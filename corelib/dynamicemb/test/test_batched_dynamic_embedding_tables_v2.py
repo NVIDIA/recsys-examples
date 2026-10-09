@@ -2926,10 +2926,9 @@ def test_fp8_table_dumps_lossless_fp16_and_round_trips(tmp_path):
         assert meta["optim_state_dtype"] == "float32"
         num_keys = _dumped_key_count(native_dir, name)
         assert num_keys > 0, f"{name}: nothing was dumped, the test proves nothing"
-        assert (
-            os.path.getsize(_shard_file(native_dir, name, "values"))
-            == num_keys * dims[table_id] * _dtype_element_size(torch.float16)
-        )
+        assert os.path.getsize(
+            _shard_file(native_dir, name, "values")
+        ) == num_keys * dims[table_id] * _dtype_element_size(torch.float16)
 
     src = _make_dump_load_tables(dims, table_names, torch.float32)
     src.load(fp32_dir, optim=True)

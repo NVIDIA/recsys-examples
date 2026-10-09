@@ -89,7 +89,9 @@ def _on_fp8_grid(values: torch.Tensor) -> torch.Tensor:
 
 def _random_case(num_rows: int, emb_dim: int, num_steps: int, seed: int = 0):
     generator = torch.Generator(device="cpu").manual_seed(seed)
-    init = _on_fp8_grid((torch.rand(num_rows, emb_dim, generator=generator) - 0.5) * 0.1)
+    init = _on_fp8_grid(
+        (torch.rand(num_rows, emb_dim, generator=generator) - 0.5) * 0.1
+    )
     grads = [
         (torch.randn(num_rows, emb_dim, generator=generator) * 1e-3).cuda()
         for _ in range(num_steps)
@@ -105,9 +107,7 @@ def _random_case(num_rows: int, emb_dim: int, num_steps: int, seed: int = 0):
 )
 def test_fp8_accumulator_matches_fp32_table(emb_dim, all_dims_vec4):
     init, grads = _random_case(64, emb_dim, 50)
-    _, ref_accumulator = _train_padded_buffer(
-        torch.float32, init, grads, all_dims_vec4
-    )
+    _, ref_accumulator = _train_padded_buffer(torch.float32, init, grads, all_dims_vec4)
     _, accumulator = _train_padded_buffer(FP8_STORAGE_DTYPE, init, grads, all_dims_vec4)
 
     assert accumulator.dtype == torch.float32
