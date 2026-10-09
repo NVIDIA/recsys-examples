@@ -28,6 +28,7 @@ def _get_flexkv_config_path() -> str:
 
 def create_testing_kvcache_manager() -> KVCacheManager:
     flexkv_config_path = _get_flexkv_config_path()
+    flexkv_enable_layerwise = os.environ.get("RECSYS_FLEXKV_ENABLE_LAYERWISE", "")
     extra_configs = {
         "flexkv_mode": "direct",
         "flexkv_host_kvstorage_fail_policy": "fail_open",
@@ -36,6 +37,8 @@ def create_testing_kvcache_manager() -> KVCacheManager:
     }
     if flexkv_config_path:
         extra_configs["flexkv_config_path"] = flexkv_config_path
+    if flexkv_enable_layerwise:
+        extra_configs["flexkv_enable_layerwise"] = flexkv_enable_layerwise
 
     kvcache_config = get_kvcache_config(
         num_layers=3,
@@ -84,6 +87,12 @@ def create_testing_kvcache_manager() -> KVCacheManager:
         )
     else:
         print("[TEST] Created KVCache Manager with FlexKV CPU tier only")
+    if flexkv_mgr.enable_layerwise:
+        print(
+            "[TEST] FlexKV layerwise transfer enabled: "
+            f"eventfd_socket={flexkv_mgr.layerwise_eventfd_socket}, "
+            f"counter_id={flexkv_mgr.layerwise_counter_id}"
+        )
     return kvcache_mgr
 
 
@@ -270,7 +279,7 @@ def run_phase_2(kvcache_mgr: KVCacheManager, all_keys, all_values) -> None:
     assert kvcache_metadata.kv_onload_handle.status == HostKVTaskStatus.SKIPPED
 
     for layer_idx in range(3):
-        kvcache_metadata.kv_onload_handle.stream_wait_layer(layer_idx)
+        kvcache_metadata.kv_onload_handle.wait_layer(layer_idx)
     assert kvcache_metadata.kv_onload_handle.handle is None
 
     for layer_idx in range(3):
@@ -403,6 +412,9 @@ def run_phase_3(kvcache_mgr: KVCacheManager, all_keys, all_values) -> None:
         "phase3 onboard launch was not LAUNCHED, "
         f"status={onboard_task_handle.status}, metadata={onboard_task_handle.metadata}"
     )
+    if onboard_task_handle.is_layerwise:
+        for layer_idx in range(3):
+            onboard_task_handle.wait_layer(layer_idx)
 
     onboard_deadline = time.time() + 60.0
     onboard_ready = False
@@ -655,6 +667,9 @@ def run_phase_5(kvcache_mgr: KVCacheManager, all_keys, all_values) -> None:
         "phase5 onboard launch failed, "
         f"status={onboard_task_handle.status}, metadata={onboard_task_handle.metadata}"
     )
+    if onboard_task_handle.is_layerwise:
+        for layer_idx in range(3):
+            onboard_task_handle.wait_layer(layer_idx)
 
     onboard_deadline = time.time() + 60.0
     onboard_ready = False

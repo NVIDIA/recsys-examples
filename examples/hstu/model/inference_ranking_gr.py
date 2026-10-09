@@ -132,6 +132,7 @@ class InferenceRankingGR(torch.nn.Module):
         batch: HSTUBatch,
         user_ids: torch.Tensor,
         total_history_lengths: torch.Tensor,
+        skip_offload: bool = False,
     ):
         with torch.inference_mode():
             # lookup and allocate for kv cache
@@ -165,6 +166,7 @@ class InferenceRankingGR(torch.nn.Module):
                 user_ids,
                 total_history_lengths,
                 kvcache_info,
+                skip_offload=skip_offload,
             )
 
         return logits
