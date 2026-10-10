@@ -83,9 +83,13 @@ class _FlexKVOnloadHandle:
     def wait_layer(self, layer_idx: int) -> None:
         if self.layer_eventfds is None:
             return
-        os.read(self.layer_eventfds[layer_idx], 8)
-        if int(layer_idx) >= int(self.num_layers) - 1:
-            self.release_counter()
+        torch.cuda.nvtx.range_push(f"recsys.kvcache.wait_layer_{int(layer_idx)}")
+        try:
+            os.read(self.layer_eventfds[layer_idx], 8)
+            if int(layer_idx) >= int(self.num_layers) - 1:
+                self.release_counter()
+        finally:
+            torch.cuda.nvtx.range_pop()
 
     def release_counter(self) -> None:
         if self._released:
@@ -765,14 +769,20 @@ class FlexKVStorage(HostKVStorageBase):
                 )
                 task_ids.append(int(task_id))
 
+        wait_ids = task_ids
         if use_batch and task_ids:
             batch_launch = len(task_ids) > 1
-            self._client.launch(task_ids, batch_slot_mappings, as_batch=batch_launch)
+            launched_ids = self._client.launch(
+                task_ids, batch_slot_mappings, as_batch=batch_launch
+            )
+            # launch() drops the child PUT ids when merging; wait on the parent.
+            if launched_ids:
+                wait_ids = [int(task_id) for task_id in launched_ids]
         return HostKVTaskHandle(
             backend="flexkv",
             user_ids=index_meta.user_ids,
             handle=_FlexKVOffloadHandle(
-                task_ids=task_ids,
+                task_ids=wait_ids,
                 uids=index_meta.user_ids,
                 seqlens=index_meta.seq_lengths,
             ),
