@@ -17,12 +17,18 @@ FWD_BWD_TEST_FILES=(
     "test/unit_tests/optimizer/test_padded_buffer_optimizer.py"
     "test/unit_tests/optimizer/test_ftrl_optimizer.py"
     "test/unit_tests/test_no_eviction_row_indexing.py"
+    "test/unit_tests/test_planner_plan_cost.py"
+    "test/unit_tests/test_planner_placement.py"
+    "test/unit_tests/test_table_row_wise.sh"
 )
 
 LOAD_DUMP_TEST_FILES=(
     "test/unit_tests/admission/test_embedding_admission.sh"
     "test/unit_tests/test_embedding_dump_load.sh"
     "test/unit_tests/incremental_dump/test_incremental_dump.sh"
+    # Registered in both groups: it covers forward and checkpoints, and runs
+    # only the half named by the group it is passed.
+    "test/unit_tests/test_table_row_wise.sh"
 )
 
 case "$1" in
@@ -49,8 +55,10 @@ for TEST_FILE in "${TEST_FILES[@]}"; do
             exit 1
         fi
     elif [[ "$TEST_FILE" == *.sh ]]; then
-        # Run shell scripts with bash
-        bash "$TEST_FILE"
+        # Run shell scripts with bash. The group is passed through so a
+        # script spanning both can run only the half being asked for; the
+        # others take no arguments and ignore it.
+        bash "$TEST_FILE" "$1"
         # Check if the test failed
         if [ $? -ne 0 ]; then
             echo "ERROR: Test failed in $TEST_FILE"

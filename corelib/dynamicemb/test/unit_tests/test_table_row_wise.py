@@ -20,6 +20,14 @@ A node here is ``LOCAL_WORLD_SIZE`` ranks, which both TorchRec's
 environment -- so N nodes are emulated on one box by setting it to
 ``world_size // N``, and these need no second machine.
 
+``--node-size`` sets it **inside the process**, because ``torchrun`` writes
+``LOCAL_WORLD_SIZE = nproc_per_node`` over anything the shell exported. Getting
+that wrong is silent and total: every run becomes ``local_size == world_size``,
+table-row-wise degenerates to row-wise, and the whole suite passes without
+having tested table-row-wise at all. So :func:`_set_node_size` asserts the
+value it asked for is the value TorchRec reads back, and every mode prints the
+topology it actually ran on.
+
 Every mode puts a table-row-wise table and a row-wise one in the same
 collection, which is the arrangement a real model has and the one §7 F5 is
 about. The row-wise table is the control: with ``DEBUG`` initialization a row is
@@ -268,9 +276,14 @@ def check_plan(args, device, rank, world_size) -> None:
             f"({rw_rows}) by about {num_nodes}x -- that is R1."
         )
 
+    # No refusal of a one-node topology here: running it is the point of the
+    # degenerate case, where table-row-wise and row-wise should agree exactly.
+    # What must not happen silently is *asking* for several nodes and getting
+    # one, and `_set_node_size` is where that is caught -- it reads the value
+    # back out of TorchRec rather than trusting the environment.
     if rank == 0:
         print(
-            f"plan ok: {num_nodes} nodes x {local_size}, trw on node {host} "
+            f"plan ok: {num_nodes} node(s) x {local_size}, trw on node {host} "
             f"({trw_rows} rows/rank), rw on all {world_size} ({rw_rows} rows/rank)"
         )
 
@@ -412,6 +425,37 @@ MODES = {
 }
 
 
+def _set_node_size(ranks_per_node: int) -> None:
+    """Make TorchRec see nodes of `ranks_per_node`, and check that it does.
+
+    Set before ``init_process_group``, so nothing has cached a process group
+    from the old value. ``get_local_size`` re-reads the environment on every
+    call, and ``intra_and_cross_node_pg`` builds the intra/cross groups from it,
+    so this is the whole of the emulation.
+
+    The assertion is the point. ``torchrun`` exports
+    ``LOCAL_WORLD_SIZE = nproc_per_node``, so a value set in the launching shell
+    is overwritten and the suite silently runs one node everywhere -- green, and
+    about row-wise.
+    """
+    world_size = int(os.environ["WORLD_SIZE"])
+    os.environ["LOCAL_WORLD_SIZE"] = str(ranks_per_node)
+    # The planner reads this one when it is set, and it is a multiplier on the
+    # node size rather than a replacement, so a stale value would widen what we
+    # just narrowed.
+    os.environ.pop("TORCHREC_RESOLVED_POD_SIZE", None)
+    if ranks_per_node < world_size:
+        # Emulated nodes share GPUs (see main), and NCCL refuses that unless
+        # asked. Slower, and correct, which is the trade this whole emulation
+        # is: one box standing in for several.
+        os.environ["NCCL_MULTI_RANK_GPU_ENABLE"] = "1"
+    seen = get_local_size(world_size)
+    assert seen == ranks_per_node, (
+        f"asked for nodes of {ranks_per_node}, TorchRec reads {seen}. Without "
+        "this the suite runs one node and table-row-wise is row-wise."
+    )
+
+
 @record
 def main(argv) -> None:
     parser = argparse.ArgumentParser()
@@ -427,18 +471,40 @@ def main(argv) -> None:
         "--dist-type", default="roundrobin", choices=["roundrobin", "hash_roundrobin"]
     )
     parser.add_argument("--save-path", default="/tmp/dynamicemb_trw_ckpt")
+    parser.add_argument(
+        "--node-size",
+        type=int,
+        default=None,
+        help="ranks per node. Default: whatever torchrun set, which is every "
+        "rank -- one node, where table-row-wise is row-wise.",
+    )
     args = parser.parse_args(argv)
 
+    if args.node_size is not None:
+        _set_node_size(args.node_size)
     dist.init_process_group(backend="nccl")
-    local_rank = int(os.environ["LOCAL_RANK"])
-    torch.cuda.set_device(local_rank)
-    device = torch.device(f"cuda:{local_rank}")
     rank, world_size = dist.get_rank(), dist.get_world_size()
 
+    # The device index is node-local: TorchRec's `placement` builds
+    # `rank:{r}/cuda:{r % local_size}`, which on a real two-node job is the
+    # rank's own GPU because its LOCAL_RANK restarts at 0 on the second node.
+    # Emulating nodes on one box breaks that -- rank 1 with nodes of 1 would sit
+    # on cuda:1 while its shard metadata says cuda:0, and ShardedTensor rejects
+    # the pair. So the emulation maps ranks onto devices the same way, which
+    # means the nodes share GPUs: two ranks on cuda:0 rather than one each.
+    # That costs memory and proves nothing less -- what is under test is the
+    # shard geometry and the two collectives, not which die they run on.
+    node_size = args.node_size or world_size
+    device_index = rank % node_size
+    torch.cuda.set_device(device_index)
+    device = torch.device(f"cuda:{device_index}")
+
+    local_size = get_local_size()
     if rank == 0:
         print(
-            f"[{args.mode}] world {world_size}, node size {get_local_size()}, "
-            f"dist_type {args.dist_type}, trw table sharded {args.trw_sharding}"
+            f"[{args.mode}] world {world_size} = {world_size // local_size} node(s) "
+            f"x {local_size}, dist_type {args.dist_type}, "
+            f"trw table sharded {args.trw_sharding}"
         )
     MODES[args.mode](args, device, rank, world_size)
     dist.barrier()
