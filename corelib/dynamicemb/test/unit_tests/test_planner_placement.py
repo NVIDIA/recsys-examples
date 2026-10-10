@@ -138,3 +138,32 @@ def test_equal_tables_spread_rather_than_stack():
         _nothing_spent(),
     )
     assert sorted(chosen.values()) == [0, 0, 1, 1]
+
+
+def test_a_pin_to_a_node_that_cannot_hold_it_is_refused():
+    """A pin says which node, not that the node will hold it.
+
+    Charging it unchecked leaves that node's ranks negative, and TorchRec's own
+    reservation looks for that on `devices[0]` alone -- so a pin to any node but
+    the first would be returned as a plan.
+    """
+    with pytest.raises(ValueError, match="cannot hold it"):
+        BalancedHostPlacer().place(
+            [_table("a", 200, pinned=1)], _topology(), _nothing_spent()
+        )
+
+
+def test_a_pin_is_refused_against_room_already_taken():
+    """The check is against what is left, not against an empty machine: an
+    earlier pin to the same node counts."""
+    placer = BalancedHostPlacer()
+    tables = [_table("first", 60, pinned=0), _table("second", 40, pinned=0)]
+    with pytest.raises(ValueError, match="'second'"):
+        placer.place(tables, _topology(hbm=80 * GB), _nothing_spent())
+
+
+def test_a_pin_that_fits_is_still_honoured():
+    chosen = BalancedHostPlacer().place(
+        [_table("a", 70, pinned=1)], _topology(hbm=80 * GB), _nothing_spent()
+    )
+    assert chosen == {"a": 1}

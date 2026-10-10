@@ -508,6 +508,12 @@ that node's range. It rejects, rather than ignores, a `host_index` on a
 row-wise table: such a table is on every rank, so naming a node for it means the
 caller expected something the plan will not do.
 
+**A pin is checked for fit like any other placement.** It says which node, not
+that the node will hold the table, so `BalancedHostPlacer` tests it against what
+is left on that node's tightest rank and refuses by name when it does not fit.
+Charging it unchecked was the earlier behaviour, on the reasoning that an
+overdraft would surface downstream -- §7.3 is where that reasoning fails.
+
 The sharding type is read from `ParameterConstraints.sharding_types`, the field
 TorchRec already has, rather than a DynamicEmb-only one; it must name exactly
 one, since a DynamicEmb table is placed rather than searched for.
@@ -1109,6 +1115,41 @@ cannot form -- `any(option.caching ...)` in the runtime is `all` of them, and a
 accounted for: it zeroes the host tier in the two layouts that have a backing
 tier to move, CACHING_PS and HOST_PS. `HybridStorage` ignores `external_storage`
 and warns, so its host tier is local and is counted, which is correct.
+
+---
+
+### 7.3 An overdrawn rank is refused here, not downstream
+
+`topology_minus` is where what DynamicEmb spends meets what the machine has, so
+it is where every route to overcommitting converges: a table pinned to a node
+too small for it, a placement the placer accepted on per-table numbers, or
+row-wise tables that simply add up to more than a rank holds. It raises
+`PlannerError(INSUFFICIENT_STORAGE)` naming the worst rank, what it has and what
+the tables take.
+
+**It used to pass the negative on**, on the reasoning that TorchRec's
+reservation reports the shortfall. It does not:
+
+```python
+# torchrec .../planner/storage_reservations.py:509
+if reserved_topology.devices[0].storage.hbm < 0:
+    raise PlannerError(...)
+```
+
+`devices[0]`, and no other rank. A table-row-wise table pinned to any node but
+the first overdraws that node's ranks while rank 0 stays positive, and the plan
+comes back. The check also belongs only to `HeuristicalStorageReservation`, the
+default -- a caller who passes a different one has nothing at all. And the
+message it would print talks about dense modules, the KJT and the batch size,
+none of which is the cause.
+
+Clamping to zero instead would be worse: zero reads as "no room, plan
+accordingly", so the plan returns looking feasible.
+
+One more reason not to rely on anything downstream: a model whose tables are
+*all* DynamicEmb's leaves TorchRec an empty search space, and `plan` returns
+`ShardingPlan({})` (`planners.py:892`) without consulting storage. That is the
+shape the dump/load tests use, so it is not a corner.
 
 ---
 

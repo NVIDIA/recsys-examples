@@ -27,7 +27,7 @@ import torch
 from fbgemm_gpu.split_embedding_configs import EmbOptimType as OptimType
 import torchrec
 from torchrec.distributed.embeddingbag import EmbeddingBagCollectionSharder
-from torchrec.distributed.planner.types import Topology
+from torchrec.distributed.planner.types import PlannerError, Topology
 
 from dynamicemb.planner.plan import make_storage
 from torchrec.distributed.types import (
@@ -201,14 +201,32 @@ def test_topology_minus_subtracts_per_rank_and_copies():
     assert [d.storage for d in topology.devices] == before
 
 
-def test_topology_minus_does_not_clamp():
-    """Zero means "no room"; negative means "already oversubscribed". Only the
-    second is true here, and the planner's error path reports the shortfall."""
+def test_topology_minus_refuses_an_overdrawn_rank():
+    """Neither clamped nor passed on. Clamping reads as "no room, plan
+    accordingly" and the plan comes back looking feasible; passing it on relies
+    on TorchRec's reservation, which tests `devices[0]` and no other rank."""
     topology = _topology(hbm=1 * GB)
+    with pytest.raises(PlannerError, match="do not fit"):
+        topology_minus(topology, [make_storage(hbm=4 * GB)] * WORLD_SIZE)
+
+
+def test_an_overdraft_away_from_rank_zero_is_still_caught():
+    """The case TorchRec's own check misses: rank 0 is fine, a later rank is
+    not. A table-row-wise table pinned to any node but the first lands here."""
+    spent = [make_storage(hbm=0)] * (WORLD_SIZE - 1) + [make_storage(hbm=200 * GB)]
+    with pytest.raises(
+        PlannerError, match=f"rank {WORLD_SIZE - 1}|Rank {WORLD_SIZE - 1}"
+    ):
+        topology_minus(_topology(), spent)
+
+
+def test_an_exact_fit_is_not_an_overdraft():
+    topology = _topology(hbm=4 * GB, ddr=8 * GB)
     reduced = topology_minus(
-        topology, [make_storage(hbm=4 * GB, ddr=0, ssd=0)] * WORLD_SIZE
+        topology, [make_storage(hbm=4 * GB, ddr=8 * GB)] * WORLD_SIZE
     )
-    assert reduced.devices[0].storage.hbm == -3 * GB
+    assert reduced.devices[0].storage.hbm == 0
+    assert reduced.devices[0].storage.ddr == 0
 
 
 def test_topology_minus_rejects_a_length_mismatch():

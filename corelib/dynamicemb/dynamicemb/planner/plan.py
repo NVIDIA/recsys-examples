@@ -35,7 +35,13 @@ from typing import Dict, List, Optional, Set, Tuple
 
 from fbgemm_gpu.split_embedding_configs import EmbOptimType as OptimType
 from torch import nn
-from torchrec.distributed.planner.types import Storage, Topology
+from torchrec.distributed.planner.types import (
+    PlannerError,
+    PlannerErrorType,
+    Storage,
+    Topology,
+)
+from torchrec.distributed.planner.utils import storage_repr_in_gb
 from torchrec.distributed.planner.utils import sharder_name
 from torchrec.distributed.utils import optimizer_type_to_emb_opt_type
 from torchrec.distributed.types import (
@@ -224,10 +230,21 @@ def topology_minus(topology: Topology, per_rank: List[Storage]) -> Topology:
     Returns a copy: the caller's Topology is an input they may reuse, and
     TorchRec's planner keeps a reference to whatever it is given.
 
-    A rank left with negative storage is not clamped to zero. Zero reads as "no
-    room, plan accordingly" while negative reads as "already oversubscribed", and
-    only the second is true; the planner's own error path reports the shortfall,
-    which a clamp would hide.
+    **Refuses a rank the DynamicEmb tables have already overdrawn**, rather than
+    clamping to zero or passing the negative on. This is the one place where
+    what DynamicEmb spends meets what the machine has, so it is where every
+    route to overcommitting it converges -- a pinned table on a node too small
+    for it, a placement the placer accepted on numbers it costs per table, or
+    row-wise tables that simply add up to more than a rank holds.
+
+    Passing it on was the earlier behaviour, on the reasoning that TorchRec's
+    own reservation reports the shortfall. It does not: it tests
+    ``devices[0].storage.hbm < 0`` and no other rank
+    (``planner/storage_reservations.py:509``), so an overdraft anywhere but
+    rank 0 survives it, and the check belongs only to
+    ``HeuristicalStorageReservation`` -- a caller who passes a different one
+    loses even that. Clamping would be worse: zero reads as "no room, plan
+    accordingly" and the plan would come back looking feasible.
     """
     if len(per_rank) != len(topology.devices):
         raise ValueError(
@@ -236,8 +253,30 @@ def topology_minus(topology: Topology, per_rank: List[Storage]) -> Topology:
         )
 
     reduced = copy.deepcopy(topology)
+    overdrawn: List[Tuple[int, Storage, Storage]] = []
     for device in reduced.devices:
-        device.storage -= per_rank[device.rank]
+        spent = per_rank[device.rank]
+        before = device.storage
+        device.storage = before - spent
+        if device.storage.hbm < 0 or device.storage.ddr < 0:
+            overdrawn.append((device.rank, before, spent))
+
+    if overdrawn:
+        worst = min(overdrawn, key=lambda o: min(o[1].hbm - o[2].hbm, 0))
+        rank, before, spent = worst
+        raise PlannerError(
+            error_type=PlannerErrorType.INSUFFICIENT_STORAGE,
+            message=(
+                f"The DynamicEmb tables do not fit on "
+                f"{len(overdrawn)} of {len(reduced.devices)} ranks, leaving "
+                "nothing for TorchRec to plan into. Rank "
+                f"{rank} has {storage_repr_in_gb(before)} and they take "
+                f"{storage_repr_in_gb(spent)}. Lower global_hbm_for_values, "
+                "shard the largest tables row-wise so they spread over every "
+                "rank instead of one node, or state a Topology that matches "
+                "the machine."
+            ),
+        )
     return reduced
 
 

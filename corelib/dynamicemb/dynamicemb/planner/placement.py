@@ -150,6 +150,22 @@ class BalancedHostPlacer(HostPlacer):
                     f"Table {table.name!r} is pinned to node {table.pinned}, "
                     f"which is outside the {num_nodes} nodes of this topology."
                 )
+            # Checked the same as a table this placer chose for. A pin says
+            # which node, not that the node will hold it, and charging it
+            # unchecked leaves the budget negative on that node's ranks --
+            # which TorchRec's own reservation looks for on `devices[0]` alone
+            # (`storage_reservations.py:509`), so a pin to any other node would
+            # go unnoticed and the plan would be returned.
+            room = tightest(table.pinned)
+            if not table.cost.fits_in(room):
+                raise ValueError(
+                    f"Table {table.name!r} is pinned to node {table.pinned}, "
+                    f"which cannot hold it. It takes {table.cost} on each of "
+                    f"that node's {local_size} ranks, and the node's tightest "
+                    f"rank has {room} left. Pin it elsewhere, leave host_index "
+                    "unset and let the placer choose, or give it row-wise "
+                    "sharding."
+                )
             chosen[table.name] = table.pinned
             charge(table.pinned, table.cost)
 
