@@ -614,7 +614,7 @@ tensor, every step. See §6.
 does it, and §3.4 says why it is inheritable. What is real is the cost, which §6
 R2 records: we pay for the gather without owning it.
 
-### 4.5 Checkpoint layout
+### 4.5 Checkpoint layout. Done (M4).
 
 Today (`batched_dynamicemb_tables.py:84-98`) a table's files are named
 `{table}_emb_{item}.rank_{r}.world_size_{ws}`, and `find_files` (`:102`) parses
@@ -632,7 +632,26 @@ either breaks that check or lies about it. Proposal:
 This is versioned-format work. It is also the natural place to fix the fact that
 **the ownership rule is currently implicit in the checkpoint** — see §8.1.
 
-### 4.6 Load / replay / twin-module ownership
+**Shipped, and further than proposed.** The kernel reads its shard geometry from
+the shard placements TorchRec planned rather than from the global process group:
+`_shard_ranks`, `_num_shards`, `_shard_index`, and the intra-node group the TRW
+sharding hands it. Everything that names a shard derives from those.
+
+- Files are named `rank_{shard_index}.world_size_{num_shards}` — the old spelling
+  kept, now meaning shard index out of shard count. Row-wise is unchanged, since
+  there `num_shards` *is* the world size.
+- Shard 0 writes the meta json and records `sharding_type`, `num_shards` and
+  `shard_ranks`.
+- **Load works across geometries**, which the proposal above did not ask for: when
+  the counts match it takes this shard's file, and otherwise it reads every file
+  and keeps the keys the rule assigns to this shard. So a checkpoint moves
+  row-wise → table-row-wise and back, or to a different shard count.
+- The per-table barrier runs over the **shard group**, not the world. A barrier
+  over the world deadlocks the moment two nodes hold different numbers of
+  tables — which is the normal case once tables are packed onto nodes, and which
+  this section did not anticipate.
+
+### 4.6 Load / replay / twin-module ownership. Done (M4).
 
 All five sites in §2(b) must move to **one shared function**:
 
@@ -646,7 +665,18 @@ def owning_rank(keys, *, dist_type, num_shards, shard_base) -> Tensor
 to this and already handles `dist_type`; it should become the single
 implementation and the other four sites should call it.
 
-### 4.7 Incremental dump / replay
+**Shipped as `(shard_index, num_shards)`** rather than `(shard_base,
+num_shards)`, which is the same statement made from inside the shard group: a
+rank filters by its index within the ranks that hold the table, so no site needs
+to know the node. The hashtable and the admission counter take the same pair
+instead of `dist.get_rank()` / `get_world_size()`.
+
+This also closes F11 at the kernel: `_shard_world_size` is now the fan-out the
+bucketizer actually used — `local_size` for a TRW table — rather than the world.
+Routing and ownership no longer disagree. The planner's third source was closed
+in M2; what remains of F11 is `construct_twin_module.py`, a separate tool.
+
+### 4.7 Incremental dump / replay. Done (M4).
 
 `meta["world_size"]` (`incremental_dump.py:110`) means "the source's row-wise
 fan-out, the modulo base for key → rank". Under TRW that is `local_size`, and the
@@ -655,6 +685,12 @@ key→rank mapping additionally needs the node. `_replay_compatibility`
 — replay does not reshard — but the field needs to carry enough to describe a TRW
 layout. Recommend replacing the single `world_size` field with the same triple
 the ownership function takes, and rejecting any delta whose triple differs.
+
+**Shipped.** Delta meta records `shard_index` and `shard_ranks` beside
+`world_size`, which now means the shard count. Replay filters ownership by the
+rank's index inside the shard group. A process group handed to `incremental_dump`
+is mapped onto the kernel's shard group, so a gather can never wait on ranks that
+do not hold the table; with no group, each rank dumps only the rows it owns.
 
 ### 4.8 Explicitly out of scope: EmbeddingCollection (sequence)
 
@@ -764,9 +800,9 @@ key -> rank rule now lives in `key_ownership.py`.
 | `shard/embeddingbag.py` | dispatch TRW. Done (M3): one `elif` | S |
 | `shard/embedding.py` | refuse TRW. Done (M3) -- §4.8 | S |
 | `shard/input_dist.py` | none required -- the staggered shuffle is inherited, see §3.4 | -- |
-| `key_ownership.py` | the rule takes a shard base, not only a fan-out. **M4** -- until then the four checkpoint entry points refuse a TRW table | S |
-| `batched_dynamicemb_tables.py` | shard-index file naming; `find_files` reads meta. **M4**. M3 added the refusal (`_refuse_if_table_row_wise`, four entry points) | M |
-| `incremental_dump.py` | meta carries the ownership triple. **M4** | S |
+| `key_ownership.py` | none required. Done (M4) by passing `(shard_index, num_shards)` at the call sites instead -- the same statement made from inside the shard group | -- |
+| `batched_dynamicemb_tables.py` | shard geometry from the planned placements; shard-index file naming; barrier over the shard group. Done (M4) -- M3's four refusals are gone | M |
+| `incremental_dump.py` | delta meta carries `shard_index` and `shard_ranks`. Done (M4) | S |
 | `src/sparse_block_bucketize_features.cu` | none required | -- |
 
 The CUDA bucketizer needs **no change**, confirmed in M3: it is already
@@ -940,21 +976,35 @@ argument to `collective_plan` that is not `GroupMember.WORLD`. Then
 with each other and with TorchRec: a rank is planned for one partition, fed the
 keys of a second, and dumps the keys of a third. Nothing raises.
 
-This is independent of TRW -- it is true on the branch today -- but TRW makes it
-worse, since TRW introduces a second legitimate reason for the fan-out to differ
-from the world size (`local_size`), and §4.6 already has to thread a shard base
-through the rule. **Recommend: give the rule one source, taken from the sharding
-environment rather than from `dist`, and reject `DMPCollection` explicitly until
-that is done.**
+This is independent of TRW -- it was true on the branch when this was written --
+but TRW makes it worse, since TRW introduces a second legitimate reason for the
+fan-out to differ from the world size (`local_size`), and §4.6 has to thread a
+shard base through the rule anyway. **Recommend: give the rule one source, taken
+from the sharding environment rather than from `dist`, and reject
+`DMPCollection` explicitly until that is done.**
+
+**Two of the three are closed.** Planning stopped reading `dist` in M2:
+`_prepare_dynemb_table_options` and `_plan_dynamicemb` take `world_size` and
+`local_size` from the Topology (§4.2). Ownership stopped in M4: the kernel's
+`_shard_world_size` is now `len(_shard_ranks)`, the fan-out the bucketizer
+actually used, read off the placements TorchRec planned (§4.6).
+
+What is left is **`construct_twin_module.py:536`**, which still applies the rule
+with its own `self._world_size`, and the recommendation above still stands for
+it. Note that closing the other two did not come from deciding to fix F11 --
+both fell out of work that needed a per-table fan-out for its own reasons, which
+is the usual way a defect of this shape gets closed.
 
 ---
 
-## 8. Pre-existing defects found while writing this, and fixed since
+## 8. Defects found along the way, and fixed since
 
-All four were found while reading for this document and are fixed on the branch
-this one sits on. Kept here because each says something about how the code got
-that way, and because the shape of §8.1 is the one TRW is most likely to
-reproduce.
+§8.1 to §8.4 were found by reading, before any of this ran. §8.5 was found by
+running it, and is the more useful half of this section: six defects, one of
+them row-wise's and five of them silent, in code that had been read closely and
+had passed every static check. Kept because each says something about how the
+code got that way, and because the shape of §8.1 is the one TRW is most likely
+to reproduce.
 
 ### 8.1 Checkpoint load dropped keys for `hash_roundrobin` tables
 
@@ -1001,6 +1051,59 @@ Both describe the same fixed features. Building them together also removed an
 unguarded assumption: the kernel indexes both with the same `t`, and nothing
 checked that the orders agreed.
 
+### 8.5 What running M3 found that reading it had not
+
+Six defects, in the order they stopped being invisible. The first two were loud;
+the rest were not.
+
+**`Storage(..., ssd=0)` raised on TorchRec 1.4.0.** The `ssd` field arrived in
+1.5.0. `planner/plan.py` and `planner/placement.py` were written against a newer
+checkout than the container runs, so `collective_plan` died on rank 0 and the
+planner tests never started. One `make_storage` helper now builds it either way.
+This is the version skew §4.9 warned about, at a site nobody thought of as a
+seam — a dataclass field, not a method signature.
+
+**A TRW table could not be constructed at all.** `get_state_dict` built the
+kernel's placeholder `ShardedTensor` with one shard per rank of `pg` and indexed
+this rank's by `pg.rank()`; a TRW table has `local_world_size` shards on one
+node while `pg` is the world, so the assertion fired and DMP construction failed.
+It now uses the table's own shard count and finds this rank's shard by placement.
+
+**Two more of the same shape.** `_initialize_torch_state` registers an empty
+weight for shards a rank does not hold but skips `CUSTOMIZED_KERNEL` tables, so
+on the nodes a TRW table is absent from, `reset_parameters` failed with "Module
+has no attribute weight". And registering an *empty* tensor there, rather than
+the same `(1, 1)` meta placeholder the owners get, made a
+`torch.distributed.checkpoint` save fail: two plain tensors under one fqn with
+different shapes are not deduplicated.
+
+*The lesson in those three:* M3 and M4 were split on the assumption that "a table
+is not on every rank" only matters when checkpointing. It does not.
+`_initialize_torch_state`, `get_state_dict` and `reset_parameters` all touch
+shard metadata at **DMP construction time**. Refusing at the four checkpoint
+entry points did not make a TRW table safe; it made one impossible to build.
+
+**The planner silently stopped planning.**
+`EmbeddingShardingPlanner.__init__` assigns `self._constraints` itself, so
+setting it *before* `super().__init__` left the planner holding only the
+non-DynamicEmb subset. `_plan_dynamicemb` then found no DynamicEmb tables,
+pruned nothing, and TorchRec planned every one of them as a fused TBE table with
+its default search -- table-wise or table-row-wise on the fused kernel -- and
+**nothing raised**. Assigning after `super().__init__` fixes it.
+
+This is the one worth sitting with. It was introduced by the §2.1 rework, it
+disabled the entire feature, and the audit in the commit before it -- which did
+find three other row-wise regressions -- went straight past it. An attribute
+assignment is not a call, so nothing about it looks like a seam.
+
+**MEAN pooled twice, under row-wise as well.**
+`GroupedPooledEmbeddingsLookup` received `sharding_type` and dropped it when
+building `BatchedDynamicEmbeddingBag`, so `BaseBatchedEmbeddingBag` kept pooling
+MEAN: the kernel averaged each shard's rows and TorchRec's mean-pooling callback
+divided by the bag length again. A MEAN-pooled DynamicEmb table returned
+`sum/len²`. **This one predates the branch** and affects every row-wise user; it
+surfaced only because TRW made someone check what `sharding_type` was for.
+
 ## 9. Suggested staging
 
 | Milestone | Content | Gate |
@@ -1008,8 +1111,8 @@ checked that the orders agreed.
 | ~~**M0**~~ | **Done.** §8.1-§8.4, one ownership function (§4.6) with all six call sites on it, a 2-GPU `hash_roundrobin` dump/load test, and the planner cleanup that came with it: the copied `enumerate` and filters handed back to TorchRec, and the budget in §6 R1b. | Shipped on its own merit, as intended |
 | ~~**M1**~~ | ~~Measure R1 as a go/no-go~~ **Cancelled.** Customer demand for TWRW is strong enough that it ships regardless of the R1 outcome. The measurement still has value as *sizing* input for §4.2 and for the `host_index` guidance in §10.3 -- it is folded into M5, not a gate. |  |
 | ~~**M2**~~ | **Done.** Placement + capacity (§4.1, §4.2). Nodes are chosen by a `HostPlacer` component, with `host_index` surviving as a pin. Plan is TRW-shaped; nothing consumes it yet -- `shard/embeddingbag.py` still dispatches only ROW_WISE, so a TRW table reaches TorchRec's own TwRw sharding and will not work. M3 is what makes it run. | `table_fanout` / `table_layout` / `BalancedHostPlacer` unit tests; plan inspection still owed |
-| ~~**M3**~~ | **Written, unrun.** `TwRwPooledDynamicEmbeddingSharding` + the input dist (§4.3, §4.4); the staggered shuffle turned out to be inherited. TRW tables reject dump / load / incremental-dump with a clear error, and `EmbeddingCollection` refuses TRW outright. | Numerical parity vs RW on a small model -- **still owed, and the gate M3 does not pass without** |
-| **M4** | Checkpoint (§4.5), ownership under TRW (§4.6), incremental dump (§4.7) | Dump→load round-trip across TRW |
+| ~~**M3**~~ | **Done.** `TwRwPooledDynamicEmbeddingSharding` + the input dist (§4.3, §4.4); the staggered shuffle turned out to be inherited. `EmbeddingCollection` refuses TRW outright. Running it found six defects the static reading had missed -- see §8.5. | Numerical parity vs row-wise, reached |
+| ~~**M4**~~ | **Done.** Checkpoint (§4.5), ownership under TRW (§4.6), incremental dump (§4.7). The kernel reads its shard geometry from the placements TorchRec planned rather than from the global process group, so the four refusals M3 added are gone. | Dump→load round-trip across TRW, reached: a two-node emulation both directions with unequal per-node table counts, and a 2x8 run whose 58 GB checkpoint reloaded onto 8 GPUs with exact key counts and bit-identical values |
 | **M5** | Perf validation: R2, R3 measured against the cross-node saving | Beat RW on the target topology, or stop |
 
 With M1 cancelled, M2 is the first thing to do. R1 is still inherent to TRW and
@@ -1027,11 +1130,17 @@ side of the line, M3 entirely on the inheritance side.
 
 1. **Target topology and table sizes?** TRW only pays off when cross-node a2a is
    a measured bottleneck *and* the table fits one node. Both need numbers.
-2. **Must TRW tables checkpoint in v1?** If not, M4 can be deferred and the
-   project is roughly half the size.
-3. **`host_index` by hand, or automatic packing?** This document assumes by hand
-   (§4.1). Automatic packing inverts the ordering in §4.2 and needs a cost model
-   DynamicEmb tables do not currently participate in.
+2. ~~**Must TRW tables checkpoint in v1?**~~ **Settled: yes, and it is done**
+   (M4). The question assumed deferring it halved the project; §8.5 shows why
+   that was wrong — the shard geometry a checkpoint needs is read at DMP
+   construction, so the half could not have been deferred anyway.
+3. ~~**`host_index` by hand, or automatic packing?**~~ **Settled: automatic**, as
+   `BalancedHostPlacer`, with `host_index` kept as a pin (§4.1). The two reasons
+   this document gave for doing it by hand were both wrong: the ordering does not
+   invert, because capacity depends on the fan-out and not on which node (§4.2);
+   and a DynamicEmb table's size is declared rather than estimated, so the
+   packing needs no cost model — that is what makes it easier than TorchRec's own,
+   not harder.
 4. **Is `hash_roundrobin` acceptable as the TRW default?** R4 argues it is close
    to required. It changes the key→rank mapping, so it is a reshard for any
    existing table.
