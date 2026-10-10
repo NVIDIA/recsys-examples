@@ -20,7 +20,7 @@ declared sizes, which is why it is a component of its own.
 """
 
 import pytest
-from torchrec.distributed.planner.types import Storage, Topology
+from torchrec.distributed.planner.types import Topology
 
 from dynamicemb.planner.plan import make_storage
 
@@ -94,7 +94,8 @@ def test_a_node_is_charged_on_every_one_of_its_ranks():
     assert chosen == {"a": 0}
     # node 0 now has 20GB per rank, so a 30GB table can only go to node 1
     spent = [
-        make_storage(hbm=60 * GB if r < LOCAL else 0, ddr=0, ssd=0) for r in range(WORLD)
+        make_storage(hbm=60 * GB if r < LOCAL else 0, ddr=0, ssd=0)
+        for r in range(WORLD)
     ]
     assert placer.place([_table("b", 30)], _topology(hbm=80 * GB), spent) == {"b": 1}
 
