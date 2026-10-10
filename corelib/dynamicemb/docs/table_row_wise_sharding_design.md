@@ -1024,6 +1024,25 @@ Run at two shapes on purpose: `local_size < world_size`, the only one where
 table-row-wise differs from row-wise at all, and `local_size == world_size`,
 where it degenerates and an off-by-one between the two would show.
 
+Registered in `test/unit_test.sh` in both groups, taking the group as an
+argument and running the half that belongs to it: 15 of the 31 runs under
+`fwd_bwd`, 16 under `load_dump`.
+
+**Two things the emulation has to get right, and did not at first.** `torchrun`
+sets `LOCAL_WORLD_SIZE = nproc_per_node` over anything the shell exports, so the
+first version ran one node everywhere: 31 passes, none of them about
+table-row-wise. `--node-size` sets it in-process, and `_set_node_size` reads it
+back out of TorchRec and asserts, because the failure is silent and total. And
+the device index in `placement` is node-local (`cuda:{rank % local_size}`),
+which is the rank's own GPU on a real second node but not on an emulated one, so
+the ranks map onto devices the same way and the emulated nodes share GPUs --
+which NCCL refuses until `NCCL_MULTI_RANK_GPU_ENABLE` says otherwise.
+
+**Measured, on 8xH100.** All 31 pass. The plan mode's numbers are the first
+measurement of R1 on this branch rather than an argument about it: a
+table-row-wise table takes 1000064 rows per rank where the same table row-wise
+takes 500096, across two nodes.
+
 **Not covered.** Variable batch (F4). Resharding a *live* model rather than a
 checkpoint (F3). `DMPCollection`, which F11 says is broken anyway. And the
 performance claim, which is M5.
