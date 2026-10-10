@@ -904,6 +904,12 @@ while DynamicEmb's bucketizer multiplies `stride_per_key_per_rank` by
 `world_size`. These two must agree. This is the easiest place to be subtly wrong
 and the hardest to cover with a test.
 
+**Still open.** `test_table_row_wise.py --mode jagged` covers an ordinary jagged
+batch, empty bags included, which is worth having but is not this: true VBE is a
+KJT carrying `stride_per_key_per_rank`, where features have different batch
+sizes per rank. Writing that test means building inverse indices, and getting
+them wrong would look like a pass.
+
 **F5 — mixed sharding types in one collection.** An EBC may hold RW tables, TRW
 tables and plain TorchRec tables. `create_embedding_bag_sharding` dispatches on
 `sharding_infos[0]` (`shard/embeddingbag.py:60`) — already a per-group decision,
@@ -994,6 +1000,39 @@ with its own `self._world_size`, and the recommendation above still stands for
 it. Note that closing the other two did not come from deciding to fix F11 --
 both fell out of work that needed a per-table fan-out for its own reasons, which
 is the usual way a defect of this shape gets closed.
+
+---
+
+### 7.1 What the tests cover, and what they do not
+
+`test_table_row_wise.py`, driven by `test_table_row_wise.sh`. A node is
+`LOCAL_WORLD_SIZE` ranks -- TorchRec's `intra_and_cross_node_pg` and the
+planner's Topology both read it from the environment -- so two nodes of one rank
+are a faithful topology on a two-GPU box, and none of this needs a second
+machine. Every mode puts a table-row-wise table and a row-wise one in the same
+collection, which is also F5's arrangement.
+
+| Mode | Catches |
+|---|---|
+| `plan` | A planner that silently stopped planning (§8.5). Asserts the sharding type, the compute kernel, that the options are attached, the shard count, that the TRW ranks are one node's, and that per-rank rows differ by the node count (R1) |
+| `parity` | DMP construction, both output collectives, the key -> rank rule. Row-wise is the control: with `DEBUG` initialization a row is a function of its key alone, so the two must agree |
+| `pooling` | MEAN applied twice. The one absolute check here -- two MEAN tables agreeing says nothing, since a double application makes both `sum/len^2`; against SUM, `mean * len` must be `sum` |
+| `jagged` | Empty and uneven bags, where an off-by-one in the bucketized offsets shows |
+| `dump` / `load` | Shard-index naming, and loading across geometries both directions. Checks the values, because §8.1's failure is a smaller table rather than an error |
+
+Run at two shapes on purpose: `local_size < world_size`, the only one where
+table-row-wise differs from row-wise at all, and `local_size == world_size`,
+where it degenerates and an off-by-one between the two would show.
+
+**Not covered.** Variable batch (F4). Resharding a *live* model rather than a
+checkpoint (F3). `DMPCollection`, which F11 says is broken anyway. And the
+performance claim, which is M5.
+
+Five modes rather than a table-row-wise variant of each existing test, because
+most of the suite builds the kernel directly and cannot observe either of the
+two things table-row-wise changes -- the fan-out, and which ranks hold a table.
+Parametrizing it would mostly re-run code that does not know what sharding it is
+under, and would still miss §8.5's planner defect, which no forward test finds.
 
 ---
 
