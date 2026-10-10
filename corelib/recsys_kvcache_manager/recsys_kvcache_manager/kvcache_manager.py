@@ -88,6 +88,12 @@ class KVCacheManager:
     ) -> Optional[HostKVWaitResult]:
         return self.backend.onboard_wait(kv_index_meta, task_handle)
 
+    def onboard_wait_layer(self, task_handle: Optional[HostKVTaskHandle], layer_idx: int) -> None:
+        self.backend.onboard_wait_layer(task_handle, layer_idx)
+
+    def prefetch_kvcache(self, index_meta: KVIndexMeta) -> HostKVTaskHandle:
+        return self.backend.prefetch_kvcache(index_meta)
+
     def offload_launch(
         self,
         index_meta: KVIndexMeta,

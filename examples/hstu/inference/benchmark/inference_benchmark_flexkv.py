@@ -26,6 +26,7 @@ ACTION_FEATURE_NAME = "act_feat"
 ITEM_VOCAB_SIZE = 10000
 ACTION_VOCAB_SIZE = 128
 SUPPORTED_SCENARIOS = frozenset({"gpu_hit", "cpu_hit", "ssd_hit"})
+PREFETCH_GAP_MS_RANGE = (0.0, 20.0)
 
 
 InferenceRequest = Tuple[HSTUBatch, torch.Tensor, torch.Tensor]
@@ -48,8 +49,10 @@ class BenchmarkConfig:
     ssd_pressure_users: int = 0
     ssd_pressure_batch_size: int = 8
     ssd_pressure_batch_sleep_s: float = 1.0
-    offload_wait_timeout_s: float = 60.0
+    flexkv_enable_layerwise: int = 0
+    flexkv_layer_granularity: int = -1
     only_onboard: bool = False
+    skip_prefetch: bool = False
 
 
 BENCHMARK_CONFIG = BenchmarkConfig()
@@ -113,7 +116,7 @@ def build_request(
         torch.randint(
             low=0,
             high=ACTION_VOCAB_SIZE,
-            size=(history_len,),
+            size=(history_len + num_candidates,),
             dtype=torch.long,
         )
         for _ in user_ids
@@ -154,9 +157,15 @@ def build_model(cfg: BenchmarkConfig, history_len: int):
     head_dim = 256
     num_layers = 8
     inference_dtype = torch.bfloat16
+    # Default buckets stop at 17*256=4352. history_len=8192 is 16k+ tokens.
+    captured_lengths = [i * 256 for i in range(2, 18)]
+    need_length = max(256, (max_seqlen + 255) // 256 * 256)
+    if need_length not in captured_lengths:
+        captured_lengths.append(need_length)
+        captured_lengths.sort()
     hstu_cudagraph_configs = {
         "batch_size": sorted({1, 2, 4, 8, cfg.batch_size}),
-        "length_per_sequence": [i * 256 for i in range(2, 18)],
+        "length_per_sequence": captured_lengths,
     }
     hstu_config = get_inference_hstu_config(
         hidden_size=hidden_dim_size,
@@ -181,9 +190,11 @@ def build_model(cfg: BenchmarkConfig, history_len: int):
         "flexkv_mode": "direct",
         "flexkv_host_kvstorage_fail_policy": "fail_open",
         "flexkv_enable_mps": 0,
-        "flexkv_as_batch": 1,
+        "flexkv_as_batch": int(os.environ.get("FLEXKV_AS_BATCH", "1")),
         "flexkv_num_cpu_blocks": int(cfg.flexkv_num_cpu_blocks),
         "flexkv_num_local_blocks": int(cfg.flexkv_num_local_blocks),
+        "flexkv_enable_layerwise": int(getattr(cfg, "flexkv_enable_layerwise", 0)),
+        "flexkv_layer_granularity": int(getattr(cfg, "flexkv_layer_granularity", -1)),
     }
     if cfg.flexkv_config_path:
         extra_configs["flexkv_config_path"] = cfg.flexkv_config_path
@@ -241,6 +252,29 @@ def build_model(cfg: BenchmarkConfig, history_len: int):
     return model_predict, page_size, max_seqlen
 
 
+def drain_offload_queue(kvcache_mgr, tag: str, log_every_s: float = 30.0) -> None:
+    # Unbounded: a 60s deadline aborted valid H2DISK on large CPU pins.
+    # Log periodically so a stuck offload is visible without a false timeout.
+    owner = getattr(kvcache_mgr, "backend", kvcache_mgr)
+    t0 = time.monotonic()
+    last_log = t0
+    torch.cuda.nvtx.range_push(tag)
+    try:
+        while len(owner.ongoing_offload_tasks) > 0:
+            kvcache_mgr.offload_try_wait()
+            now = time.monotonic()
+            if now - last_log >= log_every_s:
+                print(
+                    f"[{tag}] draining offload pending="
+                    f"{len(owner.ongoing_offload_tasks)} waited={now - t0:.0f}s",
+                    flush=True,
+                )
+                last_log = now
+            time.sleep(0.001)
+    finally:
+        torch.cuda.nvtx.range_pop()
+
+
 def run_scenario_gpu_hit(
     model_predict,
     history_len: int,
@@ -250,7 +284,6 @@ def run_scenario_gpu_hit(
     warmup_iters: int,
     timed_iters: int,
     batch_size: int,
-    offload_wait_timeout_s: float,
 ) -> None:
     base_user_id = 10
     timed_user_batches = build_user_batches(base_user_id, timed_iters, batch_size)
@@ -303,25 +336,6 @@ def run_scenario_gpu_hit(
         )
         torch.cuda.nvtx.range_pop()
 
-    deadline = time.time() + offload_wait_timeout_s
-    torch.cuda.nvtx.range_push("scenario1.timed.offload_wait_all")
-    try:
-        while len(kvcache_mgr.ongoing_offload_tasks) > 0:
-            torch.cuda.nvtx.range_push("scenario1.timed.offload_wait_all.try_wait")
-            try:
-                kvcache_mgr.offload_try_wait()
-            finally:
-                torch.cuda.nvtx.range_pop()
-            if len(kvcache_mgr.ongoing_offload_tasks) == 0:
-                break
-            if time.time() > deadline:
-                raise TimeoutError(
-                    f"offload queue not drained within timeout ({offload_wait_timeout_s}s), "
-                    f"pending={len(kvcache_mgr.ongoing_offload_tasks)}"
-                )
-            time.sleep(0.001)
-    finally:
-        torch.cuda.nvtx.range_pop()
     print(f"[Scenario1] timed run completed, iters={timed_iters}")
 
 
@@ -334,7 +348,6 @@ def run_scenario_gpu_miss_host_hit(
     warmup_iters: int,
     timed_iters: int,
     batch_size: int,
-    offload_wait_timeout_s: float,
 ) -> None:
     base_user_id = 20
     timed_user_batches = build_user_batches(base_user_id, timed_iters, batch_size)
@@ -361,25 +374,7 @@ def run_scenario_gpu_miss_host_hit(
             user_ids,
             total_history_lengths,
         )
-    deadline = time.time() + offload_wait_timeout_s
-    torch.cuda.nvtx.range_push("scenario2.warmup.offload_wait_all")
-    try:
-        while len(kvcache_mgr.ongoing_offload_tasks) > 0:
-            torch.cuda.nvtx.range_push("scenario2.warmup.offload_wait_all.try_wait")
-            try:
-                kvcache_mgr.offload_try_wait()
-            finally:
-                torch.cuda.nvtx.range_pop()
-            if len(kvcache_mgr.ongoing_offload_tasks) == 0:
-                break
-            if time.time() > deadline:
-                raise TimeoutError(
-                    f"offload queue not drained within timeout ({offload_wait_timeout_s}s), "
-                    f"pending={len(kvcache_mgr.ongoing_offload_tasks)}"
-                )
-            time.sleep(0.001)
-    finally:
-        torch.cuda.nvtx.range_pop()
+    drain_offload_queue(kvcache_mgr, "scenario2.warmup.offload_wait_all")
 
     # timed run
     print("timed run")
@@ -398,25 +393,6 @@ def run_scenario_gpu_miss_host_hit(
             total_history_lengths,
         )
         torch.cuda.nvtx.range_pop()
-    deadline = time.time() + offload_wait_timeout_s
-    torch.cuda.nvtx.range_push("scenario2.timed.offload_wait_all")
-    try:
-        while len(kvcache_mgr.ongoing_offload_tasks) > 0:
-            torch.cuda.nvtx.range_push("scenario2.timed.offload_wait_all.try_wait")
-            try:
-                kvcache_mgr.offload_try_wait()
-            finally:
-                torch.cuda.nvtx.range_pop()
-            if len(kvcache_mgr.ongoing_offload_tasks) == 0:
-                break
-            if time.time() > deadline:
-                raise TimeoutError(
-                    f"offload queue not drained within timeout ({offload_wait_timeout_s}s), "
-                    f"pending={len(kvcache_mgr.ongoing_offload_tasks)}"
-                )
-            time.sleep(0.001)
-    finally:
-        torch.cuda.nvtx.range_pop()
     print(f"[Scenario2] timed run completed, iters={timed_iters}")
 
 
@@ -429,10 +405,10 @@ def run_scenario_gpu_cpu_miss_ssd_hit(
     page_size: int,
     timed_iters: int,
     batch_size: int,
-    offload_wait_timeout_s: float,
     ssd_pressure_users: int,
     ssd_pressure_batch_size: int,
     ssd_pressure_batch_sleep_s: float,
+    warmup_iters: int = 0,
 ) -> None:
     # Use pressure users instead of FlexKV's private _clear_cpu_cache().
     # RecSys FlexKV has no per-user host eviction API, so this follows the
@@ -449,34 +425,62 @@ def run_scenario_gpu_cpu_miss_ssd_hit(
     cache_cfg = getattr(host_mgr, "_client", None)
     cache_cfg = getattr(cache_cfg, "cache_config", None)
 
+    target_blocks = math.ceil((history_len * 2) / page_size)
+    if target_blocks <= 0:
+        raise RuntimeError(f"Invalid target_blocks={target_blocks}")
+
+    def _h2disk_sleep(num_blocks: int) -> float:
+        # This SSD's H2DISK is about 2 GB/s. A 3 GB/s budget returned while the
+        # CPU block was still locked, so the next GET could not evict it.
+        seconds = num_blocks * (1024 * 1024) / (1.5 * 1024 ** 3)
+        return max(float(ssd_pressure_batch_sleep_s), seconds)
+
+    def _drain_offload(tag: str, num_blocks: int) -> None:
+        # PUT becomes READY at D2H, while the CPU block stays locked until
+        # H2DISK finishes. Otherwise a large batch fills CPU and later PUTs
+        # fail with CPU=0.
+        drain_offload_queue(kvcache_mgr, tag)
+        time.sleep(_h2disk_sleep(num_blocks))
+
+    def _pressure_fill(base_uid: int, num_users: int, tag: str) -> None:
+        # Reuse the same pressure uids so SSD does not need extra capacity.
+        torch.cuda.nvtx.range_push(tag)
+        try:
+            for pressure_idx in range(num_users):
+                pressure_user_id = base_uid + pressure_idx
+                batch, user_ids, total_history_lengths = build_request(
+                    pressure_user_id,
+                    history_len,
+                    num_candidates,
+                    max_seqlen,
+                )
+                model_predict.forward_with_kvcache(
+                    batch,
+                    user_ids,
+                    total_history_lengths,
+                )
+                if (
+                    ssd_pressure_batch_size > 0
+                    and (pressure_idx + 1) % ssd_pressure_batch_size == 0
+                ):
+                    _drain_offload(
+                        f"{tag}.batch_offload_wait_all",
+                        ssd_pressure_batch_size * target_blocks,
+                    )
+        finally:
+            torch.cuda.nvtx.range_pop()
+        _drain_offload(f"{tag}.final_offload_wait_all", target_blocks)
+
     print("warmup")
-    # Prime targets into GPU + CPU + SSD. Timed requests append a new tail so
-    # offload cannot be fully eliminated by put_match.
+    # Prime one batch at a time. A tight loop locks every CPU block on
+    # in-flight H2DISK and the remaining targets never reach SSD.
     for batch, user_ids, total_history_lengths in req_targets:
         model_predict.forward_with_kvcache(
             batch,
             user_ids,
             total_history_lengths,
         )
-    deadline = time.time() + offload_wait_timeout_s
-    torch.cuda.nvtx.range_push("scenario3.warmup.offload_wait_all")
-    try:
-        while len(kvcache_mgr.ongoing_offload_tasks) > 0:
-            torch.cuda.nvtx.range_push("scenario3.warmup.offload_wait_all.try_wait")
-            try:
-                kvcache_mgr.offload_try_wait()
-            finally:
-                torch.cuda.nvtx.range_pop()
-            if len(kvcache_mgr.ongoing_offload_tasks) == 0:
-                break
-            if time.time() > deadline:
-                raise TimeoutError(
-                    f"offload queue not drained within timeout ({offload_wait_timeout_s}s), "
-                    f"pending={len(kvcache_mgr.ongoing_offload_tasks)}"
-                )
-            time.sleep(0.001)
-    finally:
-        torch.cuda.nvtx.range_pop()
+        _drain_offload("scenario3.warmup.offload_wait_all", batch_size * target_blocks)
     num_cpu_blocks = int(getattr(cache_cfg, "num_cpu_blocks", 0))
     num_ssd_blocks = int(getattr(cache_cfg, "num_ssd_blocks", 0))
 
@@ -499,114 +503,139 @@ def run_scenario_gpu_cpu_miss_ssd_hit(
         f"pressure_batch_sleep_s={ssd_pressure_batch_sleep_s}",
         flush=True,
     )
+    _pressure_fill(
+        pressure_base_user_id, ssd_pressure_users, "scenario3.pressure_fill"
+    )
 
-    torch.cuda.nvtx.range_push("scenario3.pressure_fill")
-    try:
-        for pressure_idx in range(ssd_pressure_users):
-            pressure_user_id = pressure_base_user_id + pressure_idx
+    # The prefix is already on SSD. When one batch fills the whole CPU cache
+    # (history 8192, batch 8), this forward's offload cannot allocate staging
+    # and logs PUT FAILED even though the GET was DISK2H. Skip that re-offload
+    # so the timed window only measures the SSD hit.
+    real_offload_launch = kvcache_mgr.offload_launch
+
+    def _skip_timed_offload(*_args, **_kwargs):
+        return None
+
+    kvcache_mgr.offload_launch = _skip_timed_offload
+    if warmup_iters > 0:
+        print(f"ssd warmup iters={warmup_iters}", flush=True)
+        warmed_user_ids = []
+        for warm_idx in range(warmup_iters):
+            user_batch = timed_user_batches[warm_idx % len(timed_user_batches)]
+            warmed_user_ids.extend(user_batch)
+            user_ids = torch.tensor(user_batch, dtype=torch.int64)
+            kvcache_mgr.evict(user_ids, for_gpu=True)
             batch, user_ids, total_history_lengths = build_request(
-                pressure_user_id,
-                history_len,
+                user_batch,
+                get_timed_history_len(history_len, append_history_len),
                 num_candidates,
                 max_seqlen,
             )
-            model_predict.forward_with_kvcache(
+            run_forward_with_kvcache(
+                model_predict,
                 batch,
                 user_ids,
                 total_history_lengths,
             )
-            if (
-                ssd_pressure_batch_size > 0
-                and (pressure_idx + 1) % ssd_pressure_batch_size == 0
-            ):
-                deadline = time.time() + offload_wait_timeout_s
-                torch.cuda.nvtx.range_push("scenario3.pressure.batch_offload_wait_all")
-                try:
-                    while len(kvcache_mgr.ongoing_offload_tasks) > 0:
-                        torch.cuda.nvtx.range_push(
-                            "scenario3.pressure.batch_offload_wait_all.try_wait"
-                        )
-                        try:
-                            kvcache_mgr.offload_try_wait()
-                        finally:
-                            torch.cuda.nvtx.range_pop()
-                        if len(kvcache_mgr.ongoing_offload_tasks) == 0:
-                            break
-                        if time.time() > deadline:
-                            raise TimeoutError(
-                                f"offload queue not drained within timeout ({offload_wait_timeout_s}s), "
-                                f"pending={len(kvcache_mgr.ongoing_offload_tasks)}"
-                            )
-                        time.sleep(0.001)
-                finally:
-                    torch.cuda.nvtx.range_pop()
-                if ssd_pressure_batch_sleep_s > 0:
-                    time.sleep(ssd_pressure_batch_sleep_s)
-    finally:
-        torch.cuda.nvtx.range_pop()
-
-    deadline = time.time() + offload_wait_timeout_s
-    torch.cuda.nvtx.range_push("scenario3.pressure.offload_wait_all")
-    try:
-        while len(kvcache_mgr.ongoing_offload_tasks) > 0:
-            torch.cuda.nvtx.range_push("scenario3.pressure.offload_wait_all.try_wait")
-            try:
-                kvcache_mgr.offload_try_wait()
-            finally:
-                torch.cuda.nvtx.range_pop()
-            if len(kvcache_mgr.ongoing_offload_tasks) == 0:
-                break
-            if time.time() > deadline:
-                raise TimeoutError(
-                    f"offload queue not drained within timeout ({offload_wait_timeout_s}s), "
-                    f"pending={len(kvcache_mgr.ongoing_offload_tasks)}"
-                )
-            time.sleep(0.001)
-    finally:
-        torch.cuda.nvtx.range_pop()
-    if ssd_pressure_batch_sleep_s > 0:
-        time.sleep(ssd_pressure_batch_sleep_s)
-
+        torch.cuda.synchronize()
+        # Warmup DISK2H puts those prefixes back on CPU. GPU pages pin the
+        # matching FlexKV CPU blocks, so LRU cannot spill them until GPU
+        # unlock. Re-fill CPU with the same pressure uids (no extra SSD).
+        kvcache_mgr.offload_launch = real_offload_launch
+        kvcache_mgr.evict(
+            torch.tensor(list(dict.fromkeys(warmed_user_ids)), dtype=torch.int64),
+            for_gpu=True,
+        )
+        kvcache_mgr.evict_all(for_gpu=True)
+        print(
+            "[Scenario3 cpu_repressure] "
+            f"pressure_users={ssd_pressure_users} "
+            f"warmed_users={len(set(warmed_user_ids))}",
+            flush=True,
+        )
+        _pressure_fill(
+            pressure_base_user_id,
+            ssd_pressure_users,
+            "scenario3.cpu_repressure",
+        )
+        kvcache_mgr.evict_all(for_gpu=True)
+        torch.cuda.synchronize()
+        kvcache_mgr.offload_launch = _skip_timed_offload
     print("timed run")
-    for iter_idx, user_batch in enumerate(timed_user_batches):
-        user_ids = torch.tensor(user_batch, dtype=torch.int64)
-        kvcache_mgr.evict(user_ids, for_gpu=True)
-
-        batch, user_ids, total_history_lengths = build_request(
-            user_batch,
-            get_timed_history_len(history_len, append_history_len),
-            num_candidates,
-            max_seqlen,
-        )
-
-        # timed run
-        torch.cuda.nvtx.range_push(f"scenario3_timed_run_{iter_idx}")
-        model_predict.forward_with_kvcache(
-            batch,
-            user_ids,
-            total_history_lengths,
-        )
-        torch.cuda.nvtx.range_pop()
-    deadline = time.time() + offload_wait_timeout_s
-    torch.cuda.nvtx.range_push("scenario3.timed.offload_wait_all")
+    ts_start, ts_end = (torch.cuda.Event(enable_timing=True) for _ in range(2))
+    forward_samples = []
+    profile_timed = os.environ.get("NSYS_TIMED_RANGE", "") == "1"
+    if profile_timed:
+        torch.cuda.cudart().cudaProfilerStart()
     try:
-        while len(kvcache_mgr.ongoing_offload_tasks) > 0:
-            torch.cuda.nvtx.range_push("scenario3.timed.offload_wait_all.try_wait")
-            try:
-                kvcache_mgr.offload_try_wait()
-            finally:
-                torch.cuda.nvtx.range_pop()
-            if len(kvcache_mgr.ongoing_offload_tasks) == 0:
-                break
-            if time.time() > deadline:
-                raise TimeoutError(
-                    f"offload queue not drained within timeout ({offload_wait_timeout_s}s), "
-                    f"pending={len(kvcache_mgr.ongoing_offload_tasks)}"
+        for iter_idx, user_batch in enumerate(timed_user_batches):
+            user_ids = torch.tensor(user_batch, dtype=torch.int64)
+            kvcache_mgr.evict(user_ids, for_gpu=True)
+
+            batch, user_ids, total_history_lengths = build_request(
+                user_batch,
+                get_timed_history_len(history_len, append_history_len),
+                num_candidates,
+                max_seqlen,
+            )
+
+            # Wall clock covers the eventfd waits. The CUDA events match
+            # inference_benchmark.py and stay on the forward stream. Neither
+            # includes the post-forward H2DISK sleep.
+            ts_start.record()
+            wall_t0 = time.perf_counter()
+            torch.cuda.nvtx.range_push(f"scenario3_timed_run_{iter_idx}")
+            run_forward_with_kvcache(
+                model_predict,
+                batch,
+                user_ids,
+                total_history_lengths,
+            )
+            torch.cuda.nvtx.range_pop()
+            ts_end.record()
+            torch.cuda.synchronize()
+            forward_samples.append(
+                (
+                    (time.perf_counter() - wall_t0) * 1e3,
+                    ts_start.elapsed_time(ts_end),
                 )
-            time.sleep(0.001)
+            )
     finally:
-        torch.cuda.nvtx.range_pop()
+        if profile_timed:
+            torch.cuda.cudart().cudaProfilerStop()
+        kvcache_mgr.offload_launch = real_offload_launch
+    # Offload is skipped above, so do not sleep for an H2DISK that was not launched.
+    # Warmup DISK2H is repreessured off CPU, so timed samples stay SSD-hit. A
+    # cold first sample is dropped only when nothing was warmed up.
+    if warmup_iters > 0:
+        scored = forward_samples
+    else:
+        scored = forward_samples[1:] if len(forward_samples) > 1 else forward_samples
+    if scored:
+        wall_mean = sum(sample[0] for sample in scored) / len(scored)
+        cuda_mean = sum(sample[1] for sample in scored) / len(scored)
+        print(
+            f"[E2E] scenario=ssd_hit forward_wall_mean_ms={wall_mean:.3f} "
+            f"forward_cuda_mean_ms={cuda_mean:.3f} n={len(scored)}"
+        )
     print(f"[Scenario3] timed run completed, iters={timed_iters}")
+    # N=1 disk completions are logged after the forward returns. Stay alive
+    # so those lines land before KVManager shutdown. This is outside the timer.
+    settle_s = float(os.environ.get("SSD_LOG_SETTLE_S", "0") or 0)
+    if settle_s > 0:
+        print(f"[Scenario3] settle {settle_s:.0f}s for in-flight DISK2H logs", flush=True)
+        time.sleep(settle_s)
+
+
+def run_forward_with_kvcache(model, batch, uids, seq):
+    if not BENCHMARK_CONFIG.skip_prefetch:
+        kvc_mgr = model.dense_module.kvcache
+        index_meta = kvc_mgr.host_kvstorage_manager.build_index_meta(uids, seq)
+        kvc_mgr.prefetch_kvcache(index_meta)
+        gap_ms = random.uniform(*PREFETCH_GAP_MS_RANGE)
+        if gap_ms > 0:
+            time.sleep(gap_ms / 1000.0)
+    return model.forward_with_kvcache(batch, uids, seq)
 
 
 def shutdown_flexkv_client(model_predict) -> None:
@@ -624,7 +653,9 @@ def shutdown_flexkv_client(model_predict) -> None:
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--timed-iters", type=int, default=None)
+    parser.add_argument("--warmup-iters", type=int, default=None)
     parser.add_argument("--batch-size", type=int, default=None)
+    parser.add_argument("--history-len", type=int, default=None)
     parser.add_argument("--append-history-len", type=int, default=None)
     parser.add_argument("--ssd-pressure-users", type=int, default=None)
     parser.add_argument("--ssd-pressure-batch-size", type=int, default=None)
@@ -642,7 +673,26 @@ if __name__ == "__main__":
         help="Measure only onboard by reusing the warmed prefix in timed forwards.",
     )
     parser.add_argument("--disable-cudagraph", action="store_true")
+    parser.add_argument(
+        "--no-prefetch",
+        action="store_true",
+        help="Timed SSD-hit GET reads SSD itself. Skip the DISK2H prefetch.",
+    )
     parser.add_argument("--ablation", type=str, default=None)
+    parser.add_argument(
+        "--layerwise",
+        action="store_true",
+        help="Enable FlexKV layerwise onboard (eventfd wait per original layer).",
+    )
+    parser.add_argument(
+        "--layer-granularity",
+        type=int,
+        default=None,
+        help=(
+            "SSD DISK2H span size N while --layerwise is on. Unset defaults to 1. "
+            "Without --layerwise this flag is ignored."
+        ),
+    )
     args, _ = parser.parse_known_args()
 
     cfg = BENCHMARK_CONFIG
@@ -653,8 +703,12 @@ if __name__ == "__main__":
         cfg = replace(cfg, flexkv_config_path=flexkv_config_path)
     if args.timed_iters is not None:
         cfg = replace(cfg, timed_iters=args.timed_iters)
+    if args.warmup_iters is not None:
+        cfg = replace(cfg, warmup_iters=args.warmup_iters)
     if args.batch_size is not None:
         cfg = replace(cfg, batch_size=args.batch_size)
+    if args.history_len is not None:
+        cfg = replace(cfg, history_len=args.history_len)
     if args.append_history_len is not None:
         cfg = replace(cfg, append_history_len=args.append_history_len)
     if args.ssd_pressure_users is not None:
@@ -665,8 +719,14 @@ if __name__ == "__main__":
         cfg = replace(cfg, ssd_pressure_batch_sleep_s=args.ssd_pressure_batch_sleep_s)
     if args.disable_cudagraph:
         cfg = replace(cfg, disable_cudagraph=True)
+    if args.layerwise:
+        cfg = replace(cfg, flexkv_enable_layerwise=1)
+    if args.layer_granularity is not None:
+        cfg = replace(cfg, flexkv_layer_granularity=args.layer_granularity)
     if args.only_onboard:
         cfg = replace(cfg, only_onboard=True)
+    if args.no_prefetch:
+        cfg = replace(cfg, skip_prefetch=True)
     if args.ablation not in (None, "baseline"):
         raise ValueError(
             "This restored benchmark currently supports only --ablation baseline."
@@ -691,7 +751,8 @@ if __name__ == "__main__":
         f"[Config] history_len={history_len}, append_history_len={cfg.append_history_len}, "
         f"num_candidates={cfg.num_candidates}, batch_size={cfg.batch_size}, "
         f"disable_cudagraph={cfg.disable_cudagraph}, "
-        f"mode={mode}, "
+        f"mode={mode}, skip_prefetch={cfg.skip_prefetch}, "
+        f"prefetch_gap_ms={PREFETCH_GAP_MS_RANGE[0]}-{PREFETCH_GAP_MS_RANGE[1]}, "
         f"scenarios={','.join(sorted(scenarios))}"
     )
     model_predict, page_size, max_seqlen = build_model(cfg, history_len)
@@ -709,7 +770,6 @@ if __name__ == "__main__":
                     warmup_iters=cfg.warmup_iters,
                     timed_iters=cfg.timed_iters,
                     batch_size=cfg.batch_size,
-                    offload_wait_timeout_s=cfg.offload_wait_timeout_s,
                 )
             if "cpu_hit" in scenarios:
                 run_scenario_gpu_miss_host_hit(
@@ -721,7 +781,6 @@ if __name__ == "__main__":
                     warmup_iters=cfg.warmup_iters,
                     timed_iters=cfg.timed_iters,
                     batch_size=cfg.batch_size,
-                    offload_wait_timeout_s=cfg.offload_wait_timeout_s,
                 )
             if "ssd_hit" in scenarios:
                 run_scenario_gpu_cpu_miss_ssd_hit(
@@ -733,10 +792,10 @@ if __name__ == "__main__":
                     page_size=page_size,
                     timed_iters=cfg.timed_iters,
                     batch_size=cfg.batch_size,
-                    offload_wait_timeout_s=cfg.offload_wait_timeout_s,
                     ssd_pressure_users=cfg.ssd_pressure_users,
                     ssd_pressure_batch_size=cfg.ssd_pressure_batch_size,
                     ssd_pressure_batch_sleep_s=cfg.ssd_pressure_batch_sleep_s,
+                    warmup_iters=cfg.warmup_iters,
                 )
     finally:
         shutdown_flexkv_client(model_predict)

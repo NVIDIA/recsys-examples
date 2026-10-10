@@ -304,7 +304,13 @@ class HSTUBlockInference(torch.nn.Module):
             self._hstu_graph[batch_size][num_tokens_padded][0].replay()  # type: ignore
             for idx in range(1, self.config.num_layers + 1):
                 if kv_cache_metadata is not None:
-                    kv_cache_metadata.kv_onload_handle.stream_wait_layer(idx - 1)
+                    handle = kv_cache_metadata.kv_onload_handle
+                    if handle is not None:
+                        if handle.backend == "flexkv":
+                            if handle.is_layerwise:
+                                handle.wait_layer(idx - 1)
+                        else:
+                            handle.stream_wait_layer(idx - 1)
                 self._hstu_graph[batch_size][num_tokens_padded][idx].replay()  # type: ignore
 
             hstu_output = torch.zeros_like(hidden_states[:num_tokens, ...])
