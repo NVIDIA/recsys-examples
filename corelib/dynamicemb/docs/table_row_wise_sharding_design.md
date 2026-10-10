@@ -1101,15 +1101,27 @@ a rank, one with twice the budget it needs and one with none:
 
 Five gigabytes of HBM the old arithmetic did not reserve.
 
-**The grouping used is ours, and is coarser than the real one.** It is the
-sharding type paired with `DynamicEmbTableOptions.get_grouped_key`. The sharding
-type belongs in it because TorchRec splits tables by it into separate
-`EmbeddingSharding`s before `group_tables` runs inside each
-(`embeddingbag.py:267`, `rw_sharding.py:178`), so a row-wise table never fuses
-with a table-row-wise one however alike their options. TorchRec groups on more
-besides -- `data_type`, `pooling`, a dimension bucket, the fused params
-(`embedding_sharding.py:609`), with `DynamicEmbTableOptions`'s own key riding
-inside those. Reproducing that here would mean reimplementing
+**The grouping used is ours, and is coarser than the real one.** One function,
+`fusion_key`, answers what two tables must agree on, and both the placer and
+`per_rank_storage` bucket by it, so they cannot disagree about what fuses:
+
+| In the key | Why |
+|---|---|
+| sharding type | TorchRec splits on it before grouping runs (`embeddingbag.py:267`, `rw_sharding.py:178`), so a row-wise table never fuses with a table-row-wise one however alike their options |
+| the options | they hash on `get_grouped_key`, which is DynamicEmb's half |
+| optimizer | its state is part of a row, and TorchRec keys on it through the fused params |
+| data type | TorchRec keys on it; `get_grouped_key` does not |
+| pooling | likewise, and not DynamicEmb's to know -- the planner passes it in |
+
+Not in it: TorchRec's dimension bucket, and the rest of the fused params. Those
+need `_get_grouping_fused_params`, the bucketer and `_prefetch_and_cached` --
+upstream internals that would have to be tracked as they change.
+
+An earlier version of this section lumped all five of those together as
+impractical. Three of them were not: the optimizer was already in hand, the
+data type is on the options, and the pooling only needed passing through. Two
+tables differing in any of them were being pooled, which over-states the
+group's HBM and can refuse a node -- or a plan -- the runtime would have held. Reproducing that here would mean reimplementing
 `_get_grouping_fused_params`, the dimension bucketer and `_prefetch_and_cached`,
 and then owning them as TorchRec changes them -- the kind of fork §4.9 exists to
 avoid. So `per_rank_storage` buckets on `DynamicEmbTableOptions.get_grouped_key`

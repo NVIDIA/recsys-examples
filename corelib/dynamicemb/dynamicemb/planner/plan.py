@@ -80,6 +80,7 @@ __all__ = [
     "per_rank_storage",
     "topology_minus",
     "make_storage",
+    "fusion_key",
     "module_without_tables",
     "storage_ssd",
     "table_fanout",
@@ -148,10 +149,53 @@ def optimizer_types(
     return per_table
 
 
+def fusion_key(
+    sharding_type: str,
+    options: "object",
+    optimizer_type: Optional[OptimType] = None,
+    pooling: "object" = None,
+) -> Tuple:
+    """What two tables must agree on before they can be costed as one.
+
+    TorchRec fuses tables within a sharding that match on its grouping key
+    (``embedding_sharding.py:609``): data type, pooling, a dimension bucket,
+    and the fused params -- inside which ``DynamicEmbTableOptions`` rides, with
+    its own key, and the optimizer beside it. This reproduces the part of that
+    we can know without reaching into TorchRec's internals.
+
+    What is here: the **sharding type**, since tables are split by it into
+    separate ``EmbeddingSharding``s before grouping runs inside each
+    (``embeddingbag.py:267``, ``rw_sharding.py:178``); the **options**, which
+    hash on their own grouping key; the **optimizer**, since its state is part
+    of a row and TorchRec keys on it through the fused params; the **data
+    type**, which ``DynamicEmbTableOptions.get_grouped_key`` leaves out; and
+    the **pooling**, likewise not DynamicEmb's to know but cheap to pass.
+
+    What is not: TorchRec's dimension bucket, and the rest of the fused params.
+    Those need `_get_grouping_fused_params`, the bucketer and
+    `_prefetch_and_cached` -- upstream internals that would have to be tracked
+    as they change, which §4.9 is about not doing.
+
+    So this stays **coarser** than the truth, and coarser is the direction that
+    errs safely: merging tables the runtime keeps apart moves
+    ``min(sum total, sum budget)`` up, over-stating HBM. A plan can be refused
+    that would have fit; none is accepted that will not. Every attribute added
+    here narrows that gap.
+    """
+    return (
+        sharding_type,
+        options,
+        optimizer_type,
+        getattr(options, "embedding_dtype", None),
+        pooling,
+    )
+
+
 def per_rank_storage(
     parameter_shardings: Dict[str, ParameterSharding],
     optimizer_types: Dict[str, Optional[OptimType]],
     world_size: int,
+    poolings: Optional[Dict[str, object]] = None,
 ) -> List[Storage]:
     """What the DynamicEmb tables take from each rank, as one Storage per rank.
 
@@ -225,6 +269,12 @@ def per_rank_storage(
         # the table's fan-out, so every shard of a table weighs the same and
         # only the set of ranks differs.
         member = (options, optimizer_types.get(name))
+        key = fusion_key(
+            parameter_sharding.sharding_type,
+            options,
+            optimizer_types.get(name),
+            (poolings or {}).get(name),
+        )
         for shard in spec.shards:
             rank = shard_rank(shard)
             if not 0 <= rank < world_size:
@@ -232,9 +282,7 @@ def per_rank_storage(
                     f"Table {name!r} places a shard on rank {rank}, which is "
                     f"outside the world of {world_size}."
                 )
-            per_rank_groups[rank][(parameter_sharding.sharding_type, options)].append(
-                member
-            )
+            per_rank_groups[rank][key].append(member)
 
     for rank, groups in enumerate(per_rank_groups):
         for members in groups.values():

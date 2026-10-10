@@ -21,7 +21,9 @@ declared sizes, which is why it is a component of its own.
 
 import pytest
 import torch
+from fbgemm_gpu.split_embedding_configs import EmbOptimType as OptimType
 from torchrec.distributed.planner.types import Topology
+from torchrec.modules.embedding_configs import PoolingType
 
 from dynamicemb.planner.plan import make_storage
 
@@ -231,3 +233,54 @@ def test_tables_that_do_not_fuse_are_not_pooled():
 
     with pytest.raises(ValueError, match="No node can hold"):
         BalancedHostPlacer().place([generous, needy], topo, _nothing_spent())
+
+
+def test_a_different_optimizer_is_a_different_group():
+    """TorchRec keys on the optimizer through the fused params, so two tables
+    that differ there never share a TBE and never pool their budgets."""
+    topo = _topology(hbm=80 * GB, ddr=4 * GB)
+    generous = _table("generous", 4, budget_gb=20)
+    needy = _table("needy", 16, budget_gb=2)
+    needy = TableToPlace(
+        name=needy.name,
+        options=needy.options,
+        optimizer_type=OptimType.ADAM,  # generous has None
+        pooling=needy.pooling,
+    )
+    assert generous.fuses_with != needy.fuses_with
+
+    with pytest.raises(ValueError, match="No node can hold"):
+        BalancedHostPlacer().place([generous, needy], topo, _nothing_spent())
+
+
+def test_a_different_pooling_is_a_different_group():
+    """Pooling is TorchRec's to group on and DynamicEmbTableOptions does not
+    carry it, so it has to be passed in for the two not to be pooled."""
+    topo = _topology(hbm=80 * GB, ddr=4 * GB)
+    generous = _table("generous", 4, budget_gb=20)
+    needy = _table("needy", 16, budget_gb=2)
+    needy = TableToPlace(
+        name=needy.name,
+        options=needy.options,
+        pooling=PoolingType.SUM,  # generous has None
+    )
+    assert generous.fuses_with != needy.fuses_with
+
+    with pytest.raises(ValueError, match="No node can hold"):
+        BalancedHostPlacer().place([generous, needy], topo, _nothing_spent())
+
+
+def test_a_different_dtype_is_a_different_group():
+    """data_type is TorchRec's grouping key and not part of
+    DynamicEmbTableOptions', so it is read off the options separately."""
+    generous = _table("generous", 4, budget_gb=20)
+    needy = _table("needy", 16, budget_gb=2)
+    halved = DynamicEmbTableOptions(
+        max_capacity=needy.options.max_capacity,
+        dim=DIM,
+        embedding_dtype=torch.float16,
+        local_hbm_for_values=2 * GB,
+    )
+    assert halved == needy.options, "the DynamicEmb key alone does not separate them"
+    needy = TableToPlace(name="needy", options=halved)
+    assert generous.fuses_with != needy.fuses_with, "but the fusion key does"

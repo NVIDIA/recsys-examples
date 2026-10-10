@@ -34,13 +34,14 @@ from typing import Dict, Hashable, List, Optional, Tuple
 
 from fbgemm_gpu.split_embedding_configs import EmbOptimType as OptimType
 from torchrec.distributed.planner.types import Storage, Topology
+from torchrec.distributed.types import ShardingType
 
 from ..dynamicemb_config import (
     DynamicEmbTableOptions,
     get_group_value_bytes_by_tier,
 )
 
-from .plan import make_storage, storage_ssd
+from .plan import fusion_key, make_storage, storage_ssd
 
 __all__ = ["TableToPlace", "HostPlacer", "BalancedHostPlacer"]
 
@@ -64,6 +65,10 @@ class TableToPlace:
     optimizer_type : Optional[OptimType]
         What it trains with, since optimizer state is part of a row. ``None``
         counts the rows without it, a floor rather than a guess.
+    pooling : object
+        The table's ``PoolingType``. Not DynamicEmb's to know -- it is on the
+        TorchRec config -- but TorchRec groups on it, so two tables that differ
+        here do not pool their budgets.
     pinned : Optional[int]
         The node the caller named through ``DynamicEmbTableOptions.host_index``.
         A placer must honour it, and must still check that it fits.
@@ -72,7 +77,24 @@ class TableToPlace:
     name: str
     options: "DynamicEmbTableOptions"
     optimizer_type: Optional[OptimType] = None
+    pooling: object = None
     pinned: Optional[int] = None
+
+    @property
+    def fuses_with(self) -> Tuple:
+        """What this table must match for its budget to be pooled with another's.
+
+        :func:`~dynamicemb.planner.plan.fusion_key`, so the placer and
+        `per_rank_storage` cannot disagree about which tables share a TBE --
+        and a table-row-wise table is always that, since a pin or a placement
+        decides only the node.
+        """
+        return fusion_key(
+            ShardingType.TABLE_ROW_WISE.value,
+            self.options,
+            self.optimizer_type,
+            self.pooling,
+        )
 
     @property
     def member(self) -> Tuple["DynamicEmbTableOptions", Optional[OptimType]]:
@@ -191,13 +213,13 @@ class BalancedHostPlacer(HostPlacer):
             then goes to them.
             """
             before = cost_of(node)
-            held[node][table.options].append(table.member)
+            held[node][table.fuses_with].append(table.member)
             after = cost_of(node)
-            held[node][table.options].pop()
+            held[node][table.fuses_with].pop()
             return after - before
 
         def give(node: int, table: TableToPlace) -> None:
-            held[node][table.options].append(table.member)
+            held[node][table.fuses_with].append(table.member)
 
         def spare(node: int) -> Storage:
             left = room[node] - cost_of(node)

@@ -41,6 +41,7 @@ from torchrec.modules.embedding_configs import BaseEmbeddingConfig, data_type_to
 
 from .placement import BalancedHostPlacer, HostPlacer, TableToPlace
 from .plan import (
+    fusion_key,
     make_storage,
     module_without_tables,
     optimizer_types,
@@ -324,6 +325,7 @@ class DynamicEmbeddingShardingPlanner(EmbeddingShardingPlanner):
         all_constraints: Dict[str, DynamicEmbParameterConstraints] = constraints or {}
         self._dyn_emb_plan: Dict[str, DynamicEmbParameterSharding] = {}
         self._planned_dynamicemb = False
+        self._table_poolings: Dict[str, object] = {}
         self._host_placer: HostPlacer = host_placer or BalancedHostPlacer()
 
         super().__init__(
@@ -430,6 +432,12 @@ class DynamicEmbeddingShardingPlanner(EmbeddingShardingPlanner):
                 dynamicemb_options=opts,
             )
 
+        # What TorchRec groups on that DynamicEmbTableOptions does not carry.
+        # Recorded here because `_plan_torchrec` costs the plan later and has
+        # only the ParameterShardings, which do not mention pooling.
+        self._table_poolings = {
+            name: config.pooling for name, config in configs.items()
+        }
         self._planned_dynamicemb = True
 
     def _choose_hosts(
@@ -479,9 +487,13 @@ class DynamicEmbeddingShardingPlanner(EmbeddingShardingPlanner):
         committed = [make_storage() for _ in range(world_size)]
         row_wise_groups: Dict[object, list] = defaultdict(list)
         for name in by_type.get(ShardingType.ROW_WISE.value, []):
-            row_wise_groups[self._constraints[name].dynamicemb_options].append(
-                member(name)
+            key = fusion_key(
+                ShardingType.ROW_WISE.value,
+                self._constraints[name].dynamicemb_options,
+                optimizers.get(name),
+                configs[name].pooling,
             )
+            row_wise_groups[key].append(member(name))
         for members in row_wise_groups.values():
             hbm, ddr = get_group_value_bytes_by_tier(members)
             cost = make_storage(hbm=hbm, ddr=ddr)
@@ -496,6 +508,7 @@ class DynamicEmbeddingShardingPlanner(EmbeddingShardingPlanner):
                     name=name,
                     options=self._constraints[name].dynamicemb_options,
                     optimizer_type=optimizers.get(name),
+                    pooling=configs[name].pooling,
                     pinned=self._constraints[name].dynamicemb_options.host_index,
                 )
                 for name in sorted(trw)
@@ -606,6 +619,7 @@ class DynamicEmbeddingShardingPlanner(EmbeddingShardingPlanner):
             self._dyn_emb_plan,
             optimizer_types(module, sharders),
             len(self._topology.devices),
+            self._table_poolings,
         )
         whole_topology = self._topology
         try:
