@@ -66,7 +66,10 @@ def _placement_rank(placement) -> int:
 def _shard_ranks_of(tables: List[ShardedEmbeddingTable]) -> Optional[List[int]]:
     """The ranks holding these tables in shard order, or None without shard metadata."""
     layouts = {
-        tuple(_placement_rank(md.placement) for md in table.global_metadata.shards_metadata)
+        tuple(
+            _placement_rank(md.placement)
+            for md in table.global_metadata.shards_metadata
+        )
         for table in tables
         if table.global_metadata is not None
     }
