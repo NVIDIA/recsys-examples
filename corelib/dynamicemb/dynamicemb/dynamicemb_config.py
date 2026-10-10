@@ -993,6 +993,72 @@ def get_sharded_table_capacity(
     return int(num_buckets * effective_bucket)
 
 
+def get_group_value_bytes_by_tier(
+    members: "List[Tuple[DynamicEmbTableOptions, Optional[OptimType]]]",
+) -> Tuple[int, int]:
+    """What one rank spends on a set of tables the runtime will fuse, as ``(hbm, host)``.
+
+    The runtime decides per **grouped module**, not per table:
+    ``BatchedDynamicEmbeddingTablesV2._create_cache_storage`` sums both the
+    tables' bytes and their ``local_hbm_for_values`` and takes one
+    HBM-or-host decision for the sum. That is not the same as deciding for each
+    table and adding up, because a table whose budget exceeds its size lends the
+    remainder to its groupmates: ``sum(min(total, budget))`` is at most
+    ``min(sum total, sum budget)``, so counting per table **under-states HBM**
+    and over-states host. Under-stating HBM is the unsafe direction -- the
+    planner would believe there is room it will not find.
+
+    ``caching`` and ``external_storage`` are both part of the grouping key
+    (``DynamicEmbTableOptions.get_grouped_key``), so every member of a real
+    group agrees on them and reading them off the first is exact.
+
+    Rows that fit the HBM budget stay there and the rest go to the host; under
+    ``caching`` the HBM is a cache in front of a host tier holding every row
+    rather than a disjoint partition, so the host figure is the whole thing. An
+    external store takes that backing tier off this box, which is honoured in
+    the two layouts that have one to move -- CACHING_PS and HOST_PS.
+    ``HybridStorage`` ignores it and warns, so its host tier is local and counts.
+
+    An ``optimizer_type`` of ``None`` counts a table's rows without optimizer
+    state -- the honest answer when the caller cannot tell which optimizer it
+    trains with, and a floor rather than a guess. A table whose options have not
+    been through ``_prepare_dynemb_table_options`` has no size to compute, so it
+    contributes its HBM budget and nothing else.
+    """
+    if not members:
+        return 0, 0
+
+    total = 0
+    hbm_budget = 0
+    for options, optimizer_type in members:
+        hbm_budget += options.local_hbm_for_values
+        dim = options.dim
+        dtype = options.embedding_dtype
+        if not dim or dtype is None or not options.max_capacity:
+            # Nothing to size from: count it as filling its own budget, so a
+            # lone unsized table still reports (budget, 0).
+            total += options.local_hbm_for_values
+            continue
+        state_dim = (
+            get_optimizer_state_dim(optimizer_type, dim, dtype)
+            if optimizer_type is not None
+            else 0
+        )
+        total += options.max_capacity * DTYPE_NUM_BYTES[dtype] * (dim + state_dim)
+
+    first = members[0][0]
+    caching = first.caching
+    external = first.external_storage is not None
+
+    if caching:
+        return hbm_budget, 0 if external else total
+    if total > hbm_budget:
+        if external and hbm_budget <= 0:
+            return 0, 0
+        return hbm_budget, total - hbm_budget
+    return total, 0
+
+
 def get_local_value_bytes_by_tier(
     options: "DynamicEmbTableOptions",
     optimizer_type: Optional[OptimType],
@@ -1004,56 +1070,12 @@ def get_local_value_bytes_by_tier(
     is not the same question: ``local_hbm_for_values`` is a budget, and a table
     spends the difference on the host tier.
 
-    The split follows the branch ``BatchedDynamicEmbeddingTablesV2`` takes when
-    it builds the storage. Rows that fit the HBM budget stay there; the rest go
-    to the host. Under ``caching`` the HBM is a cache in front of a host tier
-    that keeps every row, rather than a disjoint partition of them, so the host
-    figure is the whole table and not the remainder.
-
-    ``optimizer_type`` of ``None`` counts the rows without optimizer state --
-    the honest answer when the caller cannot tell which optimizer a table
-    trains with, and a floor rather than a guess.
-
-    Returns ``(hbm_budget, 0)`` for a table whose options have not been through
-    ``_prepare_dynemb_table_options``: ``max_capacity``, ``dim`` and
-    ``embedding_dtype`` are settled there, and without them there is nothing to
-    size from.
-
-    **A table is modelled on its own, and the runtime decides per grouped
-    module.** ``BatchedDynamicEmbeddingTablesV2`` sums `total` and
-    ``local_hbm_for_values`` across the tables it was grouped with, takes one
-    HBM-or-host decision for all of them, and turns caching on for the whole
-    group if *any* member asked for it. So a mixed group is under-counted here,
-    and a table that fits on its own can still be spilled because its group did
-    not. The grouping does not exist yet when this is called -- ``group_tables``
-    runs after planning -- so this cannot be more than a per-table estimate.
+    **A table on its own is a group of one.** The runtime fuses tables and
+    decides for the group, so this is only exact for a table that ends up alone;
+    :func:`get_group_value_bytes_by_tier` is the one to call when the caller
+    knows which tables travel together.
     """
-    hbm_budget = options.local_hbm_for_values
-    dim = options.dim
-    dtype = options.embedding_dtype
-    if not dim or dtype is None or not options.max_capacity:
-        return hbm_budget, 0
-
-    state_dim = (
-        get_optimizer_state_dim(optimizer_type, dim, dtype)
-        if optimizer_type is not None
-        else 0
-    )
-    total = options.max_capacity * DTYPE_NUM_BYTES[dtype] * (dim + state_dim)
-
-    # An external store takes the backing tier off this box, so it costs the
-    # rank no host memory. It is honoured in exactly the two layouts that have
-    # a backing tier to move -- CACHING_PS and HOST_PS. HybridStorage ignores
-    # it and warns, so the host tier there is local and still counts.
-    external = options.external_storage is not None
-
-    if options.caching:
-        return hbm_budget, 0 if external else total
-    if total > hbm_budget:
-        if external and hbm_budget <= 0:
-            return 0, 0
-        return hbm_budget, total - hbm_budget
-    return total, 0
+    return get_group_value_bytes_by_tier([(options, optimizer_type)])
 
 
 def get_table_value_bytes(

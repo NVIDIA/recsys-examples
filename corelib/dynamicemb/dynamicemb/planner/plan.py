@@ -30,7 +30,8 @@ error messages use (``planner/planners.py:1138``, ``planner/stats.py:1109``).
 """
 
 import copy
-from typing import Dict, List, Optional, Set
+from collections import defaultdict
+from typing import Dict, List, Optional, Set, Tuple
 
 from fbgemm_gpu.split_embedding_configs import EmbOptimType as OptimType
 from torch import nn
@@ -45,7 +46,7 @@ from torchrec.distributed.types import (
     ShardMetadata,
 )
 
-from ..dynamicemb_config import get_local_value_bytes_by_tier
+from ..dynamicemb_config import get_group_value_bytes_by_tier
 
 _STORAGE_HAS_SSD = "ssd" in Storage.__dataclass_fields__
 
@@ -55,6 +56,7 @@ def make_storage(hbm: int = 0, ddr: int = 0, ssd: int = 0) -> Storage:
     if _STORAGE_HAS_SSD:
         return Storage(hbm=hbm, ddr=ddr, ssd=ssd)
     return Storage(hbm=hbm, ddr=ddr)
+
 
 __all__ = [
     "optimizer_types",
@@ -145,11 +147,40 @@ def per_rank_storage(
     is handed to the runtime are the same decision read twice, not the same
     arithmetic done twice.
 
+    **Tables are costed in groups, because the runtime fuses them.** A group's
+    HBM budget is the sum of its members', spent on the sum of their sizes, so a
+    table whose budget exceeds its size lends the remainder to its groupmates.
+    Costing each table alone gives ``sum(min(total, budget))``, which is at most
+    ``min(sum total, sum budget)`` -- it under-states HBM, and that is the
+    direction that lets a plan through which the machine will not hold.
+
+    The grouping used here is ``DynamicEmbTableOptions``'s own
+    (:meth:`~dynamicemb.dynamicemb_config.DynamicEmbTableOptions.get_grouped_key`),
+    which is **coarser** than the runtime's: TorchRec groups on that *and* on
+    data type, pooling, a dimension bucket and more
+    (``embedding_sharding.py:609``). Reproducing that exactly would mean
+    reimplementing `_get_grouping_fused_params`, the dimension bucketer and
+    `_prefetch_and_cached` here, and then owning them as TorchRec changes them
+    -- the kind of fork §4.9 exists to avoid.
+
+    Coarser is the safe inexactness. Merging tables the runtime would keep apart
+    only moves ``min(sum total, sum budget)`` up, so this over-states HBM rather
+    than under-stating it: a plan may be refused that would have fit, and none
+    is accepted that will not.
+
     ``optimizer_types`` maps table name -> ``OptimType``; a table missing from it
     is counted without optimizer state, which is a floor rather than a guess (see
-    :func:`~dynamicemb.dynamicemb_config.get_local_value_bytes_by_tier`).
+    :func:`~dynamicemb.dynamicemb_config.get_group_value_bytes_by_tier`).
     """
     totals = [make_storage() for _ in range(world_size)]
+
+    # rank -> the tables that rank holds, bucketed by what the runtime fuses on.
+    # A dict keyed by the options themselves: DynamicEmbTableOptions hashes and
+    # compares on its grouping key, so two tables land together exactly when
+    # they would be fused.
+    per_rank_groups: List[Dict[object, List[Tuple[object, Optional[OptimType]]]]] = [
+        defaultdict(list) for _ in range(world_size)
+    ]
 
     for name, parameter_sharding in parameter_shardings.items():
         options = getattr(parameter_sharding, "dynamicemb_options", None)
@@ -166,13 +197,10 @@ def per_rank_storage(
                 "hold it is unknown."
             )
 
-        # get_local_value_bytes_by_tier answers for *one* rank's share, which is
-        # what a shard is. Options carry max_capacity and local_hbm_for_values
-        # already divided by the table's fan-out, so every shard of a table
-        # weighs the same and only the set of ranks differs.
-        hbm, ddr = get_local_value_bytes_by_tier(options, optimizer_types.get(name))
-        share = make_storage(hbm=hbm, ddr=ddr)
-
+        # Options carry max_capacity and local_hbm_for_values already divided by
+        # the table's fan-out, so every shard of a table weighs the same and
+        # only the set of ranks differs.
+        member = (options, optimizer_types.get(name))
         for shard in spec.shards:
             rank = shard_rank(shard)
             if not 0 <= rank < world_size:
@@ -180,7 +208,12 @@ def per_rank_storage(
                     f"Table {name!r} places a shard on rank {rank}, which is "
                     f"outside the world of {world_size}."
                 )
-            totals[rank] += share
+            per_rank_groups[rank][options].append(member)
+
+    for rank, groups in enumerate(per_rank_groups):
+        for members in groups.values():
+            hbm, ddr = get_group_value_bytes_by_tier(members)
+            totals[rank] += make_storage(hbm=hbm, ddr=ddr)
 
     return totals
 

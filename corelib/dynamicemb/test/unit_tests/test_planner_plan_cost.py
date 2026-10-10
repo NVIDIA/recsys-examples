@@ -36,7 +36,11 @@ from torchrec.distributed.types import (
     ShardMetadata,
 )
 
-from dynamicemb.dynamicemb_config import DynamicEmbTableOptions
+from dynamicemb.dynamicemb_config import (
+    DynamicEmbTableOptions,
+    get_group_value_bytes_by_tier,
+    get_local_value_bytes_by_tier,
+)
 from torchrec.modules.embedding_configs import EmbeddingBagConfig
 
 from dynamicemb.planner.plan import (
@@ -357,3 +361,79 @@ def test_host_index_on_a_row_wise_table_still_reaches_the_refusal():
     refusal below into a silent correction."""
     with pytest.raises(ValueError, match="on every rank of every node"):
         table_layout(RW, 0, WORLD, LOCAL)
+
+
+# --- grouped tier accounting ------------------------------------------------
+
+
+def test_a_spare_budget_is_lent_to_the_group():
+    """The runtime sums both sides and decides once, so a table whose budget
+    exceeds its size lends the remainder. Costing each alone under-states HBM,
+    and that is the direction that lets through a plan the machine will not
+    hold."""
+    rows_bytes = ROWS * DIM * 4
+    small = _options(hbm_budget=2 * rows_bytes)  # needs 1x, allowed 2x
+    large = _options(rows=4 * ROWS, hbm_budget=0)  # needs 4x, allowed none
+
+    alone = [get_group_value_bytes_by_tier([(o, None)]) for o in (small, large)]
+    per_table_hbm = sum(h for h, _ in alone)
+    per_table_ddr = sum(d for _, d in alone)
+
+    grouped_hbm, grouped_ddr = get_group_value_bytes_by_tier(
+        [(small, None), (large, None)]
+    )
+
+    assert per_table_hbm < grouped_hbm, "per-table must under-state HBM here"
+    assert per_table_ddr > grouped_ddr
+    # The group spends every byte of budget it has, on the total it has.
+    assert grouped_hbm == 2 * rows_bytes
+    assert grouped_ddr == 5 * rows_bytes - 2 * rows_bytes
+
+
+def test_a_group_of_one_is_the_single_table_answer():
+    o = _options(hbm_budget=ROWS * DIM * 4 // 2)
+    assert get_group_value_bytes_by_tier([(o, None)]) == get_local_value_bytes_by_tier(
+        o, None
+    )
+
+
+def test_an_unsized_table_reports_its_budget():
+    """No dim or capacity means nothing to size from, so it fills its own
+    budget rather than counting as free."""
+    bare = DynamicEmbTableOptions(local_hbm_for_values=7)
+    assert get_group_value_bytes_by_tier([(bare, None)]) == (7, 0)
+
+
+def test_per_rank_storage_groups_what_shares_a_rank():
+    """Two tables with the same grouping key on the same ranks are one group,
+    so the spare budget of one covers the other."""
+    rows_bytes = ROWS * DIM * 4
+    small = _options(hbm_budget=2 * rows_bytes)
+    large = _options(rows=4 * ROWS, hbm_budget=0)
+
+    def sharding(options):
+        ranks = list(range(WORLD_SIZE))
+        return DynamicEmbParameterSharding(
+            sharding_type=ShardingType.ROW_WISE.value,
+            compute_kernel="customized_kernel",
+            ranks=ranks,
+            sharding_spec=EnumerableShardingSpec(
+                [
+                    ShardMetadata(
+                        shard_sizes=[options.max_capacity, DIM],
+                        shard_offsets=[options.max_capacity * i, 0],
+                        placement=f"rank:{r}/cuda:{r % LOCAL_SIZE}",
+                    )
+                    for i, r in enumerate(ranks)
+                ]
+            ),
+            dynamicemb_options=options,
+        )
+
+    spent = per_rank_storage(
+        {"small": sharding(small), "large": sharding(large)},
+        optimizer_types={"small": None, "large": None},
+        world_size=WORLD_SIZE,
+    )
+    grouped = get_group_value_bytes_by_tier([(small, None), (large, None)])
+    assert all(s == make_storage(hbm=grouped[0], ddr=grouped[1]) for s in spent)

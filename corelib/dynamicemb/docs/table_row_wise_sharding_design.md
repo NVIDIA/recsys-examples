@@ -478,11 +478,19 @@ reason to defer automatic placement -- it is the opposite.
   hand it a machine with nothing left on the low-numbered ones.
 
 Its inputs are prepared by `_choose_hosts`: what each table costs one rank
-(`get_local_value_bytes_by_tier`, so optimizer state is in it), and what the
+(`get_group_value_bytes_by_tier`, so optimizer state is in it), and what the
 **row-wise** DynamicEmb tables have already taken from every rank. Those shift
 no choice between nodes -- they are on all of them -- but they decide whether a
 TRW table still fits, so the placer is fitting into the room that will actually
-be there.
+be there, and they are costed in groups because they are all placed already.
+
+A table-row-wise table is costed on its own there, where `per_rank_storage`
+costs the finished plan in groups (§7.2). That is not an oversight: the placer
+is deciding one table at a time and does not yet know what will share a node
+with it, which is the thing being decided. It is a heuristic input, not the
+budget -- whatever it chooses, `per_rank_storage` re-costs the result and
+`topology_minus` subtracts that, so an optimistic placement surfaces as a
+`PlannerError` rather than as a plan that does not fit.
 
 It must be deterministic: it runs on every rank, and two ranks that disagreed
 would shard one table onto two nodes. Ties break on the table name, then the
@@ -1052,6 +1060,55 @@ most of the suite builds the kernel directly and cannot observe either of the
 two things table-row-wise changes -- the fan-out, and which ranks hold a table.
 Parametrizing it would mostly re-run code that does not know what sharding it is
 under, and would still miss §8.5's planner defect, which no forward test finds.
+
+---
+
+### 7.2 Memory is costed per group, not per table
+
+The runtime decides the HBM-or-host split for a **grouped module**:
+`BatchedDynamicEmbeddingTablesV2._create_cache_storage` sums both the tables'
+bytes and their `local_hbm_for_values` and takes one decision for the sum. So a
+table whose budget exceeds its size lends the remainder to its groupmates.
+
+Costing each table alone and adding up gives `sum(min(total, budget))`, which is
+at most `min(sum total, sum budget)` -- never more. The error therefore has a
+fixed sign: **HBM under-stated, host over-stated**. Over-stating host is
+conservative and only refuses plans that would have fit. Under-stating HBM is
+the other kind: the planner believes there is room it will not find, and the
+plan is approved and then does not fit. Checked over random groups, the
+inequality never goes the other way.
+
+`get_group_value_bytes_by_tier` costs a set of tables, and `per_rank_storage`
+buckets a rank's tables before calling it. **A worked case**, two tables sharing
+a rank, one with twice the budget it needs and one with none:
+
+| | HBM | host |
+|---|---|---|
+| per table | 6.0 GB | 19.0 GB |
+| grouped (what the runtime does) | 11.0 GB | 14.0 GB |
+
+Five gigabytes of HBM the old arithmetic did not reserve.
+
+**The grouping used is ours, and is coarser than the real one.** TorchRec groups
+on `data_type`, `pooling`, a dimension bucket, the fused params and more
+(`embedding_sharding.py:609`), with `DynamicEmbTableOptions`'s own key riding
+inside the fused params. Reproducing that here would mean reimplementing
+`_get_grouping_fused_params`, the dimension bucketer and `_prefetch_and_cached`,
+and then owning them as TorchRec changes them -- the kind of fork §4.9 exists to
+avoid. So `per_rank_storage` buckets on `DynamicEmbTableOptions.get_grouped_key`
+alone.
+
+Coarser is the safe inexactness, for the same reason: merging tables the runtime
+would keep apart only moves `min(sum total, sum budget)` up. The estimate can
+exceed the truth and refuse a plan that would have fit; it cannot fall below it.
+
+**Two things this is not.** `caching` and `external_storage` are *in* the
+grouping key, so a group where one member asks for caching and another does not
+cannot form -- `any(option.caching ...)` in the runtime is `all` of them, and a
+"mixed caching group" is not a reachable state. And an external store is
+accounted for: it zeroes the host tier in the two layouts that have a backing
+tier to move, CACHING_PS and HOST_PS. `HybridStorage` ignores `external_storage`
+and warns, so its host tier is local and is counted, which is correct.
 
 ---
 

@@ -16,6 +16,7 @@
 import copy
 import math
 import warnings
+from collections import defaultdict
 from dataclasses import dataclass, field, fields
 from typing import Any, Dict, List, Optional, Set, Tuple
 
@@ -51,7 +52,7 @@ from .plan import (
 from ..dynamicemb_config import (
     DEFAULT_INDEX_TYPE,
     DynamicEmbTableOptions,
-    get_local_value_bytes_by_tier,
+    get_group_value_bytes_by_tier,
     _sharded_table_bucket_layout,
     align_to_table_size,
     complete_initializer_args,
@@ -465,17 +466,37 @@ class DynamicEmbeddingShardingPlanner(EmbeddingShardingPlanner):
         if not trw:
             return {}
 
+        def member(name: str):
+            return (self._constraints[name].dynamicemb_options, optimizers.get(name))
+
         def rank_cost(name: str) -> Storage:
-            hbm, ddr = get_local_value_bytes_by_tier(
-                self._constraints[name].dynamicemb_options, optimizers.get(name)
-            )
+            """What one table costs a rank that holds it.
+
+            Per table, where the budget arithmetic in `per_rank_storage` is per
+            group, because the placer is deciding one table at a time and does
+            not yet know what will share a node with it -- two table-row-wise
+            tables are fused only if they land together, which is the thing
+            being decided. It is a heuristic input, not the budget: whatever the
+            placer chooses, `per_rank_storage` costs the finished plan in groups
+            and `topology_minus` subtracts that, so an optimistic placement
+            surfaces as a PlannerError rather than as a plan that does not fit.
+            """
+            hbm, ddr = get_group_value_bytes_by_tier([member(name)])
             return make_storage(hbm=hbm, ddr=ddr)
 
         # The row-wise tables are on every rank, so they shift no choice between
         # nodes -- but they do decide whether a table-row-wise one still fits.
+        # Costed in groups: they are all placed already, so what the runtime
+        # will fuse is known, and a group's budget is shared across its members.
         committed = [make_storage() for _ in range(world_size)]
+        row_wise_groups: Dict[object, list] = defaultdict(list)
         for name in by_type.get(ShardingType.ROW_WISE.value, []):
-            cost = rank_cost(name)
+            row_wise_groups[self._constraints[name].dynamicemb_options].append(
+                member(name)
+            )
+        for members in row_wise_groups.values():
+            hbm, ddr = get_group_value_bytes_by_tier(members)
+            cost = make_storage(hbm=hbm, ddr=ddr)
             committed = [spent + cost for spent in committed]
 
         return self._host_placer.place(
