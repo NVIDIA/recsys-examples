@@ -9,9 +9,10 @@ set -e
 # off-by-one between the two would show.
 
 # Which half to run: "fwd_bwd", "load_dump", or empty for both. The central
-# runner (test/unit_test.sh) passes its own group through, so this script is
-# registered in both groups and each run covers the half it is about.
-GROUP="${1:-}"
+# runner (test/unit_test.sh) sets DYNAMICEMB_TEST_GROUP, so this script is
+# registered in both groups and each run covers the half it is about. A
+# positional works too, for running one half by hand.
+GROUP="${1:-${DYNAMICEMB_TEST_GROUP:-}}"
 want() { [ -z "$GROUP" ] || [ "$GROUP" = "$1" ]; }
 
 run() {  # run <gpus> <ranks-per-node> <args...>

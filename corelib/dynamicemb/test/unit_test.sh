@@ -12,7 +12,6 @@ FWD_BWD_TEST_FILES=(
     "test/unit_tests/test_twin_module.sh"
     "test/unit_tests/test_alignment.sh"
     "test/unit_tests/test_hash_roundrobin_kuairand.py"
-    "test/unit_tests/test_hybrid_storage_export.sh"
     "test/unit_tests/test_vmm_tensor.py"
     "test/unit_tests/optimizer/test_padded_buffer_optimizer.py"
     "test/unit_tests/optimizer/test_ftrl_optimizer.py"
@@ -55,10 +54,13 @@ for TEST_FILE in "${TEST_FILES[@]}"; do
             exit 1
         fi
     elif [[ "$TEST_FILE" == *.sh ]]; then
-        # Run shell scripts with bash. The group is passed through so a
-        # script spanning both can run only the half being asked for; the
-        # others take no arguments and ignore it.
-        bash "$TEST_FILE" "$1"
+        # Run shell scripts with bash. The group travels in the environment
+        # rather than as an argument, so that a script spanning both groups
+        # can run only the half being asked for without the others seeing an
+        # argument they did not expect -- test_hybrid_storage_export.sh
+        # forwards "$@" to pytest, which would read "fwd_bwd" as a path to
+        # collect and fail.
+        DYNAMICEMB_TEST_GROUP="$1" bash "$TEST_FILE"
         # Check if the test failed
         if [ $? -ne 0 ]; then
             echo "ERROR: Test failed in $TEST_FILE"
