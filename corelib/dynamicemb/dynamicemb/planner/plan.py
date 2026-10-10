@@ -64,12 +64,24 @@ def make_storage(hbm: int = 0, ddr: int = 0, ssd: int = 0) -> Storage:
     return Storage(hbm=hbm, ddr=ddr)
 
 
+def storage_ssd(storage: Storage) -> int:
+    """``storage.ssd`` where the field exists, 0 where it does not.
+
+    The companion to :func:`make_storage`: that one covers building a Storage
+    on TorchRec before 1.5.0, this one covers reading the field back. Both are
+    needed -- the first alone leaves `.ssd` to raise AttributeError.
+    """
+    return storage.ssd if _STORAGE_HAS_SSD else 0
+
+
 __all__ = [
     "optimizer_types",
     "shard_rank",
     "per_rank_storage",
     "topology_minus",
+    "make_storage",
     "module_without_tables",
+    "storage_ssd",
     "table_fanout",
     "table_layout",
 ]
@@ -160,10 +172,16 @@ def per_rank_storage(
     ``min(sum total, sum budget)`` -- it under-states HBM, and that is the
     direction that lets a plan through which the machine will not hold.
 
-    The grouping used here is ``DynamicEmbTableOptions``'s own
-    (:meth:`~dynamicemb.dynamicemb_config.DynamicEmbTableOptions.get_grouped_key`),
-    which is **coarser** than the runtime's: TorchRec groups on that *and* on
-    data type, pooling, a dimension bucket and more
+    The grouping used here is the sharding type paired with
+    ``DynamicEmbTableOptions``'s own key
+    (:meth:`~dynamicemb.dynamicemb_config.DynamicEmbTableOptions.get_grouped_key`).
+    The sharding type belongs in it because TorchRec splits tables by it into
+    separate ``EmbeddingSharding``s before ``group_tables`` runs inside each
+    (``embeddingbag.py:267``, ``rw_sharding.py:178``), so a row-wise table never
+    fuses with a table-row-wise one however alike their options.
+
+    It is still **coarser** than the runtime's, which also keys on data type,
+    pooling, a dimension bucket and the fused params
     (``embedding_sharding.py:609``). Reproducing that exactly would mean
     reimplementing `_get_grouping_fused_params`, the dimension bucketer and
     `_prefetch_and_cached` here, and then owning them as TorchRec changes them
@@ -214,7 +232,9 @@ def per_rank_storage(
                     f"Table {name!r} places a shard on rank {rank}, which is "
                     f"outside the world of {world_size}."
                 )
-            per_rank_groups[rank][options].append(member)
+            per_rank_groups[rank][(parameter_sharding.sharding_type, options)].append(
+                member
+            )
 
     for rank, groups in enumerate(per_rank_groups):
         for members in groups.values():

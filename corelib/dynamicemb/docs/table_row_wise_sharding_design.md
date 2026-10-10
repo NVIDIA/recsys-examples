@@ -484,13 +484,19 @@ no choice between nodes -- they are on all of them -- but they decide whether a
 TRW table still fits, so the placer is fitting into the room that will actually
 be there, and they are costed in groups because they are all placed already.
 
-A table-row-wise table is costed on its own there, where `per_rank_storage`
-costs the finished plan in groups (§7.2). That is not an oversight: the placer
-is deciding one table at a time and does not yet know what will share a node
-with it, which is the thing being decided. It is a heuristic input, not the
-budget -- whatever it chooses, `per_rank_storage` re-costs the result and
-`topology_minus` subtracts that, so an optimistic placement surfaces as a
-`PlannerError` rather than as a plan that does not fit.
+**A table is handed to the placer whole, not priced**, because what it costs a
+node depends on which of the others land there with it -- and that is the
+decision being made. `TableToPlace` carries the table's options and optimizer
+rather than a `Storage`, and the placer charges each candidate node the
+*difference* the table makes to that node's grouped total.
+
+Pricing each table alone was the earlier behaviour, defended as a heuristic
+whose mistakes `per_rank_storage` would catch. That defence covered only half
+of it. Under-stating HBM does surface as a `PlannerError` -- but on a layout
+that could have worked, which is a refusal, not a safety net. And over-stating
+host has no backstop at all: the placer refuses a node the runtime would have
+held, and no later stage revisits the choice. Both are gone now that the placer
+and `per_rank_storage` call the same function over the same buckets.
 
 It must be deterministic: it runs on every rank, and two ranks that disagreed
 would shard one table onto two nodes. Ties break on the table name, then the
@@ -1095,10 +1101,15 @@ a rank, one with twice the budget it needs and one with none:
 
 Five gigabytes of HBM the old arithmetic did not reserve.
 
-**The grouping used is ours, and is coarser than the real one.** TorchRec groups
-on `data_type`, `pooling`, a dimension bucket, the fused params and more
+**The grouping used is ours, and is coarser than the real one.** It is the
+sharding type paired with `DynamicEmbTableOptions.get_grouped_key`. The sharding
+type belongs in it because TorchRec splits tables by it into separate
+`EmbeddingSharding`s before `group_tables` runs inside each
+(`embeddingbag.py:267`, `rw_sharding.py:178`), so a row-wise table never fuses
+with a table-row-wise one however alike their options. TorchRec groups on more
+besides -- `data_type`, `pooling`, a dimension bucket, the fused params
 (`embedding_sharding.py:609`), with `DynamicEmbTableOptions`'s own key riding
-inside the fused params. Reproducing that here would mean reimplementing
+inside those. Reproducing that here would mean reimplementing
 `_get_grouping_fused_params`, the dimension bucketer and `_prefetch_and_cached`,
 and then owning them as TorchRec changes them -- the kind of fork §4.9 exists to
 avoid. So `per_rank_storage` buckets on `DynamicEmbTableOptions.get_grouped_key`
@@ -1117,6 +1128,29 @@ tier to move, CACHING_PS and HOST_PS. `HybridStorage` ignores `external_storage`
 and warns, so its host tier is local and is counted, which is correct.
 
 ---
+
+### 7.2.1 The placer prices a table against its neighbours
+
+The same arithmetic, one step earlier. `BalancedHostPlacer` receives tables
+rather than costs, and asks each candidate node what the table would *add* to
+it: `cost(held + table) - cost(held)`, where `cost` is the grouped function
+§7.2 describes. A node already holding a groupmate with budget to spare charges
+less for the table than an empty node would, which is what the runtime will do
+anyway.
+
+Two cases this fixes, both of which per-table pricing got wrong:
+
+- **HBM under-stated** -- a layout accepted here, then refused by
+  `topology_minus` once the plan is costed in groups. Loud, since §7.3, but a
+  refusal of a layout that could have worked.
+- **Host over-stated** -- a node refused that the runtime would have held, with
+  no later stage to revisit it. This one had no backstop at all.
+
+And a defect of its own, found when the new tests exercised it: nodes were
+ranked by `(hbm, ddr)` lexicographically, so a node with more HBM headroom won
+over one that fits in both tiers -- with its host tier already overdrawn.
+Whether the table fits now comes first in the ranking, and room only breaks
+ties among the nodes that can hold it.
 
 ### 7.3 An overdrawn rank is refused here, not downstream
 

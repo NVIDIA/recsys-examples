@@ -24,7 +24,7 @@ from torch import distributed as dist
 from torch import nn
 from torchrec.distributed.embedding_types import EmbeddingComputeKernel
 from torchrec.distributed.planner import EmbeddingShardingPlanner, ParameterConstraints
-from torchrec.distributed.planner.types import Storage, StorageReservation, Topology
+from torchrec.distributed.planner.types import StorageReservation, Topology
 from torchrec.distributed.collective_utils import invoke_on_rank_and_broadcast_result
 from torchrec.distributed.planner.utils import sharder_name
 from torchrec.distributed.sharding_plan import placement
@@ -469,25 +469,13 @@ class DynamicEmbeddingShardingPlanner(EmbeddingShardingPlanner):
         def member(name: str):
             return (self._constraints[name].dynamicemb_options, optimizers.get(name))
 
-        def rank_cost(name: str) -> Storage:
-            """What one table costs a rank that holds it.
-
-            Per table, where the budget arithmetic in `per_rank_storage` is per
-            group, because the placer is deciding one table at a time and does
-            not yet know what will share a node with it -- two table-row-wise
-            tables are fused only if they land together, which is the thing
-            being decided. It is a heuristic input, not the budget: whatever the
-            placer chooses, `per_rank_storage` costs the finished plan in groups
-            and `topology_minus` subtracts that, so an optimistic placement
-            surfaces as a PlannerError rather than as a plan that does not fit.
-            """
-            hbm, ddr = get_group_value_bytes_by_tier([member(name)])
-            return make_storage(hbm=hbm, ddr=ddr)
-
         # The row-wise tables are on every rank, so they shift no choice between
         # nodes -- but they do decide whether a table-row-wise one still fits.
-        # Costed in groups: they are all placed already, so what the runtime
-        # will fuse is known, and a group's budget is shared across its members.
+        # Costed in groups, and separately from the table-row-wise ones: TorchRec
+        # splits tables by sharding type into different `EmbeddingSharding`s
+        # before `group_tables` runs inside each (`embeddingbag.py:267`,
+        # `rw_sharding.py:178`), so a row-wise table never fuses with a
+        # table-row-wise one however alike their options.
         committed = [make_storage() for _ in range(world_size)]
         row_wise_groups: Dict[object, list] = defaultdict(list)
         for name in by_type.get(ShardingType.ROW_WISE.value, []):
@@ -499,11 +487,15 @@ class DynamicEmbeddingShardingPlanner(EmbeddingShardingPlanner):
             cost = make_storage(hbm=hbm, ddr=ddr)
             committed = [spent + cost for spent in committed]
 
+        # The tables are handed over whole rather than priced: what one costs a
+        # node depends on which of the others land there with it, and that is
+        # the decision the placer is making.
         return self._host_placer.place(
             [
                 TableToPlace(
                     name=name,
-                    cost=rank_cost(name),
+                    options=self._constraints[name].dynamicemb_options,
+                    optimizer_type=optimizers.get(name),
                     pinned=self._constraints[name].dynamicemb_options.host_index,
                 )
                 for name in sorted(trw)

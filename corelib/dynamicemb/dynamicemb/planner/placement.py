@@ -29,11 +29,18 @@ filling nodes in order.
 
 import abc
 from dataclasses import dataclass
-from typing import Dict, List, Optional
+from collections import defaultdict
+from typing import Dict, Hashable, List, Optional, Tuple
 
+from fbgemm_gpu.split_embedding_configs import EmbOptimType as OptimType
 from torchrec.distributed.planner.types import Storage, Topology
 
-from .plan import make_storage
+from ..dynamicemb_config import (
+    DynamicEmbTableOptions,
+    get_group_value_bytes_by_tier,
+)
+
+from .plan import make_storage, storage_ssd
 
 __all__ = ["TableToPlace", "HostPlacer", "BalancedHostPlacer"]
 
@@ -42,21 +49,45 @@ __all__ = ["TableToPlace", "HostPlacer", "BalancedHostPlacer"]
 class TableToPlace:
     """One table-row-wise table awaiting a node.
 
+    It carries what the table *is* rather than what it costs, because what it
+    costs depends on what it is placed with: the runtime fuses compatible
+    tables on a rank and spends their pooled HBM budget on their pooled size,
+    so a table's price is not fixed until its neighbours are known.
+
     Attributes
     ----------
     name : str
-        The table's name, and the tie-break when two tables cost the same.
-    cost : Storage
-        What one rank of this table takes. Every rank of the chosen node pays
-        it, since table-row-wise splits the rows evenly across the node.
+        The table's name, and the tie-break when two tables weigh the same.
+    options : DynamicEmbTableOptions
+        The table's own options. These are both its size and -- through
+        ``get_grouped_key`` -- which other tables it fuses with.
+    optimizer_type : Optional[OptimType]
+        What it trains with, since optimizer state is part of a row. ``None``
+        counts the rows without it, a floor rather than a guess.
     pinned : Optional[int]
         The node the caller named through ``DynamicEmbTableOptions.host_index``.
-        A placer must honour it.
+        A placer must honour it, and must still check that it fits.
     """
 
     name: str
-    cost: Storage
+    options: "DynamicEmbTableOptions"
+    optimizer_type: Optional[OptimType] = None
     pinned: Optional[int] = None
+
+    @property
+    def member(self) -> Tuple["DynamicEmbTableOptions", Optional[OptimType]]:
+        """The pair :func:`get_group_value_bytes_by_tier` costs."""
+        return (self.options, self.optimizer_type)
+
+    def alone(self) -> Storage:
+        """What this table costs a rank with nothing to pool with.
+
+        Only for ordering: the largest-first sort needs a number before any
+        placement exists. What a table actually costs a node is the difference
+        it makes to that node's grouped total.
+        """
+        hbm, ddr = get_group_value_bytes_by_tier([self.member])
+        return make_storage(hbm=hbm, ddr=ddr)
 
 
 class HostPlacer(abc.ABC):
@@ -122,21 +153,55 @@ class BalancedHostPlacer(HostPlacer):
             )
         num_nodes = world_size // local_size
 
-        # Room on each rank, then the tightest rank of each node: what one more
-        # per-rank cost has to fit into.
-        free = [device.storage - committed[device.rank] for device in topology.devices]
-
-        def tightest(node: int) -> Storage:
+        # What each node has spare before any of these tables: its tightest
+        # rank, since a table-row-wise table charges every rank of its node the
+        # same and so is limited by the worst of them.
+        def capacity(node: int) -> Storage:
             ranks = range(node * local_size, (node + 1) * local_size)
+            free = [topology.devices[r].storage - committed[r] for r in ranks]
             return make_storage(
-                hbm=min(free[r].hbm for r in ranks),
-                ddr=min(free[r].ddr for r in ranks),
-                ssd=min(getattr(free[r], "ssd", 0) for r in ranks),
+                hbm=min(f.hbm for f in free),
+                ddr=min(f.ddr for f in free),
+                ssd=min(storage_ssd(f) for f in free),
             )
 
-        def charge(node: int, cost: Storage) -> None:
-            for r in range(node * local_size, (node + 1) * local_size):
-                free[r] = free[r] - cost
+        room = [capacity(n) for n in range(num_nodes)]
+
+        # What each node has been given, bucketed by what the runtime fuses on.
+        # Costing a node means costing each bucket, because a bucket's members
+        # pool their HBM budgets -- so what a table adds to a node depends on
+        # what is already there, and cannot be decided once per table.
+        held: List[Dict[Hashable, List[Tuple[object, Optional[OptimType]]]]] = [
+            defaultdict(list) for _ in range(num_nodes)
+        ]
+
+        def cost_of(node: int) -> Storage:
+            total = make_storage(hbm=0, ddr=0)
+            for members in held[node].values():
+                hbm, ddr = get_group_value_bytes_by_tier(members)
+                total = total + make_storage(hbm=hbm, ddr=ddr)
+            return total
+
+        def added_by(node: int, table: TableToPlace) -> Storage:
+            """What this table would add to this node, after pooling.
+
+            The difference the table makes, not its price alone: placed beside
+            a groupmate whose budget it can share, it may add less than it
+            would cost on an empty node -- or more, if its own spare budget
+            then goes to them.
+            """
+            before = cost_of(node)
+            held[node][table.options].append(table.member)
+            after = cost_of(node)
+            held[node][table.options].pop()
+            return after - before
+
+        def give(node: int, table: TableToPlace) -> None:
+            held[node][table.options].append(table.member)
+
+        def spare(node: int) -> Storage:
+            left = room[node] - cost_of(node)
+            return left
 
         chosen: Dict[str, int] = {}
 
@@ -156,41 +221,49 @@ class BalancedHostPlacer(HostPlacer):
             # which TorchRec's own reservation looks for on `devices[0]` alone
             # (`storage_reservations.py:509`), so a pin to any other node would
             # go unnoticed and the plan would be returned.
-            room = tightest(table.pinned)
-            if not table.cost.fits_in(room):
+            needs, left = added_by(table.pinned, table), spare(table.pinned)
+            if not needs.fits_in(left):
                 raise ValueError(
                     f"Table {table.name!r} is pinned to node {table.pinned}, "
-                    f"which cannot hold it. It takes {table.cost} on each of "
-                    f"that node's {local_size} ranks, and the node's tightest "
-                    f"rank has {room} left. Pin it elsewhere, leave host_index "
-                    "unset and let the placer choose, or give it row-wise "
-                    "sharding."
+                    f"which cannot hold it. It adds {needs} to each of that "
+                    f"node's {local_size} ranks, which have {left} left. Pin "
+                    "it elsewhere, leave host_index unset and let the placer "
+                    "choose, or give it row-wise sharding."
                 )
             chosen[table.name] = table.pinned
-            charge(table.pinned, table.cost)
+            give(table.pinned, table)
 
-        # Then the rest, biggest first.
+        # Then the rest, biggest first. "Biggest" is what a table weighs on its
+        # own, which is the only size there is before anything is placed.
         unpinned = sorted(
             (t for t in tables if t.pinned is None),
-            key=lambda t: (-t.cost.hbm, -t.cost.ddr, t.name),
+            key=lambda t: (-t.alone().hbm, -t.alone().ddr, t.name),
         )
         for table in unpinned:
-            # `max` keeps the first of equal keys, and range() is ascending, so
-            # a tie goes to the lower node index.
-            node = max(
-                range(num_nodes),
-                key=lambda n: (tightest(n).hbm, tightest(n).ddr, -n),
-            )
-            room = tightest(node)
-            if not table.cost.fits_in(room):
+            # Emptiest node that can hold it, measured after what each would
+            # charge for this table -- so a node holding a groupmate with budget
+            # to spare can win on that account, which is what the runtime will
+            # do anyway.
+            def rank_node(n: int) -> Tuple[bool, int, int, int]:
+                needs, left = added_by(n, table), spare(n)
+                after = left - needs
+                # Whether it fits comes first. Ranking on room alone compares
+                # the tiers one after another, so a node with headroom in HBM
+                # would win over one that fits in both -- with its host tier
+                # already overdrawn.
+                return (needs.fits_in(left), after.hbm, after.ddr, -n)
+
+            node = max(range(num_nodes), key=rank_node)
+            needs, left = added_by(node, table), spare(node)
+            if not needs.fits_in(left):
                 raise ValueError(
                     f"No node can hold the table-row-wise table {table.name!r}. "
-                    f"It takes {table.cost} on each of a node's {local_size} "
-                    f"ranks, and the emptiest node has {room} left on its "
-                    "tightest rank. Give it row-wise sharding, lower its "
-                    "capacity, or pin the tables so they pack differently."
+                    f"It adds {needs} to each of a node's {local_size} ranks, "
+                    f"and the emptiest node has {left} left on its tightest "
+                    "rank. Give it row-wise sharding, lower its capacity, or "
+                    "pin the tables so they pack differently."
                 )
             chosen[table.name] = node
-            charge(node, table.cost)
+            give(node, table)
 
         return chosen

@@ -20,13 +20,16 @@ declared sizes, which is why it is a component of its own.
 """
 
 import pytest
+import torch
 from torchrec.distributed.planner.types import Topology
 
 from dynamicemb.planner.plan import make_storage
 
+from dynamicemb.dynamicemb_config import DynamicEmbTableOptions
 from dynamicemb.planner.placement import BalancedHostPlacer, TableToPlace
 
 GB = 1024**3
+DIM = 16
 LOCAL, NODES = 4, 2
 WORLD = LOCAL * NODES
 
@@ -45,9 +48,25 @@ def _nothing_spent():
     return [make_storage(hbm=0, ddr=0, ssd=0) for _ in range(WORLD)]
 
 
-def _table(name, hbm_gb, pinned=None):
+def _table(name, size_gb, pinned=None, budget_gb=None):
+    """A table weighing `size_gb` per rank.
+
+    Its HBM budget defaults to its size, so it sits entirely in HBM and
+    `_table(name, N)` costs N GB of it -- which is what the tests that predate
+    pooling assume. Pass `budget_gb` to make a table that spills to the host,
+    or one with budget to spare for a groupmate.
+    """
+    rows = size_gb * GB // (DIM * 4) or 1
+    budget = size_gb if budget_gb is None else budget_gb
     return TableToPlace(
-        name=name, cost=make_storage(hbm=hbm_gb * GB, ddr=0, ssd=0), pinned=pinned
+        name=name,
+        options=DynamicEmbTableOptions(
+            max_capacity=rows,
+            dim=DIM,
+            embedding_dtype=torch.float32,
+            local_hbm_for_values=budget * GB,
+        ),
+        pinned=pinned,
     )
 
 
@@ -167,3 +186,48 @@ def test_a_pin_that_fits_is_still_honoured():
         [_table("a", 70, pinned=1)], _topology(hbm=80 * GB), _nothing_spent()
     )
     assert chosen == {"a": 1}
+
+
+def test_a_groupmate_with_spare_budget_makes_room():
+    """What a table costs a node depends on what is already there.
+
+    Two tables that fuse pool their HBM budgets and spend them on their pooled
+    size, so one with budget to spare keeps the other out of host memory. Priced
+    alone the second needs 14 GB of host and is refused; after pooling it needs
+    none and fits. That is the review's second case -- host over-stated, a
+    layout refused that the runtime would have held.
+    """
+    # Plenty of HBM, almost no host memory: the host figure is what decides.
+    topo = _topology(hbm=80 * GB, ddr=4 * GB)
+    generous = _table("generous", 4, budget_gb=20)  # 4 GB of a 20 GB budget
+    needy = _table("needy", 16, budget_gb=2)  # 16 GB with 2 GB allowed
+
+    assert needy.alone().ddr == 14 * GB, "priced alone it spills 14 GB to host"
+    assert generous.alone().ddr == 0
+
+    chosen = BalancedHostPlacer().place([generous, needy], topo, _nothing_spent())
+    assert chosen["generous"] == chosen["needy"], (
+        "they fuse, so together they fit in the pooled 22 GB budget and need no "
+        "host memory -- which only shows if the placer prices them together"
+    )
+
+
+def test_tables_that_do_not_fuse_are_not_pooled():
+    """Different grouping keys mean different TBEs, so no budget is shared."""
+    topo = _topology(hbm=80 * GB, ddr=4 * GB)
+    generous = _table("generous", 4, budget_gb=20)
+    needy = TableToPlace(
+        name="needy",
+        options=DynamicEmbTableOptions(
+            max_capacity=16 * GB // (DIM * 4),
+            dim=DIM,
+            embedding_dtype=torch.float32,
+            local_hbm_for_values=2 * GB,
+            # part of the grouping key, so these two never share a TBE
+            dist_type="hash_roundrobin",
+        ),
+    )
+    assert generous.options != needy.options
+
+    with pytest.raises(ValueError, match="No node can hold"):
+        BalancedHostPlacer().place([generous, needy], topo, _nothing_spent())
