@@ -30,7 +30,6 @@ from dynamicemb import (
     DynamicEmbTableOptions,
 )
 from dynamicemb.planner import (
-    DynamicEmbeddingEnumerator,
     DynamicEmbeddingShardingPlanner,
     DynamicEmbParameterConstraints,
 )
@@ -51,9 +50,6 @@ from torchrec.distributed.model_parallel import (
     DistributedModelParallel,
 )
 from torchrec.distributed.planner import ParameterConstraints, Topology
-from torchrec.distributed.planner.storage_reservations import (
-    HeuristicalStorageReservation,
-)
 from torchrec.distributed.types import BoundsCheckMode, ShardingType
 
 
@@ -129,23 +125,17 @@ def get_planner(args, device, eb_configs):
         world_size=dist.get_world_size(),
         compute_device=device.type,
         hbm_cap=args.hbm_cap,
-        ddr_cap=1024 * 1024 * 1024 * 1024,
+        # One node's host memory, not one rank's: Topology replicates
+        # whatever it is given to every device instead of dividing it.
+        ddr_cap=1024 * 1024 * 1024 * 1024 // get_local_size(),
         intra_host_bw=args.intra_host_bw,
         inter_host_bw=args.inter_host_bw,
     )
 
-    enumerator = DynamicEmbeddingEnumerator(
-        topology=topology,
-        constraints=dict_const,
-    )
-
     return DynamicEmbeddingShardingPlanner(
-        eb_configs=eb_configs,
         topology=topology,
         constraints=dict_const,
         batch_size=args.batch_size,
-        enumerator=enumerator,
-        storage_reservation=HeuristicalStorageReservation(percentage=0.05),
         debug=True,
     )
 

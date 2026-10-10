@@ -33,7 +33,8 @@ from torchrec.distributed.composable.table_batched_embedding_slice import (
     TableBatchedEmbeddingSlice,
 )
 from torchrec.distributed.embedding_kernel import get_state_dict
-from torchrec.distributed.embedding_types import (  # EmbeddingComputeKernel,; GroupedEmbeddingConfig,
+from torchrec.distributed.embedding_types import (
+    ShardingType,  # EmbeddingComputeKernel,; GroupedEmbeddingConfig,
     GroupedEmbeddingConfig,
     ShardedEmbeddingTable,
     compute_kernel_to_embedding_location,
@@ -52,6 +53,30 @@ def pooling_mode_to_dynamicemb(pooling: PoolingMode) -> DynamicEmbPoolingMode:
         return DynamicEmbPoolingMode.NONE
     else:
         raise Exception(f"Invalid pooling type {pooling}")
+
+
+def _placement_rank(placement) -> int:
+    if placement is None:
+        raise ValueError("Shard metadata without a placement has no rank.")
+    if isinstance(placement, str):
+        return int(placement.split("/", 1)[0].removeprefix("rank:"))
+    return placement.rank()
+
+
+def _shard_ranks_of(tables: List[ShardedEmbeddingTable]) -> Optional[List[int]]:
+    """The ranks holding these tables in shard order, or None without shard metadata."""
+    layouts = {
+        tuple(_placement_rank(md.placement) for md in table.global_metadata.shards_metadata)
+        for table in tables
+        if table.global_metadata is not None
+    }
+    if not layouts:
+        return None
+    if len(layouts) != 1:
+        raise ValueError(
+            f"Tables grouped in one kernel are sharded differently: {sorted(layouts)}"
+        )
+    return list(layouts.pop())
 
 
 def get_state_dict(
@@ -96,8 +121,17 @@ def get_state_dict(
 
             local_metadatas = deepcopy(embedding_table.global_metadata.shards_metadata)
 
-            world_size = pg.size()
-            assert world_size == len(local_metadatas)
+            # One placeholder shard per shard of the table, not per rank of pg:
+            # a table-row-wise table has local_world_size shards on one node's
+            # ranks while pg is still the world.
+            num_shards = len(local_metadatas)
+            shard_ranks = [_placement_rank(md.placement) for md in local_metadatas]
+            if pg.rank() not in shard_ranks:
+                raise RuntimeError(
+                    f"Rank {pg.rank()} holds no shard of table {embedding_table.name} "
+                    f"(shards on ranks {shard_ranks}) but was asked for its state."
+                )
+            my_shard = shard_ranks.index(pg.rank())
             for i, local_metadata in enumerate(local_metadatas):
                 local_metadata.shard_offsets = [i, 0]
                 local_metadata.shard_sizes = [1, 1]
@@ -106,7 +140,7 @@ def get_state_dict(
                 shards_metadata=local_metadatas,
                 size=torch.Size(
                     [
-                        world_size,
+                        num_shards,
                         1,
                     ]
                 ),
@@ -121,7 +155,7 @@ def get_state_dict(
                 #  `Union[Module, Tensor]`.
                 # pyre-fixme[6]: For 2nd argument expected `ShardMetadata` but got
                 #  `Optional[ShardMetadata]`.
-                Shard(param, local_metadatas[pg.rank()])
+                Shard(param, local_metadatas[my_shard])
             )
         else:
             destination[key] = param
@@ -265,8 +299,11 @@ class BatchedDynamicEmbeddingBag(
         config: GroupedEmbeddingConfig,
         pg: Optional[dist.ProcessGroup] = None,
         device: Optional[torch.device] = None,
+        sharding_type: Optional[ShardingType] = None,
     ) -> None:
-        super().__init__(config, pg, device)
+        # sharding_type is what turns MEAN into SUM in the kernel for row-wise and
+        # table-row-wise tables; TorchRec divides by the bag length once on output.
+        super().__init__(config, pg, device, sharding_type)
 
         _prepare_fused_params(config.fused_params)
 
@@ -292,6 +329,7 @@ class BatchedDynamicEmbeddingBag(
                 feature_table_map=self._feature_table_map,
                 table_names=[t.name for t in config.embedding_tables],
                 device=device,
+                shard_ranks=_shard_ranks_of(config.embedding_tables),
                 **fused_params,
             )
         )
@@ -420,6 +458,7 @@ class BatchedDynamicEmbedding(BaseBatchedEmbedding[torch.Tensor]):
                 feature_table_map=self._feature_table_map,
                 table_names=[t.name for t in config.embedding_tables],
                 device=device,
+                shard_ranks=_shard_ranks_of(config.embedding_tables),
                 **fused_params,
             )
         )

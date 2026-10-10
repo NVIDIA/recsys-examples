@@ -14,29 +14,20 @@
 # limitations under the License.
 
 # pyre-strict
-from typing import Dict, List, Set
+from typing import Dict, List, Optional, Set
 
 import torch
 import torch.distributed as dist
-
-# import our own finalize model grads
-from dynamicemb.dynamicemb_config import DynamicEmbTableOptions
-from dynamicemb.planner import DynamicEmbeddingEnumerator
-from dynamicemb.planner import (
-    DynamicEmbeddingShardingPlanner as DynamicEmbeddingShardingPlanner,
-)
-from dynamicemb.planner import DynamicEmbParameterConstraints
-from torch import distributed as dist
 from torchrec.distributed.comm import get_local_size
-from torchrec.distributed.embedding_types import ShardingType
-
-# from torchrec.distributed import ModuleShardingPlan
 from torchrec.distributed.planner import Topology
-from torchrec.distributed.planner.storage_reservations import (
-    HeuristicalStorageReservation,
-)
 from torchrec.distributed.types import BoundsCheckMode, ShardingType
 from torchrec.modules.embedding_configs import EmbeddingConfig
+
+from ..dynamicemb_config import DynamicEmbTableOptions
+from .planners import (
+    DynamicEmbeddingShardingPlanner as DynamicEmbeddingShardingPlanner,
+)
+from .planners import DynamicEmbParameterConstraints
 
 # refer to https://github.com/pytorch/torchrec/blob/76a0826c6aec07c347f492aed2d4adf25cbdc3d9/torchrec/distributed/embedding_types.py#L75-L91
 # compute_kernel is somehow coupled with sharding_type.
@@ -61,8 +52,16 @@ def get_planner(
     data_parallel_embedding_table_names: Set[str],
     dynamicemb_options_dict: Dict[str, DynamicEmbTableOptions],
     device: torch.device,
+    # Which DynamicEmb tables go on a single node each. Which node is chosen by
+    # the planner's HostPlacer; name one here by setting host_index on the
+    # table's options, which pins it.
+    table_row_wise_embedding_table_names: Optional[Set[str]] = None,
     pipeline_type: str = "none",
-    ddr_cap: int = 512 * 1024 * 1024 * 1024,  # Assume a Node have 512GB memory
+    # Host memory of one node, not one rank: Topology keeps ddr per rank and
+    # this is divided by the local world size below. A terabyte is a
+    # conservative figure for the nodes this runs on rather than a measurement
+    # of any of them -- a caller who knows their machine should say so.
+    ddr_cap: int = 1024 * 1024 * 1024 * 1024,
     intra_host_bw: int = 450e9,  # Nvlink bandwidth
     inter_host_bw: int = 25e9,  # NIC bandwidth
 ):
@@ -81,11 +80,20 @@ def get_planner(
                 compute_kernels=compute_kernel_type,
             )
         elif config.name in dynamicemb_options_dict:
-            # TODO add dynamic embedding compute kernels
-            compute_kernel_type = []
+            # No compute_kernels: a DynamicEmb table never reaches TorchRec's
+            # search space. The planner takes it out of the module before
+            # handing the rest over, and writes its ParameterSharding itself,
+            # CUSTOMIZED_KERNEL included. `sharding_types` still names one,
+            # because the planner reads it back to decide the table's placement
+            # and the divisor its capacity is sized by -- it is a statement, not
+            # a search space.
             dynamicemb_options = dynamicemb_options_dict[config.name]
             constraint = DynamicEmbParameterConstraints(
-                sharding_types=[ShardingType.ROW_WISE.value],
+                sharding_types=[
+                    ShardingType.TABLE_ROW_WISE.value
+                    if config.name in (table_row_wise_embedding_table_names or ())
+                    else ShardingType.ROW_WISE.value
+                ],
                 bounds_check_mode=BoundsCheckMode.NONE,  # dynamic embedding has no bounding!
                 enforce_hbm=True,
                 use_dynamicemb=True,
@@ -109,23 +117,26 @@ def get_planner(
         constraints.update({config.name: constraint})
     hbm_cap = torch.cuda.get_device_properties(0).total_memory
 
+    # Topology stores ddr per rank -- `[ddr_cap] * world_size`, replicated, not
+    # divided. `ddr_cap` is a node's host memory, shared by the ranks on it, so
+    # handing it over as-is tells the planner every rank owns the whole node's
+    # RAM: eight times too much on an eight-GPU node. Divide it here, which is
+    # right while the ranks of a node spend it evenly -- they do under row-wise,
+    # where each holds a slice of every table.
+    local_world_size = get_local_size()
     topology = Topology(
-        local_world_size=get_local_size(),
+        local_world_size=local_world_size,
         world_size=dist.get_world_size(),
         compute_device=device.type,
         hbm_cap=hbm_cap,
-        ddr_cap=ddr_cap,  # For HVK  , if we need to put embedding vector into Host memory , it is important set ddr capacity
+        ddr_cap=ddr_cap // local_world_size,
         intra_host_bw=intra_host_bw,
         inter_host_bw=inter_host_bw,
     )
-    enumerator = DynamicEmbeddingEnumerator(
-        topology=topology,
-        constraints=constraints,
-    )
     return DynamicEmbeddingShardingPlanner(
-        eb_configs=eb_configs,
         topology=topology,
         constraints=constraints,
-        enumerator=enumerator,
-        storage_reservation=HeuristicalStorageReservation(percentage=0.05),
+        # No storage_reservation: the planner takes the DynamicEmb tables out of
+        # the Topology itself, and TorchRec's default reservation then covers
+        # what it is for -- the dense modules and the input KJT.
     )
