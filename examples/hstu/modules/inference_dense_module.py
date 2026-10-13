@@ -375,6 +375,7 @@ class InferenceDenseModule(torch.nn.Module):
                 finally:
                     torch.cuda.nvtx.range_pop()
 
+            hstu_error: Optional[BaseException] = None
             try:
                 # num_tokens = batch.features.values().shape[0]
                 num_tokens = jagged_data.values.shape[0]
@@ -402,6 +403,9 @@ class InferenceDenseModule(torch.nn.Module):
                         kvcache_metadata,
                     )
                     jagged_data.values = hstu_output
+            except BaseException as err:
+                hstu_error = err
+                raise
             finally:
                 if (
                     onboard_handle is not None
@@ -413,6 +417,10 @@ class InferenceDenseModule(torch.nn.Module):
                     torch.cuda.nvtx.range_push("recsys.kvcache.onboard_wait")
                     try:
                         self.kvcache.onboard_wait(kv_index_meta, onboard_handle)
+                    except BaseException as wait_err:
+                        if hstu_error is None:
+                            raise
+                        raise hstu_error from wait_err
                     finally:
                         torch.cuda.nvtx.range_pop()
 

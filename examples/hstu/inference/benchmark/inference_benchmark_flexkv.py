@@ -252,21 +252,41 @@ def build_model(cfg: BenchmarkConfig, history_len: int):
     return model_predict, page_size, max_seqlen
 
 
+def _offload_stall_s() -> float:
+    env = os.environ.get("RECSYS_FLEXKV_OFFLOAD_STALL_S")
+    if env is not None and str(env).strip() != "":
+        return float(env)
+    return 600.0
+
+
 def drain_offload_queue(kvcache_mgr, tag: str, log_every_s: float = 30.0) -> None:
-    # Unbounded: a 60s deadline aborted valid H2DISK on large CPU pins.
-    # Log periodically so a stuck offload is visible without a false timeout.
+    # No short wall-clock deadline: a single large H2DISK can exceed 60s.
+    # Stall if pending count does not drop (dead FlexKV worker). 0 disables.
     owner = getattr(kvcache_mgr, "backend", kvcache_mgr)
+    stall_s = _offload_stall_s()
     t0 = time.monotonic()
     last_log = t0
+    last_progress = t0
+    last_pending = len(owner.ongoing_offload_tasks)
     torch.cuda.nvtx.range_push(tag)
     try:
         while len(owner.ongoing_offload_tasks) > 0:
             kvcache_mgr.offload_try_wait()
             now = time.monotonic()
+            pending = len(owner.ongoing_offload_tasks)
+            if pending != last_pending:
+                last_pending = pending
+                last_progress = now
+            elif stall_s > 0 and now - last_progress >= stall_s:
+                raise TimeoutError(
+                    f"{tag}: offload queue stalled, pending={pending} "
+                    f"unchanged for {now - last_progress:.0f}s "
+                    f"(RECSYS_FLEXKV_OFFLOAD_STALL_S={stall_s:g})"
+                )
             if now - last_log >= log_every_s:
                 print(
                     f"[{tag}] draining offload pending="
-                    f"{len(owner.ongoing_offload_tasks)} waited={now - t0:.0f}s",
+                    f"{pending} waited={now - t0:.0f}s",
                     flush=True,
                 )
                 last_log = now
