@@ -256,8 +256,11 @@ RUN git clone --recursive -b v26.05 \
       https://github.com/NVIDIA/nv-embedding-cache.git nve-26.05 && \
     git clone -b v3.5.0 https://github.com/NVIDIA/NVTX.git NVTX
 
+COPY docker/nve_cuda_architectures.cmake /usr/local/share/recsys/nve_cuda_architectures.cmake
+
 # Build into two isolated Python prefixes. NVE's upstream default feature set
-# is used for both builds and includes libnve-plugin-nvhm.so.
+# is used for both builds and includes libnve-plugin-nvhm.so. The toolchain
+# also sets the native CUDA targets; TORCH_CUDA_ARCH_LIST covers only bindings.
 RUN set -eux; \
     if [ "${TARGETPLATFORM}" != "linux/arm64" ]; then \
       export PYNVE_DISABLE_AVX512=1; \
@@ -269,6 +272,7 @@ RUN set -eux; \
       PYNVE_BUILD_DIR="/workspace/build/pynve-${version}" \
       PYNVE_WITH_TORCH_BINDINGS=1 \
       TORCH_CUDA_ARCH_LIST="7.5 8.0 8.6 9.0 10.0 12.0" \
+      CMAKE_TOOLCHAIN_FILE=/usr/local/share/recsys/nve_cuda_architectures.cmake \
       CPLUS_INCLUDE_PATH="/workspace/deps/NVTX/c/include${CPLUS_INCLUDE_PATH:+:${CPLUS_INCLUDE_PATH}}" \
       python3 -m pip install --no-build-isolation --no-deps \
         --target "/opt/nve/${version}/python" \
