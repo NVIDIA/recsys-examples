@@ -14,11 +14,20 @@ from torch import nn
 from torch.nn import functional as F
 
 
-def _pad(values, offsets, width):
-    lengths = offsets[1:] - offsets[:-1]
+def _sequence_bounds(offsets, batch_size):
+    # Use the candidate tensor's batch dimension instead of offsets.size(0) - 1.
+    # PyTorch 2.12 can specialize that derived size to >= 2 during export,
+    # causing the resulting program to reject single-user requests.
+    users = torch.arange(batch_size, device=offsets.device)
+    return offsets.index_select(0, users), offsets.index_select(0, users + 1)
+
+
+def _pad(values, offsets, width, batch_size):
+    starts, ends = _sequence_bounds(offsets, batch_size)
+    lengths = ends - starts
     positions = torch.arange(width, device=values.device)
     valid = positions[None, :] < lengths[:, None]
-    indices = torch.where(valid, offsets[:-1, None] + positions, values.shape[0])
+    indices = torch.where(valid, starts[:, None] + positions, values.shape[0])
     # A zero sentinel also handles an empty packed tensor without a negative index.
     extended = torch.cat((values, values.new_zeros((1,) + values.shape[1:])))
     return extended[indices.long()], valid
@@ -26,8 +35,9 @@ def _pad(values, offsets, width):
 
 def _unpad(values, offsets, token_count):
     tokens = torch.arange(token_count, device=values.device)
-    users = torch.searchsorted(offsets[1:].contiguous(), tokens, right=True)
-    users = users.clamp(max=offsets.shape[0] - 2)
+    _, ends = _sequence_bounds(offsets, values.shape[0])
+    users = torch.searchsorted(ends, tokens, right=True)
+    users = users.clamp(max=values.shape[0] - 1)
     positions = (tokens - offsets[users]).clamp(max=values.shape[1] - 1)
     result = values[users, positions]
     # CUDA graph buckets may contain unused packed-token slots.
@@ -153,10 +163,11 @@ class TransformerInferLayer(nn.Module):
             if torch.compiler.is_compiling()
             else min(self._max_seq_len, query.shape[0])
         )
-        q, query_valid = _pad(query, offsets, query_width)
-        k, _ = _pad(key, offsets, query_width)
-        v, _ = _pad(value, offsets, query_width)
-        lengths = offsets[1:] - offsets[:-1]
+        q, query_valid = _pad(query, offsets, query_width, candidates.shape[0])
+        k, _ = _pad(key, offsets, query_width, candidates.shape[0])
+        v, _ = _pad(value, offsets, query_width, candidates.shape[0])
+        starts, ends = _sequence_bounds(offsets, candidates.shape[0])
+        lengths = ends - starts
         torch._assert_async(
             torch.all((lengths >= 0) & (lengths <= self._max_seq_len)),
             "sequence length exceeds Transformer max_seq_len",
