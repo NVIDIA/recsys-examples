@@ -124,23 +124,28 @@ def test_checkpoint_model(
     # batches are replicated
     batch = history_batches[0]
     kjt = batch.features
-    output_before = mp_ec._model_parallel_embedding_collection(kjt).wait()["item_feat"]
-    output_after = new_model_unwrapped._model_parallel_embedding_collection(kjt).wait()[
-        "item_feat"
-    ]
+    # These comparisons only inspect values. Retaining both retrieval graphs
+    # across batches also retains their large sampled negative embeddings.
+    with torch.no_grad():
+        output_before = mp_ec._model_parallel_embedding_collection(kjt).wait()[
+            "item_feat"
+        ]
+        output_after = new_model_unwrapped._model_parallel_embedding_collection(
+            kjt
+        ).wait()["item_feat"]
 
-    assert torch.allclose(
-        output_before.values(), output_after.values()
-    ), f"[rank{dist.get_rank()}] output should be the same"
-
-    for batch in history_batches:
-        with torch.random.fork_rng():  # randomness negative sampling
-            loss, _ = model(batch)
-        with torch.random.fork_rng():
-            new_loss, _ = new_model(batch)
         assert torch.allclose(
-            loss, new_loss
-        ), f"loaded model should have same output with original model {loss} vs. {new_loss}"
+            output_before.values(), output_after.values()
+        ), f"[rank{dist.get_rank()}] output should be the same"
+
+        for batch in history_batches:
+            with torch.random.fork_rng():  # randomness negative sampling
+                loss, _ = model(batch)
+            with torch.random.fork_rng():
+                new_loss, _ = new_model(batch)
+            assert torch.allclose(
+                loss, new_loss
+            ), f"loaded model should have same output with original model {loss} vs. {new_loss}"
 
     assert_equal_two_state_dict(
         dense_optimizer.state_dict(), new_dense_optimizer.state_dict()
