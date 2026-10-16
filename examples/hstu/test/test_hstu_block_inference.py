@@ -48,7 +48,7 @@ def test_hstu_process_inference(backbone):
         head_dim=64,
         max_batch_size=2,
         max_seq_len=32,
-        dtype=torch.float32,
+        dtype=torch.bfloat16,
         contextual_max_seqlen=1,
         backbone=backbone,
     )
@@ -56,23 +56,23 @@ def test_hstu_process_inference(backbone):
     assert isinstance(block._attention_layers[0], TransformerInferLayer) == (
         backbone == "transformer"
     )
-    row_lengths = {"context": [1, 1], "item": [3, 3], "action": [2, 1]}
+    row_lengths = {"context": [1, 1], "item": [3, 3], "action": [3, 3]}
     embeddings = {}
     for name, lengths in row_lengths.items():
         embeddings[name] = JaggedTensor(
-            values=torch.randn(sum(lengths), 128, device=device),
+            values=torch.randn(sum(lengths), 128, device=device, dtype=torch.bfloat16),
             lengths=torch.tensor(lengths, device=device),
         )
     features = KeyedJaggedTensor(
         keys=list(row_lengths),
-        values=torch.arange(11, device=device),
-        lengths=torch.tensor([1, 1, 3, 3, 2, 1], device=device),
+        values=torch.arange(14, device=device),
+        lengths=torch.tensor([1, 1, 3, 3, 3, 3], device=device),
     )
     batch = HSTUBatch(
         features=features,
         batch_size=2,
-        # The shared schema bounds include candidate slots for item and action,
-        # although inference action values themselves contain history only.
+        # Inputs include candidate slots for item and action. The preprocessing
+        # operator removes candidate actions and interleaves history only.
         feature_to_max_seqlen={"context": 1, "item": 4, "action": 4},
         contextual_feature_names=["context"],
         item_feature_name="item",
@@ -94,7 +94,7 @@ def test_hstu_process_inference(backbone):
             items[2],
             ctx[1],
             items[3],
-            actions[2],
+            actions[3],
             items[4],
             items[5],
         ]
@@ -122,7 +122,9 @@ def test_hstu_process_inference(backbone):
             prediction_head_arch=[128, 2],
             num_tasks=2,
         )
-        dense = InferenceDenseModule(cfg, None, task, hstu_block=block).eval()
+        dense = (
+            InferenceDenseModule(cfg, None, task, hstu_block=block).bfloat16().eval()
+        )
         logits = dense(batch, embeddings)
         expected_logits = dense._mlp(output.values)
         torch.testing.assert_close(logits, expected_logits)

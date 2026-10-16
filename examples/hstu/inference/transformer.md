@@ -71,6 +71,7 @@ refresh are applied only to HSTU checkpoints.
 The layer uses the existing NHD page layout
 `[pages, 2, page_size, num_heads, head_dim]`. New history K/V are appended through
 `paged_kvcache_ops.append_kvcache` on CUDA; candidates are never persisted.
+The native append operator supports head dimensions 64, 128, 256 and 512.
 Reads materialize padded K/V and use PyTorch SDPA with an explicit recommendation
 mask and cached query offset. A tensor implementation of the same cache writes
 is available on CPU for numerical tests. It does not emulate asynchronous GPU
@@ -81,6 +82,9 @@ The layer implements `forward_naive`, `forward_input`, `forward_output` and
 Capture passes a nonzero token-count upper bound to the append operator so it
 does not read a GPU scalar back to the host. Native cache onload synchronization
 and offload are owned by the existing inference orchestration.
+Before each replay, `copy_kvcache_metadata` refreshes the static graph buffers,
+including `total_history_lengths`, so attention uses the current request's
+cached prefix lengths.
 
 Both existing exporter entry points propagate the backbone selection:
 
@@ -120,6 +124,13 @@ empty histories, half/bfloat16, HSTU/Transformer checkpoint handling, and
 torch.export save/reload with dynamic shapes and cache mutation. CUDA-only tests
 exercise the native append operator, graph capture/replay and the shared
 recommendation pre/postprocessor. A skip is not GPU validation.
+The graph regression changes history lengths and page mappings between requests
+and compares each replay against fresh eager inference.
+
+The CPU suite passes on PyTorch 2.5.1 and 2.12.0. Dynamic export is tested with
+both `strict=True` and `strict=False`, including replay with batch size one.
+These results do not validate the NVIDIA 26.05 Docker build (2.12.0a0), native
+CUDA operators or GPU graph replay; those checks remain pending.
 
 This backend prioritizes functional integration. Eager attention bounds query
 padding by the smaller of the packed token count and `max_seq_len`; export uses

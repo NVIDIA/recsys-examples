@@ -20,9 +20,14 @@ from torch.nn import functional as F
 
 HSTU_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(HSTU_ROOT))
+sys.path.insert(0, str(HSTU_ROOT.parents[1] / "corelib/recsys_kvcache_manager"))
 
 from modules.inference_checkpoint import load_dense_state_dict
 from modules.transformer_infer_layer import TransformerInferLayer
+from recsys_kvcache_manager.kvcache_metadata import (
+    copy_kvcache_metadata,
+    get_kvcache_metadata_buffer,
+)
 
 
 def config(**overrides):
@@ -151,6 +156,71 @@ def jagged(lengths, candidates):
     return SimpleNamespace(
         seqlen_offsets=offsets(lengths), num_candidates=torch.tensor(candidates)
     )
+
+
+def manager_metadata(histories, lengths, candidates, device="cpu"):
+    """Build real manager buffers for requests with two heads of width 64."""
+    source = make_metadata(histories, 1, 2, 64, torch.float16)
+    new_history = [n - c for n, c in zip(lengths, candidates)]
+    md = get_kvcache_metadata_buffer(
+        len(histories), sum(new_history), len(source.kv_indices), device=device
+    )
+    md.kv_cache_table = [source.kv_cache_table[0].to(device).normal_()]
+    for name in ("kv_indices", "kv_indptr", "total_history_lengths"):
+        getattr(md, name).copy_(getattr(source, name))
+    md.kv_last_page_len.copy_(
+        torch.tensor([(h - 1) % 4 + 1 if h else 0 for h in histories])
+    )
+    md.total_history_offsets.copy_(offsets(histories))
+    md.new_history_offsets.copy_(offsets(new_history))
+    md.new_history_nnz_cuda.fill_(sum(new_history))
+    md.kv_seqlens.copy_(torch.tensor([h + c for h, c in zip(histories, candidates)]))
+    md.kv_seqlen_offsets.copy_(offsets([h + c for h, c in zip(histories, candidates)]))
+    md.batch_indices.copy_(
+        torch.tensor([u for u, n in enumerate(new_history) for _ in range(n)])
+    )
+    md.position.copy_(
+        torch.tensor(
+            [p for h, n in zip(histories, new_history) for p in range(h - n, h)]
+        )
+    )
+    return md
+
+
+def test_copy_cache_metadata_refreshes_history_lengths_and_clears_padding():
+    """A graph buffer must reflect new requests without reallocating storage."""
+    dst = manager_metadata([2, 2], [3, 4], [1, 2])
+    pointer = dst.total_history_lengths.data_ptr()
+    for histories, lengths, candidates, expected in (
+        ([3, 2], [3, 4], [1, 2], [3, 2]),
+        ([1], [2], [1], [1, 0]),
+    ):
+        source = manager_metadata(histories, lengths, candidates)
+        copy_kvcache_metadata(dst, source)
+        torch.testing.assert_close(
+            dst.total_history_lengths, torch.tensor(expected, dtype=torch.int32)
+        )
+        assert dst.total_history_lengths.data_ptr() == pointer
+
+
+@torch.inference_mode()
+def test_split_layer_uses_refreshed_manager_metadata():
+    """Compare reused static metadata against fresh metadata on CPU."""
+    torch.manual_seed(456)
+    layer = TransformerInferLayer(
+        config(hidden_size=64, head_dim=64, fp16=True), 0, "cpu"
+    )
+    x = torch.randn(7, 64, dtype=torch.float16)
+    jd = jagged([3, 4], [1, 2])
+    static = manager_metadata([2, 2], [3, 4], [1, 2])
+    for histories in ([3, 2], [4, 3], [2, 2]):
+        source = manager_metadata(histories, [3, 4], [1, 2])
+        static.kv_cache_table[0].copy_(source.kv_cache_table[0])
+        expected = layer.forward_naive(2, 7, x, jd, source)
+        copy_kvcache_metadata(static, source)
+        layer.forward_input(2, 7, x, jd, static)
+        actual = layer.forward_output(2, 7, x, jd, static)
+        torch.testing.assert_close(actual, expected)
 
 
 @pytest.mark.parametrize("seed", range(8))
@@ -332,17 +402,23 @@ def test_hstu_checkpoint_transposition_is_preserved():
     torch.testing.assert_close(layer._linear_proj_weight, proj)
 
 
-def test_export_real_layer_dynamic_batch_and_tokens(tmp_path):
+@pytest.mark.parametrize("strict", [False, True])
+def test_export_real_layer_dynamic_batch_and_tokens(tmp_path, strict):
     layer = TransformerInferLayer(config(), 0, "cpu").eval()
     t = torch.export.Dim("tokens", min=2, max=40)
     b = torch.export.Dim("batch", min=1, max=4)
     args = (torch.randn(9, 12), offsets([4, 5]), torch.tensor([1, 2]))
-    ep = torch.export.export(layer, args, dynamic_shapes=({0: t}, {0: b + 1}, {0: b}))
+    ep = torch.export.export(
+        layer, args, dynamic_shapes=({0: t}, {0: b + 1}, {0: b}), strict=strict
+    )
     path = tmp_path / "transformer.pt2"
     torch.export.save(ep, path)
     replay = torch.export.load(path).module()
     for lengths, candidates in [
         ([2], [1]),
+        ([24], [0]),
+        ([5], [5]),
+        ([4, 5], [1, 2]),
         ([3, 5, 8], [1, 2, 3]),
         ([0, 4, 6, 12], [0, 0, 1, 2]),
         ([10, 11, 12], [3, 4, 5]),
@@ -471,7 +547,7 @@ def test_cuda_append_and_graph_matches_eager():
     import paged_kvcache_ops  # noqa: F401
 
     layer = TransformerInferLayer(
-        config(hidden_size=64, head_dim=32, fp16=True), 0
+        config(hidden_size=64, head_dim=64, fp16=True), 0
     ).eval()
     x = torch.randn(7, 64, device="cuda", dtype=torch.float16)
     jd = jagged([3, 4], [1, 2])
@@ -479,14 +555,7 @@ def test_cuda_append_and_graph_matches_eager():
         jd.seqlen_offsets.cuda(),
         jd.num_candidates.cuda(),
     )
-    md = make_metadata([2, 2], 1, 2, 32, torch.float16)
-    md.kv_cache_table = [md.kv_cache_table[0].cuda()]
-    for attr in ("kv_indices", "kv_indptr", "total_history_lengths"):
-        setattr(md, attr, getattr(md, attr).cuda())
-    md.batch_indices = torch.tensor([0, 0, 1, 1], dtype=torch.int32, device="cuda")
-    md.position = torch.tensor([0, 1, 0, 1], dtype=torch.int32, device="cuda")
-    md.kv_last_page_len = torch.tensor([2, 2], dtype=torch.int32, device="cuda")
-    md.new_history_nnz_cuda = torch.tensor([4], dtype=torch.int32, device="cuda")
+    md = manager_metadata([2, 2], [3, 4], [1, 2], device="cuda")
     with torch.inference_mode():
         expected = layer(x, jd.seqlen_offsets, jd.num_candidates)
         eager = layer.forward_naive(2, 7, x, jd, md)
@@ -504,3 +573,16 @@ def test_cuda_append_and_graph_matches_eager():
             output = layer.forward_output(2, 7, x, jd, md)
         graph.replay()
         torch.testing.assert_close(output, expected)
+
+        initial = output.clone()
+        for histories in ([3, 2], [4, 3], [2, 2]):
+            # Keep graph shapes fixed while changing the cached prefix lengths,
+            # positions and physical page mapping, just like a new request.
+            source = manager_metadata(histories, [3, 4], [1, 2], device="cuda")
+            md.kv_cache_table[0].copy_(source.kv_cache_table[0])
+            expected = layer.forward_naive(2, 7, x, jd, source)
+            copy_kvcache_metadata(md, source)
+            graph.replay()
+            torch.testing.assert_close(output, expected)
+            if histories == [3, 2]:
+                assert not torch.allclose(output, initial, atol=1e-3, rtol=1e-3)
