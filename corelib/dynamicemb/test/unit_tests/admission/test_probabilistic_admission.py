@@ -19,14 +19,23 @@ Admission is consulted only for a key that is missing, so one toss per
 appearance is what makes a key's chance of being in the table rise with how
 often it turns up. These check the distribution that produces, the two ends
 where no arithmetic applies, and that a batch holding a key k times is the same
-as k separate appearances.
+as k separate appearances. The strategy keeps no counter, so a checkpoint
+round trip must have nothing to say about one.
 """
 
 import math
+import warnings
 
 import pytest
 import torch
-from dynamicemb import ProbabilisticAdmissionStrategy
+import torch.distributed as dist
+from dynamicemb import (
+    DynamicEmbCheckMode,
+    DynamicEmbPoolingMode,
+    DynamicEmbTableOptions,
+    ProbabilisticAdmissionStrategy,
+)
+from dynamicemb.batched_dynamicemb_tables import BatchedDynamicEmbeddingTablesV2
 from dynamicemb.types import DynamicEmbInitializerArgs, DynamicEmbInitializerMode
 
 pytestmark = pytest.mark.skipif(
@@ -159,3 +168,54 @@ def test_rejects_a_probability_outside_the_unit_interval():
         ProbabilisticAdmissionStrategy(1.5)
     with pytest.raises(ValueError):
         ProbabilisticAdmissionStrategy(-0.1)
+
+
+def _table(probability):
+    options = DynamicEmbTableOptions(
+        index_type=torch.int64,
+        embedding_dtype=torch.float32,
+        device_id=torch.cuda.current_device(),
+        dim=8,
+        max_capacity=1024,
+        bucket_capacity=128,
+        safe_check_mode=DynamicEmbCheckMode.IGNORE,
+        local_hbm_for_values=1024**3,
+        admit_strategy=ProbabilisticAdmissionStrategy(probability),
+    )
+    return BatchedDynamicEmbeddingTablesV2(
+        table_options=[options],
+        output_dtype=torch.float32,
+        table_names=["t_0"],
+        feature_table_map=[0],
+        pooling_mode=DynamicEmbPoolingMode.SUM,
+        use_index_dedup=False,
+    )
+
+
+@pytest.fixture
+def single_process_group(tmp_path):
+    """Dumping needs a process group for its rank and barrier; one of one."""
+    dist.init_process_group(
+        "gloo", init_method=f"file://{tmp_path / 'pg'}", rank=0, world_size=1
+    )
+    yield
+    dist.destroy_process_group()
+
+
+def test_a_checkpoint_round_trip_has_no_counter_to_warn_about(
+    tmp_path, single_process_group
+):
+    """Asking to dump and load the counter -- what saving everything does --
+    is not a mistake when there is none to save, so neither side warns."""
+    table = _table(1.0)
+    keys = torch.arange(64, dtype=torch.int64, device="cuda")
+    offsets = torch.arange(keys.numel() + 1, dtype=torch.int64, device="cuda")
+    table(keys, offsets)
+
+    save_dir = tmp_path / "ckpt"
+    save_dir.mkdir()
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        table.dump(str(save_dir), counter=True)
+        _table(1.0).load(str(save_dir), counter=True)
+    assert not [w for w in caught if "Counter table" in str(w.message)]

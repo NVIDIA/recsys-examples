@@ -1564,7 +1564,9 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
             if rank == 0:
                 self._write_shard_meta(meta_file_path)
 
-            if not counter:
+            # No counter means no counter-based admission (e.g. probabilistic
+            # admission), so there is nothing to dump.
+            if not counter or counter_table is None:
                 continue
 
             counter_key_path = encode_counter_checkpoint_file_path(
@@ -1573,13 +1575,7 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
             counter_frequency_path = encode_counter_checkpoint_file_path(
                 save_dir, table_name, rank, world_size, "frequencies"
             )
-
-            if counter_table is not None:
-                counter_table.dump(counter_key_path, counter_frequency_path, table_id)
-            else:
-                warnings.warn(
-                    f"Counter table is none and will not dump it for table: {table_name}"
-                )
+            counter_table.dump(counter_key_path, counter_frequency_path, table_id)
 
     def load(
         self,
@@ -1648,9 +1644,11 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
             if not counter:
                 continue
             if counter_table is None:
-                warnings.warn(
-                    f"Counter table is none and will not load for table: {table_name}"
-                )
+                # Only worth a warning when the checkpoint has counter state to drop.
+                if counter_key_files:
+                    warnings.warn(
+                        f"Counter table is none and will not load for table: {table_name}"
+                    )
                 continue
             num_counter_key_files = len(counter_key_files)
             for i in range(num_counter_key_files):

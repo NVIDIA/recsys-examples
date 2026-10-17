@@ -1853,7 +1853,12 @@ def _validate_load_meta(
     """
     meta_data = load_from_json(meta_json_file_path)
     opt_type = meta_data.get("opt_type", None)
-    if opt_type and state.optimizer.get_opt_args().get("opt_type", None) != opt_type:
+    # The optimizer checks only matter when the caller asked for its states.
+    if (
+        include_optim
+        and opt_type
+        and state.optimizer.get_opt_args().get("opt_type", None) != opt_type
+    ):
         include_optim = False
         print(
             f"Optimizer type mismatch: {opt_type} != {state.optimizer.get_opt_args().get('opt_type')}. Will not load optimizer states."
@@ -1878,7 +1883,7 @@ def _validate_load_meta(
             f"Score file {score_file_path} does not exist. Will not load score states."
         )
 
-    if not opt_file_path or not os.path.exists(opt_file_path):
+    if include_optim and (not opt_file_path or not os.path.exists(opt_file_path)):
         include_optim = False
         print(
             f"Optimizer file {opt_file_path} does not exist. Will not load optimizer states."
