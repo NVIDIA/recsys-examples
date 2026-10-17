@@ -459,6 +459,7 @@ class InferenceEmbeddingCollection(torch.nn.Module):
         self.hash_table._ref_counter.zero_()
         weight.zero_()
 
+        sorted_file_names = sorted(os.listdir(save_dir))
         for table_id, table_name in enumerate(self.table_names_):
             if table_name not in requested_table_names:
                 continue
@@ -485,6 +486,7 @@ class InferenceEmbeddingCollection(torch.nn.Module):
                 table_name,
                 rank=0,
                 world_size=1,
+                sorted_file_names=sorted_file_names,
             )
 
             if len(emb_key_files) == 0:

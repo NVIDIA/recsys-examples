@@ -13,8 +13,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import bisect
+import fnmatch
 import json
 import os
+import re
 import warnings
 from collections import deque
 from copy import deepcopy
@@ -22,7 +25,7 @@ from dataclasses import dataclass
 from enum import Enum
 from functools import partial
 from itertools import accumulate
-from typing import Any, Callable, Deque, Dict, List, Optional, Tuple, Union
+from typing import Any, Callable, Deque, Dict, List, Optional, Sequence, Tuple, Union
 
 import torch  # usort:skip
 import torch.distributed as dist
@@ -101,7 +104,17 @@ def encode_counter_checkpoint_file_path(
     )
 
 
-def find_files(root_path: str, table_name: str, suffix: str) -> Tuple[List[str], int]:
+def find_files(
+    root_path: str, table_name: str, suffix: str, sorted_file_names: Sequence[str]
+) -> Tuple[List[str], int]:
+    """Find one table's checkpoint files of *suffix* among *sorted_file_names*.
+
+    *sorted_file_names* is the sorted listing of *root_path*, taken once by the
+    caller: a checkpoint directory holds every table's files, so globbing it per
+    table and per suffix lists it 6N times for N tables, which is slow where a
+    listing is expensive, such as object-storage mounts. Being sorted, the names
+    that can match sit together, so a lookup does not scan the whole listing.
+    """
     suffix_to_encode_file_path_func = {
         "emb_keys": partial(encode_checkpoint_file_path, item="keys"),
         "emb_values": partial(encode_checkpoint_file_path, item="values"),
@@ -116,10 +129,16 @@ def find_files(root_path: str, table_name: str, suffix: str) -> Tuple[List[str],
         raise RuntimeError(f"Invalid suffix: {suffix}")
     encode_file_path_func = suffix_to_encode_file_path_func[suffix]
 
-    import glob
-
     # v2 version
-    files = glob.glob(encode_file_path_func(root_path, table_name, "*", "*"))
+    pattern = os.path.basename(encode_file_path_func(root_path, table_name, "*", "*"))
+    prefix = re.split(r"[*?[]", pattern, maxsplit=1)[0]
+    start = end = bisect.bisect_left(sorted_file_names, prefix)
+    while end < len(sorted_file_names) and sorted_file_names[end].startswith(prefix):
+        end += 1
+    files = [
+        os.path.join(root_path, name)
+        for name in fnmatch.filter(sorted_file_names[start:end], pattern)
+    ]
     if len(files) == 0:
         return [], 0
     files = sorted(files)
@@ -144,14 +163,30 @@ def get_loading_files(
     name: str,
     rank: int,
     world_size: int,
+    sorted_file_names: Optional[Sequence[str]] = None,
 ) -> Tuple[List[str], List[str], List[str], List[str], int, int]:
+    """Resolve one table's checkpoint files under *root_path*.
+
+    Pass *sorted_file_names*, the sorted listing of *root_path*, when resolving
+    many tables, so the directory is listed once rather than once per table.
+    """
     if not os.path.exists(root_path):
         raise RuntimeError(f"can't find path to load, path:", root_path)
+    if sorted_file_names is None:
+        sorted_file_names = sorted(os.listdir(root_path))
 
-    key_files, num_key_files = find_files(root_path, name, "emb_keys")
-    value_files, num_value_files = find_files(root_path, name, "emb_values")
-    score_files, num_score_files = find_files(root_path, name, "emb_scores")
-    opt_files, num_opt_files = find_files(root_path, name, "opt_values")
+    key_files, num_key_files = find_files(
+        root_path, name, "emb_keys", sorted_file_names
+    )
+    value_files, num_value_files = find_files(
+        root_path, name, "emb_values", sorted_file_names
+    )
+    score_files, num_score_files = find_files(
+        root_path, name, "emb_scores", sorted_file_names
+    )
+    opt_files, num_opt_files = find_files(
+        root_path, name, "opt_values", sorted_file_names
+    )
 
     if num_key_files != num_value_files:
         assert (
@@ -162,10 +197,10 @@ def get_loading_files(
         )
 
     counter_key_files, num_counter_key_files = find_files(
-        root_path, name, "counter_keys"
+        root_path, name, "counter_keys", sorted_file_names
     )
     counter_freq_files, num_counter_freq_files = find_files(
-        root_path, name, "counter_frequencies"
+        root_path, name, "counter_frequencies", sorted_file_names
     )
 
     if num_counter_key_files != num_counter_freq_files:
@@ -1564,6 +1599,10 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
 
         storage = self._storage
         counter_table = self._admission_counter
+        # get_loading_files raises the missing-directory error itself.
+        sorted_file_names = (
+            sorted(os.listdir(save_dir)) if os.path.isdir(save_dir) else None
+        )
         for table_id, table_name in enumerate(self._table_names):
             if table_name not in set(table_names):
                 continue
@@ -1582,6 +1621,7 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                 table_name,
                 rank=rank,
                 world_size=world_size,
+                sorted_file_names=sorted_file_names,
             )
             if len(emb_key_files) == 0:
                 continue
