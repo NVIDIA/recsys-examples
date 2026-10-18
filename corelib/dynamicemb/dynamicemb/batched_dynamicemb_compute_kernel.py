@@ -23,6 +23,7 @@ import torch.distributed as dist
 from dynamicemb.batched_dynamicemb_tables import BatchedDynamicEmbeddingTablesV2
 from dynamicemb.dynamicemb_config import DynamicEmbPoolingMode, DynamicEmbTableOptions
 from dynamicemb.planner import DynamicEmbParameterSharding
+from dynamicemb.utils import checkpoint_dtype
 from fbgemm_gpu.split_table_batched_embeddings_ops_training import PoolingMode
 from torch import nn
 from torchrec.distributed.batched_embedding_kernel import (
@@ -159,7 +160,9 @@ def _gen_named_parameters_by_table_fused(
         #                                   dtype=emb_module.embedding_dtype))
         weight = nn.Parameter(
             torch.empty(
-                (1, 1), device=torch.device("meta"), dtype=emb_module.embedding_dtype
+                (1, 1),
+                device=torch.device("meta"),
+                dtype=checkpoint_dtype(emb_module.embedding_dtype),
             )
         )
         # this reuses logic in EmbeddingFusedOptimizer but is per table

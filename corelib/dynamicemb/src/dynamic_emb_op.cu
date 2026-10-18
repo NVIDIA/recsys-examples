@@ -173,8 +173,8 @@ void gather_embedding_pooled(
   const dyn_emb::PooledLayout layout{batch_size, num_slots / batch_size, total_D,
                                      dim, d_D_offsets};
   DISPATCH_INTEGER_DATATYPE_FUNCTION(offset_type, index_t, [&] {
-    DISPATCH_FLOAT_DATATYPE_FUNCTION(src_type, src_t, [&] {
-      DISPATCH_FLOAT_DATATYPE_FUNCTION(dst_type, dst_t, [&] {
+    DISPATCH_VALUE_DATATYPE_FUNCTION(src_type, src_t, [&] {
+      DISPATCH_VALUE_DATATYPE_FUNCTION(dst_type, dst_t, [&] {
         dyn_emb::scatter_combine<src_t, dst_t, index_t>(
             get_pointer<const src_t>(input),
             get_pointer<dst_t>(output),
@@ -645,7 +645,7 @@ void load_from_flat_table_impl(at::Tensor table_ptrs, at::Tensor indices,
 
   auto stream = at::cuda::getCurrentCUDAStream().stream();
 
-  DISPATCH_FLOAT_DATATYPE_FUNCTION(val_type, ValueType, [&] {
+  DISPATCH_VALUE_DATATYPE_FUNCTION(val_type, ValueType, [&] {
     DISPATCH_OFFSET_INT_TYPE(index_type, IndexType, [&] {
       if (all_dims_vec4 && output_dim >= 4) {
         int grid_size;
@@ -747,7 +747,7 @@ void store_to_flat_table_impl(at::Tensor table_ptrs, at::Tensor indices,
 
   auto stream = at::cuda::getCurrentCUDAStream().stream();
 
-  DISPATCH_FLOAT_DATATYPE_FUNCTION(val_type, ValueType, [&] {
+  DISPATCH_VALUE_DATATYPE_FUNCTION(val_type, ValueType, [&] {
     DISPATCH_OFFSET_INT_TYPE(index_type, IndexType, [&] {
       if (all_dims_vec4 && input_dim >= 4) {
         int grid_size;
@@ -896,7 +896,7 @@ void select_insert_failed_values(at::Tensor indices, at::Tensor input_values,
 
   auto stream = at::cuda::getCurrentCUDAStream().stream();
 
-  DISPATCH_FLOAT_DATATYPE_FUNCTION(val_type, ValueType, [&] {
+  DISPATCH_VALUE_DATATYPE_FUNCTION(val_type, ValueType, [&] {
     DISPATCH_OFFSET_INT_TYPE(index_type, IndexType, [&] {
       auto in_v_ptr = get_pointer<ValueType>(input_values);
       auto out_v_ptr = get_pointer<ValueType>(evictd_values);
@@ -927,6 +927,7 @@ void bind_dyn_emb_op(py::module &m) {
       .value("Float32", dyn_emb::DataType::Float32)
       .value("BFloat16", dyn_emb::DataType::BFloat16)
       .value("Float16", dyn_emb::DataType::Float16)
+      .value("Float8", dyn_emb::DataType::Float8)
       .value("Int64", dyn_emb::DataType::Int64)
       .value("UInt64", dyn_emb::DataType::UInt64)
       .value("Int32", dyn_emb::DataType::Int32)

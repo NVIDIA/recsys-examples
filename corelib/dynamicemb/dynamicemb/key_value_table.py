@@ -59,6 +59,7 @@ from dynamicemb.types import (
     Storage,
     torch_dtype_to_np_dtype,
 )
+from dynamicemb.utils import checkpoint_dtype, decode_table_values, encode_table_values
 from dynamicemb_extensions import EvictStrategy, device_timestamp, flagged_compact
 from dynamicemb_extensions import load_from_flat_table_contiguous as _load_contiguous
 from dynamicemb_extensions import load_from_flat_table_emb as _load_emb
@@ -1108,7 +1109,7 @@ def _split_value_row(
     """
     emb_dim = state.table_emb_dims_cpu[table_id]
     optim_state_dim = state.table_value_dims_cpu[table_id] - emb_dim
-    emb = values[:, :emb_dim].to(dtype=state.emb_dtype)
+    emb = decode_table_values(values[:, :emb_dim], checkpoint_dtype(state.emb_dtype))
     if optim_state_dim <= 0:
         return emb, None
     opt = values[:, -optim_state_dim:]
@@ -1158,7 +1159,7 @@ def store_to_flat(
         state.table_ptrs_dev,
         indices,
         table_ids,
-        values.to(state.emb_dtype),
+        encode_table_values(values, state.emb_dtype),
         state.table_value_dims,
         state.table_emb_dims,
         state.emb_dim,
@@ -1205,7 +1206,7 @@ def store_to_flat_single_table(
         state.table_ptrs_dev,
         indices,
         table_id,
-        values.to(state.emb_dtype),
+        encode_table_values(values, state.emb_dtype),
         state.table_value_dims,
         state.table_emb_dims,
         state.emb_dim,
@@ -1609,7 +1610,9 @@ def export_keys_values_iter(
         scores = named_scores[state.score_policy.name]
         flat_rows = _flat_row_indices_from_slots_and_scores(state, indices, scores)
         values = load_from_flat_single_table(state, flat_rows, table_id)
-        embeddings = values[:, :emb_dim_t].contiguous()
+        embeddings = decode_table_values(
+            values[:, :emb_dim_t], checkpoint_dtype(state.emb_dtype)
+        ).contiguous()
         if optim_state_dim != 0:
             opt_states = values[:, -optim_state_dim:].contiguous().to(device)
         else:
@@ -1665,7 +1668,9 @@ def _dump_table(
         # whole on every dump (by rank 0 only, and not by the appending second
         # tier of a hybrid dump): anything a loader needs has to be contributed
         # here, because there is no later pass that merges into the file.
-        meta_data[META_EMBEDDING_DTYPE] = dtype_to_meta_name(state.emb_dtype)
+        meta_data[META_EMBEDDING_DTYPE] = dtype_to_meta_name(
+            checkpoint_dtype(state.emb_dtype)
+        )
         meta_data[META_EMBEDDING_DIM] = int(state.table_emb_dims_cpu[table_id])
         # Recorded separately from the embedding dtype because the two can
         # differ: rowwise Adagrad keeps its accumulator in fp32 in any table.
@@ -1884,7 +1889,7 @@ def _validate_load_meta(
             f"Embedding dim mismatch: {embedding_file_path} holds rows of "
             f"{ckpt_emb_dim} but the runtime table is configured with dim {dim}."
         )
-    if emb_dtype != state.emb_dtype:
+    if emb_dtype not in (state.emb_dtype, checkpoint_dtype(state.emb_dtype)):
         # Not fatal: the insert path casts, so this is a deliberate precision
         # migration as often as it is a mistake. Say which way it goes, since
         # narrowing loses bits that the checkpoint still has.
@@ -1967,7 +1972,7 @@ def _load_key_values(
     # be the table's dtype (rowwise Adagrad keeps an fp32 accumulator), and an
     # elementwise cast here would round that accumulator away. The branch below
     # only calls it when the state is non-empty, which is the case it casts.
-    embeddings = embeddings.to(state.emb_dtype)
+    embeddings = encode_table_values(embeddings, state.emb_dtype)
 
     if opt_states is None and runtime_optstate_dim > 0:
         opt_states = torch.empty(
@@ -2100,7 +2105,7 @@ def _replay_write_values(
         return
     emb_dim_cfg = state.table_emb_dims_cpu[table_id]
     optstate_dim = state.optimizer.get_state_dim(emb_dim_cfg)
-    embeddings = embeddings.to(dtype=state.emb_dtype)
+    embeddings = encode_table_values(embeddings, state.emb_dtype)
     want_opt = ReplayContent.OPTIMIZER_STATE in content and optstate_dim > 0
 
     if optstate_dim == 0:
@@ -2249,7 +2254,7 @@ def _replay_state_increment(
         return stats
     device = state.device
     keys = keys.to(device=device, dtype=state.key_index_map.key_type)
-    embeddings = values.to(device=device, dtype=state.emb_dtype)
+    embeddings = encode_table_values(values.to(device=device), state.emb_dtype)
     slots = slot_index.to(device=device, dtype=torch.int64)
     stats.upserted = _replay_at_slots(
         state,
@@ -2876,11 +2881,18 @@ class DynamicEmbStorage(Storage):
         else:
             dev = device_for_gather if do_multi_rank_gather else "cpu"
             keys_cat = torch.empty(0, dtype=torch.int64, device=dev)
-            values_cat = torch.empty(0, emb_dim_t, dtype=state.emb_dtype, device=dev)
+            values_cat = torch.empty(
+                0, emb_dim_t, dtype=checkpoint_dtype(state.emb_dtype), device=dev
+            )
             slots_cat = torch.empty(0, dtype=torch.int64, device=dev)
             scores_cat = torch.empty(0, num_scores, dtype=SCORE_TYPE, device=dev)
             opts_cat = (
-                torch.empty(0, opt_dim_t, dtype=state.emb_dtype, device=dev)
+                torch.empty(
+                    0,
+                    opt_dim_t,
+                    dtype=state.optimizer.get_state_dtype(state.emb_dtype),
+                    device=dev,
+                )
                 if opt_dim_t > 0
                 else None
             )
@@ -3492,11 +3504,15 @@ class HybridStorage(Storage):
             dev = device_for_gather if do_multi_rank_gather else "cpu"
             dt = self.embedding_dtype()
             keys_cat = torch.empty(0, dtype=torch.int64, device=dev)
-            values_cat = torch.empty(0, emb_dim_t, dtype=dt, device=dev)
+            values_cat = torch.empty(
+                0, emb_dim_t, dtype=checkpoint_dtype(dt), device=dev
+            )
             slots_cat = torch.empty(0, dtype=torch.int64, device=dev)
             scores_cat = torch.empty(0, num_scores, dtype=SCORE_TYPE, device=dev)
             opts_cat = (
-                torch.empty(0, opt_dim_t, dtype=dt, device=dev)
+                torch.empty(
+                    0, opt_dim_t, dtype=st0.optimizer.get_state_dtype(dt), device=dev
+                )
                 if opt_dim_t > 0
                 else None
             )
@@ -3776,11 +3792,11 @@ class HybridStorage(Storage):
             vtype = self._hbm.emb_dtype
             values = (
                 torch.cat(
-                    [embeddings.to(vtype), opt_states.to(vtype)],
+                    [encode_table_values(embeddings, vtype), opt_states.to(vtype)],
                     dim=-1,
                 )
                 if opt_states is not None
-                else embeddings.to(vtype)
+                else encode_table_values(embeddings, vtype)
             )
 
             tids = torch.full(

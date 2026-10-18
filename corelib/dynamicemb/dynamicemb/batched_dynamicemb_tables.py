@@ -68,7 +68,7 @@ from dynamicemb.optimizer import (
 )
 from dynamicemb.scored_hashtable import murmur3_fmix64
 from dynamicemb.types import ReplayStats
-from dynamicemb.utils import DTYPE_NUM_BYTES
+from dynamicemb.utils import DTYPE_NUM_BYTES, checkpoint_dtype
 from dynamicemb_extensions import device_timestamp
 from fbgemm_gpu.split_table_batched_embeddings_ops_training import (
     BoundsCheckMode,
@@ -756,7 +756,7 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                 10,
                 requires_grad=True,
                 device=torch.device(self.device_id),
-                dtype=self.embedding_dtype,
+                dtype=checkpoint_dtype(self.embedding_dtype),
             )
         )
 
@@ -1112,7 +1112,9 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
         for t, _ in enumerate(self._dynamicemb_options):
             splits.append(
                 torch.empty(
-                    (1, 1), device=torch.device("cuda"), dtype=self.embedding_dtype
+                    (1, 1),
+                    device=torch.device("cuda"),
+                    dtype=checkpoint_dtype(self.embedding_dtype),
                 )
             )
         return splits
@@ -1638,7 +1640,10 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
 
         if len(keys_list) == 0:
             return torch.empty(0, dtype=torch.int64, device=device), torch.empty(
-                0, 0, dtype=self._storage.embedding_dtype(), device=device
+                0,
+                0,
+                dtype=checkpoint_dtype(self._storage.embedding_dtype()),
+                device=device,
             )
         return torch.cat(keys_list), torch.cat(values_list, dim=0)
 
