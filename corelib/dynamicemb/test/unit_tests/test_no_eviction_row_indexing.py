@@ -349,27 +349,36 @@ def test_caching_backing_retains_every_key(current_device):
     )
 
 
-def test_hbm_direct_backward_writes_the_right_row(current_device):
-    """The backward half of the slot/row split, on the layout where they differ.
+@pytest.mark.parametrize(
+    "dtype",
+    [torch.float32, torch.float16, torch.bfloat16],
+    ids=["fp32", "fp16", "bf16"],
+)
+@pytest.mark.parametrize("dim", [8, 6], ids=["vec4", "scalar"])
+@pytest.mark.parametrize(
+    "optimizer", [EmbOptimType.SGD, EmbOptimType.ADAM], ids=["sgd", "adam"]
+)
+def test_hbm_direct_backward_writes_the_right_row(
+    current_device, dtype, dim, optimizer
+):
+    """Both optimizer paths must address values by row and counters by hash slot.
 
-    ``fused_update_for_flat_table`` writes gradients into the **value buffer**
-    (rows) while ``decrement_counter`` touches the **ref counter** (slots). Every
-    other test here is forward-only, so this is the only coverage of the backward
-    index space -- and NO_EVICTION on HBM-direct is the one configuration where
-    feeding it a slot instead of a row would corrupt a different key's row.
+    Use small, exactly representable DEBUG values even though the full keys are
+    large and distinct. At the old 5001..5300 initial values a BF16 update of 0.5
+    rounds away, so an unchanged row could pass without exercising a write.
 
-    ``loss = out.sum()`` gives every element a gradient of exactly 1, so plain SGD
-    moves each embedding from ``key % DEBUG_MOD`` to ``key % DEBUG_MOD - lr``. A
-    write that landed on the wrong row shows up as one key un-updated and another
-    double-updated.
+    With beta1 = beta2 = 0.5, eps = 0 and constant gradients, Adam's bias-corrected
+    moments give an update of lr * sign(grad). The first three stored moments are
+    exactly (1 - 2**-step) * grad and (1 - 2**-step) * grad**2 in every dtype.
+    This hand-computable oracle checks the physical m/v rows as well as weights.
     """
     device = torch.device(f"cuda:{current_device}")
     lr = 0.5
     options = DynamicEmbTableOptions(
         index_type=torch.int64,
-        embedding_dtype=torch.float32,
+        embedding_dtype=dtype,
         device_id=current_device,
-        dim=DIM,
+        dim=dim,
         max_capacity=65536 * 2,
         bucket_capacity=128,
         safe_check_mode=DynamicEmbCheckMode.IGNORE,
@@ -387,32 +396,72 @@ def test_hbm_direct_backward_writes_the_right_row(current_device):
         feature_table_map=[0],
         pooling_mode=DynamicEmbPoolingMode.SUM,
         use_index_dedup=False,
-        optimizer=EmbOptimType.SGD,
+        optimizer=optimizer,
         learning_rate=lr,
+        beta1=0.5,
+        beta2=0.5,
+        eps=0.0,
+        weight_decay=0.0,
         stochastic_rounding=False,
     )
     assert model._cache is None, "expected the HBM-direct layout"
-    keys = list(range(5001, 5301))
-
-    out = lookup(model, keys, device)  # insert; rows come from the counter
-    assert_debug_values(out, keys)
-    out.sum().backward()
-    torch.cuda.synchronize()
-
-    # Re-read: this lookup takes the resident path, where the row must come from
-    # the stored score rather than the hash slot.
-    after = lookup(model, keys, device)
-    expected = torch.tensor(
-        [k % DEBUG_MOD - lr for k in keys], dtype=after.dtype, device=after.device
+    assert model._storage.embedding_dtype() == dtype
+    assert model._storage._state.tables[0].tensor().dtype == dtype
+    keys = [DEBUG_MOD * (i + 1) + i % 16 + 1 for i in range(300)]
+    # Keep every key's gradient nonzero: eps=0 would make Adam's zero-gradient
+    # case 0/0. Different magnitudes distinguish SGD from Adam's normalization.
+    coeffs = torch.tensor([1.0, -1.0, 2.0], device=device).repeat(100)
+    initial = torch.tensor(
+        [k % DEBUG_MOD for k in keys], dtype=torch.float32, device=device
     )
-    torch.testing.assert_close(after, expected.unsqueeze(1).expand(-1, after.size(1)))
+    indices = torch.tensor(keys, dtype=torch.int64, device=device)
+    offsets = torch.arange(len(keys) + 1, dtype=torch.int64, device=device)
+    update = coeffs if optimizer == EmbOptimType.SGD else coeffs.sign()
 
-    # A second step must move every row again by exactly lr -- no row left behind,
-    # none hit twice.
-    after.sum().backward()
-    torch.cuda.synchronize()
-    final = lookup(model, keys, device)
-    expected2 = torch.tensor(
-        [k % DEBUG_MOD - 2 * lr for k in keys], dtype=final.dtype, device=final.device
-    )
-    torch.testing.assert_close(final, expected2.unsqueeze(1).expand(-1, final.size(1)))
+    out = model(indices, offsets)
+    torch.testing.assert_close(out, initial[:, None].expand(-1, dim), rtol=0, atol=0)
+    for step in range(1, 4):
+        (out * coeffs[:, None]).sum().backward()
+        torch.cuda.synchronize()
+
+        # Export independently from the training forward/backward path; checking
+        # only another lookup could let a paired wrong-row read/write hide a bug.
+        exported_keys, exported_weights, exported_states = [], [], []
+        for stored_keys, weights, states, _ in model._storage.export_keys_values(
+            device
+        ):
+            exported_keys.extend(stored_keys.tolist())
+            exported_weights.append(weights)
+            if states is not None:
+                exported_states.append(states)
+        assert len(exported_keys) == len(keys)
+        assert set(exported_keys) == set(keys)
+        input_positions = {key: i for i, key in enumerate(keys)}
+        positions = torch.tensor(
+            [input_positions[key] for key in exported_keys], device=device
+        )
+        weights = torch.cat(exported_weights)
+        expected = (initial - step * lr * update)[positions].to(dtype)
+        torch.testing.assert_close(
+            weights, expected[:, None].expand(-1, dim), rtol=0, atol=0
+        )
+        if optimizer == EmbOptimType.ADAM:
+            assert model._optimizer.get_opt_args()["iters"] == step
+            states = torch.cat(exported_states)
+            scale = 1 - 2.0**-step
+            expected_m = (scale * coeffs[positions]).to(dtype)
+            expected_v = (scale * coeffs[positions] ** 2).to(dtype)
+            torch.testing.assert_close(
+                states[:, :dim], expected_m[:, None].expand(-1, dim), rtol=0, atol=0
+            )
+            torch.testing.assert_close(
+                states[:, dim:], expected_v[:, None].expand(-1, dim), rtol=0, atol=0
+            )
+
+        # Reuse the resident-key lookup for the next training iteration; an
+        # extra forward-only probe would pin another set of counter entries.
+        out = model(indices, offsets)
+        expected = initial - step * lr * update
+        torch.testing.assert_close(
+            out, expected[:, None].expand(-1, dim), rtol=0, atol=0
+        )
