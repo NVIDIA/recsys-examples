@@ -908,3 +908,377 @@ def test_lru_lfu_insert_after_erase_no_phantom_frequency(current_device):
         f"phantom frequency: insert returned frequency "
         f"{int(new_score_out[0].item())}, expected 1"
     )
+
+
+# ---------------------------------------------------------------------------
+# Full-bucket eviction on a 2-word table through every insert entry point. The
+# victim must be picked by the ranked (LruLfu) comparator no matter which score
+# policy the caller passes: load places keys with a frequency-neutral insert,
+# backward refresh uses CONST, rehash uses ASSIGN. None of them may reach the
+# single-score reduce() (device assert `num_scores_ == 1`).
+# ---------------------------------------------------------------------------
+
+
+def _filled_storage(n_keys, freq, score_strategy=LRU_LFU_TS_FIRST, dim=8):
+    device = torch.cuda.current_device()
+    storage = _lru_lfu_storage(
+        dim=dim, max_capacity=4096, score_strategy=score_strategy
+    )
+    keys = torch.arange(1, 1 + n_keys, dtype=torch.int64, device=device)
+    tids = torch.zeros(n_keys, dtype=torch.int64, device=device)
+    values = torch.randn(n_keys, dim, dtype=torch.float32, device=device)
+    storage.insert(keys, tids, values, scores=freq.to(torch.uint64))
+    return storage, keys
+
+
+def _dump(storage, d):
+    paths = [f"{d}/meta.json", f"{d}/keys", f"{d}/emb", f"{d}/score", f"{d}/opt"]
+    storage.dump(0, *paths, include_optim=False)
+    return paths
+
+
+def _read_dump(paths, dim=8):
+    keys = np.fromfile(paths[1], dtype=np.int64)
+    emb = np.fromfile(paths[2], dtype=np.float32).reshape(-1, dim)
+    scores = np.fromfile(paths[3], dtype=np.uint64).reshape(-1, 2)
+    return {int(k): (emb[i], scores[i]) for i, k in enumerate(keys.tolist())}
+
+
+def _source_dump(tmp_path, name, keys, freq, score_strategy=LRU_LFU_TS_FIRST, dim=8):
+    device = torch.cuda.current_device()
+    src = _lru_lfu_storage(dim=dim, max_capacity=4096, score_strategy=score_strategy)
+    keys = keys.to(device)
+    tids = torch.zeros(keys.numel(), dtype=torch.int64, device=device)
+    values = torch.randn(keys.numel(), dim, dtype=torch.float32, device=device)
+    src.insert(keys, tids, values, scores=freq.to(device).to(torch.uint64))
+    d = tmp_path / name
+    d.mkdir()
+    return _dump(src, str(d))
+
+
+def _assert_rows_match_sources(dst, tmp_path, sources):
+    d = tmp_path / "dst_dump"
+    d.mkdir()
+    got = _read_dump(_dump(dst, str(d)))
+    expected = {}
+    for paths in sources:
+        expected.update(_read_dump(paths))
+    for key, (emb, scores) in got.items():
+        assert key in expected, f"loaded table holds unknown key {key}"
+        np.testing.assert_array_equal(emb, expected[key][0])
+        np.testing.assert_array_equal(scores, expected[key][1])
+    return set(got)
+
+
+@pytest.mark.parametrize(
+    "score_strategy",
+    [LRU_LFU_TS_FIRST, LRU_LFU_LFU_FIRST],
+    ids=["ts_first", "lfu_first"],
+)
+def test_lru_lfu_load_overflow_evicts_lowest_frequency(
+    current_device, tmp_path, score_strategy
+):
+    """Loading more keys than a bucket holds evicts the lowest-frequency keys
+    already in the table and keeps every row's (value, score block) intact."""
+    bc = 128
+    n_hot, n_cold, n_new = 20, 80, 60
+    first_keys = torch.arange(1, 1 + n_hot + n_cold, dtype=torch.int64)
+    first_freq = torch.cat(
+        [
+            torch.arange(1000, 1000 + n_hot, dtype=torch.int64),
+            torch.arange(1, 1 + n_cold, dtype=torch.int64),
+        ]
+    )
+    new_keys = torch.arange(10001, 10001 + n_new, dtype=torch.int64)
+    new_freq = torch.full((n_new,), 500, dtype=torch.int64)
+    first = _source_dump(tmp_path, "first", first_keys, first_freq, score_strategy)
+    second = _source_dump(tmp_path, "second", new_keys, new_freq, score_strategy)
+
+    dst = _lru_lfu_storage(
+        max_capacity=bc, init_capacity=bc, score_strategy=score_strategy
+    )
+    dst.load(0, *first, include_optim=False)
+    dst.load(0, *second, include_optim=False)
+    torch.cuda.synchronize()
+
+    assert dst.size() == bc
+    present = _assert_rows_match_sources(dst, tmp_path, [first, second])
+    num_evicted = n_hot + n_cold + n_new - bc
+    lowest = set(range(1 + n_hot, 1 + n_hot + num_evicted))
+    expected = (set(first_keys.tolist()) | set(new_keys.tolist())) - lowest
+    assert present == expected
+
+
+def test_lru_lfu_load_overflow_single_batch(current_device, tmp_path):
+    """A single load batch larger than the bucket fills it without crashing and
+    without mixing rows of different keys."""
+    bc = 128
+    n = 200
+    keys = torch.arange(1, 1 + n, dtype=torch.int64)
+    freq = torch.arange(1, 1 + n, dtype=torch.int64)
+    paths = _source_dump(tmp_path, "src", keys, freq)
+
+    dst = _lru_lfu_storage(max_capacity=bc, init_capacity=bc)
+    dst.load(0, *paths, include_optim=False)
+    torch.cuda.synchronize()
+
+    assert dst.size() == bc
+    present = _assert_rows_match_sources(dst, tmp_path, [paths])
+    assert len(present) == bc
+
+
+def test_lru_lfu_load_overflow_honors_custom_score_function(current_device, tmp_path):
+    """Load-time eviction ranks by the table's own score_function (here: evict
+    the HIGHEST frequency first), not by the default frequency order."""
+    bc = 128
+    n_first, n_new = 100, 60
+    first_keys = torch.arange(1, 1 + n_first, dtype=torch.int64)
+    first_freq = torch.arange(1, 1 + n_first, dtype=torch.int64)
+    new_keys = torch.arange(10001, 10001 + n_new, dtype=torch.int64)
+    new_freq = torch.full((n_new,), 1, dtype=torch.int64)
+    first = _source_dump(tmp_path, "first", first_keys, first_freq)
+    second = _source_dump(tmp_path, "second", new_keys, new_freq)
+
+    dst = _lru_lfu_storage(
+        max_capacity=bc, init_capacity=bc, score_function=_evict_high_freq_first
+    )
+    assert dst.key_index_map.score_fn_key_ != 0
+    dst.load(0, *first, include_optim=False)
+    dst.load(0, *second, include_optim=False)
+    torch.cuda.synchronize()
+
+    present = _assert_rows_match_sources(dst, tmp_path, [first, second])
+    num_evicted = n_first + n_new - bc
+    highest = set(range(1 + n_first - num_evicted, 1 + n_first))
+    assert present == (set(first_keys.tolist()) | set(new_keys.tolist())) - highest
+
+
+@pytest.mark.parametrize("policy", [ScorePolicy.CONST, ScorePolicy.ASSIGN])
+@pytest.mark.parametrize("op", ["insert", "insert_and_evict"])
+def test_lru_lfu_non_lru_lfu_policy_on_full_bucket(current_device, policy, op):
+    """CONST / ASSIGN inserts (backward refresh, rehash, table-level load) into a
+    full 2-word bucket evict the lowest-frequency keys by the default ranking."""
+    device = torch.cuda.current_device()
+    bc = 128
+    table = _lru_lfu_table(bc, bucket_capacity=bc)
+    keys = torch.arange(1, 1 + bc, dtype=torch.int64, device=device)
+    tids = torch.zeros(bc, dtype=torch.int64, device=device)
+    freq = torch.arange(1, 1 + bc, dtype=torch.int64, device=device).to(torch.uint64)
+    _insert(table, keys, tids, freq)
+
+    n_new = 16
+    new_keys = torch.arange(10001, 10001 + n_new, dtype=torch.int64, device=device)
+    new_tids = torch.zeros(n_new, dtype=torch.int64, device=device)
+    value = (
+        None
+        if policy == ScorePolicy.CONST
+        else torch.full((n_new,), 7, dtype=torch.uint64, device=device)
+    )
+    score_arg = ScoreArg(name="frequency", value=value, policy=policy)
+    if op == "insert":
+        table.insert(new_keys, new_tids, score_arg)
+    else:
+        _, num_evicted, evicted_keys, _, _, _ = table.insert_and_evict(
+            new_keys, new_tids, score_arg
+        )
+        assert int(num_evicted) == n_new
+        assert set(evicted_keys[: int(num_evicted)].tolist()) == set(
+            range(1, 1 + n_new)
+        )
+    torch.cuda.synchronize()
+
+    lookup = ScoreArg(name="frequency", value=None, policy=ScorePolicy.CONST)
+    _, new_found, _ = table.lookup(new_keys, new_tids, lookup)
+    _, old_found, _ = table.lookup(keys, tids, lookup)
+    assert bool(new_found.all())
+    assert set(keys[~old_found].tolist()) == set(range(1, 1 + n_new))
+
+
+def test_lru_lfu_storage_preserve_existing_insert_into_full_bucket(current_device):
+    """storage.insert(preserve_existing=True) (backward refresh, CONST) of keys
+    that are no longer in a full bucket evicts the lowest-frequency keys."""
+    device = torch.cuda.current_device()
+    bc = 128
+    storage = _lru_lfu_storage(max_capacity=bc, init_capacity=bc)
+    keys = torch.arange(1, 1 + bc, dtype=torch.int64, device=device)
+    tids = torch.zeros(bc, dtype=torch.int64, device=device)
+    freq = torch.arange(1, 1 + bc, dtype=torch.int64, device=device)
+    storage.insert(
+        keys, tids, torch.randn(bc, 8, device=device), scores=freq.to(torch.uint64)
+    )
+
+    n_new = 16
+    new_keys = torch.arange(10001, 10001 + n_new, dtype=torch.int64, device=device)
+    new_tids = torch.zeros(n_new, dtype=torch.int64, device=device)
+    storage.insert(
+        new_keys, new_tids, torch.randn(n_new, 8, device=device), preserve_existing=True
+    )
+    torch.cuda.synchronize()
+
+    lookup = ScoreArg(name=storage._state.score_policy.name, policy=ScorePolicy.CONST)
+    _, old_found, _ = storage.key_index_map.lookup(keys, tids, lookup)
+    assert set(keys[~old_found].tolist()) == set(range(1, 1 + n_new))
+
+
+def test_lru_lfu_storage_insert_overflow_evicts_lowest_frequency(current_device):
+    """Training-time storage.insert (LRU_LFU policy, the cubin path) into a full
+    bucket evicts the lowest-frequency keys (regression guard)."""
+    device = torch.cuda.current_device()
+    bc = 128
+    storage = _lru_lfu_storage(max_capacity=bc, init_capacity=bc)
+    keys = torch.arange(1, 1 + bc, dtype=torch.int64, device=device)
+    tids = torch.zeros(bc, dtype=torch.int64, device=device)
+    freq = torch.arange(100, 100 + bc, dtype=torch.int64, device=device)
+    storage.insert(
+        keys, tids, torch.randn(bc, 8, device=device), scores=freq.to(torch.uint64)
+    )
+
+    n_new = 16
+    new_keys = torch.arange(10001, 10001 + n_new, dtype=torch.int64, device=device)
+    new_tids = torch.zeros(n_new, dtype=torch.int64, device=device)
+    storage.insert(
+        new_keys,
+        new_tids,
+        torch.randn(n_new, 8, device=device),
+        scores=torch.ones(n_new, dtype=torch.uint64, device=device),
+    )
+    torch.cuda.synchronize()
+
+    lookup = ScoreArg(name=storage._state.score_policy.name, policy=ScorePolicy.CONST)
+    _, old_found, _ = storage.key_index_map.lookup(keys, tids, lookup)
+    _, new_found, _ = storage.key_index_map.lookup(new_keys, new_tids, lookup)
+    assert bool(new_found.all())
+    assert set(keys[~old_found].tolist()) == set(range(1, 1 + n_new))
+
+
+@pytest.mark.parametrize(
+    "caching, local_hbm_for_values",
+    [(False, 1024**3), (False, 0), (True, 1024**3)],
+    ids=["hbm", "host", "caching"],
+)
+def test_lru_lfu_batched_training_overflow(
+    current_device, caching, local_hbm_for_values
+):
+    """Training forward/backward (find_or_insert + backward refresh) on an
+    LruLfu table that sees far more keys than it holds: no crash, the table stays
+    at capacity, and a key accessed every step survives."""
+    from dynamicemb import DynamicEmbPoolingMode
+    from dynamicemb.batched_dynamicemb_tables import BatchedDynamicEmbeddingTablesV2
+    from fbgemm_gpu.split_embedding_configs import EmbOptimType
+
+    device = torch.cuda.current_device()
+    bc = 128
+    opts = [
+        DynamicEmbTableOptions(
+            dim=8,
+            max_capacity=bc,
+            init_capacity=bc,
+            index_type=torch.int64,
+            embedding_dtype=torch.float32,
+            device_id=device,
+            bucket_capacity=bc,
+            safe_check_mode=DynamicEmbCheckMode.IGNORE,
+            local_hbm_for_values=local_hbm_for_values,
+            caching=caching,
+            score_strategy=LRU_LFU_TS_FIRST,
+        )
+    ]
+    bdebt = BatchedDynamicEmbeddingTablesV2(
+        table_names=["t0"],
+        table_options=opts,
+        feature_table_map=[0],
+        pooling_mode=DynamicEmbPoolingMode.NONE,
+        optimizer=EmbOptimType.EXACT_ROWWISE_ADAGRAD,
+        learning_rate=0.1,
+    )
+    bdebt.train()
+    hot = torch.arange(1, 9, dtype=torch.int64, device=device)
+    for step in range(8):
+        fresh = torch.arange(
+            1000 + step * 64, 1000 + (step + 1) * 64, dtype=torch.int64, device=device
+        )
+        indices = torch.cat([hot, fresh])
+        offsets = torch.tensor([0, indices.numel()], dtype=torch.int64, device=device)
+        bdebt(indices, offsets).sum().backward()
+        torch.cuda.synchronize()
+
+    storage_map = bdebt._storage.key_index_map
+    assert storage_map.size() <= bc
+    lookup = ScoreArg(name=storage_map.score_names_[0], policy=ScorePolicy.CONST)
+    _, hot_found, _ = storage_map.lookup(hot, torch.zeros_like(hot), lookup)
+    if not caching:
+        assert bool(hot_found.all())
+
+
+@pytest.mark.parametrize(
+    "score_strategy", [DynamicEmbScoreStrategy.TIMESTAMP, DynamicEmbScoreStrategy.LFU]
+)
+def test_single_score_load_overflow_evicts_lowest_score(
+    current_device, tmp_path, score_strategy
+):
+    """Single-score LRU / LFU tables keep their load-time eviction (lowest score
+    out) with the 2-word fix in place."""
+    from dynamicemb_extensions import device_timestamp
+
+    device = torch.cuda.current_device()
+    bc = 128
+    is_lru = score_strategy == DynamicEmbScoreStrategy.TIMESTAMP
+
+    def _storage(capacity):
+        opts = [
+            DynamicEmbTableOptions(
+                index_type=torch.int64,
+                embedding_dtype=torch.float32,
+                device_id=device,
+                dim=8,
+                max_capacity=capacity,
+                init_capacity=capacity,
+                bucket_capacity=bc,
+                safe_check_mode=DynamicEmbCheckMode.IGNORE,
+                local_hbm_for_values=1024**3,
+                score_strategy=score_strategy,
+                evict_strategy=(
+                    DynamicEmbEvictStrategy.LRU
+                    if is_lru
+                    else DynamicEmbEvictStrategy.LFU
+                ),
+            )
+        ]
+        return DynamicEmbStorage(opts, SGDDynamicEmbeddingOptimizer(OptimizerArgs()))
+
+    base = int(device_timestamp()) - 10**12
+
+    def _dump_keys(name, keys, ranks):
+        src = _storage(4096)
+        keys = keys.to(device)
+        tids = torch.zeros(keys.numel(), dtype=torch.int64, device=device)
+        scores = (ranks * 1000 + base) if is_lru else ranks
+        src.insert(
+            keys,
+            tids,
+            torch.randn(keys.numel(), 8, device=device),
+            scores=scores.to(device).to(torch.uint64),
+        )
+        d = tmp_path / name
+        d.mkdir()
+        paths = [f"{d}/meta.json", f"{d}/keys", f"{d}/emb", f"{d}/score", f"{d}/opt"]
+        src.dump(0, *paths, include_optim=False, timestamp=int(device_timestamp()))
+        return paths
+
+    n_first, n_new = 100, 60
+    first_keys = torch.arange(1, 1 + n_first, dtype=torch.int64)
+    first = _dump_keys("first", first_keys, torch.arange(1, 1 + n_first))
+    new_keys = torch.arange(10001, 10001 + n_new, dtype=torch.int64)
+    second = _dump_keys("second", new_keys, torch.full((n_new,), 10_000))
+
+    dst = _storage(bc)
+    dst.load(0, *first, include_optim=False, timestamp=int(device_timestamp()))
+    dst.load(0, *second, include_optim=False, timestamp=int(device_timestamp()))
+    torch.cuda.synchronize()
+
+    assert dst.size() == bc
+    tids = torch.zeros(n_first, dtype=torch.int64, device=device)
+    lookup = ScoreArg(name=dst._state.score_policy.name, policy=ScorePolicy.CONST)
+    _, found, _ = dst.key_index_map.lookup(first_keys.to(device), tids, lookup)
+    num_evicted = n_first + n_new - bc
+    assert set(first_keys[~found.cpu()].tolist()) == set(range(1, 1 + num_evicted))
