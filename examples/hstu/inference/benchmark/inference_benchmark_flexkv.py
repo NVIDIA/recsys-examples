@@ -50,6 +50,7 @@ class BenchmarkConfig:
     ssd_pressure_batch_sleep_s: float = 1.0
     offload_wait_timeout_s: float = 60.0
     only_onboard: bool = False
+    host_backend: str = "flexkv"
 
 
 BENCHMARK_CONFIG = BenchmarkConfig()
@@ -73,6 +74,13 @@ def get_timed_history_len(history_len: int, append_history_len: int) -> int:
     if BENCHMARK_CONFIG.only_onboard:
         return history_len
     return history_len + append_history_len
+
+
+def _ongoing_offload_tasks(kvcache_mgr):
+    backend = getattr(kvcache_mgr, "backend", None)
+    if backend is not None and hasattr(backend, "ongoing_offload_tasks"):
+        return backend.ongoing_offload_tasks
+    return getattr(kvcache_mgr, "ongoing_offload_tasks", [])
 
 
 def build_user_batches(
@@ -109,11 +117,13 @@ def build_request(
         )
         for _ in user_ids
     ]
+    # Ranking preprocess interleaves item/action history then appends candidate
+    # items. Action must be item_len or item_len+1 (dummy candidate actions).
     action_seqs = [
         torch.randint(
             low=0,
             high=ACTION_VOCAB_SIZE,
-            size=(history_len,),
+            size=(history_len + num_candidates,),
             dtype=torch.long,
         )
         for _ in user_ids
@@ -188,6 +198,16 @@ def build_model(cfg: BenchmarkConfig, history_len: int):
     if cfg.flexkv_config_path:
         extra_configs["flexkv_config_path"] = cfg.flexkv_config_path
 
+    host_backend = cfg.host_backend
+    use_dynamicemb = os.environ.get("RECSYS_USE_DYNAMICEMB", "1") != "0"
+    if os.environ.get("RECSYS_NSYS_FAST_GRAPH") == "1":
+        # 256 covers GPU-hit only_onboard (candidates after strip).
+        # max_seqlen covers the first warmup fill (full interleaved history).
+        hstu_cudagraph_configs = {
+            "batch_size": sorted({1, cfg.batch_size}),
+            "length_per_sequence": sorted({256, 512, 1024, 2048, max_seqlen}),
+        }
+
     kv_cache_config = get_kvcache_config(
         num_layers=num_layers,
         num_heads=num_heads,
@@ -201,7 +221,7 @@ def build_model(cfg: BenchmarkConfig, history_len: int):
         max_seq_len=math.ceil(max_seqlen / page_size) * page_size,
         dtype=torch.bfloat16,
         device=torch.cuda.current_device(),
-        host_kvstorage_backend="flexkv",
+        host_kvstorage_backend=host_backend,
         offload_timeout_ms=100.0,
         offload_mode="lazy",
         extra_configs=extra_configs,
@@ -213,7 +233,7 @@ def build_model(cfg: BenchmarkConfig, history_len: int):
             table_name="item",
             vocab_size=ITEM_VOCAB_SIZE,
             dim=hidden_dim_size,
-            use_dynamicemb=True,
+            use_dynamicemb=use_dynamicemb,
         ),
         InferenceEmbeddingConfig(
             feature_names=[ACTION_FEATURE_NAME],
@@ -253,10 +273,18 @@ def run_scenario_gpu_hit(
     offload_wait_timeout_s: float,
 ) -> None:
     base_user_id = 10
-    timed_user_batches = build_user_batches(base_user_id, timed_iters, batch_size)
+    # GPU primary cache (~10240 pages) holds ~40 users at hist=8192.
+    # only_onboard must reuse a resident batch or later unique users miss.
+    if BENCHMARK_CONFIG.only_onboard:
+        resident = build_user_batches(base_user_id, 1, batch_size)
+        warmup_user_batches = resident
+        timed_user_batches = resident * timed_iters
+    else:
+        timed_user_batches = build_user_batches(base_user_id, timed_iters, batch_size)
+        warmup_user_batches = timed_user_batches
     req_prepare = [
         build_request(user_ids, history_len, num_candidates, max_seqlen)
-        for user_ids in timed_user_batches
+        for user_ids in warmup_user_batches
     ]
     req_timed = [
         build_request(
@@ -280,7 +308,7 @@ def run_scenario_gpu_hit(
     # precheck
     kvcache_mgr = model_predict.dense_module.kvcache
     precheck_user_ids = torch.tensor(
-        [user_id for user_ids in timed_user_batches for user_id in user_ids],
+        [user_id for user_ids in warmup_user_batches for user_id in user_ids],
         dtype=torch.int64,
     )
     lookup_res = kvcache_mgr.gpu_kvcache_mgr.lookup(precheck_user_ids)
@@ -306,18 +334,18 @@ def run_scenario_gpu_hit(
     deadline = time.time() + offload_wait_timeout_s
     torch.cuda.nvtx.range_push("scenario1.timed.offload_wait_all")
     try:
-        while len(kvcache_mgr.ongoing_offload_tasks) > 0:
+        while len(_ongoing_offload_tasks(kvcache_mgr)) > 0:
             torch.cuda.nvtx.range_push("scenario1.timed.offload_wait_all.try_wait")
             try:
                 kvcache_mgr.offload_try_wait()
             finally:
                 torch.cuda.nvtx.range_pop()
-            if len(kvcache_mgr.ongoing_offload_tasks) == 0:
+            if len(_ongoing_offload_tasks(kvcache_mgr)) == 0:
                 break
             if time.time() > deadline:
                 raise TimeoutError(
                     f"offload queue not drained within timeout ({offload_wait_timeout_s}s), "
-                    f"pending={len(kvcache_mgr.ongoing_offload_tasks)}"
+                    f"pending={len(_ongoing_offload_tasks(kvcache_mgr))}"
                 )
             time.sleep(0.001)
     finally:
@@ -364,18 +392,18 @@ def run_scenario_gpu_miss_host_hit(
     deadline = time.time() + offload_wait_timeout_s
     torch.cuda.nvtx.range_push("scenario2.warmup.offload_wait_all")
     try:
-        while len(kvcache_mgr.ongoing_offload_tasks) > 0:
+        while len(_ongoing_offload_tasks(kvcache_mgr)) > 0:
             torch.cuda.nvtx.range_push("scenario2.warmup.offload_wait_all.try_wait")
             try:
                 kvcache_mgr.offload_try_wait()
             finally:
                 torch.cuda.nvtx.range_pop()
-            if len(kvcache_mgr.ongoing_offload_tasks) == 0:
+            if len(_ongoing_offload_tasks(kvcache_mgr)) == 0:
                 break
             if time.time() > deadline:
                 raise TimeoutError(
                     f"offload queue not drained within timeout ({offload_wait_timeout_s}s), "
-                    f"pending={len(kvcache_mgr.ongoing_offload_tasks)}"
+                    f"pending={len(_ongoing_offload_tasks(kvcache_mgr))}"
                 )
             time.sleep(0.001)
     finally:
@@ -401,18 +429,18 @@ def run_scenario_gpu_miss_host_hit(
     deadline = time.time() + offload_wait_timeout_s
     torch.cuda.nvtx.range_push("scenario2.timed.offload_wait_all")
     try:
-        while len(kvcache_mgr.ongoing_offload_tasks) > 0:
+        while len(_ongoing_offload_tasks(kvcache_mgr)) > 0:
             torch.cuda.nvtx.range_push("scenario2.timed.offload_wait_all.try_wait")
             try:
                 kvcache_mgr.offload_try_wait()
             finally:
                 torch.cuda.nvtx.range_pop()
-            if len(kvcache_mgr.ongoing_offload_tasks) == 0:
+            if len(_ongoing_offload_tasks(kvcache_mgr)) == 0:
                 break
             if time.time() > deadline:
                 raise TimeoutError(
                     f"offload queue not drained within timeout ({offload_wait_timeout_s}s), "
-                    f"pending={len(kvcache_mgr.ongoing_offload_tasks)}"
+                    f"pending={len(_ongoing_offload_tasks(kvcache_mgr))}"
                 )
             time.sleep(0.001)
     finally:
@@ -461,18 +489,18 @@ def run_scenario_gpu_cpu_miss_ssd_hit(
     deadline = time.time() + offload_wait_timeout_s
     torch.cuda.nvtx.range_push("scenario3.warmup.offload_wait_all")
     try:
-        while len(kvcache_mgr.ongoing_offload_tasks) > 0:
+        while len(_ongoing_offload_tasks(kvcache_mgr)) > 0:
             torch.cuda.nvtx.range_push("scenario3.warmup.offload_wait_all.try_wait")
             try:
                 kvcache_mgr.offload_try_wait()
             finally:
                 torch.cuda.nvtx.range_pop()
-            if len(kvcache_mgr.ongoing_offload_tasks) == 0:
+            if len(_ongoing_offload_tasks(kvcache_mgr)) == 0:
                 break
             if time.time() > deadline:
                 raise TimeoutError(
                     f"offload queue not drained within timeout ({offload_wait_timeout_s}s), "
-                    f"pending={len(kvcache_mgr.ongoing_offload_tasks)}"
+                    f"pending={len(_ongoing_offload_tasks(kvcache_mgr))}"
                 )
             time.sleep(0.001)
     finally:
@@ -522,7 +550,7 @@ def run_scenario_gpu_cpu_miss_ssd_hit(
                 deadline = time.time() + offload_wait_timeout_s
                 torch.cuda.nvtx.range_push("scenario3.pressure.batch_offload_wait_all")
                 try:
-                    while len(kvcache_mgr.ongoing_offload_tasks) > 0:
+                    while len(_ongoing_offload_tasks(kvcache_mgr)) > 0:
                         torch.cuda.nvtx.range_push(
                             "scenario3.pressure.batch_offload_wait_all.try_wait"
                         )
@@ -530,12 +558,12 @@ def run_scenario_gpu_cpu_miss_ssd_hit(
                             kvcache_mgr.offload_try_wait()
                         finally:
                             torch.cuda.nvtx.range_pop()
-                        if len(kvcache_mgr.ongoing_offload_tasks) == 0:
+                        if len(_ongoing_offload_tasks(kvcache_mgr)) == 0:
                             break
                         if time.time() > deadline:
                             raise TimeoutError(
                                 f"offload queue not drained within timeout ({offload_wait_timeout_s}s), "
-                                f"pending={len(kvcache_mgr.ongoing_offload_tasks)}"
+                                f"pending={len(_ongoing_offload_tasks(kvcache_mgr))}"
                             )
                         time.sleep(0.001)
                 finally:
@@ -548,18 +576,18 @@ def run_scenario_gpu_cpu_miss_ssd_hit(
     deadline = time.time() + offload_wait_timeout_s
     torch.cuda.nvtx.range_push("scenario3.pressure.offload_wait_all")
     try:
-        while len(kvcache_mgr.ongoing_offload_tasks) > 0:
+        while len(_ongoing_offload_tasks(kvcache_mgr)) > 0:
             torch.cuda.nvtx.range_push("scenario3.pressure.offload_wait_all.try_wait")
             try:
                 kvcache_mgr.offload_try_wait()
             finally:
                 torch.cuda.nvtx.range_pop()
-            if len(kvcache_mgr.ongoing_offload_tasks) == 0:
+            if len(_ongoing_offload_tasks(kvcache_mgr)) == 0:
                 break
             if time.time() > deadline:
                 raise TimeoutError(
                     f"offload queue not drained within timeout ({offload_wait_timeout_s}s), "
-                    f"pending={len(kvcache_mgr.ongoing_offload_tasks)}"
+                    f"pending={len(_ongoing_offload_tasks(kvcache_mgr))}"
                 )
             time.sleep(0.001)
     finally:
@@ -590,18 +618,18 @@ def run_scenario_gpu_cpu_miss_ssd_hit(
     deadline = time.time() + offload_wait_timeout_s
     torch.cuda.nvtx.range_push("scenario3.timed.offload_wait_all")
     try:
-        while len(kvcache_mgr.ongoing_offload_tasks) > 0:
+        while len(_ongoing_offload_tasks(kvcache_mgr)) > 0:
             torch.cuda.nvtx.range_push("scenario3.timed.offload_wait_all.try_wait")
             try:
                 kvcache_mgr.offload_try_wait()
             finally:
                 torch.cuda.nvtx.range_pop()
-            if len(kvcache_mgr.ongoing_offload_tasks) == 0:
+            if len(_ongoing_offload_tasks(kvcache_mgr)) == 0:
                 break
             if time.time() > deadline:
                 raise TimeoutError(
                     f"offload queue not drained within timeout ({offload_wait_timeout_s}s), "
-                    f"pending={len(kvcache_mgr.ongoing_offload_tasks)}"
+                    f"pending={len(_ongoing_offload_tasks(kvcache_mgr))}"
                 )
             time.sleep(0.001)
     finally:
@@ -625,6 +653,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--timed-iters", type=int, default=None)
     parser.add_argument("--batch-size", type=int, default=None)
+    parser.add_argument("--history-len", type=int, default=None)
     parser.add_argument("--append-history-len", type=int, default=None)
     parser.add_argument("--ssd-pressure-users", type=int, default=None)
     parser.add_argument("--ssd-pressure-batch-size", type=int, default=None)
@@ -642,6 +671,13 @@ if __name__ == "__main__":
         help="Measure only onboard by reusing the warmed prefix in timed forwards.",
     )
     parser.add_argument("--disable-cudagraph", action="store_true")
+    parser.add_argument(
+        "--host-backend",
+        type=str,
+        default=None,
+        choices=["flexkv", "native"],
+        help="KV host backend. GPU-hit only_onboard can use native.",
+    )
     parser.add_argument("--ablation", type=str, default=None)
     args, _ = parser.parse_known_args()
 
@@ -655,6 +691,8 @@ if __name__ == "__main__":
         cfg = replace(cfg, timed_iters=args.timed_iters)
     if args.batch_size is not None:
         cfg = replace(cfg, batch_size=args.batch_size)
+    if args.history_len is not None:
+        cfg = replace(cfg, history_len=args.history_len)
     if args.append_history_len is not None:
         cfg = replace(cfg, append_history_len=args.append_history_len)
     if args.ssd_pressure_users is not None:
@@ -667,6 +705,8 @@ if __name__ == "__main__":
         cfg = replace(cfg, disable_cudagraph=True)
     if args.only_onboard:
         cfg = replace(cfg, only_onboard=True)
+    if args.host_backend is not None:
+        cfg = replace(cfg, host_backend=args.host_backend)
     if args.ablation not in (None, "baseline"):
         raise ValueError(
             "This restored benchmark currently supports only --ablation baseline."
@@ -691,6 +731,7 @@ if __name__ == "__main__":
         f"[Config] history_len={history_len}, append_history_len={cfg.append_history_len}, "
         f"num_candidates={cfg.num_candidates}, batch_size={cfg.batch_size}, "
         f"disable_cudagraph={cfg.disable_cudagraph}, "
+        f"host_backend={cfg.host_backend}, "
         f"mode={mode}, "
         f"scenarios={','.join(sorted(scenarios))}"
     )

@@ -16,7 +16,10 @@ import dataclasses
 import pprint
 from typing import Optional
 
-import fbgemm_gpu  # pylint: disable-unused-import
+try:
+    import fbgemm_gpu  # pylint: disable-unused-import
+except ImportError:
+    fbgemm_gpu = None
 import torch
 
 

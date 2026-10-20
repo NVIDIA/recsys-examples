@@ -13,9 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 from dataclasses import dataclass
-from typing import List, Tuple, cast
-
-from commons.modules.embedding import ShardedEmbeddingConfig
+from typing import Any, List, Tuple, cast
 
 
 @dataclass
@@ -24,12 +22,12 @@ class BaseTaskConfig:
     Base configuration for tasks.
 
     Args:
-        embedding_configs (List[ShardedEmbeddingConfig]): A list of embedding configurations.
+        embedding_configs (List[Any]): A list of embedding configurations.
         user_embedding_norm (str, optional): Normalization for user embeddings. ``'layer_norm'`` | ``'l2_norm'``. Defaults to ``'l2_norm'``.
         item_l2_norm (bool, optional): Whether to apply L2 normalization to item embeddings. Defaults to False.
     """
 
-    embedding_configs: List[ShardedEmbeddingConfig]
+    embedding_configs: List[Any]
 
     user_embedding_norm: str = "l2_norm"
     item_l2_norm: bool = False
