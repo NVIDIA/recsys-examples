@@ -2021,8 +2021,11 @@ def _load_key_values(
     )
 
     # Multi-word score layouts (LruLfu: timestamp + frequency) cannot be restored
-    # by a single-value insert (which only writes word 0). Place the keys without
-    # touching scores (CONST), then scatter the full [N, num_scores] block.
+    # by a single-value insert (which only writes word 0). Place the keys, then
+    # scatter the full [N, num_scores] block. Placement uses the table's own
+    # policy with a zero frequency delta so that a full bucket evicts through the
+    # ranked LruLfu evictor (honoring a custom score_function); the scatter then
+    # overwrites both words.
     num_scores = state.key_index_map.num_scores_
     if num_scores > 1:
         # Validate the score-block shape before scatter_score_blocks writes it
@@ -2043,7 +2046,9 @@ def _load_key_values(
             (keys.numel(),), table_id, dtype=torch.int64, device=keys.device
         )
         place_arg = ScoreArg(
-            name=state.score_policy.name, value=None, policy=ScorePolicy.CONST
+            name=state.score_policy.name,
+            value=torch.zeros(keys.numel(), dtype=SCORE_TYPE, device=keys.device),
+            policy=state.score_policy.policy,
         )
         indices = state.key_index_map.insert(keys, tid_tensor, place_arg)
         state.key_index_map.scatter_score_blocks(

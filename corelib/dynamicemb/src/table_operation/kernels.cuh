@@ -17,6 +17,7 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 
 #pragma once
 
+#include "jit/evict_comparators.cuh"
 #include "types.cuh"
 #include <cub/cub.cuh>
 
@@ -228,13 +229,27 @@ insert_probe(Bucket &bucket, KeyType key, int *__restrict__ bucket_sizes,
 // score-word reduce() (used by every AoT instantiation; cur_ts/gamma ignored).
 // RankedEvictor<Comparator> drives reduce_ranked<Comparator>() (the LruLfu cubin;
 // e.g. LexFreqTsComparator or UserFnComparator).
+//
+// The AoT kernels are selected by the score POLICY of the call, not by the
+// table layout, so a 2-word (LruLfu) table still reaches DefaultEvictor
+// whenever the caller passes CONST or ASSIGN: load placement, backward
+// refresh (preserve_existing), rehash, ScoredHashTable.load. reduce() cannot
+// read the 2-word layout, so for num_scores == 2 DefaultEvictor ranks victims
+// with the default LruLfu comparator (frequency asc, then timestamp asc).
+// Paths that must honor a custom score_function go through the cubin instead.
 struct DefaultEvictor {
   template <int ReductionGroupSize, int BufferDim, typename Bucket>
   __forceinline__ __device__ bool
   operator()(Bucket &bucket, typename Bucket::Iterator &iter,
              typename Bucket::KeyType &evict_key, ScoreType &evict_score,
              ScoreType *sm_scores, int32_t const *__restrict__ counter,
-             int64_t counter_offset, uint64_t /*cur_ts*/) const {
+             int64_t counter_offset, uint64_t cur_ts) const {
+    if (bucket.num_scores() == 2) {
+      return bucket.template reduce_ranked<LexFreqTsComparator,
+                                           ReductionGroupSize, BufferDim>(
+          iter, evict_key, evict_score, sm_scores, counter, counter_offset,
+          cur_ts);
+    }
     return bucket.template reduce<ReductionGroupSize, BufferDim>(
         iter, evict_key, evict_score, sm_scores, counter, counter_offset);
   }
