@@ -24,7 +24,10 @@ from commons.ops.triton_ops.common import (
 )
 from configs import HSTUConfig, InferenceHSTUConfig, RankingConfig
 from modules.hstu_block_inference import HSTUBlockInference
-from recsys_kvcache_manager.host_kvstorage_manager import HostKVTaskStatus
+from recsys_kvcache_manager.host_kvstorage_manager import (
+    HostKVBackend,
+    HostKVTaskStatus,
+)
 from recsys_kvcache_manager.kvcache_config import KVCacheConfig
 from recsys_kvcache_manager.kvcache_manager import KVCacheManager
 from recsys_kvcache_manager.kvcache_metadata import (
@@ -366,7 +369,7 @@ class InferenceDenseModule(torch.nn.Module):
                 onboard_handle is not None
                 and onboard_handle.handle is not None
                 and onboard_handle.status != HostKVTaskStatus.SKIPPED
-                and onboard_handle.backend == "flexkv"
+                and onboard_handle.backend == HostKVBackend.FLEXKV
                 and not onboard_handle.is_layerwise
             ):
                 torch.cuda.nvtx.range_push("recsys.kvcache.onboard_wait")
@@ -411,7 +414,7 @@ class InferenceDenseModule(torch.nn.Module):
                     onboard_handle is not None
                     and onboard_handle.handle is not None
                     and onboard_handle.status != HostKVTaskStatus.SKIPPED
-                    and onboard_handle.backend == "flexkv"
+                    and onboard_handle.backend == HostKVBackend.FLEXKV
                     and onboard_handle.is_layerwise
                 ):
                     torch.cuda.nvtx.range_push("recsys.kvcache.onboard_wait")

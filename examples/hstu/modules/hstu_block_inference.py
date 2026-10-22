@@ -9,6 +9,7 @@ from configs import InferenceHSTUConfig
 from modules.hstu_processor import HSTUBlockPostprocessor, HSTUBlockPreprocessor
 from modules.jagged_data import JaggedData
 from modules.paged_hstu_infer_layer import PagedHSTUInferLayer
+from recsys_kvcache_manager.host_kvstorage_manager import HostKVBackend
 from torchrec.sparse.jagged_tensor import JaggedTensor
 
 
@@ -306,7 +307,7 @@ class HSTUBlockInference(torch.nn.Module):
                 if kv_cache_metadata is not None:
                     handle = kv_cache_metadata.kv_onload_handle
                     if handle is not None:
-                        if handle.backend == "flexkv":
+                        if handle.backend == HostKVBackend.FLEXKV:
                             if handle.is_layerwise:
                                 handle.wait_layer(idx - 1)
                         else:

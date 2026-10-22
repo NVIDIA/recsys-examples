@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import os
+import select
 import time
 import warnings
 from dataclasses import dataclass
@@ -33,6 +34,7 @@ except Exception:
     KVResponse = Any  # type: ignore
 
 from .host_kvstorage_manager import (
+    HostKVBackend,
     HostKVStorageBase,
     HostKVTaskHandle,
     HostKVTaskStatus,
@@ -70,6 +72,7 @@ class _FlexKVOnloadHandle:
     # Waiting on the children returns NOTFOUND and releases the eventfd
     # counter while the worker is still posting completions.
     flexkv_wait_ids: Optional[List[int]] = None
+    eventfd_timeout_s: float = 60.0
     _on_release: Optional[Callable[[], None]] = None
     _released: bool = False
     _flexkv_wait_result: Optional[Dict[int, Any]] = None
@@ -85,9 +88,14 @@ class _FlexKVOnloadHandle:
             return
         torch.cuda.nvtx.range_push(f"recsys.kvcache.wait_layer_{int(layer_idx)}")
         try:
-            os.read(self.layer_eventfds[layer_idx], 8)
-            if int(layer_idx) >= int(self.num_layers) - 1:
-                self.release_counter()
+            fd = self.layer_eventfds[layer_idx]
+            timeout_s = float(self.eventfd_timeout_s)
+            ready, _, _ = select.select([fd], [], [], timeout_s)
+            if not ready:
+                raise TimeoutError(
+                    f"FlexKV wait_layer({int(layer_idx)}) timed out after {timeout_s:.1f}s"
+                )
+            os.read(fd, 8)
         finally:
             torch.cuda.nvtx.range_pop()
 
@@ -161,6 +169,12 @@ class FlexKVStorage(HostKVStorageBase):
         layerwise_counter_id: int = 0,
         layer_granularity: int = -1,
     ) -> None:
+        """FlexKV host KV storage.
+
+        Constructor / extra_configs / CLI are the Recsys API and always win
+        when set. ``enable_layerwise is None`` falls back to
+        ``RECSYS_FLEXKV_ENABLE_LAYERWISE`` for tests and containers.
+        """
         self.mode = mode
         self.server_addr = server_addr
         self.server_port = int(server_port)
@@ -510,7 +524,7 @@ class FlexKVStorage(HostKVStorageBase):
 
         if len(onboard_task_ids) == 0:
             return HostKVTaskHandle(
-                backend="flexkv",
+                backend=HostKVBackend.FLEXKV,
                 handle=None,
                 status=HostKVTaskStatus.SKIPPED,
             )
@@ -538,6 +552,9 @@ class FlexKVStorage(HostKVStorageBase):
                 ),
                 counter_id=counter_id,
                 num_layers=self.num_layers,
+                eventfd_timeout_s=max(
+                    float(self.hostkv_wait_timeout_ms) / 1000.0, 60.0
+                ),
             )
             if counter_id is not None:
 
@@ -558,7 +575,7 @@ class FlexKVStorage(HostKVStorageBase):
 
                 onload_handle._on_release = _finish_layerwise_get
             onload_task_handle = HostKVTaskHandle(
-                backend="flexkv",
+                backend=HostKVBackend.FLEXKV,
                 user_ids=onload_handle.uids,
                 handle=onload_handle,
                 status=HostKVTaskStatus.LAUNCHED,
@@ -683,7 +700,7 @@ class FlexKVStorage(HostKVStorageBase):
             )
             task_ids.append(task_id)
         return HostKVTaskHandle(
-            backend="flexkv",
+            backend=HostKVBackend.FLEXKV,
             user_ids=index_meta.user_ids,
             handle=task_ids,
             status=HostKVTaskStatus.LAUNCHED,
@@ -779,7 +796,7 @@ class FlexKVStorage(HostKVStorageBase):
             if launched_ids:
                 wait_ids = [int(task_id) for task_id in launched_ids]
         return HostKVTaskHandle(
-            backend="flexkv",
+            backend=HostKVBackend.FLEXKV,
             user_ids=index_meta.user_ids,
             handle=_FlexKVOffloadHandle(
                 task_ids=wait_ids,

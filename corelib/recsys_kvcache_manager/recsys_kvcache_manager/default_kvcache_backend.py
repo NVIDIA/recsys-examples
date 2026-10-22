@@ -8,6 +8,7 @@ import torch
 
 from .gpu_kvcache_manager import DeviceKVCache
 from .host_kvstorage_manager import (
+    HostKVBackend,
     HostKVStorageBase,
     HostKVTaskHandle,
     HostKVTaskStatus,
@@ -128,7 +129,7 @@ class DefaultKVCacheBackend(KVCacheBackend):
                 task_handle.metadata["onboard_start_indices"],
                 task_handle.metadata["onboard_lengths"],
             )
-            if task_handle.backend == "flexkv":
+            if task_handle.backend == HostKVBackend.FLEXKV:
                 if self.host_kvstorage_fail_policy == "fail_close":
                     raise RuntimeError(
                         f"Onboarding failed for {wait_result.failed_user_ids}: status={wait_result.status.value}, msg={wait_result.message}"

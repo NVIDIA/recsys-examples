@@ -25,7 +25,7 @@ ITEM_FEATURE_NAME = "item_feat"
 ACTION_FEATURE_NAME = "act_feat"
 ITEM_VOCAB_SIZE = 10000
 ACTION_VOCAB_SIZE = 128
-SUPPORTED_SCENARIOS = frozenset({"gpu_hit", "cpu_hit", "ssd_hit"})
+SUPPORTED_SCENARIOS = frozenset({"gpu_hit", "cpu_hit", "ssd_hit", "no_cache"})
 PREFETCH_GAP_MS_RANGE = (0.0, 20.0)
 
 
@@ -66,7 +66,8 @@ def parse_scenarios(scenarios_arg: str) -> set[str]:
             continue
         if scenario not in SUPPORTED_SCENARIOS:
             raise ValueError(
-                f"Unsupported scenario '{scenario}'. " "Use gpu_hit,cpu_hit,ssd_hit."
+                f"Unsupported scenario '{scenario}'. "
+                "Use gpu_hit,cpu_hit,ssd_hit,no_cache."
             )
         scenarios.add(scenario)
     return scenarios
@@ -147,7 +148,9 @@ def build_request(
     )
 
 
-def build_model(cfg: BenchmarkConfig, history_len: int):
+def build_model(
+    cfg: BenchmarkConfig, history_len: int, enable_kvcache: bool = True
+):
     max_num_history = max(2048, history_len + cfg.append_history_len)
     max_num_candidates = cfg.num_candidates
     max_seqlen = max_num_history * 2 + max_num_candidates
@@ -186,37 +189,41 @@ def build_model(cfg: BenchmarkConfig, history_len: int):
         num_primary_cache_pages * 2 * page_size * (num_heads * head_dim) * 2
     )
 
-    extra_configs = {
-        "flexkv_mode": "direct",
-        "flexkv_host_kvstorage_fail_policy": "fail_open",
-        "flexkv_enable_mps": 0,
-        "flexkv_as_batch": int(os.environ.get("FLEXKV_AS_BATCH", "1")),
-        "flexkv_num_cpu_blocks": int(cfg.flexkv_num_cpu_blocks),
-        "flexkv_num_local_blocks": int(cfg.flexkv_num_local_blocks),
-        "flexkv_enable_layerwise": int(getattr(cfg, "flexkv_enable_layerwise", 0)),
-        "flexkv_layer_granularity": int(getattr(cfg, "flexkv_layer_granularity", -1)),
-    }
-    if cfg.flexkv_config_path:
-        extra_configs["flexkv_config_path"] = cfg.flexkv_config_path
+    kv_cache_config = None
+    if enable_kvcache:
+        extra_configs = {
+            "flexkv_mode": "direct",
+            "flexkv_host_kvstorage_fail_policy": "fail_open",
+            "flexkv_enable_mps": 0,
+            "flexkv_as_batch": int(os.environ.get("FLEXKV_AS_BATCH", "1")),
+            "flexkv_num_cpu_blocks": int(cfg.flexkv_num_cpu_blocks),
+            "flexkv_num_local_blocks": int(cfg.flexkv_num_local_blocks),
+            "flexkv_enable_layerwise": int(getattr(cfg, "flexkv_enable_layerwise", 0)),
+            "flexkv_layer_granularity": int(
+                getattr(cfg, "flexkv_layer_granularity", -1)
+            ),
+        }
+        if cfg.flexkv_config_path:
+            extra_configs["flexkv_config_path"] = cfg.flexkv_config_path
 
-    kv_cache_config = get_kvcache_config(
-        num_layers=num_layers,
-        num_heads=num_heads,
-        head_dim=head_dim,
-        page_size=page_size,
-        offload_chunksize=offload_chunksize,
-        num_primary_cache_pages=num_primary_cache_pages,
-        num_buffer_pages=0,
-        host_capacity_per_layer=host_capacity_per_layer,
-        max_batch_size=cfg.max_batch_size,
-        max_seq_len=math.ceil(max_seqlen / page_size) * page_size,
-        dtype=torch.bfloat16,
-        device=torch.cuda.current_device(),
-        host_kvstorage_backend="flexkv",
-        offload_timeout_ms=100.0,
-        offload_mode="lazy",
-        extra_configs=extra_configs,
-    )
+        kv_cache_config = get_kvcache_config(
+            num_layers=num_layers,
+            num_heads=num_heads,
+            head_dim=head_dim,
+            page_size=page_size,
+            offload_chunksize=offload_chunksize,
+            num_primary_cache_pages=num_primary_cache_pages,
+            num_buffer_pages=0,
+            host_capacity_per_layer=host_capacity_per_layer,
+            max_batch_size=cfg.max_batch_size,
+            max_seq_len=math.ceil(max_seqlen / page_size) * page_size,
+            dtype=torch.bfloat16,
+            device=torch.cuda.current_device(),
+            host_kvstorage_backend="flexkv",
+            offload_timeout_ms=100.0,
+            offload_mode="lazy",
+            extra_configs=extra_configs,
+        )
 
     emb_configs = [
         InferenceEmbeddingConfig(
@@ -250,6 +257,58 @@ def build_model(cfg: BenchmarkConfig, history_len: int):
     model_predict.bfloat16()
     model_predict.eval()
     return model_predict, page_size, max_seqlen
+
+
+def run_scenario_no_cache(
+    model_predict,
+    history_len: int,
+    append_history_len: int,
+    num_candidates: int,
+    max_seqlen: int,
+    warmup_iters: int,
+    timed_iters: int,
+    batch_size: int,
+) -> None:
+    timed_history_len = get_timed_history_len(history_len, append_history_len)
+    timed_user_batches = build_user_batches(40, timed_iters, batch_size)
+    req_timed = [
+        build_request(user_ids, timed_history_len, num_candidates, max_seqlen)
+        for user_ids in timed_user_batches
+    ]
+    print(
+        "[NoCache] "
+        f"history_len={timed_history_len} "
+        f"attention_kv_tokens={timed_history_len * 2 + num_candidates}"
+    )
+
+    print("warmup")
+    for batch, _, _ in req_timed[:warmup_iters]:
+        model_predict.forward_nokvcache(batch)
+
+    print("timed run")
+    wall_ms = []
+    for iter_idx, (batch, _, _) in enumerate(req_timed):
+        torch.cuda.synchronize()
+        t0 = time.perf_counter()
+        torch.cuda.nvtx.range_push(f"no_cache_timed_run_{iter_idx}")
+        try:
+            model_predict.forward_nokvcache(batch)
+        finally:
+            torch.cuda.nvtx.range_pop()
+        torch.cuda.synchronize()
+        elapsed_ms = (time.perf_counter() - t0) * 1000.0
+        wall_ms.append(elapsed_ms)
+        print(
+            f"[latency_sample] scenario=no_cache batch_size={batch_size} "
+            f"iter={iter_idx} ms={elapsed_ms:.4f}",
+            flush=True,
+        )
+    print(
+        f"[latency] scenario=no_cache batch_size={batch_size} "
+        f"avg_ms={sum(wall_ms) / len(wall_ms):.4f} "
+        f"min_ms={min(wall_ms):.4f} max_ms={max(wall_ms):.4f}",
+        flush=True,
+    )
 
 
 def _offload_stall_s() -> float:
@@ -685,7 +744,7 @@ if __name__ == "__main__":
         "--scenarios",
         type=str,
         default="gpu_hit,cpu_hit,ssd_hit",
-        help="Comma-separated scenarios to run: gpu_hit,cpu_hit,ssd_hit.",
+        help="Comma-separated scenarios: gpu_hit,cpu_hit,ssd_hit,no_cache.",
     )
     parser.add_argument(
         "--only-onboard",
@@ -766,6 +825,11 @@ if __name__ == "__main__":
 
     history_len = cfg.history_len
     scenarios = parse_scenarios(args.scenarios)
+    if "no_cache" in scenarios and scenarios != {"no_cache"}:
+        raise ValueError(
+            "no_cache cannot be combined with gpu_hit/cpu_hit/ssd_hit. Run separately."
+        )
+    enable_kvcache = scenarios != {"no_cache"}
     mode = "only_onboard" if cfg.only_onboard else "end_to_end"
     print(
         f"[Config] history_len={history_len}, append_history_len={cfg.append_history_len}, "
@@ -775,11 +839,24 @@ if __name__ == "__main__":
         f"prefetch_gap_ms={PREFETCH_GAP_MS_RANGE[0]}-{PREFETCH_GAP_MS_RANGE[1]}, "
         f"scenarios={','.join(sorted(scenarios))}"
     )
-    model_predict, page_size, max_seqlen = build_model(cfg, history_len)
+    model_predict, page_size, max_seqlen = build_model(
+        cfg, history_len, enable_kvcache=enable_kvcache
+    )
     print(f"[Config] page_size={page_size}, max_seqlen={max_seqlen}")
 
     try:
         with torch.inference_mode():
+            if "no_cache" in scenarios:
+                run_scenario_no_cache(
+                    model_predict=model_predict,
+                    history_len=history_len,
+                    append_history_len=cfg.append_history_len,
+                    num_candidates=cfg.num_candidates,
+                    max_seqlen=max_seqlen,
+                    warmup_iters=cfg.warmup_iters,
+                    timed_iters=cfg.timed_iters,
+                    batch_size=cfg.batch_size,
+                )
             if "gpu_hit" in scenarios:
                 run_scenario_gpu_hit(
                     model_predict=model_predict,
@@ -818,4 +895,5 @@ if __name__ == "__main__":
                     warmup_iters=cfg.warmup_iters,
                 )
     finally:
-        shutdown_flexkv_client(model_predict)
+        if enable_kvcache:
+            shutdown_flexkv_client(model_predict)

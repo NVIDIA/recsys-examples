@@ -21,6 +21,7 @@ import torch
 import torch.nn.functional as F
 from configs import InferenceHSTUConfig
 from hstu import hstu_attn_varlen_func
+from recsys_kvcache_manager.host_kvstorage_manager import HostKVBackend
 from modules.jagged_data import JaggedData
 from ops.pt_ops.torch_addmm import torch_addmm_silu_fwd
 from ops.triton_ops.triton_addmm import triton_addmm_silu_fwd
@@ -366,7 +367,7 @@ class PagedHSTUInferLayer(torch.nn.Module):
 
             if not self._export_mode and kv_cache_metadata.kv_onload_handle is not None:
                 handle = kv_cache_metadata.kv_onload_handle
-                if handle.backend == "flexkv":
+                if handle.backend == HostKVBackend.FLEXKV:
                     if handle.is_layerwise:
                         handle.wait_layer(self.layer_idx)
                 else:
