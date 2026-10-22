@@ -383,6 +383,10 @@ class NetworkArgs:
 
     disable_contextual_mask: bool = False
 
+    # Inference backbone. Training examples continue to construct HSTU models.
+    backbone: str = "hstu"
+    transformer_ffn_dim: Optional[int] = None
+
     def __post_init__(self):
         assert self.dtype_str in [
             "bfloat16",
@@ -390,6 +394,8 @@ class NetworkArgs:
         ], "Only support bfloat16 and float16 precision for Network."
 
         assert self.kernel_backend.lower() in ["cutlass", "triton", "pytorch"]
+        if self.backbone not in ("hstu", "transformer"):
+            raise ValueError(f"Unknown inference backbone: {self.backbone}")
 
 
 @gin.configurable
