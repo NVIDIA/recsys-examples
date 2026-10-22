@@ -109,11 +109,4 @@ Layerwise is faster than naive at every sequence length. N=8 stays the closest t
 
 ![Local Image](layerfirst_bs1_ssd_bw.png)
 
-| sequence_length | naive (GB/s) | N=1 | N=2 | N=3 | N=4 | N=8 |
-| --------------- | ------------ | --- | --- | --- | --- | --- |
-| 2048            | 6.62         | 4.86 | 5.77 | 5.88 | 6.26 | 6.62 |
-| 4096            | 6.74         | 5.60 | 6.17 | 6.37 | 6.57 | 6.77 |
-| 8192            | 6.73         | 5.84 | 6.24 | 6.34 | 6.54 | 6.69 |
-| 16384           | 6.96         | 6.24 | 6.64 | 6.69 | 6.82 | 7.02 |
-
 SSD read bandwidth rises with transfer granularity: N=1 is lowest (~4.9–6.2 GB/s) because each DISK2H is a single layer, and N=8 matches naive (~6.6–7.0 GB/s) because both issue one full-KV disk read.
