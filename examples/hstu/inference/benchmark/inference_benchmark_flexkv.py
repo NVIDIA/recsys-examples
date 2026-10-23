@@ -761,15 +761,19 @@ if __name__ == "__main__":
     parser.add_argument(
         "--layerwise",
         action="store_true",
-        help="Enable FlexKV layerwise onboard (eventfd wait per original layer).",
+        help=(
+            "Overlap SSD→CPU DISK2H with CPU→GPU H2D, and wait each original "
+            "layer so HSTU can run on layers already on GPU."
+        ),
     )
     parser.add_argument(
         "--layer-granularity",
         type=int,
         default=None,
         help=(
-            "SSD DISK2H span size N while --layerwise is on. Unset defaults to 1. "
-            "Without --layerwise this flag is ignored."
+            "Layers per SSD→CPU DISK2H while --layerwise is on. Unset defaults "
+            "to 1. N=8 is one full-KV DISK2H into CPU; only CPU→GPU H2D overlaps "
+            "HSTU. Ignored without --layerwise."
         ),
     )
     args, _ = parser.parse_known_args()

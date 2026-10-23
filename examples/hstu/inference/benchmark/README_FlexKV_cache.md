@@ -27,8 +27,8 @@ We provide benchmarks for HSTU inference with a FlexKV-backed KV cache, covering
 ```
 
 - `--scenarios`: comma-separated paths. Supported values are `gpu_hit`, `cpu_hit`, `ssd_hit`, and `no_cache`. Default is `gpu_hit,cpu_hit,ssd_hit`.
-- `--layerwise`: enable FlexKV layerwise onboard (`wait_layer` per original layer).
-- `--layer-granularity N`: SSD DISK2H span size while `--layerwise` is on. Unset defaults to 1. Ignored without `--layerwise`.
+- `--layerwise`: overlap SSD→CPU DISK2H with CPU→GPU H2D, and start HSTU on each layer once that layer is on GPU. Off: one full DISK2H into CPU, then one full H2D, no overlap.
+- `--layer-granularity N`: how many original layers each DISK2H writes into CPU. Only applies with `--layerwise`. Unset defaults to 1. `--layer-granularity 8` matches the 8 HSTU layers, so the whole KV is read into CPU in one DISK2H; the only overlap left is CPU→GPU H2D with HSTU.
 - `--history-len`: cached or recomputed prefix length per feature (action and item each). Default is 1024.
 - `--append-history-len`: extra tokens appended on the timed request after the warmed prefix. Default is 1024. These new tokens are written into the GPU KV cache and then offloaded to Host/SSD, so this flag is used to measure the follow-up offload path. Set it to 0 (or pass `--only-onboard`) when you only want to time prefix reuse.
 - `--only-onboard`: time the warmed prefix only (`history-len`). Without this flag, the timed sequence length is `history-len + append-history-len`.
@@ -95,9 +95,9 @@ python3 ./inference/benchmark/inference_benchmark_flexkv.py \
     --flexkv-config-path ../../corelib/recsys_kvcache_manager/configs/flexkv_ssd.yml
 ```
 
-- naive: sequential DISK2H + H2D.
-- `N = 1 2 3 4 8`: DISK2H span size with H2D + HSTU overlap (`wait_layer` per original layer).
-- `N = 8`: overlap is only H2D and HSTU (one full-KV disk read), matching FlexKV's original layerwise scheme.
+- naive: one SSD→CPU DISK2H, then one CPU→GPU H2D, no overlap.
+- `N = 1 2 3 4`: each DISK2H writes N layers into CPU and overlaps with CPU→GPU H2D and HSTU.
+- `N = 8`: one DISK2H of the whole KV into CPU. Overlap is only the CPU→GPU H2D with HSTU.
 
 * **End-to-end latency (ms), RTX PRO 6000 (batch size = 1):**
 

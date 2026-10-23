@@ -169,12 +169,6 @@ class FlexKVStorage(HostKVStorageBase):
         layerwise_counter_id: int = 0,
         layer_granularity: int = -1,
     ) -> None:
-        """FlexKV host KV storage.
-
-        Constructor / extra_configs / CLI are the Recsys API and always win
-        when set. ``enable_layerwise is None`` falls back to
-        ``RECSYS_FLEXKV_ENABLE_LAYERWISE`` for tests and containers.
-        """
         self.mode = mode
         self.server_addr = server_addr
         self.server_port = int(server_port)
@@ -317,15 +311,7 @@ class FlexKVStorage(HostKVStorageBase):
             update_default_config_from_user_config(
                 RankInfo(model_config=model_cfg), cache_cfg, user_cfg
             )
-        if self.enable_layerwise is None:
-            enable_layerwise_env = os.environ.get("RECSYS_FLEXKV_ENABLE_LAYERWISE", "0")
-            self.enable_layerwise = enable_layerwise_env.strip().lower() in {
-                "1",
-                "true",
-                "yes",
-                "on",
-            }
-        elif isinstance(self.enable_layerwise, str):
+        if isinstance(self.enable_layerwise, str):
             self.enable_layerwise = self.enable_layerwise.strip().lower() in {
                 "1",
                 "true",
@@ -339,16 +325,6 @@ class FlexKVStorage(HostKVStorageBase):
             "1" if self.enable_layerwise else "0"
         )
         gran = int(self.layer_granularity)
-        if gran <= 0:
-            env_gran = os.environ.get(
-                "RECSYS_FLEXKV_LAYER_GRANULARITY",
-                os.environ.get("FLEXKV_LAYER_GRANULARITY", ""),
-            )
-            if str(env_gran).strip():
-                gran = int(env_gran)
-        # layerwise is the master switch: SSD spans + H2D eventfd + HSTU
-        # wait_layer. N only sizes SSD spans. Off → ignore N, whole-block
-        # DISK2H. On + N unset → 1 (one original layer per DISK2H).
         if not self.enable_layerwise:
             gran = -1
         elif gran <= 0:
