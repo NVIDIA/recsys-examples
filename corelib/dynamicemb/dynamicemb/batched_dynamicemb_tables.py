@@ -114,6 +114,8 @@ def find_files(
     table and per suffix lists it 6N times for N tables, which is slow where a
     listing is expensive, such as object-storage mounts. Being sorted, the names
     that can match sit together, so a lookup does not scan the whole listing.
+    A table named "<scope>/<name>" lives in the subdirectory *scope* of
+    *root_path*; its files are looked up in a listing of that subdirectory.
     """
     suffix_to_encode_file_path_func = {
         "emb_keys": partial(encode_checkpoint_file_path, item="keys"),
@@ -130,13 +132,21 @@ def find_files(
     encode_file_path_func = suffix_to_encode_file_path_func[suffix]
 
     # v2 version
-    pattern = os.path.basename(encode_file_path_func(root_path, table_name, "*", "*"))
+    file_dir, pattern = os.path.split(
+        encode_file_path_func(root_path, table_name, "*", "*")
+    )
+    if os.path.normpath(file_dir) != os.path.normpath(root_path):
+        # A table named "<scope>/<name>" keeps its files in a subdirectory of
+        # root_path, which the caller's listing of root_path does not cover.
+        sorted_file_names = (
+            sorted(os.listdir(file_dir)) if os.path.isdir(file_dir) else []
+        )
     prefix = re.split(r"[*?[]", pattern, maxsplit=1)[0]
     start = end = bisect.bisect_left(sorted_file_names, prefix)
     while end < len(sorted_file_names) and sorted_file_names[end].startswith(prefix):
         end += 1
     files = [
-        os.path.join(root_path, name)
+        os.path.join(file_dir, name)
         for name in fnmatch.filter(sorted_file_names[start:end], pattern)
     ]
     if len(files) == 0:
@@ -1536,6 +1546,8 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                 continue
 
             meta_file_path = encode_meta_json_file_path(save_dir, table_name)
+            # A table named "<scope>/<name>" dumps into a subdirectory of save_dir.
+            os.makedirs(os.path.dirname(meta_file_path), exist_ok=True)
             current_score = (
                 self._scores.get(table_name, None) if hasattr(self, "_scores") else None
             )
