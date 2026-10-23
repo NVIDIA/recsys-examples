@@ -20,6 +20,7 @@ import torch
 from kvcache_cpp import HostKVStorageImpl, KVOffloadHandle, KVOnloadHandle
 
 from .host_kvstorage_manager import (
+    HostKVBackend,
     HostKVStorageBase,
     HostKVTaskHandle,
     HostKVTaskStatus,
@@ -131,7 +132,7 @@ class NativeHostKVStorage(HostKVStorageBase):
             #       Whether to onboard for each used is decided in C++ implementation
             #       from `onload_paged_ids_list`.
             return HostKVTaskHandle(
-                backend="native",
+                backend=HostKVBackend.NATIVE,
                 handle=None,
                 status=HostKVTaskStatus.SKIPPED,
             )
@@ -141,7 +142,7 @@ class NativeHostKVStorage(HostKVStorageBase):
             index_meta.user_ids, onload_paged_ids_list, native_handle
         )
         return HostKVTaskHandle(
-            backend="native",
+            backend=HostKVBackend.NATIVE,
             user_ids=index_meta.user_ids,
             handle=native_handle,
             status=HostKVTaskStatus.LAUNCHED,
@@ -187,7 +188,7 @@ class NativeHostKVStorage(HostKVStorageBase):
             return None
 
         return HostKVTaskHandle(
-            backend="native",
+            backend=HostKVBackend.NATIVE,
             user_ids=offload_user_ids,
             handle=native_handle,
             status=HostKVTaskStatus.LAUNCHED,

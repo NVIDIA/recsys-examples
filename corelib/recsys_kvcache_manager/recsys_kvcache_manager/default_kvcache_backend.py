@@ -8,6 +8,7 @@ import torch
 
 from .gpu_kvcache_manager import DeviceKVCache
 from .host_kvstorage_manager import (
+    HostKVBackend,
     HostKVStorageBase,
     HostKVTaskHandle,
     HostKVTaskStatus,
@@ -128,7 +129,7 @@ class DefaultKVCacheBackend(KVCacheBackend):
                 task_handle.metadata["onboard_start_indices"],
                 task_handle.metadata["onboard_lengths"],
             )
-            if task_handle.backend == "flexkv":
+            if task_handle.backend == HostKVBackend.FLEXKV:
                 if self.host_kvstorage_fail_policy == "fail_close":
                     raise RuntimeError(
                         f"Onboarding failed for {wait_result.failed_user_ids}: status={wait_result.status.value}, msg={wait_result.message}"
@@ -138,6 +139,23 @@ class DefaultKVCacheBackend(KVCacheBackend):
                         f"[WARNING] Onboarding failed for {wait_result.failed_user_ids}, but continue with `fail_open` policy."
                     )
         return wait_result
+
+    def onboard_wait_layer(
+        self,
+        task_handle: Optional[HostKVTaskHandle],
+        layer_idx: int,
+    ) -> None:
+        if (
+            task_handle is None
+            or task_handle.handle is None
+            or task_handle.status == HostKVTaskStatus.SKIPPED
+            or not task_handle.is_layerwise
+        ):
+            return
+        task_handle.wait_layer(layer_idx)
+
+    def prefetch_kvcache(self, index_meta: KVIndexMeta) -> HostKVTaskHandle:
+        return self.host_kvstorage_manager.prefetch_kvcache(index_meta)
 
     def offload_launch(
         self,
@@ -313,7 +331,6 @@ class DefaultKVCacheBackend(KVCacheBackend):
                 }
             else:
                 flexkv_as_batch = bool(flexkv_as_batch_raw)
-
             return FlexKVStorage(
                 mode=flexkv_mode,
                 server_addr=flexkv_server_addr,
@@ -331,6 +348,12 @@ class DefaultKVCacheBackend(KVCacheBackend):
                 host_kvstorage_fail_policy=flexkv_host_kvstorage_fail_policy,
                 hostkv_wait_timeout_ms=int(kvcache_config.offload_timeout_ms),
                 config_path=flexkv_config_path,
+                enable_layerwise=extra.get("flexkv_enable_layerwise", None),
+                layerwise_eventfd_socket=extra.get(
+                    "flexkv_layerwise_eventfd_socket", None
+                ),
+                layerwise_counter_id=int(extra.get("flexkv_layerwise_counter_id", 0)),
+                layer_granularity=extra.get("flexkv_layer_granularity", -1),
             )
         else:
             raise NotImplementedError(
