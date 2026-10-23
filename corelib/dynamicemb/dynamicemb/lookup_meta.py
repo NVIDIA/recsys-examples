@@ -24,16 +24,12 @@ def _table_lookup_fake(
     table_ids: torch.Tensor,
     score_input: Optional[torch.Tensor],
     policy_type: int,
-    ovf_storage: Optional[torch.Tensor] = None,
-    ovf_bucket_capacity: int = 0,
-    ovf_output_offsets: Optional[torch.Tensor] = None,
 ):
     del (
         table_storage,
         table_bucket_offsets,
         bucket_capacity,
         policy_type,
-        ovf_bucket_capacity,
     )
 
     _validate_1d("keys", keys)
@@ -47,11 +43,6 @@ def _table_lookup_fake(
     if score_input is not None and score_input.numel() != keys.numel():
         raise RuntimeError(
             "INFERENCE_EMB::table_lookup expects score_input length == keys length"
-        )
-
-    if ovf_storage is not None and ovf_output_offsets is None:
-        raise RuntimeError(
-            "INFERENCE_EMB::table_lookup with ovf_storage requires ovf_output_offsets"
         )
 
     n = keys.numel()

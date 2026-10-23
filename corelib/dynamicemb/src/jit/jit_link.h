@@ -18,7 +18,7 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 // Runtime loader/linker for the LruLfu eviction cubins. The default (Lex)
 // evictor is a prebuilt complete fatbin loaded directly; a custom score_function
 // is a numba-compiled LTO-IR linked into the custom fatbin via nvJitLink. Both
-// expose the dyn_emb_evict_entry_{ovf,noovf} entries and are launched the same
+// expose the dyn_emb_evict_entry entry and are launched the same
 // way. Includable by both nvcc (insert_and_evict.cu routing) and the host
 // compiler (jit_link.cpp) -- only cuda.h + the POD EvictParams.
 #pragma once
@@ -44,10 +44,10 @@ void demb_register_score_function(int64_t key, const void *ltoir,
                                   size_t ltoir_size, const void *cust,
                                   size_t cust_size, int cc_major, int cc_minor);
 
-// Evict entry CUfunction for (key, overflow). key == 0 selects the default Lex
+// Evict entry CUfunction for `key`. key == 0 selects the default Lex
 // evictor (loaded lazily from the packaged fatbin; no numba). key != 0 must have
 // been registered via demb_register_score_function.
-CUfunction demb_get_evict_fn(int64_t key, bool overflow);
+CUfunction demb_get_evict_fn(int64_t key);
 
 // Plain-insert entry CUfunction for `key` (same key space and module as
 // demb_get_evict_fn). Routes a full-bucket eviction through the ranked

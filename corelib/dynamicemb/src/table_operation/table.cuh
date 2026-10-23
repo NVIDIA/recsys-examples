@@ -69,9 +69,6 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor>
 table_lookup(at::Tensor table_storage, at::Tensor table_bucket_offsets,
              int64_t bucket_capacity, at::Tensor keys, at::Tensor table_ids,
              std::optional<at::Tensor> score_input, ScorePolicyType policy_type,
-             std::optional<at::Tensor> ovf_storage = std::nullopt,
-             int64_t ovf_bucket_capacity = 0,
-             std::optional<at::Tensor> ovf_output_offsets = std::nullopt,
              int64_t num_scores = 1);
 
 at::Tensor table_insert(at::Tensor table_storage,
@@ -82,12 +79,17 @@ at::Tensor table_insert(at::Tensor table_storage,
                         ScorePolicyType policy_type, at::Tensor counter,
                         std::optional<at::Tensor> insert_results = std::nullopt,
                         std::optional<at::Tensor> score_output = std::nullopt,
-                        int64_t num_scores = 1, int64_t score_fn_key = 0);
+                        int64_t num_scores = 1, int64_t score_fn_key = 0,
+                        // The cache's eviction guard: a device pointer to its
+                        // per-table maps and how many, or 0 for none. See
+                        // embedding_cache/guard.h.
+                        int64_t guard_tables = 0, int64_t guard_num_tables = 0);
 
 // Plain insert that also retains each evicted victim's (key, table_id). Returns
-// (indices, num_evicted[int64 scalar], evicted_keys, evicted_table_ids); the
-// evicted_* tensors are sized at the batch upper bound -- slice to num_evicted.
-std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor>
+// (indices, num_evicted[int64 scalar], evicted_keys, evicted_table_ids,
+// evicted_slots); the evicted_* tensors are sized at the batch upper bound --
+// slice to num_evicted. evicted_slots[j] is where victim j's value row is.
+std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor>
 table_insert_collect_evicted(
     at::Tensor table_storage, at::Tensor table_bucket_offsets,
     int64_t bucket_capacity, at::Tensor bucket_sizes, at::Tensor keys,
@@ -95,7 +97,8 @@ table_insert_collect_evicted(
     ScorePolicyType policy_type, at::Tensor counter,
     std::optional<at::Tensor> insert_results = std::nullopt,
     std::optional<at::Tensor> score_output = std::nullopt,
-    int64_t num_scores = 1, int64_t score_fn_key = 0);
+    int64_t num_scores = 1, int64_t score_fn_key = 0, int64_t guard_tables = 0,
+    int64_t guard_num_tables = 0);
 
 std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor,
            at::Tensor>
@@ -106,11 +109,6 @@ table_insert_and_evict(
     ScorePolicyType policy_type, at::Tensor counter,
     std::optional<at::Tensor> insert_results = std::nullopt,
     std::optional<at::Tensor> score_output = std::nullopt,
-    std::optional<at::Tensor> ovf_storage = std::nullopt,
-    int64_t ovf_bucket_capacity = 0,
-    std::optional<at::Tensor> ovf_bucket_sizes = std::nullopt,
-    std::optional<at::Tensor> ovf_counter = std::nullopt,
-    std::optional<at::Tensor> ovf_output_offsets = std::nullopt,
     int64_t num_scores = 1, int64_t score_fn_key = 0);
 
 void table_erase(at::Tensor table_storage, at::Tensor table_bucket_offsets,
@@ -173,10 +171,7 @@ std::vector<at::Tensor> bucketize_keys(at::Tensor keys, at::Tensor table_ids,
 void table_update_counter_with_layout(
     at::Tensor counter, at::Tensor slot_indices, int32_t delta,
     at::Tensor table_bucket_offsets, int64_t bucket_capacity,
-    int64_t main_capacity, int64_t num_tables,
-    c10::optional<at::Tensor> table_ids,
-    c10::optional<at::Tensor> overflow_output_offsets,
-    int64_t overflow_bucket_capacity);
+    int64_t num_tables, c10::optional<at::Tensor> table_ids);
 
 at::Tensor no_eviction_assign_scores(at::Tensor no_eviction_next_index_dev,
                                      at::Tensor table_ids);

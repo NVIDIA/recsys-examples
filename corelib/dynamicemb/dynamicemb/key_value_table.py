@@ -37,6 +37,7 @@ from dynamicemb.dynamicemb_config import (
 from dynamicemb.extendable_tensor import (
     DeviceExtendableBuffer,
     ExtendableBuffer,
+    FixedDeviceBuffer,
     HostExtendableBuffer,
 )
 from dynamicemb.key_ownership import owned_key_mask
@@ -58,7 +59,12 @@ from dynamicemb.types import (
     Storage,
     torch_dtype_to_np_dtype,
 )
-from dynamicemb_extensions import EvictStrategy, device_timestamp, flagged_compact
+from dynamicemb_extensions import (
+    EmbeddingCacheCore,
+    EvictStrategy,
+    device_timestamp,
+    flagged_compact,
+)
 from dynamicemb_extensions import load_from_flat_table_contiguous as _load_contiguous
 from dynamicemb_extensions import load_from_flat_table_emb as _load_emb
 from dynamicemb_extensions import load_from_flat_table_value as _load_value
@@ -419,8 +425,6 @@ class DynamicEmbTableState:
     threads_in_wave: int
     score: Optional[int] = None
     training: bool = False
-    # Overflow region fields (per-table, only set when overflow is enabled)
-    overflow_caps: Optional[List[int]] = None
     # NO_EVICTION: per-table auto-increment index used as insert score (internal only).
     # no_eviction_next_index: CPU pinned tensor (num_tables,); no_eviction_next_index_dev: same on state.device.
     no_eviction_next_index: Optional[torch.Tensor] = None
@@ -454,20 +458,12 @@ class DynamicEmbTableState:
 def create_table_state(
     options: List[DynamicEmbTableOptions],
     optimizer: BaseDynamicEmbeddingOptimizer,
-    enable_overflow: bool = False,
     evicted_item_mode: EvictedItemMode = EvictedItemMode.DISCARD,
 ) -> DynamicEmbTableState:
     if not options:
         raise ValueError("options must be non-empty")
 
     base_opt = options[0]
-    if (
-        base_opt.score_strategy == DynamicEmbScoreStrategy.NO_EVICTION
-        and enable_overflow
-    ):
-        raise ValueError(
-            "enable_overflow is not supported when score_strategy is NO_EVICTION"
-        )
     num_tables = len(options)
 
     device_idx = torch.cuda.current_device()
@@ -519,7 +515,6 @@ def create_table_state(
         key_type=base_opt.index_type,
         score_specs=[score_policy],
         device=device,
-        enable_overflow=enable_overflow,
         score_fn_key=score_fn_key,
     )
     capacity = key_index_map.capacity()
@@ -556,18 +551,9 @@ def create_table_state(
     else:
         table_caps = list(key_index_map_caps)
 
-    overflow_caps_list: Optional[List[int]] = None
-
-    if enable_overflow:
-        ovf_cap = key_index_map.overflow_bucket_capacity_
-        overflow_caps_list = [ovf_cap] * num_tables
-
     tables: List[ExtendableBuffer] = []
     for i, (cap, vd) in enumerate(zip(table_caps, value_dims)):
-        total_cap = cap
-        if enable_overflow:
-            total_cap += overflow_caps_list[i]
-        shape = (total_cap, vd)
+        shape = (cap, vd)
         if base_opt.local_hbm_for_values == 0:
             tables.append(HostExtendableBuffer(shape, emb_dtype, device))
         else:
@@ -603,7 +589,6 @@ def create_table_state(
         threads_in_wave=threads_in_wave,
         score=None,
         training=False,
-        overflow_caps=overflow_caps_list,
         no_eviction_next_index=(
             torch.zeros(num_tables, dtype=torch.int64, pin_memory=True)
             if base_opt.score_strategy == DynamicEmbScoreStrategy.NO_EVICTION
@@ -621,8 +606,74 @@ def create_table_state(
     )
 
 
+def create_cache_state(
+    options: List[DynamicEmbTableOptions],
+    optimizer: BaseDynamicEmbeddingOptimizer,
+    capacities: List[int],
+) -> DynamicEmbTableState:
+    """The value side of a cache: one fixed row pool per table, addressed by node.
+
+    The same state the kernels that gather and update rows read (value buffers and
+    their pointers, per-table dims, dtype, optimizer), without a key index: the
+    cache keeps its own, in :class:`EmbeddingCacheCore`.
+    """
+    if not options:
+        raise ValueError("options must be non-empty")
+    assert len(capacities) == len(options)
+
+    base_opt = options[0]
+    num_tables = len(options)
+    device_idx = torch.cuda.current_device()
+    device = torch.device(f"cuda:{device_idx}")
+    score_policy = get_score_policy(base_opt.score_strategy)
+
+    dims = [opt.dim for opt in options]
+    max_emb_dim = max(dims)
+    optim_state_dims = [optimizer.get_state_dim(d) for d in dims]
+    value_dims = [d + s for d, s in zip(dims, optim_state_dims)]
+    value_dim = max(value_dims)
+    all_dims_vec4 = all((d % 4) == 0 for d in dims) and all(
+        (v % 4) == 0 for v in value_dims
+    )
+
+    tables: List[ExtendableBuffer] = [
+        FixedDeviceBuffer((cap, vd), base_opt.embedding_dtype, device)
+        for cap, vd in zip(capacities, value_dims)
+    ]
+
+    props = torch.cuda.get_device_properties(device_idx)
+    threads_in_wave = props.multi_processor_count * props.max_threads_per_multi_processor
+
+    return DynamicEmbTableState(
+        options_list=options,
+        num_tables=num_tables,
+        device=device,
+        score_policy=score_policy,
+        incremental_score_name=score_policy.name,
+        evict_strategy=base_opt.evict_strategy.value,
+        key_index_map=None,
+        capacity=sum(capacities),
+        tables=tables,
+        table_ptrs_dev=get_table_ptrs(tables, device),
+        table_emb_dims=torch.tensor(dims, dtype=torch.int64, device=device),
+        table_emb_dims_host=torch.tensor(dims, dtype=torch.int64),
+        table_value_dims=torch.tensor(value_dims, dtype=torch.int64, device=device),
+        table_emb_dims_cpu=dims,
+        table_value_dims_cpu=value_dims,
+        max_emb_dim=max_emb_dim,
+        emb_dim=max_emb_dim,
+        value_dim=value_dim,
+        emb_dtype=base_opt.embedding_dtype,
+        all_dims_vec4=all_dims_vec4,
+        optimizer=optimizer,
+        threads_in_wave=threads_in_wave,
+        score=None,
+        training=False,
+    )
+
+
 def collect_table_sizes_to_device(state: DynamicEmbTableState) -> torch.Tensor:
-    """Collect per-table sizes (main table only, no overflow) into a tensor on state.device.
+    """Collect per-table sizes into a tensor on state.device.
 
     Uses an async CUDA kernel when key_index_map exposes table_bucket_offsets_
     and bucket_sizes; otherwise falls back to a sync Python loop. No GPU-CPU
@@ -678,7 +729,6 @@ def _expand_tables_impl(
     does not change the key set). Mutates state."""
     base_opt = state.options_list[0]
     device = state.device
-    enable_overflow = getattr(state.key_index_map, "enable_overflow_", False)
     key_caps = state.key_index_map.per_table_capacity_
     new_caps = []
     for i in range(state.num_tables):
@@ -699,7 +749,6 @@ def _expand_tables_impl(
         key_type=base_opt.index_type,
         score_specs=[state.score_policy],
         device=device,
-        enable_overflow=enable_overflow,
         # Preserve the eviction routing (default Lex or custom score_function)
         # across rehash.
         score_fn_key=state.key_index_map.score_fn_key_,
@@ -1371,13 +1420,9 @@ def _find_keys(
             torch.empty(batch, dtype=torch.int64, device=device),
         )
 
-    km = state.key_index_map
-    if getattr(km, "enable_overflow_", False):
-        score_out, founds, indices = km.lookup_with_overflow(
-            unique_keys, table_ids, score_arg
-        )
-    else:
-        score_out, founds, indices = km.lookup(unique_keys, table_ids, score_arg)
+    score_out, founds, indices = state.key_index_map.lookup(
+        unique_keys, table_ids, score_arg
+    )
 
     missing = torch.logical_not(founds)
     (
@@ -1512,6 +1557,7 @@ def _insert_key_values(
             num_evicted,
             evicted_keys,
             evicted_table_ids,
+            _evicted_slots,
         ) = state.key_index_map.insert(
             unique_keys,
             table_ids,
@@ -2323,81 +2369,102 @@ def _erase_state_keys(
 
 
 # ---------------------------------------------------------------------------
-# DynamicEmbCache – Cache interface (key-only find / insert_and_evict)
+# DynamicEmbCache – Cache interface (placement and reference protection)
 # ---------------------------------------------------------------------------
 
 
 class DynamicEmbCache(Cache):
+    """The GPU cache: placement and reference protection, from ``EmbeddingCacheCore``.
+
+    It holds no score and decides nothing about which keys stay in the system.
+    The rows live in ``_state.tables``, one fixed pool per table addressed by node,
+    and everything that reads or writes them goes through the same
+    ``table_ptrs_dev`` the backing's rows do. See docs/lightweight_cache_design.md.
+    """
+
     def __init__(
         self,
         options: List[DynamicEmbTableOptions],
         optimizer: BaseDynamicEmbeddingOptimizer,
     ):
-        self._state = create_table_state(options, optimizer, enable_overflow=True)
+        # Rounded up to a multiple of the bucket capacity, as the cache's index
+        # always was. A cache has to hold every key of a step at once, so a
+        # configuration smaller than a step would otherwise fail where it used to
+        # work.
+        capacities = [
+            align_to_table_size(int(opt.init_capacity), int(opt.bucket_capacity))
+            for opt in options
+        ]
+        self._state = create_cache_state(options, optimizer, capacities)
+        self._core = EmbeddingCacheCore(capacities)
         self._cache_metrics = torch.zeros(10, dtype=torch.long, device="cpu")
         self._record_cache_metrics = False
 
     # -- Cache interface --
 
-    def increment_counter(
-        self,
-        slot_indices: torch.Tensor,
-        table_ids: torch.Tensor,
-    ) -> None:
-        """Increment ref-counter at given per-table slot indices. table_ids must be provided and aligned with slot_indices."""
-        self._state.key_index_map.increment_counter(slot_indices, table_ids)
-
-    def decrement_counter(
-        self,
-        slot_indices: torch.Tensor,
-        table_ids: torch.Tensor,
-    ) -> None:
-        """Decrement ref-counter at given per-table slot indices. table_ids must be provided and aligned with slot_indices."""
-        self._state.key_index_map.decrement_counter(slot_indices, table_ids)
-
-    def lookup(
-        self,
-        unique_keys: torch.Tensor,
-        table_ids: torch.Tensor,
-        lfu_accumulated_frequency: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Lookup with overflow fallback. Returns (score_out, founds, indices)."""
-        state = self._state
-        score_arg = get_find_score_arg(
-            state, unique_keys.size(0), unique_keys.device, lfu_accumulated_frequency
-        )
-        result = state.key_index_map.lookup_with_overflow(
-            unique_keys, table_ids, score_arg
-        )
+    def lookup_pin(
+        self, unique_keys: torch.Tensor, offsets: List[int]
+    ) -> torch.Tensor:
+        nodes = self._core.lookup_pin(unique_keys.to(KEY_TYPE), offsets)
         if self._record_cache_metrics:
             self._cache_metrics[0] = unique_keys.size(0)
-            founds = result[1]
-            self._cache_metrics[1] = founds.sum().item()
-        return result
+            self._cache_metrics[1] = int((nodes >= 0).sum().item())
+        return nodes
 
-    def insert_and_evict(
+    def allocate(
         self,
         keys: torch.Tensor,
-        table_ids: torch.Tensor,
-        scores: Optional[torch.Tensor] = None,
-    ) -> Tuple[
-        torch.Tensor, int, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
-    ]:
-        """Insert with counter-aware eviction and overflow fallback."""
-        state = self._state
-        score_arg = get_insert_score_arg(
-            state, keys.numel(), keys.device, scores, table_ids=table_ids
-        )
-        result = state.key_index_map.insert_and_evict_with_counter_and_overflow(
-            keys, table_ids, score_arg
+        positions: torch.Tensor,
+        offsets: List[int],
+        nodes: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        victim_keys, has_victim, new_nodes = self._core.allocate(
+            keys.to(KEY_TYPE), positions, offsets, nodes
         )
         if self._record_cache_metrics:
             self._cache_metrics[2] = keys.numel()
-            self._cache_metrics[3] = result[1]  # num_evicted
-        return result
+            self._cache_metrics[3] = int(has_victim.sum().item())
+        return victim_keys, has_victim.to(torch.bool), new_nodes
+
+    def publish(self, new_nodes: torch.Tensor, offsets: List[int]) -> None:
+        self._core.publish(new_nodes, offsets)
+
+    def release(self, nodes: torch.Tensor, offsets: List[int]) -> None:
+        self._core.release(nodes, offsets)
+
+    def find_nodes(
+        self, keys: torch.Tensor, table_ids: torch.Tensor
+    ) -> torch.Tensor:
+        return self._core.find_nodes(keys.to(KEY_TYPE), table_ids)
+
+    def invalidate(self, nodes: torch.Tensor, table_ids: torch.Tensor) -> None:
+        self._core.invalidate(nodes, table_ids)
+
+    def resident(self, table_id: int) -> Tuple[torch.Tensor, torch.Tensor, int]:
+        """Every resident node of one table, its key, and how many nodes still
+        hold a reference."""
+        return self._core.resident(table_id)
+
+    def num_resident(self, table_id: int) -> int:
+        return self._core.num_resident(table_id)
+
+    def invalidate_keys(self, keys: torch.Tensor, table_id: int) -> None:
+        """Drop these keys from the cache if they are in it, whatever they hold."""
+        if keys.numel() == 0:
+            return
+        tids = torch.full(
+            (keys.numel(),), table_id, dtype=torch.int64, device=keys.device
+        )
+        self.invalidate(self.find_nodes(keys, tids), tids)
 
     def reset(self) -> None:
-        self._state.key_index_map.reset()
+        self._core.reset()
+
+    @property
+    def eviction_guard(self) -> Tuple[int, int]:
+        """What the backing's insert asks before evicting a key: a device pointer
+        to this cache's per-table maps, and how many tables."""
+        return self._core.guard()
 
     @property
     def cache_metrics(self) -> Optional[torch.Tensor]:
@@ -2405,19 +2472,6 @@ class DynamicEmbCache(Cache):
 
     def set_record_cache_metrics(self, record: bool) -> None:
         self._record_cache_metrics = record
-
-    # -- Score management --
-
-    def set_score(self, score: int) -> None:
-        self._state.score = score
-
-    @property
-    def training(self) -> bool:
-        return self._state.training
-
-    @training.setter
-    def training(self, value: bool) -> None:
-        self._state.training = value
 
     # -- Convenience accessors --
 
@@ -2446,12 +2500,12 @@ class DynamicEmbCache(Cache):
     def evict_strategy(self) -> EvictStrategy:
         return self._state.evict_strategy
 
-    def size(self) -> int:
-        return self._state.key_index_map.size()
+    def capacity(self, table_id: int) -> int:
+        """How many rows table ``table_id`` has."""
+        return self._core.capacity(table_id)
 
-    @property
-    def key_index_map(self):
-        return self._state.key_index_map
+    def size(self) -> int:
+        return sum(self.num_resident(t) for t in range(self.num_tables))
 
 
 # ---------------------------------------------------------------------------
@@ -2459,19 +2513,128 @@ class DynamicEmbCache(Cache):
 # ---------------------------------------------------------------------------
 
 
+def take_values_of_keys_evicted_in_the_same_insert(
+    evicted_keys: torch.Tensor,
+    evicted_table_ids: torch.Tensor,
+    evicted_values: torch.Tensor,
+    keys: torch.Tensor,
+    table_ids: torch.Tensor,
+    values: torch.Tensor,
+) -> None:
+    """Fix the values of victims that are themselves keys of the insert.
+
+    A victim's value is read from its row, but a key the same insert put in has
+    no row written yet -- the slot still holds whatever was there before -- so
+    if a later key of the insert evicts it, what was read is another key's value.
+    Its own is the one being inserted, and goes in its place. ``evicted_values``
+    is changed in place.
+    """
+    n = keys.numel()
+    if n == 0 or evicted_keys.numel() == 0:
+        return
+    # One column to search on: the id of each (key, table_id) pair among all the
+    # pairs of both sides. The ids are exact, so two different pairs never share
+    # one, unlike a fold of the pair into a single integer, which can collide.
+    # ``view`` keeps the bits of an unsigned key and so its identity.
+    pairs = torch.stack(
+        [
+            torch.cat([keys, evicted_keys]).view(torch.int64),
+            torch.cat([table_ids, evicted_table_ids]),
+        ],
+        dim=1,
+    )
+    _, ids = torch.unique(pairs, dim=0, return_inverse=True)
+    key_ids, evicted_ids = ids[:n], ids[n:]
+    order = torch.argsort(key_ids)
+    pos = torch.searchsorted(key_ids[order], evicted_ids).clamp_(max=n - 1)
+    cand = order[pos]
+    match = key_ids[cand] == evicted_ids
+    if bool(match.any()):
+        evicted_values[match] = values[cand[match]]
+
+
+def _fill_from_lower(
+    lower: Storage,
+    copy_mode: CopyMode,
+    values: torch.Tensor,
+    num_missing: int,
+    missing_keys: torch.Tensor,
+    missing_positions: torch.Tensor,
+    missing_table_ids: torch.Tensor,
+    missing_scores: Optional[torch.Tensor],
+    founds: torch.Tensor,
+    scores: torch.Tensor,
+):
+    """Ask ``lower`` for the keys a table does not have.
+
+    What it finds is written into ``values`` (at the keys' positions) and marked
+    found; the rest stays missing. Returns the missing description and ``founds``
+    and ``scores`` as they are afterwards. Only the found mask, the scores and
+    the values of ``lower.find`` are used, so ``lower`` need not describe its
+    misses the way a table does.
+    """
+    out = lower.find(missing_keys, missing_table_ids, copy_mode, missing_scores)
+    l_founds, l_scores, l_values = out[5], out[6], out[7]
+    if not bool(l_founds.any()):
+        return (
+            num_missing,
+            missing_keys,
+            missing_positions,
+            missing_table_ids,
+            missing_scores,
+            founds,
+            scores,
+        )
+    hit = missing_positions[l_founds]
+    values[hit] = l_values[l_founds]
+    founds = founds.clone()
+    founds[hit] = True
+    scores = scores.clone()
+    scores[hit] = l_scores[l_founds].to(scores.dtype)
+    keep = ~l_founds
+    return (
+        int(keep.sum().item()),
+        missing_keys[keep],
+        missing_positions[keep],
+        missing_table_ids[keep],
+        missing_scores[keep] if missing_scores is not None else None,
+        founds,
+        scores,
+    )
+
+
 class DynamicEmbStorage(Storage):
+    """One table of rows, optionally in front of a ``lower`` tier (a parameter server).
+
+    The table is authoritative for the keys it holds. ``lower`` holds what the
+    table has evicted: a key the table does not have is looked up there, and a
+    key the table evicts is written there with its value. A key can be in both,
+    the copy in ``lower`` then being stale; the table is asked first and written
+    last, so it never matters. Keys are never erased from ``lower``, which has no
+    way to say so.
+    """
+
     def __init__(
         self,
         options: List[DynamicEmbTableOptions],
         optimizer: BaseDynamicEmbeddingOptimizer,
+        lower: Optional[Storage] = None,
     ):
+        self._lower = lower
         self._state = create_table_state(
             options,
             optimizer,
-            # DynamicEmbStorage is always a last tier (single tier or the backing
-            # store under a cache), so it honors evicted_item_mode.
-            evicted_item_mode=options[0].evicted_item_mode,
+            # With nothing below it, this is the last tier (single tier or the
+            # backing store under a cache) and honors evicted_item_mode. With
+            # ``lower`` below, an evicted key is not leaving the system.
+            evicted_item_mode=(
+                options[0].evicted_item_mode if lower is None else EvictedItemMode.DISCARD
+            ),
         )
+
+    @property
+    def lower(self) -> Optional[Storage]:
+        return self._lower
 
     @property
     def key_index_map(self):
@@ -2672,6 +2835,28 @@ class DynamicEmbStorage(Storage):
         )
         values = load_from_flat(self._state, flat_rows, table_ids, copy_mode=copy_mode)
 
+        if self._lower is not None and h_num_missing > 0:
+            (
+                h_num_missing,
+                missing_keys,
+                missing_indices,
+                missing_table_ids,
+                missing_scores,
+                founds,
+                score_out,
+            ) = _fill_from_lower(
+                self._lower,
+                copy_mode,
+                values,
+                h_num_missing,
+                missing_keys,
+                missing_indices,
+                missing_table_ids,
+                missing_scores,
+                founds,
+                score_out,
+            )
+
         return (
             h_num_missing,
             missing_keys,
@@ -2707,14 +2892,68 @@ class DynamicEmbStorage(Storage):
         scores: Optional[torch.Tensor] = None,
         preserve_existing: bool = False,
     ) -> None:
-        _insert_key_values(
-            self._state,
+        if self._lower is None or self._state.no_eviction_next_index is not None:
+            _insert_key_values(
+                self._state,
+                unique_keys,
+                table_ids,
+                unique_values,
+                scores,
+                preserve_existing,
+            )
+            return
+
+        if preserve_existing:
+            # Refresh what the table holds. A key it does not hold was served
+            # from the tier below, and comes up into the table like any new key,
+            # with a score of its own rather than the unchanged one.
+            present = _find_keys(self._state, unique_keys, table_ids, const_lookup=True)[
+                5
+            ]
+            if bool(present.any()):
+                _insert_key_values(
+                    self._state,
+                    unique_keys[present],
+                    table_ids[present],
+                    unique_values[present],
+                    scores[present] if scores is not None else None,
+                    True,
+                )
+            absent = ~present
+            if not bool(absent.any()):
+                return
+            unique_keys = unique_keys[absent]
+            table_ids = table_ids[absent]
+            unique_values = unique_values[absent]
+            scores = scores[absent] if scores is not None else None
+
+        # What the insert evicts goes down a tier with its value, which is read
+        # before the inserted key's row is written over it.
+        (
+            indices,
+            num_evicted,
+            evicted_keys,
+            evicted_table_ids,
+            evicted_indices,
+            evicted_scores,
+        ) = _insert_and_evict_keys(self._state, unique_keys, table_ids, scores)
+        evicted_values = load_from_flat(
+            self._state, evicted_indices, evicted_table_ids, copy_mode=CopyMode.VALUE
+        )
+        select_insert_failed_values(evicted_indices, unique_values, evicted_values)
+        take_values_of_keys_evicted_in_the_same_insert(
+            evicted_keys,
+            evicted_table_ids,
+            evicted_values,
             unique_keys,
             table_ids,
             unique_values,
-            scores,
-            preserve_existing,
         )
+        store_to_flat(self._state, indices, table_ids, unique_values)
+        if num_evicted != 0:
+            self._lower.insert(
+                evicted_keys, evicted_table_ids, evicted_values, evicted_scores
+            )
 
     def dump(
         self,
@@ -3936,7 +4175,7 @@ def _expand_storage_for_cache_flush_if_needed(
     for table_id in range(st.num_tables):
         opt = st.options_list[table_id]
         s_sz = st.key_index_map.size(table_id)
-        c_sz = ca.key_index_map.size(table_id)
+        c_sz = cache.num_resident(table_id)
         merge_ub = s_sz + c_sz
         max_cap_opt = opt.max_capacity
         if max_cap_opt is not None:
@@ -3977,67 +4216,90 @@ def _expand_storage_for_cache_flush_if_needed(
     collect_table_sizes_for_state(st, non_blocking=False)
 
 
-def flush_cache(cache: DynamicEmbCache, storage: Storage) -> None:
-    if isinstance(storage, DynamicEmbStorage):
-        _expand_storage_for_cache_flush_if_needed(storage, cache)
+def _write_back_rows(
+    storage: DynamicEmbStorage,
+    keys: torch.Tensor,
+    tid: torch.Tensor,
+    values: torch.Tensor,
+) -> None:
+    """Put rows into the storage by insert, for keys it no longer holds.
 
+    The cache has no score to hand over, so the storage gives each key its own
+    default one. NO_EVICTION assigns a row per key, so a key it already holds
+    must be updated in place and a new one given a row.
+    """
+    if storage._state.no_eviction_next_index is not None:
+        st_b = storage._state
+        (
+            _hm_fc,
+            _mk_fc,
+            _mi_fc,
+            _mt_fc,
+            _ms_fc,
+            in_backing,
+            _so_fc,
+            _ix_fc,
+        ) = _find_keys(st_b, keys, tid)
+        if bool(in_backing.all()):
+            storage.insert(keys, tid, values, preserve_existing=True)
+        elif bool((~in_backing).all()):
+            storage.insert(keys, tid, values, preserve_existing=False)
+        else:
+            ex_b = in_backing
+            nw_b = ~in_backing
+            if ex_b.any():
+                storage.insert(
+                    keys[ex_b], tid[ex_b], values[ex_b], preserve_existing=True
+                )
+            if nw_b.any():
+                storage.insert(
+                    keys[nw_b], tid[nw_b], values[nw_b], preserve_existing=False
+                )
+    else:
+        storage.insert(keys, tid, values)
+
+
+def flush_cache(cache: DynamicEmbCache, storage: DynamicEmbStorage) -> None:
+    """Write every resident row back to the storage.
+
+    Every resident row is written whatever its references: a key that has never
+    left the cache is the one whose storage copy is furthest behind.
+
+    The storage already has a row for every cached key (a key enters it when it is
+    admitted), so the rows are written in place and nothing is inserted.
+    """
     state = cache._state
     batch_size = state.threads_in_wave
-    state.value_dim
 
     for t in range(state.num_tables):
-        for (
-            keys,
-            named_scores,
-            indices,
-        ) in state.key_index_map._batched_export_keys_scores(
-            [state.score_policy.name],
-            state.device,
-            batch_size=batch_size,
-            return_index=True,
-            table_id=t,
-        ):
-            scores = named_scores[state.score_policy.name]
-            tid = torch.full((keys.numel(),), t, dtype=torch.int64, device=keys.device)
-            values = load_from_flat(state, indices, tid, copy_mode=CopyMode.VALUE)
-            if isinstance(storage, DynamicEmbStorage) and (
-                storage._state.no_eviction_next_index is not None
-            ):
-                st_b = storage._state
-                (
-                    _hm_fc,
-                    _mk_fc,
-                    _mi_fc,
-                    _mt_fc,
-                    _ms_fc,
-                    in_backing,
-                    _so_fc,
-                    _ix_fc,
-                ) = _find_keys(st_b, keys, tid)
-                if bool(in_backing.all()):
-                    storage.insert(keys, tid, values, preserve_existing=True)
-                elif bool((~in_backing).all()):
-                    storage.insert(keys, tid, values, scores, preserve_existing=False)
-                else:
-                    ex_b = in_backing
-                    nw_b = ~in_backing
-                    if ex_b.any():
-                        storage.insert(
-                            keys[ex_b],
-                            tid[ex_b],
-                            values[ex_b],
-                            preserve_existing=True,
-                        )
-                    if nw_b.any():
-                        storage.insert(
-                            keys[nw_b],
-                            tid[nw_b],
-                            values[nw_b],
-                            scores[nw_b],
-                            preserve_existing=False,
-                        )
-            else:
-                storage.insert(keys, tid, values, scores)
+        nodes, keys, _referenced = cache.resident(t)
+        for start in range(0, nodes.numel(), batch_size):
+            chunk_nodes = nodes[start : start + batch_size].to(torch.int64)
+            chunk_keys = keys[start : start + batch_size]
+            tid = torch.full(
+                (chunk_keys.numel(),), t, dtype=torch.int64, device=chunk_keys.device
+            )
+            values = load_from_flat(state, chunk_nodes, tid, copy_mode=CopyMode.VALUE)
+            sstate = storage._state
+            (
+                _h,
+                _mk,
+                _mp,
+                _mt,
+                _ms,
+                founds,
+                score_out,
+                slots,
+            ) = _find_keys(sstate, chunk_keys, tid, const_lookup=True)
+            rows = _flat_row_indices_for_value_load(sstate, founds, score_out, slots)
+            if bool(founds.any()):
+                store_to_flat(sstate, rows[founds], tid[founds], values[founds])
+            if not bool(founds.all()):
+                # A cached key the storage no longer holds: the cache copy is the
+                # only one, so it goes in by insert.
+                _expand_storage_for_cache_flush_if_needed(storage, cache)
+                gone = ~founds
+                _write_back_rows(storage, chunk_keys[gone], tid[gone], values[gone])
 
 
 # ---------------------------------------------------------------------------
@@ -4079,10 +4341,11 @@ def _eval_lookup_cached(
     table_ids: torch.Tensor,
     initializer: Callable,
 ) -> torch.Tensor:
-    _, founds, cache_indices = cache.lookup(keys, table_ids)
+    nodes = cache.find_nodes(keys, table_ids)
+    founds = nodes >= 0
 
     embs = load_from_flat(
-        cache._state, cache_indices, table_ids, copy_mode=CopyMode.EMBEDDING
+        cache._state, nodes.to(torch.int64), table_ids, copy_mode=CopyMode.EMBEDDING
     )
 
     missing_mask = ~founds

@@ -1,0 +1,98 @@
+// ---------------------------------------------------------------------------
+// A HOST-ONLY STAND-IN FOR <cuda/atomic>.  NOT THE REAL THING.
+//
+// Companion to host_shim/cuda_runtime.h; the same caveat applies and then some.
+// Every operation here is a plain read or write, because the host tests are
+// single-threaded. That means the *memory order arguments are ignored* — which
+// is precisely the interesting part of the code under test. Passing tests under
+// this shim say nothing at all about acquire/release correctness.
+//
+// Kept deliberately narrow: only the members hashmap.h actually calls, only the
+// orders it actually passes. A shim that offers more than libcu++ does hides
+// the mistake until nvcc sees the code, and that has already happened once in
+// this tree (a 64-bit atomicSub that CUDA does not have).
+// ---------------------------------------------------------------------------
+#pragma once
+
+#if defined(__CUDACC__) || defined(__CUDA_ARCH__)
+#error "embedding_cache host_shim/cuda/atomic was included in a CUDA compilation. \
+Remove test/embedding_cache/host_shim from the include path; it exists only for the \
+host-only test build."
+#endif
+
+#include <cstddef>
+#include <type_traits>
+
+namespace cuda {
+
+// libcu++ spells the orders cuda::std::memory_order_*, mirroring <atomic>.
+namespace std {
+
+enum memory_order {
+  memory_order_relaxed,
+  memory_order_consume,
+  memory_order_acquire,
+  memory_order_release,
+  memory_order_acq_rel,
+  memory_order_seq_cst
+};
+
+}  // namespace std
+
+enum thread_scope {
+  thread_scope_thread,
+  thread_scope_block,
+  thread_scope_device,
+  thread_scope_system
+};
+
+// The subset of cuda::atomic_ref that hashmap.h uses: construct over an lvalue,
+// load, store, exchange. No fetch_*, no compare_exchange, no wait/notify — if a
+// caller starts needing one, it should show up as a compile error here and be
+// added against the real signature rather than guessed at.
+template <typename T, thread_scope Scope = thread_scope_system>
+class atomic_ref {
+  static_assert(::std::is_trivially_copyable<T>::value,
+                "cuda::atomic_ref requires a trivially copyable type");
+  static_assert(sizeof(T) == 4 || sizeof(T) == 8,
+                "cuda::atomic_ref supports 4- and 8-byte types on the device; "
+                "narrower ones compile but are emulated, which this shim does "
+                "not model");
+
+ public:
+  using value_type = T;
+
+  explicit atomic_ref(T& ref) : p_(&ref) {}
+
+  // const, as in libcu++ and std::atomic_ref: the reference does not own the
+  // object, so mutating it through a const atomic_ref is well-formed.
+  T load(std::memory_order = std::memory_order_seq_cst) const { return *p_; }
+  void store(T v, std::memory_order = std::memory_order_seq_cst) const {
+    *p_ = v;
+  }
+  T exchange(T v, std::memory_order = std::memory_order_seq_cst) const {
+    const T old = *p_;
+    *p_ = v;
+    return old;
+  }
+
+  // Never fails spuriously here — there is one thread, so the comparison can
+  // only fail because the value genuinely differs. Real hardware may fail the
+  // weak form for no reason at all, which is exactly the behaviour a caller's
+  // retry loop exists for and exactly what this cannot exercise.
+  bool compare_exchange_weak(T& expected, T desired,
+                             std::memory_order = std::memory_order_seq_cst,
+                             std::memory_order = std::memory_order_seq_cst) const {
+    if (*p_ == expected) {
+      *p_ = desired;
+      return true;
+    }
+    expected = *p_;
+    return false;
+  }
+
+ private:
+  T* p_;
+};
+
+}  // namespace cuda

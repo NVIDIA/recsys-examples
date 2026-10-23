@@ -33,8 +33,7 @@ namespace {
 
 struct EvictModule {
   CUmodule module = nullptr;
-  CUfunction ovf = nullptr;
-  CUfunction noovf = nullptr;
+  CUfunction evict = nullptr;
   CUfunction insert = nullptr;
   CUfunction insert_collect = nullptr;
 };
@@ -78,10 +77,8 @@ EvictModule load_from_image(const void *image, const char *ctx) {
   // If any entry is missing (e.g. a stale/mismatched image), unload the module
   // we just loaded before propagating -- otherwise it leaks.
   try {
-    cu_check(cuModuleGetFunction(&m.ovf, m.module, "dyn_emb_evict_entry_ovf"),
-             "cuModuleGetFunction(ovf)");
-    cu_check(cuModuleGetFunction(&m.noovf, m.module, "dyn_emb_evict_entry_noovf"),
-             "cuModuleGetFunction(noovf)");
+    cu_check(cuModuleGetFunction(&m.evict, m.module, "dyn_emb_evict_entry"),
+             "cuModuleGetFunction(evict)");
     cu_check(cuModuleGetFunction(&m.insert, m.module, "dyn_emb_insert_entry"),
              "cuModuleGetFunction(insert)");
     cu_check(cuModuleGetFunction(&m.insert_collect, m.module,
@@ -196,10 +193,10 @@ void demb_register_score_function(int64_t key, const void *ltoir,
   get_module_locked(current_device(), key);
 }
 
-CUfunction demb_get_evict_fn(int64_t key, bool overflow) {
+CUfunction demb_get_evict_fn(int64_t key) {
   std::lock_guard<std::mutex> lk(g_mu);
   EvictModule &m = get_module_locked(current_device(), key);
-  return overflow ? m.ovf : m.noovf;
+  return m.evict;
 }
 
 CUfunction demb_get_insert_fn(int64_t key) {

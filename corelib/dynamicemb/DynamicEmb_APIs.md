@@ -844,7 +844,7 @@ Fields declared first (through `device_id`) are **planner/runtime-heavy**: `Dyna
             frequency → older-timestamp evictor). See the "Customized eviction via
             `score_function`" section under `DynamicEmbScoreStrategy`.
         bucket_capacity : int
-            Capacity of each bucket in the hash table, and default is 128 (using 1024 when the table serves as cache).
+            Capacity of each bucket in the hash table, and default is 128. A cache sizes its rows in multiples of 1024.
             A key will only be mapped to one bucket. 
             When the bucket is full, the key with the smallest score in the bucket will be evicted, and its slot will be used to store a new key. 
             The larger the bucket capacity, the more accurate the score based eviction will be, but it will also result in performance loss.
@@ -856,7 +856,7 @@ Fields declared first (through `device_id`) are **planner/runtime-heavy**: `Dyna
             Total GPU memory allocated to store embedding + optimizer states, in bytes. Default is 0.
             It has different meanings under `caching=True` and  `caching=False`.
                 When `caching=False`, it decides how much GPU memory is in the total memory to store value in a single hybrid table.
-                When `caching=True`, it decides the table capacity of the GPU table.
+                When `caching=True`, it decides the number of rows of the GPU cache.
             To match planner row counts and optimizer state width, size the **global** budget with
             ``get_table_value_bytes(embedding_config, EmbOptimType, world_size, bucket_capacity)``
             (same ``bucket_capacity`` you pass into ``get_sharded_table_capacity``, e.g. ``128`` or ``MAX_BUCKET_CAPACITY``),
@@ -1534,9 +1534,18 @@ The size of the table is finite, but the set of keys during training may be infi
 
 dynamicemb supports caching hot embeddings on GPU memory, and you can prefetch keys from host to device like torchrec. Caching and prefetch work for both sequence mode (`NONE`) and pooling modes (`SUM`/`MEAN`). See `test_prefetch_flush_in_cache` in [test prefetch](./test/test_batched_dynamic_embedding_tables_v2.py) for usage examples.
 
+**What the cache does and does not decide.** The cache holds hot rows on the GPU and keeps a row from being reused while a step in flight is using it. It holds no score and makes no decision about which keys stay in the system: admission, scoring (LRU / LFU / customized) and which key to evict when the table is full all belong to the backing store, and apply to every key of every step, cached or not. When the cache needs a row for a new key it gives up the one that has been idle the longest (first in, first out). See [the cache design](./docs/lightweight_cache_design.md).
+
+A key is inserted into the backing store when it is admitted, and the cache holds a copy of some of the keys the backing store holds. The backing store never evicts a key a step in flight is using; if every key it could evict is in use, inserting a new key fails with an error, so size the backing store (`max_capacity`) with room beyond the cache and the keys in flight.
+
+The cache's row count per table is `init_capacity` rounded up to a multiple of `bucket_capacity` (1024 for a cache), and a step's unique keys must fit in it, together with those of the steps still in flight; otherwise prefetch raises an error naming the table.
+
 ## External storage
 
-dynamicemb supports external storage once `external_storage` in `DynamicEmbTableOptions` inherits the `Storage` interface under [types.py](./dynamicemb/types.py). 
+`external_storage` in `DynamicEmbTableOptions` names a class inheriting the `Storage` interface under [types.py](./dynamicemb/types.py). It is the tier **below** the table, whichever layout the table is in (HBM table, host table, or an HBM cache over a host table). The table in front is sized as it is without an external storage (`max_capacity` rows); the external storage holds what the table evicts, with its values, and is asked for a key the table does not have. A key found there is not new: it skips admission and comes back up into the table with the value it had.
+
+Limits to know: dump/load, export, incremental dump and `erase` cover the table only, not the external storage, which persists itself, and a key erased from the table can still be read back from it. A key that has been through the external storage starts its score again when it returns to the table. `HybridStorage` ignores `external_storage`.
+
 Refer to demo `PyDictStorage` in [unit test](./test/test_batched_dynamic_embedding_tables_v2.py) for detailed usage.
 
 
@@ -1545,7 +1554,6 @@ Refer to demo `PyDictStorage` in [unit test](./test/test_batched_dynamic_embeddi
 Users can specify the initial capacity of a table on a single GPU. When the table needs more space, the implementation may double the key_index_map and embedding table capacity (per table, only for tables that need it) before insert. Expansion is triggered in these paths so that insert does not fail for lack of capacity:
 
 - **Prefetch HBM direct**: before inserting admitted keys into `DynamicEmbStorage`.
-- **Cache write-back**: before writing evicted keys back to storage (only `DynamicEmbStorage` uses cache mode; `HybridStorage` does not).
 - **Generic forward (DEFAULT mode)**: before `storage.insert()` when using `DynamicEmbStorage` or `HybridStorage` (for the latter, only the host tier is expanded).
 - **HybridStorage.load**: before inserting keys evicted from HBM into the host tier.
 
@@ -1565,8 +1573,10 @@ Please see `DynamicEmbDump`, `DynamicEmbLoad`, `incremental_dump` in [APIs Doc](
 
 ## Deterministic mode
 
-When handling cache eviction and final table eviction, dynamicemb encounters randomness in the eviction of keys with the same score. To eliminate this uncertainty, dynamicemb provides a deterministic mode. Enabling this mode ensures that, under the same training script, the evicted keys will be determined.
+When the backing table evicts keys, it encounters randomness in the eviction of keys with the same score. To eliminate this uncertainty, dynamicemb provides a deterministic mode. Enabling this mode ensures that, under the same training script, the evicted keys will be determined.
 This mode is enabled by setting the environment variable `DEMB_DETERMINISM_MODE`.
+
+The cache itself does not evict by score, so it has nothing to make deterministic: which cache row a key lands in depends on the order threads reach the cache's queue, and does not change any key's value. Under this mode a cache in front of a `DynamicEmbStorage` is driven through `Storage.insert` at eviction instead (the storage's insert cannot report which keys it evicted in this mode, and the cache has to know), so the backing store's scores are not updated for keys that stay cached.
 
 ## Environment Variables
 
@@ -1575,5 +1585,5 @@ The following environment variables control runtime behavior of dynamicemb:
 | Variable | Default | Effect |
 |----------|---------|--------|
 | `DYNAMICEMB_CSTM_SCORE_CHECK` | `1` | When set to `0`, suppresses warnings in `set_score` when a new score is less than the previous one (CUSTOMIZED eviction mode). |
-| `DEMB_DETERMINISM_MODE` | unset | When set, enables deterministic eviction of keys with equal scores during cache eviction and final table eviction. |
+| `DEMB_DETERMINISM_MODE` | unset | When set, enables deterministic eviction of keys with equal scores in the backing table. |
 | `DYNAMICEMB_DEBUG` | unset | When set to any non-empty value, enables extra runtime validation in `segmented_unique_cuda`. Copies `segmented_range` to CPU and verifies: (1) `segmented_range[0] == 0`, (2) `segmented_range[num_tables] == num_keys`, (3) monotonically non-decreasing. Raises an error with a descriptive message on violation. Intended for development and testing only; incurs one device-to-host copy per call. |

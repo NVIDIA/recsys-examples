@@ -100,8 +100,7 @@ void bind_table_operation(py::module &m) {
         py::arg("table_storage"), py::arg("table_bucket_offsets"),
         py::arg("bucket_capacity"), py::arg("keys"), py::arg("table_ids"),
         py::arg("score_input"), py::arg("policy_type"),
-        py::arg("ovf_storage") = py::none(), py::arg("ovf_bucket_capacity") = 0,
-        py::arg("ovf_output_offsets") = py::none(), py::arg("num_scores") = 1);
+        py::arg("num_scores") = 1);
 
   m.def("table_insert", &dyn_emb::table_insert, "insert into the table",
         py::arg("table_storage"), py::arg("table_bucket_offsets"),
@@ -109,7 +108,8 @@ void bind_table_operation(py::module &m) {
         py::arg("table_ids"), py::arg("score_input"), py::arg("policy_type"),
         py::arg("counter"), py::arg("insert_results") = py::none(),
         py::arg("score_output") = py::none(), py::arg("num_scores") = 1,
-        py::arg("score_fn_key") = 0);
+        py::arg("score_fn_key") = 0, py::arg("guard_tables") = 0,
+        py::arg("guard_num_tables") = 0);
 
   m.def("table_insert_collect_evicted", &dyn_emb::table_insert_collect_evicted,
         "insert into the table, retaining evicted (key, table_id)",
@@ -118,7 +118,8 @@ void bind_table_operation(py::module &m) {
         py::arg("table_ids"), py::arg("score_input"), py::arg("policy_type"),
         py::arg("counter"), py::arg("insert_results") = py::none(),
         py::arg("score_output") = py::none(), py::arg("num_scores") = 1,
-        py::arg("score_fn_key") = 0);
+        py::arg("score_fn_key") = 0, py::arg("guard_tables") = 0,
+        py::arg("guard_num_tables") = 0);
 
   m.def("table_insert_and_evict", &dyn_emb::table_insert_and_evict,
         "insert into the table", py::arg("table_storage"),
@@ -126,11 +127,7 @@ void bind_table_operation(py::module &m) {
         py::arg("bucket_sizes"), py::arg("keys"), py::arg("table_ids"),
         py::arg("score_input"), py::arg("policy_type"), py::arg("counter"),
         py::arg("insert_results") = py::none(),
-        py::arg("score_output") = py::none(),
-        py::arg("ovf_storage") = py::none(), py::arg("ovf_bucket_capacity") = 0,
-        py::arg("ovf_bucket_sizes") = py::none(),
-        py::arg("ovf_counter") = py::none(),
-        py::arg("ovf_output_offsets") = py::none(), py::arg("num_scores") = 1,
+        py::arg("score_output") = py::none(), py::arg("num_scores") = 1,
         py::arg("score_fn_key") = 0);
 
   m.def("table_erase", &dyn_emb::table_erase, "erase keys from the table",
@@ -194,10 +191,7 @@ void bind_table_operation(py::module &m) {
         "update counters at per-table slot indices (conversion done in kernel)",
         py::arg("counter"), py::arg("slot_indices"), py::arg("delta"),
         py::arg("table_bucket_offsets"), py::arg("bucket_capacity"),
-        py::arg("main_capacity"), py::arg("num_tables"),
-        py::arg("table_ids") = py::none(),
-        py::arg("overflow_output_offsets") = py::none(),
-        py::arg("overflow_bucket_capacity") = 0);
+        py::arg("num_tables"), py::arg("table_ids") = py::none());
 
   m.def("no_eviction_assign_scores", &dyn_emb::no_eviction_assign_scores,
         "Assign per-table monotonic scores via atomicAdd on "

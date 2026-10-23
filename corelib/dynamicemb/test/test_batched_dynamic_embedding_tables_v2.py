@@ -380,12 +380,11 @@ def _print_test_expansion_storage_cache_sizes_after_train_step(
 
     cache = bdebt.cache
     if isinstance(cache, DynamicEmbCache):
-        ckm = cache.key_index_map
         nt_c = cache._state.num_tables
-        csz = _kim_occupied_sizes_per_table(ckm, nt_c)
-        ccap = _kim_capacities_per_table(ckm, nt_c)
+        csz = [cache.num_resident(t) for t in range(nt_c)]
+        ccap = [cache.capacity(t) for t in range(nt_c)]
         print(
-            f"{tag} cache KIM size (per table): {csz}, "
+            f"{tag} cache size (per table): {csz}, "
             f"capacity (per table): {ccap}",
             flush=True,
         )
@@ -464,33 +463,18 @@ def _assert_cache_export_matches_lookup_embeddings(
     if not isinstance(cache, DynamicEmbCache):
         return
     state = cache._state
-    saved_training = state.training
-    cache.training = False
-    try:
-        for tid in range(state.num_tables):
-            for keys, emb_exp, _, _ in export_keys_values_iter(
-                state, device, batch_size=batch_size, table_id=tid
-            ):
-                if keys.numel() == 0:
-                    continue
-                tids = torch.full(
-                    (keys.numel(),), tid, dtype=torch.int64, device=keys.device
-                )
-                _, founds, indices = cache.lookup(keys, tids, None)
-                assert bool(
-                    founds.all()
-                ), f"cache table_id={tid}: every exported key must be found via lookup"
-                emb_slots = load_from_flat(
-                    state, indices, tids, copy_mode=CopyMode.EMBEDDING
-                )
-                torch.testing.assert_close(
-                    emb_exp.to(dtype=emb_slots.dtype),
-                    emb_slots,
-                    rtol=1e-5,
-                    atol=1e-5,
-                )
-    finally:
-        cache.training = saved_training
+    for tid in range(state.num_tables):
+        nodes, keys, _ = cache.resident(tid)
+        for start in range(0, keys.numel(), batch_size):
+            chunk_keys = keys[start : start + batch_size]
+            chunk_nodes = nodes[start : start + batch_size].to(torch.int64)
+            tids = torch.full(
+                (chunk_keys.numel(),), tid, dtype=torch.int64, device=chunk_keys.device
+            )
+            found = cache.find_nodes(chunk_keys, tids).to(torch.int64)
+            assert bool(
+                (found == chunk_nodes).all()
+            ), f"cache table_id={tid}: every resident key must be found at its own node"
 
 
 def _assert_storage_export_matches_find_embeddings(
@@ -657,6 +641,26 @@ def _kim_scan_keys_embeddings_dict(
     return out
 
 
+def _cache_scan_keys_embeddings_dict(
+    cache: DynamicEmbCache,
+    device: torch.device,
+) -> Dict[Tuple[int, int], torch.Tensor]:
+    """Scan the cache's resident rows: (table_id, key) -> embedding."""
+    state = cache._state
+    out: Dict[Tuple[int, int], torch.Tensor] = {}
+    for tid in range(state.num_tables):
+        emb_dim_t = state.table_emb_dims_cpu[tid]
+        nodes, keys, _ = cache.resident(tid)
+        if keys.numel() == 0:
+            continue
+        values = load_from_flat_single_table(state, nodes.to(torch.int64), tid)
+        embeddings = values[:, :emb_dim_t].contiguous().to(device)
+        keys_dev = keys.to(device=device)
+        for i in range(keys.numel()):
+            out[(tid, int(keys_dev[i].item()))] = embeddings[i].detach().clone()
+    return out
+
+
 def _assert_bdebt_storage_cache_merged_export_matches_lookup(
     bdebt: BatchedDynamicEmbeddingTablesV2,
     device: torch.device,
@@ -668,7 +672,7 @@ def _assert_bdebt_storage_cache_merged_export_matches_lookup(
 
     - Fills a dict from backing ``DynamicEmbStorage`` KIM scan, then overlays cache scan
       (cache wins on key collision).
-    - Verifies every merged (table_id, key) matches ``cache.lookup`` + ``load_from_flat``
+    - Verifies every merged (table_id, key) matches ``cache.find_nodes`` + ``load_from_flat``
       when present in cache, else ``storage.find`` (embedding column).
     """
     storage = bdebt.tables
@@ -679,16 +683,12 @@ def _assert_bdebt_storage_cache_merged_export_matches_lookup(
         return
 
     saved_st = storage.training
-    saved_ca = cache.training
     storage.training = False
-    cache.training = False
     try:
         storage_dict = _kim_scan_keys_embeddings_dict(
             storage._state, device, batch_size=batch_size
         )
-        cache_dict = _kim_scan_keys_embeddings_dict(
-            cache._state, device, batch_size=batch_size
-        )
+        cache_dict = _cache_scan_keys_embeddings_dict(cache, device)
         merged: Dict[Tuple[int, int], torch.Tensor] = {**storage_dict, **cache_dict}
 
         for k, v in cache_dict.items():
@@ -716,7 +716,8 @@ def _assert_bdebt_storage_cache_merged_export_matches_lookup(
                 ref = torch.stack([p[1] for p in chunk])
                 key_t = torch.tensor(ks, device=device, dtype=key_type)
                 tid_t = torch.full((len(ks),), tid, dtype=torch.int64, device=device)
-                _, founds_c, ix_c = cache.lookup(key_t, tid_t, None)
+                ix_c = cache.find_nodes(key_t, tid_t).to(torch.int64)
+                founds_c = ix_c >= 0
                 emb_live = torch.empty_like(ref)
                 if bool(founds_c.any()):
                     emb_live[founds_c] = load_from_flat(
@@ -752,7 +753,6 @@ def _assert_bdebt_storage_cache_merged_export_matches_lookup(
                 torch.testing.assert_close(ref, emb_live, rtol=1e-5, atol=1e-5)
     finally:
         storage.training = saved_st
-        cache.training = saved_ca
 
 
 def _compare_bdebt_export_to_stbe_weights(
@@ -778,8 +778,8 @@ def _compare_bdebt_export_to_stbe_weights(
     for tid, name in enumerate(table_names):
         _, st_detail = _bdebt_storage_entry_count_for_table(bdebt.tables, tid)
         if bdebt.cache is not None:
-            ckim = bdebt.cache.key_index_map
-            cache_sz, cache_cap = ckim.size(tid), ckim.capacity(tid)
+            cache_sz = bdebt.cache.num_resident(tid)
+            cache_cap = bdebt.cache.capacity(tid)
             cache_line = (
                 f"  Cache:    table_id={tid} size={cache_sz}, capacity={cache_cap}\n"
             )
@@ -2048,17 +2048,10 @@ def test_deterministic_insert(opt_type, opt_params, caching, PS, iteration, batc
         print(
             f"Iteration {i} passed for deterministic insertion with table_x's size({map_x.size()}), table_y's size({map_y.size()}), totoal({map_x.capacity()})"
         )
-        cache_x = bdebt_x.cache
-        cache_y = bdebt_y.cache
-        if cache_x is not None:
-            map_x = cache_x.key_index_map
-            map_y = cache_y.key_index_map
-
-            assert torch.equal(map_x.keys_, map_y.keys_)
-
-            print(
-                f"Iteration {i} passed for deterministic insertion with cache_x's size({map_x.size()}), cache_y's size({map_y.size()}), totoal({map_x.capacity()})"
-            )
+        # The cache has no index to compare: which node a key lands in follows the
+        # order threads reach the reclaim queue, which is not fixed, and it does
+        # not change what any key holds. What has to be the same is what the
+        # backing keeps, which the comparison above is.
 
     del os.environ["DEMB_DETERMINISM_MODE"]
     print("all check passed")
@@ -3419,12 +3412,11 @@ def test_table_expansion_capacity_growth(
         )
     cache = bdebt.cache
     if isinstance(cache, DynamicEmbCache):
-        ckm = cache.key_index_map
         nt_c = cache._state.num_tables
-        cache_sz = _kim_occupied_sizes_per_table(ckm, nt_c)
-        cache_caps = _kim_capacities_per_table(ckm, nt_c)
+        cache_sz = [cache.num_resident(t) for t in range(nt_c)]
+        cache_caps = [cache.capacity(t) for t in range(nt_c)]
         print(
-            f"[test_table_expansion_capacity_growth] cache KIM size (per table): "
+            f"[test_table_expansion_capacity_growth] cache size (per table): "
             f"{cache_sz}, capacity (per table): {cache_caps}",
             flush=True,
         )
@@ -3460,7 +3452,7 @@ def test_table_expansion_capacity_growth(
 
     bdebt.train()
     stbe.train()
-    # we need to do backward to unlock the keys in the cache, otherwise overflow buffer will be also full.
+    # we need to do backward to unlock the keys in the cache, otherwise the cache fills with referenced keys.
     for i in range(2):
         if not multi_table:
             for j, (idx, off) in enumerate(

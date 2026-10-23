@@ -376,38 +376,57 @@ class Storage(abc.ABC, Generic[OptionsT, OptimizerT]):
 
 
 class Cache(abc.ABC):
-    @abc.abstractmethod
-    def lookup(
-        self,
-        unique_keys: torch.Tensor,
-        table_ids: torch.Tensor,
-        lfu_accumulated_frequency: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Lookup with overflow fallback.
+    """Where the hot rows live on the GPU, and which of them a step is using.
 
-        Returns:
-            score_out: Output scores.
-            founds: Boolean tensor indicating which keys were found.
-            indices: Slot indices (``-1`` for keys not found).
-        """
-        ...
+    A cache holds no score and decides nothing about which keys stay in the
+    system; admission, scoring and eviction of keys belong to the backing store.
+    What the cache does is place a key in a row, keep a row from being reused
+    while a step in flight refers to it, and pick which idle row an incoming key
+    takes. Rows are addressed by *node*: the row of a table's pool.
+
+    Keys come in unique within a table and grouped by table. ``offsets`` is the
+    position at which each table starts, with the total last, as host integers.
+    """
 
     @abc.abstractmethod
-    def insert_and_evict(
+    def lookup_pin(
+        self, unique_keys: torch.Tensor, offsets: List[int]
+    ) -> torch.Tensor:
+        """The node holding each key, with a reference taken, or ``-1``."""
+
+    @abc.abstractmethod
+    def allocate(
         self,
         keys: torch.Tensor,
-        table_ids: torch.Tensor,
-        scores: Optional[torch.Tensor] = None,
-    ) -> Tuple[
-        torch.Tensor, int, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
-    ]:
-        """Insert with counter-aware eviction and overflow fallback.
+        positions: torch.Tensor,
+        offsets: List[int],
+        nodes: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Take a node for each key, evicting an idle one if needed.
 
-        Returns:
-            indices, num_evicted, evicted_keys, evicted_indices,
-            evicted_scores, evicted_table_ids.
+        ``positions`` says where each key's answer goes in ``nodes``, which is
+        written in place. Returns ``(victim_keys, has_victim, new_nodes)``, one
+        entry per key. The nodes come back loading: the caller fills their rows
+        and then calls :meth:`publish`.
         """
-        ...
+
+    @abc.abstractmethod
+    def publish(self, new_nodes: torch.Tensor, offsets: List[int]) -> None:
+        """Make the rows the caller has just written visible as cache hits."""
+
+    @abc.abstractmethod
+    def release(self, nodes: torch.Tensor, offsets: List[int]) -> None:
+        """Give back the reference a step took on each node (``-1`` holds none)."""
+
+    @abc.abstractmethod
+    def find_nodes(
+        self, keys: torch.Tensor, table_ids: torch.Tensor
+    ) -> torch.Tensor:
+        """The node holding each key in its table, or ``-1``. Pins nothing."""
+
+    @abc.abstractmethod
+    def invalidate(self, nodes: torch.Tensor, table_ids: torch.Tensor) -> None:
+        """Drop the bindings :meth:`find_nodes` found. Nothing is written back."""
 
     @abc.abstractmethod
     def reset(

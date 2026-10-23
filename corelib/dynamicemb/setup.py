@@ -131,9 +131,21 @@ def get_extensions():
         "-lnvJitLink",  # runtime link of numba LTO-IR into the LruLfu evict cubin
     ]
     extra_compile_args = {
-        "cxx": ["-O3", "-fdiagnostics-color=always", "-w", "-DDEMB_USE_PYBIND11"],
+        "cxx": [
+            "-O3",
+            "-fdiagnostics-color=always",
+            "-w",
+            "-DNDEBUG",
+            "-DDEMB_USE_PYBIND11",
+        ],
         "nvcc": [
             "-O3",
+            # Turns off assert(). Needed explicitly on the nvcc side: torch's
+            # BuildExtension replaces the whole compiler command for .cu files,
+            # so the -DNDEBUG that Python's own build flags carry never reaches
+            # them. Device asserts are the reason this matters — one that fires
+            # aborts the kernel and leaves the CUDA context unusable.
+            "-DNDEBUG",
             # SASS<->source line mapping for ncu's Source page / --import-source.
             # Does not disable device optimizations (unlike -G), so runtime
             # kernel performance is unaffected.

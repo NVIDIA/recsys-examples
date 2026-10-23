@@ -25,11 +25,11 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 // Evictor> from kernels.cuh with RankedEvictor<Comparator>, so the insert/evict
 // logic is not duplicated. Traits are fixed for LruLfu: KeyType=int64,
 // CompactTileSize=1 (always correct), OutputScore=true (score_output
-// null-checked at runtime), PolicyType=LruLfu. Three entry points:
-//   dyn_emb_evict_entry_ovf / _noovf -- insert_and_evict (EnableOverflow on/off)
-//   dyn_emb_insert_entry             -- plain insert (no overflow tier; a full
-//                                       bucket still evicts, but no evicted
-//                                       output is collected)
+// null-checked at runtime), PolicyType=LruLfu. Entry points:
+//   dyn_emb_evict_entry              -- insert_and_evict
+//   dyn_emb_insert_entry             -- plain insert (a full bucket still
+//                                       evicts, but no evicted output is
+//                                       collected)
 
 #include "evict_abi.cuh"
 #include "evict_comparators.cuh"
@@ -52,42 +52,32 @@ __device__ __forceinline__ uint64_t read_globaltimer() {
   return t;
 }
 
-template <bool EnableOverflow>
 __device__ __forceinline__ void run_evict(const EvictParams &p,
                                           uint64_t cur_ts) {
   using KernelTraits =
       InsertKernelTraits<256, 1, 1, /*CompactTileSize=*/1,
                          /*NumScorePerThread=*/8, ScorePolicyType::LruLfu,
-                         /*OutputScore=*/true, EnableOverflow>;
+                         /*OutputScore=*/true>;
 
   EvictTable table(p.table_storage, p.num_buckets, p.bucket_capacity,
                    p.num_scores);
-  EvictTable ovf_table =
-      EnableOverflow ? EvictTable(p.ovf_storage, p.ovf_num_buckets,
-                                  p.ovf_bucket_capacity, p.num_scores)
-                     : EvictTable();
 
   insert_and_evict_body<EvictTable, KernelTraits, RankedEvictor<EvictComparator>>(
       table, p.table_bucket_offsets, p.bucket_sizes, p.batch, p.input_keys,
       p.table_ids, reinterpret_cast<InsertResult *>(p.insert_results),
       p.indices, p.score_input, p.score_output, p.table_key_slots,
       p.evicted_counter, p.evicted_keys, p.evicted_scores, p.evicted_indices,
-      p.evicted_table_ids, p.counter, ovf_table, p.ovf_bucket_sizes,
-      p.ovf_counter, p.ovf_output_offsets, cur_ts);
+      p.evicted_table_ids, p.counter, cur_ts);
 }
 
-extern "C" __global__ void dyn_emb_evict_entry_ovf(EvictParams p) {
-  run_evict<true>(p, read_globaltimer());
+extern "C" __global__ void dyn_emb_evict_entry(EvictParams p) {
+  run_evict(p, read_globaltimer());
 }
 
-extern "C" __global__ void dyn_emb_evict_entry_noovf(EvictParams p) {
-  run_evict<false>(p, read_globaltimer());
-}
-
-// Plain insert (no overflow tier, no evicted-output collection). A full bucket
+// Plain insert (no evicted-output collection). A full bucket
 // still evicts, but via RankedEvictor<Comparator> -- so a 2-word LruLfu table
 // never falls back to the single-score reduce() in table_insert_kernel. Reuses
-// EvictParams (evicted_* / ovf_* fields unused here).
+// EvictParams (evicted_* fields unused here).
 __device__ __forceinline__ void run_insert(const EvictParams &p,
                                            uint64_t cur_ts) {
   using KernelTraits =
@@ -102,17 +92,19 @@ __device__ __forceinline__ void run_insert(const EvictParams &p,
       table, p.table_bucket_offsets, p.bucket_sizes, p.batch, p.input_keys,
       p.table_ids, reinterpret_cast<InsertResult *>(p.insert_results),
       p.indices, p.score_input, p.score_output, p.table_key_slots, p.counter,
-      cur_ts);
+      cur_ts, nullptr, nullptr, nullptr, nullptr,
+      embedding_cache::EvictionGuardView{p.guard_tables, p.guard_num_tables});
 }
 
 extern "C" __global__ void dyn_emb_insert_entry(EvictParams p) {
   run_insert(p, read_globaltimer());
 }
 
-// Plain insert that ALSO retains each evicted victim's (key, table_id) into
-// p.evicted_keys / p.evicted_table_ids (count in p.evicted_counter). Same as
+// Plain insert that ALSO retains each evicted victim's (key, table_id, slot) into
+// p.evicted_keys / p.evicted_table_ids / p.evicted_indices (count in
+// p.evicted_counter). Same as
 // run_insert but CollectEvicted=true -- the last-tier retain path for LruLfu
-// tables. Only InsertResult::Evict is collected (not Busy); ovf_* stay unused.
+// tables. Only InsertResult::Evict is collected (not Busy).
 __device__ __forceinline__ void run_insert_collect(const EvictParams &p,
                                                    uint64_t cur_ts) {
   using KernelTraits =
@@ -128,7 +120,9 @@ __device__ __forceinline__ void run_insert_collect(const EvictParams &p,
       table, p.table_bucket_offsets, p.bucket_sizes, p.batch, p.input_keys,
       p.table_ids, reinterpret_cast<InsertResult *>(p.insert_results),
       p.indices, p.score_input, p.score_output, p.table_key_slots, p.counter,
-      cur_ts, p.evicted_keys, p.evicted_table_ids, p.evicted_counter);
+      cur_ts, p.evicted_keys, p.evicted_table_ids, p.evicted_indices,
+      p.evicted_counter,
+      embedding_cache::EvictionGuardView{p.guard_tables, p.guard_num_tables});
 }
 
 extern "C" __global__ void dyn_emb_insert_collect_entry(EvictParams p) {

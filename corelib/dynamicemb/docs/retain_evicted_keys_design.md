@@ -272,9 +272,11 @@ def insert(self, keys, table_ids, score, insert_results=None, score_out=None,
     indices = table_insert(...)   # as before
     return indices
 ```
-> The `_deterministic_insert` path (`DEMB_DETERMINISM_MODE`) **does not support**
-> collection: `collect_evicted=True` there raises a clear `RuntimeError` (no
-> silent fallback). [Decision 3]
+> The `_deterministic_insert` path (`DEMB_DETERMINISM_MODE`) supports collection
+> too: it inserts one wave at a time with `table_insert_collect_evicted` and
+> concatenates each wave's victims in wave order, so the list is deterministic.
+> [Decision 3, revised: the cache's eager flow needs the victim list under
+> determinism]
 
 ### 5.3 `dynamicemb/key_value_table.py` (core)
 
@@ -398,7 +400,8 @@ All retain tests live under `test/unit_tests/retain_evicted_keys/`.
   eviction oracle checks the (evicted_keys, evicted_table_ids) collected by
   `insert(collect_evicted=True)` — **one each for the LruLfu cubin and the AoT
   path**, table_id routing across logical tables sharing storage, empty on no
-  eviction, and the `DEMB_DETERMINISM_MODE` raise.
+  eviction, and collection under `DEMB_DETERMINISM_MODE` (same victims as the
+  ordinary insert).
 - **Storage level** (same file, 3 cases): `DynamicEmbStorage` end-to-end (collect
   → pop unique → evicted keys are gone from the table → second pop empty /
   incremental), `retain=False` always empty, and a buffer-logic unit test
@@ -425,8 +428,8 @@ All retain tests live under `test/unit_tests/retain_evicted_keys/`.
 1. **Collection scope**: collect only `InsertResult::Evict`; **not `Busy`**.
 2. **No mid-flight compaction**: no compaction while appending; dedup only on
    `pop` via `torch.unique`.
-3. **Determinism mode**: `DEMB_DETERMINISM_MODE` does not support collection;
-   `collect_evicted=True` there raises a `RuntimeError`.
+3. **Determinism mode**: collection is supported; the waves' victims are
+   concatenated in wave order.
 4. **Disabled tables**: omitted from the `pop` result (no empty tensor).
 5. **API location**: `pop_evicted_keys` lives in `dynamicemb/incremental_dump.py`.
 6. **No `clear=False`**: keep only the read-and-clear semantics; no read-only

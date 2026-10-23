@@ -25,12 +25,11 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 //
 // KeyType/IndexType/CounterType are all int64, ScoreType is uint64, InsertResult
 // is a uint8 enum -- fixed for LruLfu (§11.2), so this ABI is monomorphic. The
-// cubin exposes three entry points (all take EvictParams by value):
-//   dyn_emb_evict_entry_ovf(EvictParams)     -- insert_and_evict, overflow tier
-//   dyn_emb_evict_entry_noovf(EvictParams)   -- insert_and_evict, no overflow
+// cubin exposes these entry points (all take EvictParams by value):
+//   dyn_emb_evict_entry(EvictParams)         -- insert_and_evict
 //   dyn_emb_insert_entry(EvictParams)        -- plain insert (evicts a full
 //       bucket via the ranked comparator but collects no evicted output;
-//       the evicted_* and ovf_* fields are unused / may be null).
+//       the evicted_* fields are unused / may be null).
 #pragma once
 
 #include <cstdint>
@@ -62,13 +61,11 @@ struct EvictParams {
   int64_t *evicted_table_ids;
   int32_t *counter;
 
-  // --- overflow tier (fields ignored / may be null for the _noovf entry) ---
-  uint8_t *ovf_storage;
-  uint64_t ovf_num_buckets;
-  int64_t ovf_bucket_capacity;
-  int *ovf_bucket_sizes;
-  int32_t *ovf_counter;
-  const int64_t *ovf_output_offsets;
+  // --- the cache's eviction guard (plain insert only; null/0 for no guard) ---
+  // Layout-compatible with embedding_cache::EvictionGuardView, which this header
+  // cannot include: the host-side launcher includes it too.
+  const void *guard_tables;
+  int32_t guard_num_tables;
 };
 
 } // namespace dyn_emb

@@ -32,6 +32,7 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 #include <cuda_pipeline.h>
 #include <cuda_runtime.h>
 
+#include "../embedding_cache/guard.h"
 #include "score.cuh"
 
 extern "C" __device__ size_t __cvta_generic_to_shared(const void *);
@@ -398,7 +399,10 @@ struct LinearBucket {
   __forceinline__ __device__ bool
   reduce(Iterator &dst_iter, KeyType &dst_key, ScoreType &dst_score,
          ScoreType *sm_buffers, int32_t const *__restrict__ counter,
-         int64_t counter_offset) const {
+         int64_t counter_offset,
+         embedding_cache::EvictionGuardView guard =
+             embedding_cache::EvictionGuardView{nullptr, 0},
+         int64_t table_id = 0) const {
 
     static_assert(GroupSize == 1);
     bool succeed = false;
@@ -454,7 +458,7 @@ struct LinearBucket {
 
             if (temp_key != LockedKey && temp_key != EmptyKey) {
               int64_t flat_idx = counter_offset + iter + k + j;
-              if (counter[flat_idx] > 0)
+              if (counter[flat_idx] > 0 || guard.refuses(temp_key, table_id))
                 continue;
 
               dst_iter = iter + k + j;
@@ -480,7 +484,10 @@ struct LinearBucket {
   __forceinline__ __device__ bool
   reduce_ranked(Iterator &dst_iter, KeyType &dst_key, ScoreType &dst_score,
                 ScoreType *sm_buffers, int32_t const *__restrict__ counter,
-                int64_t counter_offset, uint64_t cur_ts) const {
+                int64_t counter_offset, uint64_t cur_ts,
+                embedding_cache::EvictionGuardView guard =
+                    embedding_cache::EvictionGuardView{nullptr, 0},
+                int64_t table_id = 0) const {
     static_assert(GroupSize == 1);
     bool succeed = false;
     if (storage_ == nullptr or capacity_ == 0) {
@@ -523,7 +530,7 @@ struct LinearBucket {
                               ->load(cuda::std::memory_order_relaxed);
           if (temp_key != LockedKey && temp_key != EmptyKey) {
             int64_t flat_idx = counter_offset + key_it;
-            if (counter[flat_idx] > 0)
+            if (counter[flat_idx] > 0 || guard.refuses(temp_key, table_id))
               continue;
             dst_iter = key_it;
             dst_key = temp_key;

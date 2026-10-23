@@ -93,6 +93,11 @@ target_compile_options(inference_emb_ops PRIVATE
 
 target_compile_definitions(inference_emb_ops PRIVATE
     TORCH_EXTENSION_NAME=inference_emb_ops
+    # Turns off assert(), matching setup.py. Set here rather than relying on
+    # CMAKE_BUILD_TYPE=Release, which this project never sets. Device asserts
+    # are the reason it matters: one that fires aborts the kernel and leaves
+    # the CUDA context unusable, so it must not survive into a real run.
+    NDEBUG
 )
 
 target_link_libraries(inference_emb_ops PRIVATE

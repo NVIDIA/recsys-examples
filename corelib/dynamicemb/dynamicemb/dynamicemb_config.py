@@ -1023,19 +1023,18 @@ def get_group_value_bytes_by_tier(
     and over-states host. Under-stating HBM is the unsafe direction -- the
     planner would believe there is room it will not find.
 
-    ``caching`` and ``external_storage`` are both part of the grouping key
+    ``caching`` is part of the grouping key
     (``DynamicEmbTableOptions.get_grouped_key``), so every member of a real
-    group agrees on them and reading them off the first is exact.
+    group agrees on it and reading it off the first is exact.
 
     A group whose rows fit its HBM budget is HBM_ONLY and costs nothing on the
     host, which is true of a caching group as well: the runtime reads
     ``caching`` only after deciding the rows do not fit. Where they do not, the
     rest go to the host -- and under ``caching`` the HBM is a cache in front of
     a host tier holding every row rather than a disjoint partition, so the host
-    figure is the whole thing rather than the remainder. An
-    external store takes that backing tier off this box, which is honoured in
-    the two layouts that have one to move -- CACHING_PS and HOST_PS.
-    ``HybridStorage`` ignores it and warns, so its host tier is local and counts.
+    figure is the whole thing rather than the remainder. An external store
+    (``external_storage``) sits below these tables and holds what they evict; it
+    takes nothing off this box, so it does not change the figures.
 
     An ``optimizer_type`` of ``None`` counts a table's rows without optimizer
     state -- the honest answer when the caller cannot tell which optimizer it
@@ -1064,21 +1063,16 @@ def get_group_value_bytes_by_tier(
         )
         total += options.max_capacity * DTYPE_NUM_BYTES[dtype] * (dim + state_dim)
 
-    first = members[0][0]
-    caching = first.caching
-    external = first.external_storage is not None
+    caching = members[0][0].caching
 
     # The fit check first, as the runtime does it: `caching` is only read
     # inside `total_memory > local_hbm`, and a group that fits is HBM_ONLY
-    # whatever it asked for -- `external_storage` is warned about and ignored
-    # there too. Taking the caching branch first charged such a group its whole
+    # whatever it asked for. Taking the caching branch first charged such a group its whole
     # budget in HBM and its whole size again on the host, so a 4 GiB group with
     # a 20 GiB budget cost 20 + 4 where the runtime spends 4 and nothing.
     if total > hbm_budget:
         if caching:
-            return hbm_budget, 0 if external else total
-        if external and hbm_budget <= 0:
-            return 0, 0
+            return hbm_budget, total
         return hbm_budget, total - hbm_budget
     return total, 0
 

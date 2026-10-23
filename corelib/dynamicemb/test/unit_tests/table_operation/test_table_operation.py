@@ -673,9 +673,10 @@ def test_table_evict(
         ),
     ],
 )
-def test_overflow_with_counter(key_type, table_config):
-    """Unified test: construction, fill, counter lock, overflow insertion,
-    lookup, counter release, eviction, and reset."""
+def test_counter_protects_slots(key_type, table_config):
+    """A slot whose ref counter is above zero is never evicted: fill the table
+    taking a reference on every slot, show that new keys with higher scores are
+    refused, release the references, and show that they now evict."""
     assert torch.cuda.is_available()
     device = torch.cuda.current_device()
 
@@ -683,342 +684,114 @@ def test_overflow_with_counter(key_type, table_config):
     bucket_capacity = table_config["bucket_capacity"]
     num_tables = len(num_buckets_list)
     capacity = [nb * bucket_capacity for nb in num_buckets_list]
-    total_main_cap = sum(capacity)
-    ovf_cap_per_table = 3 * bucket_capacity
-    num_rounds = 10
+    total_cap = sum(capacity)
 
-    # ------------------------------------------------------------------
-    # Phase 1: Construction verification
-    # ------------------------------------------------------------------
     table = get_scored_table(
         capacity=capacity,
         bucket_capacity=bucket_capacity,
         key_type=key_type,
         score_specs=[ScoreSpec(name="score1", policy=ScorePolicy.ASSIGN)],
-        enable_overflow=True,
     )
-
-    assert table.enable_overflow_ is True
-    assert table.overflow_bucket_capacity_ == ovf_cap_per_table
-
-    expected_total = total_main_cap + ovf_cap_per_table * num_tables
-    assert table.capacity() == expected_total
-    assert table._ref_counter is not None
-    assert table._ref_counter.numel() == expected_total
+    assert table.capacity() == total_cap
+    assert table._ref_counter.numel() == total_cap
     assert (table._ref_counter == 0).all()
-
     for t in range(num_tables):
-        assert table.main_capacity(table_id=t) == capacity[t]
-        assert table.capacity(table_id=t) == capacity[t] + ovf_cap_per_table
+        assert table.capacity(table_id=t) == capacity[t]
 
-    print(f"Phase 1 passed: {num_tables} tables, bucket_capacity={bucket_capacity}")
+    def score(n, value):
+        return ScoreArg(
+            name="score1",
+            value=torch.full((n,), value, dtype=torch.uint64, device=device),
+        )
 
-    # ------------------------------------------------------------------
-    # Phase 2: Fill main table using counter + insert (no overflow)
-    # ------------------------------------------------------------------
+    # Fill every table, taking a reference on each slot a key lands in.
     key_offset = 1
-    fill_keys_list = []
-    fill_tids_list = []
-    fill_indices_list = []
-
-    batch_per_table = total_main_cap
-    max_iters = 100
-
-    for _iter in range(max_iters):
-        all_full = all(table.size(table_id=t) == capacity[t] for t in range(num_tables))
-        if all_full:
+    fill_keys_list, fill_tids_list, fill_indices_list = [], [], []
+    for _ in range(100):
+        if all(table.size(table_id=t) == capacity[t] for t in range(num_tables)):
             break
-
         iter_keys, iter_tids = [], []
         for t in range(num_tables):
-            k = torch.arange(
-                key_offset,
-                key_offset + batch_per_table,
-                device=device,
-                dtype=torch.int64,
-            ).to(key_type)
-            iter_keys.append(k)
-            iter_tids.append(
-                torch.full((batch_per_table,), t, dtype=torch.int64, device=device)
+            iter_keys.append(
+                torch.arange(
+                    key_offset,
+                    key_offset + total_cap,
+                    device=device,
+                    dtype=torch.int64,
+                ).to(key_type)
             )
-            key_offset += batch_per_table
-
+            iter_tids.append(
+                torch.full((total_cap,), t, dtype=torch.int64, device=device)
+            )
+            key_offset += total_cap
         batch_keys = torch.cat(iter_keys)
         batch_tids = torch.cat(iter_tids)
-        batch_n = batch_keys.numel()
-        batch_scores = ScoreArg(
-            name="score1",
-            value=torch.full((batch_n,), 100, dtype=torch.uint64, device=device),
+        results = torch.empty(
+            batch_keys.numel(), dtype=table.result_type, device=device
         )
-        batch_results = torch.empty(batch_n, dtype=table.result_type, device=device)
-
-        indices = table.insert(batch_keys, batch_tids, batch_scores, batch_results)
-
-        success_mask = (
-            (batch_results == InsertResult.INSERT.value)
-            | (batch_results == InsertResult.RECLAIM.value)
-            | (batch_results == InsertResult.ASSIGN.value)
+        indices = table.insert(
+            batch_keys, batch_tids, score(batch_keys.numel(), 100), results
         )
-
-        if not success_mask.any():
+        success = (
+            (results == InsertResult.INSERT.value)
+            | (results == InsertResult.RECLAIM.value)
+            | (results == InsertResult.ASSIGN.value)
+        )
+        if not success.any():
             break
-
-        succ_indices = indices[success_mask]
-        succ_tids = batch_tids[success_mask]
-        table.increment_counter(succ_indices, succ_tids)
-        fill_keys_list.append(batch_keys[success_mask])
-        fill_tids_list.append(batch_tids[success_mask])
-        fill_indices_list.append(succ_indices)
+        table.increment_counter(indices[success], batch_tids[success])
+        fill_keys_list.append(batch_keys[success])
+        fill_tids_list.append(batch_tids[success])
+        fill_indices_list.append(indices[success])
 
     for t in range(num_tables):
-        assert (
-            table.size(table_id=t) == capacity[t]
-        ), f"Table {t}: expected size {capacity[t]}, got {table.size(table_id=t)}"
-
+        assert table.size(table_id=t) == capacity[t]
     fill_keys = torch.cat(fill_keys_list)
     fill_tids = torch.cat(fill_tids_list)
     fill_indices = torch.cat(fill_indices_list)
 
-    per_table_main_caps = torch.tensor(capacity, dtype=torch.int64, device=device)
+    # The counter is flat: table 0's slots, then table 1's, ...
+    flat = table.table_bucket_offsets_[fill_tids] * table.bucket_capacity_ + fill_indices
+    counter = table._ref_counter.cpu()
+    assert all(counter[i].item() >= 1 for i in flat.cpu().tolist())
 
-    print(f"Phase 2 passed: {fill_keys.numel()}/{total_main_cap} keys in main")
-
-    # ------------------------------------------------------------------
-    # Phase 3: Verify counters on filled slots (already locked in Phase 2)
-    # ------------------------------------------------------------------
-    # fill_indices are per-table; _ref_counter is flat (table0 slots, table1, ...)
-    flat_indices = (
-        table.table_bucket_offsets_[fill_tids] * table.bucket_capacity_ + fill_indices
-    )
-    counter_cpu = table._ref_counter.cpu()
-    for flat in flat_indices.cpu().tolist():
-        assert (
-            counter_cpu[flat].item() >= 1
-        ), f"Counter at flat slot {flat} should be >= 1 after increment"
-
-    print("Phase 3 passed: all filled slots locked")
-
-    def to_counter_indices(indices, tids):
-        per_key_main = per_table_main_caps[tids]
-        is_ovf = indices >= per_key_main
-        return torch.where(
-            is_ovf,
-            total_main_cap + (indices - per_key_main),
-            indices,
-        )
-
-    # ------------------------------------------------------------------
-    # Phase 4: Iterative overflow insertion (10 rounds)
-    # ------------------------------------------------------------------
-    ovf_keys_per_table = ovf_cap_per_table
-    batch_per_table = ovf_keys_per_table // num_rounds
-
-    ovf_key_pools = []
-    for t in range(num_tables):
-        k = torch.arange(
-            key_offset,
-            key_offset + ovf_keys_per_table,
-            device=device,
-            dtype=torch.int64,
+    def insert_and_evict_new(n_per_table):
+        nonlocal key_offset
+        keys = torch.arange(
+            key_offset, key_offset + n_per_table, device=device, dtype=torch.int64
         ).to(key_type)
-        ovf_key_pools.append(k)
-        key_offset += ovf_keys_per_table
-
-    all_ovf_indices = []
-    all_ovf_keys = []
-    all_ovf_tids = []
-    all_ovf_results = []
-
-    for r in range(num_rounds):
-        round_keys_list = []
-        round_tids_list = []
-        for t in range(num_tables):
-            start = r * batch_per_table
-            end = start + batch_per_table
-            round_keys_list.append(ovf_key_pools[t][start:end])
-            round_tids_list.append(
-                torch.full((batch_per_table,), t, dtype=torch.int64, device=device)
-            )
-        round_keys = torch.cat(round_keys_list)
-        round_tids = torch.cat(round_tids_list)
-        round_batch = round_keys.numel()
-
-        round_scores = ScoreArg(
-            name="score1",
-            value=torch.full((round_batch,), 1, dtype=torch.uint64, device=device),
+        key_offset += n_per_table
+        tids = torch.zeros(n_per_table, dtype=torch.int64, device=device)
+        results = torch.empty(n_per_table, dtype=table.result_type, device=device)
+        _, num_evicted, evicted_keys, *_ = table.insert_and_evict(
+            keys, tids, score(n_per_table, 200), results
         )
-        round_results = torch.empty(round_batch, dtype=table.result_type, device=device)
+        return results, num_evicted, evicted_keys
 
-        round_indices, _, *_ = table.insert_and_evict_with_counter_and_overflow(
-            round_keys,
-            round_tids,
-            round_scores,
-            round_results,
-        )
-
-        success_mask = (
-            (round_results == InsertResult.INSERT.value)
-            | (round_results == InsertResult.EVICT.value)
-            | (round_results == InsertResult.ASSIGN.value)
-        )
-
-        per_key_main = per_table_main_caps[round_tids]
-        ovf_mask = round_indices >= per_key_main
-
-        successful_indices = round_indices[success_mask]
-        successful_tids = round_tids[success_mask]
-        if successful_indices.numel() > 0:
-            table.increment_counter(successful_indices, successful_tids)
-
-        all_ovf_indices.append(round_indices)
-        all_ovf_keys.append(round_keys)
-        all_ovf_tids.append(round_tids)
-        all_ovf_results.append(round_results)
-
-        round_ovf_count = ovf_mask[success_mask].sum().item()
-        print(
-            f"  Round {r}: {success_mask.sum().item()}/{round_batch} succeeded, "
-            f"{round_ovf_count} in overflow"
-        )
-
-    print("Phase 4 passed: iterative overflow insertion complete")
-
-    # ------------------------------------------------------------------
-    # Phase 5: Lookup all inserted keys
-    # ------------------------------------------------------------------
-    all_ovf_keys_cat = torch.cat(all_ovf_keys)
-    all_ovf_tids_cat = torch.cat(all_ovf_tids)
-    all_ovf_results_cat = torch.cat(all_ovf_results)
-    all_ovf_indices_cat = torch.cat(all_ovf_indices)
-    ovf_success_mask = (
-        (all_ovf_results_cat == InsertResult.INSERT.value)
-        | (all_ovf_results_cat == InsertResult.EVICT.value)
-        | (all_ovf_results_cat == InsertResult.ASSIGN.value)
-    )
-
-    per_key_main_p4 = per_table_main_caps[all_ovf_tids_cat]
-    p4_in_ovf = (
-        all_ovf_indices_cat[ovf_success_mask] >= per_key_main_p4[ovf_success_mask]
-    )
-    assert p4_in_ovf.any(), "At least some Phase 4 keys should land in overflow"
-
-    lookup_score = ScoreArg(
+    # Every slot is referenced: nothing may be evicted to make room.
+    n_new = min(32, capacity[0])
+    results, _, _ = insert_and_evict_new(n_new)
+    assert (
+        results == InsertResult.BUSY.value
+    ).all(), "keys must be refused while every slot in their bucket is referenced"
+    assert not (results == InsertResult.EVICT.value).any()
+    probe = ScoreArg(
         name="score1",
-        value=torch.zeros(total_main_cap, dtype=torch.uint64, device=device),
+        value=torch.zeros(fill_keys.numel(), dtype=torch.uint64, device=device),
         policy=ScorePolicy.CONST,
     )
-    _, fill_founds, fill_lookup_indices = table.lookup_with_overflow(
-        fill_keys,
-        fill_tids,
-        lookup_score,
-    )
-    assert fill_founds.all(), "All fill keys should still be found"
-    assert torch.equal(
-        fill_indices, fill_lookup_indices
-    ), "Fill lookup indices should match original insert indices"
+    _, founds, _ = table.lookup(fill_keys, fill_tids, probe)
+    assert founds.all(), "a referenced key was evicted"
 
-    ovf_success_keys = all_ovf_keys_cat[ovf_success_mask]
-    ovf_success_tids = all_ovf_tids_cat[ovf_success_mask]
-    ovf_success_indices = all_ovf_indices_cat[ovf_success_mask]
-
-    if ovf_success_keys.numel() > 0:
-        ovf_lookup_score = ScoreArg(
-            name="score1",
-            value=torch.zeros(
-                ovf_success_keys.numel(), dtype=torch.uint64, device=device
-            ),
-            policy=ScorePolicy.CONST,
-        )
-        _, ovf_founds, ovf_lookup_indices = table.lookup_with_overflow(
-            ovf_success_keys,
-            ovf_success_tids,
-            ovf_lookup_score,
-        )
-        assert (
-            ovf_founds.all()
-        ), "All successfully inserted overflow keys should be found"
-        assert torch.equal(ovf_success_indices, ovf_lookup_indices)
-
-    ghost_keys = torch.arange(
-        key_offset, key_offset + 50, device=device, dtype=torch.int64
-    ).to(key_type)
-    ghost_tids = torch.zeros(50, dtype=torch.int64, device=device)
-    ghost_score = ScoreArg(
-        name="score1",
-        value=torch.zeros(50, dtype=torch.uint64, device=device),
-        policy=ScorePolicy.CONST,
-    )
-    _, ghost_founds, _ = table.lookup_with_overflow(
-        ghost_keys,
-        ghost_tids,
-        ghost_score,
-    )
-    assert not ghost_founds.any(), "Never-inserted keys should not be found"
-
-    print("Phase 5 passed: all lookups verified")
-
-    # ------------------------------------------------------------------
-    # Phase 6: Decrement counters + verify eviction is possible
-    # ------------------------------------------------------------------
+    # Release every reference: the same kind of insert now evicts.
     table.decrement_counter(fill_indices, fill_tids)
+    assert (table._ref_counter == 0).all()
+    results, num_evicted, evicted_keys = insert_and_evict_new(n_new)
+    assert (results == InsertResult.EVICT.value).any()
+    assert num_evicted > 0
+    assert set(evicted_keys.cpu().tolist()) <= set(fill_keys.cpu().tolist())
 
-    ovf_success_indices_list = []
-    ovf_success_tids_list = []
-    for r_idx, r_tids, r_results in zip(all_ovf_indices, all_ovf_tids, all_ovf_results):
-        r_success = (
-            (r_results == InsertResult.INSERT.value)
-            | (r_results == InsertResult.EVICT.value)
-            | (r_results == InsertResult.ASSIGN.value)
-        )
-        if r_success.any():
-            ovf_success_indices_list.append(r_idx[r_success])
-            ovf_success_tids_list.append(r_tids[r_success])
-    if ovf_success_indices_list:
-        table.decrement_counter(
-            torch.cat(ovf_success_indices_list),
-            torch.cat(ovf_success_tids_list),
-        )
-
-    assert (
-        table._ref_counter == 0
-    ).all(), "All counters should be 0 after decrementing"
-
-    evict_batch = min(32, total_main_cap)
-    evict_keys = torch.arange(
-        key_offset, key_offset + evict_batch, device=device, dtype=torch.int64
-    ).to(key_type)
-    key_offset += evict_batch
-    evict_tids = torch.zeros(evict_batch, dtype=torch.int64, device=device)
-    evict_scores = ScoreArg(
-        name="score1",
-        value=torch.full((evict_batch,), 200, dtype=torch.uint64, device=device),
-    )
-    evict_results = torch.empty(evict_batch, dtype=table.result_type, device=device)
-    _, num_evicted, evicted_keys, *_ = table.insert_and_evict_with_counter_and_overflow(
-        evict_keys,
-        evict_tids,
-        evict_scores,
-        evict_results,
-    )
-
-    has_evict = (evict_results == InsertResult.EVICT.value).any().item()
-    print(f"Phase 6: evictions={num_evicted}, " f"has_evict_result={has_evict}")
-    assert (
-        num_evicted > 0 or has_evict
-    ), "With counters at 0 and higher scores, some eviction should occur"
-
-    print("Phase 6 passed: counter release and eviction verified")
-
-    # ------------------------------------------------------------------
-    # Phase 7: Reset
-    # ------------------------------------------------------------------
     table.reset()
     for t in range(num_tables):
-        assert table.size(table_id=t) == 0, f"Table {t} should have size 0 after reset"
-    assert (table._ref_counter == 0).all(), "Counters should be 0 after reset"
-    assert (
-        table.overflow_bucket_sizes == 0
-    ).all(), "Overflow bucket sizes should be 0 after reset"
-
-    print("Phase 7 passed: reset verified")
-    print("test_overflow_with_counter PASSED")
+        assert table.size(table_id=t) == 0
+    assert (table._ref_counter == 0).all()

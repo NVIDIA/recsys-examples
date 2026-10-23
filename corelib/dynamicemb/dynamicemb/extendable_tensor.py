@@ -128,6 +128,48 @@ class DeviceExtendableBuffer(ExtendableBuffer):
         self._shape = _merge_extend_shape(self._shape, shape, numel_add)
 
 
+class FixedDeviceBuffer(ExtendableBuffer):
+    """A device buffer that never grows: the cache's row pool.
+
+    It has the buffer interface so it can sit where a table's value buffer does
+    (``get_table_ptrs``, the memory report, the kernels that address rows through
+    ``table_ptrs_dev``), but a cache's capacity is fixed at construction, so there
+    is nothing to extend.
+    """
+
+    def __init__(
+        self,
+        shape: Union[List[int], Tuple[int, ...]],
+        dtype: torch.dtype,
+        device: torch.device = None,
+    ):
+        if _shape_to_numel(shape) == 0:
+            raise ValueError("shape must have positive total size")
+        self._shape = tuple(int(d) for d in shape)
+        self._dtype = dtype
+        self._device = device
+        self._tensor = torch.zeros(self._shape, dtype=dtype, device=device)
+
+    def is_device_buffer(self) -> bool:
+        return True
+
+    def tensor(self) -> torch.Tensor:
+        return self._tensor
+
+    def extend(self, shape: Union[List[int], Tuple[int, ...]]) -> None:
+        raise NotImplementedError("a cache's row pool has a fixed capacity")
+
+    def num_bytes(self) -> int:
+        return self._tensor.numel() * self.element_size
+
+    def allocated_bytes(self) -> int:
+        return self.num_bytes()
+
+    @property
+    def shape(self) -> Tuple[int, ...]:
+        return self._shape
+
+
 class HostExtendableBuffer(ExtendableBuffer):
     """Extendable buffer in host memory (UVM). shape is (list or tuple) initial dimensions."""
 

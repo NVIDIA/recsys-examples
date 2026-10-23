@@ -280,8 +280,8 @@ Verbatim-shaped recipe from the reference:
   // apply(): pack void* args, cuLaunchKernel(..., getCurrentCUDAStream().stream())
   ```
 
-For dynamicemb the reference `apply` entry becomes our three entries —
-`dyn_emb_evict_entry_ovf` / `dyn_emb_evict_entry_noovf` (insert_and_evict) and
+For dynamicemb the reference `apply` entry becomes our entries —
+`dyn_emb_evict_entry` (insert_and_evict) and
 `dyn_emb_insert_entry` (plain insert) (§5.2, §11.2); everything else
 (link/cache/launch) follows ext_jit as-is.
 
@@ -303,13 +303,12 @@ For dynamicemb the reference `apply` entry becomes our three entries —
 ## 7. Interactions / invariants preserved
 
 - **Layout unchanged** (word 0 = ts, word 1 = freq) ⇒ dump/load, rehash,
-  gather/scatter/copy, overflow score maintenance, and `incremental_dump` all
+  gather/scatter/copy and `incremental_dump` all
   keep working with no change.
 - **`num_scores == 1` fast path** is byte-identical; single-score strategies use
   the existing AoT extension launch, untouched.
-- **Overflow eviction** stays counter-based (unchanged) — so a `score_function`
-  does **not** affect eviction of keys living in the overflow table (R7). Overflow
-  score words are still maintained for `LruLfu`.
+- The hash table no longer has an overflow buffer (it had no caller), so a
+  `score_function` governs every eviction the table makes.
 - **Existing incremental-dump LruLfu behavior change (from decision Q):** now routes
   through the driver-launched Lex cubin, so its eviction gains the freq→ts
   tiebreak and its insert-and-evict launch path changes. Re-run its 18+7
@@ -434,13 +433,12 @@ struct EvictParams {              // POD; layout is the ABI contract
   int64_t   counter_offset;
   int64_t   bucket_capacity;
   int64_t   num_scores;           // == 2 for LruLfu
-  // (the shipped struct also carries the overflow-tier pointers and the
+  // (the shipped struct also carries the
   //  evicted-key/score/index output arrays; see src/jit/evict_abi.cuh. There is
   //  NO gamma field -- any decay constant is baked into the linked user_score_fn.)
 };
-// Three entry points, all taking EvictParams by value:
-extern "C" __global__ void dyn_emb_evict_entry_ovf(EvictParams p);   // insert_and_evict, overflow
-extern "C" __global__ void dyn_emb_evict_entry_noovf(EvictParams p); // insert_and_evict, no overflow
+// Entry points, all taking EvictParams by value:
+extern "C" __global__ void dyn_emb_evict_entry(EvictParams p);       // insert_and_evict
 extern "C" __global__ void dyn_emb_insert_entry(EvictParams p);      // plain insert (drops evicted keys)
 ```
 
@@ -468,16 +466,16 @@ resolve, no instantiation matrix):
   compiles it with `UserFnComparator` (leaves `user_score_fn` undefined → LTO-IR
   fatbin for nvJitLink). **Same `.cu`, selected by a `-D` macro.**
 
-`cuModuleGetFunction(mod, "dyn_emb_evict_entry_ovf" | "..._noovf" | "dyn_emb_insert_entry")`
+`cuModuleGetFunction(mod, "dyn_emb_evict_entry" | "dyn_emb_insert_entry")`
 — stable names, resolved for both cubins.
 
 ### 11.3 Surgical launch swap, op stays multi-kernel (kills R3)
 
 Keep the existing `table_insert_and_evict` and `table_insert` C++ launchers and
-ALL their orchestration (dispatch, overflow handling, the AoT helper kernels)
+ALL their orchestration (dispatch, the AoT helper kernels)
 **AoT and unchanged**. Only the `num_scores==2` kernel launch is replaced — in
 BOTH launchers — by a `cuLaunchKernel` of the matching cubin entry
-(`dyn_emb_evict_entry_{ovf,noovf}` for insert_and_evict, `dyn_emb_insert_entry`
+(`dyn_emb_evict_entry` for insert_and_evict, `dyn_emb_insert_entry`
 for plain insert). One `if constexpr` at each of the two call sites; the helper
 kernels never move into the cubin (they don't call the comparator).
 
@@ -504,7 +502,7 @@ default `80;90;100`), mirroring ext_jit:
 the `.so`, from the same headers, with a **shared nvcc flag list** (a Python
 constant reused for `.so` and both fatbins). No stale cubin (prebuilt each build);
 flag parity guaranteed. A trivial build-time check loads each fatbin and asserts
-its entry points (`dyn_emb_evict_entry_ovf` / `_noovf` / `dyn_emb_insert_entry`)
+its entry points (`dyn_emb_evict_entry` / `dyn_emb_insert_entry`)
 resolve, so a missing/misnamed entry fails the **build**, not runtime.
 
 ### 11.7 Residual, accepted
