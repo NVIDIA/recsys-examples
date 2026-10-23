@@ -352,9 +352,7 @@ class DefaultKVCacheBackend(KVCacheBackend):
                 layerwise_eventfd_socket=extra.get(
                     "flexkv_layerwise_eventfd_socket", None
                 ),
-                layerwise_counter_id=int(
-                    extra.get("flexkv_layerwise_counter_id", 0)
-                ),
+                layerwise_counter_id=int(extra.get("flexkv_layerwise_counter_id", 0)),
                 layer_granularity=extra.get("flexkv_layer_granularity", -1),
             )
         else:

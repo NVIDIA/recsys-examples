@@ -148,9 +148,7 @@ def build_request(
     )
 
 
-def build_model(
-    cfg: BenchmarkConfig, history_len: int, enable_kvcache: bool = True
-):
+def build_model(cfg: BenchmarkConfig, history_len: int, enable_kvcache: bool = True):
     max_num_history = max(2048, history_len + cfg.append_history_len)
     max_num_candidates = cfg.num_candidates
     max_seqlen = max_num_history * 2 + max_num_candidates
@@ -511,7 +509,7 @@ def run_scenario_gpu_cpu_miss_ssd_hit(
     def _h2disk_sleep(num_blocks: int) -> float:
         # This SSD's H2DISK is about 2 GB/s. A 3 GB/s budget returned while the
         # CPU block was still locked, so the next GET could not evict it.
-        seconds = num_blocks * (1024 * 1024) / (1.5 * 1024 ** 3)
+        seconds = num_blocks * (1024 * 1024) / (1.5 * 1024**3)
         return max(float(ssd_pressure_batch_sleep_s), seconds)
 
     def _drain_offload(tag: str, num_blocks: int) -> None:
@@ -582,9 +580,7 @@ def run_scenario_gpu_cpu_miss_ssd_hit(
         f"pressure_batch_sleep_s={ssd_pressure_batch_sleep_s}",
         flush=True,
     )
-    _pressure_fill(
-        pressure_base_user_id, ssd_pressure_users, "scenario3.pressure_fill"
-    )
+    _pressure_fill(pressure_base_user_id, ssd_pressure_users, "scenario3.pressure_fill")
 
     # The prefix is already on SSD. When one batch fills the whole CPU cache
     # (history 8192, batch 8), this forward's offload cannot allocate staging
@@ -702,7 +698,9 @@ def run_scenario_gpu_cpu_miss_ssd_hit(
     # so those lines land before KVManager shutdown. This is outside the timer.
     settle_s = float(os.environ.get("SSD_LOG_SETTLE_S", "0") or 0)
     if settle_s > 0:
-        print(f"[Scenario3] settle {settle_s:.0f}s for in-flight DISK2H logs", flush=True)
+        print(
+            f"[Scenario3] settle {settle_s:.0f}s for in-flight DISK2H logs", flush=True
+        )
         time.sleep(settle_s)
 
 

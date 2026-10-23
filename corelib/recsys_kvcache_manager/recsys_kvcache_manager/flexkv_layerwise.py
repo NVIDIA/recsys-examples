@@ -25,7 +25,6 @@ from array import array
 from ctypes import CDLL, get_errno
 from typing import List, Optional
 
-
 DEFAULT_LAYERWISE_EVENTFD_SOCKET = "/tmp/flexkv_layerwise_eventfd.sock"
 
 

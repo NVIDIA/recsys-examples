@@ -48,7 +48,7 @@ For SSD-hit, set `ssd_cache_dir` in `[flexkv_ssd.yml](../../../corelib/recsys_kv
 
 ## Benchmark results
 
-Here we present the benchmark results of HSTU inference with FlexKV cache on a single RTX PRO 6000 Blackwell GPU (SSD read bandwith ~7.00 GiB/s).
+Here we present the benchmark results of HSTU inference with FlexKV cache on a single RTX PRO 6000 Blackwell GPU (SSD read bandwidth ~7.00 GiB/s).
 
 HSTU Setup for benchmark:
 

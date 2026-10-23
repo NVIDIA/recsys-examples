@@ -33,18 +33,18 @@ except Exception:
 
     KVResponse = Any  # type: ignore
 
+from .flexkv_layerwise import (
+    FlexKVLayerwiseEventfdSender,
+    LayerwiseCounterPool,
+    create_layerwise_eventfd_socket_path,
+    drain_layer_eventfds,
+)
 from .host_kvstorage_manager import (
     HostKVBackend,
     HostKVStorageBase,
     HostKVTaskHandle,
     HostKVTaskStatus,
     HostKVWaitResult,
-)
-from .flexkv_layerwise import (
-    FlexKVLayerwiseEventfdSender,
-    LayerwiseCounterPool,
-    create_layerwise_eventfd_socket_path,
-    drain_layer_eventfds,
 )
 from .kvcache_metadata import KVCacheMetadata
 from .kvcache_utils import KVIndexMeta, KVLookupResult
@@ -78,7 +78,9 @@ class _FlexKVOnloadHandle:
     _flexkv_wait_result: Optional[Dict[int, Any]] = None
 
     def ids_for_flexkv(self) -> List[int]:
-        raw = self.flexkv_wait_ids if self.flexkv_wait_ids is not None else self.task_ids
+        raw = (
+            self.flexkv_wait_ids if self.flexkv_wait_ids is not None else self.task_ids
+        )
         if isinstance(raw, torch.Tensor):
             return [int(x) for x in raw.detach().cpu().tolist()]
         return [int(x) for x in raw]
@@ -274,7 +276,11 @@ class FlexKVStorage(HostKVStorageBase):
         if self._client is not None:
             return
         try:
-            from flexkv.common.config import CacheConfig, GLOBAL_CONFIG_FROM_ENV, ModelConfig
+            from flexkv.common.config import (
+                GLOBAL_CONFIG_FROM_ENV,
+                CacheConfig,
+                ModelConfig,
+            )
             from flexkv.kvmanager import KVManager
         except Exception as e:
             raise RuntimeError(f"FlexKV SDK import failed: {e}") from e
@@ -334,7 +340,9 @@ class FlexKVStorage(HostKVStorageBase):
         GLOBAL_CONFIG_FROM_ENV.layer_granularity = gran
         os.environ["FLEXKV_LAYER_GRANULARITY"] = str(gran)
         if self.enable_layerwise:
-            os.environ["FLEXKV_LAYERWISE_EVENTFD_SOCKET"] = self.layerwise_eventfd_socket
+            os.environ[
+                "FLEXKV_LAYERWISE_EVENTFD_SOCKET"
+            ] = self.layerwise_eventfd_socket
             if self._layerwise_eventfd_sender is None:
                 self._layerwise_eventfd_sender = FlexKVLayerwiseEventfdSender(
                     num_layers=self.num_layers,
@@ -587,7 +595,9 @@ class FlexKVStorage(HostKVStorageBase):
             )
             # Save parent wait ids.
             if launched_ids:
-                onload_handle.flexkv_wait_ids = [int(task_id) for task_id in launched_ids]
+                onload_handle.flexkv_wait_ids = [
+                    int(task_id) for task_id in launched_ids
+                ]
             return onload_task_handle
         except Exception:
             # Release the counter if launch fails.
@@ -617,9 +627,7 @@ class FlexKVStorage(HostKVStorageBase):
             if len(wait_ids) == 1 and int(uids.numel()) != 1:
                 res = onboard_results[wait_ids[0]]
                 if res.status == KVResponseStatus.SUCCESS:
-                    return HostKVWaitResult(
-                        status=HostKVTaskStatus.READY, ready=True
-                    )
+                    return HostKVWaitResult(status=HostKVTaskStatus.READY, ready=True)
                 if res.status == KVResponseStatus.UNREADY:
                     return HostKVWaitResult(
                         status=HostKVTaskStatus.LAUNCHED, ready=False
@@ -644,7 +652,9 @@ class FlexKVStorage(HostKVStorageBase):
 
             if len(failed_user_ids) == 0:
                 return HostKVWaitResult(
-                    status=HostKVTaskStatus.READY if ready else HostKVTaskStatus.LAUNCHED,
+                    status=HostKVTaskStatus.READY
+                    if ready
+                    else HostKVTaskStatus.LAUNCHED,
                     ready=ready,
                 )
             return HostKVWaitResult(
