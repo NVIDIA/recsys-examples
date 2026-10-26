@@ -20,6 +20,7 @@ from dynamicemb.batched_dynamicemb_tables import (
     encode_checkpoint_file_path,
     find_files,
     get_loading_files,
+    list_checkpoint_files,
 )
 
 WORLD_SIZE = 2
@@ -44,7 +45,7 @@ def _write_table(
 def test_find_files_finds_every_shard_of_a_table(tmp_path, table_name):
     root_path = str(tmp_path)
     _write_table(root_path, table_name)
-    listing = sorted(os.listdir(root_path))
+    listing = list_checkpoint_files(root_path, [table_name])
 
     files, num_files = find_files(root_path, table_name, "emb_keys", listing)
 
@@ -60,7 +61,7 @@ def test_find_files_keeps_scoped_and_flat_tables_apart(tmp_path):
     root_path = str(tmp_path)
     _write_table(root_path, "table")
     _write_table(root_path, "scope/table")
-    listing = sorted(os.listdir(root_path))
+    listing = list_checkpoint_files(root_path, ["table", "scope/table"])
 
     flat, _ = find_files(root_path, "table", "emb_keys", listing)
     scoped, _ = find_files(root_path, "scope/table", "emb_keys", listing)
@@ -74,13 +75,16 @@ def test_find_files_returns_nothing_for_a_missing_scoped_table(tmp_path):
     _write_table(root_path, "table")
 
     files, num_files = find_files(
-        root_path, "missing_scope/table", "emb_keys", sorted(os.listdir(root_path))
+        root_path,
+        "missing_scope/table",
+        "emb_keys",
+        list_checkpoint_files(root_path, ["missing_scope/table"]),
     )
 
     assert files == [] and num_files == 0
 
 
-def test_get_loading_files_resolves_a_scoped_table_from_the_root_listing(tmp_path):
+def test_get_loading_files_resolves_a_scoped_table(tmp_path):
     root_path = str(tmp_path)
     _write_table(root_path, "scope/table")
 
@@ -96,7 +100,7 @@ def test_get_loading_files_resolves_a_scoped_table_from_the_root_listing(tmp_pat
         "scope/table",
         rank=1,
         world_size=WORLD_SIZE,
-        sorted_file_names=sorted(os.listdir(root_path)),
+        sorted_file_names=list_checkpoint_files(root_path, ["scope/table"]),
     )
 
     assert key_files == [
@@ -110,3 +114,49 @@ def test_get_loading_files_resolves_a_scoped_table_from_the_root_listing(tmp_pat
     ]
     assert opt_files == [] and counter_keys == [] and counter_freqs == []
     assert all(os.path.exists(path) for path in key_files + value_files + score_files)
+
+
+def test_list_checkpoint_files_lists_each_directory_once(tmp_path, monkeypatch):
+    root_path = str(tmp_path)
+    table_names = ["flat"] + [f"scope/table_{i}" for i in range(8)]
+    for table_name in table_names:
+        _write_table(root_path, table_name)
+
+    listed = []
+    listdir = os.listdir
+
+    def counting_listdir(path):
+        listed.append(path)
+        return listdir(path)
+
+    monkeypatch.setattr(os, "listdir", counting_listdir)
+    listing = list_checkpoint_files(root_path, table_names)
+
+    assert sorted(listed) == sorted([root_path, os.path.join(root_path, "scope")])
+    assert listing == sorted(listing)
+
+
+def test_lookups_do_not_list_the_checkpoint_directory(tmp_path, monkeypatch):
+    root_path = str(tmp_path)
+    table_names = ["flat", "scope/table", "a/b/deep_table"]
+    for table_name in table_names:
+        _write_table(root_path, table_name)
+    listing = list_checkpoint_files(root_path, table_names)
+
+    def no_listdir(path):
+        raise AssertionError(f"listed {path} during a lookup")
+
+    monkeypatch.setattr(os, "listdir", no_listdir)
+    for table_name in table_names:
+        files, num_files = find_files(root_path, table_name, "emb_keys", listing)
+        assert num_files == WORLD_SIZE
+        key_files, *_ = get_loading_files(
+            root_path,
+            table_name,
+            rank=0,
+            world_size=WORLD_SIZE,
+            sorted_file_names=listing,
+        )
+        assert key_files == [
+            encode_checkpoint_file_path(root_path, table_name, 0, WORLD_SIZE, "keys")
+        ]

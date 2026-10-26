@@ -65,11 +65,16 @@ TABLE_INITIALIZER_VALUE = 1e-1
 # erased on admission, so this only has to hold the ones still waiting.
 ADMISSION_COUNTER_CAPACITY = 1024 * 1024
 
+# Prefix "<scope>/" of every table name when set, as TorchRec names the tables
+# of fused feature groups; such a table dumps into a subdirectory.
+TABLE_SCOPE = ""
+
 
 def idx_to_name(embedding_collection_idx: int, embedding_idx: int) -> Tuple[str, str]:
+    table_name = f"embedding_collection_{embedding_collection_idx}_{embedding_idx}"
     return (
         f"feature_{embedding_collection_idx}_{embedding_idx}",
-        f"embedding_collection_{embedding_collection_idx}_{embedding_idx}",
+        f"{TABLE_SCOPE}/{table_name}" if TABLE_SCOPE else table_name,
     )
 
 
@@ -525,6 +530,7 @@ def assert_dist_type_path(model: nn.Module, expected_dist_type: str) -> None:
 )
 @click.option("--optim", type=bool, required=True)
 @click.option("--counter", type=bool, required=True)
+@click.option("--table-scope", type=str, default="", show_default=True)
 def test_model_load_dump(
     num_embedding_collections: int,
     num_embeddings: str,
@@ -537,9 +543,12 @@ def test_model_load_dump(
     save_path: str,
     optim: bool,
     counter: bool,
+    table_scope: str,
     batch_size: int = 128,
     num_iterations: int = 10,
 ):
+    global TABLE_SCOPE
+    TABLE_SCOPE = table_scope
     rank = int(os.environ["LOCAL_RANK"])
     world_size = int(os.environ["WORLD_SIZE"])
 

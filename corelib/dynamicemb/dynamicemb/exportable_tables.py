@@ -23,6 +23,7 @@ from dynamicemb import (
 from dynamicemb.batched_dynamicemb_tables import (
     encode_meta_json_file_path,
     get_loading_files,
+    list_checkpoint_files,
 )
 from dynamicemb.key_value_table import (
     _iter_batches_from_files,
@@ -459,7 +460,7 @@ class InferenceEmbeddingCollection(torch.nn.Module):
         self.hash_table._ref_counter.zero_()
         weight.zero_()
 
-        sorted_file_names = sorted(os.listdir(save_dir))
+        sorted_file_names = list_checkpoint_files(save_dir, requested_table_names)
         for table_id, table_name in enumerate(self.table_names_):
             if table_name not in requested_table_names:
                 continue

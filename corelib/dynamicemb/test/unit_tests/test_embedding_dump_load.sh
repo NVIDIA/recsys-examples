@@ -64,6 +64,27 @@ for num_gpus in ${HASH_RR_NUM_GPUS[@]}; do
   done
 done
 
+# Tables named "<scope>/<name>" dump into, and load from, a subdirectory of
+# the collection directory that nothing creates in advance.
+for mode in "dump" "load"; do
+  echo "table scope: mode: $mode"
+  torchrun \
+    --nnodes 1 \
+    --nproc_per_node 1 \
+    ./test/unit_tests/test_embedding_dump_load.py \
+    --optimizer-type adam \
+    --score-strategy timestamp \
+    --mode "${mode}" \
+    --optim True \
+    --counter False \
+    --table-scope scope \
+    --save-path "debug_weight_table_scope" \
+    --num-embedding-collections 2 \
+    --num-embeddings 1000000,1000000 \
+    --multi-hot-sizes 10,10 \
+    --embedding-dim 16 || exit 1
+done
+
 for num_load_gpus in ${NUM_GPUS[@]}; do
   for num_dump_gpus in ${NUM_GPUS[@]}; do
     for optimizer_type in ${OPTIMIZER_TYPE[@]}; do  
