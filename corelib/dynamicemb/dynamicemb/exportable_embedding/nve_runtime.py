@@ -30,12 +30,8 @@ def register_nve_export_compat() -> None:
 
     import pynve.torch  # noqa: F401
 
-    @torch.library.register_fake(
-        "nve_ops::embedding_lookup", allow_override=True
-    )
-    def _embedding_lookup_fake(
-        keys: torch.Tensor, layer_id: int
-    ) -> torch.Tensor:
+    @torch.library.register_fake("nve_ops::embedding_lookup", allow_override=True)
+    def _embedding_lookup_fake(keys: torch.Tensor, layer_id: int) -> torch.Tensor:
         del layer_id
         context = torch.library.get_ctx()
         return keys.new_empty(
@@ -48,6 +44,8 @@ def _nve_layer_constructor_kwargs(
 ) -> dict[str, object]:
     import pynve.torch.nve_layers as nve_layers
 
+    if nve_layer_type == "host" and imported_nve_generation() < (26, 10):
+        raise ValueError("HostLayer requires NVE 26.10 or later")
     if imported_nve_generation() == (26, 5):
         layer_type = {
             "gpu": nve_layers.CacheType.NoCache,
@@ -59,11 +57,15 @@ def _nve_layer_constructor_kwargs(
             result["remote_interface"] = storage
         return result
 
-    layer_type = {
-        "gpu": nve_layers.LayerType.GPULayer,
-        "linear_uvm": nve_layers.LayerType.LinearUVM,
-        "hierarchical": nve_layers.LayerType.Hierarchical,
-    }[nve_layer_type]
+    layer_type = getattr(
+        nve_layers.LayerType,
+        {
+            "gpu": "GPULayer",
+            "host": "HostLayer",
+            "linear_uvm": "LinearUVM",
+            "hierarchical": "Hierarchical",
+        }[nve_layer_type],
+    )
     result = {"layer_type": layer_type}
     if nve_layer_type == "hierarchical":
         result["storage"] = storage
@@ -99,7 +101,7 @@ def create_nve_layer(
             config.nve_layer_type, storage=config.parameter_server
         ),
     }
-    if config.nve_layer_type != "gpu":
+    if config.nve_layer_type in {"linear_uvm", "hierarchical"}:
         kwargs["gpu_cache_size"] = config.gpu_cache_size
     if config.nve_layer_type == "hierarchical":
         kwargs["host_cache_size"] = config.host_cache_size

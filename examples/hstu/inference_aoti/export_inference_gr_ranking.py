@@ -114,6 +114,7 @@ def debug_print_flattened_export_args(batch, embeddings=None) -> None:
 
 def get_inference_dataset_and_embedding_configs(
     disable_contextual_features: bool = False,
+    host_embeddings: bool = False,
 ):
     sys.path.append("./training/")
     from trainer.utils import create_embedding_configs, get_dataset_and_embedding_args
@@ -145,7 +146,8 @@ def get_inference_dataset_and_embedding_configs(
             config.vocab_size = trained_emb_table_sizes[config.table_name]
         embedding_collection_configs = (
             create_kuairand_embedding_collection_configs(
-                dynamic_gpu_cache_size=DYNAMIC_EMBEDDING_GPU_CACHE_SIZE
+                dynamic_gpu_cache_size=DYNAMIC_EMBEDDING_GPU_CACHE_SIZE,
+                use_host=host_embeddings,
             )
         )
         return (
@@ -194,6 +196,7 @@ def export_inference_gr_ranking(
     debug_flattened_inputs: bool = False,
     export_dir_: str | os.PathLike[str] = DEFAULT_EXPORT_DIR,
     dump_dir_: str | os.PathLike[str] = DEFAULT_DUMP_DIR,
+    host_embeddings: bool = False,
 ):
     export_dir, dump_dir = prepare_output_directories(export_dir_, dump_dir_)
     generation = imported_nve_generation()
@@ -222,7 +225,7 @@ def export_inference_gr_ranking(
         _,
         embedding_collection_configs,
         trained_emb_table_sizes,
-    ) = get_inference_dataset_and_embedding_configs()
+    ) = get_inference_dataset_and_embedding_configs(host_embeddings=host_embeddings)
 
     dataproc = get_common_preprocessors("")[dataset_args.dataset_name]
     num_contextual_features = len(dataproc._contextual_feature_names)
@@ -549,6 +552,8 @@ if __name__ == "__main__":
     parser.add_argument("--gin_config_file", type=str, required=True)
     parser.add_argument("--checkpoint_dir", type=str, required=True)
     parser.add_argument("--disable_auc", action="store_true")
+    parser.add_argument("--host_embeddings", action="store_true",
+                        help="Store and look up embeddings on the host; keep HSTU on CUDA.")
     parser.add_argument("--max_bs", type=int, default=2)
     parser.add_argument("--debug_flattened_inputs", action="store_true")
     parser.add_argument(
@@ -576,6 +581,7 @@ if __name__ == "__main__":
 
     export_inference_gr_ranking(
         checkpoint_dir=args.checkpoint_dir,
+        host_embeddings=args.host_embeddings,
         export_dir_=args.export_dir,
         dump_dir_=args.dump_dir,
         max_bs=args.max_bs,

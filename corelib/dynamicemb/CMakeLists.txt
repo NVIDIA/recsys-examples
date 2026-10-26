@@ -47,6 +47,7 @@ set(INFERENCE_EMB_SOURCES
     src/exportable_embedding/indexer_directory.cpp
     src/exportable_embedding/indexer_snapshot.cpp
     src/exportable_embedding/indexer_ops.cu
+    src/exportable_embedding/indexer_cpu.cpp
     src/table_operation/lookup_torch_binding.cu
     src/table_operation/get_table_range_torch_binding.cu
     src/table_operation/expand_table_ids_torch_binding.cu
@@ -115,12 +116,14 @@ install(TARGETS inference_emb_ops
     RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
 )
 
+option(DYNAMICEMB_ENABLE_NVE_UPDATE "Build the NVE incremental update subscriber" ON)
+
 # Unset selects the repository NVE (26.07 or later); set 26.05 explicitly for compatibility.
-if(
+if(DYNAMICEMB_ENABLE_NVE_UPDATE AND (
     NOT DEFINED NVE_VERSION
     OR NVE_VERSION STREQUAL ""
     OR NVE_VERSION VERSION_GREATER_EQUAL "26.06"
-)
+))
     set(DYNAMICEMB_HAS_NVE_UPDATE ON)
     include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/NVETarget.cmake)
     set(NVE_LIB_DIR "/opt/nve/default/python/pynve" CACHE PATH "NVE library directory")
@@ -153,7 +156,6 @@ if(
         inference_emb_ops
         ${TORCH_LIBRARIES}
         CUDA::cudart
-        CUDA::cuda_driver
         "${NVE_TORCH_OPS_LIB}"
         "${NVE_COMMON_LIB}"
     )

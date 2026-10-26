@@ -3,16 +3,21 @@
 
 """Exportable inference embedding-collection conversion and population."""
 
+from __future__ import annotations
+
 import itertools
 import os
 from collections.abc import Mapping, Sequence
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 import torch
-from dynamicemb.batched_dynamicemb_tables import (
+from dynamicemb.checkpoint_io import (
+    _iter_batches_from_files,
     encode_meta_json_file_path,
     get_loading_files,
     list_checkpoint_files,
+    load_from_json,
+    resolve_checkpoint_value_layout,
 )
 from dynamicemb.exportable_embedding.config import (
     BitConcatConfig,
@@ -29,15 +34,12 @@ from dynamicemb.exportable_embedding.indexer import (
     create_embedding_collection_indexer,
 )
 from dynamicemb.exportable_embedding.nve_runtime import create_nve_layer
-from dynamicemb.key_value_table import (
-    _iter_batches_from_files,
-    load_from_json,
-    resolve_checkpoint_value_layout,
-)
 from dynamicemb.types import KEY_TYPE
 from torch.nn import ModuleDict
 from torch.nn.modules.sparse import Embedding
-from torchrec.modules.embedding_configs import EmbeddingConfig
+
+if TYPE_CHECKING:
+    from torchrec.modules.embedding_configs import EmbeddingConfig
 
 
 def _derive_grouped_offsets(feature_table_map: Sequence[int]) -> list[int]:
@@ -85,6 +87,8 @@ class InferenceEmbeddingCollection(torch.nn.Module):
         self.output_dtype_ = output_dtype
         self.device = device
         self.collection_id_: Optional[str] = None
+        self._source_started = False
+        self._source_loaded = False
         self.register_buffer(
             "feature_offsets_",
             torch.tensor(
@@ -110,12 +114,14 @@ class InferenceEmbeddingCollection(torch.nn.Module):
         if storage_keys.numel() == 0:
             return
         if self.config_.nve_layer_type == "hierarchical":
-            keys_cpu = storage_keys.detach().to(
-                device="cpu", dtype=torch.int64
-            ).contiguous()
-            values_cpu = embeddings.detach().to(
-                device="cpu", dtype=self.output_dtype_
-            ).contiguous()
+            keys_cpu = (
+                storage_keys.detach().to(device="cpu", dtype=torch.int64).contiguous()
+            )
+            values_cpu = (
+                embeddings.detach()
+                .to(device="cpu", dtype=self.output_dtype_)
+                .contiguous()
+            )
             self.parameter_server_.insert(keys_cpu, values_cpu)
             return
 
@@ -133,7 +139,29 @@ class InferenceEmbeddingCollection(torch.nn.Module):
         table_ids: torch.Tensor,
         embeddings: torch.Tensor,
     ) -> None:
+        if self.config_.nve_layer_type == "host":
+            if feature_ids.device.type != "cpu" or table_ids.device.type != "cpu":
+                raise ValueError("HostLayer source IDs must be loaded on CPU")
+            if isinstance(self.indexer_, (FusedIdentityIndexer, IdentityIndexer)):
+                capacities = torch.tensor(
+                    self.table_capacities_, dtype=torch.int64, device="cpu"
+                )
+                if ((feature_ids < 0) | (feature_ids >= capacities[table_ids])).any():
+                    raise ValueError("Source key exceeds the table-local ID range")
         storage_keys = self.indexer_.build_index(feature_ids, table_ids)
+        if self.config_.nve_layer_type == "host":
+            # CPU index_copy with repeated destinations need not pick the last row.
+            # Resolve duplicates explicitly: the last checkpoint row wins.
+            unique_rows, inverse = torch.unique(storage_keys, return_inverse=True)
+            last = torch.zeros_like(unique_rows)
+            last.scatter_reduce_(
+                0,
+                inverse,
+                torch.arange(storage_keys.numel(), device="cpu"),
+                reduce="amax",
+            )
+            self._write_storage_rows(unique_rows, embeddings[last])
+            return
         retained = storage_keys >= 0
         self._write_storage_rows(
             storage_keys[retained],
@@ -142,26 +170,33 @@ class InferenceEmbeddingCollection(torch.nn.Module):
 
     @torch.no_grad()
     def _begin_source_load(self) -> None:
+        if self.config_.nve_layer_type == "host":
+            if self._source_started:
+                raise RuntimeError(
+                    "HostLayer loads once; construct a new collection for replacement"
+                )
+            self._source_started = True
         if isinstance(self.indexer_, LinearHashMapIndexer):
             self.indexer_.reset_for_build()
         if self.config_.nve_layer_type != "hierarchical":
             self._nve_embedding().weight.data.zero_()
 
-        if isinstance(
-            self.indexer_, (LinearHashMapIndexer, FusedIdentityIndexer)
-        ):
+        if isinstance(self.indexer_, (LinearHashMapIndexer, FusedIdentityIndexer)):
             self._write_storage_rows(
                 self.indexer_.miss_storage_indices,
                 torch.zeros(
                     (self.num_tables_, self.emb_dim_),
                     dtype=self.output_dtype_,
-                    device=self.device,
+                    device=(
+                        "cpu" if self.config_.nve_layer_type == "host" else self.device
+                    ),
                 ),
             )
 
     @torch.no_grad()
     def _finish_source_load(self) -> None:
         self.indexer_.finish_build()
+        self._source_loaded = True
         if self.config_.nve_layer_type == "hierarchical":
             self.nve_embedding_ = create_nve_layer(
                 num_embeddings=self.indexer_.nve_num_embeddings,
@@ -175,12 +210,32 @@ class InferenceEmbeddingCollection(torch.nn.Module):
     @torch.no_grad()
     def load_from_embedding_table(self, table_weights: torch.Tensor) -> None:
         """Populate from table-concatenated TorchRec checkpoint weights."""
+        if tuple(table_weights.shape) != (sum(self.table_capacities_), self.emb_dim_):
+            raise ValueError(
+                "Source weights must contain all configured rows and columns"
+            )
         self._begin_source_load()
+        if self.config_.nve_layer_type == "host":
+            source_offset = 0
+            for table_id, capacity in enumerate(self.table_capacities_):
+                for start in range(0, capacity, 65536):
+                    end = min(start + 65536, capacity)
+                    feature_ids = torch.arange(
+                        start, end, dtype=torch.int64, device="cpu"
+                    )
+                    self._build_and_write_rows(
+                        feature_ids,
+                        torch.full_like(feature_ids, table_id),
+                        table_weights[
+                            source_offset + start : source_offset + end
+                        ].cpu(),
+                    )
+                source_offset += capacity
+            self._finish_source_load()
+            return
         source_offset = 0
         for table_id, capacity in enumerate(self.table_capacities_):
-            feature_ids = torch.arange(
-                capacity, dtype=torch.int64, device=self.device
-            )
+            feature_ids = torch.arange(capacity, dtype=torch.int64, device=self.device)
             table_ids = torch.full_like(feature_ids, table_id)
             self._build_and_write_rows(
                 feature_ids,
@@ -200,9 +255,7 @@ class InferenceEmbeddingCollection(torch.nn.Module):
         if not os.path.exists(save_dir):
             raise RuntimeError(f"Save directory does not exist: {save_dir}")
 
-        selected_names = set(
-            self.table_names_ if table_names is None else table_names
-        )
+        selected_names = set(self.table_names_ if table_names is None else table_names)
         self._begin_source_load()
         sorted_file_names = list_checkpoint_files(save_dir, selected_names)
         missing_table_names = []
@@ -224,7 +277,10 @@ class InferenceEmbeddingCollection(torch.nn.Module):
                 _counter_key_files,
                 _counter_frequency_files,
             ) = get_loading_files(
-                save_dir, table_name, rank=0, world_size=1,
+                save_dir,
+                table_name,
+                rank=0,
+                world_size=1,
                 sorted_file_names=sorted_file_names,
             )
             if not key_files:
@@ -234,9 +290,7 @@ class InferenceEmbeddingCollection(torch.nn.Module):
                 zip(key_files, value_files)
             ):
                 score_file = (
-                    score_files[file_index]
-                    if file_index < len(score_files)
-                    else None
+                    score_files[file_index] if file_index < len(score_files) else None
                 )
                 num_keys = os.path.getsize(key_file) // KEY_TYPE.itemsize
                 emb_dtype, opt_state_dtype, ckpt_dim = resolve_checkpoint_value_layout(
@@ -247,29 +301,41 @@ class InferenceEmbeddingCollection(torch.nn.Module):
                         f"Embedding dim mismatch: {value_file} holds rows of {ckpt_dim} "
                         f"but this collection is configured with dim {self.emb_dim_}."
                     )
-                for feature_ids, embeddings, _scores, _optimizer_states in (
-                    _iter_batches_from_files(
-                        key_file,
-                        value_file,
-                        score_file,
-                        None,
-                        self.emb_dim_,
-                        0,
-                        self.device,
-                        dist_type=meta_data.get("dist_type", "roundrobin"),
-                        emb_dtype=emb_dtype,
-                        opt_state_dtype=opt_state_dtype,
-                    )
+                for (
+                    feature_ids,
+                    embeddings,
+                    _scores,
+                    _optimizer_states,
+                ) in _iter_batches_from_files(
+                    key_file,
+                    value_file,
+                    None if self.config_.nve_layer_type == "host" else score_file,
+                    None,
+                    self.emb_dim_,
+                    0,
+                    (
+                        torch.device("cpu")
+                        if self.config_.nve_layer_type == "host"
+                        else self.device
+                    ),
+                    dist_type=meta_data.get("dist_type", "roundrobin"),
+                    emb_dtype=emb_dtype,
+                    opt_state_dtype=opt_state_dtype,
+                    # A collection contains every checkpoint shard, including in
+                    # an initialized distributed process. Host loading is unsharded.
+                    **(
+                        {"shard_index": 0, "num_shards": 1}
+                        if self.config_.nve_layer_type == "host"
+                        else {}
+                    ),
                 ):
                     table_ids = torch.full(
                         (feature_ids.numel(),),
                         table_id,
                         dtype=torch.int64,
-                        device=self.device,
+                        device=feature_ids.device,
                     )
-                    self._build_and_write_rows(
-                        feature_ids, table_ids, embeddings
-                    )
+                    self._build_and_write_rows(feature_ids, table_ids, embeddings)
         self._finish_source_load()
         if missing_table_names:
             print(
@@ -285,6 +351,8 @@ class InferenceEmbeddingCollection(torch.nn.Module):
         pooling_offsets: Optional[torch.Tensor] = None,
         per_sample_weights: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        if self.config_.nve_layer_type == "host" and not self._source_loaded:
+            raise RuntimeError("Load the HostLayer collection before lookup")
         table_ids = torch.ops.INFERENCE_EMB.expand_table_ids(
             offsets,
             keys,
@@ -296,9 +364,7 @@ class InferenceEmbeddingCollection(torch.nn.Module):
         nve_embedding = self._nve_embedding()
         if self.pooling_mode_ < 0:
             return nve_embedding(storage_keys)
-        return nve_embedding(
-            storage_keys, pooling_offsets, per_sample_weights
-        )
+        return nve_embedding(storage_keys, pooling_offsets, per_sample_weights)
 
 
 def create_inference_embedding_collection(
@@ -317,7 +383,21 @@ def create_inference_embedding_collection(
         raise ValueError("pooling_mode must be -1, 1, or 2")
     if device is None:
         device = torch.device("cuda", torch.cuda.current_device())
+    device = torch.device(device)
     validate_collection_config(config)
+    if device.type not in {"cpu", "cuda"}:
+        raise ValueError("Collection device must be CPU or CUDA")
+    if device.type == "cpu" and config.nve_layer_type != "host":
+        raise ValueError("CPU execution requires nve_layer_type='host'")
+    if key_type != torch.int64:
+        raise ValueError("Collection indexers require int64 keys")
+    if config.nve_layer_type == "host" and output_dtype not in {
+        torch.float32,
+        torch.float16,
+    }:
+        raise ValueError("HostLayer supports float32 and float16 outputs")
+    if any(int(table.num_embeddings) < 0 for table in configs):
+        raise ValueError("Table capacities must be nonnegative")
 
     embedding_dims = {int(table.embedding_dim) for table in configs}
     if len(embedding_dims) != 1:
@@ -368,9 +448,7 @@ def create_inference_embedding_collection(
 
 def _resolve_collection_config(
     embedding_configs: Sequence[EmbeddingConfig],
-    embedding_collection_configs: Mapping[
-        str, InferenceEmbeddingCollectionConfig
-    ],
+    embedding_collection_configs: Mapping[str, InferenceEmbeddingCollectionConfig],
 ) -> InferenceEmbeddingCollectionConfig:
     configs = [embedding_collection_configs[table.name] for table in embedding_configs]
     if any(config != configs[0] for config in configs[1:]):
@@ -402,9 +480,7 @@ def _replace_submodule(
 
 def apply_inference_embedding_collection(
     model: torch.nn.Module,
-    embedding_collection_configs: Mapping[
-        str, InferenceEmbeddingCollectionConfig
-    ],
+    embedding_collection_configs: Mapping[str, InferenceEmbeddingCollectionConfig],
     trained_emb_table_sizes: Mapping[str, int],
 ) -> torch.nn.Module:
     """Replace TorchRec embedding collections with configured NVE collections."""
@@ -415,9 +491,7 @@ def apply_inference_embedding_collection(
             if not isinstance(module, ModuleDict) or name in checked_modules:
                 continue
             children = [
-                child
-                for child_name, child in module.named_modules()
-                if child_name
+                child for child_name, child in module.named_modules() if child_name
             ]
             if (
                 children

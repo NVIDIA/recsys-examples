@@ -22,6 +22,7 @@ namespace dynamicemb::exportable_embedding {
 
 struct EmbeddingCollectionBinding {
   std::vector<std::string> table_names;
+  std::vector<int64_t> table_capacities;
   std::string indexer_type;
   std::string indexer_module_path;
   std::string nve_layer_module_path;

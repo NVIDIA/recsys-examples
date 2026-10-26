@@ -406,18 +406,18 @@ def apply_inference_sparse(
 
 
 def create_kuairand_embedding_collection_configs(
-    *, dynamic_gpu_cache_size: int
+    *, dynamic_gpu_cache_size: int, use_host: bool = False
 ) -> Dict[str, InferenceEmbeddingCollectionConfig]:
     static_config = InferenceEmbeddingCollectionConfig(
         indexer_type=EmbeddingCollectionIndexerType.FUSED_IDENTITY,
-        nve_layer_type="gpu",
+        nve_layer_type="host" if use_host else "gpu",
         indexer_state_sidecar=False,
     )
     dynamic_config = InferenceEmbeddingCollectionConfig(
         indexer_type=EmbeddingCollectionIndexerType.LINEAR_HASH_MAP,
-        nve_layer_type="linear_uvm",
+        nve_layer_type="host" if use_host else "linear_uvm",
         indexer_state_sidecar=False,
-        gpu_cache_size=dynamic_gpu_cache_size,
+        gpu_cache_size=None if use_host else dynamic_gpu_cache_size,
     )
     return {
         "user_id": dynamic_config,

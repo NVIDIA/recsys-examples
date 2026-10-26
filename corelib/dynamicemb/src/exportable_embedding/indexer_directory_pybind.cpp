@@ -19,6 +19,7 @@ void bind_indexer_directory(py::module_& module) {
                                          "EmbeddingCollectionBinding")
       .def(py::init<>())
       .def_readwrite("table_names", &EmbeddingCollectionBinding::table_names)
+      .def_readwrite("table_capacities", &EmbeddingCollectionBinding::table_capacities)
       .def_readwrite("indexer_type", &EmbeddingCollectionBinding::indexer_type)
       .def_readwrite("indexer_module_path",
                      &EmbeddingCollectionBinding::indexer_module_path)

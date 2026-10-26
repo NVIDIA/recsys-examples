@@ -161,6 +161,7 @@ def get_extensions():
             "indexer_directory.cpp",
             "indexer_snapshot.cpp",
             "indexer_ops.cu",
+            "indexer_cpu.cpp",
             "incremental_update.cpp",
             "exportable_embedding_pybind.cpp",
             "indexer_directory_pybind.cpp",

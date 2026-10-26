@@ -40,12 +40,14 @@ void bind_update_subscriber(py::module_& module) {
       .def(
           "apply_incremental_load",
           [](EmbeddingCollectionUpdateSubscriber& subscriber,
-             const std::string& update_json, uint64_t inference_stream) {
+             const std::string& update_json, uint64_t inference_stream,
+             bool inference_paused) {
             subscriber.apply_incremental_load(
                 EmbeddingCollectionUpdate::from_json(update_json),
-                reinterpret_cast<cudaStream_t>(inference_stream));
+                reinterpret_cast<cudaStream_t>(inference_stream), inference_paused);
           },
-          py::arg("update_json"), py::arg("inference_stream"),
+          py::arg("update_json"), py::arg("inference_stream") = 0,
+          py::arg("inference_paused") = false,
           py::call_guard<py::gil_scoped_release>())
       .def(
           "wait_for_retirement",

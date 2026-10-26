@@ -53,8 +53,12 @@ class DYNAMICEMB_EXPORT EmbeddingCollectionUpdateSubscriber {
       int device_index);
   ~EmbeddingCollectionUpdateSubscriber();
 
+  // CPU Host Identity/FusedIdentity permit stale/mixed concurrent lookups.
+  // For Host LinearHashMap, the caller must pause/drain readers and pass true.
+  // One update writer per subscriber; apply messages once in snapshot order.
   void apply_incremental_load(const EmbeddingCollectionUpdate& update,
-                              cudaStream_t inference_stream);
+                              cudaStream_t inference_stream,
+                              bool inference_paused = false);
   EmbeddingCollectionUpdateAck wait_for_retirement(
       const std::string& collection_id, int64_t snapshot_id);
 

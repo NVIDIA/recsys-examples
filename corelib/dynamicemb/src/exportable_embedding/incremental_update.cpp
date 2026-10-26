@@ -8,6 +8,7 @@
 
 #include <fstream>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 
 #include "python/pynve/torch_bindings/nve_loader.hpp"
@@ -57,6 +58,8 @@ struct EmbeddingCollectionUpdateSubscriber::Impl {
                      std::shared_ptr<nve::NVEmbedBinding<int64_t>>>
       nve_layers;
   std::unordered_map<std::string, bool> has_host_cache;
+  std::unordered_map<std::string, int64_t> host_rows;
+  std::unordered_map<std::string, int64_t> host_update_ids;
 
   void load_metadata(const std::string& package_dir,
                      nve::LayerDirectory* layer_directory) {
@@ -66,6 +69,9 @@ struct EmbeddingCollectionUpdateSubscriber::Impl {
     for (const auto& layer : layers) {
       const std::string path = layer.at("module_path").get<std::string>();
       has_host_cache[path] = layer.value("host_cache_size", uint64_t{0}) > 0;
+      if (layer.value("layer_type", std::string{}) == "HostLayer") {
+        host_rows[path] = layer.at("num_embeddings").get<int64_t>();
+      }
       if (layer_directory != nullptr) {
         nve_layers[path] =
             layer_directory->get_layer(layer.at("id").get<int64_t>()).binding;
@@ -114,8 +120,60 @@ EmbeddingCollectionUpdateSubscriber::~EmbeddingCollectionUpdateSubscriber() =
     default;
 
 void EmbeddingCollectionUpdateSubscriber::apply_incremental_load(
-    const EmbeddingCollectionUpdate& update, cudaStream_t inference_stream) {
+    const EmbeddingCollectionUpdate& update, cudaStream_t inference_stream,
+    bool inference_paused) {
   const auto& binding = impl_->indexers.binding(update.collection_id);
+  const auto host = impl_->host_rows.find(binding.nve_layer_module_path);
+  if (host != impl_->host_rows.end()) {
+    TORCH_CHECK(impl_->device_index < 0 && inference_stream == nullptr,
+                "HostLayer incremental updates require CPU execution and no CUDA stream");
+    const bool linear = binding.indexer_type == "linear_hash_map";
+    TORCH_CHECK(linear || binding.indexer_type == "identity" ||
+                    binding.indexer_type == "fused_identity", "Unsupported Host indexer");
+    TORCH_CHECK(!linear || inference_paused,
+                "Host LinearHashMap updates require paused/drained inference");
+    TORCH_CHECK(linear || update.indexer_snapshot_path.empty(),
+                "Identity/FusedIdentity updates must preserve the mapping");
+    TORCH_CHECK(update.snapshot_id == impl_->host_update_ids[update.collection_id] + 1,
+                "Host updates must be applied once in snapshot order");
+    const auto& layer = impl_->nve_layers.at(binding.nve_layer_module_path);
+    const auto dim = layer->get_embedding_dim();
+    TORCH_CHECK(update.cache_update_values.size() == update.cache_update_keys.size() * dim,
+                "Host update values must contain one complete embedding per key");
+    TORCH_CHECK(binding.table_capacities.size() == binding.table_names.size(),
+                "Host updates require exported table capacities");
+    std::unordered_set<int64_t> misses;
+    int64_t base = 0;
+    if (binding.indexer_type != "identity") {
+      for (const auto capacity : binding.table_capacities) {
+        misses.insert(base);
+        base += linear ? 1 : capacity + 1;
+      }
+    }
+    for (const auto row : update.cache_update_keys) {
+      TORCH_CHECK(row >= 0 && row < host->second && misses.count(row) == 0,
+                  "Host update row is outside storage or is a reserved miss row");
+    }
+    auto keys = torch::tensor(update.cache_update_keys,
+                              torch::TensorOptions().dtype(torch::kInt64));
+    const auto dtype = layer->get_data_type() == nve::DataType_t::Float16
+        ? torch::kFloat16 : torch::kFloat32;
+    auto values = torch::tensor(update.cache_update_values,
+                                torch::TensorOptions().dtype(torch::kFloat32)).to(dtype);
+    impl_->indexers.apply_update(
+        update.collection_id, update.indexer_snapshot_path, update.snapshot_id, [&] {
+          if (keys.numel() > 0) {
+            // CPU tensors, separate update context (stream key 0). NVE CPU
+            // lookups use per-thread sentinel keys. Host update completes here;
+            // relaxed row access permits concurrent stale/mixed lookup results.
+            layer->update(keys.numel(), reinterpret_cast<uintptr_t>(keys.data_ptr()),
+                          reinterpret_cast<uintptr_t>(values.data_ptr()), 0, 0);
+          }
+        });
+    impl_->host_update_ids[update.collection_id] = update.snapshot_id;
+    return;
+  }
+  TORCH_CHECK(impl_->device_index >= 0, "CPU updates require HostLayer storage");
   const auto stream = c10::cuda::getStreamFromExternal(
       inference_stream, impl_->device_index);
   c10::cuda::CUDAStreamGuard stream_guard(stream);

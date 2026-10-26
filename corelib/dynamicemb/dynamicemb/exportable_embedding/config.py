@@ -32,7 +32,7 @@ class InferenceEmbeddingCollectionConfig:
 
 
 def validate_collection_config(config: InferenceEmbeddingCollectionConfig) -> None:
-    if config.nve_layer_type not in {"gpu", "linear_uvm", "hierarchical"}:
+    if config.nve_layer_type not in {"gpu", "linear_uvm", "hierarchical", "host"}:
         raise ValueError(f"Unsupported NVE layer type: {config.nve_layer_type}")
     if config.nve_layer_type == "hierarchical" and config.parameter_server is None:
         raise ValueError("Hierarchical NVE requires parameter_server")
@@ -43,7 +43,14 @@ def validate_collection_config(config: InferenceEmbeddingCollectionConfig) -> No
         and config.nve_layer_type != "hierarchical"
     ):
         raise ValueError("BitConcatIndexer is supported only with hierarchical NVE")
-    if config.nve_layer_type != "gpu" and config.gpu_cache_size is None:
+    if (
+        config.nve_layer_type in {"linear_uvm", "hierarchical"}
+        and config.gpu_cache_size is None
+    ):
         raise ValueError("LinearUVM and hierarchical NVE require gpu_cache_size")
     if config.bucket_capacity <= 0:
         raise ValueError("bucket_capacity must be positive")
+    if config.nve_layer_type == "host" and (
+        config.gpu_cache_size is not None or config.host_cache_size != 0
+    ):
+        raise ValueError("HostLayer does not use GPU or host cache settings")

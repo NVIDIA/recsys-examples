@@ -6,10 +6,11 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable, Mapping, Optional
+from typing import TYPE_CHECKING, Any, Iterable, Mapping, Optional
 
 import torch
-from dynamicemb.incremental_dump import DeltaDumpResult
+if TYPE_CHECKING:
+    from dynamicemb.incremental_dump import DeltaDumpResult
 
 from .config import EmbeddingCollectionIndexerType
 from .indexer_directory import (
@@ -122,7 +123,7 @@ def _open_parameter_servers(
 
 
 class EmbeddingCollectionUpdateCoordinator:
-    """Serialize DynamicEmb deltas into Redis and indexer publications."""
+    """Prepare Redis or CPU HostLayer deltas and indexer publications."""
 
     def __init__(
         self,
@@ -133,11 +134,13 @@ class EmbeddingCollectionUpdateCoordinator:
         parameter_servers: Mapping[str, Any],
         shared_update_dir: Path,
         subscriber_ids: Iterable[str],
+        host_layers: Optional[Mapping[str, dict[str, Any]]] = None,
     ) -> None:
         self.bindings = dict(bindings)
         self.snapshots = dict(snapshots)
         self.device = device
         self.parameter_servers = dict(parameter_servers)
+        self.host_layers = dict(host_layers or {})
         self.shared_update_dir = shared_update_dir
         self.subscriber_ids = set(subscriber_ids)
         self._snapshot_ids = {
@@ -164,7 +167,14 @@ class EmbeddingCollectionUpdateCoordinator:
         )
         update_dir = Path(shared_update_dir).resolve()
         update_dir.mkdir(parents=True, exist_ok=True)
+        metadata = json.loads((package_dir / "metadata.json").read_text())
+        layers = metadata if isinstance(metadata, list) else metadata["layers"]
+        hosts = {layer["module_path"]: layer for layer in layers
+                 if layer.get("layer_type") == "HostLayer"}
         return cls(
+            host_layers={name: hosts[binding.nve_layer_module_path]
+                         for name, binding in bindings.items()
+                         if binding.nve_layer_module_path in hosts},
             bindings=bindings,
             snapshots=snapshots,
             device=device,
@@ -307,9 +317,137 @@ class EmbeddingCollectionUpdateCoordinator:
             parameter_server.erase(evicted_storage.contiguous())
         return cache_update_keys, cache_update_values
 
+    def _host_update(
+        self, collection_id: str, delta: DeltaDumpResult
+    ) -> EmbeddingCollectionUpdate:
+        if self.device.type != "cpu":
+            raise ValueError("HostLayer incremental updates require CPU execution")
+        binding = self.bindings[collection_id]
+        config = self.host_layers[collection_id]
+        capacities = list(binding.table_capacities)
+        if len(capacities) != len(binding.table_names) or any(c < 0 for c in capacities):
+            raise ValueError("Host updates require exported per-table capacities; re-export the package")
+        kind = EmbeddingCollectionIndexerType(binding.indexer_type)
+        linear = kind == EmbeddingCollectionIndexerType.LINEAR_HASH_MAP
+        if kind not in (EmbeddingCollectionIndexerType.IDENTITY,
+                        EmbeddingCollectionIndexerType.FUSED_IDENTITY,
+                        EmbeddingCollectionIndexerType.LINEAR_HASH_MAP):
+            raise ValueError("Unsupported HostLayer update indexer")
+        if kind == EmbeddingCollectionIndexerType.IDENTITY and len(capacities) != 1:
+            raise ValueError("Identity requires a single table")
+        dim = int(config["embedding_size"])
+        num_rows = int(config["num_embeddings"])
+        expected_rows = sum(capacities) + (0 if kind == EmbeddingCollectionIndexerType.IDENTITY else len(capacities))
+        if num_rows != expected_rows:
+            raise ValueError("Host storage size does not match the indexer capacities")
+        names = list(delta.table_names)
+        if len(set(names)) != len(names):
+            raise ValueError("Delta table names must be unique")
+        erased = getattr(delta, "erased_keys", None) or [None] * len(names)
+        if any(len(items) != len(names) for items in
+               (delta.keys, delta.values, delta.evicted_keys, erased)):
+            raise ValueError("Delta columns must align with table names")
+        table_ids = {name: i for i, name in enumerate(binding.table_names)}
+        # Validate the entire delta before advancing shadow state or writing a snapshot.
+        changes = {}
+        for column, name in enumerate(names):
+            if name not in table_ids:
+                raise ValueError(f"Unknown table: {name}")
+            table = table_ids[name]
+            keys, values = delta.keys[column], delta.values[column]
+            removed = []
+            for tensor in (keys, delta.evicted_keys[column], erased[column]):
+                if tensor is None:
+                    continue
+                if tensor.device.type != "cpu" or tensor.dtype != torch.int64 or tensor.ndim != 1:
+                    raise ValueError("Host delta keys must be one-dimensional CPU int64 tensors")
+                ids = tensor.tolist()
+                if linear:
+                    if any(-4 <= key <= -1 for key in ids):
+                        raise ValueError("Delta key is reserved by the hash indexer")
+                elif any(key < 0 or key >= capacities[table] for key in ids):
+                    raise ValueError(f"Feature ID outside the reserved range for {name}")
+            if (values.device.type != "cpu" or values.ndim != 2
+                    or tuple(values.shape) != (keys.numel(), dim)
+                    or values.dtype not in (torch.float16, torch.float32)):
+                raise ValueError("Host delta values must be CPU float32/float16 [num_keys, embedding_dim]")
+            for tensor in (delta.evicted_keys[column], erased[column]):
+                if tensor is not None:
+                    removed.extend(tensor.tolist())
+            # A final dumped value wins over an earlier eviction/erase of that key.
+            # Repeated upserts use the last value, matching initial Host loading.
+            upserts = dict(zip(keys.tolist(), values.to(torch.float32).unbind()))
+            changes[table] = (upserts, set(removed) - upserts.keys())
+
+        row_values = {}
+        zero = torch.zeros(dim, dtype=torch.float32)
+        next_snapshot = None
+        if linear:
+            old = self.snapshots.get(collection_id)
+            if old is None:
+                raise ValueError("Host LinearHashMap updates require sidecar indexer state")
+            entries = linear_hash_entries(old)
+            changed_mapping = False
+            for table, (upserts, removed) in changes.items():
+                for key in removed:
+                    row = entries[table].pop(key, None)
+                    if row is not None:
+                        row_values[row] = zero
+                        changed_mapping = True
+                if len(entries[table].keys() | upserts.keys()) > capacities[table]:
+                    raise ValueError(f"Delta exceeds capacity of table {binding.table_names[table]}")
+            used = {row for mapping in entries for row in mapping.values()}
+            free_rows = (row for row in range(len(capacities), num_rows) if row not in used)
+            next_row = old.next_fused_key
+            for table, (upserts, _) in changes.items():
+                for key, value in upserts.items():
+                    if key not in entries[table]:
+                        row = next(free_rows)
+                        entries[table][key] = row
+                        next_row = max(next_row, row + 1)
+                        changed_mapping = True
+                    row_values[entries[table][key]] = value
+            if changed_mapping:
+                next_snapshot = rebuild_linear_hash_snapshot(
+                    entries, bucket_capacity=old.bucket_capacity,
+                    miss_storage_indices=old.miss_storage_indices,
+                    next_fused_key=next_row, device=torch.device("cpu"),
+                )
+        else:
+            base = 0
+            for table, capacity in enumerate(capacities):
+                if kind == EmbeddingCollectionIndexerType.FUSED_IDENTITY:
+                    base += 1  # Preserve the zero miss row before each table.
+                upserts, removed = changes.get(table, ({}, set()))
+                row_values.update({base + key: zero for key in removed})
+                row_values.update({base + key: value for key, value in upserts.items()})
+                base += capacity
+
+        snapshot_id = self._snapshot_ids[collection_id] + 1
+        snapshot_path = None
+        if next_snapshot is not None:
+            snapshot_path = dump_embedding_collection_indexer_snapshot(
+                collection_id=collection_id.replace(".", "_"),
+                snapshot_id=snapshot_id, snapshot=next_snapshot,
+                output_dir=self.shared_update_dir,
+            )
+        update = EmbeddingCollectionUpdate(
+            collection_id, snapshot_id,
+            torch.tensor(list(row_values), dtype=torch.int64),
+            torch.stack(list(row_values.values())).flatten() if row_values
+            else torch.empty(0, dtype=torch.float32),
+            snapshot_path,
+        )
+        if next_snapshot is not None:
+            self.snapshots[collection_id] = next_snapshot
+        self._snapshot_ids[collection_id] = snapshot_id
+        return update
+
     def apply_delta(
         self, collection_id: str, delta: DeltaDumpResult
     ) -> EmbeddingCollectionUpdate:
+        if collection_id in self.host_layers:
+            return self._host_update(collection_id, delta)
         snapshot_id = self._next_snapshot_id(collection_id)
         parameter_server = self.parameter_servers[collection_id]
         indexer_type = self.bindings[collection_id].indexer_type

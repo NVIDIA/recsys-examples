@@ -15,8 +15,8 @@ class UnavailableUpdateSubscriber {
  public:
   UnavailableUpdateSubscriber(const std::string&, py::object, py::dict, int) {
     throw std::runtime_error(
-        "Incremental embedding updates require NVE 26.06 or later; "
-        "this build targets NVE 26.05");
+        "Incremental embedding updates are unavailable in this build; "
+        "enable DYNAMICEMB_ENABLE_NVE_UPDATE with NVE 26.06 or later");
   }
 };
 
