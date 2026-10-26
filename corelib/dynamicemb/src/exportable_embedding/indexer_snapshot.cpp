@@ -104,17 +104,17 @@ std::shared_ptr<RegistryEntry> find_registered_entry(
 template <typename T>
 at::Tensor read_tensor(std::ifstream& stream, uint64_t count,
                        at::ScalarType dtype, int device_index) {
+  const auto device = device_index < 0 ? torch::Device(torch::kCPU)
+                                      : torch::Device(torch::kCUDA, device_index);
   if (count == 0) {
-    return torch::empty(
-        {0}, torch::TensorOptions().dtype(dtype).device(torch::kCUDA,
-                                                        device_index));
+    return torch::empty({0}, torch::TensorOptions().dtype(dtype).device(device));
   }
   std::vector<T> values(count);
   stream.read(reinterpret_cast<char*>(values.data()), count * sizeof(T));
   auto cpu = torch::from_blob(values.data(), {static_cast<int64_t>(count)},
                               torch::TensorOptions().dtype(dtype))
                  .clone();
-  return cpu.to(torch::Device(torch::kCUDA, device_index));
+  return cpu.to(device);
 }
 
 }  // namespace
@@ -206,6 +206,7 @@ void unregister_indexer_snapshot(const at::Tensor& marker) {
 void stage_indexer_snapshot(const at::Tensor& marker,
                             std::shared_ptr<IndexerSnapshot> snapshot,
                             int64_t snapshot_id) {
+  TORCH_CHECK(marker.is_cuda(), "CPU indexers are immutable after loading");
   auto entry = find_registered_entry(marker);
   auto pending = std::make_shared<PendingSnapshot>();
   pending->next = std::move(snapshot);
@@ -222,6 +223,7 @@ void stage_indexer_snapshot(const at::Tensor& marker,
 
 void wait_for_indexer_snapshot_retirement(const at::Tensor& marker,
                                           int64_t snapshot_id) {
+  TORCH_CHECK(marker.is_cuda(), "CPU indexers are immutable after loading");
   auto entry = find_registered_entry(marker);
   std::shared_ptr<PendingSnapshot> update;
   {

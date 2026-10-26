@@ -25,7 +25,6 @@ from .indexer_snapshot import (
     native_indexer_snapshot,
 )
 
-
 _SIDECAR_DIR = "embedding_collection_indexers"
 _MANIFEST_NAME = "manifest.json"
 _DIRECTORY_SCHEMA_VERSION = 1
@@ -52,9 +51,11 @@ def _binding(
     snapshot_path: Optional[str] = None,
     feature_id_bits: Optional[int] = None,
     marker_value: Optional[int] = None,
+    table_capacities: Optional[list[int]] = None,
 ) -> Any:
     result = _C.EmbeddingCollectionBinding()
     result.table_names = table_names
+    result.table_capacities = table_capacities or []
     result.indexer_type = indexer_type
     result.indexer_module_path = indexer_module_path
     result.nve_layer_module_path = nve_layer_module_path
@@ -70,7 +71,7 @@ def embedding_collection_indexers_from_model(
     bindings = {}
     markers = {}
     snapshots = {}
-    device = torch.device("cuda", torch.cuda.current_device())
+    device = torch.device("cpu")
     collection_number = 0
     for module_path, module in model.named_modules():
         indexer = getattr(module, "indexer_", None)
@@ -80,13 +81,13 @@ def embedding_collection_indexers_from_model(
         if not collection_id:
             collection_id = module_path or f"collection_{collection_number}"
         collection_number += 1
+        device = module.device
         indexer_path = f"{module_path}.indexer_" if module_path else "indexer_"
-        nve_path = (
-            f"{module_path}.nve_embedding_" if module_path else "nve_embedding_"
-        )
+        nve_path = f"{module_path}.nve_embedding_" if module_path else "nve_embedding_"
         snapshot = indexer.snapshot
         bindings[collection_id] = _binding(
             table_names=list(module.table_names_),
+            table_capacities=list(module.table_capacities_),
             indexer_type=_indexer_type(indexer),
             indexer_module_path=indexer_path,
             nve_layer_module_path=nve_path,
@@ -100,7 +101,9 @@ def embedding_collection_indexers_from_model(
             snapshots[collection_id] = native_indexer_snapshot(snapshot)
             device = indexer.marker_tensor.device
     device_index = (
-        device.index if device.index is not None else torch.cuda.current_device()
+        -1
+        if device.type == "cpu"
+        else (device.index if device.index is not None else torch.cuda.current_device())
     )
     return _C.EmbeddingCollectionIndexerDirectory.create(
         bindings, markers, snapshots, device_index
@@ -124,6 +127,7 @@ def dump_embedding_collection_indexers(
         dump_indexer_snapshot(snapshot, root / relative_path)
         bindings[collection_id] = _binding(
             table_names=binding.table_names,
+            table_capacities=binding.table_capacities,
             indexer_type=binding.indexer_type,
             indexer_module_path=binding.indexer_module_path,
             nve_layer_module_path=binding.nve_layer_module_path,
@@ -138,6 +142,7 @@ def dump_embedding_collection_indexers(
         "collections": {
             collection_id: {
                 "table_names": binding.table_names,
+                "table_capacities": binding.table_capacities,
                 "indexer_type": binding.indexer_type,
                 "indexer_module_path": binding.indexer_module_path,
                 "nve_layer_module_path": binding.nve_layer_module_path,
@@ -176,7 +181,9 @@ def load_embedding_collection_indexers(
     package_dir: str | Path, device: torch.device
 ) -> Any:
     device_index = (
-        device.index if device.index is not None else torch.cuda.current_device()
+        -1
+        if device.type == "cpu"
+        else (device.index if device.index is not None else torch.cuda.current_device())
     )
     return _C.EmbeddingCollectionIndexerDirectory.load(
         str(Path(package_dir).resolve()), device_index

@@ -94,6 +94,7 @@ EmbeddingCollectionIndexerDirectory::load(const std::string& package_dir,
     const auto& value = iterator.value();
     EmbeddingCollectionBinding binding;
     binding.table_names = value.at("table_names").get<std::vector<std::string>>();
+    binding.table_capacities = value.value("table_capacities", std::vector<int64_t>{});
     binding.indexer_type = value.at("indexer_type").get<std::string>();
     binding.indexer_module_path =
         value.at("indexer_module_path").get<std::string>();
@@ -119,7 +120,8 @@ EmbeddingCollectionIndexerDirectory::load(const std::string& package_dir,
     auto marker = torch::tensor(
         {binding.marker_value.value()},
         torch::TensorOptions().dtype(torch::kInt64).device(
-            torch::kCUDA, device_index));
+            device_index < 0 ? torch::Device(torch::kCPU)
+                             : torch::Device(torch::kCUDA, device_index)));
     auto snapshot = load_indexer_snapshot(
         root + "/" + binding.snapshot_path.value(), device_index);
     register_indexer_snapshot(marker, snapshot);
@@ -158,6 +160,8 @@ void EmbeddingCollectionIndexerDirectory::apply_update(
       impl_->markers.find(collection_id) != impl_->markers.end() &&
       has_replaceable_state(impl_->bindings.at(collection_id).indexer_type);
   if (!has_replaceable_snapshot) {
+    TORCH_CHECK(impl_->device_index >= 0 || snapshot_path.empty(),
+                "CPU mapping updates require a sidecar indexer snapshot");
     enqueue_cache_update();
     return;
   }
@@ -172,6 +176,13 @@ void EmbeddingCollectionIndexerDirectory::apply_update(
     return;
   }
 
+  if (impl_->device_index < 0) {
+    // The subscriber requires paused/drained CPU readers for mapping changes.
+    // Reuse registration; no CUDA event, retirement wait, or reader rendezvous.
+    register_indexer_snapshot(impl_->markers.at(collection_id), next);
+    impl_->snapshots[collection_id] = std::move(next);
+    return;
+  }
   stage_indexer_snapshot(impl_->markers.at(collection_id), next, snapshot_id);
   impl_->snapshots[collection_id] = std::move(next);
   impl_->pending_retirements.insert(

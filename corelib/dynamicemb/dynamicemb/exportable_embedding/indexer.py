@@ -6,13 +6,6 @@ from abc import ABC, abstractmethod
 from typing import Optional, Sequence
 
 import torch
-from dynamicemb.scored_hashtable import (
-    LinearBucketTable,
-    ScoreArg,
-    ScorePolicy,
-    ScoreSpec,
-)
-
 from .config import (
     EmbeddingCollectionIndexerType,
     InferenceEmbeddingCollectionConfig,
@@ -81,9 +74,12 @@ class LinearHashMapIndexer(EmbeddingCollectionIndexerBase):
         bucket_capacity: int = 128,
         key_type: torch.dtype = torch.int64,
         state_sidecar: bool = True,
+        build_on_cpu: bool = False,
         device: torch.device,
     ) -> None:
         super().__init__()
+        self._cpu_lookup = device.type == "cpu"
+        self._cpu_build = build_on_cpu or self._cpu_lookup
         self.table_capacities = tuple(int(value) for value in table_capacities)
         self.key_type = key_type
         self.state_sidecar = state_sidecar
@@ -96,34 +92,62 @@ class LinearHashMapIndexer(EmbeddingCollectionIndexerBase):
             torch.tensor([self.marker_value_], dtype=torch.int64, device=device),
             persistent=False,
         )
-        self._build_table = LinearBucketTable(
-            [
-                max(bucket_capacity, 2 * capacity)
-                for capacity in self.table_capacities
-            ],
-            [ScoreSpec(name="fused_key", policy=ScorePolicy.ASSIGN)],
-            key_type=key_type,
-            bucket_capacity=bucket_capacity,
-            device=device,
-        )
-        self.bucket_capacity = self._build_table.bucket_capacity_
-        empty = _empty_i64(device)
-        self._snapshot = IndexerSnapshot(
-            kind=IndexerSnapshotKind.LINEAR_HASH_MAP,
-            table_storage=self._build_table.table_storage_,
-            table_bucket_offsets=self._build_table.table_bucket_offsets_,
-            bucket_capacity=self.bucket_capacity,
-            miss_storage_indices=torch.arange(
-                len(self.table_capacities), dtype=torch.int64, device=device
-            ),
-            valid_bases=empty,
-            reserved_sizes=empty,
-            next_fused_key=len(self.table_capacities),
-        )
-        if not self.state_sidecar:
-            self.register_buffer(
-                "table_storage_", self._snapshot.table_storage
+        self.bucket_capacity = ((bucket_capacity + 15) // 16) * 16
+        if self._cpu_build:
+            self._cpu_capacities = torch.tensor(
+                self.table_capacities, dtype=torch.int64, device="cpu"
             )
+            self._cpu_counts = torch.zeros_like(self._cpu_capacities)
+            storage, offsets = torch.ops.INFERENCE_EMB.create_cpu_hash(
+                self._cpu_capacities, self.bucket_capacity
+            )
+            empty = _empty_i64(torch.device("cpu"))
+            self._snapshot = IndexerSnapshot(
+                kind=IndexerSnapshotKind.LINEAR_HASH_MAP,
+                table_storage=storage,
+                table_bucket_offsets=offsets,
+                bucket_capacity=self.bucket_capacity,
+                miss_storage_indices=torch.arange(
+                    len(self.table_capacities), device="cpu"
+                ),
+                valid_bases=empty,
+                reserved_sizes=empty,
+                next_fused_key=len(self.table_capacities),
+            )
+            self._build_table = None
+        else:
+            from dynamicemb.scored_hashtable import (
+                LinearBucketTable,
+                ScorePolicy,
+                ScoreSpec,
+            )
+
+            self._build_table = LinearBucketTable(
+                [
+                    max(bucket_capacity, 2 * capacity)
+                    for capacity in self.table_capacities
+                ],
+                [ScoreSpec(name="fused_key", policy=ScorePolicy.ASSIGN)],
+                key_type=key_type,
+                bucket_capacity=bucket_capacity,
+                device=device,
+            )
+            self.bucket_capacity = self._build_table.bucket_capacity_
+            empty = _empty_i64(device)
+            self._snapshot = IndexerSnapshot(
+                kind=IndexerSnapshotKind.LINEAR_HASH_MAP,
+                table_storage=self._build_table.table_storage_,
+                table_bucket_offsets=self._build_table.table_bucket_offsets_,
+                bucket_capacity=self.bucket_capacity,
+                miss_storage_indices=torch.arange(
+                    len(self.table_capacities), dtype=torch.int64, device=device
+                ),
+                valid_bases=empty,
+                reserved_sizes=empty,
+                next_fused_key=len(self.table_capacities),
+            )
+        if not self.state_sidecar:
+            self.register_buffer("table_storage_", self._snapshot.table_storage)
             self.register_buffer(
                 "table_bucket_offsets_", self._snapshot.table_bucket_offsets
             )
@@ -148,6 +172,14 @@ class LinearHashMapIndexer(EmbeddingCollectionIndexerBase):
 
     @torch.no_grad()
     def reset_for_build(self) -> None:
+        if self._cpu_build:
+            if self._snapshot.next_fused_key != len(self.table_capacities):
+                raise RuntimeError(
+                    "Construct a new collection to reload a finalized host index"
+                )
+            return
+        if self._build_table is None:
+            raise RuntimeError("Construct a new collection to reload a finalized index")
         self._build_table.reset()
         self._snapshot.next_fused_key = len(self.table_capacities)
         self._failed_candidates.clear()
@@ -157,6 +189,23 @@ class LinearHashMapIndexer(EmbeddingCollectionIndexerBase):
     def build_index(
         self, feature_ids: torch.Tensor, table_ids: torch.Tensor
     ) -> torch.Tensor:
+        if self._cpu_build:
+            storage, offsets, rows, next_row = torch.ops.INFERENCE_EMB.build_cpu_hash(
+                self._snapshot.table_storage,
+                self._snapshot.table_bucket_offsets,
+                self.bucket_capacity,
+                feature_ids,
+                table_ids,
+                self._cpu_capacities,
+                self._cpu_counts,
+                self._snapshot.next_fused_key,
+            )
+            self._snapshot.table_storage = storage
+            self._snapshot.table_bucket_offsets = offsets
+            self._snapshot.next_fused_key = next_row
+            return rows
+        from dynamicemb.scored_hashtable import ScoreArg, ScorePolicy
+
         stored_keys, found, _slots = self._build_table.lookup(
             feature_ids,
             table_ids,
@@ -214,6 +263,17 @@ class LinearHashMapIndexer(EmbeddingCollectionIndexerBase):
 
     @torch.no_grad()
     def finish_build(self) -> None:
+        if self._cpu_build:
+            self._snapshot = self._snapshot.to(self.marker_tensor.device)
+            if self.state_sidecar:
+                _publish_native(self.marker_tensor, self._snapshot)
+            else:
+                self.table_storage_ = self._snapshot.table_storage
+                self.table_bucket_offsets_ = self._snapshot.table_bucket_offsets
+                self.miss_storage_indices_ = self._snapshot.miss_storage_indices
+            return
+        from dynamicemb.scored_hashtable import ScoreArg, ScorePolicy
+
         candidates = sorted(self._failed_candidates)
         if candidates:
             table_ids = torch.tensor(
@@ -245,6 +305,15 @@ class LinearHashMapIndexer(EmbeddingCollectionIndexerBase):
         self, feature_ids: torch.Tensor, table_ids: torch.Tensor
     ) -> torch.Tensor:
         if not self.state_sidecar:
+            if self._cpu_lookup:
+                return torch.ops.INFERENCE_EMB.linear_hash_lookup(
+                    self.table_storage_,
+                    self.table_bucket_offsets_,
+                    self.bucket_capacity,
+                    self.miss_storage_indices_,
+                    feature_ids,
+                    table_ids,
+                )
             fused_keys, found, _slots = torch.ops.INFERENCE_EMB.table_lookup(
                 self.table_storage_,
                 self.table_bucket_offsets_,
@@ -252,14 +321,12 @@ class LinearHashMapIndexer(EmbeddingCollectionIndexerBase):
                 feature_ids,
                 table_ids,
                 None,
-                int(ScorePolicy.CONST),
+                0,  # ScorePolicyType::Const; no training-extension import at inference.
                 None,
                 0,
                 None,
             )
-            misses = torch.index_select(
-                self.miss_storage_indices_, 0, table_ids
-            )
+            misses = torch.index_select(self.miss_storage_indices_, 0, table_ids)
             return torch.where(found, fused_keys, misses)
         return torch.ops.INFERENCE_EMB.embedding_collection_index(
             self.marker_tensor, self.marker_value_, feature_ids, table_ids
@@ -285,12 +352,13 @@ class FusedIdentityIndexer(EmbeddingCollectionIndexerBase):
             valid_bases.append(next_row + 1)
             next_row += size + 1
         self._nve_num_embeddings = next_row
+        self._build_valid_bases = torch.tensor(
+            valid_bases, dtype=torch.int64, device="cpu"
+        )
         self.marker_value_ = _new_marker_id()
         self.register_buffer(
             "marker_tensor",
-            torch.tensor(
-                [self.marker_value_], dtype=torch.int64, device=device
-            ),
+            torch.tensor([self.marker_value_], dtype=torch.int64, device=device),
             persistent=False,
         )
         empty = _empty_i64(device)
@@ -300,9 +368,7 @@ class FusedIdentityIndexer(EmbeddingCollectionIndexerBase):
             table_bucket_offsets=empty,
             bucket_capacity=0,
             miss_storage_indices=empty,
-            valid_bases=torch.tensor(
-                valid_bases, dtype=torch.int64, device=device
-            ),
+            valid_bases=torch.tensor(valid_bases, dtype=torch.int64, device=device),
             reserved_sizes=torch.tensor(
                 reserved_sizes, dtype=torch.int64, device=device
             ),
@@ -331,7 +397,15 @@ class FusedIdentityIndexer(EmbeddingCollectionIndexerBase):
         self, feature_ids: torch.Tensor, table_ids: torch.Tensor
     ) -> torch.Tensor:
         return (
-            torch.index_select(self._snapshot.valid_bases, 0, table_ids)
+            torch.index_select(
+                (
+                    self._build_valid_bases
+                    if feature_ids.device.type == "cpu"
+                    else self._snapshot.valid_bases
+                ),
+                0,
+                table_ids,
+            )
             + feature_ids
         )
 
@@ -413,6 +487,7 @@ def create_embedding_collection_indexer(
             bucket_capacity=config.bucket_capacity,
             key_type=key_type,
             state_sidecar=config.indexer_state_sidecar,
+            build_on_cpu=config.nve_layer_type == "host",
             device=device,
         )
     if config.indexer_type is EmbeddingCollectionIndexerType.FUSED_IDENTITY:
@@ -429,5 +504,7 @@ def create_embedding_collection_indexer(
             nve_num_embeddings=sum(capacities),
         )
     if config.indexer_type is EmbeddingCollectionIndexerType.IDENTITY:
+        if len(capacities) != 1:
+            raise ValueError("IdentityIndexer requires exactly one table")
         return IdentityIndexer(nve_num_embeddings=sum(capacities))
     raise ValueError(f"Unsupported indexer: {config.indexer_type}")

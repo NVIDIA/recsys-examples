@@ -10,16 +10,7 @@ from pathlib import Path
 from typing import Any, Sequence
 
 import torch
-from dynamicemb.scored_hashtable import (
-    LinearBucketTable,
-    ScoreArg,
-    ScorePolicy,
-    ScoreSpec,
-)
-from dynamicemb_extensions import table_partition
-
 from . import _C
-
 
 _SNAPSHOT_MAGIC = b"ECIDX001"
 _SNAPSHOT_HEADER = struct.Struct("<8sIIqqQQQQQ")
@@ -90,7 +81,9 @@ def load_embedding_collection_indexer_snapshot(
     path: str | Path, device: torch.device
 ) -> Any:
     device_index = (
-        device.index if device.index is not None else torch.cuda.current_device()
+        -1
+        if device.type == "cpu"
+        else (device.index if device.index is not None else torch.cuda.current_device())
     )
     return _C.load_indexer_snapshot(str(Path(path)), device_index)
 
@@ -126,18 +119,14 @@ def linear_hash_entries(
     storage = snapshot.table_storage.cpu().contiguous()
     offsets = snapshot.table_bucket_offsets.cpu().tolist()
     num_buckets = offsets[-1]
-    keys, _digests, values = table_partition(
-        storage,
-        [torch.int64, torch.uint8, torch.uint64],
-        snapshot.bucket_capacity,
-        num_buckets,
-    )
+    width = snapshot.bucket_capacity
+    buckets = storage.view(num_buckets, 17 * width)
+    keys = buckets[:, :8 * width].contiguous().view(torch.int64)
+    values = buckets[:, 9 * width:].contiguous().view(torch.int64)
     result: list[dict[int, int]] = []
     for table_id in range(len(offsets) - 1):
         table_keys = keys[offsets[table_id] : offsets[table_id + 1]].reshape(-1)
-        table_values = values[
-            offsets[table_id] : offsets[table_id + 1]
-        ].reshape(-1)
+        table_values = values[offsets[table_id] : offsets[table_id + 1]].reshape(-1)
         present = table_keys != -1
         result.append(
             dict(
@@ -159,13 +148,37 @@ def rebuild_linear_hash_snapshot(
     next_fused_key: int,
     device: torch.device,
 ) -> IndexerSnapshot:
+    if device.type == "cpu":
+        capacities = torch.tensor([len(table) for table in entries], dtype=torch.int64)
+        storage, offsets = torch.ops.INFERENCE_EMB.create_cpu_hash(capacities, bucket_capacity)
+        keys, tables, rows = [], [], []
+        for table_id, mapping in enumerate(entries):
+            keys.extend(mapping)
+            tables.extend([table_id] * len(mapping))
+            rows.extend(mapping.values())
+        storage, offsets = torch.ops.INFERENCE_EMB.repack_cpu_hash(
+            storage, offsets, bucket_capacity,
+            torch.tensor(keys, dtype=torch.int64),
+            torch.tensor(tables, dtype=torch.int64),
+            torch.tensor(rows, dtype=torch.int64),
+        )
+        empty = torch.empty(0, dtype=torch.int64)
+        return IndexerSnapshot(
+            IndexerSnapshotKind.LINEAR_HASH_MAP, storage, offsets, bucket_capacity,
+            miss_storage_indices.cpu(), empty, empty, next_fused_key,
+        )
+
+    from dynamicemb.scored_hashtable import (
+        LinearBucketTable,
+        ScoreArg,
+        ScorePolicy,
+        ScoreSpec,
+    )
+
     logical_capacities = [max(1, len(table)) for table in entries]
     while True:
         table = LinearBucketTable(
-            [
-                max(bucket_capacity, 2 * capacity)
-                for capacity in logical_capacities
-            ],
+            [max(bucket_capacity, 2 * capacity) for capacity in logical_capacities],
             [ScoreSpec(name="fused_key", policy=ScorePolicy.ASSIGN)],
             key_type=torch.int64,
             bucket_capacity=bucket_capacity,
@@ -175,9 +188,7 @@ def rebuild_linear_hash_snapshot(
         for table_id, mapping in enumerate(entries):
             if not mapping:
                 continue
-            feature_ids = torch.tensor(
-                list(mapping), dtype=torch.int64, device=device
-            )
+            feature_ids = torch.tensor(list(mapping), dtype=torch.int64, device=device)
             table_ids = torch.full_like(feature_ids, table_id)
             fused_keys = torch.tensor(
                 list(mapping.values()), dtype=torch.int64, device=device
