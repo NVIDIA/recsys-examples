@@ -72,7 +72,7 @@ HSTU Setup for benchmark:
 
 GPU-hit is the latency floor once the prefix is long enough. Versus the no-cache baseline we see **1.4x ~ 2.5x** on GPU-hit as sequence_length grows from 8k to 16k. CPU-hit is **1.2x** at 16k. 
 
-* **Performance Results on RTX PRO 6000 (batch size = 1):**
+- **Performance Results on RTX PRO 6000 (batch size = 1):**
 
 ![Local Image](flexkv_cache_e2e.png)
 
@@ -98,14 +98,13 @@ python3 ./inference/benchmark/inference_benchmark_flexkv.py \
 - naive: one SSD→CPU DISK2H, then one CPU→GPU H2D, no overlap.
 - `N = 1 2 3 4`: each DISK2H writes N layers into CPU and overlaps with CPU→GPU H2D and HSTU.
 - `N = 8`: one DISK2H of the whole KV into CPU. Overlap is only the CPU→GPU H2D with HSTU.
-
-* **End-to-end latency (ms), RTX PRO 6000 (batch size = 1):**
+- **End-to-end latency (ms), RTX PRO 6000 (batch size = 1):**
 
 ![Local Image](layerfirst_bs1_e2e.png)
 
 Layerwise is faster than naive at every sequence length. N=8 stays the closest to naive because both read the full KV in one DISK2H, its remaining gain is H2D overlapped with HSTU. Finer N is faster still once the small-transfer bandwidth gap in the measured figure is removed.
 
-* **Measured SSD read bandwidth (GB/s), before the 7 GB/s retiming:**
+- **Measured SSD read bandwidth (GB/s):**
 
 ![Local Image](layerfirst_bs1_ssd_bw.png)
 
