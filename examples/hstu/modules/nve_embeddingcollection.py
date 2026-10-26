@@ -38,6 +38,8 @@ try:
             device: Optional[torch.device] = None,
             use_gpu_only: bool = False,
             gpu_cache_ratio: float = 0.01,
+            gpu_cache_bytes: Optional[int] = None,
+            host_cache_bytes: int = 0,
             is_weighted: bool = False,
             sparse_shareables=None,
         ):
@@ -56,13 +58,16 @@ try:
                     raise ValueError(f"Duplicate table name {embedding_config.name}")
                 table_names.add(embedding_config.name)
                 if not use_gpu_only:
-                    gpu_cache_size = int(
-                        embedding_config.num_embeddings * gpu_cache_ratio
-                    )
-                    gpu_cache_size *= embedding_config.embedding_dim
-                    gpu_cache_size *= torch.tensor(
-                        [], dtype=embedding_config.data_type
-                    ).element_size()
+                    if gpu_cache_bytes is None:
+                        gpu_cache_size = int(
+                            embedding_config.num_embeddings * gpu_cache_ratio
+                        )
+                        gpu_cache_size *= embedding_config.embedding_dim
+                        gpu_cache_size *= torch.tensor(
+                            [], dtype=embedding_config.data_type
+                        ).element_size()
+                    else:
+                        gpu_cache_size = int(gpu_cache_bytes)
                     storage = (
                         sparse_shareables[embedding_config.name]
                         if sparse_shareables
@@ -75,7 +80,7 @@ try:
                         embedding_size=embedding_config.embedding_dim,
                         data_type=embedding_config.data_type,
                         gpu_cache_size=gpu_cache_size,
-                        host_cache_size=0,
+                        host_cache_size=int(host_cache_bytes),
                         optimize_for_training=False,
                         **hierarchical_constructor_kwargs(storage),
                     )
@@ -144,9 +149,18 @@ try:
             result_embeddings: Dict[str, torch.Tensor] = dict()
             feature_dict = features.to_dict()
             for i, embedding in enumerate(self.embeddings.values()):
+                embedding_dim = self._embedding_configs[i].embedding_dim
                 for feature_name in self._feature_names[i]:
                     f = feature_dict[feature_name]
-                    res = embedding(f.values())
+                    keys = f.values()
+                    if keys.numel() == 0:
+                        res = torch.empty(
+                            (0, embedding_dim),
+                            device=torch.cuda.current_device(),
+                            dtype=torch.float32,
+                        )
+                    else:
+                        res = embedding(keys.contiguous())
                     result_embeddings[feature_name] = JaggedTensor(
                         values=res, lengths=f.lengths()
                     )

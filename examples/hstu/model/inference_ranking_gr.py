@@ -200,6 +200,10 @@ def get_inference_ranking_gr(
     use_cudagraph=False,
     cudagraph_configs=None,
     sparse_shareables=None,
+    embedding_backend=None,
+    gpu_cache_ratio: float = 0.05,
+    gpu_cache_bytes=None,
+    host_cache_bytes: int = 0,
 ):
     for ebc_config in task_config.embedding_configs:
         assert (
@@ -208,7 +212,11 @@ def get_inference_ranking_gr(
 
     inference_sparse = InferenceEmbedding(
         task_config.embedding_configs,
+        embedding_backend,
         sparse_shareables,
+        gpu_cache_ratio=gpu_cache_ratio,
+        gpu_cache_bytes=gpu_cache_bytes,
+        host_cache_bytes=host_cache_bytes,
     )
     inference_dense = InferenceDenseModule(
         hstu_config,

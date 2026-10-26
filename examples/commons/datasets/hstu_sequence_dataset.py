@@ -287,16 +287,32 @@ class HSTUSequenceDataset(IterableDataset[HSTUBatch]):
                     tensor, (0, padding_length), "constant", padded_value
                 )
 
-            contextual_features_tensor = torch.tensor(
-                [contextual_features[name] for name in self._contextual_feature_names]
-            ).view(-1)
-            # contextual features are always 1.
-            contextual_features_lengths_tensor = pad_tensor(
-                self._batch_size - actual_batch_size,
-                torch.full(
-                    (actual_batch_size,), 1, device=self._device, dtype=torch.int64
-                ),
-            )
+            if self._num_contextual_features == 0:
+                contextual_features_tensor = torch.empty(
+                    0, device=self._device, dtype=torch.int64
+                )
+                contextual_features_lengths_tensor = torch.empty(
+                    0, device=self._device, dtype=torch.int64
+                )
+            else:
+                contextual_features_tensor = torch.tensor(
+                    [
+                        contextual_features[name]
+                        for name in self._contextual_feature_names
+                    ],
+                    device=self._device,
+                    dtype=torch.int64,
+                ).view(-1)
+                # contextual features are always 1.
+                contextual_features_lengths_tensor = pad_tensor(
+                    self._batch_size - actual_batch_size,
+                    torch.full(
+                        (actual_batch_size,),
+                        1,
+                        device=self._device,
+                        dtype=torch.int64,
+                    ),
+                )
 
             item_features_tensor = torch.tensor(
                 item_features, device=self._device, dtype=torch.int64
