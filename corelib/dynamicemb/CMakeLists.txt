@@ -178,11 +178,12 @@ find_library(TORCH_PYTHON_LIBRARY torch_python
     REQUIRED
 )
 
-set(EXPORTABLE_EMBEDDING_PYBIND_SOURCES
+set(EXPORTABLE_EMBEDDING_INDEXER_SOURCES
     src/exportable_embedding/exportable_embedding_pybind.cpp
     src/exportable_embedding/indexer_directory_pybind.cpp
     src/exportable_embedding/indexer_snapshot_pybind.cpp
 )
+set(EXPORTABLE_EMBEDDING_PYBIND_SOURCES ${EXPORTABLE_EMBEDDING_INDEXER_SOURCES})
 if(DYNAMICEMB_HAS_NVE_UPDATE)
     list(APPEND EXPORTABLE_EMBEDDING_PYBIND_SOURCES
         src/exportable_embedding/update_subscriber_pybind.cu
@@ -197,25 +198,39 @@ endif()
 add_library(dynamicemb_exportable_embedding_python MODULE
     ${EXPORTABLE_EMBEDDING_PYBIND_SOURCES}
 )
-target_include_directories(dynamicemb_exportable_embedding_python PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/include
-    ${Python3_INCLUDE_DIRS}
-    ${TORCH_INCLUDE_DIRS}
-    ${CUDAToolkit_INCLUDE_DIRS}
+# NVE 26.05 must never dlopen the default extension's NVE 26.10 dependencies.
+# Both modules share the same indexer operators; only _C links the update runtime.
+add_library(dynamicemb_exportable_embedding_legacy_python MODULE
+    ${EXPORTABLE_EMBEDDING_INDEXER_SOURCES}
+    src/exportable_embedding/update_subscriber_unavailable_pybind.cpp
 )
+foreach(binding_target IN ITEMS
+    dynamicemb_exportable_embedding_python
+    dynamicemb_exportable_embedding_legacy_python
+)
+    target_include_directories(${binding_target} PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${Python3_INCLUDE_DIRS}
+        ${TORCH_INCLUDE_DIRS}
+        ${CUDAToolkit_INCLUDE_DIRS}
+    )
+    if(TORCH_CXX_FLAGS_LIST)
+        target_compile_options(${binding_target} PRIVATE
+            ${TORCH_CXX_FLAGS_LIST}
+        )
+    endif()
+    target_link_libraries(${binding_target} PRIVATE
+        inference_emb_ops
+        Python3::Python
+        ${TORCH_LIBRARIES}
+        "${TORCH_PYTHON_LIBRARY}"
+    )
+endforeach()
 target_compile_definitions(dynamicemb_exportable_embedding_python PRIVATE
     TORCH_EXTENSION_NAME=_C
 )
-if(TORCH_CXX_FLAGS_LIST)
-    target_compile_options(dynamicemb_exportable_embedding_python PRIVATE
-        ${TORCH_CXX_FLAGS_LIST}
-    )
-endif()
-target_link_libraries(dynamicemb_exportable_embedding_python PRIVATE
-    inference_emb_ops
-    Python3::Python
-    ${TORCH_LIBRARIES}
-    "${TORCH_PYTHON_LIBRARY}"
+target_compile_definitions(dynamicemb_exportable_embedding_legacy_python PRIVATE
+    TORCH_EXTENSION_NAME=_C_legacy
 )
 
 if(DYNAMICEMB_HAS_NVE_UPDATE)
@@ -241,7 +256,16 @@ set_target_properties(dynamicemb_exportable_embedding_python PROPERTIES
         "${CMAKE_CURRENT_SOURCE_DIR}/dynamicemb/exportable_embedding"
     INSTALL_RPATH "${CMAKE_INSTALL_FULL_LIBDIR};${NVE_LIB_DIR}"
 )
-install(TARGETS dynamicemb_exportable_embedding_python
+set_target_properties(dynamicemb_exportable_embedding_legacy_python PROPERTIES
+    PREFIX ""
+    OUTPUT_NAME "_C_legacy"
+    LIBRARY_OUTPUT_DIRECTORY
+        "${CMAKE_CURRENT_SOURCE_DIR}/dynamicemb/exportable_embedding"
+    INSTALL_RPATH "${CMAKE_INSTALL_FULL_LIBDIR}"
+)
+install(TARGETS
+    dynamicemb_exportable_embedding_python
+    dynamicemb_exportable_embedding_legacy_python
     LIBRARY DESTINATION
         "${Python3_SITEARCH}/dynamicemb/exportable_embedding"
     RUNTIME DESTINATION

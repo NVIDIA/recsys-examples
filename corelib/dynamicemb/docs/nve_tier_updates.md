@@ -51,3 +51,8 @@ Validation: `tests/test_nve_tier_binding.py` checks tier isolation, GPU/UVM
 lookup/pooling, and fresh-process AOTI subscriber updates. The original
 `example/exportable_embedding` Python/C++ workflow exercises paused hash and
 continuous BitConcat updates against Redis without changing its scheduling.
+
+The application image packages `_C` (default NVE updates) and `_C_legacy`
+(indexers only, no NVE linkage). Python selects the latter when importing NVE
+26.05, so ordinary installed-package imports cannot load the 26.10 libraries
+into the legacy process. No alternate DynamicEmb `PYTHONPATH` is required.

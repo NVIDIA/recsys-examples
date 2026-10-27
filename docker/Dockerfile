@@ -344,8 +344,8 @@ RUN rm -rf /workspace/deps/nve /opt/nve/default/python /workspace/build/pynve-de
       /workspace/deps/nve && \
     rm -rf /workspace/build/pynve-default
 
-# Package the default _C extension, then stage its 26.05 stub build for the
-# same image's compatibility example.
+# Package the default update binding and the NVE-neutral legacy binding.
+# Keep the compatibility prefix for callers that already select it explicitly.
 RUN rm -f /usr/lib/$(uname -m)-linux-gnu/libcuda.so.1 && \
     test -e /usr/local/cuda-13/compat/lib.real/libcuda.so.1 && \
     ln -s /usr/local/cuda-13/compat/lib.real/libcuda.so.1 /usr/lib/$(uname -m)-linux-gnu/libcuda.so.1 && \
@@ -358,14 +358,8 @@ RUN rm -f /usr/lib/$(uname -m)-linux-gnu/libcuda.so.1 && \
     make -j && \
     cd .. && \
     TORCH_CUDA_ARCH_LIST="7.5 8.0 8.6 9.0 10.0 12.0" python setup.py install && \
-    cmake -S . -B torch_binding_build -DNVE_VERSION=26.05 && \
-    cmake --build torch_binding_build --parallel 8 \
-      --target dynamicemb_exportable_embedding_python && \
     mkdir -p /opt/dynamicemb/26.05/python && \
     cp -a dynamicemb /opt/dynamicemb/26.05/python/ && \
-    cmake -S . -B torch_binding_build -UNVE_VERSION && \
-    cmake --build torch_binding_build --parallel 8 \
-      --target dynamicemb_exportable_embedding_python && \
     cmake --install torch_binding_build && \
     cd /workspace/deps && rm -rf nvcomp && \
     NVCOMP_ARCH=$([ "$(uname -m)" = "aarch64" ] && echo "linux-sbsa" || echo "linux-x86_64") && \
