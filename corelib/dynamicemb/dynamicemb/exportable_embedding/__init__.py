@@ -3,7 +3,13 @@
 
 # Register fake kernels only after the native schemas have been loaded.
 # isort: off
-from . import _C
+import pynve as _pynve
+
+if tuple(int(part) for part in _pynve.__version__.split(".")[:2]) == (26, 5):
+    # This module has no NVE dependency, keeping the selected legacy ABI isolated.
+    from . import _C_legacy as _C
+else:
+    from . import _C
 from dynamicemb import lookup_meta as _lookup_meta  # noqa: F401
 
 # isort: on

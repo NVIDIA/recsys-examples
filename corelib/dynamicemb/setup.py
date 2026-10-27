@@ -163,6 +163,8 @@ def get_extensions():
             "indexer_ops.cu",
             "indexer_cpu.cpp",
             "incremental_update.cpp",
+            "nve_runtime.cu",
+            "nve_tier_pybind.cu",
             "exportable_embedding_pybind.cpp",
             "indexer_directory_pybind.cpp",
             "indexer_snapshot_pybind.cpp",
@@ -309,7 +311,7 @@ setup(
     ext_modules=get_extensions(),
     package_data={
         f"{library_name}.jit": ["*.fatbin"],
-        f"{library_name}.exportable_embedding": ["_C.so"],
+        f"{library_name}.exportable_embedding": ["_C.so", "_C_legacy.so"],
     },
     license="BSD-3",
     keywords=[
