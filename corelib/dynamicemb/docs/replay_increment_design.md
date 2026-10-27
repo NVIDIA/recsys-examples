@@ -210,6 +210,10 @@ hash_roundrobin  : fmix64(key) % world_size == rank
 continuous       : NotImplementedError (range-based; not reconstructible per key)
 ```
 
+`key` is the key as the table stores it, an int64, read as unsigned. The
+bucketize reads an int32 input key the same way, widened to int64 with its
+sign, so a replayed key lands on the rank its lookups go to.
+
 The delta's scope depends on how it was dumped: `incremental_dump(..., pg)`
 all-gathers, so every rank holds the *global* delta and the filter hands each
 rank its share; `pg=None` leaves each rank holding only its own keys, so that

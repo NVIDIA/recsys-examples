@@ -26,12 +26,19 @@ Its device twin is ``_block_bucketize_sparse_features_cuda_kernel1/2`` in
 ``src/sparse_block_bucketize_features.cu``; the two must agree key for key, or
 a key is looked up on one rank and stored on another with nothing raising.
 
-Two things the rule is easy to get wrong, and why they live here:
+Three things the rule is easy to get wrong, and why they live here:
 
-* **The modulo is unsigned.** The kernel narrows in
-  ``make_unsigned_t<index_t>``, so a negative key wraps rather than staying
-  negative. ``torch``'s ``%`` follows Python and returns a non-negative
-  remainder for a positive divisor, which is *not* the same number.
+* **The modulo is unsigned.** Under both rules the kernel reads a key as
+  ``uint64_t``, so a negative key wraps rather than staying negative.
+  ``torch``'s ``%`` follows Python and returns a non-negative remainder for a
+  positive divisor, which is *not* the same number.
+* **The key is 64 bits, whatever the input's dtype.** A table stores an int32
+  key widened to int64 with its sign, and a checkpoint or a delta holds that
+  int64 key, which is all a loader has. So the kernel widens an int32 key the
+  same way before either rule: an int32 key gets the rank of the int64 key with
+  the same value. Read in 32 bits instead, a negative key is another number,
+  and a hash cut to 32 bits leaves another remainder at any world size that is
+  not a power of two.
 * **``dist_type`` selects the rule**, and ``roundrobin`` and ``hash_roundrobin``
   disagree for almost every key. Code that hardcodes one of them keeps roughly
   ``1/num_shards`` of the keys when handed the other, and reports no error.
@@ -131,6 +138,9 @@ def _unsigned_mod(values: Tensor, divisor: int) -> Tensor:
 
 def owning_shard(keys: Tensor, num_shards: int, dist_type: str) -> Tensor:
     """The shard index each key belongs to, as an int64 tensor on ``keys``'s device.
+
+    An int32 key is read as the int64 key with the same value, the key a table
+    stores, as the kernel reads it.
 
     ``num_shards`` is the fan-out of the rule, not the size of the cluster: under
     row-wise sharding it is the world size, and a table sharded over a subset of

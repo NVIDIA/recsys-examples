@@ -68,6 +68,8 @@ bucketize by the same rule -- the supported `dist_type` values are:
 
 `hash_roundrobin` hashes the raw key before rank assignment and is intended to reduce sensitivity to pathological raw-key patterns that can break plain modulo-based `roundrobin`. It is an opt-in routing mode; the default remains `roundrobin` for compatibility with existing checkpoints. It should be understood as a routing robustness improvement, not as a general solution to arbitrary hot-key or Zipf-skew load balancing.
 
+`roundrobin` sends a key to rank `key % world_size`, and `hash_roundrobin` to rank `murmur3_fmix64(key) % world_size`, where `world_size` is the number of ranks the table is split over. Both read the key as an unsigned 64-bit number. An int32 key is widened to int64 with its sign first, so it goes to the rank of the int64 key with the same value. That is the key the table stores and a checkpoint holds, and checkpoint load and `replay_increment` place each key by it.
+
     ```python
     #How to import
     from dynamicemb.planner import DynamicEmbeddingShardingPlanner
