@@ -215,6 +215,11 @@ class LinearHashMapIndexer(EmbeddingCollectionIndexerBase):
         missing_tables = table_ids[~found]
         if missing_ids.numel() > 0:
             start = self._snapshot.next_fused_key
+            if start + missing_ids.numel() > self._nve_num_embeddings:
+                raise ValueError(
+                    "LinearHashMapIndexer capacity exceeded while loading rows; "
+                    "reserve enough embedding rows for the checkpoint"
+                )
             assigned = torch.arange(
                 start,
                 start + missing_ids.numel(),

@@ -180,6 +180,11 @@ def get_exportable_model_for_inference(
     trained_emb_table_sizes,
     checkpoint_dir,
 ):
+    from modules.exportable_embedding import checkpoint_table_capacities
+
+    trained_emb_table_sizes = checkpoint_table_capacities(
+        checkpoint_dir, embedding_collection_configs, trained_emb_table_sizes
+    )
     model = get_training_gr_model()
     inference_model = apply_inference(
         model,

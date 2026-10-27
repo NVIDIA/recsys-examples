@@ -429,3 +429,31 @@ def create_kuairand_embedding_collection_configs(
         "video_id": dynamic_config,
         "action_weights": static_config,
     }
+
+
+def checkpoint_table_capacities(
+    checkpoint_dir: str,
+    collection_configs: Dict[str, InferenceEmbeddingCollectionConfig],
+    table_sizes: Dict[str, int],
+) -> Dict[str, int]:
+    """Reserve every saved sparse row; training capacity estimates can be smaller."""
+    from dynamicemb.checkpoint_io import find_files
+
+    directory = os.path.join(
+        checkpoint_dir,
+        "dynamicemb_module",
+        "model._embedding_collection._model_parallel_embedding_collection",
+    )
+    filenames = sorted(os.listdir(directory))
+    capacities = dict(table_sizes)
+    for name, config in collection_configs.items():
+        if config.indexer_type != EmbeddingCollectionIndexerType.LINEAR_HASH_MAP:
+            continue
+        key_files, _ = find_files(directory, name, "emb_keys", filenames)
+        # Counting rows (rather than maximum key) preserves sparse-key support.
+        # Duplicate keys only over-reserve space; no checkpoint data is changed.
+        rows = sum(
+            os.path.getsize(path) // torch.int64.itemsize for path in key_files
+        )
+        capacities[name] = max(capacities[name], rows)
+    return capacities
