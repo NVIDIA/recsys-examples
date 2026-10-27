@@ -204,7 +204,11 @@ class ShardedDynamicEmbeddingCollection(ShardedEmbeddingCollection):
         ctx: DynamicEmbeddingCollectionContext,
         input_feature_splits: List[KeyedJaggedTensor],
     ) -> List[KeyedJaggedTensor]:
-        """Deduplicate indices using segmented_unique_cuda."""
+        """Deduplicate indices using segmented_unique_cuda.
+
+        The deduplicated KJT keeps the dtype of the input indices. int32
+        indices are deduplicated as int64, the keys the tables store.
+        """
         with record_function("## dedup_ec_indices ##"):
             features_by_shards = []
             for i, input_feature in enumerate(input_feature_splits):
@@ -248,6 +252,12 @@ class ShardedDynamicEmbeddingCollection(ShardedEmbeddingCollection):
                         0, dtype=torch.int64, device=self._device
                     )
 
+                # segmented_unique_cuda takes 64-bit keys. The lookup widens
+                # int32 indices to int64, so the dedup does the same.
+                indices_64bit = (
+                    indices.to(torch.int64) if indices.dtype == torch.int32 else indices
+                )
+
                 # Call segmented_unique_cuda
                 (
                     num_uniques,
@@ -256,7 +266,7 @@ class ShardedDynamicEmbeddingCollection(ShardedEmbeddingCollection):
                     table_offsets,
                     freq_counters,
                 ) = segmented_unique_cuda(
-                    indices,
+                    indices_64bit,
                     segmented_range,
                     table_num,
                     input_frequencies,
@@ -275,7 +285,10 @@ class ShardedDynamicEmbeddingCollection(ShardedEmbeddingCollection):
                 # Get unique values for the KJT
                 # .item() implicitly syncs GPU to CPU
                 total_unique = num_uniques.item()
-                unique_keys = unique_keys[:total_unique]
+                # Return the keys in the input dtype. The input dist then sees
+                # the same dtype as without index dedup, and as on a rank whose
+                # input is empty (handled above).
+                unique_keys = unique_keys[:total_unique].to(indices.dtype)
 
                 dedup_features = KeyedJaggedTensor(
                     keys=input_feature.keys(),
