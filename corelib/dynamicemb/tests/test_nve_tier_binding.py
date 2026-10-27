@@ -80,7 +80,7 @@ def test_dense_tier_binding(kind, dtype, pooling):
 
 @pytest.mark.parametrize("host_cache", [0, 1 << 20])
 def test_hierarchical_updates_only_selected_cache(host_cache):
-    ps = NVEParameterServer(4, 64, torch.float32, ps_type=nve.NVHashMap)
+    ps = NVEParameterServer(0, 64, torch.float32, ps_type=nve.NVHashMap)
     model = collection("hierarchical", ps=ps, host_cache=host_cache)
     model.load_from_embedding_table(torch.ones(4, 64))
     keys = torch.tensor([1], device="cuda")
