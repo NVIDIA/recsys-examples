@@ -29,6 +29,7 @@ from test_embedding_dump_load import (
     get_optimizer_kwargs,
     get_score_strategy,
     idx_to_name,
+    owns_key,
 )
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 
@@ -44,6 +45,7 @@ def generate_deterministic_sparse_features_with_frequency_tracking(
     empty_rank_iteration: Optional[int] = None,
     seed: int = 42,
     caching: bool = False,
+    key_dtype: torch.dtype = torch.int64,
 ) -> Tuple[List[KeyedJaggedTensor], Dict[str, Dict[int, int]]]:
     """
     Generate deterministic sparse features and track frequency for each embedding table.
@@ -51,6 +53,7 @@ def generate_deterministic_sparse_features_with_frequency_tracking(
     Args:
         empty_rank_iteration: At this iteration rank 0 has no keys
         caching: If True, generate more unique keys to trigger cache eviction
+        key_dtype: dtype of the KJT keys
 
     Returns:
         kjts: List of KeyedJaggedTensor for each iteration
@@ -109,7 +112,7 @@ def generate_deterministic_sparse_features_with_frequency_tracking(
         kjts.append(
             KeyedJaggedTensor.from_lengths_sync(
                 keys=keys,
-                values=torch.tensor(cur_indices, dtype=torch.int64).cuda(),
+                values=torch.tensor(cur_indices, dtype=key_dtype).cuda(),
                 lengths=torch.tensor(cur_lengths, dtype=torch.int64).cuda(),
             )
         )
@@ -179,19 +182,23 @@ def validate_admission_keys(
     expected_frequencies: Dict[str, Dict[int, int]],
     actual_keys: Dict[str, Set[int]],
     threshold: int,
+    dist_type: str,
 ):
     """
-    Validate that only keys with frequency >= threshold are stored in tables.
+    Validate that exactly the keys with frequency >= threshold are stored in tables.
 
-    In multi-GPU scenarios, keys are sharded across GPUs. Each rank only validates
-    keys that are actually present in its local tables (i.e., keys that were sharded to it).
-    This is similar to how LFU score validation works.
+    In multi-GPU scenarios, keys are sharded across GPUs. Each rank validates the
+    keys in its local tables, and that every key it owns with frequency >=
+    threshold is among them.
 
     Args:
         expected_frequencies: Dict mapping table_name -> {key: frequency}
         actual_keys: Dict mapping table_name -> Set[key]
         threshold: Admission threshold
+        dist_type: The rule that maps a key to the rank that owns it
     """
+    rank = dist.get_rank()
+    world_size = dist.get_world_size()
     for table_name in expected_frequencies:
         if table_name not in actual_keys:
             raise AssertionError(f"Table {table_name} missing from actual keys")
@@ -212,6 +219,23 @@ def validate_admission_keys(
                     f"Admitted with frequency={expected[key]} < threshold={threshold} "
                     f"(should have been rejected)"
                 )
+
+        # And the other way round: every key this rank owns that reached the
+        # threshold is admitted.
+        expected_on_rank = {
+            key
+            for key, frequency in expected.items()
+            if frequency >= threshold and owns_key(key, rank, world_size, dist_type)
+        }
+        not_admitted = sorted(expected_on_rank - actual)
+        if not_admitted:
+            examples = ", ".join(
+                f"key {key} with frequency {expected[key]}" for key in not_admitted[:5]
+            )
+            raise AssertionError(
+                f"Table {table_name}: {len(not_admitted)} keys reached "
+                f"threshold={threshold} but were not admitted, e.g. {examples}"
+            )
 
         # Count expected admitted/rejected for reporting
         expected_admitted_count = sum(
@@ -339,6 +363,12 @@ def validate_non_admitted_embedding_values(
         "constant that owns non-admitted rows. Pass a threshold no key can reach."
     ),
 )
+@click.option(
+    "--key-dtype",
+    type=click.Choice(["int64", "int32"]),
+    default="int64",
+    help="dtype of the KJT keys.",
+)
 def test_admission_strategy_validation(
     num_embedding_collections: int,
     num_embeddings: str,
@@ -357,10 +387,11 @@ def test_admission_strategy_validation(
     no_strategy_initializer: bool,
     expect_all_rejected: bool,
     case: Optional[str],
+    key_dtype: str,
 ):
     """Test admission strategy correctness by comparing with naive frequency counting.
 
-    This test validates that only keys with frequency >= threshold are stored in tables.
+    This test validates that the tables store exactly the keys with frequency >= threshold.
     It supports:
     - Storage-only (default): HBM-only DynamicEmbStorage when budget fits (HBM_DIRECT)
     - StorageMode DEFAULT: pass --global-hbm-budget-scale < 1 to use HybridStorage
@@ -370,6 +401,8 @@ def test_admission_strategy_validation(
     num_embeddings = [int(v) for v in num_embeddings.split(",")]
     multi_hot_sizes = [int(v) for v in multi_hot_sizes.split(",")]
     use_index_dedup = True
+    # The rule that maps a key to its rank, for the model and for the check.
+    dist_type = "roundrobin"
 
     if not caching:
         for num_embedding, multi_hot_size in zip(num_embeddings, multi_hot_sizes):
@@ -390,6 +423,7 @@ def test_admission_strategy_validation(
     print(f"  - Empty rank iteration: {empty_rank_iteration}")
     print(f"  - Admission threshold: {threshold}")
     print(f"  - Use index dedup: {use_index_dedup}")
+    print(f"  - Key dtype: {key_dtype}")
     print(f"  - Score strategy: {score_strategy}")
     if caching:
         print(f"  - Caching: ENABLED ✓")
@@ -430,6 +464,7 @@ def test_admission_strategy_validation(
         score_strategy=get_score_strategy(
             score_strategy
         ),  # Use timestamp for admission
+        dist_type=dist_type,
         use_index_dedup=use_index_dedup,
         caching=caching,
         cache_capacity_ratio=cache_capacity_ratio if caching else 0.1,
@@ -460,6 +495,7 @@ def test_admission_strategy_validation(
         num_iterations=num_iterations,
         empty_rank_iteration=empty_rank_iteration,
         caching=caching,
+        key_dtype=getattr(torch, key_dtype),
     )
 
     # Run forward passes to trigger admission logic
@@ -488,7 +524,7 @@ def test_admission_strategy_validation(
 
     # Validate admission logic
     print(f"\nValidating admission with threshold={threshold}...")
-    validate_admission_keys(expected_frequencies, actual_keys, threshold)
+    validate_admission_keys(expected_frequencies, actual_keys, threshold, dist_type)
 
     if expect_all_rejected:
         for table_name, keys in actual_keys.items():
@@ -586,6 +622,22 @@ def _build_cases():
                 "cache_capacity_ratio": 0.08,
             },
         }
+
+    # int32 keys. Index dedup counts their frequency as it does for int64 keys.
+    # With caching the keys spread over 8000 values per table, and only one key
+    # of all 8 tables reaches the threshold of 4. A threshold of 2 admits about
+    # 360 of them.
+    for storage, storage_options in STORAGE_MODES.items():
+        options = {
+            **_FOUR_TABLES,
+            **storage_options,
+            "optimizer_type": "sgd",
+            "score_strategy": "lfu",
+            "key_dtype": "int32",
+        }
+        if storage == "cache":
+            options["threshold"] = 2
+        cases[f"int32-keys-{storage}"] = {"gpus": (1, 8), "options": options}
 
     # A threshold no key can reach, so every value the forward returns comes
     # from whichever initializer owns the rows admission rejects.
