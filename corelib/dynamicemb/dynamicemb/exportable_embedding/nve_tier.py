@@ -5,7 +5,7 @@
 
 The stock NVE constructors/loaders hardcode their binding types. Keep the small
 constructor adaptation here; forward, export discovery and serialization remain
-NVE's. Host uses its stock constructor and its separate concurrency patch.
+NVE's. Host uses its stock constructor.
 """
 
 import builtins

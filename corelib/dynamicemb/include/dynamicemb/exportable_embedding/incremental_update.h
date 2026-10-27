@@ -53,7 +53,8 @@ class DYNAMICEMB_EXPORT EmbeddingCollectionUpdateSubscriber {
       int device_index);
   ~EmbeddingCollectionUpdateSubscriber();
 
-  // CPU Host Identity/FusedIdentity permit stale/mixed concurrent lookups.
+  // CPU Host Identity/FusedIdentity keep inference running experimentally.
+  // Stock NVE row copies are non-atomic; concurrent access is not data-race safe.
   // For Host LinearHashMap, the caller must pause/drain readers and pass true.
   // One update writer per subscriber; apply messages once in snapshot order.
   void apply_incremental_load(const EmbeddingCollectionUpdate& update,

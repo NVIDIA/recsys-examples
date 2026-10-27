@@ -38,7 +38,7 @@ misses return zero. A full checkpoint load includes every saved shard.
 
 ## Build and run
 
-Use the repository-pinned NVE build (26.10 plus the concurrent host-row patch)
+Use the repository-pinned official NVE 26.10 build (`803e278`)
 and the repository's inference bindings. For a machine without an
 NVIDIA driver, build NVE with `PYNVE_DRIVERLESS_BUILD=1 PYNVE_DISABLE_MPI=1`
 and keep DynamicEmb inference updates enabled (the default). Set
@@ -85,16 +85,19 @@ a CUDA graph; capture only the dense part of the pipeline.
 
 | Indexer | Loading | Mapping |
 | --- | --- | --- |
-| Identity, single table | Inference continues | Overwrite fixed rows. |
-| FusedIdentity | Inference continues | Overwrite within reserved table ranges. |
+| Identity, single table | Inference continues (experimental; see below) | Overwrite fixed rows. |
+| FusedIdentity | Inference continues (experimental; see below) | Overwrite within reserved table ranges. |
 | LinearHashMap | Pause and drain CPU readers | Update/insert/erase mappings; reuse free rows within capacity. Sidecar required. |
 
-During fixed-mapping updates, lookups may return stale or mixed values, including
-within a row or pooled result. After `apply_incremental_load` returns, new lookups
-see the updated rows. The dense host table uses relaxed, lock-free word accesses;
-there is no new lookup/update mutex, retry loop, fence or CUDA synchronization.
-Keep the storage allocation fixed. Raw weight writes, serialization, and
-accumulation must happen outside concurrent serving.
+The intended fixed-mapping contract permits stale/mixed lookup values during
+updates and checks final values after completion. The sixth commit removes the
+atomic host-row patch and pins stock NVE 26.10: overlapping lookup/update now uses
+ordinary `memcpy`, which has a C++ data race. Concurrent runs are an experiment,
+not a guarantee of safe execution or final-value visibility. The examples keep
+their existing concurrency and synchronization; paused LinearHashMap is unchanged.
+See [the explanation, word-level example, and validation results](../../docs/host_cpu_update_concurrency.md).
+Keep the storage allocation fixed and use one update writer. Raw weight writes,
+serialization, and accumulation must happen outside concurrent serving.
 
 ```text
 CPU delta → UpdateCoordinator → row/value message (+ paused hash snapshot)
