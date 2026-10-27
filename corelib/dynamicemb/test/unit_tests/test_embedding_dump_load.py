@@ -204,6 +204,21 @@ def update_scores(
         return
 
 
+def random_key(key_dtype: torch.dtype) -> int:
+    """A random key of *key_dtype*.
+
+    int64 keys are non-negative. int32 keys take the whole int32 range, negative
+    keys included, except -4 to -1: a table stores an int32 key widened to int64
+    with its sign, and as int64 those four are the hash table's reserved keys.
+    """
+    if key_dtype == torch.int64:
+        return random.randint(0, (1 << 63) - 1)
+    while True:
+        key = random.randint(-(1 << 31), (1 << 31) - 1)
+        if not -4 <= key <= -1:
+            return key
+
+
 def generate_sparse_feature(
     num_embedding_collections: int,
     num_embeddings: List[int],
@@ -215,6 +230,7 @@ def generate_sparse_feature(
     score_strategy: str,
     scores_collection: Dict[str, Dict[int, int]],
     seed: int = 42,
+    key_dtype: torch.dtype = torch.int64,
 ):
     random.seed(seed)
     torch.manual_seed(seed)
@@ -244,7 +260,7 @@ def generate_sparse_feature(
                     hotness = random.randint(
                         0, multi_hot_sizes[embedding_collection_id]
                     )
-                    indices = [random.randint(0, (1 << 63) - 1) for _ in range(hotness)]
+                    indices = [random_key(key_dtype) for _ in range(hotness)]
                     all_indices.extend(indices)
                     all_lengths.append(hotness)
                     if sample_id // batch_size_per_rank == rank:
@@ -256,14 +272,14 @@ def generate_sparse_feature(
         kjts.append(
             KeyedJaggedTensor.from_lengths_sync(
                 keys=keys,
-                values=torch.tensor(cur_indices, dtype=torch.int64).cuda(),
+                values=torch.tensor(cur_indices, dtype=key_dtype).cuda(),
                 lengths=torch.tensor(cur_lengths, dtype=torch.int64).cuda(),
             )
         )
         all_kjts.append(
             KeyedJaggedTensor.from_lengths_sync(
                 keys=keys,
-                values=torch.tensor(all_indices, dtype=torch.int64).cuda(),
+                values=torch.tensor(all_indices, dtype=key_dtype).cuda(),
                 lengths=torch.tensor(all_lengths, dtype=torch.int64).cuda(),
             )
         )
@@ -471,6 +487,9 @@ def owns_key(key: int, rank: int, world_size: int, dist_type: str) -> bool:
     roundrobin rule written out by hand -- right for the default, wrong for
     hash_roundrobin, and invisible either way at world_size 1, where the only
     rank owns everything. The hash_roundrobin coverage ran at one rank.
+
+    A key from an int32 KJT arrives as a Python int with its sign, so it is read
+    as the int64 key a table stores.
     """
     if world_size <= 1:
         return True
@@ -528,6 +547,19 @@ def assert_dist_type_path(model: nn.Module, expected_dist_type: str) -> None:
     default="roundrobin",
     show_default=True,
 )
+@click.option(
+    "--key-dtype",
+    type=click.Choice(["int64", "int32"]),
+    default="int64",
+    show_default=True,
+)
+@click.option(
+    "--batch-size",
+    type=int,
+    default=128,
+    show_default=True,
+    help="A multiple of the world size: each rank feeds an equal share of it.",
+)
 @click.option("--optim", type=bool, required=True)
 @click.option("--counter", type=bool, required=True)
 @click.option("--table-scope", type=str, default="", show_default=True)
@@ -539,6 +571,7 @@ def test_model_load_dump(
     optimizer_type: str,
     score_strategy: str,
     dist_type: str,
+    key_dtype: str,
     mode: str,
     save_path: str,
     optim: bool,
@@ -560,6 +593,11 @@ def test_model_load_dump(
             raise ValueError(
                 "batch_size * num_iterations * multi_hot_size > num_embedding, this may lead to eviction of dynamicemb and cause test fail"
             )
+    if batch_size % world_size != 0:
+        raise ValueError(
+            f"batch_size {batch_size} is not a multiple of the world size "
+            f"{world_size}, so some samples would reach no rank"
+        )
 
     optimizer_kwargs = get_optimizer_kwargs(optimizer_type)
     score_strategy_ = get_score_strategy(score_strategy)
@@ -590,6 +628,7 @@ def test_model_load_dump(
         num_iterations=num_iterations,
         score_strategy=score_strategy,
         scores_collection=expect_scores_collection,
+        key_dtype=getattr(torch, key_dtype),
     )
 
     asserted_ref_dist_type = False
