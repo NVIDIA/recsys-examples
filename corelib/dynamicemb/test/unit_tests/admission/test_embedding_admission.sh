@@ -9,7 +9,7 @@ ADMISSION=./test/unit_tests/admission
 TEST=$ADMISSION/test_embedding_admission.py
 
 # Cheap -- one of them needs a GPU, the other not even that -- so they run
-# first and fail before the 70 below.
+# first and fail before the 71 below.
 pytest -svv $ADMISSION/test_probabilistic_admission.py \
              $ADMISSION/test_admission_counter_deprecation.py || exit 1
 
