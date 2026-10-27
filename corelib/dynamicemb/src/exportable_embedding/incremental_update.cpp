@@ -168,7 +168,7 @@ void EmbeddingCollectionUpdateSubscriber::apply_incremental_load(
           if (keys.numel() > 0) {
             // CPU tensors, separate update context (stream key 0). NVE CPU
             // lookups use per-thread sentinel keys. Host update completes here;
-            // relaxed row access permits concurrent stale/mixed lookup results.
+            // stock non-atomic row copies leave overlapping reads experimental.
             layer->update(keys.numel(), reinterpret_cast<uintptr_t>(keys.data_ptr()),
                           reinterpret_cast<uintptr_t>(values.data_ptr()), 0);
           }

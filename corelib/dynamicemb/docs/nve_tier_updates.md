@@ -39,12 +39,13 @@ selection, snapshot retirement and demo synchronization remain unchanged.
 | Companion NVE change | Status |
 | --- | --- |
 | Binding overload exposing a selected tier | Replaced by this local adapter. |
-| Atomic Host row reads/writes | Still required for concurrent CPU Host updates; unchanged here. |
+| Atomic Host row reads/writes | Removed by the sixth commit; concurrent CPU Host updates now exercise stock non-atomic copies. |
 | Construction/export/reload | Previously unmodified NVE code. Local construction/reload is needed to select the new derived bindings. |
 
 Host uses its stock binding and original four-argument update method. The
-repository's NVE pin remains in place for the separate Host concurrency patch.
-This change alone does not make concurrent CPU Host updates safe on stock NVE.
+repository now pins official NVE 26.10 (`803e278`), with neither companion patch.
+Concurrent CPU Host updates remain available as an experiment, without a
+data-race safety guarantee; see [the rationale and experiment](host_cpu_update_concurrency.md).
 
 Validation: `tests/test_nve_tier_binding.py` checks tier isolation, GPU/UVM
 lookup/pooling, and fresh-process AOTI subscriber updates. The original
