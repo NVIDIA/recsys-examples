@@ -25,6 +25,7 @@
 #include "dynamicemb/exportable_embedding/indexer_directory.h"
 #if !defined(DYNAMICEMB_NVE_2605)
 #include "dynamicemb/exportable_embedding/incremental_update.h"
+#include "dynamicemb/exportable_embedding/nve_runtime.h"
 #endif
 #include "python/pynve/torch_bindings/nve_loader.hpp"
 
@@ -130,10 +131,11 @@ int main(int argc, char** argv) {
     const auto args = parse_arguments(argc, argv);
     c10::cuda::CUDAGuard guard(args.device);
 
-#if !defined(DYNAMICEMB_NVE_2605)
-    std::shared_ptr<nve::ResourceDirectory> nve_resources;
-#endif
+#if defined(DYNAMICEMB_NVE_2605)
     std::unique_ptr<nve::LayerDirectory> nve_layers;
+#else
+    std::unique_ptr<dynamicemb::exportable_embedding::NveRuntimeDirectory> nve_layers;
+#endif
     std::unique_ptr<dynamicemb::exportable_embedding::
                         EmbeddingCollectionIndexerDirectory>
         indexers;
@@ -146,9 +148,9 @@ int main(int argc, char** argv) {
 #else
     loader = std::make_unique<torch::inductor::AOTIModelPackageLoader>(
         args.package_dir + "/model.pt2", "model", false, 1, args.device);
-    nve_resources = std::make_shared<nve::ResourceDirectory>();
-    nve_layers = std::make_unique<nve::LayerDirectory>(
-        args.package_dir, *loader, args.device, nve_resources);
+    nve_layers = std::make_unique<dynamicemb::exportable_embedding::NveRuntimeDirectory>(
+        args.package_dir, args.device);
+    nve_layers->bind(*loader);
 #endif
 
     indexers = dynamicemb::exportable_embedding::
@@ -190,7 +192,7 @@ int main(int argc, char** argv) {
 #if !defined(DYNAMICEMB_NVE_2605)
     if (args.wait_for_updates) {
       dynamicemb::exportable_embedding::EmbeddingCollectionUpdateSubscriber
-          subscriber(args.package_dir, *indexers, *nve_layers, args.device);
+          subscriber(args.package_dir, *indexers, nve_layers->bindings(), args.device);
       std::vector<dynamicemb::exportable_embedding::EmbeddingCollectionUpdate>
           updates;
       int update_round = 0;

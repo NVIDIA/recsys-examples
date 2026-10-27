@@ -133,6 +133,7 @@ if(DYNAMICEMB_ENABLE_NVE_UPDATE AND (
 
     add_library(inference_emb_update SHARED
         src/exportable_embedding/incremental_update.cpp
+        src/exportable_embedding/nve_runtime.cu
     )
     set_source_files_properties(
         src/exportable_embedding/incremental_update.cpp
@@ -185,6 +186,7 @@ set(EXPORTABLE_EMBEDDING_PYBIND_SOURCES
 if(DYNAMICEMB_HAS_NVE_UPDATE)
     list(APPEND EXPORTABLE_EMBEDDING_PYBIND_SOURCES
         src/exportable_embedding/update_subscriber_pybind.cu
+        src/exportable_embedding/nve_tier_pybind.cu
     )
 else()
     list(APPEND EXPORTABLE_EMBEDDING_PYBIND_SOURCES

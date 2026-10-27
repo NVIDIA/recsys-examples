@@ -9,6 +9,7 @@ from typing import Any, Optional
 
 import torch
 
+from . import _C
 from .config import InferenceEmbeddingCollectionConfig
 from .indexer_directory import (
     dump_embedding_collection_indexers,
@@ -105,6 +106,14 @@ def create_nve_layer(
         kwargs["gpu_cache_size"] = config.gpu_cache_size
     if config.nve_layer_type == "hierarchical":
         kwargs["host_cache_size"] = config.host_cache_size
+    if (
+        imported_nve_generation() == (26, 10)
+        and config.nve_layer_type != "host"
+        and hasattr(_C, "register_nve_tier_bindings")
+    ):
+        from .nve_tier import TierNVEmbedding, TierNVEmbeddingBag
+
+        layer_class = TierNVEmbedding if pooling_mode == -1 else TierNVEmbeddingBag
     return layer_class(**kwargs)
 
 
@@ -151,10 +160,18 @@ def load_embedding_collection_aot(
             1,
             device.index if device.index is not None else torch.cuda.current_device(),
         )
-    else:
+    elif imported_nve_generation() == (26, 10) and hasattr(
+        _C, "register_nve_tier_bindings"
+    ):
+        from .nve_tier import load_tier_aot
+
+        loader, layers = load_tier_aot(package_dir, device)
+    elif imported_nve_generation() == (26, 10):
         from pynve.torch.nve_export import load_aot
 
         loader, layers = load_aot(package_dir, device=device)
+    else:
+        raise ValueError("Exportable collection replay supports NVE 26.05 or 26.10")
 
     indexers = load_embedding_collection_indexers(package_dir, device)
     indexers.bind_aoti(loader)

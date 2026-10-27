@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include "dynamicemb/exportable_embedding/incremental_update.h"
+#include "dynamicemb/exportable_embedding/nve_runtime.h"
 
 #include <c10/cuda/CUDAGuard.h>
 #include <nlohmann/json.hpp>
@@ -76,6 +77,8 @@ struct EmbeddingCollectionUpdateSubscriber::Impl {
         nve_layers[path] =
             layer_directory->get_layer(layer.at("id").get<int64_t>()).binding;
       }
+      TORCH_CHECK(host_rows.count(path) || has_nve_tier_update(nve_layers.at(path)),
+                  "Tier updates require DynamicEmb NVE bindings; use the DynamicEmb factory/loader");
     }
   }
 
@@ -167,7 +170,7 @@ void EmbeddingCollectionUpdateSubscriber::apply_incremental_load(
             // lookups use per-thread sentinel keys. Host update completes here;
             // relaxed row access permits concurrent stale/mixed lookup results.
             layer->update(keys.numel(), reinterpret_cast<uintptr_t>(keys.data_ptr()),
-                          reinterpret_cast<uintptr_t>(values.data_ptr()), 0, 0);
+                          reinterpret_cast<uintptr_t>(values.data_ptr()), 0);
           }
         });
     impl_->host_update_ids[update.collection_id] = update.snapshot_id;
@@ -209,9 +212,9 @@ void EmbeddingCollectionUpdateSubscriber::apply_incremental_load(
           const auto value = reinterpret_cast<uintptr_t>(
               value_data + index * row_size);
           if (impl_->has_host_cache.at(binding.nve_layer_module_path)) {
-            layer->update(1, key, value, 1, nve_stream);
+            update_nve_tier(layer, 1, key, value, 1, nve_stream);
           }
-          layer->update(1, key, value, 0, nve_stream);
+          update_nve_tier(layer, 1, key, value, 0, nve_stream);
         }
       });
 }

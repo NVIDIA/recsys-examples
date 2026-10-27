@@ -14,7 +14,10 @@ namespace py = pybind11;
 
 namespace dynamicemb::exportable_embedding {
 
+void bind_nve_tier_runtime(py::module_& module);
+
 void bind_update_subscriber(py::module_& module) {
+  bind_nve_tier_runtime(module);
   py::class_<EmbeddingCollectionUpdateSubscriber>(
       module, "EmbeddingCollectionUpdateSubscriber")
       .def(
