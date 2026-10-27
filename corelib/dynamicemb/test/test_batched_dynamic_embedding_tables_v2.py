@@ -2968,6 +2968,40 @@ def test_load_reads_legacy_checkpoint_without_value_layout_meta(tmp_path):
         torch.testing.assert_close(vals_src[order_src], vals_dst[order_dst])
 
 
+def test_load_warns_for_requested_tables_without_checkpoint_files(tmp_path):
+    """A requested table the checkpoint lacks loads nothing: say so.
+
+    "scope/table1" is the shape that once loaded empty with no word: the files
+    were there under another name, so only the warning tells the caller.
+    """
+    device = _init_single_rank_pg()
+    dims = [8, 16]
+
+    src = _make_dump_load_tables(dims, ["table0", "table1"], torch.float32)
+    _train_multi_table_bdeb_once(src, torch.int64, device)
+    save_dir = str(tmp_path)
+    src.dump(save_dir)
+
+    def missing_warnings(dst):
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            dst.load(save_dir)
+        return [
+            str(w.message)
+            for w in caught
+            if str(w.message).startswith("No checkpoint files")
+        ]
+
+    assert not missing_warnings(
+        _make_dump_load_tables(dims, ["table0", "table1"], torch.float32)
+    )
+
+    (message,) = missing_warnings(
+        _make_dump_load_tables(dims, ["table0", "scope/table1"], torch.float32)
+    )
+    assert "['scope/table1']" in message
+
+
 def _dtype_element_size(dtype: torch.dtype) -> int:
     return int(torch.empty(0, dtype=dtype).element_size())
 

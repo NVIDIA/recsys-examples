@@ -1642,6 +1642,7 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
             if os.path.isdir(save_dir)
             else None
         )
+        missing_table_names = []
         for table_id, table_name in enumerate(self._table_names):
             if table_name not in set(table_names):
                 continue
@@ -1663,6 +1664,7 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                 sorted_file_names=sorted_file_names,
             )
             if len(emb_key_files) == 0:
+                missing_table_names.append(table_name)
                 continue
 
             num_key_files = len(emb_key_files)
@@ -1703,6 +1705,15 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                     shard_index=rank,
                     num_shards=world_size,
                 )
+
+        # A requested table the checkpoint lacks loads nothing, which is easy
+        # to miss. Every shard sees the same files, so shard 0 speaks for all.
+        if missing_table_names and rank == 0:
+            warnings.warn(
+                f"No checkpoint files under {save_dir} for tables "
+                f"{missing_table_names}; they keep their current contents. Check "
+                "that their names match the dumped tables."
+            )
 
     def export_keys_values(
         self, table_name: str, device: torch.device, batch_size: int = 65536

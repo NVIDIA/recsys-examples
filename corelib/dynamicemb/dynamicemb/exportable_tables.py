@@ -461,6 +461,7 @@ class InferenceEmbeddingCollection(torch.nn.Module):
         weight.zero_()
 
         sorted_file_names = list_checkpoint_files(save_dir, requested_table_names)
+        missing_table_names = []
         for table_id, table_name in enumerate(self.table_names_):
             if table_name not in requested_table_names:
                 continue
@@ -491,7 +492,7 @@ class InferenceEmbeddingCollection(torch.nn.Module):
             )
 
             if len(emb_key_files) == 0:
-                print(f"[INFO] No checkpoint files found for table: {table_name}")
+                missing_table_names.append(table_name)
                 continue
 
             num_key_files = len(emb_key_files)
@@ -581,6 +582,13 @@ class InferenceEmbeddingCollection(torch.nn.Module):
                         abs_indices.to(torch.int64),
                         embeddings[valid_mask].to(weight.dtype),
                     )
+
+        if missing_table_names:
+            print(
+                f"[WARN] No checkpoint files under {save_dir} for tables "
+                f"{missing_table_names}; they are left empty. Check that their "
+                "names match the dumped tables."
+            )
 
     def forward(
         self,
