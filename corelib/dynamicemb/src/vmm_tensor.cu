@@ -78,6 +78,56 @@ namespace py = pybind11;
 
 namespace dyn_emb {
 
+namespace {
+
+// Waits until the GPU has finished all work queued on `device`.
+//
+// cudaFree waits like this before it frees memory, but cuMemUnmap and
+// cuMemRelease do not. The tensors that VMMTensor::data() returns do not own
+// the memory, so without this wait, dropping the last reference to a VMMTensor
+// would free the memory while kernels that use it still wait in a stream.
+// Those kernels would then read or write unmapped memory and fail with an
+// illegal memory access. The wait covers every stream of the device, because
+// DynamicEmb kernels run on whichever stream is current, and TorchRec
+// pipelines use several. PyTorch also waits for queued work before it unmaps
+// an expandable segment.
+//
+// Like any device sync, this also waits for queued collectives, such as NCCL
+// kernels. If a peer launches its side of one only after a host-side step (a
+// barrier, a store wait) that this rank reaches after the drop, the ranks
+// deadlock; finish pending collectives before dropping a table. A device sync
+// is not allowed during CUDA graph capture, so a drop during a capture breaks
+// that capture.
+//
+// ~VMMTensor() calls this, so it never throws. If the wait fails, for example
+// after a sticky error from an earlier kernel or during a graph capture, the
+// caller still frees the memory. It never creates a CUDA context: if the
+// device has no active primary context, as after CUDA has shut down at exit,
+// no work can be queued on it.
+void wait_for_device_work(int device) {
+  CUdevice device_handle;
+  unsigned int context_flags = 0;
+  int context_active = 0;
+  if (cuDeviceGet(&device_handle, device) != CUDA_SUCCESS ||
+      cuDevicePrimaryCtxGetState(device_handle, &context_flags,
+                                 &context_active) != CUDA_SUCCESS ||
+      !context_active) {
+    return;
+  }
+  CUcontext context = nullptr;
+  if (cuDevicePrimaryCtxRetain(&context, device_handle) != CUDA_SUCCESS) {
+    return;
+  }
+  // Push and pop leave the caller's current context and device as they were.
+  if (cuCtxPushCurrent(context) == CUDA_SUCCESS) {
+    cuCtxSynchronize();
+    cuCtxPopCurrent(&context);
+  }
+  cuDevicePrimaryCtxRelease(device_handle);
+}
+
+} // namespace
+
 class VMMTensor {
 
 public:
@@ -215,6 +265,8 @@ public:
   std::size_t allocated_bytes() const { return m_size; }
 
   ~VMMTensor() {
+    // Kernels queued before this free may still use the memory.
+    wait_for_device_work(device_);
     if (m_size > 0) {
       cuMemUnmap(m_addr, m_size);
     }
@@ -527,6 +579,10 @@ public:
 
     if (m_size > 0) {
       munlock(m_addr_h, m_reserved);
+      // cudaHostUnregister waits for the GPU work queued before it, so kernels
+      // that still use the memory finish before munmap() frees it. The CUDA
+      // docs do not promise this: it is measured driver behavior (CUDA 13.3),
+      // and the host cases of test_drop_waits_for_queued_gpu_work check it.
       // Best-effort: a destructor must never throw, so do not CUDA_CHECK here.
       // Clear the sticky error so it cannot surface in an unrelated check.
       cudaHostUnregister(m_addr_h);
