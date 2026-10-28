@@ -381,7 +381,9 @@ def test_backend_runs_the_fused_kernel_bit_identically(
 
     out = ExistingGRDecodeAttentionBackend(fused_beam_combine=True)(inputs)
     assert fused_launches
-    _assert_bit_identical(out, ExistingGRDecodeAttentionBackend()(inputs))
+    _assert_bit_identical(
+        out, ExistingGRDecodeAttentionBackend(fused_beam_combine=False)(inputs)
+    )
 
 
 @pytest.mark.parametrize("fused_beam_combine", [True, False])

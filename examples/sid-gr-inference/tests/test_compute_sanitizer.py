@@ -8,6 +8,10 @@ import sys
 from pathlib import Path
 
 import pytest
+from gr_inference.gr_kernels.attention import (
+    ExistingGRDecodeAttentionBackend,
+    MissingKernelBackend,
+)
 
 SANITIZED_TESTS = [
     "tests/test_fused_beam_decode_gpu.py::test_fused_beam_decode_is_bit_identical_to_the_public_three_kernel_path",
@@ -37,6 +41,11 @@ def test_cuda_kernel_tests_are_clean_under_compute_sanitizer(tool) -> None:
 
     if not torch.cuda.is_available():
         pytest.skip("CUDA is not available")
+    pytest.importorskip("cutlass")
+    try:
+        ExistingGRDecodeAttentionBackend().ensure_available()
+    except MissingKernelBackend as exc:
+        pytest.skip(str(exc))
 
     result = subprocess.run(
         [
