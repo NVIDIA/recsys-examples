@@ -142,12 +142,17 @@ class InferenceEmbeddingCollection(torch.nn.Module):
         if self.config_.nve_layer_type == "host":
             if feature_ids.device.type != "cpu" or table_ids.device.type != "cpu":
                 raise ValueError("HostLayer source IDs must be loaded on CPU")
-            if isinstance(self.indexer_, (FusedIdentityIndexer, IdentityIndexer)):
-                capacities = torch.tensor(
-                    self.table_capacities_, dtype=torch.int64, device="cpu"
-                )
-                if ((feature_ids < 0) | (feature_ids >= capacities[table_ids])).any():
-                    raise ValueError("Source key exceeds the table-local ID range")
+        if isinstance(self.indexer_, (FusedIdentityIndexer, IdentityIndexer)):
+            # Validate before adding fused offsets: an invalid local ID can
+            # otherwise overwrite another table's row, including its miss row.
+            # Both source loaders keep dense IDs on CPU to avoid a CUDA wait.
+            if feature_ids.device.type != "cpu" or table_ids.device.type != "cpu":
+                raise ValueError("Dense source IDs must be loaded on CPU")
+            capacities = torch.tensor(
+                self.table_capacities_, dtype=torch.int64, device="cpu"
+            )
+            if ((feature_ids < 0) | (feature_ids >= capacities[table_ids])).any():
+                raise ValueError("Source key exceeds the table-local ID range")
         storage_keys = self.indexer_.build_index(feature_ids, table_ids)
         if self.config_.nve_layer_type == "host":
             # CPU index_copy with repeated destinations need not pick the last row.
@@ -233,9 +238,16 @@ class InferenceEmbeddingCollection(torch.nn.Module):
                 source_offset += capacity
             self._finish_source_load()
             return
+        source_device = (
+            torch.device("cpu")
+            if isinstance(self.indexer_, (FusedIdentityIndexer, IdentityIndexer))
+            else self.device
+        )
         source_offset = 0
         for table_id, capacity in enumerate(self.table_capacities_):
-            feature_ids = torch.arange(capacity, dtype=torch.int64, device=self.device)
+            feature_ids = torch.arange(
+                capacity, dtype=torch.int64, device=source_device
+            )
             table_ids = torch.full_like(feature_ids, table_id)
             self._build_and_write_rows(
                 feature_ids,
@@ -256,6 +268,12 @@ class InferenceEmbeddingCollection(torch.nn.Module):
             raise RuntimeError(f"Save directory does not exist: {save_dir}")
 
         selected_names = set(self.table_names_ if table_names is None else table_names)
+        source_device = (
+            torch.device("cpu")
+            if self.config_.nve_layer_type == "host"
+            or isinstance(self.indexer_, (FusedIdentityIndexer, IdentityIndexer))
+            else self.device
+        )
         self._begin_source_load()
         sorted_file_names = list_checkpoint_files(save_dir, selected_names)
         missing_table_names = []
@@ -313,11 +331,7 @@ class InferenceEmbeddingCollection(torch.nn.Module):
                     None,
                     self.emb_dim_,
                     0,
-                    (
-                        torch.device("cpu")
-                        if self.config_.nve_layer_type == "host"
-                        else self.device
-                    ),
+                    source_device,
                     dist_type=meta_data.get("dist_type", "roundrobin"),
                     emb_dtype=emb_dtype,
                     opt_state_dtype=opt_state_dtype,
