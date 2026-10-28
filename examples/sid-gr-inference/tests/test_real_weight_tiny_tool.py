@@ -283,6 +283,30 @@ def test_real_weight_serving_real_backend_allows_single_request_batch(
     assert isinstance(backend, FakeExistingBackend)
 
 
+@pytest.mark.parametrize("no_fused_beam_combine", [False, True])
+def test_real_weight_serving_real_backend_fuses_beam_combine_unless_disabled(
+    monkeypatch, no_fused_beam_combine
+) -> None:
+    class FakeExistingBackend:
+        def __init__(self, *, fused_beam_combine=True):
+            self.fused_beam_combine = fused_beam_combine
+
+    import run_qwen3_real_weight_serving
+
+    monkeypatch.setattr(
+        run_qwen3_real_weight_serving,
+        "ExistingGRDecodeAttentionBackend",
+        FakeExistingBackend,
+    )
+
+    backend = run_qwen3_real_weight_serving.make_decode_backend(
+        real_serving_args(no_fused_beam_combine=no_fused_beam_combine),
+        device="cuda",
+    )
+
+    assert backend.fused_beam_combine is not no_fused_beam_combine
+
+
 def test_real_weight_serving_median_helper() -> None:
     from run_qwen3_real_weight_serving import _median
 

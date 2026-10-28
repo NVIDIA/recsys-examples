@@ -146,6 +146,8 @@ def make_decode_backend(args, device: str):
         raise RuntimeError("--decode-backend real requires CUDA")
     if not args.batched_decode:
         raise RuntimeError("--decode-backend real currently requires --batched-decode")
+    if getattr(args, "no_fused_beam_combine", False):
+        return ExistingGRDecodeAttentionBackend(fused_beam_combine=False)
     return ExistingGRDecodeAttentionBackend()
 
 
@@ -966,6 +968,14 @@ def main() -> None:
         help="With staggered arrivals, submit this many requests per arrival tick",
     )
     parser.add_argument("--decode-backend", choices=["fake", "real"], default="fake")
+    parser.add_argument(
+        "--no-fused-beam-combine",
+        action="store_true",
+        help=(
+            "With --decode-backend real on SM10x, keep the separate beam "
+            "attention and combine kernels instead of the fused kernel."
+        ),
+    )
     parser.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto")
     parser.add_argument("--warmup-runs", type=int, default=0)
     parser.add_argument("--repeat", type=int, default=1)
