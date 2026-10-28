@@ -712,6 +712,7 @@ _CUDA_SOURCE = r"""
 #include <ATen/ATen.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAException.h>
+#include <c10/cuda/CUDAGuard.h>
 #include <algorithm>
 #include <cstdlib>
 #include <cublas_v2.h>
@@ -1555,6 +1556,9 @@ bool write_beam_kv_step_cuda_launcher(
     bool vectorized_only) {
   TORCH_CHECK(beam_key.is_cuda() && beam_value.is_cuda(), "BeamKV tensors must be CUDA tensors");
   TORCH_CHECK(k.is_cuda() && v.is_cuda(), "k/v tensors must be CUDA tensors");
+  TORCH_CHECK(
+      beam_value.device() == beam_key.device() && k.device() == beam_key.device() && v.device() == beam_key.device(),
+      "BeamKV and k/v tensors must be on the same device");
   TORCH_CHECK(beam_key.dim() == 6 && beam_value.dim() == 6, "BeamKV tensors must be [L,B,S,W,H,D]");
   TORCH_CHECK(k.dim() == 4 && v.dim() == 4, "k/v must be [B,W,H,D]");
   TORCH_CHECK(beam_key.scalar_type() == beam_value.scalar_type(), "BeamKV dtypes must match");
@@ -1579,6 +1583,7 @@ bool write_beam_kv_step_cuda_launcher(
   if (elements == 0) {
     return false;
   }
+  const at::cuda::OptionalCUDAGuard device_guard(beam_key.device());
   if (launch_write_beam_kv_step_vec(beam_key, beam_value, k, v, layer_idx, step, active_beam_width)) {
     return true;
   }

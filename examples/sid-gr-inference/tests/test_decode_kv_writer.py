@@ -289,3 +289,50 @@ def test_cuda_beam_kv_write_vectorized_only_writes_nothing_it_cannot_vectorize()
     assert not written
     assert torch.equal(beam_k, before_k)
     assert torch.equal(beam_v, before_v)
+
+
+@pytest.mark.parametrize(
+    ("layout", "cuda_write"), [("aligned", None), ("unaligned_rows", "1")]
+)
+@pytest.mark.parametrize(("step_device", "cuda_writes"), [(1, 1), (0, 0)])
+def test_cuda_beam_kv_write_runs_on_the_tensors_device(
+    monkeypatch: pytest.MonkeyPatch, layout, cuda_write, step_device, cuda_writes
+) -> None:
+    if importlib.util.find_spec("torch") is None:
+        pytest.skip("torch is not installed")
+
+    import torch
+
+    if torch.cuda.device_count() < 2:
+        pytest.skip("needs 2 GPUs")
+
+    if cuda_write is None:
+        monkeypatch.delenv("GR_INFERENCE_GR_TRTLLM_BEAM_KV_WRITE_JIT", raising=False)
+    else:
+        monkeypatch.setenv("GR_INFERENCE_GR_TRTLLM_BEAM_KV_WRITE_JIT", cuda_write)
+    monkeypatch.delenv("GR_INFERENCE_TRTLLM_BEAM_KV_WRITE_VECTORIZE", raising=False)
+
+    from gr_inference_trtllm_kernels import qwen3
+
+    if qwen3._cuda_extension() is None:
+        pytest.skip("gr_trtllm CUDA extension is not available")
+
+    with torch.cuda.device(1):
+        beam_k = _cuda_tensor(torch, (2, 2, 3, 4, 2, 16), torch.bfloat16, layout)
+        beam_v = _cuda_tensor(torch, (2, 2, 3, 4, 2, 16), torch.bfloat16, layout)
+    with torch.cuda.device(step_device):
+        k_step = _cuda_tensor(torch, (2, 3, 2, 16), torch.bfloat16, layout)
+        v_step = _cuda_tensor(torch, (2, 3, 2, 16), torch.bfloat16, layout)
+    expected_k, expected_v = beam_k.clone(), beam_v.clone()
+    expected_k[1, :, 2, :3] = k_step
+    expected_v[1, :, 2, :3] = v_step
+
+    qwen3.reset_call_counts()
+    BeamKVWriter(BeamKV(beam_k, beam_v)).write_layer_step(
+        layer_idx=1, step=2, active_beam_width=3, k=k_step, v=v_step
+    )
+    torch.cuda.synchronize(1)
+
+    assert qwen3.call_counts().get("beam_kv_write_cuda", 0) == cuda_writes
+    assert torch.equal(beam_k, expected_k)
+    assert torch.equal(beam_v, expected_v)
