@@ -525,8 +525,11 @@ def test_qwen3_qk_norm_rope_defaults_to_trtllm_aligned_only_on_sm10x_bf16(
     reset_default_kernel_selection_policy()
     monkeypatch.setattr(qwen3_layers, "_is_cuda_tensor", lambda _tensor: True)
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda _d: (major, 0))
+    builds = []
     monkeypatch.setattr(
-        qwen3_layers, "_trtllm_qk_norm_rope_cuda_usable", lambda: usable
+        qwen3_layers,
+        "_trtllm_qk_norm_rope_cuda_usable",
+        lambda: builds.append(1) or usable,
     )
     q = torch.empty(1, 1, heads[0], head_dim, dtype=getattr(torch, dtype))
     k = torch.empty(1, 1, heads[1], head_dim, dtype=getattr(torch, dtype))
@@ -537,3 +540,4 @@ def test_qwen3_qk_norm_rope_defaults_to_trtllm_aligned_only_on_sm10x_bf16(
     finally:
         reset_default_kernel_selection_policy()
     assert selected == (expected or unchanged)
+    assert not (builds and major != 10)

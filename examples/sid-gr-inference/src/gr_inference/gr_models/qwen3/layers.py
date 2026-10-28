@@ -1612,8 +1612,8 @@ def _qk_norm_rope_backend(q, k) -> str | None:
         and q.dtype == torch.bfloat16
         and q.shape[-1] == 128
         and 24 <= q.shape[-2] + k.shape[-2] <= 32
-        and _trtllm_qk_norm_rope_cuda_usable()
         and torch.cuda.get_device_capability(q.device)[0] == 10
+        and _trtllm_qk_norm_rope_cuda_usable()
     ):
         return "trtllm_aligned"
     return _selected_kernel_backend(CAP_QK_NORM_ROPE)
