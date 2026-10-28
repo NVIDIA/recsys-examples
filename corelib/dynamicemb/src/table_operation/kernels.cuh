@@ -790,7 +790,12 @@ __global__ void table_erase_kernel(
     if (found) {
       KeyType expected_key = key;
       if (bucket.try_lock(iter, expected_key)) {
-        *bucket.scores(iter) = ScoreType();
+        // Clear the whole (AoS-contiguous) score block, not just word 0:
+        // reduce_ranked() ranks a reclaimed slot by its words, so a stale
+        // LruLfu frequency would make the free slot lose to live keys.
+        ScoreType *sblk = bucket.scores(iter);
+        for (int64_t s = 0; s < bucket.num_scores(); ++s)
+          sblk[s] = ScoreType();
         *bucket.digests(iter) = Bucket::empty_digest();
 
         bucket.unlock(iter, Bucket::reclaimed_key());

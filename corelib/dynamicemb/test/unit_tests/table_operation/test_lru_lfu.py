@@ -872,8 +872,8 @@ def test_lru_lfu_plain_insert_evicts_via_cubin(current_device):
 
 def test_lru_lfu_insert_after_erase_no_phantom_frequency(current_device):
     """A new key taking over a slot reclaimed by erase() must start with a clean
-    score block. erase() resets word 0 only; word 1 (frequency) stays stale, and
-    the Reclaim branch must clear it before Policy::update() accumulates."""
+    score block. Covers the Reclaim branch of insert(), which clears the block
+    before Policy::update() accumulates, independently of what erase() left."""
     device = torch.cuda.current_device()
     bc = 128
     table = _lru_lfu_table(bc, bucket_capacity=bc)  # single bucket
@@ -908,3 +908,67 @@ def test_lru_lfu_insert_after_erase_no_phantom_frequency(current_device):
         f"phantom frequency: insert returned frequency "
         f"{int(new_score_out[0].item())}, expected 1"
     )
+
+
+def test_lru_lfu_erase_reclaimed_slot_is_reused_before_evicting_live_keys(
+    current_device,
+):
+    """erase() must clear every score word of the reclaimed slot. reduce_ranked()
+    ranks reclaimed slots by (frequency, timestamp) like live keys, so a stale
+    high frequency in word 1 makes the free slot lose to live frequency-1 keys:
+    the next insert evicts a live key while the free slot stays unused."""
+    device = torch.cuda.current_device()
+    bc = 128
+    table = _lru_lfu_table(bc, bucket_capacity=bc)  # single bucket
+
+    # Fill the bucket completely at frequency 1.
+    keys = torch.arange(1, 1 + bc, dtype=torch.int64, device=device)
+    tids = torch.zeros(bc, dtype=torch.int64, device=device)
+    ones = torch.ones(bc, dtype=torch.uint64, device=device)
+    _insert(table, keys, tids, ones)
+
+    # Make key 1 hot (frequency 5), then erase it: its slot is reclaimed and
+    # would keep frequency 5 in word 1 if erase() only reset word 0.
+    table.lookup(
+        keys[:1],
+        tids[:1],
+        ScoreArg(
+            name="frequency",
+            value=torch.full((1,), 4, dtype=torch.uint64, device=device),
+            policy=ScorePolicy.LRU_LFU,
+        ),
+    )
+    table.erase(keys[:1], tids[:1])
+    torch.cuda.synchronize()
+    assert table.size() == bc - 1
+
+    # One new frequency-1 key must take the reclaimed slot, not evict a live key.
+    new_key = torch.tensor([1_000_000], dtype=torch.int64, device=device)
+    new_tid = torch.tensor([0], dtype=torch.int64, device=device)
+    ir = torch.empty(1, dtype=table.result_type, device=device).fill_(
+        InsertResult.INIT.value
+    )
+    new_idx, num_evicted, evicted_keys, _, _, _ = table.insert_and_evict(
+        new_key,
+        new_tid,
+        ScoreArg(name="frequency", value=ones[:1], policy=ScorePolicy.LRU_LFU),
+        ir,
+    )
+    torch.cuda.synchronize()
+
+    assert int(num_evicted) == 0, (
+        f"insert into a bucket with a reclaimed slot evicted live key(s) "
+        f"{evicted_keys[:num_evicted].tolist()}"
+    )
+    assert table.size() == bc
+
+    _, founds, _ = table.lookup(
+        keys[1:],
+        tids[1:],
+        ScoreArg(name="frequency", value=None, policy=ScorePolicy.CONST),
+    )
+    assert torch.all(founds), "live keys must survive an insert into a free slot"
+
+    blocks = table.gather_score_blocks(0, new_idx)
+    assert int(blocks[0, 0].item()) != 0, "new key must carry a fresh timestamp"
+    assert int(blocks[0, 1].item()) == 1, "new key frequency must be its own delta"
