@@ -108,7 +108,8 @@ def _try_cuda_beam_kv_write(
 ) -> bool:
     import os
 
-    if os.environ.get("GR_INFERENCE_GR_TRTLLM_BEAM_KV_WRITE_JIT", "0") != "1":
+    setting = os.environ.get("GR_INFERENCE_GR_TRTLLM_BEAM_KV_WRITE_JIT")
+    if setting not in (None, "1"):
         return False
     try:
         from gr_inference_trtllm_kernels.qwen3 import write_beam_kv_step
@@ -122,4 +123,5 @@ def _try_cuda_beam_kv_write(
         layer_idx=layer_idx,
         step=step,
         active_beam_width=active_beam_width,
+        vectorized_only=setting is None,
     )
