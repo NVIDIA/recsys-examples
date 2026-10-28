@@ -111,3 +111,26 @@ def test_expansion_target_honors_max_load_factor(score_strategy):
     state.key_index_map.insert(keys, table_ids, score)
     _, found, _ = state.key_index_map.lookup(keys, table_ids, score)
     assert int(found.sum()) == n_keys
+
+
+def test_no_eviction_expansion_target_honors_max_load_factor():
+    """NO_EVICTION sizes to max_load_factor and is not capped by max_capacity."""
+    device = torch.device("cuda", torch.cuda.current_device())
+    option = DynamicEmbTableOptions(
+        dim=16,
+        init_capacity=1024,
+        max_capacity=4096,
+        bucket_capacity=128,
+        max_load_factor=0.5,
+        index_type=torch.int64,
+        embedding_dtype=torch.float32,
+        device_id=device.index,
+        score_strategy=DynamicEmbScoreStrategy.NO_EVICTION,
+        local_hbm_for_values=0,
+    )
+    state = create_table_state([option], AdamDynamicEmbeddingOptimizer(OptimizerArgs()))
+    n_keys = 50_000
+    flags, targets = get_expand_info(state, torch.tensor([0]), torch.tensor([n_keys]))
+    assert flags == [True]
+    assert targets[0] >= n_keys / option.max_load_factor
+    assert targets[0] > option.max_capacity
