@@ -55,6 +55,7 @@ struct PendingSnapshot {
 
 struct RegistryEntry {
   std::shared_ptr<IndexerSnapshot> current;
+  std::weak_ptr<IndexerRegistration> registration;
   int64_t marker_value{0};
   std::atomic<PendingSnapshot*> pending{nullptr};
   std::mutex updates_mutex;
@@ -64,6 +65,21 @@ struct RegistryEntry {
 std::mutex registry_mutex;
 std::unordered_map<const void*, std::shared_ptr<RegistryEntry>> registry;
 std::unordered_map<int64_t, std::shared_ptr<RegistryEntry>> registry_by_value;
+
+// Caller holds registry_mutex. Keep the entry alive while removing its aliases.
+void erase_registry_entry(std::shared_ptr<RegistryEntry> entry) {
+  for (auto iterator = registry.begin(); iterator != registry.end();) {
+    if (iterator->second == entry) {
+      iterator = registry.erase(iterator);
+    } else {
+      ++iterator;
+    }
+  }
+  const auto value_entry = registry_by_value.find(entry->marker_value);
+  if (value_entry != registry_by_value.end() && value_entry->second == entry) {
+    registry_by_value.erase(value_entry);
+  }
+}
 
 struct CachedRegistryEntry {
   int64_t marker_value;
@@ -126,6 +142,31 @@ at::Tensor read_tensor(std::ifstream& stream, uint64_t count,
 }
 
 }  // namespace
+
+IndexerRegistration::IndexerRegistration(const at::Tensor& marker)
+    : marker_(marker) {}
+
+IndexerRegistration::~IndexerRegistration() {
+  std::lock_guard<std::mutex> lock(registry_mutex);
+  const auto found = registry.find(marker_.data_ptr());
+  // A new owner can be acquired while this last owner's destructor waits for
+  // the mutex. Leave that registration alive if ownership has been renewed.
+  if (found != registry.end() && found->second->registration.expired()) {
+    erase_registry_entry(found->second);
+  }
+}
+
+std::shared_ptr<IndexerRegistration> retain_indexer_registration(
+    const at::Tensor& marker) {
+  std::lock_guard<std::mutex> lock(registry_mutex);
+  auto entry = registry.at(marker.data_ptr());
+  auto owner = entry->registration.lock();
+  if (!owner) {
+    owner = std::shared_ptr<IndexerRegistration>(new IndexerRegistration(marker));
+    entry->registration = owner;
+  }
+  return owner;
+}
 
 bool register_from_tensors(
     const at::Tensor& marker, int64_t kind, const at::Tensor& table_storage,
@@ -198,17 +239,7 @@ void unregister_indexer_snapshot(const at::Tensor& marker) {
     return;
   }
   const auto entry = found->second;
-  for (auto iterator = registry.begin(); iterator != registry.end();) {
-    if (iterator->second == entry) {
-      iterator = registry.erase(iterator);
-    } else {
-      ++iterator;
-    }
-  }
-  const auto value_entry = registry_by_value.find(entry->marker_value);
-  if (value_entry != registry_by_value.end() && value_entry->second == entry) {
-    registry_by_value.erase(value_entry);
-  }
+  erase_registry_entry(entry);
 }
 
 void stage_indexer_snapshot(const at::Tensor& marker,

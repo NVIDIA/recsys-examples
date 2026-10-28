@@ -34,6 +34,21 @@ struct IndexerSnapshot {
   int64_t next_fused_key{0};
 };
 
+// The indexer and directories share this owner; the registry holds it weakly.
+class DYNAMICEMB_EXPORT IndexerRegistration {
+ public:
+  ~IndexerRegistration();
+
+ private:
+  explicit IndexerRegistration(const at::Tensor& marker);
+  friend std::shared_ptr<IndexerRegistration> retain_indexer_registration(
+      const at::Tensor& marker);
+  at::Tensor marker_;
+};
+
+DYNAMICEMB_EXPORT std::shared_ptr<IndexerRegistration>
+retain_indexer_registration(const at::Tensor& marker);
+
 DYNAMICEMB_EXPORT std::shared_ptr<IndexerSnapshot> load_indexer_snapshot(
     const std::string& path, int device_index);
 

@@ -6,6 +6,7 @@ from abc import ABC, abstractmethod
 from typing import Optional, Sequence
 
 import torch
+from . import _C
 from .config import (
     EmbeddingCollectionIndexerType,
     InferenceEmbeddingCollectionConfig,
@@ -21,7 +22,7 @@ def _empty_i64(device: torch.device) -> torch.Tensor:
     return torch.empty(0, dtype=torch.int64, device=device)
 
 
-def _publish_native(marker: torch.Tensor, snapshot: IndexerSnapshot) -> None:
+def _publish_native(marker: torch.Tensor, snapshot: IndexerSnapshot) -> object:
     torch.ops.INFERENCE_EMB.register_embedding_collection_indexer(
         marker,
         int(snapshot.kind),
@@ -33,6 +34,7 @@ def _publish_native(marker: torch.Tensor, snapshot: IndexerSnapshot) -> None:
         snapshot.reserved_sizes,
         snapshot.next_fused_key,
     )
+    return _C._retain_indexer_registration(marker)
 
 
 class EmbeddingCollectionIndexerBase(torch.nn.Module, ABC):
@@ -156,7 +158,9 @@ class LinearHashMapIndexer(EmbeddingCollectionIndexerBase):
             )
         self._failed_candidates: set[tuple[int, int]] = set()
         if self.state_sidecar:
-            _publish_native(self.marker_tensor, self._snapshot)
+            self._registration_owner = _publish_native(
+                self.marker_tensor, self._snapshot
+            )
 
     @property
     def nve_num_embeddings(self) -> int:
@@ -271,7 +275,9 @@ class LinearHashMapIndexer(EmbeddingCollectionIndexerBase):
         if self._cpu_build:
             self._snapshot = self._snapshot.to(self.marker_tensor.device)
             if self.state_sidecar:
-                _publish_native(self.marker_tensor, self._snapshot)
+                self._registration_owner = _publish_native(
+                    self.marker_tensor, self._snapshot
+                )
             else:
                 self.table_storage_ = self._snapshot.table_storage
                 self.table_bucket_offsets_ = self._snapshot.table_bucket_offsets
@@ -303,7 +309,9 @@ class LinearHashMapIndexer(EmbeddingCollectionIndexerBase):
             }
         self._failed_candidates.clear()
         if self.state_sidecar:
-            _publish_native(self.marker_tensor, self._snapshot)
+            self._registration_owner = _publish_native(
+                self.marker_tensor, self._snapshot
+            )
         self._build_table = None
 
     def forward(
@@ -380,7 +388,9 @@ class FusedIdentityIndexer(EmbeddingCollectionIndexerBase):
             next_fused_key=next_row,
         )
         if self.state_sidecar:
-            _publish_native(self.marker_tensor, self._snapshot)
+            self._registration_owner = _publish_native(
+                self.marker_tensor, self._snapshot
+            )
         else:
             self.register_buffer("valid_bases_", self._snapshot.valid_bases)
             self.register_buffer("reserved_sizes_", self._snapshot.reserved_sizes)

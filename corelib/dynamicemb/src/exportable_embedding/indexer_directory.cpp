@@ -36,7 +36,7 @@ struct EmbeddingCollectionIndexerDirectory::Impl {
   std::unordered_map<std::string, at::Tensor> markers;
   std::unordered_map<std::string, std::shared_ptr<IndexerSnapshot>> snapshots;
   std::unordered_set<std::string> pending_retirements;
-  bool owns_native_registrations{false};
+  std::vector<std::shared_ptr<IndexerRegistration>> registrations;
 };
 
 EmbeddingCollectionIndexerDirectory::EmbeddingCollectionIndexerDirectory(
@@ -48,16 +48,8 @@ EmbeddingCollectionIndexerDirectory&
 EmbeddingCollectionIndexerDirectory::operator=(
     EmbeddingCollectionIndexerDirectory&&) noexcept = default;
 
-EmbeddingCollectionIndexerDirectory::~EmbeddingCollectionIndexerDirectory() {
-  if (!impl_) {
-    return;
-  }
-  if (impl_->owns_native_registrations) {
-    for (const auto& item : impl_->markers) {
-      unregister_indexer_snapshot(item.second);
-    }
-  }
-}
+EmbeddingCollectionIndexerDirectory::~EmbeddingCollectionIndexerDirectory() =
+    default;
 
 std::unique_ptr<EmbeddingCollectionIndexerDirectory>
 EmbeddingCollectionIndexerDirectory::create(
@@ -72,6 +64,8 @@ EmbeddingCollectionIndexerDirectory::create(
   impl->snapshots = std::move(snapshots);
   for (const auto& item : impl->snapshots) {
     register_indexer_snapshot(impl->markers.at(item.first), item.second);
+    impl->registrations.push_back(
+        retain_indexer_registration(impl->markers.at(item.first)));
   }
   return std::unique_ptr<EmbeddingCollectionIndexerDirectory>(
       new EmbeddingCollectionIndexerDirectory(std::move(impl)));
@@ -125,10 +119,10 @@ EmbeddingCollectionIndexerDirectory::load(const std::string& package_dir,
     auto snapshot = load_indexer_snapshot(
         root + "/" + binding.snapshot_path.value(), device_index);
     register_indexer_snapshot(marker, snapshot);
+    impl->registrations.push_back(retain_indexer_registration(marker));
     impl->markers.emplace(collection_id, std::move(marker));
     impl->snapshots.emplace(collection_id, std::move(snapshot));
   }
-  impl->owns_native_registrations = true;
   return std::unique_ptr<EmbeddingCollectionIndexerDirectory>(
       new EmbeddingCollectionIndexerDirectory(std::move(impl)));
 }
