@@ -12,6 +12,11 @@ namespace py = pybind11;
 namespace dynamicemb::exportable_embedding {
 
 void bind_indexer_snapshot(py::module_& module) {
+  py::class_<IndexerRegistration, std::shared_ptr<IndexerRegistration>>(
+      module, "_IndexerRegistration");
+  module.def("_retain_indexer_registration", &retain_indexer_registration,
+             py::arg("marker"));
+
   py::enum_<IndexerSnapshotKind>(module, "IndexerSnapshotKind")
       .value("LINEAR_HASH_MAP", IndexerSnapshotKind::LinearHashMap)
       .value("FUSED_IDENTITY", IndexerSnapshotKind::FusedIdentity);
