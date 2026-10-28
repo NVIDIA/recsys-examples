@@ -437,14 +437,14 @@ def checkpoint_table_capacities(
     table_sizes: Dict[str, int],
 ) -> Dict[str, int]:
     """Reserve every saved sparse row; training capacity estimates can be smaller."""
-    from dynamicemb.checkpoint_io import find_files
+    from dynamicemb.checkpoint_io import find_files, list_checkpoint_files
 
     directory = os.path.join(
         checkpoint_dir,
         "dynamicemb_module",
         "model._embedding_collection._model_parallel_embedding_collection",
     )
-    filenames = sorted(os.listdir(directory))
+    filenames = list_checkpoint_files(directory, collection_configs)
     capacities = dict(table_sizes)
     for name, config in collection_configs.items():
         if config.indexer_type != EmbeddingCollectionIndexerType.LINEAR_HASH_MAP:
