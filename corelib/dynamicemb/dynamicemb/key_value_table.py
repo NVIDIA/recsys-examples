@@ -2782,12 +2782,7 @@ class DynamicEmbStorage(Storage):
         unique_size_per_table = torch.zeros(
             self._state.num_tables, dtype=torch.int64, device=torch.device("cpu")
         )
-        unique_size_per_table[table_id] = max(
-            0,
-            params.num_keys
-            + self._state.estimated_table_sizes[table_id].item()
-            - self._state.tables[table_id].tensor().size(0),
-        )
+        unique_size_per_table[table_id] = params.num_keys
         self.expand_if_need(unique_size_per_table)
 
         device = torch.device(f"cuda:{torch.cuda.current_device()}")

@@ -18,6 +18,7 @@ DIM = 8
 BUCKET_CAPACITY = 128
 MAX_CAPACITY = 1 << 20
 MAX_LOAD_FACTOR = 0.5
+INIT_CAPACITY = 1024
 
 
 def _lfu_option(init_capacity):
@@ -47,7 +48,7 @@ def _lfu_storage(init_capacity):
 def test_expansion_target_respects_max_load_factor(n_new):
     """An expansion lands at or below max_load_factor, unless max_capacity caps it."""
     state = create_table_state(
-        [_lfu_option(init_capacity=1024)],
+        [_lfu_option(init_capacity=INIT_CAPACITY)],
         SGDDynamicEmbeddingOptimizer(OptimizerArgs()),
     )
     flags, targets = get_expand_info(state, torch.tensor([0]), torch.tensor([n_new]))
@@ -58,11 +59,12 @@ def test_expansion_target_respects_max_load_factor(n_new):
     assert target == MAX_CAPACITY or n_new / target <= MAX_LOAD_FACTOR
 
 
-def test_load_keeps_every_key_of_a_table_below_max_capacity(tmp_path):
+@pytest.mark.parametrize("n", [INIT_CAPACITY, 2 * INIT_CAPACITY, 200_000])
+def test_load_keeps_every_key_of_a_table_below_max_capacity(tmp_path, n):
     """load() expands a fresh table once to fit the whole checkpoint. Sized to just fit,
-    ~3.5% of the keys overflow their bucket and the lowest-score ones are dropped."""
+    ~3.5% of the keys overflow their bucket and the lowest-score ones are dropped;
+    checkpoints near init_capacity are the case where load() undercounted its keys."""
     device = torch.device("cuda", torch.cuda.current_device())
-    n = 200_000
     generator = torch.Generator().manual_seed(0)
     keys = torch.unique(torch.randint(1, 2**62, (2 * n,), generator=generator))[:n]
     keys = keys.to(device)
@@ -78,7 +80,7 @@ def test_load_keeps_every_key_of_a_table_below_max_capacity(tmp_path):
     paths = [f"{d}/meta.json", f"{d}/keys", f"{d}/emb", f"{d}/score", f"{d}/opt"]
     src.dump(0, *paths, include_optim=False)
 
-    dst = _lfu_storage(init_capacity=1024)
+    dst = _lfu_storage(init_capacity=INIT_CAPACITY)
     dst.load(0, *paths, include_optim=False)
     assert dst.size() == n, f"load dropped {n - dst.size()} of {n} keys"
     _, founds, _ = dst.key_index_map.lookup(
