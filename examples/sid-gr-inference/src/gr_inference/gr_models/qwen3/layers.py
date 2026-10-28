@@ -31,6 +31,7 @@ from gr_inference.gr_kernels.package_imports import (
     load_trtllm_kernel_registration as _load_trtllm_kernel_registration,
 )
 from gr_inference.gr_kernels.prefill import PrefillAttention
+from gr_inference.gr_kernels.selection import DEFAULT_CAPABILITY_ORDER
 from gr_inference.gr_kv import ContextKV
 from gr_inference.gr_models.qwen3.config import Qwen3GRConfig
 from gr_inference.gr_runtime.decode_kv import BeamKVWriter
@@ -234,7 +235,7 @@ if nn is not None:
             return q, k, v
 
         def qk_norm_rope(self, q, k, *, position_ids=None):
-            selected_backend = _selected_kernel_backend(CAP_QK_NORM_ROPE)
+            selected_backend = _qk_norm_rope_backend(q, k)
             qk_phase = "decode" if position_ids is not None else "prefill"
             fused_qk_norm_rope = (
                 _trtllm_fused_qk_norm_rope()
@@ -1583,6 +1584,28 @@ def _is_cuda_tensor(tensor) -> bool:
 def _selected_kernel_backend(capability: str) -> str | None:
     backend = default_kernel_selection_policy().select(capability)
     return backend.name if backend is not None else None
+
+
+def _qk_norm_rope_backend(q, k) -> str | None:
+    policy = default_kernel_selection_policy()
+    default_order = (
+        policy.capability_order.get(CAP_QK_NORM_ROPE)
+        == DEFAULT_CAPABILITY_ORDER[CAP_QK_NORM_ROPE]
+    )
+    chosen = CAP_QK_NORM_ROPE in policy.overrides or (
+        policy.profile is not None and CAP_QK_NORM_ROPE in policy.profile.selected
+    )
+    if (
+        default_order
+        and not chosen
+        and _is_cuda_tensor(q)
+        and q.dtype == torch.bfloat16
+        and q.shape[-1] == 128
+        and 24 <= q.shape[-2] + k.shape[-2] <= 32
+        and torch.cuda.get_device_capability(q.device)[0] == 10
+    ):
+        return "trtllm_aligned"
+    return _selected_kernel_backend(CAP_QK_NORM_ROPE)
 
 
 def flashinfer_call_counts() -> dict[str, int]:
