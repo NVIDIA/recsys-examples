@@ -795,7 +795,9 @@ def get_expand_info(
         target_capacities[i] is the desired new key_index_map capacity for table i (or -1 if not expanding).
 
     Expansion uses ``max_load_factor`` for both NO_EVICTION and other strategies:
-    expand when ``(current_size + n_new) / KIM_cap > max_load_factor`` (and ``max_lf > 0``).
+    expand when ``(current_size + n_new) / KIM_cap > max_load_factor`` (and ``max_lf > 0``),
+    to at least ``(current_size + n_new) / max_load_factor`` so the inserted keys fit at
+    ``max_load_factor``.
     NO_EVICTION does **not** apply ``max_capacity`` as an upper bound; other strategies still cap
     the target with ``max_capacity`` when it is set.
     """
@@ -828,7 +830,9 @@ def get_expand_info(
                 results[table_id] = True
                 target_capacities[table_id] = max(
                     cap * 2,
-                    align_to_table_size(new_total, opt.bucket_capacity),
+                    align_to_table_size(
+                        math.ceil(new_total / max_lf), opt.bucket_capacity
+                    ),
                 )
         else:
             max_cap = opt.max_capacity
@@ -838,7 +842,12 @@ def get_expand_info(
                 results[table_id] = True
                 target_capacities[table_id] = min(
                     max_cap,
-                    max(cap * 2, align_to_table_size(new_total, opt.bucket_capacity)),
+                    max(
+                        cap * 2,
+                        align_to_table_size(
+                            math.ceil(new_total / max_lf), opt.bucket_capacity
+                        ),
+                    ),
                 )
     return results, target_capacities
 

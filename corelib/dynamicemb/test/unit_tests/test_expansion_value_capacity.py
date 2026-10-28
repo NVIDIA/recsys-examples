@@ -70,3 +70,44 @@ def test_expansion_value_capacity(on_host, max_capacity, score_strategy):
     tail_value = torch.full((1, 384), 3.25, device=device)
     store_to_flat_single_table(state, tail, 0, tail_value)
     torch.testing.assert_close(load_from_flat_single_table(state, tail, 0), tail_value)
+
+
+@pytest.mark.parametrize(
+    "score_strategy",
+    [DynamicEmbScoreStrategy.TIMESTAMP, DynamicEmbScoreStrategy.STEP],
+)
+def test_expansion_target_honors_max_load_factor(score_strategy):
+    """A batch larger than the table (e.g. a checkpoint file) must land at max_load_factor, not ~1.0."""
+    device = torch.device("cuda", torch.cuda.current_device())
+    option = DynamicEmbTableOptions(
+        dim=16,
+        init_capacity=1024,
+        max_capacity=1 << 20,
+        bucket_capacity=128,
+        max_load_factor=0.5,
+        index_type=torch.int64,
+        embedding_dtype=torch.float32,
+        device_id=device.index,
+        score_strategy=score_strategy,
+        local_hbm_for_values=0,
+    )
+    state = create_table_state([option], AdamDynamicEmbeddingOptimizer(OptimizerArgs()))
+    n_keys = 50_000
+    flags, targets = get_expand_info(state, torch.tensor([0]), torch.tensor([n_keys]))
+    assert flags == [True]
+    assert targets[0] >= n_keys / option.max_load_factor
+    _expand_tables_impl(state, flags, targets)
+
+    generator = torch.Generator(device=device).manual_seed(0)
+    keys = torch.unique(
+        torch.randint(0, 1 << 62, (2 * n_keys,), device=device, generator=generator)
+    )[:n_keys]
+    table_ids = torch.zeros_like(keys)
+    score = ScoreArg(
+        name=state.score_policy.name,
+        value=torch.ones_like(keys, dtype=torch.uint64),
+        policy=ScorePolicy.ASSIGN,
+    )
+    state.key_index_map.insert(keys, table_ids, score)
+    _, found, _ = state.key_index_map.lookup(keys, table_ids, score)
+    assert int(found.sum()) == n_keys
