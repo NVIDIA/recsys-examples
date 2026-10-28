@@ -224,6 +224,8 @@ def test_cuda_fast_qk_norm_rope_matches_the_per_head_kernel(
 
 def test_cuda_fast_qk_norm_rope_declines_more_elements_than_int32_indexes() -> None:
     torch, qwen3 = _qwen3_kernels()
+    if torch.cuda.mem_get_info()[0] < 6 * 2**30:
+        pytest.skip("needs 6 GiB of free GPU memory")
 
     tokens = 2**31 // 256 + 1
     qkv = torch.zeros(tokens, 256, device="cuda", dtype=torch.bfloat16)

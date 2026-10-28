@@ -477,28 +477,38 @@ def test_torch_qwen3_layer_ops_loads_logical_weights() -> None:
 
 
 @pytest.mark.parametrize(
-    "env, dtype, head_dim, heads, major, expected",
+    "env, dtype, head_dim, heads, major, usable, expected",
     [
-        ({}, "bfloat16", 128, (28, 4), 10, "trtllm_aligned"),
-        ({}, "bfloat16", 128, (28, 4), 9, None),
-        ({}, "float16", 128, (28, 4), 10, None),
-        ({}, "bfloat16", 64, (28, 4), 10, None),
-        ({}, "bfloat16", 128, (16, 8), 10, "trtllm_aligned"),
-        ({}, "bfloat16", 128, (28, 8), 10, None),
-        ({}, "bfloat16", 128, (16, 2), 10, None),
+        ({}, "bfloat16", 128, (28, 4), 10, True, "trtllm_aligned"),
+        ({}, "bfloat16", 128, (28, 4), 9, True, None),
+        ({}, "float16", 128, (28, 4), 10, True, None),
+        ({}, "bfloat16", 64, (28, 4), 10, True, None),
+        ({}, "bfloat16", 128, (16, 8), 10, True, "trtllm_aligned"),
+        ({}, "bfloat16", 128, (28, 8), 10, True, None),
+        ({}, "bfloat16", 128, (16, 2), 10, True, None),
+        ({}, "bfloat16", 128, (28, 4), 10, False, None),
         (
             {"GR_INFERENCE_KERNEL_QK_NORM_ROPE": "flashinfer"},
             "bfloat16",
             128,
             (28, 4),
             10,
+            True,
             None,
         ),
-        ({"GR_INFERENCE_KERNEL_PRESET": "torch"}, "bfloat16", 128, (28, 4), 10, None),
+        (
+            {"GR_INFERENCE_KERNEL_PRESET": "torch"},
+            "bfloat16",
+            128,
+            (28, 4),
+            10,
+            True,
+            None,
+        ),
     ],
 )
 def test_qwen3_qk_norm_rope_defaults_to_trtllm_aligned_only_on_sm10x_bf16(
-    monkeypatch, env, dtype, head_dim, heads, major, expected
+    monkeypatch, env, dtype, head_dim, heads, major, usable, expected
 ) -> None:
     if importlib.util.find_spec("torch") is None:
         pytest.skip("torch is not installed")
@@ -515,6 +525,9 @@ def test_qwen3_qk_norm_rope_defaults_to_trtllm_aligned_only_on_sm10x_bf16(
     reset_default_kernel_selection_policy()
     monkeypatch.setattr(qwen3_layers, "_is_cuda_tensor", lambda _tensor: True)
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda _d: (major, 0))
+    monkeypatch.setattr(
+        qwen3_layers, "_trtllm_qk_norm_rope_cuda_usable", lambda: usable
+    )
     q = torch.empty(1, 1, heads[0], head_dim, dtype=getattr(torch, dtype))
     k = torch.empty(1, 1, heads[1], head_dim, dtype=getattr(torch, dtype))
 

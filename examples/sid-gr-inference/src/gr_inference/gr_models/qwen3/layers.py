@@ -1586,6 +1586,16 @@ def _selected_kernel_backend(capability: str) -> str | None:
     return backend.name if backend is not None else None
 
 
+def _trtllm_qk_norm_rope_cuda_usable() -> bool:
+    if os.environ.get("GR_INFERENCE_GR_TRTLLM_KERNELS_JIT", "1") != "1":
+        return False
+    try:
+        from gr_inference_trtllm_kernels.qwen3 import _cuda_extension
+    except ImportError:
+        return False
+    return _cuda_extension() is not None
+
+
 def _qk_norm_rope_backend(q, k) -> str | None:
     policy = default_kernel_selection_policy()
     default_order = (
@@ -1602,6 +1612,7 @@ def _qk_norm_rope_backend(q, k) -> str | None:
         and q.dtype == torch.bfloat16
         and q.shape[-1] == 128
         and 24 <= q.shape[-2] + k.shape[-2] <= 32
+        and _trtllm_qk_norm_rope_cuda_usable()
         and torch.cuda.get_device_capability(q.device)[0] == 10
     ):
         return "trtllm_aligned"
