@@ -43,6 +43,14 @@ struct PendingSnapshot {
   std::shared_ptr<IndexerSnapshot> retired;
   cudaEvent_t retirement_event{};
   std::atomic<bool> published{false};
+  std::shared_ptr<PendingSnapshot> superseded_by;
+
+  ~PendingSnapshot() {
+    // Earlier waiters may share this completion after its own ID is acknowledged.
+    if (retirement_event != nullptr) {
+      cudaEventDestroy(retirement_event);
+    }
+  }
 };
 
 struct RegistryEntry {
@@ -216,9 +224,17 @@ void stage_indexer_snapshot(const at::Tensor& marker,
   }
   {
     std::lock_guard<std::mutex> lock(entry->updates_mutex);
-    entry->updates[snapshot_id] = pending;
+    TORCH_CHECK(entry->updates.emplace(snapshot_id, pending).second,
+                "Indexer snapshot ID is already outstanding: ", snapshot_id);
+    auto* superseded =
+        entry->pending.exchange(pending.get(), std::memory_order_acq_rel);
+    if (superseded != nullptr) {
+      // Only an unclaimed publication can be replaced. Its acknowledgement
+      // must still wait until the successor makes the old active reads safe.
+      std::atomic_store_explicit(&superseded->superseded_by, pending,
+                                 std::memory_order_release);
+    }
   }
-  entry->pending.store(pending.get(), std::memory_order_release);
 }
 
 void wait_for_indexer_snapshot_retirement(const at::Tensor& marker,
@@ -230,11 +246,17 @@ void wait_for_indexer_snapshot_retirement(const at::Tensor& marker,
     std::lock_guard<std::mutex> lock(entry->updates_mutex);
     update = entry->updates.at(snapshot_id);
   }
-  while (!update->published.load(std::memory_order_acquire)) {
-    std::this_thread::yield();
+  auto completion = update;
+  while (!completion->published.load(std::memory_order_acquire)) {
+    auto successor = std::atomic_load_explicit(
+        &completion->superseded_by, std::memory_order_acquire);
+    if (successor != nullptr) {
+      completion = std::move(successor);
+    } else {
+      std::this_thread::yield();
+    }
   }
-  cudaEventSynchronize(update->retirement_event);
-  cudaEventDestroy(update->retirement_event);
+  cudaEventSynchronize(completion->retirement_event);
   {
     std::lock_guard<std::mutex> lock(entry->updates_mutex);
     entry->updates.erase(snapshot_id);
@@ -253,7 +275,6 @@ std::shared_ptr<IndexerSnapshot> find_indexer_snapshot(
     const auto stream =
         at::cuda::getCurrentCUDAStream(marker.get_device()).stream();
     if (cudaEventRecord(pending->retirement_event, stream) != cudaSuccess) {
-      cudaEventDestroy(pending->retirement_event);
       throw std::runtime_error("Failed to record indexer retirement event");
     }
     auto retired = std::atomic_exchange(&entry->current, next);
