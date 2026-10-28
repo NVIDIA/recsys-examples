@@ -405,7 +405,8 @@ insert_body(Table table, int64_t const *__restrict__ table_bucket_offsets,
     Iter iter = Iter(hashcode % table.bucket_capacity());
     insert_probe<ProbingGroupSize>(bucket, key, bucket_sizes, bucket_id, iter,
                                    &iter, &result);
-    int64_t counter_offset = (bucket_id - bkt_begin) * bucket.capacity();
+    // Reference counters span all tables; only output indices are table-local.
+    int64_t counter_offset = bucket_id * bucket.capacity();
     KeyType evict_key = KeyType();
     insert<ReductionGroupSize, BufferDim, Policy, Evictor>(
         bucket, key, score, bucket_sizes, bucket_id, iter, sm_scores, result,
@@ -573,7 +574,8 @@ __device__ __forceinline__ void insert_and_evict_body(
                                      &iter, &result);
 
       {
-        int64_t counter_offset = (bucket_id - bkt_begin) * bucket.capacity();
+        // Match update_counter_with_layout_kernel's global main-table index.
+        int64_t counter_offset = bucket_id * bucket.capacity();
         insert<ReductionGroupSize, BufferDim, Policy, Evictor>(
             bucket, key, score, bucket_sizes, bucket_id, iter, sm_scores,
             result, &iter, &result, &evict_key, &evict_score, counter,
