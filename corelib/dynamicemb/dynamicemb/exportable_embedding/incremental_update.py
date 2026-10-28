@@ -122,6 +122,30 @@ def _open_parameter_servers(
     return result
 
 
+def _prepare_delta_keys(
+    delta: DeltaDumpResult,
+) -> list[tuple[torch.Tensor, torch.Tensor]]:
+    """Resolve effective removals on CPU before changing any PS or indexer state."""
+    columns = len(delta.table_names)
+    evicted = delta.evicted_keys or [None] * columns
+    erased = getattr(delta, "erased_keys", None) or [None] * columns
+    if any(
+        len(items) != columns for items in (delta.keys, delta.values, evicted, erased)
+    ):
+        raise ValueError("Delta columns must align with table names")
+    result = []
+    for keys, evictions, erases in zip(delta.keys, evicted, erased):
+        keys = keys.to(dtype=torch.int64, device="cpu")
+        removed = set()
+        for tensor in (evictions, erases):
+            if tensor is not None:
+                removed.update(tensor.to(dtype=torch.int64, device="cpu").tolist())
+        # The final dumped value wins over an earlier removal in the same window.
+        removed.difference_update(keys.tolist())
+        result.append((keys, torch.tensor(sorted(removed), dtype=torch.int64)))
+    return result
+
+
 class EmbeddingCollectionUpdateCoordinator:
     """Prepare Redis or CPU HostLayer deltas and indexer publications."""
 
@@ -193,6 +217,7 @@ class EmbeddingCollectionUpdateCoordinator:
         delta: DeltaDumpResult,
         parameter_server: Any,
         snapshot_id: int,
+        table_keys: list[tuple[torch.Tensor, torch.Tensor]],
     ) -> tuple[list[int], list[torch.Tensor], Optional[str], list[int]]:
         old_snapshot = self.snapshots[collection_id]
         entries = linear_hash_entries(old_snapshot)
@@ -206,7 +231,7 @@ class EmbeddingCollectionUpdateCoordinator:
 
         for column, table_name in enumerate(delta.table_names):
             table_id = table_ids[table_name]
-            keys = delta.keys[column].to(dtype=torch.int64, device="cpu")
+            keys, removed = table_keys[column]
             values = delta.values[column].to(device="cpu").contiguous()
             storage_keys = []
             for feature_id in keys.tolist():
@@ -223,13 +248,11 @@ class EmbeddingCollectionUpdateCoordinator:
                 cache_update_keys.extend(storage_keys)
                 cache_update_values.append(values.to(dtype=torch.float32))
 
-            evicted = delta.evicted_keys[column]
-            if evicted is not None:
-                for feature_id in evicted.to(device="cpu").tolist():
-                    storage_key = entries[table_id].pop(feature_id, None)
-                    if storage_key is not None:
-                        retired.append(storage_key)
-                        changed_mapping = True
+            for feature_id in removed.tolist():
+                storage_key = entries[table_id].pop(feature_id, None)
+                if storage_key is not None:
+                    retired.append(storage_key)
+                    changed_mapping = True
 
         snapshot_path = None
         if changed_mapping:
@@ -261,6 +284,7 @@ class EmbeddingCollectionUpdateCoordinator:
         collection_id: str,
         delta: DeltaDumpResult,
         parameter_server: Any,
+        table_keys: list[tuple[torch.Tensor, torch.Tensor]],
     ) -> tuple[list[int], list[torch.Tensor]]:
         binding = self.bindings[collection_id]
         table_ids = {name: index for index, name in enumerate(binding.table_names)}
@@ -269,7 +293,7 @@ class EmbeddingCollectionUpdateCoordinator:
         cache_update_values: list[torch.Tensor] = []
         for column, table_name in enumerate(delta.table_names):
             table_id = table_ids[table_name]
-            feature_ids = delta.keys[column].to(dtype=torch.int64, device="cpu")
+            feature_ids, removed = table_keys[column]
             if binding.indexer_type == EmbeddingCollectionIndexerType.BIT_CONCAT.value:
                 feature_bits = binding.feature_id_bits
                 assert feature_bits is not None
@@ -297,24 +321,31 @@ class EmbeddingCollectionUpdateCoordinator:
                 cache_update_keys.extend(storage_keys.tolist())
                 cache_update_values.append(values.to(dtype=torch.float32))
 
-            evicted = delta.evicted_keys[column]
-            if evicted is None:
+            if removed.numel() == 0:
                 continue
-            evicted = evicted.to(dtype=torch.int64, device="cpu")
             if binding.indexer_type == EmbeddingCollectionIndexerType.BIT_CONCAT.value:
                 feature_bits = binding.feature_id_bits
                 assert feature_bits is not None
-                evicted_storage = (table_id << feature_bits) | evicted
+                removed_storage = (table_id << feature_bits) | removed
             elif (
                 binding.indexer_type
                 == EmbeddingCollectionIndexerType.FUSED_IDENTITY.value
             ):
                 assert snapshot is not None
                 base = int(snapshot.valid_bases[table_id].item())
-                evicted_storage = base + evicted
+                removed_storage = base + removed
             else:
-                evicted_storage = evicted
-            parameter_server.erase(evicted_storage.contiguous())
+                removed_storage = removed
+            parameter_server.erase(removed_storage.contiguous())
+            # Direct mappings still resolve deleted keys. Reuse the existing
+            # subscriber payload to replace stale values in every cache tier.
+            cache_update_keys.extend(removed_storage.tolist())
+            cache_update_values.append(
+                torch.zeros(
+                    (removed_storage.numel(), delta.values[column].shape[1]),
+                    dtype=torch.float32,
+                )
+            )
         return cache_update_keys, cache_update_values
 
     def _host_update(
@@ -448,13 +479,14 @@ class EmbeddingCollectionUpdateCoordinator:
     ) -> EmbeddingCollectionUpdate:
         if collection_id in self.host_layers:
             return self._host_update(collection_id, delta)
+        table_keys = _prepare_delta_keys(delta)
         snapshot_id = self._next_snapshot_id(collection_id)
         parameter_server = self.parameter_servers[collection_id]
         indexer_type = self.bindings[collection_id].indexer_type
         if indexer_type == EmbeddingCollectionIndexerType.LINEAR_HASH_MAP.value:
             cache_update_keys, cache_update_values, snapshot_path, retired = (
                 self._linear_update(
-                    collection_id, delta, parameter_server, snapshot_id
+                    collection_id, delta, parameter_server, snapshot_id, table_keys
                 )
             )
             if retired:
@@ -465,7 +497,7 @@ class EmbeddingCollectionUpdateCoordinator:
                 )
         else:
             cache_update_keys, cache_update_values = self._direct_update(
-                collection_id, delta, parameter_server
+                collection_id, delta, parameter_server, table_keys
             )
             snapshot_path = None
         if cache_update_values:
