@@ -69,10 +69,11 @@ def log_warn(msg: str) -> None:
 # Skill registry
 # ---------------------------------------------------------------------------
 
+
 @dataclass(frozen=True)
 class Skill:
-    slug: str             # directory name under .claude/skills/<slug>
-    subpackage: str       # name of the subpackage under talos (e.g. "torch_optimize")
+    slug: str  # directory name under .claude/skills/<slug>
+    subpackage: str  # name of the subpackage under talos (e.g. "torch_optimize")
 
     def root(self) -> Path:
         # Subpackage dir on disk. Resolve from this file's path rather
@@ -99,6 +100,7 @@ SKILLS: list[Skill] = [
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
+
 
 def _veloq_main() -> None:
     """Console-script entry: exec into the bundled veloq binary.
@@ -138,9 +140,8 @@ def _build_observer() -> int:
         )
         return 0
     log("pre-compiling the C++ profiling observer (cached after first build) ...")
-    from talos.torch_perf_analysis.python.profiler import (
-        compile_observer_main,
-    )
+    from talos.torch_perf_analysis.python.profiler import compile_observer_main
+
     return compile_observer_main()
 
 
@@ -150,8 +151,10 @@ def _install_skills(agents: list[str]) -> int:
         base = Path.cwd() / f".{agent}" / "skills"
         for skill in SKILLS:
             if not skill.is_populated():
-                print(f"skip {skill.slug}: SKILL.md not found at {skill.root() / 'SKILL.md'}",
-                      file=sys.stderr)
+                print(
+                    f"skip {skill.slug}: SKILL.md not found at {skill.root() / 'SKILL.md'}",
+                    file=sys.stderr,
+                )
                 continue
             target = base / skill.slug
             if _link(skill.root(), target):
@@ -160,8 +163,11 @@ def _install_skills(agents: list[str]) -> int:
                 conflicts += 1
     _print_install_hint()
     if conflicts:
-        print(f"\n{conflicts} skill(s) were not linked because a file or "
-              f"directory of the same name already exists.", file=sys.stderr)
+        print(
+            f"\n{conflicts} skill(s) were not linked because a file or "
+            f"directory of the same name already exists.",
+            file=sys.stderr,
+        )
     return 1 if conflicts else 0
 
 
@@ -183,6 +189,7 @@ def _print_install_hint() -> None:
         return
 
     import sysconfig
+
     candidates = []
     for scheme in ("posix_user", "posix_prefix"):
         try:
@@ -216,4 +223,3 @@ def _link(src: Path, target: Path) -> bool:
         return False
     os.symlink(src, target)
     return True
-
