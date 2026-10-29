@@ -795,7 +795,9 @@ def get_expand_info(
         target_capacities[i] is the desired new key_index_map capacity for table i (or -1 if not expanding).
 
     Expansion uses ``max_load_factor`` for both NO_EVICTION and other strategies:
-    expand when ``(current_size + n_new) / KIM_cap > max_load_factor`` (and ``max_lf > 0``).
+    expand when ``(current_size + n_new) / KIM_cap > max_load_factor`` (and ``max_lf > 0``),
+    to at least ``(current_size + n_new) / max_load_factor`` so the inserted keys fit at
+    ``max_load_factor``.
     NO_EVICTION does **not** apply ``max_capacity`` as an upper bound; other strategies still cap
     the target with ``max_capacity`` when it is set.
     """
@@ -828,7 +830,9 @@ def get_expand_info(
                 results[table_id] = True
                 target_capacities[table_id] = max(
                     cap * 2,
-                    align_to_table_size(new_total, opt.bucket_capacity),
+                    align_to_table_size(
+                        math.ceil(new_total / max_lf), opt.bucket_capacity
+                    ),
                 )
         else:
             max_cap = opt.max_capacity
@@ -838,7 +842,12 @@ def get_expand_info(
                 results[table_id] = True
                 target_capacities[table_id] = min(
                     max_cap,
-                    max(cap * 2, align_to_table_size(new_total, opt.bucket_capacity)),
+                    max(
+                        cap * 2,
+                        align_to_table_size(
+                            math.ceil(new_total / max_lf), opt.bucket_capacity
+                        ),
+                    ),
                 )
     return results, target_capacities
 
@@ -3906,143 +3915,85 @@ class HybridStorage(Storage):
 # ---------------------------------------------------------------------------
 
 
-def _expand_storage_for_cache_flush_if_needed(
-    storage: DynamicEmbStorage, cache: DynamicEmbCache
+def _select(values: torch.Tensor, rows: torch.Tensor, all_rows: bool) -> torch.Tensor:
+    """``values[rows]`` -- ``flagged_compact`` only takes 1-D inputs.
+
+    ``all_rows`` says the caller's mask kept every row; ``flagged_compact`` emits
+    its index in ascending order, so ``rows`` is then the identity and the gather
+    is skipped. The row count alone cannot say that: an index of the same length
+    may still permute the rows.
+    """
+    return values if all_rows else values[rows]
+
+
+def _write_back_evicted(
+    storage: DynamicEmbStorage,
+    next_tier: Optional[Storage],
+    keys: torch.Tensor,
+    table_ids: torch.Tensor,
+    values: torch.Tensor,
 ) -> None:
-    """Grow backing storage before ``flush_cache`` so inserts need not evict cold keys.
+    """Return what the cache evicted to the tier below it.
 
-    **Existing expansion** (:func:`expand_if_need_impl` / :func:`get_expand_info`):
-    runs in prefetch from :func:`dynamicemb.batched_dynamicemb_function.dynamicemb_prefetch`.
-    It expands when ``(estimated_backing_keys + batch_uniques) / physical_cap > max_load_factor``.
-    With ``caching=True``, most keys stay in the GPU cache, so backing occupancy stays low
-    and expansion often stops while physical cap is still far below ``max_capacity``.
-
-    **Flush** then copies every cache entry into backing via :meth:`Storage.insert` without
-    calling ``expand_if_need``, so backing hits its current cap and evicts (e.g. TIMESTAMP).
-
-    This helper uses a conservative upper bound on distinct keys after merge,
-    ``min(max_capacity, storage_size(table) + cache_size(table))`` per logical table
-    (disjoint worst case), and reuses :func:`_expand_tables_impl`. Target key-map capacity
-    is the max of ``align_to_table_size(2 * merge_ub, bucket_capacity)``, ``2 * key_cap``,
-    and for NO_EVICTION also ``2 * value_row_count``. The ``2 * merge_ub`` alignment
-    already covers ``merge_ub`` and ``align_to_table_size(merge_ub, ...)`` in the max.
-    Capped by ``max_capacity``. Afterward it refreshes ``estimated_table_sizes``.
+    A key still in storage keeps its score, so only the value moves. One storage
+    has evicted since goes to ``next_tier``; with none it is dropped, kept as an
+    evicted key when storage retains them.
     """
     st = storage._state
-    ca = cache._state
-    assert st.num_tables == ca.num_tables
-
-    is_no_eviction = (
-        st.options_list[0].score_strategy == DynamicEmbScoreStrategy.NO_EVICTION
-    )
-    tables_to_expand: List[bool] = [False] * st.num_tables
-    target_capacities: List[int] = [-1] * st.num_tables
-
-    for table_id in range(st.num_tables):
-        opt = st.options_list[table_id]
-        s_sz = st.key_index_map.size(table_id)
-        c_sz = ca.key_index_map.size(table_id)
-        merge_ub = s_sz + c_sz
-        max_cap_opt = opt.max_capacity
-        if max_cap_opt is not None:
-            merge_ub = min(merge_ub, int(max_cap_opt))
-
-        key_cap = int(st.key_index_map.per_table_capacity_[table_id])
-        bc = opt.bucket_capacity
-        merge_ub_2x = align_to_table_size(2 * merge_ub, bc)
-        # ``merge_ub_2x >= merge_ub`` (aligned 2× bound), so this also implies room for ``merge_ub``.
-        if key_cap >= merge_ub_2x:
-            continue
-
-        if is_no_eviction:
-            cur_v = int(st.tables[table_id].tensor().size(0))
-            target = max(merge_ub_2x, key_cap * 2, cur_v * 2)
+    in_storage = _find_keys(st, keys, table_ids, const_lookup=True)[5]
+    with torch.cuda.nvtx.range("op:flagged_compact"):
+        num_present, present, (present_keys, present_tids) = flagged_compact(
+            in_storage, [keys, table_ids]
+        )
+    with torch.cuda.nvtx.range("op:storage_insert"):
+        if num_present > 0:
+            storage.insert(
+                present_keys,
+                present_tids,
+                _select(values, present, num_present == keys.numel()),
+                preserve_existing=True,
+            )
+        if num_present == keys.numel():
+            return
+        if num_present == 0:
+            gone_keys, gone_tids, gone_values = keys, table_ids, values
         else:
-            if max_cap_opt is not None and key_cap >= int(max_cap_opt):
-                continue
-            max_lf = opt.max_load_factor
-            if max_lf <= 0:
-                continue
-            target = max(merge_ub_2x, key_cap * 2)
-
-        if max_cap_opt is not None:
-            target = min(int(max_cap_opt), target)
-
-        if is_no_eviction and target <= key_cap and target <= cur_v:
-            continue
-
-        tables_to_expand[table_id] = True
-        target_capacities[table_id] = int(target)
-
-    if not any(tables_to_expand):
-        return
-
-    _expand_tables_impl(st, tables_to_expand, target_capacities)
-    st.collect_table_sizes_flag = True
-    collect_table_sizes_for_state(st, non_blocking=False)
+            with torch.cuda.nvtx.range("op:flagged_compact"):
+                _, gone, (gone_keys, gone_tids) = flagged_compact(
+                    ~in_storage, [keys, table_ids]
+                )
+            gone_values = values[gone]
+        if next_tier is not None:
+            next_tier.insert(gone_keys, gone_tids, gone_values)
+        elif EvictedItemMode.RETAIN_KEY in st.evicted_item_mode:
+            _append_evicted(st, gone_keys, gone_tids, torch.tensor(gone_keys.numel()))
 
 
-def flush_cache(cache: DynamicEmbCache, storage: Storage) -> None:
-    if isinstance(storage, DynamicEmbStorage):
-        _expand_storage_for_cache_flush_if_needed(storage, cache)
+def flush_cache(
+    cache: DynamicEmbCache,
+    storage: DynamicEmbStorage,
+    external_storage: Optional[Storage] = None,
+) -> None:
+    """Push every cache entry's value down, as the prefetch path does on eviction.
 
+    Storage keeps the scores, so a key it still has only has its value
+    updated. One it has evicted goes to ``external_storage``, or is dropped
+    when there is none: it is not re-inserted, which would evict another row.
+    """
     state = cache._state
     batch_size = state.threads_in_wave
-    state.value_dim
 
     for t in range(state.num_tables):
-        for (
-            keys,
-            named_scores,
-            indices,
-        ) in state.key_index_map._batched_export_keys_scores(
+        for keys, _, indices in state.key_index_map._batched_export_keys_scores(
             [state.score_policy.name],
             state.device,
             batch_size=batch_size,
             return_index=True,
             table_id=t,
         ):
-            scores = named_scores[state.score_policy.name]
             tid = torch.full((keys.numel(),), t, dtype=torch.int64, device=keys.device)
             values = load_from_flat(state, indices, tid, copy_mode=CopyMode.VALUE)
-            if isinstance(storage, DynamicEmbStorage) and (
-                storage._state.no_eviction_next_index is not None
-            ):
-                st_b = storage._state
-                (
-                    _hm_fc,
-                    _mk_fc,
-                    _mi_fc,
-                    _mt_fc,
-                    _ms_fc,
-                    in_backing,
-                    _so_fc,
-                    _ix_fc,
-                ) = _find_keys(st_b, keys, tid)
-                if bool(in_backing.all()):
-                    storage.insert(keys, tid, values, preserve_existing=True)
-                elif bool((~in_backing).all()):
-                    storage.insert(keys, tid, values, scores, preserve_existing=False)
-                else:
-                    ex_b = in_backing
-                    nw_b = ~in_backing
-                    if ex_b.any():
-                        storage.insert(
-                            keys[ex_b],
-                            tid[ex_b],
-                            values[ex_b],
-                            preserve_existing=True,
-                        )
-                    if nw_b.any():
-                        storage.insert(
-                            keys[nw_b],
-                            tid[nw_b],
-                            values[nw_b],
-                            scores[nw_b],
-                            preserve_existing=False,
-                        )
-            else:
-                storage.insert(keys, tid, values, scores)
+            _write_back_evicted(storage, external_storage, keys, tid, values)
 
 
 # ---------------------------------------------------------------------------

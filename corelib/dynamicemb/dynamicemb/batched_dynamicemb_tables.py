@@ -788,6 +788,7 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
 
     def _create_cache_storage(self) -> None:
         self._cache: Optional[Cache] = None
+        self._external_storage: Optional[Storage] = None
         self._caching = any(option.caching for option in self._dynamicemb_options)
 
         for option in self._dynamicemb_options:
@@ -832,15 +833,12 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                     cache_option.max_capacity = min(cache_option.max_capacity, cap)
                     cache_option.init_capacity = min(cache_option.max_capacity, cap)
 
-                # NO_EVICTION is incompatible with cache overflow (see create_table_state).
-                # Match HybridStorage: GPU cache uses TIMESTAMP/LRU; backing keeps NO_EVICTION.
-                if (
-                    self._dynamicemb_options[0].score_strategy
-                    == DynamicEmbScoreStrategy.NO_EVICTION
-                ):
-                    for cache_option in cache_options:
-                        cache_option.score_strategy = DynamicEmbScoreStrategy.TIMESTAMP
-                        cache_option.evict_strategy = DynamicEmbEvictStrategy.LRU
+                # The cache ranks by timestamp only; the backing storage is the
+                # full set and owns every key's score (and NO_EVICTION, which
+                # cache overflow rejects, see create_table_state).
+                for cache_option in cache_options:
+                    cache_option.score_strategy = DynamicEmbScoreStrategy.TIMESTAMP
+                    cache_option.evict_strategy = DynamicEmbEvictStrategy.LRU
 
                 self._cache = DynamicEmbCache(cache_options, self._optimizer)
 
@@ -848,11 +846,23 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                 for storage_option in storage_options:
                     storage_option.local_hbm_for_values = 0
                 PS = storage_options[0].external_storage
-                self._storage = (
-                    PS(storage_options, self._optimizer)
-                    if PS
-                    else DynamicEmbStorage(storage_options, self._optimizer)
-                )
+                if (
+                    PS
+                    and storage_options[0].score_strategy
+                    == DynamicEmbScoreStrategy.NO_EVICTION
+                ):
+                    # NO_EVICTION storage never evicts (it expands instead), so
+                    # nothing would ever spill to the PS; see _insert_into_storage.
+                    raise NotImplementedError(
+                        "NO_EVICTION is not supported with external_storage: the "
+                        "storage expands instead of evicting, so a PS below it "
+                        "would never be used."
+                    )
+                self._storage = DynamicEmbStorage(storage_options, self._optimizer)
+                if PS:
+                    # The PS sits below the storage: the storage owns scores and
+                    # the freshest values, the PS only holds what it evicted.
+                    self._external_storage = PS(storage_options, self._optimizer)
                 self._storage_layout = (
                     StorageLayout.CACHING_PS if PS else StorageLayout.CACHING
                 )
@@ -1147,7 +1157,7 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
 
     def flush(self) -> None:
         if self._caching and self._cache is not None:
-            flush_cache(self._cache, self._storage)
+            flush_cache(self._cache, self._storage, self._external_storage)
 
     def reset_cache_states(self) -> None:
         if self._caching and self._cache is not None:
@@ -1272,6 +1282,12 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                 )
 
         if not self.training:
+            if self._external_storage is not None:
+                raise RuntimeError(
+                    "Evaluation does not read external_storage: a key spilled to "
+                    "it would be treated as missing. Train with external_storage "
+                    "unset, or do not call eval() on this module."
+                )
             scores = [self._scores[name] for name in self._table_names]
             fused_score = self._reduce_table_scores(scores)
             if isinstance(self._cache, DynamicEmbCache):
@@ -1368,6 +1384,7 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                 outstanding_keys_ref=self._prefetch_outstanding_keys
                 if self._cache is not None
                 else None,
+                external_storage=self._external_storage,
             )
         )
         self._update_score()
@@ -1845,7 +1862,7 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                 f"got {type(storage).__name__}"
             )
         if self._cache is not None and isinstance(storage, DynamicEmbStorage):
-            flush_cache(self._cache, storage)
+            flush_cache(self._cache, storage, self._external_storage)
         res = DeltaDumpResult()
         # One reference timestamp for the whole call: the age baseline for the
         # dumped timestamp score columns, and the returned current_score.
@@ -2047,10 +2064,9 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
             # After planning, so a rejected delta leaves the model exactly as it
             # was. Pushing dirty cache entries down first makes the storage copy
             # this replay is about to overwrite the authoritative one.
-            flush_cache(self._cache, storage)
-            # Flushing can grow and rehash the backing table. Revalidate the
-            # source slots after that layout-changing side effect, before any
-            # replay writes use the original plan.
+            flush_cache(self._cache, storage, self._external_storage)
+            # Flushing writes values only, but revalidate the source slots anyway
+            # before any replay writes use the original plan.
             plan = self._plan_replay(delta, content, storage)
 
         ts = device_timestamp()

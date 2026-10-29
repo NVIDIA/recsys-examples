@@ -304,7 +304,8 @@ def test_caching_spill_does_not_leak_rows(current_device):
 
 def test_caching_backing_retains_every_key(current_device):
     """NO_EVICTION's core promise: the backing store never drops a key, however
-    hard the cache in front of it evicts.
+    hard the cache in front of it evicts. It is the full set, so it holds the
+    keys the cache holds as well.
 
     This has to be a *structural* check. The DEBUG initializer returns
     ``key % DEBUG_MOD``, so a key that was dropped and re-initialised reads back
@@ -333,10 +334,11 @@ def test_caching_backing_retains_every_key(current_device):
         f"cache holds all {len(keys)} keys -- it never evicted, so this test "
         "says nothing about the backing store"
     )
-    # ...and everything it evicted landed in the backing store rather than being
-    # dropped. The rest is still cache-resident and has not spilled yet.
-    assert spilled + cached == len(keys), (
-        f"{spilled} spilled + {cached} cached != {len(keys)} keys -- some key was "
+    # ...and the backing store is the full key set: a new key goes into it
+    # before it reaches the cache, so cache-resident keys are in it too and
+    # nothing the cache evicted was dropped.
+    assert spilled == len(keys), (
+        f"{spilled} keys in the backing store != {len(keys)} -- some key was "
         "dropped between the tiers"
     )
 
