@@ -23,20 +23,27 @@ Usage:
 from __future__ import annotations
 
 import argparse
-from pathlib import Path
 import time
+from pathlib import Path
 
 import torch
-
 from data import get_dataloader, get_kuairand_dataloader
 from model import OneRecSIDWithValue
 
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser()
-    p.add_argument("--dataset", choices=["synthetic", "kuairand-pure"], default="synthetic")
-    p.add_argument("--data-dir", type=str, default=str(Path(__file__).resolve().parent / "data"))
-    p.add_argument("--download", action="store_true", help="Download the selected real dataset if it is missing.")
+    p.add_argument(
+        "--dataset", choices=["synthetic", "kuairand-pure"], default="synthetic"
+    )
+    p.add_argument(
+        "--data-dir", type=str, default=str(Path(__file__).resolve().parent / "data")
+    )
+    p.add_argument(
+        "--download",
+        action="store_true",
+        help="Download the selected real dataset if it is missing.",
+    )
     p.add_argument("--steps", type=int, default=50)
     p.add_argument("--batch-size", type=int, default=64)
     p.add_argument("--max-hist-len", type=int, default=64)
@@ -105,7 +112,9 @@ def main() -> None:
             seed=args.seed,
             num_workers=args.num_workers,
         )
-        print(f"Dataset: synthetic ({len(loader.dataset)} windows, num_classes={args.num_classes})")
+        print(
+            f"Dataset: synthetic ({len(loader.dataset)} windows, num_classes={args.num_classes})"
+        )
 
     model = OneRecSIDWithValue(
         num_classes=args.num_classes,

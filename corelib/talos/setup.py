@@ -56,9 +56,7 @@ except ModuleNotFoundError:
 
 from setuptools import setup
 from setuptools.command.build_py import build_py
-
 from wheel.bdist_wheel import bdist_wheel
-
 
 HERE = Path(__file__).resolve().parent
 SKILLS_ROOT = HERE / "skills"
@@ -69,9 +67,9 @@ DEFAULT_BASE_URL = "https://github.com/lucifer1004/veloq/releases/download"
 
 # (target key → veloq asset filename, wheel platform tag)
 PLATFORMS = {
-    "x86_64-linux":  ("veloq-x86_64-linux",  "manylinux2014_x86_64"),
+    "x86_64-linux": ("veloq-x86_64-linux", "manylinux2014_x86_64"),
     "aarch64-linux": ("veloq-aarch64-linux", "manylinux2014_aarch64"),
-    "x86_64-macos":  ("veloq-x86_64-macos",  "macosx_11_0_x86_64"),
+    "x86_64-macos": ("veloq-x86_64-macos", "macosx_11_0_x86_64"),
     "aarch64-macos": ("veloq-aarch64-macos", "macosx_11_0_arm64"),
 }
 
@@ -80,6 +78,7 @@ PLATFORMS = {
 # Config + platform resolution
 # ─────────────────────────────────────────────────────────────────────────────
 
+
 def _read_config() -> dict:
     with open(HERE / "pyproject.toml", "rb") as f:
         cfg = tomllib.load(f)
@@ -87,7 +86,7 @@ def _read_config() -> dict:
     if "veloq-version" not in section:
         raise SystemExit(
             "pyproject.toml is missing [tool.talos].veloq-version — "
-            "pin a release tag (e.g. \"v0.2.1\") so the build can fetch a "
+            'pin a release tag (e.g. "v0.2.1") so the build can fetch a '
             "matching binary and skill tarball."
         )
     return section
@@ -189,7 +188,7 @@ def _fetch_skills(base_url: str, version: str, digests: dict) -> None:
                 parts = Path(member.name).parts
                 if len(parts) < 3 or parts[0] != ".claude" or parts[1] != "skills":
                     continue
-                slug = parts[2]              # e.g. "nsys-profile-analysis"
+                slug = parts[2]  # e.g. "nsys-profile-analysis"
                 if not _SAFE_COMPONENT.fullmatch(slug):
                     sys.stderr.write(f"[veloq-build] skip unsafe slug: {member.name}\n")
                     continue
@@ -197,7 +196,9 @@ def _fetch_skills(base_url: str, version: str, digests: dict) -> None:
                 rest = parts[3:]
                 if not rest or not all(_SAFE_COMPONENT.fullmatch(c) for c in rest):
                     if rest:
-                        sys.stderr.write(f"[veloq-build] skip unsafe path: {member.name}\n")
+                        sys.stderr.write(
+                            f"[veloq-build] skip unsafe path: {member.name}\n"
+                        )
                     continue
                 target = SKILLS_ROOT / pkg / Path(*rest)
                 # Belt and braces: the component check above already rejects
@@ -207,7 +208,9 @@ def _fetch_skills(base_url: str, version: str, digests: dict) -> None:
                     resolved = target.resolve()
                     resolved.relative_to(skills_root / pkg)
                 except (ValueError, OSError):
-                    sys.stderr.write(f"[veloq-build] skip escaping member: {member.name}\n")
+                    sys.stderr.write(
+                        f"[veloq-build] skip escaping member: {member.name}\n"
+                    )
                     continue
                 if member.isdir():
                     target.mkdir(parents=True, exist_ok=True)
@@ -227,6 +230,7 @@ def _fetch_skills(base_url: str, version: str, digests: dict) -> None:
 # ─────────────────────────────────────────────────────────────────────────────
 # Custom commands
 # ─────────────────────────────────────────────────────────────────────────────
+
 
 class BuildWithVeloq(build_py):
     """Fetch veloq artifacts before the standard build_py pass."""
