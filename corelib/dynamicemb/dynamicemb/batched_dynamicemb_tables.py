@@ -13,15 +13,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from dynamicemb.checkpoint_io import (
-    encode_meta_json_file_path,
-    encode_checkpoint_file_path,
-    encode_counter_checkpoint_file_path,
-    find_files,
-    get_loading_files,
-    list_checkpoint_files,
-)
-
 import json
 import os
 import warnings
@@ -30,17 +21,7 @@ from copy import deepcopy
 from dataclasses import dataclass
 from enum import Enum
 from itertools import accumulate
-from typing import (
-    Any,
-    Callable,
-    Deque,
-    Dict,
-    List,
-    Optional,
-    Sequence,
-    Tuple,
-    Union,
-)
+from typing import Any, Callable, Deque, Dict, List, Optional, Tuple, Union
 
 import torch  # usort:skip
 import torch.distributed as dist
@@ -55,6 +36,14 @@ from dynamicemb.batched_dynamicemb_function import (
     PrefetchState,
     dynamicemb_eval_forward,
     dynamicemb_prefetch,
+)
+from dynamicemb.checkpoint_io import (  # noqa: F401 - preserve checkpoint helper exports
+    encode_checkpoint_file_path,
+    encode_counter_checkpoint_file_path,
+    encode_meta_json_file_path,
+    find_files,
+    get_loading_files,
+    list_checkpoint_files,
 )
 from dynamicemb.dynamicemb_config import (
     DynamicEmbCheckMode,

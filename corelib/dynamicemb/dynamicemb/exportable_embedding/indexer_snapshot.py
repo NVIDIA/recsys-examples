@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any, Sequence
 
 import torch
+
 from . import _C
 
 _SNAPSHOT_MAGIC = b"ECIDX001"
@@ -121,8 +122,8 @@ def linear_hash_entries(
     num_buckets = offsets[-1]
     width = snapshot.bucket_capacity
     buckets = storage.view(num_buckets, 17 * width)
-    keys = buckets[:, :8 * width].contiguous().view(torch.int64)
-    values = buckets[:, 9 * width:].contiguous().view(torch.int64)
+    keys = buckets[:, : 8 * width].contiguous().view(torch.int64)
+    values = buckets[:, 9 * width :].contiguous().view(torch.int64)
     result: list[dict[int, int]] = []
     for table_id in range(len(offsets) - 1):
         table_keys = keys[offsets[table_id] : offsets[table_id + 1]].reshape(-1)
@@ -150,22 +151,32 @@ def rebuild_linear_hash_snapshot(
 ) -> IndexerSnapshot:
     if device.type == "cpu":
         capacities = torch.tensor([len(table) for table in entries], dtype=torch.int64)
-        storage, offsets = torch.ops.INFERENCE_EMB.create_cpu_hash(capacities, bucket_capacity)
+        storage, offsets = torch.ops.INFERENCE_EMB.create_cpu_hash(
+            capacities, bucket_capacity
+        )
         keys, tables, rows = [], [], []
         for table_id, mapping in enumerate(entries):
             keys.extend(mapping)
             tables.extend([table_id] * len(mapping))
             rows.extend(mapping.values())
         storage, offsets = torch.ops.INFERENCE_EMB.repack_cpu_hash(
-            storage, offsets, bucket_capacity,
+            storage,
+            offsets,
+            bucket_capacity,
             torch.tensor(keys, dtype=torch.int64),
             torch.tensor(tables, dtype=torch.int64),
             torch.tensor(rows, dtype=torch.int64),
         )
         empty = torch.empty(0, dtype=torch.int64)
         return IndexerSnapshot(
-            IndexerSnapshotKind.LINEAR_HASH_MAP, storage, offsets, bucket_capacity,
-            miss_storage_indices.cpu(), empty, empty, next_fused_key,
+            IndexerSnapshotKind.LINEAR_HASH_MAP,
+            storage,
+            offsets,
+            bucket_capacity,
+            miss_storage_indices.cpu(),
+            empty,
+            empty,
+            next_fused_key,
         )
 
     from dynamicemb.scored_hashtable import (

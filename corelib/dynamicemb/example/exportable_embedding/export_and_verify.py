@@ -20,14 +20,16 @@ from typing import Any
 import torch
 import torch.distributed as dist
 
-
 torch.ops.load_library(
     os.path.join(os.environ["DYNAMICEMB_OPS_LIB_DIR"], "inference_emb_ops.so")
 )
 
 # Register DynamicEmb's export metadata implementations after loading the ops.
+# isort: off
 import dynamicemb.index_range_meta as _index_range_meta  # noqa: E402,F401
 import dynamicemb.lookup_meta as _lookup_meta  # noqa: E402,F401
+
+# isort: on
 from dynamicemb import (  # noqa: E402
     DeltaDumpResult,
     DynamicEmbPoolingMode,
@@ -60,7 +62,6 @@ from pynve.torch.nve_ps import NVEParameterServer  # noqa: E402
 from torchrec import DataType  # noqa: E402
 from torchrec.modules.embedding_configs import EmbeddingConfig  # noqa: E402
 from torchrec.modules.embedding_modules import EmbeddingCollection  # noqa: E402
-
 
 register_nve_export_compat()
 
@@ -110,9 +111,7 @@ class TrainingSparseModel(torch.nn.Module):
         super().__init__()
         self.collections = torch.nn.ModuleDict(
             {
-                name: EmbeddingCollection(
-                    tables=embedding_configs(name), device=device
-                )
+                name: EmbeddingCollection(tables=embedding_configs(name), device=device)
                 for name in collection_names
             }
         )
@@ -253,9 +252,7 @@ def dump_training_artifacts(
     return checkpoint_path, delta_producers
 
 
-def redis_parameter_server(
-    address: str, namespace_id: int
-) -> NVEParameterServer:
+def redis_parameter_server(address: str, namespace_id: int) -> NVEParameterServer:
     parameter_server = NVEParameterServer(
         num_embeddings=0,
         embedding_size=EMBEDDING_DIM,
@@ -314,9 +311,7 @@ def collection_configs(
                 BIT_CONCAT_REDIS: hierarchical_config(
                     EmbeddingCollectionIndexerType.BIT_CONCAT,
                     redis_parameter_server(redis_address, 2026090302),
-                    bit_concat=BitConcatConfig(
-                        table_id_bits=8, feature_id_bits=55
-                    ),
+                    bit_concat=BitConcatConfig(table_id_bits=8, feature_id_bits=55),
                 ),
             }
         )
@@ -366,9 +361,7 @@ def full_inputs(device: torch.device) -> tuple[torch.Tensor, ...]:
     return keys, offsets, keys.clone(), offsets.clone()
 
 
-def post_update_inputs(
-    device: torch.device, round_id: int
-) -> tuple[torch.Tensor, ...]:
+def post_update_inputs(device: torch.device, round_id: int) -> tuple[torch.Tensor, ...]:
     new_feature_id = ROWS_PER_TABLE + round_id - 1
     return (
         torch.tensor([1, 1], dtype=torch.int64, device=device),
@@ -409,9 +402,7 @@ def produce_delta(
     )
     new_feature_id = ROWS_PER_TABLE + round_id - 1
     new_keys = torch.full_like(existing_keys, new_feature_id)
-    table_ids = torch.tensor(
-        [0, 1], dtype=torch.int64, device=existing_keys.device
-    )
+    table_ids = torch.tensor([0, 1], dtype=torch.int64, device=existing_keys.device)
     values = torch.stack(
         [
             torch.full(
@@ -516,9 +507,7 @@ def verify_state(
 ) -> bool:
     for _ in range(REQUESTS_PER_VERIFIED_ROUND):
         outputs = (
-            runtime.run(list(inputs))
-            if hasattr(runtime, "run")
-            else runtime(*inputs)
+            runtime.run(list(inputs)) if hasattr(runtime, "run") else runtime(*inputs)
         )
         if not outputs_match(outputs, expected, stage):
             return False
@@ -557,9 +546,7 @@ def run_four_round_update_workflow(
                 aoti_outputs = aoti_runtime.run(list(initial_inputs))
                 round_ok = outputs_match(
                     eager_outputs, expected_zero, "python_eager_round_1"
-                ) and outputs_match(
-                    aoti_outputs, expected_zero, "python_aoti_round_1"
-                )
+                ) and outputs_match(aoti_outputs, expected_zero, "python_aoti_round_1")
                 if not round_ok:
                     inference_ok = False
                     break
@@ -584,18 +571,24 @@ def run_four_round_update_workflow(
                 if not round_ok:
                     inference_ok = False
                     break
-            inference_ok = linear_evictions_miss(
-                model,
-                model.collection_names.index(LINEAR_HASH_REDIS),
-                state["linear_eviction_query"],
-                "python_eager_round_2_evictions",
-            ) and inference_ok
-            inference_ok = linear_evictions_miss(
-                aoti_runtime,
-                model.collection_names.index(LINEAR_HASH_REDIS),
-                state["linear_eviction_query"],
-                "python_aoti_round_2_evictions",
-            ) and inference_ok
+            inference_ok = (
+                linear_evictions_miss(
+                    model,
+                    model.collection_names.index(LINEAR_HASH_REDIS),
+                    state["linear_eviction_query"],
+                    "python_eager_round_2_evictions",
+                )
+                and inference_ok
+            )
+            inference_ok = (
+                linear_evictions_miss(
+                    aoti_runtime,
+                    model.collection_names.index(LINEAR_HASH_REDIS),
+                    state["linear_eviction_query"],
+                    "python_aoti_round_2_evictions",
+                )
+                and inference_ok
+            )
             torch.cuda.synchronize(device)
             round_two_done.set()
 
@@ -692,9 +685,7 @@ def run_four_round_update_workflow(
 
             second_changed = {
                 LINEAR_HASH_REDIS: {
-                    (table_id, 1): first_changed[LINEAR_HASH_REDIS][
-                        (table_id, 1)
-                    ]
+                    (table_id, 1): first_changed[LINEAR_HASH_REDIS][(table_id, 1)]
                     for table_id in range(2)
                 }
             }
@@ -796,15 +787,9 @@ def linear_evictions_miss(
     inputs: tuple[torch.Tensor, ...],
     stage: str,
 ) -> bool:
-    outputs = (
-        runtime.run(list(inputs))
-        if hasattr(runtime, "run")
-        else runtime(*inputs)
-    )
+    outputs = runtime.run(list(inputs)) if hasattr(runtime, "run") else runtime(*inputs)
     output = outputs[output_index]
-    return outputs_match(
-        [output], [torch.zeros_like(output, device="cpu")], stage
-    )
+    return outputs_match([output], [torch.zeros_like(output, device="cpu")], stage)
 
 
 def live_layer_bindings(
@@ -967,9 +952,7 @@ def run_incremental_cpp_round(
         for update in updates:
             process.stdin.write(update.to_json() + "\n")
         process.stdin.write(
-            "RUN "
-            + ",".join(str(float(value.sum())) for value in expected)
-            + "\n"
+            "RUN " + ",".join(str(float(value.sum())) for value in expected) + "\n"
         )
         process.stdin.flush()
     except (BrokenPipeError, OSError) as error:
@@ -992,9 +975,7 @@ def run_incremental_cpp_round(
             verification_ok = False
         if line.startswith("ACK "):
             acknowledgements.append(
-                EmbeddingCollectionUpdateAck.from_json(
-                    line.removeprefix("ACK ")
-                )
+                EmbeddingCollectionUpdateAck.from_json(line.removeprefix("ACK "))
             )
         if line.rstrip() == "READY incremental updates":
             return acknowledgements, verification_ok
@@ -1095,9 +1076,7 @@ def run_workflow(args: argparse.Namespace) -> bool:
         if not enable_redis:
             with torch.inference_mode():
                 workflow_ok = (
-                    verify_state(
-                        model, inputs, expected_zero, "python_eager_initial"
-                    )
+                    verify_state(model, inputs, expected_zero, "python_eager_initial")
                     and workflow_ok
                 )
                 workflow_ok = (
@@ -1115,9 +1094,7 @@ def run_workflow(args: argparse.Namespace) -> bool:
                 print("RESULT ERROR exportable embedding verification failed")
             return workflow_ok
 
-        from dynamicemb.exportable_embedding import (
-            EmbeddingCollectionUpdateSubscriber,
-        )
+        from dynamicemb.exportable_embedding import EmbeddingCollectionUpdateSubscriber
 
         subscriber_ids = {"eager", "python_aoti"}
         if cpp_process is not None:
@@ -1139,27 +1116,28 @@ def run_workflow(args: argparse.Namespace) -> bool:
             package_dir, update_dir, subscriber_ids
         )
         try:
-            workflow_ok = run_four_round_update_workflow(
-                model=model,
-                aoti_runtime=aoti_runtime,
-                initial_inputs=inputs,
-                expected_zero=expected_zero,
-                weights=weights,
-                names=names,
-                producers=producers,
-                coordinator_connection=coordinator_connection,
-                subscribers=(
-                    ("eager", eager_subscriber),
-                    ("python_aoti", aoti_subscriber),
-                ),
-                inference_stream=inference_stream,
-                device=device,
-                cpp_process=cpp_process,
-            ) and workflow_ok
-            if cpp_process is not None:
-                workflow_ok = (
-                    stop_incremental_cpp_replayer(cpp_process) and workflow_ok
+            workflow_ok = (
+                run_four_round_update_workflow(
+                    model=model,
+                    aoti_runtime=aoti_runtime,
+                    initial_inputs=inputs,
+                    expected_zero=expected_zero,
+                    weights=weights,
+                    names=names,
+                    producers=producers,
+                    coordinator_connection=coordinator_connection,
+                    subscribers=(
+                        ("eager", eager_subscriber),
+                        ("python_aoti", aoti_subscriber),
+                    ),
+                    inference_stream=inference_stream,
+                    device=device,
+                    cpp_process=cpp_process,
                 )
+                and workflow_ok
+            )
+            if cpp_process is not None:
+                workflow_ok = stop_incremental_cpp_replayer(cpp_process) and workflow_ok
                 cpp_process = None
         finally:
             try:

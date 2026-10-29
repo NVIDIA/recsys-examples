@@ -229,9 +229,7 @@ def get_inference_ranking_gr(
 
 def apply_inference(
     training_model: torch.nn.Module,
-    embedding_collection_configs: Mapping[
-        str, InferenceEmbeddingCollectionConfig
-    ],
+    embedding_collection_configs: Mapping[str, InferenceEmbeddingCollectionConfig],
     trained_emb_table_sizes: Mapping[str, int],
     checkpoint_dir: str,
 ) -> InferenceRankingGR:

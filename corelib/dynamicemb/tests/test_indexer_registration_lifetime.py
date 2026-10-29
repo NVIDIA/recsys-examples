@@ -8,8 +8,6 @@ import uuid
 
 import pytest
 import torch
-from torch.multiprocessing.reductions import StorageWeakRef
-
 from dynamicemb.exportable_embedding import (
     EmbeddingCollectionIndexerDirectory,
     dump_embedding_collection_indexers,
@@ -20,6 +18,7 @@ from dynamicemb.exportable_embedding.indexer import (
     FusedIdentityIndexer,
     LinearHashMapIndexer,
 )
+from torch.multiprocessing.reductions import StorageWeakRef
 
 STORAGE_FIELDS = (
     "table_storage",
@@ -102,7 +101,8 @@ def test_shared_registration_survives_either_owner(kind, device, first):
     model = Model(kind, device)
     refs = storage_refs(model.indexer_.snapshot)
     marker, marker_value = model.indexer_.marker_tensor, model.indexer_.marker_value_
-    directory = embedding_collection_indexers_from_model(model)
+    # Keep this owner alive until the explicit del below.
+    directory = embedding_collection_indexers_from_model(model)  # noqa: F841
     second = embedding_collection_indexers_from_model(model)
     if first == "model":
         del model

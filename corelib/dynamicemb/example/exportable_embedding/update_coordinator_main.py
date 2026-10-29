@@ -10,7 +10,6 @@ from multiprocessing.connection import Listener
 
 import torch
 
-
 torch.ops.load_library(
     os.path.join(os.environ["DYNAMICEMB_OPS_LIB_DIR"], "inference_emb_ops.so")
 )
@@ -21,14 +20,11 @@ from dynamicemb.exportable_embedding import (  # noqa: E402
     EmbeddingCollectionUpdateCoordinator,
 )
 
-
 AUTHKEY = b"exportable-embedding-example"
 
 
 def deserialize_delta(payload: bytes) -> DeltaDumpResult:
-    value = torch.load(
-        io.BytesIO(payload), map_location="cpu", weights_only=True
-    )
+    value = torch.load(io.BytesIO(payload), map_location="cpu", weights_only=True)
     return DeltaDumpResult(
         table_names=value["table_names"],
         keys=value["keys"],
@@ -37,7 +33,9 @@ def deserialize_delta(payload: bytes) -> DeltaDumpResult:
     )
 
 
-def serve(listener: Listener, coordinator: EmbeddingCollectionUpdateCoordinator) -> None:
+def serve(
+    listener: Listener, coordinator: EmbeddingCollectionUpdateCoordinator
+) -> None:
     with listener.accept() as connection:
         while True:
             message = connection.recv()

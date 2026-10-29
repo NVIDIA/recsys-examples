@@ -452,8 +452,6 @@ def checkpoint_table_capacities(
         key_files, _ = find_files(directory, name, "emb_keys", filenames)
         # Counting rows (rather than maximum key) preserves sparse-key support.
         # Duplicate keys only over-reserve space; no checkpoint data is changed.
-        rows = sum(
-            os.path.getsize(path) // torch.int64.itemsize for path in key_files
-        )
+        rows = sum(os.path.getsize(path) // torch.int64.itemsize for path in key_files)
         capacities[name] = max(capacities[name], rows)
     return capacities

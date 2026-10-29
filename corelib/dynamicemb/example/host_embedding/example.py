@@ -9,14 +9,14 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import torch
+from dynamicemb.exportable_embedding import (
+    export_embedding_collection_aot,
+    load_embedding_collection_aot,
+)
 from dynamicemb.exportable_tables import (
     EmbeddingCollectionIndexerType,
     InferenceEmbeddingCollectionConfig,
     create_inference_embedding_collection,
-)
-from dynamicemb.exportable_embedding import (
-    export_embedding_collection_aot,
-    load_embedding_collection_aot,
 )
 
 
