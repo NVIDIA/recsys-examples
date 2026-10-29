@@ -3,6 +3,9 @@ project(DynamicEmbInferenceOps LANGUAGES CXX CUDA)
 
 include(GNUInstallDirs)
 
+# setup.py also ships these libraries together inside the Python package.
+list(APPEND CMAKE_BUILD_RPATH "$ORIGIN" "$ORIGIN/../../pynve" "$ORIGIN/../../torch/lib")
+
 set(NVE_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../../third_party/nv-embedding-cache" CACHE PATH "NVE source root")
 
 set(CMAKE_CXX_STANDARD 17)
@@ -127,7 +130,10 @@ if(DYNAMICEMB_ENABLE_NVE_UPDATE AND (
     set(DYNAMICEMB_HAS_NVE_UPDATE ON)
     include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/NVETarget.cmake)
     set(NVE_LIB_DIR "/opt/nve/default/python/pynve" CACHE PATH "NVE library directory")
-    set(NVTX_INCLUDE_DIR "/workspace/deps/NVTX/c/include" CACHE PATH "NVTX include directory")
+    find_path(NVTX_INCLUDE_DIR nvtx3/nvToolsExt.h
+        HINTS /workspace/deps/NVTX/c/include ${CUDAToolkit_INCLUDE_DIRS}
+        REQUIRED
+    )
     find_library(NVE_TORCH_OPS_LIB nve-torch-ops PATHS "${NVE_LIB_DIR}" NO_DEFAULT_PATH REQUIRED)
     find_library(NVE_COMMON_LIB nve-common PATHS "${NVE_LIB_DIR}" NO_DEFAULT_PATH REQUIRED)
 

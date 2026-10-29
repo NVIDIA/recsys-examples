@@ -13,8 +13,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import importlib.util
 import os
 import re
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -254,6 +256,77 @@ def compile_evict_fatbins():
         print(f"[dynamicemb] {out_name}: {os.path.getsize(out)} bytes")
 
 
+def build_inference_extensions(build_lib, inplace):
+    """Reuse the CMake build and package its bindings with their local libraries."""
+    package_dir = root_path / library_name / "exportable_embedding"
+    destination = (
+        package_dir
+        if inplace
+        else Path(build_lib) / library_name / "exportable_embedding"
+    )
+    libraries = (
+        "_C.so",
+        "_C_legacy.so",
+        "inference_emb_ops.so",
+        "inference_emb_update.so",
+    )
+    destination.mkdir(parents=True, exist_ok=True)
+    if not inplace:
+        # build_py can have copied artifacts from an earlier, different build.
+        for name in libraries:
+            (destination / name).unlink(missing_ok=True)
+    nve_spec = importlib.util.find_spec("pynve")
+    enabled = os.environ.get("DYNAMICEMB_BUILD_INFERENCE", "1" if nve_spec else "0")
+    if enabled not in {"0", "1"}:
+        raise ValueError("DYNAMICEMB_BUILD_INFERENCE must be 0 or 1")
+    if enabled == "0":
+        print(
+            "[dynamicemb] inference bindings disabled; set DYNAMICEMB_BUILD_INFERENCE=1 to enable"
+        )
+        return
+    if nve_spec is None:
+        raise RuntimeError(
+            "Inference bindings require pynve; install NVE before building DynamicEmb"
+        )
+    import pynve
+
+    build_dir = root_path / "torch_binding_build"
+    command = [
+        "cmake",
+        "-S",
+        str(root_path),
+        "-B",
+        str(build_dir),
+        f"-DPython3_EXECUTABLE={sys.executable}",
+        f"-DNVE_VERSION={pynve.__version__}",
+        f"-DNVE_LIB_DIR={os.environ.get('NVE_LIB_DIR', str(Path(pynve.__file__).parent))}",
+        "-DDYNAMICEMB_ENABLE_NVE_UPDATE=ON",
+    ]
+    for name in ("NVE_ROOT", "NVTX_INCLUDE_DIR"):
+        if name in os.environ:
+            command.append(f"-D{name}={os.environ[name]}")
+    # Preserve an explicit CMake configuration (including Docker's GPU targets).
+    if not (build_dir / "CMakeCache.txt").exists():
+        subprocess.run(command, check=True)
+    subprocess.run(
+        ["cmake", "--build", str(build_dir), "--parallel", os.environ["MAX_JOBS"]],
+        check=True,
+    )
+    sources = [
+        package_dir / "_C.so",
+        package_dir / "_C_legacy.so",
+        build_dir / "inference_emb_ops.so",
+    ]
+    update_library = build_dir / "inference_emb_update.so"
+    if update_library.exists():
+        sources.append(update_library)
+    for source in sources:
+        target = destination / source.name
+        if source.resolve() != target.resolve():
+            shutil.copy2(source, target)
+        print(f"[dynamicemb] staged {source.name} -> {target}")
+
+
 class NinjaBuildExtension(BuildExtension):
     def __init__(self, *args, **kwargs) -> None:
         # do not override env MAX_JOBS if already exists
@@ -285,14 +358,13 @@ class NinjaBuildExtension(BuildExtension):
         # wheel/install -- copy them in now. Inplace builds import straight from
         # the source tree and don't need this.
         if not self.inplace:
-            import shutil
-
             src_dir = root_path / library_name / "jit"
             dst_dir = os.path.join(self.build_lib, library_name, "jit")
             os.makedirs(dst_dir, exist_ok=True)
             for fb in sorted(src_dir.glob("*.fatbin")):
                 shutil.copy2(str(fb), dst_dir)
                 print(f"[dynamicemb] staged {fb.name} -> {dst_dir}")
+        build_inference_extensions(self.build_lib, self.inplace)
         end_time = time.time()
         compilation_time = end_time - start_time
         print(f"compilation_time: {compilation_time}")
@@ -311,7 +383,11 @@ setup(
     ext_modules=get_extensions(),
     package_data={
         f"{library_name}.jit": ["*.fatbin"],
-        f"{library_name}.exportable_embedding": ["_C.so", "_C_legacy.so"],
+        f"{library_name}.exportable_embedding": [
+            "_C.so",
+            "_C_legacy.so",
+            "inference_emb*.so",
+        ],
     },
     license="BSD-3",
     keywords=[
