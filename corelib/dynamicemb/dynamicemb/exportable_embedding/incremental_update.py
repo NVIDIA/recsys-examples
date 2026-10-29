@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
+from itertools import chain
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Iterable, Mapping, Optional
 
@@ -124,8 +125,9 @@ def _open_parameter_servers(
 
 def _prepare_delta_keys(
     delta: DeltaDumpResult,
+    dense_capacities: Optional[Mapping[str, int]] = None,
 ) -> list[tuple[torch.Tensor, torch.Tensor]]:
-    """Resolve effective removals on CPU before changing any PS or indexer state."""
+    """Validate dense IDs and resolve removals before changing PS or indexer state."""
     columns = len(delta.table_names)
     evicted = delta.evicted_keys or [None] * columns
     erased = getattr(delta, "erased_keys", None) or [None] * columns
@@ -134,14 +136,23 @@ def _prepare_delta_keys(
     ):
         raise ValueError("Delta columns must align with table names")
     result = []
-    for keys, evictions, erases in zip(delta.keys, evicted, erased):
+    for name, keys, evictions, erases in zip(
+        delta.table_names, delta.keys, evicted, erased
+    ):
         keys = keys.to(dtype=torch.int64, device="cpu")
+        feature_ids = keys.tolist()
         removed = set()
         for tensor in (evictions, erases):
             if tensor is not None:
                 removed.update(tensor.to(dtype=torch.int64, device="cpu").tolist())
+        if dense_capacities is not None:
+            if name not in dense_capacities:
+                raise ValueError(f"Unknown table: {name}")
+            capacity = dense_capacities[name]
+            if any(key < 0 or key >= capacity for key in chain(feature_ids, removed)):
+                raise ValueError(f"Feature ID outside the reserved range for {name}")
         # The final dumped value wins over an earlier removal in the same window.
-        removed.difference_update(keys.tolist())
+        removed.difference_update(feature_ids)
         result.append((keys, torch.tensor(sorted(removed), dtype=torch.int64)))
     return result
 
@@ -479,10 +490,24 @@ class EmbeddingCollectionUpdateCoordinator:
     ) -> EmbeddingCollectionUpdate:
         if collection_id in self.host_layers:
             return self._host_update(collection_id, delta)
-        table_keys = _prepare_delta_keys(delta)
+        binding = self.bindings[collection_id]
+        indexer_type = binding.indexer_type
+        dense_capacities = None
+        if indexer_type in (
+            EmbeddingCollectionIndexerType.IDENTITY.value,
+            EmbeddingCollectionIndexerType.FUSED_IDENTITY.value,
+        ):
+            capacities = binding.table_capacities
+            if len(capacities) != len(binding.table_names) or any(
+                c < 0 for c in capacities
+            ):
+                raise ValueError(
+                    "Dense updates require exported per-table capacities; re-export the package"
+                )
+            dense_capacities = dict(zip(binding.table_names, capacities))
+        table_keys = _prepare_delta_keys(delta, dense_capacities)
         snapshot_id = self._next_snapshot_id(collection_id)
         parameter_server = self.parameter_servers[collection_id]
-        indexer_type = self.bindings[collection_id].indexer_type
         if indexer_type == EmbeddingCollectionIndexerType.LINEAR_HASH_MAP.value:
             cache_update_keys, cache_update_values, snapshot_path, retired = (
                 self._linear_update(

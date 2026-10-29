@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Removal deltas must reach Redis, indexer snapshots, and every cache tier."""
+"""Redis deltas must respect table ranges and update every cache tier."""
 
 import itertools
 import shutil
@@ -9,6 +9,7 @@ import socket
 import subprocess
 import time
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -279,3 +280,91 @@ def test_final_upserts_win_over_removals(
         before_ack[0::ROWS] = rt.weights[0::ROWS]
         before_ack[3::ROWS] = rt.weights[3::ROWS]
     check_removal(rt, delta, expected, before_ack)
+
+
+@pytest.mark.parametrize(
+    "kind,table",
+    [(Indexer.IDENTITY, 0), (Indexer.FUSED_IDENTITY, 0), (Indexer.FUSED_IDENTITY, 1)],
+    ids=["identity", "fused_first", "fused_second"],
+)
+@pytest.mark.parametrize(
+    "field,with_upserts",
+    [
+        ("keys", True),
+        ("erased_keys", True),
+        ("evicted_keys", True),
+        ("erased_keys", False),
+        ("evicted_keys", False),
+    ],
+    ids=["upsert", "erase_mixed", "evict_mixed", "erase_only", "evict_only"],
+)
+@pytest.mark.parametrize("bad_id", [-2, -1, ROWS, ROWS + 1])
+@pytest.mark.parametrize("host_cache", [0, CACHE_BYTES], ids=["gpu_only", "host_gpu"])
+def test_dense_delta_rejects_invalid_ids_before_mutation(
+    tmp_path, redis_address, kind, table, field, with_upserts, bad_id, host_cache
+):
+    rt = runtime(tmp_path, redis_address, kind, torch.float32, host_cache)
+    # Put the invalid table last, after valid work for another table when fused.
+    names = [name for i, name in enumerate(rt.names) if i != table] + [rt.names[table]]
+    delta = SimpleNamespace(
+        table_names=names,
+        keys=[torch.tensor([0]) for _ in names],
+        values=[torch.full((1, DIM), 99.0) for _ in names],
+        erased_keys=[torch.tensor([ROWS - 1]) for _ in names],
+        evicted_keys=[None] * len(names),
+    )
+    if not with_upserts:
+        delta.keys = [torch.empty(0, dtype=torch.int64) for _ in names]
+        delta.values = [torch.empty((0, DIM)) for _ in names]
+    if field == "keys":
+        delta.keys[-1] = torch.tensor([0, bad_id])
+        delta.values[-1] = torch.full((2, DIM), 99.0)
+    else:
+        getattr(delta, field)[-1] = torch.tensor([ROWS - 1, bad_id])
+
+    coordinator = rt.coordinator
+    ps = Mock(wraps=coordinator.parameter_servers[rt.id])
+    coordinator.parameter_servers[rt.id] = ps
+    snapshot_ids = coordinator._snapshot_ids.copy()
+    snapshots = coordinator.snapshots.copy()
+    pending_deletes = coordinator._pending_deletes.copy()
+    update_files = set(coordinator.shared_update_dir.iterdir())
+    with pytest.raises(ValueError, match="reserved range"):
+        coordinator.apply_delta(rt.id, delta)
+    ps.insert.assert_not_called()
+    ps.erase.assert_not_called()
+    assert coordinator._snapshot_ids == snapshot_ids
+    assert coordinator._pending_deletes == pending_deletes
+    assert coordinator.snapshots.keys() == snapshots.keys()
+    assert all(
+        coordinator.snapshots[name] is snapshot for name, snapshot in snapshots.items()
+    )
+    assert set(coordinator.shared_update_dir.iterdir()) == update_files
+    torch.testing.assert_close(cold_ps_rows(rt), rt.weights)
+    torch.testing.assert_close(lookup(rt), rt.weights)
+
+
+@pytest.mark.parametrize("kind", [Indexer.IDENTITY, Indexer.FUSED_IDENTITY])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16], ids=["fp32", "fp16"])
+@pytest.mark.parametrize("host_cache", [0, CACHE_BYTES], ids=["gpu_only", "host_gpu"])
+def test_dense_delta_accepts_boundary_upserts(
+    tmp_path, redis_address, kind, dtype, host_cache
+):
+    rt = runtime(tmp_path, redis_address, kind, dtype, host_cache)
+    # Both ends of each reserved range are valid; final upserts still win.
+    keys = [torch.tensor([0, ROWS - 1]) for _ in rt.names]
+    values = [
+        torch.full((2, DIM), 20.0 + i, dtype=dtype) for i, _ in enumerate(rt.names)
+    ]
+    delta = SimpleNamespace(
+        table_names=rt.names,
+        keys=keys,
+        values=values,
+        erased_keys=[torch.tensor([0]) for _ in rt.names],
+        evicted_keys=[torch.tensor([ROWS - 1]) for _ in rt.names],
+    )
+    expected = rt.weights.clone()
+    for table, rows in enumerate(values):
+        expected[table * ROWS] = rows[0]
+        expected[(table + 1) * ROWS - 1] = rows[1]
+    check_removal(rt, delta, expected, expected)
