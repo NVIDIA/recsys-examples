@@ -209,6 +209,8 @@ def get_inference_dense_model_with_feature_names(
         dtype=inference_dtype,
         position_encoding_config=position_encoding_config,
         contextual_max_seqlen=num_contextual_features,
+        backbone=network_args.backbone,
+        transformer_ffn_dim=network_args.transformer_ffn_dim,
     )
 
     ranking_args = RankingArgs()

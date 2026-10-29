@@ -143,6 +143,7 @@ def copy_kvcache_metadata(dst_metadata: KVCacheMetadata, src_metadata: KVCacheMe
     copy_tensor(dst_metadata.kv_indices, src_metadata.kv_indices)
     copy_offsets(dst_metadata.kv_indptr, src_metadata.kv_indptr)
     copy_tensor(dst_metadata.kv_last_page_len, src_metadata.kv_last_page_len)
+    copy_tensor(dst_metadata.total_history_lengths, src_metadata.total_history_lengths)
     copy_tensor(dst_metadata.batch_indices, src_metadata.batch_indices)
     copy_tensor(dst_metadata.position, src_metadata.position)
     copy_tensor(dst_metadata.new_history_nnz_cuda, src_metadata.new_history_nnz_cuda)
