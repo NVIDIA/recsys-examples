@@ -10,13 +10,12 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Iterable, Mapping, Optional
 
 import torch
+
 if TYPE_CHECKING:
     from dynamicemb.incremental_dump import DeltaDumpResult
 
 from .config import EmbeddingCollectionIndexerType
-from .indexer_directory import (
-    load_embedding_collection_indexer_state,
-)
+from .indexer_directory import load_embedding_collection_indexer_state
 from .indexer_snapshot import (
     IndexerSnapshot,
     dump_embedding_collection_indexer_snapshot,
@@ -40,9 +39,9 @@ class EmbeddingCollectionUpdate:
                 "collection_id": self.collection_id,
                 "snapshot_id": self.snapshot_id,
                 "cache_update_keys": self.cache_update_keys.tolist(),
-                "cache_update_values": self.cache_update_values.to(
-                    dtype=torch.float32
-                ).flatten().tolist(),
+                "cache_update_values": self.cache_update_values.to(dtype=torch.float32)
+                .flatten()
+                .tolist(),
                 "indexer_snapshot_path": self.indexer_snapshot_path,
             }
         )
@@ -178,9 +177,7 @@ class EmbeddingCollectionUpdateCoordinator:
         self.host_layers = dict(host_layers or {})
         self.shared_update_dir = shared_update_dir
         self.subscriber_ids = set(subscriber_ids)
-        self._snapshot_ids = {
-            collection_id: 0 for collection_id in self.bindings
-        }
+        self._snapshot_ids = {collection_id: 0 for collection_id in self.bindings}
         self._pending_deletes: dict[
             tuple[str, int], tuple[Any, torch.Tensor, set[str]]
         ] = {}
@@ -204,12 +201,17 @@ class EmbeddingCollectionUpdateCoordinator:
         update_dir.mkdir(parents=True, exist_ok=True)
         metadata = json.loads((package_dir / "metadata.json").read_text())
         layers = metadata if isinstance(metadata, list) else metadata["layers"]
-        hosts = {layer["module_path"]: layer for layer in layers
-                 if layer.get("layer_type") == "HostLayer"}
+        hosts = {
+            layer["module_path"]: layer
+            for layer in layers
+            if layer.get("layer_type") == "HostLayer"
+        }
         return cls(
-            host_layers={name: hosts[binding.nve_layer_module_path]
-                         for name, binding in bindings.items()
-                         if binding.nve_layer_module_path in hosts},
+            host_layers={
+                name: hosts[binding.nve_layer_module_path]
+                for name, binding in bindings.items()
+                if binding.nve_layer_module_path in hosts
+            },
             bindings=bindings,
             snapshots=snapshots,
             device=device,
@@ -367,27 +369,37 @@ class EmbeddingCollectionUpdateCoordinator:
         binding = self.bindings[collection_id]
         config = self.host_layers[collection_id]
         capacities = list(binding.table_capacities)
-        if len(capacities) != len(binding.table_names) or any(c < 0 for c in capacities):
-            raise ValueError("Host updates require exported per-table capacities; re-export the package")
+        if len(capacities) != len(binding.table_names) or any(
+            c < 0 for c in capacities
+        ):
+            raise ValueError(
+                "Host updates require exported per-table capacities; re-export the package"
+            )
         kind = EmbeddingCollectionIndexerType(binding.indexer_type)
         linear = kind == EmbeddingCollectionIndexerType.LINEAR_HASH_MAP
-        if kind not in (EmbeddingCollectionIndexerType.IDENTITY,
-                        EmbeddingCollectionIndexerType.FUSED_IDENTITY,
-                        EmbeddingCollectionIndexerType.LINEAR_HASH_MAP):
+        if kind not in (
+            EmbeddingCollectionIndexerType.IDENTITY,
+            EmbeddingCollectionIndexerType.FUSED_IDENTITY,
+            EmbeddingCollectionIndexerType.LINEAR_HASH_MAP,
+        ):
             raise ValueError("Unsupported HostLayer update indexer")
         if kind == EmbeddingCollectionIndexerType.IDENTITY and len(capacities) != 1:
             raise ValueError("Identity requires a single table")
         dim = int(config["embedding_size"])
         num_rows = int(config["num_embeddings"])
-        expected_rows = sum(capacities) + (0 if kind == EmbeddingCollectionIndexerType.IDENTITY else len(capacities))
+        expected_rows = sum(capacities) + (
+            0 if kind == EmbeddingCollectionIndexerType.IDENTITY else len(capacities)
+        )
         if num_rows != expected_rows:
             raise ValueError("Host storage size does not match the indexer capacities")
         names = list(delta.table_names)
         if len(set(names)) != len(names):
             raise ValueError("Delta table names must be unique")
         erased = getattr(delta, "erased_keys", None) or [None] * len(names)
-        if any(len(items) != len(names) for items in
-               (delta.keys, delta.values, delta.evicted_keys, erased)):
+        if any(
+            len(items) != len(names)
+            for items in (delta.keys, delta.values, delta.evicted_keys, erased)
+        ):
             raise ValueError("Delta columns must align with table names")
         table_ids = {name: i for i, name in enumerate(binding.table_names)}
         # Validate the entire delta before advancing shadow state or writing a snapshot.
@@ -401,18 +413,31 @@ class EmbeddingCollectionUpdateCoordinator:
             for tensor in (keys, delta.evicted_keys[column], erased[column]):
                 if tensor is None:
                     continue
-                if tensor.device.type != "cpu" or tensor.dtype != torch.int64 or tensor.ndim != 1:
-                    raise ValueError("Host delta keys must be one-dimensional CPU int64 tensors")
+                if (
+                    tensor.device.type != "cpu"
+                    or tensor.dtype != torch.int64
+                    or tensor.ndim != 1
+                ):
+                    raise ValueError(
+                        "Host delta keys must be one-dimensional CPU int64 tensors"
+                    )
                 ids = tensor.tolist()
                 if linear:
                     if any(-4 <= key <= -1 for key in ids):
                         raise ValueError("Delta key is reserved by the hash indexer")
                 elif any(key < 0 or key >= capacities[table] for key in ids):
-                    raise ValueError(f"Feature ID outside the reserved range for {name}")
-            if (values.device.type != "cpu" or values.ndim != 2
-                    or tuple(values.shape) != (keys.numel(), dim)
-                    or values.dtype not in (torch.float16, torch.float32)):
-                raise ValueError("Host delta values must be CPU float32/float16 [num_keys, embedding_dim]")
+                    raise ValueError(
+                        f"Feature ID outside the reserved range for {name}"
+                    )
+            if (
+                values.device.type != "cpu"
+                or values.ndim != 2
+                or tuple(values.shape) != (keys.numel(), dim)
+                or values.dtype not in (torch.float16, torch.float32)
+            ):
+                raise ValueError(
+                    "Host delta values must be CPU float32/float16 [num_keys, embedding_dim]"
+                )
             for tensor in (delta.evicted_keys[column], erased[column]):
                 if tensor is not None:
                     removed.extend(tensor.tolist())
@@ -427,7 +452,9 @@ class EmbeddingCollectionUpdateCoordinator:
         if linear:
             old = self.snapshots.get(collection_id)
             if old is None:
-                raise ValueError("Host LinearHashMap updates require sidecar indexer state")
+                raise ValueError(
+                    "Host LinearHashMap updates require sidecar indexer state"
+                )
             entries = linear_hash_entries(old)
             changed_mapping = False
             for table, (upserts, removed) in changes.items():
@@ -437,9 +464,13 @@ class EmbeddingCollectionUpdateCoordinator:
                         row_values[row] = zero
                         changed_mapping = True
                 if len(entries[table].keys() | upserts.keys()) > capacities[table]:
-                    raise ValueError(f"Delta exceeds capacity of table {binding.table_names[table]}")
+                    raise ValueError(
+                        f"Delta exceeds capacity of table {binding.table_names[table]}"
+                    )
             used = {row for mapping in entries for row in mapping.values()}
-            free_rows = (row for row in range(len(capacities), num_rows) if row not in used)
+            free_rows = (
+                row for row in range(len(capacities), num_rows) if row not in used
+            )
             next_row = old.next_fused_key
             for table, (upserts, _) in changes.items():
                 for key, value in upserts.items():
@@ -451,9 +482,11 @@ class EmbeddingCollectionUpdateCoordinator:
                     row_values[entries[table][key]] = value
             if changed_mapping:
                 next_snapshot = rebuild_linear_hash_snapshot(
-                    entries, bucket_capacity=old.bucket_capacity,
+                    entries,
+                    bucket_capacity=old.bucket_capacity,
                     miss_storage_indices=old.miss_storage_indices,
-                    next_fused_key=next_row, device=torch.device("cpu"),
+                    next_fused_key=next_row,
+                    device=torch.device("cpu"),
                 )
         else:
             base = 0
@@ -470,13 +503,16 @@ class EmbeddingCollectionUpdateCoordinator:
         if next_snapshot is not None:
             snapshot_path = dump_embedding_collection_indexer_snapshot(
                 collection_id=collection_id.replace(".", "_"),
-                snapshot_id=snapshot_id, snapshot=next_snapshot,
+                snapshot_id=snapshot_id,
+                snapshot=next_snapshot,
                 output_dir=self.shared_update_dir,
             )
         update = EmbeddingCollectionUpdate(
-            collection_id, snapshot_id,
+            collection_id,
+            snapshot_id,
             torch.tensor(list(row_values), dtype=torch.int64),
-            torch.stack(list(row_values.values())).flatten() if row_values
+            torch.stack(list(row_values.values())).flatten()
+            if row_values
             else torch.empty(0, dtype=torch.float32),
             snapshot_path,
         )
@@ -509,10 +545,13 @@ class EmbeddingCollectionUpdateCoordinator:
         snapshot_id = self._next_snapshot_id(collection_id)
         parameter_server = self.parameter_servers[collection_id]
         if indexer_type == EmbeddingCollectionIndexerType.LINEAR_HASH_MAP.value:
-            cache_update_keys, cache_update_values, snapshot_path, retired = (
-                self._linear_update(
-                    collection_id, delta, parameter_server, snapshot_id, table_keys
-                )
+            (
+                cache_update_keys,
+                cache_update_values,
+                snapshot_path,
+                retired,
+            ) = self._linear_update(
+                collection_id, delta, parameter_server, snapshot_id, table_keys
             )
             if retired:
                 self._pending_deletes[(collection_id, snapshot_id)] = (
@@ -540,9 +579,7 @@ class EmbeddingCollectionUpdateCoordinator:
     def acknowledge(
         self, subscriber_id: str, ack: EmbeddingCollectionUpdateAck
     ) -> None:
-        pending = self._pending_deletes.get(
-            (ack.collection_id, ack.snapshot_id)
-        )
+        pending = self._pending_deletes.get((ack.collection_id, ack.snapshot_id))
         if pending is None:
             return
         parameter_server, keys, waiting = pending

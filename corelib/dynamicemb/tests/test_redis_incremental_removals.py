@@ -13,11 +13,6 @@ from unittest.mock import Mock
 
 import pytest
 import torch
-from pynve import nve
-from pynve.torch import nve_layers
-from pynve.torch.nve_export import save_nve
-from pynve.torch.nve_ps import NVEParameterServer
-
 from dynamicemb.exportable_embedding import (
     EmbeddingCollectionUpdateAck,
     EmbeddingCollectionUpdateCoordinator,
@@ -26,11 +21,15 @@ from dynamicemb.exportable_embedding import (
     embedding_collection_indexers_from_model,
 )
 from dynamicemb.exportable_embedding.config import BitConcatConfig
+from dynamicemb.exportable_tables import EmbeddingCollectionIndexerType as Indexer
 from dynamicemb.exportable_tables import (
-    EmbeddingCollectionIndexerType as Indexer,
     InferenceEmbeddingCollectionConfig,
     create_inference_embedding_collection,
 )
+from pynve import nve
+from pynve.torch import nve_layers
+from pynve.torch.nve_export import save_nve
+from pynve.torch.nve_ps import NVEParameterServer
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="CUDA Redis layers"
@@ -174,7 +173,7 @@ def runtime(path, address, kind, dtype, host_cache):
     )
     # Explicit admission makes warm-tier assertions deterministic; lookup-driven
     # admission is asynchronous and heuristic. This changes only this fixture.
-    for tier in ([1, 0] if host_cache else [0]):
+    for tier in [1, 0] if host_cache else [0]:
         rt.binding.insert(
             storage_keys.numel(),
             storage_keys.data_ptr(),

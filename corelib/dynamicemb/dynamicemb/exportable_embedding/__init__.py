@@ -18,18 +18,17 @@ from .config import (
     EmbeddingCollectionIndexerType,
     InferenceEmbeddingCollectionConfig,
 )
-
-from .indexer_directory import (
-    dump_embedding_collection_indexers,
-    embedding_collection_indexers_from_model,
-    load_embedding_collection_indexers,
-)
 from .indexer import (
     BitConcatIndexer,
     EmbeddingCollectionIndexerBase,
     FusedIdentityIndexer,
     IdentityIndexer,
     LinearHashMapIndexer,
+)
+from .indexer_directory import (
+    dump_embedding_collection_indexers,
+    embedding_collection_indexers_from_model,
+    load_embedding_collection_indexers,
 )
 from .indexer_snapshot import dump_embedding_collection_indexer_snapshot
 from .nve_runtime import (

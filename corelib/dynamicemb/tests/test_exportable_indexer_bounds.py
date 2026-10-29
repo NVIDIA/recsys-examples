@@ -3,7 +3,6 @@
 
 import pytest
 import torch
-
 from dynamicemb.exportable_embedding.indexer import FusedIdentityIndexer
 
 

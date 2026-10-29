@@ -10,16 +10,15 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-from pynve import nve
-from pynve.torch import nve_layers
-from pynve.torch.nve_ps import NVEParameterServer
-
 from dynamicemb.exportable_embedding import _C, export_embedding_collection_aot
 from dynamicemb.exportable_embedding.config import (
     EmbeddingCollectionIndexerType as Indexer,
-    InferenceEmbeddingCollectionConfig,
 )
+from dynamicemb.exportable_embedding.config import InferenceEmbeddingCollectionConfig
 from dynamicemb.exportable_tables import create_inference_embedding_collection
+from pynve import nve
+from pynve.torch import nve_layers
+from pynve.torch.nve_ps import NVEParameterServer
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="CUDA tier bindings"

@@ -15,7 +15,8 @@ from types import SimpleNamespace
 import pytest
 import test_redis_incremental_removals as removal_tests
 import torch
-from test_redis_incremental_removals import (
+from dynamicemb.exportable_embedding import EmbeddingCollectionUpdateAck
+from test_redis_incremental_removals import (  # noqa: F401 - redis_address is a pytest fixture
     CACHE_BYTES,
     DIM,
     ROWS,
@@ -25,8 +26,6 @@ from test_redis_incremental_removals import (
     redis_address,
     runtime,
 )
-
-from dynamicemb.exportable_embedding import EmbeddingCollectionUpdateAck
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="CUDA snapshot retirement"

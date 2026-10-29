@@ -6,14 +6,13 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-from pynve import nve
-from pynve.torch.nve_ps import NVEParameterServer
-
+from dynamicemb.exportable_tables import EmbeddingCollectionIndexerType as Indexer
 from dynamicemb.exportable_tables import (
-    EmbeddingCollectionIndexerType as Indexer,
     InferenceEmbeddingCollectionConfig,
     create_inference_embedding_collection,
 )
+from pynve import nve
+from pynve.torch.nve_ps import NVEParameterServer
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="CUDA source loading"

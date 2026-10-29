@@ -6,13 +6,12 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-
+from dynamicemb.exportable_embedding.indexer import LinearHashMapIndexer
+from dynamicemb.exportable_tables import EmbeddingCollectionIndexerType as Indexer
 from dynamicemb.exportable_tables import (
-    EmbeddingCollectionIndexerType as Indexer,
     InferenceEmbeddingCollectionConfig,
     create_inference_embedding_collection,
 )
-from dynamicemb.exportable_embedding.indexer import LinearHashMapIndexer
 from dynamicemb.key_ownership import murmur3_hash_64bits
 
 
@@ -266,7 +265,8 @@ def test_cpu_process_needs_no_training_imports_or_cuda_initialization():
     import sys
     import textwrap
 
-    script = textwrap.dedent("""
+    script = textwrap.dedent(
+        """
         import sys
         import torch
         def forbidden(*args, **kwargs):
@@ -288,7 +288,8 @@ def test_cpu_process_needs_no_training_imports_or_cuda_initialization():
         assert "dynamicemb_extensions" not in sys.modules
         assert "torchrec" not in sys.modules
         assert not torch.cuda.is_initialized()
-    """)
+    """
+    )
     subprocess.run(
         [sys.executable, "-c", script],
         check=True,

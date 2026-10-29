@@ -144,11 +144,9 @@ def get_inference_dataset_and_embedding_configs(
         }
         for config in embedding_configs:
             config.vocab_size = trained_emb_table_sizes[config.table_name]
-        embedding_collection_configs = (
-            create_kuairand_embedding_collection_configs(
-                dynamic_gpu_cache_size=DYNAMIC_EMBEDDING_GPU_CACHE_SIZE,
-                use_host=host_embeddings,
-            )
+        embedding_collection_configs = create_kuairand_embedding_collection_configs(
+            dynamic_gpu_cache_size=DYNAMIC_EMBEDDING_GPU_CACHE_SIZE,
+            use_host=host_embeddings,
         )
         return (
             dataset_args,
@@ -557,8 +555,11 @@ if __name__ == "__main__":
     parser.add_argument("--gin_config_file", type=str, required=True)
     parser.add_argument("--checkpoint_dir", type=str, required=True)
     parser.add_argument("--disable_auc", action="store_true")
-    parser.add_argument("--host_embeddings", action="store_true",
-                        help="Store and look up embeddings on the host; keep HSTU on CUDA.")
+    parser.add_argument(
+        "--host_embeddings",
+        action="store_true",
+        help="Store and look up embeddings on the host; keep HSTU on CUDA.",
+    )
     parser.add_argument("--max_bs", type=int, default=2)
     parser.add_argument("--debug_flattened_inputs", action="store_true")
     parser.add_argument(

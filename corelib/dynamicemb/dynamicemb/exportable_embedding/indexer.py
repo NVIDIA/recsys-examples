@@ -6,11 +6,9 @@ from abc import ABC, abstractmethod
 from typing import Optional, Sequence
 
 import torch
+
 from . import _C
-from .config import (
-    EmbeddingCollectionIndexerType,
-    InferenceEmbeddingCollectionConfig,
-)
+from .config import EmbeddingCollectionIndexerType, InferenceEmbeddingCollectionConfig
 from .indexer_snapshot import IndexerSnapshot, IndexerSnapshotKind
 
 
@@ -231,17 +229,20 @@ class LinearHashMapIndexer(EmbeddingCollectionIndexerBase):
                 device=feature_ids.device,
             )
             self._snapshot.next_fused_key += missing_ids.numel()
-            slots, evicted_count, evicted_keys, evicted_tables = (
-                self._build_table.insert(
-                    missing_ids,
-                    missing_tables,
-                    ScoreArg(
-                        name="fused_key",
-                        value=assigned,
-                        policy=ScorePolicy.ASSIGN,
-                    ),
-                    collect_evicted=True,
-                )
+            (
+                slots,
+                evicted_count,
+                evicted_keys,
+                evicted_tables,
+            ) = self._build_table.insert(
+                missing_ids,
+                missing_tables,
+                ScoreArg(
+                    name="fused_key",
+                    value=assigned,
+                    policy=ScorePolicy.ASSIGN,
+                ),
+                collect_evicted=True,
             )
             evicted_count_value = int(evicted_count.item())
             direct_failures = slots < 0
