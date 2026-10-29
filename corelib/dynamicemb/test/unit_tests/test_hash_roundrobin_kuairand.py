@@ -1,6 +1,7 @@
 import csv
 import os
 from collections import Counter
+from typing import Tuple
 
 import numpy as np
 import pytest
@@ -30,6 +31,16 @@ def hash_key_cpu(keys_np: np.ndarray) -> np.ndarray:
     return k
 
 
+def stored_keys_cpu(indices: np.ndarray) -> np.ndarray:
+    """The keys as the unsigned 64-bit numbers roundrobin and hash_roundrobin read.
+
+    A table stores a key widened to int64 with its sign, so an int32 key and the
+    int64 key with the same value are one key, with one rank. The rules read
+    those 64 bits as unsigned, so a negative key counts as a large number.
+    """
+    return np.asarray(indices).astype(np.int64).astype(np.uint64)
+
+
 def assign_owner_cpu(
     indices: np.ndarray,
     my_size: int,
@@ -43,10 +54,34 @@ def assign_owner_cpu(
             indices % my_size,
         ).astype(np.int64)
     if dist_type == "roundrobin":
-        return (indices % my_size).astype(np.int64)
+        return (stored_keys_cpu(indices) % np.uint64(my_size)).astype(np.int64)
     if dist_type == "hash_roundrobin":
-        return (hash_key_cpu(indices) % np.uint64(my_size)).astype(np.int64)
+        hashes = hash_key_cpu(stored_keys_cpu(indices))
+        return (hashes % np.uint64(my_size)).astype(np.int64)
     raise ValueError(f"Unsupported dist_type: {dist_type}")
+
+
+def continuous_owner_cpu(
+    indices: np.ndarray,
+    key_dtype: torch.dtype,
+    my_size: int,
+    blk_size: int,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Rank and rewritten key of each key under ``continuous``.
+
+    This rule reads a key in its own width, unsigned, and writes the rewritten
+    key back in that width: an int32 key stays an int32. So a negative key
+    counts as a large number past the last block, and goes by the modulo.
+    """
+    unsigned_dtype = np.uint32 if key_dtype == torch.int32 else np.uint64
+    signed_dtype = np.int32 if key_dtype == torch.int32 else np.int64
+    keys = np.asarray(indices).astype(signed_dtype).astype(unsigned_dtype)
+    block = unsigned_dtype(blk_size)
+    size = unsigned_dtype(my_size)
+    in_blocks = keys < block * size
+    ranks = np.where(in_blocks, keys // block, keys % size)
+    rewritten = np.where(in_blocks, keys % block, keys // size)
+    return ranks.astype(np.int64), rewritten.astype(signed_dtype)
 
 
 def owner_histogram_cpu(
@@ -322,9 +357,10 @@ def test_real_or_zipf_histogram_with_adversarial_remap(feature_name, my_size):
     assert max_min_ratio(hr_hist) < max_min_ratio(rr_hist)
 
 
+@pytest.mark.parametrize("key_dtype", [torch.int64, torch.int32], ids=str)
 @pytest.mark.parametrize("feature_name", ["user_id", "video_id"])
-@pytest.mark.parametrize("my_size", [4, 8])
-def test_bucketize_kernel_matches_cpu_reference(feature_name, my_size):
+@pytest.mark.parametrize("my_size", [3, 4, 7, 8])
+def test_bucketize_kernel_matches_cpu_reference(feature_name, my_size, key_dtype):
     try:
         from dynamicemb_extensions import block_bucketize_sparse_features
     except ImportError:
@@ -347,11 +383,12 @@ def test_bucketize_kernel_matches_cpu_reference(feature_name, my_size):
     )
     batch_indices = adversarial_indices[sample_idx].astype(np.int64)
 
-    indices = torch.tensor(batch_indices, dtype=torch.int64, device="cuda")
+    indices = torch.tensor(batch_indices, dtype=key_dtype, device="cuda")
     lengths = torch.tensor([batch_size], dtype=torch.int64, device="cuda")
+    # In the keys' dtype, as bucketize_kjt_before_all2all passes them.
     block_sizes = torch.tensor(
         [HASH_SIZE // my_size],
-        dtype=torch.int64,
+        dtype=key_dtype,
         device="cuda",
     )
 
@@ -388,10 +425,151 @@ def test_bucketize_kernel_matches_cpu_reference(feature_name, my_size):
             HASH_SIZE // my_size,
         )
 
-        print(f"\n{dist_type_name} kernel (my_size={my_size}, {feature_name}):")
+        print(
+            f"\n{dist_type_name} kernel "
+            f"(my_size={my_size}, {feature_name}, {key_dtype}):"
+        )
         print(f"  CUDA per-rank counts: {rank_counts.tolist()}")
         print(f"  CPU  per-rank counts: {cpu_hist.tolist()}")
 
         assert total_output == batch_size
         assert torch.all(new_indices >= 0).item()
         assert rank_counts.tolist() == cpu_hist.tolist()
+
+
+# World sizes for the edge key checks. The bucketize runs on one GPU for any
+# number of buckets. 2**32 and 2**64 leave different remainders modulo 7 and
+# 100, so there a 32-bit and a 64-bit reading of a negative key give different
+# roundrobin ranks; under hash_roundrobin, at every world size from 2.
+EDGE_KEY_WORLD_SIZES = [1, 2, 3, 5, 6, 7, 8, 12, 16, 100, 255]
+
+
+def edge_keys(key_dtype: torch.dtype) -> torch.Tensor:
+    """Keys of *key_dtype* where a 32-bit and a 64-bit reading can disagree.
+
+    The keys next to 0, where a negative key wraps; next to 2**31, where int32
+    ends; next to 2**32, where uint32 ends; and next to 2**63, where int64 ends.
+    Then random keys over the whole range of the dtype.
+    """
+    info = np.iinfo(np.int32 if key_dtype == torch.int32 else np.int64)
+    edges = set()
+    for bound in (0, 1 << 31, 1 << 32, 1 << 63):
+        for offset in range(-3, 4):
+            edges.update((bound + offset, -(bound + offset)))
+    in_range = sorted(key for key in edges if info.min <= key <= info.max)
+    random_keys = np.random.default_rng(0).integers(
+        info.min, info.max, size=4096, dtype=info.dtype, endpoint=True
+    )
+    keys = np.concatenate([np.array(in_range, dtype=info.dtype), random_keys])
+    return torch.from_numpy(keys).cuda()
+
+
+def bucketize_one_key_per_sample(
+    keys: torch.Tensor, my_size: int, dist_type: str
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Run the bucketize kernels with each key in a sample of its own.
+
+    Then the lengths that kernel1 counts say where each key goes: one 1 per
+    sample, in the row of its rank. Kernel2 writes the keys rank by rank, and
+    the permute it writes says where each key landed.
+
+    Returns the rank of each key, the keys as written, and the permute.
+    """
+    from dynamicemb.dynamicemb_config import DIST_TYPE_CODES
+    from dynamicemb_extensions import block_bucketize_sparse_features
+
+    num_keys = keys.numel()
+    (
+        new_lengths,
+        new_indices,
+        _,
+        _,
+        unbucketize_permute,
+    ) = block_bucketize_sparse_features(
+        torch.ones(num_keys, dtype=torch.int64, device=keys.device),
+        keys,
+        bucketize_pos=False,
+        sequence=True,
+        dist_type_per_feature=torch.tensor(
+            [DIST_TYPE_CODES[dist_type]], dtype=torch.int32, device=keys.device
+        ),
+        block_sizes=torch.tensor(
+            [HASH_SIZE // my_size], dtype=keys.dtype, device=keys.device
+        ),
+        my_size=my_size,
+        max_B=1,
+    )
+    per_rank = new_lengths.view(my_size, num_keys)
+    assert torch.all(per_rank.sum(dim=0) == 1).item()
+    return per_rank.argmax(dim=0), new_indices, unbucketize_permute
+
+
+@pytest.mark.parametrize("dist_type", ["roundrobin", "hash_roundrobin"])
+@pytest.mark.parametrize("my_size", EDGE_KEY_WORLD_SIZES)
+@pytest.mark.parametrize("key_dtype", [torch.int64, torch.int32], ids=str)
+def test_bucketize_kernel_matches_key_ownership(key_dtype, my_size, dist_type):
+    """The bucketize gives each key the rank that key_ownership gives it.
+
+    key_ownership places the keys that a checkpoint or a delta holds. Those are
+    the keys as a table stores them: widened to int64 with their sign. The
+    bucketize places the input key in the KJT's own dtype. For an int32 key the
+    two have to agree as well, or a loaded key sits on one rank and is looked up
+    on another.
+    """
+    pytest.importorskip("dynamicemb_extensions")
+    from dynamicemb.key_ownership import owning_shard
+
+    keys = edge_keys(key_dtype)
+    ranks, new_indices, unbucketize_permute = bucketize_one_key_per_sample(
+        keys, my_size, dist_type
+    )
+
+    stored_keys = keys.to(torch.int64)
+    expected = owning_shard(stored_keys, my_size, dist_type)
+    mismatch = torch.nonzero(ranks != expected).flatten().tolist()
+    assert not mismatch, (
+        f"{len(mismatch)} of {keys.numel()} keys get another rank from the "
+        f"bucketize than from key_ownership. First: key "
+        f"{keys[mismatch[0]].item()}, bucketize rank {ranks[mismatch[0]].item()}, "
+        f"key_ownership rank {expected[mismatch[0]].item()}"
+    )
+    # The reference in this file is written apart from key_ownership, so the
+    # kernel and key_ownership cannot be wrong in the same way and still pass.
+    reference = assign_owner_cpu(
+        stored_keys.cpu().numpy(), my_size, dist_type, HASH_SIZE // my_size
+    )
+    assert ranks.cpu().numpy().tolist() == reference.tolist()
+
+    # Kernel2 puts each key in the rank kernel1 counted it for, unchanged and in
+    # its own dtype.
+    assert new_indices.dtype == key_dtype
+    order = torch.sort(expected, stable=True).indices
+    assert torch.equal(new_indices, keys[order])
+    assert torch.equal(new_indices[unbucketize_permute.long()], keys)
+
+
+@pytest.mark.parametrize("my_size", EDGE_KEY_WORLD_SIZES)
+@pytest.mark.parametrize("key_dtype", [torch.int64, torch.int32], ids=str)
+def test_bucketize_kernel_continuous_keeps_key_width(key_dtype, my_size):
+    """``continuous`` reads a key in its own width and rewrites it in that width.
+
+    key_ownership has no rule for it: it rewrites a key to its offset inside a
+    block, so what a table stores is not the input key. The rewrite of an int32
+    key is an int32.
+    """
+    pytest.importorskip("dynamicemb_extensions")
+
+    keys = edge_keys(key_dtype)
+    ranks, new_indices, unbucketize_permute = bucketize_one_key_per_sample(
+        keys, my_size, "continuous"
+    )
+
+    expected_ranks, rewritten = continuous_owner_cpu(
+        keys.cpu().numpy(), key_dtype, my_size, HASH_SIZE // my_size
+    )
+    assert ranks.cpu().numpy().tolist() == expected_ranks.tolist()
+    assert new_indices.dtype == key_dtype
+    order = np.argsort(expected_ranks, kind="stable")
+    assert new_indices.cpu().numpy().tolist() == rewritten[order].tolist()
+    permute = unbucketize_permute.long().cpu().numpy()
+    assert new_indices.cpu().numpy()[permute].tolist() == rewritten.tolist()
