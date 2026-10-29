@@ -89,6 +89,22 @@ To install DynamicEmb, please use the following command:
 python setup.py install
 ```
 
+When `pynve` is installed, this command also builds the inference bindings with
+CMake and packages their shared libraries. `python setup.py bdist_wheel` includes
+the same inference support; the target environment still needs compatible
+PyTorch and NVE installations. Without `pynve`, the default is training-only.
+Set `DYNAMICEMB_BUILD_INFERENCE=0` to explicitly build training-only, or `1` to
+require inference support and fail if NVE is missing.
+
+Inference builds need NVE's PyTorch bindings, CMake, NVTX headers (normally
+supplied by CUDA), and the repository's recursive NVE submodule checkout. For
+external dependency locations, set `NVE_ROOT`, `NVE_LIB_DIR`, or
+`NVTX_INCLUDE_DIR` as needed. Set
+`TORCH_CUDA_ARCH_LIST` for the deployment GPUs. The existing Docker build continues
+to configure CMake first; `setup.py` reuses its `torch_binding_build` configuration
+and incrementally builds the targets. Reconfigure that directory with CMake when
+changing dependency paths or GPU architecture targets.
+
 ## DynamicEmb APIs
 
 Regarding how to use the DynamicEmb APIs and their parameters, please refer to the [DynamicEmb_APIs.md](./DynamicEmb_APIs.md) file in the same folder as this document.
@@ -101,7 +117,9 @@ Regarding how to use the DynamicEmb APIs and their parameters, please refer to t
 4. The lookup process for each dynamic embedding table incurs additional overhead from unique or radix sort operations. Therefore, if you request a large number of small dynamic embedding tables for lookup, the performance will be poor. Since the lookup range of dynamic embedding tables is particularly large (using the entire range of `int64_t`), it is recommended to create one large embedding table and perform a fused lookup for multiple features.
 5. Although dynamic embedding tables can be trained together with TorchREC tables, they cannot be fused together for embedding lookup. Therefore, it is recommended to select dynamic embedding tables for all model-parallel tables during training.
 6. DynamicEmb supports training with TorchREC's `EmbeddingBagCollection` (pooling mode: SUM/MEAN) and `EmbeddingCollection` (sequence mode). Both modes use fused CUDA kernels for embedding lookup and gradient reduction. Tables with different embedding dimensions are supported in pooling mode.
-7. DynamicEmb supports Torch-exportable embedding tables through `InferenceEmbeddingTable`. It uses DynamicEmb `ScoredHashTable` metadata frozen at export/inference time and `LinearUVMEmbedding` from [NVEmbedding](https://github.com/NVIDIA/nv-embedding-cache), supporting sequence mode and pooling mode (`SUM`, `MEAN`). It is initialized from `DynamicEmbTableOptions` and loads from DynamicEmb dumped embedding files.
+7. DynamicEmb supports exportable inference embedding collections with configurable indexing and NVE GPU, LinearUVM, or hierarchical storage. Data-backed indexer state is exported as a sidecar, while Redis-backed hierarchical collections use an ephemeral NVHashMap host cache and support incremental load.
+
+   See the [verified example](./example/exportable_embedding/README.md).
 
 ### DynamicEmb Insertion Behavior Checking Modes
 

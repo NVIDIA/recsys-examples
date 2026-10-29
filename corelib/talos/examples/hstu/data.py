@@ -36,7 +36,9 @@ class SyntheticSequenceDataset(Dataset):
         seed: int = 0,
     ) -> None:
         if vocab_size < num_user_groups + 8:
-            raise ValueError("vocab_size must be comfortably larger than num_user_groups")
+            raise ValueError(
+                "vocab_size must be comfortably larger than num_user_groups"
+            )
 
         g = torch.Generator().manual_seed(seed)
         user_group = torch.randint(1, num_user_groups + 1, (num_samples,), generator=g)
@@ -44,7 +46,9 @@ class SyntheticSequenceDataset(Dataset):
         noise = torch.randint(0, 5, (num_samples, seq_len + 1), generator=g)
         drift = torch.arange(seq_len + 1).unsqueeze(0)
 
-        seq = (first_item.unsqueeze(1) + 7 * user_group.unsqueeze(1) + 3 * drift + noise) % (vocab_size - 1)
+        seq = (
+            first_item.unsqueeze(1) + 7 * user_group.unsqueeze(1) + 3 * drift + noise
+        ) % (vocab_size - 1)
         seq = seq + 1
 
         self.input_ids = seq[:, :-1].long()
@@ -115,10 +119,16 @@ class MovieLensSequenceDataset(Dataset):
 
         if max_users is not None:
             keep = set(sorted(by_user)[:max_users])
-            by_user = {user_id: events for user_id, events in by_user.items() if user_id in keep}
+            by_user = {
+                user_id: events
+                for user_id, events in by_user.items()
+                if user_id in keep
+            }
             item_ids = {item_id for events in by_user.values() for _, item_id in events}
 
-        self.item_to_dense = {item_id: idx + 1 for idx, item_id in enumerate(sorted(item_ids))}
+        self.item_to_dense = {
+            item_id: idx + 1 for idx, item_id in enumerate(sorted(item_ids))
+        }
         self.vocab_size = len(self.item_to_dense) + 1
         self.user_sequences: list[torch.Tensor] = []
         self.user_groups: list[int] = []

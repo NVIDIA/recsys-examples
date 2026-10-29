@@ -49,10 +49,6 @@ kernel attributes to the same module and source line as its forward
 (an optimizer step, a free function) its own path + class.
 """
 
-from .python.profiler import (
-    TalosProfiler,
-    talos_profiler,
-    nvtx_range,
-)
+from .python.profiler import TalosProfiler, nvtx_range, talos_profiler
 
 __all__ = ["TalosProfiler", "talos_profiler", "nvtx_range"]

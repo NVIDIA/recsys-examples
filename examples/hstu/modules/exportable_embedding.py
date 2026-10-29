@@ -75,8 +75,9 @@ import commons.ops.cuda_ops.fake_hstu_cuda_ops  # noqa: F401 – registers fake 
 
 from commons.modules.embedding import ShardedEmbedding, ShardedEmbeddingConfig
 from dynamicemb.exportable_tables import (
+    EmbeddingCollectionIndexerType,
     InferenceEmbeddingCollection,
-    create_inference_embedding_collection,
+    InferenceEmbeddingCollectionConfig,
 )
 from modules.nve_compat import needs_legacy_embedding_lookup_fake_override
 from torchrec.modules.embedding_configs import EmbeddingConfig
@@ -135,8 +136,8 @@ class ExportableEmbedding(torch.nn.Module):
         dynamic_embedding_configs: Union[
             List[EmbeddingConfig], List[InferenceEmbeddingConfig]
         ],
-        static_embedding_collection: Optional[InferenceEmbeddingCollection] = None,
-        dynamic_embedding_collection: Optional[InferenceEmbeddingCollection] = None,
+        static_embedding_collection: InferenceEmbeddingCollection,
+        dynamic_embedding_collection: InferenceEmbeddingCollection,
     ):
         super(ExportableEmbedding, self).__init__()
         assert (
@@ -166,14 +167,6 @@ class ExportableEmbedding(torch.nn.Module):
         self._static_embedding_configs = static_embedding_configs
         self._dynamic_embedding_configs = dynamic_embedding_configs
 
-        if static_embedding_collection is None:
-            static_embedding_collection = create_inference_embedding_collection(
-                self._static_embedding_configs, pooling_mode=-1, use_dynamic=False
-            )
-        if dynamic_embedding_collection is None:
-            dynamic_embedding_collection = create_inference_embedding_collection(
-                self._dynamic_embedding_configs, pooling_mode=-1, use_dynamic=True
-            )
         self._static_embedding_collection = static_embedding_collection
         self._dynamic_embedding_collection = dynamic_embedding_collection
 
@@ -377,8 +370,8 @@ class ExportableEmbedding(torch.nn.Module):
 
 def get_exportable_embedding(
     embedding_configs: List[InferenceEmbeddingConfig],
-    static_embedding_collection: Optional[InferenceEmbeddingCollection] = None,
-    dynamic_embedding_collection: Optional[InferenceEmbeddingCollection] = None,
+    static_embedding_collection: InferenceEmbeddingCollection,
+    dynamic_embedding_collection: InferenceEmbeddingCollection,
 ):
     static_embedding_configs, dynamic_embedding_configs = [], []
     for config in embedding_configs:
@@ -396,10 +389,69 @@ def get_exportable_embedding(
 
 def apply_inference_sparse(
     training_embedding: ShardedEmbedding,
-) -> InferenceEmbeddingCollection:
+) -> ExportableEmbedding:
+    static_collection = training_embedding._data_parallel_embedding_collection
+    dynamic_collection = training_embedding._model_parallel_embedding_collection
+    if not isinstance(
+        static_collection, InferenceEmbeddingCollection
+    ) or not isinstance(dynamic_collection, InferenceEmbeddingCollection):
+        raise TypeError("embedding collections must be converted before wrapping")
+
     return ExportableEmbedding(
-        training_embedding._model_parallel_embedding_collection.embedding_configs,
-        training_embedding._data_parallel_embedding_collection.embedding_configs,
-        training_embedding._data_parallel_embedding_collection,
-        training_embedding._model_parallel_embedding_collection,
+        static_embedding_configs=static_collection.embedding_configs,
+        dynamic_embedding_configs=dynamic_collection.embedding_configs,
+        static_embedding_collection=static_collection,
+        dynamic_embedding_collection=dynamic_collection,
     )
+
+
+def create_kuairand_embedding_collection_configs(
+    *, dynamic_gpu_cache_size: int, use_host: bool = False
+) -> Dict[str, InferenceEmbeddingCollectionConfig]:
+    static_config = InferenceEmbeddingCollectionConfig(
+        indexer_type=EmbeddingCollectionIndexerType.FUSED_IDENTITY,
+        nve_layer_type="host" if use_host else "gpu",
+        indexer_state_sidecar=False,
+    )
+    dynamic_config = InferenceEmbeddingCollectionConfig(
+        indexer_type=EmbeddingCollectionIndexerType.LINEAR_HASH_MAP,
+        nve_layer_type="host" if use_host else "linear_uvm",
+        indexer_state_sidecar=False,
+        gpu_cache_size=None if use_host else dynamic_gpu_cache_size,
+    )
+    return {
+        "user_id": dynamic_config,
+        "user_active_degree": static_config,
+        "follow_user_num_range": static_config,
+        "fans_user_num_range": static_config,
+        "friend_user_num_range": static_config,
+        "register_days_range": static_config,
+        "video_id": dynamic_config,
+        "action_weights": static_config,
+    }
+
+
+def checkpoint_table_capacities(
+    checkpoint_dir: str,
+    collection_configs: Dict[str, InferenceEmbeddingCollectionConfig],
+    table_sizes: Dict[str, int],
+) -> Dict[str, int]:
+    """Reserve every saved sparse row; training capacity estimates can be smaller."""
+    from dynamicemb.checkpoint_io import find_files, list_checkpoint_files
+
+    directory = os.path.join(
+        checkpoint_dir,
+        "dynamicemb_module",
+        "model._embedding_collection._model_parallel_embedding_collection",
+    )
+    filenames = list_checkpoint_files(directory, collection_configs)
+    capacities = dict(table_sizes)
+    for name, config in collection_configs.items():
+        if config.indexer_type != EmbeddingCollectionIndexerType.LINEAR_HASH_MAP:
+            continue
+        key_files, _ = find_files(directory, name, "emb_keys", filenames)
+        # Counting rows (rather than maximum key) preserves sparse-key support.
+        # Duplicate keys only over-reserve space; no checkpoint data is changed.
+        rows = sum(os.path.getsize(path) // torch.int64.itemsize for path in key_files)
+        capacities[name] = max(capacities[name], rows)
+    return capacities

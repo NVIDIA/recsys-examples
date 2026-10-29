@@ -60,11 +60,13 @@ def main(argv: list[str] | None = None) -> int:
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument(
-        "--skip-observer-build", action="store_true",
+        "--skip-observer-build",
+        action="store_true",
         help="don't pre-compile the C++ profiling observer after linking",
     )
     parser.add_argument(
-        "agents", nargs="+",
+        "agents",
+        nargs="+",
         type=_agent_token,
         metavar="{" + ",".join(AGENTS) + "}",
         help=(

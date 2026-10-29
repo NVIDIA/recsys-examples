@@ -79,7 +79,8 @@ def main(argv: list[str] | None = None) -> int:
         help="create a fresh .torch_optimize/ (backs up any existing one first)",
     )
     p_init.add_argument(
-        "--root", default=".",
+        "--root",
+        default=".",
         help="directory to create .torch_optimize/ under (default: current directory)",
     )
 

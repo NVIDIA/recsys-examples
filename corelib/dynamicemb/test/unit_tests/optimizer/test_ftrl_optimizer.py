@@ -145,9 +145,7 @@ def _fresh_ftrl_values(
 @cuda
 @pytest.mark.parametrize("emb_dim,all_dims_vec4", [(4, True), (5, False)])
 @pytest.mark.parametrize("group_lasso_reg", [0.0, 0.2], ids=["plain", "group"])
-def test_ftrl_flat_table_matches_padded_buffer(
-    emb_dim, all_dims_vec4, group_lasso_reg
-):
+def test_ftrl_flat_table_matches_padded_buffer(emb_dim, all_dims_vec4, group_lasso_reg):
     """The two kernels differ only in how they find a row, not in the update."""
     device = torch.device("cuda")
     num_rows = 32
@@ -556,7 +554,9 @@ def _padded_group_step(optimizer, values, grads, emb_dim, all_dims_vec4):
 @cuda
 @pytest.mark.parametrize("all_dims_vec4", [True, False], ids=["vec4", "scalar"])
 @pytest.mark.parametrize(
-    "dtype", [torch.float32, torch.float16, torch.bfloat16], ids=["fp32", "fp16", "bf16"]
+    "dtype",
+    [torch.float32, torch.float16, torch.bfloat16],
+    ids=["fp32", "fp16", "bf16"],
 )
 def test_ftrl_group_threshold_boundary(all_dims_vec4, dtype):
     """A row exactly at the threshold is zeroed; just above it is not; just below is.
@@ -583,8 +583,11 @@ def test_ftrl_group_threshold_boundary(all_dims_vec4, dtype):
     values = values.to(device)
 
     _padded_group_step(
-        optimizer, values, torch.zeros(3, emb_dim, dtype=dtype, device=device),
-        emb_dim, all_dims_vec4,
+        optimizer,
+        values,
+        torch.zeros(3, emb_dim, dtype=dtype, device=device),
+        emb_dim,
+        all_dims_vec4,
     )
     out = values.cpu()
 

@@ -1239,9 +1239,7 @@ class PyDictStorage(Storage[DynamicEmbTableOptions, BaseDynamicEmbeddingOptimize
                         n, value_dim, dtype=torch.float32, device=self.device
                     )
                     values[:, :dim] = embeddings
-                    self.optimizer.reset_optimizer_states(
-                        values[:, dim:], emb_dims=dim
-                    )
+                    self.optimizer.reset_optimizer_states(values[:, dim:], emb_dims=dim)
                 else:
                     values = embeddings
 
@@ -1362,7 +1360,7 @@ def init_embedding_tables(stbe, bdet):
         num_emb = split.size(0)
         emb_dim = split.size(1)
         opt_state_dim = optimizer.get_state_dim(emb_dim)
-        val_dim = emb_dim + opt_state_dim
+        emb_dim + opt_state_dim
         indices = torch.arange(num_emb, device=split.device, dtype=torch.long)
         table_ids = torch.full(
             (num_emb,), table_idx, dtype=torch.int64, device=split.device

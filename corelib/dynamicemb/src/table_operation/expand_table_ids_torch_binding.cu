@@ -84,20 +84,6 @@ at::Tensor expand_table_ids_cuda_impl(
     return table_ids;
 }
 
-// at::Tensor expand_table_ids_cpu_impl(
-//     at::Tensor offsets, at::Tensor indices, c10::optional<at::Tensor> table_offsets_in_feature,
-//     int64_t num_tables, int64_t local_batch_size, int64_t num_elements) {
-//     TORCH_WARN_ONCE(
-//         "INFERENCE_EMB::expand_table_ids has no CPU kernel. "
-//         "Please move inputs to CUDA and load inference_emb_ops.so before calling this operator."
-//     );
-//     TORCH_CHECK(
-//         false,
-//         "INFERENCE_EMB::expand_table_ids is CUDA-only. Got CPU dispatch."
-//     );
-//     return at::Tensor();
-// }
-
 at::Tensor expand_table_ids_meta_impl(
     at::Tensor offsets, at::Tensor indices, c10::optional<at::Tensor> table_offsets_in_feature,
     int64_t num_tables, int64_t local_batch_size) {
@@ -109,10 +95,6 @@ at::Tensor expand_table_ids_meta_impl(
 TORCH_LIBRARY_IMPL(INFERENCE_EMB, CUDA, m) {
     m.impl("expand_table_ids", &dyn_emb::expand_table_ids_cuda_impl);
 }
-
-// TORCH_LIBRARY_IMPL(INFERENCE_EMB, CPU, m) {
-//     m.impl("expand_table_ids", &dyn_emb::expand_table_ids_cpu_impl);
-// }
 
 TORCH_LIBRARY_IMPL(INFERENCE_EMB, Meta, m) {
     m.impl("expand_table_ids", &dyn_emb::expand_table_ids_meta_impl);
