@@ -370,6 +370,8 @@ dynamicemb provides the following strategies to set the score.
         NO_EVICTION:
             The table’s capacity doubles whenever there are not enough slots for new keys, and this continues until available memory is exhausted.
             When the memory resources are insufficient, there will be a warning message, and training can continue but the accuracy of eviction cannot be guaranteed.
+            Used alone, it keeps no score. It can be combined with `CUSTOMIZED` as `(NO_EVICTION, CUSTOMIZED)` (either order), which keeps the user's score.
+            `incremental_dump` skips such tables (with a warning) and `replay_increment` refuses them.
         """
 
         TIMESTAMP = 0
@@ -407,6 +409,13 @@ consistent with each other:
 
 Choose the order that matches how you want checkpoint columns laid out and how you
 index `scores` in your `score_function` — the two always agree.
+
+`(NO_EVICTION, CUSTOMIZED)` (either order) is the other supported combination. It is
+not a second score: `NO_EVICTION` is a mode (the table never evicts, it grows), and
+the table keeps **one** score, `CUSTOMIZED`'s. Set it with `set_score` before a forward
+pass exactly as for a plain `CUSTOMIZED` table. `NO_EVICTION` used alone keeps **no**
+score. Neither form supports `incremental_dump` / `replay_increment`: such a table has
+no timestamp to take a delta by, and its erased keys are the user's to manage.
 
 ### Customized eviction via `score_function`
 
@@ -823,8 +832,9 @@ Fields declared first (through `device_id`) are **planner/runtime-heavy**: `Dyna
                 as they are the same table, but stored on different ranks.
             A *compound* score strategy may be given as a tuple to keep **more than
             one** score per key. Only
-            `(DynamicEmbScoreStrategy.TIMESTAMP, DynamicEmbScoreStrategy.LFU)` (in
-            either order) is supported for now: it ranks eviction by the LFU access
+            `(DynamicEmbScoreStrategy.TIMESTAMP, DynamicEmbScoreStrategy.LFU)` and
+            `(DynamicEmbScoreStrategy.NO_EVICTION, DynamicEmbScoreStrategy.CUSTOMIZED)` (in
+            either order) are supported for now. The first ranks eviction by the LFU access
             count while ALSO keeping a per-key last-access timestamp (two scores per
             key, +8 bytes/key) so items touched since the last dump can be selected by
             a time-based `incremental_dump`. Both tuple orders evict identically; the
@@ -1040,7 +1050,8 @@ Given a model contains one or more `ShardedDynamicEmbeddingCollection`, this API
 
 The meaning of the threshold depends on the table's `score_strategy`:
 - Strategies that carry a device-timestamp column — the single `TIMESTAMP` strategy, or a compound strategy that includes `TIMESTAMP` such as `(TIMESTAMP, LFU)` — produce a **time-based** incremental dump: only items whose last-access timestamp crosses the threshold (i.e. items that were touched/changed since the reference time) are dumped. Use the value returned by `get_score` as the reference threshold.
-- Strategies without a timestamp column (e.g. `STEP`, single `LFU`, `NO_EVICTION`) instead threshold on the **absolute score value**: items whose score is not less than the threshold are dumped. This is not a time-based increment.
+- Strategies without a timestamp column (e.g. `STEP`, single `LFU`) instead threshold on the **absolute score value**: items whose score is not less than the threshold are dumped. This is not a time-based increment.
+- Tables whose strategy contains `NO_EVICTION` (alone or as `(NO_EVICTION, CUSTOMIZED)`) are **skipped** with a `UserWarning` and are absent from the result; nothing is drained from them. They have no timestamp to take a delta by, and their erased keys are the user's to manage.
 
 > **Limitation — `dist_type`:** `incremental_dump` supports only `roundrobin` and `hash_roundrobin` sharding. A table sharded with `dist_type="continuous"` raises `NotImplementedError`. The returned `slot_index` is meant for precise `replay_increment`, which reconstructs each key's owning rank from the key via `(key or hash(key)) % world_size`; `continuous` uses a different, range-based key→rank mapping that this path does not implement. Use `roundrobin` or `hash_roundrobin` if you need incremental dump.
 
@@ -1087,7 +1098,7 @@ The meaning of the threshold depends on the table's `score_strategy`:
               Timestamp columns hold an **age** (`current_score - score`), not a
               raw timestamp, since `%globaltimer` is per device and resets across
               boots; a consumer rebases them onto its own clock. Every other
-              column (LFU frequency, STEP, CUSTOMIZED, NO_EVICTION row) is
+              column (LFU frequency, STEP, CUSTOMIZED) is
               carried verbatim.
             - ``erased_keys: List[Optional[torch.Tensor]]`` -- per-table keys an
               explicit erase removed, for tables whose ``evicted_item_mode``
@@ -1104,13 +1115,27 @@ The meaning of the threshold depends on the table's `score_strategy`:
                   ``incremental_dump`` threshold.
                 - ``"slot_index": torch.Tensor`` -- int64 host tensor aligned with
                   ``keys``; the storage slot each dumped key occupies (for
-                  ``replay_increment``).
+                  ``replay_increment``). A storage keeps a value row per key,
+                  apart from the slot, so it is an ``[N, 2]`` int64 tensor: the key
+                  slot and the value row.
+                - ``"num_rows": List[int]`` -- how many value rows each source
+                  rank had handed out, in rank order; the receiver picks the entry
+                  of its own shard. A delta names only the rows that changed, so
+                  replay takes the row counter from here.
+                - ``"erased_slot_index": List[torch.Tensor]`` -- per source rank,
+                  the ``[M, 2]`` int64 (slot, row) of every slot a retained erase left
+                  reclaimed since the last dump (an erased slot keeps its row), so a
+                  replica can recreate them. Only complete if the erases were
+                  retained (`RETAIN_KEY`); see ``erase_untracked``.
+                - ``"erase_untracked": bool`` -- the table erased keys without
+                  retaining them (on any rank of the dumping group), so
+                  ``erased_slot_index`` misses the slots they left and the delta
+                  cannot be replayed exactly. Sticky. ``replay_increment`` refuses
+                  such a delta.
                 - ``"current_capacity": int`` -- key-map slots: the modulus that
                   decides a key's home bucket.
                 - ``"row_capacity": Tuple[int, ...]`` -- value-buffer rows per
-                  storage tier, which is what bounds a row write. Equal to
-                  `current_capacity` except under NO_EVICTION, whose key map is
-                  deliberately larger than its value buffer.
+                  storage tier, which is what bounds a row write.
                 - ``"bucket_capacity": int`` -- slots per hash bucket.
                 - ``"num_scores": int`` -- score words per key; part of the
                   slot layout ``replay_increment`` compares against.
@@ -1135,7 +1160,13 @@ The same rule is enforced per key inside the kernel — a slot that does not lan
 
 > **Precondition:** writing a key at its source slot **overwrites whatever occupies that slot** in the target. That is what makes a replica converge — if the source evicted key `B` to make room for `A`, a same-capacity replica must do the same. It also means a replayed table must be built *only* by loading/replaying from its source: a table that also takes independent writes can lose a key whose slot a delta key claims.
 
-*Scores and optimizer state travel under `ReplayContent`,* which asks for both by default. Drop `SCORE` and a restored key is scored as if it had just been inserted into the target, so the replica ranks its own future evictions by when it received each key rather than by how the source ranked it — the two can evict in different orders, but never disagree on the value of a key they both hold. Drop `OPTIMIZER_STATE` and a key keeps its state only if it already occupies the target row. NO_EVICTION is unaffected by `SCORE` either way and is exact: its score word is a value row, not a score.
+*Rows and erases.* A storage keeps a value row per key, apart from the key's slot, and an erased key leaves its slot reclaimed, still owning its row. For a replica to keep the same rows, an erase that should be replayed has to be **retained**: `erase_keys(..., mode=EvictedItemMode.RETAIN_KEY)`. A table that erased keys **without** `RETAIN_KEY` (on any rank of the dumping group) is marked, `meta["erase_untracked"]` is set, and `replay_increment` raises `ValueError` for its deltas; the mark is sticky, so rebuild the replica from a full checkpoint after such an erase. Within a delta the order is: erase by key, recreate the reclaimed slots (`meta["erased_slot_index"]`), then upsert.
+
+*The source growing ends the delta chain.* A target's capacity does not change on its own. Once the source table expands (rehash), its capacity no longer matches the target's, and every delta dumped from then on is rejected (`capacity` mismatch). Rebuild the target from a full checkpoint of the grown source and replay what comes after it.
+
+*`NO_EVICTION` tables* are not replayed: `incremental_dump` skips them, and a delta that names one is refused with `NotImplementedError`.
+
+*Scores and optimizer state travel under `ReplayContent`,* which asks for both by default. Drop `SCORE` and a restored key is scored as if it had just been inserted into the target, so the replica ranks its own future evictions by when it received each key rather than by how the source ranked it — the two can evict in different orders, but never disagree on the value of a key they both hold. Drop `OPTIMIZER_STATE` and a key keeps its state only if it already occupies the target row. 
 
 *Sharding.* Replay keeps only the keys this rank owns, recomputing ownership from the key with **this** model's global world size — the fan-out the tables were sharded over. There is deliberately no process-group argument: replay is local (filter, then write), so a group could only narrow the modulus and mis-route every key. A delta gathered over a process group (`incremental_dump(..., pg)`) holds the whole group's keys and so fans out correctly when the same delta is handed to every rank. A per-rank delta (`pg=None`) holds only the producing rank's keys and should be replayed there — replaying it on another rank is not an error, every key simply belongs to someone else and is skipped, which `ReplayStats.skipped` reports. Like `incremental_dump`, only `roundrobin` and `hash_roundrobin` are supported; `continuous` raises `NotImplementedError`.
 
@@ -1299,7 +1330,7 @@ Under CUSTOMIZED mode, users need to understand the meaning of get_score's retur
 
 ## set_score
 
-Under CUSTOMIZED mode, users have to set the scores for each table.
+Under CUSTOMIZED mode, users have to set the scores for each table. This holds for a table configured with `(NO_EVICTION, CUSTOMIZED)` (either order) as well; `set_score` is refused for a table whose score part is anything else.
 Users can set the scores one time and use it repeatedly in the several forward passes later.
 Generally speaking, the score increases as training progresses, and dynamicemb will throw a warning when the new score is less than the old one.
 Setting the environment variable DYNAMICEMB_CSTM_SCORE_CHECK to 0 will not throw the warnings.
@@ -1552,7 +1583,8 @@ Users can specify the initial capacity of a table on a single GPU. When the tabl
 **Trigger conditions:**
 
 - **Non–NO_EVICTION**: When `max_load_factor` would be exceeded or (if set) at `max_capacity`, the table(s) that need it are doubled. See `init_capacity`, `max_load_factor`, `max_capacity` in `DynamicEmbTableOptions`.
-- **NO_EVICTION**: The option `max_load_factor` is not used. The key_index_map is sized and expanded with a fixed effective max load factor of **0.5** (key_index_map capacity = ceil(init_capacity/0.5) at creation; expansion when `needed > table_rows` or `needed > key_index_map.capacity(table_id)`). Both the key_index_map and the embedding buffer are doubled for the affected table(s).
+- **NO_EVICTION**: The option `max_load_factor` is not used. The key_index_map is sized and expanded with a fixed effective max load factor of **0.5**: at creation its capacity is ceil(init_capacity/0.5) rounded up to whole buckets, and the embedding (value) buffer has **exactly half** that many rows, so the key_index_map is twice the embedding buffer at creation and after every expansion. A table is sized by the **rows it has handed out**, not by the keys it holds: an erased key's slot keeps its row until another key takes that slot, so rows can outnumber live keys, and expansion is triggered when `rows handed out + new unique keys` exceed the embedding buffer's rows. The growth is not capped by `max_capacity`.
+- **Loading a checkpoint** (`DynamicEmbStorage.load`): the table is sized for the keys **this rank keeps** from the file (counted from the key file with the rank's ownership filter), not for every key in it, since a checkpoint may hold other ranks' keys as well.
 
 
 ## Dump/Load and Incremental dump

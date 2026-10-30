@@ -141,6 +141,19 @@ def export_optimizer_state(model, table_id: int = 0) -> dict:
     return out
 
 
+def assert_rows_accounted_for(model, table_id: int = 0) -> None:
+    """Every row below the counter sits on a live or a reclaimed slot, and no two
+    live keys share a row: what lets a rehash carry rows without moving values."""
+    kim = model._storage.key_index_map
+    keys = kim.keys_.view(torch.int64)
+    rows = kim.rows_.view(kim.num_buckets_, kim.bucket_capacity_)
+    reclaimed = (keys == -2) & (rows >= 0)
+    live = (keys != -1) & (keys != -2)
+    assert kim.num_rows(table_id) == int(live.sum() + reclaimed.sum())
+    owned = rows[live | reclaimed].tolist()
+    assert len(owned) == len(set(owned)), "a row is owned by two slots"
+
+
 @pytest.mark.parametrize(
     "score_strategy",
     [
@@ -148,9 +161,6 @@ def export_optimizer_state(model, table_id: int = 0) -> dict:
         DynamicEmbScoreStrategy.STEP,
         DynamicEmbScoreStrategy.LFU,
         (DynamicEmbScoreStrategy.TIMESTAMP, DynamicEmbScoreStrategy.LFU),
-        # NO_EVICTION exercises the packed slot_index (key slot in the high 32
-        # bits, value row in the low 32) and the auto-increment row counter.
-        DynamicEmbScoreStrategy.NO_EVICTION,
     ],
 )
 def test_replay_round_trip(current_device, score_strategy):
@@ -162,12 +172,33 @@ def test_replay_round_trip(current_device, score_strategy):
 
     keys = list(range(1001, 1301))
     touch(src, keys, device)
+    # Erase the last keys in: their rows stay allocated, so the delta names
+    # fewer rows than the source has handed out, and a replica cannot tell how
+    # many from the delta's keys alone.
+    erased, keys = keys[-20:], keys[:-20]
+    src._storage.erase_keys(
+        0,
+        torch.tensor(erased, dtype=torch.int64, device=device),
+        mode=EvictedItemMode.RETAIN_KEY,
+    )
     delta = dump_all(src)
     assert set(delta.keys[0].tolist()) == set(keys)
 
     stats = dst.replay_increment(delta)[TABLE_NAME]
     assert stats.upserted == len(keys), stats
     assert stats.skipped == 0
+
+    # A table that stores a row per key reports its row counter as metadata, and
+    # the replica adopts it rather than inferring it from the rows it was sent.
+    # By source rank (one rank here), picked by the receiver.
+    num_rows = delta.meta[0]["num_rows"]
+    if num_rows is not None:
+        (num_rows,) = num_rows
+        assert num_rows == len(keys) + len(erased)
+        assert dst._storage.key_index_map.num_rows(0) == num_rows
+        # ... and recreates the slots the erased keys left, with their rows, so
+        # every row below the counter is on a live or a reclaimed slot again.
+        assert_rows_accounted_for(dst)
 
     replayed = dump_all(dst)
     src_keys, src_vals = sorted_view(delta.keys[0], delta.values[0])
@@ -826,3 +857,195 @@ def test_replay_rechecks_layout_after_cache_flush_expansion(current_device):
 
     with pytest.raises(ValueError, match="capacity mismatch"):
         dst.replay_increment(delta)
+
+
+def _one_bucket_models(current_device):
+    """Source and replica with a single 16-slot bucket: once it is full, a new key
+    can only take a slot an erase left reclaimed.
+
+    Tests built on it touch keys with ``backward=True``: a forward pins its slots
+    (reference counts) until the backward releases them, and a pinned slot is not
+    taken by a later insert."""
+    kw = dict(max_capacity=16, init_capacity=16, bucket_capacity=16)
+    return make_model(current_device, **kw), make_model(current_device, **kw)
+
+
+def _erase(model, keys, device):
+    model._storage.erase_keys(
+        0,
+        torch.tensor(keys, dtype=torch.int64, device=device),
+        mode=EvictedItemMode.RETAIN_KEY,
+    )
+
+
+def test_replay_add_erase_add_in_one_window(current_device):
+    """Add A, erase A, add B between two dumps: B takes the slot A left, and so
+    its row. The replica never held A, yet must end up with B at that slot and
+    row, not with the slot reclaimed (the removals run before the upserts)."""
+    device = torch.device(f"cuda:{current_device}")
+    src, dst = _one_bucket_models(current_device)
+    touch(src, list(range(2001, 2016)), device, backward=True)  # 15 of the 16 slots
+    dst.replay_increment(dump_all(src))
+
+    touch(src, [3001], device, backward=True)  # A: the last free slot
+    _erase(src, [3001], device)
+    touch(
+        src, [3002], device, backward=True
+    )  # B: no empty slot left, so A's reclaimed one
+    assert src._storage.key_index_map.num_rows(0) == 16, "B must reuse A's row"
+
+    delta = dump_all(src)
+    # The scenario really happened: the delta reports A's erase, and the slot and
+    # row it left are exactly where B now lives (``slot_index`` packs both).
+    assert delta.erased_keys[0].tolist() == [3001]
+    slot_of = dict(zip(delta.keys[0].tolist(), delta.meta[0]["slot_index"].tolist()))
+    (erased_slots,) = delta.meta[0]["erased_slot_index"]
+    assert erased_slots.tolist() == [slot_of[3002]]
+
+    assert dst.replay_increment(delta)[TABLE_NAME].upserted == 16
+    replayed = dump_all(dst)
+    src_keys, src_slots = sorted_view(delta.keys[0], delta.meta[0]["slot_index"])
+    dst_keys, dst_slots = sorted_view(replayed.keys[0], replayed.meta[0]["slot_index"])
+    assert 3002 in dst_keys.tolist() and 3001 not in dst_keys.tolist()
+    assert torch.equal(src_keys, dst_keys) and torch.equal(src_slots, dst_slots)
+    assert_rows_accounted_for(dst)
+
+
+def test_replay_recreates_a_reclaimed_slot_for_a_key_it_never_held(current_device):
+    """Add A then erase A, nothing taking its slot: the delta holds no live key
+    for it, only the erase. The replica still has to leave that slot reclaimed
+    with A's row, or its counter would count a row no slot owns."""
+    device = torch.device(f"cuda:{current_device}")
+    src, dst = _one_bucket_models(current_device)
+    touch(src, list(range(2001, 2016)), device, backward=True)
+    dst.replay_increment(dump_all(src))
+
+    touch(src, [3001], device, backward=True)
+    _erase(src, [3001], device)
+    delta = dump_all(src)
+    # A is reported as erased, and no live key took the slot it left.
+    assert delta.erased_keys[0].tolist() == [3001]
+    (erased_slots,) = delta.meta[0]["erased_slot_index"]
+    assert erased_slots.shape == (1, 2)  # one erased slot: (slot, row)
+    assert 3001 not in delta.keys[0].tolist()
+    dst.replay_increment(delta)
+
+    assert dst._storage.key_index_map.num_rows(0) == 16
+    assert_rows_accounted_for(dst)
+    # A native insert now takes that reclaimed slot and row, colliding with none.
+    touch(dst, [3003], device, backward=True)
+    assert dst._storage.key_index_map.num_rows(0) == 16
+    assert_rows_accounted_for(dst)
+
+
+def test_an_unretained_erase_makes_the_delta_unreplayable(current_device):
+    """Erasing without RETAIN_KEY is allowed, but the slot it leaves reclaimed
+    keeps its row and nothing reports it, so a delta dumped afterwards cannot be
+    replayed exactly: the dump says so, and replay refuses it before it writes
+    anything."""
+    device = torch.device(f"cuda:{current_device}")
+    src, dst = _one_bucket_models(current_device)
+    touch(src, list(range(2001, 2016)), device, backward=True)
+    assert not dump_all(src).meta[0]["erase_untracked"]
+
+    src._storage.erase_keys(0, torch.tensor([2001], dtype=torch.int64, device=device))
+    delta = dump_all(src)
+    assert delta.meta[0]["erase_untracked"] is True
+    (erased_slots,) = delta.meta[0]["erased_slot_index"]
+    assert erased_slots.shape == (0, 2)
+
+    before = dump_all(dst).keys[0].numel()
+    with pytest.raises(ValueError, match="erased keys without retaining"):
+        dst.replay_increment(delta)
+    assert dump_all(dst).keys[0].numel() == before, "a refused delta writes nothing"
+
+    # Sticky: later deltas stay unreplayable.
+    touch(src, [3001], device, backward=True)
+    assert dump_all(src).meta[0]["erase_untracked"] is True
+
+
+def test_replay_removes_a_key_the_source_evicted_for_one_it_then_erased(
+    current_device,
+):
+    """B evicts A at the source and is erased before the next dump. The delta
+    holds neither (no live key took the slot), only B's erase; the replica never
+    held B, yet still holds A in the slot the source now has reclaimed. Replay has
+    to remove A, or the replica keeps a key the source no longer has."""
+    device = torch.device(f"cuda:{current_device}")
+    src, dst = _one_bucket_models(current_device)
+    touch(src, list(range(2001, 2017)), device, backward=True)  # all 16 slots
+    dst.replay_increment(dump_all(src))
+
+    touch(src, [3001], device, backward=True)  # B evicts one of them: A
+    _erase(src, [3001], device)
+
+    delta = dump_all(src)
+    assert delta.erased_keys[0].tolist() == [3001]
+    assert delta.keys[0].numel() == 15, "A was evicted, B erased"
+    dst.replay_increment(delta)
+
+    replayed = dump_all(dst)
+    assert set(replayed.keys[0].tolist()) == set(delta.keys[0].tolist())
+    assert_rows_accounted_for(dst)
+    # The replica's table ends up identical to the source's, not just the same
+    # keys: A's slot is reclaimed with its row, and the bucket count dropped.
+    src_kim, dst_kim = src._storage.key_index_map, dst._storage.key_index_map
+    assert torch.equal(dst_kim.keys_, src_kim.keys_)
+    assert torch.equal(dst_kim.rows_, src_kim.rows_)
+    assert torch.equal(dst_kim.bucket_sizes, src_kim.bucket_sizes)
+
+
+def test_an_unretained_erase_taints_only_its_own_table(current_device):
+    """One storage holds several logical tables, and an erase that was not
+    retained spoils the table it was on, not the others: a delta of the other
+    table still replays."""
+    device = torch.device(f"cuda:{current_device}")
+    src = _two_table_model(current_device, [DEFAULT_CAPACITY, DEFAULT_CAPACITY])
+    dst = _two_table_model(current_device, [DEFAULT_CAPACITY, DEFAULT_CAPACITY])
+
+    keys = list(range(1001, 1101))
+    indices = torch.tensor(keys * 2, dtype=torch.int64, device=device)
+    offsets = torch.arange(0, len(keys) * 2 + 1, dtype=torch.int64, device=device)
+    src(indices, offsets)
+    torch.cuda.synchronize()
+
+    # Erase from t_0 only, without retaining it.
+    src._storage.erase_keys(0, torch.tensor(keys[:1], dtype=torch.int64, device=device))
+
+    delta = src.incremental_dump({"t_0": 0, "t_1": 0})
+    assert [m["erase_untracked"] for m in delta.meta] == [True, False]
+
+    with pytest.raises(ValueError, match="erased keys without retaining"):
+        dst.replay_increment(delta)
+
+    only_t1 = src.incremental_dump({"t_1": 0})
+    assert only_t1.meta[0]["erase_untracked"] is False
+    assert dst.replay_increment(only_t1)["t_1"].upserted == len(keys)
+
+
+@pytest.mark.parametrize(
+    "score_strategy",
+    [
+        DynamicEmbScoreStrategy.NO_EVICTION,
+        (DynamicEmbScoreStrategy.NO_EVICTION, DynamicEmbScoreStrategy.CUSTOMIZED),
+    ],
+)
+def test_no_eviction_tables_are_skipped_by_dump_and_refuse_replay(
+    current_device, score_strategy
+):
+    """A table that never evicts has no timestamp to take a delta by, and its
+    erased keys are the user's to manage. A dump skips it, with a warning and
+    without draining anything, and replay does not write into it."""
+    device = torch.device(f"cuda:{current_device}")
+    model = make_model(current_device, score_strategy=score_strategy)
+    touch(model, list(range(1, 33)), device)
+    source = make_model(current_device)
+    touch(source, list(range(1, 33)), device)
+    delta = dump_all(source)
+
+    with pytest.warns(UserWarning, match="NO_EVICTION|never evicts"):
+        skipped = dump_all(model)
+    assert skipped.table_names == []
+
+    with pytest.raises(NotImplementedError, match="replay_increment"):
+        model.replay_increment(delta)

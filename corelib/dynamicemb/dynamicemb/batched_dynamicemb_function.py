@@ -27,7 +27,6 @@ from dynamicemb.key_value_table import (
     Storage,
     _append_evicted,
     _find_keys,
-    _flat_row_indices_for_value_load,
     _insert_and_evict_keys,
     _select,
     _write_back_evicted,
@@ -183,11 +182,11 @@ class PrefetchState:
     storage_mode: StorageMode
     slot_indices: Optional[torch.Tensor]
     # Value-buffer row per key -- what forward and backward both address values
-    # with. It differs from ``slot_indices`` only under NO_EVICTION, whose rows
-    # come from a per-table auto-increment counter unrelated to where the key
-    # hashes, and whose key map is deliberately larger than the value buffer, so
-    # indexing values by slot reads past the end of it. Every other strategy
-    # points this at the slot tensor itself rather than leaving it unset, so a
+    # with. It differs from ``slot_indices`` for a table that stores a row per
+    # key (a storage): rows are handed out densely while slots come from the
+    # key's hash, and the key map of a table that never evicts is deliberately
+    # larger than its value buffer, so indexing values by slot would read past the
+    # end of it. A cache points this at the slot tensor itself rather than leaving it unset, so a
     # consumer never has to ask which of the two it is holding. Anything indexed
     # by hash slot (the ref counter) uses ``slot_indices``.
     value_row_indices: Optional[torch.Tensor] = None
@@ -310,7 +309,7 @@ def _load_storage_values(
     unwritten.
     """
     st = storage._state
-    rows = _flat_row_indices_for_value_load(st, in_storage, scores, slots)
+    rows = slots
     return load_from_flat(st, rows, miss_tids, copy_mode=CopyMode.VALUE)
 
 
@@ -381,9 +380,7 @@ def _insert_into_storage(
         storage.insert(keys, table_ids, values, scores)
         return
     # NO_EVICTION is deliberately not handled below: its storage never evicts
-    # (it expands instead), so there is nothing to spill, and ``evicted_slots``
-    # are hash slots rather than value rows (NO_EVICTION keeps the row in the
-    # score), so loading by them would read the wrong rows. The tables module
+    # (it expands instead), so there is nothing to spill. The tables module
     # rejects NO_EVICTION together with an ``external_storage``.
     st = storage._state
     (
@@ -617,12 +614,12 @@ def _prefetch_hbm_direct_path(
     Returns ``(slot_indices, non_admitted_positions, value_row_indices)``. The
     two index spaces are kept apart because they only coincide by accident:
     ``slot_indices`` addresses the hash table (and the ref counter beside it),
-    ``value_row_indices`` addresses the flat value buffer. For NO_EVICTION they
-    differ -- rows are handed out by a per-table auto-increment counter while
-    slots come from the key's hash, and the key map is sized
-    ``1 / max_load_factor`` times the value buffer, so a slot can point past the
-    end of it. Every other strategy returns the slot tensor itself as the rows,
-    so the caller always gets something it can address values with.
+    ``value_row_indices`` addresses the flat value buffer. A storage stores a
+    row per key, so they differ: rows are handed out densely while slots come
+    from the key's hash, and the key map of a table that never evicts is sized
+    ``1 / load factor`` times the value buffer, so a slot can point past the end
+    of it. A table whose row is its slot returns the slot tensor itself as the
+    rows, so the caller always gets something it can address values with.
     """
     with torch.cuda.nvtx.range("_prefetch_hbm_direct_path"):
         state = storage._state
@@ -641,34 +638,31 @@ def _prefetch_hbm_direct_path(
                 missing_table_ids,
                 missing_scores,
                 _,
-                score_out,
+                _,
                 indices,
+                slot_indices,
             ) = _find_keys(
                 state,
                 unique_keys,
                 unique_table_ids,
                 lfu_accumulated_frequency=accumulated_frequency,
+                return_slots=True,
             )
 
-        found_mask = indices >= 0
-        found_slots = indices[found_mask]
+        # ``indices`` are rows for a table that stores them, hash slots otherwise,
+        # and ``slot_indices`` the hash slots either way (the same tensor when the
+        # row is the slot). The ref counter is keyed by slot.
+        found_mask = slot_indices >= 0
+        found_slots = slot_indices[found_mask]
         if found_slots.numel() > 0:
             storage.increment_counter(found_slots, unique_table_ids[found_mask])
 
-        # NO_EVICTION stores each key's value row IN its score word, so a lookup
-        # hit yields the row in ``score_out`` -- ``indices`` stays a hash slot and
-        # must not be used to address the value buffer. Every other strategy
-        # addresses values by slot, so ``rows`` is ``indices`` itself and the
-        # writes below reach it for free.
-        is_no_eviction = state.no_eviction_next_index is not None
-        rows = (
-            _flat_row_indices_for_value_load(state, found_mask, score_out, indices)
-            if is_no_eviction
-            else indices
-        )
+        # Values are addressed by row, the counter by slot: a storage stores a row
+        # per key, so these are different tensors and both are kept up to date.
+        rows = indices
 
         if h_num_missing == 0:
-            return indices, None, rows
+            return slot_indices, None, rows
 
         # Determine admission for missing keys
         non_admitted_positions: Optional[torch.Tensor] = None
@@ -720,9 +714,7 @@ def _prefetch_hbm_direct_path(
                     emb_dims=state.table_emb_dims[admitted_tids],
                 )
 
-            score_arg = get_insert_score_arg(
-                state, n_admitted, device, admitted_scores, table_ids=admitted_tids
-            )
+            score_arg = get_insert_score_arg(state, n_admitted, device, admitted_scores)
             with torch.cuda.nvtx.range("op:storage_insert"):
                 # HBM-direct is a last tier: this insert may evict, and the
                 # victims are dropped here (unlike the cache path, which spills
@@ -734,50 +726,44 @@ def _prefetch_hbm_direct_path(
                         num_evicted,
                         evicted_keys,
                         evicted_table_ids,
+                        new_slots,
                     ) = state.key_index_map.insert(
                         admitted_keys,
                         admitted_tids,
                         score_arg,
                         collect_evicted=True,
+                        return_slots=True,
                     )
                     _append_evicted(state, evicted_keys, evicted_table_ids, num_evicted)
                 else:
-                    new_indices = state.key_index_map.insert(
+                    new_indices, new_slots = state.key_index_map.insert(
                         admitted_keys,
                         admitted_tids,
                         score_arg,
+                        return_slots=True,
                     )
-            # The insert returns the hash slot; NO_EVICTION's value row is the
-            # score it just assigned. Keep both: the counter is indexed by slot,
-            # the value buffer by row.
-            new_rows = (
-                score_arg.value.to(torch.int64) if is_no_eviction else new_indices
-            )
+            # The insert returns rows, and the slots as well. Keep both: the
+            # counter is indexed by slot, the value buffer by row.
+            new_rows = new_indices
             with torch.cuda.nvtx.range("op:store_to_flat"):
                 store_to_flat(state, new_rows, admitted_tids, init_values)
 
-            inserted_mask = new_indices >= 0
+            inserted_mask = new_slots >= 0
             if inserted_mask.any():
                 storage.increment_counter(
-                    new_indices[inserted_mask],
+                    new_slots[inserted_mask],
                     admitted_tids[inserted_mask],
                 )
 
-            indices[admitted_unique_positions] = new_indices
-            # Skipped while ``rows`` aliases ``indices``: the write above already
-            # covered it. Testing identity rather than ``is_no_eviction`` keeps
-            # this correct even if ``rows`` ever stops being an alias -- it would
-            # simply be filled explicitly with the same values.
-            if rows is not indices:
-                rows[admitted_unique_positions] = new_rows
+            slot_indices[admitted_unique_positions] = new_slots
+            rows[admitted_unique_positions] = new_rows
 
         # Non-admitted keys: ensure slot_indices = -1
         if non_admitted_positions is not None:
-            indices[non_admitted_positions] = -1
-            if rows is not indices:
-                rows[non_admitted_positions] = -1
+            slot_indices[non_admitted_positions] = -1
+            rows[non_admitted_positions] = -1
 
-        return indices, non_admitted_positions, rows
+        return slot_indices, non_admitted_positions, rows
 
 
 def dynamicemb_prefetch(
@@ -1166,8 +1152,7 @@ class DynamicEmbeddingFunction(torch.autograd.Function):
                 with torch.cuda.nvtx.range("op:load_from_flat"):
                     unique_embs = load_from_flat(
                         state,
-                        # Value buffer: address by row, which is the slot for
-                        # every strategy except NO_EVICTION.
+                        # Value buffer: address by row (the slot, for a cache).
                         prefetch_state.value_row_indices,
                         prefetch_state.unique_table_ids,
                         copy_mode=CopyMode.EMBEDDING,

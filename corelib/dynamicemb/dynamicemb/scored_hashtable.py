@@ -30,6 +30,7 @@ from dynamicemb_extensions import (
     ScorePolicy,
     bucketize_keys,
     device_timestamp,
+    table_collect_reclaimed_rows,
     table_copy_score_blocks,
     table_count_matched,
     table_erase,
@@ -40,6 +41,9 @@ from dynamicemb_extensions import (
     table_insert_collect_evicted,
     table_lookup,
     table_partition,
+    table_place_reclaimed_rows,
+    table_restore_reclaimed_slots,
+    table_resolve_rows,
     table_scatter_keys_at_slots,
     table_scatter_score_blocks,
     table_update_counter_with_layout,
@@ -298,6 +302,7 @@ class LinearBucketTable(ScoredHashTable):
         device: torch.device = None,
         enable_overflow: bool = False,
         score_fn_key: int = 0,
+        use_rows: bool = False,
     ):
         """
         Args:
@@ -308,6 +313,16 @@ class LinearBucketTable(ScoredHashTable):
             device: CUDA device.
             enable_overflow: when True, allocate a per-table overflow buffer
                 (capacity = 3 * bucket_capacity) and a per-slot reference counter.
+            use_rows: when True, every slot owns a value row kept in ``rows_``
+                and the indices this table hands out are rows, not hash slots
+                (see :meth:`_rows_of`). The first key to occupy a slot takes the
+                next row of its table; later occupants -- the key that evicts
+                it, or the one that reuses it after an erase -- inherit that
+                row, so a rehash can carry rows along instead of moving values.
+                Meant for tables that grow and keep every key's value (storage);
+                a cache never rehashes, and its reference counters are keyed by
+                the same index its values use, so it keeps slot == row and
+                ``enable_overflow`` is not supported together with this.
         """
         self.device = (
             device
@@ -432,6 +447,29 @@ class LinearBucketTable(ScoredHashTable):
             self.num_buckets_, dtype=torch.int32, device=self.device
         )
 
+        # Value rows: one int64 per slot, -1 until a key first occupies it.
+        self.use_rows_ = use_rows
+        if self.use_rows_:
+            assert (
+                not enable_overflow
+            ), "use_rows is for storage tables; a cache (overflow) keeps slot == row."
+            self.rows_ = torch.full(
+                (self.capacity_,), -1, dtype=torch.int64, device=self.device
+            )
+            self.row_counters_ = torch.zeros(
+                self.num_tables_, dtype=torch.int64, device=self.device
+            )
+            # Rows a table's value buffer has. A slot is never more than one row
+            # of its own, so the table's capacity is the most that can be handed
+            # out; a buffer that is smaller says so through ``set_row_limits``.
+            self.row_limits_ = torch.tensor(
+                self.per_table_capacity_, dtype=torch.int64, device=self.device
+            )
+        else:
+            self.rows_ = None
+            self.row_counters_ = None
+            self.row_limits_ = None
+
         # Overflow buffer & counter
         self.enable_overflow_ = enable_overflow
         if self.enable_overflow_:
@@ -520,6 +558,94 @@ class LinearBucketTable(ScoredHashTable):
         """
         return self.score_specs_
 
+    def _rows_of(
+        self, slots: torch.Tensor, table_ids: torch.Tensor, allocate: bool
+    ) -> torch.Tensor:
+        """Table-relative hash slots -> the value rows they own.
+
+        The kernels report the slot a key sits in. With ``use_rows`` that is not
+        the row its value lives in, so every index leaving this table goes
+        through here. ``allocate`` gives a slot that has never held a key the
+        next row of its table; it is set where a key was just placed, and clear
+        where the slot must already own a row (a lookup hit, an evicted
+        victim). Negative entries pass through, as do overflow slots.
+        """
+        if not self.use_rows_:
+            return slots
+        return table_resolve_rows(
+            self.rows_,
+            self.row_counters_,
+            self.row_limits_,
+            self.table_bucket_offsets_,
+            self.bucket_capacity_,
+            slots,
+            table_ids,
+            allocate,
+        )
+
+    def _evicted_rows_of(self, result: Tuple, table_ids: torch.Tensor) -> Tuple:
+        """``_rows_of`` over an ``insert_and_evict`` result: the inserted keys'
+        indices take (and allocate) their rows, the evicted victims' indices
+        resolve to the rows they held, which the inserting keys now hold too.
+        An input key the table rejected comes back as an "evicted" entry with a
+        negative index and stays negative."""
+        if not self.use_rows_:
+            return result
+        (
+            indices,
+            num_evicted,
+            evicted_keys,
+            evicted_indices,
+            evicted_scores,
+            evicted_table_ids,
+        ) = result
+        return (
+            self._rows_of(indices, table_ids, True),
+            num_evicted,
+            evicted_keys,
+            self._rows_of(evicted_indices, evicted_table_ids, False),
+            evicted_scores,
+            evicted_table_ids,
+        )
+
+    def slots_of(self, keys: torch.Tensor, table_ids: torch.Tensor) -> torch.Tensor:
+        """The hash slots ``keys`` sit in (``-1`` where absent), whatever
+        ``use_rows`` is.
+
+        :meth:`lookup` and :meth:`insert` report rows for a table that stores
+        them. State that is keyed by slot -- the score blocks, the reference
+        counters -- needs the slot instead, and this is how to get it.
+        """
+        _, _, slots = table_lookup(
+            self.table_storage_,
+            self.table_bucket_offsets_,
+            self.bucket_capacity_,
+            keys,
+            table_ids,
+            None,
+            ScorePolicy.CONST,
+            num_scores=self.num_scores_,
+        )
+        return slots
+
+    def set_row_limits(self, limits: List[int]) -> None:
+        """Tell the table how many rows each table's value buffer has.
+
+        Allocating a row at or past its table's limit is asserted on the device
+        (no host sync), so a caller that sizes the buffer wrongly fails loudly
+        instead of writing past it. Call again whenever a buffer grows.
+        """
+        assert self.use_rows_ and len(limits) == self.num_tables_
+        self.row_limits_.copy_(
+            torch.tensor(limits, dtype=torch.int64), non_blocking=False
+        )
+
+    def num_rows(self, table_id: int) -> int:
+        """Rows handed out so far for ``table_id``: rows ``[0, num_rows)`` are
+        the ones values may live in."""
+        assert self.use_rows_
+        return int(self.row_counters_[table_id].item())
+
     def _parse_score(
         self,
         score: ScoreArg,
@@ -548,13 +674,18 @@ class LinearBucketTable(ScoredHashTable):
         keys: torch.Tensor,
         table_ids: torch.Tensor,
         score: ScoreArg,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        return_slots: bool = False,
+    ) -> Tuple:
         """
         Lookup keys in the table. Score is optional input for Assign/Accumulate policies.
         Args:
             table_ids: int64 tensor of same length as keys, identifying which logical table each key belongs to.
+            return_slots: also return the hash slots as a fourth element. For a
+                table that stores rows ``indices`` are rows, but the reference
+                counters sit beside the hash table and are keyed by slot.
         Returns:
-            (score_out, founds, indices): score tensor (int64), found mask, indices.
+            (score_out, founds, indices): score tensor (int64), found mask, indices;
+            plus ``slots`` when asked.
         """
         score_value, policy = self._parse_score(score)
         num_scores = self.num_scores_
@@ -569,7 +700,9 @@ class LinearBucketTable(ScoredHashTable):
             policy,
             num_scores=num_scores,
         )
-        return score_out, founds, indices
+        if return_slots:
+            return score_out, founds, self._rows_of(indices, table_ids, False), indices
+        return score_out, founds, self._rows_of(indices, table_ids, False)
 
     def insert(
         self,
@@ -579,6 +712,7 @@ class LinearBucketTable(ScoredHashTable):
         insert_results: Optional[torch.Tensor] = None,
         score_out: Optional[torch.Tensor] = None,
         collect_evicted: bool = False,
+        return_slots: bool = False,
     ):
         """
         Keys have to be unique.
@@ -590,6 +724,8 @@ class LinearBucketTable(ScoredHashTable):
             evicted_* tensors are sized at the batch upper bound (slice to
             ``num_evicted``). Used by the last-tier retain-evicted-keys path.
         If score_out is provided (caller-allocated int64 tensor), it is filled with output scores.
+        With ``return_slots`` the hash slots follow as the last element of what is
+        returned (they are the indices unless the table stores rows).
         """
         score_value, policy = self._parse_score(score)
         num_scores = self.num_scores_
@@ -603,10 +739,12 @@ class LinearBucketTable(ScoredHashTable):
             assert (
                 num_scores == 1
             ), "DEMB_DETERMINISM_MODE does not support auxiliary score columns yet."
-            return self._deterministic_insert(keys, table_ids, score_value, policy)
+            slots = self._deterministic_insert(keys, table_ids, score_value, policy)
+            rows = self._rows_of(slots, table_ids, True)
+            return (rows, slots) if return_slots else rows
 
         if collect_evicted:
-            return table_insert_collect_evicted(
+            indices, *rest = table_insert_collect_evicted(
                 self.table_storage_,
                 self.table_bucket_offsets_,
                 self.bucket_capacity_,
@@ -621,6 +759,8 @@ class LinearBucketTable(ScoredHashTable):
                 num_scores=num_scores,
                 score_fn_key=self.score_fn_key_,
             )
+            rows = self._rows_of(indices, table_ids, True)
+            return (rows, *rest, indices) if return_slots else (rows, *rest)
 
         indices = table_insert(
             self.table_storage_,
@@ -637,7 +777,8 @@ class LinearBucketTable(ScoredHashTable):
             num_scores=num_scores,
             score_fn_key=self.score_fn_key_,
         )
-        return indices
+        rows = self._rows_of(indices, table_ids, True)
+        return (rows, indices) if return_slots else rows
 
     def insert_and_evict(
         self,
@@ -665,8 +806,11 @@ class LinearBucketTable(ScoredHashTable):
             assert (
                 num_scores == 1
             ), "DEMB_DETERMINISM_MODE does not support auxiliary score columns yet."
-            return self._deterministic_insert_and_evict(
-                keys, table_ids, score_value, policy
+            return self._evicted_rows_of(
+                self._deterministic_insert_and_evict(
+                    keys, table_ids, score_value, policy
+                ),
+                table_ids,
             )
 
         (
@@ -693,14 +837,136 @@ class LinearBucketTable(ScoredHashTable):
         )
 
         h_num_evicted = num_evicted.cpu().item()
-        return (
-            indices,
-            h_num_evicted,
-            evicted_keys[:h_num_evicted],
-            evicted_indices[:h_num_evicted],
-            evicted_scores[:h_num_evicted],
-            evicted_table_ids[:h_num_evicted],
+        return self._evicted_rows_of(
+            (
+                indices,
+                h_num_evicted,
+                evicted_keys[:h_num_evicted],
+                evicted_indices[:h_num_evicted],
+                evicted_scores[:h_num_evicted],
+                evicted_table_ids[:h_num_evicted],
+            ),
+            table_ids,
         )
+
+    def insert_carrying_rows(
+        self,
+        keys: torch.Tensor,
+        table_id: int,
+        score: ScoreArg,
+        rows: torch.Tensor,
+    ) -> torch.Tensor:
+        """Insert ``keys`` of logical table ``table_id`` and give them ``rows``
+        instead of fresh ones: the rehash path, where a key keeps the row its
+        value already lives in.
+
+        Keys have to be unique and the table must have room for all of them (no
+        eviction is expected). Returns the hash slots the keys landed in -- what
+        the caller needs to copy slot-keyed state (score blocks, counters). The
+        row counters are left to :meth:`carry_rows_from`.
+        """
+        assert self.use_rows_
+        table_ids = torch.full(
+            (keys.numel(),), table_id, dtype=torch.int64, device=keys.device
+        )
+        score_value, policy = self._parse_score(score)
+        if os.environ.get("DEMB_DETERMINISM_MODE") is not None:
+            # The deterministic helper reads and writes one score word per key.
+            assert (
+                self.num_scores_ == 1
+            ), "DEMB_DETERMINISM_MODE does not support auxiliary score columns yet."
+            slots = self._deterministic_insert(keys, table_ids, score_value, policy)
+        else:
+            slots = table_insert(
+                self.table_storage_,
+                self.table_bucket_offsets_,
+                self.bucket_capacity_,
+                self.bucket_sizes,
+                keys,
+                table_ids,
+                score_value,
+                policy,
+                self._ref_counter,
+                num_scores=self.num_scores_,
+                score_fn_key=self.score_fn_key_,
+            )
+        assert bool((slots >= 0).all()), "rehash insert must not reject keys"
+        self.set_rows(slots, table_id, rows)
+        return slots
+
+    def set_rows(self, slots: torch.Tensor, table_id: int, rows: torch.Tensor) -> None:
+        """Make the given table-relative ``slots`` own ``rows``."""
+        assert self.use_rows_
+        base = (
+            int(self.table_bucket_offsets_cpu_[table_id].item()) * self.bucket_capacity_
+        )
+        self.rows_[base + slots] = rows.to(torch.int64)
+
+    def restore_reclaimed_slots(self, slot_index: torch.Tensor, table_id: int) -> None:
+        """Leave the slots a dump's ``[n, 2]`` (slot, row) int64 names reclaimed,
+        owning their rows.
+
+        What an erase leaves behind, recreated for a replica that never held the
+        erased key. A slot that is empty becomes reclaimed with the row; one that
+        already is reclaimed must own that row (asserted on the device); one that
+        still holds a key -- the source evicted it with a key it then erased, so
+        nothing in the delta overwrites it -- has that key erased, with
+        ``bucket_sizes`` fixed, and then owns the row like the others.
+        Reclaimed slots are not counted in ``bucket_sizes``.
+        """
+        assert self.use_rows_
+        table_restore_reclaimed_slots(
+            self.table_storage_,
+            self.table_bucket_offsets_,
+            self.bucket_capacity_,
+            self.bucket_sizes,
+            self.rows_,
+            slot_index,
+            table_id,
+            self.num_scores_,
+            self.key_type_,
+        )
+
+    def reserve_rows(self, table_id: int, num_rows: int) -> None:
+        """Make sure rows ``[0, num_rows)`` of ``table_id`` count as handed out,
+        so a later insert cannot allocate one that a replay restored."""
+        assert self.use_rows_
+        counter = self.row_counters_[table_id]
+        self.row_counters_[table_id] = torch.clamp(counter, min=num_rows)
+
+    def carry_rows_from(self, other: "LinearBucketTable", table_id: int) -> None:
+        """Finish a rehash of ``table_id`` from ``other``, after its live keys
+        were re-inserted with :meth:`insert_carrying_rows`.
+
+        An erased key leaves its slot reclaimed rather than empty, still owning
+        its row for the next key that takes the slot. Those slots have no key to
+        hash by, so they go to free slots of this table, spread evenly, with
+        their rows. That keeps every row below the counter in use: rehashing
+        leaves no holes, and no value has to move. The counter carries over.
+
+        Both steps are single kernels over the table's slots, and what they
+        allocate scales with the number of reclaimed slots, not the capacity.
+        """
+        assert self.use_rows_ and other.use_rows_
+        assert self.bucket_capacity_ == other.bucket_capacity_
+        cap = self.bucket_capacity_
+        o_b0 = int(other.table_bucket_offsets_cpu_[table_id].item())
+        o_b1 = int(other.table_bucket_offsets_cpu_[table_id + 1].item())
+        # Every row below the counter sits on a live or a reclaimed slot, so the
+        # reclaimed ones are what is left once the live keys are subtracted.
+        n = int(
+            (other.row_counters_[table_id] - other.bucket_sizes[o_b0:o_b1].sum()).item()
+        )
+        if n > 0:
+            carried = table_collect_reclaimed_rows(
+                other.keys_.view(torch.int64), other.rows_, o_b0, o_b1, cap, n
+            )
+            b0 = int(self.table_bucket_offsets_cpu_[table_id].item())
+            b1 = int(self.table_bucket_offsets_cpu_[table_id + 1].item())
+            table_place_reclaimed_rows(
+                self.keys_.view(torch.int64), self.rows_, carried, b0, b1, cap
+            )
+        self.row_counters_[table_id] = other.row_counters_[table_id]
 
     def increment_counter(
         self,
@@ -878,8 +1144,11 @@ class LinearBucketTable(ScoredHashTable):
                 erase itself should leave it False.
 
         Returns:
-            ``None`` unless *return_indices*, else the slot each key was erased
-            from, or ``-1`` where the key was not in the table.
+            ``None`` unless *return_indices*, else a tensor that is ``-1`` where
+            the key was not in the table and non-negative where it was erased
+            (the slot it was erased from -- not its value row, which stays with
+            that slot for whichever key takes it next). Callers only test it for
+            presence.
         """
         indices = (
             torch.empty(keys.numel(), dtype=self.index_type, device=keys.device)
@@ -1023,9 +1292,15 @@ class LinearBucketTable(ScoredHashTable):
         thresholds: Optional[List[int]] = None,
         batch_size: int = 65536,
         return_index: bool = False,
-    ) -> Iterator[Tuple[torch.Tensor, Dict[str, torch.Tensor], Optional[torch.Tensor]]]:
+        return_slots: bool = False,
+    ) -> Iterator[Tuple]:
         """
         export keys, {score_name: scores}, indices
+
+        ``indices`` are the rows the keys' values live in when the table
+        ``use_rows``, hash slots otherwise. With ``return_slots`` the hash slots
+        follow as a fourth element -- what a rehash needs to copy the slot-keyed
+        score blocks and counters alongside the rows.
 
         Args:
             score_names (List[str]): list of score names
@@ -1100,10 +1375,25 @@ class LinearBucketTable(ScoredHashTable):
                             score[:actual_length].to(SCORE_TYPE).to(target_device)
                         )
 
+                out_indices = None
+                out_slots = None
+                if return_index or return_slots:
+                    out_slots = indices[:actual_length]
+                    out_indices = self._rows_of(
+                        out_slots,
+                        torch.full(
+                            (actual_length,),
+                            table_id,
+                            dtype=torch.int64,
+                            device=out_slots.device,
+                        ),
+                        False,
+                    )
                 yield (
                     keys[:actual_length].to(KEY_TYPE).to(target_device),
                     named_scores,
-                    indices[:actual_length].to(target_device) if return_index else None,
+                    out_indices.to(target_device) if return_index else None,
+                    *((out_slots.to(target_device),) if return_slots else ()),
                 )
             offset += batch_size
 
@@ -1134,15 +1424,17 @@ class LinearBucketTable(ScoredHashTable):
                             )
                     ovf_out_offset = (
                         int(self.overflow_output_offsets_[table_id].item())
-                        if return_index
+                        if return_index or return_slots
                         else 0
+                    )
+                    ovf_slots = (indices[:actual_length] + ovf_out_offset).to(
+                        target_device
                     )
                     yield (
                         keys[:actual_length].to(KEY_TYPE).to(target_device),
                         named_scores,
-                        (indices[:actual_length] + ovf_out_offset).to(target_device)
-                        if return_index
-                        else None,
+                        ovf_slots if return_index else None,
+                        *((ovf_slots,) if return_slots else ()),
                     )
                 ovf_offset += batch_size
 
@@ -1198,7 +1490,8 @@ class LinearBucketTable(ScoredHashTable):
         batch_size: int = 65536,
         pg: Optional[dist.ProcessGroup] = None,
         return_index: bool = False,
-    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor], Optional[torch.Tensor]]:
+        return_slots: bool = False,
+    ) -> Tuple:
         """
         Dump incremental keys and scores into cpu tensors.
 
@@ -1207,12 +1500,16 @@ class LinearBucketTable(ScoredHashTable):
             table_id (int): the logical table to dump.
             batch_size (int): the batch size when scan the table.
             pg (Optional[dist.ProcessGroup]): process group.
-            return_index: whether return the index or not.
+            return_index: whether return the index or not (rows when the table
+                ``use_rows``, hash slots otherwise).
+            return_slots: also return the hash slots, as a fourth element; the
+                score blocks and a replay are keyed by slot.
 
         Returns:
             out_keys (torch.Tensor): output tensor of keys
             out_scores (Dict[str, torch.Tensor]): output tensors of scores.
             out_indices (Optional[torch.Tensor]): output tensors of indices.
+            out_slots (torch.Tensor): only with ``return_slots``.
         """
 
         out_keys: torch.Tensor
@@ -1282,25 +1579,35 @@ class LinearBucketTable(ScoredHashTable):
             if return_index
             else None
         )
+        out_slots = (
+            torch.empty(total_matched, dtype=self.index_type, device="cpu")
+            if return_slots
+            else None
+        )
         for score_name in out_scores.keys():
             out_scores[score_name] = torch.empty(
                 total_matched, dtype=SCORE_TYPE, device="cpu"
             )
 
         out_offset = 0
-        for keys, named_scores, indices in self._batched_export_keys_scores(
+        for keys, named_scores, indices, *slots in self._batched_export_keys_scores(
             scores,
             self.device,
             table_id,
             thresholds,
             batch_size,
             return_index=return_index,
+            return_slots=return_slots,
         ):
             h_count = keys.numel()
             out_keys[out_offset : out_offset + h_count].copy_(keys, non_blocking=True)
             if indices is not None:
                 out_indices[out_offset : out_offset + h_count].copy_(
                     indices, non_blocking=True
+                )
+            if return_slots:
+                out_slots[out_offset : out_offset + h_count].copy_(
+                    slots[0], non_blocking=True
                 )
             for score_name in out_scores.keys():
                 out_scores[score_name][out_offset : out_offset + h_count].copy_(
@@ -1313,6 +1620,8 @@ class LinearBucketTable(ScoredHashTable):
             total_matched == out_offset
         ), "Dumped keys number mismatched with the expected count."
 
+        if return_slots:
+            return out_keys, out_scores, out_indices, out_slots
         return out_keys, out_scores, out_indices
 
     def reset(self) -> None:
@@ -1322,6 +1631,9 @@ class LinearBucketTable(ScoredHashTable):
         self._init_table(self.keys_, self.scores_list, self.digests_)
         self.bucket_sizes.zero_()
         self._ref_counter.zero_()
+        if self.use_rows_:
+            self.rows_.fill_(-1)
+            self.row_counters_.zero_()
 
         if self.enable_overflow_:
             ovf_keys, ovf_digests, *ovf_scores = table_partition(
@@ -1357,6 +1669,10 @@ class LinearBucketTable(ScoredHashTable):
         self._ref_counter[slot_start:slot_end].copy_(
             other._ref_counter[o_slot_start:o_slot_end]
         )
+        if self.use_rows_:
+            assert other.use_rows_
+            self.rows_[slot_start:slot_end].copy_(other.rows_[o_slot_start:o_slot_end])
+            self.row_counters_[table_id].copy_(other.row_counters_[table_id])
         if self.enable_overflow_:
             assert other.enable_overflow_
             bytes_per_ovf_bucket = self.overflow_bucket_capacity_ * sum(
@@ -1857,6 +2173,7 @@ def get_scored_table(
     bucket_load_factor=0.5,  # used when probing_type=ProbingType.CHAINED
     enable_overflow: bool = False,
     score_fn_key: int = 0,
+    use_rows: bool = False,
 ) -> ScoredHashTable:
     if probing_type == ProbingType.LINEAR and reduction_type == ReductionType.LINEAR:
         return LinearBucketTable(
@@ -1867,6 +2184,7 @@ def get_scored_table(
             device=device,
             enable_overflow=enable_overflow,
             score_fn_key=score_fn_key,
+            use_rows=use_rows,
         )
     else:
         raise NotImplementedError

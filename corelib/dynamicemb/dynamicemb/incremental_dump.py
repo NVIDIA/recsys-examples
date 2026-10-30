@@ -59,7 +59,7 @@ class DeltaDumpResult:
         an **age** (``meta[i]["current_score"] - score``) rather than a raw
         timestamp, because ``%globaltimer`` is per device and resets across
         boots; a consumer rebases them onto its own clock. Every other column
-        (LFU frequency, STEP, CUSTOMIZED, NO_EVICTION row) is carried verbatim.
+        (LFU frequency, STEP, CUSTOMIZED) is carried verbatim.
     evicted_keys : List[Optional[torch.Tensor]]
         Per-table keys on host (keys only, no value/score) that the table
         **evicted** to make room since the last ``incremental_dump``. ``None``
@@ -93,16 +93,37 @@ class DeltaDumpResult:
                 threshold.
             meta[i]["slot_index"]:       torch.Tensor -- int64 host tensor aligned
                 with ``keys[i]``; the storage slot each dumped key occupies, used
-                by ``replay_increment``. For NO_EVICTION tables it packs the key
-                slot (high 32 bits) and value row (low 32 bits) into one int64.
+                by ``replay_increment``. For tables that store a row per key it
+                is an ``[N, 2]`` int64 tensor: key slot, value row.
+            meta[i]["erased_slot_index"]: Optional[List[torch.Tensor]] -- for a table
+                that stores a row per key, the ``[M, 2]`` (slot, row) of every slot an explicit erase left reclaimed since the
+                last dump, one per slot. A reclaimed slot keeps its row, so a
+                replica recreates these, after the removals and before the
+                upserts, to end up with the same rows as the source (the upserts
+                then overwrite any slot another key took). One entry per source
+                rank of the dumping group, in rank order -- the slots belong to
+                that rank's own table, and the per-key columns are gathered across
+                ranks, so a receiver picks the entry of its own shard index (a
+                single entry when the dump was not gathered). Only complete if the
+                erases were retained (``erase_keys(..., mode=RETAIN_KEY)``); see
+                ``erase_untracked``.
+            meta[i]["erase_untracked"]:  bool -- the table erased keys without
+                retaining them (on any rank of the dumping group), so
+                ``erased_slot_index`` misses the slots they
+                left and the delta cannot be replayed exactly. Sticky.
+                ``replay_increment`` refuses such a delta.
+            meta[i]["num_rows"]:         Optional[List[int]] -- for a table that stores
+                a row per key, how many value rows each source rank had handed out
+                (its row counter), in rank order and picked by the receiver like
+                ``erased_slot_index``; ``None`` where the row is the slot. The delta
+                names only the rows that changed, so replay takes the counter from
+                here.
             meta[i]["current_capacity"]: int  -- key-map slots for this table.
                 The modulus for choosing a home bucket, so it decides whether a
                 slot means the same thing in two tables.
             meta[i]["row_capacity"]:     Tuple[int, ...] -- value-buffer rows per
                 storage tier. A second bound: ``current_capacity`` says where a
-                key may sit, this says how far a row write may reach. The two
-                coincide except under NO_EVICTION, whose key map is deliberately
-                larger than its value buffer.
+                key may sit, this says how far a row write may reach.
             meta[i]["bucket_capacity"]:  int  -- slots per hash bucket; replay
                 compares it to decide whether the source slots are usable.
             meta[i]["num_scores"]:       int  -- score words per key; part of the
@@ -333,6 +354,11 @@ def incremental_dump(
     keys (for retain-enabled tables) and meta (see :class:`DeltaDumpResult`). An
     empty dict if the model has no dynamic embedding tables.
 
+    A table whose ``score_strategy`` contains ``NO_EVICTION`` (alone, or as
+    ``(NO_EVICTION, CUSTOMIZED)``) is skipped with a ``UserWarning`` and is absent
+    from the result: it has no timestamp to take a delta by, and its erased keys
+    are the user's to manage. Skipping drains nothing from it.
+
     Args:
         model(nn.Module):The model containing dynamic embedding tables.
          score_threshold(Uinon[int, Dict[str, Dict[str, int]]]):
@@ -471,6 +497,14 @@ def replay_increment(
     score layout, dim, dist_type, world size). A table whose metadata does not
     match is never written: it raises :class:`ValueError` instead.
 
+    **The source growing ends the delta chain.** A target's capacity does not
+    change on its own, so once the source table expands (rehash) its capacity no
+    longer matches the target's, and every delta dumped from then on is rejected
+    for it. Slots, and the rows that erased keys left reclaimed, name positions in
+    the layout they were taken from; a layout that was rebuilt cannot be followed
+    by replaying writes into the old one. Rebuild the target from a full
+    checkpoint of the grown source, and replay what comes after it.
+
     That check covers every table a module holds before the module writes any of
     them, so a rejection leaves the module as it was. It does not span a
     collection. Tables whose options differ -- score strategy, caching,
@@ -484,7 +518,7 @@ def replay_increment(
     Recover by rebuilding from a full checkpoint, or by fixing the target and
     replaying the same delta again. Replaying it twice restores the same keys,
     the same embeddings and the same optimizer states, and carries LFU
-    frequencies, ``STEP``, ``CUSTOMIZED`` and ``NO_EVICTION`` row numbers through
+    frequencies, ``STEP`` and ``CUSTOMIZED`` scores through
     unchanged. What does not repeat is a **timestamp** column: the delta stores
     it as an age, and each replay turns that back into a score against the clock
     it reads when it runs (see :class:`ReplayContent`). So a module that was
@@ -509,8 +543,6 @@ def replay_increment(
     inserted here, so the replica orders its own future evictions by when it
     received a key rather than by how the source ranked it -- the two can evict
     in different orders, but never hold a wrong embedding for a key they share.
-    (NO_EVICTION is unaffected either way: its score word is a value row, not a
-    score, and is restored exactly.)
 
     **Sharding.** The target must be sharded across the same number of ranks as
     the source: ``meta["world_size"]`` is compared with this model's, and a
@@ -669,6 +701,38 @@ def _all_gather_evicted_keys(
     if not parts:
         return keys[:0].cpu()
     return torch.unique(torch.cat(parts)).cpu()
+
+
+def _all_gather_by_rank(
+    tensor: torch.Tensor, pg: Optional[dist.ProcessGroup]
+) -> List[torch.Tensor]:
+    """All-gather a variable-length tensor (any trailing dims) within ``pg``, keeping
+    each rank's part apart: entry ``r`` is what rank ``r`` of the group contributed, on host.
+
+    For what the receiver has to pick *its own* share of, unlike
+    :func:`_all_gather_evicted_keys`, which merges the ranks into one set.
+    Without a multi-rank group the result is just ``[tensor]``.
+    """
+    if pg is None or not dist.is_initialized() or dist.get_world_size(pg) <= 1:
+        return [tensor.cpu()]
+    world_size = dist.get_world_size(pg)
+    device = torch.device("cuda", torch.cuda.current_device())
+    tensor = tensor.to(device)
+    local_size = torch.tensor([tensor.size(0)], device=device, dtype=torch.int64)
+    size_list = [torch.zeros_like(local_size) for _ in range(world_size)]
+    dist.all_gather(size_list, local_size, group=pg)
+    sizes = [int(s.item()) for s in size_list]
+    max_size = max(max(sizes), 1)  # avoid a 0-length NCCL all_gather
+    shape = (max_size,) + tuple(tensor.shape[1:])
+    padded = torch.zeros(shape, dtype=tensor.dtype, device=device)
+    if tensor.size(0) > 0:
+        padded[: tensor.size(0)] = tensor
+    gathered = [
+        torch.zeros(shape, dtype=tensor.dtype, device=device)
+        for _ in range(world_size)
+    ]
+    dist.all_gather(gathered, padded, group=pg)
+    return [g[:sz].cpu() for g, sz in zip(gathered, sizes)]
 
 
 def _pop_retained_keys(
