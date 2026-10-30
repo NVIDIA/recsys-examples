@@ -50,7 +50,11 @@ def _merge_extend_shape(
 class ExtendableBuffer(abc.ABC):
     """Base for host/device extendable buffers. Use is_device_buffer to distinguish
     device (HBM) from host; tensor.is_cuda can be True for host memory registered
-    to CUDA address space and is not reliable for this."""
+    to CUDA address space and is not reliable for this.
+
+    The buffer owns its memory; the tensors from tensor() do not keep it alive.
+    Dropping the buffer waits for the GPU work queued before the drop, then frees
+    the memory."""
 
     @abc.abstractmethod
     def num_bytes(self) -> int:
