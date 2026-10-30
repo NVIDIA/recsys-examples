@@ -753,7 +753,12 @@ def _expand_tables_impl(
 
     A table that never evicts keeps its value buffer out of this: it is sized by the
     rows the table has handed out, not by the key map (see
-    :func:`_grow_values_only`)."""
+    :func:`_grow_values_only`).
+
+    Batches prefetched before the rehash whose backward has not run yet keep
+    their keys' ref counts, which move with the keys, but their slots go
+    stale: they look them up again (``state.key_map_generation`` counts the
+    rehashes)."""
     base_opt = state.options_list[0]
     device = state.device
     enable_overflow = getattr(state.key_index_map, "enable_overflow_", False)
@@ -811,6 +816,13 @@ def _expand_tables_impl(
         if not tables_to_expand[table_id]:
             new_key_index_map.copy_table_from(old_key_index_map, table_id)
             continue
+        # The ref counters are flat over the tables: the counter of a table's
+        # slot is at its first bucket times the bucket capacity, plus the slot.
+        src_base, dst_base = [
+            int(key_map.table_bucket_offsets_cpu_[table_id].item())
+            * key_map.bucket_capacity_
+            for key_map in (old_key_index_map, new_key_index_map)
+        ]
         dst_values_list: List[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
         for (
             keys,
@@ -855,9 +867,9 @@ def _expand_tables_impl(
                     old_key_index_map, table_id, src_slots, dst_slots
                 )
             if new_key_index_map._ref_counter is not None:
-                new_key_index_map._ref_counter[dst_slots].copy_(
-                    old_key_index_map._ref_counter[src_slots]
-                )
+                new_key_index_map._ref_counter[
+                    dst_base + dst_slots
+                ] = old_key_index_map._ref_counter[src_base + src_slots]
 
             if not new_key_index_map.use_rows_:
                 # Value row == hash slot: the value has to follow its key.
