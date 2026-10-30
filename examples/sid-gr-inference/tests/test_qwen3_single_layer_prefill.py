@@ -474,3 +474,70 @@ def test_torch_qwen3_layer_ops_loads_logical_weights() -> None:
 
     assert torch.equal(ops.qkv_proj.weight, qkv)
     assert torch.equal(ops.gate_up_proj.weight, gate_up)
+
+
+@pytest.mark.parametrize(
+    "env, dtype, head_dim, heads, major, usable, expected",
+    [
+        ({}, "bfloat16", 128, (28, 4), 10, True, "trtllm_aligned"),
+        ({}, "bfloat16", 128, (28, 4), 9, True, None),
+        ({}, "float16", 128, (28, 4), 10, True, None),
+        ({}, "bfloat16", 64, (28, 4), 10, True, None),
+        ({}, "bfloat16", 128, (16, 8), 10, True, "trtllm_aligned"),
+        ({}, "bfloat16", 128, (28, 8), 10, True, None),
+        ({}, "bfloat16", 128, (16, 2), 10, True, None),
+        ({}, "bfloat16", 128, (28, 4), 10, False, None),
+        (
+            {"GR_INFERENCE_KERNEL_QK_NORM_ROPE": "flashinfer"},
+            "bfloat16",
+            128,
+            (28, 4),
+            10,
+            True,
+            None,
+        ),
+        (
+            {"GR_INFERENCE_KERNEL_PRESET": "torch"},
+            "bfloat16",
+            128,
+            (28, 4),
+            10,
+            True,
+            None,
+        ),
+    ],
+)
+def test_qwen3_qk_norm_rope_defaults_to_trtllm_aligned_only_on_sm10x_bf16(
+    monkeypatch, env, dtype, head_dim, heads, major, usable, expected
+) -> None:
+    if importlib.util.find_spec("torch") is None:
+        pytest.skip("torch is not installed")
+
+    import gr_inference.gr_models.qwen3.layers as qwen3_layers
+    import torch
+    from gr_inference.gr_kernels import CAP_QK_NORM_ROPE
+    from gr_inference.gr_kernels.selection import reset_default_kernel_selection_policy
+
+    for name in ("GR_INFERENCE_KERNEL_QK_NORM_ROPE", "GR_INFERENCE_KERNEL_PRESET"):
+        monkeypatch.delenv(name, raising=False)
+    for name, value in env.items():
+        monkeypatch.setenv(name, value)
+    reset_default_kernel_selection_policy()
+    monkeypatch.setattr(qwen3_layers, "_is_cuda_tensor", lambda _tensor: True)
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda _d: (major, 0))
+    builds = []
+    monkeypatch.setattr(
+        qwen3_layers,
+        "_trtllm_qk_norm_rope_cuda_usable",
+        lambda: builds.append(1) or usable,
+    )
+    q = torch.empty(1, 1, heads[0], head_dim, dtype=getattr(torch, dtype))
+    k = torch.empty(1, 1, heads[1], head_dim, dtype=getattr(torch, dtype))
+
+    try:
+        selected = qwen3_layers._qk_norm_rope_backend(q, k)
+        unchanged = qwen3_layers._selected_kernel_backend(CAP_QK_NORM_ROPE)
+    finally:
+        reset_default_kernel_selection_policy()
+    assert selected == (expected or unchanged)
+    assert not (builds and major != 10)
