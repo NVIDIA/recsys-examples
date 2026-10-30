@@ -124,6 +124,42 @@ def _gencode_flags(code_kind):
     return flags
 
 
+# The hierarchical dist (src/hier_output_dist) uses NCCL's device API with
+# railed GIN and ncclGin_StrongSignalAdd: NCCL 2.30.7 or newer. Without it the
+# extension is built without that op.
+NCCL_MIN_VERSION_CODE = 23007
+
+
+def _nccl_version_code(include_dir):
+    """NCCL_VERSION_CODE of include_dir/nccl.h, None if there is none."""
+    header = os.path.join(include_dir, "nccl.h")
+    if not os.path.isfile(header):
+        return None
+    with open(header) as header_file:
+        match = re.search(r"#define\s+NCCL_VERSION_CODE\s+(\d+)", header_file.read())
+    return int(match.group(1)) if match else None
+
+
+def find_nccl():
+    """(NCCL_HOME or None, version code or None) of the NCCL to build with:
+    $NCCL_HOME if set, else the first nccl.h in the order the compiler looks:
+    $CUDA_HOME/include, /usr/local/include, /usr/include."""
+    nccl_home = os.environ.get("NCCL_HOME")
+    if nccl_home:
+        return nccl_home, _nccl_version_code(os.path.join(nccl_home, "include"))
+    from torch.utils.cpp_extension import CUDA_HOME
+
+    for include_dir in (
+        os.path.join(CUDA_HOME or "/usr/local/cuda", "include"),
+        "/usr/local/include",
+        "/usr/include",
+    ):
+        code = _nccl_version_code(include_dir)
+        if code is not None:
+            return None, code
+    return None, None
+
+
 def get_extensions():
     extra_link_args = [
         "-Wl,--no-as-needed",
@@ -151,22 +187,52 @@ def get_extensions():
         ],
     }
 
-    cuda_sources = find_source_files(
-        os.path.join(root_path, "src"),
-        r".*\.cu$|.*\.cpp$|.*\.c$|.*\.cxx$",
-        exclude_files=[
-            "lookup_torch_binding.cu",
-            "get_table_range_torch_binding.cu",
-            "expand_table_ids_torch_binding.cu",
-            # Built separately into standalone fatbins (Lex + custom LTO-IR),
-            # shipped as package_data; NOT linked into the .so.
-            "evict_lrulfu.cu",
-        ],
-    )
-
+    exclude_files = [
+        "lookup_torch_binding.cu",
+        "get_table_range_torch_binding.cu",
+        "expand_table_ids_torch_binding.cu",
+        # Built separately into standalone fatbins (Lex + custom LTO-IR),
+        # shipped as package_data; NOT linked into the .so.
+        "evict_lrulfu.cu",
+    ]
     include_dirs = [
         root_path / "src",
     ]
+    library_dirs = []
+
+    cuda_sources = find_source_files(
+        os.path.join(root_path, "src"),
+        r".*\.cu$|.*\.cpp$|.*\.c$|.*\.cxx$",
+        exclude_files=exclude_files,
+    )
+
+    nccl_home, nccl_code = find_nccl()
+    if nccl_code is not None and nccl_code >= NCCL_MIN_VERSION_CODE:
+        # device API (GIN + LSA) of the hierarchical dist (src/hier_output_dist)
+        extra_link_args.append("-lnccl")
+        if nccl_home:
+            include_dirs.append(Path(nccl_home) / "include")
+            library_dirs += [
+                os.path.join(nccl_home, subdir) for subdir in ("lib", "lib64")
+            ]
+        if os.environ.get("DYNAMICEMB_HIER_TRACE") == "1":
+            for flags in extra_compile_args.values():
+                flags.append("-DDEMB_HIER_TRACE=1")
+            print(
+                "[dynamicemb] building the hierarchical dist with its trace "
+                "(DYNAMICEMB_HIER_TRACE=1)"
+            )
+    else:
+        op_dir = os.path.join(root_path, "src", "hier_output_dist") + os.sep
+        cuda_sources = [path for path in cuda_sources if not path.startswith(op_dir)]
+        for flags in extra_compile_args.values():
+            flags.append("-DDEMB_NO_HIER_OUTPUT_DIST")
+        found = "no nccl.h" if nccl_code is None else f"NCCL_VERSION_CODE {nccl_code}"
+        print(
+            "[dynamicemb] building without the hierarchical dist: it needs "
+            f"NCCL >= 2.30.7, found {found} (set NCCL_HOME to use another NCCL)"
+        )
+
     cuda_sources = [str(path) for path in cuda_sources]
     include_dirs = [str(path) for path in include_dirs]
 
@@ -177,6 +243,7 @@ def get_extensions():
             extra_compile_args=extra_compile_args,
             extra_link_args=extra_link_args,
             include_dirs=include_dirs,
+            library_dirs=library_dirs,
             # libraries=['torch', 'c10'],
         )
     ]

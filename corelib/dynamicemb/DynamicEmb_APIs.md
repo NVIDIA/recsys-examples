@@ -23,6 +23,7 @@ This document consists of two parts, one is the introduction to the API, which c
 - [set_score](#set_score)
 - [Counter](#counter)
 - [AdmissionStrategy and MultiTableAdmitter](#admissionstrategy-and-multitableadmitter)
+- [quiesce](#quiesce)
 
 ## DynamicEmbParameterConstraints
 
@@ -898,6 +899,21 @@ Fields declared first (through `device_id`) are **planner/runtime-heavy**: `Dyna
             cache / HBM tiers spill their evictions to the next tier and are not
             recorded. Records the (key, table_id) only, no value/score. Default
             ``EvictedItemMode.DISCARD``.
+        output_dist : str, optional
+            How a row-wise sequence (``EmbeddingCollection``) sharding moves keys to their
+            owners and the looked-up rows back. ``"torchrec"`` (default): TorchRec's input and
+            output dists. ``"fused"``: DynamicEmb's hierarchical dist, which needs
+            ``output_dist_capacity`` and DynamicEmb built against NCCL >= 2.30.7. ``"auto"``:
+            ``"fused"`` where the build has it and ``output_dist_capacity`` is set, else
+            TorchRec's dists. See ``docs/hier_output_dist.md``, section 4.
+        node_dedup : bool, optional
+            With ``"fused"`` (or ``"auto"``) across nodes, a node sends each key once and adds
+            up its gradient rows before they cross back. ``False`` sends every occurrence.
+            Default ``True``. See ``docs/hier_output_dist.md``, section 4.3.
+        output_dist_capacity : Optional[Union[int, Dict[str, int]]], optional
+            The capacities of ``"fused"`` (and ``"auto"``), in keys: an int for both, or a
+            dict of ``"lookup_keys"`` and, across nodes, ``"remote_keys"``. Other names raise
+            ``ValueError``. Default ``None``. See ``docs/hier_output_dist.md``, section 5.
         optimizer_state_dtype : Optional[torch.dtype], optional
             Precision the optimizer state is kept at, and the ``optim_state_dtype`` a dump
             records. ``None`` (default) keeps each optimizer's default. Only
@@ -944,6 +960,9 @@ Fields declared first (through `device_id`) are **planner/runtime-heavy**: `Dyna
         admit_strategy: Optional[AdmissionStrategy] = None
         admission_counter: Optional[Counter] = None  # deprecated
         evicted_item_mode: EvictedItemMode = EvictedItemMode.DISCARD
+        output_dist: str = "torchrec"
+        node_dedup: bool = True
+        output_dist_capacity: Optional[Union[int, Dict[str, int]]] = None
         optimizer_state_dtype: Optional[torch.dtype] = None
 
     ```
@@ -1530,6 +1549,30 @@ For both, `initializer_args` says how to initialize the rows the admitter
 rejects; None leaves them to the table's own initializer, which is also the only
 way to get UNIFORM bounds derived from a table's row count.
 
+## quiesce
+
+Lets a model on the hierarchical dist (`output_dist="fused"`, or `"auto"`) free its communication buffers at once when it is dropped. Call it on every rank, after the model's last call and before the model is dropped.
+
+    ```python
+    #How to import
+    from dynamicemb.shard import quiesce
+
+    #API arguments
+    def quiesce(model: torch.nn.Module) -> None:
+        """
+        For every hierarchical dist of ``model`` (a DistributedModelParallel, say), in the
+        same order on every rank, its operator synchronizes the device and meets the other
+        ranks over its own communicator. After it, no kernel of the sharding runs on any
+        rank, and nothing is still being sent between ranks. So dropping the model frees its
+        communication buffers at once.
+
+        Without it, dropping the model waits until every node peer and rail peer has dropped
+        its own, for at most ``min(timeout, 30 s)``. If one does not, the buffers stay until
+        the process exits. A call of the model after ``quiesce`` undoes it. Shardings on
+        TorchRec's dists are left as they are.
+        """
+    ```
+
 # Functionality and User interface
 
 ## Distributed embedding training and evaluation
@@ -1539,6 +1582,18 @@ Once the model containing `EmbeddingCollection` is built and initialized through
 The switching between training and evaluation modes should be consistent with `nn.Module`, while `training` in [DynamicEmbTableOptions](./dynamicemb/dynamicemb_config.py) is used to guide whether to allocate memory to optimizer states when builds the table.
 
 Due to limited resources, the dynamic embedding table does not pre allocate memory for all keys. If a key appears for the first time during training, it will be initialized immediately during the training process. Please see `initializer_args` and `eval_initializer_args` in `DynamicEmbTableOptions` for more information.
+
+## Hierarchical sequence dist
+
+`output_dist="fused"` in `DynamicEmbTableOptions` replaces TorchRec's input and output dists of row-wise `EmbeddingCollection` shardings with DynamicEmb's hierarchical dist.
+
+- Set `output_dist_capacity` from what the model's batches need: `hier_needs` and `hier_capacities` in `benchmark/benchmark_utils.py` count it.
+- Give every DynamicEmb table of a sharding the same `output_dist`, `output_dist_capacity` and `node_dedup`, and every rank the same options and environment variables ([docs/hier_output_dist.md](./docs/hier_output_dist.md), section 4.1).
+- Set `NCCL_CROSS_NIC=0` for multi-node jobs, before the first NCCL communicator is created, so that NCCL connects GIN on the rails alone.
+- Call [quiesce](#quiesce) on every rank before dropping the model.
+- Every rank must make the same calls in the same order, as with NCCL collectives.
+
+Design, capacities, configuration, environment variables and fallbacks: [docs/hier_output_dist.md](./docs/hier_output_dist.md). Benchmark: [benchmark/README.md](./benchmark/README.md), section 3.
 
 ## Weighted EmbeddingBagCollection
 
@@ -1609,3 +1664,6 @@ The following environment variables control runtime behavior of dynamicemb:
 | `DYNAMICEMB_CSTM_SCORE_CHECK` | `1` | When set to `0`, suppresses warnings in `set_score` when a new score is less than the previous one (CUSTOMIZED eviction mode). |
 | `DEMB_DETERMINISM_MODE` | unset | When set, enables deterministic eviction of keys with equal scores during cache eviction and final table eviction. |
 | `DYNAMICEMB_DEBUG` | unset | When set to any non-empty value, enables extra runtime validation in `segmented_unique_cuda`. Copies `segmented_range` to CPU and verifies: (1) `segmented_range[0] == 0`, (2) `segmented_range[num_tables] == num_keys`, (3) monotonically non-decreasing. Raises an error with a descriptive message on violation. Intended for development and testing only; incurs one device-to-host copy per call. |
+| `DYNAMICEMB_GIN_PROXY_MB` | `512` | Hierarchical dist (`output_dist="fused"`): cap, in MiB, of the rows a GPU passes between its node and the other nodes (in both directions); a call whose rows do not fit moves them in rounds. |
+| `DYNAMICEMB_GIN_TIMEOUT_S` | the process group's timeout | Hierarchical dist: how long a kernel waits for a peer before it prints what it waited for and traps. |
+| `DYNAMICEMB_GIN_CTAS`, `DYNAMICEMB_GIN_REDUCE_CTAS`, `LOCAL_WORLD_SIZE` | – | Hierarchical dist: its CTA counts and the GPUs per node: [docs/hier_output_dist.md](./docs/hier_output_dist.md), section 4.4, which also gives the build option of its trace. |
