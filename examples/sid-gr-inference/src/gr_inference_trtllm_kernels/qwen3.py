@@ -89,18 +89,23 @@ def write_beam_kv_step(
     layer_idx: int,
     step: int,
     active_beam_width: int,
+    vectorized_only: bool = False,
 ) -> bool:
     """Write one decode layer step into BeamKV using one CUDA launch.
 
     Returns ``False`` when the CUDA extension is unavailable or the tensors do
     not match the supported hot-path shape, allowing callers to keep the
-    regular PyTorch copy fallback.
+    regular PyTorch copy fallback. With ``vectorized_only``, it writes only
+    where the vectorized kernel applies.
     """
 
     if (
         torch is None
         or os.environ.get("GR_INFERENCE_GR_TRTLLM_KERNELS_JIT", "1") != "1"
-        or os.environ.get("GR_INFERENCE_GR_TRTLLM_BEAM_KV_WRITE_JIT", "0") != "1"
+        or (
+            not vectorized_only
+            and os.environ.get("GR_INFERENCE_GR_TRTLLM_BEAM_KV_WRITE_JIT", "0") != "1"
+        )
     ):
         _record_call("beam_kv_write_jit_disabled")
         return False
@@ -124,7 +129,7 @@ def write_beam_kv_step(
         _record_call("beam_kv_write_jit_unavailable")
         return False
     try:
-        extension.write_beam_kv_step_cuda(
+        vectorized = extension.write_beam_kv_step_cuda(
             beam_key,
             beam_value,
             k,
@@ -132,8 +137,14 @@ def write_beam_kv_step(
             int(layer_idx),
             int(step),
             int(active_beam_width),
+            bool(vectorized_only),
         )
+        if vectorized_only and not vectorized:
+            _record_call("beam_kv_write_cuda_not_vectorized")
+            return False
         _record_call("beam_kv_write_cuda")
+        if vectorized:
+            _record_call("beam_kv_write_cuda_vectorized")
         return True
     except Exception:
         _record_call("beam_kv_write_cuda_failed")
@@ -609,14 +620,15 @@ std::vector<torch::Tensor> exact_fused_add_rmsnorm_cuda_launcher(
     torch::Tensor weight,
     double eps);
 
-void write_beam_kv_step_cuda_launcher(
+bool write_beam_kv_step_cuda_launcher(
     torch::Tensor beam_key,
     torch::Tensor beam_value,
     torch::Tensor k,
     torch::Tensor v,
     int64_t layer_idx,
     int64_t step,
-    int64_t active_beam_width);
+    int64_t active_beam_width,
+    bool vectorized_only);
 
 void write_packed_qkv_prefill_kv_cuda_launcher(
     torch::Tensor k,
@@ -667,16 +679,17 @@ std::vector<torch::Tensor> exact_fused_add_rmsnorm_cuda(
   return exact_fused_add_rmsnorm_cuda_launcher(input, residual, weight, eps);
 }
 
-void write_beam_kv_step_cuda(
+bool write_beam_kv_step_cuda(
     torch::Tensor beam_key,
     torch::Tensor beam_value,
     torch::Tensor k,
     torch::Tensor v,
     int64_t layer_idx,
     int64_t step,
-    int64_t active_beam_width) {
-  write_beam_kv_step_cuda_launcher(
-      beam_key, beam_value, k, v, layer_idx, step, active_beam_width);
+    int64_t active_beam_width,
+    bool vectorized_only) {
+  return write_beam_kv_step_cuda_launcher(
+      beam_key, beam_value, k, v, layer_idx, step, active_beam_width, vectorized_only);
 }
 
 void write_packed_qkv_prefill_kv_cuda(
@@ -699,12 +712,14 @@ _CUDA_SOURCE = r"""
 #include <ATen/ATen.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAException.h>
+#include <c10/cuda/CUDAGuard.h>
 #include <algorithm>
 #include <cstdlib>
 #include <cublas_v2.h>
 #include <cstdint>
 #include <cuda.h>
 #include <cuda_runtime.h>
+#include <limits>
 #include <string>
 #include <torch/extension.h>
 #include <vector>
@@ -981,6 +996,102 @@ __global__ void write_beam_kv_step_kernel(
       + dim * dst_value_stride_dim;
   beam_key[dst_offset] = k[src_offset];
   beam_value[value_dst_offset] = v[value_src_offset];
+}
+
+inline bool beam_kv_write_vectorize_enabled() {
+  const char* setting = std::getenv("GR_INFERENCE_TRTLLM_BEAM_KV_WRITE_VECTORIZE");
+  return setting == nullptr || std::string(setting) != "0";
+}
+
+struct BeamKVStepStrides {
+  int64_t offset;
+  int64_t batch;
+  int64_t beam;
+  int64_t head;
+};
+
+__global__ void write_beam_kv_step_vec_kernel(
+    uint4* __restrict__ beam_key,
+    uint4* __restrict__ beam_value,
+    const uint4* __restrict__ k,
+    const uint4* __restrict__ v,
+    int active_beam_width,
+    int head_vecs,
+    int beam_vecs,
+    BeamKVStepStrides key_dst,
+    BeamKVStepStrides value_dst,
+    BeamKVStepStrides key_src,
+    BeamKVStepStrides value_src) {
+  int batch_idx = blockIdx.y;
+  int linear = blockIdx.x * blockDim.x + threadIdx.x;
+  int beam = linear / beam_vecs;
+  if (beam >= active_beam_width) {
+    return;
+  }
+  int rest = linear - beam * beam_vecs;
+  int head = rest / head_vecs;
+  int dim = rest - head * head_vecs;
+  beam_key[key_dst.offset + batch_idx * key_dst.batch + beam * key_dst.beam + head * key_dst.head + dim] =
+      k[batch_idx * key_src.batch + beam * key_src.beam + head * key_src.head + dim];
+  beam_value[value_dst.offset + batch_idx * value_dst.batch + beam * value_dst.beam + head * value_dst.head + dim] =
+      v[batch_idx * value_src.batch + beam * value_src.beam + head * value_src.head + dim];
+}
+
+inline bool launch_write_beam_kv_step_vec(
+    const torch::Tensor& beam_key,
+    const torch::Tensor& beam_value,
+    const torch::Tensor& k,
+    const torch::Tensor& v,
+    int64_t layer_idx,
+    int64_t step,
+    int64_t active_beam_width) {
+  if (!beam_kv_write_vectorize_enabled()) {
+    return false;
+  }
+  int64_t vec = 16 / static_cast<int64_t>(k.element_size());
+  int64_t batch = k.size(0);
+  int64_t head_dim = k.size(3);
+  if (head_dim % vec != 0 || batch > 65535) {
+    return false;
+  }
+  for (const torch::Tensor* t : {&beam_key, &beam_value, &k, &v}) {
+    if (t->stride(-1) != 1 || !is_aligned_to_16(t->data_ptr())) {
+      return false;
+    }
+    for (int64_t d = 0; d + 1 < t->dim(); ++d) {
+      if (t->stride(d) % vec != 0) {
+        return false;
+      }
+    }
+  }
+  int64_t beam_vecs = k.size(2) * head_dim / vec;
+  int64_t total = active_beam_width * beam_vecs;
+  if (total > std::numeric_limits<int>::max()) {
+    return false;
+  }
+  auto dst_strides = [&](const torch::Tensor& t) {
+    return BeamKVStepStrides{
+        (layer_idx * t.stride(0) + step * t.stride(2)) / vec, t.stride(1) / vec, t.stride(3) / vec, t.stride(4) / vec};
+  };
+  auto src_strides = [&](const torch::Tensor& t) {
+    return BeamKVStepStrides{0, t.stride(0) / vec, t.stride(1) / vec, t.stride(2) / vec};
+  };
+  int threads = 256;
+  dim3 grid(static_cast<unsigned>((total + threads - 1) / threads), static_cast<unsigned>(batch));
+  write_beam_kv_step_vec_kernel<<<grid, threads, 0, at::cuda::getCurrentCUDAStream()>>>(
+      reinterpret_cast<uint4*>(beam_key.data_ptr()),
+      reinterpret_cast<uint4*>(beam_value.data_ptr()),
+      reinterpret_cast<const uint4*>(k.data_ptr()),
+      reinterpret_cast<const uint4*>(v.data_ptr()),
+      static_cast<int>(active_beam_width),
+      static_cast<int>(head_dim / vec),
+      static_cast<int>(beam_vecs),
+      dst_strides(beam_key),
+      dst_strides(beam_value),
+      src_strides(k),
+      src_strides(v));
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  return true;
 }
 
 template <typename scalar_t>
@@ -1434,16 +1545,20 @@ void write_packed_qkv_prefill_kv_cuda_launcher(
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
-void write_beam_kv_step_cuda_launcher(
+bool write_beam_kv_step_cuda_launcher(
     torch::Tensor beam_key,
     torch::Tensor beam_value,
     torch::Tensor k,
     torch::Tensor v,
     int64_t layer_idx,
     int64_t step,
-    int64_t active_beam_width) {
+    int64_t active_beam_width,
+    bool vectorized_only) {
   TORCH_CHECK(beam_key.is_cuda() && beam_value.is_cuda(), "BeamKV tensors must be CUDA tensors");
   TORCH_CHECK(k.is_cuda() && v.is_cuda(), "k/v tensors must be CUDA tensors");
+  TORCH_CHECK(
+      beam_value.device() == beam_key.device() && k.device() == beam_key.device() && v.device() == beam_key.device(),
+      "BeamKV and k/v tensors must be on the same device");
   TORCH_CHECK(beam_key.dim() == 6 && beam_value.dim() == 6, "BeamKV tensors must be [L,B,S,W,H,D]");
   TORCH_CHECK(k.dim() == 4 && v.dim() == 4, "k/v must be [B,W,H,D]");
   TORCH_CHECK(beam_key.scalar_type() == beam_value.scalar_type(), "BeamKV dtypes must match");
@@ -1466,7 +1581,14 @@ void write_beam_kv_step_cuda_launcher(
 
   int64_t elements = k.numel();
   if (elements == 0) {
-    return;
+    return false;
+  }
+  const at::cuda::OptionalCUDAGuard device_guard(beam_key.device());
+  if (launch_write_beam_kv_step_vec(beam_key, beam_value, k, v, layer_idx, step, active_beam_width)) {
+    return true;
+  }
+  if (vectorized_only) {
+    return false;
   }
   int threads = 256;
   int blocks = static_cast<int>((elements + threads - 1) / threads);
@@ -1509,5 +1631,6 @@ void write_beam_kv_step_cuda_launcher(
             v.stride(3));
       });
   C10_CUDA_KERNEL_LAUNCH_CHECK();
+  return false;
 }
 """

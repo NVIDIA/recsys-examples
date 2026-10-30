@@ -195,6 +195,16 @@ Disable SID-GR experimental JIT kernels:
 GR_INFERENCE_GR_TRTLLM_KERNELS_JIT=0
 ```
 
+The decode beam-KV write copies 16 bytes per thread when the K/V rows are
+16-byte aligned, and uses the PyTorch copy otherwise.
+`GR_INFERENCE_GR_TRTLLM_BEAM_KV_WRITE_JIT=1` uses the scalar CUDA kernel instead
+of the PyTorch copy, and `=0` always uses the PyTorch copy. To disable the
+vectorized copy:
+
+```bash
+GR_INFERENCE_TRTLLM_BEAM_KV_WRITE_VECTORIZE=0
+```
+
 Decode graph cache size can be configured with:
 
 ```bash
