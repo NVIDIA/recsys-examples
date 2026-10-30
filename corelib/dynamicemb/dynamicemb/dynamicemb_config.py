@@ -229,6 +229,8 @@ class DynamicEmbScoreStrategy(enum.IntEnum):
         If there are not enough slots inside the bucket to store new keys, the least used key in the bucket will be evicted.
     NO_EVICTION:
         The table’s capacity doubles whenever there are not enough slots for new keys, and this continues until available memory is exhausted.
+        Alone it keeps no score; it may be combined with CUSTOMIZED as `(NO_EVICTION, CUSTOMIZED)`.
+        Incremental dump and replay are not supported for such tables.
         When the memory resources are insufficient, there will be a warning message, and training can continue but the accuracy of eviction cannot be guaranteed.
     """
 
@@ -246,15 +248,39 @@ class DynamicEmbScoreStrategy(enum.IntEnum):
 # eviction ranking. The user's tuple order is the *logical* order that
 # checkpoints are written in; the on-device *physical* layout stays fixed (see
 # :func:`get_physical_score_order`). The tuple form keeps the interface open for
-# future combinations; only ``(TIMESTAMP, LFU)`` (in either order) is supported
-# for now.
+# future combinations; only ``(TIMESTAMP, LFU)`` and ``(NO_EVICTION, CUSTOMIZED)``
+# (in either order) are supported for now.
 ScoreStrategy = Union[DynamicEmbScoreStrategy, Tuple[DynamicEmbScoreStrategy, ...]]
 
 # Supported compound strategies, as unordered element sets. Both orderings of a
 # supported set are accepted; only the checkpoint column order differs.
 SUPPORTED_COMPOUND_SCORE_STRATEGIES: Tuple[frozenset, ...] = (
     frozenset({DynamicEmbScoreStrategy.TIMESTAMP, DynamicEmbScoreStrategy.LFU}),
+    # NO_EVICTION is a mode rather than a score: the table never evicts and grows
+    # instead. Alone it keeps no score; with CUSTOMIZED the score is CUSTOMIZED's.
+    frozenset(
+        {DynamicEmbScoreStrategy.NO_EVICTION, DynamicEmbScoreStrategy.CUSTOMIZED}
+    ),
 )
+
+
+def has_no_eviction(score_strategy: "ScoreStrategy") -> bool:
+    """Whether the table never evicts: ``NO_EVICTION`` alone, or in a compound."""
+    if isinstance(score_strategy, tuple):
+        return DynamicEmbScoreStrategy.NO_EVICTION in score_strategy
+    return score_strategy == DynamicEmbScoreStrategy.NO_EVICTION
+
+
+def get_score_part(score_strategy: "ScoreStrategy") -> Optional["ScoreStrategy"]:
+    """The part of *score_strategy* that decides the stored score, without the
+    no-eviction mode: ``None`` for ``NO_EVICTION`` alone (no score is kept),
+    ``CUSTOMIZED`` for ``(NO_EVICTION, CUSTOMIZED)``, anything else unchanged."""
+    if not has_no_eviction(score_strategy):
+        return score_strategy
+    if not isinstance(score_strategy, tuple):
+        return None
+    rest = tuple(s for s in score_strategy if s != DynamicEmbScoreStrategy.NO_EVICTION)
+    return rest[0] if len(rest) == 1 else rest
 
 
 def normalize_score_strategy(score_strategy: ScoreStrategy) -> ScoreStrategy:
@@ -267,7 +293,7 @@ def normalize_score_strategy(score_strategy: ScoreStrategy) -> ScoreStrategy:
     A single :class:`DynamicEmbScoreStrategy` is returned unchanged. A one-element
     tuple ``(X,)`` is unwrapped to the single strategy ``X`` (a single score column
     has no ordering to preserve). A multi-element tuple must form a supported
-    compound set (currently only ``{TIMESTAMP, LFU}``) and is returned as a tuple.
+    compound set (``{TIMESTAMP, LFU}`` or ``{NO_EVICTION, CUSTOMIZED}``) and is returned as a tuple.
 
     Raises
     ------
@@ -327,7 +353,13 @@ def get_eviction_score_strategy(
     """
     if isinstance(score_strategy, tuple):
         non_timestamp = [
-            s for s in score_strategy if s != DynamicEmbScoreStrategy.TIMESTAMP
+            s
+            for s in score_strategy
+            if s
+            not in (
+                DynamicEmbScoreStrategy.TIMESTAMP,
+                DynamicEmbScoreStrategy.NO_EVICTION,
+            )
         ]
         # Supported compounds always contain exactly one non-TIMESTAMP element.
         return non_timestamp[0] if non_timestamp else DynamicEmbScoreStrategy.TIMESTAMP
@@ -355,8 +387,14 @@ def get_physical_score_order(
     A single strategy occupies one word. The compound ``{TIMESTAMP, LFU}`` maps to
     the underlying ``LruLfu`` policy whose physical layout is always
     ``(TIMESTAMP, LFU)`` -- word 0 is the last-access timestamp, word 1 the
-    frequency -- regardless of the user's configured (logical) order.
+    frequency -- regardless of the user's configured (logical) order. The
+    no-eviction mode stores no word of its own: ``NO_EVICTION`` alone keeps one
+    unused word, and in a compound the layout is that of the other strategy.
     """
+    part = get_score_part(score_strategy)
+    if part is None:
+        return (DynamicEmbScoreStrategy.NO_EVICTION,)
+    score_strategy = part
     if isinstance(score_strategy, tuple):
         if frozenset(score_strategy) == frozenset(
             {DynamicEmbScoreStrategy.TIMESTAMP, DynamicEmbScoreStrategy.LFU}
@@ -377,6 +415,7 @@ def score_dump_permutation(score_strategy: ScoreStrategy) -> List[int]:
     strategies and for compounds whose logical order already matches the physical
     layout.
     """
+    score_strategy = get_score_part(score_strategy)
     if not isinstance(score_strategy, tuple):
         return [0]
     physical = get_physical_score_order(score_strategy)
@@ -391,6 +430,7 @@ def score_load_permutation(score_strategy: ScoreStrategy) -> List[int]:
     ``logical[:, perm]``, where ``perm[p]`` is the logical column holding the strategy
     stored at physical word ``p``.
     """
+    score_strategy = get_score_part(score_strategy)
     if not isinstance(score_strategy, tuple):
         return [0]
     physical = get_physical_score_order(score_strategy)
