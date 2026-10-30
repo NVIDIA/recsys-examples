@@ -782,6 +782,17 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
         self._create_cache_storage()
         self._create_initializers()
         self._create_admitter()
+        # The counters ride the KJT weights channel of a whole sharding, so a
+        # group with no use for them -- CUSTOMIZED tables next to LFU ones --
+        # is handed some all the same and must drop them, or they would be
+        # misread as scores. Tables are grouped on score and admit strategy, so
+        # one answer holds for the whole group and for the module's lifetime.
+        self._consumes_frequency_counters = self._admitter is not None or any(
+            option.score_strategy is not None
+            and get_eviction_score_strategy(option.score_strategy)
+            == DynamicEmbScoreStrategy.LFU
+            for option in self._dynamicemb_options
+        )
         self._prefetch_states: Deque[PrefetchState] = deque()
 
         # TODO:1->10
@@ -1289,6 +1300,7 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                     "it would be treated as missing. Train with external_storage "
                     "unset, or do not call eval() on this module."
                 )
+            frequency_counters = self._counters_for_group(frequency_counters)
             scores = [self._scores[name] for name in self._table_names]
             fused_score = self._reduce_table_scores(scores)
             if isinstance(self._cache, DynamicEmbCache):
@@ -1341,6 +1353,12 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
 
         return res
 
+    def _counters_for_group(
+        self, frequency_counters: Optional[Tensor]
+    ) -> Optional[Tensor]:
+        """Return ``frequency_counters`` only if this group consumes them."""
+        return frequency_counters if self._consumes_frequency_counters else None
+
     def prefetch(
         self,
         indices: Tensor,
@@ -1360,6 +1378,8 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
             current_stream = torch.cuda.current_stream()
             indices.record_stream(current_stream)
             offsets.record_stream(current_stream)
+
+        frequency_counters = self._counters_for_group(frequency_counters)
 
         scores = [self._scores[name] for name in self._table_names]
         fused_score = self._reduce_table_scores(scores)

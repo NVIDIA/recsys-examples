@@ -23,6 +23,8 @@ FWD_BWD_TEST_FILES=(
     "test/unit_tests/test_expansion_value_capacity.py"
     "test/unit_tests/test_table_rows.py"
     "test/unit_tests/test_int64_weights_channel.py"
+    "test/unit_tests/test_frequency_requirements.py"
+    "test/unit_tests/test_frequency_counter_guard.py"
     "test/unit_tests/test_planner_plan_cost.py"
     "test/unit_tests/test_planner_placement.py"
     "test/unit_tests/test_table_row_wise.sh"

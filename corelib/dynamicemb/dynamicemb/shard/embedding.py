@@ -14,7 +14,7 @@
 # limitations under the License.
 
 from itertools import accumulate
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import torch
 from dynamicemb_extensions import (
@@ -52,7 +52,6 @@ from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 from ..dynamicemb_config import (
     DynamicEmbKernel,
     DynamicEmbScoreStrategy,
-    ScoreStrategy,
     get_eviction_score_strategy,
 )
 from .rw_sharding import RwSequenceDynamicEmbeddingSharding
@@ -67,7 +66,7 @@ class DynamicEmbeddingCollectionContext(EmbeddingCollectionContext):
         input_features: Optional[List[KeyedJaggedTensor]] = None,
         reverse_indices: Optional[List[torch.Tensor]] = None,
         seq_vbe_ctx: Optional[List] = None,
-        frequency_counters: Optional[List[torch.Tensor]] = None,
+        frequency_counters: Optional[List[Optional[torch.Tensor]]] = None,
     ) -> None:
         # TorchRec may retain None for these fields; dedup and VBE append to them.
         super().__init__(
@@ -76,9 +75,49 @@ class DynamicEmbeddingCollectionContext(EmbeddingCollectionContext):
             reverse_indices=[] if reverse_indices is None else reverse_indices,
             seq_vbe_ctx=[] if seq_vbe_ctx is None else seq_vbe_ctx,
         )
-        self.frequency_counters: List[torch.Tensor] = (
+        # One entry per sharding, in sharding order; None for a sharding that
+        # needs no counters (or whose input is empty).
+        self.frequency_counters: List[Optional[torch.Tensor]] = (
             [] if frequency_counters is None else frequency_counters
         )
+
+
+def collect_frequency_requirements(
+    params: Dict[str, ParameterSharding],
+) -> Dict[str, Tuple[bool, bool]]:
+    """Which sharding types need frequency counters, as ``(is_lfu, has_admit)``.
+
+    The EC dedups and counts frequency once per sharding, over the features of
+    the tables that sharding serves. A table belongs to exactly one sharding --
+    TorchRec groups the tables by ``ParameterSharding.sharding_type`` -- so this
+    groups the tables the same way and answers per sharding type:
+
+    - ``is_lfu``: some table of it evicts by LFU (a single LFU strategy, or a
+      compound one such as ``(TIMESTAMP, LFU)``);
+    - ``has_admit``: some table of it has an admission strategy.
+
+    The answer is "some table", not the first table's: reading one table's
+    options would starve an LFU or admitting table that is not first. A sharding
+    type with no DynamicEmb table is absent from the result, i.e. needs nothing.
+    Within a sharding the tables may still differ; the ones that do not use the
+    counters ignore them.
+    """
+    requirements: Dict[str, Tuple[bool, bool]] = {}
+    for param_sharding in params.values():
+        options = getattr(param_sharding, "dynamicemb_options", None)
+        if not options:
+            continue
+        sharding_type = param_sharding.sharding_type
+        is_lfu, has_admit = requirements.get(sharding_type, (False, False))
+        if options.score_strategy is not None and (
+            get_eviction_score_strategy(options.score_strategy)
+            == DynamicEmbScoreStrategy.LFU
+        ):
+            is_lfu = True
+        if options.admit_strategy is not None:
+            has_admit = True
+        requirements[sharding_type] = (is_lfu, has_admit)
+    return requirements
 
 
 class ShardedDynamicEmbeddingCollection(ShardedEmbeddingCollection):
@@ -89,21 +128,20 @@ class ShardedDynamicEmbeddingCollection(ShardedEmbeddingCollection):
     def __init__(
         self,
         *args,
-        score_strategy: Optional[ScoreStrategy] = None,
-        has_admit_strategy: bool = False,
+        frequency_requirements: Optional[Dict[str, Tuple[bool, bool]]] = None,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
-        # Store the global score strategy
-        self._score_strategy = score_strategy
-        # LFU is enabled when the strategy's eviction column is LFU -- for a single
-        # LFU strategy or for a compound strategy such as (TIMESTAMP, LFU).
-        self._is_lfu_enabled = (
-            get_eviction_score_strategy(score_strategy) == DynamicEmbScoreStrategy.LFU
-            if score_strategy is not None
-            else False
-        )
-        self._has_admit_strategy = has_admit_strategy
+        # Per sharding, in the order of ``_sharding_type_to_sharding`` -- the order
+        # the input dist iterates the shardings in, so ``[i]`` is sharding ``i``.
+        # See :func:`collect_frequency_requirements`.
+        requirements = frequency_requirements or {}
+        self._sharding_is_lfu: List[bool] = []
+        self._sharding_has_admit: List[bool] = []
+        for sharding_type in self._sharding_type_to_sharding:
+            is_lfu, has_admit = requirements.get(sharding_type, (False, False))
+            self._sharding_is_lfu.append(is_lfu)
+            self._sharding_has_admit.append(has_admit)
 
     @classmethod
     def create_embedding_sharding(
@@ -166,8 +204,6 @@ class ShardedDynamicEmbeddingCollection(ShardedEmbeddingCollection):
         ctx: Optional[EmbeddingCollectionContext] = None,
     ) -> None:
         super()._create_hash_size_info(feature_names)
-
-        # _is_lfu_enabled is already set in __init__ from score_strategy parameter
 
         for i, sharding in enumerate(self._sharding_type_to_sharding.values()):
             nonfuse_table_feature_offsets: List[int] = []
@@ -235,6 +271,7 @@ class ShardedDynamicEmbeddingCollection(ShardedEmbeddingCollection):
                     ctx.reverse_indices.append(
                         torch.empty(0, dtype=torch.int64, device=self._device)
                     )
+                    ctx.frequency_counters.append(None)
                     features_by_shards.append(dedup_features)
                     continue
 
@@ -242,8 +279,11 @@ class ShardedDynamicEmbeddingCollection(ShardedEmbeddingCollection):
                 segmented_range = get_table_range(offsets, d_table_offset)
 
                 # Prepare input_frequencies tensor to control frequency counting
+                needs_counters = (
+                    self._sharding_is_lfu[i] or self._sharding_has_admit[i]
+                )
                 input_frequencies = None
-                if self._is_lfu_enabled or self._has_admit_strategy:
+                if needs_counters:
                     input_frequencies = torch.empty(
                         0, dtype=torch.int64, device=self._device
                     )
@@ -286,9 +326,11 @@ class ShardedDynamicEmbeddingCollection(ShardedEmbeddingCollection):
                 ctx.input_features.append(input_feature)
                 ctx.reverse_indices.append(reverse_idx)
 
-                if self._is_lfu_enabled or self._has_admit_strategy:
-                    frequency_counters = freq_counters[:total_unique].to(torch.uint64)
-                    ctx.frequency_counters.append(frequency_counters)
+                ctx.frequency_counters.append(
+                    freq_counters[:total_unique].to(torch.uint64)
+                    if needs_counters
+                    else None
+                )
 
                 features_by_shards.append(dedup_features)
         return features_by_shards
@@ -321,12 +363,10 @@ class ShardedDynamicEmbeddingCollection(ShardedEmbeddingCollection):
                 zip(self._input_dists, features_by_shards)
             ):
                 # Attach frequency counters as weights if LFU strategy is enabled
-                if (
-                    self._use_index_dedup
-                    and (self._is_lfu_enabled or self._has_admit_strategy)
-                    and len(ctx.frequency_counters) > i
-                ):
-                    frequency_counters = ctx.frequency_counters[i]
+                frequency_counters = (
+                    ctx.frequency_counters[i] if self._use_index_dedup else None
+                )
+                if frequency_counters is not None:
                     features._weights = frequency_counters.float()
                 else:
                     features._weights = None
@@ -350,13 +390,7 @@ class ShardedDynamicEmbeddingCollection(ShardedEmbeddingCollection):
     #     return DynamicEmbeddingCollectionContext(sharding_contexts=[])
 
     def create_context(self) -> DynamicEmbeddingCollectionContext:
-        # pre-allocate frequency_counters list, ensure all ranks have the same structure
-        frequency_counters = (
-            [] if not (self._is_lfu_enabled or self._has_admit_strategy) else None
-        )
-        return DynamicEmbeddingCollectionContext(
-            sharding_contexts=[], frequency_counters=frequency_counters
-        )
+        return DynamicEmbeddingCollectionContext(sharding_contexts=[])
 
 
 class DynamicEmbeddingCollectionSharder(EmbeddingCollectionSharder):
@@ -379,27 +413,8 @@ class DynamicEmbeddingCollectionSharder(EmbeddingCollectionSharder):
         device: Optional[torch.device] = None,
         module_fqn: Optional[str] = None,
     ) -> ShardedEmbeddingCollection:
-        # Extract global score_strategy from params (only once, as it's a global configuration)
-        # Strategy is expected to be consistent across all tables
-        global_score_strategy = None
-        has_admit_strategy = False
-        if global_score_strategy is None:
-            for param_name, param_sharding in params.items():
-                if (
-                    hasattr(param_sharding, "dynamicemb_options")
-                    and param_sharding.dynamicemb_options
-                ):
-                    if param_sharding.dynamicemb_options.score_strategy is not None:
-                        global_score_strategy = (
-                            param_sharding.dynamicemb_options.score_strategy
-                        )
+        frequency_requirements = collect_frequency_requirements(params)
 
-                    if param_sharding.dynamicemb_options.admit_strategy is not None:
-                        has_admit_strategy = True
-
-                    break
-
-        # Pass score_strategy directly as a parameter to ShardedDynamicEmbeddingCollection
         return ShardedDynamicEmbeddingCollection(
             module,
             params,
@@ -408,6 +423,5 @@ class DynamicEmbeddingCollectionSharder(EmbeddingCollectionSharder):
             device,
             qcomm_codecs_registry=self.qcomm_codecs_registry,
             use_index_dedup=self._use_index_dedup,
-            score_strategy=global_score_strategy,  # Pass as direct parameter
-            has_admit_strategy=has_admit_strategy,
+            frequency_requirements=frequency_requirements,
         )

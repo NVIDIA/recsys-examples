@@ -252,6 +252,17 @@ def validate_lfu_scores(
         "checkpoints are a follow-up)."
     ),
 )
+@click.option(
+    "--mixed-score-strategies",
+    is_flag=True,
+    help=(
+        "Give every table of even index within a collection TIMESTAMP instead of "
+        "LFU, so one collection holds both -- with the first table not LFU and "
+        "LFU tables after a non-LFU one. Each table's frequencies must still be "
+        "gathered or left alone according to its own strategy, not the first "
+        "table's; only the LFU tables are validated."
+    ),
+)
 def test_lfu_score_validation(
     num_embedding_collections: int,
     num_embeddings: str,
@@ -266,6 +277,7 @@ def test_lfu_score_validation(
     use_index_dedup: bool,
     global_hbm_budget_scale: float,
     lru_lfu: bool,
+    mixed_score_strategies: bool,
 ):
     """Test LFU score correctness by comparing with naive frequency counting.
 
@@ -283,6 +295,9 @@ def test_lfu_score_validation(
             "--lru-lfu is only supported for storage-only (HBM_DIRECT) LFU; "
             "caching / HybridStorage multi-word score layouts are a follow-up."
         )
+
+    if mixed_score_strategies and len(num_embeddings) < 2:
+        raise ValueError("--mixed-score-strategies needs at least two tables.")
 
     if not caching:
         for num_embedding, multi_hot_size in zip(num_embeddings, multi_hot_sizes):
@@ -309,6 +324,7 @@ def test_lfu_score_validation(
         print(f"  - Caching: DISABLED")
     print(f"  - Global HBM budget scale: {global_hbm_budget_scale}")
     print(f"  - compound (TIMESTAMP, LFU) score: {lru_lfu} (LruLfu 2-word score)")
+    print(f"  - Mixed score strategies: {mixed_score_strategies}")
     if not caching and global_hbm_budget_scale < 1.0:
         print(f"  - Storage path: expect HybridStorage (StorageMode DEFAULT)")
 
@@ -321,6 +337,18 @@ def test_lfu_score_validation(
         if lru_lfu
         else DynamicEmbScoreStrategy.LFU
     )
+    # Even-indexed tables are TIMESTAMP, the rest keep the strategy above.
+    table_option_overrides = {}
+    lfu_tables = set()
+    for collection_id in range(num_embedding_collections):
+        for embedding_id in range(len(num_embeddings)):
+            _, table_name = idx_to_name(collection_id, embedding_id)
+            if mixed_score_strategies and embedding_id % 2 == 0:
+                table_option_overrides[table_name] = {
+                    "score_strategy": DynamicEmbScoreStrategy.TIMESTAMP
+                }
+            else:
+                lfu_tables.add(table_name)
     model = create_model(
         num_embedding_collections=num_embedding_collections,
         num_embeddings=num_embeddings,
@@ -331,6 +359,7 @@ def test_lfu_score_validation(
         caching=caching,
         cache_capacity_ratio=cache_capacity_ratio if caching else 0.1,
         global_hbm_budget_scale=global_hbm_budget_scale,
+        table_option_overrides=table_option_overrides,
     )
     assert_batched_dynamicemb_storage_class(
         model,
@@ -375,8 +404,15 @@ def test_lfu_score_validation(
 
     torch.cuda.synchronize()
 
-    # Validate scores
-    validate_lfu_scores(expected_frequencies, actual_scores, tolerance)
+    # Validate scores. Only LFU tables hold frequencies.
+    assert lfu_tables, "no LFU table to validate"
+    for table_name in lfu_tables:
+        assert table_name in actual_scores, f"Table {table_name} missing from scores"
+    validate_lfu_scores(
+        {name: expected_frequencies[name] for name in lfu_tables},
+        actual_scores,
+        tolerance,
+    )
 
 
 if __name__ == "__main__":
