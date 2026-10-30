@@ -220,6 +220,8 @@ Inherits from TorchREC's `EmbeddingCollectionSharder` and is used in exactly the
     from dynamicemb.shard import DynamicEmbeddingCollectionSharder
     ```
 
+With `use_index_dedup=True` and an LFU score strategy or an admission strategy, each rank sends its deduplicated keys together with how often each one occurs (as the KJT weights), so that a table counts every occurrence.
+
 ## DynamicEmbCheckMode
 
 When the dynamic embedding table capacity is small, a single feature with a large number of indices may lead to issues where the hashtable cannot insert the indices. Enabling safe check allows you to observe this behavior (the number of times indices cannot be inserted and the number of indices each time) to determine if the dynamic embedding table capacity is set too low.

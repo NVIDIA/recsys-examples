@@ -193,3 +193,47 @@ for optimizer_type in "sgd" "adam"; do
     --cache-capacity-ratio $EVICTION_CACHE_RATIO_1 || exit 1
 done
 
+
+# Index dedup with a rank that has no keys. First, at iteration 1 rank 0 has no
+# keys, on 8 GPUs. Then each collection gets a data-parallel table first, with
+# no keys on rank 0: on 1 GPU that sharding is empty on every rank, on 8 GPUs on
+# rank 0 only.
+echo ""
+echo "----------------------------------------"
+echo "Test: Empty rank at iteration 1 (dedup) | GPUs: 8 | Optimizer: sgd"
+echo "----------------------------------------"
+torchrun \
+  --nnodes 1 \
+  --nproc_per_node 8 \
+  ./test/unit_tests/test_lfu_scores.py \
+  --num-embedding-collections $NUM_EMBEDDING_COLLECTIONS \
+  --num-embeddings $NUM_EMBEDDINGS \
+  --multi-hot-sizes $MULTI_HOT_SIZES \
+  --embedding-dim $EMBEDDING_DIM \
+  --optimizer-type sgd \
+  --batch-size $BATCH_SIZE \
+  --num-iterations $NUM_ITERATIONS \
+  --tolerance $TOLERANCE \
+  --use-index-dedup \
+  --empty-rank-iteration 1 || exit 1
+
+for num_gpus in ${NUM_GPUS[@]}; do
+  echo ""
+  echo "----------------------------------------"
+  echo "Test: Data-parallel table first, no keys on rank 0 (dedup) | GPUs: $num_gpus | Optimizer: sgd"
+  echo "----------------------------------------"
+  torchrun \
+    --nnodes 1 \
+    --nproc_per_node $num_gpus \
+    ./test/unit_tests/test_lfu_scores.py \
+    --num-embedding-collections $NUM_EMBEDDING_COLLECTIONS \
+    --num-embeddings $NUM_EMBEDDINGS \
+    --multi-hot-sizes $MULTI_HOT_SIZES \
+    --embedding-dim $EMBEDDING_DIM \
+    --optimizer-type sgd \
+    --batch-size $BATCH_SIZE \
+    --num-iterations $NUM_ITERATIONS \
+    --tolerance $TOLERANCE \
+    --use-index-dedup \
+    --data-parallel-table || exit 1
+done

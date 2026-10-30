@@ -59,7 +59,12 @@ from .rw_sharding import RwSequenceDynamicEmbeddingSharding
 
 
 class DynamicEmbeddingCollectionContext(EmbeddingCollectionContext):
-    """Extended EmbeddingCollectionContext that includes frequency_counters for LFU strategy."""
+    """EmbeddingCollectionContext with the frequency counters of index dedup.
+
+    With index dedup and LFU or admission, ``frequency_counters`` holds one
+    tensor per sharding, in sharding order: how often each deduplicated key
+    occurs, or an empty tensor when the sharding's input on this rank is empty.
+    """
 
     def __init__(
         self,
@@ -235,6 +240,13 @@ class ShardedDynamicEmbeddingCollection(ShardedEmbeddingCollection):
                     ctx.reverse_indices.append(
                         torch.empty(0, dtype=torch.int64, device=self._device)
                     )
+                    if self._is_lfu_enabled or self._has_admit_strategy:
+                        # No keys, so no counts. The empty entry keeps entry i
+                        # for sharding i, and input_dist sends it as empty
+                        # weights, as the ranks with keys send theirs.
+                        ctx.frequency_counters.append(
+                            torch.empty(0, dtype=torch.uint64, device=self._device)
+                        )
                     features_by_shards.append(dedup_features)
                     continue
 
@@ -320,11 +332,12 @@ class ShardedDynamicEmbeddingCollection(ShardedEmbeddingCollection):
             for i, (input_dist, features) in enumerate(
                 zip(self._input_dists, features_by_shards)
             ):
-                # Attach frequency counters as weights if LFU strategy is enabled
-                if (
-                    self._use_index_dedup
-                    and (self._is_lfu_enabled or self._has_admit_strategy)
-                    and len(ctx.frequency_counters) > i
+                # With index dedup and LFU or admission, the KJT of every
+                # sharding carries its frequency counters as weights, empty
+                # when its input is empty. Every rank then sends the same
+                # tensors in the all-to-all.
+                if self._use_index_dedup and (
+                    self._is_lfu_enabled or self._has_admit_strategy
                 ):
                     frequency_counters = ctx.frequency_counters[i]
                     features._weights = frequency_counters.float()
@@ -346,17 +359,11 @@ class ShardedDynamicEmbeddingCollection(ShardedEmbeddingCollection):
                 self._compute_sequence_vbe_context(ctx, unpadded_features)
         return KJTListSplitsAwaitable(awaitables, ctx)
 
-    # def create_context(self) -> DynamicEmbeddingCollectionContext:
-    #     return DynamicEmbeddingCollectionContext(sharding_contexts=[])
-
     def create_context(self) -> DynamicEmbeddingCollectionContext:
-        # pre-allocate frequency_counters list, ensure all ranks have the same structure
-        frequency_counters = (
-            [] if not (self._is_lfu_enabled or self._has_admit_strategy) else None
-        )
-        return DynamicEmbeddingCollectionContext(
-            sharding_contexts=[], frequency_counters=frequency_counters
-        )
+        # frequency_counters starts empty, like the other lists. With index
+        # dedup and LFU or admission, _dedup_indices appends one entry per
+        # sharding.
+        return DynamicEmbeddingCollectionContext(sharding_contexts=[])
 
 
 class DynamicEmbeddingCollectionSharder(EmbeddingCollectionSharder):

@@ -27,6 +27,7 @@ from dynamicemb.dump_load import find_sharded_modules, get_dynamic_emb_module
 from test_embedding_dump_load import (
     assert_batched_dynamicemb_storage_class,
     create_model,
+    data_parallel_idx_to_name,
     get_optimizer_kwargs,
     idx_to_name,
 )
@@ -41,6 +42,8 @@ def generate_deterministic_sparse_features_with_frequency_tracking(
     world_size: int,
     batch_size: int,
     num_iterations: int,
+    empty_rank_iteration: Optional[int] = None,
+    data_parallel_table: bool = False,
     seed: int = 42,
     caching: bool = False,
 ) -> Tuple[List[KeyedJaggedTensor], Dict[str, Dict[int, int]]]:
@@ -48,6 +51,8 @@ def generate_deterministic_sparse_features_with_frequency_tracking(
     Generate deterministic sparse features and track frequency for each embedding table.
 
     Args:
+        empty_rank_iteration: At this iteration rank 0 has no keys
+        data_parallel_table: Add keys for the data-parallel table, none on rank 0
         caching: If True, generate more unique keys to trigger cache eviction
 
     Returns:
@@ -75,6 +80,15 @@ def generate_deterministic_sparse_features_with_frequency_tracking(
         keys = []
 
         for embedding_collection_id in range(num_embedding_collections):
+            if data_parallel_table:
+                # One key per sample, none on rank 0.
+                feature_name, _ = data_parallel_idx_to_name(embedding_collection_id)
+                for _ in range(batch_size_per_rank):
+                    indices = [] if rank == 0 else [0]
+                    cur_indices.extend(indices)
+                    cur_lengths.append(len(indices))
+                keys.append(feature_name)
+
             for embedding_id, num_embedding in enumerate(num_embeddings):
                 feature_name, embedding_name = idx_to_name(
                     embedding_collection_id, embedding_id
@@ -92,13 +106,16 @@ def generate_deterministic_sparse_features_with_frequency_tracking(
                         # In storage-only mode, limit to 100 keys for more duplicates
                         max_key = min(num_embedding - 1, 100)
                     indices = [random.randint(0, max_key) for _ in range(hotness)]
+                    sample_rank = sample_id // batch_size_per_rank
+                    if iteration == empty_rank_iteration and sample_rank == 0:
+                        indices = []
                     # Track frequency for all generated indices
                     for idx in indices:
                         table_frequency_counters[embedding_name][idx] += 1
 
-                    if sample_id // batch_size_per_rank == rank:
+                    if sample_rank == rank:
                         cur_indices.extend(indices)
-                        cur_lengths.append(hotness)
+                        cur_lengths.append(len(indices))
 
                 keys.append(feature_name)
 
@@ -232,6 +249,20 @@ def validate_lfu_scores(
     help="Enable/disable index deduplication",
 )
 @click.option(
+    "--empty-rank-iteration",
+    type=int,
+    default=None,
+    help="At this iteration rank 0 has no keys.",
+)
+@click.option(
+    "--data-parallel-table",
+    is_flag=True,
+    help=(
+        "Give each collection a data-parallel TorchRec table, declared first, "
+        "with no keys on rank 0."
+    ),
+)
+@click.option(
     "--global-hbm-budget-scale",
     type=float,
     default=1.0,
@@ -264,6 +295,8 @@ def test_lfu_score_validation(
     caching: bool,
     cache_capacity_ratio: float,
     use_index_dedup: bool,
+    empty_rank_iteration: Optional[int],
+    data_parallel_table: bool,
     global_hbm_budget_scale: float,
     lru_lfu: bool,
 ):
@@ -300,6 +333,8 @@ def test_lfu_score_validation(
     print(f"  - Optimizer: {optimizer_type}")
     print(f"  - Batch size: {batch_size}")
     print(f"  - Iterations: {num_iterations}")
+    print(f"  - Empty rank iteration: {empty_rank_iteration}")
+    print(f"  - Data-parallel table: {data_parallel_table}")
     print(f"  - Tolerance: {tolerance}")
     print(f"  - Use index dedup: {use_index_dedup}")
     if caching:
@@ -331,6 +366,7 @@ def test_lfu_score_validation(
         caching=caching,
         cache_capacity_ratio=cache_capacity_ratio if caching else 0.1,
         global_hbm_budget_scale=global_hbm_budget_scale,
+        data_parallel_table=data_parallel_table,
     )
     assert_batched_dynamicemb_storage_class(
         model,
@@ -354,6 +390,8 @@ def test_lfu_score_validation(
         world_size=dist.get_world_size(),
         batch_size=batch_size,
         num_iterations=num_iterations,
+        empty_rank_iteration=empty_rank_iteration,
+        data_parallel_table=data_parallel_table,
         caching=caching,
     )
 
