@@ -1,7 +1,8 @@
-# FlexKV layerwise transfer config for recsys KVCacheManager.
+# FlexKV tier config for recsys KVCacheManager.
+# Layerwise is not set here. The benchmark turns it on with --layerwise
+# and --layer-granularity N.
 # Use with:
 #   export RECSYS_FLEXKV_CONFIG_PATH=/path/to/flexkv_layerwise.yml
-#   export RECSYS_FLEXKV_ENABLE_LAYERWISE=1
 cpu_cache_gb: 0.2
 ssd_cache_gb: 0.99
 ssd_cache_dir: /path/to/your/ssd_cache
