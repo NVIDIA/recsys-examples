@@ -15,7 +15,7 @@
 
 from dataclasses import dataclass
 from enum import Enum, auto
-from typing import Optional, Tuple
+from typing import Callable, Optional, Tuple
 
 import torch
 from dynamicemb.dynamicemb_config import EvictedItemMode
@@ -33,6 +33,7 @@ from dynamicemb.key_value_table import (
     eval_lookup,
     get_insert_score_arg,
     load_from_flat,
+    load_from_flat_by,
     store_to_flat,
 )
 from dynamicemb.lookup_layout import EmbeddingLayout
@@ -193,6 +194,23 @@ class PrefetchState:
     non_admitted_positions: Optional[torch.Tensor] = None
     num_prefetched_keys: int = 0
     outstanding_keys_ref: Optional[torch.Tensor] = None
+
+    def record_stream(self, stream: torch.cuda.Stream) -> None:
+        """Marks the per-batch tensors used on ``stream``: a prefetch pipeline
+        makes them on its own stream, and the forward that takes them and its
+        backward read them on another, past the point where the caching
+        allocator would otherwise hand their blocks to the next prefetch."""
+        for tensor in (
+            self.unique_keys,
+            self.reverse_indices,
+            self.unique_table_ids,
+            self.lfu_accumulated_frequency,
+            self.slot_indices,
+            self.value_row_indices,
+            self.non_admitted_positions,
+        ):
+            if tensor is not None:
+                tensor.record_stream(stream)
 
 
 def _is_hbm_storage(storage: Storage) -> bool:
@@ -447,16 +465,13 @@ def _prefetch_cache_path(
             empty = torch.empty(0, dtype=torch.int64, device=device)
             return empty, None
 
-        # 1. Lookup with overflow fallback; pin what is found
+        # 1. Lookup with overflow fallback; pin what is found. The counter
+        # kernel skips the misses' slots (-1), so the hits need no compaction
+        # (nor its sync).
         with torch.cuda.nvtx.range("op:cache_lookup"):
             _, founds, cache_indices = cache.lookup(unique_keys, unique_table_ids)
         slot_indices = cache_indices.clone()
-        with torch.cuda.nvtx.range("op:flagged_compact"):
-            num_hit, _, (hit_slots, hit_tids) = flagged_compact(
-                founds, [cache_indices, unique_table_ids]
-            )
-        if num_hit > 0:
-            cache.increment_counter(hit_slots, hit_tids)
+        cache.increment_counter(cache_indices, unique_table_ids)
 
         # 2. Storage is the only place scores live: a key-only lookup of *every*
         # key -- hits included, and even when nothing missed -- updates its score
@@ -651,11 +666,10 @@ def _prefetch_hbm_direct_path(
 
         # ``indices`` are rows for a table that stores them, hash slots otherwise,
         # and ``slot_indices`` the hash slots either way (the same tensor when the
-        # row is the slot). The ref counter is keyed by slot.
-        found_mask = slot_indices >= 0
-        found_slots = slot_indices[found_mask]
-        if found_slots.numel() > 0:
-            storage.increment_counter(found_slots, unique_table_ids[found_mask])
+        # row is the slot). The ref counter is keyed by slot. Its kernel skips
+        # the missing keys' slots (-1), so the found ones need no compaction
+        # (nor its sync).
+        storage.increment_counter(slot_indices, unique_table_ids)
 
         # Values are addressed by row, the counter by slot: a storage stores a row
         # per key, so these are different tensors and both are kept up to date.
@@ -748,12 +762,8 @@ def _prefetch_hbm_direct_path(
             with torch.cuda.nvtx.range("op:store_to_flat"):
                 store_to_flat(state, new_rows, admitted_tids, init_values)
 
-            inserted_mask = new_slots >= 0
-            if inserted_mask.any():
-                storage.increment_counter(
-                    new_slots[inserted_mask],
-                    admitted_tids[inserted_mask],
-                )
+            # Keys the insert could not place (-1) are skipped by the kernel.
+            storage.increment_counter(new_slots, admitted_tids)
 
             slot_indices[admitted_unique_positions] = new_slots
             rows[admitted_unique_positions] = new_rows
@@ -915,8 +925,16 @@ def dynamicemb_eval_forward(
     evict_strategy=None,
     frequency_counters: Optional[torch.Tensor] = None,
     pooling_weights: Optional[torch.Tensor] = None,
+    output_alloc: Optional[
+        Callable[[int, int, torch.dtype], Optional[torch.Tensor]]
+    ] = None,
 ) -> torch.Tensor:
-    """Eval-only forward for all storage configurations (no autograd)."""
+    """Eval-only forward for all storage configurations (no autograd).
+
+    A sequence lookup's rows go where ``output_alloc`` says, if it has a
+    buffer for them (a call on the hierarchical dist whose lookup a pipeline
+    runs in eval mode), converted to ``output_dtype`` on the way.
+    """
     with torch.cuda.nvtx.range("dynamicemb_eval_forward"):
         table_num = feature_offsets.numel() - 1
         assert table_num != 0
@@ -943,6 +961,13 @@ def dynamicemb_eval_forward(
                 initializer,
                 cache=cache,
             )
+            out = (
+                output_alloc(*layout.sequence_shape(), output_dtype)
+                if output_alloc is not None
+                else None
+            )
+            if out is not None:
+                return out.copy_(output_embs)
             if output_dtype != emb_dtype:
                 output_embs = output_embs.to(output_dtype)
             return output_embs
@@ -1129,7 +1154,14 @@ class DynamicEmbeddingFunction(torch.autograd.Function):
         admitter=None,
         evict_strategy=None,
         pooling_weights: Optional[torch.Tensor] = None,
-        *args,
+        # Not read: a parameter that requires grad, so that autograd records the
+        # op and runs its backward.
+        empty_tensor: Optional[torch.Tensor] = None,
+        # Allocates the sequence output; an output dist may provide it (the
+        # hierarchical dist puts it in a window its node peers read in place).
+        output_alloc: Optional[
+            Callable[[int, int, torch.dtype], Optional[torch.Tensor]]
+        ] = None,
     ):
         with torch.cuda.nvtx.range("DynamicEmbeddingFunction.forward"):
             max_emb_dim = storage.max_embedding_dim()
@@ -1143,20 +1175,31 @@ class DynamicEmbeddingFunction(torch.autograd.Function):
             is_pooling = layout.is_pooling
 
             use_counter = prefetch_state.slot_indices is not None
+            # A sequence lookup whose rows all come from the table, at its own
+            # dtype, loads each key's row straight into the output: no unique
+            # rows to write and read back in between.
+            direct = False
             if use_counter:
                 state = (
                     cache._state
                     if prefetch_state.storage_mode == StorageMode.CACHE
                     else storage._state
                 )
-                with torch.cuda.nvtx.range("op:load_from_flat"):
-                    unique_embs = load_from_flat(
-                        state,
-                        # Value buffer: address by row (the slot, for a cache).
-                        prefetch_state.value_row_indices,
-                        prefetch_state.unique_table_ids,
-                        copy_mode=CopyMode.EMBEDDING,
-                    )
+                direct = (
+                    not is_pooling
+                    and prefetch_state.non_admitted_positions is None
+                    and output_dtype == state.emb_dtype
+                )
+                if not direct:
+                    with torch.cuda.nvtx.range("op:load_from_flat"):
+                        unique_embs = load_from_flat(
+                            state,
+                            # Value buffer: address by row (the slot, for a
+                            # cache).
+                            prefetch_state.value_row_indices,
+                            prefetch_state.unique_table_ids,
+                            copy_mode=CopyMode.EMBEDDING,
+                        )
                 if prefetch_state.non_admitted_positions is not None:
                     na = prefetch_state.non_admitted_positions
                     non_admitted_initializer = (
@@ -1219,15 +1262,32 @@ class DynamicEmbeddingFunction(torch.autograd.Function):
                         layout.feature_dims_vec4,
                     )
             else:
-                output_embs = torch.empty(
-                    *layout.sequence_shape(),
-                    dtype=output_dtype,
-                    device=device,
+                output_embs = (
+                    output_alloc(*layout.sequence_shape(), output_dtype)
+                    if output_alloc is not None
+                    else None
                 )
-                with torch.cuda.nvtx.range("op:gather_embedding"):
-                    gather_embedding(
-                        unique_embs, output_embs, prefetch_state.reverse_indices
+                # None: no allocator, or it has no buffer for this batch.
+                if output_embs is None:
+                    output_embs = torch.empty(
+                        *layout.sequence_shape(),
+                        dtype=output_dtype,
+                        device=device,
                     )
+                if direct:
+                    with torch.cuda.nvtx.range("op:load_from_flat"):
+                        load_from_flat_by(
+                            state,
+                            prefetch_state.value_row_indices,
+                            prefetch_state.unique_table_ids,
+                            prefetch_state.reverse_indices,
+                            output_embs,
+                        )
+                else:
+                    with torch.cuda.nvtx.range("op:gather_embedding"):
+                        gather_embedding(
+                            unique_embs, output_embs, prefetch_state.reverse_indices
+                        )
 
             ctx.unique_keys = prefetch_state.unique_keys
             ctx.reverse_indices = prefetch_state.reverse_indices

@@ -413,7 +413,8 @@ reduce_grads(at::Tensor inverse_index, at::Tensor grads, int64_t num_unique,
 
 // NumRegions: 0 = contiguous, 1 = emb-only, 2 = two-region (emb + opt)
 // When NumRegions==0, scalar_table_id is used directly (table_ids may be
-// nullptr).
+// nullptr). Output row i takes entry entry_of_row[i] of indices and table_ids
+// (entry i when entry_of_row is nullptr).
 template <int NumRegions, typename IndexT, typename ValueT>
 __global__ void load_from_flat_table_kernel_vec4(
     int64_t batch, int64_t output_dim, int64_t output_stride,
@@ -422,7 +423,7 @@ __global__ void load_from_flat_table_kernel_vec4(
     int64_t const *__restrict__ table_ptrs,
     int64_t const *__restrict__ table_value_dims,
     int64_t const *__restrict__ table_emb_dims, int64_t max_emb_dim,
-    int64_t scalar_table_id) {
+    int64_t scalar_table_id, int64_t const *__restrict__ entry_of_row) {
 
   constexpr int kWarpSize = 32;
   constexpr int VecSize = 4;
@@ -445,11 +446,12 @@ __global__ void load_from_flat_table_kernel_vec4(
 
   for (int64_t emb_id = warp_num_per_block * blockIdx.x + warp_id_in_block;
        emb_id < batch; emb_id += gridDim.x * warp_num_per_block) {
-    IndexT index = indices[emb_id];
+    int64_t entry = entry_of_row != nullptr ? entry_of_row[emb_id] : emb_id;
+    IndexT index = indices[entry];
     if (index < 0)
       continue;
 
-    int64_t table_id = NumRegions == 0 ? scalar_table_id : table_ids[emb_id];
+    int64_t table_id = NumRegions == 0 ? scalar_table_id : table_ids[entry];
     int64_t vdim = table_value_dims[table_id];
     ValueT const *src_base =
         reinterpret_cast<ValueT const *>(table_ptrs[table_id]) +
@@ -483,14 +485,16 @@ load_from_flat_table_kernel(int64_t batch, int64_t output_dim,
                             int64_t const *__restrict__ table_ptrs,
                             int64_t const *__restrict__ table_value_dims,
                             int64_t const *__restrict__ table_emb_dims,
-                            int64_t max_emb_dim, int64_t scalar_table_id) {
+                            int64_t max_emb_dim, int64_t scalar_table_id,
+                            int64_t const *__restrict__ entry_of_row) {
 
   for (int64_t emb_id = blockIdx.x; emb_id < batch; emb_id += gridDim.x) {
-    IndexT index = indices[emb_id];
+    int64_t entry = entry_of_row != nullptr ? entry_of_row[emb_id] : emb_id;
+    IndexT index = indices[entry];
     if (index < 0)
       continue;
 
-    int64_t table_id = NumRegions == 0 ? scalar_table_id : table_ids[emb_id];
+    int64_t table_id = NumRegions == 0 ? scalar_table_id : table_ids[entry];
     int64_t vdim = table_value_dims[table_id];
     ValueT const *src_base =
         reinterpret_cast<ValueT const *>(table_ptrs[table_id]) +
@@ -613,20 +617,27 @@ __global__ void store_to_flat_table_kernel(
 }
 
 template <int NumRegions>
-void load_from_flat_table_impl(at::Tensor table_ptrs, at::Tensor indices,
-                               int64_t const *table_ids_ptr,
-                               int64_t scalar_table_id, at::Tensor output,
-                               at::Tensor table_value_dims,
-                               at::Tensor table_emb_dims, int64_t max_emb_dim,
-                               bool all_dims_vec4) {
+void load_from_flat_table_impl(
+    at::Tensor table_ptrs, at::Tensor indices, int64_t const *table_ids_ptr,
+    int64_t scalar_table_id, at::Tensor output, at::Tensor table_value_dims,
+    at::Tensor table_emb_dims, int64_t max_emb_dim, bool all_dims_vec4,
+    c10::optional<at::Tensor> entry_of_row = c10::nullopt) {
 
-  int64_t num_total = indices.size(0);
+  int64_t num_total =
+      entry_of_row.has_value() ? entry_of_row->size(0) : indices.size(0);
   if (num_total == 0)
     return;
 
   TORCH_CHECK(output.dim() == 2, "output must be 2-D");
-  TORCH_CHECK(output.size(0) == num_total,
-              "output.size(0) must match indices.size(0)");
+  TORCH_CHECK(output.size(0) == num_total, "output.size(0) must match ",
+              entry_of_row.has_value() ? "entry_of_row" : "indices",
+              ".size(0)");
+  TORCH_CHECK(!entry_of_row.has_value() ||
+                  (entry_of_row->is_cuda() && entry_of_row->is_contiguous() &&
+                   entry_of_row->scalar_type() == at::kLong),
+              "entry_of_row must be a contiguous CUDA int64 tensor");
+  int64_t const *entry_of_row_ptr =
+      entry_of_row.has_value() ? entry_of_row->data_ptr<int64_t>() : nullptr;
 
   int64_t output_dim = output.size(1);
   int64_t output_stride = output.stride(0);
@@ -663,7 +674,7 @@ void load_from_flat_table_impl(at::Tensor table_ptrs, at::Tensor indices,
                 table_ids_ptr, get_pointer<int64_t>(table_ptrs),
                 get_pointer<int64_t>(table_value_dims),
                 get_pointer<int64_t>(table_emb_dims), max_emb_dim,
-                scalar_table_id);
+                scalar_table_id, entry_of_row_ptr);
       } else {
         int block_size = output_dim < device_prop.max_thread_per_block
                              ? static_cast<int>(output_dim)
@@ -677,7 +688,7 @@ void load_from_flat_table_impl(at::Tensor table_ptrs, at::Tensor indices,
                 table_ids_ptr, get_pointer<int64_t>(table_ptrs),
                 get_pointer<int64_t>(table_value_dims),
                 get_pointer<int64_t>(table_emb_dims), max_emb_dim,
-                scalar_table_id);
+                scalar_table_id, entry_of_row_ptr);
       }
     });
   });
@@ -698,10 +709,12 @@ void load_from_flat_table_emb(at::Tensor table_ptrs, at::Tensor indices,
                               at::Tensor table_ids, at::Tensor output,
                               at::Tensor table_value_dims,
                               at::Tensor table_emb_dims, int64_t max_emb_dim,
-                              bool all_dims_vec4) {
-  load_from_flat_table_impl<1>(
-      table_ptrs, indices, get_pointer<int64_t>(table_ids), 0, output,
-      table_value_dims, table_emb_dims, max_emb_dim, all_dims_vec4);
+                              bool all_dims_vec4,
+                              c10::optional<at::Tensor> entry_of_row) {
+  load_from_flat_table_impl<1>(table_ptrs, indices,
+                               get_pointer<int64_t>(table_ids), 0, output,
+                               table_value_dims, table_emb_dims, max_emb_dim,
+                               all_dims_vec4, entry_of_row);
 }
 
 void load_from_flat_table_value(at::Tensor table_ptrs, at::Tensor indices,
@@ -994,11 +1007,13 @@ void bind_dyn_emb_op(py::module &m) {
         py::arg("all_dims_vec4"));
 
   m.def("load_from_flat_table_emb", &load_from_flat_table_emb,
-        "Load from flat table: emb-only copy (NumRegions=1, EMBEDDING mode).",
+        "Load from flat table: emb-only copy (NumRegions=1, EMBEDDING mode); "
+        "output row i takes entry entry_of_row[i] of indices and table_ids if "
+        "entry_of_row is given.",
         py::arg("table_ptrs"), py::arg("indices"), py::arg("table_ids"),
         py::arg("output"), py::arg("table_value_dims"),
         py::arg("table_emb_dims"), py::arg("max_emb_dim"),
-        py::arg("all_dims_vec4"));
+        py::arg("all_dims_vec4"), py::arg("entry_of_row") = py::none());
 
   m.def("load_from_flat_table_value", &load_from_flat_table_value,
         "Load from flat table: 2-region copy (NumRegions=2, VALUE mode).",
