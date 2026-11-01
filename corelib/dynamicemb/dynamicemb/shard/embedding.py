@@ -361,7 +361,8 @@ class ShardedDynamicEmbeddingCollection(ShardedEmbeddingCollection):
         ctx: DynamicEmbeddingCollectionContext,
         features: KeyedJaggedTensor,
     ) -> Awaitable[Awaitable[KJTList]]:
-        if self._per_key_score:
+        # Evaluation reads no score, so it does not have to be given any.
+        if self._per_key_score and self.training:
             require_scores(features)
         if self._has_uninitialized_input_dist:
             self._create_input_dist(input_feature_names=features.keys(), ctx=ctx)

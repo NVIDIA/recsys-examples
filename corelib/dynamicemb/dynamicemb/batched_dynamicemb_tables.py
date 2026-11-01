@@ -1368,9 +1368,12 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
         return res
 
     def _check_scores(self, scores: Optional[Tensor], indices: Tensor) -> None:
-        """The scores must come exactly when the tables take a score per key."""
+        """The scores must come exactly when the tables take a score per key.
+
+        Evaluation reads no score, so it may go without them.
+        """
         if scores is None:
-            if self.per_key_score:
+            if self.per_key_score and self.training:
                 raise ValueError(
                     "These tables take a score per key (per_key_score=True), "
                     "but no scores were given."
@@ -1386,12 +1389,17 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                 f"{scores.dtype} x {scores.numel()} for {indices.numel()} indices."
             )
         # Reading the values to look for a negative one waits for the device, so
-        # it is done only for a table that asked to be checked.
-        if any(
-            option.safe_check_mode != DynamicEmbCheckMode.IGNORE
-            for option in self._dynamicemb_options
-        ) and bool((scores < 0).any()):
+        # it is done only for a table that asked to be checked: an error stops
+        # on it, a warning says so.
+        modes = {option.safe_check_mode for option in self._dynamicemb_options}
+        if modes == {DynamicEmbCheckMode.IGNORE} or not bool((scores < 0).any()):
+            return
+        if DynamicEmbCheckMode.ERROR in modes:
             raise ValueError("scores must be non-negative.")
+        warnings.warn(
+            "scores must be non-negative; a negative one is read as a very large "
+            "score by the table."
+        )
 
     def _counters_for_group(
         self, frequency_counters: Optional[Tensor]

@@ -498,8 +498,9 @@ Rules:
 
 - **All or none.** Every table of an `EmbeddingCollection` /
   `EmbeddingBagCollection` sets `per_key_score`, or none does, and a collection
-  that sets it holds DynamicEmb tables only. When set, the input must be a
-  `ScoredKeyedJaggedTensor` (a plain `KeyedJaggedTensor` raises). When not set,
+  that sets it holds DynamicEmb tables only. While training, when set, the input must be a
+  `ScoredKeyedJaggedTensor` (a plain `KeyedJaggedTensor` raises); evaluation reads
+  no score, so it takes either. When not set,
   the scores of a `ScoredKeyedJaggedTensor` are ignored.
 - **Score strategy.** `CUSTOMIZED`, alone or with `NO_EVICTION`. Not with LFU
   (or the compound strategy), and not with `admit_strategy`.
@@ -512,8 +513,9 @@ Rules:
   wins, even if its score is lower; a key a batch does not contain keeps its
   score. Backward does not change scores.
 - **`set_score`** raises for such a table: the scores come from the input.
-- Scores must be int64. With `safe_check_mode` other than `IGNORE` a negative
-  score raises (or warns).
+- Scores must be int64. A negative score is read by the table as a very large
+  one, so with `safe_check_mode` `ERROR` it raises, with `WARNING` it warns, and
+  with `IGNORE` it is not looked for.
 
 ## DynamicEmbPoolingMode
 

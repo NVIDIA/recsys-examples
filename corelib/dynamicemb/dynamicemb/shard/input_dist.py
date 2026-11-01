@@ -288,12 +288,13 @@ class RwSparseFeaturesDist(_RwSparseFeaturesDist):
         sparse_features: KeyedJaggedTensor,
     ) -> Awaitable[Awaitable[KeyedJaggedTensor]]:
         """Bucketize by ``dist_type``, then TorchRec's AlltoAll unchanged."""
-        takes_scores = self._score_dist is not None
-        if takes_scores and not isinstance(sparse_features, ScoredKeyedJaggedTensor):
-            raise ValueError(
-                "This distributor sends a score per key, so it takes a "
-                f"ScoredKeyedJaggedTensor; got {type(sparse_features).__name__}."
-            )
+        # A collection that takes a score per key refuses a plain input while it
+        # trains (see ``require_scores``); in evaluation nothing reads a score,
+        # so an input without them is distributed as it is. Every rank has to
+        # take the same branch, as the all2all of the scores is a collective.
+        takes_scores = self._score_dist is not None and isinstance(
+            sparse_features, ScoredKeyedJaggedTensor
+        )
         bucketized_features, unbucketize_permute = bucketize_kjt_before_all2all(
             sparse_features,
             num_buckets=self._world_size,

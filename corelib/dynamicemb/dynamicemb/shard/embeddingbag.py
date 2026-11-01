@@ -54,7 +54,8 @@ class ShardedDynamicEmbeddingBagCollection(ShardedEmbeddingBagCollection):
         self._per_key_score = per_key_score
 
     def input_dist(self, ctx, features):
-        if self._per_key_score:
+        # Evaluation reads no score, so it does not have to be given any.
+        if self._per_key_score and self.training:
             require_scores(features)
         return super().input_dist(ctx, features)
 
