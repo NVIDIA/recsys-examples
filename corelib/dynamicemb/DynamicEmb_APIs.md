@@ -469,6 +469,52 @@ table_options = DynamicEmbTableOptions(
 )
 ```
 
+### Per-key score (`per_key_score`)
+
+By default a CUSTOMIZED table scores every key of a batch with one number
+(`set_score`). With `per_key_score=True` in `DynamicEmbTableOptions`, the input
+carries **a score for each key** instead, and the table stores it as that key's
+score. A key's score then decides its eviction (lowest first) like any other
+CUSTOMIZED score.
+
+The scores travel beside the keys, not in `weights`, in a
+`ScoredKeyedJaggedTensor` -- a `KeyedJaggedTensor` with one extra int64 tensor
+`scores`, 1-D, one entry per value:
+
+```python
+from dynamicemb import ScoredKeyedJaggedTensor
+
+features = ScoredKeyedJaggedTensor(
+    keys=["f0", "f1"], values=values, lengths=lengths, scores=scores
+)
+embeddings = model(features)
+```
+
+Scores are sent to the table's rank by their own all2all, kept in step with the
+keys through the bucketize, and never mixed with the frequency counters that LFU
+and admission use.
+
+Rules:
+
+- **All or none.** Every table of an `EmbeddingCollection` /
+  `EmbeddingBagCollection` sets `per_key_score`, or none does, and a collection
+  that sets it holds DynamicEmb tables only. When set, the input must be a
+  `ScoredKeyedJaggedTensor` (a plain `KeyedJaggedTensor` raises). When not set,
+  the scores of a `ScoredKeyedJaggedTensor` are ignored.
+- **Score strategy.** `CUSTOMIZED`, alone or with `NO_EVICTION`. Not with LFU
+  (or the compound strategy), and not with `admit_strategy`.
+- **Sharding.** Row-wise only (EC and EBC). No variable batch size per key
+  (VBE). Tables with a host/hybrid storage tier (`HybridStorage`) are not
+  supported yet.
+- **Repeated keys.** Within one batch -- including across ranks, and with
+  `use_index_dedup` -- a key takes the **largest** score the batch gave it.
+- **Across batches.** The score is assigned on every hit, so the latest batch
+  wins, even if its score is lower; a key a batch does not contain keeps its
+  score. Backward does not change scores.
+- **`set_score`** raises for such a table: the scores come from the input.
+- Scores must be int64. With `safe_check_mode` other than `IGNORE` a negative
+  score raises (or warns).
+
 ## DynamicEmbPoolingMode
 
 DynamicEmb supports three pooling modes that determine how embedding lookups are aggregated. These modes correspond to how `EmbeddingCollection` (sequence) and `EmbeddingBagCollection` (pooled) work in TorchREC.
@@ -862,6 +908,10 @@ Fields declared first (through `device_id`) are **planner/runtime-heavy**: `Dyna
             Used to check if all keys in the current batch have been successfully inserted into the table.
             Should dynamic embedding table insert safe check be enabled? By default, it is disabled.
             Please refer to the API documentation for DynamicEmbCheckMode for more information.
+        per_key_score : bool
+            Take a score for each key from the input (a `ScoredKeyedJaggedTensor`) instead of one score per batch.
+            Default to False. Needs `score_strategy` CUSTOMIZED and no `admit_strategy`; row-wise only.
+            See "Per-key score" under `DynamicEmbScoreStrategy` for the rules.
         global_hbm_for_values : int
             Total GPU memory allocated to store embedding + optimizer states, in bytes. Default is 0.
             It has different meanings under `caching=True` and  `caching=False`.

@@ -47,6 +47,7 @@ from dynamicemb.batched_dynamicemb_function import (
     dynamicemb_prefetch,
 )
 from dynamicemb.dynamicemb_config import (
+    DynamicEmbCheckMode,
     DynamicEmbEvictStrategy,
     DynamicEmbPoolingMode,
     DynamicEmbScoreStrategy,
@@ -793,6 +794,15 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
             == DynamicEmbScoreStrategy.LFU
             for option in self._dynamicemb_options
         )
+        # Tables are grouped on it too (see DynamicEmbTableOptions), so it holds
+        # for the whole group: every table takes a score per key, or none does.
+        self.per_key_score: bool = any(
+            option.per_key_score for option in self._dynamicemb_options
+        )
+        if self.per_key_score and isinstance(self._storage, HybridStorage):
+            raise NotImplementedError(
+                "per_key_score is not supported with HybridStorage yet."
+            )
         self._prefetch_states: Deque[PrefetchState] = deque()
 
         # TODO:1->10
@@ -1222,7 +1232,9 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
         # Shape (number of features, number of ranks)
         batch_size_per_feature_per_rank: Optional[List[List[int]]] = None,
         total_unique_indices: Optional[int] = None,
+        scores: Optional[Tensor] = None,
     ) -> List[Tensor]:
+        self._check_scores(scores, indices)
         if indices.dtype != self.index_type:
             indices = indices.to(self.index_type)
 
@@ -1301,8 +1313,8 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                     "unset, or do not call eval() on this module."
                 )
             frequency_counters = self._counters_for_group(frequency_counters)
-            scores = [self._scores[name] for name in self._table_names]
-            fused_score = self._reduce_table_scores(scores)
+            table_scores = [self._scores[name] for name in self._table_names]
+            fused_score = self._reduce_table_scores(table_scores)
             if isinstance(self._cache, DynamicEmbCache):
                 self._cache.training = False
                 self._cache.set_score(fused_score)
@@ -1329,7 +1341,9 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
             )
 
         if not self._prefetch_states:
-            self.prefetch(indices, offsets, frequency_counters=frequency_counters)
+            self.prefetch(
+                indices, offsets, frequency_counters=frequency_counters, scores=scores
+            )
         prefetch_state = self._prefetch_states.popleft()
 
         res = DynamicEmbeddingFunction.apply(
@@ -1353,6 +1367,32 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
 
         return res
 
+    def _check_scores(self, scores: Optional[Tensor], indices: Tensor) -> None:
+        """The scores must come exactly when the tables take a score per key."""
+        if scores is None:
+            if self.per_key_score:
+                raise ValueError(
+                    "These tables take a score per key (per_key_score=True), "
+                    "but no scores were given."
+                )
+            return
+        if not self.per_key_score:
+            raise ValueError(
+                "Scores were given to tables that do not take a score per key."
+            )
+        if scores.dtype != torch.int64 or scores.numel() != indices.numel():
+            raise ValueError(
+                "scores must be int64, one per index; got "
+                f"{scores.dtype} x {scores.numel()} for {indices.numel()} indices."
+            )
+        # Reading the values to look for a negative one waits for the device, so
+        # it is done only for a table that asked to be checked.
+        if any(
+            option.safe_check_mode != DynamicEmbCheckMode.IGNORE
+            for option in self._dynamicemb_options
+        ) and bool((scores < 0).any()):
+            raise ValueError("scores must be non-negative.")
+
     def _counters_for_group(
         self, frequency_counters: Optional[Tensor]
     ) -> Optional[Tensor]:
@@ -1366,7 +1406,9 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
         forward_stream: Optional[torch.cuda.Stream] = None,
         batch_size_per_feature_per_rank: Optional[List[List[int]]] = None,
         frequency_counters: Optional[Tensor] = None,
+        scores: Optional[Tensor] = None,
     ) -> None:
+        self._check_scores(scores, indices)
         if not self.training:
             return
         if self.prefetch_stream is None and forward_stream is not None:
@@ -1381,8 +1423,8 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
 
         frequency_counters = self._counters_for_group(frequency_counters)
 
-        scores = [self._scores[name] for name in self._table_names]
-        fused_score = self._reduce_table_scores(scores)
+        table_scores = [self._scores[name] for name in self._table_names]
+        fused_score = self._reduce_table_scores(table_scores)
         if isinstance(self._cache, DynamicEmbCache):
             self._cache.training = True
             self._cache.set_score(fused_score)
@@ -1406,6 +1448,7 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                 if self._cache is not None
                 else None,
                 external_storage=self._external_storage,
+                scores=scores,
             )
         )
         self._update_score()
@@ -1424,6 +1467,11 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
             if table_score == 0:
                 raise ValueError(f"Can't set table's score to 0.")
             index = self._table_names.index(table_name)
+            if self._dynamicemb_options[index].per_key_score:
+                raise ValueError(
+                    f"Table '{table_name}' takes a score per key (per_key_score=True); "
+                    "its scores come with the input, not from set_score."
+                )
             # The score part, so that (NO_EVICTION, CUSTOMIZED) -- in either order --
             # takes a user score like CUSTOMIZED does.
             assert (

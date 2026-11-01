@@ -49,11 +49,14 @@ from torchrec.distributed.types import (
 from torchrec.modules.embedding_modules import EmbeddingCollection
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 
+from ..batched_dynamicemb_function import largest_score_per_unique_key
 from ..dynamicemb_config import (
     DynamicEmbKernel,
     DynamicEmbScoreStrategy,
     get_eviction_score_strategy,
 )
+from ..scored_kjt import ScoredKeyedJaggedTensor
+from .per_key_score import collect_per_key_score, require_scores
 from .rw_sharding import RwSequenceDynamicEmbeddingSharding
 
 
@@ -129,9 +132,13 @@ class ShardedDynamicEmbeddingCollection(ShardedEmbeddingCollection):
         self,
         *args,
         frequency_requirements: Optional[Dict[str, Tuple[bool, bool]]] = None,
+        per_key_score: bool = False,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
+        # Whether this collection's tables take a score per key; the same on every
+        # rank. See :func:`collect_per_key_score`.
+        self._per_key_score = per_key_score
         # Per sharding, in the order of ``_sharding_type_to_sharding`` -- the order
         # the input dist iterates the shardings in, so ``[i]`` is sharding ``i``.
         # See :func:`collect_frequency_requirements`.
@@ -267,6 +274,10 @@ class ShardedDynamicEmbeddingCollection(ShardedEmbeddingCollection):
                         offsets=offsets,
                         values=indices,
                     )
+                    if self._per_key_score:
+                        dedup_features = ScoredKeyedJaggedTensor.from_kjt(
+                            dedup_features, input_feature.scores()
+                        )
                     ctx.input_features.append(input_feature)
                     ctx.reverse_indices.append(
                         torch.empty(0, dtype=torch.int64, device=self._device)
@@ -323,6 +334,16 @@ class ShardedDynamicEmbeddingCollection(ShardedEmbeddingCollection):
                     offsets=new_offsets,
                     values=unique_keys,
                 )
+                if self._per_key_score:
+                    # A key that repeats keeps the largest of its scores -- the
+                    # rule the tables apply to repeats within a batch, so
+                    # merging here and again there gives what merging once would.
+                    dedup_features = ScoredKeyedJaggedTensor.from_kjt(
+                        dedup_features,
+                        largest_score_per_unique_key(
+                            input_feature.scores(), reverse_idx, total_unique
+                        ),
+                    )
                 ctx.input_features.append(input_feature)
                 ctx.reverse_indices.append(reverse_idx)
 
@@ -340,6 +361,8 @@ class ShardedDynamicEmbeddingCollection(ShardedEmbeddingCollection):
         ctx: DynamicEmbeddingCollectionContext,
         features: KeyedJaggedTensor,
     ) -> Awaitable[Awaitable[KJTList]]:
+        if self._per_key_score:
+            require_scores(features)
         if self._has_uninitialized_input_dist:
             self._create_input_dist(input_feature_names=features.keys(), ctx=ctx)
             self._has_uninitialized_input_dist = False
@@ -414,6 +437,7 @@ class DynamicEmbeddingCollectionSharder(EmbeddingCollectionSharder):
         module_fqn: Optional[str] = None,
     ) -> ShardedEmbeddingCollection:
         frequency_requirements = collect_frequency_requirements(params)
+        per_key_score = collect_per_key_score(params)
 
         return ShardedDynamicEmbeddingCollection(
             module,
@@ -424,4 +448,5 @@ class DynamicEmbeddingCollectionSharder(EmbeddingCollectionSharder):
             qcomm_codecs_registry=self.qcomm_codecs_registry,
             use_index_dedup=self._use_index_dedup,
             frequency_requirements=frequency_requirements,
+            per_key_score=per_key_score,
         )

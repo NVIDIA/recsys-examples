@@ -711,6 +711,13 @@ class DynamicEmbTableOptions:
     sharded by FBGEMM never see it. Tables differing in it are not grouped onto
     shared storage."""
 
+    per_key_score: bool = False
+    """Take a score for every key, from the ``ScoredKeyedJaggedTensor`` the
+    module is called with, instead of one score per table from ``set_score``.
+    Needs ``score_strategy`` CUSTOMIZED (alone, or with NO_EVICTION) and no
+    ``admit_strategy``. Within one collection either every table sets it or none
+    does. Tables differing in it are not grouped onto shared storage."""
+
     def __post_init__(self):
         if self.admission_counter is not None:
             warnings.warn(
@@ -763,6 +770,23 @@ class DynamicEmbTableOptions:
                 "strategy (TIMESTAMP, LFU) in either order; got "
                 f"score_strategy={self.score_strategy}."
             )
+        if self.per_key_score:
+            if (
+                self.score_strategy is None
+                or get_score_part(self.score_strategy)
+                != DynamicEmbScoreStrategy.CUSTOMIZED
+            ):
+                raise ValueError(
+                    "per_key_score takes the score from the input, so it needs "
+                    "score_strategy CUSTOMIZED (alone, or with NO_EVICTION); got "
+                    f"score_strategy={self.score_strategy}."
+                )
+            if self.admit_strategy is not None:
+                raise ValueError(
+                    "per_key_score cannot be combined with admit_strategy: both "
+                    "are decided per key from the input, and a key's score is "
+                    "not its occurrence count."
+                )
 
     def __eq__(self, other):
         if not isinstance(other, DynamicEmbTableOptions):
@@ -795,6 +819,9 @@ class DynamicEmbTableOptions:
         # per-storage choice, so tables differing in it must not share storage.
         grouped_key["evicted_item_mode"] = self.evicted_item_mode
         grouped_key["optimizer_state_dtype"] = self.optimizer_state_dtype
+        # One physical table cannot take its scores both from the input and from
+        # a per-table scalar.
+        grouped_key["per_key_score"] = self.per_key_score
         return grouped_key
 
     def __hash__(self):

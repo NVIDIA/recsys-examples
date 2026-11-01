@@ -46,6 +46,7 @@ from .incremental_dump import (
     replay_increment,
 )
 from .optimizer import DynamicEmbOptimType, EmbOptimType, OptimizerArgs
+from .scored_kjt import ScoredKeyedJaggedTensor
 from .types import (
     BUCKET_ALIGNMENT,
     DEMB_TABLE_ALIGN_SIZE,
@@ -84,6 +85,7 @@ __all__ = [
     "EvictedItemMode",
     "ReplayContent",
     "ScoreStrategy",
+    "ScoredKeyedJaggedTensor",
     "BATCH_SIZE_PER_DUMP",
     "data_type_to_dyn_emb",
     "data_type_to_dtype",

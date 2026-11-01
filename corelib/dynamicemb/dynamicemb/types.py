@@ -228,6 +228,7 @@ class Storage(abc.ABC, Generic[OptionsT, OptimizerT]):
         table_ids: torch.Tensor,
         copy_mode: CopyMode,
         lfu_accumulated_frequency: Optional[torch.Tensor] = None,
+        key_scores: Optional[torch.Tensor] = None,
     ) -> Tuple[
         int,
         torch.Tensor,
