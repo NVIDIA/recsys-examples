@@ -132,8 +132,8 @@ void table_insert_single_score(at::Tensor table_storage,
                                ScorePolicyType policy_type, at::Tensor indices,
                                std::optional<at::Tensor> insert_results,
                                std::optional<at::Tensor> score_output,
-                               at::Tensor counter, int64_t num_scores,
-                               int64_t score_fn_key) {
+                               std::optional<at::Tensor> counter,
+                               int64_t num_scores, int64_t score_fn_key) {
 
   auto key_type = get_data_type(keys);
 
@@ -159,7 +159,7 @@ void table_insert_single_score(at::Tensor table_storage,
   auto bucket_sizes_ptr = get_pointer<int>(bucket_sizes);
   auto table_ids_ptr = table_ids.data_ptr<int64_t>();
   auto table_bucket_offsets_ptr = table_bucket_offsets.data_ptr<int64_t>();
-  auto counter_ptr = counter.data_ptr<int32_t>();
+  auto counter_ptr = get_pointer<int32_t>(counter);
 
   auto stream = at::cuda::getCurrentCUDAStream().stream();
 
@@ -210,7 +210,8 @@ at::Tensor table_insert(at::Tensor table_storage,
                         int64_t bucket_capacity, at::Tensor bucket_sizes,
                         at::Tensor keys, at::Tensor table_ids,
                         std::optional<at::Tensor> score_input,
-                        ScorePolicyType policy_type, at::Tensor counter,
+                        ScorePolicyType policy_type,
+                        std::optional<at::Tensor> counter,
                         std::optional<at::Tensor> insert_results,
                         std::optional<at::Tensor> score_output,
                         int64_t num_scores, int64_t score_fn_key) {
@@ -239,7 +240,7 @@ void table_insert_collect_single_score(
     at::Tensor table_ids, std::optional<at::Tensor> score_input,
     ScorePolicyType policy_type, at::Tensor indices,
     std::optional<at::Tensor> insert_results,
-    std::optional<at::Tensor> score_output, at::Tensor counter,
+    std::optional<at::Tensor> score_output, std::optional<at::Tensor> counter,
     int64_t num_scores, int64_t score_fn_key, at::Tensor evicted_counter,
     at::Tensor evicted_keys, at::Tensor evicted_table_ids) {
 
@@ -267,7 +268,7 @@ void table_insert_collect_single_score(
   auto bucket_sizes_ptr = get_pointer<int>(bucket_sizes);
   auto table_ids_ptr = table_ids.data_ptr<int64_t>();
   auto table_bucket_offsets_ptr = table_bucket_offsets.data_ptr<int64_t>();
-  auto counter_ptr = counter.data_ptr<int32_t>();
+  auto counter_ptr = get_pointer<int32_t>(counter);
   auto evicted_counter_ptr =
       reinterpret_cast<CounterType *>(evicted_counter.data_ptr<int64_t>());
   auto evicted_table_ids_ptr = evicted_table_ids.data_ptr<int64_t>();
@@ -329,7 +330,7 @@ table_insert_collect_evicted(
     at::Tensor table_storage, at::Tensor table_bucket_offsets,
     int64_t bucket_capacity, at::Tensor bucket_sizes, at::Tensor keys,
     at::Tensor table_ids, std::optional<at::Tensor> score_input,
-    ScorePolicyType policy_type, at::Tensor counter,
+    ScorePolicyType policy_type, std::optional<at::Tensor> counter,
     std::optional<at::Tensor> insert_results,
     std::optional<at::Tensor> score_output, int64_t num_scores,
     int64_t score_fn_key) {

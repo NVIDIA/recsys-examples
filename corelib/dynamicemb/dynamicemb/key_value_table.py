@@ -482,6 +482,7 @@ def create_table_state(
     enable_overflow: bool = False,
     evicted_item_mode: EvictedItemMode = EvictedItemMode.DISCARD,
     use_rows: bool = False,
+    use_ref_counter: bool = True,
 ) -> DynamicEmbTableState:
     """Build the key map and value buffers for a group of tables.
 
@@ -490,6 +491,10 @@ def create_table_state(
     where it is. It is for tables that grow and keep their keys, so it cannot be
     combined with ``enable_overflow`` (a cache keeps slot == row). It is
     independent of the no-eviction mode, which keeps no row in its score.
+
+    ``use_ref_counter=False`` leaves out the per-slot reference counter (4 bytes
+    a slot) for a table whose slots are never pinned: the storage under a cache,
+    where the cache pins. It cannot be combined with ``enable_overflow``.
     """
     if not options:
         raise ValueError("options must be non-empty")
@@ -556,6 +561,7 @@ def create_table_state(
         enable_overflow=enable_overflow,
         score_fn_key=score_fn_key,
         use_rows=use_rows,
+        use_ref_counter=use_ref_counter,
     )
     capacity = key_index_map.capacity()
 
@@ -734,6 +740,8 @@ def _expand_tables_impl(
         # And whether a key keeps a value row of its own: the expansion below
         # carries rows when it does, and moves values by slot when it does not.
         use_rows=state.key_index_map.use_rows_,
+        # And whether it counts references at all.
+        use_ref_counter=state.key_index_map.use_ref_counter_,
     )
     for i in range(state.num_tables):
         if tables_to_expand[i]:
@@ -811,9 +819,10 @@ def _expand_tables_impl(
                 new_key_index_map.copy_score_blocks_from(
                     old_key_index_map, table_id, src_slots, dst_slots
                 )
-            new_key_index_map._ref_counter[dst_slots].copy_(
-                old_key_index_map._ref_counter[src_slots]
-            )
+            if new_key_index_map._ref_counter is not None:
+                new_key_index_map._ref_counter[dst_slots].copy_(
+                    old_key_index_map._ref_counter[src_slots]
+                )
 
             if not new_key_index_map.use_rows_:
                 # Value row == hash slot: the value has to follow its key.
@@ -2583,7 +2592,12 @@ class DynamicEmbStorage(Storage):
         self,
         options: List[DynamicEmbTableOptions],
         optimizer: BaseDynamicEmbeddingOptimizer,
+        use_ref_counter: bool = True,
     ):
+        """``use_ref_counter=False`` for a storage that sits under a cache: the
+        cache pins the slots a prefetched batch uses, never this storage's, so
+        the per-slot counter would only take memory. Such a storage cannot
+        :meth:`increment_counter` / :meth:`decrement_counter`."""
         self._state = create_table_state(
             options,
             optimizer,
@@ -2592,6 +2606,7 @@ class DynamicEmbStorage(Storage):
             evicted_item_mode=options[0].evicted_item_mode,
             # Every key keeps its own value row, so a rehash never moves values.
             use_rows=True,
+            use_ref_counter=use_ref_counter,
         )
 
     @property
@@ -3273,11 +3288,14 @@ class HybridStorage(Storage):
         # real and has nothing to retain. Erases are not covered by this setting
         # at all -- ``erase_keys`` runs against both tiers and passes its own
         # mode down, so a key erased out of HBM is recorded just the same.
-        self._hbm = create_table_state(hbm_options, optimizer)
+        # Neither tier is ever pinned (HybridStorage takes the generic path, with
+        # no PrefetchState), so neither keeps a per-slot reference counter.
+        self._hbm = create_table_state(hbm_options, optimizer, use_ref_counter=False)
         self._host = create_table_state(
             host_options,
             optimizer,
             evicted_item_mode=host_options[0].evicted_item_mode,
+            use_ref_counter=False,
         )
         self.optimizer = optimizer
 

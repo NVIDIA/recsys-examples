@@ -303,6 +303,7 @@ class LinearBucketTable(ScoredHashTable):
         enable_overflow: bool = False,
         score_fn_key: int = 0,
         use_rows: bool = False,
+        use_ref_counter: bool = True,
     ):
         """
         Args:
@@ -323,6 +324,13 @@ class LinearBucketTable(ScoredHashTable):
                 a cache never rehashes, and its reference counters are keyed by
                 the same index its values use, so it keeps slot == row and
                 ``enable_overflow`` is not supported together with this.
+            use_ref_counter: when False, no per-slot reference counter is
+                allocated (``_ref_counter`` is ``None``): nothing pins a slot, so
+                the evict kernels skip their counter check and
+                :meth:`increment_counter` / :meth:`decrement_counter` raise. For
+                a table whose slots are never pinned -- the backing storage under
+                a cache, where the cache's counters do the pinning -- and so it
+                does not pay 4 bytes per slot. ``enable_overflow`` needs it.
         """
         self.device = (
             device
@@ -472,6 +480,10 @@ class LinearBucketTable(ScoredHashTable):
 
         # Overflow buffer & counter
         self.enable_overflow_ = enable_overflow
+        self.use_ref_counter_ = use_ref_counter
+        assert (
+            use_ref_counter or not enable_overflow
+        ), "enable_overflow needs the reference counter (use_ref_counter=True)"
         if self.enable_overflow_:
             self.overflow_bucket_capacity_ = 3 * self.bucket_capacity_
             self.overflow_num_buckets_ = self.num_tables_
@@ -515,8 +527,10 @@ class LinearBucketTable(ScoredHashTable):
             self.overflow_table_storage_ = None
             self.overflow_bucket_sizes = None
             self.overflow_output_offsets_ = None
-            self._ref_counter = torch.zeros(
-                self.capacity_, dtype=torch.int32, device=self.device
+            self._ref_counter = (
+                torch.zeros(self.capacity_, dtype=torch.int32, device=self.device)
+                if use_ref_counter
+                else None
             )
             self._ovf_counter = None
 
@@ -968,6 +982,13 @@ class LinearBucketTable(ScoredHashTable):
             )
         self.row_counters_[table_id] = other.row_counters_[table_id]
 
+    def _check_has_ref_counter(self) -> None:
+        if self._ref_counter is None:
+            raise RuntimeError(
+                "this table was built with use_ref_counter=False: its slots "
+                "cannot be pinned"
+            )
+
     def increment_counter(
         self,
         slot_indices: torch.Tensor,
@@ -985,6 +1006,7 @@ class LinearBucketTable(ScoredHashTable):
         index (e.g. slot_indices from unique_keys lookup), so no two threads
         write the same counter element.
         """
+        self._check_has_ref_counter()
         table_update_counter_with_layout(
             self._ref_counter,
             slot_indices,
@@ -1019,6 +1041,7 @@ class LinearBucketTable(ScoredHashTable):
         index (e.g. slot_indices from unique_keys lookup), so no two threads
         write the same counter element.
         """
+        self._check_has_ref_counter()
         table_update_counter_with_layout(
             self._ref_counter,
             slot_indices,
@@ -1630,7 +1653,8 @@ class LinearBucketTable(ScoredHashTable):
         """
         self._init_table(self.keys_, self.scores_list, self.digests_)
         self.bucket_sizes.zero_()
-        self._ref_counter.zero_()
+        if self._ref_counter is not None:
+            self._ref_counter.zero_()
         if self.use_rows_:
             self.rows_.fill_(-1)
             self.row_counters_.zero_()
@@ -1666,9 +1690,10 @@ class LinearBucketTable(ScoredHashTable):
         slot_end = b_end * self.bucket_capacity_
         o_slot_start = o_b_start * other.bucket_capacity_
         o_slot_end = o_b_end * other.bucket_capacity_
-        self._ref_counter[slot_start:slot_end].copy_(
-            other._ref_counter[o_slot_start:o_slot_end]
-        )
+        if self._ref_counter is not None:
+            self._ref_counter[slot_start:slot_end].copy_(
+                other._ref_counter[o_slot_start:o_slot_end]
+            )
         if self.use_rows_:
             assert other.use_rows_
             self.rows_[slot_start:slot_end].copy_(other.rows_[o_slot_start:o_slot_end])
@@ -2174,6 +2199,7 @@ def get_scored_table(
     enable_overflow: bool = False,
     score_fn_key: int = 0,
     use_rows: bool = False,
+    use_ref_counter: bool = True,
 ) -> ScoredHashTable:
     if probing_type == ProbingType.LINEAR and reduction_type == ReductionType.LINEAR:
         return LinearBucketTable(
@@ -2185,6 +2211,7 @@ def get_scored_table(
             enable_overflow=enable_overflow,
             score_fn_key=score_fn_key,
             use_rows=use_rows,
+            use_ref_counter=use_ref_counter,
         )
     else:
         raise NotImplementedError

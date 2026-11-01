@@ -454,7 +454,7 @@ struct LinearBucket {
 
             if (temp_key != LockedKey && temp_key != EmptyKey) {
               int64_t flat_idx = counter_offset + iter + k + j;
-              if (counter[flat_idx] > 0)
+              if (counter != nullptr && counter[flat_idx] > 0)
                 continue;
 
               dst_iter = iter + k + j;
@@ -523,7 +523,7 @@ struct LinearBucket {
                               ->load(cuda::std::memory_order_relaxed);
           if (temp_key != LockedKey && temp_key != EmptyKey) {
             int64_t flat_idx = counter_offset + key_it;
-            if (counter[flat_idx] > 0)
+            if (counter != nullptr && counter[flat_idx] > 0)
               continue;
             dst_iter = key_it;
             dst_key = temp_key;

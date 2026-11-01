@@ -879,7 +879,12 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                         "storage expands instead of evicting, so a PS below it "
                         "would never be used."
                     )
-                self._storage = DynamicEmbStorage(storage_options, self._optimizer)
+                # Under a cache the cache pins the slots a batch uses, never the
+                # storage's, so its per-slot reference counter would only take
+                # (a lot of) memory.
+                self._storage = DynamicEmbStorage(
+                    storage_options, self._optimizer, use_ref_counter=False
+                )
                 if PS:
                     # The PS sits below the storage: the storage owns scores and
                     # the freshest values, the PS only holds what it evicted.
@@ -905,7 +910,11 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                     self._storage = (
                         PS(storage_options, self._optimizer)
                         if PS
-                        else DynamicEmbStorage(storage_options, self._optimizer)
+                        # Host-side values: the generic (DEFAULT) path, which
+                        # pins no slot, so no per-slot reference counter.
+                        else DynamicEmbStorage(
+                            storage_options, self._optimizer, use_ref_counter=False
+                        )
                     )
                     self._storage_layout = (
                         StorageLayout.HOST_PS if PS else StorageLayout.HOST_ONLY

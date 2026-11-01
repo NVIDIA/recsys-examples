@@ -294,7 +294,7 @@ insert(Bucket &bucket, KeyType key, ScoreType score,
       if (bucket.try_lock(iter, evict_key)) {
         if (evict_key != Bucket::reclaimed_key()) {
           int64_t flat_idx = counter_offset + iter;
-          if (::atomicAdd(&counter[flat_idx], 0) > 0) {
+          if (counter != nullptr && ::atomicAdd(&counter[flat_idx], 0) > 0) {
             bucket.unlock(iter, evict_key);
             continue;
           }
