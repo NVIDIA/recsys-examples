@@ -33,6 +33,7 @@ from dynamicemb_extensions import (
     table_collect_reclaimed_rows,
     table_copy_score_blocks,
     table_count_matched,
+    table_erase_by_score,
     table_erase,
     table_export_batch,
     table_gather_score_blocks,
@@ -978,7 +979,13 @@ class LinearBucketTable(ScoredHashTable):
             b0 = int(self.table_bucket_offsets_cpu_[table_id].item())
             b1 = int(self.table_bucket_offsets_cpu_[table_id + 1].item())
             table_place_reclaimed_rows(
-                self.keys_.view(torch.int64), self.rows_, carried, b0, b1, cap
+                self.keys_.view(torch.int64),
+                self.digests_,
+                self.rows_,
+                carried,
+                b0,
+                b1,
+                cap,
             )
         self.row_counters_[table_id] = other.row_counters_[table_id]
 
@@ -1189,6 +1196,77 @@ class LinearBucketTable(ScoredHashTable):
             num_scores=self.num_scores_,
         )
         return indices
+
+    def erase_by_score(
+        self,
+        table_id: int,
+        threshold: int,
+        counts: torch.Tensor,
+        *,
+        score_name: Optional[str] = None,
+        begin: Optional[int] = None,
+        end: Optional[int] = None,
+    ) -> None:
+        """Erase the keys of logical table ``table_id`` whose score is **below**
+        ``threshold``, over the table's slots ``[begin, end)``.
+
+        ``begin`` and ``end`` are slots counted from the start of the table
+        (default: all of it), so a caller scans a big table in chunks. A slot the
+        ref counter pins -- a prefetched batch is using it -- is spared, whatever
+        its score. Only the key, digest and score arrays are touched: an erased
+        slot stays reclaimed and keeps its value row, as after :meth:`erase`.
+
+        ``counts`` is an int64 tensor of two on the device, ``[erased, spared]``,
+        that this adds to: zero it once, pass it for every chunk, and read it when
+        the work is done. Nothing here waits for the GPU; the kernel runs on the
+        current stream and the binding releases the GIL.
+
+        A single-score table only (the score is compared as one word), and not one
+        with an overflow area (a cache).
+        """
+        if self.num_scores_ != 1:
+            raise NotImplementedError(
+                "erase_by_score compares one score word; a multi-word score "
+                f"({self.num_scores_} words) is not supported"
+            )
+        if self.enable_overflow_:
+            raise NotImplementedError(
+                "erase_by_score scans the main region only; a table with an "
+                "overflow area (a cache) is not supported"
+            )
+        if threshold < 0:
+            raise ValueError(f"threshold must not be negative, got {threshold}")
+        if not 0 <= table_id < self.num_tables_:
+            raise ValueError(
+                f"table_id {table_id} is not one of the {self.num_tables_} tables"
+            )
+        score_index = 0 if score_name is None else self.score_names_.index(score_name)
+
+        bucket_begin = int(self.table_bucket_offsets_cpu_[table_id].item())
+        bucket_end = int(self.table_bucket_offsets_cpu_[table_id + 1].item())
+        table_slots = (bucket_end - bucket_begin) * self.bucket_capacity_
+        begin = 0 if begin is None else begin
+        end = table_slots if end is None else end
+        if not 0 <= begin <= end <= table_slots:
+            raise ValueError(
+                f"the range [{begin}, {end}) is not inside table {table_id}'s "
+                f"{table_slots} slots"
+            )
+
+        base = bucket_begin * self.bucket_capacity_
+        table_erase_by_score(
+            self.table_storage_,
+            self.key_type_,
+            self.bucket_capacity_,
+            self.bucket_sizes,
+            self._ref_counter,
+            threshold,
+            base + begin,
+            base + end,
+            self.num_scores_,
+            score_index,
+            counts,
+        )
 
     def load(
         self,
