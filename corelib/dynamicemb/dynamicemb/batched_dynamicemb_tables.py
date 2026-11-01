@@ -1429,6 +1429,12 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
             indices.record_stream(current_stream)
             offsets.record_stream(current_stream)
 
+        if scores is not None:
+            # The kernels below read the scores on this stream, possibly after the
+            # caller has let go of them; a caller that made them on another stream
+            # would otherwise see their memory reused underneath those kernels.
+            scores.record_stream(torch.cuda.current_stream())
+
         frequency_counters = self._counters_for_group(frequency_counters)
 
         table_scores = [self._scores[name] for name in self._table_names]
