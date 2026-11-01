@@ -55,7 +55,7 @@ from ..dynamicemb_config import (
     DynamicEmbScoreStrategy,
     get_eviction_score_strategy,
 )
-from ..scored_kjt import ScoredKeyedJaggedTensor
+from ..scored_kjt import ScoredKeyedJaggedTensor, without_scores
 from .per_key_score import collect_per_key_score, require_scores
 from .rw_sharding import RwSequenceDynamicEmbeddingSharding
 
@@ -361,9 +361,14 @@ class ShardedDynamicEmbeddingCollection(ShardedEmbeddingCollection):
         ctx: DynamicEmbeddingCollectionContext,
         features: KeyedJaggedTensor,
     ) -> Awaitable[Awaitable[KJTList]]:
-        # Evaluation reads no score, so it does not have to be given any.
-        if self._per_key_score and self.training:
-            require_scores(features)
+        if self._per_key_score:
+            if self.training:
+                require_scores(features)
+            else:
+                # Evaluation reads no score, so it does not have to be given
+                # any; one given is dropped here, on every rank alike, so the
+                # ranks agree on whether the distribution sends scores.
+                features = without_scores(features)
         if self._has_uninitialized_input_dist:
             self._create_input_dist(input_feature_names=features.keys(), ctx=ctx)
             self._has_uninitialized_input_dist = False

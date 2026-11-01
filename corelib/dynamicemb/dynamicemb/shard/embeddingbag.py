@@ -37,6 +37,7 @@ from torchrec.modules.embedding_modules import EmbeddingBagCollection
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 
 from ..dynamicemb_config import DynamicEmbKernel
+from ..scored_kjt import without_scores
 from .per_key_score import collect_per_key_score, require_scores
 from .rw_sharding import RwPooledDynamicEmbeddingSharding
 from .twrw_sharding import TwRwPooledDynamicEmbeddingSharding
@@ -54,9 +55,14 @@ class ShardedDynamicEmbeddingBagCollection(ShardedEmbeddingBagCollection):
         self._per_key_score = per_key_score
 
     def input_dist(self, ctx, features):
-        # Evaluation reads no score, so it does not have to be given any.
-        if self._per_key_score and self.training:
-            require_scores(features)
+        if self._per_key_score:
+            if self.training:
+                require_scores(features)
+            else:
+                # Evaluation reads no score, so it does not have to be given
+                # any; one given is dropped here, on every rank alike, so the
+                # ranks agree on whether the distribution sends scores.
+                features = without_scores(features)
         return super().input_dist(ctx, features)
 
     def reset_parameters(self) -> None:

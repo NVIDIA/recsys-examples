@@ -33,7 +33,7 @@ from typing import List, Optional
 import torch
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 
-__all__ = ["ScoredKeyedJaggedTensor", "get_scores"]
+__all__ = ["ScoredKeyedJaggedTensor", "get_scores", "without_scores"]
 
 
 def _shallow_copy_as(cls, kjt: KeyedJaggedTensor, **fields):
@@ -142,7 +142,9 @@ class ScoredKeyedJaggedTensor(KeyedJaggedTensor):
             None,
             permuted.values().numel(),
         )
-        return _shallow_copy_as(ScoredKeyedJaggedTensor, permuted, _scores=permuted_scores)
+        return _shallow_copy_as(
+            ScoredKeyedJaggedTensor, permuted, _scores=permuted_scores
+        )
 
 
 def _check_scores(scores: torch.Tensor, values: torch.Tensor) -> None:
@@ -165,3 +167,17 @@ def _check_scores(scores: torch.Tensor, values: torch.Tensor) -> None:
 def get_scores(kjt: KeyedJaggedTensor) -> Optional[torch.Tensor]:
     """The scores ``kjt`` carries, or None if it is a plain ``KeyedJaggedTensor``."""
     return kjt.scores() if isinstance(kjt, ScoredKeyedJaggedTensor) else None
+
+
+def without_scores(kjt: KeyedJaggedTensor) -> KeyedJaggedTensor:
+    """``kjt`` as a plain ``KeyedJaggedTensor``, sharing its tensors.
+
+    For evaluation, which reads no score: dropping them on every rank, whichever
+    kind of input a rank was given, keeps all ranks on the same side of the
+    distribution's collective calls.
+    """
+    if not isinstance(kjt, ScoredKeyedJaggedTensor):
+        return kjt
+    plain = _shallow_copy_as(KeyedJaggedTensor, kjt)
+    del plain.__dict__["_scores"]
+    return plain

@@ -289,9 +289,10 @@ class RwSparseFeaturesDist(_RwSparseFeaturesDist):
     ) -> Awaitable[Awaitable[KeyedJaggedTensor]]:
         """Bucketize by ``dist_type``, then TorchRec's AlltoAll unchanged."""
         # A collection that takes a score per key refuses a plain input while it
-        # trains (see ``require_scores``); in evaluation nothing reads a score,
-        # so an input without them is distributed as it is. Every rank has to
-        # take the same branch, as the all2all of the scores is a collective.
+        # trains (see ``require_scores``) and, in evaluation, drops the scores of
+        # an input that has them (``without_scores``), so what arrives here is
+        # scored exactly when training: the same on every rank, which the
+        # all2all of the scores, a collective, needs.
         takes_scores = self._score_dist is not None and isinstance(
             sparse_features, ScoredKeyedJaggedTensor
         )
@@ -316,9 +317,7 @@ class RwSparseFeaturesDist(_RwSparseFeaturesDist):
         if not takes_scores:
             return self._dist(bucketized_features)
 
-        scores = permute_scores_like_keys(
-            sparse_features.scores(), unbucketize_permute
-        )
+        scores = permute_scores_like_keys(sparse_features.scores(), unbucketize_permute)
         # The scores are sent as the values of a KJT of the keys' shape. Its
         # lengths are a copy: ``clear_inputs`` frees what an all2all was given
         # once that all2all is done, and must not take the other's lengths away.

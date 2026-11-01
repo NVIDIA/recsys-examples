@@ -435,7 +435,10 @@ def check_eval_needs_no_scores(use_index_dedup: bool = False) -> None:
 
     model.eval()
     with torch.no_grad():
-        for scored in (False, True):
+        # Ranks that are given different kinds of input must still agree on the
+        # collectives, so the last pass gives one kind to the even ranks and the
+        # other to the odd ones.
+        for scored in (False, True, dist.get_rank() % 2 == 0):
             out = model(
                 _features_of(dist.get_rank(), 2, feature_names, device, scored=scored)
             )
