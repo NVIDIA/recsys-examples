@@ -324,12 +324,14 @@ def get_score_policy(score_strategy):
     fixed at ``(timestamp, frequency)`` regardless of the user's tuple order; the
     user's ordering only affects checkpoint column order (see
     :func:`score_dump_permutation`). The no-eviction mode adds no score of its own:
-    ``NO_EVICTION`` alone keeps none (a constant word that is never written), and
-    in a compound the score is the other strategy's.
+    ``NO_EVICTION`` alone keeps none: its one word is a ``FLAG`` (1 while a key
+    occupies the slot, 0 after an erase), which is not a score a user sets but
+    what lets a full bucket give up an erased slot before a key in use. In a
+    compound the score is the other strategy's.
     """
     score_strategy = get_score_part(score_strategy)
     if score_strategy is None:
-        return ScoreSpec(name="no_eviction", policy=ScorePolicy.CONST)
+        return ScoreSpec(name="no_eviction", policy=ScorePolicy.FLAG)
     if isinstance(score_strategy, tuple):
         # Only the {TIMESTAMP, LFU} compound is supported (validated at config
         # construction). Two adjacent AoS score words per key -- word 0 =
@@ -433,6 +435,9 @@ class DynamicEmbTableState:
     # Estimated per-table size (last_collected + accumulated unique since collection);
     # CPU tensor of shape (num_tables,), used to avoid key_index_map.size() when not needed.
     estimated_table_sizes: Optional[torch.Tensor] = None
+    # The same for the rows handed out, kept only by a table that never evicts: its
+    # key map grows with the keys it holds and its value buffer with the rows.
+    estimated_row_counts: Optional[torch.Tensor] = None
     collect_table_sizes_flag: bool = False
     # Name of the score column incremental_dump thresholds on. Equals
     # score_policy.name (for LruLfu this is the leading, timestamp, word).
@@ -535,8 +540,9 @@ def create_table_state(
             base_opt.score_function, base_opt.score_strategy, cc_major, cc_minor
         )
 
-    # NO_EVICTION: the key map is twice the value buffer, so a key never meets a full
-    # bucket before the buffer runs out of rows.
+    # NO_EVICTION: the key map starts at twice the value buffer. The two then grow
+    # on their own (the key map with the keys held, the buffer with the rows handed
+    # out, up to the key map's slots), see ``_expand_if_need_no_eviction``.
     bucket_capacity = base_opt.bucket_capacity
     if no_eviction:
         capacities = []
@@ -649,6 +655,11 @@ def create_table_state(
         estimated_table_sizes=torch.zeros(
             num_tables, dtype=torch.int64, pin_memory=True
         ),
+        estimated_row_counts=torch.zeros(
+            num_tables, dtype=torch.int64, pin_memory=True
+        )
+        if no_eviction
+        else None,
         evicted_item_mode=evicted_item_mode,
     )
 
@@ -656,10 +667,9 @@ def create_table_state(
 def collect_table_sizes_to_device(state: DynamicEmbTableState) -> torch.Tensor:
     """Collect per-table sizes (main table only, no overflow) into a tensor on state.device.
 
-    A table that never evicts is sized by the rows it has handed out rather than
-    by the keys it holds: its value buffer is half its key map, and an erased
-    key's slot keeps its row, so rows can outnumber keys. Rows are what the
-    buffer has to hold.
+    The keys each table holds. A table that never evicts also has the rows it has
+    handed out, which can be more: an erased key's slot keeps its row until a key
+    takes the slot again (see :func:`collect_row_counts_to_device`).
 
     Uses an async CUDA kernel when key_index_map exposes table_bucket_offsets_
     and bucket_sizes; otherwise falls back to a sync Python loop. No GPU-CPU
@@ -669,9 +679,17 @@ def collect_table_sizes_to_device(state: DynamicEmbTableState) -> torch.Tensor:
         Tensor of shape (num_tables,) dtype torch.int64 on state.device.
     """
     km = state.key_index_map
-    if state.no_eviction:
-        return km.row_counters_.to(torch.int64)
     return segmented_sum_cuda(km.bucket_sizes, km.table_bucket_offsets_)
+
+
+def collect_row_counts_to_device(state: DynamicEmbTableState) -> torch.Tensor:
+    """The value rows each table has handed out, as a tensor on state.device.
+
+    Only a table that stores a row per key has them. A slot owns at most one row,
+    so this never passes the table's key map capacity -- the bound a value buffer
+    needs to grow to and no further.
+    """
+    return state.key_index_map.row_counters_.to(torch.int64)
 
 
 def collect_table_sizes_for_state(
@@ -682,6 +700,10 @@ def collect_table_sizes_for_state(
         return
     table_sizes = collect_table_sizes_to_device(state)
     state.estimated_table_sizes.copy_(table_sizes, non_blocking=non_blocking)
+    if state.estimated_row_counts is not None:
+        state.estimated_row_counts.copy_(
+            collect_row_counts_to_device(state), non_blocking=non_blocking
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -709,7 +731,11 @@ def _expand_tables_impl(
     batch's values to dst_index (no key concatenation; load-then-store per batch avoids
     src/dst overlap). For tables that do not expand, key_index_map for that table is
     copied directly from the old key_index_map (copy_table_from). Updates key_index_map,
-    capacity (expansion does not change the key set). Mutates state."""
+    capacity (expansion does not change the key set). Mutates state.
+
+    A table that never evicts keeps its value buffer out of this: it is sized by the
+    rows the table has handed out, not by the key map (see
+    :func:`_grow_values_only`)."""
     base_opt = state.options_list[0]
     device = state.device
     enable_overflow = getattr(state.key_index_map, "enable_overflow_", False)
@@ -745,6 +771,8 @@ def _expand_tables_impl(
     )
     for i in range(state.num_tables):
         if tables_to_expand[i]:
+            if state.no_eviction:
+                continue  # its value buffer follows the rows, see the docstring
             if (
                 target_capacities is not None
                 and i < len(target_capacities)
@@ -752,18 +780,7 @@ def _expand_tables_impl(
             ):
                 # Hash buckets can round the requested target up. Grow values
                 # by the actual key-map capacity change, including that padding.
-                # A table that never evicts keeps its value buffer at
-                # NO_EVICTION_LOAD_FACTOR of the key map instead.
-                if state.no_eviction:
-                    add_rows = (
-                        math.ceil(
-                            new_key_index_map.per_table_capacity_[i]
-                            * NO_EVICTION_LOAD_FACTOR
-                        )
-                        - state.tables[i].shape[0]
-                    )
-                else:
-                    add_rows = new_key_index_map.per_table_capacity_[i] - key_caps[i]
+                add_rows = new_key_index_map.per_table_capacity_[i] - key_caps[i]
                 vd = state.table_value_dims_cpu[i]
                 if add_rows > 0:
                     state.tables[i].extend((add_rows, vd))
@@ -842,6 +859,36 @@ def _expand_tables_impl(
         new_key_index_map.set_row_limits([t.shape[0] for t in state.tables])
 
 
+def _value_rows_target(current_rows: int, need_rows: int, key_capacity: int) -> int:
+    """Value rows a table that never evicts should have: its current ones, unless
+    ``need_rows`` do not fit, then at least double them -- but never more than the
+    key map has slots, since a slot owns one row and no more can ever be handed out."""
+    if need_rows <= current_rows:
+        return current_rows
+    return max(current_rows, min(key_capacity, max(2 * current_rows, need_rows)))
+
+
+def _grow_values_only(state: DynamicEmbTableState, need_rows: List[int]) -> None:
+    """Grow the value buffer of a table that never evicts, leaving its key map.
+
+    The key map is sized by the keys the table holds; the value buffer by the rows
+    it has handed out, which can be more (an erased key's slot keeps its row until
+    another key takes the slot) but never more than the key map's slots.
+    """
+    grown = False
+    for i in range(state.num_tables):
+        rows = state.tables[i].shape[0]
+        target = _value_rows_target(
+            rows, need_rows[i], state.key_index_map.per_table_capacity_[i]
+        )
+        if target > rows:
+            state.tables[i].extend((target - rows, state.table_value_dims_cpu[i]))
+            grown = True
+    if grown:
+        state.table_ptrs_dev.copy_(get_table_ptrs(state.tables, state.device))
+        state.key_index_map.set_row_limits([t.shape[0] for t in state.tables])
+
+
 def get_expand_info(
     state: DynamicEmbTableState,
     table_sizes: torch.Tensor,
@@ -851,9 +898,9 @@ def get_expand_info(
 
     Args:
         state: Table state (for capacity and options).
-        table_sizes: Current size per table (length num_tables), CPU tensor: keys held, or
-            for a table that never evicts the rows handed out (see
-            :func:`collect_table_sizes_to_device`).
+        table_sizes: Current size per table (length num_tables), CPU tensor: the keys held
+            (see :func:`collect_table_sizes_to_device`). A table that never evicts grows its
+            value buffer separately, by the rows handed out (:func:`_grow_values_only`).
         unique_per_table: Number of new unique keys per table to add (length num_tables), CPU tensor.
 
     Returns:
@@ -916,6 +963,52 @@ def get_expand_info(
     return results, target_capacities
 
 
+def _expand_if_need_no_eviction(
+    state: DynamicEmbTableState, unique_size_per_table: torch.Tensor
+) -> None:
+    """Expansion for a table that never evicts.
+
+    Two things grow, each by what it is made to hold:
+
+    * the key map, when the keys it holds (plus this batch) pass the load factor;
+    * the value buffer, when the rows it has handed out (plus this batch) pass
+      the rows it has -- up to the key map's slots, since a slot owns one row.
+
+    So erasing keys lets new ones come in without growing the key map, and a table
+    that churns its keys settles at one row per slot instead of growing forever.
+    Like the other strategies this works from estimates (the last confirmed
+    numbers plus every batch's unique keys, which can only overcount) and confirms
+    them against the device, one sync, only when an estimate says something has to
+    grow.
+    """
+    if state.estimated_row_counts is None:
+        state.estimated_row_counts = torch.zeros(
+            state.num_tables, dtype=torch.int64, pin_memory=True
+        )
+    keys_est, rows_est = state.estimated_table_sizes, state.estimated_row_counts
+
+    def rows_short(rows: torch.Tensor) -> bool:
+        need = rows + unique_size_per_table
+        return any(
+            int(need[i]) > state.tables[i].shape[0] for i in range(state.num_tables)
+        )
+
+    est_results, _ = get_expand_info(state, keys_est, unique_size_per_table)
+    if any(est_results) or rows_short(rows_est):
+        keys = collect_table_sizes_to_device(state).cpu()
+        rows = collect_row_counts_to_device(state).cpu()
+        keys_est.copy_(keys)
+        rows_est.copy_(rows)
+        results, targets = get_expand_info(state, keys, unique_size_per_table)
+        need_rows = (rows + unique_size_per_table).tolist()
+        if any(results):
+            _expand_tables_impl(state, results, targets)
+        # The value buffers follow the rows, whether or not the key map grew.
+        _grow_values_only(state, need_rows)
+    keys_est.add_(unique_size_per_table)
+    rows_est.add_(unique_size_per_table)
+
+
 def expand_if_need_impl(
     state: DynamicEmbTableState,
     unique_size_per_table: torch.Tensor,
@@ -934,6 +1027,9 @@ def expand_if_need_impl(
         state.estimated_table_sizes = torch.zeros(
             state.num_tables, dtype=torch.int64, pin_memory=True
         )
+    if state.no_eviction:
+        _expand_if_need_no_eviction(state, unique_size_per_table)
+        return
     estimated_results, target_capacities = get_expand_info(
         state, state.estimated_table_sizes, unique_size_per_table
     )
@@ -1294,7 +1390,7 @@ def get_find_score_arg(
     so this takes one tensor, whichever it is.
     """
     # A table that keeps no score (NO_EVICTION alone) has nothing to update.
-    if state.score_policy.policy == ScorePolicy.CONST:
+    if state.score_policy.policy == ScorePolicy.FLAG:
         return ScoreArg(
             name=state.score_policy.name, value=None, policy=ScorePolicy.CONST
         )
@@ -1351,6 +1447,13 @@ def get_insert_score_arg(
     if preserve_existing:
         return ScoreArg(
             name=state.score_policy.name, value=None, policy=ScorePolicy.CONST
+        )
+
+    if state.score_policy.policy == ScorePolicy.FLAG:
+        # NO_EVICTION alone keeps no score a user could set, but a new key still
+        # sets its flag, so that it ranks above the slots an erase left.
+        return ScoreArg(
+            name=state.score_policy.name, value=None, policy=ScorePolicy.FLAG
         )
 
     is_lru = state.evict_strategy == EvictStrategy.KLru
@@ -2176,9 +2279,10 @@ def _load_key_values(
         (keys.numel(),), table_id, dtype=torch.int64, device=keys.device
     )
 
-    if state.score_policy.policy == ScorePolicy.CONST:
-        # A table that keeps no score (NO_EVICTION alone): nothing to restore.
-        policy, scores = ScorePolicy.CONST, None
+    if state.score_policy.policy == ScorePolicy.FLAG:
+        # A table that keeps no score (NO_EVICTION alone): none is restored, but the
+        # keys loaded set their flag like any new key.
+        policy, scores = ScorePolicy.FLAG, None
     elif scores is None:
         assert (
             state.evict_strategy == EvictStrategy.KLru

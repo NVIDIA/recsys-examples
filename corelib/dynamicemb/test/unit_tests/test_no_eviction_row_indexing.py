@@ -37,7 +37,12 @@ from dynamicemb import (
     EmbOptimType,
 )
 from dynamicemb.batched_dynamicemb_tables import BatchedDynamicEmbeddingTablesV2
-from dynamicemb.key_value_table import collect_table_sizes_to_device, get_expand_info
+from dynamicemb.key_value_table import (
+    collect_row_counts_to_device,
+    collect_table_sizes_for_state,
+    collect_table_sizes_to_device,
+    get_expand_info,
+)
 
 # The DEBUG initializer writes `key % DEBUG_EMB_INITIALIZER_MOD` into every
 # element, so a row can be checked against the key that should own it.
@@ -52,8 +57,20 @@ def current_device():
     return torch.cuda.current_device()
 
 
+# A model that trains for real but never changes a value: ``backward`` has to run
+# to release the reference counters a forward pins, and the DEBUG pattern must
+# survive it.
+NO_UPDATE = dict(
+    optimizer=EmbOptimType.SGD, learning_rate=0.0, stochastic_rounding=False
+)
+
+
 def build_model(
-    current_device: int, max_capacity: int, init_capacity=None, **options_kwargs
+    current_device: int,
+    max_capacity: int,
+    init_capacity=None,
+    model_kwargs=None,
+    **options_kwargs,
 ):
     options = DynamicEmbTableOptions(
         index_type=torch.int64,
@@ -79,6 +96,7 @@ def build_model(
         feature_table_map=[0],
         pooling_mode=DynamicEmbPoolingMode.SUM,
         use_index_dedup=False,
+        **(model_kwargs or {}),
     )
 
 
@@ -144,6 +162,15 @@ def assert_debug_values(out: torch.Tensor, keys):
         [k % DEBUG_MOD for k in keys], dtype=out.dtype, device=out.device
     )
     torch.testing.assert_close(out, expected.unsqueeze(1).expand(-1, out.size(1)))
+
+
+def train_step(model, keys, device):
+    """Forward then backward over ``keys``: the pins a forward takes are released by
+    the backward, which is what a training loop does. Returns the forward output."""
+    out = lookup(model, keys, device)
+    out.sum().backward()
+    torch.cuda.synchronize()
+    return out
 
 
 def test_resident_keys_reread_correctly(current_device):
@@ -433,14 +460,15 @@ def test_hbm_direct_backward_writes_the_right_row(current_device):
 
 
 def test_no_eviction_alone_keeps_no_score(current_device):
-    """``NO_EVICTION`` by itself stores no score: the key map's one score word is a
-    constant that nothing writes, and the rows come from the row column."""
+    """``NO_EVICTION`` by itself keeps no score a user sets: its policy is FLAG and
+    the rows come from the row column. (The key map's one score word is a flag, 1
+    for each key stored, see ``test_new_keys_carry_a_flag_and_erased_slots_do_not``.)"""
     from dynamicemb_extensions import ScorePolicy
 
     model = build_model(current_device, max_capacity=65536 * 2)
     state = model._storage._state
     assert state.no_eviction
-    assert state.score_policy.policy == ScorePolicy.CONST
+    assert state.score_policy.policy == ScorePolicy.FLAG
     assert state.key_index_map.use_rows_
 
 
@@ -561,38 +589,86 @@ def test_unaligned_init_capacity_leaves_a_row_for_every_slot_to_fill(current_dev
     assert next_row_counter(model) == len(keys)
 
 
-def test_rows_handed_out_count_toward_expansion_not_just_live_keys(current_device):
-    """An erased key's slot keeps its row, so rows can outnumber live keys, and the
-    value buffer has to hold the rows. Expansion must follow them."""
+def test_rows_handed_out_grow_the_value_buffer_not_the_key_map(current_device):
+    """An erased key's slot keeps its row, so rows can outnumber live keys. The value
+    buffer has to hold the rows, the key map only the keys: rows handed out, with no
+    live key at all, must grow the buffer and leave the key map alone."""
     model = build_model(current_device, max_capacity=65536 * 2, init_capacity=4096)
     state = model._storage._state
     km = state.key_index_map
-    assert state.tables[0].shape[0] == 4096
+    assert (km.capacity(0), state.tables[0].shape[0]) == (8192, 4096)
 
     km.reserve_rows(0, 3000)  # three thousand rows out, no live key at all
-    sizes = collect_table_sizes_to_device(state).cpu()
-    assert sizes.tolist() == [3000]
+    assert collect_table_sizes_to_device(state).cpu().tolist() == [0]
+    assert collect_row_counts_to_device(state).cpu().tolist() == [3000]
 
-    flags, targets = get_expand_info(state, sizes, torch.tensor([500]))
-    assert flags == [False]  # 3500 rows fit the 4096 the buffer has
-    flags, targets = get_expand_info(state, sizes, torch.tensor([1500]))
-    assert flags == [True]  # 4500 do not, whatever the 0 live keys say
-    assert targets[0] >= 2 * (3000 + 1500)
+    # Refresh the estimates from the device, as a checkpoint load does.
+    state.collect_table_sizes_flag = True
+    collect_table_sizes_for_state(state, non_blocking=False)
+
+    flags, _ = get_expand_info(state, torch.tensor([0]), torch.tensor([1500]))
+    assert flags == [False]  # 1500 keys in 8192 slots: the key map has room
+
+    model._storage.expand_if_need(torch.tensor([500]))
+    assert state.tables[0].shape[0] == 4096  # 3500 rows fit
+
+    model._storage.expand_if_need(torch.tensor([1500]))  # 4500 rows do not
+    km = state.key_index_map
+    assert km.capacity(0) == 8192, "the key map grew for rows, not keys"
+    assert state.tables[0].shape[0] == 8192  # doubled, and no more slots to fill
+    assert km.num_rows(0) == 3000
+
+
+def test_new_keys_carry_a_flag_and_erased_slots_do_not(current_device):
+    """``NO_EVICTION`` alone has no score a user sets, but every key it stores
+    sets its flag to 1 and an erased slot is cleared to 0. That is what lets a full bucket
+    give up an erased slot before a key in use: with every word 0 they would tie."""
+    from dynamicemb.scored_hashtable import ScoreArg
+    from dynamicemb_extensions import ScorePolicy
+
+    device = torch.device(f"cuda:{current_device}")
+    model = build_model(
+        current_device, max_capacity=65536 * 2, init_capacity=4096, model_kwargs=NO_UPDATE
+    )
+    state = model._storage._state
+    assert state.score_policy.policy == ScorePolicy.FLAG
+
+    keys = list(range(7001, 7001 + 300))
+    train_step(model, keys, device)
+
+    def scores_of(ks):
+        tensor = torch.tensor(ks, dtype=torch.int64, device=device)
+        arg = ScoreArg(name=state.score_policy.name, value=None, policy=ScorePolicy.CONST)
+        score_out, founds, _ = state.key_index_map.lookup(
+            tensor, torch.zeros_like(tensor), arg
+        )
+        return score_out, founds
+
+    score_out, founds = scores_of(keys)
+    assert bool(founds.all())
+    assert (score_out == 1).all()
+
+    gone, kept = keys[:100], keys[100:]
+    model._storage.erase_keys(0, torch.tensor(gone, dtype=torch.int64, device=device))
+    assert not bool(scores_of(gone)[1].any())
+    score_out, founds = scores_of(kept)
+    assert bool(founds.all()) and (score_out == 1).all()
 
 
 def test_erase_and_reinsert_never_outgrows_the_value_buffer(current_device):
     """Keys that churn through a table near half full, each round erasing the
     oldest and inserting new ones, take slots no erased key left behind, so rows
-    keep being handed out while the live count stays put. They must never pass the
-    value buffer."""
+    keep being handed out while the live count stays put. The value buffer follows
+    them, and they never pass it."""
     device = torch.device(f"cuda:{current_device}")
-    model = build_model(current_device, max_capacity=65536 * 2, init_capacity=4096)
+    model = build_model(
+        current_device, max_capacity=65536 * 2, init_capacity=4096, model_kwargs=NO_UPDATE
+    )
     state = model._storage._state
-    km = state.key_index_map
 
     window, step = 3900, 1900
     live = list(range(10_001, 10_001 + window))
-    assert_debug_values(lookup(model, live, device), live)
+    assert_debug_values(train_step(model, live, device), live)
     next_key = 10_001 + window
     for _ in range(10):
         gone, live = live[:step], live[step:]
@@ -600,9 +676,78 @@ def test_erase_and_reinsert_never_outgrows_the_value_buffer(current_device):
         new = list(range(next_key, next_key + step))
         next_key += step
         live += new
-        assert_debug_values(lookup(model, new, device), new)
-        assert km.num_rows(0) <= state.tables[0].shape[0]
-    assert_debug_values(lookup(model, live, device), live)
+        assert_debug_values(train_step(model, new, device), new)
+        km = state.key_index_map  # an expansion swaps it: read it again
+        assert km.num_rows(0) <= state.tables[0].shape[0] <= km.capacity(0)
+        assert int(km.size(0)) == len(live), "a live key was lost"
+    assert_debug_values(train_step(model, live, device), live)
+
+
+def test_replacing_the_whole_live_set_does_not_grow_the_key_map(current_device):
+    """Every round erases every live key and inserts the same number of new ones,
+    so the live set is always ``window`` keys however many have passed through.
+
+    The key map is sized by the keys it holds, so it must not grow for that. The
+    value buffer follows the rows handed out (a slot keeps its row after an erase),
+    which settle at one per slot, so it grows to the key map's size and stops. No
+    key may be lost on the way: once the buffer is as big as the key map, a new key
+    meets a bucket made of erased slots, and has to take one.
+    """
+    device = torch.device(f"cuda:{current_device}")
+    model = build_model(
+        current_device, max_capacity=65536 * 8, init_capacity=4096, model_kwargs=NO_UPDATE
+    )
+    state = model._storage._state
+
+    window, rounds = 1500, 20
+    live = list(range(10_001, 10_001 + window))
+    assert_debug_values(train_step(model, live, device), live)
+    capacity = state.key_index_map.capacity(0)
+    next_key = 10_001 + window
+    for r in range(rounds):
+        model._storage.erase_keys(
+            0, torch.tensor(live, dtype=torch.int64, device=device)
+        )
+        live = list(range(next_key, next_key + window))
+        next_key += window
+        assert_debug_values(train_step(model, live, device), live)
+        km = state.key_index_map  # an expansion swaps it: read it again
+        assert int(km.size(0)) == window, f"round {r}: a key was lost or not stored"
+        assert km.capacity(0) == capacity, f"round {r}: the key map grew"
+        assert km.num_rows(0) <= state.tables[0].shape[0] <= capacity
+
+    # They were stored, not just initialised on the way out: read them back.
+    assert_debug_values(train_step(model, live, device), live)
+
+
+def test_replacing_half_the_live_set_never_loses_a_live_key(current_device):
+    """The harder churn: each round erases the oldest half and inserts as many new
+    keys, so a full bucket holds keys in use as well as erased slots, and the one
+    that is given up has to be an erased slot. A value is DEBUG-derived, so a lost
+    key would look the same re-initialised; what shows it is the key count, which
+    an insert that evicts a live key leaves a key short."""
+    device = torch.device(f"cuda:{current_device}")
+    model = build_model(
+        current_device, max_capacity=65536 * 8, init_capacity=4096, model_kwargs=NO_UPDATE
+    )
+    state = model._storage._state
+
+    window, half = 1500, 750
+    live = list(range(10_001, 10_001 + window))
+    train_step(model, live, device)
+    next_key = 10_001 + window
+    for r in range(40):  # enough rounds for the buckets to fill with erased slots
+        gone, live = live[:half], live[half:]
+        model._storage.erase_keys(0, torch.tensor(gone, dtype=torch.int64, device=device))
+        new = list(range(next_key, next_key + half))
+        next_key += half
+        assert_debug_values(train_step(model, new, device), new)
+        live += new
+        km = state.key_index_map
+        assert int(km.size(0)) == len(live), (
+            f"round {r}: {len(live) - int(km.size(0))} live keys were given up"
+        )
+        assert km.capacity(0) == 8192, f"round {r}: the key map grew"
 
 
 @pytest.mark.parametrize(

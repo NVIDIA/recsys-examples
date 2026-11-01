@@ -258,6 +258,7 @@ void bind_table_operation(py::module &m) {
       .value("ACCUMULATE", dyn_emb::ScorePolicyType::Accumulate)
       .value("GLOBAL_TIMER", dyn_emb::ScorePolicyType::GlobalTimer)
       .value("LRU_LFU", dyn_emb::ScorePolicyType::LruLfu)
+      .value("FLAG", dyn_emb::ScorePolicyType::Flag)
       .export_values();
 
   py::enum_<dyn_emb::InsertResult>(m, "InsertResult")

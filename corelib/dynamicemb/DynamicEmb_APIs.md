@@ -374,7 +374,7 @@ dynamicemb provides the following strategies to set the score.
         NO_EVICTION:
             The table’s capacity doubles whenever there are not enough slots for new keys, and this continues until available memory is exhausted.
             When the memory resources are insufficient, there will be a warning message, and training can continue but the accuracy of eviction cannot be guaranteed.
-            Used alone, it keeps no score. It can be combined with `CUSTOMIZED` or `PRECISE_CUSTOMIZED` as `(NO_EVICTION, CUSTOMIZED)` (either order), which keeps the user's score.
+            Used alone, it keeps no score. It can be combined with `CUSTOMIZED` or `PRECISE_CUSTOMIZED` as `(NO_EVICTION, CUSTOMIZED)` (either order), which keeps the user's score. With such a combination **do not use a score of 0**: an erased key's slot is cleared to 0, and a full bucket gives up the slot with the smallest score, so a key scored 0 ties with an erased slot and can be the one that is given up.
             `incremental_dump` skips such tables (with a warning) and `replay_increment` refuses them.
         """
 
@@ -421,6 +421,13 @@ the table keeps **one** score, `CUSTOMIZED`'s. Set it with `set_score` before a 
 pass exactly as for a plain `CUSTOMIZED` table. `NO_EVICTION` used alone keeps **no**
 score. Neither form supports `incremental_dump` / `replay_increment`: such a table has
 no timestamp to take a delta by, and its erased keys are the user's to manage.
+
+With `(NO_EVICTION, CUSTOMIZED)` or `(NO_EVICTION, PRECISE_CUSTOMIZED)`, **scores must be at
+least 1**. An erased key leaves its slot with score 0, and when a bucket has no free slot
+left the key with the smallest score is the one given up, so an erased slot is always
+taken before a key that is in use -- unless that key is also scored 0, in which case the
+two tie and the key can be lost. (`NO_EVICTION` alone has no score to set; the table
+writes 1 for each key it stores, which gives it the same guarantee.)
 
 ### Customized eviction via `score_function`
 
@@ -1642,7 +1649,10 @@ Users can specify the initial capacity of a table on a single GPU. When the tabl
 **Trigger conditions:**
 
 - **Non–NO_EVICTION**: When `max_load_factor` would be exceeded or (if set) at `max_capacity`, the table(s) that need it are doubled. See `init_capacity`, `max_load_factor`, `max_capacity` in `DynamicEmbTableOptions`.
-- **NO_EVICTION**: The option `max_load_factor` is not used. The key_index_map is sized and expanded with a fixed effective max load factor of **0.5**: at creation its capacity is ceil(init_capacity/0.5) rounded up to whole buckets, and the embedding (value) buffer has **exactly half** that many rows, so the key_index_map is twice the embedding buffer at creation and after every expansion. A table is sized by the **rows it has handed out**, not by the keys it holds: an erased key's slot keeps its row until another key takes that slot, so rows can outnumber live keys, and expansion is triggered when `rows handed out + new unique keys` exceed the embedding buffer's rows. The growth is not capped by `max_capacity`.
+- **NO_EVICTION**: The option `max_load_factor` is not used. The key_index_map and the embedding (value) buffer grow **separately**, each by what it has to hold. At creation the key_index_map has ceil(init_capacity/0.5) slots rounded up to whole buckets and the embedding buffer half that many rows.
+  - The **key_index_map** is sized by the keys it holds, with a fixed effective max load factor of **0.5**: it grows when `keys held + new unique keys` exceed half its capacity. Erasing keys therefore makes room for new ones without growing it.
+  - The **embedding buffer** is sized by the rows it has handed out. A key takes a row when it takes a slot that has never held one; an erased key's slot keeps its row, and a later key that takes that slot uses it. So after erases the rows handed out can outnumber the keys held, and the buffer grows when `rows handed out + new unique keys` exceed its rows -- at least doubling, but never beyond the number of slots in the key_index_map, since a slot owns one row and no more rows than slots can be handed out. A table whose keys keep being replaced therefore settles at one row per slot instead of growing without bound.
+  The growth is not capped by `max_capacity`.
 - **Loading a checkpoint** (`DynamicEmbStorage.load`): the table is sized for the keys **this rank keeps** from the file (counted from the key file with the rank's ownership filter), not for every key in it, since a checkpoint may hold other ranks' keys as well.
 
 

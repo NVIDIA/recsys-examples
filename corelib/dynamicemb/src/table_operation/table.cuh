@@ -59,6 +59,7 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
     CASE_ENUM_USING_HINT(ScorePolicyType::Accumulate, HINT, __VA_ARGS__)       \
     CASE_ENUM_USING_HINT(ScorePolicyType::GlobalTimer, HINT, __VA_ARGS__)      \
     CASE_ENUM_USING_HINT(ScorePolicyType::LruLfu, HINT, __VA_ARGS__)           \
+    CASE_ENUM_USING_HINT(ScorePolicyType::Flag, HINT, __VA_ARGS__)             \
   default:                                                                     \
     throw std::runtime_error("Not supported score policy.");                   \
   }
