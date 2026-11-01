@@ -351,7 +351,8 @@ dynamicemb provides the following strategies to set the score.
 
         dynamicemb allows configuring scores by table.
         For a table, the scores in the subsequent forward passes are larger than those in the previous ones for modes TIMESTAMP and STEP.
-        Users can also provide customized score(mode CUSTOMIZED) for each table's forward pass.
+        Users can also provide customized score(mode CUSTOMIZED) for each table's forward pass,
+        or a score for every key (mode PRECISE_CUSTOMIZED).
         Attributes
         ----------
         TIMESTAMP:
@@ -367,10 +368,13 @@ dynamicemb provides the following strategies to set the score.
             Users have to set the score before every forward pass using `set_score` interface.
         LFU:
             If there are not enough slots inside the bucket to store new keys, the least used key in the bucket will be evicted.
+        PRECISE_CUSTOMIZED:
+            Like CUSTOMIZED, but every key has a score of its own: the module is called with a `ScoredKeyedJaggedTensor`
+            whose `scores` hold an int64 for each key. See "Per-key score" below.
         NO_EVICTION:
             The table’s capacity doubles whenever there are not enough slots for new keys, and this continues until available memory is exhausted.
             When the memory resources are insufficient, there will be a warning message, and training can continue but the accuracy of eviction cannot be guaranteed.
-            Used alone, it keeps no score. It can be combined with `CUSTOMIZED` as `(NO_EVICTION, CUSTOMIZED)` (either order), which keeps the user's score.
+            Used alone, it keeps no score. It can be combined with `CUSTOMIZED` or `PRECISE_CUSTOMIZED` as `(NO_EVICTION, CUSTOMIZED)` (either order), which keeps the user's score.
             `incremental_dump` skips such tables (with a warning) and `replay_increment` refuses them.
         """
 
@@ -379,6 +383,7 @@ dynamicemb provides the following strategies to set the score.
         CUSTOMIZED = 2
         LFU = 3
         NO_EVICTION = 4
+        PRECISE_CUSTOMIZED = 5
     ```
 
     Users can specify the `DynamicEmbScoreStrategy` using `score_strategy` in `DynamicEmbTableOptions` per table.
@@ -469,10 +474,10 @@ table_options = DynamicEmbTableOptions(
 )
 ```
 
-### Per-key score (`per_key_score`)
+### Per-key score (`PRECISE_CUSTOMIZED`)
 
 By default a CUSTOMIZED table scores every key of a batch with one number
-(`set_score`). With `per_key_score=True` in `DynamicEmbTableOptions`, the input
+(`set_score`). With `score_strategy=DynamicEmbScoreStrategy.PRECISE_CUSTOMIZED`, the input
 carries **a score for each key** instead, and the table stores it as that key's
 score. A key's score then decides its eviction (lowest first) like any other
 CUSTOMIZED score.
@@ -497,13 +502,14 @@ and admission use.
 Rules:
 
 - **All or none.** Every table of an `EmbeddingCollection` /
-  `EmbeddingBagCollection` sets `per_key_score`, or none does, and a collection
+  `EmbeddingBagCollection` uses it, or none does, and a collection
   that sets it holds DynamicEmb tables only. While training, when set, the input must be a
   `ScoredKeyedJaggedTensor` (a plain `KeyedJaggedTensor` raises); evaluation reads
   no score, so it takes either. When not set,
   the scores of a `ScoredKeyedJaggedTensor` are ignored.
-- **Score strategy.** `CUSTOMIZED`, alone or with `NO_EVICTION`. Not with LFU
-  (or the compound strategy), and not with `admit_strategy`.
+- **Score strategy.** `PRECISE_CUSTOMIZED`, alone or with `NO_EVICTION` as
+  `(NO_EVICTION, PRECISE_CUSTOMIZED)`. Not with `admit_strategy`. It is its own
+  strategy, so it cannot be combined with LFU.
 - **Sharding.** Row-wise only (EC and EBC). No variable batch size per key
   (VBE). Tables with a host/hybrid storage tier (`HybridStorage`) are not
   supported yet.
@@ -910,10 +916,6 @@ Fields declared first (through `device_id`) are **planner/runtime-heavy**: `Dyna
             Used to check if all keys in the current batch have been successfully inserted into the table.
             Should dynamic embedding table insert safe check be enabled? By default, it is disabled.
             Please refer to the API documentation for DynamicEmbCheckMode for more information.
-        per_key_score : bool
-            Take a score for each key from the input (a `ScoredKeyedJaggedTensor`) instead of one score per batch.
-            Default to False. Needs `score_strategy` CUSTOMIZED and no `admit_strategy`; row-wise only.
-            See "Per-key score" under `DynamicEmbScoreStrategy` for the rules.
         global_hbm_for_values : int
             Total GPU memory allocated to store embedding + optimizer states, in bytes. Default is 0.
             It has different meanings under `caching=True` and  `caching=False`.

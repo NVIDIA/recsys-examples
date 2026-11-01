@@ -797,12 +797,8 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
         # Tables are grouped on it too (see DynamicEmbTableOptions), so it holds
         # for the whole group: every table takes a score per key, or none does.
         self.per_key_score: bool = any(
-            option.per_key_score for option in self._dynamicemb_options
+            option.takes_score_per_key for option in self._dynamicemb_options
         )
-        if self.per_key_score and isinstance(self._storage, HybridStorage):
-            raise NotImplementedError(
-                "per_key_score is not supported with HybridStorage yet."
-            )
         self._prefetch_states: Deque[PrefetchState] = deque()
 
         # TODO:1->10
@@ -933,6 +929,18 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                         cap = max(1, int(host_option.max_capacity * storage_cap_scale))
                         host_option.max_capacity = min(host_option.max_capacity, cap)
                         host_option.init_capacity = min(host_option.init_capacity, cap)
+
+                    # Nor does it take a score per key: the scores of the input
+                    # reach a storage, and this one has two tiers to place them in.
+                    if any(
+                        option.takes_score_per_key
+                        for option in self._dynamicemb_options
+                    ):
+                        raise NotImplementedError(
+                            "score_strategy PRECISE_CUSTOMIZED is not supported with "
+                            "HybridStorage (non-caching partial-HBM storage). Use "
+                            "caching=True or a single-tier configuration."
+                        )
 
                     # HybridStorage does not support NO_EVICTION yet: its tiers
                     # still use the hash slot as the value row, and its
@@ -1375,7 +1383,7 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
         if scores is None:
             if self.per_key_score and self.training:
                 raise ValueError(
-                    "These tables take a score per key (per_key_score=True), "
+                    "These tables take a score per key (PRECISE_CUSTOMIZED), "
                     "but no scores were given."
                 )
             return
@@ -1481,10 +1489,11 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
             if table_score == 0:
                 raise ValueError(f"Can't set table's score to 0.")
             index = self._table_names.index(table_name)
-            if self._dynamicemb_options[index].per_key_score:
+            if self._dynamicemb_options[index].takes_score_per_key:
                 raise ValueError(
-                    f"Table '{table_name}' takes a score per key (per_key_score=True); "
-                    "its scores come with the input, not from set_score."
+                    f"Table '{table_name}' takes a score per key "
+                    "(PRECISE_CUSTOMIZED); its scores come with the input, "
+                    "not from set_score."
                 )
             # The score part, so that (NO_EVICTION, CUSTOMIZED) -- in either order --
             # takes a user score like CUSTOMIZED does.
@@ -1560,7 +1569,10 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
             elif eviction_strategy == DynamicEmbScoreStrategy.STEP:
                 option.evict_strategy = DynamicEmbEvictStrategy.CUSTOMIZED
                 self._scores[table_name] = 1
-            elif eviction_strategy == DynamicEmbScoreStrategy.CUSTOMIZED:
+            elif eviction_strategy in (
+                DynamicEmbScoreStrategy.CUSTOMIZED,
+                DynamicEmbScoreStrategy.PRECISE_CUSTOMIZED,
+            ):
                 option.evict_strategy = DynamicEmbEvictStrategy.CUSTOMIZED
                 self._scores[table_name] = 0
             elif eviction_strategy == DynamicEmbScoreStrategy.LFU:

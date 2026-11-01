@@ -38,9 +38,9 @@ Run with ``torchrun --nproc_per_node 2``. Three parts:
      not raised -- and a key the later batch did not have is left as it was;
    - backward does not change them.
 
-   Also: a host-only tier, ``(NO_EVICTION, CUSTOMIZED)``, an input whose features
+   Also: a host-only tier, ``(NO_EVICTION, PRECISE_CUSTOMIZED)``, an input whose features
    are not in the tables' order, a dump and a load, evaluation without scores,
-   and a negative score under WARNING and ERROR.
+   a negative score under WARNING and ERROR, and HybridStorage refused.
 
 3. ``check_pooled_scores`` -- the same through ``EmbeddingBagCollection``, whose
    lookup is not prefetched, so the scores reach the tables through ``forward``
@@ -110,9 +110,8 @@ def _input_model(use_index_dedup: bool):
         num_embeddings=[NUM_EMBEDDINGS] * NUM_TABLES,
         embedding_dim=16,
         optimizer_kwargs=get_optimizer_kwargs("sgd"),
-        score_strategy=DynamicEmbScoreStrategy.CUSTOMIZED,
+        score_strategy=DynamicEmbScoreStrategy.PRECISE_CUSTOMIZED,
         use_index_dedup=use_index_dedup,
-        table_option_overrides={table: {"per_key_score": True} for _, table in names},
     ), [feature for feature, _ in names]
 
 
@@ -344,13 +343,15 @@ def _train_on(model, batch_seed, feature_names, reverse=False):
 def _ec_model(
     use_index_dedup=False,
     caching=False,
-    score_strategy=DynamicEmbScoreStrategy.CUSTOMIZED,
+    score_strategy=DynamicEmbScoreStrategy.PRECISE_CUSTOMIZED,
     host_only=False,
+    hybrid=False,
     **options,
 ):
     # With caching the budget is the cache's (cache_capacity_ratio of the table,
     # a half), and global_hbm_budget_scale is not read.
     assert not (host_only and caching)
+    # Half the values in HBM, the rest on the host, with no cache: HybridStorage.
     names = [idx_to_name(0, i) for i in range(NUM_TABLES)]
     model = create_model(
         num_embedding_collections=1,
@@ -362,10 +363,8 @@ def _ec_model(
         caching=caching,
         # Without caching, 1.0 holds every value in HBM; 0.0 leaves none there: one
         # host tier, the storage mode that is neither a cache nor HBM-only.
-        global_hbm_budget_scale=0.0 if host_only else 1.0,
-        table_option_overrides={
-            table: {"per_key_score": True, **options} for _, table in names
-        },
+        global_hbm_budget_scale=0.0 if host_only else 0.5 if hybrid else 1.0,
+        table_option_overrides={table: dict(options) for _, table in names},
     )
     return model, [f for f, _ in names], [t for _, t in names]
 
@@ -373,7 +372,7 @@ def _ec_model(
 def check_ec_scores(
     use_index_dedup: bool = False,
     caching: bool = False,
-    score_strategy=DynamicEmbScoreStrategy.CUSTOMIZED,
+    score_strategy=DynamicEmbScoreStrategy.PRECISE_CUSTOMIZED,
     host_only: bool = False,
     reverse: bool = False,
 ) -> None:
@@ -447,6 +446,17 @@ def check_eval_needs_no_scores(use_index_dedup: bool = False) -> None:
     assert _table_scores(model, table_names) == held
 
 
+def check_hybrid_storage_is_refused() -> None:
+    """Two tiers without a cache is not supported: refused when the tables are
+    built, naming the strategy."""
+    try:
+        _ec_model(hybrid=True)
+    except NotImplementedError as error:
+        assert "PRECISE_CUSTOMIZED" in str(error), error
+    else:
+        raise AssertionError("PRECISE_CUSTOMIZED was accepted with HybridStorage")
+
+
 def check_negative_score() -> None:
     """A negative score warns under WARNING and raises under ERROR."""
     device = torch.device(f"cuda:{torch.cuda.current_device()}")
@@ -507,8 +517,7 @@ def _build_ebc(device: torch.device):
                 initializer_args=DynamicEmbInitializerArgs(
                     mode=DynamicEmbInitializerMode.CONSTANT, value=1.0
                 ),
-                score_strategy=DynamicEmbScoreStrategy.CUSTOMIZED,
-                per_key_score=True,
+                score_strategy=DynamicEmbScoreStrategy.PRECISE_CUSTOMIZED,
             ),
         )
         for table in TABLE_NAMES
@@ -598,12 +607,12 @@ if __name__ == "__main__":
     check_ec_scores(caching=True)
     # One host tier: neither the cache path nor the HBM one.
     check_ec_scores(host_only=True)
-    # (NO_EVICTION, CUSTOMIZED): the table grows instead of evicting, and still
+    # (NO_EVICTION, PRECISE_CUSTOMIZED): the table grows instead of evicting, and still
     # takes the scores of the input.
     check_ec_scores(
         score_strategy=(
             DynamicEmbScoreStrategy.NO_EVICTION,
-            DynamicEmbScoreStrategy.CUSTOMIZED,
+            DynamicEmbScoreStrategy.PRECISE_CUSTOMIZED,
         )
     )
     # An input whose features are not in the order of the tables is permuted.
@@ -614,6 +623,8 @@ if __name__ == "__main__":
     # The dedup before the all2all has no scores to merge in an input without.
     check_eval_needs_no_scores(use_index_dedup=True)
     check_negative_score()
+    # Last: it ends in an exception while the model is being built.
+    check_hybrid_storage_is_refused()
     check_pooled_scores()
     dist.barrier()
     if dist.get_rank() == 0:

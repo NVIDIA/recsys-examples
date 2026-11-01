@@ -32,16 +32,17 @@ def collect_per_key_score(params: Dict[str, ParameterSharding]) -> bool:
     collection: the lookup then hands scores to every table it holds, with no
     other kind of table to tell apart.
 
-    Per-table requirements (CUSTOMIZED score strategy, no admission) are checked
+    Per-table requirements (no admission) are checked
     where the option is built, in ``DynamicEmbTableOptions``. What can only be
     seen from the whole collection is checked here:
 
-    - every DynamicEmb table sets ``per_key_score``, or none does;
+    - every DynamicEmb table takes a score per key (score strategy
+      ``PRECISE_CUSTOMIZED``), or none does;
     - when it is set, every table is a DynamicEmb table and is row-wise sharded,
       the one sharding whose input distribution carries the scores along.
 
     Raises:
-        ValueError: some DynamicEmb tables set ``per_key_score`` and some do not,
+        ValueError: some DynamicEmb tables take a score per key and some do not,
             or tables that are not DynamicEmb's share the collection with ones
             that do.
         NotImplementedError: a table that sets it is not row-wise sharded.
@@ -52,14 +53,14 @@ def collect_per_key_score(params: Dict[str, ParameterSharding]) -> bool:
         if getattr(param_sharding, "dynamicemb_options", None)
     }
     enabled = sorted(
-        name for name, p in tables.items() if p.dynamicemb_options.per_key_score
+        name for name, p in tables.items() if p.dynamicemb_options.takes_score_per_key
     )
     if not enabled:
         return False
     not_dynamicemb = sorted(set(params) - set(tables))
     if not_dynamicemb:
         raise ValueError(
-            "A collection whose tables take a score per key (per_key_score=True) "
+            "A collection whose tables take a score per key (PRECISE_CUSTOMIZED) "
             f"may hold DynamicEmb tables only; {not_dynamicemb} are not. Put them "
             "in a collection of their own."
         )
@@ -67,7 +68,7 @@ def collect_per_key_score(params: Dict[str, ParameterSharding]) -> bool:
     if disabled:
         raise ValueError(
             "Within one collection either every DynamicEmb table sets "
-            f"per_key_score or none does; {enabled} set it and {disabled} do not. "
+            f"PRECISE_CUSTOMIZED or none does; {enabled} set it and {disabled} do not. "
             "Put the tables that take a score per key in a collection of their own."
         )
     not_row_wise = sorted(
@@ -77,7 +78,7 @@ def collect_per_key_score(params: Dict[str, ParameterSharding]) -> bool:
     )
     if not_row_wise:
         raise NotImplementedError(
-            f"per_key_score is supported for row-wise sharding only; {not_row_wise} "
+            f"PRECISE_CUSTOMIZED is supported for row-wise sharding only; {not_row_wise} "
             "are sharded otherwise."
         )
     return True
@@ -99,7 +100,7 @@ def require_scores(features: KeyedJaggedTensor) -> None:
     """
     if not isinstance(features, ScoredKeyedJaggedTensor):
         raise ValueError(
-            "This collection takes a score per key (per_key_score=True), so its "
+            "This collection takes a score per key (PRECISE_CUSTOMIZED), so its "
             "input must be a ScoredKeyedJaggedTensor; got "
             f"{type(features).__name__}. Build it with "
             "ScoredKeyedJaggedTensor.from_kjt(kjt, scores) after the last "
@@ -107,6 +108,6 @@ def require_scores(features: KeyedJaggedTensor) -> None:
         )
     if features.variable_stride_per_key():
         raise NotImplementedError(
-            "per_key_score does not support a variable batch size per key "
+            "PRECISE_CUSTOMIZED does not support a variable batch size per key "
             "(stride_per_key_per_rank)."
         )

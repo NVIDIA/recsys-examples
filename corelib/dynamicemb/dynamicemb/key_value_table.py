@@ -353,7 +353,11 @@ def get_score_policy(score_strategy):
         return ScoreSpec(name="timestamp", policy=ScorePolicy.GLOBAL_TIMER)
     elif score_strategy == DynamicEmbScoreStrategy.STEP:
         return ScoreSpec(name="step", policy=ScorePolicy.ASSIGN)
-    elif score_strategy == DynamicEmbScoreStrategy.CUSTOMIZED:
+    elif score_strategy in (
+        DynamicEmbScoreStrategy.CUSTOMIZED,
+        DynamicEmbScoreStrategy.PRECISE_CUSTOMIZED,
+    ):
+        # Stored the same way: what differs is only where a score comes from.
         return ScoreSpec(name="customized", policy=ScorePolicy.ASSIGN)
     elif score_strategy == DynamicEmbScoreStrategy.LFU:
         return ScoreSpec(name="frequency", policy=ScorePolicy.ACCUMULATE)

@@ -110,7 +110,7 @@ def sharding_takes_scores(sharding_infos: List[EmbeddingShardingInfo]) -> bool:
     """
     for info in sharding_infos:
         options = (info.fused_params or {}).get("dynamicemb_options")
-        if options is not None and options.per_key_score:
+        if options is not None and options.takes_score_per_key:
             return True
     return False
 

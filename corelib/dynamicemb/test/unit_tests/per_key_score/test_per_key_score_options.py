@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""``per_key_score``: what a table may combine it with, and what a collection
+"""``PRECISE_CUSTOMIZED``: what a table may combine it with, and what a collection
 must agree on.
 
 A table's own requirements are checked where the option is built; what only the
@@ -45,10 +45,14 @@ def _options(**kwargs) -> DynamicEmbTableOptions:
 
 @pytest.mark.parametrize(
     "score_strategy",
-    [S.CUSTOMIZED, (S.NO_EVICTION, S.CUSTOMIZED), (S.CUSTOMIZED, S.NO_EVICTION)],
+    [
+        S.PRECISE_CUSTOMIZED,
+        (S.NO_EVICTION, S.PRECISE_CUSTOMIZED),
+        (S.PRECISE_CUSTOMIZED, S.NO_EVICTION),
+    ],
 )
-def test_customized_may_take_a_score_per_key(score_strategy):
-    assert _options(per_key_score=True, score_strategy=score_strategy).per_key_score
+def test_precise_customized_takes_a_score_per_key(score_strategy):
+    assert _options(score_strategy=score_strategy).takes_score_per_key
 
 
 @pytest.mark.parametrize(
@@ -56,33 +60,43 @@ def test_customized_may_take_a_score_per_key(score_strategy):
     [
         S.TIMESTAMP,
         S.STEP,
+        S.CUSTOMIZED,
         S.LFU,
         (S.TIMESTAMP, S.LFU),
-        (S.LFU, S.TIMESTAMP),
+        (S.NO_EVICTION, S.CUSTOMIZED),
         S.NO_EVICTION,  # keeps no score at all
         None,
     ],
 )
-def test_other_strategies_cannot_take_a_score_per_key(score_strategy):
-    with pytest.raises(ValueError, match="needs score_strategy CUSTOMIZED"):
-        _options(per_key_score=True, score_strategy=score_strategy)
+def test_other_strategies_do_not_take_a_score_per_key(score_strategy):
+    assert not _options(score_strategy=score_strategy).takes_score_per_key
+
+
+@pytest.mark.parametrize("other", [S.LFU, S.TIMESTAMP, S.CUSTOMIZED])
+def test_it_cannot_be_combined_with_another_score(other):
+    with pytest.raises(NotImplementedError):
+        _options(score_strategy=(S.PRECISE_CUSTOMIZED, other))
 
 
 def test_cannot_be_combined_with_admission():
     with pytest.raises(ValueError, match="admit_strategy"):
         _options(
-            per_key_score=True, admit_strategy=ProbabilisticAdmissionStrategy(0.5)
+            score_strategy=S.PRECISE_CUSTOMIZED,
+            admit_strategy=ProbabilisticAdmissionStrategy(0.5),
         )
 
 
 def test_tables_differing_in_it_are_not_grouped():
-    on, off = _options(per_key_score=True), _options(per_key_score=False)
+    on = _options(score_strategy=S.PRECISE_CUSTOMIZED)
+    off = _options(score_strategy=S.CUSTOMIZED)
     assert on.get_grouped_key() != off.get_grouped_key()
     assert on != off
-    assert on == _options(per_key_score=True)
+    assert on == _options(score_strategy=S.PRECISE_CUSTOMIZED)
 
 
-def _table(sharding_type=RW, **option_kwargs):
+def _table(sharding_type=RW, per_key=False, **option_kwargs):
+    if per_key:
+        option_kwargs["score_strategy"] = S.PRECISE_CUSTOMIZED
     return SimpleNamespace(
         sharding_type=sharding_type, dynamicemb_options=_options(**option_kwargs)
     )
@@ -104,15 +118,15 @@ def test_a_collection_where_none_sets_it():
 
 
 def test_a_collection_where_every_table_sets_it():
-    params = {"a": _table(per_key_score=True), "b": _table(per_key_score=True)}
+    params = {"a": _table(per_key=True), "b": _table(per_key=True)}
     assert collect_per_key_score(params) is True
 
 
 def test_a_collection_where_only_some_set_it_is_refused():
     params = {
-        "emb_on_0": _table(per_key_score=True),
+        "emb_on_0": _table(per_key=True),
         "emb_off": _table(),
-        "emb_on_1": _table(per_key_score=True),
+        "emb_on_1": _table(per_key=True),
     }
     with pytest.raises(ValueError) as error:
         collect_per_key_score(params)
@@ -123,7 +137,7 @@ def test_a_collection_where_only_some_set_it_is_refused():
 
 @pytest.mark.parametrize("which", ["first", "last"])
 def test_the_refusal_does_not_depend_on_the_order(which):
-    tables = [_table(per_key_score=True), _table()]
+    tables = [_table(per_key=True), _table()]
     params = dict(zip("ab", tables if which == "first" else tables[::-1]))
     with pytest.raises(ValueError):
         collect_per_key_score(params)
@@ -131,8 +145,8 @@ def test_the_refusal_does_not_depend_on_the_order(which):
 
 def test_only_row_wise_tables_may_take_a_score_per_key():
     params = {
-        "rw_table": _table(per_key_score=True),
-        "tw_table": _table(sharding_type=TW, per_key_score=True),
+        "rw_table": _table(per_key=True),
+        "tw_table": _table(sharding_type=TW, per_key=True),
     }
     with pytest.raises(NotImplementedError) as error:
         collect_per_key_score(params)
@@ -141,8 +155,8 @@ def test_only_row_wise_tables_may_take_a_score_per_key():
     assert "rw_table" not in str(error.value)
 
 
-def test_a_collection_with_per_key_score_holds_dynamicemb_tables_only():
-    params = {"a": _table(per_key_score=True), "plain": _plain_table()}
+def test_a_collection_that_takes_a_score_per_key_holds_dynamicemb_tables_only():
+    params = {"a": _table(per_key=True), "plain": _plain_table()}
     with pytest.raises(ValueError) as error:
         collect_per_key_score(params)
     # It names the table that is not DynamicEmb's, so the one to move can be found.
