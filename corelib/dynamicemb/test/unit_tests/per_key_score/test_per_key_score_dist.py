@@ -425,10 +425,10 @@ def check_dump_load() -> None:
         shutil.rmtree(path, ignore_errors=True)
 
 
-def check_eval_needs_no_scores() -> None:
+def check_eval_needs_no_scores(use_index_dedup: bool = False) -> None:
     """Evaluation reads no score: an input without, or with, scores both go
     through, and neither changes what the tables hold."""
-    model, feature_names, table_names = _ec_model()
+    model, feature_names, table_names = _ec_model(use_index_dedup=use_index_dedup)
     device = torch.device(f"cuda:{torch.cuda.current_device()}")
     _train_on(model, 1, feature_names)
     held = _table_scores(model, table_names)
@@ -608,6 +608,8 @@ if __name__ == "__main__":
     check_ec_scores(reverse=True, use_index_dedup=True)
     check_dump_load()
     check_eval_needs_no_scores()
+    # The dedup before the all2all has no scores to merge in an input without.
+    check_eval_needs_no_scores(use_index_dedup=True)
     check_negative_score()
     check_pooled_scores()
     dist.barrier()

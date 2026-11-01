@@ -274,7 +274,7 @@ class ShardedDynamicEmbeddingCollection(ShardedEmbeddingCollection):
                         offsets=offsets,
                         values=indices,
                     )
-                    if self._per_key_score:
+                    if isinstance(input_feature, ScoredKeyedJaggedTensor):
                         dedup_features = ScoredKeyedJaggedTensor.from_kjt(
                             dedup_features, input_feature.scores()
                         )
@@ -290,9 +290,7 @@ class ShardedDynamicEmbeddingCollection(ShardedEmbeddingCollection):
                 segmented_range = get_table_range(offsets, d_table_offset)
 
                 # Prepare input_frequencies tensor to control frequency counting
-                needs_counters = (
-                    self._sharding_is_lfu[i] or self._sharding_has_admit[i]
-                )
+                needs_counters = self._sharding_is_lfu[i] or self._sharding_has_admit[i]
                 input_frequencies = None
                 if needs_counters:
                     input_frequencies = torch.empty(
@@ -334,7 +332,9 @@ class ShardedDynamicEmbeddingCollection(ShardedEmbeddingCollection):
                     offsets=new_offsets,
                     values=unique_keys,
                 )
-                if self._per_key_score:
+                # Evaluation may go without scores (see ``input_dist``), so what
+                # follows the keys is what the input carries.
+                if isinstance(input_feature, ScoredKeyedJaggedTensor):
                     # A key that repeats keeps the largest of its scores -- the
                     # rule the tables apply to repeats within a batch, so
                     # merging here and again there gives what merging once would.
