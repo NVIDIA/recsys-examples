@@ -410,7 +410,7 @@ def hier_of(model):
 @dataclass
 class Step:
     out: Dict[str, torch.Tensor]  # the output rows of each feature
-    plan: Optional[object]  # the call's plan, None on TorchRec's dists
+    result: Optional[object]  # the call's input dist result, None on TorchRec's dists
 
 
 def rows_of(case: Case, out) -> Dict[str, torch.Tensor]:
@@ -419,20 +419,24 @@ def rows_of(case: Case, out) -> Dict[str, torch.Tensor]:
 
 def input_dist(ec, kjt: torchrec.KeyedJaggedTensor):
     """A call's input dist, both waits: its context, the lookup's input, and
-    its plan (None on TorchRec's dists)."""
+    its result (None on TorchRec's dists)."""
     ctx = ec.create_context()
     dist_input = ec.input_dist(ctx, kjt).wait().wait()
-    return ctx, dist_input, getattr(ctx.sharding_contexts[rw_index(ec)], "plan", None)
+    return (
+        ctx,
+        dist_input,
+        getattr(ctx.sharding_contexts[rw_index(ec)], "hier_result", None),
+    )
 
 
 def plain_step(model, case: Case, kjt: torchrec.KeyedJaggedTensor, weight) -> Step:
     """One call: its forward, then its backward."""
     ec = sharded_ec(model)
-    ctx, dist_input, plan = input_dist(ec, kjt)
+    ctx, dist_input, result = input_dist(ec, kjt)
     out = ec.compute_and_output_dist(ctx, dist_input).wait()
     rows = rows_of(case, out)
     weighted_sum(out, weight, case.features).backward()
-    return Step(rows, plan)
+    return Step(rows, result)
 
 
 def interleaved(model, case: Case, batches, weight) -> List[Step]:
@@ -442,9 +446,9 @@ def interleaved(model, case: Case, batches, weight) -> List[Step]:
     for first in range(0, len(batches), 2):
         pending = []
         for kjt in batches[first : first + 2]:
-            ctx, dist_input, plan = input_dist(ec, kjt)
+            ctx, dist_input, result = input_dist(ec, kjt)
             out = ec.compute_and_output_dist(ctx, dist_input).wait()
-            pending.append((out, Step(rows_of(case, out), plan)))
+            pending.append((out, Step(rows_of(case, out), result)))
         for out, step in pending:
             weighted_sum(out, weight, case.features).backward()
             steps.append(step)
@@ -511,7 +515,7 @@ def run_case(case: Case, checks: Checks, rank: int, world_size: int, local_size:
     ample = run(ample_model, case, batches, weight)
     if case.placement:
         check_placement(case, checks, ample_model, rank, "ample's")
-    needs = [step.plan.needs() for step in ample]
+    needs = [step.result.needs for step in ample]
     quiesce(ample_model)
     del ample_model
     capacity = tight_capacity(case, needs)
@@ -542,7 +546,7 @@ def run_case(case: Case, checks: Checks, rank: int, world_size: int, local_size:
         return True
 
     checks.check(f"{label}: fwd", same_rows(tight))
-    fell = [step for step, done in enumerate(tight) if done.plan is None]
+    fell = [step for step, done in enumerate(tight) if done.result is None]
     checks.check(f"{label}: fallback {fell}", fell == list(case.expected))
     checks.check(f"{label}: same calls everywhere", same_everywhere(fell))
     said = [

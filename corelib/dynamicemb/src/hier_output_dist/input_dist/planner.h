@@ -27,9 +27,9 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 #include <utility>
 #include <vector>
 
-#include "hier_output_dist/common.h"
-#include "hier_output_dist/config.h"
-#include "hier_output_dist/window.h"
+#include "hier_output_dist/common/common.h"
+#include "hier_output_dist/common/config.h"
+#include "hier_output_dist/common/window.h"
 
 namespace dyn_emb {
 namespace hier_output_dist {
@@ -328,7 +328,7 @@ struct ProxyPlan {
   at::Tensor reducer_start;     // int32 [remote_keys + 1]: key u's entries are
                                 // reducer_entries[reducer_start[u] .. reducer_start[u + 1])
   at::Tensor reducer_entries;   // int64 [remote_keys]: a slot and the flag of the push task
-                                // that fills it (formats.h)
+                                // that fills it (common.h)
 };
 // Step 3: each requester's push order (one stable sort of the push key),
 // its push tables, and the reducer list. Writes remote_map's positions and
@@ -425,11 +425,11 @@ OwnerTables owner_tables(const RailLayout &rail, const at::Tensor &own_starts,
                          const at::Tensor &rail_keys, const at::Tensor &other_nodes,
                          const Sizes &sizes);
 
-// The requester's part of a call across nodes (the in channel's side
-// stream): its maps to the rows of its keys, from what its node's proxies
-// published (two peer_gathers: their headers, and its rows' words of their
-// remote_map) and where its owners on its node put its cells. ATen ops;
-// nothing waits for the device.
+// The requester's part of a call across nodes (the in channel): its maps to
+// the rows of its keys, from what its node's proxies published (two
+// peer_gathers: their headers, and its rows' words of their remote_map) and
+// where its owners on its node put its cells. ATen ops; nothing waits for
+// the device.
 
 // What a peer_gather reads (GatherFrom says which words): for each item a
 // node peer (negative: none) and its first int32 word to read there.

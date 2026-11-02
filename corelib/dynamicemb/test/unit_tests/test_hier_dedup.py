@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""The planner's steps across nodes (``src/hier_output_dist/planner.h``) on
+"""The planner's steps across nodes (``src/hier_output_dist/input_dist/planner.h``) on
 one GPU, on plain tensors: the proxy's node dedup, rounds, slots and push order
 (``hier_output_dist_proxy_plan``), the rail's layout, status, owner tables
 and the proxy's backward put list (``hier_output_dist_rail_tables``), and the

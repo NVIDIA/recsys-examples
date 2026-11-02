@@ -20,10 +20,10 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 
 #include <cstdint>
 
-#include "hier_output_dist/args.cuh"
-#include "hier_output_dist/common.h"
-#include "hier_output_dist/device.cuh"
-#include "hier_output_dist/window.h"
+#include "hier_output_dist/common/common.h"
+#include "hier_output_dist/common/device.cuh"
+#include "hier_output_dist/common/window.h"
+#include "hier_output_dist/output_dist/args.cuh"
 
 namespace dyn_emb {
 namespace hier_output_dist {
@@ -160,30 +160,32 @@ struct OutTimeline {
 
 // The call's tables as a requester's warps read them.
 
-// What a requester's warps read of the call: from the plan, the block starts
-// and its tables of the node's proxies (their rounds, round tables and its
-// push tables there); from the window, the node peers' buffers and words,
-// each the same place as in this rank's copy (layout()). The one word per
-// proxy a CTA keeps, half_seen, is in its shared memory. Every thread of a
-// warp makes the same one.
+// What a requester's warps read of the call: from the plan (what both
+// kernels' plans hold), the block starts and its tables of the node's
+// proxies (their rounds and its push tables there); from the window, the
+// node peers' buffers and words, each the same place as in this rank's copy
+// (layout()). The one word per proxy a CTA keeps, half_seen, is in its
+// shared memory. Every thread of a warp makes the same one.
 struct OutTables {
   const OutArgs &args;
+  const PlanView &plan;
   NodeWindow node;
   int max_rounds;  // the most rounds of the node's proxies (1 on one node)
   bool staged;     // index dedup's heavy rows at a proxy of more than one round
 
-  __device__ explicit OutTables(const OutArgs &out_args)
-      : args(out_args), node(out_args.window, out_args.topo.local_rank), max_rounds(1) {
+  __device__ OutTables(const OutArgs &out_args, const PlanView &call_plan)
+      : args(out_args),
+        plan(call_plan),
+        node(out_args.window, out_args.topo.local_rank),
+        max_rounds(1) {
     if (args.topo.num_nodes > 1)
       for (int proxy = 0; proxy < args.topo.local_size; ++proxy)
         max_rounds = max(max_rounds, rounds(proxy));
-    staged = args.plan.fanout.exp_off != nullptr && max_rounds > 1 && args.plan.fanout.count[1] > 0;
+    staged = plan.fanout.exp_off != nullptr && max_rounds > 1 && plan.fanout.count[1] > 0;
   }
   __device__ __forceinline__ WindowLayout layout() const { return node.layout(args); }
   // A same-node proxy's rounds.
-  __device__ __forceinline__ int rounds(int proxy) const {
-    return (int)args.plan.proxy_rounds[proxy];
-  }
+  __device__ __forceinline__ int rounds(int proxy) const { return (int)plan.proxy_rounds[proxy]; }
   // Node peers' buffers and words.
   __device__ __forceinline__ char *lookup_rows(int peer) const {
     return node.peer(layout().rows.lookup_rows(), peer);
@@ -220,18 +222,13 @@ struct OutTables {
   // and the next round's entry, which holds the ends.
   __device__ __forceinline__ void req_of(int proxy, int rnd, ReqEntry &entry,
                                          ReqEntry &next) const {
-    const ReqEntry *push_entry = args.plan.push_entry(proxy, rnd);
+    const ReqEntry *push_entry = plan.push_entry(proxy, rnd);
     entry = push_entry[0];
     next = push_entry[1];
   }
-  // Where an owner node's node-unique keys of a round sit in a proxy's
-  // proxy_rows.
-  __device__ __forceinline__ RoundPiece piece_of(int proxy, int rnd, int owner_node) const {
-    return args.plan.piece(proxy, rnd, owner_node);
-  }
   // The owner of one of this rank's rows (its bucketized rows by owner).
   __device__ __forceinline__ int owner_of(int64_t row) const {
-    return seg_search(args.plan.block_start, args.topo.world_size, row);
+    return seg_search(plan.block_start, args.topo.world_size, row);
   }
 };
 

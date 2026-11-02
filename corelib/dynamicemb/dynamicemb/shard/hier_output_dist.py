@@ -84,21 +84,23 @@ def _first_difference(every: List[Dict]) -> Optional[str]:
 
 
 class DynamicEmbSequenceShardingContext(SequenceShardingContext):
-    """TorchRec's sequence sharding context, plus the plan of a call that
-    took the hierarchical dist (None on TorchRec's dists).
+    """TorchRec's sequence sharding context, plus the result of the input
+    dist of a call that took the hierarchical dist (``hier_result``: the
+    owner's KJT and the output dist's plans). It is None on TorchRec's dists,
+    and once the output dist took it.
 
     Not a dataclass: up to TorchRec 1.6 the parent's ``__init__`` is written by
     hand, and a generated one would accept only this class's own fields.
     """
 
-    def __init__(self, *args, plan=None, **kwargs) -> None:
+    def __init__(self, *args, hier_result=None, **kwargs) -> None:
         super().__init__(*args, **kwargs)
-        self.plan = plan
+        self.hier_result = hier_result
 
     def record_stream(self, stream: torch.Stream) -> None:
         super().record_stream(stream)
-        if self.plan is not None:
-            self.plan.record_stream(stream)
+        if self.hier_result is not None:
+            self.hier_result.record_stream(stream)
 
 
 class HierSharding:
@@ -168,8 +170,8 @@ class HierSharding:
         self._weights = False  # the requesters' keys carry weights
         self._out_weights = False  # the owner's KJT carries weights
         # The owner's KJT of each call on this path, as its second wait
-        # returned it, and the call's plan (owns()).
-        self._plans: "weakref.WeakKeyDictionary[KeyedJaggedTensor, object]" = (
+        # returned it, and the rows its lookup writes (owns()).
+        self._num_recv: "weakref.WeakKeyDictionary[KeyedJaggedTensor, int]" = (
             weakref.WeakKeyDictionary()
         )
         # While a lookup runs (lookup()): the call's rows, and how many of
@@ -280,38 +282,38 @@ class HierSharding:
         second wait returned it. Its lookup then writes ``lookup_rows``,
         whatever the module's mode (a pipeline may switch it between a call's
         input dist and its lookup)."""
-        return kjt in self._plans
+        return kjt in self._num_recv
 
-    def owner_kjt(self, plan, keys: List[str]) -> KeyedJaggedTensor:
-        """The owner's KJT of a call that fits."""
-        length_per_key = plan.length_per_key
+    def owner_kjt(self, result, keys: List[str]) -> KeyedJaggedTensor:
+        """The owner's KJT of a call that fits (its input dist's result)."""
+        length_per_key = result.length_per_key
         kjt = KeyedJaggedTensor(
             keys=keys,
-            values=plan.values,
-            weights=plan.weights,
-            lengths=plan.lengths,
-            offsets=plan.offsets,
-            stride=plan.num_sources,
+            values=result.values,
+            weights=result.weights,
+            lengths=result.lengths,
+            offsets=result.offsets,
+            stride=result.num_sources,
             length_per_key=length_per_key,
             offset_per_key=[0] + list(accumulate(length_per_key)),
         )
-        self._plans[kjt] = plan
+        self._num_recv[kjt] = result.num_recv
         return kjt
 
-    def fell_back(self, plan) -> None:
+    def fell_back(self, result) -> None:
         """Counts a call that did not fit, and warns at the first such call
         and then at every power of two of them."""
         self.fallbacks += 1
         if self.fallbacks & (self.fallbacks - 1):
             return
-        needs, capacities = plan.needs(), self.op.capacities()
+        needs, capacities = result.needs, self.op.capacities()
         warnings.warn(
             f'output_dist="{self._asked}": a call does not fit the capacities, so it '
             f"runs on TorchRec's dists ({self.fallbacks} calls so far); raise "
             "output_dist_capacity's "
             + ", ".join(
                 f"{name} from {capacities[name]} to at least {needs[name]}"
-                for name in plan.overflows()
+                for name in result.overflows
                 if needs[name] > capacities[name]
             )
         )
@@ -338,7 +340,7 @@ class HierSharding:
         outputs come back as those rows, flat, without a copy. The rows are
         valid until the next out kernel. See docs/hier_output_dist.md,
         section 11.2."""
-        rows = self.op.lookup_rows(self._plans[kjt])
+        rows = self.op.lookup_rows(self._num_recv[kjt])
         # The lookup may run on a stream of its own (TorchRec's fused
         # pipeline), on which nobody else records the KJT's use.
         kjt.record_stream(torch.cuda.current_stream())
@@ -392,40 +394,42 @@ class _OutputAwaitable(Awaitable[torch.Tensor]):
 
 class _OutputFunction(torch.autograd.Function):
     """The output dist of a call on this path: ``op.forward`` (``fwd_kernel``)
-    in the forward, ``op.backward`` (``bwd_kernel``) in the backward, whose
-    gradient for the lookup output is ``lookup_grad``, a view of
-    ``lookup_rows`` valid until the next lookup. The backward's maps, which
-    the forward returns, are saved tensors: autograd keeps them for a second
-    backward (``retain_graph``) and frees them after the last one."""
+    with the forward's plan in the forward, ``op.backward`` (``bwd_kernel``)
+    with the backward's plan in the backward, whose gradient for the lookup
+    output is ``lookup_grad``, a view of ``lookup_rows`` valid until the next
+    lookup. The backward's plan is saved tensors: autograd keeps them for a
+    second backward (``retain_graph``) and frees them after the last one."""
 
     @staticmethod
-    def forward(ctx, lookup_out: torch.Tensor, plan, op) -> torch.Tensor:
+    def forward(ctx, lookup_out: torch.Tensor, fwd_plan, bwd_plan, op) -> torch.Tensor:
         # The out kernels may run on a stream of their own (TorchRec's fused
-        # pipeline), on which nobody else records the plan's use; the plan
-        # lets go of the forward's tables once the kernel is queued, and the
+        # pipeline), on which nobody else records the plans' use; the
         # backward runs on this stream too.
-        plan.record_stream(torch.cuda.current_stream())
-        out, maps = op.forward(plan, lookup_out)
-        ctx.save_for_backward(*maps)
-        ctx.plan, ctx.op = plan, op
+        stream = torch.cuda.current_stream()
+        fwd_plan.record_stream(stream)
+        bwd_plan.record_stream(stream)
+        out = op.forward(fwd_plan, lookup_out)
+        ctx.save_for_backward(*bwd_plan.tensors())
+        ctx.counts, ctx.op = bwd_plan.counts(), op
         return out
 
     @staticmethod
     def backward(ctx, grad_out: torch.Tensor):
+        from dynamicemb_extensions import HierBwdPlan
+
+        bwd_plan = HierBwdPlan.of(list(ctx.saved_tensors), ctx.counts)
         # Read at backward time, as TorchRec does: users flip it at runtime.
-        lookup_grad = ctx.op.backward(
-            ctx.plan, grad_out, ctx.saved_tensors, comm_ops.GRADIENT_DIVISION
-        )
-        return lookup_grad, None, None
+        lookup_grad = ctx.op.backward(bwd_plan, grad_out, comm_ops.GRADIENT_DIVISION)
+        return lookup_grad, None, None, None
 
 
 class RwSequenceHierEmbeddingDist(
     BaseEmbeddingDist[SequenceShardingContext, torch.Tensor, torch.Tensor]
 ):
     """The output dist of a sharding on the hierarchical dist. A call on that
-    path moves its rows by its plan (``ctx.plan``) on the current stream.
-    Other calls (eval, or a call that did not fit) take TorchRec's
-    ``RwSequenceEmbeddingDist``."""
+    path moves its rows by the plans its input dist made
+    (``sharding_ctx.hier_result``), on the current stream. Other calls (eval,
+    or a call that did not fit) take TorchRec's ``RwSequenceEmbeddingDist``."""
 
     def __init__(
         self,
@@ -446,10 +450,16 @@ class RwSequenceHierEmbeddingDist(
         local_embs: torch.Tensor,
         sharding_ctx: Optional[DynamicEmbSequenceShardingContext] = None,
     ) -> Awaitable[torch.Tensor]:
-        if sharding_ctx.plan is None:
+        result = sharding_ctx.hier_result
+        if result is None:
             return self._torchrec(local_embs, sharding_ctx)
+        # The output dist takes the plans: the forward's go once its kernel is
+        # queued, the backward's once the last backward is done.
+        sharding_ctx.hier_result = None
         return _OutputAwaitable(
-            _OutputFunction.apply(local_embs, sharding_ctx.plan, self._hier.op)
+            _OutputFunction.apply(
+                local_embs, result.fwd_plan, result.bwd_plan, self._hier.op
+            )
         )
 
 

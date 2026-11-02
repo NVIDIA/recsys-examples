@@ -97,7 +97,7 @@ sys.path.insert(
 )
 from benchmark_utils import hier_capacities, hier_needs, init_distributed  # noqa: E402
 
-HEAVY = 64  # kHeavy in src/hier_output_dist/common.h
+HEAVY = 64  # kHeavy in src/hier_output_dist/common/common.h
 NUM_EMBEDDINGS = 1 << 20
 # Nodes of the run (main sets it): across nodes a requester's keys for an
 # owner on another node reach it once per (node, table, key), and so do the
@@ -692,7 +692,7 @@ class Run(NamedTuple):
     ctx: object
     syncs: int  # host syncs in the input dist (-1: not counted)
     totals: bool  # the KJT construct_jagged_tensors reads had length_per_key
-    plan: object  # the call's plan on the op (None: TorchRec's dists)
+    result: object  # the call's input dist result on the op (None: TorchRec's dists)
 
 
 def counted(fn: Callable):
@@ -726,9 +726,9 @@ def run_model(ec, kjt, sync_count: bool) -> Run:
     else:
         dist_input = input_dist()
     totals = jagged_input(ec, ctx)._length_per_key is not None
-    plan = getattr(ctx.sharding_contexts[rw_index(ec)], "plan", None)
+    result = getattr(ctx.sharding_contexts[rw_index(ec)], "hier_result", None)
     out = ec.compute_and_output_dist(ctx, dist_input).wait()
-    return Run(out, ctx, syncs, totals, plan)
+    return Run(out, ctx, syncs, totals, result)
 
 
 def totals_right(kjt: KeyedJaggedTensor) -> bool:
@@ -1062,7 +1062,7 @@ def run_case(
             and state.takes_hier_dist is True
             and groups == (2 if case.groups or case.mixed else 1)
         )
-        ok_op = (hier_run.plan is None) == bool(case.plain) and (
+        ok_op = (hier_run.result is None) == bool(case.plain) and (
             state is None or state.fallbacks == 0
         )
         ok_eval = True
@@ -1079,7 +1079,7 @@ def run_case(
                 )
             ok_eval = (
                 same_outputs(case, eval_ref.out, eval_hier.out, exact)
-                and eval_hier.plan is None
+                and eval_hier.result is None
             )
             for model in (pair.ref_model, pair.hier_model):
                 model.train()
@@ -1163,7 +1163,7 @@ def run_windows(rank: int, world_size: int, local_size: int, log: Callable) -> i
             hier_run.out,
             iteration == 0 or case.exact(world_size),
         )
-        checks["op"] = hier_run.plan is not None
+        checks["op"] = hier_run.result is not None
         checks["same windows"] = pair.state.op.memory() == memory
         failures += report(
             f"windows, call {iteration} (batch {case.batch}, len {case.max_len})",
@@ -1386,8 +1386,9 @@ def run_no_sync(rank: int, world_size: int, local_size: int, log: Callable) -> i
             first = ec.input_dist(ctx, kjt).wait()
         finally:
             torch.cuda.set_sync_debug_mode("default")
-        out = ec.compute_and_output_dist(ctx, first.wait()).wait()
-        on_op = ctx.sharding_contexts[rw_index(ec)].plan is not None
+        dist_input = first.wait()
+        on_op = ctx.sharding_contexts[rw_index(ec)].hier_result is not None
+        out = ec.compute_and_output_dist(ctx, dist_input).wait()
         fits = capacity > 64
         checks = {
             "path": on_op == fits and hier_of(ec).fallbacks == int(not fits),
@@ -1462,7 +1463,7 @@ def orders_of(
             hier_run.out,
             iteration == 0 or exact,
         )
-        checks["op"] = hier_run.plan is not None
+        checks["op"] = hier_run.result is not None
         iteration += 1
         return report(f"{case.name}: step after {name}", checks, log)
 
@@ -1474,7 +1475,7 @@ def orders_of(
         hier_run = run_model(pair.hier, batch(iteration), False)
     checks["no-grad training forward"] = (
         same_outputs(case, ref_run.out, hier_run.out, exact)
-        and hier_run.plan is not None
+        and hier_run.result is not None
     )
     failures += report(f"{case.name}: forward after forward", checks, log)
     failures += step("forward after forward")
@@ -1579,7 +1580,7 @@ def run_determinism(rank: int, world_size: int, local_size: int, log: Callable) 
         grads, on_op = [], True
         for _ in range(2):
             run = run_model(ec, batch_of(case, case_idx, 0, rank, world_size), False)
-            on_op = on_op and run.plan is not None
+            on_op = on_op and run.result is not None
             gen = torch.Generator().manual_seed(rank)  # the same both times
             values = [run.out[feature].values().float() for feature in case.features]
             loss = sum(
@@ -1673,7 +1674,7 @@ def run_teardown_credits(
     calls = [batch_of(case, 121, 0, rank, world_size)]
     model = fused_model(case, world_size, local_size, calls)
     run = run_model(sharded_ec(model), batch_of(case, 121, 0, rank, world_size), False)
-    on_op = run.plan is not None
+    on_op = run.result is not None
     torch.cuda.synchronize()
     err: List[str] = []
     with fd2_into(err):

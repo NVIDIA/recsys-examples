@@ -23,11 +23,11 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 
 #include <cstdint>
 
-#include "hier_output_dist/args.cuh"
-#include "hier_output_dist/common.h"
-#include "hier_output_dist/device.cuh"
-#include "hier_output_dist/out_kernels.cuh"
-#include "hier_output_dist/window.h"
+#include "hier_output_dist/common/common.h"
+#include "hier_output_dist/common/device.cuh"
+#include "hier_output_dist/common/window.h"
+#include "hier_output_dist/output_dist/args.cuh"
+#include "hier_output_dist/output_dist/out_kernels.cuh"
 
 namespace dyn_emb {
 namespace hier_output_dist {
@@ -169,7 +169,7 @@ struct Pull {
 // relay says every such row of the warp has landed (an owner node's rows land
 // in the order of its node-unique keys, round after round). Every lane of
 // the warp.
-__device__ __forceinline__ void wait_landed_warp(const OutArgs &args, const OutTables &tables,
+__device__ __forceinline__ void wait_landed_warp(const FwdArgs &args, const OutTables &tables,
                                                  int proxy, bool live, int owner_node,
                                                  const RoundPiece &piece, int32_t src, int lane) {
   const unsigned on = __ballot_sync(kFull, live);
@@ -198,9 +198,9 @@ __device__ __forceinline__ void wait_landed_warp(const OutArgs &args, const OutT
 // from that proxy is in (ready[rail]) the sub-task copies it on from there
 // (staged). Every lane of the warp.
 template <bool kMulti>
-__device__ void heavy_sub_warp(const OutArgs &args, const OutTables &tables, int64_t sub, bool late,
+__device__ void heavy_sub_warp(const FwdArgs &args, const OutTables &tables, int64_t sub, bool late,
                                int lane) {
-  const OutPlan &plan = args.plan;
+  const FwdPlanView &plan = args.plan;
   const Fanout &fanout = plan.fanout;
   const int local_size = args.topo.local_size, row_bytes = args.row_bytes;
   const int64_t dedup_row = fanout.sub[2 * sub], first = fanout.exp_off[dedup_row];
@@ -213,25 +213,25 @@ __device__ void heavy_sub_warp(const OutArgs &args, const OutTables &tables, int
              staged = remote && tables.rounds(rail) > 1;
   if (remote != late) return;
   const char *src =
-      remote ? tables.proxy_row(rail, plan.rows[row]) : tables.lookup_row(rail, plan.rows[row]);
+      remote ? tables.proxy_row(rail, plan.src[row]) : tables.lookup_row(rail, plan.src[row]);
   int64_t from = begin;
   if (staged) {
     if (lane == 0) {
       Spin spin(args.timeout_ns);
-      while ((int64_t)ld_acquire_gpu((const uint64_t *)&plan.ready[rail]) <
+      while ((int64_t)ld_acquire_gpu((const uint64_t *)&args.ready[rail]) <
              plan.push_order_off[rail + 1] - plan.push_order_off[rail])
         spin.pause("rows pulled from a proxy", rail, dedup_row, args.topo.rank);
     }
     __syncwarp();
-    src = plan.out + (int64_t)fanout.exp_idx[first] * row_bytes;
+    src = args.out + (int64_t)fanout.exp_idx[first] * row_bytes;
     from = max(begin, first + 1);
   } else if (remote) {
-    wait_landed_warp(args, tables, rail, lane == 0, owner_node,
-                     tables.piece_of(rail, 0, owner_node), plan.rows[row], lane);
+    wait_landed_warp(args, tables, rail, lane == 0, owner_node, plan.piece(rail, 0, owner_node),
+                     plan.src[row], lane);
   }
   const OutTimeline timeline(args);
   const unsigned long long start = timeline.on() ? now_ns() : 0;
-  fanout_row(src, from, end, args.vec, lane, fanout.exp_idx, plan.out, row_bytes);
+  fanout_row(src, from, end, args.vec, lane, fanout.exp_idx, args.out, row_bytes);
   if (timeline.on() && !staged && lane == 0) {
     // the row is read once, from a node peer's window or this rank's own
     const bool peer = rail != args.topo.local_rank;
@@ -241,17 +241,17 @@ __device__ void heavy_sub_warp(const OutArgs &args, const OutTables &tables, int
 
 // Row task `index` of the node's owners: its rows of the owner's
 // lookup_rows. False when the task is past the end of that owner's block.
-__device__ __forceinline__ bool local_pull(const OutArgs &args, const OutTables &tables,
+__device__ __forceinline__ bool local_pull(const FwdArgs &args, const OutTables &tables,
                                            const LocalRows &local_rows, int64_t index, int lane,
                                            Pull &pull) {
-  const OutPlan &plan = args.plan;
+  const FwdPlanView &plan = args.plan;
   const char *src = nullptr;
   int64_t out_row = 0;
   const RowTask job = local_rows.task(index);
   if (job.count == 0) return false;
   if (lane < job.count) {
     const int64_t row = job.row0 + lane;
-    src = tables.lookup_row(job.owner, plan.rows[row]);
+    src = tables.lookup_row(job.owner, plan.src[row]);
     out_row = plan.inv[row];
   }
   pull.src = src;
@@ -265,10 +265,10 @@ __device__ __forceinline__ bool local_pull(const OutArgs &args, const OutTables 
 // turn from this rank's own one, its rows of this rank's push order there,
 // once they have landed. False when there is nothing to pull. Every lane of
 // the warp.
-__device__ __forceinline__ bool remote_pull_warp(const OutArgs &args, const OutTables &tables,
+__device__ __forceinline__ bool remote_pull_warp(const FwdArgs &args, const OutTables &tables,
                                                  const FwdCursor &cursor, int64_t task, int lane,
                                                  Pull &pull) {
-  const OutPlan &plan = args.plan;
+  const FwdPlanView &plan = args.plan;
   const int local_size = args.topo.local_size, me = args.topo.local_rank;
   const char *src = nullptr;
   int64_t out_row = 0;
@@ -298,8 +298,8 @@ __device__ __forceinline__ bool remote_pull_warp(const OutArgs &args, const OutT
   if (lane < num_rows) {
     const int32_t row = plan.push_order[pos0 + lane];
     owner_node = tables.owner_of(row) / local_size;
-    at = plan.rows[row];
-    piece = tables.piece_of(proxy, rnd, owner_node);
+    at = plan.src[row];
+    piece = plan.piece(proxy, rnd, owner_node);
     src = tables.proxy_row(proxy, at);
     out_row = plan.inv[row];
   }
@@ -316,9 +316,9 @@ __device__ __forceinline__ bool remote_pull_warp(const OutArgs &args, const OutT
 
 // Every lane of the warp: the task's rows into the output; at a proxy of
 // more than one round, counted pulled; and the task into the timeline.
-__device__ __forceinline__ void pull_warp(const OutArgs &args, const OutTables &tables,
+__device__ __forceinline__ void pull_warp(const FwdArgs &args, const OutTables &tables,
                                           const Pull &pull, int lane) {
-  const OutPlan &plan = args.plan;
+  const FwdPlanView &plan = args.plan;
   const Fanout &fanout = plan.fanout;
   const int me = args.topo.local_rank, row_bytes = args.row_bytes;
   const char *src = pull.src;
@@ -328,10 +328,10 @@ __device__ __forceinline__ void pull_warp(const OutArgs &args, const OutTables &
   const OutTimeline timeline(args);
   const unsigned long long start = timeline.on() ? now_ns() : 0;
   if (fanout.exp_off != nullptr) {
-    warp_copy_fanout(src, out_row, num_rows, args.vec, lane, fanout, plan.out, row_bytes, count);
+    warp_copy_fanout(src, out_row, num_rows, args.vec, lane, fanout, args.out, row_bytes, count);
   } else {
     char *dst = nullptr;
-    if (lane < num_rows) dst = plan.out + out_row * row_bytes;
+    if (lane < num_rows) dst = args.out + out_row * row_bytes;
     if (shared)
       warp_copy_shared(src, dst, num_rows, args.vec, lane);
     else
@@ -343,7 +343,7 @@ __device__ __forceinline__ void pull_warp(const OutArgs &args, const OutTables &
     __syncwarp();
     if (lane == 0) {
       red_release_sys(tables.done(peer, rnd), (uint64_t)num_rows);
-      if (tables.staged) red_release_gpu((uint64_t *)&plan.ready[peer], (uint64_t)num_rows);
+      if (tables.staged) red_release_gpu((uint64_t *)&args.ready[peer], (uint64_t)num_rows);
     }
   }
   if (timeline.on()) {
@@ -392,10 +392,10 @@ namespace fwd {
 // rows it published (landed_rows, tagged with this out_seq) and fwd_tot.
 struct ProxyRelay {
   // Every lane of the relay warp.
-  __device__ static void run(const OutArgs &args);
+  __device__ static void run(const FwdArgs &args);
 };
 
-__device__ void ProxyRelay::run(const OutArgs &args) {
+__device__ void ProxyRelay::run(const FwdArgs &args) {
   const int lane = threadIdx.x & 31, num_nodes = args.topo.num_nodes, node = args.topo.node,
             local_size = args.topo.local_size;
   const WindowLayout window = NodeWindow(args.window, args.topo.local_rank).layout(args);
@@ -485,10 +485,10 @@ __device__ void ProxyRelay::run(const OutArgs &args) {
 // their own. No node barrier is needed first.
 struct OwnerIssuer {
   // Every lane of the issuer warp.
-  __device__ static void run(const OutArgs &args);
+  __device__ static void run(const FwdArgs &args);
 };
 
-__device__ void OwnerIssuer::run(const OutArgs &args) {
+__device__ void OwnerIssuer::run(const FwdArgs &args) {
   const int lane = threadIdx.x & 31, num_nodes = args.topo.num_nodes, node = args.topo.node;
   ncclGin rows(args.dev, kCtxFwd), cred(args.dev, kCtxCredit);
   const ncclTeam rail = ncclTeamRail(args.dev);
@@ -547,7 +547,7 @@ __device__ void OwnerIssuer::run(const OutArgs &args) {
 }  // namespace fwd
 
 // The output dist: one cooperative kernel per direction on the caller's
-// stream, which only moves rows, by the maps the input dist made.
+// stream, which only moves rows, by the plans the input dist made.
 //   fwd_kernel (here)          every requester pulls its rows from the lookup
 //                              output (lookup_rows) of each owner of its node,
 //                              itself included, into its output; across nodes
@@ -562,7 +562,7 @@ __device__ void OwnerIssuer::run(const OutArgs &args) {
 //                              which sum each key's and put the sums into the
 //                              owners' lookup_rows.
 // Both share the out channel (out_seq, its node barrier word) and these steps
-// (protocol.cuh, schedule.cuh):
+// (out_kernels.cuh):
 //   entry  CTA 0 publishes out_seq and every CTA waits until all node peers
 //          have: a peer there has ended its lookup (which wrote its
 //          lookup_rows before the kernel) and every earlier out kernel;
@@ -602,7 +602,7 @@ namespace fwd {
 // (bwd_ready), and the proxy grants each rail owner rounds 0 and 1 of
 // proxy_rows. (At the end of a backward the proxy's issuer sends its grants
 // itself, bwd::ProxyIssuer.)
-__device__ void next_kernel_credits_warp(const OutArgs &args) {
+__device__ void next_kernel_credits_warp(const FwdArgs &args) {
   const int lane = threadIdx.x & 31, num_nodes = args.topo.num_nodes, node = args.topo.node;
   ncclGin cred(args.dev, kCtxCredit);
   const WindowLayout window = NodeWindow(args.window, args.topo.local_rank).layout(args);
@@ -627,7 +627,7 @@ __device__ void next_kernel_credits_warp(const OutArgs &args) {
 // sends the credits for the next out kernel (not compiled in on one node,
 // kMulti false). Every thread of the last CTA.
 template <bool kMulti>
-__device__ __forceinline__ void exit(const OutArgs &args) {
+__device__ __forceinline__ void exit(const FwdArgs &args) {
   const int tid = threadIdx.x;
   const OutTimeline timeline(args);
   const NodeWindow node(args.window, args.topo.local_rank);
@@ -652,13 +652,13 @@ __device__ __forceinline__ void exit(const OutArgs &args) {
 // nodes' node-unique keys into their rail proxies' proxy_rows, from which the
 // requesters pull those. Roles: across nodes the last two warps of CTA 0 are
 // the proxy's relay and the owner's issuer, which skip the entry barrier;
-// every other warp requests (fwd_requester.cuh): it zeroes the counters this
+// every other warp requests (the fwd:: steps above): it zeroes the counters this
 // kernel counts from 0 (before this rank publishes its out_seq), passes the
 // entry barrier and takes its tasks. Every CTA then arrives, and the last one
 // ends the forward for this rank (fwd::exit).
 template <bool kMulti>
-__global__ void __launch_bounds__(kThreads, 1) fwd_kernel(OutArgs args) {
-  const OutPlan &plan = args.plan;
+__global__ void __launch_bounds__(kThreads, 1) fwd_kernel(FwdArgs args) {
+  const FwdPlanView &plan = args.plan;
   const Fanout &fanout = plan.fanout;
   const int local_size = args.topo.local_size, num_nodes = kMulti ? args.topo.num_nodes : 1,
             node = args.topo.node, me = args.topo.local_rank;
@@ -672,12 +672,12 @@ __global__ void __launch_bounds__(kThreads, 1) fwd_kernel(OutArgs args) {
     else
       fwd::OwnerIssuer::run(args);
   } else {
-    const OutTables tables(args);
+    const OutTables tables(args, args.plan);
     const int64_t heavy = fanout.exp_off != nullptr ? fanout.count[1] : 0;
     if (num_nodes > 1 && heavy > 0 && blockIdx.x == 0) {
       // Counters this kernel counts from 0, before this rank publishes its
       // out_seq: everything that counts on them runs after the entry.
-      for (int proxy = tid; proxy < local_size; proxy += workers) plan.ready[proxy] = 0;
+      for (int proxy = tid; proxy < local_size; proxy += workers) args.ready[proxy] = 0;
       cta_sync(workers);
     }
     pass_entry_barrier(args, workers);

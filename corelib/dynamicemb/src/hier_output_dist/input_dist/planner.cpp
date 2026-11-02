@@ -17,13 +17,13 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 // The planner's steps of the node, of the rail and the owner, of the
 // requester, and the put lists (planner.h).
 
-#include "hier_output_dist/planner.h"
+#include "hier_output_dist/input_dist/planner.h"
 
 #include <algorithm>
 #include <cstdint>
 #include <tuple>
 
-#include "hier_output_dist/window.h"
+#include "hier_output_dist/common/window.h"
 
 namespace dyn_emb {
 namespace hier_output_dist {

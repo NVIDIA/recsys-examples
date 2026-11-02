@@ -834,15 +834,10 @@ class TorchRecTraffic:
         return out
 
 
-# A call's tables across nodes that HierTraffic reads (the plan's tensors):
-# the node-unique rows put to (uniq_in) and received from (uniq_out) each
-# node, the proxy's rounds and its remote occurrences.
-_HIER_IB_TABLES = ("uniq_in", "uniq_out", "num_rounds", "occurrence_count")
-
-
 class HierTraffic:
-    """Rows the hierarchical output dist moves, from each call's plan (its
-    block offsets and, across nodes, its node-unique counts, read once the
+    """Rows the hierarchical output dist moves, from each call's input dist
+    result (its block offsets and, across nodes, its node-unique counts: the
+    tensors of its plans and the proxy's occurrences, read once the
     timed iterations are over, and the rows the rank looked up). In the
     forward every rank pulls its rows from the owners of its node and from
     its node's proxies, over NVLink but for its own lookup's and its own
@@ -868,17 +863,20 @@ class HierTraffic:
         traffic = self
 
         def forward(self_, local_embs, sharding_ctx=None):
-            plan = getattr(sharding_ctx, "plan", None)
-            if traffic.enabled and plan is not None:
-                from dynamicemb_extensions import hier_output_dist_plan_tensors
-
+            result = getattr(sharding_ctx, "hier_result", None)
+            if traffic.enabled and result is not None:
                 traffic.hier = self_._hier
-                tensors = hier_output_dist_plan_tensors(plan)
+                fwd_plan, bwd_plan = result.fwd_plan, result.bwd_plan
                 traffic.calls.append(
                     (
-                        tensors["block_start"],
-                        plan.num_recv,
-                        tuple(tensors.get(name) for name in _HIER_IB_TABLES),
+                        fwd_plan.block_start,
+                        result.num_recv,
+                        (
+                            bwd_plan.uniq_in,
+                            fwd_plan.uniq_out,
+                            fwd_plan.num_rounds,
+                            result.occurrence_count,
+                        ),
                     )
                 )
             return orig(self_, local_embs, sharding_ctx)
@@ -944,7 +942,7 @@ class HierTraffic:
 
 
 # The hierarchical dist's trace rows (TraceSlots in
-# src/hier_output_dist/common.h): globaltimer stamps (the first
+# src/hier_output_dist/common/common.h): globaltimer stamps (the first
 # _HIER_TRACE_EARLIEST keep the earliest of their CTAs', unset at UINT64_MAX;
 # the rest the latest, unset at 0), then counters, then three timelines of
 # _HIER_TRACE_BINS bins (NVLink bytes, rows landed from other nodes, rows

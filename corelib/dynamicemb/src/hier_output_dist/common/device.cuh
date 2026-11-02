@@ -28,8 +28,8 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 #include <cstdio>
 #include <type_traits>
 
-#include "hier_output_dist/common.h"
-#include "hier_output_dist/window.h"
+#include "hier_output_dist/common/common.h"
+#include "hier_output_dist/common/window.h"
 
 namespace dyn_emb {
 namespace hier_output_dist {
@@ -251,6 +251,20 @@ struct NodeWindow {
     return (size_t)((const char *)mine - base);
   }
 };
+
+// The part of the kernels' arguments that both channels share and that is
+// fixed for the op's life: its sizes, by which a kernel lays out its window
+// and its tables, and the window itself. The op makes it once, after its
+// window is registered. The in channel's comm kernels that wait take it with
+// the call's sequence number (CommArgs), the out kernels with theirs
+// (OutArgs), and the exit round's kernel alone.
+struct ChannelStatic : Sizes {
+  ncclWindow_t window;  // the op's window (window.h)
+  uint64_t timeout_ns;  // how long a wait for a peer may take
+  ncclDevComm dev;      // GIN across nodes
+};
+static_assert(std::is_trivially_copyable<ChannelStatic>::value,
+              "a kernel parameter is copied as bytes");
 
 // Syncs between the ranks of a node through their control words: the node
 // barrier (each rank publishes its own word and waits for every peer's),

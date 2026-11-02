@@ -29,7 +29,7 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 #include <string>
 #include <vector>
 
-#include "hier_output_dist/common.h"
+#include "hier_output_dist/common/common.h"
 
 namespace dyn_emb {
 namespace hier_output_dist {

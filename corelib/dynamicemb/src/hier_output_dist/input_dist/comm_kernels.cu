@@ -14,10 +14,10 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 # See the License for the specific language governing permissions and
 # limitations under the License.
 ******************************************************************************/
-// The comm kernels of the in channel (the first wait): the input dist's only
-// custom kernels, each one exchange with the node peers or the rail peers.
-// The planner's steps (planner.h) run between them as ATen ops on the same
-// stream, in the order of InChannel::start:
+// The comm kernels of the in channel (the first wait): the input dist's
+// exchanges with the node peers and the rail peers, and the functions that
+// launch them (input_dist.h). The planner's steps (planner.h) run between
+// them on the same stream, in the order of InChannel::start:
 //   node_count_exchange   the node barrier of the call, and the node's
 //                         counts as this rank needs them;
 //   node_key_push         this rank's keys into its targets' node_keys over
@@ -37,21 +37,22 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 // lanes) take the peers in turn, so any number of them. Memory order:
 // what peers wrote is read only after an acquire of their flag or signal, by
 // the comm kernel that acquired it (with ld.global.cg) or by a later kernel
-// on the stream (peer_gather with ld.global.cg, the planner's ATen steps with
+// on the stream (peer_gather with ld.global.cg, the planner's steps with
 // plain loads). What this rank writes for its peers (its own stores, or
-// ATen's earlier on the stream) is ordered before the flag it releases or the
-// put it makes: by fence.sc.sys, or in node_count_exchange by the release
-// itself after the CTA's barrier.
-#pragma once
+// the planner's earlier on the stream) is ordered before the flag it
+// releases or the put it makes: by fence.sc.sys, or in node_count_exchange
+// by the release itself after the CTA's barrier.
 
+#include <ATen/cuda/CUDAContext.h>
 #include <nccl_device.h>
 
 #include <cstdint>
 
-#include "hier_output_dist/args.cuh"
-#include "hier_output_dist/common.h"
-#include "hier_output_dist/device.cuh"
-#include "hier_output_dist/window.h"
+#include "hier_output_dist/common/common.h"
+#include "hier_output_dist/common/config.h"
+#include "hier_output_dist/common/device.cuh"
+#include "hier_output_dist/common/window.h"
+#include "hier_output_dist/input_dist/input_dist.h"
 
 namespace dyn_emb {
 namespace hier_output_dist {
@@ -304,14 +305,93 @@ __global__ void __launch_bounds__(kThreads)
   }
 }
 
-// Signals and counters of every GIN context start at 0: `bad` counts those
-// that do not.
-__global__ void gin_zero_kernel(ncclDevComm dev, int signals, int counters, int *bad) {
-  ncclGin gin(dev, blockIdx.x);
-  for (int signal = threadIdx.x; signal < signals; signal += blockDim.x)
-    if (gin.readSignal(signal) != 0) atomicAdd(bad, 1);
-  for (int counter = threadIdx.x; counter < counters; counter += blockDim.x)
-    if (gin.readCounter(counter) != 0) atomicAdd(bad, 1);
+// The launchers.
+
+namespace {
+
+CommArgs comm_args(const ChannelStatic &channel, int64_t seq) {
+  return CommArgs{channel, Channel{seq}};
+}
+
+cudaStream_t current_stream() { return at::cuda::getCurrentCUDAStream(); }
+
+// CTAs of kThreads threads for `work` items on the current device.
+int grid_of(int64_t work) {
+  return grid_for(work, at::cuda::getCurrentDeviceProperties()->multiProcessorCount);
+}
+
+}  // namespace
+
+std::tuple<at::Tensor, at::Tensor, at::Tensor> launch_node_count_exchange(
+    const ChannelStatic &channel, int64_t seq, const at::Tensor &my_counts) {
+  at::Tensor totals = at::empty_like(my_counts), before = at::empty_like(my_counts);
+  at::Tensor mine =
+      at::empty({channel.topo.local_size, channel.num_features + 1}, my_counts.options());
+  node_count_exchange_kernel<<<1, kThreads, 0, current_stream()>>>(
+      comm_args(channel, seq), my_counts.data_ptr<int64_t>(), totals.data_ptr<int64_t>(),
+      before.data_ptr<int64_t>(), mine.data_ptr<int64_t>());
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  return {totals, before, mine};
+}
+
+void launch_node_key_push(const ChannelStatic &channel, const at::Tensor &keys,
+                          const at::Tensor &weights, const at::Tensor &row_cell,
+                          const at::Tensor &destination_base, const at::Tensor &rows_to_push) {
+  node_key_push_kernel<<<grid_of(keys.numel()), kThreads, 0, current_stream()>>>(
+      channel, keys.data_ptr<int64_t>(), weights.defined() ? weights.data_ptr<float>() : nullptr,
+      row_cell.data_ptr<int32_t>(), destination_base.data_ptr<int64_t>(),
+      rows_to_push.data_ptr<int64_t>());
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+void launch_node_done(const ChannelStatic &channel, int64_t seq) {
+  node_done_kernel<<<1, 32, 0, current_stream()>>>(comm_args(channel, seq));
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+at::Tensor launch_rail_count_exchange(const ChannelStatic &channel, int64_t seq,
+                                      const at::Tensor &message) {
+  const int num_nodes = channel.topo.num_nodes;
+  const CountMessage format{num_nodes, channel.num_features};
+  at::Tensor messages = at::empty({num_nodes, format.length()}, message.options());
+  rail_count_exchange_kernel<<<1, 256, 0, current_stream()>>>(
+      comm_args(channel, seq), message.data_ptr<int64_t>(), messages.data_ptr<int64_t>());
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  return messages;
+}
+
+void launch_rail_key_exchange(const ChannelStatic &channel, int64_t seq, const at::Tensor &put_src,
+                              const at::Tensor &put_dst, const at::Tensor &put_bytes,
+                              const at::Tensor &put_skip) {
+  rail_key_exchange_kernel<<<1, 64, 0, current_stream()>>>(
+      comm_args(channel, seq), put_src.data_ptr<int64_t>(), put_dst.data_ptr<int64_t>(),
+      put_bytes.data_ptr<int64_t>(), put_skip.data_ptr<bool>());
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+std::pair<at::Tensor, at::Tensor> launch_node_status_exchange(const ChannelStatic &channel,
+                                                              int64_t seq,
+                                                              const at::Tensor &publish) {
+  const int local_size = channel.topo.local_size;
+  at::Tensor peer_needs = at::empty({local_size, kNumNeeds}, publish.options());
+  at::Tensor owner_cell_start = at::empty({local_size, channel.num_features}, publish.options());
+  node_status_exchange_kernel<<<1, 256, 0, current_stream()>>>(
+      comm_args(channel, seq), publish.data_ptr<int64_t>(), peer_needs.data_ptr<int64_t>(),
+      owner_cell_start.data_ptr<int64_t>());
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  return {peer_needs, owner_cell_start};
+}
+
+at::Tensor launch_peer_gather(const ChannelStatic &channel, GatherFrom from, const at::Tensor &peer,
+                              const at::Tensor &first_word) {
+  const int64_t items = peer.numel();
+  const int words = gather_words(from);
+  at::Tensor out = at::empty({words, items}, peer.options());
+  peer_gather_kernel<<<grid_of(items * words), kThreads, 0, current_stream()>>>(
+      channel, from, peer.data_ptr<int32_t>(), first_word.data_ptr<int64_t>(), items, words,
+      out.data_ptr<int32_t>());
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  return out;
 }
 
 }  // namespace hier_output_dist

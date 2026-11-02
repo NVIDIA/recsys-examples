@@ -21,9 +21,9 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 #include <algorithm>
 #include <stdexcept>
 
-#include "hier_output_dist/common.h"
-#include "hier_output_dist/config.h"
-#include "hier_output_dist/planner.h"
+#include "hier_output_dist/common/common.h"
+#include "hier_output_dist/common/config.h"
+#include "hier_output_dist/input_dist/planner.h"
 
 namespace dyn_emb {
 namespace hier_output_dist {

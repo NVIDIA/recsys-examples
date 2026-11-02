@@ -124,7 +124,7 @@ struct Fanout {
 struct RoundPiece {
   int32_t uniq_lo, uniq_hi;  // the node-unique keys of the piece
   int32_t off;               // slot of its first row in proxy_rows
-  int32_t chunk;             // the proxy's own table (OutPlan::round_table): the piece's first
+  int32_t chunk;             // the proxy's own table (BwdPlan::round_table): the piece's first
                              // IB chunk of the backward, numbered over all pieces; else 0
 };
 // The push-task flags of one round in push_flags: those of round rnd start at

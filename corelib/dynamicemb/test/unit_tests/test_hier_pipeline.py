@@ -107,7 +107,7 @@ DIM = 32
 # The EC's tables and their features (t0 serves two), and the EBC's.
 TABLES = (("f0", "f1"), ("f2",), ("f3",))
 # The status a call copies to the host: status_words(num_features) int64
-# words (src/hier_output_dist/common.h) of the EC's features.
+# words (src/hier_output_dist/common/common.h) of the EC's features.
 STATUS_WORDS = 7 + 2 * sum(len(table) for table in TABLES)
 EBC_TABLES = ("e0", "e1")
 DENSE = 2048

@@ -14,8 +14,8 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 # See the License for the specific language governing permissions and
 # limitations under the License.
 ******************************************************************************/
-// The operator's construction, teardown and calls, its communicator, its
-// window and its trace (hier_output_dist.h).
+// The operator's construction, teardown and calls, its communicator and its
+// window (hier_output_dist.h), and the kernels of its setup and teardown.
 
 #include <ATen/core/grad_mode.h>
 #include <ATen/cuda/CUDAContext.h>
@@ -28,10 +28,10 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 #include <cstring>
 #include <stdexcept>
 
-#include "hier_output_dist/common.h"
-#include "hier_output_dist/config.h"
+#include "hier_output_dist/common/common.h"
+#include "hier_output_dist/common/config.h"
+#include "hier_output_dist/common/device.cuh"
 #include "hier_output_dist/hier_output_dist.h"
-#include "hier_output_dist/kernels.h"
 
 namespace dyn_emb {
 namespace hier_output_dist {
@@ -70,6 +70,90 @@ ChannelStatic channel_static(const Sizes &sizes, ncclWindow_t window, const nccl
   return ChannelStatic{sizes, window, (uint64_t)(std::min(timeout_s, 1e9) * 1e9), dev};
 }
 
+// Signals and counters of every GIN context start at 0: `bad` counts those
+// that do not.
+__global__ void gin_zero_kernel(ncclDevComm dev, int signals, int counters, int *bad) {
+  ncclGin gin(dev, blockIdx.x);
+  for (int signal = threadIdx.x; signal < signals; signal += blockDim.x)
+    if (gin.readSignal(signal) != 0) atomicAdd(bad, 1);
+  for (int counter = threadIdx.x; counter < counters; counter += blockDim.x)
+    if (gin.readCounter(counter) != 0) atomicAdd(bad, 1);
+}
+
+// Teardown, 1 warp: tell the node this rank reads no window any more (its
+// closing word) and, across nodes, its rail peers that it sends nothing more
+// (a closing signal on the credits' context, behind every credit it sent
+// them on the same QPs), both before waiting for anyone; then wait (at most
+// limit_ns) until every node peer and every rail peer said the same, each
+// lane taking peers in turn. Records in its closed word whether they all
+// did. Its waits are loops of their own: after limit_ns they give up and
+// record it, where Spin would trap.
+__global__ void exit_kernel(ChannelStatic channel, uint64_t limit_ns) {
+  const Topo &topo = channel.topo;
+  const int lane = threadIdx.x, num_nodes = topo.num_nodes;
+  const NodeWindow node(channel.window, topo.local_rank);
+  const CtrlLayout ctrl = node.layout(channel).ctrl;
+  if (lane == 0) st_release_sys(ctrl.closing(), 1);
+  if (num_nodes > 1) {
+    ncclGin cred(channel.dev, kCtxCredit);
+    for (int peer_node = lane; peer_node < num_nodes; peer_node += 32)
+      if (peer_node != topo.node)
+        cred.signal(ncclTeamRail(channel.dev), peer_node,
+                    ncclGin_StrongSignalAdd{(ncclGinSignal_t)sig_closing(num_nodes, topo.node), 1},
+                    ncclCoopThread{}, ncclGin_None{}, cuda::thread_scope_thread,
+                    cuda::thread_scope_system);
+  }
+  bool seen = true;
+  const uint64_t start_ns = now_ns();
+  for (int peer = lane; peer < topo.local_size && seen; peer += 32) {
+    const uint64_t *closing = node.peer(ctrl.closing(), peer);
+    while (ld_acquire_sys(closing) == 0) {
+      if (now_ns() - start_ns > limit_ns) {
+        seen = false;
+        break;
+      }
+      __nanosleep(1000);
+    }
+  }
+  if (num_nodes > 1) {
+    ncclGin cred(channel.dev, kCtxCredit);
+    for (int peer_node = lane; peer_node < num_nodes && seen; peer_node += 32)
+      while (peer_node != topo.node && cred.readSignal(sig_closing(num_nodes, peer_node)) == 0) {
+        if (now_ns() - start_ns > limit_ns) {
+          seen = false;
+          break;
+        }
+        __nanosleep(1000);
+      }
+    __syncwarp();
+    cred.flush(ncclCoopWarp{});
+  }
+  const bool all = __all_sync(kFull, seen);
+  if (lane == 0) *ctrl.closed() = all ? 1 : 0;
+}
+
+cudaError_t launch_exit_kernel(const ChannelStatic &channel, uint64_t limit_ns) {
+  exit_kernel<<<1, 32>>>(channel, limit_ns);
+  return cudaGetLastError();
+}
+
+// Signals and counters start at 0 (NCCL zeroes them): every comparison is
+// against running totals from 0. Checked before any peer can send, on the
+// current stream: the caching allocator may hand `bad` a block that kernels
+// queued there still use, and only that stream's order puts these writes
+// after them.
+bool gin_signals_zero(const ncclDevComm &dev, int num_nodes) {
+  int device;
+  HIER_CUDA_CHECK(cudaGetDevice(&device));
+  const cudaStream_t stream = at::cuda::getCurrentCUDAStream(device);
+  auto bad = at::empty({1}, at::TensorOptions().device(at::kCUDA, device).dtype(at::kInt));
+  HIER_CUDA_CHECK(cudaMemsetAsync(bad.data_ptr<int>(), 0, sizeof(int), stream));
+  gin_zero_kernel<<<kGinContexts, 32, 0, stream>>>(dev, kGinSignalsPerNode * num_nodes,
+                                                   kGinCounters, bad.data_ptr<int>());
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  return bad.item<int>() == 0;
+}
+
 // Every rank's readiness (`every`, in rank order) in words: those of the
 // ranks that cannot run, or "" when every rank can.
 std::string why_some_cannot_run(const std::vector<int> &every, int local_size) {
@@ -79,13 +163,6 @@ std::string why_some_cannot_run(const std::vector<int> &every, int local_size) {
       why +=
           c10::str(why.empty() ? "" : "; ", "rank ", peer, ": ", why_not(every[peer], local_size));
   return why;
-}
-
-// Part 1 runs the rules present: their codes on the host.
-OwnerRules owner_rules(const Config &config) {
-  const at::Tensor codes = config.dist_types.to(at::kCPU, at::kInt).contiguous();
-  return OwnerRules{config.dist_types, config.block_sizes,
-                    std::vector<int>(codes.data_ptr<int>(), codes.data_ptr<int>() + codes.numel())};
 }
 
 }  // namespace
@@ -109,11 +186,7 @@ std::string HierOutputDist::invalid(const Config &config) {
 }
 
 HierOutputDist::HierOutputDist(const std::string &unique_id, Config config)
-    : config_(std::move(config)),
-      sizes_(sizes_of(config_)),
-      rules_(owner_rules(config_)),
-      trace_(current_device()),
-      device_(current_device()) {
+    : config_(std::move(config)), sizes_(sizes_of(config_)), device_(current_device()) {
   c10::cuda::CUDAGuard guard(device_);
   const bool fail_alloc = g_fail_alloc;
   g_fail_alloc = false;
@@ -166,8 +239,8 @@ HierOutputDist::HierOutputDist(const std::string &unique_id, Config config)
   }
   channel_static_ =
       channel_static(sizes_, window_->handle(), communicator_->dev(), config_.timeout_s);
-  in_ = std::make_unique<InChannel>(config_, sizes_, channel_static_, *window_, device_);
-  out_ = std::make_unique<OutChannel>(config_, sizes_, channel_static_, *window_, trace_, device_);
+  in_ = std::make_unique<InChannel>(config_, sizes_, channel_static_, window_->layout(), device_);
+  out_ = std::make_unique<OutChannel>(config_, sizes_, channel_static_, window_->layout(), device_);
 }
 
 HierOutputDist::~HierOutputDist() { release(); }
@@ -236,38 +309,30 @@ void HierOutputDist::release() noexcept {
   window_->release(/*keep=*/false);
 }
 
-std::shared_ptr<Plan> HierOutputDist::plan(PlanInput input) {
-  c10::cuda::CUDAGuard guard(device_);
-  at::NoGradGuard no_grad;
-  TORCH_CHECK(input.weights.has_value() == config_.weights,
-              "hier_output_dist: the keys carry weights exactly when the op was made with "
-              "weights (",
-              config_.weights ? "with" : "without", ")");
-  Partition part = partition_keys(input, rules_, sizes_.topo.world_size);
-  FanoutTables fanout;
-  if (input.reverse_indices.has_value()) fanout = fanout_tables(*input.reverse_indices, part.inv);
-  return std::make_shared<Plan>(sizes_, std::move(input), std::move(part), std::move(fanout));
-}
+PartOne HierOutputDist::part_one(PlanInput input) { return in_->part_one(std::move(input)); }
 
-void HierOutputDist::start(Plan &plan) {
+Pending HierOutputDist::start(const PartOne &part) {
   quiesced_ = false;
-  in_->start(plan);
+  return in_->start(part);
 }
 
-bool HierOutputDist::wait(Plan &plan) { return plan.wait(); }
+InDistResult HierOutputDist::wait(const Pending &pending) { return in_->wait(pending); }
 
-at::Tensor HierOutputDist::lookup_rows(Plan &plan) { return out_->lookup_rows(plan); }
+at::Tensor HierOutputDist::lookup_rows(int64_t num_recv) {
+  c10::cuda::CUDAGuard guard(device_);
+  return window_->lookup_rows(num_recv, config_.dim, config_.dtype);
+}
 
-std::tuple<at::Tensor, std::vector<at::Tensor>> HierOutputDist::forward(
-    Plan &plan, const at::Tensor &lookup_out) {
+at::Tensor HierOutputDist::forward(const FwdPlan &plan, const at::Tensor &lookup_out) {
   quiesced_ = false;
   return out_->forward(plan, lookup_out);
 }
 
-at::Tensor HierOutputDist::backward(Plan &plan, const at::Tensor &grad,
-                                    const std::vector<at::Tensor> &maps, bool divide) {
+at::Tensor HierOutputDist::backward(const BwdPlan &plan, const at::Tensor &grad, bool divide) {
   quiesced_ = false;
-  return out_->backward(plan, grad, maps, divide);
+  out_->backward(plan, grad, divide);
+  c10::cuda::CUDAGuard guard(device_);
+  return window_->lookup_rows(plan.num_recv, grad.size(1), grad.scalar_type());
 }
 
 void HierOutputDist::quiesce() {
@@ -429,34 +494,6 @@ void SymmetricWindow::deregister(ncclComm_t comm) noexcept {
 void SymmetricWindow::release(bool keep) noexcept {
   if (keep) new std::shared_ptr<char>(memory_);  // never freed
   memory_.reset();
-}
-
-// ── the trace ──
-
-Trace::Trace(int device) {
-  if constexpr (kTrace) {
-    out_ = at::zeros({2, kTraceRing, kTraceWords},
-                     at::TensorOptions().device(at::kCUDA, device).dtype(at::kLong));
-  }
-}
-
-// The earliest stamps start at UINT64_MAX, the rest at 0.
-bool Trace::start_out(bool forward, OutCall &call, cudaStream_t stream) {
-  if constexpr (kTrace) {
-    const int direction = forward ? 0 : 1;
-    const int64_t at = direction * kTraceRing + launches_[direction] % kTraceRing;
-    int64_t *row = out_.data_ptr<int64_t>() + at * kTraceWords;
-    HIER_CUDA_CHECK(cudaMemsetAsync(row, 0xff, kNumEarliest * sizeof(int64_t), stream));
-    HIER_CUDA_CHECK(cudaMemsetAsync(row + kNumEarliest, 0,
-                                    (kTraceWords - kNumEarliest) * sizeof(int64_t), stream));
-    call.trace = (unsigned long long *)row;
-    return true;
-  }
-  return false;
-}
-
-void Trace::launched(bool forward) {
-  if constexpr (kTrace) ++launches_[forward ? 0 : 1];
 }
 
 }  // namespace hier_output_dist

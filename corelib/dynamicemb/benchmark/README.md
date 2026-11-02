@@ -749,5 +749,5 @@ GPU exchanging with every other, it measured 330.8–331.6 GB/s (SM loads) and
 351.2–352.8 GB/s (SM stores, `all-to-all in rounds`). So NVLink moves about
 7 times as much per GPU as one NIC (50 GB/s).
 
-The hierarchical dist's output dist needs the plan its own input dist makes,
+The hierarchical dist's output dist needs the plans its own input dist makes,
 so this benchmark times it in place (`--kernel_times`, `--trace`).

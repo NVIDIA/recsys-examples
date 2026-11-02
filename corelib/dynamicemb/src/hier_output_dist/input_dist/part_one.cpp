@@ -23,7 +23,7 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 #include <tuple>
 #include <utility>
 
-#include "hier_output_dist/planner.h"
+#include "hier_output_dist/input_dist/planner.h"
 #include "utils.h"
 
 namespace dyn_emb {

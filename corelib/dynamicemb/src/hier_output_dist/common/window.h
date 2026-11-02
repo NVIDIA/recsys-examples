@@ -26,7 +26,7 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 #include <utility>
 #include <vector>
 
-#include "hier_output_dist/common.h"
+#include "hier_output_dist/common/common.h"
 
 namespace dyn_emb {
 namespace hier_output_dist {
@@ -423,7 +423,7 @@ class KeysLayout {
 // exist across nodes only):
 //   lookup_rows  the owner's lookup output, row i for its KJT's key i; the
 //                backward writes the gradient of that output over it
-//   proxy_rows   (num_nodes > 1) the proxy's rows, round by round (formats.h):
+//   proxy_rows   (num_nodes > 1) the proxy's rows, round by round (common.h):
 //                the rows of the node-unique keys the rail owners put
 //                (forward), the gradient rows of its node's requesters and
 //                their sums (backward)

@@ -113,9 +113,10 @@ this dist with TorchRec's dists.
   unit in which the GPU driver maps memory.
 * **Op**: the operator `HierOutputDist`, one per sharding (section 7). It
   holds its window and everything else that lives as long as the sharding,
-  and runs every step of a call on the caller's current stream. **Plan**:
-  one call of the op, from its part 1 to its backward: the call's state
-  between the op's steps.
+  and runs every step of a call on the caller's current stream. Each step
+  returns plain data, which the next step takes. **Plans**: what the input
+  dist of a call gives the output dist, the forward's (`FwdPlan`) and the
+  backward's (`BwdPlan`): the requester's maps and the call's tables.
 * **Comm kernel**: one of the input dist's seven custom kernels, each of
   which moves data between GPUs or waits for peers (section 10.2).
   **Planner**: the input dist's other steps, which lay a call out: tensor
@@ -219,7 +220,7 @@ every rank before you drop a model (section 4.6).
   ordered after that one. It runs the input dists of all calls on one
   stream, and the output dists' kernels (forward and backward) on one
   stream. It runs each lookup after the lookup's backward has read the last
-  `lookup_grad` (section 11.2). And it records the plan's tensors on the
+  `lookup_grad` (section 11.2). And it records the call's tensors on the
   other streams that use them. TorchRec's training loop and train pipelines
   do all of this (section 16).
 * Local batch sizes may differ between ranks, and VBE works. A local batch
@@ -475,10 +476,13 @@ state that every rank shares.
 
 The op is a C++ class with a small interface. Python reaches it through
 pybind11, as `dynamicemb_extensions.HierOutputDist`, what it is built from
-(`HierOutputDistConfig`), its plans (`HierOutputDistPlan`),
-`hier_output_dist_unique_id()` and `hier_output_dist_traced()`. The op runs
-every step of a call; the plan only holds the call's state between them.
-Each step queues its work on the caller's current stream (section 7.3).
+(`HierOutputDistConfig`), the data the steps of a call hand each other
+(`HierPartOne`, `HierPending`, `HierInDistResult` with its plans
+`HierFwdPlan` and `HierBwdPlan`), `hier_output_dist_unique_id()` and
+`hier_output_dist_traced()`. The op runs every step of a call, and each
+step queues its work on the caller's current stream (section 7.3). Each step
+returns plain data, which the caller hands to the next step: nothing else
+keeps a call's state.
 
 ```cpp
 namespace dyn_emb::hier_output_dist {
@@ -494,25 +498,24 @@ class HierOutputDist {  // one per sharding
   HierOutputDist(const std::string &unique_id, Config config);  // collective (section 7.2)
   ~HierOutputDist();  // local (section 4.6)
 
-  std::shared_ptr<Plan> plan(PlanInput input);  // part 1 of a call
-  void start(Plan &plan);                       // the first wait
-  bool wait(Plan &plan);                        // the second wait, the call's one host sync;
-                                                // false: the call does not fit
-  at::Tensor lookup_rows(Plan &plan);           // the rows the lookup writes, [num_recv, dim]
-  std::tuple<at::Tensor, std::vector<at::Tensor>> forward(  // one kernel: the rows, and
-      Plan &plan, const at::Tensor &lookup_out);            // the backward's maps
-  at::Tensor backward(Plan &plan, const at::Tensor &grad,
-                      const std::vector<at::Tensor> &maps, bool divide);  // one kernel
+  PartOne part_one(PlanInput input);          // part 1 of a call
+  Pending start(const PartOne &part);         // the first wait
+  InDistResult wait(const Pending &pending);  // the second wait, the call's one host sync
+  at::Tensor lookup_rows(int64_t num_recv);   // the rows the lookup writes, [num_recv, dim]
+  at::Tensor forward(const FwdPlan &plan, const at::Tensor &lookup_out);  // one kernel
+  at::Tensor backward(const BwdPlan &plan, const at::Tensor &grad,        // one kernel
+                      bool divide);
   void quiesce();  // collective (section 4.6)
   // diagnostics: capacities(), memory(), trace(), trace_launches(), gin_railed()
 };
 
-class Plan {  // one call: its state between the op's steps
- public:
-  // after wait(): values(), weights(), lengths(), offsets(), num_sources(),
-  // length_per_key(), num_recv(), sent(), input_length_per_key(), num_out(),
-  // needs(), overflows()
-  void record_stream(c10::Stream stream) const;  // for the caller: its tensors' use on a stream
+struct InDistResult {  // what the input dist of a call gives, after its host sync
+  bool fits;                             // false: the call does not fit (section 5.4)
+  std::map<std::string, int64_t> needs;  // also overflows, sent, input_length_per_key
+  // when it fits: the owner's KJT (values, weights, lengths, offsets, num_sources,
+  // length_per_key, num_recv), and the output dist's plans
+  FwdPlan fwd_plan;  // what the forward kernel reads of the call
+  BwdPlan bwd_plan;  // what the backward kernel reads of it
 };
 
 }  // namespace dyn_emb::hier_output_dist
@@ -521,16 +524,22 @@ class Plan {  // one call: its state between the op's steps
 One training step in Python, as the sharding runs it (section 7.4):
 
 ```python
-plan = op.plan(values, offsets, lengths, batch_size, weights,
-               input_offsets, input_batch_size, reverse_indices)  # input_dist()
-op.start(plan)                       # the first wait
-if op.wait(plan):                    # the second wait; False: TorchRec's dists
-    kjt = owner_kjt(plan)            # plan.values, plan.lengths, ...
-    rows = op.lookup_rows(plan)      # the lookup writes its rows here
-    out, maps = op.forward(plan, rows)
-    ...                              # the dense forward and backward
-    lookup_grad = op.backward(plan, grad_out, maps, divide)
+part = op.part_one(values, offsets, lengths, batch_size, weights,
+                   input_offsets, input_batch_size, reverse_indices)  # input_dist()
+pending = op.start(part)                 # the first wait
+result = op.wait(pending)                # the second wait; not result.fits: TorchRec's dists
+kjt = owner_kjt(result)                  # result.values, result.lengths, ...
+rows = op.lookup_rows(result.num_recv)   # the lookup writes its rows here
+out = op.forward(result.fwd_plan, rows)
+...                                      # the dense forward and backward
+lookup_grad = op.backward(result.bwd_plan, grad_out, divide)
 ```
+
+The forward's plan (`FwdPlan`) and the backward's (`BwdPlan`) hold only what
+the input dist made: the requester's maps and the call's tables (section
+11.1). Each table both kernels read is the same tensor in both plans. The
+output dist takes the lookup's output with the forward's plan, and the
+gradient with the backward's.
 
 `Config` holds everything the op needs, read once: the ranks, the table and
 the bucketize's rule of each feature, the rows and their weights,
@@ -544,11 +553,11 @@ granules, and `memory()["buffers"]` gives what each buffer takes in it, by
 name (`ctrl` for the ctrl section; sections 7.5 and 15.2).
 
 Python reads the options and the environment when the sharding is built,
-and hands them over when it builds the op. The tests and the benchmark read
-more of the op and its plans through functions of `testing.cu`: the plan's
-tensors (the call's tables among them) and the planner's steps on plain
-tensors. `testing.cu` also has a hook that makes the next construction
-fail, and the GPU clock by which the benchmark aligns its timelines.
+and hands them over when it builds the op. The benchmark reads a call's
+tables from its plans. The tests run the planner's steps on plain tensors
+through functions of `testing.cu`, which also has a hook that makes the
+next construction fail, and the GPU clock by which the benchmark aligns its
+timelines.
 
 ### 7.2 Construction
 
@@ -597,15 +606,16 @@ current stream and returns:
 ```
 the caller's stream
 -------------------
-input_dist(): part 1 (op.plan()): the keys sorted by owner
-first wait (op.start(plan)): the steps below (comm kernels and planner steps), the
-                             last of which writes the call's status
-second wait (op.wait(plan)): a blocking copy of the status to the host, the call's
-                             one host sync; then the owner's KJT
-lookup: op.lookup_rows(plan), then writes its rows there (zero copy)
-forward kernel (op.forward(plan, rows)): the rows, and the backward's maps
+input_dist(): part 1 (op.part_one()): the keys sorted by owner
+first wait (op.start(part)): the steps below (comm kernels and planner kernels),
+                             the last of which writes the call's status
+second wait (op.wait(pending)): a blocking copy of the status to the host, the
+                                call's one host sync; then the owner's KJT and the
+                                plans
+lookup: op.lookup_rows(num_recv), then writes its rows there (zero copy)
+forward kernel (op.forward(fwd_plan, rows)): the rows
 ... dense forward and backward ...
-backward kernel (op.backward(plan, grad, maps, divide)): gradient rows into the owners'
+backward kernel (op.backward(bwd_plan, grad, divide)): gradient rows into the owners'
                  lookup_rows, handed to the lookup's backward as lookup_grad
 ```
 
@@ -643,17 +653,18 @@ and CUB sorts.
 One node runs the first five steps, the owner's KJT and the status; across
 nodes every step runs but the owner's KJT.
 
-Under index dedup the second wait then trims the requester's maps to the
-rows sent, as views: it queues nothing after its sync.
+The second wait queues nothing after its sync: the owner's KJT is a view of
+the first `num_recv` of its values.
 
-Part 1 is local: no sync, no collective, no sequence number. So its plan may
-be dropped before the first wait (TorchRec's prefetch pipeline does this):
-nothing has moved yet. Part 1 also does every check of the call's inputs.
-The plan lets go of each tensor once no later step reads it: part 1's keys
-and cells once the first wait is queued, the owner's KJT and the maps and
-tables only the forward reads after the forward. `op.forward()` returns the
-backward's maps (the tables it reads among them), which autograd keeps
-(sections 7.4 and 11.1).
+Part 1 is local: no sync, no collective, no sequence number. So its result
+may be dropped before the first wait (TorchRec's prefetch pipeline does
+this): nothing has moved yet. Part 1 also does every check of the call's
+inputs. Each step's data lives as long as the caller keeps it: the first
+wait drops part 1's once the rest of the call is queued, and the second wait
+the pending call's once it has the result. The sharding context keeps the
+result until the output dist's forward takes the plans: the forward's plan
+goes once its kernel is queued, and autograd keeps the backward's (sections
+7.4 and 11.1).
 
 ### 7.4 Around the operator: the Python sharding
 
@@ -666,45 +677,48 @@ backward's maps (the tables it reads among them), which autograd keeps
   1 and returns an awaitable. Its wait is the first wait; waiting on it
   again returns the same second awaitable, and dropping it changes nothing
   (TorchRec's prefetch pipeline does both). The second wait returns the
-  owner's KJT, built from views of the plan's tensors with no copy. It also
-  sets the input KJT's per-feature totals from the status, so TorchRec's
-  `construct_jagged_tensors` needs no host sync. The sharding context
-  carries the plan. Its `record_stream`, which TorchRec's pipelines call,
-  also records the plan's tensors (through the plan's own `record_stream`).
+  owner's KJT, built from views of the result's tensors with no copy. It
+  also sets the input KJT's per-feature totals from the status, so
+  TorchRec's `construct_jagged_tensors` needs no host sync. The sharding
+  context carries the result (`hier_result`). Its `record_stream`, which
+  TorchRec's pipelines call, also records the result's tensors (through the
+  result's own `record_stream`).
 * **A call that does not fit** gets TorchRec's input dist at its second
   wait (section 5.4): DynamicEmb's bucketize of the first `sent` keys, in
   their own dtype (part 1 placed them by the same rules), then TorchRec's
   `KJTAllToAll`. That fills the sharding context for TorchRec's output
-  dist, and the context carries no plan.
+  dist, and the context carries no result.
 * **Index dedup.** For a call that takes the op, the output dist itself
   writes each deduplicated row to all its original positions, and sums
   their gradients. So TorchRec's own expansion is skipped for that call
   only. A call on TorchRec's dists keeps it.
 * **The lookup.** For the owner's KJT of a call on the op, the sharding
-  takes the call's rows from `op.lookup_rows(plan)`, and each DynamicEmb
+  takes the call's rows from `op.lookup_rows(num_recv)`, and each DynamicEmb
   lookup group writes its rows straight into the next rows of them. The
   lookup returns those rows, which cover all groups, with no copy. Any other
   KJT (a call on TorchRec's dists) takes TorchRec's lookup path.
-* **The output dist.** An autograd function runs the forward kernel
-  (`op.forward`), and saves the backward's maps that it returns as saved
-  tensors, so they live as long as autograd keeps the graph. A second
-  backward (`retain_graph`) works, and they go after the last backward. Its
-  backward runs the backward kernel with those maps (`op.backward`) and
-  returns `lookup_grad`, the gradient of the lookup output, a view of
-  `lookup_rows` valid until the next lookup. A call without a plan takes
-  TorchRec's `RwSequenceEmbeddingDist`.
+* **The output dist.** It takes the call's plans from the sharding context.
+  An autograd function runs the forward kernel with the forward's plan
+  (`op.forward`), and keeps the backward's plan as saved tensors (its
+  tensors, and its counts beside them), so they live as long as autograd
+  keeps the graph. A second backward (`retain_graph`) works, and they go
+  after the last backward. Its backward makes the plan again from them and
+  runs the backward kernel (`op.backward`), which returns `lookup_grad`,
+  the gradient of the lookup output, a view of `lookup_rows` valid until
+  the next lookup. A call without a result takes TorchRec's
+  `RwSequenceEmbeddingDist`.
 * **Streams.** Every step runs on the current stream. The output dist's
   awaitable, like those of TorchRec's own dists, makes the stream that
   waits on it wait for the forward kernel (an event), and records the rows'
   use there. So a dense forward on another stream reads the rows after the
   kernel. The lookup records the owner's KJT, and the output dist's forward
-  the plan, on the stream they run on, which may be one of their own
+  the plans, on the stream they run on, which may be one of their own
   (TorchRec's fused pipeline). Section 16 covers the pipelines.
 
 ### 7.5 The channels and the window
 
 * The op owns an NCCL communicator, one window and, across nodes, 4 GIN
-  contexts. A plan (one per call) holds the call's tensors and its status.
+  contexts. A call's tensors are in the data its steps return (section 7.1).
 * The **in channel** is the first wait's steps (section 7.3), on the current
   stream. It keeps views of this rank's own buffers: tensors over its copy
   of the window, without an allocator. It also keeps a few constant tensors,
@@ -902,7 +916,7 @@ four. In the backward GPU 3 pushes its gradient rows into GPU 2's
 
 Part 1 and the first wait's steps run on the caller's stream, in the order of
 section 7.3. Seven of them are custom kernels, the comm kernels (section
-10.2). The planner does the rest (`src/hier_output_dist/planner.h`): ATen ops
+10.2). The planner does the rest (`src/hier_output_dist/input_dist/planner.h`): ATen ops
 and CUB sorts on the current stream, on tensors whose sizes the host knows
 from the call's keys, the capacities and the topology. The counts that only
 the device knows (valid keys, node-unique keys, rounds) stay on the device,
@@ -968,12 +982,12 @@ delta replay (`dynamicemb/key_ownership.py`) follow another rule for some
 
 ### 10.2 The comm kernels
 
-They are in `comm_kernels.cuh`. A comm kernel that waits runs on one CTA
-and takes the call's sequence number `in_seq`, the same on every rank. It
-waits only for the same kernel (the same `in_seq`) of its node or rail peers.
-Its threads take the peers in turn (thread `t` the peers `t`, `t + 32`, ...
-in a warp), so it serves any number of them. Section 13 gives their memory
-order and why no wait hangs.
+They are in `input_dist/comm_kernels.cu`. A comm kernel that waits runs on
+one CTA and takes the call's sequence number `in_seq`, the same on every
+rank. It waits only for the same kernel (the same `in_seq`) of its node or
+rail peers. Its threads take the peers in turn (thread `t` the peers `t`,
+`t + 32`, ... in a warp), so it serves any number of them. Section 13 gives
+their memory order and why no wait hangs.
 
 * **`node_count_exchange`** (1 CTA): copies this rank's count vector
   (section 10.3) into its `count_vector` words of the call, in the ctrl
@@ -1145,8 +1159,8 @@ tasks of each round.
 ### 10.5 The status and the one host sync
 
 The last step writes the call's status, `8 × (2 × num_features + 7)` bytes.
-The call's tables need no copy: each is a tensor of its own, which the plan
-keeps for the out kernels (section 11.1). The status holds the needs: the
+The call's tables need no copy: each is a tensor of its own, which the plans
+keep for the out kernels (section 11.1). The status holds the needs: the
 most any rank needs of `lookup_keys` and `remote_keys`, and the most rounds.
 It also holds the keys this owner looks up, the sub-tasks of its heavy rows
 and heavy groups, the rows sent, and the per-feature totals of the owner's
@@ -1185,17 +1199,22 @@ stream: the forward kernel `fwd_kernel` and the backward kernel
   out kernel (GIN context 3) and flushing them. So no credit is in flight
   once a kernel has ended.
 * **Tables.** The kernels read the call's tables from global memory,
-  through typed pointers in their argument (`OutPlan`). Each table is a
-  tensor of the plan: the requester's block starts and maps, and across
-  nodes its push order and heavy groups, its tables of the node's proxies
-  (`proxy_rounds`, `proxy_round_tables`, `push_tables`, `push_order_off`)
-  and its task starts (`fwd_task_starts`, `bwd_task_starts`); the owner's
-  (`uniq_in`, `fwd_put_start`); the proxy's (`num_rounds`, `num_chunks`,
-  `uniq_out`, `uniq_off`, `round_table`, `bwd_put_start`, `push_start`,
-  `reduce_task_starts`) and its reducer list; and the put lists. Their
-  strides are `rounds_cap` and `num_nodes`. The tables only the forward
-  reads go once the forward is queued; the backward's are among the maps
-  autograd saves (section 7.4).
+  through typed pointers in their argument: the forward's plan as it reads
+  it (`FwdPlanView`, in `FwdArgs`) and the backward's (`BwdPlanView`, in
+  `BwdArgs`). Each table is a tensor of a plan. Both read the requester's
+  block starts and maps, and across nodes its push order and its tables of
+  the node's proxies (`proxy_rounds`, `push_tables`), the proxy's rounds and
+  the put lists. The forward also reads the requester's `src`, its
+  `proxy_round_tables`, `push_order_off` and `fwd_task_starts`, the owner's
+  `fwd_put_start` and the proxy's `uniq_out` and `push_start`. The backward
+  reads its `dst`, its heavy groups and `bwd_task_starts`, the owner's
+  `uniq_in`, and the proxy's `num_chunks`, `uniq_off`, `round_table`,
+  `bwd_put_start`, `reduce_task_starts` and its reducer list. Their strides
+  are `rounds_cap` and `num_nodes`. Each kernel's argument also holds what
+  the op gives it for the call: the forward's output, the backward's
+  gradient and its scratch (the heavy rows' sums and counts), and across
+  nodes the counts the kernel zeroes (`ready`). The forward's plan goes once
+  its kernel is queued; autograd keeps the backward's (section 7.4).
 * **The window.** A kernel lays out this rank's copy of the window from the
   sizes in its argument (section 7.5), and names each buffer and control
   word by its accessor: in this rank's copy, or in a node peer's through
@@ -1205,7 +1224,7 @@ stream: the forward kernel `fwd_kernel` and the backward kernel
 ### 11.2 The lookup
 
 The lookup takes the call's rows, the first `num_recv` rows of `lookup_rows`,
-from `op.lookup_rows(plan)`: a view, valid until the next out kernel. Each
+from `op.lookup_rows(num_recv)`: a view, valid until the next out kernel. Each
 DynamicEmb lookup group writes its rows straight into the next rows of the
 call's rows: the tables' `output_alloc`. The lookup returns the call's rows,
 which cover all groups, with no copy into a new tensor; the forward checks
@@ -1623,20 +1642,19 @@ Under skewed keys its hot owner's buffers grow with
   compute, and the second wait waits for that stream alone. So the op does
   not bound how far the CPU runs ahead of the default stream; the pipeline
   does. Each step the CPU runs ahead keeps its memory blocks reserved in
-  the caching allocator. The out kernels
-  of a model run on one stream, in the same order on every rank: autograd
-  runs each backward on the stream of its forward.
+  the caching allocator. The out kernels of a model run on one stream, in
+  the same order on every rank: autograd runs each backward on the stream
+  of its forward.
 * **`record_stream`.** The pipelines call the sharding context's
   `record_stream` for the streams they hand a call to, and it calls the
-  plan's (`HierOutputDistPlan.record_stream`). With
-  `emb_lookup_stream="new"`, TorchRec's fused pipeline runs the lookup and
-  the output dist on that stream but records the context on the default
-  stream only. So the lookup records the owner's KJT, and the output
-  dist's forward the plan, on the stream they run on: the plan lets go of
-  the forward's own tables as soon as the forward kernel is queued, and
-  without the record the input dist of the next call, on the data_dist
-  stream, could get their memory while the kernel still reads them. The op
-  records no stream itself.
+  result's (`HierInDistResult.record_stream`, which records its plans
+  too). With `emb_lookup_stream="new"`, TorchRec's fused pipeline runs the
+  lookup and the output dist on that stream but records the context on the
+  default stream only. So the lookup records the owner's KJT, and the
+  output dist's forward the plans, on the stream they run on: the forward's
+  plan goes as soon as the forward kernel is queued, and without the record
+  the input dist of the next call, on the data_dist stream, could get its
+  memory while the kernel still reads it. The op records no stream itself.
 * A call's tensors live from its part 1 to its backward (section 15.1), so
   under `TrainPipelineSparseDist` the next batch's are alive during this
   batch's forward and backward.
@@ -1736,7 +1754,7 @@ run them, and `test/unit_test.sh` runs those.
   traps (section 13).
 * **Streams**: the op orders nothing across streams. The caller orders the
   steps of each call on its streams, runs the input dists on one stream and
-  the out kernels on one stream, and records the plan's tensors on the
+  the out kernels on one stream, and records the call's tensors on the
   streams that use them, as TorchRec's loops do (sections 4.2 and 16).
 * **The owner's KJT**: code that reads it (trackers, for example) sees
   `num_sources` columns per feature and one entry per (other node, table,
@@ -1771,53 +1789,59 @@ Paths from `corelib/dynamicemb`.
   (`hier_forward`, its two awaitables and `fallback`); `rw_sharding.py` the
   choice of dist and the lookup; `embedding.py` the choice per call. The
   table options are in `dynamicemb/dynamicemb_config.py`.
-* **C++** (`src/hier_output_dist/`, namespace `dyn_emb::hier_output_dist`),
-  24 files in one directory:
-  * `hier_output_dist.h`: the op, `HierOutputDist`, and what it owns: its
-    communicator (`Communicator`), its window (`SymmetricWindow`), its trace
-    (`Trace`) and its two channels (`InChannel`, `OutChannel`);
-  * `hier_output_dist.cu`: the op's construction, teardown and calls, the
-    communicator, the window and the trace; `channels.cu`: the channels.
-    `InChannel::start` queues the first wait's steps, and `OutChannel`
-    launches the out kernels;
-  * `plan.h`, `plan.cu`: one call (`Plan`), which holds its tensors and its
-    status between the op's steps;
-  * `config.h`, `config.cu`: error checks and small host helpers, the op's
-    configuration (`Config`) and its checks, and the op's sizes
-    (`sizes_of`);
-  * `planner.h`: the planner, ATen ops called from C++: the declarations of
-    every step, and small tensor helpers. Part 1 is in `part_one.cpp` and
-    the proxy in `proxy.cpp`; the node layout, the rail and the owner, the
-    requester and the put lists are in `planner.cpp`; `sort.cu` holds the
-    CUB radix sorts that part 1 and the proxy call;
-  * `common.h`: what host and device code share: the constants, the ranks
-    of a sharding (`Topo`) and the op's sizes (`Sizes`), the formats of the
-    call's tables, the call's status, the GIN contexts and signals, and the
-    trace's build flag and row format;
-  * `window.h`: the window's layout (`WindowLayout`) over its sections:
-    `CtrlLayout` (with the formats of the count vector and the count
-    message, and a channel's sequence number), `KeysLayout` (with
-    `ProxyHeader`, `RemoteMap` and what `peer_gather` reads) and
-    `RowsLayout`;
-  * `args.cuh`: the kernels' arguments: what both channels share
-    (`ChannelStatic`) and what the out kernels take (`OutArgs`), with the
-    call's tables (`OutPlan`);
-  * `device.cuh`: the kernels' building blocks: loads, stores and fences
-    with a memory order, bounded waits, warp and CTA helpers, a search, row
-    vectors, the window as the node's GPUs map it (`NodeWindow`), the syncs
-    on its control words (`NodeBarrier`, `PeerFlags`), and GIN on the rail
-    (`rail_put`, `RowPut`, `RailMessage`, `Credits`);
-  * `comm_kernels.cuh`: the comm kernels; `out_kernels.cuh`: what both out
-    kernels share (their timeline, the call's tables as a requester's warps
-    read them, their task schedule and their protocol); `forward.cuh` and
-    `backward.cuh`: the forward and backward kernels;
-  * `kernels.h`, `kernels.cu`: the functions that launch the comm kernels,
-    the out kernels and the setup, teardown and clock kernels. `kernels.cu`
-    is the one file that compiles the op's own kernels: only it includes
-    the files that define them (`device.cuh`, `comm_kernels.cuh`,
-    `out_kernels.cuh`, `forward.cuh` and `backward.cuh`);
+* **C++** (`src/hier_output_dist/`, namespace `dyn_emb::hier_output_dist`):
+  the op's own files, and a folder for what both dists share and one for
+  each dist.
+  * `hier_output_dist.h`, `hier_output_dist.cu`: the op, `HierOutputDist`,
+    and what it owns: its communicator (`Communicator`), its window
+    (`SymmetricWindow`) and its two channels; its construction, teardown and
+    calls, and the kernels of its setup and teardown;
   * `bind.cu`: the Python bindings; `testing.cu`: bindings for the tests and
     the benchmark only.
+  * `common/`, what both dists share:
+    * `common.h`: what host and device code share: the constants, the ranks
+      of a sharding (`Topo`) and the op's sizes (`Sizes`), the formats of the
+      call's tables, the call's status, the GIN contexts and signals, and the
+      trace's build flag and row format;
+    * `config.h`, `config.cu`: error checks and small host helpers, the op's
+      configuration (`Config`) and its checks, and the op's sizes
+      (`sizes_of`);
+    * `window.h`: the window's layout (`WindowLayout`) over its sections:
+      `CtrlLayout` (with the formats of the count vector and the count
+      message, and a channel's sequence number), `KeysLayout` (with
+      `ProxyHeader`, `RemoteMap` and what `peer_gather` reads) and
+      `RowsLayout`;
+    * `device.cuh`: the kernels' building blocks: loads, stores and fences
+      with a memory order, bounded waits, warp and CTA helpers, a search, row
+      vectors, the window as the node's GPUs map it (`NodeWindow`), what the
+      kernels of both channels take (`ChannelStatic`), the syncs on its
+      control words (`NodeBarrier`, `PeerFlags`), and GIN on the rail
+      (`rail_put`, `RowPut`, `RailMessage`, `Credits`);
+  * `input_dist/`, the input dist:
+    * `input_dist.h`, `input_dist.cu`: the data of a call's steps
+      (`PartOne`, `Pending`, `InDistResult`) and the in channel
+      (`InChannel`), whose `start` queues the first wait's steps and whose
+      `wait` makes the result;
+    * `plan.h`, `plan.cu`: the output dist's plans (`FwdPlan`, `BwdPlan`),
+      and the same as the out kernels read them (`FwdPlanView`,
+      `BwdPlanView`);
+    * `comm_kernels.cu`: the comm kernels, and the functions that launch
+      them;
+    * `planner.h`: the planner, ATen ops called from C++: the declarations of
+      every step, and small tensor helpers. Part 1 is in `part_one.cpp` and
+      the proxy in `proxy.cpp`; the node layout, the rail and the owner, the
+      requester and the put lists are in `planner.cpp`; `sort.cu` holds the
+      CUB radix sorts that part 1 and the proxy call;
+  * `output_dist/`, the output dist:
+    * `output_dist.h`, `output_dist.cu`: the out channel (`OutChannel`),
+      which launches the out kernels, and their trace (`Trace`).
+      `output_dist.cu` is the one file that compiles the out kernels;
+    * `args.cuh`: the out kernels' arguments: what both take (`OutArgs`), and
+      each one's own with its plan (`FwdArgs`, `BwdArgs`);
+    * `out_kernels.cuh`: what both out kernels share (their timeline, the
+      call's tables as a requester's warps read them, their task schedule
+      and their protocol); `forward.cuh` and `backward.cuh`: the forward and
+      backward kernels.
 * `setup.py` builds `src/hier_output_dist/` only against NCCL ≥ 2.30.7, and
   else defines `DEMB_NO_HIER_OUTPUT_DIST`. With `DYNAMICEMB_HIER_TRACE=1` it
   defines `DEMB_HIER_TRACE=1` (section 4.4).

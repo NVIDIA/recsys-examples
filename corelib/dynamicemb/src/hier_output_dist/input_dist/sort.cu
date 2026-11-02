@@ -21,7 +21,7 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 #include <cstdint>
 #include <cub/cub.cuh>
 
-#include "hier_output_dist/planner.h"
+#include "hier_output_dist/input_dist/planner.h"
 
 namespace dyn_emb {
 namespace hier_output_dist {

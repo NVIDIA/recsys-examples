@@ -15,7 +15,8 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 # limitations under the License.
 ******************************************************************************/
 // The hierarchical dist's operator (HierOutputDist) and what it owns: its
-// communicator, its window, its trace, and its two channels.
+// communicator, its window, and its two channels, the input dist's
+// (input_dist/) and the output dist's (output_dist/).
 #pragma once
 
 #include <ATen/ATen.h>
@@ -31,12 +32,13 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 #include <tuple>
 #include <vector>
 
-#include "hier_output_dist/args.cuh"
-#include "hier_output_dist/common.h"
-#include "hier_output_dist/config.h"
-#include "hier_output_dist/plan.h"
-#include "hier_output_dist/planner.h"
-#include "hier_output_dist/window.h"
+#include "hier_output_dist/common/common.h"
+#include "hier_output_dist/common/config.h"
+#include "hier_output_dist/common/device.cuh"
+#include "hier_output_dist/common/window.h"
+#include "hier_output_dist/input_dist/input_dist.h"
+#include "hier_output_dist/input_dist/plan.h"
+#include "hier_output_dist/output_dist/output_dist.h"
 
 namespace dyn_emb {
 namespace hier_output_dist {
@@ -136,127 +138,10 @@ class SymmetricWindow {
   ncclWindow_t handle_ = nullptr;  // nullptr until registered
 };
 
-// The trace of a build with DYNAMICEMB_HIER_TRACE=1 (kTrace): the out
-// kernels' timelines, a ring of rows per direction (TraceSlots) on the GPU.
-// Without kTrace its ring is empty and it keeps nothing.
-
-class Trace {
- public:
-  explicit Trace(int device);
-  // The next out kernel's row of its direction's ring, started over on
-  // `stream` (two memsets, no kernel), into `call`; returns whether the
-  // kernel keeps a timeline (false without kTrace).
-  bool start_out(bool forward, OutCall &call, cudaStream_t stream);
-  // That kernel was launched.
-  void launched(bool forward);
-  // [2, kTraceRing, kTraceWords]: forward, then backward, each kernel in
-  // row (launches before it) % ring.
-  at::Tensor out_ring() const { return out_; }
-  std::vector<int64_t> out_launches() const { return {launches_[0], launches_[1]}; }
-
- private:
-  at::Tensor out_ = at::empty({0}, at::kLong);
-  int64_t launches_[2] = {0, 0};  // out kernels of each direction launched so far
-};
-
-// The in channel: the input dist of every call after part 1 (the first
-// wait), on the caller's stream, under one sequence number (in_seq) the same
-// on every rank. Its comm kernels (comm_kernels.cuh)
-// exchange with the node and rail peers; the planner's steps (planner.h) lay the
-// call out between them, as ATen ops on the same stream.
-
-class InChannel {
- public:
-  // channel: the part of the kernels' arguments both channels share, over
-  // the registered window.
-  InChannel(const Config &config, const Sizes &sizes, const ChannelStatic &channel,
-            const SymmetricWindow &window, int device);
-
-  // Queues the call on the current stream, after part 1: the steps of the
-  // node (its counts, layout and keys), across nodes those of the proxy, the
-  // rail and the requester, then the call's tables and status, which the
-  // plan's wait() reads. It never reads a device value on the host.
-  void start(Plan &plan);
-
- private:
-  ChannelStatic channel_;
-  Sizes sizes_;
-  bool node_dedup_;
-  int64_t seq_ = 0;  // the calls started
-  // This rank's buffers the steps read and write, views of its copy of the
-  // window without an allocator (the window outlives them): the own part of
-  // node_keys (and node_weights), and across nodes its remote part,
-  // remote_cells, the buffers the proxy writes, rail_keys, cell_stage and
-  // rail_cells.
-  at::Tensor own_keys_, own_weights_;
-  at::Tensor remote_keys_, remote_weights_, remote_cells_;
-  ProxyBuffers proxy_buffers_;
-  at::Tensor rail_keys_, cell_stage_, rail_cells_;
-  // Constants of the op across nodes: the table of each feature (numbered
-  // densely), the other nodes, and the words of the proxy headers this
-  // requester reads.
-  at::Tensor tables_, other_nodes_;
-  PeerWords header_gather_;
-};
-
-// The out channel: the output dist's kernels (one per direction of a call)
-// on the caller's stream, under one sequence number (out_seq) the same on
-// every rank, and the gradient views of lookup_rows the backward hands out.
-
-class OutChannel {
- public:
-  // `channel_static`: the part of the kernels' arguments both channels share.
-  OutChannel(const Config &config, const Sizes &sizes, const ChannelStatic &channel_static,
-             SymmetricWindow &window, Trace &trace, int device);
-
-  // The rows the lookup of a call writes, the first num_recv rows of
-  // lookup_rows as a [num_recv, dim] view, valid until the next out kernel.
-  at::Tensor lookup_rows(const Plan &plan);
-  // fwd_kernel on the current stream: this rank's rows, from the
-  // lookup_rows of its node's owners and (across nodes) the proxy_rows of
-  // its node's proxies, into a new tensor of num_out rows. lookup_out must
-  // be the view lookup_rows() returned, which the lookup wrote (zero copy).
-  // Returns the rows and the backward's maps, which the plan lets go of:
-  // autograd saves them for backward().
-  std::tuple<at::Tensor, std::vector<at::Tensor>> forward(Plan &plan, const at::Tensor &lookup_out);
-  // bwd_kernel on the current stream: the gradient of this rank's rows back
-  // into the lookup_rows of their owners (across nodes through the proxies,
-  // which sum each node-unique key's), times 1 / world_size if `divide`.
-  // `maps` are those forward() returned, as autograd saved them. Returns
-  // this rank's lookup_grad, the gradient of its lookup output, a view of
-  // lookup_rows valid until the next lookup.
-  at::Tensor backward(Plan &plan, at::Tensor grad, const std::vector<at::Tensor> &maps,
-                      bool divide);
-
- private:
-  // CTAs of an out kernel, and of the backward's across nodes those that
-  // reduce.
-  int out_ctas(bool forward) const;
-  int reducers(int ctas) const;
-  // The output of a forward of `rows` rows.
-  at::Tensor output(int64_t rows);
-  // A cooperative launch: every CTA is resident, so they may wait for each
-  // other. The kernel takes its sequence number and its arrivals only once
-  // it is launched: a launch that fails leaves the channel as it was.
-  void launch(const void *kernel, bool forward, OutCall &call);
-
-  OutStatic static_{};  // what every kernel takes
-  Channel channel_;
-  int64_t arrive_ = 0;    // the arrive word (CtrlLayout) after the out kernels issued so far
-  int64_t out_rows_ = 0;  // rows of the storage of the forward's outputs
-  int64_t dim_;
-  at::ScalarType dtype_;
-  int world_size_, device_, sms_;
-  int ctas_, reduce_ctas_;  // Config's (0: out_ctas' default)
-  bool multi_node_;
-  SymmetricWindow &window_;
-  Trace &trace_;
-};
-
 // The hierarchical dist of a row-wise sequence sharding as one operator
 // (HierOutputDist, one per sharding). After one host sync per call, every
-// owner has a ready KJT of the keys it looks up, and every rank the per-row
-// maps of the output dist. Then the output dist runs one kernel per
+// owner has a ready KJT of the keys it looks up, and every rank the plans
+// of the output dist. Then the output dist runs one kernel per
 // direction, which only moves rows.
 //
 // Across nodes a requester's keys for an owner on another node go to its
@@ -269,18 +154,20 @@ class OutChannel {
 // The op's window is static: its constructor allocates it once, at the
 // capacities of its configuration, and it never grows; a call's own tables
 // come from the caching allocator. A call that does not fit the capacities
-// (wait() returns false, on every rank alike) still runs its steps to their
-// end with nothing in their messages, so the op stays valid for the next
-// call; the caller moves that call some other way.
+// (its result does not fit, on every rank alike) still runs its steps to
+// their end with nothing in their messages, so the op stays valid for the
+// next call; the caller moves that call some other way.
 //
-// A call is a Plan, which holds its state. The op runs each of its steps,
-// every one on the caller's current stream: plan() is part 1, local;
+// The op runs each step of a call on the caller's current stream, and each
+// step returns the data the next one takes: part_one() is part 1, local;
 // start() is the first wait, the in channel's comm kernels and the planner's
-// steps; wait() is the second wait, the host sync; lookup_rows() gives the
-// rows the lookup writes; then forward() and backward(). The caller orders
-// them: each step runs on the stream of the step before it, or on one the
-// caller ordered after it, and the caller keeps the tensors a step reads
-// alive on its stream (record_stream).
+// steps; wait() is the second wait, the host sync, which gives the owner's
+// KJT and the output dist's plans (InDistResult); lookup_rows() gives the
+// rows the lookup writes; then forward() with the forward's plan and the
+// lookup's output, and backward() with the backward's plan and the
+// gradient. The caller orders them: each step runs on the stream of the step
+// before it, or on one the caller ordered after it, and the caller keeps the
+// tensors a step reads alive on its stream (record_stream).
 
 class HierOutputDist {
  public:
@@ -314,28 +201,23 @@ class HierOutputDist {
   HierOutputDist(const HierOutputDist &) = delete;
   HierOutputDist &operator=(const HierOutputDist &) = delete;
 
-  // Part 1 of a call on the current stream: the keys partitioned by owner,
-  // and index dedup's fan-out. Local: no sync, no collective, no sequence
-  // number, so the plan may be dropped.
-  std::shared_ptr<Plan> plan(PlanInput input);
-  // The first wait: the rest of the call after part 1 (the comm kernels and
-  // the planner's steps, InChannel); advances the in channel's sequence
-  // number. Every rank starts the same calls in the same order.
-  void start(Plan &plan);
-  // The second wait, the call's one host sync. False: the call does not fit
-  // the capacities (the same on every rank), and the caller moves it some
-  // other way. True: the plan holds the owner's KJT and the maps of its
-  // output dist.
-  bool wait(Plan &plan);
-  // The rows the call's lookup writes its output into, and the output dist
-  // reads it from: lookup_rows' first num_recv rows, [num_recv, dim] (see
-  // OutChannel).
-  at::Tensor lookup_rows(Plan &plan);
-  // The output dist of a call (see OutChannel): forward() returns the rows
-  // and the backward's maps, which backward() takes as autograd saved them.
-  std::tuple<at::Tensor, std::vector<at::Tensor>> forward(Plan &plan, const at::Tensor &lookup_out);
-  at::Tensor backward(Plan &plan, const at::Tensor &grad, const std::vector<at::Tensor> &maps,
-                      bool divide);
+  // The input dist of a call (InChannel): part 1, local (no sync, no
+  // collective, no sequence number, so the caller may drop it); the first
+  // wait, which advances the in channel's sequence number (every rank starts
+  // the same calls in the same order); the second wait, the call's one host
+  // sync.
+  PartOne part_one(PlanInput input);
+  Pending start(const PartOne &part);
+  InDistResult wait(const Pending &pending);
+  // The rows a call's lookup writes its output into, and the output dist
+  // reads it from: lookup_rows' first num_recv rows, [num_recv, dim]. A view
+  // of the window, valid until the next out kernel.
+  at::Tensor lookup_rows(int64_t num_recv);
+  // The output dist of a call (OutChannel): forward() returns the rows,
+  // backward() the gradient of the lookup output (lookup_grad), a view of
+  // lookup_rows valid until the next lookup.
+  at::Tensor forward(const FwdPlan &plan, const at::Tensor &lookup_out);
+  at::Tensor backward(const BwdPlan &plan, const at::Tensor &grad, bool divide);
   // Collective, after the op's last call, on every rank: syncs this rank's
   // device and meets the other ranks over the op's communicator. No peer
   // then reads this rank's window or sends it a credit any more, so the
@@ -354,8 +236,8 @@ class HierOutputDist {
   bool gin_railed() const { return communicator_->gin_railed(); }
   // In a build with DYNAMICEMB_HIER_TRACE=1, the out kernels' timelines
   // (Trace; empty without it).
-  at::Tensor trace() const { return trace_.out_ring(); }
-  std::vector<int64_t> trace_launches() const { return trace_.out_launches(); }
+  at::Tensor trace() const { return out_->trace().out_ring(); }
+  std::vector<int64_t> trace_launches() const { return out_->trace().out_launches(); }
 
  private:
   void release() noexcept;
@@ -368,8 +250,6 @@ class HierOutputDist {
   // The part of the kernels' arguments both channels share, once the window
   // is registered.
   ChannelStatic channel_static_{};
-  OwnerRules rules_;  // part 1's
-  Trace trace_;
   std::unique_ptr<InChannel> in_;
   std::unique_ptr<OutChannel> out_;
   int device_;

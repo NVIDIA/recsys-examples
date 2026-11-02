@@ -14,12 +14,11 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 # See the License for the specific language governing permissions and
 # limitations under the License.
 ******************************************************************************/
-// Test-only bindings of the hierarchical dist. Some run the planner's steps
+// Test-only bindings of the hierarchical dist. Most run the planner's steps
 // outside an op, on plain tensors: part 1, the node layout, and one rank's
-// proxy, rail and requester steps across nodes. Others are views into an op
-// and its plans that only tests and the benchmark read. Last, a hook that
-// makes the next construction fail, and the GPU clock the benchmark aligns
-// timelines by (a build with DYNAMICEMB_HIER_TRACE=1).
+// proxy, rail and requester steps across nodes. Last, a hook that makes the
+// next construction fail, and the GPU clock the benchmark aligns timelines by
+// (a build with DYNAMICEMB_HIER_TRACE=1).
 
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
@@ -32,12 +31,12 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 #include <string>
 #include <vector>
 
-#include "hier_output_dist/common.h"
-#include "hier_output_dist/config.h"
+#include "hier_output_dist/common/common.h"
+#include "hier_output_dist/common/config.h"
+#include "hier_output_dist/common/device.cuh"
+#include "hier_output_dist/common/window.h"
 #include "hier_output_dist/hier_output_dist.h"
-#include "hier_output_dist/kernels.h"
-#include "hier_output_dist/planner.h"
-#include "hier_output_dist/window.h"
+#include "hier_output_dist/input_dist/planner.h"
 
 namespace dyn_emb {
 namespace hier_output_dist {
@@ -381,11 +380,29 @@ std::map<std::string, at::Tensor> requester_tables_test(
           {"group_subs", tables.group_subs}};
 }
 
+// Benchmark tracing: this GPU's %globaltimer into out[index], on the current
+// stream (each GPU's clock has its own origin; ping-pongs of these stamps
+// between ranks give their offsets). The kernel exists only in a build with
+// the trace.
+#if DEMB_HIER_TRACE
+__global__ void clock_kernel(int64_t *out) { *out = (int64_t)now_ns(); }
+#endif
+
+void clock_stamp(at::Tensor out, int64_t index) {
+  TORCH_CHECK(kTrace, "hier_output_dist_clock: built without DYNAMICEMB_HIER_TRACE=1");
+  TORCH_CHECK(out.is_cuda() && out.scalar_type() == at::kLong && index >= 0 &&
+                  index < out.numel() && out.is_contiguous(),
+              "hier_output_dist_clock: a contiguous CUDA int64 tensor and an index in it");
+  c10::cuda::CUDAGuard guard(out.device());
+#if DEMB_HIER_TRACE
+  clock_kernel<<<1, 1, 0, at::cuda::getCurrentCUDAStream()>>>(out.data_ptr<int64_t>() + index);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+#endif
+}
+
 }  // namespace
 
 void bind_testing(py::module &py_module) {
-  py_module.def("hier_output_dist_plan_tensors", &Plan::tensors,
-                "The device tensors a plan holds, by name", py::arg("plan"));
   py_module.def("hier_output_dist_fail_next_construction", &fail_next_construction,
                 "The next construction of an op in this process fails to allocate",
                 py::arg("fail_alloc"));
