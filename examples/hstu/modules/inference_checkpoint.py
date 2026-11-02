@@ -11,7 +11,8 @@ def load_dense_state_dict(module, state_dict, *args, **kwargs):
     Filter sparse embedding keys and apply legacy HSTU transpositions only to
     HSTU layers. Forward load options to PyTorch and return its incompatible-key
     result. Missing or unexpected dense keys raise RuntimeError even when the
-    caller passes strict=False to allow filtering the sparse weights.
+    caller passes strict=False to allow filtering the sparse weights. FP8
+    Transformer layers requantize their weights from the loaded bf16 values.
     """
     hstu_layout = not module._use_exportable and module._backbone == "hstu"
     converted = {}
@@ -46,4 +47,11 @@ def load_dense_state_dict(module, state_dict, *args, **kwargs):
             for layer in module._hstu_block._attention_layers:
                 layer._linear_uvqk_weight.copy_(layer._linear_uvqk.weight.T)
                 layer._linear_proj_weight.copy_(layer._linear_proj.weight.T)
+    if module._backbone == "transformer":
+        # Graphs captured before loading (the Triton model captures while building
+        # the module) read the FP8 weights in place, so rewrite them in place.
+        for layer in module._hstu_block._attention_layers:
+            refresh = getattr(layer, "refresh_fp8_weights", None)
+            if refresh is not None:
+                refresh()
     return result

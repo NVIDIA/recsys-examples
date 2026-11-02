@@ -279,6 +279,7 @@ def make_inference_hstu_config(
         export_mode=True,
         backbone=NetworkArgs().backbone,
         transformer_ffn_dim=NetworkArgs().transformer_ffn_dim,
+        transformer_fp8_linear=NetworkArgs().transformer_fp8_linear,
         hstu_preprocessing_config=hstu_config.hstu_preprocessing_config,
     )
 

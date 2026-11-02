@@ -386,6 +386,8 @@ class NetworkArgs:
     # Inference backbone. Training examples continue to construct HSTU models.
     backbone: str = "hstu"
     transformer_ffn_dim: Optional[int] = None
+    # Run the Transformer projections as FP8 DeepGEMM GEMMs (needs bf16, no export).
+    transformer_fp8_linear: bool = False
 
     def __post_init__(self):
         assert self.dtype_str in [
@@ -396,6 +398,8 @@ class NetworkArgs:
         assert self.kernel_backend.lower() in ["cutlass", "triton", "pytorch"]
         if self.backbone not in ("hstu", "transformer"):
             raise ValueError(f"Unknown inference backbone: {self.backbone}")
+        if self.transformer_fp8_linear and self.backbone != "transformer":
+            raise ValueError("transformer_fp8_linear requires the transformer backbone")
 
 
 @gin.configurable

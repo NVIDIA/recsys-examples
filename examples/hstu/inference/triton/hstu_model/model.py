@@ -211,6 +211,7 @@ def get_inference_dense_model_with_feature_names(
         contextual_max_seqlen=num_contextual_features,
         backbone=network_args.backbone,
         transformer_ffn_dim=network_args.transformer_ffn_dim,
+        transformer_fp8_linear=network_args.transformer_fp8_linear,
     )
 
     ranking_args = RankingArgs()

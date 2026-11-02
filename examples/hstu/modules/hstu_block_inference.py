@@ -161,6 +161,17 @@ def _initialize_kvcache_metadata_for_cudagraph(
     kvcache_metadata.new_history_nnz = max_new_history_nnz
 
 
+def _layer_type(config: InferenceHSTUConfig):
+    if config.backbone != "transformer":
+        return PagedHSTUInferLayer
+    if not config.transformer_fp8_linear:
+        return TransformerInferLayer
+    # DeepGEMM is an optional dependency, imported only when FP8 is requested.
+    from modules.transformer_infer_layer_fp8 import Fp8FusedTransformerInferLayer
+
+    return Fp8FusedTransformerInferLayer
+
+
 class HSTUBlockInference(torch.nn.Module):
     """
     HSTUBlock module. A stack of HSTULayers.
@@ -179,11 +190,7 @@ class HSTUBlockInference(torch.nn.Module):
         self._preprocessor = HSTUBlockPreprocessor(config, is_inference=True)
         self._postprocessor = HSTUBlockPostprocessor(is_inference=True)
 
-        layer_type = (
-            TransformerInferLayer
-            if config.backbone == "transformer"
-            else PagedHSTUInferLayer
-        )
+        layer_type = _layer_type(config)
         self._attention_layers = torch.nn.ModuleList(
             [
                 layer_type(config, layer_idx)

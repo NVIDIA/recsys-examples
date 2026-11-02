@@ -83,6 +83,7 @@ class InferenceHSTUConfig:
         embedding_backend (EmbeddingBackend, optional): Embedding backend to use.
         backbone (str): Dense inference backbone, either hstu or transformer.
         transformer_ffn_dim (int, optional): Transformer feed-forward width; defaults to four times hidden_size.
+        transformer_fp8_linear (bool): Run the Transformer projections as FP8 DeepGEMM GEMMs; needs bf16 and cannot be exported.
     """
 
     hidden_size: int
@@ -108,12 +109,15 @@ class InferenceHSTUConfig:
     # Keep the existing config/API name for compatibility with HSTU callers.
     backbone: str = "hstu"
     transformer_ffn_dim: Optional[int] = None
+    transformer_fp8_linear: bool = False
 
     def __post_init__(self):
         assert self.is_causal
         assert self.target_group_size == 1
         if self.backbone not in ("hstu", "transformer"):
             raise ValueError(f"Unknown inference backbone: {self.backbone}")
+        if self.transformer_fp8_linear and self.backbone != "transformer":
+            raise ValueError("transformer_fp8_linear requires the transformer backbone")
         if self.transformer_ffn_dim is not None and self.transformer_ffn_dim <= 0:
             raise ValueError("transformer_ffn_dim must be positive")
         if self.backbone == "transformer":
@@ -150,6 +154,7 @@ def get_inference_hstu_config(
     backbone: str = "hstu",
     transformer_ffn_dim: Optional[int] = None,
     hstu_preprocessing_config: Optional[HSTUPreprocessingConfig] = None,
+    transformer_fp8_linear: bool = False,
 ) -> InferenceHSTUConfig:
     """
     Create the HSTU configuration.
@@ -203,4 +208,5 @@ def get_inference_hstu_config(
         backbone=backbone,
         transformer_ffn_dim=transformer_ffn_dim,
         hstu_preprocessing_config=hstu_preprocessing_config,
+        transformer_fp8_linear=transformer_fp8_linear,
     )
