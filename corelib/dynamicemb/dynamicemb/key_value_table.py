@@ -13,12 +13,25 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import collections
+import contextlib
 import json
 import math
 import os
 import warnings
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, Iterator, List, Optional, Set, Tuple
+from typing import (
+    Any,
+    Callable,
+    ContextManager,
+    Dict,
+    Iterator,
+    List,
+    Optional,
+    Sequence,
+    Set,
+    Tuple,
+)
 
 import numpy as np
 import torch  # usort:skip
@@ -439,6 +452,11 @@ class DynamicEmbTableState:
     # key map grows with the keys it holds and its value buffer with the rows.
     estimated_row_counts: Optional[torch.Tensor] = None
     collect_table_sizes_flag: bool = False
+    # How many times ``key_index_map`` has been replaced (an expansion builds a
+    # new one and drops the old). A slot number means something only in the map it
+    # was read from, so whoever walks the slots across calls -- an erase by score,
+    # in chunks -- compares this to know when to start over.
+    key_map_generation: int = 0
     # Name of the score column incremental_dump thresholds on. Equals
     # score_policy.name (for LruLfu this is the leading, timestamp, word).
     incremental_score_name: Optional[str] = None
@@ -854,9 +872,141 @@ def _expand_tables_impl(
             store_to_flat_single_table(state, dst_indices, table_id, values_batch)
 
     state.key_index_map = new_key_index_map
+    state.key_map_generation += 1
     state.capacity = new_key_index_map.capacity()
     if new_key_index_map.use_rows_:
         new_key_index_map.set_row_limits([t.shape[0] for t in state.tables])
+
+
+# ---------------------------------------------------------------------------
+# Erase by score, in chunks
+# ---------------------------------------------------------------------------
+
+# The slots of a table one chunk of an erase by score scans, at most. A chunk is also
+# the length of the kernel the training's own kernels can end up waiting behind, so
+# the size is a trade between how much the scan disturbs the training and how long it
+# takes. Measured on an H100, a table of 2**29 slots at half load, training steps of
+# 0.7 ms, scans one after the other and two chunks in flight: 2**20 or 2**22 slots
+# slow a step by about 10%, 2**24 by 110%, 2**26 by 8 times; in the same 300 steps
+# 13-15 scans finish with 2**22, 115 with 2**24. A chunk of 2**22 slots is about 30
+# microseconds of scan, so a smaller one is mostly the cost of launching it (2**18:
+# 46 ms for the table, against 3.7 ms for 2**22). It is a parameter of the call.
+ERASE_CHUNK_SLOTS = 1 << 22
+
+# How many chunks of an erase by score may be launched and not yet finished on the
+# device. Launching is some thirty times faster than a chunk runs, so without a limit
+# the erase queues the whole table at once, and the prefetch that takes the table next
+# -- whose stream waits for the erase's last event -- waits for all of it. With it, that
+# wait is at most this many chunks (about a millisecond for two). Two keep the device
+# busy: one chunk running, the next already queued.
+ERASE_MAX_CHUNKS_IN_FLIGHT = 2
+
+
+def next_erase_chunk_end(
+    position: int,
+    table_slots: int,
+    bucket_capacity: int,
+    target_slots: int = ERASE_CHUNK_SLOTS,
+) -> int:
+    """Where the chunk of an erase by score that starts at ``position`` ends.
+
+    A chunk is a whole number of buckets and lies inside one table:
+
+    * the size is counted in buckets, ``target_slots // bucket_capacity`` of them,
+      so a bucket is never split;
+    * never more than the table has, and never less than one bucket: a table smaller
+      than a chunk is scanned as one, and a target below a bucket is a bucket;
+    * it stops at the table's last slot (the last chunk is the short one), so it
+      never reaches into the next table.
+
+    ``position`` and the returned end are slots counted from the start of the table.
+    """
+    if bucket_capacity <= 0 or target_slots <= 0:
+        raise ValueError("bucket_capacity and target_slots must be positive")
+    if table_slots <= 0 or table_slots % bucket_capacity != 0:
+        raise ValueError(
+            f"a table is a whole number of buckets, got {table_slots} slots of "
+            f"{bucket_capacity}-slot buckets"
+        )
+    if not 0 <= position < table_slots or position % bucket_capacity != 0:
+        raise ValueError(
+            f"position {position} is not the start of a bucket inside the table's "
+            f"{table_slots} slots"
+        )
+    table_buckets = table_slots // bucket_capacity
+    chunk_buckets = max(1, min(table_buckets, target_slots // bucket_capacity))
+    return min(position + chunk_buckets * bucket_capacity, table_slots)
+
+
+def _erase_state_by_score(
+    state: DynamicEmbTableState,
+    threshold: int,
+    table_ids: Sequence[int],
+    counts: Tensor,
+    chunk_slots: int = ERASE_CHUNK_SLOTS,
+    chunk_guard: Optional[Callable[[], ContextManager]] = None,
+    max_in_flight: int = ERASE_MAX_CHUNKS_IN_FLIGHT,
+) -> None:
+    """Erase the keys of ``table_ids`` whose score is below ``threshold``, a chunk
+    of slots at a time (:func:`next_erase_chunk_end`).
+
+    No more than ``max_in_flight`` chunks are launched and unfinished at once: before
+    launching one, the thread waits -- outside the guard, so holding nothing and not
+    the GIL -- for the chunk ``max_in_flight`` before it to finish on the device. What a
+    caller that takes the table after the guard has to wait for on the device is then
+    bounded by those chunks, not by the rest of the scan.
+
+    Each chunk runs inside ``chunk_guard()`` -- a context manager made anew for
+    every chunk, which does nothing by default. That is where a caller that has to
+    keep the table to itself for a chunk (and only a chunk) takes and drops its
+    lock. Nothing about the table is planned ahead: the key map, the table's size
+    and the chunk are all read inside the guard, because between two chunks
+    another thread may have expanded the table, replacing the key map and freeing
+    the old one.
+
+    A replaced key map also moves every key to another slot, so where the scan had
+    got to means nothing in the new one: when ``state.key_map_generation`` is not
+    the one this table's scan started with, the table is scanned again from its first
+    bucket. That is safe -- erasing by score is idempotent -- and a key an expansion
+    moved past the scan is left for the next erase.
+
+    ``counts`` is the device tensor of :meth:`LinearBucketTable.erase_by_score`,
+    added to by every chunk.
+    """
+    for table_id in table_ids:
+        if not 0 <= table_id < state.num_tables:
+            raise ValueError(
+                f"table_id {table_id} is not one of the {state.num_tables} tables"
+            )
+    if max_in_flight < 1:
+        raise ValueError(f"max_in_flight must be at least 1, got {max_in_flight}")
+    guard = contextlib.nullcontext if chunk_guard is None else chunk_guard
+    in_flight: "collections.deque[torch.cuda.Event]" = collections.deque()
+    for table_id in table_ids:
+        position = 0
+        generation: Optional[int] = None
+        finished = False
+        while not finished:
+            if len(in_flight) >= max_in_flight:
+                in_flight.popleft().synchronize()
+            with guard():
+                key_map = state.key_index_map
+                if generation != state.key_map_generation:
+                    # The first chunk, or the key map was replaced since the last.
+                    generation = state.key_map_generation
+                    position = 0
+                table_slots = key_map.main_capacity(table_id)
+                end = next_erase_chunk_end(
+                    position, table_slots, key_map.bucket_capacity_, chunk_slots
+                )
+                key_map.erase_by_score(
+                    table_id, threshold, counts, begin=position, end=end
+                )
+                position = end
+                finished = position >= table_slots
+            chunk_launched = torch.cuda.Event()
+            chunk_launched.record()
+            in_flight.append(chunk_launched)
 
 
 def _value_rows_target(current_rows: int, need_rows: int, key_capacity: int) -> int:
@@ -2716,6 +2866,37 @@ class DynamicEmbStorage(Storage):
     @property
     def key_index_map(self):
         return self._state.key_index_map
+
+    def erase_by_score(
+        self,
+        threshold: int,
+        table_ids: Sequence[int],
+        counts: Tensor,
+        *,
+        chunk_slots: int = ERASE_CHUNK_SLOTS,
+        chunk_guard: Optional[Callable[[], ContextManager]] = None,
+        max_in_flight: int = ERASE_MAX_CHUNKS_IN_FLIGHT,
+    ) -> None:
+        """Erase the keys of logical tables ``table_ids`` whose score is below
+        ``threshold``, sparing those a prefetched batch has pinned.
+
+        The tables are scanned a chunk of at most ``chunk_slots`` slots at a time, each
+        inside ``chunk_guard()``, with at most ``max_in_flight`` chunks launched and
+        unfinished (see :func:`_erase_state_by_score`). ``counts`` is an
+        int64 tensor of two on the device, ``[erased, spared]``, added to; nothing here
+        waits for the GPU, which runs the kernels on the current stream.
+
+        Single-score tables only, as :meth:`LinearBucketTable.erase_by_score`.
+        """
+        _erase_state_by_score(
+            self._state,
+            threshold,
+            table_ids,
+            counts,
+            chunk_slots,
+            chunk_guard,
+            max_in_flight,
+        )
 
     @property
     def tables(self) -> List[DynamicEmbTableState]:

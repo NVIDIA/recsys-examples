@@ -21,17 +21,10 @@ import torch
 from dynamicemb.key_ownership import murmur3_hash_64bits
 from dynamicemb.scored_hashtable import ScoreArg, ScoreSpec, get_scored_table
 from dynamicemb_extensions import ScorePolicy
-
-BUCKET = 128
+from helpers import BUCKET, erased_and_spared, new_counts
 SCORE = "s"
 EMPTY_KEY = (1 << 64) - 1
 RECLAIM_KEY = (1 << 64) - 2
-
-
-@pytest.fixture
-def device():
-    assert torch.cuda.is_available()
-    return torch.device("cuda", torch.cuda.current_device())
 
 
 def make_table(capacities, use_ref_counter=True, policy=ScorePolicy.ASSIGN):
@@ -63,15 +56,6 @@ def find(table, keys, table_id, device):
         keys, tids, ScoreArg(name=SCORE, value=None, policy=ScorePolicy.CONST)
     )
     return score_out, founds
-
-
-def new_counts(device):
-    return torch.zeros(2, dtype=torch.int64, device=device)
-
-
-def erased_and_spared(counts):
-    torch.cuda.synchronize()
-    return int(counts[0]), int(counts[1])
 
 
 @pytest.mark.parametrize(
