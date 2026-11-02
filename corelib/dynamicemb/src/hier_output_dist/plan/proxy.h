@@ -19,9 +19,9 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 // sends the owners of its rail on other nodes; the proxy deduplicates them
 // into node-unique keys, lays their rows out in proxy_rows by rounds, and
 // writes what its node's requesters and its rail's owners read of it into its
-// windows: remote_map, key_stage and the proxy header. Three steps, each
-// taking the tables of the ones before; ATen ops and cub sorts, nothing
-// waits for the device.
+// buffers of the window: remote_map, key_stage and the proxy header
+// (common/keys.h). Three steps, each taking the tables of the ones before;
+// ATen ops and cub sorts, nothing waits for the device.
 //
 // The occurrences are the entries of the remote part (occurrence index occ).
 // A node-unique key is an identity (owner node, table, key), or each
@@ -29,21 +29,17 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 // owner node after owner node, each owner node's by the smallest feature of
 // the key, then in key order. Entries past the valid part of the remote part,
 // and keys past the valid ones, hold garbage that no one reads.
-//
-// The proxy header (proxy_hdr, int32 words): word 0 the proxy's rounds; from
-// word 4 its round table, RoundPiece [rounds_cap][num_nodes]; then its push
-// tables, ReqEntry [local_size][rounds_cap + 1], positions relative to each
-// requester's push order there and groups relative to its first group.
 #pragma once
 
 #include <ATen/ATen.h>
 
+#include "hier_output_dist/common/keys.h"
 #include "hier_output_dist/plan/tensors.h"
 
 namespace dyn_emb {
 namespace hier_output_dist {
 
-// The proxy's inputs: its remote part (views of its windows) and what the
+// The proxy's inputs: its remote part (views of its buffers) and what the
 // node layout says of it.
 struct ProxyInput {
   at::Tensor keys;             // int64 [remote_keys]: the remote part of node_keys
@@ -56,17 +52,25 @@ struct ProxyInput {
                                // densely (dense_tables)
 };
 
-// The windows the proxy writes (views of this rank's regions).
-struct ProxyWindows {
-  at::Tensor remote_map;  // int32 [3][remote_keys]: per occurrence its key's row (bit 31: a
-                          // heavy key), its slot, its position in its requester's push order
-  at::Tensor key_stage;   // int64 [(num_nodes - 1) * rounds_cap * 2 + remote_keys *
-                          // record_bytes / 8 + 2]: per other owner node a slice of its round
-                          // pieces and its keys' records; the last 16 bytes take the writes
-                          // of no key
-  at::Tensor proxy_hdr;   // int32 [4 + 4 * rounds_cap * num_nodes + 4 * local_size *
-                          // (rounds_cap + 1)]
+// The buffers the proxy writes, views of this rank's copy of the window.
+struct ProxyBuffers {
+  at::Tensor remote_map;  // int32 [3][remote_keys] (RemoteMap): per occurrence its key's row
+                          // (bit 31: a heavy key), its slot, its position in its requester's
+                          // push order
+  at::Tensor key_stage;   // int64 [KeysLayout::key_stage_bytes / 8]: per other owner node a
+                          // slice of its round pieces and its keys' records; the last 16
+                          // bytes take the writes of no key
+  // the proxy header's parts (ProxyHeader)
+  at::Tensor rounds;       // int32 [1]: its rounds
+  at::Tensor round_table;  // int32 [rounds_cap][num_nodes][4]: RoundPiece
+  at::Tensor push_tables;  // int32 [local_size][rounds_cap + 1][4]: ReqEntry, positions
+                           // relative to each requester's push order here and groups
+                           // relative to its first group
 };
+// The buffers the proxy writes: remote_map and key_stage (views), and the
+// parts of the proxy header `header`, viewed on the device of `options`.
+ProxyBuffers proxy_buffers(at::Tensor remote_map, at::Tensor key_stage, const ProxyHeader &header,
+                           const at::TensorOptions &options);
 
 // Step 1: the node-unique keys, by sorts of the occurrences.
 struct ProxyKeys {
@@ -93,12 +97,12 @@ struct ProxyKeys {
 };
 // node_dedup: equal keys of an owner node and table are one node-unique key.
 // Weights must be whole numbers (frequency counts): they are summed as int64.
-ProxyKeys proxy_keys(const ProxyInput &input, const PlanSizes &sizes, bool node_dedup);
+ProxyKeys proxy_keys(const ProxyInput &input, const Sizes &sizes, bool node_dedup);
 
 // Step 2: the rows of the keys, the rounds and their pieces, each
-// occurrence's slot. Writes remote_map words 0 and 1, the records and round
-// pieces of key_stage, and the proxy header's rounds and round table; drops
-// keys.key_value and keys.key_weight, which only the records need.
+// occurrence's slot. Writes remote_map's key rows and slots, the records and
+// round pieces of key_stage, and the proxy header's rounds and round table;
+// drops keys.key_value and keys.key_weight, which only the records need.
 struct ProxyRounds {
   at::Tensor num_rounds;    // int64 0-dim: 1, or at least 3
   at::Tensor round_table;   // int32 [rounds_cap][num_nodes][4]: RoundPiece {uniq_lo, uniq_hi,
@@ -115,7 +119,7 @@ struct ProxyRounds {
   at::Tensor requester_of;  // int32 [remote_keys]: the requester of each occurrence
 };
 ProxyRounds proxy_rounds_and_slots(ProxyKeys &keys, const at::Tensor &requester_start,
-                                   const ProxyWindows &windows, const PlanSizes &sizes);
+                                   const ProxyBuffers &buffers, const Sizes &sizes);
 
 // The push key, by which one stable sort gives each requester's push order:
 // from its low bits up, a heavy key's index or, for a key with a row each,
@@ -126,7 +130,7 @@ struct PushKey {
   int heavy_shift, round_shift, requester_shift;  // where each field above the first starts
   int bits;                                       // the whole key
 };
-PushKey push_key_of(const PlanSizes &sizes);
+PushKey push_key_of(const Sizes &sizes);
 
 // What the call keeps of the proxy.
 struct ProxyPlan {
@@ -146,10 +150,10 @@ struct ProxyPlan {
                                 // that fills it (formats.h)
 };
 // Step 3: each requester's push order (one stable sort of the push key),
-// its push tables, and the reducer list. Writes remote_map word 2 and the
-// proxy header's push tables.
+// its push tables, and the reducer list. Writes remote_map's positions and
+// the proxy header's push tables.
 ProxyPlan proxy_push_order(ProxyKeys keys, ProxyRounds rounds, const at::Tensor &requester_start,
-                           const ProxyWindows &windows, const PlanSizes &sizes);
+                           const ProxyBuffers &buffers, const Sizes &sizes);
 
 }  // namespace hier_output_dist
 }  // namespace dyn_emb

@@ -21,6 +21,7 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 #include <cstdint>
 
 #include "hier_output_dist/common/formats.h"
+#include "hier_output_dist/common/rows.h"
 #include "hier_output_dist/device/rows.cuh"
 #include "hier_output_dist/device/warp.cuh"
 
@@ -135,14 +136,14 @@ __device__ __forceinline__ void scaled_copy_rows(const char *src, char *dst, int
 }
 
 // Vector `col` (when `live`) of the rows of reducer-list entries [begin, end)
-// in proxy_rows, summed in fp32 in list order into acc: rows of the key's
-// type, or (Partial) a heavy key's fp32 partial rows, those of requesters
-// without one (kEntryNoPush) skipped. Each lane loads its entry of each 32,
-// the warp then 8 rows at a time.
+// in this rank's proxy_rows (`rows`), summed in fp32 in list order into acc:
+// rows of the key's type, or (Partial) a heavy key's fp32 partial rows, those
+// of requesters without one (kEntryNoPush) skipped. Each lane loads its entry
+// of each 32, the warp then 8 rows at a time.
 template <typename RowT, bool Partial>
-__device__ __forceinline__ void sum_entries(const char *proxy_rows, const int64_t *ent,
-                                            int64_t begin, int64_t end, int row_bytes, int col,
-                                            bool live, int lane, float *acc) {
+__device__ __forceinline__ void sum_entries(const RowsLayout &rows, const int64_t *ent,
+                                            int64_t begin, int64_t end, int col, bool live,
+                                            int lane, float *acc) {
   constexpr int kValues = Vec16<RowT>::kValues,
                 kLoads = Partial ? kValues / 4 : 1;  // 16-byte loads per vector
   bool any = false;
@@ -157,8 +158,7 @@ __device__ __forceinline__ void sum_entries(const char *proxy_rows, const int64_
         const uint64_t entry = __shfl_sync(kFull, mine, (i + step) & 31);
         use[step] = i + step < block_len && (!Partial || (int32_t)(entry >> 32) != kEntryNoPush);
         const int4 *src =
-            (const int4 *)(proxy_rows + (int64_t)(entry & ~kEntryPartial) * row_bytes) +
-            col * kLoads;
+            (const int4 *)rows.proxy_row((int64_t)(entry & ~kEntryPartial)) + col * kLoads;
 #pragma unroll
         for (int load = 0; load < kLoads; ++load)
           vecs[step][load] = use[step] && live ? __ldcg(src + load) : make_int4(0, 0, 0, 0);

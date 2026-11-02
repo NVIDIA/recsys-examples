@@ -47,8 +47,8 @@ namespace hier_output_dist {
 //                              closing[node]: the rail peer on that node tears
 //                              down.
 // Credits are payload-free SignalAdds of the difference to the value the
-// sender sent before (Ctrl grant_sent, bwd_ready_sent), and name the out
-// kernel they admit.
+// sender sent before (its grant_sent and bwd_ready_sent words, CtrlLayout),
+// and name the out kernel they admit.
 constexpr int kGinContexts = 4;
 constexpr int kGinSignalsPerNode = 3;
 constexpr int kGinCounters = 2;

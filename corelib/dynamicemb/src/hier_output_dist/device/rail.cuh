@@ -25,6 +25,7 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 #include <cstdint>
 
 #include "hier_output_dist/device/memory_order.cuh"
+#include "hier_output_dist/device/node_window.cuh"
 
 namespace dyn_emb {
 namespace hier_output_dist {
@@ -57,19 +58,33 @@ struct Credits {
   __device__ __forceinline__ void flush_warp() const { gin.flush(ncclCoopWarp{}); }
 };
 
-// Puts of rows on the rail, from one region of this rank's window `win` into
-// another of a rail peer's (rows of row_bytes; the regions at byte offsets
-// src_base and dst_base of the window), each adding its rows to the peer's
-// signal `sig`. The signal is strong: a peer that sees it also sees this put
-// and every earlier one on the context to it. The puts make no release of
-// their own: they are told the caller made a system-scope release, which is
-// the scope they need. So the caller makes one system-scope fence (fence())
+// A put on the rail without a signal: `bytes` from `src` in this rank's copy
+// of the window into the place of `dst` in the rail peer's copy on node
+// peer_node (both pointers name places in this rank's copy). It makes no
+// release of its own: the caller makes one system-scope fence after the
+// writes it carries and before it.
+__device__ __forceinline__ void rail_put(const ncclGin &gin, const ncclTeam &rail,
+                                         const NodeWindow &node, int peer_node, const void *dst,
+                                         const void *src, size_t bytes) {
+  gin.put(rail, peer_node, node.window, node.offset(dst), node.window, node.offset(src), bytes,
+          ncclGin_None{}, ncclGin_None{}, ncclCoopThread{}, ncclGin_None{},
+          cuda::thread_scope_system, cuda::thread_scope_system);
+}
+
+// Puts of rows on the rail, from the rows at `src_rows` into those at
+// `dst_rows` of a rail peer (both in this rank's copy of the window: the
+// peer's at the same place), each adding its rows to the peer's signal
+// `sig`. The signal is strong: a peer that sees it also sees this put and
+// every earlier one on the context to it. The puts make no release of their
+// own: they are told the caller made a system-scope release, which is the
+// scope they need. So the caller makes one system-scope fence (fence())
 // after the writes they carry and before them.
 struct RowPut {
   const ncclGin &gin;
   const ncclTeam &rail;
-  ncclWindow_t win;
-  uint64_t dst_base, src_base;
+  const NodeWindow &node;
+  char *dst_rows;
+  const char *src_rows;
   int64_t row_bytes;
   int sig;
   __device__ __forceinline__ void fence() const { fence_sc_sys(); }
@@ -78,15 +93,15 @@ struct RowPut {
   // counter `counter` once the NIC has read its rows.
   __device__ __forceinline__ void put(int peer_node, int dst_row, int src_row, int rows, bool count,
                                       int counter) const {
-    const uint64_t dst = dst_base + (uint64_t)dst_row * row_bytes;
-    const uint64_t src = src_base + (uint64_t)src_row * row_bytes;
+    const size_t dst = node.offset(dst_rows + (int64_t)dst_row * row_bytes);
+    const size_t src = node.offset(src_rows + (int64_t)src_row * row_bytes);
     const ncclGin_StrongSignalAdd add{(ncclGinSignal_t)sig, (uint64_t)rows};
     if (!count)
-      gin.put(rail, peer_node, win, dst, win, src, (size_t)rows * row_bytes, add, ncclGin_None{},
-              ncclCoopThread{}, ncclGin_None{}, cuda::thread_scope_system,
+      gin.put(rail, peer_node, node.window, dst, node.window, src, (size_t)rows * row_bytes, add,
+              ncclGin_None{}, ncclCoopThread{}, ncclGin_None{}, cuda::thread_scope_system,
               cuda::thread_scope_system);
     else
-      gin.put(rail, peer_node, win, dst, win, src, (size_t)rows * row_bytes, add,
+      gin.put(rail, peer_node, node.window, dst, node.window, src, (size_t)rows * row_bytes, add,
               ncclGin_WeakCounterInc{(ncclGinCounter_t)counter}, ncclCoopThread{}, ncclGin_None{},
               cuda::thread_scope_system, cuda::thread_scope_system);
   }
@@ -97,28 +112,25 @@ struct RowPut {
 // rail peer one message of each kind, which adds 1 to the peer's signal of
 // that kind for this rank's node (`sig`). So a signal counts the calls whose
 // message from that node has landed, a running total that reaches in_seq
-// once this call's has. A message is one put from this rank's window into the
-// peer's, without a release of its own (as RowPut's: the caller makes one
-// system-scope fence after the writes it carries and before the put), or,
-// when there is nothing to carry, the signal alone (with a release of its
-// own).
+// once this call's has. A message is one put, without a release of its own
+// (as RowPut's: the caller makes one system-scope fence after the writes it
+// carries and before the put); a put without a signal before it on the same
+// context lands before it.
 struct RailMessage {
   const ncclGin &gin;
   const ncclTeam &rail;
+  const NodeWindow &node;
   const ncclGin_StrongSignalAdd sig;
-  __device__ __forceinline__ RailMessage(const ncclGin &context, const ncclTeam &team, int signal)
-      : gin(context), rail(team), sig{(ncclGinSignal_t)signal, 1} {}
-  // Bytes [src, src + bytes) of window `win` into [dst, dst + bytes) of the
-  // rail peer's on node peer_node.
-  __device__ __forceinline__ void put(int peer_node, ncclWindow_t win, uint64_t dst, uint64_t src,
+  __device__ __forceinline__ RailMessage(const ncclGin &context, const ncclTeam &team,
+                                         const NodeWindow &window, int signal)
+      : gin(context), rail(team), node(window), sig{(ncclGinSignal_t)signal, 1} {}
+  // `bytes` from `src` into the place of `dst` in the rail peer's copy on
+  // node peer_node (both pointers name places in this rank's copy).
+  __device__ __forceinline__ void put(int peer_node, const void *dst, const void *src,
                                       size_t bytes) const {
-    gin.put(rail, peer_node, win, dst, win, src, bytes, sig, ncclGin_None{}, ncclCoopThread{},
-            ncclGin_None{}, cuda::thread_scope_system, cuda::thread_scope_system);
-  }
-  // Nothing to carry: the signal alone.
-  __device__ __forceinline__ void signal(int peer_node) const {
-    gin.signal(rail, peer_node, sig, ncclCoopThread{}, ncclGin_None{}, cuda::thread_scope_thread,
-               cuda::thread_scope_system);
+    gin.put(rail, peer_node, node.window, node.offset(dst), node.window, node.offset(src), bytes,
+            sig, ncclGin_None{}, ncclCoopThread{}, ncclGin_None{}, cuda::thread_scope_system,
+            cuda::thread_scope_system);
   }
 };
 

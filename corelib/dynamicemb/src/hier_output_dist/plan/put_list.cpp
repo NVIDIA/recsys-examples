@@ -33,8 +33,7 @@ constexpr int64_t kKeyMask = (int64_t{1} << kNodeShift) - 1;
 PutLists put_lists(const at::Tensor &round_table, const at::Tensor &num_rounds,
                    const at::Tensor &cell_uniq, const at::Tensor &rail_cells,
                    const at::Tensor &fwd_pieces, const at::Tensor &fwd_rounds,
-                   const at::Tensor &cells_in, const at::Tensor &cell_stage,
-                   const PlanSizes &sizes) {
+                   const at::Tensor &cells_in, const at::Tensor &cell_stage, const Sizes &sizes) {
   const int64_t num_nodes = sizes.topo.num_nodes, num_features = sizes.num_features,
                 rounds_cap = sizes.rounds_cap, chunk_rows = sizes.chunk_rows;
   // The two lists as one of 2 * num_nodes nodes: the backward's owner nodes,

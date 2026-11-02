@@ -22,14 +22,14 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 #include <cstdint>
 
 #include "hier_output_dist/common/constants.h"
-#include "hier_output_dist/device/ctrl_words.cuh"
+#include "hier_output_dist/device/node_window.cuh"
 #include "hier_output_dist/device/warp.cuh"
 #include "hier_output_dist/output/args.cuh"
 
 namespace dyn_emb {
 namespace hier_output_dist {
 
-// Task queue `queue` of the out kernel (Ctrl::tasks): its warps take the
+// Task queue `queue` of the out kernel (a task word of the ctrl section): its warps take the
 // tasks in order, one at a time; the last CTA sets every queue back to 0 for
 // the next kernel.
 struct TaskQueue {
@@ -40,15 +40,16 @@ struct TaskQueue {
   // Every lane of the warp: the warp's next task.
   __device__ __forceinline__ int64_t next_warp() const {
     int64_t task = 0;
-    if ((threadIdx.x & 31) == 0)
-      task = (int64_t)atomicAdd(
-          (unsigned long long *)CtrlWords::of(args, args.topo.local_rank).task(queue), 1ull);
+    if ((threadIdx.x & 31) == 0) {
+      const NodeWindow node(args.window, args.topo.local_rank);
+      task = (int64_t)atomicAdd((unsigned long long *)node.layout(args).ctrl.task(queue), 1ull);
+    }
     return __shfl_sync(kFull, task, 0);
   }
   // One thread of the last CTA, once every other CTA has taken its last task.
   __device__ __forceinline__ static void reset_all(const OutArgs &args) {
-    const CtrlWords mine = CtrlWords::of(args, args.topo.local_rank);
-    for (int queue = 0; queue < kNumQueues; ++queue) *mine.task(queue) = 0;
+    const CtrlLayout ctrl = NodeWindow(args.window, args.topo.local_rank).layout(args).ctrl;
+    for (int queue = 0; queue < kNumQueues; ++queue) *ctrl.task(queue) = 0;
   }
 };
 
@@ -96,6 +97,7 @@ struct Interleave {
 // [start[rnd * stride], start[(rnd + 1) * stride]), and with stride 2 those
 // before start[rnd * stride + 1] come first. A warp takes its tasks in order,
 // so it only moves on, and reads the table only when its round changes.
+// Without a table (one node, no such tasks) it has one round of none.
 struct RoundCursor {
   const int64_t *start;
   int stride, rnd = 0;
@@ -103,9 +105,9 @@ struct RoundCursor {
   __device__ RoundCursor(const int64_t *task_starts, int task_stride)
       : start(task_starts),
         stride(task_stride),
-        lo(task_starts[0]),
-        mid(task_starts[task_stride - 1]),
-        hi(task_starts[task_stride]) {}
+        lo(task_starts ? task_starts[0] : 0),
+        mid(task_starts ? task_starts[task_stride - 1] : 0),
+        hi(task_starts ? task_starts[task_stride] : 0) {}
   __device__ __forceinline__ void seek(int64_t task) {
     while (task >= hi) {
       ++rnd;

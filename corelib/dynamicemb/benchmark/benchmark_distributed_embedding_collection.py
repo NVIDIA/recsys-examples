@@ -886,6 +886,12 @@ class TorchRecTraffic:
         return out
 
 
+# A call's tables across nodes that HierTraffic reads (the plan's tensors):
+# the node-unique rows put to (uniq_in) and received from (uniq_out) each
+# node, the proxy's rounds and its remote occurrences.
+_HIER_IB_TABLES = ("uniq_in", "uniq_out", "num_rounds", "occurrence_count")
+
+
 class HierTraffic:
     """Rows the hierarchical output dist moves, from each call's plan (its
     block offsets and, across nodes, its node-unique counts, read once the
@@ -898,10 +904,10 @@ class HierTraffic:
     each owner puts one row per node-unique key another node asked of it
     over IB (rows_ib_out), each proxy receives them (rows_ib_in) for the
     rows its node asked of other nodes' owners on its rail (rows_remote: the
-    IB rows over these are the node dedup's ratio), in the rounds its proxy
-    region takes them (rounds, per call); the backward moves the same rows
-    the other way. A call costs the host one append: its tables are read
-    afterwards.
+    IB rows over these are the node dedup's ratio), in the rounds its
+    proxy_rows take them (rounds, per call); the backward moves the same
+    rows the other way. A call costs the host one append: its tables are
+    read afterwards.
     """
 
     def __init__(self, rank: int, local_world_size: int):
@@ -921,7 +927,11 @@ class HierTraffic:
                 traffic.hier = self_._hier
                 tensors = hier_output_dist_plan_tensors(plan)
                 traffic.calls.append(
-                    (tensors["block_start"], plan.num_recv, tensors["meta"])
+                    (
+                        tensors["block_start"],
+                        plan.num_recv,
+                        tuple(tensors.get(name) for name in _HIER_IB_TABLES),
+                    )
                 )
             return orig(self_, local_embs, sharding_ctx)
 
@@ -933,20 +943,11 @@ class HierTraffic:
 
     def _ib(self, call) -> Optional[Tuple[torch.Tensor, ...]]:
         """A call's node-unique rows put to (uniq_in) and received from
-        (uniq_out) each node, and its MiscSlots (kMiscRounds, kMiscChunks,
-        kMiscRemoteKeys); None on one node."""
-        from dynamicemb_extensions import hier_output_dist_op_meta_offsets
-
-        hier = self.hier
-        if not hier.multi_node:
+        (uniq_out) each node, its rounds as proxy (num_rounds) and its
+        remote occurrences (occurrence_count); None on one node."""
+        if not self.hier.multi_node:
             return None
-        meta, at = call[2], hier_output_dist_op_meta_offsets(hier.op)
-        num_nodes = hier._num_nodes
-        return (
-            meta[at["uniq_in"] :][:num_nodes],
-            meta[at["uniq_out"] :][:num_nodes],
-            meta[at["misc"] :][:3],
-        )
+        return call[2]
 
     def per_call_ib(self) -> List[Tuple[int, int, int, int]]:
         """Per call (in order): the rows this rank puts over IB as owner
@@ -986,8 +987,8 @@ class HierTraffic:
             out.update(
                 rows_ib_out=sum(int(ib[0].sum()) for ib in ibs) / iterations,
                 rows_ib_in=sum(int(ib[1].sum()) for ib in ibs) / iterations,
-                rows_remote=sum(int(ib[2][2]) for ib in ibs) / iterations,
-                rounds=sum(int(ib[2][0]) for ib in ibs) / len(ibs),
+                rows_remote=sum(int(ib[3]) for ib in ibs) / iterations,
+                rounds=sum(int(ib[2]) for ib in ibs) / len(ibs),
             )
             # the busier direction of this rank's NIC
             out["rows_ib"] = max(out["rows_ib_out"], out["rows_ib_in"])

@@ -25,58 +25,59 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 
 #include <cstdint>
 
-#include "hier_output_dist/device/ctrl_words.cuh"
 #include "hier_output_dist/device/memory_order.cuh"
+#include "hier_output_dist/device/node_window.cuh"
 #include "hier_output_dist/device/spin.cuh"
 
 namespace dyn_emb {
 namespace hier_output_dist {
 
-// The node barrier on one control word, for a channel's kernel (Args, CommArgs
-// or OutArgs, gives its windows, Ctrl, Channel, Topo and timeout): one thread
-// publishes this rank's sequence number in its word; threads [0, local_size)
-// then wait, each until one node peer's word has it. That peer has then done
-// everything it did before it published (its release, our acquire): all its
-// earlier work on the channel too (its kernels run in issue order).
+// The node barrier on one control word (`word`, this rank's copy of it), for
+// a channel's kernel (Args, CommArgs or OutArgs, gives its Channel, Topo and
+// timeout): one thread publishes this rank's sequence number in its word;
+// threads [0, local_size) then wait, each until one node peer's word has it.
+// That peer has then done everything it did before it published (its
+// release, our acquire): all its earlier work on the channel too (its kernels
+// run in issue order).
 template <typename Args>
 struct NodeBarrier {
   const Args &args;
-  int word;  // Ctrl offset of the word
-  __device__ __forceinline__ NodeBarrier(const Args &channel_args, int offset)
-      : args(channel_args), word(offset) {}
-  // One thread: this rank's word (in its control words `mine`) gets the
-  // sequence number.
-  __device__ __forceinline__ void publish(const CtrlWords &mine) const {
-    st_release_sys(mine.word(word), (uint64_t)args.ch.seq);
-  }
+  const NodeWindow &node;
+  uint64_t *word;
+  __device__ __forceinline__ NodeBarrier(const Args &channel_args, const NodeWindow &window,
+                                         uint64_t *mine)
+      : args(channel_args), node(window), word(mine) {}
+  // One thread: this rank's word gets the sequence number.
+  __device__ __forceinline__ void publish() const { st_release_sys(word, (uint64_t)args.ch.seq); }
   // Waits until node peer `peer` has published (spin reports `what`).
   __device__ __forceinline__ void wait(int peer, const char *what) const {
     Spin spin(args.timeout_ns);
-    const CtrlWords peer_words = CtrlWords::of(args, peer);
-    while ((int64_t)ld_acquire_sys(peer_words.word(word)) < args.ch.seq)
+    const uint64_t *theirs = node.peer(word, peer);
+    while ((int64_t)ld_acquire_sys(theirs) < args.ch.seq)
       spin.pause(what, peer, args.ch.seq, args.topo.rank);
   }
 };
 
 // Flags of the node's ranks, one per pair: node peer r's flag in a rank's
-// control words is at word + r. Each rank tells every peer (sets its flag in
-// the peer's words to the sequence number), then waits until every peer told
-// it. Args as for NodeBarrier.
+// copy is flags[r] (`flags`: this rank's copy). Each rank tells every peer
+// (sets its flag in the peer's copy to the sequence number), then waits
+// until every peer told it. Args as for NodeBarrier.
 template <typename Args>
 struct PeerFlags {
   const Args &args;
-  int word;  // Ctrl offset of node peer 0's flag
-  __device__ __forceinline__ PeerFlags(const Args &channel_args, int offset)
-      : args(channel_args), word(offset) {}
-  // This rank (node peer `me`) tells node peer `peer`.
-  __device__ __forceinline__ void tell(int peer, int me) const {
-    st_release_sys(CtrlWords::of(args, peer).word(word + me), (uint64_t)args.ch.seq);
+  const NodeWindow &node;
+  uint64_t *flags;
+  __device__ __forceinline__ PeerFlags(const Args &channel_args, const NodeWindow &window,
+                                       uint64_t *mine)
+      : args(channel_args), node(window), flags(mine) {}
+  // This rank tells node peer `peer`.
+  __device__ __forceinline__ void tell(int peer) const {
+    st_release_sys(node.peer(flags + args.topo.local_rank, peer), (uint64_t)args.ch.seq);
   }
-  // Waits until node peer `peer` told this rank (node peer `me`).
-  __device__ __forceinline__ void wait(int me, int peer, const char *what) const {
+  // Waits until node peer `peer` told this rank.
+  __device__ __forceinline__ void wait(int peer, const char *what) const {
     Spin spin(args.timeout_ns);
-    const uint64_t *flag = CtrlWords::of(args, me).word(word + peer);
-    while ((int64_t)ld_acquire_sys(flag) < args.ch.seq)
+    while ((int64_t)ld_acquire_sys(flags + peer) < args.ch.seq)
       spin.pause(what, peer, args.ch.seq, args.topo.rank);
   }
 };

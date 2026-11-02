@@ -53,24 +53,15 @@ std::string why_not(int readiness, int local_size) {
       return "NCCL GIN does not connect the nodes' rails, gives fewer than 4 contexts, or its "
              "signals do not start at 0";
     default:  // kNoMemory
-      return "it could not allocate its windows or event";
+      return "it could not allocate its window or event";
   }
 }
 
 // The part of the kernels' arguments both channels share, over the
-// registered windows `win`.
-ChannelStatic channel_static(const Layout &layout, const Win &win, const ncclDevComm &dev,
+// registered window.
+ChannelStatic channel_static(const Sizes &sizes, ncclWindow_t window, const ncclDevComm &dev,
                              double timeout_s) {
-  ChannelStatic channel{};
-  channel.topo = layout.topo;
-  channel.num_features = layout.num_features;
-  channel.win = win;
-  channel.ctrl_at = layout.ctrl_at;
-  channel.meta_at = layout.meta_at;
-  channel.chunk_rows = layout.chunk_rows;
-  channel.timeout_ns = (uint64_t)(std::min(timeout_s, 1e9) * 1e9);
-  channel.dev = dev;
-  return channel;
+  return ChannelStatic{sizes, window, (uint64_t)(std::min(timeout_s, 1e9) * 1e9), dev};
 }
 
 // Every rank's readiness (`every`, in rank order) in words: those of the
@@ -113,28 +104,28 @@ std::string HierOutputDist::invalid(const Config &config) {
 
 HierOutputDist::HierOutputDist(const std::string &unique_id, Config config)
     : config_(std::move(config)),
-      layout_(config_),
+      sizes_(sizes_of(config_)),
       rules_(owner_rules(config_)),
       budget_(config_, sms_of(current_device())),
       trace_(current_device()),
       device_(current_device()) {
   c10::cuda::CUDAGuard guard(device_);
   const bool fail_alloc = g_fail_alloc.exchange(false);
-  communicator_ = std::make_unique<Communicator>(unique_id, layout_.topo);
+  communicator_ = std::make_unique<Communicator>(unique_id, sizes_.topo);
   // Nothing of the op stays on any rank once the ranks know it cannot run.
   // When they all know it (together), the communicator ends on every rank at
   // once: a rank whose part of the agreement is done may still be sending a
   // peer its last data, which an abort would cut. An error of this rank alone
   // aborts it.
   auto give_up = [this](bool together) noexcept {
-    if (windows_ != nullptr) windows_->deregister(communicator_->comm());
+    if (window_ != nullptr) window_->deregister(communicator_->comm());
     if (together)
       communicator_->finish();
     else
       communicator_->abort();
-    if (windows_ != nullptr) windows_->free(false);
+    if (window_ != nullptr) window_->free(false);
     lookup_grad_.reset();
-    windows_.reset();
+    window_.reset();
   };
   int readiness = kReady;
   if (!communicator_->lsa_ok())
@@ -144,20 +135,20 @@ HierOutputDist::HierOutputDist(const std::string &unique_id, Config config)
   if (readiness == kReady) {
     try {
       TORCH_CHECK(!fail_alloc, "hier_output_dist: an allocation failure a test asked for");
-      windows_ = std::make_unique<SymmetricWindows>(layout_, device_);
+      window_ = std::make_unique<SymmetricWindow>(sizes_, device_);
       lookup_grad_ = std::make_shared<LookupGrad>();
     } catch (const std::exception &) {  // out of memory included
       readiness = kNoMemory;
-      if (windows_ != nullptr) windows_->free(false);
+      if (window_ != nullptr) window_->free(false);
       lookup_grad_.reset();
-      windows_.reset();
+      window_.reset();
     }
   }
   // Before the collective registration: a rank that cannot run must not
   // leave the others waiting for it there.
   std::string why;
   try {
-    why = why_some_cannot_run(communicator_->all_gather(readiness), layout_.topo.local_size);
+    why = why_some_cannot_run(communicator_->all_gather(readiness), sizes_.topo.local_size);
   } catch (...) {
     give_up(false);
     throw;
@@ -167,15 +158,15 @@ HierOutputDist::HierOutputDist(const std::string &unique_id, Config config)
     throw std::runtime_error("[hier_output_dist] the op cannot run (" + why + ")");
   }
   try {
-    windows_->register_all(communicator_->comm());
+    window_->register_window(communicator_->comm());
   } catch (...) {  // the peers may wait in the registration: nothing to agree on
     give_up(false);
     throw;
   }
   channel_static_ =
-      channel_static(layout_, windows_->win(), communicator_->dev(), config_.timeout_s);
-  in_ = std::make_unique<InChannel>(config_, layout_, channel_static_, *windows_, device_);
-  out_ = std::make_unique<OutChannel>(config_, layout_, channel_static_, *windows_, budget_, trace_,
+      channel_static(sizes_, window_->handle(), communicator_->dev(), config_.timeout_s);
+  in_ = std::make_unique<InChannel>(config_, sizes_, channel_static_, *window_, device_);
+  out_ = std::make_unique<OutChannel>(config_, sizes_, channel_static_, *window_, budget_, trace_,
                                       device_, lookup_grad_);
   // The other ops' kernels issued so far had their CTAs counted without this
   // op (CtaBudget): let them end first.
@@ -193,66 +184,65 @@ bool HierOutputDist::exit_round() noexcept {
   if (err == cudaSuccess) err = cudaDeviceSynchronize();
   uint64_t closed = 0;
   if (err == cudaSuccess)
-    err = cudaMemcpy(&closed, windows_->region(kCtrl) + 8 * (uint64_t)layout_.ctrl_at.closed, 8,
-                     cudaMemcpyDeviceToHost);
+    err = cudaMemcpy(&closed, window_->layout().ctrl.closed(), 8, cudaMemcpyDeviceToHost);
   if (err != cudaSuccess) {
     fprintf(stderr,
             "[hier_output_dist] rank %d: CUDA error during the teardown of the op: %s;"
-            " keeping the windows until the process exits\n",
-            layout_.topo.rank, cudaGetErrorString(err));
+            " keeping the window until the process exits\n",
+            sizes_.topo.rank, cudaGetErrorString(err));
     return false;
   }
   if (closed != 1)
     fprintf(stderr,
             "[hier_output_dist] rank %d: a node or rail peer did not tear down its op within"
-            " the timeout; keeping the windows until the process exits\n",
-            layout_.topo.rank);
+            " the timeout; keeping the window until the process exits\n",
+            sizes_.topo.rank);
   return closed == 1;
 }
 
 // Python frees the op when the last reference to its sharding goes, which
 // need not happen at the same point on every rank, so the teardown is local:
 // no collective deregistration or finalize, which would deadlock against
-// ranks still training. Node peers may read this rank's windows after its
-// own kernels have ended, and rail peers may still send it the credits each
-// out kernel sends for the next one at its end, which nobody waits for. So
-// before freeing them every node peer and every rail peer must have reached
+// ranks still training. Node peers may read this rank's window after its own
+// kernels have ended, and rail peers may still send it the credits each out
+// kernel sends for the next one at its end, which nobody waits for. So
+// before freeing it every node peer and every rail peer must have reached
 // its teardown too (the exit round; a rail peer's closing signal comes
 // behind its credits), unless every rank quiesced the op after its last
 // kernel. If the device sync reports an error (a kernel that trapped), the
-// op keeps its windows, its communicator and its share of the CTA budget,
+// op keeps its window, its communicator and its share of the CTA budget,
 // since its kernels may still hold SMs. Once the sync succeeds, its kernels
 // have ended, so it leaves the budget. If the exit round then reports a CUDA
 // error, or a peer does not reach its teardown in time, the op keeps its
-// windows and communicator until the process exits.
+// window and communicator until the process exits.
 void HierOutputDist::release() noexcept {
   c10::cuda::OptionalCUDAGuard guard;
-  bool keep_lookup_rows = false;
+  bool keep_window = false;
   try {
     guard.set_device(at::Device(at::kCUDA, device_));  // Python may free the op on any thread
     cudaError_t err = cudaDeviceSynchronize();
     if (err != cudaSuccess) {
       fprintf(stderr,
               "[hier_output_dist] rank %d: CUDA error during the teardown of the op: %s;"
-              " keeping the windows until the process exits\n",
-              layout_.topo.rank, cudaGetErrorString(err));
+              " keeping the window until the process exits\n",
+              sizes_.topo.rank, cudaGetErrorString(err));
       return;
     }
     budget_.uncount();  // its kernels have ended
     if (!quiesced_ && !exit_round()) return;
-    // A view of lookup_rows still alive points into the rows window: keep its memory.
-    keep_lookup_rows = windows_->live_views() > 0;
-    if (keep_lookup_rows)
+    // A view of lookup_rows still alive points into the window: keep its memory.
+    keep_window = window_->live_views() > 0;
+    if (keep_window)
       fprintf(stderr,
-              "[hier_output_dist] rank %d: %lld views of the lookup output window outlive the"
-              " op; keeping that window's memory until the process exits\n",
-              layout_.topo.rank, (long long)windows_->live_views());
-  } catch (...) {  // teardown must not throw: keep the windows, as above
+              "[hier_output_dist] rank %d: %lld views of the lookup output (lookup_rows) outlive"
+              " the op; keeping the window's memory until the process exits\n",
+              sizes_.topo.rank, (long long)window_->live_views());
+  } catch (...) {  // teardown must not throw: keep the window, as above
     return;
   }
-  windows_->deregister(communicator_->comm());
+  window_->deregister(communicator_->comm());
   communicator_->abort();
-  windows_->free(keep_lookup_rows);
+  window_->free(keep_window);
 }
 
 std::shared_ptr<Plan> HierOutputDist::plan(PlanInput input) {
@@ -262,10 +252,10 @@ std::shared_ptr<Plan> HierOutputDist::plan(PlanInput input) {
               "hier_output_dist: the keys carry weights exactly when the op was made with "
               "weights (",
               config_.weights ? "with" : "without", ")");
-  Partition part = partition_keys(input, rules_, layout_.topo.world_size);
+  Partition part = partition_keys(input, rules_, sizes_.topo.world_size);
   FanoutTables fanout;
   if (input.reverse_indices.has_value()) fanout = fanout_tables(*input.reverse_indices, part.inv);
-  return std::make_shared<Plan>(layout_, std::move(input), std::move(part), std::move(fanout));
+  return std::make_shared<Plan>(sizes_, std::move(input), std::move(part), std::move(fanout));
 }
 
 void HierOutputDist::start(Plan &plan) {
@@ -301,20 +291,23 @@ void HierOutputDist::quiesce() {
 }
 
 std::map<std::string, int64_t> HierOutputDist::capacities() const {
-  return {{"lookup_keys", layout_.lookup_keys},
-          {"remote_keys", layout_.remote_keys},
+  return {{"lookup_keys", sizes_.lookup_keys},
+          {"remote_keys", sizes_.remote_keys},
           {"proxy_bytes", config_.capacities.proxy_bytes},
-          {"num_proxy_rows", layout_.num_proxy_rows},
-          {"rounds_cap", layout_.rounds_cap}};
+          {"num_proxy_rows", sizes_.num_proxy_rows},
+          {"rounds_cap", sizes_.rounds_cap}};
 }
 
+// The ctrl section's buffer takes whole kBufferAlign units, as the keys and
+// rows sections' buffers do.
 std::map<std::string, std::map<std::string, int64_t>> HierOutputDist::memory() const {
   std::map<std::string, std::map<std::string, int64_t>> bytes;
-  for (int window = 0; window < kNumWins; ++window)
-    bytes["windows"][window_names()[window]] =
-        windows_->window_bytes(window, communicator_->granularity());
-  for (int region = 0; region < kNumRegions; ++region)
-    bytes["regions"][region_names()[region]] = (int64_t)layout_.region_bytes[region];
+  bytes["windows"]["window"] = window_->bytes(communicator_->granularity());
+  const WindowLayout window = window_->layout();
+  std::map<std::string, int64_t> &buffers = bytes["buffers"];
+  buffers["ctrl"] = (int64_t)buffer_end(window.ctrl.bytes());
+  for (const auto &buffer : window.keys.buffers()) buffers[buffer.first] = (int64_t)buffer.second;
+  for (const auto &buffer : window.rows.buffers()) buffers[buffer.first] = (int64_t)buffer.second;
   return bytes;
 }
 

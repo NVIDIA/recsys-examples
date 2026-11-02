@@ -19,11 +19,13 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 #include <algorithm>
 #include <cstdint>
 
+#include "hier_output_dist/common/keys.h"
+
 namespace dyn_emb {
 namespace hier_output_dist {
 
 PeerWords remote_rows(const at::Tensor &row_cell, const at::Tensor &block_start,
-                      const at::Tensor &destination_base, const PlanSizes &sizes) {
+                      const at::Tensor &destination_base, const Sizes &sizes) {
   const int64_t rows = row_cell.numel(), local_size = sizes.topo.local_size,
                 world_size = sizes.topo.world_size;
   const at::Tensor row = at::arange(rows, row_cell.options());
@@ -38,20 +40,18 @@ PeerWords remote_rows(const at::Tensor &row_cell, const at::Tensor &block_start,
   return gather;
 }
 
-int64_t header_words(const PlanSizes &sizes) {
-  return 1 + 4 * sizes.rounds_cap * sizes.topo.num_nodes + 4 * (sizes.rounds_cap + 1);
-}
-
-PeerWords header_gather(const PlanSizes &sizes, const at::TensorOptions &options) {
-  const int64_t local_size = sizes.topo.local_size, words = header_words(sizes),
-                table_words = 4 * sizes.rounds_cap * sizes.topo.num_nodes,
-                push_words = 4 * (sizes.rounds_cap + 1);
-  // the proxy header (proxy.h): its rounds at word 0, its round table from
-  // word 4, then a row of push tables per requester
-  const at::Tensor word = at::arange(words, options.dtype(at::kLong));
-  const at::Tensor first_word = at::where(
-      word.eq(0), 0,
-      at::where(word.le(table_words), word + 3, word + (3 + sizes.topo.local_rank * push_words)));
+PeerWords header_gather(const Sizes &sizes, const at::TensorOptions &options) {
+  const ProxyHeader header = ProxyHeader::of(sizes);
+  const int64_t local_size = sizes.topo.local_size, words = header.gathered_words(),
+                push_table = header.push_table_word(sizes.topo.local_rank);
+  const auto long_options = options.dtype(at::kLong);
+  // of each proxy's header, in the order of its gathered words: its rounds,
+  // its round table, then its push tables for this requester
+  const at::Tensor first_word =
+      at::cat({at::arange(ProxyHeader::kRoundsWord, ProxyHeader::kRoundsWord + 1, long_options),
+               at::arange(ProxyHeader::kTableWord, ProxyHeader::kTableWord + header.table_words(),
+                          long_options),
+               at::arange(push_table, push_table + header.push_words(), long_options)});
   PeerWords gather;
   gather.peer = at::arange(local_size, options.dtype(at::kInt))
                     .view({local_size, 1})
@@ -64,23 +64,26 @@ PeerWords header_gather(const PlanSizes &sizes, const at::TensorOptions &options
 RequesterTables requester_tables(const at::Tensor &words, const at::Tensor &headers,
                                  const at::Tensor &owner_cell_start, const at::Tensor &row_cell,
                                  const at::Tensor &cell_start, const at::Tensor &block_start,
-                                 const PlanSizes &sizes) {
+                                 const Sizes &sizes) {
   const int64_t rows = row_cell.numel(), num_nodes = sizes.topo.num_nodes,
                 local_size = sizes.topo.local_size, world_size = sizes.topo.world_size,
                 num_features = sizes.num_features, rounds_cap = sizes.rounds_cap;
   const auto long_options = cell_start.options().dtype(at::kLong);
   const auto int_options = cell_start.options().dtype(at::kInt);
   RequesterTables tables;
-  // Per proxy, from its header: its rounds, its round table, and this
-  // requester's push tables there, made absolute: positions in push_order
-  // (its rows at the proxies before come first), groups after its groups at
-  // the proxies before.
+  // Per proxy, from its gathered header: its rounds, its round table, and
+  // this requester's push tables there, made absolute: positions in
+  // push_order (its rows at the proxies before come first), groups after its
+  // groups at the proxies before.
+  const ProxyHeader header = ProxyHeader::of(sizes);
   const at::Tensor block_size = block_start.diff().view({num_nodes, local_size});
   tables.push_order_off =
       exclusive_ends(block_size.sum({0}) - block_size.select(0, sizes.topo.node));
-  tables.proxy_rounds = headers.select(1, 0).to(at::kLong).clamp(1, rounds_cap);
-  tables.proxy_round_tables = headers.narrow(1, 1, rounds_cap * num_nodes * 4);
-  const at::Tensor raw = headers.narrow(1, 1 + rounds_cap * num_nodes * 4, (rounds_cap + 1) * 4)
+  tables.proxy_rounds =
+      headers.select(1, ProxyHeader::kGatheredRounds).to(at::kLong).clamp(1, rounds_cap);
+  tables.proxy_round_tables =
+      headers.narrow(1, ProxyHeader::kGatheredTable, header.table_words()).contiguous();
+  const at::Tensor raw = headers.narrow(1, header.gathered_push_table(), header.push_words())
                              .reshape({local_size, rounds_cap + 1, 4})
                              .to(at::kLong);
   const at::Tensor group_at = exclusive_ends(

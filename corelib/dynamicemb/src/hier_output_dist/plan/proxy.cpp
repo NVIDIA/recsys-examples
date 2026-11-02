@@ -26,7 +26,17 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 namespace dyn_emb {
 namespace hier_output_dist {
 
-ProxyKeys proxy_keys(const ProxyInput &input, const PlanSizes &sizes, bool node_dedup) {
+ProxyBuffers proxy_buffers(at::Tensor remote_map, at::Tensor key_stage, const ProxyHeader &header,
+                           const at::TensorOptions &options) {
+  const auto int_options = options.dtype(at::kInt);
+  return ProxyBuffers{
+      std::move(remote_map), std::move(key_stage), at::from_blob(header.rounds(), {1}, int_options),
+      at::from_blob(header.round_table(), {header.rounds_cap, header.num_nodes, 4}, int_options),
+      at::from_blob(header.push_table(0), {header.local_size, header.rounds_cap + 1, 4},
+                    int_options)};
+}
+
+ProxyKeys proxy_keys(const ProxyInput &input, const Sizes &sizes, bool node_dedup) {
   const int64_t entries = sizes.remote_keys, num_nodes = sizes.topo.num_nodes,
                 num_features = sizes.num_features, num_tables = sizes.num_tables;
   const auto int_options = input.keys.options().dtype(at::kInt);
@@ -122,7 +132,7 @@ ProxyKeys proxy_keys(const ProxyInput &input, const PlanSizes &sizes, bool node_
 }
 
 ProxyRounds proxy_rounds_and_slots(ProxyKeys &keys, const at::Tensor &requester_start,
-                                   const ProxyWindows &windows, const PlanSizes &sizes) {
+                                   const ProxyBuffers &buffers, const Sizes &sizes) {
   const int64_t entries = sizes.remote_keys, num_nodes = sizes.topo.num_nodes,
                 local_size = sizes.topo.local_size, rounds_cap = sizes.rounds_cap,
                 proxy_rows = sizes.num_proxy_rows, partial_rows = sizes.partial_rows,
@@ -189,16 +199,16 @@ ProxyRounds proxy_rounds_and_slots(ProxyKeys &keys, const at::Tensor &requester_
     at::Tensor slice_bytes = rounds.num_rounds * 16 + keys.uniq_out * record_bytes;
     slice_bytes.narrow(0, sizes.topo.node, 1).zero_();
     rounds.stage_slice = slice_bytes.cumsum(0) - slice_bytes;
-    const int64_t dump_word = windows.key_stage.numel() - 2;
+    const int64_t dump_word = buffers.key_stage.numel() - 2;
     const at::Tensor record_word =
         at::where(keys.valid_key,
                   (rounds.stage_slice.index_select(0, keys.key_node) + rounds.num_rounds * 16)
                       .div_(8, "floor")
                       .add_(keys.key_uniq, record_bytes / 8),
                   dump_word);
-    windows.key_stage.index_copy_(0, record_word, keys.key_value);
+    buffers.key_stage.index_copy_(0, record_word, keys.key_value);
     if (record_bytes == 16)  // the weight's bits, then 4 zero bytes
-      windows.key_stage.index_copy_(
+      buffers.key_stage.index_copy_(
           0, record_word + 1,
           keys.key_weight.view(at::kInt).to(at::kLong).bitwise_and_(0xFFFFFFFF));
     keys.key_value.reset();
@@ -209,13 +219,13 @@ ProxyRounds proxy_rounds_and_slots(ProxyKeys &keys, const at::Tensor &requester_
                    at::arange(rounds_cap, long_options).view({rounds_cap, 1}) * 16)
                       .div(4, "floor"),
                   2 * dump_word);
-    windows.key_stage.view(at::kInt).index_copy_(
+    buffers.key_stage.view(at::kInt).index_copy_(
         0, (piece_word.unsqueeze(2) + at::arange(4, long_options)).view({-1}),
         rounds.round_table.view({-1}));
   }
   // the proxy header: the rounds, then the round table
-  windows.proxy_hdr.narrow(0, 0, 1).copy_(rounds.num_rounds.view({1}));
-  windows.proxy_hdr.narrow(0, 4, rounds_cap * num_nodes * 4).copy_(rounds.round_table.view({-1}));
+  buffers.rounds.copy_(rounds.num_rounds.view({1}));
+  buffers.round_table.copy_(rounds.round_table);
   // Per key: its piece and its row. A piece's rows: its keys' rows, then
   // the duplicates' slots, then the partial rows of its heavy keys,
   // local_size blocks of partial_rows each.
@@ -270,13 +280,13 @@ ProxyRounds proxy_rounds_and_slots(ProxyKeys &keys, const at::Tensor &requester_
   }
   duplicate_base.reset();
   const at::Tensor order = keys.order.to(at::kLong);
-  windows.remote_map.select(0, 0).index_copy_(
+  buffers.remote_map.select(0, 0).index_copy_(
       0, order, row_at.bitwise_or(heavy_at.to(at::kInt).bitwise_left_shift_(31)));
-  windows.remote_map.select(0, 1).index_copy_(0, order, rounds.slot_at);
+  buffers.remote_map.select(0, 1).index_copy_(0, order, rounds.slot_at);
   return rounds;
 }
 
-PushKey push_key_of(const PlanSizes &sizes) {
+PushKey push_key_of(const Sizes &sizes) {
   // a piece holds at most remote_keys keys: at most this many IB chunks
   const int64_t chunks = sizes.remote_keys / sizes.chunk_rows + 1;
   PushKey key;
@@ -288,7 +298,7 @@ PushKey push_key_of(const PlanSizes &sizes) {
 }
 
 ProxyPlan proxy_push_order(ProxyKeys keys, ProxyRounds rounds, const at::Tensor &requester_start,
-                           const ProxyWindows &windows, const PlanSizes &sizes) {
+                           const ProxyBuffers &buffers, const Sizes &sizes) {
   const int64_t entries = sizes.remote_keys, num_nodes = sizes.topo.num_nodes,
                 local_size = sizes.topo.local_size, rounds_cap = sizes.rounds_cap;
   const auto long_options = keys.order.options().dtype(at::kLong);
@@ -361,13 +371,11 @@ ProxyPlan proxy_push_order(ProxyKeys keys, ProxyRounds rounds, const at::Tensor 
       at::cat({tasks.cumsum(0, at::kInt) - tasks, at::zeros({local_size, 1}, int_options)}, 1);
   ProxyPlan plan;
   plan.push_start = start.to(at::kInt);
-  windows.proxy_hdr.narrow(0, 4 + rounds_cap * num_nodes * 4, local_size * (rounds_cap + 1) * 4)
-      .copy_(at::stack({plan.push_start, heavy_start.to(at::kInt), flags,
-                        groups_at - groups_at.narrow(1, 0, 1)},
-                       2)
-                 .view({-1}));
-  // Each occurrence's place in its requester's push order (remote_map word
-  // 2), and the flag of the push task that pushes it.
+  buffers.push_tables.copy_(at::stack(
+      {plan.push_start, heavy_start.to(at::kInt), flags, groups_at - groups_at.narrow(1, 0, 1)},
+      2));
+  // Each occurrence's place in its requester's push order (remote_map's
+  // positions), and the flag of the push task that pushes it.
   at::Tensor occurrence_flag;
   {
     const at::Tensor push_order64 = push_order.to(at::kLong);
@@ -377,7 +385,7 @@ ProxyPlan proxy_push_order(ProxyKeys keys, ProxyRounds rounds, const at::Tensor 
                                      .to(at::kInt);
     const at::Tensor position =
         at::arange(entries, int_options) - requester_start.to(at::kInt).index_select(0, requester);
-    windows.remote_map.select(0, 2).index_copy_(0, push_order64, position);
+    buffers.remote_map.select(0, 2).index_copy_(0, push_order64, position);
     const at::Tensor table =
         requester.clamp_max(local_size - 1)
             .mul_(rounds_cap + 1)

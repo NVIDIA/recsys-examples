@@ -21,7 +21,7 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 #include "hier_output_dist/common/constants.h"
 #include "hier_output_dist/common/formats.h"
 #include "hier_output_dist/host/config.h"
-#include "hier_output_dist/host/layout.h"
+#include "hier_output_dist/host/sizes.h"
 #include "hier_output_dist/plan/proxy.h"
 
 namespace dyn_emb {
@@ -70,18 +70,18 @@ void Config::validate() const {
     const int64_t rows = capacities.proxy_bytes / row_bytes();
     const int64_t least = min_proxy_rows_for(num_nodes());
     if (rows < least)
-      invalid("a proxy rows region of at most ", (double)capacities.proxy_bytes / (1 << 20),
-              " MiB holds ", rows, " rows of ", row_bytes(), " bytes, and across ", num_nodes(),
+      invalid("proxy_rows of at most ", (double)capacities.proxy_bytes / (1 << 20), " MiB holds ",
+              rows, " rows of ", row_bytes(), " bytes, and across ", num_nodes(),
               " nodes every round fits its half only with at least ", least, " (",
               (least * row_bytes() + (1 << 20) - 1) >> 20, " MiB); raise DYNAMICEMB_GIN_PROXY_MB");
     const int64_t num_proxy_rows = num_proxy_rows_for(*this);
     const int64_t rounds = rounds_for(capacities.remote_keys, num_proxy_rows);
     if (rounds > kMaxRounds)
-      invalid("a proxy rows region of ", num_proxy_rows, " rows holds the ", capacities.remote_keys,
+      invalid("proxy_rows of ", num_proxy_rows, " rows holds the ", capacities.remote_keys,
               " keys of other nodes' owners a proxy may deduplicate in ", rounds,
               " rounds, more than the ", kMaxRounds,
               " a call can take; raise DYNAMICEMB_GIN_PROXY_MB");
-    const int bits = push_key_of(Layout(*this).plan_sizes()).bits;
+    const int bits = push_key_of(sizes_of(*this)).bits;
     if (bits > 63)
       invalid("the proxy sorts its push order by a key of ", bits,
               " bits (its fields: the GPUs of a node, the rounds, and the keys and IB chunks of ",

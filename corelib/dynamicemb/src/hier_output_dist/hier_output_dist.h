@@ -27,8 +27,8 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 // the rows of those keys the same way: one row per node-unique key over
 // InfiniBand, the node's own copies over NVLink.
 //
-// The op's windows are static: its constructor allocates them once, at the
-// capacities of its configuration, and they never grow; a call's own tables
+// The op's window is static: its constructor allocates it once, at the
+// capacities of its configuration, and it never grows; a call's own tables
 // come from the caching allocator. A call that does not fit the capacities
 // (wait() returns false, on every rank alike) still runs its steps to their
 // end with nothing in their messages, so the op stays valid for the next
@@ -56,11 +56,11 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 #include "hier_output_dist/host/config.h"
 #include "hier_output_dist/host/cta_budget.h"
 #include "hier_output_dist/host/in_channel.h"
-#include "hier_output_dist/host/layout.h"
 #include "hier_output_dist/host/out_channel.h"
 #include "hier_output_dist/host/plan.h"
+#include "hier_output_dist/host/sizes.h"
 #include "hier_output_dist/host/trace.h"
-#include "hier_output_dist/host/windows.h"
+#include "hier_output_dist/host/window.h"
 
 namespace dyn_emb {
 namespace hier_output_dist {
@@ -81,9 +81,9 @@ class HierOutputDist {
 
   // Collective: every rank of the sharding with the same unique id and
   // configuration (but its rank), one that invalid() takes. Creates the
-  // communicator and allocates every window and the lookup gradient's
-  // event. Then the ranks agree that each can run (its LSA team, GIN, its
-  // allocations) before they register the windows together. If one cannot,
+  // communicator and allocates the window and the lookup gradient's event.
+  // Then the ranks agree that each can run (its LSA team, GIN, its
+  // allocations) before they register the window together. If one cannot,
   // every rank throws the same std::runtime_error, which names the ranks and
   // why, and holds nothing. A rank that fails inside the registration throws
   // alone, and the others wait there, as in NCCL's own initialization.
@@ -91,7 +91,7 @@ class HierOutputDist {
   // Local: waits for this rank's kernels. Then, unless the op was quiesced
   // after the last kernel of every rank, it waits at most min(timeout, 30 s)
   // for every node and rail peer to reach its own teardown. It frees the
-  // windows only if they all did; else it keeps them until the process exits.
+  // window only if they all did; else it keeps it until the process exits.
   ~HierOutputDist();
   HierOutputDist(const HierOutputDist &) = delete;
   HierOutputDist &operator=(const HierOutputDist &) = delete;
@@ -122,8 +122,8 @@ class HierOutputDist {
                       bool divide);
   // Collective, after the op's last call, on every rank: syncs this rank's
   // device and meets the other ranks over the op's communicator. No peer
-  // then reads this rank's windows or sends it a credit any more, so the
-  // teardown frees them at once. The next call clears it.
+  // then reads this rank's window or sends it a credit any more, so the
+  // teardown frees it at once. The next call clears it.
   void quiesce();
 
   // Diagnostics.
@@ -132,11 +132,12 @@ class HierOutputDist {
   // configured): lookup_keys; across nodes also remote_keys and what follows
   // from it (num_proxy_rows, rounds_cap), which read 0 on one node.
   std::map<std::string, int64_t> capacities() const;
-  // Bytes of each window (whole granules) and region.
+  // Bytes of the window ("windows": this rank's copy, whole granules) and of
+  // each of its buffers ("buffers": what each takes in the window).
   std::map<std::string, std::map<std::string, int64_t>> memory() const;
   bool gin_railed() const { return communicator_->gin_railed(); }
   // Views of lookup_rows alive, and the gradient views among them.
-  int64_t live_views() const { return windows_->live_views(); }
+  int64_t live_views() const { return window_->live_views(); }
   int64_t lookup_grad_live() const { return lookup_grad_->live.load(); }
   // In a build with DYNAMICEMB_HIER_TRACE=1, the out kernels' timelines and
   // the in channel's step times (Trace; empty without it), and the calls of
@@ -151,11 +152,11 @@ class HierOutputDist {
   bool exit_round() noexcept;
 
   Config config_;
-  Layout layout_;
+  Sizes sizes_;
   std::unique_ptr<Communicator> communicator_;
-  std::unique_ptr<SymmetricWindows> windows_;
-  // The part of the kernels' arguments both channels share, once the
-  // windows are registered.
+  std::unique_ptr<SymmetricWindow> window_;
+  // The part of the kernels' arguments both channels share, once the window
+  // is registered.
   ChannelStatic channel_static_{};
   OwnerRules rules_;  // part 1's
   std::shared_ptr<LookupGrad> lookup_grad_;

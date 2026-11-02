@@ -31,29 +31,62 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 namespace dyn_emb {
 namespace hier_output_dist {
 
-// One output dist kernel of a call. The requester's rows are its bucketized
-// rows in [0, block_start[world_size]) (its block for an owner:
+// One output dist kernel of a call: pointers to the call's tables, which the
+// input dist made before the forward. The requester's rows are its
+// bucketized rows in [0, block_start[world_size]) (its block for an owner:
 // [block_start[owner], block_start[owner + 1])). The forward reads a row at
 // src[row], the backward writes its gradient at dst[row]: for a same-node
-// owner both are its row of the owner's lookup_rows; for a remote owner, rows
-// of the proxy's proxy_rows (the node-unique key's row, and the row's own
-// slot). inv[row] is its row of the requester's output, or under index dedup
-// its deduplicated row, whose original rows the fan-out lists. The tables of
-// the call's Meta (meta) and, across nodes, the requester's push order
-// (push_order), heavy groups and their sub-tasks, the proxy's reducer list
-// and the put lists say the rest.
+// owner both are its row of the owner's lookup_rows; for a remote owner,
+// rows of the proxy's proxy_rows (the node-unique key's row, and the row's
+// own slot). inv[row] is its row of the requester's output, or under index
+// dedup its deduplicated row, whose original rows the fan-out lists. Across
+// nodes, the requester's push order, heavy groups and its tables of the
+// node's proxies, the owner's and the proxy's tables, and the put lists say
+// the rest; the tables' strides are rounds_cap and num_nodes. Both kernels
+// of a call get the same pointers, but for the fields marked forward or
+// backward, which only that kernel gets (the plan lets go of the forward's
+// tables after it).
 struct OutPlan {
   const int64_t *block_start;  // [world_size + 1]
   const int32_t *rows;         // [sent] forward: src; backward: dst
   const int32_t *inv;          // [sent]
   Fanout fanout;               // fanout.exp_off: index dedup
-  const int64_t *meta;         // the call's small tables (Meta)
-  // across nodes
-  const int32_t *push_order;       // [sent] remote rows by proxy and push order
-  const HeavyGroup *heavy_groups;  // backward: heavy groups, positions in push_order
-  const int32_t *group_first_sub;  // backward: each heavy group's first sub-task
-  const int32_t *group_of_sub;     // backward: the heavy group of each sub-task
-  const int32_t *reducer_start;    // backward, proxy: the reducer list (plan/proxy.h)
+  // across nodes, the requester's
+  const int32_t *push_order;             // [sent] remote rows by proxy and push order
+  const HeavyGroup *heavy_groups;        // heavy groups, positions in push_order
+  const int32_t *group_first_sub;        // each heavy group's first sub-task
+  const int32_t *group_of_sub;           // the heavy group of each sub-task
+  const int64_t *proxy_rounds;           // [local_size] each same-node proxy's rounds
+  const RoundPiece *proxy_round_tables;  // forward: [local_size][rounds_cap][num_nodes] their
+                                         // round tables
+  const ReqEntry *push_tables;     // [local_size][rounds_cap + 1] its push order at each proxy,
+                                   // positions absolute in push_order, groups in heavy_groups
+  const int64_t *push_order_off;   // forward: [local_size + 1] where its rows for each proxy
+                                   // start in push_order
+  const int64_t *fwd_task_starts;  // forward: [rounds_cap + 1] its tasks of rows of other nodes
+                                   // before each round, round after round: per round a slot per
+                                   // task of its busiest proxy there (32 positions of its push
+                                   // order), proxies in turn
+  const int64_t *bwd_task_starts;  // [2 rounds_cap + 1] its backward's the same way: before
+                                   // round rnd's push tasks of heavy groups (2 * rnd), and before
+                                   // those of its rows (2 * rnd + 1)
+  // across nodes, the owner's
+  const int64_t *uniq_in;        // [num_nodes] node-unique keys from each source node
+  const int32_t *fwd_put_start;  // forward: [num_nodes][rounds_cap + 1] (fwd_puts)
+  // across nodes, the proxy's
+  const int64_t *num_rounds;          // its rounds
+  const int64_t *num_chunks;          // IB chunks of its backward puts
+  const int64_t *uniq_out;            // forward: [num_nodes] its node-unique keys of each owner
+                                      // node
+  const int64_t *uniq_off;            // [num_nodes + 1] its first node-unique key of each owner
+                                      // node, over all (the reducer list's index)
+  const RoundPiece *round_table;      // [rounds_cap][num_nodes] its round table
+  const int32_t *bwd_put_start;       // [num_nodes][rounds_cap + 1] (bwd_puts)
+  const int32_t *push_start;          // forward: [local_size][rounds_cap + 1] (push_starts)
+  const int64_t *reduce_task_starts;  // [rounds_cap + 1] its reducers' tasks before each round:
+                                      // per round its busiest owner node's IB chunks, times the
+                                      // owner nodes, times the tasks of a chunk (32 keys each)
+  const int32_t *reducer_start;       // the reducer list (plan/proxy.h)
   const int64_t *reducer_entries;
   const PutSeg *put_list;  // the owner's forward and the proxy's backward put lists
                            // (plan/put_list.h)
@@ -61,6 +94,8 @@ struct OutPlan {
                            // reduced; forward, requester: [local_size] rows it
                            // pulled from each proxy (index dedup's heavy rows
                            // wait for them); zeroed when the kernel starts
+  int64_t rounds_cap;
+  int num_nodes;
   // rows
   char *out;             // forward: [num_out, row] the requester's output
   const char *grad;      // backward: [num_out, row] its gradient
@@ -74,11 +109,41 @@ struct OutPlan {
   int64_t group_subs;    // backward: the heavy groups' sub-tasks
   float scale;           // backward: 1 / world_size under TorchRec's gradient
                          // division, else 1
+
+  // Where an owner node's node-unique keys of a round sit in a same-node
+  // proxy's proxy_rows.
+  __device__ __forceinline__ RoundPiece piece(int proxy, int rnd, int owner_node) const {
+    return proxy_round_tables[((int64_t)proxy * rounds_cap + rnd) * num_nodes + owner_node];
+  }
+  // Where an owner node's node-unique keys of a round sit in this proxy's
+  // proxy_rows, and their first IB chunk.
+  __device__ __forceinline__ RoundPiece round_piece(int rnd, int owner_node) const {
+    return round_table[(int64_t)rnd * num_nodes + owner_node];
+  }
+  // This rank's push order at a same-node proxy in a round; the next entry
+  // holds the ends.
+  __device__ __forceinline__ const ReqEntry *push_entry(int proxy, int rnd) const {
+    return push_tables + (int64_t)proxy * (rounds_cap + 1) + rnd;
+  }
+  // The owner's forward put list's segments for a proxy node, by round: those
+  // of round rnd from [rnd], and [rounds_cap] the node's end.
+  __device__ __forceinline__ const int32_t *fwd_puts(int proxy_node) const {
+    return fwd_put_start + (int64_t)proxy_node * (rounds_cap + 1);
+  }
+  // The proxy's backward put list's segments for an owner node, the same way.
+  __device__ __forceinline__ const int32_t *bwd_puts(int owner_node) const {
+    return bwd_put_start + (int64_t)owner_node * (rounds_cap + 1);
+  }
+  // Where a same-node requester's rows of each round start in its push order
+  // at this proxy ([num_rounds]: the end).
+  __device__ __forceinline__ const int32_t *push_starts(int requester) const {
+    return push_start + (int64_t)requester * (rounds_cap + 1);
+  }
 };
 
 // What every out kernel of the op takes, fixed when the op is made.
 struct OutStatic : ChannelStatic {
-  int row_bytes, vec;  // a row of lookup_rows, in bytes and in 16-byte vectors
+  int vec;  // a row of lookup_rows in 16-byte vectors
 };
 
 // What one out kernel adds: its sequence number, its CTAs' roles and
@@ -86,7 +151,7 @@ struct OutStatic : ChannelStatic {
 struct OutCall {
   Channel ch;                 // the out channel, at this kernel's out_seq
   int reducers;               // backward across nodes: the last CTAs, which reduce
-  int64_t arrive0;            // Ctrl::arrive before this kernel
+  int64_t arrive0;            // the arrive word (CtrlLayout) before this kernel
   unsigned long long *trace;  // [kTraceWords] this kernel's timeline, or nullptr
   OutPlan plan;
 };

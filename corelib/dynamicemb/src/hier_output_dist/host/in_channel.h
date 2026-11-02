@@ -28,10 +28,10 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 #include <memory>
 
 #include "hier_output_dist/common/channel_args.h"
+#include "hier_output_dist/common/sizes.h"
 #include "hier_output_dist/host/config.h"
-#include "hier_output_dist/host/layout.h"
 #include "hier_output_dist/host/plan.h"
-#include "hier_output_dist/host/windows.h"
+#include "hier_output_dist/host/window.h"
 #include "hier_output_dist/plan/proxy.h"
 #include "hier_output_dist/plan/requester.h"
 
@@ -41,9 +41,9 @@ namespace hier_output_dist {
 class InChannel {
  public:
   // channel: the part of the kernels' arguments both channels share, over
-  // the registered windows.
-  InChannel(const Config &config, const Layout &layout, const ChannelStatic &channel,
-            const SymmetricWindows &windows, int device);
+  // the registered window.
+  InChannel(const Config &config, const Sizes &sizes, const ChannelStatic &channel,
+            const SymmetricWindow &window, int device);
 
   // Queues the call on the side stream, after part 1 on the caller's stream
   // and after the out kernels that the previous start found issued (its
@@ -57,19 +57,20 @@ class InChannel {
 
  private:
   ChannelStatic channel_;
-  PlanSizes sizes_;
+  Sizes sizes_;
   bool node_dedup_;
   int64_t seq_ = 0;  // the calls started
   at::cuda::CUDAStream side_;
   // The out kernels the previous start found issued (its out_done).
   std::shared_ptr<at::cuda::CUDAEvent> previous_out_done_;
-  // This rank's regions the steps read and write, as tensors without an
-  // allocator (the windows outlive them): the own part of node_keys (and
-  // node_weights), and across nodes its remote part, the cell tags, the
-  // proxy's windows, rail_keys, cell_stage and rail_cells.
+  // This rank's buffers the steps read and write, views of its copy of the
+  // window without an allocator (the window outlives them): the own part of
+  // node_keys (and node_weights), and across nodes its remote part,
+  // remote_cells, the buffers the proxy writes, rail_keys, cell_stage and
+  // rail_cells.
   at::Tensor own_keys_, own_weights_;
   at::Tensor remote_keys_, remote_weights_, remote_cells_;
-  ProxyWindows proxy_windows_;
+  ProxyBuffers proxy_buffers_;
   at::Tensor rail_keys_, cell_stage_, rail_cells_;
   // Constants of the op across nodes: the table of each feature (numbered
   // densely), the other nodes, and the words of the proxy headers this

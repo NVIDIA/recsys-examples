@@ -35,7 +35,7 @@ namespace hier_output_dist {
 // The most IB chunks of a list's pieces, for at most `keys` keys in all: a
 // piece of k keys takes ceil(k / chunk_rows), and a list has rounds_cap *
 // num_nodes pieces.
-inline int64_t chunk_bound(int64_t keys, const PlanSizes &sizes) {
+inline int64_t chunk_bound(int64_t keys, const Sizes &sizes) {
   return keys / sizes.chunk_rows + sizes.rounds_cap * sizes.topo.num_nodes + 1;
 }
 
@@ -69,8 +69,7 @@ struct PutLists {
 PutLists put_lists(const at::Tensor &round_table, const at::Tensor &num_rounds,
                    const at::Tensor &cell_uniq, const at::Tensor &rail_cells,
                    const at::Tensor &fwd_pieces, const at::Tensor &fwd_rounds,
-                   const at::Tensor &cells_in, const at::Tensor &cell_stage,
-                   const PlanSizes &sizes);
+                   const at::Tensor &cells_in, const at::Tensor &cell_stage, const Sizes &sizes);
 
 }  // namespace hier_output_dist
 }  // namespace dyn_emb

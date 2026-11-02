@@ -22,6 +22,7 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 #include "hier_output_dist/common/trace_flag.h"
 #include "hier_output_dist/common/trace_slots.h"
 #include "hier_output_dist/host/in_channel.h"
+#include "hier_output_dist/host/sizes.h"
 #include "hier_output_dist/kernels.h"
 #include "hier_output_dist/plan/node.h"
 #include "hier_output_dist/plan/put_list.h"
@@ -30,40 +31,38 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 namespace dyn_emb {
 namespace hier_output_dist {
 
-InChannel::InChannel(const Config &config, const Layout &layout, const ChannelStatic &channel,
-                     const SymmetricWindows &windows, int device)
+InChannel::InChannel(const Config &config, const Sizes &sizes, const ChannelStatic &channel,
+                     const SymmetricWindow &window, int device)
     : channel_(channel),
-      sizes_(layout.plan_sizes()),
+      sizes_(sizes),
       node_dedup_(config.node_dedup),
       // One stream: the channel's steps rely on their issue order.
       side_(at::cuda::getStreamFromPool(/*isHighPriority=*/true, device)) {
   const auto options = at::TensorOptions().device(at::kCUDA, device);
-  auto region = [&](Region region, at::IntArrayRef sizes, at::ScalarType dtype) {
-    return at::from_blob(windows.region(region), sizes, options.dtype(dtype));
+  auto view = [&](void *buffer, at::IntArrayRef shape, at::ScalarType dtype) {
+    return at::from_blob(buffer, shape, options.dtype(dtype));
   };
+  const KeysLayout keys = window.layout().keys;
   const int64_t lookup_keys = sizes_.lookup_keys, remote_keys = sizes_.remote_keys;
-  const at::Tensor node_keys = region(kNodeKeys, {lookup_keys + remote_keys}, at::kLong);
-  own_keys_ = node_keys.narrow(0, 0, lookup_keys);
+  const at::Tensor node_keys = view(keys.node_keys(), {lookup_keys + remote_keys}, at::kLong);
+  own_keys_ = node_keys.narrow(0, 0, keys.remote_start());
   at::Tensor node_weights;
   if (config.weights) {
-    node_weights = region(kNodeWeights, {lookup_keys + remote_keys}, at::kFloat);
-    own_weights_ = node_weights.narrow(0, 0, lookup_keys);
+    node_weights = view(keys.node_weights(), {lookup_keys + remote_keys}, at::kFloat);
+    own_weights_ = node_weights.narrow(0, 0, keys.remote_start());
   }
-  if (!layout.multi_node()) return;
-  const int64_t num_nodes = sizes_.topo.num_nodes, local_size = sizes_.topo.local_size,
-                rounds_cap = sizes_.rounds_cap, record_bytes = sizes_.record_bytes;
-  remote_keys_ = node_keys.narrow(0, lookup_keys, remote_keys);
-  if (config.weights) remote_weights_ = node_weights.narrow(0, lookup_keys, remote_keys);
-  remote_cells_ = region(kRemoteCells, {remote_keys}, at::kInt);
-  const int64_t piece_words = (num_nodes - 1) * rounds_cap * 2;  // 16 bytes a round piece
-  proxy_windows_ = ProxyWindows{
-      region(kRemoteMap, {3, remote_keys}, at::kInt),
-      region(kKeyStage, {piece_words + remote_keys * record_bytes / 8 + 2}, at::kLong),
-      region(kProxyHdr, {4 + 4 * rounds_cap * num_nodes + 4 * local_size * (rounds_cap + 1)},
-             at::kInt)};
-  rail_keys_ = region(kRailKeys, {lookup_keys * record_bytes / 8 + piece_words}, at::kLong);
-  cell_stage_ = region(kCellStage, {num_nodes, sizes_.num_features}, at::kLong);
-  rail_cells_ = region(kRailCells, {num_nodes, sizes_.num_features}, at::kLong);
+  if (!sizes_.multi_node()) return;
+  const int64_t num_nodes = sizes_.topo.num_nodes, num_features = sizes_.num_features;
+  remote_keys_ = node_keys.narrow(0, keys.remote_start(), remote_keys);
+  if (config.weights) remote_weights_ = node_weights.narrow(0, keys.remote_start(), remote_keys);
+  remote_cells_ = view(keys.remote_cells(), {remote_keys}, at::kInt);
+  proxy_buffers_ =
+      proxy_buffers(view(keys.remote_map().base, {RemoteMap::kArrays, remote_keys}, at::kInt),
+                    view(keys.key_stage(), {(int64_t)keys.key_stage_bytes() / 8}, at::kLong),
+                    keys.proxy_header(), options);
+  rail_keys_ = view(keys.rail_keys(), {(int64_t)keys.rail_keys_bytes() / 8}, at::kLong);
+  cell_stage_ = view(keys.cell_stage(0), {num_nodes, num_features}, at::kLong);
+  rail_cells_ = view(keys.rail_cells(0), {num_nodes, num_features}, at::kLong);
   tables_ = at::tensor(dense_tables(config.feature_tables), at::kInt).to(options);
   other_nodes_ = other_nodes_of(sizes_.topo, options);
   header_gather_ = header_gather(sizes_, options);
@@ -91,10 +90,9 @@ void InChannel::start(Plan &plan, const std::shared_ptr<at::cuda::CUDAEvent> &ou
   };
   const Topo &topo = sizes_.topo;
   const int64_t local_size = topo.local_size, num_nodes = topo.num_nodes,
-                num_features = sizes_.num_features, rounds_cap = sizes_.rounds_cap,
-                lookup_keys = sizes_.lookup_keys, remote_keys = sizes_.remote_keys;
+                num_features = sizes_.num_features, lookup_keys = sizes_.lookup_keys,
+                remote_keys = sizes_.remote_keys;
   const auto long_options = plan.block_start_.options();
-  plan.meta_ = at::zeros({channel_.meta_at.words}, long_options);
   // The node: every rank's counts (and the node barrier), the layout of the
   // node's keys, and this rank's keys pushed to their targets.
   const auto [totals, before, mine] = launch_node_count_exchange(
@@ -105,7 +103,7 @@ void InChannel::start(Plan &plan, const std::shared_ptr<at::cuda::CUDAEvent> &ou
                   num_features, lookup_keys, remote_keys);
   step_done(kStepLayout);
   launch_node_key_push(channel_, plan.keys_, plan.key_weights_, plan.row_cell_,
-                       node.destination_base, node.rows_to_push, lookup_keys);
+                       node.destination_base, node.rows_to_push);
   step_done(kStepPush);
   launch_node_done(channel_, seq);
   step_done(kStepDone);
@@ -128,14 +126,14 @@ void InChannel::start(Plan &plan, const std::shared_ptr<at::cuda::CUDAEvent> &ou
   } else {
     // The proxy: the node-unique keys of its remote part, their rows and
     // rounds, and its node's push orders (into remote_map, key_stage and
-    // proxy_hdr).
+    // the proxy header).
     ProxyKeys keys = proxy_keys(ProxyInput{remote_keys_, remote_weights_, remote_cells_,
                                            node.requester_start, node.skip, tables_},
                                 sizes_, node_dedup_);
-    ProxyRounds rounds = proxy_rounds_and_slots(keys, node.requester_start, proxy_windows_, sizes_);
+    ProxyRounds rounds = proxy_rounds_and_slots(keys, node.requester_start, proxy_buffers_, sizes_);
     step_done(kStepDedup);
     const ProxyPlan proxy = proxy_push_order(std::move(keys), std::move(rounds),
-                                             node.requester_start, proxy_windows_, sizes_);
+                                             node.requester_start, proxy_buffers_, sizes_);
     step_done(kStepPushOrder);
     // The rail: the count messages, the layout of the rail, then the
     // proxies' key records into the owners' rail_keys and the owners' cell
@@ -158,13 +156,12 @@ void InChannel::start(Plan &plan, const std::shared_ptr<at::cuda::CUDAEvent> &ou
         launch_node_status_exchange(channel_, seq, status_publish(rail));
     needs = agreed_needs(peer_needs);
     step_done(kStepStatusExchange);
-    const at::Tensor headers = launch_peer_gather(channel_, kProxyHdr, header_gather_.peer,
-                                                  header_gather_.first_word, 1, 0)
-                                   .view({local_size, header_words(sizes_)});
+    const at::Tensor headers = launch_peer_gather(channel_, kGatherProxyHeader, header_gather_.peer,
+                                                  header_gather_.first_word)
+                                   .view({local_size, ProxyHeader::of(sizes_).gathered_words()});
     const PeerWords rows =
         remote_rows(plan.row_cell_, plan.block_start_, node.destination_base, sizes_);
-    at::Tensor words =
-        launch_peer_gather(channel_, kRemoteMap, rows.peer, rows.first_word, 3, remote_keys);
+    at::Tensor words = launch_peer_gather(channel_, kGatherRemoteMap, rows.peer, rows.first_word);
     step_done(kStepGathers);
     const RequesterTables requester =
         requester_tables(words, headers, owner_cell_start, plan.row_cell_, plan.cell_start_,
@@ -178,15 +175,33 @@ void InChannel::start(Plan &plan, const std::shared_ptr<at::cuda::CUDAEvent> &ou
         put_lists(proxy.round_table, proxy.num_rounds, proxy.cell_uniq, rail_cells_,
                   owner.fwd_pieces, owner.fwd_rounds, rail.cells_in, rail.cell_stage, sizes_);
     step_done(kStepPutList);
-    // What the out kernels read: the requester's maps, the proxy's reducer
-    // list, the put lists (the ready counters zeroed by the kernels), the
-    // owner's KJT, and Meta.
+    // What the out kernels read: the requester's maps and its tables of the
+    // node's proxies, the owner's and the proxy's tables, the proxy's reducer
+    // list, the put lists (the ready counters zeroed by the kernels), and the
+    // owner's KJT.
     plan.src_ = requester.src;
     plan.dst_ = requester.dst;
     plan.push_order_ = requester.push_order;
     plan.heavy_groups_ = requester.heavy_groups;
     plan.group_first_sub_ = requester.group_first_sub;
     plan.group_of_sub_ = requester.group_of_sub;
+    plan.proxy_rounds_ = requester.proxy_rounds;
+    plan.proxy_round_tables_ = requester.proxy_round_tables;
+    plan.push_tables_ = requester.push_tables;
+    plan.push_order_off_ = requester.push_order_off;
+    plan.fwd_task_starts_ = requester.fwd_task_starts;
+    plan.bwd_task_starts_ = requester.bwd_task_starts;
+    plan.uniq_in_ = rail.uniq_in;
+    plan.fwd_put_start_ = lists.fwd_start;
+    plan.num_rounds_ = proxy.num_rounds;
+    plan.num_chunks_ = lists.num_chunks;
+    plan.occurrence_count_ = proxy.occurrence_count;
+    plan.uniq_out_ = proxy.uniq_out;
+    plan.uniq_off_ = proxy.uniq_off;
+    plan.round_table_ = lists.round_table;
+    plan.bwd_put_start_ = lists.bwd_start;
+    plan.push_start_ = proxy.push_start;
+    plan.reduce_task_starts_ = lists.reduce_task_starts;
     plan.reducer_start_ = proxy.reducer_start;
     plan.reducer_entries_ = proxy.reducer_entries;
     plan.put_list_ = lists.list;
@@ -197,32 +212,6 @@ void InChannel::start(Plan &plan, const std::shared_ptr<at::cuda::CUDAEvent> &ou
     plan.kjt_weights_ = owner.kjt_weights;
     plan.kjt_lengths_ = rail.kjt_lengths;
     plan.kjt_offsets_ = rail.kjt_offsets;
-    const at::Tensor &meta = plan.meta_;
-    const Meta &field = channel_.meta_at;
-    meta_int32(meta, field.proxy_round_tables, local_size * rounds_cap * num_nodes * 4)
-        .view({local_size, -1})
-        .copy_(requester.proxy_round_tables);
-    meta_int32(meta, field.push_tables, local_size * (rounds_cap + 1) * 4)
-        .copy_(requester.push_tables.view({-1}));
-    meta_words(meta, field.push_order_off, local_size + 1).copy_(requester.push_order_off);
-    meta_words(meta, field.proxy_rounds, local_size).copy_(requester.proxy_rounds);
-    meta_words(meta, field.fwd_task_starts, rounds_cap + 1).copy_(requester.fwd_task_starts);
-    meta_words(meta, field.bwd_task_starts, 2 * rounds_cap + 1).copy_(requester.bwd_task_starts);
-    meta_words(meta, field.slice_in, 2 * num_nodes).copy_(rail.slice_in.view({-1}));
-    meta_words(meta, field.uniq_in, num_nodes).copy_(rail.uniq_in);
-    meta_int32(meta, field.fwd_put_start, num_nodes * (rounds_cap + 1))
-        .copy_(lists.fwd_start.view({-1}));
-    meta_int32(meta, field.uniq_off, num_nodes + 1).copy_(proxy.uniq_off);
-    meta_words(meta, field.uniq_out, num_nodes).copy_(proxy.uniq_out);
-    meta_int32(meta, field.round_table, rounds_cap * num_nodes * 4)
-        .copy_(lists.round_table.view({-1}));
-    meta_int32(meta, field.bwd_put_start, num_nodes * (rounds_cap + 1))
-        .copy_(lists.bwd_start.view({-1}));
-    meta_int32(meta, field.push_start, local_size * (rounds_cap + 1))
-        .copy_(proxy.push_start.view({-1}));
-    meta_words(meta, field.reduce_task_starts, rounds_cap + 1).copy_(lists.reduce_task_starts);
-    meta_words(meta, field.misc, kNumMisc)
-        .copy_(at::stack({proxy.num_rounds, lists.num_chunks, proxy.occurrence_count}));
     num_recv = rail.num_recv;
     length_per_key = rail.length_per_key;
     group_subs = requester.group_subs;

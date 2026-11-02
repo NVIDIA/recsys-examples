@@ -160,7 +160,7 @@ void bind_hier_output_dist(py::module &py_module) {
            py::arg("divide"),
            "The output dist's backward kernel: the gradient of the lookup output")
       .def("quiesce", &HierOutputDist::quiesce, py::call_guard<py::gil_scoped_release>(),
-           "Collective, after the last call: the teardown then frees the windows at once")
+           "Collective, after the last call: the teardown then frees the window at once")
       .def("capacities", &HierOutputDist::capacities)
       .def("memory", &HierOutputDist::memory)
       .def("gin_railed", &HierOutputDist::gin_railed)

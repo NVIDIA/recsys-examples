@@ -50,12 +50,12 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 #include "hier_output_dist/common/constants.h"
 #include "hier_output_dist/common/formats.h"
 #include "hier_output_dist/common/gin_signals.h"
-#include "hier_output_dist/common/meta.h"
 #include "hier_output_dist/common/trace_flag.h"
 #include "hier_output_dist/common/trace_slots.h"
+#include "hier_output_dist/common/window.h"
 #include "hier_output_dist/device/cta.cuh"
-#include "hier_output_dist/device/ctrl_words.cuh"
 #include "hier_output_dist/device/node_sync.cuh"
+#include "hier_output_dist/device/node_window.cuh"
 #include "hier_output_dist/device/spin.cuh"
 #include "hier_output_dist/output/args.cuh"
 #include "hier_output_dist/output/bwd_gin_warps.cuh"
@@ -74,8 +74,8 @@ namespace bwd {
 // Across nodes, the end of a backward waits (warp 0 of the last CTA, its
 // lanes taking the rail peers in turn) for the gradient rows the proxy on
 // each other node puts into this owner's lookup_rows: its bwd_rows signal
-// against the running total (bwd_tot).
-__device__ __forceinline__ void wait_rail_rows_warp(const OutArgs &args, const CtrlWords &mine) {
+// against the running total (bwd_tot, of this rank's control words `ctrl`).
+__device__ __forceinline__ void wait_rail_rows_warp(const OutArgs &args, const CtrlLayout &ctrl) {
   const int lane = threadIdx.x & 31;
   // Tracing: CTA 0 is the last CTA when its watcher stopped before every
   // row had landed; another one comes after it saw them all
@@ -84,34 +84,34 @@ __device__ __forceinline__ void wait_rail_rows_warp(const OutArgs &args, const C
   ncclGin rows(args.dev, kCtxBwd);
   for (int peer_node = lane; peer_node < args.topo.num_nodes; peer_node += 32) {
     if (peer_node == args.topo.node) continue;
-    const uint64_t want =
-        *mine.bwd_tot(peer_node) + (uint64_t)args.plan.meta[args.meta_at.uniq_in + peer_node];
+    const uint64_t want = *ctrl.bwd_tot(peer_node) + (uint64_t)args.plan.uniq_in[peer_node];
     Spin spin(args.timeout_ns);
     while (rows.readSignal(sig_rows(peer_node)) < want)
       spin.pause("gradient rows of a proxy node", peer_node, (long long)want, args.topo.rank);
-    *mine.bwd_tot(peer_node) = want;
+    *ctrl.bwd_tot(peer_node) = want;
   }
 }
 
 // The end of a backward for this rank, in the last CTA to arrive: it sets
 // the task queues back to 0, tells every owner of the node that this rank's
-// gradient rows are in (its flag pushed[me] there) and waits until every
-// requester of the node has told it the same; across nodes warp 0 then waits
-// until the gradient rows of every rail proxy have landed. This rank's
+// gradient rows are in (its flag pushed[local_rank] there) and waits until
+// every requester of the node has told it the same; across nodes warp 0 then
+// waits until the gradient rows of every rail proxy have landed. This rank's
 // lookup_grad is then complete. Every thread of the last CTA.
 __device__ __forceinline__ void exit(const OutArgs &args) {
-  const int tid = threadIdx.x, me = args.topo.local_rank;
+  const int tid = threadIdx.x;
   const OutTimeline timeline(args);
-  const CtrlWords mine = CtrlWords::of(args, me);
-  const PeerFlags<OutArgs> pushed(args, args.ctrl_at.pushed);
+  const NodeWindow node(args.window, args.topo.local_rank);
+  const WindowLayout window = node.layout(args);
+  const PeerFlags<OutArgs> pushed(args, node, window.ctrl.pushed());
   if (tid == 0) {
     timeline.stamp_latest(kTraceArrived);
     TaskQueue::reset_all(args);
-    for (int peer = 0; peer < args.topo.local_size; ++peer) pushed.tell(peer, me);
+    for (int peer = 0; peer < args.topo.local_size; ++peer) pushed.tell(peer);
   }
   for (int peer = tid; peer < args.topo.local_size; peer += blockDim.x)
-    pushed.wait(me, peer, "gradient rows pushed");
-  if (args.topo.num_nodes > 1 && (tid >> 5) == 0) wait_rail_rows_warp(args, mine);
+    pushed.wait(peer, "gradient rows pushed");
+  if (args.topo.num_nodes > 1 && (tid >> 5) == 0) wait_rail_rows_warp(args, window.ctrl);
   if (timeline.on()) {
     __syncthreads();
     if (tid == 0) timeline.stamp_latest(kTraceExited);
@@ -135,7 +135,6 @@ __global__ void __launch_bounds__(kThreads, 1) bwd_kernel(OutArgs args) {
   const int local_size = args.topo.local_size, num_nodes = args.topo.num_nodes,
             node = args.topo.node, me = args.topo.local_rank;
   const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
-  const int64_t *meta = plan.meta;
   const OutTimeline timeline(args);
   timeline.begin_cta();
   const int gin = num_nodes == 1 || blockIdx.x != 0 ? 0 : timeline.on() ? 64 : 32;
@@ -153,12 +152,8 @@ __global__ void __launch_bounds__(kThreads, 1) bwd_kernel(OutArgs args) {
     // half_seen starts at 0; the entry barrier's sync publishes it
     for (int proxy = tid; proxy < local_size; proxy += workers) *tables.half_seen(proxy) = 0;
     int64_t groups = 0;  // this rank's heavy groups, at all its proxies
-    if (num_nodes > 1) {
-      const ReqEntry *req = (const ReqEntry *)(meta + args.meta_at.push_tables);
-      groups = req[(local_size - 1) * (args.win.rounds_cap + 1) +
-                   meta[args.meta_at.proxy_rounds + local_size - 1]]
-                   .groups;
-    }
+    if (num_nodes > 1)
+      groups = plan.push_entry(local_size - 1, tables.rounds(local_size - 1))->groups;
     if (blockIdx.x == 0) {
       // Counters this kernel counts from 0, before this rank publishes its
       // out_seq: everything that counts on them runs after the entry.
@@ -166,23 +161,22 @@ __global__ void __launch_bounds__(kThreads, 1) bwd_kernel(OutArgs args) {
       for (int64_t i = tid; i < slots; i += workers) plan.heavy_done[i] = 0;
       for (int64_t i = tid; i < groups; i += workers) plan.group_done[i] = 0;
       if (num_nodes > 1)
-        for (int64_t i = tid; i < meta[args.meta_at.misc + kMiscChunks]; i += workers)
-          plan.ready[i] = 0;
+        for (int64_t i = tid; i < *plan.num_chunks; i += workers) plan.ready[i] = 0;
       cta_sync(workers);
     }
     pass_entry_barrier(args, workers);
     const int64_t *node_block_start = plan.block_start + node * local_size;
-    const int64_t *bwd_task_starts = meta + args.meta_at.bwd_task_starts;
     // Every heavy row's sub-task has a slot before the remote tasks (across
     // nodes), which those of rows to other nodes take, and one among the row
     // tasks, which those of the node's rows take.
     const int64_t heavy_subs = fanout.exp_off != nullptr ? fanout.count[1] : 0,
                   early_subs = num_nodes > 1 ? heavy_subs : 0;
     const int64_t subs = early_subs + plan.group_subs,
-                  remote = subs + (num_nodes > 1 ? bwd_task_starts[2 * tables.max_rounds] : 0);
+                  remote = subs + (num_nodes > 1 ? plan.bwd_task_starts[2 * tables.max_rounds] : 0);
     const LocalRows local_rows{node_block_start, local_size, me};
     const int64_t rows = local_rows.count(), total = remote + rows + heavy_subs;
-    RoundCursor cursor(bwd_task_starts, 2);  // the round of this warp's remote tasks
+    // The round of this warp's remote tasks (one node: none).
+    RoundCursor cursor(num_nodes > 1 ? plan.bwd_task_starts : nullptr, 2);
     const TaskQueue queue(args, kQueueWork);
     for (int64_t task = queue.next_warp(); task < total; task = queue.next_warp()) {
       if (task < early_subs) {

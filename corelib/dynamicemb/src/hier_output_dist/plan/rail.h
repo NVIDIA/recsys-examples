@@ -42,20 +42,20 @@ namespace hier_output_dist {
 // the op.
 at::Tensor other_nodes_of(const Topo &topo, const at::TensorOptions &options);
 
-// The count messages this rank sends its rail (int64 [msg_out_words],
-// common/ctrl.h): the common part, its node's largest remote part
-// (need_remote), its rounds as proxy (num_rounds), the keys of its own node
-// it looks up as owner (own_total, its own part) and its node-unique keys per
-// owner node (uniq_out); then for each node its node-unique keys of each
-// feature there (cell_uniq, [owner node][feature]).
+// The count messages this rank sends its rail (int64
+// [CountMessage::out_words], common/ctrl.h): the common part, its node's
+// largest remote part (need_remote), its rounds as proxy (num_rounds), the
+// keys of its own node it looks up as owner (own_total, its own part) and its
+// node-unique keys per owner node (uniq_out); then for each node its
+// node-unique keys of each feature there (cell_uniq, [owner node][feature]).
 at::Tensor count_message(const at::Tensor &need_remote, const at::Tensor &num_rounds,
                          const at::Tensor &own_total, const at::Tensor &uniq_out,
                          const at::Tensor &cell_uniq);
 
 // The rail's layout, from the messages this rank got (int64 [num_nodes]
-// [msg_len], its own too) and its own part's cells (the node layout's
-// own_cells). Each slice a proxy puts holds its round pieces (16 bytes each),
-// then its records (record_bytes each).
+// [CountMessage::length], its own too) and its own part's cells (the node
+// layout's own_cells). Each slice a proxy puts holds its round pieces (16
+// bytes each), then its records (record_bytes each).
 struct RailLayout {
   // as proxy, to each owner of the rail (its slice in key_stage is the proxy's stage_slice)
   at::Tensor put_dst;    // int64 [num_nodes]: where its slice lands in the owner's rail_keys
@@ -82,7 +82,7 @@ struct RailLayout {
                               // remote_keys, and its most rounds
 };
 RailLayout rail_layout(const at::Tensor &messages, const at::Tensor &own_cells,
-                       const at::Tensor &other_nodes, const PlanSizes &sizes);
+                       const at::Tensor &other_nodes, const Sizes &sizes);
 
 // What this rank publishes to its node (int64 [3 + local_size *
 // num_features]): its rail's needs, then my_cell_starts.
@@ -109,7 +109,7 @@ struct OwnerTables {
 OwnerTables owner_tables(const RailLayout &rail, const at::Tensor &own_starts,
                          const at::Tensor &node_keys, const at::Tensor &node_weights,
                          const at::Tensor &rail_keys, const at::Tensor &other_nodes,
-                         const PlanSizes &sizes);
+                         const Sizes &sizes);
 
 }  // namespace hier_output_dist
 }  // namespace dyn_emb

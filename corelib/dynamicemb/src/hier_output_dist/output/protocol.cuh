@@ -22,17 +22,17 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 
 #include "hier_output_dist/common/trace_slots.h"
 #include "hier_output_dist/device/cta.cuh"
-#include "hier_output_dist/device/ctrl_words.cuh"
 #include "hier_output_dist/device/memory_order.cuh"
 #include "hier_output_dist/device/node_sync.cuh"
+#include "hier_output_dist/device/node_window.cuh"
 #include "hier_output_dist/output/args.cuh"
 #include "hier_output_dist/output/timeline.cuh"
 
 namespace dyn_emb {
 namespace hier_output_dist {
 
-// The out channel's entry barrier, on its node barrier word
-// (Channel::started): CTA 0 publishes this rank's out_seq, after a system
+// The out channel's entry barrier, on its node barrier word (out_started):
+// CTA 0 publishes this rank's out_seq, after a system
 // fence for what earlier kernels wrote (lookup_rows, which node peers read)
 // and what CTA 0 reset for this kernel; every CTA then waits until all node
 // peers have published theirs. A peer there has ended its lookup (which wrote
@@ -40,10 +40,11 @@ namespace hier_output_dist {
 // thread of threads [0, threads) (cta_sync), in every CTA.
 __device__ __forceinline__ void pass_entry_barrier(const OutArgs &args, int threads) {
   const int tid = threadIdx.x, local_size = args.topo.local_size;
-  const NodeBarrier<OutArgs> barrier(args, args.ch.started);
+  const NodeWindow node(args.window, args.topo.local_rank);
+  const NodeBarrier<OutArgs> barrier(args, node, node.layout(args).ctrl.out_started());
   if (blockIdx.x == 0 && tid == 0) {
     fence_sc_sys();
-    barrier.publish(CtrlWords::of(args, args.topo.local_rank));
+    barrier.publish();
   }
   for (int peer = tid; peer < local_size; peer += threads)
     barrier.wait(peer, "out-channel node barrier");
@@ -55,7 +56,7 @@ __device__ __forceinline__ void pass_entry_barrier(const OutArgs &args, int thre
   }
 }
 
-// The end of a CTA of an out kernel: each CTA arrives once in Ctrl::arrive, a
+// The end of a CTA of an out kernel: each CTA arrives once in its arrive word, a
 // running total over the rank's out kernels (so nothing is reset), and the
 // one whose arrival brings it to arrive0 + gridDim.x is this kernel's last.
 // Everything a CTA wrote and every load it made are ordered before its
@@ -70,7 +71,7 @@ __device__ __forceinline__ bool arrive_cta(const OutArgs &args) {
   if (timeline.on()) timeline.fold_cta();
   if (threadIdx.x == 0) {
     fence_sc_sys();
-    uint64_t *word = CtrlWords::of(args, args.topo.local_rank).arrive();
+    uint64_t *word = NodeWindow(args.window, args.topo.local_rank).layout(args).ctrl.arrive();
     last = (int64_t)atomicAdd((unsigned long long *)word, 1ull) + 1 == target;
     if (last) fence_sc_sys();
   }

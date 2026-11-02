@@ -125,15 +125,14 @@ __device__ void heavy_sub_warp(const OutArgs &args, const OutTables &tables, int
   const bool remote = kMulti && owner_node != args.topo.node,
              staged = remote && tables.rounds(rail) > 1;
   if (remote != late) return;
-  const char *src = (remote ? tables.proxy_rows(rail) : tables.lookup_rows(rail)) +
-                    (int64_t)plan.rows[row] * row_bytes;
+  const char *src =
+      remote ? tables.proxy_row(rail, plan.rows[row]) : tables.lookup_row(rail, plan.rows[row]);
   int64_t from = begin;
   if (staged) {
     if (lane == 0) {
-      const int64_t *push_order_off = plan.meta + args.meta_at.push_order_off;
       Spin spin(args.timeout_ns);
       while ((int64_t)ld_acquire_gpu((const uint64_t *)&plan.ready[rail]) <
-             push_order_off[rail + 1] - push_order_off[rail])
+             plan.push_order_off[rail + 1] - plan.push_order_off[rail])
         spin.pause("rows pulled from a proxy", rail, dedup_row, args.topo.rank);
     }
     __syncwarp();
@@ -159,14 +158,13 @@ __device__ __forceinline__ bool local_pull(const OutArgs &args, const OutTables 
                                            const LocalRows &local_rows, int64_t index, int lane,
                                            Pull &pull) {
   const OutPlan &plan = args.plan;
-  const int row_bytes = args.row_bytes;
   const char *src = nullptr;
   int64_t out_row = 0;
   const RowTask job = local_rows.task(index);
   if (job.count == 0) return false;
   if (lane < job.count) {
     const int64_t row = job.row0 + lane;
-    src = tables.lookup_rows(job.owner) + (int64_t)plan.rows[row] * row_bytes;
+    src = tables.lookup_row(job.owner, plan.rows[row]);
     out_row = plan.inv[row];
   }
   pull.src = src;
@@ -184,8 +182,7 @@ __device__ __forceinline__ bool remote_pull_warp(const OutArgs &args, const OutT
                                                  const FwdCursor &cursor, int64_t task, int lane,
                                                  Pull &pull) {
   const OutPlan &plan = args.plan;
-  const int local_size = args.topo.local_size, me = args.topo.local_rank,
-            row_bytes = args.row_bytes;
+  const int local_size = args.topo.local_size, me = args.topo.local_rank;
   const char *src = nullptr;
   int64_t out_row = 0;
   bool shared = false;
@@ -216,7 +213,7 @@ __device__ __forceinline__ bool remote_pull_warp(const OutArgs &args, const OutT
     owner_node = tables.owner_of(row) / local_size;
     at = plan.rows[row];
     piece = tables.piece_of(proxy, rnd, owner_node);
-    src = tables.proxy_rows(proxy) + (int64_t)at * row_bytes;
+    src = tables.proxy_row(proxy, at);
     out_row = plan.inv[row];
   }
   wait_landed_warp(args, tables, proxy, lane < num_rows, owner_node, piece, at, lane);
@@ -258,7 +255,7 @@ __device__ __forceinline__ void pull_warp(const OutArgs &args, const OutTables &
     // release).
     __syncwarp();
     if (lane == 0) {
-      red_release_sys(tables.done(peer) + (rnd & 1), (uint64_t)num_rows);
+      red_release_sys(tables.done(peer, rnd), (uint64_t)num_rows);
       if (tables.staged) red_release_gpu((uint64_t *)&plan.ready[peer], (uint64_t)num_rows);
     }
   }

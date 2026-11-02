@@ -85,18 +85,18 @@ LookupGrad::~LookupGrad() {
   if (released != nullptr) cudaEventDestroy(released);
 }
 
-OutChannel::OutChannel(const Config &config, const Layout &layout,
-                       const ChannelStatic &channel_static, SymmetricWindows &windows,
+OutChannel::OutChannel(const Config &config, const Sizes &sizes,
+                       const ChannelStatic &channel_static, SymmetricWindow &window,
                        CtaBudget &budget, Trace &trace, int device,
                        std::shared_ptr<LookupGrad> lookup_grad)
-    : static_{channel_static, (int)layout.row_bytes, (int)(layout.row_bytes / 16)},
-      channel_{0, layout.ctrl_at.out_started},
+    : static_{channel_static, (int)(sizes.row_bytes / 16)},
+      channel_{0},
       dim_(config.dim),
       dtype_(config.dtype),
       world_size_(config.world_size),
       device_(device),
-      multi_node_(layout.multi_node()),
-      windows_(windows),
+      multi_node_(sizes.multi_node()),
+      window_(window),
       budget_(budget),
       trace_(trace),
       lookup_grad_(std::move(lookup_grad)) {}
@@ -104,7 +104,7 @@ OutChannel::OutChannel(const Config &config, const Layout &layout,
 void OutChannel::check_lookup_grad(const char *what) const {
   TORCH_CHECK(lookup_grad_->live.load() == 0,
               "hier_output_dist: the gradient the last backward handed the lookup's backward (a "
-              "view of the lookup output window) is still alive at ",
+              "view of lookup_rows in the op's window) is still alive at ",
               what, ", which would overwrite it; do not keep the gradient of the lookup output");
 }
 
@@ -114,7 +114,7 @@ at::Tensor OutChannel::lookup_rows(const Plan &plan) {
   auto stream = at::cuda::getCurrentCUDAStream(device_);
   wait_last_out(stream);
   HIER_CUDA_CHECK(cudaStreamWaitEvent(stream, lookup_grad_->released, 0));
-  return windows_.lookup_rows(plan.num_recv(), dim_, dtype_);
+  return window_.lookup_rows(plan.num_recv(), dim_, dtype_);
 }
 
 // Storage that changes size only when a call needs more rows than it has or
@@ -135,7 +135,7 @@ void OutChannel::launch(const void *kernel, bool forward, OutCall &call) {
   call.reducers = budget_.reducers(ctas);
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream(device_);
   const bool timeline = trace_.start_out(forward, call, stream);
-  call.ch = Channel{channel_.seq + 1, channel_.started};
+  call.ch = Channel{channel_.seq + 1};
   call.arrive0 = arrive_;
   OutArgs args{static_, call};
   launch_out_kernel(kernel, args, ctas, out_shared_bytes(static_.topo.local_size, timeline),
@@ -148,9 +148,10 @@ void OutChannel::launch(const void *kernel, bool forward, OutCall &call) {
 std::tuple<at::Tensor, std::vector<at::Tensor>> OutChannel::forward(Plan &plan,
                                                                     const at::Tensor &lookup_out) {
   c10::cuda::CUDAGuard guard(device_);
-  TORCH_CHECK(plan.num_recv() == 0 ||
-                  (lookup_out.is_cuda() && lookup_out.data_ptr() == windows_.region(kLookupRows)),
-              "hier_output_dist: the lookup output must be the rows lookup_rows() returned");
+  const void *window_rows = window_.layout().rows.lookup_rows();
+  TORCH_CHECK(
+      plan.num_recv() == 0 || (lookup_out.is_cuda() && lookup_out.data_ptr() == window_rows),
+      "hier_output_dist: the lookup output must be the rows lookup_rows() returned");
   auto stream = at::cuda::getCurrentCUDAStream(device_);
   at::Tensor out = output(plan.num_out());
   wait_last_out(stream);
@@ -201,7 +202,7 @@ at::Tensor OutChannel::backward(Plan &plan, at::Tensor grad, const std::vector<a
   auto state = lookup_grad_;
   const int device = device_;
   at::Tensor lookup_grad =
-      windows_.lookup_rows(plan.num_recv(), grad.size(1), dtype, [state, device]() {
+      window_.lookup_rows(plan.num_recv(), grad.size(1), dtype, [state, device]() {
         try {
           cudaEventRecord(state->released, at::cuda::getCurrentCUDAStream(device).stream());
         } catch (...) {  // a deleter must not throw

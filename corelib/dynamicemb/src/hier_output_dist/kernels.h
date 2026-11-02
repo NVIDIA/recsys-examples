@@ -28,7 +28,7 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 #include <utility>
 
 #include "hier_output_dist/common/channel_args.h"
-#include "hier_output_dist/common/windows.h"
+#include "hier_output_dist/common/keys.h"
 #include "hier_output_dist/output/args.cuh"
 
 namespace dyn_emb {
@@ -41,7 +41,8 @@ namespace hier_output_dist {
 bool gin_signals_zero(const ncclDevComm &dev, int num_nodes);
 // The exit round's kernel (one warp, on the default stream): tells the node
 // and the rail peers that this rank is done, waits at most limit_ns for them
-// to say the same, and records in Ctrl::closed whether they all did.
+// to say the same, and records in its closed word (CtrlLayout) whether they
+// all did.
 cudaError_t launch_exit_kernel(const ChannelStatic &channel, uint64_t limit_ns);
 
 // ── the in channel's comm kernels (input/comm_kernels.cuh) ───────────────────
@@ -58,14 +59,13 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> launch_node_count_exchange(
 // row_cell) into its targets' node_keys at destination_base[cell] + row.
 void launch_node_key_push(const ChannelStatic &channel, const at::Tensor &keys,
                           const at::Tensor &weights, const at::Tensor &row_cell,
-                          const at::Tensor &destination_base, const at::Tensor &rows_to_push,
-                          int64_t remote_base);
+                          const at::Tensor &destination_base, const at::Tensor &rows_to_push);
 // Tells the node this rank's keys are pushed, and waits until every
 // requester of the node told it.
 void launch_node_done(const ChannelStatic &channel, int64_t seq);
-// Sends each rail peer its count message (message: msg_out_words, the
-// common part and the part for each node); returns the messages this rank
-// got, int64 [num_nodes][msg_len].
+// Sends each rail peer its count message (message: CountMessage::out_words,
+// the common part and the part for each node); returns the messages this
+// rank got, int64 [num_nodes][CountMessage::length].
 at::Tensor launch_rail_count_exchange(const ChannelStatic &channel, int64_t seq,
                                       const at::Tensor &message);
 // Puts this proxy's key_stage slices into its rail owners' rail_keys (each
@@ -81,11 +81,13 @@ void launch_rail_key_exchange(const ChannelStatic &channel, int64_t seq, const a
 std::pair<at::Tensor, at::Tensor> launch_node_status_exchange(const ChannelStatic &channel,
                                                               int64_t seq,
                                                               const at::Tensor &publish);
-// int32 [words][items]: word first_word[i] + k * word_stride of node peer
-// peer[i]'s `region` (int32 words) at [k][i]; an item of a negative peer
-// keeps what the allocation held.
-at::Tensor launch_peer_gather(const ChannelStatic &channel, Region region, const at::Tensor &peer,
-                              const at::Tensor &first_word, int words, int64_t word_stride);
+// Words of the node peers' `from` (GatherFrom), int32 [words][items]: item i
+// reads node peer peer[i]'s word first_word[i] of its proxy header (1 word),
+// or entry first_word[i] of each array of its remote_map (RemoteMap::kArrays
+// words), word k into [k][i]; an item of a negative peer keeps what the
+// allocation held.
+at::Tensor launch_peer_gather(const ChannelStatic &channel, GatherFrom from, const at::Tensor &peer,
+                              const at::Tensor &first_word);
 
 // ── the out kernels ──────────────────────────────────────────────────────────
 

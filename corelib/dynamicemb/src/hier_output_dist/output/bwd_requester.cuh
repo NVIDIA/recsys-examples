@@ -125,11 +125,7 @@ __device__ __forceinline__ void wait_half_warp(const OutArgs &args, const OutTab
 __device__ __forceinline__ void push_flag_warp(const OutArgs &args, const OutTables &tables,
                                                int proxy, int rnd, int64_t flag, int lane) {
   __syncwarp();
-  if (lane == 0)
-    st_release_sys(
-        &tables.push_flags(
-            proxy)[(rnd & 1) * half_flags(args.win.num_proxy_rows, args.topo.local_size) + flag],
-        grant_of(args.ch.seq, rnd));
+  if (lane == 0) st_release_sys(tables.push_flag(proxy, rnd, flag), grant_of(args.ch.seq, rnd));
 }
 
 // Index dedup, a heavy row (more than kHeavy original rows): once its
@@ -187,7 +183,7 @@ __device__ void heavy_sub_warp(const OutArgs &args, const OutTables &tables, int
   if ((int64_t)__shfl_sync(kFull, before, 0) + 1 < num_subs) return;
   // the last one: every sub-task of the row has ended (acquired above)
   const float *sums = plan.partial + (int64_t)fanout.first[slot] * dim;
-  char *dst = tables.lookup_rows(owner % local_size) + (int64_t)plan.rows[row] * args.row_bytes;
+  char *dst = tables.lookup_row(owner % local_size, plan.rows[row]);
   for (int col = lane; col < args.vec; col += 32) {
     float acc[kValues];
     sum_fp32<kValues>(sums, num_subs, dim, col, acc);
@@ -352,8 +348,7 @@ __device__ void push_groups_warp(const OutArgs &args, const OutTables &tables, i
     const HeavyGroup span = plan.heavy_groups[group];
     num_subs = ceil_div<kHeavy>(span.end - span.start);
     part = plan.partial + (plan.heavy_subs + plan.group_first_sub[group]) * dim;
-    slot = (float *)(tables.proxy_rows(proxy) +
-                     (int64_t)plan.rows[plan.push_order[span.start]] * args.row_bytes);
+    slot = (float *)tables.proxy_row(proxy, plan.rows[plan.push_order[span.start]]);
     SubTaskDone{plan.group_done + group}.wait_lane(args, num_subs, "sub-tasks of a heavy group");
   }
   __syncwarp();
@@ -442,7 +437,7 @@ __device__ __forceinline__ void push_rows_task_warp(const OutArgs &args, const O
   if (lane < num_rows) {
     const int32_t row = plan.push_order[pos0 + lane];
     dedup_row = plan.inv[row];
-    dst = tables.proxy_rows(proxy) + (int64_t)plan.rows[row] * row_bytes;
+    dst = tables.proxy_row(proxy, plan.rows[row]);
   }
   const unsigned long long start = timeline.on() ? now_ns() : 0;
   push_rows_warp<RowT>(args, dedup_row, dst, num_rows, false, lane);
@@ -471,7 +466,7 @@ __device__ __forceinline__ void local_push_warp(const OutArgs &args, const OutTa
   if (lane < job.count) {
     const int64_t row = job.row0 + lane;
     dedup_row = plan.inv[row];
-    dst = tables.lookup_rows(job.owner) + (int64_t)plan.rows[row] * row_bytes;
+    dst = tables.lookup_row(job.owner, plan.rows[row]);
   }
   const unsigned long long start = timeline.on() ? now_ns() : 0;
   const int wrote = push_rows_warp<RowT>(args, dedup_row, dst, num_rows, true, lane);

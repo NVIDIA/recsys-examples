@@ -23,11 +23,10 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 #include "hier_output_dist/common/constants.h"
 #include "hier_output_dist/common/formats.h"
 #include "hier_output_dist/common/gin_signals.h"
-#include "hier_output_dist/common/meta.h"
-#include "hier_output_dist/common/windows.h"
+#include "hier_output_dist/common/window.h"
 #include "hier_output_dist/device/memory_order.cuh"
+#include "hier_output_dist/device/node_window.cuh"
 #include "hier_output_dist/device/spin.cuh"
-#include "hier_output_dist/device/sym_window.cuh"
 #include "hier_output_dist/device/warp.cuh"
 #include "hier_output_dist/output/args.cuh"
 #include "hier_output_dist/output/bwd_sums.cuh"
@@ -60,20 +59,12 @@ struct ProxyReducer {
 template <typename RowT>
 __device__ void ProxyReducer<RowT>::run(const OutArgs &args, int lane) {
   const OutPlan &plan = args.plan;
-  const int num_nodes = args.topo.num_nodes, node = args.topo.node, row_bytes = args.row_bytes,
-            vec = args.vec;
+  const int num_nodes = args.topo.num_nodes, node = args.topo.node, vec = args.vec;
   const int64_t chunk_tasks = args.chunk_rows / kTaskRows;  // tasks per chunk
-  // its round table (where each owner node's keys of a round sit in
-  // proxy_rows, and their first IB chunk), and where each owner node's keys
-  // start in the reducer list
-  const RoundPiece *round_table = (const RoundPiece *)(plan.meta + args.meta_at.round_table);
-  const int32_t *uniq_off = (const int32_t *)(plan.meta + args.meta_at.uniq_off);
-  const int64_t *reduce_task_starts = plan.meta + args.meta_at.reduce_task_starts;
-  char *proxy_rows = SymRegion<kProxyRows>(args.win).peer(args.topo.local_rank);
-  const uint64_t *flags = SymRegion<kPushFlags, uint64_t>(args.win).peer(args.topo.local_rank);
-  const int64_t flags_per_half = half_flags(args.win.num_proxy_rows, args.topo.local_size);
-  const int64_t total = reduce_task_starts[plan.meta[args.meta_at.misc + kMiscRounds]];
-  RoundCursor cursor(reduce_task_starts, 1);  // the round of this warp's tasks
+  // this rank's copy of the window: its proxy_rows and push flags
+  const WindowLayout window = NodeWindow(args.window, args.topo.local_rank).layout(args);
+  const int64_t total = plan.reduce_task_starts[*plan.num_rounds];
+  RoundCursor cursor(plan.reduce_task_starts, 1);  // the round of this warp's tasks
   const TaskQueue queue(args, kQueueReduce);
   for (int64_t task = queue.next_warp(); task < total; task = queue.next_warp()) {
     cursor.seek(task);
@@ -85,7 +76,9 @@ __device__ void ProxyReducer<RowT>::run(const OutArgs &args, int lane) {
     const int owner_node = (int)(slot / chunk_tasks % num_nodes);
     const int64_t chunk = slot / chunk_tasks / num_nodes, sub = slot % chunk_tasks;
     if (owner_node == node) continue;
-    const RoundPiece piece = round_table[(int64_t)rnd * num_nodes + owner_node];
+    // from its round table: where the owner node's keys of the round sit in
+    // proxy_rows, and their first IB chunk
+    const RoundPiece piece = plan.round_piece(rnd, owner_node);
     const int64_t uniq_lo = piece.uniq_lo + chunk * args.chunk_rows + sub * kTaskRows;
     const int64_t chunk_end =
         min((int64_t)piece.uniq_hi, piece.uniq_lo + (chunk + 1) * args.chunk_rows);
@@ -95,8 +88,8 @@ __device__ void ProxyReducer<RowT>::run(const OutArgs &args, int lane) {
     // the first entry is the heavy key's own row) and its row in proxy_rows.
     // Then the wait for the push task of each entry of the task's lists.
     const uint64_t tag = grant_of(args.ch.seq, rnd);
-    const uint64_t *half_flags_at = flags + (rnd & 1) * flags_per_half;
-    const int64_t uniq_global = uniq_off[owner_node] + uniq_lo;
+    const uint64_t *flags = window.rows.push_flags(rnd);
+    const int64_t uniq_global = plan.uniq_off[owner_node] + uniq_lo;  // in the reducer list
     int64_t begin = 0, end = 0;
     bool heavy = false;
     char *row = nullptr;
@@ -104,14 +97,14 @@ __device__ void ProxyReducer<RowT>::run(const OutArgs &args, int lane) {
       begin = plan.reducer_start[uniq_global + lane];
       end = plan.reducer_start[uniq_global + lane + 1];
       heavy = (int32_t)(plan.reducer_entries[begin] >> 32) == kEntryOwnRow;
-      row = proxy_rows + (int64_t)(piece.off + uniq_lo + lane - piece.uniq_lo) * row_bytes;
+      row = window.rows.proxy_row(piece.off + uniq_lo + lane - piece.uniq_lo);
     }
     const int64_t ent_end = __shfl_sync(kFull, end, num_keys - 1);
     Spin spin(args.timeout_ns);
     for (int64_t i = __shfl_sync(kFull, begin, 0) + lane; i < ent_end; i += 32) {
       const int32_t flag = (int32_t)(plan.reducer_entries[i] >> 32);
       if (flag < 0) continue;  // kEntryNoPush, kEntryOwnRow: no push task
-      while (ld_acquire_sys(&half_flags_at[flag]) < tag)
+      while (ld_acquire_sys(&flags[flag]) < tag)
         spin.pause("pushed gradient rows", flag, uniq_lo, args.topo.rank);
     }
     __syncwarp();
@@ -128,11 +121,11 @@ __device__ void ProxyReducer<RowT>::run(const OutArgs &args, int lane) {
         const int col = col_base + lane;
         float acc[Vec16<RowT>::kValues];
         if (lane_heavy)  // its own row (the first entry) gets the sum
-          sum_entries<RowT, true>(proxy_rows, plan.reducer_entries, lane_begin + 1, lane_end,
-                                  row_bytes, col, col < vec, lane, acc);
+          sum_entries<RowT, true>(window.rows, plan.reducer_entries, lane_begin + 1, lane_end, col,
+                                  col < vec, lane, acc);
         else
-          sum_entries<RowT, false>(proxy_rows, plan.reducer_entries, lane_begin, lane_end,
-                                   row_bytes, col, col < vec, lane, acc);
+          sum_entries<RowT, false>(window.rows, plan.reducer_entries, lane_begin, lane_end, col,
+                                   col < vec, lane, acc);
         if (col < vec) *((int4 *)dst + col) = Vec16<RowT>::pack(acc);
       }
     }

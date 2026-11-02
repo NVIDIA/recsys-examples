@@ -28,23 +28,22 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 namespace dyn_emb {
 namespace hier_output_dist {
 
-// What a peer_gather reads: for each item a node peer (negative: none) and
-// the first int32 word of its region to read.
+// What a peer_gather reads (GatherFrom says which words): for each item a
+// node peer (negative: none) and its first int32 word to read there.
 struct PeerWords {
   at::Tensor peer;        // int32 [items]
   at::Tensor first_word;  // int64 [items]
 };
 // The remote_map words of this requester's rows (row_cell, block_start: part
-// 1's; destination_base: the node layout's): a row of another node's owner is
-// occurrence destination - lookup_keys of its proxy, the owner's rank on this
-// node; it reads 3 words, remote_keys apart.
+// 1's; destination_base: the node layout's), kGatherRemoteMap: a row of
+// another node's owner is occurrence destination - lookup_keys of its proxy,
+// the owner's rank on this node; it reads that entry of each RemoteMap array.
 PeerWords remote_rows(const at::Tensor &row_cell, const at::Tensor &block_start,
-                      const at::Tensor &destination_base, const PlanSizes &sizes);
-// The words of the node's proxy headers this requester reads, header_words
-// of each proxy in turn: its rounds, its round table, and its row of the push
-// tables (a constant of the op).
-int64_t header_words(const PlanSizes &sizes);
-PeerWords header_gather(const PlanSizes &sizes, const at::TensorOptions &options);
+                      const at::Tensor &destination_base, const Sizes &sizes);
+// The words of the node's proxy headers this requester reads
+// (kGatherProxyHeader): ProxyHeader's gathered words of each proxy in turn,
+// a constant of the op.
+PeerWords header_gather(const Sizes &sizes, const at::TensorOptions &options);
 
 struct RequesterTables {
   at::Tensor src, dst;            // int32 [row_cell.numel()]: where each row's key is in the
@@ -67,14 +66,15 @@ struct RequesterTables {
 };
 // words: int32 [3][row_cell.numel()], the remote_map words of its rows
 // (remote_rows' gather; rows of its node's owners and past the valid rows hold
-// anything); headers: int32 [local_size][header_words] (header_gather's);
+// anything); headers: int32 [local_size][ProxyHeader::gathered_words]
+// (header_gather's);
 // owner_cell_start: int64 [local_size][num_features], where its cell
 // (feature, this requester) starts in each owner's KJT on its node
 // (node_status_exchange).
 RequesterTables requester_tables(const at::Tensor &words, const at::Tensor &headers,
                                  const at::Tensor &owner_cell_start, const at::Tensor &row_cell,
                                  const at::Tensor &cell_start, const at::Tensor &block_start,
-                                 const PlanSizes &sizes);
+                                 const Sizes &sizes);
 
 }  // namespace hier_output_dist
 }  // namespace dyn_emb

@@ -24,11 +24,10 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 
 #include "hier_output_dist/common/formats.h"
 #include "hier_output_dist/common/gin_signals.h"
-#include "hier_output_dist/common/meta.h"
 #include "hier_output_dist/common/trace_slots.h"
-#include "hier_output_dist/common/windows.h"
-#include "hier_output_dist/device/ctrl_words.cuh"
+#include "hier_output_dist/common/window.h"
 #include "hier_output_dist/device/memory_order.cuh"
+#include "hier_output_dist/device/node_window.cuh"
 #include "hier_output_dist/device/rail.cuh"
 #include "hier_output_dist/device/spin.cuh"
 #include "hier_output_dist/device/warp.cuh"
@@ -74,7 +73,7 @@ struct ProxyRelay {
 __device__ void ProxyRelay::run(const OutArgs &args) {
   const int lane = threadIdx.x & 31, num_nodes = args.topo.num_nodes, node = args.topo.node,
             local_size = args.topo.local_size;
-  const CtrlWords mine = CtrlWords::of(args, args.topo.local_rank);
+  const WindowLayout window = NodeWindow(args.window, args.topo.local_rank).layout(args);
   ncclGin rows(args.dev, kCtxFwd), cred(args.dev, kCtxCredit);
   const ncclTeam rail = ncclTeamRail(args.dev);
   const Credits credits(cred, rail);
@@ -83,21 +82,20 @@ __device__ void ProxyRelay::run(const OutArgs &args) {
     for (int owner_node = lane; owner_node < num_nodes; owner_node += 32)
       if (owner_node != node)
         credits.raise(owner_node, sig_grant(node), grant_of(args.ch.seq, rounds),
-                      mine.grant_sent(owner_node));
+                      window.ctrl.grant_sent(owner_node));
   };
   grant(2);
-  const int64_t *uniq_out = args.plan.meta + args.meta_at.uniq_out;
-  const int num_rounds = (int)args.plan.meta[args.meta_at.misc + kMiscRounds];
-  // where each requester's rows of each round start in its push order here
-  const int32_t *push_start = (const int32_t *)(args.plan.meta + args.meta_at.push_start);
+  const int num_rounds = (int)*args.plan.num_rounds;
+  // a requester's rows of round rnd at this proxy
   auto round_rows = [&](int requester, int rnd) {
-    const int32_t *start = push_start + requester * (args.win.rounds_cap + 1);
+    const int32_t *start = args.plan.push_starts(requester);
     return (uint64_t)(start[rnd + 1] - start[rnd]);
   };
   if (num_rounds > 1)
     for (int requester = lane; requester < local_size; requester += 32)
       for (int half = 0; half < 2; ++half)
-        mine.relay_want(requester)[half] = ld_acquire_sys(mine.done(requester, half));
+        *window.ctrl.relay_want(requester, half) =
+            ld_acquire_sys(window.ctrl.done(requester, half));
   __syncwarp();
   int next = 0;  // rounds every requester has pulled
   Spin spin(args.timeout_ns);
@@ -106,15 +104,16 @@ __device__ void ProxyRelay::run(const OutArgs &args) {
     // the rows of each owner node that landed, when that changed
     for (int owner_node = lane; owner_node < num_nodes; owner_node += 32) {
       if (owner_node == node) continue;
-      const int64_t num_uniq = uniq_out[owner_node];
-      const uint64_t word = *mine.landed_rows(owner_node);
+      const int64_t num_uniq = args.plan.uniq_out[owner_node];
+      const uint64_t word = *window.ctrl.landed_rows(owner_node);
       const int64_t seen =
           LandedRows::tag(word) == args.ch.seq ? (int64_t)LandedRows::payload(word) : -1;
       if (seen == num_uniq) continue;
-      const int64_t got = min(
-          (int64_t)(rows.readSignal(sig_rows(owner_node)) - *mine.fwd_tot(owner_node)), num_uniq);
+      const int64_t got =
+          min((int64_t)(rows.readSignal(sig_rows(owner_node)) - *window.ctrl.fwd_tot(owner_node)),
+              num_uniq);
       if (got != seen) {
-        LandedRows::publish(mine.landed_rows(owner_node), args.ch.seq, got);
+        LandedRows::publish(window.ctrl.landed_rows(owner_node), args.ch.seq, got);
         moved = true;
         const int64_t counted = max(seen, (int64_t)0);  // what the timeline has
         if (timeline.on() && got > counted)
@@ -127,11 +126,11 @@ __device__ void ProxyRelay::run(const OutArgs &args) {
       const int half = next & 1;
       bool in = true;
       for (int requester = lane; requester < local_size; requester += 32)
-        in = in && ld_acquire_sys(mine.done(requester, half)) >=
-                       mine.relay_want(requester)[half] + round_rows(requester, next);
+        in = in && ld_acquire_sys(window.ctrl.done(requester, half)) >=
+                       *window.ctrl.relay_want(requester, half) + round_rows(requester, next);
       if (!__all_sync(kFull, in)) break;
       for (int requester = lane; requester < local_size; requester += 32)
-        mine.relay_want(requester)[half] += round_rows(requester, next);
+        *window.ctrl.relay_want(requester, half) += round_rows(requester, next);
       ++next;
       grant(next + 2);
       moved = true;
@@ -142,7 +141,8 @@ __device__ void ProxyRelay::run(const OutArgs &args) {
       spin.pause("rows of the owner nodes", next, lane, args.topo.rank);
   }
   for (int owner_node = lane; owner_node < num_nodes; owner_node += 32)
-    if (owner_node != node) *mine.fwd_tot(owner_node) += (uint64_t)uniq_out[owner_node];
+    if (owner_node != node)
+      *window.ctrl.fwd_tot(owner_node) += (uint64_t)args.plan.uniq_out[owner_node];
   __syncwarp();
   if (lane == 0) timeline.stamp_latest(kTraceLanded);
   credits.flush_warp();  // the grants
@@ -164,24 +164,23 @@ struct OwnerIssuer {
 };
 
 __device__ void OwnerIssuer::run(const OutArgs &args) {
-  const int lane = threadIdx.x & 31, num_nodes = args.topo.num_nodes, node = args.topo.node,
-            rounds_cap = args.win.rounds_cap;
+  const int lane = threadIdx.x & 31, num_nodes = args.topo.num_nodes, node = args.topo.node;
   ncclGin rows(args.dev, kCtxFwd), cred(args.dev, kCtxCredit);
   const ncclTeam rail = ncclTeamRail(args.dev);
   const OutTimeline timeline(args);
-  const CtrlWords mine = CtrlWords::of(args, args.topo.local_rank);
-  // the segments of each (proxy node, round)
-  const int32_t *put_start = (const int32_t *)(args.plan.meta + args.meta_at.fwd_put_start);
+  const NodeWindow node_window(args.window, args.topo.local_rank);
+  const WindowLayout window = node_window.layout(args);
+  // rows of lookup_rows into the rail proxies' proxy_rows
   const RowPut put{rows,
                    rail,
-                   args.win.handle[kLookupRows],
-                   args.win.off[kProxyRows],
-                   args.win.off[kLookupRows],
+                   node_window,
+                   window.rows.proxy_rows(),
+                   window.rows.lookup_rows(),
                    args.row_bytes,
                    sig_rows(node)};
   for (int proxy_node = lane; proxy_node < num_nodes; proxy_node += 32) {
-    mine.put_at(proxy_node)[0] = put_start[proxy_node * (rounds_cap + 1)];
-    mine.put_at(proxy_node)[1] = 0;
+    window.ctrl.put_at(proxy_node)[0] = args.plan.fwd_puts(proxy_node)[0];
+    window.ctrl.put_at(proxy_node)[1] = 0;
   }
   put.fence();
   bool posted = false;  // this lane put rows
@@ -190,11 +189,11 @@ __device__ void OwnerIssuer::run(const OutArgs &args) {
     bool moved = false, left = false;  // segments of the lane's proxy nodes are left
     for (int proxy_node = lane; proxy_node < num_nodes; proxy_node += 32) {
       if (proxy_node == node) continue;
-      const int32_t *start = put_start + proxy_node * (rounds_cap + 1);
-      int64_t *at = mine.put_at(proxy_node);
+      const int32_t *start = args.plan.fwd_puts(proxy_node);  // the node's segments, by round
+      int64_t *at = window.ctrl.put_at(proxy_node);
       int64_t seg = at[0];
       int rnd = (int)at[1];
-      const int64_t end = start[rounds_cap];
+      const int64_t end = start[args.rounds_cap];
       for (; seg < end; ++seg) {
         while (seg >= start[rnd + 1]) ++rnd;  // the segment's round
         if (cred.readSignal(sig_grant(proxy_node)) < grant_of(args.ch.seq, rnd + 1)) break;

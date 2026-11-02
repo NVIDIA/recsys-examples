@@ -34,11 +34,11 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 //   entry  CTA 0 publishes out_seq and every CTA waits until all node peers
 //          have: a peer there has ended its lookup (which wrote its
 //          lookup_rows before the kernel) and every earlier out kernel;
-//   tasks  warps take 32-row tasks from one queue (Ctrl::tasks), owners (and
+//   tasks  warps take 32-row tasks from one queue (a task word), owners (and
 //          proxies) in turn, so a rank's warps reach every peer at once;
-//   exit   every CTA arrives once it is done (Ctrl::arrive, a running total,
-//          so nothing is reset), and the last one ends the kernel's protocol
-//          for the rank.
+//   exit   every CTA arrives once it is done (the arrive word, a running
+//          total, so nothing is reset), and the last one ends the kernel's
+//          protocol for the rank.
 // Across nodes the last warps of CTA 0 take the GIN roles and skip the entry
 // barrier: in the forward the owner's issuer lanes (one per rail proxy, so one
 // QP each) and the proxy's relay; in the backward the proxy's issuer lanes.
@@ -69,9 +69,10 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 #include "hier_output_dist/common/formats.h"
 #include "hier_output_dist/common/gin_signals.h"
 #include "hier_output_dist/common/trace_slots.h"
+#include "hier_output_dist/common/window.h"
 #include "hier_output_dist/device/cta.cuh"
-#include "hier_output_dist/device/ctrl_words.cuh"
 #include "hier_output_dist/device/node_sync.cuh"
+#include "hier_output_dist/device/node_window.cuh"
 #include "hier_output_dist/device/rail.cuh"
 #include "hier_output_dist/output/args.cuh"
 #include "hier_output_dist/output/fwd_gin_warps.cuh"
@@ -97,15 +98,15 @@ namespace fwd {
 __device__ void next_kernel_credits_warp(const OutArgs &args) {
   const int lane = threadIdx.x & 31, num_nodes = args.topo.num_nodes, node = args.topo.node;
   ncclGin cred(args.dev, kCtxCredit);
-  const CtrlWords mine = CtrlWords::of(args, args.topo.local_rank);
+  const WindowLayout window = NodeWindow(args.window, args.topo.local_rank).layout(args);
   const ncclTeam rail = ncclTeamRail(args.dev);
   const Credits credits(cred, rail);
   for (int peer_node = lane; peer_node < num_nodes; peer_node += 32) {
     if (peer_node == node) continue;
     credits.raise(peer_node, sig_bwd_ready(num_nodes, node), (uint64_t)args.ch.seq + 1,
-                  mine.bwd_ready_sent(peer_node));
+                  window.ctrl.bwd_ready_sent(peer_node));
     credits.raise(peer_node, sig_grant(node), grant_of(args.ch.seq + 1, 2),
-                  mine.grant_sent(peer_node));
+                  window.ctrl.grant_sent(peer_node));
   }
   __syncwarp();
   cred.flush(ncclCoopWarp{});
@@ -113,7 +114,7 @@ __device__ void next_kernel_credits_warp(const OutArgs &args) {
 
 // The end of a forward for this rank, in the last CTA to arrive: it sets the
 // task queues back to 0, tells the node that this rank has pulled everything
-// (the exit barrier, on Ctrl::pulled) and waits until every node peer has
+// (the exit barrier, on its pulled word) and waits until every node peer has
 // too. After it nobody reads this rank's lookup_rows or proxy_rows any more,
 // so the next out kernel or lookup may write them; across nodes warp 0 then
 // sends the credits for the next out kernel (not compiled in on one node,
@@ -122,12 +123,12 @@ template <bool kMulti>
 __device__ __forceinline__ void exit(const OutArgs &args) {
   const int tid = threadIdx.x;
   const OutTimeline timeline(args);
-  const NodeBarrier<OutArgs> pulled(args, args.ctrl_at.pulled);
-  const CtrlWords mine = CtrlWords::of(args, args.topo.local_rank);
+  const NodeWindow node(args.window, args.topo.local_rank);
+  const NodeBarrier<OutArgs> pulled(args, node, node.layout(args).ctrl.pulled());
   if (tid == 0) {
     timeline.stamp_latest(kTraceArrived);
     TaskQueue::reset_all(args);
-    pulled.publish(mine);
+    pulled.publish();
   }
   for (int peer = tid; peer < args.topo.local_size; peer += blockDim.x)
     pulled.wait(peer, "exit barrier of the forward");
@@ -174,14 +175,13 @@ __global__ void __launch_bounds__(kThreads, 1) fwd_kernel(OutArgs args) {
     }
     pass_entry_barrier(args, workers);
     const int64_t *node_block_start = plan.block_start + node * local_size;  // this node's owners
-    const int64_t *fwd_task_starts = plan.meta + args.meta_at.fwd_task_starts;
     const LocalRows local_rows{node_block_start, local_size, me};
     const int64_t rows = local_rows.count(), local = rows + heavy;
     const int max_rounds = num_nodes > 1 ? tables.max_rounds : 1;
-    const int64_t remote = num_nodes > 1 ? fwd_task_starts[max_rounds] : 0;
+    const int64_t remote = num_nodes > 1 ? plan.fwd_task_starts[max_rounds] : 0;
     const int64_t total = local + remote + (num_nodes > 1 ? heavy : 0);
     // this warp's round
-    FwdCursor cursor(num_nodes > 1 ? fwd_task_starts : nullptr, local, max_rounds);
+    FwdCursor cursor(num_nodes > 1 ? plan.fwd_task_starts : nullptr, local, max_rounds);
     const TaskQueue queue(args, kQueueWork);
     for (int64_t task = queue.next_warp(); task < total; task = queue.next_warp()) {
       if (task >= local + remote) {  // the late pass of the heavy rows' sub-tasks

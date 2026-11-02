@@ -36,9 +36,10 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 namespace dyn_emb {
 namespace hier_output_dist {
 
-// This rank's counts for its node, int64 [local_size * (num_features + 1)]:
-// first its keys for each target's remote part, then its keys for each
-// owner of its node, [owner][feature]. From part 1's cell_start.
+// This rank's count vector for its node (CountVector, common/ctrl.h), int64
+// [local_size * (num_features + 1)]: first its keys for each target's remote
+// part, then its keys for each owner of its node, [owner][feature]. From
+// part 1's cell_start.
 at::Tensor node_count_vector(const at::Tensor &cell_start, const Topo &topo, int64_t num_features);
 
 // The node's count vectors as node_count_exchange gives them to this rank.

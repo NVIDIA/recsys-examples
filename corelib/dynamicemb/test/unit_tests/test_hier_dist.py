@@ -28,7 +28,7 @@ batches. Every step checks:
 Before the cases: the sharding shapes, the ranks' agreement and the options.
 After them: an input dist that waits for the device nowhere but in its
 second wait, the output dist's call orders, the backward run to run, the
-windows and the trace APIs, failed constructions, across nodes a proxy rows
+window and the trace APIs, failed constructions, across nodes a proxy rows
 cap below a round's rows, and the teardown.
 
 Run it from ``corelib/dynamicemb``, one process per GPU (on one node, or
@@ -1119,7 +1119,7 @@ def run_case(
     return failures
 
 
-# ── the windows at the given capacities ──────────────────────────────────────
+# ── the window at the given capacities ───────────────────────────────────────
 
 # Uniform keys over 4 features: an owner looks up about 4 * batch * max_len / 2
 # keys of a call: 512, 32K, 196K, 524K and 524K keys per call here, under the
@@ -1149,7 +1149,7 @@ def trace_matches_build(op) -> bool:
 
 def run_windows(rank: int, world_size: int, local_size: int, log: Callable) -> int:
     """Calls of five sizes under one set of capacities, those of the largest:
-    each takes the op and matches TorchRec's, and the op keeps the windows it
+    each takes the op and matches TorchRec's, and the op keeps the window it
     made when it was built. Then its trace APIs match the build."""
     case_idx = 100
     cases = [
@@ -1336,7 +1336,7 @@ def run_agreement(rank: int, world_size: int, local_size: int, log: Callable) ->
 def run_construction_failure(
     rank: int, world_size: int, local_size: int, log: Callable
 ) -> int:
-    """A rank that cannot allocate the op's windows when it is built (the
+    """A rank that cannot allocate the op's window when it is built (the
     test hook, on that rank alone), 24 times in a row on an op outside a
     model: every rank warns once, naming that rank, and takes TorchRec's
     dists, and none hangs (every rank ends the op's communicator before it
@@ -1700,7 +1700,7 @@ def run_teardown(rank: int, world_size: int, local_size: int, log: Callable) -> 
         good = all_true(ok)
         failures += int(not good)
         log(
-            f"teardown, {name}: rank 0 dropped it in {took:.1f} s, kept its windows:"
+            f"teardown, {name}: rank 0 dropped it in {took:.1f} s, kept its window:"
             f" {kept} [{'ok' if good else 'FAIL'}]"
         )
     return failures

@@ -29,12 +29,13 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 #include <vector>
 
 #include "hier_output_dist/common/channel_args.h"
+#include "hier_output_dist/common/ctrl.h"
+#include "hier_output_dist/common/sizes.h"
 #include "hier_output_dist/host/config.h"
 #include "hier_output_dist/host/cta_budget.h"
-#include "hier_output_dist/host/layout.h"
 #include "hier_output_dist/host/plan.h"
 #include "hier_output_dist/host/trace.h"
-#include "hier_output_dist/host/windows.h"
+#include "hier_output_dist/host/window.h"
 #include "hier_output_dist/output/args.cuh"
 
 namespace dyn_emb {
@@ -55,8 +56,8 @@ class OutChannel {
  public:
   // `channel_static`: the part of the kernels' arguments both channels share;
   // `lookup_grad`: made by the op before its ranks agree that it can run.
-  OutChannel(const Config &config, const Layout &layout, const ChannelStatic &channel_static,
-             SymmetricWindows &windows, CtaBudget &budget, Trace &trace, int device,
+  OutChannel(const Config &config, const Sizes &sizes, const ChannelStatic &channel_static,
+             SymmetricWindow &window, CtaBudget &budget, Trace &trace, int device,
              std::shared_ptr<LookupGrad> lookup_grad);
 
   // The rows the lookup of a call writes, the first num_recv rows of
@@ -96,13 +97,13 @@ class OutChannel {
 
   OutStatic static_{};  // what every kernel takes
   Channel channel_;
-  int64_t arrive_ = 0;    // Ctrl::arrive after the out kernels issued so far
+  int64_t arrive_ = 0;    // the arrive word (CtrlLayout) after the out kernels issued so far
   int64_t out_rows_ = 0;  // rows of the storage of the forward's outputs
   int64_t dim_;
   at::ScalarType dtype_;
   int world_size_, device_;
   bool multi_node_;
-  SymmetricWindows &windows_;
+  SymmetricWindow &window_;
   CtaBudget &budget_;
   Trace &trace_;
   // Shared with the views' deleters, which may outlive this object.

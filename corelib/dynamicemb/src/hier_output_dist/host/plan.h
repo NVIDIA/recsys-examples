@@ -29,7 +29,7 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 #include <string>
 #include <vector>
 
-#include "hier_output_dist/host/layout.h"
+#include "hier_output_dist/common/sizes.h"
 #include "hier_output_dist/output/args.cuh"
 #include "hier_output_dist/plan/part_one.h"
 
@@ -40,7 +40,7 @@ class Plan {
  public:
   // Part 1's tensors (on the caller's stream): its partition and, under
   // index dedup, its fan-out.
-  Plan(const Layout &layout, PlanInput input, Partition part, FanoutTables fanout);
+  Plan(const Sizes &sizes, PlanInput input, Partition part, FanoutTables fanout);
   Plan(const Plan &) = delete;
   Plan &operator=(const Plan &) = delete;
 
@@ -79,14 +79,17 @@ class Plan {
   // the plan holds the owner's KJT and the maps of its output dist, and the
   // current stream is ordered after the call.
   bool wait();
-  // What the out kernels read of it: the forward's src or the backward's dst.
+  // What the out kernels read of it: the forward's src or the backward's
+  // dst, and the tables the plan holds (the backward's own, once the forward
+  // let go of its own).
   OutPlan out_plan(bool backward) const;
   // Its steps are queued (start): what only they read goes.
   void after_start();
   // The members that hold the backward's maps, in their order.
   std::vector<at::Tensor *> backward_members();
-  // Its forward is queued: the owner's KJT is the lookup's, and the plan
-  // lets go of the backward's maps, which it returns for autograd to save.
+  // Its forward is queued: the owner's KJT is the lookup's, the tables only
+  // the forward reads go, and the plan lets go of the backward's maps, which
+  // it returns for autograd to save.
   std::vector<at::Tensor> after_forward();
   // A backward holds the maps autograd saved until its kernel is queued.
   void hold_backward_maps(const std::vector<at::Tensor> &maps);
@@ -96,8 +99,9 @@ class Plan {
   int64_t heavy_slots() const { return index_dedup_ ? fanout_.pos.numel() : 0; }
   int64_t heavy_groups() const { return group_first_sub_.defined() ? group_first_sub_.numel() : 0; }
 
-  int num_features_, num_sources_;
+  int num_features_, num_sources_, num_nodes_;
   int64_t lookup_keys_, remote_keys_;  // the op's capacities, which the needs are held to
+  int64_t rounds_cap_;                 // with num_nodes_, the tables' strides (OutPlan)
   bool multi_node_, index_dedup_;
   int device_;
   PlanInput input_;  // until wait(): part 1 read it on the caller's stream
@@ -105,11 +109,19 @@ class Plan {
   at::Tensor keys_, key_weights_, inv_, row_cell_, cell_start_, block_start_, input_length_per_key_;
   FanoutTables fanout_;
   int64_t num_out_;
-  // the call's tables, from start
-  at::Tensor meta_, src_, dst_;
+  // the call's tables, from start (OutPlan says what each holds)
+  at::Tensor src_, dst_;
   at::Tensor push_order_, heavy_groups_, group_first_sub_, group_of_sub_;  // across nodes
   at::Tensor reducer_start_, reducer_entries_, put_list_, ready_;          // across nodes
-  at::Tensor kjt_values_, kjt_weights_, kjt_lengths_, kjt_offsets_;        // the owner's KJT
+  // across nodes, the requester's tables of the node's proxies
+  at::Tensor proxy_rounds_, proxy_round_tables_, push_tables_, push_order_off_;
+  at::Tensor fwd_task_starts_, bwd_task_starts_;
+  at::Tensor uniq_in_, fwd_put_start_;  // across nodes, the owner's
+  // across nodes, the proxy's
+  at::Tensor num_rounds_, num_chunks_, uniq_out_, uniq_off_, round_table_, bwd_put_start_;
+  at::Tensor push_start_, reduce_task_starts_;
+  at::Tensor occurrence_count_;  // the proxy's remote occurrences (the benchmark's)
+  at::Tensor kjt_values_, kjt_weights_, kjt_lengths_, kjt_offsets_;  // the owner's KJT
   at::Tensor status_;            // [status_words] the call's status on the device
   at::Tensor status_host_;       // pinned: start copies the status into it
   at::cuda::CUDAEvent planned_;  // after part 1, on the caller's stream

@@ -25,12 +25,14 @@ namespace hier_output_dist {
 
 // The status's pinned buffer is allocated here, after part 1, which the
 // side stream then waits for (planned_).
-Plan::Plan(const Layout &layout, PlanInput input, Partition part, FanoutTables fanout)
-    : num_features_(layout.num_features),
-      num_sources_(layout.topo.num_sources),
-      lookup_keys_(layout.lookup_keys),
-      remote_keys_(layout.remote_keys),
-      multi_node_(layout.multi_node()),
+Plan::Plan(const Sizes &sizes, PlanInput input, Partition part, FanoutTables fanout)
+    : num_features_((int)sizes.num_features),
+      num_sources_(sizes.topo.num_sources),
+      num_nodes_(sizes.topo.num_nodes),
+      lookup_keys_(sizes.lookup_keys),
+      remote_keys_(sizes.remote_keys),
+      rounds_cap_(sizes.rounds_cap),
+      multi_node_(sizes.multi_node()),
       index_dedup_(input.reverse_indices.has_value()),
       input_(std::move(input)),
       keys_(std::move(part.keys)),
@@ -63,9 +65,13 @@ bool Plan::wait() {
   status_ = status_host_ = at::Tensor();
   if (!fits) {
     // The caller moves the call another way: nothing of it stays.
-    inv_ = block_start_ = input_length_per_key_ = meta_ = src_ = dst_ = at::Tensor();
+    inv_ = block_start_ = input_length_per_key_ = src_ = dst_ = at::Tensor();
     push_order_ = heavy_groups_ = group_first_sub_ = group_of_sub_ = at::Tensor();
     reducer_start_ = reducer_entries_ = put_list_ = ready_ = at::Tensor();
+    proxy_rounds_ = proxy_round_tables_ = push_tables_ = push_order_off_ = at::Tensor();
+    fwd_task_starts_ = bwd_task_starts_ = uniq_in_ = fwd_put_start_ = at::Tensor();
+    num_rounds_ = num_chunks_ = uniq_out_ = uniq_off_ = round_table_ = at::Tensor();
+    bwd_put_start_ = push_start_ = reduce_task_starts_ = occurrence_count_ = at::Tensor();
     kjt_values_ = kjt_weights_ = kjt_lengths_ = kjt_offsets_ = at::Tensor();
     fanout_ = FanoutTables{};
     return false;
@@ -133,7 +139,6 @@ std::map<std::string, at::Tensor> Plan::tensors() const {
                                              {"fanout_pos", fanout_.pos},
                                              {"fanout_first", fanout_.first},
                                              {"status", status_},
-                                             {"meta", meta_},
                                              {"src", src_},
                                              {"dst", dst_},
                                              {"push_order", push_order_},
@@ -144,6 +149,23 @@ std::map<std::string, at::Tensor> Plan::tensors() const {
                                              {"reducer_entries", reducer_entries_},
                                              {"put_list", put_list_},
                                              {"ready", ready_},
+                                             {"proxy_rounds", proxy_rounds_},
+                                             {"proxy_round_tables", proxy_round_tables_},
+                                             {"push_tables", push_tables_},
+                                             {"push_order_off", push_order_off_},
+                                             {"fwd_task_starts", fwd_task_starts_},
+                                             {"bwd_task_starts", bwd_task_starts_},
+                                             {"uniq_in", uniq_in_},
+                                             {"fwd_put_start", fwd_put_start_},
+                                             {"num_rounds", num_rounds_},
+                                             {"num_chunks", num_chunks_},
+                                             {"uniq_out", uniq_out_},
+                                             {"uniq_off", uniq_off_},
+                                             {"round_table", round_table_},
+                                             {"bwd_put_start", bwd_put_start_},
+                                             {"push_start", push_start_},
+                                             {"reduce_task_starts", reduce_task_starts_},
+                                             {"occurrence_count", occurrence_count_},
                                              {"kjt_values", kjt_values_},
                                              {"kjt_weights", kjt_weights_},
                                              {"kjt_lengths", kjt_lengths_},
@@ -162,17 +184,27 @@ void Plan::record_stream(c10::Stream stream) const {
     if (tensor->defined()) tensor->record_stream(stream);
   // start's
   for (const at::Tensor *tensor :
-       {&status_, &meta_, &src_, &dst_, &push_order_, &heavy_groups_, &group_first_sub_,
-        &group_of_sub_, &reducer_start_, &reducer_entries_, &put_list_, &ready_, &kjt_values_,
-        &kjt_weights_, &kjt_lengths_, &kjt_offsets_})
+       {&status_, &src_, &dst_, &push_order_, &heavy_groups_, &group_first_sub_, &group_of_sub_,
+        &reducer_start_, &reducer_entries_, &put_list_, &ready_, &kjt_values_, &kjt_weights_,
+        &kjt_lengths_, &kjt_offsets_})
+    if (tensor->defined()) tensor->record_stream(stream);
+  // start's tables across nodes
+  for (const at::Tensor *tensor :
+       {&proxy_rounds_, &proxy_round_tables_, &push_tables_, &push_order_off_, &fwd_task_starts_,
+        &bwd_task_starts_, &uniq_in_, &fwd_put_start_, &num_rounds_, &num_chunks_, &uniq_out_,
+        &uniq_off_, &round_table_, &bwd_put_start_, &push_start_, &reduce_task_starts_,
+        &occurrence_count_})
     if (tensor->defined()) tensor->record_stream(stream);
 }
 
 std::vector<at::Tensor *> Plan::backward_members() {
-  std::vector<at::Tensor *> members = {&block_start_, &dst_, &inv_, &meta_};
+  std::vector<at::Tensor *> members = {&block_start_, &dst_, &inv_};
   if (multi_node_)
-    members.insert(members.end(), {&push_order_, &heavy_groups_, &group_first_sub_, &group_of_sub_,
-                                   &reducer_start_, &reducer_entries_, &put_list_, &ready_});
+    members.insert(members.end(),
+                   {&push_order_, &heavy_groups_, &group_first_sub_, &group_of_sub_,
+                    &reducer_start_, &reducer_entries_, &put_list_, &ready_, &proxy_rounds_,
+                    &push_tables_, &bwd_task_starts_, &uniq_in_, &bwd_put_start_, &round_table_,
+                    &uniq_off_, &reduce_task_starts_, &num_rounds_, &num_chunks_});
   if (index_dedup_)
     members.insert(members.end(), {&fanout_.exp_off, &fanout_.exp_idx, &fanout_.slot, &fanout_.sub,
                                    &fanout_.count, &fanout_.pos, &fanout_.first});
@@ -193,23 +225,43 @@ static Fanout fanout_of(const FanoutTables &tables) {
   return fanout;
 }
 
+// On one node the tables across nodes stay nullptr.
 OutPlan Plan::out_plan(bool backward) const {
   OutPlan plan{};
   plan.block_start = block_start_.data_ptr<int64_t>();
   plan.rows = (backward ? dst_ : src_).data_ptr<int32_t>();
   plan.inv = inv_.data_ptr<int32_t>();
-  plan.meta = meta_.data_ptr<int64_t>();
-  if (multi_node_) {
-    plan.push_order = push_order_.data_ptr<int32_t>();
-    plan.heavy_groups = (const HeavyGroup *)heavy_groups_.data_ptr<int32_t>();
-    plan.group_first_sub = group_first_sub_.data_ptr<int32_t>();
-    plan.group_of_sub = group_of_sub_.data_ptr<int32_t>();
-    plan.reducer_start = reducer_start_.data_ptr<int32_t>();
-    plan.reducer_entries = reducer_entries_.data_ptr<int64_t>();
-    plan.put_list = (const PutSeg *)put_list_.data_ptr<int32_t>();
-    plan.ready = ready_.data_ptr<int64_t>();
-  }
   plan.fanout = fanout_of(fanout_);
+  plan.rounds_cap = rounds_cap_;
+  plan.num_nodes = num_nodes_;
+  if (!multi_node_) return plan;
+  // the tables both kernels read (backward_members)
+  plan.push_order = push_order_.data_ptr<int32_t>();
+  plan.heavy_groups = (const HeavyGroup *)heavy_groups_.data_ptr<int32_t>();
+  plan.group_first_sub = group_first_sub_.data_ptr<int32_t>();
+  plan.group_of_sub = group_of_sub_.data_ptr<int32_t>();
+  plan.proxy_rounds = proxy_rounds_.data_ptr<int64_t>();
+  plan.push_tables = (const ReqEntry *)push_tables_.data_ptr<int32_t>();
+  plan.bwd_task_starts = bwd_task_starts_.data_ptr<int64_t>();
+  plan.uniq_in = uniq_in_.data_ptr<int64_t>();
+  plan.num_rounds = num_rounds_.data_ptr<int64_t>();
+  plan.num_chunks = num_chunks_.data_ptr<int64_t>();
+  plan.uniq_off = uniq_off_.data_ptr<int64_t>();
+  plan.round_table = (const RoundPiece *)round_table_.data_ptr<int32_t>();
+  plan.bwd_put_start = bwd_put_start_.data_ptr<int32_t>();
+  plan.reduce_task_starts = reduce_task_starts_.data_ptr<int64_t>();
+  plan.reducer_start = reducer_start_.data_ptr<int32_t>();
+  plan.reducer_entries = reducer_entries_.data_ptr<int64_t>();
+  plan.put_list = (const PutSeg *)put_list_.data_ptr<int32_t>();
+  plan.ready = ready_.data_ptr<int64_t>();
+  if (backward) return plan;
+  // the forward's own, which after_forward lets go of
+  plan.proxy_round_tables = (const RoundPiece *)proxy_round_tables_.data_ptr<int32_t>();
+  plan.push_order_off = push_order_off_.data_ptr<int64_t>();
+  plan.fwd_task_starts = fwd_task_starts_.data_ptr<int64_t>();
+  plan.fwd_put_start = fwd_put_start_.data_ptr<int32_t>();
+  plan.uniq_out = uniq_out_.data_ptr<int64_t>();
+  plan.push_start = push_start_.data_ptr<int32_t>();
   return plan;
 }
 
@@ -220,6 +272,8 @@ void Plan::after_start() { keys_ = key_weights_ = row_cell_ = cell_start_ = at::
 
 std::vector<at::Tensor> Plan::after_forward() {
   src_ = values_ = value_weights_ = lengths_ = offsets_ = at::Tensor();
+  proxy_round_tables_ = push_order_off_ = fwd_task_starts_ = fwd_put_start_ = at::Tensor();
+  uniq_out_ = push_start_ = occurrence_count_ = at::Tensor();
   std::vector<at::Tensor> maps;
   for (at::Tensor *member : backward_members()) maps.push_back(*member);
   drop_backward_maps();

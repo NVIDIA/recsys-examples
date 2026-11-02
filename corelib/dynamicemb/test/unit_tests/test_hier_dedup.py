@@ -400,7 +400,7 @@ def garbage(count: int, dtype: torch.dtype, generator) -> torch.Tensor:
 
 
 def make_windows(case: Case, lookup_keys: int, remote_keys: int, generator) -> Dict:
-    """A rank's window regions as the planner across nodes reads and writes
+    """A rank's window buffers as the planner across nodes reads and writes
     them, garbage in each."""
     num_nodes, local_size = case.num_nodes, case.local_size
     rounds_cap = rounds_for(remote_keys, case.num_proxy_rows)
@@ -413,7 +413,7 @@ def make_windows(case: Case, lookup_keys: int, remote_keys: int, generator) -> D
             torch.int64,
             generator,
         ),
-        proxy_hdr=garbage(
+        proxy_header=garbage(
             4 + 4 * rounds_cap * num_nodes + 4 * local_size * (rounds_cap + 1),
             torch.int32,
             generator,
@@ -799,7 +799,7 @@ def run_call(
     )
     world_size = case.world_size
     tables = torch.tensor(case.tables, dtype=torch.int32, device="cuda")
-    common = 3 + num_nodes  # a count message's common part (msg_common)
+    common = 3 + num_nodes  # a count message's common part (CountMessage::common)
 
     def sizes(rank: int) -> Dict[str, int]:
         return dict(
@@ -886,7 +886,7 @@ def run_call(
                 layout["own_total"][rank % local_size : rank % local_size + 1],
                 window["remote_map"],
                 window["key_stage"],
-                window["proxy_hdr"],
+                window["proxy_header"],
                 case.node_dedup,
                 sizes(rank),
             )
@@ -971,7 +971,7 @@ def run_call(
             planner(
                 hier_output_dist_requester_tables,
                 torch.stack([windows[peer]["remote_map"] for peer in node_ranks]),
-                torch.stack([windows[peer]["proxy_hdr"] for peer in node_ranks]),
+                torch.stack([windows[peer]["proxy_header"] for peer in node_ranks]),
                 cell_starts[:, local_rank].contiguous(),
                 ranks[rank]["row_cell"],
                 ranks[rank]["cell_start"],
@@ -1019,7 +1019,7 @@ def check_proxy(
     expect("key rows", (words[0] & 0xFFFFFFFF).tolist(), ref["word0"])
     expect("slots", words[1].tolist(), ref["slot"])
     expect("push positions", words[2].tolist(), ref["position"])
-    header = window["proxy_hdr"].cpu()
+    header = window["proxy_header"].cpu()
     table_words = 4 * rounds_cap * num_nodes
     expect("header rounds", int(header[0]), num_rounds)
     expect(

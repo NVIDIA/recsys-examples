@@ -37,7 +37,7 @@ constexpr int64_t kMaxEntries = (int64_t{1} << 31) - 1024;
 struct Capacities {
   int64_t lookup_keys = 0;  // keys an owner looks up (rows of lookup_rows)
   int64_t remote_keys = 0;  // keys of other nodes' owners a proxy deduplicates for its node
-  int64_t proxy_bytes = 0;  // the most bytes of the proxy rows region (proxy_rows)
+  int64_t proxy_bytes = 0;  // the most bytes of proxy_rows, the proxy's rows
 };
 
 struct Config {

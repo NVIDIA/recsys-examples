@@ -115,7 +115,7 @@ enum InTraceSteps : int {
   kStepRequester,       // the requester tables
   kStepOwner,           // the owner tables
   kStepPutList,         // the put lists: the owner's forward and the proxy's backward
-  kStepStatus,          // Meta, the status and its pinned copy
+  kStepStatus,          // the status and its pinned copy
   kInSteps
 };
 

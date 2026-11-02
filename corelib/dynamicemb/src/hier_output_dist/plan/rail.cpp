@@ -19,6 +19,8 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 #include <algorithm>
 #include <cstdint>
 
+#include "hier_output_dist/common/ctrl.h"
+
 namespace dyn_emb {
 namespace hier_output_dist {
 
@@ -35,17 +37,20 @@ at::Tensor count_message(const at::Tensor &need_remote, const at::Tensor &num_ro
 }
 
 RailLayout rail_layout(const at::Tensor &messages, const at::Tensor &own_cells,
-                       const at::Tensor &other_nodes, const PlanSizes &sizes) {
+                       const at::Tensor &other_nodes, const Sizes &sizes) {
   const int64_t num_nodes = sizes.topo.num_nodes, node = sizes.topo.node,
                 local_size = sizes.topo.local_size, num_features = sizes.num_features,
                 num_sources = sizes.topo.num_sources;
+  const CountMessage message{num_nodes, num_features};
   RailLayout rail;
   // per source node: its rounds, its node-unique keys for each owner node,
-  // and its keys of each feature for this owner
-  const at::Tensor source_rounds = messages.select(1, 1);
-  const at::Tensor uniq = messages.narrow(1, 3, num_nodes);  // [source node][owner node]
-  rail.cells_in = messages.narrow(1, 3 + num_nodes, num_features);
-  const at::Tensor recv = messages.select(1, 2) + uniq.sum({0});  // [owner node]
+  // and its keys of each feature for this owner (the part for this node)
+  const at::Tensor source_rounds = messages.select(1, CountMessage::kRounds);
+  // [source node][owner node]
+  const at::Tensor uniq = messages.narrow(1, message.uniq_out(0), num_nodes);
+  rail.cells_in = messages.narrow(1, message.common(), num_features);
+  const at::Tensor recv =
+      messages.select(1, CountMessage::kOwnTotal) + uniq.sum({0});  // [owner node]
   // a slice: the source's round pieces, then its records; none to its own node
   const at::Tensor slice_bytes =
       (source_rounds.view({num_nodes, 1}) * 16 + uniq * sizes.record_bytes).fill_diagonal_(0);
@@ -65,14 +70,15 @@ RailLayout rail_layout(const at::Tensor &messages, const at::Tensor &own_cells,
   rail.length_per_key = rail.kjt_lengths.view({num_features, num_sources}).sum({1});
   const at::Tensor into_me = slice_bytes.select(1, node);
   rail.slice_in = at::stack({into_me.cumsum(0) - into_me, source_rounds}, 1);
-  rail.uniq_in = uniq.select(1, node);
+  rail.uniq_in = uniq.select(1, node).contiguous();
   const at::Tensor cell_offsets =
       rail.kjt_offsets.narrow(0, 0, num_features * num_sources).view({num_features, num_sources});
   rail.my_cell_starts = cell_offsets.narrow(1, 0, local_size).t().contiguous();
   rail.cell_stage =
       at::zeros({num_nodes, num_features}, messages.options())
           .index_copy_(0, other_nodes, cell_offsets.narrow(1, local_size, num_nodes - 1).t());
-  rail.needs = at::stack({recv.max(), messages.select(1, 0).max(), source_rounds.max()});
+  rail.needs = at::stack(
+      {recv.max(), messages.select(1, CountMessage::kNeedRemote).max(), source_rounds.max()});
   return rail;
 }
 
@@ -85,7 +91,7 @@ at::Tensor agreed_needs(const at::Tensor &peer_needs) { return peer_needs.amax({
 OwnerTables owner_tables(const RailLayout &rail, const at::Tensor &own_starts,
                          const at::Tensor &node_keys, const at::Tensor &node_weights,
                          const at::Tensor &rail_keys, const at::Tensor &other_nodes,
-                         const PlanSizes &sizes) {
+                         const Sizes &sizes) {
   const int64_t num_nodes = sizes.topo.num_nodes, local_size = sizes.topo.local_size,
                 num_features = sizes.num_features, num_sources = sizes.topo.num_sources,
                 rounds_cap = sizes.rounds_cap, lookup_keys = sizes.lookup_keys,

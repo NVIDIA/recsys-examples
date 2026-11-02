@@ -15,10 +15,12 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 # limitations under the License.
 ******************************************************************************/
 // The part of the kernels' arguments that both channels share and that is
-// fixed for the op's life (ChannelStatic). The op builds it once, after its
-// windows are registered; the out channel's static part extends it
-// (OutStatic), the in channel's comm kernels take it with the call's
-// sequence number (CommArgs), and the exit round's kernel takes it alone.
+// fixed for the op's life (ChannelStatic): its sizes, by which a kernel lays
+// out its window and its tables, and the window itself. The op builds it
+// once, after its window is registered; the out channel's static part
+// extends it (OutStatic), the in channel's comm kernels take it with the
+// call's sequence number (CommArgs), and the exit round's kernel takes it
+// alone.
 #pragma once
 
 #include <nccl_device.h>
@@ -26,21 +28,13 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 #include <cstdint>
 #include <type_traits>
 
-#include "hier_output_dist/common/ctrl.h"
-#include "hier_output_dist/common/meta.h"
-#include "hier_output_dist/common/topology.h"
-#include "hier_output_dist/common/windows.h"
+#include "hier_output_dist/common/sizes.h"
 
 namespace dyn_emb {
 namespace hier_output_dist {
 
-struct ChannelStatic {
-  Topo topo;
-  int num_features;
-  Win win;              // the windows' regions and the capacities they hold
-  Ctrl ctrl_at;         // the control words
-  Meta meta_at;         // a call's small tables (across nodes for win.rounds_cap rounds)
-  int chunk_rows;       // rows of an IB chunk (2 MiB)
+struct ChannelStatic : Sizes {
+  ncclWindow_t window;  // the op's window (common/window.h)
   uint64_t timeout_ns;  // how long a wait for a peer may take
   ncclDevComm dev;      // GIN across nodes
 };

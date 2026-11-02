@@ -40,12 +40,14 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 
 #include "hier_output_dist/common/channel_args.h"
 #include "hier_output_dist/common/constants.h"
+#include "hier_output_dist/common/ctrl.h"
 #include "hier_output_dist/common/gin_signals.h"
+#include "hier_output_dist/common/keys.h"
 #include "hier_output_dist/common/status.h"
 #include "hier_output_dist/common/topology.h"
 #include "hier_output_dist/common/trace_flag.h"
-#include "hier_output_dist/device/ctrl_words.cuh"
 #include "hier_output_dist/device/memory_order.cuh"
+#include "hier_output_dist/device/node_window.cuh"
 #include "hier_output_dist/device/spin.cuh"
 #include "hier_output_dist/device/warp.cuh"
 #include "hier_output_dist/host/common.h"
@@ -63,19 +65,20 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 namespace dyn_emb {
 namespace hier_output_dist {
 
-// Teardown, 1 warp: tell the node this rank reads no window any more (closing
-// in its ctrl) and, across nodes, its rail peers that it sends nothing more
+// Teardown, 1 warp: tell the node this rank reads no window any more (its
+// closing word) and, across nodes, its rail peers that it sends nothing more
 // (a closing signal on the credits' context, behind every credit it sent
 // them on the same QPs), both before waiting for anyone; then wait (at most
 // limit_ns) until every node peer and every rail peer said the same, each
-// lane taking peers in turn. Records in `closed` whether they all did. Its
-// waits are loops of their own: after limit_ns they give up and record it,
-// where Spin would trap.
+// lane taking peers in turn. Records in its closed word whether they all
+// did. Its waits are loops of their own: after limit_ns they give up and
+// record it, where Spin would trap.
 __global__ void exit_kernel(ChannelStatic channel, uint64_t limit_ns) {
   const Topo &topo = channel.topo;
   const int lane = threadIdx.x, num_nodes = topo.num_nodes;
-  const CtrlWords mine(channel.win, channel.ctrl_at, topo.local_rank);
-  if (lane == 0) st_release_sys(mine.closing(), 1);
+  const NodeWindow node(channel.window, topo.local_rank);
+  const CtrlLayout ctrl = node.layout(channel).ctrl;
+  if (lane == 0) st_release_sys(ctrl.closing(), 1);
   if (num_nodes > 1) {
     ncclGin cred(channel.dev, kCtxCredit);
     for (int peer_node = lane; peer_node < num_nodes; peer_node += 32)
@@ -88,8 +91,8 @@ __global__ void exit_kernel(ChannelStatic channel, uint64_t limit_ns) {
   bool seen = true;
   const uint64_t start_ns = now_ns();
   for (int peer = lane; peer < topo.local_size && seen; peer += 32) {
-    const CtrlWords peer_words(channel.win, channel.ctrl_at, peer);
-    while (ld_acquire_sys(peer_words.closing()) == 0) {
+    const uint64_t *closing = node.peer(ctrl.closing(), peer);
+    while (ld_acquire_sys(closing) == 0) {
       if (now_ns() - start_ns > limit_ns) {
         seen = false;
         break;
@@ -111,7 +114,7 @@ __global__ void exit_kernel(ChannelStatic channel, uint64_t limit_ns) {
     cred.flush(ncclCoopWarp{});
   }
   const bool all = __all_sync(kFull, seen);
-  if (lane == 0) *mine.closed() = all ? 1 : 0;
+  if (lane == 0) *ctrl.closed() = all ? 1 : 0;
 }
 
 cudaError_t launch_exit_kernel(const ChannelStatic &channel, uint64_t limit_ns) {
@@ -143,7 +146,7 @@ bool gin_signals_zero(const ncclDevComm &dev, int num_nodes) {
 namespace {
 
 CommArgs comm_args(const ChannelStatic &channel, int64_t seq) {
-  return CommArgs{channel, Channel{seq, channel.ctrl_at.in_started}};
+  return CommArgs{channel, Channel{seq}};
 }
 
 cudaStream_t current_stream() { return at::cuda::getCurrentCUDAStream(); }
@@ -169,12 +172,11 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> launch_node_count_exchange(
 
 void launch_node_key_push(const ChannelStatic &channel, const at::Tensor &keys,
                           const at::Tensor &weights, const at::Tensor &row_cell,
-                          const at::Tensor &destination_base, const at::Tensor &rows_to_push,
-                          int64_t remote_base) {
+                          const at::Tensor &destination_base, const at::Tensor &rows_to_push) {
   node_key_push_kernel<<<grid_of(keys.numel()), kThreads, 0, current_stream()>>>(
       channel, keys.data_ptr<int64_t>(), weights.defined() ? weights.data_ptr<float>() : nullptr,
       row_cell.data_ptr<int32_t>(), destination_base.data_ptr<int64_t>(),
-      rows_to_push.data_ptr<int64_t>(), remote_base);
+      rows_to_push.data_ptr<int64_t>());
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
@@ -186,8 +188,8 @@ void launch_node_done(const ChannelStatic &channel, int64_t seq) {
 at::Tensor launch_rail_count_exchange(const ChannelStatic &channel, int64_t seq,
                                       const at::Tensor &message) {
   const int num_nodes = channel.topo.num_nodes;
-  at::Tensor messages =
-      at::empty({num_nodes, msg_len(num_nodes, channel.num_features)}, message.options());
+  const CountMessage format{num_nodes, channel.num_features};
+  at::Tensor messages = at::empty({num_nodes, format.length()}, message.options());
   rail_count_exchange_kernel<<<1, 256, 0, current_stream()>>>(
       comm_args(channel, seq), message.data_ptr<int64_t>(), messages.data_ptr<int64_t>());
   C10_CUDA_KERNEL_LAUNCH_CHECK();
@@ -216,13 +218,14 @@ std::pair<at::Tensor, at::Tensor> launch_node_status_exchange(const ChannelStati
   return {peer_needs, owner_cell_start};
 }
 
-at::Tensor launch_peer_gather(const ChannelStatic &channel, Region region, const at::Tensor &peer,
-                              const at::Tensor &first_word, int words, int64_t word_stride) {
+at::Tensor launch_peer_gather(const ChannelStatic &channel, GatherFrom from, const at::Tensor &peer,
+                              const at::Tensor &first_word) {
   const int64_t items = peer.numel();
+  const int words = gather_words(from);
   at::Tensor out = at::empty({words, items}, peer.options());
   peer_gather_kernel<<<grid_of(items * words), kThreads, 0, current_stream()>>>(
-      channel, region, peer.data_ptr<int32_t>(), first_word.data_ptr<int64_t>(), items, words,
-      word_stride, out.data_ptr<int32_t>());
+      channel, from, peer.data_ptr<int32_t>(), first_word.data_ptr<int64_t>(), items, words,
+      out.data_ptr<int32_t>());
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   return out;
 }

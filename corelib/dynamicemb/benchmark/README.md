@@ -730,7 +730,7 @@ calls.
 | metric | JSON field | definition |
 |---|---|---|
 | reserved_max | `mem_reserved_max_bytes` | The most that PyTorch's caching allocator reserved during the timed iterations, all told (the batches included). |
-| windows | `mem_window_bytes` | The dist's windows, from `ncclMemAlloc`, outside the allocator. |
+| windows | `mem_window_bytes` | The window of each hierarchical sharding, summed (its op's `memory()["windows"]`: `docs/hier_output_dist.md`, section 7.1), from `ncclMemAlloc`, outside the allocator. |
 | reserved + windows | `mem_total_reserved_bytes` | The two together. |
 | device memory in use | `mem_device_used_bytes` | From `cudaMemGetInfo`, after the timed iterations (and at earlier checkpoints): the CUDA context, NCCL's communicators and buffers, the windows, the tables and PyTorch's memory. |
 

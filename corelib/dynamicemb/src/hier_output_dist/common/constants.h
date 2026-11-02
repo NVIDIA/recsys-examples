@@ -31,11 +31,10 @@ constexpr int kHeavy = 64;
 constexpr int kTaskRows = 32;  // rows of an output dist task, one per lane
 constexpr int kWarps = kThreads / 32;
 // The most rounds of proxy_rows a call's tables hold: credits and push flags
-// number the rounds in 20 bits (grant_of), and the tables take int32 offsets
-// (meta_layout).
+// number the rounds in 20 bits (grant_of).
 constexpr int kMaxRounds = 1 << 16;
-// Task queues of an out kernel (Ctrl::tasks): the workers', and across nodes
-// the backward's reducers'.
+// Task queues of an out kernel (CtrlLayout::task): the workers', and across
+// nodes the backward's reducers'.
 enum Queue : int { kQueueWork = 0, kQueueReduce, kNumQueues };
 
 // count / Per rounded up (count >= 0), in the type of count + Per.

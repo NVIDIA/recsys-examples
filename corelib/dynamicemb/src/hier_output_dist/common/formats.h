@@ -55,8 +55,8 @@ struct Fanout {
 struct RoundPiece {
   int32_t uniq_lo, uniq_hi;  // the node-unique keys of the piece
   int32_t off;               // slot of its first row in proxy_rows
-  int32_t chunk;             // the proxy's own table (Meta::round_table): the piece's first IB
-                             // chunk of the backward, numbered over all pieces; else 0
+  int32_t chunk;             // the proxy's own table (OutPlan::round_table): the piece's first
+                             // IB chunk of the backward, numbered over all pieces; else 0
 };
 // The push-task flags of one round in push_flags: those of round rnd start at
 // (rnd % 2) * half_flags. A round holds at most half of proxy_rows (all of it
@@ -110,7 +110,7 @@ struct HeavyGroup {
   int32_t start, end;
 };
 // A segment of a put list: `rows` rows from src to dst (rows of the source and
-// destination regions), all in one feature's cell of the owner's KJT; for the
+// destination buffers), all in one feature's cell of the owner's KJT; for the
 // backward also its IB chunk, whose ready counter it waits for.
 struct PutSeg {
   int32_t src, dst, rows, chunk;

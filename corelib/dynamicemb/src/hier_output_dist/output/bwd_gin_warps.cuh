@@ -25,11 +25,10 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 
 #include "hier_output_dist/common/formats.h"
 #include "hier_output_dist/common/gin_signals.h"
-#include "hier_output_dist/common/meta.h"
 #include "hier_output_dist/common/trace_slots.h"
-#include "hier_output_dist/common/windows.h"
-#include "hier_output_dist/device/ctrl_words.cuh"
+#include "hier_output_dist/common/window.h"
 #include "hier_output_dist/device/memory_order.cuh"
+#include "hier_output_dist/device/node_window.cuh"
 #include "hier_output_dist/device/rail.cuh"
 #include "hier_output_dist/device/spin.cuh"
 #include "hier_output_dist/device/warp.cuh"
@@ -77,9 +76,9 @@ __device__ void ProxyIssuer::run(const OutArgs &args) {
   __shared__ int at_round[32];         // each lane's round: it has put the rounds before
   __shared__ unsigned at_half[32][2];  // its puts out of each half
   const OutPlan &plan = args.plan;
-  const int lane = threadIdx.x & 31, num_nodes = args.topo.num_nodes, node = args.topo.node,
-            rounds_cap = args.win.rounds_cap;
-  const CtrlWords mine = CtrlWords::of(args, args.topo.local_rank);
+  const int lane = threadIdx.x & 31, num_nodes = args.topo.num_nodes, node = args.topo.node;
+  const NodeWindow node_window(args.window, args.topo.local_rank);
+  const WindowLayout window = node_window.layout(args);
   ncclGin rows(args.dev, kCtxBwd), cred(args.dev, kCtxCredit);
   const ncclTeam rail = ncclTeamRail(args.dev);
   const Credits credits(cred, rail);
@@ -89,32 +88,31 @@ __device__ void ProxyIssuer::run(const OutArgs &args) {
     if (owner_node == node) continue;
     live = true;
     credits.raise(owner_node, sig_bwd_ready(num_nodes, node), (uint64_t)args.ch.seq,
-                  mine.bwd_ready_sent(owner_node));
+                  window.ctrl.bwd_ready_sent(owner_node));
   }
   Spin spin(args.timeout_ns);
   // The ready counters were zeroed before this rank published its out_seq.
   if (lane == 0)
-    while ((int64_t)ld_acquire_gpu(mine.word(args.ch.started)) < args.ch.seq)
+    while ((int64_t)ld_acquire_gpu(window.ctrl.out_started()) < args.ch.seq)
       spin.pause("entry of this rank", 0, args.ch.seq, args.topo.rank);
-  const int num_rounds = (int)plan.meta[args.meta_at.misc + kMiscRounds];
-  // the segments of each (owner node, round)
-  const int32_t *put_start = (const int32_t *)(plan.meta + args.meta_at.bwd_put_start);
+  const int num_rounds = (int)*plan.num_rounds;
   for (int owner_node = lane; owner_node < num_nodes; owner_node += 32) {
-    mine.put_at(owner_node)[0] = put_start[owner_node * (rounds_cap + 1)];
-    mine.put_at(owner_node)[1] = 0;
+    window.ctrl.put_at(owner_node)[0] = plan.bwd_puts(owner_node)[0];
+    window.ctrl.put_at(owner_node)[1] = 0;
   }
   // the puts this proxy posted to each half in earlier calls
-  const uint64_t posted[2] = {*mine.posted(0), *mine.posted(1)};
+  const uint64_t posted[2] = {*window.ctrl.posted(0), *window.ctrl.posted(1)};
   volatile int *lane_rounds = at_round;
   volatile unsigned *lane_half_puts = &at_half[0][0];
   lane_rounds[lane] = live ? 0 : num_rounds;
   lane_half_puts[2 * lane] = lane_half_puts[2 * lane + 1] = 0;
   __syncwarp();
+  // rows of proxy_rows into the rail owners' lookup_rows
   const RowPut put{rows,
                    rail,
-                   args.win.handle[kLookupRows],
-                   args.win.off[kLookupRows],
-                   args.win.off[kProxyRows],
+                   node_window,
+                   window.rows.lookup_rows(),
+                   window.rows.proxy_rows(),
                    args.row_bytes,
                    sig_rows(node)};
   unsigned puts[2] = {0, 0};  // this lane's puts out of each half
@@ -125,8 +123,8 @@ __device__ void ProxyIssuer::run(const OutArgs &args) {
     int lane_through = num_rounds;  // rounds every owner node of the lane has put
     for (int owner_node = lane; owner_node < num_nodes; owner_node += 32) {
       if (owner_node == node) continue;
-      const int32_t *start = put_start + owner_node * (rounds_cap + 1);
-      int64_t *at = mine.put_at(owner_node);
+      const int32_t *start = plan.bwd_puts(owner_node);  // the node's segments, by round
+      int64_t *at = window.ctrl.put_at(owner_node);
       int64_t done = at[0];  // segments [start of round rnd, done) are put
       int rnd = (int)at[1];
       while (rnd < num_rounds && done == start[rnd + 1]) ++rnd;
@@ -182,7 +180,7 @@ __device__ void ProxyIssuer::run(const OutArgs &args) {
         uint64_t want = posted[half];
         for (int other = 0; other < 32; ++other) want += lane_half_puts[2 * other + half];
         if (rows.readCounter(half) < want) break;
-        st_release_sys(mine.half_free(), grant_of(args.ch.seq, freed + 2));
+        st_release_sys(window.ctrl.half_free(), grant_of(args.ch.seq, freed + 2));
         ++freed;
         moved = true;
       }
@@ -202,7 +200,7 @@ __device__ void ProxyIssuer::run(const OutArgs &args) {
                              posted[1] + __reduce_add_sync(kFull, puts[1])};
     if (lane == 0) {
       for (int half = 0; half < 2; ++half) {
-        *mine.posted(half) = all[half];
+        *window.ctrl.posted(half) = all[half];
         while (rows.readCounter(half) < all[half])
           spin.pause("puts read from proxy_rows", half, (long long)all[half], args.topo.rank);
       }
@@ -215,7 +213,7 @@ __device__ void ProxyIssuer::run(const OutArgs &args) {
   for (int owner_node = lane; owner_node < num_nodes; owner_node += 32)
     if (owner_node != node)
       credits.raise(owner_node, sig_grant(node), grant_of(args.ch.seq + 1, 2),
-                    mine.grant_sent(owner_node));
+                    window.ctrl.grant_sent(owner_node));
   __syncwarp();
   credits.flush_warp();
 }
@@ -226,12 +224,13 @@ __device__ void ProxyIssuer::run(const OutArgs &args) {
 // them.
 __device__ __forceinline__ void lane_landed_rows(const OutArgs &args, const ncclGin &rows, int lane,
                                                  uint64_t &got, uint64_t &need) {
-  const CtrlWords mine = CtrlWords::of(args, args.topo.local_rank);
+  const WindowLayout window = NodeWindow(args.window, args.topo.local_rank).layout(args);
   got = need = 0;
   for (int peer_node = lane; peer_node < args.topo.num_nodes; peer_node += 32) {
     if (peer_node == args.topo.node) continue;
-    const uint64_t rows_of_node = (uint64_t)args.plan.meta[args.meta_at.uniq_in + peer_node];
-    got += min(rows.readSignal(sig_rows(peer_node)) - *mine.bwd_tot(peer_node), rows_of_node);
+    const uint64_t rows_of_node = (uint64_t)args.plan.uniq_in[peer_node];
+    got +=
+        min(rows.readSignal(sig_rows(peer_node)) - *window.ctrl.bwd_tot(peer_node), rows_of_node);
     need += rows_of_node;
   }
 }
@@ -257,7 +256,7 @@ class LandingWatcher {
 
 __device__ void LandingWatcher::run(const OutArgs &args) {
   const int lane = threadIdx.x & 31;
-  const CtrlWords mine = CtrlWords::of(args, args.topo.local_rank);
+  const WindowLayout window = NodeWindow(args.window, args.topo.local_rank).layout(args);
   ncclGin rows(args.dev, kCtxBwd);
   const OutTimeline timeline(args);
   const uint64_t others = (uint64_t)(args.arrive0 + gridDim.x - 1);
@@ -275,7 +274,7 @@ __device__ void LandingWatcher::run(const OutArgs &args) {
     }
     if (__all_sync(kFull, seen == need)) break;
     bool rest = false;
-    if (lane == 0) rest = ld_acquire_gpu(mine.arrive()) >= others;
+    if (lane == 0) rest = ld_acquire_gpu(window.ctrl.arrive()) >= others;
     if (__shfl_sync(kFull, rest, 0)) break;
     spin.pause("gradient rows of the proxy nodes", lane, (long long)need, args.topo.rank);
   }

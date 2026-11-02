@@ -42,9 +42,9 @@ sharding of DynamicEmb tables the hierarchical dist replaces both. One
 operator per sharding, `HierOutputDist`, does the work (section 7):
 
 * **A static operator.** It is built once, at the sharding's first call, and
-  makes its windows then (the buffers its peers read and write), at the
-  capacities the tables give (`output_dist_capacity`, section 5); their
-  sizes never change. A call's own tensors come from PyTorch's caching
+  makes its window then (the buffers its peers read and write), at the
+  capacities the tables give (`output_dist_capacity`, section 5); its size
+  never changes. A call's own tensors come from PyTorch's caching
   allocator. The ranks first check that they all build the op from the same
   options. A call that does not fit the capacities takes TorchRec's dists
   instead: that call alone, on every rank alike, with a warning that names
@@ -75,9 +75,9 @@ operator per sharding, `HierOutputDist`, does the work (section 7):
   rail peers in turn.
 * **Memory that does not grow with the number of GPUs.** Apart from small
   tables that grow linearly with the nodes and with the features (section
-  15.4), no buffer is sized by the number of GPUs. The proxy rows region (the
-  proxy's buffer for rows) has a fixed cap. A call whose rows do not fit
-  moves them in rounds.
+  15.4), no buffer is sized by the number of GPUs. The proxy's buffer for
+  rows (`proxy_rows`) has a fixed cap. A call whose rows do not fit moves
+  them in rounds.
 
 [benchmark/README.md](../benchmark/README.md), section 3, says how to compare
 this dist with TorchRec's dists.
@@ -100,13 +100,15 @@ this dist with TorchRec's dists.
   (GPU-initiated networking) a kernel sends data over IB itself, without the
   CPU. GIN sends *puts* (copy bytes into a peer's memory) and *signals* (add
   a number to a counter at the peer).
-* **Window**: memory each rank allocates with `ncclMemAlloc` and registers
-  with NCCL. Every rank's copy has the same size and layout, so a rank finds
-  its data in a peer's copy at the same offset. A window is cut into named
-  *regions*, one per kind of data (section 7.5). Its size is a whole number
-  of *allocation granules*, the unit in which the GPU driver maps memory.
+* **Window**: the memory an op shares with its peers. Each rank allocates
+  its copy with `ncclMemAlloc` and registers it with NCCL. Every rank's copy
+  has the same size and layout, so a rank finds its data in a peer's copy at
+  the same place. The window has three *sections*: the control words, the
+  keys and the rows. Each is cut into named *buffers*, one per kind of data
+  (section 7.5). Its size is a whole number of *allocation granules*, the
+  unit in which the GPU driver maps memory.
 * **Op**: the operator `HierOutputDist`, one per sharding (section 7). It
-  holds the windows and everything else that lives as long as the sharding,
+  holds its window and everything else that lives as long as the sharding,
   and runs every step of a call. **Plan**: one call of the op, from its
   part 1 to its backward: the call's state between the op's steps.
 * **Comm kernel**: one of the input dist's seven custom kernels, each of
@@ -128,9 +130,9 @@ this dist with TorchRec's dists.
   **Node-unique key**: one (owner node, table, key) as the proxy sends it
   on, however many occurrences its node has.
 * **Lookup output**: the owner's rows for the keys it looks up, in its
-  region `lookup_rows`. **Proxy rows region** (`proxy_rows`): the proxy's
-  buffer for the rows that pass between its node and the other nodes, in
-  both directions.
+  buffer `lookup_rows`. **Proxy rows** (`proxy_rows`): the proxy's buffer
+  for the rows that pass between its node and the other nodes, in both
+  directions.
 * **Dedup** (deduplication): removing repeated keys. **Index dedup**:
   TorchRec's `use_index_dedup`. Each rank removes its own repeated keys
   before the input dist, and the rows are copied back to every original
@@ -179,8 +181,8 @@ sharding raises `ValueError`. Tables without DynamicEmb options (plain
 TorchRec tables) do not vote. Every rank must give the same options and
 environment variables: the ranks compare them before they build the op, and
 raise the same `ValueError` when they differ (section 7.2). Training calls
-take the op; eval forwards take TorchRec's dists, while the op's windows
-stay allocated. Section 5.2 shows how to choose the capacities. Call
+take the op; eval forwards take TorchRec's dists, while the op's window
+stays allocated. Section 5.2 shows how to choose the capacities. Call
 `quiesce(model)` on every rank before you drop a model (section 4.6).
 
 ### 4.2 Requirements
@@ -225,7 +227,7 @@ every rank alike (section 6).
 
 | variable | default | meaning |
 |---|---|---|
-| `DYNAMICEMB_GIN_PROXY_MB` | `512` | Cap of the proxy rows region, in MiB (section 15.3). |
+| `DYNAMICEMB_GIN_PROXY_MB` | `512` | Cap of `proxy_rows`, in MiB (section 15.3). |
 | `DYNAMICEMB_GIN_TIMEOUT_S` | the process group's NCCL timeout | How long a kernel waits for a peer before it prints what it waited for and traps (stops, which loses the CUDA context). |
 | `DYNAMICEMB_GIN_CTAS` | `0` | CTAs of the output-dist kernels. `0`: 32 for the forward and 64 for the backward on one node, 32 for both across nodes (section 14). |
 | `DYNAMICEMB_GIN_REDUCE_CTAS` | `8` | Across nodes: the backward's CTAs that add up the proxy's rows (1 or more; the kernel uses at most its CTAs minus one). |
@@ -282,22 +284,22 @@ del model
 ```
 
 Teardown is local: ranks may drop a model at different times. After a rank's
-kernels end, its node peers may still read its windows, and its rail peers may
+kernels end, its node peers may still read its window, and its rail peers may
 still send it credits (section 12.2). So dropping a sharding first waits until
 every node peer and rail peer has dropped its own (the teardown's
 `exit_kernel`), for at most `min(timeout, 30 s)`. If a peer keeps its model,
-the rank prints a message and keeps its windows until the process exits.
+the rank prints a message and keeps its window until the process exits.
 `quiesce(model)` calls each op's `quiesce()`, in the same order on every rank:
 the op syncs its device and meets the other ranks over its own communicator.
-Dropping the model then frees the windows at once. A call of the model after
-`quiesce` undoes it. A view of `lookup_rows` that outlives the sharding (a
-lookup output kept by the caller) keeps that window's memory until the process
-exits.
+Dropping the model then frees each op's window at once. A call of the model
+after `quiesce` undoes it. A view of `lookup_rows` that outlives the sharding
+(a lookup output kept by the caller) keeps the op's whole window until the
+process exits.
 
 ## 5. Capacities
 
-The op makes its windows once, when it is built (section 7.2), at the
-capacities of `output_dist_capacity`, and keeps their sizes for its life.
+The op makes its window once, when it is built (section 7.2), at the
+capacities of `output_dist_capacity`, and keeps its size for its life.
 Each capacity counts keys. On one node only `lookup_keys` is used.
 
 ### 5.1 What each capacity bounds
@@ -313,12 +315,12 @@ The words used in this section and in section 15:
 | capacity | what it bounds | what it sizes | with uniform keys, about |
 |---|---|---|---|
 | `lookup_keys` | the keys an owner looks up: those of its own node and, across nodes, one per node-unique key of each other node | `lookup_rows` (the lookup output), the own part of `node_keys` and, across nodes, `rail_keys`; per call, the owner's KJT | `num_keys × (1 + (num_nodes − 1) × uniq_share) / num_nodes`, at most `num_keys` |
-| `remote_keys` | across nodes: the occurrences a proxy deduplicates, the keys its node sends the owners of its rail on the other nodes | the remote part of `node_keys`, `remote_cells`, `remote_map` and `key_stage`; the proxy rows region, up to its cap; per call, the proxy's lists | `num_keys × (num_nodes − 1) / num_nodes` |
+| `remote_keys` | across nodes: the occurrences a proxy deduplicates, the keys its node sends the owners of its rail on the other nodes | the remote part of `node_keys`, `remote_cells`, `remote_map` and `key_stage`; `proxy_rows`, up to its cap; per call, the proxy's lists | `num_keys × (num_nodes − 1) / num_nodes` |
 
-Two more sizes follow from these (section 15.3): the proxy rows region
-holds `remote_keys` rows, up to its cap, and the round tables hold the
-rounds that `remote_keys` rows take in it (`rounds_cap`). A call whose rows
-do not fit that region moves them in rounds (section 12.1). The op's
+Two more sizes follow from these (section 15.3): `proxy_rows` holds
+`remote_keys` rows, up to its cap, and the round tables hold the rounds
+that `remote_keys` rows take in it (`rounds_cap`). A call whose rows do not
+fit `proxy_rows` moves them in rounds (section 12.1). The op's
 `capacities()` gives them all.
 
 Say a hot key makes up a share `hot_share` of every rank's keys. It adds
@@ -385,17 +387,17 @@ Bytes per entry of each capacity, per rank. `row_bytes` is the embedding dim
 is 8, or 16 when the owner's KJT carries weights. Section 15.2 gives every
 formula.
 
-| capacity | in the windows | elsewhere |
+| capacity | in the window | elsewhere |
 |---|---|---|
 | `lookup_keys` | `row_bytes` (`lookup_rows`) + 8 (`node_keys`; 12 when the keys carry weights) + across nodes `record_bytes` (`rail_keys`) | per call, 8 (12 with weights) for the owner's KJT |
-| `remote_keys` | 8 (`node_keys`; 12 with weights) + 2 (`remote_cells`) + 12 (`remote_map`) + `record_bytes` (`key_stage`) | `row_bytes` in the proxy rows region, up to its cap; per call, 12 (the proxy's reducer list) and about 2 (the requesters' heavy groups) |
+| `remote_keys` | 8 (`node_keys`; 12 with weights) + 4 (`remote_cells`) + 12 (`remote_map`) + `record_bytes` (`key_stage`), and `row_bytes` in `proxy_rows`, up to its cap | per call, 12 (the proxy's reducer list) and about 2 (the requesters' heavy groups) |
 
 The planner's working memory comes on top, in the side stream's allocator
 pool: that of its largest step (section 15.2).
 
 For the benchmark's configuration (540,672 keys per rank, rows of 512
-bytes), capacities of 1.25 times the needs take 0.35 GB of windows per rank
-on one node and 0.53–0.61 GB on 2 to 4 nodes (section 15.4).
+bytes), capacities of 1.25 times the needs take a window of 0.35 GB per rank
+on one node and 0.53–0.62 GB on 2 to 4 nodes (section 15.4).
 
 ### 5.4 A call that does not fit
 
@@ -429,7 +431,7 @@ some capacity than the op has:
 * When a node pushes no keys, its proxies deduplicate none, so the call's
   `lookup_keys` need leaves out the keys that node sends to other nodes. A
   later call may then name `lookup_keys` too.
-* Such a call costs what TorchRec's dists cost, and the op's windows stay
+* Such a call costs what TorchRec's dists cost, and the op's window stays
   allocated meanwhile. Calls that do not fit are meant to be rare: raise the
   capacity the warning names.
 
@@ -451,8 +453,8 @@ state that every rank shares.
 | one rank in the sharding; a table of the sharding that is not a DynamicEmb table; feature processors | when sharding | a warning, TorchRec's dists |
 | ranks that would build the op from different options, capacities or environment values | first `input_dist()`, before the op is built | `ValueError` on every rank, naming the first rank and value that differ |
 | ranks that are not whole nodes; `world_size × num_features` of 2^31 − 1024 or more; rows not a multiple of 16 bytes | first `input_dist()` | a warning, TorchRec's dists |
-| a configuration the op cannot take: across nodes, capacities without `remote_keys`; a proxy cap below the rows a round needs (section 15.3); a `remote_keys` that would take more than 65536 rounds of the proxy rows region, or whose push key would pass 63 bits (section 10.4); rows that are not fp32, bf16 or fp16; an environment value it refuses (section 4.4) | first `input_dist()`, before the op is built | `"fused"`: `ValueError` on every rank; `"auto"`: a warning, TorchRec's dists |
-| On some rank: the NCCL LSA team is not the whole node. Or, across nodes, GIN does not connect the rails, has fewer than 4 contexts, or its signals do not start at 0. Or the windows or the lookup gradient's event cannot be allocated. | first `input_dist()`, collectively | a warning that names each rank and why, TorchRec's dists on every rank |
+| a configuration the op cannot take: across nodes, capacities without `remote_keys`; a proxy cap below the rows a round needs (section 15.3); a `remote_keys` that would take more than 65536 rounds of `proxy_rows`, or whose push key would pass 63 bits (section 10.4); rows that are not fp32, bf16 or fp16; an environment value it refuses (section 4.4) | first `input_dist()`, before the op is built | `"fused"`: `ValueError` on every rank; `"auto"`: a warning, TorchRec's dists |
+| On some rank: the NCCL LSA team is not the whole node. Or, across nodes, GIN does not connect the rails, has fewer than 4 contexts, or its signals do not start at 0. Or the window or the lookup gradient's event cannot be allocated. | first `input_dist()`, collectively | a warning that names each rank and why, TorchRec's dists on every rank |
 | an eval forward | per call | TorchRec's dists for that call |
 | a call that does not fit the capacities | per call, at its second wait | TorchRec's dists for that call, a warning (section 5.4) |
 
@@ -523,10 +525,16 @@ the bucketize's rule of each feature, the rows and their weights,
 `node_dedup`, the capacities (with the proxy cap in bytes) and the knobs of
 section 4.4.
 
+Of the diagnostics, `capacities()` gives the capacities in place (section
+5.1), and `memory()` the bytes of the op's window, in two maps:
+`memory()["windows"]["window"]` is this rank's copy, in whole allocation
+granules, and `memory()["buffers"]` gives what each buffer takes in it, by
+name (`ctrl` for the ctrl section; sections 7.5 and 15.2).
+
 Python reads the options and the environment when the sharding is built,
 and hands them over when it builds the op. The tests and the benchmark read
 more of the op and its plans through functions of `testing.cu`: the plan's
-tensors, the layout of its small tables, the views of `lookup_rows` alive,
+tensors (the call's tables among them), the views of `lookup_rows` alive,
 and the planner's steps on plain tensors. `testing.cu` also has a hook that
 makes the next construction fail.
 
@@ -551,18 +559,18 @@ same point on every rank:
    across nodes, GIN on the rails with 4 contexts.
 3. Each rank checks that it can run: its LSA team is the whole node, and
    across nodes GIN connects the rails with at least 4 contexts whose
-   signals start at 0. Then it allocates the three windows and the event of
-   the lookup's gradient, once.
+   signals start at 0. Then it allocates its copy of the window (section
+   7.5) and the event of the lookup's gradient, once.
 4. The ranks agree: an all-gather of one readiness code per rank, on the
-   op's own communicator, before anything collective uses the windows. If
+   op's own communicator, before anything collective uses the window. If
    some rank cannot run, every rank ends the communicator together, frees
    what it allocated, and raises the same `RuntimeError`, which names each
    rank and why. Python warns and takes TorchRec's dists for the sharding.
-5. Else every rank registers its windows (collective), makes its two
-   channels (section 7.5) and syncs its device. An error inside the
-   collective registration cannot be agreed: that rank raises alone, and
-   the others wait in the registration, as they would in NCCL's own
-   initialization.
+5. Else every rank registers its window (one collective registration),
+   makes its two channels (section 7.5) and syncs its device. An error
+   inside the collective registration cannot be agreed: that rank raises
+   alone, and the others wait in the registration, as they would in NCCL's
+   own initialization.
 
 Building the op costs a few host syncs: the all-gather, the communicator,
 the agreement and the device sync. After it, a call costs one.
@@ -615,7 +623,7 @@ traced build's step times (section 4.4).
 | requester tables | ATen | its maps, push order, heavy groups and task starts | 10.4 | `requester` |
 | owner tables | ATen | its KJT's keys, and the round pieces its forward put list sends | 10.4 | `owner` |
 | put lists | ATen | the owner's forward and the proxy's backward put lists, and the IB chunks | 10.4 | `put_list` |
-| status | ATen | the call's small tables and status, and its copy into pinned host memory | 10.5 | `status` |
+| status | ATen | the call's status, and its copy into pinned host memory | 10.5 | `status` |
 
 One node runs the first five steps, the owner's KJT and the status; across
 nodes every step runs but the owner's KJT.
@@ -627,9 +635,10 @@ Part 1 is local: no sync, no collective, no sequence number. So its plan may
 be dropped before the first wait (TorchRec's prefetch pipeline does this):
 nothing has moved yet. Part 1 also does every check of the call's inputs.
 The plan lets go of each tensor once no later step reads it: part 1's keys
-and cells once the first wait is queued, the owner's KJT and the forward's
-maps after the forward. `op.forward()` returns the backward's maps, which
-autograd keeps (section 7.4).
+and cells once the first wait is queued, the owner's KJT and the maps and
+tables only the forward reads after the forward. `op.forward()` returns the
+backward's maps (the tables it reads among them), which autograd keeps
+(sections 7.4 and 11.1).
 
 ### 7.4 Around the operator: the Python sharding
 
@@ -671,44 +680,49 @@ autograd keeps (section 7.4).
   dense forward on another stream waits for the forward kernel. Section 16
   covers the pipelines.
 
-### 7.5 Channels and windows
+### 7.5 The channels and the window
 
-* The op owns an NCCL communicator, three windows, across nodes 4 GIN
+* The op owns an NCCL communicator, one window, across nodes 4 GIN
   contexts, and a high-priority side stream. A plan (one per call) holds the
   call's tensors, a pinned status buffer and the events `planned` and
   `done`.
 * The **in channel** is the first wait's steps (section 7.3), on the side
   stream, after part 1 on the caller's stream. It keeps views of this rank's
-  own regions: tensors over window memory, without an allocator. It also keeps
-  a few constant tensors, made when the op is built: the table of each
-  feature, the other nodes, and the words of the proxy headers that this
+  own buffers: tensors over its copy of the window, without an allocator. It
+  also keeps a few constant tensors, made when the op is built: the table of
+  each feature, the other nodes, and the words of the proxy headers that this
   requester reads. The **out channel** is the forward and backward kernels,
   cooperative kernels on the caller's stream. The out kernels of every op of
   the process run one at a time. The in channel starts each call, and the out
   channel each kernel, with a node barrier tagged with its sequence number
-  (`in_seq`, `out_seq`). The two channels share no data region, control word,
-  signal or GIN context: each has its own words in the `ctrl` region.
-* **Rule:** windows hold only data in transit and control words. Anything a
-  later step reads is first copied into the call's own tensors.
+  (`in_seq`, `out_seq`). The two channels share no buffer, control word,
+  signal or GIN context: each has its own words in the ctrl section.
+* **Rule:** the window holds only data in transit and control words.
+  Anything a later step reads is first copied into the call's own tensors.
 
-| window | size | regions |
+The window has three sections, in this order (the out kernels' sections
+first, so the places of their buffers take the least to compute):
+
+| section | size | buffers |
 |---|---|---|
-| `ctrl` | its control words (section 15.2: 80 KB at 32 nodes, 8 GPUs per node and 64 features), most of them the count messages | `ctrl`: the control words of both channels (sequence numbers, running totals, the credits sent, the count messages, each GIN warp's place with each rail peer) |
-| `keys` | from `lookup_keys`, and across nodes `remote_keys` | `node_keys` and, with weights, `node_weights`. Across nodes also `remote_cells`, `remote_map`, `proxy_hdr`, `key_stage`, `rail_keys`, `cell_stage` and `rail_cells`. |
-| `rows` | `lookup_keys` rows; across nodes also the proxy rows region | `lookup_rows` (the lookup output, then its gradient). Across nodes also `proxy_rows` and `push_flags`. |
+| rows | `lookup_keys` rows; across nodes also `proxy_rows` | `lookup_rows` (the lookup output, then its gradient). Across nodes also `proxy_rows` and `push_flags`. |
+| ctrl | its control words (section 15.2: 80 KB at 32 nodes, 8 GPUs per node and 64 features), most of them the count messages | one buffer, `ctrl`: the control words of both channels (sequence numbers, running totals, the credits sent, the count vectors and count messages, each GIN warp's place with each rail peer) |
+| keys | from `lookup_keys`, and across nodes `remote_keys` | `node_keys` and, with weights, `node_weights`. Across nodes also `remote_cells`, `remote_map`, `proxy_header`, `key_stage`, `rail_keys`, `cell_stage` and `rail_cells`. |
 
 `node_keys` holds the keys a GPU's node pushes to it: its *own part*, which
 it looks up as owner, and across nodes its *remote part*, which it
-deduplicates as proxy (section 10.3). The regions that only an op across
+deduplicates as proxy (section 10.3). The buffers that only an op across
 nodes has:
 
 * `remote_cells`: the cell (owner node, feature) of each occurrence in the
   remote part, which the push writes beside its key;
-* `remote_map`: for each such occurrence, its key's row in `proxy_rows`
-  (with a bit for a heavy key), its own slot in `proxy_rows`, and its place
-  in its requester's push order;
-* `proxy_hdr`: the proxy's header for its node's requesters: its rounds,
-  its round table (section 12.1) and each requester's push tables;
+* `remote_map` (`RemoteMap`): three int32 arrays with an entry for each
+  such occurrence: its key's row in `proxy_rows` (with a bit for a heavy
+  key), its own slot in `proxy_rows`, and its place in its requester's push
+  order;
+* `proxy_header` (`ProxyHeader`): the proxy's header for its node's
+  requesters, in int32 words: its rounds, its round table (section 12.1)
+  and each requester's push tables;
 * `key_stage`: per other owner node the slice one key put sends: its round
   pieces, then its node-unique keys' records;
 * `rail_keys`: the slices the rail proxies put into this owner, one per
@@ -717,14 +731,34 @@ nodes has:
   its KJT, per feature, which it puts to that proxy;
 * `rail_cells`: as proxy, where its node's cells start in each rail owner's
   KJT, as the owners put them;
-* `push_flags`: the flags of the rows the requesters push into `proxy_rows`.
+* `push_flags`: the flags of the rows the requesters push into `proxy_rows`,
+  in two halves, one per round parity (section 12.1).
 
-All three windows are made when the op is built, from `ncclMemAlloc` and
-`ncclCommWindowRegister`. They have the same size on every rank, are rounded
-up to whole allocation granules, and keep their size for the op's life.
-Each region starts at a 4 KiB boundary of its window. Node peers reach the
-windows through LSA pointers, and rail peers through GIN puts at the same
-offsets.
+The window is made when the op is built, from `ncclMemAlloc` and
+`ncclCommWindowRegister`. It has the same size on every rank, is rounded up
+to whole allocation granules, and keeps its size for the op's life. Each
+buffer, the ctrl section too, starts at a 4 KiB boundary (`kBufferAlign`).
+Before the registration each rank zeroes its ctrl section (sequence numbers
+start at 0) and `push_flags` (their tags start at 0); every other buffer is
+written before it is read. A view of `lookup_rows` that outlives the op
+keeps the whole window until the process exits (section 4.6).
+
+**The layouts.** The host and the kernels lay the window out with the same
+code (`common/window.h`). `WindowLayout` builds the three sections,
+`RowsLayout`, `CtrlLayout` and `KeysLayout`, from the op's sizes (`Sizes`:
+its ranks, features and capacities, and what follows from them) over a
+base pointer, each from the end of the one before. Each has an accessor per
+buffer or control word, which returns its address in the copy at that base
+(`keys.node_keys()`, `rows.proxy_row(slot)`,
+`ctrl.done(requester, parity)`), so no other code computes where a buffer
+or a word is. The host lays out its copy to size the window and to view its
+buffers as tensors. A kernel's argument carries the sizes, the window and
+the device communicator (`ChannelStatic`), and the kernel lays out this
+rank's copy as the node's GPUs map it (`NodeWindow`). A place has the same
+offset in every rank's copy: `NodeWindow::peer(pointer, peer)` gives a node
+peer's copy of the place a pointer names in this rank's copy, and a GIN put
+to a rail peer takes pointers into this rank's copy for both of its ends
+(`rail_put`, `RowPut`, `RailMessage`).
 
 ## 8. The path and rail alignment
 
@@ -924,14 +958,14 @@ Its threads take the peers in turn (thread `t` the peers `t`, `t + 32`, ...
 in a warp), so it serves any number of them. Section 13 gives their memory
 order and why no wait hangs.
 
-* **`node_count_exchange`** (1 CTA): copies this rank's count vector into
-  its `in_meta` words in `ctrl` (a slot per `in_seq` parity), sets its
-  `in_started` to `in_seq`, and waits until every node peer has (the node
-  barrier of the call). Then it reads the peers' count vectors and keeps
-  only what this rank needs (section 10.3): their sum, the sum of those of
-  the ranks before it, and each requester's counts for this rank. Passing
-  the barrier also means that every peer finished its previous call on its
-  side stream.
+* **`node_count_exchange`** (1 CTA): copies this rank's count vector
+  (section 10.3) into its `count_vector` words of the call, in the ctrl
+  section (a slot per `in_seq` parity). It sets its `in_started` word to
+  `in_seq`, and waits until every node peer has (the node barrier of the
+  call). Then it reads the peers' count vectors and keeps only what this
+  rank needs (section 10.3): their sum, the sum of those of the ranks before
+  it, and each requester's counts for this rank. Passing the barrier also
+  means that every peer finished its previous call on its side stream.
 * **`node_key_push`** (threads stride over the keys, at most two CTAs per
   SM): stores each of this rank's valid keys (and its weight) into its
   target's `node_keys` over NVLink, at the place the node layout gives.
@@ -940,37 +974,44 @@ order and why no wait hangs.
   `remote_cells`. Consecutive keys of a cell go to consecutive places, so
   the stores coalesce.
 * **`node_done`** (1 warp): tells each node peer that this rank's keys are
-  there (a flag in the peer's `in_written`), then waits until every peer
-  told it.
-* **`rail_count_exchange`** (1 CTA, across nodes): puts this rank's count
-  message (section 10.4) for each rail peer into the peer's `count_msgs` (a
-  slot per `in_seq` parity) in two puts: the common part, then the part for
-  the peer's node, which carries a GIN signal (context 2). A signal is seen
-  only after the earlier puts of its context to that peer, so it covers
-  both. Then it waits until the message of every rail peer has landed.
+  there (its flag in the peer's `in_written` words), then waits until every
+  peer told it.
+* **`rail_count_exchange`** (1 CTA, across nodes): copies this rank's
+  count messages (section 10.4) into its `count_msg_out` words: the common
+  part, then the part for each node. Its own message goes into its
+  `count_msg` slot of its own node: the slots go by `in_seq` parity and
+  source node. Then it puts each rail peer its message into the same slot
+  in the peer's copy, in two puts: the common part, then the part for the
+  peer's node, which carries a GIN signal (context 2). A signal is seen only
+  after the earlier puts of its context to that peer, so it covers both.
+  Then it waits until the message of every rail peer has landed, and reads
+  them from its `count_msg` slots of the call.
 * **`rail_key_exchange`** (1 CTA, across nodes): for each rail peer, puts
   this proxy's `key_stage` slice for the owner there into the owner's
   `rail_keys` (none when the owner's keys would pass `lookup_keys`), then,
-  as owner, the peer's row of `cell_stage` (where that node's cells start in
-  this owner's KJT) into the peer's `rail_cells`, with a GIN signal. Then it
-  waits for the key stream of every other node. A proxy puts only once it
-  has the owner's count message of the call, which the owner sends after its
-  previous call ended.
+  as owner, the peer's node's row of `cell_stage` (where that node's cells
+  start in this owner's KJT) into this node's row of the peer's
+  `rail_cells`, with a GIN signal. Then it waits for the key stream of
+  every other node. A proxy puts only once it has the owner's count message
+  of the call, which the owner sends after its previous call ended.
 * **`node_status_exchange`** (1 CTA, across nodes): writes this rank's rail
   needs and where each requester of its node starts in its KJT into its
-  `ctrl` words, sets its `in_done` to `in_seq`, and waits until every node
-  peer has. Then it reads every peer's needs, and where each peer's KJT
-  holds this requester's keys.
+  `needs` and `cell_start` words, sets its `in_done` word to `in_seq`, and
+  waits until every node peer has. Then it reads every peer's needs, and
+  where each peer's KJT holds this requester's keys.
 * **`peer_gather`** (threads stride over the words, at most two CTAs per SM;
-  across nodes, twice per call): reads words of node peers' `remote_map` or
-  proxy header, which they wrote before the `in_done` that
+  across nodes, twice per call): reads words of node peers' proxy headers
+  (`ProxyHeader`: one word per item, by its word number) or `remote_map`
+  (`RemoteMap`: per item, an occurrence's entry in each of the three
+  arrays). The peers wrote them before the `in_done` that
   `node_status_exchange` waited for.
 
 ### 10.3 The node layout, and the owner's KJT on one node
 
-Each rank counts its keys for its node (its count vector): per GPU of the
-node, those for its remote part, and per owner of the node and feature,
-those for its own part. `node_count_exchange` gives each rank three sums of
+Each rank counts its keys for its node (its count vector, `CountVector`:
+`local_size × (num_features + 1)` int64 words): first per GPU of the node,
+those for its remote part, then per owner of the node and feature, those
+for its own part. `node_count_exchange` gives each rank three sums of
 the node's vectors: over the node, over the ranks before it, and each
 requester's counts for it. That is all its layout needs, so no rank keeps
 the whole node's counts. The layout:
@@ -1001,14 +1042,20 @@ is where it pushed each key.
 
 **The proxy** numbers its node-unique keys (section 9), cuts its rows into
 rounds (section 12.1) and gives each occurrence its slot. It writes the
-three regions its node's requesters and its rail's owners read:
+three buffers of its window that its node's requesters and its rail's
+owners read:
 
-* `remote_map`: for each occurrence, its key's row (and the heavy bit), its
-  slot, and its place in its requester's push order;
+* `remote_map` (`RemoteMap`): for each occurrence, its entry in three int32
+  arrays: its key's row (bit 31: a heavy key), its slot, and its place in
+  its requester's push order;
 * `key_stage`: per other owner node a slice: its round pieces (16 bytes
   each), then its node-unique keys' records in `uniq` order. A record is the
   key (`int64`) and, with weights, the weight's float bits and 4 zero bytes;
-* the proxy header: its rounds, its round table and its push tables.
+* `proxy_header` (`ProxyHeader`, int32 words): its rounds at word 0; from
+  word 4 its round table, a `RoundPiece` per round and owner node; then its
+  push tables, per requester `rounds_cap + 1` entries (`ReqEntry`), with
+  positions relative to that requester's push order and groups relative to
+  its first group.
 
 A requester's push order at the proxy comes from one stable radix sort of
 the push key. Its fields, from the highest, are the requester, the round and
@@ -1026,24 +1073,26 @@ lower requesters' tasks. The reducer list gives each key's entries, in
 occurrence order (for a heavy key its own row, then each requester's partial),
 each with the flag of the push task that fills it.
 
-**The rail.** Each rank sends each rail peer a count message. Its common
-part, the same for every peer: its node's largest remote part; as proxy its
-rounds and its node-unique keys per owner node; as owner the keys of its own
-node it looks up. Then the part for the peer's node alone: its node-unique
-keys there per feature. From the `num_nodes` messages it gets, a rank
-computes: as proxy, where its slice lands in each owner's `rail_keys` (a
-slice per source node, in node order); as owner, its KJT lengths and offsets,
-and where each other node's cells start in its KJT (`cell_stage`, which
-`rail_key_exchange` puts to that node's proxy, into its `rail_cells`); and
-the rail's needs, as every owner's keys are in the common parts.
+**The rail.** Each rank sends each rail peer a count message
+(`CountMessage`, int64 words). Its common part, the same for every peer:
+its node's largest remote part; as proxy its rounds and its node-unique keys
+per owner node; as owner the keys of its own node it looks up. Then the part
+for the peer's node alone: its node-unique keys there per feature. From the
+`num_nodes` messages it gets, a rank computes: as proxy, where its slice
+lands in each owner's `rail_keys` (a slice per source node, in node order);
+as owner, its KJT lengths and offsets, and where each other node's cells
+start in its KJT (`cell_stage`, which `rail_key_exchange` puts to that
+node's proxy, into its `rail_cells`); and the rail's needs, as every
+owner's keys are in the common parts.
 `node_status_exchange` then gives every rank its node's rail needs. Their
 maximum is the call's needs, the same on every rank: a rank's rail covers
 every node, and its node holds one rank of every rail.
 
 **The requester.** Two `peer_gather`s read what the node's proxies wrote. One
-reads their headers, by word lists made when the op is built. The other reads,
-for each of its keys for an owner on another node, the three `remote_map`
-words of its occurrence at its proxy. From them, and from where its node's
+reads the words of their headers it needs: the rounds, the round table and its
+own push table, by word lists made when the op is built. The other reads, for
+each of its keys for an owner on another node, its occurrence's entry in the
+three `remote_map` arrays at its proxy. From them, and from where its node's
 owners hold its keys (`node_status_exchange`), it makes its maps. `src` is
 where the forward reads each key's row: a row of its owner's `lookup_rows`
 when the owner is on its node, else the key's row in its proxy's `proxy_rows`.
@@ -1077,12 +1126,13 @@ tasks of each round.
 
 ### 10.5 The status and the one host sync
 
-Across nodes the last step copies the call's tables into its small tables
-(Meta, which the out kernels read). Then it writes the call's status,
-`8 × (2 × num_features + 7)` bytes. The status holds the needs: the most any rank needs of `lookup_keys`
-and `remote_keys`, and the most rounds. It also holds the keys this owner
-looks up, the sub-tasks of its heavy rows and heavy groups, the rows sent, and
-the per-feature totals of the owner's and of the input's KJT. A non-blocking
+The last step writes the call's status, `8 × (2 × num_features + 7)` bytes.
+The call's tables need no copy: each is a tensor of its own, which the plan
+keeps for the out kernels (section 11.1). The status holds the needs: the
+most any rank needs of `lookup_keys` and `remote_keys`, and the most rounds.
+It also holds the keys this owner looks up, the sub-tasks of its heavy rows
+and heavy groups, the rows sent, and the per-feature totals of the owner's
+and of the input's KJT. A non-blocking
 copy puts it into the plan's pinned host buffer, and the side stream records
 the event `done`. The second wait's `done.synchronize()` is the call's only
 host sync. The host then compares the needs with the capacities (section 5.4),
@@ -1099,27 +1149,41 @@ stream: the forward kernel `fwd_kernel` and the backward kernel
 
 ### 11.1 What both kernels share
 
-* **Entry.** CTA 0 publishes `out_seq` (after a system fence) and every CTA
-  waits until all node peers have published theirs. A peer past this point
-  has finished its lookup (which wrote its `lookup_rows`) and every earlier
-  out kernel.
-* **Tasks.** Warps take 32-row tasks from one queue. Owners (and proxies)
-  take turns, starting from each rank's own, so the ranks of a node start
-  on different peers.
-* **Exit.** Every CTA counts its arrival in a running total (so nothing is
-  reset); the last CTA ends the rank's part of the kernel.
+* **Entry.** CTA 0 publishes `out_seq` in its `out_started` word (after a
+  system fence) and every CTA waits until all node peers have published
+  theirs. A peer past this point has finished its lookup (which wrote its
+  `lookup_rows`) and every earlier out kernel.
+* **Tasks.** Warps take 32-row tasks from one queue (a `task` word). Owners
+  (and proxies) take turns, starting from each rank's own, so the ranks of a
+  node start on different peers.
+* **Exit.** Every CTA counts its arrival in a running total (its `arrive`
+  word, so nothing is reset); the last CTA ends the rank's part of the
+  kernel.
 * Across nodes, the last warps of CTA 0 take the GIN roles and skip the
   entry barrier. A GIN warp's lane `l` serves the rail peers on nodes `l`,
   `l + 32`, ... It polls them in turn and waits for no single one, so no
   order in which peers move can stall it; what it keeps of a peer between
-  polls is in that peer's words in `ctrl`. Every kernel ends by sending the
-  credits for the next out kernel (GIN context 3) and flushing them. So no
-  credit is in flight once a kernel has ended.
-* **Tables.** The kernels read the call's small tables (Meta) and the
-  requester's block starts from global memory, and reach a node peer's
-  regions through its LSA pointer when they need them. The one per-peer
-  array in shared memory is the backward's `half_seen`, sized at launch by
-  `local_size`.
+  polls is in its words for that peer in the ctrl section (`put_at`,
+  `grant_sent`, ...). Every kernel ends by sending the credits for the next
+  out kernel (GIN context 3) and flushing them. So no credit is in flight
+  once a kernel has ended.
+* **Tables.** The kernels read the call's tables from global memory,
+  through typed pointers in their argument (`OutPlan`). Each table is a
+  tensor of the plan: the requester's block starts and maps, and across
+  nodes its push order and heavy groups, its tables of the node's proxies
+  (`proxy_rounds`, `proxy_round_tables`, `push_tables`, `push_order_off`)
+  and its task starts (`fwd_task_starts`, `bwd_task_starts`); the owner's
+  (`uniq_in`, `fwd_put_start`); the proxy's (`num_rounds`, `num_chunks`,
+  `uniq_out`, `uniq_off`, `round_table`, `bwd_put_start`, `push_start`,
+  `reduce_task_starts`) and its reducer list; and the put lists. Their
+  strides are `rounds_cap` and `num_nodes`. The tables only the forward
+  reads go once the forward is queued; the backward's are among the maps
+  autograd saves (section 7.4).
+* **The window.** A kernel lays out this rank's copy of the window from the
+  sizes in its argument (section 7.5), and names each buffer and control
+  word by its accessor: in this rank's copy, or in a node peer's through
+  `NodeWindow::peer`. The one per-peer array in shared memory is the
+  backward's `half_seen`, sized at launch by `local_size`.
 
 ### 11.2 The lookup
 
@@ -1144,9 +1208,10 @@ forward checks that it gets them.
   Then a flush.
 * **Proxy relay** (across nodes): the last warp of CTA 0, whose lanes take
   the owner nodes and the requesters of the node in turn. It publishes to
-  its node, in `ctrl`, how many rows of each owner node have landed. With
-  rounds, it grants round `rnd + 2` into round `rnd`'s half of `proxy_rows`
-  once every requester of the node has pulled round `rnd`.
+  its node, in its `landed_rows` words, how many rows of each owner node
+  have landed. With rounds, it grants round `rnd + 2` into round `rnd`'s
+  half of `proxy_rows` once every requester of the node has pulled round
+  `rnd` (its `done` words count their pulls).
 * **Requester** (all other warps): pulls each of its rows from the
   same-node owner's `lookup_rows`, or, once it has landed, from its proxy's
   `proxy_rows`, into its output. Under index dedup it writes every original
@@ -1324,18 +1389,19 @@ the op.
   call, and no out kernel on any rank. A wait that lasts longer than the
   timeout prints what it waited for and traps.
 
-A window region or control word is written in call `in_seq + 1` only once
-no peer still reads what call `in_seq` wrote there:
+A buffer or control word of the window is written in call `in_seq + 1` only
+once no peer still reads what call `in_seq` wrote there. The words marked
+(ctrl) are in the ctrl section, named by their accessors (`CtrlLayout`):
 
-| region or word | written by | last read by | why that is safe |
+| buffer or word | written by | last read by | why that is safe |
 |---|---|---|---|
 | `node_keys`, `node_weights`, `remote_cells` | node peers' push | this rank's planner | the peers push after the next call's node barrier, which this rank passes only after its side stream finished the call |
-| `remote_map`, `proxy_hdr` | this rank's planner | node peers' gathers | this rank writes them after the next call's node barrier, which every peer passes only after its side stream finished the call |
-| `key_stage`, `cell_stage`, `count_msg_out` (in `ctrl`) | this rank | the NIC | the rail exchanges flush their puts before they end |
+| `remote_map`, `proxy_header` | this rank's planner | node peers' gathers | this rank writes them after the next call's node barrier, which every peer passes only after its side stream finished the call |
+| `key_stage`, `cell_stage`, `count_msg_out` (ctrl) | this rank | the NIC | the rail exchanges flush their puts before they end |
 | `rail_keys`, `rail_cells` | rail peers' key and cell puts | this rank's planner | a rail peer puts only after it has this rank's count message of the next call, which this rank sends after the call ended here |
-| `count_msgs` (in `ctrl`) | rail peers' count puts | this rank's `rail_count_exchange` | a slot per `in_seq` parity: a peer's message of call `in_seq + 2` needs this rank's of call `in_seq + 1` |
-| `in_meta` (in `ctrl`) | this rank's `node_count_exchange` | node peers' `node_count_exchange` | a slot per `in_seq` parity |
-| `cell_start`, `in_done` and its needs (in `ctrl`) | this rank | node peers' `node_status_exchange`, which copies them out | this rank writes them after the next call's node barrier |
+| `count_msg` (ctrl) | rail peers' count puts, and this rank its own | this rank's `rail_count_exchange` | a slot per `in_seq` parity (and source node): a peer's message of call `in_seq + 2` needs this rank's of call `in_seq + 1` |
+| `count_vector` (ctrl) | this rank's `node_count_exchange` | node peers' `node_count_exchange` | a slot per `in_seq` parity |
+| `cell_start`, `needs` and `in_done` (ctrl) | this rank | node peers' `node_status_exchange`, which copies them out | this rank writes them after the next call's node barrier |
 
 ## 14. The CTA budget
 
@@ -1356,11 +1422,11 @@ backward on one node its 64 with up to 35.
 
 ### 15.1 What is counted
 
-Per rank and sharding, the three windows (outside PyTorch's caching
-allocator) are *persistent*: made when the op is built, and kept through
-the dense part of every step. A call's tensors live *per call*, from its
-part 1 to its backward (one call in a plain loop, two or three under the
-train pipelines). The planner's working memory is *transient*: a step
+Per rank and sharding, the window (outside PyTorch's caching allocator) is
+*persistent*: made when the op is built, and kept through the dense part of
+every step. A call's tensors live *per call*, from its part 1 to its
+backward (one call in a plain loop, two or three under the train
+pipelines). The planner's working memory is *transient*: a step
 frees its temporaries as soon as it is done with them. The caching
 allocator keeps their blocks, though, so the side stream's pool holds the
 largest step's working memory, and the caller's pool part 1's.
@@ -1373,11 +1439,12 @@ and `rounds_cap`.
 
 | buffer | bytes | kind |
 |---|---|---|
-| `ctrl` | one node: about `16 × local_size × (num_features + 1)`; across nodes about `8 × (3 × num_features × (local_size + num_nodes) + 2 × num_nodes² + 16 × num_nodes + 8 × local_size)`, most of it the count messages: 80 KB at 32 nodes, 8 GPUs per node and 64 features, 7.1 MB at 256 nodes and 1,000 features | persistent |
-| `node_keys` (+ `node_weights`) | `8 × (lookup_keys + remote_keys)` (+ `4 ×` as many with weights; one node: `lookup_keys` alone) | persistent |
+| `ctrl` (the ctrl section) | one node: `16 × local_size × (num_features + 2) + 64`; across nodes about `8 × (3 × num_features × (local_size + num_nodes) + 2 × num_nodes² + 16 × num_nodes + 8 × local_size)`, most of it the count messages: 80 KB at 32 nodes, 8 GPUs per node and 64 features, 7.1 MB at 256 nodes and 1,000 features | persistent |
+| `node_keys` | `8 × (lookup_keys + remote_keys)` (one node: `lookup_keys` alone) | persistent |
+| `node_weights` | with weights, `4 × (lookup_keys + remote_keys)` | persistent |
 | `remote_cells` | `4 × remote_keys` | persistent |
-| `remote_map` | `12 × remote_keys` | persistent |
-| `proxy_hdr` | `16 × (1 + rounds_cap × num_nodes + local_size × (rounds_cap + 1))` | persistent |
+| `remote_map` | `12 × remote_keys`: three int32 arrays | persistent |
+| `proxy_header` | `16 × (1 + rounds_cap × num_nodes + local_size × (rounds_cap + 1))` | persistent |
 | `key_stage` | `record_bytes × remote_keys + 16 × (num_nodes − 1) × rounds_cap + 16` | persistent |
 | `rail_keys` | `record_bytes × lookup_keys + 16 × (num_nodes − 1) × rounds_cap` | persistent |
 | `cell_stage`, `rail_cells` | `8 × num_nodes × num_features` each | persistent |
@@ -1386,7 +1453,7 @@ and `rounds_cap`.
 | `push_flags` | `16 × (num_proxy_rows / 32 + 2 × local_size)` | persistent |
 | the requester's maps | 8 bytes per key on one node (`inv`, `src`), 16 across nodes (also `dst`, `push_order`) | per call |
 | the requester's heavy groups and their sub-tasks (across nodes) | `12 × heavy_groups + 4 × (num_keys / 64 + heavy_groups + 1)`, with `heavy_groups = min(num_keys, local_size × (remote_keys / 65 + 1))`: about 2 bytes per entry of `remote_keys` | per call |
-| the call's small tables (Meta) | about `16 × rounds_cap × num_nodes × (local_size + 2)`, plus a few KB | per call |
+| the call's small tables across nodes: the requester's of the node's proxies and its task starts, the owner's and the proxy's (section 11.1) | about `16 × rounds_cap × num_nodes × (local_size + 2)`, plus a few KB | per call |
 | the owner's KJT values | `8 × lookup_keys` (12 with weights), from the first wait until the forward | per call |
 | the proxy's reducer list | `12 × remote_keys` | per call |
 | the put lists and the ready counters | `24 × chunks + 32 × num_nodes × num_features`, with `chunks = (remote_keys + lookup_keys) / chunk_rows + 2 × rounds_cap × num_nodes + 2` (`chunk_rows`: rows in 2 MiB) | per call |
@@ -1397,19 +1464,28 @@ and `rounds_cap`.
 The transient figures are the peaks measured with the benchmark's batches
 (bytes in live tensors; the caching allocator's rounding and the cached
 blocks it hands out add up to about 13%), but the one-node planner's, which
-comes from the code. Each region starts at a 4 KiB boundary of its window,
-and each window is a whole number of allocation granules.
+comes from the code.
+
+The constructors of the layouts size the window's buffers as above
+(`CtrlLayout`, `KeysLayout` and `RowsLayout`, in `common/ctrl.h`, `keys.h`
+and `rows.h`). The buffers from `remote_cells` to `rail_cells`, and
+`proxy_rows` and `push_flags`, exist across nodes only, and `node_weights`
+with weights only: else they take 0 bytes. Each buffer, the ctrl section
+too, takes a whole number of 4 KiB units (`kBufferAlign`). So the window's
+bytes are the sum of its buffers, each rounded up to 4 KiB
+(`WindowLayout::bytes`), and its copy on each rank is a whole number of
+allocation granules. `memory()` gives both (section 7.1).
 
 With uniform keys across nodes, and capacities 1.25 times the needs
-(section 5.2), the key regions take about
-`1.25 × num_keys × (16 × (1 + (num_nodes − 1) × uniq_share) + 30 × (num_nodes − 1)) / num_nodes`
-bytes. That is about 38 bytes per key at 2 nodes, and 55 at 32 nodes. The
+(section 5.2), the keys section takes about
+`1.25 × num_keys × (16 × (1 + (num_nodes − 1) × uniq_share) + 32 × (num_nodes − 1)) / num_nodes`
+bytes. That is about 39 bytes per key at 2 nodes, and 58 at 32 nodes. The
 per-call tensors take about 35 to 43 bytes per key across nodes: 16 for the
 requester's maps, 1 to 2.5 for its heavy groups, about 10 for the owner's
 KJT until the forward, and `12 × 1.25 × (num_nodes − 1) / num_nodes` for the
 reducer list.
 
-### 15.3 The proxy rows region and rounds
+### 15.3 `proxy_rows` and rounds
 
 ```
 num_proxy_rows = min(max(remote_keys, min_proxy_rows), proxy_bytes / row_bytes)   (rounded down)
@@ -1418,10 +1494,10 @@ proxy_bytes    = DYNAMICEMB_GIN_PROXY_MB MiB (512 by default)
 rounds_cap     = the rounds that remote_keys rows take in num_proxy_rows rows (section 12.1)
 ```
 
-So the region holds a call's rows in one round when `remote_keys` rows fit
-under the cap. A cap below `min_proxy_rows × row_bytes` is refused when the
-op is built (section 6), and so is a `remote_keys` whose rows would take more
-than 65536 rounds.
+So `proxy_rows` holds a call's rows in one round when `remote_keys` rows
+fit under the cap. A cap below `min_proxy_rows × row_bytes` is refused when
+the op is built (section 6), and so is a `remote_keys` whose rows would take
+more than 65536 rounds.
 
 The **rows a proxy needs** count, per node-unique key, one row per
 occurrence (the key's row and its duplicates' slots), up to 64 occurrences.
@@ -1444,16 +1520,18 @@ only through:
   and 64 features, and 11 MB at 256 nodes and 1,000 features;
 * GIN's queues to `num_nodes − 1` rail peers per context (with
   `NCCL_CROSS_NIC=0`);
-* small round tables that grow with `num_nodes × rounds_cap`: `proxy_hdr`,
-  the round pieces of `key_stage` and `rail_keys`, and per call the small
-  tables (Meta, which also grow with `local_size`) and the starts of the put
-  lists;
+* small round tables that grow with `num_nodes × rounds_cap`:
+  `proxy_header`, the round pieces of `key_stage` and `rail_keys`, and per
+  call the round tables of the requester and of the proxy (the requester's
+  also grow with `local_size`) and the starts of the put lists;
 * the put lists, a segment per IB chunk and per (node, feature) cell.
 
 `local_size` enters through the node's counts (`8 × local_size ×
-(num_features + 1)` bytes for each of the three sums, and the `in_meta`
-words) and through Meta. No table holds a count per (node, node, feature)
-or per (GPU, GPU, feature).
+(num_features + 1)` bytes for each of the three sums, and the
+`count_vector` words), and through the tables kept per GPU of the node:
+the proxy header's push tables, and per call the requester's tables of
+each proxy and the proxy's push starts of each requester. No table holds a
+count per (node, node, feature) or per (GPU, GPU, feature).
 
 Everything else is linear in the capacities, except `proxy_rows` (capped: a
 larger call takes more rounds).
@@ -1463,24 +1541,25 @@ sizing rules in the code, with capacities 1.25 times the needs and at least
 4096 entries more (`hier_capacities`), and from the transient figures of
 section 15.2. It assumes uniform keys, mean loads, no weights, one owner
 rule and 8 GPUs per node; it is not measured. GB per rank. "Persistent" is
-`lookup_rows` + `proxy_rows` + key regions (the windows); "per call" is one
-call's tensors; "planner" is the largest step's working memory in the side
-stream's pool, and "part 1" part 1's in the caller's pool.
+the window: `lookup_rows` + `proxy_rows` + its other buffers (the ctrl and
+keys sections and `push_flags`); "per call" is one call's tensors;
+"planner" is the largest step's working memory in the side stream's pool,
+and "part 1" part 1's in the caller's pool.
 
-| case | nodes (GPUs) | `lookup_rows` | `proxy_rows` | key regions | persistent | per call | planner | part 1 | rounds |
+| case | nodes (GPUs) | `lookup_rows` | `proxy_rows` | other buffers | persistent | per call | planner | part 1 | rounds |
 |---|---|---|---|---|---|---|---|---|---|
 | the benchmark: 540,672 keys per rank, fp32 dim 128, `uniq_share` 0.935 | 1 (8) | 0.35 | – | 0.005 | **0.35** | 0.010 | 0.011 | 0.014 | – |
 | | 2 (16) | 0.34 | 0.17 | 0.021 | **0.53** | 0.019 | 0.043 | 0.014 | 1 |
-| | 4 (32) | 0.33 | 0.26 | 0.025 | **0.61** | 0.021 | 0.050 | 0.014 | 1 |
-| | 8 (64) | 0.33 | 0.30 | 0.028 | **0.66** | 0.022 | 0.059 | 0.014 | 1 |
-| | 32 (256) | 0.32 | 0.34 | 0.030 | **0.69** | 0.023 | 0.065 | 0.014 | 1 |
-| 16,384 samples × 1,536 keys per sample, 1 feature: 25.2M keys per rank, bf16 dim 128, `uniq_share` 1 | 2 (16) | 8.05 | 0.54 | 0.98 | **9.57** | 0.88 | 1.84 | 0.63 | 14 |
-| | 4 (32) | 8.05 | 0.54 | 1.21 | **9.80** | 0.99 | 2.34 | 0.63 | 21 |
-| | 8 (64) | 8.05 | 0.54 | 1.33 | **9.92** | 1.04 | 2.73 | 0.63 | 24 |
-| | 32 (256) | 8.05 | 0.54 | 1.42 | **10.0** | 1.08 | 3.02 | 0.63 | 26 |
-| the same with 2 features: 50.3M keys per rank, fp32 dim 128 | 2 (16) | 32.2 | 0.54 | 1.95 | **34.7** | 1.75 | 3.67 | 1.26 | 54 |
-| | 8 (64) | 32.2 | 0.54 | 2.66 | **35.4** | 2.08 | 5.45 | 1.26 | 94 |
-| | 32 (256) | 32.2 | 0.54 | 2.84 | **35.6** | 2.16 | 6.03 | 1.26 | 104 |
+| | 4 (32) | 0.33 | 0.26 | 0.027 | **0.62** | 0.021 | 0.050 | 0.014 | 1 |
+| | 8 (64) | 0.33 | 0.30 | 0.029 | **0.66** | 0.022 | 0.059 | 0.014 | 1 |
+| | 32 (256) | 0.32 | 0.34 | 0.031 | **0.69** | 0.023 | 0.065 | 0.014 | 1 |
+| 16,384 samples × 1,536 keys per sample, 1 feature: 25.2M keys per rank, bf16 dim 128, `uniq_share` 1 | 2 (16) | 8.05 | 0.54 | 1.01 | **9.60** | 0.88 | 1.84 | 0.63 | 14 |
+| | 4 (32) | 8.05 | 0.54 | 1.26 | **9.85** | 0.99 | 2.34 | 0.63 | 21 |
+| | 8 (64) | 8.05 | 0.54 | 1.39 | **9.98** | 1.04 | 2.73 | 0.63 | 24 |
+| | 32 (256) | 8.05 | 0.54 | 1.48 | **10.1** | 1.08 | 3.02 | 0.63 | 26 |
+| the same with 2 features: 50.3M keys per rank, fp32 dim 128 | 2 (16) | 32.2 | 0.54 | 2.01 | **34.8** | 1.75 | 3.67 | 1.26 | 54 |
+| | 8 (64) | 32.2 | 0.54 | 2.77 | **35.5** | 2.08 | 5.45 | 1.26 | 94 |
+| | 32 (256) | 32.2 | 0.54 | 2.96 | **35.7** | 2.16 | 6.03 | 1.26 | 104 |
 
 The planner's pool adds 3% to the persistent memory on one node and 8–9%
 across nodes at the benchmark's size, and 11–30% at the large batches above.
@@ -1592,7 +1671,7 @@ run them, and `test/unit_test.sh` runs those.
 * **Scope**: row-wise sequence shardings of DynamicEmb tables, within the
   limits of section 4.2.
 * **Fixed capacities**: a call that needs more runs on TorchRec's dists, at
-  their cost, while the op's windows stay allocated (section 5.4).
+  their cost, while the op's window stays allocated (section 5.4).
 * **Errors no agreement covers**: an NCCL error while the op makes its
   communicator, or inside the collective window registration, on some ranks
   only leaves the other ranks waiting (section 7.2). An error inside a first
@@ -1600,7 +1679,7 @@ run them, and `test/unit_test.sh` runs those.
   Python on its rank. The other ranks then trap at the timeout in the call's
   next comm kernel that waits, as when a rank dies.
 * **Memory held through the dense part**: `lookup_rows` and `proxy_rows`
-  stay allocated, each sharding has its own windows, the side stream's
+  stay allocated, each sharding has its own window, the side stream's
   allocator pool keeps the planner's working memory, and the hottest owner's
   need sizes `lookup_keys` on every rank (section 15).
 * **Host time of the input dist**: across nodes the launches of a first
@@ -1630,7 +1709,7 @@ run them, and `test/unit_test.sh` runs those.
   (seen with TorchRec 1.2.0); `quiesce()` syncs the device first (section
   4.6).
 * **Teardown** without `quiesce()` may wait up to `min(timeout, 30 s)`, or
-  keep the windows until the process exits (section 4.6).
+  keep the window until the process exits (section 4.6).
 * **A timeout traps**, which loses the CUDA context (section 13).
 * **The CPU runs ahead** by up to about two calls (section 16).
 
@@ -1646,20 +1725,31 @@ Paths from `corelib/dynamicemb`.
   table options are in `dynamicemb/dynamicemb_config.py`.
 * **C++** (`src/hier_output_dist/`, namespace `dyn_emb::hier_output_dist`):
   * `hier_output_dist.h`, `hier_output_dist.cu`: the op, `HierOutputDist`;
-  * `host/`: its host side (configuration, layout, communicator, windows,
-    channels, plans, CTA budget, trace); `host/in_channel.cu` queues the
-    first wait's steps;
+  * `host/`: its host side (configuration, sizes, communicator, window,
+    channels, plans, CTA budget, trace). `host/sizes.*` gives the op's sizes
+    from its configuration, `host/window.*` allocates and registers its
+    window and views its buffers, and `host/in_channel.cu` queues the first
+    wait's steps;
   * `plan/`: the planner, ATen ops called from C++. Part 1 is in
     `part_one.cpp`, the node layout in `node.cpp`, the proxy in
     `proxy.cpp`, the rail and the owner in `rail.cpp`, the requester in
     `requester.cpp`, and the put lists' segments in `put_list.cpp`;
     `tensors.h` holds small helpers, and `sort.cu` the CUB radix sort that
     part 1 and the proxy call;
-  * `common/`: what host and device code share, among it `trace_flag.h`,
-    the trace's build flag;
-  * `device/`: the kernels' building blocks;
+  * `common/`: what host and device code share. `sizes.h` holds the op's
+    sizes (`Sizes`), and `window.h` the window's layout (`WindowLayout`)
+    over its sections: `ctrl.h` (`CtrlLayout`, and the formats of the count
+    vector and the count message), `keys.h` (`KeysLayout`, `ProxyHeader`,
+    `RemoteMap`) and `rows.h` (`RowsLayout`). `channel_args.h` holds what
+    every kernel takes (`ChannelStatic`), and `trace_flag.h` the trace's
+    build flag;
+  * `device/`: the kernels' building blocks, among them `node_window.cuh`,
+    the window as the node's GPUs map it (`NodeWindow`), `node_sync.cuh`,
+    the syncs on its control words, and `rail.cuh`, the GIN puts and
+    credits on the rail;
   * `input/comm_kernels.cuh`: the comm kernels; `output/`: the output
-    dist's kernels;
+    dist's kernels, and in `output/args.cuh` their argument, with the
+    call's tables (`OutPlan`);
   * `kernels.h`, `kernels.cu`: the functions that launch the comm kernels,
     the out kernels and the setup, teardown and clock kernels, all compiled
     in `kernels.cu`;

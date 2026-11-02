@@ -16,6 +16,7 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 ******************************************************************************/
 #include "hier_output_dist/plan/node.h"
 
+#include "hier_output_dist/common/ctrl.h"
 #include "hier_output_dist/plan/tensors.h"
 
 namespace dyn_emb {
@@ -34,13 +35,14 @@ NodeLayout node_layout(const NodeCounts &counts, const at::Tensor &cell_start,
                        int64_t lookup_keys, int64_t remote_keys) {
   const int64_t local_size = topo.local_size, num_nodes = topo.num_nodes,
                 world_size = topo.world_size;
+  const CountVector words{local_size, num_features};
   NodeLayout node;
   // the node's keys for each owner of the node and feature, and those of the
   // requesters before this one
   const at::Tensor own_counts =
-      counts.totals.narrow(0, local_size, local_size * num_features).view({local_size, -1});
+      counts.totals.narrow(0, words.own(0, 0), local_size * num_features).view({local_size, -1});
   const at::Tensor own_before =
-      counts.before.narrow(0, local_size, local_size * num_features).view({local_size, -1});
+      counts.before.narrow(0, words.own(0, 0), local_size * num_features).view({local_size, -1});
   // this rank's own part, in its KJT order: [feature][requester]
   node.own_cells = counts.mine.narrow(1, 1, num_features).t().contiguous().view({-1});
   node.own_starts = node.own_cells.cumsum(0) - node.own_cells;
@@ -59,7 +61,7 @@ NodeLayout node_layout(const NodeCounts &counts, const at::Tensor &cell_start,
   at::Tensor destination_base = own_base;  // one node: every owner is on it
   if (num_nodes > 1) {
     node.requester_start = exclusive_ends(counts.mine.select(1, 0));
-    node.need_remote = counts.totals.narrow(0, 0, local_size).max();
+    node.need_remote = counts.totals.narrow(0, words.remote(0), local_size).max();
     node.skip.logical_or_(node.need_remote.gt(remote_keys));
     // A remote row of owner (owner node, target) goes to its target's remote
     // part: after the requesters before this rank, this rank's blocks for the
@@ -67,7 +69,7 @@ NodeLayout node_layout(const NodeCounts &counts, const at::Tensor &cell_start,
     at::Tensor remote_blocks = block_start.diff().view({num_nodes, local_size});
     remote_blocks.select(0, topo.node).zero_();
     const at::Tensor remote_block_start = remote_blocks.cumsum(0) - remote_blocks;
-    const at::Tensor remote_before_me = counts.before.narrow(0, 0, local_size);
+    const at::Tensor remote_before_me = counts.before.narrow(0, words.remote(0), local_size);
     destination_base =
         (lookup_keys + remote_before_me.view({1, local_size, 1}) + remote_block_start.unsqueeze(2) -
          block_start.narrow(0, 0, world_size).view({num_nodes, local_size, 1}))
