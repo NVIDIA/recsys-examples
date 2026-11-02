@@ -24,6 +24,12 @@ from .kvcache_metadata import KVCacheMetadata
 from .kvcache_utils import KVIndexMeta, KVLookupResult
 
 
+class HostKVBackend(str, Enum):
+    FLEXKV = "flexkv"
+    NATIVE = "native"
+    NOP = "nop"
+
+
 class HostKVTaskStatus(Enum):
     UNINITIALIZED = "uninitialized"
     SKIPPED = "skipped"
@@ -51,7 +57,7 @@ class HostKVStorageErrorCode(str, Enum):
 
 @dataclass
 class HostKVTaskHandle:
-    backend: str
+    backend: HostKVBackend
     user_ids: Optional[torch.Tensor] = None
     handle: Optional[Any] = None
     status: HostKVTaskStatus = HostKVTaskStatus.UNINITIALIZED
@@ -60,6 +66,8 @@ class HostKVTaskHandle:
     is_layerwise: bool = False
 
     def __post_init__(self):
+        if not isinstance(self.backend, HostKVBackend):
+            self.backend = HostKVBackend(self.backend)
         if self.status not in {
             HostKVTaskStatus.UNINITIALIZED,
             HostKVTaskStatus.SKIPPED,
@@ -71,9 +79,16 @@ class HostKVTaskHandle:
                 self.handle is not None
             ), "underlying handle must be provided for initialized tasks"
 
+    def wait_layer(self, layer_idx: int) -> None:
+        """FlexKV per-layer wait: eventfd os.read."""
+        if not self.is_layerwise:
+            return
+        self.handle.wait_layer(layer_idx)
+
     def stream_wait_layer(self, layer_idx: int) -> None:
-        if self.is_layerwise:
-            self.handle.wait_layer(layer_idx)
+        if self.backend == HostKVBackend.FLEXKV or not self.is_layerwise:
+            return
+        self.handle.wait_layer(layer_idx)
 
 
 @dataclass
@@ -112,6 +127,11 @@ class HostKVStorageBase(ABC):
     @abstractmethod
     def onboard_kvcache_wait(self, task_handle: HostKVTaskHandle) -> HostKVWaitResult:
         ...
+
+    def prefetch_kvcache(self, index_meta: KVIndexMeta) -> HostKVTaskHandle:
+        raise NotImplementedError(
+            "prefetch_kvcache is only implemented for flexkv backend"
+        )
 
     @abstractmethod
     def offload_kvcache_launch(
