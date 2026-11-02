@@ -225,6 +225,7 @@ def get_exportable_model_for_inference(
             backbone="transformer",
             transformer_ffn_dim=NetworkArgs().transformer_ffn_dim,
             transformer_fp8_linear=NetworkArgs().transformer_fp8_linear,
+            transformer_attention=NetworkArgs().transformer_attention,
             export_mode=True,
         )
         inference_model = InferenceRankingGR(

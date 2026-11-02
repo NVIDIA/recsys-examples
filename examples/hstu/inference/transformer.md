@@ -124,6 +124,17 @@ whose widths are not multiples of 128 in bf16 with a warning, and cannot be
 exported. Tests: `test/test_transformer_infer_layer_fp8.py` and
 `test/test_triton_fp8_quant.py`.
 
+## FA4 attention
+
+`NetworkArgs.transformer_attention = 'fa4'` (`transformer_attention="fa4"` in
+`get_inference_hstu_config`) replaces the padded reference attention (`sdpa`)
+with one FlashAttention 4 varlen kernel over the packed tokens: FA4's causal mask
+plus a `score_mod` that hides the other candidates from each candidate. With a
+paged KV cache the history is first gathered from the pages into packed K/V. The
+Docker image installs FA4 (`flash_attn.cute`, fa4-v4.0.0.beta17 with an SM120
+fix). FA4 attention works with bf16 and FP8 projections and with CUDA graphs, and
+cannot be exported. Tests: `test/test_transformer_infer_layer_fa4.py`.
+
 ## Validation and limitations
 
 ```bash

@@ -162,6 +162,7 @@ def get_inference_hstu_model(
         backbone=network_args.backbone,
         transformer_ffn_dim=network_args.transformer_ffn_dim,
         transformer_fp8_linear=network_args.transformer_fp8_linear,
+        transformer_attention=network_args.transformer_attention,
     )
 
     sm_major = torch.cuda.get_device_capability()[0]

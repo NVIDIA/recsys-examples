@@ -388,6 +388,8 @@ class NetworkArgs:
     transformer_ffn_dim: Optional[int] = None
     # Run the Transformer projections as FP8 DeepGEMM GEMMs (needs bf16, no export).
     transformer_fp8_linear: bool = False
+    # Transformer attention: "sdpa" (padded reference) or "fa4" (FlashAttention 4).
+    transformer_attention: str = "sdpa"
 
     def __post_init__(self):
         assert self.dtype_str in [
@@ -400,6 +402,12 @@ class NetworkArgs:
             raise ValueError(f"Unknown inference backbone: {self.backbone}")
         if self.transformer_fp8_linear and self.backbone != "transformer":
             raise ValueError("transformer_fp8_linear requires the transformer backbone")
+        if self.transformer_attention not in ("sdpa", "fa4"):
+            raise ValueError(
+                f"Unknown transformer attention: {self.transformer_attention}"
+            )
+        if self.transformer_attention != "sdpa" and self.backbone != "transformer":
+            raise ValueError("transformer_attention requires the transformer backbone")
 
 
 @gin.configurable

@@ -212,6 +212,7 @@ def get_inference_dense_model_with_feature_names(
         backbone=network_args.backbone,
         transformer_ffn_dim=network_args.transformer_ffn_dim,
         transformer_fp8_linear=network_args.transformer_fp8_linear,
+        transformer_attention=network_args.transformer_attention,
     )
 
     ranking_args = RankingArgs()

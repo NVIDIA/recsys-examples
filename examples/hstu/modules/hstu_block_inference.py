@@ -164,12 +164,21 @@ def _initialize_kvcache_metadata_for_cudagraph(
 def _layer_type(config: InferenceHSTUConfig):
     if config.backbone != "transformer":
         return PagedHSTUInferLayer
-    if not config.transformer_fp8_linear:
-        return TransformerInferLayer
-    # DeepGEMM is an optional dependency, imported only when FP8 is requested.
-    from modules.transformer_infer_layer_fp8 import Fp8FusedTransformerInferLayer
+    # FA4 and DeepGEMM are optional dependencies, imported only when requested.
+    if config.transformer_attention == "fa4":
+        from modules.transformer_infer_layer_fa4 import (
+            Fa4Fp8TransformerInferLayer,
+            Fa4TransformerInferLayer,
+        )
 
-    return Fp8FusedTransformerInferLayer
+        if config.transformer_fp8_linear:
+            return Fa4Fp8TransformerInferLayer
+        return Fa4TransformerInferLayer
+    if config.transformer_fp8_linear:
+        from modules.transformer_infer_layer_fp8 import Fp8FusedTransformerInferLayer
+
+        return Fp8FusedTransformerInferLayer
+    return TransformerInferLayer
 
 
 class HSTUBlockInference(torch.nn.Module):
