@@ -193,6 +193,53 @@ def check_input_dist(use_index_dedup: bool) -> None:
     check_lookup_gets_scores(sharded, arrived)
 
 
+def check_train_pipeline_is_refused() -> None:
+    """What TrainPipelineSparseDist does to the distributor is refused clearly.
+
+    The pipeline replaces each ``_dist.forward`` with ``KJTAllToAllForward``,
+    which returns the metadata of a fused splits all2all, not an awaitable.
+    """
+    from torchrec.distributed.train_pipeline.runtime_forwards import KJTAllToAllForward
+
+    model, feature_names = _input_model(use_index_dedup=False)
+    ((_, _, sharded),) = find_sharded_modules(model, "")
+    device = torch.device(f"cuda:{torch.cuda.current_device()}")
+    fields, scores = _input_features(feature_names, device)
+    scored = ScoredKeyedJaggedTensor(scores=scores, **fields)
+
+    # The tables are created by the first input_dist; do it before patching.
+    sharded.input_dist(sharded.create_context(), scored).wait().wait()
+
+    (row_wise_dist,) = sharded._input_dists
+    original = row_wise_dist._dist.forward
+    row_wise_dist._dist.forward = KJTAllToAllForward(
+        pg=row_wise_dist._dist._pg,
+        splits=row_wise_dist._dist._splits,
+        stagger=row_wise_dist._dist._stagger,
+    )
+    try:
+        sharded.input_dist(sharded.create_context(), scored)
+    except NotImplementedError as error:
+        assert "train pipeline" in str(error), error
+    else:
+        raise AssertionError("a train pipeline was accepted")
+    finally:
+        row_wise_dist._dist.forward = original
+
+    # Evaluation sends no scores, so the fused path has nothing to lose.
+    sharded.eval()
+    row_wise_dist._dist.forward = KJTAllToAllForward(
+        pg=row_wise_dist._dist._pg,
+        splits=row_wise_dist._dist._splits,
+        stagger=row_wise_dist._dist._stagger,
+    )
+    try:
+        sharded.input_dist(sharded.create_context(), scored)
+    finally:
+        row_wise_dist._dist.forward = original
+        sharded.train()
+
+
 class _Stop(Exception):
     """Raised by a spy once it has seen what it was called with."""
 
@@ -623,6 +670,7 @@ if __name__ == "__main__":
     # The dedup before the all2all has no scores to merge in an input without.
     check_eval_needs_no_scores(use_index_dedup=True)
     check_negative_score()
+    check_train_pipeline_is_refused()
     # Last: it ends in an exception while the model is being built.
     check_hybrid_storage_is_refused()
     check_pooled_scores()

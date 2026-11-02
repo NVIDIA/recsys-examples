@@ -21,6 +21,7 @@ from dynamicemb_extensions import block_bucketize_sparse_features  # pyre-ignore
 from torch import distributed as dist
 from torchrec.distributed.dist_data import KJTAllToAll, KJTAllToAllTensorsAwaitable
 from torchrec.distributed.embedding_sharding import (
+    KJTSplitsAllToAllMeta,
     _fx_wrap_batch_size_per_feature,
     _fx_wrap_gen_list_n_times,
     _fx_wrap_max_B,
@@ -314,8 +315,22 @@ class RwSparseFeaturesDist(_RwSparseFeaturesDist):
             unbucketize_permute if self._is_sequence else None
         )
 
+        keys_dist = self._dist(bucketized_features)
         if not takes_scores:
-            return self._dist(bucketized_features)
+            return keys_dist
+
+        # TrainPipelineSparseDist swaps ``_dist.forward`` for one that returns
+        # the metadata of a splits all2all it fuses across modules, not an
+        # awaitable. The fused path rebuilds the keys' tensors awaitable itself
+        # and has nowhere to carry the scores, so it is refused for now.
+        if isinstance(keys_dist, KJTSplitsAllToAllMeta):
+            raise NotImplementedError(
+                "A table with score_strategy PRECISE_CUSTOMIZED cannot be "
+                "trained with a TorchRec train pipeline "
+                "(TrainPipelineSparseDist and its variants) yet: the pipeline "
+                "fuses the splits all2all of the keys and has no channel for "
+                "per-key scores. Run the model without the pipeline."
+            )
 
         scores = permute_scores_like_keys(sparse_features.scores(), unbucketize_permute)
         # The scores are sent as the values of a KJT of the keys' shape. Its
@@ -327,6 +342,4 @@ class RwSparseFeaturesDist(_RwSparseFeaturesDist):
             lengths=bucketized_features.lengths().clone(),
             stride=bucketized_features.stride(),
         )
-        return _ScoredSplitsAwaitable(
-            self._dist(bucketized_features), self._score_dist(scores_kjt)
-        )
+        return _ScoredSplitsAwaitable(keys_dist, self._score_dist(scores_kjt))

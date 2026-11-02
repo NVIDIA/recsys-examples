@@ -513,6 +513,10 @@ Rules:
 - **Sharding.** Row-wise only (EC and EBC). No variable batch size per key
   (VBE). Tables with a host/hybrid storage tier (`HybridStorage`) are not
   supported yet.
+- **Training pipeline.** Not with TorchRec's `TrainPipelineSparseDist` or its
+  variants while training: they fuse the splits all2all of the keys, which has
+  no channel for scores, and the input dist raises `NotImplementedError`.
+  Evaluation sends no scores, so it is not affected.
 - **Repeated keys.** Within one batch -- including across ranks, and with
   `use_index_dedup` -- a key takes the **largest** score the batch gave it.
 - **Across batches.** The score is assigned on every hit, so the latest batch
