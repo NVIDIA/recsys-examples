@@ -1083,7 +1083,9 @@ def _generic_forward_path(
                 unique_table_ids,
                 copy_mode=CopyMode.VALUE,
                 lfu_accumulated_frequency=accumulated_frequency,
-                key_scores=key_scores,
+                # Only when there are some: an external store written against
+                # the interface before per-key scores has no such parameter.
+                **({} if key_scores is None else {"key_scores": key_scores}),
             )
 
         key_persisted = founds.clone()

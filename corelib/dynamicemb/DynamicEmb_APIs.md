@@ -512,7 +512,8 @@ Rules:
   strategy, so it cannot be combined with LFU.
 - **Sharding.** Row-wise only (EC and EBC). No variable batch size per key
   (VBE). Tables with a host/hybrid storage tier (`HybridStorage`) are not
-  supported yet.
+  supported yet. Neither is an `external_storage` that is the only
+  tier (no cache and no HBM for values); with a cache above it, it is fine.
 - **Training pipeline.** Not with TorchRec's `TrainPipelineSparseDist` or its
   variants while training: they fuse the splits all2all of the keys, which has
   no channel for scores, and the input dist raises `NotImplementedError`.

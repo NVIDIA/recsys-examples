@@ -894,6 +894,14 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                     for storage_option in storage_options:
                         storage_option.local_hbm_for_values = 0
                     PS = storage_options[0].external_storage
+                    if PS and any(o.takes_score_per_key for o in storage_options):
+                        # The external store is the only tier and is asked
+                        # directly; its find() has no score per key to take.
+                        raise NotImplementedError(
+                            "score_strategy PRECISE_CUSTOMIZED is not supported "
+                            "with external_storage as the only storage tier "
+                            "(caching=False and no HBM budget for values)."
+                        )
                     self._storage = (
                         PS(storage_options, self._optimizer)
                         if PS

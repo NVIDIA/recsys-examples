@@ -504,6 +504,17 @@ def check_hybrid_storage_is_refused() -> None:
         raise AssertionError("PRECISE_CUSTOMIZED was accepted with HybridStorage")
 
 
+def check_external_storage_alone_is_refused() -> None:
+    """An external store that is the only tier has no score per key to take."""
+    try:
+        # Refused before the store is built, so any class stands in for it.
+        _ec_model(host_only=True, external_storage=object)
+    except NotImplementedError as error:
+        assert "external_storage" in str(error), error
+    else:
+        raise AssertionError("PRECISE_CUSTOMIZED was accepted with a lone store")
+
+
 def check_negative_score() -> None:
     """A negative score warns under WARNING and raises under ERROR."""
     device = torch.device(f"cuda:{torch.cuda.current_device()}")
@@ -670,6 +681,7 @@ if __name__ == "__main__":
     # The dedup before the all2all has no scores to merge in an input without.
     check_eval_needs_no_scores(use_index_dedup=True)
     check_negative_score()
+    check_external_storage_alone_is_refused()
     check_train_pipeline_is_refused()
     # Last: it ends in an exception while the model is being built.
     check_hybrid_storage_is_refused()
