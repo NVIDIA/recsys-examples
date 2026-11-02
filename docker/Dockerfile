@@ -197,6 +197,7 @@ WORKDIR /workspace/deps
 RUN apt-get update -y --fix-missing && \
     apt-get install -y \
       gdb \
+      libdw-dev \
       liburing-dev \
       libxxhash-dev \
       libzmq3-dev && \
@@ -304,6 +305,15 @@ RUN cd /workspace/deps/fbgemm_hstu/fbgemm_gpu/experimental/hstu && \
     MAX_JOBS="${HSTU_BUILD_JOBS}" \
     pip install --no-build-isolation . && \
     rm -rf /workspace/deps/fbgemm_hstu
+
+# Install DeepGEMM (FP8 projections of the Transformer inference backbone) from
+# submodule. Only the host extension is compiled here; it needs the libdw-dev
+# headers. The GEMM kernels are JIT compiled on first use.
+COPY third_party/DeepGEMM /workspace/deps/DeepGEMM
+RUN cd /workspace/deps/DeepGEMM && \
+    pip install --no-build-isolation --no-deps . && \
+    python3 -c 'import importlib.metadata as m; print("deep_gemm", m.version("deep_gemm"))' && \
+    rm -rf /workspace/deps/DeepGEMM
 
 # ============================================================================
 # Stage 4: build — devel + recsys-examples in-tree builds (dynamicemb, commons,
