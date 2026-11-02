@@ -12,8 +12,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""The planner's steps across nodes (``src/hier_output_dist/plan/``) on one
-GPU, on plain tensors: the proxy's node dedup, rounds, slots and push order
+"""The planner's steps across nodes (``src/hier_output_dist/planner.h``) on
+one GPU, on plain tensors: the proxy's node dedup, rounds, slots and push order
 (``hier_output_dist_proxy_plan``), the rail's layout, status, owner tables
 and the proxy's backward put list (``hier_output_dist_rail_tables``), and the
 requester's tables (``hier_output_dist_requester_tables``).
@@ -71,7 +71,7 @@ from dynamicemb_extensions import (
 
 HEAVY = 64  # kHeavy: a node-unique key of more occurrences is heavy
 TASK_ROWS = 32  # kTaskRows: rows (or heavy groups) of a push task
-# reducer entries (formats.h): the flag of no push, a heavy key's own row,
+# reducer entries (common.h): the flag of no push, a heavy key's own row,
 # and the bit of a partial slot
 ENTRY_NO_PUSH, ENTRY_OWN_ROW, ENTRY_PARTIAL = -1, -2, 1 << 31
 
@@ -91,7 +91,7 @@ def ceil32(count: int) -> int:
 
 
 def rounds_for(total: int, num_proxy_rows: int) -> int:
-    """The rounds of ``total`` rows (``rounds_for`` in common/formats.h)."""
+    """The rounds of ``total`` rows (``rounds_for`` in common.h)."""
     if total <= num_proxy_rows:
         return 1
     room = int(0.9 * (num_proxy_rows // 2))

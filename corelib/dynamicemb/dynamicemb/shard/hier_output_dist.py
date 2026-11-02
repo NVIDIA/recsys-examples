@@ -336,9 +336,8 @@ class HierSharding:
         groups in feature order, writes its rows straight into the call's
         rows of ``op.lookup_rows`` (the tables' ``output_alloc``), and their
         outputs come back as those rows, flat, without a copy. The rows are
-        valid until the next out kernel. ``op.lookup_rows`` raises if the
-        gradient view of the last backward is still alive. See
-        docs/hier_output_dist.md, section 11.2."""
+        valid until the next out kernel. See docs/hier_output_dist.md,
+        section 11.2."""
         rows = self.op.lookup_rows(self._plans[kjt])
         # The lookup may run on a stream of its own (TorchRec's fused
         # pipeline), on which nobody else records the KJT's use.
@@ -371,7 +370,8 @@ class _LookupOutput(torch.autograd.Function):
 class _OutputAwaitable(Awaitable[torch.Tensor]):
     """The rows ``fwd_kernel`` wrote, on the stream it ran on. Waiting on them
     from another stream makes that stream wait for the kernel first (and
-    records their use there): TorchRec's fused pipeline runs the lookup and
+    records their use there), as the awaitables of TorchRec's own dists do
+    (their NCCL work's wait): TorchRec's fused pipeline runs the lookup and
     the output dist on a stream of its own (``emb_lookup_stream="new"``) and
     reads the rows in the dense forward, on the default stream."""
 
@@ -394,12 +394,17 @@ class _OutputFunction(torch.autograd.Function):
     """The output dist of a call on this path: ``op.forward`` (``fwd_kernel``)
     in the forward, ``op.backward`` (``bwd_kernel``) in the backward, whose
     gradient for the lookup output is ``lookup_grad``, a view of
-    ``lookup_rows``. The backward's maps, which the forward returns, are saved
-    tensors: autograd keeps them for a second backward (``retain_graph``) and
-    frees them after the last one."""
+    ``lookup_rows`` valid until the next lookup. The backward's maps, which
+    the forward returns, are saved tensors: autograd keeps them for a second
+    backward (``retain_graph``) and frees them after the last one."""
 
     @staticmethod
     def forward(ctx, lookup_out: torch.Tensor, plan, op) -> torch.Tensor:
+        # The out kernels may run on a stream of their own (TorchRec's fused
+        # pipeline), on which nobody else records the plan's use; the plan
+        # lets go of the forward's tables once the kernel is queued, and the
+        # backward runs on this stream too.
+        plan.record_stream(torch.cuda.current_stream())
         out, maps = op.forward(plan, lookup_out)
         ctx.save_for_backward(*maps)
         ctx.plan, ctx.op = plan, op
@@ -418,8 +423,9 @@ class RwSequenceHierEmbeddingDist(
     BaseEmbeddingDist[SequenceShardingContext, torch.Tensor, torch.Tensor]
 ):
     """The output dist of a sharding on the hierarchical dist. A call on that
-    path moves its rows by its plan (``ctx.plan``). Other calls (eval, or a
-    call that did not fit) take TorchRec's ``RwSequenceEmbeddingDist``."""
+    path moves its rows by its plan (``ctx.plan``) on the current stream.
+    Other calls (eval, or a call that did not fit) take TorchRec's
+    ``RwSequenceEmbeddingDist``."""
 
     def __init__(
         self,

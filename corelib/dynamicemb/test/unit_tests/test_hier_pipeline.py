@@ -106,8 +106,8 @@ NUM_EMBEDDINGS = 1 << 20
 DIM = 32
 # The EC's tables and their features (t0 serves two), and the EBC's.
 TABLES = (("f0", "f1"), ("f2",), ("f3",))
-# The status a first wait copies to the host: status_words(num_features)
-# int64 words (src/hier_output_dist/common/status.h) of the EC's features.
+# The status a call copies to the host: status_words(num_features) int64
+# words (src/hier_output_dist/common.h) of the EC's features.
 STATUS_WORDS = 7 + 2 * sum(len(table) for table in TABLES)
 EBC_TABLES = ("e0", "e1")
 DENSE = 2048
@@ -149,12 +149,6 @@ def all_true(ok: bool) -> bool:
     flag = torch.tensor([int(ok)], device=DEV)
     dist.all_reduce(flag, op=dist.ReduceOp.MIN)
     return bool(flag.item())
-
-
-def all_max(value: int) -> int:
-    flag = torch.tensor([value], dtype=torch.int64, device=DEV)
-    dist.all_reduce(flag, op=dist.ReduceOp.MAX)
-    return int(flag.item())
 
 
 def report(name: str, checks: Dict[str, bool], log: Callable, extra: str = "") -> int:
@@ -762,16 +756,16 @@ def d2h_shapes(prof, label: str) -> List[List[int]]:
 def sync_checks(prof, part1: bool = True) -> Tuple[Dict[str, bool], str]:
     """The hierarchical dist's host syncs and kernels in a profile of whole
     steps: no sync in part 1 (but where ``part1`` is False) and the first
-    wait, one D2H copy in each first wait, the status's (into pinned memory,
-    non-blocking), one sync in each second wait, also in a call that does not
-    fit (TorchRec's input dist runs after it); and in the calls that take the
-    op, no sync in the output dist and one kernel per direction."""
+    wait, one sync in each second wait with one D2H copy, the status's, also
+    in a call that does not fit (TorchRec's input dist runs after it); and in
+    the calls that take the op, no sync in the output dist and one kernel per
+    direction."""
     ranges_part1, syncs_part1 = syncs_in(prof, "hier::part1")
     ranges_start, syncs_start = syncs_in(prof, "hier::start")
     ranges_wait, syncs_wait = syncs_in(prof, "hier::wait")
     ranges_fwd, syncs_fwd = syncs_in(prof, "hier::forward")
     ranges_bwd, syncs_bwd = syncs_in(prof, "hier::backward")
-    d2h = d2h_shapes(prof, "hier::start")
+    d2h = d2h_shapes(prof, "hier::wait")
     fwd = launched_in(prof, "hier::forward")
     bwd = launched_in(prof, "hier::backward")
     checks = {
@@ -780,7 +774,7 @@ def sync_checks(prof, part1: bool = True) -> Tuple[Dict[str, bool], str]:
         and (syncs_part1 == 0 or not part1)
         and syncs_start == 0
         and syncs_wait == ranges_wait,
-        "one D2H of the status": d2h == [[STATUS_WORDS]] * ranges_start,
+        "one D2H of the status": d2h == [[STATUS_WORDS]] * ranges_wait,
         "output dist syncs": ranges_fwd > 0
         and ranges_bwd > 0
         and syncs_fwd == syncs_bwd == 0,
@@ -791,8 +785,8 @@ def sync_checks(prof, part1: bool = True) -> Tuple[Dict[str, bool], str]:
     }
     text = (
         f" (part 1 x{ranges_part1} {syncs_part1} syncs, first wait"
-        f" x{ranges_start} {syncs_start} syncs D2H {d2h}, second wait"
-        f" x{ranges_wait} {syncs_wait} syncs; out forward x{ranges_fwd}"
+        f" x{ranges_start} {syncs_start} syncs, second wait x{ranges_wait}"
+        f" {syncs_wait} syncs D2H {d2h}; out forward x{ranges_fwd}"
         f" {syncs_fwd} syncs {len(fwd)} kernels, backward x{ranges_bwd}"
         f" {syncs_bwd} syncs {len(bwd)} kernels)"
     )
@@ -891,9 +885,9 @@ class Stress:
     """What a stress run adds to each step of a pipeline: a sleep kernel on the
     data dist's stream before each input dist, on the embedding lookup's
     stream before each lookup (TrainPipelineFusedSparseDist), or on the
-    default stream before each step (``behind``, that many cycles: the host
-    runs steps ahead of it, and :attr:`lead` counts the most); a random host
-    sleep per rank; GEMMs on another stream."""
+    default stream before each step (``behind``, that many cycles, so that
+    the host runs steps ahead of it); a random host sleep per rank; GEMMs on
+    another stream."""
 
     def __init__(
         self,
@@ -912,10 +906,6 @@ class Stress:
         self.background = torch.cuda.Stream()
         self.mat = torch.randn(4096, 4096, device=DEV)
         self.prod = torch.empty_like(self.mat)
-        # an event after each step's sleep, and the most steps whose sleep the
-        # default stream had not got past when the next one began
-        self.marks: List[torch.cuda.Event] = []
-        self.lead = 0
 
     @staticmethod
     def _delay(pipe, method: str, stream: torch.cuda.Stream) -> None:
@@ -937,10 +927,7 @@ class Stress:
 
     def step(self) -> None:
         if self.behind:
-            self.lead = max(self.lead, sum(not mark.query() for mark in self.marks))
             torch.cuda._sleep(self.behind)
-            self.marks.append(torch.cuda.Event())
-            self.marks[-1].record()
         if self.host_sleeps:
             time.sleep(self.rng.uniform(0, 0.02))
         if self.gemms:
@@ -1329,10 +1316,7 @@ def run_stress(rank: int, log: Callable) -> int:
     # the blocks a backward's prefetched state frees must not reach the next
     # prefetch before that backward has run.
     plain = run(UNIFORM, "fused", "plain", rank)
-    stress = Stress(behind=200_000_000)
-    got = run(UNIFORM, "fused", "prefetch", rank, stress)
-    # each step the host runs ahead keeps that step's blocks reserved
-    got.checks["host lead"] = all_max(stress.lead) <= 2
+    got = run(UNIFORM, "fused", "prefetch", rank, Stress(behind=200_000_000))
     failures += compare(
         f"{UNIFORM.name}: prefetch, the default stream behind the host by a sleep"
         " kernel per step, vs the plain loop",

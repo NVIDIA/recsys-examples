@@ -25,7 +25,7 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 #include <map>
 #include <string>
 
-#include "hier_output_dist/common/trace_flag.h"
+#include "hier_output_dist/common.h"
 #include "hier_output_dist/hier_output_dist.h"
 
 namespace py = pybind11;
@@ -148,7 +148,7 @@ void bind_hier_output_dist(py::module &py_module) {
           "Part 1 of a call on the current stream (local, no sync); returns its plan")
       .def("start", &HierOutputDist::start, py::arg("plan"),
            py::call_guard<py::gil_scoped_release>(),
-           "The first wait: the rest of the call on the op's side stream (no sync)")
+           "The first wait: the rest of the call on the current stream (no sync)")
       .def("wait", &HierOutputDist::wait, py::arg("plan"), py::call_guard<py::gil_scoped_release>(),
            "The second wait, the call's one host sync: False when the call does not fit the "
            "capacities (on every rank alike)")
@@ -165,9 +165,7 @@ void bind_hier_output_dist(py::module &py_module) {
       .def("memory", &HierOutputDist::memory)
       .def("gin_railed", &HierOutputDist::gin_railed)
       .def("trace", &HierOutputDist::trace)
-      .def("trace_launches", &HierOutputDist::trace_launches)
-      .def("in_trace", &HierOutputDist::in_trace)
-      .def("in_calls", &HierOutputDist::in_calls);
+      .def("trace_launches", &HierOutputDist::trace_launches);
 
   dyn_emb::hier_output_dist::bind_testing(py_module);
 }

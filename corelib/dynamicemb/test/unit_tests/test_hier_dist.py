@@ -80,8 +80,6 @@ from dynamicemb.shard.rw_sharding import counts_frequencies
 from dynamicemb_extensions import (
     block_bucketize_sparse_features,
     hier_output_dist_fail_next_construction,
-    hier_output_dist_live_views,
-    hier_output_dist_lookup_grad_live,
     hier_output_dist_traced,
 )
 from fbgemm_gpu.split_embedding_configs import SparseType
@@ -99,7 +97,7 @@ sys.path.insert(
 )
 from benchmark_utils import hier_capacities, hier_needs, init_distributed  # noqa: E402
 
-HEAVY = 64  # kHeavy in src/hier_output_dist/common/constants.h
+HEAVY = 64  # kHeavy in src/hier_output_dist/common.h
 NUM_EMBEDDINGS = 1 << 20
 # Nodes of the run (main sets it): across nodes a requester's keys for an
 # owner on another node reach it once per (node, table, key), and so do the
@@ -602,15 +600,11 @@ def fused_model(
 
 class Probe:
     """What a model's row-wise lookup saw in the last iteration: its KJT and
-    the gradient of its output (a copy; with ``hold``, also that gradient
-    itself: on the hierarchical path, ``lookup_grad``, a view of
-    ``lookup_rows``)."""
+    the gradient of its output (a copy)."""
 
     def __init__(self, ec: ShardedDynamicEmbeddingCollection, dim: int) -> None:
         self.kjt: Optional[KeyedJaggedTensor] = None
         self.grad: Optional[torch.Tensor] = None
-        self.hold = False
-        self.held: Optional[torch.Tensor] = None
         lookup = ec._lookups[rw_index(ec)]
         orig = lookup.forward
 
@@ -623,8 +617,6 @@ class Probe:
 
         def keep(grad):
             self.grad = grad.detach().view(-1, dim).clone()
-            if self.hold:
-                self.held = grad
 
         lookup.forward = forward
 
@@ -976,9 +968,8 @@ def check_step(
     """After the forwards of one batch on both models: their backwards, and
     then the forward outputs, the backward per (table, key) (and per row on
     one node without index dedup), the tables after the step and their LFU
-    scores or admission counts, against TorchRec's, and that no view of
-    ``lookup_rows`` outlived the step (lookup outputs, ``lookup_grad``).
-    Returns the checks, and whether the tables are bitwise equal."""
+    scores or admission counts, against TorchRec's. Returns the checks, and
+    whether the tables are bitwise equal."""
     ok_fwd = same_outputs(case, ref_out, hier_out, fwd_exact)
     for out in (ref_out, hier_out):
         loss_of(case, case_idx, iteration, rank, out).backward()
@@ -990,11 +981,6 @@ def check_step(
     }
     if case.lfu or case.admit or case.mixed:
         checks["freq"] = same_frequencies(pair)
-    if pair.state is not None and pair.state.takes_hier_dist:
-        checks["views"] = (
-            hier_output_dist_live_views(pair.state.op) == 0
-            and hier_output_dist_lookup_grad_live(pair.state.op) == 0
-        )
     return checks, bitwise
 
 
@@ -1130,21 +1116,17 @@ WINDOWS_SIZES = ((64, 4), (1024, 16), (4096, 24), (8192, 32), (8192, 32))
 
 def trace_matches_build(op) -> bool:
     """The op's trace APIs match the build: without DYNAMICEMB_HIER_TRACE=1
-    empty tensors and no launches; with it, after calls, the last call's row
-    of the in channel's step times (its first step to its last, in order)
-    and each direction's last kernel row (its start stamp)."""
-    trace, steps = op.trace(), op.in_trace()
+    an empty tensor and no launches; with it, after calls, each direction's
+    last kernel row (its start stamp)."""
+    trace = op.trace()
     if not hier_output_dist_traced():
-        return (
-            trace.numel() == 0 and steps.numel() == 0 and op.trace_launches() == [0, 0]
-        )
+        return trace.numel() == 0 and op.trace_launches() == [0, 0]
     launches = op.trace_launches()
     started = all(
         trace[direction, (launches[direction] - 1) % trace.size(1), 0].item() > 0
         for direction in (0, 1)
     )
-    row = steps[op.in_calls() % steps.size(0)].tolist()
-    return min(launches) > 0 and started and 0 <= row[0] <= row[-1]
+    return min(launches) > 0 and started
 
 
 def run_windows(rank: int, world_size: int, local_size: int, log: Callable) -> int:
@@ -1202,7 +1184,7 @@ def run_proxy_rows(rank: int, world_size: int, local_size: int, log: Callable) -
     """Across nodes, a proxy rows cap below the rows a round needs: "fused"
     raises the same ValueError on every rank, naming the cap's knob, and
     "auto" warns and takes TorchRec's dists."""
-    least_rows = 20 * HEAVY * (NODES - 1)  # min_proxy_rows_for in formats.h
+    least_rows = 20 * HEAVY * (NODES - 1)  # min_proxy_rows_for in common.h
     cap_mb = least_rows * 4 * 32 / 2 / (1 << 20)  # half their fp32 rows of 32 columns
     capacity = dict.fromkeys(OUTPUT_DIST_CAPACITY_NAMES, 1 << 16)
     checks: Dict[str, bool] = {}
@@ -1417,17 +1399,16 @@ def run_no_sync(rank: int, world_size: int, local_size: int, log: Callable) -> i
     return failures
 
 
-# ── the output dist's kernels in every order, lookup_grad guard, determinism ──
+# ── the output dist's kernels in every order, determinism ────────────────────
 
 
 def run_orders(rank: int, world_size: int, local_size: int, log: Callable) -> int:
     """The output dist's kernels in each order a training loop meets, against
     TorchRec's dists on the same batches, each followed by a checked step: a
     no-grad forward; two forwards, then one backward of both or their
-    backwards in order; a second backward of one graph (``retain_graph``);
-    and ``lookup_grad`` kept alive, where the next backward and the next
-    lookup raise the same RuntimeError on every rank. Without index dedup,
-    and with index dedup and heavy rows."""
+    backwards in order; and a second backward of one graph
+    (``retain_graph``). Without index dedup, and with index dedup and heavy
+    rows."""
     failures = 0
     for case_idx, case in (
         (110, Case("orders")),
@@ -1458,7 +1439,7 @@ def orders_of(
 ) -> int:
     """run_orders for one case (its models and outputs go when it returns)."""
     failures = 0
-    calls = [batch_of(case, case_idx, index, rank, world_size) for index in range(14)]
+    calls = [batch_of(case, case_idx, index, rank, world_size) for index in range(10)]
     pair = Pair(case, case_idx, world_size, local_size, calls)
     exact = case.exact(world_size)
     iteration = 0
@@ -1553,31 +1534,6 @@ def orders_of(
     )
     iteration += 2
     failures += step("two forwards, then their backwards")
-
-    pair.hier_probe.hold = True
-    losses = {}
-    for side, ec in (("ref", pair.ref), ("hier", pair.hier)):
-        run = run_model(ec, batch(iteration), False)
-        losses[side] = loss_of(case, case_idx, iteration, rank, run.out)
-        losses[side].backward(retain_graph=True)
-    held = hier_output_dist_lookup_grad_live(pair.state.op) == 1
-    msg_bwd = expect_error(RuntimeError, losses["hier"].backward)
-    msg_fwd = expect_error(
-        RuntimeError, run_model, pair.hier, batch(iteration + 1), False
-    )
-    pair.hier_probe.hold, pair.hier_probe.held = False, None
-    del losses
-    checks = {
-        "held": held,
-        "backward raised": "still alive" in msg_bwd,
-        "lookup raised": "still alive" in msg_fwd,
-        "released": hier_output_dist_lookup_grad_live(pair.state.op) == 0,
-    }
-    failures += report(
-        f"{case.name}: lookup gradient kept alive", checks, log, f": {msg_fwd}"
-    )
-    iteration += 2
-    failures += step("lookup gradient kept alive")
     return failures
 
 

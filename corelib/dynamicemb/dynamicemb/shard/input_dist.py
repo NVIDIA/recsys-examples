@@ -345,7 +345,7 @@ class RwSparseFeaturesDist(_RwSparseFeaturesDist):
 class HierPlanAwaitable(Awaitable[Awaitable[KeyedJaggedTensor]]):
     """Part 1 of a call on the hierarchical dist. Waiting on it is the first
     wait: ``op.start(plan)`` queues the rest of the call (its comm kernels and
-    planner steps) on the op's side stream. Dropping it changes nothing (the
+    planner steps) on the current stream. Dropping it changes nothing (the
     prefetch pipeline runs part 1 of its first batch twice). A second wait
     returns what the first did (TorchRec's prefetch pipeline up to 1.6 and the
     JaggedMegatron one wait twice on their last batch)."""

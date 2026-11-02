@@ -20,6 +20,7 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 // and its plans that only tests and the benchmark read. Last, a hook that
 // makes the next construction fail, and the GPU clock the benchmark aligns
 // timelines by (a build with DYNAMICEMB_HIER_TRACE=1).
+
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <pybind11/pybind11.h>
@@ -31,24 +32,18 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 #include <string>
 #include <vector>
 
-#include "hier_output_dist/common/ctrl.h"
-#include "hier_output_dist/common/formats.h"
-#include "hier_output_dist/common/keys.h"
-#include "hier_output_dist/common/sizes.h"
+#include "hier_output_dist/common.h"
+#include "hier_output_dist/config.h"
 #include "hier_output_dist/hier_output_dist.h"
-#include "hier_output_dist/host/common.h"
 #include "hier_output_dist/kernels.h"
-#include "hier_output_dist/plan/node.h"
-#include "hier_output_dist/plan/part_one.h"
-#include "hier_output_dist/plan/proxy.h"
-#include "hier_output_dist/plan/put_list.h"
-#include "hier_output_dist/plan/rail.h"
-#include "hier_output_dist/plan/requester.h"
-
-namespace py = pybind11;
+#include "hier_output_dist/planner.h"
+#include "hier_output_dist/window.h"
 
 namespace dyn_emb {
 namespace hier_output_dist {
+
+namespace py = pybind11;
+
 namespace {
 
 // Part 1's partition of a KJT (partition_keys), by name, with each owner's
@@ -206,8 +201,7 @@ std::map<std::string, at::Tensor> proxy_plan_test(
   c10::cuda::CUDAGuard guard(keys.device());
   const Sizes sizes = plan_sizes(named_sizes);
   const int64_t entries = sizes.remote_keys, local_size = sizes.topo.local_size,
-                num_nodes = sizes.topo.num_nodes, num_features = sizes.num_features,
-                rounds_cap = sizes.rounds_cap;
+                num_features = sizes.num_features;
   ProxyHeader header = ProxyHeader::of(sizes);  // over proxy_header once checked
   TORCH_CHECK(
       is_cuda_array(keys, at::kLong, entries) &&
@@ -340,8 +334,7 @@ std::map<std::string, at::Tensor> requester_tables_test(
     std::map<std::string, int64_t> named_sizes) {
   c10::cuda::CUDAGuard guard(row_cell.device());
   const Sizes sizes = plan_sizes(named_sizes);
-  const int64_t local_size = sizes.topo.local_size, num_nodes = sizes.topo.num_nodes,
-                num_features = sizes.num_features, rounds_cap = sizes.rounds_cap,
+  const int64_t local_size = sizes.topo.local_size, num_features = sizes.num_features,
                 cells = sizes.topo.world_size * num_features;
   const ProxyHeader header = ProxyHeader::of(sizes);  // its words
   TORCH_CHECK(
@@ -393,11 +386,6 @@ std::map<std::string, at::Tensor> requester_tables_test(
 void bind_testing(py::module &py_module) {
   py_module.def("hier_output_dist_plan_tensors", &Plan::tensors,
                 "The device tensors a plan holds, by name", py::arg("plan"));
-  py_module.def("hier_output_dist_live_views", &HierOutputDist::live_views,
-                "Views of an op's lookup_rows alive", py::arg("op"));
-  py_module.def("hier_output_dist_lookup_grad_live", &HierOutputDist::lookup_grad_live,
-                "Gradient views of an op's lookup_rows alive (those its backward handed out)",
-                py::arg("op"));
   py_module.def("hier_output_dist_fail_next_construction", &fail_next_construction,
                 "The next construction of an op in this process fails to allocate",
                 py::arg("fail_alloc"));

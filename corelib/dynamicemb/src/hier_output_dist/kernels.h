@@ -27,9 +27,8 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 #include <tuple>
 #include <utility>
 
-#include "hier_output_dist/common/channel_args.h"
-#include "hier_output_dist/common/keys.h"
-#include "hier_output_dist/output/args.cuh"
+#include "hier_output_dist/args.cuh"
+#include "hier_output_dist/window.h"
 
 namespace dyn_emb {
 namespace hier_output_dist {
@@ -45,14 +44,14 @@ bool gin_signals_zero(const ncclDevComm &dev, int num_nodes);
 // all did.
 cudaError_t launch_exit_kernel(const ChannelStatic &channel, uint64_t limit_ns);
 
-// ── the in channel's comm kernels (input/comm_kernels.cuh) ───────────────────
-// On the current stream (the side stream, in InChannel::start), at call seq;
-// each allocates its outputs there.
+// ── the in channel's comm kernels (comm_kernels.cuh) ───────────────────
+// On the current stream (in InChannel::start), at call seq; each allocates
+// its outputs there.
 
 // The node barrier, and the node's count vectors (int64): their sum over the
 // node and over the ranks before this one ([my_counts.numel()] each), and
 // each requester's counts for this rank ([local_size][num_features + 1]),
-// as plan/node.h's NodeCounts.
+// as planner.h's NodeCounts.
 std::tuple<at::Tensor, at::Tensor, at::Tensor> launch_node_count_exchange(
     const ChannelStatic &channel, int64_t seq, const at::Tensor &my_counts);
 // This rank's first *rows_to_push rows of part 1 (keys, weights or undefined,

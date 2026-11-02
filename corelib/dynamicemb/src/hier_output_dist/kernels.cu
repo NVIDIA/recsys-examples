@@ -16,20 +16,19 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 ******************************************************************************/
 // The one device translation unit of the hierarchical dist: every kernel of
 // the op, in the order a call runs them, and the functions that launch them
-// (kernels.h), which the host classes call (host/, hier_output_dist.cu).
+// (kernels.h), which the host classes call (hier_output_dist.cu, channels.cu).
 // One unit: the headers below define the kernels and the device functions
 // they call, so only this file includes them.
 //
-// Per call there are two groups of kernels; the planner's ATen ops (plan/)
-// run part 1 on the caller's stream and the steps between the first group's
-// kernels:
-//   first wait (the in channel's side stream) -- the comm kernels
-//              (input/comm_kernels.cuh), which exchange the call's counts,
-//              keys and needs with the node and rail peers;
-//   output     (output/forward.cuh, output/backward.cuh; the caller's stream)
-//              -- fwd_kernel after the lookup, bwd_kernel in the backward,
-//              which hands the lookup's backward its gradient as a view of
-//              lookup_rows.
+// Per call there are two groups of kernels, all on the caller's stream; the
+// planner's ATen ops (planner.h) run part 1 and the steps between the first
+// group's kernels:
+//   first wait -- the comm kernels (comm_kernels.cuh), which exchange
+//                 the call's counts, keys and needs with the node and rail
+//                 peers;
+//   output     -- (forward.cuh, backward.cuh) fwd_kernel after
+//                 the lookup, bwd_kernel in the backward, which hands the
+//                 lookup's backward its gradient as a view of lookup_rows.
 
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
@@ -38,32 +37,23 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 
 #include <cstdint>
 
-#include "hier_output_dist/common/channel_args.h"
-#include "hier_output_dist/common/constants.h"
-#include "hier_output_dist/common/ctrl.h"
-#include "hier_output_dist/common/gin_signals.h"
-#include "hier_output_dist/common/keys.h"
-#include "hier_output_dist/common/status.h"
-#include "hier_output_dist/common/topology.h"
-#include "hier_output_dist/common/trace_flag.h"
-#include "hier_output_dist/device/memory_order.cuh"
-#include "hier_output_dist/device/node_window.cuh"
-#include "hier_output_dist/device/spin.cuh"
-#include "hier_output_dist/device/warp.cuh"
-#include "hier_output_dist/host/common.h"
+#include "hier_output_dist/args.cuh"
+#include "hier_output_dist/backward.cuh"
+#include "hier_output_dist/comm_kernels.cuh"
+#include "hier_output_dist/common.h"
+#include "hier_output_dist/config.h"
+#include "hier_output_dist/device.cuh"
+#include "hier_output_dist/forward.cuh"
 #include "hier_output_dist/kernels.h"
-#include "hier_output_dist/output/args.cuh"
+#include "hier_output_dist/window.h"
+
+namespace dyn_emb {
+namespace hier_output_dist {
 
 // The kernels, in the order a call runs them: the first wait's comm kernels,
 // then the output dist's.
 // clang-format off
-#include "hier_output_dist/input/comm_kernels.cuh"
-#include "hier_output_dist/output/forward.cuh"
-#include "hier_output_dist/output/backward.cuh"
 // clang-format on
-
-namespace dyn_emb {
-namespace hier_output_dist {
 
 // Teardown, 1 warp: tell the node this rank reads no window any more (its
 // closing word) and, across nodes, its rail peers that it sends nothing more

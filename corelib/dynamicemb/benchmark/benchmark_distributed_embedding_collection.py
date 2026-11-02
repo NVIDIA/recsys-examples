@@ -692,58 +692,6 @@ _NET_KERNEL_RE = re.compile(
 _STAGE_FIELDS = ("ms", "kernels", "net_ms")
 
 
-# The steps of a row of the in channel's step times (op.in_trace(), on the
-# host; empty without DYNAMICEMB_HIER_TRACE=1): InTraceSteps in
-# src/hier_output_dist/common/trace_slots.h, each the ns from the call's
-# start to the step's end, -1 for a step the call does not run. Its phases:
-# each step, from the end of the step before it that ran, and the span, from
-# the call's start to its last step's end.
-_IN_TRACE = (
-    "counts",
-    "layout",
-    "push",
-    "done",
-    "kjt",
-    "dedup",
-    "push_order",
-    "message",
-    "rail_counts",
-    "rail_layout",
-    "rail_keys",
-    "status_exchange",
-    "gathers",
-    "requester",
-    "owner",
-    "put_list",
-    "status",
-)
-_IN_PHASES = _IN_TRACE + ("span",)
-
-
-def in_phases(model, calls: int) -> Optional[List[float]]:
-    """In a build with the trace, the in channel's phases (_IN_PHASES) of
-    this rank's last ``calls`` calls on the hierarchical path, us, the mean
-    over the calls that ran each (nan for none)."""
-    op = _hier_op(model)
-    if op is None or not op.in_trace().numel():
-        return None
-    trace, done = op.in_trace(), op.in_calls()
-    rows = [
-        trace[call % trace.size(0)].tolist()
-        for call in range(done - min(calls, trace.size(0), done) + 1, done + 1)
-    ]
-    spans: List[List[float]] = [[] for _ in _IN_PHASES]
-    for row in rows:
-        before = 0
-        for step, ns in enumerate(row):
-            if ns >= 0:
-                spans[step].append((ns - before) / 1e3)
-                before = ns
-        if row[-1] >= 0:
-            spans[-1].append(row[-1] / 1e3)
-    return [sum(span) / len(span) if span else float("nan") for span in spans]
-
-
 def _stage_of(event) -> Tuple[str, str]:
     """(phase, stage) of a CPU event (the call that launched a kernel): the
     stage range or autograd node it runs in."""
@@ -996,7 +944,7 @@ class HierTraffic:
 
 
 # The hierarchical dist's trace rows (TraceSlots in
-# src/hier_output_dist/common/trace_slots.h): globaltimer stamps (the first
+# src/hier_output_dist/common.h): globaltimer stamps (the first
 # _HIER_TRACE_EARLIEST keep the earliest of their CTAs', unset at UINT64_MAX;
 # the rest the latest, unset at 0), then counters, then three timelines of
 # _HIER_TRACE_BINS bins (NVLink bytes, rows landed from other nodes, rows
@@ -1851,7 +1799,6 @@ def run(cfg: BenchConfig) -> Dict:
 
     records = None
     cal_stats = None
-    phase_us = None
     if cfg.trace:
         torch.cuda.synchronize()
         cal_after = clock_offsets(device)
@@ -1867,7 +1814,6 @@ def run(cfg: BenchConfig) -> Dict:
             if calls is not None and calls.clocks is not None
             else None,
         )
-        phase_us = in_phases(model, len(timed))
         cal_stats = {
             "round_trip_us_max": max(
                 cal_before[1:, 1].max().item(), cal_after[1:, 1].max().item()
@@ -1978,7 +1924,6 @@ def run(cfg: BenchConfig) -> Dict:
         ),
         "records": gather_floats(records) if records is not None else None,
         "cal_stats": cal_stats,
-        "in_phases": gather_floats(phase_us) if phase_us is not None else None,
         "syncs": syncs,
         "kernel_ms": gather_floats(kernel_ms) if kernel_ms is not None else None,
         "used": gather_floats(list(used.values())),
@@ -2198,26 +2143,6 @@ def report(
             f" {res['in_seg_ms_call_max']:.3f} and of the least over ranks"
             f" {res['in_seg_ms_call_min']:.3f}; part 1 / first wait / second wait"
             f" {' / '.join(f'{ms:.3f}' for ms in res['in_seg_steps_ms'])} ms"
-        )
-    phase_us = more.get("in_phases")
-    if phase_us is not None:
-        # the in channel's phases (trace), mean over the ranks that ran each
-        phases = {
-            name: (
-                float(col[~torch.isnan(col)].mean())
-                if (~torch.isnan(col)).any()
-                else None
-            )
-            for name, col in zip(_IN_PHASES, phase_us.t())
-        }
-        res["in_phases_us"] = phases
-        print(
-            "input dist phases (us, trace, mean over ranks): "
-            + ", ".join(
-                f"{name} {value:.1f}"
-                for name, value in phases.items()
-                if value is not None
-            )
         )
     output_dist_ms = more.get("output_dist_ms")
     if output_dist_ms is not None:
@@ -2526,8 +2451,8 @@ def parse_args(argv: List[str]) -> BenchConfig:
     parser.add_argument(
         "--trace",
         action="store_true",
-        help="the hierarchical dist's kernel timelines and input dist steps (a build"
-        " with DYNAMICEMB_HIER_TRACE=1; slows every call)",
+        help="the hierarchical dist's kernel timelines (a build with"
+        " DYNAMICEMB_HIER_TRACE=1; slows every call)",
     )
     parser.add_argument(
         "--trace_out",

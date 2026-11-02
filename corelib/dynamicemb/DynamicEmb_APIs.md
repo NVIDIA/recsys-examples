@@ -1592,6 +1592,7 @@ Due to limited resources, the dynamic embedding table does not pre allocate memo
 - Set `NCCL_CROSS_NIC=0` for multi-node jobs, before the first NCCL communicator is created, so that NCCL connects GIN on the rails alone.
 - Call [quiesce](#quiesce) on every rank before dropping the model.
 - Every rank must make the same calls in the same order, as with NCCL collectives.
+- The dist queues each step on the current stream and orders nothing across streams. TorchRec's training loop and train pipelines order its steps; a training loop of your own must order them the same way ([docs/hier_output_dist.md](./docs/hier_output_dist.md), sections 4.2 and 16).
 
 Design, capacities, configuration, environment variables and fallbacks: [docs/hier_output_dist.md](./docs/hier_output_dist.md). Benchmark: [benchmark/README.md](./benchmark/README.md), section 3.
 
