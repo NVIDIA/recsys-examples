@@ -294,7 +294,16 @@ class TransformerInferLayer(nn.Module):
             )
             handle = metadata.kv_onload_handle
             if not self._export_mode and handle is not None:
-                handle.stream_wait_layer(self._layer_idx)
+                # As in PagedHSTUInferLayer: a layerwise FlexKV transfer is waited for
+                # per layer (stream_wait_layer skips FlexKV), other backends on the
+                # stream. Imported here so that this module only needs PyTorch.
+                from recsys_kvcache_manager.host_kvstorage_manager import HostKVBackend
+
+                if handle.backend == HostKVBackend.FLEXKV:
+                    if handle.is_layerwise:
+                        handle.wait_layer(self._layer_idx)
+                else:
+                    handle.stream_wait_layer(self._layer_idx)
             cache = dict(
                 cache_table=table,
                 page_ids=metadata.kv_indices,

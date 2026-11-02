@@ -223,6 +223,38 @@ def test_split_layer_uses_refreshed_manager_metadata():
         torch.testing.assert_close(actual, expected)
 
 
+@pytest.mark.parametrize(
+    "backend,layerwise,waits",
+    [
+        ("flexkv", True, ["wait_layer"]),
+        ("flexkv", False, []),
+        ("native", True, ["stream_wait_layer"]),
+    ],
+)
+def test_layer_waits_for_kv_onload_like_hstu_layer(backend, layerwise, waits):
+    """The layer waits for its KV pages with the same per-backend calls as HSTU."""
+    from recsys_kvcache_manager.host_kvstorage_manager import HostKVBackend
+
+    calls = []
+    handle = SimpleNamespace(
+        backend=HostKVBackend(backend),
+        is_layerwise=layerwise,
+        wait_layer=lambda layer_idx: calls.append(("wait_layer", layer_idx)),
+        stream_wait_layer=lambda layer_idx: calls.append(
+            ("stream_wait_layer", layer_idx)
+        ),
+    )
+    layer = TransformerInferLayer(
+        config(hidden_size=64, head_dim=64, fp16=True), 0, "cpu"
+    )
+    metadata = manager_metadata([2, 2], [3, 4], [1, 2])
+    metadata.kv_onload_handle = handle
+    layer.forward_naive(
+        2, 7, torch.randn(7, 64, dtype=torch.float16), jagged([3, 4], [1, 2]), metadata
+    )
+    assert calls == [(name, 0) for name in waits]
+
+
 @pytest.mark.parametrize("seed", range(8))
 @pytest.mark.parametrize("page_size", [1, 4, 8])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
