@@ -119,9 +119,9 @@ this dist with TorchRec's dists.
   backward's (`BwdPlan`): the requester's maps and the call's tables.
 * **Comm kernel**: one of the input dist's seven custom kernels, each of
   which moves data between GPUs or waits for peers (section 10.2).
-  **Planner**: the input dist's other steps, which lay a call out: tensor
-  ops of ATen (PyTorch's C++ library) and the radix sort of CUB (NVIDIA's
-  library of GPU algorithms), called from C++ (section 10).
+  **Planner**: the input dist's other steps, which lay a call out: kernels
+  of its own, and the radix sorts and scans of CUB (NVIDIA's library of GPU
+  algorithms), called from C++ (section 10).
 * **Capacity**: how many keys a part of the op's buffers holds, fixed when
   the op is built: `lookup_keys` and `remote_keys` (section 5). **Need**:
   how many a call needs, the most of any rank.
@@ -626,29 +626,29 @@ pipelines the input dist (part 1 and both waits) runs on the pipeline's
 data_dist stream (section 16).
 
 The first wait queues these steps, in this order, on every rank. A *comm*
-step is a comm kernel (section 10.2); the others are the planner's ATen ops
-and CUB sorts.
+step is a comm kernel (section 10.2); the others are the planner's kernels,
+with CUB's sorts and scans.
 
 | step | kind | what it does | section |
 |---|---|---|---|
-| count vector | ATen | this rank's keys for each GPU of its node | 10.3 |
+| count vector | kernel | this rank's keys for each GPU of its node | 10.3 |
 | `node_count_exchange` | comm | the node barrier, and the node's count vectors summed as this rank needs them | 10.2 |
-| node layout | ATen | where each rank of the node pushes its keys; the node's needs | 10.3 |
+| node layout | kernel | where each rank of the node pushes its keys; the node's needs | 10.3 |
 | `node_key_push` | comm | this rank's keys into its targets' `node_keys` over NVLink | 10.2 |
 | `node_done` | comm | tells its targets; waits until every requester of the node told it | 10.2 |
-| owner's KJT (one node) | ATen | a copy of the own part of `node_keys`, and the requester's map | 10.3 |
-| node dedup | ATen, CUB | the proxy's node-unique keys, rows, rounds and slots | 9, 10.4 |
-| push order | ATen, CUB | its requesters' push orders and push tables, and its reducer list | 10.4 |
-| count message | ATen | what this rank's rail peers must know of it | 10.4 |
+| owner's KJT (one node) | kernels | a copy of the own part of `node_keys`, and the requester's map | 10.3 |
+| node dedup | kernels, CUB | the proxy's node-unique keys, rows, rounds and slots | 9, 10.4 |
+| push order | kernels, CUB | its requesters' push orders and push tables, and its reducer list | 10.4 |
+| count message | kernel | what this rank's rail peers must know of it | 10.4 |
 | `rail_count_exchange` | comm | its count message to each rail peer, and theirs | 10.2 |
-| rail layout | ATen | where each proxy's key records land, this owner's KJT layout, and where each proxy's cells start in it | 10.4 |
+| rail layout | kernel | where each proxy's key records land, this owner's KJT layout, and where each proxy's cells start in it | 10.4 |
 | `rail_key_exchange` | comm | its key records to its rail owners and its cell starts to its rail proxies, and theirs | 10.2 |
 | `node_status_exchange` | comm | the needs and cell starts of the node; the call's needs | 10.2 |
-| `peer_gather`, twice | comm (and ATen) | the node's proxy headers, then the requester's gather list and its rows' `remote_map` words | 10.2, 10.4 |
-| requester tables | ATen | its maps, push order, heavy groups and task starts | 10.4 |
-| owner tables | ATen | its KJT's keys, and the round pieces its forward put list sends | 10.4 |
-| put lists | ATen | the owner's forward and the proxy's backward put lists, and the IB chunks | 10.4 |
-| status | ATen | the call's status, which the second wait copies to the host | 10.5 |
+| `peer_gather`, twice | comm (and a kernel) | the node's proxy headers, then the requester's gather list and its rows' `remote_map` words | 10.2, 10.4 |
+| requester tables | kernels, CUB | its maps, push order, heavy groups and task starts | 10.4 |
+| owner tables | kernels | its KJT's keys, and the round pieces its forward put list sends | 10.4 |
+| put lists | kernels, CUB | the owner's forward and the proxy's backward put lists, and the IB chunks | 10.4 |
+| status | kernel | the call's status, which the second wait copies to the host | 10.5 |
 
 One node runs the first five steps, the owner's KJT and the status; across
 nodes every step runs but the owner's KJT.
@@ -915,20 +915,26 @@ four. In the backward GPU 3 pushes its gradient rows into GPU 2's
 ## 10. The input dist's steps
 
 Part 1 and the first wait's steps run on the caller's stream, in the order of
-section 7.3. Seven of them are custom kernels, the comm kernels (section
-10.2). The planner does the rest (`src/hier_output_dist/input_dist/planner.h`): ATen ops
-and CUB sorts on the current stream, on tensors whose sizes the host knows
-from the call's keys, the capacities and the topology. The counts that only
-the device knows (valid keys, node-unique keys, rounds) stay on the device,
-and no tensor's size depends on them. So the host reads no device value
-before the second wait, and no step syncs. Entries past the valid ones hold
-values that no one reads, and an index taken from device data is clamped
-first: a call that does not fit runs every step on what arrived and stays in
-bounds.
+section 7.3. Seven of them are the comm kernels (section 10.2). The planner
+does the rest (`src/hier_output_dist/input_dist/planner.h`): kernels of its
+own and CUB's radix sorts and scans, on the current stream. Each step is one
+or a few ordinary kernels. A kernel over items (keys, rows, occurrences)
+runs a thread per item; a kernel over a step's small tables (sized by the
+nodes, ranks, features and rounds) runs on one CTA, which loops over them.
+No kernel waits for another CTA: a step that needs every item done goes on
+in its next kernel. The tensors' sizes are what the host knows from the
+call's keys, the capacities and the topology. The counts that only the
+device knows (valid keys, node-unique keys, rounds) stay on the device, and
+no tensor's size depends on them; a kernel reads such a count to bound its
+own loop. So the host reads no device value before the second wait, and no
+step syncs. Entries past the valid ones hold values that no one reads, and
+an index taken from device data is clamped first: a call that does not fit
+runs every step on what arrived and stays in bounds.
 
 With the benchmark's configuration (8 features, one owner rule), part 1
-queues about 28 kernels and copies per call (79 with index dedup), and the
-first wait about 36 on one node and about 835 across nodes.
+queues 11 kernels and copies per call (39 with index dedup, DynamicEmb's own
+dedup included), and the first wait 9 on one node and about 120 across
+nodes, CUB's included.
 
 ### 10.1 Part 1 (requester, caller's stream, local)
 
@@ -1405,9 +1411,9 @@ the op.
   before the put.
 * **The in channel.** What peers wrote is read only after an acquire of
   their flag or signal. The comm kernel that acquired it reads past the L1
-  cache, and so do the gathers later on the stream; the planner's ATen ops
+  cache, and so do the gathers later on the stream; the planner's kernels
   read with plain loads. What this rank writes for its peers, with its
-  own stores or with the planner's ATen ops earlier on the stream, comes
+  own stores or with the planner's kernels earlier on the stream, comes
   before the flag it releases or the put it makes. In
   `node_count_exchange` the release of `in_started` after the CTA's barrier
   orders it. Everywhere else a system fence does: each CTA of the push ends
@@ -1741,9 +1747,9 @@ run them, and `test/unit_test.sh` runs those.
   pool of the input dist's stream keeps the largest step's working memory,
   and the hottest owner's need sizes `lookup_keys` on every rank (section
   15).
-* **Host time of the input dist**: across nodes the launches of a first
-  wait (section 10) take about 7 ms of host time on the benchmark's nodes.
-  The training thread spends it, also under the train pipelines.
+* **Host time of the input dist**: across nodes a first wait launches
+  about 120 kernels, CUB's included (section 10), and the training thread
+  spends their host time, also under the train pipelines.
 * **Size of one call**: a GPU may receive, deduplicate or look up fewer than
   about 2.1 billion keys of each kind in one call (section 4.3).
 * **Views**: a lookup output is a view of `lookup_rows`, valid until the
@@ -1827,11 +1833,12 @@ Paths from `corelib/dynamicemb`.
       `BwdPlanView`);
     * `comm_kernels.cu`: the comm kernels, and the functions that launch
       them;
-    * `planner.h`: the planner, ATen ops called from C++: the declarations of
-      every step, and small tensor helpers. Part 1 is in `part_one.cpp` and
-      the proxy in `proxy.cpp`; the node layout, the rail and the owner, the
-      requester and the put lists are in `planner.cpp`; `sort.cu` holds the
-      CUB radix sorts that part 1 and the proxy call;
+    * `planner.h`: the planner: the declarations of every step, and of the
+      CUB calls in `cub.cu` (radix sorts and scans); `planner.cuh`: what the
+      planner's kernels share (how they are launched, searches in sorted
+      tables, the starts of sorted runs, a CTA's scans). Part 1 is in
+      `part_one.cu` and the proxy in `proxy.cu`; the node layout, the rail
+      and the owner, the requester and the put lists are in `planner.cu`;
   * `output_dist/`, the output dist:
     * `output_dist.h`, `output_dist.cu`: the out channel (`OutChannel`),
       which launches the out kernels, and their trace (`Trace`).

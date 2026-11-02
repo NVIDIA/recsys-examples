@@ -165,6 +165,24 @@ def same_parity_job(case: Case, generator) -> List[Tuple]:
     return job
 
 
+def wide_node_job(case: Case, generator) -> List[Tuple]:
+    """More GPUs per node than kHeavy: every requester of node 0 asks owner
+    (node 1, 0) for key 7 once, so its proxy's one heavy key has fewer
+    occurrences (local_size) than reducer entries (1 + local_size)."""
+    cells = case.world_size * case.num_features
+    job = []
+    for rank in range(case.world_size):
+        counts = torch.zeros(cells, dtype=torch.int64)
+        keys = []
+        if rank < case.local_size:  # node 0's requesters
+            counts[case.local_size * case.num_features] = 1  # owner (node 1, 0)
+            keys = [7]
+        job.append(
+            (counts, torch.tensor(keys, dtype=torch.int64), torch.ones(len(keys)))
+        )
+    return job
+
+
 CASES = [
     Case("uniform"),
     Case("hot keys: heavy", max_block=40, key_range=30, hot=0.5),
@@ -336,6 +354,15 @@ CASES = [
         max_block=2,
         key_range=30,
         hot=0.3,
+        seeds=1,
+    ),
+    Case(
+        "2 nodes of 72, a heavy key of fewer occurrences than entries",
+        num_nodes=2,
+        local_size=72,
+        tables=(0,),
+        remote_slack=0,
+        job=wide_node_job,
         seeds=1,
     ),
 ]

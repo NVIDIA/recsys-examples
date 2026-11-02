@@ -14,10 +14,12 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 # See the License for the specific language governing permissions and
 # limitations under the License.
 ******************************************************************************/
-// The planner: the steps of a call between and around the comm kernels,
-// ATen ops and CUB sorts on the current stream, none of which waits for the
+// The planner: the steps of a call between and around the comm kernels, on
+// the current stream: kernels of their own (what they share: planner.cuh)
+// and CUB's radix sorts and scans (cub.cu), none of which waits for the
 // device. Part 1, the node layout, the proxy, the rail and the owner, the
-// requester, and the put lists.
+// requester, and the put lists. Every table of a step is sized by the op's
+// sizes (Sizes, from its configuration: config.h), never by a device value.
 #pragma once
 
 #include <ATen/ATen.h>
@@ -34,47 +36,23 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 namespace dyn_emb {
 namespace hier_output_dist {
 
-// Small helpers of the planner's steps: ATen ops on the current
-// stream, none of which waits for the device. Every table of a step is sized
-// by the op's sizes (Sizes, from its configuration: config.h), never by
-// a device value. config.h brings bits_for and the constants, after the
-// CUDA headers a host compiler needs for them.
-
-// The ends of n counts, [0, c0, c0 + c1, ...]: n + 1 entries, int64 (or
-// int32 when their sum stays below 2^31).
-inline at::Tensor exclusive_ends(const at::Tensor &counts, at::ScalarType dtype = at::kLong) {
-  return at::cat({at::zeros({1}, counts.options().dtype(dtype)), counts.cumsum(0, dtype)});
-}
-
-// value / divisor rounded up, for values of at least 0. (On an integer tensor
-// `/` divides exactly and gives floating point.)
-inline at::Tensor ceil_div(const at::Tensor &value, int64_t divisor) {
-  return (value + (divisor - 1)).div(divisor, "floor");
-}
-inline at::Tensor ceil_div(const at::Tensor &value, const at::Tensor &divisor) {
-  return (value + divisor - 1).div(divisor, "floor");
-}
-
-// Where each entry of a permutation of [0, n) is: result[permutation[i]] = i,
-// in the permutation's dtype.
-inline at::Tensor inverse_permutation(const at::Tensor &permutation) {
-  return at::empty_like(permutation)
-      .scatter_(0, permutation.to(at::kLong),
-                at::arange(permutation.numel(), permutation.options()));
-}
-
-// The planner's one sort: cub's radix sort of keys that carry int32 values.
+// The planner's CUB calls (cub.cu), on the current stream.
 
 // A stable sort of `keys` (int32 or int64, contiguous) by their bits
-// [0, end_bit), which carries `values` (int32, one per key), on the current
-// stream: the sorted keys, and the values in their order. With end_bit below
-// the keys' width the keys must not be negative.
+// [0, end_bit), which carries `values` (int32, one per key): the sorted keys,
+// and the values in their order. With end_bit below the keys' width the keys
+// must not be negative.
 std::pair<at::Tensor, at::Tensor> sort_pairs(const at::Tensor &keys, const at::Tensor &values,
                                              int end_bit);
+// A sort of int64 keys (not negative) by their bits [0, end_bit).
+at::Tensor sort_keys(const at::Tensor &keys, int end_bit);
+// The ends of n counts (bool, int32 or int64), [0, c0, c0 + c1, ...]: n + 1
+// entries, int64 (or int32 when their sum stays below 2^31).
+at::Tensor exclusive_ends(const at::Tensor &counts, at::ScalarType dtype = at::kLong);
 
 // Part 1 of a call (the requester's, local, on the caller's stream): its keys
 // partitioned by owner, and under index dedup the fan-out of its
-// deduplicated rows. ATen ops and one cub sort; nothing waits for the device.
+// deduplicated rows: kernels and a CUB sort each (part_one.cu).
 
 // The keys of a call as part 1 takes them: the KJT the input dist was given
 // and what construct_jagged_tensors reads. Under index dedup the KJT holds
@@ -137,7 +115,7 @@ FanoutTables fanout_tables(const at::Tensor &reverse_indices, const at::Tensor &
 // The node's part of a call (the in channel): this rank's
 // counts for its node, the layout every rank of the node computes alike from
 // the counts the node exchanged, and on one node the owner's KJT and the
-// requester's map. ATen ops; nothing waits for the device.
+// requester's map (planner.cu).
 //
 // node_keys of a target holds its own part at [0, lookup_keys), the keys of
 // its node for the target as owner, in the owner's KJT order
@@ -210,8 +188,8 @@ OneNodeOwner one_node_owner(const NodeLayout &node, const at::Tensor &row_cell,
 // into node-unique keys, lays their rows out in proxy_rows by rounds, and
 // writes what its node's requesters and its rail's owners read of it into its
 // buffers of the window: remote_map, key_stage and the proxy header
-// (window.h). Three steps, each taking the tables of the ones before;
-// ATen ops and cub sorts, nothing waits for the device.
+// (window.h). Three steps, each taking the tables of the ones before
+// (proxy.cu).
 //
 // The occurrences are the entries of the remote part (occurrence index occ).
 // A node-unique key is an identity (owner node, table, key), or each
@@ -327,8 +305,9 @@ struct ProxyPlan {
                                 // end at num_rounds and past it)
   at::Tensor reducer_start;     // int32 [remote_keys + 1]: key u's entries are
                                 // reducer_entries[reducer_start[u] .. reducer_start[u + 1])
-  at::Tensor reducer_entries;   // int64 [remote_keys]: a slot and the flag of the push task
-                                // that fills it (common.h)
+  at::Tensor reducer_entries;   // int64: a slot and the flag of the push task that fills it
+                                // (common.h); remote_keys of them, more with more GPUs per
+                                // node than kHeavy (a heavy key takes 1 + local_size)
 };
 // Step 3: each requester's push order (one stable sort of the push key),
 // its push tables, and the reducer list. Writes remote_map's positions and
@@ -342,8 +321,8 @@ ProxyPlan proxy_push_order(ProxyKeys keys, ProxyRounds rounds, const at::Tensor 
 // computes as proxy where its key records land at each owner, and as owner
 // its KJT and where each proxy's cells start in it, which it sends back to
 // that proxy. Then the needs and cell starts a rank publishes to its node,
-// and the owner's tables: its KJT's keys and what its forward put list sends.
-// ATen ops; nothing waits for the device.
+// and the owner's tables: its KJT's keys and what its forward put list sends
+// (planner.cu).
 //
 // An owner's KJT has num_sources = local_size + num_nodes - 1 cells per
 // feature, feature-major: its node's requesters, then the other nodes in
@@ -401,10 +380,6 @@ RailLayout rail_layout(const at::Tensor &messages, const at::Tensor &own_cells,
 // What this rank publishes to its node (int64 [3 + local_size *
 // num_features]): its rail's needs, then my_cell_starts.
 at::Tensor status_publish(const RailLayout &rail);
-// The call's needs (int64 [3]) from its node's publish vectors (peer_needs,
-// int64 [local_size][3]): a rank's rail covers every node, and its node holds
-// a rank of every rail, so the most of the node is the most of all ranks.
-at::Tensor agreed_needs(const at::Tensor &peer_needs);
 
 // The owner's tables, once the rail's proxies put their records into its
 // rail_keys (int64 view) and its node's requesters their keys into the own
@@ -428,8 +403,7 @@ OwnerTables owner_tables(const RailLayout &rail, const at::Tensor &own_starts,
 // The requester's part of a call across nodes (the in channel): its maps to
 // the rows of its keys, from what its node's proxies published (two
 // peer_gathers: their headers, and its rows' words of their remote_map) and
-// where its owners on its node put its cells. ATen ops; nothing waits for
-// the device.
+// where its owners on its node put its cells (planner.cu).
 
 // What a peer_gather reads (GatherFrom says which words): for each item a
 // node peer (negative: none) and its first int32 word to read there.
@@ -485,7 +459,7 @@ RequesterTables requester_tables(const at::Tensor &words, const at::Tensor &head
 // rows of its node-unique keys to their owners; the owner's forward list
 // sends its rows to the proxies that asked for them. Each cuts a node's keys
 // at its IB chunks and at its feature cells, so that a segment lies in one
-// chunk and one cell. ATen ops; nothing waits for the device.
+// chunk and one cell (planner.cu).
 
 // The most IB chunks of a list's pieces, for at most `keys` keys in all: a
 // piece of k keys takes ceil(k / chunk_rows), and a list has rounds_cap *

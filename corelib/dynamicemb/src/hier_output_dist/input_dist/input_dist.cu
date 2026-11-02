@@ -22,6 +22,7 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 #include <algorithm>
 
 #include "hier_output_dist/input_dist/input_dist.h"
+#include "hier_output_dist/input_dist/planner.cuh"
 
 namespace dyn_emb {
 namespace hier_output_dist {
@@ -33,6 +34,40 @@ OwnerRules owner_rules(const Config &config) {
   const at::Tensor codes = config.dist_types.to(at::kCPU, at::kInt).contiguous();
   return OwnerRules{config.dist_types, config.block_sizes,
                     std::vector<int>(codes.data_ptr<int>(), codes.data_ptr<int>() + codes.numel())};
+}
+
+// One CTA: the call's status (StatusSlots), which wait() copies to the host.
+// Its needs: across nodes the most of the node's (peer_needs, each rank's of
+// its rail, kNumNeeds each): a rank's rail covers every node, and its node
+// holds a rank of every rail, so the most of the node is the most of all
+// ranks. On one node its lookup need alone. heavy_subs and group_subs:
+// nullptr when there are none.
+__global__ void __launch_bounds__(kThreads)
+    call_status_kernel(const int64_t *peer_needs, int64_t local_size, const int64_t *need_lookup,
+                       const int64_t *num_recv, const int64_t *heavy_subs,
+                       const int64_t *group_subs, const int64_t *sent,
+                       const int64_t *length_per_key, const int64_t *input_length_per_key,
+                       int64_t num_features, int64_t *status) {
+  const int tid = threadIdx.x;
+  if (tid < kNumNeeds) {
+    int64_t need = 0;
+    if (peer_needs != nullptr)
+      for (int64_t peer = 0; peer < local_size; ++peer)
+        need = max(need, peer_needs[peer * kNumNeeds + tid]);
+    else if (tid == kNeedLookupKeys)
+      need = *need_lookup;
+    status[kStatusNeed + tid] = need;
+  }
+  if (tid == 0) {
+    status[kStatusNumRecv] = *num_recv;
+    status[kStatusHeavySubs] = heavy_subs != nullptr ? *heavy_subs : 0;
+    status[kStatusGroupSubs] = group_subs != nullptr ? *group_subs : 0;
+    status[kStatusSent] = *sent;
+  }
+  for (int64_t feature = tid; feature < num_features; feature += kThreads) {
+    status[kStatusLengthPerKey + feature] = length_per_key[feature];
+    status[kStatusLengthPerKey + num_features + feature] = input_length_per_key[feature];
+  }
 }
 
 }  // namespace
@@ -126,7 +161,7 @@ Pending InChannel::start(const PartOne &one) {
   launch_node_key_push(channel_, part.keys, part.key_weights, part.row_cell, node.destination_base,
                        node.rows_to_push);
   launch_node_done(channel_, seq);
-  at::Tensor needs, num_recv, length_per_key, group_subs;
+  at::Tensor peer_needs, num_recv, length_per_key, group_subs;
   if (num_nodes == 1) {
     // The own part of node_keys is the owner's KJT, and a row's place in its
     // owner's KJT is where it was pushed.
@@ -137,10 +172,8 @@ Pending InChannel::start(const PartOne &one) {
     pending.kjt_weights = owner.kjt_weights;
     pending.kjt_lengths = owner.kjt_lengths;
     pending.kjt_offsets = owner.kjt_offsets;
-    needs = at::cat({node.need_lookup.view({1}), at::zeros({2}, long_options)});
     num_recv = owner.num_recv;
     length_per_key = owner.length_per_key;
-    group_subs = at::zeros({}, long_options);
   } else {
     // The proxy: the node-unique keys of its remote part, their rows and
     // rounds, and its node's push orders (into remote_map, key_stage and
@@ -164,9 +197,9 @@ Pending InChannel::start(const PartOne &one) {
                              rail.put_skip);
     // The node again: the call's needs, where the node's owners hold this
     // requester's cells, and what the node's proxies published for it.
-    const auto [peer_needs, owner_cell_start] =
+    at::Tensor owner_cell_start;
+    std::tie(peer_needs, owner_cell_start) =
         launch_node_status_exchange(channel_, seq, status_publish(rail));
-    needs = agreed_needs(peer_needs);
     const at::Tensor headers = launch_peer_gather(channel_, kGatherProxyHeader, header_gather_.peer,
                                                   header_gather_.first_word)
                                    .view({local_size, ProxyHeader::of(sizes_).gathered_words()});
@@ -219,11 +252,15 @@ Pending InChannel::start(const PartOne &one) {
     group_subs = requester.group_subs;
   }
   // The status, which wait() reads.
-  const at::Tensor heavy_subs =
-      index_dedup ? one.fanout.count.narrow(0, 1, 1) : at::zeros({1}, long_options);
-  pending.status = at::cat({needs, num_recv.view({1}), heavy_subs, group_subs.view({1}),
-                            part.block_start.narrow(0, topo.world_size, 1), length_per_key,
-                            part.input_length_per_key});
+  pending.status = at::empty({status_words(num_features)}, long_options);
+  call_status_kernel<<<kOneCta, kThreads, 0, current_stream()>>>(
+      data_or_null<int64_t>(peer_needs), local_size, node.need_lookup.data_ptr<int64_t>(),
+      num_recv.data_ptr<int64_t>(),
+      index_dedup ? one.fanout.count.data_ptr<int64_t>() + 1 : nullptr,
+      data_or_null<int64_t>(group_subs), part.block_start.data_ptr<int64_t>() + topo.world_size,
+      length_per_key.data_ptr<int64_t>(), part.input_length_per_key.data_ptr<int64_t>(),
+      num_features, pending.status.data_ptr<int64_t>());
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
   return pending;
 }
 
