@@ -1094,15 +1094,19 @@ def get_group_value_bytes_by_tier(
 ) -> Tuple[int, int]:
     """What one rank spends on a set of tables the runtime will fuse, as ``(hbm, host)``.
 
-    The runtime decides per **grouped module**, not per table:
+    The runtime chooses the layout per **grouped module**, not per table:
     ``BatchedDynamicEmbeddingTablesV2._create_cache_storage`` sums both the
-    tables' bytes and their ``local_hbm_for_values`` and takes one
-    HBM-or-host decision for the sum. That is not the same as deciding for each
-    table and adding up, because a table whose budget exceeds its size lends the
-    remainder to its groupmates: ``sum(min(total, budget))`` is at most
+    tables' bytes and their ``local_hbm_for_values``, and a group whose rows fit
+    the summed budget is HBM_ONLY. There a table whose budget exceeds its size
+    covers its groupmates: ``sum(min(total, budget))`` is at most
     ``min(sum total, sum budget)``, so counting per table **under-states HBM**
     and over-states host. Under-stating HBM is the unsafe direction -- the
     planner would believe there is room it will not find.
+
+    A group that does not fit splits each table on its own budget: table *i*
+    keeps ``min(total_i, budget_i)`` of its bytes in HBM, and a spare budget is
+    not lent to the others. Charging the summed budget there would over-state
+    HBM by the spare and under-state the host tier by as much.
 
     ``caching`` and ``external_storage`` are both part of the grouping key
     (``DynamicEmbTableOptions.get_grouped_key``), so every member of a real
@@ -1129,21 +1133,28 @@ def get_group_value_bytes_by_tier(
 
     total = 0
     hbm_budget = 0
+    # What the tables keep in HBM when the group does not fit: each its own
+    # budget, up to its own size.
+    hbm_kept = 0
     for options, optimizer_type in members:
-        hbm_budget += options.local_hbm_for_values
+        budget = options.local_hbm_for_values
+        hbm_budget += budget
         dim = options.dim
         dtype = options.embedding_dtype
         if not dim or dtype is None or not options.max_capacity:
             # Nothing to size from: count it as filling its own budget, so a
             # lone unsized table still reports (budget, 0).
-            total += options.local_hbm_for_values
+            total += budget
+            hbm_kept += budget
             continue
         state_dim = (
             get_optimizer_state_dim(optimizer_type, dim, dtype)
             if optimizer_type is not None
             else 0
         )
-        total += options.max_capacity * DTYPE_NUM_BYTES[dtype] * (dim + state_dim)
+        table_bytes = options.max_capacity * DTYPE_NUM_BYTES[dtype] * (dim + state_dim)
+        total += table_bytes
+        hbm_kept += min(table_bytes, budget)
 
     first = members[0][0]
     caching = first.caching
@@ -1157,10 +1168,10 @@ def get_group_value_bytes_by_tier(
     # a 20 GiB budget cost 20 + 4 where the runtime spends 4 and nothing.
     if total > hbm_budget:
         if caching:
-            return hbm_budget, 0 if external else total
+            return hbm_kept, 0 if external else total
         if external and hbm_budget <= 0:
             return 0, 0
-        return hbm_budget, total - hbm_budget
+        return hbm_kept, total - hbm_kept
     return total, 0
 
 
