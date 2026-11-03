@@ -172,6 +172,10 @@ def _cuda_tensor(torch, shape, dtype, layout):
         return torch.randn(*rows, head_dim + 1, device="cuda", dtype=dtype)[
             ..., :head_dim
         ]
+    if layout == "overlapping_rows":
+        return torch.randn(*rows[:-1], 1, head_dim, device="cuda", dtype=dtype).expand(
+            shape
+        )
     if layout == "padded_head_dim":
         return torch.randn(*rows, 16, device="cuda", dtype=dtype)[..., :head_dim]
     return torch.randn(shape, device="cuda", dtype=dtype)
@@ -253,9 +257,10 @@ def test_cuda_beam_kv_write_selects_vectorized_scalar_or_pytorch_copy(
     assert torch.equal(beam_v, expected_v)
 
 
-def test_cuda_beam_kv_write_vectorized_only_writes_nothing_it_cannot_vectorize() -> (
-    None
-):
+@pytest.mark.parametrize("layout", ["unaligned_rows", "overlapping_rows"])
+def test_cuda_beam_kv_write_vectorized_only_writes_nothing_it_cannot_vectorize(
+    layout,
+) -> None:
     if importlib.util.find_spec("torch") is None:
         pytest.skip("torch is not installed")
 
@@ -269,9 +274,9 @@ def test_cuda_beam_kv_write_vectorized_only_writes_nothing_it_cannot_vectorize()
     if qwen3._cuda_extension() is None:
         pytest.skip("gr_trtllm CUDA extension is not available")
 
-    beam_k = _cuda_tensor(torch, (2, 2, 3, 4, 2, 16), torch.bfloat16, "unaligned_rows")
-    beam_v = _cuda_tensor(torch, (2, 2, 3, 4, 2, 16), torch.bfloat16, "unaligned_rows")
-    k_step = _cuda_tensor(torch, (2, 3, 2, 16), torch.bfloat16, "unaligned_rows")
+    beam_k = _cuda_tensor(torch, (2, 2, 3, 4, 2, 16), torch.bfloat16, layout)
+    beam_v = _cuda_tensor(torch, (2, 2, 3, 4, 2, 16), torch.bfloat16, layout)
+    k_step = _cuda_tensor(torch, (2, 3, 2, 16), torch.bfloat16, layout)
     before_k, before_v = beam_k.clone(), beam_v.clone()
 
     written = qwen3.write_beam_kv_step(

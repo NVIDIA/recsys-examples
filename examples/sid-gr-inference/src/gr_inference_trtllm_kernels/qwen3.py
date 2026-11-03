@@ -710,6 +710,7 @@ void write_packed_qkv_prefill_kv_cuda(
 
 _CUDA_SOURCE = r"""
 #include <ATen/ATen.h>
+#include <ATen/MemoryOverlap.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAException.h>
 #include <c10/cuda/CUDAGuard.h>
@@ -1062,6 +1063,11 @@ inline bool launch_write_beam_kv_step_vec(
       if (t->stride(d) % vec != 0) {
         return false;
       }
+    }
+  }
+  for (const torch::Tensor* t : {&beam_key, &beam_value}) {
+    if (at::has_internal_overlap(*t) == at::MemOverlap::Yes) {
+      return false;
     }
   }
   int64_t beam_vecs = k.size(2) * head_dim / vec;
