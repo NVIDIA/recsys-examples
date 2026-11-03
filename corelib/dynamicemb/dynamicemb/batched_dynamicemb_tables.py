@@ -61,6 +61,7 @@ from dynamicemb.dynamicemb_config import (
     EvictedItemMode,
     ReplayContent,
     get_eviction_score_strategy,
+    get_physical_score_order,
     get_score_part,
     has_no_eviction,
     score_strategy_has_timestamp_column,
@@ -1566,26 +1567,19 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
         """The tables an erase by ``score_strategy`` would scan, after checking that it can.
 
         A table is scanned when its score strategy has ``score_strategy`` as a member
-        (``(NO_EVICTION, CUSTOMIZED)`` has ``CUSTOMIZED``); one with no score, which
-        is ``NO_EVICTION`` alone, is not. Raises if a table that would be scanned
-        cannot be: it keeps more than one score word, or its storage cannot be
-        scanned. Nothing to scan is an empty list, not an error.
+        (``(NO_EVICTION, CUSTOMIZED)`` has ``CUSTOMIZED``, and ``(TIMESTAMP, LFU)`` has
+        both ``TIMESTAMP`` and ``LFU``); one with no score, which is ``NO_EVICTION``
+        alone, is not. Raises if a table that would be scanned cannot be: its storage
+        cannot be scanned. Nothing to scan is an empty list, not an error.
         """
         table_ids = []
-        for table_id, (name, option) in enumerate(
-            zip(self._table_names, self._dynamicemb_options)
-        ):
+        for table_id, option in enumerate(self._dynamicemb_options):
             part = get_score_part(option.score_strategy)
             if part is None:
                 continue
-            if isinstance(part, tuple):
-                if score_strategy in part:
-                    raise NotImplementedError(
-                        f"Table '{name}' keeps one score word per strategy in "
-                        f"{option.score_strategy}; erase by score reads one."
-                    )
-                continue
-            if part == score_strategy:
+            if part == score_strategy or (
+                isinstance(part, tuple) and score_strategy in part
+            ):
                 table_ids.append(table_id)
         if table_ids and self._storage_layout not in self._ERASABLE_LAYOUTS:
             raise NotImplementedError(
@@ -1594,6 +1588,19 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                 f"is {self._storage_layout.name}."
             )
         return table_ids
+
+    def erase_score_word(
+        self, score_strategy: DynamicEmbScoreStrategy, table_ids: Sequence[int]
+    ) -> Optional[int]:
+        """The score word an erase by ``score_strategy`` compares in ``table_ids``:
+        ``None`` for tables that keep one, else the place of ``score_strategy`` in their
+        physical layout, whatever the tuple order (``TIMESTAMP`` is word 0 and ``LFU``
+        word 1 of a ``(TIMESTAMP, LFU)`` table)."""
+        # The tables of a module share one key map, so one score layout.
+        part = get_score_part(self._dynamicemb_options[table_ids[0]].score_strategy)
+        if not isinstance(part, tuple):
+            return None
+        return get_physical_score_order(part).index(score_strategy)
 
     def erase_by_score_async(
         self,
@@ -1607,9 +1614,10 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
 
         Only tables whose score strategy has ``score_strategy`` as a member are
         scanned (see :meth:`erasable_table_ids`); with none, the handle is done at
-        once and says ``(0, 0)``. The scan runs on a thread of its own and launches on
-        ``stream``, a stream of the tables' device; the call returns at once. Without a
-        ``stream`` this one uses a stream of its own, made on first use and kept, and the
+        once and says ``(0, 0)``. In a ``(TIMESTAMP, LFU)`` table the word compared is
+        the one ``score_strategy`` names (:meth:`erase_score_word`). The scan runs on a
+        thread of its own and launches on ``stream``, a stream of the tables' device; the
+        call returns at once. Without a ``stream`` this one uses a stream of its own, made on first use and kept, and the
         scan overlaps the training. On the stream the training runs on, or the prefetch
         stream, it is queued among the training's kernels and runs correctly, only
         without overlap, which is warned about. Work the training already queued is not
@@ -1656,12 +1664,14 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                     UserWarning,
                     stacklevel=2,
                 )
+        score_word = self.erase_score_word(score_strategy, table_ids)
         storage, gate = self._storage, self._table_gate
         return self._eraser.submit(
             lambda counts: storage.erase_by_score(
                 threshold,
                 table_ids,
                 counts,
+                score_word=score_word,
                 chunk_slots=chunk_slots,
                 chunk_guard=gate,
                 max_in_flight=max_in_flight,

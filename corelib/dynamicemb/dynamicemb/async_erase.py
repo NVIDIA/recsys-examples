@@ -385,9 +385,14 @@ def erase_by_score_async(
     from every dynamic embedding table of ``model`` that scores its keys by ``score_strategy``.
 
     A table qualifies when its score strategy has ``score_strategy`` as a member, so
-    ``CUSTOMIZED`` takes ``CUSTOMIZED`` and ``(NO_EVICTION, CUSTOMIZED)`` tables; a table
-    with no score (``NO_EVICTION`` alone) never does. With no table that qualifies the
-    call is not an error: the handle is done at once and its result is ``(0, 0)``.
+    ``CUSTOMIZED`` takes ``CUSTOMIZED`` and ``(NO_EVICTION, CUSTOMIZED)`` tables, and both
+    ``TIMESTAMP`` and ``LFU`` take ``(TIMESTAMP, LFU)`` tables; a table with no score
+    (``NO_EVICTION`` alone) never does. With no table that qualifies the call is not an
+    error: the handle is done at once and its result is ``(0, 0)``.
+
+    A ``(TIMESTAMP, LFU)`` table keeps two score words, its last-access timestamp and its
+    frequency; ``score_strategy`` says which one is compared (either tuple order), the
+    other is not looked at, and an erased key loses both.
 
     Parameters
     ----------
@@ -398,7 +403,10 @@ def erase_by_score_async(
         unit of that score. For ``TIMESTAMP`` take it from
         ``dynamicemb_extensions.device_timestamp()``; for ``(NO_EVICTION, CUSTOMIZED)`` and
         ``(NO_EVICTION, PRECISE_CUSTOMIZED)`` tables, the scores of live keys must be at
-        least 1, because an erased slot is cleared to 0.
+        least 1, because an erased slot is cleared to 0. For ``LFU`` the score is the raw
+        access count, which never decays (a ``score_function`` only changes how evictions
+        rank), and a key just admitted has a small one: an erase by ``LFU`` alone also
+        removes the keys that came in recently.
     threshold : int
         A key is erased when its score is *strictly below* it. In ``[0, 2**64)``.
     stream : torch.cuda.Stream, optional
