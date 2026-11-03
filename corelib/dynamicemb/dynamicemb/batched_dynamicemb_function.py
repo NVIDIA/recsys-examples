@@ -24,6 +24,7 @@ from dynamicemb.key_value_table import (
     Cache,
     DynamicEmbCache,
     DynamicEmbStorage,
+    DynamicEmbTableState,
     Storage,
     _append_evicted,
     _find_keys,
@@ -193,6 +194,27 @@ class PrefetchState:
     non_admitted_positions: Optional[torch.Tensor] = None
     num_prefetched_keys: int = 0
     outstanding_keys_ref: Optional[torch.Tensor] = None
+    # The rehashes of the table state the slots were found in: a later
+    # prefetch may expand it before this batch's backward runs.
+    rehashes: int = 0
+
+
+def _slots_after_rehash(
+    state: DynamicEmbTableState,
+    unique_keys: torch.Tensor,
+    unique_table_ids: torch.Tensor,
+    slot_indices: torch.Tensor,
+) -> torch.Tensor:
+    """The slots of a batch's keys in ``state`` as it is now, for a batch
+    whose prefetch found them before a rehash moved them: the keys are looked
+    up again, read only (their ref counts kept them in the table). A key the
+    prefetch did not admit stays without a slot. Value rows do not move: a
+    storage keeps each key's row through a rehash, and a cache does not
+    rehash."""
+    slots = _find_keys(
+        state, unique_keys, unique_table_ids, const_lookup=True, return_slots=True
+    )[-1]
+    return torch.where(slot_indices >= 0, slots, slot_indices)
 
 
 def _is_hbm_storage(storage: Storage) -> bool:
@@ -829,6 +851,7 @@ def dynamicemb_prefetch(
         slot_indices = None
         non_admitted_positions = None
         value_row_indices = None
+        rehashes = 0
         if caching:
             storage_mode = StorageMode.CACHE
         elif _is_hbm_storage(storage):
@@ -886,6 +909,7 @@ def dynamicemb_prefetch(
                 lfu_accumulated_frequency,
                 admitter,
             )
+            rehashes = storage._state.rehashes
 
         return PrefetchState(
             unique_keys=unique_keys,
@@ -900,6 +924,7 @@ def dynamicemb_prefetch(
             num_prefetched_keys=num_prefetched_keys,
             outstanding_keys_ref=outstanding_keys_ref,
             value_row_indices=value_row_indices,
+            rehashes=rehashes,
         )
 
 
@@ -1238,6 +1263,7 @@ class DynamicEmbeddingFunction(torch.autograd.Function):
             # Same split as the forward: the fused optimizer writes into the
             # value buffer (rows), the ref counter is indexed by hash slot.
             ctx.update_value_rows = prefetch_state.value_row_indices
+            ctx.rehashes = prefetch_state.rehashes
             ctx.storage_mode = prefetch_state.storage_mode
             ctx.optimizer = optimizer
             ctx.layout = layout
@@ -1309,6 +1335,14 @@ class DynamicEmbeddingFunction(torch.autograd.Function):
                         if ctx.storage_mode == StorageMode.CACHE
                         else storage._state
                     )
+                    # A later batch's prefetch may have rehashed the table
+                    # since this one's prefetch (prefetch pipelines, several
+                    # forwards before their backwards).
+                    if ctx.rehashes != state.rehashes:
+                        ctx.slot_indices = _slots_after_rehash(
+                            state, ctx.unique_keys, unique_table_ids, ctx.slot_indices
+                        )
+                        ctx.rehashes = state.rehashes
                     with torch.cuda.nvtx.range("op:optimizer_update_fused"):
                         optimizer.fused_update_for_flat_table(
                             unique_grads.to(ctx.emb_dtype),

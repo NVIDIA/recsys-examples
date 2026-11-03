@@ -430,6 +430,9 @@ class DynamicEmbTableState:
     # CPU tensor of shape (num_tables,), used to avoid key_index_map.size() when not needed.
     estimated_table_sizes: Optional[torch.Tensor] = None
     collect_table_sizes_flag: bool = False
+    # Rehashes so far (_expand_tables_impl). Each one moves the keys of the
+    # tables it expands to other slots, so slots found before it are stale.
+    rehashes: int = 0
     # Name of the score column incremental_dump thresholds on. Equals
     # score_policy.name (for LruLfu this is the leading, timestamp, word).
     incremental_score_name: Optional[str] = None
@@ -699,7 +702,11 @@ def _expand_tables_impl(
     batch's values to dst_index (no key concatenation; load-then-store per batch avoids
     src/dst overlap). For tables that do not expand, key_index_map for that table is
     copied directly from the old key_index_map (copy_table_from). Updates key_index_map,
-    capacity (expansion does not change the key set). Mutates state."""
+    capacity (expansion does not change the key set). Mutates state.
+
+    Batches prefetched before the rehash whose backward has not run yet keep
+    their keys' ref counts, which move with the keys, but their slots go
+    stale: they look them up again (``state.rehashes`` counts the rehashes)."""
     base_opt = state.options_list[0]
     device = state.device
     enable_overflow = getattr(state.key_index_map, "enable_overflow_", False)
@@ -764,6 +771,13 @@ def _expand_tables_impl(
         if not tables_to_expand[table_id]:
             new_key_index_map.copy_table_from(old_key_index_map, table_id)
             continue
+        # The ref counters are flat over the tables: the counter of a table's
+        # slot is at its first bucket times the bucket capacity, plus the slot.
+        src_base, dst_base = [
+            int(key_map.table_bucket_offsets_cpu_[table_id].item())
+            * key_map.bucket_capacity_
+            for key_map in (old_key_index_map, new_key_index_map)
+        ]
         dst_values_list: List[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
         for (
             keys,
@@ -807,9 +821,9 @@ def _expand_tables_impl(
                 new_key_index_map.copy_score_blocks_from(
                     old_key_index_map, table_id, src_slots, dst_slots
                 )
-            new_key_index_map._ref_counter[dst_slots].copy_(
-                old_key_index_map._ref_counter[src_slots]
-            )
+            new_key_index_map._ref_counter[
+                dst_base + dst_slots
+            ] = old_key_index_map._ref_counter[src_base + src_slots]
 
             if not new_key_index_map.use_rows_:
                 # Value row == hash slot: the value has to follow its key.
@@ -827,6 +841,7 @@ def _expand_tables_impl(
     state.capacity = new_key_index_map.capacity()
     if new_key_index_map.use_rows_:
         new_key_index_map.set_row_limits([t.shape[0] for t in state.tables])
+    state.rehashes += 1
 
 
 def get_expand_info(
