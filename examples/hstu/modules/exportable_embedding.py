@@ -34,7 +34,10 @@ def _load_inference_emb_ops() -> bool:
     """Load `inference_emb_ops.so` once and return whether it succeeded."""
     global _ops_loaded, _ops_load_attempted
 
-    if _ops_loaded:
+    # The installed DynamicEmb binding may already own these schemas. Loading
+    # another copy from a build directory would register them twice.
+    if _ops_loaded or hasattr(torch.ops.INFERENCE_EMB, "table_lookup"):
+        _ops_loaded = True
         return True
     if _ops_load_attempted:
         return False
