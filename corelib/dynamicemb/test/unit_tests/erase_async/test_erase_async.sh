@@ -11,11 +11,16 @@ pytest -svv $DIR/test_erase_by_score.py \
              $DIR/test_storage_erase_by_score.py \
              $DIR/test_async_erase.py \
              $DIR/test_erase_api.py \
-             $DIR/test_erase_end_to_end.py \
-             $DIR/test_erase_stress.py
+             $DIR/test_erase_end_to_end.py
 
 # The call on a model TorchRec has sharded: a DistributedModelParallel, two ranks.
 CUDA_VISIBLE_DEVICES=0,1 torchrun \
   --nnodes 1 \
   --nproc_per_node 2 \
   $DIR/test_erase_distributed.py
+
+# The stress loop (erase every few steps, big batches) on a wrapped model, one rank.
+CUDA_VISIBLE_DEVICES=0 torchrun \
+  --nnodes 1 \
+  --nproc_per_node 1 \
+  $DIR/test_erase_stress.py

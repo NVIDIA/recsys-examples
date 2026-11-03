@@ -14,20 +14,29 @@
 # limitations under the License.
 
 """A training loop with an ``erase_by_score_async`` every few steps, at a size that is
-close to a real job: batches of ~64k keys, a table that grows to hold a million keys or
-more and is scanned in many chunks, and an erase that is still running when the next
-steps begin.
+close to a real job, on a model TorchRec has wrapped: a ``DistributedModelParallel`` around
+an ``EmbeddingCollection`` of dynamicemb tables, on ONE rank.
 
-The module is trained in one thread; the erases run on its worker. Nothing waits for an
-erase except the end. Every step checks that each key reads its own value (``train_step``),
-and when the loop is over the table is compared with a model kept on the host: the score
-of each key is the step that last trained it, so which keys the last erase had to remove,
-and which it had to leave, is known exactly.
+Run with ``torchrun --nproc_per_node 1``. Batches are ~64k keys, the tables grow to hold a
+million keys or more and are scanned in many chunks, and an erase is still running when
+the next steps begin. The keys go through the collection's forward -- input dist, lookup,
+output dist -- and the backward the wrapper runs, and the erase is the one a user makes,
+``erase_by_score_async(model, ...)``, which has to find the fused tables inside the wrapper.
+
+The model is trained in one thread; the erases run on each module's worker. Nothing waits
+for an erase except the end. Every step checks the output, and when the loop is over the
+tables are compared with a model kept on the host: the score of each key is the step that
+last trained it, so which keys the last erase had to remove, and which it had to leave,
+is known exactly.
+
+The tables start from a constant (``TABLE_INITIALIZER_VALUE``) and the learning rate is 0,
+so every key must read exactly that constant: a row a scan reclaimed and a step took before
+it was reset, or one that is not initialised, reads something else.
 
 What the workload does, per step ``s`` (a score is the step):
 
 * ``HOT`` keys, trained every step -- never below any threshold;
-* ``FRESH`` keys nobody has trained before, which make the table grow;
+* ``FRESH`` keys nobody has trained before, which make the tables grow;
 * revisits of keys introduced within the last ``WINDOW`` steps -- the live set;
 * a few ``STRAGGLERS`` from anywhere in the past, many of them below the threshold of an
   erase that is running or has run: an erase must either have removed them and the
@@ -41,14 +50,24 @@ the batch.
 """
 
 import os
+import sys
 import time
 
 import numpy as np
-import pytest
 import torch
-from dynamicemb import DynamicEmbScoreStrategy
+import torch.distributed as dist
+from dynamicemb import DynamicEmbScoreStrategy, EmbOptimType, erase_by_score_async
+from dynamicemb.dump_load import get_dynamic_emb_module
+from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 
-from helpers import build_de_table, found, size, train_step
+# test_embedding_dump_load is the fixture module the tests in unit_tests share, so it
+# stays a directory up and has to be put on the path from here.
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from test_embedding_dump_load import (  # noqa: E402
+    TABLE_INITIALIZER_VALUE,
+    create_model,
+    idx_to_name,
+)
 
 S = DynamicEmbScoreStrategy
 
@@ -62,8 +81,6 @@ REVISITS = 36864 * SCALE
 STRAGGLERS = 2048 * SCALE
 # A step's batch is 8192 + 16384 + 36864 + 2048 = 63488 keys, at most, per table.
 CHUNK_SLOTS = 1 << 18  # a table of a few million slots is scanned in a dozen chunks or more
-MAX_CAPACITY = 1 << 23
-INIT_CAPACITY = 1 << 20  # smaller than what the window holds: the table grows under the scans
 
 
 def _workload(num_steps: int):
@@ -86,27 +103,71 @@ def _workload(num_steps: int):
         batches.append(batch)
     return batches, next_key
 
+NUM_EMBEDDINGS = 1 << 23  # per table: more than the keys of the whole run
+INIT_CAPACITY = 1 << 20  # less than what the window holds: the tables grow under the scans
+DIM = 8
 
-@pytest.mark.parametrize("num_tables", [1, 2])
-def test_training_with_an_erase_every_few_steps_leaves_the_table_the_host_model_says(
-    device, num_tables
-):
-    batches, universe = _workload(STEPS)
-    module = build_de_table(
-        device.index,
-        S.CUSTOMIZED,
-        num_tables=num_tables,
-        max_capacity=MAX_CAPACITY,
-        init_capacity=INIT_CAPACITY,
-        local_hbm_for_values=8 << 30,
+
+def _device() -> torch.device:
+    return torch.device(f"cuda:{torch.cuda.current_device()}")
+
+
+def _model(num_tables: int):
+    names = [idx_to_name(0, i) for i in range(num_tables)]
+    model = create_model(
+        num_embedding_collections=1,
+        num_embeddings=[NUM_EMBEDDINGS] * num_tables,
+        embedding_dim=DIM,
+        optimizer_kwargs={"optimizer": EmbOptimType.SGD, "lr": 0.0},
+        score_strategy=S.CUSTOMIZED,
+        table_option_overrides={
+            table: {"init_capacity": INIT_CAPACITY} for _, table in names
+        },
     )
-    state = module._storage._state
-    generation_before = state.key_map_generation
+    return model, [f for f, _ in names], [t for _, t in names]
 
-    # The host model: the step that last trained a key, 0 for never. Tables are fed
-    # the same keys, so one array serves them all.
+
+def _step(model, feature_names, keys: np.ndarray, score: int) -> None:
+    """Forward and backward over ``keys``, one key per bag, in every feature; every key
+    must read the initial value."""
+    for module in get_dynamic_emb_module(model):
+        module.set_score({name: score for name in module.table_names})
+    values = torch.from_numpy(np.tile(keys, len(feature_names))).to(_device())
+    features = KeyedJaggedTensor(
+        keys=feature_names,
+        values=values,
+        lengths=torch.ones(len(values), dtype=torch.int64, device=_device()),
+    )
+    out = model(features)
+    torch.testing.assert_close(out, torch.full_like(out, TABLE_INITIALIZER_VALUE))
+    out.sum().backward()
+    torch.cuda.synchronize()
+
+
+def _held(model, table_names, universe: int):
+    """For each table, which keys of 1..universe it holds (the keys it exports)."""
+    torch.cuda.synchronize()
+    held = [np.zeros(universe + 1, dtype=bool) for _ in table_names]
+    counts = [0] * len(table_names)
+    for module in get_dynamic_emb_module(model):
+        for table_id, name in enumerate(module.table_names):
+            index = table_names.index(name)
+            for keys, _, _, _ in module.tables.export_keys_values(
+                _device(), 65536, table_id=table_id
+            ):
+                keys = keys.cpu().numpy()
+                held[index][keys] = True
+                counts[index] += len(keys)
+    return held, counts
+
+
+def check_stress(num_tables: int) -> None:
+    batches, universe = _workload(STEPS)
+    model, feature_names, table_names = _model(num_tables)
+    assert get_dynamic_emb_module(model), "the call would find no table in the model"
+
     last_step = np.zeros(universe + 1, dtype=np.int32)
-    handles, thresholds = [], []  # thresholds[i] is that of handles[i], asked for at step 10 * (i + 1)
+    handles, asked = [], []
     erased_total = 0
     started = time.monotonic()
 
@@ -118,59 +179,57 @@ def test_training_with_an_erase_every_few_steps_leaves_the_table_the_host_model_
             erased_total += erased
 
     for s, batch in enumerate(batches, start=1):
-        keys = batch.tolist()
-        train_step(module, [keys] * num_tables if num_tables > 1 else keys, device, score=s)
+        _step(model, feature_names, batch, s)
         last_step[batch] = s
         if s % ERASE_EVERY == 0 and s > WINDOW:
-            threshold = s - WINDOW + 1  # what was last trained before this window
-            thresholds.append((s, threshold))
+            threshold = s - WINDOW + 1
+            asked.append((s, threshold))
             handles.append(
-                module.erase_by_score_async(
-                    S.CUSTOMIZED, threshold, chunk_slots=CHUNK_SLOTS
+                erase_by_score_async(
+                    model, S.CUSTOMIZED, threshold, chunk_slots=CHUNK_SLOTS
                 )
             )
         reap(wait=False)
     reap(wait=True)
     elapsed = time.monotonic() - started
 
-    assert thresholds, "the loop was too short for an erase"
-    asked_at, threshold = thresholds[-1]
-    # Present iff trained at or after the last threshold. Anything trained before it was
-    # trained before the step the erase was asked for, so that erase had to remove it
-    # (unless a step saved it, which gave it a newer score); the erases before it asked for
-    # less. Nothing was evicted: the table is far from full.
-    expect = last_step >= threshold
+    assert asked, "the loop was too short for an erase"
+    asked_at, threshold = asked[-1]
+    expect = last_step >= threshold  # present iff trained at or after the last threshold
     expect[0] = False
-    all_keys = torch.arange(universe + 1, dtype=torch.int64)
-    for table_id in range(num_tables):
-        present = np.zeros(universe + 1, dtype=bool)
-        for start in range(0, universe + 1, 1 << 20):
-            part = all_keys[start : start + (1 << 20)].to(device)
-            present[start : start + len(part)] = (
-                found(module, part, device, table_id).cpu().numpy()
-            )
-        wrong_gone = np.flatnonzero(expect & ~present)
-        wrong_kept = np.flatnonzero(~expect & present)
+    held, counts = _held(model, table_names, universe)
+    for index, name in enumerate(table_names):
+        wrong_gone = np.flatnonzero(expect & ~held[index])
+        wrong_kept = np.flatnonzero(~expect & held[index])
         assert len(wrong_gone) == 0, (
-            f"table {table_id}: {len(wrong_gone)} keys at or above the threshold {threshold} "
-            f"were erased, e.g. {wrong_gone[:5].tolist()} (last steps "
-            f"{last_step[wrong_gone[:5]].tolist()})"
+            f"{name}: {len(wrong_gone)} keys at or above the threshold {threshold} were "
+            f"erased, e.g. {wrong_gone[:5].tolist()}"
         )
         assert len(wrong_kept) == 0, (
-            f"table {table_id}: {len(wrong_kept)} keys below the threshold {threshold} "
-            f"survived the erase asked for at step {asked_at}, e.g. {wrong_kept[:5].tolist()} "
-            f"(last steps {last_step[wrong_kept[:5]].tolist()})"
+            f"{name}: {len(wrong_kept)} keys below the threshold {threshold} survived "
+            f"the erase asked for at step {asked_at}, e.g. {wrong_kept[:5].tolist()}"
         )
-        assert size(module, table_id) == int(expect.sum()), f"table {table_id}"
-
-    # The erases did work, and not on a table that never changed shape.
+        assert counts[index] == int(expect.sum()), (
+            f"{name}: exports {counts[index]} keys, a key twice?"
+        )
     assert erased_total > 0
-    print(
-        f"stress: {STEPS} steps x {num_tables} tables, {len(thresholds)} erases, "
-        f"{erased_total} keys erased, {state.key_map_generation - generation_before} "
-        f"expansions seen, {size(module)} keys left, {elapsed:.1f}s"
-    )
 
     # What survived still reads right.
-    live = np.flatnonzero(expect)[:65536].tolist()
-    train_step(module, [live] * num_tables if num_tables > 1 else live, device, score=STEPS + 1)
+    _step(model, feature_names, np.flatnonzero(expect)[:65536], STEPS + 1)
+    print(
+        f"stress (DMP, {num_tables} tables): {STEPS} steps, {len(asked)} erases, "
+        f"{erased_total} keys erased, {int(expect.sum())} left per table, "
+        f"{elapsed:.1f}s",
+        flush=True,
+    )
+
+
+if __name__ == "__main__":
+    torch.cuda.set_device(int(os.environ.get("LOCAL_RANK", 0)))
+    dist.init_process_group(backend="nccl")
+    assert dist.get_world_size() == 1, "this test is for one rank"
+    for tables in (1, 2):
+        check_stress(tables)
+    dist.barrier()
+    print("test_erase_stress: all cases passed", flush=True)
+    dist.destroy_process_group()
