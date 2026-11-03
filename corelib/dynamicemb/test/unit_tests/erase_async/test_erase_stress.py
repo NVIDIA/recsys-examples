@@ -105,6 +105,10 @@ def _workload(num_steps: int):
 
 NUM_EMBEDDINGS = 1 << 23  # per table: more than the keys of the whole run
 INIT_CAPACITY = 1 << 20  # less than what the window holds: the tables grow under the scans
+# Without it a table is one bucket the size of the whole table (MAX_BUCKET_CAPACITY, what
+# create_model uses): it could not grow, and a scan could not be cut into chunks, which
+# never split a bucket.
+BUCKET_CAPACITY = 128
 DIM = 8
 
 
@@ -118,10 +122,16 @@ def _model(num_tables: int):
         num_embedding_collections=1,
         num_embeddings=[NUM_EMBEDDINGS] * num_tables,
         embedding_dim=DIM,
-        optimizer_kwargs={"optimizer": EmbOptimType.SGD, "lr": 0.0},
+        # The fused parameter is called "learning_rate": under "lr" (which the other tests of a
+        # wrapped model use) it is not read, and the default 0.01 trains every key it sees.
+        optimizer_kwargs={"optimizer": EmbOptimType.SGD, "learning_rate": 0.0},
         score_strategy=S.CUSTOMIZED,
         table_option_overrides={
-            table: {"init_capacity": INIT_CAPACITY} for _, table in names
+            table: {
+                "init_capacity": INIT_CAPACITY,
+                "bucket_capacity": BUCKET_CAPACITY,
+            }
+            for _, table in names
         },
     )
     return model, [f for f, _ in names], [t for _, t in names]
@@ -164,7 +174,13 @@ def _held(model, table_names, universe: int):
 def check_stress(num_tables: int) -> None:
     batches, universe = _workload(STEPS)
     model, feature_names, table_names = _model(num_tables)
-    assert get_dynamic_emb_module(model), "the call would find no table in the model"
+    modules = get_dynamic_emb_module(model)
+    assert modules, "the call would find no table in the model"
+
+    def expansions() -> int:
+        return sum(m._storage._state.key_map_generation for m in modules)
+
+    expansions_before = expansions()
 
     last_step = np.zeros(universe + 1, dtype=np.int32)
     handles, asked = [], []
@@ -213,12 +229,15 @@ def check_stress(num_tables: int) -> None:
             f"{name}: exports {counts[index]} keys, a key twice?"
         )
     assert erased_total > 0
+    # The scans had tables that grew under them to restart on.
+    assert expansions() > expansions_before, "the tables never grew: no restart tried"
 
     # What survived still reads right.
     _step(model, feature_names, np.flatnonzero(expect)[:65536], STEPS + 1)
     print(
         f"stress (DMP, {num_tables} tables): {STEPS} steps, {len(asked)} erases, "
-        f"{erased_total} keys erased, {int(expect.sum())} left per table, "
+        f"{erased_total} keys erased, {expansions() - expansions_before} expansions, "
+        f"{int(expect.sum())} left per table, "
         f"{elapsed:.1f}s",
         flush=True,
     )
