@@ -393,8 +393,10 @@ would need, kept from the earlier draft: a `mode: EvictedItemMode` argument like
 state's erased buffer, read by `pop_erased_keys` (and, for a table that stores rows, the
 `[M, 2]` (slot, row) of every reclaimed slot for `pop_erased_slot_index`); without it a
 table that stores rows is marked `erase_untracked`, as `erase_keys` does. Today the
-erased keys are **not recorded**: `pop_erased_keys` and `replay_increment` do not see
-what an erase by score removed.
+erased keys are **not recorded**: `pop_erased_keys` does not see what an erase by score
+removed, and a table it removed a key from is marked `erase_untracked` (it reads back the
+count of each table when the table is done), so `replay_increment` refuses that table's
+deltas instead of leaving the replica with the deleted keys.
 
 That buffer is not safe to touch from two threads (four parallel lists on
 `DynamicEmbTableState` appended with separate calls; `_pop_chunked_keys` reads and
@@ -505,12 +507,12 @@ ranks). 127 pytest items and one distributed script, passing on an H100 node.
 | File | What it covers |
 | --- | --- |
 | `test_erase_by_score.py` | the kernel through the table wrapper: exactly the keys below the threshold (thresholds, with and without a counter), chunked = whole, only the named table, a pinned slot is spared (tables 0 and 1), an erased slot takes a new key and the sizes stay right, argument checks, the digest of a reclaimed slot, the binding's tensor checks |
-| `test_storage_erase_by_score.py` | the chunk rule (a pure function) and its tiling at all sizes, the scan of a storage in chunks, with one, two or eight in flight, erasing the same keys each way (guard once per chunk, untouched tables untouched), a key map replaced between two chunks restarts that table, a table that is not there is refused first, the in-flight limit (1, 2, 4, with a control that shows the chunks pile up without it) |
+| `test_storage_erase_by_score.py` | the chunk rule (a pure function) and its tiling at all sizes, the scan of a storage in chunks, with one, two or eight in flight, erasing the same keys each way (guard once per chunk, untouched tables untouched), a key map replaced between two chunks restarts that table, a table the scan removed keys from is marked `erase_untracked` and no other, a table that is not there is refused first, the in-flight limit (1, 2, 4, with a control that shows the chunks pile up without it) |
 | `test_async_erase.py` | the lock (order, never free while one waits, a waiter interrupted before and after the hand-over, a hot loop does not keep another thread out of the gate), the gate (sections ordered on two streams, with a control; a failed section lets go; copies), the worker and the handle (thread, stream, counts; serial; the three moments; every way of asking raises; `wait_stream`), a real prefetch held back by the chunk the scan is in, and the stress test (three scans in chunks of eight buckets while training grows the table; no step limit) |
 | `test_erase_api.py` | strategy matching, argument checks (also for a model with no module), two-score-word tables, layouts refused (two real, two stand-ins) only where a table is picked, streams (type, device, the ones the training uses warn, the default one, kept), the new parameters (checked, passed through), nothing started when one module is refused, a model with several modules |
 | `test_erase_end_to_end.py` | the sliding window of a table that never evicts (does not grow), training beside the call, by time with `device_timestamp()`, a key a prefetched batch uses is spared until its backward, the same key in two tables with opposite ages, a cache (only the storage is erased, the cache is unchanged) |
 | `test_erase_distributed.py` (`torchrun`, 2 ranks) | `erase_by_score_async` on a `DistributedModelParallel` of row-wise `EmbeddingCollection`: per table, per key and per key in tables that never evict, with and without `use_index_dedup`, and beside training; the ranks erase every old key once between them; a host-only layout is refused |
-| elsewhere | `test_table_rows.py` (digest of a reclaimed slot: rehash, restore), `table_operation/` (`test_table_without_ref_counter`), `test_no_eviction_row_indexing.py` (the `FLAG` policy, reuse) |
+| elsewhere | `test_table_rows.py` (digest of a reclaimed slot: rehash, restore), `incremental_dump/test_replay_increment.py` (a delta dumped after an erase by score is refused by `replay_increment`; one after a call that removed nothing is replayed), `table_operation/` (`test_table_without_ref_counter`), `test_no_eviction_row_indexing.py` (the `FLAG` policy, reuse) |
 
 **Not covered, chosen:**
 
@@ -547,7 +549,10 @@ ranks). 127 pytest items and one distributed script, passing on an H100 node.
 - Two parameters are exposed so a user can move the trade: `chunk_slots` and
   `max_in_flight`.
 - **Not enforced:** that nothing exports while an erase is outstanding.
-- Keys erased by score are **not recorded** (`pop_erased_keys`, `replay_increment`) (§5.1).
+- Keys erased by score are **not recorded** (`pop_erased_keys`, `replay_increment`) (§5.1). A table the scan removed a
+  key from is therefore marked `erase_untracked` (sticky), like one erased by `erase_keys` without `RETAIN_KEY`, and
+  `replay_increment` refuses its deltas: without the mark a delta looked complete and a replica kept the deleted
+  keys and their rows. A scan that removes nothing does not mark.
 - A **cache** may write an erased key back to the storage when it evicts it, with the
   value it holds (§5); not tested.
 - **Multi-table modules and the evict kernels:** the way the evict kernels indexed the ref counter

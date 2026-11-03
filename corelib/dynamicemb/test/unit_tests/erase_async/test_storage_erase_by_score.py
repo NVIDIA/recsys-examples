@@ -268,6 +268,26 @@ def test_a_table_that_is_not_there_is_refused_before_anything_is_scanned(device)
     assert int(storage.key_index_map.size(0)) == len(KEYS), "table 0 was scanned first"
 
 
+def test_a_table_the_scan_removed_keys_from_is_marked_untracked_and_no_other(device):
+    """The removals are not recorded, so a delta dumped from a table that lost some cannot
+    be replayed exactly: the table is marked, as ``erase_keys`` without ``RETAIN_KEY``
+    marks one. A table the scan went over and found nothing to remove in is not, nor one
+    it was not asked to scan, whatever it holds. The mark is sticky."""
+    storage = make_storage([BUCKET * 16, BUCKET * 8, BUCKET * 8])
+    fill(storage, KEYS, SCORES, 0, device)  # some below the threshold
+    fill(storage, KEPT, [THRESHOLD + 5] * len(KEPT), 1, device)  # none below
+    fill(storage, KEYS, SCORES, 2, device)  # some below, but not scanned
+    assert [storage.erase_untracked(t) for t in (0, 1, 2)] == [False] * 3
+
+    counts = new_counts(device)
+    storage.erase_by_score(THRESHOLD, [0, 1], counts)
+    assert erased_and_spared(counts) == (len(BELOW), 0), "each table's count is added"
+    assert [storage.erase_untracked(t) for t in (0, 1, 2)] == [True, False, False]
+
+    storage.erase_by_score(THRESHOLD, [0], new_counts(device))  # nothing left to remove
+    assert storage.erase_untracked(0)
+
+
 class SlowChunks:
     """The guard of a scan whose chunks take a while on the device, counting how many
     of the chunks before the one being entered are still running there."""

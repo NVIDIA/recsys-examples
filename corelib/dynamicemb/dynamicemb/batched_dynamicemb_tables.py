@@ -2442,7 +2442,8 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                 raise ValueError(
                     f"replay_increment: the source of table '{table_name}' erased "
                     "keys without retaining them (erase_keys without "
-                    "EvictedItemMode.RETAIN_KEY). Each erase left a reclaimed slot "
+                    "EvictedItemMode.RETAIN_KEY, or erase_by_score_async, which "
+                    "retains nothing). Each erase left a reclaimed slot "
                     "that keeps its row, and nothing reports it, so this delta "
                     "cannot reproduce the source's rows. Retain the erases from "
                     "the start and rebuild the replica from deltas."
