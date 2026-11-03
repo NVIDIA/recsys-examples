@@ -573,9 +573,7 @@ def create_table_state(
         estimated_table_sizes=torch.zeros(
             num_tables, dtype=torch.int64, pin_memory=True
         ),
-        estimated_row_counts=torch.zeros(
-            num_tables, dtype=torch.int64, pin_memory=True
-        )
+        estimated_row_counts=torch.zeros(num_tables, dtype=torch.int64, pin_memory=True)
         if no_eviction
         else None,
         evicted_item_mode=evicted_item_mode,
@@ -983,8 +981,6 @@ def get_expand_info(
     assert (
         unique_per_table.device.type == "cpu"
     ), "unique_per_table must be a CPU tensor"
-
-    from dynamicemb.dynamicemb_config import DynamicEmbScoreStrategy
 
     is_no_eviction = state.no_eviction
     results = [False] * state.num_tables

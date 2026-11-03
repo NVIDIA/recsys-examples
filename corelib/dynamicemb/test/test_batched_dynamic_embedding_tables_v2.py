@@ -645,7 +645,7 @@ def _kim_scan_keys_embeddings_dict(
         ):
             if keys.numel() == 0:
                 continue
-            scores = named_scores[score_name]
+            scores = named_scores[score_name]  # noqa: F841
             flat_rows = indices
             values = load_from_flat_single_table(state, flat_rows, tid)
             embeddings = values[:, :emb_dim_t].contiguous().to(device)
