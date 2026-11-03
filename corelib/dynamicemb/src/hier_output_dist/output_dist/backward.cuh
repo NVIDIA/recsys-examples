@@ -195,22 +195,20 @@ __device__ __forceinline__ void sum_entries(const RowsLayout &rows, const int64_
 //      dedup's heavy rows' sub-tasks (each sums kHeavy original rows into an
 //      fp32 partial of its own) and the heavy groups' sub-tasks (kHeavy rows
 //      each).
-//   2. Round after round (bwd_task_starts), the push tasks of every proxy's
-//      heavy groups, then those of every proxy's rows (32 positions of its
-//      push order each), proxies in turn in both, so the IB chunks fill in
-//      push order. The heavy groups come first: first need numbers a
-//      feature's most asked keys about first, and a feature spans few IB
-//      chunks, so most chunks hold heavy keys, and none is ready before their
-//      partials.
+//   2. Chunk after chunk of the proxies' streams (bwd_task_starts), the push
+//      tasks of every proxy's heavy groups, then those of every proxy's rows
+//      (32 positions of its push order each), proxies in turn in both, so
+//      the chunks fill in stream order. The heavy groups come first: none of
+//      a chunk's keys is ready before their partials.
 //   3. The row tasks of the node's owners, with the sub-tasks of the node's
 //      heavy rows spread evenly among them (the pushes keep NVLink busy while
 //      the sub-tasks read HBM). The last sub-task of such a row to end adds
 //      them up and writes the row, which its row task leaves out.
 // A task that needs sub-tasks waits until their done counters say they
 // ended. They come earlier in the queue, so a running warp has them, and they
-// wait for nothing. A push into round rnd >= 2 of a proxy waits until the
-// proxy freed that half of proxy_rows (half_free), which needs only the
-// pushes of round rnd - 2, earlier in the queue. The kernel runs the task
+// wait for nothing. A push into a chunk whose rows are past the ring's first
+// lap waits until the proxy freed them (slot_free), which needs only the
+// pushes of earlier chunks, earlier in the queue. The kernel runs the task
 // loop (bwd_kernel); these functions are its steps.
 
 // The done counter of a heavy row's sub-tasks (index dedup) or of a heavy
@@ -239,49 +237,50 @@ struct SubTaskDone {
 
 namespace bwd {
 
-// One push task to a proxy (across nodes): the proxy, the round, the task's
+// One push task to a proxy (across nodes): the proxy, the chunk, the task's
 // place among this rank's tasks of its kind there (nth), and this rank's
-// entries of that proxy's push table for the round (entry; next holds the
+// entries of that proxy's push table for the chunk (entry; next holds the
 // ends).
 struct ProxyPush {
   bool is_group_task;  // a task of heavy groups, else of rows
-  int proxy, rnd;
-  int64_t nth;
-  int64_t plain_tasks;  // this rank's tasks of rows at the proxy in the round
+  int proxy;
+  int64_t chunk, nth;
+  int64_t plain_tasks;  // this rank's tasks of rows at the proxy in the chunk
   ReqEntry entry, next;
 };
 
-// Before a push into round rnd of the proxy's proxy_rows: rounds 0 and 1 are
-// free from the start (the previous out kernel was done with proxy_rows
-// before this one's entry), round rnd from when the proxy freed its half
-// (half_free), once the NIC had read the sums of round rnd - 2 out of it.
-// What one warp of the CTA saw is kept for the others (half_seen), so most
-// tasks read no word of the proxy. seq: the backward's out_seq. Every lane of
-// the warp.
-__device__ __forceinline__ void wait_half_warp(const Sizes &sizes, int64_t seq,
-                                               const OutTables &tables, int proxy, int rnd,
+// Before a push into chunk `chunk` of a proxy's stream: rows of the ring's
+// first lap (the stream's positions below num_proxy_rows) are free from the
+// start (the previous out kernel was done with proxy_rows before this one's
+// entry); the chunk's are free once the proxy freed the rows of its stream
+// up to the chunk's end (slot_free), when the NIC had read the sums of the
+// chunks there before. What one warp of the CTA saw is kept for the others
+// (free_seen), so most tasks read no word of the proxy. seq: the backward's
+// out_seq. Every lane of the warp.
+__device__ __forceinline__ void wait_free_warp(const Sizes &sizes, int64_t seq,
+                                               const OutTables &tables, int proxy, int64_t chunk,
                                                int lane) {
-  if (rnd < 2) return;
+  const int64_t end = tables.plan.proxy_end(proxy, chunk);
+  if (end <= sizes.num_proxy_rows) return;
   if (lane == 0) {
-    const uint64_t want = grant_of(seq, rnd);
-    if (ld_acquire_cta(tables.half_seen(proxy)) < want) {
+    const uint64_t want = tag_of(seq, (uint64_t)end);
+    if (ld_acquire_cta(tables.free_seen(proxy)) < want) {
       Spin spin(sizes.timeout_ns);
       uint64_t word;
-      while ((word = ld_acquire_sys(tables.half_free(proxy))) < want)
-        spin.pause("a half of a proxy's rows", proxy, rnd, sizes.topo.rank);
-      red_max_release_cta(tables.half_seen(proxy), word);
+      while ((word = ld_acquire_sys(tables.slot_free(proxy))) < want)
+        spin.pause("rows of a proxy's ring", proxy, chunk, sizes.topo.rank);
+      red_max_release_cta(tables.free_seen(proxy), word);
     }
   }
   __syncwarp();
 }
 
-// A push task's rows (or partials) of round rnd are in the proxy's
-// proxy_rows: its flag `flag` in the round's half of that proxy's flags,
-// tagged with (seq, rnd). Every lane of the warp.
+// A push task's rows (or partials) are in the proxy's proxy_rows: its flag
+// `flag` in that proxy's push flags, tagged with seq. Every lane of the warp.
 __device__ __forceinline__ void push_flag_warp(int64_t seq, const OutTables &tables, int proxy,
-                                               int rnd, int64_t flag, int lane) {
+                                               int64_t flag, int lane) {
   __syncwarp();
-  if (lane == 0) st_release_sys(tables.push_flag(proxy, rnd, flag), grant_of(seq, rnd));
+  if (lane == 0) st_release_sys(tables.push_flag(proxy, flag), (uint64_t)seq);
 }
 
 // Index dedup, a heavy row (more than kHeavy original rows): once its
@@ -522,30 +521,19 @@ __device__ void push_groups_warp(const Sizes &sizes, const BwdArgs &args, const 
   }
 }
 
-// Remote task `remote_task` (across nodes; `cursor` at its round): a push
-// task to the proxy in turn from this rank's own one. False when that proxy
-// has no such round.
-__device__ __forceinline__ bool remote_push(const Sizes &sizes, const OutTables &tables,
-                                            const RoundCursor &cursor, int64_t remote_task,
+// Remote task `remote_task` (across nodes): a push task of its chunk, of
+// heavy groups or of rows, to the proxy in turn from this rank's own one.
+__device__ __forceinline__ void remote_push(const Sizes &sizes, const BwdPlanView &plan,
+                                            const OutTables &tables, int64_t remote_task,
                                             ProxyPush &push) {
   const int local_size = sizes.topo.local_size, me = sizes.topo.local_rank;
-  const int rnd = cursor.rnd;
-  const bool is_group_task = remote_task < cursor.mid;  // a heavy groups' push task
-  const int64_t slot = remote_task - (is_group_task ? cursor.lo : cursor.mid);
-  const int proxy = (int)((me + slot) % local_size);
-  const int64_t nth = slot / local_size;
-  if (rnd >= tables.rounds(proxy)) return false;
-  ReqEntry entry, next;
-  tables.req_of(proxy, rnd, entry, next);
-  const int64_t plain_tasks = ceil_div<kTaskRows>(entry.heavy - entry.start);
-  push.is_group_task = is_group_task;
-  push.proxy = proxy;
-  push.rnd = rnd;
-  push.nth = nth;
-  push.plain_tasks = plain_tasks;
-  push.entry = entry;
-  push.next = next;
-  return true;
+  const RemoteTask place(plan.bwd_task_starts, 2 * plan.max_chunks * local_size, remote_task);
+  push.chunk = place.entry / (2 * local_size);
+  push.is_group_task = place.entry / local_size % 2 == 0;
+  push.proxy = (int)((me + place.entry % local_size) % local_size);
+  push.nth = place.nth;
+  tables.req_of(push.proxy, push.chunk, push.entry, push.next);
+  push.plain_tasks = ceil_div<kTaskRows>(push.entry.heavy - push.entry.start);
 }
 
 // A push task of this rank's heavy groups at the proxy (32 at most): their
@@ -557,16 +545,16 @@ __device__ __forceinline__ void push_groups_task_warp(const Sizes &sizes, int64_
                                                       const ProxyPush &push, int lane) {
   const int me = sizes.topo.local_rank;
   const OutTimeline timeline{args.trace, sizes.topo.local_size};
-  const int proxy = push.proxy, rnd = push.rnd;
+  const int proxy = push.proxy;
   const int64_t nth = push.nth, plain_tasks = push.plain_tasks;
   const ReqEntry &entry = push.entry, &next = push.next;
   const int64_t group_lo = entry.groups + nth * kTaskRows;
   if (group_lo >= next.groups) return;
-  wait_half_warp(sizes, seq, tables, proxy, rnd, lane);
+  wait_free_warp(sizes, seq, tables, proxy, push.chunk, lane);
   const unsigned long long start = timeline.on() ? now_ns() : 0;
   const int64_t group_hi = min(group_lo + kTaskRows, (int64_t)next.groups);
   push_groups_warp<RowT>(sizes, args, tables, proxy, group_lo, group_hi, lane);
-  push_flag_warp(seq, tables, proxy, rnd, entry.flags + plain_tasks + nth, lane);
+  push_flag_warp(seq, tables, proxy, entry.flags + plain_tasks + nth, lane);
   if (timeline.on() && lane == 0) {
     // an fp32 partial row per group
     const unsigned long long bytes =
@@ -585,11 +573,11 @@ __device__ __forceinline__ void push_rows_task_warp(const Sizes &sizes, int64_t 
   const BwdPlanView &plan = args.plan;
   const int me = sizes.topo.local_rank, row_bytes = sizes.row_bytes;
   const OutTimeline timeline{args.trace, sizes.topo.local_size};
-  const int proxy = push.proxy, rnd = push.rnd;
+  const int proxy = push.proxy;
   const int64_t nth = push.nth, plain_tasks = push.plain_tasks;
   const ReqEntry &entry = push.entry;
   if (nth >= plain_tasks) return;
-  wait_half_warp(sizes, seq, tables, proxy, rnd, lane);
+  wait_free_warp(sizes, seq, tables, proxy, push.chunk, lane);
   const int64_t pos0 = entry.start + nth * kTaskRows;
   const int num_rows = (int)min((int64_t)kTaskRows, entry.heavy - pos0);
   int64_t dedup_row = 0;
@@ -601,7 +589,7 @@ __device__ __forceinline__ void push_rows_task_warp(const Sizes &sizes, int64_t 
   }
   const unsigned long long start = timeline.on() ? now_ns() : 0;
   push_rows_warp<RowT>(sizes, args, dedup_row, dst, num_rows, false, lane);
-  push_flag_warp(seq, tables, proxy, rnd, entry.flags + nth, lane);
+  push_flag_warp(seq, tables, proxy, entry.flags + nth, lane);
   if (timeline.on() && lane == 0) {
     const unsigned long long bytes = (unsigned long long)num_rows * row_bytes;
     timeline.task(start, proxy != me ? bytes : 0, proxy != me ? 0 : bytes);
@@ -645,12 +633,11 @@ __device__ __forceinline__ void local_push_warp(const Sizes &sizes, const BwdArg
 namespace bwd {
 
 // The proxy's reducers (across nodes; the last CTAs of the kernel). A task
-// is 32 node-unique keys of one IB chunk of an owner node. The tasks go round
-// after round (reduce_task_starts); in a round the chunks follow the
-// requesters' push order (chunk-major, then owner node). The task's keys'
-// reducer lists are consecutive. The warp waits for the push task of each
-// entry (the lanes over the entries, 32 apart; the flags of the round's half,
-// tagged with the round). Then it sums, for each key of several entries,
+// is 32 node-unique keys of one chunk of its stream. The tasks go chunk after
+// chunk (reduce_task_starts), the order the requesters push them in. The
+// task's keys' reducer lists are consecutive. The warp waits for the push
+// task of each entry (the lanes over the entries, 32 apart; flags tagged with
+// the backward's out_seq). Then it sums, for each key of several entries,
 // their rows in fp32 in list order (a key's occurrences by requester and
 // position; a heavy key's requesters' partials in requester order) and rounds
 // the sum once into the key's row. Then it counts the task's keys ready in
@@ -669,52 +656,39 @@ template <typename RowT>
 __device__ void ProxyReducer<RowT>::run(ncclWindow_t window, const Sizes &sizes, int64_t seq,
                                         const BwdArgs &args, int lane) {
   const BwdPlanView &plan = args.plan;
-  const int num_nodes = sizes.topo.num_nodes, node = sizes.topo.node, vec = sizes.row_vecs();
-  const int64_t chunk_tasks = sizes.chunk_rows / kTaskRows;  // tasks per chunk
+  const int vec = sizes.row_vecs();
   // this rank's copy of the window: its proxy_rows and push flags
   const WindowLayout layout = NodeWindow(window, sizes.topo.local_rank).layout(sizes);
-  const int64_t total = plan.reduce_task_starts[*plan.num_rounds];
-  RoundCursor cursor(plan.reduce_task_starts, 1);  // the round of this warp's tasks
+  const uint64_t *flags = layout.rows.push_flags();
+  const int64_t total = plan.reduce_task_starts[plan.max_chunks];
   const TaskQueue queue{layout.ctrl.task(kQueueReduce)};
   for (int64_t task = queue.next_warp(); task < total; task = queue.next_warp()) {
-    cursor.seek(task);
-    // The task: keys [uniq_lo, uniq_lo + num_keys) of owner node owner_node,
-    // in IB chunk `chunk` of its keys of round rnd (piece). None for a chunk
-    // of this node's own keys, or past the end of the chunk's keys.
-    const int rnd = cursor.rnd;
-    const int64_t slot = task - cursor.lo;
-    const int owner_node = (int)(slot / chunk_tasks % num_nodes);
-    const int64_t chunk = slot / chunk_tasks / num_nodes, sub = slot % chunk_tasks;
-    if (owner_node == node) continue;
-    // from its round table: where the owner node's keys of the round sit in
-    // proxy_rows, and their first IB chunk
-    const RoundPiece piece = plan.round_piece(rnd, owner_node);
-    const int64_t uniq_lo = piece.uniq_lo + chunk * sizes.chunk_rows + sub * kTaskRows;
-    const int64_t chunk_end =
-        min((int64_t)piece.uniq_hi, piece.uniq_lo + (chunk + 1) * sizes.chunk_rows);
-    const int num_keys = (int)min((int64_t)kTaskRows, chunk_end - uniq_lo);
+    // The task: keys [key_lo + sub * 32, ...) of its chunk, at most 32.
+    const RemoteTask place(plan.reduce_task_starts, plan.max_chunks, task);
+    const Chunk chunk = plan.chunks[place.entry];
+    const int64_t uniq_lo = chunk.key_lo + place.nth * kTaskRows;
+    const int num_keys = (int)min((int64_t)kTaskRows, (int64_t)chunk.key_lo + chunk.keys - uniq_lo);
     if (num_keys <= 0) continue;
     // The lane's key (a lane per key): its reducer list [begin, end) (heavy:
-    // the first entry is the heavy key's own row) and its row in proxy_rows.
-    // Then the wait for the push task of each entry of the task's lists.
-    const uint64_t tag = grant_of(seq, rnd);
-    const uint64_t *flags = layout.rows.push_flags(rnd);
-    const int64_t uniq_global = plan.uniq_off[owner_node] + uniq_lo;  // in the reducer list
+    // the first entry is the heavy key's own row) and its row in proxy_rows
+    // (where its chunk lies). Then the wait for the push task of each entry
+    // of the task's lists.
+    const int64_t at = (int64_t)chunk.start % sizes.num_proxy_rows;
     int64_t begin = 0, end = 0;
     bool heavy = false;
     char *row = nullptr;
     if (lane < num_keys) {
-      begin = plan.reducer_start[uniq_global + lane];
-      end = plan.reducer_start[uniq_global + lane + 1];
+      begin = plan.reducer_start[uniq_lo + lane];
+      end = plan.reducer_start[uniq_lo + lane + 1];
       heavy = (int32_t)(plan.reducer_entries[begin] >> 32) == kEntryOwnRow;
-      row = layout.rows.proxy_row(piece.off + uniq_lo + lane - piece.uniq_lo);
+      row = layout.rows.proxy_row(at + uniq_lo + lane - chunk.key_lo);
     }
     const int64_t ent_end = __shfl_sync(kFull, end, num_keys - 1);
     Spin spin(sizes.timeout_ns);
     for (int64_t i = __shfl_sync(kFull, begin, 0) + lane; i < ent_end; i += 32) {
       const int32_t flag = (int32_t)(plan.reducer_entries[i] >> 32);
       if (flag < 0) continue;  // kEntryNoPush, kEntryOwnRow: no push task
-      while (ld_acquire_sys(&flags[flag]) < tag)
+      while ((int64_t)ld_acquire_sys(&flags[flag]) < seq)
         spin.pause("pushed gradient rows", flag, uniq_lo, sizes.topo.rank);
     }
     __syncwarp();
@@ -741,8 +715,7 @@ __device__ void ProxyReducer<RowT>::run(ncclWindow_t window, const Sizes &sizes,
     }
     __syncwarp();
     // The task's keys are reduced: counted ready in the chunk's counter.
-    if (lane == 0)
-      red_release_sys((uint64_t *)&args.ready[piece.chunk + chunk], (uint64_t)num_keys);
+    if (lane == 0) red_release_sys((uint64_t *)&args.ready[place.entry], (uint64_t)num_keys);
   }
 }
 
@@ -763,23 +736,21 @@ constexpr int kChunkPutBit = 62;
 // lane first lets the rail proxies on its nodes put this backward's rows
 // into its lookup_rows, if the previous kernel (a backward too) could not:
 // its lookup_grad was still live. Then, for each owner node once the owner
-// there let it (bwd_ready), it puts the IB chunks of that node's keys round
-// after round, each as soon as the reducers counted all its keys ready, in
-// whatever order they complete. It polls the owner nodes in turn and waits
-// for no single one; its place in each one's segments is in this rank's
-// put_at words. A chunk takes one system fence, then its segments from
-// proxy_rows to their rows of the owner's lookup_rows, each adding its rows
-// to the owner's bwd_rows signal and, with more than one round, counting on
-// the put counter of its half of proxy_rows once the NIC has read it. With
-// more than one round each lane also tells lane 0 (shared memory) the rounds
-// its owner nodes have all put and its puts out of each half. Once every
-// lane has put round rnd and the counter of its half reaches the puts posted
-// to that half, the NIC has read round rnd's sums: lane 0 frees the half for
-// round rnd + 2 (half_free; the half's later rounds are not ready before).
-// Once the NIC has read proxy_rows (one round: the warp's flush, as in the
-// forward; more: both counters reach the puts posted), the lanes grant each
-// rail owner rounds 0 and 1 of the next kernel, and the warp flushes the
-// credits' context.
+// there let it (bwd_ready), it puts that node's chunks, each as soon as the
+// reducers counted all its keys ready, in whatever order they complete. It
+// polls the owner nodes in turn and waits for no single one; its place in
+// each one's segments is in this rank's put_at words. A chunk takes one
+// system fence, then its segments from proxy_rows to their rows of the
+// owner's lookup_rows, each adding its rows to the owner's bwd_rows signal.
+// When the stream wraps the ring, each also counts on the put counter of its
+// chunk (chunk % counters) once the NIC has read it, and a chunk is put only
+// within `counters` chunks of the first not yet read, so no two chunks in
+// flight share a counter. Lane 0 then marks chunks read in order, once their
+// puts are posted and their counter reaches the puts posted on it, and frees
+// the rows of the stream they hold (slot_free). Once the NIC has read
+// proxy_rows (no wrap: the warp's flush, as in the forward; a wrap: every
+// chunk read), the lanes grant each rail owner the ring's rows of the next
+// kernel's stream, and the warp flushes the credits' context.
 struct ProxyIssuer {
   // Every lane of the issuer warp, in backward seq.
   __device__ static void run(ncclWindow_t window, const ncclDevComm &dev, const Sizes &sizes,
@@ -788,39 +759,31 @@ struct ProxyIssuer {
 
 __device__ void ProxyIssuer::run(ncclWindow_t window, const ncclDevComm &dev, const Sizes &sizes,
                                  int64_t seq, const BwdArgs &args) {
-  __shared__ int at_round[32];         // each lane's round: it has put the rounds before
-  __shared__ unsigned at_half[32][2];  // its puts out of each half
+  __shared__ int64_t read_chunks;  // lane 0's chunks read, for the other lanes
   const BwdPlanView &plan = args.plan;
   const int lane = threadIdx.x & 31, num_nodes = sizes.topo.num_nodes, node = sizes.topo.node;
+  const int64_t ring = sizes.num_proxy_rows, counters = sizes.counters();
   const NodeWindow node_window(window, sizes.topo.local_rank);
   const WindowLayout layout = node_window.layout(sizes);
   ncclGin rows(dev, kCtxBwd), cred(dev, kCtxCredit);
   const ncclTeam rail = ncclTeamRail(dev);
   const Credits credits(cred, rail);
   const OutTimeline timeline{args.trace, sizes.topo.local_size};
-  bool live = false;  // the lane has owner nodes
-  for (int owner_node = lane; owner_node < num_nodes; owner_node += 32) {
-    if (owner_node == node) continue;
-    live = true;
-    credits.raise(owner_node, sig_bwd_ready(num_nodes, node), (uint64_t)seq,
-                  layout.ctrl.bwd_ready_sent(owner_node));
-  }
+  for (int owner_node = lane; owner_node < num_nodes; owner_node += 32)
+    if (owner_node != node)
+      credits.raise(owner_node, sig_bwd_ready(num_nodes, node), (uint64_t)seq,
+                    layout.ctrl.bwd_ready_sent(owner_node));
   Spin spin(sizes.timeout_ns);
   // The ready counters were zeroed before this rank published its out_seq.
   if (lane == 0)
     while ((int64_t)ld_acquire_gpu(layout.ctrl.out_started()) < seq)
       spin.pause("entry of this rank", 0, seq, sizes.topo.rank);
-  const int num_rounds = (int)*plan.num_rounds;
-  for (int owner_node = lane; owner_node < num_nodes; owner_node += 32) {
-    layout.ctrl.put_at(owner_node)[0] = plan.bwd_puts(owner_node)[0];
-    layout.ctrl.put_at(owner_node)[1] = 0;
-  }
-  // the puts this proxy posted to each half in earlier calls
-  const uint64_t posted[2] = {*layout.ctrl.posted(0), *layout.ctrl.posted(1)};
-  volatile int *lane_rounds = at_round;
-  volatile unsigned *lane_half_puts = &at_half[0][0];
-  lane_rounds[lane] = live ? 0 : num_rounds;
-  lane_half_puts[2 * lane] = lane_half_puts[2 * lane + 1] = 0;
+  const int64_t count = *plan.num_chunks;
+  const bool wraps = count > 0 && plan.chunks[count - 1].end > ring;
+  for (int owner_node = lane; owner_node < num_nodes; owner_node += 32)
+    *layout.ctrl.put_at(owner_node) = plan.bwd_puts(owner_node);
+  volatile int64_t *lane_read = &read_chunks;
+  if (lane == 0) *lane_read = 0;
   __syncwarp();
   // rows of proxy_rows into the rail owners' lookup_rows
   const RowPut put{rows,
@@ -830,25 +793,22 @@ __device__ void ProxyIssuer::run(ncclWindow_t window, const ncclDevComm &dev, co
                    layout.rows.proxy_rows(),
                    sizes.row_bytes,
                    sig_rows(node)};
-  unsigned puts[2] = {0, 0};  // this lane's puts out of each half
-  int freed = 0;              // lane 0: rounds whose half the requesters may fill again
-  bool first = true;          // the lane has put nothing yet
+  int64_t read = 0;   // lane 0: chunks the NIC has read, in order
+  bool first = true;  // the lane has put nothing yet
   for (;;) {
-    bool moved = false;
-    int lane_through = num_rounds;  // rounds every owner node of the lane has put
+    bool moved = false, left = false;  // segments of the lane's owner nodes are left
+    const int64_t limit = wraps ? *lane_read + counters : count;  // chunks it may put
     for (int owner_node = lane; owner_node < num_nodes; owner_node += 32) {
       if (owner_node == node) continue;
-      const int32_t *start = plan.bwd_puts(owner_node);  // the node's segments, by round
       int64_t *at = layout.ctrl.put_at(owner_node);
-      int64_t done = at[0];  // segments [start of round rnd, done) are put
-      int rnd = (int)at[1];
-      while (rnd < num_rounds && done == start[rnd + 1]) ++rnd;
-      if (rnd < num_rounds && (int64_t)credits.read(sig_bwd_ready(num_nodes, owner_node)) >= seq) {
+      int64_t done = *at;  // segments before it are put
+      const int64_t end = plan.bwd_puts(owner_node + 1);
+      if (done < end && (int64_t)credits.read(sig_bwd_ready(num_nodes, owner_node)) >= seq) {
         // each chunk the reducers counted ready; a chunk's segments are
         // consecutive
-        const int64_t end = start[rnd + 1];
         for (int64_t seg_start = done; seg_start < end;) {
           const int32_t chunk = plan.put_list[seg_start].chunk;
+          if (chunk >= limit) break;
           int64_t seg_end = seg_start, keys = 0;
           for (; seg_end < end && plan.put_list[seg_end].chunk == chunk; ++seg_end)
             keys += plan.put_list[seg_end].rows;
@@ -860,9 +820,9 @@ __device__ void ProxyIssuer::run(ncclWindow_t window, const ncclDevComm &dev, co
             put.fence();
             for (int64_t i = seg_start; i < seg_end; ++i) {
               const PutSeg seg = plan.put_list[i];
-              put.put(owner_node, seg.dst, seg.src, seg.rows, num_rounds != 1, rnd & 1);
+              put.put(owner_node, seg.dst, seg.src, seg.rows, wraps, (int)(chunk % counters));
             }
-            puts[rnd & 1] += (unsigned)(seg_end - seg_start);
+            if (wraps) *layout.ctrl.posted(chunk % counters) += (uint64_t)(seg_end - seg_start);
             if (timeline.on()) timeline.posted((unsigned long long)keys);
             *ready = word | (1ull << kChunkPutBit);
             moved = true;
@@ -871,54 +831,39 @@ __device__ void ProxyIssuer::run(ncclWindow_t window, const ncclDevComm &dev, co
           seg_start = seg_end;
         }
       }
-      at[0] = done;
-      at[1] = rnd;
-      lane_through = min(lane_through, rnd < num_rounds && done == start[rnd + 1] ? rnd + 1 : rnd);
+      *at = done;
+      left = left || done < end;
     }
-    if (num_rounds > 1) {
-      // its puts, then its rounds: lane 0 reads them in the other order
-      lane_half_puts[2 * lane] = puts[0];
-      lane_half_puts[2 * lane + 1] = puts[1];
-      __threadfence_block();
-      lane_rounds[lane] = lane_through;
-    }
-    // Lane 0, with more than one round: the rounds every lane has put
-    // (through), and the half of each such round freed once the NIC has read
-    // the puts posted to it.
-    int through = num_rounds;
-    if (lane == 0 && num_rounds > 1) {
-      for (int other = 0; other < 32; ++other) through = min(through, lane_rounds[other]);
-      __threadfence_block();
-      while (freed < through && freed + 2 < num_rounds) {
-        const int half = freed & 1;
-        uint64_t want = posted[half];
-        for (int other = 0; other < 32; ++other) want += lane_half_puts[2 * other + half];
-        if (rows.readCounter(half) < want) break;
-        st_release_sys(layout.ctrl.half_free(), grant_of(seq, freed + 2));
-        ++freed;
+    __syncwarp();
+    // Lane 0, when the stream wraps: the chunks the NIC has read, in order
+    // (their puts posted, and their counter at the puts posted on it), and
+    // the rows of the stream they free.
+    if (wraps && lane == 0) {
+      while (read < count) {
+        if (!(((volatile uint64_t *)args.ready)[read] >> kChunkPutBit)) break;
+        const int64_t counter = read % counters;
+        if (rows.readCounter((int)counter) < *layout.ctrl.posted(counter)) break;
+        ++read;
+        const int64_t free_end = (read < count ? (int64_t)plan.chunks[read].start
+                                               : (int64_t)plan.chunks[count - 1].end) +
+                                 ring;
+        st_release_sys(layout.ctrl.slot_free(), tag_of(seq, (uint64_t)free_end));
         moved = true;
       }
+      *lane_read = read;
     }
-    if (lane_through == num_rounds && through == num_rounds) break;
-    if (!moved) spin.pause("reduced chunks", lane_through, lane, sizes.topo.rank);
+    __syncwarp();
+    const bool all_read = !wraps || *lane_read == count;
+    if (!__any_sync(kFull, left) && all_read) break;
+    if (!__any_sync(kFull, moved))
+      spin.pause("reduced chunks", (long long)read, lane, sizes.topo.rank);
   }
   if (!first) timeline.stamp_latest(kTraceLastPut);
-  // The NIC has read every put out of proxy_rows: one round, the warp's flush
-  // (its puts count on no counter); more, lane 0 waits until each half's
-  // counter reaches the puts posted to it, and keeps those totals.
-  if (num_rounds == 1) {
+  // The NIC has read every put out of proxy_rows: no wrap, the warp's flush
+  // (its puts count on no counter); a wrap, every chunk read.
+  if (!wraps) {
     __syncwarp();
     rows.flush(ncclCoopWarp{});
-  } else {
-    const uint64_t all[2] = {posted[0] + __reduce_add_sync(kFull, puts[0]),
-                             posted[1] + __reduce_add_sync(kFull, puts[1])};
-    if (lane == 0) {
-      for (int half = 0; half < 2; ++half) {
-        *layout.ctrl.posted(half) = all[half];
-        while (rows.readCounter(half) < all[half])
-          spin.pause("puts read from proxy_rows", half, (long long)all[half], sizes.topo.rank);
-      }
-    }
   }
   // the puts have completed
   if (timeline.on() && __any_sync(kFull, !first) && lane == 0)
@@ -926,7 +871,7 @@ __device__ void ProxyIssuer::run(ncclWindow_t window, const ncclDevComm &dev, co
   __syncwarp();
   for (int owner_node = lane; owner_node < num_nodes; owner_node += 32)
     if (owner_node != node)
-      credits.raise(owner_node, sig_grant(node), grant_of(seq + 1, 2),
+      credits.raise(owner_node, sig_grant(node), tag_of(seq + 1, (uint64_t)ring),
                     layout.ctrl.grant_sent(owner_node));
   __syncwarp();
   credits.flush_warp();
@@ -1034,12 +979,12 @@ __device__ void LandingWatcher::rest(ncclWindow_t window, const ncclDevComm &dev
 //   remote owner (across nodes): into the proxy's proxy_rows in the proxy's
 //     push order, at the row's slot (its key's row, a duplicate's slot), each
 //     32-row push task then setting its flag in the proxy's push_flags,
-//     tagged with (out_seq, round); the occurrences of a heavy key (more than
-//     kHeavy on the node) go as one fp32 sum per requester (heavy group) into
-//     its partial slot, 32 groups per flag.
+//     tagged with the out_seq; the occurrences of a heavy key (more than
+//     heavy_at on the node) go as one fp32 sum per requester (heavy group)
+//     into its partial slot, 32 groups per flag.
 // The proxy's reducer CTAs (across nodes, the last ones) wait for the flags
 // of each key's reducer-list entries, sum the keys of several in fp32 in list
-// order and round once into the key's row, and count each IB chunk's keys
+// order and round once into the key's row, and count each chunk's keys
 // ready; its issuer lanes (the last warp of CTA 0) put each chunk, once
 // ready, into the owner's lookup_rows. Only the keys of several rows are
 // touched: the NIC reads the others where the requester's NVLink stores left
@@ -1137,11 +1082,10 @@ __global__ void __launch_bounds__(kThreads, 1)
     bwd::ProxyReducer<RowT>::run(window, sizes, seq, args, lane);
   } else {
     const OutTables tables(window, sizes, args.plan);
-    // half_seen starts at 0; the entry barrier's sync publishes it
-    for (int proxy = tid; proxy < local_size; proxy += workers) *tables.half_seen(proxy) = 0;
+    // free_seen starts at 0; the entry barrier's sync publishes it
+    for (int proxy = tid; proxy < local_size; proxy += workers) *tables.free_seen(proxy) = 0;
     int64_t groups = 0;  // this rank's heavy groups, at all its proxies
-    if (num_nodes > 1)
-      groups = plan.push_entry(local_size - 1, tables.rounds(local_size - 1))->groups;
+    if (num_nodes > 1) groups = plan.push_entry(local_size - 1, plan.max_chunks)->groups;
     if (blockIdx.x == 0) {
       // Counters this kernel counts from 0, before this rank publishes its
       // out_seq: everything that counts on them runs after the entry.
@@ -1160,11 +1104,11 @@ __global__ void __launch_bounds__(kThreads, 1)
     const int64_t heavy_subs = fanout.exp_off != nullptr ? fanout.count[1] : 0,
                   early_subs = num_nodes > 1 ? heavy_subs : 0;
     const int64_t subs = early_subs + plan.group_subs,
-                  remote = subs + (num_nodes > 1 ? plan.bwd_task_starts[2 * tables.max_rounds] : 0);
+                  remote =
+                      subs +
+                      (num_nodes > 1 ? plan.bwd_task_starts[2 * plan.max_chunks * local_size] : 0);
     const LocalRows local_rows{node_block_start, local_size, me};
     const int64_t rows = local_rows.count(), total = remote + rows + heavy_subs;
-    // The round of this warp's remote tasks (one node: none).
-    RoundCursor cursor(num_nodes > 1 ? plan.bwd_task_starts : nullptr, 2);
     const TaskQueue queue{tables.layout().ctrl.task(kQueueWork)};
     for (int64_t task = queue.next_warp(); task < total; task = queue.next_warp()) {
       if (task < early_subs) {
@@ -1176,10 +1120,8 @@ __global__ void __launch_bounds__(kThreads, 1)
         continue;
       }
       if (task < remote) {
-        const int64_t remote_task = task - subs;
-        cursor.seek(remote_task);
         bwd::ProxyPush push;
-        if (!bwd::remote_push(sizes, tables, cursor, remote_task, push)) continue;
+        bwd::remote_push(sizes, plan, tables, task - subs, push);
         if (push.is_group_task)
           bwd::push_groups_task_warp<RowT>(sizes, seq, args, tables, push, lane);
         else

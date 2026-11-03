@@ -17,7 +17,8 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 // What host and device code share, before the window's layouts: the
 // constants, the ranks of a sharding (Topo) and an op's sizes (Sizes), the
 // formats of the tables the kernels of a call share, the status of a call,
-// the GIN contexts and signals, and the trace's build flag and row format.
+// the GIN contexts, signals and counters, and the trace's build flag and row
+// format.
 #pragma once
 
 #include <cuda_runtime.h>
@@ -28,20 +29,21 @@ namespace dyn_emb {
 namespace hier_output_dist {
 
 // Constants of the hierarchical dist that host and device code share: CTA
-// sizes, the rows of a task, the rounds a call may take and the task queues;
-// and ceil_div.
+// sizes, the rows of a task, the GIN counters of the backward's puts and the
+// task queues; and ceil_div.
 
 constexpr int kThreads = 512;  // threads per CTA
 // Index dedup's heavy rows (more original rows than kHeavy) and the heavy
-// groups take sub-tasks of kHeavy rows. A node-unique key of more than kHeavy
-// occurrences is heavy, so a key takes at most kHeavy rows of proxy_rows
-// (min_proxy_rows_for).
+// groups take sub-tasks of kHeavy rows. A node-unique key of more than
+// Sizes::heavy_at occurrences (kHeavy, or more with many GPUs per node) is
+// heavy at its proxy.
 constexpr int kHeavy = 64;
 constexpr int kTaskRows = 32;  // rows of an output dist task, one per lane
 constexpr int kWarps = kThreads / 32;
-// The most rounds of proxy_rows a call's tables hold: credits and push flags
-// number the rounds in 20 bits (grant_of).
-constexpr int kMaxRounds = 1 << 16;
+// The GIN counters of the backward's puts, at most (Sizes::counters): when a
+// proxy's stream wraps its ring, chunk c's puts count on counter c % counters,
+// and at most that many chunks have puts the NIC may still read.
+constexpr int kMaxCounters = 64;
 // Task queues of an out kernel (CtrlLayout::task): the workers', and across
 // nodes the backward's reducers'.
 enum Queue : int { kQueueWork = 0, kQueueReduce, kNumQueues };
@@ -67,18 +69,22 @@ struct Topo {
 // and on the device. They also hold how long a kernel may wait for a peer.
 // The op keeps them, and every kernel of the op takes them.
 
-// Values that follow from the capacities read 0 on one node.
+// Values that follow from the capacities read 0 on one node. Across nodes a
+// proxy's rows of a call are a stream of chunks through its ring, proxy_rows
+// (the proxy's stream, below).
 struct Sizes {
   Topo topo;
   int64_t num_features;
   int64_t num_tables;      // the features' tables, numbered densely (dense_tables)
   int64_t lookup_keys;     // keys an owner looks up (a capacity)
   int64_t remote_keys;     // remote occurrences a proxy deduplicates (a capacity)
-  int64_t num_proxy_rows;  // rows of proxy_rows
-  int64_t rounds_cap;      // the most rounds of a call, what a round table holds
+  int64_t num_proxy_rows;  // rows of proxy_rows, the proxy's ring
   int64_t row_bytes;       // an embedding row (lookup_rows, proxy_rows)
   int64_t partial_rows;    // rows of proxy_rows a requester's fp32 partial row takes
-  int64_t chunk_rows;      // rows of an IB chunk (2 MiB), a multiple of kTaskRows
+  int64_t heavy_at;        // a node-unique key of more occurrences is heavy: kHeavy, or
+                           // local_size * partial_rows when that is more
+  int64_t chunk_rows;      // the most rows of a chunk: 2 MiB, at most half the ring
+  int64_t max_chunks;      // the most chunks of a proxy's stream in a call
   int64_t record_bytes;    // a key record: 8, or 16 with its weight
   bool weights;            // the requesters' keys carry weights
   uint64_t timeout_ns;     // how long a kernel waits for a peer before it traps
@@ -86,6 +92,41 @@ struct Sizes {
   __host__ __device__ bool multi_node() const { return topo.num_nodes > 1; }
   // A row in 16-byte vectors.
   __host__ __device__ int row_vecs() const { return (int)(row_bytes / 16); }
+  // The most rows of one node-unique key in proxy_rows: a key's occurrences
+  // (at most heavy_at), or a heavy key's row and a partial for each GPU of
+  // the node.
+  __host__ __device__ int64_t max_key_rows() const {
+    const int64_t heavy_rows = 1 + topo.local_size * partial_rows;
+    return heavy_rows > heavy_at ? heavy_rows : heavy_at;
+  }
+  // A chunk takes the keys whose rows before them, among their owner node's,
+  // fall in one span of this many rows (chunk_room); a key spans at most
+  // max_key_rows, so a chunk's rows stay within chunk_rows.
+  __host__ __device__ int64_t chunk_room() const { return chunk_rows - max_key_rows() + 1; }
+  // A stream that does not fit the ring takes laps of this many rows of
+  // chunk starts (lap_room); a chunk spans at most chunk_rows, so a lap's
+  // rows stay within the ring.
+  __host__ __device__ int64_t lap_room() const { return num_proxy_rows - chunk_rows + 1; }
+  // The most heavy keys at a proxy in a call: each has more than heavy_at of
+  // its remote_keys occurrences.
+  __host__ __device__ int64_t max_heavy_keys() const { return remote_keys / (heavy_at + 1); }
+  // The GIN counters of the backward's puts (kMaxCounters).
+  __host__ __device__ int64_t counters() const {
+    return max_chunks < kMaxCounters ? max_chunks : kMaxCounters;
+  }
+  // The push-task flags of a call: one per 32 rows or heavy groups of a
+  // requester in a chunk, rounded up.
+  __host__ __device__ int64_t flag_words() const {
+    return remote_keys / kTaskRows + 2 * topo.local_size * max_chunks + 1;
+  }
+  // The most chunks an owner gets from its rail's proxies: each one's stream
+  // holds at most remote_keys / chunk_room + 1 chunks of this owner's node,
+  // and the keys this owner looks up take at most max_key_rows rows each.
+  __host__ __device__ int64_t owner_chunks() const {
+    const int64_t others = topo.num_nodes - 1, room = chunk_room();
+    const int64_t by_proxy = others * remote_keys, by_owner = max_key_rows() * lookup_keys;
+    return others + (by_proxy < by_owner ? by_proxy : by_owner) / room;
+  }
 };
 
 // Each buffer of the window starts at a multiple of kBufferAlign: a buffer of
@@ -96,8 +137,8 @@ __host__ __device__ inline uint64_t buffer_end(uint64_t bytes) {
 }
 
 // Formats of the tables the kernels of a call share (host and device): index
-// dedup's fan-out, the proxy's round table and push orders, its reducer
-// entries and heavy groups, and put lists.
+// dedup's fan-out, the proxy's chunks and push orders, its reducer entries
+// and heavy groups, and put lists.
 
 // Index dedup's fan-out of the requester's deduplicated rows to its original
 // rows (part 1): a row's are exp_idx[exp_off[row] .. exp_off[row + 1]), in
@@ -114,58 +155,58 @@ struct Fanout {
   const int32_t *first;    // [slots] its first sub-task
 };
 
-// ── the proxy's round table and push orders (num_nodes > 1) ──────────────────
-// The proxy lays its rows out in proxy_rows by rounds: round rnd of num_rounds
-// uses half rnd % 2 of proxy_rows (all of it when num_rounds = 1), owner node
-// after owner node; an owner node's piece of a round holds its node-unique keys
-// [uniq_lo, uniq_hi): their rows (the representatives) at
-// off + uniq - uniq_lo, then their duplicates' slots, then the fp32 partial
-// slots of its heavy keys (local_size each). Rounds 0 and 1 are free when an
-// out kernel starts; round rnd + 2 refills round rnd's half once that is done
-// with: in the forward once every requester of the node pulled round rnd (the
-// in-kernel grants), in the backward once the NIC read round rnd's sums
-// (half_free).
-struct RoundPiece {
-  int32_t uniq_lo, uniq_hi;  // the node-unique keys of the piece
-  int32_t off;               // slot of its first row in proxy_rows
-  int32_t chunk;             // the proxy's own table (BwdPlan::round_table): the piece's first
-                             // IB chunk of the backward, numbered over all pieces; else 0
+// ── the proxy's stream and push orders (num_nodes > 1) ──────────────────────
+// A proxy's rows of a call (proxy_rows) are a stream of chunks through its
+// ring of num_proxy_rows rows. A chunk is consecutive node-unique keys of one
+// owner node: those whose rows before them, among their owner node's, fall in
+// one span of chunk_room rows (level j: the owner node's chunk j). Its rows
+// are its keys' rows (the representatives), then its duplicates' slots, then
+// the fp32 partial slots of its heavy keys (local_size each): at most
+// chunk_rows. The stream takes the chunks level after level, owner node after
+// owner node in a level, each right after the one before. Its positions are
+// unwrapped: a stream that fits the ring lies as it is; else its chunks take
+// laps of lap_room rows of starts, lap k from position k * num_proxy_rows, so
+// no chunk crosses the ring's end. A chunk lies at start % num_proxy_rows.
+// Every row of the ring is free when an out kernel starts. A chunk is then
+// done with in the forward once every requester of the node pulled it, in
+// the backward once the NIC read its sums; chunks are done with in order. The
+// rows of a chunk may be written once the first chunk not done with starts
+// at end - num_proxy_rows or later: the relay grants the owners those rows
+// (forward), the issuer frees them for the node's requesters (backward).
+//
+// A chunk as its proxy keeps it (ProxyPlan::chunks): its owner node, its keys
+// [key_lo, key_lo + keys) among the proxy's node-unique keys, the rows its
+// requesters pull of it in the forward (its occurrences), its unwrapped start
+// and end, and its level.
+struct Chunk {
+  int32_t owner_node, key_lo, keys, pulls;
+  uint32_t start, end;
+  int32_t level;  // its place among its owner node's chunks
+  int32_t unused;
 };
-// The push-task flags of one round in push_flags: those of round rnd start at
-// (rnd % 2) * half_flags. A round holds at most half of proxy_rows (all of it
-// when num_rounds = 1), and its flags each cover 32 of its rows or heavy groups
-// (which take more than a row each), per requester rounded up.
-__host__ __device__ inline int64_t half_flags(int64_t num_proxy_rows, int local_size) {
-  return num_proxy_rows / kTaskRows + 2 * local_size;
-}
-// The rounds for `total` rows in proxy_rows: 1 if they fit, else enough of
-// 90% of a half. A round then holds less than half of proxy_rows, so a proxy
-// has one round or at least three, never two.
-__host__ __device__ inline int64_t rounds_for(int64_t total, int64_t num_proxy_rows) {
-  if (total <= num_proxy_rows) return 1;
-  const int64_t room = (int64_t)(0.9 * (double)(num_proxy_rows / 2));
-  return (total + room - 1) / room;
-}
-// The rows proxy_rows needs for every round to fit its half: cut fills a
-// round with up to 90% of a half, its piece of each other owner node up to
-// kHeavy rows over that owner node's share (a key, of at most kHeavy rows, is
-// never split), and the other 10% must hold that much.
-__host__ __device__ inline int64_t min_proxy_rows_for(int num_nodes) {
-  return 20 * (int64_t)kHeavy * (num_nodes - 1);
+// A chunk as its owner reads it (each slice of key_stage starts with the
+// chunks of its owner node): its keys [uniq_lo, uniq_hi) among the owner
+// node's, and its unwrapped start and end.
+struct ChunkPiece {
+  int32_t uniq_lo, uniq_hi;
+  uint32_t start, end;
+};
+// The least rows of proxy_rows: two chunks of keys of the most rows each.
+__host__ __device__ inline int64_t min_proxy_rows_for(int64_t max_key_rows) {
+  return 4 * max_key_rows;
 }
 // A requester's rows for one proxy, sorted by their position in its push
-// order (push_pos): round after round, in each round its rows of keys with a
-// row each, by (IB chunk, owner node), then its heavy groups: its occurrences
-// of each heavy key of the round, in position order. Per round:
+// order (push_pos): chunk after chunk, in each chunk its rows of keys with a
+// row each, then its heavy groups: its occurrences of each heavy key of the
+// chunk, in position order. Per chunk:
 struct ReqEntry {
-  int32_t start;   // first position of the round (round num_rounds: the end of its
-                   // rows)
+  int32_t start;   // first position of the chunk (chunk max_chunks: the end of its rows)
   int32_t heavy;   // first position of its heavy groups
-  int32_t flags;   // its first push-task flag of the round (in the round's half of
-                   // push_flags): ceil(rows / 32) tasks of rows, then ceil(groups / 32)
-                   // of heavy partials, after those of the lower requesters
+  int32_t flags;   // its first push-task flag of the chunk in the proxy's push_flags: ceil(rows
+                   // / 32) tasks of rows, then ceil(groups / 32) of heavy partials, after
+                   // those of the chunks before and of the lower requesters
   int32_t groups;  // its first heavy group (index into the heavy groups;
-                   // round num_rounds: the end of its groups)
+                   // chunk max_chunks: the end of its groups)
 };
 // An entry of a proxy's reducer list (planner.h, reducer_entries): a slot of
 // proxy_rows in the low word, with kEntryPartial for a heavy key's fp32
@@ -183,8 +224,10 @@ struct HeavyGroup {
   int32_t start, end;
 };
 // A segment of a put list: `rows` rows from src to dst (rows of the source and
-// destination buffers), all in one feature's cell of the owner's KJT; for the
-// backward also its IB chunk, whose ready counter it waits for.
+// destination buffers), all in one chunk and in one feature's cell of the
+// owner's KJT; and its chunk, in the list's chunks: the backward's the
+// proxy's (whose ready counter it waits for), the forward's the pieces its
+// owner got (whose end it waits for in the grant).
 struct PutSeg {
   int32_t src, dst, rows, chunk;
 };
@@ -198,8 +241,7 @@ struct PutSeg {
 //   lookup_keys  keys an owner looks up (lookup_rows, the KJT)
 //   remote_keys  remote occurrences a proxy deduplicates (the remote part of
 //                node_keys, remote_map, key_stage; num_nodes > 1)
-//   rounds       rounds of a proxy (num_nodes > 1; never an overflow)
-enum Need : int { kNeedLookupKeys = 0, kNeedRemoteKeys, kNeedRounds, kNumNeeds };
+enum Need : int { kNeedLookupKeys = 0, kNeedRemoteKeys, kNumNeeds };
 
 // The status of one call (int64 words), which the caller copies to the host
 // once, at the call's second wait (shard/input_dist.py reads it by these
@@ -224,25 +266,26 @@ __host__ __device__ inline int status_words(int num_features) {
 // GIN between nodes: its contexts, and the signals and counters of each.
 
 // GIN between nodes (num_nodes > 1): 4 contexts on the rail connection, each
-// with 3 signals per node and 2 counters, all starting at 0 (checked once),
-// every one a running total that is never reset. A signal belongs to one
-// context, whose QP to a peer executes in order, and is named after the
-// sender's node:
+// with 3 signals per node and Sizes::counters counters, all starting at 0
+// (checked once), every one a running total that is never reset. A signal
+// belongs to one context, whose QP to a peer executes in order, and is named
+// after the sender's node:
 //   context 0 (forward rows)   fwd_rows[owner_node]: rows the owner on that node
 //                              put into this proxy's proxy_rows;
 //   context 1 (backward rows)  bwd_rows[node]: gradient rows the proxy on that
 //                              node put into this owner's lookup_rows; counter
-//                              sent[half]: this proxy's backward puts out of
-//                              that half of proxy_rows whose source the NIC has
-//                              read (in calls of more than one round; one
-//                              round's puts count on none);
+//                              k: this proxy's backward puts out of the chunks
+//                              c with c % counters == k whose source the NIC
+//                              has read (in calls whose stream wraps the ring;
+//                              the others' puts count on none);
 //   context 2 (in channel)     count[node] counts the count messages from the
 //                              rail peer on that node, keys[node] its key
 //                              streams (one put, or a payload-free signal, per
 //                              call each);
-//   context 3 (credits)        grant[node] = (out_seq << 20) | rounds of
-//                              proxy_rows the proxy on that node lets this
-//                              owner fill, bwd_ready[owner_node] = the out_seq
+//   context 3 (credits)        grant[node] = tag_of(out_seq, position): the
+//                              proxy on that node lets this owner fill the
+//                              rows of its stream below that position
+//                              (unwrapped), bwd_ready[owner_node] = the out_seq
 //                              of the backward whose rows the owner on that
 //                              node lets this proxy put into its lookup_rows,
 //                              closing[node]: the rail peer on that node tears
@@ -252,7 +295,6 @@ __host__ __device__ inline int status_words(int num_features) {
 // and name the out kernel they admit.
 constexpr int kGinContexts = 4;
 constexpr int kGinSignalsPerNode = 3;
-constexpr int kGinCounters = 2;
 constexpr int kCtxFwd = 0;
 constexpr int kCtxBwd = 1;
 constexpr int kCtxIn = 2;
@@ -266,8 +308,10 @@ __host__ __device__ inline int sig_bwd_ready(int num_nodes, int owner_node) {
   return num_nodes + owner_node;
 }
 __host__ __device__ inline int sig_closing(int num_nodes, int node) { return 2 * num_nodes + node; }
-__host__ __device__ inline uint64_t grant_of(int64_t out_seq, int rounds) {
-  return ((uint64_t)out_seq << 20) | (uint64_t)rounds;
+// A word that names an out kernel and a value of it (a position of a stream,
+// a chunk), which grows with both.
+__host__ __device__ inline uint64_t tag_of(int64_t out_seq, uint64_t value) {
+  return ((uint64_t)out_seq << 32) | value;
 }
 
 // Whether the build keeps the hierarchical dist's trace: DYNAMICEMB_HIER_TRACE=1
@@ -304,8 +348,8 @@ enum TraceSlots : int {
   kTraceEntered = kNumEarliest,  // the last CTA passed the entry barrier
   kTraceLastPut,                 // (num_nodes > 1) this rank posted its last row put
   kTracePutsDone,                // (num_nodes > 1) every row put it posted had completed (the
-                                 // issuer's flush; a backward of more than one round: the
-                                 // put counters)
+                                 // issuer's flush; a backward whose stream wraps: the put
+                                 // counters)
   kTraceLanded,                  // (num_nodes > 1) every row other nodes send this rank had landed
   kTraceNvLast,                  // a worker ended its last task that moved rows over NVLink
   kTraceArrived,                 // the last CTA arrived: this rank's rows have all moved

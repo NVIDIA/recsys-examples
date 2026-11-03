@@ -160,20 +160,20 @@ InDist InChannel::input_dist(const PlanInput &input) {
     length_per_key = owner.length_per_key;
   } else {
     // The proxy: the node-unique keys of its remote part, their rows and
-    // rounds, and its node's push orders (into remote_map, key_stage and
-    // the proxy header).
+    // the chunks of its stream, and its node's push orders (into
+    // remote_map, key_stage and the proxy header).
     ProxyKeys keys = proxy_keys(ProxyInput{remote_keys_, remote_weights_, remote_cells_,
                                            node.requester_start, node.skip, tables_},
                                 sizes_, node_dedup_);
-    ProxyRounds rounds = proxy_rounds_and_slots(keys, node.requester_start, proxy_buffers_, sizes_);
-    const ProxyPlan proxy = proxy_push_order(std::move(keys), std::move(rounds),
+    ProxyChunks chunks = proxy_chunks_and_slots(keys, node.requester_start, proxy_buffers_, sizes_);
+    const ProxyPlan proxy = proxy_push_order(std::move(keys), std::move(chunks),
                                              node.requester_start, proxy_buffers_, sizes_);
     // The rail: the count messages, the layout of the rail, then the
     // proxies' key records into the owners' rail_keys and the owners' cell
     // starts into the proxies' rail_cells.
     const at::Tensor message =
-        count_message(node.need_remote, proxy.num_rounds, node.own_total.select(0, topo.local_rank),
-                      proxy.uniq_out, proxy.cell_uniq);
+        count_message(node.need_remote, node.own_total.select(0, topo.local_rank), proxy.uniq_out,
+                      proxy.chunks_out, proxy.cell_uniq);
     const at::Tensor messages = rail_count_exchange(message);
     const RailLayout rail = rail_layout(messages, node.own_cells, other_nodes_, sizes_);
     cell_stage_.copy_(rail.cell_stage);
@@ -193,35 +193,35 @@ InDist InChannel::input_dist(const PlanInput &input) {
     words = at::Tensor();  // requester_tables is its one reader: free it before the owner tables
     const OwnerTables owner = owner_tables(rail, node.own_starts, own_keys_, own_weights_,
                                            rail_keys_, other_nodes_, sizes_);
-    const PutLists lists =
-        put_lists(proxy.round_table, proxy.num_rounds, proxy.cell_uniq, rail_cells_,
-                  owner.fwd_pieces, owner.fwd_rounds, rail.cells_in, rail.cell_stage, sizes_);
+    const PutLists lists = put_lists(proxy.chunks, proxy.node_chunk_start, proxy.node_chunks,
+                                     proxy.uniq_off, proxy.cell_uniq, rail_cells_, owner.fwd_chunks,
+                                     owner.fwd_chunk_start, rail.cells_in, rail.cell_stage, sizes_);
     // The plans: the requester's maps and its tables of the node's proxies,
     // the owner's and the proxy's tables, the proxy's reducer list and the
     // put lists. Then the owner's KJT.
     fwd.src = requester.src;
     bwd.dst = requester.dst;
     fwd.push_order = bwd.push_order = requester.push_order;
-    fwd.proxy_rounds = bwd.proxy_rounds = requester.proxy_rounds;
+    fwd.proxy_chunks = bwd.proxy_chunks = requester.proxy_chunks;
+    fwd.proxy_ends = bwd.proxy_ends = requester.proxy_ends;
     fwd.push_tables = bwd.push_tables = requester.push_tables;
-    fwd.num_rounds = bwd.num_rounds = proxy.num_rounds;
+    fwd.num_chunks = bwd.num_chunks = proxy.num_chunks;
+    fwd.chunks = bwd.chunks = proxy.chunks;
+    fwd.uniq_off = bwd.uniq_off = proxy.uniq_off;
     fwd.put_list = bwd.put_list = lists.list;
-    fwd.proxy_round_tables = requester.proxy_round_tables;
+    fwd.put_starts = bwd.put_starts = lists.starts;
     fwd.push_order_off = requester.push_order_off;
     fwd.fwd_task_starts = requester.fwd_task_starts;
-    fwd.fwd_put_start = lists.fwd_start;
+    fwd.fwd_chunks = owner.fwd_chunks;
+    fwd.node_chunk_start = proxy.node_chunk_start;
+    fwd.node_chunks = proxy.node_chunks;
     fwd.uniq_out = proxy.uniq_out;
-    fwd.push_start = proxy.push_start;
     bwd.heavy_groups = requester.heavy_groups;
     bwd.group_first_sub = requester.group_first_sub;
     bwd.group_of_sub = requester.group_of_sub;
     bwd.bwd_task_starts = requester.bwd_task_starts;
     bwd.uniq_in = rail.uniq_in;
-    bwd.num_chunks = lists.num_chunks;
-    bwd.uniq_off = proxy.uniq_off;
-    bwd.round_table = lists.round_table;
-    bwd.bwd_put_start = lists.bwd_start;
-    bwd.reduce_task_starts = lists.reduce_task_starts;
+    bwd.reduce_task_starts = proxy.reduce_task_starts;
     bwd.reducer_start = proxy.reducer_start;
     bwd.reducer_entries = proxy.reducer_entries;
     dist.kjt_values = owner.kjt_values;

@@ -30,7 +30,7 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 // deduplicated row, whose original rows the fan-out lists. Across nodes the
 // requester's push order, heavy groups and its tables of the node's proxies,
 // the owner's and the proxy's tables, and the put lists say the rest
-// (planner.h makes them); the tables' strides are rounds_cap and num_nodes.
+// (planner.h makes them); the tables' strides are max_chunks and num_nodes.
 // On one node the tables across nodes are undefined, nullptr in the views.
 #pragma once
 
@@ -52,21 +52,51 @@ struct PlanView {
   const int64_t *block_start;  // [world_size + 1]
   const int32_t *inv;          // [rows]
   Fanout fanout;               // fanout.exp_off: index dedup
-  // across nodes
-  const int32_t *push_order;    // [rows] the requester's remote rows by proxy and push order
-  const int64_t *proxy_rounds;  // [local_size] each same-node proxy's rounds
-  const ReqEntry *push_tables;  // [local_size][rounds_cap + 1] its push order at each proxy,
+  // across nodes, the requester's
+  const int32_t *push_order;    // [rows] its remote rows by proxy and push order
+  const int64_t *proxy_chunks;  // [local_size] the chunks of each same-node proxy's stream
+  const int64_t *proxy_ends;    // [local_size][max_chunks + 1] each one's chunk ends, then its
+                                // stream's end
+  const ReqEntry *push_tables;  // [local_size][max_chunks + 1] its push order at each proxy,
                                 // positions absolute in push_order, groups in heavy_groups
-  const int64_t *num_rounds;    // the proxy's rounds
-  const PutSeg *put_list;       // the owner's forward and the proxy's backward put lists
-                                // (planner.h)
-  int64_t rounds_cap;
+  // across nodes, the proxy's
+  const int64_t *num_chunks;  // the chunks of its stream
+  const Chunk *chunks;        // [max_chunks] its chunks, in stream order
+  const int64_t *uniq_off;    // [num_nodes + 1] its first node-unique key of each owner node
+  // across nodes, the owner's forward and the proxy's backward put lists
+  // (planner.h): the segments of each node from put_starts[node]
+  const PutSeg *put_list;
+  const int32_t *put_starts;  // [2 * num_nodes + 1]: the backward's owner nodes, then the
+                              // forward's proxy nodes
+  int64_t max_chunks, ring;
   int num_nodes;
 
-  // This rank's push order at a same-node proxy in a round; the next entry
+  // This rank's push order at a same-node proxy in a chunk; the next entry
   // holds the ends.
-  __device__ __forceinline__ const ReqEntry *push_entry(int proxy, int rnd) const {
-    return push_tables + (int64_t)proxy * (rounds_cap + 1) + rnd;
+  __device__ __forceinline__ const ReqEntry *push_entry(int proxy, int64_t chunk) const {
+    return push_tables + (int64_t)proxy * (max_chunks + 1) + chunk;
+  }
+  // The end of a same-node proxy's chunk (chunk max_chunks: its stream's end).
+  __device__ __forceinline__ int64_t proxy_end(int proxy, int64_t chunk) const {
+    return proxy_ends[(int64_t)proxy * (max_chunks + 1) + chunk];
+  }
+  // Whether a same-node proxy's stream wraps its ring.
+  __device__ __forceinline__ bool wraps(int proxy) const {
+    return proxy_end(proxy, max_chunks) > ring;
+  }
+  // The chunk of a same-node proxy's stream that holds row `at` of its ring,
+  // when the stream fits the ring: the first that ends past it.
+  __device__ __forceinline__ int64_t chunk_at(int proxy, int64_t at) const {
+    const int64_t chunks = proxy_chunks[proxy];
+    int64_t lo = 0, hi = chunks;
+    while (lo < hi) {
+      const int64_t mid = (lo + hi) / 2;
+      if (proxy_end(proxy, mid) <= at)
+        lo = mid + 1;
+      else
+        hi = mid;
+    }
+    return min(lo, max(chunks - 1, (int64_t)0));
   }
 };
 
@@ -74,34 +104,23 @@ struct PlanView {
 struct FwdPlanView : PlanView {
   const int32_t *src;  // [rows]
   // across nodes, the requester's
-  const RoundPiece *proxy_round_tables;  // [local_size][rounds_cap][num_nodes] the round tables
-                                         // of the node's proxies
-  const int64_t *push_order_off;         // [local_size + 1] where its rows for each proxy start
-                                         // in push_order
-  const int64_t *fwd_task_starts;        // [rounds_cap + 1] its tasks of rows of other nodes before
-                                         // each round, round after round: per round a slot per task
-                                         // of its busiest proxy there (32 positions of its push
-                                         // order), proxies in turn
+  const int64_t *push_order_off;   // [local_size + 1] where its rows for each proxy start in
+                                   // push_order
+  const int64_t *fwd_task_starts;  // [max_chunks * local_size + 1] its tasks of rows of other nodes
+                                   // before each (chunk, proxy in turn from its own): 32 positions
+                                   // of its push order there each
   // across nodes, the owner's
-  const int32_t *fwd_put_start;  // [num_nodes][rounds_cap + 1] (fwd_puts)
+  const ChunkPiece *fwd_chunks;  // [owner_chunks] the chunks of its node in each source node's
+                                 // stream, its forward put list's (PutSeg::chunk)
   // across nodes, the proxy's
-  const int64_t *uniq_out;    // [num_nodes] its node-unique keys of each owner node
-  const int32_t *push_start;  // [local_size][rounds_cap + 1] (push_starts)
+  const int64_t *node_chunk_start;  // [num_nodes + 1] where each owner node's chunks start in
+                                    // node_chunks
+  const int32_t *node_chunks;       // [max_chunks] each owner node's chunks in order
+  const int64_t *uniq_out;          // [num_nodes] its node-unique keys of each owner node
 
-  // Where an owner node's node-unique keys of a round sit in a same-node
-  // proxy's proxy_rows.
-  __device__ __forceinline__ RoundPiece piece(int proxy, int rnd, int owner_node) const {
-    return proxy_round_tables[((int64_t)proxy * rounds_cap + rnd) * num_nodes + owner_node];
-  }
-  // The owner's forward put list's segments for a proxy node, by round: those
-  // of round rnd from [rnd], and [rounds_cap] the node's end.
-  __device__ __forceinline__ const int32_t *fwd_puts(int proxy_node) const {
-    return fwd_put_start + (int64_t)proxy_node * (rounds_cap + 1);
-  }
-  // Where a same-node requester's rows of each round start in its push order
-  // at this proxy ([num_rounds]: the end).
-  __device__ __forceinline__ const int32_t *push_starts(int requester) const {
-    return push_start + (int64_t)requester * (rounds_cap + 1);
+  // The owner's forward put list's segments for a proxy node.
+  __device__ __forceinline__ int64_t fwd_puts(int proxy_node) const {
+    return put_starts[num_nodes + proxy_node];
   }
 };
 
@@ -112,35 +131,23 @@ struct BwdPlanView : PlanView {
   const HeavyGroup *heavy_groups;  // heavy groups, positions in push_order
   const int32_t *group_first_sub;  // each heavy group's first sub-task
   const int32_t *group_of_sub;     // the heavy group of each sub-task
-  const int64_t *bwd_task_starts;  // [2 rounds_cap + 1] its tasks the way fwd_task_starts are:
-                                   // before round rnd's push tasks of heavy groups (2 * rnd),
-                                   // and before those of its rows (2 * rnd + 1)
+  const int64_t *bwd_task_starts;  // [2 * max_chunks * local_size + 1] its tasks the way
+                                   // fwd_task_starts are, each chunk's of heavy groups of every
+                                   // proxy, then of its rows
   // across nodes, the owner's
   const int64_t *uniq_in;  // [num_nodes] node-unique keys from each source node
   // across nodes, the proxy's
-  const int64_t *num_chunks;          // IB chunks of its backward puts
-  const int64_t *uniq_off;            // [num_nodes + 1] its first node-unique key of each owner
-                                      // node, over all (the reducer list's index)
-  const RoundPiece *round_table;      // [rounds_cap][num_nodes] its round table
-  const int32_t *bwd_put_start;       // [num_nodes][rounds_cap + 1] (bwd_puts)
-  const int64_t *reduce_task_starts;  // [rounds_cap + 1] its reducers' tasks before each round:
-                                      // per round its busiest owner node's IB chunks, times the
-                                      // owner nodes, times the tasks of a chunk (32 keys each)
+  const int64_t *reduce_task_starts;  // [max_chunks + 1] its reducers' tasks before each chunk
+                                      // (32 keys each)
   const int32_t *reducer_start;       // the reducer list (planner.h)
   const int64_t *reducer_entries;
   // the plan's counts (BwdPlan)
   int64_t heavy_subs;  // index dedup: sub-tasks of the requester's heavy rows
   int64_t group_subs;  // across nodes: sub-tasks of its heavy groups
 
-  // Where an owner node's node-unique keys of a round sit in this proxy's
-  // proxy_rows, and their first IB chunk.
-  __device__ __forceinline__ RoundPiece round_piece(int rnd, int owner_node) const {
-    return round_table[(int64_t)rnd * num_nodes + owner_node];
-  }
-  // The proxy's backward put list's segments for an owner node, by round:
-  // those of round rnd from [rnd], and [rounds_cap] the node's end.
-  __device__ __forceinline__ const int32_t *bwd_puts(int owner_node) const {
-    return bwd_put_start + (int64_t)owner_node * (rounds_cap + 1);
+  // The proxy's backward put list's segments for an owner node.
+  __device__ __forceinline__ int64_t bwd_puts(int owner_node) const {
+    return put_starts[owner_node];
   }
 };
 
@@ -157,10 +164,10 @@ struct FwdPlan {
   at::Tensor inv;          // int32 [rows]
   FanoutTables fanout;     // index dedup's, or none
   // across nodes, the tables both kernels read
-  at::Tensor push_order, proxy_rounds, push_tables, num_rounds, put_list;
+  at::Tensor push_order, proxy_chunks, proxy_ends, push_tables, num_chunks, chunks, uniq_off,
+      put_list, put_starts;
   // across nodes, the forward's own
-  at::Tensor proxy_round_tables, push_order_off, fwd_task_starts, fwd_put_start, uniq_out,
-      push_start;
+  at::Tensor push_order_off, fwd_task_starts, fwd_chunks, node_chunk_start, node_chunks, uniq_out;
 
   // Rows of the requester's output: its input's rows (under index dedup the
   // original ones).
@@ -183,10 +190,11 @@ struct BwdPlan {
   at::Tensor inv;          // int32 [rows]
   FanoutTables fanout;     // index dedup's, or none
   // across nodes, the tables both kernels read
-  at::Tensor push_order, proxy_rounds, push_tables, num_rounds, put_list;
+  at::Tensor push_order, proxy_chunks, proxy_ends, push_tables, num_chunks, chunks, uniq_off,
+      put_list, put_starts;
   // across nodes, the backward's own
-  at::Tensor heavy_groups, group_first_sub, group_of_sub, bwd_task_starts, uniq_in, num_chunks,
-      uniq_off, round_table, bwd_put_start, reduce_task_starts, reducer_start, reducer_entries;
+  at::Tensor heavy_groups, group_first_sub, group_of_sub, bwd_task_starts, uniq_in,
+      reduce_task_starts, reducer_start, reducer_entries;
 
   BwdPlanView view(const Sizes &sizes) const;
   std::vector<at::Tensor> tensors() const;

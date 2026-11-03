@@ -51,15 +51,18 @@ struct CountVector {
 
 // A count message (int64 words, planner.h), all a rail peer needs to lay
 // out the keys its rail puts: a common part, the same for every peer (its
-// node's largest remote part, its rounds as proxy, the keys of its own node
-// it looks up as owner, and its node-unique keys per owner node), then the
+// node's largest remote part, the keys of its own node it looks up as owner,
+// and as proxy its node-unique keys and its chunks per owner node), then the
 // part for the peer's node alone (its node-unique keys of each feature
 // there).
 struct CountMessage {
-  static constexpr int kNeedRemote = 0, kRounds = 1, kOwnTotal = 2;
+  static constexpr int kNeedRemote = 0, kOwnTotal = 1;
   int64_t num_nodes, num_features;
-  __host__ __device__ int64_t uniq_out(int64_t owner_node) const { return 3 + owner_node; }
-  __host__ __device__ int64_t common() const { return 3 + num_nodes; }
+  __host__ __device__ int64_t uniq_out(int64_t owner_node) const { return 2 + owner_node; }
+  __host__ __device__ int64_t chunks_out(int64_t owner_node) const {
+    return 2 + num_nodes + owner_node;
+  }
+  __host__ __device__ int64_t common() const { return 2 + 2 * num_nodes; }
   // A message as a peer gets it: the common part, then the part for its node.
   __host__ __device__ int64_t length() const { return common() + num_features; }
   // What a rank sends from: the common part, then the part for each node.
@@ -76,22 +79,21 @@ struct CountMessage {
 
 // The ctrl section (uint64 words): every control word of both channels and
 // the device state they keep across calls. Its size depends only on
-// local_size, num_nodes and num_features. Every control word is tagged with
-// its channel's sequence number, is a running total, or is back at its start
-// value when the kernel that uses it ends. The data words (the count vectors,
-// cell_start, the needs, the count messages) are written whole in each call,
-// before a tagged word, the node barrier or a signal publishes them. So none
-// is ever reset, and a call that overflowed leaves all of them valid for the
-// next. Words marked (local) are only this rank's: a GIN warp's place with
-// each peer, which it sets when it starts. Words marked (num_nodes > 1) exist
-// across nodes only. Each accessor returns the address of a word, or of the
-// first of an array of them, in the copy at `base`.
+// local_size, num_nodes, num_features and the most chunks of a stream. Every control word is tagged
+// with its channel's sequence number, is a running total, or is back at its start value when the
+// kernel that uses it ends. The data words (the count vectors, cell_start, the needs, the count
+// messages) are written whole in each call, before a tagged word, the node barrier or a signal
+// publishes them. So none is ever reset, and a call that overflowed leaves all of them valid for
+// the next. Words marked (local) are only this rank's: a GIN warp's place with each peer, which it
+// sets when it starts. Words marked (num_nodes > 1) exist across nodes only. Each accessor returns
+// the address of a word, or of the first of an array of them, in the copy at `base`.
 class CtrlLayout {
  public:
   __host__ __device__ CtrlLayout(const Sizes &sizes, void *base)
       : base_((uint64_t *)base),
         num_nodes_(sizes.topo.num_nodes),
         num_features_(sizes.num_features),
+        counters_(sizes.counters()),
         count_{sizes.topo.local_size, sizes.num_features},
         message_{sizes.topo.num_nodes, sizes.num_features} {
     const int64_t local_size = sizes.topo.local_size, num_nodes = num_nodes_;
@@ -119,11 +121,11 @@ class CtrlLayout {
     bwd_tot_ = take(multi ? num_nodes : 0);
     grant_sent_ = take(multi ? num_nodes : 0);
     bwd_ready_sent_ = take(multi ? num_nodes : 0);
-    put_at_ = take(multi ? 2 * num_nodes : 0);
-    relay_want_ = take(multi ? 2 * local_size : 0);
-    posted_ = take(multi ? 2 : 0);
-    done_ = take(multi ? 2 * local_size : 0);
-    half_free_ = take(multi ? 1 : 0);
+    put_at_ = take(multi ? num_nodes : 0);
+    landed_ = take(multi ? sizes.max_chunks : 0);
+    pulled_rows_ = take(multi ? sizes.max_chunks : 0);
+    posted_ = take(multi ? counters_ : 0);
+    slot_free_ = take(multi ? 1 : 0);
     closing_ = take(1);
     closed_ = take(1);
     words_ = next;
@@ -195,30 +197,27 @@ class CtrlLayout {
   __host__ __device__ uint64_t *bwd_ready_sent(int64_t proxy_node) const {
     return word(bwd_ready_sent_ + proxy_node);
   }
-  // (num_nodes > 1, local) [2] an issuer's place in its put list for the
-  // rail peer on node peer_node: its next segment, and that segment's round
+  // (num_nodes > 1, local) an issuer's place in its put list for the rail
+  // peer on node peer_node: its next segment
   __host__ __device__ int64_t *put_at(int64_t peer_node) const {
-    return (int64_t *)word(put_at_ + 2 * peer_node);
+    return (int64_t *)word(put_at_ + peer_node);
   }
-  // (num_nodes > 1, local) the done word the forward's relay waits for of a
-  // requester, of its even (parity 0) or its odd rounds
-  __host__ __device__ uint64_t *relay_want(int64_t requester, int parity) const {
-    return word(relay_want_ + 2 * requester + parity);
+  // (num_nodes > 1) [max_chunks] the out_seq of the forward in which every
+  // row of chunk c of this proxy's stream had landed (the relay)
+  __host__ __device__ uint64_t *landed(int64_t chunk) const { return word(landed_ + chunk); }
+  // (num_nodes > 1) [max_chunks] rows the node's requesters pulled of chunk c
+  // of this proxy's stream in a forward whose stream wraps the ring; the
+  // relay zeroes those of its chunks before any of them lands
+  __host__ __device__ uint64_t *pulled_rows(int64_t chunk) const {
+    return word(pulled_rows_ + chunk);
   }
-  // (num_nodes > 1, local) backward puts this proxy posted in calls of more
-  // than one round, out of a half of proxy_rows: what its put counters count
-  __host__ __device__ uint64_t *posted(int half) const { return word(posted_ + half); }
-  // (num_nodes > 1) rows a same-node requester pulled from this proxy's
-  // proxy_rows in forwards of more than one round, of its even (parity 0) or
-  // its odd rounds: running totals, which tell the relay a round's half is
-  // free again
-  __host__ __device__ uint64_t *done(int64_t requester, int parity) const {
-    return word(done_ + 2 * requester + parity);
-  }
-  // (num_nodes > 1) grant_of(out_seq, rnd): this proxy's node may push the
-  // gradient rows of rounds up to rnd of that backward into its proxy_rows
-  // (rounds 0 and 1 need none)
-  __host__ __device__ uint64_t *half_free() const { return word(half_free_); }
+  // (num_nodes > 1, local) [counters] backward puts this proxy posted on each
+  // put counter, in calls whose stream wraps: what the counter counts
+  __host__ __device__ uint64_t *posted(int64_t counter) const { return word(posted_ + counter); }
+  // (num_nodes > 1) tag_of(out_seq, position): this proxy's node may push
+  // the gradient rows of that backward's stream below that position into
+  // its proxy_rows (the rows below num_proxy_rows need none)
+  __host__ __device__ uint64_t *slot_free() const { return word(slot_free_); }
 
   // ── teardown ──
   // this rank reads no window any more
@@ -230,13 +229,13 @@ class CtrlLayout {
   __host__ __device__ uint64_t *word(int64_t at) const { return base_ + at; }
 
   uint64_t *base_;
-  int64_t num_nodes_, num_features_;
+  int64_t num_nodes_, num_features_, counters_;
   CountVector count_;
   CountMessage message_;
   int64_t in_started_, count_vectors_, in_written_, cell_start_, in_done_, count_msg_out_,
       count_msgs_;
   int64_t out_started_, pushed_, pulled_, arrive_, tasks_, landed_rows_, fwd_tot_, bwd_tot_,
-      grant_sent_, bwd_ready_sent_, put_at_, relay_want_, posted_, done_, half_free_;
+      grant_sent_, bwd_ready_sent_, put_at_, landed_, pulled_rows_, posted_, slot_free_;
   int64_t closing_, closed_, words_;
 };
 
@@ -245,35 +244,36 @@ class CtrlLayout {
 // header and remote_map.
 
 // The proxy header (int32 words), what a proxy publishes to its node's
-// requesters: its rounds at word 0; from word 4 its round table, RoundPiece
-// [rounds_cap][num_nodes]; then its push tables, ReqEntry [local_size]
-// [rounds_cap + 1], positions relative to each requester's push order there
-// and groups relative to its first group. A requester gathers the words it
-// reads (planner.h) by their word numbers.
+// requesters: its stream's chunks at word 0 and its end at word 1 (uint32,
+// unwrapped: past num_proxy_rows when the stream wraps the ring); from word
+// 4 each chunk's end ([max_chunks], uint32); then its push tables, ReqEntry
+// [local_size][max_chunks + 1], positions relative to each requester's push
+// order there and groups relative to its first group. A requester gathers
+// the words it reads (planner.h) by their word numbers.
 struct ProxyHeader {
-  static constexpr int64_t kRoundsWord = 0, kTableWord = 4;
+  static constexpr int64_t kChunksWord = 0, kEndWord = 1, kEndsWord = 4;
   int32_t *base;
-  int64_t num_nodes, local_size, rounds_cap;
+  int64_t local_size, max_chunks;
   // The header of a proxy of these sizes at `base` (nullptr: its word numbers
   // alone).
   __host__ __device__ static ProxyHeader of(const Sizes &sizes, int32_t *base = nullptr) {
-    return ProxyHeader{base, sizes.topo.num_nodes, sizes.topo.local_size, sizes.rounds_cap};
+    return ProxyHeader{base, sizes.topo.local_size, sizes.max_chunks};
   }
-  __host__ __device__ int64_t table_words() const { return 4 * rounds_cap * num_nodes; }
-  __host__ __device__ int64_t push_words() const { return 4 * (rounds_cap + 1); }
+  __host__ __device__ int64_t push_words() const { return 4 * (max_chunks + 1); }
   __host__ __device__ int64_t push_table_word(int64_t requester) const {
-    return kTableWord + table_words() + requester * push_words();
+    return kEndsWord + max_chunks + requester * push_words();
   }
   __host__ __device__ int64_t words() const { return push_table_word(local_size); }
-  __host__ __device__ int32_t *rounds() const { return base + kRoundsWord; }
-  __host__ __device__ int32_t *round_table() const { return base + kTableWord; }
+  __host__ __device__ int32_t *chunks() const { return base + kChunksWord; }
+  __host__ __device__ uint32_t *end() const { return (uint32_t *)(base + kEndWord); }
+  __host__ __device__ uint32_t *ends() const { return (uint32_t *)(base + kEndsWord); }
   __host__ __device__ int32_t *push_table(int64_t requester) const {
     return base + push_table_word(requester);
   }
-  // What a requester gathers of a header, in this order: the rounds, the
-  // round table, then its own push table.
-  static constexpr int64_t kGatheredRounds = 0, kGatheredTable = 1;
-  __host__ __device__ int64_t gathered_push_table() const { return kGatheredTable + table_words(); }
+  // What a requester gathers of a header, in this order: the chunks, the
+  // end, each chunk's end, then its own push table.
+  static constexpr int64_t kGatheredChunks = 0, kGatheredEnd = 1, kGatheredEnds = 2;
+  __host__ __device__ int64_t gathered_push_table() const { return kGatheredEnds + max_chunks; }
   __host__ __device__ int64_t gathered_words() const {
     return gathered_push_table() + push_words();
   }
@@ -321,11 +321,12 @@ __host__ __device__ inline int gather_words(GatherFrom from) {
 //   remote_map    (num_nodes > 1) RemoteMap
 //   proxy_header  (num_nodes > 1) ProxyHeader
 //   key_stage     (num_nodes > 1) the node-unique key records of each owner
-//                 node, each slice after its round pieces: what one key put
-//                 sends; then 16 bytes that take what no key writes
+//                 node, each slice after the node's chunks (ChunkPiece): what
+//                 one key put sends; then 16 bytes that take what no key
+//                 writes
 //   rail_keys     (num_nodes > 1) the key records the rail proxies put, one
-//                 slice per source node in node order, each its round pieces,
-//                 then its records in uniq order
+//                 slice per source node in node order, each the chunks of
+//                 this rank's node there, then its records in uniq order
 //   cell_stage    (num_nodes > 1) int64 [num_nodes][num_features]: as owner,
 //                 where the cells (feature, source node) of each rail proxy's
 //                 node start in its KJT, what it puts to that proxy
@@ -342,11 +343,9 @@ class KeysLayout {
         num_features_(sizes.num_features),
         lookup_keys_(sizes.lookup_keys),
         remote_keys_(sizes.remote_keys),
-        rounds_cap_(sizes.rounds_cap) {
+        max_chunks_(sizes.max_chunks) {
     const bool multi = num_nodes_ > 1;
     const uint64_t entries = (uint64_t)(lookup_keys_ + remote_keys_);
-    // a slice's round pieces, of every other owner node
-    const uint64_t pieces = (uint64_t)(num_nodes_ - 1) * rounds_cap_ * sizeof(RoundPiece);
     uint64_t next = 0;
     auto take = [&](uint64_t bytes) {
       const uint64_t at = next;
@@ -358,9 +357,11 @@ class KeysLayout {
     remote_cells_ = take(multi ? 4 * (uint64_t)remote_keys_ : 0);
     remote_map_ = take(multi ? 4 * RemoteMap::kArrays * (uint64_t)remote_keys_ : 0);
     proxy_header_ = take(multi ? 4 * (uint64_t)ProxyHeader::of(sizes).words() : 0);
-    key_stage_bytes_ = multi ? pieces + remote_keys_ * sizes.record_bytes + 16 : 0;
+    key_stage_bytes_ =
+        multi ? max_chunks_ * sizeof(ChunkPiece) + remote_keys_ * sizes.record_bytes + 16 : 0;
     key_stage_ = take(key_stage_bytes_);
-    rail_keys_bytes_ = multi ? lookup_keys_ * sizes.record_bytes + pieces : 0;
+    rail_keys_bytes_ =
+        multi ? lookup_keys_ * sizes.record_bytes + sizes.owner_chunks() * sizeof(ChunkPiece) : 0;
     rail_keys_ = take(rail_keys_bytes_);
     cell_stage_ = take(multi ? 8 * (uint64_t)(num_nodes_ * num_features_) : 0);
     rail_cells_ = take(multi ? 8 * (uint64_t)(num_nodes_ * num_features_) : 0);
@@ -390,7 +391,7 @@ class KeysLayout {
     return RemoteMap{(int32_t *)(base_ + remote_map_), remote_keys_};
   }
   __host__ __device__ ProxyHeader proxy_header() const {
-    return ProxyHeader{(int32_t *)(base_ + proxy_header_), num_nodes_, local_size_, rounds_cap_};
+    return ProxyHeader{(int32_t *)(base_ + proxy_header_), local_size_, max_chunks_};
   }
   // key_stage and rail_keys, and their bytes
   __host__ __device__ char *key_stage() const { return base_ + key_stage_; }
@@ -407,7 +408,7 @@ class KeysLayout {
 
  private:
   char *base_;
-  int64_t num_nodes_, local_size_, num_features_, lookup_keys_, remote_keys_, rounds_cap_;
+  int64_t num_nodes_, local_size_, num_features_, lookup_keys_, remote_keys_, max_chunks_;
   uint64_t node_keys_, node_weights_, remote_cells_, remote_map_, proxy_header_, key_stage_,
       rail_keys_, cell_stage_, rail_cells_, bytes_;
   uint64_t key_stage_bytes_, rail_keys_bytes_;
@@ -419,24 +420,21 @@ class KeysLayout {
 // exist across nodes only):
 //   lookup_rows  the owner's lookup output, row i for its KJT's key i; the
 //                backward writes the gradient of that output over it
-//   proxy_rows   (num_nodes > 1) the proxy's rows, round by round (common.h):
-//                the rows of the node-unique keys the rail owners put
-//                (forward), the gradient rows of its node's requesters and
-//                their sums (backward)
-//   push_flags   (num_nodes > 1) the requesters' push-task flags, zeroed when
-//                the window is made: those of round rnd are in half rnd % 2
+//   proxy_rows   (num_nodes > 1) the proxy's ring, its stream of chunks
+//                (common.h): the rows of the node-unique keys the rail owners
+//                put (forward), the gradient rows of its node's requesters
+//                and their sums (backward)
+//   push_flags   (num_nodes > 1) the requesters' push-task flags of a call
+//                (flag_words), each tagged with its out_seq
 // Each accessor returns its buffer in the copy at `base`.
 class RowsLayout {
  public:
   __host__ __device__ RowsLayout(const Sizes &sizes, char *base)
-      : base_(base),
-        row_bytes_(sizes.row_bytes),
-        half_flags_(sizes.multi_node() ? half_flags(sizes.num_proxy_rows, sizes.topo.local_size)
-                                       : 0) {
+      : base_(base), row_bytes_(sizes.row_bytes) {
     const bool multi = sizes.multi_node();
     proxy_rows_ = buffer_end(sizes.lookup_keys * row_bytes_);
     push_flags_ = proxy_rows_ + buffer_end(multi ? sizes.num_proxy_rows * row_bytes_ : 0);
-    bytes_ = push_flags_ + buffer_end(push_flags_bytes());
+    bytes_ = push_flags_ + buffer_end(multi ? 8 * (uint64_t)sizes.flag_words() : 0);
   }
   __host__ __device__ uint64_t bytes() const { return bytes_; }
   // Each buffer's name and the bytes it takes (HierOutputDist::memory).
@@ -454,16 +452,12 @@ class RowsLayout {
   __host__ __device__ char *proxy_row(int64_t slot) const {
     return proxy_rows() + slot * row_bytes_;
   }
-  // The flags of round rnd's half.
-  __host__ __device__ uint64_t *push_flags(int64_t rnd) const {
-    return (uint64_t *)(base_ + push_flags_) + (rnd & 1) * half_flags_;
-  }
-  // The bytes of both halves, from push_flags(0).
-  __host__ __device__ uint64_t push_flags_bytes() const { return 16 * (uint64_t)half_flags_; }
+  __host__ __device__ uint64_t *push_flags() const { return (uint64_t *)(base_ + push_flags_); }
+  __host__ __device__ uint64_t push_flags_bytes() const { return bytes_ - push_flags_; }
 
  private:
   char *base_;
-  int64_t row_bytes_, half_flags_;
+  int64_t row_bytes_;
   uint64_t proxy_rows_, push_flags_, bytes_;  // lookup_rows starts at base
 };
 

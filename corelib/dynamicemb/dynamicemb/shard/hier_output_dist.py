@@ -85,25 +85,24 @@ def _first_difference(every: List[Dict]) -> Optional[str]:
 
 # A call's status (int64 words; StatusSlots in
 # src/hier_output_dist/common/common.h): the most any rank needs of
-# lookup_keys, remote_keys and rounds; the keys this owner looks up; the
-# backward's sub-tasks of heavy rows and of heavy groups; the remote
-# occurrences this rank deduplicated as proxy; then per feature the keys this
-# owner looks up, then the input KJT's keys.
+# lookup_keys and remote_keys; the keys this owner looks up; the backward's
+# sub-tasks of heavy rows and of heavy groups; the remote occurrences this
+# rank deduplicated as proxy; then per feature the keys this owner looks up,
+# then the input KJT's keys.
 (
     _NEED_LOOKUP_KEYS,
     _NEED_REMOTE_KEYS,
-    _NEED_ROUNDS,
     _NUM_RECV,
     _HEAVY_SUBS,
     _GROUP_SUBS,
     _OCCURRENCES,
     _LENGTH_PER_KEY,
-) = range(8)
+) = range(7)
 # Where the tensors the benchmark reads are in the plans' lists (the order of
 # FwdPlan::tensors() and BwdPlan::tensors(), in
 # src/hier_output_dist/input_dist/plan.cu).
-_FWD_BLOCK_START, _FWD_NUM_ROUNDS, _FWD_UNIQ_OUT = 0, 13, 19
-_BWD_UNIQ_IN = 19
+_FWD_BLOCK_START, _FWD_NUM_CHUNKS, _FWD_UNIQ_OUT = 0, 14, 24
+_BWD_UNIQ_IN = 23
 
 
 class HierCall:
@@ -144,9 +143,10 @@ class HierCall:
         return self.fwd_plan[_FWD_BLOCK_START]
 
     @property
-    def num_rounds(self) -> Optional[torch.Tensor]:
-        """Across nodes, int64 0-dim: the rounds this rank takes as proxy."""
-        return self.fwd_plan[_FWD_NUM_ROUNDS]
+    def num_chunks(self) -> Optional[torch.Tensor]:
+        """Across nodes, int64 0-dim: the chunks of this rank's stream as
+        proxy."""
+        return self.fwd_plan[_FWD_NUM_CHUNKS]
 
     @property
     def uniq_out(self) -> Optional[torch.Tensor]:

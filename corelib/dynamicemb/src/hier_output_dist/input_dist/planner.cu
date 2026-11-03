@@ -29,12 +29,6 @@ namespace hier_output_dist {
 
 namespace {
 
-// `index` clamped into a table of `count` entries: a call that does not fit
-// may read words no one wrote.
-__device__ __forceinline__ int64_t clamp_index(int64_t index, int64_t count) {
-  return min(max(index, (int64_t)0), count - 1);
-}
-
 // ── the node ──
 
 // One CTA: this rank's count vector (CountVector) from part 1's cell_start.
@@ -260,23 +254,23 @@ OneNodeOwner one_node_owner(const NodeLayout &node, const at::Tensor &row_cell,
 namespace {
 
 // One CTA: the count message this rank sends its rail (CountMessage), word
-// by word: the common part (its node's largest remote part, its rounds as
-// proxy, its own part as owner, its node-unique keys per owner node), then
-// for each node its node-unique keys of each feature there.
+// by word: the common part (its node's largest remote part, its own part as
+// owner, and as proxy its node-unique keys and its chunks per owner node),
+// then for each node its node-unique keys of each feature there.
 __global__ void __launch_bounds__(kThreads)
-    count_message_kernel(const int64_t *need_remote, const int64_t *num_rounds,
-                         const int64_t *own_total, const int64_t *uniq_out,
+    count_message_kernel(const int64_t *need_remote, const int64_t *own_total,
+                         const int64_t *uniq_out, const int64_t *chunks_out,
                          const int64_t *cell_uniq, CountMessage format, int64_t *message) {
   for (int64_t word = threadIdx.x; word < format.out_words(); word += kThreads) {
     int64_t value;
     if (word == CountMessage::kNeedRemote)
       value = *need_remote;
-    else if (word == CountMessage::kRounds)
-      value = *num_rounds;
     else if (word == CountMessage::kOwnTotal)
       value = *own_total;
-    else if (word < format.common())
+    else if (word < format.chunks_out(0))
       value = uniq_out[word - format.uniq_out(0)];
+    else if (word < format.common())
+      value = chunks_out[word - format.chunks_out(0)];
     else
       value = cell_uniq[word - format.common()];
     message[word] = value;
@@ -286,7 +280,8 @@ __global__ void __launch_bounds__(kThreads)
 // One CTA: the rail's layout (RailLayout) from the count messages this rank
 // got (messages [num_nodes][CountMessage::length], its own too) and its own
 // part's cells (own_cells, [feature][requester]). A slice a proxy puts holds
-// its round pieces (16 bytes each), then its records; none to its own node.
+// the owner node's chunks (ChunkPiece, 16 bytes each), then its records; none
+// to its own node.
 __global__ void __launch_bounds__(kThreads)
     rail_layout_kernel(const int64_t *messages, const int64_t *own_cells,
                        const int64_t *other_nodes, Sizes sizes, int64_t *put_dst,
@@ -305,7 +300,7 @@ __global__ void __launch_bounds__(kThreads)
   // the bytes of the slice the proxy on `source` puts at the owner on `owner_node`
   auto slice_bytes = [&](int64_t source, int64_t owner_node) -> int64_t {
     if (source == owner_node) return 0;
-    return message(source, CountMessage::kRounds) * 16 +
+    return message(source, format.chunks_out(owner_node)) * (int64_t)sizeof(ChunkPiece) +
            message(source, format.uniq_out(owner_node)) * sizes.record_bytes;
   };
   // the keys the owner on `owner_node` looks up: those of its own node, and
@@ -327,13 +322,13 @@ __global__ void __launch_bounds__(kThreads)
     put_skip[owner_node] = owner_node == node || recv(owner_node) > sizes.lookup_keys;
   }
   // As owner: each source node's slice in its rail_keys (byte offset,
-  // rounds), its node-unique keys, and its keys of each feature (the part of
-  // its message for this node).
+  // chunks of this node), its node-unique keys, and its keys of each feature
+  // (the part of its message for this node).
   for (int64_t source = threadIdx.x; source < num_nodes; source += kThreads) {
     int64_t start = 0;
     for (int64_t earlier = 0; earlier < source; ++earlier) start += slice_bytes(earlier, node);
     slice_in[2 * source] = start;
-    slice_in[2 * source + 1] = message(source, CountMessage::kRounds);
+    slice_in[2 * source + 1] = source == node ? 0 : message(source, format.chunks_out(node));
     uniq_in[source] = message(source, format.uniq_out(node));
   }
   for (int64_t index = threadIdx.x; index < num_nodes * num_features; index += kThreads)
@@ -367,17 +362,14 @@ __global__ void __launch_bounds__(kThreads)
         kjt_offsets[feature * num_sources + local_size + column];
   }
   // The keys it looks up, and the most the rail needs of lookup_keys and
-  // remote_keys, and its most rounds.
+  // remote_keys.
   const int64_t most_recv = cta_max<int64_t>(num_nodes, recv, 0);
   const int64_t most_remote = cta_max<int64_t>(
       num_nodes, [&](int64_t source) { return message(source, CountMessage::kNeedRemote); }, 0);
-  const int64_t most_rounds = cta_max<int64_t>(
-      num_nodes, [&](int64_t source) { return message(source, CountMessage::kRounds); }, 0);
   if (threadIdx.x == 0) {
     *num_recv = recv(node);
     needs[kNeedLookupKeys] = most_recv;
     needs[kNeedRemoteKeys] = most_remote;
-    needs[kNeedRounds] = most_rounds;
   }
 }
 
@@ -390,37 +382,47 @@ __global__ void __launch_bounds__(kThreads)
     publish[word] = word < kNumNeeds ? needs[word] : my_cell_starts[word - kNumNeeds];
 }
 
-// One CTA: the owner's tables of its slices in rail_keys (rail_ints: its
-// int32 words), from the rail's slice_in. Each source node's rounds (its own
-// node sends none) and round pieces (fwd_pieces: the lo, hi and row words of
-// each RoundPiece, which come first in its slice; zeros past its rounds).
-// And where each other node's records of each feature start in rail_keys
-// (cell_record [feature][other node], int64 words): after its round pieces
-// and its records of the features before.
+// One CTA: where each source node's chunks start in fwd_chunks, from the
+// rail's slice_in (its own node sends none; at most owner_chunks in all),
+// and where each other node's records of each feature start in rail_keys
+// (cell_record [feature][other node], int64 words): after its chunks and its
+// records of the features before. Then a thread per entry of fwd_chunks
+// (owner_chunks of them): the chunk at that place, its source node's (the
+// last whose chunks start at or before it), read from its slice of
+// rail_keys (its bytes rail_bytes; a slice starts at a multiple of 8 bytes);
+// zeros past the chunks.
 __global__ void __launch_bounds__(kThreads)
-    owner_pieces_kernel(const int64_t *slice_in, const int64_t *cells_in, const int32_t *rail_ints,
-                        int64_t rail_int_count, const int64_t *other_nodes, Sizes sizes,
-                        int64_t *fwd_rounds, int64_t *fwd_pieces, int64_t *cell_record) {
-  const int64_t num_nodes = sizes.topo.num_nodes, num_features = sizes.num_features;
-  auto rounds_of = [&](int64_t source) {
-    return source == sizes.topo.node ? (int64_t)0 : slice_in[2 * source + 1];
-  };
-  for (int64_t source = threadIdx.x; source < num_nodes; source += kThreads)
-    fwd_rounds[source] = rounds_of(source);
-  for (int64_t index = threadIdx.x; index < sizes.rounds_cap * num_nodes * 3; index += kThreads) {
-    const int64_t round = index / (num_nodes * 3), source = index / 3 % num_nodes,
-                  field = index % 3;
-    const int64_t word = slice_in[2 * source] / 4 + 4 * round + field;
-    fwd_pieces[index] =
-        round < rounds_of(source) ? rail_ints[clamp_index(word, rail_int_count)] : 0;
-  }
+    owner_slices_kernel(const int64_t *slice_in, const int64_t *cells_in,
+                        const int64_t *other_nodes, const char *rail_keys, int64_t rail_bytes,
+                        Sizes sizes, int64_t *fwd_chunk_start, int64_t *cell_record,
+                        ChunkPiece *fwd_chunks) {
+  const int64_t num_nodes = sizes.topo.num_nodes, num_features = sizes.num_features,
+                bound = sizes.owner_chunks();
+  cta_exclusive_ends<int64_t>(
+      num_nodes, [&](int64_t source) { return slice_in[2 * source + 1]; }, fwd_chunk_start);
+  for (int64_t source = threadIdx.x; source <= num_nodes; source += kThreads)
+    fwd_chunk_start[source] = min(fwd_chunk_start[source], bound);
   for (int64_t column = threadIdx.x; column < num_nodes - 1; column += kThreads) {
     const int64_t source = other_nodes[column];
-    int64_t record = (slice_in[2 * source] + 16 * slice_in[2 * source + 1]) / 8;
+    int64_t record =
+        (slice_in[2 * source] + (int64_t)sizeof(ChunkPiece) * slice_in[2 * source + 1]) / 8;
     for (int64_t feature = 0; feature < num_features; ++feature) {
       cell_record[feature * (num_nodes - 1) + column] = record;
       record += cells_in[source * num_features + feature] * (sizes.record_bytes / 8);
     }
+  }
+  __syncthreads();
+  const int64_t count = fwd_chunk_start[num_nodes];
+  constexpr int64_t kPiece = sizeof(ChunkPiece);
+  for (int64_t index = threadIdx.x; index < bound; index += kThreads) {
+    ChunkPiece piece{0, 0, 0, 0};
+    if (index < count) {
+      const int64_t source =
+          clamp_index(upper_bound(fwd_chunk_start + 1, num_nodes, index), num_nodes);
+      const int64_t byte = slice_in[2 * source] + (index - fwd_chunk_start[source]) * kPiece;
+      piece = *(const ChunkPiece *)(rail_keys + min(max(byte, (int64_t)0), rail_bytes - kPiece));
+    }
+    fwd_chunks[index] = piece;
   }
 }
 
@@ -468,16 +470,16 @@ at::Tensor other_nodes_of(const Topo &topo, const at::TensorOptions &options) {
   return nodes + nodes.ge(topo.node);
 }
 
-at::Tensor count_message(const at::Tensor &need_remote, const at::Tensor &num_rounds,
-                         const at::Tensor &own_total, const at::Tensor &uniq_out,
+at::Tensor count_message(const at::Tensor &need_remote, const at::Tensor &own_total,
+                         const at::Tensor &uniq_out, const at::Tensor &chunks_out,
                          const at::Tensor &cell_uniq) {
   const int64_t num_nodes = uniq_out.numel();
   const CountMessage format{num_nodes, cell_uniq.numel() / num_nodes};
   const at::Tensor message = at::empty({format.out_words()}, uniq_out.options());
   count_message_kernel<<<kOneCta, kThreads, 0, current_stream()>>>(
-      need_remote.data_ptr<int64_t>(), num_rounds.data_ptr<int64_t>(),
-      own_total.data_ptr<int64_t>(), uniq_out.data_ptr<int64_t>(), cell_uniq.data_ptr<int64_t>(),
-      format, message.data_ptr<int64_t>());
+      need_remote.data_ptr<int64_t>(), own_total.data_ptr<int64_t>(), uniq_out.data_ptr<int64_t>(),
+      chunks_out.data_ptr<int64_t>(), cell_uniq.data_ptr<int64_t>(), format,
+      message.data_ptr<int64_t>());
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   return message;
 }
@@ -534,16 +536,17 @@ OwnerTables owner_tables(const RailLayout &rail, const at::Tensor &own_starts,
   const auto long_options = rail_keys.options().dtype(at::kLong);
   const cudaStream_t stream = current_stream();
   OwnerTables tables;
-  // Each source node's slice in rail_keys starts with its round pieces, then
-  // its records.
-  tables.fwd_rounds = at::empty({num_nodes}, long_options);
-  tables.fwd_pieces = at::empty({sizes.rounds_cap, num_nodes, 3}, long_options);
+  // Each source node's slice in rail_keys starts with the chunks of this
+  // node in its stream, then its records.
+  const int64_t bound = sizes.owner_chunks();
+  tables.fwd_chunk_start = at::empty({num_nodes + 1}, long_options);
+  tables.fwd_chunks = at::empty({bound, 4}, long_options.dtype(at::kInt));
   const at::Tensor cell_record = at::empty({sizes.num_features * (num_nodes - 1)}, long_options);
-  owner_pieces_kernel<<<kOneCta, kThreads, 0, stream>>>(
+  owner_slices_kernel<<<kOneCta, kThreads, 0, stream>>>(
       rail.slice_in.data_ptr<int64_t>(), rail.cells_in.data_ptr<int64_t>(),
-      (const int32_t *)rail_keys.data_ptr<int64_t>(), 2 * rail_words,
-      other_nodes.data_ptr<int64_t>(), sizes, tables.fwd_rounds.data_ptr<int64_t>(),
-      tables.fwd_pieces.data_ptr<int64_t>(), cell_record.data_ptr<int64_t>());
+      other_nodes.data_ptr<int64_t>(), (const char *)rail_keys.data_ptr<int64_t>(), 8 * rail_words,
+      sizes, tables.fwd_chunk_start.data_ptr<int64_t>(), cell_record.data_ptr<int64_t>(),
+      (ChunkPiece *)tables.fwd_chunks.data_ptr<int32_t>());
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   // The KJT's keys, its first num_recv positions: its own node's cells from
   // the own part of node_keys, the other nodes' from their records in
@@ -589,28 +592,28 @@ __global__ void __launch_bounds__(kThreads)
 // gathered headers (headers [local_size][ProxyHeader::gathered_words]): where
 // its rows at each proxy start in its push order (push_order_off: its rows of
 // the owners with the proxy's local rank on the other nodes), each proxy's
-// rounds (from 1 to rounds_cap) and round table, and its push tables there
-// made absolute: positions in push_order (its rows at the proxies before
-// come first), groups after its groups at the proxies before; their heavy
-// starts in (proxy, round) order (heavy_start); and the task starts.
+// chunks and chunk ends, and its push tables there made absolute: positions
+// in push_order (its rows at the proxies before come first), groups after its
+// groups at the proxies before (group_off); their heavy starts in (proxy,
+// chunk) order (heavy_start); and the task starts.
 __global__ void __launch_bounds__(kThreads)
     requester_proxy_tables_kernel(const int32_t *headers, const int64_t *block_start, Sizes sizes,
-                                  int64_t *push_order_off, int64_t *proxy_rounds,
-                                  int32_t *proxy_round_tables, ReqEntry *push_tables,
+                                  int64_t *push_order_off, int64_t *group_off,
+                                  int64_t *proxy_chunks, int64_t *proxy_ends, ReqEntry *push_tables,
                                   int32_t *heavy_start, int64_t *fwd_task_starts,
                                   int64_t *bwd_task_starts) {
   const ProxyHeader header = ProxyHeader::of(sizes);
-  const int64_t local_size = sizes.topo.local_size, rounds_cap = sizes.rounds_cap,
-                entries = rounds_cap + 1, table_words = header.table_words();
+  const int64_t local_size = sizes.topo.local_size, me = sizes.topo.local_rank,
+                max_chunks = sizes.max_chunks, entries = max_chunks + 1;
   auto header_of = [&](int64_t proxy) { return headers + proxy * header.gathered_words(); };
   // its push table as the proxy published it: positions relative to its push
   // order there, groups relative to its first group
   auto published = [&](int64_t proxy) {
     return (const ReqEntry *)(header_of(proxy) + header.gathered_push_table());
   };
-  auto rounds_of = [&](int64_t proxy) {
-    return min(max((int64_t)header_of(proxy)[ProxyHeader::kGatheredRounds], (int64_t)1),
-               rounds_cap);
+  auto chunks_of = [&](int64_t proxy) {
+    return min(max((int64_t)header_of(proxy)[ProxyHeader::kGatheredChunks], (int64_t)0),
+               max_chunks);
   };
   auto rows_at = [&](int64_t proxy) {
     int64_t rows = 0;
@@ -622,61 +625,62 @@ __global__ void __launch_bounds__(kThreads)
   };
   cta_exclusive_ends<int64_t>(local_size, rows_at, push_order_off);
   for (int64_t proxy = threadIdx.x; proxy < local_size; proxy += kThreads)
-    proxy_rounds[proxy] = rounds_of(proxy);
-  for (int64_t index = threadIdx.x; index < local_size * table_words; index += kThreads)
-    proxy_round_tables[index] =
-        header_of(index / table_words)[ProxyHeader::kGatheredTable + index % table_words];
-  for (int64_t proxy = threadIdx.x; proxy < local_size; proxy += kThreads) {
-    int64_t groups_before = 0;
-    for (int64_t earlier = 0; earlier < proxy; ++earlier)
-      groups_before += published(earlier)[rounds_of(earlier)].groups;
-    for (int64_t entry = 0; entry < entries; ++entry) {
-      const ReqEntry relative = published(proxy)[entry];
-      ReqEntry &absolute = push_tables[proxy * entries + entry];
-      absolute.start = (int32_t)(relative.start + push_order_off[proxy]);
-      absolute.heavy = (int32_t)(relative.heavy + push_order_off[proxy]);
-      absolute.flags = relative.flags;
-      absolute.groups = (int32_t)(relative.groups + groups_before);
-      heavy_start[proxy * entries + entry] = absolute.heavy;
-    }
+    proxy_chunks[proxy] = chunks_of(proxy);
+  // each chunk's end, then the stream's (uint32 words)
+  for (int64_t index = threadIdx.x; index < local_size * entries; index += kThreads) {
+    const int64_t proxy = index / entries, chunk = index % entries;
+    const int32_t word = chunk < max_chunks ? header_of(proxy)[ProxyHeader::kGatheredEnds + chunk]
+                                            : header_of(proxy)[ProxyHeader::kGatheredEnd];
+    proxy_ends[index] = (int64_t)(uint32_t)word;
   }
-  // The task starts over all rounds: per round a slot per task of its
-  // busiest proxy there, for every proxy, kTaskRows rows or heavy groups a
-  // task; a proxy has none past its rounds. The forward's are its rows' and
-  // its heavy rows' each round, the backward's its heavy groups' then its
-  // rows'. (The push tables' differences are the same relative or absolute.)
-  auto tasks = [&](int64_t proxy, int64_t round, int64_t first, int64_t end) -> int64_t {
-    return round < rounds_of(proxy) ? ceil_div<kTaskRows>(end - first) : 0;
+  cta_exclusive_ends<int64_t>(
+      local_size, [&](int64_t proxy) { return (int64_t)published(proxy)[max_chunks].groups; },
+      group_off);
+  // a thread per entry of a proxy's table
+  for (int64_t index = threadIdx.x; index < local_size * entries; index += kThreads) {
+    const int64_t proxy = index / entries;
+    const ReqEntry relative = published(proxy)[index % entries];
+    ReqEntry &absolute = push_tables[index];
+    absolute.start = (int32_t)(relative.start + push_order_off[proxy]);
+    absolute.heavy = (int32_t)(relative.heavy + push_order_off[proxy]);
+    absolute.flags = relative.flags;
+    absolute.groups = (int32_t)(relative.groups + group_off[proxy]);
+    heavy_start[index] = absolute.heavy;
+  }
+  // The task starts, chunk after chunk: in a chunk the proxies in turn from
+  // this rank's own one, kTaskRows rows or heavy groups a task; a proxy has
+  // none past its chunks. The forward's are its rows' and its heavy rows' of
+  // each (chunk, proxy), the backward's its heavy groups' of every proxy,
+  // then its rows' of every proxy. (The push tables' differences are the same
+  // relative or absolute.)
+  auto tasks = [&](int64_t proxy, int64_t chunk, int64_t first, int64_t end) -> int64_t {
+    return chunk < chunks_of(proxy) ? ceil_div<kTaskRows>(end - first) : 0;
   };
-  auto row_tasks = [&](int64_t proxy, int64_t round) {
+  auto row_tasks = [&](int64_t proxy, int64_t chunk) {
     const ReqEntry *table = published(proxy);
-    return tasks(proxy, round, table[round].start, table[round].heavy);
+    return tasks(proxy, chunk, table[chunk].start, table[chunk].heavy);
   };
-  auto heavy_tasks = [&](int64_t proxy, int64_t round) {
+  auto heavy_tasks = [&](int64_t proxy, int64_t chunk) {
     const ReqEntry *table = published(proxy);
-    return tasks(proxy, round, table[round].heavy, table[round + 1].start);
+    return tasks(proxy, chunk, table[chunk].heavy, table[chunk + 1].start);
   };
-  auto group_tasks = [&](int64_t proxy, int64_t round) {
+  auto group_tasks = [&](int64_t proxy, int64_t chunk) {
     const ReqEntry *table = published(proxy);
-    return tasks(proxy, round, table[round].groups, table[round + 1].groups);
+    return tasks(proxy, chunk, table[chunk].groups, table[chunk + 1].groups);
   };
   cta_exclusive_ends<int64_t>(
-      rounds_cap,
-      [&](int64_t round) {
-        int64_t most = 0;
-        for (int64_t proxy = 0; proxy < local_size; ++proxy)
-          most = max(most, row_tasks(proxy, round) + heavy_tasks(proxy, round));
-        return most * local_size;
+      max_chunks * local_size,
+      [&](int64_t index) {
+        const int64_t chunk = index / local_size, proxy = (me + index % local_size) % local_size;
+        return row_tasks(proxy, chunk) + heavy_tasks(proxy, chunk);
       },
       fwd_task_starts);
   cta_exclusive_ends<int64_t>(
-      2 * rounds_cap,
-      [&](int64_t slot) {
-        const int64_t round = slot / 2;
-        int64_t most = 0;
-        for (int64_t proxy = 0; proxy < local_size; ++proxy)
-          most = max(most, slot % 2 == 0 ? group_tasks(proxy, round) : row_tasks(proxy, round));
-        return most * local_size;
+      2 * max_chunks * local_size,
+      [&](int64_t index) {
+        const int64_t chunk = index / (2 * local_size), groups = index / local_size % 2 == 0,
+                      proxy = (me + index % local_size) % local_size;
+        return groups ? group_tasks(proxy, chunk) : row_tasks(proxy, chunk);
       },
       bwd_task_starts);
 }
@@ -729,13 +733,13 @@ struct PushOrder {
 
 // A thread per position of the push order (rows of them; its rows at every
 // proxy come first): whether a heavy group starts there. A group is a run of
-// positions of heavy rows with one slot (dst) inside one (proxy, round)
+// positions of heavy rows with one slot (dst) inside one (proxy, chunk)
 // heavy range: a heavy position starts one unless the position before is
 // heavy too, with its slot and its heavy range. Different heavy keys of a
-// range have different slots; rounds t and t + 2 share a half of
-// proxy_rows, so their keys' slots may be equal. The absolute heavy starts
-// are non-decreasing over (proxy, round): an entry past a proxy's rounds
-// holds its end.
+// range have different slots; chunks in different laps of the ring may take
+// the same rows, so their keys' slots may be equal. The absolute heavy
+// starts are non-decreasing over (proxy, chunk): an entry past a proxy's
+// chunks holds its end.
 __global__ void __launch_bounds__(kThreads)
     group_starts_kernel(PushOrder order, const int64_t *push_order_off, int64_t local_size,
                         const int32_t *heavy_start, int64_t heavy_entries, bool *group_start) {
@@ -822,13 +826,12 @@ PeerWords header_gather(const Sizes &sizes, const at::TensorOptions &options) {
   const int64_t local_size = sizes.topo.local_size, words = header.gathered_words(),
                 push_table = header.push_table_word(sizes.topo.local_rank);
   const auto long_options = options.dtype(at::kLong);
-  // of each proxy's header, in the order of its gathered words: its rounds,
-  // its round table, then its push tables for this requester
-  const at::Tensor first_word =
-      at::cat({at::arange(ProxyHeader::kRoundsWord, ProxyHeader::kRoundsWord + 1, long_options),
-               at::arange(ProxyHeader::kTableWord, ProxyHeader::kTableWord + header.table_words(),
-                          long_options),
-               at::arange(push_table, push_table + header.push_words(), long_options)});
+  // of each proxy's header, in the order of its gathered words: its chunks,
+  // its end, each chunk's end, then its push tables for this requester
+  const at::Tensor first_word = at::cat(
+      {at::arange(ProxyHeader::kChunksWord, ProxyHeader::kEndWord + 1, long_options),
+       at::arange(ProxyHeader::kEndsWord, ProxyHeader::kEndsWord + header.max_chunks, long_options),
+       at::arange(push_table, push_table + header.push_words(), long_options)});
   PeerWords gather;
   gather.peer = at::arange(local_size, options.dtype(at::kInt))
                     .view({local_size, 1})
@@ -843,25 +846,25 @@ RequesterTables requester_tables(const at::Tensor &words, const at::Tensor &head
                                  const at::Tensor &cell_start, const at::Tensor &block_start,
                                  const Sizes &sizes) {
   const int64_t rows = row_cell.numel(), local_size = sizes.topo.local_size,
-                rounds_cap = sizes.rounds_cap, heavy_entries = local_size * (rounds_cap + 1);
+                max_chunks = sizes.max_chunks, heavy_entries = local_size * (max_chunks + 1);
   const auto long_options = cell_start.options().dtype(at::kLong);
   const auto int_options = cell_start.options().dtype(at::kInt);
   const cudaStream_t stream = current_stream();
   RequesterTables tables;
-  // Per proxy, from its gathered header: its rounds, its round table, and
+  // Per proxy, from its gathered header: its chunks and their ends, and
   // this requester's push tables there, made absolute; and the task starts.
   tables.push_order_off = at::empty({local_size + 1}, long_options);
-  tables.proxy_rounds = at::empty({local_size}, long_options);
-  tables.proxy_round_tables =
-      at::empty({local_size, ProxyHeader::of(sizes).table_words()}, int_options);
-  tables.push_tables = at::empty({local_size, rounds_cap + 1, 4}, int_options);
+  tables.proxy_chunks = at::empty({local_size}, long_options);
+  tables.proxy_ends = at::empty({local_size, max_chunks + 1}, long_options);
+  tables.push_tables = at::empty({local_size, max_chunks + 1, 4}, int_options);
+  const at::Tensor group_off = at::empty({local_size + 1}, long_options);
   const at::Tensor heavy_start = at::empty({heavy_entries}, int_options);
-  tables.fwd_task_starts = at::empty({rounds_cap + 1}, long_options);
-  tables.bwd_task_starts = at::empty({2 * rounds_cap + 1}, long_options);
+  tables.fwd_task_starts = at::empty({max_chunks * local_size + 1}, long_options);
+  tables.bwd_task_starts = at::empty({2 * max_chunks * local_size + 1}, long_options);
   requester_proxy_tables_kernel<<<kOneCta, kThreads, 0, stream>>>(
       headers.data_ptr<int32_t>(), block_start.data_ptr<int64_t>(), sizes,
-      tables.push_order_off.data_ptr<int64_t>(), tables.proxy_rounds.data_ptr<int64_t>(),
-      tables.proxy_round_tables.data_ptr<int32_t>(),
+      tables.push_order_off.data_ptr<int64_t>(), group_off.data_ptr<int64_t>(),
+      tables.proxy_chunks.data_ptr<int64_t>(), tables.proxy_ends.data_ptr<int64_t>(),
       (ReqEntry *)tables.push_tables.data_ptr<int32_t>(), heavy_start.data_ptr<int32_t>(),
       tables.fwd_task_starts.data_ptr<int64_t>(), tables.bwd_task_starts.data_ptr<int64_t>());
   C10_CUDA_KERNEL_LAUNCH_CHECK();
@@ -924,37 +927,60 @@ constexpr int kNodeShift = 32;
 constexpr int64_t kKeyMask = (int64_t{1} << kNodeShift) - 1;
 
 // The two lists as one of 2 * num_nodes nodes: the backward's owner nodes
-// (the proxy's round table, its rounds and its node-unique keys per (owner
-// node, feature)), then the forward's proxy nodes (each source node's round
-// pieces, rounds and keys per feature). A call that does not fit may read
-// pieces no one wrote: their words are clamped to [0, 2^31).
-struct PutPieces {
-  const int32_t *round_table;  // [rounds_cap][num_nodes][4]
-  const int64_t *fwd_pieces;   // [rounds_cap][num_nodes][3]
-  const int64_t *num_rounds;   // 0-dim
-  const int64_t *fwd_rounds;   // [num_nodes]
-  const int64_t *cell_uniq;    // [num_nodes][num_features]
-  const int64_t *cells_in;     // [num_nodes][num_features]
-  int64_t num_nodes, num_features, rounds_cap, chunk_rows;
+// (the proxy's chunks of each, and its node-unique keys per (owner node,
+// feature)), then the forward's proxy nodes (the chunks of this owner's node
+// in each one's stream, and its keys per feature). Their chunks are numbered
+// node after node, each node's in order: the backward's, then the forward's.
+// A call that does not fit may read words no one wrote: they are clamped.
+struct PutChunks {
+  const Chunk *chunks;              // [max_chunks]: the proxy's, in stream order
+  const int64_t *node_chunk_start;  // [num_nodes + 1]: each owner node's in node_chunks
+  const int32_t *node_chunks;       // [max_chunks]: each owner node's chunks in order
+  const int64_t *uniq_off;          // [num_nodes + 1]: the proxy's first key of each owner node
+  const ChunkPiece *fwd_chunks;     // [owner_chunks]: the owner's, source node after source node
+  const int64_t *fwd_chunk_start;   // [num_nodes + 1]
+  const int64_t *cell_uniq;         // [num_nodes][num_features]
+  const int64_t *cells_in;          // [num_nodes][num_features]
+  int64_t num_nodes, num_features, max_chunks, owner_chunks, ring;
 
-  // Word `field` of the piece of `node` in `round`: 0 its first key, 1 its
-  // end, 2 the row of its first key in proxy_rows.
-  __device__ int64_t word(int64_t round, int64_t node, int field) const {
-    const int64_t value = node < num_nodes
-                              ? round_table[(round * num_nodes + node) * 4 + field]
-                              : fwd_pieces[(round * num_nodes + node - num_nodes) * 3 + field];
-    return min(max(value, (int64_t)0), kKeyMask >> 1);
+  // A chunk of the numbering: its node, its keys [lo, hi) among the node's
+  // keys, the row of lo in the proxy's proxy_rows, and its number in its own
+  // list (the proxy's chunk, or the entry of fwd_chunks).
+  struct Place {
+    int64_t node, lo, hi, row, number;
+  };
+  __device__ int64_t backward_chunks() const {
+    return min(node_chunk_start[num_nodes], max_chunks);
   }
-  __device__ int64_t lo(int64_t round, int64_t node) const { return word(round, node, 0); }
-  __device__ int64_t hi(int64_t round, int64_t node) const { return word(round, node, 1); }
-  __device__ int64_t row(int64_t round, int64_t node) const { return word(round, node, 2); }
-  // its IB chunks
-  __device__ int64_t chunks(int64_t round, int64_t node) const {
-    const int64_t keys = max(hi(round, node) - lo(round, node), (int64_t)0);
-    return (keys + chunk_rows - 1) / chunk_rows;
+  __device__ int64_t chunks_in_all() const {
+    return backward_chunks() + min(fwd_chunk_start[num_nodes], owner_chunks);
   }
-  __device__ int64_t rounds(int64_t node) const {
-    return node < num_nodes ? *num_rounds : fwd_rounds[node - num_nodes];
+  __device__ Place place(int64_t index) const {
+    Place out;
+    const int64_t backward = backward_chunks();
+    if (index < backward) {
+      const int64_t owner_node =
+          clamp_index(upper_bound(node_chunk_start + 1, num_nodes, index), num_nodes);
+      const Chunk chunk = chunks[clamp_index(node_chunks[index], max_chunks)];
+      out.node = owner_node;
+      out.lo = chunk.key_lo - uniq_off[owner_node];
+      out.hi = out.lo + chunk.keys;
+      out.row = chunk.start % ring;
+      out.number = clamp_index(node_chunks[index], max_chunks);
+    } else {
+      const int64_t entry = clamp_index(index - backward, owner_chunks);
+      const int64_t source =
+          clamp_index(upper_bound(fwd_chunk_start + 1, num_nodes, entry), num_nodes);
+      const ChunkPiece piece = fwd_chunks[entry];
+      out.node = num_nodes + source;
+      out.lo = piece.uniq_lo;
+      out.hi = piece.uniq_hi;
+      out.row = piece.start % ring;
+      out.number = entry;
+    }
+    out.lo = min(max(out.lo, (int64_t)0), kKeyMask >> 1);
+    out.hi = min(max(out.hi, out.lo), kKeyMask >> 1);
+    return out;
   }
   // the node's keys of a feature
   __device__ int64_t keys(int64_t node, int64_t feature) const {
@@ -969,71 +995,40 @@ __device__ __forceinline__ int64_t segment_rows(int64_t cut, int64_t next) {
   return (next >> kNodeShift) == (cut >> kNodeShift) ? (next & kKeyMask) - (cut & kKeyMask) : 0;
 }
 
-// One CTA: the tables of the pieces and the cells. chunk_before: where each
-// piece's IB chunks start, pieces round-major (round, node), the last entry
-// the chunks of both lists. piece_key [nodes][rounds_cap]: where each piece
-// starts as a cut key, node-major (a node's pieces past its rounds start at
-// its end). cell_key [nodes][num_features]: where each cell starts as a cut
-// key. Then the proxy's round table with each piece's first chunk of the
-// backward, and the reducers' task starts: a round's busiest owner node's
-// chunks, for every owner node, chunk_rows / kTaskRows tasks a chunk.
-__global__ void __launch_bounds__(kThreads)
-    put_pieces_kernel(PutPieces pieces, int64_t *chunk_before, int64_t *piece_key,
-                      int64_t *cell_key, int32_t *round_table, int64_t *reduce_task_starts) {
-  const int64_t num_nodes = pieces.num_nodes, nodes = 2 * num_nodes,
-                num_features = pieces.num_features, rounds_cap = pieces.rounds_cap;
-  cta_exclusive_ends<int64_t>(
-      rounds_cap * nodes,
-      [&](int64_t piece) { return pieces.chunks(piece / nodes, piece % nodes); }, chunk_before);
+// One CTA: where each node's cells start, as cut keys (cell_key
+// [nodes][num_features]).
+__global__ void __launch_bounds__(kThreads) put_cells_kernel(PutChunks lists, int64_t *cell_key) {
+  const int64_t nodes = 2 * lists.num_nodes, num_features = lists.num_features;
   for (int64_t node = threadIdx.x; node < nodes; node += kThreads) {
-    const int64_t base = node << kNodeShift;
     int64_t end = 0;  // the end of the node's cells so far
     for (int64_t feature = 0; feature < num_features; ++feature) {
-      cell_key[node * num_features + feature] = base + end;
-      end += pieces.keys(node, feature);
+      cell_key[node * num_features + feature] = (node << kNodeShift) + end;
+      end += lists.keys(node, feature);
     }
-    for (int64_t round = 0; round < rounds_cap; ++round)
-      piece_key[node * rounds_cap + round] =
-          base + (round < pieces.rounds(node) ? pieces.lo(round, node) : end);
   }
-  for (int64_t index = threadIdx.x; index < rounds_cap * num_nodes * 4; index += kThreads) {
-    const int64_t round = index / (num_nodes * 4), owner_node = index / 4 % num_nodes;
-    round_table[index] = index % 4 == 3 ? (int32_t)chunk_before[round * nodes + owner_node]
-                                        : pieces.round_table[index];
-  }
-  cta_exclusive_ends<int64_t>(
-      rounds_cap,
-      [&](int64_t round) {
-        int64_t most = 0;
-        for (int64_t owner_node = 0; owner_node < num_nodes; ++owner_node)
-          most = max(most, pieces.chunks(round, owner_node));
-        return most * (num_nodes * (pieces.chunk_rows / kTaskRows));
-      },
-      reduce_task_starts);
 }
 
 // A thread per cut, as a cut key (node << kNodeShift) + key: first the first
-// key of each IB chunk (chunk_cuts of them; past the chunks: after every
-// node), then the end of each cell.
+// key of each chunk (chunk_cuts of them, numbered as PutChunks does: past the
+// chunks after every node), which also go to chunk_key, then the end of each
+// cell.
 __global__ void __launch_bounds__(kThreads)
-    cut_keys_kernel(PutPieces pieces, const int64_t *chunk_before, const int64_t *cell_key,
-                    int64_t chunk_cuts, int64_t *cut_keys) {
-  const int64_t nodes = 2 * pieces.num_nodes, num_pieces = pieces.rounds_cap * nodes,
-                cells = nodes * pieces.num_features;
-  const int64_t num_chunks = chunk_before[num_pieces];
+    cut_keys_kernel(PutChunks lists, const int64_t *cell_key, int64_t chunk_cuts, int64_t *cut_keys,
+                    int64_t *chunk_key) {
+  const int64_t nodes = 2 * lists.num_nodes, cells = nodes * lists.num_features;
+  const int64_t chunks = lists.chunks_in_all();
   for (int64_t cut = first_item(); cut < chunk_cuts + cells; cut += item_stride()) {
     int64_t key;
     if (cut >= chunk_cuts) {
       const int64_t cell = cut - chunk_cuts;
-      key = cell_key[cell] + pieces.keys(cell / pieces.num_features, cell % pieces.num_features);
-    } else if (cut < num_chunks) {
-      // chunk `cut`, of the piece whose chunks hold it
-      const int64_t piece = upper_bound(chunk_before + 1, num_pieces, cut);
-      const int64_t round = piece / nodes, node = piece % nodes;
-      key = (node << kNodeShift) + pieces.lo(round, node) +
-            (cut - chunk_before[piece]) * pieces.chunk_rows;
+      key = cell_key[cell] + lists.keys(cell / lists.num_features, cell % lists.num_features);
     } else {
       key = nodes << kNodeShift;
+      if (cut < chunks) {
+        const PutChunks::Place place = lists.place(cut);
+        key = (place.node << kNodeShift) + place.lo;
+      }
+      chunk_key[cut] = key;
     }
     cut_keys[cut] = key;
   }
@@ -1047,131 +1042,108 @@ __global__ void __launch_bounds__(kThreads)
 }
 
 // A thread per segment that holds rows: its PutSeg, at its place among them
-// (kept_before). Its piece and its cell are the last of its node's that
-// start at or before it: the piece gives its row in proxy_rows and its IB
-// chunk, the cell its row in the owner's KJT (rail_cells for the backward's
-// owner nodes, cell_stage for the forward's proxy nodes). The backward's
-// src is the row of proxy_rows, the forward's the row of the KJT.
+// (kept_before). Its chunk and its cell are the last that start at or before
+// it: the chunk gives its row in proxy_rows and its number, the cell its row
+// in the owner's KJT (rail_cells for the backward's owner nodes, cell_stage
+// for the forward's proxy nodes). The backward's src is the row of
+// proxy_rows, the forward's the row of the KJT.
 __global__ void __launch_bounds__(kThreads)
-    put_segments_kernel(PutPieces pieces, const int64_t *sorted, const int32_t *kept_before,
-                        int64_t segments, const int64_t *chunk_before, const int64_t *piece_key,
+    put_segments_kernel(PutChunks lists, const int64_t *sorted, const int32_t *kept_before,
+                        int64_t segments, const int64_t *chunk_key, int64_t chunk_cuts,
                         const int64_t *cell_key, const int64_t *rail_cells,
                         const int64_t *cell_stage, PutSeg *list) {
-  const int64_t num_nodes = pieces.num_nodes, nodes = 2 * num_nodes, rounds_cap = pieces.rounds_cap,
-                num_pieces = rounds_cap * nodes, cells = nodes * pieces.num_features;
+  const int64_t num_nodes = lists.num_nodes, cells = 2 * num_nodes * lists.num_features;
   for (int64_t segment = first_item(); segment < segments; segment += item_stride()) {
     const int64_t cut = sorted[segment], rows = segment_rows(cut, sorted[segment + 1]);
     if (rows <= 0) continue;
     const int64_t first = cut & kKeyMask;
-    const int64_t piece = clamp_index(upper_bound(piece_key, num_pieces, cut) - 1, num_pieces);
-    const int64_t piece_node = piece / rounds_cap, round = piece % rounds_cap;
-    const int64_t in_piece = first - pieces.lo(round, piece_node);
-    const int64_t piece_row = pieces.row(round, piece_node) + in_piece;
-    const int64_t chunk = chunk_before[round * nodes + piece_node] + in_piece / pieces.chunk_rows;
+    const PutChunks::Place chunk =
+        lists.place(clamp_index(upper_bound(chunk_key, chunk_cuts, cut) - 1, chunk_cuts));
+    const int64_t chunk_row = chunk.row + first - chunk.lo;
     const int64_t cell = clamp_index(upper_bound(cell_key, cells, cut) - 1, cells);
-    const int64_t cell_row = cell < num_nodes * pieces.num_features
+    const int64_t cell_row = cell < num_nodes * lists.num_features
                                  ? rail_cells[cell]
-                                 : cell_stage[cell - num_nodes * pieces.num_features];
+                                 : cell_stage[cell - num_nodes * lists.num_features];
     const int64_t kjt_row = cell_row + first - (cell_key[cell] & kKeyMask);
     const bool forward = (cut >> kNodeShift) >= num_nodes;
     list[kept_before[segment]] =
-        PutSeg{(int32_t)(forward ? kjt_row : piece_row), (int32_t)(forward ? piece_row : kjt_row),
-               (int32_t)rows, (int32_t)chunk};
+        PutSeg{(int32_t)(forward ? kjt_row : chunk_row), (int32_t)(forward ? chunk_row : kjt_row),
+               (int32_t)rows, (int32_t)chunk.number};
   }
 }
 
-// One CTA: where each node's segments of each round start in its list,
-// starts [nodes][rounds_cap + 1]: the segments kept before the first cut at
-// or after the start of the node's piece (round rounds_cap: the node's end).
+// One CTA: where each node's segments start in the list (starts [nodes + 1]):
+// the segments kept before the node's first cut.
 __global__ void __launch_bounds__(kThreads)
-    put_starts_kernel(PutPieces pieces, const int64_t *sorted, const int32_t *kept_before,
-                      int64_t segments, const int64_t *piece_key, const int64_t *cell_key,
-                      int32_t *starts) {
-  const int64_t nodes = 2 * pieces.num_nodes, rounds_cap = pieces.rounds_cap,
-                num_features = pieces.num_features;
-  for (int64_t index = threadIdx.x; index < nodes * (rounds_cap + 1); index += kThreads) {
-    const int64_t node = index / (rounds_cap + 1), round = index % (rounds_cap + 1);
-    const int64_t last_cell = node * num_features + num_features - 1;
-    const int64_t key = round < rounds_cap
-                            ? piece_key[node * rounds_cap + round]
-                            : cell_key[last_cell] + pieces.keys(node, num_features - 1);
-    starts[index] = kept_before[min(lower_bound(sorted, segments + 1, key), segments)];
-  }
+    put_starts_kernel(const int64_t *sorted, const int32_t *kept_before, int64_t segments,
+                      int64_t nodes, int32_t *starts) {
+  for (int64_t node = threadIdx.x; node <= nodes; node += kThreads)
+    starts[node] =
+        kept_before[min(lower_bound(sorted, segments + 1, node << kNodeShift), segments)];
 }
 
 }  // namespace
 
-PutLists put_lists(const at::Tensor &round_table, const at::Tensor &num_rounds,
+PutLists put_lists(const at::Tensor &chunks, const at::Tensor &node_chunk_start,
+                   const at::Tensor &node_chunks, const at::Tensor &uniq_off,
                    const at::Tensor &cell_uniq, const at::Tensor &rail_cells,
-                   const at::Tensor &fwd_pieces, const at::Tensor &fwd_rounds,
+                   const at::Tensor &fwd_chunks, const at::Tensor &fwd_chunk_start,
                    const at::Tensor &cells_in, const at::Tensor &cell_stage, const Sizes &sizes) {
-  const int64_t num_nodes = sizes.topo.num_nodes, num_features = sizes.num_features,
-                rounds_cap = sizes.rounds_cap;
+  const int64_t num_nodes = sizes.topo.num_nodes, num_features = sizes.num_features;
   // The two lists as one of 2 * num_nodes nodes: the backward's owner nodes,
   // then the forward's proxy nodes.
-  const int64_t nodes = 2 * num_nodes, num_pieces = rounds_cap * nodes,
-                cells = nodes * num_features;
+  const int64_t nodes = 2 * num_nodes, cells = nodes * num_features;
   const auto long_options = cell_uniq.options().dtype(at::kLong);
   const auto int_options = cell_uniq.options().dtype(at::kInt);
   const cudaStream_t stream = current_stream();
-  const PutPieces pieces{round_table.data_ptr<int32_t>(),
-                         fwd_pieces.data_ptr<int64_t>(),
-                         num_rounds.data_ptr<int64_t>(),
-                         fwd_rounds.data_ptr<int64_t>(),
-                         cell_uniq.data_ptr<int64_t>(),
-                         cells_in.data_ptr<int64_t>(),
-                         num_nodes,
-                         num_features,
-                         rounds_cap,
-                         sizes.chunk_rows};
-  PutLists lists;
-  // Each piece's IB chunks and its first chunk, pieces round-major; where
-  // each piece and each cell starts.
-  const at::Tensor chunk_before = at::empty({num_pieces + 1}, long_options);
-  const at::Tensor piece_key = at::empty({num_pieces}, long_options);
+  const PutChunks lists{(const Chunk *)chunks.data_ptr<int32_t>(),
+                        node_chunk_start.data_ptr<int64_t>(),
+                        node_chunks.data_ptr<int32_t>(),
+                        uniq_off.data_ptr<int64_t>(),
+                        (const ChunkPiece *)fwd_chunks.data_ptr<int32_t>(),
+                        fwd_chunk_start.data_ptr<int64_t>(),
+                        cell_uniq.data_ptr<int64_t>(),
+                        cells_in.data_ptr<int64_t>(),
+                        num_nodes,
+                        num_features,
+                        sizes.max_chunks,
+                        sizes.owner_chunks(),
+                        sizes.num_proxy_rows};
+  PutLists out;
   const at::Tensor cell_key = at::empty({cells}, long_options);
-  lists.round_table = at::empty({rounds_cap, num_nodes, 4}, int_options);
-  lists.reduce_task_starts = at::empty({rounds_cap + 1}, long_options);
-  put_pieces_kernel<<<kOneCta, kThreads, 0, stream>>>(
-      pieces, chunk_before.data_ptr<int64_t>(), piece_key.data_ptr<int64_t>(),
-      cell_key.data_ptr<int64_t>(), lists.round_table.data_ptr<int32_t>(),
-      lists.reduce_task_starts.data_ptr<int64_t>());
+  put_cells_kernel<<<kOneCta, kThreads, 0, stream>>>(lists, cell_key.data_ptr<int64_t>());
   C10_CUDA_KERNEL_LAUNCH_CHECK();
-  lists.num_chunks = chunk_before.select(0, num_pieces);
-  // The cuts, by (node, key): the first key of each IB chunk (past the
-  // chunks: after every node) and the end of each cell. Segment i goes from
-  // cut i to cut i + 1, and holds rows when both are of one node.
-  const int64_t chunk_cuts =
-      chunk_bound(sizes.remote_keys, sizes) + chunk_bound(sizes.lookup_keys, sizes);
+  // The cuts, by (node, key): the first key of each chunk (past the chunks:
+  // after every node) and the end of each cell. Segment i goes from cut i to
+  // cut i + 1, and holds rows when both are of one node.
+  const int64_t chunk_cuts = sizes.max_chunks + sizes.owner_chunks();
   const at::Tensor cut_keys = at::empty({chunk_cuts + cells}, long_options);
+  const at::Tensor chunk_key = at::empty({chunk_cuts}, long_options);
   cut_keys_kernel<<<item_grid(chunk_cuts + cells), kThreads, 0, stream>>>(
-      pieces, chunk_before.data_ptr<int64_t>(), cell_key.data_ptr<int64_t>(), chunk_cuts,
-      cut_keys.data_ptr<int64_t>());
+      lists, cell_key.data_ptr<int64_t>(), chunk_cuts, cut_keys.data_ptr<int64_t>(),
+      chunk_key.data_ptr<int64_t>());
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   const at::Tensor sorted = sort_keys(cut_keys, kNodeShift + bits_for(nodes + 1));
-  // The segments that hold rows, in order, and where each (node, round)'s
-  // first one is.
+  // The segments that hold rows, in order, and where each node's first one is.
   const int64_t segments = sorted.numel() - 1;
   const at::Tensor kept = at::empty({segments}, long_options.dtype(at::kBool));
   kept_segments_kernel<<<item_grid(segments), kThreads, 0, stream>>>(
       sorted.data_ptr<int64_t>(), segments, kept.data_ptr<bool>());
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   const at::Tensor kept_before = exclusive_ends(kept, at::kInt);
-  lists.list = at::empty({segments, 4}, int_options);
+  out.list = at::empty({segments, 4}, int_options);
   put_segments_kernel<<<item_grid(segments), kThreads, 0, stream>>>(
-      pieces, sorted.data_ptr<int64_t>(), kept_before.data_ptr<int32_t>(), segments,
-      chunk_before.data_ptr<int64_t>(), piece_key.data_ptr<int64_t>(), cell_key.data_ptr<int64_t>(),
+      lists, sorted.data_ptr<int64_t>(), kept_before.data_ptr<int32_t>(), segments,
+      chunk_key.data_ptr<int64_t>(), chunk_cuts, cell_key.data_ptr<int64_t>(),
       rail_cells.data_ptr<int64_t>(), cell_stage.data_ptr<int64_t>(),
-      (PutSeg *)lists.list.data_ptr<int32_t>());
+      (PutSeg *)out.list.data_ptr<int32_t>());
   C10_CUDA_KERNEL_LAUNCH_CHECK();
-  const at::Tensor starts = at::empty({nodes, rounds_cap + 1}, int_options);
-  put_starts_kernel<<<kOneCta, kThreads, 0, stream>>>(
-      pieces, sorted.data_ptr<int64_t>(), kept_before.data_ptr<int32_t>(), segments,
-      piece_key.data_ptr<int64_t>(), cell_key.data_ptr<int64_t>(), starts.data_ptr<int32_t>());
+  out.starts = at::empty({nodes + 1}, int_options);
+  put_starts_kernel<<<kOneCta, kThreads, 0, stream>>>(sorted.data_ptr<int64_t>(),
+                                                      kept_before.data_ptr<int32_t>(), segments,
+                                                      nodes, out.starts.data_ptr<int32_t>());
   C10_CUDA_KERNEL_LAUNCH_CHECK();
-  lists.bwd_start = starts.narrow(0, 0, num_nodes);
-  lists.fwd_start = starts.narrow(0, num_nodes, num_nodes);
-  return lists;
+  return out;
 }
 
 }  // namespace hier_output_dist

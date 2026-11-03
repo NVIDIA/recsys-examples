@@ -49,10 +49,11 @@ namespace hier_output_dist {
 
 class Communicator {
  public:
-  // Collective: every rank of `topo` with the same unique id (unique_id()).
-  // A rank that fails here raises; the others then wait in NCCL's own
-  // initialization, as with any communicator.
-  Communicator(const std::string &unique_id, const Topo &topo);
+  // Collective: every rank of `topo` with the same unique id (unique_id()),
+  // across nodes with `counters` GIN counters a context. A rank that fails
+  // here raises; the others then wait in NCCL's own initialization, as with
+  // any communicator.
+  Communicator(const std::string &unique_id, const Topo &topo, int counters);
   Communicator(const Communicator &) = delete;
   Communicator &operator=(const Communicator &) = delete;
   // The owner ends the communicator (abort() or finish()), or keeps it until the process

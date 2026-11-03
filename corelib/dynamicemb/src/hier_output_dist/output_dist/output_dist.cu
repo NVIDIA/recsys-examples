@@ -137,8 +137,8 @@ void OutChannel::backward(const BwdPlan &plan, at::Tensor grad, bool divide) {
   if (grad.numel() > 0 && (uintptr_t)grad.data_ptr() % 16 != 0) grad = grad.clone();
   const void *kernel = backward_kernel(grad.scalar_type());
   // The sub-tasks' fp32 sums, how many of each heavy row's and each heavy
-  // group's are done, and across nodes the proxy's keys reduced of each IB
-  // chunk (the kernel zeroes the counts).
+  // group's are done, and across nodes the proxy's keys reduced of each chunk
+  // of its stream (the kernel zeroes the counts).
   const auto options = grad.options();
   const int64_t slots = plan.fanout.pos.defined() ? plan.fanout.pos.numel() : 0,
                 groups = plan.group_first_sub.defined() ? plan.group_first_sub.numel() : 0;
@@ -146,10 +146,7 @@ void OutChannel::backward(const BwdPlan &plan, at::Tensor grad, bool divide) {
       at::empty({plan.heavy_subs + plan.group_subs, grad.size(1)}, options.dtype(at::kFloat));
   const at::Tensor done = at::empty({slots + groups}, options.dtype(at::kLong));
   at::Tensor ready;
-  if (multi_node_)
-    ready = at::empty(
-        {chunk_bound(sizes_.remote_keys, sizes_) + chunk_bound(sizes_.lookup_keys, sizes_)},
-        options.dtype(at::kLong));
+  if (multi_node_) ready = at::empty({sizes_.max_chunks}, options.dtype(at::kLong));
   const int ctas = out_ctas(false);
   BwdArgs args{};
   args.plan = plan.view(sizes_);

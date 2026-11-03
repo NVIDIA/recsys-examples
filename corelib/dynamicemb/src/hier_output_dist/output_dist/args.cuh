@@ -49,8 +49,8 @@ struct BwdArgs {
                               // plan.group_subs)
   uint64_t *heavy_done;       // [heavy rows] sub-tasks of each one done
   uint64_t *group_done;       // [heavy groups] the same (the kernel zeroes both)
-  int64_t *ready;             // across nodes, the proxy's [chunks]: keys of each IB chunk
-                              // reduced; the kernel zeroes it
+  int64_t *ready;             // across nodes, the proxy's [max_chunks]: keys of each chunk of
+                              // its stream reduced; the kernel zeroes those of its chunks
   unsigned long long *trace;  // [kTraceWords] this kernel's timeline, or nullptr
   int reducers;               // across nodes: the last CTAs, which reduce
   float scale;                // 1 / world_size under TorchRec's gradient division, else 1
@@ -60,7 +60,7 @@ static_assert(std::is_trivially_copyable<FwdArgs>::value &&
                   std::is_trivially_copyable<BwdArgs>::value,
               "a kernel parameter is copied as bytes");
 
-// The out kernels' dynamic shared memory: the backward's half_seen
+// The out kernels' dynamic shared memory: the backward's free_seen
 // [local_size] (OutTables), then, when the kernel keeps a timeline, the
 // CTA's copy of it (TraceSmSlots, OutTimeline).
 __device__ __forceinline__ unsigned long long *out_shared() {

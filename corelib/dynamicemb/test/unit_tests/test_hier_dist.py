@@ -29,7 +29,7 @@ Before the cases: the sharding shapes, the ranks' agreement and the options.
 After them: an input dist that waits for the device nowhere but in its
 second wait, the output dist's call orders, the backward run to run, the
 window and the trace APIs, failed constructions, across nodes a proxy rows
-cap below a round's rows, and the teardown.
+cap below the least rows of the proxy's ring, and the teardown.
 
 Run it from ``corelib/dynamicemb``, one process per GPU (on one node, or
 across nodes under Slurm)::
@@ -38,8 +38,8 @@ across nodes under Slurm)::
     srun --ntasks-per-node 8 python test/unit_tests/test_hier_dist.py
 
 Across nodes, run it as is, and with ``DYNAMICEMB_GIN_PROXY_MB=1`` in the
-environment (a proxy rows cap of 1 MiB: the larger calls move their rows in
-several rounds).
+environment (a proxy rows cap of 1 MiB: the larger calls' streams of rows
+wrap the proxy's ring).
 """
 
 import contextlib
@@ -143,8 +143,8 @@ def bucketize_rules(num_features: int, world_size: int):
 def standalone(group) -> HierSharding:
     """A hierarchical dist of 3 features of 32 fp32 columns on ``group``,
     outside any model, with capacities of 65536 entries and a proxy rows cap
-    of 16 MiB (it holds the rounds of every node count here); its op is
-    built by ``setup``."""
+    of 16 MiB (above the least rows of the proxy's ring); its op is built by
+    ``setup``."""
     capacity = dict.fromkeys(OUTPUT_DIST_CAPACITY_NAMES, 1 << 16)
     with environ("DYNAMICEMB_GIN_PROXY_MB", 16):
         hier = HierSharding(group, 3, 32, torch.float32, capacity)
@@ -1179,10 +1179,12 @@ def run_windows(rank: int, world_size: int, local_size: int, log: Callable) -> i
 
 
 def run_proxy_rows(rank: int, world_size: int, local_size: int, log: Callable) -> int:
-    """Across nodes, a proxy rows cap below the rows a round needs: "fused"
-    raises the same ValueError on every rank, naming the cap's knob, and
-    "auto" warns and takes TorchRec's dists."""
-    least_rows = 20 * HEAVY * (NODES - 1)  # min_proxy_rows_for in common.h
+    """Across nodes, a proxy rows cap below the least rows of the proxy's
+    ring: "fused" raises the same ValueError on every rank, naming the cap's
+    knob, and "auto" warns and takes TorchRec's dists."""
+    # min_proxy_rows_for in common.h: two chunks of keys of the most rows
+    # (an fp32 partial of 32 columns takes one row)
+    least_rows = 4 * max(HEAVY, 1 + local_size)
     cap_mb = least_rows * 4 * 32 / 2 / (1 << 20)  # half their fp32 rows of 32 columns
     capacity = dict.fromkeys(OUTPUT_DIST_CAPACITY_NAMES, 1 << 16)
     checks: Dict[str, bool] = {}
@@ -1206,7 +1208,7 @@ def run_proxy_rows(rank: int, world_size: int, local_size: int, log: Callable) -
                 )
         del hier
     gc.collect()
-    return report("a proxy rows cap below a round's rows", checks, log, f": {msg}")
+    return report("a proxy rows cap below the ring's least", checks, log, f": {msg}")
 
 
 def expect_error(kind, fn: Callable, *args) -> str:

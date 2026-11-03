@@ -136,14 +136,14 @@ cudaError_t launch_exit_kernel(ncclWindow_t window, const ncclDevComm &dev, cons
 // current stream: the caching allocator may hand `bad` a block that kernels
 // queued there still use, and only that stream's order puts these writes
 // after them.
-bool gin_signals_zero(const ncclDevComm &dev, int num_nodes) {
+bool gin_signals_zero(const ncclDevComm &dev, int num_nodes, int counters) {
   int device;
   HIER_CUDA_CHECK(cudaGetDevice(&device));
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream(device);
   auto bad = at::empty({1}, at::TensorOptions().device(at::kCUDA, device).dtype(at::kInt));
   HIER_CUDA_CHECK(cudaMemsetAsync(bad.data_ptr<int>(), 0, sizeof(int), stream));
-  gin_zero_kernel<<<kGinContexts, 32, 0, stream>>>(dev, kGinSignalsPerNode * num_nodes,
-                                                   kGinCounters, bad.data_ptr<int>());
+  gin_zero_kernel<<<kGinContexts, 32, 0, stream>>>(dev, kGinSignalsPerNode * num_nodes, counters,
+                                                   bad.data_ptr<int>());
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   return bad.item<int>() == 0;
 }
@@ -185,7 +185,7 @@ HierOutputDist::HierOutputDist(const std::string &unique_id, int64_t rank, int64
   c10::cuda::CUDAGuard guard(device_);
   const bool fail_alloc = g_fail_alloc;
   g_fail_alloc = false;
-  communicator_ = std::make_unique<Communicator>(unique_id, sizes_.topo);
+  communicator_ = std::make_unique<Communicator>(unique_id, sizes_.topo, (int)sizes_.counters());
   // Nothing of the op stays on any rank once the ranks know it cannot run.
   // When they all know it (together), the communicator ends on every rank at
   // once: a rank whose part of the agreement is done may still be sending a
@@ -381,7 +381,8 @@ std::string Communicator::unique_id() {
   return std::string(id.internal, sizeof(id.internal));
 }
 
-Communicator::Communicator(const std::string &unique_id, const Topo &topo) : topo_(topo) {
+Communicator::Communicator(const std::string &unique_id, const Topo &topo, int counters)
+    : topo_(topo) {
   TORCH_CHECK(unique_id.size() == sizeof(ncclUniqueId::internal),
               "hier_output_dist: a unique id is ", sizeof(ncclUniqueId::internal), " bytes, got ",
               unique_id.size());
@@ -402,18 +403,18 @@ Communicator::Communicator(const std::string &unique_id, const Topo &topo) : top
     HIER_NCCL_CHECK(ncclCommQueryProperties(comm_, &props));
     TORCH_CHECK(props.deviceApiSupport, "hier_output_dist: NCCL device API not supported here");
     // One node: LSA only, no GIN context. Across nodes: the rails over GIN,
-    // 4 contexts (a hint: the count is checked), 3 signals per node and 2
-    // counters each. Without GIN the op cannot run (gin_ok).
+    // 4 contexts (a hint: the count is checked), 3 signals per node and
+    // `counters` counters each. Without GIN the op cannot run (gin_ok).
     ncclDevCommRequirements reqs = NCCL_DEV_COMM_REQUIREMENTS_INITIALIZER;
     const bool gin = topo.num_nodes > 1 && props.railedGinType != NCCL_GIN_TYPE_NONE;
     reqs.ginContextCount = gin ? kGinContexts : 0;
     reqs.ginSignalCount = gin ? kGinSignalsPerNode * topo.num_nodes : 0;
-    reqs.ginCounterCount = gin ? kGinCounters : 0;
+    reqs.ginCounterCount = gin ? counters : 0;
     reqs.ginConnectionType = gin ? NCCL_GIN_CONNECTION_RAIL : NCCL_GIN_CONNECTION_NONE;
     reqs.ginQueueDepth = gin ? 512 : 0;
     HIER_NCCL_CHECK(ncclDevCommCreate(comm_, &reqs, &dev_));
-    gin_ok_ =
-        gin && (int)dev_.ginContextCount >= kGinContexts && gin_signals_zero(dev_, topo.num_nodes);
+    gin_ok_ = gin && (int)dev_.ginContextCount >= kGinContexts &&
+              gin_signals_zero(dev_, topo.num_nodes, counters);
   } catch (...) {
     abort();
     throw;
@@ -467,7 +468,7 @@ SymmetricWindow::SymmetricWindow(const Sizes &sizes, int device)
   const WindowLayout window = layout();
   HIER_CUDA_CHECK(cudaMemset(window.ctrl.base(), 0, window.ctrl.bytes()));
   if (window.rows.push_flags_bytes() > 0)
-    HIER_CUDA_CHECK(cudaMemset(window.rows.push_flags(0), 0, window.rows.push_flags_bytes()));
+    HIER_CUDA_CHECK(cudaMemset(window.rows.push_flags(), 0, window.rows.push_flags_bytes()));
   HIER_CUDA_CHECK(cudaDeviceSynchronize());
 }
 

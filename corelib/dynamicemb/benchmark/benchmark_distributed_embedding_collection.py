@@ -841,8 +841,8 @@ class HierTraffic:
     each owner puts one row per node-unique key another node asked of it
     over IB (rows_ib_out), each proxy receives them (rows_ib_in) for the
     rows its node asked of other nodes' owners on its rail (rows_remote: the
-    IB rows over these are the node dedup's ratio), in the rounds its
-    proxy_rows take them (rounds, per call); the backward moves the same
+    IB rows over these are the node dedup's ratio), in the chunks of its
+    stream through its ring (chunks, per call); the backward moves the same
     rows the other way. A call costs the host one append: its tables are
     read afterwards.
     """
@@ -867,7 +867,7 @@ class HierTraffic:
                         (
                             call.uniq_in,
                             call.uniq_out,
-                            call.num_rounds,
+                            call.num_chunks,
                             call.occurrences,
                         ),
                     )
@@ -882,7 +882,7 @@ class HierTraffic:
 
     def _ib(self, call) -> Optional[Tuple[torch.Tensor, ...]]:
         """A call's node-unique rows put to (uniq_in) and received from
-        (uniq_out) each node, its rounds as proxy (num_rounds) and its
+        (uniq_out) each node, its chunks as proxy (num_chunks) and its
         remote occurrences (occurrence_count); None on one node."""
         if not self.hier.multi_node:
             return None
@@ -927,7 +927,7 @@ class HierTraffic:
                 rows_ib_out=sum(int(ib[0].sum()) for ib in ibs) / iterations,
                 rows_ib_in=sum(int(ib[1].sum()) for ib in ibs) / iterations,
                 rows_remote=sum(int(ib[3]) for ib in ibs) / iterations,
-                rounds=sum(int(ib[2]) for ib in ibs) / len(ibs),
+                chunks=sum(int(ib[2]) for ib in ibs) / len(ibs),
             )
             # the busier direction of this rank's NIC
             out["rows_ib"] = max(out["rows_ib_out"], out["rows_ib_in"])

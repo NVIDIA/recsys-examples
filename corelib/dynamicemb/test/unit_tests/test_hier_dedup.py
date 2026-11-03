@@ -13,10 +13,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """The planner's steps across nodes (``src/hier_output_dist/input_dist/planner.h``) on
-one GPU, on plain tensors: the proxy's node dedup, rounds, slots and push order
-(``hier_output_dist_proxy_plan``), the rail's layout, status, owner tables
-and the proxy's backward put list (``hier_output_dist_rail_tables``), and the
-requester's tables (``hier_output_dist_requester_tables``).
+one GPU, on plain tensors: the proxy's node dedup, the chunks of its stream
+through its ring, slots and push order (``hier_output_dist_proxy_plan``), the
+rail's layout, status, owner tables and the put lists
+(``hier_output_dist_rail_tables``), and the requester's tables
+(``hier_output_dist_requester_tables``).
 
 The test plays every rank of an N-node job: each rank's part 1 (its rows by
 owner and feature, and past the valid ones index dedup's bound), its node
@@ -30,8 +31,9 @@ checks:
 
 * each proxy against a plain reference of the planner's rules: its
   node-unique keys (identities (owner node, table, key), cells by smallest
-  feature, key order inside a cell), their records, its rounds and round
-  table (cuts of equal rows), each occurrence's row and slot (the first
+  feature, key order inside a cell), their records, the chunks of its stream
+  (levels of each owner node's rows, packed, in laps when they pass the ring)
+  and where each lies, each occurrence's row and slot (the first
   occurrence's row, duplicate slots, heavy partials), push positions, push
   tables, flags and reducer lists; its cells and records against a dedup by
   merge ranks (each key's cell that of its occurrence of least merge rank),
@@ -42,9 +44,9 @@ checks:
   requesters' push tasks and the proxies' reducer lists;
 * the rail: each proxy's slices start where its owners' offsets say, and
   each owner sends each proxy its KJT's offsets of that node's cells; each
-  owner's KJT; each rank's put lists (as proxy and as owner) against a plain
-  loop over the pieces, IB chunks and cells; the needs, the same on every
-  rank.
+  owner's KJT and the chunks it got; each rank's put lists (as proxy and as
+  owner) against a plain loop over the chunks and cells; the needs, the same
+  on every rank.
 
 Calls that do not fit check the needs alone (and that no access was out of
 range). Every planner call runs under ``torch.cuda.set_sync_debug_mode
@@ -90,12 +92,41 @@ def ceil32(count: int) -> int:
     return -(-count // TASK_ROWS)
 
 
-def rounds_for(total: int, num_proxy_rows: int) -> int:
-    """The rounds of ``total`` rows (``rounds_for`` in common.h)."""
-    if total <= num_proxy_rows:
-        return 1
-    room = int(0.9 * (num_proxy_rows // 2))
-    return -(-total // room)
+def heavy_at(case: "Case") -> int:
+    """A node-unique key of more occurrences is heavy (Sizes::heavy_at)."""
+    return max(HEAVY, case.local_size * case.partial_rows)
+
+
+def max_key_rows(case: "Case") -> int:
+    """The most rows of one key (Sizes::max_key_rows)."""
+    return max(heavy_at(case), 1 + case.local_size * case.partial_rows)
+
+
+def chunk_room(case: "Case") -> int:
+    """Rows of a level (Sizes::chunk_room)."""
+    return case.slot_rows - max_key_rows(case) + 1
+
+
+def max_chunks(case: "Case", remote_keys: int) -> int:
+    """The most chunks of a stream (Sizes::max_chunks)."""
+    return remote_keys // chunk_room(case) + case.num_nodes
+
+
+def owner_chunks(case: "Case", lookup_keys: int, remote_keys: int) -> int:
+    """The most chunks an owner gets (Sizes::owner_chunks)."""
+    others = case.num_nodes - 1
+    return others + min(
+        others * remote_keys, max_key_rows(case) * lookup_keys
+    ) // chunk_room(case)
+
+
+def flag_words(case: "Case", remote_keys: int) -> int:
+    """The push-task flags of a call (Sizes::flag_words)."""
+    return (
+        remote_keys // TASK_ROWS
+        + 2 * case.local_size * max_chunks(case, remote_keys)
+        + 1
+    )
 
 
 @dataclass
@@ -110,8 +141,8 @@ class Case:
     weights: bool = False  # the keys carry weights (whole numbers: frequency counts)
     counts: bool = False  # the owner's KJT carries weights: without weights, counts
     node_dedup: bool = True
-    num_proxy_rows: int = 1 << 20  # small: several rounds
-    chunk_rows: int = 32
+    num_proxy_rows: int = 1 << 20  # small: the ring wraps
+    chunk_rows: int = 0  # the most rows of a chunk; 0: the least, 2 * max_key_rows
     itemsize: int = 4  # of an embedding row; 2: a partial takes 2 rows
     bound: int = 0  # index dedup: rows past the valid ones
     # the capacities: the most a rank needs plus this (below 0: the call
@@ -141,42 +172,61 @@ class Case:
     def record_bytes(self) -> int:
         return 16 if self.weights or self.counts else 8
 
+    @property
+    def slot_rows(self) -> int:
+        """Sizes::chunk_rows."""
+        return self.chunk_rows or 2 * max_key_rows(self)
 
-def same_parity_job(case: Case, generator) -> List[Tuple]:
-    """Review M1: requester 0's only rows at its proxy are one heavy key of
-    round 0 and one of round 2, none of round 1, and their partial slots are
-    equal. Requester 1 makes every key of the owner heavy: three rounds of
-    them."""
-    per_round = int(0.9 * (case.num_proxy_rows // 2)) // (
-        1 + case.local_size * case.partial_rows
-    )
+
+def same_place_job(case: Case, generator) -> List[Tuple]:
+    """Requester 1 makes every key of owner (node 1, 0) heavy (65
+    occurrences each), enough of them for the stream to pass the ring; then
+    the first key of the second lap's first chunk lies where key 0 does, and
+    so do their partial slots. Requester 0 asks those two keys once each: two
+    rows of one slot in two chunks."""
+    heavy_rows = 1 + case.local_size * case.partial_rows
+    room, ring = chunk_room(case), case.num_proxy_rows
+    lap_room = ring - case.slot_rows + 1
+    keys = ring // heavy_rows + 2 * (room // heavy_rows + 2)
+    level = [key * heavy_rows // room for key in range(keys)]  # each key's chunk
+    rows_before, second_lap = 0, 0  # the stream's rows before each chunk
+    for chunk in range(level[-1] + 1):
+        if rows_before >= lap_room:
+            second_lap = level.index(chunk)
+            break
+        rows_before += level.count(chunk) * heavy_rows
     cells = case.world_size * case.num_features
     rows = [
-        [0, 2 * per_round],
-        [key for key in range(3 * per_round) for _ in range(65)],
+        [0, second_lap],
+        [key for key in range(keys) for _ in range(HEAVY + 1)],
     ]
     job = []
-    for keys in rows + [[]] * (case.world_size - 2):
+    for keys_of in rows + [[]] * (case.world_size - 2):
         counts = torch.zeros(cells, dtype=torch.int64)
-        counts[case.local_size * case.num_features] = len(keys)  # owner (node 1, 0)
+        counts[case.local_size * case.num_features] = len(keys_of)  # owner (node 1, 0)
         job.append(
-            (counts, torch.tensor(keys, dtype=torch.int64), torch.ones(len(keys)))
+            (
+                counts,
+                torch.tensor(keys_of, dtype=torch.int64),
+                torch.ones(len(keys_of)),
+            )
         )
     return job
 
 
 def wide_node_job(case: Case, generator) -> List[Tuple]:
     """More GPUs per node than kHeavy: every requester of node 0 asks owner
-    (node 1, 0) for key 7 once, so its proxy's one heavy key has fewer
-    occurrences (local_size) than reducer entries (1 + local_size)."""
+    (node 1, 0) for key 7 once and for key 8 once, requester 0 twice: key 7's
+    local_size occurrences are not more than heavy_at, key 8's one more are,
+    and take its row and a partial for each requester, its occurrences."""
     cells = case.world_size * case.num_features
     job = []
     for rank in range(case.world_size):
         counts = torch.zeros(cells, dtype=torch.int64)
         keys = []
         if rank < case.local_size:  # node 0's requesters
-            counts[case.local_size * case.num_features] = 1  # owner (node 1, 0)
-            keys = [7]
+            keys = [7, 8, 8] if rank == 0 else [7, 8]
+            counts[case.local_size * case.num_features] = len(keys)  # owner (node 1, 0)
         job.append(
             (counts, torch.tensor(keys, dtype=torch.int64), torch.ones(len(keys)))
         )
@@ -194,7 +244,7 @@ CASES = [
         key_range=30,
         hot=0.5,
         weights=True,
-        chunk_rows=64,
+        chunk_rows=300,
     ),
     Case(
         "occurrence counts as weights",
@@ -206,7 +256,7 @@ CASES = [
         counts=True,
     ),
     Case(
-        "2 nodes, several rounds",
+        "2 nodes, a wrapping ring",
         num_nodes=2,
         max_block=200,
         key_range=600,
@@ -214,7 +264,7 @@ CASES = [
         num_proxy_rows=1280,
     ),
     Case(
-        "2 nodes, several rounds, weights, bf16 partials",
+        "2 nodes, a wrapping ring, weights, bf16 partials",
         num_nodes=2,
         max_block=200,
         key_range=400,
@@ -241,7 +291,7 @@ CASES = [
         hot=0.5,
     ),
     Case(
-        "large, several rounds",
+        "large, a wrapping ring",
         max_block=200,
         key_range=600,
         hot=0.15,
@@ -249,18 +299,17 @@ CASES = [
         seeds=1,
     ),
     Case(
-        "large, weights, bf16 partials, several rounds",
+        "large, weights, bf16 partials, a wrapping ring",
         max_block=200,
         key_range=400,
         hot=0.08,
         weights=True,
         num_proxy_rows=3840,
-        chunk_rows=64,
         itemsize=2,
         seeds=1,
     ),
     Case(
-        "one table, counts, several rounds",
+        "one table, counts, a wrapping ring",
         num_nodes=3,
         tables=(0, 0, 0),
         max_block=250,
@@ -271,7 +320,7 @@ CASES = [
         seeds=1,
     ),
     Case(
-        "node dedup off, 4 nodes of 2, several rounds",
+        "node dedup off, 4 nodes of 2, a wrapping ring",
         local_size=2,
         tables=(0, 1),
         max_block=700,
@@ -289,7 +338,7 @@ CASES = [
     Case("an empty call", max_block=0),
     Case("an empty call, index dedup's bound", max_block=0, bound=20),
     Case(
-        "2 nodes, several rounds, one hot key",
+        "2 nodes, a wrapping ring, one hot key",
         num_nodes=2,
         max_block=300,
         key_range=5000,
@@ -297,12 +346,12 @@ CASES = [
         num_proxy_rows=1280,
     ),
     Case(
-        "same-parity rounds (review M1)",
+        "one slot in two laps of the ring",
         num_nodes=2,
         local_size=2,
         tables=(0,),
         num_proxy_rows=1280,
-        job=same_parity_job,
+        job=same_place_job,
         seeds=1,
     ),
     Case("remote_keys overflow", max_block=20, hot=0.3, remote_slack=-1),
@@ -324,7 +373,7 @@ CASES = [
         seeds=1,
     ),
     Case(
-        "70 features, 3 nodes of 4, several rounds",
+        "70 features, 3 nodes of 4, a wrapping ring",
         num_nodes=3,
         local_size=4,
         tables=tuple(feature // 3 for feature in range(70)),
@@ -332,7 +381,7 @@ CASES = [
         key_range=4000,
         hot=0.05,
         num_proxy_rows=2560,
-        chunk_rows=64,
+        chunk_rows=200,
         seeds=1,
     ),
     Case(
@@ -343,7 +392,7 @@ CASES = [
         max_block=6,
         key_range=100,
         hot=0.2,
-        num_proxy_rows=45 * 1280,
+        num_proxy_rows=1280,
         seeds=1,
     ),
     Case(
@@ -357,7 +406,7 @@ CASES = [
         seeds=1,
     ),
     Case(
-        "2 nodes of 72, a heavy key of fewer occurrences than entries",
+        "2 nodes of 72, keys at heavy_at and past it",
         num_nodes=2,
         local_size=72,
         tables=(0,),
@@ -430,23 +479,27 @@ def make_windows(case: Case, lookup_keys: int, remote_keys: int, generator) -> D
     """A rank's window buffers as the planner across nodes reads and writes
     them, garbage in each."""
     num_nodes, local_size = case.num_nodes, case.local_size
-    rounds_cap = rounds_for(remote_keys, case.num_proxy_rows)
+    chunks = max_chunks(case, remote_keys)
     windows = dict(
         node_keys=garbage(lookup_keys + remote_keys, torch.int64, generator),
         remote_cells=garbage(remote_keys, torch.int32, generator),
         remote_map=garbage(3 * remote_keys, torch.int32, generator),
         key_stage=garbage(
-            (num_nodes - 1) * rounds_cap * 2 + remote_keys * case.record_bytes // 8 + 2,
+            chunks * 2 + remote_keys * case.record_bytes // 8 + 2,
             torch.int64,
             generator,
         ),
         proxy_header=garbage(
-            4 + 4 * rounds_cap * num_nodes + 4 * local_size * (rounds_cap + 1),
+            4 + chunks + 4 * local_size * (chunks + 1),
             torch.int32,
             generator,
         ),
         rail_keys=garbage(
-            (lookup_keys * case.record_bytes + (num_nodes - 1) * rounds_cap * 16) // 8,
+            (
+                lookup_keys * case.record_bytes
+                + owner_chunks(case, lookup_keys, remote_keys) * 16
+            )
+            // 8,
             torch.int64,
             generator,
         ),
@@ -490,7 +543,7 @@ def proxy_occurrences(case: Case, ranks: List[Dict], node: int, proxy: int) -> L
 # ── references ───────────────────────────────────────────────────────────────
 
 
-def proxy_reference(case: Case, occurrences: List, node: int, rounds_cap: int) -> Dict:
+def proxy_reference(case: Case, occurrences: List, node: int, remote_keys: int) -> Dict:
     """A proxy's tables by the planner's rules, in plain Python, from its
     occurrences."""
     num_nodes, local_size, num_features = (
@@ -498,7 +551,8 @@ def proxy_reference(case: Case, occurrences: List, node: int, rounds_cap: int) -
         case.local_size,
         case.num_features,
     )
-    partial_rows = case.partial_rows
+    partial_rows, ring, room = case.partial_rows, case.num_proxy_rows, chunk_room(case)
+    capacity = max_chunks(case, remote_keys)
     # node-unique keys: (owner node, table, key), or each occurrence; numbered
     # by (owner node, smallest feature), then key order (then occurrence)
     members: Dict = {}
@@ -529,48 +583,73 @@ def proxy_reference(case: Case, occurrences: List, node: int, rounds_cap: int) -
         for owner_node in range(num_nodes + 1)
     ]
     count = [len(group) for *_, group in keys]
-    heavy = [case.node_dedup and key_count > HEAVY for key_count in count]
+    heavy = [case.node_dedup and key_count > heavy_at(case) for key_count in count]
     rows = [
         1 + local_size * partial_rows if key_heavy else key_count
         for key_heavy, key_count in zip(heavy, count)
     ]
     row_scan = [0] + list(accumulate(rows))
-    num_rounds = rounds_for(row_scan[-1], case.num_proxy_rows)
-    half = 0 if num_rounds == 1 else case.num_proxy_rows // 2
+    occurrence_scan = [0] + list(accumulate(count))
 
-    def cut(owner_node: int, rnd: int) -> int:
-        """The cut: the first key whose rows before reach the round's share
-        of the owner node's rows."""
+    # the levels: owner node o's chunk j takes its keys whose rows before them,
+    # among the node's, are in [j * room, (j + 1) * room)
+    def first_key(owner_node: int, level: int) -> int:
         lo, hi = uniq_off[owner_node], uniq_off[owner_node + 1]
-        want = -(-rnd * (row_scan[hi] - row_scan[lo]) // num_rounds)
-        return bisect_left(row_scan, row_scan[lo] + want, lo, hi) - lo
+        return bisect_left(row_scan, row_scan[lo] + level * room, lo, hi) - lo
 
-    # (a call that does not fit may need more rounds than the cap)
-    table_rounds = max(rounds_cap, num_rounds)
-    table = [[[0, 0, 0, 0] for _ in range(num_nodes)] for _ in range(table_rounds)]
-    round_of, key_row, duplicate_base, partial_base = ([0] * num_keys for _ in range(4))
-    for rnd in range(num_rounds):
-        at = 0
-        for owner_node in range(num_nodes):
-            if owner_node == node:
-                continue
-            lo, hi = cut(owner_node, rnd), cut(owner_node, rnd + 1)
-            off = (rnd & 1) * half + at
-            table[rnd][owner_node] = [lo, hi, off, 0]
-            at += (
-                row_scan[uniq_off[owner_node] + hi]
-                - row_scan[uniq_off[owner_node] + lo]
-            )
-            # the piece: its keys' rows, the duplicates' slots, the partials
-            piece = range(uniq_off[owner_node] + lo, uniq_off[owner_node] + hi)
-            slot = off + hi - lo
-            for key in piece:
-                round_of[key], key_row[key] = rnd, off + key - uniq_off[owner_node] - lo
-                if not heavy[key]:
-                    duplicate_base[key], slot = slot, slot + count[key] - 1
-            for key in piece:
-                if heavy[key]:
-                    partial_base[key], slot = slot, slot + local_size * partial_rows
+    chunks_out = []
+    for owner_node in range(num_nodes):
+        lo, hi = uniq_off[owner_node], uniq_off[owner_node + 1]
+        chunks_out.append(
+            0
+            if owner_node == node or hi == lo
+            else (row_scan[hi - 1] - row_scan[lo]) // room + 1
+        )
+    # the stream: level after level, owner node after owner node in a level
+    stream = [
+        (owner_node, level)
+        for level in range(max(chunks_out, default=0))
+        for owner_node in range(num_nodes)
+        if chunks_out[owner_node] > level
+    ]
+    num_chunks = len(stream)
+    chunk_rows, chunk_keys = [], []
+    for owner_node, level in stream:
+        lo, hi = first_key(owner_node, level), first_key(owner_node, level + 1)
+        first = uniq_off[owner_node]
+        chunk_keys.append((first + lo, hi - lo))
+        chunk_rows.append(row_scan[first + hi] - row_scan[first + lo])
+    ends = list(accumulate([0] + chunk_rows))
+    total, lap_room = ends[-1], ring - case.slot_rows + 1
+    starts = []
+    for chunk in range(num_chunks):
+        if total <= ring:
+            starts.append(ends[chunk])
+        else:
+            lap = ends[chunk] // lap_room
+            first = bisect_left(ends, lap * lap_room, 0, num_chunks)
+            starts.append(lap * ring + ends[chunk] - ends[first])
+    stream_end = starts[-1] + chunk_rows[-1] if num_chunks else 0
+    table = [[0] * 8 for _ in range(capacity)]
+    node_chunk_start = list(accumulate([0] + chunks_out))
+    node_chunks = [0] * node_chunk_start[-1]
+    chunk_of, key_row, duplicate_base, partial_base = ([0] * num_keys for _ in range(4))
+    for chunk, (owner_node, level) in enumerate(stream):
+        key_lo, num = chunk_keys[chunk]
+        start, end = starts[chunk], starts[chunk] + chunk_rows[chunk]
+        pulls = occurrence_scan[key_lo + num] - occurrence_scan[key_lo]
+        table[chunk] = [owner_node, key_lo, num, pulls, start, end, level, 0]
+        node_chunks[node_chunk_start[owner_node] + level] = chunk
+        # the chunk's rows: its keys' rows, the duplicates' slots, the partials
+        at = start % ring
+        slot = at + num
+        for key in range(key_lo, key_lo + num):
+            chunk_of[key], key_row[key] = chunk, at + key - key_lo
+            if not heavy[key]:
+                duplicate_base[key], slot = slot, slot + count[key] - 1
+        for key in range(key_lo, key_lo + num):
+            if heavy[key]:
+                partial_base[key], slot = slot, slot + local_size * partial_rows
     # each occurrence's row word, slot, and place in its requester's push order
     word0, slots = [0] * len(occurrences), [0] * len(occurrences)
     for key, (*_, group) in enumerate(keys):
@@ -583,21 +662,14 @@ def proxy_reference(case: Case, occurrences: List, node: int, rounds_cap: int) -
 
     def push_key(occ: int) -> Tuple:
         key = key_of[occ]
-        uniq = key - uniq_off[node_of[key]]
-        chunk = (uniq - table[round_of[key]][node_of[key]][0]) // case.chunk_rows
-        return (
-            round_of[key],
-            heavy[key],
-            key if heavy[key] else (chunk << 5 | node_of[key]),
-            occ,
-        )
+        return (chunk_of[key], heavy[key], key if heavy[key] else 0, occ)
 
     position = [0] * len(occurrences)
     asks: Dict = {}  # (requester, heavy key) -> its occurrences of the key
-    plain = [[0] * (table_rounds + 1) for _ in range(local_size)]
-    heavy_rows = [[0] * (table_rounds + 1) for _ in range(local_size)]
+    plain = [[0] * (capacity + 1) for _ in range(local_size)]
+    heavy_rows = [[0] * (capacity + 1) for _ in range(local_size)]
     groups: List[List[List[int]]] = [
-        [[] for _ in range(table_rounds + 1)] for _ in range(local_size)
+        [[] for _ in range(capacity + 1)] for _ in range(local_size)
     ]
     for requester in range(local_size):
         mine = [
@@ -609,43 +681,57 @@ def proxy_reference(case: Case, occurrences: List, node: int, rounds_cap: int) -
             position[occ] = pos
             key = key_of[occ]
             if not heavy[key]:
-                plain[requester][round_of[key]] += 1
+                plain[requester][chunk_of[key]] += 1
             else:
-                heavy_rows[requester][round_of[key]] += 1
+                heavy_rows[requester][chunk_of[key]] += 1
                 if (requester, key) not in asks:
-                    groups[requester][round_of[key]].append(key)
+                    groups[requester][chunk_of[key]].append(key)
                 asks[(requester, key)] = asks.get((requester, key), 0) + 1
-    # push tables: per requester and round its start, heavy start, flags, groups
+    # push tables: per requester and chunk its start, heavy start, flags,
+    # groups; the flags chunk after chunk, requester after requester in one
+    tasks = [
+        [
+            ceil32(plain[requester][chunk]) + ceil32(len(groups[requester][chunk]))
+            for chunk in range(capacity + 1)
+        ]
+        for requester in range(local_size)
+    ]
+    flag_start = list(
+        accumulate(
+            [0]
+            + [
+                sum(tasks[requester][chunk] for requester in range(local_size))
+                for chunk in range(capacity)
+            ]
+        )
+    )
     push_tables = []
     for requester in range(local_size):
         entries, start, group_start = [], 0, 0
-        for rnd in range(rounds_cap + 1):
-            flags = 0
-            if rnd < num_rounds:
-                flags = sum(
-                    ceil32(plain[lower][rnd]) + ceil32(len(groups[lower][rnd]))
-                    for lower in range(requester)
-                )
-            entries.append([start, start + plain[requester][rnd], flags, group_start])
-            start += plain[requester][rnd] + heavy_rows[requester][rnd]
-            group_start += len(groups[requester][rnd])
+        for chunk in range(capacity + 1):
+            flags = flag_start[chunk] + sum(
+                tasks[lower][chunk] for lower in range(requester)
+            )
+            entries.append([start, start + plain[requester][chunk], flags, group_start])
+            start += plain[requester][chunk] + heavy_rows[requester][chunk]
+            group_start += len(groups[requester][chunk])
         push_tables.append(entries)
     # reducer lists: a key's entries in occurrence order; a heavy key's own
     # row, then each requester's partial; each the flag of the push task that
     # fills its slot
     entries, reducer_start = [], [0]
     for key, (*_, group) in enumerate(keys):
-        rnd = round_of[key]
+        chunk = chunk_of[key]
         if heavy[key]:
             entries.append((key_row[key], ENTRY_OWN_ROW))
             for requester in range(local_size):
                 flag = ENTRY_NO_PUSH
-                if key in groups[requester][rnd]:
-                    entry = push_tables[requester][rnd]
+                if key in groups[requester][chunk]:
+                    entry = push_tables[requester][chunk]
                     flag = (
                         entry[2]
                         + ceil32(entry[1] - entry[0])
-                        + groups[requester][rnd].index(key) // TASK_ROWS
+                        + groups[requester][chunk].index(key) // TASK_ROWS
                     )
                 entries.append(
                     (
@@ -655,7 +741,7 @@ def proxy_reference(case: Case, occurrences: List, node: int, rounds_cap: int) -
                 )
         else:
             for occ in group:
-                entry = push_tables[occurrences[occ][0]][rnd]
+                entry = push_tables[occurrences[occ][0]][chunk]
                 entries.append(
                     (slots[occ], entry[2] + (position[occ] - entry[0]) // TASK_ROWS)
                 )
@@ -672,7 +758,7 @@ def proxy_reference(case: Case, occurrences: List, node: int, rounds_cap: int) -
     slice_bytes = [
         0
         if owner_node == node
-        else num_rounds * 16
+        else chunks_out[owner_node] * 16
         + (uniq_off[owner_node + 1] - uniq_off[owner_node]) * case.record_bytes
         for owner_node in range(num_nodes)
     ]
@@ -688,9 +774,13 @@ def proxy_reference(case: Case, occurrences: List, node: int, rounds_cap: int) -
         heavy=heavy,
         cell_uniq=cell_uniq,
         uniq_off=uniq_off,
-        num_rounds=num_rounds,
-        round_table=table,
-        round_of=round_of,
+        num_chunks=num_chunks,
+        chunks=table,
+        chunks_out=chunks_out,
+        node_chunk_start=node_chunk_start,
+        node_chunks=node_chunks,
+        stream_end=stream_end,
+        chunk_of=chunk_of,
         key_row=key_row,
         word0=word0,
         slot=slots,
@@ -701,6 +791,9 @@ def proxy_reference(case: Case, occurrences: List, node: int, rounds_cap: int) -
         reducer_start=reducer_start,
         entries=entries,
         records=records,
+        reduce_task_starts=list(
+            accumulate([0] + [ceil32(table[chunk][2]) for chunk in range(capacity)])
+        ),
         stage_slice=[sum(slice_bytes[:owner_node]) for owner_node in range(num_nodes)],
     )
 
@@ -754,53 +847,32 @@ def merge_rank_cells(case: Case, occurrences: List) -> Dict:
     return {cell: sorted(records) for cell, records in cells.items()}
 
 
-def segments_reference(case: Case, pieces, rounds, cells, cell_rows, rounds_cap: int):
+def segments_reference(case: Case, chunks, cells, cell_rows):
     """The put lists by a plain loop, over 2 * num_nodes nodes: the backward
     list's owner nodes, then the forward list's proxy nodes. Each node's keys,
-    round by round, its piece cut every chunk_rows keys and at its feature
-    cells; chunks numbered piece by piece, round-major. pieces[rnd][node] =
-    (lo, hi, row of lo in proxy_rows), rounds[node]: its rounds,
-    cells[node][feature]: its keys of each feature, cell_rows[node][feature]:
-    the owner's KJT row of each cell's first key. Returns the segments [src,
-    dst, rows, chunk], the first segment of each (node, round), [node]
-    [rounds_cap + 1], and the chunks."""
-    nodes, chunk_rows = 2 * case.num_nodes, case.chunk_rows
-    first_chunk, chunks = {}, 0
-    for rnd in range(rounds_cap):
-        for node in range(nodes):
-            lo, hi, _ = pieces[rnd][node]
-            first_chunk[rnd, node] = chunks
-            if rnd < rounds[node]:
-                chunks += -(-(hi - lo) // chunk_rows)
+    chunk by chunk, each chunk cut at its feature cells. chunks[node]: its
+    chunks in order, each (lo, hi, row of lo in proxy_rows, its number in its
+    list); cells[node][feature]: its keys of each feature; cell_rows[node]
+    [feature]: the owner's KJT row of each cell's first key. Returns the
+    segments [src, dst, rows, chunk] and where each node's start, [2 *
+    num_nodes + 1]."""
     segments, starts = [], []
-    for node in range(nodes):
+    for node in range(2 * case.num_nodes):
+        starts.append(len(segments))
         cell_ends = list(accumulate([0] + list(cells[node])))
-        node_starts = []
-        for rnd in range(rounds_cap):
-            node_starts.append(len(segments))
-            if rnd >= rounds[node]:
-                continue
-            lo, hi, row = pieces[rnd][node]
-            cuts = sorted(
-                set(
-                    [lo, hi]
-                    + list(range(lo, hi, chunk_rows))
-                    + [end for end in cell_ends if lo < end < hi]
-                )
-            )
+        for lo, hi, row, number in chunks[node]:
+            cuts = sorted(set([lo, hi] + [end for end in cell_ends if lo < end < hi]))
             for first, last in zip(cuts, cuts[1:]):
                 feature = bisect_right(cell_ends, first) - 1
-                piece_row = row + first - lo
+                chunk_row = row + first - lo
                 cell_row = cell_rows[node][feature] + first - cell_ends[feature]
-                chunk = first_chunk[rnd, node] + (first - lo) // chunk_rows
                 segments.append(
-                    [cell_row, piece_row, last - first, chunk]
+                    [cell_row, chunk_row, last - first, number]
                     if node >= case.num_nodes
-                    else [piece_row, cell_row, last - first, chunk]
+                    else [chunk_row, cell_row, last - first, number]
                 )
-        node_starts.append(len(segments))
-        starts.append(node_starts)
-    return segments, starts, chunks
+    starts.append(len(segments))
+    return segments, starts
 
 
 # ── the call ─────────────────────────────────────────────────────────────────
@@ -826,7 +898,7 @@ def run_call(
     )
     world_size = case.world_size
     tables = torch.tensor(case.tables, dtype=torch.int32, device="cuda")
-    common = 3 + num_nodes  # a count message's common part (CountMessage::common)
+    common = 2 + 2 * num_nodes  # a count message's common part (CountMessage::common)
 
     def sizes(rank: int) -> Dict[str, int]:
         return dict(
@@ -840,7 +912,7 @@ def run_call(
             remote_keys=remote_keys,
             num_proxy_rows=case.num_proxy_rows,
             partial_rows=case.partial_rows,
-            chunk_rows=case.chunk_rows,
+            chunk_rows=case.slot_rows,
             record_bytes=case.record_bytes,
         )
 
@@ -938,8 +1010,10 @@ def run_call(
             messages_of(rank),
             layouts[rank]["own_cells"],
             layouts[rank]["own_starts"],
-            proxies[rank]["round_table"],
-            proxies[rank]["num_rounds"].view(1),
+            proxies[rank]["chunks"],
+            proxies[rank]["node_chunk_start"],
+            proxies[rank]["node_chunks"],
+            proxies[rank]["uniq_off"],
             proxies[rank]["cell_uniq"],
             sizes=sizes(rank),
             **later,
@@ -992,7 +1066,7 @@ def run_call(
                 else None,
             )
         )
-        cell_starts = publish[node, :, 3:].view(local_size, local_size, num_features)
+        cell_starts = publish[node, :, 2:].view(local_size, local_size, num_features)
         node_ranks = range(node * local_size, (node + 1) * local_size)
         requesters.append(
             planner(
@@ -1023,11 +1097,17 @@ def run_call(
 # ── checks ───────────────────────────────────────────────────────────────────
 
 
+def u32(values: List[int]) -> List[int]:
+    """int32 words as the uint32 they hold."""
+    return [value & 0xFFFFFFFF for value in values]
+
+
 def check_proxy(
-    case: Case, node: int, ref: Dict, out: Dict, window: Dict, rounds_cap: int
+    case: Case, node: int, ref: Dict, out: Dict, window: Dict, remote_keys: int
 ):
     """A proxy's outputs and windows against its reference."""
     num_nodes, local_size = case.num_nodes, case.local_size
+    capacity = max_chunks(case, remote_keys)
     problems = []
 
     def expect(label: str, got, want) -> None:
@@ -1035,60 +1115,77 @@ def check_proxy(
             problems.append(label)
 
     num_occurrences, num_keys = len(ref["occurrences"]), ref["num_keys"]
-    num_rounds = ref["num_rounds"]
+    num_chunks = ref["num_chunks"]
     expect("occurrences", int(out["occurrence_count"]), num_occurrences)
     expect("keys", out["key_of_occurrence"][:num_occurrences].tolist(), ref["key_of"])
     expect("cells", out["cell_uniq"].tolist(), ref["cell_uniq"])
     expect("uniq_off", out["uniq_off"].tolist(), ref["uniq_off"])
-    expect("rounds", int(out["num_rounds"]), num_rounds)
-    expect("round table", out["round_table"].tolist(), ref["round_table"])
+    expect("chunks", int(out["num_chunks"]), num_chunks)
+    expect(
+        "chunk table",
+        [
+            row[:4] + u32(row[4:6]) + row[6:]
+            for row in out["chunks"].view(-1, 8).tolist()
+        ],
+        ref["chunks"],
+    )
+    expect("chunks_out", out["chunks_out"].tolist(), ref["chunks_out"])
+    expect(
+        "node_chunk_start", out["node_chunk_start"].tolist(), ref["node_chunk_start"]
+    )
+    expect(
+        "node_chunks",
+        out["node_chunks"][: len(ref["node_chunks"])].tolist(),
+        ref["node_chunks"],
+    )
+    expect(
+        "reduce_task_starts",
+        out["reduce_task_starts"].tolist(),
+        ref["reduce_task_starts"],
+    )
     words = window["remote_map"].view(3, -1)[:, :num_occurrences].long().cpu()
     expect("key rows", (words[0] & 0xFFFFFFFF).tolist(), ref["word0"])
     expect("slots", words[1].tolist(), ref["slot"])
     expect("push positions", words[2].tolist(), ref["position"])
     header = window["proxy_header"].cpu()
-    table_words = 4 * rounds_cap * num_nodes
-    expect("header rounds", int(header[0]), num_rounds)
+    expect("header chunks", int(header[0]), num_chunks)
+    expect("header end", int(header[1]) & 0xFFFFFFFF, ref["stream_end"])
     expect(
-        "header round table",
-        header[4 : 4 + table_words].view(rounds_cap, num_nodes, 4).tolist(),
-        ref["round_table"],
+        "header ends",
+        u32(header[4 : 4 + capacity].tolist()),
+        [row[5] for row in ref["chunks"]],
     )
     expect(
         "push tables",
-        header[4 + table_words :].view(local_size, rounds_cap + 1, 4).tolist(),
+        header[4 + capacity :].view(local_size, capacity + 1, 4).tolist(),
         ref["push_tables"],
     )
-    expect(
-        "push_start",
-        out["push_start"].tolist(),
-        [[entry[0] for entry in entries] for entries in ref["push_tables"]],
-    )
-    # key_stage: per owner node its round pieces, then its keys' records
+    # key_stage: per owner node its chunks, then its keys' records
     stage = window["key_stage"].cpu()
     stage_slice = out["stage_slice"].tolist()
     expect("stage slices", stage_slice, ref["stage_slice"])
-    pieces = stage.view(torch.int32)
-    expect(
-        "stage pieces",
-        [
-            pieces[(stage_slice[owner_node] + 16 * rnd) // 4 :][:4].tolist()
-            for rnd in range(num_rounds)
-            for owner_node in range(num_nodes)
-            if owner_node != node
-        ],
-        [
-            ref["round_table"][rnd][owner_node]
-            for rnd in range(num_rounds)
-            for owner_node in range(num_nodes)
-            if owner_node != node
-        ],
-    )
+    words32 = stage.view(torch.int32)
+    got, want = [], []
+    for owner_node in range(num_nodes):
+        if owner_node == node:
+            continue
+        for level in range(ref["chunks_out"][owner_node]):
+            word = (stage_slice[owner_node] + 16 * level) // 4
+            got.append(
+                words32[word : word + 2].tolist()
+                + u32(words32[word + 2 : word + 4].tolist())
+            )
+            chunk = ref["chunks"][
+                ref["node_chunks"][ref["node_chunk_start"][owner_node] + level]
+            ]
+            uniq_lo = chunk[1] - ref["uniq_off"][owner_node]
+            want.append([uniq_lo, uniq_lo + chunk[2], chunk[4], chunk[5]])
+    expect("stage chunks", got, want)
     word = torch.tensor(
         [
             (
                 stage_slice[owner_node]
-                + 16 * num_rounds
+                + 16 * ref["chunks_out"][owner_node]
                 + (key - ref["uniq_off"][owner_node]) * case.record_bytes
             )
             // 8
@@ -1135,7 +1232,7 @@ def check_requester(
     refs: Dict,
     out: Dict,
     owner_offsets,
-    rounds_cap: int,
+    remote_keys: int,
 ):
     """A requester's tables against its proxies' references and its node's
     owners' KJTs."""
@@ -1187,7 +1284,8 @@ def check_requester(
         [row for rows in at_proxy for _, row in sorted(rows)],
     )
     # Its push tables at each proxy made absolute, and its heavy groups:
-    # per proxy and round the positions of each heavy key it asks.
+    # per proxy and chunk the positions of each heavy key it asks.
+    capacity = max_chunks(case, remote_keys)
     tables, heavy_groups, group_at = [], [], 0
     for proxy in range(local_size):
         ref = refs[(node, proxy)]
@@ -1197,25 +1295,27 @@ def check_requester(
             for entry in ref["push_tables"][local_rank]
         ]
         tables.append(entries)
-        for rnd in range(ref["num_rounds"]):
-            position = entries[rnd][1]
-            for key in ref["groups"][local_rank][rnd]:
+        for chunk in range(ref["num_chunks"]):
+            position = entries[chunk][1]
+            for key in ref["groups"][local_rank][chunk]:
                 asks = ref["asks"][(local_rank, key)]
                 heavy_groups.append([position, position + asks])
                 position += asks
-        group_at += ref["push_tables"][local_rank][ref["num_rounds"]][3]
+        group_at += ref["push_tables"][local_rank][capacity][3]
     expect("push tables", out["push_tables"].tolist(), tables)
     expect(
-        "proxy rounds",
-        out["proxy_rounds"].tolist(),
-        [refs[(node, proxy)]["num_rounds"] for proxy in range(local_size)],
+        "proxy chunks",
+        out["proxy_chunks"].tolist(),
+        [refs[(node, proxy)]["num_chunks"] for proxy in range(local_size)],
     )
     expect(
-        "proxy round tables",
-        out["proxy_round_tables"]
-        .reshape(local_size, rounds_cap, num_nodes, 4)
-        .tolist(),
-        [refs[(node, proxy)]["round_table"] for proxy in range(local_size)],
+        "proxy ends",
+        out["proxy_ends"].tolist(),
+        [
+            [row[5] for row in refs[(node, proxy)]["chunks"]]
+            + [refs[(node, proxy)]["stream_end"]]
+            for proxy in range(local_size)
+        ],
     )
     groups = len(heavy_groups)
     expect("heavy groups", out["heavy_groups"][:groups].tolist(), heavy_groups)
@@ -1228,35 +1328,52 @@ def check_requester(
         out["group_of_sub"][: first_sub[-1]].tolist(),
         [group for group, count in enumerate(subs) for _ in range(count)],
     )
-    # task starts: per round a slot per task of its busiest proxy there, for
-    # every proxy
+    # task starts: chunk after chunk, the proxies in turn from its own one;
+    # the backward's each chunk's heavy groups of every proxy, then its rows
     fwd, bwd = [0], [0]
-    for rnd in range(rounds_cap):
-        row_tasks, heavy_tasks, group_tasks = [0], [0], [0]
-        for proxy, entries in enumerate(tables):
-            if rnd < refs[(node, proxy)]["num_rounds"]:
-                entry, next_entry = entries[rnd], entries[rnd + 1]
-                row_tasks.append(ceil32(entry[1] - entry[0]))
-                heavy_tasks.append(ceil32(next_entry[0] - entry[1]))
-                group_tasks.append(ceil32(next_entry[3] - entry[3]))
-        fwd.append(fwd[-1] + local_size * max(map(sum, zip(row_tasks, heavy_tasks))))
-        bwd.append(bwd[-1] + local_size * max(group_tasks))
-        bwd.append(bwd[-1] + local_size * max(row_tasks))
+
+    def tasks(proxy: int, chunk: int):
+        if chunk >= refs[(node, proxy)]["num_chunks"]:
+            return 0, 0, 0
+        entry, next_entry = tables[proxy][chunk], tables[proxy][chunk + 1]
+        return (
+            ceil32(entry[1] - entry[0]),
+            ceil32(next_entry[0] - entry[1]),
+            ceil32(next_entry[3] - entry[3]),
+        )
+
+    for chunk in range(capacity):
+        turn = [(local_rank + k) % local_size for k in range(local_size)]
+        for proxy in turn:
+            rows, heavy_rows, _ = tasks(proxy, chunk)
+            fwd.append(fwd[-1] + rows + heavy_rows)
+        for proxy in turn:
+            bwd.append(bwd[-1] + tasks(proxy, chunk)[2])
+        for proxy in turn:
+            bwd.append(bwd[-1] + tasks(proxy, chunk)[0])
     expect("fwd_task_starts", out["fwd_task_starts"].tolist(), fwd)
     expect("bwd_task_starts", out["bwd_task_starts"].tolist(), bwd)
     return problems
 
 
 def check_backward(
-    case: Case, node: int, ranks: List[Dict], refs: Dict, proxies, requesters, generator
+    case: Case,
+    node: int,
+    ranks: List[Dict],
+    refs: Dict,
+    proxies,
+    requesters,
+    remote_keys: int,
+    generator,
 ):
     """A backward of the node with integer gradients: each requester pushes
-    its rows of a round at a proxy as its push tasks do (rows, then each heavy
-    group's sum into its partial slot), each with its task's flag; each
+    its rows of a chunk at a proxy as its push tasks do (rows, then each
+    heavy group's sum into its partial slot), each with its task's flag; each
     proxy's reducers sum their keys' entries, which must name those flags.
-    Every key gets the sum of its occurrences' gradients."""
+    Every key gets the sum of its occurrences' gradients, and every flag of
+    the call is one task's."""
     local_size = case.local_size
-    half_flags = case.num_proxy_rows // TASK_ROWS + 2 * local_size
+    flags = flag_words(case, remote_keys)
     problems = []
     node_ranks = range(node * local_size, (node + 1) * local_size)
     grads = [
@@ -1279,17 +1396,17 @@ def check_backward(
         occurrences_of = [[] for _ in range(ref["num_keys"])]
         for occ, key in enumerate(ref["key_of"]):
             occurrences_of[key].append(ref["occurrences"][occ])
-        for rnd in range(ref["num_rounds"]):
+        flags_used = [0] * flags
+        for chunk in range(ref["num_chunks"]):
             store: Dict = {}  # slot -> pushes of (gradient, flag)
-            flags_used = [0] * half_flags
             for requester, table in enumerate(tables):
-                entry = table["push_tables"][proxy][rnd]
-                next_entry = table["push_tables"][proxy][rnd + 1]
+                entry = table["push_tables"][proxy][chunk]
+                next_entry = table["push_tables"][proxy][chunk + 1]
                 row_tasks = ceil32(entry[1] - entry[0])
                 last_flag = entry[2] + row_tasks + ceil32(next_entry[3] - entry[3])
-                if last_flag > half_flags:
-                    problems.append("flags past half_flags")
-                for flag in range(entry[2], min(last_flag, half_flags)):
+                if last_flag > flags:
+                    problems.append("flags past flag_words")
+                for flag in range(entry[2], min(last_flag, flags)):
                     flags_used[flag] += 1
                 for position in range(entry[0], entry[1]):
                     row = table["push_order"][position]
@@ -1302,7 +1419,7 @@ def check_backward(
                 for group in range(entry[3], next_entry[3]):
                     start, end = table["heavy_groups"][group]
                     if not entry[1] <= start < end <= next_entry[0]:
-                        problems.append("a heavy group outside its round's heavy range")
+                        problems.append("a heavy group outside its chunk's heavy range")
                     rows = table["push_order"][start:end]
                     slots = {table["dst"][row] for row in rows}
                     if len(slots) != 1:
@@ -1312,12 +1429,10 @@ def check_backward(
                     store.setdefault(slots.pop(), []).append(
                         (sum(grads[requester][row] for row in rows), flag)
                     )
-            if max(flags_used) > 1:
-                problems.append("flag ranges of requesters overlap")
             if any(len(pushes) > 1 for pushes in store.values()):
                 problems.append("two pushes to one slot")
             for key in range(ref["num_keys"]):
-                if ref["round_of"][key] != rnd:
+                if ref["chunk_of"][key] != chunk:
                     continue
                 total = 0
                 for entry in entries[reducer_start[key] : reducer_start[key + 1]]:
@@ -1334,6 +1449,8 @@ def check_backward(
                 want = sum(grads[occ[0]][occ[1]] for occ in occurrences_of[key])
                 if total != want:
                     problems.append("a key's gradient sum")
+        if max(flags_used, default=0) > 1:
+            problems.append("flag ranges of tasks overlap")
     return problems
 
 
@@ -1375,13 +1492,11 @@ def check_rail(
         if mine["put_dst"][owner_node] != slice_in[node][0]:
             problems.append("put_dst != the owner's slice_in")
         uniq = ref["uniq_off"][owner_node + 1] - ref["uniq_off"][owner_node]
-        if (
-            mine["put_bytes"][owner_node]
-            != 16 * ref["num_rounds"] + uniq * case.record_bytes
-        ):
+        chunks = ref["chunks_out"][owner_node]
+        if mine["put_bytes"][owner_node] != 16 * chunks + uniq * case.record_bytes:
             problems.append("put_bytes")
-        if slice_in[node][1] != ref["num_rounds"]:
-            problems.append("slice_in rounds")
+        if slice_in[node][1] != chunks:
+            problems.append("slice_in chunks")
         if owner["uniq_in"].tolist()[node] != uniq:
             problems.append("uniq_in != the proxy's uniq_out")
     offsets = mine["kjt_offsets"]
@@ -1395,9 +1510,7 @@ def check_rail(
     return problems
 
 
-def check_owner(
-    case: Case, rank: int, ranks: List[Dict], refs: Dict, out: Dict, rounds_cap: int
-):
+def check_owner(case: Case, rank: int, ranks: List[Dict], refs: Dict, out: Dict):
     """An owner's KJT: per feature its node's keys, each requester's in its
     order, then each other node's node-unique keys of its rail's proxy there,
     in key order."""
@@ -1456,46 +1569,67 @@ def check_owner(
     return problems
 
 
-def check_put_lists(
-    case: Case, rank: int, refs: Dict, out: Dict, rail_cells, rounds_cap: int
-):
+def check_put_lists(case: Case, rank: int, refs: Dict, out: Dict, rail_cells):
     """A rank's put lists, as proxy the backward's and as owner the
-    forward's, its chunks and its reducer task starts, against a plain
-    loop."""
+    forward's, and the chunks it got as owner, against a plain loop."""
     num_nodes, local_size, num_features = (
         case.num_nodes,
         case.local_size,
         case.num_features,
     )
     num_sources = local_size + num_nodes - 1
+    ring = case.num_proxy_rows
     node, rail = divmod(rank, local_size)
     ref = refs[(node, rail)]
     offsets = out["kjt_offsets"].tolist()
-    # the backward's owner nodes: this proxy's pieces and cells, at the rows
+
+    def node_chunks(proxy_ref: Dict, owner_node: int):
+        """A proxy's chunks of an owner node, in order: (uniq_lo, uniq_hi,
+        start, end, its place in the stream)."""
+        out_chunks = []
+        first = proxy_ref["node_chunk_start"][owner_node]
+        for level in range(proxy_ref["chunks_out"][owner_node]):
+            place = proxy_ref["node_chunks"][first + level]
+            chunk = proxy_ref["chunks"][place]
+            uniq_lo = chunk[1] - proxy_ref["uniq_off"][owner_node]
+            out_chunks.append((uniq_lo, uniq_lo + chunk[2], chunk[4], chunk[5], place))
+        return out_chunks
+
+    # the backward's owner nodes: this proxy's chunks and cells, at the rows
     # its owners sent; then the forward's proxy nodes: each source node's
-    # pieces for this owner, at its cells in this owner's KJT
-    pieces = [[(0, 0, 0)] * (2 * num_nodes) for _ in range(rounds_cap)]
-    rounds = [ref["num_rounds"]] * num_nodes + [0] * num_nodes
+    # chunks for this owner, numbered in the order it got them, at its cells in
+    # this owner's KJT
+    chunks = [
+        [
+            (lo, hi, start % ring, place)
+            for lo, hi, start, _, place in node_chunks(ref, owner)
+        ]
+        for owner in range(num_nodes)
+    ]
     cells = [
         ref["cell_uniq"][owner_node * num_features :][:num_features]
         for owner_node in range(num_nodes)
     ]
     cell_rows = list(rail_cells)
-    for rnd in range(ref["num_rounds"]):
-        for owner_node in range(num_nodes):
-            pieces[rnd][owner_node] = tuple(ref["round_table"][rnd][owner_node][:3])
+    fwd_chunks, fwd_chunk_start = [], [0]
     for source in range(num_nodes):
         if source == node:
+            chunks.append([])
             cells.append([0] * num_features)
             cell_rows.append([0] * num_features)
+            fwd_chunk_start.append(len(fwd_chunks))
             continue
         source_ref = refs[(source, rail)]
         column = source if source < node else source - 1
-        rounds[num_nodes + source] = source_ref["num_rounds"]
-        for rnd in range(source_ref["num_rounds"]):
-            pieces[rnd][num_nodes + source] = tuple(
-                source_ref["round_table"][rnd][node][:3]
-            )
+        got = node_chunks(source_ref, node)
+        chunks.append(
+            [
+                (lo, hi, start % ring, len(fwd_chunks) + nth)
+                for nth, (lo, hi, start, _, _) in enumerate(got)
+            ]
+        )
+        fwd_chunks += [[lo, hi, start, end] for lo, hi, start, end, _ in got]
+        fwd_chunk_start.append(len(fwd_chunks))
         cells.append(source_ref["cell_uniq"][node * num_features :][:num_features])
         cell_rows.append(
             [
@@ -1503,49 +1637,17 @@ def check_put_lists(
                 for feature in range(num_features)
             ]
         )
-    segments, starts, chunks = segments_reference(
-        case, pieces, rounds, cells, cell_rows, rounds_cap
-    )
+    segments, starts = segments_reference(case, chunks, cells, cell_rows)
     problems = []
-    if int(out["num_chunks"]) != chunks:
-        problems.append("chunks")
+    got_chunks = out["fwd_chunks"][: len(fwd_chunks)].tolist()
+    if [row[:2] + u32(row[2:]) for row in got_chunks] != fwd_chunks:
+        problems.append("fwd_chunks")
+    if out["fwd_chunk_start"].tolist() != fwd_chunk_start:
+        problems.append("fwd_chunk_start")
     if out["put_list"][: len(segments)].tolist() != segments:
         problems.append("put list")
-    if out["bwd_put_start"].tolist() != starts[:num_nodes]:
-        problems.append("backward put starts")
-    if out["fwd_put_start"].tolist() != starts[num_nodes:]:
-        problems.append("forward put starts")
-    chunk0, at = [], 0
-    for rnd in range(rounds_cap):
-        for piece_node in range(2 * num_nodes):
-            lo, hi, _ = pieces[rnd][piece_node]
-            if piece_node < num_nodes:
-                chunk0.append(at)
-            if rnd < rounds[piece_node]:
-                at += -(-(hi - lo) // case.chunk_rows)
-    table = out["round_table"].tolist()
-    if [
-        table[rnd][owner_node][3]
-        for rnd in range(rounds_cap)
-        for owner_node in range(num_nodes)
-    ] != chunk0:
-        problems.append("round table chunks")
-    busiest = [
-        max(
-            -(-(hi - lo) // case.chunk_rows) for lo, hi, _, _ in ref["round_table"][rnd]
-        )
-        for rnd in range(rounds_cap)
-    ]
-    if out["reduce_task_starts"].tolist() != list(
-        accumulate(
-            [0]
-            + [
-                round_chunks * num_nodes * (case.chunk_rows // TASK_ROWS)
-                for round_chunks in busiest
-            ]
-        )
-    ):
-        problems.append("reduce_task_starts")
+    if out["put_starts"].tolist() != starts:
+        problems.append("put starts")
     return problems
 
 
@@ -1566,9 +1668,8 @@ def run_case(case: Case, seed: int) -> Tuple[Dict[str, List[str]], str]:
     }
     need_remote = max(len(occs) for occs in occurrences.values())
     remote_keys = max(need_remote + case.remote_slack, 1)
-    rounds_cap = rounds_for(remote_keys, case.num_proxy_rows)
     refs = {
-        where: proxy_reference(case, occs, where[0], rounds_cap)
+        where: proxy_reference(case, occs, where[0], remote_keys)
         for where, occs in occurrences.items()
     }
     # what each owner looks up: its node's keys for it, and the node-unique
@@ -1595,13 +1696,14 @@ def run_case(case: Case, seed: int) -> Tuple[Dict[str, List[str]], str]:
         )
     need_lookup = max(recv)
     lookup_keys = max(need_lookup + case.lookup_slack, 1)
-    need_rounds = max(ref["num_rounds"] for ref in refs.values())
+    laps = max(-(-ref["stream_end"] // case.num_proxy_rows) for ref in refs.values())
     call = run_call(case, ranks, lookup_keys, remote_keys, generator)
     # each node's agreed needs: the most of what its ranks publish
-    agreed = call["publish"][:, :, :3].amax(1).tolist()
+    agreed = call["publish"][:, :, :2].amax(1).tolist()
     checks = {"puts": call["problems"]}
     stats = (
-        f"rounds {need_rounds}, heavy keys {sum(sum(ref['heavy']) for ref in refs.values())}, "
+        f"chunks {max(ref['num_chunks'] for ref in refs.values())}, laps {laps}, "
+        f"heavy keys {sum(sum(ref['heavy']) for ref in refs.values())}, "
         f"heavy groups {sum(len(ref['asks']) for ref in refs.values())}"
     )
     if lookup_keys < need_lookup or remote_keys < need_remote:
@@ -1617,9 +1719,7 @@ def run_case(case: Case, seed: int) -> Tuple[Dict[str, List[str]], str]:
         )
         return checks, stats
     checks["needs"] = (
-        []
-        if all(row == [need_lookup, need_remote, need_rounds] for row in agreed)
-        else ["needs"]
+        [] if all(row == [need_lookup, need_remote] for row in agreed) else ["needs"]
     )
     proxies, rails, owners = call["proxies"], call["rails"], call["owners"]
     requesters = call["requesters"]
@@ -1632,7 +1732,7 @@ def run_case(case: Case, seed: int) -> Tuple[Dict[str, List[str]], str]:
                 refs[divmod(rank, local_size)],
                 proxies[rank],
                 call["windows"][rank],
-                rounds_cap,
+                remote_keys,
             )
             for rank in range(world_size)
         ),
@@ -1641,7 +1741,7 @@ def run_case(case: Case, seed: int) -> Tuple[Dict[str, List[str]], str]:
     checks["requesters"] = sum(
         (
             check_requester(
-                case, rank, ranks, refs, requesters[rank], owner_offsets, rounds_cap
+                case, rank, ranks, refs, requesters[rank], owner_offsets, remote_keys
             )
             for rank in range(world_size)
         ),
@@ -1649,7 +1749,9 @@ def run_case(case: Case, seed: int) -> Tuple[Dict[str, List[str]], str]:
     )
     checks["backward"] = sum(
         (
-            check_backward(case, node, ranks, refs, proxies, requesters, generator)
+            check_backward(
+                case, node, ranks, refs, proxies, requesters, remote_keys, generator
+            )
             for node in range(num_nodes)
         ),
         [],
@@ -1663,7 +1765,7 @@ def run_case(case: Case, seed: int) -> Tuple[Dict[str, List[str]], str]:
     )
     checks["owners"] = sum(
         (
-            check_owner(case, rank, ranks, refs, owners[rank], rounds_cap)
+            check_owner(case, rank, ranks, refs, owners[rank])
             for rank in range(world_size)
         ),
         [],
@@ -1678,7 +1780,6 @@ def run_case(case: Case, seed: int) -> Tuple[Dict[str, List[str]], str]:
                 call["windows"][rank]["rail_cells"]
                 .view(num_nodes, num_features)
                 .tolist(),
-                rounds_cap,
             )
             for rank in range(world_size)
         ),
@@ -1691,12 +1792,10 @@ def run_case(case: Case, seed: int) -> Tuple[Dict[str, List[str]], str]:
         for name, tensor in rails[rank].items()
         if not torch.equal(owners[rank][name], tensor)
     ]
-    if case.job is same_parity_job:
-        # requester 0's two rows at proxy 0: rounds 0 and 2, one partial slot
+    if case.job is same_place_job:
+        # requester 0's two rows at proxy 0: chunks in two laps, one partial slot
         dst = requesters[0]["dst"].tolist()
-        checks["shape"] = (
-            [] if need_rounds == 3 and dst[0] == dst[1] else ["the case's shape"]
-        )
+        checks["shape"] = [] if laps >= 2 and dst[0] == dst[1] else ["the case's shape"]
     return checks, stats
 
 

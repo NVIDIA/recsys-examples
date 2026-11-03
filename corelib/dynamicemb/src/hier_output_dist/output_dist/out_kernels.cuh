@@ -34,12 +34,12 @@ namespace hier_output_dist {
 
 // The timeline of an out kernel: its row (`trace`, the call's args.trace,
 // nullptr without kTrace) and the CTA's shared copy (TraceSmSlots, in the
-// kernel's dynamic shared memory after half_seen, out_shared). Stamps check
+// kernel's dynamic shared memory after free_seen, out_shared). Stamps check
 // on() themselves; the rest is for when it is on. Each member does its work
 // only with kTrace.
 struct OutTimeline {
   unsigned long long *trace;
-  int local_size;  // half_seen's words, before the shared copy
+  int local_size;  // free_seen's words, before the shared copy
   __device__ __forceinline__ bool on() const { return kTrace && trace != nullptr; }
 
   // One thread: `slot` keeps the earliest (or the latest) time any CTA
@@ -163,27 +163,19 @@ struct OutTimeline {
 
 // What a requester's warps read of the call: from the plan (what both
 // kernels' plans hold), the block starts and its tables of the node's
-// proxies (their rounds and its push tables there); from the window, the
-// node peers' buffers and words, each the same place as in this rank's copy
-// (layout()). The one word per proxy a CTA keeps, half_seen, is in its
-// shared memory. Every thread of a warp makes the same one.
+// proxies (their streams' chunks and ends, and its push tables there); from
+// the window, the node peers' buffers and words, each the same place as in
+// this rank's copy (layout()). The one word per proxy a CTA keeps,
+// free_seen, is in its shared memory. Every thread of a warp makes the same
+// one.
 struct OutTables {
   const Sizes &sizes;
   const PlanView &plan;
   NodeWindow node;
-  int max_rounds;  // the most rounds of the node's proxies (1 on one node)
-  bool staged;     // index dedup's heavy rows at a proxy of more than one round
 
   __device__ OutTables(ncclWindow_t window, const Sizes &op_sizes, const PlanView &call_plan)
-      : sizes(op_sizes), plan(call_plan), node(window, op_sizes.topo.local_rank), max_rounds(1) {
-    if (sizes.topo.num_nodes > 1)
-      for (int proxy = 0; proxy < sizes.topo.local_size; ++proxy)
-        max_rounds = max(max_rounds, rounds(proxy));
-    staged = plan.fanout.exp_off != nullptr && max_rounds > 1 && plan.fanout.count[1] > 0;
-  }
+      : sizes(op_sizes), plan(call_plan), node(window, op_sizes.topo.local_rank) {}
   __device__ __forceinline__ WindowLayout layout() const { return node.layout(sizes); }
-  // A same-node proxy's rounds.
-  __device__ __forceinline__ int rounds(int proxy) const { return (int)plan.proxy_rounds[proxy]; }
   // Node peers' buffers and words.
   __device__ __forceinline__ char *lookup_rows(int peer) const {
     return node.peer(layout().rows.lookup_rows(), peer);
@@ -198,29 +190,30 @@ struct OutTables {
   __device__ __forceinline__ char *proxy_row(int proxy, int64_t slot) const {
     return node.peer(layout().rows.proxy_row(slot), proxy);
   }
-  // A push task's flag of round rnd at a proxy.
-  __device__ __forceinline__ uint64_t *push_flag(int proxy, int rnd, int64_t flag) const {
-    return node.peer(layout().rows.push_flags(rnd) + flag, proxy);
+  // A push task's flag at a proxy.
+  __device__ __forceinline__ uint64_t *push_flag(int proxy, int64_t flag) const {
+    return node.peer(layout().rows.push_flags() + flag, proxy);
   }
-  __device__ __forceinline__ const uint64_t *landed_rows(int proxy, int owner_node) const {
-    return node.peer(layout().ctrl.landed_rows(owner_node), proxy);
+  // A proxy's words of its chunk `chunk`: when it landed, and the rows its
+  // node's requesters pulled of it.
+  __device__ __forceinline__ const uint64_t *landed(int proxy, int64_t chunk) const {
+    return node.peer(layout().ctrl.landed(chunk), proxy);
   }
-  // This rank's done word at a proxy, of round rnd's parity.
-  __device__ __forceinline__ uint64_t *done(int proxy, int rnd) const {
-    return node.peer(layout().ctrl.done(sizes.topo.local_rank, rnd & 1), proxy);
+  __device__ __forceinline__ uint64_t *pulled_rows(int proxy, int64_t chunk) const {
+    return node.peer(layout().ctrl.pulled_rows(chunk), proxy);
   }
-  __device__ __forceinline__ const uint64_t *half_free(int proxy) const {
-    return node.peer(layout().ctrl.half_free(), proxy);
+  __device__ __forceinline__ const uint64_t *slot_free(int proxy) const {
+    return node.peer(layout().ctrl.slot_free(), proxy);
   }
-  // The most of a proxy's half_free word that this CTA's warps saw.
-  __device__ __forceinline__ uint64_t *half_seen(int proxy) const {
+  // The most of a proxy's slot_free word that this CTA's warps saw.
+  __device__ __forceinline__ uint64_t *free_seen(int proxy) const {
     return (uint64_t *)out_shared() + proxy;
   }
-  // This rank's push order at a proxy in a round (positions of push_order)
-  // and the next round's entry, which holds the ends.
-  __device__ __forceinline__ void req_of(int proxy, int rnd, ReqEntry &entry,
+  // This rank's push order at a proxy in a chunk (positions of push_order)
+  // and the next chunk's entry, which holds the ends.
+  __device__ __forceinline__ void req_of(int proxy, int64_t chunk, ReqEntry &entry,
                                          ReqEntry &next) const {
-    const ReqEntry *push_entry = plan.push_entry(proxy, rnd);
+    const ReqEntry *push_entry = plan.push_entry(proxy, chunk);
     entry = push_entry[0];
     next = push_entry[1];
   }
@@ -231,8 +224,8 @@ struct OutTables {
 };
 
 // How the warps of an out kernel take their tasks: the task queues, the row
-// tasks of the node's owners and sub-tasks spread among them, and a warp's
-// place in tasks laid out round after round.
+// tasks of the node's owners and sub-tasks spread among them, and the remote
+// tasks laid out by chunk.
 
 // A task queue of the out kernel (`word`, its task word in this rank's ctrl
 // section, CtrlLayout::task): its warps take the tasks in order, one at a
@@ -291,64 +284,13 @@ struct Interleave {
   }
 };
 
-// A warp's place in tasks laid out round after round: round rnd's are
-// [start[rnd * stride], start[(rnd + 1) * stride]), and with stride 2 those
-// before start[rnd * stride + 1] come first. A warp takes its tasks in order,
-// so it only moves on, and reads the table only when its round changes.
-// Without a table (one node, no such tasks) it has one round of none.
-struct RoundCursor {
-  const int64_t *start;
-  int stride, rnd = 0;
-  int64_t lo, mid, hi;  // round rnd's tasks
-  __device__ RoundCursor(const int64_t *task_starts, int task_stride)
-      : start(task_starts),
-        stride(task_stride),
-        lo(task_starts ? task_starts[0] : 0),
-        mid(task_starts ? task_starts[task_stride - 1] : 0),
-        hi(task_starts ? task_starts[task_stride] : 0) {}
-  __device__ __forceinline__ void seek(int64_t task) {
-    while (task >= hi) {
-      ++rnd;
-      lo = hi;
-      mid = start[(int64_t)rnd * stride + stride - 1];
-      hi = start[(int64_t)(rnd + 1) * stride];
-    }
-  }
-};
-
-// The forward's tasks of rows, round after round: round rnd's slice of the
-// local tasks (slice rnd of max_rounds; all of them with one round), then its
-// remote tasks (fwd_task_starts, absent on one node). A warp takes its tasks
-// in order, so it only moves on.
-struct FwdCursor {
-  const int64_t *task_starts;  // nullptr: no remote tasks
-  int64_t local;
-  int max_rounds, rnd = 0;
-  int64_t local_lo;     // round rnd's first local task
-  int64_t lo, mid, hi;  // its local slice's slots [lo, mid), its remote tasks' [mid, hi)
-  __device__ FwdCursor(const int64_t *remote_tasks, int64_t local_tasks, int most_rounds)
-      : task_starts(remote_tasks), local(local_tasks), max_rounds(most_rounds) {
-    set();
-  }
-  __device__ __forceinline__ int64_t before(int rnd) const {
-    return task_starts ? task_starts[rnd] : 0;
-  }
-  __device__ __forceinline__ void set() {
-    local_lo = rnd * local / max_rounds;
-    lo = local_lo + before(rnd);
-    mid = lo + (rnd + 1) * local / max_rounds - local_lo;
-    hi = mid + before(rnd + 1) - before(rnd);
-  }
-  __device__ __forceinline__ void seek(int64_t task) {
-    while (task >= hi && rnd + 1 < max_rounds) {
-      ++rnd;
-      set();
-    }
-  }
-  // A task of the local slice: its index among the local tasks.
-  __device__ __forceinline__ int64_t local_index(int64_t task) const {
-    return local_lo + task - lo;
-  }
+// A task of the remote tasks laid out by (chunk, proxy in turn): its entry
+// in their task starts (starts [entries + 1]: the tasks before each entry),
+// the entry it falls in, and its place there.
+struct RemoteTask {
+  int64_t entry, nth;
+  __device__ __forceinline__ RemoteTask(const int64_t *starts, int64_t entries, int64_t task)
+      : entry(seg_search(starts, (int)entries, task)), nth(task - starts[entry]) {}
 };
 
 // The out channel's protocol, which both out kernels follow: the entry

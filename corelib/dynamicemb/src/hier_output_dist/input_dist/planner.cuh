@@ -21,7 +21,7 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 // A step's kernels are of two kinds. A kernel over items (keys, rows,
 // occurrences) runs a thread per item in a grid-stride loop (item_grid).
 // A kernel over a step's small tables (sizes of the nodes, ranks, features
-// and rounds) runs on one CTA of kThreads threads (kOneCta), which loops over
+// and chunks) runs on one CTA of kThreads threads (kOneCta), which loops over
 // them and syncs with __syncthreads; its scans are cub::BlockScan, a tile at
 // a time. No kernel waits for another CTA: a step that needs every item done
 // goes on in its next kernel.
@@ -61,6 +61,12 @@ __device__ __forceinline__ int64_t item_stride() { return (int64_t)gridDim.x * b
 template <typename T>
 T *data_or_null(const at::Tensor &tensor) {
   return tensor.defined() ? tensor.data_ptr<T>() : nullptr;
+}
+
+// `index` clamped into a table of `count` entries: a call that does not fit
+// may read words no one wrote.
+__device__ __forceinline__ int64_t clamp_index(int64_t index, int64_t count) {
+  return min(max(index, (int64_t)0), count - 1);
 }
 
 // ── searches in a sorted table ──

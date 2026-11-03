@@ -51,11 +51,16 @@ PlanView plan_view(const Plan &plan, const Sizes &sizes) {
   view.inv = data_of<int32_t>(plan.inv);
   view.fanout = fanout_view(plan.fanout);
   view.push_order = data_of<int32_t>(plan.push_order);
-  view.proxy_rounds = data_of<int64_t>(plan.proxy_rounds);
+  view.proxy_chunks = data_of<int64_t>(plan.proxy_chunks);
+  view.proxy_ends = data_of<int64_t>(plan.proxy_ends);
   view.push_tables = data_of<ReqEntry, int32_t>(plan.push_tables);
-  view.num_rounds = data_of<int64_t>(plan.num_rounds);
+  view.num_chunks = data_of<int64_t>(plan.num_chunks);
+  view.chunks = data_of<Chunk, int32_t>(plan.chunks);
+  view.uniq_off = data_of<int64_t>(plan.uniq_off);
   view.put_list = data_of<PutSeg, int32_t>(plan.put_list);
-  view.rounds_cap = sizes.rounds_cap;
+  view.put_starts = data_of<int32_t>(plan.put_starts);
+  view.max_chunks = sizes.max_chunks;
+  view.ring = sizes.num_proxy_rows;
   view.num_nodes = sizes.topo.num_nodes;
   return view;
 }
@@ -74,16 +79,20 @@ auto fwd_tensors(Plan &plan) -> std::vector<decltype(&plan.src)> {
           &plan.fanout.pos,
           &plan.fanout.first,
           &plan.push_order,
-          &plan.proxy_rounds,
+          &plan.proxy_chunks,
+          &plan.proxy_ends,
           &plan.push_tables,
-          &plan.num_rounds,
+          &plan.num_chunks,
+          &plan.chunks,
+          &plan.uniq_off,
           &plan.put_list,
-          &plan.proxy_round_tables,
+          &plan.put_starts,
           &plan.push_order_off,
           &plan.fwd_task_starts,
-          &plan.fwd_put_start,
-          &plan.uniq_out,
-          &plan.push_start};
+          &plan.fwd_chunks,
+          &plan.node_chunk_start,
+          &plan.node_chunks,
+          &plan.uniq_out};
 }
 
 // The backward plan's tensors, in the order of tensors() and of().
@@ -100,19 +109,19 @@ auto bwd_tensors(Plan &plan) -> std::vector<decltype(&plan.dst)> {
           &plan.fanout.pos,
           &plan.fanout.first,
           &plan.push_order,
-          &plan.proxy_rounds,
+          &plan.proxy_chunks,
+          &plan.proxy_ends,
           &plan.push_tables,
-          &plan.num_rounds,
+          &plan.num_chunks,
+          &plan.chunks,
+          &plan.uniq_off,
           &plan.put_list,
+          &plan.put_starts,
           &plan.heavy_groups,
           &plan.group_first_sub,
           &plan.group_of_sub,
           &plan.bwd_task_starts,
           &plan.uniq_in,
-          &plan.num_chunks,
-          &plan.uniq_off,
-          &plan.round_table,
-          &plan.bwd_put_start,
           &plan.reduce_task_starts,
           &plan.reducer_start,
           &plan.reducer_entries};
@@ -124,12 +133,12 @@ FwdPlanView FwdPlan::view(const Sizes &sizes) const {
   FwdPlanView view{};
   static_cast<PlanView &>(view) = plan_view(*this, sizes);
   view.src = data_of<int32_t>(src);
-  view.proxy_round_tables = data_of<RoundPiece, int32_t>(proxy_round_tables);
   view.push_order_off = data_of<int64_t>(push_order_off);
   view.fwd_task_starts = data_of<int64_t>(fwd_task_starts);
-  view.fwd_put_start = data_of<int32_t>(fwd_put_start);
+  view.fwd_chunks = data_of<ChunkPiece, int32_t>(fwd_chunks);
+  view.node_chunk_start = data_of<int64_t>(node_chunk_start);
+  view.node_chunks = data_of<int32_t>(node_chunks);
   view.uniq_out = data_of<int64_t>(uniq_out);
-  view.push_start = data_of<int32_t>(push_start);
   return view;
 }
 
@@ -158,10 +167,6 @@ BwdPlanView BwdPlan::view(const Sizes &sizes) const {
   view.group_of_sub = data_of<int32_t>(group_of_sub);
   view.bwd_task_starts = data_of<int64_t>(bwd_task_starts);
   view.uniq_in = data_of<int64_t>(uniq_in);
-  view.num_chunks = data_of<int64_t>(num_chunks);
-  view.uniq_off = data_of<int64_t>(uniq_off);
-  view.round_table = data_of<RoundPiece, int32_t>(round_table);
-  view.bwd_put_start = data_of<int32_t>(bwd_put_start);
   view.reduce_task_starts = data_of<int64_t>(reduce_task_starts);
   view.reducer_start = data_of<int32_t>(reducer_start);
   view.reducer_entries = data_of<int64_t>(reducer_entries);

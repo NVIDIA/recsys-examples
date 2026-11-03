@@ -68,25 +68,28 @@ void Config::validate() const {
   check_capacity("lookup_keys", capacities.lookup_keys);
   if (num_nodes() > 1) {
     check_capacity("remote_keys", capacities.remote_keys);
+    const Sizes sizes = sizes_of(*this);
     const int64_t rows = capacities.proxy_bytes / row_bytes();
-    const int64_t least = min_proxy_rows_for(num_nodes());
+    const int64_t least = min_proxy_rows_for(sizes.max_key_rows());
     if (rows < least)
       refuse("proxy_rows of at most ", (double)capacities.proxy_bytes / (1 << 20), " MiB holds ",
-             rows, " rows of ", row_bytes(), " bytes, and across ", num_nodes(),
-             " nodes every round fits its half only with at least ", least, " (",
-             (least * row_bytes() + (1 << 20) - 1) >> 20, " MiB); raise DYNAMICEMB_GIN_PROXY_MB");
-    const int64_t num_proxy_rows = num_proxy_rows_for(*this);
-    const int64_t rounds = rounds_for(capacities.remote_keys, num_proxy_rows);
-    if (rounds > kMaxRounds)
-      refuse("proxy_rows of ", num_proxy_rows, " rows holds the ", capacities.remote_keys,
-             " keys of other nodes' owners a proxy may deduplicate in ", rounds,
-             " rounds, more than the ", kMaxRounds,
-             " a call can take; raise DYNAMICEMB_GIN_PROXY_MB");
-    const int bits = push_key_of(sizes_of(*this)).bits;
+             rows, " rows of ", row_bytes(),
+             " bytes, and its ring takes two chunks of keys of the ", "most rows: at least ", least,
+             " (", (least * row_bytes() + (1 << 20) - 1) >> 20,
+             " MiB); raise DYNAMICEMB_GIN_PROXY_MB");
+    // the positions of a proxy's stream, unwrapped, stay below 2^32 (tag_of)
+    if (2 * capacities.remote_keys + sizes.num_proxy_rows > (int64_t)UINT32_MAX)
+      refuse("a proxy's stream of remote_keys rows through proxy_rows of ", sizes.num_proxy_rows,
+             " rows may pass position 2^32; lower remote_keys");
+    if (sizes.flag_words() >= kMaxEntries)
+      refuse("a proxy's push-task flags for remote_keys at ", local_size, " GPUs per node are ",
+             sizes.flag_words(), ", more than int32 numbers hold; lower remote_keys");
+    const int bits = push_key_of(sizes).bits;
     if (bits > 63)
-      refuse("the proxy sorts its push order by a key of ", bits,
-             " bits (its fields: the GPUs of a node, the rounds, and the keys and IB chunks of ",
-             "remote_keys), more than 63; lower remote_keys");
+      refuse(
+          "the proxy sorts its push order by a key of ", bits,
+          " bits (its fields: the GPUs of a node, the chunks and the heavy keys of remote_keys), ",
+          "more than 63; lower remote_keys");
   }
   if (!(timeout_s > 0)) refuse("the timeout must be positive, got ", timeout_s);
   if (ctas < 0 || reduce_ctas < 1)
@@ -128,20 +131,20 @@ Config config_of(int64_t rank, int64_t world_size, int64_t local_size,
 
 // ── the sizes ──
 
-int64_t num_proxy_rows_for(const Config &config) {
-  const int64_t least = min_proxy_rows_for(config.num_nodes());
-  return std::min(std::max(config.capacities.remote_keys, least),
-                  config.capacities.proxy_bytes / config.row_bytes());
-}
-
-// IB chunks are 2 MiB of rows, a multiple of kTaskRows.
-int chunk_rows_for(int64_t row_bytes) {
-  return (int)std::max<int64_t>(kTaskRows, (2 << 20) / row_bytes / kTaskRows * kTaskRows);
-}
-
 // A requester's fp32 partial row of a heavy key takes 4 * dim bytes of proxy_rows.
 int partial_rows_for(int64_t dim, int64_t row_bytes) {
   return (int)((4 * dim + row_bytes - 1) / row_bytes);
+}
+
+// A heavy key takes a partial for each GPU of the node besides its row: it
+// is heavy only with more occurrences than those, so it never takes more
+// rows than it has occurrences.
+int64_t heavy_at_for(int64_t local_size, int64_t partial_rows) {
+  return std::max<int64_t>(kHeavy, local_size * partial_rows);
+}
+
+int64_t max_chunks_for(const Sizes &sizes) {
+  return sizes.remote_keys / sizes.chunk_room() + sizes.topo.num_nodes;
 }
 
 std::vector<int> dense_tables(const std::vector<int> &feature_tables) {
@@ -166,13 +169,18 @@ Sizes sizes_of(const Config &config) {
   sizes.lookup_keys = config.capacities.lookup_keys;
   sizes.row_bytes = config.row_bytes();
   sizes.partial_rows = partial_rows_for(config.dim, sizes.row_bytes);
-  sizes.chunk_rows = chunk_rows_for(sizes.row_bytes);
   sizes.weights = config.weights;
   sizes.timeout_ns = (uint64_t)(std::min(config.timeout_s, 1e9) * 1e9);
   if (num_nodes > 1) {
     sizes.remote_keys = config.capacities.remote_keys;
-    sizes.num_proxy_rows = num_proxy_rows_for(config);
-    sizes.rounds_cap = rounds_for(sizes.remote_keys, sizes.num_proxy_rows);
+    sizes.heavy_at = heavy_at_for(local_size, sizes.partial_rows);
+    const int64_t key_rows = sizes.max_key_rows();
+    sizes.num_proxy_rows = std::min(std::max(sizes.remote_keys, min_proxy_rows_for(key_rows)),
+                                    config.capacities.proxy_bytes / sizes.row_bytes);
+    // 2 MiB of rows, at most half the ring: the ring holds two chunks at least
+    const int64_t two_mib = std::max<int64_t>(kTaskRows, (2 << 20) / sizes.row_bytes);
+    sizes.chunk_rows = std::max(std::min(two_mib, sizes.num_proxy_rows / 2), 2 * key_rows);
+    sizes.max_chunks = max_chunks_for(sizes);
     sizes.record_bytes = config.out_weights ? 16 : 8;
   }
   return sizes;

@@ -145,15 +145,18 @@ std::string invalid(const Config &config);
 // them (0 on one node).
 Sizes sizes_of(const Config &config);
 
-// The sizing rules of the capacities that follow from the configured ones
+// The sizing rules of the sizes that follow from the configuration
 // (sizes_of's, and Config::validate's), across nodes:
-//   num_proxy_rows  min(max(remote_keys, the least rows every round needs),
+//   heavy_at        max(kHeavy, local_size * partial_rows)
+//   num_proxy_rows  min(max(remote_keys, min_proxy_rows_for(max_key_rows)),
 //                   proxy_bytes / row_bytes)
-//   rounds          the rounds remote_keys rows take in that many rows
-int64_t num_proxy_rows_for(const Config &config);
-// rows of an IB chunk, and of proxy_rows a requester's fp32 partial row takes
-int chunk_rows_for(int64_t row_bytes);
+//   chunk_rows      max(min(2 MiB of rows, num_proxy_rows / 2), 2 * max_key_rows)
+//   max_chunks      remote_keys / chunk_room + num_nodes
+// rows of proxy_rows a requester's fp32 partial row takes
 int partial_rows_for(int64_t dim, int64_t row_bytes);
+int64_t heavy_at_for(int64_t local_size, int64_t partial_rows);
+// max_chunks of sizes whose other fields are set
+int64_t max_chunks_for(const Sizes &sizes);
 
 // The table of each feature, numbered from 0 in the order the tables first
 // appear: equal tables keep equal numbers.
