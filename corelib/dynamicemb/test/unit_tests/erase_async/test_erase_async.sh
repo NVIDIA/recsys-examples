@@ -11,7 +11,8 @@ pytest -svv $DIR/test_erase_by_score.py \
              $DIR/test_storage_erase_by_score.py \
              $DIR/test_async_erase.py \
              $DIR/test_erase_api.py \
-             $DIR/test_erase_end_to_end.py
+             $DIR/test_erase_end_to_end.py \
+             $DIR/test_erase_stress.py
 
 # The call on a model TorchRec has sharded: a DistributedModelParallel, two ranks.
 CUDA_VISIBLE_DEVICES=0,1 torchrun \
