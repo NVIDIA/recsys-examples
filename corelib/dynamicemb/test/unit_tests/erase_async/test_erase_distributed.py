@@ -101,7 +101,9 @@ def _model(strategy, use_index_dedup=False, hbm_scale=1.0):
 def _features(feature_names: List[str], keys: List[int], per_key_score=None):
     """One key per bag, the same keys in every feature; ``per_key_score`` is the score
     every key carries, for tables that take one per key."""
-    values = torch.tensor(keys * len(feature_names), dtype=torch.int64, device=_device())
+    values = torch.tensor(
+        keys * len(feature_names), dtype=torch.int64, device=_device()
+    )
     fields = dict(
         keys=feature_names,
         values=values,
@@ -110,7 +112,9 @@ def _features(feature_names: List[str], keys: List[int], per_key_score=None):
     if per_key_score is None:
         return KeyedJaggedTensor(**fields)
     return ScoredKeyedJaggedTensor(
-        scores=torch.full((len(values),), per_key_score, dtype=torch.int64, device=_device()),
+        scores=torch.full(
+            (len(values),), per_key_score, dtype=torch.int64, device=_device()
+        ),
         **fields,
     )
 
@@ -187,7 +191,9 @@ def check_erase(case: str, use_index_dedup: bool) -> None:
 
     # The model goes on: the old keys are new keys again.
     _train(model, feature_names, OLD_KEYS, per_key, NEW_SCORE + 100)
-    _expect(model, table_names, OLD_KEYS + NEW_KEYS, f"{label}, after training them again")
+    _expect(
+        model, table_names, OLD_KEYS + NEW_KEYS, f"{label}, after training them again"
+    )
     hier_switch.release()
 
 
@@ -199,7 +205,9 @@ def check_erase_beside_training(case: str) -> None:
     _train(model, feature_names, OLD_KEYS, per_key, OLD_SCORE)
     _train(model, feature_names, NEW_KEYS, per_key, NEW_SCORE)
     handle = erase_by_score_async(model, asked, THRESHOLD)
-    _train(model, feature_names, LATER_KEYS, per_key, NEW_SCORE)  # the call has returned
+    _train(
+        model, feature_names, LATER_KEYS, per_key, NEW_SCORE
+    )  # the call has returned
 
     erased, spared = handle.result()
     assert (_everywhere(erased), _everywhere(spared)) == (

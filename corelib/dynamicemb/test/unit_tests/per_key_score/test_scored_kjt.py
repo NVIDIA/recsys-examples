@@ -38,7 +38,9 @@ def _make(with_weights: bool = False) -> ScoredKeyedJaggedTensor:
     # Four features, a batch of two; lengths vary, one bag is empty.
     keys = ["f0", "f1", "f2", "f3"]
     lengths = torch.tensor([2, 0, 1, 3, 2, 2, 0, 1], dtype=torch.int64, device=DEVICE)
-    values = torch.arange(100, 100 + int(lengths.sum()), dtype=torch.int64, device=DEVICE)
+    values = torch.arange(
+        100, 100 + int(lengths.sum()), dtype=torch.int64, device=DEVICE
+    )
     weights = (
         torch.arange(values.numel(), dtype=torch.float32, device=DEVICE)
         if with_weights
@@ -180,7 +182,9 @@ def test_weights_stay_independent_of_scores():
         weights=kjt.weights(),
         lengths=kjt.lengths(),
     )
-    assert torch.equal(kjt.permute([3, 1, 0, 2]).weights(), plain.permute([3, 1, 0, 2]).weights())
+    assert torch.equal(
+        kjt.permute([3, 1, 0, 2]).weights(), plain.permute([3, 1, 0, 2]).weights()
+    )
     assert torch.equal(kjt.permute([3, 1, 0, 2]).weights(), expected)
 
 

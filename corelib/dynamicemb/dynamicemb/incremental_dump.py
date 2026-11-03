@@ -730,8 +730,7 @@ def _all_gather_by_rank(
     if tensor.size(0) > 0:
         padded[: tensor.size(0)] = tensor
     gathered = [
-        torch.zeros(shape, dtype=tensor.dtype, device=device)
-        for _ in range(world_size)
+        torch.zeros(shape, dtype=tensor.dtype, device=device) for _ in range(world_size)
     ]
     dist.all_gather(gathered, padded, group=pg)
     return [g[:sz].cpu() for g, sz in zip(gathered, sizes)]
