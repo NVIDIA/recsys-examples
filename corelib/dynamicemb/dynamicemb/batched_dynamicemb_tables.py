@@ -69,6 +69,7 @@ from dynamicemb.key_value_table import (
     HybridStorage,
     Storage,
     flush_cache,
+    load_from_json,
 )
 from dynamicemb.lookup_layout import EmbeddingLayout
 from dynamicemb.optimizer import (
@@ -197,11 +198,19 @@ def get_loading_files(
     rank: int,
     world_size: int,
     sorted_file_names: Optional[Sequence[str]] = None,
+    read_all: bool = False,
 ) -> Tuple[List[str], List[str], List[str], List[str], int, int]:
     """Resolve one table's checkpoint files under *root_path*.
 
     Pass *sorted_file_names*, from list_checkpoint_files, when resolving many
     tables, so the directory is listed once rather than once per table.
+
+    When the checkpoint has as many shard files as the table has shards, each
+    rank gets only its own file -- which is right only if the files were
+    written under the rank's own key -> rank rule. *read_all* turns that
+    shortcut off and hands every rank every file, for a checkpoint whose rule
+    or bucket layout differs from the table's; the loader's ownership filter
+    then re-partitions the keys.
     """
     if not os.path.exists(root_path):
         raise RuntimeError(f"can't find path to load, path:", root_path)
@@ -246,7 +255,7 @@ def get_loading_files(
             f"The number of key files under path {root_path} for table {name} does not match the number of keys files of admission counter({num_key_files}/{num_counter_key_files})."
         )
 
-    if world_size == num_key_files:
+    if world_size == num_key_files and not read_all:
         return (
             [encode_checkpoint_file_path(root_path, name, rank, world_size, "keys")],
             [encode_checkpoint_file_path(root_path, name, rank, world_size, "values")],
@@ -1655,14 +1664,63 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
             return
         dist.barrier(group=self._shard_pg if self._shard_pg is not None else pg)
 
-    def _write_shard_meta(self, meta_file_path: str) -> None:
+    def _write_shard_meta(self, meta_file_path: str, table_id: int) -> None:
         with open(meta_file_path) as meta_file:
             meta_data = json.load(meta_file)
         meta_data["sharding_type"] = self._sharding_type
         meta_data["num_shards"] = self._num_shards
         meta_data["shard_ranks"] = self._shard_ranks
+        # The bucket layout the keys were partitioned by, from the module's
+        # option (a tier's copy may have rescaled it). A loader whose layout
+        # matches reads only its own shard file; one that differs reads every
+        # file and re-partitions.
+        option = self._dynamicemb_options[table_id]
+        meta_data["global_capacity"] = option.global_capacity
+        meta_data["bucket_capacity"] = option.bucket_capacity
         with open(meta_file_path, "w") as meta_file:
             json.dump(meta_data, meta_file, indent=4)
+
+    def _checkpoint_layout_matches(
+        self, meta_json_file: str, table_id: int, table_name: str
+    ) -> bool:
+        """Whether the checkpoint's keys were partitioned the way this table's are.
+
+        When true and the shard counts agree, every rank's own shard file holds
+        exactly its keys. Otherwise every rank must read every file and keep
+        what the table's rule gives it -- a lossy step for full buckets, said
+        once per table by shard 0.
+        """
+        if not os.path.exists(meta_json_file):
+            return True
+        meta = load_from_json(meta_json_file)
+        option = self._dynamicemb_options[table_id]
+        ckpt_dist_type = meta.get("dist_type", "roundrobin")
+        why = None
+        if ckpt_dist_type != option.dist_type:
+            why = (
+                f"checkpoint dist_type {ckpt_dist_type!r} differs from the "
+                f"table's {option.dist_type!r}"
+            )
+        elif option.dist_type == "hash_bucket" and (
+            meta.get("global_capacity") != option.global_capacity
+            or meta.get("bucket_capacity") != option.bucket_capacity
+        ):
+            why = (
+                "checkpoint global bucket layout (global_capacity="
+                f"{meta.get('global_capacity')}, bucket_capacity="
+                f"{meta.get('bucket_capacity')}) differs from the table's "
+                f"({option.global_capacity}, {option.bucket_capacity})"
+            )
+        if why is None:
+            return True
+        if self._shard_index == 0:
+            warnings.warn(
+                f"{table_name}: {why}. Every rank reads every shard file and "
+                "re-partitions the keys by the table's rule; rows may be lost "
+                "where a bucket overflows.",
+                UserWarning,
+            )
+        return False
 
     def dump(
         self,
@@ -1723,7 +1781,7 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                 timestamp=ts,
             )
             if rank == 0:
-                self._write_shard_meta(meta_file_path)
+                self._write_shard_meta(meta_file_path, table_id)
 
             # No counter means no counter-based admission (e.g. probabilistic
             # admission), so there is nothing to dump.
@@ -1784,6 +1842,9 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                 rank=rank,
                 world_size=world_size,
                 sorted_file_names=sorted_file_names,
+                read_all=not self._checkpoint_layout_matches(
+                    meta_json_file, table_id, table_name
+                ),
             )
             if len(emb_key_files) == 0:
                 missing_table_names.append(table_name)
@@ -1818,14 +1879,17 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                     )
                 continue
             num_counter_key_files = len(counter_key_files)
+            option = self._dynamicemb_options[table_id]
             for i in range(num_counter_key_files):
                 counter_table.load(
                     counter_key_files[i],
                     counter_frequency_files[i],
                     table_id,
-                    self._dynamicemb_options[table_id].dist_type,
+                    option.dist_type,
                     shard_index=rank,
                     num_shards=world_size,
+                    global_capacity=option.global_capacity,
+                    bucket_capacity=option.bucket_capacity,
                 )
 
         # A requested table the checkpoint lacks loads nothing, which is easy
@@ -2108,6 +2172,15 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
         src_options = meta.get("table_options")
         if src_options is None:
             return "delta carries no 'table_options' (dumped by an older version)"
+        # The global bucket layout decides a key's home bucket as much as the
+        # capacity does; a delta from an older version carries none, which
+        # matches a target without one.
+        src_global_capacity = getattr(src_options, "global_capacity", None)
+        if src_global_capacity != option.global_capacity:
+            return (
+                f"global_capacity mismatch (source {src_global_capacity} vs "
+                f"target {option.global_capacity})"
+            )
 
         checks = [
             (
@@ -2458,7 +2531,13 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
         # group could only narrow the modulus and mis-route every key, leaving
         # each claimed by several ranks and the one that owns it claiming nothing.
         rank = self._shard_index
-        mask = owned_key_mask(keys, rank, self._shard_world_size, option.dist_type)
+        routing = dict(
+            global_capacity=option.global_capacity,
+            bucket_capacity=option.bucket_capacity,
+        )
+        mask = owned_key_mask(
+            keys, rank, self._shard_world_size, option.dist_type, **routing
+        )
         if mask is not None:
             stats.skipped = int(keys.numel() - mask.sum().item())
             keys, values = keys[mask], values[mask]
@@ -2468,8 +2547,8 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                 scores = scores[mask]
             slot_index = slot_index[mask]
             ws, dt = self._shard_world_size, option.dist_type
-            erased = owned_keys(erased, rank, ws, dt)
-            evicted = owned_keys(evicted, rank, ws, dt)
+            erased = owned_keys(erased, rank, ws, dt, **routing)
+            evicted = owned_keys(evicted, rank, ws, dt, **routing)
 
         # Erase first: a key erased and then re-inserted inside the same window
         # appears in BOTH lists, and must survive the replay.

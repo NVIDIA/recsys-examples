@@ -482,6 +482,7 @@ def create_table_state(
     enable_overflow: bool = False,
     evicted_item_mode: EvictedItemMode = EvictedItemMode.DISCARD,
     use_rows: bool = False,
+    global_bucket_layout: bool = True,
 ) -> DynamicEmbTableState:
     """Build the key map and value buffers for a group of tables.
 
@@ -490,6 +491,16 @@ def create_table_state(
     where it is. It is for tables that grow and keep their keys, so it cannot be
     combined with ``enable_overflow`` (a cache keeps slot == row). It is
     independent of the no-eviction mode, which keeps no row in its score.
+
+    ``global_bucket_layout`` lets a table whose options carry a
+    ``global_capacity`` (a ``hash_bucket`` table sized by the planner) hash
+    keys into the whole table's bucket space, so the keys that share a bucket
+    do not depend on the number of shards and a checkpoint reloads at any world
+    size without a bucket overflowing. It holds only when this state *is* the
+    whole shard -- exactly ``max_capacity / bucket_capacity`` buckets. A cache
+    or a hybrid tier is a rescaled part of the shard and passes ``False``; a
+    no-eviction table sizes its key map at twice its rows and is excluded here
+    for the same reason.
     """
     if not options:
         raise ValueError("options must be non-empty")
@@ -547,6 +558,31 @@ def create_table_state(
     else:
         capacities = [opt.init_capacity for opt in options]
 
+    global_capacities: List[Optional[int]] = []
+    for opt in options:
+        global_capacity = getattr(opt, "global_capacity", None)
+        if global_capacity is not None and global_bucket_layout and not no_eviction:
+            # The fused group hashes every table with options[0]'s bucket
+            # capacity (above); a global capacity derived with another one
+            # would send keys to buckets the input distributor does not expect.
+            if opt.bucket_capacity != bucket_capacity:
+                raise ValueError(
+                    f"global_capacity {global_capacity} was derived with "
+                    f"bucket_capacity {opt.bucket_capacity}, but the fused "
+                    f"group hashes with bucket_capacity {bucket_capacity}"
+                )
+            if opt.init_capacity != opt.max_capacity:
+                raise ValueError(
+                    "a table with global_capacity must start at its full "
+                    f"capacity (init_capacity {opt.init_capacity} != "
+                    f"max_capacity {opt.max_capacity}): the global bucket map "
+                    "is only realised with exactly max_capacity / "
+                    "bucket_capacity buckets"
+                )
+            global_capacities.append(global_capacity)
+        else:
+            global_capacities.append(None)
+
     key_index_map = get_scored_table(
         capacity=capacities,
         bucket_capacity=base_opt.bucket_capacity,
@@ -556,6 +592,7 @@ def create_table_state(
         enable_overflow=enable_overflow,
         score_fn_key=score_fn_key,
         use_rows=use_rows,
+        global_capacities=global_capacities,
     )
     capacity = key_index_map.capacity()
 
@@ -708,8 +745,20 @@ def _expand_tables_impl(
     device = state.device
     enable_overflow = getattr(state.key_index_map, "enable_overflow_", False)
     key_caps = state.key_index_map.per_table_capacity_
+    old_global_caps = list(
+        getattr(state.key_index_map, "global_capacities_", [0] * state.num_tables)
+    )
     new_caps = []
     for i in range(state.num_tables):
+        if tables_to_expand[i] and old_global_caps[i]:
+            # Growing would re-partition the keys and break the promise that
+            # the bucket a key lives in does not depend on the table's size.
+            # Such a table starts at max_capacity, so get_expand_info never
+            # asks; this guards a table built by hand.
+            raise RuntimeError(
+                f"table {i} hashes into the whole table's bucket space "
+                f"(global_capacity {old_global_caps[i]}) and cannot be expanded"
+            )
         if tables_to_expand[i]:
             if (
                 target_capacities is not None
@@ -734,6 +783,7 @@ def _expand_tables_impl(
         # And whether a key keeps a value row of its own: the expansion below
         # carries rows when it does, and moves values by slot when it does not.
         use_rows=state.key_index_map.use_rows_,
+        global_capacities=[gc or None for gc in old_global_caps],
     )
     for i in range(state.num_tables):
         if tables_to_expand[i]:
@@ -861,8 +911,6 @@ def get_expand_info(
     assert (
         unique_per_table.device.type == "cpu"
     ), "unique_per_table must be a CPU tensor"
-
-    from dynamicemb.dynamicemb_config import DynamicEmbScoreStrategy
 
     is_no_eviction = state.no_eviction
     results = [False] * state.num_tables
@@ -1781,6 +1829,8 @@ def _count_owned_keys(
     batch_size: int = 65536,
     shard_index: Optional[int] = None,
     num_shards: Optional[int] = None,
+    global_capacity: Optional[int] = None,
+    bucket_capacity: Optional[int] = None,
 ) -> int:
     """How many of a checkpoint file's keys this rank keeps.
 
@@ -1804,7 +1854,14 @@ def _count_owned_keys(
                 dtype=KEY_TYPE,
                 device=device,
             )
-            mask = owned_key_mask(keys, shard_index, num_shards, dist_type)
+            mask = owned_key_mask(
+                keys,
+                shard_index,
+                num_shards,
+                dist_type,
+                global_capacity=global_capacity,
+                bucket_capacity=bucket_capacity,
+            )
             owned += int(mask.sum().item()) if mask is not None else n
     return owned
 
@@ -1824,6 +1881,8 @@ def _iter_batches_from_files(
     opt_state_dtype: torch.dtype = OPT_STATE_TYPE,
     shard_index: Optional[int] = None,
     num_shards: Optional[int] = None,
+    global_capacity: Optional[int] = None,
+    bucket_capacity: Optional[int] = None,
 ) -> Iterator[Tuple[Tensor, Tensor, Optional[Tensor], Optional[Tensor]]]:
     """Yield (keys, embeddings, scores, opt_states) batches from checkpoint files.
 
@@ -1853,7 +1912,10 @@ def _iter_batches_from_files(
     key in it already belongs to that rank, and the filter is a no-op -- but
     only if the rule is the right one. When the counts differ the files are
     re-split across ranks and the filter is what does the resharding.
-    Pass *score_file_path* / *opt_file_path* as ``None`` to skip those files.
+    *global_capacity* / *bucket_capacity* are the parameters of the
+    ``hash_bucket`` rule (``_LoadParams`` carries them from the table's
+    options). Pass *score_file_path* / *opt_file_path* as ``None`` to skip
+    those files.
     """
     fkey = open(emb_key_path, "rb")
     fembedding = open(embedding_file_path, "rb")
@@ -1901,7 +1963,14 @@ def _iter_batches_from_files(
                     opt_bytes, opt_state_dtype, device
                 ).view(-1, optstate_dim)
 
-            masks = owned_key_mask(keys, shard_index, num_shards, dist_type)
+            masks = owned_key_mask(
+                keys,
+                shard_index,
+                num_shards,
+                dist_type,
+                global_capacity=global_capacity,
+                bucket_capacity=bucket_capacity,
+            )
             if masks is not None:
                 keys = keys[masks]
                 embeddings = embeddings[masks]
@@ -1928,8 +1997,11 @@ class _LoadParams:
     file_optstate_dim: int
     include_optim: bool
     num_keys: int
-    # The table's key -> rank rule, already checked against the checkpoint's.
+    # The table's key -> rank rule, already checked against the checkpoint's,
+    # with the parameters hash_bucket needs (None for the other rules).
     dist_type: str
+    global_capacity: Optional[int] = None
+    bucket_capacity: Optional[int] = None
     # Precisions the value files were written at, resolved from meta (fp32 for
     # checkpoints predating it). Pass both to ``_iter_batches_from_files``.
     emb_dtype: torch.dtype = EMBEDDING_TYPE
@@ -1945,12 +2017,17 @@ def _validate_load_meta(
     score_file_path: Optional[str],
     opt_file_path: Optional[str],
     include_optim: bool,
+    routing_options: Optional[DynamicEmbTableOptions] = None,
 ) -> _LoadParams:
     """Shared validation for checkpoint loading.
 
     Reads meta JSON, validates opt_type / evict_strategy / dist_type, resolves
     the value files' precision and row width, resolves include_optim, and checks
     file-size consistency.
+
+    *routing_options* are the options the key -> rank rule is read from; they
+    default to this state's own, and a storage whose state is a rescaled tier
+    (``HybridStorage``) passes the tier that kept the shard's bucket capacity.
     """
     meta_data = load_from_json(meta_json_file_path)
     opt_type = meta_data.get("opt_type", None)
@@ -1970,13 +2047,39 @@ def _validate_load_meta(
         raise ValueError(
             f"Evict strategy mismatch: {evict_strategy} != {state.evict_strategy}"
         )
+    if routing_options is None:
+        routing_options = state.options_list[table_id]
     ckpt_dist_type = meta_data.get("dist_type", "roundrobin")
-    runtime_dist_type = state.options_list[table_id].dist_type
+    runtime_dist_type = routing_options.dist_type
+    runtime_global_capacity = getattr(routing_options, "global_capacity", None)
     if runtime_dist_type != ckpt_dist_type:
-        raise ValueError(
-            "Input dist_type mismatch: checkpoint was dumped with "
-            f"{ckpt_dist_type!r}, but runtime table is configured with "
-            f"{runtime_dist_type!r}. Please load with a matching dist_type."
+        # Ownership is recomputed from the key by the *table's* rule, so a
+        # checkpoint written under another rule still loads -- provided every
+        # rank reads every file (BatchedDynamicEmbeddingTablesV2.load reads
+        # all files when the rules differ). Keys then land in buckets the
+        # source never grouped them by, and a full bucket evicts: a one-time
+        # loss on migration, which is why this is a warning and not silent.
+        warnings.warn(
+            f"{emb_key_path}: checkpoint was dumped with dist_type "
+            f"{ckpt_dist_type!r} but the table uses {runtime_dist_type!r}; keys "
+            "are re-partitioned by the table's rule, and rows may be lost where "
+            "a bucket overflows. Every rank must read every shard file.",
+            UserWarning,
+            stacklevel=2,
+        )
+    elif runtime_dist_type == "hash_bucket" and (
+        meta_data.get("global_capacity") != runtime_global_capacity
+        or meta_data.get("bucket_capacity") != routing_options.bucket_capacity
+    ):
+        warnings.warn(
+            f"{emb_key_path}: checkpoint has global bucket layout "
+            f"(global_capacity={meta_data.get('global_capacity')}, "
+            f"bucket_capacity={meta_data.get('bucket_capacity')}) but the table "
+            f"has ({runtime_global_capacity}, {routing_options.bucket_capacity}); "
+            "keys are re-partitioned by the table's layout, and rows may be lost "
+            "where a bucket overflows. Every rank must read every shard file.",
+            UserWarning,
+            stacklevel=2,
         )
 
     if score_file_path is None:
@@ -2060,6 +2163,8 @@ def _validate_load_meta(
         include_optim=include_optim,
         num_keys=num_keys,
         dist_type=runtime_dist_type,
+        global_capacity=runtime_global_capacity,
+        bucket_capacity=routing_options.bucket_capacity,
         emb_dtype=emb_dtype,
         opt_state_dtype=opt_state_dtype,
     )
@@ -2451,7 +2556,9 @@ class DynamicEmbCache(Cache):
         options: List[DynamicEmbTableOptions],
         optimizer: BaseDynamicEmbeddingOptimizer,
     ):
-        self._state = create_table_state(options, optimizer, enable_overflow=True)
+        self._state = create_table_state(
+            options, optimizer, enable_overflow=True, global_bucket_layout=False
+        )
         self._cache_metrics = torch.zeros(10, dtype=torch.long, device="cpu")
         self._record_cache_metrics = False
 
@@ -2914,6 +3021,8 @@ class DynamicEmbStorage(Storage):
             params.dist_type,
             shard_index=shard_index,
             num_shards=num_shards,
+            global_capacity=params.global_capacity,
+            bucket_capacity=params.bucket_capacity,
         )
         self.expand_if_need(unique_size_per_table)
 
@@ -2940,6 +3049,8 @@ class DynamicEmbStorage(Storage):
             opt_state_dtype=params.opt_state_dtype,
             shard_index=shard_index,
             num_shards=num_shards,
+            global_capacity=params.global_capacity,
+            bucket_capacity=params.bucket_capacity,
         ):
             if (
                 scores is not None
@@ -3273,11 +3384,17 @@ class HybridStorage(Storage):
         # real and has nothing to retain. Erases are not covered by this setting
         # at all -- ``erase_keys`` runs against both tiers and passes its own
         # mode down, so a key erased out of HBM is recorded just the same.
-        self._hbm = create_table_state(hbm_options, optimizer)
+        # Both tiers are rescaled parts of the shard, so neither holds the
+        # exact bucket count the global bucket map needs (see
+        # create_table_state); a hybrid table keeps today's per-tier hashing.
+        self._hbm = create_table_state(
+            hbm_options, optimizer, global_bucket_layout=False
+        )
         self._host = create_table_state(
             host_options,
             optimizer,
             evicted_item_mode=host_options[0].evicted_item_mode,
+            global_bucket_layout=False,
         )
         self.optimizer = optimizer
 
@@ -3919,6 +4036,9 @@ class HybridStorage(Storage):
             score_file_path,
             opt_file_path,
             include_optim,
+            # The HBM tier hashes with its own (larger) bucket capacity; the
+            # host tier kept the shard's, which the routing rule is stated in.
+            routing_options=self._host.options_list[table_id],
         )
         self._hbm.collect_table_sizes_flag = True
         collect_table_sizes_for_state(self._hbm, non_blocking=False)
@@ -3953,6 +4073,8 @@ class HybridStorage(Storage):
             opt_state_dtype=params.opt_state_dtype,
             shard_index=shard_index,
             num_shards=num_shards,
+            global_capacity=params.global_capacity,
+            bucket_capacity=params.bucket_capacity,
         ):
             if keys.numel() == 0:
                 continue

@@ -124,6 +124,8 @@ class MultiTableKVCounter(Counter):
         dist_type: str,
         shard_index: Optional[int] = None,
         num_shards: Optional[int] = None,
+        global_capacity: Optional[int] = None,
+        bucket_capacity: Optional[int] = None,
     ) -> None:
         self.table_.load(
             key_file,
@@ -132,6 +134,8 @@ class MultiTableKVCounter(Counter):
             dist_type=dist_type,
             shard_index=shard_index,
             num_shards=num_shards,
+            global_capacity=global_capacity,
+            bucket_capacity=bucket_capacity,
         )
 
     def dump(self, key_file, counter_file, table_id: int) -> None:

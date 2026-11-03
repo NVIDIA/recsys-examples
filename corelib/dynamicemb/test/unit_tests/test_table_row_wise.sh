@@ -40,7 +40,7 @@ run 2 2 --mode plan --dist-type hash_roundrobin
 # `parity` and `jagged` do read keys, so both rules are run. Bags of differing
 # length, empty ones included, reach the bucketizer's edges, and the two rules
 # bucket by different arithmetic.
-for dist_type in roundrobin hash_roundrobin; do
+for dist_type in roundrobin hash_roundrobin hash_bucket; do
   run 2 1 --mode parity --dist-type ${dist_type}
   run 2 1 --mode jagged --dist-type ${dist_type}
   run 2 2 --mode parity --dist-type ${dist_type}
@@ -56,6 +56,7 @@ run 2 1 --mode pooling --dist-type hash_roundrobin
 # count, not on the rule that placed the key, so one rule and both topologies.
 # The four-rank one below is the only place the two divisions are both > 1.
 run 2 1 --mode grad --dist-type hash_roundrobin
+run 2 1 --mode grad --dist-type hash_bucket
 
 # Four ranks split two ways, so a node holds more than one rank. The only
 # topology here where intra-node is itself a group.
@@ -76,7 +77,7 @@ CKPT=/tmp/dynamicemb_trw_ckpt
 # checkpoint suite already covers, and both halves of it are reached by the
 # two crossings below.
 if want load_dump; then
-for dist_type in roundrobin hash_roundrobin; do
+for dist_type in roundrobin hash_roundrobin hash_bucket; do
   for pair in "table_row_wise table_row_wise" \
               "table_row_wise row_wise" \
               "row_wise table_row_wise"; do

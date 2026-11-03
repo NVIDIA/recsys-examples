@@ -65,8 +65,11 @@ bucketize by the same rule -- the supported `dist_type` values are:
 - `continuous`
 - `roundrobin`
 - `hash_roundrobin`
+- `hash_bucket`
 
 `hash_roundrobin` hashes the raw key before rank assignment and is intended to reduce sensitivity to pathological raw-key patterns that can break plain modulo-based `roundrobin`. It is an opt-in routing mode; the default remains `roundrobin` for compatibility with existing checkpoints. It should be understood as a routing robustness improvement, not as a general solution to arbitrary hot-key or Zipf-skew load balancing.
+
+`hash_bucket` goes one step further and fixes the table's bucket layout independently of the number of ranks. The key's **global bucket** is `(murmur3(key) & INT64_MAX) % global_capacity // bucket_capacity`, where `global_capacity = ceil(num_embeddings / bucket_capacity) * bucket_capacity` is the capacity of the whole table (the planner writes it to `DynamicEmbTableOptions.global_capacity`), and the key goes to the rank holding that bucket: rank `r` holds buckets `[r * P, (r + 1) * P)` with `P = ceil(global_buckets / fanout)`. The keys that share a bucket therefore do not depend on the fan-out, and a checkpoint written at one world size is reloaded at another **without a bucket overflowing**: no row is lost on an 8 → 1 (or 1 → 8) restore of an in-memory table, which the per-rank layouts of `roundrobin` and `hash_roundrobin` cannot promise. This holds for HBM-only and host-only `DynamicEmbStorage` and for the storage tier of a caching table; HYBRID tiers, `MAX_BUCKET_CAPACITY` and `NO_EVICTION` tables are excluded. A checkpoint written under another `dist_type` (or another `hash_bucket` layout) is read whole by every rank and re-partitioned, with a warning -- a one-time migration that may lose rows where buckets overflow. See `docs/global_bucket_layout_design.md`.
 
     ```python
     #How to import
@@ -159,7 +162,7 @@ At plan time, `DynamicEmbeddingShardingPlanner` reads the table configs off the 
 | Step | Field(s) | What happens |
 |------|-----------|----------------|
 | 1 | `initializer_args` | **`complete_initializer_args`** returns a new `DynamicEmbInitializerArgs` when needed. For **`UNIFORM`** initialization only: if `lower` or `upper` is `None`, they are filled. With a TorchREC `embedding_config`, bounds are `±sqrt(1 / num_embeddings)`; without it, `0.0` and `1.0`. Other modes are returned unchanged. |
-| 2 | `bucket_capacity`, `max_capacity` | **`_sharded_table_bucket_layout(embedding_config, world_size, bucket_capacity)`** (internal) returns **`(num_buckets, effective_bucket_width)`** per rank. The planner overwrites **`bucket_capacity`** with the **effective** width (after `MAX_BUCKET_CAPACITY` / alignment rules). **`max_capacity`** is set to **`num_buckets * effective_bucket_width`**, i.e. the same value as **`get_sharded_table_capacity(embedding_config, world_size, bucket_capacity)`**. **`init_capacity`**: if unset, set to **`max_capacity`**; if set, align to **`bucket_capacity`**, then clamp to **`max_capacity`** if larger. **User input:** `bucket_capacity` on `DynamicEmbTableOptions` (multiple of **`BUCKET_ALIGNMENT` (16)** unless **`MAX_BUCKET_CAPACITY`** = `2**63 - 1`). **Sentinel:** layout is `(1, aligned_per_rank_rows)` — one bucket spanning the shard. **Otherwise:** `num_buckets = align_to_table_size(ceil(N/world), bucket_capacity) // bucket_capacity`. |
+| 2 | `bucket_capacity`, `max_capacity` | **`_sharded_table_bucket_layout(embedding_config, world_size, bucket_capacity)`** (internal) returns **`(num_buckets, effective_bucket_width)`** per rank. The planner overwrites **`bucket_capacity`** with the **effective** width (after `MAX_BUCKET_CAPACITY` / alignment rules). **`max_capacity`** is set to **`num_buckets * effective_bucket_width`**, i.e. the same value as **`get_sharded_table_capacity(embedding_config, world_size, bucket_capacity)`**. **`init_capacity`**: if unset, set to **`max_capacity`**; if set, align to **`bucket_capacity`**, then clamp to **`max_capacity`** if larger. **User input:** `bucket_capacity` on `DynamicEmbTableOptions` (multiple of **`BUCKET_ALIGNMENT` (16)** unless **`MAX_BUCKET_CAPACITY`** = `2**63 - 1`). **Sentinel:** layout is `(1, aligned_per_rank_rows)` — one bucket spanning the shard. **Otherwise:** `num_buckets = ceil(ceil(N / bucket_capacity) / world)` -- the whole table's bucket count (`_global_table_bucket_layout`) split over the ranks, equal to the former `align_to_table_size(ceil(N/world), bucket_capacity) // bucket_capacity`. **`global_capacity`:** for `dist_type="hash_bucket"` set to `ceil(N / bucket_capacity) * bucket_capacity` (**`get_global_table_capacity(embedding_config, bucket_capacity)`**; `fanout * max_capacity` under the `MAX_BUCKET_CAPACITY` sentinel), and `init_capacity` is raised to `max_capacity`; `None` for every other `dist_type`. |
 | 3 | `local_hbm_for_values` | Overwritten to **`ceil(global_hbm_for_values / fanout)`** so each rank holding the table gets an equal byte budget from the user-provided **`global_hbm_for_values`** (set on `DynamicEmbTableOptions` before planning). **It is a budget for the group, not the table:** tables the runtime fuses pool both their sizes and their budgets and take one HBM-or-host decision for the sum, so a table whose budget exceeds its size lends the remainder to its groupmates rather than wasting it. The planner reserves memory the same way. |
 
 **The divisor (`fanout`) is per table.** It is how many pieces the table's rows are split into: `world_size` for a `ROW_WISE` table, which sits on every rank, and `local_world_size` for a `TABLE_ROW_WISE` one, which sits on a single node. The same number decides the shard metadata, so capacity and placement cannot disagree. Steps 2 and 3 both use it.
@@ -208,6 +211,7 @@ A `TableKey` is the pair `(collection, name)` -- the collection being the path t
 
 - `from dynamicemb.dynamicemb_config import complete_initializer_args` (initializer completion; not re-exported from `dynamicemb` top-level today)
 - `from dynamicemb import get_sharded_table_capacity` — returns **per-rank row capacity** after sharding and bucket alignment (``num_buckets * effective_bucket_width``), matching **`max_capacity`** set by the planner. With **`MAX_BUCKET_CAPACITY`**, the table is one bucket per rank whose width is the aligned shard row count.
+- `from dynamicemb import get_global_table_capacity` — returns the **whole table's** row capacity as one hash space, `ceil(num_embeddings / bucket_capacity) * bucket_capacity`, matching **`global_capacity`** the planner sets on a `hash_bucket` table (independent of the world size); `None` for **`MAX_BUCKET_CAPACITY`**.
 - `from dynamicemb import get_table_value_bytes` — total bytes for **all ranks**’ value storage (embedding + optimizer state rows), using the same row layout as `get_sharded_table_capacity` for the given `bucket_capacity` (including **`MAX_BUCKET_CAPACITY`**). Use this to size **`global_hbm_for_values`** before planning; apply your own **caching** fraction or **HBM budget scale** on top if needed (as in benchmarks / examples).
 - `from dynamicemb import BUCKET_ALIGNMENT, MAX_BUCKET_CAPACITY`
 
@@ -870,6 +874,17 @@ Fields declared first (through `device_id`) are **planner/runtime-heavy**: `Dyna
                 set **`caching=True`** will create a GPU table and a host table, and make GPU table serves as a cache;
                 set **`caching=False`** will create a hybrid table which use GPU and host memory in a concatenated way to store value.
                 All keys and other meta data are always stored on GPU for both cases.
+        global_capacity : Optional[int], optional
+            Set by the planner for ``dist_type="hash_bucket"`` tables only: the row
+            capacity of the whole table across every rank,
+            ``ceil(num_embeddings / bucket_capacity) * bucket_capacity``. A key's home
+            bucket is ``(murmur3(key) & INT64_MAX) % global_capacity // bucket_capacity``
+            and the input distributor sends the key to the rank holding that bucket, so
+            the bucket layout does not depend on the world size and a checkpoint reloads
+            at another world size without a bucket overflowing. ``None`` (the default,
+            and what the planner writes for other ``dist_type`` values) keeps the table
+            hashing within its per-rank capacity. Such a table starts at
+            ``max_capacity`` and does not rehash. See ``docs/global_bucket_layout_design.md``.
         init_capacity : Optional[int], optional
             The initial capacity of the table. If not set, it defaults to max_capacity after sharding.
             ``BatchedDynamicEmbeddingTablesV2`` also sets ``init_capacity`` to ``max_capacity`` when it is still ``None``.
@@ -973,6 +988,7 @@ Fields declared first (through `device_id`) are **planner/runtime-heavy**: `Dyna
         embedding_dtype: Optional[torch.dtype] = None
         dim: Optional[int] = None
         max_capacity: Optional[int] = None
+        global_capacity: Optional[int] = None
         evict_strategy: DynamicEmbEvictStrategy = DynamicEmbEvictStrategy.LRU
         local_hbm_for_values: int = 0  # in bytes
         device_id: Optional[int] = None
@@ -1112,7 +1128,7 @@ The meaning of the threshold depends on the table's `score_strategy`:
 - Strategies without a timestamp column (e.g. `STEP`, single `LFU`) instead threshold on the **absolute score value**: items whose score is not less than the threshold are dumped. This is not a time-based increment.
 - Tables whose strategy contains `NO_EVICTION` (alone or as `(NO_EVICTION, CUSTOMIZED)`) are **skipped** with a `UserWarning` and are absent from the result; nothing is drained from them. They have no timestamp to take a delta by, and their erased keys are the user's to manage.
 
-> **Limitation — `dist_type`:** `incremental_dump` supports only `roundrobin` and `hash_roundrobin` sharding. A table sharded with `dist_type="continuous"` raises `NotImplementedError`. The returned `slot_index` is meant for precise `replay_increment`, which reconstructs each key's owning rank from the key via `(key or hash(key)) % world_size`; `continuous` uses a different, range-based key→rank mapping that this path does not implement. Use `roundrobin` or `hash_roundrobin` if you need incremental dump.
+> **Limitation — `dist_type`:** `incremental_dump` supports only `roundrobin`, `hash_roundrobin` and `hash_bucket` sharding. A table sharded with `dist_type="continuous"` raises `NotImplementedError`. The returned `slot_index` is meant for precise `replay_increment`, which reconstructs each key's owning rank from the key (`key % world_size` for `roundrobin`, `murmur3(key) % world_size` for `hash_roundrobin`, the global-bucket rule of `dynamicemb.key_ownership` for `hash_bucket`); `continuous` uses a different, range-based key→rank mapping that this path does not implement. Use `roundrobin` or `hash_roundrobin` if you need incremental dump.
 
     ```python
     #How to import
@@ -1213,7 +1229,7 @@ More usage please see [test](https://github.com/NVIDIA/recsys-examples/blob/main
 **Behavior**
 For every table in the delta, `replay_increment` erases the table's `erased_keys` (so the target converges to the source) and then upserts `keys` / `values` at the slots in `meta["slot_index"]`. `evicted_keys` is never applied: the key that took an evicted key's slot is in the same delta and overwrites it.
 
-*Write-back is by slot.* Every key is written at the slot and value row it held in the source table, leaving the target layout-identical to it. A key can only be found inside its own home bucket, and that bucket is `hash(key) % capacity / bucket_capacity`, so this requires the target's layout to match the source's. `replay_increment` compares the delta's `meta` (`current_capacity`, `row_capacity`, `bucket_capacity`, `num_scores`, `world_size`, and the `table_options` fields `score_strategy` / `dim` / `dist_type`) against the target table, and checks that every column has the shape the write path needs. Both happen for **all** of the delta's tables before any of them is written, so a mismatch anywhere raises `ValueError` naming the first offending field with the collection untouched — a delta spans a whole collection, and a partly applied one is worse to recover from than a rejected one. Configure the target to match the source, or rebuild it from a full checkpoint (`DynamicEmbLoad`) instead.
+*Write-back is by slot.* Every key is written at the slot and value row it held in the source table, leaving the target layout-identical to it. A key can only be found inside its own home bucket, and that bucket is `hash(key) % capacity / bucket_capacity`, so this requires the target's layout to match the source's. `replay_increment` compares the delta's `meta` (`current_capacity`, `row_capacity`, `bucket_capacity`, `num_scores`, `world_size`, and the `table_options` fields `score_strategy` / `dim` / `dist_type` / `global_capacity`) against the target table, and checks that every column has the shape the write path needs. Both happen for **all** of the delta's tables before any of them is written, so a mismatch anywhere raises `ValueError` naming the first offending field with the collection untouched — a delta spans a whole collection, and a partly applied one is worse to recover from than a rejected one. Configure the target to match the source, or rebuild it from a full checkpoint (`DynamicEmbLoad`) instead.
 
 The same rule is enforced per key inside the kernel — a slot that does not land in its key's home bucket raises rather than dropping the key.
 
@@ -1227,7 +1243,7 @@ The same rule is enforced per key inside the kernel — a slot that does not lan
 
 *Scores and optimizer state travel under `ReplayContent`,* which asks for both by default. Drop `SCORE` and a restored key is scored as if it had just been inserted into the target, so the replica ranks its own future evictions by when it received each key rather than by how the source ranked it — the two can evict in different orders, but never disagree on the value of a key they both hold. Drop `OPTIMIZER_STATE` and a key keeps its state only if it already occupies the target row. 
 
-*Sharding.* Replay keeps only the keys this rank owns, recomputing ownership from the key with **this** model's global world size — the fan-out the tables were sharded over. There is deliberately no process-group argument: replay is local (filter, then write), so a group could only narrow the modulus and mis-route every key. A delta gathered over a process group (`incremental_dump(..., pg)`) holds the whole group's keys and so fans out correctly when the same delta is handed to every rank. A per-rank delta (`pg=None`) holds only the producing rank's keys and should be replayed there — replaying it on another rank is not an error, every key simply belongs to someone else and is skipped, which `ReplayStats.skipped` reports. Like `incremental_dump`, only `roundrobin` and `hash_roundrobin` are supported; `continuous` raises `NotImplementedError`.
+*Sharding.* Replay keeps only the keys this rank owns, recomputing ownership from the key with **this** model's global world size — the fan-out the tables were sharded over. There is deliberately no process-group argument: replay is local (filter, then write), so a group could only narrow the modulus and mis-route every key. A delta gathered over a process group (`incremental_dump(..., pg)`) holds the whole group's keys and so fans out correctly when the same delta is handed to every rank. A per-rank delta (`pg=None`) holds only the producing rank's keys and should be replayed there — replaying it on another rank is not an error, every key simply belongs to someone else and is skipped, which `ReplayStats.skipped` reports. Like `incremental_dump`, only `roundrobin`, `hash_roundrobin` and `hash_bucket` are supported; `continuous` raises `NotImplementedError`.
 
 *Optimizer state* is not part of a delta. A key that already occupies its target row keeps its optimizer state; a row taken over from another key (or a brand-new one) is reset to the table's initial optimizer state.
 

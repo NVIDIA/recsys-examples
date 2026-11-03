@@ -100,6 +100,43 @@ def dist_type_per_feature(
     return per_feature
 
 
+def routing_params_per_feature(
+    sharding_infos: List[EmbeddingShardingInfo],
+) -> Dict[str, Tuple[int, int]]:
+    """Per feature, the ``(global_capacity, shard_capacity)`` of its rule.
+
+    The ``hash_bucket`` rule sends a key to the shard holding its global
+    bucket, ``(hash % global_capacity) // shard_capacity``
+    (:func:`~dynamicemb.key_ownership.owning_shard`), so the kernel needs both
+    numbers per feature, next to ``dist_type_per_feature``. They come from the
+    same ``DynamicEmbTableOptions`` the planner put into ``fused_params``:
+    ``global_capacity`` (whole table) and ``max_capacity`` (this shard). A
+    feature under any other rule gets ``(0, 0)``, which the kernel never reads.
+
+    A ``hash_bucket`` table without ``global_capacity`` has no rule to
+    route by -- a plan built without ``DynamicEmbeddingShardingPlanner`` -- and
+    raises rather than route by a modulus the table does not hash with.
+    """
+    per_feature: Dict[str, Tuple[int, int]] = {}
+    for info in sharding_infos:
+        fused_params = info.fused_params
+        options = fused_params.get("dynamicemb_options") if fused_params else None
+        params = (0, 0)
+        if options is not None and options.dist_type == "hash_bucket":
+            if options.global_capacity is None or options.max_capacity is None:
+                raise ValueError(
+                    f"DynamicEmb table {info.embedding_config.name!r} uses "
+                    "dist_type 'hash_bucket' but its options carry no "
+                    "global_capacity / max_capacity. DynamicEmbeddingShardingPlanner "
+                    "sets both from num_embeddings and bucket_capacity; a plan "
+                    "built another way has to (see get_global_table_capacity)."
+                )
+            params = (int(options.global_capacity), int(options.max_capacity))
+        for feature_name in info.embedding_config.feature_names:
+            per_feature[feature_name] = params
+    return per_feature
+
+
 def sharding_takes_scores(sharding_infos: List[EmbeddingShardingInfo]) -> bool:
     """Whether the tables of one sharding take a score per key.
 
@@ -199,6 +236,9 @@ class RwSequenceDynamicEmbeddingSharding(RwSequenceEmbeddingSharding):
         self._dist_type_per_feature: Dict[str, str] = dist_type_per_feature(
             sharding_infos
         )
+        self._routing_params_per_feature: Dict[
+            str, Tuple[int, int]
+        ] = routing_params_per_feature(sharding_infos)
         self._per_key_score: bool = sharding_takes_scores(sharding_infos)
 
     def create_input_dist(
@@ -217,6 +257,9 @@ class RwSequenceDynamicEmbeddingSharding(RwSequenceEmbeddingSharding):
             need_pos=False,
             dist_types=[
                 self._dist_type_per_feature[name] for name in self.feature_names()
+            ],
+            routing_params=[
+                self._routing_params_per_feature[name] for name in self.feature_names()
             ],
             per_key_score=self._per_key_score,
         )
@@ -290,6 +333,9 @@ class RwPooledDynamicEmbeddingSharding(RwPooledEmbeddingSharding):
         self._dist_type_per_feature: Dict[str, str] = dist_type_per_feature(
             sharding_infos
         )
+        self._routing_params_per_feature: Dict[
+            str, Tuple[int, int]
+        ] = routing_params_per_feature(sharding_infos)
         self._per_key_score: bool = sharding_takes_scores(sharding_infos)
 
     def create_input_dist(
@@ -308,6 +354,9 @@ class RwPooledDynamicEmbeddingSharding(RwPooledEmbeddingSharding):
             need_pos=self._need_pos,
             dist_types=[
                 self._dist_type_per_feature[name] for name in self.feature_names()
+            ],
+            routing_params=[
+                self._routing_params_per_feature[name] for name in self.feature_names()
             ],
             per_key_score=self._per_key_score,
         )

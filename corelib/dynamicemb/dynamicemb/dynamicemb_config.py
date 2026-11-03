@@ -63,6 +63,7 @@ DIST_TYPE_CODES: Dict[str, int] = {
     "continuous": int(DistType.KBlock),
     "roundrobin": int(DistType.KCyclic),
     "hash_roundrobin": int(DistType.KHashedCyclic),
+    "hash_bucket": int(DistType.KHashedBucket),
 }
 SUPPORTED_DIST_TYPES: Tuple[str, ...] = tuple(DIST_TYPE_CODES)
 # Must match ``MappingEmbeddingGenerator`` mod in ``debug_init`` (initializer.cu).
@@ -620,8 +621,24 @@ class DynamicEmbTableOptions:
         Index type of sparse features, will be set to DEFAULT_INDEX_TYPE(torch.int64) by default.
     dist_type : str
         Input distribution policy for row-wise sharding. Supported values are
-        ``continuous``, ``roundrobin``, and ``hash_roundrobin``. Defaults to
-        ``roundrobin``.
+        ``continuous``, ``roundrobin``, ``hash_roundrobin`` and ``hash_bucket``.
+        Defaults to ``roundrobin``. ``hash_bucket`` routes a key to the rank
+        holding its *global* hash bucket (see ``global_capacity``), so a
+        checkpoint reloads at another world size without losing rows to full
+        buckets; the other three hash within the rank's own capacity.
+    global_capacity : Optional[int], optional
+        Set by the planner, for ``hash_bucket`` tables only: the row
+        capacity of the whole table across every shard,
+        ``ceil(num_embeddings / bucket_capacity) * bucket_capacity``. The hash
+        table maps a key to global bucket
+        ``(murmur3(key) & INT64_MAX) % global_capacity // bucket_capacity`` and
+        the input distributor sends it to the shard holding that bucket, so the
+        keys that share a bucket do not depend on the number of shards and a
+        checkpoint reloads without a bucket overflowing at a different world
+        size. Leave it ``None`` (the default, and what the planner writes for
+        every other ``dist_type``): the table then hashes within its own
+        per-shard capacity, as before. See
+        ``docs/global_bucket_layout_design.md``.
     node_index : Optional[int], optional
         Pins this table to a node, under ``TABLE_ROW_WISE`` sharding. Leave it
         unset -- the default -- and the planner's
@@ -658,6 +675,7 @@ class DynamicEmbTableOptions:
     embedding_dtype: Optional[torch.dtype] = None
     dim: Optional[int] = None
     max_capacity: Optional[int] = None
+    global_capacity: Optional[int] = None
     evict_strategy: DynamicEmbEvictStrategy = DynamicEmbEvictStrategy.LRU
     local_hbm_for_values: int = 0  # in bytes
     device_id: Optional[int] = None
@@ -775,6 +793,10 @@ class DynamicEmbTableOptions:
             raise ValueError(
                 f"Unsupported dist_type {self.dist_type!r}. "
                 f"Supported values: {SUPPORTED_DIST_TYPES}."
+            )
+        if self.global_capacity is not None and self.global_capacity <= 0:
+            raise ValueError(
+                f"global_capacity must be positive when set, got {self.global_capacity}"
             )
         # Validate and canonicalize score_strategy (unwrap one-element tuples,
         # reject unsupported compound tuples) so all downstream code sees either a
@@ -1015,27 +1037,22 @@ def align_to_table_size(n: int, alignment: int = DEMB_TABLE_ALIGN_SIZE) -> int:
     return (n + alignment - 1) // alignment * alignment
 
 
-def _sharded_table_bucket_layout(
-    embedding_config: BaseEmbeddingConfig,
-    world_size: int,
-    bucket_capacity: int,
-) -> Tuple[int, int]:
-    """Per-rank hashtable layout: ``(num_buckets, effective_bucket_width)`` in rows.
+def _global_bucket_layout_rows(
+    num_embeddings: int, bucket_capacity: int
+) -> Optional[Tuple[int, int]]:
+    """Whole-table hashtable layout: ``(num_global_buckets, bucket_capacity)``.
 
-    Used by the sharding planner to set ``DynamicEmbTableOptions.bucket_capacity`` and
-    ``max_capacity`` (the latter equals ``num_buckets * effective_bucket_width``).
-    Prefer :func:`get_sharded_table_capacity` when only the per-rank row capacity is needed.
+    The bucket count of the table as one hash space, before it is split over
+    shards: ``ceil(num_embeddings / bucket_capacity)``. It does not depend on
+    the world size, which is what lets ``hash_bucket`` place a key in the
+    same global bucket at every fan-out (see
+    :func:`~dynamicemb.key_ownership.owning_shard`).
+
+    Returns ``None`` for :data:`MAX_BUCKET_CAPACITY`, whose single bucket spans
+    one rank's shard and has no whole-table form.
     """
-    if world_size <= 0:
-        raise ValueError(f"world_size must be positive, got {world_size}")
-
-    num_global = int(embedding_config.num_embeddings)
-    shard_rows = math.ceil(num_global / world_size)
-
     if bucket_capacity == MAX_BUCKET_CAPACITY:
-        effective_bucket = align_to_table_size(shard_rows, BUCKET_ALIGNMENT)
-        return 1, effective_bucket
-
+        return None
     if bucket_capacity <= 0:
         raise ValueError(
             f"bucket_capacity must be positive when not MAX_BUCKET_CAPACITY, "
@@ -1046,10 +1063,69 @@ def _sharded_table_bucket_layout(
             f"bucket_capacity ({bucket_capacity}) must be a multiple of "
             f"BUCKET_ALIGNMENT ({BUCKET_ALIGNMENT}) when not using MAX_BUCKET_CAPACITY."
         )
+    table_capacity = align_to_table_size(int(num_embeddings), bucket_capacity)
+    return table_capacity // bucket_capacity, bucket_capacity
 
-    table_capacity = align_to_table_size(shard_rows, bucket_capacity)
-    num_buckets = table_capacity // bucket_capacity
-    return num_buckets, bucket_capacity
+
+def _global_table_bucket_layout(
+    embedding_config: BaseEmbeddingConfig,
+    bucket_capacity: int,
+) -> Optional[Tuple[int, int]]:
+    """:func:`_global_bucket_layout_rows` of a table config's ``num_embeddings``."""
+    return _global_bucket_layout_rows(
+        int(embedding_config.num_embeddings), bucket_capacity
+    )
+
+
+def _sharded_table_bucket_layout(
+    embedding_config: BaseEmbeddingConfig,
+    world_size: int,
+    bucket_capacity: int,
+) -> Tuple[int, int]:
+    """Per-rank hashtable layout: ``(num_buckets, effective_bucket_width)`` in rows.
+
+    Used by the sharding planner to set ``DynamicEmbTableOptions.bucket_capacity`` and
+    ``max_capacity`` (the latter equals ``num_buckets * effective_bucket_width``).
+    Prefer :func:`get_sharded_table_capacity` when only the per-rank row capacity is needed.
+
+    The per-rank count is the whole table's bucket count split over the ranks,
+    ``ceil(ceil(N / bc) / world_size)`` -- the same number as
+    ``ceil(ceil(N / world_size) / bc)``, so sizing did not change when the
+    whole-table view (:func:`_global_table_bucket_layout`) was introduced; only
+    the sum over ranks did, which may now exceed the global count by up to
+    ``world_size - 1`` buckets that no key maps to.
+    """
+    if world_size <= 0:
+        raise ValueError(f"world_size must be positive, got {world_size}")
+
+    if bucket_capacity == MAX_BUCKET_CAPACITY:
+        num_global = int(embedding_config.num_embeddings)
+        shard_rows = math.ceil(num_global / world_size)
+        effective_bucket = align_to_table_size(shard_rows, BUCKET_ALIGNMENT)
+        return 1, effective_bucket
+
+    layout = _global_table_bucket_layout(embedding_config, bucket_capacity)
+    assert layout is not None
+    num_global_buckets, bucket_capacity = layout
+    return math.ceil(num_global_buckets / world_size), bucket_capacity
+
+
+def get_global_table_capacity(
+    embedding_config: BaseEmbeddingConfig,
+    bucket_capacity: int,
+) -> Optional[int]:
+    """Row capacity of the whole dynamic embedding table as one hash space.
+
+    ``ceil(num_embeddings / bucket_capacity) * bucket_capacity`` -- the value the
+    planner writes to ``DynamicEmbTableOptions.global_capacity`` for a
+    ``hash_bucket`` table, independent of the world size. ``None`` for
+    :data:`dynamicemb.types.MAX_BUCKET_CAPACITY`.
+    """
+    layout = _global_table_bucket_layout(embedding_config, bucket_capacity)
+    if layout is None:
+        return None
+    num_global_buckets, effective_bucket = layout
+    return int(num_global_buckets * effective_bucket)
 
 
 def get_sharded_table_capacity(

@@ -40,7 +40,9 @@ from torchrec.modules.embedding_configs import BaseEmbeddingConfig, data_type_to
 
 from ..dynamicemb_config import (
     DEFAULT_INDEX_TYPE,
+    MAX_BUCKET_CAPACITY,
     DynamicEmbTableOptions,
+    _global_table_bucket_layout,
     _sharded_table_bucket_layout,
     align_to_table_size,
     complete_initializer_args,
@@ -477,15 +479,39 @@ def _prepare_dynemb_table_options(
         # is per table, not global (§4.2). It does not depend on *which* node,
         # which is why a table can be sized before it is placed.
         fanout = table_fanout(_sharding_type_of(tmp_constraint), world_size, local_size)
+        requested_bucket_capacity = opts.bucket_capacity
         num_buckets, effective_bucket_capacity = _sharded_table_bucket_layout(
             tmp_config,
             fanout,
-            opts.bucket_capacity,
+            requested_bucket_capacity,
         )
         opts.bucket_capacity = effective_bucket_capacity
         aligned_per_rank_rows = num_buckets * effective_bucket_capacity
         opts.max_capacity = aligned_per_rank_rows
         opts.local_hbm_for_values = math.ceil(opts.global_hbm_for_values / fanout)
+        # hash_bucket keys to a global bucket of the whole table, so the
+        # table has to know the whole table's capacity, not just its shard's.
+        # Every other rule keeps hashing within the shard (None), and the
+        # one-bucket sentinel has no whole-table form.
+        if opts.dist_type != "hash_bucket":
+            opts.global_capacity = None
+        elif requested_bucket_capacity == MAX_BUCKET_CAPACITY:
+            # One bucket per shard has no whole-table form, so the rule's
+            # modulus is the shards laid end to end: the key goes to shard
+            # (h % (S * shard_rows)) // shard_rows, uniform over the shards.
+            # It changes with the fan-out, so such a table is routed
+            # consistently but not reloaded losslessly across world sizes.
+            opts.global_capacity = fanout * aligned_per_rank_rows
+        else:
+            global_layout = _global_table_bucket_layout(
+                tmp_config, effective_bucket_capacity
+            )
+            assert global_layout is not None
+            num_global_buckets, _ = global_layout
+            # ceil(ceil(N/bc)/S) == ceil(ceil(N/S)/bc): the shard keeps the
+            # size it always had.
+            assert math.ceil(num_global_buckets / fanout) == num_buckets
+            opts.global_capacity = num_global_buckets * effective_bucket_capacity
 
         if opts.init_capacity is not None:
             aligned_init = align_to_table_size(
@@ -506,6 +532,19 @@ def _prepare_dynemb_table_options(
                 )
                 opts.init_capacity = opts.max_capacity
         else:
+            opts.init_capacity = opts.max_capacity
+        if opts.global_capacity is not None and opts.init_capacity != opts.max_capacity:
+            # The global bucket map is only realised with exactly
+            # max_capacity / bucket_capacity buckets; a smaller table would hash
+            # into a different partition until it grows, and the growth would
+            # re-partition again.
+            warnings.warn(
+                f"{tmp_config.name}: a hash_bucket table keeps exactly "
+                f"{num_buckets} buckets so that its key -> bucket map does not "
+                f"depend on the number of shards; init_capacity is raised from "
+                f"{opts.init_capacity} to max_capacity {opts.max_capacity}",
+                UserWarning,
+            )
             opts.init_capacity = opts.max_capacity
 
         opts.dim = tmp_config.embedding_dim

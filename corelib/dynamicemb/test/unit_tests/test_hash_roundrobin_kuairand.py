@@ -30,6 +30,26 @@ def hash_key_cpu(keys_np: np.ndarray) -> np.ndarray:
     return k
 
 
+BUCKET_CAPACITY = 128
+INT64_MAX = (1 << 63) - 1
+
+
+def hashed_layout(my_size: int) -> tuple:
+    """``(global_capacity, shard_capacity)`` of a HASH_SIZE-row table over my_size shards.
+
+    The hash_bucket rule sends a key to the shard holding its *global*
+    bucket: ``ceil(HASH_SIZE / bc)`` buckets of ``bc`` rows for the whole table,
+    ``ceil(G / my_size)`` of them per shard. Spelled out here, not imported, for
+    the same reason as ``hash_key_cpu``.
+    """
+    num_global_buckets = -(-HASH_SIZE // BUCKET_CAPACITY)
+    buckets_per_shard = -(-num_global_buckets // my_size)
+    return (
+        num_global_buckets * BUCKET_CAPACITY,
+        buckets_per_shard * BUCKET_CAPACITY,
+    )
+
+
 def assign_owner_cpu(
     indices: np.ndarray,
     my_size: int,
@@ -46,6 +66,12 @@ def assign_owner_cpu(
         return (indices % my_size).astype(np.int64)
     if dist_type == "hash_roundrobin":
         return (hash_key_cpu(indices) % np.uint64(my_size)).astype(np.int64)
+    if dist_type == "hash_bucket":
+        global_capacity, shard_capacity = hashed_layout(my_size)
+        h = hash_key_cpu(indices) & np.uint64(INT64_MAX)
+        return ((h % np.uint64(global_capacity)) // np.uint64(shard_capacity)).astype(
+            np.int64
+        )
     raise ValueError(f"Unsupported dist_type: {dist_type}")
 
 
@@ -265,7 +291,7 @@ def test_key_frequency_skew(feature_name):
     top1_pct = counts[0] / total * 100
     top10_pct = counts[:10].sum() / total * 100
     top100_pct = counts[:100].sum() / total * 100
-    gini = 1 - 2 * np.trapz(
+    gini = 1 - 2 * getattr(np, "trapezoid", getattr(np, "trapz", None))(
         np.cumsum(sorted(counts)) / total,
         np.linspace(0, 1, len(counts)),
     )
@@ -355,9 +381,18 @@ def test_bucketize_kernel_matches_cpu_reference(feature_name, my_size):
         device="cuda",
     )
 
+    global_capacity, shard_capacity = hashed_layout(my_size)
+    global_capacity_per_feature = torch.tensor(
+        [global_capacity], dtype=torch.int64, device="cuda"
+    )
+    shard_capacity_per_feature = torch.tensor(
+        [shard_capacity], dtype=torch.int64, device="cuda"
+    )
+
     for dist_type_val, dist_type_name in [
         (1, "roundrobin"),
         (2, "hash_roundrobin"),
+        (3, "hash_bucket"),
     ]:
         dist_type_per_feature = torch.tensor(
             [dist_type_val],
@@ -365,12 +400,16 @@ def test_bucketize_kernel_matches_cpu_reference(feature_name, my_size):
             device="cuda",
         )
 
+        # sequence=True returns the permutation input -> output slot, which
+        # gives every key's owner, not just the per-rank counts.
         result = block_bucketize_sparse_features(
             lengths,
             indices,
             bucketize_pos=False,
-            sequence=False,
+            sequence=True,
             dist_type_per_feature=dist_type_per_feature,
+            global_capacity_per_feature=global_capacity_per_feature,
+            shard_capacity_per_feature=shard_capacity_per_feature,
             block_sizes=block_sizes,
             my_size=my_size,
             max_B=1,
@@ -378,15 +417,17 @@ def test_bucketize_kernel_matches_cpu_reference(feature_name, my_size):
 
         new_lengths = result[0].cpu().numpy()
         new_indices = result[1]
+        permute = result[4].cpu().numpy()
         rank_counts = new_lengths[:my_size]
         total_output = rank_counts.sum()
 
-        cpu_hist = owner_histogram_cpu(
+        cpu_owner = assign_owner_cpu(
             batch_indices,
             my_size,
             dist_type_name,
             HASH_SIZE // my_size,
         )
+        cpu_hist = np.bincount(cpu_owner, minlength=my_size)
 
         print(f"\n{dist_type_name} kernel (my_size={my_size}, {feature_name}):")
         print(f"  CUDA per-rank counts: {rank_counts.tolist()}")
@@ -395,3 +436,39 @@ def test_bucketize_kernel_matches_cpu_reference(feature_name, my_size):
         assert total_output == batch_size
         assert torch.all(new_indices >= 0).item()
         assert rank_counts.tolist() == cpu_hist.tolist()
+        # Key for key, not just in aggregate: the output is laid out rank by
+        # rank, so the owner of output slot j is the rank whose range holds j.
+        kernel_owner = np.repeat(np.arange(my_size), rank_counts)[permute]
+        assert (kernel_owner == cpu_owner).all()
+
+        # The host twin of the rule (what the checkpoint loader and replay
+        # filter by) must agree with both.
+        from dynamicemb.key_ownership import owning_shard
+
+        host_owner = owning_shard(
+            indices,
+            my_size,
+            dist_type_name,
+            global_capacity=global_capacity,
+            bucket_capacity=BUCKET_CAPACITY,
+        )
+        assert (host_owner.cpu().numpy() == cpu_owner).all()
+
+
+def test_hash_bucket_owner_does_not_depend_on_fanout_within_a_bucket():
+    """Keys that share a global bucket share a shard at every fan-out, and the
+    shard is the bucket's position: g // ceil(G / my_size). That is the property
+    the rule exists for -- a bucket written by one world size is reloaded whole
+    by another."""
+    keys = np.random.default_rng(0).integers(1, 1 << 62, 200_000, dtype=np.int64)
+    global_capacity, _ = hashed_layout(1)
+    num_global_buckets = global_capacity // BUCKET_CAPACITY
+    h = hash_key_cpu(keys) & np.uint64(INT64_MAX)
+    g = ((h % np.uint64(global_capacity)) // np.uint64(BUCKET_CAPACITY)).astype(
+        np.int64
+    )
+    for my_size in (1, 2, 3, 4, 8, 16):
+        buckets_per_shard = -(-num_global_buckets // my_size)
+        owner = assign_owner_cpu(keys, my_size, "hash_bucket", 0)
+        assert (owner == g // buckets_per_shard).all()
+        assert owner.max() < my_size

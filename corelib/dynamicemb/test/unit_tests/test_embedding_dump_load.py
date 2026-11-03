@@ -27,6 +27,7 @@ from dynamicemb import (
     DynamicEmbScoreStrategy,
     DynamicEmbTableOptions,
     FrequencyAdmissionStrategy,
+    get_sharded_table_capacity,
 )
 from dynamicemb.batched_dynamicemb_tables import BatchedDynamicEmbeddingTablesV2
 from dynamicemb.dump_load import (
@@ -471,7 +472,9 @@ def check_counter_table_checkpoint(x, y):
                 ), f"counter frequency mismatch for table_id={table_id}"
 
 
-def owns_key(key: int, rank: int, world_size: int, dist_type: str) -> bool:
+def owns_key(
+    key: int, rank: int, world_size: int, dist_type: str, num_embeddings: int
+) -> bool:
     """Whether *rank* is the one holding *key*, under the rule the model uses.
 
     The question `dynamicemb.key_ownership` answers for tensors, asked one
@@ -481,11 +484,30 @@ def owns_key(key: int, rank: int, world_size: int, dist_type: str) -> bool:
     roundrobin rule written out by hand -- right for the default, wrong for
     hash_roundrobin, and invisible either way at world_size 1, where the only
     rank owns everything. The hash_roundrobin coverage ran at one rank.
+
+    hash_bucket routes by the table's global bucket layout, so it needs the
+    table's size: these tables use MAX_BUCKET_CAPACITY (one bucket per shard),
+    for which the planner sets global_capacity = world_size * shard rows and
+    the bucket capacity to the shard's rows (``_prepare_dynemb_table_options``).
     """
     if world_size <= 1:
         return True
     if dist_type == "hash_roundrobin":
         return int(murmur3_fmix64(key)) % world_size == rank
+    if dist_type == "hash_bucket":
+        shard_capacity = get_sharded_table_capacity(
+            EmbeddingConfig(
+                name="owns_key",
+                embedding_dim=1,
+                num_embeddings=num_embeddings,
+                feature_names=["owns_key"],
+            ),
+            world_size,
+            MAX_BUCKET_CAPACITY,
+        )
+        global_capacity = world_size * shard_capacity
+        h = int(murmur3_fmix64(key)) & ((1 << 63) - 1)
+        return (h % global_capacity) // shard_capacity == rank
     return (int(key) & 0xFFFFFFFFFFFFFFFF) % world_size == rank
 
 
@@ -509,6 +531,14 @@ def assert_dist_type_path(model: nn.Module, expected_dist_type: str) -> None:
                 # rather than restating the mapping here.
                 expected_code = int(dist_type_codes([expected_dist_type])[0])
                 assert set(codes.tolist()) == {expected_code}
+                # hash_bucket carries its parameters next to the codes:
+                # every feature a positive whole-table and shard capacity.
+                global_caps = input_dist._global_capacity_tensor.tolist()
+                shard_caps = input_dist._shard_capacity_tensor.tolist()
+                assert len(global_caps) == len(shard_caps) == codes.numel()
+                if expected_dist_type == "hash_bucket":
+                    assert all(c > 0 for c in global_caps), global_caps
+                    assert all(c > 0 for c in shard_caps), shard_caps
                 seen_input_dist = True
 
     assert seen_sharding, "Did not find any DynamicEmb sharding carrying dist_type."
@@ -534,7 +564,7 @@ def assert_dist_type_path(model: nn.Module, expected_dist_type: str) -> None:
 )
 @click.option(
     "--dist-type",
-    type=click.Choice(["continuous", "roundrobin", "hash_roundrobin"]),
+    type=click.Choice(["continuous", "roundrobin", "hash_roundrobin", "hash_bucket"]),
     default="roundrobin",
     show_default=True,
 )
@@ -687,7 +717,13 @@ def test_model_load_dump(
                     keys = kjt[feature_name].values().tolist()
                     for key in keys:
                         if (
-                            owns_key(key, rank, world_size, dist_type)
+                            owns_key(
+                                key,
+                                rank,
+                                world_size,
+                                dist_type,
+                                num_embeddings[embedding_idx],
+                            )
                             and key not in visited_keys
                         ):
                             assert (
@@ -704,7 +740,13 @@ def test_model_load_dump(
                     keys = kjt[feature_name].values().tolist()
                     for key in keys:
                         if (
-                            owns_key(key, rank, world_size, dist_type)
+                            owns_key(
+                                key,
+                                rank,
+                                world_size,
+                                dist_type,
+                                num_embeddings[embedding_idx],
+                            )
                             and key not in visited_keys
                         ):
                             assert (

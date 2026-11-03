@@ -9,7 +9,7 @@
 TORCH_LIBRARY_FRAGMENT(INFERENCE_EMB, m) {
     // NOTE: In Torch operator schema, integral scalar arguments are declared as
     // "int" and are represented as int64_t on the C++ kernel side.
-    m.def("table_lookup(Tensor table_storage, Tensor table_bucket_offsets, int bucket_capacity, Tensor keys, Tensor table_ids, Tensor? score_input, int policy_type, Tensor? ovf_storage=None, int ovf_bucket_capacity=0, Tensor? ovf_output_offsets=None) -> (Tensor, Tensor, Tensor)");
+    m.def("table_lookup(Tensor table_storage, Tensor table_bucket_offsets, int bucket_capacity, Tensor keys, Tensor table_ids, Tensor? score_input, int policy_type, Tensor? ovf_storage=None, int ovf_bucket_capacity=0, Tensor? ovf_output_offsets=None, Tensor? table_global_capacities=None) -> (Tensor, Tensor, Tensor)");
 }
 
 
@@ -25,7 +25,8 @@ table_lookup(at::Tensor table_storage, at::Tensor table_bucket_offsets,
              std::optional<at::Tensor> ovf_storage,
              int64_t ovf_bucket_capacity,
              std::optional<at::Tensor> ovf_output_offsets,
-             int64_t num_scores);
+             int64_t num_scores = 1,
+             std::optional<at::Tensor> table_global_capacities = std::nullopt);
 
 std::tuple<at::Tensor, at::Tensor, at::Tensor>
 table_lookup_cuda_impl(at::Tensor table_storage, at::Tensor table_bucket_offsets,
@@ -35,7 +36,8 @@ table_lookup_cuda_impl(at::Tensor table_storage, at::Tensor table_bucket_offsets
              int64_t policy,
              std::optional<at::Tensor> ovf_storage,
              int64_t ovf_bucket_capacity,
-             std::optional<at::Tensor> ovf_output_offsets) {
+             std::optional<at::Tensor> ovf_output_offsets,
+             std::optional<at::Tensor> table_global_capacities) {
     TORCH_CHECK(table_storage.is_cuda(), "INFERENCE_EMB::table_lookup expects CUDA table_storage.");
     TORCH_CHECK(table_bucket_offsets.is_cuda(), "INFERENCE_EMB::table_lookup expects CUDA table_bucket_offsets.");
     TORCH_CHECK(keys.is_cuda(), "INFERENCE_EMB::table_lookup expects CUDA keys.");
@@ -53,7 +55,8 @@ table_lookup_cuda_impl(at::Tensor table_storage, at::Tensor table_bucket_offsets
     return table_lookup(
         table_storage, table_bucket_offsets, bucket_capacity, keys, table_ids,
         score_input, static_cast<ScorePolicyType>(policy),
-        ovf_storage, ovf_bucket_capacity, ovf_output_offsets);
+        ovf_storage, ovf_bucket_capacity, ovf_output_offsets, /*num_scores=*/1,
+        table_global_capacities);
 }
 
 std::tuple<at::Tensor, at::Tensor, at::Tensor>
@@ -64,7 +67,8 @@ table_lookup_cpu_impl(at::Tensor table_storage, at::Tensor table_bucket_offsets,
              int64_t policy,
              std::optional<at::Tensor> ovf_storage,
              int64_t ovf_bucket_capacity,
-             std::optional<at::Tensor> ovf_output_offsets) {
+             std::optional<at::Tensor> ovf_output_offsets,
+             std::optional<at::Tensor> table_global_capacities) {
     TORCH_WARN_ONCE(
         "INFERENCE_EMB::table_lookup has no CPU kernel. "
         "Please move inputs to CUDA and load inference_emb_ops.so before calling this operator."

@@ -67,6 +67,58 @@ def dist_type_codes(
     return torch.tensor(codes, dtype=torch.int32, device=device)
 
 
+def routing_param_tensors(
+    dist_types: List[str],
+    routing_params: Optional[List[Tuple[int, int]]],
+    num_shards: int,
+    device: Optional[torch.device] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """The per-feature ``(global_capacity, shard_capacity)`` as two int64 tensors.
+
+    The parameters of the ``hash_bucket`` rule, in the same feature order as
+    :func:`dist_type_codes`; the kernel indexes all three with the same ``t``.
+    Built once, when the distributor is, and validated here on the host so the
+    per-batch kernel call stays free of checks and syncs: a ``hash_bucket``
+    feature needs both numbers positive, the global capacity a multiple of the
+    shard's, and ``ceil(global / shard) <= num_shards`` or the kernel would
+    name a shard that does not exist. Features under another rule carry
+    ``(0, 0)``, which the kernel does not read.
+    """
+    if routing_params is None:
+        routing_params = [(0, 0)] * len(dist_types)
+    if len(routing_params) != len(dist_types):
+        raise ValueError(
+            f"routing_params has {len(routing_params)} entries for "
+            f"{len(dist_types)} features"
+        )
+    global_caps: List[int] = []
+    shard_caps: List[int] = []
+    for t, (dist_type, (global_capacity, shard_capacity)) in enumerate(
+        zip(dist_types, routing_params)
+    ):
+        global_capacity, shard_capacity = int(global_capacity), int(shard_capacity)
+        if dist_type == "hash_bucket":
+            if global_capacity <= 0 or shard_capacity <= 0:
+                raise ValueError(
+                    f"feature {t} uses dist_type 'hash_bucket' and needs a "
+                    "positive global_capacity and shard_capacity, got "
+                    f"({global_capacity}, {shard_capacity})"
+                )
+            if -(-global_capacity // shard_capacity) > num_shards:
+                raise ValueError(
+                    f"feature {t}: global_capacity {global_capacity} over "
+                    f"shard_capacity {shard_capacity} needs "
+                    f"{-(-global_capacity // shard_capacity)} shards, but the "
+                    f"distributor has {num_shards}"
+                )
+        global_caps.append(global_capacity)
+        shard_caps.append(shard_capacity)
+    return (
+        torch.tensor(global_caps, dtype=torch.int64, device=device),
+        torch.tensor(shard_caps, dtype=torch.int64, device=device),
+    )
+
+
 def bucketize_kjt_before_all2all(
     kjt: KeyedJaggedTensor,
     num_buckets: int,
@@ -75,6 +127,8 @@ def bucketize_kjt_before_all2all(
     bucketize_pos: bool = False,
     block_bucketize_row_pos: Optional[List[torch.Tensor]] = None,
     dist_type_per_feature: Optional[torch.Tensor] = None,
+    global_capacity_per_feature: Optional[torch.Tensor] = None,
+    shard_capacity_per_feature: Optional[torch.Tensor] = None,
 ) -> Tuple[KeyedJaggedTensor, Optional[torch.Tensor]]:
     """
     Bucketizes the `values` in KeyedJaggedTensor into `num_buckets` buckets,
@@ -94,6 +148,10 @@ def bucketize_kjt_before_all2all(
         dist_type_per_feature (Optional[torch.Tensor]): int32 key -> rank rule per
             feature, from :func:`dist_type_codes`, in the same feature order as
             ``block_sizes`` -- the kernel indexes both with the same ``t``.
+        global_capacity_per_feature / shard_capacity_per_feature (Optional[torch.Tensor]):
+            int64 parameters of the ``hash_bucket`` rule per feature, from
+            :func:`routing_param_tensors`. Required when any feature uses that
+            rule; left ``None`` otherwise, the kernel gets zeros it never reads.
 
     Returns:
         Tuple[KeyedJaggedTensor, Optional[torch.Tensor]]: the bucketized `KeyedJaggedTensor` and the optional permute mapping from the unbucketized values to bucketized value.
@@ -110,6 +168,28 @@ def bucketize_kjt_before_all2all(
     )
     block_sizes_new_type = _fx_wrap_tensor_to_device_dtype(block_sizes, kjt.values())
     dist_type_t = dist_type_per_feature.to(device=kjt.values().device)
+    if global_capacity_per_feature is None or shard_capacity_per_feature is None:
+        # Only a caller outside the distributors gets here (they always pass
+        # both). A hash_bucket feature cannot be routed without them, and
+        # the kernel would divide by zero rather than say so -- check on the
+        # host instead, at the price of one sync on this path.
+        if bool((dist_type_t == DIST_TYPE_CODES["hash_bucket"]).any().item()):
+            raise ValueError(
+                "a feature uses dist_type 'hash_bucket', which needs "
+                "global_capacity_per_feature and shard_capacity_per_feature "
+                "(see routing_param_tensors)"
+            )
+        zeros = torch.zeros(num_features, dtype=torch.int64, device=kjt.values().device)
+        global_capacity_per_feature = zeros
+        shard_capacity_per_feature = zeros
+    assert_fx_safe(
+        global_capacity_per_feature.numel() == num_features
+        and shard_capacity_per_feature.numel() == num_features,
+        f"Expecting routing parameters for {num_features} features, but "
+        f"{global_capacity_per_feature.numel()}/{shard_capacity_per_feature.numel()} received.",
+    )
+    global_capacity_t = global_capacity_per_feature.to(device=kjt.values().device)
+    shard_capacity_t = shard_capacity_per_feature.to(device=kjt.values().device)
 
     (
         bucketized_lengths,
@@ -129,6 +209,8 @@ def bucketize_kjt_before_all2all(
         max_B=_fx_wrap_max_B(kjt),
         block_bucketize_pos=block_bucketize_row_pos,  # each tensor should have the same dtype as kjt.lengths()
         dist_type_per_feature=dist_type_t,
+        global_capacity_per_feature=global_capacity_t,
+        shard_capacity_per_feature=shard_capacity_t,
     )
 
     return (
@@ -263,6 +345,7 @@ class RwSparseFeaturesDist(_RwSparseFeaturesDist):
         need_pos: bool = False,
         dist_types: Optional[List[str]] = None,
         per_key_score: bool = False,
+        routing_params: Optional[List[Tuple[int, int]]] = None,
     ) -> None:
         super().__init__(
             pg=pg,
@@ -277,6 +360,17 @@ class RwSparseFeaturesDist(_RwSparseFeaturesDist):
             "_dist_type_tensor",
             dist_type_codes(dist_types, device=device),
             persistent=False,
+        )
+        # The hash_bucket parameters per feature (see routing_param_tensors),
+        # validated against this distributor's fan-out, the world.
+        global_capacity_tensor, shard_capacity_tensor = routing_param_tensors(
+            dist_types, routing_params, self._world_size, device=device
+        )
+        self.register_buffer(
+            "_global_capacity_tensor", global_capacity_tensor, persistent=False
+        )
+        self.register_buffer(
+            "_shard_capacity_tensor", shard_capacity_tensor, persistent=False
         )
         self._score_dist: Optional[KJTAllToAll] = (
             KJTAllToAll(pg=pg, splits=[num_features] * pg.size())
@@ -310,6 +404,8 @@ class RwSparseFeaturesDist(_RwSparseFeaturesDist):
                 else self._need_pos
             ),
             dist_type_per_feature=self._dist_type_tensor,
+            global_capacity_per_feature=self._global_capacity_tensor,
+            shard_capacity_per_feature=self._shard_capacity_tensor,
         )
         self.unbucketize_permute_tensor = (
             unbucketize_permute if self._is_sequence else None

@@ -108,13 +108,8 @@ __global__ void table_lookup_kernel(
     if (Bucket::is_valid(key)) {
       hashcode = Table::hash(key);
       t_id = table_ids[i];
-      bkt_begin = table_bucket_offsets[t_id];
-      int64_t bkt_end = table_bucket_offsets[t_id + 1];
-      table_cap = (bkt_end - bkt_begin) * table.bucket_capacity();
-      if (table_cap > 0) {
-        int64_t local_idx = hashcode % table_cap;
-        bucket_id = bkt_begin + local_idx / table.bucket_capacity();
-      }
+      table.home_bucket(table_bucket_offsets, t_id, hashcode, &bucket_id,
+                        &bkt_begin, &table_cap);
     }
     if (table_cap == 0) {
       score_output[i] = static_cast<int64_t>(score);
@@ -395,13 +390,8 @@ insert_body(Table table, int64_t const *__restrict__ table_bucket_offsets,
     if (Bucket::is_valid(key)) {
       hashcode = Table::hash(key);
       int64_t t_id = table_ids[i];
-      bkt_begin = table_bucket_offsets[t_id];
-      int64_t bkt_end = table_bucket_offsets[t_id + 1];
-      table_cap = (bkt_end - bkt_begin) * table.bucket_capacity();
-      if (table_cap > 0) {
-        int64_t local_idx = hashcode % table_cap;
-        bucket_id = bkt_begin + local_idx / table.bucket_capacity();
-      }
+      table.home_bucket(table_bucket_offsets, t_id, hashcode, &bucket_id,
+                        &bkt_begin, &table_cap);
     }
     if (table_cap == 0) {
       if constexpr (OutputScore) {
@@ -569,13 +559,8 @@ __device__ __forceinline__ void insert_and_evict_body(
     if (Bucket::is_valid(key)) {
       hashcode = Table::hash(key);
       t_id = table_ids[i];
-      bkt_begin = table_bucket_offsets[t_id];
-      int64_t bkt_end = table_bucket_offsets[t_id + 1];
-      table_cap = (bkt_end - bkt_begin) * table.bucket_capacity();
-      if (table_cap > 0) {
-        int64_t local_idx = hashcode % table_cap;
-        bucket_id = bkt_begin + local_idx / table.bucket_capacity();
-      }
+      table.home_bucket(table_bucket_offsets, t_id, hashcode, &bucket_id,
+                        &bkt_begin, &table_cap);
     }
     InsertResult result = InsertResult::Illegal;
     Bucket bucket = table[bucket_id];
@@ -783,13 +768,8 @@ __global__ void table_erase_kernel(
     if (Bucket::is_valid(key)) {
       hashcode = Table::hash(key);
       int64_t t_id = table_ids[i];
-      bkt_begin = table_bucket_offsets[t_id];
-      int64_t bkt_end = table_bucket_offsets[t_id + 1];
-      table_cap = (bkt_end - bkt_begin) * table.bucket_capacity();
-      if (table_cap > 0) {
-        int64_t local_idx = hashcode % table_cap;
-        bucket_id = bkt_begin + local_idx / table.bucket_capacity();
-      }
+      table.home_bucket(table_bucket_offsets, t_id, hashcode, &bucket_id,
+                        &bkt_begin, &table_cap);
     }
     if (table_cap == 0) {
       if (indices) {
@@ -1127,20 +1107,20 @@ __global__ void scatter_keys_at_slots_kernel(
 
     int64_t bc = table.bucket_capacity();
     int64_t t_id = table_ids[i];
-    int64_t bkt_begin = table_bucket_offsets[t_id];
-    int64_t bkt_end = table_bucket_offsets[t_id + 1];
-    int64_t table_cap = (bkt_end - bkt_begin) * bc;
+    int64_t hashcode = Table::hash(key);
+    int64_t bucket_id = 0;
+    int64_t bkt_begin = 0;
+    int64_t table_cap = 0;
+    table.home_bucket(table_bucket_offsets, t_id, hashcode, &bucket_id,
+                      &bkt_begin, &table_cap);
     if (table_cap <= 0 || slot >= table_cap)
       continue;
 
     // The slot must land in the key's home bucket, otherwise no lookup would
     // ever probe it. This is the per-key half of the layout-compatibility check.
-    int64_t hashcode = Table::hash(key);
-    int64_t home_local = (hashcode % table_cap) / bc;
+    int64_t home_local = bucket_id - bkt_begin;
     if (home_local != slot / bc)
       continue;
-
-    int64_t bucket_id = bkt_begin + home_local;
     Bucket bucket = table[bucket_id];
     int64_t ns = table.num_scores();
     Iter target = static_cast<Iter>(slot % bc);

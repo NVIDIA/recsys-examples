@@ -208,6 +208,26 @@ __launch_bounds__(kMaxThreads) void _populate_length_to_feature_id_inplace_kerne
   length_to_feature_idx[batch_size_offsets[t] + b] = t;
 }
 
+// The shard that owns a key under `hash_bucket`.
+//
+// The key's global bucket is `(h % global_capacity) / bucket_capacity` with
+// `h = murmur3_fmix64(key) & INT64_MAX` -- the same `h` the table hashes with
+// (LinearBucket::hash) and a capacity that is the whole table's, not one
+// shard's, so the bucket a key belongs to does not change with the number of
+// shards. Shard `r` holds the contiguous bucket range
+// `[r * buckets_per_shard, (r + 1) * buckets_per_shard)`, so the owner is the
+// quotient by `shard_capacity = buckets_per_shard * bucket_capacity`. The host
+// twin is `dynamicemb.key_ownership.owning_shard`; the two must agree key for
+// key. Both capacities are validated (> 0, ceil(global/shard) <= my_size) when
+// the distributor is built, not here.
+__device__ __forceinline__ uint64_t hashed_shard(uint64_t key,
+                                                 int64_t global_capacity,
+                                                 int64_t shard_capacity) {
+  uint64_t h = hash_key(key) & 0x7FFFFFFFFFFFFFFFull;
+  return (h % static_cast<uint64_t>(global_capacity)) /
+         static_cast<uint64_t>(shard_capacity);
+}
+
 // Kernel for bucketize lengths, with the Block distribution (vs. cyclic,
 // block-cyclic distribution). Used for bucketize sparse feature, especially for
 // checkpointing with row-wise partition (sparse_feature is partitioned
@@ -225,7 +245,9 @@ __launch_bounds__(kMaxThreads) void _block_bucketize_sparse_features_cuda_kernel
     const offset_t *const __restrict__ block_bucketize_pos_offsets,
     offset_t *__restrict__ indices_to_lb,
     // bool use_roundrobin) {
-    const int32_t *__restrict__ dist_type_per_feature) {
+    const int32_t *__restrict__ dist_type_per_feature,
+    const int64_t *__restrict__ global_capacity_per_feature,
+    const int64_t *__restrict__ shard_capacity_per_feature) {
   using uindex_t = std::make_unsigned_t<index_t>;
   const auto bt_start = blockIdx.x * blockDim.y + threadIdx.y;
   const auto stride = gridDim.x * blockDim.y;
@@ -255,6 +277,10 @@ __launch_bounds__(kMaxThreads) void _block_bucketize_sparse_features_cuda_kernel
         case DistType::kHashedCyclic:
           p = static_cast<uindex_t>(hash_key(static_cast<uint64_t>(idx))) %
               my_size;
+          break;
+        case DistType::kHashedBucket:
+          p = hashed_shard(idx, global_capacity_per_feature[t],
+                           shard_capacity_per_feature[t]);
           break;
         default: // DistType::kBlock
           p = idx < blk_size * my_size ? idx / blk_size : idx % my_size;
@@ -310,7 +336,9 @@ __launch_bounds__(kMaxThreads) void _block_bucketize_sparse_features_cuda_kernel
     const offset_t *const __restrict__ block_bucketize_pos_offsets,
     // const offset_t* const __restrict__ indices_to_lb,bool use_roundrobin) {
     const offset_t *const __restrict__ indices_to_lb,
-    const int32_t *__restrict__ dist_type_per_feature) {
+    const int32_t *__restrict__ dist_type_per_feature,
+    const int64_t *__restrict__ global_capacity_per_feature,
+    const int64_t *__restrict__ shard_capacity_per_feature) {
   using uindex_t = std::make_unsigned_t<index_t>;
   using uoffset_t = std::make_unsigned_t<offset_t>;
   CUDA_1D_KERNEL_LOOP(b_t, lengths_size) {
@@ -341,6 +369,11 @@ __launch_bounds__(kMaxThreads) void _block_bucketize_sparse_features_cuda_kernel
         case DistType::kHashedCyclic:
           p = static_cast<uindex_t>(hash_key(static_cast<uint64_t>(idx))) %
               my_size;
+          new_idx = idx;
+          break;
+        case DistType::kHashedBucket:
+          p = hashed_shard(idx, global_capacity_per_feature[t],
+                           shard_capacity_per_feature[t]);
           new_idx = idx;
           break;
         default: // DistType::kBlock
@@ -377,7 +410,9 @@ block_bucketize_sparse_features_cuda(
     const Tensor &lengths, const Tensor &indices, const bool bucketize_pos,
     const bool sequence,
     // const bool use_roundrobin,
-    const Tensor &dist_type_per_feature, const Tensor &block_sizes,
+    const Tensor &dist_type_per_feature,
+    const Tensor &global_capacity_per_feature,
+    const Tensor &shard_capacity_per_feature, const Tensor &block_sizes,
     const int64_t my_size, const c10::optional<Tensor> &weights,
     const c10::optional<Tensor> &batch_size_per_feature, const int64_t max_B,
     const c10::optional<std::vector<at::Tensor>> &block_bucketize_pos) {
@@ -388,6 +423,23 @@ block_bucketize_sparse_features_cuda(
   // allocate tensors and buffers
   const auto lengths_size = lengths.numel();
   const auto T = block_sizes.numel();
+  // Per-feature parameters of the hash_bucket rule (see hashed_shard).
+  // Entries of features with another dist_type are ignored. Only the shape and
+  // dtype are checked here -- the values are validated once, on the host,
+  // when the distributor is built, so this per-batch call stays sync-free.
+  TORCH_CHECK(global_capacity_per_feature.scalar_type() == at::kLong &&
+                  shard_capacity_per_feature.scalar_type() == at::kLong,
+              "global/shard_capacity_per_feature must be int64");
+  TORCH_CHECK(global_capacity_per_feature.numel() == T &&
+                  shard_capacity_per_feature.numel() == T,
+              "global/shard_capacity_per_feature must have one entry per "
+              "feature (",
+              T, ")");
+  TORCH_CHECK(global_capacity_per_feature.is_cuda() &&
+                  shard_capacity_per_feature.is_cuda(),
+              "global/shard_capacity_per_feature must be CUDA tensors");
+  auto global_capacity_contig = global_capacity_per_feature.contiguous();
+  auto shard_capacity_contig = shard_capacity_per_feature.contiguous();
   const auto B = lengths_size / T;
   const auto new_lengths_size = lengths_size * my_size;
   auto offsets = at::empty({lengths_size}, lengths.options());
@@ -482,7 +534,9 @@ block_bucketize_sparse_features_cuda(
                   block_bucketize_pos.has_value()
                       ? indices_to_lb.data_ptr<offset_t>()
                       : static_cast<offset_t *>(nullptr),
-                  dist_type_per_feature.data_ptr<int32_t>());
+                  dist_type_per_feature.data_ptr<int32_t>(),
+                  global_capacity_contig.data_ptr<int64_t>(),
+                  shard_capacity_contig.data_ptr<int64_t>());
               C10_CUDA_KERNEL_LAUNCH_CHECK();
             });
       });
@@ -538,7 +592,9 @@ block_bucketize_sparse_features_cuda(
                                 block_bucketize_pos.has_value()
                                     ? indices_to_lb.data_ptr<offset_t>()
                                     : static_cast<offset_t *>(nullptr),
-                                dist_type_per_feature.data_ptr<int32_t>());
+                                dist_type_per_feature.data_ptr<int32_t>(),
+                  global_capacity_contig.data_ptr<int64_t>(),
+                  shard_capacity_contig.data_ptr<int64_t>());
                         C10_CUDA_KERNEL_LAUNCH_CHECK();
                       });
                 });
@@ -585,7 +641,9 @@ block_bucketize_sparse_features_cuda(
                                 block_bucketize_pos.has_value()
                                     ? indices_to_lb.data_ptr<offset_t>()
                                     : static_cast<offset_t *>(nullptr),
-                                dist_type_per_feature.data_ptr<int32_t>());
+                                dist_type_per_feature.data_ptr<int32_t>(),
+                  global_capacity_contig.data_ptr<int64_t>(),
+                  shard_capacity_contig.data_ptr<int64_t>());
                         C10_CUDA_KERNEL_LAUNCH_CHECK();
                       });
                 });
@@ -622,7 +680,9 @@ block_bucketize_sparse_features_cuda(
                           block_bucketize_pos.has_value()
                               ? indices_to_lb.data_ptr<offset_t>()
                               : static_cast<offset_t *>(nullptr),
-                          dist_type_per_feature.data_ptr<int32_t>());
+                          dist_type_per_feature.data_ptr<int32_t>(),
+                  global_capacity_contig.data_ptr<int64_t>(),
+                  shard_capacity_contig.data_ptr<int64_t>());
                   C10_CUDA_KERNEL_LAUNCH_CHECK();
                 });
           });
@@ -656,7 +716,9 @@ block_bucketize_sparse_features_cuda(
                           block_bucketize_pos.has_value()
                               ? indices_to_lb.data_ptr<offset_t>()
                               : static_cast<offset_t *>(nullptr),
-                          dist_type_per_feature.data_ptr<int32_t>());
+                          dist_type_per_feature.data_ptr<int32_t>(),
+                  global_capacity_contig.data_ptr<int64_t>(),
+                  shard_capacity_contig.data_ptr<int64_t>());
                   C10_CUDA_KERNEL_LAUNCH_CHECK();
                 });
           });
@@ -705,7 +767,9 @@ block_bucketize_sparse_features_cuda(
                                 block_bucketize_pos.has_value()
                                     ? indices_to_lb.data_ptr<offset_t>()
                                     : static_cast<offset_t *>(nullptr),
-                                dist_type_per_feature.data_ptr<int32_t>());
+                                dist_type_per_feature.data_ptr<int32_t>(),
+                  global_capacity_contig.data_ptr<int64_t>(),
+                  shard_capacity_contig.data_ptr<int64_t>());
                         C10_CUDA_KERNEL_LAUNCH_CHECK();
                       });
                 });
@@ -752,7 +816,9 @@ block_bucketize_sparse_features_cuda(
                                 block_bucketize_pos.has_value()
                                     ? indices_to_lb.data_ptr<offset_t>()
                                     : static_cast<offset_t *>(nullptr),
-                                dist_type_per_feature.data_ptr<int32_t>());
+                                dist_type_per_feature.data_ptr<int32_t>(),
+                  global_capacity_contig.data_ptr<int64_t>(),
+                  shard_capacity_contig.data_ptr<int64_t>());
                         C10_CUDA_KERNEL_LAUNCH_CHECK();
                       });
                 });
@@ -788,7 +854,9 @@ block_bucketize_sparse_features_cuda(
                           block_bucketize_pos.has_value()
                               ? indices_to_lb.data_ptr<offset_t>()
                               : static_cast<offset_t *>(nullptr),
-                          dist_type_per_feature.data_ptr<int32_t>());
+                          dist_type_per_feature.data_ptr<int32_t>(),
+                  global_capacity_contig.data_ptr<int64_t>(),
+                  shard_capacity_contig.data_ptr<int64_t>());
                   C10_CUDA_KERNEL_LAUNCH_CHECK();
                 });
           });
@@ -822,7 +890,9 @@ block_bucketize_sparse_features_cuda(
                           block_bucketize_pos.has_value()
                               ? indices_to_lb.data_ptr<offset_t>()
                               : static_cast<offset_t *>(nullptr),
-                          dist_type_per_feature.data_ptr<int32_t>());
+                          dist_type_per_feature.data_ptr<int32_t>(),
+                  global_capacity_contig.data_ptr<int64_t>(),
+                  shard_capacity_contig.data_ptr<int64_t>());
                   C10_CUDA_KERNEL_LAUNCH_CHECK();
                 });
           });
@@ -841,7 +911,9 @@ void bind_bucktiz_kernel_op(py::module &m) {
         "Block bucketize sparse features in CUDA", py::arg("lengths"),
         py::arg("indices"), py::arg("bucketize_pos"), py::arg("sequence"),
         // py::arg("use_roundrobin"),
-        py::arg("dist_type_per_feature"), py::arg("block_sizes"),
+        py::arg("dist_type_per_feature"),
+        py::arg("global_capacity_per_feature"),
+        py::arg("shard_capacity_per_feature"), py::arg("block_sizes"),
         py::arg("my_size"), py::arg("weights") = py::none(),
         py::arg("batch_size_per_feature") = py::none(), py::arg("max_B"),
         py::arg("block_bucketize_pos") = py::none());
