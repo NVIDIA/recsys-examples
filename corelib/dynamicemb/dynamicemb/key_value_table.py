@@ -1138,9 +1138,17 @@ def _expand_if_need_no_eviction(
     keys_est, rows_est = state.estimated_table_sizes, state.estimated_row_counts
 
     def rows_short(rows: torch.Tensor) -> bool:
+        # A buffer that already has a row for every slot of the key map has nothing
+        # more to grow to (see _value_rows_target), so the rows it is asked for are no
+        # pressure: counting them would make every batch of a table that has settled
+        # at one row per slot ask the device for numbers that change nothing. The key
+        # map's own growth is checked apart, by get_expand_info, and when it grows the
+        # buffer is short of slots again.
         need = rows + unique_size_per_table
         return any(
-            int(need[i]) > state.tables[i].shape[0] for i in range(state.num_tables)
+            int(need[i]) > state.tables[i].shape[0]
+            and state.tables[i].shape[0] < state.key_index_map.per_table_capacity_[i]
+            for i in range(state.num_tables)
         )
 
     est_results, _ = get_expand_info(state, keys_est, unique_size_per_table)
