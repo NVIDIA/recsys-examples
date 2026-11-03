@@ -66,6 +66,33 @@ Notes:
   enabling multi-worker loading in CUDA + distributed setups.
 - Pick a value no larger than the CPU cores available per rank.
 
+- Erasing keys that have not been seen for a while (`--erase_interval`, `--erase_retention`):
+```shell
+export NGPU=2
+
+# every 100 batches, erase the keys that were not seen in the last 1000 batches
+torchrun --standalone --nproc_per_node=${NGPU} example.py --train --erase_interval 100 --erase_retention 1000
+
+# the same by the device clock: keys not seen for the last 60 seconds
+torchrun --standalone --nproc_per_node=${NGPU} example.py --train --score_strategy timestamp --erase_interval 100 --erase_retention 60
+```
+
+`--erase_interval N` asks, every N batches, for an [erase_by_score_async](../DynamicEmb_APIs.md#erase_by_score_async)
+of the keys whose score is below a threshold (default `0`: off). The call returns at once and the scan runs in the
+background of the training. `--erase_retention K` sets the threshold: a key is kept if it was seen within the last `K`
+batches (`--score_strategy step`, the default) or `K` seconds (`--score_strategy timestamp`). The example reads the
+tables' current score with `get_score` and erases what is below `score - K`, so nothing is erased until the run is
+older than `K`.
+
+Notes:
+- The MovieLens tables are small and nearly every key appears in every epoch, so with a `--erase_retention` longer than
+  an epoch nothing is old enough to erase. To see keys erased, use a retention shorter than an epoch.
+- Each epoch ends by waiting for the erase in flight, since an erase must not overlap an evaluation or a dump, and prints
+  what this rank erased (the call is local: each rank erases what it holds).
+- `--erase_interval` needs `--score_strategy step` or `timestamp` (not `lru_lfu`, whose `(TIMESTAMP, LFU)` tables cannot
+  be erased by either score), and cannot be combined with `--external_storage` or with `--incremental_dump`: an erase by
+  score is not recorded, so the deltas of a table it removed keys from cannot be replayed.
+
 - For detailed explanations of specific APIs and parameters, please refer to [API Doc](../DynamicEmb_APIs.md).
 
 - For usage of external storage, refer to the `PyDictStorage` demo in the [unit test](../test/test_batched_dynamic_embedding_tables_v2.py).

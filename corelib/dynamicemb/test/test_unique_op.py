@@ -544,3 +544,89 @@ def test_flagged_compact(setup_device, N, flag_mode, input_spec):
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+@pytest.mark.parametrize("reduce", ["sum", "max", "min"])
+@pytest.mark.parametrize("num_keys,key_range", [(1000, 100), (200000, 5000)])
+def test_segmented_unique_reduce(setup_device, reduce, num_keys, key_range):
+    """A repeated key's value is reduced by `reduce` (sum / max / min)."""
+    device = setup_device
+    num_tables = 3
+
+    keys_raw = torch.randint(
+        0, key_range, (num_keys,), dtype=torch.int64, device=device
+    )
+    table_assignments = torch.randint(
+        0, num_tables, (num_keys,), dtype=torch.int64, device=device
+    )
+    sort_idx, segmented_range = make_segmented_range(
+        table_assignments, num_tables, device
+    )
+    keys = keys_raw[sort_idx]
+    # Large non-negative values: a narrower accumulator would lose bits.
+    values = torch.randint(0, 2**40, (num_keys,), dtype=torch.int64, device=device)
+
+    num_uniques, unique_keys, output_indices, _, freq = segmented_unique_cuda(
+        keys, segmented_range, num_tables, values, reduce
+    )
+    torch.cuda.synchronize()
+
+    total_unique = num_uniques.item()
+    assert torch.equal(unique_keys[:total_unique][output_indices], keys)
+
+    # Reference: reduce `values` into the unique slot each input maps to.
+    ref_op = {"sum": "sum", "max": "amax", "min": "amin"}[reduce]
+    init = {"sum": 0, "max": 0, "min": 2**62}[reduce]
+    # Every unique slot has at least one occurrence, so include_self=False
+    # leaves no slot at `init`.
+    expected = torch.full((total_unique,), init, dtype=torch.int64, device=device)
+    expected.scatter_reduce_(
+        0, output_indices, values, reduce=ref_op, include_self=(reduce == "sum")
+    )
+    assert torch.equal(freq[:total_unique], expected)
+
+
+@pytest.mark.parametrize("reduce", ["max", "min"])
+def test_segmented_unique_reduce_without_input_frequencies(setup_device, reduce):
+    """No input values: every occurrence counts as 1, so max/min of any key is 1."""
+    device = setup_device
+    keys = torch.tensor([5, 5, 7, 5, 9, 9], dtype=torch.int64, device=device)
+    segmented_range = torch.tensor([0, 6], dtype=torch.int64, device=device)
+    empty = torch.empty(0, dtype=torch.int64, device=device)
+    num_uniques, _, _, _, freq = segmented_unique_cuda(
+        keys, segmented_range, 1, empty, reduce
+    )
+    torch.cuda.synchronize()
+    assert torch.equal(
+        freq[: num_uniques.item()],
+        torch.ones(num_uniques.item(), dtype=torch.int64, device=device),
+    )
+
+
+def test_segmented_unique_reduce_rejects_unknown(setup_device):
+    device = setup_device
+    keys = torch.tensor([1, 2], dtype=torch.int64, device=device)
+    segmented_range = torch.tensor([0, 2], dtype=torch.int64, device=device)
+    with pytest.raises(Exception, match="reduce must be"):
+        segmented_unique_cuda(
+            keys, segmented_range, 1, torch.empty(0, dtype=torch.int64, device=device), "avg"
+        )
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.int32])
+def test_segmented_unique_rejects_non_int64_frequencies(setup_device, dtype):
+    device = setup_device
+    keys = torch.tensor([1, 2, 1], dtype=torch.int64, device=device)
+    segmented_range = torch.tensor([0, 3], dtype=torch.int64, device=device)
+    freq = torch.ones(3, dtype=dtype, device=device)
+    with pytest.raises(Exception, match="must be int64"):
+        segmented_unique_cuda(keys, segmented_range, 1, freq)
+
+
+def test_segmented_unique_rejects_non_contiguous_frequencies(setup_device):
+    device = setup_device
+    keys = torch.tensor([1, 2, 1], dtype=torch.int64, device=device)
+    segmented_range = torch.tensor([0, 3], dtype=torch.int64, device=device)
+    freq = torch.ones(6, dtype=torch.int64, device=device)[::2]
+    with pytest.raises(Exception, match="must be contiguous"):
+        segmented_unique_cuda(keys, segmented_range, 1, freq)

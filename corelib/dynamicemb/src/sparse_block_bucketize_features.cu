@@ -506,7 +506,7 @@ block_bucketize_sparse_features_cuda(
             AT_DISPATCH_INDEX_TYPES(
                 indices_contig.scalar_type(),
                 "_bucketize_sparse_features_weight_cuda_kernel2_2", [&] {
-                  DYNAMICEMB_AT_DISPATCH_FLOAT_ONLY(
+                  DYNAMICEMB_AT_DISPATCH_FLOAT_OR_INT64(
                       weights_value.scalar_type(),
                       "_block_bucketize_sparse_features_cuda_weight_kernel2_3",
                       [&] {
@@ -554,7 +554,7 @@ block_bucketize_sparse_features_cuda(
             AT_DISPATCH_INDEX_TYPES(
                 indices_contig.scalar_type(),
                 "_bucketize_sparse_features_weight_cuda_kernel2_2", [&] {
-                  DYNAMICEMB_AT_DISPATCH_FLOAT_ONLY(
+                  DYNAMICEMB_AT_DISPATCH_FLOAT_OR_INT64(
                       weights_value.scalar_type(),
                       "_block_bucketize_sparse_features_cuda_weight_kernel2_3",
                       [&] {
@@ -674,7 +674,7 @@ block_bucketize_sparse_features_cuda(
             AT_DISPATCH_INDEX_TYPES(
                 indices_contig.scalar_type(),
                 "_bucketize_sparse_features_weight_cuda_kernel2_2", [&] {
-                  DYNAMICEMB_AT_DISPATCH_FLOAT_ONLY(
+                  DYNAMICEMB_AT_DISPATCH_FLOAT_OR_INT64(
                       weights_value.scalar_type(),
                       "_block_bucketize_sparse_features_cuda_weight_kernel2_3",
                       [&] {
@@ -721,7 +721,7 @@ block_bucketize_sparse_features_cuda(
             AT_DISPATCH_INDEX_TYPES(
                 indices_contig.scalar_type(),
                 "_bucketize_sparse_features_weight_cuda_kernel2_2", [&] {
-                  DYNAMICEMB_AT_DISPATCH_FLOAT_ONLY(
+                  DYNAMICEMB_AT_DISPATCH_FLOAT_OR_INT64(
                       weights_value.scalar_type(),
                       "_block_bucketize_sparse_features_cuda_weight_kernel2_3",
                       [&] {

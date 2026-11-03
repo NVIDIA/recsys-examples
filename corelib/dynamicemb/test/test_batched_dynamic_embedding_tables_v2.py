@@ -49,7 +49,6 @@ from dynamicemb.key_value_table import (
     DynamicEmbTableState,
     HybridStorage,
     Storage,
-    _flat_row_indices_from_slots_and_scores,
     export_keys_values_iter,
     load_from_flat,
     load_from_flat_single_table,
@@ -647,7 +646,7 @@ def _kim_scan_keys_embeddings_dict(
             if keys.numel() == 0:
                 continue
             scores = named_scores[score_name]
-            flat_rows = _flat_row_indices_from_slots_and_scores(state, indices, scores)
+            flat_rows = indices
             values = load_from_flat_single_table(state, flat_rows, tid)
             embeddings = values[:, :emb_dim_t].contiguous().to(device)
             keys_dev = keys.to(device=device)
@@ -1239,9 +1238,7 @@ class PyDictStorage(Storage[DynamicEmbTableOptions, BaseDynamicEmbeddingOptimize
                         n, value_dim, dtype=torch.float32, device=self.device
                     )
                     values[:, :dim] = embeddings
-                    self.optimizer.reset_optimizer_states(
-                        values[:, dim:], emb_dims=dim
-                    )
+                    self.optimizer.reset_optimizer_states(values[:, dim:], emb_dims=dim)
                 else:
                     values = embeddings
 

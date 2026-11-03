@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from .async_erase import EraseHandle, erase_by_score_async
 from .dump_load import DynamicEmbDump, DynamicEmbLoad
 from .dynamicemb_config import (
     BATCH_SIZE_PER_DUMP,
@@ -46,6 +47,7 @@ from .incremental_dump import (
     replay_increment,
 )
 from .optimizer import DynamicEmbOptimType, EmbOptimType, OptimizerArgs
+from .scored_kjt import ScoredKeyedJaggedTensor
 from .types import (
     BUCKET_ALIGNMENT,
     DEMB_TABLE_ALIGN_SIZE,
@@ -84,6 +86,7 @@ __all__ = [
     "EvictedItemMode",
     "ReplayContent",
     "ScoreStrategy",
+    "ScoredKeyedJaggedTensor",
     "BATCH_SIZE_PER_DUMP",
     "data_type_to_dyn_emb",
     "data_type_to_dtype",
@@ -92,6 +95,8 @@ __all__ = [
     "string_to_evict_strategy",
     "DynamicEmbDump",
     "DynamicEmbLoad",
+    "EraseHandle",
+    "erase_by_score_async",
     "DeltaDumpResult",
     "ReplayStats",
     "pop_erased_keys",

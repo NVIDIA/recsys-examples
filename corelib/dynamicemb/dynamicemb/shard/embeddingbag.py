@@ -37,6 +37,8 @@ from torchrec.modules.embedding_modules import EmbeddingBagCollection
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 
 from ..dynamicemb_config import DynamicEmbKernel
+from ..scored_kjt import without_scores
+from .per_key_score import collect_per_key_score, require_scores
 from .rw_sharding import RwPooledDynamicEmbeddingSharding
 from .twrw_sharding import TwRwPooledDynamicEmbeddingSharding
 
@@ -45,6 +47,23 @@ class ShardedDynamicEmbeddingBagCollection(ShardedEmbeddingBagCollection):
     supported_compute_kernels: List[str] = [
         kernel.value for kernel in EmbeddingComputeKernel
     ] + [DynamicEmbKernel]
+
+    def __init__(self, *args, per_key_score: bool = False, **kwargs):
+        super().__init__(*args, **kwargs)
+        # Whether this collection's tables take a score per key; the same on every
+        # rank. See :func:`collect_per_key_score`.
+        self._per_key_score = per_key_score
+
+    def input_dist(self, ctx, features):
+        if self._per_key_score:
+            if self.training:
+                require_scores(features)
+            else:
+                # Evaluation reads no score, so it does not have to be given
+                # any; one given is dropped here, on every rank alike, so the
+                # ranks agree on whether the distribution sends scores.
+                features = without_scores(features)
+        return super().input_dist(ctx, features)
 
     def reset_parameters(self) -> None:
         # TorchRec registers an empty weight for shards a rank does not hold but
@@ -130,6 +149,7 @@ class DynamicEmbeddingBagCollectionSharder(EmbeddingBagCollectionSharder):
         device: Optional[torch.device] = None,
         module_fqn: Optional[str] = None,
     ) -> ShardedEmbeddingBagCollection:
+        per_key_score = collect_per_key_score(params)
         return ShardedDynamicEmbeddingBagCollection(
             module=module,
             table_name_to_parameter_sharding=params,
@@ -138,4 +158,5 @@ class DynamicEmbeddingBagCollectionSharder(EmbeddingBagCollectionSharder):
             device=device,
             qcomm_codecs_registry=self.qcomm_codecs_registry,
             module_fqn=module_fqn,
+            per_key_score=per_key_score,
         )

@@ -146,6 +146,16 @@ void bind_table_operation(py::module &m) {
         py::arg("threshold") = py::none(), py::arg("table_begin") = 0,
         py::arg("num_scores") = 1, py::arg("score_index") = 0);
 
+  m.def("table_erase_by_score", &dyn_emb::table_erase_by_score,
+        "erase the keys of the slots [begin, end) whose score is below the "
+        "threshold, sparing slots a ref counter pins; adds [erased, spared] to "
+        "counts",
+        py::arg("table_storage"), py::arg("key_dtype"),
+        py::arg("bucket_capacity"), py::arg("bucket_sizes"), py::arg("counter"),
+        py::arg("threshold"), py::arg("begin"), py::arg("end"),
+        py::arg("num_scores"), py::arg("score_index"), py::arg("counts"),
+        py::call_guard<py::gil_scoped_release>());
+
   m.def("table_count_matched", &dyn_emb::table_count_matched,
         "count number of items in the table whose scores >= threshold",
         py::arg("table_storage"), py::arg("key_dtype"),
@@ -199,10 +209,35 @@ void bind_table_operation(py::module &m) {
         py::arg("overflow_output_offsets") = py::none(),
         py::arg("overflow_bucket_capacity") = 0);
 
-  m.def("no_eviction_assign_scores", &dyn_emb::no_eviction_assign_scores,
-        "Assign per-table monotonic scores via atomicAdd on "
-        "no_eviction_next_index_dev; mutates no_eviction_next_index_dev.",
-        py::arg("no_eviction_next_index_dev"), py::arg("table_ids"));
+  m.def("table_resolve_rows", &dyn_emb::table_resolve_rows,
+        "map table-relative hash slots to the value rows they own, "
+        "allocating the next row of the table for a slot without one when "
+        "allocate is set (asserting it is below the table's row limit)",
+        py::arg("rows"), py::arg("row_counters"), py::arg("row_limits"),
+        py::arg("table_bucket_offsets"), py::arg("bucket_capacity"),
+        py::arg("slots"), py::arg("table_ids"), py::arg("allocate"));
+
+  m.def("table_collect_reclaimed_rows", &dyn_emb::table_collect_reclaimed_rows,
+        "rows owned by the reclaimed slots of a bucket range; num_rows is "
+        "how many there are",
+        py::arg("keys"), py::arg("rows"), py::arg("bkt_begin"),
+        py::arg("bkt_end"), py::arg("bucket_capacity"), py::arg("num_rows"));
+
+  m.def("table_place_reclaimed_rows", &dyn_emb::table_place_reclaimed_rows,
+        "place carried rows into free slots of a bucket range, marking the "
+        "slots reclaimed (key and digest)",
+        py::arg("keys"), py::arg("digests"), py::arg("rows"),
+        py::arg("carried"), py::arg("bkt_begin"), py::arg("bkt_end"),
+        py::arg("bucket_capacity"));
+
+  m.def("table_restore_reclaimed_slots",
+        &dyn_emb::table_restore_reclaimed_slots,
+        "restore the reclaimed slots named by [n, 2] (slot, row), "
+        "owning their rows, on a replica; a live key still in a slot is erased",
+        py::arg("table_storage"), py::arg("table_bucket_offsets"),
+        py::arg("bucket_capacity"), py::arg("bucket_sizes"), py::arg("rows"),
+        py::arg("slot_index"), py::arg("table_id"), py::arg("num_scores"),
+        py::arg("key_dtype"));
 
   // --- LruLfu eviction JIT (see jit_link.h) ---
   m.def(
@@ -234,6 +269,7 @@ void bind_table_operation(py::module &m) {
       .value("ACCUMULATE", dyn_emb::ScorePolicyType::Accumulate)
       .value("GLOBAL_TIMER", dyn_emb::ScorePolicyType::GlobalTimer)
       .value("LRU_LFU", dyn_emb::ScorePolicyType::LruLfu)
+      .value("FLAG", dyn_emb::ScorePolicyType::Flag)
       .export_values();
 
   py::enum_<dyn_emb::InsertResult>(m, "InsertResult")

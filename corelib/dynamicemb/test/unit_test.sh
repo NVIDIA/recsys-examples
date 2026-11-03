@@ -1,6 +1,7 @@
 set -e
 FWD_BWD_TEST_FILES=(
     "test/unit_tests/table_operation/test_table_operation.sh"
+    "test/unit_tests/erase_async/test_erase_async.sh"
     "test/unit_tests/retain_evicted_keys/test_retain_evicted_keys.sh"
     "test/unit_tests/test_hybrid_storage_export.sh"
     "test/unit_tests/test_lfu_scores.sh"
@@ -21,6 +22,11 @@ FWD_BWD_TEST_FILES=(
     "test/unit_tests/optimizer/test_rowwise_adagrad_state_precision.py"
     "test/unit_tests/test_no_eviction_row_indexing.py"
     "test/unit_tests/test_expansion_value_capacity.py"
+    "test/unit_tests/test_table_rows.py"
+    "test/unit_tests/test_int64_weights_channel.py"
+    "test/unit_tests/test_frequency_requirements.py"
+    "test/unit_tests/test_frequency_counter_guard.py"
+    "test/unit_tests/per_key_score/test_per_key_score.sh"
     "test/unit_tests/test_planner_plan_cost.py"
     "test/unit_tests/test_planner_placement.py"
     "test/unit_tests/test_table_row_wise.sh"

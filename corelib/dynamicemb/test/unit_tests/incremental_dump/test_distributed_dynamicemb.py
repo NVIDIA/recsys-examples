@@ -28,6 +28,7 @@ from dynamicemb import (
     DynamicEmbScoreStrategy,
     DynamicEmbTableOptions,
 )
+from dynamicemb.dump_load import get_dynamic_emb_module
 from dynamicemb.dynamicemb_config import ScoreStrategy
 from dynamicemb.incremental_dump import (
     get_score,
@@ -524,3 +525,70 @@ def test_replay_increment_distributed(
     assert set(served.keys()) == set(trained.keys())
     for feature in trained:
         torch.testing.assert_close(served[feature], trained[feature])
+
+
+def test_erase_untracked_is_the_groups_not_one_ranks(request, backend_session):
+    """A delta gathers every rank's keys and slots, and is then handed whole to
+    every receiver, so a rank that erased keys without retaining them has to taint
+    it even when the rank whose copy is shipped did not. Otherwise the receiver
+    replays a delta that is missing the reclaimed slots those erases left."""
+    if dist.get_world_size() < 2:
+        pytest.skip("needs a second rank to erase on")
+    local_rank = int(os.environ["LOCAL_RANK"])
+    device = torch.device(f"cuda:{local_rank}")
+    table_names = ["t_0", "t_1"]
+    dim, local_batch = 8, 64
+    eb_configs = [
+        torchrec.EmbeddingConfig(
+            name=name,
+            embedding_dim=dim,
+            num_embeddings=BATCH_SIZE_PER_DUMP * 8,
+            feature_names=[f"f_{t}"],
+        )
+        for t, name in enumerate(table_names)
+    ]
+    strategies = [DynamicEmbScoreStrategy.TIMESTAMP] * len(table_names)
+    train_model = _build_sharded_model(
+        table_names, eb_configs, strategies, local_batch, dim, device
+    )
+    serve_model = _build_sharded_model(
+        table_names, eb_configs, strategies, local_batch, dim, device, training=False
+    )
+    serve_model.eval()
+
+    sparse_feature = generate_sparse_feature(
+        [f"f_{t}" for t in range(len(table_names))],
+        [1] * len(table_names),
+        local_batch,
+        [set({}) for _ in table_names],
+        [True] * len(table_names),
+        [BATCH_SIZE_PER_DUMP * 8] * len(table_names),
+    )
+    train_model(sparse_feature)
+
+    pg = intra_and_cross_node_pg()[0]
+    prefix_path = "model"
+    everything = incremental_dump(train_model, 0, pg)[prefix_path]
+
+    # Rank 1, and only rank 1, erases table t_0's keys without RETAIN_KEY. The
+    # keys it does not own are simply absent from its table.
+    if dist.get_rank() == 1:
+        j = everything.table_names.index("t_0")
+        keys = everything.keys[j].to(device)
+        modules = get_dynamic_emb_module(train_model)
+        assert modules, "no dynamic embedding module found in the model"
+        for module in modules:
+            table_id = module._table_names.index("t_0")
+            assert module._storage.erase_keys(table_id, keys) > 0
+
+    deltas = incremental_dump(train_model, 0, pg)
+    delta = deltas[prefix_path]
+    flags = {
+        name: delta.meta[j]["erase_untracked"]
+        for j, name in enumerate(delta.table_names)
+    }
+    # Every rank sees rank 1's erase, and only on the table it touched.
+    assert flags == {"t_0": True, "t_1": False}, flags
+
+    with pytest.raises(ValueError, match="without retaining"):
+        replay_increment(serve_model, deltas)

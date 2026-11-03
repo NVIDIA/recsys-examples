@@ -17,6 +17,7 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 
 #pragma once
 
+#include "jit/evict_comparators.cuh"
 #include "types.cuh"
 #include <cub/cub.cuh>
 
@@ -228,13 +229,27 @@ insert_probe(Bucket &bucket, KeyType key, int *__restrict__ bucket_sizes,
 // score-word reduce() (used by every AoT instantiation; cur_ts/gamma ignored).
 // RankedEvictor<Comparator> drives reduce_ranked<Comparator>() (the LruLfu cubin;
 // e.g. LexFreqTsComparator or UserFnComparator).
+//
+// The AoT kernels are selected by the score POLICY of the call, not by the
+// table layout, so a 2-word (LruLfu) table still reaches DefaultEvictor
+// whenever the caller passes CONST or ASSIGN: load placement, backward
+// refresh (preserve_existing), rehash, ScoredHashTable.load. reduce() cannot
+// read the 2-word layout, so for num_scores == 2 DefaultEvictor ranks victims
+// with the default LruLfu comparator (frequency asc, then timestamp asc).
+// Paths that must honor a custom score_function go through the cubin instead.
 struct DefaultEvictor {
   template <int ReductionGroupSize, int BufferDim, typename Bucket>
   __forceinline__ __device__ bool
   operator()(Bucket &bucket, typename Bucket::Iterator &iter,
              typename Bucket::KeyType &evict_key, ScoreType &evict_score,
              ScoreType *sm_scores, int32_t const *__restrict__ counter,
-             int64_t counter_offset, uint64_t /*cur_ts*/) const {
+             int64_t counter_offset, uint64_t cur_ts) const {
+    if (bucket.num_scores() == 2) {
+      return bucket.template reduce_ranked<LexFreqTsComparator,
+                                           ReductionGroupSize, BufferDim>(
+          iter, evict_key, evict_score, sm_scores, counter, counter_offset,
+          cur_ts);
+    }
     return bucket.template reduce<ReductionGroupSize, BufferDim>(
         iter, evict_key, evict_score, sm_scores, counter, counter_offset);
   }
@@ -279,7 +294,7 @@ insert(Bucket &bucket, KeyType key, ScoreType score,
       if (bucket.try_lock(iter, evict_key)) {
         if (evict_key != Bucket::reclaimed_key()) {
           int64_t flat_idx = counter_offset + iter;
-          if (::atomicAdd(&counter[flat_idx], 0) > 0) {
+          if (counter != nullptr && ::atomicAdd(&counter[flat_idx], 0) > 0) {
             bucket.unlock(iter, evict_key);
             continue;
           }
@@ -405,7 +420,8 @@ insert_body(Table table, int64_t const *__restrict__ table_bucket_offsets,
     Iter iter = Iter(hashcode % table.bucket_capacity());
     insert_probe<ProbingGroupSize>(bucket, key, bucket_sizes, bucket_id, iter,
                                    &iter, &result);
-    int64_t counter_offset = (bucket_id - bkt_begin) * bucket.capacity();
+    // Reference counters span all tables; only output indices are table-local.
+    int64_t counter_offset = bucket_id * bucket.capacity();
     KeyType evict_key = KeyType();
     insert<ReductionGroupSize, BufferDim, Policy, Evictor>(
         bucket, key, score, bucket_sizes, bucket_id, iter, sm_scores, result,
@@ -573,7 +589,8 @@ __device__ __forceinline__ void insert_and_evict_body(
                                      &iter, &result);
 
       {
-        int64_t counter_offset = (bucket_id - bkt_begin) * bucket.capacity();
+        // Match update_counter_with_layout_kernel's global main-table index.
+        int64_t counter_offset = bucket_id * bucket.capacity();
         insert<ReductionGroupSize, BufferDim, Policy, Evictor>(
             bucket, key, score, bucket_sizes, bucket_id, iter, sm_scores,
             result, &iter, &result, &evict_key, &evict_score, counter,
@@ -790,8 +807,13 @@ __global__ void table_erase_kernel(
     if (found) {
       KeyType expected_key = key;
       if (bucket.try_lock(iter, expected_key)) {
-        *bucket.scores(iter) = ScoreType();
-        *bucket.digests(iter) = Bucket::empty_digest();
+        // Clear the whole (AoS-contiguous) score block, not just word 0:
+        // reduce_ranked() ranks a reclaimed slot by its words, so a stale
+        // LruLfu frequency would make the free slot lose to live keys.
+        ScoreType *sblk = bucket.scores(iter);
+        for (int64_t s = 0; s < bucket.num_scores(); ++s)
+          sblk[s] = ScoreType();
+        *bucket.digests(iter) = Bucket::reclaimed_digest();
 
         bucket.unlock(iter, Bucket::reclaimed_key());
         atomicSub(bucket_sizes + bucket_id, 1);
@@ -805,6 +827,97 @@ __global__ void table_erase_kernel(
     }
     if (indices) {
       indices[i] = index;
+    }
+  }
+}
+
+// Whether a prefetched batch is using the slot: its ref counter is above zero.
+// ``counter`` is indexed by the global slot, and is null for a storage that keeps
+// none, where nothing is ever pinned. A plain (volatile) read is enough: nothing
+// writes the counters while an erase runs, a prefetch being kept out by the lock.
+__device__ __forceinline__ bool slot_is_pinned(int32_t const *counter,
+                                               int64_t slot) {
+  return counter != nullptr &&
+         *static_cast<volatile int32_t const *>(counter + slot) > 0;
+}
+
+// Erase every key of the slots [begin, end) whose score is below ``threshold``.
+//
+// The slots are global (the tables of a storage share one array, table t's
+// buckets start at table_bucket_offsets[t]); the caller picks a range inside one
+// table. Only the key, digest and score arrays are touched: no value, no row.
+//
+// A slot is locked with the same compare-and-swap an insert or a lookup that
+// updates a score takes, and its score is read again under the lock: a lookup
+// rewrites it under that lock, so a key read as old a moment ago may just have been
+// used. A slot whose ref counter is above zero is in use by a prefetched batch and
+// is spared -- the same test the evict kernel makes. ``counter`` is indexed by the
+// global slot, which is what ``increment_counter`` writes; it is null for a storage
+// that keeps no counter (nothing there is ever pinned).
+//
+// ``num_erased`` / ``num_spared`` are added to. Counted a tile at a time, so the
+// atomics are few even when every key matches.
+template <typename Table, int TileSize>
+__global__ void table_erase_by_score_kernel(
+    Table table, IndexType begin, IndexType end, ScoreType threshold,
+    int64_t score_index, int *__restrict__ bucket_sizes,
+    int32_t const *__restrict__ counter, CounterType *__restrict__ num_erased,
+    CounterType *__restrict__ num_spared) {
+  using KeyType = typename Table::KeyType;
+  using Bucket = typename Table::BucketType;
+  using Iter = typename Bucket::Iterator;
+
+  cg::thread_block_tile<TileSize> g =
+      cg::tiled_partition<TileSize>(cg::this_thread_block());
+
+  auto tid = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  // 64-bit: gridDim.x * blockDim.x alone is an unsigned 32-bit product, which wraps
+  // for a grid of 2^24 blocks or more. A multiple of 32, so a tile's lanes still
+  // take the same steps.
+  const int64_t stride = static_cast<int64_t>(gridDim.x) * blockDim.x;
+
+  for (int64_t i = begin + tid; i < end; i += stride) {
+
+    int64_t bucket_id = i / table.bucket_capacity();
+    Bucket bucket = table[bucket_id];
+    Iter iter = Iter(i % bucket.capacity());
+
+    bool erased = false;
+    bool spared = false;
+
+    KeyType key = *bucket.keys(iter);
+    if (Bucket::is_valid(key) &&
+        *bucket.scores(iter, score_index) < threshold) {
+      KeyType expected_key = key;
+      if (bucket.try_lock(iter, expected_key)) {
+        if (*bucket.scores(iter, score_index) >= threshold) {
+          // Used since it was read: keep it.
+          bucket.unlock(iter, key);
+        } else if (slot_is_pinned(counter, i)) {
+          bucket.unlock(iter, key);
+          spared = true;
+        } else {
+          // As table_erase_kernel: clear the whole score block, so that a
+          // reclaimed slot ranks below the keys in use, then leave the slot
+          // reclaimed (it keeps its value row).
+          ScoreType *sblk = bucket.scores(iter);
+          for (int64_t s = 0; s < bucket.num_scores(); ++s)
+            sblk[s] = ScoreType();
+          *bucket.digests(iter) = Bucket::reclaimed_digest();
+          bucket.unlock(iter, Bucket::reclaimed_key());
+          atomicSub(bucket_sizes + bucket_id, 1);
+          erased = true;
+        }
+      }
+    }
+
+    uint32_t erased_vote = g.ballot(erased);
+    uint32_t spared_vote = g.ballot(spared);
+    if (g.thread_rank() == 0) {
+      if (erased_vote)
+        atomicAdd(num_erased, static_cast<CounterType>(__popc(erased_vote)));
+      if (spared_vote)
+        atomicAdd(num_spared, static_cast<CounterType>(__popc(spared_vote)));
     }
   }
 }
