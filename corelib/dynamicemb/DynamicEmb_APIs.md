@@ -215,6 +215,8 @@ A `TableKey` is the pair `(collection, name)` -- the collection being the path t
 
 Inherits from TorchREC's `EmbeddingCollectionSharder` and is used in exactly the same way. This API mainly overrides the deduplication process of indices through inheritance, making it compatible with dynamic embedding tables.
 
+With `use_index_dedup=True`, each rank deduplicates its indices per table before the input distribution. The indices may be int32 or int64. int32 indices are deduplicated as int64, the keys the tables store, and are passed on as int32.
+
     ```python
     #How to import
     from dynamicemb.shard import DynamicEmbeddingCollectionSharder

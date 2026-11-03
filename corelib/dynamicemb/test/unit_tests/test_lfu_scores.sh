@@ -128,6 +128,54 @@ for dedup_flag in "${DEDUP_FLAGS[@]}"; do
 done
 
 
+# int32 keys, with and without index dedup and a cache: the score must equal
+# the true access count, as it does for int64 keys.
+for dedup_flag in "${DEDUP_FLAGS[@]}"; do
+  dedup_label=$( [ "$dedup_flag" = "--use-index-dedup" ] && echo "dedup" || echo "no-dedup" )
+  for num_gpus in ${NUM_GPUS[@]}; do
+    echo ""
+    echo "----------------------------------------"
+    echo "Test: Storage-Only + int32 keys ($dedup_label) | GPUs: $num_gpus | Optimizer: sgd"
+    echo "----------------------------------------"
+    torchrun \
+      --nnodes 1 \
+      --nproc_per_node $num_gpus \
+      ./test/unit_tests/test_lfu_scores.py \
+      --num-embedding-collections $NUM_EMBEDDING_COLLECTIONS \
+      --num-embeddings $NUM_EMBEDDINGS \
+      --multi-hot-sizes $MULTI_HOT_SIZES \
+      --embedding-dim $EMBEDDING_DIM \
+      --optimizer-type sgd \
+      --batch-size $BATCH_SIZE \
+      --num-iterations $NUM_ITERATIONS \
+      --tolerance $TOLERANCE \
+      --key-dtype int32 \
+      $dedup_flag || exit 1
+
+    echo ""
+    echo "----------------------------------------"
+    echo "Test: Cache+Storage + int32 keys ($dedup_label) | GPUs: $num_gpus | Optimizer: sgd | Cache Ratio: $CACHE_CAPACITY_RATIO"
+    echo "----------------------------------------"
+    torchrun \
+      --nnodes 1 \
+      --nproc_per_node $num_gpus \
+      ./test/unit_tests/test_lfu_scores.py \
+      --num-embedding-collections $NUM_EMBEDDING_COLLECTIONS \
+      --num-embeddings $NUM_EMBEDDINGS \
+      --multi-hot-sizes $MULTI_HOT_SIZES \
+      --embedding-dim $EMBEDDING_DIM \
+      --optimizer-type sgd \
+      --batch-size $BATCH_SIZE \
+      --num-iterations $NUM_ITERATIONS \
+      --tolerance $TOLERANCE \
+      --caching \
+      --cache-capacity-ratio $CACHE_CAPACITY_RATIO \
+      --key-dtype int32 \
+      $dedup_flag || exit 1
+  done
+done
+
+
 # High-frequency test: more iterations to test frequency accumulation
 
 HIGH_FREQ_ITERATIONS=50

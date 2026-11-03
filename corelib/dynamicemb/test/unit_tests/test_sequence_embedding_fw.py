@@ -29,6 +29,7 @@ from dynamicemb import (
     DynamicEmbInitializerMode,
     DynamicEmbTableOptions,
 )
+from dynamicemb.dynamicemb_config import DEBUG_EMB_INITIALIZER_MOD
 from dynamicemb.planner import (
     DynamicEmbeddingShardingPlanner,
     DynamicEmbParameterConstraints,
@@ -173,6 +174,15 @@ def generate_sparse_feature(
     )
 
 
+def with_key_dtype(features: torchrec.KeyedJaggedTensor, key_dtype: torch.dtype):
+    """The same features, with their keys in ``key_dtype``."""
+    return torchrec.KeyedJaggedTensor(
+        keys=features.keys(),
+        values=features.values().to(key_dtype),
+        lengths=features.lengths(),
+    )
+
+
 def run(args):
     backend = "nccl"
     dist.init_process_group(backend=backend)
@@ -285,6 +295,16 @@ def run(args):
 
     debugger = Debugger()
 
+    # The features get_planner puts on DynamicEmb tables. Their rows start at
+    # the DEBUG initializer's value.
+    data_parallel_embeddings = args.data_parallel_embeddings or []
+    dynamicemb_features = [
+        feature_idx_to_name(feature_idx)
+        for feature_idx in range(args.num_embedding_table)
+        if feature_idx < args.dynamicemb_num
+        and feature_idx not in data_parallel_embeddings
+    ]
+
     local_batch_size = args.batch_size // world_size
 
     for i in range(args.num_iterations + 1):
@@ -318,6 +338,30 @@ def run(args):
                     local_batch_size=local_batch_size,
                 )
         ret = model(sparse_feature)  # => this is awaitable
+        if args.key_dtype == "int32":
+            # The same keys as int32 must look up the same embeddings. On the
+            # last iteration rank 0 has no keys while the other ranks have some.
+            ret_int32 = model(with_key_dtype(sparse_feature, torch.int32))
+            for feature_name, jagged_tensor in ret.items():
+                torch.testing.assert_close(
+                    ret_int32[feature_name].values(),
+                    jagged_tensor.values(),
+                    rtol=0,
+                    atol=0,
+                )
+            # Nothing trains here, so each DynamicEmb row still holds what the
+            # DEBUG initializer wrote: its key modulo DEBUG_EMB_INITIALIZER_MOD,
+            # in every element. The lookup without index dedup gives the same.
+            for feature_name in dynamicemb_features:
+                embeddings = ret_int32[feature_name].values()
+                keys = sparse_feature[feature_name].values()
+                expected = (keys % DEBUG_EMB_INITIALIZER_MOD).to(embeddings.dtype)
+                torch.testing.assert_close(
+                    embeddings,
+                    expected.unsqueeze(1).expand_as(embeddings),
+                    rtol=0,
+                    atol=0,
+                )
 
         feature_names = []
         jagged_tensors = []
@@ -546,6 +590,15 @@ def main(argv: List[str]) -> None:
         type=str2bool,
         default=True,
         help="Use index deduplication (default: True).",
+    )
+    parser.add_argument(
+        "--key_dtype",
+        type=str,
+        default="int64",
+        choices=["int64", "int32"],
+        help="int32 also looks up every batch as int32 keys and checks that the "
+        "embeddings equal the int64 lookup's and, on DynamicEmb tables, the "
+        "DEBUG initializer's values.",
     )
     args = parser.parse_args()
 
