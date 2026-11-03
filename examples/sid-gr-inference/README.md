@@ -213,6 +213,12 @@ GR_INFERENCE_PREFILL_CUDA_GRAPH_SEPARATE_POOLS=1
 GR_INFERENCE_DECODE_CUDA_GRAPH_SEPARATE_LOGITS=1
 ```
 
+On SM10x (Blackwell), the real decode backend fuses the beam attention and
+combine kernels into one launch when the context attention uses one split.
+Output is bit-identical to the separate kernels. To keep the separate kernels,
+pass `--no-fused-beam-combine` (or
+`ExistingGRDecodeAttentionBackend(fused_beam_combine=False)`).
+
 ## 5. Baseline
 
 The headline numbers compare against the SGLang beam-search PR branch:
