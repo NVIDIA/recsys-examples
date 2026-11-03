@@ -166,15 +166,8 @@ class TransformerInferLayer(nn.Module):
         q, query_valid = _pad(query, offsets, query_width, candidates.shape[0])
         k, _ = _pad(key, offsets, query_width, candidates.shape[0])
         v, _ = _pad(value, offsets, query_width, candidates.shape[0])
-        starts, ends = _sequence_bounds(offsets, candidates.shape[0])
-        lengths = ends - starts
-        torch._assert_async(
-            torch.all((lengths >= 0) & (lengths <= self._max_seq_len)),
-            "sequence length exceeds Transformer max_seq_len",
-        )
-        torch._assert_async(
-            torch.all((candidates >= 0) & (candidates <= lengths)),
-            "invalid Transformer candidate count",
+        lengths = self._checked_lengths(
+            offsets, candidates, None if cache_table is None else history_lengths
         )
         new_history = lengths - candidates
         query_local_positions = torch.arange(query_width, device=query.device)
@@ -185,13 +178,6 @@ class TransformerInferLayer(nn.Module):
             cached_lengths = torch.zeros_like(lengths)
         else:
             cached_lengths = history_lengths - new_history
-            torch._assert_async(
-                torch.all(cached_lengths >= 0), "negative cached prefix length"
-            )
-            torch._assert_async(
-                torch.all(history_lengths + candidates <= self._max_seq_len),
-                "cached sequence exceeds Transformer max_seq_len",
-            )
             history_k, history_v = read_paged_history(
                 cache_table, page_ids, page_indptr, history_lengths, self._max_seq_len
             )
@@ -226,6 +212,34 @@ class TransformerInferLayer(nn.Module):
         )
         output = output.transpose(1, 2).flatten(2)
         return _unpad(output, offsets, query.shape[0])
+
+    def _checked_lengths(self, offsets, candidates, history_lengths=None):
+        """Return each user's packed length, asserting on the device that it is valid.
+
+        The new tokens hold the candidates, the history (history_lengths, if given)
+        includes the new history, and the whole sequence fits max_seq_len. The
+        attention sizes its tensors by max_seq_len and trusts these lengths.
+        """
+        starts, ends = _sequence_bounds(offsets, candidates.shape[0])
+        lengths = ends - starts
+        torch._assert_async(
+            torch.all((lengths >= 0) & (lengths <= self._max_seq_len)),
+            "sequence length exceeds Transformer max_seq_len",
+        )
+        torch._assert_async(
+            torch.all((candidates >= 0) & (candidates <= lengths)),
+            "invalid Transformer candidate count",
+        )
+        if history_lengths is not None:
+            torch._assert_async(
+                torch.all(history_lengths >= lengths - candidates),
+                "negative cached prefix length",
+            )
+            torch._assert_async(
+                torch.all(history_lengths + candidates <= self._max_seq_len),
+                "cached sequence exceeds Transformer max_seq_len",
+            )
+        return lengths
 
     def finish(self, hidden, attention):
         """Apply the output projection, feed-forward block and residuals."""

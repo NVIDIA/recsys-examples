@@ -371,6 +371,14 @@ def test_invalid_lengths_are_rejected():
         layer(torch.randn(25, 12), offsets([25]), torch.tensor([1]))
     with pytest.raises(RuntimeError, match="candidate count"):
         layer(torch.randn(5, 12), offsets([5]), torch.tensor([6]))
+    # The cache is read only after these checks.
+    q, unused = torch.randn(5, 2, 4), torch.empty(0)
+    cases = {3: "negative cached prefix", 24: "cached sequence exceeds"}
+    for history, message in cases.items():
+        cache = dict(cache_table=unused, page_ids=unused, page_indptr=unused)
+        cache["history_lengths"] = torch.tensor([history])
+        with pytest.raises(RuntimeError, match=message):
+            layer.attention(q, q, q, offsets([5]), torch.tensor([1]), **cache)
 
 
 def test_non_affine_input_norm_and_empty_batch_tokens():

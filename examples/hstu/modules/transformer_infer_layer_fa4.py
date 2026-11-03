@@ -63,6 +63,10 @@ class Fa4AttentionMixin:
         tokens = query.shape[0]
         if tokens == 0:
             return query.new_empty((0, self.num_heads * self.head_dim))
+        # The reference's checks: the bounds below and the packed K/V assume them.
+        self._checked_lengths(
+            offsets, candidates, None if cache_table is None else history_lengths
+        )
         offsets = _with_end_sentinel(offsets.int())
         candidates = _with_end_sentinel(candidates.int())
         # Static bounds keep the call free of GPU-to-host reads, as CUDA graphs need.

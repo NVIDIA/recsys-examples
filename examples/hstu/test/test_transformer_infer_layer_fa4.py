@@ -270,6 +270,55 @@ def test_per_user_inputs_have_an_element_past_the_end(monkeypatch):
             assert torch.equal(behind[:-1], values) and behind[-1] == values[-1]
 
 
+def test_invalid_lengths_are_rejected_before_the_kernel(monkeypatch):
+    # The reference's length checks (test_invalid_lengths_are_rejected), which the FA4
+    # bounds and the packed K/V rely on. A failed device assert would end the CUDA context
+    # of the remaining tests, so the asserts run on the host here, and neither the K/V
+    # packing nor FA4 may be reached.
+    from modules import transformer_infer_layer_fa4
+
+    class Reached(Exception):
+        pass
+
+    def reached(*args, **kwargs):
+        raise Reached
+
+    def host_assert(condition, message):
+        if not condition.item():
+            raise RuntimeError(message)
+
+    monkeypatch.setattr(torch, "_assert_async", host_assert)
+    monkeypatch.setattr(transformer_infer_layer_fa4, "flash_attn_varlen_func", reached)
+    monkeypatch.setattr(Fa4TransformerInferLayer, "_packed_kv", reached)
+    fa4 = Fa4TransformerInferLayer(config(max_seq_len=16), 0, "cuda")
+
+    def attention(length, candidates, history=None):
+        x = torch.randn(length, 4, 128, device="cuda", dtype=torch.bfloat16)
+        offsets = torch.tensor([0, length], dtype=torch.int32, device="cuda")
+        cache = {}
+        if history is not None:
+            # Only the history lengths are read before the K/V packing.
+            unused = torch.empty(0, device="cuda")
+            cache = dict(cache_table=unused, page_ids=unused, page_indptr=unused)
+            cache["history_lengths"] = torch.tensor([history], device="cuda")
+        candidates = torch.tensor([candidates], dtype=torch.int32, device="cuda")
+        fa4.attention(x, x, x, offsets, candidates, **cache)
+
+    with pytest.raises(RuntimeError, match="sequence length exceeds"):
+        attention(17, 1)
+    with pytest.raises(RuntimeError, match="candidate count"):
+        attention(5, 6)
+    with pytest.raises(RuntimeError, match="negative cached prefix"):
+        attention(5, 1, history=3)
+    with pytest.raises(RuntimeError, match="cached sequence exceeds"):
+        attention(5, 1, history=16)
+    # At the limits, the lengths are valid and reach the kernel.
+    with pytest.raises(Reached):
+        attention(16, 16)
+    with pytest.raises(Reached):
+        attention(5, 1, history=15)
+
+
 def test_padded_tail_rows_are_zero_and_ignored():
     # A CUDA graph bucket packs more rows than the request has; its tail holds stale data.
     base, fa4 = layer_pair(Fa4TransformerInferLayer)
