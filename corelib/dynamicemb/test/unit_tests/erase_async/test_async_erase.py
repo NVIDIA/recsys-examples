@@ -211,7 +211,8 @@ def test_a_thread_in_a_hot_loop_does_not_keep_another_out_of_the_gate(device):
     training thread, asking meanwhile, is let in after the section that holds it, not
     after the loop. The loop takes about a second; the training thread waits, each time,
     far less than that. (It is timed, not counted in laps: the thread that was let in
-    needs the GIL to go on, and the loop may take a few milliseconds of laps meanwhile.)"""
+    needs the GIL to go on, and the loop may take a few milliseconds of laps meanwhile.)
+    """
     gate = TableAccessGate()
     laps = [0]
 
@@ -437,7 +438,8 @@ def scan(module, chunk_guard, chunk_slots=BUCKET):
 
 class WatchedGate:
     """The module's gate, counting the sections it is entered for -- one per chunk of
-    a scan -- and, if told to, stopping the worker inside the ``at``-th until released."""
+    a scan -- and, if told to, stopping the worker inside the ``at``-th until released.
+    """
 
     def __init__(self, gate, at=None):
         self.gate, self.at, self.entered = gate, at, 0
@@ -495,7 +497,9 @@ def test_a_prefetch_waits_for_the_chunk_the_scan_is_in_not_for_the_scan(
     assert not step.is_alive() and not errors, errors
 
     assert handle.result() == (len(OLD), 0)
-    assert state.key_map_generation > generation_before, "no expansion: no restart tried"
+    assert (
+        state.key_map_generation > generation_before
+    ), "no expansion: no restart tried"
     assert not bool(found(module, OLD, device).any())
     assert bool(found(module, new_keys, device).all())
     assert int(module._storage.key_index_map.size(0)) == len(new_keys)

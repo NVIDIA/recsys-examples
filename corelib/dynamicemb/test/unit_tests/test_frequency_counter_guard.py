@@ -46,7 +46,9 @@ def device():
     return torch.cuda.current_device()
 
 
-def _make_module(score_strategy, device, admit_strategy=None) -> BatchedDynamicEmbeddingTablesV2:
+def _make_module(
+    score_strategy, device, admit_strategy=None
+) -> BatchedDynamicEmbeddingTablesV2:
     option = DynamicEmbTableOptions(
         dim=DIM,
         max_capacity=CAPACITY,

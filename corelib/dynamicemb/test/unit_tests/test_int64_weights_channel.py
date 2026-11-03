@@ -37,9 +37,7 @@ def _make_kjt(weights_dtype, num_features=3, batch=8, seed=0):
     values = torch.randint(0, 1000, (n,), generator=g, dtype=torch.int64)
     if weights_dtype == torch.int64:
         # Large values, above 2**53, so a float round trip would lose bits.
-        weights = torch.randint(
-            2**60, 2**62, (n,), generator=g, dtype=torch.int64
-        )
+        weights = torch.randint(2**60, 2**62, (n,), generator=g, dtype=torch.int64)
     else:
         weights = torch.rand(n, generator=g).to(weights_dtype)
     return KeyedJaggedTensor.from_lengths_sync(
@@ -54,9 +52,7 @@ def _make_kjt(weights_dtype, num_features=3, batch=8, seed=0):
 @pytest.mark.parametrize("num_buckets", [2, 4])
 def test_bucketize_carries_int64_weights(dist_type, num_buckets):
     kjt = _make_kjt(torch.int64)
-    block_sizes = torch.full(
-        (len(kjt.keys()),), 250, dtype=torch.int64, device="cuda"
-    )
+    block_sizes = torch.full((len(kjt.keys()),), 250, dtype=torch.int64, device="cuda")
     dist_types = dist_type_codes([dist_type] * len(kjt.keys()), device="cuda")
     out, _ = bucketize_kjt_before_all2all(
         kjt,
@@ -95,6 +91,4 @@ def test_permute_and_split_keep_int64_weights():
 
     parts = kjt.split([1, 2])
     assert [p.weights().dtype for p in parts] == [torch.int64, torch.int64]
-    torch.testing.assert_close(
-        torch.cat([p.weights() for p in parts]), kjt.weights()
-    )
+    torch.testing.assert_close(torch.cat([p.weights() for p in parts]), kjt.weights())
