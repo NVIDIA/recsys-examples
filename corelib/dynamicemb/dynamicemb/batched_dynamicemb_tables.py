@@ -69,15 +69,17 @@ from dynamicemb.dynamicemb_config import (
 from dynamicemb.initializer import MultiTableInitializer
 from dynamicemb.key_ownership import owned_key_mask, owned_keys
 from dynamicemb.key_value_table import (
+    ERASE_CHUNK_SLOTS,
+    ERASE_MAX_CHUNKS_IN_FLIGHT,
     Cache,
     DynamicEmbCache,
     DynamicEmbStorage,
-    ERASE_CHUNK_SLOTS,
-    ERASE_MAX_CHUNKS_IN_FLIGHT,
     HybridStorage,
     Storage,
+    check_dist_type_migration,
     flush_cache,
     load_from_json,
+    suppress_layout_warnings,
 )
 from dynamicemb.lookup_layout import EmbeddingLayout
 from dynamicemb.optimizer import (
@@ -462,8 +464,8 @@ def _print_memory_consume(
     The caller passes the ``StorageLayout`` set by ``_create_cache_storage`` so
     the report matches the code path that ran (no inference from buffer state).
     Per-tier bytes come from the constructed ``ExtendableBuffer`` (init) and
-    ``options.max_capacity`` (peak), capturing bucket alignment, hybrid
-    ``cap_scale`` rebalancing, and caching's HBM/backing duplication. Does
+    ``options.max_capacity`` (peak), capturing bucket alignment, each table's
+    HBM-budget share of its rows, and caching's HBM/backing duplication. Does
     *not* include hash-table metadata (keys/digests/scores/ref_counter), which
     always live on HBM regardless of value tier.
     """
@@ -854,13 +856,22 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
             option.dim + self._optimizer.get_state_dim(option.dim)
             for option in self._dynamicemb_options
         ]
-        total_memory = sum(
+        table_bytes = [
             option.max_capacity * DTYPE_NUM_BYTES[option.embedding_dtype] * value_dim
             for option, value_dim in zip(self._dynamicemb_options, value_dims)
-        )
+        ]
+        total_memory = sum(table_bytes)
         local_hbm = sum(
             option.local_hbm_for_values for option in self._dynamicemb_options
         )
+        # The layout is chosen for the group (above, from the sums), but when it
+        # splits rows between HBM and the next tier each table keeps the share
+        # its own budget buys: a budget the planner gave one table is not
+        # spread over its groupmates, nor is a spare one lent to them.
+        hbm_fractions = [
+            min(1.0, option.local_hbm_for_values / nbytes) if nbytes > 0 else 1.0
+            for option, nbytes in zip(self._dynamicemb_options, table_bytes)
+        ]
 
         if total_memory > local_hbm:
             # Data does not fit entirely in HBM.
@@ -872,10 +883,9 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                     )
 
                 cache_options = deepcopy(self._dynamicemb_options)
-                cap_scale = local_hbm / total_memory if total_memory > 0 else 1.0
-                for cache_option in cache_options:
+                for cache_option, frac in zip(cache_options, hbm_fractions):
                     cache_option.bucket_capacity = 1024
-                    cap = max(1, int(cache_option.max_capacity * cap_scale))
+                    cap = max(1, int(cache_option.max_capacity * frac))
                     cache_option.max_capacity = min(cache_option.max_capacity, cap)
                     cache_option.init_capacity = min(cache_option.max_capacity, cap)
 
@@ -951,20 +961,17 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                             "Set caching=True to use external storage.",
                             UserWarning,
                         )
-                    cap_scale = local_hbm / total_memory if total_memory > 0 else 1.0
-
                     hbm_options = deepcopy(self._dynamicemb_options)
-                    for hbm_option in hbm_options:
+                    for hbm_option, frac in zip(hbm_options, hbm_fractions):
                         hbm_option.bucket_capacity = 1024
-                        cap = max(1, int(hbm_option.max_capacity * cap_scale))
+                        cap = max(1, int(hbm_option.max_capacity * frac))
                         hbm_option.max_capacity = min(hbm_option.max_capacity, cap)
                         hbm_option.init_capacity = hbm_option.max_capacity
 
-                    storage_cap_scale = 1.0 - cap_scale
                     host_options = deepcopy(self._dynamicemb_options)
-                    for host_option in host_options:
+                    for host_option, frac in zip(host_options, hbm_fractions):
                         host_option.local_hbm_for_values = 0
-                        cap = max(1, int(host_option.max_capacity * storage_cap_scale))
+                        cap = max(1, int(host_option.max_capacity * (1.0 - frac)))
                         host_option.max_capacity = min(host_option.max_capacity, cap)
                         host_option.init_capacity = min(host_option.init_capacity, cap)
 
@@ -1832,6 +1839,9 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
         ckpt_dist_type = meta.get("dist_type", "roundrobin")
         why = None
         if ckpt_dist_type != option.dist_type:
+            # A continuous table's keys are shard-local ids: no rule can
+            # re-partition them, so that migration is refused outright.
+            check_dist_type_migration(ckpt_dist_type, option.dist_type, meta_json_file)
             why = (
                 f"checkpoint dist_type {ckpt_dist_type!r} differs from the "
                 f"table's {option.dist_type!r}"
@@ -1988,21 +1998,24 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
             num_key_files = len(emb_key_files)
             self._shard_barrier(pg)
             ts = device_timestamp()
-            for i in range(num_key_files):
-                loaded_score = storage.load(
-                    table_id,
-                    meta_json_file,
-                    emb_key_files[i],
-                    emb_value_files[i],
-                    emb_score_files[i] if len(emb_score_files) > 0 else None,
-                    opt_value_files[i] if len(opt_value_files) > 0 else None,
-                    include_optim=optim,
-                    timestamp=ts,
-                    shard_index=rank,
-                    num_shards=world_size,
-                )
-                if loaded_score is not None and table_name in self._scores:
-                    self._scores[table_name] = loaded_score
+            # _checkpoint_layout_matches has already said once, on shard 0, when
+            # the layout differs; the storage would otherwise repeat it per file.
+            with suppress_layout_warnings():
+                for i in range(num_key_files):
+                    loaded_score = storage.load(
+                        table_id,
+                        meta_json_file,
+                        emb_key_files[i],
+                        emb_value_files[i],
+                        emb_score_files[i] if len(emb_score_files) > 0 else None,
+                        opt_value_files[i] if len(opt_value_files) > 0 else None,
+                        include_optim=optim,
+                        timestamp=ts,
+                        shard_index=rank,
+                        num_shards=world_size,
+                    )
+                    if loaded_score is not None and table_name in self._scores:
+                        self._scores[table_name] = loaded_score
 
             if not counter:
                 continue

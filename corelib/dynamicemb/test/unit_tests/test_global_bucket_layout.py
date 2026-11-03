@@ -245,12 +245,22 @@ def test_table_rejects_a_global_capacity_that_cannot_hold_its_buckets(current_de
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.parametrize("key_dtype", [torch.int64, torch.int32])
 @pytest.mark.parametrize("num_shards", [1, 2, 3, 8])
-def test_routing_kernel_and_host_rule_agree(current_device, num_shards):
+def test_routing_kernel_and_host_rule_agree(current_device, num_shards, key_dtype):
+    """Kernel, host rule and oracle agree key for key -- for int32 keys too. A
+    negative int32 key must widen with its sign before hashing (the table and
+    the host rule see it as int64), not as the kernel's unsigned index."""
     device = torch.device(f"cuda:{current_device}")
-    keys = torch.randint(1, 1 << 62, (300_000,), dtype=torch.int64, device=device)
-    keys[:1000] = -keys[:1000]
-    expected = oracle_shard(keys.cpu().numpy(), num_shards)
+    if key_dtype == torch.int64:
+        keys = torch.randint(1, 1 << 62, (300_000,), dtype=torch.int64, device=device)
+        keys[:1000] = -keys[:1000]
+    else:
+        keys = torch.randint(
+            -(1 << 31), 1 << 31, (300_000,), dtype=torch.int32, device=device
+        )
+        assert (keys < 0).sum() > 100_000
+    expected = oracle_shard(keys.to(torch.int64).cpu().numpy(), num_shards)
     shard_capacity = buckets_per_shard(num_shards) * BC
     assert hashed_shard_capacity(GLOBAL_CAPACITY, BC, num_shards) == shard_capacity
 
@@ -265,6 +275,9 @@ def test_routing_kernel_and_host_rule_agree(current_device, num_shards):
     rule = OwnershipRule("hash_bucket", num_shards, GLOBAL_CAPACITY, BC)
     assert rule.shard_capacity == shard_capacity
     assert torch.equal(rule.owner(keys), host)
+    if key_dtype == torch.int32:
+        # The rule is about the key's value, whatever width it arrives in.
+        assert torch.equal(rule.owner(keys.to(torch.int64)), host)
 
     global_caps, shard_caps = routing_param_tensors(
         ["hash_bucket"], [(GLOBAL_CAPACITY, shard_capacity)], num_shards, device
@@ -277,8 +290,10 @@ def test_routing_kernel_and_host_rule_agree(current_device, num_shards):
         dist_type_per_feature=dist_type_codes(["hash_bucket"], device=device),
         global_capacity_per_feature=global_caps,
         shard_capacity_per_feature=shard_caps,
+        # The kernel reads block_sizes in the keys' dtype (the distributor
+        # converts them, _fx_wrap_tensor_to_device_dtype).
         block_sizes=torch.tensor(
-            [GLOBAL_CAPACITY // num_shards + 1], dtype=torch.int64, device=device
+            [GLOBAL_CAPACITY // num_shards + 1], dtype=key_dtype, device=device
         ),
         my_size=num_shards,
         max_B=1,
@@ -727,10 +742,87 @@ def test_old_rule_checkpoint_loads_into_a_hash_bucket_table(
     keys = keys_filling_every_bucket(per_bucket=32)
     with tempfile.TemporaryDirectory() as save_dir:
         held, _ = dump_shards(current_device, keys, 2, save_dir, source)
-        with pytest.warns(UserWarning, match="dist_type"):
+        with pytest.warns(UserWarning, match="dist_type") as record:
             loaded, values, seen = _load_with_spy(
                 monkeypatch, current_device, 2, save_dir, "hash_bucket"
             )
     assert seen == [True, True]
     assert np.array_equal(np.sort(loaded), np.sort(held))
     assert_debug_rows(loaded, values)
+    # Said once, by shard 0, for the table -- not once per shard file per rank.
+    layout_warnings = [w for w in record if "re-partition" in str(w.message)]
+    assert len(layout_warnings) == 1, [str(w.message) for w in layout_warnings]
+
+
+def _shard_files(save_dir: str, shard: int, num_shards: int) -> Tuple[str, ...]:
+    return tuple(
+        bdt_module.encode_checkpoint_file_path(save_dir, TABLE, shard, num_shards, kind)
+        for kind in ("keys", "values", "scores", "opt_values")
+    )
+
+
+def test_direct_storage_load_warns_once_per_table(current_device):
+    """A Storage.load outside the module has nobody else to say it, so it warns
+    itself -- once for the table, however many shard files it is handed."""
+    keys = keys_filling_every_bucket(per_bucket=16)
+    with tempfile.TemporaryDirectory() as save_dir:
+        dump_shards(current_device, keys, 2, save_dir, "roundrobin")
+        model = build_model(current_device, 2, "hash_bucket")
+        meta = _meta_path(save_dir)
+        with warnings.catch_warnings(record=True) as record:
+            warnings.simplefilter("always")
+            for shard in range(2):
+                key_file, value_file, score_file, opt_file = _shard_files(
+                    save_dir, shard, 2
+                )
+                model._storage.load(
+                    0,
+                    meta,
+                    key_file,
+                    value_file,
+                    score_file,
+                    opt_file,
+                    include_optim=False,
+                    shard_index=0,
+                    num_shards=2,
+                )
+        del model
+        torch.cuda.empty_cache()
+    layout_warnings = [w for w in record if "re-partition" in str(w.message)]
+    assert len(layout_warnings) == 1, [str(w.message) for w in layout_warnings]
+
+
+def test_continuous_checkpoint_is_refused(monkeypatch, current_device):
+    """A continuous table's keys are shard-local ids (the bucketizer rewrote
+    them), so two source shards can hold the same id for different rows; no
+    rule can re-partition them. The mismatch stays an error, in the module path
+    and in a direct Storage.load."""
+    keys = keys_filling_every_bucket(per_bucket=16)
+    with tempfile.TemporaryDirectory() as save_dir:
+        dump_shards(current_device, keys, 2, save_dir, "roundrobin")
+        meta_path = _meta_path(save_dir)
+        with open(meta_path) as f:
+            meta = json.load(f)
+        meta["dist_type"] = "continuous"
+        with open(meta_path, "w") as f:
+            json.dump(meta, f)
+
+        with pytest.raises(ValueError, match="continuous"):
+            _load_with_spy(monkeypatch, current_device, 2, save_dir, "hash_bucket")
+
+        model = build_model(current_device, 2, "hash_bucket")
+        key_file, value_file, score_file, opt_file = _shard_files(save_dir, 0, 2)
+        with pytest.raises(ValueError, match="continuous"):
+            model._storage.load(
+                0,
+                meta_path,
+                key_file,
+                value_file,
+                score_file,
+                opt_file,
+                include_optim=False,
+                shard_index=0,
+                num_shards=2,
+            )
+        del model
+        torch.cuda.empty_cache()

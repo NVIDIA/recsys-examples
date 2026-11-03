@@ -126,7 +126,7 @@ the whole shard, with exactly `P` buckets:
 | `DynamicEmbStorage`, HBM-only or host-only | yes | **yes** |
 | CACHING: storage tier (host, full table) | yes | **yes** -- the cache is a subset and never the source of truth |
 | CACHING: cache tier (`DynamicEmbCache`) | no (rescaled, `bc=1024`) | n/a |
-| HYBRID: HBM and host tiers | no (each a rescaled part of the shard) | **no** -- see §8 |
+| HYBRID: HBM and host tiers | no (each a rescaled part of the shard) | **no** -- a key's tier is decided by eviction history, so the two tiers are not a fixed partition of the keys; the layout is left as it is |
 | `NO_EVICTION` tables | no (key map is `2P` buckets at load factor 0.5) | n/a: they never evict |
 | `MAX_BUCKET_CAPACITY` | no whole-table form | **no** |
 | `roundrobin`, `hash_roundrobin`, `continuous` | no | **no** (unchanged) |
@@ -158,7 +158,11 @@ tier's copy may have rescaled them.
   used to refuse a `dist_type` mismatch; it now warns, because ownership is
   recomputed from the key by the *table's* rule and the old check only ever
   protected the own-file shortcut. Since the rule is named by `dist_type`, no
-  guessing is needed about which rule wrote a checkpoint.
+  guessing is needed about which rule wrote a checkpoint. The exception is
+  `continuous` on either side (`check_dist_type_migration`): its keys are
+  shard-local ids that no other rule can re-partition, so that mismatch stays
+  an error. The warning is said once per table (shard 0 in the module path,
+  once per process for a direct `Storage.load`), not once per shard file.
 
 The first restore of an old checkpoint into the invariant layout is therefore a
 one-time lossy fold (the same loss as before); every save/restore after it is
@@ -180,34 +184,7 @@ the price of a non-contiguous bucket range per shard; the contiguous range was
 chosen so that a shard's checkpoint file is one range of the global bucket
 space.
 
-## 8. Phase 2: lossless HYBRID (designed, not implemented)
-
-A HYBRID key lives in one of two bucketed tiers (HBM, `bc=1024`, capacity
-`max_cap·scale`; host, `bc`, capacity `max_cap·(1-scale)`), and which tier is
-dynamic: a full HBM bucket spills its lowest-score key to the host tier.
-`HybridStorage.load` re-inserts every key into HBM with `insert_and_evict`, so
-the spilled subset differs from the original and host buckets overflow even if
-the host partition were invariant -- the ~1.2 % loss per same-topology reload
-measured above.
-
-Making it lossless needs three pieces:
-
-1. **A nested invariant HBM partition.** HBM bucket = a fixed group of
-   `m = bc_hbm / bc` consecutive global host buckets (`g // m`), its width
-   derived from `global_hbm_for_values` (not today's per-rank
-   `int(max_cap·scale)`), and the per-shard `P` aligned up to a multiple of `m`
-   so both buckets of a key sit on one rank.
-2. **Tier membership in the checkpoint.** Per shard file, how many leading rows
-   came from the HBM tier (dump already writes the tiers in order).
-3. **A tier-respecting load.** Insert each row into its recorded tier with a
-   plain `insert`, no cross-tier eviction; files without tier counts fall back
-   to today's path.
-
-Phase 1 leaves this open: `home_bucket` reads a per-table capacity pointer (an
-HBM tier can carry its own), the meta is a dict, and `OwnershipRule` is the
-single routing object.
-
-## 9. Tests
+## 8. Tests
 
 * `test/unit_tests/test_global_bucket_layout.py` -- the table kernels place
   keys in their global bucket (and keep the old buckets when no global

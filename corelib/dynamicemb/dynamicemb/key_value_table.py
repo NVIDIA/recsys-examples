@@ -18,6 +18,7 @@ import contextlib
 import json
 import math
 import os
+import threading
 import warnings
 from dataclasses import dataclass, field
 from typing import (
@@ -660,13 +661,17 @@ def create_table_state(
         ovf_cap = key_index_map.overflow_bucket_capacity_
         overflow_caps_list = [ovf_cap] * num_tables
 
+    # Which memory the values live in is the group's tier, not options[0]'s
+    # budget: a host tier zeroes every table's budget, while an HBM tier may
+    # hold a table with no budget of its own beside one that has some.
+    on_host = all(opt.local_hbm_for_values == 0 for opt in options)
     tables: List[ExtendableBuffer] = []
     for i, (cap, vd) in enumerate(zip(table_caps, value_dims)):
         total_cap = cap
         if enable_overflow:
             total_cap += overflow_caps_list[i]
         shape = (total_cap, vd)
-        if base_opt.local_hbm_for_values == 0:
+        if on_host:
             tables.append(HostExtendableBuffer(shape, emb_dtype, device))
         else:
             tables.append(DeviceExtendableBuffer(shape, emb_dtype, device))
@@ -2291,6 +2296,60 @@ class _LoadParams:
     opt_state_dtype: torch.dtype = OPT_STATE_TYPE
 
 
+def check_dist_type_migration(
+    ckpt_dist_type: str, runtime_dist_type: str, meta_json_file_path: str
+) -> None:
+    """Refuse a load across ``dist_type`` when either side is ``continuous``.
+
+    A ``continuous`` table stores shard-local ids (the bucketizer rewrites a key
+    to ``key % block_size``), so two source shards can hold the same id for
+    different rows: re-partitioning those ids by another rule would merge
+    distinct rows and attach values to the wrong keys even with no bucket
+    overflowing. The other rules store the global key, so a key says which
+    rank owns it under any of them, and a migration between them is allowed
+    (lossy only where a bucket overflows).
+    """
+    if ckpt_dist_type == runtime_dist_type:
+        return
+    if "continuous" in (ckpt_dist_type, runtime_dist_type):
+        raise ValueError(
+            f"{meta_json_file_path}: checkpoint was dumped with dist_type "
+            f"{ckpt_dist_type!r} but the table uses {runtime_dist_type!r}. A "
+            "'continuous' table stores shard-local ids, which no other rule can "
+            "re-partition. Load it into a table of the same dist_type."
+        )
+
+
+# Layout warnings are said once per checkpoint table in a process: a load reads
+# one file per source shard, and the warning is about the table, not the file.
+_LAYOUT_WARNED: Set[str] = set()
+_layout_warnings_suppressed = threading.local()
+
+
+@contextlib.contextmanager
+def suppress_layout_warnings():
+    """Silence the per-file layout warnings of ``Storage.load``.
+
+    For a caller that has already said it once -- ``BatchedDynamicEmbeddingTablesV2.load``
+    warns per table on shard 0 before it hands the files to the storage.
+    """
+    previous = getattr(_layout_warnings_suppressed, "depth", 0)
+    _layout_warnings_suppressed.depth = previous + 1
+    try:
+        yield
+    finally:
+        _layout_warnings_suppressed.depth = previous
+
+
+def _warn_layout_once(meta_json_file_path: str, message: str) -> None:
+    if getattr(_layout_warnings_suppressed, "depth", 0) > 0:
+        return
+    if meta_json_file_path in _LAYOUT_WARNED:
+        return
+    _LAYOUT_WARNED.add(meta_json_file_path)
+    warnings.warn(message, UserWarning, stacklevel=3)
+
+
 def _validate_load_meta(
     state: DynamicEmbTableState,
     table_id: int,
@@ -2336,33 +2395,34 @@ def _validate_load_meta(
     runtime_dist_type = routing_options.dist_type
     runtime_global_capacity = getattr(routing_options, "global_capacity", None)
     if runtime_dist_type != ckpt_dist_type:
+        check_dist_type_migration(
+            ckpt_dist_type, runtime_dist_type, meta_json_file_path
+        )
         # Ownership is recomputed from the key by the *table's* rule, so a
         # checkpoint written under another rule still loads -- provided every
         # rank reads every file (BatchedDynamicEmbeddingTablesV2.load reads
         # all files when the rules differ). Keys then land in buckets the
         # source never grouped them by, and a full bucket evicts: a one-time
         # loss on migration, which is why this is a warning and not silent.
-        warnings.warn(
-            f"{emb_key_path}: checkpoint was dumped with dist_type "
+        _warn_layout_once(
+            meta_json_file_path,
+            f"{meta_json_file_path}: checkpoint was dumped with dist_type "
             f"{ckpt_dist_type!r} but the table uses {runtime_dist_type!r}; keys "
             "are re-partitioned by the table's rule, and rows may be lost where "
             "a bucket overflows. Every rank must read every shard file.",
-            UserWarning,
-            stacklevel=2,
         )
     elif runtime_dist_type == "hash_bucket" and (
         meta_data.get("global_capacity") != runtime_global_capacity
         or meta_data.get("bucket_capacity") != routing_options.bucket_capacity
     ):
-        warnings.warn(
-            f"{emb_key_path}: checkpoint has global bucket layout "
+        _warn_layout_once(
+            meta_json_file_path,
+            f"{meta_json_file_path}: checkpoint has global bucket layout "
             f"(global_capacity={meta_data.get('global_capacity')}, "
             f"bucket_capacity={meta_data.get('bucket_capacity')}) but the table "
             f"has ({runtime_global_capacity}, {routing_options.bucket_capacity}); "
             "keys are re-partitioned by the table's layout, and rows may be lost "
             "where a bucket overflows. Every rank must read every shard file.",
-            UserWarning,
-            stacklevel=2,
         )
 
     if score_file_path is None:
