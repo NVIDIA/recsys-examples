@@ -140,6 +140,17 @@ struct LinearBucket {
     return hashcode_to_digest(hashcode);
   }
 
+  // What a slot an erase left reclaimed carries: the digest of the key it holds,
+  // ReclaimKey, as every slot carries the digest of its own key (an empty slot
+  // that of EmptyKey). Not the empty digest: a probe looking for a free slot takes
+  // the slots with that digest as candidates and reads each one's key, so a
+  // reclaimed slot posing as empty is a wasted read in every probe, and more of
+  // them the more keys have been erased.
+  static __device__ __forceinline__ DigestType reclaimed_digest() {
+    auto hashcode = hash(ReclaimKey);
+    return hashcode_to_digest(hashcode);
+  }
+
   static __device__ __forceinline__ bool is_valid(uint64_t const &key) {
     return (key & ReserveKeyMask) != ReserveKeyMask;
   }
@@ -454,7 +465,7 @@ struct LinearBucket {
 
             if (temp_key != LockedKey && temp_key != EmptyKey) {
               int64_t flat_idx = counter_offset + iter + k + j;
-              if (counter[flat_idx] > 0)
+              if (counter != nullptr && counter[flat_idx] > 0)
                 continue;
 
               dst_iter = iter + k + j;
@@ -523,7 +534,7 @@ struct LinearBucket {
                               ->load(cuda::std::memory_order_relaxed);
           if (temp_key != LockedKey && temp_key != EmptyKey) {
             int64_t flat_idx = counter_offset + key_it;
-            if (counter[flat_idx] > 0)
+            if (counter != nullptr && counter[flat_idx] > 0)
               continue;
             dst_iter = key_it;
             dst_key = temp_key;

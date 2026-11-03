@@ -59,6 +59,7 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
     CASE_ENUM_USING_HINT(ScorePolicyType::Accumulate, HINT, __VA_ARGS__)       \
     CASE_ENUM_USING_HINT(ScorePolicyType::GlobalTimer, HINT, __VA_ARGS__)      \
     CASE_ENUM_USING_HINT(ScorePolicyType::LruLfu, HINT, __VA_ARGS__)           \
+    CASE_ENUM_USING_HINT(ScorePolicyType::Flag, HINT, __VA_ARGS__)             \
   default:                                                                     \
     throw std::runtime_error("Not supported score policy.");                   \
   }
@@ -101,7 +102,7 @@ at::Tensor table_insert(at::Tensor table_storage,
                         int64_t bucket_capacity, at::Tensor bucket_sizes,
                         at::Tensor keys, at::Tensor table_ids,
                         std::optional<at::Tensor> score_input,
-                        ScorePolicyType policy_type, at::Tensor counter,
+                        ScorePolicyType policy_type, std::optional<at::Tensor> counter,
                         std::optional<at::Tensor> insert_results = std::nullopt,
                         std::optional<at::Tensor> score_output = std::nullopt,
                         int64_t num_scores = 1, int64_t score_fn_key = 0,
@@ -115,7 +116,7 @@ table_insert_collect_evicted(
     at::Tensor table_storage, at::Tensor table_bucket_offsets,
     int64_t bucket_capacity, at::Tensor bucket_sizes, at::Tensor keys,
     at::Tensor table_ids, std::optional<at::Tensor> score_input,
-    ScorePolicyType policy_type, at::Tensor counter,
+    ScorePolicyType policy_type, std::optional<at::Tensor> counter,
     std::optional<at::Tensor> insert_results = std::nullopt,
     std::optional<at::Tensor> score_output = std::nullopt,
     int64_t num_scores = 1, int64_t score_fn_key = 0,
@@ -127,7 +128,7 @@ table_insert_and_evict(
     at::Tensor table_storage, at::Tensor table_bucket_offsets,
     int64_t bucket_capacity, at::Tensor bucket_sizes, at::Tensor keys,
     at::Tensor table_ids, std::optional<at::Tensor> score_input,
-    ScorePolicyType policy_type, at::Tensor counter,
+    ScorePolicyType policy_type, std::optional<at::Tensor> counter,
     std::optional<at::Tensor> insert_results = std::nullopt,
     std::optional<at::Tensor> score_output = std::nullopt,
     std::optional<at::Tensor> ovf_storage = std::nullopt,
@@ -137,6 +138,13 @@ table_insert_and_evict(
     std::optional<at::Tensor> ovf_output_offsets = std::nullopt,
     int64_t num_scores = 1, int64_t score_fn_key = 0,
     std::optional<at::Tensor> table_global_capacities = std::nullopt);
+
+void table_erase_by_score(at::Tensor table_storage, torch::Dtype key_dtype,
+                          int64_t bucket_capacity, at::Tensor bucket_sizes,
+                          std::optional<at::Tensor> counter,
+                          ScoreType threshold, int64_t begin, int64_t end,
+                          int64_t num_scores, int64_t score_index,
+                          at::Tensor counts);
 
 void table_erase(at::Tensor table_storage, at::Tensor table_bucket_offsets,
                  int64_t bucket_capacity, at::Tensor bucket_sizes,
@@ -219,14 +227,16 @@ at::Tensor table_resolve_rows(at::Tensor rows, at::Tensor row_counters,
 // reclaimed slots of buckets [bkt_begin, bkt_end) as int64[num_rows], where
 // num_rows is how many there are (the table's row counter minus its live
 // keys). table_place_reclaimed_rows then gives each of those rows a free slot
-// of the (new) table's bucket range, marking the slot reclaimed.
+// of the (new) table's bucket range, marking the slot reclaimed: its key becomes
+// ReclaimKey and its digest that key's.
 at::Tensor table_collect_reclaimed_rows(at::Tensor keys, at::Tensor rows,
                                         int64_t bkt_begin, int64_t bkt_end,
                                         int64_t bucket_capacity,
                                         int64_t num_rows);
-void table_place_reclaimed_rows(at::Tensor keys, at::Tensor rows,
-                                at::Tensor carried, int64_t bkt_begin,
-                                int64_t bkt_end, int64_t bucket_capacity);
+void table_place_reclaimed_rows(at::Tensor keys, at::Tensor digests,
+                                at::Tensor rows, at::Tensor carried,
+                                int64_t bkt_begin, int64_t bkt_end,
+                                int64_t bucket_capacity);
 
 // Restore the reclaimed slots a dump's [n, 2] (slot, row) int64 names, owning
 // their rows, on a replica: an empty slot becomes reclaimed with the row, a

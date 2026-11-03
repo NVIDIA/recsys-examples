@@ -140,8 +140,8 @@ void table_insert_and_evict_single_score(
     std::optional<at::Tensor> score_output, at::Tensor num_evicted,
     at::Tensor evicted_keys, at::Tensor evicted_indices,
     at::Tensor evicted_scores, at::Tensor evicted_table_ids,
-    at::Tensor counter, int64_t num_scores, int64_t score_fn_key,
-    int64_t const *global_caps_ptr) {
+    std::optional<at::Tensor> counter, int64_t num_scores,
+    int64_t score_fn_key, int64_t const *global_caps_ptr) {
 
   auto key_type = get_data_type(keys);
 
@@ -172,7 +172,7 @@ void table_insert_and_evict_single_score(
   auto evicted_table_ids_ptr = evicted_table_ids.data_ptr<int64_t>();
   auto table_ids_ptr = table_ids.data_ptr<int64_t>();
   auto table_bucket_offsets_ptr = table_bucket_offsets.data_ptr<int64_t>();
-  auto counter_ptr = counter.data_ptr<int32_t>();
+  auto counter_ptr = get_pointer<int32_t>(counter);
   auto stream = at::cuda::getCurrentCUDAStream().stream();
 
   int64_t num_total = keys.size(0);
@@ -379,7 +379,8 @@ table_insert_and_evict(at::Tensor table_storage,
                        at::Tensor bucket_sizes, at::Tensor keys,
                        at::Tensor table_ids,
                        std::optional<at::Tensor> score_input,
-                       ScorePolicyType policy_type, at::Tensor counter,
+                       ScorePolicyType policy_type,
+                       std::optional<at::Tensor> counter,
                        std::optional<at::Tensor> insert_results,
                        std::optional<at::Tensor> score_output,
                        std::optional<at::Tensor> ovf_storage,
@@ -425,11 +426,13 @@ table_insert_and_evict(at::Tensor table_storage,
       global_capacities_ptr(table_global_capacities, table_bucket_offsets);
 
   if (use_overflow) {
+    TORCH_CHECK(counter.has_value(),
+                "table_insert_and_evict with overflow needs a ref counter");
     table_insert_and_evict_with_counter_and_overflow_single_score(
         table_storage, table_bucket_offsets, bucket_capacity, bucket_sizes,
         keys, table_ids, score_input, policy_type, indices, insert_results,
         score_output, num_evicted, evicted_keys, evicted_indices,
-        evicted_scores, evicted_table_ids, counter, ovf_storage.value(),
+        evicted_scores, evicted_table_ids, counter.value(), ovf_storage.value(),
         ovf_bucket_capacity, ovf_bucket_sizes.value(), ovf_counter.value(),
         ovf_output_offsets.value(), num_scores, score_fn_key, global_caps_ptr);
   } else {

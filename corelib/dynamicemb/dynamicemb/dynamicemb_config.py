@@ -242,6 +242,8 @@ class DynamicEmbScoreStrategy(enum.IntEnum):
     NO_EVICTION:
         The table’s capacity doubles whenever there are not enough slots for new keys, and this continues until available memory is exhausted.
         Alone it keeps no score; it may be combined with CUSTOMIZED or PRECISE_CUSTOMIZED as `(NO_EVICTION, CUSTOMIZED)`.
+        With such a combination do not use a score of 0: an erased key's slot is cleared to 0, and a full bucket gives up
+        the slot with the smallest score, so a key scored 0 ties with an erased slot and can be the one given up.
         Incremental dump and replay are not supported for such tables.
         When the memory resources are insufficient, there will be a warning message, and training can continue but the accuracy of eviction cannot be guaranteed.
     """

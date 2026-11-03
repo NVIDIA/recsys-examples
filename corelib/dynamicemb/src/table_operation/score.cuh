@@ -39,6 +39,12 @@ enum class ScorePolicyType : uint8_t {
   // select keys for time-based incremental dump. Used for tables created with
   // a compound (TIMESTAMP, LFU) score_strategy (in either order).
   LruLfu = 4,
+  // The one score word is a flag, not a score: 1 while a key occupies the slot,
+  // 0 once an erase has cleared it. It ranks a slot in use above an erased one, so
+  // a full bucket gives up an erased slot before a key in use -- with every word 0
+  // they would tie. For a table that keeps no score of its own (NO_EVICTION
+  // alone). Reads leave it alone; use Const for those.
+  Flag = 5,
 };
 
 // Number of contiguous score words a policy occupies per key. LruLfu stores a
@@ -54,6 +60,8 @@ template <ScorePolicyType PolicyType> struct ScorePolicy {
                                                   int64_t index) {
     if constexpr (PolicyType == ScorePolicyType::Const) {
       return ScoreType();
+    } else if constexpr (PolicyType == ScorePolicyType::Flag) {
+      return ScoreType(1);
     } else if constexpr (PolicyType == ScorePolicyType::GlobalTimer) {
       ScoreType score;
       asm volatile("mov.u64 %0,%%globaltimer;" : "=l"(score));
@@ -76,6 +84,9 @@ template <ScorePolicyType PolicyType> struct ScorePolicy {
                                                      ScoreType score) {
     if constexpr (PolicyType == ScorePolicyType::Const) {
       return *table_score;
+    } else if constexpr (PolicyType == ScorePolicyType::Flag) {
+      *table_score = ScoreType(1);
+      return ScoreType(1);
     } else if constexpr (PolicyType == ScorePolicyType::Accumulate) {
       score += *table_score;
       *table_score = score;

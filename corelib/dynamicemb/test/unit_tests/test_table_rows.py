@@ -12,10 +12,19 @@ rehash can carry them along instead of moving values.
 
 import pytest
 import torch
+from dynamicemb.key_ownership import murmur3_hash_64bits
 from dynamicemb.scored_hashtable import ScoreArg, ScoreSpec, get_scored_table
 from dynamicemb_extensions import ScorePolicy
 
 BUCKET = 16
+EMPTY_KEY = (1 << 64) - 1
+RECLAIM_KEY = (1 << 64) - 2
+
+
+def _digest_of(key):
+    """The digest a slot holding ``key`` carries (``Bucket::key_to_digest``: the high
+    word of the mixed key, its low byte)."""
+    return (murmur3_hash_64bits(key) >> 32) & 0xFF
 
 
 def _table(capacity, use_rows=True):
@@ -99,6 +108,10 @@ def test_erased_slot_keeps_its_row_for_the_next_key():
     present = table.erase(gone, gone_tids, return_indices=True)
     assert bool((present >= 0).all())
     assert table.num_rows(0) == BUCKET, "erase does not hand rows back"
+    # An erased slot holds ReclaimKey, so it carries that key's digest, not the empty
+    # one: the same as after an erase by score.
+    for slot in present.tolist():
+        assert int(table.digests_[0][slot]) == _digest_of(RECLAIM_KEY)
     again = table.erase(gone, gone_tids, return_indices=True)
     assert bool((again < 0).all()), "erasing a missing key reports -1"
 
@@ -151,6 +164,13 @@ def test_rehash_carries_rows_and_reclaimed_slots(erased):
     reclaimed = keys_col == reclaim_key
     assert int(reclaimed.sum()) == erased
     assert sorted(rows_col[reclaimed].tolist()) == sorted(rows[:erased].tolist())
+
+    # A reclaimed slot holds ReclaimKey, so it carries that key's digest -- as after
+    # an erase -- and not the empty digest the new table was filled with.
+    assert _digest_of(RECLAIM_KEY) != _digest_of(EMPTY_KEY), "nothing to tell apart"
+    digests = new.digests_
+    assert bool((digests[reclaimed] == _digest_of(RECLAIM_KEY)).all())
+    assert bool((digests[keys_col == -1] == _digest_of(EMPTY_KEY)).all())
     assert new.num_rows(0) == old.num_rows(0)
 
     # The live keys keep their rows ...
@@ -167,14 +187,17 @@ def test_rehash_carries_rows_and_reclaimed_slots(erased):
 
 
 def test_restore_reclaimed_slots_recreates_what_an_erase_leaves():
-    # One bucket with 8 live keys. The two states a slot can be in when a replica
+    # One bucket with 8 live keys. The three states a slot can be in when a replica
     # restores it, after its own erase of the key it held has run:
     #  - empty: the replica never held the erased key. The slot becomes reclaimed
     #    and takes the row.
     #  - reclaimed: it did hold it, and the erase left the slot reclaimed with
     #    the row it had. Restoring changes nothing.
-    # A different row on a reclaimed slot, or a live key in the slot, is asserted
-    # on the device, which cannot be exercised in-process.
+    #  - a live key (with the row the delta names): it is erased, the slot left
+    #    reclaimed.
+    # Whichever way it ends reclaimed, the slot holds ReclaimKey and its digest.
+    # A different row on a reclaimed slot (or on the live key's slot) is asserted on
+    # the device, which cannot be exercised in-process.
     table = _table(BUCKET)
     keys = _keys(0, 8)
     tids, score = _args(table, keys)
@@ -189,6 +212,8 @@ def test_restore_reclaimed_slots_recreates_what_an_erase_leaves():
     empty = int((key_col == -1).nonzero()[0])
     table.restore_reclaimed_slots(pack(empty, 100), 0)
     assert int(key_col[empty]) == -2 and int(table.rows_[empty]) == 100
+    # ... and, holding ReclaimKey, carries that key's digest, not the empty one it had.
+    assert int(table.digests_[0][empty]) == _digest_of(RECLAIM_KEY)
     assert int(table.bucket_sizes.sum()) == size, "reclaimed slots are not counted"
 
     # A row is a full int64: one past 2^32 survives the round trip.
@@ -196,6 +221,7 @@ def test_restore_reclaimed_slots_recreates_what_an_erase_leaves():
     big_row = (1 << 33) + 5
     table.restore_reclaimed_slots(pack(empty2, big_row), 0)
     assert int(key_col[empty2]) == -2 and int(table.rows_[empty2]) == big_row
+    assert int(table.digests_[0][empty2]) == _digest_of(RECLAIM_KEY)
 
     # Reclaimed: a real erase, which changes the key but leaves the row behind.
     victim = keys[:1]
@@ -208,6 +234,20 @@ def test_restore_reclaimed_slots_recreates_what_an_erase_leaves():
     table.restore_reclaimed_slots(pack(victim_slot, victim_row), 0)
     assert int(key_col[victim_slot]) == -2
     assert int(table.rows_[victim_slot]) == victim_row
+    assert int(table.digests_[0][victim_slot]) == _digest_of(RECLAIM_KEY)
+
+    # A live key still in the slot (the source evicted it with another key, then
+    # erased that one): it is erased the way an erase does, the slot left
+    # reclaimed with the row it already owns, and the table one key smaller.
+    live_slot = int((key_col == int(keys[1])).nonzero()[0])
+    live_row = int(rows[1])
+    assert int(table.digests_[0][live_slot]) == _digest_of(int(keys[1]))
+    before = int(table.bucket_sizes.sum())
+    table.restore_reclaimed_slots(pack(live_slot, live_row), 0)
+    assert int(key_col[live_slot]) == -2
+    assert int(table.rows_[live_slot]) == live_row
+    assert int(table.bucket_sizes.sum()) == before - 1
+    assert int(table.digests_[0][live_slot]) == _digest_of(RECLAIM_KEY)
 
 
 def test_row_limit_is_asserted_on_the_device():

@@ -143,9 +143,10 @@ __global__ void collect_reclaimed_rows_kernel(
 // reclaimed. Linear probing fills the same set of slots whatever the order the
 // threads claim them in, so the key layout does not depend on scheduling.
 __global__ void place_reclaimed_rows_kernel(
-    int64_t *__restrict__ keys, int64_t key_stride, int64_t *__restrict__ rows,
-    int64_t const *__restrict__ carried, int64_t n, int64_t bkt_begin,
-    int64_t num_slots, int64_t bucket_capacity) {
+    int64_t *__restrict__ keys, int64_t key_stride,
+    uint8_t *__restrict__ digests, int64_t digest_stride,
+    int64_t *__restrict__ rows, int64_t const *__restrict__ carried, int64_t n,
+    int64_t bkt_begin, int64_t num_slots, int64_t bucket_capacity) {
   for (int64_t j = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
        j < n; j += static_cast<int64_t>(gridDim.x) * blockDim.x) {
     // A hole means fewer reclaimed rows were found than the counters promised.
@@ -174,6 +175,10 @@ __global__ void place_reclaimed_rows_kernel(
           static_cast<unsigned long long>(kEmptyKey),
           static_cast<unsigned long long>(kReclaimedKey));
       if (static_cast<int64_t>(old) == kEmptyKey) {
+        // The slot holds ReclaimKey now, so it carries that key's digest, as an
+        // erase leaves it -- not the empty one the new table was filled with.
+        digests[bucket * digest_stride + iter] =
+            LinearBucket<int64_t>::reclaimed_digest();
         rows[bucket * bucket_capacity + iter] = carried[j];
         placed = true;
       }
@@ -212,10 +217,14 @@ at::Tensor table_collect_reclaimed_rows(at::Tensor keys, at::Tensor rows,
   return out;
 }
 
-void table_place_reclaimed_rows(at::Tensor keys, at::Tensor rows,
-                                at::Tensor carried, int64_t bkt_begin,
-                                int64_t bkt_end, int64_t bucket_capacity) {
+void table_place_reclaimed_rows(at::Tensor keys, at::Tensor digests,
+                                at::Tensor rows, at::Tensor carried,
+                                int64_t bkt_begin, int64_t bkt_end,
+                                int64_t bucket_capacity) {
   check_keys_view(keys);
+  TORCH_CHECK(digests.is_cuda() && digests.scalar_type() == at::kByte &&
+                  digests.dim() == 2 && digests.stride(1) == 1,
+              "digests must be the [num_buckets, bucket_capacity] uint8 column");
   TORCH_CHECK(rows.is_cuda() && rows.scalar_type() == at::kLong);
   TORCH_CHECK(carried.is_cuda() && carried.scalar_type() == at::kLong);
   int64_t n = carried.numel();
@@ -227,8 +236,9 @@ void table_place_reclaimed_rows(at::Tensor keys, at::Tensor rows,
   int64_t grid = std::min<int64_t>((n + BLOCK - 1) / BLOCK, 1 << 20);
   cudaStream_t stream = at::cuda::getCurrentCUDAStream();
   place_reclaimed_rows_kernel<<<grid, BLOCK, 0, stream>>>(
-      keys.data_ptr<int64_t>(), keys.stride(0), rows.data_ptr<int64_t>(),
-      carried.data_ptr<int64_t>(), n, bkt_begin, num_slots, bucket_capacity);
+      keys.data_ptr<int64_t>(), keys.stride(0), digests.data_ptr<uint8_t>(),
+      digests.stride(0), rows.data_ptr<int64_t>(), carried.data_ptr<int64_t>(),
+      n, bkt_begin, num_slots, bucket_capacity);
   DEMB_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
@@ -250,6 +260,8 @@ void table_place_reclaimed_rows(at::Tensor keys, at::Tensor rows,
 //    slot is reclaimed there. The key is erased the way the erase kernel does --
 //    score words cleared, digest emptied, bucket_sizes decremented -- and the
 //    slot then must own the row, like the reclaimed case.
+// A slot that ends reclaimed -- the empty one and the live one -- is left as an
+// erase leaves it: ReclaimKey, and that key's digest.
 // Reclaimed slots are not counted in bucket_sizes. The slots of one call must be
 // distinct -- the erased slots are de-duplicated when they are popped, since a
 // slot erased, refilled and erased again is still one reclaimed slot with one
@@ -300,10 +312,13 @@ __global__ void restore_reclaimed_slots_kernel(
     } else {
       for (int64_t k = 0; k < ns; ++k)
         *bucket.scores(iter, k) = ScoreType();
-      *bucket.digests(iter) = Bucket::empty_digest();
       atomicSub(bucket_sizes + bucket_id, 1);
       CUDA_KERNEL_ASSERT(rows[flat] == row);
     }
+    // Either way the slot ends holding ReclaimKey, so it carries that key's
+    // digest, as an erase leaves it: an empty slot that became reclaimed still
+    // has the empty one.
+    *bucket.digests(iter) = Bucket::reclaimed_digest();
     bucket.unlock(iter, Bucket::reclaimed_key());
   }
 }
