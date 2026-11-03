@@ -131,9 +131,13 @@ exported. Tests: `test/test_transformer_infer_layer_fp8.py` and
 with one FlashAttention 4 varlen kernel over the packed tokens: FA4's causal mask
 plus a `score_mod` that hides the other candidates from each candidate. With a
 paged KV cache the history is first gathered from the pages into packed K/V. The
-Docker image installs FA4 (`flash_attn.cute`, fa4-v4.0.0.beta17 with an SM120
-fix). FA4 attention works with bf16 and FP8 projections and with CUDA graphs, and
-cannot be exported. Tests: `test/test_transformer_infer_layer_fa4.py`.
+Docker image installs FA4 (`flash_attn.cute`) from its PyPI wheel,
+`flash-attn-4==4.0.0b21`, the first release with the SM120 varlen fix, without
+its dependencies: the release asks for CUTLASS DSL 4.6 and quack 0.5.3, but runs
+with the image's 4.5.2 and 0.4.1, on which all FA4 tests pass. Elsewhere, install
+it the same way: `pip install --no-deps flash-attn-4==4.0.0b21`. FA4 attention
+works with bf16 and FP8 projections and with CUDA graphs, and cannot be exported.
+Tests: `test/test_transformer_infer_layer_fa4.py`.
 
 ## Validation and limitations
 

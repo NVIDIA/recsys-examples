@@ -131,11 +131,12 @@ class Fa4AttentionMixin:
 def _with_end_sentinel(values):
     """``values`` as a view of a copy one element longer that repeats the last one.
 
-    FA4's varlen scheduler (4.0.0b17) also runs spare CTAs for the batch index past the
-    last user: they read ``cu_seqlens[batch + 1]`` and the score_mod reads
-    ``candidates[batch]``, one element out of bounds (compute-sanitizer on SM120). Out of
-    bounds memory can give such a CTA a nonzero length, so it reads and writes outside the
-    tensors (illegal addresses, overwritten rows). The repeated end makes it empty.
+    FA4's varlen scheduler (4.0.0b17 through 4.0.0b21) also runs spare CTAs for the
+    batch index past the last user: they read ``cu_seqlens[batch + 1]`` and the score_mod
+    reads ``candidates[batch]``, one element out of bounds (compute-sanitizer on SM120).
+    Out of bounds memory can give such a CTA a nonzero length, so it reads and writes
+    outside the tensors (illegal addresses, overwritten rows). The repeated end makes it
+    empty.
     """
     return torch.cat((values, values[-1:]))[:-1]
 

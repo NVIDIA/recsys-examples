@@ -315,20 +315,12 @@ RUN cd /workspace/deps/DeepGEMM && \
     python3 -c 'import importlib.metadata as m; print("deep_gemm", m.version("deep_gemm"))' && \
     rm -rf /workspace/deps/DeepGEMM
 
-# Install FlashAttention 4 (flash_attn.cute), the FA4 attention of the Transformer
-# inference backbone, into the base image's flash_attn package. fa4-v4.0.0.beta17 is
-# the newest release that accepts CUTLASS DSL 4.5; later ones need 4.6. Its SM120
-# varlen forward needs the fix of fa4-v4.0.0.beta21 (no TMA store of O in the
-# SM80-derived kernel), applied and checked here.
-ARG FLASH_ATTN_4_TAG=fa4-v4.0.0.beta17
-RUN git clone --depth 1 --branch ${FLASH_ATTN_4_TAG} \
-      https://github.com/Dao-AILab/flash-attention.git /workspace/deps/flash-attention && \
-    cd /workspace/deps/flash-attention && \
-    sed -i 's/self.use_tma_O = self.arch >= Arch.sm_90$/self.use_tma_O = Arch.sm_90 <= self.arch < Arch.sm_120/' \
-      flash_attn/cute/flash_fwd.py && \
-    grep -q 'self.use_tma_O = Arch.sm_90 <= self.arch < Arch.sm_120' flash_attn/cute/flash_fwd.py && \
-    pip install --no-cache-dir --no-deps ./flash_attn/cute && \
-    rm -rf /workspace/deps/flash-attention
+# Install FlashAttention 4 (flash_attn.cute, pure Python), the FA4 attention of the
+# Transformer inference backbone, into the base image's flash_attn package. 4.0.0b21
+# is the first release with the SM120 varlen fix. It asks for CUTLASS DSL 4.6 and
+# quack 0.5.3 but runs with the image's 4.5 and 0.4, hence --no-deps.
+RUN pip install --no-cache-dir --no-deps flash-attn-4==4.0.0b21 && \
+    python3 -c 'import importlib.metadata as m; print("flash-attn-4", m.version("flash-attn-4"))'
 
 # ============================================================================
 # Stage 4: build — devel + recsys-examples in-tree builds (dynamicemb, commons,
