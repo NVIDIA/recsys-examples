@@ -18,8 +18,9 @@ Each loop and pipeline trains on the same batches as the plain loop, or as
 TorchRec's dists, and must give the same outputs and tables, bit for bit
 (with a power-of-two world size of at most 128, every sum is exact). Its
 last steps also count the host syncs and the kernels of each call. Then
-calls over the capacities under the pipelines, stress runs, shardings that
-take TorchRec's dists, and the teardown with a pipeline in flight. On one
+calls over the capacities, which raise, under each loop and pipeline,
+stress runs, shardings that take TorchRec's dists, and the teardown with a
+pipeline in flight. On one
 GPU the sharding takes TorchRec's dists. On a build without the op (NCCL
 older than 2.30.7), "fused" raises and "auto" takes TorchRec's dists.
 
@@ -627,12 +628,6 @@ def capacities_of(spec: Spec, rank: int) -> List[Dict[str, int]]:
     return capacities
 
 
-def fallbacks_of(spec: Spec, num_shardings: int) -> List[int]:
-    """The calls of each sharding a run moves to TorchRec's dists (it feeds
-    every batch): the last sharding's of ``spec.over``."""
-    return [0] * (num_shardings - 1) + [len(spec.over)]
-
-
 # ── instrumentation: ranges ──────────────────────────────────────────────────
 
 
@@ -648,17 +643,16 @@ def _in_range(owner, name: str, label: str) -> None:
 
 def instrument() -> None:
     """Ranges around the hierarchical dist's steps, in which the profiler
-    counts host syncs and launches: ``hier::part1`` (the EC's
-    ``input_dist``), ``hier::start`` and ``hier::wait`` (the first and the
-    second wait of a call), ``hier::forward`` and ``hier::backward`` (the
-    output dist's kernels)."""
-    _in_range(ShardedDynamicEmbeddingCollection, "input_dist", "hier::part1")
+    counts host syncs and launches: ``hier::input`` (the EC's
+    ``input_dist``, which queues the op's whole input dist), ``hier::wait``
+    (the second wait of a call, ``HierSharding.finish``), ``hier::forward``
+    and ``hier::backward`` (the output dist's kernels)."""
+    _in_range(ShardedDynamicEmbeddingCollection, "input_dist", "hier::input")
     if not GIN:
         return
-    _in_range(HierOutputDist, "start", "hier::start")
-    _in_range(HierOutputDist, "wait", "hier::wait")
-    _in_range(HierOutputDist, "forward", "hier::forward")
-    _in_range(HierOutputDist, "backward", "hier::backward")
+    _in_range(HierSharding, "finish", "hier::wait")
+    _in_range(HierOutputDist, "output_dist_fwd", "hier::forward")
+    _in_range(HierOutputDist, "output_dist_bwd", "hier::backward")
 
 
 # Every hierarchical dist built, to check its teardown ran.
@@ -753,15 +747,12 @@ def d2h_shapes(prof, label: str) -> List[List[int]]:
     ]
 
 
-def sync_checks(prof, part1: bool = True) -> Tuple[Dict[str, bool], str]:
+def sync_checks(prof, input_dist: bool = True) -> Tuple[Dict[str, bool], str]:
     """The hierarchical dist's host syncs and kernels in a profile of whole
-    steps: no sync in part 1 (but where ``part1`` is False) and the first
-    wait, one sync in each second wait with one D2H copy, the status's, also
-    in a call that does not fit (TorchRec's input dist runs after it); and in
-    the calls that take the op, no sync in the output dist and one kernel per
-    direction."""
-    ranges_part1, syncs_part1 = syncs_in(prof, "hier::part1")
-    ranges_start, syncs_start = syncs_in(prof, "hier::start")
+    steps: no sync in the input dist (but where ``input_dist`` is False), one
+    sync in each second wait with one D2H copy, the status's; no sync in the
+    output dist and one kernel per direction."""
+    ranges_input, syncs_input = syncs_in(prof, "hier::input")
     ranges_wait, syncs_wait = syncs_in(prof, "hier::wait")
     ranges_fwd, syncs_fwd = syncs_in(prof, "hier::forward")
     ranges_bwd, syncs_bwd = syncs_in(prof, "hier::backward")
@@ -769,10 +760,9 @@ def sync_checks(prof, part1: bool = True) -> Tuple[Dict[str, bool], str]:
     fwd = launched_in(prof, "hier::forward")
     bwd = launched_in(prof, "hier::backward")
     checks = {
-        "input dist syncs": ranges_start > 0
+        "input dist syncs": ranges_input > 0
         and ranges_wait > 0
-        and (syncs_part1 == 0 or not part1)
-        and syncs_start == 0
+        and (syncs_input == 0 or not input_dist)
         and syncs_wait == ranges_wait,
         "one D2H of the status": d2h == [[STATUS_WORDS]] * ranges_wait,
         "output dist syncs": ranges_fwd > 0
@@ -784,9 +774,8 @@ def sync_checks(prof, part1: bool = True) -> Tuple[Dict[str, bool], str]:
         and all("bwd_kernel" in name for name in bwd),
     }
     text = (
-        f" (part 1 x{ranges_part1} {syncs_part1} syncs, first wait"
-        f" x{ranges_start} {syncs_start} syncs, second wait x{ranges_wait}"
-        f" {syncs_wait} syncs D2H {d2h}; out forward x{ranges_fwd}"
+        f" (input dist x{ranges_input} {syncs_input} syncs, second wait"
+        f" x{ranges_wait} {syncs_wait} syncs D2H {d2h}; out forward x{ranges_fwd}"
         f" {syncs_fwd} syncs {len(fwd)} kernels, backward x{ranges_bwd}"
         f" {syncs_bwd} syncs {len(bwd)} kernels)"
     )
@@ -798,7 +787,7 @@ def eval_checks(prof) -> Tuple[Dict[str, bool], str]:
     hierarchical dist at all."""
     ran = {
         name: len(ranges_in(prof, f"hier::{name}"))
-        for name in ("start", "wait", "forward", "backward")
+        for name in ("wait", "forward", "backward")
     }
     return {"eval on TorchRec's dists": not any(ran.values())}, f"; eval steps {ran}"
 
@@ -951,9 +940,8 @@ def run(
     "torchrec" its DynamicEmb tables get no capacities, else those of
     ``spec`` (:func:`capacities_of`). Its outputs, tables and frequencies,
     and its checks: whether its tables rehashed if they start small; on the
-    hierarchical dist the calls of each sharding that ran on TorchRec's
-    dists, the host syncs and kernels of the last steps, and that the eval
-    epoch ran none of the hierarchical dist's steps."""
+    hierarchical dist the host syncs and kernels of the last steps, and that
+    the eval epoch ran none of the hierarchical dist's steps."""
     capacities: List[Optional[Dict[str, int]]] = [None]
     if output_dist != "torchrec":
         capacities = capacities_of(spec, rank)
@@ -1040,14 +1028,10 @@ def run(
         hier for hier in hiers_of(model) if hier is not None and hier.takes_hier_dist
     ]
     if hiers:
-        fallbacks = [hier.fallbacks for hier in hiers]
-        expected = fallbacks_of(spec, len(hiers))
-        result.checks["fallbacks"] = fallbacks == expected
-        if any(fallbacks) or any(expected):
-            result.text = f" (calls on TorchRec's dists, per sharding: {fallbacks})"
         if profiling:
-            # VBE adds TorchRec's own syncs to part 1 (its sequence context)
-            checks, text = sync_checks(prof, part1=not spec.vbe)
+            # VBE adds TorchRec's own syncs to the input dist (its sequence
+            # context)
+            checks, text = sync_checks(prof, input_dist=not spec.vbe)
             result.checks.update(checks)
             result.text += text
         if eval_prof is not None:
@@ -1225,7 +1209,7 @@ def run_matrix(rank: int, log: Callable, core: bool, need_megatron: bool) -> int
         failures += against(f"{kind} vs the plain loop", plain, COUNTED, kind)[0]
     del torchrec_run, plain
     failures += run_overflows(rank, log, megatron_kinds)
-    failures += run_fallbacks(rank, log, core)
+    failures += run_torchrec_shardings(rank, log, core)
     if core:
         return failures
 
@@ -1259,42 +1243,32 @@ def run_matrix(rank: int, log: Callable, core: bool, need_megatron: bool) -> int
 
 
 def run_overflows(rank: int, log: Callable, megatron_kinds: List[str]) -> int:
-    """Calls over the capacities under the pipelines. OVER's capacities fit
-    its small batches alone, so that its two large calls run on TorchRec's
-    dists, on every rank alike, and the sharding counts them. The plain loop
-    against TorchRec's dists; each pipeline against the plain loop, but
-    TrainPipelineSemiSync, whose outputs are not the plain loop's, against
-    itself with capacities that fit every call. Then two row-wise shardings,
-    the first with capacities that fit every call and the second with
-    OVER's: only the second's calls fall back."""
-    against = partial(run_against, rank=rank, log=log)
+    """Calls over the capacities under each loop and pipeline. OVER's
+    capacities fit its small batches alone, so its first large call raises
+    RuntimeError at its second wait, on every rank alike, naming the
+    capacity to raise, wherever the loop or the pipeline waits for it.
+    Nothing hangs, and the model then goes. Then two row-wise shardings, the
+    first with capacities that fit every call: the second's call raises."""
     failures = 0
-    torchrec_run = run(OVER, "torchrec", "plain", rank)
-    failed, plain = against(
-        "plain loop vs TorchRec's dists", torchrec_run, OVER, "plain"
-    )
-    failures += failed
-    for kind in ["base", "sparse_dist", "prefetch", *fused_kinds(), *megatron_kinds]:
-        failures += against(f"{kind} vs the plain loop", plain, OVER, kind)[0]
-    del torchrec_run, plain
-    semisync = run(replace(OVER, over=()), "fused", "semisync", rank)
-    failures += against(
-        "semisync vs itself with capacities that fit every call",
-        semisync,
-        OVER,
-        "semisync",
-    )[0]
-    del semisync
-    spec = replace(
+    second = replace(
         OVER, name="calls over the second EC's capacities alone", second=True
     )
-    torchrec_run = run(spec, "torchrec", "plain", rank)
-    failed, plain = against(
-        "plain loop vs TorchRec's dists", torchrec_run, spec, "plain"
-    )
-    failures += failed
-    for kind in ["sparse_dist", "prefetch", *megatron_kinds]:
-        failures += against(f"{kind} vs the plain loop", plain, spec, kind)[0]
+    kinds = ["plain", "base", "sparse_dist", "prefetch", "semisync", *fused_kinds()]
+    for spec, spec_kinds in (
+        (OVER, kinds + megatron_kinds),
+        (second, ["plain", "sparse_dist", "prefetch", *megatron_kinds]),
+    ):
+        for kind in spec_kinds:
+            try:
+                run(spec, "fused", kind, rank)
+                raised = ""
+            except RuntimeError as error:
+                raised = str(error)
+            checks = {
+                "raises": "output_dist_capacity" in raised and "_keys from" in raised
+            }
+            failures += report(f"{spec.name}: {kind} raises", checks, log)
+            failures += gc_models(log)
     return failures
 
 
@@ -1377,7 +1351,7 @@ def run_stress(rank: int, log: Callable) -> int:
     return failures
 
 
-# ── fallbacks ────────────────────────────────────────────────────────────────
+# ── shardings on TorchRec's dists ────────────────────────────────────────────
 
 
 def warned(fn: Callable, text: str):
@@ -1388,7 +1362,7 @@ def warned(fn: Callable, text: str):
     return out, any(text in str(warning.message) for warning in caught)
 
 
-def run_fallbacks(rank: int, log: Callable, core: bool) -> int:
+def run_torchrec_shardings(rank: int, log: Callable, core: bool) -> int:
     """Shardings that take TorchRec's dists, equal to TorchRec's: a plain
     TorchRec table in the row-wise sharding (under TrainPipelineSparseDist);
     and, but in the version matrix, feature processors (the decision) and

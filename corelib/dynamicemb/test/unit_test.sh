@@ -26,7 +26,7 @@ FWD_BWD_TEST_FILES=(
     "test/unit_tests/test_planner_placement.py"
     "test/unit_tests/test_table_row_wise.sh"
     "test/unit_tests/test_hier_dist.sh"
-    "test/unit_tests/test_hier_fallback.sh"
+    "test/unit_tests/test_hier_overflow.sh"
     "test/unit_tests/test_hier_pipeline.sh"
 )
 

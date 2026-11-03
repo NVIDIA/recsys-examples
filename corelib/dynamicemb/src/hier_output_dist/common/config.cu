@@ -49,48 +49,81 @@ std::string unsupported(int world_size, int local_size, int num_features, int64_
 namespace {
 
 template <typename... Parts>
-[[noreturn]] void invalid(const Parts &...parts) {
+[[noreturn]] void refuse(const Parts &...parts) {
   throw std::invalid_argument(c10::str(parts...));
 }
 
 void check_capacity(const char *name, int64_t value) {
   if (value < 1 || value >= kMaxEntries)
-    invalid("the capacity ", name, " must be in [1, 2^31 - 1024), got ", value);
+    refuse("the capacity ", name, " must be in [1, 2^31 - 1024), got ", value);
 }
 
 }  // namespace
 
 void Config::validate() const {
   const std::string why = unsupported(world_size, local_size, num_features(), row_bytes());
-  if (!why.empty()) invalid(why);
+  if (!why.empty()) refuse(why);
   if (dtype != at::kFloat && dtype != at::kBFloat16 && dtype != at::kHalf)
-    invalid("rows of the lookup output must be fp32, bf16 or fp16, got ", dtype);
+    refuse("rows of the lookup output must be fp32, bf16 or fp16, got ", dtype);
   check_capacity("lookup_keys", capacities.lookup_keys);
   if (num_nodes() > 1) {
     check_capacity("remote_keys", capacities.remote_keys);
     const int64_t rows = capacities.proxy_bytes / row_bytes();
     const int64_t least = min_proxy_rows_for(num_nodes());
     if (rows < least)
-      invalid("proxy_rows of at most ", (double)capacities.proxy_bytes / (1 << 20), " MiB holds ",
-              rows, " rows of ", row_bytes(), " bytes, and across ", num_nodes(),
-              " nodes every round fits its half only with at least ", least, " (",
-              (least * row_bytes() + (1 << 20) - 1) >> 20, " MiB); raise DYNAMICEMB_GIN_PROXY_MB");
+      refuse("proxy_rows of at most ", (double)capacities.proxy_bytes / (1 << 20), " MiB holds ",
+             rows, " rows of ", row_bytes(), " bytes, and across ", num_nodes(),
+             " nodes every round fits its half only with at least ", least, " (",
+             (least * row_bytes() + (1 << 20) - 1) >> 20, " MiB); raise DYNAMICEMB_GIN_PROXY_MB");
     const int64_t num_proxy_rows = num_proxy_rows_for(*this);
     const int64_t rounds = rounds_for(capacities.remote_keys, num_proxy_rows);
     if (rounds > kMaxRounds)
-      invalid("proxy_rows of ", num_proxy_rows, " rows holds the ", capacities.remote_keys,
-              " keys of other nodes' owners a proxy may deduplicate in ", rounds,
-              " rounds, more than the ", kMaxRounds,
-              " a call can take; raise DYNAMICEMB_GIN_PROXY_MB");
+      refuse("proxy_rows of ", num_proxy_rows, " rows holds the ", capacities.remote_keys,
+             " keys of other nodes' owners a proxy may deduplicate in ", rounds,
+             " rounds, more than the ", kMaxRounds,
+             " a call can take; raise DYNAMICEMB_GIN_PROXY_MB");
     const int bits = push_key_of(sizes_of(*this)).bits;
     if (bits > 63)
-      invalid("the proxy sorts its push order by a key of ", bits,
-              " bits (its fields: the GPUs of a node, the rounds, and the keys and IB chunks of ",
-              "remote_keys), more than 63; lower remote_keys");
+      refuse("the proxy sorts its push order by a key of ", bits,
+             " bits (its fields: the GPUs of a node, the rounds, and the keys and IB chunks of ",
+             "remote_keys), more than 63; lower remote_keys");
   }
-  if (!(timeout_s > 0)) invalid("the timeout must be positive, got ", timeout_s);
+  if (!(timeout_s > 0)) refuse("the timeout must be positive, got ", timeout_s);
   if (ctas < 0 || reduce_ctas < 1)
-    invalid("out kernel CTAs must not be negative, and the backward needs a reducing CTA");
+    refuse("out kernel CTAs must not be negative, and the backward needs a reducing CTA");
+}
+
+std::string invalid(const Config &config) {
+  try {
+    config.validate();
+  } catch (const std::invalid_argument &error) {
+    return error.what();
+  }
+  return "";
+}
+
+Config config_of(int64_t rank, int64_t world_size, int64_t local_size,
+                 const std::vector<int64_t> &feature_tables, const at::Tensor &block_sizes,
+                 const at::Tensor &dist_types, int64_t dim, at::ScalarType dtype, bool weights,
+                 bool out_weights, bool node_dedup, int64_t lookup_keys, int64_t remote_keys,
+                 int64_t proxy_bytes, double timeout_s, int64_t ctas, int64_t reduce_ctas) {
+  Config config;
+  config.rank = (int)rank;
+  config.world_size = (int)world_size;
+  config.local_size = (int)local_size;
+  config.feature_tables.assign(feature_tables.begin(), feature_tables.end());
+  config.block_sizes = block_sizes;
+  config.dist_types = dist_types;
+  config.dim = dim;
+  config.dtype = dtype;
+  config.weights = weights;
+  config.out_weights = out_weights;
+  config.node_dedup = node_dedup;
+  config.capacities = Capacities{lookup_keys, remote_keys, proxy_bytes};
+  config.timeout_s = timeout_s;
+  config.ctas = (int)ctas;
+  config.reduce_ctas = (int)reduce_ctas;
+  return config;
 }
 
 // ── the sizes ──

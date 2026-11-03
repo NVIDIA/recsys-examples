@@ -46,22 +46,24 @@ operator per sharding, `HierOutputDist`, does the work (section 7):
   capacities the tables give (`output_dist_capacity`, section 5); its size
   never changes. A call's own tensors come from PyTorch's caching
   allocator. The ranks first check that they all build the op from the same
-  options. A call that does not fit the capacities takes TorchRec's dists
-  instead: that call alone, on every rank alike, with a warning that names
-  the capacity to raise.
-* **Only an op, on the caller's stream.** Each of its steps queues its work
-  on the current stream and returns. The caller orders the steps on its
-  streams and records the call's tensors on the streams that use them, as
-  TorchRec's training loop and train pipelines do (section 16).
+  options. A call that does not fit the capacities raises an error at its
+  second wait, on every rank alike, which names the capacity to raise.
+* **Only an op, on the caller's stream.** Its interface takes and gives
+  tensors and plain values only: the constructor, `input_dist()`,
+  `output_dist_fwd()` and `output_dist_bwd()` (section 7.1). Each queues
+  its work on the current stream and returns. The caller orders the calls
+  on its streams and records the call's tensors on the streams that use
+  them, as TorchRec's training loop and train pipelines do (section 16).
 * **The input dist does all the planning, with one host sync.** Keys move
   over NVLink inside a node and over InfiniBand between nodes, sent by the
   GPU itself (NCCL GIN). Seven custom kernels move them and wait for peers
-  (the *comm kernels*); the steps between them are PyTorch's tensor ops
-  called from C++ and CUB sorts (the *planner*). At the end every owner has
-  a ready KeyedJaggedTensor (KJT) of the keys it looks up, and every GPU has
-  the per-row maps of the output dist. The CPU waits for the GPU once per
-  call, in one blocking copy of a small status (`8 × (2 × num_features + 7)`
-  bytes) to the host.
+  (the *comm kernels*); the steps between them are kernels of its own and
+  CUB's sorts and scans (the *planner*). `input_dist()` queues all of it at
+  once. At the end every owner has a ready KeyedJaggedTensor (KJT) of the
+  keys it looks up, and every GPU has the per-row maps of the output dist.
+  The CPU waits for the GPU once per call, at the call's second wait, in
+  one blocking copy of a small status (`8 × (2 × num_features + 7)` bytes)
+  to the host.
 * **The lookup only looks up.** DynamicEmb's lookup writes its rows straight
   into a buffer that the output dist reads (zero copy).
 * **The output dist only moves rows**, in one kernel per direction. It
@@ -147,7 +149,7 @@ this dist with TorchRec's dists.
 * **Skewed keys**: keys drawn so that a few of them are very common (a *hot*
   key appears in many samples).
 * **Fall back**: take TorchRec's dists instead, for a whole sharding
-  (section 6) or for one call (section 5.4).
+  (section 6), or for an eval forward.
 
 ## 3. Why
 
@@ -232,7 +234,7 @@ every rank before you drop a model (section 4.6).
 | option | default | meaning |
 |---|---|---|
 | `output_dist` | `"torchrec"` | `"torchrec"`: TorchRec's dists. `"fused"`: the hierarchical dist. It needs `output_dist_capacity` (without it, making the options raises `ValueError`), and a build without NCCL ≥ 2.30.7 raises `ImportError` when the model is sharded. `"auto"`: `"fused"` where the build has it and `output_dist_capacity` is set, else TorchRec's dists, with a warning. Any other value raises `ValueError`. |
-| `output_dist_capacity` | `None` | The capacities of the op's buffers, in keys (section 5). An int sets `lookup_keys` and `remote_keys` to that many. A dict sets them by name: `lookup_keys`, and across nodes also `remote_keys` (one node uses `lookup_keys` alone). Each capacity is a positive int below 2^31 − 1024; other values or names raise `ValueError` when the options are made. A call that needs more of one runs on TorchRec's dists (section 5.4). TorchRec's dists ignore it. |
+| `output_dist_capacity` | `None` | The capacities of the op's buffers, in keys (section 5). An int sets `lookup_keys` and `remote_keys` to that many. A dict sets them by name: `lookup_keys`, and across nodes also `remote_keys` (one node uses `lookup_keys` alone). Each capacity is a positive int below 2^31 − 1024; other values or names raise `ValueError` when the options are made. A call that needs more of one raises `RuntimeError` at its second wait, on every rank (section 5.4). TorchRec's dists ignore it. |
 | `node_dedup` | `True` | Across nodes, the proxy sends one key per (owner node, table, key), and the node adds up its gradient rows before they cross back. `False` sends every occurrence (more IB traffic) and keeps TorchRec's gradient row per occurrence (section 18). Gradient clipping turns it off by itself. |
 
 ### 4.4 Environment variables
@@ -332,8 +334,7 @@ The words used in this section and in section 15:
 Two more sizes follow from these (section 15.3): `proxy_rows` holds
 `remote_keys` rows, up to its cap, and the round tables hold the rounds
 that `remote_keys` rows take in it (`rounds_cap`). A call whose rows do not
-fit `proxy_rows` moves them in rounds (section 12.1). The op's
-`capacities()` gives them all.
+fit `proxy_rows` moves them in rounds (section 12.1).
 
 Say a hot key makes up a share `hot_share` of every rank's keys. It adds
 about `local_size × hot_share × num_keys` occurrences on its owner's rail:
@@ -384,8 +385,8 @@ capacities = hier_capacities(needs, headroom=1.25)
   room than it needs, which costs memory (section 5.3).
 * **Skewed keys and changing batches.** The needs grow with the hot keys'
   share and with the longest batches. Count them on enough batches, or add
-  more headroom. A call that does not fit still runs, on TorchRec's dists,
-  and its warning gives what it needed (section 5.4).
+  more headroom. A call that does not fit raises, and its error gives what
+  it needed (section 5.4).
 * **The benchmark** counts the needs of its own batches before it builds
   the model (`--capacity measure`, the default) and takes
   `--capacity_headroom` (1.25) times them, and at least 4096 entries more
@@ -417,35 +418,22 @@ The call's status holds its needs: the most any rank needs of each
 capacity, the same on every rank (section 10.5). When the call needs more of
 some capacity than the op has:
 
-* **That call alone takes TorchRec's dists, on every rank.** Its input dist
-  runs TorchRec's all-to-alls on the keys that part 1 took (DynamicEmb's
-  bucketize first, with the host syncs TorchRec's input dist makes). Its
-  lookup and output dist are TorchRec's too, and the lookup does not write
-  `lookup_rows`. Under index dedup, TorchRec copies the rows back to their
-  original positions as it does on its own path. The calls before and after
-  take the op.
-* **A warning names each capacity the call overflowed**, how large it is,
-  and what the call needed of it. For example:
-  `output_dist="fused": a call does not fit the capacities, so it runs on
-  TorchRec's dists (1 calls so far); raise output_dist_capacity's
-  lookup_keys from 541000 to at least 541801`. It comes at the first such
-  call, and then at the 2nd, 4th, 8th and every further power of two.
-* **A counter.** Each sharding counts such calls (`HierSharding.fallbacks`;
-  the benchmark sums them over a model and reports them).
-* The first wait still runs every step of such a call, and its comm kernels
-  send their messages, so the sequence numbers and running totals stay
-  valid for the next call. Nothing is written past a capacity. When a GPU
-  would get more of its node's keys than a capacity holds (its own part
-  above `lookup_keys`, or across nodes its remote part above `remote_keys`),
-  no GPU of that node pushes its keys. And an owner whose keys pass
-  `lookup_keys` gets no key records. Telling that a call does not fit costs
-  nothing more: the needs come with the call's one host sync.
+* **Its second wait raises RuntimeError, on every rank alike.** The error
+  names each capacity the call overflowed, how large it is, and what the
+  call needed of it. For example: `output_dist="fused": a call needs more
+  than the capacities hold; raise output_dist_capacity's lookup_keys from
+  541000 to at least 541801`. The call makes no lookup and no output dist.
+* Its input dist still ran every step, and its comm kernels sent their
+  messages, so the sequence numbers and running totals stay valid: the op
+  takes the next call that fits. Nothing is written past a capacity. When a
+  GPU would get more of its node's keys than a capacity holds (its own part
+  above `lookup_keys`, or across nodes its remote part above
+  `remote_keys`), no GPU of that node pushes its keys. And an owner whose
+  keys pass `lookup_keys` gets no key records. Telling that a call does not
+  fit costs nothing more: the needs come with the call's one host sync.
 * When a node pushes no keys, its proxies deduplicate none, so the call's
   `lookup_keys` need leaves out the keys that node sends to other nodes. A
   later call may then name `lookup_keys` too.
-* Such a call costs what TorchRec's dists cost, and the op's window stays
-  allocated meanwhile. Calls that do not fit are meant to be rare: raise the
-  capacity the warning names.
 
 ## 6. When a sharding takes TorchRec's dists
 
@@ -468,116 +456,136 @@ state that every rank shares.
 | a configuration the op cannot take: across nodes, capacities without `remote_keys`; a proxy cap below the rows a round needs (section 15.3); a `remote_keys` that would take more than 65536 rounds of `proxy_rows`, or whose push key would pass 63 bits (section 10.4); rows that are not fp32, bf16 or fp16; an environment value it refuses (section 4.4) | first `input_dist()`, before the op is built | `"fused"`: `ValueError` on every rank; `"auto"`: a warning, TorchRec's dists |
 | On some rank: the NCCL LSA team is not the whole node. Or, across nodes, GIN does not connect the rails, has fewer than 4 contexts, or its signals do not start at 0. Or the window cannot be allocated. | first `input_dist()`, collectively | a warning that names each rank and why, TorchRec's dists on every rank |
 | an eval forward | per call | TorchRec's dists for that call |
-| a call that does not fit the capacities | per call, at its second wait | TorchRec's dists for that call, a warning (section 5.4) |
+| a call that does not fit the capacities | per call, at its second wait | `RuntimeError` on every rank, naming the capacity to raise (section 5.4) |
 
 ## 7. The operator
 
 ### 7.1 Its interface
 
-The op is a C++ class with a small interface. Python reaches it through
-pybind11, as `dynamicemb_extensions.HierOutputDist`, what it is built from
-(`HierOutputDistConfig`), the data the steps of a call hand each other
-(`HierPartOne`, `HierPending`, `HierInDistResult` with its plans
-`HierFwdPlan` and `HierBwdPlan`), `hier_output_dist_unique_id()` and
-`hier_output_dist_traced()`. The op runs every step of a call, and each
-step queues its work on the caller's current stream (section 7.3). Each step
-returns plain data, which the caller hands to the next step: nothing else
-keeps a call's state.
+The op is a C++ class with a small interface, which takes and gives tensors
+and plain values only. Python reaches it through pybind11, as
+`dynamicemb_extensions.HierOutputDist`, beside four functions of the
+module: `hier_output_dist_unique_id()` (the id of the op's communicator,
+made on one rank), `hier_output_dist_unsupported()` and
+`hier_output_dist_invalid()` (why the op does not apply to a sharding, or
+refuses a configuration, or ""; they build nothing, section 7.2), and
+`hier_output_dist_traced()`. Each call of the op queues its work on the
+caller's current stream (section 7.3). What a call gives back is data that
+the caller hands to the next call: nothing else keeps a call's state.
 
 ```cpp
 namespace dyn_emb::hier_output_dist {
 
 class HierOutputDist {  // one per sharding
  public:
-  static std::string unique_id();  // the communicator's id, made on one rank
-  // Why the op does not apply to such a sharding, or "" (section 6).
-  static std::string unsupported(int world_size, int local_size, int num_features,
-                                 int64_t row_bytes);
-  // Why the op refuses a configuration, or "". It builds nothing (section 7.2).
-  static std::string invalid(const Config &config);
-  HierOutputDist(const std::string &unique_id, Config config);  // collective (section 7.2)
+  // Collective (section 7.2). A configuration it does not take throws
+  // std::invalid_argument (Python: ValueError), on every rank alike.
+  HierOutputDist(const std::string &unique_id, int64_t rank, int64_t world_size,
+                 int64_t local_size, const std::vector<int64_t> &feature_tables,
+                 const at::Tensor &block_sizes, const at::Tensor &dist_types, int64_t dim,
+                 at::ScalarType dtype, bool weights, bool out_weights, bool node_dedup,
+                 int64_t lookup_keys, int64_t remote_keys, int64_t proxy_bytes,
+                 double timeout_s, int64_t ctas, int64_t reduce_ctas);
   ~HierOutputDist();  // local (section 4.6)
 
-  PartOne part_one(PlanInput input);          // part 1 of a call
-  Pending start(const PartOne &part);         // the first wait
-  InDistResult wait(const Pending &pending);  // the second wait, the call's one host sync
-  at::Tensor lookup_rows(int64_t num_recv);   // the rows the lookup writes, [num_recv, dim]
-  at::Tensor forward(const FwdPlan &plan, const at::Tensor &lookup_out);  // one kernel
-  at::Tensor backward(const BwdPlan &plan, const at::Tensor &grad,        // one kernel
-                      bool divide);
+  // The whole input dist of a call, with no host sync: (values, weights,
+  // lengths, offsets, lookup_rows, status, fwd_plan, bwd_plan).
+  InDistTensors input_dist(const at::Tensor &values, const c10::optional<at::Tensor> &offsets,
+                           const c10::optional<at::Tensor> &lengths, int64_t batch_size,
+                           const c10::optional<at::Tensor> &weights,
+                           const c10::optional<at::Tensor> &input_offsets,
+                           int64_t input_batch_size,
+                           const c10::optional<at::Tensor> &reverse_indices);
+  // The output dist: one kernel each.
+  at::Tensor output_dist_fwd(const std::vector<c10::optional<at::Tensor>> &fwd_plan,
+                             const at::Tensor &lookup_out);
+  at::Tensor output_dist_bwd(const std::vector<c10::optional<at::Tensor>> &bwd_plan,
+                             const std::vector<int64_t> &counts, const at::Tensor &grad,
+                             bool divide);
   void quiesce();  // collective (section 4.6)
-  // diagnostics: capacities(), memory(), trace(), trace_launches(), gin_railed()
-};
-
-struct InDistResult {  // what the input dist of a call gives, after its host sync
-  bool fits;                             // false: the call does not fit (section 5.4)
-  std::map<std::string, int64_t> needs;  // also overflows, sent, input_length_per_key
-  // when it fits: the owner's KJT (values, weights, lengths, offsets, num_sources,
-  // length_per_key, num_recv), and the output dist's plans
-  FwdPlan fwd_plan;  // what the forward kernel reads of the call
-  BwdPlan bwd_plan;  // what the backward kernel reads of it
+  // diagnostics: memory(), trace(), trace_launches()
 };
 
 }  // namespace dyn_emb::hier_output_dist
 ```
 
+The constructor takes the configuration (`Config`'s fields): the ranks, the
+table and the bucketize's rule of each feature, the rows and their weights,
+`node_dedup`, the capacities (with the proxy cap in bytes) and the knobs of
+section 4.4. `input_dist()` takes the requester's KJT (its values; offsets,
+or lengths when it has none; its batch size; its weights or none), the
+input KJT that `construct_jagged_tensors` reads when it is another one, and
+index dedup's reverse indices. It returns:
+
+* the owner's KJT: its values and weights (or none) hold `lookup_keys`
+  entries, the first `num_recv` its own; its lengths and offsets are those
+  of its `num_features × num_sources` cells;
+* `lookup_rows`, `[lookup_keys, dim]`, a view of the window: the call's
+  lookup writes its first `num_recv` rows;
+* the call's status, `int64 [2 × num_features + 7]` on the device (section
+  10.5): the needs, `num_recv`, the backward's counts, the remote
+  occurrences this rank deduplicated as proxy, and the totals per feature;
+* the output dist's plans, as lists of their tensors (`None` for those the
+  call has not).
+
 One training step in Python, as the sharding runs it (section 7.4):
 
 ```python
-part = op.part_one(values, offsets, lengths, batch_size, weights,
-                   input_offsets, input_batch_size, reverse_indices)  # input_dist()
-pending = op.start(part)                 # the first wait
-result = op.wait(pending)                # the second wait; not result.fits: TorchRec's dists
-kjt = owner_kjt(result)                  # result.values, result.lengths, ...
-rows = op.lookup_rows(result.num_recv)   # the lookup writes its rows here
-out = op.forward(result.fwd_plan, rows)
-...                                      # the dense forward and backward
-lookup_grad = op.backward(result.bwd_plan, grad_out, divide)
+values, weights, lengths, offsets, rows, status, fwd_plan, bwd_plan = op.input_dist(
+    values, offsets, lengths, batch_size, weights,
+    input_offsets, input_batch_size, reverse_indices)  # input_dist()
+words = status.cpu().tolist()  # the second wait, the call's one host sync
+# a need above its capacity: raise RuntimeError (section 5.4)
+num_recv, heavy_subs, group_subs = words[3:6]
+kjt = owner_kjt(values[:num_recv], lengths, offsets, words)  # the lookup's input
+...                            # the lookup writes its rows into rows[:num_recv]
+out = op.output_dist_fwd(fwd_plan, rows[:num_recv])
+...                            # the dense forward and backward
+lookup_grad = op.output_dist_bwd(bwd_plan, [num_recv, heavy_subs, group_subs],
+                                 grad_out, divide)
 ```
 
 The forward's plan (`FwdPlan`) and the backward's (`BwdPlan`) hold only what
 the input dist made: the requester's maps and the call's tables (section
 11.1). Each table both kernels read is the same tensor in both plans. The
-output dist takes the lookup's output with the forward's plan, and the
-gradient with the backward's.
+op gives each as the list of its tensors (`tensors()`), and makes it again
+from such a list (`of()`); to Python the lists are opaque. The output dist
+takes the lookup's output with the forward's plan, and the gradient with
+the backward's plan and its counts, which only the status gives.
 
-`Config` holds everything the op needs, read once: the ranks, the table and
-the bucketize's rule of each feature, the rows and their weights,
-`node_dedup`, the capacities (with the proxy cap in bytes) and the knobs of
-section 4.4.
-
-Of the diagnostics, `capacities()` gives the capacities in place (section
-5.1), and `memory()` the bytes of the op's window, in two maps:
-`memory()["windows"]["window"]` is this rank's copy, in whole allocation
-granules, and `memory()["buffers"]` gives what each buffer takes in it, by
-name (`ctrl` for the ctrl section; sections 7.5 and 15.2).
+Of the diagnostics, `memory()` gives the bytes of the op's window, in two
+maps: `memory()["windows"]["window"]` is this rank's copy, in whole
+allocation granules, and `memory()["buffers"]` gives what each buffer takes
+in it, by name (`ctrl` for the ctrl section; sections 7.5 and 15.2).
 
 Python reads the options and the environment when the sharding is built,
 and hands them over when it builds the op. The benchmark reads a call's
-tables from its plans. The tests run the planner's steps on plain tensors
-through functions of `testing.cu`, which also has a hook that makes the
-next construction fail, and the GPU clock by which the benchmark aligns its
-timelines.
+tables from its plans (`HierCall`, `shard/hier_output_dist.py`). The tests
+run the planner's steps on plain tensors through functions of `testing.cu`,
+which also has a hook that makes the next construction fail, and the GPU
+clock by which the benchmark aligns its timelines.
 
 ### 7.2 Construction
 
 The op is built at the sharding's first `input_dist()`, in any mode, at the
 same point on every rank:
 
-1. **The ranks agree on what they build it from.** Each rank makes its
-   `Config` and asks `invalid()` whether the op takes it. Then one
+1. **The ranks agree on what they build it from.** Each rank asks
+   `hier_output_dist_invalid()` whether the op takes its configuration. Then one
    all-gather over the sharding's process group gives every rank what every
    rank would build the op from (all but its rank), and a unique id for the
    op's own NCCL communicator, made on rank 0. If some rank's configuration
    differs from rank 0's, every rank raises the same `ValueError`, which
    names that rank and the first value that differs. Else every rank has
    the same configuration, so every rank decides alike. If the op does not
-   apply (`unsupported`, section 6), every rank warns and takes TorchRec's
-   dists. If the op refuses the configuration, `"fused"` raises `ValueError`
-   on every rank and `"auto"` warns and takes TorchRec's dists.
-2. Else every rank builds the op with that id. The constructor makes the
-   communicator and its device communicator: LSA inside the node and,
-   across nodes, GIN on the rails with 4 contexts.
+   apply (`hier_output_dist_unsupported()`, section 6), every rank warns and
+   takes TorchRec's dists. If the op refuses the configuration, `"fused"`
+   raises `ValueError` on every rank and `"auto"` warns and takes TorchRec's
+   dists.
+2. Else every rank builds the op with that id. The constructor checks the
+   configuration again (it throws before any collective if it refuses it),
+   then makes the communicator and its device communicator: LSA inside the
+   node and, across nodes, GIN on the rails with 4 contexts.
 3. Each rank checks that it can run: its LSA team is the whole node, and
    across nodes GIN connects the rails with at least 4 contexts whose
    signals start at 0. Then it allocates its copy of the window (section
@@ -597,35 +605,39 @@ the window's zeroing and the agreement. After it, a call costs one.
 
 ### 7.3 One call
 
-As in TorchRec, `input_dist()` returns an awaitable. Waiting on it (the
-*first wait*) queues the rest of the input dist and returns a second
-awaitable. Waiting on that one (the *second wait*) is the call's one host
-sync, and returns the owner's KJT. Every step queues its work on the
-current stream and returns:
+As in TorchRec, `input_dist()` returns an awaitable, whose wait (the *first
+wait*) returns a second awaitable. Here `input_dist()` itself queues the
+whole input dist of the call (`op.input_dist()`), so the first wait returns
+the second awaitable at once. Waiting on that one (the *second wait*) is
+the call's one host sync: it copies the status to the host, raises if the
+call does not fit (section 5.4), and returns the owner's KJT. Every call of
+the op queues its work on the current stream and returns:
 
 ```
 the caller's stream
 -------------------
-input_dist(): part 1 (op.part_one()): the keys sorted by owner
-first wait (op.start(part)): the steps below (comm kernels and planner kernels),
-                             the last of which writes the call's status
-second wait (op.wait(pending)): a blocking copy of the status to the host, the
-                                call's one host sync; then the owner's KJT and the
-                                plans
-lookup: op.lookup_rows(num_recv), then writes its rows there (zero copy)
-forward kernel (op.forward(fwd_plan, rows)): the rows
+input_dist() (op.input_dist()): part 1 (the keys sorted by owner), then the
+               steps below (comm kernels and planner kernels), the last of
+               which writes the call's status
+first wait:    nothing
+second wait:   a blocking copy of the status to the host, the call's one
+               host sync; then the owner's KJT
+lookup:        writes its rows into lookup_rows (zero copy)
+forward kernel (op.output_dist_fwd(fwd_plan, rows)): the rows
 ... dense forward and backward ...
-backward kernel (op.backward(bwd_plan, grad, divide)): gradient rows into the owners'
-                 lookup_rows, handed to the lookup's backward as lookup_grad
+backward kernel (op.output_dist_bwd(bwd_plan, counts, grad, divide)): gradient
+               rows into the owners' lookup_rows, handed to the lookup's
+               backward as lookup_grad
 ```
 
 The op orders nothing across streams. The caller runs each step on the
 stream of the step before it, or on a stream it ordered after that one. In
 a plain loop every step runs on the default stream. Under TorchRec's train
-pipelines the input dist (part 1 and both waits) runs on the pipeline's
-data_dist stream (section 16).
+pipelines the input dist (`input_dist()` and both waits) runs on the
+pipeline's data_dist stream (section 16).
 
-The first wait queues these steps, in this order, on every rank. A *comm*
+After part 1, `input_dist()` queues these steps, in this order, on every
+rank. A *comm*
 step is a comm kernel (section 10.2); the others are the planner's kernels,
 with CUB's sorts and scans.
 
@@ -656,15 +668,16 @@ nodes every step runs but the owner's KJT.
 The second wait queues nothing after its sync: the owner's KJT is a view of
 the first `num_recv` of its values.
 
-Part 1 is local: no sync, no collective, no sequence number. So its result
-may be dropped before the first wait (TorchRec's prefetch pipeline does
-this): nothing has moved yet. Part 1 also does every check of the call's
-inputs. Each step's data lives as long as the caller keeps it: the first
-wait drops part 1's once the rest of the call is queued, and the second wait
-the pending call's once it has the result. The sharding context keeps the
-result until the output dist's forward takes the plans: the forward's plan
-goes once its kernel is queued, and autograd keeps the backward's (sections
-7.4 and 11.1).
+`input_dist()` checks the call's inputs first, and advances the in
+channel's sequence number: every rank runs the same calls in the same
+order. A call whose awaitables are dropped still ran its input dist
+(TorchRec's prefetch pipeline runs the input dist of its first batch
+twice): every rank does the same, so nothing goes out of step. The second
+awaitable holds the call's inputs until its wait, since the input dist
+reads them on its stream. The sharding context keeps what the output dist
+takes until the output dist's forward takes the plans: the forward's plan
+goes once its kernel is queued, and autograd keeps the backward's
+(sections 7.4 and 11.1).
 
 ### 7.4 Around the operator: the Python sharding
 
@@ -673,39 +686,38 @@ goes once its kernel is queued, and autograd keeps the backward's (sections
   `output_alloc` to the sharding. In each call on the op, the sharding then
   hands each lookup group the next rows of the call's rows of `lookup_rows`
   (section 11.2).
-* **The input dist.** On a call that takes the op, `input_dist()` runs part
-  1 and returns an awaitable. Its wait is the first wait; waiting on it
-  again returns the same second awaitable, and dropping it changes nothing
-  (TorchRec's prefetch pipeline does both). The second wait returns the
-  owner's KJT, built from views of the result's tensors with no copy. It
-  also sets the input KJT's per-feature totals from the status, so
-  TorchRec's `construct_jagged_tensors` needs no host sync. The sharding
-  context carries the result (`hier_result`). Its `record_stream`, which
-  TorchRec's pipelines call, also records the result's tensors (through the
-  result's own `record_stream`).
-* **A call that does not fit** gets TorchRec's input dist at its second
-  wait (section 5.4): DynamicEmb's bucketize of the first `sent` keys, in
-  their own dtype (part 1 placed them by the same rules), then TorchRec's
-  `KJTAllToAll`. That fills the sharding context for TorchRec's output
-  dist, and the context carries no result.
+* **The input dist.** On a call that takes the op, `input_dist()` queues
+  the whole input dist (`op.input_dist()`) and returns an awaitable, whose
+  wait (the first wait) returns the second awaitable at once; waiting on it
+  again returns the same. The second wait copies the status to the host
+  (`HierSharding.finish`), raises `RuntimeError` on every rank if the call
+  does not fit (section 5.4), and returns the owner's KJT, built from views
+  of the input dist's tensors with no copy. It also sets the input KJT's
+  per-feature totals from the status, so TorchRec's
+  `construct_jagged_tensors` needs no host sync. The sharding context
+  carries what the output dist takes (`hier_result`, a `HierCall`: the
+  plans and the backward's counts). Its `record_stream`, which TorchRec's
+  pipelines call, also records the plans' tensors.
 * **Index dedup.** For a call that takes the op, the output dist itself
   writes each deduplicated row to all its original positions, and sums
-  their gradients. So TorchRec's own expansion is skipped for that call
-  only. A call on TorchRec's dists keeps it.
+  their gradients. So the sharding skips TorchRec's own expansion for that
+  call (it clears the context's reverse indices when the call starts). A
+  call on TorchRec's dists (an eval forward) keeps it.
 * **The lookup.** For the owner's KJT of a call on the op, the sharding
-  takes the call's rows from `op.lookup_rows(num_recv)`, and each DynamicEmb
-  lookup group writes its rows straight into the next rows of them. The
-  lookup returns those rows, which cover all groups, with no copy. Any other
-  KJT (a call on TorchRec's dists) takes TorchRec's lookup path.
+  takes the call's rows, the first `num_recv` rows of the `lookup_rows`
+  that `op.input_dist()` gave, and each DynamicEmb lookup group writes its
+  rows straight into the next rows of them. The lookup returns those rows,
+  which cover all groups, with no copy. Any other KJT (an eval forward, on
+  TorchRec's dists) takes TorchRec's lookup path.
 * **The output dist.** It takes the call's plans from the sharding context.
   An autograd function runs the forward kernel with the forward's plan
-  (`op.forward`), and keeps the backward's plan as saved tensors (its
-  tensors, and its counts beside them), so they live as long as autograd
+  (`op.output_dist_fwd()`), and keeps the backward's plan as saved tensors
+  (the list, and its counts beside them), so they live as long as autograd
   keeps the graph. A second backward (`retain_graph`) works, and they go
-  after the last backward. Its backward makes the plan again from them and
-  runs the backward kernel (`op.backward`), which returns `lookup_grad`,
-  the gradient of the lookup output, a view of `lookup_rows` valid until
-  the next lookup. A call without a result takes TorchRec's
+  after the last backward. Its backward runs the backward kernel with them
+  (`op.output_dist_bwd()`), which returns `lookup_grad`, the gradient of
+  the lookup output, a view of `lookup_rows` valid until the next lookup. A
+  call without a plan (an eval forward) takes TorchRec's
   `RwSequenceEmbeddingDist`.
 * **Streams.** Every step runs on the current stream. The output dist's
   awaitable, like those of TorchRec's own dists, makes the stream that
@@ -718,8 +730,8 @@ goes once its kernel is queued, and autograd keeps the backward's (sections
 ### 7.5 The channels and the window
 
 * The op owns an NCCL communicator, one window and, across nodes, 4 GIN
-  contexts. A call's tensors are in the data its steps return (section 7.1).
-* The **in channel** is the first wait's steps (section 7.3), on the current
+  contexts. A call's tensors are in what its calls return (section 7.1).
+* The **in channel** is the input dist's steps (section 7.3), on the current
   stream. It keeps views of this rank's own buffers: tensors over its copy
   of the window, without an allocator. It also keeps a few constant tensors,
   made when the op is built: the table of each feature, the other nodes, and
@@ -917,8 +929,8 @@ four. In the backward GPU 3 pushes its gradient rows into GPU 2's
 
 ## 10. The input dist's steps
 
-Part 1 and the first wait's steps run on the caller's stream, in the order of
-section 7.3. Seven of them are the comm kernels (section 10.2). The planner
+`input_dist()` queues part 1 and the steps after it on the caller's stream,
+in the order of section 7.3. Seven of them are the comm kernels (section 10.2). The planner
 does the rest (`src/hier_output_dist/input_dist/planner.h`): kernels of its
 own and CUB's radix sorts and scans, on the current stream. Each step is one
 or a few ordinary kernels. A kernel over items (keys, rows, occurrences)
@@ -936,7 +948,7 @@ runs every step on what arrived and stays in bounds.
 
 With the benchmark's configuration (8 features, one owner rule), part 1
 queues 11 kernels and copies per call (39 with index dedup, DynamicEmb's own
-dedup included), and the first wait 9 on one node and about 120 across
+dedup included), and the steps after it 9 on one node and about 120 across
 nodes, CUB's included.
 
 ### 10.1 Part 1 (requester, caller's stream, local)
@@ -1172,11 +1184,13 @@ The call's tables need no copy: each is a tensor of its own, which the plans
 keep for the out kernels (section 11.1). The status holds the needs: the
 most any rank needs of `lookup_keys` and `remote_keys`, and the most rounds.
 It also holds the keys this owner looks up, the sub-tasks of its heavy rows
-and heavy groups, the rows sent, and the per-feature totals of the owner's
-and of the input's KJT. The second wait copies it to the host on the current
-stream: a blocking copy, which waits for every step before it, and the
-call's only host sync. The host then compares the needs with the capacities
-(section 5.4), and builds the owner's KJT from views, with no copy.
+and heavy groups (the backward's counts), the remote occurrences this rank
+deduplicated as proxy (for the benchmark), and the per-feature totals of
+the owner's and of the input's KJT. `input_dist()` returns it on the
+device; the second wait copies it to the host on the current stream: a
+blocking copy, which waits for every step before it, and the call's only
+host sync. The host then compares the needs with the capacities (section
+5.4), and builds the owner's KJT from views, with no copy.
 TorchRec's code around the dist keeps its own host syncs where they apply:
 `split()` when a call spans several shardings or has input features that no
 table serves, and VBE. So does DynamicEmb's lookup, the same on every dist.
@@ -1236,8 +1250,9 @@ stream: the forward kernel `fwd_kernel` and the backward kernel
 
 ### 11.2 The lookup
 
-The lookup takes the call's rows, the first `num_recv` rows of `lookup_rows`,
-from `op.lookup_rows(num_recv)`: a view, valid until the next out kernel. Each
+The lookup takes the call's rows, the first `num_recv` rows of the
+`lookup_rows` that `op.input_dist()` gave: a view, valid until the next out
+kernel. Each
 DynamicEmb lookup group writes its rows straight into the next rows of the
 call's rows: the tables' `output_alloc`. The lookup returns the call's rows,
 which cover all groups, with no copy into a new tensor; the forward checks
@@ -1365,7 +1380,7 @@ a piece          [ rows of keys uniq_lo..uniq_hi | duplicates' slots | heavy par
 
 ### 12.2 Credits and sequence numbers
 
-`in_seq` counts first waits and `out_seq` counts out kernels, the same on
+`in_seq` counts input dists and `out_seq` counts out kernels, the same on
 every rank. The credits for the next out kernel (`out_seq + 1`) go out at the
 end of kernel `out_seq`. At that time no one knows yet whether the next one
 is a forward or a backward. A credit names the kernel it lets in, and other
@@ -1396,8 +1411,8 @@ put its first IB rows as soon as they are ready, without asking first.
 Credits are signals with no data, each adding the difference to the value
 sent before, on context 3.
 
-A call that does not fit runs no out kernel, so it sends and takes no
-credit. The credits of the last out kernel wait for the next call that takes
+A call that does not fit raises and runs no out kernel, so it sends and
+takes no credit. The credits of the last out kernel wait for the next call that takes
 the op.
 
 ## 13. Memory order, and why nothing hangs
@@ -1439,7 +1454,7 @@ the op.
   comm kernel on another stream, and NCCL's kernels. So every kernel ends:
   the first one can always end, and each later one can end once the ones
   before it have. A call that does not fit runs its input dist like any
-  other call, and no out kernel on any rank. A wait that lasts longer than
+  other call, then raises on every rank, and runs no out kernel. A wait that lasts longer than
   the timeout prints what it waited for and traps.
 
 A buffer or control word of the window is written in call `in_seq + 1` only
@@ -1509,7 +1524,7 @@ and `rounds_cap`.
 | the requester's maps | 8 bytes per key on one node (`inv`, `src`), 16 across nodes (also `dst`, `push_order`) | per call |
 | the requester's heavy groups and their sub-tasks (across nodes) | `12 × heavy_groups + 4 × (num_keys / 64 + heavy_groups + 1)`, with `heavy_groups = min(num_keys, local_size × (remote_keys / 65 + 1))`: about 2 bytes per entry of `remote_keys` | per call |
 | the call's small tables across nodes: the requester's of the node's proxies and its task starts, the owner's and the proxy's (section 11.1) | about `16 × rounds_cap × num_nodes × (local_size + 2)`, plus a few KB | per call |
-| the owner's KJT values | `8 × lookup_keys` (12 with weights), from the first wait until the forward | per call |
+| the owner's KJT values | `8 × lookup_keys` (12 with weights), from the input dist until the forward | per call |
 | the proxy's reducer list | `12 × remote_keys` | per call |
 | the put lists and the ready counters | `24 × chunks + 32 × num_nodes × num_features`, with `chunks = (remote_keys + lookup_keys) / chunk_rows + 2 × rounds_cap × num_nodes + 2` (`chunk_rows`: rows in 2 MiB) | per call |
 | index dedup's fan-out table | about 13 bytes per original key (on this path the deduplicated KJT keeps the original length) | per call |
@@ -1640,9 +1655,9 @@ Under skewed keys its hot owner's buffers grow with
 | `TrainPipelineFusedSparseDist`, with `emb_lookup_stream` `"data_dist"` and `"new"` | supported, tested (TorchRec 1.3 and up) |
 | `EvalPipelineSparseDist` | supported, tested: eval forwards take TorchRec's dists |
 | the repo's `JaggedMegatronTrainPipelineSparseDist` and its prefetch variant | supported, tested |
-| `TrainPipelineSemiSync` | runs; tested against itself (its outputs are not the plain loop's): without rehashes, and with capacities that fit every call |
+| `TrainPipelineSemiSync` | runs; tested against itself (its outputs are not the plain loop's), without rehashes |
 | several forwards, then their backwards; `retain_graph`; forwards without grad | supported, tested |
-| calls that do not fit the capacities, under the plain loop and the train pipelines above | supported, tested: they take TorchRec's dists, and the calls around them take the op |
+| a call that does not fit the capacities, under the plain loop and each train pipeline above | tested: it raises `RuntimeError` on every rank (section 5.4) |
 | a different call order on different ranks | not supported: it hangs until the timeout |
 
 * **Streams.** The op queues each step on the current stream and orders
@@ -1659,9 +1674,8 @@ Under skewed keys its hot owner's buffers grow with
   the same order on every rank: autograd runs each backward on the stream
   of its forward.
 * **`record_stream`.** The pipelines call the sharding context's
-  `record_stream` for the streams they hand a call to, and it calls the
-  result's (`HierInDistResult.record_stream`, which records its plans
-  too). With `emb_lookup_stream="new"`, TorchRec's fused pipeline runs the
+  `record_stream` for the streams they hand a call to, and it records the
+  plans' tensors there too (`HierCall.record_stream`). With `emb_lookup_stream="new"`, TorchRec's fused pipeline runs the
   lookup and the output dist on that stream but records the context on the
   default stream only. So the lookup records the owner's KJT, and the
   output dist's forward the plans, on the stream they run on: the forward's
@@ -1680,9 +1694,9 @@ Under skewed keys its hot owner's buffers grow with
 
 TorchRec 1.2 to 1.8 are supported. The dist uses only these parts of TorchRec:
 its `Awaitable` classes, its sequence sharding context, the KJT constructor,
-and `RwSequenceEmbeddingDist` and `KJTAllToAll` for calls on TorchRec's dists.
-The input dist keeps a real `KJTAllToAll`, because TorchRec's pipelines check
-its type; a call that does not fit runs it. Two version checks handle the
+and `RwSequenceEmbeddingDist` and `KJTAllToAll` for calls on TorchRec's dists
+(eval forwards). The input dist keeps a real `KJTAllToAll`, because
+TorchRec's pipelines check its type; an eval forward runs it. Two version checks handle the
 rest: `_create_embedding_kernel` takes an `env` argument from 1.5 on, and the
 model delta tracker hook exists from 1.5 on. `TrainPipelineFusedSparseDist`
 exists from 1.3 on.
@@ -1696,8 +1710,7 @@ occurrence, and one entry per (other node, table, key). It sees the same
 frequency counts, so inserts, admission and LFU scores match. As with any
 change of key order, random initializers and eviction under capacity
 pressure may differ. TorchRec's own `unique` order is not fixed either. So
-the bit-exact tests use the DEBUG initializer and no eviction. A call that
-does not fit runs on TorchRec's dists, so it gives TorchRec's results.
+the bit-exact tests use the DEBUG initializer and no eviction.
 
 **Backward: per (table, key), the same terms.** Every row of `lookup_grad`
 is written once, and every occurrence adds to exactly one row, so the
@@ -1732,21 +1745,21 @@ lookup backward adds a hot key's partial sums with 16-bit atomic additions on
 every dist, so tables of 16-bit rows may still differ from run to run.
 
 **Tests** (`test/unit_tests/`): `test_hier_part1.py`, `test_hier_dedup.py`,
-`test_hier_dist.py`, `test_hier_fallback.py` and `test_hier_pipeline.py`;
+`test_hier_dist.py`, `test_hier_overflow.py` and `test_hier_pipeline.py`;
 each module's docstring says what it checks and how to run it. On one node
-`test_hier_dist.sh`, `test_hier_fallback.sh` and `test_hier_pipeline.sh`
+`test_hier_dist.sh`, `test_hier_overflow.sh` and `test_hier_pipeline.sh`
 run them, and `test/unit_test.sh` runs those.
 
 ## 19. Limitations
 
 * **Scope**: row-wise sequence shardings of DynamicEmb tables, within the
   limits of section 4.2.
-* **Fixed capacities**: a call that needs more runs on TorchRec's dists, at
-  their cost, while the op's window stays allocated (section 5.4).
+* **Fixed capacities**: a call that needs more raises, on every rank
+  (section 5.4); the capacities must hold the largest call.
 * **Errors no agreement covers**: an NCCL error while the op makes its
   communicator, or inside the collective window registration, on some ranks
-  only leaves the other ranks waiting (section 7.2). An error inside a first
-  wait, such as an allocation that fails, reaches Python on its rank. The
+  only leaves the other ranks waiting (section 7.2). An error inside an
+  input dist, such as an allocation that fails, reaches Python on its rank. The
   other ranks then trap at the timeout in the call's next comm kernel that
   waits, as when a rank dies.
 * **Memory held through the dense part**: `lookup_rows` and `proxy_rows`
@@ -1754,8 +1767,8 @@ run them, and `test/unit_test.sh` runs those.
   pool of the input dist's stream keeps the largest step's working memory,
   and the hottest owner's need sizes `lookup_keys` on every rank (section
   15).
-* **Host time of the input dist**: across nodes a first wait launches
-  about 120 kernels, CUB's included (section 10), and the training thread
+* **Host time of the input dist**: across nodes an input dist launches
+  about 130 kernels, CUB's included (section 10), and the training thread
   spends their host time, also under the train pipelines.
 * **Size of one call**: a GPU may receive, deduplicate or look up fewer than
   about 2.1 billion keys of each kind in one call (section 4.3).
@@ -1797,10 +1810,12 @@ run them, and `test/unit_test.sh` runs those.
 Paths from `corelib/dynamicemb`.
 
 * **Python** (`dynamicemb/shard/`): `hier_output_dist.py` holds
-  `HierSharding` (the op and what a sharding's calls share), the output
-  dist and `quiesce`; `input_dist.py` the hierarchical input dist
-  (`hier_forward`, its two awaitables and `fallback`); `rw_sharding.py` the
-  choice of dist and the lookup; `embedding.py` the choice per call. The
+  `HierSharding` (the op, what a sharding's calls share, and a call's
+  second wait, `finish`), what a call leaves its output dist (`HierCall`),
+  the output dist and `quiesce`; `input_dist.py` the hierarchical input
+  dist (`hier_forward` and its two awaitables); `rw_sharding.py` the choice
+  of dist and the lookup; `embedding.py` the choice per call (eval
+  forwards take TorchRec's dists). The
   table options are in `dynamicemb/dynamicemb_config.py`.
 * **C++** (`src/hier_output_dist/`, namespace `dyn_emb::hier_output_dist`):
   the op's own files, and a folder for what both dists share and one for
@@ -1829,15 +1844,14 @@ Paths from `corelib/dynamicemb`.
       on its control words (`NodeBarrier`, `PeerFlags`), and GIN on the rail
       (`rail_put`, `RowPut`, `RailMessage`, `Credits`);
   * `input_dist/`, the input dist:
-    * `input_dist.h`, `input_dist.cu`: the data of a call's steps
-      (`PartOne`, `Pending`, `InDistResult`) and the in channel
-      (`InChannel`), whose `start` queues the first wait's steps and whose
-      `wait` makes the result;
+    * `input_dist.h`, `input_dist.cu`: what the input dist of a call gives
+      (`InDist`) and the in channel (`InChannel`), whose `input_dist`
+      queues a call's whole input dist;
     * `plan.h`, `plan.cu`: the output dist's plans (`FwdPlan`, `BwdPlan`),
       and the same as the out kernels read them (`FwdPlanView`,
       `BwdPlanView`);
-    * `comm_kernels.cu`: the comm kernels, and the functions that launch
-      them;
+    * `comm_kernels.cu`: the comm kernels, and the in channel's functions
+      that launch them;
     * `planner.h`: the planner: the declarations of every step, and of the
       CUB calls in `cub.cu` (radix sorts and scans); `planner.cuh`: what the
       planner's kernels share (how they are launched, searches in sorted

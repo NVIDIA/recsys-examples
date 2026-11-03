@@ -139,10 +139,9 @@ class SymmetricWindow {
 };
 
 // The hierarchical dist of a row-wise sequence sharding as one operator
-// (HierOutputDist, one per sharding). After one host sync per call, every
-// owner has a ready KJT of the keys it looks up, and every rank the plans
-// of the output dist. Then the output dist runs one kernel per
-// direction, which only moves rows.
+// (HierOutputDist, one per sharding). Its input dist leaves every owner a
+// KJT of the keys it looks up, and every rank the plans of the output dist;
+// the output dist then runs one kernel per direction, which only moves rows.
 //
 // Across nodes a requester's keys for an owner on another node go to its
 // proxy, the GPU of its own node on the owner's rail. The proxy deduplicates
@@ -154,44 +153,47 @@ class SymmetricWindow {
 // The op's window is static: its constructor allocates it once, at the
 // capacities of its configuration, and it never grows; a call's own tables
 // come from the caching allocator. A call that does not fit the capacities
-// (its result does not fit, on every rank alike) still runs its steps to
-// their end with nothing in their messages, so the op stays valid for the
-// next call; the caller moves that call some other way.
+// (its status says so, on every rank alike) still runs its input dist to its
+// end, with nothing in its messages, so the op stays valid for the next
+// call; the caller raises for it.
 //
-// The op runs each step of a call on the caller's current stream, and each
-// step returns the data the next one takes: part_one() is part 1, local;
-// start() is the first wait, the in channel's comm kernels and the planner's
-// steps; wait() is the second wait, the host sync, which gives the owner's
-// KJT and the output dist's plans (InDistResult); lookup_rows() gives the
-// rows the lookup writes; then forward() with the forward's plan and the
-// lookup's output, and backward() with the backward's plan and the
-// gradient. The caller orders them: each step runs on the stream of the step
-// before it, or on one the caller ordered after it, and the caller keeps the
-// tensors a step reads alive on its stream (record_stream).
+// Its interface takes and gives tensors and plain values only: the
+// constructor; input_dist(), which queues the whole input dist of a call on
+// the caller's current stream and reads nothing on the host; then
+// output_dist_fwd() with the forward's plan and the lookup's output, and
+// output_dist_bwd() with the backward's plan, its counts and the gradient.
+// The caller copies the call's status to the host once (StatusSlots), for
+// the KJT's sizes and the backward's counts. It orders the calls on its
+// streams, and keeps the tensors a step reads alive on the stream that reads
+// them (record_stream).
 
 class HierOutputDist {
  public:
-  // A new unique id for the op's communicator (on one rank; the caller
-  // hands it to the others).
-  static std::string unique_id();
-  // Why the op does not apply to a sharding (its kernels' static limits), or
-  // "" if it does.
-  static std::string unsupported(int world_size, int local_size, int num_features,
-                                 int64_t row_bytes);
-  // Why the op refuses `config` (Config::validate), or "" if it takes it. It
-  // builds nothing, so the ranks can compare their configurations and
-  // answers before any of them builds the op.
-  static std::string invalid(const Config &config);
+  // What input_dist() returns: the owner's KJT (values, weights or
+  // undefined, lengths, offsets; values and weights hold lookup_keys
+  // entries, the first num_recv the owner's), lookup_rows ([lookup_keys,
+  // dim], a view of the window: the call's lookup writes its first num_recv
+  // rows), the call's status (int64 [status_words], StatusSlots), and the
+  // forward's and the backward's plans (FwdPlan::tensors(),
+  // BwdPlan::tensors()).
+  using InDistTensors = std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor,
+                                   at::Tensor, std::vector<at::Tensor>, std::vector<at::Tensor>>;
 
-  // Collective: every rank of the sharding with the same unique id and
-  // configuration (but its rank), one that invalid() takes. Creates the
-  // communicator and allocates the window.
+  // Collective: every rank of the sharding with the same unique id
+  // (Communicator::unique_id) and configuration (Config's fields, but its
+  // rank). A configuration the op does not take throws
+  // std::invalid_argument (Python: ValueError) before any collective, on
+  // every rank alike. Creates the communicator and allocates the window.
   // Then the ranks agree that each can run (its LSA team, GIN, its
   // allocations) before they register the window together. If one cannot,
   // every rank throws the same std::runtime_error, which names the ranks and
   // why, and holds nothing. A rank that fails inside the registration throws
   // alone, and the others wait there, as in NCCL's own initialization.
-  HierOutputDist(const std::string &unique_id, Config config);
+  HierOutputDist(const std::string &unique_id, int64_t rank, int64_t world_size, int64_t local_size,
+                 const std::vector<int64_t> &feature_tables, const at::Tensor &block_sizes,
+                 const at::Tensor &dist_types, int64_t dim, at::ScalarType dtype, bool weights,
+                 bool out_weights, bool node_dedup, int64_t lookup_keys, int64_t remote_keys,
+                 int64_t proxy_bytes, double timeout_s, int64_t ctas, int64_t reduce_ctas);
   // Local: waits for this rank's kernels. Then, unless the op was quiesced
   // after the last kernel of every rank, it waits at most min(timeout, 30 s)
   // for every node and rail peer to reach its own teardown. It lets go of
@@ -201,39 +203,36 @@ class HierOutputDist {
   HierOutputDist(const HierOutputDist &) = delete;
   HierOutputDist &operator=(const HierOutputDist &) = delete;
 
-  // The input dist of a call (InChannel): part 1, local (no sync, no
-  // collective, no sequence number, so the caller may drop it); the first
-  // wait, which advances the in channel's sequence number (every rank starts
-  // the same calls in the same order); the second wait, the call's one host
-  // sync.
-  PartOne part_one(PlanInput input);
-  Pending start(const PartOne &part);
-  InDistResult wait(const Pending &pending);
-  // The rows a call's lookup writes its output into, and the output dist
-  // reads it from: lookup_rows' first num_recv rows, [num_recv, dim]. A view
-  // of the window, valid until the next out kernel.
-  at::Tensor lookup_rows(int64_t num_recv);
-  // The output dist of a call (OutChannel): forward() returns the rows,
-  // backward() the gradient of the lookup output (lookup_grad), a view of
-  // lookup_rows valid until the next lookup.
-  at::Tensor forward(const FwdPlan &plan, const at::Tensor &lookup_out);
-  at::Tensor backward(const BwdPlan &plan, const at::Tensor &grad, bool divide);
+  // The input dist of a call (InChannel::input_dist) of the requester's KJT
+  // (values; offsets, or lengths when it has none; batch_size; weights or
+  // none), the input KJT that construct_jagged_tensors reads when it is
+  // another one (input_offsets, input_batch_size), and index dedup's
+  // reverse_indices. Every rank runs the same calls in the same order.
+  InDistTensors input_dist(const at::Tensor &values, const c10::optional<at::Tensor> &offsets,
+                           const c10::optional<at::Tensor> &lengths, int64_t batch_size,
+                           const c10::optional<at::Tensor> &weights,
+                           const c10::optional<at::Tensor> &input_offsets, int64_t input_batch_size,
+                           const c10::optional<at::Tensor> &reverse_indices);
+  // The output dist of a call (OutChannel): the forward kernel returns the
+  // rows of this rank's output; the backward kernel, with the backward's
+  // counts ([num_recv, heavy_subs, group_subs], from the status), returns the
+  // gradient of the lookup output (lookup_grad), a view of lookup_rows valid
+  // until the next lookup.
+  at::Tensor output_dist_fwd(const std::vector<c10::optional<at::Tensor>> &fwd_plan,
+                             const at::Tensor &lookup_out);
+  at::Tensor output_dist_bwd(const std::vector<c10::optional<at::Tensor>> &bwd_plan,
+                             const std::vector<int64_t> &counts, const at::Tensor &grad,
+                             bool divide);
   // Collective, after the op's last call, on every rank: syncs this rank's
   // device and meets the other ranks over the op's communicator. No peer
   // then reads this rank's window or sends it a credit any more, so the
   // teardown frees it at once. The next call clears it.
   void quiesce();
 
-  // Diagnostics.
-  const Config &config() const { return config_; }
-  // The capacities in place, in entries (proxy_bytes in bytes, as
-  // configured): lookup_keys; across nodes also remote_keys and what follows
-  // from it (num_proxy_rows, rounds_cap), which read 0 on one node.
-  std::map<std::string, int64_t> capacities() const;
-  // Bytes of the window ("windows": this rank's copy, whole granules) and of
-  // each of its buffers ("buffers": what each takes in the window).
+  // Diagnostics (tests and the benchmark). Bytes of the window ("windows":
+  // this rank's copy, whole granules) and of each of its buffers ("buffers":
+  // what each takes in the window).
   std::map<std::string, std::map<std::string, int64_t>> memory() const;
-  bool gin_railed() const { return communicator_->gin_railed(); }
   // In a build with DYNAMICEMB_HIER_TRACE=1, the out kernels' timelines
   // (Trace; empty without it).
   at::Tensor trace() const { return out_->trace().out_ring(); }

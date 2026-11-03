@@ -14,10 +14,10 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 # See the License for the specific language governing permissions and
 # limitations under the License.
 ******************************************************************************/
-// The comm kernels of the in channel (the first wait): the input dist's
-// exchanges with the node peers and the rail peers, and the functions that
-// launch them (input_dist.h). The planner's steps (planner.h) run between
-// them on the same stream, in the order of InChannel::start:
+// The comm kernels of the in channel: the input dist's exchanges with the
+// node peers and the rail peers, and the in channel's functions that launch
+// them (input_dist.h). The planner's steps (planner.h) run between
+// them on the same stream, in the order of InChannel::input_dist:
 //   node_count_exchange   the node barrier of the call, and the node's
 //                         counts as this rank needs them;
 //   node_key_push         this rank's keys into its targets' node_keys over
@@ -316,72 +316,69 @@ int grid_of(int64_t work) {
 
 }  // namespace
 
-std::tuple<at::Tensor, at::Tensor, at::Tensor> launch_node_count_exchange(
-    ncclWindow_t window, const Sizes &sizes, int64_t seq, const at::Tensor &my_counts) {
+std::tuple<at::Tensor, at::Tensor, at::Tensor> InChannel::node_count_exchange(
+    const at::Tensor &my_counts) const {
   at::Tensor totals = at::empty_like(my_counts), before = at::empty_like(my_counts);
-  at::Tensor mine = at::empty({sizes.topo.local_size, sizes.num_features + 1}, my_counts.options());
+  at::Tensor mine =
+      at::empty({sizes_.topo.local_size, sizes_.num_features + 1}, my_counts.options());
   node_count_exchange_kernel<<<1, kThreads, 0, current_stream()>>>(
-      window, sizes, seq, my_counts.data_ptr<int64_t>(), totals.data_ptr<int64_t>(),
+      window_, sizes_, seq_, my_counts.data_ptr<int64_t>(), totals.data_ptr<int64_t>(),
       before.data_ptr<int64_t>(), mine.data_ptr<int64_t>());
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   return {totals, before, mine};
 }
 
-void launch_node_key_push(ncclWindow_t window, const Sizes &sizes, const at::Tensor &keys,
-                          const at::Tensor &weights, const at::Tensor &row_cell,
-                          const at::Tensor &destination_base, const at::Tensor &rows_to_push) {
+void InChannel::node_key_push(const at::Tensor &keys, const at::Tensor &weights,
+                              const at::Tensor &row_cell, const at::Tensor &destination_base,
+                              const at::Tensor &rows_to_push) const {
   node_key_push_kernel<<<grid_of(keys.numel()), kThreads, 0, current_stream()>>>(
-      window, sizes, keys.data_ptr<int64_t>(),
+      window_, sizes_, keys.data_ptr<int64_t>(),
       weights.defined() ? weights.data_ptr<float>() : nullptr, row_cell.data_ptr<int32_t>(),
       destination_base.data_ptr<int64_t>(), rows_to_push.data_ptr<int64_t>());
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
-void launch_node_done(ncclWindow_t window, const Sizes &sizes, int64_t seq) {
-  node_done_kernel<<<1, 32, 0, current_stream()>>>(window, sizes, seq);
+void InChannel::node_done() const {
+  node_done_kernel<<<1, 32, 0, current_stream()>>>(window_, sizes_, seq_);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
-at::Tensor launch_rail_count_exchange(ncclWindow_t window, const ncclDevComm &dev,
-                                      const Sizes &sizes, int64_t seq, const at::Tensor &message) {
-  const int num_nodes = sizes.topo.num_nodes;
-  const CountMessage format{num_nodes, sizes.num_features};
+at::Tensor InChannel::rail_count_exchange(const at::Tensor &message) const {
+  const int num_nodes = sizes_.topo.num_nodes;
+  const CountMessage format{num_nodes, sizes_.num_features};
   at::Tensor messages = at::empty({num_nodes, format.length()}, message.options());
   rail_count_exchange_kernel<<<1, 256, 0, current_stream()>>>(
-      window, dev, sizes, seq, message.data_ptr<int64_t>(), messages.data_ptr<int64_t>());
+      window_, dev_, sizes_, seq_, message.data_ptr<int64_t>(), messages.data_ptr<int64_t>());
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   return messages;
 }
 
-void launch_rail_key_exchange(ncclWindow_t window, const ncclDevComm &dev, const Sizes &sizes,
-                              int64_t seq, const at::Tensor &put_src, const at::Tensor &put_dst,
-                              const at::Tensor &put_bytes, const at::Tensor &put_skip) {
+void InChannel::rail_key_exchange(const at::Tensor &put_src, const at::Tensor &put_dst,
+                                  const at::Tensor &put_bytes, const at::Tensor &put_skip) const {
   rail_key_exchange_kernel<<<1, 64, 0, current_stream()>>>(
-      window, dev, sizes, seq, put_src.data_ptr<int64_t>(), put_dst.data_ptr<int64_t>(),
+      window_, dev_, sizes_, seq_, put_src.data_ptr<int64_t>(), put_dst.data_ptr<int64_t>(),
       put_bytes.data_ptr<int64_t>(), put_skip.data_ptr<bool>());
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
-std::pair<at::Tensor, at::Tensor> launch_node_status_exchange(ncclWindow_t window,
-                                                              const Sizes &sizes, int64_t seq,
-                                                              const at::Tensor &publish) {
-  const int local_size = sizes.topo.local_size;
+std::pair<at::Tensor, at::Tensor> InChannel::node_status_exchange(const at::Tensor &publish) const {
+  const int local_size = sizes_.topo.local_size;
   at::Tensor peer_needs = at::empty({local_size, kNumNeeds}, publish.options());
-  at::Tensor owner_cell_start = at::empty({local_size, sizes.num_features}, publish.options());
+  at::Tensor owner_cell_start = at::empty({local_size, sizes_.num_features}, publish.options());
   node_status_exchange_kernel<<<1, 256, 0, current_stream()>>>(
-      window, sizes, seq, publish.data_ptr<int64_t>(), peer_needs.data_ptr<int64_t>(),
+      window_, sizes_, seq_, publish.data_ptr<int64_t>(), peer_needs.data_ptr<int64_t>(),
       owner_cell_start.data_ptr<int64_t>());
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   return {peer_needs, owner_cell_start};
 }
 
-at::Tensor launch_peer_gather(ncclWindow_t window, const Sizes &sizes, GatherFrom from,
-                              const at::Tensor &peer, const at::Tensor &first_word) {
+at::Tensor InChannel::peer_gather(GatherFrom from, const at::Tensor &peer,
+                                  const at::Tensor &first_word) const {
   const int64_t items = peer.numel();
   const int words = gather_words(from);
   at::Tensor out = at::empty({words, items}, peer.options());
   peer_gather_kernel<<<grid_of(items * words), kThreads, 0, current_stream()>>>(
-      window, sizes, from, peer.data_ptr<int32_t>(), first_word.data_ptr<int64_t>(), items, words,
+      window_, sizes_, from, peer.data_ptr<int32_t>(), first_word.data_ptr<int64_t>(), items, words,
       out.data_ptr<int32_t>());
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   return out;

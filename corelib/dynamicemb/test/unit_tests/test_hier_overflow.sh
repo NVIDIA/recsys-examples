@@ -1,5 +1,5 @@
 #!/bin/bash
-# test_hier_fallback.py on 8, 6 and 2 GPUs (6: a world size that is not a power of two).
+# test_hier_overflow.py on 8, 6 and 2 GPUs (6: a world size that is not a power of two).
 set -e
 if [ "$(python -c 'import dynamicemb_extensions as ext; print(hasattr(ext, "HierOutputDist"))')" = False ]; then
     echo 'this build has no hierarchical dist: skipped'
@@ -13,5 +13,5 @@ for nproc in 8 6 2; do
     fi
     echo "=== ${nproc} GPU(s) ==="
     torchrun --nnodes 1 --nproc_per_node $nproc \
-        ./test/unit_tests/test_hier_fallback.py || exit 1
+        ./test/unit_tests/test_hier_overflow.py || exit 1
 done

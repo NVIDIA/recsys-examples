@@ -85,9 +85,9 @@ inline bool is_cuda_array(const at::Tensor &tensor, at::ScalarType dtype, int64_
 // stays below this.
 constexpr int64_t kMaxEntries = (int64_t{1} << 31) - 1024;
 
-// How much a call may hold, in entries; a call that needs more of one runs
-// on TorchRec's dists (the caller's fallback). On one node only lookup_keys
-// is used.
+// How much a call may hold, in entries; a call that needs more of one is an
+// error, which the caller raises at the call's second wait. On one node only
+// lookup_keys is used.
 struct Capacities {
   int64_t lookup_keys = 0;  // keys an owner looks up (rows of lookup_rows)
   int64_t remote_keys = 0;  // keys of other nodes' owners a proxy deduplicates for its node
@@ -122,10 +122,19 @@ struct Config {
   void validate() const;
 };
 
+// A configuration of these fields (Config's), as Python gives them.
+Config config_of(int64_t rank, int64_t world_size, int64_t local_size,
+                 const std::vector<int64_t> &feature_tables, const at::Tensor &block_sizes,
+                 const at::Tensor &dist_types, int64_t dim, at::ScalarType dtype, bool weights,
+                 bool out_weights, bool node_dedup, int64_t lookup_keys, int64_t remote_keys,
+                 int64_t proxy_bytes, double timeout_s, int64_t ctas, int64_t reduce_ctas);
+
 // Why the op does not apply to a sharding of these ranks, features and rows
 // (ranks that are not whole nodes, int32 cell numbers, rows the kernels
 // cannot move), or "" if it does.
 std::string unsupported(int world_size, int local_size, int num_features, int64_t row_bytes);
+// Why the op refuses `config` (Config::validate), or "" if it takes it.
+std::string invalid(const Config &config);
 
 // The sizes of an op (Sizes, common.h) from its configuration alone,
 // and the rules of the capacities that follow from the configured ones. The

@@ -13,7 +13,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from functools import partial
 from itertools import accumulate
 from typing import Dict, List, Optional
 
@@ -99,14 +98,6 @@ class DynamicEmbeddingCollectionContext(EmbeddingCollectionContext):
                 reverse.record_stream(stream)
         for vbe_ctx in self.seq_vbe_ctx:
             vbe_ctx.record_stream(stream)
-
-
-def _expanded_by_output_dist(
-    ctx: DynamicEmbeddingCollectionContext, index: int
-) -> None:
-    """Sharding ``index``'s output dist expands its index dedup itself (a
-    call that took the hierarchical dist): TorchRec must not do it again."""
-    ctx.reverse_indices[index] = None
 
 
 class ShardedDynamicEmbeddingCollection(ShardedEmbeddingCollection):
@@ -420,20 +411,17 @@ class ShardedDynamicEmbeddingCollection(ShardedEmbeddingCollection):
                     features_before_input_dist=features
                 )
                 if on_hier[i]:
-                    input_features, reverse_indices, on_ok = features, None, None
+                    input_features, reverse_indices = features, None
                     if self._use_index_dedup:
                         input_features = ctx.input_features[i]
                         reverse_indices = ctx.reverse_indices[i]
-                        # The output dist then expands the index dedup, from
-                        # the plan's fan-out table.
-                        on_ok = partial(_expanded_by_output_dist, ctx, i)
+                        # The output dist expands the index dedup itself, from
+                        # the plan's fan-out table: TorchRec must not do it
+                        # again.
+                        ctx.reverse_indices[i] = None
                     awaitables.append(
                         input_dist.hier_forward(
-                            features,
-                            input_features,
-                            reverse_indices,
-                            sharding_ctx,
-                            on_ok,
+                            features, input_features, reverse_indices, sharding_ctx
                         )
                     )
                 else:

@@ -13,29 +13,30 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """A call over the hierarchical dist's capacities (``output_dist="fused"``)
-runs on TorchRec's dists, on every rank alike.
+raises at its second wait, on every rank alike, and the op takes the calls
+after it.
 
-Each case trains three models on the same batches: on TorchRec's dists, on
-the hierarchical dist with ample capacities (whose calls give the needs),
-and on the hierarchical dist with one capacity that the case's large calls
-do not fit. The last one must give TorchRec's outputs, bit for bit at a
-power-of-two world size. Its large calls alone take TorchRec's dists, on
-every rank, and the sharding counts them and warns. The ``placement`` cases
-also check that each table holds exactly the keys DynamicEmb's bucketize
-gives its rank.
+Each case trains three models: on the hierarchical dist with ample
+capacities (whose calls give the needs), on the hierarchical dist with one
+capacity that the case's large calls do not fit, and on TorchRec's dists
+with the case's small calls alone. On the second model every large call
+raises RuntimeError on every rank, naming the capacity to raise, and every
+small call must give TorchRec's outputs, bit for bit at a power-of-two world
+size: the large calls changed nothing. The ``placement`` cases also check
+that each table holds exactly the keys DynamicEmb's bucketize gives its
+rank.
 
 Run it from ``corelib/dynamicemb``, one process per GPU (on one node, or
 across nodes under Slurm)::
 
-    torchrun --nproc_per_node 8 test/unit_tests/test_hier_fallback.py
-    srun --ntasks-per-node 8 python test/unit_tests/test_hier_fallback.py
+    torchrun --nproc_per_node 8 test/unit_tests/test_hier_overflow.py
+    srun --ntasks-per-node 8 python test/unit_tests/test_hier_overflow.py
 """
 
 import os
 import sys
-import warnings
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import torch
 import torch.distributed as dist
@@ -57,7 +58,6 @@ from dynamicemb.planner import (
 )
 from dynamicemb.shard import DynamicEmbeddingCollectionSharder, quiesce
 from dynamicemb.shard.embedding import ShardedDynamicEmbeddingCollection
-from dynamicemb.shard.hier_output_dist import RwSequenceHierEmbeddingDist
 from fbgemm_gpu.split_embedding_configs import SparseType
 from torchrec.distributed.embedding_types import EmbeddingComputeKernel
 from torchrec.distributed.model_parallel import DistributedModelParallel
@@ -100,7 +100,7 @@ class Case:
     # calls' forwards, then their backwards in order
     order: str = "plain"
     multi_node: bool = False  # across nodes only
-    expected: Tuple[int, ...] = field(init=False)  # the calls that fall back
+    expected: Tuple[int, ...] = field(init=False)  # the calls that raise
 
     def __post_init__(self) -> None:
         self.expected = tuple(
@@ -347,11 +347,13 @@ def table_keys(model) -> Dict[str, torch.Tensor]:
     return out
 
 
-def bucketized_keys(model, case: Case, rank: int) -> Dict[str, torch.Tensor]:
-    """The keys each table of this rank holds after the case's calls on
-    TorchRec's path: the keys of every rank's KJTs that DynamicEmb's bucketize
-    (the sharding's own, on the KJT as it is) gives this rank, as it writes
-    them, widened to int64 with their sign; per table, sorted."""
+def bucketized_keys(
+    model, case: Case, rank: int, steps: Sequence[int]
+) -> Dict[str, torch.Tensor]:
+    """The keys each table of this rank holds after the case's calls
+    ``steps``: the keys of every rank's KJTs of those calls that DynamicEmb's
+    bucketize (the sharding's own, on the KJT as it is) gives this rank, as it
+    writes them, widened to int64 with their sign; per table, sorted."""
     ec = sharded_ec(model)
     input_dist = ec._input_dists[rw_index(ec)]
     world_size = dist.get_world_size()
@@ -365,7 +367,8 @@ def bucketized_keys(model, case: Case, rank: int) -> Dict[str, torch.Tensor]:
     }
     parts: Dict[str, List[torch.Tensor]] = {name: [] for name in table_of.values()}
     for source in range(world_size):
-        for kjt in batches_of(case, source):
+        batches = batches_of(case, source)
+        for kjt in (batches[step] for step in steps):
             kjt = kjt.permute([kjt.keys().index(feature) for feature in features])
             bucketized, _ = input_dist._bucketize(kjt)
             # keys by [owner][feature][sample]
@@ -379,10 +382,12 @@ def bucketized_keys(model, case: Case, rank: int) -> Dict[str, torch.Tensor]:
     return {name: torch.unique(torch.cat(keys)) for name, keys in parts.items()}
 
 
-def check_placement(case: Case, checks: "Checks", model, rank: int, which: str):
+def check_placement(
+    case: Case, checks: "Checks", model, rank: int, which: str, steps: Sequence[int]
+):
     """Each table of this rank holds exactly the keys the bucketize gives the
-    rank (:func:`bucketized_keys`)."""
-    want, got = bucketized_keys(model, case, rank), table_keys(model)
+    rank in the calls ``steps`` (:func:`bucketized_keys`)."""
+    want, got = bucketized_keys(model, case, rank, steps), table_keys(model)
     placed = sorted(got) == sorted(want) and all(
         torch.equal(got[name].cpu(), want[name].cpu()) for name in want
     )
@@ -399,18 +404,12 @@ def check_placement(case: Case, checks: "Checks", model, rank: int, which: str):
     checks.check(f"{case.name}: {which} placed", placed)
 
 
-def hier_of(model):
-    for module in model.modules():
-        for output_dist in getattr(module, "_output_dists", None) or []:
-            if isinstance(output_dist, RwSequenceHierEmbeddingDist):
-                return output_dist._hier
-    return None
-
-
 @dataclass
 class Step:
     out: Dict[str, torch.Tensor]  # the output rows of each feature
-    result: Optional[object]  # the call's input dist result, None on TorchRec's dists
+    call: Optional[
+        object
+    ]  # what the input dist left the output dist, None on TorchRec's
 
 
 def rows_of(case: Case, out) -> Dict[str, torch.Tensor]:
@@ -419,7 +418,7 @@ def rows_of(case: Case, out) -> Dict[str, torch.Tensor]:
 
 def input_dist(ec, kjt: torchrec.KeyedJaggedTensor):
     """A call's input dist, both waits: its context, the lookup's input, and
-    its result (None on TorchRec's dists)."""
+    what it left the output dist (None on TorchRec's dists)."""
     ctx = ec.create_context()
     dist_input = ec.input_dist(ctx, kjt).wait().wait()
     return (
@@ -429,42 +428,37 @@ def input_dist(ec, kjt: torchrec.KeyedJaggedTensor):
     )
 
 
-def plain_step(model, case: Case, kjt: torchrec.KeyedJaggedTensor, weight) -> Step:
-    """One call: its forward, then its backward."""
+def run(
+    model, case: Case, batches, weight, skip: Sequence[int] = ()
+) -> Tuple[Dict[int, Step], Dict[int, str]]:
+    """The case's calls on ``model``, but those in ``skip``, in the case's
+    order: each call's forward, then its backward; or (``interleaved``) the
+    forwards of two calls, then their backwards in order. A call whose input
+    dist raises RuntimeError makes no forward. Returns the steps of the calls
+    that ran and the messages of those that raised, by call. Their kernels
+    have ended when it returns (the caller may drop the model, and its
+    tables' memory with it)."""
     ec = sharded_ec(model)
-    ctx, dist_input, result = input_dist(ec, kjt)
-    out = ec.compute_and_output_dist(ctx, dist_input).wait()
-    rows = rows_of(case, out)
-    weighted_sum(out, weight, case.features).backward()
-    return Step(rows, result)
-
-
-def interleaved(model, case: Case, batches, weight) -> List[Step]:
-    """Two calls' forwards, then their backwards in order, pair by pair."""
-    ec = sharded_ec(model)
-    steps = []
-    for first in range(0, len(batches), 2):
+    steps: Dict[int, Step] = {}
+    raised: Dict[int, str] = {}
+    group = 2 if case.order == "interleaved" else 1
+    for first in range(0, len(batches), group):
         pending = []
-        for kjt in batches[first : first + 2]:
-            ctx, dist_input, result = input_dist(ec, kjt)
+        for index in range(first, min(first + group, len(batches))):
+            if index in skip:
+                continue
+            try:
+                ctx, dist_input, call = input_dist(ec, batches[index])
+            except RuntimeError as error:
+                raised[index] = str(error)
+                continue
             out = ec.compute_and_output_dist(ctx, dist_input).wait()
-            pending.append((out, Step(rows_of(case, out), result)))
-        for out, step in pending:
+            pending.append((index, out, Step(rows_of(case, out), call)))
+        for index, out, step in pending:
             weighted_sum(out, weight, case.features).backward()
-            steps.append(step)
-    return steps
-
-
-def run(model, case: Case, batches, weight) -> List[Step]:
-    """The case's calls on ``model``, in the case's order; their kernels have
-    ended when it returns (the caller may drop the model, and its tables'
-    memory with it)."""
-    if case.order == "interleaved":
-        steps = interleaved(model, case, batches, weight)
-    else:
-        steps = [plain_step(model, case, kjt, weight) for kjt in batches]
+            steps[index] = step
     torch.cuda.synchronize()
-    return steps
+    return steps, raised
 
 
 def same_everywhere(values: List[int]) -> bool:
@@ -506,32 +500,32 @@ def run_case(case: Case, checks: Checks, rank: int, world_size: int, local_size:
     torch.manual_seed(7)
     weight = torch.randn(DIM, device="cuda").sign()
     batches = batches_of(case, rank)
-    # TorchRec's dists, then the ample capacities, whose calls give the needs
+    small = [step for step in range(len(batches)) if step not in case.expected]
+    label = case.name
+    # The ample capacities, whose calls give the needs; then TorchRec's dists
+    # on the small calls alone.
     ample_capacity = dict.fromkeys(OUTPUT_DIST_CAPACITY_NAMES, AMPLE)
-    reference_model = build_model(case, "torchrec", None, world_size, local_size)
-    reference = run(reference_model, case, batches, weight)
-    del reference_model
     ample_model = build_model(case, "fused", ample_capacity, world_size, local_size)
-    ample = run(ample_model, case, batches, weight)
+    ample, ample_raised = run(ample_model, case, batches, weight)
+    checks.check(f"{label}: ample runs every call", not ample_raised)
     if case.placement:
-        check_placement(case, checks, ample_model, rank, "ample's")
-    needs = [step.result.needs for step in ample]
+        check_placement(case, checks, ample_model, rank, "ample's", range(len(batches)))
+    needs = [ample[step].call.needs for step in range(len(batches))]
     quiesce(ample_model)
     del ample_model
+    reference_model = build_model(case, "torchrec", None, world_size, local_size)
+    reference, _ = run(reference_model, case, batches, weight, skip=case.expected)
+    del reference_model
     capacity = tight_capacity(case, needs)
     tight_model = build_model(case, "fused", capacity, world_size, local_size)
-    with warnings.catch_warnings(record=True) as caught:
-        warnings.simplefilter("always")
-        tight = run(tight_model, case, batches, weight)
-    hier = hier_of(tight_model)
-    label = case.name
+    tight, raised = run(tight_model, case, batches, weight)
 
-    def same_rows(steps: List[Step]) -> bool:
-        if len(steps) != len(reference):
+    def same_rows() -> bool:
+        if sorted(tight) != small:
             return False
-        for index, (step, ref) in enumerate(zip(steps, reference)):
+        for step in small:
             for name in case.features:
-                expected, got = ref.out[name], step.out[name]
+                expected, got = reference[step].out[name], tight[step].out[name]
                 same = (
                     torch.equal(expected, got)
                     if exact
@@ -539,35 +533,26 @@ def run_case(case: Case, checks: Checks, rank: int, world_size: int, local_size:
                 )
                 if not same:
                     print(
-                        f"[rank {rank}] {label}: feature {name} differs at step {index}",
+                        f"[rank {rank}] {label}: feature {name} differs at step {step}",
                         flush=True,
                     )
                     return False
         return True
 
-    checks.check(f"{label}: fwd", same_rows(tight))
-    fell = [step for step, done in enumerate(tight) if done.result is None]
-    checks.check(f"{label}: fallback {fell}", fell == list(case.expected))
-    checks.check(f"{label}: same calls everywhere", same_everywhere(fell))
-    said = [
-        str(warning.message)
-        for warning in caught
-        if "does not fit the capacities" in str(warning.message)
-    ]
-    named = case.capacity if case.capacity != "int" else ""
-    # at the first call that falls back, then at every power of two of them
-    warnings_due = sum(
-        1 for count in range(1, hier.fallbacks + 1) if count & (count - 1) == 0
-    )
+    checks.check(f"{label}: fwd of the small calls", same_rows())
+    over = sorted(raised)
+    checks.check(f"{label}: raised {over}", over == list(case.expected))
+    checks.check(f"{label}: same calls everywhere", same_everywhere(over))
+    named = case.capacity if case.capacity != "int" else "_keys from"
     checks.check(
-        f"{label}: fallbacks {hier.fallbacks}", hier.fallbacks == len(case.expected)
-    )
-    checks.check(
-        f"{label}: warned {len(said)} times",
-        len(said) == warnings_due and (not said or named in said[0]),
+        f"{label}: names the capacity",
+        all(
+            "output_dist_capacity" in message and named in message
+            for message in raised.values()
+        ),
     )
     if case.placement:
-        check_placement(case, checks, tight_model, rank, "tight's")
+        check_placement(case, checks, tight_model, rank, "tight's", small)
     quiesce(tight_model)
     del tight_model
     torch.cuda.synchronize()

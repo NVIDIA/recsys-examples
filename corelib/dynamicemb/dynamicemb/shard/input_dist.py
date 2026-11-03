@@ -13,14 +13,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from itertools import accumulate
-from typing import Callable, List, Optional, Tuple
+from typing import List, Optional, Tuple
 
 import torch
 from dynamicemb.dynamicemb_config import DIST_TYPE_CODES
 from dynamicemb_extensions import block_bucketize_sparse_features  # pyre-ignore
 from torch import distributed as dist
-from torchrec.distributed.dist_data import KJTAllToAll
 from torchrec.distributed.embedding_sharding import (
     _fx_wrap_batch_size_per_feature,
     _fx_wrap_gen_list_n_times,
@@ -265,13 +263,12 @@ class RwSparseFeaturesDist(_RwSparseFeaturesDist):
         input_features: KeyedJaggedTensor,
         reverse_indices: Optional[torch.Tensor],
         sharding_ctx: DynamicEmbSequenceShardingContext,
-        on_ok: Optional[Callable[[], None]] = None,
     ) -> "HierStartAwaitable":
-        """Part 1 of the hierarchical input dist, local: the sharding's
-        operator sorts the keys of ``features`` by owner (``dist_type``), on
-        the device (``op.part_one``). Nothing moves until the first wait. A
-        call that does not fit the capacities moves by :meth:`fallback` at
-        the second wait. See docs/hier_output_dist.md, sections 7.3 and 10.1.
+        """The hierarchical input dist of a call: the sharding's operator
+        queues all of it on the current stream at once (``op.input_dist``),
+        and reads nothing on the host. The second wait copies the call's
+        status to the host and raises if the call does not fit the
+        capacities. See docs/hier_output_dist.md, sections 7.3 and 10.
 
         Args:
             features: the keys to send, ``int32`` or ``int64``. Under index
@@ -281,9 +278,8 @@ class RwSparseFeaturesDist(_RwSparseFeaturesDist):
                 input before index dedup).
             reverse_indices: index dedup's map from the input's rows to the
                 rows of ``features``.
-            sharding_ctx: the call's sharding context, which gets the input
-                dist's result.
-            on_ok: what to run once the call takes this path.
+            sharding_ctx: the call's sharding context, which gets what the
+                output dist takes (``hier_result``).
         """
         if features.stride() == 0:
             raise ValueError(
@@ -293,7 +289,7 @@ class RwSparseFeaturesDist(_RwSparseFeaturesDist):
             )
         offsets = features.offsets_or_none()
         weights = features.weights_or_none()
-        part = self.hier.op.part_one(
+        in_dist = self.hier.op.input_dist(
             features.values().contiguous(),
             offsets,
             features.lengths() if offsets is None else None,
@@ -304,133 +300,62 @@ class RwSparseFeaturesDist(_RwSparseFeaturesDist):
             reverse_indices,
         )
         return HierStartAwaitable(
-            self, part, features, input_features, sharding_ctx, on_ok
+            HierKJTAwaitable(
+                self.hier,
+                in_dist,
+                (features, input_features, reverse_indices),
+                features.keys(),
+                input_features,
+                sharding_ctx,
+            )
         )
-
-    def fallback(
-        self,
-        features: KeyedJaggedTensor,
-        sent: int,
-        sharding_ctx: DynamicEmbSequenceShardingContext,
-    ) -> KeyedJaggedTensor:
-        """TorchRec's input dist of a call that does not fit the capacities.
-        It bucketizes the first ``sent`` keys of ``features`` by
-        ``dist_type`` (under index dedup only those are valid), so each key
-        goes to the owner part 1 gave it. TorchRec's all-to-alls then move
-        them; their split sizes cost a host sync. ``sharding_ctx`` gets what
-        TorchRec's output dist reads. The pipelines replace ``self._dist``'s
-        ``forward``, so it is called on the class. This module's own
-        ``unbucketize_permute_tensor`` stays as it was."""
-        weights = features.weights_or_none()
-        kjt = KeyedJaggedTensor(
-            keys=features.keys(),
-            values=features.values()[:sent],
-            weights=None if weights is None else weights[:sent],
-            lengths=features.lengths(),
-            stride=features.stride(),
-        )
-        bucketized, unbucketize_permute = self._bucketize(kjt)
-        tensors = KJTAllToAll.forward(self._dist, bucketized).wait()
-        sharding_ctx.input_splits = tensors._input_splits["values"]
-        sharding_ctx.output_splits = tensors._output_splits["values"]
-        sharding_ctx.sparse_features_recat = tensors._recat
-        if tensors._stride_per_rank is not None:
-            sharding_ctx.batch_size_per_rank = tensors._stride_per_rank
-        sharding_ctx.unbucketize_permute_tensor = unbucketize_permute
-        return tensors.wait()
 
 
 class HierStartAwaitable(Awaitable[Awaitable[KeyedJaggedTensor]]):
-    """Part 1 of a call on the hierarchical dist. Waiting on it is the first
-    wait: ``op.start(part)`` queues the rest of the call (its comm kernels and
-    planner steps) on the current stream. Dropping it changes nothing (the
-    prefetch pipeline runs part 1 of its first batch twice). A second wait
-    returns what the first did (TorchRec's prefetch pipeline up to 1.6 and the
-    JaggedMegatron one wait twice on their last batch)."""
+    """The first wait of a call on the hierarchical dist: its input dist is
+    queued already, so the wait returns the second at once."""
 
-    def __init__(
-        self,
-        input_dist: RwSparseFeaturesDist,
-        part,
-        features: KeyedJaggedTensor,
-        input_features: KeyedJaggedTensor,
-        sharding_ctx: DynamicEmbSequenceShardingContext,
-        on_ok: Optional[Callable[[], None]],
-    ) -> None:
+    def __init__(self, second: "HierKJTAwaitable") -> None:
         super().__init__()
-        self._input_dist = input_dist
-        self._part = part
-        self._features = features
-        self._input_features = input_features
-        self._sharding_ctx = sharding_ctx
-        self._on_ok = on_ok
-        self._second: Optional[HierKJTAwaitable] = None
+        self._second = second
 
     def _wait_impl(self) -> "HierKJTAwaitable":
-        if self._second is None:
-            pending = self._input_dist.hier.op.start(self._part)
-            self._second = HierKJTAwaitable(
-                self._input_dist,
-                pending,
-                self._features,
-                self._input_features,
-                self._sharding_ctx,
-                self._on_ok,
-            )
-            self._part = self._features = self._input_features = None
-            self._sharding_ctx = self._on_ok = None
         return self._second
 
 
 class HierKJTAwaitable(Awaitable[KeyedJaggedTensor]):
-    """The second wait: ``op.wait(pending)``, the call's one host sync, then
-    the owner's KJT (the same KJT on a later wait); the sharding context gets
-    the input dist's result, the plans of the output dist. A call that does
-    not fit the capacities runs on TorchRec's dists, on every rank alike:
-    :meth:`RwSparseFeaturesDist.fallback` moves its keys and fills the
-    sharding context for TorchRec's output dist."""
+    """The second wait of a call on the hierarchical dist: the call's status
+    on the host, its one host sync; then the owner's KJT (the same KJT on a
+    later wait), and the sharding context gets what the output dist takes. A
+    call that does not fit the capacities raises RuntimeError, on every rank
+    alike. Until then it holds the call's inputs, which the input dist reads
+    on its stream."""
 
     def __init__(
         self,
-        input_dist: RwSparseFeaturesDist,
-        pending,
-        features: KeyedJaggedTensor,
+        hier: HierSharding,
+        in_dist: Tuple,
+        inputs: Tuple,
+        keys: List[str],
         input_features: KeyedJaggedTensor,
         sharding_ctx: DynamicEmbSequenceShardingContext,
-        on_ok: Optional[Callable[[], None]],
     ) -> None:
         super().__init__()
-        self._input_dist = input_dist
-        self._pending = pending
-        self._features = features
+        self._hier = hier
+        self._in_dist = in_dist
+        self._inputs = inputs
+        self._keys = keys
         self._input_features = input_features
         self._sharding_ctx = sharding_ctx
-        self._on_ok = on_ok
         self._kjt: Optional[KeyedJaggedTensor] = None
 
     def _wait_impl(self) -> KeyedJaggedTensor:
-        if self._kjt is not None:
-            return self._kjt
-        hier = self._input_dist.hier
-        result = hier.op.wait(self._pending)
-        # The totals construct_jagged_tensors reads, without a host sync.
-        input_length_per_key = result.input_length_per_key
-        self._input_features._length_per_key = input_length_per_key
-        self._input_features._offset_per_key = [0] + list(
-            accumulate(input_length_per_key)
-        )
-        if result.fits:
-            if self._on_ok is not None:
-                self._on_ok()
-            self._sharding_ctx.hier_result = result
-            self._kjt = hier.owner_kjt(result, self._features.keys())
-        else:
-            hier.fell_back(result)
-            self._kjt = self._input_dist.fallback(
-                self._features, result.sent, self._sharding_ctx
+        if self._kjt is None:
+            self._kjt = self._hier.finish(
+                self._in_dist, self._keys, self._input_features, self._sharding_ctx
             )
-        # What only this wait needed goes: a pipeline keeps this awaitable
-        # until after the backward.
-        self._pending = self._features = self._input_features = None
-        self._sharding_ctx = self._on_ok = None
+            # What only this wait needed goes: a pipeline keeps this awaitable
+            # until after the backward.
+            self._in_dist = self._inputs = self._input_features = None
+            self._sharding_ctx = None
         return self._kjt

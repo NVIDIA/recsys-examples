@@ -23,15 +23,15 @@ holds what the calls share. The input dist is in input_dist.py
 (``RwSparseFeaturesDist.hier_forward``). The lookup writes its rows into the
 operator's window (:meth:`HierSharding.lookup`), and
 :class:`RwSequenceHierEmbeddingDist` moves them. A call that does not fit the
-capacities runs on TorchRec's dists, and so does every eval forward.
-:func:`quiesce` lets every rank free the operators at once.
+capacities raises at its second wait; every eval forward runs on TorchRec's
+dists. :func:`quiesce` lets every rank free the operators at once.
 """
 
 import os
 import warnings
 import weakref
 from itertools import accumulate
-from typing import Callable, Dict, List, Optional, Sequence, Union
+from typing import Callable, Dict, List, Optional, Sequence, Tuple, Union
 
 import torch
 import torch.distributed as dist
@@ -83,10 +83,88 @@ def _first_difference(every: List[Dict]) -> Optional[str]:
     return None
 
 
+# A call's status (int64 words; StatusSlots in
+# src/hier_output_dist/common/common.h): the most any rank needs of
+# lookup_keys, remote_keys and rounds; the keys this owner looks up; the
+# backward's sub-tasks of heavy rows and of heavy groups; the remote
+# occurrences this rank deduplicated as proxy; then per feature the keys this
+# owner looks up, then the input KJT's keys.
+(
+    _NEED_LOOKUP_KEYS,
+    _NEED_REMOTE_KEYS,
+    _NEED_ROUNDS,
+    _NUM_RECV,
+    _HEAVY_SUBS,
+    _GROUP_SUBS,
+    _OCCURRENCES,
+    _LENGTH_PER_KEY,
+) = range(8)
+# Where the tensors the benchmark reads are in the plans' lists (the order of
+# FwdPlan::tensors() and BwdPlan::tensors(), in
+# src/hier_output_dist/input_dist/plan.cu).
+_FWD_BLOCK_START, _FWD_NUM_ROUNDS, _FWD_UNIQ_OUT = 0, 13, 19
+_BWD_UNIQ_IN = 19
+
+
+class HierCall:
+    """What the input dist of a call on the hierarchical dist leaves its
+    output dist: the plans (``fwd_plan``, ``bwd_plan``: the op's lists of
+    tensors, ``None`` for those the call has not) and, from the call's
+    status, the backward's counts (``counts``: num_recv, heavy_subs,
+    group_subs). Also from the status, for tests and the benchmark: what the
+    call needs of each capacity, the most of every rank (``needs``), and the
+    remote occurrences this rank deduplicated as proxy (``occurrences``, 0
+    on one node)."""
+
+    def __init__(
+        self,
+        fwd_plan: List[Optional[torch.Tensor]],
+        bwd_plan: List[Optional[torch.Tensor]],
+        counts: List[int],
+        needs: Dict[str, int],
+        occurrences: int,
+    ) -> None:
+        self.fwd_plan = fwd_plan
+        self.bwd_plan = bwd_plan
+        self.counts = counts
+        self.needs = needs
+        self.occurrences = occurrences
+
+    def record_stream(self, stream: torch.Stream) -> None:
+        """The plans' use on ``stream`` (the caching allocator's)."""
+        for tensor in self.fwd_plan + self.bwd_plan:
+            if tensor is not None:
+                tensor.record_stream(stream)
+
+    # Tables of the plans the benchmark reads.
+    @property
+    def block_start(self) -> torch.Tensor:
+        """int64 [world_size + 1]: where the requester's rows for each owner
+        start."""
+        return self.fwd_plan[_FWD_BLOCK_START]
+
+    @property
+    def num_rounds(self) -> Optional[torch.Tensor]:
+        """Across nodes, int64 0-dim: the rounds this rank takes as proxy."""
+        return self.fwd_plan[_FWD_NUM_ROUNDS]
+
+    @property
+    def uniq_out(self) -> Optional[torch.Tensor]:
+        """Across nodes, int64 [num_nodes]: this proxy's node-unique keys of
+        each owner node."""
+        return self.fwd_plan[_FWD_UNIQ_OUT]
+
+    @property
+    def uniq_in(self) -> Optional[torch.Tensor]:
+        """Across nodes, int64 [num_nodes]: the node-unique keys this owner
+        gets from each source node."""
+        return self.bwd_plan[_BWD_UNIQ_IN]
+
+
 class DynamicEmbSequenceShardingContext(SequenceShardingContext):
-    """TorchRec's sequence sharding context, plus the result of the input
-    dist of a call that took the hierarchical dist (``hier_result``: the
-    owner's KJT and the output dist's plans). It is None on TorchRec's dists,
+    """TorchRec's sequence sharding context, plus what the input dist of a
+    call that took the hierarchical dist leaves its output dist
+    (``hier_result``, a :class:`HierCall`). It is None on TorchRec's dists,
     and once the output dist took it.
 
     Not a dataclass: up to TorchRec 1.6 the parent's ``__init__`` is written by
@@ -146,12 +224,9 @@ class HierSharding:
         self.dtype = output_dtype  # of the lookup output's rows
         if isinstance(capacity, int):
             capacity = dict.fromkeys(OUTPUT_DIST_CAPACITY_NAMES, capacity)
-        # One node needs lookup_keys alone.
-        capacities = {"remote_keys": 0, **capacity}
         proxy_mb = float(os.environ.get("DYNAMICEMB_GIN_PROXY_MB", 512))
-        capacities["proxy_bytes"] = int(proxy_mb * (1 << 20))
         # What the operator is built from, but the bucketize's rules and the
-        # weights (setup()).
+        # weights (setup()). One node needs lookup_keys alone.
         self._arguments = dict(
             world_size=world_size,
             local_size=local_size,
@@ -159,7 +234,9 @@ class HierSharding:
             dim=embedding_dim,
             dtype=output_dtype,
             node_dedup=node_dedup,
-            capacities=capacities,
+            lookup_keys=capacity["lookup_keys"],
+            remote_keys=capacity.get("remote_keys", 0),
+            proxy_bytes=int(proxy_mb * (1 << 20)),
             timeout_s=_timeout_s(pg),
             ctas=int(os.environ.get("DYNAMICEMB_GIN_CTAS", 0)),
             reduce_ctas=int(os.environ.get("DYNAMICEMB_GIN_REDUCE_CTAS", 8)),
@@ -170,16 +247,14 @@ class HierSharding:
         self._weights = False  # the requesters' keys carry weights
         self._out_weights = False  # the owner's KJT carries weights
         # The owner's KJT of each call on this path, as its second wait
-        # returned it, and the rows its lookup writes (owns()).
-        self._num_recv: "weakref.WeakKeyDictionary[KeyedJaggedTensor, int]" = (
+        # returned it, and the rows its lookup writes (owns(), lookup()).
+        self._rows: "weakref.WeakKeyDictionary[KeyedJaggedTensor, torch.Tensor]" = (
             weakref.WeakKeyDictionary()
         )
         # While a lookup runs (lookup()): the call's rows, and how many of
         # them the lookup groups took so far (lookup_buffer()).
         self._lookup_rows: Optional[torch.Tensor] = None
         self._rows_taken = 0
-        # Calls that did not fit the capacities and took TorchRec's dists.
-        self.fallbacks = 0
 
     @property
     def multi_node(self) -> bool:
@@ -207,8 +282,9 @@ class HierSharding:
             return self.takes_hier_dist
         from dynamicemb_extensions import (
             HierOutputDist,
-            HierOutputDistConfig,
+            hier_output_dist_invalid,
             hier_output_dist_unique_id,
+            hier_output_dist_unsupported,
         )
 
         self.takes_hier_dist = False
@@ -223,8 +299,7 @@ class HierSharding:
             weights=self._weights,
             out_weights=self._out_weights,
         )
-        config = HierOutputDistConfig(rank=self._rank, **arguments)
-        refusal = HierOutputDist.invalid(config)
+        refusal = hier_output_dist_invalid(rank=self._rank, **arguments)
         # Making an id starts NCCL's listener for the other ranks: none for a
         # configuration the operator refuses.
         unique_id = (
@@ -241,7 +316,7 @@ class HierSharding:
                 f"operator from the same arguments, and {difference} (set the "
                 "environment variables and table options alike on every rank)"
             )
-        why = HierOutputDist.unsupported(
+        why = hier_output_dist_unsupported(
             arguments["world_size"],
             arguments["local_size"],
             len(arguments["feature_tables"]),
@@ -261,20 +336,13 @@ class HierSharding:
             )
             return False
         try:
-            self.op = HierOutputDist(every[0][0], config)
+            self.op = HierOutputDist(every[0][0], rank=self._rank, **arguments)
         except RuntimeError as err:  # some rank cannot run it, every rank says so
             warnings.warn(
                 f'output_dist="{self._asked}": {err}; using TorchRec\'s dists'
             )
             return False
         self.takes_hier_dist = True
-        if self.multi_node and not self.op.gin_railed():
-            warnings.warn(
-                f'output_dist="{self._asked}": NCCL connected GIN to every rank, '
-                "not only to the rails it uses, so its queues take memory that grows "
-                "with the number of ranks; set NCCL_CROSS_NIC=0 for the job to connect "
-                "the rails alone"
-            )
         return True
 
     def owns(self, kjt: KeyedJaggedTensor) -> bool:
@@ -282,41 +350,81 @@ class HierSharding:
         second wait returned it. Its lookup then writes ``lookup_rows``,
         whatever the module's mode (a pipeline may switch it between a call's
         input dist and its lookup)."""
-        return kjt in self._num_recv
+        return kjt in self._rows
 
-    def owner_kjt(self, result, keys: List[str]) -> KeyedJaggedTensor:
-        """The owner's KJT of a call that fits (its input dist's result)."""
-        length_per_key = result.length_per_key
+    def finish(
+        self,
+        in_dist: Tuple,
+        keys: List[str],
+        input_features: KeyedJaggedTensor,
+        sharding_ctx: DynamicEmbSequenceShardingContext,
+    ) -> KeyedJaggedTensor:
+        """The second wait of a call: its status on the host, the call's one
+        host sync, then the owner's KJT. ``in_dist`` is what ``op.input_dist``
+        gave. A call that needs more of a capacity than it holds raises
+        RuntimeError, on every rank alike: the needs are the most of every
+        rank's. Else ``input_features`` gets the totals
+        ``construct_jagged_tensors`` reads, ``sharding_ctx`` what the output
+        dist takes, and the call's lookup will write the first num_recv rows
+        of ``lookup_rows``."""
+        (
+            values,
+            weights,
+            lengths,
+            offsets,
+            lookup_rows,
+            status,
+            fwd_plan,
+            bwd_plan,
+        ) = in_dist
+        words = status.cpu().tolist()
+        over = [
+            (name, self._arguments[name], words[slot])
+            for name, slot in (
+                ("lookup_keys", _NEED_LOOKUP_KEYS),
+                ("remote_keys", _NEED_REMOTE_KEYS),
+            )
+            if words[slot] > self._arguments[name]
+        ]
+        if over:
+            raise RuntimeError(
+                f'output_dist="{self._asked}": a call needs more than the capacities '
+                "hold; raise output_dist_capacity's "
+                + ", ".join(
+                    f"{name} from {capacity} to at least {need}"
+                    for name, capacity, need in over
+                )
+            )
+        num_features = len(keys)
+        length_per_key = words[_LENGTH_PER_KEY : _LENGTH_PER_KEY + num_features]
+        input_length_per_key = words[
+            _LENGTH_PER_KEY + num_features : _LENGTH_PER_KEY + 2 * num_features
+        ]
+        input_features._length_per_key = input_length_per_key
+        input_features._offset_per_key = [0] + list(accumulate(input_length_per_key))
+        num_recv = words[_NUM_RECV]
+        sharding_ctx.hier_result = HierCall(
+            fwd_plan,
+            bwd_plan,
+            [num_recv, words[_HEAVY_SUBS], words[_GROUP_SUBS]],
+            {
+                "lookup_keys": words[_NEED_LOOKUP_KEYS],
+                "remote_keys": words[_NEED_REMOTE_KEYS],
+            },
+            words[_OCCURRENCES],
+        )
         kjt = KeyedJaggedTensor(
             keys=keys,
-            values=result.values,
-            weights=result.weights,
-            lengths=result.lengths,
-            offsets=result.offsets,
-            stride=result.num_sources,
+            values=values[:num_recv],
+            weights=None if weights is None else weights[:num_recv],
+            lengths=lengths,
+            offsets=offsets,
+            stride=self._arguments["local_size"] + self._num_nodes - 1,
             length_per_key=length_per_key,
             offset_per_key=[0] + list(accumulate(length_per_key)),
         )
-        self._num_recv[kjt] = result.num_recv
+        self._rows[kjt] = lookup_rows[:num_recv]
         return kjt
-
-    def fell_back(self, result) -> None:
-        """Counts a call that did not fit, and warns at the first such call
-        and then at every power of two of them."""
-        self.fallbacks += 1
-        if self.fallbacks & (self.fallbacks - 1):
-            return
-        needs, capacities = result.needs, self.op.capacities()
-        warnings.warn(
-            f'output_dist="{self._asked}": a call does not fit the capacities, so it '
-            f"runs on TorchRec's dists ({self.fallbacks} calls so far); raise "
-            "output_dist_capacity's "
-            + ", ".join(
-                f"{name} from {capacities[name]} to at least {needs[name]}"
-                for name in result.overflows
-                if needs[name] > capacities[name]
-            )
-        )
 
     def lookup_buffer(
         self, rows: int, cols: int, dtype: torch.dtype
@@ -336,11 +444,11 @@ class HierSharding:
     ) -> torch.Tensor:
         """The lookup of a call on this path. Each of ``look_ups``, the lookup
         groups in feature order, writes its rows straight into the call's
-        rows of ``op.lookup_rows`` (the tables' ``output_alloc``), and their
+        rows of the op's ``lookup_rows`` (the tables' ``output_alloc``), and their
         outputs come back as those rows, flat, without a copy. The rows are
         valid until the next out kernel. See docs/hier_output_dist.md,
         section 11.2."""
-        rows = self.op.lookup_rows(self._num_recv[kjt])
+        rows = self._rows[kjt]
         # The lookup may run on a stream of its own (TorchRec's fused
         # pipeline), on which nobody else records the KJT's use.
         kjt.record_stream(torch.cuda.current_stream())
@@ -393,34 +501,32 @@ class _OutputAwaitable(Awaitable[torch.Tensor]):
 
 
 class _OutputFunction(torch.autograd.Function):
-    """The output dist of a call on this path: ``op.forward`` (``fwd_kernel``)
-    with the forward's plan in the forward, ``op.backward`` (``bwd_kernel``)
-    with the backward's plan in the backward, whose gradient for the lookup
-    output is ``lookup_grad``, a view of ``lookup_rows`` valid until the next
-    lookup. The backward's plan is saved tensors: autograd keeps them for a
-    second backward (``retain_graph``) and frees them after the last one."""
+    """The output dist of a call on this path: ``op.output_dist_fwd``
+    (``fwd_kernel``) with the forward's plan in the forward,
+    ``op.output_dist_bwd`` (``bwd_kernel``) with the backward's plan and
+    counts in the backward, whose gradient for the lookup output is
+    ``lookup_grad``, a view of ``lookup_rows`` valid until the next lookup.
+    The backward's plan is saved tensors: autograd keeps them for a second
+    backward (``retain_graph``) and frees them after the last one."""
 
     @staticmethod
-    def forward(ctx, lookup_out: torch.Tensor, fwd_plan, bwd_plan, op) -> torch.Tensor:
+    def forward(ctx, lookup_out: torch.Tensor, call: HierCall, op) -> torch.Tensor:
         # The out kernels may run on a stream of their own (TorchRec's fused
         # pipeline), on which nobody else records the plans' use; the
         # backward runs on this stream too.
-        stream = torch.cuda.current_stream()
-        fwd_plan.record_stream(stream)
-        bwd_plan.record_stream(stream)
-        out = op.forward(fwd_plan, lookup_out)
-        ctx.save_for_backward(*bwd_plan.tensors())
-        ctx.counts, ctx.op = bwd_plan.counts(), op
+        call.record_stream(torch.cuda.current_stream())
+        out = op.output_dist_fwd(call.fwd_plan, lookup_out)
+        ctx.save_for_backward(*call.bwd_plan)
+        ctx.counts, ctx.op = call.counts, op
         return out
 
     @staticmethod
     def backward(ctx, grad_out: torch.Tensor):
-        from dynamicemb_extensions import HierBwdPlan
-
-        bwd_plan = HierBwdPlan.of(list(ctx.saved_tensors), ctx.counts)
         # Read at backward time, as TorchRec does: users flip it at runtime.
-        lookup_grad = ctx.op.backward(bwd_plan, grad_out, comm_ops.GRADIENT_DIVISION)
-        return lookup_grad, None, None, None
+        lookup_grad = ctx.op.output_dist_bwd(
+            list(ctx.saved_tensors), ctx.counts, grad_out, comm_ops.GRADIENT_DIVISION
+        )
+        return lookup_grad, None, None
 
 
 class RwSequenceHierEmbeddingDist(
@@ -428,8 +534,8 @@ class RwSequenceHierEmbeddingDist(
 ):
     """The output dist of a sharding on the hierarchical dist. A call on that
     path moves its rows by the plans its input dist made
-    (``sharding_ctx.hier_result``), on the current stream. Other calls (eval,
-    or a call that did not fit) take TorchRec's ``RwSequenceEmbeddingDist``."""
+    (``sharding_ctx.hier_result``), on the current stream. Eval calls take
+    TorchRec's ``RwSequenceEmbeddingDist``."""
 
     def __init__(
         self,
@@ -450,17 +556,13 @@ class RwSequenceHierEmbeddingDist(
         local_embs: torch.Tensor,
         sharding_ctx: Optional[DynamicEmbSequenceShardingContext] = None,
     ) -> Awaitable[torch.Tensor]:
-        result = sharding_ctx.hier_result
-        if result is None:
+        call = sharding_ctx.hier_result
+        if call is None:
             return self._torchrec(local_embs, sharding_ctx)
         # The output dist takes the plans: the forward's go once its kernel is
         # queued, the backward's once the last backward is done.
         sharding_ctx.hier_result = None
-        return _OutputAwaitable(
-            _OutputFunction.apply(
-                local_embs, result.fwd_plan, result.bwd_plan, self._hier.op
-            )
-        )
+        return _OutputAwaitable(_OutputFunction.apply(local_embs, call, self._hier.op))
 
 
 def quiesce(model: torch.nn.Module) -> None:

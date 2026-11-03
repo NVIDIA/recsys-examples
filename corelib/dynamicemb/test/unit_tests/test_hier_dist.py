@@ -1062,9 +1062,7 @@ def run_case(
             and state.takes_hier_dist is True
             and groups == (2 if case.groups or case.mixed else 1)
         )
-        ok_op = (hier_run.result is None) == bool(case.plain) and (
-            state is None or state.fallbacks == 0
-        )
+        ok_op = (hier_run.result is None) == bool(case.plain)
         ok_eval = True
         if iteration == 1:
             # Eval runs call by call on TorchRec's dists; then training goes on.
@@ -1299,7 +1297,7 @@ def run_agreement(rank: int, world_size: int, local_size: int, log: Callable) ->
     SHARDINGS.append(weakref.ref(hier))
     msg = expect_error(ValueError, hier.setup, *bucketize_rules(3, world_size), False)
     checks["a capacity on one rank"] = (
-        f"rank {last} has capacities=" in msg
+        f"rank {last} has lookup_keys=" in msg
         and same_everywhere(msg)
         and hier.op is None
     )
@@ -1357,7 +1355,8 @@ def run_no_sync(rank: int, world_size: int, local_size: int, log: Callable) -> i
     second wait is the call's one host sync): they run under the sync debug
     mode "error", where c10 raises on an op that syncs, inside C++ too. With
     index dedup, keys with weights, three owner rules, and a call that does
-    not fit the capacities (it then takes TorchRec's dists)."""
+    not fit the capacities (its second wait then raises, naming the capacity
+    to raise, and the next call that fits runs)."""
     failures = 0
     for case_idx, case, capacity in (
         (130, Case("no sync, dedup", dedup=True), 1 << 16),
@@ -1386,14 +1385,34 @@ def run_no_sync(rank: int, world_size: int, local_size: int, log: Callable) -> i
             first = ec.input_dist(ctx, kjt).wait()
         finally:
             torch.cuda.set_sync_debug_mode("default")
-        dist_input = first.wait()
-        on_op = ctx.sharding_contexts[rw_index(ec)].hier_result is not None
-        out = ec.compute_and_output_dist(ctx, dist_input).wait()
-        fits = capacity > 64
-        checks = {
-            "path": on_op == fits and hier_of(ec).fallbacks == int(not fits),
-            "rows": all(feature in out for feature in case.features),
-        }
+        if capacity > 64:
+            dist_input = first.wait()
+            on_op = ctx.sharding_contexts[rw_index(ec)].hier_result is not None
+            out = ec.compute_and_output_dist(ctx, dist_input).wait()
+            checks = {
+                "path": on_op,
+                "rows": all(feature in out for feature in case.features),
+            }
+        else:
+            try:
+                first.wait()
+                raised = ""
+            except RuntimeError as error:
+                raised = str(error)
+            # every rank raises alike, and the op takes the next call that fits
+            fits_kjt = KeyedJaggedTensor(
+                keys=kjt.keys(),
+                values=kjt.values()[:0],
+                lengths=torch.zeros_like(kjt.lengths()),
+            )
+            ctx = ec.create_context()
+            dist_input = ec.input_dist(ctx, fits_kjt).wait().wait()
+            on_op = ctx.sharding_contexts[rw_index(ec)].hier_result is not None
+            out = ec.compute_and_output_dist(ctx, dist_input).wait()
+            checks = {
+                "raises": "lookup_keys from 64 to at least" in raised,
+                "next call": on_op and all(feature in out for feature in case.features),
+            }
         failures += report(case.name, checks, log)
         del ec, first, out
         failures += gc_models(log)

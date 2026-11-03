@@ -751,9 +751,9 @@ class DynamicEmbTableOptions:
       deduplicates for its node.
 
     An int sets both. Each is a positive int below 2^31 - 1024. A call that
-    needs more runs on TorchRec's dists, with a warning that names the
-    capacity to raise. ``"fused"`` needs it, and ``"auto"`` without it takes
-    TorchRec's dists. Other output dists ignore it, but every DynamicEmb
+    needs more raises RuntimeError at its second wait, on every rank, naming
+    the capacity to raise. ``"fused"`` needs it, and ``"auto"`` without it
+    takes TorchRec's dists. Other output dists ignore it, but every DynamicEmb
     table of a sharding sets it alike. See docs/hier_output_dist.md,
     section 5."""
 

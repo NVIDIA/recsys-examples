@@ -144,9 +144,14 @@ struct BwdPlanView : PlanView {
   }
 };
 
+// The plans cross the op's interface as lists of their tensors (tensors(),
+// undefined ones too, in the order of their fields here), and the op makes
+// them again from such a list (of()). Python holds the lists until the out
+// kernels take them: autograd keeps the backward's as saved tensors, and
+// frees them after the last backward.
+
 // The forward's plan.
 struct FwdPlan {
-  int64_t num_out = 0;     // rows of the requester's output
   at::Tensor block_start;  // int64 [world_size + 1]
   at::Tensor src;          // int32 [rows]
   at::Tensor inv;          // int32 [rows]
@@ -157,12 +162,18 @@ struct FwdPlan {
   at::Tensor proxy_round_tables, push_order_off, fwd_task_starts, fwd_put_start, uniq_out,
       push_start;
 
+  // Rows of the requester's output: its input's rows (under index dedup the
+  // original ones).
+  int64_t num_out() const {
+    return fanout.exp_idx.defined() ? fanout.exp_idx.numel() : inv.numel();
+  }
   FwdPlanView view(const Sizes &sizes) const;
-  // The tensors' use on `stream` (the caching allocator's).
-  void record_stream(c10::Stream stream) const;
+  std::vector<at::Tensor> tensors() const;
+  static FwdPlan of(const std::vector<c10::optional<at::Tensor>> &tensors);
 };
 
-// The backward's plan.
+// The backward's plan, and its counts, which the call's status gives
+// (StatusSlots): of() takes them as [num_recv, heavy_subs, group_subs].
 struct BwdPlan {
   int64_t num_recv = 0;    // rows of the owner's lookup output (and of its lookup_grad)
   int64_t heavy_subs = 0;  // index dedup: sub-tasks of the requester's heavy rows
@@ -178,12 +189,7 @@ struct BwdPlan {
       uniq_off, round_table, bwd_put_start, reduce_task_starts, reducer_start, reducer_entries;
 
   BwdPlanView view(const Sizes &sizes) const;
-  void record_stream(c10::Stream stream) const;
-  // Autograd keeps the plan from the forward to the backward as saved
-  // tensors, which it frees after the last backward: tensors() (undefined
-  // ones too) and counts(), from which of() makes the plan again.
   std::vector<at::Tensor> tensors() const;
-  std::vector<int64_t> counts() const { return {num_recv, heavy_subs, group_subs}; }
   static BwdPlan of(const std::vector<c10::optional<at::Tensor>> &tensors,
                     const std::vector<int64_t> &counts);
 };

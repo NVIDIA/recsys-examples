@@ -159,28 +159,29 @@ std::string why_some_cannot_run(const std::vector<int> &every, int local_size) {
   return why;
 }
 
+// `config` once it passed its checks (Config::validate throws).
+Config validated(Config config) {
+  config.validate();
+  return config;
+}
+
 }  // namespace
 
 void fail_next_construction(bool fail_alloc) { g_fail_alloc = fail_alloc; }
 
-std::string HierOutputDist::unique_id() { return Communicator::unique_id(); }
-
-std::string HierOutputDist::unsupported(int world_size, int local_size, int num_features,
-                                        int64_t row_bytes) {
-  return hier_output_dist::unsupported(world_size, local_size, num_features, row_bytes);
-}
-
-std::string HierOutputDist::invalid(const Config &config) {
-  try {
-    config.validate();
-  } catch (const std::invalid_argument &error) {
-    return error.what();
-  }
-  return "";
-}
-
-HierOutputDist::HierOutputDist(const std::string &unique_id, Config config)
-    : config_(std::move(config)), sizes_(sizes_of(config_)), device_(current_device()) {
+HierOutputDist::HierOutputDist(const std::string &unique_id, int64_t rank, int64_t world_size,
+                               int64_t local_size, const std::vector<int64_t> &feature_tables,
+                               const at::Tensor &block_sizes, const at::Tensor &dist_types,
+                               int64_t dim, at::ScalarType dtype, bool weights, bool out_weights,
+                               bool node_dedup, int64_t lookup_keys, int64_t remote_keys,
+                               int64_t proxy_bytes, double timeout_s, int64_t ctas,
+                               int64_t reduce_ctas)
+    : config_(
+          validated(config_of(rank, world_size, local_size, feature_tables, block_sizes, dist_types,
+                              dim, dtype, weights, out_weights, node_dedup, lookup_keys,
+                              remote_keys, proxy_bytes, timeout_s, ctas, reduce_ctas))),
+      sizes_(sizes_of(config_)),
+      device_(current_device()) {
   c10::cuda::CUDAGuard guard(device_);
   const bool fail_alloc = g_fail_alloc;
   g_fail_alloc = false;
@@ -235,6 +236,11 @@ HierOutputDist::HierOutputDist(const std::string &unique_id, Config config)
                                     window_->layout(), device_);
   out_ = std::make_unique<OutChannel>(config_, sizes_, window_->handle(), communicator_->dev(),
                                       window_->layout(), device_);
+  if (sizes_.multi_node() && !communicator_->gin_railed() && sizes_.topo.rank == 0)
+    fprintf(stderr,
+            "[hier_output_dist] NCCL connected GIN to every rank, not only to the rails it uses, "
+            "so its queues take memory that grows with the number of ranks; set "
+            "NCCL_CROSS_NIC=0 for the job to connect the rails alone\n");
 }
 
 HierOutputDist::~HierOutputDist() { release(); }
@@ -304,27 +310,44 @@ void HierOutputDist::release() noexcept {
   window_->release(/*keep=*/false);
 }
 
-PartOne HierOutputDist::part_one(PlanInput input) { return in_->part_one(std::move(input)); }
-
-Pending HierOutputDist::start(const PartOne &part) {
+HierOutputDist::InDistTensors HierOutputDist::input_dist(
+    const at::Tensor &values, const c10::optional<at::Tensor> &offsets,
+    const c10::optional<at::Tensor> &lengths, int64_t batch_size,
+    const c10::optional<at::Tensor> &weights, const c10::optional<at::Tensor> &input_offsets,
+    int64_t input_batch_size, const c10::optional<at::Tensor> &reverse_indices) {
   quiesced_ = false;
-  return in_->start(part);
-}
-
-InDistResult HierOutputDist::wait(const Pending &pending) { return in_->wait(pending); }
-
-at::Tensor HierOutputDist::lookup_rows(int64_t num_recv) {
+  PlanInput input;
+  input.values = values;
+  input.offsets = offsets;
+  input.lengths = lengths;
+  input.batch_size = batch_size;
+  input.weights = weights;
+  input.input_offsets = input_offsets;
+  input.input_batch_size = input_batch_size;
+  input.reverse_indices = reverse_indices;
+  const InDist dist = in_->input_dist(input);
   c10::cuda::CUDAGuard guard(device_);
-  return window_->lookup_rows(num_recv, config_.dim, config_.dtype);
+  return {dist.kjt_values,
+          dist.kjt_weights,
+          dist.kjt_lengths,
+          dist.kjt_offsets,
+          window_->lookup_rows(sizes_.lookup_keys, config_.dim, config_.dtype),
+          dist.status,
+          dist.fwd_plan.tensors(),
+          dist.bwd_plan.tensors()};
 }
 
-at::Tensor HierOutputDist::forward(const FwdPlan &plan, const at::Tensor &lookup_out) {
+at::Tensor HierOutputDist::output_dist_fwd(const std::vector<c10::optional<at::Tensor>> &fwd_plan,
+                                           const at::Tensor &lookup_out) {
   quiesced_ = false;
-  return out_->forward(plan, lookup_out);
+  return out_->forward(FwdPlan::of(fwd_plan), lookup_out);
 }
 
-at::Tensor HierOutputDist::backward(const BwdPlan &plan, const at::Tensor &grad, bool divide) {
+at::Tensor HierOutputDist::output_dist_bwd(const std::vector<c10::optional<at::Tensor>> &bwd_plan,
+                                           const std::vector<int64_t> &counts,
+                                           const at::Tensor &grad, bool divide) {
   quiesced_ = false;
+  const BwdPlan plan = BwdPlan::of(bwd_plan, counts);
   out_->backward(plan, grad, divide);
   c10::cuda::CUDAGuard guard(device_);
   return window_->lookup_rows(plan.num_recv, grad.size(1), grad.scalar_type());
@@ -335,14 +358,6 @@ void HierOutputDist::quiesce() {
   HIER_CUDA_CHECK(cudaDeviceSynchronize());
   communicator_->barrier();
   quiesced_ = true;
-}
-
-std::map<std::string, int64_t> HierOutputDist::capacities() const {
-  return {{"lookup_keys", sizes_.lookup_keys},
-          {"remote_keys", sizes_.remote_keys},
-          {"proxy_bytes", config_.capacities.proxy_bytes},
-          {"num_proxy_rows", sizes_.num_proxy_rows},
-          {"rounds_cap", sizes_.rounds_cap}};
 }
 
 // The ctrl section's buffer takes whole kBufferAlign units, as the keys and

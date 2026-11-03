@@ -201,15 +201,17 @@ struct PutSeg {
 //   rounds       rounds of a proxy (num_nodes > 1; never an overflow)
 enum Need : int { kNeedLookupKeys = 0, kNeedRemoteKeys, kNeedRounds, kNumNeeds };
 
-// The status of one call (int64 words), copied to the host once.
+// The status of one call (int64 words), which the caller copies to the host
+// once, at the call's second wait (shard/input_dist.py reads it by these
+// slots).
 enum StatusSlots : int {
   kStatusNeed = 0,                           // [kNumNeeds] the most any rank needs, by Need
   kStatusNumRecv = kStatusNeed + kNumNeeds,  // keys this owner looks up
   kStatusHeavySubs,                          // sub-tasks of this requester's heavy rows
                                              // (index dedup), what its backward sums in
   kStatusGroupSubs,                          // (num_nodes > 1) sub-tasks of its heavy groups
-  kStatusSent,                               // rows this requester sends, the valid ones
-                                             // of its bound (index dedup: fewer)
+  kStatusOccurrences,                        // (num_nodes > 1) the remote occurrences this
+                                             // rank deduplicated as proxy
   kStatusLengthPerKey,                       // [num_features] keys this owner looks up per
                                              // feature, then [num_features] keys per feature
                                              // of the input KJT that construct_jagged_tensors

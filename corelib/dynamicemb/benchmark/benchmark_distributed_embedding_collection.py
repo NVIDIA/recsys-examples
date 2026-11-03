@@ -357,12 +357,6 @@ def _hier_shardings(model) -> List:
     ]
 
 
-def hier_fallbacks(model) -> int:
-    """Calls of the model's hierarchical dists that did not fit their
-    capacities and ran on TorchRec's dists, so far."""
-    return sum(hier.fallbacks for hier in _hier_shardings(model))
-
-
 def _hier_op(model):
     """The model's HierOutputDist (the first sharding's), or None."""
     return next((hier.op for hier in _hier_shardings(model)), None)
@@ -486,13 +480,13 @@ class _HostSyncs:
 
 class _Calls:
     """What the plain loop keeps of each call of its timed iterations: CUDA
-    events on the caller's stream before the input dist, after part 1, after
-    the first wait and after the second wait (when the lookup may start: the
-    stream then waits for everything the KJT needs), and right before and
-    after the hierarchical output dist's forward and backward launches, made
-    beforehand; when tracing, this GPU's globaltimer before the input dist
-    and after its second wait ([2] int64 each). With --host_stages it tells
-    the sync counter which call runs."""
+    events on the caller's stream before the input dist, after input_dist(),
+    after the first wait and after the second wait (when the lookup may
+    start: the stream then waits for everything the KJT needs), and right
+    before and after the hierarchical output dist's forward and backward
+    launches, made beforehand; when tracing, this GPU's globaltimer before
+    the input dist and after its second wait ([2] int64 each). With
+    --host_stages it tells the sync counter which call runs."""
 
     def __init__(
         self, num_calls: int, clocks: bool, host: Optional[_HostSyncs]
@@ -523,8 +517,8 @@ class _Calls:
         self.count += 1
 
     def step(self, which: int) -> None:
-        """Step ``which`` of the call's input dist (1: part 1, 2: the first
-        wait, 3: the second wait) has returned."""
+        """Step ``which`` of the call's input dist (1: input_dist(), 2: the
+        first wait, 3: the second wait) has returned."""
         self.events[self.count - 1][which].record()
         if which == 3 and self.clocks is not None:
             from dynamicemb_extensions import hier_output_dist_clock
@@ -545,8 +539,7 @@ class _Calls:
     def op_calls(self) -> List[int]:
         """The calls that took the hierarchical dist (they timed both of its
         output-dist launches), or every call when none did (TorchRec's
-        dists): a call over its capacities runs on TorchRec's dists, and
-        the per-call figures leave it out."""
+        dists)."""
         took = [call for call in range(self.count) if all(self.output_dist_timed[call])]
         return took or list(range(self.count))
 
@@ -569,14 +562,15 @@ _OUTPUT_DIST_COUNTS: Dict[int, int] = defaultdict(int)
 
 
 def _time_output_dist_launches() -> None:
-    """Wrap the hierarchical output dist's forward and backward launches (one
-    kernel each), where the build has them, in the per-call events of the
-    timed iterations (_Calls.output_dist_launch)."""
+    """Wrap the hierarchical output dist's forward and backward launches
+    (output_dist_fwd and output_dist_bwd, one kernel each), where the build
+    has them, in the per-call events of the timed iterations
+    (_Calls.output_dist_launch)."""
     import dynamicemb_extensions as ext
 
     if not hasattr(ext, "HierOutputDist"):
         return
-    for method, direction in (("forward", 0), ("backward", 1)):
+    for method, direction in (("output_dist_fwd", 0), ("output_dist_bwd", 1)):
         orig = getattr(ext.HierOutputDist, method)
 
         def launch(self, *args, _orig=orig, _direction=direction, **kwargs):
@@ -618,8 +612,8 @@ def install_stage_markers() -> None:
 
     ShardedDynamicEmbeddingCollection.forward = forward
 
-    # Under a train pipeline the input dist's part 1 and its waits run from
-    # the pipeline, outside the module's forward.
+    # Under a train pipeline input_dist() and its waits run from the
+    # pipeline, outside the module's forward.
     def in_stage(fn):
         def wrapped(*args, **kwargs):
             with _range(_STAGE_PREFIX + "input_dist"):
@@ -717,7 +711,7 @@ def _kernels(prof):
     launched it (the same correlation id). The profiler links a kernel to a
     PyTorch op only when one was running at its launch, so this also counts
     kernels a C++ extension launches directly (DynamicEmb's bucketize, the
-    hierarchical input dist's first wait). Device-side copies of annotation
+    hierarchical input dist). Device-side copies of annotation
     ranges are left out: they have no launch (and their ids are not CUDA
     correlation ids)."""
     events = prof.events()
@@ -863,19 +857,18 @@ class HierTraffic:
         traffic = self
 
         def forward(self_, local_embs, sharding_ctx=None):
-            result = getattr(sharding_ctx, "hier_result", None)
-            if traffic.enabled and result is not None:
+            call = getattr(sharding_ctx, "hier_result", None)
+            if traffic.enabled and call is not None:
                 traffic.hier = self_._hier
-                fwd_plan, bwd_plan = result.fwd_plan, result.bwd_plan
                 traffic.calls.append(
                     (
-                        fwd_plan.block_start,
-                        result.num_recv,
+                        call.block_start,
+                        call.counts[0],
                         (
-                            bwd_plan.uniq_in,
-                            fwd_plan.uniq_out,
-                            fwd_plan.num_rounds,
-                            result.occurrence_count,
+                            call.uniq_in,
+                            call.uniq_out,
+                            call.num_rounds,
+                            call.occurrences,
                         ),
                     )
                 )
@@ -1614,16 +1607,12 @@ def check_against_torchrec(
         if loss_hier is not None:
             loss_hier.backward()
     ran = all(_OUTPUT_DIST_COUNTS[direction] >= steps for direction in (0, 1))
-    flags = torch.tensor(
-        [int(ok), int(ran), -hier_fallbacks(hier_model)], device=device
-    )
+    flags = torch.tensor([int(ok), int(ran)], device=device)
     dist.all_reduce(flags, op=dist.ReduceOp.MIN)
     # The models go when this returns: the hierarchical dist then frees its
     # windows at once, without its teardown's exit round.
     quiesce(hier_model)
-    ok, ran, fallbacks = flags.tolist()
-    if fallbacks:
-        return f"{-fallbacks} calls of the {fused} model ran on TorchRec's dists"
+    ok, ran = flags.tolist()
     if not ran:
         return f"the {fused} model fell back to TorchRec's dists"
     return None if ok else "the outputs differ"
@@ -1731,7 +1720,6 @@ def run(cfg: BenchConfig) -> Dict:
     nics0 = nic_counters() if cfg.nic_counters and local_rank == 0 else {}
     if host is not None:
         host.install()
-    fallbacks0 = hier_fallbacks(model)
     t0 = time.perf_counter()
     iter_ms = None
     if pipeline is None:
@@ -1739,9 +1727,6 @@ def run(cfg: BenchConfig) -> Dict:
     else:
         iter_ms = time_pipeline(pipeline, fed, len(timed))
     wall_ms = (time.perf_counter() - t0) * 1000.0 / len(timed)
-    # calls of the timed iterations that ran on TorchRec's dists (over the
-    # capacities)
-    fallback_calls = hier_fallbacks(model) - fallbacks0
     if host is not None:
         host.uninstall()
     nics = None
@@ -1831,12 +1816,10 @@ def run(cfg: BenchConfig) -> Dict:
     # costs the host a few us per launch, so the timed iterations run without
     # it): per call, the output dist's kernels' GPU ms (forward, backward).
     kernel_ms = None
-    kernel_fallbacks = 0
     if cfg.kernel_times:
         start = cfg.warmup + cfg.num_iterations
         torch.cuda.synchronize()
         dist.barrier()
-        fallbacks0 = hier_fallbacks(model)
         with torch.profiler.profile(
             activities=[torch.profiler.ProfilerActivity.CUDA]
         ) as kprof:
@@ -1844,7 +1827,6 @@ def run(cfg: BenchConfig) -> Dict:
                 time_iterations(model, batches[start : start + kernel_iters])
             else:
                 time_pipeline(pipeline, fed, kernel_iters)
-        kernel_fallbacks = hier_fallbacks(model) - fallbacks0
         # per call that took the hierarchical dist (the same calls on every
         # rank)
         kernel_ms = output_dist_kernel_times(kprof) or None
@@ -1852,13 +1834,11 @@ def run(cfg: BenchConfig) -> Dict:
     breakdown = {}
     names = {}
     prof_traffic = None
-    prof_fallbacks = 0
     if cfg.profile_iterations > 0:
         prof_batches = batches[cfg.warmup + cfg.num_iterations + kernel_iters :]
         torch.cuda.synchronize()
         dist.barrier()
         reset_traffic()
-        fallbacks0 = hier_fallbacks(model)
         _PROFILING = True
         with torch.profiler.profile(
             activities=[
@@ -1869,7 +1849,6 @@ def run(cfg: BenchConfig) -> Dict:
             train(prof_batches)
             torch.cuda.synchronize()
         _PROFILING = False
-        prof_fallbacks = hier_fallbacks(model) - fallbacks0
         prof_traffic = traffic_of(len(prof_batches))
         breakdown = kernel_breakdown(prof, len(prof_batches))
         names = {
@@ -1927,10 +1906,6 @@ def run(cfg: BenchConfig) -> Dict:
         "used": gather_floats(list(used.values())),
         "used_keys": list(used),
         "nics": nics,
-        "fallback_calls": fallback_calls,
-        "fallback_calls_kernel_times": kernel_fallbacks,
-        "fallback_calls_profile": prof_fallbacks,
-        "fallback_calls_all": hier_fallbacks(model),
     }
 
     result = None
@@ -2013,24 +1988,7 @@ def report(
         "nodes": world_size // local_size,
         "iter_ms_host": wall_ms,
         "capacities": cfg.output_dist_capacity,
-        # calls that did not fit the capacities (TorchRec's dists): of the
-        # timed iterations, of the --kernel_times and profiled ones, and all
-        # calls so far
-        "fallback_calls": more["fallback_calls"],
-        "fallback_calls_kernel_times": more["fallback_calls_kernel_times"],
-        "fallback_calls_profile": more["fallback_calls_profile"],
-        "fallback_calls_all": more["fallback_calls_all"],
     }
-    if more["fallback_calls_all"]:
-        print(
-            f"fallback: {more['fallback_calls']} timed calls,"
-            f" {more['fallback_calls_kernel_times']} of --kernel_times,"
-            f" {more['fallback_calls_profile']} profiled"
-            f" ({more['fallback_calls_all']} in all) did not fit output_dist_capacity"
-            " and ran on TorchRec's dists; the per-call figures leave them out, the"
-            " times and the kernel breakdown do not",
-            flush=True,
-        )
     # The forward and the backward of the plain loop, or a pipeline's whole
     # iterations (which overlap the next batch's input dist with both).
     parts = ("fwd", "bwd") if cfg.pipeline == "none" else ("iter",)
@@ -2124,8 +2082,8 @@ def report(
             print(f"    {ms:8.3f}  {site}")
     in_ms = more.get("in_ms")
     if in_ms is not None:
-        # [world_size, calls, 4]: part 1, first wait, second wait, the whole
-        # segment
+        # [world_size, calls, 4]: input_dist(), first wait, second wait, the
+        # whole segment
         per_rank = in_ms.mean(dim=1)  # [world_size, 4]
         res["in_seg_ms_mean"] = per_rank[:, 3].mean().item()
         res["in_seg_ms_max_rank"] = per_rank[:, 3].max().item()
@@ -2139,7 +2097,7 @@ def report(
             f" second wait): mean {res['in_seg_ms_mean']:.3f} ms, max rank"
             f" {res['in_seg_ms_max_rank']:.3f}, mean over calls of the slowest rank"
             f" {res['in_seg_ms_call_max']:.3f} and of the least over ranks"
-            f" {res['in_seg_ms_call_min']:.3f}; part 1 / first wait / second wait"
+            f" {res['in_seg_ms_call_min']:.3f}; input_dist() / first wait / second wait"
             f" {' / '.join(f'{ms:.3f}' for ms in res['in_seg_steps_ms'])} ms"
         )
     output_dist_ms = more.get("output_dist_ms")

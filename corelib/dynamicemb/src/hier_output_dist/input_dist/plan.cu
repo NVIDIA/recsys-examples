@@ -60,14 +60,30 @@ PlanView plan_view(const Plan &plan, const Sizes &sizes) {
   return view;
 }
 
-void record(const at::Tensor &tensor, c10::Stream stream) {
-  if (tensor.defined()) tensor.record_stream(stream);
-}
-
-void record(const FanoutTables &fanout, c10::Stream stream) {
-  for (const at::Tensor *tensor : {&fanout.exp_off, &fanout.exp_idx, &fanout.slot, &fanout.sub,
-                                   &fanout.count, &fanout.pos, &fanout.first})
-    record(*tensor, stream);
+// The forward plan's tensors, in the order of tensors() and of().
+template <typename Plan>
+auto fwd_tensors(Plan &plan) -> std::vector<decltype(&plan.src)> {
+  return {&plan.block_start,
+          &plan.src,
+          &plan.inv,
+          &plan.fanout.exp_off,
+          &plan.fanout.exp_idx,
+          &plan.fanout.slot,
+          &plan.fanout.sub,
+          &plan.fanout.count,
+          &plan.fanout.pos,
+          &plan.fanout.first,
+          &plan.push_order,
+          &plan.proxy_rounds,
+          &plan.push_tables,
+          &plan.num_rounds,
+          &plan.put_list,
+          &plan.proxy_round_tables,
+          &plan.push_order_off,
+          &plan.fwd_task_starts,
+          &plan.fwd_put_start,
+          &plan.uniq_out,
+          &plan.push_start};
 }
 
 // The backward plan's tensors, in the order of tensors() and of().
@@ -117,13 +133,20 @@ FwdPlanView FwdPlan::view(const Sizes &sizes) const {
   return view;
 }
 
-void FwdPlan::record_stream(c10::Stream stream) const {
-  for (const at::Tensor *tensor :
-       {&block_start, &src, &inv, &push_order, &proxy_rounds, &push_tables, &num_rounds, &put_list,
-        &proxy_round_tables, &push_order_off, &fwd_task_starts, &fwd_put_start, &uniq_out,
-        &push_start})
-    record(*tensor, stream);
-  record(fanout, stream);
+std::vector<at::Tensor> FwdPlan::tensors() const {
+  std::vector<at::Tensor> tensors;
+  for (const at::Tensor *tensor : fwd_tensors(*this)) tensors.push_back(*tensor);
+  return tensors;
+}
+
+FwdPlan FwdPlan::of(const std::vector<c10::optional<at::Tensor>> &tensors) {
+  FwdPlan plan;
+  const std::vector<at::Tensor *> fields = fwd_tensors(plan);
+  TORCH_CHECK(tensors.size() == fields.size(), "hier_output_dist: a forward plan is made of ",
+              fields.size(), " tensors, got ", tensors.size());
+  for (size_t field = 0; field < fields.size(); ++field)
+    if (tensors[field].has_value()) *fields[field] = *tensors[field];
+  return plan;
 }
 
 BwdPlanView BwdPlan::view(const Sizes &sizes) const {
@@ -145,10 +168,6 @@ BwdPlanView BwdPlan::view(const Sizes &sizes) const {
   view.heavy_subs = heavy_subs;
   view.group_subs = group_subs;
   return view;
-}
-
-void BwdPlan::record_stream(c10::Stream stream) const {
-  for (const at::Tensor *tensor : bwd_tensors(*this)) record(*tensor, stream);
 }
 
 std::vector<at::Tensor> BwdPlan::tensors() const {

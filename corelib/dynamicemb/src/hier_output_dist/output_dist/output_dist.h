@@ -70,7 +70,7 @@ class OutChannel {
 
   // fwd_kernel on the current stream: this rank's rows, from the
   // lookup_rows of its node's owners and (across nodes) the proxy_rows of
-  // its node's proxies, into a new tensor of plan.num_out rows. lookup_out
+  // its node's proxies, into a new tensor of plan.num_out() rows. lookup_out
   // must be the rows of lookup_rows the lookup wrote (zero copy).
   at::Tensor forward(const FwdPlan &plan, const at::Tensor &lookup_out);
   // bwd_kernel on the current stream: the gradient of this rank's rows back

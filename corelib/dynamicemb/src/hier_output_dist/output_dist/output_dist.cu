@@ -120,7 +120,7 @@ at::Tensor OutChannel::forward(const FwdPlan &plan, const at::Tensor &lookup_out
   TORCH_CHECK(
       lookup_out.numel() == 0 || (lookup_out.is_cuda() && lookup_out.data_ptr() == lookup_rows_),
       "hier_output_dist: the lookup output must be the rows lookup_rows() returned");
-  at::Tensor out = output(plan.num_out);
+  at::Tensor out = output(plan.num_out());
   at::Tensor ready;  // the kernel zeroes it
   if (multi_node_) ready = at::empty({sizes_.topo.local_size}, out.options().dtype(at::kLong));
   FwdArgs args{};
