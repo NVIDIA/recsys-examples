@@ -294,7 +294,7 @@ insert(Bucket &bucket, KeyType key, ScoreType score,
       if (bucket.try_lock(iter, evict_key)) {
         if (evict_key != Bucket::reclaimed_key()) {
           int64_t flat_idx = counter_offset + iter;
-          if (::atomicAdd(&counter[flat_idx], 0) > 0) {
+          if (counter != nullptr && ::atomicAdd(&counter[flat_idx], 0) > 0) {
             bucket.unlock(iter, evict_key);
             continue;
           }
@@ -813,7 +813,7 @@ __global__ void table_erase_kernel(
         ScoreType *sblk = bucket.scores(iter);
         for (int64_t s = 0; s < bucket.num_scores(); ++s)
           sblk[s] = ScoreType();
-        *bucket.digests(iter) = Bucket::empty_digest();
+        *bucket.digests(iter) = Bucket::reclaimed_digest();
 
         bucket.unlock(iter, Bucket::reclaimed_key());
         atomicSub(bucket_sizes + bucket_id, 1);
@@ -827,6 +827,97 @@ __global__ void table_erase_kernel(
     }
     if (indices) {
       indices[i] = index;
+    }
+  }
+}
+
+// Whether a prefetched batch is using the slot: its ref counter is above zero.
+// ``counter`` is indexed by the global slot, and is null for a storage that keeps
+// none, where nothing is ever pinned. A plain (volatile) read is enough: nothing
+// writes the counters while an erase runs, a prefetch being kept out by the lock.
+__device__ __forceinline__ bool slot_is_pinned(int32_t const *counter,
+                                               int64_t slot) {
+  return counter != nullptr &&
+         *static_cast<volatile int32_t const *>(counter + slot) > 0;
+}
+
+// Erase every key of the slots [begin, end) whose score is below ``threshold``.
+//
+// The slots are global (the tables of a storage share one array, table t's
+// buckets start at table_bucket_offsets[t]); the caller picks a range inside one
+// table. Only the key, digest and score arrays are touched: no value, no row.
+//
+// A slot is locked with the same compare-and-swap an insert or a lookup that
+// updates a score takes, and its score is read again under the lock: a lookup
+// rewrites it under that lock, so a key read as old a moment ago may just have been
+// used. A slot whose ref counter is above zero is in use by a prefetched batch and
+// is spared -- the same test the evict kernel makes. ``counter`` is indexed by the
+// global slot, which is what ``increment_counter`` writes; it is null for a storage
+// that keeps no counter (nothing there is ever pinned).
+//
+// ``num_erased`` / ``num_spared`` are added to. Counted a tile at a time, so the
+// atomics are few even when every key matches.
+template <typename Table, int TileSize>
+__global__ void table_erase_by_score_kernel(
+    Table table, IndexType begin, IndexType end, ScoreType threshold,
+    int64_t score_index, int *__restrict__ bucket_sizes,
+    int32_t const *__restrict__ counter, CounterType *__restrict__ num_erased,
+    CounterType *__restrict__ num_spared) {
+  using KeyType = typename Table::KeyType;
+  using Bucket = typename Table::BucketType;
+  using Iter = typename Bucket::Iterator;
+
+  cg::thread_block_tile<TileSize> g =
+      cg::tiled_partition<TileSize>(cg::this_thread_block());
+
+  auto tid = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  // 64-bit: gridDim.x * blockDim.x alone is an unsigned 32-bit product, which wraps
+  // for a grid of 2^24 blocks or more. A multiple of 32, so a tile's lanes still
+  // take the same steps.
+  const int64_t stride = static_cast<int64_t>(gridDim.x) * blockDim.x;
+
+  for (int64_t i = begin + tid; i < end; i += stride) {
+
+    int64_t bucket_id = i / table.bucket_capacity();
+    Bucket bucket = table[bucket_id];
+    Iter iter = Iter(i % bucket.capacity());
+
+    bool erased = false;
+    bool spared = false;
+
+    KeyType key = *bucket.keys(iter);
+    if (Bucket::is_valid(key) &&
+        *bucket.scores(iter, score_index) < threshold) {
+      KeyType expected_key = key;
+      if (bucket.try_lock(iter, expected_key)) {
+        if (*bucket.scores(iter, score_index) >= threshold) {
+          // Used since it was read: keep it.
+          bucket.unlock(iter, key);
+        } else if (slot_is_pinned(counter, i)) {
+          bucket.unlock(iter, key);
+          spared = true;
+        } else {
+          // As table_erase_kernel: clear the whole score block, so that a
+          // reclaimed slot ranks below the keys in use, then leave the slot
+          // reclaimed (it keeps its value row).
+          ScoreType *sblk = bucket.scores(iter);
+          for (int64_t s = 0; s < bucket.num_scores(); ++s)
+            sblk[s] = ScoreType();
+          *bucket.digests(iter) = Bucket::reclaimed_digest();
+          bucket.unlock(iter, Bucket::reclaimed_key());
+          atomicSub(bucket_sizes + bucket_id, 1);
+          erased = true;
+        }
+      }
+    }
+
+    uint32_t erased_vote = g.ballot(erased);
+    uint32_t spared_vote = g.ballot(spared);
+    if (g.thread_rank() == 0) {
+      if (erased_vote)
+        atomicAdd(num_erased, static_cast<CounterType>(__popc(erased_vote)));
+      if (spared_vote)
+        atomicAdd(num_spared, static_cast<CounterType>(__popc(spared_vote)));
     }
   }
 }

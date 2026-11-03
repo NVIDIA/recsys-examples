@@ -31,6 +31,7 @@ from dynamicemb import (
 )
 from dynamicemb.batched_dynamicemb_tables import BatchedDynamicEmbeddingTablesV2
 from dynamicemb.dynamicemb_config import ReplayContent
+from dynamicemb_extensions import device_timestamp
 
 TABLE_NAME = "t_0"
 DIM = 8
@@ -962,6 +963,48 @@ def test_an_unretained_erase_makes_the_delta_unreplayable(current_device):
     # Sticky: later deltas stay unreplayable.
     touch(src, [3001], device, backward=True)
     assert dump_all(src).meta[0]["erase_untracked"] is True
+
+
+def test_an_erase_by_score_makes_the_delta_unreplayable(current_device):
+    """``erase_by_score_async`` removes keys without retaining them, as an unretained
+    ``erase_keys`` does. Without a mark the delta dumped afterwards would look complete,
+    and replay would leave the replica with the keys the source erased: the table is
+    marked and replay refuses the delta, before it writes anything."""
+    device = torch.device(f"cuda:{current_device}")
+    src, dst = _one_bucket_models(current_device)
+    touch(src, list(range(2001, 2016)), device, backward=True)
+    dst.replay_increment(dump_all(src))
+    assert not dump_all(src).meta[0]["erase_untracked"]
+
+    erased = src.erase_by_score_async(
+        DynamicEmbScoreStrategy.TIMESTAMP, device_timestamp()
+    ).result()
+    assert erased == (15, 0)
+
+    delta = dump_all(src)
+    assert delta.meta[0]["erase_untracked"] is True
+    before = dump_all(dst).keys[0].numel()
+    with pytest.raises(ValueError, match="erased keys without retaining"):
+        dst.replay_increment(delta)
+    assert dump_all(dst).keys[0].numel() == before, "a refused delta writes nothing"
+
+
+def test_an_erase_by_score_that_removes_nothing_leaves_the_delta_replayable(
+    current_device,
+):
+    """The mark is sticky, so it is not put on a table for a call that found nothing below
+    its threshold."""
+    device = torch.device(f"cuda:{current_device}")
+    src, dst = _one_bucket_models(current_device)
+    touch(src, list(range(2001, 2016)), device, backward=True)
+
+    assert src.erase_by_score_async(DynamicEmbScoreStrategy.TIMESTAMP, 0).result() == (
+        0,
+        0,
+    )
+    delta = dump_all(src)
+    assert delta.meta[0]["erase_untracked"] is False
+    assert dst.replay_increment(delta)[TABLE_NAME].upserted == 15
 
 
 def test_replay_removes_a_key_the_source_evicted_for_one_it_then_erased(

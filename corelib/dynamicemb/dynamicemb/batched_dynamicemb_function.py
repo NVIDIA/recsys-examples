@@ -15,9 +15,10 @@
 
 from dataclasses import dataclass
 from enum import Enum, auto
-from typing import Optional, Tuple
+from typing import Callable, ContextManager, Optional, Tuple
 
 import torch
+from dynamicemb.async_erase import table_section
 from dynamicemb.dynamicemb_config import EvictedItemMode
 from dynamicemb.initializer import MultiTableInitializer
 from dynamicemb.key_value_table import (
@@ -805,6 +806,7 @@ def dynamicemb_prefetch(
     outstanding_keys_ref: Optional[torch.Tensor] = None,
     external_storage: Optional[Storage] = None,
     scores: Optional[torch.Tensor] = None,
+    table_gate: Optional[Callable[[], ContextManager]] = None,
 ) -> PrefetchState:
     """Unified prefetch for all storage types (cache, HBM-direct, generic).
 
@@ -815,6 +817,11 @@ def dynamicemb_prefetch(
     follow the keys through the dedup on a channel of their own, beside the
     frequency counters: where a key repeats in the batch, the largest of its
     scores is the one the table gets.
+
+    ``table_gate`` is what an erase running beside the training takes too (see
+    ``async_erase.TableAccessGate``). Prefetch holds it while it reads or changes the
+    tables -- from the expansion through the find and the counter increment -- so
+    that a key it found is pinned before an erase can look at it.
     """
     with torch.cuda.nvtx.range("dynamicemb_prefetch"):
         table_num = feature_offsets.numel() - 1
@@ -856,9 +863,6 @@ def dynamicemb_prefetch(
 
         num_prefetched_keys = unique_keys.numel()
 
-        if hasattr(storage, "expand_if_need"):
-            storage.expand_if_need(unique_size_per_table)
-
         unique_table_ids = expand_table_ids_cuda(
             unique_indices_table_range,
             unique_keys.numel(),
@@ -874,58 +878,62 @@ def dynamicemb_prefetch(
         else:
             storage_mode = StorageMode.DEFAULT
 
-        if storage_mode == StorageMode.CACHE:
-            if outstanding_keys_ref is not None:
-                outstanding_keys_ref += num_prefetched_keys
-                cache_capacity = cache._state.capacity
-                outstanding_keys = _scalar_item(outstanding_keys_ref)
-                if outstanding_keys > cache_capacity:
-                    raise RuntimeError(
-                        f"Outstanding prefetched keys "
-                        f"({outstanding_keys}) "
-                        f"exceed cache capacity ({cache_capacity}). "
-                        "Reduce prefetch pipeline depth or increase "
-                        "cache size."
-                    )
-            (
-                slot_indices,
-                non_admitted_positions,
-            ) = _prefetch_cache_path(
-                cache,
-                storage,
-                unique_keys,
-                unique_table_ids,
-                max_emb_dim,
-                max_val_dim,
-                emb_dtype,
-                initializer,
-                evict_strat,
-                lfu_accumulated_frequency,
-                admitter,
-                external_storage,
-                key_scores=unique_scores,
-            )
-            # The cache addresses its own value buffer by cache slot: a cache is
-            # never NO_EVICTION (it enables overflow, which NO_EVICTION rejects
-            # at construction), so the two index spaces coincide here.
-            value_row_indices = slot_indices
-        elif storage_mode == StorageMode.HBM_DIRECT:
-            (
-                slot_indices,
-                non_admitted_positions,
-                value_row_indices,
-            ) = _prefetch_hbm_direct_path(
-                storage,
-                unique_keys,
-                unique_table_ids,
-                max_emb_dim,
-                max_val_dim,
-                initializer,
-                evict_strat,
-                lfu_accumulated_frequency,
-                admitter,
-                key_scores=unique_scores,
-            )
+        with table_section(table_gate):
+            if hasattr(storage, "expand_if_need"):
+                storage.expand_if_need(unique_size_per_table)
+
+            if storage_mode == StorageMode.CACHE:
+                if outstanding_keys_ref is not None:
+                    outstanding_keys_ref += num_prefetched_keys
+                    cache_capacity = cache._state.capacity
+                    outstanding_keys = _scalar_item(outstanding_keys_ref)
+                    if outstanding_keys > cache_capacity:
+                        raise RuntimeError(
+                            f"Outstanding prefetched keys "
+                            f"({outstanding_keys}) "
+                            f"exceed cache capacity ({cache_capacity}). "
+                            "Reduce prefetch pipeline depth or increase "
+                            "cache size."
+                        )
+                (
+                    slot_indices,
+                    non_admitted_positions,
+                ) = _prefetch_cache_path(
+                    cache,
+                    storage,
+                    unique_keys,
+                    unique_table_ids,
+                    max_emb_dim,
+                    max_val_dim,
+                    emb_dtype,
+                    initializer,
+                    evict_strat,
+                    lfu_accumulated_frequency,
+                    admitter,
+                    external_storage,
+                    key_scores=unique_scores,
+                )
+                # The cache addresses its own value buffer by cache slot: a cache is
+                # never NO_EVICTION (it enables overflow, which NO_EVICTION rejects
+                # at construction), so the two index spaces coincide here.
+                value_row_indices = slot_indices
+            elif storage_mode == StorageMode.HBM_DIRECT:
+                (
+                    slot_indices,
+                    non_admitted_positions,
+                    value_row_indices,
+                ) = _prefetch_hbm_direct_path(
+                    storage,
+                    unique_keys,
+                    unique_table_ids,
+                    max_emb_dim,
+                    max_val_dim,
+                    initializer,
+                    evict_strat,
+                    lfu_accumulated_frequency,
+                    admitter,
+                    key_scores=unique_scores,
+                )
 
         return PrefetchState(
             unique_keys=unique_keys,

@@ -40,6 +40,12 @@ from typing import (
 
 import torch  # usort:skip
 import torch.distributed as dist
+from dynamicemb.async_erase import (
+    AsyncEraser,
+    EraseHandle,
+    TableAccessGate,
+    check_erase_arguments,
+)
 from dynamicemb.batched_dynamicemb_function import (
     DynamicEmbeddingFunction,
     PrefetchState,
@@ -66,6 +72,8 @@ from dynamicemb.key_value_table import (
     Cache,
     DynamicEmbCache,
     DynamicEmbStorage,
+    ERASE_CHUNK_SLOTS,
+    ERASE_MAX_CHUNKS_IN_FLIGHT,
     HybridStorage,
     Storage,
     flush_cache,
@@ -666,6 +674,10 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
         self._enable_prefetch = prefetch_pipeline
         self.prefetch_stream = None
         self._prefetch_outstanding_keys = torch.tensor(0, dtype=torch.int64)
+        # Who may touch the tables now: prefetch, and an erase running beside the
+        # training. See async_erase.py.
+        self._table_gate = TableAccessGate()
+        self._eraser = AsyncEraser()
         self._table_names = table_names
         self.bounds_check_mode_int: int = bounds_check_mode.value
         self._create_score()
@@ -879,7 +891,12 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                         "storage expands instead of evicting, so a PS below it "
                         "would never be used."
                     )
-                self._storage = DynamicEmbStorage(storage_options, self._optimizer)
+                # Under a cache the cache pins the slots a batch uses, never the
+                # storage's, so its per-slot reference counter would only take
+                # (a lot of) memory.
+                self._storage = DynamicEmbStorage(
+                    storage_options, self._optimizer, use_ref_counter=False
+                )
                 if PS:
                     # The PS sits below the storage: the storage owns scores and
                     # the freshest values, the PS only holds what it evicted.
@@ -905,7 +922,11 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                     self._storage = (
                         PS(storage_options, self._optimizer)
                         if PS
-                        else DynamicEmbStorage(storage_options, self._optimizer)
+                        # Host-side values: the generic (DEFAULT) path, which
+                        # pins no slot, so no per-slot reference counter.
+                        else DynamicEmbStorage(
+                            storage_options, self._optimizer, use_ref_counter=False
+                        )
                     )
                     self._storage_layout = (
                         StorageLayout.HOST_PS if PS else StorageLayout.HOST_ONLY
@@ -1479,6 +1500,7 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                 else None,
                 external_storage=self._external_storage,
                 scores=scores,
+                table_gate=self._table_gate,
             )
         )
         self._update_score()
@@ -1533,6 +1555,119 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
             else:
                 result[table_name] = self._scores[table_name]
         return result
+
+    # What a storage layout lets an erase by score do. Only a single-tier GPU storage
+    # and the backing storage of a cache keep a key map the erase can scan; the others
+    # keep their keys where it cannot (host values read by the generic path, two tiers,
+    # an external store).
+    _ERASABLE_LAYOUTS = (StorageLayout.HBM_ONLY, StorageLayout.CACHING)
+
+    def erasable_table_ids(self, score_strategy: DynamicEmbScoreStrategy) -> List[int]:
+        """The tables an erase by ``score_strategy`` would scan, after checking that it can.
+
+        A table is scanned when its score strategy has ``score_strategy`` as a member
+        (``(NO_EVICTION, CUSTOMIZED)`` has ``CUSTOMIZED``); one with no score, which
+        is ``NO_EVICTION`` alone, is not. Raises if a table that would be scanned
+        cannot be: it keeps more than one score word, or its storage cannot be
+        scanned. Nothing to scan is an empty list, not an error.
+        """
+        table_ids = []
+        for table_id, (name, option) in enumerate(
+            zip(self._table_names, self._dynamicemb_options)
+        ):
+            part = get_score_part(option.score_strategy)
+            if part is None:
+                continue
+            if isinstance(part, tuple):
+                if score_strategy in part:
+                    raise NotImplementedError(
+                        f"Table '{name}' keeps one score word per strategy in "
+                        f"{option.score_strategy}; erase by score reads one."
+                    )
+                continue
+            if part == score_strategy:
+                table_ids.append(table_id)
+        if table_ids and self._storage_layout not in self._ERASABLE_LAYOUTS:
+            raise NotImplementedError(
+                "erase by score needs the keys in a GPU hash table: HBM-only storage, "
+                "or a cache over host storage with no external storage. This module "
+                f"is {self._storage_layout.name}."
+            )
+        return table_ids
+
+    def erase_by_score_async(
+        self,
+        score_strategy: DynamicEmbScoreStrategy,
+        threshold: int,
+        stream: Optional[torch.cuda.Stream] = None,
+        chunk_slots: int = ERASE_CHUNK_SLOTS,
+        max_in_flight: int = ERASE_MAX_CHUNKS_IN_FLIGHT,
+    ) -> EraseHandle:
+        """Erase, in the background, the keys whose score is below ``threshold``.
+
+        Only tables whose score strategy has ``score_strategy`` as a member are
+        scanned (see :meth:`erasable_table_ids`); with none, the handle is done at
+        once and says ``(0, 0)``. The scan runs on a thread of its own and launches on
+        ``stream``, a stream of the tables' device; the call returns at once. Without a
+        ``stream`` this one uses a stream of its own, made on first use and kept, and the
+        scan overlaps the training. On the stream the training runs on, or the prefetch
+        stream, it is queued among the training's kernels and runs correctly, only
+        without overlap, which is warned about. Work the training already queued is not
+        waited for.
+
+        The scan goes a chunk at a time of at most ``chunk_slots`` slots, with at most
+        ``max_in_flight`` chunks launched and not yet finished on the device: smaller
+        chunks and fewer in flight disturb the training less and make the scan take
+        longer (see ``ERASE_CHUNK_SLOTS``).
+
+        Best effort: a key a prefetched batch is still using is spared, not erased.
+        With a cache only the storage behind it is erased, and the cache is neither
+        read nor changed.
+
+        The scan can overlap training -- forward, backward and prefetch -- and nothing
+        else: before a dump, load, incremental dump, replay or ``pop_*``, wait for
+        the handle.
+
+        Returns an :class:`EraseHandle`; ``result()`` is ``(erased, spared)``.
+        """
+        check_erase_arguments(
+            score_strategy, threshold, stream, chunk_slots, max_in_flight
+        )
+        table_ids = self.erasable_table_ids(score_strategy)
+        if not table_ids:
+            return EraseHandle.completed()
+        if stream is None:
+            stream = self._eraser.own_stream(self.device_id)
+        else:
+            if stream.device != torch.device("cuda", self.device_id):
+                raise ValueError(
+                    f"stream is on {stream.device}, the tables are on cuda:{self.device_id}."
+                )
+            if stream in (
+                torch.cuda.current_stream(self.device_id),
+                torch.cuda.default_stream(self.device_id),
+                self.prefetch_stream,
+            ):
+                warnings.warn(
+                    "The erase runs on a stream the training uses (the current, the "
+                    "default or the prefetch stream): it is queued among the training's "
+                    "kernels and will not overlap them. Leave stream out, or pass a "
+                    "stream of its own, to overlap.",
+                    UserWarning,
+                    stacklevel=2,
+                )
+        storage, gate = self._storage, self._table_gate
+        return self._eraser.submit(
+            lambda counts: storage.erase_by_score(
+                threshold,
+                table_ids,
+                counts,
+                chunk_slots=chunk_slots,
+                chunk_guard=gate,
+                max_in_flight=max_in_flight,
+            ),
+            stream,
+        )
 
     def fill_tables(
         self,
@@ -2307,7 +2442,8 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                 raise ValueError(
                     f"replay_increment: the source of table '{table_name}' erased "
                     "keys without retaining them (erase_keys without "
-                    "EvictedItemMode.RETAIN_KEY). Each erase left a reclaimed slot "
+                    "EvictedItemMode.RETAIN_KEY, or erase_by_score_async, which "
+                    "retains nothing). Each erase left a reclaimed slot "
                     "that keeps its row, and nothing reports it, so this delta "
                     "cannot reproduce the source's rows. Retain the erases from "
                     "the start and rebuild the replica from deltas."

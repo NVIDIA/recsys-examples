@@ -146,6 +146,16 @@ void bind_table_operation(py::module &m) {
         py::arg("threshold") = py::none(), py::arg("table_begin") = 0,
         py::arg("num_scores") = 1, py::arg("score_index") = 0);
 
+  m.def("table_erase_by_score", &dyn_emb::table_erase_by_score,
+        "erase the keys of the slots [begin, end) whose score is below the "
+        "threshold, sparing slots a ref counter pins; adds [erased, spared] to "
+        "counts",
+        py::arg("table_storage"), py::arg("key_dtype"),
+        py::arg("bucket_capacity"), py::arg("bucket_sizes"), py::arg("counter"),
+        py::arg("threshold"), py::arg("begin"), py::arg("end"),
+        py::arg("num_scores"), py::arg("score_index"), py::arg("counts"),
+        py::call_guard<py::gil_scoped_release>());
+
   m.def("table_count_matched", &dyn_emb::table_count_matched,
         "count number of items in the table whose scores >= threshold",
         py::arg("table_storage"), py::arg("key_dtype"),
@@ -215,9 +225,10 @@ void bind_table_operation(py::module &m) {
 
   m.def("table_place_reclaimed_rows", &dyn_emb::table_place_reclaimed_rows,
         "place carried rows into free slots of a bucket range, marking the "
-        "slots reclaimed",
-        py::arg("keys"), py::arg("rows"), py::arg("carried"),
-        py::arg("bkt_begin"), py::arg("bkt_end"), py::arg("bucket_capacity"));
+        "slots reclaimed (key and digest)",
+        py::arg("keys"), py::arg("digests"), py::arg("rows"),
+        py::arg("carried"), py::arg("bkt_begin"), py::arg("bkt_end"),
+        py::arg("bucket_capacity"));
 
   m.def("table_restore_reclaimed_slots",
         &dyn_emb::table_restore_reclaimed_slots,
@@ -258,6 +269,7 @@ void bind_table_operation(py::module &m) {
       .value("ACCUMULATE", dyn_emb::ScorePolicyType::Accumulate)
       .value("GLOBAL_TIMER", dyn_emb::ScorePolicyType::GlobalTimer)
       .value("LRU_LFU", dyn_emb::ScorePolicyType::LruLfu)
+      .value("FLAG", dyn_emb::ScorePolicyType::Flag)
       .export_values();
 
   py::enum_<dyn_emb::InsertResult>(m, "InsertResult")

@@ -13,12 +13,25 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import collections
+import contextlib
 import json
 import math
 import os
 import warnings
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, Iterator, List, Optional, Set, Tuple
+from typing import (
+    Any,
+    Callable,
+    ContextManager,
+    Dict,
+    Iterator,
+    List,
+    Optional,
+    Sequence,
+    Set,
+    Tuple,
+)
 
 import numpy as np
 import torch  # usort:skip
@@ -324,12 +337,14 @@ def get_score_policy(score_strategy):
     fixed at ``(timestamp, frequency)`` regardless of the user's tuple order; the
     user's ordering only affects checkpoint column order (see
     :func:`score_dump_permutation`). The no-eviction mode adds no score of its own:
-    ``NO_EVICTION`` alone keeps none (a constant word that is never written), and
-    in a compound the score is the other strategy's.
+    ``NO_EVICTION`` alone keeps none: its one word is a ``FLAG`` (1 while a key
+    occupies the slot, 0 after an erase), which is not a score a user sets but
+    what lets a full bucket give up an erased slot before a key in use. In a
+    compound the score is the other strategy's.
     """
     score_strategy = get_score_part(score_strategy)
     if score_strategy is None:
-        return ScoreSpec(name="no_eviction", policy=ScorePolicy.CONST)
+        return ScoreSpec(name="no_eviction", policy=ScorePolicy.FLAG)
     if isinstance(score_strategy, tuple):
         # Only the {TIMESTAMP, LFU} compound is supported (validated at config
         # construction). Two adjacent AoS score words per key -- word 0 =
@@ -433,7 +448,15 @@ class DynamicEmbTableState:
     # Estimated per-table size (last_collected + accumulated unique since collection);
     # CPU tensor of shape (num_tables,), used to avoid key_index_map.size() when not needed.
     estimated_table_sizes: Optional[torch.Tensor] = None
+    # The same for the rows handed out, kept only by a table that never evicts: its
+    # key map grows with the keys it holds and its value buffer with the rows.
+    estimated_row_counts: Optional[torch.Tensor] = None
     collect_table_sizes_flag: bool = False
+    # How many times ``key_index_map`` has been replaced (an expansion builds a
+    # new one and drops the old). A slot number means something only in the map it
+    # was read from, so whoever walks the slots across calls -- an erase by score,
+    # in chunks -- compares this to know when to start over.
+    key_map_generation: int = 0
     # Name of the score column incremental_dump thresholds on. Equals
     # score_policy.name (for LruLfu this is the leading, timestamp, word).
     incremental_score_name: Optional[str] = None
@@ -482,6 +505,7 @@ def create_table_state(
     enable_overflow: bool = False,
     evicted_item_mode: EvictedItemMode = EvictedItemMode.DISCARD,
     use_rows: bool = False,
+    use_ref_counter: bool = True,
 ) -> DynamicEmbTableState:
     """Build the key map and value buffers for a group of tables.
 
@@ -490,6 +514,10 @@ def create_table_state(
     where it is. It is for tables that grow and keep their keys, so it cannot be
     combined with ``enable_overflow`` (a cache keeps slot == row). It is
     independent of the no-eviction mode, which keeps no row in its score.
+
+    ``use_ref_counter=False`` leaves out the per-slot reference counter (4 bytes
+    a slot) for a table whose slots are never pinned: the storage under a cache,
+    where the cache pins. It cannot be combined with ``enable_overflow``.
     """
     if not options:
         raise ValueError("options must be non-empty")
@@ -530,8 +558,9 @@ def create_table_state(
             base_opt.score_function, base_opt.score_strategy, cc_major, cc_minor
         )
 
-    # NO_EVICTION: the key map is twice the value buffer, so a key never meets a full
-    # bucket before the buffer runs out of rows.
+    # NO_EVICTION: the key map starts at twice the value buffer. The two then grow
+    # on their own (the key map with the keys held, the buffer with the rows handed
+    # out, up to the key map's slots), see ``_expand_if_need_no_eviction``.
     bucket_capacity = base_opt.bucket_capacity
     if no_eviction:
         capacities = []
@@ -556,6 +585,7 @@ def create_table_state(
         enable_overflow=enable_overflow,
         score_fn_key=score_fn_key,
         use_rows=use_rows,
+        use_ref_counter=use_ref_counter,
     )
     capacity = key_index_map.capacity()
 
@@ -643,6 +673,11 @@ def create_table_state(
         estimated_table_sizes=torch.zeros(
             num_tables, dtype=torch.int64, pin_memory=True
         ),
+        estimated_row_counts=torch.zeros(
+            num_tables, dtype=torch.int64, pin_memory=True
+        )
+        if no_eviction
+        else None,
         evicted_item_mode=evicted_item_mode,
     )
 
@@ -650,10 +685,9 @@ def create_table_state(
 def collect_table_sizes_to_device(state: DynamicEmbTableState) -> torch.Tensor:
     """Collect per-table sizes (main table only, no overflow) into a tensor on state.device.
 
-    A table that never evicts is sized by the rows it has handed out rather than
-    by the keys it holds: its value buffer is half its key map, and an erased
-    key's slot keeps its row, so rows can outnumber keys. Rows are what the
-    buffer has to hold.
+    The keys each table holds. A table that never evicts also has the rows it has
+    handed out, which can be more: an erased key's slot keeps its row until a key
+    takes the slot again (see :func:`collect_row_counts_to_device`).
 
     Uses an async CUDA kernel when key_index_map exposes table_bucket_offsets_
     and bucket_sizes; otherwise falls back to a sync Python loop. No GPU-CPU
@@ -663,9 +697,17 @@ def collect_table_sizes_to_device(state: DynamicEmbTableState) -> torch.Tensor:
         Tensor of shape (num_tables,) dtype torch.int64 on state.device.
     """
     km = state.key_index_map
-    if state.no_eviction:
-        return km.row_counters_.to(torch.int64)
     return segmented_sum_cuda(km.bucket_sizes, km.table_bucket_offsets_)
+
+
+def collect_row_counts_to_device(state: DynamicEmbTableState) -> torch.Tensor:
+    """The value rows each table has handed out, as a tensor on state.device.
+
+    Only a table that stores a row per key has them. A slot owns at most one row,
+    so this never passes the table's key map capacity -- the bound a value buffer
+    needs to grow to and no further.
+    """
+    return state.key_index_map.row_counters_.to(torch.int64)
 
 
 def collect_table_sizes_for_state(
@@ -676,6 +718,10 @@ def collect_table_sizes_for_state(
         return
     table_sizes = collect_table_sizes_to_device(state)
     state.estimated_table_sizes.copy_(table_sizes, non_blocking=non_blocking)
+    if state.estimated_row_counts is not None:
+        state.estimated_row_counts.copy_(
+            collect_row_counts_to_device(state), non_blocking=non_blocking
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -703,7 +749,11 @@ def _expand_tables_impl(
     batch's values to dst_index (no key concatenation; load-then-store per batch avoids
     src/dst overlap). For tables that do not expand, key_index_map for that table is
     copied directly from the old key_index_map (copy_table_from). Updates key_index_map,
-    capacity (expansion does not change the key set). Mutates state."""
+    capacity (expansion does not change the key set). Mutates state.
+
+    A table that never evicts keeps its value buffer out of this: it is sized by the
+    rows the table has handed out, not by the key map (see
+    :func:`_grow_values_only`)."""
     base_opt = state.options_list[0]
     device = state.device
     enable_overflow = getattr(state.key_index_map, "enable_overflow_", False)
@@ -734,9 +784,13 @@ def _expand_tables_impl(
         # And whether a key keeps a value row of its own: the expansion below
         # carries rows when it does, and moves values by slot when it does not.
         use_rows=state.key_index_map.use_rows_,
+        # And whether it counts references at all.
+        use_ref_counter=state.key_index_map.use_ref_counter_,
     )
     for i in range(state.num_tables):
         if tables_to_expand[i]:
+            if state.no_eviction:
+                continue  # its value buffer follows the rows, see the docstring
             if (
                 target_capacities is not None
                 and i < len(target_capacities)
@@ -744,18 +798,7 @@ def _expand_tables_impl(
             ):
                 # Hash buckets can round the requested target up. Grow values
                 # by the actual key-map capacity change, including that padding.
-                # A table that never evicts keeps its value buffer at
-                # NO_EVICTION_LOAD_FACTOR of the key map instead.
-                if state.no_eviction:
-                    add_rows = (
-                        math.ceil(
-                            new_key_index_map.per_table_capacity_[i]
-                            * NO_EVICTION_LOAD_FACTOR
-                        )
-                        - state.tables[i].shape[0]
-                    )
-                else:
-                    add_rows = new_key_index_map.per_table_capacity_[i] - key_caps[i]
+                add_rows = new_key_index_map.per_table_capacity_[i] - key_caps[i]
                 vd = state.table_value_dims_cpu[i]
                 if add_rows > 0:
                     state.tables[i].extend((add_rows, vd))
@@ -811,9 +854,10 @@ def _expand_tables_impl(
                 new_key_index_map.copy_score_blocks_from(
                     old_key_index_map, table_id, src_slots, dst_slots
                 )
-            new_key_index_map._ref_counter[dst_slots].copy_(
-                old_key_index_map._ref_counter[src_slots]
-            )
+            if new_key_index_map._ref_counter is not None:
+                new_key_index_map._ref_counter[dst_slots].copy_(
+                    old_key_index_map._ref_counter[src_slots]
+                )
 
             if not new_key_index_map.use_rows_:
                 # Value row == hash slot: the value has to follow its key.
@@ -828,9 +872,187 @@ def _expand_tables_impl(
             store_to_flat_single_table(state, dst_indices, table_id, values_batch)
 
     state.key_index_map = new_key_index_map
+    state.key_map_generation += 1
     state.capacity = new_key_index_map.capacity()
     if new_key_index_map.use_rows_:
         new_key_index_map.set_row_limits([t.shape[0] for t in state.tables])
+
+
+# ---------------------------------------------------------------------------
+# Erase by score, in chunks
+# ---------------------------------------------------------------------------
+
+# The slots of a table one chunk of an erase by score scans, at most. A chunk is also
+# the length of the kernel the training's own kernels can end up waiting behind, so
+# the size is a trade between how much the scan disturbs the training and how long it
+# takes. Measured on an H100, a table of 2**29 slots at half load, training steps of
+# 0.7 ms, scans one after the other and two chunks in flight: 2**20 or 2**22 slots
+# slow a step by about 10%, 2**24 by 110%, 2**26 by 8 times; in the same 300 steps
+# 13-15 scans finish with 2**22, 115 with 2**24. A chunk of 2**22 slots is about 30
+# microseconds of scan, so a smaller one is mostly the cost of launching it (2**18:
+# 46 ms for the table, against 3.7 ms for 2**22). It is a parameter of the call.
+ERASE_CHUNK_SLOTS = 1 << 22
+
+# How many chunks of an erase by score may be launched and not yet finished on the
+# device. Launching is some thirty times faster than a chunk runs, so without a limit
+# the erase queues the whole table at once, and the prefetch that takes the table next
+# -- whose stream waits for the erase's last event -- waits for all of it. With it, that
+# wait is at most this many chunks (about a millisecond for two). Two keep the device
+# busy: one chunk running, the next already queued.
+ERASE_MAX_CHUNKS_IN_FLIGHT = 2
+
+
+def next_erase_chunk_end(
+    position: int,
+    table_slots: int,
+    bucket_capacity: int,
+    target_slots: int = ERASE_CHUNK_SLOTS,
+) -> int:
+    """Where the chunk of an erase by score that starts at ``position`` ends.
+
+    A chunk is a whole number of buckets and lies inside one table:
+
+    * the size is counted in buckets, ``target_slots // bucket_capacity`` of them,
+      so a bucket is never split;
+    * never more than the table has, and never less than one bucket: a table smaller
+      than a chunk is scanned as one, and a target below a bucket is a bucket;
+    * it stops at the table's last slot (the last chunk is the short one), so it
+      never reaches into the next table.
+
+    ``position`` and the returned end are slots counted from the start of the table.
+    """
+    if bucket_capacity <= 0 or target_slots <= 0:
+        raise ValueError("bucket_capacity and target_slots must be positive")
+    if table_slots <= 0 or table_slots % bucket_capacity != 0:
+        raise ValueError(
+            f"a table is a whole number of buckets, got {table_slots} slots of "
+            f"{bucket_capacity}-slot buckets"
+        )
+    if not 0 <= position < table_slots or position % bucket_capacity != 0:
+        raise ValueError(
+            f"position {position} is not the start of a bucket inside the table's "
+            f"{table_slots} slots"
+        )
+    table_buckets = table_slots // bucket_capacity
+    chunk_buckets = max(1, min(table_buckets, target_slots // bucket_capacity))
+    return min(position + chunk_buckets * bucket_capacity, table_slots)
+
+
+def _erase_state_by_score(
+    state: DynamicEmbTableState,
+    threshold: int,
+    table_ids: Sequence[int],
+    counts: Tensor,
+    chunk_slots: int = ERASE_CHUNK_SLOTS,
+    chunk_guard: Optional[Callable[[], ContextManager]] = None,
+    max_in_flight: int = ERASE_MAX_CHUNKS_IN_FLIGHT,
+) -> None:
+    """Erase the keys of ``table_ids`` whose score is below ``threshold``, a chunk
+    of slots at a time (:func:`next_erase_chunk_end`).
+
+    No more than ``max_in_flight`` chunks are launched and unfinished at once: before
+    launching one, the thread waits -- outside the guard, so holding nothing and not
+    the GIL -- for the chunk ``max_in_flight`` before it to finish on the device. What a
+    caller that takes the table after the guard has to wait for on the device is then
+    bounded by those chunks, not by the rest of the scan.
+
+    Each chunk runs inside ``chunk_guard()`` -- a context manager made anew for
+    every chunk, which does nothing by default. That is where a caller that has to
+    keep the table to itself for a chunk (and only a chunk) takes and drops its
+    lock. Nothing about the table is planned ahead: the key map, the table's size
+    and the chunk are all read inside the guard, because between two chunks
+    another thread may have expanded the table, replacing the key map and freeing
+    the old one.
+
+    A replaced key map also moves every key to another slot, so where the scan had
+    got to means nothing in the new one: when ``state.key_map_generation`` is not
+    the one this table's scan started with, the table is scanned again from its first
+    bucket. That is safe -- erasing by score is idempotent -- and a key an expansion
+    moved past the scan is left for the next erase.
+
+    ``counts`` is the device tensor of :meth:`LinearBucketTable.erase_by_score`,
+    added to by every chunk.
+
+    The keys it removes are not recorded (no ``RETAIN_KEY``), and a table that stores a
+    row per key leaves each erased slot reclaimed with its row, which only a recorded
+    erase lets an incremental dump report. So a table it removed any key from is marked,
+    as :func:`_erase_state_keys` marks one (``erase_untracked_tables``): a delta dumped
+    from it cannot be replayed exactly, and ``replay_increment`` refuses it. A table
+    from which it removed nothing is not marked -- the mark is sticky. To know, each
+    table is scanned into a count of its own, which the worker reads when the table is
+    done (a wait for its own stream only) before adding it to ``counts``.
+    """
+    for table_id in table_ids:
+        if not 0 <= table_id < state.num_tables:
+            raise ValueError(
+                f"table_id {table_id} is not one of the {state.num_tables} tables"
+            )
+    if max_in_flight < 1:
+        raise ValueError(f"max_in_flight must be at least 1, got {max_in_flight}")
+    guard = contextlib.nullcontext if chunk_guard is None else chunk_guard
+    in_flight: "collections.deque[torch.cuda.Event]" = collections.deque()
+    for table_id in table_ids:
+        table_counts = torch.zeros(2, dtype=counts.dtype, device=counts.device)
+        # Marked also when the scan fails half way: whatever it removed before is gone.
+        try:
+            position = 0
+            generation: Optional[int] = None
+            finished = False
+            while not finished:
+                if len(in_flight) >= max_in_flight:
+                    in_flight.popleft().synchronize()
+                with guard():
+                    key_map = state.key_index_map
+                    if generation != state.key_map_generation:
+                        # The first chunk, or the key map was replaced since the last.
+                        generation = state.key_map_generation
+                        position = 0
+                    table_slots = key_map.main_capacity(table_id)
+                    end = next_erase_chunk_end(
+                        position, table_slots, key_map.bucket_capacity_, chunk_slots
+                    )
+                    key_map.erase_by_score(
+                        table_id, threshold, table_counts, begin=position, end=end
+                    )
+                    position = end
+                    finished = position >= table_slots
+                chunk_launched = torch.cuda.Event()
+                chunk_launched.record()
+                in_flight.append(chunk_launched)
+        finally:
+            counts.add_(table_counts)
+            if state.key_index_map.use_rows_ and int(table_counts[0]) > 0:
+                state.erase_untracked_tables.add(table_id)
+
+
+def _value_rows_target(current_rows: int, need_rows: int, key_capacity: int) -> int:
+    """Value rows a table that never evicts should have: its current ones, unless
+    ``need_rows`` do not fit, then at least double them -- but never more than the
+    key map has slots, since a slot owns one row and no more can ever be handed out."""
+    if need_rows <= current_rows:
+        return current_rows
+    return max(current_rows, min(key_capacity, max(2 * current_rows, need_rows)))
+
+
+def _grow_values_only(state: DynamicEmbTableState, need_rows: List[int]) -> None:
+    """Grow the value buffer of a table that never evicts, leaving its key map.
+
+    The key map is sized by the keys the table holds; the value buffer by the rows
+    it has handed out, which can be more (an erased key's slot keeps its row until
+    another key takes the slot) but never more than the key map's slots.
+    """
+    grown = False
+    for i in range(state.num_tables):
+        rows = state.tables[i].shape[0]
+        target = _value_rows_target(
+            rows, need_rows[i], state.key_index_map.per_table_capacity_[i]
+        )
+        if target > rows:
+            state.tables[i].extend((target - rows, state.table_value_dims_cpu[i]))
+            grown = True
+    if grown:
+        state.table_ptrs_dev.copy_(get_table_ptrs(state.tables, state.device))
+        state.key_index_map.set_row_limits([t.shape[0] for t in state.tables])
 
 
 def get_expand_info(
@@ -842,9 +1064,9 @@ def get_expand_info(
 
     Args:
         state: Table state (for capacity and options).
-        table_sizes: Current size per table (length num_tables), CPU tensor: keys held, or
-            for a table that never evicts the rows handed out (see
-            :func:`collect_table_sizes_to_device`).
+        table_sizes: Current size per table (length num_tables), CPU tensor: the keys held
+            (see :func:`collect_table_sizes_to_device`). A table that never evicts grows its
+            value buffer separately, by the rows handed out (:func:`_grow_values_only`).
         unique_per_table: Number of new unique keys per table to add (length num_tables), CPU tensor.
 
     Returns:
@@ -907,6 +1129,60 @@ def get_expand_info(
     return results, target_capacities
 
 
+def _expand_if_need_no_eviction(
+    state: DynamicEmbTableState, unique_size_per_table: torch.Tensor
+) -> None:
+    """Expansion for a table that never evicts.
+
+    Two things grow, each by what it is made to hold:
+
+    * the key map, when the keys it holds (plus this batch) pass the load factor;
+    * the value buffer, when the rows it has handed out (plus this batch) pass
+      the rows it has -- up to the key map's slots, since a slot owns one row.
+
+    So erasing keys lets new ones come in without growing the key map, and a table
+    that churns its keys settles at one row per slot instead of growing forever.
+    Like the other strategies this works from estimates (the last confirmed
+    numbers plus every batch's unique keys, which can only overcount) and confirms
+    them against the device, one sync, only when an estimate says something has to
+    grow.
+    """
+    if state.estimated_row_counts is None:
+        state.estimated_row_counts = torch.zeros(
+            state.num_tables, dtype=torch.int64, pin_memory=True
+        )
+    keys_est, rows_est = state.estimated_table_sizes, state.estimated_row_counts
+
+    def rows_short(rows: torch.Tensor) -> bool:
+        # A buffer that already has a row for every slot of the key map has nothing
+        # more to grow to (see _value_rows_target), so the rows it is asked for are no
+        # pressure: counting them would make every batch of a table that has settled
+        # at one row per slot ask the device for numbers that change nothing. The key
+        # map's own growth is checked apart, by get_expand_info, and when it grows the
+        # buffer is short of slots again.
+        need = rows + unique_size_per_table
+        return any(
+            int(need[i]) > state.tables[i].shape[0]
+            and state.tables[i].shape[0] < state.key_index_map.per_table_capacity_[i]
+            for i in range(state.num_tables)
+        )
+
+    est_results, _ = get_expand_info(state, keys_est, unique_size_per_table)
+    if any(est_results) or rows_short(rows_est):
+        keys = collect_table_sizes_to_device(state).cpu()
+        rows = collect_row_counts_to_device(state).cpu()
+        keys_est.copy_(keys)
+        rows_est.copy_(rows)
+        results, targets = get_expand_info(state, keys, unique_size_per_table)
+        need_rows = (rows + unique_size_per_table).tolist()
+        if any(results):
+            _expand_tables_impl(state, results, targets)
+        # The value buffers follow the rows, whether or not the key map grew.
+        _grow_values_only(state, need_rows)
+    keys_est.add_(unique_size_per_table)
+    rows_est.add_(unique_size_per_table)
+
+
 def expand_if_need_impl(
     state: DynamicEmbTableState,
     unique_size_per_table: torch.Tensor,
@@ -925,6 +1201,9 @@ def expand_if_need_impl(
         state.estimated_table_sizes = torch.zeros(
             state.num_tables, dtype=torch.int64, pin_memory=True
         )
+    if state.no_eviction:
+        _expand_if_need_no_eviction(state, unique_size_per_table)
+        return
     estimated_results, target_capacities = get_expand_info(
         state, state.estimated_table_sizes, unique_size_per_table
     )
@@ -1285,7 +1564,7 @@ def get_find_score_arg(
     so this takes one tensor, whichever it is.
     """
     # A table that keeps no score (NO_EVICTION alone) has nothing to update.
-    if state.score_policy.policy == ScorePolicy.CONST:
+    if state.score_policy.policy == ScorePolicy.FLAG:
         return ScoreArg(
             name=state.score_policy.name, value=None, policy=ScorePolicy.CONST
         )
@@ -1342,6 +1621,13 @@ def get_insert_score_arg(
     if preserve_existing:
         return ScoreArg(
             name=state.score_policy.name, value=None, policy=ScorePolicy.CONST
+        )
+
+    if state.score_policy.policy == ScorePolicy.FLAG:
+        # NO_EVICTION alone keeps no score a user could set, but a new key still
+        # sets its flag, so that it ranks above the slots an erase left.
+        return ScoreArg(
+            name=state.score_policy.name, value=None, policy=ScorePolicy.FLAG
         )
 
     is_lru = state.evict_strategy == EvictStrategy.KLru
@@ -2167,9 +2453,10 @@ def _load_key_values(
         (keys.numel(),), table_id, dtype=torch.int64, device=keys.device
     )
 
-    if state.score_policy.policy == ScorePolicy.CONST:
-        # A table that keeps no score (NO_EVICTION alone): nothing to restore.
-        policy, scores = ScorePolicy.CONST, None
+    if state.score_policy.policy == ScorePolicy.FLAG:
+        # A table that keeps no score (NO_EVICTION alone): none is restored, but the
+        # keys loaded set their flag like any new key.
+        policy, scores = ScorePolicy.FLAG, None
     elif scores is None:
         assert (
             state.evict_strategy == EvictStrategy.KLru
@@ -2583,7 +2870,12 @@ class DynamicEmbStorage(Storage):
         self,
         options: List[DynamicEmbTableOptions],
         optimizer: BaseDynamicEmbeddingOptimizer,
+        use_ref_counter: bool = True,
     ):
+        """``use_ref_counter=False`` for a storage that sits under a cache: the
+        cache pins the slots a prefetched batch uses, never this storage's, so
+        the per-slot counter would only take memory. Such a storage cannot
+        :meth:`increment_counter` / :meth:`decrement_counter`."""
         self._state = create_table_state(
             options,
             optimizer,
@@ -2592,11 +2884,46 @@ class DynamicEmbStorage(Storage):
             evicted_item_mode=options[0].evicted_item_mode,
             # Every key keeps its own value row, so a rehash never moves values.
             use_rows=True,
+            use_ref_counter=use_ref_counter,
         )
 
     @property
     def key_index_map(self):
         return self._state.key_index_map
+
+    def erase_by_score(
+        self,
+        threshold: int,
+        table_ids: Sequence[int],
+        counts: Tensor,
+        *,
+        chunk_slots: int = ERASE_CHUNK_SLOTS,
+        chunk_guard: Optional[Callable[[], ContextManager]] = None,
+        max_in_flight: int = ERASE_MAX_CHUNKS_IN_FLIGHT,
+    ) -> None:
+        """Erase the keys of logical tables ``table_ids`` whose score is below
+        ``threshold``, sparing those a prefetched batch has pinned.
+
+        The tables are scanned a chunk of at most ``chunk_slots`` slots at a time, each
+        inside ``chunk_guard()``, with at most ``max_in_flight`` chunks launched and
+        unfinished (see :func:`_erase_state_by_score`). ``counts`` is an
+        int64 tensor of two on the device, ``[erased, spared]``, added to. The kernels run on
+        the current stream and nothing waits for them, except that at the end of each table
+        the count of its removals is read back, to know whether to mark it (below).
+
+        Single-score tables only, as :meth:`LinearBucketTable.erase_by_score`. A table the
+        scan removed a key from is marked (:meth:`erase_untracked`): the removals are not
+        recorded, so a delta dumped from it cannot be replayed exactly.
+        """
+        _erase_state_by_score(
+            self._state,
+            threshold,
+            table_ids,
+            counts,
+            chunk_slots,
+            chunk_guard,
+            max_in_flight,
+        )
 
     @property
     def tables(self) -> List[DynamicEmbTableState]:
@@ -3273,11 +3600,14 @@ class HybridStorage(Storage):
         # real and has nothing to retain. Erases are not covered by this setting
         # at all -- ``erase_keys`` runs against both tiers and passes its own
         # mode down, so a key erased out of HBM is recorded just the same.
-        self._hbm = create_table_state(hbm_options, optimizer)
+        # Neither tier is ever pinned (HybridStorage takes the generic path, with
+        # no PrefetchState), so neither keeps a per-slot reference counter.
+        self._hbm = create_table_state(hbm_options, optimizer, use_ref_counter=False)
         self._host = create_table_state(
             host_options,
             optimizer,
             evicted_item_mode=host_options[0].evicted_item_mode,
+            use_ref_counter=False,
         )
         self.optimizer = optimizer
 

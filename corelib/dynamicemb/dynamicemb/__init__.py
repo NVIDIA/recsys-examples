@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from .async_erase import EraseHandle, erase_by_score_async
 from .dump_load import DynamicEmbDump, DynamicEmbLoad
 from .dynamicemb_config import (
     BATCH_SIZE_PER_DUMP,
@@ -94,6 +95,8 @@ __all__ = [
     "string_to_evict_strategy",
     "DynamicEmbDump",
     "DynamicEmbLoad",
+    "EraseHandle",
+    "erase_by_score_async",
     "DeltaDumpResult",
     "ReplayStats",
     "pop_erased_keys",
