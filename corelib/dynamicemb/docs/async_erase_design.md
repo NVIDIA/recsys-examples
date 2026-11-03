@@ -550,20 +550,25 @@ ranks). 127 pytest items and one distributed script, passing on an H100 node.
 - Keys erased by score are **not recorded** (`pop_erased_keys`, `replay_increment`) (§5.1).
 - A **cache** may write an erased key back to the storage when it evicts it, with the
   value it holds (§5); not tested.
-- **Multi-table modules and the evict kernels** are affected by the older issue of §10, not
-  by this work.
+- **Multi-table modules and the evict kernels:** the way the evict kernels indexed the ref counter
+  (§10) was wrong for tables after the first; it is fixed upstream in #514, which this branch is
+  rebased onto. This work did not depend on it: the erase kernel always used the global slot.
 - The `FairLock` costs ~5 µs more per section than `threading.Lock`; at the default chunk
   that is below the noise of §4.8.
 
-## 10. Found on the way, not part of this work
+## 10. Found on the way: the ref counter indexing of the evict kernels (fixed upstream in #514)
 
 While checking how the ref counter is indexed for the erase kernel, the evict kernels
 turned out to read it with a table-relative offset (`kernels.cuh`, `counter_offset =
 (bucket_id - bkt_begin) * capacity`) while `increment_counter` writes it by global slot.
-For table 0 they agree; for table 1 and later of a multi-table storage the evictor reads
-table 0's counters, so a pinned slot is evicted as if it were free. Measured: two tables
+For table 0 they agree; for table 1 and later of a multi-table storage the evictor read
+table 0's counters, so a pinned slot was evicted as if it were free. Measured: two tables
 of 512 slots, every resident key of table 1 pinned, 2000 new keys inserted -- all 512
 pinned keys lost; the same on table 0 or on a single table loses none. `erase_by_score`
-uses the global index and is not affected.
+uses the global index and was not affected.
 
-Not fixed here. To be raised again, and fixed on its own, now that the erase work is done.
+It was kept out of this work, and then fixed upstream by #514 (`0f5c0a0`): `counter_offset =
+bucket_id * bucket.capacity()` at both sites (`insert_body`, `insert_and_evict_body`), with
+a regression test, `table_operation/test_multitable_ref_counter.py`. This branch is rebased
+onto it, so the evict kernels and the erase kernel now index the counter the same way, by the
+slot's position in all the tables.
