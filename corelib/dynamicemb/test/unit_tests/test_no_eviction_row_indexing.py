@@ -13,14 +13,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""NO_EVICTION is the only score strategy whose value row differs from its hash
-slot: rows come from a per-table auto-increment counter, and the key map is sized
-``1 / max_load_factor`` times the value buffer. Addressing the value buffer with a
-slot therefore reads the wrong row -- or past the end of the buffer entirely.
+"""A storage keeps a value row per key, apart from the key's hash slot: rows are
+handed out densely per table, and the key map of a table that never evicts
+(NO_EVICTION) is twice the size of its value buffer. Addressing the value buffer
+with a slot therefore reads the wrong row -- or past the end of the buffer
+entirely.
 
 These tests drive the forward path over keys that are *already resident*, which is
 what makes a lookup (rather than an insert) supply the index.
 """
+
+import tempfile
 
 import pytest
 import torch
@@ -34,6 +37,12 @@ from dynamicemb import (
     EmbOptimType,
 )
 from dynamicemb.batched_dynamicemb_tables import BatchedDynamicEmbeddingTablesV2
+from dynamicemb.key_value_table import (
+    collect_row_counts_to_device,
+    collect_table_sizes_for_state,
+    collect_table_sizes_to_device,
+    get_expand_info,
+)
 
 # The DEBUG initializer writes `key % DEBUG_EMB_INITIALIZER_MOD` into every
 # element, so a row can be checked against the key that should own it.
@@ -48,7 +57,21 @@ def current_device():
     return torch.cuda.current_device()
 
 
-def build_model(current_device: int, max_capacity: int, init_capacity=None):
+# A model that trains for real but never changes a value: ``backward`` has to run
+# to release the reference counters a forward pins, and the DEBUG pattern must
+# survive it.
+NO_UPDATE = dict(
+    optimizer=EmbOptimType.SGD, learning_rate=0.0, stochastic_rounding=False
+)
+
+
+def build_model(
+    current_device: int,
+    max_capacity: int,
+    init_capacity=None,
+    model_kwargs=None,
+    **options_kwargs,
+):
     options = DynamicEmbTableOptions(
         index_type=torch.int64,
         embedding_dtype=torch.float32,
@@ -56,6 +79,7 @@ def build_model(current_device: int, max_capacity: int, init_capacity=None):
         dim=DIM,
         max_capacity=max_capacity,
         init_capacity=init_capacity,
+        **options_kwargs,
         bucket_capacity=128,
         safe_check_mode=DynamicEmbCheckMode.IGNORE,
         local_hbm_for_values=1024**3,
@@ -72,6 +96,7 @@ def build_model(current_device: int, max_capacity: int, init_capacity=None):
         feature_table_map=[0],
         pooling_mode=DynamicEmbPoolingMode.SUM,
         use_index_dedup=False,
+        **(model_kwargs or {}),
     )
 
 
@@ -118,8 +143,8 @@ def build_caching_model(
 
 
 def next_row_counter(model, table_id: int = 0) -> int:
-    """The backing store's NO_EVICTION auto-increment row counter."""
-    return int(model._storage._state.no_eviction_next_index_dev[table_id].item())
+    """How many value rows the backing store has handed out."""
+    return model._storage._state.key_index_map.num_rows(table_id)
 
 
 def lookup(model, keys, device):
@@ -137,6 +162,15 @@ def assert_debug_values(out: torch.Tensor, keys):
         [k % DEBUG_MOD for k in keys], dtype=out.dtype, device=out.device
     )
     torch.testing.assert_close(out, expected.unsqueeze(1).expand(-1, out.size(1)))
+
+
+def train_step(model, keys, device):
+    """Forward then backward over ``keys``: the pins a forward takes are released by
+    the backward, which is what a training loop does. Returns the forward output."""
+    out = lookup(model, keys, device)
+    out.sum().backward()
+    torch.cuda.synchronize()
+    return out
 
 
 def test_resident_keys_reread_correctly(current_device):
@@ -258,7 +292,7 @@ def test_caching_downgrades_cache_but_not_backing(current_device):
         model._storage._state.options_list[0].score_strategy
         == DynamicEmbScoreStrategy.NO_EVICTION
     )
-    assert model._storage._state.no_eviction_next_index is not None
+    assert model._storage._state.no_eviction
 
 
 def test_caching_spill_does_not_leak_rows(current_device):
@@ -304,7 +338,8 @@ def test_caching_spill_does_not_leak_rows(current_device):
 
 def test_caching_backing_retains_every_key(current_device):
     """NO_EVICTION's core promise: the backing store never drops a key, however
-    hard the cache in front of it evicts.
+    hard the cache in front of it evicts. It is the full set, so it holds the
+    keys the cache holds as well.
 
     This has to be a *structural* check. The DEBUG initializer returns
     ``key % DEBUG_MOD``, so a key that was dropped and re-initialised reads back
@@ -333,10 +368,11 @@ def test_caching_backing_retains_every_key(current_device):
         f"cache holds all {len(keys)} keys -- it never evicted, so this test "
         "says nothing about the backing store"
     )
-    # ...and everything it evicted landed in the backing store rather than being
-    # dropped. The rest is still cache-resident and has not spilled yet.
-    assert spilled + cached == len(keys), (
-        f"{spilled} spilled + {cached} cached != {len(keys)} keys -- some key was "
+    # ...and the backing store is the full key set: a new key goes into it
+    # before it reaches the cache, so cache-resident keys are in it too and
+    # nothing the cache evicted was dropped.
+    assert spilled == len(keys), (
+        f"{spilled} keys in the backing store != {len(keys)} -- some key was "
         "dropped between the tiers"
     )
 
@@ -416,3 +452,393 @@ def test_hbm_direct_backward_writes_the_right_row(current_device):
         [k % DEBUG_MOD - 2 * lr for k in keys], dtype=final.dtype, device=final.device
     )
     torch.testing.assert_close(final, expected2.unsqueeze(1).expand(-1, final.size(1)))
+
+
+# ---------------------------------------------------------------------------
+# Score strategy: NO_EVICTION is a mode, not a score
+# ---------------------------------------------------------------------------
+
+
+def test_no_eviction_alone_keeps_no_score(current_device):
+    """``NO_EVICTION`` by itself keeps no score a user sets: its policy is FLAG and
+    the rows come from the row column. (The key map's one score word is a flag, 1
+    for each key stored, see ``test_new_keys_carry_a_flag_and_erased_slots_do_not``.)"""
+    from dynamicemb_extensions import ScorePolicy
+
+    model = build_model(current_device, max_capacity=65536 * 2)
+    state = model._storage._state
+    assert state.no_eviction
+    assert state.score_policy.policy == ScorePolicy.FLAG
+    assert state.key_index_map.use_rows_
+
+
+@pytest.mark.parametrize(
+    "strategy",
+    [
+        (DynamicEmbScoreStrategy.NO_EVICTION, DynamicEmbScoreStrategy.CUSTOMIZED),
+        (DynamicEmbScoreStrategy.CUSTOMIZED, DynamicEmbScoreStrategy.NO_EVICTION),
+    ],
+)
+def test_no_eviction_with_customized_keeps_the_customized_score(
+    current_device, strategy
+):
+    """``(NO_EVICTION, CUSTOMIZED)``, in either order, never evicts and scores like
+    CUSTOMIZED: the user sets the score before a forward and the keys it touches
+    take it."""
+    from dynamicemb.scored_hashtable import ScoreArg
+    from dynamicemb_extensions import ScorePolicy
+
+    device = torch.device(f"cuda:{current_device}")
+    options = DynamicEmbTableOptions(
+        index_type=torch.int64,
+        embedding_dtype=torch.float32,
+        device_id=current_device,
+        dim=DIM,
+        max_capacity=65536 * 2,
+        bucket_capacity=128,
+        safe_check_mode=DynamicEmbCheckMode.IGNORE,
+        local_hbm_for_values=1024**3,
+        score_strategy=strategy,
+        caching=False,
+        initializer_args=DynamicEmbInitializerArgs(
+            mode=DynamicEmbInitializerMode.DEBUG
+        ),
+    )
+    model = BatchedDynamicEmbeddingTablesV2(
+        table_options=[options],
+        output_dtype=torch.float32,
+        table_names=[TABLE],
+        feature_table_map=[0],
+        pooling_mode=DynamicEmbPoolingMode.SUM,
+        use_index_dedup=False,
+    )
+    state = model._storage._state
+    assert state.no_eviction
+    assert state.score_policy.policy == ScorePolicy.ASSIGN
+    assert state.key_index_map.num_scores_ == 1
+
+    keys = list(range(1001, 1301))
+    key_tensor = torch.tensor(keys, dtype=torch.int64, device=device)
+    tids = torch.zeros_like(key_tensor)
+    read_only = ScoreArg(
+        name=state.score_policy.name, value=None, policy=ScorePolicy.CONST
+    )
+
+    def stored_scores():
+        scores, founds, _ = state.key_index_map.lookup(key_tensor, tids, read_only)
+        assert bool(founds.all())
+        return scores
+
+    model.set_score({TABLE: 7})
+    assert_debug_values(lookup(model, keys, device), keys)  # insert
+    assert (stored_scores() == 7).all()
+    model.set_score({TABLE: 9})
+    assert_debug_values(lookup(model, keys, device), keys)  # all resident
+    assert (stored_scores() == 9).all()
+    assert next_row_counter(model) == len(keys)
+
+
+def test_key_map_stays_twice_the_value_buffer_through_expansion(current_device):
+    """The key map is exactly twice the value buffer when the table is made, and
+    an expansion keeps it so: the value buffer grows with the key map, not by the
+    key map's whole growth. The expansion happens with keys already in the table,
+    so it rehashes them, and each must still find its own row afterwards."""
+    device = torch.device(f"cuda:{current_device}")
+    model = build_model(current_device, max_capacity=65536 * 2, init_capacity=4096)
+    state = model._storage._state
+
+    def ratio() -> float:
+        return state.key_index_map.capacity(0) / state.tables[0].shape[0]
+
+    assert ratio() == 2.0
+
+    # Fits the 4096-row buffer, so nothing expands yet.
+    first = list(range(4001, 4001 + 3000))
+    assert_debug_values(lookup(model, first, device), first)
+    assert state.key_index_map.capacity(0) == 8192
+    assert next_row_counter(model) == len(first)
+
+    # 6000 keys in all is past the buffer: this batch expands the table first,
+    # rehashing the 3000 above into the larger map.
+    second = list(range(20001, 20001 + 3000))
+    assert_debug_values(lookup(model, second, device), second)
+    assert state.key_index_map.capacity(0) > 8192, "the table never expanded"
+    assert ratio() == 2.0
+    assert next_row_counter(model) == len(first) + len(second)
+
+    # The keys that were rehashed still own the rows their values sit in.
+    assert_debug_values(lookup(model, first, device), first)
+    assert_debug_values(lookup(model, second, device), second)
+
+
+def test_unaligned_init_capacity_leaves_a_row_for_every_slot_to_fill(current_device):
+    """An init_capacity that is not a whole number of buckets still gets a value
+    buffer half the (bucket-rounded) key map, so the load factor at which the
+    table expands is the load at which the buffer is full, not past it."""
+    device = torch.device(f"cuda:{current_device}")
+    model = build_model(current_device, max_capacity=65536 * 2, init_capacity=100)
+    state = model._storage._state
+    assert state.key_index_map.capacity(0) == 256
+    assert state.tables[0].shape[0] == 128
+
+    # Half the key map: fills the buffer. A single batch, since a later forward
+    # counts every key in it as possibly new, resident or not, and would expand.
+    keys = list(range(4001, 4001 + 128))
+    assert_debug_values(lookup(model, keys, device), keys)
+    assert state.key_index_map.capacity(0) == 256, "expanded before the buffer filled"
+    assert next_row_counter(model) == len(keys)
+
+
+def test_rows_handed_out_grow_the_value_buffer_not_the_key_map(current_device):
+    """An erased key's slot keeps its row, so rows can outnumber live keys. The value
+    buffer has to hold the rows, the key map only the keys: rows handed out, with no
+    live key at all, must grow the buffer and leave the key map alone."""
+    model = build_model(current_device, max_capacity=65536 * 2, init_capacity=4096)
+    state = model._storage._state
+    km = state.key_index_map
+    assert (km.capacity(0), state.tables[0].shape[0]) == (8192, 4096)
+
+    km.reserve_rows(0, 3000)  # three thousand rows out, no live key at all
+    assert collect_table_sizes_to_device(state).cpu().tolist() == [0]
+    assert collect_row_counts_to_device(state).cpu().tolist() == [3000]
+
+    # Refresh the estimates from the device, as a checkpoint load does.
+    state.collect_table_sizes_flag = True
+    collect_table_sizes_for_state(state, non_blocking=False)
+
+    flags, _ = get_expand_info(state, torch.tensor([0]), torch.tensor([1500]))
+    assert flags == [False]  # 1500 keys in 8192 slots: the key map has room
+
+    model._storage.expand_if_need(torch.tensor([500]))
+    assert state.tables[0].shape[0] == 4096  # 3500 rows fit
+
+    model._storage.expand_if_need(torch.tensor([1500]))  # 4500 rows do not
+    km = state.key_index_map
+    assert km.capacity(0) == 8192, "the key map grew for rows, not keys"
+    assert state.tables[0].shape[0] == 8192  # doubled, and no more slots to fill
+    assert km.num_rows(0) == 3000
+
+
+def test_new_keys_carry_a_flag_and_erased_slots_do_not(current_device):
+    """``NO_EVICTION`` alone has no score a user sets, but every key it stores
+    sets its flag to 1 and an erased slot is cleared to 0. That is what lets a full bucket
+    give up an erased slot before a key in use: with every word 0 they would tie."""
+    from dynamicemb.scored_hashtable import ScoreArg
+    from dynamicemb_extensions import ScorePolicy
+
+    device = torch.device(f"cuda:{current_device}")
+    model = build_model(
+        current_device, max_capacity=65536 * 2, init_capacity=4096, model_kwargs=NO_UPDATE
+    )
+    state = model._storage._state
+    assert state.score_policy.policy == ScorePolicy.FLAG
+
+    keys = list(range(7001, 7001 + 300))
+    train_step(model, keys, device)
+
+    def scores_of(ks):
+        tensor = torch.tensor(ks, dtype=torch.int64, device=device)
+        arg = ScoreArg(name=state.score_policy.name, value=None, policy=ScorePolicy.CONST)
+        score_out, founds, _ = state.key_index_map.lookup(
+            tensor, torch.zeros_like(tensor), arg
+        )
+        return score_out, founds
+
+    score_out, founds = scores_of(keys)
+    assert bool(founds.all())
+    assert (score_out == 1).all()
+
+    gone, kept = keys[:100], keys[100:]
+    model._storage.erase_keys(0, torch.tensor(gone, dtype=torch.int64, device=device))
+    assert not bool(scores_of(gone)[1].any())
+    score_out, founds = scores_of(kept)
+    assert bool(founds.all()) and (score_out == 1).all()
+
+
+def test_erase_and_reinsert_never_outgrows_the_value_buffer(current_device):
+    """Keys that churn through a table near half full, each round erasing the
+    oldest and inserting new ones, take slots no erased key left behind, so rows
+    keep being handed out while the live count stays put. The value buffer follows
+    them, and they never pass it."""
+    device = torch.device(f"cuda:{current_device}")
+    model = build_model(
+        current_device, max_capacity=65536 * 2, init_capacity=4096, model_kwargs=NO_UPDATE
+    )
+    state = model._storage._state
+
+    window, step = 3900, 1900
+    live = list(range(10_001, 10_001 + window))
+    assert_debug_values(train_step(model, live, device), live)
+    next_key = 10_001 + window
+    for _ in range(10):
+        gone, live = live[:step], live[step:]
+        model._storage.erase_keys(0, torch.tensor(gone, dtype=torch.int64, device=device))
+        new = list(range(next_key, next_key + step))
+        next_key += step
+        live += new
+        assert_debug_values(train_step(model, new, device), new)
+        km = state.key_index_map  # an expansion swaps it: read it again
+        assert km.num_rows(0) <= state.tables[0].shape[0] <= km.capacity(0)
+        assert int(km.size(0)) == len(live), "a live key was lost"
+    assert_debug_values(train_step(model, live, device), live)
+
+
+def test_replacing_the_whole_live_set_does_not_grow_the_key_map(current_device):
+    """Every round erases every live key and inserts the same number of new ones,
+    so the live set is always ``window`` keys however many have passed through.
+
+    The key map is sized by the keys it holds, so it must not grow for that. The
+    value buffer follows the rows handed out (a slot keeps its row after an erase),
+    which settle at one per slot, so it grows to the key map's size and stops. No
+    key may be lost on the way: once the buffer is as big as the key map, a new key
+    meets a bucket made of erased slots, and has to take one.
+    """
+    device = torch.device(f"cuda:{current_device}")
+    model = build_model(
+        current_device, max_capacity=65536 * 8, init_capacity=4096, model_kwargs=NO_UPDATE
+    )
+    state = model._storage._state
+
+    window, rounds = 1500, 20
+    live = list(range(10_001, 10_001 + window))
+    assert_debug_values(train_step(model, live, device), live)
+    capacity = state.key_index_map.capacity(0)
+    next_key = 10_001 + window
+    for r in range(rounds):
+        model._storage.erase_keys(
+            0, torch.tensor(live, dtype=torch.int64, device=device)
+        )
+        live = list(range(next_key, next_key + window))
+        next_key += window
+        assert_debug_values(train_step(model, live, device), live)
+        km = state.key_index_map  # an expansion swaps it: read it again
+        assert int(km.size(0)) == window, f"round {r}: a key was lost or not stored"
+        assert km.capacity(0) == capacity, f"round {r}: the key map grew"
+        assert km.num_rows(0) <= state.tables[0].shape[0] <= capacity
+
+    # They were stored, not just initialised on the way out: read them back.
+    assert_debug_values(train_step(model, live, device), live)
+
+
+def test_replacing_half_the_live_set_never_loses_a_live_key(current_device):
+    """The harder churn: each round erases the oldest half and inserts as many new
+    keys, so a full bucket holds keys in use as well as erased slots, and the one
+    that is given up has to be an erased slot. A value is DEBUG-derived, so a lost
+    key would look the same re-initialised; what shows it is the key count, which
+    an insert that evicts a live key leaves a key short."""
+    device = torch.device(f"cuda:{current_device}")
+    model = build_model(
+        current_device, max_capacity=65536 * 8, init_capacity=4096, model_kwargs=NO_UPDATE
+    )
+    state = model._storage._state
+
+    window, half = 1500, 750
+    live = list(range(10_001, 10_001 + window))
+    train_step(model, live, device)
+    next_key = 10_001 + window
+    for r in range(40):  # enough rounds for the buckets to fill with erased slots
+        gone, live = live[:half], live[half:]
+        model._storage.erase_keys(0, torch.tensor(gone, dtype=torch.int64, device=device))
+        new = list(range(next_key, next_key + half))
+        next_key += half
+        assert_debug_values(train_step(model, new, device), new)
+        live += new
+        km = state.key_index_map
+        assert int(km.size(0)) == len(live), (
+            f"round {r}: {len(live) - int(km.size(0))} live keys were given up"
+        )
+        assert km.capacity(0) == 8192, f"round {r}: the key map grew"
+
+
+@pytest.mark.parametrize(
+    "num_keys, expect_expansion",
+    [
+        # Fits the 1024 rows the destination starts with.
+        (1024, False),
+        # More than the rows, but no more than twice them: sizing the table by only
+        # the part that overflows the buffer would see 476 keys in a 2048-slot map,
+        # well under half full, and never expand.
+        (1500, True),
+        (2000, True),
+    ],
+)
+def test_load_expands_for_every_key_in_the_checkpoint(
+    current_device, num_keys, expect_expansion
+):
+    """Loading a checkpoint is sized by the keys in it, not by how far they overrun
+    the value buffer: each of them takes a row."""
+    device = torch.device(f"cuda:{current_device}")
+    keys = list(range(20001, 20001 + num_keys))
+
+    source = build_model(current_device, max_capacity=65536 * 2, init_capacity=4096)
+    assert_debug_values(lookup(source, keys, device), keys)
+
+    with tempfile.TemporaryDirectory() as save_dir:
+        source.dump(save_dir)
+        torch.cuda.synchronize()
+
+        target = build_model(current_device, max_capacity=65536 * 2, init_capacity=1024)
+        state = target._storage._state
+        assert (state.key_index_map.capacity(0), state.tables[0].shape[0]) == (2048, 1024)
+        target.load(save_dir)
+        torch.cuda.synchronize()
+
+    assert (state.key_index_map.capacity(0) > 2048) == expect_expansion
+    assert state.key_index_map.capacity(0) == 2 * state.tables[0].shape[0]
+    assert next_row_counter(target) == num_keys
+    assert next_row_counter(target) <= state.tables[0].shape[0]
+    assert_debug_values(lookup(target, keys, device), keys)
+
+
+def test_load_reserves_room_only_for_the_keys_this_rank_keeps(current_device):
+    """A checkpoint that holds every rank's keys is read whole by each rank, which
+    keeps its own share. The table has to be sized for that share: a table that
+    never evicts has no max_capacity to stop it growing for the whole file."""
+    from dynamicemb.key_ownership import owned_key_mask
+
+    device = torch.device(f"cuda:{current_device}")
+    num_shards, shard_index = 8, 3
+    keys = list(range(30001, 30001 + 4000))
+
+    # Round-robin ownership, named rather than left to the default: consecutive
+    # keys then fall on consecutive shards, so each of the 8 owns exactly 500 of
+    # the 4000. A checkpoint is only loaded into a table of the same dist_type.
+    source = build_model(
+        current_device,
+        max_capacity=65536 * 2,
+        init_capacity=4096,
+        dist_type="roundrobin",
+    )
+    assert_debug_values(lookup(source, keys, device), keys)
+
+    with tempfile.TemporaryDirectory() as save_dir:
+        source.dump(save_dir)
+        torch.cuda.synchronize()
+
+        target = build_model(
+            current_device,
+            max_capacity=65536 * 2,
+            init_capacity=1024,
+            dist_type="roundrobin",
+        )
+        state = target._storage._state
+        assert (state.key_index_map.capacity(0), state.tables[0].shape[0]) == (2048, 1024)
+        # This module is one rank of a larger group as far as the load is concerned.
+        original = (target._shard_index, target._num_shards)
+        target._shard_index, target._num_shards = shard_index, num_shards
+        try:
+            target.load(save_dir)
+        finally:
+            target._shard_index, target._num_shards = original
+        torch.cuda.synchronize()
+
+    key_tensor = torch.tensor(keys, dtype=torch.int64, device=device)
+    mask = owned_key_mask(key_tensor, shard_index, num_shards, "roundrobin")
+    mine = key_tensor[mask].tolist()
+    # 500 fit the 1024 rows the table has, so it has no reason to grow.
+    assert len(mine) == 500
+
+    assert next_row_counter(target) == len(mine)
+    assert state.key_index_map.capacity(0) == 2048, "grew for keys it does not keep"
+    assert state.tables[0].shape[0] == 1024
+    assert_debug_values(lookup(target, mine, device), mine)

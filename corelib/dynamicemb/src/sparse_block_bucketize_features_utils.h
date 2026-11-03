@@ -217,9 +217,13 @@ inline bool torch_tensor_on_cpu_check(const c10::optional<at::Tensor> &ten) {
   at::cuda::OptionalCUDAGuard device_guard;                                    \
   device_guard.set_index(TENSOR.get_device())
 
-#define DYNAMICEMB_AT_DISPATCH_FLOAT_ONLY(TYPE, NAME, ...)                     \
+// The weights channel carries float32 pooling weights / LFU counters and int64
+// per-key scores. The bucketizer only copies each weight to its new position,
+// so both are handled bit-for-bit.
+#define DYNAMICEMB_AT_DISPATCH_FLOAT_OR_INT64(TYPE, NAME, ...)                 \
   AT_DISPATCH_SWITCH(TYPE, NAME,                                               \
-                     AT_DISPATCH_CASE(at::ScalarType::Float, __VA_ARGS__))
+                     AT_DISPATCH_CASE(at::ScalarType::Float, __VA_ARGS__)      \
+                         AT_DISPATCH_CASE(at::ScalarType::Long, __VA_ARGS__))
 
 static constexpr int32_t kMaxThreads = 1024;
 static int const kWarpSize = 32;
