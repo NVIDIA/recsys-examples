@@ -211,7 +211,8 @@ class DynamicEmbScoreStrategy(enum.IntEnum):
 
     dynamicemb allows configuring scores by table.
     For a table, the scores in the subsequent forward passes are larger than those in the previous ones for modes TIMESTAMP and STEP.
-    Users can also provide customized score(mode CUSTOMIZED) for each table's forward pass.
+    Users can also provide customized score(mode CUSTOMIZED) for each table's forward pass,
+    or a score for every key (mode PRECISE_CUSTOMIZED).
     Attributes
     ----------
     TIMESTAMP:
@@ -227,9 +228,19 @@ class DynamicEmbScoreStrategy(enum.IntEnum):
         Users have to set the score before every forward pass using `set_score` interface.
     LFU:
         If there are not enough slots inside the bucket to store new keys, the least used key in the bucket will be evicted.
+    PRECISE_CUSTOMIZED:
+        Like CUSTOMIZED, but every key has a score of its own instead of one score per table: the module is
+        called with a `ScoredKeyedJaggedTensor`, whose `scores` hold an int64 for each key, and a key's score
+        is the one it came with. Users must not set scores with `set_score` under this mode.
+        A key that repeats in a batch takes the largest of its scores; a later batch assigns, so the latest
+        score of a key wins. While training the input must be a `ScoredKeyedJaggedTensor`; evaluation reads
+        no score and takes either kind. Row-wise sharding only; no `admit_strategy`; no variable batch size
+        per key; no HybridStorage. May be combined with NO_EVICTION as `(NO_EVICTION, PRECISE_CUSTOMIZED)`.
+        Within one collection either every table uses it or none does, and a collection that does holds
+        DynamicEmb tables only.
     NO_EVICTION:
         The table’s capacity doubles whenever there are not enough slots for new keys, and this continues until available memory is exhausted.
-        Alone it keeps no score; it may be combined with CUSTOMIZED as `(NO_EVICTION, CUSTOMIZED)`.
+        Alone it keeps no score; it may be combined with CUSTOMIZED or PRECISE_CUSTOMIZED as `(NO_EVICTION, CUSTOMIZED)`.
         Incremental dump and replay are not supported for such tables.
         When the memory resources are insufficient, there will be a warning message, and training can continue but the accuracy of eviction cannot be guaranteed.
     """
@@ -239,6 +250,7 @@ class DynamicEmbScoreStrategy(enum.IntEnum):
     CUSTOMIZED = 2
     LFU = 3
     NO_EVICTION = 4
+    PRECISE_CUSTOMIZED = 5
 
 
 # A score strategy is either a single :class:`DynamicEmbScoreStrategy` or a
@@ -248,8 +260,8 @@ class DynamicEmbScoreStrategy(enum.IntEnum):
 # eviction ranking. The user's tuple order is the *logical* order that
 # checkpoints are written in; the on-device *physical* layout stays fixed (see
 # :func:`get_physical_score_order`). The tuple form keeps the interface open for
-# future combinations; only ``(TIMESTAMP, LFU)`` and ``(NO_EVICTION, CUSTOMIZED)``
-# (in either order) are supported for now.
+# future combinations; only ``(TIMESTAMP, LFU)``, ``(NO_EVICTION, CUSTOMIZED)`` and
+# ``(NO_EVICTION, PRECISE_CUSTOMIZED)`` (in either order) are supported for now.
 ScoreStrategy = Union[DynamicEmbScoreStrategy, Tuple[DynamicEmbScoreStrategy, ...]]
 
 # Supported compound strategies, as unordered element sets. Both orderings of a
@@ -260,6 +272,12 @@ SUPPORTED_COMPOUND_SCORE_STRATEGIES: Tuple[frozenset, ...] = (
     # instead. Alone it keeps no score; with CUSTOMIZED the score is CUSTOMIZED's.
     frozenset(
         {DynamicEmbScoreStrategy.NO_EVICTION, DynamicEmbScoreStrategy.CUSTOMIZED}
+    ),
+    frozenset(
+        {
+            DynamicEmbScoreStrategy.NO_EVICTION,
+            DynamicEmbScoreStrategy.PRECISE_CUSTOMIZED,
+        }
     ),
 )
 
@@ -283,6 +301,15 @@ def get_score_part(score_strategy: "ScoreStrategy") -> Optional["ScoreStrategy"]
     return rest[0] if len(rest) == 1 else rest
 
 
+def takes_score_per_key(score_strategy: Optional["ScoreStrategy"]) -> bool:
+    """Whether the table takes a score for every key from its input: its score
+    strategy, without the no-eviction mode, is ``PRECISE_CUSTOMIZED``."""
+    return (
+        score_strategy is not None
+        and get_score_part(score_strategy) == DynamicEmbScoreStrategy.PRECISE_CUSTOMIZED
+    )
+
+
 def normalize_score_strategy(score_strategy: ScoreStrategy) -> ScoreStrategy:
     """Validate *score_strategy* and return it in canonical form.
 
@@ -293,7 +320,8 @@ def normalize_score_strategy(score_strategy: ScoreStrategy) -> ScoreStrategy:
     A single :class:`DynamicEmbScoreStrategy` is returned unchanged. A one-element
     tuple ``(X,)`` is unwrapped to the single strategy ``X`` (a single score column
     has no ordering to preserve). A multi-element tuple must form a supported
-    compound set (``{TIMESTAMP, LFU}`` or ``{NO_EVICTION, CUSTOMIZED}``) and is returned as a tuple.
+    compound set (``{TIMESTAMP, LFU}``, ``{NO_EVICTION, CUSTOMIZED}`` or
+    ``{NO_EVICTION, PRECISE_CUSTOMIZED}``) and is returned as a tuple.
 
     Raises
     ------
@@ -763,6 +791,17 @@ class DynamicEmbTableOptions:
                 "strategy (TIMESTAMP, LFU) in either order; got "
                 f"score_strategy={self.score_strategy}."
             )
+        if self.takes_score_per_key and self.admit_strategy is not None:
+            raise ValueError(
+                "score_strategy PRECISE_CUSTOMIZED cannot be combined with "
+                "admit_strategy: both are decided per key from the input, and a "
+                "key's score is not its occurrence count."
+            )
+
+    @property
+    def takes_score_per_key(self) -> bool:
+        """Whether the table takes a score for every key from its input."""
+        return takes_score_per_key(self.score_strategy)
 
     def __eq__(self, other):
         if not isinstance(other, DynamicEmbTableOptions):

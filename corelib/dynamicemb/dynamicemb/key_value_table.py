@@ -353,7 +353,11 @@ def get_score_policy(score_strategy):
         return ScoreSpec(name="timestamp", policy=ScorePolicy.GLOBAL_TIMER)
     elif score_strategy == DynamicEmbScoreStrategy.STEP:
         return ScoreSpec(name="step", policy=ScorePolicy.ASSIGN)
-    elif score_strategy == DynamicEmbScoreStrategy.CUSTOMIZED:
+    elif score_strategy in (
+        DynamicEmbScoreStrategy.CUSTOMIZED,
+        DynamicEmbScoreStrategy.PRECISE_CUSTOMIZED,
+    ):
+        # Stored the same way: what differs is only where a score comes from.
         return ScoreSpec(name="customized", policy=ScorePolicy.ASSIGN)
     elif score_strategy == DynamicEmbScoreStrategy.LFU:
         return ScoreSpec(name="frequency", policy=ScorePolicy.ACCUMULATE)
@@ -1229,11 +1233,35 @@ def store_to_flat_single_table(
     )
 
 
+def score_source(
+    state: DynamicEmbTableState,
+    frequency: Optional[torch.Tensor] = None,
+    key_scores: Optional[torch.Tensor] = None,
+) -> Optional[torch.Tensor]:
+    """The per-key values a table's score is made from, or ``None`` if it has none.
+
+    The two inputs a key can carry are separate channels -- ``frequency``, how
+    often the batch counted it, and ``key_scores``, what the input scored it
+    with -- and this is the one place that says which of them a table takes: an
+    LFU table the frequency, a CUSTOMIZED table the score of the input. Every
+    path that hands a score to the key map (the find, the insert) asks here, so a
+    table that takes both one day has one rule to change.
+
+    ``None`` means "the table's own default" -- ``get_find_score_arg`` and
+    ``get_insert_score_arg`` supply it.
+    """
+    if state.evict_strategy == EvictStrategy.KLfu:
+        return frequency
+    if state.evict_strategy == EvictStrategy.KCustomized:
+        return key_scores
+    return None
+
+
 def get_find_score_arg(
     state: DynamicEmbTableState,
     num_keys: int,
     device: torch.device,
-    lfu_accumulated_frequency: Optional[torch.Tensor] = None,
+    score_input: Optional[torch.Tensor] = None,
     *,
     const_lookup: bool = False,
 ) -> ScoreArg:
@@ -1248,7 +1276,13 @@ def get_find_score_arg(
     When ``state.training`` is True:
       - LFU: ACCUMULATE with provided or default (ones) frequency.
       - LRU (GLOBAL_TIMER): no explicit value needed.
-      - CUSTOMIZED / STEP: ASSIGN with ``state.score``.
+      - CUSTOMIZED / STEP: ASSIGN with ``state.score``; a CUSTOMIZED table that
+        takes a score per key is given those scores instead, one per key, and
+        assigns each key its own.
+
+    ``score_input`` is what :func:`score_source` chose for the table -- the
+    frequency of an LFU table, the scores of the input for a CUSTOMIZED one --
+    so this takes one tensor, whichever it is.
     """
     # A table that keeps no score (NO_EVICTION alone) has nothing to update.
     if state.score_policy.policy == ScorePolicy.CONST:
@@ -1263,17 +1297,18 @@ def get_find_score_arg(
 
     # LFU: use provided frequency for ACCUMULATE; must have length num_keys for lookup.
     if state.evict_strategy == EvictStrategy.KLfu:
-        if (
-            lfu_accumulated_frequency is not None
-            and lfu_accumulated_frequency.numel() == num_keys
-        ):
-            scores = lfu_accumulated_frequency.contiguous()
+        if score_input is not None and score_input.numel() == num_keys:
+            scores = score_input.contiguous()
         else:
             # Fallback: each key counts as 1 so score accumulates by 1 per lookup
             scores = torch.ones(num_keys, device=device, dtype=torch.long)
     elif state.evict_strategy == EvictStrategy.KCustomized:
-        scores = torch.empty(num_keys, device=device, dtype=torch.long)
-        scores.fill_(state.score)
+        if score_input is not None:
+            assert score_input.numel() == num_keys
+            scores = score_input.contiguous()
+        else:
+            scores = torch.empty(num_keys, device=device, dtype=torch.long)
+            scores.fill_(state.score)
     else:
         scores = None
 
@@ -1327,7 +1362,7 @@ def _find_keys(
     state: DynamicEmbTableState,
     unique_keys: torch.Tensor,
     table_ids: torch.Tensor,
-    lfu_accumulated_frequency: Optional[torch.Tensor] = None,
+    score_input: Optional[torch.Tensor] = None,
     *,
     const_lookup: bool = False,
     return_slots: bool = False,
@@ -1337,6 +1372,9 @@ def _find_keys(
     The indices are value rows for a table that stores them, hash slots otherwise.
     With ``return_slots`` the hash slots follow as a ninth element: the reference
     counters are keyed by slot.
+
+    ``score_input`` is the one tensor a table's score is made from, as
+    :func:`score_source` chose it (see :func:`get_find_score_arg`).
     """
     if unique_keys.dtype != state.key_index_map.key_type:
         unique_keys = unique_keys.to(state.key_index_map.key_type)
@@ -1345,7 +1383,11 @@ def _find_keys(
     device = unique_keys.device
 
     score_arg = get_find_score_arg(
-        state, batch, device, lfu_accumulated_frequency, const_lookup=const_lookup
+        state,
+        batch,
+        device,
+        score_input,
+        const_lookup=const_lookup,
     )
 
     if batch == 0:
@@ -2440,7 +2482,10 @@ class DynamicEmbCache(Cache):
         """Lookup with overflow fallback. Returns (score_out, founds, indices)."""
         state = self._state
         score_arg = get_find_score_arg(
-            state, unique_keys.size(0), unique_keys.device, lfu_accumulated_frequency
+            state,
+            unique_keys.size(0),
+            unique_keys.device,
+            score_source(state, lfu_accumulated_frequency),
         )
         result = state.key_index_map.lookup_with_overflow(
             unique_keys, table_ids, score_arg
@@ -2653,7 +2698,7 @@ class DynamicEmbStorage(Storage):
                     state,
                     keys.numel(),
                     device,
-                    lfu_accumulated_frequency=lfu_freq,
+                    score_input=score_source(state, lfu_freq),
                 )
                 _, founds, _ = km.lookup(keys, table_ids, score_find)
                 missing = torch.logical_not(founds)
@@ -2726,6 +2771,7 @@ class DynamicEmbStorage(Storage):
         table_ids: torch.Tensor,
         copy_mode: CopyMode,
         lfu_accumulated_frequency: Optional[torch.Tensor] = None,
+        key_scores: Optional[torch.Tensor] = None,
     ) -> Tuple[
         int,
         torch.Tensor,
@@ -2737,7 +2783,10 @@ class DynamicEmbStorage(Storage):
         torch.Tensor,
     ]:
         result = _find_keys(
-            self._state, unique_keys, table_ids, lfu_accumulated_frequency
+            self._state,
+            unique_keys,
+            table_ids,
+            score_source(self._state, lfu_accumulated_frequency, key_scores),
         )
         (
             h_num_missing,
@@ -3334,6 +3383,7 @@ class HybridStorage(Storage):
         table_ids: torch.Tensor,
         copy_mode: CopyMode,
         lfu_accumulated_frequency: Optional[torch.Tensor] = None,
+        key_scores: Optional[torch.Tensor] = None,
     ) -> Tuple[
         int,
         torch.Tensor,
@@ -3344,8 +3394,15 @@ class HybridStorage(Storage):
         torch.Tensor,
         torch.Tensor,
     ]:
+        if key_scores is not None:
+            raise NotImplementedError(
+                "A score per key is not supported by HybridStorage."
+            )
         result_hbm = _find_keys(
-            self._hbm, unique_keys, table_ids, lfu_accumulated_frequency
+            self._hbm,
+            unique_keys,
+            table_ids,
+            score_source(self._hbm, lfu_accumulated_frequency),
         )
         (
             h_num_missing_hbm,

@@ -100,7 +100,46 @@ def dist_type_per_feature(
     return per_feature
 
 
+def sharding_takes_scores(sharding_infos: List[EmbeddingShardingInfo]) -> bool:
+    """Whether the tables of one sharding take a score per key.
+
+    The collection has settled that its DynamicEmb tables all do or none does
+    (:func:`~dynamicemb.shard.per_key_score.collect_per_key_score`), so any one
+    table that does says the sharding's input carries scores. A table that is
+    not DynamicEmb's has no options, and no say.
+    """
+    for info in sharding_infos:
+        options = (info.fused_params or {}).get("dynamicemb_options")
+        if options is not None and options.takes_score_per_key:
+            return True
+    return False
+
+
 class GroupedEmbeddingsLookup(_GroupedEmbeddingsLookup):
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        # A collection that takes a score per key holds DynamicEmb tables only
+        # (see collect_per_key_score), and all of them take it, or none does.
+        self._per_key_score: bool = any(
+            isinstance(emb_op, BatchedDynamicEmbedding)
+            and emb_op.emb_module.per_key_score
+            for emb_op in self._emb_modules
+        )
+
+    def prefetch(
+        self,
+        sparse_features: KeyedJaggedTensor,
+        forward_stream: Optional[torch.cuda.Stream] = None,
+    ) -> None:
+        """TorchRec's prefetch, which hands the tables only the values and offsets
+        of each group, so that the scores split off with them would be left behind.
+        """
+        if not self._per_key_score:
+            return super().prefetch(sparse_features, forward_stream)
+        features_by_group = sparse_features.split(self._feature_splits)
+        for emb_op, features in zip(self._emb_modules, features_by_group):
+            emb_op.prefetch(features, forward_stream)
+
     def _create_embedding_kernel(
         self,
         config: GroupedEmbeddingConfig,
@@ -160,6 +199,7 @@ class RwSequenceDynamicEmbeddingSharding(RwSequenceEmbeddingSharding):
         self._dist_type_per_feature: Dict[str, str] = dist_type_per_feature(
             sharding_infos
         )
+        self._per_key_score: bool = sharding_takes_scores(sharding_infos)
 
     def create_input_dist(
         self,
@@ -178,6 +218,7 @@ class RwSequenceDynamicEmbeddingSharding(RwSequenceEmbeddingSharding):
             dist_types=[
                 self._dist_type_per_feature[name] for name in self.feature_names()
             ],
+            per_key_score=self._per_key_score,
         )
 
     def create_lookup(
@@ -249,6 +290,7 @@ class RwPooledDynamicEmbeddingSharding(RwPooledEmbeddingSharding):
         self._dist_type_per_feature: Dict[str, str] = dist_type_per_feature(
             sharding_infos
         )
+        self._per_key_score: bool = sharding_takes_scores(sharding_infos)
 
     def create_input_dist(
         self,
@@ -267,6 +309,7 @@ class RwPooledDynamicEmbeddingSharding(RwPooledEmbeddingSharding):
             dist_types=[
                 self._dist_type_per_feature[name] for name in self.feature_names()
             ],
+            per_key_score=self._per_key_score,
         )
 
     def create_lookup(

@@ -351,7 +351,8 @@ dynamicemb provides the following strategies to set the score.
 
         dynamicemb allows configuring scores by table.
         For a table, the scores in the subsequent forward passes are larger than those in the previous ones for modes TIMESTAMP and STEP.
-        Users can also provide customized score(mode CUSTOMIZED) for each table's forward pass.
+        Users can also provide customized score(mode CUSTOMIZED) for each table's forward pass,
+        or a score for every key (mode PRECISE_CUSTOMIZED).
         Attributes
         ----------
         TIMESTAMP:
@@ -367,10 +368,13 @@ dynamicemb provides the following strategies to set the score.
             Users have to set the score before every forward pass using `set_score` interface.
         LFU:
             If there are not enough slots inside the bucket to store new keys, the least used key in the bucket will be evicted.
+        PRECISE_CUSTOMIZED:
+            Like CUSTOMIZED, but every key has a score of its own: the module is called with a `ScoredKeyedJaggedTensor`
+            whose `scores` hold an int64 for each key. See "Per-key score" below.
         NO_EVICTION:
             The table’s capacity doubles whenever there are not enough slots for new keys, and this continues until available memory is exhausted.
             When the memory resources are insufficient, there will be a warning message, and training can continue but the accuracy of eviction cannot be guaranteed.
-            Used alone, it keeps no score. It can be combined with `CUSTOMIZED` as `(NO_EVICTION, CUSTOMIZED)` (either order), which keeps the user's score.
+            Used alone, it keeps no score. It can be combined with `CUSTOMIZED` or `PRECISE_CUSTOMIZED` as `(NO_EVICTION, CUSTOMIZED)` (either order), which keeps the user's score.
             `incremental_dump` skips such tables (with a warning) and `replay_increment` refuses them.
         """
 
@@ -379,6 +383,7 @@ dynamicemb provides the following strategies to set the score.
         CUSTOMIZED = 2
         LFU = 3
         NO_EVICTION = 4
+        PRECISE_CUSTOMIZED = 5
     ```
 
     Users can specify the `DynamicEmbScoreStrategy` using `score_strategy` in `DynamicEmbTableOptions` per table.
@@ -468,6 +473,60 @@ table_options = DynamicEmbTableOptions(
     score_function=lru_lfu_decay_score,
 )
 ```
+
+### Per-key score (`PRECISE_CUSTOMIZED`)
+
+By default a CUSTOMIZED table scores every key of a batch with one number
+(`set_score`). With `score_strategy=DynamicEmbScoreStrategy.PRECISE_CUSTOMIZED`, the input
+carries **a score for each key** instead, and the table stores it as that key's
+score. A key's score then decides its eviction (lowest first) like any other
+CUSTOMIZED score.
+
+The scores travel beside the keys, not in `weights`, in a
+`ScoredKeyedJaggedTensor` -- a `KeyedJaggedTensor` with one extra int64 tensor
+`scores`, 1-D, one entry per value:
+
+```python
+from dynamicemb import ScoredKeyedJaggedTensor
+
+features = ScoredKeyedJaggedTensor(
+    keys=["f0", "f1"], values=values, lengths=lengths, scores=scores
+)
+embeddings = model(features)
+```
+
+Scores are sent to the table's rank by their own all2all, kept in step with the
+keys through the bucketize, and never mixed with the frequency counters that LFU
+and admission use.
+
+Rules:
+
+- **All or none.** Every table of an `EmbeddingCollection` /
+  `EmbeddingBagCollection` uses it, or none does, and a collection
+  that sets it holds DynamicEmb tables only. While training, when set, the input must be a
+  `ScoredKeyedJaggedTensor` (a plain `KeyedJaggedTensor` raises); evaluation reads
+  no score, so it takes either. When not set,
+  the scores of a `ScoredKeyedJaggedTensor` are ignored.
+- **Score strategy.** `PRECISE_CUSTOMIZED`, alone or with `NO_EVICTION` as
+  `(NO_EVICTION, PRECISE_CUSTOMIZED)`. Not with `admit_strategy`. It is its own
+  strategy, so it cannot be combined with LFU.
+- **Sharding.** Row-wise only (EC and EBC). No variable batch size per key
+  (VBE). Tables with a host/hybrid storage tier (`HybridStorage`) are not
+  supported yet. Neither is an `external_storage` that is the only
+  tier (no cache and no HBM for values); with a cache above it, it is fine.
+- **Training pipeline.** Not with TorchRec's `TrainPipelineSparseDist` or its
+  variants while training: they fuse the splits all2all of the keys, which has
+  no channel for scores, and the input dist raises `NotImplementedError`.
+  Evaluation sends no scores, so it is not affected.
+- **Repeated keys.** Within one batch -- including across ranks, and with
+  `use_index_dedup` -- a key takes the **largest** score the batch gave it.
+- **Across batches.** The score is assigned on every hit, so the latest batch
+  wins, even if its score is lower; a key a batch does not contain keeps its
+  score. Backward does not change scores.
+- **`set_score`** raises for such a table: the scores come from the input.
+- Scores must be int64. A negative score is read by the table as a very large
+  one, so with `safe_check_mode` `ERROR` it raises, with `WARNING` it warns, and
+  with `IGNORE` it is not looked for.
 
 ## DynamicEmbPoolingMode
 

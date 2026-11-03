@@ -17,7 +17,7 @@ import os
 import random
 import shutil
 from itertools import product
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import click
 import torch
@@ -300,7 +300,11 @@ def apply_dmp(
     cache_capacity_ratio: float = 0.5,
     admit_strategy: AdmissionStrategy = None,
     global_hbm_budget_scale: float = 1.0,
+    table_option_overrides: Optional[Dict[str, Dict[str, Any]]] = None,
 ):
+    """``table_option_overrides`` maps a table name to ``DynamicEmbTableOptions``
+    fields that replace the ones every table otherwise shares, for a collection
+    whose tables are not configured alike."""
     eb_configs: List[EmbeddingConfig] = []
     for _, m in model.named_modules():
         if type(m) in TORCHREC_TYPES:
@@ -324,7 +328,7 @@ def apply_dmp(
         else:
             global_hbm = int(value_bytes * global_hbm_budget_scale)
 
-        dynamicemb_options_dict[eb_config.name] = DynamicEmbTableOptions(
+        option_kwargs = dict(
             global_hbm_for_values=global_hbm,
             score_strategy=score_strategy,
             dist_type=dist_type,
@@ -335,6 +339,10 @@ def apply_dmp(
             bucket_capacity=MAX_BUCKET_CAPACITY,  # keep same to the bucket capacity from get_table_value_bytes
             caching=caching,
             admit_strategy=admit_strategy,
+        )
+        option_kwargs.update((table_option_overrides or {}).get(eb_config.name, {}))
+        dynamicemb_options_dict[eb_config.name] = DynamicEmbTableOptions(
+            **option_kwargs
         )
     planner = get_planner(
         eb_configs,
@@ -376,6 +384,7 @@ def create_model(
     cache_capacity_ratio: float = 0.5,
     admit_strategy: AdmissionStrategy = None,
     global_hbm_budget_scale: float = 1.0,
+    table_option_overrides: Optional[Dict[str, Dict[str, Any]]] = None,
 ):
     ebc_list = []
     for embedding_collection_id in range(num_embedding_collections):
@@ -414,6 +423,7 @@ def create_model(
         cache_capacity_ratio=cache_capacity_ratio,
         admit_strategy=admit_strategy,
         global_hbm_budget_scale=global_hbm_budget_scale,
+        table_option_overrides=table_option_overrides,
     )
     return model
 
