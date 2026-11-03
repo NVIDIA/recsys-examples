@@ -858,8 +858,6 @@ def get_expand_info(
         unique_per_table.device.type == "cpu"
     ), "unique_per_table must be a CPU tensor"
 
-    from dynamicemb.dynamicemb_config import DynamicEmbScoreStrategy
-
     is_no_eviction = state.no_eviction
     results = [False] * state.num_tables
     target_capacities = [-1] * state.num_tables
@@ -1158,6 +1156,30 @@ def load_from_flat(
             state.all_dims_vec4,
         )
     return output
+
+
+def load_from_flat_by(
+    state: DynamicEmbTableState,
+    indices: torch.Tensor,
+    table_ids: torch.Tensor,
+    entry_of_row: torch.Tensor,
+    out: torch.Tensor,
+) -> None:
+    """Into row i of ``out`` (``[entry_of_row.numel(), columns]``, of the
+    tables' dtype) the embedding of row ``indices[entry_of_row[i]]`` of table
+    ``table_ids[entry_of_row[i]]``; rows whose index is negative are left as
+    they are."""
+    _load_emb(
+        state.table_ptrs_dev,
+        indices,
+        table_ids,
+        out,
+        state.table_value_dims,
+        state.table_emb_dims,
+        state.emb_dim,
+        state.all_dims_vec4,
+        entry_of_row,
+    )
 
 
 def store_to_flat(

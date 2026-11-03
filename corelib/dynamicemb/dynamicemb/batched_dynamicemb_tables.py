@@ -783,6 +783,12 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
         self._create_initializers()
         self._create_admitter()
         self._prefetch_states: Deque[PrefetchState] = deque()
+        # Hook of the hierarchical dist (shard/hier_output_dist.py, set by
+        # HierGroupedEmbeddingsLookup): where to put the sequence lookup
+        # output, in training and in eval.
+        self.output_alloc: Optional[
+            Callable[[int, int, torch.dtype], Optional[Tensor]]
+        ] = None
 
         # TODO:1->10
         self._empty_tensor = nn.Parameter(
@@ -1309,6 +1315,7 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                 self._evict_strategy,
                 frequency_counters,
                 pooling_weights,
+                self.output_alloc,
             )
 
         if any([not o.training for o in self._dynamicemb_options]):
@@ -1319,6 +1326,7 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
         if not self._prefetch_states:
             self.prefetch(indices, offsets, frequency_counters=frequency_counters)
         prefetch_state = self._prefetch_states.popleft()
+        prefetch_state.record_stream(torch.cuda.current_stream())
 
         res = DynamicEmbeddingFunction.apply(
             prefetch_state,
@@ -1333,6 +1341,7 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
             self._evict_strategy,
             pooling_weights,
             self._empty_tensor,
+            self.output_alloc,
         )
         if isinstance(self._cache, DynamicEmbCache):
             self._cache.training = False

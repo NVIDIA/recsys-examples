@@ -65,6 +65,24 @@ DIST_TYPE_CODES: Dict[str, int] = {
     "hash_roundrobin": int(DistType.KHashedCyclic),
 }
 SUPPORTED_DIST_TYPES: Tuple[str, ...] = tuple(DIST_TYPE_CODES)
+# DynamicEmbTableOptions.output_dist: TorchRec's dists, the hierarchical dist
+# of shard/hier_output_dist.py, or that one where the build has it and
+# TorchRec's elsewhere.
+TORCHREC_OUTPUT_DIST = "torchrec"
+FUSED_OUTPUT_DIST = "fused"
+AUTO_OUTPUT_DIST = "auto"
+SUPPORTED_OUTPUT_DISTS: Tuple[str, ...] = (
+    TORCHREC_OUTPUT_DIST,
+    FUSED_OUTPUT_DIST,
+    AUTO_OUTPUT_DIST,
+)
+# The capacities of output_dist_capacity, by name (see
+# DynamicEmbTableOptions.output_dist_capacity). A dict sets "lookup_keys",
+# and across nodes "remote_keys" too.
+OUTPUT_DIST_CAPACITY_NAMES: Tuple[str, ...] = ("lookup_keys", "remote_keys")
+# Every capacity stays below this many entries: the planner numbers the keys
+# with int32 indices.
+MAX_OUTPUT_DIST_CAPACITY = (1 << 31) - 1024
 # Must match ``MappingEmbeddingGenerator`` mod in ``debug_init`` (initializer.cu).
 DEBUG_EMB_INITIALIZER_MOD = 100_000
 # Default hashtable bucket width in rows; keep in sync with
@@ -700,6 +718,45 @@ class DynamicEmbTableOptions:
     (key, table_id) only, no value/score. Tables differing in this mode are not
     grouped onto shared storage."""
 
+    output_dist: str = "torchrec"
+    """How a row-wise sequence (EmbeddingCollection) sharding moves keys to
+    the ranks that own them and looked-up rows back. ``"torchrec"`` is
+    TorchRec's input and output dists. ``"fused"`` is the hierarchical dist:
+    keys and rows move over NVLink inside a node and over the rails (NCCL
+    GIN) between nodes, with one host sync per call. It needs DynamicEmb
+    built against NCCL >= 2.30.7 (else ``ImportError`` when the model is
+    sharded) and ``output_dist_capacity``. ``"auto"`` is ``"fused"`` where
+    the build has it and ``output_dist_capacity`` is set, and TorchRec's
+    dists (with a warning) elsewhere. Pooled shardings ignore it. Every
+    DynamicEmb table of a sharding sets ``output_dist``,
+    ``output_dist_capacity`` and ``node_dedup`` alike. See
+    docs/hier_output_dist.md, section 4."""
+
+    node_dedup: bool = True
+    """With ``output_dist="fused"`` (or ``"auto"``) across nodes, a node sends
+    each key once and sums its gradient rows before they cross back. With
+    bf16 or fp16 rows that sum adds one rounding to TorchRec's. ``False``
+    sends every occurrence instead, as TorchRec does (more InfiniBand
+    traffic). Gradient clipping turns it off. Other output dists ignore it,
+    but every DynamicEmb table of a sharding sets it alike. See
+    docs/hier_output_dist.md, section 9."""
+
+    output_dist_capacity: Optional[Union[int, Dict[str, int]]] = None
+    """The capacities of ``output_dist="fused"`` (and ``"auto"``), in entries,
+    fixed for the model's life: its buffers are made once, at the first
+    ``input_dist()``. A dict sets each by name:
+
+    * ``"lookup_keys"``: the keys an owner looks up;
+    * ``"remote_keys"`` (across nodes): the keys of other nodes' owners a GPU
+      deduplicates for its node.
+
+    An int sets both. Each is a positive int below 2^31 - 1024. A call that
+    needs more runs on TorchRec's dists, with a warning that names the
+    capacity to raise. ``"fused"`` needs it, and ``"auto"`` without it takes
+    TorchRec's dists. Other output dists ignore it, but every DynamicEmb
+    table of a sharding sets it alike. See docs/hier_output_dist.md,
+    section 5."""
+
     optimizer_state_dtype: Optional[torch.dtype] = None
     """Precision the optimizer state is kept at, and the ``optim_state_dtype`` a
     dump records. ``None`` keeps each optimizer's default. Only
@@ -748,6 +805,12 @@ class DynamicEmbTableOptions:
                 f"Unsupported dist_type {self.dist_type!r}. "
                 f"Supported values: {SUPPORTED_DIST_TYPES}."
             )
+        if self.output_dist not in SUPPORTED_OUTPUT_DISTS:
+            raise ValueError(
+                f"Unsupported output_dist {self.output_dist!r}. "
+                f"Supported values: {SUPPORTED_OUTPUT_DISTS}."
+            )
+        self._validate_output_dist_capacity()
         # Validate and canonicalize score_strategy (unwrap one-element tuples,
         # reject unsupported compound tuples) so all downstream code sees either a
         # single strategy or a supported compound tuple.
@@ -762,6 +825,40 @@ class DynamicEmbTableOptions:
                 "score_function is only supported for the compound LruLfu score "
                 "strategy (TIMESTAMP, LFU) in either order; got "
                 f"score_strategy={self.score_strategy}."
+            )
+
+    def _validate_output_dist_capacity(self) -> None:
+        cap = self.output_dist_capacity
+
+        def is_capacity(value) -> bool:
+            return (
+                isinstance(value, int)
+                and not isinstance(value, bool)
+                and 0 < value < MAX_OUTPUT_DIST_CAPACITY
+            )
+
+        if cap is None:
+            if self.output_dist == FUSED_OUTPUT_DIST:
+                raise ValueError(
+                    'output_dist="fused" needs output_dist_capacity: an int, or a '
+                    f"dict of {OUTPUT_DIST_CAPACITY_NAMES}."
+                )
+            return
+        if isinstance(cap, dict):
+            if not (
+                "lookup_keys" in cap
+                and set(cap) <= set(OUTPUT_DIST_CAPACITY_NAMES)
+                and all(is_capacity(value) for value in cap.values())
+            ):
+                raise ValueError(
+                    f"output_dist_capacity as a dict sets {OUTPUT_DIST_CAPACITY_NAMES} "
+                    '("remote_keys" across nodes) to positive ints below 2^31 - 1024; '
+                    f"got {cap}."
+                )
+        elif not is_capacity(cap):
+            raise ValueError(
+                "output_dist_capacity must be a positive int below 2^31 - 1024, or a "
+                f"dict of capacities; got {cap!r}."
             )
 
     def __eq__(self, other):

@@ -24,8 +24,12 @@ will only ever have a handful of the latter:
                                      (TorchRec: distributed/embedding{,bag}.py)
     rw_sharding.py                   the row-wise EmbeddingSharding and lookups
                                      (TorchRec: distributed/sharding/rw_sharding.py)
-    input_dist.py                    the bucketizer feeding them
-                                     (TorchRec keeps this inside rw_sharding.py)
+    input_dist.py                    the bucketizer feeding them and the
+                                     hierarchical input dist
+                                     (TorchRec keeps its bucketizer inside
+                                     rw_sharding.py)
+    hier_output_dist.py              the hierarchical dist's operator and its
+                                     output dist
 
 Nothing here belongs under ``planner/``: planning decides how a table is laid
 out, this runs the layout. A new sharding type goes beside rw_sharding.py.
@@ -39,10 +43,12 @@ from .embeddingbag import (
     DynamicEmbeddingBagCollectionSharder,
     ShardedDynamicEmbeddingBagCollection,
 )
+from .hier_output_dist import quiesce
 
 __all__ = [
     "ShardedDynamicEmbeddingCollection",
     "DynamicEmbeddingCollectionSharder",
     "ShardedDynamicEmbeddingBagCollection",
     "DynamicEmbeddingBagCollectionSharder",
+    "quiesce",
 ]
