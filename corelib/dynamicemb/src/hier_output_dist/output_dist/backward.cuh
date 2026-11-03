@@ -219,11 +219,11 @@ __device__ __forceinline__ void sum_entries(const RowsLayout &rows, const int64_
 struct SubTaskDone {
   uint64_t *word;
   // One lane: waits until `count` sub-tasks counted themselves done.
-  __device__ __forceinline__ void wait_lane(const BwdArgs &args, int64_t count,
+  __device__ __forceinline__ void wait_lane(const Sizes &sizes, int64_t count,
                                             const char *what) const {
-    Spin spin(args.timeout_ns);
+    Spin spin(sizes.timeout_ns);
     while ((int64_t)ld_acquire_gpu(word) < count)
-      spin.pause(what, (long long)*word, count, args.topo.rank);
+      spin.pause(what, (long long)*word, count, sizes.topo.rank);
   }
   // Every lane of the warp, once its sum is written: counts it done.
   __device__ __forceinline__ void count_warp(int lane) const {
@@ -256,17 +256,19 @@ struct ProxyPush {
 // before this one's entry), round rnd from when the proxy freed its half
 // (half_free), once the NIC had read the sums of round rnd - 2 out of it.
 // What one warp of the CTA saw is kept for the others (half_seen), so most
-// tasks read no word of the proxy. Every lane of the warp.
-__device__ __forceinline__ void wait_half_warp(const BwdArgs &args, const OutTables &tables,
-                                               int proxy, int rnd, int lane) {
+// tasks read no word of the proxy. seq: the backward's out_seq. Every lane of
+// the warp.
+__device__ __forceinline__ void wait_half_warp(const Sizes &sizes, int64_t seq,
+                                               const OutTables &tables, int proxy, int rnd,
+                                               int lane) {
   if (rnd < 2) return;
   if (lane == 0) {
-    const uint64_t want = grant_of(args.ch.seq, rnd);
+    const uint64_t want = grant_of(seq, rnd);
     if (ld_acquire_cta(tables.half_seen(proxy)) < want) {
-      Spin spin(args.timeout_ns);
+      Spin spin(sizes.timeout_ns);
       uint64_t word;
       while ((word = ld_acquire_sys(tables.half_free(proxy))) < want)
-        spin.pause("a half of a proxy's rows", proxy, rnd, args.topo.rank);
+        spin.pause("a half of a proxy's rows", proxy, rnd, sizes.topo.rank);
       red_max_release_cta(tables.half_seen(proxy), word);
     }
   }
@@ -275,26 +277,27 @@ __device__ __forceinline__ void wait_half_warp(const BwdArgs &args, const OutTab
 
 // A push task's rows (or partials) of round rnd are in the proxy's
 // proxy_rows: its flag `flag` in the round's half of that proxy's flags,
-// tagged with (out_seq, rnd). Every lane of the warp.
-__device__ __forceinline__ void push_flag_warp(const BwdArgs &args, const OutTables &tables,
-                                               int proxy, int rnd, int64_t flag, int lane) {
+// tagged with (seq, rnd). Every lane of the warp.
+__device__ __forceinline__ void push_flag_warp(int64_t seq, const OutTables &tables, int proxy,
+                                               int rnd, int64_t flag, int lane) {
   __syncwarp();
-  if (lane == 0) st_release_sys(tables.push_flag(proxy, rnd, flag), grant_of(args.ch.seq, rnd));
+  if (lane == 0) st_release_sys(tables.push_flag(proxy, rnd, flag), grant_of(seq, rnd));
 }
 
 // Index dedup, a heavy row (more than kHeavy original rows): once its
 // sub-tasks are done, where their sums are (num_subs of them, in sub-task
 // order). Every lane of the warp.
 template <typename RowT>
-__device__ __forceinline__ const float *heavy_row_warp(const BwdArgs &args, int64_t dedup_row,
-                                                       int64_t cnt, int lane, int64_t &num_subs) {
+__device__ __forceinline__ const float *heavy_row_warp(const Sizes &sizes, const BwdArgs &args,
+                                                       int64_t dedup_row, int64_t cnt, int lane,
+                                                       int64_t &num_subs) {
   const Fanout &fanout = args.plan.fanout;
   const int32_t slot = fanout.slot[dedup_row];
   num_subs = ceil_div<kHeavy>(cnt);
   if (lane == 0)
-    SubTaskDone{args.heavy_done + slot}.wait_lane(args, num_subs, "sub-tasks of a heavy row");
+    SubTaskDone{args.heavy_done + slot}.wait_lane(sizes, num_subs, "sub-tasks of a heavy row");
   __syncwarp();
-  return args.partial + (int64_t)fanout.first[slot] * (args.vec * Vec16<RowT>::kValues);
+  return args.partial + (int64_t)fanout.first[slot] * (sizes.row_vecs() * Vec16<RowT>::kValues);
 }
 
 // Index dedup: heavy row sub-task `sub` sums kHeavy of its original rows
@@ -305,24 +308,24 @@ __device__ __forceinline__ const float *heavy_row_warp(const BwdArgs &args, int6
 // end adds them up, in sub-task order, and writes the row into the owner's
 // lookup_rows. Every lane of the warp.
 template <typename RowT>
-__device__ void heavy_sub_warp(const BwdArgs &args, const OutTables &tables, int64_t sub,
-                               bool remote, int lane) {
+__device__ void heavy_sub_warp(const Sizes &sizes, const BwdArgs &args, const OutTables &tables,
+                               int64_t sub, bool remote, int lane) {
   constexpr int kValues = Vec16<RowT>::kValues;
   const BwdPlanView &plan = args.plan;
   const Fanout &fanout = plan.fanout;
-  const int dim = args.vec * kValues, local_size = args.topo.local_size;
+  const int vec = sizes.row_vecs(), dim = vec * kValues, local_size = sizes.topo.local_size;
   const int64_t dedup_row = fanout.sub[2 * sub], begin = fanout.sub[2 * sub + 1],
                 row_end = fanout.exp_off[dedup_row + 1];
   const int32_t slot = fanout.slot[dedup_row], row = fanout.pos[slot];
   const int owner = tables.owner_of(row);
-  if ((owner / local_size != args.topo.node) != remote) return;
-  const OutTimeline timeline(args);
+  if ((owner / local_size != sizes.topo.node) != remote) return;
+  const OutTimeline timeline{args.trace, local_size};
   const unsigned long long start = timeline.on() ? now_ns() : 0;
   const int64_t end = min(begin + kHeavy, row_end);
   float *part = args.partial + sub * dim;
-  for (int col = lane; col < args.vec; col += 32) {
+  for (int col = lane; col < vec; col += 32) {
     float acc[kValues];
-    sum_vec<RowT>(args.grad, fanout.exp_idx, begin, end, args.row_bytes, col, acc);
+    sum_vec<RowT>(args.grad, fanout.exp_idx, begin, end, sizes.row_bytes, col, acc);
     store_fp32<kValues>(part, col, acc);
   }
   if (remote) {
@@ -338,14 +341,14 @@ __device__ void heavy_sub_warp(const BwdArgs &args, const OutTables &tables, int
   // the last one: every sub-task of the row has ended (acquired above)
   const float *sums = args.partial + (int64_t)fanout.first[slot] * dim;
   char *dst = tables.lookup_row(owner % local_size, plan.dst[row]);
-  for (int col = lane; col < args.vec; col += 32) {
+  for (int col = lane; col < vec; col += 32) {
     float acc[kValues];
     sum_fp32<kValues>(sums, num_subs, dim, col, acc);
     *((int4 *)dst + col) = scaled<RowT>(acc, args.scale);
   }
   if (timeline.on() && lane == 0) {
-    const bool peer = owner % local_size != args.topo.local_rank;
-    timeline.task(start, peer ? args.row_bytes : 0, peer ? 0 : args.row_bytes);
+    const bool peer = owner % local_size != sizes.topo.local_rank;
+    timeline.task(start, peer ? sizes.row_bytes : 0, peer ? 0 : sizes.row_bytes);
   }
 }
 
@@ -354,17 +357,17 @@ __device__ void heavy_sub_warp(const BwdArgs &args, const OutTables &tables, int
 // push_order), into an fp32 partial of its own; then it counts itself done
 // for its group. Every lane of the warp.
 template <typename RowT>
-__device__ void group_sub_warp(const BwdArgs &args, int64_t sub, int lane) {
+__device__ void group_sub_warp(const Sizes &sizes, const BwdArgs &args, int64_t sub, int lane) {
   constexpr int kValues = Vec16<RowT>::kValues;
   static_assert(kHeavy % 32 == 0, "a sub-task's rows are spread over the lanes");
   const BwdPlanView &plan = args.plan;
   const Fanout &fanout = plan.fanout;
-  const int row_bytes = args.row_bytes, vec = args.vec, dim = vec * kValues;
+  const int row_bytes = sizes.row_bytes, vec = sizes.row_vecs(), dim = vec * kValues;
   const int32_t group = plan.group_of_sub[sub];
   const HeavyGroup span = plan.heavy_groups[group];
   const int64_t begin = span.start + (sub - plan.group_first_sub[group]) * kHeavy,
                 end = min(begin + kHeavy, (int64_t)span.end);
-  float *part = args.partial + (args.heavy_subs + sub) * dim;
+  float *part = args.partial + (plan.heavy_subs + sub) * dim;
   if (fanout.exp_off == nullptr) {
     // each lane holds the gradient rows of positions begin + lane, begin + 32 + lane, ...
     int64_t grad_rows[kHeavy / 32];
@@ -411,7 +414,7 @@ __device__ void group_sub_warp(const BwdArgs &args, int64_t sub, int lane) {
                   cnt = fanout.exp_off[dedup_row + 1] - first_entry;
     int64_t num_subs = 0;
     const float *heavy_part =
-        cnt > kHeavy ? heavy_row_warp<RowT>(args, dedup_row, cnt, lane, num_subs) : nullptr;
+        cnt > kHeavy ? heavy_row_warp<RowT>(sizes, args, dedup_row, cnt, lane, num_subs) : nullptr;
     for (int col = lane; col < vec; col += 32) {
       float vals[kValues];
       if (heavy_part != nullptr)
@@ -438,11 +441,11 @@ __device__ void group_sub_warp(const BwdArgs &args, int64_t sub, int lane) {
 // (`local`), not at all: their last sub-task writes them (heavy_sub_warp).
 // Returns how many rows it wrote. Every lane of the warp.
 template <typename RowT>
-__device__ int push_rows_warp(const BwdArgs &args, int64_t dedup_row, char *dst, int num_rows,
-                              bool local, int lane) {
+__device__ int push_rows_warp(const Sizes &sizes, const BwdArgs &args, int64_t dedup_row, char *dst,
+                              int num_rows, bool local, int lane) {
   const BwdPlanView &plan = args.plan;
   const Fanout &fanout = plan.fanout;
-  const int row_bytes = args.row_bytes, vec = args.vec, dim = vec * Vec16<RowT>::kValues;
+  const int row_bytes = sizes.row_bytes, vec = sizes.row_vecs(), dim = vec * Vec16<RowT>::kValues;
   if (fanout.exp_off == nullptr) {
     scaled_copy_rows<RowT>(lane < num_rows ? args.grad + dedup_row * row_bytes : nullptr, dst,
                            num_rows, vec, lane, args.scale);
@@ -473,7 +476,8 @@ __device__ int push_rows_warp(const BwdArgs &args, int64_t dedup_row, char *dst,
       continue;
     }
     int64_t num_subs;
-    const float *part = heavy_row_warp<RowT>(args, lane_dedup_row, lane_count, lane, num_subs);
+    const float *part =
+        heavy_row_warp<RowT>(sizes, args, lane_dedup_row, lane_count, lane, num_subs);
     for (int col = lane; col < vec; col += 32) {
       float acc[Vec16<RowT>::kValues];
       sum_fp32<Vec16<RowT>::kValues>(part, num_subs, dim, col, acc);
@@ -490,10 +494,10 @@ __device__ int push_rows_warp(const BwdArgs &args, int64_t dedup_row, char *dst,
 // group (group_lo + lane) and waits for its sub-tasks. Every lane of the
 // warp.
 template <typename RowT>
-__device__ void push_groups_warp(const BwdArgs &args, const OutTables &tables, int proxy,
-                                 int64_t group_lo, int64_t group_hi, int lane) {
+__device__ void push_groups_warp(const Sizes &sizes, const BwdArgs &args, const OutTables &tables,
+                                 int proxy, int64_t group_lo, int64_t group_hi, int lane) {
   const BwdPlanView &plan = args.plan;
-  const int dim = args.vec * Vec16<RowT>::kValues;
+  const int dim = sizes.row_vecs() * Vec16<RowT>::kValues;
   int64_t num_subs = 0;
   const float *part = nullptr;
   float *slot = nullptr;
@@ -501,9 +505,9 @@ __device__ void push_groups_warp(const BwdArgs &args, const OutTables &tables, i
     const int64_t group = group_lo + lane;
     const HeavyGroup span = plan.heavy_groups[group];
     num_subs = ceil_div<kHeavy>(span.end - span.start);
-    part = args.partial + (args.heavy_subs + plan.group_first_sub[group]) * dim;
+    part = args.partial + (plan.heavy_subs + plan.group_first_sub[group]) * dim;
     slot = (float *)tables.proxy_row(proxy, plan.dst[plan.push_order[span.start]]);
-    SubTaskDone{args.group_done + group}.wait_lane(args, num_subs, "sub-tasks of a heavy group");
+    SubTaskDone{args.group_done + group}.wait_lane(sizes, num_subs, "sub-tasks of a heavy group");
   }
   __syncwarp();
   for (int j = 0; j < group_hi - group_lo; ++j) {
@@ -521,10 +525,10 @@ __device__ void push_groups_warp(const BwdArgs &args, const OutTables &tables, i
 // Remote task `remote_task` (across nodes; `cursor` at its round): a push
 // task to the proxy in turn from this rank's own one. False when that proxy
 // has no such round.
-__device__ __forceinline__ bool remote_push(const BwdArgs &args, const OutTables &tables,
+__device__ __forceinline__ bool remote_push(const Sizes &sizes, const OutTables &tables,
                                             const RoundCursor &cursor, int64_t remote_task,
                                             ProxyPush &push) {
-  const int local_size = args.topo.local_size, me = args.topo.local_rank;
+  const int local_size = sizes.topo.local_size, me = sizes.topo.local_rank;
   const int rnd = cursor.rnd;
   const bool is_group_task = remote_task < cursor.mid;  // a heavy groups' push task
   const int64_t slot = remote_task - (is_group_task ? cursor.lo : cursor.mid);
@@ -548,24 +552,25 @@ __device__ __forceinline__ bool remote_push(const BwdArgs &args, const OutTables
 // sums into their partial slots, then the task's flag. Every lane of the
 // warp.
 template <typename RowT>
-__device__ __forceinline__ void push_groups_task_warp(const BwdArgs &args, const OutTables &tables,
+__device__ __forceinline__ void push_groups_task_warp(const Sizes &sizes, int64_t seq,
+                                                      const BwdArgs &args, const OutTables &tables,
                                                       const ProxyPush &push, int lane) {
-  const int me = args.topo.local_rank;
-  const OutTimeline timeline(args);
+  const int me = sizes.topo.local_rank;
+  const OutTimeline timeline{args.trace, sizes.topo.local_size};
   const int proxy = push.proxy, rnd = push.rnd;
   const int64_t nth = push.nth, plain_tasks = push.plain_tasks;
   const ReqEntry &entry = push.entry, &next = push.next;
   const int64_t group_lo = entry.groups + nth * kTaskRows;
   if (group_lo >= next.groups) return;
-  wait_half_warp(args, tables, proxy, rnd, lane);
+  wait_half_warp(sizes, seq, tables, proxy, rnd, lane);
   const unsigned long long start = timeline.on() ? now_ns() : 0;
   const int64_t group_hi = min(group_lo + kTaskRows, (int64_t)next.groups);
-  push_groups_warp<RowT>(args, tables, proxy, group_lo, group_hi, lane);
-  push_flag_warp(args, tables, proxy, rnd, entry.flags + plain_tasks + nth, lane);
+  push_groups_warp<RowT>(sizes, args, tables, proxy, group_lo, group_hi, lane);
+  push_flag_warp(seq, tables, proxy, rnd, entry.flags + plain_tasks + nth, lane);
   if (timeline.on() && lane == 0) {
     // an fp32 partial row per group
     const unsigned long long bytes =
-        (unsigned long long)(group_hi - group_lo) * 4 * args.vec * Vec16<RowT>::kValues;
+        (unsigned long long)(group_hi - group_lo) * 4 * sizes.row_vecs() * Vec16<RowT>::kValues;
     timeline.task(start, proxy != me ? bytes : 0, proxy != me ? 0 : bytes);
   }
 }
@@ -574,16 +579,17 @@ __device__ __forceinline__ void push_groups_task_warp(const BwdArgs &args, const
 // order there): their gradients into their rows of proxy_rows, then the
 // task's flag. Every lane of the warp.
 template <typename RowT>
-__device__ __forceinline__ void push_rows_task_warp(const BwdArgs &args, const OutTables &tables,
+__device__ __forceinline__ void push_rows_task_warp(const Sizes &sizes, int64_t seq,
+                                                    const BwdArgs &args, const OutTables &tables,
                                                     const ProxyPush &push, int lane) {
   const BwdPlanView &plan = args.plan;
-  const int me = args.topo.local_rank, row_bytes = args.row_bytes;
-  const OutTimeline timeline(args);
+  const int me = sizes.topo.local_rank, row_bytes = sizes.row_bytes;
+  const OutTimeline timeline{args.trace, sizes.topo.local_size};
   const int proxy = push.proxy, rnd = push.rnd;
   const int64_t nth = push.nth, plain_tasks = push.plain_tasks;
   const ReqEntry &entry = push.entry;
   if (nth >= plain_tasks) return;
-  wait_half_warp(args, tables, proxy, rnd, lane);
+  wait_half_warp(sizes, seq, tables, proxy, rnd, lane);
   const int64_t pos0 = entry.start + nth * kTaskRows;
   const int num_rows = (int)min((int64_t)kTaskRows, entry.heavy - pos0);
   int64_t dedup_row = 0;
@@ -594,8 +600,8 @@ __device__ __forceinline__ void push_rows_task_warp(const BwdArgs &args, const O
     dst = tables.proxy_row(proxy, plan.dst[row]);
   }
   const unsigned long long start = timeline.on() ? now_ns() : 0;
-  push_rows_warp<RowT>(args, dedup_row, dst, num_rows, false, lane);
-  push_flag_warp(args, tables, proxy, rnd, entry.flags + nth, lane);
+  push_rows_warp<RowT>(sizes, args, dedup_row, dst, num_rows, false, lane);
+  push_flag_warp(seq, tables, proxy, rnd, entry.flags + nth, lane);
   if (timeline.on() && lane == 0) {
     const unsigned long long bytes = (unsigned long long)num_rows * row_bytes;
     timeline.task(start, proxy != me ? bytes : 0, proxy != me ? 0 : bytes);
@@ -606,12 +612,13 @@ __device__ __forceinline__ void push_rows_task_warp(const BwdArgs &args, const O
 // lookup_rows, but those of heavy rows (their last sub-task writes them).
 // Every lane of the warp.
 template <typename RowT>
-__device__ __forceinline__ void local_push_warp(const BwdArgs &args, const OutTables &tables,
+__device__ __forceinline__ void local_push_warp(const Sizes &sizes, const BwdArgs &args,
+                                                const OutTables &tables,
                                                 const LocalRows &local_rows, int64_t index,
                                                 int lane) {
   const BwdPlanView &plan = args.plan;
-  const int me = args.topo.local_rank, row_bytes = args.row_bytes;
-  const OutTimeline timeline(args);
+  const int me = sizes.topo.local_rank, row_bytes = sizes.row_bytes;
+  const OutTimeline timeline{args.trace, sizes.topo.local_size};
   const RowTask job = local_rows.task(index);
   if (job.count == 0) return;
   const int num_rows = job.count;
@@ -623,7 +630,7 @@ __device__ __forceinline__ void local_push_warp(const BwdArgs &args, const OutTa
     dst = tables.lookup_row(job.owner, plan.dst[row]);
   }
   const unsigned long long start = timeline.on() ? now_ns() : 0;
-  const int wrote = push_rows_warp<RowT>(args, dedup_row, dst, num_rows, true, lane);
+  const int wrote = push_rows_warp<RowT>(sizes, args, dedup_row, dst, num_rows, true, lane);
   if (timeline.on() && lane == 0) {
     const unsigned long long bytes = (unsigned long long)wrote * row_bytes;
     timeline.task(start, job.owner != me ? bytes : 0, job.owner != me ? 0 : bytes);
@@ -652,20 +659,23 @@ namespace bwd {
 // (released by the task flag, acquired here, released again by the counter).
 template <typename RowT>
 struct ProxyReducer {
-  // Every thread of a reducer CTA: the CTA's warps take the tasks.
-  __device__ static void run(const BwdArgs &args, int lane);
+  // Every thread of a reducer CTA, in backward seq: the CTA's warps take the
+  // tasks.
+  __device__ static void run(ncclWindow_t window, const Sizes &sizes, int64_t seq,
+                             const BwdArgs &args, int lane);
 };
 
 template <typename RowT>
-__device__ void ProxyReducer<RowT>::run(const BwdArgs &args, int lane) {
+__device__ void ProxyReducer<RowT>::run(ncclWindow_t window, const Sizes &sizes, int64_t seq,
+                                        const BwdArgs &args, int lane) {
   const BwdPlanView &plan = args.plan;
-  const int num_nodes = args.topo.num_nodes, node = args.topo.node, vec = args.vec;
-  const int64_t chunk_tasks = args.chunk_rows / kTaskRows;  // tasks per chunk
+  const int num_nodes = sizes.topo.num_nodes, node = sizes.topo.node, vec = sizes.row_vecs();
+  const int64_t chunk_tasks = sizes.chunk_rows / kTaskRows;  // tasks per chunk
   // this rank's copy of the window: its proxy_rows and push flags
-  const WindowLayout window = NodeWindow(args.window, args.topo.local_rank).layout(args);
+  const WindowLayout layout = NodeWindow(window, sizes.topo.local_rank).layout(sizes);
   const int64_t total = plan.reduce_task_starts[*plan.num_rounds];
   RoundCursor cursor(plan.reduce_task_starts, 1);  // the round of this warp's tasks
-  const TaskQueue queue(args, kQueueReduce);
+  const TaskQueue queue{layout.ctrl.task(kQueueReduce)};
   for (int64_t task = queue.next_warp(); task < total; task = queue.next_warp()) {
     cursor.seek(task);
     // The task: keys [uniq_lo, uniq_lo + num_keys) of owner node owner_node,
@@ -679,16 +689,16 @@ __device__ void ProxyReducer<RowT>::run(const BwdArgs &args, int lane) {
     // from its round table: where the owner node's keys of the round sit in
     // proxy_rows, and their first IB chunk
     const RoundPiece piece = plan.round_piece(rnd, owner_node);
-    const int64_t uniq_lo = piece.uniq_lo + chunk * args.chunk_rows + sub * kTaskRows;
+    const int64_t uniq_lo = piece.uniq_lo + chunk * sizes.chunk_rows + sub * kTaskRows;
     const int64_t chunk_end =
-        min((int64_t)piece.uniq_hi, piece.uniq_lo + (chunk + 1) * args.chunk_rows);
+        min((int64_t)piece.uniq_hi, piece.uniq_lo + (chunk + 1) * sizes.chunk_rows);
     const int num_keys = (int)min((int64_t)kTaskRows, chunk_end - uniq_lo);
     if (num_keys <= 0) continue;
     // The lane's key (a lane per key): its reducer list [begin, end) (heavy:
     // the first entry is the heavy key's own row) and its row in proxy_rows.
     // Then the wait for the push task of each entry of the task's lists.
-    const uint64_t tag = grant_of(args.ch.seq, rnd);
-    const uint64_t *flags = window.rows.push_flags(rnd);
+    const uint64_t tag = grant_of(seq, rnd);
+    const uint64_t *flags = layout.rows.push_flags(rnd);
     const int64_t uniq_global = plan.uniq_off[owner_node] + uniq_lo;  // in the reducer list
     int64_t begin = 0, end = 0;
     bool heavy = false;
@@ -697,15 +707,15 @@ __device__ void ProxyReducer<RowT>::run(const BwdArgs &args, int lane) {
       begin = plan.reducer_start[uniq_global + lane];
       end = plan.reducer_start[uniq_global + lane + 1];
       heavy = (int32_t)(plan.reducer_entries[begin] >> 32) == kEntryOwnRow;
-      row = window.rows.proxy_row(piece.off + uniq_lo + lane - piece.uniq_lo);
+      row = layout.rows.proxy_row(piece.off + uniq_lo + lane - piece.uniq_lo);
     }
     const int64_t ent_end = __shfl_sync(kFull, end, num_keys - 1);
-    Spin spin(args.timeout_ns);
+    Spin spin(sizes.timeout_ns);
     for (int64_t i = __shfl_sync(kFull, begin, 0) + lane; i < ent_end; i += 32) {
       const int32_t flag = (int32_t)(plan.reducer_entries[i] >> 32);
       if (flag < 0) continue;  // kEntryNoPush, kEntryOwnRow: no push task
       while (ld_acquire_sys(&flags[flag]) < tag)
-        spin.pause("pushed gradient rows", flag, uniq_lo, args.topo.rank);
+        spin.pause("pushed gradient rows", flag, uniq_lo, sizes.topo.rank);
     }
     __syncwarp();
     // The keys of several entries, each summed in fp32 in list order (a heavy
@@ -721,10 +731,10 @@ __device__ void ProxyReducer<RowT>::run(const BwdArgs &args, int lane) {
         const int col = col_base + lane;
         float acc[Vec16<RowT>::kValues];
         if (lane_heavy)  // its own row (the first entry) gets the sum
-          sum_entries<RowT, true>(window.rows, plan.reducer_entries, lane_begin + 1, lane_end, col,
+          sum_entries<RowT, true>(layout.rows, plan.reducer_entries, lane_begin + 1, lane_end, col,
                                   col < vec, lane, acc);
         else
-          sum_entries<RowT, false>(window.rows, plan.reducer_entries, lane_begin, lane_end, col,
+          sum_entries<RowT, false>(layout.rows, plan.reducer_entries, lane_begin, lane_end, col,
                                    col < vec, lane, acc);
         if (col < vec) *((int4 *)dst + col) = Vec16<RowT>::pack(acc);
       }
@@ -771,40 +781,42 @@ constexpr int kChunkPutBit = 62;
 // rail owner rounds 0 and 1 of the next kernel, and the warp flushes the
 // credits' context.
 struct ProxyIssuer {
-  // Every lane of the issuer warp.
-  __device__ static void run(const BwdArgs &args);
+  // Every lane of the issuer warp, in backward seq.
+  __device__ static void run(ncclWindow_t window, const ncclDevComm &dev, const Sizes &sizes,
+                             int64_t seq, const BwdArgs &args);
 };
 
-__device__ void ProxyIssuer::run(const BwdArgs &args) {
+__device__ void ProxyIssuer::run(ncclWindow_t window, const ncclDevComm &dev, const Sizes &sizes,
+                                 int64_t seq, const BwdArgs &args) {
   __shared__ int at_round[32];         // each lane's round: it has put the rounds before
   __shared__ unsigned at_half[32][2];  // its puts out of each half
   const BwdPlanView &plan = args.plan;
-  const int lane = threadIdx.x & 31, num_nodes = args.topo.num_nodes, node = args.topo.node;
-  const NodeWindow node_window(args.window, args.topo.local_rank);
-  const WindowLayout window = node_window.layout(args);
-  ncclGin rows(args.dev, kCtxBwd), cred(args.dev, kCtxCredit);
-  const ncclTeam rail = ncclTeamRail(args.dev);
+  const int lane = threadIdx.x & 31, num_nodes = sizes.topo.num_nodes, node = sizes.topo.node;
+  const NodeWindow node_window(window, sizes.topo.local_rank);
+  const WindowLayout layout = node_window.layout(sizes);
+  ncclGin rows(dev, kCtxBwd), cred(dev, kCtxCredit);
+  const ncclTeam rail = ncclTeamRail(dev);
   const Credits credits(cred, rail);
-  const OutTimeline timeline(args);
+  const OutTimeline timeline{args.trace, sizes.topo.local_size};
   bool live = false;  // the lane has owner nodes
   for (int owner_node = lane; owner_node < num_nodes; owner_node += 32) {
     if (owner_node == node) continue;
     live = true;
-    credits.raise(owner_node, sig_bwd_ready(num_nodes, node), (uint64_t)args.ch.seq,
-                  window.ctrl.bwd_ready_sent(owner_node));
+    credits.raise(owner_node, sig_bwd_ready(num_nodes, node), (uint64_t)seq,
+                  layout.ctrl.bwd_ready_sent(owner_node));
   }
-  Spin spin(args.timeout_ns);
+  Spin spin(sizes.timeout_ns);
   // The ready counters were zeroed before this rank published its out_seq.
   if (lane == 0)
-    while ((int64_t)ld_acquire_gpu(window.ctrl.out_started()) < args.ch.seq)
-      spin.pause("entry of this rank", 0, args.ch.seq, args.topo.rank);
+    while ((int64_t)ld_acquire_gpu(layout.ctrl.out_started()) < seq)
+      spin.pause("entry of this rank", 0, seq, sizes.topo.rank);
   const int num_rounds = (int)*plan.num_rounds;
   for (int owner_node = lane; owner_node < num_nodes; owner_node += 32) {
-    window.ctrl.put_at(owner_node)[0] = plan.bwd_puts(owner_node)[0];
-    window.ctrl.put_at(owner_node)[1] = 0;
+    layout.ctrl.put_at(owner_node)[0] = plan.bwd_puts(owner_node)[0];
+    layout.ctrl.put_at(owner_node)[1] = 0;
   }
   // the puts this proxy posted to each half in earlier calls
-  const uint64_t posted[2] = {*window.ctrl.posted(0), *window.ctrl.posted(1)};
+  const uint64_t posted[2] = {*layout.ctrl.posted(0), *layout.ctrl.posted(1)};
   volatile int *lane_rounds = at_round;
   volatile unsigned *lane_half_puts = &at_half[0][0];
   lane_rounds[lane] = live ? 0 : num_rounds;
@@ -814,9 +826,9 @@ __device__ void ProxyIssuer::run(const BwdArgs &args) {
   const RowPut put{rows,
                    rail,
                    node_window,
-                   window.rows.lookup_rows(),
-                   window.rows.proxy_rows(),
-                   args.row_bytes,
+                   layout.rows.lookup_rows(),
+                   layout.rows.proxy_rows(),
+                   sizes.row_bytes,
                    sig_rows(node)};
   unsigned puts[2] = {0, 0};  // this lane's puts out of each half
   int freed = 0;              // lane 0: rounds whose half the requesters may fill again
@@ -827,12 +839,11 @@ __device__ void ProxyIssuer::run(const BwdArgs &args) {
     for (int owner_node = lane; owner_node < num_nodes; owner_node += 32) {
       if (owner_node == node) continue;
       const int32_t *start = plan.bwd_puts(owner_node);  // the node's segments, by round
-      int64_t *at = window.ctrl.put_at(owner_node);
+      int64_t *at = layout.ctrl.put_at(owner_node);
       int64_t done = at[0];  // segments [start of round rnd, done) are put
       int rnd = (int)at[1];
       while (rnd < num_rounds && done == start[rnd + 1]) ++rnd;
-      if (rnd < num_rounds &&
-          (int64_t)credits.read(sig_bwd_ready(num_nodes, owner_node)) >= args.ch.seq) {
+      if (rnd < num_rounds && (int64_t)credits.read(sig_bwd_ready(num_nodes, owner_node)) >= seq) {
         // each chunk the reducers counted ready; a chunk's segments are
         // consecutive
         const int64_t end = start[rnd + 1];
@@ -883,13 +894,13 @@ __device__ void ProxyIssuer::run(const BwdArgs &args) {
         uint64_t want = posted[half];
         for (int other = 0; other < 32; ++other) want += lane_half_puts[2 * other + half];
         if (rows.readCounter(half) < want) break;
-        st_release_sys(window.ctrl.half_free(), grant_of(args.ch.seq, freed + 2));
+        st_release_sys(layout.ctrl.half_free(), grant_of(seq, freed + 2));
         ++freed;
         moved = true;
       }
     }
     if (lane_through == num_rounds && through == num_rounds) break;
-    if (!moved) spin.pause("reduced chunks", lane_through, lane, args.topo.rank);
+    if (!moved) spin.pause("reduced chunks", lane_through, lane, sizes.topo.rank);
   }
   if (!first) timeline.stamp_latest(kTraceLastPut);
   // The NIC has read every put out of proxy_rows: one round, the warp's flush
@@ -903,9 +914,9 @@ __device__ void ProxyIssuer::run(const BwdArgs &args) {
                              posted[1] + __reduce_add_sync(kFull, puts[1])};
     if (lane == 0) {
       for (int half = 0; half < 2; ++half) {
-        *window.ctrl.posted(half) = all[half];
+        *layout.ctrl.posted(half) = all[half];
         while (rows.readCounter(half) < all[half])
-          spin.pause("puts read from proxy_rows", half, (long long)all[half], args.topo.rank);
+          spin.pause("puts read from proxy_rows", half, (long long)all[half], sizes.topo.rank);
       }
     }
   }
@@ -915,8 +926,8 @@ __device__ void ProxyIssuer::run(const BwdArgs &args) {
   __syncwarp();
   for (int owner_node = lane; owner_node < num_nodes; owner_node += 32)
     if (owner_node != node)
-      credits.raise(owner_node, sig_grant(node), grant_of(args.ch.seq + 1, 2),
-                    window.ctrl.grant_sent(owner_node));
+      credits.raise(owner_node, sig_grant(node), grant_of(seq + 1, 2),
+                    layout.ctrl.grant_sent(owner_node));
   __syncwarp();
   credits.flush_warp();
 }
@@ -925,15 +936,15 @@ __device__ void ProxyIssuer::run(const BwdArgs &args) {
 // this rank's lookup_rows: how many have landed during this backward (each
 // node's bwd_rows signal against the running total, bwd_tot), and all of
 // them.
-__device__ __forceinline__ void lane_landed_rows(const BwdArgs &args, const ncclGin &rows, int lane,
+__device__ __forceinline__ void lane_landed_rows(ncclWindow_t window, const Sizes &sizes,
+                                                 const BwdArgs &args, const ncclGin &rows, int lane,
                                                  uint64_t &got, uint64_t &need) {
-  const WindowLayout window = NodeWindow(args.window, args.topo.local_rank).layout(args);
+  const CtrlLayout ctrl = NodeWindow(window, sizes.topo.local_rank).layout(sizes).ctrl;
   got = need = 0;
-  for (int peer_node = lane; peer_node < args.topo.num_nodes; peer_node += 32) {
-    if (peer_node == args.topo.node) continue;
+  for (int peer_node = lane; peer_node < sizes.topo.num_nodes; peer_node += 32) {
+    if (peer_node == sizes.topo.node) continue;
     const uint64_t rows_of_node = (uint64_t)args.plan.uniq_in[peer_node];
-    got +=
-        min(rows.readSignal(sig_rows(peer_node)) - *window.ctrl.bwd_tot(peer_node), rows_of_node);
+    got += min(rows.readSignal(sig_rows(peer_node)) - *ctrl.bwd_tot(peer_node), rows_of_node);
     need += rows_of_node;
   }
 }
@@ -948,27 +959,31 @@ __device__ __forceinline__ void lane_landed_rows(const BwdArgs &args, const nccl
 // landing, and the kernel still ends when its last CTA has them all.
 class LandingWatcher {
  public:
-  // Every lane of the watcher warp.
-  __device__ static void run(const BwdArgs &args);
+  // Every lane of the watcher warp (arrive0: the arrive word before this
+  // kernel).
+  __device__ static void run(ncclWindow_t window, const ncclDevComm &dev, const Sizes &sizes,
+                             int64_t arrive0, const BwdArgs &args);
   // The backward's last CTA when it is CTA 0 (the watcher stopped before
   // every row had landed), every lane of its warp 0: the rows of the lane's
   // nodes the watcher had not seen, binned into the kernel's row as they land
   // (the CTA's shared copy is folded already), and when the last one landed.
-  __device__ static void rest(const BwdArgs &args, int lane);
+  __device__ static void rest(ncclWindow_t window, const ncclDevComm &dev, const Sizes &sizes,
+                              const BwdArgs &args, int lane);
 };
 
-__device__ void LandingWatcher::run(const BwdArgs &args) {
+__device__ void LandingWatcher::run(ncclWindow_t window, const ncclDevComm &dev, const Sizes &sizes,
+                                    int64_t arrive0, const BwdArgs &args) {
   const int lane = threadIdx.x & 31;
-  const WindowLayout window = NodeWindow(args.window, args.topo.local_rank).layout(args);
-  ncclGin rows(args.dev, kCtxBwd);
-  const OutTimeline timeline(args);
-  const uint64_t others = (uint64_t)(args.arrive0 + gridDim.x - 1);
+  const CtrlLayout ctrl = NodeWindow(window, sizes.topo.local_rank).layout(sizes).ctrl;
+  ncclGin rows(dev, kCtxBwd);
+  const OutTimeline timeline{args.trace, sizes.topo.local_size};
+  const uint64_t others = (uint64_t)(arrive0 + gridDim.x - 1);
   uint64_t seen = 0, got = 0, need = 0;
-  lane_landed_rows(args, rows, lane, got, need);
-  Spin spin(args.timeout_ns);
+  lane_landed_rows(window, sizes, args, rows, lane, got, need);
+  Spin spin(sizes.timeout_ns);
   for (;;) {
     if (seen < need) {
-      lane_landed_rows(args, rows, lane, got, need);
+      lane_landed_rows(window, sizes, args, rows, lane, got, need);
       if (got > seen) {
         timeline.landed(got - seen, seen == 0);
         seen = got;
@@ -977,24 +992,25 @@ __device__ void LandingWatcher::run(const BwdArgs &args) {
     }
     if (__all_sync(kFull, seen == need)) break;
     bool rest = false;
-    if (lane == 0) rest = ld_acquire_gpu(window.ctrl.arrive()) >= others;
+    if (lane == 0) rest = ld_acquire_gpu(ctrl.arrive()) >= others;
     if (__shfl_sync(kFull, rest, 0)) break;
-    spin.pause("gradient rows of the proxy nodes", lane, (long long)need, args.topo.rank);
+    spin.pause("gradient rows of the proxy nodes", lane, (long long)need, sizes.topo.rank);
   }
   timeline.shared()[kSmLanded + lane] = seen;
 }
 
-__device__ void LandingWatcher::rest(const BwdArgs &args, int lane) {
-  const OutTimeline timeline(args);
-  ncclGin rows(args.dev, kCtxBwd);
+__device__ void LandingWatcher::rest(ncclWindow_t window, const ncclDevComm &dev,
+                                     const Sizes &sizes, const BwdArgs &args, int lane) {
+  const OutTimeline timeline{args.trace, sizes.topo.local_size};
+  ncclGin rows(dev, kCtxBwd);
   uint64_t seen = timeline.shared()[kSmLanded + lane], got = 0, need = 0;
-  lane_landed_rows(args, rows, lane, got, need);
+  lane_landed_rows(window, sizes, args, rows, lane, got, need);
   if (seen >= need) return;
-  Spin spin(args.timeout_ns);
+  Spin spin(sizes.timeout_ns);
   while (seen < need) {
-    lane_landed_rows(args, rows, lane, got, need);
+    lane_landed_rows(window, sizes, args, rows, lane, got, need);
     if (got == seen) {
-      spin.pause("gradient rows of the proxy nodes", lane, (long long)need, args.topo.rank);
+      spin.pause("gradient rows of the proxy nodes", lane, (long long)need, sizes.topo.rank);
       continue;
     }
     timeline.landed_late(got - seen, seen == 0);
@@ -1039,43 +1055,48 @@ namespace bwd {
 // lanes taking the rail peers in turn) for the gradient rows the proxy on
 // each other node puts into this owner's lookup_rows: its bwd_rows signal
 // against the running total (bwd_tot, of this rank's control words `ctrl`).
-__device__ __forceinline__ void wait_rail_rows_warp(const BwdArgs &args, const CtrlLayout &ctrl) {
+__device__ __forceinline__ void wait_rail_rows_warp(ncclWindow_t window, const ncclDevComm &dev,
+                                                    const Sizes &sizes, const BwdArgs &args,
+                                                    const CtrlLayout &ctrl) {
   const int lane = threadIdx.x & 31;
   // Tracing: CTA 0 is the last CTA when its watcher stopped before every
   // row had landed; another one comes after it saw them all
   // (LandingWatcher).
-  if (OutTimeline(args).on() && blockIdx.x == 0) LandingWatcher::rest(args, lane);
-  ncclGin rows(args.dev, kCtxBwd);
-  for (int peer_node = lane; peer_node < args.topo.num_nodes; peer_node += 32) {
-    if (peer_node == args.topo.node) continue;
+  if (OutTimeline{args.trace, sizes.topo.local_size}.on() && blockIdx.x == 0)
+    LandingWatcher::rest(window, dev, sizes, args, lane);
+  ncclGin rows(dev, kCtxBwd);
+  for (int peer_node = lane; peer_node < sizes.topo.num_nodes; peer_node += 32) {
+    if (peer_node == sizes.topo.node) continue;
     const uint64_t want = *ctrl.bwd_tot(peer_node) + (uint64_t)args.plan.uniq_in[peer_node];
-    Spin spin(args.timeout_ns);
+    Spin spin(sizes.timeout_ns);
     while (rows.readSignal(sig_rows(peer_node)) < want)
-      spin.pause("gradient rows of a proxy node", peer_node, (long long)want, args.topo.rank);
+      spin.pause("gradient rows of a proxy node", peer_node, (long long)want, sizes.topo.rank);
     *ctrl.bwd_tot(peer_node) = want;
   }
 }
 
-// The end of a backward for this rank, in the last CTA to arrive: it sets
+// The end of backward seq for this rank, in the last CTA to arrive: it sets
 // the task queues back to 0, tells every owner of the node that this rank's
 // gradient rows are in (its flag pushed[local_rank] there) and waits until
 // every requester of the node has told it the same; across nodes warp 0 then
 // waits until the gradient rows of every rail proxy have landed. This rank's
 // lookup_grad is then complete. Every thread of the last CTA.
-__device__ __forceinline__ void exit(const BwdArgs &args) {
+__device__ __forceinline__ void exit(ncclWindow_t window, const ncclDevComm &dev,
+                                     const Sizes &sizes, int64_t seq, const BwdArgs &args) {
   const int tid = threadIdx.x;
-  const OutTimeline timeline(args);
-  const NodeWindow node(args.window, args.topo.local_rank);
-  const WindowLayout window = node.layout(args);
-  const PeerFlags<OutArgs> pushed(args, node, window.ctrl.pushed());
+  const OutTimeline timeline{args.trace, sizes.topo.local_size};
+  const NodeWindow node(window, sizes.topo.local_rank);
+  const CtrlLayout ctrl = node.layout(sizes).ctrl;
+  const PeerFlags pushed{sizes, node, ctrl.pushed(), seq};
   if (tid == 0) {
     timeline.stamp_latest(kTraceArrived);
-    TaskQueue::reset_all(args);
-    for (int peer = 0; peer < args.topo.local_size; ++peer) pushed.tell(peer);
+    TaskQueue::reset_all(ctrl);
+    for (int peer = 0; peer < sizes.topo.local_size; ++peer) pushed.tell(peer);
   }
-  for (int peer = tid; peer < args.topo.local_size; peer += blockDim.x)
+  for (int peer = tid; peer < sizes.topo.local_size; peer += blockDim.x)
     pushed.wait(peer, "gradient rows pushed");
-  if (args.topo.num_nodes > 1 && (tid >> 5) == 0) wait_rail_rows_warp(args, window.ctrl);
+  if (sizes.topo.num_nodes > 1 && (tid >> 5) == 0)
+    wait_rail_rows_warp(window, dev, sizes, args, ctrl);
   if (timeline.on()) {
     __syncthreads();
     if (tid == 0) timeline.stamp_latest(kTraceExited);
@@ -1091,28 +1112,31 @@ __device__ __forceinline__ void exit(const BwdArgs &args) {
 // steps above): it zeroes the counters this kernel counts from 0
 // (before this rank publishes its out_seq), passes the entry barrier and
 // takes its tasks. Every CTA then arrives, and the last one ends the
-// backward for this rank (bwd::exit).
+// backward for this rank (bwd::exit). It takes what fwd_kernel takes, with
+// its call (args).
 template <typename RowT>
-__global__ void __launch_bounds__(kThreads, 1) bwd_kernel(BwdArgs args) {
+__global__ void __launch_bounds__(kThreads, 1)
+    bwd_kernel(ncclWindow_t window, ncclDevComm dev, Sizes sizes, int64_t seq, int64_t arrive0,
+               BwdArgs args) {
   const BwdPlanView &plan = args.plan;
   const Fanout &fanout = plan.fanout;
-  const int local_size = args.topo.local_size, num_nodes = args.topo.num_nodes,
-            node = args.topo.node, me = args.topo.local_rank;
+  const int local_size = sizes.topo.local_size, num_nodes = sizes.topo.num_nodes,
+            node = sizes.topo.node, me = sizes.topo.local_rank;
   const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
-  const OutTimeline timeline(args);
+  const OutTimeline timeline{args.trace, local_size};
   timeline.begin_cta();
   const int gin = num_nodes == 1 || blockIdx.x != 0 ? 0 : timeline.on() ? 64 : 32;
   const int workers = kThreads - gin;
   if (tid >= workers) {
     if (warp == kWarps - 1)
-      bwd::ProxyIssuer::run(args);
+      bwd::ProxyIssuer::run(window, dev, sizes, seq, args);
     else if constexpr (kTrace)
-      bwd::LandingWatcher::run(args);
+      bwd::LandingWatcher::run(window, dev, sizes, arrive0, args);
   } else if (num_nodes > 1 && blockIdx.x >= gridDim.x - args.reducers) {
-    pass_entry_barrier(args, kThreads);
-    bwd::ProxyReducer<RowT>::run(args, lane);
+    pass_entry_barrier(window, sizes, seq, timeline, kThreads);
+    bwd::ProxyReducer<RowT>::run(window, sizes, seq, args, lane);
   } else {
-    const OutTables tables(args, args.plan);
+    const OutTables tables(window, sizes, args.plan);
     // half_seen starts at 0; the entry barrier's sync publishes it
     for (int proxy = tid; proxy < local_size; proxy += workers) *tables.half_seen(proxy) = 0;
     int64_t groups = 0;  // this rank's heavy groups, at all its proxies
@@ -1128,50 +1152,50 @@ __global__ void __launch_bounds__(kThreads, 1) bwd_kernel(BwdArgs args) {
         for (int64_t i = tid; i < *plan.num_chunks; i += workers) args.ready[i] = 0;
       cta_sync(workers);
     }
-    pass_entry_barrier(args, workers);
+    pass_entry_barrier(window, sizes, seq, timeline, workers);
     const int64_t *node_block_start = plan.block_start + node * local_size;
     // Every heavy row's sub-task has a slot before the remote tasks (across
     // nodes), which those of rows to other nodes take, and one among the row
     // tasks, which those of the node's rows take.
     const int64_t heavy_subs = fanout.exp_off != nullptr ? fanout.count[1] : 0,
                   early_subs = num_nodes > 1 ? heavy_subs : 0;
-    const int64_t subs = early_subs + args.group_subs,
+    const int64_t subs = early_subs + plan.group_subs,
                   remote = subs + (num_nodes > 1 ? plan.bwd_task_starts[2 * tables.max_rounds] : 0);
     const LocalRows local_rows{node_block_start, local_size, me};
     const int64_t rows = local_rows.count(), total = remote + rows + heavy_subs;
     // The round of this warp's remote tasks (one node: none).
     RoundCursor cursor(num_nodes > 1 ? plan.bwd_task_starts : nullptr, 2);
-    const TaskQueue queue(args, kQueueWork);
+    const TaskQueue queue{tables.layout().ctrl.task(kQueueWork)};
     for (int64_t task = queue.next_warp(); task < total; task = queue.next_warp()) {
       if (task < early_subs) {
-        bwd::heavy_sub_warp<RowT>(args, tables, task, true, lane);
+        bwd::heavy_sub_warp<RowT>(sizes, args, tables, task, true, lane);
         continue;
       }
       if (task < subs) {
-        bwd::group_sub_warp<RowT>(args, task - early_subs, lane);
+        bwd::group_sub_warp<RowT>(sizes, args, task - early_subs, lane);
         continue;
       }
       if (task < remote) {
         const int64_t remote_task = task - subs;
         cursor.seek(remote_task);
         bwd::ProxyPush push;
-        if (!bwd::remote_push(args, tables, cursor, remote_task, push)) continue;
+        if (!bwd::remote_push(sizes, tables, cursor, remote_task, push)) continue;
         if (push.is_group_task)
-          bwd::push_groups_task_warp<RowT>(args, tables, push, lane);
+          bwd::push_groups_task_warp<RowT>(sizes, seq, args, tables, push, lane);
         else
-          bwd::push_rows_task_warp<RowT>(args, tables, push, lane);
+          bwd::push_rows_task_warp<RowT>(sizes, seq, args, tables, push, lane);
         continue;
       }
       int64_t index;
       if (Interleave{rows, heavy_subs}.is_sub(task - remote, index)) {
-        bwd::heavy_sub_warp<RowT>(args, tables, index, false, lane);
+        bwd::heavy_sub_warp<RowT>(sizes, args, tables, index, false, lane);
         continue;
       }
-      bwd::local_push_warp<RowT>(args, tables, local_rows, index, lane);
+      bwd::local_push_warp<RowT>(sizes, args, tables, local_rows, index, lane);
     }
   }
-  if (!arrive_cta(args)) return;  // the last CTA goes on
-  bwd::exit(args);
+  if (!arrive_cta(window, sizes, arrive0, timeline)) return;  // the last CTA goes on
+  bwd::exit(window, dev, sizes, seq, args);
 }
 
 }  // namespace hier_output_dist

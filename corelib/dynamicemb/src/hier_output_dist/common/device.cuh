@@ -252,75 +252,53 @@ struct NodeWindow {
   }
 };
 
-// The part of the kernels' arguments that both channels share and that is
-// fixed for the op's life: its sizes, by which a kernel lays out its window
-// and its tables, and the window itself. The op makes it once, after its
-// window is registered. The in channel's comm kernels that wait take it with
-// the call's sequence number (CommArgs), the out kernels with theirs
-// (OutArgs), and the exit round's kernel alone.
-struct ChannelStatic : Sizes {
-  ncclWindow_t window;  // the op's window (window.h)
-  uint64_t timeout_ns;  // how long a wait for a peer may take
-  ncclDevComm dev;      // GIN across nodes
-};
-static_assert(std::is_trivially_copyable<ChannelStatic>::value,
-              "a kernel parameter is copied as bytes");
-
 // Syncs between the ranks of a node through their control words: the node
 // barrier (each rank publishes its own word and waits for every peer's),
 // flags per pair of node peers (each rank sets its flag in every peer's words
 // and waits for every peer's in its own), and words that carry a payload
-// beside the sequence number (TaggedWord). The words hold the channel's
-// sequence number, so none is ever reset: a later kernel waits for a larger
-// one.
+// beside the sequence number (TaggedWord). The words hold the sequence number
+// of the kernel that writes them (`seq`: in_seq or out_seq), so none is ever
+// reset: a later kernel waits for a larger one.
 
-// The node barrier on one control word (`word`, this rank's copy of it), for
-// a channel's kernel (Args, CommArgs or OutArgs, gives its Channel, Topo and
-// timeout): one thread publishes this rank's sequence number in its word;
-// threads [0, local_size) then wait, each until one node peer's word has it.
-// That peer has then done everything it did before it published (its
-// release, our acquire): all its earlier work on the channel too (its kernels
-// run in issue order).
-template <typename Args>
+// The node barrier on one control word (`word`, this rank's copy of it), of
+// the kernel with sequence number `seq`: one thread publishes seq in this
+// rank's word; threads [0, local_size) then wait, each until one node peer's
+// word has it. That peer has then done everything it did before it
+// published (its release, our acquire): all its earlier kernels of the same
+// sequence too (they run in issue order).
 struct NodeBarrier {
-  const Args &args;
+  const Sizes &sizes;
   const NodeWindow &node;
   uint64_t *word;
-  __device__ __forceinline__ NodeBarrier(const Args &channel_args, const NodeWindow &window,
-                                         uint64_t *mine)
-      : args(channel_args), node(window), word(mine) {}
+  int64_t seq;
   // One thread: this rank's word gets the sequence number.
-  __device__ __forceinline__ void publish() const { st_release_sys(word, (uint64_t)args.ch.seq); }
+  __device__ __forceinline__ void publish() const { st_release_sys(word, (uint64_t)seq); }
   // Waits until node peer `peer` has published (spin reports `what`).
   __device__ __forceinline__ void wait(int peer, const char *what) const {
-    Spin spin(args.timeout_ns);
+    Spin spin(sizes.timeout_ns);
     const uint64_t *theirs = node.peer(word, peer);
-    while ((int64_t)ld_acquire_sys(theirs) < args.ch.seq)
-      spin.pause(what, peer, args.ch.seq, args.topo.rank);
+    while ((int64_t)ld_acquire_sys(theirs) < seq) spin.pause(what, peer, seq, sizes.topo.rank);
   }
 };
 
 // Flags of the node's ranks, one per pair: node peer r's flag in a rank's
 // copy is flags[r] (`flags`: this rank's copy). Each rank tells every peer
 // (sets its flag in the peer's copy to the sequence number), then waits
-// until every peer told it. Args as for NodeBarrier.
-template <typename Args>
+// until every peer told it. Its fields as NodeBarrier's.
 struct PeerFlags {
-  const Args &args;
+  const Sizes &sizes;
   const NodeWindow &node;
   uint64_t *flags;
-  __device__ __forceinline__ PeerFlags(const Args &channel_args, const NodeWindow &window,
-                                       uint64_t *mine)
-      : args(channel_args), node(window), flags(mine) {}
+  int64_t seq;
   // This rank tells node peer `peer`.
   __device__ __forceinline__ void tell(int peer) const {
-    st_release_sys(node.peer(flags + args.topo.local_rank, peer), (uint64_t)args.ch.seq);
+    st_release_sys(node.peer(flags + sizes.topo.local_rank, peer), (uint64_t)seq);
   }
   // Waits until node peer `peer` told this rank.
   __device__ __forceinline__ void wait(int peer, const char *what) const {
-    Spin spin(args.timeout_ns);
-    while ((int64_t)ld_acquire_sys(flags + peer) < args.ch.seq)
-      spin.pause(what, peer, args.ch.seq, args.topo.rank);
+    Spin spin(sizes.timeout_ns);
+    while ((int64_t)ld_acquire_sys(flags + peer) < seq)
+      spin.pause(what, peer, seq, sizes.topo.rank);
   }
 };
 

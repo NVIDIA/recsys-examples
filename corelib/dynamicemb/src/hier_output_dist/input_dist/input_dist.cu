@@ -79,9 +79,10 @@ void InDistResult::record_stream(c10::Stream stream) const {
   bwd_plan.record_stream(stream);
 }
 
-InChannel::InChannel(const Config &config, const Sizes &sizes, const ChannelStatic &channel,
-                     const WindowLayout &window, int device)
-    : channel_(channel),
+InChannel::InChannel(const Config &config, const Sizes &sizes, ncclWindow_t window,
+                     const ncclDevComm &dev, const WindowLayout &layout, int device)
+    : window_(window),
+      dev_(dev),
       sizes_(sizes),
       rules_(owner_rules(config)),
       weights_(config.weights),
@@ -91,7 +92,7 @@ InChannel::InChannel(const Config &config, const Sizes &sizes, const ChannelStat
   auto view = [&](void *buffer, at::IntArrayRef shape, at::ScalarType dtype) {
     return at::from_blob(buffer, shape, options.dtype(dtype));
   };
-  const KeysLayout &keys = window.keys;
+  const KeysLayout &keys = layout.keys;
   const int64_t lookup_keys = sizes_.lookup_keys, remote_keys = sizes_.remote_keys;
   const at::Tensor node_keys = view(keys.node_keys(), {lookup_keys + remote_keys}, at::kLong);
   own_keys_ = node_keys.narrow(0, 0, keys.remote_start());
@@ -154,13 +155,13 @@ Pending InChannel::start(const PartOne &one) {
   // The node: every rank's counts (and the node barrier), the layout of the
   // node's keys, and this rank's keys pushed to their targets.
   const auto [totals, before, mine] = launch_node_count_exchange(
-      channel_, seq, node_count_vector(part.cell_start, topo, num_features));
+      window_, sizes_, seq, node_count_vector(part.cell_start, topo, num_features));
   const NodeLayout node =
       node_layout(NodeCounts{totals, before, mine}, part.cell_start, part.block_start, topo,
                   num_features, lookup_keys, remote_keys);
-  launch_node_key_push(channel_, part.keys, part.key_weights, part.row_cell, node.destination_base,
-                       node.rows_to_push);
-  launch_node_done(channel_, seq);
+  launch_node_key_push(window_, sizes_, part.keys, part.key_weights, part.row_cell,
+                       node.destination_base, node.rows_to_push);
+  launch_node_done(window_, sizes_, seq);
   at::Tensor peer_needs, num_recv, length_per_key, group_subs;
   if (num_nodes == 1) {
     // The own part of node_keys is the owner's KJT, and a row's place in its
@@ -190,22 +191,23 @@ Pending InChannel::start(const PartOne &one) {
     const at::Tensor message =
         count_message(node.need_remote, proxy.num_rounds, node.own_total.select(0, topo.local_rank),
                       proxy.uniq_out, proxy.cell_uniq);
-    const at::Tensor messages = launch_rail_count_exchange(channel_, seq, message);
+    const at::Tensor messages = launch_rail_count_exchange(window_, dev_, sizes_, seq, message);
     const RailLayout rail = rail_layout(messages, node.own_cells, other_nodes_, sizes_);
     cell_stage_.copy_(rail.cell_stage);
-    launch_rail_key_exchange(channel_, seq, proxy.stage_slice, rail.put_dst, rail.put_bytes,
-                             rail.put_skip);
+    launch_rail_key_exchange(window_, dev_, sizes_, seq, proxy.stage_slice, rail.put_dst,
+                             rail.put_bytes, rail.put_skip);
     // The node again: the call's needs, where the node's owners hold this
     // requester's cells, and what the node's proxies published for it.
     at::Tensor owner_cell_start;
     std::tie(peer_needs, owner_cell_start) =
-        launch_node_status_exchange(channel_, seq, status_publish(rail));
-    const at::Tensor headers = launch_peer_gather(channel_, kGatherProxyHeader, header_gather_.peer,
-                                                  header_gather_.first_word)
+        launch_node_status_exchange(window_, sizes_, seq, status_publish(rail));
+    const at::Tensor headers = launch_peer_gather(window_, sizes_, kGatherProxyHeader,
+                                                  header_gather_.peer, header_gather_.first_word)
                                    .view({local_size, ProxyHeader::of(sizes_).gathered_words()});
     const PeerWords rows =
         remote_rows(part.row_cell, part.block_start, node.destination_base, sizes_);
-    at::Tensor words = launch_peer_gather(channel_, kGatherRemoteMap, rows.peer, rows.first_word);
+    at::Tensor words =
+        launch_peer_gather(window_, sizes_, kGatherRemoteMap, rows.peer, rows.first_word);
     const RequesterTables requester = requester_tables(
         words, headers, owner_cell_start, part.row_cell, part.cell_start, part.block_start, sizes_);
     words = at::Tensor();  // requester_tables is its one reader: free it before the owner tables

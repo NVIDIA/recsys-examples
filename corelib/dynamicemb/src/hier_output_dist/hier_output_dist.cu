@@ -63,13 +63,6 @@ std::string why_not(int readiness, int local_size) {
   }
 }
 
-// The part of the kernels' arguments both channels share, over the
-// registered window.
-ChannelStatic channel_static(const Sizes &sizes, ncclWindow_t window, const ncclDevComm &dev,
-                             double timeout_s) {
-  return ChannelStatic{sizes, window, (uint64_t)(std::min(timeout_s, 1e9) * 1e9), dev};
-}
-
 // Signals and counters of every GIN context start at 0: `bad` counts those
 // that do not.
 __global__ void gin_zero_kernel(ncclDevComm dev, int signals, int counters, int *bad) {
@@ -88,17 +81,17 @@ __global__ void gin_zero_kernel(ncclDevComm dev, int signals, int counters, int 
 // lane taking peers in turn. Records in its closed word whether they all
 // did. Its waits are loops of their own: after limit_ns they give up and
 // record it, where Spin would trap.
-__global__ void exit_kernel(ChannelStatic channel, uint64_t limit_ns) {
-  const Topo &topo = channel.topo;
+__global__ void exit_kernel(ncclWindow_t window, ncclDevComm dev, Sizes sizes, uint64_t limit_ns) {
+  const Topo &topo = sizes.topo;
   const int lane = threadIdx.x, num_nodes = topo.num_nodes;
-  const NodeWindow node(channel.window, topo.local_rank);
-  const CtrlLayout ctrl = node.layout(channel).ctrl;
+  const NodeWindow node(window, topo.local_rank);
+  const CtrlLayout ctrl = node.layout(sizes).ctrl;
   if (lane == 0) st_release_sys(ctrl.closing(), 1);
   if (num_nodes > 1) {
-    ncclGin cred(channel.dev, kCtxCredit);
+    ncclGin cred(dev, kCtxCredit);
     for (int peer_node = lane; peer_node < num_nodes; peer_node += 32)
       if (peer_node != topo.node)
-        cred.signal(ncclTeamRail(channel.dev), peer_node,
+        cred.signal(ncclTeamRail(dev), peer_node,
                     ncclGin_StrongSignalAdd{(ncclGinSignal_t)sig_closing(num_nodes, topo.node), 1},
                     ncclCoopThread{}, ncclGin_None{}, cuda::thread_scope_thread,
                     cuda::thread_scope_system);
@@ -116,7 +109,7 @@ __global__ void exit_kernel(ChannelStatic channel, uint64_t limit_ns) {
     }
   }
   if (num_nodes > 1) {
-    ncclGin cred(channel.dev, kCtxCredit);
+    ncclGin cred(dev, kCtxCredit);
     for (int peer_node = lane; peer_node < num_nodes && seen; peer_node += 32)
       while (peer_node != topo.node && cred.readSignal(sig_closing(num_nodes, peer_node)) == 0) {
         if (now_ns() - start_ns > limit_ns) {
@@ -132,8 +125,9 @@ __global__ void exit_kernel(ChannelStatic channel, uint64_t limit_ns) {
   if (lane == 0) *ctrl.closed() = all ? 1 : 0;
 }
 
-cudaError_t launch_exit_kernel(const ChannelStatic &channel, uint64_t limit_ns) {
-  exit_kernel<<<1, 32>>>(channel, limit_ns);
+cudaError_t launch_exit_kernel(ncclWindow_t window, const ncclDevComm &dev, const Sizes &sizes,
+                               uint64_t limit_ns) {
+  exit_kernel<<<1, 32>>>(window, dev, sizes, limit_ns);
   return cudaGetLastError();
 }
 
@@ -237,10 +231,10 @@ HierOutputDist::HierOutputDist(const std::string &unique_id, Config config)
     give_up(false);
     throw;
   }
-  channel_static_ =
-      channel_static(sizes_, window_->handle(), communicator_->dev(), config_.timeout_s);
-  in_ = std::make_unique<InChannel>(config_, sizes_, channel_static_, window_->layout(), device_);
-  out_ = std::make_unique<OutChannel>(config_, sizes_, channel_static_, window_->layout(), device_);
+  in_ = std::make_unique<InChannel>(config_, sizes_, window_->handle(), communicator_->dev(),
+                                    window_->layout(), device_);
+  out_ = std::make_unique<OutChannel>(config_, sizes_, window_->handle(), communicator_->dev(),
+                                      window_->layout(), device_);
 }
 
 HierOutputDist::~HierOutputDist() { release(); }
@@ -249,7 +243,8 @@ HierOutputDist::~HierOutputDist() { release(); }
 // within the limit.
 bool HierOutputDist::exit_round() noexcept {
   const double limit_s = std::min(config_.timeout_s, 30.0);
-  cudaError_t err = launch_exit_kernel(channel_static_, (uint64_t)(limit_s * 1e9));
+  cudaError_t err = launch_exit_kernel(window_->handle(), communicator_->dev(), sizes_,
+                                       (uint64_t)(limit_s * 1e9));
   if (err == cudaSuccess) err = cudaDeviceSynchronize();
   uint64_t closed = 0;
   if (err == cudaSuccess)

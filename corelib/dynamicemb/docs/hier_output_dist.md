@@ -786,13 +786,16 @@ buffer or control word, which returns its address in the copy at that base
 (`keys.node_keys()`, `rows.proxy_row(slot)`,
 `ctrl.done(requester, parity)`), so no other code computes where a buffer
 or a word is. The host lays out its copy to size the window and to view its
-buffers as tensors. A kernel's argument carries the sizes, the window and
-the device communicator (`ChannelStatic`), and the kernel lays out this
-rank's copy as the node's GPUs map it (`NodeWindow`). A place has the same
-offset in every rank's copy: `NodeWindow::peer(pointer, peer)` gives a node
-peer's copy of the place a pointer names in this rank's copy, and a GIN put
-to a rail peer takes pointers into this rank's copy for both of its ends
-(`rail_put`, `RowPut`, `RailMessage`).
+buffers as tensors. Each kernel of the op takes the window, the sizes and,
+when it uses GIN, the device communicator, each as a parameter of its own;
+a kernel that waits for peers also takes its sequence number. The kernel
+lays out this rank's copy as the node's GPUs map it (`NodeWindow`). The
+sizes, the window and the communicator stay in the op's C++ classes:
+Python never sees them. A place has the same offset in every rank's copy:
+`NodeWindow::peer(pointer, peer)` gives a node peer's copy of the place a
+pointer names in this rank's copy, and a GIN put to a rail peer takes
+pointers into this rank's copy for both of its ends (`rail_put`, `RowPut`,
+`RailMessage`).
 
 ## 8. The path and rail alignment
 
@@ -1204,9 +1207,12 @@ stream: the forward kernel `fwd_kernel` and the backward kernel
   `grant_sent`, ...). Every kernel ends by sending the credits for the next
   out kernel (GIN context 3) and flushing them. So no credit is in flight
   once a kernel has ended.
+* **Arguments.** Each out kernel takes the op's window, its GIN device
+  communicator and its sizes, its `out_seq` and the `arrive` word before
+  it, and its call (`FwdArgs`, `BwdArgs`): the call's plan and tensors.
 * **Tables.** The kernels read the call's tables from global memory,
-  through typed pointers in their argument: the forward's plan as it reads
-  it (`FwdPlanView`, in `FwdArgs`) and the backward's (`BwdPlanView`, in
+  through typed pointers in the call: the forward's plan as it reads it
+  (`FwdPlanView`, in `FwdArgs`) and the backward's (`BwdPlanView`, in
   `BwdArgs`). Each table is a tensor of a plan. Both read the requester's
   block starts and maps, and across nodes its push order and its tables of
   the node's proxies (`proxy_rounds`, `push_tables`), the proxy's rounds and
@@ -1216,14 +1222,15 @@ stream: the forward kernel `fwd_kernel` and the backward kernel
   reads its `dst`, its heavy groups and `bwd_task_starts`, the owner's
   `uniq_in`, and the proxy's `num_chunks`, `uniq_off`, `round_table`,
   `bwd_put_start`, `reduce_task_starts` and its reducer list. Their strides
-  are `rounds_cap` and `num_nodes`. Each kernel's argument also holds what
-  the op gives it for the call: the forward's output, the backward's
-  gradient and its scratch (the heavy rows' sums and counts), and across
-  nodes the counts the kernel zeroes (`ready`). The forward's plan goes once
-  its kernel is queued; autograd keeps the backward's (section 7.4).
+  are `rounds_cap` and `num_nodes`. The call also holds what the op gives
+  the kernel for it: the forward's output, the backward's gradient and its
+  scratch (the heavy rows' sums and counts), across nodes the counts the
+  kernel zeroes (`ready`), and the kernel's row of the trace. The forward's
+  plan goes once its kernel is queued; autograd keeps the backward's
+  (section 7.4).
 * **The window.** A kernel lays out this rank's copy of the window from the
-  sizes in its argument (section 7.5), and names each buffer and control
-  word by its accessor: in this rank's copy, or in a node peer's through
+  sizes (section 7.5), and names each buffer and control word by its
+  accessor: in this rank's copy, or in a node peer's through
   `NodeWindow::peer`. The one per-peer array in shared memory is the
   backward's `half_seen`, sized at launch by `local_size`.
 
@@ -1814,14 +1821,12 @@ Paths from `corelib/dynamicemb`.
       (`sizes_of`);
     * `window.h`: the window's layout (`WindowLayout`) over its sections:
       `CtrlLayout` (with the formats of the count vector and the count
-      message, and a channel's sequence number), `KeysLayout` (with
-      `ProxyHeader`, `RemoteMap` and what `peer_gather` reads) and
-      `RowsLayout`;
+      message), `KeysLayout` (with `ProxyHeader`, `RemoteMap` and what
+      `peer_gather` reads) and `RowsLayout`;
     * `device.cuh`: the kernels' building blocks: loads, stores and fences
       with a memory order, bounded waits, warp and CTA helpers, a search, row
-      vectors, the window as the node's GPUs map it (`NodeWindow`), what the
-      kernels of both channels take (`ChannelStatic`), the syncs on its
-      control words (`NodeBarrier`, `PeerFlags`), and GIN on the rail
+      vectors, the window as the node's GPUs map it (`NodeWindow`), the syncs
+      on its control words (`NodeBarrier`, `PeerFlags`), and GIN on the rail
       (`rail_put`, `RowPut`, `RailMessage`, `Credits`);
   * `input_dist/`, the input dist:
     * `input_dist.h`, `input_dist.cu`: the data of a call's steps
@@ -1843,8 +1848,8 @@ Paths from `corelib/dynamicemb`.
     * `output_dist.h`, `output_dist.cu`: the out channel (`OutChannel`),
       which launches the out kernels, and their trace (`Trace`).
       `output_dist.cu` is the one file that compiles the out kernels;
-    * `args.cuh`: the out kernels' arguments: what both take (`OutArgs`), and
-      each one's own with its plan (`FwdArgs`, `BwdArgs`);
+    * `args.cuh`: the call each out kernel takes, its plan and its tensors
+      (`FwdArgs`, `BwdArgs`);
     * `out_kernels.cuh`: what both out kernels share (their timeline, the
       call's tables as a requester's warps read them, their task schedule
       and their protocol); `forward.cuh` and `backward.cuh`: the forward and

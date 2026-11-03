@@ -92,10 +92,11 @@ struct InDistResult {
 // planner's steps (planner.h) lay the call out between them.
 class InChannel {
  public:
-  // channel: the part of the kernels' arguments both channels share, over
-  // the registered window; window: the window over this rank's copy.
-  InChannel(const Config &config, const Sizes &sizes, const ChannelStatic &channel,
-            const WindowLayout &window, int device);
+  // window and dev: the op's registered window and its GIN device
+  // communicator, which the comm kernels take; layout: the window over this
+  // rank's copy.
+  InChannel(const Config &config, const Sizes &sizes, ncclWindow_t window, const ncclDevComm &dev,
+            const WindowLayout &layout, int device);
 
   // Part 1 of a call. Local: no sync, no collective, no sequence number, so
   // the caller may drop it.
@@ -110,7 +111,8 @@ class InChannel {
   InDistResult wait(const Pending &pending) const;
 
  private:
-  ChannelStatic channel_;
+  ncclWindow_t window_;
+  ncclDevComm dev_;
   Sizes sizes_;
   OwnerRules rules_;  // part 1's
   bool weights_, node_dedup_;
@@ -132,48 +134,49 @@ class InChannel {
   PeerWords header_gather_;
 };
 
-// The comm kernels (comm_kernels.cu), on the current stream at call seq;
-// each allocates its outputs there.
+// The comm kernels (comm_kernels.cu), on the current stream, over the op's
+// window (and on the rail its GIN device communicator) at call seq; each
+// allocates its outputs there.
 
 // The node barrier, and the node's count vectors (int64): their sum over the
 // node and over the ranks before this one ([my_counts.numel()] each), and
 // each requester's counts for this rank ([local_size][num_features + 1]),
 // as planner.h's NodeCounts.
 std::tuple<at::Tensor, at::Tensor, at::Tensor> launch_node_count_exchange(
-    const ChannelStatic &channel, int64_t seq, const at::Tensor &my_counts);
+    ncclWindow_t window, const Sizes &sizes, int64_t seq, const at::Tensor &my_counts);
 // This rank's first *rows_to_push rows of part 1 (keys, weights or undefined,
 // row_cell) into its targets' node_keys at destination_base[cell] + row.
-void launch_node_key_push(const ChannelStatic &channel, const at::Tensor &keys,
+void launch_node_key_push(ncclWindow_t window, const Sizes &sizes, const at::Tensor &keys,
                           const at::Tensor &weights, const at::Tensor &row_cell,
                           const at::Tensor &destination_base, const at::Tensor &rows_to_push);
 // Tells the node this rank's keys are pushed, and waits until every
 // requester of the node told it.
-void launch_node_done(const ChannelStatic &channel, int64_t seq);
+void launch_node_done(ncclWindow_t window, const Sizes &sizes, int64_t seq);
 // Sends each rail peer its count message (message: CountMessage::out_words,
 // the common part and the part for each node); returns the messages this
 // rank got, int64 [num_nodes][CountMessage::length].
-at::Tensor launch_rail_count_exchange(const ChannelStatic &channel, int64_t seq,
-                                      const at::Tensor &message);
+at::Tensor launch_rail_count_exchange(ncclWindow_t window, const ncclDevComm &dev,
+                                      const Sizes &sizes, int64_t seq, const at::Tensor &message);
 // Puts this proxy's key_stage slices into its rail owners' rail_keys (each
 // [num_nodes], int64 but put_skip) and its cell_stage rows into its rail
 // proxies' rail_cells, and waits for the other nodes' key streams.
-void launch_rail_key_exchange(const ChannelStatic &channel, int64_t seq, const at::Tensor &put_src,
-                              const at::Tensor &put_dst, const at::Tensor &put_bytes,
-                              const at::Tensor &put_skip);
+void launch_rail_key_exchange(ncclWindow_t window, const ncclDevComm &dev, const Sizes &sizes,
+                              int64_t seq, const at::Tensor &put_src, const at::Tensor &put_dst,
+                              const at::Tensor &put_bytes, const at::Tensor &put_skip);
 // Publishes this rank's needs and cell starts to its node (publish, int64
 // [kNumNeeds + local_size * num_features]); returns every node peer's needs
 // (int64 [local_size][kNumNeeds]) and where each one's KJT holds this
 // requester's cells (int64 [local_size][num_features]).
-std::pair<at::Tensor, at::Tensor> launch_node_status_exchange(const ChannelStatic &channel,
-                                                              int64_t seq,
+std::pair<at::Tensor, at::Tensor> launch_node_status_exchange(ncclWindow_t window,
+                                                              const Sizes &sizes, int64_t seq,
                                                               const at::Tensor &publish);
 // Words of the node peers' `from` (GatherFrom), int32 [words][items]: item i
 // reads node peer peer[i]'s word first_word[i] of its proxy header (1 word),
 // or entry first_word[i] of each array of its remote_map (RemoteMap::kArrays
 // words), word k into [k][i]; an item of a negative peer keeps what the
 // allocation held.
-at::Tensor launch_peer_gather(const ChannelStatic &channel, GatherFrom from, const at::Tensor &peer,
-                              const at::Tensor &first_word);
+at::Tensor launch_peer_gather(ncclWindow_t window, const Sizes &sizes, GatherFrom from,
+                              const at::Tensor &peer, const at::Tensor &first_word);
 
 }  // namespace hier_output_dist
 }  // namespace dyn_emb

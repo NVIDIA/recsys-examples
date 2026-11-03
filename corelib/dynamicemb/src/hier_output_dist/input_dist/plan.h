@@ -128,6 +128,9 @@ struct BwdPlanView : PlanView {
                                       // owner nodes, times the tasks of a chunk (32 keys each)
   const int32_t *reducer_start;       // the reducer list (planner.h)
   const int64_t *reducer_entries;
+  // the plan's counts (BwdPlan)
+  int64_t heavy_subs;  // index dedup: sub-tasks of the requester's heavy rows
+  int64_t group_subs;  // across nodes: sub-tasks of its heavy groups
 
   // Where an owner node's node-unique keys of a round sit in this proxy's
   // proxy_rows, and their first IB chunk.

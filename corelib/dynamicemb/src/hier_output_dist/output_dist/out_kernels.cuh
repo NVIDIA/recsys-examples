@@ -32,14 +32,15 @@ namespace hier_output_dist {
 // stamps, counters and bins, which each CTA keeps in shared memory and folds
 // into the kernel's row. Without kTrace it compiles away.
 
-// The timeline of an out kernel: its row (args.trace, nullptr without
-// kTrace) and the CTA's shared copy (TraceSmSlots, in the kernel's dynamic
-// shared memory after half_seen, out_shared). Stamps check on() themselves;
-// the rest is for when it is on. Each member does its work only with kTrace.
+// The timeline of an out kernel: its row (`trace`, the call's args.trace,
+// nullptr without kTrace) and the CTA's shared copy (TraceSmSlots, in the
+// kernel's dynamic shared memory after half_seen, out_shared). Stamps check
+// on() themselves; the rest is for when it is on. Each member does its work
+// only with kTrace.
 struct OutTimeline {
-  const OutArgs &args;
-  __device__ __forceinline__ explicit OutTimeline(const OutArgs &out_args) : args(out_args) {}
-  __device__ __forceinline__ bool on() const { return kTrace && args.trace != nullptr; }
+  unsigned long long *trace;
+  int local_size;  // half_seen's words, before the shared copy
+  __device__ __forceinline__ bool on() const { return kTrace && trace != nullptr; }
 
   // One thread: `slot` keeps the earliest (or the latest) time any CTA
   // stamps it with.
@@ -48,14 +49,14 @@ struct OutTimeline {
 
   // The CTA's shared copy.
   __device__ __forceinline__ unsigned long long *shared() const {
-    return out_shared() + args.topo.local_size;
+    return out_shared() + local_size;
   }
   // At the top of the kernel, every thread of the CTA (on() is the same for
   // all): the CTA's start, the kernel's first and last CTA start, and the
   // shared copy set to its start values.
   __device__ __forceinline__ void begin_cta() const {
     if constexpr (kTrace) {
-      if (args.trace == nullptr) return;
+      if (trace == nullptr) return;
       unsigned long long *sm = shared();
       for (int i = threadIdx.x; i < kTraceSmWords; i += blockDim.x)
         sm[i] = i == kSmNvFirst || i == kSmFirstLanded ? ~0ull : 0ull;
@@ -63,8 +64,8 @@ struct OutTimeline {
       if (threadIdx.x == 0) {
         const unsigned long long now = now_ns();
         sm[kSmStart] = now;
-        atomicMin(args.trace + kTraceStart, now);
-        atomicMax(args.trace + kTraceStartLast, now);
+        atomicMin(trace + kTraceStart, now);
+        atomicMax(trace + kTraceStartLast, now);
       }
       __syncthreads();
     }
@@ -100,9 +101,9 @@ struct OutTimeline {
   __device__ __forceinline__ void landed_late(unsigned long long rows, bool first) const {
     if constexpr (kTrace) {
       const unsigned long long now = now_ns();
-      if (first) atomicMin(args.trace + kTraceFirstLanded, now);
-      atomicAdd(args.trace + kTraceIbIn, rows);
-      add(args.trace + kTraceBinNv, 1, now, rows);
+      if (first) atomicMin(trace + kTraceFirstLanded, now);
+      atomicAdd(trace + kTraceIbIn, rows);
+      add(trace + kTraceBinNv, 1, now, rows);
     }
   }
   // Rows put to another node (`rows` more).
@@ -118,7 +119,7 @@ struct OutTimeline {
   __device__ __forceinline__ void fold_cta() const {
     if constexpr (kTrace) {
       const unsigned long long *sm = shared();
-      unsigned long long *row = args.trace;
+      unsigned long long *row = trace;
       if (threadIdx.x == 0) {
         if (sm[kSmNvFirst] != ~0ull) atomicMin(row + kTraceNvFirst, sm[kSmNvFirst]);
         if (sm[kSmFirstLanded] != ~0ull) atomicMin(row + kTraceFirstLanded, sm[kSmFirstLanded]);
@@ -138,12 +139,12 @@ struct OutTimeline {
  private:
   __device__ __forceinline__ void stamp(int slot, bool earliest) const {
     if constexpr (kTrace) {
-      if (args.trace == nullptr) return;
+      if (trace == nullptr) return;
       const unsigned long long now = now_ns();
       if (earliest)
-        atomicMin(args.trace + slot, now);
+        atomicMin(trace + slot, now);
       else
-        atomicMax(args.trace + slot, now);
+        atomicMax(trace + slot, now);
     }
   }
   // Timeline `which` (0: NVLink bytes, 1: rows landed, 2: rows posted) of
@@ -167,23 +168,20 @@ struct OutTimeline {
 // (layout()). The one word per proxy a CTA keeps, half_seen, is in its
 // shared memory. Every thread of a warp makes the same one.
 struct OutTables {
-  const OutArgs &args;
+  const Sizes &sizes;
   const PlanView &plan;
   NodeWindow node;
   int max_rounds;  // the most rounds of the node's proxies (1 on one node)
   bool staged;     // index dedup's heavy rows at a proxy of more than one round
 
-  __device__ OutTables(const OutArgs &out_args, const PlanView &call_plan)
-      : args(out_args),
-        plan(call_plan),
-        node(out_args.window, out_args.topo.local_rank),
-        max_rounds(1) {
-    if (args.topo.num_nodes > 1)
-      for (int proxy = 0; proxy < args.topo.local_size; ++proxy)
+  __device__ OutTables(ncclWindow_t window, const Sizes &op_sizes, const PlanView &call_plan)
+      : sizes(op_sizes), plan(call_plan), node(window, op_sizes.topo.local_rank), max_rounds(1) {
+    if (sizes.topo.num_nodes > 1)
+      for (int proxy = 0; proxy < sizes.topo.local_size; ++proxy)
         max_rounds = max(max_rounds, rounds(proxy));
     staged = plan.fanout.exp_off != nullptr && max_rounds > 1 && plan.fanout.count[1] > 0;
   }
-  __device__ __forceinline__ WindowLayout layout() const { return node.layout(args); }
+  __device__ __forceinline__ WindowLayout layout() const { return node.layout(sizes); }
   // A same-node proxy's rounds.
   __device__ __forceinline__ int rounds(int proxy) const { return (int)plan.proxy_rounds[proxy]; }
   // Node peers' buffers and words.
@@ -209,7 +207,7 @@ struct OutTables {
   }
   // This rank's done word at a proxy, of round rnd's parity.
   __device__ __forceinline__ uint64_t *done(int proxy, int rnd) const {
-    return node.peer(layout().ctrl.done(args.topo.local_rank, rnd & 1), proxy);
+    return node.peer(layout().ctrl.done(sizes.topo.local_rank, rnd & 1), proxy);
   }
   __device__ __forceinline__ const uint64_t *half_free(int proxy) const {
     return node.peer(layout().ctrl.half_free(), proxy);
@@ -228,7 +226,7 @@ struct OutTables {
   }
   // The owner of one of this rank's rows (its bucketized rows by owner).
   __device__ __forceinline__ int owner_of(int64_t row) const {
-    return seg_search(plan.block_start, args.topo.world_size, row);
+    return seg_search(plan.block_start, sizes.topo.world_size, row);
   }
 };
 
@@ -236,26 +234,19 @@ struct OutTables {
 // tasks of the node's owners and sub-tasks spread among them, and a warp's
 // place in tasks laid out round after round.
 
-// Task queue `queue` of the out kernel (a task word of the ctrl section): its warps take the
-// tasks in order, one at a time; the last CTA sets every queue back to 0 for
-// the next kernel.
+// A task queue of the out kernel (`word`, its task word in this rank's ctrl
+// section, CtrlLayout::task): its warps take the tasks in order, one at a
+// time; the last CTA sets every queue back to 0 for the next kernel.
 struct TaskQueue {
-  const OutArgs &args;
-  int queue;
-  __device__ __forceinline__ TaskQueue(const OutArgs &out_args, int which)
-      : args(out_args), queue(which) {}
+  uint64_t *word;
   // Every lane of the warp: the warp's next task.
   __device__ __forceinline__ int64_t next_warp() const {
     int64_t task = 0;
-    if ((threadIdx.x & 31) == 0) {
-      const NodeWindow node(args.window, args.topo.local_rank);
-      task = (int64_t)atomicAdd((unsigned long long *)node.layout(args).ctrl.task(queue), 1ull);
-    }
+    if ((threadIdx.x & 31) == 0) task = (int64_t)atomicAdd((unsigned long long *)word, 1ull);
     return __shfl_sync(kFull, task, 0);
   }
   // One thread of the last CTA, once every other CTA has taken its last task.
-  __device__ __forceinline__ static void reset_all(const OutArgs &args) {
-    const CtrlLayout ctrl = NodeWindow(args.window, args.topo.local_rank).layout(args).ctrl;
+  __device__ __forceinline__ static void reset_all(const CtrlLayout &ctrl) {
     for (int queue = 0; queue < kNumQueues; ++queue) *ctrl.task(queue) = 0;
   }
 };
@@ -369,11 +360,14 @@ struct FwdCursor {
 // and what CTA 0 reset for this kernel; every CTA then waits until all node
 // peers have published theirs. A peer there has ended its lookup (which wrote
 // its lookup_rows before the kernel) and every earlier out kernel. Every
-// thread of threads [0, threads) (cta_sync), in every CTA.
-__device__ __forceinline__ void pass_entry_barrier(const OutArgs &args, int threads) {
-  const int tid = threadIdx.x, local_size = args.topo.local_size;
-  const NodeWindow node(args.window, args.topo.local_rank);
-  const NodeBarrier<OutArgs> barrier(args, node, node.layout(args).ctrl.out_started());
+// thread of threads [0, threads) (cta_sync), in every CTA; seq is the
+// kernel's out_seq.
+__device__ __forceinline__ void pass_entry_barrier(ncclWindow_t window, const Sizes &sizes,
+                                                   int64_t seq, const OutTimeline &timeline,
+                                                   int threads) {
+  const int tid = threadIdx.x, local_size = sizes.topo.local_size;
+  const NodeWindow node(window, sizes.topo.local_rank);
+  const NodeBarrier barrier{sizes, node, node.layout(sizes).ctrl.out_started(), seq};
   if (blockIdx.x == 0 && tid == 0) {
     fence_sc_sys();
     barrier.publish();
@@ -382,7 +376,6 @@ __device__ __forceinline__ void pass_entry_barrier(const OutArgs &args, int thre
     barrier.wait(peer, "out-channel node barrier");
   cta_sync(threads);
   if (tid == 0) {
-    const OutTimeline timeline(args);
     timeline.stamp_earliest(kTraceEnterFirst);
     timeline.stamp_latest(kTraceEntered);
   }
@@ -390,20 +383,21 @@ __device__ __forceinline__ void pass_entry_barrier(const OutArgs &args, int thre
 
 // The end of a CTA of an out kernel: each CTA arrives once in its arrive word, a
 // running total over the rank's out kernels (so nothing is reset), and the
-// one whose arrival brings it to arrive0 + gridDim.x is this kernel's last.
-// Everything a CTA wrote and every load it made are ordered before its
-// arrival, so the last CTA sees everything the others did. Every thread of
-// the CTA (tracing: the CTA first folds its shared copy of the timeline into
-// the kernel's row). Returns, to every thread, whether this CTA is the last.
-__device__ __forceinline__ bool arrive_cta(const OutArgs &args) {
-  const int64_t target = args.arrive0 + gridDim.x;
+// one whose arrival brings it to arrive0 (the word before this kernel) +
+// gridDim.x is this kernel's last. Everything a CTA wrote and every load it
+// made are ordered before its arrival, so the last CTA sees everything the
+// others did. Every thread of the CTA (tracing: the CTA first folds its
+// shared copy of the timeline into the kernel's row). Returns, to every
+// thread, whether this CTA is the last.
+__device__ __forceinline__ bool arrive_cta(ncclWindow_t window, const Sizes &sizes, int64_t arrive0,
+                                           const OutTimeline &timeline) {
+  const int64_t target = arrive0 + gridDim.x;
   __shared__ int last;
   __syncthreads();
-  const OutTimeline timeline(args);
   if (timeline.on()) timeline.fold_cta();
   if (threadIdx.x == 0) {
     fence_sc_sys();
-    uint64_t *word = NodeWindow(args.window, args.topo.local_rank).layout(args).ctrl.arrive();
+    uint64_t *word = NodeWindow(window, sizes.topo.local_rank).layout(sizes).ctrl.arrive();
     last = (int64_t)atomicAdd((unsigned long long *)word, 1ull) + 1 == target;
     if (last) fence_sc_sys();
   }

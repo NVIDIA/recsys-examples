@@ -167,20 +167,21 @@ struct Pull {
 // the node-unique keys of `owner_node` in that proxy's proxy_rows (src: its
 // row there, in `piece` of its round). The warp waits until the proxy's
 // relay says every such row of the warp has landed (an owner node's rows land
-// in the order of its node-unique keys, round after round). Every lane of
-// the warp.
-__device__ __forceinline__ void wait_landed_warp(const FwdArgs &args, const OutTables &tables,
-                                                 int proxy, bool live, int owner_node,
-                                                 const RoundPiece &piece, int32_t src, int lane) {
+// in the order of its node-unique keys, round after round) in forward seq.
+// Every lane of the warp.
+__device__ __forceinline__ void wait_landed_warp(const Sizes &sizes, int64_t seq,
+                                                 const OutTables &tables, int proxy, bool live,
+                                                 int owner_node, const RoundPiece &piece,
+                                                 int32_t src, int lane) {
   const unsigned on = __ballot_sync(kFull, live);
   if (live) {
     const unsigned peers = __match_any_sync(on, owner_node);
     const int need = __reduce_max_sync(peers, (unsigned)(src - piece.off + piece.uniq_lo + 1));
     if (lane == __ffs(peers) - 1) {
-      const uint64_t want = LandedRows::of(args.ch.seq, need);
-      Spin spin(args.timeout_ns);
+      const uint64_t want = LandedRows::of(seq, need);
+      Spin spin(sizes.timeout_ns);
       while (ld_acquire_sys(tables.landed_rows(proxy, owner_node)) < want)
-        spin.pause("rows landed at a proxy", proxy, need, args.topo.rank);
+        spin.pause("rows landed at a proxy", proxy, need, sizes.topo.rank);
     }
   }
   __syncwarp();
@@ -198,18 +199,18 @@ __device__ __forceinline__ void wait_landed_warp(const FwdArgs &args, const OutT
 // from that proxy is in (ready[rail]) the sub-task copies it on from there
 // (staged). Every lane of the warp.
 template <bool kMulti>
-__device__ void heavy_sub_warp(const FwdArgs &args, const OutTables &tables, int64_t sub, bool late,
-                               int lane) {
+__device__ void heavy_sub_warp(const Sizes &sizes, int64_t seq, const FwdArgs &args,
+                               const OutTables &tables, int64_t sub, bool late, int lane) {
   const FwdPlanView &plan = args.plan;
   const Fanout &fanout = plan.fanout;
-  const int local_size = args.topo.local_size, row_bytes = args.row_bytes;
+  const int local_size = sizes.topo.local_size, row_bytes = sizes.row_bytes;
   const int64_t dedup_row = fanout.sub[2 * sub], first = fanout.exp_off[dedup_row];
   const int64_t begin = fanout.sub[2 * sub + 1],
                 end = min(begin + kHeavy, (int64_t)fanout.exp_off[dedup_row + 1]);
   const int32_t row = fanout.pos[fanout.slot[dedup_row]];
   const int owner = tables.owner_of(row), rail = owner % local_size,
             owner_node = owner / local_size;
-  const bool remote = kMulti && owner_node != args.topo.node,
+  const bool remote = kMulti && owner_node != sizes.topo.node,
              staged = remote && tables.rounds(rail) > 1;
   if (remote != late) return;
   const char *src =
@@ -217,24 +218,24 @@ __device__ void heavy_sub_warp(const FwdArgs &args, const OutTables &tables, int
   int64_t from = begin;
   if (staged) {
     if (lane == 0) {
-      Spin spin(args.timeout_ns);
+      Spin spin(sizes.timeout_ns);
       while ((int64_t)ld_acquire_gpu((const uint64_t *)&args.ready[rail]) <
              plan.push_order_off[rail + 1] - plan.push_order_off[rail])
-        spin.pause("rows pulled from a proxy", rail, dedup_row, args.topo.rank);
+        spin.pause("rows pulled from a proxy", rail, dedup_row, sizes.topo.rank);
     }
     __syncwarp();
     src = args.out + (int64_t)fanout.exp_idx[first] * row_bytes;
     from = max(begin, first + 1);
   } else if (remote) {
-    wait_landed_warp(args, tables, rail, lane == 0, owner_node, plan.piece(rail, 0, owner_node),
-                     plan.src[row], lane);
+    wait_landed_warp(sizes, seq, tables, rail, lane == 0, owner_node,
+                     plan.piece(rail, 0, owner_node), plan.src[row], lane);
   }
-  const OutTimeline timeline(args);
+  const OutTimeline timeline{args.trace, local_size};
   const unsigned long long start = timeline.on() ? now_ns() : 0;
-  fanout_row(src, from, end, args.vec, lane, fanout.exp_idx, args.out, row_bytes);
+  fanout_row(src, from, end, sizes.row_vecs(), lane, fanout.exp_idx, args.out, row_bytes);
   if (timeline.on() && !staged && lane == 0) {
     // the row is read once, from a node peer's window or this rank's own
-    const bool peer = rail != args.topo.local_rank;
+    const bool peer = rail != sizes.topo.local_rank;
     timeline.task(start, peer ? row_bytes : 0, peer ? 0 : row_bytes);
   }
 }
@@ -265,11 +266,12 @@ __device__ __forceinline__ bool local_pull(const FwdArgs &args, const OutTables 
 // turn from this rank's own one, its rows of this rank's push order there,
 // once they have landed. False when there is nothing to pull. Every lane of
 // the warp.
-__device__ __forceinline__ bool remote_pull_warp(const FwdArgs &args, const OutTables &tables,
+__device__ __forceinline__ bool remote_pull_warp(const Sizes &sizes, int64_t seq,
+                                                 const FwdArgs &args, const OutTables &tables,
                                                  const FwdCursor &cursor, int64_t task, int lane,
                                                  Pull &pull) {
   const FwdPlanView &plan = args.plan;
-  const int local_size = args.topo.local_size, me = args.topo.local_rank;
+  const int local_size = sizes.topo.local_size, me = sizes.topo.local_rank;
   const char *src = nullptr;
   int64_t out_row = 0;
   bool shared = false;
@@ -303,7 +305,7 @@ __device__ __forceinline__ bool remote_pull_warp(const FwdArgs &args, const OutT
     src = tables.proxy_row(proxy, at);
     out_row = plan.inv[row];
   }
-  wait_landed_warp(args, tables, proxy, lane < num_rows, owner_node, piece, at, lane);
+  wait_landed_warp(sizes, seq, tables, proxy, lane < num_rows, owner_node, piece, at, lane);
   pull.src = src;
   pull.out_row = out_row;
   pull.num_rows = num_rows;
@@ -316,26 +318,26 @@ __device__ __forceinline__ bool remote_pull_warp(const FwdArgs &args, const OutT
 
 // Every lane of the warp: the task's rows into the output; at a proxy of
 // more than one round, counted pulled; and the task into the timeline.
-__device__ __forceinline__ void pull_warp(const FwdArgs &args, const OutTables &tables,
-                                          const Pull &pull, int lane) {
+__device__ __forceinline__ void pull_warp(const Sizes &sizes, const FwdArgs &args,
+                                          const OutTables &tables, const Pull &pull, int lane) {
   const FwdPlanView &plan = args.plan;
   const Fanout &fanout = plan.fanout;
-  const int me = args.topo.local_rank, row_bytes = args.row_bytes;
+  const int me = sizes.topo.local_rank, row_bytes = sizes.row_bytes, vec = sizes.row_vecs();
   const char *src = pull.src;
   const int64_t out_row = pull.out_row;
   const int num_rows = pull.num_rows, rnd = pull.rnd, peer = pull.peer;
   const bool shared = pull.shared, count = pull.count;
-  const OutTimeline timeline(args);
+  const OutTimeline timeline{args.trace, sizes.topo.local_size};
   const unsigned long long start = timeline.on() ? now_ns() : 0;
   if (fanout.exp_off != nullptr) {
-    warp_copy_fanout(src, out_row, num_rows, args.vec, lane, fanout, args.out, row_bytes, count);
+    warp_copy_fanout(src, out_row, num_rows, vec, lane, fanout, args.out, row_bytes, count);
   } else {
     char *dst = nullptr;
     if (lane < num_rows) dst = args.out + out_row * row_bytes;
     if (shared)
-      warp_copy_shared(src, dst, num_rows, args.vec, lane);
+      warp_copy_shared(src, dst, num_rows, vec, lane);
     else
-      warp_copy_rows(src, dst, num_rows, args.vec, lane);
+      warp_copy_rows(src, dst, num_rows, vec, lane);
   }
   if (count) {
     // The task's rows are out of proxy_rows (the warp's loads, before the
@@ -391,23 +393,25 @@ namespace fwd {
 // What it keeps of an owner node between polls is in this rank's words: the
 // rows it published (landed_rows, tagged with this out_seq) and fwd_tot.
 struct ProxyRelay {
-  // Every lane of the relay warp.
-  __device__ static void run(const FwdArgs &args);
+  // Every lane of the relay warp, in forward seq.
+  __device__ static void run(ncclWindow_t window, const ncclDevComm &dev, const Sizes &sizes,
+                             int64_t seq, const FwdArgs &args);
 };
 
-__device__ void ProxyRelay::run(const FwdArgs &args) {
-  const int lane = threadIdx.x & 31, num_nodes = args.topo.num_nodes, node = args.topo.node,
-            local_size = args.topo.local_size;
-  const WindowLayout window = NodeWindow(args.window, args.topo.local_rank).layout(args);
-  ncclGin rows(args.dev, kCtxFwd), cred(args.dev, kCtxCredit);
-  const ncclTeam rail = ncclTeamRail(args.dev);
+__device__ void ProxyRelay::run(ncclWindow_t window, const ncclDevComm &dev, const Sizes &sizes,
+                                int64_t seq, const FwdArgs &args) {
+  const int lane = threadIdx.x & 31, num_nodes = sizes.topo.num_nodes, node = sizes.topo.node,
+            local_size = sizes.topo.local_size;
+  const CtrlLayout ctrl = NodeWindow(window, sizes.topo.local_rank).layout(sizes).ctrl;
+  ncclGin rows(dev, kCtxFwd), cred(dev, kCtxCredit);
+  const ncclTeam rail = ncclTeamRail(dev);
   const Credits credits(cred, rail);
-  const OutTimeline timeline(args);
+  const OutTimeline timeline{args.trace, local_size};
   auto grant = [&](int rounds) {  // rounds [0, rounds) to every rail owner of the lane
     for (int owner_node = lane; owner_node < num_nodes; owner_node += 32)
       if (owner_node != node)
-        credits.raise(owner_node, sig_grant(node), grant_of(args.ch.seq, rounds),
-                      window.ctrl.grant_sent(owner_node));
+        credits.raise(owner_node, sig_grant(node), grant_of(seq, rounds),
+                      ctrl.grant_sent(owner_node));
   };
   grant(2);
   const int num_rounds = (int)*args.plan.num_rounds;
@@ -419,26 +423,23 @@ __device__ void ProxyRelay::run(const FwdArgs &args) {
   if (num_rounds > 1)
     for (int requester = lane; requester < local_size; requester += 32)
       for (int half = 0; half < 2; ++half)
-        *window.ctrl.relay_want(requester, half) =
-            ld_acquire_sys(window.ctrl.done(requester, half));
+        *ctrl.relay_want(requester, half) = ld_acquire_sys(ctrl.done(requester, half));
   __syncwarp();
   int next = 0;  // rounds every requester has pulled
-  Spin spin(args.timeout_ns);
+  Spin spin(sizes.timeout_ns);
   for (;;) {
     bool moved = false, landed = true;  // every row of the lane's owner nodes has landed
     // the rows of each owner node that landed, when that changed
     for (int owner_node = lane; owner_node < num_nodes; owner_node += 32) {
       if (owner_node == node) continue;
       const int64_t num_uniq = args.plan.uniq_out[owner_node];
-      const uint64_t word = *window.ctrl.landed_rows(owner_node);
-      const int64_t seen =
-          LandedRows::tag(word) == args.ch.seq ? (int64_t)LandedRows::payload(word) : -1;
+      const uint64_t word = *ctrl.landed_rows(owner_node);
+      const int64_t seen = LandedRows::tag(word) == seq ? (int64_t)LandedRows::payload(word) : -1;
       if (seen == num_uniq) continue;
-      const int64_t got =
-          min((int64_t)(rows.readSignal(sig_rows(owner_node)) - *window.ctrl.fwd_tot(owner_node)),
-              num_uniq);
+      const int64_t got = min(
+          (int64_t)(rows.readSignal(sig_rows(owner_node)) - *ctrl.fwd_tot(owner_node)), num_uniq);
       if (got != seen) {
-        LandedRows::publish(window.ctrl.landed_rows(owner_node), args.ch.seq, got);
+        LandedRows::publish(ctrl.landed_rows(owner_node), seq, got);
         moved = true;
         const int64_t counted = max(seen, (int64_t)0);  // what the timeline has
         if (timeline.on() && got > counted)
@@ -451,11 +452,11 @@ __device__ void ProxyRelay::run(const FwdArgs &args) {
       const int half = next & 1;
       bool in = true;
       for (int requester = lane; requester < local_size; requester += 32)
-        in = in && ld_acquire_sys(window.ctrl.done(requester, half)) >=
-                       *window.ctrl.relay_want(requester, half) + round_rows(requester, next);
+        in = in && ld_acquire_sys(ctrl.done(requester, half)) >=
+                       *ctrl.relay_want(requester, half) + round_rows(requester, next);
       if (!__all_sync(kFull, in)) break;
       for (int requester = lane; requester < local_size; requester += 32)
-        *window.ctrl.relay_want(requester, half) += round_rows(requester, next);
+        *ctrl.relay_want(requester, half) += round_rows(requester, next);
       ++next;
       grant(next + 2);
       moved = true;
@@ -463,11 +464,10 @@ __device__ void ProxyRelay::run(const FwdArgs &args) {
     if (__all_sync(kFull, landed)) break;
     // the warp polls again at once while any lane moved
     if (!__any_sync(kFull, moved))
-      spin.pause("rows of the owner nodes", next, lane, args.topo.rank);
+      spin.pause("rows of the owner nodes", next, lane, sizes.topo.rank);
   }
   for (int owner_node = lane; owner_node < num_nodes; owner_node += 32)
-    if (owner_node != node)
-      *window.ctrl.fwd_tot(owner_node) += (uint64_t)args.plan.uniq_out[owner_node];
+    if (owner_node != node) *ctrl.fwd_tot(owner_node) += (uint64_t)args.plan.uniq_out[owner_node];
   __syncwarp();
   if (lane == 0) timeline.stamp_latest(kTraceLanded);
   credits.flush_warp();  // the grants
@@ -484,44 +484,46 @@ __device__ void ProxyRelay::run(const FwdArgs &args) {
 // before the kernel: one system fence, then puts that make no release of
 // their own. No node barrier is needed first.
 struct OwnerIssuer {
-  // Every lane of the issuer warp.
-  __device__ static void run(const FwdArgs &args);
+  // Every lane of the issuer warp, in forward seq.
+  __device__ static void run(ncclWindow_t window, const ncclDevComm &dev, const Sizes &sizes,
+                             int64_t seq, const FwdArgs &args);
 };
 
-__device__ void OwnerIssuer::run(const FwdArgs &args) {
-  const int lane = threadIdx.x & 31, num_nodes = args.topo.num_nodes, node = args.topo.node;
-  ncclGin rows(args.dev, kCtxFwd), cred(args.dev, kCtxCredit);
-  const ncclTeam rail = ncclTeamRail(args.dev);
-  const OutTimeline timeline(args);
-  const NodeWindow node_window(args.window, args.topo.local_rank);
-  const WindowLayout window = node_window.layout(args);
+__device__ void OwnerIssuer::run(ncclWindow_t window, const ncclDevComm &dev, const Sizes &sizes,
+                                 int64_t seq, const FwdArgs &args) {
+  const int lane = threadIdx.x & 31, num_nodes = sizes.topo.num_nodes, node = sizes.topo.node;
+  ncclGin rows(dev, kCtxFwd), cred(dev, kCtxCredit);
+  const ncclTeam rail = ncclTeamRail(dev);
+  const OutTimeline timeline{args.trace, sizes.topo.local_size};
+  const NodeWindow node_window(window, sizes.topo.local_rank);
+  const WindowLayout layout = node_window.layout(sizes);
   // rows of lookup_rows into the rail proxies' proxy_rows
   const RowPut put{rows,
                    rail,
                    node_window,
-                   window.rows.proxy_rows(),
-                   window.rows.lookup_rows(),
-                   args.row_bytes,
+                   layout.rows.proxy_rows(),
+                   layout.rows.lookup_rows(),
+                   sizes.row_bytes,
                    sig_rows(node)};
   for (int proxy_node = lane; proxy_node < num_nodes; proxy_node += 32) {
-    window.ctrl.put_at(proxy_node)[0] = args.plan.fwd_puts(proxy_node)[0];
-    window.ctrl.put_at(proxy_node)[1] = 0;
+    layout.ctrl.put_at(proxy_node)[0] = args.plan.fwd_puts(proxy_node)[0];
+    layout.ctrl.put_at(proxy_node)[1] = 0;
   }
   put.fence();
   bool posted = false;  // this lane put rows
-  Spin spin(args.timeout_ns);
+  Spin spin(sizes.timeout_ns);
   for (;;) {
     bool moved = false, left = false;  // segments of the lane's proxy nodes are left
     for (int proxy_node = lane; proxy_node < num_nodes; proxy_node += 32) {
       if (proxy_node == node) continue;
       const int32_t *start = args.plan.fwd_puts(proxy_node);  // the node's segments, by round
-      int64_t *at = window.ctrl.put_at(proxy_node);
+      int64_t *at = layout.ctrl.put_at(proxy_node);
       int64_t seg = at[0];
       int rnd = (int)at[1];
-      const int64_t end = start[args.rounds_cap];
+      const int64_t end = start[sizes.rounds_cap];
       for (; seg < end; ++seg) {
         while (seg >= start[rnd + 1]) ++rnd;  // the segment's round
-        if (cred.readSignal(sig_grant(proxy_node)) < grant_of(args.ch.seq, rnd + 1)) break;
+        if (cred.readSignal(sig_grant(proxy_node)) < grant_of(seq, rnd + 1)) break;
         const PutSeg segment = args.plan.put_list[seg];
         if (!posted) timeline.stamp_earliest(kTraceFirstPut);
         posted = true;
@@ -534,7 +536,7 @@ __device__ void OwnerIssuer::run(const FwdArgs &args) {
       left = left || seg < end;
     }
     if (!__any_sync(kFull, left)) break;
-    if (!__any_sync(kFull, moved)) spin.pause("grant of proxy_rows", lane, 0, args.topo.rank);
+    if (!__any_sync(kFull, moved)) spin.pause("grant of proxy_rows", lane, 0, sizes.topo.rank);
   }
   if (posted) timeline.stamp_latest(kTraceLastPut);
   __syncwarp();
@@ -602,45 +604,48 @@ namespace fwd {
 // (bwd_ready), and the proxy grants each rail owner rounds 0 and 1 of
 // proxy_rows. (At the end of a backward the proxy's issuer sends its grants
 // itself, bwd::ProxyIssuer.)
-__device__ void next_kernel_credits_warp(const FwdArgs &args) {
-  const int lane = threadIdx.x & 31, num_nodes = args.topo.num_nodes, node = args.topo.node;
-  ncclGin cred(args.dev, kCtxCredit);
-  const WindowLayout window = NodeWindow(args.window, args.topo.local_rank).layout(args);
-  const ncclTeam rail = ncclTeamRail(args.dev);
+__device__ void next_kernel_credits_warp(ncclWindow_t window, const ncclDevComm &dev,
+                                         const Sizes &sizes, int64_t seq) {
+  const int lane = threadIdx.x & 31, num_nodes = sizes.topo.num_nodes, node = sizes.topo.node;
+  ncclGin cred(dev, kCtxCredit);
+  const CtrlLayout ctrl = NodeWindow(window, sizes.topo.local_rank).layout(sizes).ctrl;
+  const ncclTeam rail = ncclTeamRail(dev);
   const Credits credits(cred, rail);
   for (int peer_node = lane; peer_node < num_nodes; peer_node += 32) {
     if (peer_node == node) continue;
-    credits.raise(peer_node, sig_bwd_ready(num_nodes, node), (uint64_t)args.ch.seq + 1,
-                  window.ctrl.bwd_ready_sent(peer_node));
-    credits.raise(peer_node, sig_grant(node), grant_of(args.ch.seq + 1, 2),
-                  window.ctrl.grant_sent(peer_node));
+    credits.raise(peer_node, sig_bwd_ready(num_nodes, node), (uint64_t)seq + 1,
+                  ctrl.bwd_ready_sent(peer_node));
+    credits.raise(peer_node, sig_grant(node), grant_of(seq + 1, 2), ctrl.grant_sent(peer_node));
   }
   __syncwarp();
   cred.flush(ncclCoopWarp{});
 }
 
-// The end of a forward for this rank, in the last CTA to arrive: it sets the
-// task queues back to 0, tells the node that this rank has pulled everything
-// (the exit barrier, on its pulled word) and waits until every node peer has
-// too. After it nobody reads this rank's lookup_rows or proxy_rows any more,
-// so the next out kernel or lookup may write them; across nodes warp 0 then
-// sends the credits for the next out kernel (not compiled in on one node,
-// kMulti false). Every thread of the last CTA.
+// The end of forward seq for this rank, in the last CTA to arrive: it sets
+// the task queues back to 0, tells the node that this rank has pulled
+// everything (the exit barrier, on its pulled word) and waits until every
+// node peer has too. After it nobody reads this rank's lookup_rows or
+// proxy_rows any more, so the next out kernel or lookup may write them;
+// across nodes warp 0 then sends the credits for the next out kernel (not
+// compiled in on one node, kMulti false). Every thread of the last CTA.
 template <bool kMulti>
-__device__ __forceinline__ void exit(const FwdArgs &args) {
+__device__ __forceinline__ void exit(ncclWindow_t window, const ncclDevComm &dev,
+                                     const Sizes &sizes, int64_t seq, const FwdArgs &args) {
   const int tid = threadIdx.x;
-  const OutTimeline timeline(args);
-  const NodeWindow node(args.window, args.topo.local_rank);
-  const NodeBarrier<OutArgs> pulled(args, node, node.layout(args).ctrl.pulled());
+  const OutTimeline timeline{args.trace, sizes.topo.local_size};
+  const NodeWindow node(window, sizes.topo.local_rank);
+  const CtrlLayout ctrl = node.layout(sizes).ctrl;
+  const NodeBarrier pulled{sizes, node, ctrl.pulled(), seq};
   if (tid == 0) {
     timeline.stamp_latest(kTraceArrived);
-    TaskQueue::reset_all(args);
+    TaskQueue::reset_all(ctrl);
     pulled.publish();
   }
-  for (int peer = tid; peer < args.topo.local_size; peer += blockDim.x)
+  for (int peer = tid; peer < sizes.topo.local_size; peer += blockDim.x)
     pulled.wait(peer, "exit barrier of the forward");
   __syncthreads();
-  if (kMulti && args.topo.num_nodes > 1 && (tid >> 5) == 0) next_kernel_credits_warp(args);
+  if (kMulti && sizes.topo.num_nodes > 1 && (tid >> 5) == 0)
+    next_kernel_credits_warp(window, dev, sizes, seq);
   if (tid == 0) timeline.stamp_latest(kTraceExited);
 }
 
@@ -655,24 +660,28 @@ __device__ __forceinline__ void exit(const FwdArgs &args) {
 // every other warp requests (the fwd:: steps above): it zeroes the counters this
 // kernel counts from 0 (before this rank publishes its out_seq), passes the
 // entry barrier and takes its tasks. Every CTA then arrives, and the last one
-// ends the forward for this rank (fwd::exit).
+// ends the forward for this rank (fwd::exit). It takes the op's window, its
+// GIN device communicator and its sizes, its out_seq (seq) and the arrive
+// word before it (arrive0), and the call (args).
 template <bool kMulti>
-__global__ void __launch_bounds__(kThreads, 1) fwd_kernel(FwdArgs args) {
+__global__ void __launch_bounds__(kThreads, 1)
+    fwd_kernel(ncclWindow_t window, ncclDevComm dev, Sizes sizes, int64_t seq, int64_t arrive0,
+               FwdArgs args) {
   const FwdPlanView &plan = args.plan;
   const Fanout &fanout = plan.fanout;
-  const int local_size = args.topo.local_size, num_nodes = kMulti ? args.topo.num_nodes : 1,
-            node = args.topo.node, me = args.topo.local_rank;
+  const int local_size = sizes.topo.local_size, num_nodes = kMulti ? sizes.topo.num_nodes : 1,
+            node = sizes.topo.node, me = sizes.topo.local_rank;
   const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
-  const OutTimeline timeline(args);
+  const OutTimeline timeline{args.trace, local_size};
   timeline.begin_cta();
   const int workers = num_nodes > 1 && blockIdx.x == 0 ? kThreads - 64 : kThreads;
   if (tid >= workers) {
     if (warp == kWarps - 1)
-      fwd::ProxyRelay::run(args);
+      fwd::ProxyRelay::run(window, dev, sizes, seq, args);
     else
-      fwd::OwnerIssuer::run(args);
+      fwd::OwnerIssuer::run(window, dev, sizes, seq, args);
   } else {
-    const OutTables tables(args, args.plan);
+    const OutTables tables(window, sizes, args.plan);
     const int64_t heavy = fanout.exp_off != nullptr ? fanout.count[1] : 0;
     if (num_nodes > 1 && heavy > 0 && blockIdx.x == 0) {
       // Counters this kernel counts from 0, before this rank publishes its
@@ -680,7 +689,7 @@ __global__ void __launch_bounds__(kThreads, 1) fwd_kernel(FwdArgs args) {
       for (int proxy = tid; proxy < local_size; proxy += workers) args.ready[proxy] = 0;
       cta_sync(workers);
     }
-    pass_entry_barrier(args, workers);
+    pass_entry_barrier(window, sizes, seq, timeline, workers);
     const int64_t *node_block_start = plan.block_start + node * local_size;  // this node's owners
     const LocalRows local_rows{node_block_start, local_size, me};
     const int64_t rows = local_rows.count(), local = rows + heavy;
@@ -689,29 +698,29 @@ __global__ void __launch_bounds__(kThreads, 1) fwd_kernel(FwdArgs args) {
     const int64_t total = local + remote + (num_nodes > 1 ? heavy : 0);
     // this warp's round
     FwdCursor cursor(num_nodes > 1 ? plan.fwd_task_starts : nullptr, local, max_rounds);
-    const TaskQueue queue(args, kQueueWork);
+    const TaskQueue queue{tables.layout().ctrl.task(kQueueWork)};
     for (int64_t task = queue.next_warp(); task < total; task = queue.next_warp()) {
       if (task >= local + remote) {  // the late pass of the heavy rows' sub-tasks
-        fwd::heavy_sub_warp<kMulti>(args, tables, task - local - remote, true, lane);
+        fwd::heavy_sub_warp<kMulti>(sizes, seq, args, tables, task - local - remote, true, lane);
         continue;
       }
       cursor.seek(task);
       int64_t index = 0;
       if (task < cursor.mid && Interleave{rows, heavy}.is_sub(cursor.local_index(task), index)) {
-        fwd::heavy_sub_warp<kMulti>(args, tables, index, false, lane);
+        fwd::heavy_sub_warp<kMulti>(sizes, seq, args, tables, index, false, lane);
         continue;
       }
       fwd::Pull pull(me);
       if (task < cursor.mid) {
         if (!fwd::local_pull(args, tables, local_rows, index, lane, pull)) continue;
       } else {
-        if (!fwd::remote_pull_warp(args, tables, cursor, task, lane, pull)) continue;
+        if (!fwd::remote_pull_warp(sizes, seq, args, tables, cursor, task, lane, pull)) continue;
       }
-      fwd::pull_warp(args, tables, pull, lane);
+      fwd::pull_warp(sizes, args, tables, pull, lane);
     }
   }
-  if (!arrive_cta(args)) return;  // the last CTA goes on
-  fwd::exit<kMulti>(args);
+  if (!arrive_cta(window, sizes, arrive0, timeline)) return;  // the last CTA goes on
+  fwd::exit<kMulti>(window, dev, sizes, seq, args);
 }
 
 }  // namespace hier_output_dist

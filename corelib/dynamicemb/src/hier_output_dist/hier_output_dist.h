@@ -247,9 +247,6 @@ class HierOutputDist {
   Sizes sizes_;
   std::unique_ptr<Communicator> communicator_;
   std::unique_ptr<SymmetricWindow> window_;
-  // The part of the kernels' arguments both channels share, once the window
-  // is registered.
-  ChannelStatic channel_static_{};
   std::unique_ptr<InChannel> in_;
   std::unique_ptr<OutChannel> out_;
   int device_;

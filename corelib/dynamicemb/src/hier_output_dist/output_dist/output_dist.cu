@@ -55,11 +55,12 @@ const void *backward_kernel(at::ScalarType dtype) {
 // SMs left to NCCL's own kernels.
 constexpr int kNcclReserve = 32;
 
-OutChannel::OutChannel(const Config &config, const Sizes &sizes, const ChannelStatic &channel,
-                       const WindowLayout &window, int device)
+OutChannel::OutChannel(const Config &config, const Sizes &sizes, ncclWindow_t window,
+                       const ncclDevComm &dev, const WindowLayout &layout, int device)
     : sizes_(sizes),
-      channel_{0},
-      lookup_rows_(window.rows.lookup_rows()),
+      window_(window),
+      dev_(dev),
+      lookup_rows_(layout.rows.lookup_rows()),
       dim_(config.dim),
       dtype_(config.dtype),
       world_size_(config.world_size),
@@ -68,10 +69,7 @@ OutChannel::OutChannel(const Config &config, const Sizes &sizes, const ChannelSt
       ctas_(config.ctas),
       reduce_ctas_(config.reduce_ctas),
       multi_node_(sizes.multi_node()),
-      trace_(device) {
-  static_cast<ChannelStatic &>(static_) = channel;
-  static_.vec = (int)(sizes.row_bytes / 16);
-}
+      trace_(device) {}
 
 // DYNAMICEMB_GIN_CTAS if set. Else on one node 32 for the forward and 64 for
 // the backward: inside a node pulls saturate NVLink at about 32 CTAs, and
@@ -106,16 +104,14 @@ at::Tensor OutChannel::output(int64_t rows) {
 template <typename Args>
 void OutChannel::launch(const void *kernel, bool forward, int ctas, Args &args) {
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream(device_);
-  OutArgs &common = args;
-  common = static_;
-  common.ch = Channel{channel_.seq + 1};
-  common.arrive0 = arrive_;
-  const bool timeline = trace_.start_out(forward, common, stream);
-  void *params[] = {&args};
+  int64_t seq = seq_ + 1, arrive0 = arrive_;
+  args.trace = trace_.start_out(forward, stream);
+  void *params[] = {&window_, &dev_, &sizes_, &seq, &arrive0, &args};
   HIER_CUDA_CHECK(cudaLaunchCooperativeKernel(
-      kernel, ctas, kThreads, params, out_shared_bytes(sizes_.topo.local_size, timeline), stream));
+      kernel, ctas, kThreads, params,
+      out_shared_bytes(sizes_.topo.local_size, args.trace != nullptr), stream));
   trace_.launched(forward);
-  channel_.seq = common.ch.seq;
+  seq_ = seq;
   arrive_ += ctas;
 }
 
@@ -161,8 +157,6 @@ void OutChannel::backward(const BwdPlan &plan, at::Tensor grad, bool divide) {
   args.partial = partial.data_ptr<float>();
   args.heavy_done = (uint64_t *)done.data_ptr<int64_t>();
   args.group_done = args.heavy_done + slots;
-  args.heavy_subs = plan.heavy_subs;
-  args.group_subs = plan.group_subs;
   args.ready = ready.defined() ? ready.data_ptr<int64_t>() : nullptr;
   args.reducers = reducers(ctas);
   // TorchRec's owner divides by world_size, a CPU scalar: PyTorch multiplies
@@ -181,7 +175,7 @@ Trace::Trace(int device) {
 }
 
 // The earliest stamps start at UINT64_MAX, the rest at 0.
-bool Trace::start_out(bool forward, OutArgs &args, cudaStream_t stream) {
+unsigned long long *Trace::start_out(bool forward, cudaStream_t stream) {
   if constexpr (kTrace) {
     const int direction = forward ? 0 : 1;
     const int64_t at = direction * kTraceRing + launches_[direction] % kTraceRing;
@@ -189,10 +183,9 @@ bool Trace::start_out(bool forward, OutArgs &args, cudaStream_t stream) {
     HIER_CUDA_CHECK(cudaMemsetAsync(row, 0xff, kNumEarliest * sizeof(int64_t), stream));
     HIER_CUDA_CHECK(cudaMemsetAsync(row + kNumEarliest, 0,
                                     (kTraceWords - kNumEarliest) * sizeof(int64_t), stream));
-    args.trace = (unsigned long long *)row;
-    return true;
+    return (unsigned long long *)row;
   }
-  return false;
+  return nullptr;
 }
 
 void Trace::launched(bool forward) {

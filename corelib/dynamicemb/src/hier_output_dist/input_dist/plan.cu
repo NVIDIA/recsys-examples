@@ -142,6 +142,8 @@ BwdPlanView BwdPlan::view(const Sizes &sizes) const {
   view.reduce_task_starts = data_of<int64_t>(reduce_task_starts);
   view.reducer_start = data_of<int32_t>(reducer_start);
   view.reducer_entries = data_of<int64_t>(reducer_entries);
+  view.heavy_subs = heavy_subs;
+  view.group_subs = group_subs;
   return view;
 }
 

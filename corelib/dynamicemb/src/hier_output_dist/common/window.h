@@ -32,9 +32,8 @@ namespace dyn_emb {
 namespace hier_output_dist {
 
 // The ctrl section of the window (CtrlLayout): the control words of both
-// channels and the device state they keep across calls. The formats of two
-// messages that live there, the count vector and the count message; and a
-// channel's sequence number (Channel).
+// channels and the device state they keep across calls, and the formats of
+// two messages that live there, the count vector and the count message.
 
 // A rank's count vector (int64 words, planner.h): the keys it pushes each
 // GPU of its node, for their remote parts, then for each feature of their
@@ -70,13 +69,10 @@ struct CountMessage {
   __host__ __device__ int64_t slot_words() const { return (length() + 1) / 2 * 2; }
 };
 
-// Kernels of one channel run one at a time, in issue order, and share a
-// sequence number, the same on every rank. The in channel is the input dist,
-// whose sequence number counts calls; the out channel the output dist's
-// kernels, whose number counts them.
-struct Channel {
-  int64_t seq;
-};
+// The kernels of one channel run one at a time, in issue order, and each
+// takes its sequence number (seq), the same on every rank. The in channel is
+// the input dist, whose sequence number (in_seq) counts calls; the out
+// channel the output dist's kernels, whose number (out_seq) counts them.
 
 // The ctrl section (uint64 words): every control word of both channels and
 // the device state they keep across calls. Its size depends only on

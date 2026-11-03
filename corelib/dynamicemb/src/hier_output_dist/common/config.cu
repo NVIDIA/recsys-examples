@@ -135,6 +135,7 @@ Sizes sizes_of(const Config &config) {
   sizes.partial_rows = partial_rows_for(config.dim, sizes.row_bytes);
   sizes.chunk_rows = chunk_rows_for(sizes.row_bytes);
   sizes.weights = config.weights;
+  sizes.timeout_ns = (uint64_t)(std::min(config.timeout_s, 1e9) * 1e9);
   if (num_nodes > 1) {
     sizes.remote_keys = config.capacities.remote_keys;
     sizes.num_proxy_rows = num_proxy_rows_for(config);

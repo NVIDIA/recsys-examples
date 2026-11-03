@@ -64,7 +64,8 @@ struct Topo {
 
 // The sizes of an op, from its configuration (config.h): every buffer of
 // its window and every table of its calls is laid out by them, on the host
-// and on the device.
+// and on the device. They also hold how long a kernel may wait for a peer.
+// The op keeps them, and every kernel of the op takes them.
 
 // Values that follow from the capacities read 0 on one node.
 struct Sizes {
@@ -80,8 +81,11 @@ struct Sizes {
   int64_t chunk_rows;      // rows of an IB chunk (2 MiB), a multiple of kTaskRows
   int64_t record_bytes;    // a key record: 8, or 16 with its weight
   bool weights;            // the requesters' keys carry weights
+  uint64_t timeout_ns;     // how long a kernel waits for a peer before it traps
 
   __host__ __device__ bool multi_node() const { return topo.num_nodes > 1; }
+  // A row in 16-byte vectors.
+  __host__ __device__ int row_vecs() const { return (int)(row_bytes / 16); }
 };
 
 // Each buffer of the window starts at a multiple of kBufferAlign: a buffer of
