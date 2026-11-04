@@ -673,18 +673,20 @@ class TestTableRanks:
 class TestGroupedTiers:
     """What a set of tables that share a TBE costs a rank.
 
-    The runtime sums the group's sizes and the group's HBM budgets and decides
-    once, so a table with budget to spare lends it. Costing each table alone
+    The runtime sums the group's sizes and the group's HBM budgets to choose the
+    layout, so a group that fits its summed budget is held in HBM whole and a
+    table with budget to spare covers the others. Costing each table alone
     gives ``sum(min(total, budget))``, at most ``min(sum total, sum budget)``.
+    A group that does not fit splits each table on its own budget instead.
     """
 
-    def test_a_spare_budget_is_lent_to_the_group(self):
-        """The runtime sums both sides and decides once, so a table whose budget
-        exceeds its size lends the remainder. Costing each alone under-states HBM,
-        and that is the direction that lets through a plan the machine will not
-        hold."""
+    def test_a_spare_budget_covers_the_group_when_the_group_fits(self):
+        """The group's rows fit its summed budget, so the runtime holds all of
+        them in HBM -- the table with no budget included. Costing each alone
+        under-states HBM, and that is the direction that lets through a plan
+        the machine will not hold."""
         rows_bytes = ROWS * DIM * 4
-        small = _options(hbm_budget=2 * rows_bytes)  # needs 1x, allowed 2x
+        small = _options(hbm_budget=5 * rows_bytes)  # needs 1x, allowed 5x
         large = _options(rows=4 * ROWS, hbm_budget=0)  # needs 4x, allowed none
 
         alone = [get_group_value_bytes_by_tier([(o, None)]) for o in (small, large)]
@@ -697,9 +699,37 @@ class TestGroupedTiers:
 
         assert per_table_hbm < grouped_hbm, "per-table must under-state HBM here"
         assert per_table_ddr > grouped_ddr
-        # The group spends every byte of budget it has, on the total it has.
-        assert grouped_hbm == 2 * rows_bytes
-        assert grouped_ddr == 5 * rows_bytes - 2 * rows_bytes
+        assert (grouped_hbm, grouped_ddr) == (5 * rows_bytes, 0)
+
+    @pytest.mark.parametrize("caching", [False, True])
+    def test_a_spare_budget_is_not_lent_when_the_group_does_not_fit(self, caching):
+        """5x of rows against 2x of budget: the runtime splits each table on its
+        own budget, so the small table is in HBM whole, the large one is all on
+        the host, and the 1x the small table had spare is not spent. Charging
+        the summed budget would put that 1x in HBM and leave it off the host."""
+        rows_bytes = ROWS * DIM * 4
+        small = _options(hbm_budget=2 * rows_bytes)  # needs 1x, allowed 2x
+        large = _options(rows=4 * ROWS, hbm_budget=0)  # needs 4x, allowed none
+        small.caching = large.caching = caching
+
+        grouped = get_group_value_bytes_by_tier([(small, None), (large, None)])
+
+        # Caching keeps every row on the host behind the cache.
+        assert grouped == (rows_bytes, 5 * rows_bytes if caching else 4 * rows_bytes)
+        if not caching:
+            alone = [get_group_value_bytes_by_tier([(o, None)]) for o in (small, large)]
+            assert grouped == (sum(h for h, _ in alone), sum(d for _, d in alone))
+
+    def test_budgets_within_their_tables_are_spent_as_given(self):
+        """The case a shared scale got wrong: 10% and 90% of two equal tables.
+        No budget exceeds its table, so nothing is spare and the group spends
+        exactly its summed budget, whichever table it belongs to."""
+        rows_bytes = ROWS * DIM * 4
+        a = _options(hbm_budget=rows_bytes // 10)
+        b = _options(hbm_budget=rows_bytes * 9 // 10)
+        hbm, ddr = get_group_value_bytes_by_tier([(a, None), (b, None)])
+        assert hbm == a.local_hbm_for_values + b.local_hbm_for_values
+        assert ddr == 2 * rows_bytes - hbm
 
     def test_a_group_of_one_is_the_single_table_answer(self):
         o = _options(hbm_budget=ROWS * DIM * 4 // 2)
@@ -717,7 +747,8 @@ class TestGroupedTiers:
         """Two tables with the same grouping key on the same ranks are one group,
         so the spare budget of one covers the other."""
         rows_bytes = ROWS * DIM * 4
-        small = _options(hbm_budget=2 * rows_bytes)
+        # 5x of budget for 5x of rows: the group fits, so it is held whole.
+        small = _options(hbm_budget=5 * rows_bytes)
         large = _options(rows=4 * ROWS, hbm_budget=0)
 
         def sharding(options):
@@ -898,7 +929,8 @@ class TestCollectionsDoNotPoolBudgets:
         asks for host memory nobody costed.
         """
         rows_bytes = ROWS * DIM * 4
-        generous = _options(hbm_budget=2 * rows_bytes)
+        # Enough for both, so pooled they fit and need no host memory.
+        generous = _options(hbm_budget=5 * rows_bytes)
         needy = _options(rows=4 * ROWS, hbm_budget=0)
 
         def records(generous_key, needy_key):

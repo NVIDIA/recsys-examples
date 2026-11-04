@@ -198,9 +198,10 @@ class BalancedNodePlacer(NodePlacer):
         room = [capacity(n) for n in range(num_nodes)]
 
         # What each node has been given, bucketed by what the runtime fuses on.
-        # Costing a node means costing each bucket, because a bucket's members
-        # pool their HBM budgets -- so what a table adds to a node depends on
-        # what is already there, and cannot be decided once per table.
+        # Costing a node means costing each bucket, because a bucket whose
+        # members fit their summed HBM budget is held in HBM whole -- so what a
+        # table adds to a node depends on what is already there, and cannot be
+        # decided once per table.
         held: List[Dict[Hashable, List[Tuple[object, Optional[OptimType]]]]] = [
             defaultdict(list) for _ in range(num_nodes)
         ]
