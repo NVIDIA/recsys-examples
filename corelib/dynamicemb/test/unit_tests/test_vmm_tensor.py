@@ -17,6 +17,8 @@ from __future__ import annotations
 
 import os
 import platform
+import subprocess
+import sys
 import time
 
 import pytest
@@ -212,6 +214,98 @@ def test_is_device_buffer_device_vs_host():
     assert host_buf.is_device_buffer() is False
 
 
+# Long enough that the work queued behind it still waits when the buffer is
+# dropped: about half a second at 2 GHz, while the host reaches the drop within
+# microseconds.
+_GPU_DELAY_CYCLES = 1_000_000_000
+_DROP_FILL_VALUE = 7
+_DROP_DONE_MESSAGE = "queued work finished"
+_DROP_CHILD_TIMEOUT_SEC = 300.0
+_BUFFER_CLASSES_BY_NAME = {
+    cls.__name__: cls for cls in (DeviceExtendableBuffer, HostExtendableBuffer)
+}
+# Where the queued work runs: on the current stream or on a side stream of the
+# current GPU, or on GPU 1 while GPU 0 is current at the drop.
+_QUEUED_ON_PARAMS = [
+    "current_stream",
+    "side_stream",
+    pytest.param(
+        "other_gpu",
+        marks=pytest.mark.skipif(
+            torch.cuda.device_count() < 2, reason="2 GPUs required"
+        ),
+    ),
+]
+
+
+def _drop_buffer_with_queued_gpu_work(buffer_cls, queued_on: str) -> None:
+    """Drop a buffer while GPU work that uses it still waits in a stream.
+
+    A long GPU-side sleep holds back a fill of the buffer and a copy out of it,
+    so the last reference to the buffer goes away before they run. Freeing the
+    buffer has to wait for them, on whichever stream and GPU they run; if it
+    does not, they touch unmapped memory and fail with an illegal memory access.
+    The drop must also leave the current GPU as it was.
+    """
+    if queued_on == "other_gpu":
+        # Give GPU 0 an active context, so that it is the current GPU of the
+        # driver, not only of PyTorch, when the buffer on GPU 1 is dropped.
+        torch.cuda.set_device(0)
+        torch.zeros(1, device="cuda:0")
+        device = torch.device("cuda", 1)
+    else:
+        device = _cuda_device()
+    with torch.cuda.device(device):
+        buf = buffer_cls((1 << 20,), torch.int32, device)
+        view = buf.tensor()
+        stream = (
+            torch.cuda.Stream(device)
+            if queued_on == "side_stream"
+            else torch.cuda.current_stream(device)
+        )
+        with torch.cuda.stream(stream):
+            # Launch each kernel once first: with lazy loading, the first launch
+            # of a kernel can wait for the kernels that are already running.
+            torch.cuda._sleep(1)
+            view.fill_(0)
+            view.clone()
+            torch.cuda.synchronize()
+
+            torch.cuda._sleep(_GPU_DELAY_CYCLES)
+            view.fill_(_DROP_FILL_VALUE)
+            snapshot = view.clone()
+    current_device = torch.cuda.current_device()
+    del view, buf
+    assert torch.cuda.current_device() == current_device, "the drop changed the GPU"
+    torch.cuda.synchronize(device)
+    assert torch.equal(snapshot, torch.full_like(snapshot, _DROP_FILL_VALUE))
+    print(_DROP_DONE_MESSAGE)
+
+
+@requires_cuda
+@pytest.mark.parametrize("queued_on", _QUEUED_ON_PARAMS)
+@pytest.mark.parametrize("buffer_cls", _EXTENDABLE_BUFFER_PARAMS)
+def test_drop_waits_for_queued_gpu_work(buffer_cls, queued_on):
+    """Dropping a buffer must not free memory that queued GPU work still uses.
+
+    An illegal memory access is sticky: it breaks the CUDA context for the rest
+    of the process. So the case runs in a child process, and the test checks
+    the child's exit status and output. The child gets the import path of this
+    process, so it imports the same dynamicemb build as the test.
+    """
+    child = subprocess.run(
+        [sys.executable, __file__, buffer_cls.__name__, queued_on],
+        capture_output=True,
+        text=True,
+        timeout=_DROP_CHILD_TIMEOUT_SEC,
+        env={**os.environ, "PYTHONPATH": os.pathsep.join(sys.path)},
+    )
+    output = child.stdout + child.stderr
+    assert "illegal memory access" not in output, output
+    assert child.returncode == 0, output
+    assert _DROP_DONE_MESSAGE in child.stdout, output
+
+
 def _vmm_stress_full_matrix() -> bool:
     """Set DYNAMICEMB_VMM_STRESS_FULL=1 to run the old wide param grid (very slow)."""
     return os.environ.get("DYNAMICEMB_VMM_STRESS_FULL", "").strip().lower() in (
@@ -297,3 +391,10 @@ def test_vmm_buffer(init_capacity, dtype, buffer_cls):
             f"logical={_format_mem_bytes(logical_b)} allocated={_format_mem_bytes(alloc_b)} "
             f"base_ptr={pointer:#x} tensor_ptr={buffer.tensor().data_ptr():#x}"
         )
+
+
+if __name__ == "__main__":
+    # The child process of test_drop_waits_for_queued_gpu_work.
+    _drop_buffer_with_queued_gpu_work(
+        _BUFFER_CLASSES_BY_NAME[sys.argv[1]], queued_on=sys.argv[2]
+    )
