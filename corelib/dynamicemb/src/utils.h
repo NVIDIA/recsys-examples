@@ -85,6 +85,10 @@ enum class DistType : int32_t {
   kBlock = 0,
   // rank = key % world_size.  One modulo, and balanced as long as keys are
   // densely allocated.  Python calls it "roundrobin".
+  //
+  // This rule and the next read the key as a table stores it: widened to 64
+  // bits with its sign, then unsigned.  So an int32 key gets the rank of the
+  // int64 key with the same value, which is the key a checkpoint holds.
   kCyclic = 1,
   // rank = murmur3_fmix64(key) % world_size.  One avalanche per key, in
   // exchange for not caring what structure the key space has.  Python calls it

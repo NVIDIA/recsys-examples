@@ -33,6 +33,22 @@ __forceinline__ __device__ uint64_t hash_key(uint64_t key) {
   return murmur3_fmix64(key);
 }
 
+// The bucket of a key under kCyclic or kHashedCyclic. Both rules read the key
+// as a table stores it: widened to 64 bits with its sign, then unsigned. So an
+// int32 key goes where the int64 key with the same value goes, which is where a
+// checkpoint load or a delta replay puts it (dynamicemb/key_ownership.py).
+// Kernel1 and kernel2 both call this, so the lengths one counts and the keys
+// the other writes agree.
+template <typename index_t>
+__forceinline__ __device__ std::make_unsigned_t<index_t>
+cyclic_bucket(const index_t key, const DistType dist_type, const int my_size) {
+  const uint64_t wide_key = static_cast<uint64_t>(static_cast<int64_t>(key));
+  const uint64_t spread =
+      dist_type == DistType::kHashedCyclic ? hash_key(wide_key) : wide_key;
+  return static_cast<std::make_unsigned_t<index_t>>(
+      spread % static_cast<uint64_t>(my_size));
+}
+
 __forceinline__ __device__ int atomicAdd(int *address, int val) {
   return ::atomicAdd(address, val);
 }
@@ -250,11 +266,8 @@ __launch_bounds__(kMaxThreads) void _block_bucketize_sparse_features_cuda_kernel
         uindex_t p = 0;
         switch (dist_type) {
         case DistType::kCyclic:
-          p = idx % my_size;
-          break;
         case DistType::kHashedCyclic:
-          p = static_cast<uindex_t>(hash_key(static_cast<uint64_t>(idx))) %
-              my_size;
+          p = cyclic_bucket(indices_data[i], dist_type, my_size);
           break;
         default: // DistType::kBlock
           p = idx < blk_size * my_size ? idx / blk_size : idx % my_size;
@@ -335,12 +348,8 @@ __launch_bounds__(kMaxThreads) void _block_bucketize_sparse_features_cuda_kernel
       if (!use_block_bucketize_pos) {
         switch (dist_type) {
         case DistType::kCyclic:
-          p = idx % my_size;
-          new_idx = idx;
-          break;
         case DistType::kHashedCyclic:
-          p = static_cast<uindex_t>(hash_key(static_cast<uint64_t>(idx))) %
-              my_size;
+          p = cyclic_bucket(indices_data[i], dist_type, my_size);
           new_idx = idx;
           break;
         default: // DistType::kBlock
