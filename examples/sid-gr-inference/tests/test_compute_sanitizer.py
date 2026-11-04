@@ -26,6 +26,12 @@ SANITIZED_TESTS = [
     "tests/test_fused_beam_decode_gpu.py::test_fused_beam_decode_runs_the_public_path_where_context_attention_splits",
     "tests/test_fused_beam_decode_gpu.py::test_fused_beam_decode_follows_the_public_backend_choice",
     "tests/test_fused_beam_decode_gpu.py::test_backend_runs_the_fused_kernel_bit_identically",
+    "tests/test_fused_qk_norm_rope.py::test_cuda_qk_norm_rope_takes_the_fast_kernel_only_where_it_applies",
+    "tests/test_fused_qk_norm_rope.py::test_cuda_fast_qk_norm_rope_declines_unsupported_layouts",
+    "tests/test_fused_qk_norm_rope.py::test_cuda_fast_qk_norm_rope_leaves_mixed_dtypes_to_the_per_head_kernel",
+    "tests/test_fused_qk_norm_rope.py::test_cuda_fast_qk_norm_rope_matches_the_per_head_kernel",
+    "tests/test_fused_qk_norm_rope.py::test_cuda_fast_qk_norm_rope_leaves_rows_past_the_last_token_untouched",
+    "tests/test_fused_qk_norm_rope.py::test_cuda_token_qk_norm_rope_matches_the_fast_kernel_exactly",
 ]
 
 

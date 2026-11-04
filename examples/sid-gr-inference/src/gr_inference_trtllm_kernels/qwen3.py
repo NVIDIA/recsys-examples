@@ -452,7 +452,7 @@ def _try_cuda_fused_qk_norm_rope(
             .reshape(-1)
             .contiguous()
         )
-        extension.fused_qk_norm_rope_cuda(
+        fast = extension.fused_qk_norm_rope_cuda(
             qkv,
             int(num_heads),
             int(num_kv_heads),
@@ -468,6 +468,8 @@ def _try_cuda_fused_qk_norm_rope(
             bool(is_qk_norm),
         )
         _record_call("fused_qk_norm_rope_cuda")
+        if fast:
+            _record_call("fused_qk_norm_rope_cuda_fast")
         return True
     except Exception:
         _record_call("fused_qk_norm_rope_cuda_failed")
@@ -581,7 +583,7 @@ _CPP_SOURCE = r"""
 #include <torch/extension.h>
 #include <vector>
 
-void fused_qk_norm_rope_cuda_launcher(
+bool fused_qk_norm_rope_cuda_launcher(
     torch::Tensor qkv,
     int64_t num_heads,
     int64_t num_kv_heads,
@@ -628,7 +630,7 @@ void write_packed_qkv_prefill_kv_cuda_launcher(
     int64_t num_kv_heads,
     int64_t head_dim);
 
-void fused_qk_norm_rope_cuda(
+bool fused_qk_norm_rope_cuda(
     torch::Tensor qkv,
     int64_t num_heads,
     int64_t num_kv_heads,
@@ -642,7 +644,7 @@ void fused_qk_norm_rope_cuda(
     torch::Tensor position_ids,
     double attention_factor,
     bool is_qk_norm) {
-  fused_qk_norm_rope_cuda_launcher(
+  return fused_qk_norm_rope_cuda_launcher(
       qkv, num_heads, num_kv_heads, head_dim, rotary_dim, eps,
       q_weight, k_weight, rope_theta, is_neox, position_ids,
       attention_factor, is_qk_norm);
@@ -699,11 +701,13 @@ _CUDA_SOURCE = r"""
 #include <ATen/ATen.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAException.h>
+#include <c10/cuda/CUDAGuard.h>
 #include <algorithm>
 #include <cstdlib>
 #include <cublas_v2.h>
 #include <cstdint>
 #include <cuda.h>
+#include <cuda_bf16.h>
 #include <cuda_runtime.h>
 #include <string>
 #include <torch/extension.h>
@@ -714,6 +718,530 @@ inline void check_cublas_status(cublasStatus_t status, const char* expr) {
 }
 
 #define GR_TRTLLM_CUBLAS_CHECK(expr) check_cublas_status((expr), #expr)
+
+/*
+ * Fast fused Q/K RMSNorm + RoPE path adapted from SGLang sgl-kernel's
+ * fused_qknorm_rope_kernel.cu, which carries this notice:
+ *
+ * Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+ * Licensed under the Apache License, Version 2.0.
+ */
+#define GR_TRTLLM_FINAL_MASK 0xffffffff
+
+namespace gr_trtllm_fast_qk {
+
+template <typename T, int num>
+struct packed_as;
+
+template <>
+struct packed_as<uint, 1> {
+  using type = uint;
+};
+
+template <>
+struct packed_as<uint, 2> {
+  using type = uint2;
+};
+
+template <>
+struct packed_as<uint, 4> {
+  using type = uint4;
+};
+
+template <typename T>
+__inline__ __device__ T warp_reduce_sum(T val) {
+#pragma unroll
+  for (int mask = 16; mask > 0; mask >>= 1) {
+    val += __shfl_xor_sync(GR_TRTLLM_FINAL_MASK, val, mask, 32);
+  }
+  return val;
+}
+
+template <typename T>
+inline __device__ __host__ T div_up(T m, T n) {
+  return (m + n - 1) / n;
+}
+
+__device__ inline float compute_freq_yarn(
+    float base,
+    int head_dim,
+    int half_dim,
+    float factor,
+    float low,
+    float high) {
+  float freq = powf(base, -2.0f * half_dim / static_cast<float>(head_dim));
+  if (factor != 1.0f) {
+    float inv_freq_extrapolation = freq;
+    float inv_freq_interpolation = freq / factor;
+    float high_adj = high;
+    if (fabsf(low - high_adj) <= 1e-6f) {
+      high_adj += 0.001f;
+    }
+    float linear_func = (static_cast<float>(half_dim) - low) / (high_adj - low);
+    float ramp_func = fminf(fmaxf(linear_func, 0.0f), 1.0f);
+    float inv_freq_extrapolation_factor = 1.0f - ramp_func;
+    freq = inv_freq_interpolation * (1.0f - inv_freq_extrapolation_factor)
+        + inv_freq_extrapolation * inv_freq_extrapolation_factor;
+  }
+  return freq;
+}
+
+template <int HeadDim, bool Interleave, bool ShareBlockRope>
+__global__ void fused_qk_norm_rope_fast_kernel(
+    __nv_bfloat16* qkv,
+    int num_heads_q,
+    int num_heads_k,
+    int num_heads_v,
+    float eps,
+    const __nv_bfloat16* q_weight,
+    const __nv_bfloat16* k_weight,
+    float base,
+    const int* position_ids,
+    int num_tokens,
+    float factor,
+    float low,
+    float high,
+    float attention_factor,
+    int rotary_dim) {
+  // With ShareBlockRope every warp in the block has the same token, so the
+  // block computes its rotary table once.
+  __shared__ float shared_cos[ShareBlockRope ? HeadDim / 2 : 1];
+  __shared__ float shared_sin[ShareBlockRope ? HeadDim / 2 : 1];
+  int warps_per_block = blockDim.x / 32;
+  int warp_id = threadIdx.x / 32;
+  int lane_id = threadIdx.x % 32;
+  int global_warp_idx = blockIdx.x * warps_per_block + warp_id;
+  int total_qk_heads = num_heads_q + num_heads_k;
+  int token_idx = global_warp_idx / total_qk_heads;
+  int local_head_idx = global_warp_idx % total_qk_heads;
+  if constexpr (ShareBlockRope) {
+    int block_token_idx =
+        (static_cast<int>(blockIdx.x) * warps_per_block) / total_qk_heads;
+    if (block_token_idx >= num_tokens) {
+      return;
+    }
+    if (threadIdx.x < rotary_dim / 2) {
+      int half_dim = threadIdx.x;
+      float freq = compute_freq_yarn(
+          base, rotary_dim, half_dim, factor, low, high);
+      float theta = static_cast<float>(position_ids[block_token_idx]) * freq;
+      __sincosf(theta, &shared_sin[half_dim], &shared_cos[half_dim]);
+    }
+  }
+  if (token_idx >= num_tokens) {
+    return;
+  }
+
+  bool is_q = local_head_idx < num_heads_q;
+  int head_idx = is_q ? local_head_idx : local_head_idx - num_heads_q;
+  int total_heads = num_heads_q + num_heads_k + num_heads_v;
+  static_assert(
+      HeadDim % (32 * 2) == 0,
+      "HeadDim must be divisible by 64 for the warp fused qk_norm_rope kernel");
+  constexpr int elems_per_thread = HeadDim / 32;
+  float elements[elems_per_thread];
+  constexpr int elem_bytes = elems_per_thread * sizeof(__nv_bfloat16);
+  static_assert(elem_bytes % 4 == 0, "packed element bytes must be a multiple of 4");
+  constexpr int vec_size = elem_bytes / 4;
+  using vec_t = typename packed_as<uint, vec_size>::type;
+
+  int offset_warp = token_idx * total_heads * HeadDim
+      + (is_q ? head_idx * HeadDim : num_heads_q * HeadDim + head_idx * HeadDim);
+  int offset_thread = offset_warp + lane_id * elems_per_thread;
+
+  float sum_of_squares = 0.0f;
+  {
+    vec_t vec = *reinterpret_cast<const vec_t*>(&qkv[offset_thread]);
+    for (int i = 0; i < vec_size; i++) {
+      float2 vals = __bfloat1622float2(
+          *reinterpret_cast<__nv_bfloat162*>(reinterpret_cast<uint*>(&vec) + i));
+      sum_of_squares += vals.x * vals.x;
+      sum_of_squares += vals.y * vals.y;
+      elements[2 * i] = vals.x;
+      elements[2 * i + 1] = vals.y;
+    }
+  }
+
+  sum_of_squares = warp_reduce_sum(sum_of_squares);
+  float rms_rcp = rsqrtf(sum_of_squares / static_cast<float>(HeadDim) + eps);
+  for (int i = 0; i < elems_per_thread; i++) {
+    int dim = lane_id * elems_per_thread + i;
+    float weight = is_q ? __bfloat162float(q_weight[dim])
+                        : __bfloat162float(k_weight[dim]);
+    elements[i] *= rms_rcp * weight;
+  }
+
+  if constexpr (ShareBlockRope) {
+    __syncthreads();
+  }
+  float elements2[elems_per_thread];
+  float pos_id = static_cast<float>(position_ids[token_idx]);
+  int rotary_lanes = rotary_dim / elems_per_thread;
+  if (lane_id < rotary_lanes) {
+    if constexpr (Interleave) {
+      for (int i = 0; i < elems_per_thread; i++) {
+        elements2[i] = (i % 2 == 0) ? -elements[i + 1] : elements[i - 1];
+      }
+    } else {
+      __syncwarp();
+      int half_rotary_lanes = rotary_lanes / 2;
+      unsigned int active_mask = rotary_lanes >= 32
+          ? GR_TRTLLM_FINAL_MASK
+          : ((1u << rotary_lanes) - 1);
+      for (int i = 0; i < elems_per_thread; i++) {
+        elements2[i] = __shfl_xor_sync(active_mask, elements[i], half_rotary_lanes);
+        if (lane_id < half_rotary_lanes) {
+          elements2[i] = -elements2[i];
+        }
+      }
+      __syncwarp();
+    }
+
+    for (int i = 0; i < elems_per_thread; i++) {
+      int dim_idx = lane_id * elems_per_thread + i;
+      if constexpr (!Interleave) {
+        dim_idx = (dim_idx * 2) % rotary_dim;
+      }
+      int half_dim = dim_idx / 2;
+      float cos_val;
+      float sin_val;
+      if constexpr (ShareBlockRope) {
+        cos_val = shared_cos[half_dim];
+        sin_val = shared_sin[half_dim];
+      } else {
+        float freq = compute_freq_yarn(
+            base, rotary_dim, half_dim, factor, low, high);
+        float theta = pos_id * freq;
+        __sincosf(theta, &sin_val, &cos_val);
+      }
+      elements[i] = (elements[i] * cos_val + elements2[i] * sin_val)
+          * attention_factor;
+    }
+  }
+
+  {
+    vec_t vec;
+    for (int i = 0; i < vec_size; i++) {
+      __nv_bfloat162 vals =
+          __float22bfloat162_rn(make_float2(elements[2 * i], elements[2 * i + 1]));
+      reinterpret_cast<__nv_bfloat162&>(
+          *(reinterpret_cast<uint*>(&vec) + i)) = vals;
+    }
+    *reinterpret_cast<vec_t*>(&qkv[offset_thread]) = vec;
+  }
+}
+
+inline bool qk_norm_rope_token_kernel_enabled() {
+  const char* setting = std::getenv("GR_INFERENCE_TRTLLM_QK_NORM_ROPE_TOKEN_KERNEL");
+  if (setting != nullptr) {
+    return std::string(setting) == "1";
+  }
+  return at::cuda::getCurrentDeviceProperties()->major == 10;
+}
+
+constexpr int64_t kTokenKernelMinTokens = 1024;
+constexpr int kTokenKernelWarps = 4;
+constexpr int kTokenKernelMaxHeadsPerWarp = 8;
+
+inline bool token_kernel_applies(int64_t tokens, int64_t num_qk_heads, int64_t head_dim, int64_t rotary_dim, bool is_neox) {
+  return qk_norm_rope_token_kernel_enabled() && tokens >= kTokenKernelMinTokens && is_neox && head_dim == 128
+      && rotary_dim == head_dim && num_qk_heads <= kTokenKernelWarps * kTokenKernelMaxHeadsPerWarp;
+}
+
+template <int HeadDim, int HeadsPerWarp, bool PartialLastRow>
+__global__ void fused_qk_norm_rope_token_kernel(
+    __nv_bfloat16* qkv,
+    int num_heads_q,
+    int num_heads_k,
+    int num_heads_v,
+    float eps,
+    const __nv_bfloat16* q_weight,
+    const __nv_bfloat16* k_weight,
+    float base,
+    const int* position_ids,
+    float factor,
+    float low,
+    float high,
+    float attention_factor,
+    int rotary_dim) {
+  __shared__ float shared_cos[HeadDim / 2];
+  __shared__ float shared_sin[HeadDim / 2];
+  constexpr int elems_per_thread = HeadDim / 32;
+  constexpr int vec_size = elems_per_thread * sizeof(__nv_bfloat16) / 4;
+  using vec_t = typename packed_as<uint, vec_size>::type;
+  int warps_per_block = blockDim.x / 32;
+  int warp_id = threadIdx.x / 32;
+  int lane_id = threadIdx.x % 32;
+  int token_idx = blockIdx.x;
+  int total_heads = num_heads_q + num_heads_k + num_heads_v;
+  int num_qk_heads = num_heads_q + num_heads_k;
+  if (threadIdx.x < rotary_dim / 2) {
+    int half_dim = threadIdx.x;
+    float freq = compute_freq_yarn(base, rotary_dim, half_dim, factor, low, high);
+    float theta = static_cast<float>(position_ids[token_idx]) * freq;
+    __sincosf(theta, &shared_sin[half_dim], &shared_cos[half_dim]);
+  }
+
+  vec_t vecs[HeadsPerWarp];
+  int64_t offsets[HeadsPerWarp];
+#pragma unroll
+  for (int h = 0; h < HeadsPerWarp; h++) {
+    int local_head_idx = warp_id + h * warps_per_block;
+    offsets[h] = static_cast<int64_t>(token_idx) * total_heads * HeadDim
+        + local_head_idx * HeadDim + lane_id * elems_per_thread;
+    if (!PartialLastRow || local_head_idx < num_qk_heads) {
+      vecs[h] = *reinterpret_cast<const vec_t*>(&qkv[offsets[h]]);
+    }
+  }
+
+  float elements[HeadsPerWarp][elems_per_thread];
+#pragma unroll
+  for (int h = 0; h < HeadsPerWarp; h++) {
+    if (PartialLastRow && warp_id + h * warps_per_block >= num_qk_heads) {
+      continue;
+    }
+    bool is_q = warp_id + h * warps_per_block < num_heads_q;
+    float sum_of_squares = 0.0f;
+    for (int i = 0; i < vec_size; i++) {
+      float2 vals = __bfloat1622float2(
+          *reinterpret_cast<__nv_bfloat162*>(reinterpret_cast<uint*>(&vecs[h]) + i));
+      sum_of_squares += vals.x * vals.x;
+      sum_of_squares += vals.y * vals.y;
+      elements[h][2 * i] = vals.x;
+      elements[h][2 * i + 1] = vals.y;
+    }
+    sum_of_squares = warp_reduce_sum(sum_of_squares);
+    float rms_rcp = rsqrtf(sum_of_squares / static_cast<float>(HeadDim) + eps);
+    for (int i = 0; i < elems_per_thread; i++) {
+      int dim = lane_id * elems_per_thread + i;
+      float weight = is_q ? __bfloat162float(q_weight[dim])
+                          : __bfloat162float(k_weight[dim]);
+      elements[h][i] *= rms_rcp * weight;
+    }
+  }
+
+  __syncthreads();
+  constexpr int half_rotary_lanes = HeadDim / elems_per_thread / 2;
+#pragma unroll
+  for (int h = 0; h < HeadsPerWarp; h++) {
+    if (PartialLastRow && warp_id + h * warps_per_block >= num_qk_heads) {
+      continue;
+    }
+    float elements2[elems_per_thread];
+    __syncwarp();
+    for (int i = 0; i < elems_per_thread; i++) {
+      elements2[i] = __shfl_xor_sync(GR_TRTLLM_FINAL_MASK, elements[h][i], half_rotary_lanes);
+      if (lane_id < half_rotary_lanes) {
+        elements2[i] = -elements2[i];
+      }
+    }
+    __syncwarp();
+    for (int i = 0; i < elems_per_thread; i++) {
+      int dim_idx = (lane_id * elems_per_thread + i) * 2 % rotary_dim;
+      int half_dim = dim_idx / 2;
+      float cos_val = shared_cos[half_dim];
+      float sin_val = shared_sin[half_dim];
+      elements[h][i] = (elements[h][i] * cos_val + elements2[i] * sin_val)
+          * attention_factor;
+    }
+    vec_t vec;
+    for (int i = 0; i < vec_size; i++) {
+      __nv_bfloat162 vals = __float22bfloat162_rn(
+          make_float2(elements[h][2 * i], elements[h][2 * i + 1]));
+      reinterpret_cast<__nv_bfloat162&>(
+          *(reinterpret_cast<uint*>(&vec) + i)) = vals;
+    }
+    *reinterpret_cast<vec_t*>(&qkv[offsets[h]]) = vec;
+  }
+}
+
+#define GR_TRTLLM_DISPATCH_INTERLEAVE(interleave, InterleaveConst, ...) \
+  if (interleave) {                                                     \
+    constexpr bool InterleaveConst = true;                              \
+    __VA_ARGS__                                                         \
+  } else {                                                              \
+    constexpr bool InterleaveConst = false;                             \
+    __VA_ARGS__                                                         \
+  }
+
+#define GR_TRTLLM_DISPATCH_SHARE_BLOCK_ROPE(share, ShareConst, ...) \
+  if (share) {                                                        \
+    constexpr bool ShareConst = true;                                 \
+    __VA_ARGS__                                                       \
+  } else {                                                            \
+    constexpr bool ShareConst = false;                                \
+    __VA_ARGS__                                                       \
+  }
+
+inline bool half_rotary_lanes_supported(int head_dim, int rotary_dim) {
+  int elems_per_thread = head_dim / 32;
+  if (elems_per_thread <= 0 || rotary_dim % elems_per_thread != 0) {
+    return false;
+  }
+  int half_rotary_lanes = rotary_dim / elems_per_thread / 2;
+  return half_rotary_lanes >= 1
+      && (half_rotary_lanes & (half_rotary_lanes - 1)) == 0;
+}
+
+inline bool launch_fused_qk_norm_rope_fast(
+    torch::Tensor qkv,
+    int64_t num_heads_q,
+    int64_t num_heads_k,
+    int64_t head_dim,
+    int64_t rotary_dim,
+    double eps,
+    torch::Tensor q_weight,
+    torch::Tensor k_weight,
+    double rope_theta,
+    bool is_neox,
+    torch::Tensor position_ids,
+    double attention_factor,
+    bool is_qk_norm) {
+  if (!is_qk_norm || qkv.scalar_type() != at::ScalarType::BFloat16
+      || q_weight.scalar_type() != at::ScalarType::BFloat16
+      || k_weight.scalar_type() != at::ScalarType::BFloat16
+      || position_ids.scalar_type() != at::ScalarType::Int
+      || qkv.dim() != 2 || !qkv.is_contiguous()
+      || !q_weight.is_contiguous() || !k_weight.is_contiguous()
+      || !position_ids.is_contiguous()) {
+    return false;
+  }
+  if (rotary_dim != head_dim || head_dim % 64 != 0) {
+    return false;
+  }
+  if (is_neox && !half_rotary_lanes_supported(static_cast<int>(head_dim),
+                                              static_cast<int>(rotary_dim))) {
+    return false;
+  }
+  int64_t tokens = qkv.size(0);
+  int64_t packed_size = qkv.size(1);
+  int64_t total_heads = packed_size / head_dim;
+  int64_t num_heads_v = total_heads - num_heads_q - num_heads_k;
+  if (tokens <= 0 || total_heads * head_dim != packed_size || num_heads_v <= 0
+      || position_ids.size(0) != tokens
+      || qkv.numel() > std::numeric_limits<int>::max()) {
+    return false;
+  }
+
+  auto stream = at::cuda::getCurrentCUDAStream();
+  if (token_kernel_applies(tokens, num_heads_q + num_heads_k, head_dim, rotary_dim, is_neox)) {
+    auto launch = [&](auto heads_per_warp, auto partial_last_row) {
+      fused_qk_norm_rope_token_kernel<128, decltype(heads_per_warp)::value, decltype(partial_last_row)::value>
+          <<<tokens, kTokenKernelWarps * 32, 0, stream>>>(
+          reinterpret_cast<__nv_bfloat16*>(qkv.data_ptr()),
+          static_cast<int>(num_heads_q),
+          static_cast<int>(num_heads_k),
+          static_cast<int>(num_heads_v),
+          static_cast<float>(eps),
+          reinterpret_cast<const __nv_bfloat16*>(q_weight.data_ptr()),
+          reinterpret_cast<const __nv_bfloat16*>(k_weight.data_ptr()),
+          static_cast<float>(rope_theta),
+          reinterpret_cast<const int*>(position_ids.data_ptr()),
+          1.0f,
+          0.0f,
+          0.0f,
+          static_cast<float>(attention_factor),
+          static_cast<int>(rotary_dim));
+    };
+    auto dispatch = [&](auto heads_per_warp) {
+      if ((num_heads_q + num_heads_k) % kTokenKernelWarps != 0) {
+        launch(heads_per_warp, std::true_type{});
+      } else {
+        launch(heads_per_warp, std::false_type{});
+      }
+    };
+    switch ((num_heads_q + num_heads_k + kTokenKernelWarps - 1) / kTokenKernelWarps) {
+      case 1: dispatch(std::integral_constant<int, 1>{}); break;
+      case 2: dispatch(std::integral_constant<int, 2>{}); break;
+      case 3: dispatch(std::integral_constant<int, 3>{}); break;
+      case 4: dispatch(std::integral_constant<int, 4>{}); break;
+      case 5: dispatch(std::integral_constant<int, 5>{}); break;
+      case 6: dispatch(std::integral_constant<int, 6>{}); break;
+      case 7: dispatch(std::integral_constant<int, 7>{}); break;
+      default: dispatch(std::integral_constant<int, kTokenKernelMaxHeadsPerWarp>{}); break;
+    }
+    return true;
+  }
+
+  constexpr int block_size = 256;
+  int warps_per_block = block_size / 32;
+  int total_warps = static_cast<int>(tokens * (num_heads_q + num_heads_k));
+  int grid_size = div_up(total_warps, warps_per_block);
+  dim3 grid(grid_size);
+  dim3 block(block_size);
+  bool interleave = !is_neox;
+  bool share_block_rope = num_heads_q + num_heads_k >= warps_per_block
+      && (num_heads_q + num_heads_k) % warps_per_block == 0;
+  GR_TRTLLM_DISPATCH_SHARE_BLOCK_ROPE(share_block_rope, ShareConst, {
+  switch (head_dim) {
+    case 64:
+      GR_TRTLLM_DISPATCH_INTERLEAVE(interleave, InterleaveConst, {
+        fused_qk_norm_rope_fast_kernel<64, InterleaveConst, ShareConst><<<grid, block, 0, stream>>>(
+            reinterpret_cast<__nv_bfloat16*>(qkv.data_ptr()),
+            static_cast<int>(num_heads_q),
+            static_cast<int>(num_heads_k),
+            static_cast<int>(num_heads_v),
+            static_cast<float>(eps),
+            reinterpret_cast<const __nv_bfloat16*>(q_weight.data_ptr()),
+            reinterpret_cast<const __nv_bfloat16*>(k_weight.data_ptr()),
+            static_cast<float>(rope_theta),
+            reinterpret_cast<const int*>(position_ids.data_ptr()),
+            static_cast<int>(tokens),
+            1.0f,
+            0.0f,
+            0.0f,
+            static_cast<float>(attention_factor),
+            static_cast<int>(rotary_dim));
+      });
+      return true;
+    case 128:
+      GR_TRTLLM_DISPATCH_INTERLEAVE(interleave, InterleaveConst, {
+        fused_qk_norm_rope_fast_kernel<128, InterleaveConst, ShareConst><<<grid, block, 0, stream>>>(
+            reinterpret_cast<__nv_bfloat16*>(qkv.data_ptr()),
+            static_cast<int>(num_heads_q),
+            static_cast<int>(num_heads_k),
+            static_cast<int>(num_heads_v),
+            static_cast<float>(eps),
+            reinterpret_cast<const __nv_bfloat16*>(q_weight.data_ptr()),
+            reinterpret_cast<const __nv_bfloat16*>(k_weight.data_ptr()),
+            static_cast<float>(rope_theta),
+            reinterpret_cast<const int*>(position_ids.data_ptr()),
+            static_cast<int>(tokens),
+            1.0f,
+            0.0f,
+            0.0f,
+            static_cast<float>(attention_factor),
+            static_cast<int>(rotary_dim));
+      });
+      return true;
+    case 256:
+      GR_TRTLLM_DISPATCH_INTERLEAVE(interleave, InterleaveConst, {
+        fused_qk_norm_rope_fast_kernel<256, InterleaveConst, ShareConst><<<grid, block, 0, stream>>>(
+            reinterpret_cast<__nv_bfloat16*>(qkv.data_ptr()),
+            static_cast<int>(num_heads_q),
+            static_cast<int>(num_heads_k),
+            static_cast<int>(num_heads_v),
+            static_cast<float>(eps),
+            reinterpret_cast<const __nv_bfloat16*>(q_weight.data_ptr()),
+            reinterpret_cast<const __nv_bfloat16*>(k_weight.data_ptr()),
+            static_cast<float>(rope_theta),
+            reinterpret_cast<const int*>(position_ids.data_ptr()),
+            static_cast<int>(tokens),
+            1.0f,
+            0.0f,
+            0.0f,
+            static_cast<float>(attention_factor),
+            static_cast<int>(rotary_dim));
+      });
+      return true;
+    default:
+      return false;
+  }
+  });
+  return false;
+}
+
+}  // namespace gr_trtllm_fast_qk
 
 template <typename scalar_t>
 __device__ inline float load_as_float(const scalar_t* ptr, int64_t offset) {
@@ -1097,7 +1625,7 @@ __global__ void write_packed_qkv_prefill_kv_vec_kernel(
   }
 }
 
-void fused_qk_norm_rope_cuda_launcher(
+bool fused_qk_norm_rope_cuda_launcher(
     torch::Tensor qkv,
     int64_t num_heads,
     int64_t num_kv_heads,
@@ -1118,6 +1646,29 @@ void fused_qk_norm_rope_cuda_launcher(
   TORCH_CHECK(position_ids.scalar_type() == at::ScalarType::Int, "position_ids must be int32");
   TORCH_CHECK(rotary_dim == head_dim, "partial rotary_dim is not supported");
   TORCH_CHECK(head_dim % 2 == 0, "head_dim must be even");
+  TORCH_CHECK(
+      q_weight.device() == qkv.device() && k_weight.device() == qkv.device() && position_ids.device() == qkv.device(),
+      "qkv, q/k weights and position_ids must be on the same device");
+
+  const at::cuda::OptionalCUDAGuard device_guard(qkv.device());
+  if (is_aligned_to_16(qkv.data_ptr()) &&
+      gr_trtllm_fast_qk::launch_fused_qk_norm_rope_fast(
+          qkv,
+          num_heads,
+          num_kv_heads,
+          head_dim,
+          rotary_dim,
+          eps,
+          q_weight,
+          k_weight,
+          rope_theta,
+          is_neox,
+          position_ids,
+          attention_factor,
+          is_qk_norm)) {
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    return true;
+  }
 
   int64_t tokens = qkv.size(0);
   int64_t packed_size = qkv.size(1);
@@ -1148,6 +1699,7 @@ void fused_qk_norm_rope_cuda_launcher(
             is_qk_norm);
       });
   C10_CUDA_KERNEL_LAUNCH_CHECK();
+  return false;
 }
 
 torch::Tensor silu_and_mul_packed_cuda_launcher(

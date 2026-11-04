@@ -174,8 +174,10 @@ Core implementation points:
 - Online serving warms up the common batch, pool-window, and `/generate
   ignore_eos` shapes at startup, then freezes new graph capture by default.
 - QK norm and RoPE prefer the fastest available SGLang-style in-place kernels,
-  with FlashInfer/Torch fallback. Experimental branches are not part of the
-  serving hot path.
+  with FlashInfer/Torch fallback. On SM10x with bf16, head_dim 128 and 24 to 32
+  q/k heads, they use the fused CUDA q/k-norm + RoPE op instead unless
+  `GR_INFERENCE_KERNEL_QK_NORM_ROPE` is set. Experimental branches are not part
+  of the serving hot path.
 - Prefill uses SGLang-style piecewise CUDA graph by default. The current
   Qwen3-1.7B bs4/ctx1000 shape captures six graph pieces: embed, four layer
   chunks, and output.
@@ -187,6 +189,14 @@ Fallback to eager decode:
 
 ```bash
 GR_INFERENCE_DISABLE_DECODE_CUDA_GRAPH=1
+```
+
+On SM10x, the CUDA fused q/k-norm + RoPE op runs one block per token from
+1,024 tokens (bf16, head_dim 128, NeoX RoPE, up to 32 q/k heads). To force the
+token kernel on (`1`) or off (`0`):
+
+```bash
+GR_INFERENCE_TRTLLM_QK_NORM_ROPE_TOKEN_KERNEL=0
 ```
 
 Disable SID-GR experimental JIT kernels:
