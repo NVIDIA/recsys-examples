@@ -96,12 +96,21 @@ PyTorch and NVE installations. Without `pynve`, the default is training-only.
 Set `DYNAMICEMB_BUILD_INFERENCE=0` to explicitly build training-only, or `1` to
 require inference support and fail if NVE is missing.
 
+For standalone inference, set `DYNAMICEMB_BUILD_TRAINING=0`. This requires NVE and
+builds only the inference bindings: no TorchRec check, training extension, or
+training eviction kernels. Both installation and wheel building support this
+mode. It uses separate `build_inference` and `torch_binding_build_inference`
+directories to avoid reusing training build artifacts. See the
+[Host-only installation](example/host_embedding/README.md#host-only-installation)
+for deployment without a GPU or CUDA driver.
+
 Inference builds need NVE's PyTorch bindings, CMake, NVTX headers (normally
 supplied by CUDA), and the repository's recursive NVE submodule checkout. For
 external dependency locations, set `NVE_ROOT`, `NVE_LIB_DIR`, or
 `NVTX_INCLUDE_DIR` as needed. Set
-`TORCH_CUDA_ARCH_LIST` for the deployment GPUs. The existing Docker build continues
-to configure CMake first; `setup.py` reuses its `torch_binding_build` configuration
+`TORCH_CUDA_ARCH_LIST` for the deployment GPUs; `CMAKE_CUDA_ARCHITECTURES`
+can also be set explicitly for a fresh CMake build without a GPU. The existing
+Docker build continues to configure CMake first; `setup.py` reuses its `torch_binding_build` configuration
 and incrementally builds the targets. Reconfigure that directory with CMake when
 changing dependency paths or GPU architecture targets.
 

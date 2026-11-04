@@ -7,6 +7,10 @@ include(GNUInstallDirs)
 list(APPEND CMAKE_BUILD_RPATH "$ORIGIN" "$ORIGIN/../../pynve" "$ORIGIN/../../torch/lib")
 
 set(NVE_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../../third_party/nv-embedding-cache" CACHE PATH "NVE source root")
+set(DYNAMICEMB_PYTHON_MODULE_DIR
+    "${CMAKE_CURRENT_SOURCE_DIR}/dynamicemb/exportable_embedding"
+    CACHE PATH "Output directory for the inference Python bindings"
+)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -258,15 +262,13 @@ endif()
 set_target_properties(dynamicemb_exportable_embedding_python PROPERTIES
     PREFIX ""
     OUTPUT_NAME "_C"
-    LIBRARY_OUTPUT_DIRECTORY
-        "${CMAKE_CURRENT_SOURCE_DIR}/dynamicemb/exportable_embedding"
+    LIBRARY_OUTPUT_DIRECTORY "${DYNAMICEMB_PYTHON_MODULE_DIR}"
     INSTALL_RPATH "${CMAKE_INSTALL_FULL_LIBDIR};${NVE_LIB_DIR}"
 )
 set_target_properties(dynamicemb_exportable_embedding_legacy_python PROPERTIES
     PREFIX ""
     OUTPUT_NAME "_C_legacy"
-    LIBRARY_OUTPUT_DIRECTORY
-        "${CMAKE_CURRENT_SOURCE_DIR}/dynamicemb/exportable_embedding"
+    LIBRARY_OUTPUT_DIRECTORY "${DYNAMICEMB_PYTHON_MODULE_DIR}"
     INSTALL_RPATH "${CMAKE_INSTALL_FULL_LIBDIR}"
 )
 install(TARGETS

@@ -2,7 +2,9 @@
 
 `nve_layer_type="host"` stores embedding values on the host. `device="cpu"`
 executes the whole collection on CPU; `device="cuda:0"` uses CUDA keys,
-indexing and outputs with NVE's host lookup. HSTU's dense model remains on CUDA.
+indexing and outputs with NVE's host lookup. Standalone CPU collections run
+without a GPU or CUDA driver when installed with driverless NVE as described below.
+They do not depend on HSTU.
 
 Supported: fused identity, linear hash, single-table identity; FP32/FP16;
 plain, sum and mean lookup; embedded or sidecar index state. BitConcat is
@@ -50,8 +52,47 @@ NVIDIA driver, build NVE with `PYNVE_DRIVERLESS_BUILD=1 PYNVE_DISABLE_MPI=1`
 and keep DynamicEmb inference updates enabled (the default). Set
 `-DNVE_LIB_DIR` to that driverless build.
 A CUDA toolkit and CUDA-capable PyTorch build are still used to build these
-bindings; CPU execution does not require a GPU or driver. Importing the
-collection does not import TorchRec or the DynamicEmb training extension.
+bindings; CPU execution does not require a GPU or driver.
+The inference-only installation avoids the training extension, which links
+`-lcuda`. Importing the collection does not import TorchRec or the DynamicEmb
+training extension.
+
+### Host-only installation
+
+With CUDA-enabled PyTorch and driverless NVE installed, build a DynamicEmb wheel
+from `corelib/dynamicemb`. No GPU, CUDA driver, or TorchRec is needed to build it;
+the builder still needs the CUDA toolkit, CMake, a C++ compiler, and NVTX headers.
+
+```bash
+# Explicit targets avoid GPU detection during the build; these kernels are unused
+# by CPU Host collections. Choose a target supported by the installed toolkit.
+export TORCH_CUDA_ARCH_LIST=8.0
+export CMAKE_CUDA_ARCHITECTURES=80
+DYNAMICEMB_BUILD_TRAINING=0 NVE_ROOT=/path/to/nv-embedding-cache \
+  python3 -m pip wheel --no-build-isolation --no-deps . -w dist/host
+```
+
+`DYNAMICEMB_BUILD_TRAINING=0` builds and packages the inference bindings, including
+Host incremental updates. It skips TorchRec, the training extension, and its
+GPU eviction kernels. It uses `torch_binding_build_inference` and `build_inference`
+to keep previously built training artifacts out of the wheel.
+`python setup.py install` also accepts this environment setting; the default
+training build is unchanged.
+
+Install that wheel in the deployment image/environment alongside matching
+CUDA-enabled PyTorch and driverless NVE:
+
+```bash
+python3 -m pip install --no-deps /wheels/dynamicemb-*.whl
+```
+
+CPU lookup and updates use the installed package; they need neither a GPU, a
+CUDA driver, TorchRec, nor the source checkout. CUDA runtime libraries remain
+required. The CUDA toolkit is needed for building native bindings, not for
+ordinary lookup/update with the installed wheel. AOT export additionally needs
+PyTorch's C++ compilation tools.
+
+### Build directly from source
 
 From `corelib/dynamicemb`, with NVE on `PYTHONPATH`:
 
