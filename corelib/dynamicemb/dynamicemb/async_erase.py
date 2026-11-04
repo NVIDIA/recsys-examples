@@ -397,6 +397,7 @@ def erase_by_score_async(
     chunk_slots: int = ERASE_CHUNK_SLOTS,
     max_in_flight: int = ERASE_MAX_CHUNKS_IN_FLIGHT,
     table_names: Optional[Sequence[str]] = None,
+    strict: bool = True,
 ) -> EraseHandle:
     """Erase, in the background of training, the keys whose score is below ``threshold``
     from every dynamic embedding table of ``model`` that scores its keys by ``score_strategy``,
@@ -419,7 +420,7 @@ def erase_by_score_async(
     score_strategy : DynamicEmbScoreStrategy
         Which tables to erase from, and how their scores read: ``threshold`` is in the
         unit of that score. For ``TIMESTAMP`` take it from
-        ``dynamicemb_extensions.device_timestamp()``; for ``(NO_EVICTION, CUSTOMIZED)`` and
+        ``dynamicemb.device_timestamp()``; for ``(NO_EVICTION, CUSTOMIZED)`` and
         ``(NO_EVICTION, PRECISE_CUSTOMIZED)`` tables, the scores of live keys must be at
         least 1, because an erased slot is cleared to 0. For ``LFU`` the score is the raw
         access count, which never decays (a ``score_function`` only changes how evictions
@@ -450,6 +451,13 @@ def erase_by_score_async(
         qualifies. A name that is in no module, or names a table that does not qualify,
         and an empty list, are errors. Tables that need different thresholds -- a TTL of a
         day on one and of 90 days on another -- take one call each.
+    strict : bool
+        With ``strict=False``, a name in ``table_names`` that no module of this
+        rank's ``model`` holds is skipped instead of being an error, so one call
+        works on every rank when tables are not on every rank (``TABLE_ROW_WISE``).
+        A rank that holds none of the names erases nothing and its result is
+        ``(0, 0)``. A name that is held but does not qualify is an error either
+        way. Default ``True``.
 
     Returns
     -------
@@ -493,7 +501,7 @@ def erase_by_score_async(
                     f"stream is on {stream.device}, the tables are on cuda:{module.device_id}."
                 )
             modules.append((module, names))
-    if table_names is not None:
+    if table_names is not None and strict:
         missing = [name for name in table_names if name not in found]
         if missing:
             raise ValueError(

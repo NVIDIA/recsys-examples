@@ -17,10 +17,14 @@
 model, so that tables which share a module can be erased at thresholds of their own --
 a TTL of an hour on one and of a hundred hours on another, one call each."""
 
+import os
+import subprocess
+import sys
+
+import dynamicemb
 import pytest
 import torch
-from dynamicemb import DynamicEmbScoreStrategy, erase_by_score_async
-from dynamicemb_extensions import device_timestamp
+from dynamicemb import DynamicEmbScoreStrategy, device_timestamp, erase_by_score_async
 from helpers import build_de_table, found, size, train_step
 from torch import nn
 
@@ -181,3 +185,57 @@ def test_on_a_model_a_name_the_strategy_does_not_erase_starts_no_module(device):
         erase_by_score_async(model, S.TIMESTAMP, now - HOUR, table_names=["a_0", "c_0"])
     torch.cuda.synchronize()
     assert size(lru_lfu, 0) == len(KEYS)
+
+
+def test_not_strict_skips_names_this_rank_does_not_hold(device):
+    model, first, second, now = two_module_model(device)
+    stale = len(older_than(HOUR))
+    handle = erase_by_score_async(
+        model, S.TIMESTAMP, now - HOUR, table_names=["a_0", "elsewhere"], strict=False
+    )
+    assert handle.result() == (stale, 0)
+    assert size(first, 0) == len(KEYS) - stale
+    assert size(first, 1) == size(second, 0) == len(KEYS)
+
+
+def test_not_strict_with_no_name_held_erases_nothing(device):
+    model, first, second, now = two_module_model(device)
+    handle = erase_by_score_async(
+        model, S.TIMESTAMP, now - HOUR, table_names=["elsewhere"], strict=False
+    )
+    assert handle.result() == (0, 0)
+    torch.cuda.synchronize()
+    assert size(first, 0) == size(first, 1) == size(second, 0) == len(KEYS)
+
+
+def test_not_strict_still_refuses_a_held_name_the_strategy_does_not_erase(device):
+    lru_lfu, now = two_table_module(device, names=["a_0", "a_1"])
+    lfu = build_de_table(device.index, S.LFU, names=["c_0"])
+    train_step(lfu, KEYS, device)
+    model = nn.ModuleList([lru_lfu, lfu])
+    with pytest.raises(ValueError, match="not erased by"):
+        erase_by_score_async(
+            model,
+            S.TIMESTAMP,
+            now - HOUR,
+            table_names=["a_0", "c_0", "elsewhere"],
+            strict=False,
+        )
+    torch.cuda.synchronize()
+    assert size(lru_lfu, 0) == len(KEYS)
+
+
+def test_device_timestamp_imports_from_dynamicemb_in_a_fresh_process():
+    source_root = os.path.dirname(os.path.dirname(dynamicemb.__file__))
+    probe = "import dynamicemb; print(dynamicemb.device_timestamp())"
+    library_path = os.environ.get("LD_LIBRARY_PATH", "").split(":")
+    without_torch_lib = ":".join(p for p in library_path if "torch" not in p)
+    run = subprocess.run(
+        [sys.executable, "-c", probe],
+        cwd=source_root,
+        env={**os.environ, "LD_LIBRARY_PATH": without_torch_lib},
+        capture_output=True,
+        text=True,
+    )
+    assert run.returncode == 0, run.stderr
+    assert int(run.stdout) > 0
