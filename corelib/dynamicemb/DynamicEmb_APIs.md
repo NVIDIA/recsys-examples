@@ -1464,7 +1464,7 @@ The same call is a method of `BatchedDynamicEmbeddingTablesV2`, `module.erase_by
     DynamicEmbDump(path, model)
     ```
 
-Tables that need different thresholds take one call each, with `table_names`. Here two `(TIMESTAMP, LFU)` tables expire keys at different ages: `story_id` after a day without being seen, `heads_story_id` after 90 days. The calls on one module run one after another, in the order they were made, and each handle has its own counts.
+Tables that need different thresholds take one call each, with `table_names`. Here two `(TIMESTAMP, LFU)` tables expire keys at different ages: `item_id` after a day without being seen, `creator_id` after 90 days. The calls on one module run one after another, in the order they were made, and each handle has its own counts.
 
     ```python
     from dynamicemb import DynamicEmbScoreStrategy, erase_by_score_async
@@ -1473,14 +1473,14 @@ Tables that need different thresholds take one call each, with `table_names`. He
     DAY_NS = 24 * 3600 * 10**9
     now = device_timestamp()   # this rank's device clock, in ns
     short = erase_by_score_async(
-        model, DynamicEmbScoreStrategy.TIMESTAMP, now - DAY_NS, table_names=["story_id"]
+        model, DynamicEmbScoreStrategy.TIMESTAMP, now - DAY_NS, table_names=["item_id"]
     )
     long = erase_by_score_async(
-        model, DynamicEmbScoreStrategy.TIMESTAMP, now - 90 * DAY_NS, table_names=["heads_story_id"]
+        model, DynamicEmbScoreStrategy.TIMESTAMP, now - 90 * DAY_NS, table_names=["creator_id"]
     )
     # Before a dump: both must be finished.
-    erased_story, _ = short.result()
-    erased_heads, _ = long.result()
+    erased_items, _ = short.result()
+    erased_creators, _ = long.result()
     DynamicEmbDump(path, model)
     ```
 
