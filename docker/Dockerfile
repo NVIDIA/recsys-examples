@@ -302,7 +302,7 @@ RUN cd /workspace/deps/fbgemm_hstu/fbgemm_gpu/experimental/hstu && \
     HSTU_DISABLE_DRAB=TRUE \
     HSTU_DISABLE_FP16=TRUE \
     MAX_JOBS="${HSTU_BUILD_JOBS}" \
-    pip install --no-build-isolation . && \
+    pip install --no-cache-dir --no-build-isolation . && \
     rm -rf /workspace/deps/fbgemm_hstu
 
 # ============================================================================
@@ -314,6 +314,31 @@ FROM ${DEVEL_IMAGE} AS build
 RUN rm -rf /workspace/recsys-examples
 WORKDIR /workspace/recsys-examples
 COPY . .
+
+# DEVEL_IMAGE (often devel_latest) already has fbgemm_gpu_hstu pip-installed.
+# That package keeps a fixed version (0.1.0+cu*) so a FBGEMM python-only pin
+# such as the Hopper DSL paged-only gate does not replace dist-packages/hstu.
+# Overlay the submodule python here; keep the prebuilt .so.
+RUN python3 - <<'PY'
+from pathlib import Path
+import importlib.util
+import shutil
+
+src = Path("/workspace/recsys-examples/third_party/FBGEMM/fbgemm_gpu/experimental/hstu")
+spec = importlib.util.find_spec("hstu")
+if spec is None or spec.origin is None:
+    raise SystemExit("installed hstu package not found")
+dst = Path(spec.origin).resolve().parent
+shutil.copy2(src / "hstu" / "cuda_hstu_attention.py", dst / "cuda_hstu_attention.py")
+shutil.copy2(src / "hstu" / "library.py", dst / "library.py")
+dsl_src = src / "src" / "hstu_hopper_dsl"
+if dsl_src.is_dir():
+    shutil.copytree(dsl_src, dst / "hstu_hopper_dsl", dirs_exist_ok=True)
+gate = (dst / "cuda_hstu_attention.py").read_text()
+if "if kv_cache is None:" not in gate:
+    raise SystemExit(f"HSTU overlay missing paged-only DSL gate: {dst / 'cuda_hstu_attention.py'}")
+print(f"overlaid HSTU python from {src} -> {dst}")
+PY
 
 RUN rm -f /usr/lib/$(uname -m)-linux-gnu/libcuda.so.1 && \
     test -e /usr/local/cuda-13/compat/lib.real/libcuda.so.1 && \
