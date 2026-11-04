@@ -45,6 +45,7 @@ from dynamicemb.async_erase import (
     EraseHandle,
     TableAccessGate,
     check_erase_arguments,
+    check_table_names,
 )
 from dynamicemb.batched_dynamicemb_function import (
     DynamicEmbeddingFunction,
@@ -1589,6 +1590,37 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
             )
         return table_ids
 
+    def erase_table_ids(
+        self,
+        score_strategy: DynamicEmbScoreStrategy,
+        table_names: Optional[Sequence[str]] = None,
+    ) -> List[int]:
+        """The tables an erase by ``score_strategy`` scans: :meth:`erasable_table_ids`,
+        narrowed to ``table_names`` when they are given, in table order. Raises if a name
+        is not a table of this module, or names a table that ``score_strategy`` does not
+        erase."""
+        check_table_names(table_names)
+        table_ids = self.erasable_table_ids(score_strategy)
+        if table_names is None:
+            return table_ids
+        unknown = [name for name in table_names if name not in self._table_names]
+        if unknown:
+            raise ValueError(
+                f"table_names {unknown} are not tables of this module, whose tables "
+                f"are {self._table_names}."
+            )
+        erasable = {self._table_names[table_id] for table_id in table_ids}
+        refused = [name for name in table_names if name not in erasable]
+        if refused:
+            raise ValueError(
+                f"Tables {refused} are not erased by {score_strategy}: their score "
+                f"strategy does not have it as a member."
+            )
+        wanted = set(table_names)
+        return [
+            table_id for table_id in table_ids if self._table_names[table_id] in wanted
+        ]
+
     def erase_score_word(
         self, score_strategy: DynamicEmbScoreStrategy, table_ids: Sequence[int]
     ) -> Optional[int]:
@@ -1609,15 +1641,20 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
         stream: Optional[torch.cuda.Stream] = None,
         chunk_slots: int = ERASE_CHUNK_SLOTS,
         max_in_flight: int = ERASE_MAX_CHUNKS_IN_FLIGHT,
+        table_names: Optional[Sequence[str]] = None,
     ) -> EraseHandle:
         """Erase, in the background, the keys whose score is below ``threshold``.
 
         Only tables whose score strategy has ``score_strategy`` as a member are
         scanned (see :meth:`erasable_table_ids`); with none, the handle is done at
-        once and says ``(0, 0)``. In a ``(TIMESTAMP, LFU)`` table the word compared is
-        the one ``score_strategy`` names (:meth:`erase_score_word`). The scan runs on a
-        thread of its own and launches on ``stream``, a stream of the tables' device; the
-        call returns at once. Without a ``stream`` this one uses a stream of its own, made on first use and kept, and the
+        once and says ``(0, 0)``. ``table_names`` narrows them to the tables named, each
+        of which must be one of them (see :meth:`erase_table_ids`); ``None`` is all of
+        them. Tables that need different thresholds take one call each: the calls on a
+        module run one after another, in the order they were made. In a ``(TIMESTAMP,
+        LFU)`` table the word compared is the one ``score_strategy`` names
+        (:meth:`erase_score_word`). The scan runs on a thread of its own and launches on
+        ``stream``, a stream of the tables' device; the call returns at once. Without a
+        ``stream`` this one uses a stream of its own, made on first use and kept, and the
         scan overlaps the training. On the stream the training runs on, or the prefetch
         stream, it is queued among the training's kernels and runs correctly, only
         without overlap, which is warned about. Work the training already queued is not
@@ -1639,9 +1676,9 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
         Returns an :class:`EraseHandle`; ``result()`` is ``(erased, spared)``.
         """
         check_erase_arguments(
-            score_strategy, threshold, stream, chunk_slots, max_in_flight
+            score_strategy, threshold, stream, chunk_slots, max_in_flight, table_names
         )
-        table_ids = self.erasable_table_ids(score_strategy)
+        table_ids = self.erase_table_ids(score_strategy, table_names)
         if not table_ids:
             return EraseHandle.completed()
         if stream is None:

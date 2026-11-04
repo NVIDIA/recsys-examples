@@ -1373,7 +1373,7 @@ Remove, in the background of training, every key whose score is below a threshol
 The call returns at once with a handle; the scan runs on a thread of its own, on a CUDA stream of its own, beside the forward, the backward and the prefetch of the training.
 
 **Behavior**
-- *Which tables.* Those whose score strategy has the one you name as a member, so `CUSTOMIZED` takes `CUSTOMIZED` and `(NO_EVICTION, CUSTOMIZED)` tables, and `PRECISE_CUSTOMIZED` takes `PRECISE_CUSTOMIZED` and `(NO_EVICTION, PRECISE_CUSTOMIZED)` tables. A table that is `NO_EVICTION` alone keeps no score and is never picked; naming `NO_EVICTION` is an error. With no table that qualifies the call is not an error: the handle is done at once and says `(0, 0)`. A table that keeps two score words (`(TIMESTAMP, LFU)`, in either order) is taken by both `TIMESTAMP` and `LFU`, and the one you name is the word compared: `TIMESTAMP` its last-access timestamp (an expiry, whatever the key's frequency), `LFU` its frequency (whatever its age). The other word is not looked at, and an erased key loses both.
+- *Which tables.* Those whose score strategy has the one you name as a member, so `CUSTOMIZED` takes `CUSTOMIZED` and `(NO_EVICTION, CUSTOMIZED)` tables, and `PRECISE_CUSTOMIZED` takes `PRECISE_CUSTOMIZED` and `(NO_EVICTION, PRECISE_CUSTOMIZED)` tables. A table that is `NO_EVICTION` alone keeps no score and is never picked; naming `NO_EVICTION` is an error. With no table that qualifies the call is not an error: the handle is done at once and says `(0, 0)`. A table that keeps two score words (`(TIMESTAMP, LFU)`, in either order) is taken by both `TIMESTAMP` and `LFU`, and the one you name is the word compared: `TIMESTAMP` its last-access timestamp (an expiry, whatever the key's frequency), `LFU` its frequency (whatever its age). The other word is not looked at, and an erased key loses both. `table_names` narrows the call to the tables you name, each of which must qualify; a name that is in no module, a table that does not qualify, or an empty list is an error, raised before anything starts. Tables that need different thresholds take one call each (example below).
 - *The threshold.* A key is erased when its score is **strictly below** `threshold`, an int in `[0, 2**64)`, in the unit the score has: the number you set or gave per key, a step, a frequency, or for `TIMESTAMP` the device clock, which you read with `dynamicemb_extensions.device_timestamp()`. An `LFU` frequency is the raw access count: it never decays (a `score_function` only changes how evictions rank), and a key just admitted starts at its first count, so an erase by `LFU` alone also removes the keys that came in recently. A frequency floor usually wants an age condition with it, which this call does not combine. For `(NO_EVICTION, CUSTOMIZED)` and `(NO_EVICTION, PRECISE_CUSTOMIZED)` tables the scores of the keys you keep must be at least 1: an erased slot is cleared to 0, so a key scored 0 ties with one.
 - *Layouts.* Supported: GPU-only tables, and a cache over host storage (only the storage behind the cache is erased; the cache is neither read nor changed, so a key it still holds can be written back when the cache lets it go). Refused when a table of the module would be scanned: host-only tables, `HybridStorage`, and any layout with an `external_storage`.
 - *What is spared.* Best effort. A key a prefetched batch is using -- from its prefetch to its backward -- is not erased even if its score is below the threshold; it is counted as spared instead. A key whose score is raised or lowered while the scan runs is erased or not by the score it has when the scan reaches it. If the table is expanded while it is scanned (the training inserted more keys than it has room for), that table is scanned again from its first bucket.
@@ -1406,9 +1406,11 @@ Anything the background thread raised is raised by whichever of these you call. 
         stream: Optional[torch.cuda.Stream] = None,
         chunk_slots: int = 1 << 22,
         max_in_flight: int = 2,
+        table_names: Optional[Sequence[str]] = None,
     ) -> EraseHandle:
         """Erase, in the background of training, the keys whose score is below ``threshold``
-        from every dynamic embedding table of ``model`` that scores its keys by ``score_strategy``.
+        from every dynamic embedding table of ``model`` that scores its keys by ``score_strategy``,
+        or only from the tables named in ``table_names``.
 
         Parameters
         ----------
@@ -1427,6 +1429,10 @@ Anything the background thread raised is raised by whichever of these you call. 
             The most slots one chunk of the scan covers, in whole buckets. Default 2**22.
         max_in_flight : int
             At most this many chunks launched and not yet finished on the device. Default 2.
+        table_names : Optional[Sequence[str]]
+            Erase only from these tables, by name; each must qualify for ``score_strategy``.
+            Default ``None``: every table that qualifies. A name in no module, a table that does
+            not qualify, and an empty list are errors.
 
         Returns
         -------
@@ -1435,7 +1441,7 @@ Anything the background thread raised is raised by whichever of these you call. 
         """
     ```
 
-The same call is a method of `BatchedDynamicEmbeddingTablesV2`, `module.erase_by_score_async(score_strategy, threshold, stream=None, chunk_slots=..., max_in_flight=...)`, for the tables of that one module.
+The same call is a method of `BatchedDynamicEmbeddingTablesV2`, `module.erase_by_score_async(score_strategy, threshold, stream=None, chunk_slots=..., max_in_flight=..., table_names=None)`, for the tables of that one module.
 
     ```python
     # Keep the last 1000 steps. Every key is given the step it was seen in, as its score
@@ -1455,6 +1461,26 @@ The same call is a method of `BatchedDynamicEmbeddingTablesV2`, `module.erase_by
     # Before a dump: the erase must be finished.
     if handle is not None:
         erased, spared = handle.result()   # this rank's
+    DynamicEmbDump(path, model)
+    ```
+
+Tables that need different thresholds take one call each, with `table_names`. Here two `(TIMESTAMP, LFU)` tables expire keys at different ages: `story_id` after a day without being seen, `heads_story_id` after 90 days. The calls on one module run one after another, in the order they were made, and each handle has its own counts.
+
+    ```python
+    from dynamicemb import DynamicEmbScoreStrategy, erase_by_score_async
+    from dynamicemb_extensions import device_timestamp
+
+    DAY_NS = 24 * 3600 * 10**9
+    now = device_timestamp()   # this rank's device clock, in ns
+    short = erase_by_score_async(
+        model, DynamicEmbScoreStrategy.TIMESTAMP, now - DAY_NS, table_names=["story_id"]
+    )
+    long = erase_by_score_async(
+        model, DynamicEmbScoreStrategy.TIMESTAMP, now - 90 * DAY_NS, table_names=["heads_story_id"]
+    )
+    # Before a dump: both must be finished.
+    erased_story, _ = short.result()
+    erased_heads, _ = long.result()
     DynamicEmbDump(path, model)
     ```
 
