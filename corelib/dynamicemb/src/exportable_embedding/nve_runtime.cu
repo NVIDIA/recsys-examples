@@ -46,7 +46,7 @@ NveRuntimeDirectory::NveRuntimeDirectory(const std::string& path, int device)
   TORCH_CHECK(file.is_open(), "Cannot open NVE metadata in ", path);
   const auto doc = nlohmann::json::parse(file);
   TORCH_CHECK(doc.is_object() && doc.at("version") == 2,
-              "DynamicEmb tier bindings require NVE 26.10 v2 metadata");
+              "DynamicEmb tier bindings require NVE metadata schema v2 (26.06 or later)");
   const auto& resources = doc.at("resources");
   std::set<std::string> module_paths;
   std::set<int64_t> ids;
@@ -106,10 +106,13 @@ NveRuntimeDirectory::NveRuntimeDirectory(const std::string& path, int device)
       auto storage = impl_->resources.find_memblock(ref);
       const bool load_weights = !storage;
       if (!storage) {
-        const auto type = mb.at("type").get<std::string>();
+        auto type = mb.at("type").get<std::string>();
         TORCH_CHECK(type.find("NVL") == std::string::npos &&
                         type.find("MPI") == std::string::npos,
                     "DynamicEmb runtime does not load distributed MemBlock topology");
+        // NVE 26.06 exports UserMemBlock as Managed even for CPU HostLayer.
+        // Match the stock Python loader: CPU replay needs plain host storage.
+        if (device < 0 && kind == "HostLayer") type = "Host";
         storage = nve::create_memblock(type, dim, rows, dtype, device, kind == "GPULayer");
         impl_->resources.insert_memblock(ref, storage);
       }

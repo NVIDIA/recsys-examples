@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Inference constructors for tier-capable bindings on NVE 26.10.
+"""Inference constructors for tier-capable bindings on NVE 26.06 and later.
 
 The stock NVE constructors/loaders hardcode their binding types. Keep the small
 constructor adaptation here; forward, export discovery and serialization remain
@@ -55,7 +55,11 @@ def _init_layer(
         values = torch.empty(
             num_embeddings, embedding_size, dtype=data_type, device=device
         )
-        self.storage = nve.UserMemBlock(values.data_ptr(), values.nbytes)
+        # NVE 26.08 added sized MemBlocks and the required size argument.
+        size_args = (
+            (values.nbytes,) if hasattr(nve.MemBlock, "get_size_in_bytes") else ()
+        )
+        self.storage = nve.UserMemBlock(values.data_ptr(), *size_args)
         self.memblock_type = self.storage.get_type()
         self.emb_layer = _C.TierGPUEmbedding(
             *common, self.storage, self.device_index, self.config
@@ -84,9 +88,11 @@ def _init_layer(
             if storage.data_type != data_type:
                 raise ValueError("Parameter-server dtype mismatch")
             remote = storage.parameter_server
-        self.config.default_embedding = [0] * (
-            embedding_size * torch.empty(0, dtype=data_type).element_size()
-        )
+        # Configurable miss values were added in NVE 26.09.
+        if hasattr(self.config, "default_embedding"):
+            self.config.default_embedding = [0] * (
+                embedding_size * torch.empty(0, dtype=data_type).element_size()
+            )
         self.emb_layer = _C.TierHierarchicalEmbedding(
             embedding_size,
             self.layer_data_type,

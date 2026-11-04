@@ -54,7 +54,7 @@ target_link_libraries(replay_and_verify PRIVATE
     "${NVE_COMMON}"
 )
 
-# Unset selects the repository NVE (26.07 or later); set 26.05 explicitly for compatibility.
+# Unset selects the repository NVE (26.06 or later); set 26.05 explicitly for compatibility.
 if(
   NOT DEFINED NVE_VERSION
   OR NVE_VERSION STREQUAL ""

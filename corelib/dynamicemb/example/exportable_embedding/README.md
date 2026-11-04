@@ -40,6 +40,10 @@ coordinator subprocess, and runs the in-process DynamicEmb delta producers.
 The NVHashMap host caches are empty when loaded and are populated by inference;
 their contents are not exported.
 
+This example uses unpooled lookup, supported from 26.06 in the modern path.
+Pooled collections require 26.07+ (or legacy 26.05); Host collections require
+26.09+. See [NVE compatibility and rebuild requirements](../../docs/nve_tier_updates.md).
+
 Build the optional C++ replayer for the selected NVE installation:
 
 ```bash
@@ -51,7 +55,7 @@ cmake -S /workspace/recsys-examples/corelib/dynamicemb/example/exportable_embedd
 cmake --build /workspace/recsys-examples/corelib/dynamicemb/example/exportable_embedding/cpp/build -j 8
 ```
 
-Run all four combinations with the repository NVE (26.07 or later):
+Run all four combinations with the repository NVE (26.06 or later):
 
 ```bash
 /workspace/recsys-examples/corelib/dynamicemb/example/exportable_embedding/run_example.sh \
