@@ -29,7 +29,7 @@ namespace hier_output_dist {
 
 namespace {
 
-// Part 1 runs the rules present: their codes on the host.
+// The bucketize runs the rules present: their codes on the host.
 OwnerRules owner_rules(const Config &config) {
   const at::Tensor codes = config.dist_types.to(at::kCPU, at::kInt).contiguous();
   return OwnerRules{config.dist_types, config.block_sizes,
@@ -98,14 +98,14 @@ InChannel::InChannel(const Config &config, const Sizes &sizes, ncclWindow_t wind
   const int64_t num_nodes = sizes_.topo.num_nodes, num_features = sizes_.num_features;
   remote_keys_ = node_keys.narrow(0, keys.remote_start(), remote_keys);
   if (config.weights) remote_weights_ = node_weights.narrow(0, keys.remote_start(), remote_keys);
-  remote_cells_ = view(keys.remote_cells(), {remote_keys}, at::kInt);
+  bucket_feature_of_occ_ = view(keys.bucket_feature_of_occ(), {remote_keys}, at::kInt);
   proxy_buffers_ =
       proxy_buffers(view(keys.remote_map().base, {RemoteMap::kArrays, remote_keys}, at::kInt),
                     view(keys.key_stage(), {(int64_t)keys.key_stage_bytes() / 8}, at::kLong),
                     keys.proxy_header(), options);
   rail_keys_ = view(keys.rail_keys(), {(int64_t)keys.rail_keys_bytes() / 8}, at::kLong);
-  cell_stage_ = view(keys.cell_stage(0), {num_nodes, num_features}, at::kLong);
-  rail_cells_ = view(keys.rail_cells(0), {num_nodes, num_features}, at::kLong);
+  source_offsets_ = view(keys.source_offsets(0), {num_nodes, num_features}, at::kLong);
+  owner_offsets_ = view(keys.owner_offsets(0), {num_nodes, num_features}, at::kLong);
   tables_ = at::tensor(dense_tables(config.feature_tables), at::kInt).to(options);
   other_nodes_ = other_nodes_of(sizes_.topo, options);
   header_gather_ = header_gather(sizes_, options);
@@ -119,38 +119,38 @@ InDist InChannel::input_dist(const PlanInput &input) {
               "weights (",
               weights_ ? "with" : "without", ")");
   ++seq_;
-  // Part 1: the call's keys by owner, and under index dedup its fan-out.
-  const Partition part = partition_keys(input, rules_, sizes_.topo.world_size);
+  // The bucketize: the call's keys by owner, and under index dedup its fan-out.
+  const BucketizedKeys bucketized = bucketize_keys(input, rules_, sizes_.topo.world_size);
   const bool index_dedup = input.reverse_indices.has_value();
   const FanoutTables fanout =
-      index_dedup ? fanout_tables(*input.reverse_indices, part.inv) : FanoutTables{};
+      index_dedup ? fanout_tables(*input.reverse_indices, bucketized.inv) : FanoutTables{};
   const Topo &topo = sizes_.topo;
   const int64_t local_size = topo.local_size, num_nodes = topo.num_nodes,
                 num_features = sizes_.num_features, lookup_keys = sizes_.lookup_keys,
                 remote_keys = sizes_.remote_keys;
-  const auto long_options = part.block_start.options();
+  const auto long_options = bucketized.offset_per_bucket.options();
   InDist dist;
   FwdPlan &fwd = dist.fwd_plan;
   BwdPlan &bwd = dist.bwd_plan;
-  fwd.block_start = bwd.block_start = part.block_start;
-  fwd.inv = bwd.inv = part.inv;
+  fwd.offset_per_bucket = bwd.offset_per_bucket = bucketized.offset_per_bucket;
+  fwd.inv = bwd.inv = bucketized.inv;
   fwd.fanout = bwd.fanout = fanout;
   // The node: every rank's counts (and the node barrier), the layout of the
   // node's keys, and this rank's keys pushed to their targets.
-  const auto [totals, before, mine] =
-      node_count_exchange(node_count_vector(part.cell_start, topo, num_features));
+  const auto [totals, before, mine] = node_count_exchange(
+      node_count_vector(bucketized.offset_per_bucket_feature, topo, num_features));
   const NodeLayout node =
-      node_layout(NodeCounts{totals, before, mine}, part.cell_start, part.block_start, topo,
-                  num_features, lookup_keys, remote_keys);
-  node_key_push(part.keys, part.key_weights, part.row_cell, node.destination_base,
-                node.rows_to_push);
+      node_layout(NodeCounts{totals, before, mine}, bucketized.offset_per_bucket_feature,
+                  bucketized.offset_per_bucket, topo, num_features, lookup_keys, remote_keys);
+  node_key_push(bucketized.keys, bucketized.key_weights, bucketized.bucket_feature_of_row,
+                node.destination_base, node.rows_to_push);
   node_done();
   at::Tensor peer_needs, num_recv, length_per_key, group_subs, occurrences;
   if (num_nodes == 1) {
     // The own part of node_keys is the owner's KJT, and a row's place in its
     // owner's KJT is where it was pushed.
-    const OneNodeOwner owner =
-        one_node_owner(node, part.row_cell, own_keys_, own_weights_, topo, num_features);
+    const OneNodeOwner owner = one_node_owner(node, bucketized.bucket_feature_of_row, own_keys_,
+                                              own_weights_, topo, num_features);
     fwd.src = bwd.dst = owner.src;
     dist.kjt_values = owner.kjt_values;
     dist.kjt_weights = owner.kjt_weights;
@@ -162,40 +162,43 @@ InDist InChannel::input_dist(const PlanInput &input) {
     // The proxy: the node-unique keys of its remote part, their rows and
     // the chunks of its stream, and its node's push orders (into
     // remote_map, key_stage and the proxy header).
-    ProxyKeys keys = proxy_keys(ProxyInput{remote_keys_, remote_weights_, remote_cells_,
+    ProxyKeys keys = proxy_keys(ProxyInput{remote_keys_, remote_weights_, bucket_feature_of_occ_,
                                            node.requester_start, node.skip, tables_},
                                 sizes_, node_dedup_);
     ProxyChunks chunks = proxy_chunks_and_slots(keys, node.requester_start, proxy_buffers_, sizes_);
     const ProxyPlan proxy = proxy_push_order(std::move(keys), std::move(chunks),
                                              node.requester_start, proxy_buffers_, sizes_);
     // The rail: the count messages, the layout of the rail, then the
-    // proxies' key records into the owners' rail_keys and the owners' cell
-    // starts into the proxies' rail_cells.
+    // proxies' key records into the owners' rail_keys and the owners'
+    // source_offsets into the proxies' owner_offsets.
     const at::Tensor message =
         count_message(node.need_remote, node.own_total.select(0, topo.local_rank), proxy.uniq_out,
-                      proxy.chunks_out, proxy.cell_uniq);
+                      proxy.chunks_out, proxy.uniq_per_bucket_feature);
     const at::Tensor messages = rail_count_exchange(message);
-    const RailLayout rail = rail_layout(messages, node.own_cells, other_nodes_, sizes_);
-    cell_stage_.copy_(rail.cell_stage);
+    const RailLayout rail = rail_layout(messages, node.own_lengths, other_nodes_, sizes_);
+    source_offsets_.copy_(rail.source_offsets);
     rail_key_exchange(proxy.stage_slice, rail.put_dst, rail.put_bytes, rail.put_skip);
     // The node again: the call's needs, where the node's owners hold this
-    // requester's cells, and what the node's proxies published for it.
-    at::Tensor owner_cell_start;
-    std::tie(peer_needs, owner_cell_start) = node_status_exchange(status_publish(rail));
+    // requester's keys of each feature, and what the node's proxies published
+    // for it.
+    at::Tensor offset_per_owner_feature;
+    std::tie(peer_needs, offset_per_owner_feature) = node_status_exchange(status_publish(rail));
     const at::Tensor headers =
         peer_gather(kGatherProxyHeader, header_gather_.peer, header_gather_.first_word)
             .view({local_size, ProxyHeader::of(sizes_).gathered_words()});
-    const PeerWords rows =
-        remote_rows(part.row_cell, part.block_start, node.destination_base, sizes_);
+    const PeerWords rows = remote_rows(bucketized.bucket_feature_of_row,
+                                       bucketized.offset_per_bucket, node.destination_base, sizes_);
     at::Tensor words = peer_gather(kGatherRemoteMap, rows.peer, rows.first_word);
     const RequesterTables requester = requester_tables(
-        words, headers, owner_cell_start, part.row_cell, part.cell_start, part.block_start, sizes_);
+        words, headers, offset_per_owner_feature, bucketized.bucket_feature_of_row,
+        bucketized.offset_per_bucket_feature, bucketized.offset_per_bucket, sizes_);
     words = at::Tensor();  // requester_tables is its one reader: free it before the owner tables
-    const OwnerTables owner = owner_tables(rail, node.own_starts, own_keys_, own_weights_,
+    const OwnerTables owner = owner_tables(rail, node.own_offsets, own_keys_, own_weights_,
                                            rail_keys_, other_nodes_, sizes_);
     const PutLists lists = put_lists(proxy.chunks, proxy.node_chunk_start, proxy.node_chunks,
-                                     proxy.uniq_off, proxy.cell_uniq, rail_cells_, owner.fwd_chunks,
-                                     owner.fwd_chunk_start, rail.cells_in, rail.cell_stage, sizes_);
+                                     proxy.uniq_off, proxy.uniq_per_bucket_feature, owner_offsets_,
+                                     owner.fwd_chunks, owner.fwd_chunk_start,
+                                     rail.length_per_source_feature, rail.source_offsets, sizes_);
     // The plans: the requester's maps and its tables of the node's proxies,
     // the owner's and the proxy's tables, the proxy's reducer list and the
     // put lists. Then the owner's KJT.
@@ -239,7 +242,7 @@ InDist InChannel::input_dist(const PlanInput &input) {
       data_or_null<int64_t>(peer_needs), local_size, node.need_lookup.data_ptr<int64_t>(),
       num_recv.data_ptr<int64_t>(), index_dedup ? fanout.count.data_ptr<int64_t>() + 1 : nullptr,
       data_or_null<int64_t>(group_subs), data_or_null<int64_t>(occurrences),
-      length_per_key.data_ptr<int64_t>(), part.input_length_per_key.data_ptr<int64_t>(),
+      length_per_key.data_ptr<int64_t>(), bucketized.input_length_per_key.data_ptr<int64_t>(),
       num_features, dist.status.data_ptr<int64_t>());
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   return dist;

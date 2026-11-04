@@ -32,24 +32,19 @@ namespace hier_output_dist {
 
 namespace {
 
-// An int32 table of records (Chunk, ReqEntry), as its records.
-template <typename Record>
-Record *records_of(const at::Tensor &table) {
-  return reinterpret_cast<Record *>(table.data_ptr<int32_t>());
-}
-
 // ── step 1: the node-unique keys ──
 
-// The owner node of a cell owner node * num_features + feature (the cell
-// past the node-unique keys, num_nodes * num_features: the last node).
-__device__ __forceinline__ int64_t owner_node_of(int64_t cell, int64_t num_features,
+// The owner node of a bucket feature owner node * num_features + feature (the
+// bucket feature past the node-unique keys, num_nodes * num_features: the last
+// node).
+__device__ __forceinline__ int64_t owner_node_of(int64_t bucket_feature, int64_t num_features,
                                                  int64_t num_nodes) {
-  return min(cell / num_features, num_nodes - 1);
+  return min(bucket_feature / num_features, num_nodes - 1);
 }
 
-// A thread per occurrence: whether it is valid, among the occurrences the
-// node layout counts for this proxy (none when the node skips the call), and
-// its own index, which the sort by key carries (and the sort by cell, as an
+// A thread per occurrence: whether it is valid, among the occurrences the node
+// layout counts for this proxy (none when the node skips the call), and its own
+// index, which the sort by key carries (and the sort by bucket feature, as an
 // identity's index). The first thread writes the count.
 __global__ void __launch_bounds__(kThreads)
     valid_occurrences_kernel(const bool *skip, const int64_t *requester_start, int64_t local_size,
@@ -67,16 +62,17 @@ __global__ void __launch_bounds__(kThreads)
 // of the occurrence there, owner node * num_tables + the table of its
 // feature, or num_nodes * num_tables for an invalid one (which sorts it last).
 __global__ void __launch_bounds__(kThreads)
-    identity_tags_kernel(const int32_t *by_key, const bool *valid, const int32_t *cells,
-                         const int32_t *tables, int64_t entries, int64_t num_nodes,
-                         int64_t num_features, int64_t num_tables, int32_t *tag) {
+    identity_tags_kernel(const int32_t *by_key, const bool *valid,
+                         const int32_t *bucket_feature_of_occ, const int32_t *tables,
+                         int64_t entries, int64_t num_nodes, int64_t num_features,
+                         int64_t num_tables, int32_t *tag) {
   for (int64_t position = first_item(); position < entries; position += item_stride()) {
     const int32_t occurrence = by_key[position];
     int64_t identity_tag = num_nodes * num_tables;
     if (valid[occurrence]) {
-      const int64_t cell = cells[occurrence];
-      identity_tag =
-          owner_node_of(cell, num_features, num_nodes) * num_tables + tables[cell % num_features];
+      const int64_t bucket_feature = bucket_feature_of_occ[occurrence];
+      identity_tag = owner_node_of(bucket_feature, num_features, num_nodes) * num_tables +
+                     tables[bucket_feature % num_features];
     }
     tag[position] = (int32_t)identity_tag;
   }
@@ -84,21 +80,21 @@ __global__ void __launch_bounds__(kThreads)
 
 // A thread per sorted position (the occurrences in identity order): whether
 // an identity starts there, where the key or the tag differs from the
-// position before (without node dedup: at every position); and when the
-// records carry the weights, the weight of its occurrence as a whole number
-// (0 when invalid), which the identities sum. It also sets the smallest
-// feature of identity `position` above every feature, for the next kernel to
-// lower.
+// position before (at every position without node dedup, kNodeDedup false);
+// and when the records carry the weights, the weight of its occurrence as a
+// whole number (0 when invalid), which the identities sum. It also sets the
+// smallest feature of identity `position` above every feature, for the next
+// kernel to lower.
+template <bool kNodeDedup>
 __global__ void __launch_bounds__(kThreads)
     identity_starts_kernel(const int32_t *order, const int32_t *tag_sorted,
                            const int64_t *occurrence_keys, const float *weights, const bool *valid,
-                           int64_t entries, int64_t num_features, bool node_dedup,
-                           bool *starts_identity, int64_t *position_weight,
-                           int32_t *smallest_feature) {
+                           int64_t entries, int64_t num_features, bool *starts_identity,
+                           int64_t *position_weight, int32_t *smallest_feature) {
   for (int64_t position = first_item(); position < entries; position += item_stride()) {
     const int32_t occurrence = order[position];
     starts_identity[position] =
-        !node_dedup || position == 0 ||
+        !kNodeDedup || position == 0 ||
         occurrence_keys[occurrence] != occurrence_keys[order[position - 1]] ||
         tag_sorted[position] != tag_sorted[position - 1];
     if (position_weight != nullptr)
@@ -116,10 +112,11 @@ __global__ void __launch_bounds__(kThreads)
 // requester, each requester's by feature. The first thread writes num_keys:
 // the identities that start at the valid positions, which come first.
 __global__ void __launch_bounds__(kThreads)
-    identity_ranges_kernel(const int32_t *identity_ends, const int32_t *order, const int32_t *cells,
-                           const bool *valid, const int64_t *occurrence_count, int64_t entries,
-                           int64_t num_features, int32_t *identity_of, int32_t *identity_start,
-                           int32_t *smallest_feature, int64_t *num_keys) {
+    identity_ranges_kernel(const int32_t *identity_ends, const int32_t *order,
+                           const int32_t *bucket_feature_of_occ, const bool *valid,
+                           const int64_t *occurrence_count, int64_t entries, int64_t num_features,
+                           int32_t *identity_of, int32_t *identity_start, int32_t *smallest_feature,
+                           int64_t *num_keys) {
   const int32_t identities = identity_ends[entries];
   if (first_item() == 0) *num_keys = identity_ends[*occurrence_count];
   for (int64_t position = first_item(); position <= entries; position += item_stride()) {
@@ -130,38 +127,40 @@ __global__ void __launch_bounds__(kThreads)
     identity_of[position] = identity;
     if (starts) identity_start[identity] = (int32_t)position;
     if (!valid[position]) continue;
-    const int32_t feature = (int32_t)(cells[order[position]] % num_features);
-    if (starts || feature < cells[order[position - 1]] % num_features)
+    const int32_t feature = (int32_t)(bucket_feature_of_occ[order[position]] % num_features);
+    if (starts || feature < bucket_feature_of_occ[order[position - 1]] % num_features)
       atomicMin(&smallest_feature[identity], feature);
   }
 }
 
-// A thread per identity: its cell, its owner node * num_features + its
-// smallest feature; num_nodes * num_features past the node-unique keys,
+// A thread per identity: its bucket feature, its owner node * num_features +
+// its smallest feature; num_nodes * num_features past the node-unique keys,
 // which sorts those last.
 __global__ void __launch_bounds__(kThreads)
-    identity_cells_kernel(const int32_t *identity_start, const int32_t *order, const int32_t *cells,
-                          const int32_t *smallest_feature, const int64_t *num_keys, int64_t entries,
-                          int64_t num_nodes, int64_t num_features, int32_t *identity_cell) {
+    identity_bucket_features_kernel(const int32_t *identity_start, const int32_t *order,
+                                    const int32_t *bucket_feature_of_occ,
+                                    const int32_t *smallest_feature, const int64_t *num_keys,
+                                    int64_t entries, int64_t num_nodes, int64_t num_features,
+                                    int32_t *identity_bucket_feature) {
   const int64_t valid_keys = *num_keys;
   for (int64_t identity = first_item(); identity < entries; identity += item_stride()) {
-    int64_t cell = num_nodes * num_features;
+    int64_t bucket_feature = num_nodes * num_features;
     if (identity < valid_keys) {
-      const int64_t first_cell = cells[order[identity_start[identity]]];
-      cell = owner_node_of(first_cell, num_features, num_nodes) * num_features +
-             smallest_feature[identity];
+      const int64_t first_bucket_feature = bucket_feature_of_occ[order[identity_start[identity]]];
+      bucket_feature = owner_node_of(first_bucket_feature, num_features, num_nodes) * num_features +
+                       smallest_feature[identity];
     }
-    identity_cell[identity] = (int32_t)cell;
+    identity_bucket_feature[identity] = (int32_t)bucket_feature;
   }
 }
 
-// A thread per key index u (the identities sorted by cell): which key index
-// its identity gets (key_of_identity, the inverse of the sort), and its
+// A thread per key index u (the identities sorted by bucket feature): which key
+// index its identity gets (key_of_identity, the inverse of the sort), and its
 // entries of the per-key tables of ProxyKeys; it is heavy with more than
 // heavy_at occurrences. Its record's weight: the sum of its occurrences'
 // weights (from weight_ends at its positions), or their count.
 __global__ void __launch_bounds__(kThreads)
-    key_tables_kernel(const int32_t *identity_of_key, const int32_t *cell_of_key,
+    key_tables_kernel(const int32_t *identity_of_key, const int32_t *bucket_feature_of_key,
                       const int32_t *identity_start, const int32_t *order,
                       const int64_t *occurrence_keys, const int64_t *weight_ends,
                       const int64_t *uniq_off, const int64_t *num_keys, int64_t entries,
@@ -173,7 +172,7 @@ __global__ void __launch_bounds__(kThreads)
   for (int64_t key = first_item(); key < entries; key += item_stride()) {
     const int32_t identity = identity_of_key[key];
     const int32_t first = identity_start[identity], end = identity_start[identity + 1];
-    const int64_t owner_node = owner_node_of(cell_of_key[key], num_features, num_nodes);
+    const int64_t owner_node = owner_node_of(bucket_feature_of_key[key], num_features, num_nodes);
     key_of_identity[identity] = (int32_t)key;
     valid_key[key] = key < valid_keys;
     key_count[key] = end - first;
@@ -196,13 +195,16 @@ __global__ void __launch_bounds__(kThreads)
     key_at[position] = key_of_identity[identity_of[position]];
 }
 
-// One CTA: the node-unique keys of each cell and of each owner node, from
-// where they start.
+// One CTA: the node-unique keys of each bucket feature and of each owner node,
+// from where they start.
 __global__ void __launch_bounds__(kThreads)
-    key_counts_kernel(const int64_t *cell_key_start, const int64_t *uniq_off, int64_t num_nodes,
-                      int64_t num_features, int64_t *cell_uniq, int64_t *uniq_out) {
-  for (int64_t cell = threadIdx.x; cell < num_nodes * num_features; cell += kThreads)
-    cell_uniq[cell] = cell_key_start[cell + 1] - cell_key_start[cell];
+    key_counts_kernel(const int64_t *key_offset_per_bucket_feature, const int64_t *uniq_off,
+                      int64_t num_nodes, int64_t num_features, int64_t *uniq_per_bucket_feature,
+                      int64_t *uniq_out) {
+  for (int64_t bucket_feature = threadIdx.x; bucket_feature < num_nodes * num_features;
+       bucket_feature += kThreads)
+    uniq_per_bucket_feature[bucket_feature] = key_offset_per_bucket_feature[bucket_feature + 1] -
+                                              key_offset_per_bucket_feature[bucket_feature];
   for (int64_t owner_node = threadIdx.x; owner_node < num_nodes; owner_node += kThreads)
     uniq_out[owner_node] = uniq_off[owner_node + 1] - uniq_off[owner_node];
 }
@@ -395,19 +397,19 @@ __global__ void __launch_bounds__(kThreads) stream_kernel(StreamArgs args) {
 // chunk's place in proxy_rows (its start % ring) its row and, after the
 // chunk's keys' rows, the first slot of its duplicates and its first partial
 // row (a chunk's rows: its keys' rows, then the duplicates' slots, then the
-// partial rows of its heavy keys, heavy_partials each); and its record in its
-// owner node's slice of key_stage, after the node's chunks: the key and, in
-// 16 bytes, its weight's bits and 4 zero bytes. Its occurrences add to its
+// partial rows of its heavy keys, heavy_partials each); and its Record
+// (KeyRecord, or WeightedKeyRecord with its weight) in its owner node's
+// slice of key_stage, after the node's chunks. Its occurrences add to its
 // chunk's pulls, a sum per chunk of a warp's keys.
+template <typename Record>
 __global__ void __launch_bounds__(kThreads)
     key_rows_kernel(Levels levels, const int32_t *duplicate_ends, const int32_t *heavy_ends,
                     const int32_t *key_node, const int32_t *key_count, const int64_t *key_value,
                     const float *key_weight, const int32_t *node_chunks,
                     const int64_t *node_chunk_start, const int64_t *stage_slice,
                     const int64_t *num_keys, int64_t max_chunks, int64_t ring,
-                    int64_t heavy_partials, int64_t record_bytes, Chunk *chunks, int32_t *key_chunk,
-                    int32_t *key_row, int32_t *duplicate_base, int32_t *partial_base,
-                    int64_t *key_stage) {
+                    int64_t heavy_partials, Chunk *chunks, int32_t *key_chunk, int32_t *key_row,
+                    int32_t *duplicate_base, int32_t *partial_base, char *key_stage) {
   const int64_t valid_keys = *num_keys;
   const int lane = threadIdx.x & 31;
   // a warp's keys at a time, so every lane takes part in the sums
@@ -429,13 +431,12 @@ __global__ void __launch_bounds__(kThreads)
       duplicate_base[key] = (int32_t)(keys_end + duplicate_ends[key] - duplicate_ends[lo]);
       partial_base[key] = (int32_t)(keys_end + duplicate_ends[hi] - duplicate_ends[lo] +
                                     (int64_t)(heavy_ends[key] - heavy_ends[lo]) * heavy_partials);
-      int64_t *record =
-          key_stage +
-          (stage_slice[owner_node] + levels.chunks_out[owner_node] * (int64_t)sizeof(ChunkPiece)) /
-              8 +
-          (key - first) * (record_bytes / 8);
-      record[0] = key_value[key];
-      if (record_bytes == 16) record[1] = (int64_t)__float_as_uint(key_weight[key]);
+      Record *records = (Record *)(key_stage + stage_slice[owner_node] +
+                                   levels.chunks_out[owner_node] * (int64_t)sizeof(ChunkPiece));
+      Record record{};
+      record.key = key_value[key];
+      if constexpr (Record::kWeighted) record.weight = key_weight[key];
+      records[key - first] = record;
       occurrences = key_count[key];
     }
     // the lanes of each chunk: their sum, added once
@@ -448,15 +449,15 @@ __global__ void __launch_bounds__(kThreads)
 // A thread per valid sorted position: its occurrence's requester (from
 // requester_start) and its slot: for a heavy key its requester's partial;
 // else the key's row for its first occurrence, a duplicate slot for the
-// others. remote_map gets the occurrence's key row (bit 31: a heavy key) and
-// its slot.
+// others. remote_map gets the occurrence's key row (MapKeyRow: the row and
+// whether the key is heavy) and its slot.
 __global__ void __launch_bounds__(kThreads)
     occurrence_slots_kernel(const int32_t *order, const int32_t *key_at, const int32_t *key_first,
                             const bool *key_heavy, const int32_t *key_row,
                             const int32_t *duplicate_base, const int32_t *partial_base,
                             const int64_t *requester_start, const int64_t *occurrence_count,
                             int64_t local_size, int64_t partial_rows, int32_t *requester_of,
-                            int32_t *slot_at, int32_t *map_key_row, int32_t *map_slot) {
+                            int32_t *slot_at, MapKeyRow *map_key_row, int32_t *map_slot) {
   const int64_t count = *occurrence_count;
   for (int64_t position = first_item(); position < count; position += item_stride()) {
     const int32_t occurrence = order[position], key = key_at[position];
@@ -473,7 +474,7 @@ __global__ void __launch_bounds__(kThreads)
       slot = duplicate_base[key] + place - 1;
     requester_of[occurrence] = (int32_t)requester;
     slot_at[position] = (int32_t)slot;
-    map_key_row[occurrence] = (int32_t)((uint32_t)key_row[key] | (uint32_t)key_heavy[key] << 31);
+    map_key_row[occurrence] = MapKeyRow::of(key_row[key], key_heavy[key]);
     map_slot[occurrence] = (int32_t)slot;
   }
 }
@@ -491,13 +492,12 @@ __global__ void __launch_bounds__(kThreads)
                      int64_t *push_key, int32_t *index) {
   for (int64_t position = first_item(); position < entries; position += item_stride()) {
     const int32_t occurrence = order[position];
-    int64_t push = local_size << layout.requester_shift;
+    int64_t push = layout.of(local_size, 0, false, 0);
     if (valid[occurrence]) {
       const int32_t key = key_at[position];
       const bool heavy = key_heavy[key];
-      push = ((int64_t)requester_of[occurrence] << layout.requester_shift) |
-             ((int64_t)key_chunk[key] << layout.chunk_shift) |
-             ((int64_t)heavy << layout.heavy_shift) | (heavy ? heavy_ends[key] : 0);
+      push =
+          layout.of(requester_of[occurrence], key_chunk[key], heavy, heavy ? heavy_ends[key] : 0);
     }
     push_key[occurrence] = push;
     index[position] = (int32_t)position;
@@ -518,17 +518,15 @@ __global__ void __launch_bounds__(kThreads)
                         int64_t entries, int64_t max_chunks, int64_t parts, PushKey layout,
                         bool *starts_group, int32_t *part_start) {
   const int64_t count = *occurrence_count;
-  const int64_t chunk_mask = (int64_t{1} << (layout.requester_shift - layout.chunk_shift)) - 1;
   auto part_of = [&](int64_t push) {
-    const int64_t requester = push >> layout.requester_shift;
-    const int64_t chunk = (push >> layout.chunk_shift) & chunk_mask;
-    return (requester * (max_chunks + 1) + chunk) * 2 + ((push >> layout.heavy_shift) & 1);
+    return (layout.requester(push) * (max_chunks + 1) + layout.chunk(push)) * 2 +
+           (int64_t)layout.heavy(push);
   };
   if (first_item() == 0 && count == 0)
     for (int64_t part = 0; part < parts; ++part) part_start[part] = 0;
   for (int64_t position = first_item(); position < entries; position += item_stride()) {
     const int64_t push = push_key_sorted[position];
-    starts_group[position] = position < count && ((push >> layout.heavy_shift) & 1) == 1 &&
+    starts_group[position] = position < count && layout.heavy(push) &&
                              (position == 0 || push != push_key_sorted[position - 1]);
     if (position >= count) continue;
     const int64_t part = part_of(push);
@@ -599,12 +597,10 @@ __global__ void __launch_bounds__(kThreads)
                           const int64_t *occurrence_count, int64_t max_chunks, PushKey layout,
                           int32_t *map_position, int32_t *occurrence_flag) {
   const int64_t count = *occurrence_count;
-  const int64_t chunk_mask = (int64_t{1} << (layout.requester_shift - layout.chunk_shift)) - 1;
   for (int64_t position = first_item(); position < count; position += item_stride()) {
     const int64_t push = push_key_sorted[position];
-    const int64_t requester = push >> layout.requester_shift;
-    const int64_t chunk = (push >> layout.chunk_shift) & chunk_mask;
-    const ReqEntry entry = push_chunks[requester * (max_chunks + 1) + chunk];
+    const int64_t requester = layout.requester(push);
+    const ReqEntry entry = push_chunks[requester * (max_chunks + 1) + layout.chunk(push)];
     const int32_t occurrence = push_order[position];
     map_position[occurrence] = (int32_t)(position - requester_start[requester]);
     occurrence_flag[occurrence] = entry.flags + (int32_t)((position - entry.start) / kTaskRows);
@@ -623,18 +619,12 @@ __global__ void __launch_bounds__(kThreads)
                                           : key_count[key];
 }
 
-// A reducer entry: a slot word of proxy_rows low, the flag of its push task
-// high (common.h).
-__device__ __forceinline__ int64_t reducer_entry(uint32_t slot, int32_t flag) {
-  return (int64_t)(((uint64_t)(uint32_t)flag << 32) | slot);
-}
-
-// A thread per node-unique key: its entries of the reducer list. A key with a
-// row each: the slot of each of its occurrences, in order, with the
-// occurrence's flag. A heavy key: its own row (kEntryOwnRow), then each
-// requester's partial (kEntryPartial) with the flag of that requester's task
-// of the key's heavy group, which a search for the group's push key finds
-// (kEntryNoPush: the requester does not ask the key).
+// A thread per node-unique key: its entries of the reducer list
+// (ReducerEntry). A key with a row each: the slot of each of its occurrences,
+// in order, with the occurrence's flag. A heavy key: its own row
+// (kEntryOwnRow), then each requester's partial with the flag of that
+// requester's task of the key's heavy group, which a search for the group's
+// push key finds (kEntryNoPush: the requester does not ask the key).
 __global__ void __launch_bounds__(kThreads) reducer_entries_kernel(
     const int32_t *reducer_start, const bool *key_heavy, const int32_t *heavy_ends,
     const int32_t *key_first, const int32_t *key_count, const int32_t *key_row,
@@ -642,7 +632,7 @@ __global__ void __launch_bounds__(kThreads) reducer_entries_kernel(
     const int32_t *order, const int32_t *occurrence_flag, const int64_t *push_key_sorted,
     const int32_t *groups_before, const ReqEntry *push_chunks, const int64_t *num_keys,
     int64_t entries, int64_t local_size, int64_t max_chunks, int64_t partial_rows, PushKey layout,
-    int64_t *reducer_entries) {
+    ReducerEntry *reducer_entries) {
   const int64_t valid_keys = *num_keys;
   for (int64_t key = first_item(); key < valid_keys; key += item_stride()) {
     int64_t entry = reducer_start[key];
@@ -650,15 +640,13 @@ __global__ void __launch_bounds__(kThreads) reducer_entries_kernel(
       const int64_t first = key_first[key];
       for (int64_t position = first; position < first + key_count[key]; ++position, ++entry)
         reducer_entries[entry] =
-            reducer_entry((uint32_t)slot_at[position], occurrence_flag[order[position]]);
+            ReducerEntry::row(slot_at[position], occurrence_flag[order[position]]);
       continue;
     }
-    reducer_entries[entry++] = reducer_entry((uint32_t)key_row[key], kEntryOwnRow);
+    reducer_entries[entry++] = ReducerEntry::row(key_row[key], kEntryOwnRow);
     const int64_t chunk = key_chunk[key];
     for (int64_t requester = 0; requester < local_size; ++requester, ++entry) {
-      const int64_t group_key = (requester << layout.requester_shift) |
-                                (chunk << layout.chunk_shift) | (int64_t{1} << layout.heavy_shift) |
-                                heavy_ends[key];
+      const int64_t group_key = layout.of(requester, chunk, true, heavy_ends[key]);
       const int64_t group = lower_bound(push_key_sorted, entries, group_key);
       int32_t flag = kEntryNoPush;
       if (group < entries && push_key_sorted[group] == group_key) {
@@ -666,8 +654,8 @@ __global__ void __launch_bounds__(kThreads) reducer_entries_kernel(
         flag = table.flags + ceil_div<kTaskRows>(table.heavy - table.start) +
                (groups_before[group] - table.groups) / kTaskRows;
       }
-      const int64_t partial = partial_base[key] + requester * partial_rows;
-      reducer_entries[entry] = reducer_entry((uint32_t)partial | kEntryPartial, flag);
+      reducer_entries[entry] =
+          ReducerEntry::partial((int32_t)(partial_base[key] + requester * partial_rows), flag);
     }
   }
 }
@@ -689,7 +677,7 @@ ProxyBuffers proxy_buffers(at::Tensor remote_map, at::Tensor key_stage, const Pr
 ProxyKeys proxy_keys(const ProxyInput &input, const Sizes &sizes, bool node_dedup) {
   const int64_t entries = sizes.remote_keys, num_nodes = sizes.topo.num_nodes,
                 num_features = sizes.num_features, num_tables = sizes.num_tables,
-                cells = num_nodes * num_features;
+                bucket_features = num_nodes * num_features;
   const auto long_options = input.keys.options().dtype(at::kLong);
   const auto int_options = input.keys.options().dtype(at::kInt);
   const auto bool_options = input.keys.options().dtype(at::kBool);
@@ -709,26 +697,31 @@ ProxyKeys proxy_keys(const ProxyInput &input, const Sizes &sizes, bool node_dedu
   const at::Tensor by_key = sort_pairs(input.keys, index, 64).second;
   const at::Tensor tag = at::empty({entries}, int_options);
   identity_tags_kernel<<<item_grid(entries), kThreads, 0, stream>>>(
-      by_key.data_ptr<int32_t>(), keys.valid.data_ptr<bool>(), input.cells.data_ptr<int32_t>(),
-      input.tables.data_ptr<int32_t>(), entries, num_nodes, num_features, num_tables,
-      tag.data_ptr<int32_t>());
+      by_key.data_ptr<int32_t>(), keys.valid.data_ptr<bool>(),
+      input.bucket_feature_of_occ.data_ptr<int32_t>(), input.tables.data_ptr<int32_t>(), entries,
+      num_nodes, num_features, num_tables, tag.data_ptr<int32_t>());
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   at::Tensor tag_sorted;
   std::tie(tag_sorted, keys.order) = sort_pairs(tag, by_key, bits_for(num_nodes * num_tables + 1));
   // The identity at each sorted position and where each identity starts.
   // Per identity: its smallest feature, and the sum of its weights, exact as
   // integers, when the records carry it.
-  const bool sum_weights = input.weights.defined() && sizes.record_bytes == 16;
+  const bool sum_weights = input.weights.defined() && sizes.weighted_records();
   const at::Tensor starts_identity = at::empty({entries}, bool_options);
   const at::Tensor position_weight =
       sum_weights ? at::empty({entries}, long_options) : at::Tensor();
   const at::Tensor smallest_feature = at::empty({entries}, int_options);
-  identity_starts_kernel<<<item_grid(entries), kThreads, 0, stream>>>(
-      keys.order.data_ptr<int32_t>(), tag_sorted.data_ptr<int32_t>(),
-      input.keys.data_ptr<int64_t>(), data_or_null<float>(input.weights),
-      keys.valid.data_ptr<bool>(), entries, num_features, node_dedup,
-      starts_identity.data_ptr<bool>(), data_or_null<int64_t>(position_weight),
-      smallest_feature.data_ptr<int32_t>());
+  const auto launch_starts = [&](auto kernel) {
+    kernel<<<item_grid(entries), kThreads, 0, stream>>>(
+        keys.order.data_ptr<int32_t>(), tag_sorted.data_ptr<int32_t>(),
+        input.keys.data_ptr<int64_t>(), data_or_null<float>(input.weights),
+        keys.valid.data_ptr<bool>(), entries, num_features, starts_identity.data_ptr<bool>(),
+        data_or_null<int64_t>(position_weight), smallest_feature.data_ptr<int32_t>());
+  };
+  if (node_dedup)
+    launch_starts(identity_starts_kernel<true>);
+  else
+    launch_starts(identity_starts_kernel<false>);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   const at::Tensor identity_ends = exclusive_ends(starts_identity, at::kInt);
   const at::Tensor weight_ends = sum_weights ? exclusive_ends(position_weight) : at::Tensor();
@@ -737,25 +730,27 @@ ProxyKeys proxy_keys(const ProxyInput &input, const Sizes &sizes, bool node_dedu
   keys.num_keys = at::empty({}, long_options);
   identity_ranges_kernel<<<item_grid(entries + 1), kThreads, 0, stream>>>(
       identity_ends.data_ptr<int32_t>(), keys.order.data_ptr<int32_t>(),
-      input.cells.data_ptr<int32_t>(), keys.valid.data_ptr<bool>(),
+      input.bucket_feature_of_occ.data_ptr<int32_t>(), keys.valid.data_ptr<bool>(),
       keys.occurrence_count.data_ptr<int64_t>(), entries, num_features,
       identity_of.data_ptr<int32_t>(), identity_start.data_ptr<int32_t>(),
       smallest_feature.data_ptr<int32_t>(), keys.num_keys.data_ptr<int64_t>());
   C10_CUDA_KERNEL_LAUNCH_CHECK();
-  // The key index u: by cell (owner node, smallest feature), then in
-  // identity order (key order inside a cell).
-  const at::Tensor identity_cell = at::empty({entries}, int_options);
-  identity_cells_kernel<<<item_grid(entries), kThreads, 0, stream>>>(
+  // The key index u: by bucket feature (owner node, smallest feature), then in
+  // identity order (key order inside a bucket feature).
+  const at::Tensor identity_bucket_feature = at::empty({entries}, int_options);
+  identity_bucket_features_kernel<<<item_grid(entries), kThreads, 0, stream>>>(
       identity_start.data_ptr<int32_t>(), keys.order.data_ptr<int32_t>(),
-      input.cells.data_ptr<int32_t>(), smallest_feature.data_ptr<int32_t>(),
+      input.bucket_feature_of_occ.data_ptr<int32_t>(), smallest_feature.data_ptr<int32_t>(),
       keys.num_keys.data_ptr<int64_t>(), entries, num_nodes, num_features,
-      identity_cell.data_ptr<int32_t>());
+      identity_bucket_feature.data_ptr<int32_t>());
   C10_CUDA_KERNEL_LAUNCH_CHECK();
-  at::Tensor cell_of_key, identity_of_key;
-  std::tie(cell_of_key, identity_of_key) = sort_pairs(identity_cell, index, bits_for(cells + 1));
-  const at::Tensor cell_key_start = at::empty({cells + 1}, long_options);
+  at::Tensor bucket_feature_of_key, identity_of_key;
+  std::tie(bucket_feature_of_key, identity_of_key) =
+      sort_pairs(identity_bucket_feature, index, bits_for(bucket_features + 1));
+  const at::Tensor key_offset_per_bucket_feature = at::empty({bucket_features + 1}, long_options);
   keys.uniq_off = at::empty({num_nodes + 1}, long_options);
-  run_starts<int32_t, int64_t>(cell_of_key, cells, cell_key_start, num_features, keys.uniq_off);
+  run_starts<int32_t, int64_t>(bucket_feature_of_key, bucket_features,
+                               key_offset_per_bucket_feature, num_features, keys.uniq_off);
   // per key, and the key of each sorted position
   const at::Tensor key_of_identity = at::empty({entries}, int_options);
   keys.valid_key = at::empty({entries}, bool_options);
@@ -765,10 +760,10 @@ ProxyKeys proxy_keys(const ProxyInput &input, const Sizes &sizes, bool node_dedu
   keys.key_node = at::empty({entries}, int_options);
   keys.key_uniq = at::empty({entries}, int_options);
   keys.key_value = at::empty({entries}, long_options);
-  if (sizes.record_bytes == 16)
+  if (sizes.weighted_records())
     keys.key_weight = at::empty({entries}, input.keys.options().dtype(at::kFloat));
   key_tables_kernel<<<item_grid(entries), kThreads, 0, stream>>>(
-      identity_of_key.data_ptr<int32_t>(), cell_of_key.data_ptr<int32_t>(),
+      identity_of_key.data_ptr<int32_t>(), bucket_feature_of_key.data_ptr<int32_t>(),
       identity_start.data_ptr<int32_t>(), keys.order.data_ptr<int32_t>(),
       input.keys.data_ptr<int64_t>(), data_or_null<int64_t>(weight_ends),
       keys.uniq_off.data_ptr<int64_t>(), keys.num_keys.data_ptr<int64_t>(), entries, num_nodes,
@@ -783,12 +778,13 @@ ProxyKeys proxy_keys(const ProxyInput &input, const Sizes &sizes, bool node_dedu
       identity_of.data_ptr<int32_t>(), key_of_identity.data_ptr<int32_t>(), entries,
       keys.key_at.data_ptr<int32_t>());
   C10_CUDA_KERNEL_LAUNCH_CHECK();
-  // per cell and per owner node
-  keys.cell_uniq = at::empty({cells}, long_options);
+  // per bucket feature and per owner node
+  keys.uniq_per_bucket_feature = at::empty({bucket_features}, long_options);
   keys.uniq_out = at::empty({num_nodes}, long_options);
   key_counts_kernel<<<kOneCta, kThreads, 0, stream>>>(
-      cell_key_start.data_ptr<int64_t>(), keys.uniq_off.data_ptr<int64_t>(), num_nodes,
-      num_features, keys.cell_uniq.data_ptr<int64_t>(), keys.uniq_out.data_ptr<int64_t>());
+      key_offset_per_bucket_feature.data_ptr<int64_t>(), keys.uniq_off.data_ptr<int64_t>(),
+      num_nodes, num_features, keys.uniq_per_bucket_feature.data_ptr<int64_t>(),
+      keys.uniq_out.data_ptr<int64_t>());
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   return keys;
 }
@@ -797,7 +793,7 @@ ProxyChunks proxy_chunks_and_slots(ProxyKeys &keys, const at::Tensor &requester_
                                    const ProxyBuffers &buffers, const Sizes &sizes) {
   const int64_t entries = sizes.remote_keys, num_nodes = sizes.topo.num_nodes,
                 local_size = sizes.topo.local_size, max_chunks = sizes.max_chunks,
-                partial_rows = sizes.partial_rows, record_bytes = sizes.record_bytes;
+                partial_rows = sizes.partial_rows;
   const auto long_options = keys.order.options().dtype(at::kLong);
   const auto int_options = keys.order.options().dtype(at::kInt);
   const cudaStream_t stream = current_stream();
@@ -829,13 +825,13 @@ ProxyChunks proxy_chunks_and_slots(ProxyKeys &keys, const at::Tensor &requester_
   const at::Tensor stream_tables = at::empty({3, max_chunks + 1}, long_options);
   const Levels levels{row_ends.data_ptr<int64_t>(), keys.uniq_off.data_ptr<int64_t>(),
                       chunks.chunks_out.data_ptr<int64_t>(), num_nodes, sizes.chunk_room()};
-  Chunk *chunk_table = (Chunk *)chunks.chunks.data_ptr<int32_t>();
+  Chunk *chunk_table = records_of<Chunk>(chunks.chunks);
   StreamArgs stream_args;
   stream_args.levels = levels;
   stream_args.uniq_out = keys.uniq_out.data_ptr<int64_t>();
   stream_args.node = sizes.topo.node;
   stream_args.max_chunks = max_chunks;
-  stream_args.record_bytes = record_bytes;
+  stream_args.record_bytes = sizes.record_bytes;
   stream_args.ring = sizes.num_proxy_rows;
   stream_args.lap_room = sizes.lap_room();
   stream_args.chunks_out = chunks.chunks_out.data_ptr<int64_t>();
@@ -860,16 +856,18 @@ ProxyChunks proxy_chunks_and_slots(ProxyKeys &keys, const at::Tensor &requester_
   chunks.key_row = at::empty({entries}, int_options);
   chunks.partial_base = at::empty({entries}, int_options);
   const at::Tensor duplicate_base = at::empty({entries}, int_options);
-  key_rows_kernel<<<item_grid(entries), kThreads, 0, stream>>>(
-      levels, duplicate_ends.data_ptr<int32_t>(), chunks.heavy_ends.data_ptr<int32_t>(),
-      keys.key_node.data_ptr<int32_t>(), keys.key_count.data_ptr<int32_t>(),
-      keys.key_value.data_ptr<int64_t>(), data_or_null<float>(keys.key_weight),
-      chunks.node_chunks.data_ptr<int32_t>(), chunks.node_chunk_start.data_ptr<int64_t>(),
-      chunks.stage_slice.data_ptr<int64_t>(), keys.num_keys.data_ptr<int64_t>(), max_chunks,
-      sizes.num_proxy_rows, local_size * partial_rows, record_bytes, chunk_table,
-      chunks.key_chunk.data_ptr<int32_t>(), chunks.key_row.data_ptr<int32_t>(),
-      duplicate_base.data_ptr<int32_t>(), chunks.partial_base.data_ptr<int32_t>(),
-      buffers.key_stage.data_ptr<int64_t>());
+  with_record(sizes, [&](auto record) {
+    key_rows_kernel<decltype(record)><<<item_grid(entries), kThreads, 0, stream>>>(
+        levels, duplicate_ends.data_ptr<int32_t>(), chunks.heavy_ends.data_ptr<int32_t>(),
+        keys.key_node.data_ptr<int32_t>(), keys.key_count.data_ptr<int32_t>(),
+        keys.key_value.data_ptr<int64_t>(), data_or_null<float>(keys.key_weight),
+        chunks.node_chunks.data_ptr<int32_t>(), chunks.node_chunk_start.data_ptr<int64_t>(),
+        chunks.stage_slice.data_ptr<int64_t>(), keys.num_keys.data_ptr<int64_t>(), max_chunks,
+        sizes.num_proxy_rows, local_size * partial_rows, chunk_table,
+        chunks.key_chunk.data_ptr<int32_t>(), chunks.key_row.data_ptr<int32_t>(),
+        duplicate_base.data_ptr<int32_t>(), chunks.partial_base.data_ptr<int32_t>(),
+        (char *)buffers.key_stage.data_ptr<int64_t>());
+  });
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   keys.key_value.reset();
   keys.key_weight.reset();
@@ -980,11 +978,11 @@ ProxyPlan proxy_push_order(ProxyKeys keys, ProxyChunks chunks, const at::Tensor 
       occurrence_flag.data_ptr<int32_t>(), push_key_sorted.data_ptr<int64_t>(),
       groups_before.data_ptr<int32_t>(), records_of<ReqEntry>(push_chunks),
       keys.num_keys.data_ptr<int64_t>(), entries, local_size, max_chunks, sizes.partial_rows,
-      layout, plan.reducer_entries.data_ptr<int64_t>());
+      layout, records_of<ReducerEntry>(plan.reducer_entries));
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   plan.num_chunks = chunks.num_chunks;
   plan.occurrence_count = keys.occurrence_count;
-  plan.cell_uniq = keys.cell_uniq;
+  plan.uniq_per_bucket_feature = keys.uniq_per_bucket_feature;
   plan.uniq_off = keys.uniq_off;
   plan.uniq_out = keys.uniq_out;
   plan.chunks = chunks.chunks;

@@ -47,7 +47,7 @@ Fanout fanout_view(const FanoutTables &tables) {
 template <typename Plan>
 PlanView plan_view(const Plan &plan, const Sizes &sizes) {
   PlanView view{};
-  view.block_start = data_of<int64_t>(plan.block_start);
+  view.offset_per_bucket = data_of<int64_t>(plan.offset_per_bucket);
   view.inv = data_of<int32_t>(plan.inv);
   view.fanout = fanout_view(plan.fanout);
   view.push_order = data_of<int32_t>(plan.push_order);
@@ -68,7 +68,7 @@ PlanView plan_view(const Plan &plan, const Sizes &sizes) {
 // The forward plan's tensors, in the order of tensors() and of().
 template <typename Plan>
 auto fwd_tensors(Plan &plan) -> std::vector<decltype(&plan.src)> {
-  return {&plan.block_start,
+  return {&plan.offset_per_bucket,
           &plan.src,
           &plan.inv,
           &plan.fanout.exp_off,
@@ -98,7 +98,7 @@ auto fwd_tensors(Plan &plan) -> std::vector<decltype(&plan.src)> {
 // The backward plan's tensors, in the order of tensors() and of().
 template <typename Plan>
 auto bwd_tensors(Plan &plan) -> std::vector<decltype(&plan.dst)> {
-  return {&plan.block_start,
+  return {&plan.offset_per_bucket,
           &plan.dst,
           &plan.inv,
           &plan.fanout.exp_off,
@@ -169,7 +169,7 @@ BwdPlanView BwdPlan::view(const Sizes &sizes) const {
   view.uniq_in = data_of<int64_t>(uniq_in);
   view.reduce_task_starts = data_of<int64_t>(reduce_task_starts);
   view.reducer_start = data_of<int32_t>(reducer_start);
-  view.reducer_entries = data_of<int64_t>(reducer_entries);
+  view.reducer_entries = data_of<ReducerEntry, int64_t>(reducer_entries);
   view.heavy_subs = heavy_subs;
   view.group_subs = group_subs;
   return view;

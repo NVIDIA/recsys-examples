@@ -15,7 +15,7 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 # limitations under the License.
 ******************************************************************************/
 // The input dist of a call, in one step on the caller's stream (the in
-// channel, InChannel::input_dist): part 1, the comm kernels and the
+// channel, InChannel::input_dist): the bucketize, the comm kernels and the
 // planner's steps, and the call's status. It reads no device value on the
 // host: what it gives (InDist) is the owner's KJT at the op's capacity, the
 // status, and the output dist's plans (plan.h). The caller copies the status
@@ -77,11 +77,12 @@ class InChannel {
   // 1]), as planner.h's NodeCounts.
   std::tuple<at::Tensor, at::Tensor, at::Tensor> node_count_exchange(
       const at::Tensor &my_counts) const;
-  // This rank's first *rows_to_push rows of part 1 (keys, weights or
-  // undefined, row_cell) into its targets' node_keys at
-  // destination_base[cell] + row.
-  void node_key_push(const at::Tensor &keys, const at::Tensor &weights, const at::Tensor &row_cell,
-                     const at::Tensor &destination_base, const at::Tensor &rows_to_push) const;
+  // This rank's first *rows_to_push bucketized rows (keys, weights or
+  // undefined, bucket_feature_of_row) into its targets' node_keys at
+  // destination_base[bucket_feature] + row.
+  void node_key_push(const at::Tensor &keys, const at::Tensor &weights,
+                     const at::Tensor &bucket_feature_of_row, const at::Tensor &destination_base,
+                     const at::Tensor &rows_to_push) const;
   // Tells the node this rank's keys are pushed, and waits until every
   // requester of the node told it.
   void node_done() const;
@@ -90,14 +91,14 @@ class InChannel {
   // rank got, int64 [num_nodes][CountMessage::length].
   at::Tensor rail_count_exchange(const at::Tensor &message) const;
   // Puts this proxy's key_stage slices into its rail owners' rail_keys (each
-  // [num_nodes], int64 but put_skip) and its cell_stage rows into its rail
-  // proxies' rail_cells, and waits for the other nodes' key streams.
+  // [num_nodes], int64 but put_skip) and its source_offsets rows into its rail
+  // proxies' owner_offsets, and waits for the other nodes' key streams.
   void rail_key_exchange(const at::Tensor &put_src, const at::Tensor &put_dst,
                          const at::Tensor &put_bytes, const at::Tensor &put_skip) const;
-  // Publishes this rank's needs and cell starts to its node (publish, int64
-  // [kNumNeeds + local_size * num_features]); returns every node peer's
+  // Publishes this rank's needs and requester offsets to its node (publish,
+  // int64 [kNumNeeds + local_size * num_features]); returns every node peer's
   // needs (int64 [local_size][kNumNeeds]) and where each one's KJT holds this
-  // requester's cells (int64 [local_size][num_features]).
+  // requester's keys of each feature (int64 [local_size][num_features]).
   std::pair<at::Tensor, at::Tensor> node_status_exchange(const at::Tensor &publish) const;
   // Words of the node peers' `from` (GatherFrom), int32 [words][items]: item
   // i reads node peer peer[i]'s word first_word[i] of its proxy header (1
@@ -110,19 +111,19 @@ class InChannel {
   ncclWindow_t window_;
   ncclDevComm dev_;
   Sizes sizes_;
-  OwnerRules rules_;  // part 1's
+  OwnerRules rules_;  // the bucketize's
   bool weights_, node_dedup_;
   int device_;
   int64_t seq_ = 0;  // the calls run so far: the current one's sequence number
   // This rank's buffers the steps read and write, views of its copy of the
   // window without an allocator (the window outlives them): the own part of
   // node_keys (and node_weights), and across nodes its remote part,
-  // remote_cells, the buffers the proxy writes, rail_keys, cell_stage and
-  // rail_cells.
+  // bucket_feature_of_occ, the buffers the proxy writes, rail_keys,
+  // source_offsets and owner_offsets.
   at::Tensor own_keys_, own_weights_;
-  at::Tensor remote_keys_, remote_weights_, remote_cells_;
+  at::Tensor remote_keys_, remote_weights_, bucket_feature_of_occ_;
   ProxyBuffers proxy_buffers_;
-  at::Tensor rail_keys_, cell_stage_, rail_cells_;
+  at::Tensor rail_keys_, source_offsets_, owner_offsets_;
   // Constants of the op across nodes: the table of each feature (numbered
   // densely), the other nodes, and the words of the proxy headers this
   // requester reads.

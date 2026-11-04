@@ -35,7 +35,8 @@ std::string unsupported(int world_size, int local_size, int num_features, int64_
   if (world_size % local_size != 0)
     return c10::str("the sharding's ", world_size, " ranks are not whole nodes of ", local_size,
                     " GPUs");
-  // The planner numbers the cells (owner, feature) of a call with int32.
+  // The planner numbers the bucket features (owner, feature) of a call
+  // with int32.
   if ((int64_t)world_size * num_features >= kMaxEntries)
     return c10::str("it numbers the (rank, feature) pairs with int32, and ", world_size,
                     " ranks times ", num_features, " features are too many");

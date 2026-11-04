@@ -372,12 +372,18 @@ def bucketized_keys(
             kjt = kjt.permute([kjt.keys().index(feature) for feature in features])
             bucketized, _ = input_dist._bucketize(kjt)
             # keys by [owner][feature][sample]
-            cells = bucketized.lengths().view(world_size, len(features), -1).sum(2)
-            ends = torch.cumsum(cells.flatten(), 0).view_as(cells).tolist()
+            length_per_bucket_feature = (
+                bucketized.lengths().view(world_size, len(features), -1).sum(2)
+            )
+            ends = (
+                torch.cumsum(length_per_bucket_feature.flatten(), 0)
+                .view_as(length_per_bucket_feature)
+                .tolist()
+            )
             values = bucketized.values().long()
             for index, feature in enumerate(features):
                 end = ends[rank][index]
-                begin = end - int(cells[rank][index])
+                begin = end - int(length_per_bucket_feature[rank][index])
                 parts[table_of[feature]].append(values[begin:end])
     return {name: torch.unique(torch.cat(keys)) for name, keys in parts.items()}
 

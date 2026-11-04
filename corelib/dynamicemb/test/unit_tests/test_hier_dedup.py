@@ -19,34 +19,35 @@ rail's layout, status, owner tables and the put lists
 (``hier_output_dist_rail_tables``), and the requester's tables
 (``hier_output_dist_requester_tables``).
 
-The test plays every rank of an N-node job: each rank's part 1 (its rows by
+The test plays every rank of an N-node job: each rank's bucketized rows (by
 owner and feature, and past the valid ones index dedup's bound), its node
 layout (``hier_output_dist_node_layout``), and between the steps what the
 comm kernels do: the node's summed counts, the pushes into node_keys, the
 count messages of each rail, the key records each proxy puts into its owners'
-rail_keys and the cell starts each owner puts into its proxies' rail_cells,
-the needs and cell starts each node exchanges (the requester binding gathers
-the proxies' words itself). The windows hold garbage before the call. The
-checks:
+rail_keys and the source_offsets each owner puts into its proxies'
+owner_offsets, the needs and requester_offsets each node exchanges (the
+requester binding gathers the proxies' words itself). The windows hold
+garbage before the call. The checks:
 
 * each proxy against a plain reference of the planner's rules: its
-  node-unique keys (identities (owner node, table, key), cells by smallest
-  feature, key order inside a cell), their records, the chunks of its stream
+  node-unique keys (identities (owner node, table, key), each in the bucket
+  feature (owner node, feature) of its smallest feature, key order inside a
+  bucket feature), their records, the chunks of its stream
   (levels of each owner node's rows, packed, in laps when they pass the ring)
   and where each lies, each occurrence's row and slot (the first
   occurrence's row, duplicate slots, heavy partials), push positions, push
-  tables, flags and reducer lists; its cells and records against a dedup by
-  merge ranks (each key's cell that of its occurrence of least merge rank),
-  as equal sets;
+  tables, flags and reducer lists; its records of each bucket feature
+  against a dedup by merge ranks (each key's bucket feature that of its
+  occurrence of least merge rank), as equal sets;
 * each requester's maps (its node's owners' KJT places, its keys' rows and
   slots at its proxies), push order, push tables, heavy groups, sub-tasks and
   task starts; and per node a backward with integer gradients through the
   requesters' push tasks and the proxies' reducer lists;
 * the rail: each proxy's slices start where its owners' offsets say, and
-  each owner sends each proxy its KJT's offsets of that node's cells; each
-  owner's KJT and the chunks it got; each rank's put lists (as proxy and as
-  owner) against a plain loop over the chunks and cells; the needs, the same
-  on every rank.
+  each owner sends each proxy its KJT's offsets of that node's features
+  (source_offsets); each owner's KJT and the chunks it got; each rank's put
+  lists (as proxy and as owner) against a plain loop over the chunks and
+  features; the needs, the same on every rank.
 
 Calls that do not fit check the needs alone (and that no access was out of
 range). Every planner call runs under ``torch.cuda.set_sync_debug_mode
@@ -135,7 +136,7 @@ class Case:
     num_nodes: int = 4
     local_size: int = 4
     tables: Tuple[int, ...] = (0, 0, 1, 2)  # features 0 and 1 share table 0
-    max_block: int = 6  # keys of a (requester, owner, feature) cell, at most
+    max_block: int = 6  # a requester's keys of one (owner, feature), at most
     key_range: int = 40
     hot: float = 0.0  # share of keys that are key 7
     weights: bool = False  # the keys carry weights (whole numbers: frequency counts)
@@ -195,14 +196,14 @@ def same_place_job(case: Case, generator) -> List[Tuple]:
             second_lap = level.index(chunk)
             break
         rows_before += level.count(chunk) * heavy_rows
-    cells = case.world_size * case.num_features
+    num_bucket_features = case.world_size * case.num_features
     rows = [
         [0, second_lap],
         [key for key in range(keys) for _ in range(HEAVY + 1)],
     ]
     job = []
     for keys_of in rows + [[]] * (case.world_size - 2):
-        counts = torch.zeros(cells, dtype=torch.int64)
+        counts = torch.zeros(num_bucket_features, dtype=torch.int64)
         counts[case.local_size * case.num_features] = len(keys_of)  # owner (node 1, 0)
         job.append(
             (
@@ -219,10 +220,10 @@ def wide_node_job(case: Case, generator) -> List[Tuple]:
     (node 1, 0) for key 7 once and for key 8 once, requester 0 twice: key 7's
     local_size occurrences are not more than heavy_at, key 8's one more are,
     and take its row and a partial for each requester, its occurrences."""
-    cells = case.world_size * case.num_features
+    num_bucket_features = case.world_size * case.num_features
     job = []
     for rank in range(case.world_size):
-        counts = torch.zeros(cells, dtype=torch.int64)
+        counts = torch.zeros(num_bucket_features, dtype=torch.int64)
         keys = []
         if rank < case.local_size:  # node 0's requesters
             keys = [7, 8, 8] if rank == 0 else [7, 8]
@@ -421,12 +422,14 @@ CASES = [
 
 
 def random_job(case: Case, generator) -> List[Tuple]:
-    """Each rank's rows: its keys for each (owner, feature) cell, and their
-    weights."""
-    cells = case.world_size * case.num_features
+    """Each rank's rows: its keys for each bucket feature (owner, feature),
+    and their weights."""
+    num_bucket_features = case.world_size * case.num_features
     job = []
     for _ in range(case.world_size):
-        counts = torch.randint(0, case.max_block + 1, (cells,), generator=generator)
+        counts = torch.randint(
+            0, case.max_block + 1, (num_bucket_features,), generator=generator
+        )
         valid = int(counts.sum())
         keys = torch.randint(0, case.key_range, (valid,), generator=generator)
         keys[torch.rand(valid, generator=generator) < case.hot] = 7
@@ -436,13 +439,16 @@ def random_job(case: Case, generator) -> List[Tuple]:
     return job
 
 
-def part_one(case: Case, counts, keys, weights, generator) -> Dict:
-    """A rank's part 1 as the planner takes it: its rows by cell (owner *
-    num_features + feature), then index dedup's bound (garbage keys)."""
-    cells = counts.numel()
-    cell_start = torch.cat([torch.zeros(1, dtype=torch.int64), counts.cumsum(0)])
+def bucketized_rows(case: Case, counts, keys, weights, generator) -> Dict:
+    """A rank's bucketized rows as the planner takes them: by bucket feature
+    (owner * num_features + feature), then index dedup's bound (garbage
+    keys)."""
+    num_bucket_features = counts.numel()
+    offset_per_bucket_feature = torch.cat(
+        [torch.zeros(1, dtype=torch.int64), counts.cumsum(0)]
+    )
     return dict(
-        cell_start_list=cell_start.tolist(),
+        offset_per_bucket_feature_list=offset_per_bucket_feature.tolist(),
         keys_list=keys.tolist(),
         weights_list=weights.tolist(),
         valid=int(counts.sum()),
@@ -454,16 +460,18 @@ def part_one(case: Case, counts, keys, weights, generator) -> Dict:
             ]
         ).cuda(),
         weights=torch.cat([weights, torch.full((case.bound,), 1e9)]).cuda(),
-        row_cell=torch.cat(
+        bucket_feature_of_row=torch.cat(
             [
-                torch.repeat_interleave(torch.arange(cells), counts),
-                torch.full((case.bound,), cells),
+                torch.repeat_interleave(torch.arange(num_bucket_features), counts),
+                torch.full((case.bound,), num_bucket_features),
             ]
         )
         .int()
         .cuda(),
-        cell_start=cell_start.cuda(),
-        block_start=cell_start[:: case.num_features].contiguous().cuda(),
+        offset_per_bucket_feature=offset_per_bucket_feature.cuda(),
+        offset_per_bucket=offset_per_bucket_feature[:: case.num_features]
+        .contiguous()
+        .cuda(),
     )
 
 
@@ -482,7 +490,7 @@ def make_windows(case: Case, lookup_keys: int, remote_keys: int, generator) -> D
     chunks = max_chunks(case, remote_keys)
     windows = dict(
         node_keys=garbage(lookup_keys + remote_keys, torch.int64, generator),
-        remote_cells=garbage(remote_keys, torch.int32, generator),
+        bucket_feature_of_occ=garbage(remote_keys, torch.int32, generator),
         remote_map=garbage(3 * remote_keys, torch.int32, generator),
         key_stage=garbage(
             chunks * 2 + remote_keys * case.record_bytes // 8 + 2,
@@ -503,7 +511,7 @@ def make_windows(case: Case, lookup_keys: int, remote_keys: int, generator) -> D
             torch.int64,
             generator,
         ),
-        rail_cells=garbage(num_nodes * case.num_features, torch.int64, generator),
+        owner_offsets=garbage(num_nodes * case.num_features, torch.int64, generator),
     )
     if case.weights:
         windows["node_weights"] = garbage(
@@ -517,24 +525,24 @@ def proxy_occurrences(case: Case, ranks: List[Dict], node: int, proxy: int) -> L
     feature, key, weight), requester-major, then owner node, feature, row."""
     occurrences = []
     for requester in range(case.local_size):
-        part = ranks[node * case.local_size + requester]
-        cell_start = part["cell_start_list"]
+        bucketized = ranks[node * case.local_size + requester]
+        offsets = bucketized["offset_per_bucket_feature_list"]
         for owner_node in range(case.num_nodes):
             if owner_node == node:
                 continue
             for feature in range(case.num_features):
-                cell = (
+                bucket_feature = (
                     owner_node * case.local_size + proxy
                 ) * case.num_features + feature
-                for row in range(cell_start[cell], cell_start[cell + 1]):
+                for row in range(offsets[bucket_feature], offsets[bucket_feature + 1]):
                     occurrences.append(
                         (
                             requester,
                             row,
                             owner_node,
                             feature,
-                            part["keys_list"][row],
-                            part["weights_list"][row],
+                            bucketized["keys_list"][row],
+                            bucketized["weights_list"][row],
                         )
                     )
     return occurrences
@@ -575,11 +583,11 @@ def proxy_reference(case: Case, occurrences: List, node: int, remote_keys: int) 
         for occ in group:
             key_of[occ] = key
     node_of = [owner_node for owner_node, *_ in keys]
-    cell_uniq = [0] * (num_nodes * num_features)
+    uniq_per_bucket_feature = [0] * (num_nodes * num_features)
     for owner_node, feature, *_ in keys:
-        cell_uniq[owner_node * num_features + feature] += 1
+        uniq_per_bucket_feature[owner_node * num_features + feature] += 1
     uniq_off = [
-        sum(cell_uniq[: owner_node * num_features])
+        sum(uniq_per_bucket_feature[: owner_node * num_features])
         for owner_node in range(num_nodes + 1)
     ]
     count = [len(group) for *_, group in keys]
@@ -772,7 +780,7 @@ def proxy_reference(case: Case, occurrences: List, node: int, remote_keys: int) 
         key_of=key_of,
         node_of=node_of,
         heavy=heavy,
-        cell_uniq=cell_uniq,
+        uniq_per_bucket_feature=uniq_per_bucket_feature,
         uniq_off=uniq_off,
         num_chunks=num_chunks,
         chunks=table,
@@ -798,7 +806,7 @@ def proxy_reference(case: Case, occurrences: List, node: int, remote_keys: int) 
     )
 
 
-def cell_merge_rank(requester: int, nth: int, counts: List[int]) -> int:
+def merge_rank(requester: int, nth: int, counts: List[int]) -> int:
     result = nth
     for other, other_count in enumerate(counts):
         if other == requester or other_count == 0:
@@ -811,31 +819,31 @@ def cell_merge_rank(requester: int, nth: int, counts: List[int]) -> int:
     return result
 
 
-def merge_rank_cells(case: Case, occurrences: List) -> Dict:
+def dedup_by_merge_rank(case: Case, occurrences: List) -> Dict:
     """A dedup by merge ranks: an occurrence's merge rank orders it among the
-    node's (cells in owner node, then feature order; merge ranks inside a
-    cell), a node-unique key's representative is its occurrence of least
-    merge rank, and its cell is the representative's. Each cell's records
-    (key, weight), sorted."""
-    by_cell: Dict = {}
+    node's (bucket features (owner node, feature) in order; merge ranks inside
+    a bucket feature), a node-unique key's representative is its occurrence of
+    least merge rank, and its bucket feature is the representative's. Each
+    bucket feature's records (key, weight), sorted."""
+    occs_of: Dict = {}  # bucket feature -> each requester's occurrences
     for occ, (requester, _, owner_node, feature, _, _) in enumerate(occurrences):
-        cell = by_cell.setdefault(
+        per_requester = occs_of.setdefault(
             (owner_node, feature), [[] for _ in range(case.local_size)]
         )
-        cell[requester].append(occ)
+        per_requester[requester].append(occ)
     rank_of, base = {}, 0
-    for cell in sorted(by_cell):
-        counts = [len(occs) for occs in by_cell[cell]]
-        for requester, occs in enumerate(by_cell[cell]):
+    for bucket_feature in sorted(occs_of):
+        counts = [len(occs) for occs in occs_of[bucket_feature]]
+        for requester, occs in enumerate(occs_of[bucket_feature]):
             for nth, occ in enumerate(occs):
-                rank_of[occ] = base + cell_merge_rank(requester, nth, counts)
+                rank_of[occ] = base + merge_rank(requester, nth, counts)
         base += sum(counts)
     members: Dict = {}
     for occ in sorted(rank_of, key=rank_of.get):
         owner_node, feature, key = occurrences[occ][2:5]
         identity = (owner_node, case.tables[feature], key) if case.node_dedup else occ
         members.setdefault(identity, []).append(occ)
-    cells: Dict = {}
+    records_of: Dict = {}
     for group in members.values():
         owner_node, feature, key = occurrences[group[0]][2:5]
         weight = 0.0
@@ -843,33 +851,38 @@ def merge_rank_cells(case: Case, occurrences: List) -> Dict:
             weight = float(sum(occurrences[occ][5] for occ in group))
         elif case.counts:
             weight = float(len(group))
-        cells.setdefault((owner_node, feature), []).append((key, weight))
-    return {cell: sorted(records) for cell, records in cells.items()}
+        records_of.setdefault((owner_node, feature), []).append((key, weight))
+    return {
+        bucket_feature: sorted(records)
+        for bucket_feature, records in records_of.items()
+    }
 
 
-def segments_reference(case: Case, chunks, cells, cell_rows):
+def segments_reference(case: Case, chunks, lengths, kjt_offsets):
     """The put lists by a plain loop, over 2 * num_nodes nodes: the backward
     list's owner nodes, then the forward list's proxy nodes. Each node's keys,
-    chunk by chunk, each chunk cut at its feature cells. chunks[node]: its
-    chunks in order, each (lo, hi, row of lo in proxy_rows, its number in its
-    list); cells[node][feature]: its keys of each feature; cell_rows[node]
-    [feature]: the owner's KJT row of each cell's first key. Returns the
-    segments [src, dst, rows, chunk] and where each node's start, [2 *
-    num_nodes + 1]."""
+    chunk by chunk, each chunk cut where a feature's keys end. chunks[node]:
+    its chunks in order, each (lo, hi, row of lo in proxy_rows, its number in
+    its list); lengths[node][feature]: the node's keys of each feature;
+    kjt_offsets[node][feature]: the owner's KJT row of the first of them.
+    Returns the segments [src, dst, rows, chunk] and where each node's start,
+    [2 * num_nodes + 1]."""
     segments, starts = [], []
     for node in range(2 * case.num_nodes):
         starts.append(len(segments))
-        cell_ends = list(accumulate([0] + list(cells[node])))
+        feature_ends = list(accumulate([0] + list(lengths[node])))
         for lo, hi, row, number in chunks[node]:
-            cuts = sorted(set([lo, hi] + [end for end in cell_ends if lo < end < hi]))
+            cuts = sorted(
+                set([lo, hi] + [end for end in feature_ends if lo < end < hi])
+            )
             for first, last in zip(cuts, cuts[1:]):
-                feature = bisect_right(cell_ends, first) - 1
+                feature = bisect_right(feature_ends, first) - 1
                 chunk_row = row + first - lo
-                cell_row = cell_rows[node][feature] + first - cell_ends[feature]
+                kjt_row = kjt_offsets[node][feature] + first - feature_ends[feature]
                 segments.append(
-                    [cell_row, chunk_row, last - first, number]
+                    [kjt_row, chunk_row, last - first, number]
                     if node >= case.num_nodes
-                    else [chunk_row, cell_row, last - first, number]
+                    else [chunk_row, kjt_row, last - first, number]
                 )
     starts.append(len(segments))
     return segments, starts
@@ -878,12 +891,14 @@ def segments_reference(case: Case, chunks, cells, cell_rows):
 # ── the call ─────────────────────────────────────────────────────────────────
 
 
-def count_vector(case: Case, part: Dict, node: int) -> torch.Tensor:
+def count_vector(case: Case, bucketized: Dict, node: int) -> torch.Tensor:
     """A requester's counts for its node: its keys for each target's remote
     part, then for each owner of its node and feature."""
-    cells = part["counts"].view(case.num_nodes, case.local_size, case.num_features)
-    same = cells[node]
-    return torch.cat([cells.sum((0, 2)) - same.sum(1), same.flatten()])
+    counts = bucketized["counts"].view(
+        case.num_nodes, case.local_size, case.num_features
+    )
+    same = counts[node]
+    return torch.cat([counts.sum((0, 2)) - same.sum(1), same.flatten()])
 
 
 def run_call(
@@ -917,7 +932,7 @@ def run_call(
         )
 
     layouts, windows = [], []
-    for rank, part in enumerate(ranks):
+    for rank, bucketized in enumerate(ranks):
         node, local_rank = divmod(rank, local_size)
         # node_count_exchange: the count vectors' sum over the node and over
         # the ranks before this one, and each requester's counts for it
@@ -937,9 +952,9 @@ def run_call(
                 vectors.sum(0).cuda(),
                 vectors[:local_rank].sum(0).cuda(),
                 mine.contiguous().view(-1).cuda(),
-                part["cell_start"],
-                part["block_start"],
-                part["row_cell"],
+                bucketized["offset_per_bucket_feature"],
+                bucketized["offset_per_bucket"],
+                bucketized["bucket_feature_of_row"],
                 num_nodes,
                 local_size,
                 node,
@@ -951,23 +966,26 @@ def run_call(
         )
         windows.append(make_windows(case, lookup_keys, remote_keys, generator))
     # node_key_push: each requester's valid rows into its targets' node_keys
-    # (weights, and the cell of each remote occurrence) where its layout says
-    for rank, part in enumerate(ranks):
+    # (weights, and the bucket feature (owner node, feature) of each remote
+    # occurrence) where its layout says
+    for rank, bucketized in enumerate(ranks):
         node = rank // local_size
         rows = torch.arange(int(layouts[rank]["rows_to_push"]), device="cuda")
-        cell = part["row_cell"][rows].long()
-        owner = cell // num_features
-        destination = layouts[rank]["destination_base"][cell] + rows
+        bucket_feature = bucketized["bucket_feature_of_row"][rows].long()
+        owner = bucket_feature // num_features
+        destination = layouts[rank]["destination_base"][bucket_feature] + rows
         for target in range(local_size):
             mine = owner % local_size == target
             window = windows[node * local_size + target]
-            window["node_keys"][destination[mine]] = part["keys"][rows[mine]]
+            window["node_keys"][destination[mine]] = bucketized["keys"][rows[mine]]
             if case.weights:
-                window["node_weights"][destination[mine]] = part["weights"][rows[mine]]
+                window["node_weights"][destination[mine]] = bucketized["weights"][
+                    rows[mine]
+                ]
             remote = mine & (destination >= lookup_keys)
-            window["remote_cells"][destination[remote] - lookup_keys] = (
+            window["bucket_feature_of_occ"][destination[remote] - lookup_keys] = (
                 (owner[remote] // local_size) * num_features
-                + cell[remote] % num_features
+                + bucket_feature[remote] % num_features
             ).int()
     proxies = []
     for rank, window in enumerate(windows):
@@ -977,7 +995,7 @@ def run_call(
                 hier_output_dist_proxy_plan,
                 window["node_keys"][lookup_keys:],
                 window["node_weights"][lookup_keys:] if case.weights else None,
-                window["remote_cells"],
+                window["bucket_feature_of_occ"],
                 layout["requester_start"],
                 layout["skip"],
                 tables,
@@ -1008,20 +1026,20 @@ def run_call(
         return planner(
             hier_output_dist_rail_tables,
             messages_of(rank),
-            layouts[rank]["own_cells"],
-            layouts[rank]["own_starts"],
+            layouts[rank]["own_lengths"],
+            layouts[rank]["own_offsets"],
             proxies[rank]["chunks"],
             proxies[rank]["node_chunk_start"],
             proxies[rank]["node_chunks"],
             proxies[rank]["uniq_off"],
-            proxies[rank]["cell_uniq"],
+            proxies[rank]["uniq_per_bucket_feature"],
             sizes=sizes(rank),
             **later,
         )
 
     rails = [rail_tables(rank) for rank in range(world_size)]
     # rail_key_exchange: each proxy's slice for each owner of its rail, and
-    # each owner's cell starts for each proxy of its rail
+    # each owner's source_offsets for each proxy of its rail
     problems = []
     for rank, rail in enumerate(rails):
         node, rail_rank = divmod(rank, local_size)
@@ -1036,9 +1054,9 @@ def run_call(
             if owner_node == node:
                 continue
             owner = owner_node * local_size + rail_rank
-            windows[rank]["rail_cells"].view(num_nodes, num_features)[
+            windows[rank]["owner_offsets"].view(num_nodes, num_features)[
                 owner_node
-            ] = rails[owner]["cell_stage"][node]
+            ] = rails[owner]["source_offsets"][node]
             if skip:
                 continue
             rail_keys = windows[owner]["rail_keys"]
@@ -1058,7 +1076,7 @@ def run_call(
         owners.append(
             rail_tables(
                 rank,
-                rail_cells=window["rail_cells"],
+                owner_offsets=window["owner_offsets"],
                 rail_keys=window["rail_keys"],
                 node_keys=window["node_keys"][:lookup_keys],
                 node_weights=window["node_weights"][:lookup_keys]
@@ -1066,17 +1084,19 @@ def run_call(
                 else None,
             )
         )
-        cell_starts = publish[node, :, 2:].view(local_size, local_size, num_features)
+        requester_offsets = publish[node, :, 2:].view(
+            local_size, local_size, num_features
+        )
         node_ranks = range(node * local_size, (node + 1) * local_size)
         requesters.append(
             planner(
                 hier_output_dist_requester_tables,
                 torch.stack([windows[peer]["remote_map"] for peer in node_ranks]),
                 torch.stack([windows[peer]["proxy_header"] for peer in node_ranks]),
-                cell_starts[:, local_rank].contiguous(),
-                ranks[rank]["row_cell"],
-                ranks[rank]["cell_start"],
-                ranks[rank]["block_start"],
+                requester_offsets[:, local_rank].contiguous(),
+                ranks[rank]["bucket_feature_of_row"],
+                ranks[rank]["offset_per_bucket_feature"],
+                ranks[rank]["offset_per_bucket"],
                 layouts[rank]["destination_base"],
                 sizes(rank),
             )
@@ -1118,7 +1138,11 @@ def check_proxy(
     num_chunks = ref["num_chunks"]
     expect("occurrences", int(out["occurrence_count"]), num_occurrences)
     expect("keys", out["key_of_occurrence"][:num_occurrences].tolist(), ref["key_of"])
-    expect("cells", out["cell_uniq"].tolist(), ref["cell_uniq"])
+    expect(
+        "uniq_per_bucket_feature",
+        out["uniq_per_bucket_feature"].tolist(),
+        ref["uniq_per_bucket_feature"],
+    )
     expect("uniq_off", out["uniq_off"].tolist(), ref["uniq_off"])
     expect("chunks", int(out["num_chunks"]), num_chunks)
     expect(
@@ -1201,17 +1225,18 @@ def check_proxy(
         for key, value in enumerate(stage[word].tolist())
     ]
     expect("records", records, ref["records"])
-    # the cells against a dedup by merge ranks, as sets of records
-    cell_ends = list(accumulate(out["cell_uniq"].tolist()))
-    cells: Dict = {}
+    # the records of each bucket feature against a dedup by merge ranks, as
+    # sets
+    bucket_feature_ends = list(accumulate(out["uniq_per_bucket_feature"].tolist()))
+    records_of: Dict = {}
     for key, record in enumerate(records):
-        cells.setdefault(
-            divmod(bisect_right(cell_ends, key), case.num_features), []
+        records_of.setdefault(
+            divmod(bisect_right(bucket_feature_ends, key), case.num_features), []
         ).append(record)
     expect(
-        "cells by merge ranks",
-        {cell: sorted(cell_records) for cell, cell_records in cells.items()},
-        merge_rank_cells(case, ref["occurrences"]),
+        "records by merge ranks",
+        {bucket_feature: sorted(group) for bucket_feature, group in records_of.items()},
+        dedup_by_merge_rank(case, ref["occurrences"]),
     )
     # the reducer lists
     reducer_start = out["reducer_start"][: num_keys + 1].tolist()
@@ -1231,7 +1256,7 @@ def check_requester(
     ranks: List[Dict],
     refs: Dict,
     out: Dict,
-    owner_offsets,
+    kjt_offsets,
     remote_keys: int,
 ):
     """A requester's tables against its proxies' references and its node's
@@ -1249,22 +1274,22 @@ def check_requester(
         if got != want:
             problems.append(label)
 
-    part = ranks[rank]
-    valid, cell_start = part["valid"], part["cell_start_list"]
-    # A row of its node's owner is in the owner's KJT, cell (feature,
-    # local_rank); another node's row reads its key's row at its proxy, and
-    # pushes to its occurrence's slot.
+    bucketized = ranks[rank]
+    valid, offsets = bucketized["valid"], bucketized["offset_per_bucket_feature_list"]
+    # A row of its node's owner is in the owner's KJT, at index feature *
+    # num_sources + local_rank; another node's row reads its key's row at its
+    # proxy, and pushes to its occurrence's slot.
     src, dst = [0] * valid, [0] * valid
     at_proxy: List[List] = [[] for _ in range(local_size)]  # (push position, row)
-    for cell in range(case.world_size * num_features):
-        owner, feature = divmod(cell, num_features)
+    for bucket_feature in range(case.world_size * num_features):
+        owner, feature = divmod(bucket_feature, num_features)
         owner_node, proxy = divmod(owner, local_size)
-        for row in range(cell_start[cell], cell_start[cell + 1]):
+        for row in range(offsets[bucket_feature], offsets[bucket_feature + 1]):
             if owner_node == node:
                 src[row] = dst[row] = (
-                    owner_offsets[owner][feature * num_sources + local_rank]
+                    kjt_offsets[owner][feature * num_sources + local_rank]
                     + row
-                    - cell_start[cell]
+                    - offsets[bucket_feature]
                 )
             else:
                 ref = refs[(node, proxy)]
@@ -1463,8 +1488,9 @@ def check_rail(
     lookup_keys: int,
 ):
     """What a rank as proxy computed of its rail's owners against what they
-    computed: where its slice starts there and its puts; what each owner
-    sends it of where its cells start; and its own cell starts as owner."""
+    computed: where its slice starts there and its puts; the KJT offsets of
+    its node's features each owner sends it (source_offsets); and its own
+    requester_offsets as owner."""
     num_nodes, local_size, num_features = (
         case.num_nodes,
         case.local_size,
@@ -1484,11 +1510,11 @@ def check_rail(
             continue
         column = node if node < owner_node else node - 1
         offsets, slice_in = owner["kjt_offsets"].tolist(), owner["slice_in"].tolist()
-        if owner["cell_stage"].tolist()[node] != [
+        if owner["source_offsets"].tolist()[node] != [
             offsets[feature * num_sources + local_size + column]
             for feature in range(num_features)
         ]:
-            problems.append("cell_stage != the owner's KJT offsets")
+            problems.append("source_offsets != the owner's KJT offsets")
         if mine["put_dst"][owner_node] != slice_in[node][0]:
             problems.append("put_dst != the owner's slice_in")
         uniq = ref["uniq_off"][owner_node + 1] - ref["uniq_off"][owner_node]
@@ -1500,13 +1526,13 @@ def check_rail(
         if owner["uniq_in"].tolist()[node] != uniq:
             problems.append("uniq_in != the proxy's uniq_out")
     offsets = mine["kjt_offsets"]
-    if mine["my_cell_starts"] != [
+    if mine["requester_offsets"] != [
         [offsets[feature * num_sources + source] for feature in range(num_features)]
         for source in range(local_size)
     ]:
-        problems.append("my_cell_starts")
-    if mine["cell_stage"][node] != [0] * num_features:
-        problems.append("cell_stage of its own node")
+        problems.append("requester_offsets")
+    if mine["source_offsets"][node] != [0] * num_features:
+        problems.append("source_offsets of its own node")
     return problems
 
 
@@ -1529,24 +1555,25 @@ def check_owner(case: Case, rank: int, ranks: List[Dict], refs: Dict, out: Dict)
             problems.append(label)
 
     lengths, keys, weights = [], [], []
-    cell_first = {other_node: 0 for other_node in others}
+    # where the feature's keys start in each other node's keys for this node
+    feature_start = {other_node: 0 for other_node in others}
     for feature in range(num_features):
-        cell = rank * num_features + feature
+        bucket_feature = rank * num_features + feature
         for requester in range(local_size):
-            part = ranks[node * local_size + requester]
+            bucketized = ranks[node * local_size + requester]
             rows = range(
-                part["cell_start_list"][cell], part["cell_start_list"][cell + 1]
+                *bucketized["offset_per_bucket_feature_list"][bucket_feature:][:2]
             )
             lengths.append(len(rows))
-            keys += [part["keys_list"][row] for row in rows]
+            keys += [bucketized["keys_list"][row] for row in rows]
             weights += [
-                part["weights_list"][row] if case.weights else 1.0 for row in rows
+                bucketized["weights_list"][row] if case.weights else 1.0 for row in rows
             ]
         for other_node in others:
             ref = refs[(other_node, rail)]
-            count = ref["cell_uniq"][node * num_features + feature]
-            first = ref["uniq_off"][node] + cell_first[other_node]
-            cell_first[other_node] += count
+            count = ref["uniq_per_bucket_feature"][node * num_features + feature]
+            first = ref["uniq_off"][node] + feature_start[other_node]
+            feature_start[other_node] += count
             lengths.append(count)
             keys += [key for key, _ in ref["records"][first : first + count]]
             weights += [weight for _, weight in ref["records"][first : first + count]]
@@ -1569,7 +1596,7 @@ def check_owner(case: Case, rank: int, ranks: List[Dict], refs: Dict, out: Dict)
     return problems
 
 
-def check_put_lists(case: Case, rank: int, refs: Dict, out: Dict, rail_cells):
+def check_put_lists(case: Case, rank: int, refs: Dict, out: Dict, owner_offsets):
     """A rank's put lists, as proxy the backward's and as owner the
     forward's, and the chunks it got as owner, against a plain loop."""
     num_nodes, local_size, num_features = (
@@ -1595,10 +1622,10 @@ def check_put_lists(case: Case, rank: int, refs: Dict, out: Dict, rail_cells):
             out_chunks.append((uniq_lo, uniq_lo + chunk[2], chunk[4], chunk[5], place))
         return out_chunks
 
-    # the backward's owner nodes: this proxy's chunks and cells, at the rows
-    # its owners sent; then the forward's proxy nodes: each source node's
-    # chunks for this owner, numbered in the order it got them, at its cells in
-    # this owner's KJT
+    # the backward's owner nodes: this proxy's chunks and its keys of each
+    # feature, at the rows its owners sent (owner_offsets); then the forward's
+    # proxy nodes: each source node's chunks for this owner, numbered in the
+    # order it got them, at its features' rows in this owner's KJT
     chunks = [
         [
             (lo, hi, start % ring, place)
@@ -1606,17 +1633,17 @@ def check_put_lists(case: Case, rank: int, refs: Dict, out: Dict, rail_cells):
         ]
         for owner in range(num_nodes)
     ]
-    cells = [
-        ref["cell_uniq"][owner_node * num_features :][:num_features]
+    lengths = [
+        ref["uniq_per_bucket_feature"][owner_node * num_features :][:num_features]
         for owner_node in range(num_nodes)
     ]
-    cell_rows = list(rail_cells)
+    kjt_offsets = list(owner_offsets)
     fwd_chunks, fwd_chunk_start = [], [0]
     for source in range(num_nodes):
         if source == node:
             chunks.append([])
-            cells.append([0] * num_features)
-            cell_rows.append([0] * num_features)
+            lengths.append([0] * num_features)
+            kjt_offsets.append([0] * num_features)
             fwd_chunk_start.append(len(fwd_chunks))
             continue
         source_ref = refs[(source, rail)]
@@ -1630,14 +1657,16 @@ def check_put_lists(case: Case, rank: int, refs: Dict, out: Dict, rail_cells):
         )
         fwd_chunks += [[lo, hi, start, end] for lo, hi, start, end, _ in got]
         fwd_chunk_start.append(len(fwd_chunks))
-        cells.append(source_ref["cell_uniq"][node * num_features :][:num_features])
-        cell_rows.append(
+        lengths.append(
+            source_ref["uniq_per_bucket_feature"][node * num_features :][:num_features]
+        )
+        kjt_offsets.append(
             [
                 offsets[feature * num_sources + local_size + column]
                 for feature in range(num_features)
             ]
         )
-    segments, starts = segments_reference(case, chunks, cells, cell_rows)
+    segments, starts = segments_reference(case, chunks, lengths, kjt_offsets)
     problems = []
     got_chunks = out["fwd_chunks"][: len(fwd_chunks)].tolist()
     if [row[:2] + u32(row[2:]) for row in got_chunks] != fwd_chunks:
@@ -1660,7 +1689,7 @@ def run_case(case: Case, seed: int) -> Tuple[Dict[str, List[str]], str]:
     )
     world_size = case.world_size
     job = (case.job or random_job)(case, generator)
-    ranks = [part_one(case, *rows, generator) for rows in job]
+    ranks = [bucketized_rows(case, *rows, generator) for rows in job]
     occurrences = {
         (node, proxy): proxy_occurrences(case, ranks, node, proxy)
         for node in range(num_nodes)
@@ -1723,7 +1752,7 @@ def run_case(case: Case, seed: int) -> Tuple[Dict[str, List[str]], str]:
     )
     proxies, rails, owners = call["proxies"], call["rails"], call["owners"]
     requesters = call["requesters"]
-    owner_offsets = [rail["kjt_offsets"].tolist() for rail in rails]
+    kjt_offsets = [rail["kjt_offsets"].tolist() for rail in rails]
     checks["proxies"] = sum(
         (
             check_proxy(
@@ -1741,7 +1770,7 @@ def run_case(case: Case, seed: int) -> Tuple[Dict[str, List[str]], str]:
     checks["requesters"] = sum(
         (
             check_requester(
-                case, rank, ranks, refs, requesters[rank], owner_offsets, remote_keys
+                case, rank, ranks, refs, requesters[rank], kjt_offsets, remote_keys
             )
             for rank in range(world_size)
         ),
@@ -1777,7 +1806,7 @@ def run_case(case: Case, seed: int) -> Tuple[Dict[str, List[str]], str]:
                 rank,
                 refs,
                 owners[rank],
-                call["windows"][rank]["rail_cells"]
+                call["windows"][rank]["owner_offsets"]
                 .view(num_nodes, num_features)
                 .tolist(),
             )

@@ -130,8 +130,8 @@ Config config_of(int64_t rank, int64_t world_size, int64_t local_size,
                  int64_t proxy_bytes, double timeout_s, int64_t ctas, int64_t reduce_ctas);
 
 // Why the op does not apply to a sharding of these ranks, features and rows
-// (ranks that are not whole nodes, int32 cell numbers, rows the kernels
-// cannot move), or "" if it does.
+// (ranks that are not whole nodes, int32 bucket feature numbers, rows the
+// kernels cannot move), or "" if it does.
 std::string unsupported(int world_size, int local_size, int num_features, int64_t row_bytes);
 // Why the op refuses `config` (Config::validate), or "" if it takes it.
 std::string invalid(const Config &config);

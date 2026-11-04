@@ -178,7 +178,7 @@ __device__ __forceinline__ void wait_landed_warp(const Sizes &sizes, int64_t seq
 
 // Index dedup, heavy row sub-task `sub`: kHeavy of its row's original rows,
 // the row read where the pull would read it. Its slot in each of the two
-// passes of the sub-tasks (`late`) runs it in one of them: a row of the
+// passes of the sub-tasks (kLate) runs it in one of them: a row of the
 // node's owners in the first, among the row tasks; a row of another node's in
 // the last, once every remote row's task was taken. There, at a proxy whose
 // stream fits its ring the row is read in proxy_rows once its chunk has
@@ -187,9 +187,9 @@ __device__ __forceinline__ void wait_landed_warp(const Sizes &sizes, int64_t seq
 // kernel runs, so the row's remote task copied it to its first original row,
 // and once every row this rank pulls from that proxy is in (ready[rail]) the
 // sub-task copies it on from there (staged). Every lane of the warp.
-template <bool kMulti>
+template <bool kMulti, bool kLate>
 __device__ void heavy_sub_warp(const Sizes &sizes, int64_t seq, const FwdArgs &args,
-                               const OutTables &tables, int64_t sub, bool late, int lane) {
+                               const OutTables &tables, int64_t sub, int lane) {
   const FwdPlanView &plan = args.plan;
   const Fanout &fanout = plan.fanout;
   const int local_size = sizes.topo.local_size, row_bytes = sizes.row_bytes;
@@ -200,7 +200,7 @@ __device__ void heavy_sub_warp(const Sizes &sizes, int64_t seq, const FwdArgs &a
   const int owner = tables.owner_of(row), rail = owner % local_size;
   const bool remote = kMulti && owner / local_size != sizes.topo.node,
              staged = remote && plan.wraps(rail);
-  if (remote != late) return;
+  if (remote != kLate) return;
   const char *src =
       remote ? tables.proxy_row(rail, plan.src[row]) : tables.lookup_row(rail, plan.src[row]);
   int64_t from = begin;
@@ -485,7 +485,7 @@ __device__ void ProxyRelay::run(ncclWindow_t window, const ncclDevComm &dev, con
 // The owner's issuer in the forward (across nodes; a warp of CTA 0, whose
 // lanes take the rail proxies in turn, so one QP each). For each proxy node
 // it puts the rows of lookup_rows the node asks for (the forward put list:
-// its segments in stream order, each in one chunk and one feature cell),
+// its segments in stream order, each in one chunk and one feature),
 // each once the proxy granted the rows of its stream up to the end of the
 // segment's chunk, in one put that adds its rows to the proxy's fwd_rows
 // signal. It polls the proxy nodes in turn and waits for no single one; its
@@ -702,20 +702,21 @@ __global__ void __launch_bounds__(kThreads, 1)
       cta_sync(workers);
     }
     pass_entry_barrier(window, sizes, seq, timeline, workers);
-    const int64_t *node_block_start = plan.block_start + node * local_size;  // this node's owners
-    const LocalRows local_rows{node_block_start, local_size, me};
+    // this node's owners' rows
+    const int64_t *node_offset_per_bucket = plan.offset_per_bucket + node * local_size;
+    const LocalRows local_rows{node_offset_per_bucket, local_size, me};
     const int64_t rows = local_rows.count(), local = rows + heavy;
     const int64_t remote = num_nodes > 1 ? plan.fwd_task_starts[plan.max_chunks * local_size] : 0;
     const int64_t total = local + remote + (num_nodes > 1 ? heavy : 0);
     const TaskQueue queue{tables.layout().ctrl.task(kQueueWork)};
     for (int64_t task = queue.next_warp(); task < total; task = queue.next_warp()) {
       if (task >= local + remote) {  // the late pass of the heavy rows' sub-tasks
-        fwd::heavy_sub_warp<kMulti>(sizes, seq, args, tables, task - local - remote, true, lane);
+        fwd::heavy_sub_warp<kMulti, true>(sizes, seq, args, tables, task - local - remote, lane);
         continue;
       }
       int64_t index = 0;
       if (task < local && Interleave{rows, heavy}.is_sub(task, index)) {
-        fwd::heavy_sub_warp<kMulti>(sizes, seq, args, tables, index, false, lane);
+        fwd::heavy_sub_warp<kMulti, false>(sizes, seq, args, tables, index, lane);
         continue;
       }
       fwd::Pull pull(me);

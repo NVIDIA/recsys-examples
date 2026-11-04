@@ -90,6 +90,9 @@ struct Sizes {
   uint64_t timeout_ns;     // how long a kernel waits for a peer before it traps
 
   __host__ __device__ bool multi_node() const { return topo.num_nodes > 1; }
+  // The key records carry their weights: WeightedKeyRecord, else KeyRecord
+  // (below).
+  __host__ __device__ bool weighted_records() const { return record_bytes == 16; }
   // A row in 16-byte vectors.
   __host__ __device__ int row_vecs() const { return (int)(row_bytes / 16); }
   // The most rows of one node-unique key in proxy_rows: a key's occurrences
@@ -141,9 +144,9 @@ __host__ __device__ inline uint64_t buffer_end(uint64_t bytes) {
 // and heavy groups, and put lists.
 
 // Index dedup's fan-out of the requester's deduplicated rows to its original
-// rows (part 1): a row's are exp_idx[exp_off[row] .. exp_off[row + 1]), in
-// increasing order. A row with more than kHeavy is heavy, and split into
-// sub-tasks of kHeavy original rows.
+// rows (the bucketize's): a row's are
+// exp_idx[exp_off[row] .. exp_off[row + 1]), in increasing order. A row with
+// more than kHeavy is heavy, and split into sub-tasks of kHeavy original rows.
 struct Fanout {
   const int32_t *exp_off;  // [rows + 1], nullptr without index dedup
   const int32_t *exp_idx;  // [original rows]
@@ -191,6 +194,21 @@ struct ChunkPiece {
   int32_t uniq_lo, uniq_hi;
   uint32_t start, end;
 };
+// A node-unique key as its proxy sends it to the owner (key_stage, then the
+// owner's rail_keys), after the chunks of the owner's node: the key as its
+// owner stores it, and when the owner's KJT carries weights
+// (Sizes::weighted_records, record_bytes 16) the weight of its occurrences.
+struct KeyRecord {
+  static constexpr bool kWeighted = false;
+  int64_t key;
+};
+struct WeightedKeyRecord {
+  static constexpr bool kWeighted = true;
+  int64_t key;
+  float weight;
+  uint32_t zero;
+};
+static_assert(sizeof(KeyRecord) == 8 && sizeof(WeightedKeyRecord) == 16, "record_bytes is 8 or 16");
 // The least rows of proxy_rows: two chunks of keys of the most rows each.
 __host__ __device__ inline int64_t min_proxy_rows_for(int64_t max_key_rows) {
   return 4 * max_key_rows;
@@ -208,14 +226,33 @@ struct ReqEntry {
   int32_t groups;  // its first heavy group (index into the heavy groups;
                    // chunk max_chunks: the end of its groups)
 };
-// An entry of a proxy's reducer list (planner.h, reducer_entries): a slot of
-// proxy_rows in the low word, with kEntryPartial for a heavy key's fp32
-// partial row; in the high word the flag of the push task that fills it, or
-// kEntryNoPush (a requester without a partial) or kEntryOwnRow (a heavy key's
-// own row, which gets the sum).
+// An entry of a proxy's reducer list (planner.h, reducer_entries), 8 bytes:
+// a slot of proxy_rows in the low word, with kEntryPartial for a heavy key's
+// fp32 partial row; in the high word the flag of the push task that fills it,
+// or kEntryNoPush (a requester without a partial) or kEntryOwnRow (a heavy
+// key's own row, which gets the sum).
 constexpr int32_t kEntryNoPush = -1;
 constexpr int32_t kEntryOwnRow = -2;
 constexpr uint32_t kEntryPartial = 0x80000000u;
+struct ReducerEntry {
+  uint32_t slot;
+  int32_t flag;
+  // A row of a key with a row per occurrence, or its own row, with its flag.
+  __host__ __device__ static ReducerEntry row(int32_t slot, int32_t flag) {
+    return {(uint32_t)slot, flag};
+  }
+  // A heavy key's fp32 partial row of one requester, with its flag.
+  __host__ __device__ static ReducerEntry partial(int32_t slot, int32_t flag) {
+    return {(uint32_t)slot | kEntryPartial, flag};
+  }
+  // Its row of proxy_rows.
+  __host__ __device__ int64_t proxy_row() const { return (int64_t)(slot & ~kEntryPartial); }
+  // A heavy key's own row: it gets the sum of the entries after it.
+  __host__ __device__ bool own_row() const { return flag == kEntryOwnRow; }
+  // A push task fills it (its flag is the task's).
+  __host__ __device__ bool pushed() const { return flag >= 0; }
+};
+static_assert(sizeof(ReducerEntry) == 8, "a reducer entry is one int64 of reducer_entries");
 // A heavy group: positions [start, end) of a requester's rows for one proxy.
 // Its backward sums them in sub-tasks of at most kHeavy rows each (the
 // requester's group sub-tasks, numbered group after group), then those sums
@@ -224,7 +261,7 @@ struct HeavyGroup {
   int32_t start, end;
 };
 // A segment of a put list: `rows` rows from src to dst (rows of the source and
-// destination buffers), all in one chunk and in one feature's cell of the
+// destination buffers), all in one chunk and in one (feature, source) of the
 // owner's KJT; and its chunk, in the list's chunks: the backward's the
 // proxy's (whose ready counter it waits for), the forward's the pieces its
 // owner got (whose end it waits for in the grant).

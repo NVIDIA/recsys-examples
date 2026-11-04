@@ -12,20 +12,21 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""The planner's part 1 and node layout of the hierarchical input dist on
+"""The planner's bucketize and node layout of the hierarchical input dist on
 one GPU, on plain tensors:
 
-* the partition (``hier_output_dist_partition``) against the bucketize of
+* the bucketize (``hier_output_dist_bucketize``) against the bucketize of
   TorchRec's dists in DynamicEmb (``block_bucketize_sparse_features``) on the
   same KJT, bit for bit: the keys by owner, their rows in the KJT (``inv``),
-  their weights, their cells, where each owner's and each (owner, feature)'s
-  keys start, and the input's per-feature totals, for many world sizes (most
-  not powers of two). A second run gives the same bits;
+  their weights, their bucket features, where each owner's and each (owner,
+  feature)'s keys start, and the input's per-feature totals, for many world
+  sizes (most not powers of two). A second run gives the same bits;
 * index dedup's fan-out (``hier_output_dist_fanout``) against a torch
   reference: the original rows of each row, its heavy rows of more than 64,
-  their slots and consecutive sub-tasks, and where part 1 put each of them;
+  their slots and consecutive sub-tasks, and where the bucketize put each of
+  them;
 * the node layout (``hier_output_dist_node_layout``): the test plays every
-  rank of one node (part 1 on a batch of its own, the node's counts stacked
+  rank of one node (the bucketize of a batch of its own, the node's counts stacked
   from their count vectors), pushes their keys where the layout says, and
   checks that each target's own part holds its node's keys in its KJT order
   and its remote part requester-major, then owner node, then feature-major,
@@ -37,7 +38,7 @@ Every call of the planner runs under ``torch.cuda.set_sync_debug_mode
 
 Run it on one GPU, from ``corelib/dynamicemb``::
 
-    python test/unit_tests/test_hier_part1.py
+    python test/unit_tests/test_hier_bucketize.py
 """
 
 import sys
@@ -48,9 +49,9 @@ import torch
 from dynamicemb.dynamicemb_config import DIST_TYPE_CODES
 from dynamicemb_extensions import (
     block_bucketize_sparse_features,
+    hier_output_dist_bucketize,
     hier_output_dist_fanout,
     hier_output_dist_node_layout,
-    hier_output_dist_partition,
 )
 
 # Owners of a case: the bucketize's 32-bit rules give other owners than the
@@ -304,12 +305,21 @@ def reference(
         batch_size_per_feature=None,
         max_B=-1,
     )
-    cells = new_lengths.cpu().long().view(world_size, num_features, batch_size).sum(2)
-    block_start = torch.cat(
-        [torch.zeros(1, dtype=torch.int64), torch.cumsum(cells.sum(1), 0)]
+    length_per_bucket_feature = (
+        new_lengths.cpu().long().view(world_size, num_features, batch_size).sum(2)
+    )
+    offset_per_bucket = torch.cat(
+        [
+            torch.zeros(1, dtype=torch.int64),
+            torch.cumsum(length_per_bucket_feature.sum(1), 0),
+        ]
     )
     feature_start = torch.cat(
-        [torch.zeros(world_size, 1, dtype=torch.int64), torch.cumsum(cells, 1)], 1
+        [
+            torch.zeros(world_size, 1, dtype=torch.int64),
+            torch.cumsum(length_per_bucket_feature, 1),
+        ],
+        1,
     )
     inv = torch.empty(valid, dtype=torch.int64)
     inv[perm.cpu().long()[:valid]] = torch.arange(valid)
@@ -319,16 +329,21 @@ def reference(
         "weights": new_weights.cpu()[:valid]
         if new_weights is not None
         else torch.empty(0),
-        "block_start": block_start,
+        "offset_per_bucket": offset_per_bucket,
         "feature_start": feature_start.flatten(),
-        "cell_start": torch.cat(
-            [torch.zeros(1, dtype=torch.int64), torch.cumsum(cells.flatten(), 0)]
+        "offset_per_bucket_feature": torch.cat(
+            [
+                torch.zeros(1, dtype=torch.int64),
+                torch.cumsum(length_per_bucket_feature.flatten(), 0),
+            ]
         ),
-        # each key's cell, and world_size * num_features past the valid keys
-        "row_cell": torch.cat(
+        # each key's bucket feature, and world_size * num_features past the
+        # valid keys
+        "bucket_feature_of_row": torch.cat(
             [
                 torch.repeat_interleave(
-                    torch.arange(world_size * num_features), cells.flatten()
+                    torch.arange(world_size * num_features),
+                    length_per_bucket_feature.flatten(),
                 ),
                 torch.full((case.bound,), world_size * num_features),
             ]
@@ -336,7 +351,7 @@ def reference(
     }
 
 
-def partition(
+def bucketize(
     case: Case,
     batch: Batch,
     world_size: int,
@@ -344,11 +359,11 @@ def partition(
     block_sizes,
     lengths: bool = False,
 ) -> Dict[str, torch.Tensor]:
-    """The partition of the batch, from its offsets, or (``lengths``) from its
+    """The bucketize of the batch, from its offsets, or (``lengths``) from its
     lengths alone, the input's totals then from this KJT when it is the input
     (no index dedup's bound)."""
     return planner(
-        hier_output_dist_partition,
+        hier_output_dist_bucketize,
         batch.values,
         None if lengths else batch.offsets,
         batch.lengths if lengths else None,
@@ -366,7 +381,7 @@ def run_case(case: Case, seed: int, world_size: int) -> Dict[str, bool]:
     batch = make_batch(case, seed, world_size)
     dist_types, block_sizes = rules_of(case, world_size)
     ref = reference(case, batch, world_size, dist_types, block_sizes)
-    out = partition(case, batch, world_size, dist_types, block_sizes)
+    out = bucketize(case, batch, world_size, dist_types, block_sizes)
     valid, num_keys = batch.valid, batch.values.numel()
     checks = {
         "keys": out["keys"].dtype == torch.int64
@@ -380,11 +395,17 @@ def run_case(case: Case, seed: int, world_size: int) -> Dict[str, bool]:
             batch.weights is None
             or torch.equal(out["weights"].cpu()[:valid], ref["weights"])
         ),
-        "block_start": torch.equal(out["block_start"].cpu(), ref["block_start"]),
+        "offset_per_bucket": torch.equal(
+            out["offset_per_bucket"].cpu(), ref["offset_per_bucket"]
+        ),
         "feature_start": torch.equal(out["feature_start"].cpu(), ref["feature_start"]),
-        "cells": torch.equal(out["cell_start"].cpu(), ref["cell_start"])
-        and out["row_cell"].dtype == torch.int32
-        and torch.equal(out["row_cell"].cpu().long(), ref["row_cell"]),
+        "offset_per_bucket_feature": torch.equal(
+            out["offset_per_bucket_feature"].cpu(), ref["offset_per_bucket_feature"]
+        )
+        and out["bucket_feature_of_row"].dtype == torch.int32
+        and torch.equal(
+            out["bucket_feature_of_row"].cpu().long(), ref["bucket_feature_of_row"]
+        ),
         "totals": out["input_length_per_key"].tolist() == batch.in_totals,
     }
 
@@ -396,9 +417,9 @@ def run_case(case: Case, seed: int, world_size: int) -> Dict[str, bool]:
             for name, tensor in out.items()
         )
 
-    checks["again"] = same(partition(case, batch, world_size, dist_types, block_sizes))
+    checks["again"] = same(bucketize(case, batch, world_size, dist_types, block_sizes))
     checks["lengths"] = same(
-        partition(case, batch, world_size, dist_types, block_sizes, lengths=True)
+        bucketize(case, batch, world_size, dist_types, block_sizes, lengths=True)
     )
     return checks
 
@@ -465,7 +486,7 @@ def fanout_reference(
     """On the host: each row's original rows in increasing order; the heavy
     rows (more than HEAVY) in row order, each with its slot and its
     sub-tasks of HEAVY original rows, consecutive and in entry order; and
-    each heavy row's place among part 1's keys (inv's inverse)."""
+    each heavy row's place among the bucketized keys (inv's inverse)."""
     counts = torch.bincount(reverse_indices, minlength=rows)
     exp_off = torch.cat([torch.zeros(1, dtype=torch.int64), torch.cumsum(counts, 0)])
     heavy_rows = torch.nonzero(counts > HEAVY).flatten()
@@ -568,21 +589,23 @@ NODE_CASES = [
 ]
 
 
-def count_vector(row_cell: torch.Tensor, valid: int, case: NodeCase) -> torch.Tensor:
-    """A requester's counts for its node, from its rows' cells: its keys for
-    each target's remote part, then for each owner of the node and
-    feature."""
+def count_vector(
+    bucket_feature_of_row: torch.Tensor, valid: int, case: NodeCase
+) -> torch.Tensor:
+    """A requester's counts for its node, from its rows' bucket features:
+    its keys for each target's remote part, then for each owner of the node
+    and feature."""
     num_nodes, local_size, num_features = (
         case.num_nodes,
         case.local_size,
         case.num_features,
     )
     world_size = num_nodes * local_size
-    cells = torch.bincount(
-        row_cell[:valid].long(), minlength=world_size * num_features
+    counts = torch.bincount(
+        bucket_feature_of_row[:valid].long(), minlength=world_size * num_features
     ).view(num_nodes, local_size, num_features)
-    same = cells[case.node]
-    return torch.cat([cells.sum((0, 2)) - same.sum(1), same.flatten()])
+    same = counts[case.node]
+    return torch.cat([counts.sum((0, 2)) - same.sum(1), same.flatten()])
 
 
 def run_node_case(case: NodeCase, seed: int) -> Dict[str, bool]:
@@ -608,24 +631,28 @@ def run_node_case(case: NodeCase, seed: int) -> Dict[str, bool]:
     batches = [
         make_batch(kjt, seed * 100 + local_rank) for local_rank in range(local_size)
     ]
-    parts = [
-        partition(kjt, batch, world_size, dist_types, block_sizes) for batch in batches
+    ranks = [
+        bucketize(kjt, batch, world_size, dist_types, block_sizes) for batch in batches
     ]
     valid = [batch.valid for batch in batches]
-    cell_start = [part["cell_start"].tolist() for part in parts]
+    offset_per_bucket_feature = [
+        bucketized["offset_per_bucket_feature"].tolist() for bucketized in ranks
+    ]
     # every rank's count vector, [requester][words]
     node_counts = torch.stack(
         [
-            count_vector(part["row_cell"].cpu(), valid[local_rank], case)
-            for local_rank, part in enumerate(parts)
+            count_vector(
+                bucketized["bucket_feature_of_row"].cpu(), valid[local_rank], case
+            )
+            for local_rank, bucketized in enumerate(ranks)
         ]
     )
     remote_counts = node_counts[:, :local_size]  # [requester][target]
     same_counts = node_counts[:, local_size:].view(
         local_size, local_size, num_features
     )  # [requester][owner][feature]
-    own_cells = same_counts.permute(1, 2, 0).reshape(local_size, -1)
-    own_total, remote_total = own_cells.sum(1), remote_counts.sum(0)
+    own_lengths = same_counts.permute(1, 2, 0).reshape(local_size, -1)
+    own_total, remote_total = own_lengths.sum(1), remote_counts.sum(0)
 
     def exchanged(local_rank: int) -> List[torch.Tensor]:
         """What node_count_exchange gives a rank: the count vectors' sum over
@@ -649,13 +676,13 @@ def run_node_case(case: NodeCase, seed: int) -> Dict[str, bool]:
     skip = need_lookup > lookup_keys or need_remote > remote_keys
 
     def layout_of(local_rank: int, **owner) -> Dict[str, torch.Tensor]:
-        part = parts[local_rank]
+        bucketized = ranks[local_rank]
         out = planner(
             hier_output_dist_node_layout,
             *exchanged(local_rank),
-            part["cell_start"],
-            part["block_start"],
-            part["row_cell"],
+            bucketized["offset_per_bucket_feature"],
+            bucketized["offset_per_bucket"],
+            bucketized["bucket_feature_of_row"],
             num_nodes,
             local_size,
             node,
@@ -673,11 +700,11 @@ def run_node_case(case: NodeCase, seed: int) -> Dict[str, bool]:
             torch.equal(layout["count_vector"], node_counts[local_rank])
             for local_rank, layout in enumerate(layouts)
         ),
-        "own_cells": all(
-            torch.equal(layout["own_cells"], own_cells[local_rank])
+        "own_lengths": all(
+            torch.equal(layout["own_lengths"], own_lengths[local_rank])
             and torch.equal(
-                layout["own_starts"],
-                torch.cumsum(own_cells[local_rank], 0) - own_cells[local_rank],
+                layout["own_offsets"],
+                torch.cumsum(own_lengths[local_rank], 0) - own_lengths[local_rank],
             )
             and torch.equal(layout["own_total"], own_total)
             for local_rank, layout in enumerate(layouts)
@@ -709,20 +736,22 @@ def run_node_case(case: NodeCase, seed: int) -> Dict[str, bool]:
         return checks
 
     def rows_of(source: int, owner: int, feature: int) -> range:
-        cell = owner * num_features + feature
-        return range(cell_start[source][cell], cell_start[source][cell + 1])
+        bucket_feature = owner * num_features + feature
+        return range(*offset_per_bucket_feature[source][bucket_feature:][:2])
 
     # Every requester pushes its valid rows where its layout says: rows of
     # (target, destination, requester, row).
     pushes = []
     for local_rank in range(local_size):
-        cell = parts[local_rank]["row_cell"].cpu()[: valid[local_rank]].long()
+        bucket_feature = (
+            ranks[local_rank]["bucket_feature_of_row"].cpu()[: valid[local_rank]].long()
+        )
         rows = torch.arange(valid[local_rank])
         pushes.append(
             torch.stack(
                 [
-                    cell // num_features % local_size,
-                    layouts[local_rank]["destination_base"][cell] + rows,
+                    bucket_feature // num_features % local_size,
+                    layouts[local_rank]["destination_base"][bucket_feature] + rows,
                     torch.full_like(rows, local_rank),
                     rows,
                 ],
@@ -773,8 +802,10 @@ def run_node_case(case: NodeCase, seed: int) -> Dict[str, bool]:
 
     # One node: each owner's KJT from its node_keys after the pushes, and each
     # requester's map into its owners' KJTs.
-    keys = [part["keys"].cpu() for part in parts]
-    weights = [part["weights"].cpu() for part in parts] if case.weights else None
+    keys = [bucketized["keys"].cpu() for bucketized in ranks]
+    weights = (
+        [bucketized["weights"].cpu() for bucketized in ranks] if case.weights else None
+    )
     place = [
         torch.full((valid[local_rank],), -1, dtype=torch.int64)
         for local_rank in range(local_size)
@@ -796,7 +827,7 @@ def run_node_case(case: NodeCase, seed: int) -> Dict[str, bool]:
         )
         order = own_order[target]
         num_recv = len(order)
-        lengths = own_cells[target]
+        lengths = own_lengths[target]
         for position, (source, row) in enumerate(order):
             place[source][row] = position
         owner_good &= (
@@ -849,7 +880,7 @@ def main() -> None:
     for case_idx, case in enumerate(CASES):
         for world_size in case.world_sizes:
             checks = run_case(case, 100 + case_idx, world_size)
-            label = f"partition '{case.name}' world_size={world_size}"
+            label = f"bucketize '{case.name}' world_size={world_size}"
             failures += not report(label, checks)
     for case_idx, case in enumerate(FANOUT_CASES):
         checks = run_fanout_case(case, 200 + case_idx)

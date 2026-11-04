@@ -219,7 +219,7 @@ struct OutTables {
   }
   // The owner of one of this rank's rows (its bucketized rows by owner).
   __device__ __forceinline__ int owner_of(int64_t row) const {
-    return seg_search(plan.block_start, sizes.topo.world_size, row);
+    return seg_search(plan.offset_per_bucket, sizes.topo.world_size, row);
   }
 };
 
@@ -251,23 +251,23 @@ struct RowTask {
   int owner, count;
   int64_t row0;
 };
-// The row tasks of the node's owners (block_start: theirs, this rank `me`
+// The row tasks of the node's owners (offset_per_bucket: theirs, this rank `me`
 // of local_size): every owner gets as many as the largest block needs.
 struct LocalRows {
-  const int64_t *block_start;
+  const int64_t *offset_per_bucket;
   int local_size, me;
   __device__ __forceinline__ int64_t count() const {
     int64_t most = 0;
     for (int owner = 0; owner < local_size; ++owner)
-      most = max(most, block_start[owner + 1] - block_start[owner]);
+      most = max(most, offset_per_bucket[owner + 1] - offset_per_bucket[owner]);
     return local_size * ceil_div<kTaskRows>(most);
   }
   __device__ __forceinline__ RowTask task(int64_t task) const {
     RowTask job;
     job.owner = (int)((me + task) % local_size);
-    job.row0 = block_start[job.owner] + task / local_size * kTaskRows;
+    job.row0 = offset_per_bucket[job.owner] + task / local_size * kTaskRows;
     job.count =
-        (int)min((int64_t)kTaskRows, max(block_start[job.owner + 1] - job.row0, (int64_t)0));
+        (int)min((int64_t)kTaskRows, max(offset_per_bucket[job.owner + 1] - job.row0, (int64_t)0));
     return job;
   }
 };

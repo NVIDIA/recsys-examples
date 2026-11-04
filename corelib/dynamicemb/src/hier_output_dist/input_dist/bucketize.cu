@@ -14,12 +14,15 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 # See the License for the specific language governing permissions and
 # limitations under the License.
 ******************************************************************************/
-// Part 1 of a call: the keys partitioned by owner, and index dedup's
-// fan-out (planner.h).
+// The bucketize of a call: its keys by owner, as TorchRec's bucketize orders
+// them, and index dedup's fan-out (planner.h).
 
 #include <c10/util/Exception.h>
 
+#include <algorithm>
 #include <cstdint>
+#include <type_traits>
+#include <vector>
 
 #include "hier_output_dist/input_dist/planner.cuh"
 #include "hier_output_dist/input_dist/planner.h"
@@ -31,26 +34,33 @@ namespace hier_output_dist {
 
 namespace {
 
-// An index table of int32 or int64 entries (a KJT's offsets or lengths), read
-// as int64; data nullptr: none.
-struct IndexTable {
-  const void *data;
-  bool wide;
-  __device__ __forceinline__ int64_t operator[](int64_t index) const {
-    return wide ? ((const int64_t *)data)[index] : (int64_t)((const int32_t *)data)[index];
-  }
-};
-IndexTable index_table(const c10::optional<at::Tensor> &tensor) {
-  if (!tensor.has_value()) return IndexTable{nullptr, false};
-  return IndexTable{tensor->data_ptr(), tensor->scalar_type() == at::kLong};
+// The KJT's keys, offsets and lengths are each int32 or int64: the kernels
+// that read them take the type as a template argument (Key, Length,
+// Offset), and with_index calls `launch` with the tensor's data as a pointer
+// of its dtype; an absent tensor as a null int64_t pointer, which the kernel
+// does not read.
+template <typename Launch>
+void with_index(const at::Tensor &tensor, Launch &&launch) {
+  if (tensor.scalar_type() == at::kInt)
+    launch(tensor.data_ptr<int32_t>());
+  else
+    launch(tensor.data_ptr<int64_t>());
+}
+template <typename Launch>
+void with_index(const c10::optional<at::Tensor> &tensor, Launch &&launch) {
+  if (tensor.has_value())
+    with_index(*tensor, launch);
+  else
+    launch(static_cast<const int64_t *>(nullptr));
 }
 
 // ── the KJT's features ──
 
 // One CTA per feature of a KJT of lengths: its keys, the sum of its batch
 // lengths.
+template <typename Length>
 __global__ void __launch_bounds__(kThreads)
-    feature_totals_kernel(IndexTable lengths, int64_t batch, int64_t *totals) {
+    feature_totals_kernel(const Length *lengths, int64_t batch, int64_t *totals) {
   using Reduce = cub::BlockReduce<int64_t, kThreads>;
   __shared__ typename Reduce::TempStorage reduce;
   const int64_t feature = blockIdx.x;
@@ -63,26 +73,29 @@ __global__ void __launch_bounds__(kThreads)
 
 // One CTA: where each feature's keys start in the KJT (value_start
 // [num_features + 1], from its first key), from its offsets (every
-// batch-th) or from the features' totals (a KJT of lengths); and the totals
-// construct_jagged_tensors reads (input_length_per_key [num_features]), of
-// the input KJT's offsets when it is another KJT.
+// batch-th) or, for a KJT of lengths (offsets nullptr), from the features'
+// totals; and the totals construct_jagged_tensors reads
+// (input_length_per_key [num_features]), of the input KJT's offsets when it
+// is another KJT (else input_offsets is nullptr).
+template <typename Offset, typename InputOffset>
 __global__ void __launch_bounds__(kThreads)
-    feature_starts_kernel(IndexTable offsets, const int64_t *totals, int64_t batch,
-                          int64_t num_features, IndexTable input_offsets, int64_t input_batch,
-                          int64_t *value_start, int64_t *input_length_per_key) {
-  if (offsets.data != nullptr) {
+    feature_starts_kernel(const Offset *offsets, const int64_t *totals, int64_t batch,
+                          int64_t num_features, const InputOffset *input_offsets,
+                          int64_t input_batch, int64_t *value_start,
+                          int64_t *input_length_per_key) {
+  if (offsets != nullptr) {
     for (int64_t feature = threadIdx.x; feature <= num_features; feature += kThreads)
-      value_start[feature] = offsets[feature * batch] - offsets[0];
+      value_start[feature] = (int64_t)offsets[feature * batch] - (int64_t)offsets[0];
     __syncthreads();
   } else {
     cta_exclusive_ends<int64_t>(
         num_features, [&](int64_t feature) { return totals[feature]; }, value_start);
   }
   for (int64_t feature = threadIdx.x; feature < num_features; feature += kThreads)
-    input_length_per_key[feature] =
-        input_offsets.data != nullptr
-            ? input_offsets[(feature + 1) * input_batch] - input_offsets[feature * input_batch]
-            : value_start[feature + 1] - value_start[feature];
+    input_length_per_key[feature] = input_offsets != nullptr
+                                        ? (int64_t)input_offsets[(feature + 1) * input_batch] -
+                                              (int64_t)input_offsets[feature * input_batch]
+                                        : value_start[feature + 1] - value_start[feature];
 }
 
 // ── the owner rules ──
@@ -92,63 +105,126 @@ struct Placement {
   int64_t owner, stored;
 };
 
-// The owner of a key and the key its owner stores, by the rule of its
-// feature (a DistType code and a block size), as DynamicEmb's bucketize
-// places it (src/sparse_block_bucketize_features.cu): in the arithmetic of
-// the keys' own int32 or int64, as unsigned numbers. TorchRec converts the
-// block sizes to the keys' dtype, so int32 keys take their low 32 bits. The
-// cyclic rules store the key itself. The continuous rule (kBlock: any code
-// but the cyclic ones): below the end of the blocks (block * world_size,
+// The owner rules (DistType), a type each: place(key, block_size,
+// world_size) gives a key's owner and the key its owner stores, as
+// DynamicEmb's bucketize places it (src/sparse_block_bucketize_features.cu):
+// in the arithmetic of the key's own type (int32_t or int64_t), as unsigned
+// numbers. The cyclic rules store the key itself.
+
+// kCyclic ("roundrobin"): the owner is key % world_size.
+struct CyclicRule {
+  template <typename Key>
+  __device__ __forceinline__ static Placement place(Key key, int64_t, int64_t world_size) {
+    using Unsigned = std::make_unsigned_t<Key>;
+    return {(int64_t)((Unsigned)key % (Unsigned)world_size), key};
+  }
+};
+
+// kHashedCyclic ("hash_roundrobin"): the owner is murmur3_fmix64(key) %
+// world_size, the hash of an int32 key taken to its low 32 bits.
+struct HashedCyclicRule {
+  template <typename Key>
+  __device__ __forceinline__ static Placement place(Key key, int64_t, int64_t world_size) {
+    using Unsigned = std::make_unsigned_t<Key>;
+    const Unsigned hash = (Unsigned)murmur3_fmix64((Unsigned)key);
+    return {(int64_t)(hash % (Unsigned)world_size), key};
+  }
+};
+
+// kBlock ("continuous"): below the end of the blocks (block * world_size,
 // wrapping) the owner is key / block and stores key % block; past it
-// key % world_size and key / world_size.
-__device__ __forceinline__ Placement place_key(int64_t key, int code, int64_t block_size,
-                                               int64_t world_size) {
-  const uint64_t value = (uint64_t)key, ranks = (uint64_t)world_size;
-  if (code == (int)DistType::kHashedCyclic) return {(int64_t)(murmur3_fmix64(value) % ranks), key};
-  if (code == (int)DistType::kCyclic) return {(int64_t)(value % ranks), key};
-  const uint64_t block = (uint64_t)max(block_size, (int64_t)1);  // a block of 0 takes 1
-  if (value < block * ranks) return {(int64_t)(value / block), (int64_t)(value % block)};
-  return {(int64_t)(value % ranks), (int64_t)(value / ranks)};
-}
-// The same on int32 keys, in 32-bit arithmetic: the low 32 bits of the block
-// size, an end that wraps at 2^32 (the block is taken as 1 only after it),
-// and the stored key the int32 the bucketize writes, widened with its sign.
-__device__ __forceinline__ Placement place_key(int32_t key, int code, int64_t block_size,
-                                               int64_t world_size) {
-  const uint32_t value = (uint32_t)key, ranks = (uint32_t)world_size;
-  if (code == (int)DistType::kHashedCyclic)
-    return {(int64_t)((murmur3_fmix64(value) & 0xFFFFFFFFull) % ranks), key};
-  if (code == (int)DistType::kCyclic) return {(int64_t)(value % ranks), key};
-  uint32_t block = (uint32_t)block_size;
-  const bool in_blocks = value < block * ranks;
-  block = max(block, 1u);
-  if (in_blocks) return {(int64_t)(value / block), (int64_t)(int32_t)(value % block)};
-  return {(int64_t)(value % ranks), (int64_t)(int32_t)(value / ranks)};
+// key % world_size and key / world_size. TorchRec converts the block sizes
+// to the keys' dtype, so int32 keys take their low 32 bits.
+struct BlockRule {
+  __device__ __forceinline__ static Placement place(int64_t key, int64_t block_size,
+                                                    int64_t world_size) {
+    const uint64_t value = (uint64_t)key, ranks = (uint64_t)world_size;
+    const uint64_t block = (uint64_t)max(block_size, (int64_t)1);  // a block of 0 takes 1
+    if (value < block * ranks) return {(int64_t)(value / block), (int64_t)(value % block)};
+    return {(int64_t)(value % ranks), (int64_t)(value / ranks)};
+  }
+  // int32 keys, in 32-bit arithmetic: an end that wraps at 2^32 (the block
+  // is taken as 1 only after it), and the stored key the int32 the bucketize
+  // writes, widened with its sign.
+  __device__ __forceinline__ static Placement place(int32_t key, int64_t block_size,
+                                                    int64_t world_size) {
+    const uint32_t value = (uint32_t)key, ranks = (uint32_t)world_size;
+    uint32_t block = (uint32_t)block_size;
+    const bool in_blocks = value < block * ranks;
+    block = max(block, 1u);
+    if (in_blocks) return {(int64_t)(value / block), (int64_t)(int32_t)(value % block)};
+    return {(int64_t)(value % ranks), (int64_t)(int32_t)(value / ranks)};
+  }
+};
+
+// The rules of a KJT's features, as place_keys_kernel reads them
+// (place(key, feature, world_size)): every feature of one rule, Rule, known
+// when the kernel is compiled; or features of different rules, each key's
+// rule picked by its feature's DistType code at run time (any code but the
+// cyclic ones is kBlock).
+template <typename Rule>
+struct OneRule {
+  const int64_t *block_sizes;  // [num_features]
+  template <typename Key>
+  __device__ __forceinline__ Placement place(Key key, int64_t feature, int64_t world_size) const {
+    return Rule::place(key, block_sizes[feature], world_size);
+  }
+};
+struct MixedRules {
+  const int32_t *dist_types;   // [num_features]
+  const int64_t *block_sizes;  // [num_features]
+  template <typename Key>
+  __device__ __forceinline__ Placement place(Key key, int64_t feature, int64_t world_size) const {
+    const int64_t block_size = block_sizes[feature];
+    switch (dist_types[feature]) {
+      case (int)DistType::kCyclic:
+        return CyclicRule::place(key, block_size, world_size);
+      case (int)DistType::kHashedCyclic:
+        return HashedCyclicRule::place(key, block_size, world_size);
+      default:
+        return BlockRule::place(key, block_size, world_size);
+    }
+  }
+};
+
+// Calls `launch` with the rules of the features (their codes on the host):
+// OneRule of the rule all of them have, else MixedRules.
+template <typename Launch>
+void with_rules(const OwnerRules &rules, Launch &&launch) {
+  const std::vector<int> &codes = rules.host_dist_types;
+  const int64_t *block_sizes = rules.block_sizes.data_ptr<int64_t>();
+  if (!std::all_of(codes.begin(), codes.end(), [&](int code) { return code == codes[0]; }))
+    launch(MixedRules{rules.dist_types.data_ptr<int32_t>(), block_sizes});
+  else if (codes[0] == (int)DistType::kCyclic)
+    launch(OneRule<CyclicRule>{block_sizes});
+  else if (codes[0] == (int)DistType::kHashedCyclic)
+    launch(OneRule<HashedCyclicRule>{block_sizes});
+  else
+    launch(OneRule<BlockRule>{block_sizes});
 }
 
 // A thread per key of the KJT: its feature, its owner and the key its owner
-// stores, and its cell owner * num_features + feature (world_size *
-// num_features past the valid keys, index dedup's bound: those take the last
-// feature's rule); `index` the key's own index, which the sort carries.
-template <typename Key>
+// stores, by its feature's rule, and its bucket feature owner * num_features +
+// feature (world_size * num_features past the valid keys, index dedup's bound:
+// those take the last feature's rule); `index` the key's own index, which the
+// sort carries.
+template <typename Key, typename Rules>
 __global__ void __launch_bounds__(kThreads)
     place_keys_kernel(const Key *values, int64_t num_keys, const int64_t *value_start,
-                      int64_t num_features, const int32_t *dist_types, const int64_t *block_sizes,
-                      int64_t world_size, int32_t *cell, int64_t *stored, int32_t *index) {
+                      int64_t num_features, Rules rules, int64_t world_size,
+                      int32_t *bucket_feature, int64_t *stored, int32_t *index) {
   for (int64_t key = first_item(); key < num_keys; key += item_stride()) {
     const int64_t feature = upper_bound(value_start, num_features + 1, key) - 1;
-    const int64_t rule = min(feature, num_features - 1);
-    const Placement placed =
-        place_key(values[key], dist_types[rule], block_sizes[rule], world_size);
-    cell[key] = (int32_t)(feature < num_features ? placed.owner * num_features + feature
-                                                 : world_size * num_features);
+    const Placement placed = rules.place(values[key], min(feature, num_features - 1), world_size);
+    bucket_feature[key] = (int32_t)(feature < num_features ? placed.owner * num_features + feature
+                                                           : world_size * num_features);
     stored[key] = placed.stored;
     index[key] = (int32_t)key;
   }
 }
 
-// A thread per position of the keys sorted by cell: the key there as its
-// owner stores it, and its weight.
+// A thread per position of the keys sorted by bucket feature: the key there as
+// its owner stores it, and its weight.
 __global__ void __launch_bounds__(kThreads)
     gather_keys_kernel(const int32_t *inv, int64_t num_keys, const int64_t *stored,
                        const float *weights, int64_t *keys, float *key_weights) {
@@ -172,9 +248,9 @@ __global__ void __launch_bounds__(kThreads)
   }
 }
 
-// A thread per deduplicated row (and per position of part 1, both `rows`):
+// A thread per deduplicated row (and per bucketized row, both `rows`):
 // whether the row is heavy (more original rows than kHeavy) and its
-// sub-tasks of kHeavy original rows; and where part 1 put each row
+// sub-tasks of kHeavy original rows; and where the bucketize put each row
 // (position_of, the inverse of inv).
 __global__ void __launch_bounds__(kThreads)
     heavy_counts_kernel(const int32_t *exp_off, const int32_t *inv, int64_t rows, int32_t *heavy,
@@ -188,7 +264,7 @@ __global__ void __launch_bounds__(kThreads)
 }
 
 // A thread per deduplicated row: its slot (heavy rows numbered in row order,
-// heavy_before) or -1, and for a heavy row its place in part 1 and its first
+// heavy_before) or -1, and for a heavy row its bucketized row and its first
 // sub-task. The thread past the rows writes the counts.
 __global__ void __launch_bounds__(kThreads)
     heavy_rows_kernel(const int32_t *heavy_before, const int64_t *sub_before,
@@ -233,11 +309,11 @@ bool is_index_dtype(const at::Tensor &tensor) {
 
 }  // namespace
 
-Partition partition_keys(const PlanInput &input, const OwnerRules &rules, int64_t world_size) {
+BucketizedKeys bucketize_keys(const PlanInput &input, const OwnerRules &rules, int64_t world_size) {
   const at::Tensor &values = input.values;
   const int64_t num_keys = values.numel(), batch = input.batch_size,
                 num_features = (int64_t)rules.host_dist_types.size();
-  const int64_t cells = world_size * num_features;
+  const int64_t bucket_features = world_size * num_features;
   TORCH_CHECK(num_features >= 1 && world_size >= 1 && rules.dist_types.numel() == num_features &&
                   rules.block_sizes.numel() == num_features,
               "hier_output_dist: a rule and a block size per feature, and some owners");
@@ -269,57 +345,63 @@ Partition partition_keys(const PlanInput &input, const OwnerRules &rules, int64_
 
   // where each feature's keys start in the KJT, and the input's totals
   const at::Tensor value_start = at::empty({num_features + 1}, long_options);
-  Partition part;
-  part.input_length_per_key = at::empty({num_features}, long_options);
+  BucketizedKeys bucketized;
+  bucketized.input_length_per_key = at::empty({num_features}, long_options);
   at::Tensor totals;
   if (input.lengths.has_value()) {
     totals = at::empty({num_features}, long_options);
-    feature_totals_kernel<<<num_features, kThreads, 0, stream>>>(index_table(input.lengths), batch,
-                                                                 totals.data_ptr<int64_t>());
+    with_index(*input.lengths, [&](const auto *lengths) {
+      feature_totals_kernel<<<num_features, kThreads, 0, stream>>>(lengths, batch,
+                                                                   totals.data_ptr<int64_t>());
+    });
     C10_CUDA_KERNEL_LAUNCH_CHECK();
   }
-  feature_starts_kernel<<<kOneCta, kThreads, 0, stream>>>(
-      index_table(input.offsets), data_or_null<int64_t>(totals), batch, num_features,
-      index_table(input.input_offsets), input.input_batch_size, value_start.data_ptr<int64_t>(),
-      part.input_length_per_key.data_ptr<int64_t>());
+  with_index(input.offsets, [&](const auto *offsets) {
+    with_index(input.input_offsets, [&](const auto *input_offsets) {
+      feature_starts_kernel<<<kOneCta, kThreads, 0, stream>>>(
+          offsets, data_or_null<int64_t>(totals), batch, num_features, input_offsets,
+          input.input_batch_size, value_start.data_ptr<int64_t>(),
+          bucketized.input_length_per_key.data_ptr<int64_t>());
+    });
+  });
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 
-  // the cell of each key and the key its owner stores, then a stable sort by
-  // cell: a cell's keys keep the KJT's order, and the keys past the valid
-  // ones stay last, in order
-  const at::Tensor cell = at::empty({num_keys}, int_options);
+  // the bucket feature of each key and the key its owner stores, then a stable
+  // sort by bucket feature: a bucket feature's keys keep the KJT's order, and
+  // the keys past the valid ones stay last, in order
+  const at::Tensor bucket_feature = at::empty({num_keys}, int_options);
   const at::Tensor stored = at::empty({num_keys}, long_options);
   const at::Tensor index = at::empty({num_keys}, int_options);
   if (num_keys > 0) {
-    if (values.scalar_type() == at::kInt)
-      place_keys_kernel<<<item_grid(num_keys), kThreads, 0, stream>>>(
-          values.data_ptr<int32_t>(), num_keys, value_start.data_ptr<int64_t>(), num_features,
-          rules.dist_types.data_ptr<int32_t>(), rules.block_sizes.data_ptr<int64_t>(), world_size,
-          cell.data_ptr<int32_t>(), stored.data_ptr<int64_t>(), index.data_ptr<int32_t>());
-    else
-      place_keys_kernel<<<item_grid(num_keys), kThreads, 0, stream>>>(
-          values.data_ptr<int64_t>(), num_keys, value_start.data_ptr<int64_t>(), num_features,
-          rules.dist_types.data_ptr<int32_t>(), rules.block_sizes.data_ptr<int64_t>(), world_size,
-          cell.data_ptr<int32_t>(), stored.data_ptr<int64_t>(), index.data_ptr<int32_t>());
+    with_index(values, [&](const auto *keys) {
+      with_rules(rules, [&](auto feature_rules) {
+        place_keys_kernel<<<item_grid(num_keys), kThreads, 0, stream>>>(
+            keys, num_keys, value_start.data_ptr<int64_t>(), num_features, feature_rules,
+            world_size, bucket_feature.data_ptr<int32_t>(), stored.data_ptr<int64_t>(),
+            index.data_ptr<int32_t>());
+      });
+    });
     C10_CUDA_KERNEL_LAUNCH_CHECK();
   }
-  std::tie(part.row_cell, part.inv) = sort_pairs(cell, index, bits_for(cells + 1));
-  part.keys = at::empty({num_keys}, long_options);
+  std::tie(bucketized.bucket_feature_of_row, bucketized.inv) =
+      sort_pairs(bucket_feature, index, bits_for(bucket_features + 1));
+  bucketized.keys = at::empty({num_keys}, long_options);
   if (input.weights.has_value())
-    part.key_weights = at::empty({num_keys}, values.options().dtype(at::kFloat));
+    bucketized.key_weights = at::empty({num_keys}, values.options().dtype(at::kFloat));
   if (num_keys > 0) {
     gather_keys_kernel<<<item_grid(num_keys), kThreads, 0, stream>>>(
-        part.inv.data_ptr<int32_t>(), num_keys, stored.data_ptr<int64_t>(),
+        bucketized.inv.data_ptr<int32_t>(), num_keys, stored.data_ptr<int64_t>(),
         input.weights.has_value() ? input.weights->data_ptr<float>() : nullptr,
-        part.keys.data_ptr<int64_t>(), data_or_null<float>(part.key_weights));
+        bucketized.keys.data_ptr<int64_t>(), data_or_null<float>(bucketized.key_weights));
     C10_CUDA_KERNEL_LAUNCH_CHECK();
   }
-  // where each cell, and each owner's block, starts
-  part.cell_start = at::empty({cells + 1}, long_options);
-  part.block_start = at::empty({world_size + 1}, long_options);
-  run_starts<int32_t, int64_t>(part.row_cell, cells, part.cell_start, num_features,
-                               part.block_start);
-  return part;
+  // where each bucket feature, and each bucket (owner), starts
+  bucketized.offset_per_bucket_feature = at::empty({bucket_features + 1}, long_options);
+  bucketized.offset_per_bucket = at::empty({world_size + 1}, long_options);
+  run_starts<int32_t, int64_t>(bucketized.bucket_feature_of_row, bucket_features,
+                               bucketized.offset_per_bucket_feature, num_features,
+                               bucketized.offset_per_bucket);
+  return bucketized;
 }
 
 FanoutTables fanout_tables(const at::Tensor &reverse_indices, const at::Tensor &inv) {

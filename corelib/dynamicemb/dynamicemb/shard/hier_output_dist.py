@@ -101,7 +101,7 @@ def _first_difference(every: List[Dict]) -> Optional[str]:
 # Where the tensors the benchmark reads are in the plans' lists (the order of
 # FwdPlan::tensors() and BwdPlan::tensors(), in
 # src/hier_output_dist/input_dist/plan.cu).
-_FWD_BLOCK_START, _FWD_NUM_CHUNKS, _FWD_UNIQ_OUT = 0, 14, 24
+_FWD_OFFSET_PER_BUCKET, _FWD_NUM_CHUNKS, _FWD_UNIQ_OUT = 0, 14, 24
 _BWD_UNIQ_IN = 23
 
 
@@ -137,10 +137,10 @@ class HierCall:
 
     # Tables of the plans the benchmark reads.
     @property
-    def block_start(self) -> torch.Tensor:
+    def offset_per_bucket(self) -> torch.Tensor:
         """int64 [world_size + 1]: where the requester's rows for each owner
         start."""
-        return self.fwd_plan[_FWD_BLOCK_START]
+        return self.fwd_plan[_FWD_OFFSET_PER_BUCKET]
 
     @property
     def num_chunks(self) -> Optional[torch.Tensor]:

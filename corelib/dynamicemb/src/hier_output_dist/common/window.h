@@ -77,16 +77,16 @@ struct CountMessage {
 // the input dist, whose sequence number (in_seq) counts calls; the out
 // channel the output dist's kernels, whose number (out_seq) counts them.
 
-// The ctrl section (uint64 words): every control word of both channels and
-// the device state they keep across calls. Its size depends only on
-// local_size, num_nodes, num_features and the most chunks of a stream. Every control word is tagged
-// with its channel's sequence number, is a running total, or is back at its start value when the
-// kernel that uses it ends. The data words (the count vectors, cell_start, the needs, the count
-// messages) are written whole in each call, before a tagged word, the node barrier or a signal
-// publishes them. So none is ever reset, and a call that overflowed leaves all of them valid for
-// the next. Words marked (local) are only this rank's: a GIN warp's place with each peer, which it
-// sets when it starts. Words marked (num_nodes > 1) exist across nodes only. Each accessor returns
-// the address of a word, or of the first of an array of them, in the copy at `base`.
+// The ctrl section (uint64 words): every control word of both channels and the device state they
+// keep across calls. Its size depends only on local_size, num_nodes, num_features and the most
+// chunks of a stream. Every control word is tagged with its channel's sequence number, is a running
+// total, or is back at its start value when the kernel that uses it ends. The data words (the count
+// vectors, requester_offsets, the needs, the count messages) are written whole in each call, before
+// a tagged word, the node barrier or a signal publishes them. So none is ever reset, and a call
+// that overflowed leaves all of them valid for the next. Words marked (local) are only this rank's:
+// a GIN warp's place with each peer, which it sets when it starts. Words marked (num_nodes > 1)
+// exist across nodes only. Each accessor returns the address of a word, or of the first of an array
+// of them, in the copy at `base`.
 class CtrlLayout {
  public:
   __host__ __device__ CtrlLayout(const Sizes &sizes, void *base)
@@ -107,7 +107,7 @@ class CtrlLayout {
     in_started_ = take(1);
     count_vectors_ = take(2 * count_.words());
     in_written_ = take(local_size);
-    cell_start_ = take(multi ? local_size * num_features_ : 0);
+    requester_offsets_ = take(multi ? local_size * num_features_ : 0);
     in_done_ = take(multi ? 1 + kNumNeeds : 0);
     count_msg_out_ = take(multi ? message_.out_words() : 0);
     count_msgs_ = take(multi ? 2 * num_nodes * message_.slot_words() : 0);
@@ -143,10 +143,10 @@ class CtrlLayout {
   }
   // [local_size] in_seq whose keys each requester pushed into node_keys
   __host__ __device__ uint64_t *in_written() const { return word(in_written_); }
-  // (num_nodes > 1) [num_features] where the cells (feature, requester) of a
+  // (num_nodes > 1) [num_features] where the keys of each feature of a
   // same-node requester start in this rank's KJT
-  __host__ __device__ int64_t *cell_start(int64_t requester) const {
-    return (int64_t *)word(cell_start_ + requester * num_features_);
+  __host__ __device__ int64_t *requester_offsets(int64_t requester) const {
+    return (int64_t *)word(requester_offsets_ + requester * num_features_);
   }
   // (num_nodes > 1) in_seq of this rank's node_status_exchange
   __host__ __device__ uint64_t *in_done() const { return word(in_done_); }
@@ -232,7 +232,7 @@ class CtrlLayout {
   int64_t num_nodes_, num_features_, counters_;
   CountVector count_;
   CountMessage message_;
-  int64_t in_started_, count_vectors_, in_written_, cell_start_, in_done_, count_msg_out_,
+  int64_t in_started_, count_vectors_, in_written_, requester_offsets_, in_done_, count_msg_out_,
       count_msgs_;
   int64_t out_started_, pushed_, pulled_, arrive_, tasks_, landed_rows_, fwd_tot_, bwd_tot_,
       grant_sent_, bwd_ready_sent_, put_at_, landed_, pulled_rows_, posted_, slot_free_;
@@ -242,6 +242,8 @@ class CtrlLayout {
 // The keys section of the window (KeysLayout): the in channel's data, and the
 // formats of the two buffers in it that the node's requesters read, the proxy
 // header and remote_map.
+
+struct GatheredHeader;  // below
 
 // The proxy header (int32 words), what a proxy publishes to its node's
 // requesters: its stream's chunks at word 0 and its end at word 1 (uint32,
@@ -277,22 +279,68 @@ struct ProxyHeader {
   __host__ __device__ int64_t gathered_words() const {
     return gathered_push_table() + push_words();
   }
+  // Proxy `proxy`'s words in what a requester gathered of every proxy's
+  // header (`headers`, gathered_words each).
+  __host__ __device__ GatheredHeader gathered(const int32_t *headers, int64_t proxy) const;
 };
+// What a requester gathered of a proxy's header: its stream's chunks, each
+// chunk's end and the stream's end (unwrapped positions), and this
+// requester's push table there (positions relative to its push order at the
+// proxy, groups relative to its first group).
+struct GatheredHeader {
+  const int32_t *words;
+  int64_t max_chunks;
+  __host__ __device__ int64_t chunks() const { return words[ProxyHeader::kGatheredChunks]; }
+  // chunk c's end for c < max_chunks, the stream's end for c = max_chunks
+  __host__ __device__ int64_t end(int64_t chunk) const {
+    const int64_t word =
+        chunk < max_chunks ? ProxyHeader::kGatheredEnds + chunk : ProxyHeader::kGatheredEnd;
+    return (int64_t)(uint32_t)words[word];
+  }
+  __host__ __device__ const ReqEntry *push_table() const {
+    return (const ReqEntry *)(words + ProxyHeader::kGatheredEnds + max_chunks);
+  }
+};
+__host__ __device__ inline GatheredHeader ProxyHeader::gathered(const int32_t *headers,
+                                                                int64_t proxy) const {
+  return GatheredHeader{headers + proxy * gathered_words(), max_chunks};
+}
 
 // remote_map (int32), what a proxy publishes of each occurrence of its
 // remote part (occ) to the occurrence's requester, in three arrays of
 // remote_keys: its key's row in proxy_rows (bit 31: a heavy key), its slot
 // in proxy_rows (the key's row, a duplicate's or the requester's partial
 // slot) and its position in its requester's push order. A requester gathers
-// an occurrence's words from entry occ of each array.
+// an occurrence's words from entry occ of each array (GatheredMap).
+// An occurrence's key row in remote_map: the row, bit 31 set for a heavy key.
+struct MapKeyRow {
+  uint32_t bits;
+  __host__ __device__ static MapKeyRow of(int32_t row, bool heavy) {
+    return {(uint32_t)row | (uint32_t)heavy << 31};
+  }
+  __host__ __device__ int32_t row() const { return (int32_t)(bits & 0x7FFFFFFFu); }
+  __host__ __device__ bool heavy() const { return (bits >> 31) != 0; }
+};
+static_assert(sizeof(MapKeyRow) == 4, "remote_map's arrays are int32");
 struct RemoteMap {
   static constexpr int kArrays = 3;
   int32_t *base;
   int64_t remote_keys;  // the entries of each array
   __host__ __device__ int32_t *array(int which) const { return base + which * remote_keys; }
-  __host__ __device__ int32_t *key_row() const { return array(0); }
+  __host__ __device__ MapKeyRow *key_row() const { return (MapKeyRow *)array(0); }
   __host__ __device__ int32_t *slot() const { return array(1); }
   __host__ __device__ int32_t *position() const { return array(2); }
+};
+// The remote_map words a requester gathered for its rows (peer_gather's
+// [RemoteMap::kArrays][rows]): each row's key row, slot and push position.
+struct GatheredMap {
+  const int32_t *words;
+  int64_t rows;
+  __host__ __device__ MapKeyRow key_row(int64_t row) const {
+    return ((const MapKeyRow *)words)[row];
+  }
+  __host__ __device__ int32_t slot(int64_t row) const { return words[rows + row]; }
+  __host__ __device__ int32_t position(int64_t row) const { return words[2 * rows + row]; }
 };
 
 // The buffers of the keys section whose words a requester gathers from its
@@ -301,7 +349,7 @@ struct RemoteMap {
 // entry occ of each array).
 enum GatherFrom : int { kGatherProxyHeader = 0, kGatherRemoteMap };
 // The words peer_gather reads per item.
-__host__ __device__ inline int gather_words(GatherFrom from) {
+__host__ __device__ constexpr int gather_words(GatherFrom from) {
   return from == kGatherProxyHeader ? 1 : RemoteMap::kArrays;
 }
 
@@ -316,8 +364,9 @@ __host__ __device__ inline int gather_words(GatherFrom from) {
 //                 then [feature][position]. A remote occurrence is named by
 //                 its index occ in the remote part.
 //   node_weights  their weights, when the requesters' keys carry them
-//   remote_cells  (num_nodes > 1) per remote occurrence, int32: its owner
-//                 node * num_features + feature
+//   bucket_feature_of_occ
+//                 (num_nodes > 1) per remote occurrence, int32: its bucket
+//                 feature, owner node * num_features + feature
 //   remote_map    (num_nodes > 1) RemoteMap
 //   proxy_header  (num_nodes > 1) ProxyHeader
 //   key_stage     (num_nodes > 1) the node-unique key records of each owner
@@ -327,12 +376,13 @@ __host__ __device__ inline int gather_words(GatherFrom from) {
 //   rail_keys     (num_nodes > 1) the key records the rail proxies put, one
 //                 slice per source node in node order, each the chunks of
 //                 this rank's node there, then its records in uniq order
-//   cell_stage    (num_nodes > 1) int64 [num_nodes][num_features]: as owner,
-//                 where the cells (feature, source node) of each rail proxy's
-//                 node start in its KJT, what it puts to that proxy
-//   rail_cells    (num_nodes > 1) int64 [num_nodes][num_features]: as proxy,
-//                 where its node's cells start in each rail owner's KJT, as
-//                 the owners put them
+//   source_offsets
+//                 (num_nodes > 1) int64 [num_nodes][num_features]: as owner,
+//                 where each rail proxy's node's keys of each feature start
+//                 in its KJT, what it puts to that proxy
+//   owner_offsets (num_nodes > 1) int64 [num_nodes][num_features]: as proxy,
+//                 where its node's keys of each feature start in each rail
+//                 owner's KJT, as the owners put them
 // Each accessor returns its buffer in the copy at `base`.
 class KeysLayout {
  public:
@@ -354,7 +404,7 @@ class KeysLayout {
     };
     node_keys_ = take(8 * entries);
     node_weights_ = take(sizes.weights ? 4 * entries : 0);
-    remote_cells_ = take(multi ? 4 * (uint64_t)remote_keys_ : 0);
+    bucket_feature_of_occ_ = take(multi ? 4 * (uint64_t)remote_keys_ : 0);
     remote_map_ = take(multi ? 4 * RemoteMap::kArrays * (uint64_t)remote_keys_ : 0);
     proxy_header_ = take(multi ? 4 * (uint64_t)ProxyHeader::of(sizes).words() : 0);
     key_stage_bytes_ =
@@ -363,22 +413,22 @@ class KeysLayout {
     rail_keys_bytes_ =
         multi ? lookup_keys_ * sizes.record_bytes + sizes.owner_chunks() * sizeof(ChunkPiece) : 0;
     rail_keys_ = take(rail_keys_bytes_);
-    cell_stage_ = take(multi ? 8 * (uint64_t)(num_nodes_ * num_features_) : 0);
-    rail_cells_ = take(multi ? 8 * (uint64_t)(num_nodes_ * num_features_) : 0);
+    source_offsets_ = take(multi ? 8 * (uint64_t)(num_nodes_ * num_features_) : 0);
+    owner_offsets_ = take(multi ? 8 * (uint64_t)(num_nodes_ * num_features_) : 0);
     bytes_ = next;
   }
   __host__ __device__ uint64_t bytes() const { return bytes_; }
   // Each buffer's name and the bytes it takes (HierOutputDist::memory).
   std::vector<std::pair<const char *, uint64_t>> buffers() const {
     return {{"node_keys", node_weights_ - node_keys_},
-            {"node_weights", remote_cells_ - node_weights_},
-            {"remote_cells", remote_map_ - remote_cells_},
+            {"node_weights", bucket_feature_of_occ_ - node_weights_},
+            {"bucket_feature_of_occ", remote_map_ - bucket_feature_of_occ_},
             {"remote_map", proxy_header_ - remote_map_},
             {"proxy_header", key_stage_ - proxy_header_},
             {"key_stage", rail_keys_ - key_stage_},
-            {"rail_keys", cell_stage_ - rail_keys_},
-            {"cell_stage", rail_cells_ - cell_stage_},
-            {"rail_cells", bytes_ - rail_cells_}};
+            {"rail_keys", source_offsets_ - rail_keys_},
+            {"source_offsets", owner_offsets_ - source_offsets_},
+            {"owner_offsets", bytes_ - owner_offsets_}};
   }
 
   // node_keys and node_weights, [lookup_keys + remote_keys]
@@ -386,7 +436,9 @@ class KeysLayout {
   __host__ __device__ float *node_weights() const { return (float *)(base_ + node_weights_); }
   // where the remote part starts in them
   __host__ __device__ int64_t remote_start() const { return lookup_keys_; }
-  __host__ __device__ int32_t *remote_cells() const { return (int32_t *)(base_ + remote_cells_); }
+  __host__ __device__ int32_t *bucket_feature_of_occ() const {
+    return (int32_t *)(base_ + bucket_feature_of_occ_);
+  }
   __host__ __device__ RemoteMap remote_map() const {
     return RemoteMap{(int32_t *)(base_ + remote_map_), remote_keys_};
   }
@@ -399,18 +451,18 @@ class KeysLayout {
   __host__ __device__ char *rail_keys() const { return base_ + rail_keys_; }
   __host__ __device__ uint64_t rail_keys_bytes() const { return rail_keys_bytes_; }
   // [num_features] of a node
-  __host__ __device__ int64_t *cell_stage(int64_t node) const {
-    return (int64_t *)(base_ + cell_stage_) + node * num_features_;
+  __host__ __device__ int64_t *source_offsets(int64_t node) const {
+    return (int64_t *)(base_ + source_offsets_) + node * num_features_;
   }
-  __host__ __device__ int64_t *rail_cells(int64_t node) const {
-    return (int64_t *)(base_ + rail_cells_) + node * num_features_;
+  __host__ __device__ int64_t *owner_offsets(int64_t node) const {
+    return (int64_t *)(base_ + owner_offsets_) + node * num_features_;
   }
 
  private:
   char *base_;
   int64_t num_nodes_, local_size_, num_features_, lookup_keys_, remote_keys_, max_chunks_;
-  uint64_t node_keys_, node_weights_, remote_cells_, remote_map_, proxy_header_, key_stage_,
-      rail_keys_, cell_stage_, rail_cells_, bytes_;
+  uint64_t node_keys_, node_weights_, bucket_feature_of_occ_, remote_map_, proxy_header_,
+      key_stage_, rail_keys_, source_offsets_, owner_offsets_, bytes_;
   uint64_t key_stage_bytes_, rail_keys_bytes_;
 };
 

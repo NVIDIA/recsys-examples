@@ -27,9 +27,11 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 //   rail_count_exchange   (across nodes) its count message to each rail
 //                         peer, and theirs;
 //   rail_key_exchange     (across nodes) its key records to each rail owner
-//                         and its cell starts to each rail proxy, and theirs;
-//   node_status_exchange  (across nodes) its rail's needs and cell starts to
-//                         its node, and every node peer's;
+//                         and its source_offsets to each rail proxy, and
+//                         theirs;
+//   node_status_exchange  (across nodes) its rail's needs and
+//                         requester_offsets to its node, and every node
+//                         peer's;
 //   peer_gather           (across nodes) words of the node peers' remote_map
 //                         or proxy header.
 // A kernel that waits runs on one CTA and waits only for the same kernel (the
@@ -105,16 +107,16 @@ __global__ void node_count_exchange_kernel(ncclWindow_t window, Sizes sizes, int
   }
 }
 
-// Every CTA, a thread per row: row `row` of part 1 (row < *rows_to_push) goes
-// to destination_base[cell] + row of node_keys (and node_weights) of its
-// target, the owner's local rank; a destination from remote_start on is an
-// occurrence of the target's remote part, whose cell tag (owner node *
-// num_features + feature) goes to remote_cells. Consecutive rows of a cell
-// go to consecutive destinations. Each CTA's stores are fenced at system
-// scope before it ends.
+// Every CTA, a thread per row: bucketized row `row` (row < *rows_to_push) goes
+// to destination_base[bucket_feature] + row of node_keys (and node_weights) of
+// its target, the owner's local rank; a destination from remote_start on is an
+// occurrence of the target's remote part, whose bucket feature (owner node *
+// num_features + feature) goes to bucket_feature_of_occ. Consecutive rows of a
+// bucket feature go to consecutive destinations. Each CTA's stores are fenced
+// at system scope before it ends.
 __global__ void __launch_bounds__(kThreads)
     node_key_push_kernel(ncclWindow_t window, Sizes sizes, const int64_t *keys,
-                         const float *weights, const int32_t *row_cell,
+                         const float *weights, const int32_t *bucket_feature_of_row,
                          const int64_t *destination_base, const int64_t *rows_to_push) {
   const int local_size = sizes.topo.local_size, num_features = (int)sizes.num_features;
   const NodeWindow node(window, sizes.topo.local_rank);
@@ -123,15 +125,15 @@ __global__ void __launch_bounds__(kThreads)
   const int64_t rows = *rows_to_push;
   for (int64_t row = blockIdx.x * (int64_t)blockDim.x + threadIdx.x; row < rows;
        row += (int64_t)gridDim.x * blockDim.x) {
-    const int cell = row_cell[row];
-    const int owner = cell / num_features, target = owner % local_size;
-    const int64_t destination = destination_base[cell] + row;
+    const int bucket_feature = bucket_feature_of_row[row];
+    const int owner = bucket_feature / num_features, target = owner % local_size;
+    const int64_t destination = destination_base[bucket_feature] + row;
     node.peer(keys_layout.node_keys(), target)[destination] = keys[row];
     if (weights != nullptr)
       node.peer(keys_layout.node_weights(), target)[destination] = weights[row];
     if (destination >= remote_start)
-      node.peer(keys_layout.remote_cells(), target)[destination - remote_start] =
-          owner / local_size * num_features + cell % num_features;
+      node.peer(keys_layout.bucket_feature_of_occ(), target)[destination - remote_start] =
+          owner / local_size * num_features + bucket_feature % num_features;
   }
   __syncthreads();
   if (threadIdx.x == 0) fence_sc_sys();
@@ -201,14 +203,14 @@ __global__ void rail_count_exchange_kernel(ncclWindow_t window, ncclDevComm dev,
 
 // 1 CTA (2 warps): warp 1's lanes, each taking rail peers in turn, send each
 // peer o this call's key stream: as proxy, this rank's slice of key_stage
-// (bytes [put_src[o], put_src[o] + put_bytes[o])) into the owner's rail_keys
-// at put_dst[o], unless put_skip[o] (the owner overflows lookup_keys); then
-// as owner, where that proxy's cells start in its KJT (row o of cell_stage)
-// into the proxy's rail_cells, which signals keys[node]. Its system fence
-// orders the planner's writes of key_stage and cell_stage before the puts.
-// Warp 0 waits for the other nodes' key streams. A proxy puts only after it
-// has the owner's count message of the call, which the owner sends once its
-// previous call ended.
+// (bytes [put_src[o], put_src[o] + put_bytes[o])) into the owner's rail_keys at
+// put_dst[o], unless put_skip[o] (the owner overflows lookup_keys); then as
+// owner, where that proxy's keys of each feature start in its KJT (row o of
+// source_offsets) into the proxy's owner_offsets, which signals keys[node]. Its
+// system fence orders the planner's writes of key_stage and source_offsets
+// before the puts. Warp 0 waits for the other nodes' key streams. A proxy puts
+// only after it has the owner's count message of the call, which the owner
+// sends once its previous call ended.
 __global__ void rail_key_exchange_kernel(ncclWindow_t window, ncclDevComm dev, Sizes sizes,
                                          int64_t seq, const int64_t *put_src,
                                          const int64_t *put_dst, const int64_t *put_bytes,
@@ -221,14 +223,15 @@ __global__ void rail_key_exchange_kernel(ncclWindow_t window, ncclDevComm dev, S
     const NodeWindow node_window(window, sizes.topo.local_rank);
     const KeysLayout keys = node_window.layout(sizes).keys;
     const RailMessage key_stream(gin, rail, node_window, sig_keys(num_nodes, node));
-    const size_t cells_bytes = 8 * (size_t)sizes.num_features;
+    const size_t offsets_bytes = 8 * (size_t)sizes.num_features;
     fence_sc_sys();
     for (int owner_node = lane; owner_node < num_nodes; owner_node += 32) {
       if (owner_node == node) continue;
       if (!put_skip[owner_node])
         rail_put(gin, rail, node_window, owner_node, keys.rail_keys() + put_dst[owner_node],
                  keys.key_stage() + put_src[owner_node], (size_t)put_bytes[owner_node]);
-      key_stream.put(owner_node, keys.rail_cells(node), keys.cell_stage(owner_node), cells_bytes);
+      key_stream.put(owner_node, keys.owner_offsets(node), keys.source_offsets(owner_node),
+                     offsets_bytes);
     }
   }
   if (warp == 0) {
@@ -237,20 +240,21 @@ __global__ void rail_key_exchange_kernel(ncclWindow_t window, ncclDevComm dev, S
       while (peer_node != node && (int64_t)gin.readSignal(sig_keys(num_nodes, peer_node)) < seq)
         spin.pause("key stream", peer_node, seq, sizes.topo.rank);
   }
-  // key_stage and cell_stage may be written again once the NIC has read them.
+  // key_stage and source_offsets may be written again once the NIC has read
+  // them.
   if (warp == 1) gin.flush(ncclCoopThread{});
 }
 
 // 1 CTA: this rank's publish vector (its rail's kNumNeeds needs, then its
-// cell starts [requester][feature]) into its needs and cell_start words;
-// after a system fence, which also orders the planner's writes of
-// remote_map and the proxy header before it, in_done gets seq. Once every
-// node peer's has it, every peer's needs land in peer_needs [local_size]
-// [kNumNeeds] and where each one's KJT holds this requester's cells in
-// owner_cell_start [local_size][num_features].
+// requester offsets [requester][feature]) into its needs and requester_offsets
+// words; after a system fence, which also orders the planner's writes of
+// remote_map and the proxy header before it, in_done gets seq. Once every node
+// peer's has it, every peer's needs land in peer_needs [local_size] [kNumNeeds]
+// and where each one's KJT holds this requester's keys of each feature in
+// offset_per_owner_feature [local_size][num_features].
 __global__ void node_status_exchange_kernel(ncclWindow_t window, Sizes sizes, int64_t seq,
                                             const int64_t *publish, int64_t *peer_needs,
-                                            int64_t *owner_cell_start) {
+                                            int64_t *offset_per_owner_feature) {
   const int local_size = sizes.topo.local_size, num_features = (int)sizes.num_features,
             me = sizes.topo.local_rank, tid = threadIdx.x;
   const NodeWindow node(window, me);
@@ -259,8 +263,8 @@ __global__ void node_status_exchange_kernel(ncclWindow_t window, Sizes sizes, in
     if (i < kNumNeeds) {
       ctrl.needs()[i] = publish[i];
     } else {
-      const int cell = i - kNumNeeds;  // requester * num_features + feature
-      ctrl.cell_start(cell / num_features)[cell % num_features] = publish[i];
+      const int index = i - kNumNeeds;  // requester * num_features + feature
+      ctrl.requester_offsets(index / num_features)[index % num_features] = publish[i];
     }
   }
   __syncthreads();
@@ -278,27 +282,30 @@ __global__ void node_status_exchange_kernel(ncclWindow_t window, Sizes sizes, in
   for (int i = tid; i < local_size * kNumNeeds; i += blockDim.x)
     peer_needs[i] = word_of(i / kNumNeeds, ctrl.needs() + i % kNumNeeds);
   for (int i = tid; i < local_size * num_features; i += blockDim.x)
-    owner_cell_start[i] = word_of(i / num_features, ctrl.cell_start(me) + i % num_features);
+    offset_per_owner_feature[i] =
+        word_of(i / num_features, ctrl.requester_offsets(me) + i % num_features);
 }
 
 // Every CTA, a thread per word: word k of item i is node peer peer[i]'s word
-// first_word[i] of its proxy header (kGatherProxyHeader, k = 0) or entry
-// first_word[i] of array k of its remote_map (kGatherRemoteMap), into
+// first_word[i] of its proxy header (kFrom kGatherProxyHeader, k = 0) or
+// entry first_word[i] of array k of its remote_map (kGatherRemoteMap), into
 // out[k][i] (none when peer[i] < 0). The peers published them before the
 // in_done this rank's node_status_exchange acquired earlier on the stream.
+template <GatherFrom kFrom>
 __global__ void __launch_bounds__(kThreads)
-    peer_gather_kernel(ncclWindow_t window, Sizes sizes, GatherFrom from, const int32_t *peer,
-                       const int64_t *first_word, int64_t items, int words, int32_t *out) {
+    peer_gather_kernel(ncclWindow_t window, Sizes sizes, const int32_t *peer,
+                       const int64_t *first_word, int64_t items, int32_t *out) {
+  constexpr int kWords = gather_words(kFrom);
   const NodeWindow node(window, sizes.topo.local_rank);
   const KeysLayout keys = node.layout(sizes).keys;
   const ProxyHeader header = keys.proxy_header();
   const RemoteMap map = keys.remote_map();
-  for (int64_t i = blockIdx.x * (int64_t)blockDim.x + threadIdx.x; i < items * words;
+  for (int64_t i = blockIdx.x * (int64_t)blockDim.x + threadIdx.x; i < items * kWords;
        i += (int64_t)gridDim.x * blockDim.x) {
     const int64_t item = i % items, word = i / items;
     const int32_t source = peer[item];
     // the words that word k of the items is read from, in this rank's copy
-    const int32_t *mine = from == kGatherProxyHeader ? header.base : map.array((int)word);
+    const int32_t *mine = kFrom == kGatherProxyHeader ? header.base : map.array((int)word);
     if (source >= 0) out[i] = __ldcg(node.peer(mine, source) + first_word[item]);
   }
 }
@@ -329,12 +336,14 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> InChannel::node_count_exchange(
 }
 
 void InChannel::node_key_push(const at::Tensor &keys, const at::Tensor &weights,
-                              const at::Tensor &row_cell, const at::Tensor &destination_base,
+                              const at::Tensor &bucket_feature_of_row,
+                              const at::Tensor &destination_base,
                               const at::Tensor &rows_to_push) const {
   node_key_push_kernel<<<grid_of(keys.numel()), kThreads, 0, current_stream()>>>(
       window_, sizes_, keys.data_ptr<int64_t>(),
-      weights.defined() ? weights.data_ptr<float>() : nullptr, row_cell.data_ptr<int32_t>(),
-      destination_base.data_ptr<int64_t>(), rows_to_push.data_ptr<int64_t>());
+      weights.defined() ? weights.data_ptr<float>() : nullptr,
+      bucket_feature_of_row.data_ptr<int32_t>(), destination_base.data_ptr<int64_t>(),
+      rows_to_push.data_ptr<int64_t>());
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
@@ -364,12 +373,13 @@ void InChannel::rail_key_exchange(const at::Tensor &put_src, const at::Tensor &p
 std::pair<at::Tensor, at::Tensor> InChannel::node_status_exchange(const at::Tensor &publish) const {
   const int local_size = sizes_.topo.local_size;
   at::Tensor peer_needs = at::empty({local_size, kNumNeeds}, publish.options());
-  at::Tensor owner_cell_start = at::empty({local_size, sizes_.num_features}, publish.options());
+  at::Tensor offset_per_owner_feature =
+      at::empty({local_size, sizes_.num_features}, publish.options());
   node_status_exchange_kernel<<<1, 256, 0, current_stream()>>>(
       window_, sizes_, seq_, publish.data_ptr<int64_t>(), peer_needs.data_ptr<int64_t>(),
-      owner_cell_start.data_ptr<int64_t>());
+      offset_per_owner_feature.data_ptr<int64_t>());
   C10_CUDA_KERNEL_LAUNCH_CHECK();
-  return {peer_needs, owner_cell_start};
+  return {peer_needs, offset_per_owner_feature};
 }
 
 at::Tensor InChannel::peer_gather(GatherFrom from, const at::Tensor &peer,
@@ -377,9 +387,15 @@ at::Tensor InChannel::peer_gather(GatherFrom from, const at::Tensor &peer,
   const int64_t items = peer.numel();
   const int words = gather_words(from);
   at::Tensor out = at::empty({words, items}, peer.options());
-  peer_gather_kernel<<<grid_of(items * words), kThreads, 0, current_stream()>>>(
-      window_, sizes_, from, peer.data_ptr<int32_t>(), first_word.data_ptr<int64_t>(), items, words,
-      out.data_ptr<int32_t>());
+  const auto launch = [&](auto kernel) {
+    kernel<<<grid_of(items * words), kThreads, 0, current_stream()>>>(
+        window_, sizes_, peer.data_ptr<int32_t>(), first_word.data_ptr<int64_t>(), items,
+        out.data_ptr<int32_t>());
+  };
+  if (from == kGatherProxyHeader)
+    launch(peer_gather_kernel<kGatherProxyHeader>);
+  else
+    launch(peer_gather_kernel<kGatherRemoteMap>);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   return out;
 }

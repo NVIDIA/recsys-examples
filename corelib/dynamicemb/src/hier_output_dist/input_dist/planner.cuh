@@ -63,6 +63,25 @@ T *data_or_null(const at::Tensor &tensor) {
   return tensor.defined() ? tensor.data_ptr<T>() : nullptr;
 }
 
+// A tensor of int32 (or int64) words as the records it holds (Chunk,
+// ChunkPiece, ReqEntry, PutSeg, HeavyGroup, ReducerEntry: whole words).
+template <typename Record>
+Record *records_of(const at::Tensor &table) {
+  static_assert(sizeof(Record) % 4 == 0, "a record is whole int32 words");
+  return reinterpret_cast<Record *>(table.data_ptr());
+}
+
+// Calls `launch` with an empty record of the op's key records (common.h):
+// WeightedKeyRecord when they carry weights, else KeyRecord. The kernels
+// that write or read the records take its type.
+template <typename Launch>
+void with_record(const Sizes &sizes, Launch &&launch) {
+  if (sizes.weighted_records())
+    launch(WeightedKeyRecord{});
+  else
+    launch(KeyRecord{});
+}
+
 // `index` clamped into a table of `count` entries: a call that does not fit
 // may read words no one wrote.
 __device__ __forceinline__ int64_t clamp_index(int64_t index, int64_t count) {

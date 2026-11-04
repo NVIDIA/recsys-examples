@@ -862,7 +862,7 @@ class HierTraffic:
                 traffic.hier = self_._hier
                 traffic.calls.append(
                     (
-                        call.block_start,
+                        call.offset_per_bucket,
                         call.counts[0],
                         (
                             call.uniq_in,

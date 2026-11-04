@@ -20,18 +20,19 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 // (FwdPlanView, BwdPlanView: pointers). A table both kernels read is the
 // same tensor in both plans.
 //
-// The requester's rows are its bucketized rows [0, block_start[world_size]),
-// owner by owner (its block for an owner: [block_start[owner],
-// block_start[owner + 1])). The forward reads a row at src[row], the backward
-// writes its gradient at dst[row]: for an owner of its node both are its row
-// of the owner's lookup_rows; for an owner on another node, rows of the
-// proxy's proxy_rows (the node-unique key's row, and the row's own slot).
-// inv[row] is its row of the requester's output, or under index dedup its
-// deduplicated row, whose original rows the fan-out lists. Across nodes the
-// requester's push order, heavy groups and its tables of the node's proxies,
-// the owner's and the proxy's tables, and the put lists say the rest
-// (planner.h makes them); the tables' strides are max_chunks and num_nodes.
-// On one node the tables across nodes are undefined, nullptr in the views.
+// The requester's rows are its bucketized rows [0,
+// offset_per_bucket[world_size]), owner by owner (its block for an owner:
+// [offset_per_bucket[owner], offset_per_bucket[owner + 1])). The forward reads
+// a row at src[row], the backward writes its gradient at dst[row]: for an owner
+// of its node both are its row of the owner's lookup_rows; for an owner on
+// another node, rows of the proxy's proxy_rows (the node-unique key's row, and
+// the row's own slot). inv[row] is its row of the requester's output, or under
+// index dedup its deduplicated row, whose original rows the fan-out lists.
+// Across nodes the requester's push order, heavy groups and its tables of the
+// node's proxies, the owner's and the proxy's tables, and the put lists say the
+// rest (planner.h makes them); the tables' strides are max_chunks and
+// num_nodes. On one node the tables across nodes are undefined, nullptr in the
+// views.
 #pragma once
 
 #include <ATen/ATen.h>
@@ -49,9 +50,9 @@ namespace hier_output_dist {
 
 // What both kernels read of a call.
 struct PlanView {
-  const int64_t *block_start;  // [world_size + 1]
-  const int32_t *inv;          // [rows]
-  Fanout fanout;               // fanout.exp_off: index dedup
+  const int64_t *offset_per_bucket;  // [world_size + 1]
+  const int32_t *inv;                // [rows]
+  Fanout fanout;                     // fanout.exp_off: index dedup
   // across nodes, the requester's
   const int32_t *push_order;    // [rows] its remote rows by proxy and push order
   const int64_t *proxy_chunks;  // [local_size] the chunks of each same-node proxy's stream
@@ -140,7 +141,7 @@ struct BwdPlanView : PlanView {
   const int64_t *reduce_task_starts;  // [max_chunks + 1] its reducers' tasks before each chunk
                                       // (32 keys each)
   const int32_t *reducer_start;       // the reducer list (planner.h)
-  const int64_t *reducer_entries;
+  const ReducerEntry *reducer_entries;
   // the plan's counts (BwdPlan)
   int64_t heavy_subs;  // index dedup: sub-tasks of the requester's heavy rows
   int64_t group_subs;  // across nodes: sub-tasks of its heavy groups
@@ -159,10 +160,10 @@ struct BwdPlanView : PlanView {
 
 // The forward's plan.
 struct FwdPlan {
-  at::Tensor block_start;  // int64 [world_size + 1]
-  at::Tensor src;          // int32 [rows]
-  at::Tensor inv;          // int32 [rows]
-  FanoutTables fanout;     // index dedup's, or none
+  at::Tensor offset_per_bucket;  // int64 [world_size + 1]
+  at::Tensor src;                // int32 [rows]
+  at::Tensor inv;                // int32 [rows]
+  FanoutTables fanout;           // index dedup's, or none
   // across nodes, the tables both kernels read
   at::Tensor push_order, proxy_chunks, proxy_ends, push_tables, num_chunks, chunks, uniq_off,
       put_list, put_starts;
@@ -182,13 +183,13 @@ struct FwdPlan {
 // The backward's plan, and its counts, which the call's status gives
 // (StatusSlots): of() takes them as [num_recv, heavy_subs, group_subs].
 struct BwdPlan {
-  int64_t num_recv = 0;    // rows of the owner's lookup output (and of its lookup_grad)
-  int64_t heavy_subs = 0;  // index dedup: sub-tasks of the requester's heavy rows
-  int64_t group_subs = 0;  // across nodes: sub-tasks of its heavy groups
-  at::Tensor block_start;  // int64 [world_size + 1]
-  at::Tensor dst;          // int32 [rows]
-  at::Tensor inv;          // int32 [rows]
-  FanoutTables fanout;     // index dedup's, or none
+  int64_t num_recv = 0;          // rows of the owner's lookup output (and of its lookup_grad)
+  int64_t heavy_subs = 0;        // index dedup: sub-tasks of the requester's heavy rows
+  int64_t group_subs = 0;        // across nodes: sub-tasks of its heavy groups
+  at::Tensor offset_per_bucket;  // int64 [world_size + 1]
+  at::Tensor dst;                // int32 [rows]
+  at::Tensor inv;                // int32 [rows]
+  FanoutTables fanout;           // index dedup's, or none
   // across nodes, the tables both kernels read
   at::Tensor push_order, proxy_chunks, proxy_ends, push_tables, num_chunks, chunks, uniq_off,
       put_list, put_starts;

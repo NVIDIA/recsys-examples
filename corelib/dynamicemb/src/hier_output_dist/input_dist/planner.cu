@@ -31,9 +31,10 @@ namespace {
 
 // ── the node ──
 
-// One CTA: this rank's count vector (CountVector) from part 1's cell_start.
+// One CTA: this rank's count vector (CountVector) from the bucketize's
+// offset_per_bucket_feature.
 __global__ void __launch_bounds__(kThreads)
-    count_vector_kernel(const int64_t *cell_start, Topo topo, int64_t num_features,
+    count_vector_kernel(const int64_t *offset_per_bucket_feature, Topo topo, int64_t num_features,
                         int64_t *counts) {
   const int64_t local_size = topo.local_size;
   const CountVector format{local_size, num_features};
@@ -44,42 +45,44 @@ __global__ void __launch_bounds__(kThreads)
     for (int64_t owner_node = 0; owner_node < topo.num_nodes; ++owner_node) {
       const int64_t owner = owner_node * local_size + target;
       if (owner_node != topo.node)
-        keys += cell_start[(owner + 1) * num_features] - cell_start[owner * num_features];
+        keys += offset_per_bucket_feature[(owner + 1) * num_features] -
+                offset_per_bucket_feature[owner * num_features];
     }
     counts[format.remote(target)] = keys;
   }
-  // its keys for each owner of its node and feature: the cell's
+  // its keys for each owner of its node and feature: the bucket feature's
   for (int64_t index = threadIdx.x; index < local_size * num_features; index += kThreads) {
     const int64_t target = index / num_features, feature = index % num_features;
-    const int64_t cell = (topo.node * local_size + target) * num_features + feature;
-    counts[format.own(target, feature)] = cell_start[cell + 1] - cell_start[cell];
+    const int64_t bucket_feature = (topo.node * local_size + target) * num_features + feature;
+    counts[format.own(target, feature)] =
+        offset_per_bucket_feature[bucket_feature + 1] - offset_per_bucket_feature[bucket_feature];
   }
 }
 
 // One CTA: the layout of the node's keys (NodeLayout) from the node's counts
-// (totals, before, mine: NodeCounts) and this rank's part 1.
+// (totals, before, mine: NodeCounts) and this rank's bucketized keys.
 // requester_start and need_remote: nullptr on one node.
 __global__ void __launch_bounds__(kThreads)
     node_layout_kernel(const int64_t *totals, const int64_t *before, const int64_t *mine,
-                       const int64_t *cell_start, const int64_t *block_start, Topo topo,
-                       int64_t num_features, int64_t lookup_keys, int64_t remote_keys,
-                       int64_t *own_cells, int64_t *own_starts, int64_t *own_total,
+                       const int64_t *offset_per_bucket_feature, const int64_t *offset_per_bucket,
+                       Topo topo, int64_t num_features, int64_t lookup_keys, int64_t remote_keys,
+                       int64_t *own_lengths, int64_t *own_offsets, int64_t *own_total,
                        int64_t *requester_start, int64_t *need_lookup, int64_t *need_remote,
                        bool *skip, int64_t *rows_to_push, int64_t *destination_base) {
   const int64_t local_size = topo.local_size, num_nodes = topo.num_nodes, node = topo.node;
   const CountVector words{local_size, num_features};
   // This rank's own part, in its KJT order [feature][requester]: each
   // requester's keys of each feature for it (in mine, after those for its
-  // remote part), and where each cell starts: the ends of every cell but the
+  // remote part), and where each starts: the ends of every one but the
   // last.
-  const int64_t own_part_cells = num_features * local_size;
-  auto own_cell = [&](int64_t cell) {
-    const int64_t feature = cell / local_size, requester = cell % local_size;
+  const int64_t num_own_lengths = num_features * local_size;
+  auto own_length = [&](int64_t index) {
+    const int64_t feature = index / local_size, requester = index % local_size;
     return mine[requester * (num_features + 1) + 1 + feature];
   };
-  for (int64_t cell = threadIdx.x; cell < own_part_cells; cell += kThreads)
-    own_cells[cell] = own_cell(cell);
-  cta_exclusive_ends<int64_t>(own_part_cells - 1, own_cell, own_starts);
+  for (int64_t index = threadIdx.x; index < num_own_lengths; index += kThreads)
+    own_lengths[index] = own_length(index);
+  cta_exclusive_ends<int64_t>(num_own_lengths - 1, own_length, own_offsets);
   // The node's keys for each owner of the node, and the largest own part.
   for (int64_t target = threadIdx.x; target < local_size; target += kThreads) {
     int64_t keys = 0;
@@ -106,19 +109,19 @@ __global__ void __launch_bounds__(kThreads)
   if (threadIdx.x == 0) {
     *need_lookup = most_own;
     *skip = skips;
-    *rows_to_push = skips ? 0 : block_start[topo.world_size];
+    *rows_to_push = skips ? 0 : offset_per_bucket[topo.world_size];
   }
-  // Row `row` of part 1 in cell `cell` goes to destination_base[cell] + row.
-  // A row of an owner of this node goes to the owner's own part: where this
-  // rank's cell starts there (the node's keys of the features before, then
-  // those of the requesters before), and the rows of the cell before it. A
-  // thread per owner walks its features.
+  // Bucketized row `row` in bucket feature b goes to destination_base[b] +
+  // row. A row of an owner of this node goes to the owner's own part: where
+  // this rank's keys of the feature start there (the node's keys of the
+  // features before, then those of the requesters before), and the rows of
+  // the bucket feature before it. A thread per owner walks its features.
   for (int64_t target = threadIdx.x; target < local_size; target += kThreads) {
     int64_t feature_start = 0;  // where the owner's keys of `feature` start in its own part
     for (int64_t feature = 0; feature < num_features; ++feature) {
-      const int64_t cell = (node * local_size + target) * num_features + feature;
-      destination_base[cell] =
-          feature_start + before[words.own(target, feature)] - cell_start[cell];
+      const int64_t bucket_feature = (node * local_size + target) * num_features + feature;
+      destination_base[bucket_feature] = feature_start + before[words.own(target, feature)] -
+                                         offset_per_bucket_feature[bucket_feature];
       feature_start += totals[words.own(target, feature)];
     }
   }
@@ -132,11 +135,12 @@ __global__ void __launch_bounds__(kThreads)
     for (int64_t owner_node = 0; owner_node < num_nodes; ++owner_node) {
       if (owner_node == node) continue;
       const int64_t owner = owner_node * local_size + target;
-      destination_base[owner * num_features + feature] = block_place - block_start[owner];
-      block_place += block_start[owner + 1] - block_start[owner];
+      destination_base[owner * num_features + feature] = block_place - offset_per_bucket[owner];
+      block_place += offset_per_bucket[owner + 1] - offset_per_bucket[owner];
     }
   }
-  // the rows past the valid ones (cell world_size * num_features) are never pushed
+  // the rows past the valid ones (bucket feature world_size * num_features)
+  // are never pushed
   if (threadIdx.x == 0) destination_base[topo.world_size * num_features] = 0;
 }
 
@@ -153,46 +157,48 @@ __global__ void __launch_bounds__(kThreads)
   }
 }
 
-// One CTA: the owner's KJT offsets, the ends of its cells (feature,
+// One CTA: the owner's KJT offsets, the ends of its lengths (feature,
 // requester), and its keys of each feature.
 __global__ void __launch_bounds__(kThreads)
-    one_node_offsets_kernel(const int64_t *own_cells, int64_t local_size, int64_t num_features,
+    one_node_offsets_kernel(const int64_t *own_lengths, int64_t local_size, int64_t num_features,
                             int64_t *kjt_offsets, int64_t *length_per_key) {
   cta_exclusive_ends<int64_t>(
-      num_features * local_size, [&](int64_t cell) { return own_cells[cell]; }, kjt_offsets);
+      num_features * local_size, [&](int64_t index) { return own_lengths[index]; }, kjt_offsets);
   for (int64_t feature = threadIdx.x; feature < num_features; feature += kThreads)
     length_per_key[feature] =
         kjt_offsets[(feature + 1) * local_size] - kjt_offsets[feature * local_size];
 }
 
-// A thread per row of part 1: its place in its owner's KJT, where it was
+// A thread per bucketized row: its place in its owner's KJT, where it was
 // pushed (a row past the valid ones: its own index).
 __global__ void __launch_bounds__(kThreads)
-    one_node_src_kernel(const int32_t *row_cell, const int64_t *destination_base, int64_t rows,
-                        int32_t *src) {
+    one_node_src_kernel(const int32_t *bucket_feature_of_row, const int64_t *destination_base,
+                        int64_t rows, int32_t *src) {
   for (int64_t row = first_item(); row < rows; row += item_stride())
-    src[row] = (int32_t)(destination_base[row_cell[row]] + row);
+    src[row] = (int32_t)(destination_base[bucket_feature_of_row[row]] + row);
 }
 
 }  // namespace
 
-at::Tensor node_count_vector(const at::Tensor &cell_start, const Topo &topo, int64_t num_features) {
-  const at::Tensor counts =
-      at::empty({CountVector{topo.local_size, num_features}.words()}, cell_start.options());
+at::Tensor node_count_vector(const at::Tensor &offset_per_bucket_feature, const Topo &topo,
+                             int64_t num_features) {
+  const at::Tensor counts = at::empty({CountVector{topo.local_size, num_features}.words()},
+                                      offset_per_bucket_feature.options());
   count_vector_kernel<<<kOneCta, kThreads, 0, current_stream()>>>(
-      cell_start.data_ptr<int64_t>(), topo, num_features, counts.data_ptr<int64_t>());
+      offset_per_bucket_feature.data_ptr<int64_t>(), topo, num_features,
+      counts.data_ptr<int64_t>());
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   return counts;
 }
 
-NodeLayout node_layout(const NodeCounts &counts, const at::Tensor &cell_start,
-                       const at::Tensor &block_start, const Topo &topo, int64_t num_features,
+NodeLayout node_layout(const NodeCounts &counts, const at::Tensor &offset_per_bucket_feature,
+                       const at::Tensor &offset_per_bucket, const Topo &topo, int64_t num_features,
                        int64_t lookup_keys, int64_t remote_keys) {
   const int64_t local_size = topo.local_size;
-  const auto long_options = cell_start.options();
+  const auto long_options = offset_per_bucket_feature.options();
   NodeLayout node;
-  node.own_cells = at::empty({num_features * local_size}, long_options);
-  node.own_starts = at::empty({num_features * local_size}, long_options);
+  node.own_lengths = at::empty({num_features * local_size}, long_options);
+  node.own_offsets = at::empty({num_features * local_size}, long_options);
   node.own_total = at::empty({local_size}, long_options);
   node.need_lookup = at::empty({}, long_options);
   node.skip = at::empty({}, long_options.dtype(at::kBool));
@@ -204,9 +210,9 @@ NodeLayout node_layout(const NodeCounts &counts, const at::Tensor &cell_start,
   }
   node_layout_kernel<<<kOneCta, kThreads, 0, current_stream()>>>(
       counts.totals.data_ptr<int64_t>(), counts.before.data_ptr<int64_t>(),
-      counts.mine.data_ptr<int64_t>(), cell_start.data_ptr<int64_t>(),
-      block_start.data_ptr<int64_t>(), topo, num_features, lookup_keys, remote_keys,
-      node.own_cells.data_ptr<int64_t>(), node.own_starts.data_ptr<int64_t>(),
+      counts.mine.data_ptr<int64_t>(), offset_per_bucket_feature.data_ptr<int64_t>(),
+      offset_per_bucket.data_ptr<int64_t>(), topo, num_features, lookup_keys, remote_keys,
+      node.own_lengths.data_ptr<int64_t>(), node.own_offsets.data_ptr<int64_t>(),
       node.own_total.data_ptr<int64_t>(), data_or_null<int64_t>(node.requester_start),
       node.need_lookup.data_ptr<int64_t>(), data_or_null<int64_t>(node.need_remote),
       node.skip.data_ptr<bool>(), node.rows_to_push.data_ptr<int64_t>(),
@@ -215,10 +221,10 @@ NodeLayout node_layout(const NodeCounts &counts, const at::Tensor &cell_start,
   return node;
 }
 
-OneNodeOwner one_node_owner(const NodeLayout &node, const at::Tensor &row_cell,
+OneNodeOwner one_node_owner(const NodeLayout &node, const at::Tensor &bucket_feature_of_row,
                             const at::Tensor &node_keys, const at::Tensor &node_weights,
                             const Topo &topo, int64_t num_features) {
-  const int64_t own_part = node_keys.numel(), rows = row_cell.numel();
+  const int64_t own_part = node_keys.numel(), rows = bucket_feature_of_row.numel();
   const cudaStream_t stream = current_stream();
   OneNodeOwner owner;
   // The own part is the KJT: a copy of its first num_recv keys (wait()
@@ -232,17 +238,17 @@ OneNodeOwner one_node_owner(const NodeLayout &node, const at::Tensor &row_cell,
       owner.num_recv.data_ptr<int64_t>(), own_part, owner.kjt_values.data_ptr<int64_t>(),
       data_or_null<float>(owner.kjt_weights));
   C10_CUDA_KERNEL_LAUNCH_CHECK();
-  owner.kjt_lengths = node.own_cells;
-  owner.kjt_offsets = at::empty({node.own_cells.numel() + 1}, node.own_cells.options());
-  owner.length_per_key = at::empty({num_features}, node.own_cells.options());
+  owner.kjt_lengths = node.own_lengths;
+  owner.kjt_offsets = at::empty({node.own_lengths.numel() + 1}, node.own_lengths.options());
+  owner.length_per_key = at::empty({num_features}, node.own_lengths.options());
   one_node_offsets_kernel<<<kOneCta, kThreads, 0, stream>>>(
-      node.own_cells.data_ptr<int64_t>(), topo.local_size, num_features,
+      node.own_lengths.data_ptr<int64_t>(), topo.local_size, num_features,
       owner.kjt_offsets.data_ptr<int64_t>(), owner.length_per_key.data_ptr<int64_t>());
   C10_CUDA_KERNEL_LAUNCH_CHECK();
-  owner.src = at::empty({rows}, row_cell.options());
+  owner.src = at::empty({rows}, bucket_feature_of_row.options());
   if (rows > 0) {
     one_node_src_kernel<<<item_grid(rows), kThreads, 0, stream>>>(
-        row_cell.data_ptr<int32_t>(), node.destination_base.data_ptr<int64_t>(), rows,
+        bucket_feature_of_row.data_ptr<int32_t>(), node.destination_base.data_ptr<int64_t>(), rows,
         owner.src.data_ptr<int32_t>());
     C10_CUDA_KERNEL_LAUNCH_CHECK();
   }
@@ -260,7 +266,8 @@ namespace {
 __global__ void __launch_bounds__(kThreads)
     count_message_kernel(const int64_t *need_remote, const int64_t *own_total,
                          const int64_t *uniq_out, const int64_t *chunks_out,
-                         const int64_t *cell_uniq, CountMessage format, int64_t *message) {
+                         const int64_t *uniq_per_bucket_feature, CountMessage format,
+                         int64_t *message) {
   for (int64_t word = threadIdx.x; word < format.out_words(); word += kThreads) {
     int64_t value;
     if (word == CountMessage::kNeedRemote)
@@ -272,23 +279,23 @@ __global__ void __launch_bounds__(kThreads)
     else if (word < format.common())
       value = chunks_out[word - format.chunks_out(0)];
     else
-      value = cell_uniq[word - format.common()];
+      value = uniq_per_bucket_feature[word - format.common()];
     message[word] = value;
   }
 }
 
-// One CTA: the rail's layout (RailLayout) from the count messages this rank
-// got (messages [num_nodes][CountMessage::length], its own too) and its own
-// part's cells (own_cells, [feature][requester]). A slice a proxy puts holds
-// the owner node's chunks (ChunkPiece, 16 bytes each), then its records; none
-// to its own node.
+// One CTA: the rail's layout (RailLayout) from the count messages this rank got
+// (messages [num_nodes][CountMessage::length], its own too) and its own part's
+// lengths (own_lengths, [feature][requester]). A slice a proxy puts holds the
+// owner node's chunks (ChunkPiece, 16 bytes each), then its records; none to
+// its own node.
 __global__ void __launch_bounds__(kThreads)
-    rail_layout_kernel(const int64_t *messages, const int64_t *own_cells,
+    rail_layout_kernel(const int64_t *messages, const int64_t *own_lengths,
                        const int64_t *other_nodes, Sizes sizes, int64_t *put_dst,
                        int64_t *put_bytes, bool *put_skip, int64_t *kjt_lengths,
                        int64_t *kjt_offsets, int64_t *num_recv, int64_t *length_per_key,
-                       int64_t *slice_in, int64_t *uniq_in, int64_t *cells_in, int64_t *cell_stage,
-                       int64_t *my_cell_starts, int64_t *needs) {
+                       int64_t *slice_in, int64_t *uniq_in, int64_t *length_per_source_feature,
+                       int64_t *source_offsets, int64_t *requester_offsets, int64_t *needs) {
   const int64_t num_nodes = sizes.topo.num_nodes, node = sizes.topo.node,
                 local_size = sizes.topo.local_size, num_features = sizes.num_features,
                 num_sources = sizes.topo.num_sources;
@@ -332,33 +339,34 @@ __global__ void __launch_bounds__(kThreads)
     uniq_in[source] = message(source, format.uniq_out(node));
   }
   for (int64_t index = threadIdx.x; index < num_nodes * num_features; index += kThreads)
-    cells_in[index] = message(index / num_features, format.common() + index % num_features);
-  // Its KJT, cell (feature, source) feature-major: its node's keys, then the
-  // other nodes' in order. Then where each requester of its node has its
-  // cells in it, and each other node (what it sends that node's proxy; its
-  // own node: 0).
-  auto kjt_length = [&](int64_t cell) {
-    const int64_t feature = cell / num_sources, source = cell % num_sources;
+    length_per_source_feature[index] =
+        message(index / num_features, format.common() + index % num_features);
+  // Its KJT's lengths, (feature, source) feature-major: its node's
+  // requesters, then the other nodes in order. Then where each requester of
+  // its node has its keys of each feature in it, and each other node (what it
+  // sends that node's proxy; its own node: 0).
+  auto kjt_length = [&](int64_t index) {
+    const int64_t feature = index / num_sources, source = index % num_sources;
     return source < local_size
-               ? own_cells[feature * local_size + source]
+               ? own_lengths[feature * local_size + source]
                : message(other_nodes[source - local_size], format.common() + feature);
   };
-  const int64_t kjt_cells = num_features * num_sources;
-  for (int64_t cell = threadIdx.x; cell < kjt_cells; cell += kThreads)
-    kjt_lengths[cell] = kjt_length(cell);
-  cta_exclusive_ends<int64_t>(kjt_cells, kjt_length, kjt_offsets);
+  const int64_t num_lengths = num_features * num_sources;
+  for (int64_t index = threadIdx.x; index < num_lengths; index += kThreads)
+    kjt_lengths[index] = kjt_length(index);
+  cta_exclusive_ends<int64_t>(num_lengths, kjt_length, kjt_offsets);
   for (int64_t feature = threadIdx.x; feature < num_features; feature += kThreads)
     length_per_key[feature] =
         kjt_offsets[(feature + 1) * num_sources] - kjt_offsets[feature * num_sources];
   for (int64_t index = threadIdx.x; index < local_size * num_features; index += kThreads) {
     const int64_t requester = index / num_features, feature = index % num_features;
-    my_cell_starts[index] = kjt_offsets[feature * num_sources + requester];
+    requester_offsets[index] = kjt_offsets[feature * num_sources + requester];
   }
   for (int64_t feature = threadIdx.x; feature < num_features; feature += kThreads)
-    cell_stage[node * num_features + feature] = 0;
+    source_offsets[node * num_features + feature] = 0;
   for (int64_t index = threadIdx.x; index < (num_nodes - 1) * num_features; index += kThreads) {
     const int64_t column = index / num_features, feature = index % num_features;
-    cell_stage[other_nodes[column] * num_features + feature] =
+    source_offsets[other_nodes[column] * num_features + feature] =
         kjt_offsets[feature * num_sources + local_size + column];
   }
   // The keys it looks up, and the most the rail needs of lookup_keys and
@@ -374,27 +382,28 @@ __global__ void __launch_bounds__(kThreads)
 }
 
 // One CTA: what this rank publishes to its node, its rail's needs, then
-// where each requester of its node has its cells in its KJT.
+// where each requester of its node has its keys of each feature in its KJT.
 __global__ void __launch_bounds__(kThreads)
-    status_publish_kernel(const int64_t *needs, const int64_t *my_cell_starts, int64_t cell_words,
-                          int64_t *publish) {
-  for (int64_t word = threadIdx.x; word < kNumNeeds + cell_words; word += kThreads)
-    publish[word] = word < kNumNeeds ? needs[word] : my_cell_starts[word - kNumNeeds];
+    status_publish_kernel(const int64_t *needs, const int64_t *requester_offsets,
+                          int64_t offset_words, int64_t *publish) {
+  for (int64_t word = threadIdx.x; word < kNumNeeds + offset_words; word += kThreads)
+    publish[word] = word < kNumNeeds ? needs[word] : requester_offsets[word - kNumNeeds];
 }
 
 // One CTA: where each source node's chunks start in fwd_chunks, from the
 // rail's slice_in (its own node sends none; at most owner_chunks in all),
 // and where each other node's records of each feature start in rail_keys
-// (cell_record [feature][other node], int64 words): after its chunks and its
+// (record_offsets [feature][other node], counted in records of record_bytes:
+// a slice and its chunks are whole records): after its chunks and its
 // records of the features before. Then a thread per entry of fwd_chunks
 // (owner_chunks of them): the chunk at that place, its source node's (the
 // last whose chunks start at or before it), read from its slice of
 // rail_keys (its bytes rail_bytes; a slice starts at a multiple of 8 bytes);
 // zeros past the chunks.
 __global__ void __launch_bounds__(kThreads)
-    owner_slices_kernel(const int64_t *slice_in, const int64_t *cells_in,
+    owner_slices_kernel(const int64_t *slice_in, const int64_t *length_per_source_feature,
                         const int64_t *other_nodes, const char *rail_keys, int64_t rail_bytes,
-                        Sizes sizes, int64_t *fwd_chunk_start, int64_t *cell_record,
+                        Sizes sizes, int64_t *fwd_chunk_start, int64_t *record_offsets,
                         ChunkPiece *fwd_chunks) {
   const int64_t num_nodes = sizes.topo.num_nodes, num_features = sizes.num_features,
                 bound = sizes.owner_chunks();
@@ -405,10 +414,11 @@ __global__ void __launch_bounds__(kThreads)
   for (int64_t column = threadIdx.x; column < num_nodes - 1; column += kThreads) {
     const int64_t source = other_nodes[column];
     int64_t record =
-        (slice_in[2 * source] + (int64_t)sizeof(ChunkPiece) * slice_in[2 * source + 1]) / 8;
+        (slice_in[2 * source] + (int64_t)sizeof(ChunkPiece) * slice_in[2 * source + 1]) /
+        sizes.record_bytes;
     for (int64_t feature = 0; feature < num_features; ++feature) {
-      cell_record[feature * (num_nodes - 1) + column] = record;
-      record += cells_in[source * num_features + feature] * (sizes.record_bytes / 8);
+      record_offsets[feature * (num_nodes - 1) + column] = record;
+      record += length_per_source_feature[source * num_features + feature];
     }
   }
   __syncthreads();
@@ -426,39 +436,39 @@ __global__ void __launch_bounds__(kThreads)
   }
 }
 
-// A thread per position of the owner's KJT, up to the keys it looks up (at
-// most lookup_keys): the cell (feature, source) it is in and its place
-// there. A key of its own node is in the own part of node_keys (its weight
-// 1 when the keys carry none), another node's in its record in rail_keys
-// (int64 words: the key, then with 16-byte records the weight's bits).
+// A thread per position of the owner's KJT, up to the keys it looks up (at most
+// lookup_keys): the (feature, source) of the KJT's lengths it is in and its
+// place there. A key of its own node is in the own part of node_keys, another
+// node's in its Record in rail_keys (rail_records of them). With weighted
+// records the KJT carries weights: an own key's from node_weights, 1 when the
+// requesters' keys carry none.
+template <typename Record>
 __global__ void __launch_bounds__(kThreads)
-    owner_kjt_kernel(const int64_t *kjt_offsets, const int64_t *num_recv, const int64_t *own_starts,
-                     const int64_t *cell_record, const int64_t *node_keys,
-                     const float *node_weights, const int64_t *rail_keys, int64_t rail_words,
-                     Sizes sizes, int64_t *kjt_values, float *kjt_weights) {
+    owner_kjt_kernel(const int64_t *kjt_offsets, const int64_t *num_recv,
+                     const int64_t *own_offsets, const int64_t *record_offsets,
+                     const int64_t *node_keys, const float *node_weights,
+                     const Record *rail_records, int64_t rail_count, Sizes sizes,
+                     int64_t *kjt_values, float *kjt_weights) {
   const int64_t local_size = sizes.topo.local_size, num_sources = sizes.topo.num_sources,
                 other_columns = sizes.topo.num_nodes - 1, lookup_keys = sizes.lookup_keys,
-                kjt_cells = sizes.num_features * num_sources, record_words = sizes.record_bytes / 8;
-  const float *rail_floats = (const float *)rail_keys;
+                num_lengths = sizes.num_features * num_sources;
   const int64_t keys = min(*num_recv, lookup_keys);
   for (int64_t position = first_item(); position < keys; position += item_stride()) {
-    const int64_t cell =
-        clamp_index(upper_bound(kjt_offsets, kjt_cells + 1, position) - 1, kjt_cells);
-    const int64_t feature = cell / num_sources, source = cell % num_sources,
-                  in_cell = position - kjt_offsets[cell];
+    const int64_t index =
+        clamp_index(upper_bound(kjt_offsets, num_lengths + 1, position) - 1, num_lengths);
+    const int64_t feature = index / num_sources, source = index % num_sources,
+                  nth = position - kjt_offsets[index];
     if (source < local_size) {
       const int64_t own =
-          clamp_index(own_starts[feature * local_size + source] + in_cell, lookup_keys);
+          clamp_index(own_offsets[feature * local_size + source] + nth, lookup_keys);
       kjt_values[position] = node_keys[own];
-      if (kjt_weights != nullptr)
+      if constexpr (Record::kWeighted)
         kjt_weights[position] = node_weights != nullptr ? node_weights[own] : 1.0f;
     } else {
-      const int64_t record =
-          cell_record[feature * other_columns + source - local_size] + in_cell * record_words;
-      kjt_values[position] = rail_keys[clamp_index(record, rail_words)];
-      // the weight: the low half of the record's second word
-      if (kjt_weights != nullptr)
-        kjt_weights[position] = rail_floats[clamp_index(2 * record + 2, 2 * rail_words)];
+      const Record &record = rail_records[clamp_index(
+          record_offsets[feature * other_columns + source - local_size] + nth, rail_count)];
+      kjt_values[position] = record.key;
+      if constexpr (Record::kWeighted) kjt_weights[position] = record.weight;
     }
   }
 }
@@ -472,62 +482,62 @@ at::Tensor other_nodes_of(const Topo &topo, const at::TensorOptions &options) {
 
 at::Tensor count_message(const at::Tensor &need_remote, const at::Tensor &own_total,
                          const at::Tensor &uniq_out, const at::Tensor &chunks_out,
-                         const at::Tensor &cell_uniq) {
+                         const at::Tensor &uniq_per_bucket_feature) {
   const int64_t num_nodes = uniq_out.numel();
-  const CountMessage format{num_nodes, cell_uniq.numel() / num_nodes};
+  const CountMessage format{num_nodes, uniq_per_bucket_feature.numel() / num_nodes};
   const at::Tensor message = at::empty({format.out_words()}, uniq_out.options());
   count_message_kernel<<<kOneCta, kThreads, 0, current_stream()>>>(
       need_remote.data_ptr<int64_t>(), own_total.data_ptr<int64_t>(), uniq_out.data_ptr<int64_t>(),
-      chunks_out.data_ptr<int64_t>(), cell_uniq.data_ptr<int64_t>(), format,
+      chunks_out.data_ptr<int64_t>(), uniq_per_bucket_feature.data_ptr<int64_t>(), format,
       message.data_ptr<int64_t>());
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   return message;
 }
 
-RailLayout rail_layout(const at::Tensor &messages, const at::Tensor &own_cells,
+RailLayout rail_layout(const at::Tensor &messages, const at::Tensor &own_lengths,
                        const at::Tensor &other_nodes, const Sizes &sizes) {
   const int64_t num_nodes = sizes.topo.num_nodes, local_size = sizes.topo.local_size,
                 num_features = sizes.num_features,
-                kjt_cells = num_features * sizes.topo.num_sources;
+                num_lengths = num_features * sizes.topo.num_sources;
   const auto long_options = messages.options();
   RailLayout rail;
   rail.put_dst = at::empty({num_nodes}, long_options);
   rail.put_bytes = at::empty({num_nodes}, long_options);
   rail.put_skip = at::empty({num_nodes}, long_options.dtype(at::kBool));
-  rail.kjt_lengths = at::empty({kjt_cells}, long_options);
-  rail.kjt_offsets = at::empty({kjt_cells + 1}, long_options);
+  rail.kjt_lengths = at::empty({num_lengths}, long_options);
+  rail.kjt_offsets = at::empty({num_lengths + 1}, long_options);
   rail.num_recv = at::empty({}, long_options);
   rail.length_per_key = at::empty({num_features}, long_options);
   rail.slice_in = at::empty({num_nodes, 2}, long_options);
   rail.uniq_in = at::empty({num_nodes}, long_options);
-  rail.cells_in = at::empty({num_nodes, num_features}, long_options);
-  rail.cell_stage = at::empty({num_nodes, num_features}, long_options);
-  rail.my_cell_starts = at::empty({local_size, num_features}, long_options);
+  rail.length_per_source_feature = at::empty({num_nodes, num_features}, long_options);
+  rail.source_offsets = at::empty({num_nodes, num_features}, long_options);
+  rail.requester_offsets = at::empty({local_size, num_features}, long_options);
   rail.needs = at::empty({kNumNeeds}, long_options);
   rail_layout_kernel<<<kOneCta, kThreads, 0, current_stream()>>>(
-      messages.data_ptr<int64_t>(), own_cells.data_ptr<int64_t>(), other_nodes.data_ptr<int64_t>(),
-      sizes, rail.put_dst.data_ptr<int64_t>(), rail.put_bytes.data_ptr<int64_t>(),
-      rail.put_skip.data_ptr<bool>(), rail.kjt_lengths.data_ptr<int64_t>(),
-      rail.kjt_offsets.data_ptr<int64_t>(), rail.num_recv.data_ptr<int64_t>(),
-      rail.length_per_key.data_ptr<int64_t>(), rail.slice_in.data_ptr<int64_t>(),
-      rail.uniq_in.data_ptr<int64_t>(), rail.cells_in.data_ptr<int64_t>(),
-      rail.cell_stage.data_ptr<int64_t>(), rail.my_cell_starts.data_ptr<int64_t>(),
-      rail.needs.data_ptr<int64_t>());
+      messages.data_ptr<int64_t>(), own_lengths.data_ptr<int64_t>(),
+      other_nodes.data_ptr<int64_t>(), sizes, rail.put_dst.data_ptr<int64_t>(),
+      rail.put_bytes.data_ptr<int64_t>(), rail.put_skip.data_ptr<bool>(),
+      rail.kjt_lengths.data_ptr<int64_t>(), rail.kjt_offsets.data_ptr<int64_t>(),
+      rail.num_recv.data_ptr<int64_t>(), rail.length_per_key.data_ptr<int64_t>(),
+      rail.slice_in.data_ptr<int64_t>(), rail.uniq_in.data_ptr<int64_t>(),
+      rail.length_per_source_feature.data_ptr<int64_t>(), rail.source_offsets.data_ptr<int64_t>(),
+      rail.requester_offsets.data_ptr<int64_t>(), rail.needs.data_ptr<int64_t>());
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   return rail;
 }
 
 at::Tensor status_publish(const RailLayout &rail) {
-  const int64_t cell_words = rail.my_cell_starts.numel();
-  const at::Tensor publish = at::empty({kNumNeeds + cell_words}, rail.needs.options());
+  const int64_t offset_words = rail.requester_offsets.numel();
+  const at::Tensor publish = at::empty({kNumNeeds + offset_words}, rail.needs.options());
   status_publish_kernel<<<kOneCta, kThreads, 0, current_stream()>>>(
-      rail.needs.data_ptr<int64_t>(), rail.my_cell_starts.data_ptr<int64_t>(), cell_words,
+      rail.needs.data_ptr<int64_t>(), rail.requester_offsets.data_ptr<int64_t>(), offset_words,
       publish.data_ptr<int64_t>());
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   return publish;
 }
 
-OwnerTables owner_tables(const RailLayout &rail, const at::Tensor &own_starts,
+OwnerTables owner_tables(const RailLayout &rail, const at::Tensor &own_offsets,
                          const at::Tensor &node_keys, const at::Tensor &node_weights,
                          const at::Tensor &rail_keys, const at::Tensor &other_nodes,
                          const Sizes &sizes) {
@@ -541,25 +551,28 @@ OwnerTables owner_tables(const RailLayout &rail, const at::Tensor &own_starts,
   const int64_t bound = sizes.owner_chunks();
   tables.fwd_chunk_start = at::empty({num_nodes + 1}, long_options);
   tables.fwd_chunks = at::empty({bound, 4}, long_options.dtype(at::kInt));
-  const at::Tensor cell_record = at::empty({sizes.num_features * (num_nodes - 1)}, long_options);
+  const at::Tensor record_offsets = at::empty({sizes.num_features * (num_nodes - 1)}, long_options);
   owner_slices_kernel<<<kOneCta, kThreads, 0, stream>>>(
-      rail.slice_in.data_ptr<int64_t>(), rail.cells_in.data_ptr<int64_t>(),
+      rail.slice_in.data_ptr<int64_t>(), rail.length_per_source_feature.data_ptr<int64_t>(),
       other_nodes.data_ptr<int64_t>(), (const char *)rail_keys.data_ptr<int64_t>(), 8 * rail_words,
-      sizes, tables.fwd_chunk_start.data_ptr<int64_t>(), cell_record.data_ptr<int64_t>(),
-      (ChunkPiece *)tables.fwd_chunks.data_ptr<int32_t>());
+      sizes, tables.fwd_chunk_start.data_ptr<int64_t>(), record_offsets.data_ptr<int64_t>(),
+      records_of<ChunkPiece>(tables.fwd_chunks));
   C10_CUDA_KERNEL_LAUNCH_CHECK();
-  // The KJT's keys, its first num_recv positions: its own node's cells from
+  // The KJT's keys, its first num_recv positions: its own node's from
   // the own part of node_keys, the other nodes' from their records in
   // rail_keys.
   tables.kjt_values = at::empty({lookup_keys}, long_options);
-  if (sizes.record_bytes == 16)
+  if (sizes.weighted_records())
     tables.kjt_weights = at::empty({lookup_keys}, long_options.dtype(at::kFloat));
-  owner_kjt_kernel<<<item_grid(lookup_keys), kThreads, 0, stream>>>(
-      rail.kjt_offsets.data_ptr<int64_t>(), rail.num_recv.data_ptr<int64_t>(),
-      own_starts.data_ptr<int64_t>(), cell_record.data_ptr<int64_t>(),
-      node_keys.data_ptr<int64_t>(), data_or_null<float>(node_weights),
-      rail_keys.data_ptr<int64_t>(), rail_words, sizes, tables.kjt_values.data_ptr<int64_t>(),
-      data_or_null<float>(tables.kjt_weights));
+  with_record(sizes, [&](auto record) {
+    using Record = decltype(record);
+    owner_kjt_kernel<Record><<<item_grid(lookup_keys), kThreads, 0, stream>>>(
+        rail.kjt_offsets.data_ptr<int64_t>(), rail.num_recv.data_ptr<int64_t>(),
+        own_offsets.data_ptr<int64_t>(), record_offsets.data_ptr<int64_t>(),
+        node_keys.data_ptr<int64_t>(), data_or_null<float>(node_weights),
+        (const Record *)rail_keys.data_ptr<int64_t>(), 8 * rail_words / (int64_t)sizeof(Record),
+        sizes, tables.kjt_values.data_ptr<int64_t>(), data_or_null<float>(tables.kjt_weights));
+  });
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   return tables;
 }
@@ -568,23 +581,23 @@ OwnerTables owner_tables(const RailLayout &rail, const at::Tensor &own_starts,
 
 namespace {
 
-// A thread per row of part 1: the node peer whose remote_map has its words,
+// A thread per bucketized row: the node peer whose remote_map has its words,
 // for a valid row of another node's owner (its proxy: the owner's local
 // rank; else -1), and its occurrence there: its destination less
 // lookup_keys, clamped into the remote part.
 __global__ void __launch_bounds__(kThreads)
-    remote_rows_kernel(const int32_t *row_cell, const int64_t *block_start,
+    remote_rows_kernel(const int32_t *bucket_feature_of_row, const int64_t *offset_per_bucket,
                        const int64_t *destination_base, int64_t rows, Sizes sizes, int32_t *peer,
                        int64_t *first_word) {
   const int64_t local_size = sizes.topo.local_size, world_size = sizes.topo.world_size;
-  const int64_t valid_rows = block_start[world_size];
+  const int64_t valid_rows = offset_per_bucket[world_size];
   for (int64_t row = first_item(); row < rows; row += item_stride()) {
-    const int64_t cell = row_cell[row];
-    const int64_t owner = min(cell / sizes.num_features, world_size - 1);
+    const int64_t bucket_feature = bucket_feature_of_row[row];
+    const int64_t owner = min(bucket_feature / sizes.num_features, world_size - 1);
     const bool remote = owner / local_size != sizes.topo.node && row < valid_rows;
     peer[row] = remote ? (int32_t)(owner % local_size) : -1;
     first_word[row] =
-        clamp_index(destination_base[cell] + row - sizes.lookup_keys, sizes.remote_keys);
+        clamp_index(destination_base[bucket_feature] + row - sizes.lookup_keys, sizes.remote_keys);
   }
 }
 
@@ -597,29 +610,26 @@ __global__ void __launch_bounds__(kThreads)
 // groups at the proxies before (group_off); their heavy starts in (proxy,
 // chunk) order (heavy_start); and the task starts.
 __global__ void __launch_bounds__(kThreads)
-    requester_proxy_tables_kernel(const int32_t *headers, const int64_t *block_start, Sizes sizes,
-                                  int64_t *push_order_off, int64_t *group_off,
+    requester_proxy_tables_kernel(const int32_t *headers, const int64_t *offset_per_bucket,
+                                  Sizes sizes, int64_t *push_order_off, int64_t *group_off,
                                   int64_t *proxy_chunks, int64_t *proxy_ends, ReqEntry *push_tables,
                                   int32_t *heavy_start, int64_t *fwd_task_starts,
                                   int64_t *bwd_task_starts) {
   const ProxyHeader header = ProxyHeader::of(sizes);
   const int64_t local_size = sizes.topo.local_size, me = sizes.topo.local_rank,
                 max_chunks = sizes.max_chunks, entries = max_chunks + 1;
-  auto header_of = [&](int64_t proxy) { return headers + proxy * header.gathered_words(); };
   // its push table as the proxy published it: positions relative to its push
   // order there, groups relative to its first group
-  auto published = [&](int64_t proxy) {
-    return (const ReqEntry *)(header_of(proxy) + header.gathered_push_table());
-  };
+  auto published = [&](int64_t proxy) { return header.gathered(headers, proxy).push_table(); };
   auto chunks_of = [&](int64_t proxy) {
-    return min(max((int64_t)header_of(proxy)[ProxyHeader::kGatheredChunks], (int64_t)0),
-               max_chunks);
+    return min(max(header.gathered(headers, proxy).chunks(), (int64_t)0), max_chunks);
   };
   auto rows_at = [&](int64_t proxy) {
     int64_t rows = 0;
     for (int64_t owner_node = 0; owner_node < sizes.topo.num_nodes; ++owner_node) {
       const int64_t owner = owner_node * local_size + proxy;
-      if (owner_node != sizes.topo.node) rows += block_start[owner + 1] - block_start[owner];
+      if (owner_node != sizes.topo.node)
+        rows += offset_per_bucket[owner + 1] - offset_per_bucket[owner];
     }
     return rows;
   };
@@ -629,9 +639,7 @@ __global__ void __launch_bounds__(kThreads)
   // each chunk's end, then the stream's (uint32 words)
   for (int64_t index = threadIdx.x; index < local_size * entries; index += kThreads) {
     const int64_t proxy = index / entries, chunk = index % entries;
-    const int32_t word = chunk < max_chunks ? header_of(proxy)[ProxyHeader::kGatheredEnds + chunk]
-                                            : header_of(proxy)[ProxyHeader::kGatheredEnd];
-    proxy_ends[index] = (int64_t)(uint32_t)word;
+    proxy_ends[index] = header.gathered(headers, proxy).end(chunk);
   }
   cta_exclusive_ends<int64_t>(
       local_size, [&](int64_t proxy) { return (int64_t)published(proxy)[max_chunks].groups; },
@@ -685,49 +693,53 @@ __global__ void __launch_bounds__(kThreads)
       bwd_task_starts);
 }
 
-// A thread per row of part 1. A row of an owner on this node is in the
-// owner's KJT, where this requester's cell starts plus its place in the
-// cell, both forward and backward. Another node's row reads its key's row in
-// proxy_rows (bit 31, a heavy key, dropped) and pushes its gradient to its
-// slot, from its proxy's remote_map (words [3][rows], RemoteMap's arrays); a
-// valid one is at its push position at the proxy in its push order.
+// A thread per bucketized row. A row of an owner on this node is in the owner's
+// KJT, where this requester's keys of the feature start plus its place among
+// them, both forward and backward. Another node's row reads its key's row in
+// proxy_rows and pushes its gradient to its slot, from what it gathered of its
+// proxy's remote_map (map); a valid one is at its push position at the proxy in
+// its push order.
 __global__ void __launch_bounds__(kThreads)
-    requester_rows_kernel(const int32_t *words, const int64_t *owner_cell_start,
-                          const int32_t *row_cell, const int64_t *cell_start,
-                          const int64_t *block_start, const int64_t *push_order_off, int64_t rows,
-                          Sizes sizes, int32_t *src, int32_t *dst, int32_t *push_order) {
+    requester_rows_kernel(GatheredMap map, const int64_t *offset_per_owner_feature,
+                          const int32_t *bucket_feature_of_row,
+                          const int64_t *offset_per_bucket_feature,
+                          const int64_t *offset_per_bucket, const int64_t *push_order_off,
+                          int64_t rows, Sizes sizes, int32_t *src, int32_t *dst,
+                          int32_t *push_order) {
   const int64_t local_size = sizes.topo.local_size, num_features = sizes.num_features,
                 world_size = sizes.topo.world_size;
-  const int32_t *key_row = words, *slot = words + rows, *push_position = words + 2 * rows;
-  const int64_t valid_rows = block_start[world_size];
+  const int64_t valid_rows = offset_per_bucket[world_size];
   for (int64_t row = first_item(); row < rows; row += item_stride()) {
-    const int64_t cell = row_cell[row];
-    const int64_t owner = min(cell / num_features, world_size - 1);
+    const int64_t bucket_feature = bucket_feature_of_row[row];
+    const int64_t owner = min(bucket_feature / num_features, world_size - 1);
     const int64_t peer = owner % local_size;  // the owner itself on this node, else its proxy
     if (owner / local_size == sizes.topo.node) {
-      const int32_t place = (int32_t)(owner_cell_start[peer * num_features + cell % num_features] +
-                                      row - cell_start[cell]);
+      const int32_t place =
+          (int32_t)(offset_per_owner_feature[peer * num_features + bucket_feature % num_features] +
+                    row - offset_per_bucket_feature[bucket_feature]);
       src[row] = place;
       dst[row] = place;
       continue;
     }
-    src[row] = key_row[row] & 0x7FFFFFFF;
-    dst[row] = slot[row];
+    src[row] = map.key_row(row).row();
+    dst[row] = map.slot(row);
     // a call that does not fit may read words no one wrote: a position out
     // of range is dropped
-    const int64_t position = push_order_off[peer] + push_position[row];
+    const int64_t position = push_order_off[peer] + map.position(row);
     if (row < valid_rows && position >= 0 && position < rows) push_order[position] = (int32_t)row;
   }
 }
 
 // The push order as the heavy groups read it: the row at a position (a call
 // that does not fit may hold rows no one wrote: clamped), whether it is
-// heavy (bit 31 of its key's row) and its slot.
+// heavy (its key row in remote_map says so) and its slot.
 struct PushOrder {
-  const int32_t *order, *key_row, *dst;
+  const int32_t *order;
+  GatheredMap map;
+  const int32_t *dst;
   int64_t rows;
   __device__ int64_t row(int64_t position) const { return clamp_index(order[position], rows); }
-  __device__ bool heavy(int64_t position) const { return key_row[row(position)] < 0; }
+  __device__ bool heavy(int64_t position) const { return map.key_row(row(position)).heavy(); }
   __device__ int32_t slot(int64_t position) const { return dst[row(position)]; }
 };
 
@@ -805,15 +817,15 @@ __global__ void __launch_bounds__(kThreads)
 
 }  // namespace
 
-PeerWords remote_rows(const at::Tensor &row_cell, const at::Tensor &block_start,
+PeerWords remote_rows(const at::Tensor &bucket_feature_of_row, const at::Tensor &offset_per_bucket,
                       const at::Tensor &destination_base, const Sizes &sizes) {
-  const int64_t rows = row_cell.numel();
+  const int64_t rows = bucket_feature_of_row.numel();
   PeerWords gather;
-  gather.peer = at::empty({rows}, row_cell.options());
-  gather.first_word = at::empty({rows}, block_start.options());
+  gather.peer = at::empty({rows}, bucket_feature_of_row.options());
+  gather.first_word = at::empty({rows}, offset_per_bucket.options());
   if (rows > 0) {
     remote_rows_kernel<<<item_grid(rows), kThreads, 0, current_stream()>>>(
-        row_cell.data_ptr<int32_t>(), block_start.data_ptr<int64_t>(),
+        bucket_feature_of_row.data_ptr<int32_t>(), offset_per_bucket.data_ptr<int64_t>(),
         destination_base.data_ptr<int64_t>(), rows, sizes, gather.peer.data_ptr<int32_t>(),
         gather.first_word.data_ptr<int64_t>());
     C10_CUDA_KERNEL_LAUNCH_CHECK();
@@ -842,13 +854,14 @@ PeerWords header_gather(const Sizes &sizes, const at::TensorOptions &options) {
 }
 
 RequesterTables requester_tables(const at::Tensor &words, const at::Tensor &headers,
-                                 const at::Tensor &owner_cell_start, const at::Tensor &row_cell,
-                                 const at::Tensor &cell_start, const at::Tensor &block_start,
-                                 const Sizes &sizes) {
-  const int64_t rows = row_cell.numel(), local_size = sizes.topo.local_size,
+                                 const at::Tensor &offset_per_owner_feature,
+                                 const at::Tensor &bucket_feature_of_row,
+                                 const at::Tensor &offset_per_bucket_feature,
+                                 const at::Tensor &offset_per_bucket, const Sizes &sizes) {
+  const int64_t rows = bucket_feature_of_row.numel(), local_size = sizes.topo.local_size,
                 max_chunks = sizes.max_chunks, heavy_entries = local_size * (max_chunks + 1);
-  const auto long_options = cell_start.options().dtype(at::kLong);
-  const auto int_options = cell_start.options().dtype(at::kInt);
+  const auto long_options = offset_per_bucket_feature.options().dtype(at::kLong);
+  const auto int_options = offset_per_bucket_feature.options().dtype(at::kInt);
   const cudaStream_t stream = current_stream();
   RequesterTables tables;
   // Per proxy, from its gathered header: its chunks and their ends, and
@@ -862,10 +875,10 @@ RequesterTables requester_tables(const at::Tensor &words, const at::Tensor &head
   tables.fwd_task_starts = at::empty({max_chunks * local_size + 1}, long_options);
   tables.bwd_task_starts = at::empty({2 * max_chunks * local_size + 1}, long_options);
   requester_proxy_tables_kernel<<<kOneCta, kThreads, 0, stream>>>(
-      headers.data_ptr<int32_t>(), block_start.data_ptr<int64_t>(), sizes,
+      headers.data_ptr<int32_t>(), offset_per_bucket.data_ptr<int64_t>(), sizes,
       tables.push_order_off.data_ptr<int64_t>(), group_off.data_ptr<int64_t>(),
       tables.proxy_chunks.data_ptr<int64_t>(), tables.proxy_ends.data_ptr<int64_t>(),
-      (ReqEntry *)tables.push_tables.data_ptr<int32_t>(), heavy_start.data_ptr<int32_t>(),
+      records_of<ReqEntry>(tables.push_tables), heavy_start.data_ptr<int32_t>(),
       tables.fwd_task_starts.data_ptr<int64_t>(), tables.bwd_task_starts.data_ptr<int64_t>());
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   const int64_t group_bound = std::min(rows, local_size * (sizes.remote_keys / (kHeavy + 1) + 1));
@@ -883,23 +896,25 @@ RequesterTables requester_tables(const at::Tensor &words, const at::Tensor &head
   }
   // Per row: its src and dst, and its place in the push order, its rows at
   // each proxy at their push positions there.
+  const GatheredMap map{words.data_ptr<int32_t>(), rows};
   requester_rows_kernel<<<item_grid(rows), kThreads, 0, stream>>>(
-      words.data_ptr<int32_t>(), owner_cell_start.data_ptr<int64_t>(), row_cell.data_ptr<int32_t>(),
-      cell_start.data_ptr<int64_t>(), block_start.data_ptr<int64_t>(),
+      map, offset_per_owner_feature.data_ptr<int64_t>(), bucket_feature_of_row.data_ptr<int32_t>(),
+      offset_per_bucket_feature.data_ptr<int64_t>(), offset_per_bucket.data_ptr<int64_t>(),
       tables.push_order_off.data_ptr<int64_t>(), rows, sizes, tables.src.data_ptr<int32_t>(),
       tables.dst.data_ptr<int32_t>(), tables.push_order.data_ptr<int32_t>());
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   // The heavy groups, in its push order: where each starts, numbered by a
   // scan, then each group's start and end.
-  const PushOrder order{tables.push_order.data_ptr<int32_t>(), words.data_ptr<int32_t>(),
-                        tables.dst.data_ptr<int32_t>(), rows};
-  const at::Tensor group_start = at::empty({rows}, cell_start.options().dtype(at::kBool));
+  const PushOrder order{tables.push_order.data_ptr<int32_t>(), map, tables.dst.data_ptr<int32_t>(),
+                        rows};
+  const at::Tensor group_start =
+      at::empty({rows}, offset_per_bucket_feature.options().dtype(at::kBool));
   group_starts_kernel<<<item_grid(rows), kThreads, 0, stream>>>(
       order, tables.push_order_off.data_ptr<int64_t>(), local_size, heavy_start.data_ptr<int32_t>(),
       heavy_entries, group_start.data_ptr<bool>());
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   const at::Tensor group_before = exclusive_ends(group_start, at::kInt);
-  HeavyGroup *heavy_groups = (HeavyGroup *)tables.heavy_groups.data_ptr<int32_t>();
+  HeavyGroup *heavy_groups = records_of<HeavyGroup>(tables.heavy_groups);
   heavy_groups_kernel<<<item_grid(rows + 1), kThreads, 0, stream>>>(
       order, tables.push_order_off.data_ptr<int64_t>(), local_size, group_start.data_ptr<bool>(),
       group_before.data_ptr<int32_t>(), group_bound, heavy_groups);
@@ -922,9 +937,19 @@ RequesterTables requester_tables(const at::Tensor &words, const at::Tensor &head
 
 namespace {
 
-// A cut's sort key: its node, then its key (below 2^31).
-constexpr int kNodeShift = 32;
-constexpr int64_t kKeyMask = (int64_t{1} << kNodeShift) - 1;
+// A cut of the lists, as the int64 they are sorted by: its node in the high
+// 32 bits, its place among the node's keys (below 2^31) in the low ones.
+struct CutKey {
+  static constexpr int kNodeShift = 32;
+  static constexpr int64_t kMaxKey = (int64_t{1} << 31) - 1;
+  __host__ __device__ static int64_t of(int64_t node, int64_t key) {
+    return (node << kNodeShift) + key;
+  }
+  __host__ __device__ static int64_t node(int64_t cut) { return cut >> kNodeShift; }
+  __host__ __device__ static int64_t key(int64_t cut) {
+    return cut & ((int64_t{1} << kNodeShift) - 1);
+  }
+};
 
 // The two lists as one of 2 * num_nodes nodes: the backward's owner nodes
 // (the proxy's chunks of each, and its node-unique keys per (owner node,
@@ -933,14 +958,16 @@ constexpr int64_t kKeyMask = (int64_t{1} << kNodeShift) - 1;
 // node after node, each node's in order: the backward's, then the forward's.
 // A call that does not fit may read words no one wrote: they are clamped.
 struct PutChunks {
-  const Chunk *chunks;              // [max_chunks]: the proxy's, in stream order
-  const int64_t *node_chunk_start;  // [num_nodes + 1]: each owner node's in node_chunks
-  const int32_t *node_chunks;       // [max_chunks]: each owner node's chunks in order
-  const int64_t *uniq_off;          // [num_nodes + 1]: the proxy's first key of each owner node
-  const ChunkPiece *fwd_chunks;     // [owner_chunks]: the owner's, source node after source node
-  const int64_t *fwd_chunk_start;   // [num_nodes + 1]
-  const int64_t *cell_uniq;         // [num_nodes][num_features]
-  const int64_t *cells_in;          // [num_nodes][num_features]
+  const Chunk *chunks;                       // [max_chunks]: the proxy's, in stream order
+  const int64_t *node_chunk_start;           // [num_nodes + 1]: each owner node's in node_chunks
+  const int32_t *node_chunks;                // [max_chunks]: each owner node's chunks in order
+  const int64_t *uniq_off;                   // [num_nodes + 1]: the proxy's first key of each
+                                             // owner node
+  const ChunkPiece *fwd_chunks;              // [owner_chunks]: the owner's, source node after
+                                             // source node
+  const int64_t *fwd_chunk_start;            // [num_nodes + 1]
+  const int64_t *uniq_per_bucket_feature;    // [num_nodes][num_features]
+  const int64_t *length_per_source_feature;  // [num_nodes][num_features]
   int64_t num_nodes, num_features, max_chunks, owner_chunks, ring;
 
   // A chunk of the numbering: its node, its keys [lo, hi) among the node's
@@ -978,55 +1005,58 @@ struct PutChunks {
       out.row = piece.start % ring;
       out.number = entry;
     }
-    out.lo = min(max(out.lo, (int64_t)0), kKeyMask >> 1);
-    out.hi = min(max(out.hi, out.lo), kKeyMask >> 1);
+    out.lo = min(max(out.lo, (int64_t)0), CutKey::kMaxKey);
+    out.hi = min(max(out.hi, out.lo), CutKey::kMaxKey);
     return out;
   }
   // the node's keys of a feature
   __device__ int64_t keys(int64_t node, int64_t feature) const {
-    return node < num_nodes ? cell_uniq[node * num_features + feature]
-                            : cells_in[(node - num_nodes) * num_features + feature];
+    return node < num_nodes
+               ? uniq_per_bucket_feature[node * num_features + feature]
+               : length_per_source_feature[(node - num_nodes) * num_features + feature];
   }
 };
 
 // The rows of the segment from a cut to the next cut: the keys between them
 // when both are of one node, else none.
 __device__ __forceinline__ int64_t segment_rows(int64_t cut, int64_t next) {
-  return (next >> kNodeShift) == (cut >> kNodeShift) ? (next & kKeyMask) - (cut & kKeyMask) : 0;
+  return CutKey::node(next) == CutKey::node(cut) ? CutKey::key(next) - CutKey::key(cut) : 0;
 }
 
-// One CTA: where each node's cells start, as cut keys (cell_key
-// [nodes][num_features]).
-__global__ void __launch_bounds__(kThreads) put_cells_kernel(PutChunks lists, int64_t *cell_key) {
+// One CTA: where each node's keys of each feature start, as cut keys
+// (feature_cut [nodes][num_features]).
+__global__ void __launch_bounds__(kThreads)
+    feature_cuts_kernel(PutChunks lists, int64_t *feature_cut) {
   const int64_t nodes = 2 * lists.num_nodes, num_features = lists.num_features;
   for (int64_t node = threadIdx.x; node < nodes; node += kThreads) {
-    int64_t end = 0;  // the end of the node's cells so far
+    int64_t end = 0;  // the end of the node's features so far
     for (int64_t feature = 0; feature < num_features; ++feature) {
-      cell_key[node * num_features + feature] = (node << kNodeShift) + end;
+      feature_cut[node * num_features + feature] = CutKey::of(node, end);
       end += lists.keys(node, feature);
     }
   }
 }
 
-// A thread per cut, as a cut key (node << kNodeShift) + key: first the first
-// key of each chunk (chunk_cuts of them, numbered as PutChunks does: past the
-// chunks after every node), which also go to chunk_key, then the end of each
-// cell.
+// A thread per cut (CutKey): first the first key of each chunk (chunk_cuts
+// of them, numbered as PutChunks does: past the chunks after every node),
+// which also go to chunk_key, then the end of each node's keys of each
+// feature.
 __global__ void __launch_bounds__(kThreads)
-    cut_keys_kernel(PutChunks lists, const int64_t *cell_key, int64_t chunk_cuts, int64_t *cut_keys,
-                    int64_t *chunk_key) {
-  const int64_t nodes = 2 * lists.num_nodes, cells = nodes * lists.num_features;
+    cut_keys_kernel(PutChunks lists, const int64_t *feature_cut, int64_t chunk_cuts,
+                    int64_t *cut_keys, int64_t *chunk_key) {
+  const int64_t nodes = 2 * lists.num_nodes, node_features = nodes * lists.num_features;
   const int64_t chunks = lists.chunks_in_all();
-  for (int64_t cut = first_item(); cut < chunk_cuts + cells; cut += item_stride()) {
+  for (int64_t cut = first_item(); cut < chunk_cuts + node_features; cut += item_stride()) {
     int64_t key;
     if (cut >= chunk_cuts) {
-      const int64_t cell = cut - chunk_cuts;
-      key = cell_key[cell] + lists.keys(cell / lists.num_features, cell % lists.num_features);
+      const int64_t node_feature = cut - chunk_cuts;
+      key = feature_cut[node_feature] +
+            lists.keys(node_feature / lists.num_features, node_feature % lists.num_features);
     } else {
-      key = nodes << kNodeShift;
+      key = CutKey::of(nodes, 0);
       if (cut < chunks) {
         const PutChunks::Place place = lists.place(cut);
-        key = (place.node << kNodeShift) + place.lo;
+        key = CutKey::of(place.node, place.lo);
       }
       chunk_key[cut] = key;
     }
@@ -1042,30 +1072,31 @@ __global__ void __launch_bounds__(kThreads)
 }
 
 // A thread per segment that holds rows: its PutSeg, at its place among them
-// (kept_before). Its chunk and its cell are the last that start at or before
-// it: the chunk gives its row in proxy_rows and its number, the cell its row
-// in the owner's KJT (rail_cells for the backward's owner nodes, cell_stage
-// for the forward's proxy nodes). The backward's src is the row of
-// proxy_rows, the forward's the row of the KJT.
+// (kept_before). Its chunk and its node's feature are the last that start at
+// or before it: the chunk gives its row in proxy_rows and its number, the
+// feature its row in the owner's KJT (owner_offsets for the backward's owner
+// nodes, source_offsets for the forward's proxy nodes). The backward's src is
+// the row of proxy_rows, the forward's the row of the KJT.
 __global__ void __launch_bounds__(kThreads)
     put_segments_kernel(PutChunks lists, const int64_t *sorted, const int32_t *kept_before,
                         int64_t segments, const int64_t *chunk_key, int64_t chunk_cuts,
-                        const int64_t *cell_key, const int64_t *rail_cells,
-                        const int64_t *cell_stage, PutSeg *list) {
-  const int64_t num_nodes = lists.num_nodes, cells = 2 * num_nodes * lists.num_features;
+                        const int64_t *feature_cut, const int64_t *owner_offsets,
+                        const int64_t *source_offsets, PutSeg *list) {
+  const int64_t num_nodes = lists.num_nodes, node_features = 2 * num_nodes * lists.num_features;
   for (int64_t segment = first_item(); segment < segments; segment += item_stride()) {
     const int64_t cut = sorted[segment], rows = segment_rows(cut, sorted[segment + 1]);
     if (rows <= 0) continue;
-    const int64_t first = cut & kKeyMask;
+    const int64_t first = CutKey::key(cut);
     const PutChunks::Place chunk =
         lists.place(clamp_index(upper_bound(chunk_key, chunk_cuts, cut) - 1, chunk_cuts));
     const int64_t chunk_row = chunk.row + first - chunk.lo;
-    const int64_t cell = clamp_index(upper_bound(cell_key, cells, cut) - 1, cells);
-    const int64_t cell_row = cell < num_nodes * lists.num_features
-                                 ? rail_cells[cell]
-                                 : cell_stage[cell - num_nodes * lists.num_features];
-    const int64_t kjt_row = cell_row + first - (cell_key[cell] & kKeyMask);
-    const bool forward = (cut >> kNodeShift) >= num_nodes;
+    const int64_t node_feature =
+        clamp_index(upper_bound(feature_cut, node_features, cut) - 1, node_features);
+    const int64_t kjt_offset = node_feature < num_nodes * lists.num_features
+                                   ? owner_offsets[node_feature]
+                                   : source_offsets[node_feature - num_nodes * lists.num_features];
+    const int64_t kjt_row = kjt_offset + first - CutKey::key(feature_cut[node_feature]);
+    const bool forward = CutKey::node(cut) >= num_nodes;
     list[kept_before[segment]] =
         PutSeg{(int32_t)(forward ? kjt_row : chunk_row), (int32_t)(forward ? chunk_row : kjt_row),
                (int32_t)rows, (int32_t)chunk.number};
@@ -1079,51 +1110,53 @@ __global__ void __launch_bounds__(kThreads)
                       int64_t nodes, int32_t *starts) {
   for (int64_t node = threadIdx.x; node <= nodes; node += kThreads)
     starts[node] =
-        kept_before[min(lower_bound(sorted, segments + 1, node << kNodeShift), segments)];
+        kept_before[min(lower_bound(sorted, segments + 1, CutKey::of(node, 0)), segments)];
 }
 
 }  // namespace
 
 PutLists put_lists(const at::Tensor &chunks, const at::Tensor &node_chunk_start,
                    const at::Tensor &node_chunks, const at::Tensor &uniq_off,
-                   const at::Tensor &cell_uniq, const at::Tensor &rail_cells,
+                   const at::Tensor &uniq_per_bucket_feature, const at::Tensor &owner_offsets,
                    const at::Tensor &fwd_chunks, const at::Tensor &fwd_chunk_start,
-                   const at::Tensor &cells_in, const at::Tensor &cell_stage, const Sizes &sizes) {
+                   const at::Tensor &length_per_source_feature, const at::Tensor &source_offsets,
+                   const Sizes &sizes) {
   const int64_t num_nodes = sizes.topo.num_nodes, num_features = sizes.num_features;
   // The two lists as one of 2 * num_nodes nodes: the backward's owner nodes,
   // then the forward's proxy nodes.
-  const int64_t nodes = 2 * num_nodes, cells = nodes * num_features;
-  const auto long_options = cell_uniq.options().dtype(at::kLong);
-  const auto int_options = cell_uniq.options().dtype(at::kInt);
+  const int64_t nodes = 2 * num_nodes, node_features = nodes * num_features;
+  const auto long_options = uniq_per_bucket_feature.options().dtype(at::kLong);
+  const auto int_options = uniq_per_bucket_feature.options().dtype(at::kInt);
   const cudaStream_t stream = current_stream();
-  const PutChunks lists{(const Chunk *)chunks.data_ptr<int32_t>(),
+  const PutChunks lists{records_of<const Chunk>(chunks),
                         node_chunk_start.data_ptr<int64_t>(),
                         node_chunks.data_ptr<int32_t>(),
                         uniq_off.data_ptr<int64_t>(),
-                        (const ChunkPiece *)fwd_chunks.data_ptr<int32_t>(),
+                        records_of<const ChunkPiece>(fwd_chunks),
                         fwd_chunk_start.data_ptr<int64_t>(),
-                        cell_uniq.data_ptr<int64_t>(),
-                        cells_in.data_ptr<int64_t>(),
+                        uniq_per_bucket_feature.data_ptr<int64_t>(),
+                        length_per_source_feature.data_ptr<int64_t>(),
                         num_nodes,
                         num_features,
                         sizes.max_chunks,
                         sizes.owner_chunks(),
                         sizes.num_proxy_rows};
   PutLists out;
-  const at::Tensor cell_key = at::empty({cells}, long_options);
-  put_cells_kernel<<<kOneCta, kThreads, 0, stream>>>(lists, cell_key.data_ptr<int64_t>());
+  const at::Tensor feature_cut = at::empty({node_features}, long_options);
+  feature_cuts_kernel<<<kOneCta, kThreads, 0, stream>>>(lists, feature_cut.data_ptr<int64_t>());
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   // The cuts, by (node, key): the first key of each chunk (past the chunks:
-  // after every node) and the end of each cell. Segment i goes from cut i to
-  // cut i + 1, and holds rows when both are of one node.
+  // after every node) and the end of each node's keys of each feature.
+  // Segment i goes from cut i to cut i + 1, and holds rows when both are of
+  // one node.
   const int64_t chunk_cuts = sizes.max_chunks + sizes.owner_chunks();
-  const at::Tensor cut_keys = at::empty({chunk_cuts + cells}, long_options);
+  const at::Tensor cut_keys = at::empty({chunk_cuts + node_features}, long_options);
   const at::Tensor chunk_key = at::empty({chunk_cuts}, long_options);
-  cut_keys_kernel<<<item_grid(chunk_cuts + cells), kThreads, 0, stream>>>(
-      lists, cell_key.data_ptr<int64_t>(), chunk_cuts, cut_keys.data_ptr<int64_t>(),
+  cut_keys_kernel<<<item_grid(chunk_cuts + node_features), kThreads, 0, stream>>>(
+      lists, feature_cut.data_ptr<int64_t>(), chunk_cuts, cut_keys.data_ptr<int64_t>(),
       chunk_key.data_ptr<int64_t>());
   C10_CUDA_KERNEL_LAUNCH_CHECK();
-  const at::Tensor sorted = sort_keys(cut_keys, kNodeShift + bits_for(nodes + 1));
+  const at::Tensor sorted = sort_keys(cut_keys, CutKey::kNodeShift + bits_for(nodes + 1));
   // The segments that hold rows, in order, and where each node's first one is.
   const int64_t segments = sorted.numel() - 1;
   const at::Tensor kept = at::empty({segments}, long_options.dtype(at::kBool));
@@ -1134,9 +1167,9 @@ PutLists put_lists(const at::Tensor &chunks, const at::Tensor &node_chunk_start,
   out.list = at::empty({segments, 4}, int_options);
   put_segments_kernel<<<item_grid(segments), kThreads, 0, stream>>>(
       lists, sorted.data_ptr<int64_t>(), kept_before.data_ptr<int32_t>(), segments,
-      chunk_key.data_ptr<int64_t>(), chunk_cuts, cell_key.data_ptr<int64_t>(),
-      rail_cells.data_ptr<int64_t>(), cell_stage.data_ptr<int64_t>(),
-      (PutSeg *)out.list.data_ptr<int32_t>());
+      chunk_key.data_ptr<int64_t>(), chunk_cuts, feature_cut.data_ptr<int64_t>(),
+      owner_offsets.data_ptr<int64_t>(), source_offsets.data_ptr<int64_t>(),
+      records_of<PutSeg>(out.list));
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   out.starts = at::empty({nodes + 1}, int_options);
   put_starts_kernel<<<kOneCta, kThreads, 0, stream>>>(sorted.data_ptr<int64_t>(),

@@ -35,6 +35,10 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 namespace dyn_emb {
 namespace hier_output_dist {
 
+// The output dist's two kernels: fwd_kernel and bwd_kernel. Their numbers
+// index the trace's rings.
+enum class OutKernel : int { kForward = 0, kBackward = 1 };
+
 // The trace of a build with DYNAMICEMB_HIER_TRACE=1 (kTrace): the out
 // kernels' timelines, a ring of rows per direction (TraceSlots) on the GPU.
 // Without kTrace its ring is empty and it keeps nothing.
@@ -44,9 +48,9 @@ class Trace {
   // The next out kernel's row of its direction's ring (its args.trace),
   // started over on `stream` (two memsets, no kernel); nullptr without
   // kTrace.
-  unsigned long long *start_out(bool forward, cudaStream_t stream);
+  unsigned long long *start_out(OutKernel which, cudaStream_t stream);
   // That kernel was launched.
-  void launched(bool forward);
+  void launched(OutKernel which);
   // [2, kTraceRing, kTraceWords]: forward, then backward, each kernel in
   // row (launches before it) % ring.
   at::Tensor out_ring() const { return out_; }
@@ -84,7 +88,7 @@ class OutChannel {
  private:
   // CTAs of an out kernel, and of the backward's across nodes those that
   // reduce.
-  int out_ctas(bool forward) const;
+  int out_ctas(OutKernel which) const;
   int reducers(int ctas) const;
   // The output of a forward of `rows` rows.
   at::Tensor output(int64_t rows);
@@ -95,7 +99,7 @@ class OutChannel {
   // sequence number and its arrivals only once it is launched: a launch that
   // fails leaves the channel as it was.
   template <typename Args>
-  void launch(const void *kernel, bool forward, int ctas, Args &args);
+  void launch(const void *kernel, OutKernel which, int ctas, Args &args);
 
   Sizes sizes_;
   ncclWindow_t window_;

@@ -833,7 +833,7 @@ class Pair:
         self.hier = sharded_ec(self.hier_model)
         self.state = hier_of(self.hier)
         # The first input_dist() makes the EC's input dists and builds the op
-        # (collective): a part 1 nobody waits for, before the calls.
+        # (collective): a bucketize nobody waits for, before the calls.
         self.hier.input_dist(self.hier.create_context(), calls[0])
         self.ref_probe = Probe(self.ref, case.dim)
         self.hier_probe = Probe(self.hier, case.dim)
@@ -1019,7 +1019,7 @@ def run_case(
     failures = 0
     for iteration in range(3):
         if iteration == 1:
-            # A part 1 nobody waits for, and a first wait whose result is
+            # A bucketize nobody waits for, and a first wait whose result is
             # dropped (TorchRec's prefetch and eval pipelines do both).
             hier.input_dist(
                 hier.create_context(),
@@ -1559,20 +1559,22 @@ def orders_of(
     return failures
 
 
-def by_cell(case: Case, kjt: KeyedJaggedTensor, grad: torch.Tensor) -> torch.Tensor:
+def grad_in_key_order(
+    case: Case, kjt: KeyedJaggedTensor, grad: torch.Tensor
+) -> torch.Tensor:
     """The rows of the gradient of an owner's lookup output, ordered by
     (table, key, source column), and in KJT order within one (each comes
     once under index dedup, and across nodes in another node's column)."""
     num_features, num_sources = len(kjt.keys()), kjt.stride()
-    per_cell = kjt.lengths().view(-1)
+    lengths = kjt.lengths().view(-1)
     feature_tables = torch.tensor(
         [case.table_of[feature] for feature in kjt.keys()], device=grad.device
     )
     tables = torch.repeat_interleave(
-        feature_tables.repeat_interleave(num_sources), per_cell
+        feature_tables.repeat_interleave(num_sources), lengths
     )
     cols = torch.repeat_interleave(
-        torch.arange(num_sources, device=grad.device).repeat(num_features), per_cell
+        torch.arange(num_sources, device=grad.device).repeat(num_features), lengths
     )
     ids = (tables * (1 << 40) + kjt.values().long()) * num_sources + cols
     return grad[torch.argsort(ids, stable=True)]
@@ -1609,7 +1611,7 @@ def run_determinism(rank: int, world_size: int, local_size: int, log: Callable) 
                 for value in values
             )
             loss.backward()
-            grads.append(by_cell(case, probe.kjt, probe.grad))
+            grads.append(grad_in_key_order(case, probe.kjt, probe.grad))
         checks = {
             "op": on_op,
             "same gradient": grads[0].shape == grads[1].shape and torch.equal(*grads),

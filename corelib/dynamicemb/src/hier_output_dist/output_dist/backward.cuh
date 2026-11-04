@@ -146,9 +146,9 @@ __device__ __forceinline__ void scaled_copy_rows(const char *src, char *dst, int
 // in this rank's proxy_rows (`rows`), summed in fp32 in list order into acc:
 // rows of the key's type, or (Partial) a heavy key's fp32 partial rows, those
 // of requesters without one (kEntryNoPush) skipped. Each lane loads its entry
-// of each 32, the warp then 8 rows at a time.
+// of each 32, the warp then 8 rows at a time (only partials need the flag).
 template <typename RowT, bool Partial>
-__device__ __forceinline__ void sum_entries(const RowsLayout &rows, const int64_t *ent,
+__device__ __forceinline__ void sum_entries(const RowsLayout &rows, const ReducerEntry *ent,
                                             int64_t begin, int64_t end, int col, bool live,
                                             int lane, float *acc) {
   constexpr int kValues = Vec16<RowT>::kValues,
@@ -156,16 +156,17 @@ __device__ __forceinline__ void sum_entries(const RowsLayout &rows, const int64_
   bool any = false;
   for (int64_t block0 = begin; block0 < end; block0 += 32) {
     const int block_len = (int)min((int64_t)32, end - block0);
-    const uint64_t mine = lane < block_len ? (uint64_t)ent[block0 + lane] : 0;
+    const ReducerEntry mine = lane < block_len ? ent[block0 + lane] : ReducerEntry{0, 0};
     for (int i = 0; i < block_len; i += 8) {
       int4 vecs[8][kLoads];
       bool use[8];
 #pragma unroll
       for (int step = 0; step < 8; ++step) {
-        const uint64_t entry = __shfl_sync(kFull, mine, (i + step) & 31);
-        use[step] = i + step < block_len && (!Partial || (int32_t)(entry >> 32) != kEntryNoPush);
-        const int4 *src =
-            (const int4 *)rows.proxy_row((int64_t)(entry & ~kEntryPartial)) + col * kLoads;
+        ReducerEntry entry;
+        entry.slot = __shfl_sync(kFull, mine.slot, (i + step) & 31);
+        entry.flag = Partial ? __shfl_sync(kFull, mine.flag, (i + step) & 31) : 0;
+        use[step] = i + step < block_len && (!Partial || entry.flag != kEntryNoPush);
+        const int4 *src = (const int4 *)rows.proxy_row(entry.proxy_row()) + col * kLoads;
 #pragma unroll
         for (int load = 0; load < kLoads; ++load)
           vecs[step][load] = use[step] && live ? __ldcg(src + load) : make_int4(0, 0, 0, 0);
@@ -301,14 +302,14 @@ __device__ __forceinline__ const float *heavy_row_warp(const Sizes &sizes, const
 
 // Index dedup: heavy row sub-task `sub` sums kHeavy of its original rows
 // into an fp32 partial of its own, then counts itself done for its row. It
-// runs in its row's pass: `remote` for a row an owner on another node gets
+// runs in its row's pass: kRemote for a row an owner on another node gets
 // (through a proxy), whose push task adds up the row's sub-tasks; else for a
 // row of one of the node's owners, where the last of the row's sub-tasks to
 // end adds them up, in sub-task order, and writes the row into the owner's
 // lookup_rows. Every lane of the warp.
-template <typename RowT>
+template <typename RowT, bool kRemote>
 __device__ void heavy_sub_warp(const Sizes &sizes, const BwdArgs &args, const OutTables &tables,
-                               int64_t sub, bool remote, int lane) {
+                               int64_t sub, int lane) {
   constexpr int kValues = Vec16<RowT>::kValues;
   const BwdPlanView &plan = args.plan;
   const Fanout &fanout = plan.fanout;
@@ -317,7 +318,7 @@ __device__ void heavy_sub_warp(const Sizes &sizes, const BwdArgs &args, const Ou
                 row_end = fanout.exp_off[dedup_row + 1];
   const int32_t slot = fanout.slot[dedup_row], row = fanout.pos[slot];
   const int owner = tables.owner_of(row);
-  if ((owner / local_size != sizes.topo.node) != remote) return;
+  if ((owner / local_size != sizes.topo.node) != kRemote) return;
   const OutTimeline timeline{args.trace, local_size};
   const unsigned long long start = timeline.on() ? now_ns() : 0;
   const int64_t end = min(begin + kHeavy, row_end);
@@ -327,7 +328,7 @@ __device__ void heavy_sub_warp(const Sizes &sizes, const BwdArgs &args, const Ou
     sum_vec<RowT>(args.grad, fanout.exp_idx, begin, end, sizes.row_bytes, col, acc);
     store_fp32<kValues>(part, col, acc);
   }
-  if (remote) {
+  if constexpr (kRemote) {
     SubTaskDone{args.heavy_done + slot}.count_warp(lane);
     return;
   }
@@ -437,11 +438,11 @@ __device__ void group_sub_warp(const Sizes &sizes, const BwdArgs &args, int64_t 
 // over the original rows of deduplicated row `dedup_row`. Rows of one
 // original row (most) in one warp copy, those of 2..kHeavy then one at a
 // time, heavy ones from their sub-tasks' sums, or, rows of the node's owners
-// (`local`), not at all: their last sub-task writes them (heavy_sub_warp).
+// (kLocal), not at all: their last sub-task writes them (heavy_sub_warp).
 // Returns how many rows it wrote. Every lane of the warp.
-template <typename RowT>
+template <typename RowT, bool kLocal>
 __device__ int push_rows_warp(const Sizes &sizes, const BwdArgs &args, int64_t dedup_row, char *dst,
-                              int num_rows, bool local, int lane) {
+                              int num_rows, int lane) {
   const BwdPlanView &plan = args.plan;
   const Fanout &fanout = plan.fanout;
   const int row_bytes = sizes.row_bytes, vec = sizes.row_vecs(), dim = vec * Vec16<RowT>::kValues;
@@ -458,7 +459,7 @@ __device__ int push_rows_warp(const Sizes &sizes, const BwdArgs &args, int64_t d
     if (cnt == 1) src = args.grad + (int64_t)fanout.exp_idx[first_entry] * row_bytes;
   }
   scaled_copy_rows<RowT>(src, cnt <= 1 ? dst : nullptr, num_rows, vec, lane, args.scale);
-  const bool left = local && cnt > kHeavy;
+  const bool left = kLocal && cnt > kHeavy;
   for (unsigned many = __ballot_sync(kFull, cnt > 1 && !left); many; many &= many - 1) {
     const int src_lane = __ffs(many) - 1;
     const int64_t lane_begin = __shfl_sync(kFull, first_entry, src_lane);
@@ -588,7 +589,7 @@ __device__ __forceinline__ void push_rows_task_warp(const Sizes &sizes, int64_t 
     dst = tables.proxy_row(proxy, plan.dst[row]);
   }
   const unsigned long long start = timeline.on() ? now_ns() : 0;
-  push_rows_warp<RowT>(sizes, args, dedup_row, dst, num_rows, false, lane);
+  push_rows_warp<RowT, false>(sizes, args, dedup_row, dst, num_rows, lane);
   push_flag_warp(seq, tables, proxy, entry.flags + nth, lane);
   if (timeline.on() && lane == 0) {
     const unsigned long long bytes = (unsigned long long)num_rows * row_bytes;
@@ -618,7 +619,7 @@ __device__ __forceinline__ void local_push_warp(const Sizes &sizes, const BwdArg
     dst = tables.lookup_row(job.owner, plan.dst[row]);
   }
   const unsigned long long start = timeline.on() ? now_ns() : 0;
-  const int wrote = push_rows_warp<RowT>(sizes, args, dedup_row, dst, num_rows, true, lane);
+  const int wrote = push_rows_warp<RowT, true>(sizes, args, dedup_row, dst, num_rows, lane);
   if (timeline.on() && lane == 0) {
     const unsigned long long bytes = (unsigned long long)wrote * row_bytes;
     timeline.task(start, job.owner != me ? bytes : 0, job.owner != me ? 0 : bytes);
@@ -680,16 +681,16 @@ __device__ void ProxyReducer<RowT>::run(ncclWindow_t window, const Sizes &sizes,
     if (lane < num_keys) {
       begin = plan.reducer_start[uniq_lo + lane];
       end = plan.reducer_start[uniq_lo + lane + 1];
-      heavy = (int32_t)(plan.reducer_entries[begin] >> 32) == kEntryOwnRow;
+      heavy = plan.reducer_entries[begin].own_row();
       row = layout.rows.proxy_row(at + uniq_lo + lane - chunk.key_lo);
     }
     const int64_t ent_end = __shfl_sync(kFull, end, num_keys - 1);
     Spin spin(sizes.timeout_ns);
     for (int64_t i = __shfl_sync(kFull, begin, 0) + lane; i < ent_end; i += 32) {
-      const int32_t flag = (int32_t)(plan.reducer_entries[i] >> 32);
-      if (flag < 0) continue;  // kEntryNoPush, kEntryOwnRow: no push task
-      while ((int64_t)ld_acquire_sys(&flags[flag]) < seq)
-        spin.pause("pushed gradient rows", flag, uniq_lo, sizes.topo.rank);
+      const ReducerEntry entry = plan.reducer_entries[i];
+      if (!entry.pushed()) continue;  // kEntryNoPush, kEntryOwnRow: no push task
+      while ((int64_t)ld_acquire_sys(&flags[entry.flag]) < seq)
+        spin.pause("pushed gradient rows", entry.flag, uniq_lo, sizes.topo.rank);
     }
     __syncwarp();
     // The keys of several entries, each summed in fp32 in list order (a heavy
@@ -727,9 +728,16 @@ __device__ void ProxyReducer<RowT>::run(ncclWindow_t window, const Sizes &sizes,
 
 namespace bwd {
 
-// The bit of a chunk's ready counter that the issuer sets once the chunk's
-// puts are posted (only that lane reads it).
-constexpr int kChunkPutBit = 62;
+// A chunk's ready word (args.ready[chunk]): the keys of the chunk the
+// reducers have counted ready, and the bit kPostedBit, which the issuer sets
+// once the chunk's puts are posted (only that lane reads it).
+struct ChunkReady {
+  static constexpr int kPostedBit = 62;
+  uint64_t word;
+  __device__ int64_t keys() const { return (int64_t)(word & ((1ull << kPostedBit) - 1)); }
+  __device__ bool posted() const { return (word >> kPostedBit) != 0; }
+  __device__ uint64_t with_posted() const { return word | (1ull << kPostedBit); }
+};
 
 // The proxy's issuer in the backward (across nodes; the last warp of CTA 0,
 // whose lanes take the owner nodes in turn, so one QP each). As owner, each
@@ -813,8 +821,8 @@ __device__ void ProxyIssuer::run(ncclWindow_t window, const ncclDevComm &dev, co
           for (; seg_end < end && plan.put_list[seg_end].chunk == chunk; ++seg_end)
             keys += plan.put_list[seg_end].rows;
           uint64_t *ready = (uint64_t *)&args.ready[chunk];
-          const uint64_t word = ld_acquire_sys(ready);
-          if (!(word >> kChunkPutBit) && (int64_t)word >= keys) {
+          const ChunkReady state{ld_acquire_sys(ready)};
+          if (!state.posted() && state.keys() >= keys) {
             if (first) timeline.stamp_earliest(kTraceFirstPut);
             first = false;
             put.fence();
@@ -824,10 +832,10 @@ __device__ void ProxyIssuer::run(ncclWindow_t window, const ncclDevComm &dev, co
             }
             if (wraps) *layout.ctrl.posted(chunk % counters) += (uint64_t)(seg_end - seg_start);
             if (timeline.on()) timeline.posted((unsigned long long)keys);
-            *ready = word | (1ull << kChunkPutBit);
+            *ready = state.with_posted();
             moved = true;
           }
-          if (seg_start == done && (*ready >> kChunkPutBit)) done = seg_end;
+          if (seg_start == done && ChunkReady{*ready}.posted()) done = seg_end;
           seg_start = seg_end;
         }
       }
@@ -840,7 +848,7 @@ __device__ void ProxyIssuer::run(ncclWindow_t window, const ncclDevComm &dev, co
     // the rows of the stream they free.
     if (wraps && lane == 0) {
       while (read < count) {
-        if (!(((volatile uint64_t *)args.ready)[read] >> kChunkPutBit)) break;
+        if (!ChunkReady{((volatile uint64_t *)args.ready)[read]}.posted()) break;
         const int64_t counter = read % counters;
         if (rows.readCounter((int)counter) < *layout.ctrl.posted(counter)) break;
         ++read;
@@ -1097,7 +1105,7 @@ __global__ void __launch_bounds__(kThreads, 1)
       cta_sync(workers);
     }
     pass_entry_barrier(window, sizes, seq, timeline, workers);
-    const int64_t *node_block_start = plan.block_start + node * local_size;
+    const int64_t *node_offset_per_bucket = plan.offset_per_bucket + node * local_size;
     // Every heavy row's sub-task has a slot before the remote tasks (across
     // nodes), which those of rows to other nodes take, and one among the row
     // tasks, which those of the node's rows take.
@@ -1107,12 +1115,12 @@ __global__ void __launch_bounds__(kThreads, 1)
                   remote =
                       subs +
                       (num_nodes > 1 ? plan.bwd_task_starts[2 * plan.max_chunks * local_size] : 0);
-    const LocalRows local_rows{node_block_start, local_size, me};
+    const LocalRows local_rows{node_offset_per_bucket, local_size, me};
     const int64_t rows = local_rows.count(), total = remote + rows + heavy_subs;
     const TaskQueue queue{tables.layout().ctrl.task(kQueueWork)};
     for (int64_t task = queue.next_warp(); task < total; task = queue.next_warp()) {
       if (task < early_subs) {
-        bwd::heavy_sub_warp<RowT>(sizes, args, tables, task, true, lane);
+        bwd::heavy_sub_warp<RowT, true>(sizes, args, tables, task, lane);
         continue;
       }
       if (task < subs) {
@@ -1130,7 +1138,7 @@ __global__ void __launch_bounds__(kThreads, 1)
       }
       int64_t index;
       if (Interleave{rows, heavy_subs}.is_sub(task - remote, index)) {
-        bwd::heavy_sub_warp<RowT>(sizes, args, tables, index, false, lane);
+        bwd::heavy_sub_warp<RowT, false>(sizes, args, tables, index, lane);
         continue;
       }
       bwd::local_push_warp<RowT>(sizes, args, tables, local_rows, index, lane);
