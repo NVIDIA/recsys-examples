@@ -210,6 +210,7 @@ class TestJaggedGPTLayerCorrectness:
 
         torch.testing.assert_close(test_out, ref_out, atol=5e-2, rtol=5e-2)
 
+
 @pytest.mark.skipif(not HAS_FLASH_ATTN, reason="flash_attn not installed")
 class TestJaggedGPTLayerBackward:
     """Verify gradients flow correctly."""
@@ -443,16 +444,12 @@ class TestJaggedTransformerBlockVsPadded:
         # Run A alone
         offsets_a = torch.tensor([0, 5], device="cuda")
         with torch.no_grad():
-            out_a = block(
-                seq_a, cu_seqlens=offsets_a.to(torch.int32), max_seqlen=5
-            )
+            out_a = block(seq_a, cu_seqlens=offsets_a.to(torch.int32), max_seqlen=5)
 
         # Run B alone
         offsets_b = torch.tensor([0, 7], device="cuda")
         with torch.no_grad():
-            out_b = block(
-                seq_b, cu_seqlens=offsets_b.to(torch.int32), max_seqlen=7
-            )
+            out_b = block(seq_b, cu_seqlens=offsets_b.to(torch.int32), max_seqlen=7)
 
         torch.testing.assert_close(out_ab[:5], out_a, atol=1e-3, rtol=1e-3)
         torch.testing.assert_close(out_ab[5:], out_b, atol=1e-3, rtol=1e-3)

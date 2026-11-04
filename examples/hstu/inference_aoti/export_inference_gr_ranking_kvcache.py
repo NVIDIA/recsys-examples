@@ -72,6 +72,7 @@ torch.set_warn_always(False)
 SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_EXPORT_DIR = SCRIPT_DIR / "hstu_gr_ranking_kvcache_model"
 DEFAULT_DUMP_DIR = SCRIPT_DIR / "export_test_dump"
+DYNAMIC_EMBEDDING_GPU_CACHE_SIZE = 4 << 30
 
 
 def start_flexkv_server(
@@ -186,6 +187,7 @@ def cleanup_single_rank_distributed():
 
 def get_inference_dataset_and_embedding_configs(
     disable_contextual_features: bool = False,
+    host_embeddings: bool = False,
 ):
     sys.path.append("./training/")
     from trainer.utils import create_embedding_configs, get_dataset_and_embedding_args
@@ -198,17 +200,11 @@ def get_inference_dataset_and_embedding_configs(
     )
 
     if dataset_args.dataset_name == "kuairand-1k":
+        from modules.exportable_embedding import (
+            create_kuairand_embedding_collection_configs,
+        )
+
         HASH_SIZE = 1000_064
-        dynamic_table_configs = {
-            "user_id": True,
-            "user_active_degree": False,
-            "follow_user_num_range": False,
-            "fans_user_num_range": False,
-            "friend_user_num_range": False,
-            "register_days_range": False,
-            "video_id": True,
-            "action_weights": False,
-        }
         trained_emb_table_sizes = {
             "user_id": 1000,
             "user_active_degree": 8,
@@ -219,15 +215,18 @@ def get_inference_dataset_and_embedding_configs(
             "video_id": HASH_SIZE,
             "action_weights": 233,
         }
-        for idx, config in enumerate(embedding_configs):
+        for config in embedding_configs:
             config.vocab_size = trained_emb_table_sizes[config.table_name]
-            config.use_dynamic = dynamic_table_configs[config.table_name]
+        embedding_collection_configs = create_kuairand_embedding_collection_configs(
+            dynamic_gpu_cache_size=DYNAMIC_EMBEDDING_GPU_CACHE_SIZE,
+            use_host=host_embeddings,
+        )
         return (
             dataset_args,
             embedding_configs
             if not disable_contextual_features
             else embedding_configs[-2:],
-            dynamic_table_configs,
+            embedding_collection_configs,
             trained_emb_table_sizes,
         )
 
@@ -347,7 +346,7 @@ def make_export_kvcache_config(
 
 
 def get_exportable_model_for_inference(
-    dynamic_table_configs,
+    embedding_collection_configs,
     trained_emb_table_sizes,
     checkpoint_dir,
     max_batch_size,
@@ -356,12 +355,18 @@ def get_exportable_model_for_inference(
     kvcache_config_file: Optional[str] = None,
 ):
     from dynamicemb.exportable_tables import apply_inference_embedding_collection
-    from modules.exportable_embedding import apply_inference_sparse
+    from modules.exportable_embedding import (
+        apply_inference_sparse,
+        checkpoint_table_capacities,
+    )
 
+    trained_emb_table_sizes = checkpoint_table_capacities(
+        checkpoint_dir, embedding_collection_configs, trained_emb_table_sizes
+    )
     model = get_training_gr_model()
     model = apply_inference_embedding_collection(
         model,
-        dynamic_table_configs=dynamic_table_configs,
+        embedding_collection_configs=embedding_collection_configs,
         trained_emb_table_sizes=trained_emb_table_sizes,
     )
     inference_hstu_config = make_inference_hstu_config(
@@ -410,6 +415,7 @@ def export_inference_gr_ranking(
     kvcache_config_file: Optional[str] = None,
     export_dir_: str | os.PathLike[str] = DEFAULT_EXPORT_DIR,
     dump_dir_: str | os.PathLike[str] = DEFAULT_DUMP_DIR,
+    host_embeddings: bool = False,
 ):
     export_dir, dump_dir = prepare_output_directories(export_dir_, dump_dir_)
     generation = imported_nve_generation()
@@ -449,9 +455,9 @@ def export_inference_gr_ranking(
     (
         dataset_args,
         _,
-        dynamic_table_configs,
+        embedding_collection_configs,
         trained_emb_table_sizes,
-    ) = get_inference_dataset_and_embedding_configs()
+    ) = get_inference_dataset_and_embedding_configs(host_embeddings=host_embeddings)
 
     dataproc = get_common_preprocessors("")[dataset_args.dataset_name]
     num_contextual_features = len(dataproc._contextual_feature_names)
@@ -485,7 +491,7 @@ def export_inference_gr_ranking(
 
         try:
             model = get_exportable_model_for_inference(
-                dynamic_table_configs,
+                embedding_collection_configs,
                 trained_emb_table_sizes,
                 checkpoint_dir,
                 config_max_batch_size,
@@ -670,15 +676,7 @@ def export_inference_gr_ranking(
                 export_dir,
                 dynamic_shapes=dynamic_shapes,
             )
-            print(f"[INFO] Exported and packaged the model to:")
-            print(f"       {export_dir}/")
-            print(
-                "       ├── model.pt2                  # AOT-compiled model package for AOTIModelPackageLoader"
-            )
-            print(
-                "       ├── metadata.json              # NVE layer metadata (id, num_embeddings, emb_size, etc.)"
-            )
-            print("       └── weights/*.nve              # NVE weight data (LinearUVM)")
+            print("[INFO] Exported the model package and NVE resources")
 
             # === Test Compiled Model ===
             aoti_model_runtime, nve_layers = load_aoti(
@@ -781,6 +779,11 @@ if __name__ == "__main__":
     parser.add_argument("--gin_config_file", type=str, required=True)
     parser.add_argument("--checkpoint_dir", type=str, required=True)
     parser.add_argument("--disable_auc", action="store_true")
+    parser.add_argument(
+        "--host_embeddings",
+        action="store_true",
+        help="Store and look up embeddings on the host; keep HSTU on CUDA.",
+    )
     parser.add_argument("--max_bs", type=int, default=8)
     parser.add_argument(
         "--kvcache_config_file",
@@ -814,6 +817,7 @@ if __name__ == "__main__":
 
     export_inference_gr_ranking(
         checkpoint_dir=args.checkpoint_dir,
+        host_embeddings=args.host_embeddings,
         export_dir_=args.export_dir,
         dump_dir_=args.dump_dir,
         max_bs=args.max_bs,

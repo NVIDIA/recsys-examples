@@ -105,7 +105,9 @@ def train_step(
     table that takes a score per key), or ``score`` for the table -- one number for every
     table, or a dict by table name. Whatever an erase is doing, each key must read its own
     initial value."""
-    per_feature = [list(k) for k in keys] if isinstance(keys[0], (list, tuple)) else [list(keys)]
+    per_feature = (
+        [list(k) for k in keys] if isinstance(keys[0], (list, tuple)) else [list(keys)]
+    )
     if isinstance(score, dict):
         module.set_score(score)
     elif score is not None:
@@ -159,7 +161,9 @@ def found(
     state = (module.cache if cache else module._storage)._state
     keys = torch.as_tensor(keys, dtype=torch.int64, device=device)
     arg = ScoreArg(name=state.score_policy.name, value=None, policy=ScorePolicy.CONST)
-    _, founds, _ = state.key_index_map.lookup(keys, torch.full_like(keys, table_id), arg)
+    _, founds, _ = state.key_index_map.lookup(
+        keys, torch.full_like(keys, table_id), arg
+    )
     return founds
 
 

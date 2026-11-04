@@ -25,8 +25,8 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from dynamicemb import DynamicEmbScoreStrategy as S
 from dynamicemb import (
-    DynamicEmbScoreStrategy as S,
     DynamicEmbTableOptions,
     ProbabilisticAdmissionStrategy,
     ScoredKeyedJaggedTensor,

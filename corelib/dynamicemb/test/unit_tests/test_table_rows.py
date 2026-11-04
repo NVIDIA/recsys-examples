@@ -280,9 +280,7 @@ def test_row_limit_is_asserted_on_the_device():
         torch.cuda.synchronize()
         """
     )
-    run = subprocess.run(
-        [sys.executable, "-c", script], capture_output=True, text=True
-    )
+    run = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True)
     assert run.returncode != 0
     assert "row_limits" in run.stderr, run.stderr[-2000:]
 

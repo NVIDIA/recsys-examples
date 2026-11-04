@@ -362,7 +362,6 @@ class Storage(abc.ABC, Generic[OptionsT, OptimizerT]):
         scalar cannot describe an optimizer whose state regions start at
         different values.
         """
-        pass
 
     @abc.abstractmethod
     def export_keys_values(
