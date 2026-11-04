@@ -8,7 +8,7 @@
 namespace dynamicemb::exportable_embedding {
 
 // Construct the derived type from the outset: no casts of stock objects and no
-// replacement cache. NVE 26.10 already supports tier selection below its binding.
+// replacement cache. NVE 26.06+ supports tier selection below its binding.
 template <class StockBinding>
 class TierUpdateBinding : public StockBinding {
  public:

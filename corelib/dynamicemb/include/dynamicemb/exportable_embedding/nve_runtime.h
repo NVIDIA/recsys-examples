@@ -25,9 +25,9 @@ struct NveRuntimeLayer {
   at::Tensor marker;
 };
 
-// Reconstructs the PR's NVE 26.10 v2 packages with local tier-capable bindings.
+// Reconstructs NVE v2 packages (26.06+) with local tier-capable bindings.
 // Own this directory until after the AOTI loader is destroyed. Host keeps its
-// stock implementation (including the separate concurrent-row NVE patch).
+// stock implementation and requires NVE 26.09+ for zero-filled misses.
 class DYNAMICEMB_EXPORT NveRuntimeDirectory {
  public:
   NveRuntimeDirectory(const std::string& package_dir, int device_index);

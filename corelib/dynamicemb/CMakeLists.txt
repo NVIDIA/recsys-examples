@@ -121,7 +121,7 @@ install(TARGETS inference_emb_ops
 
 option(DYNAMICEMB_ENABLE_NVE_UPDATE "Build the NVE incremental update subscriber" ON)
 
-# Unset selects the repository NVE (26.07 or later); set 26.05 explicitly for compatibility.
+# Unset selects the repository NVE (26.06 or later); set 26.05 explicitly for compatibility.
 if(DYNAMICEMB_ENABLE_NVE_UPDATE AND (
     NOT DEFINED NVE_VERSION
     OR NVE_VERSION STREQUAL ""
@@ -204,7 +204,7 @@ endif()
 add_library(dynamicemb_exportable_embedding_python MODULE
     ${EXPORTABLE_EMBEDDING_PYBIND_SOURCES}
 )
-# NVE 26.05 must never dlopen the default extension's NVE 26.10 dependencies.
+# NVE 26.05 must never dlopen the default extension's modern NVE dependencies.
 # Both modules share the same indexer operators; only _C links the update runtime.
 add_library(dynamicemb_exportable_embedding_legacy_python MODULE
     ${EXPORTABLE_EMBEDDING_INDEXER_SOURCES}

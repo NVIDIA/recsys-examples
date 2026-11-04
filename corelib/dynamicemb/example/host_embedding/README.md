@@ -38,6 +38,12 @@ misses return zero. A full checkpoint load includes every saved shard.
 
 ## Build and run
 
+Host collections support NVE 26.09 and later; zero-filled misses require the
+26.09 Python binding. Earlier Host bounds checks do not provide that behavior.
+Compatible later releases use the same path. Rebuild the native adapter against
+matching NVE headers and libraries when changing versions; see
+[NVE compatibility and rebuild requirements](../../docs/nve_tier_updates.md).
+
 Use the repository-pinned official NVE 26.10 build (`803e278`)
 and the repository's inference bindings. For a machine without an
 NVIDIA driver, build NVE with `PYNVE_DRIVERLESS_BUILD=1 PYNVE_DISABLE_MPI=1`

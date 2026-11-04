@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Local tier bindings must work against unmodified NVE 26.10."""
+"""Local tier bindings must work against the installed, unmodified NVE."""
 
 import os
 import subprocess

@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 from typing import Any, Optional
@@ -40,13 +41,25 @@ def register_nve_export_compat() -> None:
         )
 
 
+def _check_nve_layer_support(*, host: bool = False, pooled: bool = False) -> None:
+    generation = imported_nve_generation()
+    # Host needs 26.07 per-thread contexts and 26.09 zero-filled misses: Identity
+    # forwards raw IDs, so bounds checks alone (26.08) are not enough.
+    if host and generation < (26, 9):
+        raise ValueError("HostLayer requires NVE 26.09 or later (zero-filled misses)")
+    # NVE 26.06 passes the wrong CSR offset count to its pooling kernels.
+    if pooled and generation == (26, 6):
+        raise ValueError(
+            "Pooled collections require NVE 26.07 or later (or legacy 26.05)"
+        )
+
+
 def _nve_layer_constructor_kwargs(
     nve_layer_type: str, *, storage: Optional[Any] = None
 ) -> dict[str, object]:
     import pynve.torch.nve_layers as nve_layers
 
-    if nve_layer_type == "host" and imported_nve_generation() < (26, 10):
-        raise ValueError("HostLayer requires NVE 26.10 or later")
+    _check_nve_layer_support(host=nve_layer_type == "host")
     if imported_nve_generation() == (26, 5):
         layer_type = {
             "gpu": nve_layers.CacheType.NoCache,
@@ -84,6 +97,9 @@ def create_nve_layer(
 ) -> torch.nn.Module:
     import pynve.torch.nve_layers as nve_layers
 
+    _check_nve_layer_support(
+        host=config.nve_layer_type == "host", pooled=pooling_mode != -1
+    )
     if pooling_mode == -1:
         layer_class = nve_layers.NVEmbedding
         pooling_args: dict[str, Any] = {}
@@ -107,7 +123,7 @@ def create_nve_layer(
     if config.nve_layer_type == "hierarchical":
         kwargs["host_cache_size"] = config.host_cache_size
     if (
-        imported_nve_generation() == (26, 10)
+        imported_nve_generation() >= (26, 6)
         and config.nve_layer_type != "host"
         and hasattr(_C, "register_nve_tier_bindings")
     ):
@@ -147,6 +163,14 @@ def load_embedding_collection_aot(
     package_dir: str | os.PathLike[str], device: torch.device
 ) -> tuple[Any, list[Any], Any]:
     package_dir = os.fspath(Path(package_dir).resolve())
+    if (26, 6) <= imported_nve_generation() < (26, 9):
+        with open(os.path.join(package_dir, "metadata.json")) as file:
+            metadata = json.load(file)
+        for layer in metadata["layers"]:
+            _check_nve_layer_support(
+                host=layer["layer_type"] == "HostLayer",
+                pooled=layer.get("is_bag", False) and layer.get("mode") != "concat",
+            )
     if imported_nve_generation() == (26, 5):
         from pynve.torch.nve_export import load_nve_layers
         from torch._C._aoti import AOTIModelPackageLoader
@@ -160,18 +184,18 @@ def load_embedding_collection_aot(
             1,
             device.index if device.index is not None else torch.cuda.current_device(),
         )
-    elif imported_nve_generation() == (26, 10) and hasattr(
+    elif imported_nve_generation() >= (26, 6) and hasattr(
         _C, "register_nve_tier_bindings"
     ):
         from .nve_tier import load_tier_aot
 
         loader, layers = load_tier_aot(package_dir, device)
-    elif imported_nve_generation() == (26, 10):
+    elif imported_nve_generation() >= (26, 6):
         from pynve.torch.nve_export import load_aot
 
         loader, layers = load_aot(package_dir, device=device)
     else:
-        raise ValueError("Exportable collection replay supports NVE 26.05 or 26.10")
+        raise ValueError("Exportable collection replay requires NVE 26.05 or later")
 
     indexers = load_embedding_collection_indexers(package_dir, device)
     indexers.bind_aoti(loader)
