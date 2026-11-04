@@ -464,8 +464,8 @@ def _print_memory_consume(
     The caller passes the ``StorageLayout`` set by ``_create_cache_storage`` so
     the report matches the code path that ran (no inference from buffer state).
     Per-tier bytes come from the constructed ``ExtendableBuffer`` (init) and
-    ``options.max_capacity`` (peak), capturing bucket alignment, each table's
-    HBM-budget share of its rows, and caching's HBM/backing duplication. Does
+    ``options.max_capacity`` (peak), capturing bucket alignment, hybrid
+    ``cap_scale`` rebalancing, and caching's HBM/backing duplication. Does
     *not* include hash-table metadata (keys/digests/scores/ref_counter), which
     always live on HBM regardless of value tier.
     """
@@ -856,22 +856,13 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
             option.dim + self._optimizer.get_state_dim(option.dim)
             for option in self._dynamicemb_options
         ]
-        table_bytes = [
+        total_memory = sum(
             option.max_capacity * DTYPE_NUM_BYTES[option.embedding_dtype] * value_dim
             for option, value_dim in zip(self._dynamicemb_options, value_dims)
-        ]
-        total_memory = sum(table_bytes)
+        )
         local_hbm = sum(
             option.local_hbm_for_values for option in self._dynamicemb_options
         )
-        # The layout is chosen for the group (above, from the sums), but when it
-        # splits rows between HBM and the next tier each table keeps the share
-        # its own budget buys: a budget the planner gave one table is not
-        # spread over its groupmates, nor is a spare one lent to them.
-        hbm_fractions = [
-            min(1.0, option.local_hbm_for_values / nbytes) if nbytes > 0 else 1.0
-            for option, nbytes in zip(self._dynamicemb_options, table_bytes)
-        ]
 
         if total_memory > local_hbm:
             # Data does not fit entirely in HBM.
@@ -883,9 +874,10 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                     )
 
                 cache_options = deepcopy(self._dynamicemb_options)
-                for cache_option, frac in zip(cache_options, hbm_fractions):
+                cap_scale = local_hbm / total_memory if total_memory > 0 else 1.0
+                for cache_option in cache_options:
                     cache_option.bucket_capacity = 1024
-                    cap = max(1, int(cache_option.max_capacity * frac))
+                    cap = max(1, int(cache_option.max_capacity * cap_scale))
                     cache_option.max_capacity = min(cache_option.max_capacity, cap)
                     cache_option.init_capacity = min(cache_option.max_capacity, cap)
 
@@ -961,17 +953,20 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                             "Set caching=True to use external storage.",
                             UserWarning,
                         )
+                    cap_scale = local_hbm / total_memory if total_memory > 0 else 1.0
+
                     hbm_options = deepcopy(self._dynamicemb_options)
-                    for hbm_option, frac in zip(hbm_options, hbm_fractions):
+                    for hbm_option in hbm_options:
                         hbm_option.bucket_capacity = 1024
-                        cap = max(1, int(hbm_option.max_capacity * frac))
+                        cap = max(1, int(hbm_option.max_capacity * cap_scale))
                         hbm_option.max_capacity = min(hbm_option.max_capacity, cap)
                         hbm_option.init_capacity = hbm_option.max_capacity
 
+                    storage_cap_scale = 1.0 - cap_scale
                     host_options = deepcopy(self._dynamicemb_options)
-                    for host_option, frac in zip(host_options, hbm_fractions):
+                    for host_option in host_options:
                         host_option.local_hbm_for_values = 0
-                        cap = max(1, int(host_option.max_capacity * (1.0 - frac)))
+                        cap = max(1, int(host_option.max_capacity * storage_cap_scale))
                         host_option.max_capacity = min(host_option.max_capacity, cap)
                         host_option.init_capacity = min(host_option.init_capacity, cap)
 
