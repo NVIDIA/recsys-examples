@@ -25,6 +25,10 @@ import torch.distributed as dist
 import torchrec
 from dynamicemb import DynamicEmbTableOptions
 from dynamicemb.dump_load import find_sharded_modules, get_dynamic_emb_module
+from dynamicemb.dynamicemb_config import (
+    DEFAULT_BUCKET_CAPACITY,
+    _global_bucket_layout_rows,
+)
 from dynamicemb.key_ownership import owned_key_mask
 from dynamicemb.key_value_table import Storage
 from dynamicemb.planner import (
@@ -533,15 +537,31 @@ class ConstructTwinModule:
             indices = result["indices"]
             values = result["values"]
 
+            # Get the dimension for this feature
+            feature_idx = self._feature_names.index(feature)
+            dim = self._dims[feature_idx]
+
+            # The same rule the planner gave the table: hash_bucket needs
+            # the whole table's capacity, which get_planner's options derive
+            # from num_embeddings and the default bucket capacity.
+            global_capacity = None
+            if self._dist_type == "hash_bucket":
+                layout = _global_bucket_layout_rows(
+                    self._num_embeddings[feature_idx] * self._scale_factor,
+                    DEFAULT_BUCKET_CAPACITY,
+                )
+                global_capacity = layout[0] * layout[1] if layout is not None else None
             mask = owned_key_mask(
-                indices, self._rank, self._world_size, self._dist_type
+                indices,
+                self._rank,
+                self._world_size,
+                self._dist_type,
+                global_capacity=global_capacity,
+                bucket_capacity=DEFAULT_BUCKET_CAPACITY,
             )
             if mask is None:
                 mask = torch.ones_like(indices, dtype=torch.bool)
             filtered_indices = indices[mask]
-
-            # Get the dimension for this feature
-            dim = self._dims[self._feature_names.index(feature)]
 
             # Reshape values to [num_indices, dim]
             values = values.reshape(-1, dim)

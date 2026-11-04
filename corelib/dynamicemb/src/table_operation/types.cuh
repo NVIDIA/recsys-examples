@@ -564,13 +564,14 @@ template <typename BucketType_> struct LinearBucketTable {
   // from the raw pointers in EvictParams. Just member init -- safe on both.
   __host__ __device__ LinearBucketTable()
       : storage_(nullptr), num_buckets_(0), bucket_capacity_(0),
-        num_scores_(1) {}
+        num_scores_(1), global_capacities_(nullptr) {}
 
-  __host__ __device__ LinearBucketTable(uint8_t *storage, uint64_t num_buckets,
-                                        int64_t bucket_capacity,
-                                        int64_t num_scores = 1)
+  __host__ __device__ LinearBucketTable(
+      uint8_t *storage, uint64_t num_buckets, int64_t bucket_capacity,
+      int64_t num_scores = 1, int64_t const *global_capacities = nullptr)
       : storage_(storage), num_buckets_(num_buckets),
-        bucket_capacity_(bucket_capacity), num_scores_(num_scores) {}
+        bucket_capacity_(bucket_capacity), num_scores_(num_scores),
+        global_capacities_(global_capacities) {}
 
   static __device__ __forceinline__ int64_t hash(uint64_t key) {
     return BucketType::hash(key);
@@ -593,6 +594,36 @@ template <typename BucketType_> struct LinearBucketTable {
 
   __device__ __forceinline__ int64_t num_scores() const { return num_scores_; }
 
+  // Home bucket of `hashcode` inside logical table `t_id`.
+  //
+  // Writes the table's first bucket and its row capacity, and -- when the
+  // table has buckets -- the bucket id. The key's global bucket is
+  // `(hashcode % global_cap) / bucket_capacity`, where `global_cap` is the
+  // capacity of the *whole* logical table across every shard
+  // (`global_capacities_[t_id]`), so the set of keys that share a bucket does
+  // not depend on how many shards the table is split over. This rank's slice
+  // of that bucket range is `[r*nb, (r+1)*nb)`, hence the `% nb`, which also
+  // keeps a mis-routed key in range. When no global capacity is given
+  // (`global_capacities_ == nullptr` or a non-positive entry) `global_cap`
+  // is the table's own capacity, `g < nb`, and the result is bit-identical to
+  // `bkt_begin + (hashcode % table_cap) / bucket_capacity`.
+  __device__ __forceinline__ void
+  home_bucket(int64_t const *__restrict__ table_bucket_offsets, int64_t t_id,
+              int64_t hashcode, int64_t *bucket_id, int64_t *bkt_begin,
+              int64_t *table_cap) const {
+    *bkt_begin = table_bucket_offsets[t_id];
+    int64_t nb = table_bucket_offsets[t_id + 1] - *bkt_begin;
+    *table_cap = nb * bucket_capacity_;
+    if (nb <= 0)
+      return;
+    int64_t global_cap =
+        global_capacities_ != nullptr ? global_capacities_[t_id] : 0;
+    if (global_cap <= 0)
+      global_cap = *table_cap;
+    int64_t g = (hashcode % global_cap) / bucket_capacity_;
+    *bucket_id = *bkt_begin + g % nb;
+  }
+
   __device__ __forceinline__ BucketType get_bucket(KeyType key) const {
     auto hashcode = hash(key);
     auto idx = hashcode / bucket_capacity_;
@@ -605,6 +636,9 @@ template <typename BucketType_> struct LinearBucketTable {
   uint64_t num_buckets_;
   int64_t bucket_capacity_;
   int64_t num_scores_;
+  // Per logical table: capacity (rows) of the whole table across all shards,
+  // or nullptr / <= 0 for "this table's own capacity". See home_bucket().
+  int64_t const *__restrict__ global_capacities_;
 };
 
 } // namespace dyn_emb

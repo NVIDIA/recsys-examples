@@ -90,6 +90,13 @@ enum class DistType : int32_t {
   // exchange for not caring what structure the key space has.  Python calls it
   // "hash_roundrobin".
   kHashedCyclic = 2,
+  // rank = ((murmur3_fmix64(key) & INT64_MAX) % global_capacity) / shard_capacity:
+  // the key's *global* hash bucket decides the rank, so the keys that share a
+  // bucket do not depend on the world size and a checkpoint reloads at another
+  // world size without a bucket overflowing (see hashed_shard in
+  // sparse_block_bucketize_features.cu and LinearBucketTable::home_bucket).
+  // Python calls it "hash_bucket".
+  kHashedBucket = 3,
 };
 
 #define CASE_TYPE_USING_HINT(enum_type, type, HINT, ...)                       \
