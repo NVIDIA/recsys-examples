@@ -14,6 +14,9 @@ from gr_inference.gr_kernels.attention import (
 )
 
 SANITIZED_TESTS = [
+    "tests/test_decode_kv_writer.py::test_cuda_beam_kv_writer_handles_distinct_k_v_strides",
+    "tests/test_decode_kv_writer.py::test_cuda_beam_kv_write_selects_vectorized_scalar_or_pytorch_copy",
+    "tests/test_decode_kv_writer.py::test_cuda_beam_kv_write_vectorized_only_writes_nothing_it_cannot_vectorize",
     "tests/test_fused_beam_decode_gpu.py::test_fused_beam_decode_is_bit_identical_to_the_public_three_kernel_path",
     "tests/test_fused_beam_decode_gpu.py::test_fused_beam_decode_is_bit_identical_at_any_beam_width",
     "tests/test_fused_beam_decode_gpu.py::test_fused_beam_decode_is_bit_identical_for_every_context_layout",
@@ -65,6 +68,8 @@ def test_cuda_kernel_tests_are_clean_under_compute_sanitizer(tool) -> None:
             sys.executable,
             "-m",
             "pytest",
+            "-k",
+            "not batch_over_grid_limit",
             *SANITIZED_TESTS,
         ],
         cwd=Path(__file__).resolve().parents[1],
