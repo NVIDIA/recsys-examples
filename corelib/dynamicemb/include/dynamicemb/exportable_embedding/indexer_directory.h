@@ -3,8 +3,6 @@
 
 #pragma once
 
-#include <cuda_runtime_api.h>
-
 #include <cstdint>
 #include <functional>
 #include <memory>

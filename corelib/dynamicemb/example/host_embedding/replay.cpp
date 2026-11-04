@@ -9,7 +9,9 @@
 #endif
 #include <iostream>
 #include <torch/torch.h>
+#ifdef DYNAMICEMB_WITH_CUDA
 #include <c10/cuda/CUDAGuard.h>
+#endif
 #include <torch/csrc/inductor/aoti_package/model_package_loader.h>
 #include "dynamicemb/exportable_embedding/indexer_directory.h"
 #include "python/pynve/torch_bindings/nve_loader.hpp"
@@ -20,8 +22,12 @@ int main(int argc, char** argv) {
     const std::string package = argv[1];
     const int index = std::stoi(argv[2]);
     const auto device = index < 0 ? torch::Device(torch::kCPU) : torch::Device(torch::kCUDA, index);
+#ifdef DYNAMICEMB_WITH_CUDA
     c10::cuda::OptionalCUDAGuard guard;
     if (index >= 0) guard.set_index(index);
+#else
+    TORCH_CHECK(index < 0, "This replay build supports only CPU HostLayer packages");
+#endif
     // Resource owners must outlive the AOTI loader's user-managed constants.
     auto resources = std::make_shared<nve::ResourceDirectory>();
     std::unique_ptr<nve::LayerDirectory> layers;

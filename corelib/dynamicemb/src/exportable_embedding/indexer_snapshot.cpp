@@ -3,7 +3,9 @@
 
 #include "dynamicemb/exportable_embedding/indexer_snapshot.h"
 
+#ifdef DYNAMICEMB_WITH_CUDA
 #include <ATen/cuda/CUDAContext.h>
+#endif
 
 #include <atomic>
 #include <cstring>
@@ -41,15 +43,19 @@ struct SnapshotHeader {
 struct PendingSnapshot {
   std::shared_ptr<IndexerSnapshot> next;
   std::shared_ptr<IndexerSnapshot> retired;
+#ifdef DYNAMICEMB_WITH_CUDA
   cudaEvent_t retirement_event{};
+#endif
   std::atomic<bool> published{false};
   std::shared_ptr<PendingSnapshot> superseded_by;
 
   ~PendingSnapshot() {
+#ifdef DYNAMICEMB_WITH_CUDA
     // Earlier waiters may share this completion after its own ID is acknowledged.
     if (retirement_event != nullptr) {
       cudaEventDestroy(retirement_event);
     }
+#endif
   }
 };
 
@@ -128,6 +134,10 @@ std::shared_ptr<RegistryEntry> find_registered_entry(
 template <typename T>
 at::Tensor read_tensor(std::ifstream& stream, uint64_t count,
                        at::ScalarType dtype, int device_index) {
+#ifndef DYNAMICEMB_WITH_CUDA
+  TORCH_CHECK(device_index < 0,
+              "This inference_emb_ops build has no CUDA; load snapshots on CPU");
+#endif
   const auto device = device_index < 0 ? torch::Device(torch::kCPU)
                                       : torch::Device(torch::kCUDA, device_index);
   if (count == 0) {
@@ -249,10 +259,12 @@ void stage_indexer_snapshot(const at::Tensor& marker,
   auto entry = find_registered_entry(marker);
   auto pending = std::make_shared<PendingSnapshot>();
   pending->next = std::move(snapshot);
+#ifdef DYNAMICEMB_WITH_CUDA
   if (cudaEventCreateWithFlags(&pending->retirement_event,
                                cudaEventDisableTiming) != cudaSuccess) {
     throw std::runtime_error("Failed to create indexer retirement event");
   }
+#endif
   {
     std::lock_guard<std::mutex> lock(entry->updates_mutex);
     TORCH_CHECK(entry->updates.emplace(snapshot_id, pending).second,
@@ -287,7 +299,9 @@ void wait_for_indexer_snapshot_retirement(const at::Tensor& marker,
       std::this_thread::yield();
     }
   }
+#ifdef DYNAMICEMB_WITH_CUDA
   cudaEventSynchronize(completion->retirement_event);
+#endif
   {
     std::lock_guard<std::mutex> lock(entry->updates_mutex);
     entry->updates.erase(snapshot_id);
@@ -303,11 +317,13 @@ std::shared_ptr<IndexerSnapshot> find_indexer_snapshot(
   }
   if (pending != nullptr) {
     auto next = pending->next;
+#ifdef DYNAMICEMB_WITH_CUDA
     const auto stream =
         at::cuda::getCurrentCUDAStream(marker.get_device()).stream();
     if (cudaEventRecord(pending->retirement_event, stream) != cudaSuccess) {
       throw std::runtime_error("Failed to record indexer retirement event");
     }
+#endif
     auto retired = std::atomic_exchange(&entry->current, next);
     pending->retired = std::move(retired);
     pending->published.store(true, std::memory_order_release);

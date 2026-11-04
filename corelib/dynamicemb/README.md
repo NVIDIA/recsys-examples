@@ -102,14 +102,45 @@ PyTorch and NVE installations. Without `pynve`, the default is training-only.
 Set `DYNAMICEMB_BUILD_INFERENCE=0` to explicitly build training-only, or `1` to
 require inference support and fail if NVE is missing.
 
-Inference builds need NVE's PyTorch bindings, CMake, NVTX headers (normally
+For standalone CPU Host inference, set `DYNAMICEMB_CPU_ONLY=1` with CPU-only
+PyTorch and driverless NVE installed. This builds the CPU inference bindings,
+sidecar loader and Host update runtime, without TorchRec, the training extension
+or eviction kernels. Both installation and wheel building support this mode.
+Separate `build_cpu` and `torch_binding_build_cpu` directories prevent reuse of
+CUDA build artifacts. The native builder still needs the CUDA toolkit for NVE
+headers; deployment needs CPU-only PyTorch and `cudart`, without a GPU or driver.
+See [CPU-only Host build and test](example/host_embedding/CPU_BUILD_AND_TEST.md).
+
+CUDA inference builds need NVE's PyTorch bindings, CMake, NVTX headers (normally
 supplied by CUDA), and the repository's recursive NVE submodule checkout. For
 external dependency locations, set `NVE_ROOT`, `NVE_LIB_DIR`, or
 `NVTX_INCLUDE_DIR` as needed. Set
-`TORCH_CUDA_ARCH_LIST` for the deployment GPUs. The existing Docker build continues
-to configure CMake first; `setup.py` reuses its `torch_binding_build` configuration
+`TORCH_CUDA_ARCH_LIST` for the deployment GPUs; `CMAKE_CUDA_ARCHITECTURES`
+can also be set explicitly for a fresh CMake build without a GPU. The existing
+Docker build continues to configure CMake first; `setup.py` reuses its `torch_binding_build` configuration
 and incrementally builds the targets. Reconfigure that directory with CMake when
 changing dependency paths or GPU architecture targets.
+
+### Optional: standalone CPU indexing library
+
+This developer target builds only `inference_emb_ops.so`: CPU key-to-row indexing,
+registration and export shape inference. It requires CPU-only PyTorch/libtorch,
+CMake, a C++ compiler and Make or Ninja. It has no NVE, CUDA toolkit or Python
+link dependency.
+
+From `corelib/dynamicemb`:
+
+```bash
+cmake -S . -B build_cpu_ops -DDYNAMICEMB_CPU_ONLY=ON
+cmake --build build_cpu_ops --target inference_emb_ops --parallel
+bash test/test_cpu_only_build.sh build_cpu_ops
+```
+
+CMake defaults `DYNAMICEMB_BUILD_PYTHON=OFF` in this mode. It does not build the
+full Python package, NVE embedding storage or Host subscriber. For actual
+HostLayer construction, lookup, export/replay and updates, use the
+[CPU Host build and test guide](example/host_embedding/CPU_BUILD_AND_TEST.md),
+whose setup build enables `DYNAMICEMB_BUILD_PYTHON=ON`.
 
 ## DynamicEmb APIs
 

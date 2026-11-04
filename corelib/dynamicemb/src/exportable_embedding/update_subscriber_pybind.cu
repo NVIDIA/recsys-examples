@@ -14,10 +14,14 @@ namespace py = pybind11;
 
 namespace dynamicemb::exportable_embedding {
 
+#ifdef DYNAMICEMB_WITH_CUDA
 void bind_nve_tier_runtime(py::module_& module);
+#endif
 
 void bind_update_subscriber(py::module_& module) {
+#ifdef DYNAMICEMB_WITH_CUDA
   bind_nve_tier_runtime(module);
+#endif
   py::class_<EmbeddingCollectionUpdateSubscriber>(
       module, "EmbeddingCollectionUpdateSubscriber")
       .def(

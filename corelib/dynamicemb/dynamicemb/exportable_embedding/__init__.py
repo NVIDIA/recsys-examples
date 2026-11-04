@@ -10,7 +10,8 @@ if tuple(int(part) for part in _pynve.__version__.split(".")[:2]) == (26, 5):
     from . import _C_legacy as _C
 else:
     from . import _C
-from dynamicemb import lookup_meta as _lookup_meta  # noqa: F401
+if not getattr(_C, "cpu_only", False):
+    from dynamicemb import lookup_meta as _lookup_meta  # noqa: F401
 
 # isort: on
 from .config import (

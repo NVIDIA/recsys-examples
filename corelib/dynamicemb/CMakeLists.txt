@@ -1,5 +1,19 @@
 cmake_minimum_required(VERSION 3.18)
-project(DynamicEmbInferenceOps LANGUAGES CXX CUDA)
+
+# CPU mode uses CPU-only libtorch. Without the Python package, it builds just
+# the indexing operators, with no CUDA toolkit, cudart or Python dependency.
+option(DYNAMICEMB_CPU_ONLY "Build CPU inference against CPU-only PyTorch" OFF)
+if(DYNAMICEMB_CPU_ONLY)
+    set(_build_python_default OFF)
+else()
+    set(_build_python_default ON)
+endif()
+option(DYNAMICEMB_BUILD_PYTHON "Build the full inference package (requires NVE)" ${_build_python_default})
+if(DYNAMICEMB_CPU_ONLY)
+    project(DynamicEmbInferenceOps LANGUAGES CXX)
+else()
+    project(DynamicEmbInferenceOps LANGUAGES CXX CUDA)
+endif()
 
 include(GNUInstallDirs)
 
@@ -7,6 +21,10 @@ include(GNUInstallDirs)
 list(APPEND CMAKE_BUILD_RPATH "$ORIGIN" "$ORIGIN/../../pynve" "$ORIGIN/../../torch/lib")
 
 set(NVE_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../../third_party/nv-embedding-cache" CACHE PATH "NVE source root")
+set(DYNAMICEMB_PYTHON_MODULE_DIR
+    "${CMAKE_CURRENT_SOURCE_DIR}/dynamicemb/exportable_embedding"
+    CACHE PATH "Output directory for the inference Python bindings"
+)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -16,7 +34,11 @@ set(CMAKE_CUDA_STANDARD_REQUIRED ON)
 set(CMAKE_CUDA_EXTENSIONS OFF)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
-find_package(Python3 COMPONENTS Interpreter Development REQUIRED)
+if(DYNAMICEMB_CPU_ONLY AND NOT DYNAMICEMB_BUILD_PYTHON)
+    find_package(Python3 COMPONENTS Interpreter)
+else()
+    find_package(Python3 COMPONENTS Interpreter Development REQUIRED)
+endif()
 
 if(NOT DEFINED CMAKE_PREFIX_PATH)
     execute_process(
@@ -32,6 +54,58 @@ if(NOT DEFINED CMAKE_PREFIX_PATH)
 endif()
 
 find_package(Torch REQUIRED)
+if(DYNAMICEMB_CPU_ONLY AND TARGET torch_cuda)
+    message(FATAL_ERROR "DYNAMICEMB_CPU_ONLY requires CPU-only PyTorch/libtorch")
+endif()
+message(STATUS "Found Torch ${TORCH_VERSION}")
+separate_arguments(TORCH_CXX_FLAGS_LIST NATIVE_COMMAND "${TORCH_CXX_FLAGS}")
+
+if(DYNAMICEMB_CPU_ONLY)
+    add_library(inference_emb_ops SHARED
+        src/exportable_embedding/indexer_snapshot.cpp
+        src/exportable_embedding/indexer_cpu.cpp
+        src/exportable_embedding/inference_emb_schemas.cpp
+    )
+    target_compile_options(inference_emb_ops PRIVATE
+        ${TORCH_CXX_FLAGS_LIST} -O3 -fvisibility=hidden -w)
+    target_include_directories(inference_emb_ops PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+        ${TORCH_INCLUDE_DIRS}
+    )
+    # at::parallel_for is header-inlined; without OpenMP it runs serially.
+    find_package(OpenMP)
+    if(OpenMP_CXX_FOUND)
+        target_link_libraries(inference_emb_ops PRIVATE OpenMP::OpenMP_CXX)
+    endif()
+    target_link_libraries(inference_emb_ops PRIVATE ${TORCH_LIBRARIES})
+    target_link_options(inference_emb_ops PRIVATE "LINKER:--no-undefined")
+    set_target_properties(inference_emb_ops PROPERTIES
+        PREFIX ""
+        OUTPUT_NAME "inference_emb_ops"
+    )
+    install(TARGETS inference_emb_ops
+        LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
+        RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+    )
+    if(NOT DYNAMICEMB_BUILD_PYTHON)
+        return()
+    endif()
+    # Directory loading and marker rebinding use only CPU libtorch.
+    target_sources(inference_emb_ops PRIVATE src/exportable_embedding/indexer_directory.cpp)
+    target_include_directories(inference_emb_ops PRIVATE ${NVE_ROOT}/third_party/json/include)
+
+    # NVE's public binding headers still contain CUDA code. The native builder
+    # needs nvcc; the resulting Host package needs only cudart at deployment.
+    if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
+        set(CMAKE_CUDA_ARCHITECTURES 80)
+    endif()
+    # nvcc's C++17 processing of PyTorch 2.10's dependent List type drops a
+    # required typename. C++20 accepts that type in the NVE-facing bindings.
+    set(CMAKE_CUDA_STANDARD 20)
+    enable_language(CUDA)
+    find_package(CUDAToolkit REQUIRED)
+else()
+
 find_package(CUDAToolkit REQUIRED)
 
 
@@ -43,7 +117,6 @@ if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
     endif()
 endif()
 
-message(STATUS "Found Torch ${TORCH_VERSION}")
 message(STATUS "CUDA architectures: ${CMAKE_CUDA_ARCHITECTURES}")
 
 set(INFERENCE_EMB_SOURCES
@@ -51,6 +124,7 @@ set(INFERENCE_EMB_SOURCES
     src/exportable_embedding/indexer_snapshot.cpp
     src/exportable_embedding/indexer_ops.cu
     src/exportable_embedding/indexer_cpu.cpp
+    src/exportable_embedding/inference_emb_schemas.cpp
     src/table_operation/lookup_torch_binding.cu
     src/table_operation/get_table_range_torch_binding.cu
     src/table_operation/expand_table_ids_torch_binding.cu
@@ -63,8 +137,8 @@ set(INFERENCE_EMB_SOURCES
 )
 
 add_library(inference_emb_ops SHARED ${INFERENCE_EMB_SOURCES})
+target_compile_definitions(inference_emb_ops PRIVATE DYNAMICEMB_WITH_CUDA)
 
-separate_arguments(TORCH_CXX_FLAGS_LIST NATIVE_COMMAND "${TORCH_CXX_FLAGS}")
 if(TORCH_CXX_FLAGS_LIST)
     target_compile_options(inference_emb_ops PRIVATE ${TORCH_CXX_FLAGS_LIST})
 endif()
@@ -118,6 +192,11 @@ install(TARGETS inference_emb_ops
     LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
     RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
 )
+endif()
+
+if(NOT DYNAMICEMB_BUILD_PYTHON)
+    return()
+endif()
 
 option(DYNAMICEMB_ENABLE_NVE_UPDATE "Build the NVE incremental update subscriber" ON)
 
@@ -130,17 +209,20 @@ if(DYNAMICEMB_ENABLE_NVE_UPDATE AND (
     set(DYNAMICEMB_HAS_NVE_UPDATE ON)
     include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/NVETarget.cmake)
     set(NVE_LIB_DIR "/opt/nve/default/python/pynve" CACHE PATH "NVE library directory")
-    find_path(NVTX_INCLUDE_DIR nvtx3/nvToolsExt.h
-        HINTS /workspace/deps/NVTX/c/include ${CUDAToolkit_INCLUDE_DIRS}
-        REQUIRED
-    )
+    if(NOT DYNAMICEMB_CPU_ONLY)
+        find_path(NVTX_INCLUDE_DIR nvtx3/nvToolsExt.h
+            HINTS /workspace/deps/NVTX/c/include ${CUDAToolkit_INCLUDE_DIRS}
+            REQUIRED
+        )
+    endif()
     find_library(NVE_TORCH_OPS_LIB nve-torch-ops PATHS "${NVE_LIB_DIR}" NO_DEFAULT_PATH REQUIRED)
     find_library(NVE_COMMON_LIB nve-common PATHS "${NVE_LIB_DIR}" NO_DEFAULT_PATH REQUIRED)
 
-    add_library(inference_emb_update SHARED
-        src/exportable_embedding/incremental_update.cpp
-        src/exportable_embedding/nve_runtime.cu
-    )
+    add_library(inference_emb_update SHARED src/exportable_embedding/incremental_update.cpp)
+    if(NOT DYNAMICEMB_CPU_ONLY)
+        target_sources(inference_emb_update PRIVATE src/exportable_embedding/nve_runtime.cu)
+        target_compile_definitions(inference_emb_update PRIVATE DYNAMICEMB_WITH_CUDA)
+    endif()
     set_source_files_properties(
         src/exportable_embedding/incremental_update.cpp
         PROPERTIES LANGUAGE CUDA
@@ -193,8 +275,10 @@ set(EXPORTABLE_EMBEDDING_PYBIND_SOURCES ${EXPORTABLE_EMBEDDING_INDEXER_SOURCES})
 if(DYNAMICEMB_HAS_NVE_UPDATE)
     list(APPEND EXPORTABLE_EMBEDDING_PYBIND_SOURCES
         src/exportable_embedding/update_subscriber_pybind.cu
-        src/exportable_embedding/nve_tier_pybind.cu
     )
+    if(NOT DYNAMICEMB_CPU_ONLY)
+        list(APPEND EXPORTABLE_EMBEDDING_PYBIND_SOURCES src/exportable_embedding/nve_tier_pybind.cu)
+    endif()
 else()
     list(APPEND EXPORTABLE_EMBEDDING_PYBIND_SOURCES
         src/exportable_embedding/update_subscriber_unavailable_pybind.cpp
@@ -206,14 +290,25 @@ add_library(dynamicemb_exportable_embedding_python MODULE
 )
 # NVE 26.05 must never dlopen the default extension's modern NVE dependencies.
 # Both modules share the same indexer operators; only _C links the update runtime.
-add_library(dynamicemb_exportable_embedding_legacy_python MODULE
-    ${EXPORTABLE_EMBEDDING_INDEXER_SOURCES}
-    src/exportable_embedding/update_subscriber_unavailable_pybind.cpp
-)
-foreach(binding_target IN ITEMS
-    dynamicemb_exportable_embedding_python
-    dynamicemb_exportable_embedding_legacy_python
-)
+set(_binding_targets dynamicemb_exportable_embedding_python)
+if(DYNAMICEMB_CPU_ONLY)
+    target_compile_definitions(dynamicemb_exportable_embedding_python PRIVATE DYNAMICEMB_CPU_ONLY)
+else()
+    add_library(dynamicemb_exportable_embedding_legacy_python MODULE
+        ${EXPORTABLE_EMBEDDING_INDEXER_SOURCES}
+        src/exportable_embedding/update_subscriber_unavailable_pybind.cpp
+    )
+    list(APPEND _binding_targets dynamicemb_exportable_embedding_legacy_python)
+    target_compile_definitions(dynamicemb_exportable_embedding_python PRIVATE DYNAMICEMB_WITH_CUDA)
+    target_compile_definitions(dynamicemb_exportable_embedding_legacy_python PRIVATE TORCH_EXTENSION_NAME=_C_legacy)
+    set_target_properties(dynamicemb_exportable_embedding_legacy_python PROPERTIES
+        PREFIX ""
+        OUTPUT_NAME "_C_legacy"
+        LIBRARY_OUTPUT_DIRECTORY "${DYNAMICEMB_PYTHON_MODULE_DIR}"
+        INSTALL_RPATH "${CMAKE_INSTALL_FULL_LIBDIR}"
+    )
+endif()
+foreach(binding_target IN LISTS _binding_targets)
     target_include_directories(${binding_target} PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/include
         ${Python3_INCLUDE_DIRS}
@@ -235,9 +330,6 @@ endforeach()
 target_compile_definitions(dynamicemb_exportable_embedding_python PRIVATE
     TORCH_EXTENSION_NAME=_C
 )
-target_compile_definitions(dynamicemb_exportable_embedding_legacy_python PRIVATE
-    TORCH_EXTENSION_NAME=_C_legacy
-)
 
 if(DYNAMICEMB_HAS_NVE_UPDATE)
     target_include_directories(dynamicemb_exportable_embedding_python PRIVATE
@@ -258,20 +350,11 @@ endif()
 set_target_properties(dynamicemb_exportable_embedding_python PROPERTIES
     PREFIX ""
     OUTPUT_NAME "_C"
-    LIBRARY_OUTPUT_DIRECTORY
-        "${CMAKE_CURRENT_SOURCE_DIR}/dynamicemb/exportable_embedding"
+    LIBRARY_OUTPUT_DIRECTORY "${DYNAMICEMB_PYTHON_MODULE_DIR}"
     INSTALL_RPATH "${CMAKE_INSTALL_FULL_LIBDIR};${NVE_LIB_DIR}"
 )
-set_target_properties(dynamicemb_exportable_embedding_legacy_python PROPERTIES
-    PREFIX ""
-    OUTPUT_NAME "_C_legacy"
-    LIBRARY_OUTPUT_DIRECTORY
-        "${CMAKE_CURRENT_SOURCE_DIR}/dynamicemb/exportable_embedding"
-    INSTALL_RPATH "${CMAKE_INSTALL_FULL_LIBDIR}"
-)
 install(TARGETS
-    dynamicemb_exportable_embedding_python
-    dynamicemb_exportable_embedding_legacy_python
+    ${_binding_targets}
     LIBRARY DESTINATION
         "${Python3_SITEARCH}/dynamicemb/exportable_embedding"
     RUNTIME DESTINATION

@@ -2,9 +2,11 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include "dynamicemb/exportable_embedding/incremental_update.h"
+#ifdef DYNAMICEMB_WITH_CUDA
 #include "dynamicemb/exportable_embedding/nve_runtime.h"
 
 #include <c10/cuda/CUDAGuard.h>
+#endif
 #include <nlohmann/json.hpp>
 
 #include <fstream>
@@ -77,8 +79,13 @@ struct EmbeddingCollectionUpdateSubscriber::Impl {
         nve_layers[path] =
             layer_directory->get_layer(layer.at("id").get<int64_t>()).binding;
       }
+#ifdef DYNAMICEMB_WITH_CUDA
       TORCH_CHECK(host_rows.count(path) || has_nve_tier_update(nve_layers.at(path)),
                   "Tier updates require DynamicEmb NVE bindings; use the DynamicEmb factory/loader");
+#else
+      TORCH_CHECK(device_index < 0 && host_rows.count(path),
+                  "This build supports only CPU HostLayer updates");
+#endif
     }
   }
 
@@ -176,6 +183,7 @@ void EmbeddingCollectionUpdateSubscriber::apply_incremental_load(
     impl_->host_update_ids[update.collection_id] = update.snapshot_id;
     return;
   }
+#ifdef DYNAMICEMB_WITH_CUDA
   TORCH_CHECK(impl_->device_index >= 0, "CPU updates require HostLayer storage");
   const auto stream = c10::cuda::getStreamFromExternal(
       inference_stream, impl_->device_index);
@@ -217,6 +225,9 @@ void EmbeddingCollectionUpdateSubscriber::apply_incremental_load(
           update_nve_tier(layer, 1, key, value, 0, nve_stream);
         }
       });
+#else
+  TORCH_CHECK(false, "This build supports only CPU HostLayer updates");
+#endif
 }
 
 EmbeddingCollectionUpdateAck

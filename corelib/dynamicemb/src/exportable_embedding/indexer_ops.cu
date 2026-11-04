@@ -38,29 +38,9 @@ at::Tensor embedding_collection_index_cuda(const at::Tensor& marker,
   TORCH_CHECK(false, "Unsupported embedding-collection indexer kind");
 }
 
-at::Tensor embedding_collection_index_meta(const at::Tensor& marker,
-                                            int64_t marker_value,
-                                            const at::Tensor& feature_ids,
-                                            const at::Tensor& table_ids) {
-  (void)marker;
-  (void)marker_value;
-  (void)table_ids;
-  return at::empty_like(feature_ids, feature_ids.options().dtype(at::kLong));
-}
-
 }  // namespace dynamicemb::exportable_embedding
-
-TORCH_LIBRARY_FRAGMENT(INFERENCE_EMB, m) {
-  m.def("embedding_collection_index(Tensor marker, int marker_value, "
-        "Tensor feature_ids, Tensor table_ids) -> Tensor");
-}
 
 TORCH_LIBRARY_IMPL(INFERENCE_EMB, CUDA, m) {
   m.impl("embedding_collection_index",
          &dynamicemb::exportable_embedding::embedding_collection_index_cuda);
-}
-
-TORCH_LIBRARY_IMPL(INFERENCE_EMB, Meta, m) {
-  m.impl("embedding_collection_index",
-         &dynamicemb::exportable_embedding::embedding_collection_index_meta);
 }

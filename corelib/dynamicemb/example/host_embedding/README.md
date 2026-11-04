@@ -1,12 +1,36 @@
-# HostLayer collections
+# HostLayer examples
 
-`nve_layer_type="host"` stores embedding values on the host. `device="cpu"`
-executes the whole collection on CPU; `device="cuda:0"` uses CUDA keys,
-indexing and outputs with NVE's host lookup. HSTU's dense model remains on CUDA.
+This directory tests real NVE HostLayer collections: loading, lookup, AOT export,
+replay and CPU incremental updates. It covers **both CPU and CUDA callers**.
+The CPU-only package is one supported deployment of these examples.
+
+**CPU-only build and test: follow [CPU_BUILD_AND_TEST.md](CPU_BUILD_AND_TEST.md), steps 1–3.**
+It uses stock NVE's minimal driverless configuration and DynamicEmb's CPU
+inference targets, then checks export/replay, updates and related CPU unit tests.
+
+| File | Purpose | Execution device |
+|---|---|---|
+| [example.py](example.py) | Load, verify, export and replay a collection | `--device cpu` (default), or `--device cuda:0` with a regular CUDA build |
+| [replay.cpp](replay.cpp) | C++ AOT replay; also consumes saved CPU updates | Device index `-1` for CPU; `0` for CUDA with a regular CUDA build |
+| [incremental_cpu.py](incremental_cpu.py) | Verify CPU lookup during incremental updates | CPU only |
+| [CMakeLists.txt](CMakeLists.txt) | Build the C++ runner | `DYNAMICEMB_CPU_ONLY=ON` for CPU-only PyTorch |
+
+**Storage and execution are separate choices.** `nve_layer_type="host"` keeps
+embedding values in CPU memory in every case. `device="cpu"` also runs indexing
+and returns outputs on CPU. `device="cuda:0"` uses CUDA keys, indexing and outputs
+with NVE's host lookup.
+
+For **CPU-only PyTorch + NVE + cudart**, use the [CPU-only guide](CPU_BUILD_AND_TEST.md).
+With the [normal DynamicEmb installation](../../README.md#installation) and NVE
+inference bindings already installed, run these examples directly. There is no
+separate Host-specific DynamicEmb build. These examples do not depend on HSTU.
+
+## Collection API and supported features
 
 Supported: fused identity, linear hash, single-table identity; FP32/FP16;
 plain, sum and mean lookup; embedded or sidecar index state. BitConcat is
-unsupported by the current dense pynve HostLayer.
+unsupported by the current dense pynve HostLayer. HSTU's ranking exporters accept
+`--host_embeddings`; HostLayer lookup cannot be captured in a CUDA graph.
 
 ```python
 import torch
@@ -38,54 +62,18 @@ misses return zero. A full checkpoint load includes every saved shard.
 
 ## Build and run
 
-Host collections support NVE 26.09 and later; zero-filled misses require the
-26.09 Python binding. Earlier Host bounds checks do not provide that behavior.
-Compatible later releases use the same path. Rebuild the native adapter against
-matching NVE headers and libraries when changing versions; see
-[NVE compatibility and rebuild requirements](../../docs/nve_tier_updates.md).
+Use the [CPU-only build-to-test guide](CPU_BUILD_AND_TEST.md) for CPU-only PyTorch. It uses
+`example.py`, `incremental_cpu.py`, `replay.cpp` and `CMakeLists.txt` from this
+directory; `../../setup.py` selects CPU inference with `DYNAMICEMB_CPU_ONLY=1`.
 
-Use the repository-pinned official NVE 26.10 build (`803e278`)
-and the repository's inference bindings. For a machine without an
-NVIDIA driver, build NVE with `PYNVE_DRIVERLESS_BUILD=1 PYNVE_DISABLE_MPI=1`
-and keep DynamicEmb inference updates enabled (the default). Set
-`-DNVE_LIB_DIR` to that driverless build.
-A CUDA toolkit and CUDA-capable PyTorch build are still used to build these
-bindings; CPU execution does not require a GPU or driver. Importing the
-collection does not import TorchRec or the DynamicEmb training extension.
+With a normal CUDA-enabled DynamicEmb/NVE installation, `example.py` also accepts
+`--device cuda:0`. Export CPU and CUDA graphs into separate package directories.
+A C++ runner built against that normal installation accepts device index `0` for
+CUDA and `-1` for CPU. Keep NVE resources/layers and indexer directories alive
+until the AOTI loader is destroyed, as the example shows.
 
-From `corelib/dynamicemb`, with NVE on `PYTHONPATH`:
-
-```bash
-export PYTHONPATH="$PWD:$PYTHONPATH"
-# Set TORCH_CUDA_ARCH_LIST to the deployment GPU architecture when building.
-cmake -S . -B torch_binding_build -DNVE_ROOT=/path/to/nv-embedding-cache \
-  -DNVE_LIB_DIR=/path/to/pynve -DNVTX_INCLUDE_DIR=/path/to/NVTX/c/include
-cmake --build torch_binding_build --parallel
-python example/host_embedding/example.py --device cpu --package-dir /tmp/host-cpu
-python example/host_embedding/example.py --device cpu --package-dir /tmp/host-cpu --replay
-```
-
-Use `--device cuda:0` to export a separate CUDA package. CUDA callers must
-select the same current device with `torch.cuda.set_device(device)` before
-construction and replay; the example does this once at startup. `--embedded`,
-`--indexer fused_identity`, `--dtype float16`, and `--pooling 1` select other
-supported modes. The example checks several input sizes against a direct
-reference, exports, and verifies Python replay.
-
-For C++ replay, configure `example/host_embedding` with the same NVE paths and
-`-DDYNAMICEMB_LIB_DIR=/path/to/torch_binding_build`, build it, then run:
-
-```bash
-example/host_embedding/build/replay_host /tmp/host-cpu -1
-```
-
-Pass `0` for CUDA device 0. Keep the NVE layer directory, resource directory,
-and indexer directory alive until the AOTI loader is destroyed, as the example
-shows. Export CPU and CUDA packages separately.
-
-HSTU's ranking exporters accept `--host_embeddings`; the existing default
-storage choices are unchanged. HostLayer lookup itself cannot be captured in
-a CUDA graph; capture only the dense part of the pipeline.
+Host collections require NVE 26.09 or later; use the repository-pinned NVE 26.10
+and matching headers/libraries. See [NVE compatibility](../../docs/nve_tier_updates.md).
 
 ## Incremental updates on CPU
 
@@ -96,11 +84,11 @@ a CUDA graph; capture only the dense part of the pipeline.
 | LinearHashMap | Pause and drain CPU readers | Update/insert/erase mappings; reuse free rows within capacity. Sidecar required. |
 
 The intended fixed-mapping contract permits stale/mixed lookup values during
-updates and checks final values after completion. The sixth commit removes the
-atomic host-row patch and pins stock NVE 26.10: overlapping lookup/update now uses
-ordinary `memcpy`, which has a C++ data race. Concurrent runs are an experiment,
-not a guarantee of safe execution or final-value visibility. The examples keep
-their existing concurrency and synchronization; paused LinearHashMap is unchanged.
+updates and checks final values after completion. With stock NVE 26.10,
+overlapping lookup/update uses ordinary `memcpy`, which has a C++ data race.
+Concurrent runs are an experiment, not a guarantee of safe execution or
+final-value visibility. Identity/FusedIdentity examples run lookup concurrently
+with updates; LinearHashMap updates require paused/drained readers.
 See [the explanation, word-level example, and validation results](../../docs/host_cpu_update_concurrency.md).
 Keep the storage allocation fixed and use one update writer. Raw weight writes,
 serialization, and accumulation must happen outside concurrent serving.
@@ -111,12 +99,12 @@ CPU delta → UpdateCoordinator → row/value message (+ paused hash snapshot)
 CPU inference → unchanged indexer → HostLayer.lookup, concurrently for fixed mappings
 ```
 
-The existing `EmbeddingCollectionUpdateCoordinator.open(..., device=cpu)` reads
+`EmbeddingCollectionUpdateCoordinator.open(..., device=cpu)` reads
 the exported package. Call `apply_delta(collection_id, delta)` with a CPU
 `DeltaDumpResult`, then pass `update.to_json()` to the subscriber. Use one update
 writer and apply messages once, in snapshot order. Each subscriber has its own
-host storage; the coordinator does not need Redis. Packages need the new
-per-table capacity metadata, so re-export older packages.
+host storage; the coordinator does not need Redis. Exported packages must include
+per-table capacity metadata.
 
 ```python
 update = coordinator.apply_delta(collection_id, delta)
@@ -132,16 +120,7 @@ before publication. A hash update can reuse a row freed by that same delta;
 surviving keys keep their rows. CPU hash publication and acknowledgement complete
 without waiting for a subsequent inference call.
 
-Run the Python/C++ AOT example (CPU only):
-
-```bash
-python example/host_embedding/incremental_cpu.py --indexer fused_identity \
-  --package-dir /tmp/host-updates
-example/host_embedding/build/replay_host /tmp/host-updates -1
-```
-
-Use `--indexer identity` or `--indexer linear_hash_map` for the other modes;
-`--embedded` works for fixed mappings, and `--dtype float16 --pooling 2` tests
-pooled FP16. The example keeps AOT inference running during fixed-mapping updates
-and checks final values afterwards. CUDA HostLayer incremental loading is outside
-this CPU update path.
+Run [step 3 of the CPU-only guide](CPU_BUILD_AND_TEST.md#3-test)
+for Python/C++ update checks with all three indexers. `--embedded` works for fixed
+mappings; `--dtype float16 --pooling 2` selects pooled FP16. CUDA HostLayer
+incremental loading is outside this CPU update path.
