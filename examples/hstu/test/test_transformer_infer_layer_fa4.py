@@ -5,7 +5,8 @@
 References: the padded SDPA attention of ``TransformerInferLayer`` with identical weights,
 and, independent of it, the mask read back from FA4 itself and a step-by-step fp32
 attention. Needs FlashAttention 4 (``flash_attn.cute``, which the Docker image installs)
-and a CUDA GPU; otherwise the whole module is skipped, and a skip is not validation of FA4.
+and an SM90 or newer GPU, since FA4 takes no score_mod on SM8x; otherwise the whole module
+is skipped, and a skip is not validation of FA4.
 """
 
 import itertools
@@ -20,7 +21,8 @@ HSTU_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(HSTU_ROOT))
 
 pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available(), reason="FA4 needs a CUDA GPU"
+    not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 9,
+    reason="FA4 takes no score_mod on SM8x, so its attention needs an SM90+ GPU",
 )
 pytest.importorskip("flash_attn.cute.interface", reason="FA4 is not installed")
 

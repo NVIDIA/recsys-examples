@@ -136,7 +136,8 @@ Docker image installs FA4 (`flash_attn.cute`) from its PyPI wheel,
 its dependencies: the release asks for CUTLASS DSL 4.6 and quack 0.5.3, but runs
 with the image's 4.5.2 and 0.4.1, on which all FA4 tests pass. Elsewhere, install
 it the same way: `pip install --no-deps flash-attn-4==4.0.0b21`. FA4 attention
-works with bf16 and FP8 projections and with CUDA graphs, and cannot be exported.
+needs an SM90 or newer GPU, since FA4 takes no `score_mod` on SM8x. It works with
+bf16 and FP8 projections and with CUDA graphs, and cannot be exported.
 Tests: `test/test_transformer_infer_layer_fa4.py`.
 
 ## Validation and limitations

@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES.
 # SPDX-License-Identifier: Apache-2.0
-"""CUDA tests for the Triton FP8 quantization kernels; DeepGEMM is not needed.
+"""CUDA tests for the Triton FP8 quantization kernels; DeepGEMM is not needed, but
+Triton's float8e4nv needs an SM89 or newer GPU.
 
 Each kernel is compared with a plain PyTorch computation of the same values followed by
 a PyTorch reference quantizer.
@@ -16,7 +17,10 @@ from torch.nn import functional as F
 HSTU_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(HSTU_ROOT))
 
-pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+pytestmark = pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability() < (8, 9),
+    reason="Triton's float8e4nv needs an SM89+ GPU",
+)
 
 from ops.triton_ops.triton_fp8_quant import (
     GROUP_SIZE,
