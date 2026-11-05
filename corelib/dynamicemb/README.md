@@ -40,7 +40,7 @@ The lookup kernel algorithms implemented in DynamicEmb primarily leverage portio
 
 ### Version Compatibility
 
-DynamicEmb builds on PyTorch, FBGEMM_GPU, and TorchRec. The project Docker image installs the validated dependency set from `docker/Dockerfile`:
+DynamicEmb builds on PyTorch, FBGEMM_GPU, and TorchRec. The project Docker image configures the version-coupled dependency set in `docker/Dockerfile`:
 
 - NGC PyTorch `26.07-py3` (PyTorch 2.13.0a0 / CUDA 13.3.1)
 - FBGEMM_GPU `v1.8.0`
@@ -69,7 +69,7 @@ Once the build is done, run `python -c 'import fbgemm_gpu'` to make sure it is i
 
 2. **TorchRec**
 
-> torchrec >= v1.2.0; the Docker image currently validates against TorchRec `v1.8.0-rc1`.
+> torchrec >= v1.2.0; the Docker image currently pins TorchRec `v1.8.0-rc1`.
 
 Thanks to the torchrec team for their [support](https://github.com/meta-pytorch/torchrec/commit/6aaf1fa72e884642f39c49ef232162fa3772055e), torchrec v1.2.0 added support for custom embedding lookup module.
 

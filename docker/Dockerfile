@@ -1,4 +1,4 @@
-ARG BASE_IMAGE=nvcr.io/nvidia/pytorch:26.07-py3
+ARG BASE_IMAGE=nvcr.io/nvidia/pytorch:26.07-py3@sha256:2140e699b3beaf7f96a0081fd9c9406bc3832b435cdb60dfa2d261f7d2f34a1c
 ARG BASE_FBGEMM_IMAGE=base_fbgemm
 ARG BASE_TRITON_IMAGE=base_triton
 ARG DEVEL_IMAGE=devel
@@ -23,6 +23,7 @@ FROM ${BASE_IMAGE} AS base_fbgemm
 ARG TARGETPLATFORM
 ARG FBGEMM_BUILD_FROM_SOURCE=0
 ARG FBGEMM_CUDA_ARCH_LIST="8.0 9.0a 10.0 10.3"
+ARG FBGEMM_BUILD_JOBS=4
 
 WORKDIR /workspace/deps
 
@@ -41,7 +42,9 @@ RUN set -eux; \
           'https://download.pytorch.org/whl/cu130/fbgemm_gpu-1.8.0%2Bcu130-cp312-cp312-manylinux_2_28_x86_64.whl#sha256=b5a98aad7c662c84e04a005d0656a7da99da15bd70c7aa1cb04bfc1e868a0b48'; \
         ;; \
       linux/arm64:*|linux/amd64:1) \
-        bash /usr/local/bin/install_fbgemm_gpu_arm64.sh; \
+        CMAKE_BUILD_PARALLEL_LEVEL="${FBGEMM_BUILD_JOBS}" \
+          MAX_JOBS="${FBGEMM_BUILD_JOBS}" \
+          bash /usr/local/bin/install_fbgemm_gpu_arm64.sh; \
         ;; \
       *) \
         echo "Unsupported TARGETPLATFORM=${TARGETPLATFORM}" >&2; \
@@ -128,9 +131,10 @@ RUN wget -O /tmp/boost.tar.gz \
 # disabled so their additional libraries and headers do not have to be staged.
 RUN set -eux; \
     parsed_upstream=; \
-    case "${BASE_IMAGE}" in \
+    base_without_digest="${BASE_IMAGE%%@*}"; \
+    case "${base_without_digest}" in \
       nvcr.io/nvidia/pytorch:[0-9][0-9].[0-9][0-9]-py3) \
-        parsed_upstream="${BASE_IMAGE#nvcr.io/nvidia/pytorch:}"; \
+        parsed_upstream="${base_without_digest#nvcr.io/nvidia/pytorch:}"; \
         parsed_upstream="${parsed_upstream%-py3}";; \
     esac; \
     effective_upstream="${UPSTREAM_PYTORCH_CONTAINER_VERSION:-${parsed_upstream}}"; \
