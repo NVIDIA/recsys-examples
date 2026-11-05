@@ -211,6 +211,8 @@ std::vector<int64_t> FlexKVCppClient::launch_tasks(
     const std::vector<int64_t>& task_ids,
     const std::vector<at::Tensor>& slot_mappings,
     bool as_batch) {
+    // FlexKV only merges multiple tasks. A single task keeps its original ID.
+    as_batch = as_batch && task_ids.size() > 1;
     int64_t batch_id = -1;
     if (as_batch) {
         batch_id = impl_->next_task_id();
