@@ -138,7 +138,7 @@ def _start_flexkv_server(kvcache_config: KVCacheConfig):
     model_config.num_kv_heads = kvcache_config.num_heads
     model_config.head_size = kvcache_config.head_dim
     model_config.dtype = kvcache_config.dtype
-    model_config.use_mla = False
+    model_config.kv_dim = 2
     model_config.tp_size = 1
     model_config.dp_size = 1
     cache_config.tokens_per_block = kvcache_config.page_size
