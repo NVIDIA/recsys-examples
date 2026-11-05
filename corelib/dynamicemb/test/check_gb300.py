@@ -95,7 +95,8 @@ def main():
     )
     assert (results == InsertResult.INSERT.value).all().item()
     assert found.all().item()
-    torch.testing.assert_close(observed, scores)
+    # Lookup exposes the uint64 score bit patterns through an int64 tensor.
+    torch.testing.assert_close(observed, scores.view(torch.int64))
     torch.testing.assert_close(restored_slots, slots)
     torch.cuda.synchronize()
     print(
