@@ -60,6 +60,13 @@ class Fa4AttentionMixin:
         page_indptr=None,
         history_lengths=None,
     ):
+        """``TransformerInferLayer.attention`` as one FA4 kernel.
+
+        Rows past the last user, the padding of a CUDA graph bucket, must be finite. They
+        never get weight, but FA4's SM90 kernel loads whole K/V tiles past a user's end and
+        weighs those rows by zero, which a NaN survives (0 * NaN). The dense module's
+        static input buffer starts random and then only holds finite activations.
+        """
         tokens = query.shape[0]
         if tokens == 0:
             return query.new_empty((0, self.num_heads * self.head_dim))
@@ -133,7 +140,8 @@ def _with_end_sentinel(values):
 
     FA4's varlen scheduler (4.0.0b17 through 4.0.0b21) also runs spare CTAs for the
     batch index past the last user: they read ``cu_seqlens[batch + 1]`` and the score_mod
-    reads ``candidates[batch]``, one element out of bounds (compute-sanitizer on SM120).
+    reads ``candidates[batch]``, one element out of bounds (compute-sanitizer on SM120; not on
+    SM90).
     Out of bounds memory can give such a CTA a nonzero length, so it reads and writes
     outside the tensors (illegal addresses, overwritten rows). The repeated end makes it
     empty.

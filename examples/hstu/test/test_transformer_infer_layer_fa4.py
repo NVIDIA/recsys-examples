@@ -322,11 +322,15 @@ def test_invalid_lengths_are_rejected_before_the_kernel(monkeypatch):
 
 
 def test_padded_tail_rows_are_zero_and_ignored():
-    # A CUDA graph bucket packs more rows than the request has; its tail holds stale data.
+    # A CUDA graph bucket packs more rows than the request has; its tail holds stale, but
+    # finite, data (see Fa4AttentionMixin.attention). Rows of large random values stay
+    # large after the LayerNorm, so any weight on them would show in the output.
     base, fa4 = layer_pair(Fa4TransformerInferLayer)
     x, offsets, candidates = layer_inputs()
     rows = x.shape[0]
-    tail = torch.full((9, 512), float("nan"), device="cuda", dtype=torch.bfloat16)
+    generator = torch.Generator(device="cuda").manual_seed(3)
+    tail = torch.randn((9, 512), generator=generator, device="cuda") * 100
+    tail = tail.to(torch.bfloat16)
     padded = torch.cat((x, tail))
     jd = SimpleNamespace(seqlen_offsets=offsets, num_candidates=candidates)
     with torch.inference_mode():
