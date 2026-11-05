@@ -35,6 +35,7 @@ from configs import HSTUConfig, InferenceHSTUConfig, get_inference_hstu_config
 from flexkv.common.config import (
     CacheConfig,
     ModelConfig,
+    RankInfo,
     UserConfig,
     update_default_config_from_user_config,
 )
@@ -118,7 +119,9 @@ def start_flexkv_server(
         if name in extra_configs:
             setattr(user_config, name, extra_configs[name])
 
-    update_default_config_from_user_config(model_config, cache_config, user_config)
+    update_default_config_from_user_config(
+        RankInfo(model_config=model_config), cache_config, user_config
+    )
 
     server_recv_port = str(required_config(runtime_config, "server_recv_port"))
     gpu_register_port = str(required_config(runtime_config, "gpu_register_port"))

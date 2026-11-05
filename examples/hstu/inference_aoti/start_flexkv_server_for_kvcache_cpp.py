@@ -15,6 +15,7 @@ import torch
 from flexkv.common.config import (  # noqa: E402
     CacheConfig,
     ModelConfig,
+    RankInfo,
     UserConfig,
     update_default_config_from_user_config,
 )
@@ -157,7 +158,9 @@ def _start_flexkv_server(kvcache_config: KVCacheConfig):
     for name, value in (kvcache_config.extra_configs or {}).items():
         setattr(user_config, name, value)
 
-    update_default_config_from_user_config(model_config, cache_config, user_config)
+    update_default_config_from_user_config(
+        RankInfo(model_config=model_config), cache_config, user_config
+    )
 
     reset_ipc_socket(kvcache_config.server_recv_port)
     reset_ipc_socket(kvcache_config.gpu_register_port)

@@ -11,6 +11,7 @@ from flexkv.common.config import (
     GLOBAL_CONFIG_FROM_ENV,
     CacheConfig,
     ModelConfig,
+    RankInfo,
     UserConfig,
     parse_path_list,
     update_default_config_from_user_config,
@@ -124,7 +125,9 @@ def get_config(config_path: str):
         # Store mooncake_config_path in cache_config so it survives spawn subprocesses via pickle
         cache_config.mooncake_config_path = mooncake_config_path
 
-    update_default_config_from_user_config(model_config, cache_config, user_config)
+    update_default_config_from_user_config(
+        RankInfo(model_config=model_config), cache_config, user_config
+    )
 
     # Handle server_client_mode from config
     if config.get("server_client_mode", False):
