@@ -73,7 +73,7 @@ RUN python3 -m pip install --no-cache-dir ninja psutil pytest numba-cuda && \
     cd corelib/dynamicemb && \
     DEMB_ARCHS="${DEMB_ARCHS}" MAX_JOBS="${MAX_JOBS}" \
       python3 -m pip install --no-build-isolation --no-deps . && \
-    cd /tmp && python3 -c 'import torch, fbgemm_gpu, torchrec, dynamicemb, dynamicemb_extensions' && \
+    cd /tmp && \
     python3 /workspace/recsys-examples/corelib/dynamicemb/test/check_gb300.py --build-only
 
 # ============================================================================

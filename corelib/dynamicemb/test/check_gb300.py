@@ -5,10 +5,12 @@
 
 import argparse
 import importlib.metadata
+import importlib.util
 import json
 import platform
 import re
 import subprocess
+from pathlib import Path
 
 
 def version_tuple(value):
@@ -17,24 +19,34 @@ def version_tuple(value):
     )
 
 
+def module_path(name):
+    spec = importlib.util.find_spec(name)
+    assert (
+        spec and spec.origin and Path(spec.origin).is_file()
+    ), f"Missing artifact: {name}"
+    return spec.origin
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "--build-only", action="store_true", help="Do not require an attached GB300"
+        "--build-only",
+        action="store_true",
+        help="Check metadata, artifacts and compiler without loading GPU-dependent modules",
     )
     args = parser.parse_args()
 
-    import dynamicemb
-    import dynamicemb_extensions
-    import fbgemm_gpu
     import torch
-    import torchrec
     from torch.utils.cpp_extension import CUDA_HOME
 
     nvcc = f"{CUDA_HOME or '/usr/local/cuda'}/bin/nvcc"
     compiler = subprocess.check_output([nvcc, "--version"], text=True)
     compiler_version = re.search(r"V(\d+\.\d+\.\d+)", compiler).group(1)
     gpu_codes = subprocess.check_output([nvcc, "--list-gpu-code"], text=True).split()
+    paths = {
+        name: module_path(name)
+        for name in ("fbgemm_gpu", "torchrec", "dynamicemb", "dynamicemb_extensions")
+    }
     report = {
         "machine": platform.machine(),
         "torch": torch.__version__,
@@ -42,11 +54,16 @@ def main():
         "nvcc": compiler_version,
         "cudnn": torch.backends.cudnn.version(),
         "fbgemm_gpu": importlib.metadata.version("fbgemm-gpu"),
-        "fbgemm_gpu_module": fbgemm_gpu.__file__,
-        "torchrec": torchrec.__version__,
-        "dynamicemb": dynamicemb.__file__,
-        "extension": dynamicemb_extensions.__file__,
-        "scope": "build/import" if args.build_only else "GB300 single-device smoke",
+        "fbgemm_gpu_module": paths["fbgemm_gpu"],
+        "torchrec": importlib.metadata.version("torchrec"),
+        "dynamicemb_version": importlib.metadata.version("dynamicemb"),
+        "dynamicemb": paths["dynamicemb"],
+        "extension": paths["dynamicemb_extensions"],
+        "scope": (
+            "build/metadata/artifacts"
+            if args.build_only
+            else "GB300 single-device smoke"
+        ),
     }
     print(json.dumps(report, sort_keys=True), flush=True)
     assert version_tuple(compiler_version) >= (
@@ -72,6 +89,21 @@ def main():
         167,
         8,
     ), "Driver is older than the documented GB300 stack"
+
+    # Real library loading belongs to runtime, where the container receives
+    # the host driver's NVML/CUDA libraries through the NVIDIA runtime.
+    import dynamicemb
+    import dynamicemb_extensions
+    import fbgemm_gpu
+    import torchrec
+
+    for name, module in (
+        ("fbgemm_gpu", fbgemm_gpu),
+        ("torchrec", torchrec),
+        ("dynamicemb", dynamicemb),
+        ("dynamicemb_extensions", dynamicemb_extensions),
+    ):
+        assert module.__file__ == paths[name], f"Unexpected runtime module: {name}"
 
     # Run a real FBGEMM CUDA operator, not just a shared-library import.
     lengths = torch.tensor([1, 2, 0], dtype=torch.int64, device="cuda")
@@ -106,6 +138,7 @@ def main():
                 "gpu": torch.cuda.get_device_name(),
                 "cc": [10, 3],
                 "driver": driver,
+                "runtime_imports": "passed",
                 "fbgemm_cuda": "passed",
                 "dynamicemb_insert_lookup": "passed",
             }

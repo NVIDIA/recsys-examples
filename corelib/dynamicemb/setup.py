@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import importlib.metadata
 import os
 import re
 import subprocess
@@ -41,18 +42,22 @@ compatible_versions = "1.2.0"
 
 def check_torchrec_version():
     try:
-        import torchrec
+        # Importing TorchRec loads FBGEMM's CUDA libraries, which require the
+        # host driver's NVML library. CPU wheel builders only need metadata.
+        installed = importlib.metadata.version("torchrec")
+    except importlib.metadata.PackageNotFoundError as error:
+        raise RuntimeError("torchrec is not installed.") from error
 
-        version = re.match(r"^\d+\.\d+\.\d+", torchrec.__version__).group()
-        if version >= compatible_versions:
-            print(f"torchrec version {version} is installed.")
-            return
-        else:
-            raise RuntimeError(
-                f"torchrec version {version} is installed, but version >= {compatible_versions} is required."
-            )
-    except ImportError:
-        raise RuntimeError("torchrec is not installed.")
+    match = re.match(r"^\d+\.\d+\.\d+", installed)
+    if match is None:
+        raise RuntimeError(f"Cannot read torchrec version {installed!r}.")
+    version = tuple(int(part) for part in match.group().split("."))
+    minimum = tuple(int(part) for part in compatible_versions.split("."))
+    if version < minimum:
+        raise RuntimeError(
+            f"torchrec version {installed} is installed, but version >= {compatible_versions} is required."
+        )
+    print(f"torchrec version {installed} is installed.")
 
 
 def find_source_files(
