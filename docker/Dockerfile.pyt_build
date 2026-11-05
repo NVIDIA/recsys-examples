@@ -1,3 +1,6 @@
+# Legacy x86 CUDA 12.6 / Torch 2.6 image. For GB300 use the `dynamicemb`
+# target in docker/Dockerfile; see docker/GB300.md. This legacy stack cannot
+# compile SM103 and must not be used as the GB300 environment.
 ARG BASE_IMAGE=pytorch/pytorch:2.6.0-cuda12.6-cudnn9-devel
 ARG DEVEL_IMAGE=devel
 ARG RUNTIME_IMAGE=pytorch/pytorch:2.6.0-cuda12.6-cudnn9-runtime

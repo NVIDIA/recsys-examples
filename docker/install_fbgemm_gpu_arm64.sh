@@ -3,7 +3,7 @@ set -Eeuo pipefail
 
 readonly fbgemm_tag=v1.8.0
 readonly fbgemm_source=/workspace/deps/fbgemm
-readonly torch_tensor_body=/usr/local/lib/python3.12/dist-packages/torch/include/ATen/core/TensorBody.h
+readonly torch_tensor_body="$(python3 -c 'import pathlib, torch; print(pathlib.Path(torch.__file__).parent / "include/ATen/core/TensorBody.h")')"
 
 torch_tensor_body_backup=
 backup_ready=false
@@ -46,4 +46,4 @@ test "$(grep -Fc 'return repr_type(std::forward<Args>(args)...);' "${torch_tenso
 
 python3 setup.py install --build-target=default --build-variant=cuda \
   --package_channel=release \
-  -DTORCH_CUDA_ARCH_LIST='8.0 9.0a 10.0'
+  -DTORCH_CUDA_ARCH_LIST="${FBGEMM_CUDA_ARCH_LIST:-8.0 9.0a 10.0 10.3}"

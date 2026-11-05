@@ -1,4 +1,10 @@
 cmake_minimum_required(VERSION 3.18)
+
+# project() initializes CMAKE_CUDA_ARCHITECTURES to the compiler default. Keep
+# track of caller overrides before that happens (including CUDAARCHS).
+if(DEFINED CMAKE_CUDA_ARCHITECTURES OR DEFINED ENV{CUDAARCHS})
+    set(DEMB_EXPLICIT_CUDA_ARCHITECTURES TRUE)
+endif()
 project(DynamicEmbInferenceOps LANGUAGES CXX CUDA)
 
 include(GNUInstallDirs)
@@ -30,11 +36,27 @@ find_package(Torch REQUIRED)
 find_package(CUDAToolkit REQUIRED)
 
 
-if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
+if(NOT DEMB_EXPLICIT_CUDA_ARCHITECTURES)
     if(DEFINED SM)
         set(CMAKE_CUDA_ARCHITECTURES ${SM})
     else()
-        set(CMAKE_CUDA_ARCHITECTURES 70 75 80 89 90 100 120)
+        execute_process(
+            COMMAND "${CMAKE_CUDA_COMPILER}" --list-gpu-code
+            OUTPUT_VARIABLE DEMB_SUPPORTED_GPU_CODES
+            RESULT_VARIABLE DEMB_GPU_CODES_STATUS
+        )
+        if(NOT DEMB_GPU_CODES_STATUS EQUAL 0)
+            message(FATAL_ERROR "Cannot query CUDA compiler GPU targets")
+        endif()
+        set(CMAKE_CUDA_ARCHITECTURES "")
+        foreach(arch 75 80 89 90 100 103 120)
+            if(DEMB_SUPPORTED_GPU_CODES MATCHES "sm_${arch}([\r\n ]|$)")
+                list(APPEND CMAKE_CUDA_ARCHITECTURES ${arch})
+            endif()
+        endforeach()
+        if(NOT CMAKE_CUDA_ARCHITECTURES)
+            message(FATAL_ERROR "No supported DynamicEmb CUDA architectures")
+        endif()
     endif()
 endif()
 

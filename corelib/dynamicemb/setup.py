@@ -20,7 +20,7 @@ import sys
 from pathlib import Path
 
 from setuptools import find_packages, setup
-from torch.utils.cpp_extension import BuildExtension, CUDAExtension
+from torch.utils.cpp_extension import CUDA_HOME, BuildExtension, CUDAExtension
 
 subprocess.run(
     [
@@ -103,16 +103,30 @@ def get_version():
     return version, sha
 
 
-# Target GPU compute capabilities (no dot). Parsed in two places: the main
-# extension's -gencode flags and the LruLfu evict fatbins. Override with
-# DEMB_ARCHS="80;90;100".
-DEMB_ARCHS = [
-    a.strip()
-    for a in os.environ.get("DEMB_ARCHS", "75;80;90;100;120")
-    .replace(",", ";")
-    .split(";")
-    if a.strip()
-]
+def get_cuda_archs():
+    # Query the compiler, not the build host GPU: wheels are often built on
+    # CPU-only hosts. GB300 is SM103; older toolkits cannot compile it.
+    nvcc = os.path.join(CUDA_HOME or "/usr/local/cuda", "bin", "nvcc")
+    supported = set(
+        re.findall(
+            r"sm_(\d+[af]?)",
+            subprocess.check_output([nvcc, "--list-gpu-code"], text=True),
+        )
+    )
+    requested = os.environ.get("DEMB_ARCHS")
+    if requested is None:
+        archs = [a for a in ("75", "80", "90", "100", "103", "120") if a in supported]
+    else:
+        archs = [a.strip() for a in requested.replace(",", ";").split(";") if a.strip()]
+    if not archs or any(a not in supported for a in archs):
+        raise RuntimeError(
+            f"Invalid DEMB_ARCHS={requested!r}; {nvcc} supports {sorted(supported)}"
+        )
+    return archs
+
+
+# The extension and both eviction fatbins must use the same architecture set.
+DEMB_ARCHS = get_cuda_archs()
 
 
 def _gencode_flags(code_kind):

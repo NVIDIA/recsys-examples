@@ -21,6 +21,8 @@ ARG TRITON_BUILD_JOBS=8
 FROM ${BASE_IMAGE} AS base_fbgemm
 
 ARG TARGETPLATFORM
+ARG FBGEMM_BUILD_FROM_SOURCE=0
+ARG FBGEMM_CUDA_ARCH_LIST="8.0 9.0a 10.0 10.3"
 
 WORKDIR /workspace/deps
 
@@ -33,12 +35,12 @@ COPY docker/install_fbgemm_gpu_arm64.sh /usr/local/bin/install_fbgemm_gpu_arm64.
 # Using the wheel also avoids CUDA 13.3 source-compiler issues in this image.
 # The CUDA wheel is not published for aarch64, so retain the source build there.
 RUN set -eux; \
-    case "${TARGETPLATFORM}" in \
-      linux/amd64) \
+    case "${TARGETPLATFORM}:${FBGEMM_BUILD_FROM_SOURCE}" in \
+      linux/amd64:0) \
         pip install --no-cache-dir --no-deps \
           'https://download.pytorch.org/whl/cu130/fbgemm_gpu-1.8.0%2Bcu130-cp312-cp312-manylinux_2_28_x86_64.whl#sha256=b5a98aad7c662c84e04a005d0656a7da99da15bd70c7aa1cb04bfc1e868a0b48'; \
         ;; \
-      linux/arm64) \
+      linux/arm64:*|linux/amd64:1) \
         bash /usr/local/bin/install_fbgemm_gpu_arm64.sh; \
         ;; \
       *) \
@@ -55,6 +57,21 @@ RUN pip install --no-deps tensordict orjson && \
     cd torchrec && \
     test "$(git rev-parse HEAD)" = "$(git rev-list -n 1 v1.8.0-rc1)" && \
     pip install --no-deps .
+
+# DynamicEmb-only build for Grace Blackwell. Reuse the version-coupled PyTorch,
+# FBGEMM and TorchRec stack without building the HSTU/Triton inference services.
+# Use --platform linux/arm64 --target dynamicemb --build-arg DEMB_ARCHS=103.
+FROM base_fbgemm AS dynamicemb
+ARG DEMB_ARCHS=103
+ARG MAX_JOBS=4
+WORKDIR /workspace/recsys-examples
+COPY corelib/dynamicemb /workspace/recsys-examples/corelib/dynamicemb
+RUN python3 -m pip install --no-cache-dir ninja psutil pytest numba-cuda && \
+    cd corelib/dynamicemb && \
+    DEMB_ARCHS="${DEMB_ARCHS}" MAX_JOBS="${MAX_JOBS}" \
+      python3 -m pip install --no-build-isolation --no-deps . && \
+    cd /tmp && python3 -c 'import torch, fbgemm_gpu, torchrec, dynamicemb, dynamicemb_extensions' && \
+    python3 /workspace/recsys-examples/corelib/dynamicemb/test/check_gb300.py --build-only
 
 # ============================================================================
 # Stage 2: base_triton — base_fbgemm + Triton core, PyTorch backend, and
