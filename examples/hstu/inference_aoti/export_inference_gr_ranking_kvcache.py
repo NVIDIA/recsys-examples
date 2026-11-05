@@ -133,7 +133,6 @@ def start_flexkv_server(
         cache_config=cache_config,
         gpu_register_port=gpu_register_port,
         server_recv_port=server_recv_port,
-        total_clients=1,
         inherit_env=True,
     )
     print(

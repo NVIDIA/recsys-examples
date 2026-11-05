@@ -170,7 +170,6 @@ def _start_flexkv_server(kvcache_config: KVCacheConfig):
         cache_config=cache_config,
         gpu_register_port=kvcache_config.gpu_register_port,
         server_recv_port=kvcache_config.server_recv_port,
-        total_clients=1,
         inherit_env=True,
     )
     print("[INFO] Started FlexKV server for kvcache C++ demo", flush=True)
