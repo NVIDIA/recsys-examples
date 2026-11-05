@@ -42,6 +42,7 @@ def main():
         "nvcc": compiler_version,
         "cudnn": torch.backends.cudnn.version(),
         "fbgemm_gpu": importlib.metadata.version("fbgemm-gpu"),
+        "fbgemm_gpu_module": fbgemm_gpu.__file__,
         "torchrec": torchrec.__version__,
         "dynamicemb": dynamicemb.__file__,
         "extension": dynamicemb_extensions.__file__,
