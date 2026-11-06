@@ -1,4 +1,4 @@
-ARG BASE_IMAGE=nvcr.io/nvidia/pytorch:26.07-py3
+ARG BASE_IMAGE=nvcr.io/nvidia/pytorch:26.07-py3@sha256:2140e699b3beaf7f96a0081fd9c9406bc3832b435cdb60dfa2d261f7d2f34a1c
 ARG BASE_FBGEMM_IMAGE=base_fbgemm
 ARG BASE_TRITON_IMAGE=base_triton
 ARG DEVEL_IMAGE=devel
@@ -21,6 +21,9 @@ ARG TRITON_BUILD_JOBS=8
 FROM ${BASE_IMAGE} AS base_fbgemm
 
 ARG TARGETPLATFORM
+ARG FBGEMM_BUILD_FROM_SOURCE=0
+ARG FBGEMM_CUDA_ARCH_LIST="8.0 9.0a 10.0 10.3"
+ARG FBGEMM_BUILD_JOBS=4
 
 WORKDIR /workspace/deps
 
@@ -33,13 +36,15 @@ COPY docker/install_fbgemm_gpu_arm64.sh /usr/local/bin/install_fbgemm_gpu_arm64.
 # Using the wheel also avoids CUDA 13.3 source-compiler issues in this image.
 # The CUDA wheel is not published for aarch64, so retain the source build there.
 RUN set -eux; \
-    case "${TARGETPLATFORM}" in \
-      linux/amd64) \
+    case "${TARGETPLATFORM}:${FBGEMM_BUILD_FROM_SOURCE}" in \
+      linux/amd64:0) \
         pip install --no-cache-dir --no-deps \
           'https://download.pytorch.org/whl/cu130/fbgemm_gpu-1.8.0%2Bcu130-cp312-cp312-manylinux_2_28_x86_64.whl#sha256=b5a98aad7c662c84e04a005d0656a7da99da15bd70c7aa1cb04bfc1e868a0b48'; \
         ;; \
-      linux/arm64) \
-        bash /usr/local/bin/install_fbgemm_gpu_arm64.sh; \
+      linux/arm64:*|linux/amd64:1) \
+        CMAKE_BUILD_PARALLEL_LEVEL="${FBGEMM_BUILD_JOBS}" \
+          MAX_JOBS="${FBGEMM_BUILD_JOBS}" \
+          bash /usr/local/bin/install_fbgemm_gpu_arm64.sh; \
         ;; \
       *) \
         echo "Unsupported TARGETPLATFORM=${TARGETPLATFORM}" >&2; \
@@ -49,12 +54,30 @@ RUN set -eux; \
     python3 -c 'import importlib.metadata as m; assert m.version("fbgemm-gpu").startswith("1.8.0")'
 
 # Layer 0b: TorchRec (tightly coupled with FBGEMM C++ ops version).
-RUN pip install --no-deps tensordict orjson && \
+RUN python3 -c 'import importlib.metadata as m; from pathlib import Path; Path("/tmp/ngc-constraints.txt").write_text("".join(f"{name}=={m.version(name)}\n" for name in ("torch", "fbgemm-gpu")))' && \
+    pip install --constraint /tmp/ngc-constraints.txt tensordict==0.15.4 orjson==3.13.0 pyvers==0.2.3 cloudpickle==3.1.2 && \
     git clone --recursive --depth 1 --branch v1.8.0-rc1 \
       https://github.com/meta-pytorch/torchrec.git torchrec && \
     cd torchrec && \
     test "$(git rev-parse HEAD)" = "$(git rev-list -n 1 v1.8.0-rc1)" && \
-    pip install --no-deps .
+    pip install --constraint /tmp/ngc-constraints.txt . && \
+    python3 -c 'import tensordict, pyre_extensions, torchmetrics'
+
+# DynamicEmb-only build for Grace Blackwell. Reuse the version-coupled PyTorch,
+# FBGEMM and TorchRec stack without building the HSTU/Triton inference services.
+# Use --platform linux/arm64 --target dynamicemb --build-arg DEMB_ARCHS=103.
+FROM base_fbgemm AS dynamicemb
+ARG DEMB_ARCHS=103
+ARG MAX_JOBS=4
+WORKDIR /workspace/recsys-examples
+COPY corelib/dynamicemb /workspace/recsys-examples/corelib/dynamicemb
+RUN python3 -m pip install --no-cache-dir ninja psutil pytest numba-cuda && \
+    python3 -c 'import tensordict, pyre_extensions, torchmetrics' && \
+    cd corelib/dynamicemb && \
+    DEMB_ARCHS="${DEMB_ARCHS}" MAX_JOBS="${MAX_JOBS}" \
+      python3 -m pip install --no-build-isolation --no-deps . && \
+    cd /tmp && \
+    python3 /workspace/recsys-examples/corelib/dynamicemb/test/check_gb300.py --build-only
 
 # ============================================================================
 # Stage 2: base_triton — base_fbgemm + Triton core, PyTorch backend, and
@@ -111,9 +134,10 @@ RUN wget -O /tmp/boost.tar.gz \
 # disabled so their additional libraries and headers do not have to be staged.
 RUN set -eux; \
     parsed_upstream=; \
-    case "${BASE_IMAGE}" in \
+    base_without_digest="${BASE_IMAGE%%@*}"; \
+    case "${base_without_digest}" in \
       nvcr.io/nvidia/pytorch:[0-9][0-9].[0-9][0-9]-py3) \
-        parsed_upstream="${BASE_IMAGE#nvcr.io/nvidia/pytorch:}"; \
+        parsed_upstream="${base_without_digest#nvcr.io/nvidia/pytorch:}"; \
         parsed_upstream="${parsed_upstream%-py3}";; \
     esac; \
     effective_upstream="${UPSTREAM_PYTORCH_CONTAINER_VERSION:-${parsed_upstream}}"; \

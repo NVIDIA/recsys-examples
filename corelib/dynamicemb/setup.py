@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import importlib.metadata
 import os
 import re
 import subprocess
@@ -20,7 +21,7 @@ import sys
 from pathlib import Path
 
 from setuptools import find_packages, setup
-from torch.utils.cpp_extension import BuildExtension, CUDAExtension
+from torch.utils.cpp_extension import CUDA_HOME, BuildExtension, CUDAExtension
 
 subprocess.run(
     [
@@ -41,18 +42,22 @@ compatible_versions = "1.2.0"
 
 def check_torchrec_version():
     try:
-        import torchrec
+        # Importing TorchRec loads FBGEMM's CUDA libraries, which require the
+        # host driver's NVML library. CPU wheel builders only need metadata.
+        installed = importlib.metadata.version("torchrec")
+    except importlib.metadata.PackageNotFoundError as error:
+        raise RuntimeError("torchrec is not installed.") from error
 
-        version = re.match(r"^\d+\.\d+\.\d+", torchrec.__version__).group()
-        if version >= compatible_versions:
-            print(f"torchrec version {version} is installed.")
-            return
-        else:
-            raise RuntimeError(
-                f"torchrec version {version} is installed, but version >= {compatible_versions} is required."
-            )
-    except ImportError:
-        raise RuntimeError("torchrec is not installed.")
+    match = re.match(r"^\d+\.\d+\.\d+", installed)
+    if match is None:
+        raise RuntimeError(f"Cannot read torchrec version {installed!r}.")
+    version = tuple(int(part) for part in match.group().split("."))
+    minimum = tuple(int(part) for part in compatible_versions.split("."))
+    if version < minimum:
+        raise RuntimeError(
+            f"torchrec version {installed} is installed, but version >= {compatible_versions} is required."
+        )
+    print(f"torchrec version {installed} is installed.")
 
 
 def find_source_files(
@@ -103,16 +108,30 @@ def get_version():
     return version, sha
 
 
-# Target GPU compute capabilities (no dot). Parsed in two places: the main
-# extension's -gencode flags and the LruLfu evict fatbins. Override with
-# DEMB_ARCHS="80;90;100".
-DEMB_ARCHS = [
-    a.strip()
-    for a in os.environ.get("DEMB_ARCHS", "75;80;90;100;120")
-    .replace(",", ";")
-    .split(";")
-    if a.strip()
-]
+def get_cuda_archs():
+    # Query the compiler, not the build host GPU: wheels are often built on
+    # CPU-only hosts. GB300 is SM103; older toolkits cannot compile it.
+    nvcc = os.path.join(CUDA_HOME or "/usr/local/cuda", "bin", "nvcc")
+    supported = set(
+        re.findall(
+            r"sm_(\d+[af]?)",
+            subprocess.check_output([nvcc, "--list-gpu-code"], text=True),
+        )
+    )
+    requested = os.environ.get("DEMB_ARCHS")
+    if requested is None:
+        archs = [a for a in ("75", "80", "90", "100", "103", "120") if a in supported]
+    else:
+        archs = [a.strip() for a in requested.replace(",", ";").split(";") if a.strip()]
+    if not archs or any(a not in supported for a in archs):
+        raise RuntimeError(
+            f"Invalid DEMB_ARCHS={requested!r}; {nvcc} supports {sorted(supported)}"
+        )
+    return archs
+
+
+# The extension and both eviction fatbins must use the same architecture set.
+DEMB_ARCHS = get_cuda_archs()
 
 
 def _gencode_flags(code_kind):

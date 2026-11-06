@@ -317,7 +317,8 @@ def run(args):
                     multi_hot_sizes=args.multi_hot_sizes,
                     local_batch_size=local_batch_size,
                 )
-        ret = model(sparse_feature)  # => this is awaitable
+        with torch.no_grad():
+            ret = model(sparse_feature)  # => this is awaitable
 
         feature_names = []
         jagged_tensors = []

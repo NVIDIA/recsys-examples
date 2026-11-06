@@ -40,10 +40,15 @@ The lookup kernel algorithms implemented in DynamicEmb primarily leverage portio
 
 ### Version Compatibility
 
-DynamicEmb builds on PyTorch, FBGEMM_GPU, and TorchRec. The project Docker image installs the validated dependency set from `docker/Dockerfile`:
+DynamicEmb builds on PyTorch, FBGEMM_GPU, and TorchRec. The project Docker image configures the version-coupled dependency set in `docker/Dockerfile`:
 
-- FBGEMM_GPU `v1.5.0`
-- TorchRec `release/V1.5.0`
+- NGC PyTorch `26.07-py3` (PyTorch 2.13.0a0 / CUDA 13.3.1)
+- FBGEMM_GPU `v1.8.0`
+- TorchRec `v1.8.0-rc1`
+
+For GB300 (Grace ARM + SM103), use the reproducible build and real-GPU
+verification commands in [docker/GB300.md](../../docker/GB300.md). The legacy
+`Dockerfile.pyt_build` environment is not a GB300 build.
 
 For source installs outside the Docker image, make sure a CUDA-enabled PyTorch environment is already installed (refer to [PyTorch documentation](https://pytorch.org/get-started/locally/)), then install compatible FBGEMM_GPU and TorchRec packages.
 
@@ -54,29 +59,29 @@ Please follow the instructions below to build FBGEMM_GPU from source. It may tak
 ```bash
 # install setup tools
 pip install --no-cache setuptools-git-versioning scikit-build
-git clone --recursive -b v1.5.0 https://github.com/pytorch/FBGEMM.git fbgemm
+git clone --recursive -b v1.8.0 https://github.com/pytorch/FBGEMM.git fbgemm
 cd fbgemm/fbgemm_gpu
 # please specify the proper TORCH_CUDA_ARCH_LIST for your ENV
-python setup.py install --build-target=default --build-variant=cuda -DTORCH_CUDA_ARCH_LIST="7.5 8.0 9.0"
+python setup.py install --build-target=default --build-variant=cuda -DTORCH_CUDA_ARCH_LIST="8.0 9.0a 10.0 10.3"
 ```
 
 Once the build is done, run `python -c 'import fbgemm_gpu'` to make sure it is installed.
 
 2. **TorchRec**
 
-> torchrec >= v1.2.0; the Docker image currently validates against TorchRec `release/V1.5.0`.
+> torchrec >= v1.2.0; the Docker image currently pins TorchRec `v1.8.0-rc1`.
 
 Thanks to the torchrec team for their [support](https://github.com/meta-pytorch/torchrec/commit/6aaf1fa72e884642f39c49ef232162fa3772055e), torchrec v1.2.0 added support for custom embedding lookup module.
 
 After FBGEMM_GPU is installed, install TorchRec with:
 
 ```bash
-# torchrec depends on below 2 libs
-pip install --no-deps tensordict orjson
-git clone --recursive -b release/V1.5.0 https://github.com/pytorch/torchrec.git torchrec
+# Resolve Python dependencies without replacing the selected native packages.
+python3 -c 'import importlib.metadata as m; from pathlib import Path; Path("/tmp/torchrec-constraints.txt").write_text("".join(f"{name}=={m.version(name)}\n" for name in ("torch", "fbgemm-gpu")))'
+pip install --constraint /tmp/torchrec-constraints.txt tensordict==0.15.4 orjson==3.13.0 pyvers==0.2.3 cloudpickle==3.1.2
+git clone --recursive -b v1.8.0-rc1 https://github.com/meta-pytorch/torchrec.git torchrec
 cd torchrec
-# with --no-deps to prevent from installing dependencies
-pip install --no-deps .
+pip install --constraint /tmp/torchrec-constraints.txt .
 ```
 
 Once the install is done, run `python -c 'import torchrec'` to make sure it is installed.
