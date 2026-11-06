@@ -76,12 +76,12 @@ Thanks to the torchrec team for their [support](https://github.com/meta-pytorch/
 After FBGEMM_GPU is installed, install TorchRec with:
 
 ```bash
-# torchrec depends on below 2 libs
-pip install --no-deps tensordict orjson
+# Resolve Python dependencies without replacing the selected native packages.
+python3 -c 'import importlib.metadata as m; from pathlib import Path; Path("/tmp/torchrec-constraints.txt").write_text("".join(f"{name}=={m.version(name)}\n" for name in ("torch", "fbgemm-gpu")))'
+pip install --constraint /tmp/torchrec-constraints.txt tensordict==0.15.4 orjson==3.13.0 pyvers==0.2.3 cloudpickle==3.1.2
 git clone --recursive -b v1.8.0-rc1 https://github.com/meta-pytorch/torchrec.git torchrec
 cd torchrec
-# with --no-deps to prevent from installing dependencies
-pip install --no-deps .
+pip install --constraint /tmp/torchrec-constraints.txt .
 ```
 
 Once the install is done, run `python -c 'import torchrec'` to make sure it is installed.
