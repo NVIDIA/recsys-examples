@@ -58,7 +58,9 @@ struct CountVector {
 struct CountMessage {
   static constexpr int kNeedRemote = 0, kOwnTotal = 1, kKeyRows = 2;
   int64_t num_nodes, num_features;
-  __host__ __device__ int64_t uniq_out(int64_t owner_node) const { return 3 + owner_node; }
+  __host__ __device__ int64_t node_length_per_bucket(int64_t owner_node) const {
+    return 3 + owner_node;
+  }
   __host__ __device__ int64_t chunks_out(int64_t owner_node) const {
     return 3 + num_nodes + owner_node;
   }

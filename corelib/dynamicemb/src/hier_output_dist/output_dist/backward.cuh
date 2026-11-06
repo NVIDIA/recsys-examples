@@ -489,7 +489,7 @@ __device__ void ProxyReducer<RowT>::run(ncclWindow_t window, const Sizes &sizes,
     const int64_t uniq_lo = chunk.key_lo + place.nth * kTaskRows;
     const int num_keys = (int)min((int64_t)kTaskRows, (int64_t)chunk.key_lo + chunk.keys - uniq_lo);
     if (num_keys <= 0) continue;
-    // The lane's key (a lane per key): its rows (reducer_start), its row in
+    // The lane's key (a lane per key): its rows (node_exp_off), its row in
     // proxy_rows (where its chunk lies) and its duplicates' first slot (after
     // the chunk's keys' rows and the duplicates of the chunk's keys before
     // it). Then the wait for the rows of the chunk.
@@ -497,10 +497,10 @@ __device__ void ProxyReducer<RowT>::run(ncclWindow_t window, const Sizes &sizes,
     int64_t count = 0, key_row = 0, duplicates = 0;
     if (lane < num_keys) {
       const int64_t key = uniq_lo + lane, before = key - chunk.key_lo;
-      const int64_t begin = plan.reducer_start[key];
-      count = plan.reducer_start[key + 1] - begin;
+      const int64_t begin = plan.node_exp_off[key];
+      count = plan.node_exp_off[key + 1] - begin;
       key_row = at + before;
-      duplicates = at + chunk.keys + begin - plan.reducer_start[chunk.key_lo] - before;
+      duplicates = at + chunk.keys + begin - plan.node_exp_off[chunk.key_lo] - before;
     }
     if (lane == 0) {
       const uint64_t *pushed = layout.ctrl.pushed_rows(place.entry);
@@ -915,14 +915,14 @@ __global__ void __launch_bounds__(kThreads, 1)
       cta_sync(workers);
     }
     pass_entry_barrier(window, sizes, seq, timeline, workers);
-    const int64_t *node_offset_per_bucket = plan.offset_per_bucket + node * local_size;
+    const int64_t *local_offset_per_bucket = plan.offset_per_bucket + node * local_size;
     // Every heavy row's sub-task has a slot before the remote tasks (across
     // nodes), which those of rows to other nodes take, and one among the row
     // tasks, which those of the node's rows take.
     const int64_t heavy_subs = fanout.count[1], early_subs = num_nodes > 1 ? heavy_subs : 0;
     const int64_t remote =
         early_subs + (num_nodes > 1 ? plan.task_starts[plan.max_chunks * local_size] : 0);
-    const LocalRows local_rows{node_offset_per_bucket, local_size, me};
+    const LocalRows local_rows{local_offset_per_bucket, local_size, me};
     const int64_t rows = local_rows.count(), total = remote + rows + heavy_subs;
     const TaskQueue queue{tables.layout().ctrl.task(kQueueWork)};
     for (int64_t task = queue.next_warp(); task < total; task = queue.next_warp()) {

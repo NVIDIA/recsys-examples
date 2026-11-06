@@ -57,7 +57,7 @@ PlanView plan_view(const Plan &plan, const Sizes &sizes) {
   view.task_starts = data_of<int64_t>(plan.task_starts);
   view.num_chunks = data_of<int64_t>(plan.num_chunks);
   view.chunks = data_of<Chunk, int32_t>(plan.chunks);
-  view.uniq_off = data_of<int64_t>(plan.uniq_off);
+  view.node_offset_per_bucket = data_of<int64_t>(plan.node_offset_per_bucket);
   view.put_list = data_of<PutSeg, int32_t>(plan.put_list);
   view.put_starts = data_of<int32_t>(plan.put_starts);
   view.max_chunks = sizes.max_chunks;
@@ -86,14 +86,14 @@ auto fwd_tensors(Plan &plan) -> std::vector<decltype(&plan.src)> {
           &plan.task_starts,
           &plan.num_chunks,
           &plan.chunks,
-          &plan.uniq_off,
+          &plan.node_offset_per_bucket,
           &plan.put_list,
           &plan.put_starts,
           &plan.push_order_off,
           &plan.fwd_chunks,
           &plan.node_chunk_start,
           &plan.node_chunks,
-          &plan.uniq_out};
+          &plan.node_length_per_bucket};
 }
 
 // The backward plan's tensors, in the order of tensors() and of().
@@ -116,12 +116,12 @@ auto bwd_tensors(Plan &plan) -> std::vector<decltype(&plan.dst)> {
           &plan.task_starts,
           &plan.num_chunks,
           &plan.chunks,
-          &plan.uniq_off,
+          &plan.node_offset_per_bucket,
           &plan.put_list,
           &plan.put_starts,
           &plan.uniq_in,
           &plan.reduce_task_starts,
-          &plan.reducer_start};
+          &plan.node_exp_off};
 }
 
 }  // namespace
@@ -134,7 +134,7 @@ FwdPlanView FwdPlan::view(const Sizes &sizes) const {
   view.fwd_chunks = data_of<ChunkPiece, int32_t>(fwd_chunks);
   view.node_chunk_start = data_of<int64_t>(node_chunk_start);
   view.node_chunks = data_of<int32_t>(node_chunks);
-  view.uniq_out = data_of<int64_t>(uniq_out);
+  view.node_length_per_bucket = data_of<int64_t>(node_length_per_bucket);
   return view;
 }
 
@@ -160,7 +160,7 @@ BwdPlanView BwdPlan::view(const Sizes &sizes) const {
   view.dst = data_of<int32_t>(dst);
   view.uniq_in = data_of<int64_t>(uniq_in);
   view.reduce_task_starts = data_of<int64_t>(reduce_task_starts);
-  view.reducer_start = data_of<int64_t>(reducer_start);
+  view.node_exp_off = data_of<int64_t>(node_exp_off);
   view.heavy_subs = heavy_subs;
   return view;
 }

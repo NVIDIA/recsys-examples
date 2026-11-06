@@ -413,7 +413,7 @@ formula.
 | capacity | in the window | elsewhere |
 |---|---|---|
 | `lookup_keys` | `row_bytes` (`lookup_rows`) + 8 (`node_keys`; 12 when the keys carry weights) + across nodes `record_bytes` (`rail_keys`) | per call, 8 (12 with weights) for the owner's KJT |
-| `remote_keys` | 8 (`node_keys`; 12 with weights) + 4 (`bucket_feature_of_occ`) + 12 (`remote_map`) + `record_bytes` (`key_stage`), and `row_bytes` in `proxy_rows`, up to its cap | per call, 8 (the proxy's rows before each key, `reducer_start`) |
+| `remote_keys` | 8 (`node_keys`; 12 with weights) + 4 (`bucket_feature_of_occ`) + 12 (`remote_map`) + `record_bytes` (`key_stage`), and `row_bytes` in `proxy_rows`, up to its cap | per call, 8 (the proxy's rows before each key, `node_exp_off`) |
 
 The input dist's working memory comes on top, in the caching allocator's
 pool of the stream it runs on: that of its largest step (section 15.2).
@@ -1130,13 +1130,25 @@ window that its node's requesters and its rail's owners read:
   of each chunk start (the last: where they end), relative to that
   requester's push order.
 
+**Names.** The proxy's tables mirror the requester's, with a `node_`
+prefix. Node dedup is index dedup over the node's occurrences, and its keys
+sorted by bucket feature (owner node × `num_features` + feature) are the
+bucketize's, a bucket being an owner node: `node_uniq_keys`,
+`node_bucket_feature_of_row`, `node_offset_per_bucket_feature`,
+`node_offset_per_bucket` and `node_length_per_bucket(_feature)` mirror
+`keys`, `bucket_feature_of_row`, `offset_per_bucket_feature`,
+`offset_per_bucket` and the bucketize's lengths. `node_exp_off`, the rows
+before each key, mirrors index dedup's `exp_off`, and the tests'
+`node_reverse_indices` (each occurrence's node-unique key) its
+`reverse_indices`.
+
 A requester's push order at the proxy comes from one stable radix sort of
 the push key, the occurrence's part: requester × (`max_chunks` + 1) + its
 key's chunk. So a requester pushes its rows chunk after chunk, in each chunk
 in its own order. Its push tables give, per chunk, its first position; a
 pass over the sorted push keys writes where each part starts, so the tables
 take no search. A key's rows are its key row, then its duplicates' slots
-in occurrence order; `reducer_start` holds the rows before each key, and
+in occurrence order; `node_exp_off` holds the rows before each key, and
 where the rows lie follows from the chunk (section 12.1).
 
 **The rail.** Each rank sends each rail peer a count message
@@ -1247,12 +1259,12 @@ stream: the forward kernel `fwd_kernel` and the backward kernel
   `BwdArgs`). Each table is a tensor of a plan. Both read the requester's
   block starts and maps, and across nodes its push order and its tables of
   the node's proxies (`proxy_chunks`, `proxy_ends`, `push_tables`,
-  `task_starts`), the proxy's chunks (`num_chunks`, `chunks`, `uniq_off`)
+  `task_starts`), the proxy's chunks (`num_chunks`, `chunks`, `node_offset_per_bucket`)
   and the put lists (`put_list`, `put_starts`). The forward also reads the
   requester's `src` and `push_order_off`, the owner's `fwd_chunks` and the
-  proxy's `node_chunk_start`, `node_chunks` and `uniq_out`. The backward
+  proxy's `node_chunk_start`, `node_chunks` and `node_length_per_bucket`. The backward
   reads its `dst`, the owner's `uniq_in`, and the proxy's
-  `reduce_task_starts` and `reducer_start`.
+  `reduce_task_starts` and `node_exp_off`.
   Their strides are `max_chunks` and `num_nodes`. The call also holds what the op gives
   the kernel for it: the forward's output, the backward's gradient and its
   scratch (the heavy rows' sums and counts), across nodes the counts the
@@ -1566,7 +1578,7 @@ The capacities are the ones in place (section 5), and `row_bytes` and
 | the requester's maps | 8 bytes per key on one node (`inv`, `src`), 16 across nodes (also `dst`, `push_order`) | per call |
 | the call's small tables across nodes: the requester's of the node's proxies and its task starts, the owner's and the proxy's (section 11.1) | about `24 × local_size × max_chunks + 48 × max_chunks + 16 × owner_chunks`, plus a few KB | per call |
 | the owner's KJT values | `8 × lookup_keys` (12 with weights), from the input dist until the forward | per call |
-| the proxy's rows before each key (`reducer_start`) | `8 × remote_keys` | per call |
+| the proxy's rows before each key (`node_exp_off`) | `8 × remote_keys` | per call |
 | the put lists and the ready counters | `24 × max_chunks + 16 × owner_chunks + 32 × num_nodes × num_features` | per call |
 | index dedup's fan-out table | about 13 bytes per original key (on this path the deduplicated KJT keeps the original length) | per call |
 | the bucketize, in the caller's pool | at its peak 25 bytes per key with one owner rule (67 with three), and about 60 with index dedup while the fan-out table is made | transient |

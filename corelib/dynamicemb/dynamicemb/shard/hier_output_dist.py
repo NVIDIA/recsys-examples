@@ -103,7 +103,7 @@ def _first_difference(every: List[Dict]) -> Optional[str]:
 # Where the tensors the benchmark reads are in the plans' lists (the order of
 # FwdPlan::tensors() and BwdPlan::tensors(), in
 # src/hier_output_dist/input_dist/plan.cu).
-_FWD_OFFSET_PER_BUCKET, _FWD_NUM_CHUNKS, _FWD_UNIQ_OUT = 0, 15, 24
+_FWD_OFFSET_PER_BUCKET, _FWD_NUM_CHUNKS, _FWD_NODE_LENGTH_PER_BUCKET = 0, 15, 24
 _BWD_UNIQ_IN = 20
 
 
@@ -150,10 +150,10 @@ class HierCall:
         return self.fwd_plan[_FWD_NUM_CHUNKS]
 
     @property
-    def uniq_out(self) -> Optional[torch.Tensor]:
+    def node_length_per_bucket(self) -> Optional[torch.Tensor]:
         """Across nodes, int64 [num_nodes]: this proxy's node-unique keys of
         each owner node."""
-        return self.fwd_plan[_FWD_UNIQ_OUT]
+        return self.fwd_plan[_FWD_NODE_LENGTH_PER_BUCKET]
 
     @property
     def uniq_in(self) -> Optional[torch.Tensor]:

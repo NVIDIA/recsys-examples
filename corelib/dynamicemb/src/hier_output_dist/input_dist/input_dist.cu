@@ -168,9 +168,9 @@ InDist InChannel::input_dist(const PlanInput &input) {
     // The rail: the count messages, the layout of the rail, then the
     // proxies' key records into the owners' rail_keys and the owners'
     // source_offsets into the proxies' owner_offsets.
-    const at::Tensor message =
-        count_message(node.need_remote, node.own_total.select(0, topo.local_rank), proxy.key_rows,
-                      proxy.uniq_out, proxy.chunks_out, proxy.uniq_per_bucket_feature);
+    const at::Tensor message = count_message(
+        node.need_remote, node.own_total.select(0, topo.local_rank), proxy.key_rows,
+        proxy.node_length_per_bucket, proxy.chunks_out, proxy.node_length_per_bucket_feature);
     const at::Tensor messages = rail_count_exchange(message);
     const RailLayout rail = rail_layout(messages, node.own_lengths, other_nodes_, sizes_);
     source_offsets_.copy_(rail.source_offsets);
@@ -192,10 +192,10 @@ InDist InChannel::input_dist(const PlanInput &input) {
     words = at::Tensor();  // requester_tables is its one reader: free it before the owner tables
     const OwnerTables owner = owner_tables(rail, node.own_offsets, own_keys_, own_weights_,
                                            rail_keys_, other_nodes_, sizes_);
-    const PutLists lists = put_lists(proxy.chunks, proxy.node_chunk_start, proxy.node_chunks,
-                                     proxy.uniq_off, proxy.uniq_per_bucket_feature, owner_offsets_,
-                                     owner.fwd_chunks, owner.fwd_chunk_start,
-                                     rail.length_per_source_feature, rail.source_offsets, sizes_);
+    const PutLists lists = put_lists(
+        proxy.chunks, proxy.node_chunk_start, proxy.node_chunks, proxy.node_offset_per_bucket,
+        proxy.node_length_per_bucket_feature, owner_offsets_, owner.fwd_chunks,
+        owner.fwd_chunk_start, rail.length_per_source_feature, rail.source_offsets, sizes_);
     // The plans: the requester's maps and its tables of the node's proxies,
     // the owner's and the proxy's tables, the proxy's rows before each key
     // and the put lists. Then the owner's KJT.
@@ -208,17 +208,17 @@ InDist InChannel::input_dist(const PlanInput &input) {
     fwd.task_starts = bwd.task_starts = requester.task_starts;
     fwd.num_chunks = bwd.num_chunks = proxy.num_chunks;
     fwd.chunks = bwd.chunks = proxy.chunks;
-    fwd.uniq_off = bwd.uniq_off = proxy.uniq_off;
+    fwd.node_offset_per_bucket = bwd.node_offset_per_bucket = proxy.node_offset_per_bucket;
     fwd.put_list = bwd.put_list = lists.list;
     fwd.put_starts = bwd.put_starts = lists.starts;
     fwd.push_order_off = requester.push_order_off;
     fwd.fwd_chunks = owner.fwd_chunks;
     fwd.node_chunk_start = proxy.node_chunk_start;
     fwd.node_chunks = proxy.node_chunks;
-    fwd.uniq_out = proxy.uniq_out;
+    fwd.node_length_per_bucket = proxy.node_length_per_bucket;
     bwd.uniq_in = rail.uniq_in;
     bwd.reduce_task_starts = proxy.reduce_task_starts;
-    bwd.reducer_start = proxy.reducer_start;
+    bwd.node_exp_off = proxy.node_exp_off;
     dist.kjt_values = owner.kjt_values;
     dist.kjt_weights = owner.kjt_weights;
     dist.kjt_lengths = rail.kjt_lengths;

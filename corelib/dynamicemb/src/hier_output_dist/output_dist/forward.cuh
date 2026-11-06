@@ -308,7 +308,7 @@ struct NodeChunks {
   __device__ int64_t place(int64_t j) const { return plan.node_chunks[first + j]; }
   __device__ int64_t keys_end(int64_t j) const {
     const Chunk &chunk = plan.chunks[place(j)];
-    return (int64_t)chunk.key_lo + chunk.keys - plan.uniq_off[owner_node];
+    return (int64_t)chunk.key_lo + chunk.keys - plan.node_offset_per_bucket[owner_node];
   }
   // The first chunk whose keys end past `keys` (chunks when none does).
   __device__ int64_t first_past(int64_t keys) const {
@@ -381,7 +381,7 @@ __device__ void ProxyRelay::run(ncclWindow_t window, const ncclDevComm &dev, con
     // chunks that thereby landed
     for (int owner_node = lane; owner_node < num_nodes; owner_node += 32) {
       if (owner_node == node) continue;
-      const int64_t num_uniq = plan.uniq_out[owner_node];
+      const int64_t num_uniq = plan.node_length_per_bucket[owner_node];
       const uint64_t word = *ctrl.landed_rows(owner_node);
       const int64_t seen = LandedRows::tag(word) == seq ? (int64_t)LandedRows::payload(word) : -1;
       if (seen == num_uniq) continue;
@@ -423,7 +423,8 @@ __device__ void ProxyRelay::run(ncclWindow_t window, const ncclDevComm &dev, con
       spin.pause("rows of the owner nodes", done, lane, sizes.topo.rank);
   }
   for (int owner_node = lane; owner_node < num_nodes; owner_node += 32)
-    if (owner_node != node) *ctrl.fwd_tot(owner_node) += (uint64_t)plan.uniq_out[owner_node];
+    if (owner_node != node)
+      *ctrl.fwd_tot(owner_node) += (uint64_t)plan.node_length_per_bucket[owner_node];
   __syncwarp();
   if (lane == 0) timeline.stamp_latest(kTraceLanded);
   credits.flush_warp();  // the grants
@@ -650,8 +651,8 @@ __global__ void __launch_bounds__(kThreads, 1)
     }
     pass_entry_barrier(window, sizes, seq, timeline, workers);
     // this node's owners' rows
-    const int64_t *node_offset_per_bucket = plan.offset_per_bucket + node * local_size;
-    const LocalRows local_rows{node_offset_per_bucket, local_size, me};
+    const int64_t *local_offset_per_bucket = plan.offset_per_bucket + node * local_size;
+    const LocalRows local_rows{local_offset_per_bucket, local_size, me};
     const int64_t rows = local_rows.count(), local = rows + heavy;
     const int64_t remote = num_nodes > 1 ? plan.task_starts[plan.max_chunks * local_size] : 0;
     const int64_t total = local + remote + (num_nodes > 1 ? heavy : 0);

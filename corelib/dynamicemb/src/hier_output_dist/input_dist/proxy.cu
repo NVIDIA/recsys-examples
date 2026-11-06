@@ -164,27 +164,29 @@ __global__ void __launch_bounds__(kThreads)
 // its positions). key_rows gets the most occurrences of a valid key, one max
 // per warp.
 __global__ void __launch_bounds__(kThreads)
-    key_tables_kernel(const int32_t *identity_of_key, const int32_t *bucket_feature_of_key,
+    key_tables_kernel(const int32_t *identity_of_key, const int32_t *node_bucket_feature_of_row,
                       const int32_t *identity_start, const int32_t *order,
                       const int64_t *occurrence_keys, const int64_t *weight_ends,
-                      const int64_t *uniq_off, const int64_t *num_keys, int64_t entries,
-                      int64_t num_nodes, int64_t num_features, int32_t *key_of_identity,
-                      bool *valid_key, int32_t *key_count, int32_t *key_first, int32_t *key_node,
-                      int32_t *key_uniq, int64_t *key_value, float *key_weight, int64_t *key_rows) {
+                      const int64_t *node_offset_per_bucket, const int64_t *num_keys,
+                      int64_t entries, int64_t num_nodes, int64_t num_features,
+                      int32_t *key_of_identity, bool *valid_key, int32_t *key_count,
+                      int32_t *key_first, int32_t *key_node, int32_t *key_uniq,
+                      int64_t *node_uniq_keys, float *key_weight, int64_t *key_rows) {
   const int64_t valid_keys = *num_keys;
   int32_t most = 0;  // the most occurrences of this thread's valid keys
   for (int64_t key = first_item(); key < entries; key += item_stride()) {
     const int32_t identity = identity_of_key[key];
     const int32_t first = identity_start[identity], end = identity_start[identity + 1];
-    const int64_t owner_node = owner_node_of(bucket_feature_of_key[key], num_features, num_nodes);
+    const int64_t owner_node =
+        owner_node_of(node_bucket_feature_of_row[key], num_features, num_nodes);
     key_of_identity[identity] = (int32_t)key;
     valid_key[key] = key < valid_keys;
     key_count[key] = end - first;
     if (key < valid_keys) most = max(most, end - first);
     key_first[key] = first;
     key_node[key] = (int32_t)owner_node;
-    key_uniq[key] = (int32_t)(key - uniq_off[owner_node]);
-    key_value[key] = occurrence_keys[order[min(first, (int32_t)entries - 1)]];
+    key_uniq[key] = (int32_t)(key - node_offset_per_bucket[owner_node]);
+    node_uniq_keys[key] = occurrence_keys[order[min(first, (int32_t)entries - 1)]];
     if (key_weight != nullptr) key_weight[key] = (float)(weight_ends[end] - weight_ends[first]);
   }
   most = __reduce_max_sync(0xffffffffu, most);
@@ -203,15 +205,18 @@ __global__ void __launch_bounds__(kThreads)
 // One CTA: the node-unique keys of each bucket feature and of each owner node,
 // from where they start.
 __global__ void __launch_bounds__(kThreads)
-    key_counts_kernel(const int64_t *key_offset_per_bucket_feature, const int64_t *uniq_off,
-                      int64_t num_nodes, int64_t num_features, int64_t *uniq_per_bucket_feature,
-                      int64_t *uniq_out) {
+    key_counts_kernel(const int64_t *node_offset_per_bucket_feature,
+                      const int64_t *node_offset_per_bucket, int64_t num_nodes,
+                      int64_t num_features, int64_t *node_length_per_bucket_feature,
+                      int64_t *node_length_per_bucket) {
   for (int64_t bucket_feature = threadIdx.x; bucket_feature < num_nodes * num_features;
        bucket_feature += kThreads)
-    uniq_per_bucket_feature[bucket_feature] = key_offset_per_bucket_feature[bucket_feature + 1] -
-                                              key_offset_per_bucket_feature[bucket_feature];
+    node_length_per_bucket_feature[bucket_feature] =
+        node_offset_per_bucket_feature[bucket_feature + 1] -
+        node_offset_per_bucket_feature[bucket_feature];
   for (int64_t owner_node = threadIdx.x; owner_node < num_nodes; owner_node += kThreads)
-    uniq_out[owner_node] = uniq_off[owner_node + 1] - uniq_off[owner_node];
+    node_length_per_bucket[owner_node] =
+        node_offset_per_bucket[owner_node + 1] - node_offset_per_bucket[owner_node];
 }
 
 // ── step 2: the rows, the chunks and the slots ──
@@ -231,16 +236,17 @@ __global__ void __launch_bounds__(kThreads)
 // (j + 1) * room) (room: Sizes::chunk_room); a key spans at most room rows,
 // so no chunk is empty.
 struct Levels {
-  const int64_t *row_ends;    // [entries + 1]: the rows before each key
-  const int64_t *uniq_off;    // [num_nodes + 1]: the first key of each owner node
-  const int64_t *chunks_out;  // [num_nodes]: the chunks of each owner node
+  const int64_t *node_exp_off;            // [entries + 1]: the rows before each key
+  const int64_t *node_offset_per_bucket;  // [num_nodes + 1]: the first key of each owner node
+  const int64_t *chunks_out;              // [num_nodes]: the chunks of each owner node
   int64_t num_nodes, room;
 
   // The first key of owner node `owner_node`'s chunk j, among the node's (its
   // keys when j is its chunks).
   __device__ int64_t first_key(int64_t owner_node, int64_t j) const {
-    const int64_t first = uniq_off[owner_node], keys = uniq_off[owner_node + 1] - first;
-    return lower_bound(row_ends + first, keys, row_ends[first] + j * room);
+    const int64_t first = node_offset_per_bucket[owner_node],
+                  keys = node_offset_per_bucket[owner_node + 1] - first;
+    return lower_bound(node_exp_off + first, keys, node_exp_off[first] + j * room);
   }
   // The chunks of the levels below j: each owner node's, up to j.
   __device__ int64_t before(int64_t j) const {
@@ -254,8 +260,8 @@ struct Levels {
 // The chunks of the proxy's stream, made by one CTA (stream_kernel) in three
 // steps.
 struct StreamArgs {
-  Levels levels;            // its chunks_out is the first step's
-  const int64_t *uniq_out;  // [num_nodes]
+  Levels levels;                          // its chunks_out is the first step's
+  const int64_t *node_length_per_bucket;  // [num_nodes]
   int64_t node, max_chunks, record_bytes, ring, lap_room;
   // what the steps write: of each owner node, its chunks, where they start in
   // node_chunks, and where its slice starts in key_stage; the stream's chunks
@@ -280,11 +286,12 @@ __device__ void chunk_counts(const StreamArgs &args) {
   const Levels &levels = args.levels;
   const int64_t num_nodes = levels.num_nodes, node = args.node, max_chunks = args.max_chunks,
                 record_bytes = args.record_bytes;
-  const int64_t *uniq_out = args.uniq_out;
+  const int64_t *node_length_per_bucket = args.node_length_per_bucket;
   auto chunks_of = [&](int64_t owner_node) -> int64_t {
-    const int64_t first = levels.uniq_off[owner_node], keys = uniq_out[owner_node];
+    const int64_t first = levels.node_offset_per_bucket[owner_node],
+                  keys = node_length_per_bucket[owner_node];
     if (owner_node == node || keys <= 0) return 0;
-    return (levels.row_ends[first + keys - 1] - levels.row_ends[first]) / levels.room + 1;
+    return (levels.node_exp_off[first + keys - 1] - levels.node_exp_off[first]) / levels.room + 1;
   };
   for (int64_t owner_node = threadIdx.x; owner_node < num_nodes; owner_node += kThreads)
     args.chunks_out[owner_node] = chunks_of(owner_node);
@@ -292,7 +299,8 @@ __device__ void chunk_counts(const StreamArgs &args) {
   for (int64_t owner_node = threadIdx.x; owner_node < num_nodes; owner_node += kThreads) {
     int64_t start = 0;
     for (int64_t before = 0; before < owner_node; ++before)
-      start += chunks_of(before) * (int64_t)sizeof(ChunkPiece) + uniq_out[before] * record_bytes;
+      start += chunks_of(before) * (int64_t)sizeof(ChunkPiece) +
+               node_length_per_bucket[before] * record_bytes;
     args.stage_slice[owner_node] = start;
   }
   if (threadIdx.x == 0) {
@@ -327,14 +335,14 @@ __device__ void chunk_table(const StreamArgs &args) {
       int64_t rank = place - levels.before(level), owner_node = 0;
       for (; owner_node < levels.num_nodes - 1; ++owner_node)
         if (levels.chunks_out[owner_node] > level && rank-- == 0) break;
-      const int64_t first = levels.uniq_off[owner_node];
+      const int64_t first = levels.node_offset_per_bucket[owner_node];
       const int64_t lo_key = first + levels.first_key(owner_node, level),
                     hi_key = first + levels.first_key(owner_node, level + 1);
       chunk.owner_node = (int32_t)owner_node;
       chunk.key_lo = (int32_t)lo_key;
       chunk.keys = (int32_t)(hi_key - lo_key);
       chunk.level = (int32_t)level;
-      rows = levels.row_ends[hi_key] - levels.row_ends[lo_key];
+      rows = levels.node_exp_off[hi_key] - levels.node_exp_off[lo_key];
       args.node_chunks[clamp_index(args.node_chunk_start[owner_node] + level, max_chunks)] =
           (int32_t)place;
     }
@@ -355,7 +363,8 @@ __device__ void chunk_table(const StreamArgs &args) {
 // key_stage; the stream's end into the header. Every thread of the CTA.
 __device__ void chunk_places(const StreamArgs &args) {
   const int64_t max_chunks = args.max_chunks, ring = args.ring, lap_room = args.lap_room;
-  const int64_t *stream_ends = args.stream_ends, *uniq_off = args.levels.uniq_off;
+  const int64_t *stream_ends = args.stream_ends,
+                *node_offset_per_bucket = args.levels.node_offset_per_bucket;
   cta_exclusive_ends<int64_t>(
       max_chunks, [&](int64_t place) { return args.rows_of[place]; }, args.stream_ends);
   cta_exclusive_ends<int64_t>(
@@ -379,7 +388,7 @@ __device__ void chunk_places(const StreamArgs &args) {
     chunk.end = (uint32_t)end;
     args.header_ends[place] = (uint32_t)end;
     if (place == count - 1) *args.header_end = (uint32_t)end;
-    const int32_t uniq_lo = (int32_t)(chunk.key_lo - uniq_off[chunk.owner_node]);
+    const int32_t uniq_lo = (int32_t)(chunk.key_lo - node_offset_per_bucket[chunk.owner_node]);
     ((ChunkPiece *)(args.key_stage + args.stage_slice[chunk.owner_node]))[chunk.level] =
         ChunkPiece{uniq_lo, uniq_lo + chunk.keys, (uint32_t)start, (uint32_t)end};
   }
@@ -396,9 +405,9 @@ __global__ void __launch_bounds__(kThreads) stream_kernel(StreamArgs args) {
 
 // The duplicates' slots before key `key`, of the keys from `lo` (a key's
 // rows but its key row): rows before it less one per key.
-__device__ __forceinline__ int64_t duplicates_between(const int64_t *row_ends, int64_t lo,
+__device__ __forceinline__ int64_t duplicates_between(const int64_t *node_exp_off, int64_t lo,
                                                       int64_t key) {
-  return row_ends[key] - row_ends[lo] - (key - lo);
+  return node_exp_off[key] - node_exp_off[lo] - (key - lo);
 }
 
 // A thread per node-unique key: its chunk (from its level), and in the
@@ -411,11 +420,11 @@ __device__ __forceinline__ int64_t duplicates_between(const int64_t *row_ends, i
 template <typename Record>
 __global__ void __launch_bounds__(kThreads)
     key_rows_kernel(Levels levels, const int32_t *key_node, const int32_t *key_count,
-                    const int64_t *key_value, const float *key_weight, const int32_t *node_chunks,
-                    const int64_t *node_chunk_start, const int64_t *stage_slice,
-                    const int64_t *num_keys, int64_t max_chunks, int64_t ring, Chunk *chunks,
-                    int32_t *key_chunk, int32_t *key_row, int32_t *duplicate_base,
-                    char *key_stage) {
+                    const int64_t *node_uniq_keys, const float *key_weight,
+                    const int32_t *node_chunks, const int64_t *node_chunk_start,
+                    const int64_t *stage_slice, const int64_t *num_keys, int64_t max_chunks,
+                    int64_t ring, Chunk *chunks, int32_t *key_chunk, int32_t *key_row,
+                    int32_t *duplicate_base, char *key_stage) {
   const int64_t valid_keys = *num_keys;
   const int lane = threadIdx.x & 31;
   // a warp's keys at a time, so every lane takes part in the sums
@@ -424,9 +433,10 @@ __global__ void __launch_bounds__(kThreads)
     int64_t place = -1;  // past the keys: none
     int32_t occurrences = 0;
     if (key < valid_keys) {
-      const int64_t owner_node = key_node[key], first = levels.uniq_off[owner_node];
-      const int64_t level = min((levels.row_ends[key] - levels.row_ends[first]) / levels.room,
-                                max(levels.chunks_out[owner_node] - 1, (int64_t)0));
+      const int64_t owner_node = key_node[key], first = levels.node_offset_per_bucket[owner_node];
+      const int64_t level =
+          min((levels.node_exp_off[key] - levels.node_exp_off[first]) / levels.room,
+              max(levels.chunks_out[owner_node] - 1, (int64_t)0));
       place = clamp_index(
           node_chunks[clamp_index(node_chunk_start[owner_node] + level, max_chunks)], max_chunks);
       const Chunk &chunk = chunks[place];
@@ -434,11 +444,11 @@ __global__ void __launch_bounds__(kThreads)
       const int64_t keys_end = at + chunk.keys;  // the end of its keys' rows
       key_chunk[key] = (int32_t)place;
       key_row[key] = (int32_t)(at + key - lo);
-      duplicate_base[key] = (int32_t)(keys_end + duplicates_between(levels.row_ends, lo, key));
+      duplicate_base[key] = (int32_t)(keys_end + duplicates_between(levels.node_exp_off, lo, key));
       Record *records = (Record *)(key_stage + stage_slice[owner_node] +
                                    levels.chunks_out[owner_node] * (int64_t)sizeof(ChunkPiece));
       Record record{};
-      record.key = key_value[key];
+      record.key = node_uniq_keys[key];
       if constexpr (Record::kWeighted) record.weight = key_weight[key];
       records[key - first] = record;
       occurrences = key_count[key];
@@ -458,7 +468,7 @@ __global__ void __launch_bounds__(kThreads)
 __global__ void __launch_bounds__(kThreads)
     occurrence_slots_kernel(const int32_t *order, const int32_t *key_at, const int32_t *key_first,
                             const int32_t *key_row, const int32_t *duplicate_base,
-                            const int64_t *row_ends, const int64_t *requester_start,
+                            const int64_t *node_exp_off, const int64_t *requester_start,
                             const int64_t *occurrence_count, int64_t local_size,
                             int32_t *requester_of, int32_t *map_key_row, int32_t *map_slot) {
   const int64_t count = *occurrence_count;
@@ -468,7 +478,7 @@ __global__ void __launch_bounds__(kThreads)
         min(max(upper_bound(requester_start, local_size + 1, occurrence) - 1, (int64_t)0),
             local_size - 1);
     const int64_t place = position - key_first[key];  // among the key's occurrences
-    const int64_t rows = row_ends[key + 1] - row_ends[key];
+    const int64_t rows = node_exp_off[key + 1] - node_exp_off[key];
     const int64_t slot =
         place == 0 || place >= rows ? key_row[key] : duplicate_base[key] + place - 1;
     requester_of[occurrence] = (int32_t)requester;
@@ -628,13 +638,14 @@ ProxyKeys proxy_keys(const ProxyInput &input, const Sizes &sizes, bool node_dedu
       keys.num_keys.data_ptr<int64_t>(), entries, num_nodes, num_features,
       identity_bucket_feature.data_ptr<int32_t>());
   C10_CUDA_KERNEL_LAUNCH_CHECK();
-  at::Tensor bucket_feature_of_key, identity_of_key;
-  std::tie(bucket_feature_of_key, identity_of_key) =
+  at::Tensor node_bucket_feature_of_row, identity_of_key;
+  std::tie(node_bucket_feature_of_row, identity_of_key) =
       sort_pairs(identity_bucket_feature, index, bits_for(bucket_features + 1));
-  const at::Tensor key_offset_per_bucket_feature = at::empty({bucket_features + 1}, long_options);
-  keys.uniq_off = at::empty({num_nodes + 1}, long_options);
-  run_starts<int32_t, int64_t>(bucket_feature_of_key, bucket_features,
-                               key_offset_per_bucket_feature, num_features, keys.uniq_off);
+  const at::Tensor node_offset_per_bucket_feature = at::empty({bucket_features + 1}, long_options);
+  keys.node_offset_per_bucket = at::empty({num_nodes + 1}, long_options);
+  run_starts<int32_t, int64_t>(node_bucket_feature_of_row, bucket_features,
+                               node_offset_per_bucket_feature, num_features,
+                               keys.node_offset_per_bucket);
   // per key, and the key of each sorted position
   const at::Tensor key_of_identity = at::empty({entries}, int_options);
   keys.valid_key = at::empty({entries}, bool_options);
@@ -642,18 +653,18 @@ ProxyKeys proxy_keys(const ProxyInput &input, const Sizes &sizes, bool node_dedu
   keys.key_first = at::empty({entries}, int_options);
   keys.key_node = at::empty({entries}, int_options);
   keys.key_uniq = at::empty({entries}, int_options);
-  keys.key_value = at::empty({entries}, long_options);
+  keys.node_uniq_keys = at::empty({entries}, long_options);
   if (sizes.weighted_records())
     keys.key_weight = at::empty({entries}, input.keys.options().dtype(at::kFloat));
   key_tables_kernel<<<item_grid(entries), kThreads, 0, stream>>>(
-      identity_of_key.data_ptr<int32_t>(), bucket_feature_of_key.data_ptr<int32_t>(),
+      identity_of_key.data_ptr<int32_t>(), node_bucket_feature_of_row.data_ptr<int32_t>(),
       identity_start.data_ptr<int32_t>(), keys.order.data_ptr<int32_t>(),
       input.keys.data_ptr<int64_t>(), data_or_null<int64_t>(weight_ends),
-      keys.uniq_off.data_ptr<int64_t>(), keys.num_keys.data_ptr<int64_t>(), entries, num_nodes,
-      num_features, key_of_identity.data_ptr<int32_t>(), keys.valid_key.data_ptr<bool>(),
+      keys.node_offset_per_bucket.data_ptr<int64_t>(), keys.num_keys.data_ptr<int64_t>(), entries,
+      num_nodes, num_features, key_of_identity.data_ptr<int32_t>(), keys.valid_key.data_ptr<bool>(),
       keys.key_count.data_ptr<int32_t>(), keys.key_first.data_ptr<int32_t>(),
       keys.key_node.data_ptr<int32_t>(), keys.key_uniq.data_ptr<int32_t>(),
-      keys.key_value.data_ptr<int64_t>(), data_or_null<float>(keys.key_weight),
+      keys.node_uniq_keys.data_ptr<int64_t>(), data_or_null<float>(keys.key_weight),
       keys.key_rows.data_ptr<int64_t>());
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   keys.key_at = at::empty({entries}, int_options);
@@ -662,12 +673,13 @@ ProxyKeys proxy_keys(const ProxyInput &input, const Sizes &sizes, bool node_dedu
       keys.key_at.data_ptr<int32_t>());
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   // per bucket feature and per owner node
-  keys.uniq_per_bucket_feature = at::empty({bucket_features}, long_options);
-  keys.uniq_out = at::empty({num_nodes}, long_options);
+  keys.node_length_per_bucket_feature = at::empty({bucket_features}, long_options);
+  keys.node_length_per_bucket = at::empty({num_nodes}, long_options);
   key_counts_kernel<<<kOneCta, kThreads, 0, stream>>>(
-      key_offset_per_bucket_feature.data_ptr<int64_t>(), keys.uniq_off.data_ptr<int64_t>(),
-      num_nodes, num_features, keys.uniq_per_bucket_feature.data_ptr<int64_t>(),
-      keys.uniq_out.data_ptr<int64_t>());
+      node_offset_per_bucket_feature.data_ptr<int64_t>(),
+      keys.node_offset_per_bucket.data_ptr<int64_t>(), num_nodes, num_features,
+      keys.node_length_per_bucket_feature.data_ptr<int64_t>(),
+      keys.node_length_per_bucket.data_ptr<int64_t>());
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   return keys;
 }
@@ -687,7 +699,7 @@ ProxyChunks proxy_chunks_and_slots(ProxyKeys &keys, const at::Tensor &requester_
       keys.valid_key.data_ptr<bool>(), keys.key_count.data_ptr<int32_t>(), entries,
       (int32_t)sizes.max_key_rows(), rows.data_ptr<int32_t>());
   C10_CUDA_KERNEL_LAUNCH_CHECK();
-  chunks.row_ends = exclusive_ends(rows);
+  chunks.node_exp_off = exclusive_ends(rows);
   // The chunks of the stream (each owner node's, by levels of its keys'
   // rows, level after level), where each lies, and key_stage's slices; the
   // stream's chunks and their ends to the proxy header too.
@@ -700,12 +712,13 @@ ProxyChunks proxy_chunks_and_slots(ProxyKeys &keys, const at::Tensor &requester_
   chunks.reduce_task_starts = at::empty({max_chunks + 1}, long_options);
   // each chunk's rows and reducer tasks, and the ends of its rows
   const at::Tensor stream_tables = at::empty({3, max_chunks + 1}, long_options);
-  const Levels levels{chunks.row_ends.data_ptr<int64_t>(), keys.uniq_off.data_ptr<int64_t>(),
+  const Levels levels{chunks.node_exp_off.data_ptr<int64_t>(),
+                      keys.node_offset_per_bucket.data_ptr<int64_t>(),
                       chunks.chunks_out.data_ptr<int64_t>(), num_nodes, sizes.chunk_room()};
   Chunk *chunk_table = records_of<Chunk>(chunks.chunks);
   StreamArgs stream_args;
   stream_args.levels = levels;
-  stream_args.uniq_out = keys.uniq_out.data_ptr<int64_t>();
+  stream_args.node_length_per_bucket = keys.node_length_per_bucket.data_ptr<int64_t>();
   stream_args.node = sizes.topo.node;
   stream_args.max_chunks = max_chunks;
   stream_args.record_bytes = sizes.record_bytes;
@@ -736,7 +749,7 @@ ProxyChunks proxy_chunks_and_slots(ProxyKeys &keys, const at::Tensor &requester_
   with_record(sizes, [&](auto record) {
     key_rows_kernel<decltype(record)><<<item_grid(entries), kThreads, 0, stream>>>(
         levels, keys.key_node.data_ptr<int32_t>(), keys.key_count.data_ptr<int32_t>(),
-        keys.key_value.data_ptr<int64_t>(), data_or_null<float>(keys.key_weight),
+        keys.node_uniq_keys.data_ptr<int64_t>(), data_or_null<float>(keys.key_weight),
         chunks.node_chunks.data_ptr<int32_t>(), chunks.node_chunk_start.data_ptr<int64_t>(),
         chunks.stage_slice.data_ptr<int64_t>(), keys.num_keys.data_ptr<int64_t>(), max_chunks,
         sizes.num_proxy_rows, chunk_table, chunks.key_chunk.data_ptr<int32_t>(),
@@ -744,7 +757,7 @@ ProxyChunks proxy_chunks_and_slots(ProxyKeys &keys, const at::Tensor &requester_
         (char *)buffers.key_stage.data_ptr<int64_t>());
   });
   C10_CUDA_KERNEL_LAUNCH_CHECK();
-  keys.key_value.reset();
+  keys.node_uniq_keys.reset();
   keys.key_weight.reset();
   // Each occurrence's slot: the key's row for its first occurrence, a
   // duplicate slot for the others.
@@ -753,7 +766,7 @@ ProxyChunks proxy_chunks_and_slots(ProxyKeys &keys, const at::Tensor &requester_
   occurrence_slots_kernel<<<item_grid(entries), kThreads, 0, stream>>>(
       keys.order.data_ptr<int32_t>(), keys.key_at.data_ptr<int32_t>(),
       keys.key_first.data_ptr<int32_t>(), key_row.data_ptr<int32_t>(),
-      duplicate_base.data_ptr<int32_t>(), chunks.row_ends.data_ptr<int64_t>(),
+      duplicate_base.data_ptr<int32_t>(), chunks.node_exp_off.data_ptr<int64_t>(),
       requester_start.data_ptr<int64_t>(), keys.occurrence_count.data_ptr<int64_t>(), local_size,
       chunks.requester_of.data_ptr<int32_t>(), remote_map.key_row(), remote_map.slot());
   C10_CUDA_KERNEL_LAUNCH_CHECK();
@@ -807,13 +820,13 @@ ProxyPlan proxy_push_order(ProxyKeys keys, ProxyChunks chunks, const at::Tensor 
       remote_map.position());
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   ProxyPlan plan;
-  plan.reducer_start = chunks.row_ends;
+  plan.node_exp_off = chunks.node_exp_off;
   plan.num_chunks = chunks.num_chunks;
   plan.occurrence_count = keys.occurrence_count;
   plan.key_rows = keys.key_rows;
-  plan.uniq_per_bucket_feature = keys.uniq_per_bucket_feature;
-  plan.uniq_off = keys.uniq_off;
-  plan.uniq_out = keys.uniq_out;
+  plan.node_length_per_bucket_feature = keys.node_length_per_bucket_feature;
+  plan.node_offset_per_bucket = keys.node_offset_per_bucket;
+  plan.node_length_per_bucket = keys.node_length_per_bucket;
   plan.chunks = chunks.chunks;
   plan.chunks_out = chunks.chunks_out;
   plan.node_chunk_start = chunks.node_chunk_start;

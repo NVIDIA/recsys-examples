@@ -587,11 +587,11 @@ def proxy_reference(case: Case, occurrences: List, node: int, remote_keys: int) 
         for occ in group:
             key_of[occ] = key
     node_of = [owner_node for owner_node, *_ in keys]
-    uniq_per_bucket_feature = [0] * (num_nodes * num_features)
+    node_length_per_bucket_feature = [0] * (num_nodes * num_features)
     for owner_node, feature, *_ in keys:
-        uniq_per_bucket_feature[owner_node * num_features + feature] += 1
-    uniq_off = [
-        sum(uniq_per_bucket_feature[: owner_node * num_features])
+        node_length_per_bucket_feature[owner_node * num_features + feature] += 1
+    node_offset_per_bucket = [
+        sum(node_length_per_bucket_feature[: owner_node * num_features])
         for owner_node in range(num_nodes + 1)
     ]
     # a row per occurrence, max_key_rows at most (a key of more: the call
@@ -604,12 +604,18 @@ def proxy_reference(case: Case, occurrences: List, node: int, remote_keys: int) 
     # the levels: owner node o's chunk j takes its keys whose rows before them,
     # among the node's, are in [j * room, (j + 1) * room)
     def first_key(owner_node: int, level: int) -> int:
-        lo, hi = uniq_off[owner_node], uniq_off[owner_node + 1]
+        lo, hi = (
+            node_offset_per_bucket[owner_node],
+            node_offset_per_bucket[owner_node + 1],
+        )
         return bisect_left(row_scan, row_scan[lo] + level * room, lo, hi) - lo
 
     chunks_out = []
     for owner_node in range(num_nodes):
-        lo, hi = uniq_off[owner_node], uniq_off[owner_node + 1]
+        lo, hi = (
+            node_offset_per_bucket[owner_node],
+            node_offset_per_bucket[owner_node + 1],
+        )
         chunks_out.append(
             0
             if owner_node == node or hi == lo
@@ -626,7 +632,7 @@ def proxy_reference(case: Case, occurrences: List, node: int, remote_keys: int) 
     chunk_rows, chunk_keys = [], []
     for owner_node, level in stream:
         lo, hi = first_key(owner_node, level), first_key(owner_node, level + 1)
-        first = uniq_off[owner_node]
+        first = node_offset_per_bucket[owner_node]
         chunk_keys.append((first + lo, hi - lo))
         chunk_rows.append(row_scan[first + hi] - row_scan[first + lo])
     ends = list(accumulate([0] + chunk_rows))
@@ -683,7 +689,7 @@ def proxy_reference(case: Case, occurrences: List, node: int, remote_keys: int) 
         for requester in range(local_size)
     ]
     # the rows before each key: its key row, then its duplicates' slots
-    reducer_start = list(accumulate([0] + rows))
+    node_exp_off = list(accumulate([0] + rows))
     # records: the key and, in 16 bytes, its weights' sum
     records = []
     for *_, value, _, group in keys:
@@ -695,7 +701,8 @@ def proxy_reference(case: Case, occurrences: List, node: int, remote_keys: int) 
         0
         if owner_node == node
         else chunks_out[owner_node] * 16
-        + (uniq_off[owner_node + 1] - uniq_off[owner_node]) * case.record_bytes
+        + (node_offset_per_bucket[owner_node + 1] - node_offset_per_bucket[owner_node])
+        * case.record_bytes
         for owner_node in range(num_nodes)
     ]
     return dict(
@@ -708,8 +715,8 @@ def proxy_reference(case: Case, occurrences: List, node: int, remote_keys: int) 
         key_rows=max(count, default=0),
         key_of=key_of,
         node_of=node_of,
-        uniq_per_bucket_feature=uniq_per_bucket_feature,
-        uniq_off=uniq_off,
+        node_length_per_bucket_feature=node_length_per_bucket_feature,
+        node_offset_per_bucket=node_offset_per_bucket,
         num_chunks=num_chunks,
         chunks=table,
         chunks_out=chunks_out,
@@ -722,7 +729,7 @@ def proxy_reference(case: Case, occurrences: List, node: int, remote_keys: int) 
         slot=slots,
         position=position,
         push_tables=push_tables,
-        reducer_start=reducer_start,
+        node_exp_off=node_exp_off,
         records=records,
         reduce_task_starts=list(
             accumulate([0] + [ceil32(table[chunk][2]) for chunk in range(capacity)])
@@ -953,8 +960,8 @@ def run_call(
             proxies[rank]["chunks"],
             proxies[rank]["node_chunk_start"],
             proxies[rank]["node_chunks"],
-            proxies[rank]["uniq_off"],
-            proxies[rank]["uniq_per_bucket_feature"],
+            proxies[rank]["node_offset_per_bucket"],
+            proxies[rank]["node_length_per_bucket_feature"],
             sizes=sizes(rank),
             **later,
         )
@@ -1060,13 +1067,19 @@ def check_proxy(
     num_chunks = ref["num_chunks"]
     expect("occurrences", int(out["occurrence_count"]), num_occurrences)
     expect("key_rows", int(out["key_rows"]), ref["key_rows"])
-    expect("keys", out["key_of_occurrence"][:num_occurrences].tolist(), ref["key_of"])
     expect(
-        "uniq_per_bucket_feature",
-        out["uniq_per_bucket_feature"].tolist(),
-        ref["uniq_per_bucket_feature"],
+        "keys", out["node_reverse_indices"][:num_occurrences].tolist(), ref["key_of"]
     )
-    expect("uniq_off", out["uniq_off"].tolist(), ref["uniq_off"])
+    expect(
+        "node_length_per_bucket_feature",
+        out["node_length_per_bucket_feature"].tolist(),
+        ref["node_length_per_bucket_feature"],
+    )
+    expect(
+        "node_offset_per_bucket",
+        out["node_offset_per_bucket"].tolist(),
+        ref["node_offset_per_bucket"],
+    )
     expect("chunks", int(out["num_chunks"]), num_chunks)
     expect(
         "chunk table",
@@ -1125,7 +1138,7 @@ def check_proxy(
             chunk = ref["chunks"][
                 ref["node_chunks"][ref["node_chunk_start"][owner_node] + level]
             ]
-            uniq_lo = chunk[1] - ref["uniq_off"][owner_node]
+            uniq_lo = chunk[1] - ref["node_offset_per_bucket"][owner_node]
             want.append([uniq_lo, uniq_lo + chunk[2], chunk[4], chunk[5]])
     expect("stage chunks", got, want)
     word = torch.tensor(
@@ -1133,7 +1146,7 @@ def check_proxy(
             (
                 stage_slice[owner_node]
                 + 16 * ref["chunks_out"][owner_node]
-                + (key - ref["uniq_off"][owner_node]) * case.record_bytes
+                + (key - ref["node_offset_per_bucket"][owner_node]) * case.record_bytes
             )
             // 8
             for key, owner_node in enumerate(ref["node_of"])
@@ -1150,7 +1163,9 @@ def check_proxy(
     expect("records", records, ref["records"])
     # the records of each bucket feature against a dedup by merge ranks, as
     # sets
-    bucket_feature_ends = list(accumulate(out["uniq_per_bucket_feature"].tolist()))
+    bucket_feature_ends = list(
+        accumulate(out["node_length_per_bucket_feature"].tolist())
+    )
     records_of: Dict = {}
     for key, record in enumerate(records):
         records_of.setdefault(
@@ -1164,8 +1179,8 @@ def check_proxy(
     # the rows before each key
     expect(
         "reducer starts",
-        out["reducer_start"][: num_keys + 1].tolist(),
-        ref["reducer_start"],
+        out["node_exp_off"][: num_keys + 1].tolist(),
+        ref["node_exp_off"],
     )
     return problems
 
@@ -1300,7 +1315,7 @@ def check_backward(
     ]
     for proxy in range(local_size):
         ref = refs[(node, proxy)]
-        reducer_start = proxies[node * local_size + proxy]["reducer_start"].tolist()
+        node_exp_off = proxies[node * local_size + proxy]["node_exp_off"].tolist()
         occurrences_of = [[] for _ in range(ref["num_keys"])]
         for occ, key in enumerate(ref["key_of"]):
             occurrences_of[key].append(ref["occurrences"][occ])
@@ -1326,8 +1341,8 @@ def check_backward(
             if sorted(store) != list(range(at, at + chunk_rows)):
                 problems.append("a chunk's pushes miss or pass its rows")
             for key in range(key_lo, key_lo + num):
-                begin, end = reducer_start[key], reducer_start[key + 1]
-                duplicates = at + num + begin - reducer_start[key_lo] - (key - key_lo)
+                begin, end = node_exp_off[key], node_exp_off[key + 1]
+                duplicates = at + num + begin - node_exp_off[key_lo] - (key - key_lo)
                 total = 0
                 for row in range(begin, end):
                     slot = (
@@ -1384,14 +1399,17 @@ def check_rail(
             problems.append("source_offsets != the owner's KJT offsets")
         if mine["put_dst"][owner_node] != slice_in[node][0]:
             problems.append("put_dst != the owner's slice_in")
-        uniq = ref["uniq_off"][owner_node + 1] - ref["uniq_off"][owner_node]
+        uniq = (
+            ref["node_offset_per_bucket"][owner_node + 1]
+            - ref["node_offset_per_bucket"][owner_node]
+        )
         chunks = ref["chunks_out"][owner_node]
         if mine["put_bytes"][owner_node] != 16 * chunks + uniq * case.record_bytes:
             problems.append("put_bytes")
         if slice_in[node][1] != chunks:
             problems.append("slice_in chunks")
         if owner["uniq_in"].tolist()[node] != uniq:
-            problems.append("uniq_in != the proxy's uniq_out")
+            problems.append("uniq_in != the proxy's node_length_per_bucket")
     offsets = mine["kjt_offsets"]
     if mine["requester_offsets"] != [
         [offsets[feature * num_sources + source] for feature in range(num_features)]
@@ -1438,8 +1456,8 @@ def check_owner(case: Case, rank: int, ranks: List[Dict], refs: Dict, out: Dict)
             ]
         for other_node in others:
             ref = refs[(other_node, rail)]
-            count = ref["uniq_per_bucket_feature"][node * num_features + feature]
-            first = ref["uniq_off"][node] + feature_start[other_node]
+            count = ref["node_length_per_bucket_feature"][node * num_features + feature]
+            first = ref["node_offset_per_bucket"][node] + feature_start[other_node]
             feature_start[other_node] += count
             lengths.append(count)
             keys += [key for key, _ in ref["records"][first : first + count]]
@@ -1485,7 +1503,7 @@ def check_put_lists(case: Case, rank: int, refs: Dict, out: Dict, owner_offsets)
         for level in range(proxy_ref["chunks_out"][owner_node]):
             place = proxy_ref["node_chunks"][first + level]
             chunk = proxy_ref["chunks"][place]
-            uniq_lo = chunk[1] - proxy_ref["uniq_off"][owner_node]
+            uniq_lo = chunk[1] - proxy_ref["node_offset_per_bucket"][owner_node]
             out_chunks.append((uniq_lo, uniq_lo + chunk[2], chunk[4], chunk[5], place))
         return out_chunks
 
@@ -1501,7 +1519,9 @@ def check_put_lists(case: Case, rank: int, refs: Dict, out: Dict, owner_offsets)
         for owner in range(num_nodes)
     ]
     lengths = [
-        ref["uniq_per_bucket_feature"][owner_node * num_features :][:num_features]
+        ref["node_length_per_bucket_feature"][owner_node * num_features :][
+            :num_features
+        ]
         for owner_node in range(num_nodes)
     ]
     kjt_offsets = list(owner_offsets)
@@ -1525,7 +1545,9 @@ def check_put_lists(case: Case, rank: int, refs: Dict, out: Dict, owner_offsets)
         fwd_chunks += [[lo, hi, start, end] for lo, hi, start, end, _ in got]
         fwd_chunk_start.append(len(fwd_chunks))
         lengths.append(
-            source_ref["uniq_per_bucket_feature"][node * num_features :][:num_features]
+            source_ref["node_length_per_bucket_feature"][node * num_features :][
+                :num_features
+            ]
         )
         kjt_offsets.append(
             [
@@ -1584,8 +1606,8 @@ def run_case(case: Case, seed: int) -> Tuple[Dict[str, List[str]], str]:
         recv.append(
             own
             + sum(
-                refs[(other_node, rail)]["uniq_off"][node + 1]
-                - refs[(other_node, rail)]["uniq_off"][node]
+                refs[(other_node, rail)]["node_offset_per_bucket"][node + 1]
+                - refs[(other_node, rail)]["node_offset_per_bucket"][node]
                 for other_node in range(num_nodes)
                 if other_node != node
             )

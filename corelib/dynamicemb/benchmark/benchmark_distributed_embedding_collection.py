@@ -866,7 +866,7 @@ class HierTraffic:
                         call.counts[0],
                         (
                             call.uniq_in,
-                            call.uniq_out,
+                            call.node_length_per_bucket,
                             call.num_chunks,
                             call.occurrences,
                         ),
@@ -882,7 +882,7 @@ class HierTraffic:
 
     def _ib(self, call) -> Optional[Tuple[torch.Tensor, ...]]:
         """A call's node-unique rows put to (uniq_in) and received from
-        (uniq_out) each node, its chunks as proxy (num_chunks) and its
+        (node_length_per_bucket) each node, its chunks as proxy (num_chunks) and its
         remote occurrences (occurrence_count); None on one node."""
         if not self.hier.multi_node:
             return None

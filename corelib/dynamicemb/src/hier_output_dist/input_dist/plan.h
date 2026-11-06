@@ -66,7 +66,8 @@ struct PlanView {
   // across nodes, the proxy's
   const int64_t *num_chunks;  // the chunks of its stream
   const Chunk *chunks;        // [max_chunks] its chunks, in stream order
-  const int64_t *uniq_off;    // [num_nodes + 1] its first node-unique key of each owner node
+  const int64_t
+      *node_offset_per_bucket;  // [num_nodes + 1] its first node-unique key of each owner node
   // across nodes, the owner's forward and the proxy's backward put lists
   // (planner.h): the segments of each node from put_starts[node]
   const PutSeg *put_list;
@@ -114,10 +115,10 @@ struct FwdPlanView : PlanView {
   const ChunkPiece *fwd_chunks;  // [owner_chunks] the chunks of its node in each source node's
                                  // stream, its forward put list's (PutSeg::chunk)
   // across nodes, the proxy's
-  const int64_t *node_chunk_start;  // [num_nodes + 1] where each owner node's chunks start in
-                                    // node_chunks
-  const int32_t *node_chunks;       // [max_chunks] each owner node's chunks in order
-  const int64_t *uniq_out;          // [num_nodes] its node-unique keys of each owner node
+  const int64_t *node_chunk_start;        // [num_nodes + 1] where each owner node's chunks start in
+                                          // node_chunks
+  const int32_t *node_chunks;             // [max_chunks] each owner node's chunks in order
+  const int64_t *node_length_per_bucket;  // [num_nodes] its node-unique keys of each owner node
 
   // The owner's forward put list's segments for a proxy node.
   __device__ __forceinline__ int64_t fwd_puts(int proxy_node) const {
@@ -133,7 +134,7 @@ struct BwdPlanView : PlanView {
   // across nodes, the proxy's
   const int64_t *reduce_task_starts;  // [max_chunks + 1] its reducers' tasks before each chunk
                                       // (32 keys each)
-  const int64_t *reducer_start;       // [remote_keys + 1] the rows before each key (planner.h)
+  const int64_t *node_exp_off;        // [remote_keys + 1] the rows before each key (planner.h)
   // the plan's counts (BwdPlan)
   int64_t heavy_subs;  // sub-tasks of the requester's heavy rows
 
@@ -157,9 +158,9 @@ struct FwdPlan {
   FanoutTables fanout;
   // across nodes, the tables both kernels read
   at::Tensor push_order, proxy_chunks, proxy_ends, push_tables, task_starts, num_chunks, chunks,
-      uniq_off, put_list, put_starts;
+      node_offset_per_bucket, put_list, put_starts;
   // across nodes, the forward's own
-  at::Tensor push_order_off, fwd_chunks, node_chunk_start, node_chunks, uniq_out;
+  at::Tensor push_order_off, fwd_chunks, node_chunk_start, node_chunks, node_length_per_bucket;
 
   // Rows of the requester's output: its input's rows, the original ones.
   int64_t num_out() const { return fanout.exp_idx.numel(); }
@@ -179,9 +180,9 @@ struct BwdPlan {
   FanoutTables fanout;
   // across nodes, the tables both kernels read
   at::Tensor push_order, proxy_chunks, proxy_ends, push_tables, task_starts, num_chunks, chunks,
-      uniq_off, put_list, put_starts;
+      node_offset_per_bucket, put_list, put_starts;
   // across nodes, the backward's own
-  at::Tensor uniq_in, reduce_task_starts, reducer_start;
+  at::Tensor uniq_in, reduce_task_starts, node_exp_off;
 
   BwdPlanView view(const Sizes &sizes) const;
   std::vector<at::Tensor> tensors() const;
