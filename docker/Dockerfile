@@ -54,12 +54,14 @@ RUN set -eux; \
     python3 -c 'import importlib.metadata as m; assert m.version("fbgemm-gpu").startswith("1.8.0")'
 
 # Layer 0b: TorchRec (tightly coupled with FBGEMM C++ ops version).
-RUN pip install --no-deps tensordict==0.15.4 orjson==3.13.0 pyvers==0.2.3 cloudpickle==3.1.2 && \
+RUN python3 -c 'import importlib.metadata as m; from pathlib import Path; Path("/tmp/ngc-constraints.txt").write_text("".join(f"{name}=={m.version(name)}\n" for name in ("torch", "fbgemm-gpu")))' && \
+    pip install --constraint /tmp/ngc-constraints.txt tensordict==0.15.4 orjson==3.13.0 pyvers==0.2.3 cloudpickle==3.1.2 && \
     git clone --recursive --depth 1 --branch v1.8.0-rc1 \
       https://github.com/meta-pytorch/torchrec.git torchrec && \
     cd torchrec && \
     test "$(git rev-parse HEAD)" = "$(git rev-list -n 1 v1.8.0-rc1)" && \
-    pip install --no-deps .
+    pip install --constraint /tmp/ngc-constraints.txt . && \
+    python3 -c 'import tensordict, pyre_extensions, torchmetrics'
 
 # DynamicEmb-only build for Grace Blackwell. Reuse the version-coupled PyTorch,
 # FBGEMM and TorchRec stack without building the HSTU/Triton inference services.
@@ -70,7 +72,7 @@ ARG MAX_JOBS=4
 WORKDIR /workspace/recsys-examples
 COPY corelib/dynamicemb /workspace/recsys-examples/corelib/dynamicemb
 RUN python3 -m pip install --no-cache-dir ninja psutil pytest numba-cuda && \
-    python3 -c 'import tensordict' && \
+    python3 -c 'import tensordict, pyre_extensions, torchmetrics' && \
     cd corelib/dynamicemb && \
     DEMB_ARCHS="${DEMB_ARCHS}" MAX_JOBS="${MAX_JOBS}" \
       python3 -m pip install --no-build-isolation --no-deps . && \

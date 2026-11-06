@@ -161,7 +161,14 @@ class BuildOnlyCheckTest(unittest.TestCase):
                     tensordict_available=False, missing_dependency=dependency
                 )
 
-    def run_build_check(self, tensordict_available, missing_dependency="pyvers"):
+    def test_missing_torchrec_python_dependency_fails_on_cpu(self):
+        for dependency in ("pyre_extensions", "torchmetrics"):
+            with self.subTest(dependency=dependency):
+                self.run_build_check(False, dependency, missing_import=dependency)
+
+    def run_build_check(
+        self, tensordict_available, missing_dependency="pyvers", missing_import=None
+    ):
         torch = ModuleType("torch")
         torch.__path__ = []
         torch.__version__ = "2.13.0"
@@ -176,10 +183,14 @@ class BuildOnlyCheckTest(unittest.TestCase):
         tensordict.__file__ = "/packages/tensordict/__init__.py"
         modules = {
             "tensordict": tensordict,
+            "pyre_extensions": ModuleType("pyre_extensions"),
+            "torchmetrics": ModuleType("torchmetrics"),
             "torch": torch,
             "torch.utils": torch.utils,
             "torch.utils.cpp_extension": extension,
         }
+        for name in ("pyre_extensions", "torchmetrics"):
+            modules[name].__file__ = f"/packages/{name}/__init__.py"
         versions = {
             "torchrec": "1.8.0",
             "fbgemm-gpu": "1.8.0",
@@ -187,11 +198,15 @@ class BuildOnlyCheckTest(unittest.TestCase):
             "tensordict": "0.15.4",
             "pyvers": "0.2.3",
             "cloudpickle": "3.1.2",
+            "pyre-extensions": "0.0.32",
+            "torchmetrics": "1.0.3",
         }
         import_without_gpu = block_runtime_imports(builtins.__import__)
 
         def import_dependencies(name, *args, **kwargs):
-            if name == "tensordict" and not tensordict_available:
+            if name == missing_import or (
+                name == "tensordict" and not tensordict_available and not missing_import
+            ):
                 raise ModuleNotFoundError(f"No module named '{missing_dependency}'")
             return import_without_gpu(name, *args, **kwargs)
 
