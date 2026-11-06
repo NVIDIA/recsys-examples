@@ -61,7 +61,9 @@ __device__ __forceinline__ void fanout_row(const char *src, int64_t begin, int64
 // first original row in one warp copy; the few that repeat are then copied on
 // from there (local memory, whatever the source was). Heavy rows are left to
 // their sub-tasks, but for their first original row when `heavy_first` (their
-// sub-tasks then copy from there).
+// sub-tasks then copy from there). The warp copy keeps kVectors vectors in
+// flight per lane (warp_copy_rows).
+template <int kVectors>
 __device__ __forceinline__ void warp_copy_fanout(const char *src, int64_t dedup_row, int num_rows,
                                                  int vec, int lane, const Fanout &fanout, char *out,
                                                  int row_bytes, bool heavy_first) {
@@ -74,7 +76,7 @@ __device__ __forceinline__ void warp_copy_fanout(const char *src, int64_t dedup_
       dst = out + (int64_t)fanout.exp_idx[first_entry] * row_bytes;
   }
   if (__ballot_sync(kFull, lane < num_rows && dst == nullptr) == 0) {
-    warp_copy_rows(src, dst, num_rows, vec, lane);
+    warp_copy_rows<kVectors>(src, dst, num_rows, vec, lane);
   } else {
     const int total = num_rows * vec;
     for (int base = 0; base < total; base += 32) {
@@ -127,6 +129,12 @@ __device__ __forceinline__ void warp_copy_fanout(const char *src, int64_t dedup_
 // steps.
 
 namespace fwd {
+
+// The vectors in flight per lane of a pull's warp copy (warp_copy_rows): 8 on
+// one node. Across nodes 4, which leaves the task loop the registers of its
+// multi-node paths, so it has no spills. NVLink moves rows as fast with 4 as
+// with 8 in flight per lane (32 CTAs of 16 warps).
+constexpr int kPullVectors = 8, kPullVectorsMulti = 4;
 
 // One pull task of a warp: at most kTaskRows rows, a lane each, from a node
 // peer's lookup_rows (a row task) or a proxy's proxy_rows (a remote task),
@@ -264,7 +272,8 @@ __device__ __forceinline__ bool remote_pull_warp(const Sizes &sizes, int64_t seq
 // Every lane of the warp: the task's rows into the output; a remote task's,
 // when its proxy's stream wraps the ring, counted pulled at the proxy and
 // (staged: index dedup's heavy rows across nodes) at this rank; and the task
-// into the timeline.
+// into the timeline. The warp copy keeps kVectors vectors in flight per lane.
+template <int kVectors>
 __device__ __forceinline__ void pull_warp(const Sizes &sizes, const FwdArgs &args,
                                           const OutTables &tables, const Pull &pull, bool staged,
                                           int lane) {
@@ -274,8 +283,8 @@ __device__ __forceinline__ void pull_warp(const Sizes &sizes, const FwdArgs &arg
   const bool remote = pull.remote;
   const OutTimeline timeline{args.trace, sizes.topo.local_size};
   const unsigned long long start = timeline.on() ? now_ns() : 0;
-  warp_copy_fanout(pull.src, pull.out_row, num_rows, vec, lane, plan.fanout, args.out, row_bytes,
-                   remote);
+  warp_copy_fanout<kVectors>(pull.src, pull.out_row, num_rows, vec, lane, plan.fanout, args.out,
+                             row_bytes, remote);
   if (remote && plan.wraps(peer)) {
     // The task's rows are out of proxy_rows (the warp's loads, before the
     // release).
@@ -350,17 +359,19 @@ struct NodeChunks {
 // rows it published (landed_rows, tagged with this out_seq) and fwd_tot.
 struct ProxyRelay {
   // Every lane of the relay warp, in forward seq.
+  template <ncclGinType_t kGin>
   __device__ static void run(ncclWindow_t window, const ncclDevComm &dev, const Sizes &sizes,
                              int64_t seq, const FwdArgs &args);
 };
 
+template <ncclGinType_t kGin>
 __device__ void ProxyRelay::run(ncclWindow_t window, const ncclDevComm &dev, const Sizes &sizes,
                                 int64_t seq, const FwdArgs &args) {
   const FwdPlanView &plan = args.plan;
   const int lane = threadIdx.x & 31, num_nodes = sizes.topo.num_nodes, node = sizes.topo.node;
   const int64_t ring = sizes.num_proxy_rows;
   const CtrlLayout ctrl = NodeWindow(window, sizes.topo.local_rank).layout(sizes).ctrl;
-  ncclGin rows(dev, kCtxFwd), cred(dev, kCtxCredit);
+  ncclGin rows = gin_context<kGin>(dev, kCtxFwd), cred = gin_context<kGin>(dev, kCtxCredit);
   const ncclTeam rail = ncclTeamRail(dev);
   const Credits credits(cred, rail);
   const OutTimeline timeline{args.trace, sizes.topo.local_size};
@@ -447,15 +458,18 @@ __device__ void ProxyRelay::run(ncclWindow_t window, const ncclDevComm &dev, con
 // first.
 struct OwnerIssuer {
   // Every lane of the issuer warp, in forward seq.
+  template <ncclGinType_t kGin>
   __device__ static void run(ncclWindow_t window, const ncclDevComm &dev, const Sizes &sizes,
                              int64_t seq, const FwdArgs &args);
 };
 
+template <ncclGinType_t kGin>
 __device__ void OwnerIssuer::run(ncclWindow_t window, const ncclDevComm &dev, const Sizes &sizes,
                                  int64_t seq, const FwdArgs &args) {
   const FwdPlanView &plan = args.plan;
   const int lane = threadIdx.x & 31, num_nodes = sizes.topo.num_nodes, node = sizes.topo.node;
-  ncclGin rows(dev, kCtxFwd), cred(dev, kCtxCredit);
+  ncclGin rows = gin_context<kGin>(dev, kCtxFwd, NCCL_GIN_RESOURCE_SHARING_CTA);
+  ncclGin cred = gin_context<kGin>(dev, kCtxCredit);
   const ncclTeam rail = ncclTeamRail(dev);
   const OutTimeline timeline{args.trace, sizes.topo.local_size};
   const NodeWindow node_window(window, sizes.topo.local_rank);
@@ -566,10 +580,11 @@ namespace fwd {
 // (bwd_ready), and the proxy grants each rail owner the ring's rows of the
 // next kernel's stream. (At the end of a backward the proxy's issuer sends
 // its grants itself, bwd::ProxyIssuer.)
+template <ncclGinType_t kGin>
 __device__ void next_kernel_credits_warp(ncclWindow_t window, const ncclDevComm &dev,
                                          const Sizes &sizes, int64_t seq) {
   const int lane = threadIdx.x & 31, num_nodes = sizes.topo.num_nodes, node = sizes.topo.node;
-  ncclGin cred(dev, kCtxCredit);
+  ncclGin cred = gin_context<kGin>(dev, kCtxCredit);
   const CtrlLayout ctrl = NodeWindow(window, sizes.topo.local_rank).layout(sizes).ctrl;
   const ncclTeam rail = ncclTeamRail(dev);
   const Credits credits(cred, rail);
@@ -590,8 +605,9 @@ __device__ void next_kernel_credits_warp(ncclWindow_t window, const ncclDevComm 
 // node peer has too. After it nobody reads this rank's lookup_rows or
 // proxy_rows any more, so the next out kernel or lookup may write them;
 // across nodes warp 0 then sends the credits for the next out kernel (not
-// compiled in on one node, kMulti false). Every thread of the last CTA.
-template <bool kMulti>
+// compiled in on one node, kGin NCCL_GIN_TYPE_NONE). Every thread of the last
+// CTA.
+template <ncclGinType_t kGin>
 __device__ __forceinline__ void exit(ncclWindow_t window, const ncclDevComm &dev,
                                      const Sizes &sizes, int64_t seq, const FwdArgs &args) {
   const int tid = threadIdx.x;
@@ -607,8 +623,9 @@ __device__ __forceinline__ void exit(ncclWindow_t window, const ncclDevComm &dev
   for (int peer = tid; peer < sizes.topo.local_size; peer += blockDim.x)
     pulled.wait(peer, "exit barrier of the forward");
   __syncthreads();
-  if (kMulti && sizes.topo.num_nodes > 1 && (tid >> 5) == 0)
-    next_kernel_credits_warp(window, dev, sizes, seq);
+  if constexpr (kGin != NCCL_GIN_TYPE_NONE)
+    if (sizes.topo.num_nodes > 1 && (tid >> 5) == 0)
+      next_kernel_credits_warp<kGin>(window, dev, sizes, seq);
   if (tid == 0) timeline.stamp_latest(kTraceExited);
 }
 
@@ -625,11 +642,14 @@ __device__ __forceinline__ void exit(ncclWindow_t window, const ncclDevComm &dev
 // entry barrier and takes its tasks. Every CTA then arrives, and the last one
 // ends the forward for this rank (fwd::exit). It takes the op's window, its
 // GIN device communicator and its sizes, its out_seq (seq) and the arrive
-// word before it (arrive0), and the call (args).
-template <bool kMulti>
+// word before it (arrive0), and the call (args). It is built once for each
+// GIN backend (kGin, gin_context); NCCL_GIN_TYPE_NONE is the kernel for one
+// node (kMulti false).
+template <ncclGinType_t kGin>
 __global__ void __launch_bounds__(kThreads, 1)
     fwd_kernel(ncclWindow_t window, ncclDevComm dev, Sizes sizes, int64_t seq, int64_t arrive0,
                FwdArgs args) {
+  constexpr bool kMulti = kGin != NCCL_GIN_TYPE_NONE;
   const FwdPlanView &plan = args.plan;
   const Fanout &fanout = plan.fanout;
   const int local_size = sizes.topo.local_size, num_nodes = kMulti ? sizes.topo.num_nodes : 1,
@@ -639,10 +659,12 @@ __global__ void __launch_bounds__(kThreads, 1)
   timeline.begin_cta();
   const int workers = num_nodes > 1 && blockIdx.x == 0 ? kThreads - 64 : kThreads;
   if (tid >= workers) {
-    if (warp == kWarps - 1)
-      fwd::ProxyRelay::run(window, dev, sizes, seq, args);
-    else
-      fwd::OwnerIssuer::run(window, dev, sizes, seq, args);
+    if constexpr (kMulti) {
+      if (warp == kWarps - 1)
+        fwd::ProxyRelay::run<kGin>(window, dev, sizes, seq, args);
+      else
+        fwd::OwnerIssuer::run<kGin>(window, dev, sizes, seq, args);
+    }
   } else {
     const OutTables tables(window, sizes, args.plan);
     const int64_t heavy = fanout.count[1];
@@ -695,11 +717,12 @@ __global__ void __launch_bounds__(kThreads, 1)
       } else {
         if (!fwd::remote_pull_warp(sizes, seq, args, tables, task - local, lane, pull)) continue;
       }
-      fwd::pull_warp(sizes, args, tables, pull, staged, lane);
+      fwd::pull_warp<kMulti ? fwd::kPullVectorsMulti : fwd::kPullVectors>(sizes, args, tables, pull,
+                                                                          staged, lane);
     }
   }
   if (!arrive_cta(window, sizes, arrive0, timeline)) return;  // the last CTA goes on
-  fwd::exit<kMulti>(window, dev, sizes, seq, args);
+  fwd::exit<kGin>(window, dev, sizes, seq, args);
 }
 
 }  // namespace hier_output_dist

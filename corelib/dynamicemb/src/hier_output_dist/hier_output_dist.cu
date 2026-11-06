@@ -56,8 +56,9 @@ std::string why_not(int readiness, int local_size) {
       return c10::str("the NCCL LSA team (NVLink domain) does not hold all ", local_size,
                       " ranks of its node");
     case kNoGin:
-      return "NCCL GIN does not connect the nodes' rails, gives fewer than 4 contexts, or its "
-             "signals do not start at 0";
+      return "NCCL GIN does not connect the nodes' rails, gives fewer than 4 contexts, its "
+             "connections are of different backends or of none the kernels are built for, or "
+             "its signals do not start at 0";
     default:  // kNoMemory
       return "it could not allocate its window";
   }
@@ -129,6 +130,19 @@ cudaError_t launch_exit_kernel(ncclWindow_t window, const ncclDevComm &dev, cons
                                uint64_t limit_ns) {
   exit_kernel<<<1, 32>>>(window, dev, sizes, limit_ns);
   return cudaGetLastError();
+}
+
+// The GIN backend of every connection of `dev` (ncclGinType_t), or
+// NCCL_GIN_TYPE_NONE when they differ or it is not one the out kernels are
+// built for (gin_context).
+ncclGinType_t gin_type_of(const ncclDevComm &dev) {
+  if (dev.ginConnectionCount == 0) return NCCL_GIN_TYPE_NONE;
+  const int type = dev.ginNetDeviceTypes[0];
+  for (int c = 1; c < dev.ginConnectionCount; ++c)
+    if (dev.ginNetDeviceTypes[c] != type) return NCCL_GIN_TYPE_NONE;
+  return type == NCCL_GIN_TYPE_PROXY || type == NCCL_GIN_TYPE_GDAKI || type == NCCL_GIN_TYPE_GPI
+             ? (ncclGinType_t)type
+             : NCCL_GIN_TYPE_NONE;
 }
 
 // Signals and counters start at 0 (NCCL zeroes them): every comparison is
@@ -233,7 +247,7 @@ HierOutputDist::HierOutputDist(const std::string &unique_id, int64_t rank, int64
   in_ = std::make_unique<InChannel>(config_, sizes_, window_->handle(), communicator_->dev(),
                                     window_->layout(), device_);
   out_ = std::make_unique<OutChannel>(config_, sizes_, window_->handle(), communicator_->dev(),
-                                      window_->layout(), device_);
+                                      communicator_->gin_type(), window_->layout(), device_);
   if (sizes_.multi_node() && !communicator_->gin_railed() && sizes_.topo.rank == 0)
     fprintf(stderr,
             "[hier_output_dist] NCCL connected GIN to every rank, not only to the rails it uses, "
@@ -403,7 +417,8 @@ Communicator::Communicator(const std::string &unique_id, const Topo &topo, int c
     TORCH_CHECK(props.deviceApiSupport, "hier_output_dist: NCCL device API not supported here");
     // One node: LSA only, no GIN context. Across nodes: the rails over GIN,
     // 4 contexts (a hint: the count is checked), 3 signals per node and
-    // `counters` counters each. Without GIN the op cannot run (gin_ok).
+    // `counters` counters each, all of one backend the out kernels are built
+    // for (gin_type). Without GIN the op cannot run (gin_ok).
     ncclDevCommRequirements reqs = NCCL_DEV_COMM_REQUIREMENTS_INITIALIZER;
     const bool gin = topo.num_nodes > 1 && props.railedGinType != NCCL_GIN_TYPE_NONE;
     reqs.ginContextCount = gin ? kGinContexts : 0;
@@ -412,7 +427,8 @@ Communicator::Communicator(const std::string &unique_id, const Topo &topo, int c
     reqs.ginConnectionType = gin ? NCCL_GIN_CONNECTION_RAIL : NCCL_GIN_CONNECTION_NONE;
     reqs.ginQueueDepth = gin ? 512 : 0;
     HIER_NCCL_CHECK(ncclDevCommCreate(comm_, &reqs, &dev_));
-    gin_ok_ = gin && (int)dev_.ginContextCount >= kGinContexts &&
+    gin_type_ = gin ? gin_type_of(dev_) : NCCL_GIN_TYPE_NONE;
+    gin_ok_ = gin_type_ != NCCL_GIN_TYPE_NONE && (int)dev_.ginContextCount >= kGinContexts &&
               gin_signals_zero(dev_, topo.num_nodes, counters);
   } catch (...) {
     abort();

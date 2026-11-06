@@ -50,6 +50,15 @@ __device__ __forceinline__ uint64_t ld_acquire_gpu(const uint64_t *addr) {
   asm volatile("ld.acquire.gpu.global.u64 %0, [%1];" : "=l"(value) : "l"(addr) : "memory");
   return value;
 }
+// A poll of a flag, when the reader makes a fence after it before what the
+// flag guards (an acquire pattern). An acquire load drops the whole L1 cache
+// of its SM (CCTL.IVALL): a warp that polls with it in a fast loop makes the
+// other warps of its SM miss in L1.
+__device__ __forceinline__ uint64_t ld_relaxed_sys(const uint64_t *addr) {
+  uint64_t value;
+  asm volatile("ld.relaxed.sys.global.u64 %0, [%1];" : "=l"(value) : "l"(addr) : "memory");
+  return value;
+}
 __device__ __forceinline__ void st_release_sys(uint64_t *addr, uint64_t value) {
   asm volatile("st.release.sys.global.u64 [%0], %1;" ::"l"(addr), "l"(value) : "memory");
 }
@@ -87,18 +96,23 @@ __device__ __forceinline__ uint64_t now_ns() {
 }
 
 // Waits report instead of hanging forever: after `limit` ns the kernel prints
-// what it was waiting for and traps.
+// what it was waiting for and traps (timed_out). The report is a separate
+// function: when it was inline, its printf used registers at each wait, also
+// at the waits in the task loops of the out kernels.
+[[noreturn]] __device__ __noinline__ inline void timed_out(const char *what, long long first,
+                                                           long long second, int rank) {
+  printf("[hier_output_dist] rank %d timed out waiting for %s (%lld, %lld)\n", rank, what, first,
+         second);
+  __trap();
+}
 struct Spin {
   uint64_t start_ns, limit;
   uint32_t polls = 0;
   __device__ explicit Spin(uint64_t limit_ns) : start_ns(now_ns()), limit(limit_ns) {}
   __device__ __forceinline__ void pause(const char *what, long long first, long long second,
                                         int rank) {
-    if (((++polls) & 1023) == 0 && now_ns() - start_ns > limit) {
-      printf("[hier_output_dist] rank %d timed out waiting for %s (%lld, %lld)\n", rank, what,
-             first, second);
-      __trap();
-    }
+    if (((++polls) & 1023) == 0 && now_ns() - start_ns > limit)
+      timed_out(what, first, second, rank);
     __nanosleep(64);
   }
 };
@@ -152,23 +166,24 @@ __device__ __forceinline__ int seg_search(const BoundT *bounds, int count, int64
 
 // Every lane holds one row of up to 32: `src`/`dst` byte pointers (lanes with
 // lane >= num_rows hold anything). Copies num_rows rows of vec 16-byte vectors
-// each, 8 vectors in flight per lane. Loads go through L2 only
-// (ld.global.cg): a row another GPU wrote must not come from a stale L1 line.
+// each, kVectors vectors in flight per lane (in registers: 4 each). Loads go
+// through L2 only (ld.global.cg): a row another GPU wrote must not come from a
+// stale L1 line.
+template <int kVectors>
 __device__ __forceinline__ void warp_copy_rows(const char *src, char *dst, int num_rows, int vec,
                                                int lane) {
-  constexpr int kUnroll = 8;
   const int total = num_rows * vec;
-  for (int base = 0; base < total; base += 32 * kUnroll) {
-    int4 vecs[kUnroll];
+  for (int base = 0; base < total; base += 32 * kVectors) {
+    int4 vecs[kVectors];
 #pragma unroll
-    for (int step = 0; step < kUnroll; ++step) {
+    for (int step = 0; step < kVectors; ++step) {
       const int idx = base + step * 32 + lane;
       const int row = idx / vec;
       const char *src_row = from_lane(src, row & 31);
       if (idx < total) vecs[step] = __ldcg((const int4 *)src_row + (idx - row * vec));
     }
 #pragma unroll
-    for (int step = 0; step < kUnroll; ++step) {
+    for (int step = 0; step < kVectors; ++step) {
       const int idx = base + step * 32 + lane;
       const int row = idx / vec;
       char *dst_row = from_lane(dst, row & 31);
@@ -336,6 +351,29 @@ struct TaggedWord {
 // in channel's messages. A GIN warp's lane l works with the rail peers on
 // nodes l, l + 32, l + 64, ...
 
+// The out kernels are built once for each GIN backend (kGin, an
+// ncclGinType_t; NCCL_GIN_TYPE_NONE on one node, where the kernels use no
+// GIN). The host launches the kernels of the backend that all GIN contexts
+// of its communicator have (Communicator::gin_type). NCCL compiles each GIN
+// call for all backends and selects one at run time from the backend of the
+// context. A context that holds kGin as a constant keeps only the code of
+// kGin. Together, the code of all the backends used more registers than the
+// out kernels have. `mode`: who uses its QPs (one each per rail peer). GPU,
+// the default, lets the warps of every CTA use them. An issuer warp of CTA 0
+// is the only user of its rows context's QPs, a lane each: CTA, as DeepEP
+// does for a QP that one SM uses. In GPU mode, each put takes its QP's slots
+// with GPU-scope atomics and a GPU-scope acquire fence, which drops the L1
+// cache of the SM (the other warps of CTA 0 then miss in L1).
+template <ncclGinType_t kGin>
+__device__ __forceinline__ ncclGin
+gin_context(const ncclDevComm &dev, int index,
+            ncclGinResourceSharingMode mode = NCCL_GIN_RESOURCE_SHARING_GPU) {
+  static_assert(kGin != NCCL_GIN_TYPE_NONE, "one node has no GIN context");
+  ncclGin gin(dev, index, mode);
+  gin._ginBackend = (uint32_t)kGin;
+  return gin;
+}
+
 // Credits on the rail: payload-free signals of GIN context kCtxCredit (the
 // caller's `gin`) whose value only grows. A sender adds the difference to the
 // value it sent before, which it keeps in a word of its own, so its peer
@@ -359,6 +397,11 @@ struct Credits {
   }
   // The credit `sig` that rail peers raised at this rank (acquire).
   __device__ __forceinline__ uint64_t read(int sig) const { return gin.readSignal(sig); }
+  // The same without acquire (ld_relaxed_sys): the caller makes a fence after
+  // it before what the credit allows.
+  __device__ __forceinline__ uint64_t read_relaxed(int sig) const {
+    return gin.readSignal(sig, 64, cuda::memory_order_relaxed);
+  }
   // Every lane of the warp: once it returns, no credit the warp raised is in
   // flight.
   __device__ __forceinline__ void flush_warp() const { gin.flush(ncclCoopWarp{}); }

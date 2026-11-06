@@ -69,10 +69,11 @@ class Trace {
 class OutChannel {
  public:
   // window and dev: the op's registered window and its GIN device
-  // communicator, which the kernels take; layout: the window over this
-  // rank's copy.
+  // communicator, which the kernels take; gin: the GIN backend of dev's
+  // contexts (NCCL_GIN_TYPE_NONE on one node), whose kernels it launches;
+  // layout: the window over this rank's copy.
   OutChannel(const Config &config, const Sizes &sizes, ncclWindow_t window, const ncclDevComm &dev,
-             const WindowLayout &layout, int device);
+             ncclGinType_t gin, const WindowLayout &layout, int device);
 
   // fwd_kernel on the current stream: this rank's rows, from the
   // lookup_rows of its node's owners and (across nodes) the proxy_rows of
@@ -115,6 +116,7 @@ class OutChannel {
   int world_size_, device_, sms_;
   int ctas_, reduce_ctas_;  // Config's (0: out_ctas' default)
   bool multi_node_;
+  ncclGinType_t gin_;
   Trace trace_;
 };
 

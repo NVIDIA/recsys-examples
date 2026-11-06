@@ -38,16 +38,41 @@ namespace hier_output_dist {
 
 namespace {
 
-const void *forward_kernel(bool multi_node) {
-  return multi_node ? (const void *)fwd_kernel<true> : (const void *)fwd_kernel<false>;
+// The kernels of GIN backend `gin` (gin_context; NCCL_GIN_TYPE_NONE: one
+// node).
+const void *forward_kernel(ncclGinType_t gin) {
+  switch (gin) {
+    case NCCL_GIN_TYPE_PROXY:
+      return (const void *)fwd_kernel<NCCL_GIN_TYPE_PROXY>;
+    case NCCL_GIN_TYPE_GDAKI:
+      return (const void *)fwd_kernel<NCCL_GIN_TYPE_GDAKI>;
+    case NCCL_GIN_TYPE_GPI:
+      return (const void *)fwd_kernel<NCCL_GIN_TYPE_GPI>;
+    default:
+      return (const void *)fwd_kernel<NCCL_GIN_TYPE_NONE>;
+  }
 }
 
-const void *backward_kernel(at::ScalarType dtype) {
+template <typename RowT>
+const void *backward_kernel_of(ncclGinType_t gin) {
+  switch (gin) {
+    case NCCL_GIN_TYPE_PROXY:
+      return (const void *)bwd_kernel<RowT, NCCL_GIN_TYPE_PROXY>;
+    case NCCL_GIN_TYPE_GDAKI:
+      return (const void *)bwd_kernel<RowT, NCCL_GIN_TYPE_GDAKI>;
+    case NCCL_GIN_TYPE_GPI:
+      return (const void *)bwd_kernel<RowT, NCCL_GIN_TYPE_GPI>;
+    default:
+      return (const void *)bwd_kernel<RowT, NCCL_GIN_TYPE_NONE>;
+  }
+}
+
+const void *backward_kernel(at::ScalarType dtype, ncclGinType_t gin) {
   TORCH_CHECK(dtype == at::kFloat || dtype == at::kBFloat16 || dtype == at::kHalf,
               "hier_output_dist: gradient rows must be fp32, bf16 or fp16, got ", dtype);
-  return dtype == at::kFloat      ? (const void *)bwd_kernel<float>
-         : dtype == at::kBFloat16 ? (const void *)bwd_kernel<__nv_bfloat16>
-                                  : (const void *)bwd_kernel<__half>;
+  return dtype == at::kFloat      ? backward_kernel_of<float>(gin)
+         : dtype == at::kBFloat16 ? backward_kernel_of<__nv_bfloat16>(gin)
+                                  : backward_kernel_of<__half>(gin);
 }
 
 // The heavy rows' sub-tasks of a backward whose gradient rows are of `dtype`
@@ -64,7 +89,8 @@ const void *heavy_kernel(at::ScalarType dtype) {
 constexpr int kNcclReserve = 32;
 
 OutChannel::OutChannel(const Config &config, const Sizes &sizes, ncclWindow_t window,
-                       const ncclDevComm &dev, const WindowLayout &layout, int device)
+                       const ncclDevComm &dev, ncclGinType_t gin, const WindowLayout &layout,
+                       int device)
     : sizes_(sizes),
       window_(window),
       dev_(dev),
@@ -77,6 +103,7 @@ OutChannel::OutChannel(const Config &config, const Sizes &sizes, ncclWindow_t wi
       ctas_(config.ctas),
       reduce_ctas_(config.reduce_ctas),
       multi_node_(sizes.multi_node()),
+      gin_(multi_node_ ? gin : NCCL_GIN_TYPE_NONE),
       trace_(device) {}
 
 // DYNAMICEMB_GIN_CTAS if set. Else on one node 32 for the forward and 64 for
@@ -136,7 +163,7 @@ at::Tensor OutChannel::forward(const FwdPlan &plan, const at::Tensor &lookup_out
   args.plan = plan.view(sizes_);
   args.out = (char *)out.data_ptr();
   args.ready = ready.defined() ? ready.data_ptr<int64_t>() : nullptr;
-  launch(forward_kernel(multi_node_), OutKernel::kForward, out_ctas(OutKernel::kForward), args);
+  launch(forward_kernel(gin_), OutKernel::kForward, out_ctas(OutKernel::kForward), args);
   return out;
 }
 
@@ -144,7 +171,7 @@ void OutChannel::backward(const BwdPlan &plan, at::Tensor grad, bool divide) {
   c10::cuda::CUDAGuard guard(device_);
   grad = grad.contiguous();
   if (grad.numel() > 0 && (uintptr_t)grad.data_ptr() % 16 != 0) grad = grad.clone();
-  const void *kernel = backward_kernel(grad.scalar_type());
+  const void *kernel = backward_kernel(grad.scalar_type(), gin_);
   // The heavy rows' sub-tasks' fp32 sums, and across nodes the proxy's keys
   // reduced of each chunk of its stream (the kernel zeroes those).
   const auto options = grad.options();

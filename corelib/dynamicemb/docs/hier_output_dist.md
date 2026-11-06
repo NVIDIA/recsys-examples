@@ -218,7 +218,8 @@ every rank before you drop a model (section 4.6).
   file name for every version: with `NCCL_HOME`, put its `lib` directory on
   `LD_LIBRARY_PATH`).
 * NCCL's device API on the GPUs. Across nodes: GIN on the rail connection,
-  with at least 4 contexts.
+  with at least 4 contexts, all of one backend (proxy, GDAKI or GPI;
+  section 11.1).
 * Ranks numbered node by node (the code assumes it; torchrun and Slurm's
   default task layout do this), and forming whole nodes.
 * Fewer than 2^31 − 1024 (rank, feature) pairs: `world_size × num_features`
@@ -1267,6 +1268,28 @@ the gradients of the heavy rows (section 11.4).
 * **Arguments.** Each out kernel takes the op's window, its GIN device
   communicator and its sizes, its `out_seq` and the `arrive` word before
   it, and its call (`FwdArgs`, `BwdArgs`): the call's plan and tensors.
+* **One build for each GIN backend.** Each out kernel is built once for each
+  GIN backend (proxy, GDAKI and GPI), and once for one node, where it uses
+  no GIN. The communicator checks that all its GIN contexts have the same
+  backend, and the out channel launches the kernels of that backend. NCCL
+  compiles each GIN call for all its backends and selects one at run time.
+  With the code of all the backends, the out kernels needed more registers
+  than they have (128 for each thread, at 512 threads for each CTA), so the
+  compiler moved values to local memory (spills). With the code of one
+  backend, and with 4 vectors in flight per lane in the pulls of the forward
+  across nodes (section 11.3), there are no spills: `ptxas -v` shows 0 bytes
+  of spill stores and loads for each out kernel, for sm_75 to sm_120
+  (CUDA 13.2).
+* **QP sharing and polls.** Only the issuer warp of CTA 0 uses the QPs of
+  its rows context (one lane for each rail peer). So the issuers use these
+  contexts in CTA sharing mode (`gin_context`), as DeepEP does for a QP that
+  one SM uses. In the default GPU mode, each put takes its slots in the QP
+  with GPU-scope atomics and a GPU-scope acquire fence. An acquire at GPU or
+  system scope drops the L1 cache of the SM (`CCTL.IVALL`), and the other
+  warps of CTA 0 then miss in L1. For the same reason, the backward's issuer
+  polls the credits and the chunks' `ready` words with relaxed loads
+  (`Credits::read_relaxed`, `ld_relaxed_sys`): the fence before the puts of
+  each chunk orders these loads.
 * **Tables.** The kernels read the call's tables from global memory,
   through typed pointers in the call: the forward's plan as it reads it
   (`FwdPlanView`, in `FwdArgs`) and the backward's (`BwdPlanView`, in
@@ -1324,7 +1347,12 @@ forward, so the lookup and its backward share a stream.
 * **Requester** (all other warps): pulls each of its rows from the
   same-node owner's `lookup_rows`, or, once its chunk has landed, from its
   proxy's `proxy_rows`, and writes it to every original row of its
-  deduplicated row in its output.
+  deduplicated row in its output. A warp copies the rows of a task in
+  16-byte vectors through registers. Each lane has 8 vectors in flight on
+  one node, and 4 across nodes: across nodes, the task loop also needs the
+  registers of its multi-node paths, and with 8 vectors it had spills.
+  NVLink moves the rows as fast with 4 vectors in flight as with 8 (32 CTAs
+  of 16 warps).
 * **Task order.**
   * Local queue: the row tasks of the node's owners. Index dedup's
     sub-tasks of the heavy rows of these owners are spread among them.
@@ -1351,7 +1379,8 @@ forward, so the lookup and its backward share a stream.
   a grant of the ring's rows (the stream's positions below `num_proxy_rows`)
   to each rail owner.
 
-On one node the forward kernel is built without the code for several nodes.
+On one node, the forward kernel and the backward kernel are built without
+the code for several nodes (section 11.1).
 
 ### 11.4 The backward kernel
 
@@ -1947,7 +1976,7 @@ Paths from `corelib/dynamicemb`.
       with a memory order, bounded waits, warp and CTA helpers, a search, row
       vectors, the window as the node's GPUs map it (`NodeWindow`), the syncs
       on its control words (`NodeBarrier`, `PeerFlags`), and GIN on the rail
-      (`rail_put`, `RowPut`, `RailMessage`, `Credits`);
+      (`gin_context`, `rail_put`, `RowPut`, `RailMessage`, `Credits`);
   * `input_dist/`, the input dist:
     * `input_dist.h`, `input_dist.cu`: what the input dist of a call gives
       (`InDist`) and the in channel (`InChannel`), whose `input_dist`
@@ -1966,7 +1995,8 @@ Paths from `corelib/dynamicemb`.
   * `output_dist/`, the output dist:
     * `output_dist.h`, `output_dist.cu`: the out channel (`OutChannel`),
       which launches the out kernels, and their trace (`Trace`).
-      `output_dist.cu` is the one file that compiles the out kernels;
+      `output_dist.cu` is the one file that compiles the out kernels, once
+      for each GIN backend;
     * `args.cuh`: the call each out kernel takes, its plan and its tensors
       (`FwdArgs`, `BwdArgs`);
     * `out_kernels.cuh`: what both out kernels share (their timeline, the

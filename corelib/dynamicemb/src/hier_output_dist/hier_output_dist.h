@@ -70,6 +70,9 @@ class Communicator {
   // signals and counters start at 0.
   bool lsa_ok() const { return dev_.lsaSize == topo_.local_size; }
   bool gin_ok() const { return topo_.num_nodes == 1 || gin_ok_; }
+  // The GIN backend of every context (NCCL_GIN_TYPE_NONE on one node, or
+  // when not gin_ok), whose out kernels run.
+  ncclGinType_t gin_type() const { return gin_type_; }
   // Across nodes, whether NCCL connected GIN on the rails only, as asked (it
   // does so only when NCCL_CROSS_NIC is 0; else GIN's memory grows with the
   // ranks).
@@ -92,6 +95,7 @@ class Communicator {
   ncclComm_t comm_ = nullptr;
   ncclDevComm dev_{};
   bool gin_ok_ = false;
+  ncclGinType_t gin_type_ = NCCL_GIN_TYPE_NONE;
   int device_ = 0;
   size_t granularity_ = 0;
 };

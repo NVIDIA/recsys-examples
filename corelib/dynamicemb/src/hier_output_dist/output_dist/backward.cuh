@@ -568,10 +568,12 @@ struct ChunkReady {
 // kernel's stream, and the warp flushes the credits' context.
 struct ProxyIssuer {
   // Every lane of the issuer warp, in backward seq.
+  template <ncclGinType_t kGin>
   __device__ static void run(ncclWindow_t window, const ncclDevComm &dev, const Sizes &sizes,
                              int64_t seq, const BwdArgs &args);
 };
 
+template <ncclGinType_t kGin>
 __device__ void ProxyIssuer::run(ncclWindow_t window, const ncclDevComm &dev, const Sizes &sizes,
                                  int64_t seq, const BwdArgs &args) {
   __shared__ int64_t read_chunks;  // lane 0's chunks read, for the other lanes
@@ -580,7 +582,8 @@ __device__ void ProxyIssuer::run(ncclWindow_t window, const ncclDevComm &dev, co
   const int64_t ring = sizes.num_proxy_rows, counters = sizes.counters();
   const NodeWindow node_window(window, sizes.topo.local_rank);
   const WindowLayout layout = node_window.layout(sizes);
-  ncclGin rows(dev, kCtxBwd), cred(dev, kCtxCredit);
+  ncclGin rows = gin_context<kGin>(dev, kCtxBwd, NCCL_GIN_RESOURCE_SHARING_CTA);
+  ncclGin cred = gin_context<kGin>(dev, kCtxCredit);
   const ncclTeam rail = ncclTeamRail(dev);
   const Credits credits(cred, rail);
   const OutTimeline timeline{args.trace, sizes.topo.local_size};
@@ -618,7 +621,9 @@ __device__ void ProxyIssuer::run(ncclWindow_t window, const ncclDevComm &dev, co
       int64_t *at = layout.ctrl.put_at(owner_node);
       int64_t done = *at;  // segments before it are put
       const int64_t end = plan.bwd_puts(owner_node + 1);
-      if (done < end && (int64_t)credits.read(sig_bwd_ready(num_nodes, owner_node)) >= seq) {
+      // The polls are relaxed: put.fence() comes before each chunk's puts.
+      if (done < end &&
+          (int64_t)credits.read_relaxed(sig_bwd_ready(num_nodes, owner_node)) >= seq) {
         // each chunk the reducers counted ready; a chunk's segments are
         // consecutive
         for (int64_t seg_start = done; seg_start < end;) {
@@ -628,7 +633,7 @@ __device__ void ProxyIssuer::run(ncclWindow_t window, const ncclDevComm &dev, co
           for (; seg_end < end && plan.put_list[seg_end].chunk == chunk; ++seg_end)
             keys += plan.put_list[seg_end].rows;
           uint64_t *ready = (uint64_t *)&args.ready[chunk];
-          const ChunkReady state{ld_acquire_sys(ready)};
+          const ChunkReady state{ld_relaxed_sys(ready)};
           if (!state.posted() && state.keys() >= keys) {
             if (first) timeline.stamp_earliest(kTraceFirstPut);
             first = false;
@@ -721,21 +726,24 @@ class LandingWatcher {
  public:
   // Every lane of the watcher warp (arrive0: the arrive word before this
   // kernel).
+  template <ncclGinType_t kGin>
   __device__ static void run(ncclWindow_t window, const ncclDevComm &dev, const Sizes &sizes,
                              int64_t arrive0, const BwdArgs &args);
   // The backward's last CTA when it is CTA 0 (the watcher stopped before
   // every row had landed), every lane of its warp 0: the rows of the lane's
   // nodes the watcher had not seen, binned into the kernel's row as they land
   // (the CTA's shared copy is folded already), and when the last one landed.
+  template <ncclGinType_t kGin>
   __device__ static void rest(ncclWindow_t window, const ncclDevComm &dev, const Sizes &sizes,
                               const BwdArgs &args, int lane);
 };
 
+template <ncclGinType_t kGin>
 __device__ void LandingWatcher::run(ncclWindow_t window, const ncclDevComm &dev, const Sizes &sizes,
                                     int64_t arrive0, const BwdArgs &args) {
   const int lane = threadIdx.x & 31;
   const CtrlLayout ctrl = NodeWindow(window, sizes.topo.local_rank).layout(sizes).ctrl;
-  ncclGin rows(dev, kCtxBwd);
+  ncclGin rows = gin_context<kGin>(dev, kCtxBwd);
   const OutTimeline timeline{args.trace, sizes.topo.local_size};
   const uint64_t others = (uint64_t)(arrive0 + gridDim.x - 1);
   uint64_t seen = 0, got = 0, need = 0;
@@ -759,10 +767,11 @@ __device__ void LandingWatcher::run(ncclWindow_t window, const ncclDevComm &dev,
   timeline.shared()[kSmLanded + lane] = seen;
 }
 
+template <ncclGinType_t kGin>
 __device__ void LandingWatcher::rest(ncclWindow_t window, const ncclDevComm &dev,
                                      const Sizes &sizes, const BwdArgs &args, int lane) {
   const OutTimeline timeline{args.trace, sizes.topo.local_size};
-  ncclGin rows(dev, kCtxBwd);
+  ncclGin rows = gin_context<kGin>(dev, kCtxBwd);
   uint64_t seen = timeline.shared()[kSmLanded + lane], got = 0, need = 0;
   lane_landed_rows(window, sizes, args, rows, lane, got, need);
   if (seen >= need) return;
@@ -814,6 +823,7 @@ namespace bwd {
 // lanes taking the rail peers in turn) for the gradient rows the proxy on
 // each other node puts into this owner's lookup_rows: its bwd_rows signal
 // against the running total (bwd_tot, of this rank's control words `ctrl`).
+template <ncclGinType_t kGin>
 __device__ __forceinline__ void wait_rail_rows_warp(ncclWindow_t window, const ncclDevComm &dev,
                                                     const Sizes &sizes, const BwdArgs &args,
                                                     const CtrlLayout &ctrl) {
@@ -822,8 +832,8 @@ __device__ __forceinline__ void wait_rail_rows_warp(ncclWindow_t window, const n
   // row had landed; another one comes after it saw them all
   // (LandingWatcher).
   if (OutTimeline{args.trace, sizes.topo.local_size}.on() && blockIdx.x == 0)
-    LandingWatcher::rest(window, dev, sizes, args, lane);
-  ncclGin rows(dev, kCtxBwd);
+    LandingWatcher::rest<kGin>(window, dev, sizes, args, lane);
+  ncclGin rows = gin_context<kGin>(dev, kCtxBwd);
   for (int peer_node = lane; peer_node < sizes.topo.num_nodes; peer_node += 32) {
     if (peer_node == sizes.topo.node) continue;
     const uint64_t want =
@@ -839,8 +849,10 @@ __device__ __forceinline__ void wait_rail_rows_warp(ncclWindow_t window, const n
 // the task queues back to 0, tells every owner of the node that this rank's
 // gradient rows are in (its flag pushed[local_rank] there) and waits until
 // every requester of the node has told it the same; across nodes warp 0 then
-// waits until the gradient rows of every rail proxy have landed. This rank's
-// lookup_grad is then complete. Every thread of the last CTA.
+// waits until the gradient rows of every rail proxy have landed (not
+// compiled in on one node, kGin NCCL_GIN_TYPE_NONE). This rank's lookup_grad
+// is then complete. Every thread of the last CTA.
+template <ncclGinType_t kGin>
 __device__ __forceinline__ void exit(ncclWindow_t window, const ncclDevComm &dev,
                                      const Sizes &sizes, int64_t seq, const BwdArgs &args) {
   const int tid = threadIdx.x;
@@ -855,8 +867,9 @@ __device__ __forceinline__ void exit(ncclWindow_t window, const ncclDevComm &dev
   }
   for (int peer = tid; peer < sizes.topo.local_size; peer += blockDim.x)
     pushed.wait(peer, "gradient rows pushed");
-  if (sizes.topo.num_nodes > 1 && (tid >> 5) == 0)
-    wait_rail_rows_warp(window, dev, sizes, args, ctrl);
+  if constexpr (kGin != NCCL_GIN_TYPE_NONE)
+    if (sizes.topo.num_nodes > 1 && (tid >> 5) == 0)
+      wait_rail_rows_warp<kGin>(window, dev, sizes, args, ctrl);
   if (timeline.on()) {
     __syncthreads();
     if (tid == 0) timeline.stamp_latest(kTraceExited);
@@ -873,13 +886,16 @@ __device__ __forceinline__ void exit(ncclWindow_t window, const ncclDevComm &dev
 // (before this rank publishes its out_seq), passes the entry barrier and
 // takes its tasks. Every CTA then arrives, and the last one ends the
 // backward for this rank (bwd::exit). It takes what fwd_kernel takes, with
-// its call (args).
-template <typename RowT>
+// its call (args). It is built once for each GIN backend, as fwd_kernel is
+// (kGin; on one node, NCCL_GIN_TYPE_NONE, only the one-node paths are
+// compiled in).
+template <typename RowT, ncclGinType_t kGin>
 __global__ void __launch_bounds__(kThreads, 1)
     bwd_kernel(ncclWindow_t window, ncclDevComm dev, Sizes sizes, int64_t seq, int64_t arrive0,
                BwdArgs args) {
+  constexpr bool kMulti = kGin != NCCL_GIN_TYPE_NONE;
   const BwdPlanView &plan = args.plan;
-  const int local_size = sizes.topo.local_size, num_nodes = sizes.topo.num_nodes,
+  const int local_size = sizes.topo.local_size, num_nodes = kMulti ? sizes.topo.num_nodes : 1,
             node = sizes.topo.node, me = sizes.topo.local_rank;
   const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
   const OutTimeline timeline{args.trace, local_size};
@@ -887,10 +903,12 @@ __global__ void __launch_bounds__(kThreads, 1)
   const int gin = num_nodes == 1 || blockIdx.x != 0 ? 0 : timeline.on() ? 64 : 32;
   const int workers = kThreads - gin;
   if (tid >= workers) {
-    if (warp == kWarps - 1)
-      bwd::ProxyIssuer::run(window, dev, sizes, seq, args);
-    else if constexpr (kTrace)
-      bwd::LandingWatcher::run(window, dev, sizes, arrive0, args);
+    if constexpr (kMulti) {
+      if (warp == kWarps - 1)
+        bwd::ProxyIssuer::run<kGin>(window, dev, sizes, seq, args);
+      else if constexpr (kTrace)
+        bwd::LandingWatcher::run<kGin>(window, dev, sizes, arrive0, args);
+    }
   } else if (num_nodes > 1 && blockIdx.x >= gridDim.x - args.reducers) {
     pass_entry_barrier(window, sizes, seq, timeline, kThreads);
     bwd::ProxyReducer<RowT>::run(window, sizes, args, lane);
@@ -938,7 +956,7 @@ __global__ void __launch_bounds__(kThreads, 1)
     }
   }
   if (!arrive_cta(window, sizes, arrive0, timeline)) return;  // the last CTA goes on
-  bwd::exit(window, dev, sizes, seq, args);
+  bwd::exit<kGin>(window, dev, sizes, seq, args);
 }
 
 }  // namespace hier_output_dist
