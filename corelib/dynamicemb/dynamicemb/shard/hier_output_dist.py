@@ -104,7 +104,7 @@ def _first_difference(every: List[Dict]) -> Optional[str]:
 # FwdPlan::tensors() and BwdPlan::tensors(), in
 # src/hier_output_dist/input_dist/plan.cu).
 _FWD_OFFSET_PER_BUCKET, _FWD_NUM_CHUNKS, _FWD_NODE_LENGTH_PER_BUCKET = 0, 15, 24
-_BWD_UNIQ_IN = 20
+_BWD_NODE_LENGTH_PER_SOURCE = 20
 
 
 class HierCall:
@@ -156,10 +156,10 @@ class HierCall:
         return self.fwd_plan[_FWD_NODE_LENGTH_PER_BUCKET]
 
     @property
-    def uniq_in(self) -> Optional[torch.Tensor]:
+    def node_length_per_source(self) -> Optional[torch.Tensor]:
         """Across nodes, int64 [num_nodes]: the node-unique keys this owner
         gets from each source node."""
-        return self.bwd_plan[_BWD_UNIQ_IN]
+        return self.bwd_plan[_BWD_NODE_LENGTH_PER_SOURCE]
 
 
 class DynamicEmbSequenceShardingContext(SequenceShardingContext):

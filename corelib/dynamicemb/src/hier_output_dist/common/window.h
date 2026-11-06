@@ -61,7 +61,7 @@ struct CountMessage {
   __host__ __device__ int64_t node_length_per_bucket(int64_t owner_node) const {
     return 3 + owner_node;
   }
-  __host__ __device__ int64_t chunks_out(int64_t owner_node) const {
+  __host__ __device__ int64_t chunk_length_per_bucket(int64_t owner_node) const {
     return 3 + num_nodes + owner_node;
   }
   __host__ __device__ int64_t common() const { return 3 + 2 * num_nodes; }
@@ -361,8 +361,8 @@ __host__ __device__ constexpr int gather_words(GatherFrom from) {
 //                 deduplicates as proxy, requester-major, then owner node,
 //                 then [feature][position]. A remote occurrence is named by
 //                 its index occ in the remote part.
-//   node_weights  their weights, when the requesters' keys carry them
-//   bucket_feature_of_occ
+//   node_key_weights  their weights, when the requesters' keys carry them
+//   node_bucket_feature_of_row
 //                 (num_nodes > 1) per remote occurrence, int32: its bucket
 //                 feature, owner node * num_features + feature
 //   remote_map    (num_nodes > 1) RemoteMap
@@ -401,8 +401,8 @@ class KeysLayout {
       return at;
     };
     node_keys_ = take(8 * entries);
-    node_weights_ = take(sizes.weights ? 4 * entries : 0);
-    bucket_feature_of_occ_ = take(multi ? 4 * (uint64_t)remote_keys_ : 0);
+    node_key_weights_ = take(sizes.weights ? 4 * entries : 0);
+    node_bucket_feature_of_row_ = take(multi ? 4 * (uint64_t)remote_keys_ : 0);
     remote_map_ = take(multi ? 4 * RemoteMap::kArrays * (uint64_t)remote_keys_ : 0);
     proxy_header_ = take(multi ? 4 * (uint64_t)ProxyHeader::of(sizes).words() : 0);
     key_stage_bytes_ =
@@ -418,9 +418,9 @@ class KeysLayout {
   __host__ __device__ uint64_t bytes() const { return bytes_; }
   // Each buffer's name and the bytes it takes (HierOutputDist::memory).
   std::vector<std::pair<const char *, uint64_t>> buffers() const {
-    return {{"node_keys", node_weights_ - node_keys_},
-            {"node_weights", bucket_feature_of_occ_ - node_weights_},
-            {"bucket_feature_of_occ", remote_map_ - bucket_feature_of_occ_},
+    return {{"node_keys", node_key_weights_ - node_keys_},
+            {"node_key_weights", node_bucket_feature_of_row_ - node_key_weights_},
+            {"node_bucket_feature_of_row", remote_map_ - node_bucket_feature_of_row_},
             {"remote_map", proxy_header_ - remote_map_},
             {"proxy_header", key_stage_ - proxy_header_},
             {"key_stage", rail_keys_ - key_stage_},
@@ -429,13 +429,15 @@ class KeysLayout {
             {"owner_offsets", bytes_ - owner_offsets_}};
   }
 
-  // node_keys and node_weights, [lookup_keys + remote_keys]
+  // node_keys and node_key_weights, [lookup_keys + remote_keys]
   __host__ __device__ int64_t *node_keys() const { return (int64_t *)(base_ + node_keys_); }
-  __host__ __device__ float *node_weights() const { return (float *)(base_ + node_weights_); }
+  __host__ __device__ float *node_key_weights() const {
+    return (float *)(base_ + node_key_weights_);
+  }
   // where the remote part starts in them
   __host__ __device__ int64_t remote_start() const { return lookup_keys_; }
-  __host__ __device__ int32_t *bucket_feature_of_occ() const {
-    return (int32_t *)(base_ + bucket_feature_of_occ_);
+  __host__ __device__ int32_t *node_bucket_feature_of_row() const {
+    return (int32_t *)(base_ + node_bucket_feature_of_row_);
   }
   __host__ __device__ RemoteMap remote_map() const {
     return RemoteMap{(int32_t *)(base_ + remote_map_), remote_keys_};
@@ -459,7 +461,7 @@ class KeysLayout {
  private:
   char *base_;
   int64_t num_nodes_, local_size_, num_features_, lookup_keys_, remote_keys_, max_chunks_;
-  uint64_t node_keys_, node_weights_, bucket_feature_of_occ_, remote_map_, proxy_header_,
+  uint64_t node_keys_, node_key_weights_, node_bucket_feature_of_row_, remote_map_, proxy_header_,
       key_stage_, rail_keys_, source_offsets_, owner_offsets_, bytes_;
   uint64_t key_stage_bytes_, rail_keys_bytes_;
 };

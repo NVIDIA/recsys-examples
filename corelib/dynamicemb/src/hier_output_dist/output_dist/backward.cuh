@@ -707,7 +707,7 @@ __device__ __forceinline__ void lane_landed_rows(ncclWindow_t window, const Size
   got = need = 0;
   for (int peer_node = lane; peer_node < sizes.topo.num_nodes; peer_node += 32) {
     if (peer_node == sizes.topo.node) continue;
-    const uint64_t rows_of_node = (uint64_t)args.plan.uniq_in[peer_node];
+    const uint64_t rows_of_node = (uint64_t)args.plan.node_length_per_source[peer_node];
     got += min(rows.readSignal(sig_rows(peer_node)) - *ctrl.bwd_tot(peer_node), rows_of_node);
     need += rows_of_node;
   }
@@ -829,7 +829,8 @@ __device__ __forceinline__ void wait_rail_rows_warp(ncclWindow_t window, const n
   ncclGin rows(dev, kCtxBwd);
   for (int peer_node = lane; peer_node < sizes.topo.num_nodes; peer_node += 32) {
     if (peer_node == sizes.topo.node) continue;
-    const uint64_t want = *ctrl.bwd_tot(peer_node) + (uint64_t)args.plan.uniq_in[peer_node];
+    const uint64_t want =
+        *ctrl.bwd_tot(peer_node) + (uint64_t)args.plan.node_length_per_source[peer_node];
     Spin spin(sizes.timeout_ns);
     while (rows.readSignal(sig_rows(peer_node)) < want)
       spin.pause("gradient rows of a proxy node", peer_node, (long long)want, sizes.topo.rank);

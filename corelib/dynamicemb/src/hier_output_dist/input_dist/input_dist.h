@@ -118,11 +118,11 @@ class InChannel {
   int64_t seq_ = 0;  // the calls run so far: the current one's sequence number
   // This rank's buffers the steps read and write, views of its copy of the
   // window without an allocator (the window outlives them): the own part of
-  // node_keys (and node_weights), and across nodes its remote part,
-  // bucket_feature_of_occ, the buffers the proxy writes, rail_keys,
+  // node_keys (and node_key_weights), and across nodes its remote part,
+  // node_bucket_feature_of_row, the buffers the proxy writes, rail_keys,
   // source_offsets and owner_offsets.
-  at::Tensor own_keys_, own_weights_;
-  at::Tensor remote_keys_, remote_weights_, bucket_feature_of_occ_;
+  at::Tensor own_node_keys_, own_node_key_weights_;
+  at::Tensor remote_node_keys_, remote_node_key_weights_, node_bucket_feature_of_row_;
   ProxyBuffers proxy_buffers_;
   at::Tensor rail_keys_, source_offsets_, owner_offsets_;
   // Constants of the op across nodes: the table of each feature (numbered

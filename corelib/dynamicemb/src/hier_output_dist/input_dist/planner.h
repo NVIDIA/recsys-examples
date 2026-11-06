@@ -169,7 +169,7 @@ NodeLayout node_layout(const NodeCounts &counts, const at::Tensor &offset_per_bu
 
 // On one node, the KJT of this rank as owner, a copy of its own part of
 // node_keys once every requester of the node pushed (node_keys, and
-// node_weights when the keys carry weights: views of the own part), and its
+// node_key_weights when the keys carry weights: views of the own part), and its
 // map as requester: its rows' places in their owners' KJTs, which are where
 // it pushed them.
 struct OneNodeOwner {
@@ -183,7 +183,7 @@ struct OneNodeOwner {
                    // KJT (and its dst)
 };
 OneNodeOwner one_node_owner(const NodeLayout &node, const at::Tensor &bucket_feature_of_row,
-                            const at::Tensor &node_keys, const at::Tensor &node_weights,
+                            const at::Tensor &node_keys, const at::Tensor &node_key_weights,
                             const Topo &topo, int64_t num_features);
 
 // The proxy's part of a call across nodes (the in channel, after
@@ -207,14 +207,14 @@ OneNodeOwner one_node_owner(const NodeLayout &node, const at::Tensor &bucket_fea
 // The proxy's inputs: its remote part (views of its buffers) and what the
 // node layout says of it.
 struct ProxyInput {
-  at::Tensor keys;                   // int64 [remote_keys]: the remote part of node_keys
-  at::Tensor weights;                // fp32 [remote_keys]: their weights, or undefined
-  at::Tensor bucket_feature_of_occ;  // int32 [remote_keys]: owner node * num_features + feature
-                                     // of each
-  at::Tensor requester_start;        // int64 [local_size + 1]: each requester's occurrences
-  at::Tensor skip;                   // bool 0-dim: the node skips the call (it pushed nothing)
-  at::Tensor tables;                 // int32 [num_features]: the table of each feature, numbered
-                                     // densely (dense_tables)
+  at::Tensor node_keys;                   // int64 [remote_keys]: the remote part of node_keys
+  at::Tensor node_key_weights;            // fp32 [remote_keys]: their weights, or undefined
+  at::Tensor node_bucket_feature_of_row;  // int32 [remote_keys]: owner node * num_features +
+                                          // feature of each
+  at::Tensor requester_start;             // int64 [local_size + 1]: each requester's occurrences
+  at::Tensor skip;                        // bool 0-dim: the node skips the call (it pushed nothing)
+  at::Tensor tables;  // int32 [num_features]: the table of each feature, numbered
+                      // densely (dense_tables)
 };
 
 // The buffers the proxy writes, views of this rank's copy of the window.
@@ -236,32 +236,27 @@ struct ProxyBuffers {
 ProxyBuffers proxy_buffers(at::Tensor remote_map, at::Tensor key_stage, const ProxyHeader &header,
                            const at::TensorOptions &options);
 
-// Step 1: the node-unique keys, by sorts of the occurrences. The proxy's
-// tables mirror the requester's, with a node_ prefix: node dedup is index
-// dedup over the node's occurrences (each occurrence's key: the tests'
-// node_reverse_indices), and its keys sorted by bucket feature, a bucket
-// being an owner node, are the bucketize's (node_uniq_keys,
-// node_bucket_feature_of_row, node_offset_per_bucket_feature,
-// node_offset_per_bucket, node_length_per_bucket_feature and
-// node_length_per_bucket); node_exp_off is index dedup's exp_off: where
-// each key's rows (one per occurrence) start.
+// Step 1: the node-unique keys, by sorts of the occurrences. Node dedup is
+// index dedup over the node's keys, and its sort by owner node is the
+// bucketize: their tables take index dedup's and the bucketize's names with
+// a node_ prefix (docs/hier_output_dist.md, section 10.4).
 struct ProxyKeys {
   at::Tensor occurrence_count;  // int64 0-dim: the valid occurrences (0 when the node skips)
-  at::Tensor num_keys;          // int64 0-dim: the node-unique keys
+  at::Tensor node_num_uniques;  // int64 0-dim: the node-unique keys
   at::Tensor key_rows;          // int64 0-dim: the most occurrences of one (kNeedKeyRows)
   // per sorted position q: the occurrences in identity order, each identity's in occ order
   at::Tensor valid;   // bool [remote_keys]: q < occurrence_count (also per occurrence)
   at::Tensor order;   // int32 [remote_keys]: the occurrence at q
   at::Tensor key_at;  // int32 [remote_keys]: the node-unique key of the occurrence at q
   // per node-unique key u
-  at::Tensor valid_key;       // bool [remote_keys]: u < num_keys
-  at::Tensor key_count;       // int32 [remote_keys]: its occurrences
-  at::Tensor key_first;       // int32 [remote_keys]: the sorted position of its first occurrence
-  at::Tensor key_node;        // int32 [remote_keys]: its owner node
-  at::Tensor key_uniq;        // int32 [remote_keys]: u among its owner node's
-  at::Tensor node_uniq_keys;  // int64 [remote_keys]: the key, as its owner stores it
-  at::Tensor key_weight;      // fp32 [remote_keys]: the weight of its record, its occurrences'
-                              // weights, or undefined (8-byte records)
+  at::Tensor valid_key;         // bool [remote_keys]: u < node_num_uniques
+  at::Tensor key_count;         // int32 [remote_keys]: its occurrences
+  at::Tensor key_first;         // int32 [remote_keys]: the sorted position of its first occurrence
+  at::Tensor key_node;          // int32 [remote_keys]: its owner node
+  at::Tensor key_uniq;          // int32 [remote_keys]: u among its owner node's
+  at::Tensor node_unique_keys;  // int64 [remote_keys]: the key, as its owner stores it
+  at::Tensor node_unique_key_weights;  // fp32 [remote_keys]: the weight of its record, its
+                                       // occurrences' weights, or undefined (8-byte records)
   at::Tensor node_length_per_bucket_feature;  // int64 [num_nodes * num_features]: the keys of each
                                               // (owner node, feature)
   at::Tensor node_offset_per_bucket;  // int64 [num_nodes + 1]: the first key of each owner node
@@ -277,18 +272,18 @@ ProxyKeys proxy_keys(const ProxyInput &input, const Sizes &sizes, bool node_dedu
 // more occurrences, which the call raises for, takes max_key_rows, and those
 // past them get no slot of their own). Writes remote_map's key rows and
 // slots, the chunks and records of key_stage, and the proxy header's chunks,
-// end and ends; drops keys.node_uniq_keys and keys.key_weight, which only the
+// end and ends; drops keys.node_unique_keys and keys.node_unique_key_weights, which only the
 // records need.
 struct ProxyChunks {
-  at::Tensor num_chunks;        // int64 0-dim: the chunks of the stream
-  at::Tensor chunks;            // int32 [max_chunks][8]: Chunk, in stream order (zeros past them)
-  at::Tensor chunks_out;        // int64 [num_nodes]: the chunks of each owner node
-  at::Tensor node_chunk_start;  // int64 [num_nodes + 1]: where each owner node's chunks start in
-                                // node_chunks
-  at::Tensor node_chunks;       // int32 [max_chunks]: each owner node's chunks in order, as their
-                                // places in the stream
-  at::Tensor stage_slice;       // int64 [num_nodes]: where its slice for each owner node starts in
-                                // key_stage (bytes)
+  at::Tensor num_chunks;  // int64 0-dim: the chunks of the stream
+  at::Tensor chunks;      // int32 [max_chunks][8]: Chunk, in stream order (zeros past them)
+  at::Tensor chunk_length_per_bucket;  // int64 [num_nodes]: the chunks of each owner node
+  at::Tensor chunk_offset_per_bucket;  // int64 [num_nodes + 1]: where each owner node's chunks
+                                       // start in chunk_inv
+  at::Tensor chunk_inv;  // int32 [max_chunks]: each owner node's chunks in order, as their
+                         // places in the stream
+  at::Tensor stage_offset_per_bucket;  // int64 [num_nodes]: where its slice for each owner node
+                                       // starts in key_stage (bytes)
   at::Tensor reduce_task_starts;  // int64 [max_chunks + 1]: the reducers' tasks before each chunk
   at::Tensor node_exp_off;        // int64 [remote_keys + 1]: the rows before each key
   at::Tensor key_chunk;           // int32 [remote_keys]: the chunk of each key
@@ -306,10 +301,10 @@ struct ProxyPlan {
   at::Tensor node_offset_per_bucket;          // int64 [num_nodes + 1]
   at::Tensor node_length_per_bucket;          // int64 [num_nodes]
   at::Tensor chunks;                          // int32 [max_chunks][8]: Chunk
-  at::Tensor chunks_out;                      // int64 [num_nodes]
-  at::Tensor node_chunk_start;                // int64 [num_nodes + 1]
-  at::Tensor node_chunks;                     // int32 [max_chunks]
-  at::Tensor stage_slice;                     // int64 [num_nodes]
+  at::Tensor chunk_length_per_bucket;         // int64 [num_nodes]
+  at::Tensor chunk_offset_per_bucket;         // int64 [num_nodes + 1]
+  at::Tensor chunk_inv;                       // int32 [max_chunks]
+  at::Tensor stage_offset_per_bucket;         // int64 [num_nodes]
   at::Tensor reduce_task_starts;  // int64 [max_chunks + 1]: its reducers' tasks before each chunk
                                   // (32 keys each)
   at::Tensor node_exp_off;        // int64 [remote_keys + 1]: the rows before each key
@@ -346,12 +341,12 @@ at::Tensor other_nodes_of(const Topo &topo, const at::TensorOptions &options);
 // window.h): the common part, its node's largest remote part (need_remote), the
 // keys of its own node it looks up as owner (own_total, its own part), and as
 // proxy the most occurrences of one of its keys (key_rows), its node-unique
-// keys and its chunks per owner node (node_length_per_bucket, chunks_out); then for each
-// node its node-unique keys of each feature there (node_length_per_bucket_feature,
-// [owner node][feature]).
+// keys and its chunks per owner node (node_length_per_bucket, chunk_length_per_bucket); then for
+// each node its node-unique keys of each feature there (node_length_per_bucket_feature, [owner
+// node][feature]).
 at::Tensor count_message(const at::Tensor &need_remote, const at::Tensor &own_total,
                          const at::Tensor &key_rows, const at::Tensor &node_length_per_bucket,
-                         const at::Tensor &chunks_out,
+                         const at::Tensor &chunk_length_per_bucket,
                          const at::Tensor &node_length_per_bucket_feature);
 
 // The rail's layout, from the messages this rank got (int64 [num_nodes]
@@ -359,25 +354,26 @@ at::Tensor count_message(const at::Tensor &need_remote, const at::Tensor &own_to
 // layout's own_lengths). Each slice a proxy puts holds the owner node's chunks
 // (ChunkPiece, 16 bytes each), then its records (record_bytes each).
 struct RailLayout {
-  // as proxy, to each owner of the rail (its slice in key_stage is the proxy's stage_slice)
+  // as proxy, to each owner of the rail (its slice in key_stage is the proxy's
+  // stage_offset_per_bucket)
   at::Tensor put_dst;    // int64 [num_nodes]: where its slice lands in the owner's rail_keys
                          // (bytes)
   at::Tensor put_bytes;  // int64 [num_nodes]
   at::Tensor put_skip;   // bool [num_nodes]: no put of keys (the owner overflows
                          // lookup_keys, or it is on this node)
   // as owner
-  at::Tensor kjt_lengths;     // int64 [num_features * num_sources]: per (feature, source)
-  at::Tensor kjt_offsets;     // int64 [num_features * num_sources + 1]
-  at::Tensor num_recv;        // int64 0-dim: the keys it looks up
-  at::Tensor length_per_key;  // int64 [num_features]
-  at::Tensor slice_in;        // int64 [num_nodes][2]: each source node's slice in its
-                              // rail_keys: byte offset, chunks
-  at::Tensor uniq_in;         // int64 [num_nodes]: the node-unique keys of each source node
-  at::Tensor length_per_source_feature;  // int64 [num_nodes][num_features]: of each source node,
-                                         // per feature (its own node: 0)
-  at::Tensor source_offsets;             // int64 [num_nodes][num_features]: where the keys of each
-                              // source node start in its KJT, what it sends the node's proxy
-                              // (its own node: 0)
+  at::Tensor kjt_lengths;             // int64 [num_features * num_sources]: per (feature, source)
+  at::Tensor kjt_offsets;             // int64 [num_features * num_sources + 1]
+  at::Tensor num_recv;                // int64 0-dim: the keys it looks up
+  at::Tensor length_per_key;          // int64 [num_features]
+  at::Tensor slice_in;                // int64 [num_nodes][2]: each source node's slice in its
+                                      // rail_keys: byte offset, chunks
+  at::Tensor node_length_per_source;  // int64 [num_nodes]: the node-unique keys of each source node
+  at::Tensor node_length_per_source_feature;  // int64 [num_nodes][num_features]: of each source
+                                              // node, per feature (its own node: 0)
+  at::Tensor source_offsets;     // int64 [num_nodes][num_features]: where the keys of each
+                                 // source node start in its KJT, what it sends the node's proxy
+                                 // (its own node: 0)
   at::Tensor requester_offsets;  // int64 [local_size][num_features]: where each requester of
                                  // its node's (feature, requester) keys start in its KJT
   at::Tensor needs;              // int64 [kNumNeeds]: the most the rail needs of each
@@ -392,8 +388,8 @@ at::Tensor status_publish(const RailLayout &rail);
 
 // The owner's tables, once the rail's proxies put their records into its
 // rail_keys (int64 view) and its node's requesters their keys into the own
-// part of its node_keys (node_keys, node_weights: views of [lookup_keys];
-// node_weights undefined when the keys carry none).
+// part of its node_keys (node_keys, node_key_weights: views of [lookup_keys];
+// node_key_weights undefined when the keys carry none).
 struct OwnerTables {
   at::Tensor kjt_values;       // int64 [lookup_keys]: the first num_recv are its KJT's keys
   at::Tensor kjt_weights;      // fp32 [lookup_keys]: their weights, or undefined (8-byte
@@ -404,7 +400,7 @@ struct OwnerTables {
   at::Tensor fwd_chunk_start;  // int64 [num_nodes + 1]: where each source node's start there
 };
 OwnerTables owner_tables(const RailLayout &rail, const at::Tensor &own_offsets,
-                         const at::Tensor &node_keys, const at::Tensor &node_weights,
+                         const at::Tensor &node_keys, const at::Tensor &node_key_weights,
                          const at::Tensor &rail_keys, const at::Tensor &other_nodes,
                          const Sizes &sizes);
 
@@ -437,15 +433,15 @@ struct RequesterTables {
                           // proxy_rows), and where its gradient goes in the backward
   at::Tensor push_order;  // int32 [bucket_feature_of_row.numel()]: its rows at each proxy in their
                           // push order
-  at::Tensor push_order_off;  // int64 [local_size + 1]: where its rows at each proxy start
-  at::Tensor push_tables;     // int32 [local_size][max_chunks + 1]: where its rows of each chunk
-                              // at each proxy start in push_order (chunk max_chunks: their end)
-  at::Tensor proxy_chunks;    // int64 [local_size]: the chunks of each proxy's stream
-  at::Tensor proxy_ends;      // int64 [local_size][max_chunks + 1]: each proxy's chunk ends,
-                              // then its stream's end (past num_proxy_rows when it wraps)
-  at::Tensor task_starts;     // int64 [max_chunks * local_size + 1]: its tasks of rows of other
-                              // nodes before each (chunk, proxy in turn), the forward's pulls
-                              // and the backward's pushes alike
+  at::Tensor push_order_off;     // int64 [local_size + 1]: where its rows at each proxy start
+  at::Tensor proxy_push_tables;  // int32 [local_size][max_chunks + 1]: where its rows of each chunk
+                                 // at each proxy start in push_order (chunk max_chunks: their end)
+  at::Tensor proxy_chunks;       // int64 [local_size]: the chunks of each proxy's stream
+  at::Tensor proxy_ends;         // int64 [local_size][max_chunks + 1]: each proxy's chunk ends,
+                                 // then its stream's end (past num_proxy_rows when it wraps)
+  at::Tensor task_starts;        // int64 [max_chunks * local_size + 1]: its tasks of rows of other
+                                 // nodes before each (chunk, proxy in turn), the forward's pulls
+                                 // and the backward's pushes alike
 };
 // words: int32 [3][bucket_feature_of_row.numel()], the remote_map words of its
 // rows (remote_rows' gather; rows of its node's owners and past the valid rows
@@ -477,19 +473,20 @@ struct PutLists {
              // proxy's; the forward's the other way round, its chunk one of the owner's fwd_chunks
   at::Tensor starts;  // int32 [2 * num_nodes + 1]: where each node's segments start
 };
-// The backward list from the proxy's chunks (chunks, node_chunk_start,
-// node_chunks: ProxyChunks'), its node-unique keys per (owner node, feature)
+// The backward list from the proxy's chunks (chunks, chunk_offset_per_bucket,
+// chunk_inv: ProxyChunks'), its node-unique keys per (owner node, feature)
 // and where its keys of each feature start in each rail owner's KJT
 // (owner_offsets, int64 [num_nodes][num_features], as the owners put them). The
 // forward list from the chunks of this owner's node in each source node's
 // stream (fwd_chunks, fwd_chunk_start: OwnerTables'), its keys per feature
-// (length_per_source_feature) and where those keys start in the owner's KJT
+// (node_length_per_source_feature) and where those keys start in the owner's KJT
 // (source_offsets).
-PutLists put_lists(const at::Tensor &chunks, const at::Tensor &node_chunk_start,
-                   const at::Tensor &node_chunks, const at::Tensor &node_offset_per_bucket,
+PutLists put_lists(const at::Tensor &chunks, const at::Tensor &chunk_offset_per_bucket,
+                   const at::Tensor &chunk_inv, const at::Tensor &node_offset_per_bucket,
                    const at::Tensor &node_length_per_bucket_feature,
                    const at::Tensor &owner_offsets, const at::Tensor &fwd_chunks,
-                   const at::Tensor &fwd_chunk_start, const at::Tensor &length_per_source_feature,
+                   const at::Tensor &fwd_chunk_start,
+                   const at::Tensor &node_length_per_source_feature,
                    const at::Tensor &source_offsets, const Sizes &sizes);
 
 }  // namespace hier_output_dist

@@ -303,9 +303,10 @@ struct NodeChunks {
   __device__ NodeChunks(const FwdPlanView &call_plan, int64_t node)
       : plan(call_plan),
         owner_node(node),
-        first(call_plan.node_chunk_start[node]),
-        chunks(call_plan.node_chunk_start[node + 1] - call_plan.node_chunk_start[node]) {}
-  __device__ int64_t place(int64_t j) const { return plan.node_chunks[first + j]; }
+        first(call_plan.chunk_offset_per_bucket[node]),
+        chunks(call_plan.chunk_offset_per_bucket[node + 1] -
+               call_plan.chunk_offset_per_bucket[node]) {}
+  __device__ int64_t place(int64_t j) const { return plan.chunk_inv[first + j]; }
   __device__ int64_t keys_end(int64_t j) const {
     const Chunk &chunk = plan.chunks[place(j)];
     return (int64_t)chunk.key_lo + chunk.keys - plan.node_offset_per_bucket[owner_node];

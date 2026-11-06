@@ -53,16 +53,16 @@ struct PlanView {
   const int32_t *inv;                // [rows]
   Fanout fanout;
   // across nodes, the requester's
-  const int32_t *push_order;    // [rows] its remote rows by proxy and push order
-  const int64_t *proxy_chunks;  // [local_size] the chunks of each same-node proxy's stream
-  const int64_t *proxy_ends;    // [local_size][max_chunks + 1] each one's chunk ends, then its
-                                // stream's end
-  const int32_t *push_tables;   // [local_size][max_chunks + 1] where its rows of each chunk at
-                                // each proxy start in push_order (chunk max_chunks: their end)
-  const int64_t *task_starts;   // [max_chunks * local_size + 1] its tasks of rows of other nodes
-                                // before each (chunk, proxy in turn from its own): 32 positions
-                                // of its push order there each, the forward's pulls and the
-                                // backward's pushes
+  const int32_t *push_order;         // [rows] its remote rows by proxy and push order
+  const int64_t *proxy_chunks;       // [local_size] the chunks of each same-node proxy's stream
+  const int64_t *proxy_ends;         // [local_size][max_chunks + 1] each one's chunk ends, then its
+                                     // stream's end
+  const int32_t *proxy_push_tables;  // [local_size][max_chunks + 1] where its rows of each chunk at
+                                     // each proxy start in push_order (chunk max_chunks: their end)
+  const int64_t *task_starts;  // [max_chunks * local_size + 1] its tasks of rows of other nodes
+                               // before each (chunk, proxy in turn from its own): 32 positions
+                               // of its push order there each, the forward's pulls and the
+                               // backward's pushes
   // across nodes, the proxy's
   const int64_t *num_chunks;  // the chunks of its stream
   const Chunk *chunks;        // [max_chunks] its chunks, in stream order
@@ -79,7 +79,7 @@ struct PlanView {
   // Where this rank's rows of a chunk at a same-node proxy start in its push
   // order (the next chunk's: where they end).
   __device__ __forceinline__ int64_t push_start(int proxy, int64_t chunk) const {
-    return push_tables[(int64_t)proxy * (max_chunks + 1) + chunk];
+    return proxy_push_tables[(int64_t)proxy * (max_chunks + 1) + chunk];
   }
   // The end of a same-node proxy's chunk (chunk max_chunks: its stream's end).
   __device__ __forceinline__ int64_t proxy_end(int proxy, int64_t chunk) const {
@@ -115,9 +115,9 @@ struct FwdPlanView : PlanView {
   const ChunkPiece *fwd_chunks;  // [owner_chunks] the chunks of its node in each source node's
                                  // stream, its forward put list's (PutSeg::chunk)
   // across nodes, the proxy's
-  const int64_t *node_chunk_start;        // [num_nodes + 1] where each owner node's chunks start in
-                                          // node_chunks
-  const int32_t *node_chunks;             // [max_chunks] each owner node's chunks in order
+  const int64_t *chunk_offset_per_bucket;  // [num_nodes + 1] where each owner node's chunks start
+                                           // in chunk_inv
+  const int32_t *chunk_inv;               // [max_chunks] each owner node's chunks in order
   const int64_t *node_length_per_bucket;  // [num_nodes] its node-unique keys of each owner node
 
   // The owner's forward put list's segments for a proxy node.
@@ -130,7 +130,7 @@ struct FwdPlanView : PlanView {
 struct BwdPlanView : PlanView {
   const int32_t *dst;  // [rows]
   // across nodes, the owner's
-  const int64_t *uniq_in;  // [num_nodes] node-unique keys from each source node
+  const int64_t *node_length_per_source;  // [num_nodes] node-unique keys from each source node
   // across nodes, the proxy's
   const int64_t *reduce_task_starts;  // [max_chunks + 1] its reducers' tasks before each chunk
                                       // (32 keys each)
@@ -157,10 +157,10 @@ struct FwdPlan {
   at::Tensor inv;                // int32 [rows]
   FanoutTables fanout;
   // across nodes, the tables both kernels read
-  at::Tensor push_order, proxy_chunks, proxy_ends, push_tables, task_starts, num_chunks, chunks,
-      node_offset_per_bucket, put_list, put_starts;
+  at::Tensor push_order, proxy_chunks, proxy_ends, proxy_push_tables, task_starts, num_chunks,
+      chunks, node_offset_per_bucket, put_list, put_starts;
   // across nodes, the forward's own
-  at::Tensor push_order_off, fwd_chunks, node_chunk_start, node_chunks, node_length_per_bucket;
+  at::Tensor push_order_off, fwd_chunks, chunk_offset_per_bucket, chunk_inv, node_length_per_bucket;
 
   // Rows of the requester's output: its input's rows, the original ones.
   int64_t num_out() const { return fanout.exp_idx.numel(); }
@@ -179,10 +179,10 @@ struct BwdPlan {
   at::Tensor inv;                // int32 [rows]
   FanoutTables fanout;
   // across nodes, the tables both kernels read
-  at::Tensor push_order, proxy_chunks, proxy_ends, push_tables, task_starts, num_chunks, chunks,
-      node_offset_per_bucket, put_list, put_starts;
+  at::Tensor push_order, proxy_chunks, proxy_ends, proxy_push_tables, task_starts, num_chunks,
+      chunks, node_offset_per_bucket, put_list, put_starts;
   // across nodes, the backward's own
-  at::Tensor uniq_in, reduce_task_starts, node_exp_off;
+  at::Tensor node_length_per_source, reduce_task_starts, node_exp_off;
 
   BwdPlanView view(const Sizes &sizes) const;
   std::vector<at::Tensor> tensors() const;

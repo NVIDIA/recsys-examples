@@ -108,10 +108,10 @@ __global__ void node_count_exchange_kernel(ncclWindow_t window, Sizes sizes, int
 }
 
 // Every CTA, a thread per row: bucketized row `row` (row < *rows_to_push) goes
-// to destination_base[bucket_feature] + row of node_keys (and node_weights) of
+// to destination_base[bucket_feature] + row of node_keys (and node_key_weights) of
 // its target, the owner's local rank; a destination from remote_start on is an
 // occurrence of the target's remote part, whose bucket feature (owner node *
-// num_features + feature) goes to bucket_feature_of_occ. Consecutive rows of a
+// num_features + feature) goes to node_bucket_feature_of_row. Consecutive rows of a
 // bucket feature go to consecutive destinations. Each CTA's stores are fenced
 // at system scope before it ends.
 __global__ void __launch_bounds__(kThreads)
@@ -130,9 +130,9 @@ __global__ void __launch_bounds__(kThreads)
     const int64_t destination = destination_base[bucket_feature] + row;
     node.peer(keys_layout.node_keys(), target)[destination] = keys[row];
     if (weights != nullptr)
-      node.peer(keys_layout.node_weights(), target)[destination] = weights[row];
+      node.peer(keys_layout.node_key_weights(), target)[destination] = weights[row];
     if (destination >= remote_start)
-      node.peer(keys_layout.bucket_feature_of_occ(), target)[destination - remote_start] =
+      node.peer(keys_layout.node_bucket_feature_of_row(), target)[destination - remote_start] =
           owner / local_size * num_features + bucket_feature % num_features;
   }
   __syncthreads();

@@ -96,14 +96,14 @@ std::map<std::string, at::Tensor> fanout_test(at::Tensor reverse_indices, at::Te
 // layout (node_layout) on the node's counts (totals, before, mine) as
 // node_count_exchange would give them, by name (requester_start and
 // need_remote across nodes). On one node, with the owner's node_keys (and
-// node_weights) after every requester pushed, also its KJT and src
+// node_key_weights) after every requester pushed, also its KJT and src
 // (one_node_owner).
 std::map<std::string, at::Tensor> node_layout_test(
     at::Tensor totals, at::Tensor before, at::Tensor mine, at::Tensor offset_per_bucket_feature,
     at::Tensor offset_per_bucket, at::Tensor bucket_feature_of_row, int64_t num_nodes,
     int64_t local_size, int64_t node, int64_t local_rank, int64_t num_features, int64_t lookup_keys,
     int64_t remote_keys, c10::optional<at::Tensor> node_keys,
-    c10::optional<at::Tensor> node_weights) {
+    c10::optional<at::Tensor> node_key_weights) {
   c10::cuda::CUDAGuard guard(offset_per_bucket_feature.device());
   const int world_size = (int)(num_nodes * local_size);
   const Topo topo{world_size,
@@ -134,9 +134,9 @@ std::map<std::string, at::Tensor> node_layout_test(
     named["need_remote"] = layout.need_remote;
   }
   if (node_keys.has_value()) {
-    const OneNodeOwner owner =
-        one_node_owner(layout, bucket_feature_of_row, *node_keys,
-                       node_weights.has_value() ? *node_weights : at::Tensor(), topo, num_features);
+    const OneNodeOwner owner = one_node_owner(
+        layout, bucket_feature_of_row, *node_keys,
+        node_key_weights.has_value() ? *node_key_weights : at::Tensor(), topo, num_features);
     named["kjt_values"] = owner.kjt_values;
     if (owner.kjt_weights.defined()) named["kjt_weights"] = owner.kjt_weights;
     named["kjt_lengths"] = owner.kjt_lengths;
@@ -183,9 +183,9 @@ Sizes plan_sizes(const std::map<std::string, int64_t> &named) {
 }
 
 // One proxy's steps of a call across nodes (proxy_keys,
-// proxy_chunks_and_slots, proxy_push_order) on its remote part (keys,
-// weights, bucket_feature_of_occ: what node_keys, node_weights and
-// bucket_feature_of_occ hold past lookup_keys; weights exactly with 16-byte
+// proxy_chunks_and_slots, proxy_push_order) on its remote part (node_keys,
+// node_key_weights, node_bucket_feature_of_row: what those buffers hold
+// past lookup_keys; weights exactly with 16-byte
 // records) and what the node layout says of it (requester_start, skip,
 // need_remote, own_total: its own part), and its count messages
 // (count_message), by name. It writes remote_map, key_stage and
@@ -193,19 +193,22 @@ Sizes plan_sizes(const std::map<std::string, int64_t> &named) {
 // buffers of its window. Also the node-unique key of each occurrence
 // (node_reverse_indices), for the test's reference.
 std::map<std::string, at::Tensor> proxy_plan_test(
-    at::Tensor keys, c10::optional<at::Tensor> weights, at::Tensor bucket_feature_of_occ,
-    at::Tensor requester_start, at::Tensor skip, at::Tensor tables, at::Tensor need_remote,
-    at::Tensor own_total, at::Tensor remote_map, at::Tensor key_stage, at::Tensor proxy_header,
-    bool node_dedup, std::map<std::string, int64_t> named_sizes) {
-  c10::cuda::CUDAGuard guard(keys.device());
+    at::Tensor node_keys, c10::optional<at::Tensor> node_key_weights,
+    at::Tensor node_bucket_feature_of_row, at::Tensor requester_start, at::Tensor skip,
+    at::Tensor tables, at::Tensor need_remote, at::Tensor own_total, at::Tensor remote_map,
+    at::Tensor key_stage, at::Tensor proxy_header, bool node_dedup,
+    std::map<std::string, int64_t> named_sizes) {
+  c10::cuda::CUDAGuard guard(node_keys.device());
   const Sizes sizes = plan_sizes(named_sizes);
   const int64_t entries = sizes.remote_keys, local_size = sizes.topo.local_size,
                 num_features = sizes.num_features;
   ProxyHeader header = ProxyHeader::of(sizes);  // over proxy_header once checked
   TORCH_CHECK(
-      is_cuda_array(keys, at::kLong, entries) && weights.has_value() == sizes.weighted_records() &&
-          (!weights.has_value() || is_cuda_array(*weights, at::kFloat, entries)) &&
-          is_cuda_array(bucket_feature_of_occ, at::kInt, entries) &&
+      is_cuda_array(node_keys, at::kLong, entries) &&
+          node_key_weights.has_value() == sizes.weighted_records() &&
+          (!node_key_weights.has_value() ||
+           is_cuda_array(*node_key_weights, at::kFloat, entries)) &&
+          is_cuda_array(node_bucket_feature_of_row, at::kInt, entries) &&
           is_cuda_array(requester_start, at::kLong, local_size + 1) &&
           is_cuda_array(skip, at::kBool, 1) && is_cuda_array(tables, at::kInt, num_features) &&
           is_cuda_array(need_remote, at::kLong, 1) && is_cuda_array(own_total, at::kLong, 1) &&
@@ -214,9 +217,9 @@ std::map<std::string, at::Tensor> proxy_plan_test(
                         (int64_t)KeysLayout(sizes, nullptr).key_stage_bytes() / 8) &&
           is_cuda_array(proxy_header, at::kInt, header.words()),
       "hier_output_dist: proxy_plan's inputs");
-  const ProxyInput input{keys,
-                         weights.has_value() ? *weights : at::Tensor(),
-                         bucket_feature_of_occ,
+  const ProxyInput input{node_keys,
+                         node_key_weights.has_value() ? *node_key_weights : at::Tensor(),
+                         node_bucket_feature_of_row,
                          requester_start,
                          skip.reshape({}),
                          tables};
@@ -236,14 +239,14 @@ std::map<std::string, at::Tensor> proxy_plan_test(
           {"node_offset_per_bucket", plan.node_offset_per_bucket},
           {"node_length_per_bucket", plan.node_length_per_bucket},
           {"chunks", plan.chunks},
-          {"chunks_out", plan.chunks_out},
-          {"node_chunk_start", plan.node_chunk_start},
-          {"node_chunks", plan.node_chunks},
-          {"stage_slice", plan.stage_slice},
+          {"chunk_length_per_bucket", plan.chunk_length_per_bucket},
+          {"chunk_offset_per_bucket", plan.chunk_offset_per_bucket},
+          {"chunk_inv", plan.chunk_inv},
+          {"stage_offset_per_bucket", plan.stage_offset_per_bucket},
           {"reduce_task_starts", plan.reduce_task_starts},
           {"node_exp_off", plan.node_exp_off},
           {"message", count_message(need_remote.reshape({}), own_total.reshape({}), plan.key_rows,
-                                    plan.node_length_per_bucket, plan.chunks_out,
+                                    plan.node_length_per_bucket, plan.chunk_length_per_bucket,
                                     plan.node_length_per_bucket_feature)},
           {"node_reverse_indices", node_reverse_indices}};
 }
@@ -252,18 +255,18 @@ std::map<std::string, at::Tensor> proxy_plan_test(
 // [num_nodes][CountMessage::length], as rail_count_exchange gives them), by
 // name: the rail layout (rail_layout) and what the rank publishes to its node
 // (status_publish). Given its rail_keys (int64) and the own part of its
-// node_keys (and node_weights) once the rail's proxies and its node's
+// node_keys (and node_key_weights) once the rail's proxies and its node's
 // requesters put their keys, and where its keys of each feature start at its
 // rail's owners (owner_offsets, int64 [num_nodes][num_features], as the owners
 // put their source_offsets rows), also its owner tables (owner_tables) and the
-// put lists (put_lists, on its chunks, node_chunk_start, node_chunks, node_offset_per_bucket
+// put lists (put_lists, on its chunks, chunk_offset_per_bucket, chunk_inv, node_offset_per_bucket
 // and node_length_per_bucket_feature as proxy: proxy_plan's).
 std::map<std::string, at::Tensor> rail_tables_test(
     at::Tensor messages, at::Tensor own_lengths, at::Tensor own_offsets, at::Tensor chunks,
-    at::Tensor node_chunk_start, at::Tensor node_chunks, at::Tensor node_offset_per_bucket,
+    at::Tensor chunk_offset_per_bucket, at::Tensor chunk_inv, at::Tensor node_offset_per_bucket,
     at::Tensor node_length_per_bucket_feature, c10::optional<at::Tensor> owner_offsets,
     c10::optional<at::Tensor> rail_keys, c10::optional<at::Tensor> node_keys,
-    c10::optional<at::Tensor> node_weights, std::map<std::string, int64_t> named_sizes) {
+    c10::optional<at::Tensor> node_key_weights, std::map<std::string, int64_t> named_sizes) {
   c10::cuda::CUDAGuard guard(messages.device());
   const Sizes sizes = plan_sizes(named_sizes);
   const int64_t local_size = sizes.topo.local_size, num_nodes = sizes.topo.num_nodes,
@@ -276,8 +279,8 @@ std::map<std::string, at::Tensor> rail_tables_test(
           is_cuda_array(own_lengths, at::kLong, own_columns) &&
           is_cuda_array(own_offsets, at::kLong, own_columns) &&
           is_cuda_array(chunks, at::kInt, max_chunks * 8) &&
-          is_cuda_array(node_chunk_start, at::kLong, num_nodes + 1) &&
-          is_cuda_array(node_chunks, at::kInt, max_chunks) &&
+          is_cuda_array(chunk_offset_per_bucket, at::kLong, num_nodes + 1) &&
+          is_cuda_array(chunk_inv, at::kInt, max_chunks) &&
           is_cuda_array(node_offset_per_bucket, at::kLong, num_nodes + 1) &&
           is_cuda_array(node_length_per_bucket_feature, at::kLong, num_nodes * num_features) &&
           (!owner_offsets.has_value() ||
@@ -286,7 +289,8 @@ std::map<std::string, at::Tensor> rail_tables_test(
            (is_cuda_array(*rail_keys, at::kLong,
                           (int64_t)KeysLayout(sizes, nullptr).rail_keys_bytes() / 8) &&
             node_keys.has_value() && is_cuda_array(*node_keys, at::kLong, lookup_keys))) &&
-          (!node_weights.has_value() || is_cuda_array(*node_weights, at::kFloat, lookup_keys)),
+          (!node_key_weights.has_value() ||
+           is_cuda_array(*node_key_weights, at::kFloat, lookup_keys)),
       "hier_output_dist: rail_tables' inputs");
   const at::Tensor other_nodes = other_nodes_of(sizes.topo, messages.options());
   const RailLayout rail =
@@ -300,8 +304,8 @@ std::map<std::string, at::Tensor> rail_tables_test(
       {"num_recv", rail.num_recv},
       {"length_per_key", rail.length_per_key},
       {"slice_in", rail.slice_in},
-      {"uniq_in", rail.uniq_in},
-      {"length_per_source_feature", rail.length_per_source_feature},
+      {"node_length_per_source", rail.node_length_per_source},
+      {"node_length_per_source_feature", rail.node_length_per_source_feature},
       {"source_offsets", rail.source_offsets},
       {"requester_offsets", rail.requester_offsets},
       {"needs", rail.needs},
@@ -309,14 +313,15 @@ std::map<std::string, at::Tensor> rail_tables_test(
   if (rail_keys.has_value()) {
     TORCH_CHECK(owner_offsets.has_value(),
                 "hier_output_dist: rail_tables' put lists need owner_offsets");
-    const OwnerTables owner = owner_tables(rail, own_offsets, *node_keys,
-                                           node_weights.has_value() ? *node_weights : at::Tensor(),
-                                           *rail_keys, other_nodes, sizes);
-    const PutLists lists = put_lists(chunks.view({max_chunks, 8}), node_chunk_start, node_chunks,
-                                     node_offset_per_bucket, node_length_per_bucket_feature,
-                                     owner_offsets->view({num_nodes, num_features}),
-                                     owner.fwd_chunks, owner.fwd_chunk_start,
-                                     rail.length_per_source_feature, rail.source_offsets, sizes);
+    const OwnerTables owner =
+        owner_tables(rail, own_offsets, *node_keys,
+                     node_key_weights.has_value() ? *node_key_weights : at::Tensor(), *rail_keys,
+                     other_nodes, sizes);
+    const PutLists lists = put_lists(
+        chunks.view({max_chunks, 8}), chunk_offset_per_bucket, chunk_inv, node_offset_per_bucket,
+        node_length_per_bucket_feature, owner_offsets->view({num_nodes, num_features}),
+        owner.fwd_chunks, owner.fwd_chunk_start, rail.node_length_per_source_feature,
+        rail.source_offsets, sizes);
     named["kjt_values"] = owner.kjt_values;
     if (owner.kjt_weights.defined()) named["kjt_weights"] = owner.kjt_weights;
     named["fwd_chunks"] = owner.fwd_chunks;
@@ -379,7 +384,7 @@ std::map<std::string, at::Tensor> requester_tables_test(
           {"dst", tables.dst},
           {"push_order", tables.push_order},
           {"push_order_off", tables.push_order_off},
-          {"push_tables", tables.push_tables},
+          {"proxy_push_tables", tables.proxy_push_tables},
           {"proxy_chunks", tables.proxy_chunks},
           {"proxy_ends", tables.proxy_ends},
           {"task_starts", tables.task_starts}};
@@ -428,25 +433,25 @@ void bind_testing(py::module &py_module) {
                 py::arg("bucket_feature_of_row"), py::arg("num_nodes"), py::arg("local_size"),
                 py::arg("node"), py::arg("local_rank"), py::arg("num_features"),
                 py::arg("lookup_keys"), py::arg("remote_keys"), py::arg("node_keys") = py::none(),
-                py::arg("node_weights") = py::none());
+                py::arg("node_key_weights") = py::none());
   py_module.def("hier_output_dist_proxy_plan", &proxy_plan_test,
                 "One proxy's steps of a call across nodes on plain tensors, which it writes as "
                 "its buffers of the window, and its count messages, by name",
-                py::arg("keys"), py::arg("weights"), py::arg("bucket_feature_of_occ"),
-                py::arg("requester_start"), py::arg("skip"), py::arg("tables"),
-                py::arg("need_remote"), py::arg("own_total"), py::arg("remote_map"),
-                py::arg("key_stage"), py::arg("proxy_header"), py::arg("node_dedup"),
-                py::arg("sizes"));
+                py::arg("node_keys"), py::arg("node_key_weights"),
+                py::arg("node_bucket_feature_of_row"), py::arg("requester_start"), py::arg("skip"),
+                py::arg("tables"), py::arg("need_remote"), py::arg("own_total"),
+                py::arg("remote_map"), py::arg("key_stage"), py::arg("proxy_header"),
+                py::arg("node_dedup"), py::arg("sizes"));
   py_module.def(
       "hier_output_dist_rail_tables", &rail_tables_test,
       "One rank's rail layout and status publish vector on the count messages it got, "
       "and given its rail_keys, node_keys and owner_offsets its owner tables and put lists, "
       "by name",
       py::arg("messages"), py::arg("own_lengths"), py::arg("own_offsets"), py::arg("chunks"),
-      py::arg("node_chunk_start"), py::arg("node_chunks"), py::arg("node_offset_per_bucket"),
+      py::arg("chunk_offset_per_bucket"), py::arg("chunk_inv"), py::arg("node_offset_per_bucket"),
       py::arg("node_length_per_bucket_feature"), py::arg("owner_offsets") = py::none(),
       py::arg("rail_keys") = py::none(), py::arg("node_keys") = py::none(),
-      py::arg("node_weights") = py::none(), py::arg("sizes"));
+      py::arg("node_key_weights") = py::none(), py::arg("sizes"));
   py_module.def("hier_output_dist_requester_tables", &requester_tables_test,
                 "One requester's tables across nodes from its node's proxies' remote_map and "
                 "headers, by name",

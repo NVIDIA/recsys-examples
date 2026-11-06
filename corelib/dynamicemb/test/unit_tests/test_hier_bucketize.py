@@ -812,16 +812,16 @@ def run_node_case(case: NodeCase, seed: int) -> Dict[str, bool]:
     for target in range(local_size):
         mine = pushes[pushes[:, 0] == target]
         node_keys = torch.zeros(lookup_keys, dtype=torch.int64)
-        node_weights = torch.zeros(lookup_keys)
+        node_key_weights = torch.zeros(lookup_keys)
         for source in range(local_size):
             sent = mine[mine[:, 2] == source]
             node_keys[sent[:, 1]] = keys[source][sent[:, 3]]
             if weights:
-                node_weights[sent[:, 1]] = weights[source][sent[:, 3]]
+                node_key_weights[sent[:, 1]] = weights[source][sent[:, 3]]
         out = layout_of(
             target,
             node_keys=node_keys.cuda(),
-            node_weights=node_weights.cuda() if weights else None,
+            node_key_weights=node_key_weights.cuda() if weights else None,
         )
         order = own_order[target]
         num_recv = len(order)

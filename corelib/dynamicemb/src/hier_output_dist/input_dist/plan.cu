@@ -53,7 +53,7 @@ PlanView plan_view(const Plan &plan, const Sizes &sizes) {
   view.push_order = data_of<int32_t>(plan.push_order);
   view.proxy_chunks = data_of<int64_t>(plan.proxy_chunks);
   view.proxy_ends = data_of<int64_t>(plan.proxy_ends);
-  view.push_tables = data_of<int32_t>(plan.push_tables);
+  view.proxy_push_tables = data_of<int32_t>(plan.proxy_push_tables);
   view.task_starts = data_of<int64_t>(plan.task_starts);
   view.num_chunks = data_of<int64_t>(plan.num_chunks);
   view.chunks = data_of<Chunk, int32_t>(plan.chunks);
@@ -82,7 +82,7 @@ auto fwd_tensors(Plan &plan) -> std::vector<decltype(&plan.src)> {
           &plan.push_order,
           &plan.proxy_chunks,
           &plan.proxy_ends,
-          &plan.push_tables,
+          &plan.proxy_push_tables,
           &plan.task_starts,
           &plan.num_chunks,
           &plan.chunks,
@@ -91,8 +91,8 @@ auto fwd_tensors(Plan &plan) -> std::vector<decltype(&plan.src)> {
           &plan.put_starts,
           &plan.push_order_off,
           &plan.fwd_chunks,
-          &plan.node_chunk_start,
-          &plan.node_chunks,
+          &plan.chunk_offset_per_bucket,
+          &plan.chunk_inv,
           &plan.node_length_per_bucket};
 }
 
@@ -112,14 +112,14 @@ auto bwd_tensors(Plan &plan) -> std::vector<decltype(&plan.dst)> {
           &plan.push_order,
           &plan.proxy_chunks,
           &plan.proxy_ends,
-          &plan.push_tables,
+          &plan.proxy_push_tables,
           &plan.task_starts,
           &plan.num_chunks,
           &plan.chunks,
           &plan.node_offset_per_bucket,
           &plan.put_list,
           &plan.put_starts,
-          &plan.uniq_in,
+          &plan.node_length_per_source,
           &plan.reduce_task_starts,
           &plan.node_exp_off};
 }
@@ -132,8 +132,8 @@ FwdPlanView FwdPlan::view(const Sizes &sizes) const {
   view.src = data_of<int32_t>(src);
   view.push_order_off = data_of<int64_t>(push_order_off);
   view.fwd_chunks = data_of<ChunkPiece, int32_t>(fwd_chunks);
-  view.node_chunk_start = data_of<int64_t>(node_chunk_start);
-  view.node_chunks = data_of<int32_t>(node_chunks);
+  view.chunk_offset_per_bucket = data_of<int64_t>(chunk_offset_per_bucket);
+  view.chunk_inv = data_of<int32_t>(chunk_inv);
   view.node_length_per_bucket = data_of<int64_t>(node_length_per_bucket);
   return view;
 }
@@ -158,7 +158,7 @@ BwdPlanView BwdPlan::view(const Sizes &sizes) const {
   BwdPlanView view{};
   static_cast<PlanView &>(view) = plan_view(*this, sizes);
   view.dst = data_of<int32_t>(dst);
-  view.uniq_in = data_of<int64_t>(uniq_in);
+  view.node_length_per_source = data_of<int64_t>(node_length_per_source);
   view.reduce_task_starts = data_of<int64_t>(reduce_task_starts);
   view.node_exp_off = data_of<int64_t>(node_exp_off);
   view.heavy_subs = heavy_subs;

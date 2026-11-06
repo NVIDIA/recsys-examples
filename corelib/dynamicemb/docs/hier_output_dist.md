@@ -342,7 +342,7 @@ The words used in this section and in section 15:
 | capacity | what it bounds | what it sizes | with uniform keys, about |
 |---|---|---|---|
 | `lookup_keys` | the keys an owner looks up: those of its own node and, across nodes, one per node-unique key of each other node | `lookup_rows` (the lookup output), the own part of `node_keys` and, across nodes, `rail_keys`; per call, the owner's KJT | `num_keys × (1 + (num_nodes − 1) × uniq_share) / num_nodes`, at most `num_keys` |
-| `remote_keys` | across nodes: the occurrences a proxy deduplicates, the keys its node sends the owners of its rail on the other nodes | the remote part of `node_keys`, `bucket_feature_of_occ`, `remote_map` and `key_stage`; `proxy_rows`, up to its cap; per call, the proxy's lists | `num_keys × (num_nodes − 1) / num_nodes` |
+| `remote_keys` | across nodes: the occurrences a proxy deduplicates, the keys its node sends the owners of its rail on the other nodes | the remote part of `node_keys`, `node_bucket_feature_of_row`, `remote_map` and `key_stage`; `proxy_rows`, up to its cap; per call, the proxy's lists | `num_keys × (num_nodes − 1) / num_nodes` |
 
 Two more sizes follow from these (section 15.3): `proxy_rows` holds
 `remote_keys` rows, up to its cap, and the proxy's tables hold the most
@@ -413,7 +413,7 @@ formula.
 | capacity | in the window | elsewhere |
 |---|---|---|
 | `lookup_keys` | `row_bytes` (`lookup_rows`) + 8 (`node_keys`; 12 when the keys carry weights) + across nodes `record_bytes` (`rail_keys`) | per call, 8 (12 with weights) for the owner's KJT |
-| `remote_keys` | 8 (`node_keys`; 12 with weights) + 4 (`bucket_feature_of_occ`) + 12 (`remote_map`) + `record_bytes` (`key_stage`), and `row_bytes` in `proxy_rows`, up to its cap | per call, 8 (the proxy's rows before each key, `node_exp_off`) |
+| `remote_keys` | 8 (`node_keys`; 12 with weights) + 4 (`node_bucket_feature_of_row`) + 12 (`remote_map`) + `record_bytes` (`key_stage`), and `row_bytes` in `proxy_rows`, up to its cap | per call, 8 (the proxy's rows before each key, `node_exp_off`) |
 
 The input dist's working memory comes on top, in the caching allocator's
 pool of the stream it runs on: that of its largest step (section 15.2).
@@ -772,14 +772,14 @@ first, so the places of their buffers take the least to compute):
 |---|---|---|
 | rows | `lookup_keys` rows; across nodes also `proxy_rows` | `lookup_rows` (the lookup output, then its gradient). Across nodes also `proxy_rows`. |
 | ctrl | its control words (section 15.2: 80 KB at 32 nodes, 8 GPUs per node and 64 features), most of them the count messages | one buffer, `ctrl`: the control words of both channels (sequence numbers, running totals, the credits sent, the count vectors and count messages, each GIN warp's place with each rail peer) |
-| keys | from `lookup_keys`, and across nodes `remote_keys` | `node_keys` and, with weights, `node_weights`. Across nodes also `bucket_feature_of_occ`, `remote_map`, `proxy_header`, `key_stage`, `rail_keys`, `source_offsets` and `owner_offsets`. |
+| keys | from `lookup_keys`, and across nodes `remote_keys` | `node_keys` and, with weights, `node_key_weights`. Across nodes also `node_bucket_feature_of_row`, `remote_map`, `proxy_header`, `key_stage`, `rail_keys`, `source_offsets` and `owner_offsets`. |
 
 `node_keys` holds the keys a GPU's node pushes to it: its *own part*, which
 it looks up as owner, and across nodes its *remote part*, which it
 deduplicates as proxy (section 10.3). The buffers that only an op across
 nodes has:
 
-* `bucket_feature_of_occ`: the bucket feature of each occurrence in the
+* `node_bucket_feature_of_row`: the bucket feature of each occurrence in the
   remote part, owner node × `num_features` + feature, which the push writes
   beside its key;
 * `remote_map` (`RemoteMap`): three int32 arrays with an entry for each
@@ -889,7 +889,7 @@ Why `NCCL_CROSS_NIC=0`: section 4.5.
 
 A proxy holds, in the remote part of its `node_keys`, every occurrence that
 its node's requesters ask of the owners of its rail on the other nodes, and
-in `bucket_feature_of_occ` the (owner node, feature) of each. Its planner
+in `node_bucket_feature_of_row` the (owner node, feature) of each. Its planner
 numbers them with stable radix sorts (section 10.4):
 
 * **Identity: (owner node, table, key).** The owner node is part of it
@@ -1041,7 +1041,7 @@ their memory order and why no wait hangs.
   target's `node_keys` over NVLink, at the place the node layout gives.
   Across nodes a key for an owner on another node also writes its bucket
   feature (owner node × `num_features` + feature) into the target's
-  `bucket_feature_of_occ`. Consecutive keys of a bucket feature go to
+  `node_bucket_feature_of_row`. Consecutive keys of a bucket feature go to
   consecutive places, so the stores coalesce.
 * **`node_done`** (1 warp): tells each node peer that this rank's keys are
   there (its flag in the peer's `in_written` words), then waits until every
@@ -1130,17 +1130,19 @@ window that its node's requesters and its rail's owners read:
   of each chunk start (the last: where they end), relative to that
   requester's push order.
 
-**Names.** The proxy's tables mirror the requester's, with a `node_`
-prefix. Node dedup is index dedup over the node's occurrences, and its keys
-sorted by bucket feature (owner node × `num_features` + feature) are the
-bucketize's, a bucket being an owner node: `node_uniq_keys`,
-`node_bucket_feature_of_row`, `node_offset_per_bucket_feature`,
-`node_offset_per_bucket` and `node_length_per_bucket(_feature)` mirror
-`keys`, `bucket_feature_of_row`, `offset_per_bucket_feature`,
-`offset_per_bucket` and the bucketize's lengths. `node_exp_off`, the rows
-before each key, mirrors index dedup's `exp_off`, and the tests'
-`node_reverse_indices` (each occurrence's node-unique key) its
-`reverse_indices`.
+**Names.** A table that holds data from another step is named after that
+data where it came from, with a prefix for where it is now. The requesters
+push their `keys`, `key_weights` and `bucket_feature_of_row` into
+`node_keys`, `node_key_weights` and `node_bucket_feature_of_row`. Node
+dedup gives `node_unique_keys`, `node_num_uniques`, `node_reverse_indices`
+and `node_exp_off`, as index dedup gives `unique_keys`, `num_uniques`,
+`reverse_indices` and `exp_off`, and its sort by owner node gives
+`node_bucket_feature_of_unique_row`, `node_offset_per_bucket(_feature)` and
+`node_length_per_bucket(_feature)`, as the bucketize gives
+`bucket_feature_of_row` and `offset_per_bucket(_feature)`. An owner keeps
+the proxies' counts as `node_length_per_source(_feature)`, and a requester
+the proxies' tables as `proxy_chunks`, `proxy_ends` and
+`proxy_push_tables`.
 
 A requester's push order at the proxy comes from one stable radix sort of
 the push key, the occurrence's part: requester × (`max_chunks` + 1) + its
@@ -1258,12 +1260,12 @@ stream: the forward kernel `fwd_kernel` and the backward kernel
   (`FwdPlanView`, in `FwdArgs`) and the backward's (`BwdPlanView`, in
   `BwdArgs`). Each table is a tensor of a plan. Both read the requester's
   block starts and maps, and across nodes its push order and its tables of
-  the node's proxies (`proxy_chunks`, `proxy_ends`, `push_tables`,
+  the node's proxies (`proxy_chunks`, `proxy_ends`, `proxy_push_tables`,
   `task_starts`), the proxy's chunks (`num_chunks`, `chunks`, `node_offset_per_bucket`)
   and the put lists (`put_list`, `put_starts`). The forward also reads the
   requester's `src` and `push_order_off`, the owner's `fwd_chunks` and the
-  proxy's `node_chunk_start`, `node_chunks` and `node_length_per_bucket`. The backward
-  reads its `dst`, the owner's `uniq_in`, and the proxy's
+  proxy's `chunk_offset_per_bucket`, `chunk_inv` and `node_length_per_bucket`. The backward
+  reads its `dst`, the owner's `node_length_per_source`, and the proxy's
   `reduce_task_starts` and `node_exp_off`.
   Their strides are `max_chunks` and `num_nodes`. The call also holds what the op gives
   the kernel for it: the forward's output, the backward's gradient and its
@@ -1518,7 +1520,7 @@ once no peer still reads what call `in_seq` wrote there. The words marked
 
 | buffer or word | written by | last read by | why that is safe |
 |---|---|---|---|
-| `node_keys`, `node_weights`, `bucket_feature_of_occ` | node peers' push | this rank's planner | the peers push after the next call's node barrier, which this rank passes only after its in channel finished the call |
+| `node_keys`, `node_key_weights`, `node_bucket_feature_of_row` | node peers' push | this rank's planner | the peers push after the next call's node barrier, which this rank passes only after its in channel finished the call |
 | `remote_map`, `proxy_header` | this rank's planner | node peers' gathers | this rank writes them after the next call's node barrier, which every peer passes only after its in channel finished the call |
 | `key_stage`, `source_offsets`, `count_msg_out` (ctrl) | this rank | the NIC | the rail exchanges flush their puts before they end |
 | `rail_keys`, `owner_offsets` | rail peers' key and offset puts | this rank's planner | a rail peer puts only after it has this rank's count message of the next call, which this rank sends after the call ended here |
@@ -1566,8 +1568,8 @@ The capacities are the ones in place (section 5), and `row_bytes` and
 |---|---|---|
 | `ctrl` (the ctrl section) | one node: `16 × local_size × (num_features + 2) + 64`; across nodes about `8 × (3 × num_features × (local_size + num_nodes) + 4 × num_nodes² + 16 × num_nodes + 4 × local_size + 3 × max_chunks + 64)`, most of it the count messages: 97 KB at 32 nodes, 8 GPUs per node and 64 features, 8.1 MB at 256 nodes and 1,000 features, and 24 bytes per chunk of `max_chunks` | persistent |
 | `node_keys` | `8 × (lookup_keys + remote_keys)` (one node: `lookup_keys` alone) | persistent |
-| `node_weights` | with weights, `4 × (lookup_keys + remote_keys)` | persistent |
-| `bucket_feature_of_occ` | `4 × remote_keys` | persistent |
+| `node_key_weights` | with weights, `4 × (lookup_keys + remote_keys)` | persistent |
+| `node_bucket_feature_of_row` | `4 × remote_keys` | persistent |
 | `remote_map` | `12 × remote_keys`: three int32 arrays | persistent |
 | `proxy_header` | `4 × (4 + max_chunks + local_size × (max_chunks + 1))` | persistent |
 | `key_stage` | `record_bytes × remote_keys + 16 × max_chunks + 16` | persistent |
@@ -1591,8 +1593,8 @@ planner's, which comes from the code.
 
 The constructors of the layouts size the window's buffers as above
 (`CtrlLayout`, `KeysLayout` and `RowsLayout`, in `window.h`). The buffers
-from `bucket_feature_of_occ` to `owner_offsets`, and `proxy_rows`, exist
-across nodes only, and `node_weights` with weights
+from `node_bucket_feature_of_row` to `owner_offsets`, and `proxy_rows`, exist
+across nodes only, and `node_key_weights` with weights
 only: else they take 0 bytes. Each buffer, the ctrl section too, takes a whole number of 4 KiB
 units (`kBufferAlign`). So the window's bytes are the sum of its buffers,
 each rounded up to 4 KiB (`WindowLayout::bytes`), and its copy on each rank
