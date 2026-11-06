@@ -81,6 +81,10 @@ class InferenceHSTUConfig:
         hstu_preprocessing_config (HSTUPreprocessingConfig, optional): HSTU preprocessing config.
         contextual_max_seqlen (int): The (maximum) length of contextual features.
         embedding_backend (EmbeddingBackend, optional): Embedding backend to use.
+        backbone (str): Dense inference backbone, either hstu or transformer.
+        transformer_ffn_dim (int, optional): Transformer feed-forward width; defaults to four times hidden_size.
+        transformer_fp8_linear (bool): Run the Transformer projections as FP8 DeepGEMM GEMMs; needs bf16 and cannot be exported.
+        transformer_attention (str): Transformer attention, sdpa (padded reference) or fa4 (FlashAttention 4, cannot be exported).
     """
 
     hidden_size: int
@@ -103,10 +107,38 @@ class InferenceHSTUConfig:
     scaling_seqlen: int = -1
     embedding_backend: Optional[EmbeddingBackend] = None
     export_mode: bool = False
+    # Keep the existing config/API name for compatibility with HSTU callers.
+    backbone: str = "hstu"
+    transformer_ffn_dim: Optional[int] = None
+    transformer_fp8_linear: bool = False
+    transformer_attention: str = "sdpa"
 
     def __post_init__(self):
         assert self.is_causal
         assert self.target_group_size == 1
+        if self.backbone not in ("hstu", "transformer"):
+            raise ValueError(f"Unknown inference backbone: {self.backbone}")
+        if self.transformer_fp8_linear and self.backbone != "transformer":
+            raise ValueError("transformer_fp8_linear requires the transformer backbone")
+        if self.transformer_attention not in ("sdpa", "fa4"):
+            raise ValueError(
+                f"Unknown transformer attention: {self.transformer_attention}"
+            )
+        if self.transformer_attention != "sdpa" and self.backbone != "transformer":
+            raise ValueError("transformer_attention requires the transformer backbone")
+        if self.transformer_ffn_dim is not None and self.transformer_ffn_dim <= 0:
+            raise ValueError("transformer_ffn_dim must be positive")
+        if self.backbone == "transformer":
+            for name in (
+                "hidden_size",
+                "num_heads",
+                "head_dim",
+                "num_layers",
+                "max_batch_size",
+                "max_seq_len",
+            ):
+                if getattr(self, name) <= 0:
+                    raise ValueError(f"{name} must be positive")
 
 
 def get_inference_hstu_config(
@@ -127,6 +159,11 @@ def get_inference_hstu_config(
     scaling_seqlen: int = -1,
     embedding_backend=None,
     export_mode: Optional[bool] = None,
+    backbone: str = "hstu",
+    transformer_ffn_dim: Optional[int] = None,
+    hstu_preprocessing_config: Optional[HSTUPreprocessingConfig] = None,
+    transformer_fp8_linear: bool = False,
+    transformer_attention: str = "sdpa",
 ) -> InferenceHSTUConfig:
     """
     Create the HSTU configuration.
@@ -177,4 +214,9 @@ def get_inference_hstu_config(
         scaling_seqlen=scaling_seqlen,
         embedding_backend=embedding_backend,
         export_mode=export_mode,
+        backbone=backbone,
+        transformer_ffn_dim=transformer_ffn_dim,
+        hstu_preprocessing_config=hstu_preprocessing_config,
+        transformer_fp8_linear=transformer_fp8_linear,
+        transformer_attention=transformer_attention,
     )

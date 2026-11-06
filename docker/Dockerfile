@@ -197,6 +197,7 @@ WORKDIR /workspace/deps
 RUN apt-get update -y --fix-missing && \
     apt-get install -y \
       gdb \
+      libdw-dev \
       liburing-dev \
       libxxhash-dev \
       libzmq3-dev && \
@@ -304,6 +305,22 @@ RUN cd /workspace/deps/fbgemm_hstu/fbgemm_gpu/experimental/hstu && \
     MAX_JOBS="${HSTU_BUILD_JOBS}" \
     pip install --no-build-isolation . && \
     rm -rf /workspace/deps/fbgemm_hstu
+
+# Install DeepGEMM (FP8 projections of the Transformer inference backbone) from
+# submodule. Only the host extension is compiled here; it needs the libdw-dev
+# headers. The GEMM kernels are JIT compiled on first use.
+COPY third_party/DeepGEMM /workspace/deps/DeepGEMM
+RUN cd /workspace/deps/DeepGEMM && \
+    pip install --no-build-isolation --no-deps . && \
+    python3 -c 'import importlib.metadata as m; print("deep_gemm", m.version("deep_gemm"))' && \
+    rm -rf /workspace/deps/DeepGEMM
+
+# Install FlashAttention 4 (flash_attn.cute, pure Python), the FA4 attention of the
+# Transformer inference backbone, into the base image's flash_attn package. 4.0.0b21
+# is the first release with the SM120 varlen fix. It asks for CUTLASS DSL 4.6 and
+# quack 0.5.3 but runs with the image's 4.5 and 0.4, hence --no-deps.
+RUN pip install --no-cache-dir --no-deps flash-attn-4==4.0.0b21 && \
+    python3 -c 'import importlib.metadata as m; print("flash-attn-4", m.version("flash-attn-4"))'
 
 # ============================================================================
 # Stage 4: build — devel + recsys-examples in-tree builds (dynamicemb, commons,
