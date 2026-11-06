@@ -62,6 +62,7 @@ def main():
         "tensordict": importlib.metadata.version("tensordict"),
         "tensordict_module": tensordict.__file__,
         "pyvers": importlib.metadata.version("pyvers"),
+        "cloudpickle": importlib.metadata.version("cloudpickle"),
         "dynamicemb_version": importlib.metadata.version("dynamicemb"),
         "dynamicemb": paths["dynamicemb"],
         "extension": paths["dynamicemb_extensions"],

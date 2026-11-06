@@ -155,9 +155,13 @@ class BuildOnlyCheckTest(unittest.TestCase):
         self.run_build_check(tensordict_available=True)
 
     def test_missing_tensordict_dependency_fails_on_cpu(self):
-        self.run_build_check(tensordict_available=False)
+        for dependency in ("pyvers", "cloudpickle"):
+            with self.subTest(dependency=dependency):
+                self.run_build_check(
+                    tensordict_available=False, missing_dependency=dependency
+                )
 
-    def run_build_check(self, tensordict_available):
+    def run_build_check(self, tensordict_available, missing_dependency="pyvers"):
         torch = ModuleType("torch")
         torch.__path__ = []
         torch.__version__ = "2.13.0"
@@ -182,12 +186,13 @@ class BuildOnlyCheckTest(unittest.TestCase):
             "dynamicemb": "0.1.0",
             "tensordict": "0.15.4",
             "pyvers": "0.2.3",
+            "cloudpickle": "3.1.2",
         }
         import_without_gpu = block_runtime_imports(builtins.__import__)
 
         def import_dependencies(name, *args, **kwargs):
             if name == "tensordict" and not tensordict_available:
-                raise ModuleNotFoundError("No module named 'pyvers'")
+                raise ModuleNotFoundError(f"No module named '{missing_dependency}'")
             return import_without_gpu(name, *args, **kwargs)
 
         def compiler_output(command, **kwargs):
@@ -228,7 +233,9 @@ class BuildOnlyCheckTest(unittest.TestCase):
                 if tensordict_available:
                     runpy.run_path(script, run_name="__main__")
                 else:
-                    with self.assertRaisesRegex(ModuleNotFoundError, "pyvers"):
+                    with self.assertRaisesRegex(
+                        ModuleNotFoundError, missing_dependency
+                    ):
                         runpy.run_path(script, run_name="__main__")
             if tensordict_available:
                 self.assertTrue(
