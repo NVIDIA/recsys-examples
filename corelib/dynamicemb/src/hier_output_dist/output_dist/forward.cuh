@@ -32,8 +32,8 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 namespace dyn_emb {
 namespace hier_output_dist {
 
-// Row copies of the forward under index dedup and for heavy keys: a row to
-// each of its original rows, and rows of one source read once.
+// Row copies of the forward under index dedup: a row to each of its
+// original rows.
 
 // Copies of the row at `src` into original rows exp_idx[begin .. end) of
 // `out`. The row is read once: lanes hold its 16-byte vectors, and a short
@@ -100,26 +100,6 @@ __device__ __forceinline__ void warp_copy_fanout(const char *src, int64_t dedup_
   }
 }
 
-// Lanes whose rows have the same source (the occurrences of a heavy key, all
-// at its one row in proxy_rows) read it once: its vectors in the lanes, stored
-// to each of their destinations.
-__device__ __forceinline__ void warp_copy_shared(const char *src, char *dst, int num_rows, int vec,
-                                                 int lane) {
-  for (unsigned todo = __ballot_sync(kFull, lane < num_rows); todo;) {
-    const char *src_row = from_lane(src, __ffs(todo) - 1);
-    const unsigned same = __ballot_sync(kFull, lane < num_rows && src == src_row);
-    todo &= ~same;
-    for (int col_base = 0; col_base < vec; col_base += 32) {
-      const int col = col_base + lane;
-      const int4 val = col < vec ? __ldcg((const int4 *)src_row + col) : make_int4(0, 0, 0, 0);
-      for (unsigned mask = same; mask; mask &= mask - 1) {
-        char *dst_row = from_lane(dst, __ffs(mask) - 1);
-        if (col < vec) *((int4 *)dst_row + col) = val;
-      }
-    }
-  }
-}
-
 // The forward's requester warps: a pull task (fwd::Pull) and the steps of
 // their task loop. Every warp but, across nodes, CTA 0's two GIN warps
 // requests. Its tasks:
@@ -129,10 +109,8 @@ __device__ __forceinline__ void warp_copy_shared(const char *src, char *dst, int
 //     node's owners take these slots: the pulls keep NVLink busy while the
 //     sub-tasks write HBM;
 //   - across nodes, the tasks of the node's proxies, chunk after chunk of
-//     their streams (fwd_task_starts): in a chunk each proxy's in its push
-//     order, first its rows of keys with a row each, then those of heavy
-//     keys (32 positions each; occurrences of one key read its row once),
-//     proxies in turn;
+//     their streams (task_starts): in a chunk each proxy's in its push
+//     order, 32 positions each, proxies in turn;
 //   - then a slot per heavy row sub-task again, which those of rows of other
 //     nodes take. Taken first, they would hold warps waiting for rows to land
 //     while the pulls of rows that have landed wait behind them.
@@ -152,14 +130,13 @@ namespace fwd {
 // into the requester's output.
 struct Pull {
   bool remote;    // a remote task: from a proxy's proxy_rows
-  bool shared;    // occurrences of heavy keys, a source per key: read once
   int peer;       // the node peer whose window the task reads (a remote task: its proxy)
   int64_t chunk;  // a remote task: its chunk of the proxy's stream
   int num_rows;
-  int64_t out_row;  // the lane's row of the output (index dedup: its deduplicated row)
+  int64_t out_row;  // the lane's deduplicated row, whose original rows its row goes to
   const char *src;  // its row
   __device__ __forceinline__ explicit Pull(int me)
-      : remote(false), shared(false), peer(me), chunk(0), out_row(0), src(nullptr) {}
+      : remote(false), peer(me), chunk(0), out_row(0), src(nullptr) {}
 };
 
 // Across nodes: every row of chunk `chunk` of a proxy's stream has landed in
@@ -258,23 +235,13 @@ __device__ __forceinline__ bool remote_pull_warp(const Sizes &sizes, int64_t seq
                                                  int64_t task, int lane, Pull &pull) {
   const FwdPlanView &plan = args.plan;
   const int local_size = sizes.topo.local_size, me = sizes.topo.local_rank;
-  const RemoteTask place(plan.fwd_task_starts, plan.max_chunks * local_size, task);
-  const int64_t chunk = place.entry / local_size, nth = place.nth;
+  const RemoteTask place(plan.task_starts, plan.max_chunks * local_size, task);
+  const int64_t chunk = place.entry / local_size;
   const int proxy = (int)((me + place.entry % local_size) % local_size);
   ReqEntry entry, next;
   tables.req_of(proxy, chunk, entry, next);
-  const int64_t plain = ceil_div<kTaskRows>(entry.heavy - entry.start);
-  int64_t pos0, end;
-  bool shared = false;
-  if (nth < plain) {
-    pos0 = entry.start + nth * kTaskRows;
-    end = entry.heavy;
-  } else {
-    pos0 = entry.heavy + (nth - plain) * kTaskRows;
-    end = next.start;
-    shared = true;
-  }
-  const int num_rows = (int)min((int64_t)kTaskRows, end - pos0);
+  const int64_t pos0 = entry.start + place.nth * kTaskRows;
+  const int num_rows = (int)min((int64_t)kTaskRows, next.start - pos0);
   if (num_rows <= 0) return false;
   const char *src = nullptr;
   int64_t out_row = 0;
@@ -290,7 +257,6 @@ __device__ __forceinline__ bool remote_pull_warp(const Sizes &sizes, int64_t seq
   pull.num_rows = num_rows;
   pull.chunk = chunk;
   pull.peer = proxy;
-  pull.shared = shared;
   return true;
 }
 
@@ -302,24 +268,13 @@ __device__ __forceinline__ void pull_warp(const Sizes &sizes, const FwdArgs &arg
                                           const OutTables &tables, const Pull &pull, bool staged,
                                           int lane) {
   const FwdPlanView &plan = args.plan;
-  const Fanout &fanout = plan.fanout;
   const int me = sizes.topo.local_rank, row_bytes = sizes.row_bytes, vec = sizes.row_vecs();
-  const char *src = pull.src;
-  const int64_t out_row = pull.out_row;
   const int num_rows = pull.num_rows, peer = pull.peer;
-  const bool shared = pull.shared, remote = pull.remote;
+  const bool remote = pull.remote;
   const OutTimeline timeline{args.trace, sizes.topo.local_size};
   const unsigned long long start = timeline.on() ? now_ns() : 0;
-  if (fanout.exp_off != nullptr) {
-    warp_copy_fanout(src, out_row, num_rows, vec, lane, fanout, args.out, row_bytes, remote);
-  } else {
-    char *dst = nullptr;
-    if (lane < num_rows) dst = args.out + out_row * row_bytes;
-    if (shared)
-      warp_copy_shared(src, dst, num_rows, vec, lane);
-    else
-      warp_copy_rows(src, dst, num_rows, vec, lane);
-  }
+  warp_copy_fanout(pull.src, pull.out_row, num_rows, vec, lane, plan.fanout, args.out, row_bytes,
+                   remote);
   if (remote && plan.wraps(peer)) {
     // The task's rows are out of proxy_rows (the warp's loads, before the
     // release).
@@ -330,13 +285,7 @@ __device__ __forceinline__ void pull_warp(const Sizes &sizes, const FwdArgs &arg
     }
   }
   if (timeline.on()) {
-    // rows read: occurrences of one heavy key read its row once
-    int read = num_rows;
-    if (shared && fanout.exp_off == nullptr) {
-      const unsigned same = __match_any_sync(kFull, (unsigned long long)src);
-      read = __popc(__ballot_sync(kFull, lane < num_rows && lane == __ffs(same) - 1));
-    }
-    const unsigned long long bytes = (unsigned long long)read * row_bytes;
+    const unsigned long long bytes = (unsigned long long)num_rows * row_bytes;
     if (lane == 0) timeline.task(start, peer != me ? bytes : 0, peer != me ? 0 : bytes);
   }
 }
@@ -691,7 +640,7 @@ __global__ void __launch_bounds__(kThreads, 1)
       fwd::OwnerIssuer::run(window, dev, sizes, seq, args);
   } else {
     const OutTables tables(window, sizes, args.plan);
-    const int64_t heavy = fanout.exp_off != nullptr ? fanout.count[1] : 0;
+    const int64_t heavy = fanout.count[1];
     // index dedup's heavy rows of other nodes at a proxy whose stream wraps
     // the ring copy on from their first original row (fwd::heavy_sub_warp)
     const bool staged = num_nodes > 1 && heavy > 0;
@@ -706,7 +655,7 @@ __global__ void __launch_bounds__(kThreads, 1)
     const int64_t *node_offset_per_bucket = plan.offset_per_bucket + node * local_size;
     const LocalRows local_rows{node_offset_per_bucket, local_size, me};
     const int64_t rows = local_rows.count(), local = rows + heavy;
-    const int64_t remote = num_nodes > 1 ? plan.fwd_task_starts[plan.max_chunks * local_size] : 0;
+    const int64_t remote = num_nodes > 1 ? plan.task_starts[plan.max_chunks * local_size] : 0;
     const int64_t total = local + remote + (num_nodes > 1 ? heavy : 0);
     const TaskQueue queue{tables.layout().ctrl.task(kQueueWork)};
     for (int64_t task = queue.next_warp(); task < total; task = queue.next_warp()) {

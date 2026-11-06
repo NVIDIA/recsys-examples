@@ -19,7 +19,8 @@ over the rails (NCCL GIN) between nodes, with one host sync per call. Design:
 docs/hier_output_dist.md (section 7.4 for this file).
 
 :class:`HierSharding` builds the operator at the first ``input_dist()`` and
-holds what the calls share. The input dist is in input_dist.py
+holds what the calls share. The operator takes index-deduplicated keys
+(the sharder's ``use_index_dedup=True``). The input dist is in input_dist.py
 (``RwSparseFeaturesDist.hier_forward``). The lookup writes its rows into the
 operator's window (:meth:`HierSharding.lookup`), and
 :class:`RwSequenceHierEmbeddingDist` moves them. A call that does not fit the
@@ -85,35 +86,35 @@ def _first_difference(every: List[Dict]) -> Optional[str]:
 
 # A call's status (int64 words; StatusSlots in
 # src/hier_output_dist/common/common.h): the most any rank needs of
-# lookup_keys and remote_keys; the keys this owner looks up; the backward's
-# sub-tasks of heavy rows and of heavy groups; the remote occurrences this
-# rank deduplicated as proxy; then per feature the keys this owner looks up,
-# then the input KJT's keys.
+# lookup_keys and remote_keys, and the most occurrences of one key at a proxy
+# (key_rows: at most local_size, the keys being index-deduplicated); the keys
+# this owner looks up; the backward's sub-tasks of heavy rows; the remote
+# occurrences this rank deduplicated as proxy; then per feature the keys this
+# owner looks up, then the input KJT's keys.
 (
     _NEED_LOOKUP_KEYS,
     _NEED_REMOTE_KEYS,
+    _NEED_KEY_ROWS,
     _NUM_RECV,
     _HEAVY_SUBS,
-    _GROUP_SUBS,
     _OCCURRENCES,
     _LENGTH_PER_KEY,
 ) = range(7)
 # Where the tensors the benchmark reads are in the plans' lists (the order of
 # FwdPlan::tensors() and BwdPlan::tensors(), in
 # src/hier_output_dist/input_dist/plan.cu).
-_FWD_OFFSET_PER_BUCKET, _FWD_NUM_CHUNKS, _FWD_UNIQ_OUT = 0, 14, 24
-_BWD_UNIQ_IN = 23
+_FWD_OFFSET_PER_BUCKET, _FWD_NUM_CHUNKS, _FWD_UNIQ_OUT = 0, 15, 24
+_BWD_UNIQ_IN = 20
 
 
 class HierCall:
     """What the input dist of a call on the hierarchical dist leaves its
     output dist: the plans (``fwd_plan``, ``bwd_plan``: the op's lists of
     tensors, ``None`` for those the call has not) and, from the call's
-    status, the backward's counts (``counts``: num_recv, heavy_subs,
-    group_subs). Also from the status, for tests and the benchmark: what the
-    call needs of each capacity, the most of every rank (``needs``), and the
-    remote occurrences this rank deduplicated as proxy (``occurrences``, 0
-    on one node)."""
+    status, the backward's counts (``counts``: num_recv, heavy_subs). Also
+    from the status, for tests and the benchmark: what the call needs of each
+    capacity, the most of every rank (``needs``), and the remote occurrences
+    this rank deduplicated as proxy (``occurrences``, 0 on one node)."""
 
     def __init__(
         self,
@@ -198,7 +199,6 @@ class HierSharding:
             dists.
         tables: the table of each feature.
         node_dedup: across nodes a node sends each key once.
-        lfu: some table counts frequencies (:attr:`counts_as_weights`).
     """
 
     def __init__(
@@ -211,7 +211,6 @@ class HierSharding:
         asked: str = "fused",
         tables: Optional[List[int]] = None,
         node_dedup: bool = True,
-        lfu: bool = False,
     ) -> None:
         self._pg = pg
         self._rank = dist.get_rank(pg)
@@ -220,7 +219,6 @@ class HierSharding:
         local_size = min(get_local_size(), world_size)
         self._num_nodes = world_size // local_size
         self._asked = asked
-        self._lfu = lfu
         self.dtype = output_dtype  # of the lookup output's rows
         if isinstance(capacity, int):
             capacity = dict.fromkeys(OUTPUT_DIST_CAPACITY_NAMES, capacity)
@@ -244,8 +242,6 @@ class HierSharding:
         self.op = None  # the HierOutputDist, once setup() made it
         # Whether the sharding takes the hierarchical dist; None until setup().
         self.takes_hier_dist: Optional[bool] = None
-        self._weights = False  # the requesters' keys carry weights
-        self._out_weights = False  # the owner's KJT carries weights
         # The owner's KJT of each call on this path, as its second wait
         # returned it, and the rows its lookup writes (owns(), lookup()).
         self._rows: "weakref.WeakKeyDictionary[KeyedJaggedTensor, torch.Tensor]" = (
@@ -260,21 +256,20 @@ class HierSharding:
     def multi_node(self) -> bool:
         return self._num_nodes > 1
 
-    @property
-    def counts_as_weights(self) -> bool:
-        """The owner's KJT carries occurrence counts as its weights (LFU
-        across nodes without input weights), for LFU tables alone."""
-        return self._out_weights and not self._weights
-
     def setup(
-        self, block_sizes: torch.Tensor, dist_types: torch.Tensor, weights: bool
+        self,
+        block_sizes: torch.Tensor,
+        dist_types: torch.Tensor,
+        weights: bool,
+        index_dedup: bool,
     ) -> bool:
         """Whether this sharding takes the hierarchical dist, the same on
         every rank. The first call builds the operator, collectively, with
         the bucketize's rule of each feature and whether the keys carry
         weights. Ranks whose arguments differ raise the same ValueError. A
         sharding the operator does not apply to takes TorchRec's dists with a
-        warning. A configuration it refuses raises ValueError under
+        warning. A configuration it refuses, or keys that are not
+        index-deduplicated (``index_dedup`` False), raises ValueError under
         ``"fused"`` and takes TorchRec's dists with a warning under
         ``"auto"``. If a rank cannot build it, every rank warns and takes
         TorchRec's dists. See docs/hier_output_dist.md, sections 6 and 7.2."""
@@ -288,18 +283,18 @@ class HierSharding:
         )
 
         self.takes_hier_dist = False
-        self._weights = weights
-        self._out_weights = weights or (
-            self._lfu and self._arguments["node_dedup"] and self.multi_node
-        )
         arguments = dict(
             self._arguments,
             block_sizes=block_sizes,
             dist_types=dist_types,
-            weights=self._weights,
-            out_weights=self._out_weights,
+            weights=weights,
         )
-        refusal = hier_output_dist_invalid(rank=self._rank, **arguments)
+        refusal = (
+            hier_output_dist_invalid(rank=self._rank, **arguments)
+            if index_dedup
+            else "it takes index-deduplicated keys only: give the sharder "
+            "use_index_dedup=True"
+        )
         # Making an id starts NCCL's listener for the other ranks: none for a
         # configuration the operator refuses.
         unique_id = (
@@ -395,6 +390,14 @@ class HierSharding:
                     for name, capacity, need in over
                 )
             )
+        local_size = self._arguments["local_size"]
+        if words[_NEED_KEY_ROWS] > local_size:
+            raise RuntimeError(
+                f'output_dist="{self._asked}": a proxy got one key '
+                f"{words[_NEED_KEY_ROWS]} times from the {local_size} GPUs of its "
+                "node; the keys must be index-deduplicated, each table's at most "
+                "once per GPU"
+            )
         num_features = len(keys)
         length_per_key = words[_LENGTH_PER_KEY : _LENGTH_PER_KEY + num_features]
         input_length_per_key = words[
@@ -406,10 +409,11 @@ class HierSharding:
         sharding_ctx.hier_result = HierCall(
             fwd_plan,
             bwd_plan,
-            [num_recv, words[_HEAVY_SUBS], words[_GROUP_SUBS]],
+            [num_recv, words[_HEAVY_SUBS]],
             {
                 "lookup_keys": words[_NEED_LOOKUP_KEYS],
                 "remote_keys": words[_NEED_REMOTE_KEYS],
+                "key_rows": words[_NEED_KEY_ROWS],
             },
             words[_OCCURRENCES],
         )
@@ -419,7 +423,7 @@ class HierSharding:
             weights=None if weights is None else weights[:num_recv],
             lengths=lengths,
             offsets=offsets,
-            stride=self._arguments["local_size"] + self._num_nodes - 1,
+            stride=local_size + self._num_nodes - 1,
             length_per_key=length_per_key,
             offset_per_key=[0] + list(accumulate(length_per_key)),
         )

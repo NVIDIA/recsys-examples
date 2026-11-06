@@ -16,7 +16,8 @@
 
 Each case builds the same EmbeddingCollection of DynamicEmb tables twice, on
 TorchRec's dists and on the hierarchical dist, and trains both on the same
-batches. Every step checks:
+batches, under index dedup, which the hierarchical dist takes. Every step
+checks:
 
 * the forward outputs: bit for bit in the first iteration, and in every
   iteration when every sum is exact (else within :func:`close`'s tolerances);
@@ -25,7 +26,9 @@ batches. Every step checks:
 * the input dist's host syncs, and in the second step an eval forward,
   which takes TorchRec's dists.
 
-Before the cases: the sharding shapes, the ranks' agreement and the options.
+Before the cases: the sharding shapes, the ranks' agreement and the options
+(a model without index dedup raises under ``"fused"`` and takes TorchRec's
+dists under ``"auto"``).
 After them: an input dist that waits for the device nowhere but in its
 second wait, the output dist's call orders, the backward run to run, the
 window and the trace APIs, failed constructions, across nodes a proxy rows
@@ -68,7 +71,11 @@ from dynamicemb import (
     get_table_value_bytes,
 )
 from dynamicemb.batched_dynamicemb_tables import BatchedDynamicEmbeddingTablesV2
-from dynamicemb.dynamicemb_config import DIST_TYPE_CODES, OUTPUT_DIST_CAPACITY_NAMES
+from dynamicemb.dynamicemb_config import (
+    DIST_TYPE_CODES,
+    OUTPUT_DIST_CAPACITY_NAMES,
+    get_eviction_score_strategy,
+)
 from dynamicemb.planner import (
     DynamicEmbeddingShardingPlanner,
     DynamicEmbParameterConstraints,
@@ -76,7 +83,6 @@ from dynamicemb.planner import (
 from dynamicemb.shard import DynamicEmbeddingCollectionSharder
 from dynamicemb.shard.embedding import ShardedDynamicEmbeddingCollection
 from dynamicemb.shard.hier_output_dist import HierSharding
-from dynamicemb.shard.rw_sharding import counts_frequencies
 from dynamicemb_extensions import (
     block_bucketize_sparse_features,
     hier_output_dist_fail_next_construction,
@@ -97,7 +103,6 @@ sys.path.insert(
 )
 from benchmark_utils import hier_capacities, hier_needs, init_distributed  # noqa: E402
 
-HEAVY = 64  # kHeavy in src/hier_output_dist/common/common.h
 NUM_EMBEDDINGS = 1 << 20
 # Nodes of the run (main sets it): across nodes a requester's keys for an
 # owner on another node reach it once per (node, table, key), and so do the
@@ -165,7 +170,9 @@ def check_group_shapes(rank: int, world_size: int) -> bool:
         with warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter("always")
             hier = standalone(dist.group.WORLD)
-            ok = hier.setup(*bucketize_rules(3, world_size), False) is False and any(
+            ok = hier.setup(
+                *bucketize_rules(3, world_size), False, True
+            ) is False and any(
                 "using TorchRec" in str(warning.message) for warning in caught
             )
         del hier
@@ -176,7 +183,7 @@ def check_group_shapes(rank: int, world_size: int) -> bool:
         if rank < 2:
             hier = standalone(pair)
             ok &= hier._arguments["local_size"] == 2 and hier.setup(
-                *bucketize_rules(3, 2), False
+                *bucketize_rules(3, 2), False, True
             )
             del hier
     return ok
@@ -191,7 +198,7 @@ class Case:
     dtype: str = "fp32"  # table rows and lookup output
     # "uniform", "pow-law", or "hot": uniform, and one key in 1 of 16 places
     keys: str = "uniform"
-    dedup: bool = False  # index dedup
+    dedup: bool = True  # index dedup
     # DynamicEmb tables, row-wise: features per table (f0 and f1 share t0)
     tables: Tuple[Tuple[str, ...], ...] = (("f0", "f1"), ("f2",), ("f3",))
     # plain TorchRec tables, one feature each: in the row-wise sharding (which
@@ -252,15 +259,12 @@ class Case:
 
     def exact(self, world_size: int) -> bool:
         # Sums of multiples of 1/8, scaled by 1/world_size, are exact in any
-        # order when world_size is a power of two: in fp32, and in 16 bits on
-        # one node without index dedup (which adds sums before the lookup,
-        # TorchRec's in 16 bits, ours in fp32); across nodes the owner's lookup
-        # backward adds a key's 16-bit rows in another order than TorchRec's
-        # (its KJT's), and with node dedup a node's sum of them is rounded once
+        # order when world_size is a power of two, in fp32. In 16 bits index
+        # dedup adds sums before the lookup (TorchRec's in 16 bits, ours in
+        # fp32), and across nodes a node's sum of a key's rows is rounded once
         # more. Clipped gradients are no such multiples.
-        sixteen = not self.dedup and NODES == 1
         return (
-            (self.dtype == "fp32" or sixteen)
+            self.dtype == "fp32"
             and not self.clip
             and (world_size & (world_size - 1)) == 0
         )
@@ -268,23 +272,19 @@ class Case:
 
 # Hot keys repeat hundreds of times on a rank: heavy rows of many sub-tasks.
 HEAVY_ROWS = Case(
-    "fp32 pow-law dedup, heavy rows",
+    "fp32 pow-law, heavy rows",
     keys="pow-law",
-    dedup=True,
     batch=1024,
     max_len=16,
     key_range=20000,
 )
-# 16-bit with index dedup takes uniform keys: TorchRec's index_add sums a hot
-# key's gradients in 16 bits, so the reference itself would be far off.
+# 16-bit takes uniform keys: under index dedup TorchRec's index_add sums a
+# hot key's gradients in 16 bits, so the reference itself would be far off.
 CASES = [
     Case("fp32"),
-    Case("fp32 dedup", dedup=True),
     Case("bf16", dtype="bf16"),
-    Case("bf16 dedup", dtype="bf16", dedup=True),
     Case("fp16", dtype="fp16"),
-    Case("bf16 pow-law", dtype="bf16", keys="pow-law"),
-    Case("fp32 pow-law dedup", keys="pow-law", dedup=True),
+    Case("fp32 pow-law", keys="pow-law"),
     Case("fp32 pow-law uneven empty", keys="pow-law", uneven=True, empty=("f3",)),
     Case(
         "int32 uneven empty indices",
@@ -293,18 +293,13 @@ CASES = [
         empty=("f1",),
         indices=True,
     ),
-    Case("fp32 pow-law dedup lfu", keys="pow-law", dedup=True, lfu=True),
+    Case("fp32 pow-law lfu", keys="pow-law", lfu=True),
     Case("fp32 admission", admit=True),
-    Case(
-        "fp32 dedup, no keys on the last rank",
-        dedup=True,
-        empty_last=("f0", "f1", "f2", "f3"),
-    ),
+    Case("fp32, no keys on the last rank", empty_last=("f0", "f1", "f2", "f3")),
     Case("fp32 + an input feature no table serves", extra=("x0",), syncs=2),
     Case(
-        "fp32 pow-law dedup lfu + table-wise table",
+        "fp32 pow-law lfu + table-wise table",
         keys="pow-law",
-        dedup=True,
         lfu=True,
         table_wise=("g0",),
         empty_last=("g0",),
@@ -312,40 +307,27 @@ CASES = [
     ),
     Case("fp32 + plain table: falls back", plain=("p0",), syncs=None),
     Case("fp32 large", batch=2048, max_len=16, key_range=60000, dim=64),
-    Case("fp32 large dedup", batch=2048, max_len=16, key_range=60000, dedup=True),
     Case("fp32 two lookup groups", groups=True),
-    Case("bf16 dedup two lookup groups", dtype="bf16", dedup=True, groups=True),
-    # LFU without index dedup: across nodes the owner's KJT carries each
-    # node-unique key's occurrences as its weight
-    Case("fp32 pow-law lfu, no index dedup", keys="pow-law", lfu=True),
+    Case("bf16 two lookup groups", dtype="bf16", groups=True),
     # gradient clipping clamps each looked-up row: across nodes every
-    # occurrence crosses (no node dedup), so the clamp is TorchRec's
+    # requester's row crosses (no node dedup), so the clamp is TorchRec's
     Case("fp32 hot keys, gradient clipping", keys="hot", clip=True),
-    # node dedup off by the tables' option: every occurrence crosses, and each
-    # 16-bit gradient row is TorchRec's
-    Case(
-        "bf16 pow-law, node dedup off", dtype="bf16", keys="pow-law", node_dedup=False
-    ),
+    # node dedup off by the tables' option: every requester's row crosses,
+    # and each 16-bit gradient row is TorchRec's
+    Case("bf16, node dedup off", dtype="bf16", node_dedup=False),
     # continuous: a key's owner is its range, and the key is rewritten to its
     # place there, so different owners' keys collide at a proxy
     Case("fp32 continuous", dist_type="continuous", key_range=NUM_EMBEDDINGS),
-    Case(
-        "fp32 pow-law hash_roundrobin dedup",
-        keys="pow-law",
-        dedup=True,
-        dist_type="hash_roundrobin",
-    ),
-    # LFU on one table, admission on the others: across nodes the owner's
-    # KJT carries occurrence counts, which only the LFU table may see
+    Case("fp32 pow-law hash_roundrobin", keys="pow-law", dist_type="hash_roundrobin"),
+    # LFU on one table, admission on the others: the keys carry index dedup's
+    # frequency counters, for both
     Case("fp32 pow-law, LFU and admission tables", keys="pow-law", mixed=True),
     HEAVY_ROWS,
     # every rank's features without keys: calls of no keys at all
     Case("fp32, no keys on any rank", empty=("f0", "f1", "f2", "f3")),
-    Case("fp32 dedup, no keys on any rank", dedup=True, empty=("f0", "f1", "f2", "f3")),
     # 4 keys in all: owners 4 and up get no keys, and the 4 keys are very hot
-    # (heavy rows under index dedup, heavy keys of a node across nodes)
-    Case("fp32 a key range of 4 keys", key_range=4),
-    Case("fp32 dedup, a key range of 4 keys", dedup=True, key_range=4),
+    # (heavy rows)
+    Case("fp32, a key range of 4 keys", key_range=4),
     # across nodes: the first node's keys avoid the last node's owners
     Case(
         "fp32 one rank with most keys, a node avoiding an owner node",
@@ -358,8 +340,7 @@ CASES = [
     ),
     # many features: 80, two per table
     Case(
-        "fp32 dedup, 80 features",
-        dedup=True,
+        "fp32, 80 features",
         tables=tuple((f"f{2 * table}", f"f{2 * table + 1}") for table in range(40)),
         num_embeddings=1 << 16,
         batch=64,
@@ -852,14 +833,10 @@ def loss_of(
 
 def same_keys_grads(case: Case, pair: Pair) -> bool:
     """The gradient of the lookup output the last backward handed each model's
-    lookup: summed per (table, key), and per row on one node without index
-    dedup (across nodes the owner has a row per node-unique key)."""
+    lookup, summed per (table, key)."""
     ref_uniq, ref_sum = per_key(case, pair.ref_probe.kjt, pair.ref_probe.grad)
     hier_uniq, hier_sum = per_key(case, pair.hier_probe.kjt, pair.hier_probe.grad)
-    ok = torch.equal(ref_uniq, hier_uniq) and close(case, ref_sum, hier_sum)
-    if not case.dedup and NODES == 1:
-        ok = ok and torch.equal(pair.ref_probe.grad, pair.hier_probe.grad)
-    return ok
+    return torch.equal(ref_uniq, hier_uniq) and close(case, ref_sum, hier_sum)
 
 
 def same_tables(case: Case, pair: Pair, world_size: int) -> Tuple[bool, bool]:
@@ -889,6 +866,15 @@ def same_tables(case: Case, pair: Pair, world_size: int) -> Tuple[bool, bool]:
         )
         bitwise = bitwise and same and torch.equal(ref_values, hier_values)
     return ok, bitwise
+
+
+def counts_frequencies(options) -> bool:
+    """Whether a DynamicEmb table counts its keys' frequencies (LFU scores)."""
+    return (
+        options.score_strategy is not None
+        and get_eviction_score_strategy(options.score_strategy)
+        == DynamicEmbScoreStrategy.LFU
+    )
 
 
 def frequencies_of(ec) -> Dict[Tuple[str, str], Tuple[torch.Tensor, torch.Tensor]]:
@@ -937,9 +923,9 @@ def frequencies_of(ec) -> Dict[Tuple[str, str], Tuple[torch.Tensor, torch.Tensor
 
 def same_frequencies(pair: Pair) -> bool:
     """The LFU scores and the admission counts of both models' tables: the
-    hierarchical owner counts every occurrence TorchRec's does (across
-    nodes, a node-unique key's weight carries its node's, for LFU tables;
-    an admission strategy counts a key once per batch on both)."""
+    hierarchical owner counts every occurrence TorchRec's does (the keys'
+    weights carry index dedup's frequency counters, across nodes a
+    node-unique key's those of its node)."""
     ref_freq, hier_freq = frequencies_of(pair.ref), frequencies_of(pair.hier)
     return ref_freq.keys() == hier_freq.keys() and all(
         torch.equal(ref_freq[key][0], hier_freq[key][0])
@@ -966,10 +952,9 @@ def check_step(
     fwd_exact: bool,
 ) -> Tuple[Dict[str, bool], bool]:
     """After the forwards of one batch on both models: their backwards, and
-    then the forward outputs, the backward per (table, key) (and per row on
-    one node without index dedup), the tables after the step and their LFU
-    scores or admission counts, against TorchRec's. Returns the checks, and
-    whether the tables are bitwise equal."""
+    then the forward outputs, the backward per (table, key), the tables after
+    the step and their LFU scores or admission counts, against TorchRec's.
+    Returns the checks, and whether the tables are bitwise equal."""
     ok_fwd = same_outputs(case, ref_out, hier_out, fwd_exact)
     for out in (ref_out, hier_out):
         loss_of(case, case_idx, iteration, rank, out).backward()
@@ -1182,9 +1167,9 @@ def run_proxy_rows(rank: int, world_size: int, local_size: int, log: Callable) -
     """Across nodes, a proxy rows cap below the least rows of the proxy's
     ring: "fused" raises the same ValueError on every rank, naming the cap's
     knob, and "auto" warns and takes TorchRec's dists."""
-    # min_proxy_rows_for in common.h: two chunks of keys of the most rows
-    # (an fp32 partial of 32 columns takes one row)
-    least_rows = 4 * max(HEAVY, 1 + local_size)
+    # min_proxy_rows_for in common.h: two chunks of keys of the most rows (a
+    # row per GPU of the node)
+    least_rows = 4 * local_size
     cap_mb = least_rows * 4 * 32 / 2 / (1 << 20)  # half their fp32 rows of 32 columns
     capacity = dict.fromkeys(OUTPUT_DIST_CAPACITY_NAMES, 1 << 16)
     checks: Dict[str, bool] = {}
@@ -1197,12 +1182,12 @@ def run_proxy_rows(rank: int, world_size: int, local_size: int, log: Callable) -
             warnings.simplefilter("always")
             if asked == "fused":
                 msg = expect_error(
-                    ValueError, hier.setup, *bucketize_rules(3, world_size), False
+                    ValueError, hier.setup, *bucketize_rules(3, world_size), False, True
                 )
                 named = "DYNAMICEMB_GIN_PROXY_MB" in msg
                 checks["fused raised"] = named and same_everywhere(msg)
             else:
-                took = hier.setup(*bucketize_rules(3, world_size), False)
+                took = hier.setup(*bucketize_rules(3, world_size), False, True)
                 checks["auto takes TorchRec's dists"] = took is False and any(
                     "using TorchRec" in str(warning.message) for warning in caught
                 )
@@ -1231,7 +1216,9 @@ def run_options(rank: int, world_size: int, local_size: int, log: Callable) -> i
     dist it does not know (naming those it knows); tables of one sharding
     that ask for different capacities raise it when the model is sharded;
     ``"auto"`` without a capacity takes TorchRec's dists with a warning, and
-    trains as they do."""
+    trains as they do. A model without index dedup: under ``"fused"`` its
+    first input dist raises ValueError on every rank alike, under ``"auto"``
+    it warns and trains as TorchRec's dists do."""
     every_capacity = dict.fromkeys(OUTPUT_DIST_CAPACITY_NAMES, 1 << 16)
     unknown = option_error(output_dist="hierarchical", output_dist_capacity=4)
     checks = {
@@ -1264,9 +1251,32 @@ def run_options(rank: int, world_size: int, local_size: int, log: Callable) -> i
     checks["auto trains as TorchRec"] = same_outputs(
         case, ref_run.out, auto_run.out, True
     )
-    failures = report("options", checks, log, f": {msg}; {unknown}")
+    plain = replace(case, dedup=False)
+    kjt = batch_of(plain, 141, 0, rank, world_size)
+    fused = sharded_ec(
+        build_model(plain, "fused", world_size, local_size, every_capacity)
+    )
+    refused = expect_error(ValueError, fused.input_dist, fused.create_context(), kjt)
+    checks[
+        "fused without index dedup"
+    ] = "index-deduplicated" in refused and same_everywhere(refused)
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        auto_plain = sharded_ec(
+            build_model(plain, "auto", world_size, local_size, every_capacity)
+        )
+        auto_plain_run = run_model(auto_plain, kjt, False)
+    ref_plain = sharded_ec(build_model(plain, "torchrec", world_size, local_size))
+    ref_plain_run = run_model(ref_plain, kjt, False)
+    checks["auto without index dedup"] = (
+        hier_of(auto_plain).takes_hier_dist is False
+        and any("index-deduplicated" in str(warning.message) for warning in caught)
+        and same_outputs(plain, ref_plain_run.out, auto_plain_run.out, True)
+    )
+    failures = report("options", checks, log, f": {msg}; {unknown}; {refused}")
     torch.cuda.synchronize()  # before the tables' memory goes with the models
-    del auto, ref, auto_run, ref_run
+    del auto, ref, auto_run, ref_run, fused, auto_plain, ref_plain
+    del auto_plain_run, ref_plain_run
     return failures + gc_models(log)
 
 
@@ -1281,7 +1291,9 @@ def run_agreement(rank: int, world_size: int, local_size: int, log: Callable) ->
     messages = []
     with environ("DYNAMICEMB_GIN_TIMEOUT_S", 60 if rank == last else None):
         hier = standalone(dist.group.WORLD)
-    msg = expect_error(ValueError, hier.setup, *bucketize_rules(3, world_size), False)
+    msg = expect_error(
+        ValueError, hier.setup, *bucketize_rules(3, world_size), False, True
+    )
     checks["an environment variable on one rank"] = (
         f"rank {last} has timeout_s=60.0" in msg
         and same_everywhere(msg)
@@ -1297,7 +1309,9 @@ def run_agreement(rank: int, world_size: int, local_size: int, log: Callable) ->
             dist.group.WORLD, 3, 32, torch.float32, capacity, asked="auto"
         )
     SHARDINGS.append(weakref.ref(hier))
-    msg = expect_error(ValueError, hier.setup, *bucketize_rules(3, world_size), False)
+    msg = expect_error(
+        ValueError, hier.setup, *bucketize_rules(3, world_size), False, True
+    )
     checks["a capacity on one rank"] = (
         f"rank {last} has lookup_keys=" in msg
         and same_everywhere(msg)
@@ -1307,7 +1321,7 @@ def run_agreement(rank: int, world_size: int, local_size: int, log: Callable) ->
     del hier
     hier = standalone(dist.group.WORLD)
     checks["built after them"] = (
-        hier.setup(*bucketize_rules(3, world_size), False) is True
+        hier.setup(*bucketize_rules(3, world_size), False, True) is True
     )
     del hier
     torch.cuda.synchronize()
@@ -1331,7 +1345,9 @@ def run_construction_failure(
             hier_output_dist_fail_next_construction(fail_alloc=True)
         with warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter("always")
-            fell_back += hier.setup(*bucketize_rules(3, world_size), False) is False
+            fell_back += (
+                hier.setup(*bucketize_rules(3, world_size), False, True) is False
+            )
         said = [
             str(warning.message)
             for warning in caught
@@ -1361,12 +1377,8 @@ def run_no_sync(rank: int, world_size: int, local_size: int, log: Callable) -> i
     to raise, and the next call that fits runs)."""
     failures = 0
     for case_idx, case, capacity in (
-        (130, Case("no sync, dedup", dedup=True), 1 << 16),
-        (
-            131,
-            Case("no sync, pow-law dedup lfu", keys="pow-law", dedup=True, lfu=True),
-            1 << 16,
-        ),
+        (130, Case("no sync"), 1 << 16),
+        (131, Case("no sync, pow-law lfu", keys="pow-law", lfu=True), 1 << 16),
         (
             132,
             Case(
@@ -1429,7 +1441,7 @@ def run_orders(rank: int, world_size: int, local_size: int, log: Callable) -> in
     TorchRec's dists on the same batches, each followed by a checked step: a
     no-grad forward; two forwards, then one backward of both or their
     backwards in order; and a second backward of one graph
-    (``retain_graph``). Without index dedup, and with index dedup and heavy
+    (``retain_graph``). With uniform keys, and with pow-law keys and heavy
     rows."""
     failures = 0
     for case_idx, case in (
@@ -1437,9 +1449,8 @@ def run_orders(rank: int, world_size: int, local_size: int, log: Callable) -> in
         (
             111,
             Case(
-                "orders, pow-law dedup",
+                "orders, pow-law",
                 keys="pow-law",
-                dedup=True,
                 batch=512,
                 max_len=16,
                 key_range=20000,
@@ -1584,18 +1595,10 @@ def run_determinism(rank: int, world_size: int, local_size: int, log: Callable) 
     """The backward is the same bit for bit from run to run: the same batch
     twice, with random fp32 output gradients (whose sums depend on their
     order), hands each owner's lookup the same gradient for every (table,
-    key, source). Heavy index-dedup rows included; across nodes also without
-    index dedup."""
+    key, source). Heavy rows included."""
     failures = 0
     case_idx = 108
-    heavy_case = replace(HEAVY_ROWS, name="determinism")
-    cases = [heavy_case]
-    if NODES > 1:
-        # without index dedup a requester's heavy groups hold hundreds of rows
-        cases.append(
-            replace(heavy_case, name="determinism, no index dedup", dedup=False)
-        )
-    for case in cases:
+    for case in (replace(HEAVY_ROWS, name="determinism"),):
         torch.manual_seed(case_idx)
         calls = [batch_of(case, case_idx, 0, rank, world_size)]
         ec = sharded_ec(fused_model(case, world_size, local_size, calls))
@@ -1662,7 +1665,7 @@ def run_teardown(rank: int, world_size: int, local_size: int, log: Callable) -> 
     ):
         with environ("DYNAMICEMB_GIN_TIMEOUT_S", timeout_s):
             hier = standalone(dist.group.WORLD)
-        ok = hier.setup(*bucketize_rules(3, world_size), False)
+        ok = hier.setup(*bucketize_rules(3, world_size), False, True)
         dist.barrier()
         if last:
             time.sleep(late)

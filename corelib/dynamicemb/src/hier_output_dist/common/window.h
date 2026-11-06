@@ -52,17 +52,17 @@ struct CountVector {
 // A count message (int64 words, planner.h), all a rail peer needs to lay
 // out the keys its rail puts: a common part, the same for every peer (its
 // node's largest remote part, the keys of its own node it looks up as owner,
-// and as proxy its node-unique keys and its chunks per owner node), then the
-// part for the peer's node alone (its node-unique keys of each feature
-// there).
+// and as proxy the most occurrences of one of its node-unique keys, its
+// node-unique keys and its chunks per owner node), then the part for the
+// peer's node alone (its node-unique keys of each feature there).
 struct CountMessage {
-  static constexpr int kNeedRemote = 0, kOwnTotal = 1;
+  static constexpr int kNeedRemote = 0, kOwnTotal = 1, kKeyRows = 2;
   int64_t num_nodes, num_features;
-  __host__ __device__ int64_t uniq_out(int64_t owner_node) const { return 2 + owner_node; }
+  __host__ __device__ int64_t uniq_out(int64_t owner_node) const { return 3 + owner_node; }
   __host__ __device__ int64_t chunks_out(int64_t owner_node) const {
-    return 2 + num_nodes + owner_node;
+    return 3 + num_nodes + owner_node;
   }
-  __host__ __device__ int64_t common() const { return 2 + 2 * num_nodes; }
+  __host__ __device__ int64_t common() const { return 3 + 2 * num_nodes; }
   // A message as a peer gets it: the common part, then the part for its node.
   __host__ __device__ int64_t length() const { return common() + num_features; }
   // What a rank sends from: the common part, then the part for each node.
@@ -250,8 +250,8 @@ struct GatheredHeader;  // below
 // unwrapped: past num_proxy_rows when the stream wraps the ring); from word
 // 4 each chunk's end ([max_chunks], uint32); then its push tables, ReqEntry
 // [local_size][max_chunks + 1], positions relative to each requester's push
-// order there and groups relative to its first group. A requester gathers
-// the words it reads (planner.h) by their word numbers.
+// order there. A requester gathers the words it reads (planner.h) by their
+// word numbers.
 struct ProxyHeader {
   static constexpr int64_t kChunksWord = 0, kEndWord = 1, kEndsWord = 4;
   int32_t *base;
@@ -261,7 +261,7 @@ struct ProxyHeader {
   __host__ __device__ static ProxyHeader of(const Sizes &sizes, int32_t *base = nullptr) {
     return ProxyHeader{base, sizes.topo.local_size, sizes.max_chunks};
   }
-  __host__ __device__ int64_t push_words() const { return 4 * (max_chunks + 1); }
+  __host__ __device__ int64_t push_words() const { return 2 * (max_chunks + 1); }
   __host__ __device__ int64_t push_table_word(int64_t requester) const {
     return kEndsWord + max_chunks + requester * push_words();
   }
@@ -286,7 +286,7 @@ struct ProxyHeader {
 // What a requester gathered of a proxy's header: its stream's chunks, each
 // chunk's end and the stream's end (unwrapped positions), and this
 // requester's push table there (positions relative to its push order at the
-// proxy, groups relative to its first group).
+// proxy).
 struct GatheredHeader {
   const int32_t *words;
   int64_t max_chunks;
@@ -308,26 +308,16 @@ __host__ __device__ inline GatheredHeader ProxyHeader::gathered(const int32_t *h
 
 // remote_map (int32), what a proxy publishes of each occurrence of its
 // remote part (occ) to the occurrence's requester, in three arrays of
-// remote_keys: its key's row in proxy_rows (bit 31: a heavy key), its slot
-// in proxy_rows (the key's row, a duplicate's or the requester's partial
-// slot) and its position in its requester's push order. A requester gathers
-// an occurrence's words from entry occ of each array (GatheredMap).
-// An occurrence's key row in remote_map: the row, bit 31 set for a heavy key.
-struct MapKeyRow {
-  uint32_t bits;
-  __host__ __device__ static MapKeyRow of(int32_t row, bool heavy) {
-    return {(uint32_t)row | (uint32_t)heavy << 31};
-  }
-  __host__ __device__ int32_t row() const { return (int32_t)(bits & 0x7FFFFFFFu); }
-  __host__ __device__ bool heavy() const { return (bits >> 31) != 0; }
-};
-static_assert(sizeof(MapKeyRow) == 4, "remote_map's arrays are int32");
+// remote_keys: its key's row in proxy_rows, its slot in proxy_rows (the
+// key's row or a duplicate's) and its position in its requester's push
+// order. A requester gathers an occurrence's words from entry occ of each
+// array (GatheredMap).
 struct RemoteMap {
   static constexpr int kArrays = 3;
   int32_t *base;
   int64_t remote_keys;  // the entries of each array
   __host__ __device__ int32_t *array(int which) const { return base + which * remote_keys; }
-  __host__ __device__ MapKeyRow *key_row() const { return (MapKeyRow *)array(0); }
+  __host__ __device__ int32_t *key_row() const { return array(0); }
   __host__ __device__ int32_t *slot() const { return array(1); }
   __host__ __device__ int32_t *position() const { return array(2); }
 };
@@ -336,9 +326,7 @@ struct RemoteMap {
 struct GatheredMap {
   const int32_t *words;
   int64_t rows;
-  __host__ __device__ MapKeyRow key_row(int64_t row) const {
-    return ((const MapKeyRow *)words)[row];
-  }
+  __host__ __device__ int32_t key_row(int64_t row) const { return words[row]; }
   __host__ __device__ int32_t slot(int64_t row) const { return words[rows + row]; }
   __host__ __device__ int32_t position(int64_t row) const { return words[2 * rows + row]; }
 };

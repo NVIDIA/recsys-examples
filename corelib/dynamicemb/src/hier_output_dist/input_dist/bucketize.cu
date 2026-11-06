@@ -75,14 +75,12 @@ __global__ void __launch_bounds__(kThreads)
 // [num_features + 1], from its first key), from its offsets (every
 // batch-th) or, for a KJT of lengths (offsets nullptr), from the features'
 // totals; and the totals construct_jagged_tensors reads
-// (input_length_per_key [num_features]), of the input KJT's offsets when it
-// is another KJT (else input_offsets is nullptr).
+// (input_length_per_key [num_features]), of the input KJT's offsets.
 template <typename Offset, typename InputOffset>
 __global__ void __launch_bounds__(kThreads)
     feature_starts_kernel(const Offset *offsets, const int64_t *totals, int64_t batch,
                           int64_t num_features, const InputOffset *input_offsets,
-                          int64_t input_batch, int64_t *value_start,
-                          int64_t *input_length_per_key) {
+                          int64_t *value_start, int64_t *input_length_per_key) {
   if (offsets != nullptr) {
     for (int64_t feature = threadIdx.x; feature <= num_features; feature += kThreads)
       value_start[feature] = (int64_t)offsets[feature * batch] - (int64_t)offsets[0];
@@ -92,10 +90,8 @@ __global__ void __launch_bounds__(kThreads)
         num_features, [&](int64_t feature) { return totals[feature]; }, value_start);
   }
   for (int64_t feature = threadIdx.x; feature < num_features; feature += kThreads)
-    input_length_per_key[feature] = input_offsets != nullptr
-                                        ? (int64_t)input_offsets[(feature + 1) * input_batch] -
-                                              (int64_t)input_offsets[feature * input_batch]
-                                        : value_start[feature + 1] - value_start[feature];
+    input_length_per_key[feature] =
+        (int64_t)input_offsets[(feature + 1) * batch] - (int64_t)input_offsets[feature * batch];
 }
 
 // ── the owner rules ──
@@ -329,12 +325,10 @@ BucketizedKeys bucketize_keys(const PlanInput &input, const OwnerRules &rules, i
               "hier_output_dist: offsets (num_features * batch_size + 1) or lengths "
               "(num_features * batch_size) must be contiguous int32 or int64 on the GPU of the "
               "keys");
-  TORCH_CHECK(!input.input_offsets.has_value() ||
-                  (input.input_batch_size > 0 && on_gpu_of(*input.input_offsets, values) &&
-                   is_index_dtype(*input.input_offsets) &&
-                   input.input_offsets->numel() == num_features * input.input_batch_size + 1),
+  TORCH_CHECK(on_gpu_of(input.input_offsets, values) && is_index_dtype(input.input_offsets) &&
+                  input.input_offsets.numel() == num_features * batch + 1,
               "hier_output_dist: the input KJT's offsets must be contiguous int32 or int64 on "
-              "the GPU of the keys, num_features * input_batch_size + 1 of them");
+              "the GPU of the keys, num_features * batch_size + 1 of them");
   TORCH_CHECK(!input.weights.has_value() || (on_gpu_of(*input.weights, values) &&
                                              input.weights->scalar_type() == at::kFloat &&
                                              input.weights->numel() == num_keys),
@@ -360,8 +354,7 @@ BucketizedKeys bucketize_keys(const PlanInput &input, const OwnerRules &rules, i
     with_index(input.input_offsets, [&](const auto *input_offsets) {
       feature_starts_kernel<<<kOneCta, kThreads, 0, stream>>>(
           offsets, data_or_null<int64_t>(totals), batch, num_features, input_offsets,
-          input.input_batch_size, value_start.data_ptr<int64_t>(),
-          bucketized.input_length_per_key.data_ptr<int64_t>());
+          value_start.data_ptr<int64_t>(), bucketized.input_length_per_key.data_ptr<int64_t>());
     });
   });
   C10_CUDA_KERNEL_LAUNCH_CHECK();

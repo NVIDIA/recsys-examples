@@ -102,12 +102,10 @@ struct Config {
   at::Tensor dist_types;   // [num_features] int32 on the GPU: of each feature
   int64_t dim = 0;         // a row of the lookup output: dim values of dtype
   at::ScalarType dtype = at::kFloat;
-  bool weights = false;      // the requesters' keys carry weights: whole counts of at
-                             // least 0, which the proxy adds as integers
-  bool out_weights = false;  // the owner's KJT carries weights: the keys', or across
-                             // nodes each node-unique key's occurrences
-  bool node_dedup = true;    // across nodes a node sends a key once (else each
-                             // occurrence)
+  bool weights = false;    // the requesters' keys carry weights, and so the owner's KJT:
+                           // whole counts of at least 0, which the proxy adds as integers
+  bool node_dedup = true;  // across nodes a node sends a key once (else each
+                           // occurrence)
   Capacities capacities;
   double timeout_s = 120;  // the longest a kernel waits for a peer before it traps
   int ctas = 0;            // CTAs of an out kernel (0: its default)
@@ -126,8 +124,8 @@ struct Config {
 Config config_of(int64_t rank, int64_t world_size, int64_t local_size,
                  const std::vector<int64_t> &feature_tables, const at::Tensor &block_sizes,
                  const at::Tensor &dist_types, int64_t dim, at::ScalarType dtype, bool weights,
-                 bool out_weights, bool node_dedup, int64_t lookup_keys, int64_t remote_keys,
-                 int64_t proxy_bytes, double timeout_s, int64_t ctas, int64_t reduce_ctas);
+                 bool node_dedup, int64_t lookup_keys, int64_t remote_keys, int64_t proxy_bytes,
+                 double timeout_s, int64_t ctas, int64_t reduce_ctas);
 
 // Why the op does not apply to a sharding of these ranks, features and rows
 // (ranks that are not whole nodes, int32 bucket feature numbers, rows the
@@ -147,14 +145,10 @@ Sizes sizes_of(const Config &config);
 
 // The sizing rules of the sizes that follow from the configuration
 // (sizes_of's, and Config::validate's), across nodes:
-//   heavy_at        max(kHeavy, local_size * partial_rows)
 //   num_proxy_rows  min(max(remote_keys, min_proxy_rows_for(max_key_rows)),
 //                   proxy_bytes / row_bytes)
 //   chunk_rows      max(min(2 MiB of rows, num_proxy_rows / 2), 2 * max_key_rows)
 //   max_chunks      remote_keys / chunk_room + num_nodes
-// rows of proxy_rows a requester's fp32 partial row takes
-int partial_rows_for(int64_t dim, int64_t row_bytes);
-int64_t heavy_at_for(int64_t local_size, int64_t partial_rows);
 // max_chunks of sizes whose other fields are set
 int64_t max_chunks_for(const Sizes &sizes);
 

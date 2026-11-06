@@ -566,7 +566,8 @@ to move keys and rows between GPUs (`--output_dist`):
   ([docs/hier_output_dist.md](../docs/hier_output_dist.md)). Its own input
   dist does all the planning, with one host sync per call. Its output dist
   only moves rows, one kernel per direction. Its capacities come from the
-  benchmark's own batches (`--capacity`).
+  benchmark's own batches (`--capacity`). It takes index-deduplicated keys:
+  it needs `--use_index_dedup`.
 * `auto`: `fused` where the build has it, else `torchrec`.
 
 ### How to run
@@ -584,7 +585,7 @@ default task layout do this). The words used here (GIN, rail, proxy,
 ```bash
 BENCH=benchmark/benchmark_distributed_embedding_collection.py
 ARGS="--num_tables 8 --num_embeddings 4000000 --local_batch_size 4096 \
-      --max_seq_len 32 --num_iterations 20 --warmup 5"
+      --max_seq_len 32 --num_iterations 20 --warmup 5 --use_index_dedup"
 export NCCL_CROSS_NIC=0                            # GIN on the rails only (recommended)
 export NCCL_NET_PLUGIN=none NCCL_GIN_PLUGIN=none   # only where NCCL's plugin cannot run GIN (Eos)
 
@@ -613,17 +614,19 @@ need of each capacity (`--capacity measure`, the default), and takes
 does not raises at its second wait, naming the capacity to raise.
 
 The configuration above has 8 tables of 4,000,000 rows, dim 128, fp32, SGD,
-4096 samples per GPU, and sequence lengths from 1 to 32: about 540,000 keys
-per GPU and iteration. Three workloads, each with both dists:
+4096 samples per GPU, sequence lengths from 1 to 32 (about 540,000 keys per
+GPU and iteration) and index dedup. Two workloads, each with both dists:
 
 ```bash
 for DIST in torchrec fused; do
   EXTRA="--nic_counters"; [ $DIST = fused ] && EXTRA="$EXTRA --kernel_times"
-  $LAUNCH $BENCH $ARGS --output_dist $DIST $EXTRA                             # uniform keys
-  $LAUNCH $BENCH $ARGS --output_dist $DIST $EXTRA --key_dist pow-law          # power-law keys
-  $LAUNCH $BENCH $ARGS --output_dist $DIST $EXTRA --key_dist pow-law --use_index_dedup
+  $LAUNCH $BENCH $ARGS --output_dist $DIST $EXTRA                     # uniform keys
+  $LAUNCH $BENCH $ARGS --output_dist $DIST $EXTRA --key_dist pow-law  # power-law keys
 done      # $LAUNCH: the torchrun or srun prefix above
 ```
+
+TorchRec's dists also run without `--use_index_dedup`; the hierarchical
+dist does not.
 
 More runs on the same configuration:
 
@@ -644,7 +647,7 @@ More runs on the same configuration:
 
 | option | default | meaning |
 |---|---|---|
-| `--output_dist` | `torchrec` | `torchrec`, `fused` or `auto` (see above) |
+| `--output_dist` | `torchrec` | `torchrec`, `fused` or `auto` (see above); `fused` and `auto` need `--use_index_dedup` |
 | `--capacity` | `measure` | The hierarchical dist's `output_dist_capacity`. An int sets `lookup_keys` and `remote_keys` to that many keys. `measure` counts what the benchmark's own batches need of each, as the dist counts it, before the model is built (`hier_needs` in `benchmark_utils.py`, on a process group made for it and destroyed after). It takes `--capacity_headroom` times that, and at least 4096 entries more (`hier_capacities`). A call that does not fit raises at its second wait. |
 | `--capacity_headroom` | 1.25 | with `--capacity measure`: the capacities over the measured needs |
 | `--pipeline` | `none` | `none`: plain loop (forward, then backward, one batch at a time); `sparse_dist`: `TrainPipelineSparseDist`; `prefetch`: `PrefetchTrainPipelineSparseDist`. Under a pipeline the report gives whole iterations, and `--check` runs the checked model under it |
@@ -658,12 +661,12 @@ More runs on the same configuration:
 | `--key_range` | `--num_embeddings` | uniform keys are drawn from [0, key_range), pow-law ones from [1, key_range) |
 | `--dist_type` | `roundrobin` | which rank owns a key: `roundrobin` (key mod ranks) or `hash_roundrobin` (hashed key mod ranks) |
 | `--emb_dtype`, `--output_dtype` | `fp32` | `fp32`, `bf16` or `fp16` |
-| `--use_index_dedup` | off | TorchRec's index dedup: each rank removes its own repeated keys before the input dist |
+| `--use_index_dedup` | off | TorchRec's index dedup: each rank removes its own repeated keys before the input dist. The hierarchical dist (`fused`, `auto`, `--check`) needs it |
 | `--optimizer`, `--learning_rate` | `sgd`, 0.01 | `sgd`, `adam`, `exact_adagrad` or `rowwise_adagrad` |
 | `--num_iterations`, `--warmup` | 30, 10 | timed and untimed iterations, at least 1 each |
 | `--seed` | 1234 | seed of the batches (different for each rank) |
 | `--profile_iterations` | 5 | that many more iterations under `torch.profiler`, for the per-stage kernel times and counts; 0 skips them |
-| `--check` | off | Before timing, train 4 steps of two models side by side: one on TorchRec's dists, and one on the hierarchical dist (`--output_dist`'s, or `fused` when that is `torchrec`). Both start from the DEBUG initializer, where a key's row is a function of the key. They use SGD at learning rate 1, and keys from an eighth of the table, so nothing is evicted. The capacities are `--capacity`, or measured on the check's own batches. Then print PASSED or FAILED. Outputs must match bit for bit when `--emb_dtype` and `--output_dtype` are both `fp32` and the world size is a power of two. Otherwise they must match bit for bit at the first step, and within 1e-2 after it. The checked model must also have launched its own output dist's kernels at every step, both ways. A sharding that took TorchRec's dists (one rank, for example) prints `FAILED (the <dist> model fell back to TorchRec's dists)`, where `<dist>` is `fused` or `auto`. A failure exits with status 1. |
+| `--check` | off | Before timing, train 4 steps of two models side by side: one on TorchRec's dists, and one on the hierarchical dist (`--output_dist`'s, or `fused` when that is `torchrec`), both with `--use_index_dedup`, which it needs. Both start from the DEBUG initializer, where a key's row is a function of the key. They use SGD at learning rate 1, and keys from an eighth of the table, so nothing is evicted. The capacities are `--capacity`, or measured on the check's own batches. Then print PASSED or FAILED. Outputs must match bit for bit when `--emb_dtype` and `--output_dtype` are both `fp32` and the world size is a power of two. Otherwise they must match bit for bit at the first step, and within 1e-2 after it. The checked model must also have launched its own output dist's kernels at every step, both ways. A sharding that took TorchRec's dists (one rank, for example) prints `FAILED (the <dist> model fell back to TorchRec's dists)`, where `<dist>` is `fused` or `auto`. A failure exits with status 1. |
 | `--trace` | off | The hierarchical dist's kernel timelines. It needs DynamicEmb built with `DYNAMICEMB_HIER_TRACE=1` (`docs/hier_output_dist.md`, section 4.4), and else stops with `--trace: rebuild with DYNAMICEMB_HIER_TRACE=1`. It keeps the timelines of the last 64 calls of each direction (every timed call at 64 iterations or fewer), and puts every rank's time stamps on rank 0's clock. It reports the traced metrics below (IB, NVLink and their overlap). A traced build traces every output-dist kernel: two memsets per kernel and counters in shared memory; `--trace` adds two clock stamps per input dist. So its times and kernel counts do not compare with an untraced build's. |
 | `--trace_out` | none | with `--trace`: save every rank's traced kernels of the timed iterations to this `.npz` file, for offline analysis |
 | `--kernel_times` | off | After the timed iterations, as many again under a CUDA-only profiler. It reports every call's output-dist kernel times, with their wait at the start for the other ranks (the hierarchical dist only). |

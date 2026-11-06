@@ -261,19 +261,22 @@ namespace {
 
 // One CTA: the count message this rank sends its rail (CountMessage), word
 // by word: the common part (its node's largest remote part, its own part as
-// owner, and as proxy its node-unique keys and its chunks per owner node),
-// then for each node its node-unique keys of each feature there.
+// owner, and as proxy the most occurrences of one of its keys, its
+// node-unique keys and its chunks per owner node), then for each node its
+// node-unique keys of each feature there.
 __global__ void __launch_bounds__(kThreads)
     count_message_kernel(const int64_t *need_remote, const int64_t *own_total,
-                         const int64_t *uniq_out, const int64_t *chunks_out,
-                         const int64_t *uniq_per_bucket_feature, CountMessage format,
-                         int64_t *message) {
+                         const int64_t *key_rows, const int64_t *uniq_out,
+                         const int64_t *chunks_out, const int64_t *uniq_per_bucket_feature,
+                         CountMessage format, int64_t *message) {
   for (int64_t word = threadIdx.x; word < format.out_words(); word += kThreads) {
     int64_t value;
     if (word == CountMessage::kNeedRemote)
       value = *need_remote;
     else if (word == CountMessage::kOwnTotal)
       value = *own_total;
+    else if (word == CountMessage::kKeyRows)
+      value = *key_rows;
     else if (word < format.chunks_out(0))
       value = uniq_out[word - format.uniq_out(0)];
     else if (word < format.common())
@@ -369,15 +372,17 @@ __global__ void __launch_bounds__(kThreads)
     source_offsets[other_nodes[column] * num_features + feature] =
         kjt_offsets[feature * num_sources + local_size + column];
   }
-  // The keys it looks up, and the most the rail needs of lookup_keys and
-  // remote_keys.
+  // The keys it looks up, and the most the rail needs of each capacity.
   const int64_t most_recv = cta_max<int64_t>(num_nodes, recv, 0);
   const int64_t most_remote = cta_max<int64_t>(
       num_nodes, [&](int64_t source) { return message(source, CountMessage::kNeedRemote); }, 0);
+  const int64_t most_key_rows = cta_max<int64_t>(
+      num_nodes, [&](int64_t source) { return message(source, CountMessage::kKeyRows); }, 0);
   if (threadIdx.x == 0) {
     *num_recv = recv(node);
     needs[kNeedLookupKeys] = most_recv;
     needs[kNeedRemoteKeys] = most_remote;
+    needs[kNeedKeyRows] = most_key_rows;
   }
 }
 
@@ -440,8 +445,7 @@ __global__ void __launch_bounds__(kThreads)
 // lookup_keys): the (feature, source) of the KJT's lengths it is in and its
 // place there. A key of its own node is in the own part of node_keys, another
 // node's in its Record in rail_keys (rail_records of them). With weighted
-// records the KJT carries weights: an own key's from node_weights, 1 when the
-// requesters' keys carry none.
+// records the KJT carries weights: an own key's from node_weights.
 template <typename Record>
 __global__ void __launch_bounds__(kThreads)
     owner_kjt_kernel(const int64_t *kjt_offsets, const int64_t *num_recv,
@@ -462,8 +466,7 @@ __global__ void __launch_bounds__(kThreads)
       const int64_t own =
           clamp_index(own_offsets[feature * local_size + source] + nth, lookup_keys);
       kjt_values[position] = node_keys[own];
-      if constexpr (Record::kWeighted)
-        kjt_weights[position] = node_weights != nullptr ? node_weights[own] : 1.0f;
+      if constexpr (Record::kWeighted) kjt_weights[position] = node_weights[own];
     } else {
       const Record &record = rail_records[clamp_index(
           record_offsets[feature * other_columns + source - local_size] + nth, rail_count)];
@@ -481,15 +484,15 @@ at::Tensor other_nodes_of(const Topo &topo, const at::TensorOptions &options) {
 }
 
 at::Tensor count_message(const at::Tensor &need_remote, const at::Tensor &own_total,
-                         const at::Tensor &uniq_out, const at::Tensor &chunks_out,
-                         const at::Tensor &uniq_per_bucket_feature) {
+                         const at::Tensor &key_rows, const at::Tensor &uniq_out,
+                         const at::Tensor &chunks_out, const at::Tensor &uniq_per_bucket_feature) {
   const int64_t num_nodes = uniq_out.numel();
   const CountMessage format{num_nodes, uniq_per_bucket_feature.numel() / num_nodes};
   const at::Tensor message = at::empty({format.out_words()}, uniq_out.options());
   count_message_kernel<<<kOneCta, kThreads, 0, current_stream()>>>(
-      need_remote.data_ptr<int64_t>(), own_total.data_ptr<int64_t>(), uniq_out.data_ptr<int64_t>(),
-      chunks_out.data_ptr<int64_t>(), uniq_per_bucket_feature.data_ptr<int64_t>(), format,
-      message.data_ptr<int64_t>());
+      need_remote.data_ptr<int64_t>(), own_total.data_ptr<int64_t>(), key_rows.data_ptr<int64_t>(),
+      uniq_out.data_ptr<int64_t>(), chunks_out.data_ptr<int64_t>(),
+      uniq_per_bucket_feature.data_ptr<int64_t>(), format, message.data_ptr<int64_t>());
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   return message;
 }
@@ -605,21 +608,19 @@ __global__ void __launch_bounds__(kThreads)
 // gathered headers (headers [local_size][ProxyHeader::gathered_words]): where
 // its rows at each proxy start in its push order (push_order_off: its rows of
 // the owners with the proxy's local rank on the other nodes), each proxy's
-// chunks and chunk ends, and its push tables there made absolute: positions
-// in push_order (its rows at the proxies before come first), groups after its
-// groups at the proxies before (group_off); their heavy starts in (proxy,
-// chunk) order (heavy_start); and the task starts.
+// chunks and chunk ends, its push tables there made absolute (positions in
+// push_order: its rows at the proxies before come first), and the task
+// starts.
 __global__ void __launch_bounds__(kThreads)
     requester_proxy_tables_kernel(const int32_t *headers, const int64_t *offset_per_bucket,
-                                  Sizes sizes, int64_t *push_order_off, int64_t *group_off,
-                                  int64_t *proxy_chunks, int64_t *proxy_ends, ReqEntry *push_tables,
-                                  int32_t *heavy_start, int64_t *fwd_task_starts,
-                                  int64_t *bwd_task_starts) {
+                                  Sizes sizes, int64_t *push_order_off, int64_t *proxy_chunks,
+                                  int64_t *proxy_ends, ReqEntry *push_tables,
+                                  int64_t *task_starts) {
   const ProxyHeader header = ProxyHeader::of(sizes);
   const int64_t local_size = sizes.topo.local_size, me = sizes.topo.local_rank,
                 max_chunks = sizes.max_chunks, entries = max_chunks + 1;
   // its push table as the proxy published it: positions relative to its push
-  // order there, groups relative to its first group
+  // order there
   auto published = [&](int64_t proxy) { return header.gathered(headers, proxy).push_table(); };
   auto chunks_of = [&](int64_t proxy) {
     return min(max(header.gathered(headers, proxy).chunks(), (int64_t)0), max_chunks);
@@ -641,56 +642,26 @@ __global__ void __launch_bounds__(kThreads)
     const int64_t proxy = index / entries, chunk = index % entries;
     proxy_ends[index] = header.gathered(headers, proxy).end(chunk);
   }
-  cta_exclusive_ends<int64_t>(
-      local_size, [&](int64_t proxy) { return (int64_t)published(proxy)[max_chunks].groups; },
-      group_off);
   // a thread per entry of a proxy's table
   for (int64_t index = threadIdx.x; index < local_size * entries; index += kThreads) {
     const int64_t proxy = index / entries;
     const ReqEntry relative = published(proxy)[index % entries];
-    ReqEntry &absolute = push_tables[index];
-    absolute.start = (int32_t)(relative.start + push_order_off[proxy]);
-    absolute.heavy = (int32_t)(relative.heavy + push_order_off[proxy]);
-    absolute.flags = relative.flags;
-    absolute.groups = (int32_t)(relative.groups + group_off[proxy]);
-    heavy_start[index] = absolute.heavy;
+    push_tables[index] =
+        ReqEntry{(int32_t)(relative.start + push_order_off[proxy]), relative.flags};
   }
   // The task starts, chunk after chunk: in a chunk the proxies in turn from
-  // this rank's own one, kTaskRows rows or heavy groups a task; a proxy has
-  // none past its chunks. The forward's are its rows' and its heavy rows' of
-  // each (chunk, proxy), the backward's its heavy groups' of every proxy,
-  // then its rows' of every proxy. (The push tables' differences are the same
-  // relative or absolute.)
-  auto tasks = [&](int64_t proxy, int64_t chunk, int64_t first, int64_t end) -> int64_t {
-    return chunk < chunks_of(proxy) ? ceil_div<kTaskRows>(end - first) : 0;
-  };
-  auto row_tasks = [&](int64_t proxy, int64_t chunk) {
-    const ReqEntry *table = published(proxy);
-    return tasks(proxy, chunk, table[chunk].start, table[chunk].heavy);
-  };
-  auto heavy_tasks = [&](int64_t proxy, int64_t chunk) {
-    const ReqEntry *table = published(proxy);
-    return tasks(proxy, chunk, table[chunk].heavy, table[chunk + 1].start);
-  };
-  auto group_tasks = [&](int64_t proxy, int64_t chunk) {
-    const ReqEntry *table = published(proxy);
-    return tasks(proxy, chunk, table[chunk].groups, table[chunk + 1].groups);
-  };
+  // this rank's own one, kTaskRows positions of its push order a task; a
+  // proxy has none past its chunks. (The push tables' differences are the
+  // same relative or absolute.)
   cta_exclusive_ends<int64_t>(
       max_chunks * local_size,
-      [&](int64_t index) {
+      [&](int64_t index) -> int64_t {
         const int64_t chunk = index / local_size, proxy = (me + index % local_size) % local_size;
-        return row_tasks(proxy, chunk) + heavy_tasks(proxy, chunk);
+        if (chunk >= chunks_of(proxy)) return 0;
+        const ReqEntry *table = published(proxy);
+        return ceil_div<kTaskRows>((int64_t)table[chunk + 1].start - table[chunk].start);
       },
-      fwd_task_starts);
-  cta_exclusive_ends<int64_t>(
-      2 * max_chunks * local_size,
-      [&](int64_t index) {
-        const int64_t chunk = index / (2 * local_size), groups = index / local_size % 2 == 0,
-                      proxy = (me + index % local_size) % local_size;
-        return groups ? group_tasks(proxy, chunk) : row_tasks(proxy, chunk);
-      },
-      bwd_task_starts);
+      task_starts);
 }
 
 // A thread per bucketized row. A row of an owner on this node is in the owner's
@@ -721,97 +692,12 @@ __global__ void __launch_bounds__(kThreads)
       dst[row] = place;
       continue;
     }
-    src[row] = map.key_row(row).row();
+    src[row] = map.key_row(row);
     dst[row] = map.slot(row);
     // a call that does not fit may read words no one wrote: a position out
     // of range is dropped
     const int64_t position = push_order_off[peer] + map.position(row);
     if (row < valid_rows && position >= 0 && position < rows) push_order[position] = (int32_t)row;
-  }
-}
-
-// The push order as the heavy groups read it: the row at a position (a call
-// that does not fit may hold rows no one wrote: clamped), whether it is
-// heavy (its key row in remote_map says so) and its slot.
-struct PushOrder {
-  const int32_t *order;
-  GatheredMap map;
-  const int32_t *dst;
-  int64_t rows;
-  __device__ int64_t row(int64_t position) const { return clamp_index(order[position], rows); }
-  __device__ bool heavy(int64_t position) const { return map.key_row(row(position)).heavy(); }
-  __device__ int32_t slot(int64_t position) const { return dst[row(position)]; }
-};
-
-// A thread per position of the push order (rows of them; its rows at every
-// proxy come first): whether a heavy group starts there. A group is a run of
-// positions of heavy rows with one slot (dst) inside one (proxy, chunk)
-// heavy range: a heavy position starts one unless the position before is
-// heavy too, with its slot and its heavy range. Different heavy keys of a
-// range have different slots; chunks in different laps of the ring may take
-// the same rows, so their keys' slots may be equal. The absolute heavy
-// starts are non-decreasing over (proxy, chunk): an entry past a proxy's
-// chunks holds its end.
-__global__ void __launch_bounds__(kThreads)
-    group_starts_kernel(PushOrder order, const int64_t *push_order_off, int64_t local_size,
-                        const int32_t *heavy_start, int64_t heavy_entries, bool *group_start) {
-  const int64_t positions = push_order_off[local_size];
-  auto heavy_range = [&](int64_t position) {
-    return upper_bound(heavy_start, heavy_entries, position);
-  };
-  for (int64_t position = first_item(); position < order.rows; position += item_stride()) {
-    bool starts = false;
-    if (position < positions && order.heavy(position))
-      starts = position == 0 || !order.heavy(position - 1) ||
-               order.slot(position) != order.slot(position - 1) ||
-               heavy_range(position) != heavy_range(position - 1);
-    group_start[position] = starts;
-  }
-}
-
-// A thread per position of its push order, and one past its end: a group's
-// start writes it, numbered in position order (group_before); the position
-// after a group's last (the next run's start, or the end) writes its end.
-// Groups past group_bound (a call that does not fit) are left out.
-__global__ void __launch_bounds__(kThreads)
-    heavy_groups_kernel(PushOrder order, const int64_t *push_order_off, int64_t local_size,
-                        const bool *group_start, const int32_t *group_before, int64_t group_bound,
-                        HeavyGroup *heavy_groups) {
-  const int64_t positions = push_order_off[local_size];
-  for (int64_t position = first_item(); position <= positions; position += item_stride()) {
-    const bool starts = position < positions && group_start[position];
-    if (starts && group_before[position] < group_bound)
-      heavy_groups[group_before[position]].start = (int32_t)position;
-    const bool ends = position > 0 && order.heavy(position - 1) &&
-                      (position == positions || !order.heavy(position) || starts);
-    if (ends && group_before[position] - 1 < group_bound)
-      heavy_groups[group_before[position] - 1].end = (int32_t)position;
-  }
-}
-
-// A thread per heavy group of the bound: its sub-tasks of kHeavy positions
-// (none past the groups).
-__global__ void __launch_bounds__(kThreads)
-    group_subs_kernel(const HeavyGroup *heavy_groups, const int32_t *group_before, int64_t rows,
-                      int64_t group_bound, int64_t *subs) {
-  const int64_t groups = group_before[rows];
-  for (int64_t group = first_item(); group < group_bound; group += item_stride())
-    subs[group] =
-        group < groups
-            ? ceil_div<kHeavy>((int64_t)heavy_groups[group].end - heavy_groups[group].start)
-            : 0;
-}
-
-// A thread per sub-task of the bound: its group, the first whose sub-tasks
-// end after it (past the sub-tasks: the last group). The threads of the
-// first group_bound sub-tasks also write each group's first sub-task.
-__global__ void __launch_bounds__(kThreads)
-    group_of_sub_kernel(const int64_t *sub_before, int64_t group_bound, int64_t sub_bound,
-                        int32_t *group_of_sub, int32_t *group_first_sub) {
-  for (int64_t sub = first_item(); sub < sub_bound; sub += item_stride()) {
-    group_of_sub[sub] =
-        (int32_t)min(upper_bound(sub_before + 1, group_bound, sub), group_bound - 1);
-    if (sub < group_bound) group_first_sub[sub] = (int32_t)sub_before[sub];
   }
 }
 
@@ -859,7 +745,7 @@ RequesterTables requester_tables(const at::Tensor &words, const at::Tensor &head
                                  const at::Tensor &offset_per_bucket_feature,
                                  const at::Tensor &offset_per_bucket, const Sizes &sizes) {
   const int64_t rows = bucket_feature_of_row.numel(), local_size = sizes.topo.local_size,
-                max_chunks = sizes.max_chunks, heavy_entries = local_size * (max_chunks + 1);
+                max_chunks = sizes.max_chunks;
   const auto long_options = offset_per_bucket_feature.options().dtype(at::kLong);
   const auto int_options = offset_per_bucket_feature.options().dtype(at::kInt);
   const cudaStream_t stream = current_stream();
@@ -869,31 +755,18 @@ RequesterTables requester_tables(const at::Tensor &words, const at::Tensor &head
   tables.push_order_off = at::empty({local_size + 1}, long_options);
   tables.proxy_chunks = at::empty({local_size}, long_options);
   tables.proxy_ends = at::empty({local_size, max_chunks + 1}, long_options);
-  tables.push_tables = at::empty({local_size, max_chunks + 1, 4}, int_options);
-  const at::Tensor group_off = at::empty({local_size + 1}, long_options);
-  const at::Tensor heavy_start = at::empty({heavy_entries}, int_options);
-  tables.fwd_task_starts = at::empty({max_chunks * local_size + 1}, long_options);
-  tables.bwd_task_starts = at::empty({2 * max_chunks * local_size + 1}, long_options);
+  tables.push_tables = at::empty({local_size, max_chunks + 1, 2}, int_options);
+  tables.task_starts = at::empty({max_chunks * local_size + 1}, long_options);
   requester_proxy_tables_kernel<<<kOneCta, kThreads, 0, stream>>>(
       headers.data_ptr<int32_t>(), offset_per_bucket.data_ptr<int64_t>(), sizes,
-      tables.push_order_off.data_ptr<int64_t>(), group_off.data_ptr<int64_t>(),
-      tables.proxy_chunks.data_ptr<int64_t>(), tables.proxy_ends.data_ptr<int64_t>(),
-      records_of<ReqEntry>(tables.push_tables), heavy_start.data_ptr<int32_t>(),
-      tables.fwd_task_starts.data_ptr<int64_t>(), tables.bwd_task_starts.data_ptr<int64_t>());
+      tables.push_order_off.data_ptr<int64_t>(), tables.proxy_chunks.data_ptr<int64_t>(),
+      tables.proxy_ends.data_ptr<int64_t>(), records_of<ReqEntry>(tables.push_tables),
+      tables.task_starts.data_ptr<int64_t>());
   C10_CUDA_KERNEL_LAUNCH_CHECK();
-  const int64_t group_bound = std::min(rows, local_size * (sizes.remote_keys / (kHeavy + 1) + 1));
-  const int64_t sub_bound = rows / kHeavy + group_bound + 1;
   tables.src = at::empty({rows}, int_options);
   tables.dst = at::empty({rows}, int_options);
   tables.push_order = at::empty({rows}, int_options);
-  tables.heavy_groups = at::empty({group_bound, 2}, int_options);
-  tables.group_first_sub = at::empty({group_bound}, int_options);
-  tables.group_of_sub = at::empty({sub_bound}, int_options);
-  if (rows == 0) {
-    tables.group_subs = at::empty({}, long_options);
-    AT_CUDA_CHECK(cudaMemsetAsync(tables.group_subs.data_ptr(), 0, sizeof(int64_t), stream));
-    return tables;
-  }
+  if (rows == 0) return tables;
   // Per row: its src and dst, and its place in the push order, its rows at
   // each proxy at their push positions there.
   const GatheredMap map{words.data_ptr<int32_t>(), rows};
@@ -902,33 +775,6 @@ RequesterTables requester_tables(const at::Tensor &words, const at::Tensor &head
       offset_per_bucket_feature.data_ptr<int64_t>(), offset_per_bucket.data_ptr<int64_t>(),
       tables.push_order_off.data_ptr<int64_t>(), rows, sizes, tables.src.data_ptr<int32_t>(),
       tables.dst.data_ptr<int32_t>(), tables.push_order.data_ptr<int32_t>());
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
-  // The heavy groups, in its push order: where each starts, numbered by a
-  // scan, then each group's start and end.
-  const PushOrder order{tables.push_order.data_ptr<int32_t>(), map, tables.dst.data_ptr<int32_t>(),
-                        rows};
-  const at::Tensor group_start =
-      at::empty({rows}, offset_per_bucket_feature.options().dtype(at::kBool));
-  group_starts_kernel<<<item_grid(rows), kThreads, 0, stream>>>(
-      order, tables.push_order_off.data_ptr<int64_t>(), local_size, heavy_start.data_ptr<int32_t>(),
-      heavy_entries, group_start.data_ptr<bool>());
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
-  const at::Tensor group_before = exclusive_ends(group_start, at::kInt);
-  HeavyGroup *heavy_groups = records_of<HeavyGroup>(tables.heavy_groups);
-  heavy_groups_kernel<<<item_grid(rows + 1), kThreads, 0, stream>>>(
-      order, tables.push_order_off.data_ptr<int64_t>(), local_size, group_start.data_ptr<bool>(),
-      group_before.data_ptr<int32_t>(), group_bound, heavy_groups);
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
-  // Each group's sub-tasks of kHeavy positions, numbered in group order.
-  const at::Tensor subs = at::empty({group_bound}, long_options);
-  group_subs_kernel<<<item_grid(group_bound), kThreads, 0, stream>>>(
-      heavy_groups, group_before.data_ptr<int32_t>(), rows, group_bound, subs.data_ptr<int64_t>());
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
-  const at::Tensor sub_before = exclusive_ends(subs);
-  tables.group_subs = sub_before.select(0, group_bound);
-  group_of_sub_kernel<<<item_grid(sub_bound), kThreads, 0, stream>>>(
-      sub_before.data_ptr<int64_t>(), group_bound, sub_bound,
-      tables.group_of_sub.data_ptr<int32_t>(), tables.group_first_sub.data_ptr<int32_t>());
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   return tables;
 }

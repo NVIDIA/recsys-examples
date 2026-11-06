@@ -53,8 +53,7 @@ namespace {
 std::map<std::string, at::Tensor> bucketize_test(
     at::Tensor values, c10::optional<at::Tensor> offsets, c10::optional<at::Tensor> lengths,
     int64_t batch_size, c10::optional<at::Tensor> weights, at::Tensor block_sizes,
-    std::vector<int> dist_types, int64_t world_size, c10::optional<at::Tensor> input_offsets,
-    int64_t input_batch_size) {
+    std::vector<int> dist_types, int64_t world_size, at::Tensor input_offsets) {
   c10::cuda::CUDAGuard guard(values.device());
   PlanInput input;
   input.values = values;
@@ -63,7 +62,6 @@ std::map<std::string, at::Tensor> bucketize_test(
   input.batch_size = batch_size;
   input.weights = weights;
   input.input_offsets = input_offsets;
-  input.input_batch_size = input_batch_size;
   const OwnerRules rules{at::tensor(dist_types, at::kInt)
                              .pin_memory()
                              .to(values.options().dtype(at::kInt), /*non_blocking=*/true),
@@ -152,9 +150,9 @@ std::map<std::string, at::Tensor> node_layout_test(
 
 // The sizes of a call across nodes (Sizes) by name: num_nodes, local_size,
 // node, local_rank, num_features, num_tables, lookup_keys, remote_keys,
-// num_proxy_rows, partial_rows, chunk_rows, record_bytes; heavy_at and
-// max_chunks follow. No step of the planner reads the others (row_bytes,
-// weights), which stay 0.
+// num_proxy_rows, chunk_rows, record_bytes; max_chunks follows, and weights
+// with record_bytes. No step of the planner reads the others (row_bytes),
+// which stay 0.
 Sizes plan_sizes(const std::map<std::string, int64_t> &named) {
   const int num_nodes = (int)named.at("num_nodes"), local_size = (int)named.at("local_size"),
             node = (int)named.at("node"), local_rank = (int)named.at("local_rank");
@@ -167,21 +165,19 @@ Sizes plan_sizes(const std::map<std::string, int64_t> &named) {
   sizes.lookup_keys = named.at("lookup_keys");
   sizes.remote_keys = named.at("remote_keys");
   sizes.num_proxy_rows = named.at("num_proxy_rows");
-  sizes.partial_rows = named.at("partial_rows");
-  sizes.heavy_at = heavy_at_for(local_size, sizes.partial_rows);
   sizes.chunk_rows = named.at("chunk_rows");
   sizes.max_chunks = max_chunks_for(sizes);
   sizes.record_bytes = named.at("record_bytes");
+  sizes.weights = sizes.weighted_records();
   TORCH_CHECK(num_nodes >= 2 && local_size >= 1 && node >= 0 && node < num_nodes &&
                   local_rank >= 0 && local_rank < local_size && sizes.num_features >= 1 &&
                   num_nodes * local_size * sizes.num_features < INT32_MAX &&
                   sizes.num_tables >= 1 && sizes.num_tables <= sizes.num_features &&
                   sizes.lookup_keys >= 1 && sizes.lookup_keys < INT32_MAX &&
                   sizes.remote_keys >= 1 && sizes.remote_keys < INT32_MAX &&
-                  sizes.partial_rows >= 1 && sizes.chunk_rows >= 2 * sizes.max_key_rows() &&
+                  sizes.chunk_rows >= 2 * sizes.max_key_rows() &&
                   sizes.num_proxy_rows >= 2 * sizes.chunk_rows &&
-                  (sizes.record_bytes == 8 || sizes.record_bytes == 16) &&
-                  push_key_of(sizes).bits <= 63,
+                  (sizes.record_bytes == 8 || sizes.record_bytes == 16),
               "hier_output_dist: the sizes of a call across nodes");
   return sizes;
 }
@@ -189,8 +185,8 @@ Sizes plan_sizes(const std::map<std::string, int64_t> &named) {
 // One proxy's steps of a call across nodes (proxy_keys,
 // proxy_chunks_and_slots, proxy_push_order) on its remote part (keys,
 // weights, bucket_feature_of_occ: what node_keys, node_weights and
-// bucket_feature_of_occ hold past
-// lookup_keys) and what the node layout says of it (requester_start, skip,
+// bucket_feature_of_occ hold past lookup_keys; weights exactly with 16-byte
+// records) and what the node layout says of it (requester_start, skip,
 // need_remote, own_total: its own part), and its count messages
 // (count_message), by name. It writes remote_map, key_stage and
 // proxy_header (a proxy header, ProxyHeader) as the steps write those
@@ -207,7 +203,7 @@ std::map<std::string, at::Tensor> proxy_plan_test(
                 num_features = sizes.num_features;
   ProxyHeader header = ProxyHeader::of(sizes);  // over proxy_header once checked
   TORCH_CHECK(
-      is_cuda_array(keys, at::kLong, entries) &&
+      is_cuda_array(keys, at::kLong, entries) && weights.has_value() == sizes.weighted_records() &&
           (!weights.has_value() || is_cuda_array(*weights, at::kFloat, entries)) &&
           is_cuda_array(bucket_feature_of_occ, at::kInt, entries) &&
           is_cuda_array(requester_start, at::kLong, local_size + 1) &&
@@ -235,6 +231,7 @@ std::map<std::string, at::Tensor> proxy_plan_test(
       proxy_push_order(std::move(proxy), std::move(chunks), requester_start, buffers, sizes);
   return {{"num_chunks", plan.num_chunks},
           {"occurrence_count", plan.occurrence_count},
+          {"key_rows", plan.key_rows},
           {"uniq_per_bucket_feature", plan.uniq_per_bucket_feature},
           {"uniq_off", plan.uniq_off},
           {"uniq_out", plan.uniq_out},
@@ -245,9 +242,9 @@ std::map<std::string, at::Tensor> proxy_plan_test(
           {"stage_slice", plan.stage_slice},
           {"reduce_task_starts", plan.reduce_task_starts},
           {"reducer_start", plan.reducer_start},
-          {"reducer_entries", plan.reducer_entries},
-          {"message", count_message(need_remote.reshape({}), own_total.reshape({}), plan.uniq_out,
-                                    plan.chunks_out, plan.uniq_per_bucket_feature)},
+          {"reducer_flags", plan.reducer_flags},
+          {"message", count_message(need_remote.reshape({}), own_total.reshape({}), plan.key_rows,
+                                    plan.uniq_out, plan.chunks_out, plan.uniq_per_bucket_feature)},
           {"key_of_occurrence", key_of_occurrence}};
 }
 
@@ -384,12 +381,7 @@ std::map<std::string, at::Tensor> requester_tables_test(
           {"push_tables", tables.push_tables},
           {"proxy_chunks", tables.proxy_chunks},
           {"proxy_ends", tables.proxy_ends},
-          {"fwd_task_starts", tables.fwd_task_starts},
-          {"bwd_task_starts", tables.bwd_task_starts},
-          {"heavy_groups", tables.heavy_groups},
-          {"group_first_sub", tables.group_first_sub},
-          {"group_of_sub", tables.group_of_sub},
-          {"group_subs", tables.group_subs}};
+          {"task_starts", tables.task_starts}};
 }
 
 // Benchmark tracing: this GPU's %globaltimer into out[index], on the current
@@ -423,7 +415,7 @@ void bind_testing(py::module &py_module) {
                 "per-feature totals, by name",
                 py::arg("values"), py::arg("offsets"), py::arg("lengths"), py::arg("batch_size"),
                 py::arg("weights"), py::arg("block_sizes"), py::arg("dist_types"),
-                py::arg("world_size"), py::arg("input_offsets"), py::arg("input_batch_size"));
+                py::arg("world_size"), py::arg("input_offsets"));
   py_module.def("hier_output_dist_fanout", &fanout_test,
                 "Index dedup's fan-out of the bucketized rows, by name", py::arg("reverse_indices"),
                 py::arg("inv"));

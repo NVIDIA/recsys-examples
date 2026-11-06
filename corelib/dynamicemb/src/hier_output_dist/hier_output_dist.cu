@@ -172,14 +172,12 @@ void fail_next_construction(bool fail_alloc) { g_fail_alloc = fail_alloc; }
 HierOutputDist::HierOutputDist(const std::string &unique_id, int64_t rank, int64_t world_size,
                                int64_t local_size, const std::vector<int64_t> &feature_tables,
                                const at::Tensor &block_sizes, const at::Tensor &dist_types,
-                               int64_t dim, at::ScalarType dtype, bool weights, bool out_weights,
-                               bool node_dedup, int64_t lookup_keys, int64_t remote_keys,
-                               int64_t proxy_bytes, double timeout_s, int64_t ctas,
-                               int64_t reduce_ctas)
-    : config_(
-          validated(config_of(rank, world_size, local_size, feature_tables, block_sizes, dist_types,
-                              dim, dtype, weights, out_weights, node_dedup, lookup_keys,
-                              remote_keys, proxy_bytes, timeout_s, ctas, reduce_ctas))),
+                               int64_t dim, at::ScalarType dtype, bool weights, bool node_dedup,
+                               int64_t lookup_keys, int64_t remote_keys, int64_t proxy_bytes,
+                               double timeout_s, int64_t ctas, int64_t reduce_ctas)
+    : config_(validated(config_of(rank, world_size, local_size, feature_tables, block_sizes,
+                                  dist_types, dim, dtype, weights, node_dedup, lookup_keys,
+                                  remote_keys, proxy_bytes, timeout_s, ctas, reduce_ctas))),
       sizes_(sizes_of(config_)),
       device_(current_device()) {
   c10::cuda::CUDAGuard guard(device_);
@@ -310,11 +308,13 @@ void HierOutputDist::release() noexcept {
   window_->release(/*keep=*/false);
 }
 
-HierOutputDist::InDistTensors HierOutputDist::input_dist(
-    const at::Tensor &values, const c10::optional<at::Tensor> &offsets,
-    const c10::optional<at::Tensor> &lengths, int64_t batch_size,
-    const c10::optional<at::Tensor> &weights, const c10::optional<at::Tensor> &input_offsets,
-    int64_t input_batch_size, const c10::optional<at::Tensor> &reverse_indices) {
+HierOutputDist::InDistTensors HierOutputDist::input_dist(const at::Tensor &values,
+                                                         const c10::optional<at::Tensor> &offsets,
+                                                         const c10::optional<at::Tensor> &lengths,
+                                                         int64_t batch_size,
+                                                         const c10::optional<at::Tensor> &weights,
+                                                         const at::Tensor &input_offsets,
+                                                         const at::Tensor &reverse_indices) {
   quiesced_ = false;
   PlanInput input;
   input.values = values;
@@ -323,7 +323,6 @@ HierOutputDist::InDistTensors HierOutputDist::input_dist(
   input.batch_size = batch_size;
   input.weights = weights;
   input.input_offsets = input_offsets;
-  input.input_batch_size = input_batch_size;
   input.reverse_indices = reverse_indices;
   const InDist dist = in_->input_dist(input);
   c10::cuda::CUDAGuard guard(device_);

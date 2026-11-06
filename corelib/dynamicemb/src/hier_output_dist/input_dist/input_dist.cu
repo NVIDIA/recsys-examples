@@ -41,13 +41,12 @@ OwnerRules owner_rules(const Config &config) {
 // node's (peer_needs, each rank's of its rail, kNumNeeds each): a rank's
 // rail covers every node, and its node holds a rank of every rail, so the
 // most of the node is the most of all ranks. On one node its lookup need
-// alone. heavy_subs, group_subs and occurrences: nullptr when there are none.
+// alone. occurrences: nullptr on one node.
 __global__ void __launch_bounds__(kThreads)
     call_status_kernel(const int64_t *peer_needs, int64_t local_size, const int64_t *need_lookup,
                        const int64_t *num_recv, const int64_t *heavy_subs,
-                       const int64_t *group_subs, const int64_t *occurrences,
-                       const int64_t *length_per_key, const int64_t *input_length_per_key,
-                       int64_t num_features, int64_t *status) {
+                       const int64_t *occurrences, const int64_t *length_per_key,
+                       const int64_t *input_length_per_key, int64_t num_features, int64_t *status) {
   const int tid = threadIdx.x;
   if (tid < kNumNeeds) {
     int64_t need = 0;
@@ -60,8 +59,7 @@ __global__ void __launch_bounds__(kThreads)
   }
   if (tid == 0) {
     status[kStatusNumRecv] = *num_recv;
-    status[kStatusHeavySubs] = heavy_subs != nullptr ? *heavy_subs : 0;
-    status[kStatusGroupSubs] = group_subs != nullptr ? *group_subs : 0;
+    status[kStatusHeavySubs] = *heavy_subs;
     status[kStatusOccurrences] = occurrences != nullptr ? *occurrences : 0;
   }
   for (int64_t feature = tid; feature < num_features; feature += kThreads) {
@@ -119,11 +117,10 @@ InDist InChannel::input_dist(const PlanInput &input) {
               "weights (",
               weights_ ? "with" : "without", ")");
   ++seq_;
-  // The bucketize: the call's keys by owner, and under index dedup its fan-out.
+  // The bucketize: the call's keys by owner, and the fan-out of its
+  // deduplicated rows.
   const BucketizedKeys bucketized = bucketize_keys(input, rules_, sizes_.topo.world_size);
-  const bool index_dedup = input.reverse_indices.has_value();
-  const FanoutTables fanout =
-      index_dedup ? fanout_tables(*input.reverse_indices, bucketized.inv) : FanoutTables{};
+  const FanoutTables fanout = fanout_tables(input.reverse_indices, bucketized.inv);
   const Topo &topo = sizes_.topo;
   const int64_t local_size = topo.local_size, num_nodes = topo.num_nodes,
                 num_features = sizes_.num_features, lookup_keys = sizes_.lookup_keys,
@@ -145,7 +142,7 @@ InDist InChannel::input_dist(const PlanInput &input) {
   node_key_push(bucketized.keys, bucketized.key_weights, bucketized.bucket_feature_of_row,
                 node.destination_base, node.rows_to_push);
   node_done();
-  at::Tensor peer_needs, num_recv, length_per_key, group_subs, occurrences;
+  at::Tensor peer_needs, num_recv, length_per_key, occurrences;
   if (num_nodes == 1) {
     // The own part of node_keys is the owner's KJT, and a row's place in its
     // owner's KJT is where it was pushed.
@@ -172,8 +169,8 @@ InDist InChannel::input_dist(const PlanInput &input) {
     // proxies' key records into the owners' rail_keys and the owners'
     // source_offsets into the proxies' owner_offsets.
     const at::Tensor message =
-        count_message(node.need_remote, node.own_total.select(0, topo.local_rank), proxy.uniq_out,
-                      proxy.chunks_out, proxy.uniq_per_bucket_feature);
+        count_message(node.need_remote, node.own_total.select(0, topo.local_rank), proxy.key_rows,
+                      proxy.uniq_out, proxy.chunks_out, proxy.uniq_per_bucket_feature);
     const at::Tensor messages = rail_count_exchange(message);
     const RailLayout rail = rail_layout(messages, node.own_lengths, other_nodes_, sizes_);
     source_offsets_.copy_(rail.source_offsets);
@@ -208,25 +205,21 @@ InDist InChannel::input_dist(const PlanInput &input) {
     fwd.proxy_chunks = bwd.proxy_chunks = requester.proxy_chunks;
     fwd.proxy_ends = bwd.proxy_ends = requester.proxy_ends;
     fwd.push_tables = bwd.push_tables = requester.push_tables;
+    fwd.task_starts = bwd.task_starts = requester.task_starts;
     fwd.num_chunks = bwd.num_chunks = proxy.num_chunks;
     fwd.chunks = bwd.chunks = proxy.chunks;
     fwd.uniq_off = bwd.uniq_off = proxy.uniq_off;
     fwd.put_list = bwd.put_list = lists.list;
     fwd.put_starts = bwd.put_starts = lists.starts;
     fwd.push_order_off = requester.push_order_off;
-    fwd.fwd_task_starts = requester.fwd_task_starts;
     fwd.fwd_chunks = owner.fwd_chunks;
     fwd.node_chunk_start = proxy.node_chunk_start;
     fwd.node_chunks = proxy.node_chunks;
     fwd.uniq_out = proxy.uniq_out;
-    bwd.heavy_groups = requester.heavy_groups;
-    bwd.group_first_sub = requester.group_first_sub;
-    bwd.group_of_sub = requester.group_of_sub;
-    bwd.bwd_task_starts = requester.bwd_task_starts;
     bwd.uniq_in = rail.uniq_in;
     bwd.reduce_task_starts = proxy.reduce_task_starts;
     bwd.reducer_start = proxy.reducer_start;
-    bwd.reducer_entries = proxy.reducer_entries;
+    bwd.reducer_flags = proxy.reducer_flags;
     dist.kjt_values = owner.kjt_values;
     dist.kjt_weights = owner.kjt_weights;
     dist.kjt_lengths = rail.kjt_lengths;
@@ -234,16 +227,15 @@ InDist InChannel::input_dist(const PlanInput &input) {
     occurrences = proxy.occurrence_count;
     num_recv = rail.num_recv;
     length_per_key = rail.length_per_key;
-    group_subs = requester.group_subs;
   }
   // The status, which the caller reads at the call's second wait.
   dist.status = at::empty({status_words(num_features)}, long_options);
   call_status_kernel<<<kOneCta, kThreads, 0, current_stream()>>>(
       data_or_null<int64_t>(peer_needs), local_size, node.need_lookup.data_ptr<int64_t>(),
-      num_recv.data_ptr<int64_t>(), index_dedup ? fanout.count.data_ptr<int64_t>() + 1 : nullptr,
-      data_or_null<int64_t>(group_subs), data_or_null<int64_t>(occurrences),
-      length_per_key.data_ptr<int64_t>(), bucketized.input_length_per_key.data_ptr<int64_t>(),
-      num_features, dist.status.data_ptr<int64_t>());
+      num_recv.data_ptr<int64_t>(), fanout.count.data_ptr<int64_t>() + 1,
+      data_or_null<int64_t>(occurrences), length_per_key.data_ptr<int64_t>(),
+      bucketized.input_length_per_key.data_ptr<int64_t>(), num_features,
+      dist.status.data_ptr<int64_t>());
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   return dist;
 }

@@ -54,6 +54,7 @@ PlanView plan_view(const Plan &plan, const Sizes &sizes) {
   view.proxy_chunks = data_of<int64_t>(plan.proxy_chunks);
   view.proxy_ends = data_of<int64_t>(plan.proxy_ends);
   view.push_tables = data_of<ReqEntry, int32_t>(plan.push_tables);
+  view.task_starts = data_of<int64_t>(plan.task_starts);
   view.num_chunks = data_of<int64_t>(plan.num_chunks);
   view.chunks = data_of<Chunk, int32_t>(plan.chunks);
   view.uniq_off = data_of<int64_t>(plan.uniq_off);
@@ -82,13 +83,13 @@ auto fwd_tensors(Plan &plan) -> std::vector<decltype(&plan.src)> {
           &plan.proxy_chunks,
           &plan.proxy_ends,
           &plan.push_tables,
+          &plan.task_starts,
           &plan.num_chunks,
           &plan.chunks,
           &plan.uniq_off,
           &plan.put_list,
           &plan.put_starts,
           &plan.push_order_off,
-          &plan.fwd_task_starts,
           &plan.fwd_chunks,
           &plan.node_chunk_start,
           &plan.node_chunks,
@@ -112,19 +113,16 @@ auto bwd_tensors(Plan &plan) -> std::vector<decltype(&plan.dst)> {
           &plan.proxy_chunks,
           &plan.proxy_ends,
           &plan.push_tables,
+          &plan.task_starts,
           &plan.num_chunks,
           &plan.chunks,
           &plan.uniq_off,
           &plan.put_list,
           &plan.put_starts,
-          &plan.heavy_groups,
-          &plan.group_first_sub,
-          &plan.group_of_sub,
-          &plan.bwd_task_starts,
           &plan.uniq_in,
           &plan.reduce_task_starts,
           &plan.reducer_start,
-          &plan.reducer_entries};
+          &plan.reducer_flags};
 }
 
 }  // namespace
@@ -134,7 +132,6 @@ FwdPlanView FwdPlan::view(const Sizes &sizes) const {
   static_cast<PlanView &>(view) = plan_view(*this, sizes);
   view.src = data_of<int32_t>(src);
   view.push_order_off = data_of<int64_t>(push_order_off);
-  view.fwd_task_starts = data_of<int64_t>(fwd_task_starts);
   view.fwd_chunks = data_of<ChunkPiece, int32_t>(fwd_chunks);
   view.node_chunk_start = data_of<int64_t>(node_chunk_start);
   view.node_chunks = data_of<int32_t>(node_chunks);
@@ -162,16 +159,11 @@ BwdPlanView BwdPlan::view(const Sizes &sizes) const {
   BwdPlanView view{};
   static_cast<PlanView &>(view) = plan_view(*this, sizes);
   view.dst = data_of<int32_t>(dst);
-  view.heavy_groups = data_of<HeavyGroup, int32_t>(heavy_groups);
-  view.group_first_sub = data_of<int32_t>(group_first_sub);
-  view.group_of_sub = data_of<int32_t>(group_of_sub);
-  view.bwd_task_starts = data_of<int64_t>(bwd_task_starts);
   view.uniq_in = data_of<int64_t>(uniq_in);
   view.reduce_task_starts = data_of<int64_t>(reduce_task_starts);
-  view.reducer_start = data_of<int32_t>(reducer_start);
-  view.reducer_entries = data_of<ReducerEntry, int64_t>(reducer_entries);
+  view.reducer_start = data_of<int64_t>(reducer_start);
+  view.reducer_flags = data_of<int32_t>(reducer_flags);
   view.heavy_subs = heavy_subs;
-  view.group_subs = group_subs;
   return view;
 }
 
@@ -185,14 +177,13 @@ BwdPlan BwdPlan::of(const std::vector<c10::optional<at::Tensor>> &tensors,
                     const std::vector<int64_t> &counts) {
   BwdPlan plan;
   const std::vector<at::Tensor *> fields = bwd_tensors(plan);
-  TORCH_CHECK(tensors.size() == fields.size() && counts.size() == 3,
+  TORCH_CHECK(tensors.size() == fields.size() && counts.size() == 2,
               "hier_output_dist: a backward plan is made of ", fields.size(),
-              " tensors and 3 counts");
+              " tensors and 2 counts");
   for (size_t field = 0; field < fields.size(); ++field)
     if (tensors[field].has_value()) *fields[field] = *tensors[field];
   plan.num_recv = counts[0];
   plan.heavy_subs = counts[1];
-  plan.group_subs = counts[2];
   return plan;
 }
 

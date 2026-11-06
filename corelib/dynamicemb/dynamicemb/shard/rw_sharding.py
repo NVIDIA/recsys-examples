@@ -61,9 +61,7 @@ from ..dynamicemb_config import (
     AUTO_OUTPUT_DIST,
     FUSED_OUTPUT_DIST,
     TORCHREC_OUTPUT_DIST,
-    DynamicEmbScoreStrategy,
     DynamicEmbTableOptions,
-    get_eviction_score_strategy,
 )
 from .hier_output_dist import HierSharding, RwSequenceHierEmbeddingDist
 from .input_dist import RwSparseFeaturesDist
@@ -168,29 +166,6 @@ def output_dist_options(
     return voters[0] if voters else None
 
 
-def counts_frequencies(options) -> bool:
-    """Whether a DynamicEmb table counts its keys' frequencies (LFU scores)."""
-    return (
-        options is not None
-        and options.score_strategy is not None
-        and get_eviction_score_strategy(options.score_strategy)
-        == DynamicEmbScoreStrategy.LFU
-    )
-
-
-def _without_weights(features: KeyedJaggedTensor) -> KeyedJaggedTensor:
-    """``features`` without its weights (no copy)."""
-    return KeyedJaggedTensor(
-        keys=features.keys(),
-        values=features.values(),
-        lengths=features.lengths(),
-        offsets=features.offsets(),
-        stride=features.stride(),
-        length_per_key=features._length_per_key,
-        offset_per_key=features._offset_per_key,
-    )
-
-
 class GroupedEmbeddingsLookup(_GroupedEmbeddingsLookup):
     def _create_embedding_kernel(
         self,
@@ -228,7 +203,7 @@ class GroupedEmbeddingsLookup(_GroupedEmbeddingsLookup):
         passes keys and offsets alone. Under the prefetch pipelines the LFU
         scores and admission counters would then differ from the plain loop's
         wherever weights count occurrences: index dedup's (whatever the
-        output dist), and across nodes the hierarchical dist's for LFU."""
+        output dist)."""
         if not self._need_prefetch:
             return
         for emb_op, features in zip(
@@ -278,11 +253,8 @@ class HierGroupedEmbeddingsLookup(GroupedEmbeddingsLookup):
     module's mode. For such a call each group writes its rows straight into
     the call's rows of ``op.lookup_rows``, through the tables'
     ``output_alloc``. The groups' outputs come back as those rows, without a
-    copy (``HierSharding.lookup``). When the KJT's weights are occurrence
-    counts (LFU across nodes without input weights), only the groups of LFU
-    tables get them, in the forward and in the prefetch. TorchRec's owner
-    gives the other groups no frequency counters either: there an admission
-    strategy counts each key once. See docs/hier_output_dist.md, section 7.4.
+    copy (``HierSharding.lookup``). See docs/hier_output_dist.md, section
+    7.4.
     """
 
     def __init__(
@@ -294,7 +266,6 @@ class HierGroupedEmbeddingsLookup(GroupedEmbeddingsLookup):
     ) -> None:
         super().__init__(grouped_configs=grouped_configs, pg=pg, device=device)
         self._hier = hier
-        self._lfu = []  # per group: its tables count frequencies
         for module in self._emb_modules:
             emb = module.emb_module
             if emb.output_dtype != hier.dtype:
@@ -304,18 +275,6 @@ class HierGroupedEmbeddingsLookup(GroupedEmbeddingsLookup):
                     "of the sharding one output_dtype."
                 )
             emb.output_alloc = hier.lookup_buffer
-            self._lfu.append(counts_frequencies(emb._dynamicemb_options[0]))
-
-    def _group_features(
-        self, sparse_features: KeyedJaggedTensor
-    ) -> List[KeyedJaggedTensor]:
-        groups = super()._group_features(sparse_features)
-        if not (self._hier.owns(sparse_features) and self._hier.counts_as_weights):
-            return groups
-        return [
-            group if lfu else _without_weights(group)
-            for group, lfu in zip(groups, self._lfu)
-        ]
 
     def forward(self, sparse_features: KeyedJaggedTensor) -> torch.Tensor:
         if not self._hier.owns(sparse_features):
@@ -434,14 +393,6 @@ class RwSequenceDynamicEmbeddingSharding(RwSequenceEmbeddingSharding):
             (sharding_info.fused_params or {}).get("gradient_clipping", False)
             for sharding_info in sharding_infos
         )
-        # LFU tables count occurrences: across nodes the owner gets them as
-        # weights.
-        lfu = any(
-            counts_frequencies(
-                (sharding_info.fused_params or {}).get("dynamicemb_options")
-            )
-            for sharding_info in sharding_infos
-        )
         return HierSharding(
             self._pg,
             self._get_num_features(),
@@ -451,7 +402,6 @@ class RwSequenceDynamicEmbeddingSharding(RwSequenceEmbeddingSharding):
             asked=asked,
             tables=tables,
             node_dedup=options.node_dedup and not clipping,
-            lfu=lfu,
         )
 
     def create_input_dist(

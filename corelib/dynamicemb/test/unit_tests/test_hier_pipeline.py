@@ -15,7 +15,8 @@
 """The hierarchical dist (``output_dist="fused"``) under the train pipelines.
 
 Each loop and pipeline trains on the same batches as the plain loop, or as
-TorchRec's dists, and must give the same outputs and tables, bit for bit
+TorchRec's dists, under index dedup (which the hierarchical dist takes), and
+must give the same outputs and tables, bit for bit
 (with a power-of-two world size of at most 128, every sum is exact). Its
 last steps also count the host syncs and the kernels of each call. Then
 calls over the capacities, which raise, under each loop and pipeline,
@@ -64,6 +65,7 @@ from dynamicemb import (
     get_table_value_bytes,
 )
 from dynamicemb.batched_dynamicemb_tables import BatchedDynamicEmbeddingTablesV2
+from dynamicemb.dynamicemb_config import get_eviction_score_strategy
 from dynamicemb.key_ownership import owning_shard
 from dynamicemb.planner import (
     DynamicEmbeddingShardingPlanner,
@@ -72,10 +74,7 @@ from dynamicemb.planner import (
 from dynamicemb.shard import DynamicEmbeddingCollectionSharder, quiesce
 from dynamicemb.shard.embedding import ShardedDynamicEmbeddingCollection
 from dynamicemb.shard.hier_output_dist import HierSharding
-from dynamicemb.shard.rw_sharding import (
-    RwSequenceDynamicEmbeddingSharding,
-    counts_frequencies,
-)
+from dynamicemb.shard.rw_sharding import RwSequenceDynamicEmbeddingSharding
 from fbgemm_gpu.split_embedding_configs import SparseType
 from torch.autograd import DeviceType
 from torch.profiler import ProfilerActivity, profile, record_function
@@ -242,7 +241,7 @@ class Batch(Pipelineable):
 @dataclass
 class Spec:
     name: str
-    dedup: bool = False  # index dedup
+    dedup: bool = True  # index dedup
     lfu: bool = False  # LFU scores
     admit: bool = False  # FrequencyAdmissionStrategy, threshold 2
     # t0 LFU, the other tables admission alone (threshold 2): two lookup groups
@@ -555,6 +554,15 @@ def tables_of(model) -> Dict[str, Tuple[torch.Tensor, torch.Tensor]]:
             order = torch.argsort(keys)
             out[name] = (keys[order], values[order])
     return out
+
+
+def counts_frequencies(options) -> bool:
+    """Whether a DynamicEmb table counts its keys' frequencies (LFU scores)."""
+    return (
+        options.score_strategy is not None
+        and get_eviction_score_strategy(options.score_strategy)
+        == DynamicEmbScoreStrategy.LFU
+    )
 
 
 def frequencies_of(model) -> Dict[Tuple[str, str], Tuple[torch.Tensor, torch.Tensor]]:
@@ -1109,18 +1117,10 @@ def run_against(
 # ── the matrix ───────────────────────────────────────────────────────────────
 
 UNIFORM = Spec("uniform")
-# index dedup with LFU and admission: the keys carry frequency counters
-COUNTED = Spec(
-    "pow-law, index dedup, LFU and admission",
-    dedup=True,
-    lfu=True,
-    admit=True,
-    keys="pow-law",
-)
-# LFU without index dedup: across nodes the owner's KJT carries each
-# node-unique key's occurrences
+# LFU and admission: the keys carry index dedup's frequency counters
+COUNTED = Spec("pow-law, LFU and admission", lfu=True, admit=True, keys="pow-law")
 LFU = Spec("pow-law, LFU", lfu=True, keys="pow-law")
-# and only the LFU table's lookup may see them
+# the LFU table and the admission tables in two lookup groups
 MIXED = Spec(
     "pow-law, an LFU table beside admission tables", mixed=True, keys="pow-law"
 )

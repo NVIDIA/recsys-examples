@@ -63,8 +63,9 @@ class InChannel {
 
   // The input dist of a call, under the next sequence number. Every rank
   // runs the same calls in the same order. A call that does not fit the
-  // capacities runs every step on what arrived and stays in bounds; its
-  // status says so on every rank alike.
+  // capacities, or whose keys were not index-deduplicated (kNeedKeyRows),
+  // runs every step on what arrived and stays in bounds; its status says so
+  // on every rank alike.
   InDist input_dist(const PlanInput &input);
 
  private:

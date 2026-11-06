@@ -75,7 +75,7 @@ OutChannel::OutChannel(const Config &config, const Sizes &sizes, ncclWindow_t wi
 // the backward: inside a node pulls saturate NVLink at about 32 CTAs, and
 // pushes keep improving up to about 64. Across nodes 32 for both: InfiniBand
 // bounds them under uniform keys, and under skew the hot owner's NVLink and
-// the heavy keys' sums do (more CTAs crowd the backward's pushes). Every
+// the proxies' sums do (more CTAs crowd the backward's pushes). Every
 // kernel that waits for peers must be resident at once: an out kernel leaves
 // an SM to a comm kernel of an input dist on another stream, kNcclReserve to
 // NCCL's own kernels, and one to spare. Across nodes the backward needs CTA 0
@@ -137,15 +137,12 @@ void OutChannel::backward(const BwdPlan &plan, at::Tensor grad, bool divide) {
   grad = grad.contiguous();
   if (grad.numel() > 0 && (uintptr_t)grad.data_ptr() % 16 != 0) grad = grad.clone();
   const void *kernel = backward_kernel(grad.scalar_type());
-  // The sub-tasks' fp32 sums, how many of each heavy row's and each heavy
-  // group's are done, and across nodes the proxy's keys reduced of each chunk
-  // of its stream (the kernel zeroes the counts).
+  // The heavy rows' sub-tasks' fp32 sums, how many of each heavy row's are
+  // done, and across nodes the proxy's keys reduced of each chunk of its
+  // stream (the kernel zeroes the counts).
   const auto options = grad.options();
-  const int64_t slots = plan.fanout.pos.defined() ? plan.fanout.pos.numel() : 0,
-                groups = plan.group_first_sub.defined() ? plan.group_first_sub.numel() : 0;
-  const at::Tensor partial =
-      at::empty({plan.heavy_subs + plan.group_subs, grad.size(1)}, options.dtype(at::kFloat));
-  const at::Tensor done = at::empty({slots + groups}, options.dtype(at::kLong));
+  const at::Tensor partial = at::empty({plan.heavy_subs, grad.size(1)}, options.dtype(at::kFloat));
+  const at::Tensor done = at::empty({plan.fanout.pos.numel()}, options.dtype(at::kLong));
   at::Tensor ready;
   if (multi_node_) ready = at::empty({sizes_.max_chunks}, options.dtype(at::kLong));
   const int ctas = out_ctas(OutKernel::kBackward);
@@ -154,7 +151,6 @@ void OutChannel::backward(const BwdPlan &plan, at::Tensor grad, bool divide) {
   args.grad = (const char *)grad.data_ptr();
   args.partial = partial.data_ptr<float>();
   args.heavy_done = (uint64_t *)done.data_ptr<int64_t>();
-  args.group_done = args.heavy_done + slots;
   args.ready = ready.defined() ? ready.data_ptr<int64_t>() : nullptr;
   args.reducers = reducers(ctas);
   // TorchRec's owner divides by world_size, a CPU scalar: PyTorch multiplies

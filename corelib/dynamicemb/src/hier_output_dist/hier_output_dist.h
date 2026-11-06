@@ -193,8 +193,8 @@ class HierOutputDist {
   HierOutputDist(const std::string &unique_id, int64_t rank, int64_t world_size, int64_t local_size,
                  const std::vector<int64_t> &feature_tables, const at::Tensor &block_sizes,
                  const at::Tensor &dist_types, int64_t dim, at::ScalarType dtype, bool weights,
-                 bool out_weights, bool node_dedup, int64_t lookup_keys, int64_t remote_keys,
-                 int64_t proxy_bytes, double timeout_s, int64_t ctas, int64_t reduce_ctas);
+                 bool node_dedup, int64_t lookup_keys, int64_t remote_keys, int64_t proxy_bytes,
+                 double timeout_s, int64_t ctas, int64_t reduce_ctas);
   // Local: waits for this rank's kernels. Then, unless the op was quiesced
   // after the last kernel of every rank, it waits at most min(timeout, 30 s)
   // for every node and rail peer to reach its own teardown. It lets go of
@@ -204,21 +204,20 @@ class HierOutputDist {
   HierOutputDist(const HierOutputDist &) = delete;
   HierOutputDist &operator=(const HierOutputDist &) = delete;
 
-  // The input dist of a call (InChannel::input_dist) of the requester's KJT
-  // (values; offsets, or lengths when it has none; batch_size; weights or
-  // none), the input KJT that construct_jagged_tensors reads when it is
-  // another one (input_offsets, input_batch_size), and index dedup's
+  // The input dist of a call (InChannel::input_dist) of the requester's KJT,
+  // index-deduplicated (values; offsets, or lengths when it has none;
+  // batch_size; weights or none), the offsets of the input KJT before index
+  // dedup, which construct_jagged_tensors reads, and index dedup's
   // reverse_indices. Every rank runs the same calls in the same order.
   InDistTensors input_dist(const at::Tensor &values, const c10::optional<at::Tensor> &offsets,
                            const c10::optional<at::Tensor> &lengths, int64_t batch_size,
                            const c10::optional<at::Tensor> &weights,
-                           const c10::optional<at::Tensor> &input_offsets, int64_t input_batch_size,
-                           const c10::optional<at::Tensor> &reverse_indices);
+                           const at::Tensor &input_offsets, const at::Tensor &reverse_indices);
   // The output dist of a call (OutChannel): the forward kernel returns the
   // rows of this rank's output; the backward kernel, with the backward's
-  // counts ([num_recv, heavy_subs, group_subs], from the status), returns the
-  // gradient of the lookup output (lookup_grad), a view of lookup_rows valid
-  // until the next lookup.
+  // counts ([num_recv, heavy_subs], from the status), returns the gradient
+  // of the lookup output (lookup_grad), a view of lookup_rows valid until
+  // the next lookup.
   at::Tensor output_dist_fwd(const std::vector<c10::optional<at::Tensor>> &fwd_plan,
                              const at::Tensor &lookup_out);
   at::Tensor output_dist_bwd(const std::vector<c10::optional<at::Tensor>> &bwd_plan,

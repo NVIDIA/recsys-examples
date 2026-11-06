@@ -16,10 +16,11 @@
 raises at its second wait, on every rank alike, and the op takes the calls
 after it.
 
-Each case trains three models: on the hierarchical dist with ample
-capacities (whose calls give the needs), on the hierarchical dist with one
-capacity that the case's large calls do not fit, and on TorchRec's dists
-with the case's small calls alone. On the second model every large call
+Each case trains three models, under index dedup (which the hierarchical
+dist takes): on the hierarchical dist with ample capacities (whose calls
+give the needs), on the hierarchical dist with one capacity that the case's
+large calls do not fit, and on TorchRec's dists with the case's small calls
+alone. On the second model every large call
 raises RuntimeError on every rank, naming the capacity to raise, and every
 small call must give TorchRec's outputs, bit for bit at a power-of-two world
 size: the large calls changed nothing. The ``placement`` cases also check
@@ -85,9 +86,9 @@ class Case:
     capacity: str  # the tight one: a name of OUTPUT_DIST_CAPACITY_NAMES, or "int"
     # the calls, "s" small and "l" large (those do not fit the tight capacity)
     schedule: str = "sls"
-    dedup: bool = False  # index dedup
+    dedup: bool = True  # index dedup
     hot: float = 0.0  # share of the keys drawn from 4 hot keys (heavy rows)
-    lfu: bool = False  # LFU scores (frequency counts as weights)
+    lfu: bool = False  # LFU scores (frequency counters as weights)
     int32: bool = False  # KJT values and lengths
     # int32 keys of placement_keys(), and the checks of where they went
     # (check_placement)
@@ -120,32 +121,29 @@ CASES = [
     Case("int", "int"),
     Case("first call", "lookup_keys", schedule="lss"),
     Case("many calls", "lookup_keys", schedule="sllslls"),
-    Case("dedup heavy", "lookup_keys", dedup=True, hot=0.5),
-    Case("dedup lfu", "lookup_keys", dedup=True, lfu=True),
-    Case("lfu counts", "int", lfu=True),
+    Case("heavy rows", "lookup_keys", hot=0.5),
+    Case("lfu", "lookup_keys", lfu=True),
+    Case("lfu, int", "int", lfu=True),
     Case("int32 keys", "lookup_keys", int32=True),
     *(
         Case(
-            f"int32 placement, {dist_type}{', dedup' if dedup else ''}",
+            f"int32 placement, {dist_type}",
             "lookup_keys",
             schedule="slss",
             int32=True,
             placement=True,
             dist_type=dist_type,
-            dedup=dedup,
         )
         for dist_type in ("roundrobin", "hash_roundrobin", "continuous")
-        for dedup in (False, True)
     ),
     Case("variable batch per feature", "lookup_keys", vbe=True),
-    Case("two lookup groups", "lookup_keys", groups=True, dedup=True),
+    Case("two lookup groups", "lookup_keys", groups=True),
     Case("a table-wise table beside", "lookup_keys", beside=True),
     Case(
         "between a forward and its backward",
         "lookup_keys",
         schedule="slssls",
         order="interleaved",
-        dedup=True,
         hot=0.5,
     ),
     Case("remote_keys", "remote_keys", multi_node=True),
@@ -226,10 +224,7 @@ def build_model(
             "learning_rate": 1.0,
             "output_dtype": SparseType.FP32,
         },
-        # TorchRec's dists in DynamicEmb take no int32 keys under index dedup
-        # (segmented_unique takes int64 keys): the reference then runs
-        # without it, which gives the same rows
-        use_index_dedup=case.dedup and not (output_dist == "torchrec" and case.int32),
+        use_index_dedup=case.dedup,
     )
     plan = planner.collective_plan(ec, [sharder], dist.GroupMember.WORLD)
     return DistributedModelParallel(

@@ -35,8 +35,8 @@ namespace hier_output_dist {
 struct FwdArgs {
   FwdPlanView plan;
   char *out;                  // [num_out, row] the requester's output
-  int64_t *ready;             // across nodes [local_size]: rows it pulled from each proxy (index
-                              // dedup's heavy rows wait for them); the kernel zeroes it
+  int64_t *ready;             // across nodes [local_size]: rows it pulled from each proxy (heavy
+                              // rows wait for them); the kernel zeroes it
   unsigned long long *trace;  // [kTraceWords] this kernel's timeline, or nullptr
 };
 
@@ -44,11 +44,8 @@ struct FwdArgs {
 struct BwdArgs {
   BwdPlanView plan;
   const char *grad;           // [num_out, row] the gradient of the requester's output
-  float *partial;             // [sub-tasks, dim] fp32 sums of the heavy rows' sub-tasks (index
-                              // dedup), then of the heavy groups' (plan.heavy_subs, then
-                              // plan.group_subs)
-  uint64_t *heavy_done;       // [heavy rows] sub-tasks of each one done
-  uint64_t *group_done;       // [heavy groups] the same (the kernel zeroes both)
+  float *partial;             // [plan.heavy_subs, dim] fp32 sums of the heavy rows' sub-tasks
+  uint64_t *heavy_done;       // [heavy rows] sub-tasks of each one done (the kernel zeroes it)
   int64_t *ready;             // across nodes, the proxy's [max_chunks]: keys of each chunk of
                               // its stream reduced; the kernel zeroes those of its chunks
   unsigned long long *trace;  // [kTraceWords] this kernel's timeline, or nullptr

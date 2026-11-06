@@ -249,19 +249,24 @@ class RwSparseFeaturesDist(_RwSparseFeaturesDist):
             dist_type_per_feature=self._dist_type_tensor,
         )
 
-    def hier_setup(self, weights: bool) -> bool:
+    def hier_setup(self, weights: bool, index_dedup: bool) -> bool:
         """Whether the sharding takes its hierarchical dist; the first call
         builds it, collectively (``HierSharding.setup``), with this input
-        dist's rule of each feature. ``weights``: the keys carry weights."""
+        dist's rule of each feature. ``weights``: the keys carry weights;
+        ``index_dedup``: they are index-deduplicated, which the hierarchical
+        dist needs."""
         return self.hier.setup(
-            self._feature_block_sizes_tensor, self._dist_type_tensor, weights
+            self._feature_block_sizes_tensor,
+            self._dist_type_tensor,
+            weights,
+            index_dedup,
         )
 
     def hier_forward(
         self,
         features: KeyedJaggedTensor,
         input_features: KeyedJaggedTensor,
-        reverse_indices: Optional[torch.Tensor],
+        reverse_indices: torch.Tensor,
         sharding_ctx: DynamicEmbSequenceShardingContext,
     ) -> "HierStartAwaitable":
         """The hierarchical input dist of a call: the sharding's operator
@@ -271,9 +276,9 @@ class RwSparseFeaturesDist(_RwSparseFeaturesDist):
         capacities. See docs/hier_output_dist.md, sections 7.3 and 10.
 
         Args:
-            features: the keys to send, ``int32`` or ``int64``. Under index
-                dedup only the first keys are valid, and only the device
-                knows how many.
+            features: the keys to send, ``int32`` or ``int64``,
+                index-deduplicated: only the first keys are valid, and only
+                the device knows how many.
             input_features: the KJT ``construct_jagged_tensors`` reads (the
                 input before index dedup).
             reverse_indices: index dedup's map from the input's rows to the
@@ -295,8 +300,7 @@ class RwSparseFeaturesDist(_RwSparseFeaturesDist):
             features.lengths() if offsets is None else None,
             features.stride(),
             None if weights is None else weights.contiguous(),
-            None if input_features is features else input_features.offsets(),
-            input_features.stride(),
+            input_features.offsets(),
             reverse_indices,
         )
         return HierStartAwaitable(

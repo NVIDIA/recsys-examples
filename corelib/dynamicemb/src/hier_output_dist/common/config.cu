@@ -23,7 +23,6 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 
 #include "hier_output_dist/common/common.h"
 #include "hier_output_dist/common/config.h"
-#include "hier_output_dist/input_dist/planner.h"
 
 namespace dyn_emb {
 namespace hier_output_dist {
@@ -85,12 +84,6 @@ void Config::validate() const {
     if (sizes.flag_words() >= kMaxEntries)
       refuse("a proxy's push-task flags for remote_keys at ", local_size, " GPUs per node are ",
              sizes.flag_words(), ", more than int32 numbers hold; lower remote_keys");
-    const int bits = push_key_of(sizes).bits;
-    if (bits > 63)
-      refuse(
-          "the proxy sorts its push order by a key of ", bits,
-          " bits (its fields: the GPUs of a node, the chunks and the heavy keys of remote_keys), ",
-          "more than 63; lower remote_keys");
   }
   if (!(timeout_s > 0)) refuse("the timeout must be positive, got ", timeout_s);
   if (ctas < 0 || reduce_ctas < 1)
@@ -109,8 +102,8 @@ std::string invalid(const Config &config) {
 Config config_of(int64_t rank, int64_t world_size, int64_t local_size,
                  const std::vector<int64_t> &feature_tables, const at::Tensor &block_sizes,
                  const at::Tensor &dist_types, int64_t dim, at::ScalarType dtype, bool weights,
-                 bool out_weights, bool node_dedup, int64_t lookup_keys, int64_t remote_keys,
-                 int64_t proxy_bytes, double timeout_s, int64_t ctas, int64_t reduce_ctas) {
+                 bool node_dedup, int64_t lookup_keys, int64_t remote_keys, int64_t proxy_bytes,
+                 double timeout_s, int64_t ctas, int64_t reduce_ctas) {
   Config config;
   config.rank = (int)rank;
   config.world_size = (int)world_size;
@@ -121,7 +114,6 @@ Config config_of(int64_t rank, int64_t world_size, int64_t local_size,
   config.dim = dim;
   config.dtype = dtype;
   config.weights = weights;
-  config.out_weights = out_weights;
   config.node_dedup = node_dedup;
   config.capacities = Capacities{lookup_keys, remote_keys, proxy_bytes};
   config.timeout_s = timeout_s;
@@ -131,18 +123,6 @@ Config config_of(int64_t rank, int64_t world_size, int64_t local_size,
 }
 
 // ── the sizes ──
-
-// A requester's fp32 partial row of a heavy key takes 4 * dim bytes of proxy_rows.
-int partial_rows_for(int64_t dim, int64_t row_bytes) {
-  return (int)((4 * dim + row_bytes - 1) / row_bytes);
-}
-
-// A heavy key takes a partial for each GPU of the node besides its row: it
-// is heavy only with more occurrences than those, so it never takes more
-// rows than it has occurrences.
-int64_t heavy_at_for(int64_t local_size, int64_t partial_rows) {
-  return std::max<int64_t>(kHeavy, local_size * partial_rows);
-}
 
 int64_t max_chunks_for(const Sizes &sizes) {
   return sizes.remote_keys / sizes.chunk_room() + sizes.topo.num_nodes;
@@ -169,12 +149,10 @@ Sizes sizes_of(const Config &config) {
   sizes.num_tables = tables.empty() ? 0 : *std::max_element(tables.begin(), tables.end()) + 1;
   sizes.lookup_keys = config.capacities.lookup_keys;
   sizes.row_bytes = config.row_bytes();
-  sizes.partial_rows = partial_rows_for(config.dim, sizes.row_bytes);
   sizes.weights = config.weights;
   sizes.timeout_ns = (uint64_t)(std::min(config.timeout_s, 1e9) * 1e9);
   if (num_nodes > 1) {
     sizes.remote_keys = config.capacities.remote_keys;
-    sizes.heavy_at = heavy_at_for(local_size, sizes.partial_rows);
     const int64_t key_rows = sizes.max_key_rows();
     sizes.num_proxy_rows = std::min(std::max(sizes.remote_keys, min_proxy_rows_for(key_rows)),
                                     config.capacities.proxy_bytes / sizes.row_bytes);
@@ -182,7 +160,7 @@ Sizes sizes_of(const Config &config) {
     const int64_t two_mib = std::max<int64_t>(kTaskRows, (2 << 20) / sizes.row_bytes);
     sizes.chunk_rows = std::max(std::min(two_mib, sizes.num_proxy_rows / 2), 2 * key_rows);
     sizes.max_chunks = max_chunks_for(sizes);
-    sizes.record_bytes = config.out_weights ? 16 : 8;
+    sizes.record_bytes = config.weights ? 16 : 8;
   }
   return sizes;
 }

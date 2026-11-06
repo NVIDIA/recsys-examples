@@ -725,10 +725,12 @@ class DynamicEmbTableOptions:
     keys and rows move over NVLink inside a node and over the rails (NCCL
     GIN) between nodes, with one host sync per call. It needs DynamicEmb
     built against NCCL >= 2.30.7 (else ``ImportError`` when the model is
-    sharded) and ``output_dist_capacity``. ``"auto"`` is ``"fused"`` where
-    the build has it and ``output_dist_capacity`` is set, and TorchRec's
-    dists (with a warning) elsewhere. Pooled shardings ignore it. Every
-    DynamicEmb table of a sharding sets ``output_dist``,
+    sharded), ``output_dist_capacity`` and index dedup (the sharder's
+    ``use_index_dedup=True``; else ``ValueError`` at the first
+    ``input_dist()``). ``"auto"`` is ``"fused"`` where the build has it,
+    ``output_dist_capacity`` is set and the keys are index-deduplicated, and
+    TorchRec's dists (with a warning) elsewhere. Pooled shardings ignore it.
+    Every DynamicEmb table of a sharding sets ``output_dist``,
     ``output_dist_capacity`` and ``node_dedup`` alike. See
     docs/hier_output_dist.md, section 4."""
 

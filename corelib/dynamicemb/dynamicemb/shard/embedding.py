@@ -223,14 +223,15 @@ class ShardedDynamicEmbeddingCollection(ShardedEmbeddingCollection):
         (``shard/hier_output_dist.py``): a training call of a sharding that
         takes it. The sharding decides at its first call (in any mode),
         collectively, so the answer is the same on every rank. Eval calls run
-        on TorchRec's dists. The keys carry weights (frequency counters) under
-        index dedup with LFU scores or an admission strategy."""
+        on TorchRec's dists. The hierarchical dist takes index-deduplicated
+        keys only. The keys carry weights (frequency counters) under index
+        dedup with LFU scores or an admission strategy."""
         weights = self._use_index_dedup and (
             self._is_lfu_enabled or self._has_admit_strategy
         )
         return [
             getattr(input_dist, "hier", None) is not None
-            and input_dist.hier_setup(weights)
+            and input_dist.hier_setup(weights, self._use_index_dedup)
             and self.training
             for input_dist in self._input_dists
         ]
@@ -249,11 +250,10 @@ class ShardedDynamicEmbeddingCollection(ShardedEmbeddingCollection):
         the count (a host sync) nor a slice. TorchRec's dists send all of
         ``values``, so theirs are sliced to the count.
 
-        ``segmented_unique_cuda`` takes ``int64`` (or ``uint64``) keys, so
-        TorchRec's dists here take no ``int32`` keys. A sharding on the
-        hierarchical dist deduplicates its ``int32`` keys as ``int64`` and
-        gets the deduplicated keys back in the caller's dtype. Its part 1
-        places each key by the rule of the key's own width, as DynamicEmb's
+        ``segmented_unique_cuda`` takes ``int64`` (or ``uint64``) keys:
+        ``int32`` keys are deduplicated as ``int64``, and the deduplicated
+        keys go back to the caller's dtype. So both dists' bucketizes place
+        each key by the rule of the key's own width, as DynamicEmb's
         bucketize does.
         """
         with record_function("## dedup_ec_indices ##"):
@@ -271,7 +271,7 @@ class ShardedDynamicEmbeddingCollection(ShardedEmbeddingCollection):
                 local_batchsize = total_B // features
 
                 values = input_feature.values()
-                indices = values.long() if on_hier[i] else values
+                indices = values.long() if values.dtype == torch.int32 else values
                 offsets = input_feature.offsets().to(torch.int64)
                 num_elements = indices.numel()
 
@@ -330,9 +330,8 @@ class ShardedDynamicEmbeddingCollection(ShardedEmbeddingCollection):
                     total_B,
                 )
 
-                if on_hier[i]:
-                    unique_keys = unique_keys.to(values.dtype)
-                else:
+                unique_keys = unique_keys.to(values.dtype)
+                if not on_hier[i]:
                     # Get unique values for the KJT
                     # .item() implicitly syncs GPU to CPU
                     total_unique = num_uniques.item()
@@ -411,14 +410,13 @@ class ShardedDynamicEmbeddingCollection(ShardedEmbeddingCollection):
                     features_before_input_dist=features
                 )
                 if on_hier[i]:
-                    input_features, reverse_indices = features, None
-                    if self._use_index_dedup:
-                        input_features = ctx.input_features[i]
-                        reverse_indices = ctx.reverse_indices[i]
-                        # The output dist expands the index dedup itself, from
-                        # the plan's fan-out table: TorchRec must not do it
-                        # again.
-                        ctx.reverse_indices[i] = None
+                    # The hierarchical dist takes index-deduplicated keys (its
+                    # setup refuses others) and expands the index dedup
+                    # itself, from the plan's fan-out table: TorchRec must not
+                    # do it again.
+                    input_features = ctx.input_features[i]
+                    reverse_indices = ctx.reverse_indices[i]
+                    ctx.reverse_indices[i] = None
                     awaitables.append(
                         input_dist.hier_forward(
                             features, input_features, reverse_indices, sharding_ctx

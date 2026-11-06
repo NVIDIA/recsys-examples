@@ -360,8 +360,7 @@ def bucketize(
     lengths: bool = False,
 ) -> Dict[str, torch.Tensor]:
     """The bucketize of the batch, from its offsets, or (``lengths``) from its
-    lengths alone, the input's totals then from this KJT when it is the input
-    (no index dedup's bound)."""
+    lengths alone; the input's totals from the input KJT's offsets."""
     return planner(
         hier_output_dist_bucketize,
         batch.values,
@@ -372,8 +371,7 @@ def bucketize(
         block_sizes,
         dist_types,
         world_size,
-        None if lengths and not case.bound else batch.in_offsets,
-        case.batch_size,
+        batch.in_offsets,
     )
 
 

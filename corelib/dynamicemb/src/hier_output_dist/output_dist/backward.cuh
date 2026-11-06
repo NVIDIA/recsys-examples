@@ -142,48 +142,31 @@ __device__ __forceinline__ void scaled_copy_rows(const char *src, char *dst, int
   }
 }
 
-// Vector `col` (when `live`) of the rows of reducer-list entries [begin, end)
-// in this rank's proxy_rows (`rows`), summed in fp32 in list order into acc:
-// rows of the key's type, or (Partial) a heavy key's fp32 partial rows, those
-// of requesters without one (kEntryNoPush) skipped. Each lane loads its entry
-// of each 32, the warp then 8 rows at a time (only partials need the flag).
-template <typename RowT, bool Partial>
-__device__ __forceinline__ void sum_entries(const RowsLayout &rows, const ReducerEntry *ent,
-                                            int64_t begin, int64_t end, int col, bool live,
-                                            int lane, float *acc) {
-  constexpr int kValues = Vec16<RowT>::kValues,
-                kLoads = Partial ? kValues / 4 : 1;  // 16-byte loads per vector
-  bool any = false;
-  for (int64_t block0 = begin; block0 < end; block0 += 32) {
-    const int block_len = (int)min((int64_t)32, end - block0);
-    const ReducerEntry mine = lane < block_len ? ent[block0 + lane] : ReducerEntry{0, 0};
-    for (int i = 0; i < block_len; i += 8) {
-      int4 vecs[8][kLoads];
-      bool use[8];
+// Vector `col` (when `live`) of a key's `count` rows in this rank's
+// proxy_rows (`rows`): its row `key_row`, then its duplicates' slots from
+// `duplicates` on, summed in fp32 in that order into acc, 8 rows' loads in
+// flight.
+template <typename RowT>
+__device__ __forceinline__ void sum_key_rows(const RowsLayout &rows, int64_t key_row,
+                                             int64_t duplicates, int64_t count, int col, bool live,
+                                             float *acc) {
+  constexpr int kValues = Vec16<RowT>::kValues;
+  for (int64_t first = 0; first < count; first += 8) {
+    int4 vecs[8];
 #pragma unroll
-      for (int step = 0; step < 8; ++step) {
-        ReducerEntry entry;
-        entry.slot = __shfl_sync(kFull, mine.slot, (i + step) & 31);
-        entry.flag = Partial ? __shfl_sync(kFull, mine.flag, (i + step) & 31) : 0;
-        use[step] = i + step < block_len && (!Partial || entry.flag != kEntryNoPush);
-        const int4 *src = (const int4 *)rows.proxy_row(entry.proxy_row()) + col * kLoads;
+    for (int step = 0; step < 8; ++step) {
+      const int64_t row = first + step, slot = row == 0 ? key_row : duplicates + row - 1;
+      vecs[step] = row < count && live ? __ldcg((const int4 *)rows.proxy_row(slot) + col)
+                                       : make_int4(0, 0, 0, 0);
+    }
 #pragma unroll
-        for (int load = 0; load < kLoads; ++load)
-          vecs[step][load] = use[step] && live ? __ldcg(src + load) : make_int4(0, 0, 0, 0);
-      }
+    for (int step = 0; step < 8; ++step) {
+      if (first + step >= count) continue;
+      float vals[kValues];
+      Vec16<RowT>::get(vals, vecs[step]);
 #pragma unroll
-      for (int step = 0; step < 8; ++step) {
-        if (!use[step]) continue;
-        float vals[kValues];
-        if constexpr (Partial)
-          memcpy(vals, vecs[step], sizeof(vals));
-        else
-          Vec16<RowT>::get(vals, vecs[step][0]);
-#pragma unroll
-        for (int elem = 0; elem < kValues; ++elem)
-          acc[elem] = any ? acc[elem] + vals[elem] : vals[elem];
-        any = true;
-      }
+      for (int elem = 0; elem < kValues; ++elem)
+        acc[elem] = first + step == 0 ? vals[elem] : acc[elem] + vals[elem];
     }
   }
 }
@@ -192,15 +175,12 @@ __device__ __forceinline__ void sum_entries(const RowsLayout &rows, const Reduce
 // (SubTaskDone), a push task to a proxy (bwd::ProxyPush) and the steps of
 // their task loop. Every warp but, across nodes, CTA 0's GIN warps and the
 // reducer CTAs requests. It takes its tasks in this order:
-//   1. Across nodes, the sub-tasks whose sums go to other nodes: index
-//      dedup's heavy rows' sub-tasks (each sums kHeavy original rows into an
-//      fp32 partial of its own) and the heavy groups' sub-tasks (kHeavy rows
-//      each).
-//   2. Chunk after chunk of the proxies' streams (bwd_task_starts), the push
-//      tasks of every proxy's heavy groups, then those of every proxy's rows
-//      (32 positions of its push order each), proxies in turn in both, so
-//      the chunks fill in stream order. The heavy groups come first: none of
-//      a chunk's keys is ready before their partials.
+//   1. Across nodes, the sub-tasks of index dedup's heavy rows whose sums go
+//      to other nodes (each sums kHeavy original rows into an fp32 partial
+//      of its own).
+//   2. Chunk after chunk of the proxies' streams (task_starts), the push
+//      tasks of every proxy's rows (32 positions of its push order each),
+//      proxies in turn, so the chunks fill in stream order.
 //   3. The row tasks of the node's owners, with the sub-tasks of the node's
 //      heavy rows spread evenly among them (the pushes keep NVLink busy while
 //      the sub-tasks read HBM). The last sub-task of such a row to end adds
@@ -212,9 +192,9 @@ __device__ __forceinline__ void sum_entries(const RowsLayout &rows, const Reduce
 // pushes of earlier chunks, earlier in the queue. The kernel runs the task
 // loop (bwd_kernel); these functions are its steps.
 
-// The done counter of a heavy row's sub-tasks (index dedup) or of a heavy
-// group's: each sub-task counts itself done once its warp wrote its fp32 sum,
-// and what adds the sums up waits until all have.
+// The done counter of a heavy row's sub-tasks: each sub-task counts itself
+// done once its warp wrote its fp32 sum, and what adds the sums up waits
+// until all have.
 struct SubTaskDone {
   uint64_t *word;
   // One lane: waits until `count` sub-tasks counted themselves done.
@@ -239,14 +219,11 @@ struct SubTaskDone {
 namespace bwd {
 
 // One push task to a proxy (across nodes): the proxy, the chunk, the task's
-// place among this rank's tasks of its kind there (nth), and this rank's
-// entries of that proxy's push table for the chunk (entry; next holds the
-// ends).
+// place among this rank's tasks there (nth), and this rank's entries of that
+// proxy's push table for the chunk (entry; next holds the ends).
 struct ProxyPush {
-  bool is_group_task;  // a task of heavy groups, else of rows
   int proxy;
   int64_t chunk, nth;
-  int64_t plain_tasks;  // this rank's tasks of rows at the proxy in the chunk
   ReqEntry entry, next;
 };
 
@@ -276,17 +253,17 @@ __device__ __forceinline__ void wait_free_warp(const Sizes &sizes, int64_t seq,
   __syncwarp();
 }
 
-// A push task's rows (or partials) are in the proxy's proxy_rows: its flag
-// `flag` in that proxy's push flags, tagged with seq. Every lane of the warp.
+// A push task's rows are in the proxy's proxy_rows: its flag `flag` in that
+// proxy's push flags, tagged with seq. Every lane of the warp.
 __device__ __forceinline__ void push_flag_warp(int64_t seq, const OutTables &tables, int proxy,
                                                int64_t flag, int lane) {
   __syncwarp();
   if (lane == 0) st_release_sys(tables.push_flag(proxy, flag), (uint64_t)seq);
 }
 
-// Index dedup, a heavy row (more than kHeavy original rows): once its
-// sub-tasks are done, where their sums are (num_subs of them, in sub-task
-// order). Every lane of the warp.
+// A heavy row (more than kHeavy original rows): once its sub-tasks are done,
+// where their sums are (num_subs of them, in sub-task order). Every lane of
+// the warp.
 template <typename RowT>
 __device__ __forceinline__ const float *heavy_row_warp(const Sizes &sizes, const BwdArgs &args,
                                                        int64_t dedup_row, int64_t cnt, int lane,
@@ -300,8 +277,8 @@ __device__ __forceinline__ const float *heavy_row_warp(const Sizes &sizes, const
   return args.partial + (int64_t)fanout.first[slot] * (sizes.row_vecs() * Vec16<RowT>::kValues);
 }
 
-// Index dedup: heavy row sub-task `sub` sums kHeavy of its original rows
-// into an fp32 partial of its own, then counts itself done for its row. It
+// Heavy row sub-task `sub` sums kHeavy of its original rows into an fp32
+// partial of its own, then counts itself done for its row. It
 // runs in its row's pass: kRemote for a row an owner on another node gets
 // (through a proxy), whose push task adds up the row's sub-tasks; else for a
 // row of one of the node's owners, where the last of the row's sub-tasks to
@@ -352,105 +329,18 @@ __device__ void heavy_sub_warp(const Sizes &sizes, const BwdArgs &args, const Ou
   }
 }
 
-// Across nodes, heavy group sub-task `sub`: the fp32 sum, in position order,
-// of the scaled gradients of its rows (at most kHeavy positions of
-// push_order), into an fp32 partial of its own; then it counts itself done
-// for its group. Every lane of the warp.
-template <typename RowT>
-__device__ void group_sub_warp(const Sizes &sizes, const BwdArgs &args, int64_t sub, int lane) {
-  constexpr int kValues = Vec16<RowT>::kValues;
-  static_assert(kHeavy % 32 == 0, "a sub-task's rows are spread over the lanes");
-  const BwdPlanView &plan = args.plan;
-  const Fanout &fanout = plan.fanout;
-  const int row_bytes = sizes.row_bytes, vec = sizes.row_vecs(), dim = vec * kValues;
-  const int32_t group = plan.group_of_sub[sub];
-  const HeavyGroup span = plan.heavy_groups[group];
-  const int64_t begin = span.start + (sub - plan.group_first_sub[group]) * kHeavy,
-                end = min(begin + kHeavy, (int64_t)span.end);
-  float *part = args.partial + (plan.heavy_subs + sub) * dim;
-  if (fanout.exp_off == nullptr) {
-    // each lane holds the gradient rows of positions begin + lane, begin + 32 + lane, ...
-    int64_t grad_rows[kHeavy / 32];
-#pragma unroll
-    for (int j = 0; j < kHeavy / 32; ++j)
-      grad_rows[j] =
-          begin + 32 * j + lane < end ? plan.inv[plan.push_order[begin + 32 * j + lane]] : 0;
-    const int count = (int)(end - begin);
-    for (int col_base = 0; col_base < vec; col_base += 32) {
-      const int col = col_base + lane;
-      float acc[kValues];
-#pragma unroll
-      for (int j = 0; j < kHeavy / 32; ++j)
-        for (int i = 32 * j; i < min(count, 32 * j + 32); i += 8) {
-          int4 vecs[8];
-#pragma unroll
-          for (int step = 0; step < 8; ++step) {
-            const int64_t out_row = __shfl_sync(kFull, grad_rows[j], (i + step) & 31);
-            vecs[step] = i + step < count && col < vec
-                             ? __ldcg((const int4 *)(args.grad + out_row * row_bytes) + col)
-                             : make_int4(0, 0, 0, 0);
-          }
-#pragma unroll
-          for (int step = 0; step < 8; ++step) {
-            if (i + step >= count) continue;
-            float vals[kValues];
-            Vec16<RowT>::get(vals, vecs[step]);
-#pragma unroll
-            for (int elem = 0; elem < kValues; ++elem) {
-              vals[elem] = mul_rn(vals[elem], args.scale);
-              acc[elem] = i + step == 0 ? vals[elem] : acc[elem] + vals[elem];
-            }
-          }
-        }
-      if (col < vec) store_fp32<kValues>(part, col, acc);
-    }
-    SubTaskDone{args.group_done + group}.count_warp(lane);
-    return;
-  }
-  // index dedup: each row is a deduplicated row's fan-in
-  for (int64_t pos = begin; pos < end; ++pos) {
-    const int64_t dedup_row = plan.inv[plan.push_order[pos]];
-    const int64_t first_entry = fanout.exp_off[dedup_row],
-                  cnt = fanout.exp_off[dedup_row + 1] - first_entry;
-    int64_t num_subs = 0;
-    const float *heavy_part =
-        cnt > kHeavy ? heavy_row_warp<RowT>(sizes, args, dedup_row, cnt, lane, num_subs) : nullptr;
-    for (int col = lane; col < vec; col += 32) {
-      float vals[kValues];
-      if (heavy_part != nullptr)
-        sum_fp32<kValues>(heavy_part, num_subs, dim, col, vals);
-      else
-        sum_vec<RowT>(args.grad, fanout.exp_idx, first_entry, first_entry + cnt, row_bytes, col,
-                      vals);
-#pragma unroll
-      for (int i = 0; i < kValues; ++i) {
-        vals[i] = mul_rn(vals[i], args.scale);
-        if (pos != begin) vals[i] += part[col * kValues + i];
-      }
-      store_fp32<kValues>(part, col, vals);
-    }
-  }
-  SubTaskDone{args.group_done + group}.count_warp(lane);
-}
-
-// Each lane's `dst` gets the gradient of its row `dedup_row`: the
-// requester's output gradient row `dedup_row`, or under index dedup the sum
-// over the original rows of deduplicated row `dedup_row`. Rows of one
-// original row (most) in one warp copy, those of 2..kHeavy then one at a
-// time, heavy ones from their sub-tasks' sums, or, rows of the node's owners
-// (kLocal), not at all: their last sub-task writes them (heavy_sub_warp).
-// Returns how many rows it wrote. Every lane of the warp.
+// Each lane's `dst` gets the gradient of its deduplicated row `dedup_row`,
+// the sum over its original rows. Rows of one original row (most) in one
+// warp copy, those of 2..kHeavy then one at a time, heavy ones from their
+// sub-tasks' sums, or, rows of the node's owners (kLocal), not at all: their
+// last sub-task writes them (heavy_sub_warp). Returns how many rows it
+// wrote. Every lane of the warp.
 template <typename RowT, bool kLocal>
 __device__ int push_rows_warp(const Sizes &sizes, const BwdArgs &args, int64_t dedup_row, char *dst,
                               int num_rows, int lane) {
   const BwdPlanView &plan = args.plan;
   const Fanout &fanout = plan.fanout;
   const int row_bytes = sizes.row_bytes, vec = sizes.row_vecs(), dim = vec * Vec16<RowT>::kValues;
-  if (fanout.exp_off == nullptr) {
-    scaled_copy_rows<RowT>(lane < num_rows ? args.grad + dedup_row * row_bytes : nullptr, dst,
-                           num_rows, vec, lane, args.scale);
-    return num_rows;
-  }
   int64_t first_entry = 0, cnt = 0;
   const char *src = nullptr;
   if (lane < num_rows) {
@@ -487,81 +377,17 @@ __device__ int push_rows_warp(const Sizes &sizes, const BwdArgs &args, int64_t d
   return num_rows - __popc(__ballot_sync(kFull, left));
 }
 
-// Across nodes, heavy groups [group_lo, group_hi) of a push task to `proxy`
-// (at most 32): each group's sub-task sums, once done, added in sub-task
-// order into its fp32 partial slot in that proxy's proxy_rows (where all of
-// the group's rows point; it spans partial_rows rows). Each lane looks up one
-// group (group_lo + lane) and waits for its sub-tasks. Every lane of the
-// warp.
-template <typename RowT>
-__device__ void push_groups_warp(const Sizes &sizes, const BwdArgs &args, const OutTables &tables,
-                                 int proxy, int64_t group_lo, int64_t group_hi, int lane) {
-  const BwdPlanView &plan = args.plan;
-  const int dim = sizes.row_vecs() * Vec16<RowT>::kValues;
-  int64_t num_subs = 0;
-  const float *part = nullptr;
-  float *slot = nullptr;
-  if (group_lo + lane < group_hi) {
-    const int64_t group = group_lo + lane;
-    const HeavyGroup span = plan.heavy_groups[group];
-    num_subs = ceil_div<kHeavy>(span.end - span.start);
-    part = args.partial + (plan.heavy_subs + plan.group_first_sub[group]) * dim;
-    slot = (float *)tables.proxy_row(proxy, plan.dst[plan.push_order[span.start]]);
-    SubTaskDone{args.group_done + group}.wait_lane(sizes, num_subs, "sub-tasks of a heavy group");
-  }
-  __syncwarp();
-  for (int j = 0; j < group_hi - group_lo; ++j) {
-    const int64_t lane_subs = __shfl_sync(kFull, num_subs, j);
-    const float *lane_part = from_lane(part, j);
-    float *lane_slot = from_lane(slot, j);
-    for (int col = lane; col < dim / 4; col += 32) {
-      float acc[4];
-      sum_fp32<4>(lane_part, lane_subs, dim, col, acc);
-      store_fp32<4>(lane_slot, col, acc);
-    }
-  }
-}
-
-// Remote task `remote_task` (across nodes): a push task of its chunk, of
-// heavy groups or of rows, to the proxy in turn from this rank's own one.
+// Remote task `remote_task` (across nodes): a push task of its chunk, to the
+// proxy in turn from this rank's own one.
 __device__ __forceinline__ void remote_push(const Sizes &sizes, const BwdPlanView &plan,
                                             const OutTables &tables, int64_t remote_task,
                                             ProxyPush &push) {
   const int local_size = sizes.topo.local_size, me = sizes.topo.local_rank;
-  const RemoteTask place(plan.bwd_task_starts, 2 * plan.max_chunks * local_size, remote_task);
-  push.chunk = place.entry / (2 * local_size);
-  push.is_group_task = place.entry / local_size % 2 == 0;
+  const RemoteTask place(plan.task_starts, plan.max_chunks * local_size, remote_task);
+  push.chunk = place.entry / local_size;
   push.proxy = (int)((me + place.entry % local_size) % local_size);
   push.nth = place.nth;
   tables.req_of(push.proxy, push.chunk, push.entry, push.next);
-  push.plain_tasks = ceil_div<kTaskRows>(push.entry.heavy - push.entry.start);
-}
-
-// A push task of this rank's heavy groups at the proxy (32 at most): their
-// sums into their partial slots, then the task's flag. Every lane of the
-// warp.
-template <typename RowT>
-__device__ __forceinline__ void push_groups_task_warp(const Sizes &sizes, int64_t seq,
-                                                      const BwdArgs &args, const OutTables &tables,
-                                                      const ProxyPush &push, int lane) {
-  const int me = sizes.topo.local_rank;
-  const OutTimeline timeline{args.trace, sizes.topo.local_size};
-  const int proxy = push.proxy;
-  const int64_t nth = push.nth, plain_tasks = push.plain_tasks;
-  const ReqEntry &entry = push.entry, &next = push.next;
-  const int64_t group_lo = entry.groups + nth * kTaskRows;
-  if (group_lo >= next.groups) return;
-  wait_free_warp(sizes, seq, tables, proxy, push.chunk, lane);
-  const unsigned long long start = timeline.on() ? now_ns() : 0;
-  const int64_t group_hi = min(group_lo + kTaskRows, (int64_t)next.groups);
-  push_groups_warp<RowT>(sizes, args, tables, proxy, group_lo, group_hi, lane);
-  push_flag_warp(seq, tables, proxy, entry.flags + plain_tasks + nth, lane);
-  if (timeline.on() && lane == 0) {
-    // an fp32 partial row per group
-    const unsigned long long bytes =
-        (unsigned long long)(group_hi - group_lo) * 4 * sizes.row_vecs() * Vec16<RowT>::kValues;
-    timeline.task(start, proxy != me ? bytes : 0, proxy != me ? 0 : bytes);
-  }
 }
 
 // A push task of this rank's rows at the proxy (32 positions of its push
@@ -575,12 +401,12 @@ __device__ __forceinline__ void push_rows_task_warp(const Sizes &sizes, int64_t 
   const int me = sizes.topo.local_rank, row_bytes = sizes.row_bytes;
   const OutTimeline timeline{args.trace, sizes.topo.local_size};
   const int proxy = push.proxy;
-  const int64_t nth = push.nth, plain_tasks = push.plain_tasks;
+  const int64_t nth = push.nth;
   const ReqEntry &entry = push.entry;
-  if (nth >= plain_tasks) return;
-  wait_free_warp(sizes, seq, tables, proxy, push.chunk, lane);
   const int64_t pos0 = entry.start + nth * kTaskRows;
-  const int num_rows = (int)min((int64_t)kTaskRows, entry.heavy - pos0);
+  const int num_rows = (int)min((int64_t)kTaskRows, push.next.start - pos0);
+  if (num_rows <= 0) return;
+  wait_free_warp(sizes, seq, tables, proxy, push.chunk, lane);
   int64_t dedup_row = 0;
   char *dst = nullptr;
   if (lane < num_rows) {
@@ -636,15 +462,16 @@ namespace bwd {
 // The proxy's reducers (across nodes; the last CTAs of the kernel). A task
 // is 32 node-unique keys of one chunk of its stream. The tasks go chunk after
 // chunk (reduce_task_starts), the order the requesters push them in. The
-// task's keys' reducer lists are consecutive. The warp waits for the push
-// task of each entry (the lanes over the entries, 32 apart; flags tagged with
-// the backward's out_seq). Then it sums, for each key of several entries,
-// their rows in fp32 in list order (a key's occurrences by requester and
-// position; a heavy key's requesters' partials in requester order) and rounds
-// the sum once into the key's row. Then it counts the task's keys ready in
-// the chunk's counter, where the issuer looks. A key of one row is not
-// touched: the NIC reads it where its requester's NVLink stores left it
-// (released by the task flag, acquired here, released again by the counter).
+// task's keys' rows are consecutive in the reducer list, a flag each, that of
+// the push task that fills the row. The warp waits for those push tasks (the
+// lanes over the list, 32 apart; flags tagged with the backward's out_seq).
+// Then it sums, for each key of several rows, its rows in fp32 in order (its
+// key row, then its duplicates' slots: its occurrences by requester and
+// position) and rounds the sum once into the key's row. Then it counts the
+// task's keys ready in the chunk's counter, where the issuer looks. A key of
+// one row is not touched: the NIC reads it where its requester's NVLink
+// stores left it (released by the task flag, acquired here, released again
+// by the counter).
 template <typename RowT>
 struct ProxyReducer {
   // Every thread of a reducer CTA, in backward seq: the CTA's warps take the
@@ -670,47 +497,40 @@ __device__ void ProxyReducer<RowT>::run(ncclWindow_t window, const Sizes &sizes,
     const int64_t uniq_lo = chunk.key_lo + place.nth * kTaskRows;
     const int num_keys = (int)min((int64_t)kTaskRows, (int64_t)chunk.key_lo + chunk.keys - uniq_lo);
     if (num_keys <= 0) continue;
-    // The lane's key (a lane per key): its reducer list [begin, end) (heavy:
-    // the first entry is the heavy key's own row) and its row in proxy_rows
-    // (where its chunk lies). Then the wait for the push task of each entry
-    // of the task's lists.
+    // The lane's key (a lane per key): its rows [begin, end) of the reducer
+    // list, its row in proxy_rows (where its chunk lies) and its duplicates'
+    // first slot (after the chunk's keys' rows and the duplicates of the
+    // chunk's keys before it). Then the wait for the push task of each row of
+    // the task's keys.
     const int64_t at = (int64_t)chunk.start % sizes.num_proxy_rows;
-    int64_t begin = 0, end = 0;
-    bool heavy = false;
-    char *row = nullptr;
+    int64_t begin = 0, end = 0, key_row = 0, duplicates = 0;
     if (lane < num_keys) {
-      begin = plan.reducer_start[uniq_lo + lane];
-      end = plan.reducer_start[uniq_lo + lane + 1];
-      heavy = plan.reducer_entries[begin].own_row();
-      row = layout.rows.proxy_row(at + uniq_lo + lane - chunk.key_lo);
+      const int64_t key = uniq_lo + lane, before = key - chunk.key_lo;
+      begin = plan.reducer_start[key];
+      end = plan.reducer_start[key + 1];
+      key_row = at + before;
+      duplicates = at + chunk.keys + begin - plan.reducer_start[chunk.key_lo] - before;
     }
-    const int64_t ent_end = __shfl_sync(kFull, end, num_keys - 1);
+    const int64_t list_end = __shfl_sync(kFull, end, num_keys - 1);
     Spin spin(sizes.timeout_ns);
-    for (int64_t i = __shfl_sync(kFull, begin, 0) + lane; i < ent_end; i += 32) {
-      const ReducerEntry entry = plan.reducer_entries[i];
-      if (!entry.pushed()) continue;  // kEntryNoPush, kEntryOwnRow: no push task
-      while ((int64_t)ld_acquire_sys(&flags[entry.flag]) < seq)
-        spin.pause("pushed gradient rows", entry.flag, uniq_lo, sizes.topo.rank);
+    for (int64_t i = __shfl_sync(kFull, begin, 0) + lane; i < list_end; i += 32) {
+      const int32_t flag = plan.reducer_flags[i];
+      while ((int64_t)ld_acquire_sys(&flags[flag]) < seq)
+        spin.pause("pushed gradient rows", flag, uniq_lo, sizes.topo.rank);
     }
     __syncwarp();
-    // The keys of several entries, each summed in fp32 in list order (a heavy
-    // key's own row gets the sum), and rounded once into the key's row.
-    for (unsigned many = __ballot_sync(kFull, lane < num_keys && (heavy || end - begin > 1)); many;
-         many &= many - 1) {
+    // The keys of several rows, each summed in fp32 in order and rounded once
+    // into the key's row.
+    for (unsigned many = __ballot_sync(kFull, end - begin > 1); many; many &= many - 1) {
       const int src_lane = __ffs(many) - 1;
-      const int64_t lane_begin = __shfl_sync(kFull, begin, src_lane),
-                    lane_end = __shfl_sync(kFull, end, src_lane);
-      const bool lane_heavy = __shfl_sync(kFull, heavy, src_lane);
-      char *dst = from_lane(row, src_lane);
+      const int64_t lane_row = __shfl_sync(kFull, key_row, src_lane),
+                    lane_duplicates = __shfl_sync(kFull, duplicates, src_lane),
+                    lane_count = __shfl_sync(kFull, end - begin, src_lane);
+      char *dst = layout.rows.proxy_row(lane_row);
       for (int col_base = 0; col_base < vec; col_base += 32) {
         const int col = col_base + lane;
         float acc[Vec16<RowT>::kValues];
-        if (lane_heavy)  // its own row (the first entry) gets the sum
-          sum_entries<RowT, true>(layout.rows, plan.reducer_entries, lane_begin + 1, lane_end, col,
-                                  col < vec, lane, acc);
-        else
-          sum_entries<RowT, false>(layout.rows, plan.reducer_entries, lane_begin, lane_end, col,
-                                   col < vec, lane, acc);
+        sum_key_rows<RowT>(layout.rows, lane_row, lane_duplicates, lane_count, col, col < vec, acc);
         if (col < vec) *((int4 *)dst + col) = Vec16<RowT>::pack(acc);
       }
     }
@@ -977,9 +797,9 @@ __device__ void LandingWatcher::rest(ncclWindow_t window, const ncclDevComm &dev
 // The backward of the output dist (bwd_kernel): every requester pushes the
 // gradient of its rows back where each one came from. Every row of an
 // owner's gradient (lookup_grad, over its lookup_rows) is written exactly
-// once, so nothing is zeroed and nothing scattered. A row's gradient is,
-// under index dedup, first summed over its original rows (fan-in), in fp32
-// and in the fan-out's order, which is fixed (increasing original row); under
+// once, so nothing is zeroed and nothing scattered. A row's gradient is
+// first summed over its original rows (index dedup's fan-in), in fp32 and in
+// the fan-out's order, which is fixed (increasing original row); under
 // TorchRec's gradient division it is then multiplied by 1 / world_size in
 // fp32 and rounded once to the row dtype, which is what TorchRec's
 // div_(world_size) at the owner computes.
@@ -987,11 +807,9 @@ __device__ void LandingWatcher::rest(ncclWindow_t window, const ncclDevComm &dev
 //   remote owner (across nodes): into the proxy's proxy_rows in the proxy's
 //     push order, at the row's slot (its key's row, a duplicate's slot), each
 //     32-row push task then setting its flag in the proxy's push_flags,
-//     tagged with the out_seq; the occurrences of a heavy key (more than
-//     heavy_at on the node) go as one fp32 sum per requester (heavy group)
-//     into its partial slot, 32 groups per flag.
+//     tagged with the out_seq.
 // The proxy's reducer CTAs (across nodes, the last ones) wait for the flags
-// of each key's reducer-list entries, sum the keys of several in fp32 in list
+// of each key's rows in the reducer list, sum the keys of several in fp32 in
 // order and round once into the key's row, and count each chunk's keys
 // ready; its issuer lanes (the last warp of CTA 0) put each chunk, once
 // ready, into the owner's lookup_rows. Only the keys of several rows are
@@ -1092,14 +910,10 @@ __global__ void __launch_bounds__(kThreads, 1)
     const OutTables tables(window, sizes, args.plan);
     // free_seen starts at 0; the entry barrier's sync publishes it
     for (int proxy = tid; proxy < local_size; proxy += workers) *tables.free_seen(proxy) = 0;
-    int64_t groups = 0;  // this rank's heavy groups, at all its proxies
-    if (num_nodes > 1) groups = plan.push_entry(local_size - 1, plan.max_chunks)->groups;
     if (blockIdx.x == 0) {
       // Counters this kernel counts from 0, before this rank publishes its
       // out_seq: everything that counts on them runs after the entry.
-      const int64_t slots = fanout.exp_off != nullptr ? fanout.count[0] : 0;
-      for (int64_t i = tid; i < slots; i += workers) args.heavy_done[i] = 0;
-      for (int64_t i = tid; i < groups; i += workers) args.group_done[i] = 0;
+      for (int64_t i = tid; i < fanout.count[0]; i += workers) args.heavy_done[i] = 0;
       if (num_nodes > 1)
         for (int64_t i = tid; i < *plan.num_chunks; i += workers) args.ready[i] = 0;
       cta_sync(workers);
@@ -1109,12 +923,9 @@ __global__ void __launch_bounds__(kThreads, 1)
     // Every heavy row's sub-task has a slot before the remote tasks (across
     // nodes), which those of rows to other nodes take, and one among the row
     // tasks, which those of the node's rows take.
-    const int64_t heavy_subs = fanout.exp_off != nullptr ? fanout.count[1] : 0,
-                  early_subs = num_nodes > 1 ? heavy_subs : 0;
-    const int64_t subs = early_subs + plan.group_subs,
-                  remote =
-                      subs +
-                      (num_nodes > 1 ? plan.bwd_task_starts[2 * plan.max_chunks * local_size] : 0);
+    const int64_t heavy_subs = fanout.count[1], early_subs = num_nodes > 1 ? heavy_subs : 0;
+    const int64_t remote =
+        early_subs + (num_nodes > 1 ? plan.task_starts[plan.max_chunks * local_size] : 0);
     const LocalRows local_rows{node_offset_per_bucket, local_size, me};
     const int64_t rows = local_rows.count(), total = remote + rows + heavy_subs;
     const TaskQueue queue{tables.layout().ctrl.task(kQueueWork)};
@@ -1123,17 +934,10 @@ __global__ void __launch_bounds__(kThreads, 1)
         bwd::heavy_sub_warp<RowT, true>(sizes, args, tables, task, lane);
         continue;
       }
-      if (task < subs) {
-        bwd::group_sub_warp<RowT>(sizes, args, task - early_subs, lane);
-        continue;
-      }
       if (task < remote) {
         bwd::ProxyPush push;
-        bwd::remote_push(sizes, plan, tables, task - subs, push);
-        if (push.is_group_task)
-          bwd::push_groups_task_warp<RowT>(sizes, seq, args, tables, push, lane);
-        else
-          bwd::push_rows_task_warp<RowT>(sizes, seq, args, tables, push, lane);
+        bwd::remote_push(sizes, plan, tables, task - early_subs, push);
+        bwd::push_rows_task_warp<RowT>(sizes, seq, args, tables, push, lane);
         continue;
       }
       int64_t index;

@@ -2372,13 +2372,14 @@ def parse_args(argv: List[str]) -> BenchConfig:
     parser.add_argument(
         "--use_index_dedup",
         action="store_true",
-        help="TorchRec's index dedup",
+        help="TorchRec's index dedup (the hierarchical dist takes no other keys)",
     )
     parser.add_argument(
         "--output_dist",
         choices=["torchrec", "fused", "auto"],
         default=defaults.output_dist,
-        help="TorchRec's dists, or the hierarchical dist (fused, or auto)",
+        help="TorchRec's dists, or the hierarchical dist (fused, or auto; with"
+        " --use_index_dedup)",
     )
     parser.add_argument(
         "--pipeline",
@@ -2444,6 +2445,11 @@ def parse_args(argv: List[str]) -> BenchConfig:
         parser.error("--warmup must be at least 1")
     if cfg.capacity != "measure" and not cfg.capacity.isdigit():
         parser.error("--capacity is an int or measure")
+    if (cfg.output_dist != "torchrec" or cfg.check) and not cfg.use_index_dedup:
+        parser.error(
+            "the hierarchical dist (--output_dist fused or auto, --check) takes"
+            " index-deduplicated keys: add --use_index_dedup"
+        )
     return cfg
 
 

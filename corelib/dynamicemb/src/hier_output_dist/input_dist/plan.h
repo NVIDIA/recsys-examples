@@ -26,13 +26,12 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 // a row at src[row], the backward writes its gradient at dst[row]: for an owner
 // of its node both are its row of the owner's lookup_rows; for an owner on
 // another node, rows of the proxy's proxy_rows (the node-unique key's row, and
-// the row's own slot). inv[row] is its row of the requester's output, or under
-// index dedup its deduplicated row, whose original rows the fan-out lists.
-// Across nodes the requester's push order, heavy groups and its tables of the
-// node's proxies, the owner's and the proxy's tables, and the put lists say the
-// rest (planner.h makes them); the tables' strides are max_chunks and
-// num_nodes. On one node the tables across nodes are undefined, nullptr in the
-// views.
+// the row's own slot). inv[row] is its deduplicated row (index dedup), whose
+// original rows, the requester's output rows, the fan-out lists. Across nodes
+// the requester's push order and its tables of the node's proxies, the owner's
+// and the proxy's tables, and the put lists say the rest (planner.h makes
+// them); the tables' strides are max_chunks and num_nodes. On one node the
+// tables across nodes are undefined, nullptr in the views.
 #pragma once
 
 #include <ATen/ATen.h>
@@ -52,14 +51,18 @@ namespace hier_output_dist {
 struct PlanView {
   const int64_t *offset_per_bucket;  // [world_size + 1]
   const int32_t *inv;                // [rows]
-  Fanout fanout;                     // fanout.exp_off: index dedup
+  Fanout fanout;
   // across nodes, the requester's
   const int32_t *push_order;    // [rows] its remote rows by proxy and push order
   const int64_t *proxy_chunks;  // [local_size] the chunks of each same-node proxy's stream
   const int64_t *proxy_ends;    // [local_size][max_chunks + 1] each one's chunk ends, then its
                                 // stream's end
   const ReqEntry *push_tables;  // [local_size][max_chunks + 1] its push order at each proxy,
-                                // positions absolute in push_order, groups in heavy_groups
+                                // positions absolute in push_order
+  const int64_t *task_starts;   // [max_chunks * local_size + 1] its tasks of rows of other nodes
+                                // before each (chunk, proxy in turn from its own): 32 positions
+                                // of its push order there each, the forward's pulls and the
+                                // backward's pushes
   // across nodes, the proxy's
   const int64_t *num_chunks;  // the chunks of its stream
   const Chunk *chunks;        // [max_chunks] its chunks, in stream order
@@ -105,11 +108,8 @@ struct PlanView {
 struct FwdPlanView : PlanView {
   const int32_t *src;  // [rows]
   // across nodes, the requester's
-  const int64_t *push_order_off;   // [local_size + 1] where its rows for each proxy start in
-                                   // push_order
-  const int64_t *fwd_task_starts;  // [max_chunks * local_size + 1] its tasks of rows of other nodes
-                                   // before each (chunk, proxy in turn from its own): 32 positions
-                                   // of its push order there each
+  const int64_t *push_order_off;  // [local_size + 1] where its rows for each proxy start in
+                                  // push_order
   // across nodes, the owner's
   const ChunkPiece *fwd_chunks;  // [owner_chunks] the chunks of its node in each source node's
                                  // stream, its forward put list's (PutSeg::chunk)
@@ -128,23 +128,15 @@ struct FwdPlanView : PlanView {
 // What bwd_kernel reads of a call.
 struct BwdPlanView : PlanView {
   const int32_t *dst;  // [rows]
-  // across nodes, the requester's
-  const HeavyGroup *heavy_groups;  // heavy groups, positions in push_order
-  const int32_t *group_first_sub;  // each heavy group's first sub-task
-  const int32_t *group_of_sub;     // the heavy group of each sub-task
-  const int64_t *bwd_task_starts;  // [2 * max_chunks * local_size + 1] its tasks the way
-                                   // fwd_task_starts are, each chunk's of heavy groups of every
-                                   // proxy, then of its rows
   // across nodes, the owner's
   const int64_t *uniq_in;  // [num_nodes] node-unique keys from each source node
   // across nodes, the proxy's
   const int64_t *reduce_task_starts;  // [max_chunks + 1] its reducers' tasks before each chunk
                                       // (32 keys each)
-  const int32_t *reducer_start;       // the reducer list (planner.h)
-  const ReducerEntry *reducer_entries;
+  const int64_t *reducer_start;       // the reducer list (planner.h)
+  const int32_t *reducer_flags;
   // the plan's counts (BwdPlan)
-  int64_t heavy_subs;  // index dedup: sub-tasks of the requester's heavy rows
-  int64_t group_subs;  // across nodes: sub-tasks of its heavy groups
+  int64_t heavy_subs;  // sub-tasks of the requester's heavy rows
 
   // The proxy's backward put list's segments for an owner node.
   __device__ __forceinline__ int64_t bwd_puts(int owner_node) const {
@@ -163,39 +155,34 @@ struct FwdPlan {
   at::Tensor offset_per_bucket;  // int64 [world_size + 1]
   at::Tensor src;                // int32 [rows]
   at::Tensor inv;                // int32 [rows]
-  FanoutTables fanout;           // index dedup's, or none
+  FanoutTables fanout;
   // across nodes, the tables both kernels read
-  at::Tensor push_order, proxy_chunks, proxy_ends, push_tables, num_chunks, chunks, uniq_off,
-      put_list, put_starts;
+  at::Tensor push_order, proxy_chunks, proxy_ends, push_tables, task_starts, num_chunks, chunks,
+      uniq_off, put_list, put_starts;
   // across nodes, the forward's own
-  at::Tensor push_order_off, fwd_task_starts, fwd_chunks, node_chunk_start, node_chunks, uniq_out;
+  at::Tensor push_order_off, fwd_chunks, node_chunk_start, node_chunks, uniq_out;
 
-  // Rows of the requester's output: its input's rows (under index dedup the
-  // original ones).
-  int64_t num_out() const {
-    return fanout.exp_idx.defined() ? fanout.exp_idx.numel() : inv.numel();
-  }
+  // Rows of the requester's output: its input's rows, the original ones.
+  int64_t num_out() const { return fanout.exp_idx.numel(); }
   FwdPlanView view(const Sizes &sizes) const;
   std::vector<at::Tensor> tensors() const;
   static FwdPlan of(const std::vector<c10::optional<at::Tensor>> &tensors);
 };
 
 // The backward's plan, and its counts, which the call's status gives
-// (StatusSlots): of() takes them as [num_recv, heavy_subs, group_subs].
+// (StatusSlots): of() takes them as [num_recv, heavy_subs].
 struct BwdPlan {
   int64_t num_recv = 0;          // rows of the owner's lookup output (and of its lookup_grad)
-  int64_t heavy_subs = 0;        // index dedup: sub-tasks of the requester's heavy rows
-  int64_t group_subs = 0;        // across nodes: sub-tasks of its heavy groups
+  int64_t heavy_subs = 0;        // sub-tasks of the requester's heavy rows
   at::Tensor offset_per_bucket;  // int64 [world_size + 1]
   at::Tensor dst;                // int32 [rows]
   at::Tensor inv;                // int32 [rows]
-  FanoutTables fanout;           // index dedup's, or none
+  FanoutTables fanout;
   // across nodes, the tables both kernels read
-  at::Tensor push_order, proxy_chunks, proxy_ends, push_tables, num_chunks, chunks, uniq_off,
-      put_list, put_starts;
+  at::Tensor push_order, proxy_chunks, proxy_ends, push_tables, task_starts, num_chunks, chunks,
+      uniq_off, put_list, put_starts;
   // across nodes, the backward's own
-  at::Tensor heavy_groups, group_first_sub, group_of_sub, bwd_task_starts, uniq_in,
-      reduce_task_starts, reducer_start, reducer_entries;
+  at::Tensor uniq_in, reduce_task_starts, reducer_start, reducer_flags;
 
   BwdPlanView view(const Sizes &sizes) const;
   std::vector<at::Tensor> tensors() const;

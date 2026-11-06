@@ -148,8 +148,9 @@ this dist with TorchRec's dists.
 * **Dedup** (deduplication): removing repeated keys. **Index dedup**:
   TorchRec's `use_index_dedup`. Each rank removes its own repeated keys
   before the input dist, and the rows are copied back to every original
-  position after the output dist. **Node dedup**: the proxy removes the
-  repeated keys of its whole node (section 9).
+  position after the output dist. The op takes index-deduplicated keys
+  only (section 6). **Node dedup**: the proxy removes the repeated keys of
+  its whole node (section 9).
 * **Skewed keys**: keys drawn so that a few of them are very common (a *hot*
   key appears in many samples).
 * **Fall back**: take TorchRec's dists instead, for a whole sharding
@@ -176,6 +177,7 @@ NIC's load grow with the number of GPUs.
 
 ```python
 from dynamicemb import DynamicEmbTableOptions
+from dynamicemb.shard import DynamicEmbeddingCollectionSharder
 
 DynamicEmbTableOptions(
     ...,
@@ -183,9 +185,13 @@ DynamicEmbTableOptions(
     output_dist_capacity=capacities,  # an int, or a dict by name (section 5)
     node_dedup=True,                  # across nodes: one key per (owner node, table, key)
 )
+DynamicEmbeddingCollectionSharder(..., use_index_dedup=True)  # the op takes no other keys
 ```
 
-It serves `ROW_WISE` sequence shardings (`EmbeddingCollection`). Pooled
+It serves `ROW_WISE` sequence shardings (`EmbeddingCollection`) under index
+dedup: without `use_index_dedup=True` on the sharder, `"fused"` raises
+`ValueError` at the first `input_dist()` and `"auto"` takes TorchRec's
+dists (section 6). Pooled
 shardings (`EmbeddingBagCollection`) ignore `output_dist`. All DynamicEmb
 tables of one sharding must agree on `output_dist`, `output_dist_capacity`
 and `node_dedup`, whatever their `output_dist`; otherwise building the
@@ -217,6 +223,9 @@ every rank before you drop a model (section 4.6).
   (the planner numbers them with int32).
 * Rows (embedding dim × bytes of the output dtype) a multiple of 16 bytes,
   in fp32, bf16 or fp16.
+* Index dedup: the sharder's `use_index_dedup=True`. Each rank then sends
+  each (table, key) of a call once, so a key has at most `local_size`
+  occurrences at its proxy (section 9).
 * Capacities (`output_dist_capacity`) that fit the calls (section 5).
 * Every rank makes the same calls in the same order, as with NCCL
   collectives (operations that all ranks run together).
@@ -237,9 +246,9 @@ every rank before you drop a model (section 4.6).
 
 | option | default | meaning |
 |---|---|---|
-| `output_dist` | `"torchrec"` | `"torchrec"`: TorchRec's dists. `"fused"`: the hierarchical dist. It needs `output_dist_capacity` (without it, making the options raises `ValueError`), and a build without NCCL ≥ 2.30.7 raises `ImportError` when the model is sharded. `"auto"`: `"fused"` where the build has it and `output_dist_capacity` is set, else TorchRec's dists, with a warning. Any other value raises `ValueError`. |
+| `output_dist` | `"torchrec"` | `"torchrec"`: TorchRec's dists. `"fused"`: the hierarchical dist. It needs `output_dist_capacity` (without it, making the options raises `ValueError`) and index dedup (without it, the first `input_dist()` raises `ValueError`), and a build without NCCL ≥ 2.30.7 raises `ImportError` when the model is sharded. `"auto"`: `"fused"` where the build has it, `output_dist_capacity` is set and the keys are index-deduplicated, else TorchRec's dists, with a warning. Any other value raises `ValueError`. |
 | `output_dist_capacity` | `None` | The capacities of the op's buffers, in keys (section 5). An int sets `lookup_keys` and `remote_keys` to that many. A dict sets them by name: `lookup_keys`, and across nodes also `remote_keys` (one node uses `lookup_keys` alone). Each capacity is a positive int below 2^31 − 1024; other values or names raise `ValueError` when the options are made. A call that needs more of one raises `RuntimeError` at its second wait, on every rank (section 5.4). TorchRec's dists ignore it. |
-| `node_dedup` | `True` | Across nodes, the proxy sends one key per (owner node, table, key), and the node adds up its gradient rows before they cross back. `False` sends every occurrence (more IB traffic) and keeps TorchRec's gradient row per occurrence (section 18). Gradient clipping turns it off by itself. |
+| `node_dedup` | `True` | Across nodes, the proxy sends one key per (owner node, table, key), and the node adds up its gradient rows before they cross back. `False` sends each GPU's occurrence on its own (more IB traffic) and keeps TorchRec's gradient rows (section 18). Gradient clipping turns it off by itself. |
 
 ### 4.4 Environment variables
 
@@ -324,8 +333,8 @@ Each capacity counts keys. On one node only `lookup_keys` is used.
 
 The words used in this section and in section 15:
 
-* `num_keys`: the number of keys a rank sends in one call (after index dedup
-  when it is on);
+* `num_keys`: the number of keys a rank sends in one call (after index
+  dedup);
 * `uniq_share`: the number of node-unique keys per occurrence at a proxy.
   It is about 0.935 with the benchmark's uniform keys and 0.27 with its
   power-law keys, and 1 when no two GPUs of a node share keys.
@@ -340,13 +349,11 @@ Two more sizes follow from these (section 15.3): `proxy_rows` holds
 chunks that `remote_keys` rows make (`max_chunks`). A call whose rows do not
 fit `proxy_rows` takes it again as its rows stream through (section 12.1).
 
-Say a hot key makes up a share `hot_share` of every rank's keys. It adds
-about `local_size × hot_share × num_keys` occurrences on its owner's rail:
-to its owner's `lookup_keys` (its own node's occurrences), and to
-`remote_keys` at its proxy on every other node. After node dedup each other
-node adds one key to its owner's `lookup_keys`. That holds whatever the
-number of nodes. TorchRec's hot owner receives about
-`(1 + (world_size − 1) × hot_share) × num_keys` rows.
+However hot a key is, index dedup sends it at most once per rank and
+table: it adds at most `local_size` keys to its owner's `lookup_keys` from
+its own node, and at most `local_size` occurrences to `remote_keys` at its
+proxy on every other node, which after node dedup add one key each to its
+owner's `lookup_keys`. That holds whatever the number of nodes.
 
 ### 5.2 How to choose them
 
@@ -355,7 +362,7 @@ headroom. Two helpers in `benchmark/benchmark_utils.py` do this (it is not
 part of the installed package: put `benchmark/` on `sys.path`, as the tests
 do):
 
-* `hier_needs(batches, tables, owner_of, local_world_size, index_dedup=False,
+* `hier_needs(batches, tables, owner_of, local_world_size, index_dedup=True,
   node_dedup=True, group=None)` counts what the op needs of each capacity
   for some calls, as the op counts it: the most any rank needs in any call.
   It is collective: every rank of the sharding's process group calls it with
@@ -379,7 +386,6 @@ needs = hier_needs(
     # 32-bit rule (section 10.1)
     lambda keys, feature: owning_shard(keys, world_size, "roundrobin"),
     local_world_size,
-    index_dedup=use_index_dedup,
 )
 capacities = hier_capacities(needs, headroom=1.25)
 ```
@@ -407,7 +413,7 @@ formula.
 | capacity | in the window | elsewhere |
 |---|---|---|
 | `lookup_keys` | `row_bytes` (`lookup_rows`) + 8 (`node_keys`; 12 when the keys carry weights) + across nodes `record_bytes` (`rail_keys`) | per call, 8 (12 with weights) for the owner's KJT |
-| `remote_keys` | 8 (`node_keys`; 12 with weights) + 4 (`bucket_feature_of_occ`) + 12 (`remote_map`) + `record_bytes` (`key_stage`), and `row_bytes` in `proxy_rows`, up to its cap | per call, 12 (the proxy's reducer list) and about 2 (the requesters' heavy groups) |
+| `remote_keys` | 8 (`node_keys`; 12 with weights) + 4 (`bucket_feature_of_occ`) + 12 (`remote_map`) + `record_bytes` (`key_stage`), and `row_bytes` in `proxy_rows`, up to its cap | per call, 12 (the proxy's reducer list) |
 
 The input dist's working memory comes on top, in the caching allocator's
 pool of the stream it runs on: that of its largest step (section 15.2).
@@ -439,6 +445,14 @@ some capacity than the op has:
   `lookup_keys` need leaves out the keys that node sends to other nodes. A
   later call may then name `lookup_keys` too.
 
+A call whose keys are not index-deduplicated, so that a proxy gets one key
+more than `local_size` times, also raises at its second wait, on every rank
+alike: `output_dist="fused": a proxy got one key 9 times from the 8 GPUs of
+its node; the keys must be index-deduplicated, each table's at most once per
+GPU`. Its status carries that need too (`key_rows`, against `local_size`).
+The proxy gives such a key `local_size` rows (section 9), so the input dist
+stays in bounds, and the call makes no lookup and no output dist.
+
 ## 6. When a sharding takes TorchRec's dists
 
 A sharding that cannot take the hierarchical dist uses TorchRec's
@@ -457,10 +471,11 @@ state that every rank shares.
 | one rank in the sharding; a table of the sharding that is not a DynamicEmb table; feature processors | when sharding | a warning, TorchRec's dists |
 | ranks that would build the op from different options, capacities or environment values | first `input_dist()`, before the op is built | `ValueError` on every rank, naming the first rank and value that differ |
 | ranks that are not whole nodes; `world_size × num_features` of 2^31 − 1024 or more; rows not a multiple of 16 bytes | first `input_dist()` | a warning, TorchRec's dists |
-| a configuration the op cannot take: across nodes, capacities without `remote_keys`; a proxy cap below the least rows of its ring (section 15.3); a `remote_keys` whose stream could pass position 2^32, whose push-task flags would pass int32 numbers, or whose push key would pass 63 bits (sections 10.4, 12.1); rows that are not fp32, bf16 or fp16; an environment value it refuses (section 4.4) | first `input_dist()`, before the op is built | `"fused"`: `ValueError` on every rank; `"auto"`: a warning, TorchRec's dists |
+| keys that are not index-deduplicated (a sharder without `use_index_dedup=True`) | first `input_dist()`, before the op is built | `"fused"`: `ValueError` on every rank; `"auto"`: a warning, TorchRec's dists |
+| a configuration the op cannot take: across nodes, capacities without `remote_keys`; a proxy cap below the least rows of its ring (section 15.3); a `remote_keys` whose stream could pass position 2^32, or whose push-task flags would pass int32 numbers (section 12.1); rows that are not fp32, bf16 or fp16; an environment value it refuses (section 4.4) | first `input_dist()`, before the op is built | `"fused"`: `ValueError` on every rank; `"auto"`: a warning, TorchRec's dists |
 | On some rank: the NCCL LSA team is not the whole node. Or, across nodes, GIN does not connect the rails, has fewer than 4 contexts, or its signals do not start at 0. Or the window cannot be allocated. | first `input_dist()`, collectively | a warning that names each rank and why, TorchRec's dists on every rank |
 | an eval forward | per call | TorchRec's dists for that call |
-| a call that does not fit the capacities | per call, at its second wait | `RuntimeError` on every rank, naming the capacity to raise (section 5.4) |
+| a call that does not fit the capacities, or a proxy that gets one key more than `local_size` times | per call, at its second wait | `RuntimeError` on every rank, naming the capacity to raise or the key's occurrences (section 5.4) |
 
 ## 7. The operator
 
@@ -487,9 +502,9 @@ class HierOutputDist {  // one per sharding
   HierOutputDist(const std::string &unique_id, int64_t rank, int64_t world_size,
                  int64_t local_size, const std::vector<int64_t> &feature_tables,
                  const at::Tensor &block_sizes, const at::Tensor &dist_types, int64_t dim,
-                 at::ScalarType dtype, bool weights, bool out_weights, bool node_dedup,
-                 int64_t lookup_keys, int64_t remote_keys, int64_t proxy_bytes,
-                 double timeout_s, int64_t ctas, int64_t reduce_ctas);
+                 at::ScalarType dtype, bool weights, bool node_dedup, int64_t lookup_keys,
+                 int64_t remote_keys, int64_t proxy_bytes, double timeout_s, int64_t ctas,
+                 int64_t reduce_ctas);
   ~HierOutputDist();  // local (section 4.6)
 
   // The whole input dist of a call, with no host sync: (values, weights,
@@ -497,9 +512,7 @@ class HierOutputDist {  // one per sharding
   InDistTensors input_dist(const at::Tensor &values, const c10::optional<at::Tensor> &offsets,
                            const c10::optional<at::Tensor> &lengths, int64_t batch_size,
                            const c10::optional<at::Tensor> &weights,
-                           const c10::optional<at::Tensor> &input_offsets,
-                           int64_t input_batch_size,
-                           const c10::optional<at::Tensor> &reverse_indices);
+                           const at::Tensor &input_offsets, const at::Tensor &reverse_indices);
   // The output dist: one kernel each.
   at::Tensor output_dist_fwd(const std::vector<c10::optional<at::Tensor>> &fwd_plan,
                              const at::Tensor &lookup_out);
@@ -516,10 +529,11 @@ class HierOutputDist {  // one per sharding
 The constructor takes the configuration (`Config`'s fields): the ranks, the
 table and the bucketize's rule of each feature, the rows and their weights,
 `node_dedup`, the capacities (with the proxy cap in bytes) and the knobs of
-section 4.4. `input_dist()` takes the requester's KJT (its values; offsets,
-or lengths when it has none; its batch size; its weights or none), the
-input KJT that `construct_jagged_tensors` reads when it is another one, and
-index dedup's reverse indices. It returns:
+section 4.4. `input_dist()` takes the requester's KJT, index-deduplicated
+(its values; offsets, or lengths when it has none; its batch size; its
+weights or none), the offsets of the input KJT before index dedup, which
+`construct_jagged_tensors` reads, and index dedup's reverse indices. It
+returns:
 
 * the owner's KJT: its values and weights (or none) hold `lookup_keys`
   entries, the first `num_recv` its own; its lengths and offsets have an
@@ -527,8 +541,8 @@ index dedup's reverse indices. It returns:
   stride is `num_sources`);
 * `lookup_rows`, `[lookup_keys, dim]`, a view of the window: the call's
   lookup writes its first `num_recv` rows;
-* the call's status, `int64 [2 × num_features + 7]` on the device (section
-  10.5): the needs, `num_recv`, the backward's counts, the remote
+* the call's status, `int64 [2 × num_features + 6]` on the device (section
+  10.5): the needs, `num_recv`, the backward's count, the remote
   occurrences this rank deduplicated as proxy, and the totals per feature;
 * the output dist's plans, as lists of their tensors (`None` for those the
   call has not).
@@ -538,16 +552,15 @@ One training step in Python, as the sharding runs it (section 7.4):
 ```python
 values, weights, lengths, offsets, rows, status, fwd_plan, bwd_plan = op.input_dist(
     values, offsets, lengths, batch_size, weights,
-    input_offsets, input_batch_size, reverse_indices)  # input_dist()
+    input_offsets, reverse_indices)  # input_dist()
 words = status.cpu().tolist()  # the second wait, the call's one host sync
 # a need above its capacity: raise RuntimeError (section 5.4)
-num_recv, heavy_subs, group_subs = words[3:6]
+num_recv, heavy_subs = words[3:5]
 kjt = owner_kjt(values[:num_recv], lengths, offsets, words)  # the lookup's input
 ...                            # the lookup writes its rows into rows[:num_recv]
 out = op.output_dist_fwd(fwd_plan, rows[:num_recv])
 ...                            # the dense forward and backward
-lookup_grad = op.output_dist_bwd(bwd_plan, [num_recv, heavy_subs, group_subs],
-                                 grad_out, divide)
+lookup_grad = op.output_dist_bwd(bwd_plan, [num_recv, heavy_subs], grad_out, divide)
 ```
 
 The forward's plan (`FwdPlan`) and the backward's (`BwdPlan`) hold only what
@@ -584,9 +597,9 @@ same point on every rank:
    names that rank and the first value that differs. Else every rank has
    the same configuration, so every rank decides alike. If the op does not
    apply (`hier_output_dist_unsupported()`, section 6), every rank warns and
-   takes TorchRec's dists. If the op refuses the configuration, `"fused"`
-   raises `ValueError` on every rank and `"auto"` warns and takes TorchRec's
-   dists.
+   takes TorchRec's dists. If the op refuses the configuration, or the keys
+   are not index-deduplicated, `"fused"` raises `ValueError` on every rank
+   and `"auto"` warns and takes TorchRec's dists.
 2. Else every rank builds the op with that id. The constructor checks the
    configuration again (it throws before any collective if it refuses it),
    then makes the communicator and its device communicator: LSA inside the
@@ -661,7 +674,7 @@ the planner's kernels, with CUB's sorts and scans.
 | `rail_key_exchange` | comm | its key records to its rail owners and its `source_offsets` to its rail proxies, and theirs | 10.2 |
 | `node_status_exchange` | comm | the needs and `requester_offsets` of the node; the call's needs | 10.2 |
 | `peer_gather`, twice | comm (and a kernel) | the node's proxy headers, then the requester's gather list and its rows' `remote_map` words | 10.2, 10.4 |
-| requester tables | kernels, CUB | its maps, push order, heavy groups and task starts | 10.4 |
+| requester tables | kernels, CUB | its maps, push order, push tables and task starts | 10.4 |
 | owner tables | kernels | its KJT's keys, and the chunks its forward put list sends | 10.4 |
 | put lists | kernels, CUB | the owner's forward and the proxy's backward put lists | 10.4 |
 | status | kernel | the call's status, which the second wait copies to the host | 10.5 |
@@ -702,11 +715,14 @@ goes once its kernel is queued, and autograd keeps the backward's
   carries what the output dist takes (`hier_result`, a `HierCall`: the
   plans and the backward's counts). Its `record_stream`, which TorchRec's
   pipelines call, also records the plans' tensors.
-* **Index dedup.** For a call that takes the op, the output dist itself
-  writes each deduplicated row to all its original positions, and sums
-  their gradients. So the sharding skips TorchRec's own expansion for that
-  call (it clears the context's reverse indices when the call starts). A
-  call on TorchRec's dists (an eval forward) keeps it.
+* **Index dedup.** The op takes index-deduplicated keys only: a sharding
+  whose sharder has no `use_index_dedup=True` takes TorchRec's dists under
+  `"auto"`, and raises `ValueError` under `"fused"`, at its first input
+  dist. For a call that takes the op, the output dist itself writes each
+  deduplicated row to all its original positions, and sums their
+  gradients. So the sharding skips TorchRec's own expansion for that call
+  (it clears the context's reverse indices when the call starts). A call on
+  TorchRec's dists (an eval forward) keeps it.
 * **The lookup.** For the owner's KJT of a call on the op, the sharding
   takes the call's rows, the first `num_recv` rows of the `lookup_rows`
   that `op.input_dist()` gave, and each DynamicEmb lookup group writes its
@@ -767,9 +783,8 @@ nodes has:
   remote part, owner node × `num_features` + feature, which the push writes
   beside its key;
 * `remote_map` (`RemoteMap`): three int32 arrays with an entry for each
-  such occurrence: its key's row in `proxy_rows` (with a bit for a heavy
-  key), its own slot in `proxy_rows`, and its place in its requester's push
-  order;
+  such occurrence: its key's row in `proxy_rows`, its own slot in
+  `proxy_rows`, and its place in its requester's push order;
 * `proxy_header` (`ProxyHeader`): the proxy's header for its node's
   requesters, in int32 words: the chunks of its stream and the stream's
   end, each chunk's end (section 12.1), and each requester's push tables;
@@ -891,27 +906,19 @@ numbers them with stable radix sorts (section 10.4):
 * **Numbering.** The node-unique keys are numbered (`uniq`) per owner node,
   feature by feature (the representative's), and in key order (signed
   `int64`) inside each (owner node, feature).
-* **Rows.** In `proxy_rows` a key of at most `heavy_at` occurrences takes
-  one row per occurrence. Its first occurrence holds the key's row: the
-  owner's put fills it in the forward, and in the backward that
-  occurrence's gradient row and then the key's sum go there. Each other
-  occurrence holds a duplicate's slot for its gradient row.
-* **Heavy keys.** A key with more than `heavy_at` occurrences on the node
-  is *heavy*: `heavy_at` is 64, or `local_size × partial_rows` when that is
-  more (section 15.3), so a heavy key never takes more rows than it has
-  occurrences. In `proxy_rows` it takes one row, plus one fp32 partial row
-  per requester (each partial takes `partial_rows = ceil(4 × dim /
-  row_bytes)` rows of `proxy_rows`). In the backward each requester first adds up, in fp32, the
-  gradients of its own occurrences of the key (its *heavy group*). It pushes
-  them as one partial. The proxy then adds the at most `local_size` partials
-  in requester order. In the forward, the occurrences of one heavy key in a
-  32-row task read its row once.
-* **Weights** ride along only when TorchRec's owner would see frequency
-  counts. The keys' own weights (index dedup with LFU scores, which count
-  how often each key is seen, or with an admission strategy) are added up
-  per node-unique key, as whole numbers. With LFU tables across nodes and no
-  such weights, the proxy sends each node-unique key's number of
-  occurrences. The owner hands them to the lookup groups of LFU tables only.
+* **Rows.** In `proxy_rows` a key takes one row per occurrence. Index
+  dedup leaves each requester each (table, key) once, so a key has at most
+  `local_size` occurrences, however hot it is (`max_key_rows`, section
+  15.3). Its first occurrence holds the key's row: the owner's put fills it
+  in the forward, and in the backward that occurrence's gradient row and
+  then the key's sum go there. Each other occurrence holds a duplicate's
+  slot for its gradient row. A key of more occurrences (keys that are not
+  index-deduplicated) takes `local_size` rows, its other occurrences take
+  the key's row, and the call raises at its second wait (section 5.4).
+* **Weights** ride along when the keys carry them: index dedup's frequency
+  counters, with LFU scores (which count how often each key is seen) or an
+  admission strategy. The proxy adds them up per node-unique key, as whole
+  numbers.
 * **`node_dedup=False`** (or gradient clipping): every occurrence is a
   node-unique key of its own.
 
@@ -956,24 +963,23 @@ an index taken from device data is clamped first: a call that does not fit
 runs every step on what arrived and stays in bounds.
 
 With the benchmark's configuration (8 features, one owner rule), the
-bucketize queues 11 kernels and copies per call (39 with index dedup, DynamicEmb's own
-dedup included), and the steps after it 9 on one node and about 120 across
-nodes, CUB's included.
+bucketize queues 39 kernels and copies per call (DynamicEmb's index dedup
+and the fan-out table included), and the steps after it 9 on one node and
+about 120 across nodes, CUB's included.
 
 ### 10.1 The bucketize (requester, caller's stream, local)
 
-The requester's own steps, local: DynamicEmb's index dedup when it is on,
-then `bucketize_keys` (`bucketize.cu`), named after TorchRec's
+The requester's own steps, local: DynamicEmb's index dedup, then
+`bucketize_keys` (`bucketize.cu`), named after TorchRec's
 `bucketize_kjt_before_all2all`, whose key order it gives:
 
-1. **Index dedup** (when on): DynamicEmb's `segmented_unique`, sized on the
+1. **Index dedup**: DynamicEmb's `segmented_unique`, sized on the
    GPU. The deduplicated KJT keeps its full length, and its lengths say how
    many keys are valid. So `num_uniques.item()` (a host sync) is not needed.
    `segmented_unique` takes `int64` keys, so `int32` keys are deduplicated
    as `int64`, and the deduplicated keys go back to `int32`: the bucketize
-   places each key by the rules of its own width (see below). (TorchRec's path in
-   DynamicEmb takes no `int32` keys under index dedup: `segmented_unique`
-   raises.)
+   places each key by the rules of its own width (see below). TorchRec's
+   path in DynamicEmb (an eval forward) does the same.
 2. **The keys by owner.** Each key's feature comes from the KJT's offsets, and
    its owner and the key its owner stores from the bucketize's rules
    (`dist_type`, and `continuous`'s key rewrite), in the arithmetic of the
@@ -986,7 +992,7 @@ then `bucketize_keys` (`bucketize.cu`), named after TorchRec's
    (`offset_per_bucket_feature`, `offset_per_bucket`). It also gives the
    input KJT's per-feature totals. Its outputs take 16 bytes per key (20
    with weights), and nothing of size `world_size × samples`.
-3. **The fan-out table** (index dedup): for each deduplicated row, its
+3. **The fan-out table**: for each deduplicated row, its
    original rows in increasing order, from a stable radix sort of the
    reverse indices. A row with more than 64 original rows is a *heavy row*:
    it gets a slot and consecutive sub-tasks of 64 original rows, numbered
@@ -1114,8 +1120,8 @@ and gives each occurrence its slot. It writes the three buffers of its
 window that its node's requesters and its rail's owners read:
 
 * `remote_map` (`RemoteMap`): for each occurrence, its entry in three int32
-  arrays: its key's row (bit 31: a heavy key), its slot, and its place in
-  its requester's push order;
+  arrays: its key's row, its slot, and its place in its requester's push
+  order;
 * `key_stage`: per other owner node a slice: that node's chunks
   (`ChunkPiece`, 16 bytes each: its keys among the node's, and its start
   and end in the stream), then its node-unique keys' records in `uniq`
@@ -1123,32 +1129,26 @@ window that its node's requesters and its rail's owners read:
   bits and 4 zero bytes;
 * `proxy_header` (`ProxyHeader`, int32 words): the chunks of its stream at
   word 0 and the stream's end at word 1; from word 4 each chunk's end; then
-  its push tables, per requester `max_chunks + 1` entries (`ReqEntry`), with
-  positions relative to that requester's push order and groups relative to
-  its first group.
+  its push tables, per requester `max_chunks + 1` entries (`ReqEntry`: a
+  first position and a first push-task flag), with positions relative to
+  that requester's push order.
 
 A requester's push order at the proxy comes from one stable radix sort of
-the push key. Its fields, from the highest, are the requester, the key's
-chunk and whether the key is heavy, then a heavy key's number among the
-heavy keys (0 for a key with a row each). Each field is as wide as its
-largest value needs, so the key's width follows from `local_size`,
-`max_chunks` and the heavy keys `remote_keys` can hold
-(`remote_keys / (heavy_at + 1)`); the op refuses a configuration whose key
-would pass 63 bits. So in each chunk a requester first pushes the rows of
-keys with a row each, then its heavy keys' rows, key by key. Its push
-tables give, per chunk, its first position, its first heavy position, its
-first push-task flag and its first heavy group. The pass over the sorted
-push keys that finds the heavy groups also writes where each of these parts
-starts, so the tables take no search. The flags of a call number its tasks
-chunk after chunk, in a chunk requester after requester: each requester's
-tasks of 32 rows, then of 32 heavy groups. The reducer list gives each
-key's entries, in occurrence order (for a heavy key its own row, then each
-requester's partial), each with the flag of the push task that fills it.
+the push key, the occurrence's part: requester × (`max_chunks` + 1) + its
+key's chunk. So a requester pushes its rows chunk after chunk, in each chunk
+in its own order. Its push tables give, per chunk, its first position and
+its first push-task flag; a pass over the sorted push keys writes where each
+part starts, so the tables take no search. The flags of a call number its
+tasks chunk after chunk, in a chunk requester after requester, a task per
+32 rows. The reducer list gives, for each row of each key (its key row,
+then its duplicates' slots, in occurrence order), the flag of the push task
+that fills it; where the rows lie follows from the chunk (section 12.1).
 
 **The rail.** Each rank sends each rail peer a count message
 (`CountMessage`, int64 words). Its common part, the same for every peer:
 its node's largest remote part; as owner the keys of its own node it looks
-up; as proxy its node-unique keys and its chunks per owner node. Then the part
+up; as proxy the most occurrences of one of its keys, and its node-unique
+keys and its chunks per owner node. Then the part
 for the peer's node alone: its node-unique keys there per feature. From the
 `num_nodes` messages it gets, a rank computes: as proxy, where its slice
 lands in each owner's `rail_keys` (a slice per source node, in node order);
@@ -1170,11 +1170,8 @@ where the forward reads each key's row: a row of its owner's `lookup_rows`
 when the owner is on its node, else the key's row in its proxy's `proxy_rows`.
 `dst` is where the backward writes the row's gradient: the same row, or its
 own slot in `proxy_rows`. It also makes its rows in push order at each proxy,
-its push tables with absolute positions and groups, and the task starts of
-each (chunk, proxy). Its heavy groups are the runs of its push order of one
-partial slot inside one (proxy, chunk) heavy range: chunks in different laps
-of a ring may take the same rows. Groups and their sub-tasks of 64 rows are
-numbered by cumulative sums.
+its push tables with absolute positions, and the task starts of each
+(chunk, proxy), which the forward's pulls and the backward's pushes share.
 
 **The owner.** Its KJT has `num_sources = local_size + num_nodes − 1`
 columns per feature (section 9). Its keys come in slices of 2^22 positions:
@@ -1203,9 +1200,10 @@ proxy also gets its reducers' tasks of each chunk.
 The last step writes the call's status, `8 × (2 × num_features + 6)` bytes.
 The call's tables need no copy: each is a tensor of its own, which the plans
 keep for the out kernels (section 11.1). The status holds the needs: the
-most any rank needs of `lookup_keys` and `remote_keys`.
-It also holds the keys this owner looks up, the sub-tasks of its heavy rows
-and heavy groups (the backward's counts), the remote occurrences this rank
+most any rank needs of `lookup_keys` and `remote_keys`, and the most
+occurrences of one key at a proxy (`key_rows`, against `local_size`). It
+also holds the keys this owner looks up, the sub-tasks of its heavy rows
+(the backward's count), the remote occurrences this rank
 deduplicated as proxy (for the benchmark), and the per-feature totals of
 the owner's and of the input's KJT. `input_dist()` returns it on the
 device; the second wait copies it to the host on the current stream: a
@@ -1250,13 +1248,13 @@ stream: the forward kernel `fwd_kernel` and the backward kernel
   (`FwdPlanView`, in `FwdArgs`) and the backward's (`BwdPlanView`, in
   `BwdArgs`). Each table is a tensor of a plan. Both read the requester's
   block starts and maps, and across nodes its push order and its tables of
-  the node's proxies (`proxy_chunks`, `proxy_ends`, `push_tables`), the
-  proxy's chunks (`num_chunks`, `chunks`, `uniq_off`) and the put lists
-  (`put_list`, `put_starts`). The forward also reads the requester's `src`,
-  `push_order_off` and `fwd_task_starts`, the owner's `fwd_chunks` and the
+  the node's proxies (`proxy_chunks`, `proxy_ends`, `push_tables`,
+  `task_starts`), the proxy's chunks (`num_chunks`, `chunks`, `uniq_off`)
+  and the put lists (`put_list`, `put_starts`). The forward also reads the
+  requester's `src` and `push_order_off`, the owner's `fwd_chunks` and the
   proxy's `node_chunk_start`, `node_chunks` and `uniq_out`. The backward
-  reads its `dst`, its heavy groups and `bwd_task_starts`, the owner's
-  `uniq_in`, and the proxy's `reduce_task_starts` and its reducer list.
+  reads its `dst`, the owner's `uniq_in`, and the proxy's
+  `reduce_task_starts` and its reducer list.
   Their strides are `max_chunks` and `num_nodes`. The call also holds what the op gives
   the kernel for it: the forward's output, the backward's gradient and its
   scratch (the heavy rows' sums and counts), across nodes the counts the
@@ -1301,13 +1299,12 @@ forward, so the lookup and its backward share a stream.
   chunk of its frees (section 12.1).
 * **Requester** (all other warps): pulls each of its rows from the
   same-node owner's `lookup_rows`, or, once its chunk has landed, from its
-  proxy's `proxy_rows`, into its output. Under index dedup it writes every
-  original row.
+  proxy's `proxy_rows`, and writes it to every original row of its
+  deduplicated row in its output.
 * **Task order.** The row tasks of the node's owners, with index dedup's
   heavy-row sub-tasks of those rows spread among them. Across nodes, then
   chunk after chunk of the proxies' streams: a chunk's tasks at every proxy,
-  proxies in turn. At a proxy they follow its push order: first the rows of
-  keys that have a row each, then the rows of heavy keys. Last, the
+  proxies in turn, each 32 rows of its push order there. Last, the
   sub-tasks of heavy rows that come from other nodes: they read the row in
   its proxy's `proxy_rows` once its chunk has landed, or, at a proxy whose
   stream wraps its ring (which takes other rows there while the kernel
@@ -1325,22 +1322,21 @@ On one node the forward kernel is built without the code for several nodes.
 
 ### 11.4 The backward kernel
 
-* **Requester**: under index dedup it first adds up each deduplicated row's
-  original rows in fp32, in a fixed order (increasing original row). Under
-  TorchRec's gradient division it then multiplies by `1 / world_size` in
-  fp32 and rounds once to the row dtype, as TorchRec's `div_(world_size)`
-  does. It pushes each row, in push order, into a same-node owner's
-  `lookup_rows`, or into its proxy's `proxy_rows` at the row's slot. It sets
-  one flag per 32-row task, tagged with `out_seq`. A heavy key goes as one
-  fp32 partial per requester, its heavy group added up in sub-tasks of at
-  most 64 rows. A push into a chunk past the ring's first lap waits until
-  the proxy has freed the chunk's rows.
+* **Requester**: it first adds up each deduplicated row's original rows
+  in fp32, in a fixed order (increasing original row). Under TorchRec's
+  gradient division it then multiplies by `1 / world_size` in fp32 and
+  rounds once to the row dtype, as TorchRec's `div_(world_size)` does. It
+  pushes each row, in push order, into a same-node owner's `lookup_rows`,
+  or into its proxy's `proxy_rows` at the row's slot. It sets one flag per
+  32-row task, tagged with `out_seq`. A push into a chunk past the ring's
+  first lap waits until the proxy has freed the chunk's rows.
 * **Proxy reducers** (the last CTAs, 8 by default). They wait for the flags
-  of each key's entries. They add up each key of several rows in fp32, in a
-  fixed order: its occurrences by requester and position, or a heavy key's
-  partials by requester. They round the sum once into the key's row, and
-  count the keys of the chunk as ready. A key of one row is not touched:
-  the NIC reads it where the requester's NVLink stores left it.
+  of each key's rows in the reducer list. They add up each key of several
+  rows in fp32, in a fixed order: its key row, then its duplicates' slots,
+  its occurrences by requester and position. They round the sum once into
+  the key's row, and count the keys of the chunk as ready. A key of one row
+  is not touched: the NIC reads it where the requester's NVLink stores left
+  it.
 * **Proxy issuer**: the last warp of CTA 0, whose lanes take the owner
   nodes in turn. Once an owner's `bwd_ready` is in, it puts each chunk (at
   most 2 MiB of rows) of that owner node into the owner's `lookup_rows` as
@@ -1359,11 +1355,10 @@ On one node the forward kernel is built without the code for several nodes.
   written exactly once, so nothing is zeroed or scattered. The owner hands
   it to the lookup's backward. It is valid until the next lookup, which
   writes `lookup_rows` (section 11.2).
-* **Task order.** Across nodes, first the sub-tasks of heavy index-dedup
-  rows that go to other nodes, and the heavy groups' sub-tasks. Then, chunk
-  after chunk of the proxies' streams, each proxy's heavy-group push tasks,
-  then each proxy's row push tasks, proxies in turn. So the chunks fill in
-  stream order. Last, the row tasks
+* **Task order.** Across nodes, first the sub-tasks of heavy rows that go
+  to other nodes. Then, chunk after chunk of the proxies' streams, each
+  proxy's push tasks, proxies in turn. So the chunks fill in stream order.
+  Last, the row tasks
   of the node's owners, with the sub-tasks of heavy rows that stay on the
   node spread among them. The last sub-task of such a row to end adds them
   up and writes the row. A task that needs sub-tasks waits until they end.
@@ -1379,15 +1374,14 @@ a call are a *stream* of chunks through it. A chunk is consecutive
 node-unique keys of one owner node: those whose rows before them, among the
 owner node's, fall in one span of `chunk_room` rows (level `j`: the owner
 node's chunk `j`). Its rows are its keys' rows (the representatives), then
-their duplicates' slots (for the backward), then the fp32 partial slots of
-its heavy keys: at most `chunk_rows`, 2 MiB or half the ring (section
-15.3). A chunk is the unit of every step of the rows across the rail: one
+their duplicates' slots (for the backward), each key's in key order: at
+most `chunk_rows`, 2 MiB or half the ring (section 15.3). A chunk is the unit of every step of the rows across the rail: one
 IB put list per chunk and owner, a grant or a free per chunk, and the
 reducers' tasks of a chunk.
 
 ```
 the stream   [ level 0: owner node a's chunk 0 | b's chunk 0 | ... ][ level 1: a's chunk 1 | ... ] ...
-a chunk      [ rows of its keys | duplicates' slots | heavy partials ]
+a chunk      [ rows of its keys | duplicates' slots, key by key ]
 the ring     its chunks one after another; when the stream passes the ring, laps from the ring's start
 ```
 
@@ -1561,16 +1555,15 @@ The capacities are the ones in place (section 5), and `row_bytes` and
 | `node_weights` | with weights, `4 × (lookup_keys + remote_keys)` | persistent |
 | `bucket_feature_of_occ` | `4 × remote_keys` | persistent |
 | `remote_map` | `12 × remote_keys`: three int32 arrays | persistent |
-| `proxy_header` | `4 × (4 + max_chunks + 4 × local_size × (max_chunks + 1))` | persistent |
+| `proxy_header` | `4 × (4 + max_chunks + 2 × local_size × (max_chunks + 1))` | persistent |
 | `key_stage` | `record_bytes × remote_keys + 16 × max_chunks + 16` | persistent |
 | `rail_keys` | `record_bytes × lookup_keys + 16 × owner_chunks` | persistent |
 | `source_offsets`, `owner_offsets` | `8 × num_nodes × num_features` each | persistent |
 | `lookup_rows` | `row_bytes × lookup_keys` | persistent |
 | `proxy_rows` | `row_bytes × num_proxy_rows` (section 15.3) | persistent |
-| `push_flags` | `8 × (remote_keys / 32 + 2 × local_size × max_chunks + 1)` | persistent |
+| `push_flags` | `8 × (remote_keys / 32 + local_size × max_chunks + 1)` | persistent |
 | the requester's maps | 8 bytes per key on one node (`inv`, `src`), 16 across nodes (also `dst`, `push_order`) | per call |
-| the requester's heavy groups and their sub-tasks (across nodes) | `12 × heavy_groups + 4 × (num_keys / 64 + heavy_groups + 1)`, with `heavy_groups = min(num_keys, local_size × (remote_keys / 65 + 1))`: about 2 bytes per entry of `remote_keys` | per call |
-| the call's small tables across nodes: the requester's of the node's proxies and its task starts, the owner's and the proxy's (section 11.1) | about `48 × local_size × max_chunks + 48 × max_chunks + 16 × owner_chunks`, plus a few KB | per call |
+| the call's small tables across nodes: the requester's of the node's proxies and its task starts, the owner's and the proxy's (section 11.1) | about `24 × local_size × max_chunks + 48 × max_chunks + 16 × owner_chunks`, plus a few KB | per call |
 | the owner's KJT values | `8 × lookup_keys` (12 with weights), from the input dist until the forward | per call |
 | the proxy's reducer list | `12 × remote_keys` | per call |
 | the put lists and the ready counters | `24 × max_chunks + 16 × owner_chunks + 32 × num_nodes × num_features` | per call |
@@ -1578,10 +1571,10 @@ The capacities are the ones in place (section 5), and `row_bytes` and
 | the bucketize, in the caller's pool | at its peak 25 bytes per key with one owner rule (67 with three), and about 60 with index dedup while the fan-out table is made | transient |
 | the planner, in the caller's pool | its largest step: across nodes the proxy's about 99 bytes per entry of `remote_keys`, the requester's about 73 per key, or the owner's gather about 65 per entry of `lookup_keys`, at most 2^22 entries at a time; on one node about 20 bytes per key | transient |
 
-The transient figures are the peaks measured with the benchmark's batches
-(bytes in live tensors; the caching allocator's rounding and the cached
-blocks it hands out add up to about 13%), but the one-node planner's, which
-comes from the code.
+The transient figures are upper bounds from the peaks measured with the
+benchmark's batches (bytes in live tensors; the caching allocator's rounding
+and the cached blocks it hands out add up to about 13%), but the one-node
+planner's, which comes from the code.
 
 The constructors of the layouts size the window's buffers as above
 (`CtrlLayout`, `KeysLayout` and `RowsLayout`, in `window.h`). The buffers
@@ -1597,17 +1590,15 @@ With uniform keys across nodes, and capacities 1.25 times the needs
 (section 5.2), the keys section takes about
 `1.25 × num_keys × (16 × (1 + (num_nodes − 1) × uniq_share) + 32 × (num_nodes − 1)) / num_nodes`
 bytes. That is about 39 bytes per key at 2 nodes, and 58 at 32 nodes. The
-per-call tensors take about 35 to 43 bytes per key across nodes: 16 for the
-requester's maps, 1 to 2.5 for its heavy groups, about 10 for the owner's
-KJT until the forward, and `12 × 1.25 × (num_nodes − 1) / num_nodes` for the
-reducer list.
+per-call tensors take about 33 to 41 bytes per key across nodes: 16 for the
+requester's maps, about 10 for the owner's KJT until the forward, and
+`12 × 1.25 × (num_nodes − 1) / num_nodes` for the reducer list.
 
 ### 15.3 `proxy_rows` and its ring
 
 ```
 num_proxy_rows = min(max(remote_keys, 4 × max_key_rows), proxy_bytes / row_bytes)   (rounded down)
-max_key_rows   = max(heavy_at, 1 + local_size × partial_rows)
-heavy_at       = max(64, local_size × partial_rows),  partial_rows = ceil(4 × dim / row_bytes)
+max_key_rows   = local_size
 chunk_rows     = max(min(2 MiB of rows, num_proxy_rows / 2), 2 × max_key_rows)
 chunk_room     = chunk_rows − max_key_rows + 1
 max_chunks     = remote_keys / chunk_room + num_nodes
@@ -1619,15 +1610,14 @@ So the ring holds a call's rows in one lap when `remote_keys` rows fit under
 the cap: its stream then lies in it as it is. A cap below `4 × max_key_rows
 × row_bytes` (two chunks of keys of the most rows) is refused when the op is
 built (section 6), and so is a `remote_keys` whose stream could pass
-position 2^32 (`2 × remote_keys + num_proxy_rows` of 2^32 or more), whose
-push-task flags would pass int32 numbers, or whose push key would pass 63
-bits.
+position 2^32 (`2 × remote_keys + num_proxy_rows` of 2^32 or more), or whose
+push-task flags would pass int32 numbers.
 
 The **rows a proxy needs** count, per node-unique key, one row per
-occurrence (the key's row and its duplicates' slots), up to `heavy_at`
-occurrences. A heavy key, with more, counts `1 + local_size × partial_rows`
-rows: its row and its partials, no more than its occurrences. So a call
-never needs more rows than it has occurrences: a call within `remote_keys`
+occurrence (the key's row and its duplicates' slots): at most `local_size`,
+as index dedup leaves each GPU each (table, key) once (a key of more, in a
+call that raises, counts `local_size`). So a call never needs more rows
+than it has occurrences: a call within `remote_keys`
 fits in `num_proxy_rows` rows when they hold `remote_keys` rows, and makes
 at most `max_chunks` chunks, as each owner node's chunks but its last hold at
 least `chunk_room` rows. The laps of its stream follow from these rows
@@ -1762,7 +1752,7 @@ exists from 1.3 on.
 
 ## 18. Correctness and determinism
 
-**Forward: bit for bit equal to TorchRec's dists, index dedup included.**
+**Forward: bit for bit equal to TorchRec's dists (under index dedup).**
 Each output row is a byte copy of the owner's row. For each table the owner
 looks up the same set of keys as TorchRec's owner: every same-node
 occurrence, and one entry per (other node, table, key). It sees the same
@@ -1777,26 +1767,24 @@ lookup's backward adds up the same terms as TorchRec's:
 
 * fp32 rows: equal up to the order of fp32 additions. The `1 / world_size`
   scaling is TorchRec's bit for bit (a multiplication by `1 / world_size`
-  in fp32, rounded once). On one node without index dedup every gradient
-  row equals TorchRec's bit for bit.
+  in fp32, rounded once).
 * bf16 or fp16 rows with node dedup: a node's sum of several occurrences is
   rounded to the row dtype once more before it crosses IB. The error is at
   most `2^-8` of that sum for bf16, and `2^-11` for fp16. Index dedup's sums
-  are made in fp32, where TorchRec's `index_add` adds in the row dtype; a
-  heavy key's occurrences are added in fp32 without rounding each one.
-  `node_dedup=False` gives TorchRec's rows back, at the cost of more IB
-  traffic.
+  are made in fp32, where TorchRec's `index_add` adds in the row dtype.
+  `node_dedup=False` sends each GPU's row across IB on its own, at the cost
+  of more IB traffic.
 * Gradient clipping clamps each row before the per-key sum, so it turns node
   dedup off and keeps TorchRec's meaning.
 
-**Run to run.** Every sum the dist makes has a fixed order: duplicates by
-requester and position, heavy partials by requester, and index dedup's sums by
-original row. The planner numbers keys, slots and tasks with stable sorts and
+**Run to run.** Every sum the dist makes has a fixed order: a key's rows at
+its proxy by requester and position, and index dedup's sums by original
+row. The planner numbers keys, slots and tasks with stable sorts and
 cumulative sums, which give the same result every run, and adds weights as
 whole numbers. None of its steps adds up or hands out slots with atomics. So
 the output rows and the gradient handed to the lookup are the same bits every
-run. That holds across nodes, with or without index dedup, whether a
-stream wraps its ring or not. Under index dedup, the keys in the owner's
+run. That holds on one node and across nodes, whether a stream wraps its
+ring or not. The keys in the owner's
 KJT columns of same-node requesters follow DynamicEmb's `unique` numbering,
 and so do those rows of `lookup_grad` (the other nodes' columns are in key
 order, section 9). That numbering may change between runs; the value per

@@ -100,7 +100,7 @@ def hier_needs(
     tables: Mapping[str, int],
     owner_of: Callable[[torch.Tensor, str], torch.Tensor],
     local_world_size: int,
-    index_dedup: bool = False,
+    index_dedup: bool = True,
     node_dedup: bool = True,
     group: Optional[dist.ProcessGroup] = None,
 ) -> Dict[str, int]:
@@ -119,7 +119,8 @@ def hier_needs(
             given the keys in the KJT's own dtype (TorchRec's path places an
             ``int32`` key by the bucketize's 32-bit rule).
         local_world_size: GPUs per node.
-        index_dedup: a rank sends each (table, key) of a call once.
+        index_dedup: a rank sends each (table, key) of a call once (index
+            dedup, which the hierarchical dist takes; False: every key).
         node_dedup: across nodes an owner receives each (table, key) once
             per node; False: every occurrence.
         group: the sharding's process group (the default one if None).
