@@ -493,7 +493,7 @@ def erase_by_score_async(
             if not names:
                 continue
             found.update(names)
-        if module.erase_table_ids(score_strategy, names):
+        if module.get_erase_table_ids(score_strategy, names):
             if stream is not None and stream.device != torch.device(
                 "cuda", module.device_id
             ):

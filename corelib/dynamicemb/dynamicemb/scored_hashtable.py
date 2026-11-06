@@ -1203,7 +1203,6 @@ class LinearBucketTable(ScoredHashTable):
         threshold: int,
         counts: torch.Tensor,
         *,
-        score_name: Optional[str] = None,
         score_word: Optional[int] = None,
         begin: Optional[int] = None,
         end: Optional[int] = None,
@@ -1255,12 +1254,7 @@ class LinearBucketTable(ScoredHashTable):
             raise ValueError(
                 f"table_id {table_id} is not one of the {self.num_tables_} tables"
             )
-        if score_word is not None:
-            score_index = score_word
-        else:
-            score_index = (
-                0 if score_name is None else self.score_names_.index(score_name)
-            )
+        score_index = 0 if score_word is None else score_word
 
         bucket_begin = int(self.table_bucket_offsets_cpu_[table_id].item())
         bucket_end = int(self.table_bucket_offsets_cpu_[table_id + 1].item())

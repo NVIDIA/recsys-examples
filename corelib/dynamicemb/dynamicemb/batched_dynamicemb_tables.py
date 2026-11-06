@@ -1590,7 +1590,7 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
             )
         return table_ids
 
-    def erase_table_ids(
+    def get_erase_table_ids(
         self,
         score_strategy: DynamicEmbScoreStrategy,
         table_names: Optional[Sequence[str]] = None,
@@ -1648,8 +1648,8 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
         Only tables whose score strategy has ``score_strategy`` as a member are
         scanned (see :meth:`erasable_table_ids`); with none, the handle is done at
         once and says ``(0, 0)``. ``table_names`` narrows them to the tables named, each
-        of which must be one of them (see :meth:`erase_table_ids`); ``None`` is all of
-        them. Tables that need different thresholds take one call each: the calls on a
+        of which must be one of them (see :meth:`get_erase_table_ids`); ``None`` is all
+        of them. Tables that need different thresholds take one call each: the calls on a
         module run one after another, in the order they were made. In a ``(TIMESTAMP,
         LFU)`` table the word compared is the one ``score_strategy`` names
         (:meth:`erase_score_word`). The scan runs on a thread of its own and launches on
@@ -1678,7 +1678,7 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
         check_erase_arguments(
             score_strategy, threshold, stream, chunk_slots, max_in_flight, table_names
         )
-        table_ids = self.erase_table_ids(score_strategy, table_names)
+        table_ids = self.get_erase_table_ids(score_strategy, table_names)
         if not table_ids:
             return EraseHandle.completed()
         if stream is None:

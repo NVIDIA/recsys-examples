@@ -41,8 +41,7 @@ def two_table_module(device, names=None):
     module = build_de_table(device.index, LRU_LFU, num_tables=2, names=names)
     assert module._storage.key_index_map.num_tables_ == 2, "the tables do not share"
     train_step(module, [KEYS, KEYS], device)
-    now = device_timestamp()
-    assert now > 200 * HOUR
+    now = device_timestamp() + max(AGES)
     for table_id in (0, 1):
         age(module, table_id, now, device)
     return module, now

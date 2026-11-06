@@ -253,12 +253,13 @@ def test_the_word_a_strategy_names_is_the_same_in_either_tuple_order(device, ord
 @pytest.mark.parametrize("order", ORDERS, ids=["ts_first", "lfu_first"])
 @pytest.mark.parametrize("strategy", [S.TIMESTAMP, S.LFU])
 def test_a_model_is_erased_by_the_word_the_strategy_names(device, order, strategy):
-    """A real timestamp: stale keys were last seen an hour before the threshold."""
+    """Timestamps from the device clock: stale keys were last seen an hour before the
+    threshold. The reference sits two hours past the clock, so no timestamp is negative
+    however recently the GPU started."""
     module = build_de_table(device.index, order)
     train_step(module, KEYS, device)
-    now = device_timestamp()
     hour = 3600 * 10**9
-    assert now > 2 * hour
+    now = device_timestamp() + 2 * hour
     timestamps = [now - 2 * hour if t == STALE_TS else now for t in TIMESTAMPS]
     set_score_words(module, KEYS, timestamps, FREQUENCIES, device)
     if strategy == S.TIMESTAMP:
