@@ -759,7 +759,8 @@ def sync_checks(prof, input_dist: bool = True) -> Tuple[Dict[str, bool], str]:
     """The hierarchical dist's host syncs and kernels in a profile of whole
     steps: no sync in the input dist (but where ``input_dist`` is False), one
     sync in each second wait with one D2H copy, the status's; no sync in the
-    output dist and one kernel per direction."""
+    output dist, one out kernel per direction, and before the backward's at
+    most two kernels of heavy rows' sums."""
     ranges_input, syncs_input = syncs_in(prof, "hier::input")
     ranges_wait, syncs_wait = syncs_in(prof, "hier::wait")
     ranges_fwd, syncs_fwd = syncs_in(prof, "hier::forward")
@@ -767,6 +768,7 @@ def sync_checks(prof, input_dist: bool = True) -> Tuple[Dict[str, bool], str]:
     d2h = d2h_shapes(prof, "hier::wait")
     fwd = launched_in(prof, "hier::forward")
     bwd = launched_in(prof, "hier::backward")
+    out_bwd = [name for name in bwd if "bwd_heavy_" not in name]
     checks = {
         "input dist syncs": ranges_input > 0
         and ranges_wait > 0
@@ -778,8 +780,9 @@ def sync_checks(prof, input_dist: bool = True) -> Tuple[Dict[str, bool], str]:
         and syncs_fwd == syncs_bwd == 0,
         "one kernel each": len(fwd) == ranges_fwd
         and all("fwd_kernel" in name for name in fwd)
-        and len(bwd) == ranges_bwd
-        and all("bwd_kernel" in name for name in bwd),
+        and len(out_bwd) == ranges_bwd
+        and len(bwd) - len(out_bwd) <= 2 * ranges_bwd
+        and all("bwd_kernel" in name or "bwd_heavy_" in name for name in bwd),
     }
     text = (
         f" (input dist x{ranges_input} {syncs_input} syncs, second wait"

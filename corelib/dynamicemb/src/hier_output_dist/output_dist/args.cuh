@@ -40,12 +40,12 @@ struct FwdArgs {
   unsigned long long *trace;  // [kTraceWords] this kernel's timeline, or nullptr
 };
 
-// bwd_kernel's call.
+// The backward's call (the heavy rows' kernels' and bwd_kernel's).
 struct BwdArgs {
   BwdPlanView plan;
   const char *grad;           // [num_out, row] the gradient of the requester's output
-  float *partial;             // [plan.heavy_subs, dim] fp32 sums of the heavy rows' sub-tasks
-  uint64_t *heavy_done;       // [heavy rows] sub-tasks of each one done (the kernel zeroes it)
+  float *partial;             // [plan.heavy_subs, dim] fp32 sums of the heavy rows' sub-tasks; a
+                              // heavy row's first one ends as the row's sum (bwd_heavy_sum_kernel)
   int64_t *ready;             // across nodes, the proxy's [max_chunks]: keys of each chunk of
                               // its stream reduced; the kernel zeroes those of its chunks
   unsigned long long *trace;  // [kTraceWords] this kernel's timeline, or nullptr

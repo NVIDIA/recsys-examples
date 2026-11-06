@@ -61,9 +61,11 @@ class Trace {
   int64_t launches_[2] = {0, 0};  // out kernels of each direction launched so far
 };
 
-// The out channel: the output dist's kernels (one per direction of a call)
-// on the caller's stream, under one sequence number (out_seq) the same on
-// every rank.
+// The out channel: the output dist's kernels (one per direction of a call,
+// and before the backward's the two of the heavy rows' sums when there are
+// any) on the
+// caller's stream, the out kernels under one sequence number (out_seq) the
+// same on every rank.
 class OutChannel {
  public:
   // window and dev: the op's registered window and its GIN device
@@ -77,10 +79,10 @@ class OutChannel {
   // its node's proxies, into a new tensor of plan.num_out() rows. lookup_out
   // must be the rows of lookup_rows the lookup wrote (zero copy).
   at::Tensor forward(const FwdPlan &plan, const at::Tensor &lookup_out);
-  // bwd_kernel on the current stream: the gradient of this rank's rows back
-  // into the lookup_rows of their owners (across nodes through the proxies,
-  // which sum each node-unique key's), times 1 / world_size if `divide`.
-  // There each owner's lookup backward reads it.
+  // bwd_kernel on the current stream, after bwd_heavy_kernel and
+  // bwd_heavy_sum_kernel when the call has heavy rows: the gradient of this rank's rows back into
+  // the lookup_rows of their owners (across nodes through the proxies, which sum each node-unique
+  // key's), times 1 / world_size if `divide`. There each owner's lookup backward reads it.
   void backward(const BwdPlan &plan, at::Tensor grad, bool divide);
 
   const Trace &trace() const { return trace_; }

@@ -50,6 +50,14 @@ const void *backward_kernel(at::ScalarType dtype) {
                                   : (const void *)bwd_kernel<__half>;
 }
 
+// The heavy rows' sub-tasks of a backward whose gradient rows are of `dtype`
+// (checked by backward_kernel).
+const void *heavy_kernel(at::ScalarType dtype) {
+  return dtype == at::kFloat      ? (const void *)bwd_heavy_kernel<float>
+         : dtype == at::kBFloat16 ? (const void *)bwd_heavy_kernel<__nv_bfloat16>
+                                  : (const void *)bwd_heavy_kernel<__half>;
+}
+
 }  // namespace
 
 // SMs left to NCCL's own kernels.
@@ -137,12 +145,10 @@ void OutChannel::backward(const BwdPlan &plan, at::Tensor grad, bool divide) {
   grad = grad.contiguous();
   if (grad.numel() > 0 && (uintptr_t)grad.data_ptr() % 16 != 0) grad = grad.clone();
   const void *kernel = backward_kernel(grad.scalar_type());
-  // The heavy rows' sub-tasks' fp32 sums, how many of each heavy row's are
-  // done, and across nodes the proxy's keys reduced of each chunk of its
-  // stream (the kernel zeroes the counts).
+  // The heavy rows' sub-tasks' fp32 sums, and across nodes the proxy's keys
+  // reduced of each chunk of its stream (the kernel zeroes those).
   const auto options = grad.options();
   const at::Tensor partial = at::empty({plan.heavy_subs, grad.size(1)}, options.dtype(at::kFloat));
-  const at::Tensor done = at::empty({plan.fanout.pos.numel()}, options.dtype(at::kLong));
   at::Tensor ready;
   if (multi_node_) ready = at::empty({sizes_.max_chunks}, options.dtype(at::kLong));
   const int ctas = out_ctas(OutKernel::kBackward);
@@ -150,12 +156,27 @@ void OutChannel::backward(const BwdPlan &plan, at::Tensor grad, bool divide) {
   args.plan = plan.view(sizes_);
   args.grad = (const char *)grad.data_ptr();
   args.partial = partial.data_ptr<float>();
-  args.heavy_done = (uint64_t *)done.data_ptr<int64_t>();
   args.ready = ready.defined() ? ready.data_ptr<int64_t>() : nullptr;
   args.reducers = reducers(ctas);
   // TorchRec's owner divides by world_size, a CPU scalar: PyTorch multiplies
   // by the fp32 reciprocal.
   args.scale = divide ? 1.0f / (float)world_size_ : 1.0f;
+  if (plan.heavy_subs > 0) {
+    // The heavy rows' sums first, on the whole GPU: the sub-tasks' partials
+    // (a group of lanes each), then each heavy row's sum (a CTA each).
+    const cudaStream_t stream = at::cuda::getCurrentCUDAStream(device_);
+    const int64_t per_cta = kThreads / heavy_group_lanes(sizes_.row_vecs());
+    const int grid =
+        (int)std::min<int64_t>((plan.heavy_subs + per_cta - 1) / per_cta, 4 * (int64_t)sms_);
+    void *params[] = {&sizes_, &args};
+    HIER_CUDA_CHECK(
+        cudaLaunchKernel(heavy_kernel(grad.scalar_type()), grid, kThreads, params, 0, stream));
+    int dim = (int)grad.size(1);
+    const int sum_grid = (int)std::min<int64_t>(plan.fanout.pos.numel(), 8 * (int64_t)sms_);
+    void *sum_params[] = {&args, &dim};
+    HIER_CUDA_CHECK(cudaLaunchKernel((const void *)bwd_heavy_sum_kernel, sum_grid, kSumThreads,
+                                     sum_params, 0, stream));
+  }
   launch(kernel, OutKernel::kBackward, ctas, args);
 }
 

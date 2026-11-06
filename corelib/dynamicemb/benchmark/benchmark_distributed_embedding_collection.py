@@ -1427,18 +1427,20 @@ def device_used() -> int:
     return total - free
 
 
-# Kernels of the hierarchical output dist, by name: the forward's and the
-# backward's.
+# Kernels of the hierarchical output dist, by name: the forward's, the
+# backward's, and the two that sum the heavy rows before the backward's.
 _OUTPUT_DIST_FWD_RE = re.compile(r"\bhier_output_dist::fwd_kernel\b")
 _OUTPUT_DIST_BWD_RE = re.compile(r"\bhier_output_dist::bwd_kernel\b")
+_OUTPUT_DIST_HEAVY_RE = re.compile(r"\bhier_output_dist::bwd_heavy_(?:sum_)?kernel\b")
 
 
 def output_dist_kernel_times(prof) -> List[List[float]]:
     """Per call, from a CUDA-only profile of the --kernel_times iterations:
     the GPU ms of the hierarchical output dist's forward kernel and of its
-    backward kernel, each with its wait at the entry for the other ranks, in
-    call order (each backward kernel with the forward kernel before it).
-    Empty for TorchRec's output dist."""
+    backward kernels, each with its wait at the entry for the other ranks, in
+    call order (each backward with the forward kernel before it). The
+    backward's time adds the heavy rows' kernels (when they run) to the
+    backward kernel. Empty for TorchRec's output dist."""
     kernels = sorted(
         (event.time_range.start, event.time_range.end, event.name)
         for event in prof.events()
@@ -1446,13 +1448,17 @@ def output_dist_kernel_times(prof) -> List[List[float]]:
         and (
             _OUTPUT_DIST_FWD_RE.search(event.name)
             or _OUTPUT_DIST_BWD_RE.search(event.name)
+            or _OUTPUT_DIST_HEAVY_RE.search(event.name)
         )
     )
-    calls, fwd = [], 0.0
+    calls, fwd, heavy = [], 0.0, 0.0
     for begin, end, name in kernels:
         ms = (end - begin) / 1e3
-        if _OUTPUT_DIST_BWD_RE.search(name):
-            calls.append([fwd, ms])
+        if _OUTPUT_DIST_HEAVY_RE.search(name):
+            heavy += ms
+        elif _OUTPUT_DIST_BWD_RE.search(name):
+            calls.append([fwd, heavy + ms])
+            heavy = 0.0
         else:
             fwd = ms
     return calls

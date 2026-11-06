@@ -66,8 +66,10 @@ operator per sharding, `HierOutputDist`, does the work (section 7):
   to the host.
 * **The lookup only looks up.** DynamicEmb's lookup writes its rows straight
   into a buffer that the output dist reads (zero copy).
-* **The output dist only moves rows**, in one kernel per direction. It
-  computes no index.
+* **The output dist only moves rows.** The forward uses one kernel. The
+  backward uses one kernel. When the call has heavy rows, two short kernels
+  add up their gradients first (section 11.4). The output dist computes no
+  index.
 * **Rail-aligned path.** A key that a GPU asks of an owner on another node
   first goes over NVLink to the *proxy*: the GPU of its own node on the
   owner's rail. The proxy sends it over that rail's InfiniBand link to the
@@ -513,7 +515,7 @@ class HierOutputDist {  // one per sharding
                            const c10::optional<at::Tensor> &lengths, int64_t batch_size,
                            const c10::optional<at::Tensor> &weights,
                            const at::Tensor &input_offsets, const at::Tensor &reverse_indices);
-  // The output dist: one kernel each.
+  // The output dist: one kernel for the forward, one to three for the backward.
   at::Tensor output_dist_fwd(const std::vector<c10::optional<at::Tensor>> &fwd_plan,
                              const at::Tensor &lookup_out);
   at::Tensor output_dist_bwd(const std::vector<c10::optional<at::Tensor>> &bwd_plan,
@@ -1227,7 +1229,9 @@ table serves, and VBE. So does DynamicEmb's lookup, the same on every dist.
 
 The output dist runs one cooperative kernel per direction on the caller's
 stream: the forward kernel `fwd_kernel` and the backward kernel
-`bwd_kernel`.
+`bwd_kernel`. When a call has heavy rows, the backward first runs
+`bwd_heavy_kernel` and `bwd_heavy_sum_kernel`. These ordinary kernels add up
+the gradients of the heavy rows (section 11.4).
 
 ### 11.1 What both kernels share
 
@@ -1235,16 +1239,18 @@ stream: the forward kernel `fwd_kernel` and the backward kernel
   system fence) and every CTA waits until all node peers have published
   theirs. A peer past this point has finished its lookup (which wrote its
   `lookup_rows`) and every earlier out kernel. Before it publishes, the
-  backward's CTA 0 zeroes the words it counts from 0 (the heavy rows' done
-  counters, and across nodes each chunk's `ready` and `pushed_rows`), so no
-  peer counts on one before it is zeroed.
-* **Tasks.** Warps take 32-row tasks from two queues (`task` words): the
-  *local* tasks (the rows of the node's owners) and, across nodes, the
-  *remote* ones (the rows that cross nodes, chunk after chunk of the
-  proxies' streams). A local task waits for nothing; a remote one may wait
-  for its chunk at its proxy. So while local tasks are left, a warp takes
-  the next remote task only when that one would not wait, else a local one
-  (ready first). Each queue goes in order. Owners (and proxies) take turns,
+  backward's CTA 0 zeroes the words it counts from 0 (across nodes, each
+  chunk's `ready` and `pushed_rows`), so no peer counts on one before it is
+  zeroed.
+* **Tasks.** Warps take 32-row tasks from two queues (`task` words):
+  * The *local* queue holds the tasks of the rows of the node's owners.
+  * Across nodes, the *remote* queue holds the tasks of the rows that cross
+    nodes, chunk after chunk of the proxies' streams.
+
+  A local task does not wait. A remote task can wait for its chunk at its
+  proxy. While local tasks are left, a warp takes the next remote task only
+  if that task does not wait. Otherwise, the warp takes a local task (ready
+  first). Each queue keeps its order. Owners (and proxies) take turns,
   starting from each rank's own, so the ranks of a node start on different
   peers.
 * **Exit.** Every CTA counts its arrival in a running total (its `arrive`
@@ -1319,21 +1325,25 @@ forward, so the lookup and its backward share a stream.
   same-node owner's `lookup_rows`, or, once its chunk has landed, from its
   proxy's `proxy_rows`, and writes it to every original row of its
   deduplicated row in its output.
-* **Task order.** Local: the row tasks of the node's owners, with index
-  dedup's heavy-row sub-tasks of those rows spread among them. Remote
-  (across nodes): chunk after chunk of the proxies' streams, a chunk's
-  tasks at every proxy, proxies in turn, each 32 rows of its push order
-  there; then the sub-tasks of heavy rows that come from other nodes: they
-  read the row in its proxy's `proxy_rows` once its chunk has landed, or, at
-  a proxy whose stream wraps its ring (which takes other rows there while
-  the kernel runs), copy on from their first original row, which the row's
-  task wrote, once this rank's rows at that proxy are all in. A warp takes
-  the next remote task once its chunk has landed, else a local task; the
-  late sub-tasks wait for the local tasks. So the pulls empty the rings as
-  rows land, and the local rows fill the time between (taking the local
-  tasks first left the rows of a wrapping ring waiting, and the owners
-  waiting for their grants). No task waits for a task that comes later in
-  its queue.
+* **Task order.**
+  * Local queue: the row tasks of the node's owners. Index dedup's
+    sub-tasks of the heavy rows of these owners are spread among them.
+  * Remote queue (across nodes): first the tasks of the proxies' streams,
+    chunk after chunk. In a chunk, the tasks of each proxy come in turn,
+    each 32 rows of the push order there. Then come the sub-tasks of the
+    heavy rows that come from other nodes. Such a sub-task reads the row in
+    its proxy's `proxy_rows` when its chunk has landed. At a proxy whose
+    stream wraps its ring, other rows can take that place while the kernel
+    runs. So there, the sub-task copies from the first original row of the
+    row. The task of the row wrote it, and the sub-task waits until all rows
+    of this rank at that proxy are in.
+
+  A warp takes the next remote task when its chunk has landed. Otherwise,
+  it takes a local task. The late sub-tasks wait for the local tasks. Thus
+  the pulls empty the rings as the rows land, and the local rows fill the
+  time between. (When the local tasks came first, the rows of a wrapping
+  ring stayed in the ring, and the owners waited for their grants.) No task
+  waits for a task that comes later in its queue.
 * **Exit.** The last CTA tells the node that this rank has pulled
   everything, and waits until every node peer has too. After that nobody
   reads this rank's `lookup_rows` or `proxy_rows`. Across nodes it then
@@ -1345,8 +1355,25 @@ On one node the forward kernel is built without the code for several nodes.
 
 ### 11.4 The backward kernel
 
+* **Heavy rows** (`bwd_heavy_kernel`, then `bwd_heavy_sum_kernel`). These
+  two kernels run before the backward kernel, and only when the call has
+  heavy rows. They wait for no peer and can use all SMs.
+  1. `bwd_heavy_kernel` adds the gradients of each sub-task's 64 original
+     rows in fp32, in order, into the sub-task's own fp32 row of `partial`.
+     A group of lanes does a sub-task: one lane per 16-byte vector of a row,
+     at most 32. Thus a warp does 2 sub-tasks of 256-byte rows at a time.
+  2. `bwd_heavy_sum_kernel` adds the partial rows of each heavy row in
+     sub-task order. It writes the sum into the first partial row of the
+     row. A CTA does one row. A thread does one value of the row and keeps
+     16 partial rows in flight, so a very hot row does not hold one warp
+     for a long time.
+
+  The kernel boundary orders the two steps, so no counter is needed.
+  `partial` holds one fp32 row per sub-task, as before. The split adds no
+  memory, and each sum keeps its order.
 * **Requester**: it first adds up each deduplicated row's original rows
-  in fp32, in a fixed order (increasing original row). Under TorchRec's
+  in fp32, in a fixed order (increasing original row). For a heavy row, it
+  reads the sum that `bwd_heavy_kernel` wrote. Under TorchRec's
   gradient division it then multiplies by `1 / world_size` in fp32 and
   rounds once to the row dtype, as TorchRec's `div_(world_size)` does. It
   pushes each row, in push order, into a same-node owner's `lookup_rows`,
@@ -1380,19 +1407,18 @@ On one node the forward kernel is built without the code for several nodes.
   written exactly once, so nothing is zeroed or scattered. The owner hands
   it to the lookup's backward. It is valid until the next lookup, which
   writes `lookup_rows` (section 11.2).
-* **Task order.** Remote (across nodes): first the sub-tasks of heavy rows
-  that go to other nodes; then, chunk after chunk of the proxies' streams,
-  each proxy's push tasks, proxies in turn. So the chunks fill in stream
-  order. Local: the row tasks of the node's owners, with the sub-tasks of
-  heavy rows that stay on the node spread among them. The last sub-task of
-  such a row to end adds them up and writes the row. A warp takes the next
-  remote task when it would not wait (a sub-task, or a push whose rows of
-  the ring are free), else a local task. So the pushes feed the proxies as
-  fast as their rings free rows, and the local rows fill the time between
-  (taking the remote tasks first left the local rows waiting behind pushes
-  that wait for the ring). A task that needs sub-tasks waits until they
-  end. They come earlier in the remote queue, so a running warp has them,
-  and they wait for nothing.
+* **Task order.**
+  * Remote queue (across nodes): the push tasks of the proxies' streams,
+    chunk after chunk, the proxies in turn. Thus the chunks fill in stream
+    order.
+  * Local queue: the row tasks of the node's owners.
+
+  A warp takes the next remote task when the rows of its chunk in the ring
+  are free. Otherwise, it takes a local task. Thus the pushes feed the
+  proxies as fast as the rings free rows, and the local rows fill the time
+  between. (When the remote tasks came first, the local rows waited behind
+  pushes that waited for the ring.) The heavy rows' sums are ready before
+  the kernel starts, so no task waits for another task.
 
 ## 12. The ring and credits
 
@@ -1555,7 +1581,8 @@ such a comm kernel, 32 to NCCL's kernels, and one to spare. It takes at least
 1 CTA, and the backward across nodes at least 2 (its issuer's CTA and a
 reducing one). `want` is `DYNAMICEMB_GIN_CTAS` when set, else 32, or 64 for
 the backward on one node (section 4.4). The input dist's other kernels never
-wait (section 13), so they need no SM of their own. **Example**, H100 (132
+wait (section 13), so they need no SM of their own. The kernels of the
+heavy rows do not wait for peers either. They can use all SMs. **Example**, H100 (132
 SMs): an out kernel may take up to 98 CTAs, so the out kernels keep their 32,
 and the backward on one node its 64.
 
