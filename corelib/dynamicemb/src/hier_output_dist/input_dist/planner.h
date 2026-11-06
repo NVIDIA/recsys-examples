@@ -228,8 +228,8 @@ struct ProxyBuffers {
   at::Tensor chunks;       // int32 [1]: its stream's chunks
   at::Tensor end;          // int32 [1]: its stream's end (uint32)
   at::Tensor ends;         // int32 [max_chunks]: each chunk's end (uint32)
-  at::Tensor push_tables;  // int32 [local_size][max_chunks + 1][2]: ReqEntry, positions
-                           // relative to each requester's push order here
+  at::Tensor push_tables;  // int32 [local_size][max_chunks + 1]: where each requester's rows of
+                           // each chunk start, relative to its push order here
 };
 // The buffers the proxy writes: remote_map and key_stage (views), and the
 // parts of the proxy header `header`, viewed on the device of `options`.
@@ -305,15 +305,12 @@ struct ProxyPlan {
   at::Tensor reduce_task_starts;  // int64 [max_chunks + 1]: its reducers' tasks before each chunk
                                   // (32 keys each)
   at::Tensor reducer_start;       // int64 [remote_keys + 1]: the rows before each key
-                                  // (ProxyChunks::row_ends)
-  at::Tensor reducer_flags;       // int32 [remote_keys]: the reducer list, the flag of the push
-                                  // task that fills each row of each key, key u's at
-                                  // [reducer_start[u], reducer_start[u + 1]): its key row,
-                                  // then its duplicates' slots in order
+                                  // (ProxyChunks::row_ends): key u's are its key row, then its
+                                  // duplicates' slots in order
 };
 // Step 3: each requester's push order (one stable sort by its part, a
-// requester and a chunk), its push tables, and the reducer list. Writes
-// remote_map's positions and the proxy header's push tables.
+// requester and a chunk) and its push tables. Writes remote_map's positions
+// and the proxy header's push tables.
 ProxyPlan proxy_push_order(ProxyKeys keys, ProxyChunks chunks, const at::Tensor &requester_start,
                            const ProxyBuffers &buffers, const Sizes &sizes);
 
@@ -432,8 +429,8 @@ struct RequesterTables {
   at::Tensor push_order;  // int32 [bucket_feature_of_row.numel()]: its rows at each proxy in their
                           // push order
   at::Tensor push_order_off;  // int64 [local_size + 1]: where its rows at each proxy start
-  at::Tensor push_tables;     // int32 [local_size][max_chunks + 1][2]: ReqEntry at each proxy,
-                              // positions in push_order
+  at::Tensor push_tables;     // int32 [local_size][max_chunks + 1]: where its rows of each chunk
+                              // at each proxy start in push_order (chunk max_chunks: their end)
   at::Tensor proxy_chunks;    // int64 [local_size]: the chunks of each proxy's stream
   at::Tensor proxy_ends;      // int64 [local_size][max_chunks + 1]: each proxy's chunk ends,
                               // then its stream's end (past num_proxy_rows when it wraps)

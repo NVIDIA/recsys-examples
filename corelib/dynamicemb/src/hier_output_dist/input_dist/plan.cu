@@ -53,7 +53,7 @@ PlanView plan_view(const Plan &plan, const Sizes &sizes) {
   view.push_order = data_of<int32_t>(plan.push_order);
   view.proxy_chunks = data_of<int64_t>(plan.proxy_chunks);
   view.proxy_ends = data_of<int64_t>(plan.proxy_ends);
-  view.push_tables = data_of<ReqEntry, int32_t>(plan.push_tables);
+  view.push_tables = data_of<int32_t>(plan.push_tables);
   view.task_starts = data_of<int64_t>(plan.task_starts);
   view.num_chunks = data_of<int64_t>(plan.num_chunks);
   view.chunks = data_of<Chunk, int32_t>(plan.chunks);
@@ -121,8 +121,7 @@ auto bwd_tensors(Plan &plan) -> std::vector<decltype(&plan.dst)> {
           &plan.put_starts,
           &plan.uniq_in,
           &plan.reduce_task_starts,
-          &plan.reducer_start,
-          &plan.reducer_flags};
+          &plan.reducer_start};
 }
 
 }  // namespace
@@ -162,7 +161,6 @@ BwdPlanView BwdPlan::view(const Sizes &sizes) const {
   view.uniq_in = data_of<int64_t>(uniq_in);
   view.reduce_task_starts = data_of<int64_t>(reduce_task_starts);
   view.reducer_start = data_of<int64_t>(reducer_start);
-  view.reducer_flags = data_of<int32_t>(reducer_flags);
   view.heavy_subs = heavy_subs;
   return view;
 }

@@ -190,17 +190,16 @@ struct OutTables {
   __device__ __forceinline__ char *proxy_row(int proxy, int64_t slot) const {
     return node.peer(layout().rows.proxy_row(slot), proxy);
   }
-  // A push task's flag at a proxy.
-  __device__ __forceinline__ uint64_t *push_flag(int proxy, int64_t flag) const {
-    return node.peer(layout().rows.push_flags() + flag, proxy);
-  }
   // A proxy's words of its chunk `chunk`: when it landed, and the rows its
-  // node's requesters pulled of it.
+  // node's requesters pulled of it (forward) and pushed into it (backward).
   __device__ __forceinline__ const uint64_t *landed(int proxy, int64_t chunk) const {
     return node.peer(layout().ctrl.landed(chunk), proxy);
   }
   __device__ __forceinline__ uint64_t *pulled_rows(int proxy, int64_t chunk) const {
     return node.peer(layout().ctrl.pulled_rows(chunk), proxy);
+  }
+  __device__ __forceinline__ uint64_t *pushed_rows(int proxy, int64_t chunk) const {
+    return node.peer(layout().ctrl.pushed_rows(chunk), proxy);
   }
   __device__ __forceinline__ const uint64_t *slot_free(int proxy) const {
     return node.peer(layout().ctrl.slot_free(), proxy);
@@ -208,14 +207,6 @@ struct OutTables {
   // The most of a proxy's slot_free word that this CTA's warps saw.
   __device__ __forceinline__ uint64_t *free_seen(int proxy) const {
     return (uint64_t *)out_shared() + proxy;
-  }
-  // This rank's push order at a proxy in a chunk (positions of push_order)
-  // and the next chunk's entry, which holds the ends.
-  __device__ __forceinline__ void req_of(int proxy, int64_t chunk, ReqEntry &entry,
-                                         ReqEntry &next) const {
-    const ReqEntry *push_entry = plan.push_entry(proxy, chunk);
-    entry = push_entry[0];
-    next = push_entry[1];
   }
   // The owner of one of this rank's rows (its bucketized rows by owner).
   __device__ __forceinline__ int owner_of(int64_t row) const {

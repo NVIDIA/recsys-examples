@@ -81,9 +81,6 @@ void Config::validate() const {
     if (2 * capacities.remote_keys + sizes.num_proxy_rows > (int64_t)UINT32_MAX)
       refuse("a proxy's stream of remote_keys rows through proxy_rows of ", sizes.num_proxy_rows,
              " rows may pass position 2^32; lower remote_keys");
-    if (sizes.flag_words() >= kMaxEntries)
-      refuse("a proxy's push-task flags for remote_keys at ", local_size, " GPUs per node are ",
-             sizes.flag_words(), ", more than int32 numbers hold; lower remote_keys");
   }
   if (!(timeout_s > 0)) refuse("the timeout must be positive, got ", timeout_s);
   if (ctas < 0 || reduce_ctas < 1)

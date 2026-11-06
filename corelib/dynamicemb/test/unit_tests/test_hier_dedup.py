@@ -36,15 +36,16 @@ garbage before the call. The checks:
   bucket feature), their records, the chunks of its stream
   (levels of each owner node's rows, packed, in laps when they pass the ring)
   and where each lies, each occurrence's row and slot (the first
-  occurrence's row, then duplicate slots), push positions, push tables,
-  flags and the reducer list (a flag per row of each key); its records of
-  each bucket feature against a dedup by merge ranks (each key's bucket
-  feature that of its occurrence of least merge rank), as equal sets;
+  occurrence's row, then duplicate slots), push positions, push tables and
+  the rows before each key; its records of each bucket feature against a
+  dedup by merge ranks (each key's bucket feature that of its occurrence of
+  least merge rank), as equal sets;
 * each requester's maps (its node's owners' KJT places, its keys' rows and
   slots at its proxies), push order, push tables and task starts; and per
   node a backward with integer gradients through the requesters' push tasks
-  and the proxies' reducer lists, each key's rows its key row and then its
-  duplicates' slots;
+  (each counting its rows in its chunk's pushed_rows, which must reach the
+  chunk's rows once every row is in) and the proxies' reducers, each key's
+  rows its key row and then its duplicates' slots;
 * the rail: each proxy's slices start where its owners' offsets say, and
   each owner sends each proxy its KJT's offsets of that node's features
   (source_offsets); each owner's KJT and the chunks it got; each rank's put
@@ -113,13 +114,6 @@ def owner_chunks(case: "Case", lookup_keys: int, remote_keys: int) -> int:
     return others + min(
         others * remote_keys, max_key_rows(case) * lookup_keys
     ) // chunk_room(case)
-
-
-def flag_words(case: "Case", remote_keys: int) -> int:
-    """The push-task flags of a call (Sizes::flag_words)."""
-    return (
-        remote_keys // TASK_ROWS + case.local_size * max_chunks(case, remote_keys) + 1
-    )
 
 
 @dataclass
@@ -508,7 +502,7 @@ def make_windows(case: Case, lookup_keys: int, remote_keys: int, generator) -> D
             generator,
         ),
         proxy_header=garbage(
-            4 + chunks + 2 * local_size * (chunks + 1),
+            4 + chunks + local_size * (chunks + 1),
             torch.int32,
             generator,
         ),
@@ -683,40 +677,13 @@ def proxy_reference(case: Case, occurrences: List, node: int, remote_keys: int) 
         for pos, occ in enumerate(sorted(mine, key=lambda occ: chunk_of[key_of[occ]])):
             position[occ] = pos
             pushes[requester][chunk_of[key_of[occ]]] += 1
-    # push tables: per requester and chunk its start and its first flag; the
-    # flags chunk after chunk, requester after requester in one
-    tasks = [
-        [ceil32(pushes[requester][chunk]) for chunk in range(capacity + 1)]
+    # push tables: per requester and chunk where its positions start
+    push_tables = [
+        list(accumulate([0] + pushes[requester][:capacity]))
         for requester in range(local_size)
     ]
-    flag_start = list(
-        accumulate(
-            [0]
-            + [
-                sum(tasks[requester][chunk] for requester in range(local_size))
-                for chunk in range(capacity)
-            ]
-        )
-    )
-    push_tables = []
-    for requester in range(local_size):
-        entries, start = [], 0
-        for chunk in range(capacity + 1):
-            flags = flag_start[chunk] + sum(
-                tasks[lower][chunk] for lower in range(requester)
-            )
-            entries.append([start, flags])
-            start += pushes[requester][chunk]
-        push_tables.append(entries)
-    # the reducer list: per row of each key (its key row, then its
-    # duplicates' slots: its occurrences in order), the flag of the push task
-    # that fills it
-    reducer_flags, reducer_start = [], [0]
-    for key, (*_, group) in enumerate(keys):
-        for occ in group[: rows[key]]:
-            entry = push_tables[occurrences[occ][0]][chunk_of[key]]
-            reducer_flags.append(entry[1] + (position[occ] - entry[0]) // TASK_ROWS)
-        reducer_start.append(len(reducer_flags))
+    # the rows before each key: its key row, then its duplicates' slots
+    reducer_start = list(accumulate([0] + rows))
     # records: the key and, in 16 bytes, its weights' sum
     records = []
     for *_, value, _, group in keys:
@@ -756,7 +723,6 @@ def proxy_reference(case: Case, occurrences: List, node: int, remote_keys: int) 
         position=position,
         push_tables=push_tables,
         reducer_start=reducer_start,
-        reducer_flags=reducer_flags,
         records=records,
         reduce_task_starts=list(
             accumulate([0] + [ceil32(table[chunk][2]) for chunk in range(capacity)])
@@ -1138,7 +1104,7 @@ def check_proxy(
     )
     expect(
         "push tables",
-        header[4 + capacity :].view(local_size, capacity + 1, 2).tolist(),
+        header[4 + capacity :].view(local_size, capacity + 1).tolist(),
         ref["push_tables"],
     )
     # key_stage: per owner node its chunks, then its keys' records
@@ -1195,13 +1161,11 @@ def check_proxy(
         {bucket_feature: sorted(group) for bucket_feature, group in records_of.items()},
         dedup_by_merge_rank(case, ref["occurrences"]),
     )
-    # the reducer list
-    reducer_start = out["reducer_start"][: num_keys + 1].tolist()
-    expect("reducer starts", reducer_start, ref["reducer_start"])
+    # the rows before each key
     expect(
-        "reducer flags",
-        out["reducer_flags"][: reducer_start[-1]].tolist(),
-        ref["reducer_flags"],
+        "reducer starts",
+        out["reducer_start"][: num_keys + 1].tolist(),
+        ref["reducer_start"],
     )
     return problems
 
@@ -1270,10 +1234,7 @@ def check_requester(
     for proxy in range(local_size):
         start = push_order_off[proxy]
         tables.append(
-            [
-                [entry[0] + start, entry[1]]
-                for entry in refs[(node, proxy)]["push_tables"][local_rank]
-            ]
+            [entry + start for entry in refs[(node, proxy)]["push_tables"][local_rank]]
         )
     expect("push tables", out["push_tables"].tolist(), tables)
     expect(
@@ -1298,7 +1259,7 @@ def check_requester(
             proxy = (local_rank + turn) % local_size
             tasks = 0
             if chunk < refs[(node, proxy)]["num_chunks"]:
-                tasks = ceil32(tables[proxy][chunk + 1][0] - tables[proxy][chunk][0])
+                tasks = ceil32(tables[proxy][chunk + 1] - tables[proxy][chunk])
             task_starts.append(task_starts[-1] + tasks)
     expect("task_starts", out["task_starts"].tolist(), task_starts)
     return problems
@@ -1311,18 +1272,17 @@ def check_backward(
     refs: Dict,
     proxies,
     requesters,
-    remote_keys: int,
     generator,
 ):
     """A backward of the node with integer gradients: each requester pushes
-    its rows of a chunk at a proxy as its push tasks do, each with its task's
-    flag; each proxy's reducers sum their keys' rows (a key's row, then its
-    duplicates' slots after the chunk's keys' rows, from the reducer list's
-    starts), whose flags the reducer list must name. Every key gets the sum
-    of its occurrences' gradients, and every flag of the call is one
-    task's."""
+    its rows of a chunk at a proxy as its push tasks do, each task counting
+    its rows in the chunk's pushed_rows; each proxy's reducers wait until a
+    chunk's count reaches its rows, then sum their keys' rows (a key's row,
+    then its duplicates' slots after the chunk's keys' rows, from the rows
+    before each key). The pushes of a chunk fill each of its rows once, so
+    its count reaches its rows exactly when every row is in, and every key
+    gets the sum of its occurrences' gradients."""
     local_size, ring = case.local_size, case.num_proxy_rows
-    flags = flag_words(case, remote_keys)
     problems = []
     node_ranks = range(node * local_size, (node + 1) * local_size)
     grads = [
@@ -1341,33 +1301,30 @@ def check_backward(
     for proxy in range(local_size):
         ref = refs[(node, proxy)]
         reducer_start = proxies[node * local_size + proxy]["reducer_start"].tolist()
-        reducer_flags = proxies[node * local_size + proxy]["reducer_flags"].tolist()
         occurrences_of = [[] for _ in range(ref["num_keys"])]
         for occ, key in enumerate(ref["key_of"]):
             occurrences_of[key].append(ref["occurrences"][occ])
-        flags_used = [0] * flags
         for chunk in range(ref["num_chunks"]):
-            store: Dict = {}  # slot -> pushes of (gradient, flag)
+            store: Dict = {}  # slot -> the gradients pushed there
+            pushed = 0  # the chunk's pushed_rows: each push task's rows
             for requester, table in enumerate(tables):
-                entry = table["push_tables"][proxy][chunk]
-                next_entry = table["push_tables"][proxy][chunk + 1]
-                last_flag = entry[1] + ceil32(next_entry[0] - entry[0])
-                if last_flag > flags:
-                    problems.append("flags past flag_words")
-                for flag in range(entry[1], min(last_flag, flags)):
-                    flags_used[flag] += 1
-                for position in range(entry[0], next_entry[0]):
+                lo = table["push_tables"][proxy][chunk]
+                hi = table["push_tables"][proxy][chunk + 1]
+                for first in range(lo, hi, TASK_ROWS):
+                    pushed += min(TASK_ROWS, hi - first)
+                for position in range(lo, hi):
                     row = table["push_order"][position]
                     store.setdefault(table["dst"][row], []).append(
-                        (
-                            grads[requester][row],
-                            entry[1] + (position - entry[0]) // TASK_ROWS,
-                        )
+                        grads[requester][row]
                     )
             if any(len(pushes) > 1 for pushes in store.values()):
                 problems.append("two pushes to one slot")
-            _, key_lo, num, _, start, *_ = ref["chunks"][chunk]
-            at = start % ring
+            _, key_lo, num, _, start, end, *_ = ref["chunks"][chunk]
+            at, chunk_rows = start % ring, end - start
+            if pushed != chunk_rows:
+                problems.append("a chunk's pushed rows != its rows")
+            if sorted(store) != list(range(at, at + chunk_rows)):
+                problems.append("a chunk's pushes miss or pass its rows")
             for key in range(key_lo, key_lo + num):
                 begin, end = reducer_start[key], reducer_start[key + 1]
                 duplicates = at + num + begin - reducer_start[key_lo] - (key - key_lo)
@@ -1382,14 +1339,10 @@ def check_backward(
                     if not pushes:
                         problems.append("a key's row without a push")
                         continue
-                    if pushes[0][1] != reducer_flags[row]:
-                        problems.append("a reducer flag names another task's")
-                    total += pushes[0][0]
+                    total += pushes[0]
                 want = sum(grads[occ[0]][occ[1]] for occ in occurrences_of[key])
                 if total != want:
                     problems.append("a key's gradient sum")
-        if max(flags_used, default=0) > 1:
-            problems.append("flag ranges of tasks overlap")
     return problems
 
 
@@ -1700,9 +1653,7 @@ def run_case(case: Case, seed: int) -> Tuple[Dict[str, List[str]], str]:
     )
     checks["backward"] = sum(
         (
-            check_backward(
-                case, node, ranks, refs, proxies, requesters, remote_keys, generator
-            )
+            check_backward(case, node, ranks, refs, proxies, requesters, generator)
             for node in range(num_nodes)
         ),
         [],

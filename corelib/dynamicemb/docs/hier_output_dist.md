@@ -413,7 +413,7 @@ formula.
 | capacity | in the window | elsewhere |
 |---|---|---|
 | `lookup_keys` | `row_bytes` (`lookup_rows`) + 8 (`node_keys`; 12 when the keys carry weights) + across nodes `record_bytes` (`rail_keys`) | per call, 8 (12 with weights) for the owner's KJT |
-| `remote_keys` | 8 (`node_keys`; 12 with weights) + 4 (`bucket_feature_of_occ`) + 12 (`remote_map`) + `record_bytes` (`key_stage`), and `row_bytes` in `proxy_rows`, up to its cap | per call, 12 (the proxy's reducer list) |
+| `remote_keys` | 8 (`node_keys`; 12 with weights) + 4 (`bucket_feature_of_occ`) + 12 (`remote_map`) + `record_bytes` (`key_stage`), and `row_bytes` in `proxy_rows`, up to its cap | per call, 8 (the proxy's rows before each key, `reducer_start`) |
 
 The input dist's working memory comes on top, in the caching allocator's
 pool of the stream it runs on: that of its largest step (section 15.2).
@@ -472,7 +472,7 @@ state that every rank shares.
 | ranks that would build the op from different options, capacities or environment values | first `input_dist()`, before the op is built | `ValueError` on every rank, naming the first rank and value that differ |
 | ranks that are not whole nodes; `world_size × num_features` of 2^31 − 1024 or more; rows not a multiple of 16 bytes | first `input_dist()` | a warning, TorchRec's dists |
 | keys that are not index-deduplicated (a sharder without `use_index_dedup=True`) | first `input_dist()`, before the op is built | `"fused"`: `ValueError` on every rank; `"auto"`: a warning, TorchRec's dists |
-| a configuration the op cannot take: across nodes, capacities without `remote_keys`; a proxy cap below the least rows of its ring (section 15.3); a `remote_keys` whose stream could pass position 2^32, or whose push-task flags would pass int32 numbers (section 12.1); rows that are not fp32, bf16 or fp16; an environment value it refuses (section 4.4) | first `input_dist()`, before the op is built | `"fused"`: `ValueError` on every rank; `"auto"`: a warning, TorchRec's dists |
+| a configuration the op cannot take: across nodes, capacities without `remote_keys`; a proxy cap below the least rows of its ring (section 15.3); a `remote_keys` whose stream could pass position 2^32 (section 12.1); rows that are not fp32, bf16 or fp16; an environment value it refuses (section 4.4) | first `input_dist()`, before the op is built | `"fused"`: `ValueError` on every rank; `"auto"`: a warning, TorchRec's dists |
 | On some rank: the NCCL LSA team is not the whole node. Or, across nodes, GIN does not connect the rails, has fewer than 4 contexts, or its signals do not start at 0. Or the window cannot be allocated. | first `input_dist()`, collectively | a warning that names each rank and why, TorchRec's dists on every rank |
 | an eval forward | per call | TorchRec's dists for that call |
 | a call that does not fit the capacities, or a proxy that gets one key more than `local_size` times | per call, at its second wait | `RuntimeError` on every rank, naming the capacity to raise or the key's occurrences (section 5.4) |
@@ -667,7 +667,7 @@ the planner's kernels, with CUB's sorts and scans.
 | `node_done` | comm | tells its targets; waits until every requester of the node told it | 10.2 |
 | owner's KJT (one node) | kernels | a copy of the own part of `node_keys`, and the requester's map | 10.3 |
 | node dedup | kernels, CUB | the proxy's node-unique keys, rows, the chunks of its stream and their slots | 9, 10.4 |
-| push order | kernels, CUB | its requesters' push orders and push tables, and its reducer list | 10.4 |
+| push order | kernels, CUB | its requesters' push orders and push tables | 10.4 |
 | count message | kernel | what this rank's rail peers must know of it | 10.4 |
 | `rail_count_exchange` | comm | its count message to each rail peer, and theirs | 10.2 |
 | rail layout | kernel | where each proxy's key records land, this owner's KJT layout, and where each proxy node's keys of each feature start in it (`source_offsets`) | 10.4 |
@@ -770,7 +770,7 @@ first, so the places of their buffers take the least to compute):
 
 | section | size | buffers |
 |---|---|---|
-| rows | `lookup_keys` rows; across nodes also `proxy_rows` | `lookup_rows` (the lookup output, then its gradient). Across nodes also `proxy_rows` and `push_flags`. |
+| rows | `lookup_keys` rows; across nodes also `proxy_rows` | `lookup_rows` (the lookup output, then its gradient). Across nodes also `proxy_rows`. |
 | ctrl | its control words (section 15.2: 80 KB at 32 nodes, 8 GPUs per node and 64 features), most of them the count messages | one buffer, `ctrl`: the control words of both channels (sequence numbers, running totals, the credits sent, the count vectors and count messages, each GIN warp's place with each rail peer) |
 | keys | from `lookup_keys`, and across nodes `remote_keys` | `node_keys` and, with weights, `node_weights`. Across nodes also `bucket_feature_of_occ`, `remote_map`, `proxy_header`, `key_stage`, `rail_keys`, `source_offsets` and `owner_offsets`. |
 
@@ -795,17 +795,14 @@ nodes has:
 * `source_offsets`: as owner, where each rail proxy's node's keys of each
   feature start in its KJT, which it puts to that proxy;
 * `owner_offsets`: as proxy, where its node's keys of each feature start in
-  each rail owner's KJT, as the owners put them;
-* `push_flags`: the flags of the rows the requesters push into `proxy_rows`
-  in a call, one per push task (section 11.4).
+  each rail owner's KJT, as the owners put them.
 
 The window is made when the op is built, from `ncclMemAlloc` and
 `ncclCommWindowRegister`. It has the same size on every rank, is rounded up
 to whole allocation granules, and keeps its size for the op's life. Each
 buffer, the ctrl section too, starts at a 4 KiB boundary (`kBufferAlign`).
 Before the registration each rank zeroes its ctrl section (sequence numbers
-start at 0) and `push_flags` (their tags start at 0); every other buffer is
-written before it is read. Each view of `lookup_rows` holds this rank's copy:
+start at 0); every other buffer is written before it is read. Each view of `lookup_rows` holds this rank's copy:
 its memory goes once the op has let go of it and every view is gone (section
 4.6).
 
@@ -1129,20 +1126,18 @@ window that its node's requesters and its rail's owners read:
   bits and 4 zero bytes;
 * `proxy_header` (`ProxyHeader`, int32 words): the chunks of its stream at
   word 0 and the stream's end at word 1; from word 4 each chunk's end; then
-  its push tables, per requester `max_chunks + 1` entries (`ReqEntry`: a
-  first position and a first push-task flag), with positions relative to
-  that requester's push order.
+  its push tables, per requester `max_chunks + 1` positions: where its rows
+  of each chunk start (the last: where they end), relative to that
+  requester's push order.
 
 A requester's push order at the proxy comes from one stable radix sort of
 the push key, the occurrence's part: requester × (`max_chunks` + 1) + its
 key's chunk. So a requester pushes its rows chunk after chunk, in each chunk
-in its own order. Its push tables give, per chunk, its first position and
-its first push-task flag; a pass over the sorted push keys writes where each
-part starts, so the tables take no search. The flags of a call number its
-tasks chunk after chunk, in a chunk requester after requester, a task per
-32 rows. The reducer list gives, for each row of each key (its key row,
-then its duplicates' slots, in occurrence order), the flag of the push task
-that fills it; where the rows lie follows from the chunk (section 12.1).
+in its own order. Its push tables give, per chunk, its first position; a
+pass over the sorted push keys writes where each part starts, so the tables
+take no search. A key's rows are its key row, then its duplicates' slots
+in occurrence order; `reducer_start` holds the rows before each key, and
+where the rows lie follows from the chunk (section 12.1).
 
 **The rail.** Each rank sends each rail peer a count message
 (`CountMessage`, int64 words). Its common part, the same for every peer:
@@ -1225,7 +1220,10 @@ stream: the forward kernel `fwd_kernel` and the backward kernel
 * **Entry.** CTA 0 publishes `out_seq` in its `out_started` word (after a
   system fence) and every CTA waits until all node peers have published
   theirs. A peer past this point has finished its lookup (which wrote its
-  `lookup_rows`) and every earlier out kernel.
+  `lookup_rows`) and every earlier out kernel. Before it publishes, the
+  backward's CTA 0 zeroes the words it counts from 0 (the heavy rows' done
+  counters, and across nodes each chunk's `ready` and `pushed_rows`), so no
+  peer counts on one before it is zeroed.
 * **Tasks.** Warps take 32-row tasks from one queue (a `task` word). Owners
   (and proxies) take turns, starting from each rank's own, so the ranks of a
   node start on different peers.
@@ -1254,7 +1252,7 @@ stream: the forward kernel `fwd_kernel` and the backward kernel
   requester's `src` and `push_order_off`, the owner's `fwd_chunks` and the
   proxy's `node_chunk_start`, `node_chunks` and `uniq_out`. The backward
   reads its `dst`, the owner's `uniq_in`, and the proxy's
-  `reduce_task_starts` and its reducer list.
+  `reduce_task_starts` and `reducer_start`.
   Their strides are `max_chunks` and `num_nodes`. The call also holds what the op gives
   the kernel for it: the forward's output, the backward's gradient and its
   scratch (the heavy rows' sums and counts), across nodes the counts the
@@ -1327,16 +1325,18 @@ On one node the forward kernel is built without the code for several nodes.
   gradient division it then multiplies by `1 / world_size` in fp32 and
   rounds once to the row dtype, as TorchRec's `div_(world_size)` does. It
   pushes each row, in push order, into a same-node owner's `lookup_rows`,
-  or into its proxy's `proxy_rows` at the row's slot. It sets one flag per
-  32-row task, tagged with `out_seq`. A push into a chunk past the ring's
-  first lap waits until the proxy has freed the chunk's rows.
-* **Proxy reducers** (the last CTAs, 8 by default). They wait for the flags
-  of each key's rows in the reducer list. They add up each key of several
-  rows in fp32, in a fixed order: its key row, then its duplicates' slots,
-  its occurrences by requester and position. They round the sum once into
-  the key's row, and count the keys of the chunk as ready. A key of one row
-  is not touched: the NIC reads it where the requester's NVLink stores left
-  it.
+  or into its proxy's `proxy_rows` at the row's slot. Each 32-row task
+  then adds its rows to its chunk's `pushed_rows` word at the proxy (a
+  release add). A push into a chunk past the ring's first lap waits until
+  the proxy has freed the chunk's rows.
+* **Proxy reducers** (the last CTAs, 8 by default). A reducer task (32
+  keys of a chunk) waits until the chunk's `pushed_rows` reaches its rows
+  (`end − start`): the chunk's pushes fill each of its rows once, so every
+  row is then in. They add up each key of several rows in fp32, in a fixed
+  order: its key row, then its duplicates' slots, its occurrences by
+  requester and position. They round the sum once into the key's row, and
+  count the keys of the chunk as ready. A key of one row is not touched:
+  the NIC reads it where the requester's NVLink stores left it.
 * **Proxy issuer**: the last warp of CTA 0, whose lanes take the owner
   nodes in turn. Once an owner's `bwd_ready` is in, it puts each chunk (at
   most 2 MiB of rows) of that owner node into the owner's `lookup_rows` as
@@ -1460,17 +1460,19 @@ the op.
 
 * **NVLink.** A writer stores rows with 16-byte stores, waits at a warp or
   CTA barrier, then does one *release* store (system scope) of a flag
-  tagged with the sequence number. The reader does an *acquire* load of the
-  flag, then reads the rows past the L1 cache. (Release and acquire are
-  ordering rules: every write before the release is seen by a reader after
-  its acquire.)
+  tagged with the sequence number, or one release add of its rows to a
+  count (the backward's pushes into a chunk, the forward's pulls of one).
+  The reader does an *acquire* load of the flag, or of the count until it
+  reaches the rows it waits for, then reads the rows past the L1 cache.
+  (Release and acquire are ordering rules: every write before the release
+  is seen by a reader after its acquire.)
 * **GIN.** The sender makes one system-scope fence, then puts. The forward
   fences once per kernel, since the lookup wrote `lookup_rows` before the
   kernel. The backward fences once per chunk. Each put adds to a signal
   at the receiver, which reads the signal before the rows. In the backward,
   a node peer writes rows over NVLink and the NIC then reads them. A chain
-  orders the two: the task flag (release), the reducer (acquire), the
-  chunk's ready counter (release), the issuer (acquire), and its fence
+  orders the two: the push task's count (release), the reducer (acquire),
+  the chunk's ready counter (release), the issuer (acquire), and its fence
   before the put.
 * **The in channel.** What peers wrote is read only after an acquire of
   their flag or signal. The comm kernel that acquired it reads past the L1
@@ -1550,22 +1552,21 @@ The capacities are the ones in place (section 5), and `row_bytes` and
 
 | buffer | bytes | kind |
 |---|---|---|
-| `ctrl` (the ctrl section) | one node: `16 × local_size × (num_features + 2) + 64`; across nodes about `8 × (3 × num_features × (local_size + num_nodes) + 4 × num_nodes² + 16 × num_nodes + 4 × local_size + 2 × max_chunks + 64)`, most of it the count messages: 97 KB at 32 nodes, 8 GPUs per node and 64 features, 8.1 MB at 256 nodes and 1,000 features, and 16 bytes per chunk of `max_chunks` | persistent |
+| `ctrl` (the ctrl section) | one node: `16 × local_size × (num_features + 2) + 64`; across nodes about `8 × (3 × num_features × (local_size + num_nodes) + 4 × num_nodes² + 16 × num_nodes + 4 × local_size + 3 × max_chunks + 64)`, most of it the count messages: 97 KB at 32 nodes, 8 GPUs per node and 64 features, 8.1 MB at 256 nodes and 1,000 features, and 24 bytes per chunk of `max_chunks` | persistent |
 | `node_keys` | `8 × (lookup_keys + remote_keys)` (one node: `lookup_keys` alone) | persistent |
 | `node_weights` | with weights, `4 × (lookup_keys + remote_keys)` | persistent |
 | `bucket_feature_of_occ` | `4 × remote_keys` | persistent |
 | `remote_map` | `12 × remote_keys`: three int32 arrays | persistent |
-| `proxy_header` | `4 × (4 + max_chunks + 2 × local_size × (max_chunks + 1))` | persistent |
+| `proxy_header` | `4 × (4 + max_chunks + local_size × (max_chunks + 1))` | persistent |
 | `key_stage` | `record_bytes × remote_keys + 16 × max_chunks + 16` | persistent |
 | `rail_keys` | `record_bytes × lookup_keys + 16 × owner_chunks` | persistent |
 | `source_offsets`, `owner_offsets` | `8 × num_nodes × num_features` each | persistent |
 | `lookup_rows` | `row_bytes × lookup_keys` | persistent |
 | `proxy_rows` | `row_bytes × num_proxy_rows` (section 15.3) | persistent |
-| `push_flags` | `8 × (remote_keys / 32 + local_size × max_chunks + 1)` | persistent |
 | the requester's maps | 8 bytes per key on one node (`inv`, `src`), 16 across nodes (also `dst`, `push_order`) | per call |
 | the call's small tables across nodes: the requester's of the node's proxies and its task starts, the owner's and the proxy's (section 11.1) | about `24 × local_size × max_chunks + 48 × max_chunks + 16 × owner_chunks`, plus a few KB | per call |
 | the owner's KJT values | `8 × lookup_keys` (12 with weights), from the input dist until the forward | per call |
-| the proxy's reducer list | `12 × remote_keys` | per call |
+| the proxy's rows before each key (`reducer_start`) | `8 × remote_keys` | per call |
 | the put lists and the ready counters | `24 × max_chunks + 16 × owner_chunks + 32 × num_nodes × num_features` | per call |
 | index dedup's fan-out table | about 13 bytes per original key (on this path the deduplicated KJT keeps the original length) | per call |
 | the bucketize, in the caller's pool | at its peak 25 bytes per key with one owner rule (67 with three), and about 60 with index dedup while the fan-out table is made | transient |
@@ -1578,8 +1579,8 @@ planner's, which comes from the code.
 
 The constructors of the layouts size the window's buffers as above
 (`CtrlLayout`, `KeysLayout` and `RowsLayout`, in `window.h`). The buffers
-from `bucket_feature_of_occ` to `owner_offsets`, and `proxy_rows` and
-`push_flags`, exist across nodes only, and `node_weights` with weights
+from `bucket_feature_of_occ` to `owner_offsets`, and `proxy_rows`, exist
+across nodes only, and `node_weights` with weights
 only: else they take 0 bytes. Each buffer, the ctrl section too, takes a whole number of 4 KiB
 units (`kBufferAlign`). So the window's bytes are the sum of its buffers,
 each rounded up to 4 KiB (`WindowLayout::bytes`), and its copy on each rank
@@ -1590,9 +1591,10 @@ With uniform keys across nodes, and capacities 1.25 times the needs
 (section 5.2), the keys section takes about
 `1.25 × num_keys × (16 × (1 + (num_nodes − 1) × uniq_share) + 32 × (num_nodes − 1)) / num_nodes`
 bytes. That is about 39 bytes per key at 2 nodes, and 58 at 32 nodes. The
-per-call tensors take about 33 to 41 bytes per key across nodes: 16 for the
+per-call tensors take about 31 to 36 bytes per key across nodes: 16 for the
 requester's maps, about 10 for the owner's KJT until the forward, and
-`12 × 1.25 × (num_nodes − 1) / num_nodes` for the reducer list.
+`8 × 1.25 × (num_nodes − 1) / num_nodes` for the proxy's rows before each
+key.
 
 ### 15.3 `proxy_rows` and its ring
 
@@ -1610,8 +1612,7 @@ So the ring holds a call's rows in one lap when `remote_keys` rows fit under
 the cap: its stream then lies in it as it is. A cap below `4 × max_key_rows
 × row_bytes` (two chunks of keys of the most rows) is refused when the op is
 built (section 6), and so is a `remote_keys` whose stream could pass
-position 2^32 (`2 × remote_keys + num_proxy_rows` of 2^32 or more), or whose
-push-task flags would pass int32 numbers.
+position 2^32 (`2 × remote_keys + num_proxy_rows` of 2^32 or more).
 
 The **rows a proxy needs** count, per node-unique key, one row per
 occurrence (the key's row and its duplicates' slots): at most `local_size`,
@@ -1661,24 +1662,24 @@ sizing rules in the code, with capacities 1.25 times the needs and at least
 section 15.2. It assumes uniform keys, mean loads, no weights, one owner
 rule and 8 GPUs per node; it is not measured. GB per rank. "Persistent" is
 the window: `lookup_rows` + `proxy_rows` + its other buffers (the ctrl and
-keys sections and `push_flags`); "per call" is one call's tensors;
+keys sections); "per call" is one call's tensors;
 "planner" is the planner's largest step's working memory, and "bucketize"
 the bucketize's, both in the caller's pool.
 
 | case | nodes (GPUs) | `lookup_rows` | `proxy_rows` | other buffers | persistent | per call | planner | bucketize | laps |
 |---|---|---|---|---|---|---|---|---|---|
 | the benchmark: 540,672 keys per rank, fp32 dim 128, `uniq_share` 0.935 | 1 (8) | 0.35 | – | 0.005 | **0.35** | 0.010 | 0.011 | 0.014 | – |
-| | 2 (16) | 0.34 | 0.17 | 0.021 | **0.53** | 0.019 | 0.043 | 0.014 | 1 |
-| | 4 (32) | 0.33 | 0.26 | 0.027 | **0.62** | 0.021 | 0.050 | 0.014 | 1 |
-| | 8 (64) | 0.33 | 0.30 | 0.029 | **0.66** | 0.022 | 0.059 | 0.014 | 1 |
-| | 32 (256) | 0.32 | 0.34 | 0.031 | **0.69** | 0.023 | 0.065 | 0.014 | 1 |
-| 16,384 samples × 1,536 keys per sample, 1 feature: 25.2M keys per rank, bf16 dim 128, `uniq_share` 1 | 2 (16) | 8.05 | 0.54 | 1.01 | **9.60** | 0.88 | 1.84 | 0.63 | 7 |
-| | 4 (32) | 8.05 | 0.54 | 1.27 | **9.86** | 0.99 | 2.34 | 0.63 | 10 |
-| | 8 (64) | 8.05 | 0.54 | 1.39 | **9.98** | 1.04 | 2.73 | 0.63 | 11 |
-| | 32 (256) | 8.05 | 0.54 | 1.49 | **10.1** | 1.09 | 3.02 | 0.63 | 12 |
-| the same with 2 features: 50.3M keys per rank, fp32 dim 128 | 2 (16) | 32.2 | 0.54 | 2.02 | **34.8** | 1.75 | 3.67 | 1.26 | 25 |
-| | 8 (64) | 32.2 | 0.54 | 2.79 | **35.5** | 2.09 | 5.45 | 1.26 | 43 |
-| | 32 (256) | 32.2 | 0.54 | 2.98 | **35.7** | 2.18 | 6.03 | 1.26 | 47 |
+| | 2 (16) | 0.34 | 0.17 | 0.021 | **0.53** | 0.018 | 0.043 | 0.014 | 1 |
+| | 4 (32) | 0.33 | 0.26 | 0.027 | **0.62** | 0.019 | 0.050 | 0.014 | 1 |
+| | 8 (64) | 0.33 | 0.30 | 0.029 | **0.66** | 0.020 | 0.059 | 0.014 | 1 |
+| | 32 (256) | 0.32 | 0.34 | 0.031 | **0.69** | 0.020 | 0.065 | 0.014 | 1 |
+| 16,384 samples × 1,536 keys per sample, 1 feature: 25.2M keys per rank, bf16 dim 128, `uniq_share` 1 | 2 (16) | 8.05 | 0.54 | 1.01 | **9.60** | 0.82 | 1.84 | 0.63 | 7 |
+| | 4 (32) | 8.05 | 0.54 | 1.26 | **9.85** | 0.90 | 2.34 | 0.63 | 10 |
+| | 8 (64) | 8.05 | 0.54 | 1.38 | **9.97** | 0.93 | 2.73 | 0.63 | 11 |
+| | 32 (256) | 8.05 | 0.54 | 1.48 | **10.1** | 0.97 | 3.02 | 0.63 | 12 |
+| the same with 2 features: 50.3M keys per rank, fp32 dim 128 | 2 (16) | 32.2 | 0.54 | 2.01 | **34.8** | 1.62 | 3.67 | 1.26 | 25 |
+| | 8 (64) | 32.2 | 0.54 | 2.78 | **35.5** | 1.87 | 5.45 | 1.26 | 43 |
+| | 32 (256) | 32.2 | 0.54 | 2.96 | **35.7** | 1.94 | 6.03 | 1.26 | 47 |
 
 The planner's working memory adds 3% to the persistent memory on one node and
 8–9% across nodes at the benchmark's size, and 11–30% at the large batches

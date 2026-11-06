@@ -107,11 +107,6 @@ struct Sizes {
   __host__ __device__ int64_t counters() const {
     return max_chunks < kMaxCounters ? max_chunks : kMaxCounters;
   }
-  // The push-task flags of a call: one per 32 rows of a requester in a
-  // chunk, rounded up.
-  __host__ __device__ int64_t flag_words() const {
-    return remote_keys / kTaskRows + topo.local_size * max_chunks + 1;
-  }
   // The most chunks an owner gets from its rail's proxies: each one's stream
   // holds at most remote_keys / chunk_room + 1 chunks of this owner's node,
   // and the keys this owner looks up take at most max_key_rows rows each.
@@ -199,13 +194,6 @@ static_assert(sizeof(KeyRecord) == 8 && sizeof(WeightedKeyRecord) == 16, "record
 __host__ __device__ inline int64_t min_proxy_rows_for(int64_t max_key_rows) {
   return 4 * max_key_rows;
 }
-// A requester's rows for one proxy, sorted by their position in its push
-// order (push_pos): chunk after chunk. Per chunk:
-struct ReqEntry {
-  int32_t start;  // first position of the chunk (chunk max_chunks: the end of its rows)
-  int32_t flags;  // its first push-task flag of the chunk in the proxy's push_flags: ceil(rows
-                  // / 32) tasks, after those of the chunks before and of the lower requesters
-};
 // A segment of a put list: `rows` rows from src to dst (rows of the source and
 // destination buffers), all in one chunk and in one (feature, source) of the
 // owner's KJT; and its chunk, in the list's chunks: the backward's the

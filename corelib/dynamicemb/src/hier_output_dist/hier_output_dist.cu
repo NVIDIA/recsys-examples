@@ -466,8 +466,6 @@ SymmetricWindow::SymmetricWindow(const Sizes &sizes, int device)
   });
   const WindowLayout window = layout();
   HIER_CUDA_CHECK(cudaMemset(window.ctrl.base(), 0, window.ctrl.bytes()));
-  if (window.rows.push_flags_bytes() > 0)
-    HIER_CUDA_CHECK(cudaMemset(window.rows.push_flags(), 0, window.rows.push_flags_bytes()));
   HIER_CUDA_CHECK(cudaDeviceSynchronize());
 }
 

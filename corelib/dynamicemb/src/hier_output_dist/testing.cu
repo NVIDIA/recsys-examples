@@ -242,7 +242,6 @@ std::map<std::string, at::Tensor> proxy_plan_test(
           {"stage_slice", plan.stage_slice},
           {"reduce_task_starts", plan.reduce_task_starts},
           {"reducer_start", plan.reducer_start},
-          {"reducer_flags", plan.reducer_flags},
           {"message", count_message(need_remote.reshape({}), own_total.reshape({}), plan.key_rows,
                                     plan.uniq_out, plan.chunks_out, plan.uniq_per_bucket_feature)},
           {"key_of_occurrence", key_of_occurrence}};

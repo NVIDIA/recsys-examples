@@ -124,6 +124,7 @@ class CtrlLayout {
     put_at_ = take(multi ? num_nodes : 0);
     landed_ = take(multi ? sizes.max_chunks : 0);
     pulled_rows_ = take(multi ? sizes.max_chunks : 0);
+    pushed_rows_ = take(multi ? sizes.max_chunks : 0);
     posted_ = take(multi ? counters_ : 0);
     slot_free_ = take(multi ? 1 : 0);
     closing_ = take(1);
@@ -211,6 +212,12 @@ class CtrlLayout {
   __host__ __device__ uint64_t *pulled_rows(int64_t chunk) const {
     return word(pulled_rows_ + chunk);
   }
+  // (num_nodes > 1) [max_chunks] gradient rows the node's requesters pushed
+  // into chunk c of this proxy's stream in the current backward, which zeroes
+  // those of its chunks before it publishes its out_seq
+  __host__ __device__ uint64_t *pushed_rows(int64_t chunk) const {
+    return word(pushed_rows_ + chunk);
+  }
   // (num_nodes > 1, local) [counters] backward puts this proxy posted on each
   // put counter, in calls whose stream wraps: what the counter counts
   __host__ __device__ uint64_t *posted(int64_t counter) const { return word(posted_ + counter); }
@@ -235,7 +242,8 @@ class CtrlLayout {
   int64_t in_started_, count_vectors_, in_written_, requester_offsets_, in_done_, count_msg_out_,
       count_msgs_;
   int64_t out_started_, pushed_, pulled_, arrive_, tasks_, landed_rows_, fwd_tot_, bwd_tot_,
-      grant_sent_, bwd_ready_sent_, put_at_, landed_, pulled_rows_, posted_, slot_free_;
+      grant_sent_, bwd_ready_sent_, put_at_, landed_, pulled_rows_, pushed_rows_, posted_,
+      slot_free_;
   int64_t closing_, closed_, words_;
 };
 
@@ -248,10 +256,10 @@ struct GatheredHeader;  // below
 // The proxy header (int32 words), what a proxy publishes to its node's
 // requesters: its stream's chunks at word 0 and its end at word 1 (uint32,
 // unwrapped: past num_proxy_rows when the stream wraps the ring); from word
-// 4 each chunk's end ([max_chunks], uint32); then its push tables, ReqEntry
-// [local_size][max_chunks + 1], positions relative to each requester's push
-// order there. A requester gathers the words it reads (planner.h) by their
-// word numbers.
+// 4 each chunk's end ([max_chunks], uint32); then its push tables
+// [local_size][max_chunks + 1]: where each requester's rows of each chunk
+// start in its push order there (chunk max_chunks: their end). A requester
+// gathers the words it reads (planner.h) by their word numbers.
 struct ProxyHeader {
   static constexpr int64_t kChunksWord = 0, kEndWord = 1, kEndsWord = 4;
   int32_t *base;
@@ -261,7 +269,7 @@ struct ProxyHeader {
   __host__ __device__ static ProxyHeader of(const Sizes &sizes, int32_t *base = nullptr) {
     return ProxyHeader{base, sizes.topo.local_size, sizes.max_chunks};
   }
-  __host__ __device__ int64_t push_words() const { return 2 * (max_chunks + 1); }
+  __host__ __device__ int64_t push_words() const { return max_chunks + 1; }
   __host__ __device__ int64_t push_table_word(int64_t requester) const {
     return kEndsWord + max_chunks + requester * push_words();
   }
@@ -297,8 +305,8 @@ struct GatheredHeader {
         chunk < max_chunks ? ProxyHeader::kGatheredEnds + chunk : ProxyHeader::kGatheredEnd;
     return (int64_t)(uint32_t)words[word];
   }
-  __host__ __device__ const ReqEntry *push_table() const {
-    return (const ReqEntry *)(words + ProxyHeader::kGatheredEnds + max_chunks);
+  __host__ __device__ const int32_t *push_table() const {
+    return words + ProxyHeader::kGatheredEnds + max_chunks;
   }
 };
 __host__ __device__ inline GatheredHeader ProxyHeader::gathered(const int32_t *headers,
@@ -464,8 +472,6 @@ class KeysLayout {
 //                (common.h): the rows of the node-unique keys the rail owners
 //                put (forward), the gradient rows of its node's requesters
 //                and their sums (backward)
-//   push_flags   (num_nodes > 1) the requesters' push-task flags of a call
-//                (flag_words), each tagged with its out_seq
 // Each accessor returns its buffer in the copy at `base`.
 class RowsLayout {
  public:
@@ -473,15 +479,12 @@ class RowsLayout {
       : base_(base), row_bytes_(sizes.row_bytes) {
     const bool multi = sizes.multi_node();
     proxy_rows_ = buffer_end(sizes.lookup_keys * row_bytes_);
-    push_flags_ = proxy_rows_ + buffer_end(multi ? sizes.num_proxy_rows * row_bytes_ : 0);
-    bytes_ = push_flags_ + buffer_end(multi ? 8 * (uint64_t)sizes.flag_words() : 0);
+    bytes_ = proxy_rows_ + buffer_end(multi ? sizes.num_proxy_rows * row_bytes_ : 0);
   }
   __host__ __device__ uint64_t bytes() const { return bytes_; }
   // Each buffer's name and the bytes it takes (HierOutputDist::memory).
   std::vector<std::pair<const char *, uint64_t>> buffers() const {
-    return {{"lookup_rows", proxy_rows_},
-            {"proxy_rows", push_flags_ - proxy_rows_},
-            {"push_flags", bytes_ - push_flags_}};
+    return {{"lookup_rows", proxy_rows_}, {"proxy_rows", bytes_ - proxy_rows_}};
   }
 
   __host__ __device__ char *lookup_rows() const { return base_; }
@@ -492,13 +495,11 @@ class RowsLayout {
   __host__ __device__ char *proxy_row(int64_t slot) const {
     return proxy_rows() + slot * row_bytes_;
   }
-  __host__ __device__ uint64_t *push_flags() const { return (uint64_t *)(base_ + push_flags_); }
-  __host__ __device__ uint64_t push_flags_bytes() const { return bytes_ - push_flags_; }
 
  private:
   char *base_;
   int64_t row_bytes_;
-  uint64_t proxy_rows_, push_flags_, bytes_;  // lookup_rows starts at base
+  uint64_t proxy_rows_, bytes_;  // lookup_rows starts at base
 };
 
 // The op's window: this rank's copy of its symmetric memory, one NCCL window

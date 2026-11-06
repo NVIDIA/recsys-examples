@@ -238,10 +238,8 @@ __device__ __forceinline__ bool remote_pull_warp(const Sizes &sizes, int64_t seq
   const RemoteTask place(plan.task_starts, plan.max_chunks * local_size, task);
   const int64_t chunk = place.entry / local_size;
   const int proxy = (int)((me + place.entry % local_size) % local_size);
-  ReqEntry entry, next;
-  tables.req_of(proxy, chunk, entry, next);
-  const int64_t pos0 = entry.start + place.nth * kTaskRows;
-  const int num_rows = (int)min((int64_t)kTaskRows, next.start - pos0);
+  const int64_t pos0 = plan.push_start(proxy, chunk) + place.nth * kTaskRows;
+  const int num_rows = (int)min((int64_t)kTaskRows, plan.push_start(proxy, chunk + 1) - pos0);
   if (num_rows <= 0) return false;
   const char *src = nullptr;
   int64_t out_row = 0;

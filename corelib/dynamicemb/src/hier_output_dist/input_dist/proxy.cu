@@ -16,7 +16,7 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 ******************************************************************************/
 // The proxy's steps of a call across nodes (planner.h): the node-unique keys
 // of its remote part, their rows, the chunks of its stream and their slots,
-// and its node's push orders with its reducer list.
+// and its node's push orders with their push tables.
 
 #include <algorithm>
 #include <cstdint>
@@ -477,7 +477,7 @@ __global__ void __launch_bounds__(kThreads)
   }
 }
 
-// ── step 3: the push order and the reducer list ──
+// ── step 3: the push order ──
 
 // A thread per sorted position: the push key of its occurrence, its part of
 // the push order, requester * (max_chunks + 1) + chunk (past the valid
@@ -519,80 +519,27 @@ __global__ void __launch_bounds__(kThreads)
   }
 }
 
-// One CTA: the push tables, a ReqEntry per requester and chunk up to
-// max_chunks: where its positions start (part_start) and its first
-// push-task flag. The flags go chunk after chunk (flag_start: the first of
-// each), in a chunk requester after requester, a task per 32 rows; chunk
-// max_chunks has none. push_chunks gets the entries in the positions of
-// this proxy's push order; the proxy header gets them relative to each
-// requester's push order (requester_start).
+// A thread per entry of the push tables, a requester's and a chunk's up to
+// max_chunks: where its positions start (part_start), relative to the
+// requester's push order (requester_start), into the proxy header.
 __global__ void __launch_bounds__(kThreads)
     push_tables_kernel(const int32_t *part_start, const int64_t *requester_start,
-                       int64_t local_size, int64_t max_chunks, ReqEntry *push_chunks,
-                       int64_t *flag_start, ReqEntry *header_tables) {
+                       int64_t local_size, int64_t max_chunks, int32_t *header_tables) {
   const int64_t columns = max_chunks + 1;  // the entries of a requester
-  for (int64_t index = threadIdx.x; index < local_size * columns; index += kThreads)
-    push_chunks[index] = ReqEntry{part_start[index], 0};
-  __syncthreads();
-  // a requester's tasks in a chunk, of 32 rows
-  auto tasks = [&](int64_t requester, int64_t chunk) -> int64_t {
-    if (chunk >= max_chunks) return 0;
-    const ReqEntry *entry = push_chunks + requester * columns + chunk;
-    return ceil_div<kTaskRows>((int64_t)entry[1].start - entry[0].start);
-  };
-  cta_exclusive_ends<int64_t>(
-      columns,
-      [&](int64_t chunk) {
-        int64_t flags = 0;
-        for (int64_t requester = 0; requester < local_size; ++requester)
-          flags += tasks(requester, chunk);
-        return flags;
-      },
-      flag_start);
-  // a thread per chunk: the flags, requester after requester; then the copies
-  for (int64_t chunk = threadIdx.x; chunk < columns; chunk += kThreads) {
-    int64_t flags = flag_start[chunk];
-    for (int64_t requester = 0; requester < local_size; ++requester) {
-      ReqEntry &entry = push_chunks[requester * columns + chunk];
-      entry.flags = (int32_t)flags;
-      flags += tasks(requester, chunk);
-      header_tables[requester * columns + chunk] =
-          ReqEntry{entry.start - (int32_t)requester_start[requester], entry.flags};
-    }
-  }
+  for (int64_t index = first_item(); index < local_size * columns; index += item_stride())
+    header_tables[index] = part_start[index] - (int32_t)requester_start[index / columns];
 }
 
 // A thread per valid push position: its occurrence's place in its
-// requester's push order (remote_map's positions), and the flag of the push
-// task that pushes it, from the ReqEntry of its part (requester and chunk).
+// requester's push order (remote_map's positions).
 __global__ void __launch_bounds__(kThreads)
     push_positions_kernel(const int64_t *push_key_sorted, const int32_t *push_order,
-                          const ReqEntry *push_chunks, const int64_t *requester_start,
-                          const int64_t *occurrence_count, int64_t max_chunks,
-                          int32_t *map_position, int32_t *occurrence_flag) {
+                          const int64_t *requester_start, const int64_t *occurrence_count,
+                          int64_t max_chunks, int32_t *map_position) {
   const int64_t count = *occurrence_count;
   for (int64_t position = first_item(); position < count; position += item_stride()) {
-    const int64_t part = push_key_sorted[position], requester = part / (max_chunks + 1);
-    const ReqEntry entry = push_chunks[part];
-    const int32_t occurrence = push_order[position];
-    map_position[occurrence] = (int32_t)(position - requester_start[requester]);
-    occurrence_flag[occurrence] = entry.flags + (int32_t)((position - entry.start) / kTaskRows);
-  }
-}
-
-// A thread per valid sorted position: its occurrence's entry of the reducer
-// list, at row `place` of its key's rows (its place among the key's
-// occurrences): the flag of the push task that fills that row. An occurrence
-// past its key's rows (a call that raises) has none.
-__global__ void __launch_bounds__(kThreads)
-    reducer_flags_kernel(const int32_t *order, const int32_t *key_at, const int32_t *key_first,
-                         const int64_t *row_ends, const int32_t *occurrence_flag,
-                         const int64_t *occurrence_count, int32_t *reducer_flags) {
-  const int64_t count = *occurrence_count;
-  for (int64_t position = first_item(); position < count; position += item_stride()) {
-    const int32_t key = key_at[position];
-    const int64_t row = row_ends[key] + position - key_first[key];
-    if (row < row_ends[key + 1]) reducer_flags[row] = occurrence_flag[order[position]];
+    const int64_t requester = push_key_sorted[position] / (max_chunks + 1);
+    map_position[push_order[position]] = (int32_t)(position - requester_start[requester]);
   }
 }
 
@@ -601,13 +548,13 @@ __global__ void __launch_bounds__(kThreads)
 ProxyBuffers proxy_buffers(at::Tensor remote_map, at::Tensor key_stage, const ProxyHeader &header,
                            const at::TensorOptions &options) {
   const auto int_options = options.dtype(at::kInt);
-  return ProxyBuffers{std::move(remote_map),
-                      std::move(key_stage),
-                      at::from_blob(header.chunks(), {1}, int_options),
-                      at::from_blob(header.end(), {1}, int_options),
-                      at::from_blob(header.ends(), {header.max_chunks}, int_options),
-                      at::from_blob(header.push_table(0),
-                                    {header.local_size, header.max_chunks + 1, 2}, int_options)};
+  return ProxyBuffers{
+      std::move(remote_map),
+      std::move(key_stage),
+      at::from_blob(header.chunks(), {1}, int_options),
+      at::from_blob(header.end(), {1}, int_options),
+      at::from_blob(header.ends(), {header.max_chunks}, int_options),
+      at::from_blob(header.push_table(0), {header.local_size, header.max_chunks + 1}, int_options)};
 }
 
 ProxyKeys proxy_keys(const ProxyInput &input, const Sizes &sizes, bool node_dedup) {
@@ -841,40 +788,26 @@ ProxyPlan proxy_push_order(ProxyKeys keys, ProxyChunks chunks, const at::Tensor 
     std::tie(push_key_sorted, push_order) = sort_pairs(push_key, index, bits_for(parts + 1));
   }
   // Where the parts of the push order start, then the push tables, per
-  // requester and chunk: its first position and its first push-task flag.
+  // requester and chunk: its first position.
   const at::Tensor part_start = at::empty({parts}, int_options);
   part_starts_kernel<<<item_grid(entries), kThreads, 0, stream>>>(
       push_key_sorted.data_ptr<int64_t>(), keys.occurrence_count.data_ptr<int64_t>(), entries,
       parts, part_start.data_ptr<int32_t>());
   C10_CUDA_KERNEL_LAUNCH_CHECK();
-  const at::Tensor push_chunks = at::empty({local_size, max_chunks + 1, 2}, int_options);
-  const at::Tensor flag_start = at::empty({max_chunks + 2}, long_options);
-  push_tables_kernel<<<kOneCta, kThreads, 0, stream>>>(
+  push_tables_kernel<<<item_grid(parts), kThreads, 0, stream>>>(
       part_start.data_ptr<int32_t>(), requester_start.data_ptr<int64_t>(), local_size, max_chunks,
-      records_of<ReqEntry>(push_chunks), flag_start.data_ptr<int64_t>(),
-      records_of<ReqEntry>(buffers.push_tables));
+      buffers.push_tables.data_ptr<int32_t>());
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   // Each occurrence's place in its requester's push order (remote_map's
-  // positions), and the flag of the push task that pushes it.
-  const at::Tensor occurrence_flag = at::empty({entries}, int_options);
+  // positions).
   const RemoteMap remote_map{buffers.remote_map.data_ptr<int32_t>(), entries};
   push_positions_kernel<<<item_grid(entries), kThreads, 0, stream>>>(
       push_key_sorted.data_ptr<int64_t>(), push_order.data_ptr<int32_t>(),
-      records_of<ReqEntry>(push_chunks), requester_start.data_ptr<int64_t>(),
-      keys.occurrence_count.data_ptr<int64_t>(), max_chunks, remote_map.position(),
-      occurrence_flag.data_ptr<int32_t>());
+      requester_start.data_ptr<int64_t>(), keys.occurrence_count.data_ptr<int64_t>(), max_chunks,
+      remote_map.position());
   C10_CUDA_KERNEL_LAUNCH_CHECK();
-  // The reducer list: per row of each key, in key order (its key row, then
-  // its duplicates' slots), the flag of the push task that fills it.
   ProxyPlan plan;
   plan.reducer_start = chunks.row_ends;
-  plan.reducer_flags = at::empty({entries}, int_options);
-  reducer_flags_kernel<<<item_grid(entries), kThreads, 0, stream>>>(
-      keys.order.data_ptr<int32_t>(), keys.key_at.data_ptr<int32_t>(),
-      keys.key_first.data_ptr<int32_t>(), chunks.row_ends.data_ptr<int64_t>(),
-      occurrence_flag.data_ptr<int32_t>(), keys.occurrence_count.data_ptr<int64_t>(),
-      plan.reducer_flags.data_ptr<int32_t>());
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
   plan.num_chunks = chunks.num_chunks;
   plan.occurrence_count = keys.occurrence_count;
   plan.key_rows = keys.key_rows;

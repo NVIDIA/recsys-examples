@@ -57,8 +57,8 @@ struct PlanView {
   const int64_t *proxy_chunks;  // [local_size] the chunks of each same-node proxy's stream
   const int64_t *proxy_ends;    // [local_size][max_chunks + 1] each one's chunk ends, then its
                                 // stream's end
-  const ReqEntry *push_tables;  // [local_size][max_chunks + 1] its push order at each proxy,
-                                // positions absolute in push_order
+  const int32_t *push_tables;   // [local_size][max_chunks + 1] where its rows of each chunk at
+                                // each proxy start in push_order (chunk max_chunks: their end)
   const int64_t *task_starts;   // [max_chunks * local_size + 1] its tasks of rows of other nodes
                                 // before each (chunk, proxy in turn from its own): 32 positions
                                 // of its push order there each, the forward's pulls and the
@@ -75,10 +75,10 @@ struct PlanView {
   int64_t max_chunks, ring;
   int num_nodes;
 
-  // This rank's push order at a same-node proxy in a chunk; the next entry
-  // holds the ends.
-  __device__ __forceinline__ const ReqEntry *push_entry(int proxy, int64_t chunk) const {
-    return push_tables + (int64_t)proxy * (max_chunks + 1) + chunk;
+  // Where this rank's rows of a chunk at a same-node proxy start in its push
+  // order (the next chunk's: where they end).
+  __device__ __forceinline__ int64_t push_start(int proxy, int64_t chunk) const {
+    return push_tables[(int64_t)proxy * (max_chunks + 1) + chunk];
   }
   // The end of a same-node proxy's chunk (chunk max_chunks: its stream's end).
   __device__ __forceinline__ int64_t proxy_end(int proxy, int64_t chunk) const {
@@ -133,8 +133,7 @@ struct BwdPlanView : PlanView {
   // across nodes, the proxy's
   const int64_t *reduce_task_starts;  // [max_chunks + 1] its reducers' tasks before each chunk
                                       // (32 keys each)
-  const int64_t *reducer_start;       // the reducer list (planner.h)
-  const int32_t *reducer_flags;
+  const int64_t *reducer_start;       // [remote_keys + 1] the rows before each key (planner.h)
   // the plan's counts (BwdPlan)
   int64_t heavy_subs;  // sub-tasks of the requester's heavy rows
 
@@ -182,7 +181,7 @@ struct BwdPlan {
   at::Tensor push_order, proxy_chunks, proxy_ends, push_tables, task_starts, num_chunks, chunks,
       uniq_off, put_list, put_starts;
   // across nodes, the backward's own
-  at::Tensor uniq_in, reduce_task_starts, reducer_start, reducer_flags;
+  at::Tensor uniq_in, reduce_task_starts, reducer_start;
 
   BwdPlanView view(const Sizes &sizes) const;
   std::vector<at::Tensor> tensors() const;

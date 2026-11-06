@@ -104,10 +104,9 @@ class Communicator {
 class SymmetricWindow {
  public:
   // Allocates this rank's copy and zeroes what must read 0 before the window
-  // is registered: the ctrl section (sequence numbers start at 0) and
-  // push_flags (tags start at 0). Every other buffer is written before it is
-  // read, so it is never initialized. Throws if it cannot, with nothing left
-  // allocated.
+  // is registered: the ctrl section (sequence numbers start at 0). Every
+  // other buffer is written before it is read, so it is never initialized.
+  // Throws if it cannot, with nothing left allocated.
   SymmetricWindow(const Sizes &sizes, int device);
   SymmetricWindow(const SymmetricWindow &) = delete;
   SymmetricWindow &operator=(const SymmetricWindow &) = delete;

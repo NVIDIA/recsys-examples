@@ -614,8 +614,7 @@ __global__ void __launch_bounds__(kThreads)
 __global__ void __launch_bounds__(kThreads)
     requester_proxy_tables_kernel(const int32_t *headers, const int64_t *offset_per_bucket,
                                   Sizes sizes, int64_t *push_order_off, int64_t *proxy_chunks,
-                                  int64_t *proxy_ends, ReqEntry *push_tables,
-                                  int64_t *task_starts) {
+                                  int64_t *proxy_ends, int32_t *push_tables, int64_t *task_starts) {
   const ProxyHeader header = ProxyHeader::of(sizes);
   const int64_t local_size = sizes.topo.local_size, me = sizes.topo.local_rank,
                 max_chunks = sizes.max_chunks, entries = max_chunks + 1;
@@ -645,9 +644,7 @@ __global__ void __launch_bounds__(kThreads)
   // a thread per entry of a proxy's table
   for (int64_t index = threadIdx.x; index < local_size * entries; index += kThreads) {
     const int64_t proxy = index / entries;
-    const ReqEntry relative = published(proxy)[index % entries];
-    push_tables[index] =
-        ReqEntry{(int32_t)(relative.start + push_order_off[proxy]), relative.flags};
+    push_tables[index] = (int32_t)(published(proxy)[index % entries] + push_order_off[proxy]);
   }
   // The task starts, chunk after chunk: in a chunk the proxies in turn from
   // this rank's own one, kTaskRows positions of its push order a task; a
@@ -658,8 +655,8 @@ __global__ void __launch_bounds__(kThreads)
       [&](int64_t index) -> int64_t {
         const int64_t chunk = index / local_size, proxy = (me + index % local_size) % local_size;
         if (chunk >= chunks_of(proxy)) return 0;
-        const ReqEntry *table = published(proxy);
-        return ceil_div<kTaskRows>((int64_t)table[chunk + 1].start - table[chunk].start);
+        const int32_t *table = published(proxy);
+        return ceil_div<kTaskRows>((int64_t)table[chunk + 1] - table[chunk]);
       },
       task_starts);
 }
@@ -755,12 +752,12 @@ RequesterTables requester_tables(const at::Tensor &words, const at::Tensor &head
   tables.push_order_off = at::empty({local_size + 1}, long_options);
   tables.proxy_chunks = at::empty({local_size}, long_options);
   tables.proxy_ends = at::empty({local_size, max_chunks + 1}, long_options);
-  tables.push_tables = at::empty({local_size, max_chunks + 1, 2}, int_options);
+  tables.push_tables = at::empty({local_size, max_chunks + 1}, int_options);
   tables.task_starts = at::empty({max_chunks * local_size + 1}, long_options);
   requester_proxy_tables_kernel<<<kOneCta, kThreads, 0, stream>>>(
       headers.data_ptr<int32_t>(), offset_per_bucket.data_ptr<int64_t>(), sizes,
       tables.push_order_off.data_ptr<int64_t>(), tables.proxy_chunks.data_ptr<int64_t>(),
-      tables.proxy_ends.data_ptr<int64_t>(), records_of<ReqEntry>(tables.push_tables),
+      tables.proxy_ends.data_ptr<int64_t>(), tables.push_tables.data_ptr<int32_t>(),
       tables.task_starts.data_ptr<int64_t>());
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   tables.src = at::empty({rows}, int_options);

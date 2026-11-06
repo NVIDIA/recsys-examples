@@ -197,8 +197,8 @@ InDist InChannel::input_dist(const PlanInput &input) {
                                      owner.fwd_chunks, owner.fwd_chunk_start,
                                      rail.length_per_source_feature, rail.source_offsets, sizes_);
     // The plans: the requester's maps and its tables of the node's proxies,
-    // the owner's and the proxy's tables, the proxy's reducer list and the
-    // put lists. Then the owner's KJT.
+    // the owner's and the proxy's tables, the proxy's rows before each key
+    // and the put lists. Then the owner's KJT.
     fwd.src = requester.src;
     bwd.dst = requester.dst;
     fwd.push_order = bwd.push_order = requester.push_order;
@@ -219,7 +219,6 @@ InDist InChannel::input_dist(const PlanInput &input) {
     bwd.uniq_in = rail.uniq_in;
     bwd.reduce_task_starts = proxy.reduce_task_starts;
     bwd.reducer_start = proxy.reducer_start;
-    bwd.reducer_flags = proxy.reducer_flags;
     dist.kjt_values = owner.kjt_values;
     dist.kjt_weights = owner.kjt_weights;
     dist.kjt_lengths = rail.kjt_lengths;
