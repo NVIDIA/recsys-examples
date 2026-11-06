@@ -52,6 +52,7 @@ from dynamicemb.batched_dynamicemb_function import (
     dynamicemb_eval_forward,
     dynamicemb_prefetch,
 )
+from dynamicemb.cache import DynamicEmbCache
 from dynamicemb.dynamicemb_config import (
     DynamicEmbCheckMode,
     DynamicEmbEvictStrategy,
@@ -70,7 +71,6 @@ from dynamicemb.initializer import MultiTableInitializer
 from dynamicemb.key_ownership import owned_key_mask, owned_keys
 from dynamicemb.key_value_table import (
     Cache,
-    DynamicEmbCache,
     DynamicEmbStorage,
     ERASE_CHUNK_SLOTS,
     ERASE_MAX_CHUNKS_IN_FLIGHT,
@@ -79,6 +79,7 @@ from dynamicemb.key_value_table import (
     flush_cache,
 )
 from dynamicemb.lookup_layout import EmbeddingLayout
+from dynamicemb.mixed_dim_buffers import MixedDimBuffers
 from dynamicemb.optimizer import (
     AdaGradDynamicEmbeddingOptimizer,
     AdamDynamicEmbeddingOptimizer,
@@ -441,7 +442,7 @@ def _render_tier_table(
 def _print_memory_consume(
     table_names: List[str],
     storage: "Storage",
-    cache: Optional["Cache"],
+    cache: Optional[DynamicEmbCache],
     layout: StorageLayout,
     dynamicemb_options: List[DynamicEmbTableOptions],
     optimizer: Optional["BaseDynamicEmbeddingOptimizer"],
@@ -468,14 +469,10 @@ def _print_memory_consume(
         tiers.append((f"hbm/cuda:{device_id}", _tier_bytes_from_state(storage._hbm)))
         tiers.append(("host (CPU)", _tier_bytes_from_state(storage._host)))
     elif layout == StorageLayout.CACHING:
-        tiers.append(
-            (f"hbm cache/cuda:{device_id}", _tier_bytes_from_state(cache._state))
-        )
+        tiers.append((f"hbm cache/cuda:{device_id}", cache.value_bytes()))
         tiers.append(("host backing (full)", _tier_bytes_from_state(storage._state)))
     elif layout == StorageLayout.CACHING_PS:
-        tiers.append(
-            (f"hbm cache/cuda:{device_id}", _tier_bytes_from_state(cache._state))
-        )
+        tiers.append((f"hbm cache/cuda:{device_id}", cache.value_bytes()))
         tiers.append(
             (
                 "external PS",
@@ -862,22 +859,28 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                         "Can't use caching mode as the reserved HBM size is too small."
                     )
 
-                cache_options = deepcopy(self._dynamicemb_options)
+                # Each table gets its share of the HBM budget as slots: never more
+                # than the table has, never fewer than one. The capacity is what is
+                # set here, no more: a cache too small for the keys of one step
+                # raises when that step is prefetched. The backing storage is the
+                # full set and owns every key's score; the cache has none.
                 cap_scale = local_hbm / total_memory if total_memory > 0 else 1.0
-                for cache_option in cache_options:
-                    cache_option.bucket_capacity = 1024
-                    cap = max(1, int(cache_option.max_capacity * cap_scale))
-                    cache_option.max_capacity = min(cache_option.max_capacity, cap)
-                    cache_option.init_capacity = min(cache_option.max_capacity, cap)
-
-                # The cache ranks by timestamp only; the backing storage is the
-                # full set and owns every key's score (and the no-eviction mode,
-                # which cache overflow rejects, see create_table_state).
-                for cache_option in cache_options:
-                    cache_option.score_strategy = DynamicEmbScoreStrategy.TIMESTAMP
-                    cache_option.evict_strategy = DynamicEmbEvictStrategy.LRU
-
-                self._cache = DynamicEmbCache(cache_options, self._optimizer)
+                capacities = [
+                    min(option.max_capacity, max(1, int(option.max_capacity * cap_scale)))
+                    for option in self._dynamicemb_options
+                ]
+                first = self._dynamicemb_options[0]
+                self._cache = DynamicEmbCache(
+                    MixedDimBuffers(
+                        [option.dim for option in self._dynamicemb_options],
+                        value_dims,
+                        capacities,
+                        first.embedding_dtype,
+                        torch.device(f"cuda:{torch.cuda.current_device()}"),
+                        "fixed",
+                    ),
+                    key_dtype=first.index_type,
+                )
 
                 storage_options = deepcopy(self._dynamicemb_options)
                 for storage_option in storage_options:
@@ -1352,9 +1355,6 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
             frequency_counters = self._counters_for_group(frequency_counters)
             table_scores = [self._scores[name] for name in self._table_names]
             fused_score = self._reduce_table_scores(table_scores)
-            if isinstance(self._cache, DynamicEmbCache):
-                self._cache.training = False
-                self._cache.set_score(fused_score)
             if isinstance(self._storage, (DynamicEmbStorage, HybridStorage)):
                 self._storage.training = False
                 self._storage.set_score(fused_score)
@@ -1397,8 +1397,6 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
             pooling_weights,
             self._empty_tensor,
         )
-        if isinstance(self._cache, DynamicEmbCache):
-            self._cache.training = False
         if isinstance(self._storage, (DynamicEmbStorage, HybridStorage)):
             self._storage.training = False
 
@@ -1476,9 +1474,6 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
 
         table_scores = [self._scores[name] for name in self._table_names]
         fused_score = self._reduce_table_scores(table_scores)
-        if isinstance(self._cache, DynamicEmbCache):
-            self._cache.training = True
-            self._cache.set_score(fused_score)
         if isinstance(self._storage, (DynamicEmbStorage, HybridStorage)):
             self._storage.training = True
             self._storage.set_score(fused_score)
@@ -1491,6 +1486,7 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                 self._storage,
                 self.feature_offsets,
                 self._initializer,
+                self._optimizer,
                 forward_stream,
                 self._evict_strategy,
                 frequency_counters,
@@ -2690,7 +2686,7 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
         if stale.numel() == 0:
             return
         device = torch.device(f"cuda:{torch.cuda.current_device()}")
-        self._cache.key_index_map.erase(
+        self._cache.erase(
             stale.to(device=device),
             torch.full((stale.numel(),), table_id, dtype=torch.int64, device=device),
         )

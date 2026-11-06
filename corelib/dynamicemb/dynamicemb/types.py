@@ -376,20 +376,41 @@ class Storage(abc.ABC, Generic[OptionsT, OptimizerT]):
         pass
 
 
+@dataclass
+class CacheMetrics:
+    """What the cache did in its last lookup and its last insert.
+
+    Recorded only while ``set_record_cache_metrics(True)``. Each field is
+    overwritten by the next call of its kind, not accumulated.
+    """
+
+    # keys of the last ``lookup`` and how many of them were found
+    num_lookups: int = 0
+    num_hits: int = 0
+    # keys of the last ``insert_and_evict`` and how many keys it evicted
+    num_inserts: int = 0
+    num_evictions: int = 0
+
+
 class Cache(abc.ABC):
+    """Which keys have a row in the GPU cache, and which rows are in use.
+
+    A key's row number is its *slot*. A slot is pinned while a step uses it:
+    ``lookup`` pins the slots it finds and ``insert_and_evict`` the slots it
+    hands out; ``release`` takes the pin back. A pinned slot is never handed out.
+    """
+
     @abc.abstractmethod
     def lookup(
         self,
         unique_keys: torch.Tensor,
         table_ids: torch.Tensor,
-        lfu_accumulated_frequency: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Lookup with overflow fallback.
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Look the keys up (they must be unique) and pin every slot found.
 
         Returns:
-            score_out: Output scores.
             founds: Boolean tensor indicating which keys were found.
-            indices: Slot indices (``-1`` for keys not found).
+            slots: Slot of each key (``-1`` for keys not found).
         """
         ...
 
@@ -398,16 +419,49 @@ class Cache(abc.ABC):
         self,
         keys: torch.Tensor,
         table_ids: torch.Tensor,
-        scores: Optional[torch.Tensor] = None,
-    ) -> Tuple[
-        torch.Tensor, int, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
-    ]:
-        """Insert with counter-aware eviction and overflow fallback.
+    ) -> Tuple[torch.Tensor, int, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Give each key a slot, evicting the key that held it, and pin it.
+
+        ``keys`` are unique, not cached, and grouped by table. Raises if a table
+        has fewer unpinned slots than keys.
 
         Returns:
-            indices, num_evicted, evicted_keys, evicted_indices,
-            evicted_scores, evicted_table_ids.
+            slots, num_evicted, evicted_keys, evicted_slots, evicted_table_ids.
         """
+        ...
+
+    @abc.abstractmethod
+    def release(self, slots: torch.Tensor, table_ids: torch.Tensor) -> None:
+        """Take one pin back from each slot (a slot of ``-1`` is skipped).
+        ``table_ids`` aligns with ``slots``."""
+        ...
+
+    @abc.abstractmethod
+    def erase(self, keys: torch.Tensor, table_ids: torch.Tensor) -> None:
+        """Drop the keys from the cache (keys not cached are ignored)."""
+        ...
+
+    @abc.abstractmethod
+    def export(
+        self, table_id: int, batch_size: int
+    ) -> Iterator[Tuple[torch.Tensor, torch.Tensor]]:
+        """Yield ``(keys, slots)`` of the keys one table holds, in chunks."""
+        ...
+
+    @property
+    @abc.abstractmethod
+    def num_tables(self) -> int:
+        """The number of tables the cache serves."""
+        ...
+
+    @abc.abstractmethod
+    def capacity(self, table_id: Optional[int] = None) -> int:
+        """Slots of one table or (``table_id`` None) of all."""
+        ...
+
+    @abc.abstractmethod
+    def size(self, table_id: Optional[int] = None) -> int:
+        """Keys held, of one table or (``table_id`` None) of all."""
         ...
 
     @abc.abstractmethod
@@ -416,11 +470,11 @@ class Cache(abc.ABC):
     ) -> None:
         pass
 
+    @property
     @abc.abstractmethod
-    def cache_metrics(
-        self,
-    ) -> torch.Tensor:
-        pass
+    def cache_metrics(self) -> Optional[CacheMetrics]:
+        """A snapshot of the metrics, or None when they are not being recorded."""
+        ...
 
     @abc.abstractmethod
     def set_record_cache_metrics(self, record: bool) -> None:

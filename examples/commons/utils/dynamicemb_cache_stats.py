@@ -37,8 +37,8 @@ class _CacheDebugHook:
         if metrics is None:
             return
         rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
-        unique = metrics[0].item()
-        hit = metrics[1].item()
+        unique = metrics.num_lookups
+        hit = metrics.num_hits
         if unique == 0:
             return
         miss = unique - hit

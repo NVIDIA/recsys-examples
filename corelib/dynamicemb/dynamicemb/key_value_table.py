@@ -21,6 +21,7 @@ import os
 import warnings
 from dataclasses import dataclass, field
 from typing import (
+    TYPE_CHECKING,
     Any,
     Callable,
     ContextManager,
@@ -81,6 +82,9 @@ from dynamicemb_extensions import segmented_sum_cuda, select_insert_failed_value
 from dynamicemb_extensions import store_to_flat_table_contiguous as _store_contiguous
 from dynamicemb_extensions import store_to_flat_table_value as _store_value
 from torch import Tensor, nn  # usort:skip
+
+if TYPE_CHECKING:
+    from dynamicemb.cache import DynamicEmbCache
 
 # ---------------------------------------------------------------------------
 # Utility helpers
@@ -2728,139 +2732,6 @@ def _erase_state_keys(
 
 
 # ---------------------------------------------------------------------------
-# DynamicEmbCache – Cache interface (key-only find / insert_and_evict)
-# ---------------------------------------------------------------------------
-
-
-class DynamicEmbCache(Cache):
-    def __init__(
-        self,
-        options: List[DynamicEmbTableOptions],
-        optimizer: BaseDynamicEmbeddingOptimizer,
-    ):
-        self._state = create_table_state(options, optimizer, enable_overflow=True)
-        self._cache_metrics = torch.zeros(10, dtype=torch.long, device="cpu")
-        self._record_cache_metrics = False
-
-    # -- Cache interface --
-
-    def increment_counter(
-        self,
-        slot_indices: torch.Tensor,
-        table_ids: torch.Tensor,
-    ) -> None:
-        """Increment ref-counter at given per-table slot indices. table_ids must be provided and aligned with slot_indices."""
-        self._state.key_index_map.increment_counter(slot_indices, table_ids)
-
-    def decrement_counter(
-        self,
-        slot_indices: torch.Tensor,
-        table_ids: torch.Tensor,
-    ) -> None:
-        """Decrement ref-counter at given per-table slot indices. table_ids must be provided and aligned with slot_indices."""
-        self._state.key_index_map.decrement_counter(slot_indices, table_ids)
-
-    def lookup(
-        self,
-        unique_keys: torch.Tensor,
-        table_ids: torch.Tensor,
-        lfu_accumulated_frequency: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Lookup with overflow fallback. Returns (score_out, founds, indices)."""
-        state = self._state
-        score_arg = get_find_score_arg(
-            state,
-            unique_keys.size(0),
-            unique_keys.device,
-            score_source(state, lfu_accumulated_frequency),
-        )
-        result = state.key_index_map.lookup_with_overflow(
-            unique_keys, table_ids, score_arg
-        )
-        if self._record_cache_metrics:
-            self._cache_metrics[0] = unique_keys.size(0)
-            founds = result[1]
-            self._cache_metrics[1] = founds.sum().item()
-        return result
-
-    def insert_and_evict(
-        self,
-        keys: torch.Tensor,
-        table_ids: torch.Tensor,
-        scores: Optional[torch.Tensor] = None,
-    ) -> Tuple[
-        torch.Tensor, int, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
-    ]:
-        """Insert with counter-aware eviction and overflow fallback."""
-        state = self._state
-        score_arg = get_insert_score_arg(state, keys.numel(), keys.device, scores)
-        result = state.key_index_map.insert_and_evict_with_counter_and_overflow(
-            keys, table_ids, score_arg
-        )
-        if self._record_cache_metrics:
-            self._cache_metrics[2] = keys.numel()
-            self._cache_metrics[3] = result[1]  # num_evicted
-        return result
-
-    def reset(self) -> None:
-        self._state.key_index_map.reset()
-
-    @property
-    def cache_metrics(self) -> Optional[torch.Tensor]:
-        return self._cache_metrics if self._record_cache_metrics else None
-
-    def set_record_cache_metrics(self, record: bool) -> None:
-        self._record_cache_metrics = record
-
-    # -- Score management --
-
-    def set_score(self, score: int) -> None:
-        self._state.score = score
-
-    @property
-    def training(self) -> bool:
-        return self._state.training
-
-    @training.setter
-    def training(self, value: bool) -> None:
-        self._state.training = value
-
-    # -- Convenience accessors --
-
-    @property
-    def num_tables(self) -> int:
-        return self._state.num_tables
-
-    def embedding_dtype(self) -> torch.dtype:
-        return self._state.emb_dtype
-
-    def embedding_dim(self, table_id: int) -> int:
-        return self._state.table_emb_dims_cpu[table_id]
-
-    def value_dim(self, table_id: int) -> int:
-        return self._state.table_value_dims_cpu[table_id]
-
-    def max_embedding_dim(self) -> int:
-        return self._state.emb_dim
-
-    def max_value_dim(self) -> int:
-        return self._state.value_dim
-
-    def init_optimizer_state(self) -> float:
-        return self._state.optimizer.get_initial_optimizer_state()
-
-    def evict_strategy(self) -> EvictStrategy:
-        return self._state.evict_strategy
-
-    def size(self) -> int:
-        return self._state.key_index_map.size()
-
-    @property
-    def key_index_map(self):
-        return self._state.key_index_map
-
-
-# ---------------------------------------------------------------------------
 # DynamicEmbStorage – Storage interface (find with values, insert, dump, load)
 # ---------------------------------------------------------------------------
 
@@ -4455,7 +4326,7 @@ def _write_back_evicted(
 
 
 def flush_cache(
-    cache: DynamicEmbCache,
+    cache: "DynamicEmbCache",
     storage: DynamicEmbStorage,
     external_storage: Optional[Storage] = None,
 ) -> None:
@@ -4465,19 +4336,10 @@ def flush_cache(
     updated. One it has evicted goes to ``external_storage``, or is dropped
     when there is none: it is not re-inserted, which would evict another row.
     """
-    state = cache._state
-    batch_size = state.threads_in_wave
-
-    for t in range(state.num_tables):
-        for keys, _, indices in state.key_index_map._batched_export_keys_scores(
-            [state.score_policy.name],
-            state.device,
-            batch_size=batch_size,
-            return_index=True,
-            table_id=t,
-        ):
+    for t in range(cache.num_tables):
+        for keys, indices in cache.export(t):
+            values = cache.load_exact(indices, t)
             tid = torch.full((keys.numel(),), t, dtype=torch.int64, device=keys.device)
-            values = load_from_flat(state, indices, tid, copy_mode=CopyMode.VALUE)
             _write_back_evicted(storage, external_storage, keys, tid, values)
 
 
@@ -4514,17 +4376,17 @@ def _eval_lookup_storage(
 
 
 def _eval_lookup_cached(
-    cache: Cache,
+    cache: "DynamicEmbCache",
     storage: Storage,
     keys: torch.Tensor,
     table_ids: torch.Tensor,
     initializer: Callable,
 ) -> torch.Tensor:
-    _, founds, cache_indices = cache.lookup(keys, table_ids)
+    founds, cache_indices = cache.lookup(keys, table_ids)
 
-    embs = load_from_flat(
-        cache._state, cache_indices, table_ids, copy_mode=CopyMode.EMBEDDING
-    )
+    embs = cache.load_padded(cache_indices, table_ids, CopyMode.EMBEDDING)
+    # ``lookup`` pinned what it found; this read is done with it
+    cache.release(cache_indices, table_ids)
 
     missing_mask = ~founds
     h_num_miss, miss_compact_idx, (missing_keys, missing_table_ids) = flagged_compact(

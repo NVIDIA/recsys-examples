@@ -5,7 +5,7 @@
 # ``get_table_value_bytes * hbm_ratio``, planner + DMP, then per-table checks that
 # ``max_capacity`` matches ``get_sharded_table_capacity``, ``local_hbm_for_values``
 # matches ``ceil(global/world_size)``, and cache/storage value tensors match
-# hashtable ``per_table_capacity_`` (+ cache overflow slots when applicable).
+# hashtable ``per_table_capacity_``; the cache's value buffer has one row per slot.
 #
 # Run (from ``corelib/dynamicemb``)::
 #   torchrun --nnodes 1 --nproc_per_node 1 -m pytest test/unit_tests/test_alignment.py -q
@@ -27,6 +27,7 @@ import torch.distributed as dist
 import torch.nn as nn
 from dynamicemb import DynamicEmbScoreStrategy
 from dynamicemb.batched_dynamicemb_tables import BatchedDynamicEmbeddingTablesV2
+from dynamicemb.cache import DynamicEmbCache
 from dynamicemb.dump_load import find_sharded_modules, get_dynamic_emb_module
 from dynamicemb.dynamicemb_config import (
     DEFAULT_BUCKET_CAPACITY,
@@ -36,7 +37,7 @@ from dynamicemb.dynamicemb_config import (
     get_sharded_table_capacity,
     get_table_value_bytes,
 )
-from dynamicemb.key_value_table import DynamicEmbCache, DynamicEmbStorage, HybridStorage
+from dynamicemb.key_value_table import DynamicEmbStorage, HybridStorage
 from dynamicemb.optimizer import DynamicEmbOptimType, OptimType, get_optimizer_state_dim
 from dynamicemb.planner import get_planner
 from dynamicemb.shard import DynamicEmbeddingCollectionSharder
@@ -162,32 +163,29 @@ def build_dmp_for_alignment_test(
     return dmp
 
 
-def _overflow_rows_for_cache(bucket_capacity: int) -> int:
-    # dynamicemb.scored_hashtable: overflow_bucket_capacity_ = 3 * bucket_capacity_
-    return 3 * int(bucket_capacity)
-
-
-def _assert_value_buffer_matches_hashtable(
-    state: object,
-    table_id: int,
-    *,
-    include_overflow: bool,
-) -> None:
-    """Value tensor rows must match hashtable main capacity plus optional overflow slots."""
+def _assert_value_buffer_matches_hashtable(state: object, table_id: int) -> None:
+    """Value tensor rows must match the hashtable's per-table capacity."""
     km = state.key_index_map
-    main = int(km.per_table_capacity_[table_id])
-    ovf = int(km.overflow_bucket_capacity_) if include_overflow else 0
-    if include_overflow:
-        bc = int(state.options_list[0].bucket_capacity)
-        assert ovf == _overflow_rows_for_cache(
-            bc
-        ), f"table {table_id}: overflow_bucket_capacity_={ovf} != 3 * bucket ({bc})"
-    expected_rows = main + ovf
+    expected_rows = int(km.per_table_capacity_[table_id])
     t = state.tables[table_id].tensor()
     vd = int(state.table_value_dims_cpu[table_id])
     assert t.shape == (expected_rows, vd), (
         f"table {table_id}: value buffer shape {tuple(t.shape)} != "
-        f"expected ({expected_rows}, {vd}) (main={main}, overflow_extra={ovf})"
+        f"expected ({expected_rows}, {vd})"
+    )
+
+
+def _assert_cache_value_buffer(cache: object, table_id: int, max_capacity: int) -> None:
+    """The cache's value buffer has one row per slot: rows == the table's capacity."""
+    rows = cache.capacity(table_id)
+    assert 1 <= rows <= max_capacity, (
+        f"table {table_id}: cache capacity {rows} not in [1, max_capacity={max_capacity}]"
+    )
+    t = cache.values.tensor(table_id)
+    vd = int(cache.values.value_dim(table_id))
+    assert t.shape == (rows, vd), (
+        f"table {table_id}: cache value buffer shape {tuple(t.shape)} != "
+        f"expected ({rows}, {vd})"
     )
 
 
@@ -225,28 +223,21 @@ def assert_cache_and_storage_shapes(
     if batched._caching and total_memory > local_hbm:
         assert batched._cache is not None
         assert isinstance(batched._cache, DynamicEmbCache)
-        cstate = batched._cache._state
-        for tid in range(len(names)):
-            _assert_value_buffer_matches_hashtable(cstate, tid, include_overflow=True)
+        for tid, opt in enumerate(options):
+            _assert_cache_value_buffer(batched._cache, tid, int(opt.max_capacity))
     else:
         assert batched._cache is None
 
     storage = batched._storage
     if isinstance(storage, DynamicEmbStorage):
         for tid in range(len(names)):
-            _assert_value_buffer_matches_hashtable(
-                storage._state, tid, include_overflow=False
-            )
+            _assert_value_buffer_matches_hashtable(storage._state, tid)
     elif isinstance(storage, HybridStorage):
         assert not batched._caching
         assert total_memory > local_hbm
         for tid in range(len(names)):
-            _assert_value_buffer_matches_hashtable(
-                storage._hbm, tid, include_overflow=False
-            )
-            _assert_value_buffer_matches_hashtable(
-                storage._host, tid, include_overflow=False
-            )
+            _assert_value_buffer_matches_hashtable(storage._hbm, tid)
+            _assert_value_buffer_matches_hashtable(storage._host, tid)
     else:
         raise AssertionError(f"Unexpected storage type {type(storage)}")
 

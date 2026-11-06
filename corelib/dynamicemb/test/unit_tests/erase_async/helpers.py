@@ -156,10 +156,16 @@ def found(
 ):
     """Which of ``keys`` table ``table_id`` holds: in the storage, which is where an erase
     works and behind any cache, or with ``cache=True`` in the cache."""
-    state = (module.cache if cache else module._storage)._state
     keys = torch.as_tensor(keys, dtype=torch.int64, device=device)
+    table_ids = torch.full_like(keys, table_id)
+    if cache:
+        # A lookup pins what it finds; give the pins back so the cache is unchanged.
+        founds, slots = module.cache.lookup(keys, table_ids)
+        module.cache.release(slots, table_ids)
+        return founds
+    state = module._storage._state
     arg = ScoreArg(name=state.score_policy.name, value=None, policy=ScorePolicy.CONST)
-    _, founds, _ = state.key_index_map.lookup(keys, torch.full_like(keys, table_id), arg)
+    _, founds, _ = state.key_index_map.lookup(keys, table_ids, arg)
     return founds
 
 
