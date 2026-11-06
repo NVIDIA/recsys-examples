@@ -87,8 +87,8 @@ def _spy_prefetch(monkeypatch):
 
     def spy(*args, **kwargs):
         # Positional order: indices, offsets, cache, storage, feature_offsets,
-        # initializer, forward_stream, evict_strategy, frequency_counters, ...
-        seen.append(args[8])
+        # initializer, optimizer, forward_stream, evict_strategy, frequency_counters, ...
+        seen.append(args[9])
         return real(*args, **kwargs)
 
     monkeypatch.setattr(tables_module, "dynamicemb_prefetch", spy)

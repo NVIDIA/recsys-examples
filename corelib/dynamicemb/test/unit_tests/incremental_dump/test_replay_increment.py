@@ -814,16 +814,18 @@ def test_replay_with_caching(current_device):
     the values fit and no cache is built at all.
     """
     device = torch.device(f"cuda:{current_device}")
-    src = make_model(current_device, caching=True, local_hbm_for_values=2048)
-    dst = make_model(current_device, caching=True, local_hbm_for_values=2048)
+    src = make_model(current_device, caching=True, local_hbm_for_values=4096)
+    dst = make_model(current_device, caching=True, local_hbm_for_values=4096)
     assert dst._cache is not None, "this test is meaningless without a cache"
 
     keys = list(range(1001, 1101))
-    touch(src, keys, device)
+    # backward releases the slots a forward pass pins; without it the 100 keys keep
+    # most of the small cache pinned and the next lookup has nowhere to insert
+    touch(src, keys, device, backward=True)
     delta = dump_all(src)
 
     # Warm the target's cache with different values for the same keys.
-    touch(dst, keys, device)
+    touch(dst, keys, device, backward=True)
     dst.replay_increment(delta)
 
     out = touch(dst, keys, device)

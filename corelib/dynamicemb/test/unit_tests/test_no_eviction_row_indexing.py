@@ -272,22 +272,14 @@ def test_explicit_init_capacity(current_device, init_capacity, n_keys, expect_gr
 # ---------------------------------------------------------------------------
 
 
-def test_caching_downgrades_cache_but_not_backing(current_device):
-    """The cache tier cannot be NO_EVICTION (it enables an overflow buffer, which
-    ``create_table_state`` rejects for NO_EVICTION), so it is forced to
-    TIMESTAMP/LRU while the backing store keeps NO_EVICTION.
-
-    Pinning this down matters for users: with ``caching=True`` the *cache* still
-    evicts -- only the backing store never drops a key.
+def test_the_cache_evicts_but_the_backing_store_never_drops_a_key(current_device):
+    """With ``caching=True`` the *cache* still evicts (FIFO, it has no score) --
+    only the backing store, which keeps NO_EVICTION, never drops a key.
     """
     model = build_caching_model(
         current_device, max_capacity=16384, cache_fraction=0.125
     )
     assert model._cache is not None, "expected a CACHING layout"
-    assert (
-        model._cache._state.options_list[0].score_strategy
-        == DynamicEmbScoreStrategy.TIMESTAMP
-    )
     assert (
         model._storage._state.options_list[0].score_strategy
         == DynamicEmbScoreStrategy.NO_EVICTION
@@ -305,7 +297,7 @@ def test_caching_spill_does_not_leak_rows(current_device):
     eventually past the value buffer, which is sized from the key count.
 
     Backward is required, not decorative: a prefetched key is pinned by the
-    cache's ref counter until ``decrement_counter`` runs in the backward pass, so
+    cache's ref counter until ``release`` runs in the backward pass, so
     a forward-only loop cannot evict anything and nothing would ever spill.
     ``learning_rate=0`` keeps the DEBUG pattern intact for the value checks.
     """
@@ -361,7 +353,7 @@ def test_caching_backing_retains_every_key(current_device):
         out.sum().backward()  # unpins cache entries so eviction can proceed
         torch.cuda.synchronize()
 
-    cached = int(model._cache._state.key_index_map.size(0))
+    cached = int(model._cache.size(0))
     spilled = int(model._storage._state.key_index_map.size(0))
     # The cache is a fraction of the key set, so it must have evicted...
     assert cached < len(keys), (
@@ -389,7 +381,7 @@ def test_hbm_direct_backward_writes_the_right_row(current_device):
     """The backward half of the slot/row split, on the layout where they differ.
 
     ``fused_update_for_flat_table`` writes gradients into the **value buffer**
-    (rows) while ``decrement_counter`` touches the **ref counter** (slots). Every
+    (rows) while ``release`` touches the **ref counter** (slots). Every
     other test here is forward-only, so this is the only coverage of the backward
     index space -- and NO_EVICTION on HBM-direct is the one configuration where
     feeding it a slot instead of a row would corrupt a different key's row.

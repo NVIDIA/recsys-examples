@@ -170,8 +170,7 @@ def test_with_a_cache_only_the_storage_behind_it_is_erased(device):
     it holds that the storage no longer does is written back when the cache lets it go.
     (Spared is always zero: a cache pins its own slots, the storage keeps no counter.)
 
-    The cache asked for holds about thirteen hundred rows and is rounded up to 2048, so
-    four thousand keys do not fit."""
+    The cache holds about thirteen hundred rows, so four thousand keys do not fit."""
     max_capacity = 1 << 16
     module = build_de_table(
         device.index,

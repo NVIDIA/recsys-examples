@@ -169,8 +169,11 @@ class MixedDimBuffers:
         self, rows: torch.Tensor, table_ids: torch.Tensor, copy_mode: CopyMode
     ) -> torch.Tensor:
         """Rows of the given (row, table) pairs, padded to the widest table: the embedding
-        only for ``CopyMode.EMBEDDING``, the whole value row otherwise. Each row is valid
-        only up to its own table's width; the columns after it are uninitialized."""
+        only for ``CopyMode.EMBEDDING`` (``max_emb_dim`` columns), the whole value row
+        otherwise (``max_value_dim`` columns). A value row is laid out as the embedding,
+        padded to ``max_emb_dim``, followed by the optimizer state; columns a table does
+        not use are uninitialized. The widest row needs ``max_emb_dim`` plus the largest
+        optimizer width to fit in ``max_value_dim``."""
         if copy_mode == CopyMode.EMBEDDING:
             width, kernel = self.max_emb_dim, _load_emb
         else:
@@ -192,8 +195,9 @@ class MixedDimBuffers:
     def store_padded(
         self, rows: torch.Tensor, table_ids: torch.Tensor, values: torch.Tensor
     ) -> None:
-        """Write padded value rows (each as wide as the widest table) to (row, table) pairs;
-        only each table's own width of a row is written."""
+        """Write padded value rows (each as wide as the widest table, in the layout
+        ``load_padded`` returns) to (row, table) pairs; only the columns a table uses are
+        written."""
         if values.dim() == 1:
             values = values.unsqueeze(1)
         _store_value(

@@ -38,13 +38,13 @@ from dynamicemb.batched_dynamicemb_tables import (
     encode_checkpoint_file_path,
     encode_meta_json_file_path,
 )
+from dynamicemb.cache import DynamicEmbCache
 from dynamicemb.dynamicemb_config import (
     DEBUG_EMB_INITIALIZER_MOD,
     ScoreStrategy,
     _sharded_table_bucket_layout,
 )
 from dynamicemb.key_value_table import (
-    DynamicEmbCache,
     DynamicEmbStorage,
     DynamicEmbTableState,
     HybridStorage,
@@ -136,11 +136,8 @@ def _embedding_configs_for_strict_expansion_test(
 def _iter_dynamic_emb_table_states(
     bdebt: BatchedDynamicEmbeddingTablesV2,
 ) -> List[Tuple[str, DynamicEmbTableState]]:
-    """All table states (cache + backing, or hybrid tiers)."""
+    """All table states of the backing storage (or hybrid tiers); a cache has none."""
     out: List[Tuple[str, DynamicEmbTableState]] = []
-    cache = bdebt.cache
-    if isinstance(cache, DynamicEmbCache):
-        out.append(("cache", cache._state))
     st = bdebt.tables
     if isinstance(st, DynamicEmbStorage):
         out.append(("storage", st._state))
@@ -379,12 +376,11 @@ def _print_test_expansion_storage_cache_sizes_after_train_step(
 
     cache = bdebt.cache
     if isinstance(cache, DynamicEmbCache):
-        ckm = cache.key_index_map
-        nt_c = cache._state.num_tables
-        csz = _kim_occupied_sizes_per_table(ckm, nt_c)
-        ccap = _kim_capacities_per_table(ckm, nt_c)
+        nt_c = cache.num_tables
+        csz = [cache.size(t) for t in range(nt_c)]
+        ccap = cache._core.capacities()
         print(
-            f"{tag} cache KIM size (per table): {csz}, "
+            f"{tag} cache size (per table): {csz}, "
             f"capacity (per table): {ccap}",
             flush=True,
         )
@@ -454,42 +450,36 @@ def _assert_cache_export_matches_lookup_embeddings(
     *,
     batch_size: int = 65536,
 ) -> None:
-    """Check GPU cache: exported (key, slot) rows match ``lookup`` + ``load_from_flat``.
+    """Check GPU cache: exported (key, slot) rows match ``lookup`` + ``values.load``.
 
-    Uses ``training=False`` on cache state so lookup does not mutate scores.
-    No-op when ``bdebt.cache`` is None.
+    Every ``lookup`` is followed by a ``release``. No-op when ``bdebt.cache`` is None.
     """
     cache = bdebt.cache
     if not isinstance(cache, DynamicEmbCache):
         return
-    state = cache._state
-    saved_training = state.training
-    cache.training = False
-    try:
-        for tid in range(state.num_tables):
-            for keys, emb_exp, _, _ in export_keys_values_iter(
-                state, device, batch_size=batch_size, table_id=tid
-            ):
-                if keys.numel() == 0:
-                    continue
-                tids = torch.full(
-                    (keys.numel(),), tid, dtype=torch.int64, device=keys.device
-                )
-                _, founds, indices = cache.lookup(keys, tids, None)
-                assert bool(
-                    founds.all()
-                ), f"cache table_id={tid}: every exported key must be found via lookup"
-                emb_slots = load_from_flat(
-                    state, indices, tids, copy_mode=CopyMode.EMBEDDING
-                )
-                torch.testing.assert_close(
-                    emb_exp.to(dtype=emb_slots.dtype),
-                    emb_slots,
-                    rtol=1e-5,
-                    atol=1e-5,
-                )
-    finally:
-        cache.training = saved_training
+    for tid in range(cache.num_tables):
+        for keys, slots in cache.export(tid, batch_size):
+            if keys.numel() == 0:
+                continue
+            tids = torch.full(
+                (keys.numel(),), tid, dtype=torch.int64, device=keys.device
+            )
+            founds, indices = cache.lookup(keys, tids)
+            assert bool(
+                founds.all()
+            ), f"cache table_id={tid}: every exported key must be found via lookup"
+            assert torch.equal(
+                indices, slots
+            ), f"cache table_id={tid}: exported slots differ from the looked-up slots"
+            emb_exp = cache.load_padded(slots, tids, CopyMode.EMBEDDING)
+            emb_slots = cache.load_padded(indices, tids, CopyMode.EMBEDDING)
+            torch.testing.assert_close(
+                emb_exp.to(dtype=emb_slots.dtype),
+                emb_slots,
+                rtol=1e-5,
+                atol=1e-5,
+            )
+            cache.release(indices, tids)  # ``lookup`` pinned them
 
 
 def _assert_storage_export_matches_find_embeddings(
@@ -656,6 +646,26 @@ def _kim_scan_keys_embeddings_dict(
     return out
 
 
+def _cache_scan_keys_embeddings_dict(
+    cache: DynamicEmbCache,
+    device: torch.device,
+    *,
+    batch_size: int = 65536,
+) -> Dict[Tuple[int, int], torch.Tensor]:
+    """Scan the cache's keys + value buffer: (table_id, key) -> embedding."""
+    out: Dict[Tuple[int, int], torch.Tensor] = {}
+    for tid in range(cache.num_tables):
+        emb_dim_t = cache.values.emb_dim(tid)
+        for keys, slots in cache.export(tid, batch_size):
+            if keys.numel() == 0:
+                continue
+            values = cache.load_exact(slots, tid)
+            embeddings = values[:, :emb_dim_t].contiguous().to(device)
+            for i, k in enumerate(keys.tolist()):
+                out[(tid, int(k))] = embeddings[i].detach().clone()
+    return out
+
+
 def _assert_bdebt_storage_cache_merged_export_matches_lookup(
     bdebt: BatchedDynamicEmbeddingTablesV2,
     device: torch.device,
@@ -667,7 +677,7 @@ def _assert_bdebt_storage_cache_merged_export_matches_lookup(
 
     - Fills a dict from backing ``DynamicEmbStorage`` KIM scan, then overlays cache scan
       (cache wins on key collision).
-    - Verifies every merged (table_id, key) matches ``cache.lookup`` + ``load_from_flat``
+    - Verifies every merged (table_id, key) matches ``cache.lookup`` + ``cache.load_padded``
       when present in cache, else ``storage.find`` (embedding column).
     """
     storage = bdebt.tables
@@ -678,15 +688,13 @@ def _assert_bdebt_storage_cache_merged_export_matches_lookup(
         return
 
     saved_st = storage.training
-    saved_ca = cache.training
     storage.training = False
-    cache.training = False
     try:
         storage_dict = _kim_scan_keys_embeddings_dict(
             storage._state, device, batch_size=batch_size
         )
-        cache_dict = _kim_scan_keys_embeddings_dict(
-            cache._state, device, batch_size=batch_size
+        cache_dict = _cache_scan_keys_embeddings_dict(
+            cache, device, batch_size=batch_size
         )
         merged: Dict[Tuple[int, int], torch.Tensor] = {**storage_dict, **cache_dict}
 
@@ -702,7 +710,6 @@ def _assert_bdebt_storage_cache_merged_export_matches_lookup(
                 torch.testing.assert_close(merged[k], v, rtol=1e-5, atol=1e-5)
 
         st = storage._state
-        ca = cache._state
         key_type = st.key_index_map.key_type
         by_tid: Dict[int, List[Tuple[int, torch.Tensor]]] = {}
         for (tid, k_int), emb in merged.items():
@@ -715,14 +722,13 @@ def _assert_bdebt_storage_cache_merged_export_matches_lookup(
                 ref = torch.stack([p[1] for p in chunk])
                 key_t = torch.tensor(ks, device=device, dtype=key_type)
                 tid_t = torch.full((len(ks),), tid, dtype=torch.int64, device=device)
-                _, founds_c, ix_c = cache.lookup(key_t, tid_t, None)
+                founds_c, ix_c = cache.lookup(key_t, tid_t)
                 emb_live = torch.empty_like(ref)
                 if bool(founds_c.any()):
-                    emb_live[founds_c] = load_from_flat(
-                        ca,
+                    emb_live[founds_c] = cache.load_padded(
                         ix_c[founds_c],
                         tid_t[founds_c],
-                        copy_mode=CopyMode.EMBEDDING,
+                        CopyMode.EMBEDDING,
                     )
                 miss = ~founds_c
                 if bool(miss.any()):
@@ -748,10 +754,10 @@ def _assert_bdebt_storage_cache_merged_export_matches_lookup(
                         sf.all()
                     ), f"table_id={tid}: storage.find must hit all keys absent from cache"
                     emb_live[miss] = sv
+                cache.release(ix_c, tid_t)  # ``lookup`` pinned what it found
                 torch.testing.assert_close(ref, emb_live, rtol=1e-5, atol=1e-5)
     finally:
         storage.training = saved_st
-        cache.training = saved_ca
 
 
 def _compare_bdebt_export_to_stbe_weights(
@@ -777,8 +783,8 @@ def _compare_bdebt_export_to_stbe_weights(
     for tid, name in enumerate(table_names):
         _, st_detail = _bdebt_storage_entry_count_for_table(bdebt.tables, tid)
         if bdebt.cache is not None:
-            ckim = bdebt.cache.key_index_map
-            cache_sz, cache_cap = ckim.size(tid), ckim.capacity(tid)
+            cache_sz = bdebt.cache.size(tid)
+            cache_cap = bdebt.cache._core.capacities()[tid]
             cache_line = (
                 f"  Cache:    table_id={tid} size={cache_sz}, capacity={cache_cap}\n"
             )
@@ -1405,8 +1411,8 @@ def init_embedding_tables(stbe, bdet):
 @pytest.mark.parametrize(
     "caching, PS, local_hbm_for_values",
     [
-        (True, None, 1024),  # Caching + DynamicEmbStorage backend
-        (True, PyDictStorage, 1024),  # Caching + PS backend
+        (True, None, 2048),  # Caching + DynamicEmbStorage backend
+        (True, PyDictStorage, 2048),  # Caching + PS backend
         (False, None, 1024**3),  # HBM-only
         (False, None, 1024),  # HybridStorage
         (False, None, 0),  # No HBM budget, no cache -> DynamicEmbStorage (host-only)
@@ -1921,8 +1927,8 @@ def test_prefetch_flush_in_cache(opt_type, opt_params, deterministic, PS):
             # Prefetch is the only thing that looks the cache up, and a cold
             # cache holds none of A's keys; cache_metrics reports the last lookup.
             metrics = cache.cache_metrics
-            assert metrics[0].item() == len(keys_A)
-            assert metrics[1].item() == 0
+            assert metrics.num_lookups == len(keys_A)
+            assert metrics.num_hits == 0
 
     with torch.no_grad():
         bdeb.flush()
@@ -1964,8 +1970,8 @@ def test_prefetch_flush_in_cache(opt_type, opt_params, deterministic, PS):
             # The last prefetch is B; the cache holds A and nothing else, so
             # only the keys B shares with A hit.
             metrics = cache.cache_metrics
-            assert metrics[0].item() == len(keys_B)
-            assert metrics[1].item() == len(keys_A & keys_B)
+            assert metrics.num_lookups == len(keys_B)
+            assert metrics.num_hits == len(keys_A & keys_B)
 
     if deterministic:
         del os.environ["DEMB_DETERMINISM_MODE"]
@@ -2072,13 +2078,16 @@ def test_deterministic_insert(opt_type, opt_params, caching, PS, iteration, batc
         cache_x = bdebt_x.cache
         cache_y = bdebt_y.cache
         if cache_x is not None:
-            map_x = cache_x.key_index_map
-            map_y = cache_y.key_index_map
-
-            assert torch.equal(map_x.keys_, map_y.keys_)
+            # The cache does not promise a placement (which slot a key gets can
+            # depend on the timing of concurrent releases), only that both runs
+            # hold the same keys.
+            for t in range(cache_x._state.num_tables):
+                kx = torch.sort(cache_x._core.keys_of(t)).values
+                ky = torch.sort(cache_y._core.keys_of(t)).values
+                assert torch.equal(kx, ky)
 
             print(
-                f"Iteration {i} passed for deterministic insertion with cache_x's size({map_x.size()}), cache_y's size({map_y.size()}), totoal({map_x.capacity()})"
+                f"Iteration {i} passed for deterministic insertion with cache_x's size({cache_x.size()}), cache_y's size({cache_y.size()})"
             )
 
     del os.environ["DEMB_DETERMINISM_MODE"]
@@ -3224,8 +3233,9 @@ def test_dump_optimizer_states_ckpt_width(
 def test_multi_table_caching_flush(opt_type, opt_params):
     """Multi-table caching mode: prefetch, forward, flush, verify cache metrics.
 
-    ``DynamicEmbCache`` updates ``cache_metrics[0]`` (last lookup unique count) and
-    ``[1]`` (last lookup hit count) only inside ``lookup()``, overwriting prior values.
+    ``DynamicEmbCache`` updates ``cache_metrics.num_lookups`` (last lookup unique count)
+    and ``num_hits`` (last lookup hit count) only inside ``lookup()``, overwriting prior
+    values. ``cache_metrics`` is a snapshot, so it is read again after each prefetch.
     Prefetch calls ``lookup``; training forward with cache loads from flat via
     ``slot_indices`` and does not call ``lookup`` again. The first prefetch is thus
     cold (all misses); a second prefetch on the same keys should record all hits.
@@ -3298,8 +3308,8 @@ def test_multi_table_caching_flush(opt_type, opt_params):
     cache = bdeb.cache
     assert cache is not None
     metrics = cache.cache_metrics
-    assert metrics[0].item() == 4
-    assert metrics[1].item() == 0
+    assert metrics.num_lookups == 4
+    assert metrics.num_hits == 0
 
     with torch.cuda.stream(prefetch_stream):
         bdeb.prefetch(indices, offsets, forward_stream)
@@ -3310,7 +3320,8 @@ def test_multi_table_caching_flush(opt_type, opt_params):
         _ = embs2.mean()
 
     torch.cuda.synchronize()
-    assert metrics[0].item() == metrics[1].item() == 4
+    metrics = cache.cache_metrics  # a snapshot: read it again after the second prefetch
+    assert metrics.num_lookups == metrics.num_hits == 4
 
     bdeb.flush()
     bdeb.reset_cache_states()
@@ -3476,12 +3487,11 @@ def test_table_expansion_capacity_growth(
         )
     cache = bdebt.cache
     if isinstance(cache, DynamicEmbCache):
-        ckm = cache.key_index_map
-        nt_c = cache._state.num_tables
-        cache_sz = _kim_occupied_sizes_per_table(ckm, nt_c)
-        cache_caps = _kim_capacities_per_table(ckm, nt_c)
+        nt_c = cache.num_tables
+        cache_sz = [cache.size(t) for t in range(nt_c)]
+        cache_caps = cache._core.capacities()
         print(
-            f"[test_table_expansion_capacity_growth] cache KIM size (per table): "
+            f"[test_table_expansion_capacity_growth] cache size (per table): "
             f"{cache_sz}, capacity (per table): {cache_caps}",
             flush=True,
         )
@@ -3517,7 +3527,7 @@ def test_table_expansion_capacity_growth(
 
     bdebt.train()
     stbe.train()
-    # we need to do backward to unlock the keys in the cache, otherwise overflow buffer will be also full.
+    # we need to do backward to unlock the keys in the cache, otherwise the cache will run out of unpinned slots.
     for i in range(2):
         if not multi_table:
             for j, (idx, off) in enumerate(
@@ -3700,7 +3710,12 @@ def test_caching_ps_spills_storage_evictions():
     def lookup(keys):
         keys = torch.tensor(keys, dtype=torch.int64, device=device)
         offsets = torch.tensor([0, keys.numel()], dtype=torch.int64, device=device)
-        return bdebt(keys, offsets).detach().clone()
+        out = bdebt(keys, offsets)
+        # A training-mode forward pins the rows it uses until the backward releases
+        # them. The cache holds 32 rows, so forwards that never run a backward would
+        # pin it full. A zero gradient releases the pins and leaves the values alone.
+        (out * 0).sum().backward()
+        return out.detach().clone()
 
     first = list(range(32))
     # One SGD step moves the values off their initial draw, so what comes back
