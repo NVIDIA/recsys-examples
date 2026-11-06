@@ -25,6 +25,7 @@ def make_model(pooling, caching):
             init_capacity=4096,
             bucket_capacity=128,
             device_id=torch.cuda.current_device(),
+            index_type=torch.int64,
             embedding_dtype=torch.float32,
             local_hbm_for_values=1024 * dim * 4 if caching else 1024**3,
             caching=caching,
