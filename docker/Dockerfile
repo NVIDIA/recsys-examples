@@ -54,7 +54,7 @@ RUN set -eux; \
     python3 -c 'import importlib.metadata as m; assert m.version("fbgemm-gpu").startswith("1.8.0")'
 
 # Layer 0b: TorchRec (tightly coupled with FBGEMM C++ ops version).
-RUN pip install --no-deps tensordict orjson && \
+RUN pip install --no-deps tensordict==0.15.4 orjson==3.13.0 pyvers==0.2.3 && \
     git clone --recursive --depth 1 --branch v1.8.0-rc1 \
       https://github.com/meta-pytorch/torchrec.git torchrec && \
     cd torchrec && \

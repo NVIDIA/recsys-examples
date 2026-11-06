@@ -151,7 +151,13 @@ class TorchRecMetadataTest(unittest.TestCase):
 
 
 class BuildOnlyCheckTest(unittest.TestCase):
-    def test_build_check_without_driver_or_runtime_imports(self):
+    def test_build_check_without_driver_or_gpu_runtime_imports(self):
+        self.run_build_check(tensordict_available=True)
+
+    def test_missing_tensordict_dependency_fails_on_cpu(self):
+        self.run_build_check(tensordict_available=False)
+
+    def run_build_check(self, tensordict_available):
         torch = ModuleType("torch")
         torch.__path__ = []
         torch.__version__ = "2.13.0"
@@ -162,12 +168,27 @@ class BuildOnlyCheckTest(unittest.TestCase):
         extension = ModuleType("torch.utils.cpp_extension")
         extension.CUDA_HOME = "/toolkit"
         torch.utils.cpp_extension = extension
+        tensordict = ModuleType("tensordict")
+        tensordict.__file__ = "/packages/tensordict/__init__.py"
         modules = {
+            "tensordict": tensordict,
             "torch": torch,
             "torch.utils": torch.utils,
             "torch.utils.cpp_extension": extension,
         }
-        versions = {"torchrec": "1.8.0", "fbgemm-gpu": "1.8.0", "dynamicemb": "0.1.0"}
+        versions = {
+            "torchrec": "1.8.0",
+            "fbgemm-gpu": "1.8.0",
+            "dynamicemb": "0.1.0",
+            "tensordict": "0.15.4",
+            "pyvers": "0.2.3",
+        }
+        import_without_gpu = block_runtime_imports(builtins.__import__)
+
+        def import_dependencies(name, *args, **kwargs):
+            if name == "tensordict" and not tensordict_available:
+                raise ModuleNotFoundError("No module named 'pyvers'")
+            return import_without_gpu(name, *args, **kwargs)
 
         def compiler_output(command, **kwargs):
             self.assertEqual(command[0], "/toolkit/bin/nvcc")
@@ -199,14 +220,20 @@ class BuildOnlyCheckTest(unittest.TestCase):
             ), patch.object(
                 builtins,
                 "__import__",
-                side_effect=block_runtime_imports(builtins.__import__),
+                side_effect=import_dependencies,
             ), redirect_stdout(
                 output
             ):
-                runpy.run_path(
-                    str(Path(__file__).with_name("check_gb300.py")), run_name="__main__"
+                script = str(Path(__file__).with_name("check_gb300.py"))
+                if tensordict_available:
+                    runpy.run_path(script, run_name="__main__")
+                else:
+                    with self.assertRaisesRegex(ModuleNotFoundError, "pyvers"):
+                        runpy.run_path(script, run_name="__main__")
+            if tensordict_available:
+                self.assertTrue(
+                    '"scope": "build/metadata/artifacts"' in output.getvalue()
                 )
-            self.assertTrue('"scope": "build/metadata/artifacts"' in output.getvalue())
 
 
 if __name__ == "__main__":

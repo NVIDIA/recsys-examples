@@ -36,6 +36,9 @@ def main():
     )
     args = parser.parse_args()
 
+    # TensorDict is CPU-safe; importing it catches missing Python dependencies
+    # before a GPU job is launched. TorchRec/FBGEMM still load only at runtime.
+    import tensordict
     import torch
     from torch.utils.cpp_extension import CUDA_HOME
 
@@ -56,6 +59,9 @@ def main():
         "fbgemm_gpu": importlib.metadata.version("fbgemm-gpu"),
         "fbgemm_gpu_module": paths["fbgemm_gpu"],
         "torchrec": importlib.metadata.version("torchrec"),
+        "tensordict": importlib.metadata.version("tensordict"),
+        "tensordict_module": tensordict.__file__,
+        "pyvers": importlib.metadata.version("pyvers"),
         "dynamicemb_version": importlib.metadata.version("dynamicemb"),
         "dynamicemb": paths["dynamicemb"],
         "extension": paths["dynamicemb_extensions"],
