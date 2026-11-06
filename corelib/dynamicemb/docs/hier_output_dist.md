@@ -1238,9 +1238,15 @@ stream: the forward kernel `fwd_kernel` and the backward kernel
   backward's CTA 0 zeroes the words it counts from 0 (the heavy rows' done
   counters, and across nodes each chunk's `ready` and `pushed_rows`), so no
   peer counts on one before it is zeroed.
-* **Tasks.** Warps take 32-row tasks from one queue (a `task` word). Owners
-  (and proxies) take turns, starting from each rank's own, so the ranks of a
-  node start on different peers.
+* **Tasks.** Warps take 32-row tasks from two queues (`task` words): the
+  *local* tasks (the rows of the node's owners) and, across nodes, the
+  *remote* ones (the rows that cross nodes, chunk after chunk of the
+  proxies' streams). A local task waits for nothing; a remote one may wait
+  for its chunk at its proxy. So while local tasks are left, a warp takes
+  the next remote task only when that one would not wait, else a local one
+  (ready first). Each queue goes in order. Owners (and proxies) take turns,
+  starting from each rank's own, so the ranks of a node start on different
+  peers.
 * **Exit.** Every CTA counts its arrival in a running total (its `arrive`
   word, so nothing is reset); the last CTA ends the rank's part of the
   kernel.
@@ -1313,16 +1319,21 @@ forward, so the lookup and its backward share a stream.
   same-node owner's `lookup_rows`, or, once its chunk has landed, from its
   proxy's `proxy_rows`, and writes it to every original row of its
   deduplicated row in its output.
-* **Task order.** The row tasks of the node's owners, with index dedup's
-  heavy-row sub-tasks of those rows spread among them. Across nodes, then
-  chunk after chunk of the proxies' streams: a chunk's tasks at every proxy,
-  proxies in turn, each 32 rows of its push order there. Last, the
-  sub-tasks of heavy rows that come from other nodes: they read the row in
-  its proxy's `proxy_rows` once its chunk has landed, or, at a proxy whose
-  stream wraps its ring (which takes other rows there while the kernel
-  runs), copy on from their first original row, which the row's task wrote,
-  once this rank's rows at that proxy are all in. No task waits for a task
-  that comes later in the queue.
+* **Task order.** Local: the row tasks of the node's owners, with index
+  dedup's heavy-row sub-tasks of those rows spread among them. Remote
+  (across nodes): chunk after chunk of the proxies' streams, a chunk's
+  tasks at every proxy, proxies in turn, each 32 rows of its push order
+  there; then the sub-tasks of heavy rows that come from other nodes: they
+  read the row in its proxy's `proxy_rows` once its chunk has landed, or, at
+  a proxy whose stream wraps its ring (which takes other rows there while
+  the kernel runs), copy on from their first original row, which the row's
+  task wrote, once this rank's rows at that proxy are all in. A warp takes
+  the next remote task once its chunk has landed, else a local task; the
+  late sub-tasks wait for the local tasks. So the pulls empty the rings as
+  rows land, and the local rows fill the time between (taking the local
+  tasks first left the rows of a wrapping ring waiting, and the owners
+  waiting for their grants). No task waits for a task that comes later in
+  its queue.
 * **Exit.** The last CTA tells the node that this rank has pulled
   everything, and waits until every node peer has too. After that nobody
   reads this rank's `lookup_rows` or `proxy_rows`. Across nodes it then
@@ -1369,15 +1380,19 @@ On one node the forward kernel is built without the code for several nodes.
   written exactly once, so nothing is zeroed or scattered. The owner hands
   it to the lookup's backward. It is valid until the next lookup, which
   writes `lookup_rows` (section 11.2).
-* **Task order.** Across nodes, first the sub-tasks of heavy rows that go
-  to other nodes. Then, chunk after chunk of the proxies' streams, each
-  proxy's push tasks, proxies in turn. So the chunks fill in stream order.
-  Last, the row tasks
-  of the node's owners, with the sub-tasks of heavy rows that stay on the
-  node spread among them. The last sub-task of such a row to end adds them
-  up and writes the row. A task that needs sub-tasks waits until they end.
-  They come earlier in the queue, so a running warp has them, and they wait
-  for nothing.
+* **Task order.** Remote (across nodes): first the sub-tasks of heavy rows
+  that go to other nodes; then, chunk after chunk of the proxies' streams,
+  each proxy's push tasks, proxies in turn. So the chunks fill in stream
+  order. Local: the row tasks of the node's owners, with the sub-tasks of
+  heavy rows that stay on the node spread among them. The last sub-task of
+  such a row to end adds them up and writes the row. A warp takes the next
+  remote task when it would not wait (a sub-task, or a push whose rows of
+  the ring are free), else a local task. So the pushes feed the proxies as
+  fast as their rings free rows, and the local rows fill the time between
+  (taking the remote tasks first left the local rows waiting behind pushes
+  that wait for the ring). A task that needs sub-tasks waits until they
+  end. They come earlier in the remote queue, so a running warp has them,
+  and they wait for nothing.
 
 ## 12. The ring and credits
 

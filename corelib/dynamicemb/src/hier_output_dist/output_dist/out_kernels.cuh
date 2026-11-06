@@ -235,6 +235,53 @@ struct TaskQueue {
   }
 };
 
+// A worker warp's tasks from two queues: the local tasks (`local` of them,
+// the node's owners' rows) and, across nodes, the remote tasks (`remote`,
+// rows that cross nodes, chunk after chunk of the proxies' streams). A local
+// task waits for nothing; a remote one may wait for its chunk at its proxy
+// (the forward: until it has landed; the backward: until its rows of the
+// ring are free). So while local tasks are left, the warp takes the next
+// remote task only when `ready` says that one would not wait, else the next
+// local task; once the local tasks are all taken, the remote ones in turn.
+// Either kind goes in its queue's order, so no remote task waits for a later
+// one (one taken past the task the warp saw ready may still wait). Returns a
+// local task as its index, a remote one as local + its index, and -1 once
+// both queues are done. Every lane of the warp; `ready` runs on lane 0, with
+// the remote queue's next task.
+struct ReadyFirst {
+  TaskQueue local_queue, remote_queue;
+  int64_t local, remote;
+  bool local_left = true;  // the warp has not seen the local queue run out
+
+  template <typename Ready>
+  __device__ __forceinline__ int64_t next_warp(Ready &&ready) {
+    if (remote == 0) {  // one node, or no rows cross nodes: the local queue alone
+      const int64_t task = local_queue.next_warp();
+      return task < local ? task : -1;
+    }
+    for (;;) {
+      bool take_remote = !local_left;
+      if (local_left) {
+        int go = 0;
+        if ((threadIdx.x & 31) == 0) {
+          const volatile uint64_t *word = remote_queue.word;
+          const int64_t next = (int64_t)*word;
+          go = next < remote && ready(next);
+        }
+        take_remote = __shfl_sync(kFull, go, 0) != 0;
+      }
+      if (!take_remote) {
+        const int64_t task = local_queue.next_warp();
+        if (task < local) return task;
+        local_left = false;
+      }
+      const int64_t task = remote_queue.next_warp();
+      if (task < remote) return local + task;
+      if (!local_left) return -1;
+    }
+  }
+};
+
 // A row task: kTaskRows rows of an owner's block (from row0), owners in turn
 // from this rank's own one, so the ranks of a node start on different peers.
 // count = 0 when the task is past the end of that owner's block.

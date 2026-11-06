@@ -102,23 +102,26 @@ __device__ __forceinline__ void warp_copy_fanout(const char *src, int64_t dedup_
 
 // The forward's requester warps: a pull task (fwd::Pull) and the steps of
 // their task loop. Every warp but, across nodes, CTA 0's two GIN warps
-// requests. Its tasks:
-//   - the row tasks of the node's owners, with index dedup's heavy rows'
-//     sub-tasks spread evenly among them (each sub-task reads its row where
-//     the pull would and writes kHeavy of its copies). Those of rows of the
-//     node's owners take these slots: the pulls keep NVLink busy while the
-//     sub-tasks write HBM;
-//   - across nodes, the tasks of the node's proxies, chunk after chunk of
-//     their streams (task_starts): in a chunk each proxy's in its push
-//     order, 32 positions each, proxies in turn;
-//   - then a slot per heavy row sub-task again, which those of rows of other
-//     nodes take. Taken first, they would hold warps waiting for rows to land
-//     while the pulls of rows that have landed wait behind them.
-// A remote task's rows are pulled once the relay of its proxy says its chunk
-// has landed. At a proxy whose stream wraps its ring the task then adds its
-// rows to that chunk's pulled_rows word there, which tells the relay when
-// the chunk is done with. No task waits for a later one. On one node
-// (kMulti false) only the row tasks and the sub-tasks among them are
+// requests. Its tasks come from two queues (ReadyFirst):
+//   - local: the row tasks of the node's owners, with index dedup's heavy
+//     rows' sub-tasks spread evenly among them (each sub-task reads its row
+//     where the pull would and writes kHeavy of its copies). Those of rows of
+//     the node's owners take these slots: the pulls keep NVLink busy while
+//     the sub-tasks write HBM;
+//   - remote (across nodes): the tasks of the node's proxies, chunk after
+//     chunk of their streams (task_starts): in a chunk each proxy's in its
+//     push order, 32 positions each, proxies in turn; then a slot per heavy
+//     row sub-task again, which those of rows of other nodes take. Taken
+//     before the pulls, they would hold warps waiting for rows to land while
+//     the pulls of rows that have landed wait behind them.
+// A warp takes the next remote task once its chunk has landed, else a local
+// task, so the pulls empty the proxies' rings as their rows land, while the
+// local rows fill the time between; the late sub-tasks wait for the local
+// tasks. A remote task's rows are pulled once the relay of its proxy says
+// its chunk has landed. At a proxy whose stream wraps its ring the task then
+// adds its rows to that chunk's pulled_rows word there, which tells the relay
+// when the chunk is done with. No task waits for a later one of its queue. On
+// one node (kMulti false) only the row tasks and the sub-tasks among them are
 // compiled in: the multi-node paths would make the one-node loop about 10%
 // slower. The kernel runs the task loop (fwd_kernel); these functions are its
 // steps.
@@ -524,7 +527,9 @@ __device__ void OwnerIssuer::run(ncclWindow_t window, const ncclDevComm &dev, co
 //   entry  CTA 0 publishes out_seq and every CTA waits until all node peers
 //          have: a peer there has ended its lookup (which wrote its
 //          lookup_rows before the kernel) and every earlier out kernel;
-//   tasks  warps take 32-row tasks from one queue (a task word), owners (and
+//   tasks  warps take 32-row tasks from two queues (task words): the node's
+//          owners' rows, and across nodes the rows that cross nodes, each
+//          remote task when it would not wait (ReadyFirst); owners (and
 //          proxies) in turn, so a rank's warps reach every peer at once;
 //   exit   every CTA arrives once it is done (the arrive word, a running
 //          total, so nothing is reset), and the last one ends the kernel's
@@ -656,9 +661,25 @@ __global__ void __launch_bounds__(kThreads, 1)
     const LocalRows local_rows{local_offset_per_bucket, local_size, me};
     const int64_t rows = local_rows.count(), local = rows + heavy;
     const int64_t remote = num_nodes > 1 ? plan.task_starts[plan.max_chunks * local_size] : 0;
-    const int64_t total = local + remote + (num_nodes > 1 ? heavy : 0);
-    const TaskQueue queue{tables.layout().ctrl.task(kQueueWork)};
-    for (int64_t task = queue.next_warp(); task < total; task = queue.next_warp()) {
+    const int64_t late = num_nodes > 1 ? heavy : 0;
+    const CtrlLayout ctrl = tables.layout().ctrl;
+    ReadyFirst tasks{TaskQueue{ctrl.task(kQueueLocal)}, TaskQueue{ctrl.task(kQueueRemote)}, local,
+                     remote + late};
+    // Lane 0: a remote pull is ready once its chunk has landed at its proxy;
+    // the late sub-tasks wait for the local tasks. The warp keeps the last
+    // (chunk, proxy) entry it saw landed.
+    int64_t landed_entry = -1;
+    const auto ready = [&](int64_t next) {
+      if (next >= remote) return false;
+      const RemoteTask place(plan.task_starts, plan.max_chunks * local_size, next);
+      if (place.entry == landed_entry) return true;
+      const int proxy = (int)((me + place.entry % local_size) % local_size);
+      if ((int64_t)ld_acquire_sys(tables.landed(proxy, place.entry / local_size)) < seq)
+        return false;
+      landed_entry = place.entry;
+      return true;
+    };
+    for (int64_t task = tasks.next_warp(ready); task >= 0; task = tasks.next_warp(ready)) {
       if (task >= local + remote) {  // the late pass of the heavy rows' sub-tasks
         fwd::heavy_sub_warp<kMulti, true>(sizes, seq, args, tables, task - local - remote, lane);
         continue;

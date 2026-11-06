@@ -42,9 +42,10 @@ constexpr int kWarps = kThreads / 32;
 // proxy's stream wraps its ring, chunk c's puts count on counter c % counters,
 // and at most that many chunks have puts the NIC may still read.
 constexpr int kMaxCounters = 64;
-// Task queues of an out kernel (CtrlLayout::task): the workers', and across
-// nodes the backward's reducers'.
-enum Queue : int { kQueueWork = 0, kQueueReduce, kNumQueues };
+// Task queues of an out kernel (CtrlLayout::task): the workers' tasks of the
+// node's owners' rows, across nodes their remote tasks (ReadyFirst), and
+// across nodes the backward's reducers'.
+enum Queue : int { kQueueLocal = 0, kQueueRemote, kQueueReduce, kNumQueues };
 
 // count / Per rounded up (count >= 0), in the type of count + Per.
 template <int Per, typename Count>

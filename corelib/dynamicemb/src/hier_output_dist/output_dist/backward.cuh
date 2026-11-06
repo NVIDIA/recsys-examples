@@ -174,23 +174,27 @@ __device__ __forceinline__ void sum_key_rows(const RowsLayout &rows, int64_t key
 // The backward's requester warps: the done counters of sub-tasks
 // (SubTaskDone), a push task to a proxy (bwd::ProxyPush) and the steps of
 // their task loop. Every warp but, across nodes, CTA 0's GIN warps and the
-// reducer CTAs requests. It takes its tasks in this order:
-//   1. Across nodes, the sub-tasks of index dedup's heavy rows whose sums go
-//      to other nodes (each sums kHeavy original rows into an fp32 partial
-//      of its own).
-//   2. Chunk after chunk of the proxies' streams (task_starts), the push
-//      tasks of every proxy's rows (32 positions of its push order each),
-//      proxies in turn, so the chunks fill in stream order.
-//   3. The row tasks of the node's owners, with the sub-tasks of the node's
-//      heavy rows spread evenly among them (the pushes keep NVLink busy while
-//      the sub-tasks read HBM). The last sub-task of such a row to end adds
-//      them up and writes the row, which its row task leaves out.
-// A task that needs sub-tasks waits until their done counters say they
-// ended. They come earlier in the queue, so a running warp has them, and they
-// wait for nothing. A push into a chunk whose rows are past the ring's first
-// lap waits until the proxy freed them (slot_free), which needs only the
-// pushes of earlier chunks, earlier in the queue. The kernel runs the task
-// loop (bwd_kernel); these functions are its steps.
+// reducer CTAs requests. Its tasks come from two queues (ReadyFirst):
+//   - remote (across nodes): first the sub-tasks of index dedup's heavy rows
+//     whose sums go to other nodes (each sums kHeavy original rows into an
+//     fp32 partial of its own); then, chunk after chunk of the proxies'
+//     streams (task_starts), the push tasks of every proxy's rows (32
+//     positions of its push order each), proxies in turn, so the chunks fill
+//     in stream order;
+//   - local: the row tasks of the node's owners, with the sub-tasks of the
+//     node's heavy rows spread evenly among them (the pushes keep NVLink busy
+//     while the sub-tasks read HBM). The last sub-task of such a row to end
+//     adds them up and writes the row, which its row task leaves out.
+// A warp takes the next remote task when it is ready (a sub-task, or a push
+// whose rows of the ring are free), else a local task: the pushes feed the
+// proxies' NICs as fast as their rings free rows, while the local rows fill
+// the time between. A task that needs sub-tasks waits until their done
+// counters say they ended. They come earlier in the remote queue, so a
+// running warp has them, and they wait for nothing. A push into a chunk whose
+// rows are past the ring's first lap waits until the proxy freed them
+// (slot_free), which needs only the pushes of earlier chunks, earlier in the
+// remote queue. The kernel runs the task loop (bwd_kernel); these functions
+// are its steps.
 
 // The done counter of a heavy row's sub-tasks: each sub-task counts itself
 // done once its warp wrote its fp32 sum, and what adds the sums up waits
@@ -249,6 +253,20 @@ __device__ __forceinline__ void wait_free_warp(const Sizes &sizes, int64_t seq,
     }
   }
   __syncwarp();
+}
+
+// Whether the rows of chunk `chunk` of a proxy's stream are free for the
+// pushes of backward seq: wait_free_warp would not wait. One lane.
+__device__ __forceinline__ bool rows_free_lane(const Sizes &sizes, int64_t seq,
+                                               const OutTables &tables, int proxy, int64_t chunk) {
+  const int64_t end = tables.plan.proxy_end(proxy, chunk);
+  if (end <= sizes.num_proxy_rows) return true;
+  const uint64_t want = tag_of(seq, (uint64_t)end);
+  if (ld_acquire_cta(tables.free_seen(proxy)) >= want) return true;
+  const uint64_t word = ld_acquire_sys(tables.slot_free(proxy));
+  if (word < want) return false;
+  red_max_release_cta(tables.free_seen(proxy), word);
+  return true;
 }
 
 // A push task's `num_rows` rows are in the proxy's proxy_rows (the warp's
@@ -924,21 +942,37 @@ __global__ void __launch_bounds__(kThreads, 1)
     const int64_t remote =
         early_subs + (num_nodes > 1 ? plan.task_starts[plan.max_chunks * local_size] : 0);
     const LocalRows local_rows{local_offset_per_bucket, local_size, me};
-    const int64_t rows = local_rows.count(), total = remote + rows + heavy_subs;
-    const TaskQueue queue{tables.layout().ctrl.task(kQueueWork)};
-    for (int64_t task = queue.next_warp(); task < total; task = queue.next_warp()) {
-      if (task < early_subs) {
-        bwd::heavy_sub_warp<RowT, true>(sizes, args, tables, task, lane);
-        continue;
-      }
-      if (task < remote) {
+    const int64_t rows = local_rows.count(), local = rows + heavy_subs;
+    const CtrlLayout ctrl = tables.layout().ctrl;
+    ReadyFirst tasks{TaskQueue{ctrl.task(kQueueLocal)}, TaskQueue{ctrl.task(kQueueRemote)}, local,
+                     remote};
+    // Lane 0: a sub-task is ready, and a push task once its chunk's rows of
+    // the ring are free. The warp keeps the last (chunk, proxy) entry it saw
+    // free.
+    int64_t free_entry = -1;
+    const auto ready = [&](int64_t next) {
+      if (next < early_subs) return true;
+      const RemoteTask place(plan.task_starts, plan.max_chunks * local_size, next - early_subs);
+      if (place.entry == free_entry) return true;
+      const int proxy = (int)((me + place.entry % local_size) % local_size);
+      if (!bwd::rows_free_lane(sizes, seq, tables, proxy, place.entry / local_size)) return false;
+      free_entry = place.entry;
+      return true;
+    };
+    for (int64_t task = tasks.next_warp(ready); task >= 0; task = tasks.next_warp(ready)) {
+      if (task >= local) {
+        const int64_t remote_task = task - local;
+        if (remote_task < early_subs) {
+          bwd::heavy_sub_warp<RowT, true>(sizes, args, tables, remote_task, lane);
+          continue;
+        }
         bwd::ProxyPush push;
-        bwd::remote_push(sizes, plan, task - early_subs, push);
+        bwd::remote_push(sizes, plan, remote_task - early_subs, push);
         bwd::push_rows_task_warp<RowT>(sizes, seq, args, tables, push, lane);
         continue;
       }
       int64_t index;
-      if (Interleave{rows, heavy_subs}.is_sub(task - remote, index)) {
+      if (Interleave{rows, heavy_subs}.is_sub(task, index)) {
         bwd::heavy_sub_warp<RowT, false>(sizes, args, tables, index, lane);
         continue;
       }

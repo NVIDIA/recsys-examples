@@ -643,6 +643,38 @@ More runs on the same configuration:
 * `--capacity <entries>`: the capacities by hand, for example to see calls
   that do not fit.
 
+A large-batch workload: one table of 268 million rows, bf16, and 16,384
+samples per GPU with 1,536 keys each (about 25 million keys per GPU and
+iteration). The rows of a proxy for one call (3.1 GB on 2 nodes, 4.6 GB on
+4 nodes) go through its ring in laps. The ring is 512 MiB at most by default
+(`DYNAMICEMB_GIN_PROXY_MB`, [docs/hier_output_dist.md](../docs/hier_output_dist.md),
+sections 12.1 and 15.3). A larger cap holds the whole stream in one lap:
+
+```bash
+LARGE="--num_tables 1 --num_embeddings 268435456 --local_batch_size 16384 \
+       --max_seq_len 1536 --seq_len_dist fixed --emb_dtype bf16 --output_dtype bf16 \
+       --num_iterations 10 --warmup 3 --use_index_dedup"
+$LAUNCH $BENCH $LARGE --output_dist fused --kernel_times                    # laps
+DYNAMICEMB_GIN_PROXY_MB=12288 $LAUNCH $BENCH $LARGE --output_dist fused --kernel_times  # one lap
+```
+
+On Eos (H100, 8 GPUs per node), the kernels of the output dist take these
+times, in ms (the median of 2 runs, with the default ring):
+
+| keys | nodes | laps | forward kernel | backward kernel |
+|---|---|---|---|---|
+| uniform | 2 | 6 | 49.0 | 48.9 |
+| uniform | 4 | 9 | 70.5 | 70.3 |
+| power-law | 4 | | 16.9 | 29.6 |
+
+The laps cost little. A ring that holds the whole stream in one lap makes no
+kernel more than 2.5% faster (47.9 and 49.2 ms on 2 nodes, 70.3 and 71.0 ms
+on 4 nodes, measured on the commit before). On 4 nodes, the NICs move rows
+96–97% of the time, with laps or without. On 2 nodes, the laps cost more
+when the workers took their tasks in a fixed order: 50.7 and 52.7 ms on the
+same nodes. Now a worker takes the remote tasks that do not wait first (see
+[docs/hier_output_dist.md](../docs/hier_output_dist.md), section 11.1).
+
 #### Options
 
 | option | default | meaning |
