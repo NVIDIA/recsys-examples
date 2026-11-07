@@ -621,11 +621,12 @@ def proxy_reference(case: Case, occurrences: List, node: int, remote_keys: int) 
             if owner_node == node or hi == lo
             else (row_scan[hi - 1] - row_scan[lo]) // room + 1
         )
-    # the stream: level after level, owner node after owner node in a level
+    # the stream: level after level, owner node after owner node in a level,
+    # in turn from the node after the proxy's own
     stream = [
         (owner_node, level)
         for level in range(max(chunk_length_per_bucket, default=0))
-        for owner_node in range(num_nodes)
+        for owner_node in ((node + turn) % num_nodes for turn in range(1, num_nodes))
         if chunk_length_per_bucket[owner_node] > level
     ]
     num_chunks = len(stream)

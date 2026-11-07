@@ -311,10 +311,18 @@ __device__ void chunk_counts(const StreamArgs &args) {
 
 // A thread per place c of the stream: its chunk, of level j and owner node o
 // (the levels below j hold before(j) chunks, and in level j the owner nodes
-// with more than j chunks come in node order); zeros past the chunks. Its
-// keys (key_rows_kernel adds their occurrences, the rows its requesters
-// pull), its rows (rows_of, for the stream's scan), its reducer tasks of 32
-// keys, and its place among its owner node's (chunk_inv).
+// with more than j chunks come in turn from the node after the proxy's own:
+// node + 1, node + 2, ... mod num_nodes); zeros past the chunks. Its keys
+// (key_rows_kernel adds their occurrences, the rows its requesters pull),
+// its rows (rows_of, for the stream's scan), its reducer tasks of 32 keys,
+// and its place among its owner node's (chunk_inv).
+// The agents take the stream in order on every node at about the same pace,
+// so with the turn the proxies of a rail mostly serve different owner nodes
+// at a place of a level. In node order they served the same owner node at
+// the same time: its NIC took the puts of several proxies (backward), or
+// sent to several proxies (forward, grants of a stream that wraps the ring),
+// while the other NICs of the rail were idle. DeepEP turns its RDMA peers
+// the same way against this incast.
 __device__ void chunk_table(const StreamArgs &args) {
   const Levels &levels = args.levels;
   const int64_t count = *args.num_chunks, max_chunks = args.max_chunks;
@@ -332,9 +340,11 @@ __device__ void chunk_table(const StreamArgs &args) {
           hi = mid - 1;
       }
       const int64_t level = lo;
-      int64_t rank = place - levels.before(level), owner_node = 0;
-      for (; owner_node < levels.num_nodes - 1; ++owner_node)
+      int64_t rank = place - levels.before(level), owner_node = args.node;
+      for (int64_t turn = 1; turn < levels.num_nodes; ++turn) {
+        owner_node = (args.node + turn) % levels.num_nodes;
         if (levels.chunk_length_per_bucket[owner_node] > level && rank-- == 0) break;
+      }
       const int64_t first = levels.node_offset_per_bucket[owner_node];
       const int64_t lo_key = first + levels.first_key(owner_node, level),
                     hi_key = first + levels.first_key(owner_node, level + 1);

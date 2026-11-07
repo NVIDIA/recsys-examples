@@ -1470,9 +1470,26 @@ the ring     its chunks one after another; when the stream passes the ring, laps
 ```
 
 * The stream takes the chunks level after level, owner node after owner
-  node in a level, each right after the one before. Its positions are
-  unwrapped: a stream that fits the ring lies as it is, which is the case
-  whenever `remote_keys` rows fit under the cap (section 15.3).
+  node in a level, each right after the one before. In a level, the owner
+  nodes come in turn from the node after the proxy's own (`node + 1`,
+  `node + 2`, ... mod `num_nodes`). All agents take the stream in order, on
+  every node at about the same pace. So at a place of a level, the proxies
+  of a rail serve different owner nodes, and each NIC of the rail sends and
+  receives a share of the puts. In node order, the proxies served the same
+  owner node at the same time: in the backward its NIC took the puts of
+  several proxies, and in the forward of a stream that wraps the ring it
+  sent to several proxies, while the other NICs were idle (incast). DeepEP
+  turns its RDMA peers the same way (each rank starts from a different
+  peer). `benchmark/gin_rail_congestion.cu` measures the effect on the rails
+  (`benchmark/README.md`, *Link tools*). With the benchmark's configuration
+  (`--use_index_dedup`, uniform and power-law keys), the backward kernel
+  takes 0.4 to 1.6% less time in this order on 4 nodes, and 6.0 to 7.7%
+  less on 8 nodes. The forward kernel takes the same time. With a large
+  batch (16384 samples of 1536 keys of one feature), the time of neither
+  kernel changes.
+* Its positions are unwrapped: a stream that fits the ring lies as it is,
+  which is the case whenever `remote_keys` rows fit under the cap (section
+  15.3).
 * A stream that does not fit takes laps. Lap `k` holds the chunks whose rows
   before them are in `[k × lap_room, (k + 1) × lap_room)`, with `lap_room =
   num_proxy_rows − chunk_rows + 1`, packed from position `k ×

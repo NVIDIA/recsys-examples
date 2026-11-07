@@ -150,7 +150,8 @@ struct Fanout {
 // one span of chunk_room rows (level j: the owner node's chunk j). Its rows
 // are its keys' rows (the representatives), then its duplicates' slots, each
 // key's in order: at most chunk_rows. The stream takes the chunks level after level, owner node
-// after owner node in a level, each right after the one before. Its positions are unwrapped: a
+// after owner node in a level from the node after the proxy's own (so the proxies of a rail serve
+// different owner nodes at a time), each right after the one before. Its positions are unwrapped: a
 // stream that fits the ring lies as it is; else its chunks take laps of lap_room rows of starts,
 // lap k from position k * num_proxy_rows, so no chunk crosses the ring's end. A chunk lies at start
 // % num_proxy_rows. Every row of the ring is free when an out kernel starts. A chunk is then done
