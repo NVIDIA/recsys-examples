@@ -19,10 +19,8 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 
 #include <c10/util/Exception.h>
 
-#include <algorithm>
 #include <cstdint>
 #include <type_traits>
-#include <vector>
 
 #include "hier_output_dist/input_dist/planner.cuh"
 #include "hier_output_dist/input_dist/planner.h"
@@ -153,50 +151,21 @@ struct BlockRule {
   }
 };
 
-// The rules of a KJT's features, as place_keys_kernel reads them
-// (place(key, feature, world_size)): every feature of one rule, Rule, known
-// when the kernel is compiled; or features of different rules, each key's
-// rule picked by its feature's DistType code at run time (any code but the
-// cyclic ones is kBlock).
-template <typename Rule>
-struct OneRule {
-  const int64_t *block_sizes;  // [num_features]
-  template <typename Key>
-  __device__ __forceinline__ Placement place(Key key, int64_t feature, int64_t world_size) const {
-    return Rule::place(key, block_sizes[feature], world_size);
+// A key's placement by its feature's rule: the feature's DistType code (any
+// code but the cyclic ones is kBlock), read at run time, and its block size.
+// A warp's keys are consecutive, so they are of one feature, and take one
+// branch, except at the start of a feature.
+template <typename Key>
+__device__ __forceinline__ Placement place(Key key, int32_t dist_type, int64_t block_size,
+                                           int64_t world_size) {
+  switch (dist_type) {
+    case (int)DistType::kCyclic:
+      return CyclicRule::place(key, block_size, world_size);
+    case (int)DistType::kHashedCyclic:
+      return HashedCyclicRule::place(key, block_size, world_size);
+    default:
+      return BlockRule::place(key, block_size, world_size);
   }
-};
-struct MixedRules {
-  const int32_t *dist_types;   // [num_features]
-  const int64_t *block_sizes;  // [num_features]
-  template <typename Key>
-  __device__ __forceinline__ Placement place(Key key, int64_t feature, int64_t world_size) const {
-    const int64_t block_size = block_sizes[feature];
-    switch (dist_types[feature]) {
-      case (int)DistType::kCyclic:
-        return CyclicRule::place(key, block_size, world_size);
-      case (int)DistType::kHashedCyclic:
-        return HashedCyclicRule::place(key, block_size, world_size);
-      default:
-        return BlockRule::place(key, block_size, world_size);
-    }
-  }
-};
-
-// Calls `launch` with the rules of the features (their codes on the host):
-// OneRule of the rule all of them have, else MixedRules.
-template <typename Launch>
-void with_rules(const OwnerRules &rules, Launch &&launch) {
-  const std::vector<int> &codes = rules.host_dist_types;
-  const int64_t *block_sizes = rules.block_sizes.data_ptr<int64_t>();
-  if (!std::all_of(codes.begin(), codes.end(), [&](int code) { return code == codes[0]; }))
-    launch(MixedRules{rules.dist_types.data_ptr<int32_t>(), block_sizes});
-  else if (codes[0] == (int)DistType::kCyclic)
-    launch(OneRule<CyclicRule>{block_sizes});
-  else if (codes[0] == (int)DistType::kHashedCyclic)
-    launch(OneRule<HashedCyclicRule>{block_sizes});
-  else
-    launch(OneRule<BlockRule>{block_sizes});
 }
 
 // A thread per key of the KJT: its feature, its owner and the key its owner
@@ -204,14 +173,16 @@ void with_rules(const OwnerRules &rules, Launch &&launch) {
 // feature (world_size * num_features past the valid keys, index dedup's bound:
 // those take the last feature's rule); `index` the key's own index, which the
 // sort carries.
-template <typename Key, typename Rules>
+template <typename Key>
 __global__ void __launch_bounds__(kThreads)
     place_keys_kernel(const Key *values, int64_t num_keys, const int64_t *value_start,
-                      int64_t num_features, Rules rules, int64_t world_size,
-                      int32_t *bucket_feature, int64_t *stored, int32_t *index) {
+                      int64_t num_features, const int32_t *dist_types, const int64_t *block_sizes,
+                      int64_t world_size, int32_t *bucket_feature, int64_t *stored,
+                      int32_t *index) {
   for (int64_t key = first_item(); key < num_keys; key += item_stride()) {
     const int64_t feature = upper_bound(value_start, num_features + 1, key) - 1;
-    const Placement placed = rules.place(values[key], min(feature, num_features - 1), world_size);
+    const int64_t rule = min(feature, num_features - 1);
+    const Placement placed = place(values[key], dist_types[rule], block_sizes[rule], world_size);
     bucket_feature[key] = (int32_t)(feature < num_features ? placed.owner * num_features + feature
                                                            : world_size * num_features);
     stored[key] = placed.stored;
@@ -308,11 +279,15 @@ bool is_index_dtype(const at::Tensor &tensor) {
 BucketizedKeys bucketize_keys(const PlanInput &input, const OwnerRules &rules, int64_t world_size) {
   const at::Tensor &values = input.values;
   const int64_t num_keys = values.numel(), batch = input.batch_size,
-                num_features = (int64_t)rules.host_dist_types.size();
+                num_features = rules.dist_types.numel();
   const int64_t bucket_features = world_size * num_features;
-  TORCH_CHECK(num_features >= 1 && world_size >= 1 && rules.dist_types.numel() == num_features &&
-                  rules.block_sizes.numel() == num_features,
+  TORCH_CHECK(num_features >= 1 && world_size >= 1 && rules.block_sizes.numel() == num_features,
               "hier_output_dist: a rule and a block size per feature, and some owners");
+  TORCH_CHECK(on_gpu_of(rules.dist_types, values) && rules.dist_types.scalar_type() == at::kInt &&
+                  on_gpu_of(rules.block_sizes, values) &&
+                  rules.block_sizes.scalar_type() == at::kLong,
+              "hier_output_dist: the rules' dist types (int32) and block sizes (int64) must be "
+              "contiguous on the GPU of the keys");
   TORCH_CHECK(
       values.is_cuda() && values.is_contiguous() && is_index_dtype(values) && num_keys < INT32_MAX,
       "hier_output_dist: keys must be contiguous int32 or int64 on the GPU, fewer than 2^31");
@@ -367,12 +342,11 @@ BucketizedKeys bucketize_keys(const PlanInput &input, const OwnerRules &rules, i
   const at::Tensor index = at::empty({num_keys}, int_options);
   if (num_keys > 0) {
     with_index(values, [&](const auto *keys) {
-      with_rules(rules, [&](auto feature_rules) {
-        place_keys_kernel<<<item_grid(num_keys), kThreads, 0, stream>>>(
-            keys, num_keys, value_start.data_ptr<int64_t>(), num_features, feature_rules,
-            world_size, bucket_feature.data_ptr<int32_t>(), stored.data_ptr<int64_t>(),
-            index.data_ptr<int32_t>());
-      });
+      place_keys_kernel<<<item_grid(num_keys), kThreads, 0, stream>>>(
+          keys, num_keys, value_start.data_ptr<int64_t>(), num_features,
+          rules.dist_types.data_ptr<int32_t>(), rules.block_sizes.data_ptr<int64_t>(), world_size,
+          bucket_feature.data_ptr<int32_t>(), stored.data_ptr<int64_t>(),
+          index.data_ptr<int32_t>());
     });
     C10_CUDA_KERNEL_LAUNCH_CHECK();
   }

@@ -27,7 +27,6 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 
 #include <cstdint>
 #include <utility>
-#include <vector>
 
 #include "hier_output_dist/common/common.h"
 #include "hier_output_dist/common/config.h"
@@ -71,12 +70,11 @@ struct PlanInput {
 
 // The rule that places the keys of each feature on their owners, the
 // bucketize's: a DistType code (src/utils.h; codes other than kCyclic and
-// kHashedCyclic are kBlock) and the block size kBlock divides by.
+// kHashedCyclic are kBlock), which the bucketize reads at run time, and the
+// block size kBlock divides by.
 struct OwnerRules {
-  at::Tensor dist_types;             // [num_features] int32 on the GPU
-  at::Tensor block_sizes;            // [num_features] int64 on the GPU
-  std::vector<int> host_dist_types;  // the codes on the host: one rule for every feature
-                                     // makes the bucketize's rule a compile-time type
+  at::Tensor dist_types;   // [num_features] int32 on the GPU
+  at::Tensor block_sizes;  // [num_features] int64 on the GPU
 };
 
 // A call's keys by owner, bucketized: [owner][feature][sample][position],

@@ -65,7 +65,7 @@ std::map<std::string, at::Tensor> bucketize_test(
   const OwnerRules rules{at::tensor(dist_types, at::kInt)
                              .pin_memory()
                              .to(values.options().dtype(at::kInt), /*non_blocking=*/true),
-                         block_sizes, dist_types};
+                         block_sizes};
   const BucketizedKeys bucketized = bucketize_keys(input, rules, world_size);
   const int64_t num_features = (int64_t)dist_types.size();
   std::map<std::string, at::Tensor> named{

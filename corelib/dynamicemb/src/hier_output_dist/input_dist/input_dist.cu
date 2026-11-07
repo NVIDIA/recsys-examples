@@ -29,13 +29,6 @@ namespace hier_output_dist {
 
 namespace {
 
-// The bucketize runs the rules present: their codes on the host.
-OwnerRules owner_rules(const Config &config) {
-  const at::Tensor codes = config.dist_types.to(at::kCPU, at::kInt).contiguous();
-  return OwnerRules{config.dist_types, config.block_sizes,
-                    std::vector<int>(codes.data_ptr<int>(), codes.data_ptr<int>() + codes.numel())};
-}
-
 // One CTA: the call's status (StatusSlots), which the caller copies to the
 // host at the call's second wait. Its needs: across nodes the most of the
 // node's (peer_needs, each rank's of its rail, kNumNeeds each): a rank's
@@ -75,7 +68,7 @@ InChannel::InChannel(const Config &config, const Sizes &sizes, ncclWindow_t wind
     : window_(window),
       dev_(dev),
       sizes_(sizes),
-      rules_(owner_rules(config)),
+      rules_{config.dist_types, config.block_sizes},
       weights_(config.weights),
       node_dedup_(config.node_dedup),
       device_(device) {

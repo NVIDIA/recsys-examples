@@ -983,10 +983,13 @@ The requester's own steps, local: DynamicEmb's index dedup, then
 2. **The keys by owner.** Each key's feature comes from the KJT's offsets, and
    its owner and the key its owner stores from the bucketize's rules
    (`dist_type`, and `continuous`'s key rewrite), in the arithmetic of the
-   keys' own width (see below). Only the rules of some feature run. Then one
-   stable radix sort by bucket feature (an int32, owner × `num_features` +
-   feature) puts the keys in `[owner][feature][sample][position]` order, as
-   `int64`, with `inv` (each key's row in the KJT); the keys past the valid
+   keys' own width (see below). The kernel reads the rule of each key's
+   feature at run time, so the features of a sharding can have different
+   rules. A warp's keys are consecutive, so all but a few warps have the
+   keys of one feature and take one branch. Then one stable radix sort by
+   bucket feature (an int32, owner × `num_features` + feature) puts the keys
+   in `[owner][feature][sample][position]` order, as `int64`, with `inv`
+   (each key's row in the KJT); the keys past the valid
    ones (index dedup) go last. Searches of the sorted bucket features give
    where each bucket feature's and each owner's keys start
    (`offset_per_bucket_feature`, `offset_per_bucket`). It also gives the
@@ -1671,7 +1674,7 @@ The capacities are the ones in place (section 5), and `row_bytes` and
 | the proxy's rows before each key (`node_exp_off`) | `8 × remote_keys` | per call |
 | the put lists and the ready counters | `24 × max_chunks + 16 × owner_chunks + 32 × num_nodes × num_features` | per call |
 | index dedup's fan-out table | about 13 bytes per original key (on this path the deduplicated KJT keeps the original length) | per call |
-| the bucketize, in the caller's pool | at its peak 25 bytes per key with one owner rule (67 with three), and about 60 with index dedup while the fan-out table is made | transient |
+| the bucketize, in the caller's pool | at its peak 32 bytes per key, its outputs (16) included, the same for any owner rules; about 60 with index dedup while the fan-out table is made | transient |
 | the planner, in the caller's pool | its largest step: across nodes the proxy's about 99 bytes per entry of `remote_keys`, the requester's about 73 per key, or the owner's gather about 65 per entry of `lookup_keys`, at most 2^22 entries at a time; on one node about 20 bytes per key | transient |
 
 The transient figures are upper bounds from the peaks measured with the
