@@ -238,6 +238,7 @@ class HierSharding:
             timeout_s=_timeout_s(pg),
             ctas=int(os.environ.get("DYNAMICEMB_GIN_CTAS", 0)),
             reduce_ctas=int(os.environ.get("DYNAMICEMB_GIN_REDUCE_CTAS", 8)),
+            chunk_kb=int(os.environ.get("DYNAMICEMB_GIN_CHUNK_KB", 512)),
         )
         self.op = None  # the HierOutputDist, once setup() made it
         # Whether the sharding takes the hierarchical dist; None until setup().

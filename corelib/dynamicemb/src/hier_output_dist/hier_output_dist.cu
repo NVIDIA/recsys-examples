@@ -188,10 +188,12 @@ HierOutputDist::HierOutputDist(const std::string &unique_id, int64_t rank, int64
                                const at::Tensor &block_sizes, const at::Tensor &dist_types,
                                int64_t dim, at::ScalarType dtype, bool weights, bool node_dedup,
                                int64_t lookup_keys, int64_t remote_keys, int64_t proxy_bytes,
-                               double timeout_s, int64_t ctas, int64_t reduce_ctas)
-    : config_(validated(config_of(rank, world_size, local_size, feature_tables, block_sizes,
-                                  dist_types, dim, dtype, weights, node_dedup, lookup_keys,
-                                  remote_keys, proxy_bytes, timeout_s, ctas, reduce_ctas))),
+                               double timeout_s, int64_t ctas, int64_t reduce_ctas,
+                               int64_t chunk_kb)
+    : config_(
+          validated(config_of(rank, world_size, local_size, feature_tables, block_sizes, dist_types,
+                              dim, dtype, weights, node_dedup, lookup_keys, remote_keys,
+                              proxy_bytes, timeout_s, ctas, reduce_ctas, chunk_kb))),
       sizes_(sizes_of(config_)),
       device_(current_device()) {
   c10::cuda::CUDAGuard guard(device_);

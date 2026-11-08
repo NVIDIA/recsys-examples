@@ -667,6 +667,11 @@ times, in ms (the median of 2 runs, with the default ring):
 | uniform | 4 | 9 | 70.5 | 70.3 |
 | power-law | 4 | | 16.9 | 29.6 |
 
+These times are from chunks of 2 MiB of rows, before
+`DYNAMICEMB_GIN_CHUNK_KB` (512 by default): `DYNAMICEMB_GIN_CHUNK_KB=2048`
+gives those chunks ([docs/hier_output_dist.md](../docs/hier_output_dist.md),
+section 4.4).
+
 The laps cost little. A ring that holds the whole stream in one lap makes no
 kernel more than 2.5% faster (47.9 and 49.2 ms on 2 nodes, 70.3 and 71.0 ms
 on 4 nodes, measured on the commit before). On 4 nodes, the NICs move rows
@@ -786,8 +791,10 @@ GPU exchanging with every other, it measured 330.8–331.6 GB/s (SM loads) and
 The second tool, `gin_rail_congestion.cu`, measures incast on the rails. It
 is also a single `.cu` file with its build and run lines at the top (`nvcc
 -O3 -arch=sm_90 ... -lnccl`, then `srun` with one process per GPU on 2 or
-more nodes). Each GPU sends a stream of 2 MiB chunks with GIN puts to the
-GPUs of its rail on the other nodes, as the proxies of the hierarchical dist
+more nodes). Each GPU sends a stream of 2 MiB chunks (the tool's default
+chunk size, its second argument, and the dist's chunks before
+`DYNAMICEMB_GIN_CHUNK_KB`) with GIN puts to the GPUs of its rail on the
+other nodes, in the order in which the proxies of the hierarchical dist
 send their chunks (`docs/hier_output_dist.md`, section 12.1): 16 levels of
 one chunk for each other node. It sends the stream in two orders. In node
 order, every sender takes the other nodes of a level in the same order, so

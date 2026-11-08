@@ -221,20 +221,27 @@ __global__ void __launch_bounds__(kThreads)
 // ── step 2: the rows, the chunks and the slots ──
 
 // A thread per key index: its rows in proxy_rows, one for each occurrence, at
-// most max_key_rows (a call with more raises: kNeedKeyRows); 0 past the
-// node-unique keys.
+// most max_key_rows (a call with more raises: kNeedKeyRows), and with
+// `weights` its weight in its chunk, its rows but at least chunk_weight
+// (Sizes::max_key_weight); 0 past the node-unique keys. Without `weights`
+// chunk_weight is 1: the weights are the rows.
 __global__ void __launch_bounds__(kThreads)
     key_row_counts_kernel(const bool *valid_key, const int32_t *key_count, int64_t entries,
-                          int32_t max_key_rows, int32_t *rows) {
-  for (int64_t key = first_item(); key < entries; key += item_stride())
-    rows[key] = valid_key[key] ? min(key_count[key], max_key_rows) : 0;
+                          int32_t max_key_rows, int32_t chunk_weight, int32_t *rows,
+                          int32_t *weights) {
+  for (int64_t key = first_item(); key < entries; key += item_stride()) {
+    const int32_t key_rows = valid_key[key] ? min(key_count[key], max_key_rows) : 0;
+    rows[key] = key_rows;
+    if (weights != nullptr) weights[key] = valid_key[key] ? max(key_rows, chunk_weight) : 0;
+  }
 }
 
 // The levels of the proxy's stream (common.h): chunk j of an owner node takes
-// its keys whose rows before them, among the node's, are in [j * room,
-// (j + 1) * room) (room: Sizes::chunk_room); a key spans at most room rows,
-// so no chunk is empty.
+// its keys whose weights before them, among the node's, are in [j * room,
+// (j + 1) * room) (room: Sizes::chunk_room); a key weighs at most room, so no
+// chunk is empty. A chunk's rows are its keys' rows (node_exp_off).
 struct Levels {
+  const int64_t *weight_off;               // [entries + 1]: the weights before each key
   const int64_t *node_exp_off;             // [entries + 1]: the rows before each key
   const int64_t *node_offset_per_bucket;   // [num_nodes + 1]: the first key of each owner node
   const int64_t *chunk_length_per_bucket;  // [num_nodes]: the chunks of each owner node
@@ -245,7 +252,12 @@ struct Levels {
   __device__ int64_t first_key(int64_t owner_node, int64_t j) const {
     const int64_t first = node_offset_per_bucket[owner_node],
                   keys = node_offset_per_bucket[owner_node + 1] - first;
-    return lower_bound(node_exp_off + first, keys, node_exp_off[first] + j * room);
+    return lower_bound(weight_off + first, keys, weight_off[first] + j * room);
+  }
+  // The level of key `key` of the owner node whose first key is `first` (the
+  // level of the node's last key, plus one, is its chunks).
+  __device__ int64_t level_of(int64_t first, int64_t key) const {
+    return (weight_off[key] - weight_off[first]) / room;
   }
   // The chunks of the levels below j: each owner node's, up to j.
   __device__ int64_t before(int64_t j) const {
@@ -290,7 +302,7 @@ __device__ void chunk_counts(const StreamArgs &args) {
     const int64_t first = levels.node_offset_per_bucket[owner_node],
                   keys = node_length_per_bucket[owner_node];
     if (owner_node == node || keys <= 0) return 0;
-    return (levels.node_exp_off[first + keys - 1] - levels.node_exp_off[first]) / levels.room + 1;
+    return levels.level_of(first, first + keys - 1) + 1;
   };
   for (int64_t owner_node = threadIdx.x; owner_node < num_nodes; owner_node += kThreads)
     args.chunk_length_per_bucket[owner_node] = chunks_of(owner_node);
@@ -444,9 +456,8 @@ __global__ void __launch_bounds__(kThreads)
     int32_t occurrences = 0;
     if (key < valid_keys) {
       const int64_t owner_node = key_node[key], first = levels.node_offset_per_bucket[owner_node];
-      const int64_t level =
-          min((levels.node_exp_off[key] - levels.node_exp_off[first]) / levels.room,
-              max(levels.chunk_length_per_bucket[owner_node] - 1, (int64_t)0));
+      const int64_t level = min(levels.level_of(first, key),
+                                max(levels.chunk_length_per_bucket[owner_node] - 1, (int64_t)0));
       place = clamp_index(
           chunk_inv[clamp_index(chunk_offset_per_bucket[owner_node] + level, max_chunks)],
           max_chunks);
@@ -706,15 +717,21 @@ ProxyChunks proxy_chunks_and_slots(ProxyKeys &keys, const at::Tensor &requester_
   const cudaStream_t stream = current_stream();
   ProxyChunks chunks;
   // The rows of each key, a row per occurrence (max_key_rows at most), and
-  // the rows before each key.
+  // the rows before each key; the weight of each key, its rows but at least
+  // chunk_weight, and the weights before each key (the rows' when
+  // chunk_weight is 1).
+  const bool weighted = sizes.chunk_weight > 1;
   const at::Tensor rows = at::empty({entries}, int_options);
+  const at::Tensor weights = weighted ? at::empty({entries}, int_options) : at::Tensor();
   key_row_counts_kernel<<<item_grid(entries), kThreads, 0, stream>>>(
       keys.valid_key.data_ptr<bool>(), keys.key_count.data_ptr<int32_t>(), entries,
-      (int32_t)sizes.max_key_rows(), rows.data_ptr<int32_t>());
+      (int32_t)sizes.max_key_rows(), (int32_t)sizes.chunk_weight, rows.data_ptr<int32_t>(),
+      data_or_null<int32_t>(weights));
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   chunks.node_exp_off = exclusive_ends(rows);
+  const at::Tensor weight_off = weighted ? exclusive_ends(weights) : chunks.node_exp_off;
   // The chunks of the stream (each owner node's, by levels of its keys'
-  // rows, level after level), where each lies, and key_stage's slices; the
+  // weights, level after level), where each lies, and key_stage's slices; the
   // stream's chunks and their ends to the proxy header too.
   chunks.chunk_length_per_bucket = at::empty({num_nodes}, long_options);
   chunks.chunk_offset_per_bucket = at::empty({num_nodes + 1}, long_options);
@@ -725,9 +742,12 @@ ProxyChunks proxy_chunks_and_slots(ProxyKeys &keys, const at::Tensor &requester_
   chunks.reduce_task_starts = at::empty({max_chunks + 1}, long_options);
   // each chunk's rows and reducer tasks, and the ends of its rows
   const at::Tensor stream_tables = at::empty({3, max_chunks + 1}, long_options);
-  const Levels levels{
-      chunks.node_exp_off.data_ptr<int64_t>(), keys.node_offset_per_bucket.data_ptr<int64_t>(),
-      chunks.chunk_length_per_bucket.data_ptr<int64_t>(), num_nodes, sizes.chunk_room()};
+  const Levels levels{weight_off.data_ptr<int64_t>(),
+                      chunks.node_exp_off.data_ptr<int64_t>(),
+                      keys.node_offset_per_bucket.data_ptr<int64_t>(),
+                      chunks.chunk_length_per_bucket.data_ptr<int64_t>(),
+                      num_nodes,
+                      sizes.chunk_room()};
   Chunk *chunk_table = records_of<Chunk>(chunks.chunks);
   StreamArgs stream_args;
   stream_args.levels = levels;

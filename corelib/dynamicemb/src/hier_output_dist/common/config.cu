@@ -66,6 +66,9 @@ void Config::validate() const {
   if (dtype != at::kFloat && dtype != at::kBFloat16 && dtype != at::kHalf)
     refuse("rows of the lookup output must be fp32, bf16 or fp16, got ", dtype);
   check_capacity("lookup_keys", capacities.lookup_keys);
+  if (chunk_kb < kMinChunkKb || chunk_kb % 16 != 0)
+    refuse("DYNAMICEMB_GIN_CHUNK_KB must be at least ", kMinChunkKb,
+           " KiB and a multiple of 16, got ", chunk_kb);
   if (num_nodes() > 1) {
     check_capacity("remote_keys", capacities.remote_keys);
     const Sizes sizes = sizes_of(*this);
@@ -100,7 +103,7 @@ Config config_of(int64_t rank, int64_t world_size, int64_t local_size,
                  const std::vector<int64_t> &feature_tables, const at::Tensor &block_sizes,
                  const at::Tensor &dist_types, int64_t dim, at::ScalarType dtype, bool weights,
                  bool node_dedup, int64_t lookup_keys, int64_t remote_keys, int64_t proxy_bytes,
-                 double timeout_s, int64_t ctas, int64_t reduce_ctas) {
+                 double timeout_s, int64_t ctas, int64_t reduce_ctas, int64_t chunk_kb) {
   Config config;
   config.rank = (int)rank;
   config.world_size = (int)world_size;
@@ -116,13 +119,18 @@ Config config_of(int64_t rank, int64_t world_size, int64_t local_size,
   config.timeout_s = timeout_s;
   config.ctas = (int)ctas;
   config.reduce_ctas = (int)reduce_ctas;
+  config.chunk_kb = chunk_kb;
   return config;
 }
 
 // ── the sizes ──
 
+int64_t chunk_weight_for(int64_t ring_rows, int64_t payload_rows) {
+  return std::max<int64_t>(ring_rows / payload_rows, 1);
+}
+
 int64_t max_chunks_for(const Sizes &sizes) {
-  return sizes.remote_keys / sizes.chunk_room() + sizes.topo.num_nodes;
+  return sizes.chunk_weight * sizes.remote_keys / sizes.chunk_room() + sizes.topo.num_nodes;
 }
 
 std::vector<int> dense_tables(const std::vector<int> &feature_tables) {
@@ -153,9 +161,23 @@ Sizes sizes_of(const Config &config) {
     const int64_t key_rows = sizes.max_key_rows();
     sizes.num_proxy_rows = std::min(std::max(sizes.remote_keys, min_proxy_rows_for(key_rows)),
                                     config.capacities.proxy_bytes / sizes.row_bytes);
-    // 2 MiB of rows, at most half the ring: the ring holds two chunks at least
-    const int64_t two_mib = std::max<int64_t>(kTaskRows, (2 << 20) / sizes.row_bytes);
-    sizes.chunk_rows = std::max(std::min(two_mib, sizes.num_proxy_rows / 2), 2 * key_rows);
+    // A chunk's payload over IB, chunk_kb KiB of rows (a row per key), and
+    // its rows in the ring (a row per occurrence): kChunkRowCapBytes of rows,
+    // or the payload if larger, at most half the ring (the ring holds two
+    // chunks at least), and at least two keys of the most rows. When its keys
+    // have few rows, their weights make it send at least about its payload
+    // (config.h). chunk_weight takes ring_rows, before the least of two keys
+    // of the most rows, so it is 1 when the payload is at least the cap. The
+    // payload stops at 2^52 KiB (2^62 bytes, in int64): half the ring is at
+    // most proxy_bytes / 2, which is fewer bytes, so a larger chunk_kb
+    // changes nothing.
+    const int64_t payload_bytes = std::min<int64_t>(config.chunk_kb, int64_t{1} << 52) << 10;
+    const int64_t payload_rows = std::max<int64_t>(kTaskRows, payload_bytes / sizes.row_bytes);
+    const int64_t cap_rows =
+        std::max<int64_t>(kTaskRows, std::max(payload_bytes, kChunkRowCapBytes) / sizes.row_bytes);
+    const int64_t ring_rows = std::min(cap_rows, sizes.num_proxy_rows / 2);
+    sizes.chunk_rows = std::max(ring_rows, 2 * key_rows);
+    sizes.chunk_weight = chunk_weight_for(ring_rows, payload_rows);
     sizes.max_chunks = max_chunks_for(sizes);
     sizes.record_bytes = config.weights ? 16 : 8;
   }

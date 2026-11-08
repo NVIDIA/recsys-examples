@@ -337,24 +337,64 @@ struct NodeChunks {
   }
 };
 
+// The grants of the rows of the stream that the chunks done with free (the
+// rows below free_end): the chunks from `granted` on that end at or below
+// free_end, 32 at a time (lane i: chunk granted + i; their ends grow along the
+// stream). Each owner node gets one grant, to the end of its last such chunk:
+// the last lane of its node raises it, and Credits::raise sends the
+// difference to what it sent before. Returns the chunks granted. Every lane
+// of the relay warp, after the fence that orders what the relay polled.
+__device__ __forceinline__ int64_t grant_warp(const Credits &credits, const FwdPlanView &plan,
+                                              const CtrlLayout &ctrl, int64_t seq, int node,
+                                              int64_t count, int64_t granted, int64_t free_end,
+                                              int lane) {
+  for (;;) {
+    const int64_t at = granted + lane;
+    int owner = -1;  // the owner node of the lane's chunk, when it is granted now
+    uint32_t end = 0;
+    if (at < count) {
+      const Chunk chunk = plan.chunks[at];
+      if ((int64_t)chunk.end <= free_end) {
+        owner = chunk.owner_node;
+        end = chunk.end;
+      }
+    }
+    const unsigned now = __ballot_sync(kFull, owner >= 0);
+    const unsigned same = __match_any_sync(kFull, owner);
+    // Before the grants: the grant_sent words of the grants raised before, and
+    // the pulled_rows polls of every lane (each one's acquire is its fence).
+    __syncwarp();
+    if (owner >= 0 && (same >> lane) == 1u)
+      credits.raise(owner, sig_grant(node), tag_of(seq, end), ctrl.grant_sent(owner));
+    const int run = ballot_run(now);
+    granted += run;
+    if (run < 32) return granted;
+  }
+}
+
 // The proxy's relay in the forward (across nodes; a warp of CTA 0, whose
 // lanes take the owner nodes in turn: lane l those numbered l, l + 32, ...).
 // It grants every rail owner the ring's rows of the stream (positions below
 // num_proxy_rows) if the previous out kernel has not (the first forward).
 // When its stream wraps the ring it first zeroes the pulled_rows word of each
-// of its chunks. Then it polls, waiting for no single one:
-//   - it publishes the rows each owner node puts into proxy_rows as they
+// of its chunks. Then it polls, waiting for no single one. A pass polls with
+// relaxed loads, and the warp makes one system fence if a poll found news
+// (for each 32 owner nodes when there are more): the acquire of what it
+// polled and the release of the stores and grants that follow.
+//   - It publishes the rows each owner node puts into proxy_rows as they
 //     land, in landed_rows[owner_node]; each chunk all of whose rows have
 //     landed gets this out_seq in its landed word, where the node's
-//     requesters read it. An owner node's rows land in the order of its
-//     node-unique keys, chunk after chunk, and add up on its fwd_rows signal,
-//     a running total over forwards (fwd_tot: what it held when this forward
-//     began; rows may land before the kernel starts, as the grant came at
-//     the end of the previous one);
-//   - when its stream wraps the ring, lane 0 marks chunks done with in
-//     order, once the node's requesters pulled all their rows of them
-//     (pulled_rows reaches the chunk's pulls), and grants each chunk whose
-//     rows that frees to its owner: the rows of the stream below its end.
+//     requesters read it (relaxed stores after the fence). An owner node's
+//     rows land in the order of its node-unique keys, chunk after chunk, and
+//     add up on its fwd_rows signal, a running total over forwards (fwd_tot:
+//     what it held when this forward began; rows may land before the kernel
+//     starts, as the grant came at the end of the previous one).
+//   - When its stream wraps the ring, the warp marks chunks done with in
+//     order, lane i the i-th from the first not yet done with, once the
+//     node's requesters pulled all their rows of it (pulled_rows reaches the
+//     chunk's pulls). Then it grants each owner node the rows of the stream
+//     that this frees, once for the pass: up to the end of its last chunk
+//     that ends there (grant_warp).
 // What it keeps of an owner node between polls is in this rank's words: the
 // rows it published (landed_rows, tagged with this out_seq) and fwd_tot.
 struct ProxyRelay {
@@ -385,28 +425,57 @@ __device__ void ProxyRelay::run(ncclWindow_t window, const ncclDevComm &dev, con
     __threadfence_system();
   }
   __syncwarp();
-  int64_t done = 0;     // lane 0: chunks done with
-  int64_t granted = 0;  // lane 0: chunks granted (those that end within the ring need none)
-  if (wraps && lane == 0)
-    while (granted < count && plan.chunks[granted].end <= ring) ++granted;
+  // Chunks done with, and chunks granted, the same in every lane. The chunks
+  // that end within the ring need no grant (the one above): a binary search,
+  // as the chunks' ends grow along the stream.
+  int64_t done = 0, granted = count;
+  if (wraps) {
+    int64_t lo = 0, hi = count;
+    while (lo < hi) {
+      const int64_t mid = (lo + hi) / 2;
+      if ((int64_t)plan.chunks[mid].end <= ring)
+        lo = mid + 1;
+      else
+        hi = mid;
+    }
+    granted = lo;
+  }
   Spin spin(sizes.timeout_ns);
   for (;;) {
     bool moved = false, landed = true;  // every row of the lane's owner nodes has landed
-    // the rows of each owner node that landed, when that changed, and the
-    // chunks that thereby landed
-    for (int owner_node = lane; owner_node < num_nodes; owner_node += 32) {
-      if (owner_node == node) continue;
-      const int64_t num_uniq = plan.node_length_per_bucket[owner_node];
-      const uint64_t word = *ctrl.landed_rows(owner_node);
-      const int64_t seen = LandedRows::tag(word) == seq ? (int64_t)LandedRows::payload(word) : -1;
-      if (seen == num_uniq) continue;
-      const int64_t got = min(
-          (int64_t)(rows.readSignal(sig_rows(owner_node)) - *ctrl.fwd_tot(owner_node)), num_uniq);
+    // When the stream wraps: the chunks done with, lane i the i-th from the
+    // first not yet done with (relaxed).
+    bool pulled = false;
+    if (wraps && done + lane < count)
+      pulled =
+          (int64_t)ld_relaxed_sys(ctrl.pulled_rows(done + lane)) >= plan.chunks[done + lane].pulls;
+    const int newly_done = ballot_run(__ballot_sync(kFull, pulled));
+    // The owner nodes 32 at a time, a lane each: the rows of each one that
+    // landed (relaxed), when that changed, and the chunks that thereby landed.
+    for (int base = 0; base < num_nodes; base += 32) {
+      const int owner_node = base + lane;
+      int64_t seen = 0, got = 0;  // the rows published before, and those landed now
+      if (owner_node < num_nodes && owner_node != node) {
+        const int64_t num_uniq = plan.node_length_per_bucket[owner_node];
+        const uint64_t word = *ctrl.landed_rows(owner_node);
+        seen = LandedRows::tag(word) == seq ? (int64_t)LandedRows::payload(word) : -1;
+        got = seen;
+        if (seen != num_uniq) {
+          const uint64_t total =
+              rows.readSignal(sig_rows(owner_node), 64, cuda::memory_order_relaxed);
+          got = min((int64_t)(total - *ctrl.fwd_tot(owner_node)), num_uniq);
+        }
+        landed = landed && got == num_uniq;
+      }
+      // One system fence for the warp when a lane saw rows land, or (with the
+      // first 32 owner nodes) chunks were done with: the acquire of the
+      // relaxed polls above, and the release of the stores and grants below.
+      if (__any_sync(kFull, got != seen || (base == 0 && newly_done > 0))) fence_acq_rel_sys();
       if (got != seen) {
         const NodeChunks chunks(plan, owner_node);
         for (int64_t j = chunks.first_past(max(seen, (int64_t)0)); j < chunks.chunks; ++j) {
           if (chunks.keys_end(j) > got) break;
-          st_release_sys(ctrl.landed(chunks.place(j)), (uint64_t)seq);
+          st_relaxed_sys(ctrl.landed(chunks.place(j)), (uint64_t)seq);
         }
         LandedRows::publish(ctrl.landed_rows(owner_node), seq, got);
         moved = true;
@@ -414,23 +483,15 @@ __device__ void ProxyRelay::run(ncclWindow_t window, const ncclDevComm &dev, con
         if (timeline.on() && got > counted)
           timeline.landed((unsigned long long)(got - counted), counted == 0);
       }
-      landed = landed && got == num_uniq;
     }
     // the chunks done with, and the grants of the rows they free
-    if (wraps && lane == 0) {
-      while (done < count &&
-             (int64_t)ld_acquire_sys(ctrl.pulled_rows(done)) >= plan.chunks[done].pulls) {
-        ++done;
-        const int64_t free_end = (done < count ? (int64_t)plan.chunks[done].start
-                                               : (int64_t)plan.chunks[count - 1].end) +
-                                 ring;
-        for (; granted < count && (int64_t)plan.chunks[granted].end <= free_end; ++granted) {
-          const Chunk &chunk = plan.chunks[granted];
-          credits.raise(chunk.owner_node, sig_grant(node), tag_of(seq, chunk.end),
-                        ctrl.grant_sent(chunk.owner_node));
-        }
-        moved = true;
-      }
+    if (newly_done > 0) {
+      done += newly_done;
+      const int64_t free_end =
+          (done < count ? (int64_t)plan.chunks[done].start : (int64_t)plan.chunks[count - 1].end) +
+          ring;
+      granted = grant_warp(credits, plan, ctrl, seq, node, count, granted, free_end, lane);
+      moved = true;
     }
     if (__all_sync(kFull, landed)) break;
     // the warp polls again at once while any lane moved
@@ -451,11 +512,19 @@ __device__ void ProxyRelay::run(ncclWindow_t window, const ncclDevComm &dev, con
 // its segments in stream order, each in one chunk and one feature),
 // each once the proxy granted the rows of its stream up to the end of the
 // segment's chunk, in one put that adds its rows to the proxy's fwd_rows
-// signal. It polls the proxy nodes in turn and waits for no single one; its
-// place in each one's segments is in this rank's put_at words. Then the warp
-// flushes. The lookup wrote lookup_rows before the kernel: one system fence,
-// then puts that make no release of their own. No node barrier is needed
-// first.
+// signal. It polls the proxy nodes in turn and waits for no single one: in
+// a pass it reads each one's grant once and puts every segment the grant
+// covers. Its place in each one's segments is in this rank's put_at words.
+// Then the warp flushes. The lookup wrote lookup_rows before the kernel: one
+// system fence, then puts that make no release of their own. No node barrier
+// is needed first. The grants are read relaxed, with no fence after them:
+// the issuer reads nothing that a grant guards. A grant only lets its puts
+// write rows of the proxy's ring, which the proxy's requesters were done with
+// before the relay granted them (its fence, then the credit's release). Each
+// put depends on the grant value the lane read, and the lane makes no store
+// of a put (its work request, its doorbell) before it has that value. DeepEP
+// polls the heads of its RDMA buffers with volatile loads before its puts in
+// the same way.
 struct OwnerIssuer {
   // Every lane of the issuer warp, in forward seq.
   template <ncclGinType_t kGin>
@@ -468,9 +537,10 @@ __device__ void OwnerIssuer::run(ncclWindow_t window, const ncclDevComm &dev, co
                                  int64_t seq, const FwdArgs &args) {
   const FwdPlanView &plan = args.plan;
   const int lane = threadIdx.x & 31, num_nodes = sizes.topo.num_nodes, node = sizes.topo.node;
-  ncclGin rows = gin_context<kGin>(dev, kCtxFwd, NCCL_GIN_RESOURCE_SHARING_CTA);
+  ncclGin rows = gin_context<kGin>(dev, kCtxFwd, issuer_sharing<kGin>());
   ncclGin cred = gin_context<kGin>(dev, kCtxCredit);
   const ncclTeam rail = ncclTeamRail(dev);
+  const Credits credits(cred, rail);
   const OutTimeline timeline{args.trace, sizes.topo.local_size};
   const NodeWindow node_window(window, sizes.topo.local_rank);
   const WindowLayout layout = node_window.layout(sizes);
@@ -494,16 +564,18 @@ __device__ void OwnerIssuer::run(ncclWindow_t window, const ncclDevComm &dev, co
       int64_t *at = layout.ctrl.put_at(proxy_node);
       int64_t seg = *at;
       const int64_t end = plan.fwd_puts(proxy_node + 1);
-      for (; seg < end; ++seg) {
-        const PutSeg segment = plan.put_list[seg];
-        if (cred.readSignal(sig_grant(proxy_node)) <
-            tag_of(seq, plan.fwd_chunks[segment.chunk].end))
-          break;
-        if (!posted) timeline.stamp_earliest(kTraceFirstPut);
-        posted = true;
-        put.put(proxy_node, segment.dst, segment.src, segment.rows, false, 0);
-        if (timeline.on()) timeline.posted((unsigned long long)segment.rows);
-        moved = true;
+      if (seg < end) {
+        // the proxy's grant, once for the pass (relaxed: see above)
+        const uint64_t grant = credits.read_relaxed(sig_grant(proxy_node));
+        for (; seg < end; ++seg) {
+          const PutSeg segment = plan.put_list[seg];
+          if (grant < tag_of(seq, plan.fwd_chunks[segment.chunk].end)) break;
+          if (!posted) timeline.stamp_earliest(kTraceFirstPut);
+          posted = true;
+          put.put(proxy_node, segment.dst, segment.src, segment.rows, false, 0);
+          if (timeline.on()) timeline.posted((unsigned long long)segment.rows);
+          moved = true;
+        }
       }
       *at = seg;
       left = left || seg < end;

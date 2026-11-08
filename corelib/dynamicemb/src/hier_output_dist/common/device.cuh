@@ -62,6 +62,11 @@ __device__ __forceinline__ uint64_t ld_relaxed_sys(const uint64_t *addr) {
 __device__ __forceinline__ void st_release_sys(uint64_t *addr, uint64_t value) {
   asm volatile("st.release.sys.global.u64 [%0], %1;" ::"l"(addr), "l"(value) : "memory");
 }
+// A store of a flag that another GPU reads, when the writer made a fence
+// before it after what the flag guards (a release pattern).
+__device__ __forceinline__ void st_relaxed_sys(uint64_t *addr, uint64_t value) {
+  asm volatile("st.relaxed.sys.global.u64 [%0], %1;" ::"l"(addr), "l"(value) : "memory");
+}
 __device__ __forceinline__ void red_release_sys(uint64_t *addr, uint64_t value) {
   asm volatile("red.release.sys.global.add.u64 [%0], %1;" ::"l"(addr), "l"(value) : "memory");
 }
@@ -86,6 +91,14 @@ __device__ __forceinline__ uint64_t atom_add_acq_rel_gpu(uint64_t *addr, uint64_
   return old;
 }
 __device__ __forceinline__ void fence_sc_sys() { asm volatile("fence.sc.sys;" ::: "memory"); }
+// A system-scope fence that is not sequentially consistent (MEMBAR.ALL, where
+// fence.sc is MEMBAR.SC). After relaxed polls of flags (ld_relaxed_sys) it is
+// an acquire of what they guard, and before relaxed stores of flags
+// (st_relaxed_sys) or puts it is a release of what this thread saw and wrote
+// before it. Like an acquire load, it drops the L1 cache of the SM.
+__device__ __forceinline__ void fence_acq_rel_sys() {
+  asm volatile("fence.acq_rel.sys;" ::: "memory");
+}
 
 // The GPU's clock (%globaltimer) and bounded spin-waits.
 
@@ -117,8 +130,8 @@ struct Spin {
   }
 };
 
-// Warp-wide helpers: the mask of every lane, and a lane's pointer in every
-// lane.
+// Warp-wide helpers: the mask of every lane, a lane's pointer in every lane,
+// and the run of a ballot.
 
 constexpr unsigned kFull = 0xffffffffu;
 
@@ -127,6 +140,10 @@ template <typename T>
 __device__ __forceinline__ T *from_lane(T *ptr, int src_lane) {
   return (T *)__shfl_sync(kFull, (unsigned long long)ptr, src_lane);
 }
+
+// The lanes of a ballot that voted true from lane 0 on, before the first
+// that did not (32 when all did).
+__device__ __forceinline__ int ballot_run(unsigned ballot) { return __clz(__brev(~ballot)); }
 
 // The threads of a CTA: a sync of some of them.
 
@@ -359,11 +376,11 @@ struct TaggedWord {
 // context. A context that holds kGin as a constant keeps only the code of
 // kGin. Together, the code of all the backends used more registers than the
 // out kernels have. `mode`: who uses its QPs (one each per rail peer). GPU,
-// the default, lets the warps of every CTA use them. An issuer warp of CTA 0
-// is the only user of its rows context's QPs, a lane each: CTA, as DeepEP
-// does for a QP that one SM uses. In GPU mode, each put takes its QP's slots
-// with GPU-scope atomics and a GPU-scope acquire fence, which drops the L1
-// cache of the SM (the other warps of CTA 0 then miss in L1).
+// the default, lets the warps of every CTA use them. In GPU mode, each put
+// takes its QP's slots with GPU-scope atomics and a GPU-scope acquire fence,
+// which drops the L1 cache of the SM (the other warps of CTA 0 then miss in
+// L1). An issuer warp of CTA 0 is the only user of its rows context's QPs
+// (issuer_sharing).
 template <ncclGinType_t kGin>
 __device__ __forceinline__ ncclGin
 gin_context(const ncclDevComm &dev, int index,
@@ -372,6 +389,21 @@ gin_context(const ncclDevComm &dev, int index,
   ncclGin gin(dev, index, mode);
   gin._ginBackend = (uint32_t)kGin;
   return gin;
+}
+
+// The mode of an issuer's rows context (kCtxFwd, kCtxBwd). The issuer warp
+// of CTA 0 is the only user of its QPs, and one lane posts on each QP: lane
+// l on those of the rail peers on nodes l, l + 32, ... The warp's flush
+// comes after a __syncwarp. On GDAKI, THREAD: a QP has one posting thread,
+// so a put takes its slots and rings the doorbell with plain loads and
+// stores, without atomics, a lock or CTA fences. GPI has one channel per
+// context for all peers, on which every lane of a warp's flush posts: CTA
+// there, as DeepEP does for a QP that one SM uses. The proxy backend does
+// not use the mode.
+template <ncclGinType_t kGin>
+__device__ __forceinline__ constexpr ncclGinResourceSharingMode issuer_sharing() {
+  return kGin == NCCL_GIN_TYPE_GDAKI ? NCCL_GIN_RESOURCE_SHARING_THREAD
+                                     : NCCL_GIN_RESOURCE_SHARING_CTA;
 }
 
 // Credits on the rail: payload-free signals of GIN context kCtxCredit (the
@@ -398,7 +430,8 @@ struct Credits {
   // The credit `sig` that rail peers raised at this rank (acquire).
   __device__ __forceinline__ uint64_t read(int sig) const { return gin.readSignal(sig); }
   // The same without acquire (ld_relaxed_sys): the caller makes a fence after
-  // it before what the credit allows.
+  // it before what the credit allows, or reads nothing the credit guards (the
+  // forward's issuer: fwd::OwnerIssuer).
   __device__ __forceinline__ uint64_t read_relaxed(int sig) const {
     return gin.readSignal(sig, 64, cuda::memory_order_relaxed);
   }
@@ -427,7 +460,8 @@ __device__ __forceinline__ void rail_put(const ncclGin &gin, const ncclTeam &rai
 // every earlier one on the context to it. The puts make no release of their
 // own: they are told the caller made a system-scope release, which is the
 // scope they need. So the caller makes one system-scope fence (fence())
-// after the writes they carry and before them.
+// after the writes they carry and before them. The same fence is the
+// acquire of the caller's relaxed polls before it.
 struct RowPut {
   const ncclGin &gin;
   const ncclTeam &rail;
@@ -436,7 +470,7 @@ struct RowPut {
   const char *src_rows;
   int64_t row_bytes;
   int sig;
-  __device__ __forceinline__ void fence() const { fence_sc_sys(); }
+  __device__ __forceinline__ void fence() const { fence_acq_rel_sys(); }
   // Rows [src_row, src_row + rows) into [dst_row, dst_row + rows) of the rail
   // peer on node peer_node; with `count`, the put also counts on this rank's
   // counter `counter` once the NIC has read its rows.

@@ -197,7 +197,7 @@ class HierOutputDist {
                  const std::vector<int64_t> &feature_tables, const at::Tensor &block_sizes,
                  const at::Tensor &dist_types, int64_t dim, at::ScalarType dtype, bool weights,
                  bool node_dedup, int64_t lookup_keys, int64_t remote_keys, int64_t proxy_bytes,
-                 double timeout_s, int64_t ctas, int64_t reduce_ctas);
+                 double timeout_s, int64_t ctas, int64_t reduce_ctas, int64_t chunk_kb);
   // Local: waits for this rank's kernels. Then, unless the op was quiesced
   // after the last kernel of every rank, it waits at most min(timeout, 30 s)
   // for every node and rail peer to reach its own teardown. It lets go of

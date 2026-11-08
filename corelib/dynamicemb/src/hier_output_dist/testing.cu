@@ -203,9 +203,13 @@ void node_push_test(at::Tensor stored, at::Tensor inv, c10::optional<at::Tensor>
 
 // The sizes of a call across nodes (Sizes) by name: num_nodes, local_size,
 // node, local_rank, num_features, num_tables, lookup_keys, remote_keys,
-// num_proxy_rows, chunk_rows, record_bytes; max_chunks follows, and weights
-// with record_bytes. No step of the planner reads the others (row_bytes),
-// which stay 0.
+// num_proxy_rows, chunk_rows, record_bytes, and payload_rows (the rows of a
+// chunk's payload; chunk_rows when not given). chunk_weight is
+// chunk_weight_for(chunk_rows, payload_rows): here chunk_rows stands for
+// sizes_of's ring_rows. The two differ only when sizes_of's least of 2 *
+// max_key_rows sets chunk_rows. Then max_chunks follows, and weights with
+// record_bytes. No step of the planner reads the others (row_bytes), which
+// stay 0.
 Sizes plan_sizes(const std::map<std::string, int64_t> &named) {
   const int num_nodes = (int)named.at("num_nodes"), local_size = (int)named.at("local_size"),
             node = (int)named.at("node"), local_rank = (int)named.at("local_rank");
@@ -217,19 +221,24 @@ Sizes plan_sizes(const std::map<std::string, int64_t> &named) {
   sizes.remote_keys = named.at("remote_keys");
   sizes.num_proxy_rows = named.at("num_proxy_rows");
   sizes.chunk_rows = named.at("chunk_rows");
-  sizes.max_chunks = max_chunks_for(sizes);
+  const auto payload = named.find("payload_rows");
+  const int64_t payload_rows = payload != named.end() ? payload->second : sizes.chunk_rows;
+  TORCH_CHECK(payload_rows >= 1, "hier_output_dist: a chunk's payload of at least one row");
+  sizes.chunk_weight = chunk_weight_for(sizes.chunk_rows, payload_rows);
   sizes.record_bytes = named.at("record_bytes");
   sizes.weights = sizes.weighted_records();
+  // a chunk holds two keys of the most weight (sizes_of's do)
   TORCH_CHECK(num_nodes >= 2 && local_size >= 1 && node >= 0 && node < num_nodes &&
                   local_rank >= 0 && local_rank < local_size && sizes.num_features >= 1 &&
                   num_nodes * local_size * sizes.num_features < INT32_MAX &&
                   sizes.num_tables >= 1 && sizes.num_tables <= sizes.num_features &&
                   sizes.lookup_keys >= 1 && sizes.lookup_keys < INT32_MAX &&
                   sizes.remote_keys >= 1 && sizes.remote_keys < INT32_MAX &&
-                  sizes.chunk_rows >= 2 * sizes.max_key_rows() &&
+                  sizes.chunk_rows >= 2 * sizes.max_key_weight() &&
                   sizes.num_proxy_rows >= 2 * sizes.chunk_rows &&
                   (sizes.record_bytes == 8 || sizes.record_bytes == 16),
               "hier_output_dist: the sizes of a call across nodes");
+  sizes.max_chunks = max_chunks_for(sizes);
   return sizes;
 }
 

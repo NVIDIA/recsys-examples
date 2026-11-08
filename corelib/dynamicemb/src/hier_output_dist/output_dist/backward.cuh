@@ -536,33 +536,104 @@ __device__ void ProxyReducer<RowT>::run(ncclWindow_t window, const Sizes &sizes,
 namespace bwd {
 
 // A chunk's ready word (args.ready[chunk]): the keys of the chunk the
-// reducers have counted ready, and the bit kPostedBit, which the issuer sets
-// once the chunk's puts are posted (only that lane reads it).
+// reducers have counted ready, and the bit kPostedBit, which the issuer lane
+// of its owner node sets (an atomic or) once the chunk's puts are posted.
+// That lane reads it when it polls; when the stream wraps, the warp reads it
+// to mark the chunk read.
 struct ChunkReady {
   static constexpr int kPostedBit = 62;
   uint64_t word;
   __device__ int64_t keys() const { return (int64_t)(word & ((1ull << kPostedBit) - 1)); }
   __device__ bool posted() const { return (word >> kPostedBit) != 0; }
-  __device__ uint64_t with_posted() const { return word | (1ull << kPostedBit); }
 };
+
+// The chunks of an owner node's put list that the issuer polls in a pass, at
+// most: the bits of a mask.
+constexpr int kIssueWindow = 8;
+
+// The window of an owner node's put list in a pass: at most kIssueWindow
+// chunks (a chunk's segments are consecutive) from the first segment not yet
+// put (done), each below `limit`. Bit i of `ready`: the i-th chunk is ready
+// to put, as the reducers counted all its keys (Chunk::keys) ready; of
+// `put_before`: it was put in an earlier pass. The loads of the ready words
+// are relaxed: the caller makes a fence after them before it puts.
+__device__ __forceinline__ void poll_window(const BwdPlanView &plan, const int64_t *ready_words,
+                                            int64_t done, int64_t end, int64_t limit,
+                                            unsigned &ready, unsigned &put_before) {
+  int64_t seg = done;
+  for (int i = 0; i < kIssueWindow && seg < end; ++i) {
+    const int32_t chunk = plan.put_list[seg].chunk;
+    if (chunk >= limit) break;
+    const ChunkReady state{ld_relaxed_sys((const uint64_t *)&ready_words[chunk])};
+    if (state.posted())
+      put_before |= 1u << i;
+    else if (state.keys() >= plan.chunks[chunk].keys)
+      ready |= 1u << i;
+    while (++seg < end && plan.put_list[seg].chunk == chunk) {
+    }
+  }
+}
+
+// After the fence, the puts of the window's ready chunks (poll_window's
+// masks; one lane, `ready` not 0): all the segments of each such chunk, each
+// adding its rows to the owner's bwd_rows signal, then the chunk's posted
+// bit. When the stream wraps, each put also counts on the counter of its
+// chunk, and posted(counter) counts the puts. Returns where the segments not
+// yet put start: done moves over the first chunks of the window, as long as
+// they are put. The put list's places are int32 (put_starts).
+__device__ __forceinline__ int64_t post_window(const RowPut &put, const BwdPlanView &plan,
+                                               const BwdArgs &args, const CtrlLayout &ctrl,
+                                               const OutTimeline &timeline, int owner_node,
+                                               int64_t done, int64_t end, unsigned ready,
+                                               unsigned put_before, bool wraps, int counters) {
+  const int prefix = ballot_run(ready | put_before);  // the first chunks, which are all put
+  const int walk = max(32 - __clz(ready), prefix);    // the chunks to walk over
+  const int last = (int)end;
+  int seg = (int)done;
+  PutSeg segment = plan.put_list[seg];
+  for (int i = 0; i < walk; ++i) {
+    const int32_t chunk = segment.chunk;
+    const int counter = chunk % counters;
+    const bool now = ((ready >> i) & 1u) != 0;
+    const int first = seg;
+    do {
+      if (now) put.put(owner_node, segment.dst, segment.src, segment.rows, wraps, counter);
+      if (++seg < last) segment = plan.put_list[seg];
+    } while (seg < last && segment.chunk == chunk);
+    if (now) {
+      if (wraps) *ctrl.posted(counter) += (uint64_t)(seg - first);
+      // its segments' rows: a row per key
+      if (timeline.on()) timeline.posted((unsigned long long)plan.chunks[chunk].keys);
+      atomicOr((unsigned long long *)&args.ready[chunk], 1ull << ChunkReady::kPostedBit);
+    }
+    if (i < prefix) done = seg;
+  }
+  return done;
+}
 
 // The proxy's issuer in the backward (across nodes; the last warp of CTA 0,
 // whose lanes take the owner nodes in turn, so one QP each). As owner, each
 // lane first lets the rail proxies on its nodes put this backward's rows
 // into its lookup_rows, if the previous kernel (a backward too) could not:
 // its lookup_grad was still live. Then, for each owner node once the owner
-// there let it (bwd_ready), it puts that node's chunks, each as soon as the
-// reducers counted all its keys ready, in whatever order they complete. It
-// polls the owner nodes in turn and waits for no single one; its place in
-// each one's segments is in this rank's put_at words. A chunk takes one
-// system fence, then its segments from proxy_rows to their rows of the
-// owner's lookup_rows, each adding its rows to the owner's bwd_rows signal.
-// When the stream wraps the ring, each also counts on the put counter of its
-// chunk (chunk % counters) once the NIC has read it, and a chunk is put only
-// within `counters` chunks of the first not yet read, so no two chunks in
-// flight share a counter. Lane 0 then marks chunks read in order, once their
-// puts are posted and their counter reaches the puts posted on it, and frees
-// the rows of the stream they hold (slot_free). Once the NIC has read
+// there let it (bwd_ready), it puts that node's chunks, each once the
+// reducers counted all its keys ready and it is within kIssueWindow chunks
+// of the first chunk not yet put. It polls the owner nodes in turn and waits
+// for no single one; its place in each one's segments is in this rank's
+// put_at words. In a pass each lane polls the window of its owner node
+// (poll_window, relaxed loads); then the warp makes one system fence if a
+// lane found a ready chunk, and each lane puts the ready chunks of its
+// window in list order (post_window): each one's segments from proxy_rows to
+// their rows of the owner's lookup_rows. So chunks go out of order only
+// within the window. With more than 32 nodes, the lanes take 32 owner nodes
+// at a time, with a fence for each 32. When the stream wraps the ring, each
+// put also counts on the put counter of its chunk (chunk % counters) once
+// the NIC has read it, and a chunk is put only within `counters` chunks of
+// the first not yet read, so no two chunks in flight share a counter. At the
+// end of a pass the warp then marks chunks read in order, lane i the i-th
+// from the first not yet read, once their puts are posted and their counter
+// reaches the puts posted on it, and lane 0 frees the rows of the stream
+// they hold (slot_free), one store for the pass. Once the NIC has read
 // proxy_rows (no wrap: the warp's flush, as in the forward; a wrap: every
 // chunk read), the lanes grant each rail owner the ring's rows of the next
 // kernel's stream, and the warp flushes the credits' context.
@@ -576,13 +647,12 @@ struct ProxyIssuer {
 template <ncclGinType_t kGin>
 __device__ void ProxyIssuer::run(ncclWindow_t window, const ncclDevComm &dev, const Sizes &sizes,
                                  int64_t seq, const BwdArgs &args) {
-  __shared__ int64_t read_chunks;  // lane 0's chunks read, for the other lanes
   const BwdPlanView &plan = args.plan;
   const int lane = threadIdx.x & 31, num_nodes = sizes.topo.num_nodes, node = sizes.topo.node;
   const int64_t ring = sizes.num_proxy_rows, counters = sizes.counters();
   const NodeWindow node_window(window, sizes.topo.local_rank);
   const WindowLayout layout = node_window.layout(sizes);
-  ncclGin rows = gin_context<kGin>(dev, kCtxBwd, NCCL_GIN_RESOURCE_SHARING_CTA);
+  ncclGin rows = gin_context<kGin>(dev, kCtxBwd, issuer_sharing<kGin>());
   ncclGin cred = gin_context<kGin>(dev, kCtxCredit);
   const ncclTeam rail = ncclTeamRail(dev);
   const Credits credits(cred, rail);
@@ -600,8 +670,6 @@ __device__ void ProxyIssuer::run(ncclWindow_t window, const ncclDevComm &dev, co
   const bool wraps = count > 0 && plan.chunks[count - 1].end > ring;
   for (int owner_node = lane; owner_node < num_nodes; owner_node += 32)
     *layout.ctrl.put_at(owner_node) = plan.bwd_puts(owner_node);
-  volatile int64_t *lane_read = &read_chunks;
-  if (lane == 0) *lane_read = 0;
   __syncwarp();
   // rows of proxy_rows into the rail owners' lookup_rows
   const RowPut put{rows,
@@ -611,69 +679,67 @@ __device__ void ProxyIssuer::run(ncclWindow_t window, const ncclDevComm &dev, co
                    layout.rows.proxy_rows(),
                    sizes.row_bytes,
                    sig_rows(node)};
-  int64_t read = 0;   // lane 0: chunks the NIC has read, in order
+  int64_t read = 0;   // chunks the NIC has read, in order (the same in every lane)
   bool first = true;  // the lane has put nothing yet
   for (;;) {
     bool moved = false, left = false;  // segments of the lane's owner nodes are left
-    const int64_t limit = wraps ? *lane_read + counters : count;  // chunks it may put
-    for (int owner_node = lane; owner_node < num_nodes; owner_node += 32) {
-      if (owner_node == node) continue;
-      int64_t *at = layout.ctrl.put_at(owner_node);
-      int64_t done = *at;  // segments before it are put
-      const int64_t end = plan.bwd_puts(owner_node + 1);
-      // The polls are relaxed: put.fence() comes before each chunk's puts.
-      if (done < end &&
-          (int64_t)credits.read_relaxed(sig_bwd_ready(num_nodes, owner_node)) >= seq) {
-        // each chunk the reducers counted ready; a chunk's segments are
-        // consecutive
-        for (int64_t seg_start = done; seg_start < end;) {
-          const int32_t chunk = plan.put_list[seg_start].chunk;
-          if (chunk >= limit) break;
-          int64_t seg_end = seg_start, keys = 0;
-          for (; seg_end < end && plan.put_list[seg_end].chunk == chunk; ++seg_end)
-            keys += plan.put_list[seg_end].rows;
-          uint64_t *ready = (uint64_t *)&args.ready[chunk];
-          const ChunkReady state{ld_relaxed_sys(ready)};
-          if (!state.posted() && state.keys() >= keys) {
-            if (first) timeline.stamp_earliest(kTraceFirstPut);
-            first = false;
-            put.fence();
-            for (int64_t i = seg_start; i < seg_end; ++i) {
-              const PutSeg seg = plan.put_list[i];
-              put.put(owner_node, seg.dst, seg.src, seg.rows, wraps, (int)(chunk % counters));
-            }
-            if (wraps) *layout.ctrl.posted(chunk % counters) += (uint64_t)(seg_end - seg_start);
-            if (timeline.on()) timeline.posted((unsigned long long)keys);
-            *ready = state.with_posted();
-            moved = true;
-          }
-          if (seg_start == done && ChunkReady{*ready}.posted()) done = seg_end;
-          seg_start = seg_end;
-        }
+    const int64_t limit = wraps ? read + counters : count;  // chunks it may put
+    // the owner nodes 32 at a time, a lane each
+    for (int base = 0; base < num_nodes; base += 32) {
+      const int owner_node = base + lane;
+      int64_t done = 0, end = 0;           // the owner node's segments: those before done are put
+      unsigned ready = 0, put_before = 0;  // its window's chunks (poll_window)
+      if (owner_node < num_nodes && owner_node != node) {
+        done = *layout.ctrl.put_at(owner_node);
+        end = plan.bwd_puts(owner_node + 1);
+        if (done < end &&
+            (int64_t)credits.read_relaxed(sig_bwd_ready(num_nodes, owner_node)) >= seq)
+          poll_window(plan, args.ready, done, end, limit, ready, put_before);
       }
-      *at = done;
+      // One system fence for the warp when a lane found a ready chunk: the
+      // acquire of the relaxed polls above (the credit and the ready words),
+      // and the release of what the puts below carry.
+      if (__any_sync(kFull, ready != 0)) put.fence();
+      if (ready != 0) {
+        if (first) timeline.stamp_earliest(kTraceFirstPut);
+        first = false;
+        done = post_window(put, plan, args, layout.ctrl, timeline, owner_node, done, end, ready,
+                           put_before, wraps, (int)counters);
+        *layout.ctrl.put_at(owner_node) = done;
+        moved = true;
+      }
       left = left || done < end;
     }
     __syncwarp();
-    // Lane 0, when the stream wraps: the chunks the NIC has read, in order
-    // (their puts posted, and their counter at the puts posted on it), and
-    // the rows of the stream they free.
-    if (wraps && lane == 0) {
-      while (read < count) {
-        if (!ChunkReady{((volatile uint64_t *)args.ready)[read]}.posted()) break;
-        const int64_t counter = read % counters;
-        if (rows.readCounter((int)counter) < *layout.ctrl.posted(counter)) break;
-        ++read;
-        const int64_t free_end = (read < count ? (int64_t)plan.chunks[read].start
-                                               : (int64_t)plan.chunks[count - 1].end) +
-                                 ring;
-        st_release_sys(layout.ctrl.slot_free(), tag_of(seq, (uint64_t)free_end));
+    // When the stream wraps: the chunks the NIC has read, in order, lane i
+    // the i-th from the first not yet read (its puts posted, and its counter
+    // at the puts posted on it). Only the lanes below `counters` look, so no
+    // two of them read one counter. Then lane 0 frees the rows of the stream
+    // they hold (slot_free), one store for the pass. The counter reads are
+    // relaxed: the __syncwarp orders them before lane 0's release.
+    if (wraps) {
+      const int64_t chunk = read + lane;
+      bool chunk_read = false;
+      if (lane < counters && chunk < count) {
+        const int64_t counter = chunk % counters;
+        chunk_read = ChunkReady{((volatile uint64_t *)args.ready)[chunk]}.posted() &&
+                     rows.readCounter((int)counter, 56, cuda::memory_order_relaxed) >=
+                         *layout.ctrl.posted(counter);
+      }
+      __syncwarp();
+      const int newly = ballot_run(__ballot_sync(kFull, chunk_read));
+      if (newly > 0) {
+        read += newly;
+        if (lane == 0) {
+          const int64_t free_end = (read < count ? (int64_t)plan.chunks[read].start
+                                                 : (int64_t)plan.chunks[count - 1].end) +
+                                   ring;
+          st_release_sys(layout.ctrl.slot_free(), tag_of(seq, (uint64_t)free_end));
+        }
         moved = true;
       }
-      *lane_read = read;
     }
-    __syncwarp();
-    const bool all_read = !wraps || *lane_read == count;
+    const bool all_read = !wraps || read == count;
     if (!__any_sync(kFull, left) && all_read) break;
     if (!__any_sync(kFull, moved))
       spin.pause("reduced chunks", (long long)read, lane, sizes.topo.rank);

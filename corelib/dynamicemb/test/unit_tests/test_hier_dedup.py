@@ -37,7 +37,8 @@ garbage before the call. The checks:
   node-unique keys (identities (owner node, table, key), each in the bucket
   feature (owner node, feature) of its smallest feature, key order inside a
   bucket feature), their records, the chunks of its stream
-  (levels of each owner node's rows, packed, in laps when they pass the ring)
+  (levels of each owner node's weights: a key's rows, but at least the chunk
+  weight; packed, in laps when they pass the ring), their bounds,
   and where each lies, each occurrence's row and slot (the first
   occurrence's row, then duplicate slots), push positions, push tables and
   the rows before each key; its records of each bucket feature against a
@@ -102,21 +103,36 @@ def max_key_rows(case: "Case") -> int:
     return case.local_size
 
 
+def chunk_weight(case: "Case") -> int:
+    """The least weight of a key in a chunk (Sizes::chunk_weight, as
+    chunk_weight_for makes it): the chunk's rows in the ring per row of its
+    payload, at least 1."""
+    return max(case.slot_rows // case.chunk_payload_rows, 1)
+
+
+def key_weight(case: "Case", rows: int) -> int:
+    """A key's weight in a chunk: its rows, but at least chunk_weight."""
+    return max(rows, chunk_weight(case))
+
+
 def chunk_room(case: "Case") -> int:
-    """Rows of a level (Sizes::chunk_room)."""
-    return case.slot_rows - max_key_rows(case) + 1
+    """Weights of a level (Sizes::chunk_room): a key weighs at most
+    max(max_key_rows, chunk_weight) (Sizes::max_key_weight)."""
+    return case.slot_rows - key_weight(case, max_key_rows(case)) + 1
 
 
 def max_chunks(case: "Case", remote_keys: int) -> int:
     """The most chunks of a stream (Sizes::max_chunks)."""
-    return remote_keys // chunk_room(case) + case.num_nodes
+    return chunk_weight(case) * remote_keys // chunk_room(case) + case.num_nodes
 
 
 def owner_chunks(case: "Case", lookup_keys: int, remote_keys: int) -> int:
-    """The most chunks an owner gets (Sizes::owner_chunks)."""
+    """The most chunks an owner gets (Sizes::owner_chunks): a key weighs at
+    most chunk_weight per row, and at most max_key_weight."""
     others = case.num_nodes - 1
     return others + min(
-        others * remote_keys, max_key_rows(case) * lookup_keys
+        chunk_weight(case) * others * remote_keys,
+        key_weight(case, max_key_rows(case)) * lookup_keys,
     ) // chunk_room(case)
 
 
@@ -136,6 +152,9 @@ class Case:
     node_dedup: bool = True
     num_proxy_rows: int = 1 << 20  # small: the ring wraps
     chunk_rows: int = 0  # the most rows of a chunk; 0: the least, 2 * max_key_rows
+    # the rows of a chunk's payload (plan_sizes' payload_rows); 0: chunk_rows,
+    # chunk_weight 1 (the weights are the rows)
+    payload_rows: int = 0
     bound: int = 0  # index dedup: rows past the valid ones
     # the capacities: the most a rank needs plus this (below 0: the call
     # does not fit)
@@ -165,6 +184,11 @@ class Case:
         """Sizes::chunk_rows."""
         return self.chunk_rows or 2 * max_key_rows(self)
 
+    @property
+    def chunk_payload_rows(self) -> int:
+        """The rows of a chunk's payload (plan_sizes' payload_rows)."""
+        return self.payload_rows or self.slot_rows
+
 
 def one_owner_job(case: Case, keys_of_rank: List[List[int]]) -> List[Tuple]:
     """Each rank's rows: its keys (keys_of_rank, the ranks past them none) for
@@ -189,9 +213,12 @@ def same_place_job(case: Case, generator) -> List[Tuple]:
     room, ring = chunk_room(case), case.num_proxy_rows
     lap_room = ring - case.slot_rows + 1
     keys = ring + 2 * room
-    # a key's rows before it: key 0 has two occurrences, the keys up to the
+    # a key's weights before it: key 0 has two occurrences, the keys up to the
     # second lap's first one each
-    level = [0] + [(key + 1) // room for key in range(1, keys)]  # each key's chunk
+    first, weight = key_weight(case, 2), key_weight(case, 1)
+    level = [0] + [
+        (first + (key - 1) * weight) // room for key in range(1, keys)
+    ]  # each key's chunk
     rows_before, second_lap = 0, 0  # the stream's rows before each chunk
     for chunk in range(level[-1] + 1):
         if rows_before >= lap_room:
@@ -219,6 +246,16 @@ def past_bound_job(case: Case, generator) -> List[Tuple]:
 CASES = [
     Case("uniform"),
     Case("hot keys", max_block=40, key_range=30, hot=0.5),
+    # chunks by weights: a key weighs its rows, but at least chunk_weight
+    # (chunk_rows // payload_rows), so weights differ from rows
+    Case(
+        "hot keys, chunk weight 2",
+        max_block=40,
+        key_range=30,
+        hot=0.5,
+        chunk_rows=40,
+        payload_rows=20,
+    ),
     Case(
         "weights, 3 nodes",
         num_nodes=3,
@@ -228,6 +265,18 @@ CASES = [
         hot=0.5,
         weights=True,
         chunk_rows=300,
+    ),
+    Case(
+        "weights, 3 nodes of 2, chunk weight 6 above a key's rows",
+        num_nodes=3,
+        local_size=2,
+        tables=(0, 0, 1),
+        max_block=40,
+        key_range=30,
+        hot=0.5,
+        weights=True,
+        chunk_rows=60,
+        payload_rows=10,
     ),
     Case(
         "2 nodes, a wrapping ring",
@@ -247,12 +296,33 @@ CASES = [
         num_proxy_rows=1280,
     ),
     Case(
+        "2 nodes, a wrapping ring, chunk weight 4",
+        num_nodes=2,
+        max_block=200,
+        key_range=600,
+        hot=0.15,
+        num_proxy_rows=640,
+        chunk_rows=160,
+        payload_rows=40,
+    ),
+    Case(
         "node dedup off",
         max_block=10,
         key_range=60,
         hot=0.3,
         weights=True,
         node_dedup=False,
+    ),
+    Case(
+        "node dedup off, chunk weight 3",
+        max_block=10,
+        key_range=60,
+        hot=0.3,
+        weights=True,
+        node_dedup=False,
+        chunk_rows=30,
+        payload_rows=10,
+        seeds=1,
     ),
     Case(
         "2 nodes of 8, hot keys",
@@ -262,6 +332,17 @@ CASES = [
         max_block=40,
         key_range=30,
         hot=0.5,
+    ),
+    Case(
+        "2 nodes of 8, hot keys, chunk weight 3",
+        num_nodes=2,
+        local_size=8,
+        tables=(0, 1, 1),
+        max_block=40,
+        key_range=30,
+        hot=0.5,
+        chunk_rows=60,
+        payload_rows=20,
     ),
     Case(
         "large, a wrapping ring",
@@ -278,6 +359,17 @@ CASES = [
         hot=0.08,
         weights=True,
         num_proxy_rows=3840,
+        seeds=1,
+    ),
+    Case(
+        "large, weights, a wrapping ring, chunk weight 8",
+        max_block=200,
+        key_range=400,
+        hot=0.08,
+        weights=True,
+        num_proxy_rows=960,
+        chunk_rows=400,
+        payload_rows=50,
         seeds=1,
     ),
     Case(
@@ -305,6 +397,15 @@ CASES = [
     Case(
         "4 nodes of 1, hot", local_size=1, max_block=100, hot=0.4, num_proxy_rows=3840
     ),
+    Case(
+        "4 nodes of 1, hot, chunk weight 5",
+        local_size=1,
+        max_block=100,
+        hot=0.4,
+        num_proxy_rows=3840,
+        chunk_rows=50,
+        payload_rows=10,
+    ),
     Case("4 nodes of 8", local_size=8, max_block=3, key_range=20, hot=0.1, seeds=1),
     Case("index dedup's bound", bound=50, weights=True, hot=0.2),
     Case("an empty call", max_block=0),
@@ -326,7 +427,26 @@ CASES = [
         job=same_place_job,
         seeds=1,
     ),
+    Case(
+        "one slot in two laps of the ring, chunk weight 2",
+        num_nodes=2,
+        local_size=2,
+        tables=(0,),
+        num_proxy_rows=1280,
+        chunk_rows=8,
+        payload_rows=4,
+        job=same_place_job,
+        seeds=1,
+    ),
     Case("remote_keys overflow", max_block=20, hot=0.3, remote_slack=-1),
+    Case(
+        "remote_keys overflow, chunk weight 2",
+        max_block=20,
+        hot=0.3,
+        remote_slack=-1,
+        chunk_rows=16,
+        payload_rows=8,
+    ),
     Case("lookup_keys overflow", max_block=20, hot=0.3, lookup_slack=-1),
     Case(
         "remote_keys overflow, weights, bound",
@@ -388,6 +508,15 @@ CASES = [
     ),
     # keys not index-deduplicated: the need key_rows
     Case("keys not deduplicated", max_block=40, key_range=30, hot=0.5, dedup=False),
+    Case(
+        "keys not deduplicated, chunk weight 2",
+        max_block=40,
+        key_range=30,
+        hot=0.5,
+        dedup=False,
+        chunk_rows=16,
+        payload_rows=8,
+    ),
     Case(
         "keys not deduplicated, weights, a wrapping ring",
         num_nodes=2,
@@ -624,16 +753,19 @@ def proxy_reference(case: Case, occurrences: List, node: int, remote_keys: int) 
     count = [len(group) for *_, group in keys]
     rows = [min(key_count, max_key_rows(case)) for key_count in count]
     row_scan = [0] + list(accumulate(rows))
+    # a key's weight: its rows, but at least chunk_weight
+    weights = [key_weight(case, key_rows) for key_rows in rows]
+    weight_scan = [0] + list(accumulate(weights))
     occurrence_scan = [0] + list(accumulate(count))
 
-    # the levels: owner node o's chunk j takes its keys whose rows before them,
-    # among the node's, are in [j * room, (j + 1) * room)
+    # the levels: owner node o's chunk j takes its keys whose weights before
+    # them, among the node's, are in [j * room, (j + 1) * room)
     def first_key(owner_node: int, level: int) -> int:
         lo, hi = (
             node_offset_per_bucket[owner_node],
             node_offset_per_bucket[owner_node + 1],
         )
-        return bisect_left(row_scan, row_scan[lo] + level * room, lo, hi) - lo
+        return bisect_left(weight_scan, weight_scan[lo] + level * room, lo, hi) - lo
 
     chunk_length_per_bucket = []
     for owner_node in range(num_nodes):
@@ -644,7 +776,7 @@ def proxy_reference(case: Case, occurrences: List, node: int, remote_keys: int) 
         chunk_length_per_bucket.append(
             0
             if owner_node == node or hi == lo
-            else (row_scan[hi - 1] - row_scan[lo]) // room + 1
+            else (weight_scan[hi - 1] - weight_scan[lo]) // room + 1
         )
     # the stream: level after level, owner node after owner node in a level,
     # in turn from the node after the proxy's own
@@ -655,12 +787,13 @@ def proxy_reference(case: Case, occurrences: List, node: int, remote_keys: int) 
         if chunk_length_per_bucket[owner_node] > level
     ]
     num_chunks = len(stream)
-    chunk_rows, chunk_keys = [], []
+    chunk_rows, chunk_keys, chunk_weights = [], [], []
     for owner_node, level in stream:
         lo, hi = first_key(owner_node, level), first_key(owner_node, level + 1)
         first = node_offset_per_bucket[owner_node]
         chunk_keys.append((first + lo, hi - lo))
         chunk_rows.append(row_scan[first + hi] - row_scan[first + lo])
+        chunk_weights.append(weight_scan[first + hi] - weight_scan[first + lo])
     ends = list(accumulate([0] + chunk_rows))
     total, lap_room = ends[-1], ring - case.slot_rows + 1
     starts = []
@@ -745,6 +878,7 @@ def proxy_reference(case: Case, occurrences: List, node: int, remote_keys: int) 
         node_offset_per_bucket=node_offset_per_bucket,
         num_chunks=num_chunks,
         chunks=table,
+        chunk_weights=chunk_weights,
         chunk_length_per_bucket=chunk_length_per_bucket,
         chunk_offset_per_bucket=chunk_offset_per_bucket,
         chunk_inv=chunk_inv,
@@ -875,6 +1009,7 @@ def run_call(
             remote_keys=remote_keys,
             num_proxy_rows=case.num_proxy_rows,
             chunk_rows=case.slot_rows,
+            payload_rows=case.chunk_payload_rows,
             record_bytes=case.record_bytes,
         )
 
@@ -1095,6 +1230,18 @@ def check_proxy(
         ref["node_offset_per_bucket"],
     )
     expect("chunks", int(out["num_chunks"]), num_chunks)
+    # the chunks' bounds: none empty, its rows at most its weights, which are
+    # at most chunk_rows, and none past the ring's end
+    expect(
+        "chunk bounds",
+        all(
+            row[2] >= 1
+            and row[5] - row[4] <= weight <= case.slot_rows
+            and row[4] % case.num_proxy_rows + row[5] - row[4] <= case.num_proxy_rows
+            for row, weight in zip(ref["chunks"], ref["chunk_weights"])
+        ),
+        True,
+    )
     expect(
         "chunk table",
         [
