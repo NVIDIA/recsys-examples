@@ -74,20 +74,21 @@ struct Topo {
 struct Sizes {
   Topo topo;
   int64_t num_features;
-  int64_t num_tables;      // the features' tables, numbered densely (dense_tables)
-  int64_t lookup_keys;     // keys an owner looks up (a capacity)
-  int64_t remote_keys;     // remote occurrences a proxy deduplicates (a capacity)
-  int64_t num_proxy_rows;  // rows of proxy_rows, the proxy's ring
-  int64_t row_bytes;       // an embedding row (lookup_rows, proxy_rows)
-  int64_t chunk_rows;      // the most rows of a chunk in the ring: 2 MiB, or its payload if
-                           // more, at most half the ring
-  int64_t chunk_weight;    // the least weight of a key in a chunk (see max_key_weight): a
-                           // chunk's ring rows, before the least of two keys of the most rows,
-                           // per row of its payload over IB (512 KiB by default), at least 1
-  int64_t max_chunks;      // the most chunks of a proxy's stream in a call
-  int64_t record_bytes;    // a key record: 8, or 16 with its weight
-  bool weights;            // the requesters' keys carry weights
-  uint64_t timeout_ns;     // how long a kernel waits for a peer before it traps
+  int64_t num_tables;        // the features' tables, numbered densely (dense_tables)
+  int64_t lookup_keys;       // keys an owner looks up (a capacity)
+  int64_t remote_keys;       // remote occurrences a proxy deduplicates (a capacity)
+  int64_t num_proxy_rows;    // rows of proxy_rows, the proxy's ring
+  int64_t row_bytes;         // an embedding row (lookup_rows, proxy_rows)
+  int64_t chunk_rows;        // the most rows of a chunk in the ring: 2 MiB, or its payload if
+                             // more, at most half the ring
+  int64_t rows_per_payload;  // the ring rows a chunk may spend per row it sends over IB (4 at
+                             // 512 KiB): its ring rows, before the least of two keys of the
+                             // most rows, per row of its payload, at least 1; a key counts at
+                             // least this many rows in its chunk (max_counted_rows)
+  int64_t max_chunks;        // the most chunks of a proxy's stream in a call
+  int64_t record_bytes;      // a key record: 8, or 16 with its weight
+  bool weights;              // the requesters' keys carry weights
+  uint64_t timeout_ns;       // how long a kernel waits for a peer before it traps
 
   __host__ __device__ bool multi_node() const { return topo.num_nodes > 1; }
   // The key records carry their weights: WeightedKeyRecord, else KeyRecord
@@ -100,41 +101,41 @@ struct Sizes {
   // (table, key) once. A proxy gives a key of more occurrences this many rows,
   // and the call raises (kNeedKeyRows).
   __host__ __device__ int64_t max_key_rows() const { return topo.local_size; }
-  // A key's weight in a chunk is its rows, but at least chunk_weight. A key
-  // sends one row over IB, and it has a row in the ring per occurrence. So a
-  // chunk of keys of few rows holds about chunk_rows / chunk_weight keys (its
-  // payload). A chunk of keys of many rows stops at chunk_rows rows. The most
-  // weight of a key:
-  __host__ __device__ int64_t max_key_weight() const {
-    return max_key_rows() > chunk_weight ? max_key_rows() : chunk_weight;
+  // A key counts in its chunk for its rows, but for at least rows_per_payload:
+  // its counted rows. A key sends one row over IB, and it has a row in the
+  // ring per occurrence. So a chunk of keys of few rows holds about
+  // chunk_rows / rows_per_payload keys (its payload). A chunk of keys of many
+  // rows stops at chunk_rows rows. The most counted rows of a key:
+  __host__ __device__ int64_t max_counted_rows() const {
+    return max_key_rows() > rows_per_payload ? max_key_rows() : rows_per_payload;
   }
-  // A chunk takes the keys whose weights before them, among their owner
-  // node's, fall in one span of this much weight (chunk_room). A key weighs
-  // at most max_key_weight, and its rows are at most its weight. So a chunk's
-  // weights, and so its rows, stay within chunk_rows.
-  __host__ __device__ int64_t chunk_room() const { return chunk_rows - max_key_weight() + 1; }
-  // A stream that does not fit the ring takes laps of this many rows of
-  // chunk starts (lap_room); a chunk spans at most chunk_rows, so a lap's
-  // rows stay within the ring.
-  __host__ __device__ int64_t lap_room() const { return num_proxy_rows - chunk_rows + 1; }
+  // A chunk takes the keys whose counted rows before them, among their owner
+  // node's, fall in one span of this many counted rows (chunk_span). A key
+  // counts at most max_counted_rows, and its rows are at most its counted
+  // rows. So a chunk's counted rows, and so its rows, stay within chunk_rows.
+  __host__ __device__ int64_t chunk_span() const { return chunk_rows - max_counted_rows() + 1; }
+  // A stream that does not fit the ring takes laps, a lap's chunks starting
+  // in a span of this many stream rows (lap_span); a chunk has at most
+  // chunk_rows rows, so a lap's rows stay within the ring.
+  __host__ __device__ int64_t lap_span() const { return num_proxy_rows - chunk_rows + 1; }
   // The GIN counters of the backward's puts (kMaxCounters).
   __host__ __device__ int64_t counters() const {
     return max_chunks < kMaxCounters ? max_chunks : kMaxCounters;
   }
   // The most chunks an owner gets from its rail's proxies. A proxy's stream
-  // holds at most w / chunk_room + 1 chunks of this owner's node, w the
-  // weights of its keys of the node. A key weighs at most chunk_weight per
-  // row, and a proxy's rows are at most remote_keys. A key weighs at most
-  // max_key_weight too, and this owner looks up at most lookup_keys keys (or
-  // no proxy puts to it).
+  // holds at most r / chunk_span + 1 chunks of this owner's node, r the
+  // counted rows of its keys of the node. A key counts at most
+  // rows_per_payload times its rows, and a proxy's rows are at most
+  // remote_keys. A key counts at most max_counted_rows too, and this owner
+  // looks up at most lookup_keys keys (or no proxy puts to it).
   __host__ __device__ int64_t owner_chunks() const {
-    const int64_t others = topo.num_nodes - 1, room = chunk_room();
-    const int64_t by_proxy = others * remote_keys, by_owner = max_key_weight() * lookup_keys;
-    // min(chunk_weight * by_proxy, by_owner): the product only when it is at
-    // most by_owner, so it does not overflow
-    const int64_t weights =
-        by_proxy <= by_owner / chunk_weight ? chunk_weight * by_proxy : by_owner;
-    return others + weights / room;
+    const int64_t others = topo.num_nodes - 1, span = chunk_span();
+    const int64_t by_proxy = others * remote_keys, by_owner = max_counted_rows() * lookup_keys;
+    // min(rows_per_payload * by_proxy, by_owner): the product only when it is
+    // at most by_owner, so it does not overflow
+    const int64_t counted =
+        by_proxy <= by_owner / rows_per_payload ? rows_per_payload * by_proxy : by_owner;
+    return others + counted / span;
   }
 };
 
@@ -168,28 +169,29 @@ struct Fanout {
 // ── the proxy's stream and push orders (num_nodes > 1) ──────────────────────
 // A proxy's rows of a call (proxy_rows) are a stream of chunks through its
 // ring of num_proxy_rows rows. A chunk is consecutive node-unique keys of one
-// owner node: those whose weights before them (Sizes::max_key_weight), among their owner
-// node's, fall in one span of chunk_room (level j: the owner node's chunk j). Its rows are its
-// keys' rows (each key's first occurrence's), then its duplicates' slots, each key's in order:
-// at most chunk_rows. The stream takes the chunks level after level, owner node
-// after owner node in a level from the node after the proxy's own (so the proxies of a rail serve
+// owner node: those whose counted rows before them (Sizes::max_counted_rows), among their owner
+// node's, fall in one span of chunk_span (the owner node's chunk j, in the stream's round j). Its
+// rows are its keys' rows (each key's first occurrence's), then its duplicates' slots, each key's
+// in order: at most chunk_rows. The stream takes the chunks round after round, owner node
+// after owner node in a round from the node after the proxy's own (so the proxies of a rail serve
 // different owner nodes at a time), each right after the one before. Its positions are unwrapped: a
-// stream that fits the ring lies as it is; else its chunks take laps of lap_room rows of starts,
-// lap k from position k * num_proxy_rows, so no chunk crosses the ring's end. A chunk lies at start
-// % num_proxy_rows. Every row of the ring is free when an out kernel starts. A chunk is then done
-// with in the forward once every requester of the node pulled it, in the backward once the NIC read
-// its sums; chunks are done with in order. The rows of a chunk may be written once the first chunk
-// not done with starts at end - num_proxy_rows or later: the relay grants the owners those rows
-// (forward), the issuer frees them for the node's requesters (backward).
+// stream that fits the ring lies as it is; else its chunks take laps, the chunks of a lap starting
+// in a span of lap_span stream rows, lap k from position k * num_proxy_rows, so no chunk crosses
+// the ring's end. A chunk lies at start % num_proxy_rows. Every row of the ring is free when an out
+// kernel starts. A chunk is then done with in the forward once every requester of the node pulled
+// it, in the backward once the NIC read its sums; chunks are done with in order. The rows of a
+// chunk may be written once the first chunk not done with starts at end - num_proxy_rows or later:
+// the relay grants the owners those rows (forward), the issuer frees them for the node's requesters
+// (backward).
 //
 // A chunk as its proxy keeps it (ProxyPlan::chunks): its owner node, its keys
 // [key_lo, key_lo + keys) among the proxy's node-unique keys, the rows its
 // requesters pull of it in the forward (its occurrences), its unwrapped start
-// and end, and its level.
+// and end, and its round.
 struct Chunk {
   int32_t owner_node, key_lo, keys, pulls;
   uint32_t start, end;
-  int32_t level;  // its place among its owner node's chunks
+  int32_t round;  // its place among its owner node's chunks: its round of the stream
   int32_t unused;
 };
 // A chunk as its owner reads it (each slice of key_stage starts with the

@@ -18,18 +18,19 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 // hierarchical dist's kernels make them.
 //
 // The dist sends rows between nodes chunk by chunk, on each rail: every proxy
-// has a stream of chunks, level after level, one chunk of each owner node in a
-// level. Its agents take the streams in order, on every node at about the same
-// pace. When every proxy takes the owner nodes of a level in the same order
-// (node order), the proxies of a rail send to the same owner node at the same
-// time: its NIC takes the puts of several proxies while the other NICs are
-// idle. DeepEP turns its peers instead: each rank starts from a different peer.
+// has a stream of chunks, round after round (the stream's rounds), one chunk of
+// each owner node in a round. Its agents take the streams in order, on every
+// node at about the same pace. When every proxy takes the owner nodes of a
+// round in the same order (node order), the proxies of a rail send to the same
+// owner node at the same time: its NIC takes the puts of several proxies while
+// the other NICs are idle. DeepEP turns its peers instead: each rank starts
+// from a different peer.
 // This benchmark sends such streams on every rail at once, with one-sided GIN
 // puts (each adds 1 to a strong signal of the receiver), in both orders:
 //   node      a sender on node p takes the other nodes in node order;
-//   rotated   it takes p + 1, p + 2, ... mod nodes (each place of a level is a
+//   rotated   it takes p + 1, p + 2, ... mod nodes (each place of a round is a
 //             permutation: every node receives one chunk).
-// A sender has levels * (nodes - 1) places, a chunk each. It puts `window`
+// A sender has rounds * (nodes - 1) places, a chunk each. It puts `window`
 // places, waits until the chunks of those places that are its own have landed,
 // and then the rail passes a barrier (signals) before the next window. Window
 // 1 is the senders in full lock-step; a large window is a sender with a
@@ -40,7 +41,7 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 // Run one process per GPU, across nodes, with srun (NCCL_CROSS_NIC=0, so GIN
 // connects the rails):
 //   srun -N <nodes> --ntasks-per-node=8 ./gin_rail_congestion <new file on a
-//     shared file system> [chunk MiB, 2] [levels, 16] [windows, 1,2,3,0]
+//     shared file system> [chunk MiB, 2] [rounds, 16] [windows, 1,2,3,0]
 // The file passes NCCL's unique id from rank 0 to the others. Rank 0 prints,
 // for each window and order, the time of the exchange (the slowest rank's) and
 // the rate each GPU sends at. A window of 0 is every place at once.
@@ -76,7 +77,7 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 
 constexpr int kMaxNodes = 64;
 
-// The node a sender on `node` puts its chunk of place k of a level to.
+// The node a sender on `node` puts its chunk of place k of a round to.
 __host__ __device__ int dest_of(int node, int nodes, int k, bool rotated) {
   if (rotated) return (node + 1 + k) % nodes;
   return k < node ? k : k + 1;  // the k-th of the other nodes, in node order
@@ -148,12 +149,12 @@ static int env_int(const char *name) {
 
 int main(int argc, char **argv) {
   if (argc < 2) {
-    fprintf(stderr, "usage: %s <id file> [chunk MiB] [levels] [windows]\n", argv[0]);
+    fprintf(stderr, "usage: %s <id file> [chunk MiB] [rounds] [windows]\n", argv[0]);
     return 1;
   }
   const std::string id_file = argv[1];
   const double chunk_mib = argc > 2 ? atof(argv[2]) : 2.0;
-  const int levels = argc > 3 ? atoi(argv[3]) : 16;
+  const int rounds = argc > 3 ? atoi(argv[3]) : 16;  // the stream's rounds
   const std::string window_list = argc > 4 ? argv[4] : "1,2,3,0";
   const int rank = env_int("SLURM_PROCID"), world = env_int("SLURM_NTASKS");
   const int local_rank = env_int("SLURM_LOCALID"), local_size = world / env_int("SLURM_NNODES");
@@ -190,7 +191,7 @@ int main(int argc, char **argv) {
   NCCL_CHECK(ncclCommInitRank(&comm, world, id, rank));
 
   std::vector<int> windows;
-  const int places = levels * (nodes - 1);
+  const int places = rounds * (nodes - 1);
   for (size_t at = 0; at < window_list.size();) {
     const size_t comma = std::min(window_list.find(',', at), window_list.size());
     const int window = atoi(window_list.substr(at, comma - at).c_str());
@@ -229,9 +230,9 @@ int main(int argc, char **argv) {
   constexpr int kWarmup = 3, kIterations = 10;
   if (rank == 0)
     printf(
-        "gin_rail_congestion: %d nodes x %d GPUs, %d levels of %d chunks of %g MiB per sender, "
+        "gin_rail_congestion: %d nodes x %d GPUs, %d rounds of %d chunks of %g MiB per sender, "
         "median of %d\n%7s %8s %9s %13s %13s\n",
-        nodes, local_size, levels, nodes - 1, chunk_mib, kIterations, "window", "order", "ms",
+        nodes, local_size, rounds, nodes - 1, chunk_mib, kIterations, "window", "order", "ms",
         "GB/s per GPU", "most senders");
   for (int window : windows) {
     double ms[2] = {0, 0};
@@ -252,9 +253,9 @@ int main(int argc, char **argv) {
         CUDA_CHECK(cudaMemcpyAsync(&seconds, took, sizeof(double), cudaMemcpyDeviceToHost, stream));
         CUDA_CHECK(cudaStreamSynchronize(stream));
         if (it >= kWarmup) times.push_back(seconds);
-        // the running totals: levels chunks from every other node, a barrier a window
+        // the running totals: rounds chunks from every other node, a barrier a window
         for (int s = 0; s < nodes; ++s)
-          if (s != node) p.received[s] += levels;
+          if (s != node) p.received[s] += rounds;
         p.barriers += (places + window - 1) / window;
       }
       std::sort(times.begin(), times.end());

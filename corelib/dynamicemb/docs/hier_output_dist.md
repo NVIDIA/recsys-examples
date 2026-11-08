@@ -290,16 +290,17 @@ Across nodes the dist moves rows over IB in chunks (section 12.1). A chunk
 takes a row of the ring per occurrence of its keys: at most 2 MiB of rows
 (or `DYNAMICEMB_GIN_CHUNK_KB`, if that is more). Over IB it moves one row
 per key, its payload. When the proxy cuts its chunks, it counts each key
-as its rows, but at least `chunk_weight` (section 12.1). Section 15.3 gives
-the exact rule; what follows holds for rows that are small beside a chunk.
-When the ring holds two chunks of 2 MiB and the value is at most 2048,
-`chunk_weight` is about 2048 / `DYNAMICEMB_GIN_CHUNK_KB`, rounded down. So
-a chunk of keys of at most `chunk_weight` occurrences each moves about 2 MiB /
-`chunk_weight` of rows over IB: about the value when it divides 2048, else
-up to about twice the value. A chunk of keys of more occurrences moves
-less. A value from 1040 to 2032 gives `chunk_weight` 1: the chunks of
-2048. From 2048 on, when half the ring holds that much, a chunk of keys of
-one occurrence each moves about the value.
+as its rows, but at least `rows_per_payload` (its counted rows, section
+12.1). Section 15.3 gives the exact rule; what follows holds for rows that
+are small beside a chunk. When the ring holds two chunks of 2 MiB and the
+value is at most 2048, `rows_per_payload` is about 2048 /
+`DYNAMICEMB_GIN_CHUNK_KB`, rounded down. So a chunk of keys of at most
+`rows_per_payload` occurrences each moves about 2 MiB / `rows_per_payload`
+of rows over IB: about the value when it divides 2048, else up to about
+twice the value. A chunk of keys of more occurrences moves less. A value
+from 1040 to 2032 gives `rows_per_payload` 1: the chunks of 2048. From 2048
+on, when half the ring holds that much, a chunk of keys of one occurrence
+each moves about the value.
 
 **The trace** is a build option: `DYNAMICEMB_HIER_TRACE=1` in the
 environment when DynamicEmb is built. `setup.py` then compiles the dist with
@@ -1320,7 +1321,7 @@ each key.
 ### 10.4 Across nodes: the proxy, the rail, the requester and the owner
 
 **The proxy** numbers its node-unique keys (section 9), cuts them into the
-chunks of its stream by their weights and places each chunk in its ring
+chunks of its stream by their counted rows and places each chunk in its ring
 (section 12.1), and gives each occurrence its slot. It writes the three
 buffers of its window that its node's requesters and its rail's owners
 read:
@@ -1753,55 +1754,58 @@ node-unique keys of one owner node. Its rows are its keys' rows (each
 key's first occurrence's), then their duplicates' slots (for the backward),
 key after key in `uniq` order. Its *payload* is what it moves over IB: one
 row per key. Under node dedup a key has up to `max_key_rows` rows in the
-ring, but one row of payload. So the chunks are cut by weight. A key's
-*weight* is its rows, but at least `chunk_weight`: a chunk's most rows in
-the ring over the payload rows that `DYNAMICEMB_GIN_CHUNK_KB` sets
-(`ring_rows / payload_rows`, section 15.3). A chunk takes the keys
-whose weights before them, among the owner node's, fall in one span of
-`chunk_room` (level `j`: the owner node's chunk `j`). A key weighs at most
-`max_key_weight`, and `chunk_room = chunk_rows − max_key_weight + 1`. So:
+ring, but one row of payload. So the chunks are cut by counted rows. A
+key's *counted rows* are its rows, but at least `rows_per_payload`: the
+ring rows a chunk may spend per row it sends over IB, its most rows in the
+ring over the payload rows that `DYNAMICEMB_GIN_CHUNK_KB` sets
+(`ring_rows / payload_rows`, section 15.3; 4 at 512 KiB). A chunk takes
+the keys whose counted rows before them, among the owner node's, fall in
+one span of `chunk_span` counted rows: the owner node's chunk `j`, which
+goes in the stream's round `j`. A key counts at most `max_counted_rows`,
+and `chunk_span = chunk_rows − max_counted_rows + 1`. So:
 
-* a chunk's weights are at most `chunk_rows`, and so are its rows, as a
-  key's rows are at most its weight. A chunk takes at most `chunk_rows`
-  rows of the ring: 2 MiB of rows, or `DYNAMICEMB_GIN_CHUNK_KB` if that is
-  more, and at most half the ring (section 15.3);
-* a chunk of keys of at most `chunk_weight` rows each holds about
-  `chunk_rows / chunk_weight` keys: by default about 512 KiB of payload
+* a chunk's counted rows are at most `chunk_rows`, and so are its rows, as
+  a key's rows are at most its counted rows. A chunk takes at most
+  `chunk_rows` rows of the ring: 2 MiB of rows, or `DYNAMICEMB_GIN_CHUNK_KB`
+  if that is more, and at most half the ring (section 15.3);
+* a chunk of keys of at most `rows_per_payload` rows each holds about
+  `chunk_rows / rows_per_payload` keys: by default about 512 KiB of payload
   (section 4.4). A chunk of keys of more rows stops at `chunk_rows` rows,
-  so its payload is smaller, down to about `chunk_rows / max_key_weight`
+  so its payload is smaller, down to about `chunk_rows / max_counted_rows`
   rows. Each owner node's last chunk takes the keys that are left;
-* a key weighs less than `chunk_room`, so no chunk is empty.
+* a key counts fewer rows than `chunk_span`, so no chunk is empty.
 
 On Eos, on 2 nodes with power-law keys, chunks of 512 KiB of rows in the
 ring made the forward and backward kernels 6.1% and 11.1% slower than
-chunks of 2 MiB. Chunks cut by weight, with 512 KiB of payload, made each
-0.3% slower.
+chunks of 2 MiB. Chunks cut by counted rows, with 512 KiB of payload, made
+each 0.3% slower.
 
-Only the levels count weights. A chunk's rows and its place in the ring, a
-key's rows and slots, and the requesters' push orders and tables count
-rows. With `chunk_weight` 1 the weights are the rows. A chunk is the unit
-of every step of the rows across the rail: one IB put list per chunk and
-owner, grants and frees of whole chunks, and the reducers' tasks of a
-chunk.
+Only the cut of the chunks uses counted rows. A chunk's rows and its place
+in the ring, a key's rows and slots, and the requesters' push orders and
+tables count rows. With `rows_per_payload` 1 the counted rows are the rows.
+A chunk is the unit of every step of the rows across the rail: one IB put
+list per chunk and owner, grants and frees of whole chunks, and the
+reducers' tasks of a chunk.
 
 ```
-the stream   [ level 0: owner node a's chunk 0 | b's chunk 0 | ... ][ level 1: a's chunk 1 | ... ] ...
+the stream   [ round 0: owner node a's chunk 0 | b's chunk 0 | ... ][ round 1: a's chunk 1 | ... ] ...
 a chunk      [ rows of its keys | duplicates' slots, key by key ]
 the ring     its chunks one after another; when the stream passes the ring, laps from the ring's start
 ```
 
-* The stream takes the chunks level after level, owner node after owner
-  node in a level, each right after the one before. In a level, the owner
-  nodes come in turn from the node after the proxy's own (`node + 1`,
-  `node + 2`, ... mod `num_nodes`). All agents take the stream in order, on
-  every node at about the same pace. So at a place of a level, the proxies
-  of a rail serve different owner nodes, and each NIC of the rail sends and
-  receives a share of the puts. In node order, the proxies served the same
-  owner node at the same time: in the backward its NIC took the puts of
-  several proxies, and in the forward of a stream that wraps the ring it
-  sent to several proxies, while the other NICs were idle (incast). DeepEP
-  turns its RDMA peers the same way (each rank starts from a different
-  peer). `benchmark/gin_rail_congestion.cu` measures the effect on the rails
+* The stream takes the chunks round after round (in round `j` each owner
+  node's chunk `j`), owner node after owner node in a round, each right
+  after the one before. In a round, the owner nodes come in turn from the
+  node after the proxy's own (`node + 1`, `node + 2`, ... mod `num_nodes`).
+  All agents take the stream in order, on every node at about the same
+  pace. So at a place of a round, the proxies of a rail serve different
+  owner nodes, and each NIC of the rail sends and receives a share of the
+  puts. In node order, the proxies served the same owner node at the same
+  time: in the backward its NIC took the puts of several proxies, and in
+  the forward of a stream that wraps the ring it sent to several proxies,
+  while the other NICs were idle (incast). DeepEP turns its RDMA peers the
+  same way (each rank starts from a different peer).
+  `benchmark/gin_rail_congestion.cu` measures the effect on the rails
   (`benchmark/README.md`, *Link tools*). With the benchmark's configuration
   (`--use_index_dedup`, uniform and power-law keys), the backward kernel
   takes 0.4 to 1.6% less time in this order on 4 nodes, and 6.0 to 7.7%
@@ -1812,10 +1816,10 @@ the ring     its chunks one after another; when the stream passes the ring, laps
   which is the case whenever `remote_keys` rows fit under the cap (section
   15.3).
 * A stream that does not fit takes laps. Lap `k` holds the chunks whose rows
-  before them are in `[k × lap_room, (k + 1) × lap_room)`, with `lap_room =
-  num_proxy_rows − chunk_rows + 1`, packed from position `k ×
-  num_proxy_rows`: no chunk crosses the ring's end. A chunk lies at its
-  start `mod num_proxy_rows`.
+  before them are in `[k × lap_span, (k + 1) × lap_span)`, with `lap_span =
+  num_proxy_rows − chunk_rows + 1` (the stream rows in which a lap's chunks
+  start), packed from position `k × num_proxy_rows`: no chunk crosses the
+  ring's end. A chunk lies at its start `mod num_proxy_rows`.
 * Every row of the ring is free when an out kernel starts. A chunk is done
   with in the forward once every requester of the node pulled it (the
   relay counts their pulls), in the backward once the NIC read its sums
@@ -2058,9 +2062,9 @@ The transient figures are upper bounds from the peaks measured with the
 benchmark's batches (bytes in live tensors; the caching allocator's rounding
 and the cached blocks it hands out add up to about 13%), but the one-node
 planner's and the proxy's, which come from the code. They were measured
-before the chunks had weights, and while the bucketize also kept each key
-as `int64` (8 bytes per key, until the input dist returned). It no longer
-does: the push reads the KJT's keys (section 10.1).
+before the chunks were cut by counted rows, and while the bucketize also
+kept each key as `int64` (8 bytes per key, until the input dist returned).
+It no longer does: the push reads the KJT's keys (section 10.1).
 
 The proxy's figure counts its steps' live tensors. Its node dedup holds
 about 52 bytes per entry, 64 with weights: during the insert its hash table
@@ -2069,10 +2073,10 @@ identity's state (24, or 32 with weights), then that state, the
 representatives before each occurrence and its tables per occurrence and
 per key. By the same count its sorts held about 79 bytes per entry, and 99
 with weights. The 99 measured earlier with the benchmark's batches, which
-carry no weights, was of an older proxy. With `chunk_weight` above 1, as by
-default, its next step holds each key's weight (int32) and the weights
-before each key (int64) while it cuts its chunks and gives the slots: about
-60 bytes per entry, 64 with weights, now its largest.
+carry no weights, was of an older proxy. With `rows_per_payload` above 1, as
+by default, its next step holds each key's counted rows (int32) and the
+counted rows before each key (int64) while it cuts its chunks and gives the
+slots: about 60 bytes per entry, 64 with weights, now its largest.
 
 The constructors of the layouts size the window's buffers as above
 (`CtrlLayout`, `KeysLayout` and `RowsLayout`, in `window.h`). The buffers
@@ -2096,30 +2100,31 @@ key.
 ### 15.3 `proxy_rows` and its ring
 
 ```
-num_proxy_rows = min(max(remote_keys, 4 × max_key_rows), proxy_bytes / row_bytes)   (rounded down)
-max_key_rows   = local_size
-payload_rows   = max(chunk_kb KiB / row_bytes, 32)
-cap_rows       = max(max(chunk_kb KiB, 2 MiB) / row_bytes, 32)
-ring_rows      = min(cap_rows, num_proxy_rows / 2)
-chunk_rows     = max(ring_rows, 2 × max_key_rows)
-chunk_weight   = max(ring_rows / payload_rows, 1)                                   (rounded down)
-max_key_weight = max(max_key_rows, chunk_weight)
-chunk_room     = chunk_rows − max_key_weight + 1
-max_chunks     = chunk_weight × remote_keys / chunk_room + num_nodes
-owner_chunks   = (num_nodes − 1) + min(chunk_weight × (num_nodes − 1) × remote_keys, max_key_weight × lookup_keys) / chunk_room
-proxy_bytes    = DYNAMICEMB_GIN_PROXY_MB MiB (512 by default)
-chunk_kb       = DYNAMICEMB_GIN_CHUNK_KB (512 by default)
+num_proxy_rows   = min(max(remote_keys, 4 × max_key_rows), proxy_bytes / row_bytes)   (rounded down)
+max_key_rows     = local_size
+payload_rows     = max(chunk_kb KiB / row_bytes, 32)
+cap_rows         = max(max(chunk_kb KiB, 2 MiB) / row_bytes, 32)
+ring_rows        = min(cap_rows, num_proxy_rows / 2)
+chunk_rows       = max(ring_rows, 2 × max_key_rows)
+rows_per_payload = max(ring_rows / payload_rows, 1)                                   (rounded down)
+max_counted_rows = max(max_key_rows, rows_per_payload)
+chunk_span       = chunk_rows − max_counted_rows + 1
+max_chunks       = rows_per_payload × remote_keys / chunk_span + num_nodes
+owner_chunks     = (num_nodes − 1) + min(rows_per_payload × (num_nodes − 1) × remote_keys, max_counted_rows × lookup_keys) / chunk_span
+proxy_bytes      = DYNAMICEMB_GIN_PROXY_MB MiB (512 by default)
+chunk_kb         = DYNAMICEMB_GIN_CHUNK_KB (512 by default)
 ```
 
 `payload_rows` is a chunk's payload in rows, and `cap_rows` the most rows
 it takes in the ring: 2 MiB of rows, or the payload if that is more (each
 at least one task of 32 rows). `ring_rows` keeps a chunk within half the
 ring, and `chunk_rows` gives it room for two keys of the most rows at
-least. `chunk_weight` is `ring_rows / payload_rows`, rounded down and at
-least 1. A key of fewer rows weighs that much, so a chunk of such keys
-holds about `chunk_rows / chunk_weight` keys. `chunk_weight` is 1 when
-half the ring holds less than the payload, and when `chunk_kb` is 1040 or
-more (but with very large rows). The weights are then the rows.
+least. `rows_per_payload` is `ring_rows / payload_rows`, rounded down and
+at least 1: the ring rows a chunk may spend per row it sends over IB. A key
+of fewer rows counts that many, so a chunk of such keys holds about
+`chunk_rows / rows_per_payload` keys. `rows_per_payload` is 1 when half the
+ring holds less than the payload, and when `chunk_kb` is 1040 or more (but
+with very large rows). The counted rows are then the rows.
 
 So the ring holds a call's rows in one lap when `remote_keys` rows fit under
 the cap: its stream then lies in it as it is. A cap below `4 × max_key_rows
@@ -2134,15 +2139,15 @@ call that raises, counts `local_size`). So a call never needs more rows
 than it has occurrences: a call within `remote_keys` fits in
 `num_proxy_rows` rows when they hold `remote_keys` rows. It makes at most
 `max_chunks` chunks. An owner node's chunk `j` starts where the node's
-weights before it reach `j × chunk_room` or more. So a node of weight `w`
-has at most `w / chunk_room + 1` chunks (rounded down). A key weighs at
-most `chunk_weight` per row, so a proxy's weights are at most
-`chunk_weight × remote_keys`. An owner gets
-at most `owner_chunks` chunks: a proxy's stream holds at most
-`w / chunk_room + 1` chunks of the owner's node, `w` its weights of that
-node, and the keys the owner looks up, at most `lookup_keys`, weigh at most
-`max_key_weight` each. The laps of a stream follow from its rows (section
-12.1).
+counted rows before it reach `j × chunk_span` or more. So a node of `r`
+counted rows has at most `r / chunk_span + 1` chunks (rounded down). A key's
+counted rows are at most `rows_per_payload` times its rows, so a proxy's
+counted rows are at most `rows_per_payload × remote_keys`. An owner gets at
+most `owner_chunks` chunks: a proxy's stream holds at most
+`r / chunk_span + 1` chunks of the owner's node, `r` its counted rows of
+that node, and the keys the owner looks up, at most `lookup_keys`, count at
+most `max_counted_rows` each. The laps of a stream follow from its rows
+(section 12.1).
 
 ### 15.4 How memory scales
 
@@ -2169,12 +2174,12 @@ and so are the proxy's block tables while its node dedup runs (about
 * GIN's queues to `num_nodes − 1` rail peers per context (with
   `NCCL_CROSS_NIC=0`);
 * the chunk tables, which grow with `max_chunks` (linear in
-  `chunk_weight × remote_keys`, plus `num_nodes`): `proxy_header`, the
+  `rows_per_payload × remote_keys`, plus `num_nodes`): `proxy_header`, the
   chunks of `key_stage`, and per call the requester's tables of the node's
   proxies (which also grow with `local_size`) and the proxy's; and the
   chunks an owner gets (`owner_chunks`: `rail_keys` and the owner's
   tables), which grow with `num_nodes` until
-  `max_key_weight × lookup_keys / chunk_room`;
+  `max_counted_rows × lookup_keys / chunk_span`;
 * the put lists, a segment per chunk and per (node, feature).
 
 `local_size` enters through `node_offsets` (a row per GPU of the node),
@@ -2194,9 +2199,10 @@ sizing rules in the code, with capacities 1.25 times the needs and at least
 4096 entries more (`hier_capacities`), and from the transient figures of
 section 15.2. It assumes uniform keys, mean loads, no weights, one owner
 rule and 8 GPUs per node; it is not measured. It counts chunks of 2 MiB of
-rows (`chunk_weight` 1). The default chunks make the chunk tables, a small
-part of each figure, up to `chunk_weight` times as large, and add to the
-proxy's step (section 15.2), which stays below the largest. GB per rank.
+rows (`rows_per_payload` 1). The default chunks make the chunk tables, a
+small part of each figure, up to `rows_per_payload` times as large, and add
+to the proxy's step (section 15.2), which stays below the largest. GB per
+rank.
 "Persistent" is the window: `lookup_rows` + `proxy_rows` + its other
 buffers (the ctrl and keys sections); "per call" is one call's tensors;
 "planner" is the planner's largest step's working memory, and "bucketize"
@@ -2445,7 +2451,7 @@ KJT offsets.
 * **Skewed keys**: lower IB use in the backward, and a slow rank's lookup
   delays the other ranks' output-dist kernels. A chunk of hot keys, which
   have many rows in the ring, moves less than `DYNAMICEMB_GIN_CHUNK_KB`
-  over IB: down to `chunk_rows / max_key_weight` rows (section 12.1).
+  over IB: down to `chunk_rows / max_counted_rows` rows (section 12.1).
 * **`int32` keys**: checkpoint loading and delta replay
   (`dynamicemb/key_ownership.py`) place every `roundrobin` and
   `hash_roundrobin` key by the 64-bit rule (`continuous` keys raise there).
@@ -2491,7 +2497,7 @@ Paths from `corelib/dynamicemb`.
     * `config.h`, `config.cu`: error checks and small host helpers, the op's
       configuration (`Config`) and its checks, the sizes of a chunk
       (`kChunkBytes`, `kChunkRowCapBytes`, `kMinChunkKb`), and the op's
-      sizes (`sizes_of`, `chunk_weight_for`, `max_chunks_for`);
+      sizes (`sizes_of`, `rows_per_payload_for`, `max_chunks_for`);
     * `window.h`: the window's layout (`WindowLayout`) over its sections:
       `CtrlLayout` (with the format of the count message), `KeysLayout`
       (with `ProxyHeader`, `RemoteMap` and what `peer_gather` reads) and
@@ -2526,8 +2532,8 @@ Paths from `corelib/dynamicemb`.
       tables, the starts of sorted runs, a CTA's scans). The bucketize is in
       `bucketize.cu` and the proxy in `proxy.cu` (with its node dedup's
       hash table, `Identities`, which takes index dedup's chained insert
-      from `src/dedup_chain.cuh`, and the levels of its chunks by weight,
-      `Levels`); the node layout, the push, the count
+      from `src/dedup_chain.cuh`, and the rounds of its chunks, cut by
+      counted rows, `Rounds`); the node layout, the push, the count
       message and the rail layout as the hooks run them (`node_layout`,
       `push_to_node_keys`, `count_message`, `rail_layout`), the owner's KJT
       on one node (`one_node_owner`), the owner's tables, the requester and

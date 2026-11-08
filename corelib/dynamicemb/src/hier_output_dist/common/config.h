@@ -95,14 +95,14 @@ struct Capacities {
 };
 
 // The payload of a chunk of a proxy's stream, the rows it sends over IB, one
-// per key (Sizes::chunk_weight): at least about Config::chunk_kb KiB, by
+// per key (Sizes::rows_per_payload): at least about Config::chunk_kb KiB, by
 // default kChunkBytes. Python reads chunk_kb from DYNAMICEMB_GIN_CHUNK_KB when
 // it builds the sharding, and the ranks compare it with the other arguments,
 // so every rank has the same value. Config::validate refuses a value below
 // kMinChunkKb or not a multiple of 16. A chunk's rows in the ring, a row per
 // occurrence of its keys, stop at kChunkRowCapBytes, or at the payload if it
 // is larger (Sizes::chunk_rows). A chunk of keys of one row each sends about
-// ring_rows / chunk_weight rows over IB (sizes_of). When the ring holds two
+// ring_rows / rows_per_payload rows over IB (sizes_of). When the ring holds two
 // chunks at the cap, that is chunk_kb rounded up to 2 MiB / floor(2 MiB /
 // chunk_kb), and chunk_kb from 2048 KiB. It is chunk_kb at 64, 128, 256, 512
 // and 1024 KiB. Other values give up to about twice chunk_kb; above 512 KiB,
@@ -166,22 +166,23 @@ Sizes sizes_of(const Config &config);
 
 // The sizing rules of the sizes that follow from the configuration
 // (sizes_of's, and Config::validate's), across nodes:
-//   num_proxy_rows  min(max(remote_keys, min_proxy_rows_for(max_key_rows)),
-//                   proxy_bytes / row_bytes)
-//   payload_rows    max(payload / row_bytes, kTaskRows), the payload chunk_kb KiB
-//   ring_rows       min(max(max(payload, kChunkRowCapBytes) / row_bytes, kTaskRows),
-//                   num_proxy_rows / 2)
-//   chunk_rows      max(ring_rows, 2 * max_key_rows)
-//   chunk_weight    chunk_weight_for(ring_rows, payload_rows)
-//   max_chunks      chunk_weight * remote_keys / chunk_room + num_nodes
-// chunk_weight of chunks of at most `ring_rows` rows in the ring and a payload
-// of `payload_rows` rows: max(ring_rows / payload_rows, 1). It is 1 when the
-// payload is at least kChunkRowCapBytes, and the chunks are then those of
-// levels of rows (the weights are the rows).
-int64_t chunk_weight_for(int64_t ring_rows, int64_t payload_rows);
-// max_chunks of sizes whose other fields are set: a proxy's keys weigh at
-// most chunk_weight per row, so its stream holds at most chunk_weight *
-// remote_keys / chunk_room chunks, and one more per owner node.
+//   num_proxy_rows    min(max(remote_keys, min_proxy_rows_for(max_key_rows)),
+//                     proxy_bytes / row_bytes)
+//   payload_rows      max(payload / row_bytes, kTaskRows), the payload chunk_kb KiB
+//   ring_rows         min(max(max(payload, kChunkRowCapBytes) / row_bytes, kTaskRows),
+//                     num_proxy_rows / 2)
+//   chunk_rows        max(ring_rows, 2 * max_key_rows)
+//   rows_per_payload  rows_per_payload_for(ring_rows, payload_rows)
+//   max_chunks        rows_per_payload * remote_keys / chunk_span + num_nodes
+// rows_per_payload of chunks of at most `ring_rows` rows in the ring and a
+// payload of `payload_rows` rows: max(ring_rows / payload_rows, 1). It is 1
+// when the payload is at least kChunkRowCapBytes, and a key's counted rows are
+// then its rows.
+int64_t rows_per_payload_for(int64_t ring_rows, int64_t payload_rows);
+// max_chunks of sizes whose other fields are set: a proxy's keys count at most
+// rows_per_payload times their rows, so its stream holds at most
+// rows_per_payload * remote_keys / chunk_span chunks, and one more per owner
+// node.
 int64_t max_chunks_for(const Sizes &sizes);
 
 // The table of each feature, numbered from 0 in the order the tables first

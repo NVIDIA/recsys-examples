@@ -155,12 +155,12 @@ Config config_of(int64_t rank, int64_t world_size, int64_t local_size,
 
 // ── the sizes ──
 
-int64_t chunk_weight_for(int64_t ring_rows, int64_t payload_rows) {
+int64_t rows_per_payload_for(int64_t ring_rows, int64_t payload_rows) {
   return std::max<int64_t>(ring_rows / payload_rows, 1);
 }
 
 int64_t max_chunks_for(const Sizes &sizes) {
-  return sizes.chunk_weight * sizes.remote_keys / sizes.chunk_room() + sizes.topo.num_nodes;
+  return sizes.rows_per_payload * sizes.remote_keys / sizes.chunk_span() + sizes.topo.num_nodes;
 }
 
 std::vector<int> dense_tables(const std::vector<int> &feature_tables) {
@@ -195,11 +195,11 @@ Sizes sizes_of(const Config &config) {
     // its rows in the ring (a row per occurrence): kChunkRowCapBytes of rows,
     // or the payload if larger, at most half the ring (the ring holds two
     // chunks at least), and at least two keys of the most rows. When its keys
-    // have few rows, their weights make it send at least about its payload
-    // (config.h). chunk_weight takes ring_rows, before the least of two keys
-    // of the most rows, so it is 1 when the payload is at least the cap. The
-    // payload stops at 2^52 KiB (2^62 bytes, in int64): half the ring is at
-    // most proxy_bytes / 2, which is fewer bytes, so a larger chunk_kb
+    // have few rows, their counted rows make it send at least about its
+    // payload (config.h). rows_per_payload takes ring_rows, before the least of
+    // two keys of the most rows, so it is 1 when the payload is at least the
+    // cap. The payload stops at 2^52 KiB (2^62 bytes, in int64): half the ring
+    // is at most proxy_bytes / 2, which is fewer bytes, so a larger chunk_kb
     // changes nothing.
     const int64_t payload_bytes = std::min<int64_t>(config.chunk_kb, int64_t{1} << 52) << 10;
     const int64_t payload_rows = std::max<int64_t>(kTaskRows, payload_bytes / sizes.row_bytes);
@@ -207,7 +207,7 @@ Sizes sizes_of(const Config &config) {
         std::max<int64_t>(kTaskRows, std::max(payload_bytes, kChunkRowCapBytes) / sizes.row_bytes);
     const int64_t ring_rows = std::min(cap_rows, sizes.num_proxy_rows / 2);
     sizes.chunk_rows = std::max(ring_rows, 2 * key_rows);
-    sizes.chunk_weight = chunk_weight_for(ring_rows, payload_rows);
+    sizes.rows_per_payload = rows_per_payload_for(ring_rows, payload_rows);
     sizes.max_chunks = max_chunks_for(sizes);
     sizes.record_bytes = config.weights ? 16 : 8;
   }

@@ -795,15 +795,15 @@ more nodes). Each GPU sends a stream of 2 MiB chunks (the tool's default
 chunk size, its second argument, and the dist's chunks before
 `DYNAMICEMB_GIN_CHUNK_KB`) with GIN puts to the GPUs of its rail on the
 other nodes, in the order in which the proxies of the hierarchical dist
-send their chunks (`docs/hier_output_dist.md`, section 12.1): 16 levels of
-one chunk for each other node. It sends the stream in two orders. In node
-order, every sender takes the other nodes of a level in the same order, so
-up to `nodes − 1` senders put to the same node at the same time. In rotated
-order, the order of the hierarchical dist, a sender on node `p` starts at
-node `p + 1`, so each node receives from one sender at a time. A window is
-the number of chunks a sender puts before it waits for its chunks to land
-and the rail passes a barrier. On H100 nodes, node order took this many
-times the rotated order's time:
+send their chunks (`docs/hier_output_dist.md`, section 12.1): 16 of the
+stream's rounds, each of one chunk for each other node. It sends the stream
+in two orders. In node order, every sender takes the other nodes of a round
+in the same order, so up to `nodes − 1` senders put to the same node at the
+same time. In rotated order, the order of the hierarchical dist, a sender on
+node `p` starts at node `p + 1`, so each node receives from one sender at a
+time. A window is the number of chunks a sender puts before it waits for
+its chunks to land and the rail passes a barrier. On H100 nodes, node order
+took this many times the rotated order's time:
 
 | nodes | window: node order's time / rotated order's time |
 |---|---|

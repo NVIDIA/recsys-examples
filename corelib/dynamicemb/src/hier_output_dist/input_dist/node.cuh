@@ -183,7 +183,7 @@ __device__ inline void node_layout_of(const int64_t *offsets, const Topo &topo,
   }
   // A row of an owner (n, t) of another node is in t's remote part: after the keys of the
   // requesters before this rank, this rank's blocks for the owner nodes before n, and the rows
-  // of its block before it. Every feature of the owner has the same base.
+  // of its block before it. Every feature of the owner has the same row_shift.
   cta_exclusive_ends<int64_t>(
       topo.world_size,
       [&](int64_t index) {

@@ -51,7 +51,7 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 //   before read them).
 // - A buffer the NIC reads is written again only after a flush, earlier on the stream, of the puts
 //   that read it: rail_exchange's own for count_msg_out, rail_done's for key_stage.
-// - The key round is waited for late. rail_key_push only posts the puts (each slice with a strong
+// - The key puts are waited for late. rail_key_push only posts the puts (each slice with a strong
 //   signal, so the owner that sees the signal sees the slice). rail_done acquires every rail
 //   proxy's key signal and flushes this rank's puts. Between the two run node_status_exchange,
 //   peer_gather, remote_rows and requester_tables: none of them reads rail_keys or writes
@@ -291,7 +291,7 @@ __global__ void __launch_bounds__(kThreads)
 // the call has landed here: its key signal (the slice it put, which the strong signal covers, or
 // the signal alone). Then the warp flushes this rank's puts on the in channel's context, so the
 // NIC has read its key_stage slices before the next call's proxy steps write key_stage again. It
-// runs just before owner_tables, the first reader of rail_keys, so the key round overlaps the
+// runs just before owner_tables, the first reader of rail_keys, so the key puts overlap the
 // steps after rail_key_push.
 __global__ void rail_done_kernel(ncclDevComm dev, Sizes sizes, int64_t seq) {
   const int num_nodes = sizes.topo.num_nodes, node = sizes.topo.node;

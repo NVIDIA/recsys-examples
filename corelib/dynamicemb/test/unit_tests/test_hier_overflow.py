@@ -150,8 +150,8 @@ CASES = [
 ]
 
 
-def weighted_sum(out, weight: torch.Tensor, features: List[str]) -> torch.Tensor:
-    return sum((out[name].values() * weight).sum() for name in features)
+def signed_sum(out, signs: torch.Tensor, features: List[str]) -> torch.Tensor:
+    return sum((out[name].values() * signs).sum() for name in features)
 
 
 def build_model(
@@ -429,7 +429,7 @@ def input_dist(ec, kjt: torchrec.KeyedJaggedTensor):
 
 
 def run(
-    model, case: Case, batches, weight, skip: Sequence[int] = ()
+    model, case: Case, batches, signs, skip: Sequence[int] = ()
 ) -> Tuple[Dict[int, Step], Dict[int, str]]:
     """The case's calls on ``model``, but those in ``skip``, in the case's
     order: each call's forward, then its backward; or (``interleaved``) the
@@ -455,7 +455,7 @@ def run(
             out = ec.compute_and_output_dist(ctx, dist_input).wait()
             pending.append((index, out, Step(rows_of(case, out), call)))
         for index, out, step in pending:
-            weighted_sum(out, weight, case.features).backward()
+            signed_sum(out, signs, case.features).backward()
             steps[index] = step
     torch.cuda.synchronize()
     return steps, raised
@@ -498,7 +498,7 @@ def tight_capacity(case: Case, needs: List[Dict[str, int]]):
 def run_case(case: Case, checks: Checks, rank: int, world_size: int, local_size: int):
     exact = world_size & (world_size - 1) == 0
     torch.manual_seed(7)
-    weight = torch.randn(DIM, device="cuda").sign()
+    signs = torch.randn(DIM, device="cuda").sign()
     batches = batches_of(case, rank)
     small = [step for step in range(len(batches)) if step not in case.expected]
     label = case.name
@@ -506,7 +506,7 @@ def run_case(case: Case, checks: Checks, rank: int, world_size: int, local_size:
     # on the small calls alone.
     ample_capacity = dict.fromkeys(OUTPUT_DIST_CAPACITY_NAMES, AMPLE)
     ample_model = build_model(case, "fused", ample_capacity, world_size, local_size)
-    ample, ample_raised = run(ample_model, case, batches, weight)
+    ample, ample_raised = run(ample_model, case, batches, signs)
     checks.check(f"{label}: ample runs every call", not ample_raised)
     if case.placement:
         check_placement(case, checks, ample_model, rank, "ample's", range(len(batches)))
@@ -514,11 +514,11 @@ def run_case(case: Case, checks: Checks, rank: int, world_size: int, local_size:
     quiesce(ample_model)
     del ample_model
     reference_model = build_model(case, "torchrec", None, world_size, local_size)
-    reference, _ = run(reference_model, case, batches, weight, skip=case.expected)
+    reference, _ = run(reference_model, case, batches, signs, skip=case.expected)
     del reference_model
     capacity = tight_capacity(case, needs)
     tight_model = build_model(case, "fused", capacity, world_size, local_size)
-    tight, raised = run(tight_model, case, batches, weight)
+    tight, raised = run(tight_model, case, batches, signs)
 
     def same_rows() -> bool:
         if sorted(tight) != small:
