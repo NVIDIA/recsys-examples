@@ -27,15 +27,15 @@ pipeline in flight. On one
 GPU the sharding takes TorchRec's dists. On a build without the op (NCCL
 older than 2.30.7), "hierarchical" raises and "auto" takes TorchRec's dists.
 
-Run it from ``corelib/dynamicemb`` with ``examples`` on ``PYTHONPATH``, one
-process per GPU (on one node, or across nodes under Slurm)::
+Run it from ``corelib/dynamicemb``, one process per GPU (on one node, or
+across nodes under Slurm)::
 
-    torchrun --nproc_per_node 8 test/unit_tests/test_hier_pipeline.py --megatron
-    srun --ntasks-per-node 8 python test/unit_tests/test_hier_pipeline.py --megatron
+    torchrun --nproc_per_node 8 test/unit_tests/test_hier_pipeline.py
+    srun --ntasks-per-node 8 python test/unit_tests/test_hier_pipeline.py
 
-``--core`` runs the cases of the TorchRec version matrix alone, and
-``--megatron`` fails when the repo's JaggedMegatron pipelines cannot be
-imported.
+``--core`` runs the cases of the TorchRec version matrix alone. The HSTU
+example tests its own train pipelines on this dist end to end, in its
+test_hierarchical_dist.py.
 """
 
 import argparse
@@ -237,11 +237,6 @@ class Batch(Pipelineable):
 
     def record_stream(self, stream: torch.Stream) -> None:
         self._map(lambda tensor: tensor.record_stream(stream))
-
-    def num_loss_tokens(self) -> torch.Tensor:
-        """The repo's JaggedMegatron pipelines scale the loss by the data
-        parallel size over the tokens of all ranks: 1 each, a scale of 1."""
-        return torch.ones((), dtype=torch.int64)
 
 
 @dataclass
@@ -836,25 +831,6 @@ def eval_step(model, batch: Batch) -> torch.Tensor:
         return model(batch.to(DEV, non_blocking=True))[1]
 
 
-def megatron_pipelines():
-    """The repo's JaggedMegatron pipelines (Megatron's parallel state set up
-    once), or the reason they cannot be imported."""
-    try:
-        from commons.pipeline.train_pipeline import (
-            JaggedMegatronPrefetchTrainPipelineSparseDist,
-            JaggedMegatronTrainPipelineSparseDist,
-        )
-        from megatron.core import parallel_state
-    except ImportError as err:
-        return None, str(err)
-    if not parallel_state.model_parallel_is_initialized():
-        parallel_state.initialize_model_parallel(1)
-    return {
-        "megatron": JaggedMegatronTrainPipelineSparseDist,
-        "megatron_prefetch": JaggedMegatronPrefetchTrainPipelineSparseDist,
-    }, None
-
-
 def pipeline_of(kind: str, model, opt):
     device = this_gpu()
     if kind == "base":
@@ -869,13 +845,7 @@ def pipeline_of(kind: str, model, opt):
         )
     if kind == "semisync":
         return pipelines.TrainPipelineSemiSync(model, opt, device, start_batch=0)
-    return megatron_pipelines()[0][kind](model, opt, device)
-
-
-def rows_of(kind: str, out) -> torch.Tensor:
-    """The EC's rows of a pipeline's output (the repo's pipelines return the
-    loss and the tokens before it)."""
-    return (out[2] if kind.startswith("megatron") else out).detach()
+    raise ValueError(f"no pipeline {kind!r}")
 
 
 @dataclass
@@ -1004,7 +974,7 @@ def run(
                 if train is None:
                     outs.append(plain_step(model, opt, batch))
                 else:
-                    outs.append(rows_of(kind, train.progress(batch_iter)))
+                    outs.append(train.progress(batch_iter).detach())
             if train is not None:
                 train.detach()
             if epoch_idx == 1:
@@ -1018,9 +988,7 @@ def run(
                 eval_pipe = pipelines.EvalPipelineSparseDist(model, opt, this_gpu())
                 batch_iter = iter(evals)
                 with torch.no_grad():
-                    outs += [
-                        rows_of(kind, eval_pipe.progress(batch_iter)) for _ in evals
-                    ]
+                    outs += [eval_pipe.progress(batch_iter).detach() for _ in evals]
                 eval_pipe.detach()
                 del eval_pipe
             torch.cuda.synchronize()
@@ -1033,7 +1001,7 @@ def run(
         batch_iter = iter(batches)
         for i in range(num_steps):
             at_step(i)
-            outs.append(rows_of(kind, pipe.progress(batch_iter)))
+            outs.append(pipe.progress(batch_iter).detach())
         del pipe
     torch.cuda.synchronize()
     if profiling:
@@ -1157,19 +1125,10 @@ def fused_kinds() -> List[str]:
     return []
 
 
-def run_matrix(rank: int, log: Callable, core: bool, need_megatron: bool) -> int:
+def run_matrix(rank: int, log: Callable, core: bool) -> int:
     """Each loop and pipeline against its reference (see the module's
     docstring); with ``core`` the TorchRec version matrix's subset."""
     failures = 0
-    megatron, why = megatron_pipelines()
-    if megatron is None:
-        log(
-            f"the repo's JaggedMegatron pipelines cannot be imported ({why}): "
-            + ("[FAIL]" if need_megatron else "skipped")
-        )
-        failures += int(need_megatron)
-    megatron_kinds = list(megatron or [])
-    megatron_prefetch = [kind for kind in megatron_kinds if kind.endswith("prefetch")]
     against = partial(run_against, rank=rank, log=log)
 
     torchrec_run = run(UNIFORM, "torchrec", "plain", rank)
@@ -1177,7 +1136,7 @@ def run_matrix(rank: int, log: Callable, core: bool, need_megatron: bool) -> int
         "plain loop vs TorchRec's dists", torchrec_run, UNIFORM, "plain"
     )
     failures += failed
-    for kind in ["base", "sparse_dist", "prefetch", *fused_kinds(), *megatron_kinds]:
+    for kind in ["base", "sparse_dist", "prefetch", *fused_kinds()]:
         failures += against(f"{kind} vs the plain loop", plain, UNIFORM, kind)[0]
     failures += against(
         "sparse_dist vs TorchRec's dists", torchrec_run, UNIFORM, "sparse_dist"
@@ -1214,10 +1173,9 @@ def run_matrix(rank: int, log: Callable, core: bool, need_megatron: bool) -> int
         "prefetch",
         output_dist="torchrec",
     )[0]
-    for kind in ["prefetch", *megatron_prefetch]:
-        failures += against(f"{kind} vs the plain loop", plain, COUNTED, kind)[0]
+    failures += against("prefetch vs the plain loop", plain, COUNTED, "prefetch")[0]
     del torchrec_run, plain
-    failures += run_overflows(rank, log, megatron_kinds)
+    failures += run_overflows(rank, log)
     failures += run_torchrec_shardings(rank, log, core)
     if core:
         return failures
@@ -1228,8 +1186,7 @@ def run_matrix(rank: int, log: Callable, core: bool, need_megatron: bool) -> int
             "plain loop vs TorchRec's dists", torchrec_run, spec, "plain"
         )
         failures += failed
-        for kind in ["prefetch", *(megatron_prefetch if spec is MIXED else [])]:
-            failures += against(f"{kind} vs the plain loop", plain, spec, kind)[0]
+        failures += against("prefetch vs the plain loop", plain, spec, "prefetch")[0]
         del torchrec_run, plain
     torchrec_run = run(UNIFORM, "torchrec", "two_forwards", rank)
     for spec in (UNIFORM, REHASH):
@@ -1252,7 +1209,7 @@ def run_matrix(rank: int, log: Callable, core: bool, need_megatron: bool) -> int
     return failures
 
 
-def run_overflows(rank: int, log: Callable, megatron_kinds: List[str]) -> int:
+def run_overflows(rank: int, log: Callable) -> int:
     """Calls over the capacities under each loop and pipeline. OVER's
     capacities fit its small batches alone, so its first large call raises
     RuntimeError at its second wait, on every rank alike, naming the
@@ -1265,8 +1222,8 @@ def run_overflows(rank: int, log: Callable, megatron_kinds: List[str]) -> int:
     )
     kinds = ["plain", "base", "sparse_dist", "prefetch", "semisync", *fused_kinds()]
     for spec, spec_kinds in (
-        (OVER, kinds + megatron_kinds),
-        (second, ["plain", "sparse_dist", "prefetch", *megatron_kinds]),
+        (OVER, kinds),
+        (second, ["plain", "sparse_dist", "prefetch"]),
     ):
         for kind in spec_kinds:
             try:
@@ -1589,11 +1546,6 @@ def main() -> None:
     parser.add_argument(
         "--core", action="store_true", help="the TorchRec version matrix's cases"
     )
-    parser.add_argument(
-        "--megatron",
-        action="store_true",
-        help="fail when the repo's JaggedMegatron pipelines cannot be imported",
-    )
     args = parser.parse_args()
     # Spins that trap after two minutes instead of the process group's timeout.
     os.environ.setdefault("DYNAMICEMB_HIER_TIMEOUT_S", "120")
@@ -1615,7 +1567,7 @@ def main() -> None:
     elif world_size == 1:
         failures = run_one_rank(rank, log)
     else:
-        failures = run_matrix(rank, log, args.core, args.megatron)
+        failures = run_matrix(rank, log, args.core)
         if not args.core:
             failures += run_teardown(rank, world_size, log)
     dist.barrier()

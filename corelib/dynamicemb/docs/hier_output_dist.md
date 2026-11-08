@@ -2259,7 +2259,7 @@ Under skewed keys its hot owner's buffers grow with
 | `PrefetchTrainPipelineSparseDist` | supported, tested; frequency weights reach the prefetch through DynamicEmb's `GroupedEmbeddingsLookup.prefetch` |
 | `TrainPipelineFusedSparseDist`, with `emb_lookup_stream` `"data_dist"` and `"new"` | supported, tested (TorchRec 1.3 and up) |
 | `EvalPipelineSparseDist` | supported, tested: eval forwards take TorchRec's dists |
-| the repo's `JaggedMegatronTrainPipelineSparseDist` and its prefetch variant | supported, tested |
+| the repo's `JaggedMegatronTrainPipelineSparseDist` and its prefetch variant | supported, tested end to end with the HSTU ranking model (`examples/hstu/test/test_hierarchical_dist.py`) |
 | `TrainPipelineSemiSync` | runs; tested against itself (its outputs are not the plain loop's), without rehashes |
 | several forwards, then their backwards; `retain_graph`; forwards without grad | supported, tested |
 | a call that does not fit the capacities, under the plain loop and each train pipeline above | tested: it raises `RuntimeError` on every rank (section 5.4) |
@@ -2369,7 +2369,17 @@ every dist, so tables of 16-bit rows may still differ from run to run.
 `test_hier_dist.py`, `test_hier_overflow.py` and `test_hier_pipeline.py`;
 each module's docstring says what it checks and how to run it. On one node
 `test_hier_dist.sh`, `test_hier_overflow.sh` and `test_hier_pipeline.sh`
-run them, and `test/unit_test.sh` runs those.
+run them, and `test/unit_test.sh` runs those. End to end,
+`examples/hstu/test/test_hierarchical_dist.py` trains the HSTU ranking model
+on the hierarchical dist and on TorchRec's dists, under the example's
+JaggedMegatron pipelines, and compares them: the first step's loss and logits
+and the tables' keys bit for bit, and with fp32 on one node every step and row
+within `torch.allclose`'s defaults. It also checks the over-capacity error
+under each pipeline. Run it from `examples/hstu`:
+
+```
+PYTHONPATH=${PYTHONPATH}:$(realpath ../) torchrun --nproc_per_node 8 -m pytest -svv test/test_hierarchical_dist.py
+```
 
 The node's part of a call has hooks of its own in `testing.cu`:
 
