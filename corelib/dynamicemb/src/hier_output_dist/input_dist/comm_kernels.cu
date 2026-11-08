@@ -328,7 +328,7 @@ void InChannel::node_key_push(const BucketizedKeys &bucketized,
       gather_rows_of(bucketized.inv, bucketized.values, weights.value_or(at::Tensor()));
   const PushPlaces places{bucketized.bucket_feature_of_row.data_ptr<int32_t>(),
                           bucketized.offset_per_bucket.data_ptr<int64_t>(),
-                          node.destination_base.data_ptr<int64_t>(), node.skip.data_ptr<bool>()};
+                          node.row_shift.data_ptr<int64_t>(), node.skip.data_ptr<bool>()};
   node_key_push_kernel<<<item_grid(rows), kThreads, 0, current_stream()>>>(
       window_, sizes_, gather, rows, places, data_or_null<int32_t>(src));
   C10_CUDA_KERNEL_LAUNCH_CHECK();

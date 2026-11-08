@@ -145,7 +145,7 @@ std::map<std::string, at::Tensor> node_layout_test(at::Tensor node_offsets, int6
                                           {"own_total", layout.own_total},
                                           {"need_lookup", layout.need_lookup},
                                           {"skip", layout.skip},
-                                          {"destination_base", layout.destination_base}};
+                                          {"row_shift", layout.row_shift}};
   if (num_nodes > 1) {
     named["requester_start"] = layout.requester_start;
     named["need_remote"] = layout.need_remote;
@@ -175,7 +175,7 @@ std::map<std::string, at::Tensor> node_layout_test(at::Tensor node_offsets, int6
 
 // One requester's push (push_to_node_keys: node_key_push's push_rows) of its KJT's keys (values,
 // int32 or int64) and weights (or None), on what its bucketize gives (bucketize_rows: inv,
-// bucket_feature_of_row and offset_per_bucket) and its node layout (destination_base, skip),
+// bucket_feature_of_row and offset_per_bucket) and its node layout (row_shift, skip),
 // into stand-ins for its targets' node_keys: row t of node_keys ([local_size][lookup_keys +
 // remote_keys]), of node_key_weights (given exactly with weights) and across nodes of
 // node_bucket_feature_of_row ([local_size][remote_keys]); on one node also src (int32 [rows]).
@@ -183,9 +183,9 @@ std::map<std::string, at::Tensor> node_layout_test(at::Tensor node_offsets, int6
 // a row is not stored.
 void node_push_test(at::Tensor values, at::Tensor inv, c10::optional<at::Tensor> weights,
                     at::Tensor bucket_feature_of_row, at::Tensor offset_per_bucket,
-                    at::Tensor destination_base, at::Tensor skip, int64_t num_nodes,
-                    int64_t local_size, int64_t node, int64_t local_rank, int64_t num_features,
-                    int64_t lookup_keys, int64_t remote_keys, at::Tensor node_keys,
+                    at::Tensor row_shift, at::Tensor skip, int64_t num_nodes, int64_t local_size,
+                    int64_t node, int64_t local_rank, int64_t num_features, int64_t lookup_keys,
+                    int64_t remote_keys, at::Tensor node_keys,
                     c10::optional<at::Tensor> node_key_weights,
                     c10::optional<at::Tensor> node_bucket_feature_of_row,
                     c10::optional<at::Tensor> src) {
@@ -198,13 +198,13 @@ void node_push_test(at::Tensor values, at::Tensor inv, c10::optional<at::Tensor>
                   (!weights.has_value() || is_cuda_array(*weights, at::kFloat, rows)) &&
                   is_cuda_array(bucket_feature_of_row, at::kInt, rows) &&
                   is_cuda_array(offset_per_bucket, at::kLong, topo.world_size + 1) &&
-                  is_cuda_array(destination_base, at::kLong, topo.world_size * num_features + 1) &&
+                  is_cuda_array(row_shift, at::kLong, topo.world_size * num_features + 1) &&
                   is_cuda_array(skip, at::kBool, 1) &&
                   node_bucket_feature_of_row.has_value() == (num_nodes > 1),
               "hier_output_dist: node_push's inputs (node_bucket_feature_of_row exactly across "
               "nodes)");
   NodeLayout layout;
-  layout.destination_base = destination_base;
+  layout.row_shift = row_shift;
   layout.skip = skip;
   push_to_node_keys(values, inv, weights.value_or(at::Tensor()), bucket_feature_of_row,
                     offset_per_bucket, layout, topo, num_features, lookup_keys, remote_keys,
@@ -408,7 +408,7 @@ std::map<std::string, at::Tensor> rail_tables_test(
 std::map<std::string, at::Tensor> requester_tables_test(
     at::Tensor remote_maps, at::Tensor proxy_headers, at::Tensor offset_per_owner_feature,
     at::Tensor bucket_feature_of_row, at::Tensor offset_per_bucket_feature,
-    at::Tensor offset_per_bucket, at::Tensor destination_base,
+    at::Tensor offset_per_bucket, at::Tensor row_shift,
     std::map<std::string, int64_t> named_sizes) {
   c10::cuda::CUDAGuard guard(bucket_feature_of_row.device());
   const Sizes sizes = plan_sizes(named_sizes);
@@ -423,7 +423,7 @@ std::map<std::string, at::Tensor> requester_tables_test(
           bucket_feature_of_row.scalar_type() == at::kInt &&
           is_cuda_array(offset_per_bucket_feature, at::kLong, bucket_features + 1) &&
           is_cuda_array(offset_per_bucket, at::kLong, sizes.topo.world_size + 1) &&
-          is_cuda_array(destination_base, at::kLong, bucket_features + 1),
+          is_cuda_array(row_shift, at::kLong, bucket_features + 1),
       "hier_output_dist: requester_tables' inputs");
   // peer_gather: out[k][item] = word first_word[item] + k * stride of its
   // peer's buffer (a proxy header: one word; remote_map: entry first_word of
@@ -438,7 +438,7 @@ std::map<std::string, at::Tensor> requester_tables_test(
   };
   const at::Tensor words =
       gather(remote_maps.view({local_size, -1}),
-             remote_rows(bucket_feature_of_row, offset_per_bucket, destination_base, sizes),
+             remote_rows(bucket_feature_of_row, offset_per_bucket, row_shift, sizes),
              RemoteMap::kArrays, sizes.remote_keys);
   const at::Tensor headers = gather(proxy_headers.view({local_size, -1}),
                                     header_gather(sizes, bucket_feature_of_row.options()), 1, 0)
@@ -505,10 +505,10 @@ void bind_testing(py::module &py_module) {
                 "node_keys ([local_size] rows), in place",
                 py::arg("values"), py::arg("inv"), py::arg("weights"),
                 py::arg("bucket_feature_of_row"), py::arg("offset_per_bucket"),
-                py::arg("destination_base"), py::arg("skip"), py::arg("num_nodes"),
-                py::arg("local_size"), py::arg("node"), py::arg("local_rank"),
-                py::arg("num_features"), py::arg("lookup_keys"), py::arg("remote_keys"),
-                py::arg("node_keys"), py::arg("node_key_weights") = py::none(),
+                py::arg("row_shift"), py::arg("skip"), py::arg("num_nodes"), py::arg("local_size"),
+                py::arg("node"), py::arg("local_rank"), py::arg("num_features"),
+                py::arg("lookup_keys"), py::arg("remote_keys"), py::arg("node_keys"),
+                py::arg("node_key_weights") = py::none(),
                 py::arg("node_bucket_feature_of_row") = py::none(), py::arg("src") = py::none());
   py_module.def("hier_output_dist_delay_node_reads", &delay_node_reads,
                 "Each later input dist of this process waits ns on the GPU twice (0: none): in "
@@ -538,7 +538,7 @@ void bind_testing(py::module &py_module) {
                 py::arg("remote_maps"), py::arg("proxy_headers"),
                 py::arg("offset_per_owner_feature"), py::arg("bucket_feature_of_row"),
                 py::arg("offset_per_bucket_feature"), py::arg("offset_per_bucket"),
-                py::arg("destination_base"), py::arg("sizes"));
+                py::arg("row_shift"), py::arg("sizes"));
   py_module.def(
       "hier_output_dist_clock", &clock_stamp,
       "Writes this GPU's %globaltimer (ns) into out[index] on the current stream, from one "

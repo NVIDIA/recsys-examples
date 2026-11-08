@@ -41,7 +41,7 @@ struct NodeLayoutView {
   int64_t *own_lengths, *own_offsets, *own_total, *requester_start;
   int64_t *need_lookup, *need_remote;
   bool *skip;
-  int64_t *destination_base, *kjt_offsets, *length_per_key;
+  int64_t *row_shift, *kjt_offsets, *length_per_key;
 };
 // The data of each table of `node` (nullptr: a table it does not have).
 inline NodeLayoutView view_of(const NodeLayout &node) {
@@ -52,7 +52,7 @@ inline NodeLayoutView view_of(const NodeLayout &node) {
                         node.need_lookup.data_ptr<int64_t>(),
                         data_or_null<int64_t>(node.need_remote),
                         node.skip.data_ptr<bool>(),
-                        node.destination_base.data_ptr<int64_t>(),
+                        node.row_shift.data_ptr<int64_t>(),
                         data_or_null<int64_t>(node.kjt_offsets),
                         data_or_null<int64_t>(node.length_per_key)};
 }
@@ -169,14 +169,16 @@ __device__ inline void node_layout_of(const int64_t *offsets, const Topo &topo,
     *out.need_lookup = most_own;
     *out.skip = skips;
   }
-  // Bucketized row `row` in bucket feature b is at destination_base[b] + row of its target's
-  // node_keys. A row of an owner t of this node is in t's own part: where this rank's keys of the
-  // feature start there (the node's keys of the features before, then those of the requesters
-  // before), and the rows of the bucket feature before it.
+  // Bucketized row `row` of bucket feature b goes to place row + row_shift[b] in its target's
+  // node_keys: row_shift[b] is where this rank's rows of b start there, less where they start
+  // among its rows (at(me, b)), so one add places a row. A row of an owner t of this node is in
+  // t's own part: where this rank's keys of the feature start there (the node's keys of the
+  // features before, then those of the requesters before), and the rows of the bucket feature
+  // before it.
   for (int64_t index = threadIdx.x; index < columns; index += kThreads) {
     const int64_t target = index / num_features, feature = index % num_features;
     const int64_t bucket_feature = (node * local_size + target) * num_features + feature;
-    out.destination_base[bucket_feature] =
+    out.row_shift[bucket_feature] =
         ends[index] - ends[target * num_features] + before[index] - at(me, bucket_feature);
   }
   // A row of an owner (n, t) of another node is in t's remote part: after the keys of the
@@ -197,11 +199,11 @@ __device__ inline void node_layout_of(const int64_t *offsets, const Topo &topo,
         lookup_keys + block_ends[target * num_nodes + owner_node] - block_ends[target * num_nodes];
     for (int64_t requester = 0; requester < me; ++requester)
       block_place += remote[requester * local_size + target];
-    out.destination_base[index] = block_place - at(me, owner * num_features);
+    out.row_shift[index] = block_place - at(me, owner * num_features);
   }
   // the rows past the valid ones (bucket feature world_size * num_features) are never pushed:
   // their place is their own index
-  if (threadIdx.x == 0) out.destination_base[topo.world_size * num_features] = 0;
+  if (threadIdx.x == 0) out.row_shift[topo.world_size * num_features] = 0;
 }
 
 // A requester's bucketize up to its gather (bucketize_rows), as the gather reads it.
@@ -237,18 +239,18 @@ __device__ __forceinline__ void gather_rows(const GatherRows &in, int64_t rows, 
 }
 
 // What the push reads besides the gather's rows: the bucketize's bucket_feature_of_row and
-// offset_per_bucket, and the node layout's destination_base and skip.
+// offset_per_bucket, and the node layout's row_shift and skip.
 struct PushPlaces {
   const int32_t *bucket_feature_of_row;  // [rows]
   const int64_t *offset_per_bucket;      // [world_size + 1]
-  const int64_t *destination_base;       // [world_size * num_features + 1]
+  const int64_t *row_shift;              // [world_size * num_features + 1]
   const bool *skip;
 };
 
 // The push (node_key_push): the bucketize's gather into its targets' node_keys. Every thread of
 // a grid over the `rows` bucketized rows, a thread per row. A valid row (below
 // offset_per_bucket[world_size]) of bucket feature b, owner o, goes to place
-// destination_base[b] + row in its target's node_keys: put(target, place, key, weight,
+// row + row_shift[b] in its target's node_keys: put(target, place, key, weight,
 // node_bucket_feature), the target o's local rank and node_bucket_feature o's node *
 // num_features + its feature. A place from lookup_keys on is in the target's remote part. Under
 // skip no row goes. With src (one node), each row's place in its owner's KJT goes to src[row]
@@ -261,7 +263,7 @@ __device__ __forceinline__ void push_rows(const GatherRows &in, int64_t rows,
   const int64_t valid = *places.skip ? 0 : places.offset_per_bucket[topo.world_size];
   for (int64_t row = first_item(); row < (src != nullptr ? rows : valid); row += item_stride()) {
     const int64_t bucket_feature = places.bucket_feature_of_row[row];
-    const int64_t place = places.destination_base[bucket_feature] + row;
+    const int64_t place = places.row_shift[bucket_feature] + row;
     if (src != nullptr) src[row] = (int32_t)place;
     if (row >= valid) continue;
     const int64_t source = in.inv[row], owner = bucket_feature / num_features;

@@ -86,7 +86,7 @@ NodeLayout empty_node_layout(const Topo &topo, int64_t num_features,
   node.own_total = at::empty({local_size}, long_options);
   node.need_lookup = at::empty({}, long_options);
   node.skip = at::empty({}, long_options.dtype(at::kBool));
-  node.destination_base = at::empty({topo.world_size * num_features + 1}, long_options);
+  node.row_shift = at::empty({topo.world_size * num_features + 1}, long_options);
   if (topo.num_nodes > 1) {  // one node has no remote part
     node.requester_start = at::empty({local_size + 1}, long_options);
     node.need_remote = at::empty({}, long_options);
@@ -135,8 +135,8 @@ void push_to_node_keys(const at::Tensor &values, const at::Tensor &inv, const at
   if (rows == 0) return;
   const GatherRows gather = gather_rows_of(inv, values, weights);
   const PushPlaces places{bucket_feature_of_row.data_ptr<int32_t>(),
-                          offset_per_bucket.data_ptr<int64_t>(),
-                          node.destination_base.data_ptr<int64_t>(), node.skip.data_ptr<bool>()};
+                          offset_per_bucket.data_ptr<int64_t>(), node.row_shift.data_ptr<int64_t>(),
+                          node.skip.data_ptr<bool>()};
   push_to_node_keys_kernel<<<item_grid(rows), kThreads, 0, current_stream()>>>(
       gather, rows, places, topo, num_features, lookup_keys, remote_keys,
       node_keys.data_ptr<int64_t>(), data_or_null<float>(node_key_weights),
@@ -375,11 +375,11 @@ namespace {
 
 // A thread per bucketized row: the node peer whose remote_map has its words,
 // for a valid row of another node's owner (its proxy: the owner's local
-// rank; else -1), and its occurrence there: its destination less
-// lookup_keys, clamped into the remote part.
+// rank; else -1), and its occurrence there: its place, row + row_shift,
+// less lookup_keys, clamped into the remote part.
 __global__ void __launch_bounds__(kThreads)
     remote_rows_kernel(const int32_t *bucket_feature_of_row, const int64_t *offset_per_bucket,
-                       const int64_t *destination_base, int64_t rows, Sizes sizes, int32_t *peer,
+                       const int64_t *row_shift, int64_t rows, Sizes sizes, int32_t *peer,
                        int64_t *first_word) {
   const int64_t local_size = sizes.topo.local_size, world_size = sizes.topo.world_size;
   const int64_t valid_rows = offset_per_bucket[world_size];
@@ -389,7 +389,7 @@ __global__ void __launch_bounds__(kThreads)
     const bool remote = owner / local_size != sizes.topo.node && row < valid_rows;
     peer[row] = remote ? (int32_t)(owner % local_size) : -1;
     first_word[row] =
-        clamp_index(destination_base[bucket_feature] + row - sizes.lookup_keys, sizes.remote_keys);
+        clamp_index(row_shift[bucket_feature] + row - sizes.lookup_keys, sizes.remote_keys);
   }
 }
 
@@ -491,7 +491,7 @@ __global__ void __launch_bounds__(kThreads)
 }  // namespace
 
 PeerWords remote_rows(const at::Tensor &bucket_feature_of_row, const at::Tensor &offset_per_bucket,
-                      const at::Tensor &destination_base, const Sizes &sizes) {
+                      const at::Tensor &row_shift, const Sizes &sizes) {
   const int64_t rows = bucket_feature_of_row.numel();
   PeerWords gather;
   gather.peer = at::empty({rows}, bucket_feature_of_row.options());
@@ -499,7 +499,7 @@ PeerWords remote_rows(const at::Tensor &bucket_feature_of_row, const at::Tensor 
   if (rows > 0) {
     remote_rows_kernel<<<item_grid(rows), kThreads, 0, current_stream()>>>(
         bucket_feature_of_row.data_ptr<int32_t>(), offset_per_bucket.data_ptr<int64_t>(),
-        destination_base.data_ptr<int64_t>(), rows, sizes, gather.peer.data_ptr<int32_t>(),
+        row_shift.data_ptr<int64_t>(), rows, sizes, gather.peer.data_ptr<int32_t>(),
         gather.first_word.data_ptr<int64_t>());
     C10_CUDA_KERNEL_LAUNCH_CHECK();
   }

@@ -1061,7 +1061,7 @@ def run_call(
             bucketized["kjt_weights"] if case.weights else None,
             bucketized["bucket_feature_of_row"],
             bucketized["offset_per_bucket"],
-            layouts[rank]["destination_base"],
+            layouts[rank]["row_shift"],
             layouts[rank]["skip"],
             num_nodes,
             local_size,
@@ -1179,7 +1179,7 @@ def run_call(
                 ranks[rank]["bucket_feature_of_row"],
                 ranks[rank]["offset_per_bucket_feature"],
                 ranks[rank]["offset_per_bucket"],
-                layouts[rank]["destination_base"],
+                layouts[rank]["row_shift"],
                 sizes(rank),
             )
         )

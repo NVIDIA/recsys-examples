@@ -909,8 +909,8 @@ def run_node_case(case: NodeCase, seed: int) -> Dict[str, bool]:
 
     if not skip:
         # Where each requester's valid rows are in its targets' parts, as its
-        # layout says (destination_base): rows of (target, destination,
-        # requester, row).
+        # layout says (row + row_shift): rows of (target, place, requester,
+        # row).
         pushes = []
         for local_rank in range(local_size):
             bucket_feature = (
@@ -923,7 +923,7 @@ def run_node_case(case: NodeCase, seed: int) -> Dict[str, bool]:
                 torch.stack(
                     [
                         bucket_feature // num_features % local_size,
-                        layouts[local_rank]["destination_base"][bucket_feature] + rows,
+                        layouts[local_rank]["row_shift"][bucket_feature] + rows,
                         torch.full_like(rows, local_rank),
                         rows,
                     ],
@@ -983,7 +983,7 @@ def run_node_case(case: NodeCase, seed: int) -> Dict[str, bool]:
             batches[local_rank].weights,
             bucketized["bucket_feature_of_row"],
             bucketized["offset_per_bucket"],
-            on_gpu[local_rank]["destination_base"],
+            on_gpu[local_rank]["row_shift"],
             on_gpu[local_rank]["skip"],
             num_nodes,
             local_size,

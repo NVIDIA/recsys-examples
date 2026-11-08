@@ -155,21 +155,23 @@ FanoutTables fanout_tables(const at::Tensor &reverse_indices, const at::Tensor &
 // of the node pushes (skip). One node has no remote part: there requester_start and need_remote
 // stay undefined. Across nodes kjt_offsets and length_per_key stay undefined.
 struct NodeLayout {
-  at::Tensor own_lengths;       // int64 [num_features * local_size]: keys of each (feature,
-                                // requester) in this rank's own part
-  at::Tensor own_offsets;       // int64 [num_features * local_size]: where each one
-                                // starts there
-  at::Tensor own_total;         // int64 [local_size]: each owner's own part
-  at::Tensor requester_start;   // int64 [local_size + 1]: where each requester's keys start in
-                                // this rank's remote part
-  at::Tensor need_lookup;       // int64 0-dim: the largest own part of the node
-  at::Tensor need_remote;       // int64 0-dim: the largest remote part of the node
-  at::Tensor skip;              // bool 0-dim: a need above its capacity
-  at::Tensor destination_base;  // int64 [world_size * num_features + 1]: bucketized row `row`
-                                // goes to destination_base[bucket_feature_of_row[row]] + row
-                                // in node_keys of its target
-  at::Tensor kjt_offsets;       // (one node) int64 [num_features * local_size + 1]
-  at::Tensor length_per_key;    // (one node) int64 [num_features]
+  at::Tensor own_lengths;      // int64 [num_features * local_size]: keys of each (feature,
+                               // requester) in this rank's own part
+  at::Tensor own_offsets;      // int64 [num_features * local_size]: where each one
+                               // starts there
+  at::Tensor own_total;        // int64 [local_size]: each owner's own part
+  at::Tensor requester_start;  // int64 [local_size + 1]: where each requester's keys start in
+                               // this rank's remote part
+  at::Tensor need_lookup;      // int64 0-dim: the largest own part of the node
+  at::Tensor need_remote;      // int64 0-dim: the largest remote part of the node
+  at::Tensor skip;             // bool 0-dim: a need above its capacity
+  at::Tensor row_shift;        // int64 [world_size * num_features + 1]: bucketized row `row`
+                               // goes to row + row_shift[bucket_feature_of_row[row]] in
+                               // node_keys of its target: where this rank's rows of the
+                               // bucket feature start there, less where they start among its
+                               // rows (offset_per_bucket_feature)
+  at::Tensor kjt_offsets;      // (one node) int64 [num_features * local_size + 1]
+  at::Tensor length_per_key;   // (one node) int64 [num_features]
 };
 // The layout as node_exchange makes it, from the node's offsets (node_offsets: int64
 // [local_size][world_size * num_features + 1], row r requester r's offset_per_bucket_feature).
@@ -451,13 +453,13 @@ struct PeerWords {
   at::Tensor first_word;  // int64 [items]
 };
 // The remote_map words of this requester's rows (bucket_feature_of_row,
-// offset_per_bucket: the bucketize's; destination_base: the node layout's),
-// kGatherRemoteMap: a row of another node's owner is occurrence destination -
-// lookup_keys of its proxy, the owner's rank on this node (its place in its
-// proxy's remote part, where it pushed it); it reads that entry of each
-// RemoteMap array.
+// offset_per_bucket: the bucketize's; row_shift: the node layout's),
+// kGatherRemoteMap: a row of another node's owner is occurrence
+// row + row_shift - lookup_keys of its proxy, the owner's rank on this node
+// (its place in its proxy's remote part, where it pushed it); it reads that
+// entry of each RemoteMap array.
 PeerWords remote_rows(const at::Tensor &bucket_feature_of_row, const at::Tensor &offset_per_bucket,
-                      const at::Tensor &destination_base, const Sizes &sizes);
+                      const at::Tensor &row_shift, const Sizes &sizes);
 // The words of the node's proxy headers this requester reads
 // (kGatherProxyHeader): ProxyHeader's gathered words of each proxy in turn,
 // a constant of the op.

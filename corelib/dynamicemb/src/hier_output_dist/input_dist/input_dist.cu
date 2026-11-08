@@ -193,7 +193,7 @@ InDist InChannel::input_dist(const PlanInput &input) {
         peer_gather(kGatherProxyHeader, header_gather_.peer, header_gather_.first_word)
             .view({local_size, ProxyHeader::of(sizes_).gathered_words()});
     const PeerWords rows = remote_rows(bucketized.bucket_feature_of_row,
-                                       bucketized.offset_per_bucket, node.destination_base, sizes_);
+                                       bucketized.offset_per_bucket, node.row_shift, sizes_);
     at::Tensor words = peer_gather(kGatherRemoteMap, rows.peer, rows.first_word);
     const RequesterTables requester = requester_tables(
         words, headers, offset_per_owner_feature, bucketized.bucket_feature_of_row,

@@ -1265,20 +1265,23 @@ The layout, with `me` this rank's local rank:
   section 5.4).
 
 Bucketized row `row` of bucket feature `b` goes to place
-`destination_base[b] + row` in its target's `node_keys`:
+`row + row_shift[b]` in its target's `node_keys`. `row_shift[b]` is where
+this rank's rows of `b` start there, less `O[me][b]`, where they start among
+its bucketized rows. So one add places a row, wherever it is inside `b`:
 
-* for an owner `t` of this node, `destination_base[b]` is the node's keys
-  for `t` of the features before `f` (the sum of `c(r, t, f')` over every
-  `r` and `f' < f`), plus those of the requesters before this rank in `f`
-  (the sum of `c(r, t, f)` over `r < me`), minus `O[me][b]`;
-* for an owner `(n, t)` of another node, it is `lookup_keys`, plus the keys
-  of the requesters before this rank in `t`'s remote part (the sum of
-  `R(r, t)` over `r < me`), plus this rank's blocks for the owners `(n', t)`
-  of the other nodes before `n`, minus
-  `O[me][(n × local_size + t) × num_features]`. Every feature of the owner
-  has this base;
+* for an owner `t` of this node, this rank's rows of `b` start after the
+  node's keys for `t` of the features before `f` (the sum of `c(r, t, f')`
+  over every `r` and `f' < f`) and those of the requesters before this rank
+  in `f` (the sum of `c(r, t, f)` over `r < me`);
+* for an owner `(n, t)` of another node, they start at `lookup_keys`, after
+  the keys of the requesters before this rank in `t`'s remote part (the sum
+  of `R(r, t)` over `r < me`) and this rank's blocks for the owners
+  `(n', t)` of the other nodes before `n`. That block holds every feature of
+  the owner in the bucketize's order, so `row_shift[b]` is this start less
+  `O[me][(n × local_size + t) × num_features]` for every feature of the
+  owner;
 * the rows past the valid ones (bucket feature `world_size × num_features`)
-  are never pushed: their base is 0.
+  are never pushed: their `row_shift` is 0, so each is at its own index.
 
 On one node the own part is the owner's KJT. Its lengths are `own_lengths`,
 and `node_exchange` also gives its offsets (`kjt_offsets`, `num_features ×
