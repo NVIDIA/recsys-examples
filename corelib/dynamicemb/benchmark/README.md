@@ -715,7 +715,7 @@ same nodes. Now a worker takes the remote tasks that do not wait first (see
 
 Times are in ms. A utilization is a % of the link's rate in one direction.
 For InfiniBand (IB) that rate is 50 GB/s per NIC (400 Gb/s). For NVLink it is
-the ceilings measured with `nvlink_ceiling.cu` (*Link tools*). JSON field
+the ceilings measured with `nvlink_ceiling.cu` (*NVLink ceiling*). JSON field
 names are in backticks. The JSON line holds more than these measures.
 
 | metric | JSON field | definition |
@@ -772,9 +772,9 @@ calls.
 | reserved + windows | `mem_total_reserved_bytes` | The two together. |
 | device memory in use | `mem_device_used_bytes` | From `cudaMemGetInfo`, after the timed iterations (and at earlier checkpoints): the CUDA context, NCCL's communicators and buffers, the windows, the tables and PyTorch's memory. |
 
-### Link tools
+### NVLink ceiling
 
-One more tool measures the links on its own: `nvlink_ceiling.cu`, a single
+`nvlink_ceiling.cu` measures NVLink on its own. It is a single
 `.cu` file with its build and run lines at the top (`nvcc -O3
 -arch=sm_90`). It measures what NVLink gives inside a node with SM loads and
 SM stores, at several CTA counts. It runs an all-to-all with all GPUs
@@ -787,33 +787,6 @@ loads), and 376.0–376.1 GB/s for one GPU receiving (SM stores). With every
 GPU exchanging with every other, it measured 330.8–331.6 GB/s (SM loads) and
 351.2–352.8 GB/s (SM stores, `all-to-all in rounds`). So NVLink moves about
 7 times as much per GPU as one NIC (50 GB/s).
-
-The second tool, `gin_rail_congestion.cu`, measures incast on the rails. It
-is also a single `.cu` file with its build and run lines at the top (`nvcc
--O3 -arch=sm_90 ... -lnccl`, then `srun` with one process per GPU on 2 or
-more nodes). Each GPU sends a stream of 2 MiB chunks (the tool's default
-chunk size, its second argument, and the dist's chunks before
-`DYNAMICEMB_HIER_PAYLOAD_KB`) with GIN puts to the GPUs of its rail on the
-other nodes, in the order in which the proxies of the hierarchical dist
-send their chunks (`docs/hier_output_dist.md`, section 12.1): 16 of the
-stream's rounds, each of one chunk for each other node. It sends the stream
-in two orders. In node order, every sender takes the other nodes of a round
-in the same order, so up to `nodes − 1` senders put to the same node at the
-same time. In rotated order, the order of the hierarchical dist, a sender on
-node `p` starts at node `p + 1`, so each node receives from one sender at a
-time. A window is the number of chunks a sender puts before it waits for
-its chunks to land and the rail passes a barrier. On H100 nodes, node order
-took this many times the rotated order's time:
-
-| nodes | window: node order's time / rotated order's time |
-|---|---|
-| 2 | 1: 0.99; all chunks at once: 1.00 (one receiver, so the orders are the same) |
-| 4 | 1: 1.19; 2: 1.32; 3: 1.04; 6: 1.02; all chunks at once: 1.00 |
-| 8 | 1: 0.98; 2: 1.66; 4: 1.53; 7: 1.09; 14: 1.08; all chunks at once: 1.02 |
-
-With a few chunks in flight, node order is slower. With all chunks in
-flight, a sender puts to all nodes at once and the order has almost no
-effect. On 8 nodes with a window of 1, the barriers take most of the time.
 
 The hierarchical dist's output dist needs the plans its own input dist makes,
 so this benchmark times it in place (`--kernel_times`, `--trace`).

@@ -1812,14 +1812,12 @@ the ring     its chunks one after another; when the stream passes the ring, laps
   time: in the backward its NIC took the puts of several proxies, and in
   the forward of a stream that wraps the ring it sent to several proxies,
   while the other NICs were idle (incast). DeepEP turns its RDMA peers the
-  same way (each rank starts from a different peer).
-  `benchmark/gin_rail_congestion.cu` measures the effect on the rails
-  (`benchmark/README.md`, *Link tools*). With the benchmark's configuration
-  (`--use_index_dedup`, uniform and power-law keys), the backward kernel
-  takes 0.4 to 1.6% less time in this order on 4 nodes, and 6.0 to 7.7%
-  less on 8 nodes. The forward kernel takes the same time. With a large
-  batch (16384 samples of 1536 keys of one feature), the time of neither
-  kernel changes.
+  same way (each rank starts from a different peer). When the proxies
+  started to take the owner nodes in turn, the backward kernel took 0.4 to
+  1.6% less time than in node order on 4 nodes, and 6.0 to 7.7% less on 8
+  nodes, and the forward kernel the same time (measured then, with chunks
+  of 2 MiB of rows, and the benchmark's configuration: `--use_index_dedup`,
+  uniform and power-law keys).
 * Its positions are unwrapped: a stream that fits the ring lies as it is,
   which is the case whenever `remote_keys` rows fit under the cap (section
   15.3).
