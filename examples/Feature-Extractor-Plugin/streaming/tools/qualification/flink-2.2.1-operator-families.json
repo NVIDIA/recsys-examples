@@ -1,0 +1,550 @@
+{
+  "spdx_copyright": "Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.",
+  "spdx_license_identifier": "Apache-2.0",
+  "schema": "fep-flink-operator-families/v1",
+  "flink_version": "2.2.1",
+  "version_scope": "Verified only against Flink 2.2.1. Other Flink versions are not verified: physical node names and REST fields may differ.",
+  "status": "DRAFT for the family list. The library API names (GpuWindows.tumble, GpuWindows.hop, GpuJoins.lookupInner) match the Java library in this repository.",
+  "scope": "Family-level discovery only. A library-provided family is not proof that a concrete SQL shape can be rewritten to the library operator.",
+  "coverage_values": {
+    "library-provided": "the GPU library has an operator for this SQL physical node",
+    "not-provided": "the library does not provide this operator; the node stays on the CPU",
+    "cpu-boundary": "source, sink or exchange; outside GPU compute scope"
+  },
+  "library_operators": [
+    {
+      "name": "Window aggregation",
+      "sql": "TUMBLE / HOP window aggregate",
+      "library_api": "GpuWindows.tumble / GpuWindows.hop",
+      "families": [
+        "WindowAggregate",
+        "LocalWindowAggregate",
+        "GlobalWindowAggregate"
+      ],
+      "not_covered": "CUMULATE and SESSION windows (cannot be told apart from the node name; review window_kind)"
+    },
+    {
+      "name": "Bounded INNER dimension-table lookup",
+      "sql": "INNER lookup join (FOR SYSTEM_TIME AS OF)",
+      "library_api": "GpuJoins.lookupInner",
+      "families": [
+        "LookupJoin"
+      ],
+      "not_covered": "LEFT/SEMI/ANTI lookup joins (cannot be told apart from the node name; review join_type)"
+    }
+  ],
+  "families": [
+    {
+      "name": "WindowDeduplicate",
+      "sql_physical_nodes": [
+        "StreamExecWindowDeduplicate"
+      ],
+      "tokens": [
+        "StreamExecWindowDeduplicate",
+        "WindowDeduplicate"
+      ],
+      "coverage": "not-provided",
+      "library_api": null,
+      "review_priority": "medium",
+      "review_checks": [
+        "window_time_semantics",
+        "keep_semantics",
+        "changelog_mode",
+        "key_and_payload_types"
+      ]
+    },
+    {
+      "name": "WindowRank",
+      "sql_physical_nodes": [
+        "StreamExecWindowRank"
+      ],
+      "tokens": [
+        "StreamExecWindowRank",
+        "WindowRank",
+        "WindowTopN"
+      ],
+      "coverage": "not-provided",
+      "library_api": null,
+      "review_priority": "high",
+      "review_checks": [
+        "window_time_semantics",
+        "rank_function",
+        "sort_key_types",
+        "rank_limit",
+        "changelog_mode"
+      ]
+    },
+    {
+      "name": "LocalWindowAggregate",
+      "sql_physical_nodes": [
+        "StreamExecLocalWindowAggregate"
+      ],
+      "tokens": [
+        "StreamExecLocalWindowAggregate",
+        "LocalWindowAggregate"
+      ],
+      "coverage": "library-provided",
+      "library_api": "GpuWindows.tumble / GpuWindows.hop",
+      "review_priority": "high",
+      "review_checks": [
+        "window_kind_tumble_or_hop_only",
+        "two_phase_plan",
+        "aggregate_functions",
+        "key_and_value_types",
+        "append_only_input"
+      ]
+    },
+    {
+      "name": "GlobalWindowAggregate",
+      "sql_physical_nodes": [
+        "StreamExecGlobalWindowAggregate"
+      ],
+      "tokens": [
+        "StreamExecGlobalWindowAggregate",
+        "GlobalWindowAggregate"
+      ],
+      "coverage": "library-provided",
+      "library_api": "GpuWindows.tumble / GpuWindows.hop",
+      "review_priority": "high",
+      "review_checks": [
+        "window_kind_tumble_or_hop_only",
+        "two_phase_plan",
+        "aggregate_functions",
+        "key_and_value_types",
+        "append_only_input"
+      ]
+    },
+    {
+      "name": "WindowAggregate",
+      "sql_physical_nodes": [
+        "StreamExecWindowAggregate"
+      ],
+      "tokens": [
+        "StreamExecWindowAggregate",
+        "WindowAggregate"
+      ],
+      "coverage": "library-provided",
+      "library_api": "GpuWindows.tumble / GpuWindows.hop",
+      "review_priority": "high",
+      "review_checks": [
+        "window_kind_tumble_or_hop_only",
+        "append_only_input",
+        "aggregate_functions",
+        "key_and_value_types",
+        "non_null_keys"
+      ]
+    },
+    {
+      "name": "IntervalJoin",
+      "sql_physical_nodes": [
+        "StreamExecIntervalJoin"
+      ],
+      "tokens": [
+        "StreamExecIntervalJoin",
+        "IntervalJoin"
+      ],
+      "coverage": "not-provided",
+      "library_api": null,
+      "review_priority": "high",
+      "review_checks": [
+        "join_type",
+        "equality_key_types",
+        "bounded_time_condition",
+        "residual_condition",
+        "changelog_mode",
+        "state_ttl"
+      ]
+    },
+    {
+      "name": "WindowJoin",
+      "sql_physical_nodes": [
+        "StreamExecWindowJoin"
+      ],
+      "tokens": [
+        "StreamExecWindowJoin",
+        "WindowJoin"
+      ],
+      "coverage": "not-provided",
+      "library_api": null,
+      "review_priority": "high",
+      "review_checks": [
+        "join_type",
+        "equality_key_types",
+        "window_time_semantics",
+        "residual_condition",
+        "changelog_mode"
+      ]
+    },
+    {
+      "name": "TemporalJoin",
+      "sql_physical_nodes": [
+        "StreamExecTemporalJoin"
+      ],
+      "tokens": [
+        "StreamExecTemporalJoin",
+        "TemporalJoin"
+      ],
+      "coverage": "not-provided",
+      "library_api": null,
+      "review_priority": "high",
+      "review_checks": [
+        "join_type",
+        "equality_key_types",
+        "event_time_semantics",
+        "version_history_shape",
+        "changelog_mode"
+      ]
+    },
+    {
+      "name": "LookupJoin",
+      "sql_physical_nodes": [
+        "StreamExecLookupJoin"
+      ],
+      "tokens": [
+        "StreamExecLookupJoin",
+        "LookupJoin"
+      ],
+      "coverage": "library-provided",
+      "library_api": "GpuJoins.lookupInner",
+      "review_priority": "high",
+      "review_checks": [
+        "join_type_inner_only",
+        "bounded_dimension_table",
+        "equality_key_types",
+        "non_null_keys",
+        "async_retry_mode",
+        "residual_condition"
+      ]
+    },
+    {
+      "name": "Join",
+      "sql_physical_nodes": [
+        "StreamExecJoin"
+      ],
+      "tokens": [
+        "StreamExecJoin",
+        "HashJoin",
+        "SortMergeJoin",
+        "NestedLoopJoin",
+        "Join"
+      ],
+      "coverage": "not-provided",
+      "library_api": null,
+      "review_priority": "high",
+      "review_checks": [
+        "join_type",
+        "equality_key_types",
+        "residual_condition",
+        "changelog_mode",
+        "state_ttl",
+        "output_amplification"
+      ]
+    },
+    {
+      "name": "TemporalSort",
+      "sql_physical_nodes": [
+        "StreamExecTemporalSort"
+      ],
+      "tokens": [
+        "StreamExecTemporalSort",
+        "TemporalSort"
+      ],
+      "coverage": "not-provided",
+      "library_api": null,
+      "review_priority": "high",
+      "review_checks": [
+        "event_time_semantics",
+        "sort_key_types",
+        "sort_field_count",
+        "changelog_mode"
+      ]
+    },
+    {
+      "name": "SortLimit",
+      "sql_physical_nodes": [
+        "StreamExecSortLimit"
+      ],
+      "tokens": [
+        "StreamExecSortLimit",
+        "SortLimit",
+        "TakeOrderedAndProject"
+      ],
+      "coverage": "not-provided",
+      "library_api": null,
+      "review_priority": "high",
+      "review_checks": [
+        "sort_key_types",
+        "sort_field_count",
+        "rank_limit",
+        "changelog_mode"
+      ]
+    },
+    {
+      "name": "Sort",
+      "sql_physical_nodes": [
+        "StreamExecSort"
+      ],
+      "tokens": [
+        "StreamExecSort",
+        "Sort"
+      ],
+      "coverage": "not-provided",
+      "library_api": null,
+      "review_priority": "high",
+      "review_checks": [
+        "bounded_input",
+        "sort_key_types",
+        "sort_field_count",
+        "null_ordering",
+        "changelog_mode",
+        "experimental_operator_policy"
+      ]
+    },
+    {
+      "name": "OverAggregate",
+      "sql_physical_nodes": [
+        "StreamExecOverAggregate"
+      ],
+      "tokens": [
+        "StreamExecOverAggregate",
+        "OverAggregate"
+      ],
+      "coverage": "not-provided",
+      "library_api": null,
+      "review_priority": "high",
+      "review_checks": [
+        "window_frame",
+        "time_semantics",
+        "aggregate_functions",
+        "order_key_types",
+        "changelog_mode"
+      ]
+    },
+    {
+      "name": "LocalGroupAggregate",
+      "sql_physical_nodes": [
+        "StreamExecLocalGroupAggregate"
+      ],
+      "tokens": [
+        "StreamExecLocalGroupAggregate",
+        "LocalGroupAggregate"
+      ],
+      "coverage": "not-provided",
+      "library_api": null,
+      "review_priority": "high",
+      "review_checks": [
+        "two_phase_plan",
+        "aggregate_functions",
+        "distinct_and_filter",
+        "retract_mode",
+        "state_ttl",
+        "key_and_value_types"
+      ]
+    },
+    {
+      "name": "GlobalGroupAggregate",
+      "sql_physical_nodes": [
+        "StreamExecGlobalGroupAggregate"
+      ],
+      "tokens": [
+        "StreamExecGlobalGroupAggregate",
+        "GlobalGroupAggregate"
+      ],
+      "coverage": "not-provided",
+      "library_api": null,
+      "review_priority": "high",
+      "review_checks": [
+        "two_phase_plan",
+        "aggregate_functions",
+        "distinct_and_filter",
+        "retract_mode",
+        "state_ttl",
+        "key_and_value_types"
+      ]
+    },
+    {
+      "name": "GroupAggregate",
+      "sql_physical_nodes": [
+        "StreamExecGroupAggregate"
+      ],
+      "tokens": [
+        "StreamExecGroupAggregate",
+        "GroupAggregate",
+        "HashAggregate",
+        "Aggregate"
+      ],
+      "coverage": "not-provided",
+      "library_api": null,
+      "review_priority": "high",
+      "review_checks": [
+        "aggregate_functions",
+        "distinct_and_filter",
+        "retract_mode",
+        "state_ttl",
+        "key_and_value_types",
+        "mini_batch_policy"
+      ]
+    },
+    {
+      "name": "Deduplicate",
+      "sql_physical_nodes": [
+        "StreamExecDeduplicate"
+      ],
+      "tokens": [
+        "StreamExecDeduplicate",
+        "Deduplicate"
+      ],
+      "coverage": "not-provided",
+      "library_api": null,
+      "review_priority": "medium",
+      "review_checks": [
+        "keep_semantics",
+        "time_semantics",
+        "changelog_mode",
+        "state_ttl",
+        "key_and_payload_types"
+      ]
+    },
+    {
+      "name": "Rank",
+      "sql_physical_nodes": [
+        "StreamExecRank"
+      ],
+      "tokens": [
+        "StreamExecRank",
+        "Rank",
+        "TopN"
+      ],
+      "coverage": "not-provided",
+      "library_api": null,
+      "review_priority": "high",
+      "review_checks": [
+        "rank_function",
+        "sort_key_types",
+        "sort_field_count",
+        "rank_limit",
+        "changelog_mode"
+      ]
+    },
+    {
+      "name": "Expand",
+      "sql_physical_nodes": [
+        "StreamExecExpand"
+      ],
+      "tokens": [
+        "StreamExecExpand",
+        "Expand"
+      ],
+      "coverage": "not-provided",
+      "library_api": null,
+      "review_priority": "medium",
+      "review_checks": [
+        "projection_shape",
+        "field_and_literal_types",
+        "grouping_set_count",
+        "downstream_fusion"
+      ]
+    },
+    {
+      "name": "Correlate",
+      "sql_physical_nodes": [
+        "StreamExecCorrelate"
+      ],
+      "tokens": [
+        "StreamExecCorrelate",
+        "Correlate",
+        "Unnest"
+      ],
+      "coverage": "not-provided",
+      "library_api": null,
+      "review_priority": "medium",
+      "review_checks": [
+        "built_in_unnest",
+        "join_type",
+        "residual_condition",
+        "nested_element_types",
+        "ordinality_and_zip_semantics",
+        "output_amplification",
+        "batch_latency_policy",
+        "experimental_operator_policy"
+      ]
+    },
+    {
+      "name": "Calc",
+      "sql_physical_nodes": [
+        "StreamExecCalc"
+      ],
+      "tokens": [
+        "StreamExecCalc",
+        "Calc",
+        "FilterProject"
+      ],
+      "coverage": "not-provided",
+      "library_api": null,
+      "review_priority": "medium",
+      "review_checks": [
+        "expression_set",
+        "input_and_output_types",
+        "udf_presence",
+        "changelog_mode",
+        "batch_latency_policy"
+      ]
+    },
+    {
+      "name": "Exchange",
+      "sql_physical_nodes": [
+        "StreamExecExchange"
+      ],
+      "tokens": [
+        "StreamExecExchange",
+        "Exchange",
+        "Rebalance",
+        "Rescale"
+      ],
+      "coverage": "cpu-boundary",
+      "library_api": null,
+      "review_priority": "low",
+      "review_checks": [
+        "outside_gpu_compute_scope"
+      ]
+    },
+    {
+      "name": "Source",
+      "sql_physical_nodes": [
+        "TableSourceScan"
+      ],
+      "tokens": [
+        "TableSourceScan",
+        "DataSourceScan",
+        "Source"
+      ],
+      "coverage": "cpu-boundary",
+      "library_api": null,
+      "review_priority": "low",
+      "review_checks": [
+        "outside_gpu_compute_scope",
+        "source_rate_and_partitioning"
+      ]
+    },
+    {
+      "name": "Sink",
+      "sql_physical_nodes": [
+        "StreamExecSink"
+      ],
+      "tokens": [
+        "StreamExecSink",
+        "Data Sink",
+        "Sink",
+        "Writer",
+        "Committer"
+      ],
+      "coverage": "cpu-boundary",
+      "library_api": null,
+      "review_priority": "low",
+      "review_checks": [
+        "outside_gpu_compute_scope",
+        "sink_capacity_and_delivery_semantics"
+      ]
+    }
+  ]
+}

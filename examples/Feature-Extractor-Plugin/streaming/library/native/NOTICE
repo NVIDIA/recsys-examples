@@ -1,0 +1,12 @@
+Feature-Extractor-Plugin streaming library, native (CUDA + JNI) layer
+Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+Licensed under the Apache License, Version 2.0 (SPDX: Apache-2.0).
+
+Portions derived from Mega-Flink (https://github.com/cb521/Mega-Flink, Apache-2.0).
+The CUDA sources in this directory (cuda_device_jni.cu, dense_groupby_jni.cu,
+gpu_arch_compat.h, gpu_device_batch.h, gpu_device_batch_jni.cu, lookup_join_jni.cu) and the
+structure of build.sh originate there; the JNI symbol prefix was changed to match the Java
+package com.nvidia.fep.flink, and gpu_arch_compat.h was generalised (see its header).
+
+Only the CUDA Toolkit headers and the JNI headers of a JDK are needed to build; no third-party
+source is bundled.
