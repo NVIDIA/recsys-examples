@@ -81,11 +81,8 @@ void inclusive_sums_to(const at::Tensor &counts, const at::Tensor &offsets) {
     case at::kInt:
       inclusive_sums<int32_t, To>(counts, offsets);
       break;
-    case at::kLong:
-      inclusive_sums<int64_t, To>(counts, offsets);
-      break;
     default:
-      TORCH_CHECK(false, "hier_output_dist: offsets_of sums bool, int32 or int64 counts, got ",
+      TORCH_CHECK(false, "hier_output_dist: offsets_of sums bool or int32 counts, got ",
                   counts.scalar_type());
   }
 }

@@ -180,8 +180,6 @@ Sizes sizes_of(const Config &config) {
                     local_size + num_nodes - 1, config.rank, config.rank % local_size,
                     config.rank / local_size};
   sizes.num_features = config.num_features();
-  const std::vector<int> tables = dense_tables(config.feature_tables);
-  sizes.num_tables = tables.empty() ? 0 : *std::max_element(tables.begin(), tables.end()) + 1;
   sizes.lookup_keys = config.capacities.lookup_keys;
   sizes.row_bytes = config.row_bytes();
   sizes.weighted = config.weighted;

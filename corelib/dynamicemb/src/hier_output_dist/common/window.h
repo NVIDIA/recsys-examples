@@ -79,7 +79,6 @@ class CtrlLayout {
       : base_((uint64_t *)base),
         num_nodes_(sizes.topo.num_nodes),
         num_features_(sizes.num_features),
-        counters_(sizes.counters()),
         count_format_{sizes.topo.num_nodes, sizes.num_features} {
     const int64_t local_size = sizes.topo.local_size, num_nodes = num_nodes_;
     const bool multi = num_nodes > 1;
@@ -109,7 +108,7 @@ class CtrlLayout {
     landed_ = take(multi ? sizes.max_chunks : 0);
     pulled_rows_ = take(multi ? sizes.max_chunks : 0);
     pushed_rows_ = take(multi ? sizes.max_chunks : 0);
-    posted_ = take(multi ? counters_ : 0);
+    posted_ = take(multi ? sizes.counters() : 0);
     bwd_free_end_ = take(multi ? 1 : 0);
     closing_ = take(1);
     closed_ = take(1);
@@ -219,7 +218,7 @@ class CtrlLayout {
   __host__ __device__ uint64_t *word(int64_t at) const { return base_ + at; }
 
   uint64_t *base_;
-  int64_t num_nodes_, num_features_, counters_;
+  int64_t num_nodes_, num_features_;
   CountMessage count_format_;
   int64_t in_started_, in_written_, requester_offsets_, in_status_, count_msg_out_, count_msgs_;
   int64_t out_started_, pushed_, pulled_, arrive_, tasks_, landed_rows_, fwd_tot_, bwd_tot_,
@@ -237,12 +236,12 @@ struct GatheredHeader;  // below
 // The proxy header (int32 words), what a proxy publishes to its node's
 // requesters: its stream's chunks at word 0 and its end at word 1 (uint32,
 // unwrapped: past num_proxy_rows when the stream wraps the ring); from word
-// 4 each chunk's end ([max_chunks], uint32); then its push tables
+// 2 each chunk's end ([max_chunks], uint32); then its push tables
 // [local_size][max_chunks + 1]: where each requester's rows of each chunk
 // start in its push order there (chunk max_chunks: their end). A requester
 // gathers the words it reads (planner.h) by their word numbers.
 struct ProxyHeader {
-  static constexpr int64_t kNumChunksWord = 0, kEndWord = 1, kEndsWord = 4;
+  static constexpr int64_t kNumChunksWord = 0, kEndWord = 1, kEndsWord = 2;
   int32_t *base;
   int64_t local_size, max_chunks;
   // The header of a proxy of these sizes at `base` (nullptr: its word numbers
@@ -351,8 +350,7 @@ __host__ __device__ constexpr int gather_words(GatherFrom from) {
 //   proxy_header  (num_nodes > 1) ProxyHeader
 //   key_stage     (num_nodes > 1) the node-unique key records of each owner
 //                 node, each slice after the node's chunks (OwnerChunk): what
-//                 one key put sends; then 16 bytes that take what no key
-//                 writes
+//                 one key put sends
 //   rail_keys     (num_nodes > 1) the key records the rail proxies put, one
 //                 slice per source node in node order, each the chunks of
 //                 this rank's node there, then its records in uniq order
@@ -361,13 +359,12 @@ class KeysLayout {
  public:
   __host__ __device__ KeysLayout(const Sizes &sizes, char *base)
       : base_(base),
-        num_nodes_(sizes.topo.num_nodes),
         local_size_(sizes.topo.local_size),
         offset_words_((int64_t)sizes.topo.world_size * sizes.num_features + 1),
         lookup_keys_(sizes.lookup_keys),
         remote_keys_(sizes.remote_keys),
         max_chunks_(sizes.max_chunks) {
-    const bool multi = num_nodes_ > 1;
+    const bool multi = sizes.multi_node();
     const uint64_t entries = (uint64_t)(lookup_keys_ + remote_keys_);
     uint64_t next = 0;
     auto take = [&](uint64_t bytes) {
@@ -382,7 +379,7 @@ class KeysLayout {
     remote_map_ = take(multi ? 4 * RemoteMap::kArrays * (uint64_t)remote_keys_ : 0);
     proxy_header_ = take(multi ? 4 * (uint64_t)ProxyHeader::of(sizes).words() : 0);
     key_stage_bytes_ =
-        multi ? max_chunks_ * sizeof(OwnerChunk) + remote_keys_ * sizes.record_bytes + 16 : 0;
+        multi ? max_chunks_ * sizeof(OwnerChunk) + remote_keys_ * sizes.record_bytes : 0;
     key_stage_ = take(key_stage_bytes_);
     rail_keys_bytes_ =
         multi ? lookup_keys_ * sizes.record_bytes + sizes.max_owner_chunks() * sizeof(OwnerChunk)
@@ -432,7 +429,7 @@ class KeysLayout {
 
  private:
   char *base_;
-  int64_t num_nodes_, local_size_, offset_words_, lookup_keys_, remote_keys_, max_chunks_;
+  int64_t local_size_, offset_words_, lookup_keys_, remote_keys_, max_chunks_;
   uint64_t node_offsets_, node_keys_, node_key_weights_, node_bucket_feature_of_row_, remote_map_,
       proxy_header_, key_stage_, rail_keys_, bytes_;
   uint64_t key_stage_bytes_, rail_keys_bytes_;

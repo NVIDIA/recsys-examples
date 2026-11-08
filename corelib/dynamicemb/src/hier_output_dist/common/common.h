@@ -74,7 +74,6 @@ struct Topo {
 struct Sizes {
   Topo topo;
   int64_t num_features;
-  int64_t num_tables;        // the features' tables, numbered densely (dense_tables)
   int64_t lookup_keys;       // keys an owner looks up (a capacity)
   int64_t remote_keys;       // remote occurrences a proxy deduplicates (a capacity)
   int64_t num_proxy_rows;    // rows of proxy_rows, the proxy's ring

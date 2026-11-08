@@ -214,9 +214,9 @@ void node_push_test(at::Tensor values, at::Tensor inv, c10::optional<at::Tensor>
 }
 
 // The sizes of a call across nodes (Sizes) by name: num_nodes, local_size,
-// node, local_rank, num_features, num_tables, lookup_keys, remote_keys,
-// num_proxy_rows, max_chunk_rows, record_bytes, and payload_rows (the rows of
-// a chunk's payload; max_chunk_rows when not given). rows_per_payload is
+// node, local_rank, num_features, lookup_keys, remote_keys, num_proxy_rows,
+// max_chunk_rows, record_bytes, and payload_rows (the rows of a chunk's
+// payload; max_chunk_rows when not given). rows_per_payload is
 // rows_per_payload_for(max_chunk_rows, payload_rows): here max_chunk_rows
 // stands for sizes_of's chunk_ring_rows. The two differ only when sizes_of's
 // least of 2 * max_key_rows sets max_chunk_rows. Then max_chunks follows, and
@@ -228,7 +228,6 @@ Sizes plan_sizes(const std::map<std::string, int64_t> &named) {
   Sizes sizes{};
   sizes.topo = topo_of(num_nodes, local_size, node, local_rank);
   sizes.num_features = named.at("num_features");
-  sizes.num_tables = named.at("num_tables");
   sizes.lookup_keys = named.at("lookup_keys");
   sizes.remote_keys = named.at("remote_keys");
   sizes.num_proxy_rows = named.at("num_proxy_rows");
@@ -243,7 +242,6 @@ Sizes plan_sizes(const std::map<std::string, int64_t> &named) {
   TORCH_CHECK(num_nodes >= 2 && local_size >= 1 && node >= 0 && node < num_nodes &&
                   local_rank >= 0 && local_rank < local_size && sizes.num_features >= 1 &&
                   num_nodes * local_size * sizes.num_features < INT32_MAX &&
-                  sizes.num_tables >= 1 && sizes.num_tables <= sizes.num_features &&
                   sizes.lookup_keys >= 1 && sizes.lookup_keys < INT32_MAX &&
                   sizes.remote_keys >= 1 && sizes.remote_keys < INT32_MAX &&
                   sizes.max_chunk_rows >= 2 * sizes.max_counted_rows() &&
@@ -257,15 +255,14 @@ Sizes plan_sizes(const std::map<std::string, int64_t> &named) {
 // One proxy's steps of a call across nodes (proxy_keys,
 // proxy_chunks_and_slots, proxy_push_order) on its remote part (node_keys,
 // node_key_weights, node_bucket_feature_of_row: what those buffers hold
-// past lookup_keys; weights exactly with 16-byte
-// records) and what the node layout says of it (remote_offsets, skip,
-// need_remote, own_total: its own part, own_lengths: its own part's lengths
-// [feature][requester]), and the count message it sends its rail
-// (count_message), by name. It writes remote_map, key_stage and
-// proxy_header (a proxy header, ProxyHeader) as the steps write those
-// buffers of its window. Also the node-unique key of each occurrence
-// (node_reverse_indices, garbage past the valid ones), for the test's
-// reference.
+// past lookup_keys; weights exactly with 16-byte records) and what the node
+// layout says of it (remote_offsets, skip, need_remote, own_total: its own
+// part, own_lengths: its own part's lengths [feature][requester]), and the
+// count message it sends its rail (count_message), by name. It writes
+// remote_map, key_stage and proxy_header (a proxy header, ProxyHeader) as the
+// steps write those buffers of its window. Also the node-unique key of each
+// occurrence (node_reverse_indices, garbage past the valid ones), for the
+// test's reference.
 std::map<std::string, at::Tensor> proxy_plan_test(
     at::Tensor node_keys, c10::optional<at::Tensor> node_key_weights,
     at::Tensor node_bucket_feature_of_row, at::Tensor remote_offsets, at::Tensor skip,

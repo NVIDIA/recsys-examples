@@ -177,10 +177,6 @@ class Case:
         return len(self.tables)
 
     @property
-    def num_tables(self) -> int:
-        return max(self.tables) + 1
-
-    @property
     def world_size(self) -> int:
         return self.num_nodes * self.local_size
 
@@ -475,9 +471,8 @@ CASES = [
         bound=30,
         remote_slack=-1,
     ),
-    # the owner gather's second slice of 1 << 22 positions (past num_recv)
     Case(
-        "lookup_keys past one gather slice",
+        "lookup_keys far above the call",
         num_nodes=2,
         local_size=2,
         weighted=True,
@@ -676,12 +671,12 @@ def make_windows(
         window.update(
             remote_map=garbage(3 * remote_keys, torch.int32, generator),
             key_stage=garbage(
-                chunks * 2 + remote_keys * case.record_bytes // 8 + 2,
+                chunks * 2 + remote_keys * case.record_bytes // 8,
                 torch.int64,
                 generator,
             ),
             proxy_header=garbage(
-                4 + chunks + local_size * (chunks + 1),
+                2 + chunks + local_size * (chunks + 1),
                 torch.int32,
                 generator,
             ),
@@ -925,7 +920,6 @@ def proxy_reference(case: Case, occurrences: List, node: int, remote_keys: int) 
         chunk_offset_per_bucket=chunk_offset_per_bucket,
         chunk_inv=chunk_inv,
         stream_end=stream_end,
-        chunk_of=chunk_of,
         key_row=key_row,
         word0=word0,
         slot=slots,
@@ -1045,7 +1039,6 @@ def run_call(
             node=rank // local_size,
             local_rank=rank % local_size,
             num_features=num_features,
-            num_tables=case.num_tables,
             lookup_keys=lookup_keys,
             remote_keys=remote_keys,
             num_proxy_rows=case.num_proxy_rows,
@@ -1219,7 +1212,6 @@ def run_call(
         )
     torch.cuda.synchronize()  # an access out of range would raise here
     return dict(
-        layouts=layouts,
         windows=windows,
         proxies=proxies,
         rails=rails,
@@ -1317,12 +1309,12 @@ def check_proxy(
     expect("header end", int(header[1]) & 0xFFFFFFFF, ref["stream_end"])
     expect(
         "header ends",
-        u32(header[4 : 4 + capacity].tolist()),
+        u32(header[2 : 2 + capacity].tolist()),
         [row[5] for row in ref["chunks"]],
     )
     expect(
         "push tables",
-        header[4 + capacity :].view(local_size, capacity + 1).tolist(),
+        header[2 + capacity :].view(local_size, capacity + 1).tolist(),
         ref["push_tables"],
     )
     # key_stage: per owner node its chunks, then its keys' records

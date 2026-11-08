@@ -47,7 +47,7 @@ std::pair<at::Tensor, at::Tensor> sort_pairs(const at::Tensor &keys, const at::T
                                              int end_bit);
 // A sort of int64 keys (not negative) by their bits [0, end_bit).
 at::Tensor sort_keys(const at::Tensor &keys, int end_bit);
-// The offsets of n counts (bool, int32 or int64), [0, c0, c0 + c1, ...]: n + 1
+// The offsets of n counts (bool or int32), [0, c0, c0 + c1, ...]: n + 1
 // entries, int64 (or int32 when their sum stays below 2^31).
 at::Tensor offsets_of(const at::Tensor &counts, at::ScalarType dtype = at::kLong);
 
@@ -257,8 +257,7 @@ struct ProxyBuffers {
   at::Tensor remote_map;  // int32 [3][remote_keys] (RemoteMap): per occurrence its key's row,
                           // its slot, its position in its requester's push order
   at::Tensor key_stage;   // int64 [KeysLayout::key_stage_bytes / 8]: per other owner node a
-                          // slice of its chunks (OwnerChunk) and its keys' records; the
-                          // last 16 bytes take the writes of no key
+                          // slice of its chunks (OwnerChunk) and its keys' records
   // the proxy header's parts (ProxyHeader)
   at::Tensor num_chunks;   // int32 [1]: its stream's chunks
   at::Tensor end;          // int32 [1]: its stream's end (uint32)

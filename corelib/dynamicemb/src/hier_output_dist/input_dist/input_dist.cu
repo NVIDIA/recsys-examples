@@ -19,8 +19,6 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 #include <ATen/core/grad_mode.h>
 #include <c10/cuda/CUDAGuard.h>
 
-#include <algorithm>
-
 #include "hier_output_dist/input_dist/input_dist.h"
 #include "hier_output_dist/input_dist/planner.cuh"
 
@@ -214,13 +212,13 @@ InDist InChannel::input_dist(const PlanInput &input) {
     fwd.src = requester.src;
     bwd.dst = requester.dst;
     fwd.push_order = bwd.push_order = requester.push_order;
-    fwd.proxy_num_chunks = bwd.proxy_num_chunks = requester.proxy_num_chunks;
+    fwd.proxy_num_chunks = requester.proxy_num_chunks;
     fwd.proxy_ends = bwd.proxy_ends = requester.proxy_ends;
     fwd.proxy_push_tables = bwd.proxy_push_tables = requester.proxy_push_tables;
     fwd.remote_task_offsets = bwd.remote_task_offsets = requester.remote_task_offsets;
     fwd.num_chunks = bwd.num_chunks = proxy.num_chunks;
     fwd.chunks = bwd.chunks = proxy.chunks;
-    fwd.node_offset_per_bucket = bwd.node_offset_per_bucket = proxy.node_offset_per_bucket;
+    fwd.node_offset_per_bucket = proxy.node_offset_per_bucket;
     fwd.put_list = bwd.put_list = lists.list;
     fwd.put_offsets = bwd.put_offsets = lists.offsets;
     fwd.push_order_off = requester.push_order_off;

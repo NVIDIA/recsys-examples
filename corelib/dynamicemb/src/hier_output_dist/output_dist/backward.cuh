@@ -74,40 +74,16 @@ __device__ __forceinline__ void store_fp32(float *row, int col, const float *val
         make_float4(vals[i], vals[i + 1], vals[i + 2], vals[i + 3]);
 }
 
-// Vector `col` (`Values` floats) of fp32 rows part[0], part[dim], ...
-// part[(count - 1) * dim], count >= 1, summed in that order into acc, 4 rows'
-// loads in flight.
+// Vector `col` (`Values` floats) of the fp32 row at `row`, into vals.
 template <int Values>
-__device__ __forceinline__ void sum_fp32(const float *part, int64_t count, int dim, int col,
-                                         float *acc) {
+__device__ __forceinline__ void load_fp32(const float *row, int col, float *vals) {
 #pragma unroll
   for (int i = 0; i < Values; i += 4) {
-    const float4 val = __ldcg((const float4 *)(part + col * Values + i));
-    acc[i] = val.x;
-    acc[i + 1] = val.y;
-    acc[i + 2] = val.z;
-    acc[i + 3] = val.w;
-  }
-  for (int64_t j = 1; j < count; j += 4) {
-    float4 vals[4][Values / 4];
-#pragma unroll
-    for (int step = 0; step < 4; ++step)
-#pragma unroll
-      for (int i = 0; i < Values; i += 4)
-        vals[step][i / 4] =
-            j + step < count ? __ldcg((const float4 *)(part + (j + step) * dim + col * Values + i))
-                             : make_float4(0.f, 0.f, 0.f, 0.f);
-#pragma unroll
-    for (int step = 0; step < 4; ++step) {
-      if (j + step >= count) continue;
-#pragma unroll
-      for (int i = 0; i < Values; i += 4) {
-        acc[i] += vals[step][i / 4].x;
-        acc[i + 1] += vals[step][i / 4].y;
-        acc[i + 2] += vals[step][i / 4].z;
-        acc[i + 3] += vals[step][i / 4].w;
-      }
-    }
+    const float4 val = __ldcg((const float4 *)(row + col * Values + i));
+    vals[i] = val.x;
+    vals[i + 1] = val.y;
+    vals[i + 2] = val.z;
+    vals[i + 3] = val.w;
   }
 }
 
@@ -371,7 +347,7 @@ __device__ void push_rows_warp(const Sizes &sizes, const BwdArgs &args, int64_t 
         args.partial + (int64_t)fanout.first[fanout.heavy_slot[lane_dedup_row]] * dim;
     for (int col = lane; col < vec; col += 32) {
       float acc[Vec16<RowT>::kValues];
-      sum_fp32<Vec16<RowT>::kValues>(sum, 1, dim, col, acc);
+      load_fp32<Vec16<RowT>::kValues>(sum, col, acc);
       *((int4 *)lane_dst + col) = scaled<RowT>(acc, args.scale);
     }
   }

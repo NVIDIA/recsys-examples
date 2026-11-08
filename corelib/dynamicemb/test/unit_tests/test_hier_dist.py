@@ -106,9 +106,7 @@ sys.path.insert(
 from benchmark_utils import hier_capacities, hier_needs, init_distributed  # noqa: E402
 
 NUM_EMBEDDINGS = 1 << 20
-# Nodes of the run (main sets it): across nodes a requester's keys for an
-# owner on another node reach it once per (node, table, key), and so do the
-# rows of the output dist.
+# Nodes of the run (main sets it).
 NODES = 1
 DTYPES = {
     "fp32": (DataType.FP32, SparseType.FP32),
@@ -134,10 +132,10 @@ def all_true(ok: bool) -> bool:
 # ── ops outside a model ──────────────────────────────────────────────────────
 
 
-def bucketize_rules(num_features: int, world_size: int):
-    """The bucketize's rule of each of ``num_features`` features, roundrobin
-    over ``world_size`` ranks, as ``HierDist.setup`` takes them: a
-    1-tuple of their DistType codes (a list)."""
+def bucketize_rules(num_features: int):
+    """The bucketize's rule of each of ``num_features`` features, roundrobin,
+    as ``HierDist.setup`` takes them: a 1-tuple of their DistType codes (a
+    list)."""
     return ([DIST_TYPE_CODES["roundrobin"]] * num_features,)
 
 
@@ -166,9 +164,7 @@ def check_group_shapes(rank: int, world_size: int) -> bool:
         with warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter("always")
             hier = standalone(dist.group.WORLD)
-            ok = hier.setup(
-                *bucketize_rules(3, world_size), False, True
-            ) is False and any(
+            ok = hier.setup(*bucketize_rules(3), False, True) is False and any(
                 "using TorchRec" in str(warning.message) for warning in caught
             )
         del hier
@@ -179,7 +175,7 @@ def check_group_shapes(rank: int, world_size: int) -> bool:
         if rank < 2:
             hier = standalone(pair)
             ok &= hier._arguments["local_size"] == 2 and hier.setup(
-                *bucketize_rules(3, 2), False, True
+                *bucketize_rules(3), False, True
             )
             del hier
     return ok
@@ -1183,12 +1179,13 @@ def run_proxy_rows(rank: int, world_size: int, local_size: int, log: Callable) -
             warnings.simplefilter("always")
             if asked == "hierarchical":
                 msg = expect_error(
-                    ValueError, hier.setup, *bucketize_rules(3, world_size), False, True
+                    ValueError, hier.setup, *bucketize_rules(3), False, True
                 )
-                named = "DYNAMICEMB_HIER_PROXY_MB" in msg
-                checks["hierarchical raised"] = named and same_everywhere(msg)
+                checks["hierarchical raised"] = (
+                    same_everywhere(msg) and "DYNAMICEMB_HIER_PROXY_MB" in msg
+                )
             else:
-                took = hier.setup(*bucketize_rules(3, world_size), False, True)
+                took = hier.setup(*bucketize_rules(3), False, True)
                 checks["auto takes TorchRec's dists"] = took is False and any(
                     "using TorchRec" in str(warning.message) for warning in caught
                 )
@@ -1225,7 +1222,6 @@ def run_options(rank: int, world_size: int, local_size: int, log: Callable) -> i
     input dist raises ValueError on every rank alike, under ``"auto"`` it
     warns and trains as TorchRec's dists do."""
     every_capacity = dict.fromkeys(OUTPUT_DIST_CAPACITY_NAMES, 1 << 16)
-    # the old name of "hierarchical" is refused (no alias)
     unknown = option_error(output_dist="fused", output_dist_capacity=4)
     checks = {
         "hierarchical without a capacity": (
@@ -1289,9 +1285,9 @@ def run_options(rank: int, world_size: int, local_size: int, log: Callable) -> i
     refused = expect_error(
         ValueError, hierarchical.input_dist, hierarchical.create_context(), kjt
     )
-    checks[
-        "hierarchical without index dedup"
-    ] = "index-deduplicated" in refused and same_everywhere(refused)
+    checks["hierarchical without index dedup"] = same_everywhere(refused) and (
+        "index-deduplicated" in refused
+    )
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
         auto_plain = sharded_ec(
@@ -1318,8 +1314,8 @@ def run_options(rank: int, world_size: int, local_size: int, log: Callable) -> i
         kjt,
     )
     checks["hierarchical with a continuous table"] = (
-        '"continuous"' in refused_cont
-        and same_everywhere(refused_cont)
+        same_everywhere(refused_cont)
+        and '"continuous"' in refused_cont
         and hier_of(hierarchical_cont).op is None
     )
     with warnings.catch_warnings(record=True) as caught:
@@ -1361,12 +1357,10 @@ def run_agreement(rank: int, world_size: int, local_size: int, log: Callable) ->
     messages = []
     with environ("DYNAMICEMB_HIER_TIMEOUT_S", 60 if rank == last else None):
         hier = standalone(dist.group.WORLD)
-    msg = expect_error(
-        ValueError, hier.setup, *bucketize_rules(3, world_size), False, True
-    )
+    msg = expect_error(ValueError, hier.setup, *bucketize_rules(3), False, True)
     checks["an environment variable on one rank"] = (
-        f"rank {last} has timeout_s=60.0" in msg
-        and same_everywhere(msg)
+        same_everywhere(msg)
+        and f"rank {last} has timeout_s=60.0" in msg
         and hier.op is None
     )
     messages.append(msg)
@@ -1377,20 +1371,16 @@ def run_agreement(rank: int, world_size: int, local_size: int, log: Callable) ->
     with environ("DYNAMICEMB_HIER_PROXY_MB", 16):
         hier = HierDist(dist.group.WORLD, 3, 32, torch.float32, capacity, asked="auto")
     HIER_DISTS.append(weakref.ref(hier))
-    msg = expect_error(
-        ValueError, hier.setup, *bucketize_rules(3, world_size), False, True
-    )
+    msg = expect_error(ValueError, hier.setup, *bucketize_rules(3), False, True)
     checks["a capacity on one rank"] = (
-        f"rank {last} has lookup_keys=" in msg
-        and same_everywhere(msg)
+        same_everywhere(msg)
+        and f"rank {last} has lookup_keys=" in msg
         and hier.op is None
     )
     messages.append(msg)
     del hier
     hier = standalone(dist.group.WORLD)
-    checks["built after them"] = (
-        hier.setup(*bucketize_rules(3, world_size), False, True) is True
-    )
+    checks["built after them"] = hier.setup(*bucketize_rules(3), False, True) is True
     del hier
     torch.cuda.synchronize()
     dist.barrier()
@@ -1402,7 +1392,7 @@ def run_rule_refusal(rank: int, world_size: int, local_size: int, log: Callable)
     "hierarchical" raises the same ValueError on every rank, naming the rule,
     and builds no op; "auto" warns and takes TorchRec's dists."""
     capacity = dict.fromkeys(OUTPUT_DIST_CAPACITY_NAMES, 1 << 16)
-    (dist_types,) = bucketize_rules(3, world_size)
+    (dist_types,) = bucketize_rules(3)
     dist_types[2] = DIST_TYPE_CODES["continuous"]
     checks: Dict[str, bool] = {}
     msg = ""
@@ -1417,7 +1407,7 @@ def run_rule_refusal(rank: int, world_size: int, local_size: int, log: Callable)
             if asked == "hierarchical":
                 msg = expect_error(ValueError, hier.setup, dist_types, False, True)
                 checks["hierarchical raised"] = (
-                    '"continuous"' in msg and same_everywhere(msg) and hier.op is None
+                    same_everywhere(msg) and '"continuous"' in msg and hier.op is None
                 )
             else:
                 took = hier.setup(dist_types, False, True)
@@ -1452,9 +1442,7 @@ def run_construction_failure(
             hier_output_dist_fail_next_construction(fail_alloc=True)
         with warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter("always")
-            fell_back += (
-                hier.setup(*bucketize_rules(3, world_size), False, True) is False
-            )
+            fell_back += hier.setup(*bucketize_rules(3), False, True) is False
         said = [
             str(warning.message)
             for warning in caught
@@ -1705,34 +1693,31 @@ def run_determinism(rank: int, world_size: int, local_size: int, log: Callable) 
     twice, with random fp32 output gradients (whose sums depend on their
     order), hands each owner's lookup the same gradient for every (table,
     key, column). Heavy rows included."""
-    failures = 0
     case_idx = 108
-    for case in (replace(HEAVY_ROWS, name="determinism"),):
-        torch.manual_seed(case_idx)
-        calls = [batch_of(case, case_idx, 0, rank, world_size)]
-        ec = sharded_ec(hierarchical_model(case, world_size, local_size, calls))
-        probe = Probe(ec, case.dim)
-        grads, on_op = [], True
-        for _ in range(2):
-            run = run_model(ec, batch_of(case, case_idx, 0, rank, world_size), False)
-            on_op = on_op and run.result is not None
-            gen = torch.Generator().manual_seed(rank)  # the same both times
-            values = [run.out[feature].values().float() for feature in case.features]
-            loss = sum(
-                (value * torch.randn(value.shape, generator=gen).cuda()).sum()
-                for value in values
-            )
-            loss.backward()
-            grads.append(grad_in_key_order(case, probe.kjt, probe.grad))
-        checks = {
-            "op": on_op,
-            "same gradient": grads[0].shape == grads[1].shape and torch.equal(*grads),
-        }
-        failures += report(
-            f"backward bit for bit run to run ({case.name})", checks, log
+    case = replace(HEAVY_ROWS, name="determinism")
+    torch.manual_seed(case_idx)
+    calls = [batch_of(case, case_idx, 0, rank, world_size)]
+    ec = sharded_ec(hierarchical_model(case, world_size, local_size, calls))
+    probe = Probe(ec, case.dim)
+    grads, on_op = [], True
+    for _ in range(2):
+        run = run_model(ec, batch_of(case, case_idx, 0, rank, world_size), False)
+        on_op = on_op and run.result is not None
+        gen = torch.Generator().manual_seed(rank)  # the same both times
+        values = [run.out[feature].values().float() for feature in case.features]
+        loss = sum(
+            (value * torch.randn(value.shape, generator=gen).cuda()).sum()
+            for value in values
         )
-        del ec, probe, run, loss, values
-        failures += gc_models(log)
+        loss.backward()
+        grads.append(grad_in_key_order(case, probe.kjt, probe.grad))
+    checks = {
+        "op": on_op,
+        "same gradient": grads[0].shape == grads[1].shape and torch.equal(*grads),
+    }
+    failures = report(f"backward bit for bit run to run ({case.name})", checks, log)
+    del ec, probe, run, loss, values
+    failures += gc_models(log)
     return failures
 
 
@@ -1774,7 +1759,7 @@ def run_teardown(rank: int, world_size: int, local_size: int, log: Callable) -> 
     ):
         with environ("DYNAMICEMB_HIER_TIMEOUT_S", timeout_s):
             hier = standalone(dist.group.WORLD)
-        ok = hier.setup(*bucketize_rules(3, world_size), False, True)
+        ok = hier.setup(*bucketize_rules(3), False, True)
         dist.barrier()
         if last:
             time.sleep(late)

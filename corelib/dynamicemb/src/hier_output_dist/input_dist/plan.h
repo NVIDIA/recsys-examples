@@ -35,7 +35,6 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 #pragma once
 
 #include <ATen/ATen.h>
-#include <c10/core/Stream.h>
 #include <c10/util/Optional.h>
 
 #include <cstdint>
@@ -54,9 +53,8 @@ struct PlanView {
   Fanout fanout;
   // across nodes, the requester's
   const int32_t *push_order;         // [rows] its remote rows by proxy and push order
-  const int64_t *proxy_num_chunks;   // [local_size] the chunks of each same-node proxy's stream
-  const int64_t *proxy_ends;         // [local_size][max_chunks + 1] each one's chunk ends, then its
-                                     // stream's end
+  const int64_t *proxy_ends;         // [local_size][max_chunks + 1] each same-node proxy's chunk
+                                     // ends, then its stream's end
   const int32_t *proxy_push_tables;  // [local_size][max_chunks + 1] where its rows of each chunk at
                                      // each proxy start in push_order (chunk max_chunks: their end)
   const int64_t *remote_task_offsets;  // [max_chunks * local_size + 1] its tasks of rows of other
@@ -66,8 +64,6 @@ struct PlanView {
   // across nodes, the proxy's
   const int64_t *num_chunks;  // the chunks of its stream
   const Chunk *chunks;        // [max_chunks] its chunks, in stream order
-  const int64_t
-      *node_offset_per_bucket;  // [num_nodes + 1] its first node-unique key of each owner node
   // across nodes, the owner's forward and the proxy's backward put lists
   // (planner.h): the segments of each node from put_offsets[node]
   const PutSeg *put_list;
@@ -89,6 +85,30 @@ struct PlanView {
   __device__ __forceinline__ bool wraps(int proxy) const {
     return proxy_end(proxy, max_chunks) > ring;
   }
+};
+
+// What fwd_kernel reads of a call.
+struct FwdPlanView : PlanView {
+  const int32_t *src;  // [rows]
+  // across nodes, the requester's
+  const int64_t *push_order_off;    // [local_size + 1] where its rows for each proxy start in
+                                    // push_order
+  const int64_t *proxy_num_chunks;  // [local_size] the chunks of each same-node proxy's stream
+  // across nodes, the owner's
+  const OwnerChunk *fwd_chunks;  // [max_owner_chunks] the chunks of its node in each source
+                                 // node's stream, its forward put list's (PutSeg::chunk)
+  // across nodes, the proxy's
+  const int64_t *chunk_offset_per_bucket;  // [num_nodes + 1] where each owner node's chunks start
+                                           // in chunk_inv
+  const int32_t *chunk_inv;                // [max_chunks] each owner node's chunks in order
+  const int64_t *node_length_per_bucket;   // [num_nodes] its node-unique keys of each owner node
+  const int64_t *node_offset_per_bucket;   // [num_nodes + 1] its first node-unique key of each
+                                           // owner node
+
+  // Where the owner's forward put list's segments for a proxy node start.
+  __device__ __forceinline__ int64_t fwd_put_offset(int proxy_node) const {
+    return put_offsets[num_nodes + proxy_node];
+  }
   // The chunk of a same-node proxy's stream that holds row `at` of its ring,
   // when the stream fits the ring: the first that ends past it.
   __device__ __forceinline__ int64_t chunk_at(int proxy, int64_t at) const {
@@ -105,27 +125,6 @@ struct PlanView {
   }
 };
 
-// What fwd_kernel reads of a call.
-struct FwdPlanView : PlanView {
-  const int32_t *src;  // [rows]
-  // across nodes, the requester's
-  const int64_t *push_order_off;  // [local_size + 1] where its rows for each proxy start in
-                                  // push_order
-  // across nodes, the owner's
-  const OwnerChunk *fwd_chunks;  // [max_owner_chunks] the chunks of its node in each source
-                                 // node's stream, its forward put list's (PutSeg::chunk)
-  // across nodes, the proxy's
-  const int64_t *chunk_offset_per_bucket;  // [num_nodes + 1] where each owner node's chunks start
-                                           // in chunk_inv
-  const int32_t *chunk_inv;               // [max_chunks] each owner node's chunks in order
-  const int64_t *node_length_per_bucket;  // [num_nodes] its node-unique keys of each owner node
-
-  // Where the owner's forward put list's segments for a proxy node start.
-  __device__ __forceinline__ int64_t fwd_put_offset(int proxy_node) const {
-    return put_offsets[num_nodes + proxy_node];
-  }
-};
-
 // What bwd_kernel reads of a call.
 struct BwdPlanView : PlanView {
   const int32_t *dst;  // [rows]
@@ -135,8 +134,6 @@ struct BwdPlanView : PlanView {
   const int64_t *reduce_task_offsets;  // [max_chunks + 1] its reducers' tasks before each chunk
                                        // (32 keys each)
   const int64_t *node_exp_off;         // [remote_keys + 1] the rows before each key (planner.h)
-  // the plan's counts (BwdPlan)
-  int64_t heavy_subs;  // sub-tasks of the requester's heavy rows
 
   // Where the proxy's backward put list's segments for an owner node start.
   __device__ __forceinline__ int64_t bwd_put_offset(int owner_node) const {
@@ -157,10 +154,11 @@ struct FwdPlan {
   at::Tensor inv;                // int32 [rows]
   FanoutTables fanout;
   // across nodes, the tables both kernels read
-  at::Tensor push_order, proxy_num_chunks, proxy_ends, proxy_push_tables, remote_task_offsets,
-      num_chunks, chunks, node_offset_per_bucket, put_list, put_offsets;
+  at::Tensor push_order, proxy_ends, proxy_push_tables, remote_task_offsets, num_chunks, chunks,
+      put_list, put_offsets;
   // across nodes, the forward's own
-  at::Tensor push_order_off, fwd_chunks, chunk_offset_per_bucket, chunk_inv, node_length_per_bucket;
+  at::Tensor push_order_off, fwd_chunks, chunk_offset_per_bucket, chunk_inv, node_length_per_bucket,
+      proxy_num_chunks, node_offset_per_bucket;
 
   // Rows of the requester's output: its input's rows, the original ones.
   int64_t num_out() const { return fanout.exp_idx.numel(); }
@@ -179,8 +177,8 @@ struct BwdPlan {
   at::Tensor inv;                // int32 [rows]
   FanoutTables fanout;
   // across nodes, the tables both kernels read
-  at::Tensor push_order, proxy_num_chunks, proxy_ends, proxy_push_tables, remote_task_offsets,
-      num_chunks, chunks, node_offset_per_bucket, put_list, put_offsets;
+  at::Tensor push_order, proxy_ends, proxy_push_tables, remote_task_offsets, num_chunks, chunks,
+      put_list, put_offsets;
   // across nodes, the backward's own
   at::Tensor node_length_per_source, reduce_task_offsets, node_exp_off;
 

@@ -34,7 +34,7 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 namespace dyn_emb {
 namespace hier_output_dist {
 
-// Loads, stores, reductions, atomics and fences with an explicit memory order
+// Loads, stores, reductions and fences with an explicit memory order
 // and scope (inline PTX).
 
 // Flags that another GPU writes are read with system-scope acquire, and the
@@ -82,14 +82,6 @@ __device__ __forceinline__ uint64_t ld_acquire_cta(const uint64_t *addr) {
 __device__ __forceinline__ void red_max_release_cta(uint64_t *addr, uint64_t value) {
   asm volatile("red.release.cta.max.u64 [%0], %1;" ::"l"(addr), "l"(value) : "memory");
 }
-__device__ __forceinline__ uint64_t atom_add_acq_rel_gpu(uint64_t *addr, uint64_t value) {
-  uint64_t old;
-  asm volatile("atom.acq_rel.gpu.global.add.u64 %0, [%1], %2;"
-               : "=l"(old)
-               : "l"(addr), "l"(value)
-               : "memory");
-  return old;
-}
 __device__ __forceinline__ void fence_sc_sys() { asm volatile("fence.sc.sys;" ::: "memory"); }
 // A system-scope fence that is not sequentially consistent (MEMBAR.ALL, where
 // fence.sc is MEMBAR.SC). After relaxed polls of flags (ld_relaxed_sys) it is
@@ -110,8 +102,8 @@ __device__ __forceinline__ uint64_t now_ns() {
 
 // Waits report instead of hanging forever: after `limit` ns the kernel prints
 // what it was waiting for and traps (timed_out). The report is a separate
-// function: when it was inline, its printf used registers at each wait, also
-// at the waits in the task loops of the out kernels.
+// function (__noinline__): inline, its printf would take registers at every
+// wait, the waits in the out kernels' task loops too.
 [[noreturn]] __device__ __noinline__ inline void timed_out(const char *what, long long first,
                                                            long long second, int rank) {
   printf("[hier_output_dist] rank %d timed out waiting for %s (%lld, %lld)\n", rank, what, first,
@@ -159,18 +151,16 @@ __device__ __forceinline__ void cta_sync(int threads) {
 
 // A binary search: the segment a value falls in.
 
-// Smallest i in [0, count) with bounds[(i + 1) * stride] > value, for
-// non-decreasing bounds[0], bounds[stride], ..., bounds[count * stride] with
-// bounds[0] <= value < bounds[count * stride]: the segment value falls in,
-// empty segments skipped. bounds[count * stride] is never read, so it need not
-// exist.
+// Smallest i in [0, count) with bounds[i + 1] > value, for non-decreasing
+// bounds[0], ..., bounds[count] with bounds[0] <= value < bounds[count]: the
+// segment value falls in, empty segments skipped. bounds[count] is never
+// read, so it need not exist.
 template <typename BoundT>
-__device__ __forceinline__ int seg_search(const BoundT *bounds, int count, int64_t value,
-                                          int stride = 1) {
+__device__ __forceinline__ int seg_search(const BoundT *bounds, int count, int64_t value) {
   int lo = 0, hi = count - 1;
   while (lo < hi) {
     const int mid = (lo + hi + 1) >> 1;
-    if ((int64_t)bounds[(int64_t)mid * stride] <= value)
+    if ((int64_t)bounds[mid] <= value)
       lo = mid;
     else
       hi = mid - 1;
@@ -285,10 +275,9 @@ struct NodeWindow {
 };
 
 // Syncs between the ranks of a node through their control words: the node
-// barrier (each rank publishes its own word and waits for every peer's),
+// barrier (each rank publishes its own word and waits for every peer's), and
 // flags per pair of node peers (each rank sets its flag in every peer's words
-// and waits for every peer's in its own), and words that carry a payload
-// beside the sequence number (TaggedWord). The words hold the sequence number
+// and waits for every peer's in its own). The words hold the sequence number
 // of the kernel that writes them (`seq`: in_seq or out_seq), so none is ever
 // reset: a later kernel waits for a larger one.
 
@@ -335,8 +324,8 @@ struct PeerFlags {
 };
 
 // A control word that holds a channel's sequence number in its high bits and
-// a payload in its low PayloadBits bits, which its writer publishes (release)
-// and readers wait for (acquire): landed_rows (rows, 32 bits).
+// a payload in its low PayloadBits bits, which its writer publishes
+// (release): landed_rows (rows, 32 bits).
 template <int PayloadBits>
 struct TaggedWord {
   __device__ __forceinline__ static uint64_t of(int64_t seq, uint64_t payload) {
@@ -352,15 +341,6 @@ struct TaggedWord {
   __device__ __forceinline__ static void publish(uint64_t *word, int64_t seq, uint64_t payload) {
     st_release_sys(word, of(seq, payload));
   }
-  // Waits until *word holds sequence number seq or a later one, and returns
-  // it (a timeout reports `what`, the peer, seq and this rank).
-  __device__ __forceinline__ static uint64_t wait(const uint64_t *word, int64_t seq, Spin &spin,
-                                                  const char *what, int peer, int rank) {
-    uint64_t value;
-    while (((value = ld_acquire_sys(word)) >> PayloadBits) < (uint64_t)seq)
-      spin.pause(what, peer, seq, rank);
-    return value;
-  }
 };
 
 // The rail: GIN between this rank and the ranks of its local index on the
@@ -374,13 +354,13 @@ struct TaggedWord {
 // of its communicator have (Communicator::gin_type). NCCL compiles each GIN
 // call for all backends and selects one at run time from the backend of the
 // context. A context that holds kGin as a constant keeps only the code of
-// kGin. Together, the code of all the backends used more registers than the
-// out kernels have. `mode`: who uses its QPs (one each per rail peer). GPU,
-// the default, lets the warps of every CTA use them. In GPU mode, each put
-// takes its QP's slots with GPU-scope atomics and a GPU-scope acquire fence,
-// which drops the L1 cache of the SM (the other warps of CTA 0 then miss in
-// L1). An issuer warp of CTA 0 is the only user of its rows context's QPs
-// (issuer_sharing).
+// kGin. Together, the code of all the backends would take more registers than
+// the out kernels have. `mode`: who uses its QPs (one each per rail peer).
+// GPU, the default, lets the warps of every CTA use them. In GPU mode, each
+// put takes its QP's slots with GPU-scope atomics and a GPU-scope acquire
+// fence, which drops the L1 cache of the SM (the other warps of CTA 0 then
+// miss in L1). An issuer warp of CTA 0 is the only user of its rows context's
+// QPs (issuer_sharing).
 template <ncclGinType_t kGin>
 __device__ __forceinline__ ncclGin
 gin_context(const ncclDevComm &dev, int index,
@@ -427,11 +407,10 @@ struct Credits {
                cuda::thread_scope_system);
     *sent = value;
   }
-  // The credit `sig` that rail peers raised at this rank (acquire).
-  __device__ __forceinline__ uint64_t read(int sig) const { return gin.readSignal(sig); }
-  // The same without acquire (ld_relaxed_sys): the caller makes a fence after
-  // it before what the credit allows, or reads nothing the credit guards (the
-  // forward's issuer: fwd::OwnerIssuer).
+  // The credit `sig` that rail peers raised at this rank, without acquire
+  // (ld_relaxed_sys): the caller makes a fence after it before what the
+  // credit allows, or reads nothing the credit guards (the forward's issuer:
+  // fwd::OwnerIssuer).
   __device__ __forceinline__ uint64_t read_relaxed(int sig) const {
     return gin.readSignal(sig, 64, cuda::memory_order_relaxed);
   }

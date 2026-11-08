@@ -28,7 +28,7 @@ void bind_index_calculation_op(py::module &m);
 void bind_initializer_op(py::module &m);
 void bind_table_operation(py::module &m);
 void bind_vmm_op(py::module &m);
-#ifndef DEMB_NO_HIER_OUTPUT_DIST  // defined by setup.py without NCCL >= 2.30.7
+#ifndef DEMB_NO_HIER_OUTPUT_DIST // defined by setup.py without NCCL >= 2.30.7
 void bind_hier_output_dist(py::module &m);
 #endif
 

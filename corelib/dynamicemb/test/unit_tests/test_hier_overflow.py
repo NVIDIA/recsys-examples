@@ -86,7 +86,6 @@ class Case:
     capacity: str  # the tight one: a name of OUTPUT_DIST_CAPACITY_NAMES, or "int"
     # the calls, "s" small and "l" large (those do not fit the tight capacity)
     schedule: str = "sls"
-    dedup: bool = True  # index dedup
     hot: float = 0.0  # share of the keys drawn from 4 hot keys (heavy rows)
     lfu: bool = False  # LFU scores (frequency counters as weights)
     int32: bool = False  # KJT values and lengths
@@ -224,7 +223,7 @@ def build_model(
             "learning_rate": 1.0,
             "output_dtype": SparseType.FP32,
         },
-        use_index_dedup=case.dedup,
+        use_index_dedup=True,
     )
     plan = planner.collective_plan(ec, [sharder], dist.GroupMember.WORLD)
     return DistributedModelParallel(

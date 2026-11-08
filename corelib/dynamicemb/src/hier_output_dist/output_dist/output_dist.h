@@ -63,9 +63,8 @@ class Trace {
 
 // The out channel: the output dist's kernels (one per direction of a call,
 // and before the backward's the two of the heavy rows' sums when there are
-// any) on the
-// caller's stream, the out kernels under one sequence number (out_seq) the
-// same on every rank.
+// any) on the caller's stream, the out kernels under one sequence number
+// (out_seq) the same on every rank.
 class OutChannel {
  public:
   // window and dev: the op's registered window and its GIN device

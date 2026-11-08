@@ -478,16 +478,14 @@ __global__ void load_from_flat_table_kernel_vec4(
 }
 
 template <int NumRegions, typename IndexT, typename ValueT>
-__global__ void
-load_from_flat_table_kernel(int64_t batch, int64_t output_dim,
-                            int64_t output_stride, ValueT *__restrict__ output,
-                            IndexT const *__restrict__ indices,
-                            int64_t const *__restrict__ table_ids,
-                            int64_t const *__restrict__ table_ptrs,
-                            int64_t const *__restrict__ table_value_dims,
-                            int64_t const *__restrict__ table_emb_dims,
-                            int64_t max_emb_dim, int64_t scalar_table_id,
-                            int64_t const *__restrict__ entry_of_row) {
+__global__ void load_from_flat_table_kernel(
+    int64_t batch, int64_t output_dim, int64_t output_stride,
+    ValueT *__restrict__ output, IndexT const *__restrict__ indices,
+    int64_t const *__restrict__ table_ids,
+    int64_t const *__restrict__ table_ptrs,
+    int64_t const *__restrict__ table_value_dims,
+    int64_t const *__restrict__ table_emb_dims, int64_t max_emb_dim,
+    int64_t scalar_table_id, int64_t const *__restrict__ entry_of_row) {
 
   for (int64_t emb_id = blockIdx.x; emb_id < batch; emb_id += gridDim.x) {
     int64_t entry = entry_of_row != nullptr ? entry_of_row[emb_id] : emb_id;

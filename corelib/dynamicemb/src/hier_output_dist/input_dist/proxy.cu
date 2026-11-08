@@ -507,11 +507,11 @@ __device__ void chunk_counts(const ChunkLayoutArgs &args) {
 // and its place among its owner node's (chunk_inv).
 // The agents take the stream in order on every node at about the same pace,
 // so with the turn the proxies of a rail mostly serve different owner nodes
-// at a place of a round. In node order they served the same owner node at
-// the same time: its NIC took the puts of several proxies (backward), or
-// sent to several proxies (forward, grants of a stream that wraps the ring),
-// while the other NICs of the rail were idle. DeepEP turns its RDMA peers
-// the same way against this incast.
+// at a place of a round. In node order they would serve the same owner node
+// at the same time: its NIC would take the puts of several proxies
+// (backward), or send to several proxies (forward, grants of a stream that
+// wraps the ring), while the other NICs of the rail would sit idle. DeepEP
+// turns its RDMA peers the same way against this incast.
 __device__ void chunk_table(const ChunkLayoutArgs &args) {
   const Rounds &rounds = args.rounds;
   const int64_t count = *args.num_chunks, max_chunks = args.max_chunks;
@@ -717,7 +717,7 @@ __global__ void __launch_bounds__(kThreads)
 // thread every part when there is no valid one.
 __global__ void __launch_bounds__(kThreads)
     part_offsets_kernel(const int64_t *push_key_sorted, const int64_t *occurrence_count,
-                        int64_t entries, int64_t parts, int32_t *part_offsets) {
+                        int64_t parts, int32_t *part_offsets) {
   const int64_t count = *occurrence_count;
   if (first_item() == 0 && count == 0)
     for (int64_t part = 0; part < parts; ++part) part_offsets[part] = 0;
@@ -1013,8 +1013,8 @@ ProxyPlan proxy_push_order(ProxyKeys keys, ProxyChunks chunks, const at::Tensor 
   // requester and chunk: its first position.
   const at::Tensor part_offsets = at::empty({parts}, int_options);
   part_offsets_kernel<<<item_grid(entries), kThreads, 0, stream>>>(
-      push_key_sorted.data_ptr<int64_t>(), keys.occurrence_count.data_ptr<int64_t>(), entries,
-      parts, part_offsets.data_ptr<int32_t>());
+      push_key_sorted.data_ptr<int64_t>(), keys.occurrence_count.data_ptr<int64_t>(), parts,
+      part_offsets.data_ptr<int32_t>());
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   push_tables_kernel<<<item_grid(parts), kThreads, 0, stream>>>(
       part_offsets.data_ptr<int32_t>(), remote_offsets.data_ptr<int64_t>(), local_size, max_chunks,

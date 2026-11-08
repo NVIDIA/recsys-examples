@@ -17,7 +17,6 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 // The planner's steps of the node, of the rail and the owner, of the
 // requester, and the put lists (planner.h).
 
-#include <algorithm>
 #include <cstdint>
 
 #include "hier_output_dist/common/window.h"
@@ -151,9 +150,9 @@ OneNodeOwner one_node_owner(const NodeLayout &node, const at::Tensor &node_keys,
                             const Topo &topo) {
   const int64_t own_part = node_keys.numel();
   OneNodeOwner owner;
-  // The own part is the KJT: a copy of its first num_recv keys (wait()
-  // narrows it to num_recv). The node's next call rewrites node_keys after
-  // its barrier, which does not wait for this call's lookup.
+  // The own part is the KJT: a copy of its first num_recv keys (the call's
+  // second wait narrows it to num_recv). The node's next call rewrites
+  // node_keys after its barrier, which does not wait for this call's lookup.
   owner.num_recv = node.own_total.select(0, topo.local_rank);
   owner.kjt_values = at::empty({own_part}, node_keys.options());
   if (node_key_weights.defined())

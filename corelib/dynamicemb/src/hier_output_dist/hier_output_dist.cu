@@ -17,7 +17,6 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 // The operator's construction, teardown and calls, its communicator and its
 // window (hier_output_dist.h), and the kernels of its setup and teardown.
 
-#include <ATen/core/grad_mode.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <c10/util/StringUtil.h>

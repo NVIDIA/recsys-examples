@@ -242,7 +242,6 @@ class Batch(Pipelineable):
 @dataclass
 class Spec:
     name: str
-    dedup: bool = True  # index dedup
     lfu: bool = False  # LFU scores
     admit: bool = False  # FrequencyAdmissionStrategy, threshold 2
     # t0 LFU, the other tables admission alone (threshold 2): two lookup groups
@@ -258,8 +257,7 @@ class Spec:
     sizes: Tuple[Tuple[int, int], ...] = SIZES
     key_range: int = 200_000
     # the steps whose batches the capacities do not count: their calls do not
-    # fit, and run on TorchRec's dists (with a second EC, the second's calls
-    # alone)
+    # fit, and raise (with a second EC, the second's calls alone)
     over: Tuple[int, ...] = ()
     # a second EC of DynamicEmb tables on the same features: another row-wise
     # sharding, with a hierarchical dist of its own beside the first one's
@@ -494,7 +492,7 @@ def build(
     sharders = [
         DynamicEmbeddingCollectionSharder(
             fused_params={**fused, "output_dtype": SparseType.FP32},
-            use_index_dedup=spec.dedup,
+            use_index_dedup=True,
         ),
         EmbeddingBagCollectionSharder(fused_params=fused),
     ]
@@ -607,7 +605,7 @@ def table_capacities(model) -> List[int]:
 # ── capacities ───────────────────────────────────────────────────────────────
 
 
-def needs_of(spec: Spec, batches: List[Batch]) -> Dict[str, int]:
+def needs_of(batches: List[Batch]) -> Dict[str, int]:
     """What the EC's calls on ``batches`` (this rank's) need of each
     capacity of its hierarchical dist, the most any rank needs in any of
     them (``hier_needs``, collective)."""
@@ -618,7 +616,6 @@ def needs_of(spec: Spec, batches: List[Batch]) -> Dict[str, int]:
         tables,
         lambda keys, feature: owning_shard(keys, world_size, DIST_TYPE),
         min(LOCAL, world_size),
-        index_dedup=spec.dedup,
     )
 
 
@@ -630,8 +627,8 @@ def capacities_of(spec: Spec, rank: int) -> List[Dict[str, int]]:
     ECs fits them all. Collective: every run of a spec gets the same."""
     batches = batches_of(spec, rank)
     fit = [batch for step, batch in enumerate(batches) if step not in spec.over]
-    needs = needs_of(spec, batches)
-    capacities = [hier_capacities(needs_of(spec, fit) if spec.over else needs)]
+    needs = needs_of(batches)
+    capacities = [hier_capacities(needs_of(fit) if spec.over else needs)]
     if spec.second:
         capacities.insert(0, hier_capacities(needs))
     return capacities
@@ -1109,8 +1106,8 @@ EVAL = Spec("eval on TorchRec's dists")
 # the first must not be too far below them: keys it evicted would make the
 # tables differ from tables that never rehash.
 REHASH = Spec("tables that rehash as they fill", init_capacity=16384)
-# small batches with two large ones the capacities do not fit, one of them
-# in the profiled steps
+# small batches with two large ones the capacities do not fit: the first
+# raises, before the profiled steps
 OVER = Spec(
     "calls over the capacities",
     sizes=(SMALL, LARGE, SMALL, SMALL, LARGE, SMALL),

@@ -111,9 +111,6 @@ template <typename Key, uint32_t m_seed = 0> struct MurmurHash3_32 {
   }
 };
 
-// (The chained insert, chain_insert, is in dedup_chain.cuh, which the
-// hierarchical dist's node dedup shares.)
-
 // Atomic operation overloads for 64-bit types
 __forceinline__ __device__ long atomicAdd(long *address, long val) {
   return static_cast<long>(
@@ -332,7 +329,8 @@ segmented_unique_core(
 
       // Lock-free tail-append dedup (chain_insert, dedup_chain.cuh).
       const ChainEntry entry =
-          chain_insert(d_head, d_next, bucket, idx, [&](int node) { return d_keys[node] == key; });
+          chain_insert(d_head, d_next, bucket, idx,
+                       [&](int node) { return d_keys[node] == key; });
       kind = entry.claimed ? 1 : 2;
       rep = entry.node;
     }

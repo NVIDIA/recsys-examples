@@ -163,7 +163,7 @@ struct OutTimeline {
 
 // What a requester's warps read of the call: from the plan (what both
 // kernels' plans hold), its offset_per_bucket and its tables of the node's
-// proxies (their streams' chunks and ends, and its push tables there); from
+// proxies (their streams' chunk ends, and its push tables there); from
 // the window, the node peers' buffers and words, each the same place as in
 // this rank's copy (layout()). The one word per proxy a CTA keeps,
 // free_seen, is in its shared memory. Every thread of a warp makes the same
@@ -177,12 +177,6 @@ struct OutTables {
       : sizes(op_sizes), plan(call_plan), node(window, op_sizes.topo.local_rank) {}
   __device__ __forceinline__ WindowLayout layout() const { return node.layout(sizes); }
   // Node peers' buffers and words.
-  __device__ __forceinline__ char *lookup_rows(int peer) const {
-    return node.peer(layout().rows.lookup_rows(), peer);
-  }
-  __device__ __forceinline__ char *proxy_rows(int proxy) const {
-    return node.peer(layout().rows.proxy_rows(), proxy);
-  }
   // Row `row` of a node peer's lookup_rows, slot `slot` of a proxy's proxy_rows.
   __device__ __forceinline__ char *lookup_row(int peer, int64_t row) const {
     return node.peer(layout().rows.lookup_row(row), peer);
@@ -336,13 +330,12 @@ struct TaskPlace {
 // barrier, a CTA's arrival at its end, and the landed_rows words.
 
 // The out channel's entry barrier, on its node barrier word (out_started):
-// CTA 0 publishes this rank's out_seq, after a system
-// fence for what earlier kernels wrote (lookup_rows, which node peers read)
-// and what CTA 0 reset for this kernel; every CTA then waits until all node
-// peers have published theirs. A peer there has ended its lookup (which wrote
-// its lookup_rows before the kernel) and every earlier out kernel. Every
-// thread of threads [0, threads) (cta_sync), in every CTA; seq is the
-// kernel's out_seq.
+// CTA 0 publishes this rank's out_seq, after a system fence for what earlier
+// kernels wrote (lookup_rows, which node peers read) and what CTA 0 reset for
+// this kernel; every CTA then waits until all node peers have published
+// theirs. A peer there has ended its lookup (which wrote its lookup_rows
+// before the kernel) and every earlier out kernel. Every thread of threads
+// [0, threads) (cta_sync), in every CTA; seq is the kernel's out_seq.
 __device__ __forceinline__ void pass_entry_barrier(ncclWindow_t window, const Sizes &sizes,
                                                    int64_t seq, const OutTimeline &timeline,
                                                    int threads) {

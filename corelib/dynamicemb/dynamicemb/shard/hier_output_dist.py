@@ -62,15 +62,6 @@ def _timeout_s(pg: dist.ProcessGroup) -> float:
     return timeout.total_seconds()
 
 
-def _comparable(arguments: Dict) -> Dict:
-    """The operator's arguments as values two ranks can compare (tensors as
-    lists)."""
-    return {
-        name: value.tolist() if isinstance(value, torch.Tensor) else value
-        for name, value in arguments.items()
-    }
-
-
 def _first_difference(every: List[Dict]) -> Optional[str]:
     """Where the first rank whose arguments differ from rank 0's differs, in
     words, or None when every rank has rank 0's."""
@@ -103,8 +94,8 @@ def _first_difference(every: List[Dict]) -> Optional[str]:
 # Where the tensors the benchmark reads are in the plans' lists (the order of
 # FwdPlan::tensors() and BwdPlan::tensors(), in
 # src/hier_output_dist/input_dist/plan.cu).
-_FWD_OFFSET_PER_BUCKET, _FWD_NUM_CHUNKS, _FWD_NODE_LENGTH_PER_BUCKET = 0, 15, 24
-_BWD_NODE_LENGTH_PER_SOURCE = 20
+_FWD_OFFSET_PER_BUCKET, _FWD_NUM_CHUNKS, _FWD_NODE_LENGTH_PER_BUCKET = 0, 14, 22
+_BWD_NODE_LENGTH_PER_SOURCE = 18
 
 
 class HierCall:
@@ -301,9 +292,7 @@ class HierDist:
             hier_output_dist_unique_id() if self._rank == 0 and not refusal else None
         )
         every = [None] * arguments["world_size"]
-        dist.all_gather_object(
-            every, (unique_id, _comparable(arguments)), group=self._pg
-        )
+        dist.all_gather_object(every, (unique_id, arguments), group=self._pg)
         difference = _first_difference([theirs for _, theirs in every])
         if difference is not None:
             raise ValueError(

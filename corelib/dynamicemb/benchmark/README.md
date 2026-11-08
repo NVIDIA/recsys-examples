@@ -565,9 +565,10 @@ to move keys and rows between GPUs (`--output_dist`):
 * `hierarchical`: DynamicEmb's hierarchical dist
   ([docs/hier_output_dist.md](../docs/hier_output_dist.md)). Its own input
   dist does all the planning, with one host sync per call. Its output dist
-  only moves rows, one kernel per direction. Its capacities come from the
-  benchmark's own batches (`--capacity`). It takes index-deduplicated keys:
-  it needs `--use_index_dedup`.
+  only moves rows: one kernel per direction, and before the backward's, when
+  a call has heavy rows, two short kernels that add up their gradients. Its
+  capacities come from the benchmark's own batches (`--capacity`). It takes
+  index-deduplicated keys: it needs `--use_index_dedup`.
 * `auto`: `hierarchical` where the build has it, else `torchrec`.
 
 ### How to run
@@ -729,7 +730,7 @@ names are in backticks. The JSON line holds more than these measures.
 | input-dist segment | `in_seg_ms_mean`, `in_seg_ms_per_call`, `in_seg_steps_ms` | Plain loop. Four CUDA events on the caller's stream: before `input_dist()`, after it, after the first wait, and after the second wait, when the lookup may start. The segment runs from the first event to the last, idle time from host syncs included. `in_seg_ms_mean` is its mean over calls and ranks, `in_seg_ms_per_call` holds every call, and `in_seg_steps_ms` the three steps. TorchRec's input dist is measured the same way. The first timed call is slow on every dist, because the GPU waits for the CPU when the loop starts. |
 | stages | `stages` | Profiled iterations: per stage of the forward or the backward (`fwd/input_dist`, `fwd/lookup`, `bwd/output_dist`, ...), the GPU ms per iteration of its kernels (`ms`) and their count (`kernels`), the mean over ranks. `net_ms` is the time of the output dist's kernels that move rows between GPUs: NCCL's, or `fwd_kernel` and `bwd_kernel`. |
 | output dist, events | `output_dist_event_ms_median` | Plain loop, `hierarchical`: CUDA events right before and after the output dist's forward and backward launches, in the timed iterations, with no profiler running; the median over calls of the mean over ranks. They hold the kernel's wait at its start for the other ranks and, when the GPU is idle at the launch, the launch's own CPU time. |
-| output-dist kernels | `output_dist_kernel_ms_median` | `--kernel_times`: the GPU ms of every call's forward and backward kernel under a CUDA-only profiler, the median over calls. |
+| output-dist kernels | `output_dist_kernel_ms_median` | `--kernel_times`: the GPU ms of every call's forward kernel and backward kernels (the heavy rows' two included) under a CUDA-only profiler, the median over calls. |
 | rows per iteration | `traffic_mean`, `traffic_max` | The output dist's rows of the timed iterations, per rank and iteration: the mean or the most over the ranks (`traffic_per_rank` holds each rank's). `hierarchical`: `rows_self`, the rows it asks of itself as owner; `rows_nvlink`, the rows it pulls from its node peers; `rows_served`, the rows other GPUs ask of it as owner; across nodes `rows_ib_out` and `rows_ib_in`, the rows its NIC puts and receives in the forward (the backward moves them the other way), `rows_ib`, the larger of the two, `rows_remote`, the rows of its proxy's stream, and `chunks`, that stream's chunks per call. `torchrec`: the forward's rows to itself, to its node peers and to other nodes (`rows_self`, `rows_nvlink`, `rows_ib`), and from other nodes (`rows_ib_in`). |
 
 **InfiniBand.** A NIC's bytes in a direction are the more of what it sends

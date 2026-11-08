@@ -554,9 +554,8 @@ _OUTPUT_DIST_COUNTS: Dict[int, int] = defaultdict(int)
 
 def _time_output_dist_launches() -> None:
     """Wrap the hierarchical output dist's forward and backward launches
-    (output_dist_fwd and output_dist_bwd, one kernel each), where the build
-    has them, in the per-call events of the timed iterations
-    (_Calls.output_dist_launch)."""
+    (output_dist_fwd and output_dist_bwd), where the build has them, in the
+    per-call events of the timed iterations (_Calls.output_dist_launch)."""
     import dynamicemb_extensions as ext
 
     if not hasattr(ext, "HierOutputDist"):
@@ -874,7 +873,7 @@ class HierTraffic:
     def _ib(self, call) -> Optional[Tuple[torch.Tensor, ...]]:
         """A call's node-unique rows put to (node_length_per_source) and received from
         (node_length_per_bucket) each node, its chunks as proxy (num_chunks) and its
-        remote occurrences (occurrence_count); None on one node."""
+        remote occurrences (occurrences); None on one node."""
         if not self.hier.multi_node:
             return None
         return call[2]
