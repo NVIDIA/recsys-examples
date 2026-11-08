@@ -72,23 +72,23 @@ __global__ void __launch_bounds__(kThreads)
   if (threadIdx.x == 0) totals[feature] = total;
 }
 
-// One CTA: where each feature's keys start in the KJT (value_start
+// One CTA: where each feature's keys start in the KJT (value_offsets
 // [num_features + 1], from its first key), from its offsets (every
 // batch-th) or, for a KJT of lengths (offsets nullptr), from the features'
 // totals; and the totals construct_jagged_tensors reads
 // (input_length_per_key [num_features]), of the input KJT's offsets.
 template <typename Offset, typename InputOffset>
 __global__ void __launch_bounds__(kThreads)
-    feature_starts_kernel(const Offset *offsets, const int64_t *totals, int64_t batch,
-                          int64_t num_features, const InputOffset *input_offsets,
-                          int64_t *value_start, int64_t *input_length_per_key) {
+    feature_offsets_kernel(const Offset *offsets, const int64_t *totals, int64_t batch,
+                           int64_t num_features, const InputOffset *input_offsets,
+                           int64_t *value_offsets, int64_t *input_length_per_key) {
   if (offsets != nullptr) {
     for (int64_t feature = threadIdx.x; feature <= num_features; feature += kThreads)
-      value_start[feature] = (int64_t)offsets[feature * batch] - (int64_t)offsets[0];
+      value_offsets[feature] = (int64_t)offsets[feature * batch] - (int64_t)offsets[0];
     __syncthreads();
   } else {
-    cta_exclusive_ends<int64_t>(
-        num_features, [&](int64_t feature) { return totals[feature]; }, value_start);
+    cta_offsets_of<int64_t>(
+        num_features, [&](int64_t feature) { return totals[feature]; }, value_offsets);
   }
   for (int64_t feature = threadIdx.x; feature < num_features; feature += kThreads)
     input_length_per_key[feature] =
@@ -135,11 +135,11 @@ __device__ __forceinline__ int64_t owner_of(Key key, int32_t dist_type, int64_t 
 // KJT: the push gathers them from there.
 template <typename Key>
 __global__ void __launch_bounds__(kThreads)
-    place_keys_kernel(const Key *values, int64_t num_keys, const int64_t *value_start,
+    place_keys_kernel(const Key *values, int64_t num_keys, const int64_t *value_offsets,
                       int64_t num_features, const int32_t *dist_types, int64_t world_size,
                       int32_t *bucket_feature, int32_t *index) {
   for (int64_t key = first_item(); key < num_keys; key += item_stride()) {
-    const int64_t feature = upper_bound(value_start, num_features + 1, key) - 1;
+    const int64_t feature = upper_bound(value_offsets, num_features + 1, key) - 1;
     bucket_feature[key] =
         feature < num_features
             ? (int32_t)(owner_of(values[key], dist_types[feature], world_size) * num_features +
@@ -383,7 +383,7 @@ BucketizedKeys bucketize_rows(const PlanInput &input, const at::Tensor &dist_typ
   const cudaStream_t stream = current_stream();
 
   // where each feature's keys start in the KJT, and the input's totals
-  const at::Tensor value_start = at::empty({num_features + 1}, long_options);
+  const at::Tensor value_offsets = at::empty({num_features + 1}, long_options);
   BucketizedKeys bucketized;
   bucketized.input_length_per_key = at::empty({num_features}, long_options);
   at::Tensor totals;
@@ -397,9 +397,9 @@ BucketizedKeys bucketize_rows(const PlanInput &input, const at::Tensor &dist_typ
   }
   with_index(input.offsets, [&](const auto *offsets) {
     with_index(input.input_offsets, [&](const auto *input_offsets) {
-      feature_starts_kernel<<<kOneCta, kThreads, 0, stream>>>(
+      feature_offsets_kernel<<<kOneCta, kThreads, 0, stream>>>(
           offsets, data_or_null<int64_t>(totals), batch, num_features, input_offsets,
-          value_start.data_ptr<int64_t>(), bucketized.input_length_per_key.data_ptr<int64_t>());
+          value_offsets.data_ptr<int64_t>(), bucketized.input_length_per_key.data_ptr<int64_t>());
     });
   });
   C10_CUDA_KERNEL_LAUNCH_CHECK();
@@ -412,7 +412,7 @@ BucketizedKeys bucketize_rows(const PlanInput &input, const at::Tensor &dist_typ
   if (num_keys > 0) {
     with_index(values, [&](const auto *keys) {
       place_keys_kernel<<<item_grid(num_keys), kThreads, 0, stream>>>(
-          keys, num_keys, value_start.data_ptr<int64_t>(), num_features,
+          keys, num_keys, value_offsets.data_ptr<int64_t>(), num_features,
           dist_types.data_ptr<int32_t>(), world_size, bucket_feature.data_ptr<int32_t>(),
           index.data_ptr<int32_t>());
     });
@@ -423,9 +423,9 @@ BucketizedKeys bucketize_rows(const PlanInput &input, const at::Tensor &dist_typ
   // where each bucket feature, and each bucket (owner), starts
   bucketized.offset_per_bucket_feature = at::empty({bucket_features + 1}, long_options);
   bucketized.offset_per_bucket = at::empty({world_size + 1}, long_options);
-  run_starts<int32_t, int64_t>(bucketized.bucket_feature_of_row, bucket_features,
-                               bucketized.offset_per_bucket_feature, num_features,
-                               bucketized.offset_per_bucket);
+  run_offsets<int32_t, int64_t>(bucketized.bucket_feature_of_row, bucket_features,
+                                bucketized.offset_per_bucket_feature, num_features,
+                                bucketized.offset_per_bucket);
   // the keys stay in the KJT: the push gathers them (bucketize_keys here)
   bucketized.values = values;
   return bucketized;

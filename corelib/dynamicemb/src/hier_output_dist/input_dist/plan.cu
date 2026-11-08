@@ -54,12 +54,12 @@ PlanView plan_view(const Plan &plan, const Sizes &sizes) {
   view.proxy_chunks = data_of<int64_t>(plan.proxy_chunks);
   view.proxy_ends = data_of<int64_t>(plan.proxy_ends);
   view.proxy_push_tables = data_of<int32_t>(plan.proxy_push_tables);
-  view.task_starts = data_of<int64_t>(plan.task_starts);
+  view.remote_task_offsets = data_of<int64_t>(plan.remote_task_offsets);
   view.num_chunks = data_of<int64_t>(plan.num_chunks);
   view.chunks = data_of<Chunk, int32_t>(plan.chunks);
   view.node_offset_per_bucket = data_of<int64_t>(plan.node_offset_per_bucket);
   view.put_list = data_of<PutSeg, int32_t>(plan.put_list);
-  view.put_starts = data_of<int32_t>(plan.put_starts);
+  view.put_offsets = data_of<int32_t>(plan.put_offsets);
   view.max_chunks = sizes.max_chunks;
   view.ring = sizes.num_proxy_rows;
   view.num_nodes = sizes.topo.num_nodes;
@@ -83,12 +83,12 @@ auto fwd_tensors(Plan &plan) -> std::vector<decltype(&plan.src)> {
           &plan.proxy_chunks,
           &plan.proxy_ends,
           &plan.proxy_push_tables,
-          &plan.task_starts,
+          &plan.remote_task_offsets,
           &plan.num_chunks,
           &plan.chunks,
           &plan.node_offset_per_bucket,
           &plan.put_list,
-          &plan.put_starts,
+          &plan.put_offsets,
           &plan.push_order_off,
           &plan.fwd_chunks,
           &plan.chunk_offset_per_bucket,
@@ -113,14 +113,14 @@ auto bwd_tensors(Plan &plan) -> std::vector<decltype(&plan.dst)> {
           &plan.proxy_chunks,
           &plan.proxy_ends,
           &plan.proxy_push_tables,
-          &plan.task_starts,
+          &plan.remote_task_offsets,
           &plan.num_chunks,
           &plan.chunks,
           &plan.node_offset_per_bucket,
           &plan.put_list,
-          &plan.put_starts,
+          &plan.put_offsets,
           &plan.node_length_per_source,
-          &plan.reduce_task_starts,
+          &plan.reduce_task_offsets,
           &plan.node_exp_off};
 }
 
@@ -159,7 +159,7 @@ BwdPlanView BwdPlan::view(const Sizes &sizes) const {
   static_cast<PlanView &>(view) = plan_view(*this, sizes);
   view.dst = data_of<int32_t>(dst);
   view.node_length_per_source = data_of<int64_t>(node_length_per_source);
-  view.reduce_task_starts = data_of<int64_t>(reduce_task_starts);
+  view.reduce_task_offsets = data_of<int64_t>(reduce_task_offsets);
   view.node_exp_off = data_of<int64_t>(node_exp_off);
   view.heavy_subs = heavy_subs;
   return view;

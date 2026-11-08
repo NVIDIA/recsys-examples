@@ -739,7 +739,7 @@ the planner's kernels, with CUB's sorts and scans.
 | `rail_key_push` | comm | its key records to its rail owners; it does not wait | 10.2 |
 | `node_status_exchange` | comm | the needs and `requester_offsets` of the node; the call's needs | 10.2 |
 | `peer_gather`, twice | comm (and a kernel) | the node's proxy headers, then the requester's gather list and its rows' `remote_map` words | 10.2, 10.4 |
-| requester tables | kernels, CUB | its maps, push order, push tables and task starts | 10.4 |
+| requester tables | kernels, CUB | its maps, push order, push tables and remote task offsets | 10.4 |
 | `rail_done` | comm | waits until every rail proxy's key records are in; flushes this rank's key puts | 10.2, 13 |
 | owner tables | kernels | its KJT's keys, and the chunks its forward put list sends | 10.4 |
 | put lists | kernels, CUB | the owner's forward and the proxy's backward put lists | 10.4 |
@@ -1279,7 +1279,7 @@ The layout, with `me` this rank's local rank:
   `[lookup_keys, lookup_keys + remote_keys)`, holds the keys of its node for
   the owners of its rail on the other nodes. They are requester after
   requester, then owner node, then feature, then position. In this rank's
-  remote part, requester `r`'s keys start at `requester_start[r]`, the sum
+  remote part, requester `r`'s keys start at `remote_offsets[r]`, the sum
   of `R(r', me)` over `r' < r`;
 * the node's needs: its largest own part (the most `own_total[t]`) and its
   largest remote part (the most, over `t`, of the sum of `R(r, t)` over
@@ -1458,7 +1458,7 @@ where the forward reads each key's row: a row of its owner's `lookup_rows`
 when the owner is on its node, else the key's row in its proxy's `proxy_rows`.
 `dst` is where the backward writes the row's gradient: the same row, or its
 own slot in `proxy_rows`. It also makes its rows in push order at each proxy,
-its push tables with absolute positions, and the task starts of each
+its push tables with absolute positions, and the remote task offsets of each
 (chunk, proxy), which the forward's pulls and the backward's pushes share.
 
 **The owner.** Its KJT has `num_sources = local_size + num_nodes − 1`
@@ -1576,14 +1576,14 @@ the gradients of the heavy rows (section 11.4).
   through typed pointers in the call: the forward's plan as it reads it
   (`FwdPlanView`, in `FwdArgs`) and the backward's (`BwdPlanView`, in
   `BwdArgs`). Each table is a tensor of a plan. Both read the requester's
-  block starts and maps, and across nodes its push order and its tables of
+  `offset_per_bucket` and maps, and across nodes its push order and its tables of
   the node's proxies (`proxy_chunks`, `proxy_ends`, `proxy_push_tables`,
-  `task_starts`), the proxy's chunks (`num_chunks`, `chunks`, `node_offset_per_bucket`)
-  and the put lists (`put_list`, `put_starts`). The forward also reads the
+  `remote_task_offsets`), the proxy's chunks (`num_chunks`, `chunks`, `node_offset_per_bucket`)
+  and the put lists (`put_list`, `put_offsets`). The forward also reads the
   requester's `src` and `push_order_off`, the owner's `fwd_chunks` and the
   proxy's `chunk_offset_per_bucket`, `chunk_inv` and `node_length_per_bucket`. The backward
   reads its `dst`, the owner's `node_length_per_source`, and the proxy's
-  `reduce_task_starts` and `node_exp_off`.
+  `reduce_task_offsets` and `node_exp_off`.
   Their strides are `max_chunks` and `num_nodes`. The call also holds what the op gives
   the kernel for it: the forward's output, the backward's gradient and its
   scratch (the heavy rows' sums and counts), across nodes the counts the
@@ -2050,7 +2050,7 @@ The capacities are the ones in place (section 5), and `row_bytes` and
 | `lookup_rows` | `row_bytes × lookup_keys` | persistent |
 | `proxy_rows` | `row_bytes × num_proxy_rows` (section 15.3) | persistent |
 | the requester's maps | 8 bytes per key on one node (`inv`, `src`), 16 across nodes (also `dst`, `push_order`) | per call |
-| the call's small tables across nodes: the requester's of the node's proxies and its task starts, the owner's and the proxy's (section 11.1) | about `24 × local_size × max_chunks + 48 × max_chunks + 16 × owner_chunks`, plus a few KB | per call |
+| the call's small tables across nodes: the requester's of the node's proxies and its remote task offsets, the owner's and the proxy's (section 11.1) | about `24 × local_size × max_chunks + 48 × max_chunks + 16 × owner_chunks`, plus a few KB | per call |
 | the owner's KJT values | `8 × lookup_keys` (12 with weights), from the input dist until the forward | per call |
 | the proxy's rows before each key (`node_exp_off`) | `8 × remote_keys` | per call |
 | the put lists and the ready counters | `24 × max_chunks + 16 × owner_chunks + 32 × num_nodes × num_features` | per call |
@@ -2185,7 +2185,7 @@ and so are the proxy's block tables while its node dedup runs (about
 `local_size` enters through `node_offsets` (a row per GPU of the node),
 and through the tables kept per GPU of the node: the proxy header's push
 tables, and per call the requester's tables of each proxy and the proxy's
-push starts of each requester. Two tables hold a count per (sender,
+`part_offsets` of each requester. Two tables hold a count per (sender,
 receiver, feature). The count messages hold one per (node, node, feature):
 each rail peer's node-unique keys per owner node and feature. `node_offsets`
 holds one per (GPU of the node, GPU, feature): the bucketize's
@@ -2529,7 +2529,7 @@ Paths from `corelib/dynamicemb`.
     * `planner.h`: the planner: the declarations of every step, and of the
       CUB calls in `cub.cu` (radix sorts and scans); `planner.cuh`: what the
       planner's kernels share (how they are launched, searches in sorted
-      tables, the starts of sorted runs, a CTA's scans). The bucketize is in
+      tables, the offsets of sorted runs, a CTA's scans). The bucketize is in
       `bucketize.cu` and the proxy in `proxy.cu` (with its node dedup's
       hash table, `Identities`, which takes index dedup's chained insert
       from `src/dedup_chain.cuh`, and the rounds of its chunks, cut by

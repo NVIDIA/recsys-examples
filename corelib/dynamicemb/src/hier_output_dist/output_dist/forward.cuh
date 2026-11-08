@@ -111,11 +111,11 @@ __device__ __forceinline__ void warp_copy_fanout(const char *src, int64_t dedup_
 //     the node's owners take these slots: the pulls keep NVLink busy while
 //     the sub-tasks write HBM;
 //   - remote (across nodes): the tasks of the node's proxies, chunk after
-//     chunk of their streams (task_starts): in a chunk each proxy's in its
-//     push order, 32 positions each, proxies in turn; then a slot per heavy
-//     row sub-task again, which those of rows of other nodes take. Taken
-//     before the pulls, they would hold warps waiting for rows to land while
-//     the pulls of rows that have landed wait behind them.
+//     chunk of their streams (remote_task_offsets): in a chunk each proxy's
+//     in its push order, 32 positions each, proxies in turn; then a slot per
+//     heavy row sub-task again, which those of rows of other nodes take.
+//     Taken before the pulls, they would hold warps waiting for rows to land
+//     while the pulls of rows that have landed wait behind them.
 // A warp takes the next remote task once its chunk has landed, else a local
 // task, so the pulls empty the proxies' rings as their rows land, while the
 // local rows fill the time between; the late sub-tasks wait for the local
@@ -246,11 +246,11 @@ __device__ __forceinline__ bool remote_pull_warp(const Sizes &sizes, int64_t seq
                                                  int64_t task, int lane, Pull &pull) {
   const FwdPlanView &plan = args.plan;
   const int local_size = sizes.topo.local_size, me = sizes.topo.local_rank;
-  const RemoteTask place(plan.task_starts, plan.max_chunks * local_size, task);
+  const RemoteTask place(plan.remote_task_offsets, plan.max_chunks * local_size, task);
   const int64_t chunk = place.entry / local_size;
   const int proxy = (int)((me + place.entry % local_size) % local_size);
-  const int64_t pos0 = plan.push_start(proxy, chunk) + place.nth * kTaskRows;
-  const int num_rows = (int)min((int64_t)kTaskRows, plan.push_start(proxy, chunk + 1) - pos0);
+  const int64_t pos0 = plan.push_offset(proxy, chunk) + place.nth * kTaskRows;
+  const int num_rows = (int)min((int64_t)kTaskRows, plan.push_offset(proxy, chunk + 1) - pos0);
   if (num_rows <= 0) return false;
   const char *src = nullptr;
   int64_t out_row = 0;
@@ -553,7 +553,7 @@ __device__ void OwnerIssuer::run(ncclWindow_t window, const ncclDevComm &dev, co
                    sizes.row_bytes,
                    sig_rows(node)};
   for (int proxy_node = lane; proxy_node < num_nodes; proxy_node += 32)
-    *layout.ctrl.put_at(proxy_node) = plan.fwd_puts(proxy_node);
+    *layout.ctrl.put_at(proxy_node) = plan.fwd_put_offset(proxy_node);
   put.fence();
   bool posted = false;  // this lane put rows
   Spin spin(sizes.timeout_ns);
@@ -563,7 +563,7 @@ __device__ void OwnerIssuer::run(ncclWindow_t window, const ncclDevComm &dev, co
       if (proxy_node == node) continue;
       int64_t *at = layout.ctrl.put_at(proxy_node);
       int64_t seg = *at;
-      const int64_t end = plan.fwd_puts(proxy_node + 1);
+      const int64_t end = plan.fwd_put_offset(proxy_node + 1);
       if (seg < end) {
         // the proxy's grant, once for the pass (relaxed: see above)
         const uint64_t grant = credits.read_relaxed(sig_grant(proxy_node));
@@ -754,7 +754,8 @@ __global__ void __launch_bounds__(kThreads, 1)
     const int64_t *local_offset_per_bucket = plan.offset_per_bucket + node * local_size;
     const LocalRows local_rows{local_offset_per_bucket, local_size, me};
     const int64_t rows = local_rows.count(), local = rows + heavy;
-    const int64_t remote = num_nodes > 1 ? plan.task_starts[plan.max_chunks * local_size] : 0;
+    const int64_t remote =
+        num_nodes > 1 ? plan.remote_task_offsets[plan.max_chunks * local_size] : 0;
     const int64_t late = num_nodes > 1 ? heavy : 0;
     const CtrlLayout ctrl = tables.layout().ctrl;
     ReadyFirst tasks{TaskQueue{ctrl.task(kQueueLocal)}, TaskQueue{ctrl.task(kQueueRemote)}, local,
@@ -765,7 +766,7 @@ __global__ void __launch_bounds__(kThreads, 1)
     int64_t landed_entry = -1;
     const auto ready = [&](int64_t next) {
       if (next >= remote) return false;
-      const RemoteTask place(plan.task_starts, plan.max_chunks * local_size, next);
+      const RemoteTask place(plan.remote_task_offsets, plan.max_chunks * local_size, next);
       if (place.entry == landed_entry) return true;
       const int proxy = (int)((me + place.entry % local_size) % local_size);
       if ((int64_t)ld_acquire_sys(tables.landed(proxy, place.entry / local_size)) < seq)

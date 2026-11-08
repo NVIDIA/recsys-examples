@@ -50,7 +50,7 @@ namespace py = pybind11;
 namespace {
 
 // The bucketize of a KJT (bucketize_keys), by name, with each owner's feature
-// offsets relative to its block (feature_start [world_size][num_features + 1]),
+// offsets relative to its block (feature_offsets [world_size][num_features + 1]),
 // which TorchRec's bucketize gives. The keys by owner are the KJT's keys
 // gathered at inv, widened to int64 with their sign. dist_types are the
 // rules' codes on the host, kCyclic or kHashedCyclic, the op's (it raises for
@@ -85,7 +85,7 @@ std::map<std::string, at::Tensor> bucketize_test(
       {"bucket_feature_of_row", bucketized.bucket_feature_of_row},
       {"offset_per_bucket_feature", bucketized.offset_per_bucket_feature},
       {"offset_per_bucket", bucketized.offset_per_bucket},
-      {"feature_start",
+      {"feature_offsets",
        (bucketized.offset_per_bucket_feature.unfold(0, num_features + 1, num_features) -
         bucketized.offset_per_bucket.narrow(0, 0, world_size).unsqueeze(1))
            .reshape({-1})},
@@ -123,7 +123,7 @@ Topo topo_of(int64_t num_nodes, int64_t local_size, int64_t node, int64_t local_
 
 // One rank of a node: its node layout (node_layout) on the node's offsets (node_offsets: int64
 // [local_size][world_size * num_features + 1], row r requester r's offset_per_bucket_feature, as
-// node_exchange gathers them), by name (requester_start and need_remote across nodes,
+// node_exchange gathers them), by name (remote_offsets and need_remote across nodes,
 // kjt_offsets and length_per_key on one node). On one node, given the own part of its node_keys
 // once every requester pushed (node_keys, and node_key_weights with weights: [lookup_keys]) and
 // the src its own push wrote, also its KJT and src (one_node_owner).
@@ -147,7 +147,7 @@ std::map<std::string, at::Tensor> node_layout_test(at::Tensor node_offsets, int6
                                           {"skip", layout.skip},
                                           {"row_shift", layout.row_shift}};
   if (num_nodes > 1) {
-    named["requester_start"] = layout.requester_start;
+    named["remote_offsets"] = layout.remote_offsets;
     named["need_remote"] = layout.need_remote;
   } else {
     named["kjt_offsets"] = layout.kjt_offsets;
@@ -257,7 +257,7 @@ Sizes plan_sizes(const std::map<std::string, int64_t> &named) {
 // proxy_chunks_and_slots, proxy_push_order) on its remote part (node_keys,
 // node_key_weights, node_bucket_feature_of_row: what those buffers hold
 // past lookup_keys; weights exactly with 16-byte
-// records) and what the node layout says of it (requester_start, skip,
+// records) and what the node layout says of it (remote_offsets, skip,
 // need_remote, own_total: its own part, own_lengths: its own part's lengths
 // [feature][requester]), and the count message it sends its rail
 // (count_message), by name. It writes remote_map, key_stage and
@@ -267,7 +267,7 @@ Sizes plan_sizes(const std::map<std::string, int64_t> &named) {
 // reference.
 std::map<std::string, at::Tensor> proxy_plan_test(
     at::Tensor node_keys, c10::optional<at::Tensor> node_key_weights,
-    at::Tensor node_bucket_feature_of_row, at::Tensor requester_start, at::Tensor skip,
+    at::Tensor node_bucket_feature_of_row, at::Tensor remote_offsets, at::Tensor skip,
     at::Tensor tables, at::Tensor need_remote, at::Tensor own_total, at::Tensor own_lengths,
     at::Tensor remote_map, at::Tensor key_stage, at::Tensor proxy_header, bool node_dedup,
     std::map<std::string, int64_t> named_sizes) {
@@ -282,7 +282,7 @@ std::map<std::string, at::Tensor> proxy_plan_test(
           (!node_key_weights.has_value() ||
            is_cuda_array(*node_key_weights, at::kFloat, entries)) &&
           is_cuda_array(node_bucket_feature_of_row, at::kInt, entries) &&
-          is_cuda_array(requester_start, at::kLong, local_size + 1) &&
+          is_cuda_array(remote_offsets, at::kLong, local_size + 1) &&
           is_cuda_array(skip, at::kBool, 1) && is_cuda_array(tables, at::kInt, num_features) &&
           is_cuda_array(need_remote, at::kLong, 1) && is_cuda_array(own_total, at::kLong, 1) &&
           is_cuda_array(own_lengths, at::kLong, num_features * local_size) &&
@@ -294,7 +294,7 @@ std::map<std::string, at::Tensor> proxy_plan_test(
   const ProxyInput input{node_keys,
                          node_key_weights.has_value() ? *node_key_weights : at::Tensor(),
                          node_bucket_feature_of_row,
-                         requester_start,
+                         remote_offsets,
                          skip.reshape({}),
                          tables};
   header.base = proxy_header.data_ptr<int32_t>();
@@ -302,9 +302,9 @@ std::map<std::string, at::Tensor> proxy_plan_test(
                                              key_stage, header, proxy_header.options());
   ProxyKeys proxy = proxy_keys(input, sizes, node_dedup);
   const at::Tensor node_reverse_indices = proxy.node_reverse_indices;  // the push order drops it
-  ProxyChunks chunks = proxy_chunks_and_slots(proxy, requester_start, buffers, sizes);
+  ProxyChunks chunks = proxy_chunks_and_slots(proxy, remote_offsets, buffers, sizes);
   const ProxyPlan plan =
-      proxy_push_order(std::move(proxy), std::move(chunks), requester_start, buffers, sizes);
+      proxy_push_order(std::move(proxy), std::move(chunks), remote_offsets, buffers, sizes);
   return {{"num_chunks", plan.num_chunks},
           {"occurrence_count", plan.occurrence_count},
           {"key_rows", plan.key_rows},
@@ -316,7 +316,7 @@ std::map<std::string, at::Tensor> proxy_plan_test(
           {"chunk_offset_per_bucket", plan.chunk_offset_per_bucket},
           {"chunk_inv", plan.chunk_inv},
           {"stage_offset_per_bucket", plan.stage_offset_per_bucket},
-          {"reduce_task_starts", plan.reduce_task_starts},
+          {"reduce_task_offsets", plan.reduce_task_offsets},
           {"node_exp_off", plan.node_exp_off},
           {"message", count_message(need_remote.reshape({}), own_total.reshape({}), plan.key_rows,
                                     plan.chunk_length_per_bucket, own_lengths,
@@ -386,14 +386,14 @@ std::map<std::string, at::Tensor> rail_tables_test(
                      other_nodes_of(sizes.topo, messages.options()), sizes);
     const PutLists lists = put_lists(
         chunks.view({max_chunks, 8}), chunk_offset_per_bucket, chunk_inv, node_offset_per_bucket,
-        node_length_per_bucket_feature, rail.owner_offsets, owner.fwd_chunks, owner.fwd_chunk_start,
-        rail.node_length_per_source_feature, rail.source_offsets, sizes);
+        node_length_per_bucket_feature, rail.owner_offsets, owner.fwd_chunks,
+        owner.fwd_chunk_offsets, rail.node_length_per_source_feature, rail.source_offsets, sizes);
     named["kjt_values"] = owner.kjt_values;
     if (owner.kjt_weights.defined()) named["kjt_weights"] = owner.kjt_weights;
     named["fwd_chunks"] = owner.fwd_chunks;
-    named["fwd_chunk_start"] = owner.fwd_chunk_start;
+    named["fwd_chunk_offsets"] = owner.fwd_chunk_offsets;
     named["put_list"] = lists.list;
-    named["put_starts"] = lists.starts;
+    named["put_offsets"] = lists.offsets;
   }
   return named;
 }
@@ -453,7 +453,7 @@ std::map<std::string, at::Tensor> requester_tables_test(
           {"proxy_push_tables", tables.proxy_push_tables},
           {"proxy_chunks", tables.proxy_chunks},
           {"proxy_ends", tables.proxy_ends},
-          {"task_starts", tables.task_starts}};
+          {"remote_task_offsets", tables.remote_task_offsets}};
 }
 
 // Benchmark tracing: this GPU's %globaltimer into out[index], on the current
@@ -520,7 +520,7 @@ void bind_testing(py::module &py_module) {
                 "One proxy's steps of a call across nodes on plain tensors, which it writes as "
                 "its buffers of the window, and the count message its rank sends its rail, by name",
                 py::arg("node_keys"), py::arg("node_key_weights"),
-                py::arg("node_bucket_feature_of_row"), py::arg("requester_start"), py::arg("skip"),
+                py::arg("node_bucket_feature_of_row"), py::arg("remote_offsets"), py::arg("skip"),
                 py::arg("tables"), py::arg("need_remote"), py::arg("own_total"),
                 py::arg("own_lengths"), py::arg("remote_map"), py::arg("key_stage"),
                 py::arg("proxy_header"), py::arg("node_dedup"), py::arg("sizes"));

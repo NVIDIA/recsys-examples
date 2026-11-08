@@ -15,7 +15,7 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 # limitations under the License.
 ******************************************************************************/
 // What the planner's kernels share (planner.h's steps, in the .cu files of
-// this folder): how they are launched, searches in sorted tables, the starts
+// this folder): how they are launched, searches in sorted tables, the offsets
 // of the runs of a sorted table, and a CTA's scans and reductions.
 //
 // A step's kernels are of two kinds. A kernel over items (keys, rows,
@@ -120,42 +120,42 @@ __device__ __forceinline__ int64_t upper_bound(const T *table, int64_t n, V valu
   return lo;
 }
 
-// ── the starts of sorted runs ──
+// ── the offsets of sorted runs ──
 
-// The starts of the runs of `sorted` (n values in [0, buckets], ascending),
-// a thread per bucket in [0, buckets]: start[bucket] is the first position
+// The offsets of the runs of `sorted` (n values in [0, buckets], ascending),
+// a thread per bucket in [0, buckets]: offsets[bucket] is the first position
 // whose value is at least `bucket` (n when none is), by a search. Every
-// stride-th start also goes to coarse[bucket / stride] (coarse nullptr:
+// stride-th offset also goes to coarse[bucket / stride] (coarse nullptr:
 // none).
-template <typename Value, typename Start>
+template <typename Value, typename Offset>
 __global__ void __launch_bounds__(kThreads)
-    run_starts_kernel(const Value *sorted, int64_t n, int64_t buckets, Start *start, int64_t stride,
-                      Start *coarse) {
+    run_offsets_kernel(const Value *sorted, int64_t n, int64_t buckets, Offset *offsets,
+                       int64_t stride, Offset *coarse) {
   for (int64_t bucket = first_item(); bucket <= buckets; bucket += item_stride()) {
-    const Start position = (Start)lower_bound(sorted, n, bucket);
-    start[bucket] = position;
+    const Offset position = (Offset)lower_bound(sorted, n, bucket);
+    offsets[bucket] = position;
     if (coarse != nullptr && bucket % stride == 0) coarse[bucket / stride] = position;
   }
 }
-// start: buckets + 1 entries; coarse: buckets / stride + 1, or undefined.
-template <typename Value, typename Start>
-void run_starts(const at::Tensor &sorted, int64_t buckets, const at::Tensor &start,
-                int64_t stride = 1, const at::Tensor &coarse = at::Tensor()) {
+// offsets: buckets + 1 entries; coarse: buckets / stride + 1, or undefined.
+template <typename Value, typename Offset>
+void run_offsets(const at::Tensor &sorted, int64_t buckets, const at::Tensor &offsets,
+                 int64_t stride = 1, const at::Tensor &coarse = at::Tensor()) {
   const int64_t n = sorted.numel();
-  run_starts_kernel<<<item_grid(buckets + 1), kThreads, 0, current_stream()>>>(
-      sorted.data_ptr<Value>(), n, buckets, start.data_ptr<Start>(), stride,
-      data_or_null<Start>(coarse));
+  run_offsets_kernel<<<item_grid(buckets + 1), kThreads, 0, current_stream()>>>(
+      sorted.data_ptr<Value>(), n, buckets, offsets.data_ptr<Offset>(), stride,
+      data_or_null<Offset>(coarse));
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
 // ── a CTA's scans and reductions (kernels of one CTA of kThreads) ──
 
-// Every thread of the CTA: ends[index] = value(0) + ... + value(index - 1)
+// Every thread of the CTA: offsets[index] = value(0) + ... + value(index - 1)
 // for every index in [0, n], n + 1 entries, a tile of kThreads values at a
 // time; value(index) is called once for each index below n. Returns the
 // total to every thread.
 template <typename T, typename Value>
-__device__ T cta_exclusive_ends(int64_t n, Value value, T *ends) {
+__device__ T cta_offsets_of(int64_t n, Value value, T *offsets) {
   using Scan = cub::BlockScan<T, kThreads>;
   __shared__ typename Scan::TempStorage scan;
   __shared__ T carry;
@@ -165,13 +165,13 @@ __device__ T cta_exclusive_ends(int64_t n, Value value, T *ends) {
     const int64_t index = first + threadIdx.x;
     T before, total;
     Scan(scan).ExclusiveSum(index < n ? (T)value(index) : (T)0, before, total);
-    if (index < n) ends[index] = carry + before;
+    if (index < n) offsets[index] = carry + before;
     __syncthreads();
     if (threadIdx.x == 0) carry += total;
     __syncthreads();
   }
   const T total = carry;
-  if (threadIdx.x == 0) ends[n] = total;
+  if (threadIdx.x == 0) offsets[n] = total;
   __syncthreads();
   return total;
 }

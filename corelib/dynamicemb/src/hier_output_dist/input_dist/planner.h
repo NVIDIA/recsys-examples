@@ -47,9 +47,9 @@ std::pair<at::Tensor, at::Tensor> sort_pairs(const at::Tensor &keys, const at::T
                                              int end_bit);
 // A sort of int64 keys (not negative) by their bits [0, end_bit).
 at::Tensor sort_keys(const at::Tensor &keys, int end_bit);
-// The ends of n counts (bool, int32 or int64), [0, c0, c0 + c1, ...]: n + 1
+// The offsets of n counts (bool, int32 or int64), [0, c0, c0 + c1, ...]: n + 1
 // entries, int64 (or int32 when their sum stays below 2^31).
-at::Tensor exclusive_ends(const at::Tensor &counts, at::ScalarType dtype = at::kLong);
+at::Tensor offsets_of(const at::Tensor &counts, at::ScalarType dtype = at::kLong);
 
 // The bucketize of a call (the requester's, local, on the caller's stream):
 // its keys by owner, as TorchRec's bucketize orders them, and the fan-out of
@@ -152,32 +152,32 @@ FanoutTables fanout_tables(const at::Tensor &reverse_indices, const at::Tensor &
 // then owner node, then [feature][position].
 
 // The layout of the node's keys, from the node's offsets. Under a need above a capacity no rank
-// of the node pushes (skip). One node has no remote part: there requester_start and need_remote
+// of the node pushes (skip). One node has no remote part: there remote_offsets and need_remote
 // stay undefined. Across nodes kjt_offsets and length_per_key stay undefined.
 struct NodeLayout {
-  at::Tensor own_lengths;      // int64 [num_features * local_size]: keys of each (feature,
-                               // requester) in this rank's own part
-  at::Tensor own_offsets;      // int64 [num_features * local_size]: where each one
-                               // starts there
-  at::Tensor own_total;        // int64 [local_size]: each owner's own part
-  at::Tensor requester_start;  // int64 [local_size + 1]: where each requester's keys start in
-                               // this rank's remote part
-  at::Tensor need_lookup;      // int64 0-dim: the largest own part of the node
-  at::Tensor need_remote;      // int64 0-dim: the largest remote part of the node
-  at::Tensor skip;             // bool 0-dim: a need above its capacity
-  at::Tensor row_shift;        // int64 [world_size * num_features + 1]: bucketized row `row`
-                               // goes to row + row_shift[bucket_feature_of_row[row]] in
-                               // node_keys of its target: where this rank's rows of the
-                               // bucket feature start there, less where they start among its
-                               // rows (offset_per_bucket_feature)
-  at::Tensor kjt_offsets;      // (one node) int64 [num_features * local_size + 1]
-  at::Tensor length_per_key;   // (one node) int64 [num_features]
+  at::Tensor own_lengths;     // int64 [num_features * local_size]: keys of each (feature,
+                              // requester) in this rank's own part
+  at::Tensor own_offsets;     // int64 [num_features * local_size]: where each one
+                              // starts there
+  at::Tensor own_total;       // int64 [local_size]: each owner's own part
+  at::Tensor remote_offsets;  // int64 [local_size + 1]: where each requester's keys start in
+                              // this rank's remote part
+  at::Tensor need_lookup;     // int64 0-dim: the largest own part of the node
+  at::Tensor need_remote;     // int64 0-dim: the largest remote part of the node
+  at::Tensor skip;            // bool 0-dim: a need above its capacity
+  at::Tensor row_shift;       // int64 [world_size * num_features + 1]: bucketized row `row`
+                              // goes to row + row_shift[bucket_feature_of_row[row]] in
+                              // node_keys of its target: where this rank's rows of the
+                              // bucket feature start there, less where they start among its
+                              // rows (offset_per_bucket_feature)
+  at::Tensor kjt_offsets;     // (one node) int64 [num_features * local_size + 1]
+  at::Tensor length_per_key;  // (one node) int64 [num_features]
 };
 // The layout as node_exchange makes it, from the node's offsets (node_offsets: int64
 // [local_size][world_size * num_features + 1], row r requester r's offset_per_bucket_feature).
 NodeLayout node_layout(const at::Tensor &node_offsets, const Topo &topo, int64_t num_features,
                        int64_t lookup_keys, int64_t remote_keys);
-// The tensors of a NodeLayout, empty: requester_start and need_remote across nodes, kjt_offsets
+// The tensors of a NodeLayout, empty: remote_offsets and need_remote across nodes, kjt_offsets
 // and length_per_key on one node.
 NodeLayout empty_node_layout(const Topo &topo, int64_t num_features,
                              const at::TensorOptions &options);
@@ -245,7 +245,7 @@ struct ProxyInput {
   at::Tensor node_key_weights;            // fp32 [remote_keys]: their weights, or undefined
   at::Tensor node_bucket_feature_of_row;  // int32 [remote_keys]: owner node * num_features +
                                           // feature of each
-  at::Tensor requester_start;             // int64 [local_size + 1]: each requester's occurrences
+  at::Tensor remote_offsets;              // int64 [local_size + 1]: each requester's occurrences
   at::Tensor skip;                        // bool 0-dim: the node skips the call (it pushed nothing)
   at::Tensor tables;  // int32 [num_features]: the table of each feature, numbered
                       // densely (dense_tables)
@@ -322,12 +322,12 @@ struct ProxyChunks {
                          // places in the stream
   at::Tensor stage_offset_per_bucket;  // int64 [num_nodes]: where its slice for each owner node
                                        // starts in key_stage (bytes)
-  at::Tensor reduce_task_starts;  // int64 [max_chunks + 1]: the reducers' tasks before each chunk
-  at::Tensor node_exp_off;        // int64 [remote_keys + 1]: the rows before each key
-  at::Tensor key_chunk;           // int32 [remote_keys]: the chunk of each key
-  at::Tensor requester_of;        // int32 [remote_keys]: the requester of each occurrence
+  at::Tensor reduce_task_offsets;  // int64 [max_chunks + 1]: the reducers' tasks before each chunk
+  at::Tensor node_exp_off;         // int64 [remote_keys + 1]: the rows before each key
+  at::Tensor key_chunk;            // int32 [remote_keys]: the chunk of each key
+  at::Tensor requester_of;         // int32 [remote_keys]: the requester of each occurrence
 };
-ProxyChunks proxy_chunks_and_slots(ProxyKeys &keys, const at::Tensor &requester_start,
+ProxyChunks proxy_chunks_and_slots(ProxyKeys &keys, const at::Tensor &remote_offsets,
                                    const ProxyBuffers &buffers, const Sizes &sizes);
 
 // What the call keeps of the proxy.
@@ -343,16 +343,16 @@ struct ProxyPlan {
   at::Tensor chunk_offset_per_bucket;         // int64 [num_nodes + 1]
   at::Tensor chunk_inv;                       // int32 [max_chunks]
   at::Tensor stage_offset_per_bucket;         // int64 [num_nodes]
-  at::Tensor reduce_task_starts;  // int64 [max_chunks + 1]: its reducers' tasks before each chunk
-                                  // (32 keys each)
-  at::Tensor node_exp_off;        // int64 [remote_keys + 1]: the rows before each key
-                                  // (ProxyChunks::node_exp_off): key u's are its key row, then its
-                                  // duplicates' slots in order
+  at::Tensor reduce_task_offsets;  // int64 [max_chunks + 1]: its reducers' tasks before each chunk
+                                   // (32 keys each)
+  at::Tensor node_exp_off;         // int64 [remote_keys + 1]: the rows before each key
+                                   // (ProxyChunks::node_exp_off): key u's are its key row, then its
+                                   // duplicates' slots in order
 };
 // Step 3: each requester's push order (one stable sort by its part, a
 // requester and a chunk) and its push tables. Writes remote_map's positions
 // and the proxy header's push tables.
-ProxyPlan proxy_push_order(ProxyKeys keys, ProxyChunks chunks, const at::Tensor &requester_start,
+ProxyPlan proxy_push_order(ProxyKeys keys, ProxyChunks chunks, const at::Tensor &remote_offsets,
                            const ProxyBuffers &buffers, const Sizes &sizes);
 
 // The rail's part of a call across nodes (the in channel). A rank's rail is the
@@ -435,13 +435,13 @@ RailLayout empty_rail_layout(const Sizes &sizes, const at::TensorOptions &option
 // part of its node_keys (node_keys, node_key_weights: views of [lookup_keys];
 // node_key_weights undefined when the keys carry none).
 struct OwnerTables {
-  at::Tensor kjt_values;       // int64 [lookup_keys]: the first num_recv are its KJT's keys
-  at::Tensor kjt_weights;      // fp32 [lookup_keys]: their weights, or undefined (8-byte
-                               // records)
-  at::Tensor fwd_chunks;       // int32 [owner_chunks][4]: what its forward put list sends, the
-                               // chunks of its node in each source node's stream (ChunkPiece,
-                               // first in its slice), source node after source node
-  at::Tensor fwd_chunk_start;  // int64 [num_nodes + 1]: where each source node's start there
+  at::Tensor kjt_values;         // int64 [lookup_keys]: the first num_recv are its KJT's keys
+  at::Tensor kjt_weights;        // fp32 [lookup_keys]: their weights, or undefined (8-byte
+                                 // records)
+  at::Tensor fwd_chunks;         // int32 [owner_chunks][4]: what its forward put list sends, the
+                                 // chunks of its node in each source node's stream (ChunkPiece,
+                                 // first in its slice), source node after source node
+  at::Tensor fwd_chunk_offsets;  // int64 [num_nodes + 1]: where each source node's start there
 };
 OwnerTables owner_tables(const RailLayout &rail, const at::Tensor &own_offsets,
                          const at::Tensor &node_keys, const at::Tensor &node_key_weights,
@@ -484,9 +484,9 @@ struct RequesterTables {
   at::Tensor proxy_chunks;       // int64 [local_size]: the chunks of each proxy's stream
   at::Tensor proxy_ends;         // int64 [local_size][max_chunks + 1]: each proxy's chunk ends,
                                  // then its stream's end (past num_proxy_rows when it wraps)
-  at::Tensor task_starts;        // int64 [max_chunks * local_size + 1]: its tasks of rows of other
-                                 // nodes before each (chunk, proxy in turn), the forward's pulls
-                                 // and the backward's pushes alike
+  at::Tensor remote_task_offsets;  // int64 [max_chunks * local_size + 1]: its tasks of rows of
+                                   // other nodes before each (chunk, proxy in turn), the forward's
+                                   // pulls and the backward's pushes alike
 };
 // words: int32 [3][bucket_feature_of_row.numel()], the remote_map words of its
 // rows (remote_rows' gather; rows of its node's owners and past the valid rows
@@ -516,21 +516,21 @@ struct PutLists {
       list;  // int32 [bound][4]: PutSeg {src, dst, rows, chunk}; the backward's src is a
              // row of proxy_rows, its dst a row of the owner's KJT and its chunk the
              // proxy's; the forward's the other way round, its chunk one of the owner's fwd_chunks
-  at::Tensor starts;  // int32 [2 * num_nodes + 1]: where each node's segments start
+  at::Tensor offsets;  // int32 [2 * num_nodes + 1]: where each node's segments start
 };
 // The backward list from the proxy's chunks (chunks, chunk_offset_per_bucket,
 // chunk_inv: ProxyChunks'), its node-unique keys per (owner node, feature)
 // and where its keys of each feature start in each rail owner's KJT
 // (owner_offsets, int64 [num_nodes][num_features]: the rail layout's, the
 // owners' source_offsets). The forward list from the chunks of this owner's
-// node in each source node's stream (fwd_chunks, fwd_chunk_start:
+// node in each source node's stream (fwd_chunks, fwd_chunk_offsets:
 // OwnerTables'), its keys per feature (node_length_per_source_feature) and
 // where those keys start in the owner's KJT (source_offsets).
 PutLists put_lists(const at::Tensor &chunks, const at::Tensor &chunk_offset_per_bucket,
                    const at::Tensor &chunk_inv, const at::Tensor &node_offset_per_bucket,
                    const at::Tensor &node_length_per_bucket_feature,
                    const at::Tensor &owner_offsets, const at::Tensor &fwd_chunks,
-                   const at::Tensor &fwd_chunk_start,
+                   const at::Tensor &fwd_chunk_offsets,
                    const at::Tensor &node_length_per_source_feature,
                    const at::Tensor &source_offsets, const Sizes &sizes);
 

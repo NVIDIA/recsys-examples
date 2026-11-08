@@ -49,11 +49,11 @@ windows hold garbage before the call. The checks:
   bucket feature against a dedup by merge ranks (each key's bucket feature
   that of its occurrence of least merge rank), as equal sets;
 * each requester's maps (its node's owners' KJT places, its keys' rows and
-  slots at its proxies), push order, push tables and task starts; and per
-  node a backward with integer gradients through the requesters' push tasks
-  (each counting its rows in its chunk's pushed_rows, which must reach the
-  chunk's rows once every row is in) and the proxies' reducers, each key's
-  rows its key row and then its duplicates' slots;
+  slots at its proxies), push order, push tables and remote task offsets;
+  and per node a backward with integer gradients through the requesters'
+  push tasks (each counting its rows in its chunk's pushed_rows, which must
+  reach the chunk's rows once every row is in) and the proxies' reducers,
+  each key's rows its key row and then its duplicates' slots;
 * the rail: each proxy's slices start where its owners' offsets say; each
   owner's KJT offsets of each other node's features (source_offsets), and
   each proxy's of its node's features at each owner (owner_offsets) equal to
@@ -832,24 +832,24 @@ def proxy_reference(case: Case, occurrences: List, node: int, remote_keys: int) 
         chunk_keys.append((first + lo, hi - lo))
         chunk_rows.append(row_scan[first + hi] - row_scan[first + lo])
         chunk_counted.append(counted_off[first + hi] - counted_off[first + lo])
-    ends = list(accumulate([0] + chunk_rows))
-    total, lap_span = ends[-1], ring - case.slot_rows + 1
-    starts = []
+    stream_offsets = list(accumulate([0] + chunk_rows))
+    total, lap_span = stream_offsets[-1], ring - case.slot_rows + 1
+    offsets = []
     for chunk in range(num_chunks):
         if total <= ring:
-            starts.append(ends[chunk])
+            offsets.append(stream_offsets[chunk])
         else:
-            lap = ends[chunk] // lap_span
-            first = bisect_left(ends, lap * lap_span, 0, num_chunks)
-            starts.append(lap * ring + ends[chunk] - ends[first])
-    stream_end = starts[-1] + chunk_rows[-1] if num_chunks else 0
+            lap = stream_offsets[chunk] // lap_span
+            first = bisect_left(stream_offsets, lap * lap_span, 0, num_chunks)
+            offsets.append(lap * ring + stream_offsets[chunk] - stream_offsets[first])
+    stream_end = offsets[-1] + chunk_rows[-1] if num_chunks else 0
     table = [[0] * 8 for _ in range(capacity)]
     chunk_offset_per_bucket = list(accumulate([0] + chunk_length_per_bucket))
     chunk_inv = [0] * chunk_offset_per_bucket[-1]
     chunk_of, key_row, duplicate_base = ([0] * node_num_uniques for _ in range(3))
     for chunk, (owner_node, j) in enumerate(stream):
         key_lo, num = chunk_keys[chunk]
-        start, end = starts[chunk], starts[chunk] + chunk_rows[chunk]
+        start, end = offsets[chunk], offsets[chunk] + chunk_rows[chunk]
         pulls = occurrence_scan[key_lo + num] - occurrence_scan[key_lo]
         table[chunk] = [owner_node, key_lo, num, pulls, start, end, j, 0]
         chunk_inv[chunk_offset_per_bucket[owner_node] + j] = chunk
@@ -932,7 +932,7 @@ def proxy_reference(case: Case, occurrences: List, node: int, remote_keys: int) 
         push_tables=push_tables,
         node_exp_off=node_exp_off,
         records=records,
-        reduce_task_starts=list(
+        reduce_task_offsets=list(
             accumulate([0] + [ceil32(table[chunk][2]) for chunk in range(capacity)])
         ),
         stage_offset_per_bucket=[
@@ -1000,25 +1000,25 @@ def segments_reference(case: Case, chunks, lengths, kjt_offsets):
     kjt_offsets[node][feature]: the owner's KJT row of the first of them.
     Returns the segments [src, dst, rows, chunk] and where each node's start,
     [2 * num_nodes + 1]."""
-    segments, starts = [], []
+    segments, offsets = [], []
     for node in range(2 * case.num_nodes):
-        starts.append(len(segments))
-        feature_ends = list(accumulate([0] + list(lengths[node])))
+        offsets.append(len(segments))
+        feature_offsets = list(accumulate([0] + list(lengths[node])))
         for lo, hi, row, number in chunks[node]:
             cuts = sorted(
-                set([lo, hi] + [end for end in feature_ends if lo < end < hi])
+                set([lo, hi] + [end for end in feature_offsets if lo < end < hi])
             )
             for first, last in zip(cuts, cuts[1:]):
-                feature = bisect_right(feature_ends, first) - 1
+                feature = bisect_right(feature_offsets, first) - 1
                 chunk_row = row + first - lo
-                kjt_row = kjt_offsets[node][feature] + first - feature_ends[feature]
+                kjt_row = kjt_offsets[node][feature] + first - feature_offsets[feature]
                 segments.append(
                     [kjt_row, chunk_row, last - first, number]
                     if node >= case.num_nodes
                     else [chunk_row, kjt_row, last - first, number]
                 )
-    starts.append(len(segments))
-    return segments, starts
+    offsets.append(len(segments))
+    return segments, offsets
 
 
 # ── the call ─────────────────────────────────────────────────────────────────
@@ -1114,7 +1114,7 @@ def run_call(
                 window["node_keys"][lookup_keys:],
                 window["node_key_weights"][lookup_keys:] if case.weights else None,
                 window["node_bucket_feature_of_row"],
-                layout["requester_start"],
+                layout["remote_offsets"],
                 layout["skip"],
                 tables,
                 layout["need_remote"],
@@ -1303,9 +1303,9 @@ def check_proxy(
         ref["chunk_inv"],
     )
     expect(
-        "reduce_task_starts",
-        out["reduce_task_starts"].tolist(),
-        ref["reduce_task_starts"],
+        "reduce_task_offsets",
+        out["reduce_task_offsets"].tolist(),
+        ref["reduce_task_offsets"],
     )
     words = window["remote_map"].view(3, -1)[:, :num_occurrences].long().cpu()
     expect("key rows", words[0].tolist(), ref["word0"])
@@ -1382,7 +1382,7 @@ def check_proxy(
     )
     # the rows before each key
     expect(
-        "reducer starts",
+        "node_exp_off",
         out["node_exp_off"][: node_num_uniques + 1].tolist(),
         ref["node_exp_off"],
     )
@@ -1470,17 +1470,19 @@ def check_requester(
             for proxy in range(local_size)
         ],
     )
-    # task starts: chunk after chunk, the proxies in turn from its own one,
-    # 32 positions a task
-    task_starts = [0]
+    # remote task offsets: chunk after chunk, the proxies in turn from its own
+    # one, 32 positions a task
+    remote_task_offsets = [0]
     for chunk in range(capacity):
         for turn in range(local_size):
             proxy = (local_rank + turn) % local_size
             tasks = 0
             if chunk < refs[(node, proxy)]["num_chunks"]:
                 tasks = ceil32(tables[proxy][chunk + 1] - tables[proxy][chunk])
-            task_starts.append(task_starts[-1] + tasks)
-    expect("task_starts", out["task_starts"].tolist(), task_starts)
+            remote_task_offsets.append(remote_task_offsets[-1] + tasks)
+    expect(
+        "remote_task_offsets", out["remote_task_offsets"].tolist(), remote_task_offsets
+    )
     return problems
 
 
@@ -1655,7 +1657,7 @@ def check_owner(case: Case, rank: int, ranks: List[Dict], refs: Dict, out: Dict)
 
     lengths, keys, weights = [], [], []
     # where the feature's keys start in each other node's keys for this node
-    feature_start = {other_node: 0 for other_node in others}
+    feature_offsets = {other_node: 0 for other_node in others}
     for feature in range(num_features):
         bucket_feature = rank * num_features + feature
         for requester in range(local_size):
@@ -1671,8 +1673,8 @@ def check_owner(case: Case, rank: int, ranks: List[Dict], refs: Dict, out: Dict)
         for other_node in others:
             ref = refs[(other_node, rail)]
             count = ref["node_length_per_bucket_feature"][node * num_features + feature]
-            first = ref["node_offset_per_bucket"][node] + feature_start[other_node]
-            feature_start[other_node] += count
+            first = ref["node_offset_per_bucket"][node] + feature_offsets[other_node]
+            feature_offsets[other_node] += count
             lengths.append(count)
             keys += [key for key, _ in ref["records"][first : first + count]]
             weights += [weight for _, weight in ref["records"][first : first + count]]
@@ -1741,13 +1743,13 @@ def check_put_lists(case: Case, rank: int, refs: Dict, out: Dict, owner_offsets)
         for owner_node in range(num_nodes)
     ]
     kjt_offsets = list(owner_offsets)
-    fwd_chunks, fwd_chunk_start = [], [0]
+    fwd_chunks, fwd_chunk_offsets = [], [0]
     for source in range(num_nodes):
         if source == node:
             chunks.append([])
             lengths.append([0] * num_features)
             kjt_offsets.append([0] * num_features)
-            fwd_chunk_start.append(len(fwd_chunks))
+            fwd_chunk_offsets.append(len(fwd_chunks))
             continue
         source_ref = refs[(source, rail)]
         column = source if source < node else source - 1
@@ -1759,7 +1761,7 @@ def check_put_lists(case: Case, rank: int, refs: Dict, out: Dict, owner_offsets)
             ]
         )
         fwd_chunks += [[lo, hi, start, end] for lo, hi, start, end, _ in got]
-        fwd_chunk_start.append(len(fwd_chunks))
+        fwd_chunk_offsets.append(len(fwd_chunks))
         lengths.append(
             source_ref["node_length_per_bucket_feature"][node * num_features :][
                 :num_features
@@ -1771,17 +1773,17 @@ def check_put_lists(case: Case, rank: int, refs: Dict, out: Dict, owner_offsets)
                 for feature in range(num_features)
             ]
         )
-    segments, starts = segments_reference(case, chunks, lengths, kjt_offsets)
+    segments, put_offsets = segments_reference(case, chunks, lengths, kjt_offsets)
     problems = []
     got_chunks = out["fwd_chunks"][: len(fwd_chunks)].tolist()
     if [row[:2] + u32(row[2:]) for row in got_chunks] != fwd_chunks:
         problems.append("fwd_chunks")
-    if out["fwd_chunk_start"].tolist() != fwd_chunk_start:
-        problems.append("fwd_chunk_start")
+    if out["fwd_chunk_offsets"].tolist() != fwd_chunk_offsets:
+        problems.append("fwd_chunk_offsets")
     if out["put_list"][: len(segments)].tolist() != segments:
         problems.append("put list")
-    if out["put_starts"].tolist() != starts:
-        problems.append("put starts")
+    if out["put_offsets"].tolist() != put_offsets:
+        problems.append("put offsets")
     return problems
 
 

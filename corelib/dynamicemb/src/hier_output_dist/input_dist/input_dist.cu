@@ -93,16 +93,16 @@ InChannel::InChannel(const Config &config, const Sizes &sizes, ncclWindow_t wind
   const KeysLayout &keys = layout.keys;
   const int64_t lookup_keys = sizes_.lookup_keys, remote_keys = sizes_.remote_keys;
   const at::Tensor node_keys = view(keys.node_keys(), {lookup_keys + remote_keys}, at::kLong);
-  own_node_keys_ = node_keys.narrow(0, 0, keys.remote_start());
+  own_node_keys_ = node_keys.narrow(0, 0, keys.remote_offset());
   at::Tensor node_key_weights;
   if (config.weights) {
     node_key_weights = view(keys.node_key_weights(), {lookup_keys + remote_keys}, at::kFloat);
-    own_node_key_weights_ = node_key_weights.narrow(0, 0, keys.remote_start());
+    own_node_key_weights_ = node_key_weights.narrow(0, 0, keys.remote_offset());
   }
   if (!sizes_.multi_node()) return;
-  remote_node_keys_ = node_keys.narrow(0, keys.remote_start(), remote_keys);
+  remote_node_keys_ = node_keys.narrow(0, keys.remote_offset(), remote_keys);
   if (config.weights)
-    remote_node_key_weights_ = node_key_weights.narrow(0, keys.remote_start(), remote_keys);
+    remote_node_key_weights_ = node_key_weights.narrow(0, keys.remote_offset(), remote_keys);
   node_bucket_feature_of_row_ = view(keys.node_bucket_feature_of_row(), {remote_keys}, at::kInt);
   proxy_buffers_ =
       proxy_buffers(view(keys.remote_map().base, {RemoteMap::kArrays, remote_keys}, at::kInt),
@@ -172,13 +172,13 @@ InDist InChannel::input_dist(const PlanInput &input) {
     // The proxy: the node-unique keys of its remote part, their rows and
     // the chunks of its stream, and its node's push orders (into
     // remote_map, key_stage and the proxy header).
-    ProxyKeys keys = proxy_keys(
-        ProxyInput{remote_node_keys_, remote_node_key_weights_, node_bucket_feature_of_row_,
-                   node.requester_start, node.skip, tables_},
-        sizes_, node_dedup_);
-    ProxyChunks chunks = proxy_chunks_and_slots(keys, node.requester_start, proxy_buffers_, sizes_);
+    ProxyKeys keys =
+        proxy_keys(ProxyInput{remote_node_keys_, remote_node_key_weights_,
+                              node_bucket_feature_of_row_, node.remote_offsets, node.skip, tables_},
+                   sizes_, node_dedup_);
+    ProxyChunks chunks = proxy_chunks_and_slots(keys, node.remote_offsets, proxy_buffers_, sizes_);
     const ProxyPlan proxy = proxy_push_order(std::move(keys), std::move(chunks),
-                                             node.requester_start, proxy_buffers_, sizes_);
+                                             node.remote_offsets, proxy_buffers_, sizes_);
     // The rail: every rank's count message to its rail, and the rail's layout
     // from them; then the proxy's key records into its owners' rail_keys,
     // which rail_done waits for just before the owner's tables.
@@ -207,7 +207,7 @@ InDist InChannel::input_dist(const PlanInput &input) {
     const PutLists lists = put_lists(
         proxy.chunks, proxy.chunk_offset_per_bucket, proxy.chunk_inv, proxy.node_offset_per_bucket,
         proxy.node_length_per_bucket_feature, rail.owner_offsets, owner.fwd_chunks,
-        owner.fwd_chunk_start, rail.node_length_per_source_feature, rail.source_offsets, sizes_);
+        owner.fwd_chunk_offsets, rail.node_length_per_source_feature, rail.source_offsets, sizes_);
     // The plans: the requester's maps and its tables of the node's proxies,
     // the owner's and the proxy's tables, the proxy's rows before each key
     // and the put lists. Then the owner's KJT.
@@ -217,19 +217,19 @@ InDist InChannel::input_dist(const PlanInput &input) {
     fwd.proxy_chunks = bwd.proxy_chunks = requester.proxy_chunks;
     fwd.proxy_ends = bwd.proxy_ends = requester.proxy_ends;
     fwd.proxy_push_tables = bwd.proxy_push_tables = requester.proxy_push_tables;
-    fwd.task_starts = bwd.task_starts = requester.task_starts;
+    fwd.remote_task_offsets = bwd.remote_task_offsets = requester.remote_task_offsets;
     fwd.num_chunks = bwd.num_chunks = proxy.num_chunks;
     fwd.chunks = bwd.chunks = proxy.chunks;
     fwd.node_offset_per_bucket = bwd.node_offset_per_bucket = proxy.node_offset_per_bucket;
     fwd.put_list = bwd.put_list = lists.list;
-    fwd.put_starts = bwd.put_starts = lists.starts;
+    fwd.put_offsets = bwd.put_offsets = lists.offsets;
     fwd.push_order_off = requester.push_order_off;
     fwd.fwd_chunks = owner.fwd_chunks;
     fwd.chunk_offset_per_bucket = proxy.chunk_offset_per_bucket;
     fwd.chunk_inv = proxy.chunk_inv;
     fwd.node_length_per_bucket = proxy.node_length_per_bucket;
     bwd.node_length_per_source = rail.node_length_per_source;
-    bwd.reduce_task_starts = proxy.reduce_task_starts;
+    bwd.reduce_task_offsets = proxy.reduce_task_offsets;
     bwd.node_exp_off = proxy.node_exp_off;
     dist.kjt_values = owner.kjt_values;
     dist.kjt_weights = owner.kjt_weights;

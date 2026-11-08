@@ -416,7 +416,7 @@ class KeysLayout {
     return (float *)(base_ + node_key_weights_);
   }
   // where the remote part starts in them
-  __host__ __device__ int64_t remote_start() const { return lookup_keys_; }
+  __host__ __device__ int64_t remote_offset() const { return lookup_keys_; }
   __host__ __device__ int32_t *node_bucket_feature_of_row() const {
     return (int32_t *)(base_ + node_bucket_feature_of_row_);
   }

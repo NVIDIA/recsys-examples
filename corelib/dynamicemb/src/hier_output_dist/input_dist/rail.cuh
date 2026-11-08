@@ -130,7 +130,7 @@ inline RailLayoutView view_of(const RailLayout &rail) {
 }
 
 // The int64 words rail_layout_of works in: per (source node, owner node) the source's node-unique
-// keys for the owner, and the ends of every rail owner's KJT features, owner after owner.
+// keys for the owner, and the offsets of every rail owner's KJT features, owner after owner.
 __host__ __device__ inline int64_t rail_layout_scratch(const Topo &topo, int64_t num_features) {
   const int64_t num_nodes = topo.num_nodes;
   return num_nodes * num_nodes + num_nodes * num_features + 1;
@@ -147,18 +147,18 @@ __device__ __forceinline__ int64_t owner_feature_keys(const RailCounts &in, int6
 }
 
 // Where the keys of feature `feature` from the proxy on node `source` start in the KJT of the rail
-// owner on node `owner_node` (another node): after the KJT's features before (feature_ends, the
-// ends of owner_feature_keys, owner after owner), the owner's own part of the feature, then the
+// owner on node `owner_node` (another node): after the KJT's features before (feature_offsets, the
+// offsets of owner_feature_keys, owner after owner), the owner's own part of the feature, then the
 // keys of the other nodes before `source` (the KJT's columns: its node's requesters, then the
 // other nodes in order). rail_layout_of computes it as owner for each proxy of the rail
 // (source_offsets), and as proxy for each owner (owner_offsets): one function of the same
 // messages, so a proxy's owner_offsets are its owners' source_offsets, bit for bit.
-__device__ __forceinline__ int64_t source_offset(const RailCounts &in, const int64_t *feature_ends,
-                                                 int64_t owner_node, int64_t source,
-                                                 int64_t feature) {
+__device__ __forceinline__ int64_t source_offset(const RailCounts &in,
+                                                 const int64_t *feature_offsets, int64_t owner_node,
+                                                 int64_t source, int64_t feature) {
   const int64_t first = owner_node * in.format.num_features;
   int64_t offset =
-      feature_ends[first + feature] - feature_ends[first] + in.own(owner_node, feature);
+      feature_offsets[first + feature] - feature_offsets[first] + in.own(owner_node, feature);
   for (int64_t before = 0; before < source; ++before)
     if (before != owner_node) offset += in.keys(before, owner_node, feature);
   return offset;
@@ -176,9 +176,9 @@ __device__ inline void rail_layout_of(const RailCounts &in, const int64_t *own_l
                 local_size = sizes.topo.local_size, num_features = sizes.num_features,
                 num_sources = sizes.topo.num_sources;
   // [source][owner node]: the source's node-unique keys for the owner node, a warp each, its lanes
-  // taking the features. [owner node][feature] (and the total): the ends of each owner's KJT
+  // taking the features. [owner node][feature] (and the total): the offsets of each owner's KJT
   // features, owner after owner.
-  int64_t *node_keys = scratch, *feature_ends = node_keys + num_nodes * num_nodes;
+  int64_t *node_keys = scratch, *feature_offsets = node_keys + num_nodes * num_nodes;
   const int lane = threadIdx.x & 31;
   for (int64_t index = threadIdx.x >> 5; index < num_nodes * num_nodes; index += kWarps) {
     const int64_t source = index / num_nodes, owner_node = index % num_nodes;
@@ -190,12 +190,12 @@ __device__ inline void rail_layout_of(const RailCounts &in, const int64_t *own_l
     if (lane == 0) node_keys[index] = keys;
   }
   // (its first __syncthreads makes node_keys whole)
-  cta_exclusive_ends<int64_t>(
+  cta_offsets_of<int64_t>(
       num_nodes * num_features,
       [&](int64_t index) {
         return owner_feature_keys(in, index / num_features, index % num_features);
       },
-      feature_ends);
+      feature_offsets);
   // the bytes of the slice the proxy on `source` puts at the owner on `owner_node`
   auto slice_bytes = [&](int64_t source, int64_t owner_node) -> int64_t {
     if (source == owner_node) return 0;
@@ -244,7 +244,7 @@ __device__ inline void rail_layout_of(const RailCounts &in, const int64_t *own_l
   const int64_t num_lengths = num_features * num_sources;
   for (int64_t index = threadIdx.x; index < num_lengths; index += kThreads)
     out.kjt_lengths[index] = kjt_length(index);
-  cta_exclusive_ends<int64_t>(num_lengths, kjt_length, out.kjt_offsets);
+  cta_offsets_of<int64_t>(num_lengths, kjt_length, out.kjt_offsets);
   for (int64_t feature = threadIdx.x; feature < num_features; feature += kThreads)
     out.length_per_key[feature] =
         out.kjt_offsets[(feature + 1) * num_sources] - out.kjt_offsets[feature * num_sources];
@@ -258,9 +258,9 @@ __device__ inline void rail_layout_of(const RailCounts &in, const int64_t *own_l
   for (int64_t index = threadIdx.x; index < num_nodes * num_features; index += kThreads) {
     const int64_t other = index / num_features, feature = index % num_features;
     out.source_offsets[index] =
-        other == node ? 0 : source_offset(in, feature_ends, node, other, feature);
+        other == node ? 0 : source_offset(in, feature_offsets, node, other, feature);
     out.owner_offsets[index] =
-        other == node ? 0 : source_offset(in, feature_ends, other, node, feature);
+        other == node ? 0 : source_offset(in, feature_offsets, other, node, feature);
   }
   // The keys it looks up, and the most the rail needs of each capacity.
   const int64_t most_recv = cta_max<int64_t>(num_nodes, recv, 0);

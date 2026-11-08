@@ -258,9 +258,9 @@ __global__ void __launch_bounds__(kSumThreads) bwd_heavy_sum_kernel(BwdArgs args
 // warps and the reducer CTAs requests. Its tasks come from two queues
 // (ReadyFirst):
 //   - remote (across nodes): chunk after chunk of the proxies' streams
-//     (task_starts), the push tasks of every proxy's rows (32 positions of
-//     its push order each), proxies in turn, so the chunks fill in stream
-//     order;
+//     (remote_task_offsets), the push tasks of every proxy's rows (32
+//     positions of its push order each), proxies in turn, so the chunks fill
+//     in stream order;
 //   - local: the row tasks of the node's owners.
 // A task sums each of its rows over its original rows, or for a heavy row
 // takes its sum from bwd_heavy_kernel, and stores it where the row goes. A
@@ -378,7 +378,7 @@ __device__ void push_rows_warp(const Sizes &sizes, const BwdArgs &args, int64_t 
 __device__ __forceinline__ void remote_push(const Sizes &sizes, const BwdPlanView &plan,
                                             int64_t remote_task, ProxyPush &push) {
   const int local_size = sizes.topo.local_size, me = sizes.topo.local_rank;
-  const RemoteTask place(plan.task_starts, plan.max_chunks * local_size, remote_task);
+  const RemoteTask place(plan.remote_task_offsets, plan.max_chunks * local_size, remote_task);
   push.chunk = place.entry / local_size;
   push.proxy = (int)((me + place.entry % local_size) % local_size);
   push.nth = place.nth;
@@ -395,8 +395,8 @@ __device__ __forceinline__ void push_rows_task_warp(const Sizes &sizes, int64_t 
   const int me = sizes.topo.local_rank, row_bytes = sizes.row_bytes;
   const OutTimeline timeline{args.trace, sizes.topo.local_size};
   const int proxy = push.proxy;
-  const int64_t pos0 = plan.push_start(proxy, push.chunk) + push.nth * kTaskRows;
-  const int num_rows = (int)min((int64_t)kTaskRows, plan.push_start(proxy, push.chunk + 1) - pos0);
+  const int64_t pos0 = plan.push_offset(proxy, push.chunk) + push.nth * kTaskRows;
+  const int num_rows = (int)min((int64_t)kTaskRows, plan.push_offset(proxy, push.chunk + 1) - pos0);
   if (num_rows <= 0) return;
   wait_free_warp(sizes, seq, tables, proxy, push.chunk, lane);
   int64_t dedup_row = 0;
@@ -452,7 +452,7 @@ namespace bwd {
 
 // The proxy's reducers (across nodes; the last CTAs of the kernel). A task
 // is 32 node-unique keys of one chunk of its stream. The tasks go chunk after
-// chunk (reduce_task_starts), the order the requesters push them in. The
+// chunk (reduce_task_offsets), the order the requesters push them in. The
 // warp waits until every row of its chunk is in: the node's requesters
 // count each push task's rows in the chunk's pushed_rows word, which reaches
 // the chunk's rows (end - start). Then it sums, for each key of several
@@ -476,11 +476,11 @@ __device__ void ProxyReducer<RowT>::run(ncclWindow_t window, const Sizes &sizes,
   const int vec = sizes.row_vecs();
   // this rank's copy of the window: its proxy_rows and pushed_rows
   const WindowLayout layout = NodeWindow(window, sizes.topo.local_rank).layout(sizes);
-  const int64_t total = plan.reduce_task_starts[plan.max_chunks];
+  const int64_t total = plan.reduce_task_offsets[plan.max_chunks];
   const TaskQueue queue{layout.ctrl.task(kQueueReduce)};
   for (int64_t task = queue.next_warp(); task < total; task = queue.next_warp()) {
     // The task: keys [key_lo + sub * 32, ...) of its chunk, at most 32.
-    const RemoteTask place(plan.reduce_task_starts, plan.max_chunks, task);
+    const RemoteTask place(plan.reduce_task_offsets, plan.max_chunks, task);
     const Chunk chunk = plan.chunks[place.entry];
     const int64_t uniq_lo = chunk.key_lo + place.nth * kTaskRows;
     const int num_keys = (int)min((int64_t)kTaskRows, (int64_t)chunk.key_lo + chunk.keys - uniq_lo);
@@ -580,7 +580,7 @@ __device__ __forceinline__ void poll_window(const BwdPlanView &plan, const int64
 // bit. When the stream wraps, each put also counts on the counter of its
 // chunk, and posted(counter) counts the puts. Returns where the segments not
 // yet put start: done moves over the first chunks of the window, as long as
-// they are put. The put list's places are int32 (put_starts).
+// they are put. The put list's places are int32 (put_offsets).
 __device__ __forceinline__ int64_t post_window(const RowPut &put, const BwdPlanView &plan,
                                                const BwdArgs &args, const CtrlLayout &ctrl,
                                                const OutTimeline &timeline, int owner_node,
@@ -669,7 +669,7 @@ __device__ void ProxyIssuer::run(ncclWindow_t window, const ncclDevComm &dev, co
   const int64_t count = *plan.num_chunks;
   const bool wraps = count > 0 && plan.chunks[count - 1].end > ring;
   for (int owner_node = lane; owner_node < num_nodes; owner_node += 32)
-    *layout.ctrl.put_at(owner_node) = plan.bwd_puts(owner_node);
+    *layout.ctrl.put_at(owner_node) = plan.bwd_put_offset(owner_node);
   __syncwarp();
   // rows of proxy_rows into the rail owners' lookup_rows
   const RowPut put{rows,
@@ -691,7 +691,7 @@ __device__ void ProxyIssuer::run(ncclWindow_t window, const ncclDevComm &dev, co
       unsigned ready = 0, put_before = 0;  // its window's chunks (poll_window)
       if (owner_node < num_nodes && owner_node != node) {
         done = *layout.ctrl.put_at(owner_node);
-        end = plan.bwd_puts(owner_node + 1);
+        end = plan.bwd_put_offset(owner_node + 1);
         if (done < end &&
             (int64_t)credits.read_relaxed(sig_bwd_ready(num_nodes, owner_node)) >= seq)
           poll_window(plan, args.ready, done, end, limit, ready, put_before);
@@ -994,7 +994,8 @@ __global__ void __launch_bounds__(kThreads, 1)
     }
     pass_entry_barrier(window, sizes, seq, timeline, workers);
     const int64_t *local_offset_per_bucket = plan.offset_per_bucket + node * local_size;
-    const int64_t remote = num_nodes > 1 ? plan.task_starts[plan.max_chunks * local_size] : 0;
+    const int64_t remote =
+        num_nodes > 1 ? plan.remote_task_offsets[plan.max_chunks * local_size] : 0;
     const LocalRows local_rows{local_offset_per_bucket, local_size, me};
     const int64_t local = local_rows.count();
     const CtrlLayout ctrl = tables.layout().ctrl;
@@ -1004,7 +1005,7 @@ __global__ void __launch_bounds__(kThreads, 1)
     // free. The warp keeps the last (chunk, proxy) entry it saw free.
     int64_t free_entry = -1;
     const auto ready = [&](int64_t next) {
-      const RemoteTask place(plan.task_starts, plan.max_chunks * local_size, next);
+      const RemoteTask place(plan.remote_task_offsets, plan.max_chunks * local_size, next);
       if (place.entry == free_entry) return true;
       const int proxy = (int)((me + place.entry % local_size) % local_size);
       if (!bwd::rows_free_lane(sizes, seq, tables, proxy, place.entry / local_size)) return false;

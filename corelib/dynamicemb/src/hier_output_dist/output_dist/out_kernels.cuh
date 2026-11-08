@@ -162,7 +162,7 @@ struct OutTimeline {
 // The call's tables as a requester's warps read them.
 
 // What a requester's warps read of the call: from the plan (what both
-// kernels' plans hold), the block starts and its tables of the node's
+// kernels' plans hold), its offset_per_bucket and its tables of the node's
 // proxies (their streams' chunks and ends, and its push tables there); from
 // the window, the node peers' buffers and words, each the same place as in
 // this rank's copy (layout()). The one word per proxy a CTA keeps,
@@ -323,12 +323,12 @@ struct Interleave {
 };
 
 // A task of the remote tasks laid out by (chunk, proxy in turn): its entry
-// in their task starts (starts [entries + 1]: the tasks before each entry),
+// in their task offsets (offsets [entries + 1]: the tasks before each entry),
 // the entry it falls in, and its place there.
 struct RemoteTask {
   int64_t entry, nth;
-  __device__ __forceinline__ RemoteTask(const int64_t *starts, int64_t entries, int64_t task)
-      : entry(seg_search(starts, (int)entries, task)), nth(task - starts[entry]) {}
+  __device__ __forceinline__ RemoteTask(const int64_t *offsets, int64_t entries, int64_t task)
+      : entry(seg_search(offsets, (int)entries, task)), nth(task - offsets[entry]) {}
 };
 
 // The out channel's protocol, which both out kernels follow: the entry

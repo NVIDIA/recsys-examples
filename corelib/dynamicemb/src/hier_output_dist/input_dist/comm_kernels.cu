@@ -129,14 +129,14 @@ __global__ void __launch_bounds__(kThreads)
                          PushPlaces places, int32_t *src) {
   const NodeWindow node(window, sizes.topo.local_rank);
   const KeysLayout keys = node.layout(sizes).keys;
-  const int64_t remote_start = keys.remote_start();
+  const int64_t remote_offset = keys.remote_offset();
   push_rows(rows, num_rows, places, sizes.topo, sizes.num_features, src,
             [&](int64_t target, int64_t place, int64_t key, float weight, int32_t feature) {
               node.peer(keys.node_keys(), (int)target)[place] = key;
               if (rows.weights != nullptr)
                 node.peer(keys.node_key_weights(), (int)target)[place] = weight;
-              if (place >= remote_start)
-                node.peer(keys.node_bucket_feature_of_row(), (int)target)[place - remote_start] =
+              if (place >= remote_offset)
+                node.peer(keys.node_bucket_feature_of_row(), (int)target)[place - remote_offset] =
                     feature;
             });
   __syncthreads();

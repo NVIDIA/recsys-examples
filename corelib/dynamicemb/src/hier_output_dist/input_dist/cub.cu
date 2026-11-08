@@ -51,7 +51,7 @@ void radix_sort_pairs(const at::Tensor &keys, const at::Tensor &values, at::Tens
       values.data_ptr<int32_t>(), sorted_values.data_ptr<int32_t>(), count, 0, end_bit, stream()));
 }
 
-// A count as the ends' type, as the scan reads it.
+// A count as the offsets' type, as the scan reads it.
 template <typename To>
 struct CastTo {
   template <typename From>
@@ -60,12 +60,12 @@ struct CastTo {
   }
 };
 
-// ends[1 .. n] = the inclusive sums of the n counts.
+// offsets[1 .. n] = the inclusive sums of the n counts.
 template <typename From, typename To>
-void inclusive_sums(const at::Tensor &counts, const at::Tensor &ends) {
+void inclusive_sums(const at::Tensor &counts, const at::Tensor &offsets) {
   const int64_t count = counts.numel();
   auto in = thrust::make_transform_iterator(counts.data_ptr<From>(), CastTo<To>{});
-  To *out = ends.data_ptr<To>() + 1;
+  To *out = offsets.data_ptr<To>() + 1;
   size_t bytes = 0;
   AT_CUDA_CHECK(cub::DeviceScan::InclusiveSum(nullptr, bytes, in, out, count, stream()));
   at::Tensor scratch = scratch_of(bytes, counts);
@@ -73,19 +73,19 @@ void inclusive_sums(const at::Tensor &counts, const at::Tensor &ends) {
 }
 
 template <typename To>
-void inclusive_sums_to(const at::Tensor &counts, const at::Tensor &ends) {
+void inclusive_sums_to(const at::Tensor &counts, const at::Tensor &offsets) {
   switch (counts.scalar_type()) {
     case at::kBool:
-      inclusive_sums<bool, To>(counts, ends);
+      inclusive_sums<bool, To>(counts, offsets);
       break;
     case at::kInt:
-      inclusive_sums<int32_t, To>(counts, ends);
+      inclusive_sums<int32_t, To>(counts, offsets);
       break;
     case at::kLong:
-      inclusive_sums<int64_t, To>(counts, ends);
+      inclusive_sums<int64_t, To>(counts, offsets);
       break;
     default:
-      TORCH_CHECK(false, "hier_output_dist: exclusive_ends sums bool, int32 or int64 counts, got ",
+      TORCH_CHECK(false, "hier_output_dist: offsets_of sums bool, int32 or int64 counts, got ",
                   counts.scalar_type());
   }
 }
@@ -135,19 +135,19 @@ at::Tensor sort_keys(const at::Tensor &keys, int end_bit) {
   return sorted;
 }
 
-at::Tensor exclusive_ends(const at::Tensor &counts, at::ScalarType dtype) {
+at::Tensor offsets_of(const at::Tensor &counts, at::ScalarType dtype) {
   TORCH_CHECK(counts.is_cuda() && (dtype == at::kInt || dtype == at::kLong),
-              "hier_output_dist: exclusive_ends takes counts on the GPU, and gives int32 or "
-              "int64 ends");
+              "hier_output_dist: offsets_of takes counts on the GPU, and gives int32 or "
+              "int64 offsets");
   const at::Tensor values = counts.contiguous().view(-1);
-  const at::Tensor ends = at::empty({values.numel() + 1}, values.options().dtype(dtype));
-  AT_CUDA_CHECK(cudaMemsetAsync(ends.data_ptr(), 0, ends.element_size(), stream()));
-  if (values.numel() == 0) return ends;
+  const at::Tensor offsets = at::empty({values.numel() + 1}, values.options().dtype(dtype));
+  AT_CUDA_CHECK(cudaMemsetAsync(offsets.data_ptr(), 0, offsets.element_size(), stream()));
+  if (values.numel() == 0) return offsets;
   if (dtype == at::kInt)
-    inclusive_sums_to<int32_t>(values, ends);
+    inclusive_sums_to<int32_t>(values, offsets);
   else
-    inclusive_sums_to<int64_t>(values, ends);
-  return ends;
+    inclusive_sums_to<int64_t>(values, offsets);
+  return offsets;
 }
 
 }  // namespace hier_output_dist

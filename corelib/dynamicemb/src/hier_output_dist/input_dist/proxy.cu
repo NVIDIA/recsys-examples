@@ -56,10 +56,10 @@ __device__ __forceinline__ int64_t owner_node_of(int64_t bucket_feature, int64_t
 }
 
 // The requester of a valid occurrence: the last one whose occurrences start
-// at or before it (requester_start: local_size + 1 entries).
-__device__ __forceinline__ int64_t requester_of_occurrence(const int64_t *requester_start,
+// at or before it (remote_offsets: local_size + 1 entries).
+__device__ __forceinline__ int64_t requester_of_occurrence(const int64_t *remote_offsets,
                                                            int64_t local_size, int64_t occurrence) {
-  return min(max(upper_bound(requester_start, local_size + 1, occurrence) - 1, (int64_t)0),
+  return min(max(upper_bound(remote_offsets, local_size + 1, occurrence) - 1, (int64_t)0),
              local_size - 1);
 }
 
@@ -137,17 +137,17 @@ inline int64_t block_scratch(int64_t local_size, int64_t bucket_features) {
 // after the requester's rows for the owner nodes before n, at its offset in
 // its bucket, which is feature-major). So node_bucket_feature_of_row does not
 // decrease there, and a binary search finds where each block starts:
-// block_start [local_size][bucket_features + 1], each requester's last entry
+// block_offsets [local_size][bucket_features + 1], each requester's last entry
 // the end of its range.
 // The first thread writes the count of the valid occurrences, those the node
 // layout counts for this proxy (none when the node skips the call), and
 // key_rows' start.
 __global__ void __launch_bounds__(kThreads)
-    prepare_kernel(const bool *skip, const int64_t *requester_start,
+    prepare_kernel(const bool *skip, const int64_t *remote_offsets,
                    const int32_t *node_bucket_feature_of_row, int64_t local_size,
                    int64_t bucket_features, int64_t entries, int64_t buckets, Identities ids,
-                   int64_t *block_start, int64_t *occurrence_count, int64_t *key_rows) {
-  const int64_t count = *skip ? 0 : requester_start[local_size], columns = bucket_features + 1;
+                   int64_t *block_offsets, int64_t *occurrence_count, int64_t *key_rows) {
+  const int64_t count = *skip ? 0 : remote_offsets[local_size], columns = bucket_features + 1;
   if (first_item() == 0) {
     *occurrence_count = count;
     *key_rows = 0;
@@ -163,9 +163,9 @@ __global__ void __launch_bounds__(kThreads)
   }
   for (int64_t index = first_item(); index < local_size * columns; index += item_stride()) {
     const int64_t requester = index / columns, bucket_feature = index % columns;
-    const int64_t lo = min(requester_start[requester], count),
-                  hi = max(min(requester_start[requester + 1], count), lo);
-    block_start[index] =
+    const int64_t lo = min(remote_offsets[requester], count),
+                  hi = max(min(remote_offsets[requester + 1], count), lo);
+    block_offsets[index] =
         bucket_feature == bucket_features
             ? hi
             : lo + lower_bound(node_bucket_feature_of_row + lo, hi - lo, bucket_feature);
@@ -230,34 +230,34 @@ __device__ __forceinline__ int64_t reps_before_of(const int32_t *reps_before, in
 }
 
 // The representatives of block (r, b), its node-unique keys: those before
-// the block's next entry of block_start ([local_size][columns]; a
+// the block's next entry of block_offsets ([local_size][columns]; a
 // requester's last entry is the end of its range) less those before its own.
-__device__ __forceinline__ int64_t block_reps(const int64_t *block_start, int64_t columns,
+__device__ __forceinline__ int64_t block_reps(const int64_t *block_offsets, int64_t columns,
                                               const int32_t *reps_before, int64_t requester,
                                               int64_t bucket_feature) {
-  const int64_t *start = block_start + requester * columns + bucket_feature;
-  return reps_before_of(reps_before, start[1]) - reps_before_of(reps_before, start[0]);
+  const int64_t *offsets = block_offsets + requester * columns + bucket_feature;
+  return reps_before_of(reps_before, offsets[1]) - reps_before_of(reps_before, offsets[0]);
 }
 
 // The key u of representative `rep` of block (r, b). With node dedup
 // (kNodeDedup), inside bucket feature b the requesters take turns: the k-th
 // representative (k from 0, in occurrence order) of block (r, b), k =
-// reps_before[rep] - reps_before[block_start[r][b]], is key
-//   u = key_start[b] + sum over r' of min(k, reps(r', b))
-//                    + #{r' < r : reps(r', b) > k},
+// reps_before[rep] - reps_before[block_offsets[r][b]], is key
+//   u = key_offsets[b] + sum over r' of min(k, reps(r', b))
+//                      + #{r' < r : reps(r', b) > k},
 // reps(r', b) the representatives of block (r', b) (block_reps). Before it
 // come every representative of b of index below k, of every requester, and
 // those of index k of the requesters before r: the keys of b are b's
-// representatives in (k, r) order, a bijection onto [key_start[b],
-// key_start[b + 1]). So a chunk mostly takes keys of all the node's
+// representatives in (k, r) order, a bijection onto [key_offsets[b],
+// key_offsets[b + 1]). So a chunk mostly takes keys of all the node's
 // requesters, and its pushes mostly come from all of them. (Requester after
 // requester, as below, a chunk's pushes come from a few requesters, about
 // half of them from one.) O(local_size) loads per occurrence: per requester
-// two words of block_start and two of reps_before, the same for every
+// two words of block_offsets and two of reps_before, the same for every
 // occurrence of b.
 // Without node dedup each occurrence is a key, and the keys of b go
 // requester after requester, each requester's in occurrence order: u =
-// key_start[b] + the occurrences of b at the requesters before r + rep's
+// key_offsets[b] + the occurrences of b at the requesters before r + rep's
 // place in its block. So the rows of a (table, key) that several requesters
 // ask reach the owner's lookup in requester order. With the requesters in
 // turn their order would follow index dedup's order of each requester's
@@ -265,22 +265,22 @@ __device__ __forceinline__ int64_t block_reps(const int64_t *block_start, int64_
 // sum of them.
 template <bool kNodeDedup>
 __device__ __forceinline__ int64_t key_of_representative(
-    const int64_t *block_start, const int64_t *key_start, const int32_t *reps_before,
+    const int64_t *block_offsets, const int64_t *key_offsets, const int32_t *reps_before,
     int64_t local_size, int64_t columns, int64_t requester, int64_t bucket_feature, int64_t rep) {
-  int64_t key = key_start[bucket_feature];
+  int64_t key = key_offsets[bucket_feature];
   if constexpr (kNodeDedup) {
     const int64_t k =
-        reps_before[rep] - reps_before[block_start[requester * columns + bucket_feature]];
+        reps_before[rep] - reps_before[block_offsets[requester * columns + bucket_feature]];
     for (int64_t other = 0; other < local_size; ++other) {
-      const int64_t *start = block_start + other * columns + bucket_feature;
-      const int64_t reps = reps_before[start[1]] - reps_before[start[0]];
+      const int64_t *offsets = block_offsets + other * columns + bucket_feature;
+      const int64_t reps = reps_before[offsets[1]] - reps_before[offsets[0]];
       key += min(k, reps) + (other < requester && reps > k);
     }
   } else {
-    key += rep - block_start[requester * columns + bucket_feature];
+    key += rep - block_offsets[requester * columns + bucket_feature];
     for (int64_t other = 0; other < requester; ++other) {
-      const int64_t *start = block_start + other * columns + bucket_feature;
-      key += start[1] - start[0];
+      const int64_t *offsets = block_offsets + other * columns + bucket_feature;
+      key += offsets[1] - offsets[0];
     }
   }
   return key;
@@ -290,12 +290,12 @@ __device__ __forceinline__ int64_t key_of_representative(
 // (prepare_kernel), its representatives (block_reps; reps_before: the
 // representatives before each occurrence, nullptr without node dedup, where
 // each occurrence is one). From them: the node-unique keys of each bucket
-// feature and where they start (key_start: key_of_representative numbers
+// feature and where they start (key_offsets: key_of_representative numbers
 // each bucket feature's keys from there), and those of each owner node.
 // local_size * num_nodes * num_features blocks on one CTA, whose reads do
 // not wait on each other: the order of the node layout's row_shift
 // (world_size * num_features entries), also one CTA's. scratch:
-// block_scratch words, block_start written.
+// block_scratch words, block_offsets written.
 __global__ void __launch_bounds__(kThreads)
     blocks_kernel(const int32_t *reps_before, int64_t local_size, int64_t num_nodes,
                   int64_t num_features, int64_t *scratch, int64_t *node_length_per_bucket_feature,
@@ -305,25 +305,25 @@ __global__ void __launch_bounds__(kThreads)
   // [requester][bucket feature]: where each block starts, then where the
   // requester's range ends; where the keys of each bucket feature start, then
   // their end
-  const int64_t *block_start = scratch;
-  int64_t *key_start = scratch + local_size * columns;
+  const int64_t *block_offsets = scratch;
+  int64_t *key_offsets = scratch + local_size * columns;
   for (int64_t bucket_feature = threadIdx.x; bucket_feature < bucket_features;
        bucket_feature += kThreads) {
     int64_t keys = 0;
     for (int64_t requester = 0; requester < local_size; ++requester)
-      keys += block_reps(block_start, columns, reps_before, requester, bucket_feature);
+      keys += block_reps(block_offsets, columns, reps_before, requester, bucket_feature);
     node_length_per_bucket_feature[bucket_feature] = keys;
   }
   __syncthreads();
-  const int64_t total = cta_exclusive_ends<int64_t>(
+  const int64_t total = cta_offsets_of<int64_t>(
       bucket_features,
       [&](int64_t bucket_feature) { return node_length_per_bucket_feature[bucket_feature]; },
-      key_start);
+      key_offsets);
   for (int64_t owner_node = threadIdx.x; owner_node <= num_nodes; owner_node += kThreads) {
-    node_offset_per_bucket[owner_node] = key_start[owner_node * num_features];
+    node_offset_per_bucket[owner_node] = key_offsets[owner_node * num_features];
     if (owner_node < num_nodes)
       node_length_per_bucket[owner_node] =
-          key_start[(owner_node + 1) * num_features] - key_start[owner_node * num_features];
+          key_offsets[(owner_node + 1) * num_features] - key_offsets[owner_node * num_features];
   }
   if (threadIdx.x == 0) *node_num_uniques = total;
 }
@@ -331,7 +331,7 @@ __global__ void __launch_bounds__(kThreads)
 // A thread per valid occurrence: its node-unique key u (node_reverse_indices)
 // from its identity's representative rep (itself without node dedup,
 // kNodeDedup false): rep's key in its block (rep's requester, rep's bucket
-// feature), key_of_representative (block_start and key_start:
+// feature), key_of_representative (block_offsets and key_offsets:
 // blocks_kernel's scratch); and its rank among its key's occurrences in
 // occurrence order, the occurrences in its identity's list before it. A
 // list holds at most max_key_rows occurrences in a call that fits. A key of
@@ -343,9 +343,9 @@ __global__ void __launch_bounds__(kThreads)
 template <bool kNodeDedup>
 __global__ void __launch_bounds__(kThreads)
     key_tables_kernel(const int64_t *occurrence_keys, const float *weights,
-                      const int32_t *node_bucket_feature_of_row, const int64_t *requester_start,
+                      const int32_t *node_bucket_feature_of_row, const int64_t *remote_offsets,
                       const int64_t *occurrence_count, Identities ids, const int32_t *reps_before,
-                      const int64_t *block_start, const int64_t *key_start, int64_t entries,
+                      const int64_t *block_offsets, const int64_t *key_offsets, int64_t entries,
                       int64_t local_size, int64_t num_nodes, int64_t num_features,
                       int32_t max_key_rows, int32_t *node_reverse_indices, int32_t *occurrence_rank,
                       int32_t *key_count, int32_t *key_node, int64_t *node_unique_keys,
@@ -369,10 +369,10 @@ __global__ void __launch_bounds__(kThreads)
     } else {
       bucket_feature = node_bucket_feature_of_row[occurrence];
     }
-    const int64_t requester = requester_of_occurrence(requester_start, local_size, rep);
+    const int64_t requester = requester_of_occurrence(remote_offsets, local_size, rep);
     const int64_t key =
         clamp_index(key_of_representative<kNodeDedup>(
-                        block_start, key_start, reps_before, local_size, bucket_features + 1,
+                        block_offsets, key_offsets, reps_before, local_size, bucket_features + 1,
                         requester, clamp_index(bucket_feature, bucket_features), rep),
                     entries);
     node_reverse_indices[occurrence] = (int32_t)key;
@@ -457,8 +457,8 @@ struct StreamArgs {
   Chunk *chunks;       // [max_chunks]
   int32_t *chunk_inv;  // [max_chunks]
   // [max_chunks]: each chunk's rows and reducer tasks; [max_chunks + 1]: their
-  // ends in stream order
-  int64_t *rows_of, *reduce_tasks, *stream_ends, *reduce_task_starts;
+  // offsets in stream order
+  int64_t *rows_of, *reduce_tasks, *stream_offsets, *reduce_task_offsets;
   // the proxy header's words, and key_stage
   int32_t *header_chunks;
   uint32_t *header_ends, *header_end;
@@ -482,8 +482,7 @@ __device__ void chunk_counts(const StreamArgs &args) {
   };
   for (int64_t owner_node = threadIdx.x; owner_node < num_nodes; owner_node += kThreads)
     args.chunk_length_per_bucket[owner_node] = chunks_of(owner_node);
-  const int64_t total =
-      cta_exclusive_ends<int64_t>(num_nodes, chunks_of, args.chunk_offset_per_bucket);
+  const int64_t total = cta_offsets_of<int64_t>(num_nodes, chunks_of, args.chunk_offset_per_bucket);
   for (int64_t owner_node = threadIdx.x; owner_node < num_nodes; owner_node += kThreads) {
     int64_t start = 0;
     for (int64_t before = 0; before < owner_node; ++before)
@@ -550,8 +549,8 @@ __device__ void chunk_table(const StreamArgs &args) {
   }
 }
 
-// The ends of the stream's chunks' rows, in stream order (stream_ends, from
-// rows_of), and the reducer tasks before each chunk (reduce_task_starts,
+// The offsets of the stream's chunks' rows, in stream order (stream_offsets,
+// from rows_of), and the reducer tasks before each chunk (reduce_task_offsets,
 // from reduce_tasks); then, a thread per place c of the stream, where its
 // chunk lies, unwrapped. A stream that fits the ring (ring rows) lies as it
 // is; else lap k takes the chunks whose rows before them are in
@@ -561,26 +560,27 @@ __device__ void chunk_table(const StreamArgs &args) {
 // key_stage; the stream's end into the header. Every thread of the CTA.
 __device__ void chunk_places(const StreamArgs &args) {
   const int64_t max_chunks = args.max_chunks, ring = args.ring, lap_span = args.lap_span;
-  const int64_t *stream_ends = args.stream_ends,
+  const int64_t *stream_offsets = args.stream_offsets,
                 *node_offset_per_bucket = args.rounds.node_offset_per_bucket;
-  cta_exclusive_ends<int64_t>(
-      max_chunks, [&](int64_t place) { return args.rows_of[place]; }, args.stream_ends);
-  cta_exclusive_ends<int64_t>(
-      max_chunks, [&](int64_t place) { return args.reduce_tasks[place]; }, args.reduce_task_starts);
-  const int64_t count = *args.num_chunks, total = stream_ends[count];
+  cta_offsets_of<int64_t>(
+      max_chunks, [&](int64_t place) { return args.rows_of[place]; }, args.stream_offsets);
+  cta_offsets_of<int64_t>(
+      max_chunks, [&](int64_t place) { return args.reduce_tasks[place]; },
+      args.reduce_task_offsets);
+  const int64_t count = *args.num_chunks, total = stream_offsets[count];
   if (threadIdx.x == 0 && count == 0) *args.header_end = 0;
   for (int64_t place = threadIdx.x; place < max_chunks; place += kThreads) {
     if (place >= count) {
       args.header_ends[place] = 0;
       continue;
     }
-    int64_t start = stream_ends[place];
+    int64_t start = stream_offsets[place];
     if (total > ring) {
-      const int64_t lap = stream_ends[place] / lap_span;
-      const int64_t first = lower_bound(stream_ends, count, lap * lap_span);
-      start = lap * ring + stream_ends[place] - stream_ends[first];
+      const int64_t lap = stream_offsets[place] / lap_span;
+      const int64_t first = lower_bound(stream_offsets, count, lap * lap_span);
+      start = lap * ring + stream_offsets[place] - stream_offsets[first];
     }
-    const int64_t end = start + stream_ends[place + 1] - stream_ends[place];
+    const int64_t end = start + stream_offsets[place + 1] - stream_offsets[place];
     Chunk &chunk = args.chunks[place];
     chunk.start = (uint32_t)start;
     chunk.end = (uint32_t)end;
@@ -659,7 +659,7 @@ __global__ void __launch_bounds__(kThreads)
   }
 }
 
-// A thread per valid occurrence: its requester (from requester_start) and its
+// A thread per valid occurrence: its requester (from remote_offsets) and its
 // slot: the key's row for its key's first occurrence, a duplicate slot for the
 // others (every occurrence of a key of more than max_key_rows, in a call that
 // raises, has rank max_key_rows and takes the key's row). remote_map gets the
@@ -667,7 +667,7 @@ __global__ void __launch_bounds__(kThreads)
 __global__ void __launch_bounds__(kThreads)
     occurrence_slots_kernel(const int32_t *node_reverse_indices, const int32_t *occurrence_rank,
                             const int32_t *key_row, const int32_t *duplicate_base,
-                            const int64_t *node_exp_off, const int64_t *requester_start,
+                            const int64_t *node_exp_off, const int64_t *remote_offsets,
                             const int64_t *occurrence_count, int64_t local_size,
                             int32_t *requester_of, int32_t *map_key_row, int32_t *map_slot) {
   const int64_t count = *occurrence_count;
@@ -678,7 +678,7 @@ __global__ void __launch_bounds__(kThreads)
     const int64_t slot =
         place == 0 || place >= rows ? key_row[key] : duplicate_base[key] + place - 1;
     requester_of[occurrence] =
-        (int32_t)requester_of_occurrence(requester_start, local_size, occurrence);
+        (int32_t)requester_of_occurrence(remote_offsets, local_size, occurrence);
     map_key_row[occurrence] = key_row[key];
     map_slot[occurrence] = (int32_t)slot;
   }
@@ -707,47 +707,47 @@ __global__ void __launch_bounds__(kThreads)
 }
 
 // A thread per push position (the occurrences sorted by push key): where the
-// parts of the push order start (part_start; a part per requester and chunk
+// parts of the push order start (part_offsets; a part per requester and chunk
 // up to max_chunks, in push key order). A valid position whose part is not
 // the one before's starts its part and the parts in between, which have
 // none; the last valid one ends the parts after its own, and the first
 // thread every part when there is no valid one.
 __global__ void __launch_bounds__(kThreads)
-    part_starts_kernel(const int64_t *push_key_sorted, const int64_t *occurrence_count,
-                       int64_t entries, int64_t parts, int32_t *part_start) {
+    part_offsets_kernel(const int64_t *push_key_sorted, const int64_t *occurrence_count,
+                        int64_t entries, int64_t parts, int32_t *part_offsets) {
   const int64_t count = *occurrence_count;
   if (first_item() == 0 && count == 0)
-    for (int64_t part = 0; part < parts; ++part) part_start[part] = 0;
+    for (int64_t part = 0; part < parts; ++part) part_offsets[part] = 0;
   for (int64_t position = first_item(); position < count; position += item_stride()) {
     const int64_t part = push_key_sorted[position];
     const int64_t before = position == 0 ? -1 : push_key_sorted[position - 1];
-    for (int64_t next = before + 1; next <= part; ++next) part_start[next] = (int32_t)position;
+    for (int64_t next = before + 1; next <= part; ++next) part_offsets[next] = (int32_t)position;
     if (position == count - 1)
-      for (int64_t next = part + 1; next < parts; ++next) part_start[next] = (int32_t)count;
+      for (int64_t next = part + 1; next < parts; ++next) part_offsets[next] = (int32_t)count;
   }
 }
 
 // A thread per entry of the push tables, a requester's and a chunk's up to
-// max_chunks: where its positions start (part_start), relative to the
-// requester's push order (requester_start), into the proxy header.
+// max_chunks: where its positions start (part_offsets), relative to the
+// requester's push order (remote_offsets), into the proxy header.
 __global__ void __launch_bounds__(kThreads)
-    push_tables_kernel(const int32_t *part_start, const int64_t *requester_start,
+    push_tables_kernel(const int32_t *part_offsets, const int64_t *remote_offsets,
                        int64_t local_size, int64_t max_chunks, int32_t *header_tables) {
   const int64_t columns = max_chunks + 1;  // the entries of a requester
   for (int64_t index = first_item(); index < local_size * columns; index += item_stride())
-    header_tables[index] = part_start[index] - (int32_t)requester_start[index / columns];
+    header_tables[index] = part_offsets[index] - (int32_t)remote_offsets[index / columns];
 }
 
 // A thread per valid push position: its occurrence's place in its
 // requester's push order (remote_map's positions).
 __global__ void __launch_bounds__(kThreads)
     push_positions_kernel(const int64_t *push_key_sorted, const int32_t *push_order,
-                          const int64_t *requester_start, const int64_t *occurrence_count,
+                          const int64_t *remote_offsets, const int64_t *occurrence_count,
                           int64_t max_chunks, int32_t *map_position) {
   const int64_t count = *occurrence_count;
   for (int64_t position = first_item(); position < count; position += item_stride()) {
     const int64_t requester = push_key_sorted[position] / (max_chunks + 1);
-    map_position[push_order[position]] = (int32_t)(position - requester_start[requester]);
+    map_position[push_order[position]] = (int32_t)(position - remote_offsets[requester]);
   }
 }
 
@@ -772,7 +772,7 @@ ProxyKeys proxy_keys(const ProxyInput &input, const Sizes &sizes, bool node_dedu
   const auto long_options = input.node_keys.options().dtype(at::kLong);
   const auto int_options = input.node_keys.options().dtype(at::kInt);
   const cudaStream_t stream = current_stream();
-  const int64_t *requester_start = input.requester_start.data_ptr<int64_t>();
+  const int64_t *remote_offsets = input.remote_offsets.data_ptr<int64_t>();
   const float *weights = data_or_null<float>(input.node_key_weights);
   // the sum of an identity's weights, exact as integers, when the records
   // carry it (the keys carry weights then)
@@ -812,7 +812,7 @@ ProxyKeys proxy_keys(const ProxyInput &input, const Sizes &sizes, bool node_dedu
   }
   prepare_kernel<<<item_grid(std::max(buckets, local_size * (bucket_features + 1))), kThreads, 0,
                    stream>>>(
-      input.skip.data_ptr<bool>(), requester_start,
+      input.skip.data_ptr<bool>(), remote_offsets,
       input.node_bucket_feature_of_row.data_ptr<int32_t>(), local_size, bucket_features, entries,
       buckets, ids, block_tables.data_ptr<int64_t>(), keys.occurrence_count.data_ptr<int64_t>(),
       keys.key_rows.data_ptr<int64_t>());
@@ -833,7 +833,7 @@ ProxyKeys proxy_keys(const ProxyInput &input, const Sizes &sizes, bool node_dedu
     representatives_kernel<<<item_grid(entries), kThreads, 0, stream>>>(
         ids, keys.occurrence_count.data_ptr<int64_t>(), entries, is_rep.data_ptr<bool>());
     C10_CUDA_KERNEL_LAUNCH_CHECK();
-    reps_before = exclusive_ends(is_rep, at::kInt);
+    reps_before = offsets_of(is_rep, at::kInt);
   }
   // The node-unique keys of the blocks: per bucket feature, where they
   // start, and per owner node.
@@ -860,7 +860,7 @@ ProxyKeys proxy_keys(const ProxyInput &input, const Sizes &sizes, bool node_dedu
   const auto launch_tables = [&](auto kernel) {
     kernel<<<item_grid(entries), kThreads, 0, stream>>>(
         input.node_keys.data_ptr<int64_t>(), weights,
-        input.node_bucket_feature_of_row.data_ptr<int32_t>(), requester_start,
+        input.node_bucket_feature_of_row.data_ptr<int32_t>(), remote_offsets,
         keys.occurrence_count.data_ptr<int64_t>(), ids, data_or_null<int32_t>(reps_before),
         block_tables.data_ptr<int64_t>(),
         block_tables.data_ptr<int64_t>() + local_size * (bucket_features + 1), entries, local_size,
@@ -878,7 +878,7 @@ ProxyKeys proxy_keys(const ProxyInput &input, const Sizes &sizes, bool node_dedu
   return keys;
 }
 
-ProxyChunks proxy_chunks_and_slots(ProxyKeys &keys, const at::Tensor &requester_start,
+ProxyChunks proxy_chunks_and_slots(ProxyKeys &keys, const at::Tensor &remote_offsets,
                                    const ProxyBuffers &buffers, const Sizes &sizes) {
   const int64_t entries = sizes.remote_keys, num_nodes = sizes.topo.num_nodes,
                 local_size = sizes.topo.local_size, max_chunks = sizes.max_chunks;
@@ -898,9 +898,9 @@ ProxyChunks proxy_chunks_and_slots(ProxyKeys &keys, const at::Tensor &requester_
       (int32_t)sizes.max_key_rows(), (int32_t)sizes.rows_per_payload, rows.data_ptr<int32_t>(),
       data_or_null<int32_t>(counted_rows));
   C10_CUDA_KERNEL_LAUNCH_CHECK();
-  chunks.node_exp_off = exclusive_ends(rows);
+  chunks.node_exp_off = offsets_of(rows);
   const at::Tensor counted_off =
-      sizes.rows_per_payload > 1 ? exclusive_ends(counted_rows) : chunks.node_exp_off;
+      sizes.rows_per_payload > 1 ? offsets_of(counted_rows) : chunks.node_exp_off;
   // The chunks of the stream (each owner node's, cut by its keys' counted
   // rows, round after round), where each lies, and key_stage's slices; the
   // stream's chunks and their ends to the proxy header too.
@@ -910,8 +910,8 @@ ProxyChunks proxy_chunks_and_slots(ProxyKeys &keys, const at::Tensor &requester_
   chunks.stage_offset_per_bucket = at::empty({num_nodes}, long_options);
   chunks.chunks = at::empty({max_chunks, 8}, int_options);
   chunks.chunk_inv = at::empty({max_chunks}, int_options);
-  chunks.reduce_task_starts = at::empty({max_chunks + 1}, long_options);
-  // each chunk's rows and reducer tasks, and the ends of its rows
+  chunks.reduce_task_offsets = at::empty({max_chunks + 1}, long_options);
+  // each chunk's rows and reducer tasks, and the offsets of its rows
   const at::Tensor stream_tables = at::empty({3, max_chunks + 1}, long_options);
   const Rounds rounds{counted_off.data_ptr<int64_t>(),
                       chunks.node_exp_off.data_ptr<int64_t>(),
@@ -936,8 +936,8 @@ ProxyChunks proxy_chunks_and_slots(ProxyKeys &keys, const at::Tensor &requester_
   stream_args.chunk_inv = chunks.chunk_inv.data_ptr<int32_t>();
   stream_args.rows_of = stream_tables[0].data_ptr<int64_t>();
   stream_args.reduce_tasks = stream_tables[1].data_ptr<int64_t>();
-  stream_args.stream_ends = stream_tables[2].data_ptr<int64_t>();
-  stream_args.reduce_task_starts = chunks.reduce_task_starts.data_ptr<int64_t>();
+  stream_args.stream_offsets = stream_tables[2].data_ptr<int64_t>();
+  stream_args.reduce_task_offsets = chunks.reduce_task_offsets.data_ptr<int64_t>();
   stream_args.header_chunks = buffers.chunks.data_ptr<int32_t>();
   stream_args.header_ends = (uint32_t *)buffers.ends.data_ptr<int32_t>();
   stream_args.header_end = (uint32_t *)buffers.end.data_ptr<int32_t>();
@@ -971,7 +971,7 @@ ProxyChunks proxy_chunks_and_slots(ProxyKeys &keys, const at::Tensor &requester_
   occurrence_slots_kernel<<<item_grid(entries), kThreads, 0, stream>>>(
       keys.node_reverse_indices.data_ptr<int32_t>(), keys.occurrence_rank.data_ptr<int32_t>(),
       key_row.data_ptr<int32_t>(), duplicate_base.data_ptr<int32_t>(),
-      chunks.node_exp_off.data_ptr<int64_t>(), requester_start.data_ptr<int64_t>(),
+      chunks.node_exp_off.data_ptr<int64_t>(), remote_offsets.data_ptr<int64_t>(),
       keys.occurrence_count.data_ptr<int64_t>(), local_size,
       chunks.requester_of.data_ptr<int32_t>(), remote_map.key_row(), remote_map.slot());
   C10_CUDA_KERNEL_LAUNCH_CHECK();
@@ -979,7 +979,7 @@ ProxyChunks proxy_chunks_and_slots(ProxyKeys &keys, const at::Tensor &requester_
   return chunks;
 }
 
-ProxyPlan proxy_push_order(ProxyKeys keys, ProxyChunks chunks, const at::Tensor &requester_start,
+ProxyPlan proxy_push_order(ProxyKeys keys, ProxyChunks chunks, const at::Tensor &remote_offsets,
                            const ProxyBuffers &buffers, const Sizes &sizes) {
   const int64_t entries = sizes.remote_keys, local_size = sizes.topo.local_size,
                 max_chunks = sizes.max_chunks, parts = local_size * (max_chunks + 1);
@@ -1007,13 +1007,13 @@ ProxyPlan proxy_push_order(ProxyKeys keys, ProxyChunks chunks, const at::Tensor 
   }
   // Where the parts of the push order start, then the push tables, per
   // requester and chunk: its first position.
-  const at::Tensor part_start = at::empty({parts}, int_options);
-  part_starts_kernel<<<item_grid(entries), kThreads, 0, stream>>>(
+  const at::Tensor part_offsets = at::empty({parts}, int_options);
+  part_offsets_kernel<<<item_grid(entries), kThreads, 0, stream>>>(
       push_key_sorted.data_ptr<int64_t>(), keys.occurrence_count.data_ptr<int64_t>(), entries,
-      parts, part_start.data_ptr<int32_t>());
+      parts, part_offsets.data_ptr<int32_t>());
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   push_tables_kernel<<<item_grid(parts), kThreads, 0, stream>>>(
-      part_start.data_ptr<int32_t>(), requester_start.data_ptr<int64_t>(), local_size, max_chunks,
+      part_offsets.data_ptr<int32_t>(), remote_offsets.data_ptr<int64_t>(), local_size, max_chunks,
       buffers.push_tables.data_ptr<int32_t>());
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   // Each occurrence's place in its requester's push order (remote_map's
@@ -1021,7 +1021,7 @@ ProxyPlan proxy_push_order(ProxyKeys keys, ProxyChunks chunks, const at::Tensor 
   const RemoteMap remote_map{buffers.remote_map.data_ptr<int32_t>(), entries};
   push_positions_kernel<<<item_grid(entries), kThreads, 0, stream>>>(
       push_key_sorted.data_ptr<int64_t>(), push_order.data_ptr<int32_t>(),
-      requester_start.data_ptr<int64_t>(), keys.occurrence_count.data_ptr<int64_t>(), max_chunks,
+      remote_offsets.data_ptr<int64_t>(), keys.occurrence_count.data_ptr<int64_t>(), max_chunks,
       remote_map.position());
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   ProxyPlan plan;
@@ -1037,7 +1037,7 @@ ProxyPlan proxy_push_order(ProxyKeys keys, ProxyChunks chunks, const at::Tensor 
   plan.chunk_offset_per_bucket = chunks.chunk_offset_per_bucket;
   plan.chunk_inv = chunks.chunk_inv;
   plan.stage_offset_per_bucket = chunks.stage_offset_per_bucket;
-  plan.reduce_task_starts = chunks.reduce_task_starts;
+  plan.reduce_task_offsets = chunks.reduce_task_offsets;
   return plan;
 }
 

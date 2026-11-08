@@ -35,10 +35,10 @@ namespace dyn_emb {
 namespace hier_output_dist {
 
 // The node layout's tables (NodeLayout) as kernels write and read them. nullptr: a table the
-// layout does not have (requester_start, need_remote on one node; kjt_offsets, length_per_key
+// layout does not have (remote_offsets, need_remote on one node; kjt_offsets, length_per_key
 // across nodes).
 struct NodeLayoutView {
-  int64_t *own_lengths, *own_offsets, *own_total, *requester_start;
+  int64_t *own_lengths, *own_offsets, *own_total, *remote_offsets;
   int64_t *need_lookup, *need_remote;
   bool *skip;
   int64_t *row_shift, *kjt_offsets, *length_per_key;
@@ -48,7 +48,7 @@ inline NodeLayoutView view_of(const NodeLayout &node) {
   return NodeLayoutView{node.own_lengths.data_ptr<int64_t>(),
                         node.own_offsets.data_ptr<int64_t>(),
                         node.own_total.data_ptr<int64_t>(),
-                        data_or_null<int64_t>(node.requester_start),
+                        data_or_null<int64_t>(node.remote_offsets),
                         node.need_lookup.data_ptr<int64_t>(),
                         data_or_null<int64_t>(node.need_remote),
                         node.skip.data_ptr<bool>(),
@@ -58,8 +58,8 @@ inline NodeLayoutView view_of(const NodeLayout &node) {
 }
 
 // The int64 words node_layout_of works in: per (owner of the node, feature) the node's keys, those
-// of the requesters before this rank, and their ends over the node's owners; per (requester,
-// target) the requester's keys for the target's remote part; and the ends of this rank's blocks
+// of the requesters before this rank, and their offsets over the node's owners; per (requester,
+// target) the requester's keys for the target's remote part; and the offsets of this rank's blocks
 // for the owners of each target's rail.
 __host__ __device__ inline int64_t node_layout_scratch(const Topo &topo, int64_t num_features) {
   const int64_t local_size = topo.local_size;
@@ -91,12 +91,12 @@ __device__ inline void node_layout_of(const int64_t *offsets, const Topo &topo,
   auto bucket_keys = [&](int64_t requester, int64_t owner) {
     return at(requester, (owner + 1) * num_features) - at(requester, owner * num_features);
   };
-  // [owner t][feature f]: the node's keys, those of the requesters before this rank, and the ends
-  // of the node's keys, owner-major. [requester][target]: its keys for the target's remote part,
-  // a warp each, its lanes taking the owner nodes. [target][owner node]: the ends of this rank's
-  // blocks for the owners of the target's rail on the other nodes.
-  int64_t *total = scratch, *before = total + columns, *ends = before + columns,
-          *remote = ends + columns + 1, *block_ends = remote + local_size * local_size;
+  // [owner t][feature f]: the node's keys, those of the requesters before this rank, and the
+  // offsets of the node's keys (total_offsets), owner-major. [requester][target]: its keys for the
+  // target's remote part, a warp each, its lanes taking the owner nodes. [target][owner node]: the
+  // offsets of this rank's blocks for the owners of the target's rail on the other nodes.
+  int64_t *total = scratch, *before = total + columns, *total_offsets = before + columns,
+          *remote = total_offsets + columns + 1, *block_offsets = remote + local_size * local_size;
   for (int64_t index = threadIdx.x; index < columns; index += kThreads) {
     const int64_t owner = node * local_size + index / num_features, feature = index % num_features;
     int64_t keys = 0, earlier = 0;
@@ -119,7 +119,7 @@ __device__ inline void node_layout_of(const int64_t *offsets, const Topo &topo,
     if (lane == 0) remote[index] = keys;
   }
   // This rank's own part, in its KJT order [feature][requester]: each requester's keys of each
-  // feature for it, and where each starts: the ends of every one but the last.
+  // feature for it, and where each starts: their offsets without the total.
   for (int64_t index = threadIdx.x; index < columns; index += kThreads)
     out.own_lengths[index] =
         keys_of(index % local_size, node * local_size + me, index / local_size);
@@ -128,20 +128,21 @@ __device__ inline void node_layout_of(const int64_t *offsets, const Topo &topo,
   if (out.kjt_offsets != nullptr) {
     // One node: the own part is the owner's KJT. Its offsets (own_offsets are the first ones),
     // and its keys of each feature.
-    cta_exclusive_ends<int64_t>(columns, own_length, out.kjt_offsets);
+    cta_offsets_of<int64_t>(columns, own_length, out.kjt_offsets);
     for (int64_t i = threadIdx.x; i < columns; i += kThreads)
       out.own_offsets[i] = out.kjt_offsets[i];
     for (int64_t f = threadIdx.x; f < num_features; f += kThreads)
       out.length_per_key[f] =
           out.kjt_offsets[(f + 1) * local_size] - out.kjt_offsets[f * local_size];
   } else {
-    cta_exclusive_ends<int64_t>(columns - 1, own_length, out.own_offsets);
+    cta_offsets_of<int64_t>(columns - 1, own_length, out.own_offsets);
   }
   // The node's keys for each owner of the node, and the largest own part.
-  cta_exclusive_ends<int64_t>(
-      columns, [&](int64_t index) { return total[index]; }, ends);
+  cta_offsets_of<int64_t>(
+      columns, [&](int64_t index) { return total[index]; }, total_offsets);
   for (int64_t target = threadIdx.x; target < local_size; target += kThreads)
-    out.own_total[target] = ends[(target + 1) * num_features] - ends[target * num_features];
+    out.own_total[target] =
+        total_offsets[(target + 1) * num_features] - total_offsets[target * num_features];
   __syncthreads();
   const int64_t most_own = cta_max<int64_t>(
       local_size, [&](int64_t target) { return out.own_total[target]; }, 0);
@@ -150,9 +151,9 @@ __device__ inline void node_layout_of(const int64_t *offsets, const Topo &topo,
   // the node.
   bool skips = most_own > lookup_keys;
   if (num_nodes > 1) {
-    cta_exclusive_ends<int64_t>(
+    cta_offsets_of<int64_t>(
         local_size, [&](int64_t requester) { return remote[requester * local_size + me]; },
-        out.requester_start);
+        out.remote_offsets);
     const int64_t most_remote = cta_max<int64_t>(
         local_size,
         [&](int64_t target) {
@@ -178,25 +179,25 @@ __device__ inline void node_layout_of(const int64_t *offsets, const Topo &topo,
   for (int64_t index = threadIdx.x; index < columns; index += kThreads) {
     const int64_t target = index / num_features, feature = index % num_features;
     const int64_t bucket_feature = (node * local_size + target) * num_features + feature;
-    out.row_shift[bucket_feature] =
-        ends[index] - ends[target * num_features] + before[index] - at(me, bucket_feature);
+    out.row_shift[bucket_feature] = total_offsets[index] - total_offsets[target * num_features] +
+                                    before[index] - at(me, bucket_feature);
   }
   // A row of an owner (n, t) of another node is in t's remote part: after the keys of the
   // requesters before this rank, this rank's blocks for the owner nodes before n, and the rows
   // of its block before it. Every feature of the owner has the same row_shift.
-  cta_exclusive_ends<int64_t>(
+  cta_offsets_of<int64_t>(
       topo.world_size,
       [&](int64_t index) {
         const int64_t target = index / num_nodes, owner_node = index % num_nodes;
         return owner_node == node ? 0 : bucket_keys(me, owner_node * local_size + target);
       },
-      block_ends);
+      block_offsets);
   for (int64_t index = threadIdx.x; index < topo.world_size * num_features; index += kThreads) {
     const int64_t owner = index / num_features, owner_node = owner / local_size,
                   target = owner % local_size;
     if (owner_node == node) continue;
-    int64_t block_place =
-        lookup_keys + block_ends[target * num_nodes + owner_node] - block_ends[target * num_nodes];
+    int64_t block_place = lookup_keys + block_offsets[target * num_nodes + owner_node] -
+                          block_offsets[target * num_nodes];
     for (int64_t requester = 0; requester < me; ++requester)
       block_place += remote[requester * local_size + target];
     out.row_shift[index] = block_place - at(me, owner * num_features);

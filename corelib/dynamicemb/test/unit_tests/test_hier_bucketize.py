@@ -314,7 +314,7 @@ def reference(
             torch.cumsum(length_per_bucket_feature.sum(1), 0),
         ]
     )
-    feature_start = torch.cat(
+    feature_offsets = torch.cat(
         [
             torch.zeros(world_size, 1, dtype=torch.int64),
             torch.cumsum(length_per_bucket_feature, 1),
@@ -330,7 +330,7 @@ def reference(
         if new_weights is not None
         else torch.empty(0),
         "offset_per_bucket": offset_per_bucket,
-        "feature_start": feature_start.flatten(),
+        "feature_offsets": feature_offsets.flatten(),
         "offset_per_bucket_feature": torch.cat(
             [
                 torch.zeros(1, dtype=torch.int64),
@@ -447,7 +447,9 @@ def run_case(case: Case, seed: int, world_size: int) -> Dict[str, bool]:
         "offset_per_bucket": torch.equal(
             out["offset_per_bucket"].cpu(), ref["offset_per_bucket"]
         ),
-        "feature_start": torch.equal(out["feature_start"].cpu(), ref["feature_start"]),
+        "feature_offsets": torch.equal(
+            out["feature_offsets"].cpu(), ref["feature_offsets"]
+        ),
         "offset_per_bucket_feature": torch.equal(
             out["offset_per_bucket_feature"].cpu(), ref["offset_per_bucket_feature"]
         )
@@ -742,10 +744,10 @@ NODE_CASES = [
 def gathered(values: List[torch.Tensor], rows: List[Tuple[int, ...]]) -> torch.Tensor:
     """``values[requester][row]`` of each ``(requester, row, ...)`` of
     ``rows``, in order."""
-    starts = [0]
+    offsets = [0]
     for tensor in values:
-        starts.append(starts[-1] + tensor.numel())
-    index = [starts[source] + row for source, row, *_ in rows]
+        offsets.append(offsets[-1] + tensor.numel())
+    index = [offsets[source] + row for source, row, *_ in rows]
     return torch.cat(values)[torch.tensor(index, dtype=torch.int64)]
 
 
@@ -843,9 +845,9 @@ def run_node_case(case: NodeCase, seed: int) -> Dict[str, bool]:
         ),
     }
     if num_nodes > 1:  # one node has no remote part
-        checks["requester_start"] = all(
+        checks["remote_offsets"] = all(
             torch.equal(
-                layout["requester_start"],
+                layout["remote_offsets"],
                 torch.cat(
                     [
                         torch.zeros(1, dtype=torch.int64),
