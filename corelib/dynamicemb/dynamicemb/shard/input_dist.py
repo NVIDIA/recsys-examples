@@ -19,7 +19,9 @@ import torch
 from dynamicemb.dynamicemb_config import DIST_TYPE_CODES
 from dynamicemb_extensions import block_bucketize_sparse_features  # pyre-ignore
 from torch import distributed as dist
+from torchrec.distributed.dist_data import KJTAllToAll, KJTAllToAllTensorsAwaitable
 from torchrec.distributed.embedding_sharding import (
+    KJTSplitsAllToAllMeta,
     _fx_wrap_batch_size_per_feature,
     _fx_wrap_gen_list_n_times,
     _fx_wrap_max_B,
@@ -34,6 +36,7 @@ from torchrec.distributed.types import Awaitable
 from torchrec.fx.utils import assert_fx_safe
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 
+from ..scored_kjt import ScoredKeyedJaggedTensor
 from .hier_output_dist import DynamicEmbSequenceShardingContext, HierSharding
 
 torch.fx.wrap("len")
@@ -149,6 +152,62 @@ def bucketize_kjt_before_all2all(
     )
 
 
+def permute_scores_like_keys(
+    scores: torch.Tensor, unbucketize_permute: torch.Tensor
+) -> torch.Tensor:
+    """``scores`` in the order :func:`bucketize_kjt_before_all2all` put its keys.
+
+    ``unbucketize_permute[i]`` is where the bucketize moved the ``i``-th input
+    key, so the score of that key goes there too. It is a permutation, so the
+    scatter writes each place once and gives the same result every time.
+    """
+    return torch.empty_like(scores).index_copy_(0, unbucketize_permute, scores)
+
+
+class _ScoredTensorsAwaitable(KJTAllToAllTensorsAwaitable):
+    """The keys' tensors all2all, waiting for the scores' too.
+
+    It is a ``KJTAllToAllTensorsAwaitable`` on purpose: TorchRec reads the
+    ``input_splits``, ``output_splits`` and recat the output distribution needs
+    off the instances of that class, and skips anything else. It takes over the
+    state of the keys' awaitable instead of issuing the all2all again.
+    """
+
+    def __init__(
+        self,
+        keys_awaitable: KJTAllToAllTensorsAwaitable,
+        scores_awaitable: KJTAllToAllTensorsAwaitable,
+    ) -> None:
+        self.__dict__.update(keys_awaitable.__dict__)
+        self._scores_awaitable = scores_awaitable
+
+    def clear_inputs(self) -> int:
+        return super().clear_inputs() + self._scores_awaitable.clear_inputs()
+
+    def _wait_impl(self) -> ScoredKeyedJaggedTensor:
+        keys = super()._wait_impl()
+        scores = self._scores_awaitable.wait()
+        # Same lengths, same recat: the scores come out in the keys' order.
+        return ScoredKeyedJaggedTensor.from_kjt(keys, scores.values())
+
+
+class _ScoredSplitsAwaitable(Awaitable[KJTAllToAllTensorsAwaitable]):
+    """The first level of the keys' all2all and of the scores'.
+
+    The keys' tensors are waited for before the scores', on every rank, so the
+    two all2alls are issued in the same order everywhere.
+    """
+
+    def __init__(self, keys_awaitable, scores_awaitable) -> None:
+        super().__init__()
+        self._keys_awaitable = keys_awaitable
+        self._scores_awaitable = scores_awaitable
+
+    def _wait_impl(self) -> KJTAllToAllTensorsAwaitable:
+        keys = self._keys_awaitable.wait()
+        return _ScoredTensorsAwaitable(keys, self._scores_awaitable.wait())
+
+
 def _determine_output_weights(kjt, pos, bucketize_pos, bucketized_weights):
     """
     Determine which weights to return: pos or bucketized_weights.
@@ -189,9 +248,15 @@ class RwSparseFeaturesDist(_RwSparseFeaturesDist):
         dist_types: the rule per feature, in the same order as
             ``feature_hash_sizes`` -- the kernel indexes both with the same
             ``t``, and building them together here is what keeps them aligned.
+        per_key_score: the sparse features carry a score per key
+            (:class:`~dynamicemb.scored_kjt.ScoredKeyedJaggedTensor`), sent by
+            an all2all of their own beside the keys', and handed on with the
+            received keys.
         hier: the sharding's hierarchical dist (``shard/hier_output_dist.py``),
             whose input dist :meth:`hier_forward` runs, or None. ``forward``
             stays TorchRec's distribution, for the calls that do not take it.
+            None where ``per_key_score``: :meth:`hier_forward` carries no
+            scores.
     """
 
     def __init__(
@@ -204,6 +269,7 @@ class RwSparseFeaturesDist(_RwSparseFeaturesDist):
         has_feature_processor: bool = False,
         need_pos: bool = False,
         dist_types: Optional[List[str]] = None,
+        per_key_score: bool = False,
         hier: Optional[HierSharding] = None,
     ) -> None:
         super().__init__(
@@ -220,6 +286,11 @@ class RwSparseFeaturesDist(_RwSparseFeaturesDist):
             dist_type_codes(dist_types, device=device),
             persistent=False,
         )
+        self._score_dist: Optional[KJTAllToAll] = (
+            KJTAllToAll(pg=pg, splits=[num_features] * pg.size())
+            if per_key_score
+            else None
+        )
         # the same codes on the host, which the hierarchical dist takes
         # (dist_type_codes checked them)
         self._dist_type_codes: List[int] = [DIST_TYPE_CODES[t] for t in dist_types]
@@ -230,20 +301,60 @@ class RwSparseFeaturesDist(_RwSparseFeaturesDist):
         sparse_features: KeyedJaggedTensor,
     ) -> Awaitable[Awaitable[KeyedJaggedTensor]]:
         """Bucketize by ``dist_type``, then TorchRec's AlltoAll unchanged."""
-        (
-            bucketized_features,
-            self.unbucketize_permute_tensor,
-        ) = self._bucketize(sparse_features)
-        return self._dist(bucketized_features)
+        # A collection that takes a score per key refuses a plain input while it
+        # trains (see ``require_scores``) and, in evaluation, drops the scores of
+        # an input that has them (``without_scores``), so what arrives here is
+        # scored exactly when training: the same on every rank, which the
+        # all2all of the scores, a collective, needs.
+        takes_scores = self._score_dist is not None and isinstance(
+            sparse_features, ScoredKeyedJaggedTensor
+        )
+        bucketized_features, unbucketize_permute = self._bucketize(
+            sparse_features, takes_scores
+        )
+        self.unbucketize_permute_tensor = (
+            unbucketize_permute if self._is_sequence else None
+        )
+
+        keys_dist = self._dist(bucketized_features)
+        if not takes_scores:
+            return keys_dist
+
+        # TrainPipelineSparseDist swaps ``_dist.forward`` for one that returns
+        # the metadata of a splits all2all it fuses across modules, not an
+        # awaitable. The fused path rebuilds the keys' tensors awaitable itself
+        # and has nowhere to carry the scores, so it is refused for now.
+        if isinstance(keys_dist, KJTSplitsAllToAllMeta):
+            raise NotImplementedError(
+                "A table with score_strategy PRECISE_CUSTOMIZED cannot be "
+                "trained with a TorchRec train pipeline "
+                "(TrainPipelineSparseDist and its variants) yet: the pipeline "
+                "fuses the splits all2all of the keys and has no channel for "
+                "per-key scores. Run the model without the pipeline."
+            )
+
+        scores = permute_scores_like_keys(sparse_features.scores(), unbucketize_permute)
+        # The scores are sent as the values of a KJT of the keys' shape. Its
+        # lengths are a copy: ``clear_inputs`` frees what an all2all was given
+        # once that all2all is done, and must not take the other's lengths away.
+        scores_kjt = KeyedJaggedTensor(
+            keys=bucketized_features.keys(),
+            values=scores,
+            lengths=bucketized_features.lengths().clone(),
+            stride=bucketized_features.stride(),
+        )
+        return _ScoredSplitsAwaitable(keys_dist, self._score_dist(scores_kjt))
 
     def _bucketize(
-        self, sparse_features: KeyedJaggedTensor
+        self, sparse_features: KeyedJaggedTensor, takes_scores: bool = False
     ) -> Tuple[KeyedJaggedTensor, Optional[torch.Tensor]]:
         return bucketize_kjt_before_all2all(
             sparse_features,
             num_buckets=self._world_size,
             block_sizes=self._feature_block_sizes_tensor,
-            output_permute=self._is_sequence,
+            # The scores are moved by it too, though only a sequence embedding
+            # needs it afterwards.
+            output_permute=self._is_sequence or takes_scores,
             bucketize_pos=(
                 self._has_feature_processor
                 if sparse_features.weights_or_none() is None

@@ -46,6 +46,9 @@ namespace dyn_emb {
  *                            frequencies for weighted counting
  *                          - Pass None from Python to disable frequency
  *                            counting entirely (output freq_counters will be empty)
+ * @param reduce_op How the values of a repeated key are combined: 0 = sum
+ *                  (default), 1 = max, 2 = min. max / min treat the values as
+ *                  non-negative per-key scores.
  *
  * @return Tuple of (num_uniques, unique_keys, output_indices, table_offsets,
  *         freq_counters)
@@ -62,7 +65,8 @@ namespace dyn_emb {
 std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor>
 segmented_unique_cuda(at::Tensor keys, at::Tensor segmented_range,
                       int64_t num_tables,
-                      at::Tensor input_frequencies = at::Tensor());
+                      at::Tensor input_frequencies = at::Tensor(),
+                      int64_t reduce_op = 0);
 
 /**
  * @brief Expand table IDs from offsets (identity mapping: one feature per table,

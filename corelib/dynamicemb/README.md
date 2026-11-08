@@ -102,6 +102,7 @@ Regarding how to use the DynamicEmb APIs and their parameters, please refer to t
 5. Although dynamic embedding tables can be trained together with TorchREC tables, they cannot be fused together for embedding lookup. Therefore, it is recommended to select dynamic embedding tables for all model-parallel tables during training.
 6. DynamicEmb supports training with TorchREC's `EmbeddingBagCollection` (pooling mode: SUM/MEAN) and `EmbeddingCollection` (sequence mode). Both modes use fused CUDA kernels for embedding lookup and gradient reduction. Tables with different embedding dimensions are supported in pooling mode.
 7. DynamicEmb supports Torch-exportable embedding tables through `InferenceEmbeddingTable`. It uses DynamicEmb `ScoredHashTable` metadata frozen at export/inference time and `LinearUVMEmbedding` from [NVEmbedding](https://github.com/NVIDIA/nv-embedding-cache), supporting sequence mode and pooling mode (`SUM`, `MEAN`). It is initialized from `DynamicEmbTableOptions` and loads from DynamicEmb dumped embedding files.
+8. A table can take a score per key from the input (`DynamicEmbScoreStrategy.PRECISE_CUSTOMIZED`, with a `ScoredKeyedJaggedTensor` as input), for row-wise `EmbeddingCollection` and `EmbeddingBagCollection`. See "Per-key score" in [DynamicEmb_APIs.md](./DynamicEmb_APIs.md).
 
 ### DynamicEmb Insertion Behavior Checking Modes
 

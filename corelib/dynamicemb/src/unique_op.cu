@@ -141,15 +141,51 @@ __device__ __forceinline__ int binary_search_upper_bound(const int64_t *arr,
   return lo - 1;
 }
 
+// How the per-key values of one distinct key are combined. kSum is the access
+// frequency; kMax / kMin keep the largest / smallest value (a per-key score).
+// The values are signed int64, so they must be non-negative where they are
+// scores (see the Python-side contract).
+enum class FreqReduceOp : int { kSum = 0, kMax = 1, kMin = 2 };
+
+// The value node_freq starts from: the identity of the reduction, so a
+// representative and its duplicates can all reduce into it in any order.
+static __host__ __forceinline__ int64_t freq_reduce_identity(FreqReduceOp op) {
+  switch (op) {
+  case FreqReduceOp::kMax:
+    return std::numeric_limits<int64_t>::min();
+  case FreqReduceOp::kMin:
+    return std::numeric_limits<int64_t>::max();
+  default:
+    return 0;
+  }
+}
+
+__device__ __forceinline__ void reduce_into(int64_t *address, int64_t val,
+                                            FreqReduceOp op) {
+  auto *ll = reinterpret_cast<long long *>(address);
+  switch (op) {
+  case FreqReduceOp::kMax:
+    ::atomicMax(ll, static_cast<long long>(val));
+    break;
+  case FreqReduceOp::kMin:
+    ::atomicMin(ll, static_cast<long long>(val));
+    break;
+  default:
+    atomicAdd(address, val);
+    break;
+  }
+}
+
 // Initialize the chaining hash structures: bucket heads and chain pointers to
-// -1 (empty), node_freq to 0, and the per-table counters to 0.  rep_local and
+// -1 (empty), node_freq to the identity of the reduction (freq_init), and the per-table counters to 0.  rep_local and
 // output_indices need no init -- core writes rep_local for every input and
 // finalize writes every output_indices.
 __global__ void segmented_unique_prepare(int *head, int *next_arr,
                                          int64_t *node_freq,
                                          int64_t *table_counters,
-                                         bool count_freq, size_t num_buckets,
-                                         size_t num_keys, int64_t num_tables) {
+                                         bool count_freq, int64_t freq_init,
+                                         size_t num_buckets, size_t num_keys,
+                                         int64_t num_tables) {
   const size_t stride = blockDim.x * gridDim.x;
   const size_t gtid = blockIdx.x * blockDim.x + threadIdx.x;
   for (size_t i = gtid; i < num_buckets; i += stride)
@@ -157,7 +193,7 @@ __global__ void segmented_unique_prepare(int *head, int *next_arr,
   for (size_t i = gtid; i < num_keys; i += stride) {
     next_arr[i] = -1;
     if (count_freq)
-      node_freq[i] = 0;
+      node_freq[i] = freq_init;
   }
   for (size_t i = gtid; i < static_cast<size_t>(num_tables); i += stride)
     table_counters[i] = 0;
@@ -192,7 +228,7 @@ segmented_unique_core(
     const KeyType *d_keys, size_t num_keys, int *d_head, int *d_next,
     int64_t *node_freq, int *rep_local, int64_t *table_counters,
     const int64_t *d_segmented_range, const int64_t *input_frequencies,
-    int64_t num_tables) {
+    int64_t num_tables, FreqReduceOp reduce_op) {
   const int B = blockDim.x;
   const int tid = threadIdx.x;
   const bool count_freq = node_freq != nullptr;
@@ -266,13 +302,13 @@ segmented_unique_core(
       // from rep_local, so duplicates need not spin here.
       rep_local[idx] = s_base[t] + rank;
       if (count_freq)
-        atomicAdd(&node_freq[idx], input_freq);
+        reduce_into(&node_freq[idx], input_freq, reduce_op);
     } else if (valid && kind == 2) {
       // Duplicate: encode the representative node as -(rep+1); finalize reads
       // rep_local[rep] (the rep's local index, stable) to resolve it.
       rep_local[idx] = -(rep + 1);
       if (count_freq)
-        atomicAdd(&node_freq[rep], input_freq);
+        reduce_into(&node_freq[rep], input_freq, reduce_op);
     }
     __syncthreads();
   }
@@ -398,7 +434,8 @@ __global__ void expand_table_ids_kernel(const int64_t *offsets,
 
 std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor>
 segmented_unique_cuda(at::Tensor keys, at::Tensor segmented_range,
-                      int64_t num_tables, at::Tensor input_frequencies) {
+                      int64_t num_tables, at::Tensor input_frequencies,
+                      int64_t reduce_op) {
   cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
 
   const int64_t num_keys = keys.numel();
@@ -427,13 +464,28 @@ segmented_unique_cuda(at::Tensor keys, at::Tensor segmented_range,
   // counts as 1
   // - input_frequencies defined with numel()>0: use provided frequencies (must
   // match num_keys)
+  TORCH_CHECK(reduce_op >= static_cast<int64_t>(FreqReduceOp::kSum) &&
+                  reduce_op <= static_cast<int64_t>(FreqReduceOp::kMin),
+              "reduce_op must be 0 (sum), 1 (max) or 2 (min), got ", reduce_op);
+  const auto freq_op = static_cast<FreqReduceOp>(reduce_op);
   const bool enable_freq_counting = input_frequencies.defined();
   const bool has_input_freq =
       enable_freq_counting && input_frequencies.numel() > 0;
 
+  if (enable_freq_counting) {
+    // The kernel reads this as raw int64; any other dtype would be silently
+    // misread, so insist on it (an empty tensor included).
+    TORCH_CHECK(input_frequencies.scalar_type() == at::kLong,
+                "input_frequencies must be int64, got ",
+                input_frequencies.scalar_type());
+  }
   if (has_input_freq) {
     TORCH_CHECK(input_frequencies.numel() == num_keys,
                 "input_frequencies must have same length as keys");
+    TORCH_CHECK(input_frequencies.device() == device,
+                "input_frequencies must be on the same device as keys");
+    TORCH_CHECK(input_frequencies.is_contiguous(),
+                "input_frequencies must be contiguous");
   }
 
   // Debug validation of segmented_range (enabled via DYNAMICEMB_DEBUG=1).
@@ -532,7 +584,8 @@ segmented_unique_cuda(at::Tensor keys, at::Tensor segmented_range,
       get_pointer<int32_t>(head), get_pointer<int32_t>(next_arr),
       enable_freq_counting ? get_pointer<int64_t>(node_freq) : nullptr,
       get_pointer<int64_t>(table_counters), enable_freq_counting,
-      static_cast<size_t>(num_buckets), num_keys, num_tables);
+      freq_reduce_identity(freq_op), static_cast<size_t>(num_buckets), num_keys,
+      num_tables);
   DEMB_CUDA_KERNEL_LAUNCH_CHECK();
 
   dispatch_key_type(key_dtype, [&]<typename KeyType>() {
@@ -575,7 +628,7 @@ segmented_unique_cuda(at::Tensor keys, at::Tensor segmented_range,
         get_pointer<const int64_t>(segmented_range),
         has_input_freq ? get_pointer<const int64_t>(input_frequencies)
                        : nullptr,
-        num_tables);
+        num_tables, freq_op);
     DEMB_CUDA_KERNEL_LAUNCH_CHECK();
   });
 
@@ -711,7 +764,8 @@ void bind_unique_op(py::module &m) {
   m.def(
       "segmented_unique_cuda",
       [](at::Tensor keys, at::Tensor segmented_range, int64_t num_tables,
-         const c10::optional<at::Tensor> &input_frequencies) {
+         const c10::optional<at::Tensor> &input_frequencies,
+         const std::string &reduce) {
         // Convert optional to tensor:
         // - None -> undefined tensor (disables frequency counting)
         // - Some(tensor) -> that tensor (enables frequency counting)
@@ -721,8 +775,19 @@ void bind_unique_op(py::module &m) {
         }
         // If input_frequencies was None, freq_tensor remains undefined
         // which will disable frequency counting in the C++ implementation
+        int64_t reduce_op = 0;
+        if (reduce == "sum") {
+          reduce_op = static_cast<int64_t>(dyn_emb::FreqReduceOp::kSum);
+        } else if (reduce == "max") {
+          reduce_op = static_cast<int64_t>(dyn_emb::FreqReduceOp::kMax);
+        } else if (reduce == "min") {
+          reduce_op = static_cast<int64_t>(dyn_emb::FreqReduceOp::kMin);
+        } else {
+          TORCH_CHECK(false, "reduce must be 'sum', 'max' or 'min', got '",
+                      reduce, "'");
+        }
         return dyn_emb::segmented_unique_cuda(keys, segmented_range, num_tables,
-                                              freq_tensor);
+                                              freq_tensor, reduce_op);
       },
       R"doc(
 Segmented unique: deduplicate keys per table using GPU hash table.
@@ -743,6 +808,10 @@ Args:
                        - None: Disable frequency counting (output freq_counters empty)
                        - Empty tensor (numel==0): Enable counting, each key counts as 1
                        - Tensor with numel==num_keys: Use provided frequencies
+    reduce: How the values of a repeated key are combined into its
+            frequency_counters entry: "sum" (default, accumulate), "max" or "min".
+            For "max" / "min" the values are per-key scores and must be
+            non-negative; without input_frequencies every occurrence is 1.
 
 Returns:
     Tuple of (num_uniques, unique_keys, output_indices, table_offsets, frequency_counters)
@@ -755,7 +824,8 @@ Returns:
     - frequency_counters: Per-unique-key frequency counts (empty if disabled)
 )doc",
       py::arg("keys"), py::arg("segmented_range"), py::arg("num_tables"),
-      py::arg("input_frequencies") = py::none());
+      py::arg("input_frequencies") = py::none(),
+      py::arg("reduce") = std::string("sum"));
 
   m.def(
       "expand_table_ids_cuda",

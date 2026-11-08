@@ -40,6 +40,12 @@ from typing import (
 
 import torch  # usort:skip
 import torch.distributed as dist
+from dynamicemb.async_erase import (
+    AsyncEraser,
+    EraseHandle,
+    TableAccessGate,
+    check_erase_arguments,
+)
 from dynamicemb.batched_dynamicemb_function import (
     DynamicEmbeddingFunction,
     PrefetchState,
@@ -47,6 +53,7 @@ from dynamicemb.batched_dynamicemb_function import (
     dynamicemb_prefetch,
 )
 from dynamicemb.dynamicemb_config import (
+    DynamicEmbCheckMode,
     DynamicEmbEvictStrategy,
     DynamicEmbPoolingMode,
     DynamicEmbScoreStrategy,
@@ -65,6 +72,8 @@ from dynamicemb.key_value_table import (
     Cache,
     DynamicEmbCache,
     DynamicEmbStorage,
+    ERASE_CHUNK_SLOTS,
+    ERASE_MAX_CHUNKS_IN_FLIGHT,
     HybridStorage,
     Storage,
     flush_cache,
@@ -665,6 +674,10 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
         self._enable_prefetch = prefetch_pipeline
         self.prefetch_stream = None
         self._prefetch_outstanding_keys = torch.tensor(0, dtype=torch.int64)
+        # Who may touch the tables now: prefetch, and an erase running beside the
+        # training. See async_erase.py.
+        self._table_gate = TableAccessGate()
+        self._eraser = AsyncEraser()
         self._table_names = table_names
         self.bounds_check_mode_int: int = bounds_check_mode.value
         self._create_score()
@@ -782,6 +795,22 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
         self._create_cache_storage()
         self._create_initializers()
         self._create_admitter()
+        # The counters ride the KJT weights channel of a whole sharding, so a
+        # group with no use for them -- CUSTOMIZED tables next to LFU ones --
+        # is handed some all the same and must drop them, or they would be
+        # misread as scores. Tables are grouped on score and admit strategy, so
+        # one answer holds for the whole group and for the module's lifetime.
+        self._consumes_frequency_counters = self._admitter is not None or any(
+            option.score_strategy is not None
+            and get_eviction_score_strategy(option.score_strategy)
+            == DynamicEmbScoreStrategy.LFU
+            for option in self._dynamicemb_options
+        )
+        # Tables are grouped on it too (see DynamicEmbTableOptions), so it holds
+        # for the whole group: every table takes a score per key, or none does.
+        self.per_key_score: bool = any(
+            option.takes_score_per_key for option in self._dynamicemb_options
+        )
         self._prefetch_states: Deque[PrefetchState] = deque()
         # Hook of the hierarchical dist (shard/hier_output_dist.py, set by
         # HierGroupedEmbeddingsLookup): where to put the sequence lookup
@@ -868,7 +897,12 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                         "storage expands instead of evicting, so a PS below it "
                         "would never be used."
                     )
-                self._storage = DynamicEmbStorage(storage_options, self._optimizer)
+                # Under a cache the cache pins the slots a batch uses, never the
+                # storage's, so its per-slot reference counter would only take
+                # (a lot of) memory.
+                self._storage = DynamicEmbStorage(
+                    storage_options, self._optimizer, use_ref_counter=False
+                )
                 if PS:
                     # The PS sits below the storage: the storage owns scores and
                     # the freshest values, the PS only holds what it evicted.
@@ -883,10 +917,22 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                     for storage_option in storage_options:
                         storage_option.local_hbm_for_values = 0
                     PS = storage_options[0].external_storage
+                    if PS and any(o.takes_score_per_key for o in storage_options):
+                        # The external store is the only tier and is asked
+                        # directly; its find() has no score per key to take.
+                        raise NotImplementedError(
+                            "score_strategy PRECISE_CUSTOMIZED is not supported "
+                            "with external_storage as the only storage tier "
+                            "(caching=False and no HBM budget for values)."
+                        )
                     self._storage = (
                         PS(storage_options, self._optimizer)
                         if PS
-                        else DynamicEmbStorage(storage_options, self._optimizer)
+                        # Host-side values: the generic (DEFAULT) path, which
+                        # pins no slot, so no per-slot reference counter.
+                        else DynamicEmbStorage(
+                            storage_options, self._optimizer, use_ref_counter=False
+                        )
                     )
                     self._storage_layout = (
                         StorageLayout.HOST_PS if PS else StorageLayout.HOST_ONLY
@@ -918,6 +964,18 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                         cap = max(1, int(host_option.max_capacity * storage_cap_scale))
                         host_option.max_capacity = min(host_option.max_capacity, cap)
                         host_option.init_capacity = min(host_option.init_capacity, cap)
+
+                    # Nor does it take a score per key: the scores of the input
+                    # reach a storage, and this one has two tiers to place them in.
+                    if any(
+                        option.takes_score_per_key
+                        for option in self._dynamicemb_options
+                    ):
+                        raise NotImplementedError(
+                            "score_strategy PRECISE_CUSTOMIZED is not supported with "
+                            "HybridStorage (non-caching partial-HBM storage). Use "
+                            "caching=True or a single-tier configuration."
+                        )
 
                     # HybridStorage does not support NO_EVICTION yet: its tiers
                     # still use the hash slot as the value row, and its
@@ -1217,7 +1275,9 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
         # Shape (number of features, number of ranks)
         batch_size_per_feature_per_rank: Optional[List[List[int]]] = None,
         total_unique_indices: Optional[int] = None,
+        scores: Optional[Tensor] = None,
     ) -> List[Tensor]:
+        self._check_scores(scores, indices)
         if indices.dtype != self.index_type:
             indices = indices.to(self.index_type)
 
@@ -1295,8 +1355,9 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                     "it would be treated as missing. Train with external_storage "
                     "unset, or do not call eval() on this module."
                 )
-            scores = [self._scores[name] for name in self._table_names]
-            fused_score = self._reduce_table_scores(scores)
+            frequency_counters = self._counters_for_group(frequency_counters)
+            table_scores = [self._scores[name] for name in self._table_names]
+            fused_score = self._reduce_table_scores(table_scores)
             if isinstance(self._cache, DynamicEmbCache):
                 self._cache.training = False
                 self._cache.set_score(fused_score)
@@ -1324,7 +1385,9 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
             )
 
         if not self._prefetch_states:
-            self.prefetch(indices, offsets, frequency_counters=frequency_counters)
+            self.prefetch(
+                indices, offsets, frequency_counters=frequency_counters, scores=scores
+            )
         prefetch_state = self._prefetch_states.popleft()
         prefetch_state.record_stream(torch.cuda.current_stream())
 
@@ -1350,6 +1413,46 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
 
         return res
 
+    def _check_scores(self, scores: Optional[Tensor], indices: Tensor) -> None:
+        """The scores must come exactly when the tables take a score per key.
+
+        Evaluation reads no score, so it may go without them.
+        """
+        if scores is None:
+            if self.per_key_score and self.training:
+                raise ValueError(
+                    "These tables take a score per key (PRECISE_CUSTOMIZED), "
+                    "but no scores were given."
+                )
+            return
+        if not self.per_key_score:
+            raise ValueError(
+                "Scores were given to tables that do not take a score per key."
+            )
+        if scores.dtype != torch.int64 or scores.numel() != indices.numel():
+            raise ValueError(
+                "scores must be int64, one per index; got "
+                f"{scores.dtype} x {scores.numel()} for {indices.numel()} indices."
+            )
+        # Reading the values to look for a negative one waits for the device, so
+        # it is done only for a table that asked to be checked: an error stops
+        # on it, a warning says so.
+        modes = {option.safe_check_mode for option in self._dynamicemb_options}
+        if modes == {DynamicEmbCheckMode.IGNORE} or not bool((scores < 0).any()):
+            return
+        if DynamicEmbCheckMode.ERROR in modes:
+            raise ValueError("scores must be non-negative.")
+        warnings.warn(
+            "scores must be non-negative; a negative one is read as a very large "
+            "score by the table."
+        )
+
+    def _counters_for_group(
+        self, frequency_counters: Optional[Tensor]
+    ) -> Optional[Tensor]:
+        """Return ``frequency_counters`` only if this group consumes them."""
+        return frequency_counters if self._consumes_frequency_counters else None
+
     def prefetch(
         self,
         indices: Tensor,
@@ -1357,7 +1460,9 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
         forward_stream: Optional[torch.cuda.Stream] = None,
         batch_size_per_feature_per_rank: Optional[List[List[int]]] = None,
         frequency_counters: Optional[Tensor] = None,
+        scores: Optional[Tensor] = None,
     ) -> None:
+        self._check_scores(scores, indices)
         if not self.training:
             return
         if self.prefetch_stream is None and forward_stream is not None:
@@ -1370,8 +1475,16 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
             indices.record_stream(current_stream)
             offsets.record_stream(current_stream)
 
-        scores = [self._scores[name] for name in self._table_names]
-        fused_score = self._reduce_table_scores(scores)
+        if scores is not None:
+            # The kernels below read the scores on this stream, possibly after the
+            # caller has let go of them; a caller that made them on another stream
+            # would otherwise see their memory reused underneath those kernels.
+            scores.record_stream(torch.cuda.current_stream())
+
+        frequency_counters = self._counters_for_group(frequency_counters)
+
+        table_scores = [self._scores[name] for name in self._table_names]
+        fused_score = self._reduce_table_scores(table_scores)
         if isinstance(self._cache, DynamicEmbCache):
             self._cache.training = True
             self._cache.set_score(fused_score)
@@ -1395,6 +1508,8 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                 if self._cache is not None
                 else None,
                 external_storage=self._external_storage,
+                scores=scores,
+                table_gate=self._table_gate,
             )
         )
         self._update_score()
@@ -1413,6 +1528,12 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
             if table_score == 0:
                 raise ValueError(f"Can't set table's score to 0.")
             index = self._table_names.index(table_name)
+            if self._dynamicemb_options[index].takes_score_per_key:
+                raise ValueError(
+                    f"Table '{table_name}' takes a score per key "
+                    "(PRECISE_CUSTOMIZED); its scores come with the input, "
+                    "not from set_score."
+                )
             # The score part, so that (NO_EVICTION, CUSTOMIZED) -- in either order --
             # takes a user score like CUSTOMIZED does.
             assert (
@@ -1443,6 +1564,119 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
             else:
                 result[table_name] = self._scores[table_name]
         return result
+
+    # What a storage layout lets an erase by score do. Only a single-tier GPU storage
+    # and the backing storage of a cache keep a key map the erase can scan; the others
+    # keep their keys where it cannot (host values read by the generic path, two tiers,
+    # an external store).
+    _ERASABLE_LAYOUTS = (StorageLayout.HBM_ONLY, StorageLayout.CACHING)
+
+    def erasable_table_ids(self, score_strategy: DynamicEmbScoreStrategy) -> List[int]:
+        """The tables an erase by ``score_strategy`` would scan, after checking that it can.
+
+        A table is scanned when its score strategy has ``score_strategy`` as a member
+        (``(NO_EVICTION, CUSTOMIZED)`` has ``CUSTOMIZED``); one with no score, which
+        is ``NO_EVICTION`` alone, is not. Raises if a table that would be scanned
+        cannot be: it keeps more than one score word, or its storage cannot be
+        scanned. Nothing to scan is an empty list, not an error.
+        """
+        table_ids = []
+        for table_id, (name, option) in enumerate(
+            zip(self._table_names, self._dynamicemb_options)
+        ):
+            part = get_score_part(option.score_strategy)
+            if part is None:
+                continue
+            if isinstance(part, tuple):
+                if score_strategy in part:
+                    raise NotImplementedError(
+                        f"Table '{name}' keeps one score word per strategy in "
+                        f"{option.score_strategy}; erase by score reads one."
+                    )
+                continue
+            if part == score_strategy:
+                table_ids.append(table_id)
+        if table_ids and self._storage_layout not in self._ERASABLE_LAYOUTS:
+            raise NotImplementedError(
+                "erase by score needs the keys in a GPU hash table: HBM-only storage, "
+                "or a cache over host storage with no external storage. This module "
+                f"is {self._storage_layout.name}."
+            )
+        return table_ids
+
+    def erase_by_score_async(
+        self,
+        score_strategy: DynamicEmbScoreStrategy,
+        threshold: int,
+        stream: Optional[torch.cuda.Stream] = None,
+        chunk_slots: int = ERASE_CHUNK_SLOTS,
+        max_in_flight: int = ERASE_MAX_CHUNKS_IN_FLIGHT,
+    ) -> EraseHandle:
+        """Erase, in the background, the keys whose score is below ``threshold``.
+
+        Only tables whose score strategy has ``score_strategy`` as a member are
+        scanned (see :meth:`erasable_table_ids`); with none, the handle is done at
+        once and says ``(0, 0)``. The scan runs on a thread of its own and launches on
+        ``stream``, a stream of the tables' device; the call returns at once. Without a
+        ``stream`` this one uses a stream of its own, made on first use and kept, and the
+        scan overlaps the training. On the stream the training runs on, or the prefetch
+        stream, it is queued among the training's kernels and runs correctly, only
+        without overlap, which is warned about. Work the training already queued is not
+        waited for.
+
+        The scan goes a chunk at a time of at most ``chunk_slots`` slots, with at most
+        ``max_in_flight`` chunks launched and not yet finished on the device: smaller
+        chunks and fewer in flight disturb the training less and make the scan take
+        longer (see ``ERASE_CHUNK_SLOTS``).
+
+        Best effort: a key a prefetched batch is still using is spared, not erased.
+        With a cache only the storage behind it is erased, and the cache is neither
+        read nor changed.
+
+        The scan can overlap training -- forward, backward and prefetch -- and nothing
+        else: before a dump, load, incremental dump, replay or ``pop_*``, wait for
+        the handle.
+
+        Returns an :class:`EraseHandle`; ``result()`` is ``(erased, spared)``.
+        """
+        check_erase_arguments(
+            score_strategy, threshold, stream, chunk_slots, max_in_flight
+        )
+        table_ids = self.erasable_table_ids(score_strategy)
+        if not table_ids:
+            return EraseHandle.completed()
+        if stream is None:
+            stream = self._eraser.own_stream(self.device_id)
+        else:
+            if stream.device != torch.device("cuda", self.device_id):
+                raise ValueError(
+                    f"stream is on {stream.device}, the tables are on cuda:{self.device_id}."
+                )
+            if stream in (
+                torch.cuda.current_stream(self.device_id),
+                torch.cuda.default_stream(self.device_id),
+                self.prefetch_stream,
+            ):
+                warnings.warn(
+                    "The erase runs on a stream the training uses (the current, the "
+                    "default or the prefetch stream): it is queued among the training's "
+                    "kernels and will not overlap them. Leave stream out, or pass a "
+                    "stream of its own, to overlap.",
+                    UserWarning,
+                    stacklevel=2,
+                )
+        storage, gate = self._storage, self._table_gate
+        return self._eraser.submit(
+            lambda counts: storage.erase_by_score(
+                threshold,
+                table_ids,
+                counts,
+                chunk_slots=chunk_slots,
+                chunk_guard=gate,
+                max_in_flight=max_in_flight,
+            ),
+            stream,
+        )
 
     def fill_tables(
         self,
@@ -1487,7 +1721,10 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
             elif eviction_strategy == DynamicEmbScoreStrategy.STEP:
                 option.evict_strategy = DynamicEmbEvictStrategy.CUSTOMIZED
                 self._scores[table_name] = 1
-            elif eviction_strategy == DynamicEmbScoreStrategy.CUSTOMIZED:
+            elif eviction_strategy in (
+                DynamicEmbScoreStrategy.CUSTOMIZED,
+                DynamicEmbScoreStrategy.PRECISE_CUSTOMIZED,
+            ):
                 option.evict_strategy = DynamicEmbEvictStrategy.CUSTOMIZED
                 self._scores[table_name] = 0
             elif eviction_strategy == DynamicEmbScoreStrategy.LFU:
@@ -2214,7 +2451,8 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                 raise ValueError(
                     f"replay_increment: the source of table '{table_name}' erased "
                     "keys without retaining them (erase_keys without "
-                    "EvictedItemMode.RETAIN_KEY). Each erase left a reclaimed slot "
+                    "EvictedItemMode.RETAIN_KEY, or erase_by_score_async, which "
+                    "retains nothing). Each erase left a reclaimed slot "
                     "that keeps its row, and nothing reports it, so this delta "
                     "cannot reproduce the source's rows. Retain the erases from "
                     "the start and rebuild the replica from deltas."

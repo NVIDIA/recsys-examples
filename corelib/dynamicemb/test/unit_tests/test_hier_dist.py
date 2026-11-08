@@ -214,6 +214,7 @@ class Case:
     admit: bool = False  # FrequencyAdmissionStrategy, threshold 2
     # the first table LFU, the others FrequencyAdmissionStrategy without LFU
     mixed: bool = False
+    scored: bool = False  # a score per key (score_strategy PRECISE_CUSTOMIZED)
     # the last DynamicEmb table in a lookup group of its own (it retains
     # evicted keys; nothing is evicted here)
     groups: bool = False
@@ -345,6 +346,13 @@ CASES = [
         batch=64,
         max_len=4,
     ),
+    # LFU with no keys on the last rank: that rank still sends weights (the
+    # frequency counters, empty), as the other ranks do
+    Case(
+        "fp32 lfu, no keys on the last rank",
+        lfu=True,
+        empty_last=("f0", "f1", "f2", "f3"),
+    ),
 ]
 
 
@@ -386,6 +394,8 @@ def build_model(
         extra = {}
         if case.lfu or (case.mixed and table_idx == 0):
             extra["score_strategy"] = DynamicEmbScoreStrategy.LFU
+        if case.scored:
+            extra["score_strategy"] = DynamicEmbScoreStrategy.PRECISE_CUSTOMIZED
         if case.admit or (case.mixed and table_idx > 0):
             extra["admit_strategy"] = FrequencyAdmissionStrategy(
                 threshold=2, counter=KVCounter(capacity=1 << 16)
@@ -1206,7 +1216,10 @@ def run_options(rank: int, world_size: int, local_size: int, log: Callable) -> i
     dist it does not know (naming those it knows); tables of one sharding
     that ask for different capacities raise it when the model is sharded;
     ``"auto"`` without a capacity takes TorchRec's dists with a warning, and
-    trains as they do. A model without index dedup, and a sharding with a
+    trains as they do. Tables that take a score per key
+    (``PRECISE_CUSTOMIZED``) raise ValueError under ``"fused"`` when the model
+    is sharded, on every rank alike; under ``"auto"`` the sharding warns and
+    takes TorchRec's dists. A model without index dedup, and a sharding with a
     ``continuous`` table: under ``"fused"`` its first input dist raises
     ValueError on every rank alike, under ``"auto"`` it warns and trains as
     TorchRec's dists do."""
@@ -1229,6 +1242,22 @@ def run_options(rank: int, world_size: int, local_size: int, log: Callable) -> i
         [every_capacity, {**every_capacity, "lookup_keys": 1 << 17}, every_capacity],
     )
     checks["tables that disagree"] = "must agree on output_dist" in msg
+    scored = replace(case, scored=True)
+    refused_scored = expect_error(
+        ValueError, build_model, scored, "fused", world_size, local_size, every_capacity
+    )
+    # same_everywhere first: a collective, which every rank must reach
+    checks["fused with a score per key"] = same_everywhere(refused_scored) and (
+        "does not carry a score per key" in refused_scored
+    )
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        auto_scored = sharded_ec(
+            build_model(scored, "auto", world_size, local_size, every_capacity)
+        )
+    checks["auto with a score per key"] = hier_of(auto_scored) is None and any(
+        "does not carry a score per key" in str(warning.message) for warning in caught
+    )
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
         auto = sharded_ec(build_model(case, "auto", world_size, local_size))
@@ -1301,7 +1330,7 @@ def run_options(rank: int, world_size: int, local_size: int, log: Callable) -> i
     )
     torch.cuda.synchronize()  # before the tables' memory goes with the models
     del auto, ref, auto_run, ref_run, fused, auto_plain, ref_plain
-    del auto_plain_run, ref_plain_run
+    del auto_plain_run, ref_plain_run, auto_scored
     del fused_cont, auto_cont, ref_cont, auto_cont_run, ref_cont_run
     return failures + gc_models(log)
 

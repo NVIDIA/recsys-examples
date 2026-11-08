@@ -8,6 +8,7 @@ from __future__ import annotations
 import importlib
 import os
 import sys
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Any
 
@@ -21,6 +22,20 @@ DEFAULT_KERNEL_ROOTS = (
 )
 
 
+def _cuda_capability_major(device) -> int | None:
+    import torch
+
+    if device.type != "cuda":
+        return None
+    return torch.cuda.get_device_capability(device)[0]
+
+
+def _on_device(device):
+    import torch
+
+    return torch.cuda.device(device) if device.type == "cuda" else nullcontext()
+
+
 class ExistingGRDecodeAttentionBackend:
     """Call the existing ``interface.beam_decode_attn`` implementation.
 
@@ -30,10 +45,20 @@ class ExistingGRDecodeAttentionBackend:
     - ``k_context/v_context``: ``[B, S_ctx, Hkv, D]``
     - ``k_beam/v_beam``: ``[B, decode_nums * W, Hkv, D]``
     - ``topk_indices``: ``[B, 1, Hq, max_decode_nums, W]``
+
+    ``fused_beam_combine`` (on by default) fuses the beam attention and combine
+    kernels into one launch on SM10x (Blackwell), where the context attention
+    uses one split.
     """
 
-    def __init__(self, kernel_root: str | os.PathLike[str] | None = None) -> None:
+    def __init__(
+        self,
+        kernel_root: str | os.PathLike[str] | None = None,
+        *,
+        fused_beam_combine: bool = True,
+    ) -> None:
         self.kernel_root = self._resolve_kernel_root(kernel_root)
+        self.fused_beam_combine = fused_beam_combine
         self._beam_decode_attn = None
 
     def ensure_available(self) -> "ExistingGRDecodeAttentionBackend":
@@ -64,17 +89,26 @@ class ExistingGRDecodeAttentionBackend:
             inputs.active_beam_width,
         )
 
-        output = beam_decode_attn(
-            q,
-            k_context,
-            v_context,
-            k_beam,
-            v_beam,
-            inputs.topk_indices,
-            decode_nums,
-            return_lse=inputs.return_lse,
-            backend=inputs.backend_name,
-        )
+        if self.fused_beam_combine and _cuda_capability_major(q.device) == 10:
+            # Imported late: it needs the kernel root on sys.path and CuTe DSL.
+            from gr_inference.gr_kernels.attention.fused_beam_decode import (
+                beam_decode_fused,
+            )
+
+            beam_decode_attn = beam_decode_fused
+
+        with _on_device(q.device):
+            output = beam_decode_attn(
+                q,
+                k_context,
+                v_context,
+                k_beam,
+                v_beam,
+                inputs.topk_indices,
+                decode_nums,
+                return_lse=inputs.return_lse,
+                backend=inputs.backend_name,
+            )
         return self._normalize_kernel_output(output, return_lse=inputs.return_lse)
 
     def _load_kernel(self):

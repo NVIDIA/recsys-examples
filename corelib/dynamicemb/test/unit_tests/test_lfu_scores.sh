@@ -128,6 +128,35 @@ for dedup_flag in "${DEDUP_FLAGS[@]}"; do
 done
 
 
+# Mixed score strategies: one collection holds LFU tables and TIMESTAMP tables,
+# with the first table not LFU. Whether frequencies are gathered for a table, and
+# handed to it, follows that table's own strategy, not the first table's or the
+# collection's. Only the LFU tables are validated.
+for dedup_flag in "${DEDUP_FLAGS[@]}"; do
+  dedup_label=$( [ "$dedup_flag" = "--use-index-dedup" ] && echo "dedup" || echo "no-dedup" )
+  for num_gpus in ${NUM_GPUS[@]}; do
+    echo ""
+    echo "----------------------------------------"
+    echo "Test: Storage-Only + mixed LFU/TIMESTAMP tables ($dedup_label) | GPUs: $num_gpus"
+    echo "----------------------------------------"
+    torchrun \
+      --nnodes 1 \
+      --nproc_per_node $num_gpus \
+      ./test/unit_tests/test_lfu_scores.py \
+      --num-embedding-collections $NUM_EMBEDDING_COLLECTIONS \
+      --num-embeddings $NUM_EMBEDDINGS \
+      --multi-hot-sizes $MULTI_HOT_SIZES \
+      --embedding-dim $EMBEDDING_DIM \
+      --optimizer-type sgd \
+      --batch-size $BATCH_SIZE \
+      --num-iterations $NUM_ITERATIONS \
+      --tolerance $TOLERANCE \
+      --mixed-score-strategies \
+      $dedup_flag || exit 1
+  done
+done
+
+
 # High-frequency test: more iterations to test frequency accumulation
 
 HIGH_FREQ_ITERATIONS=50

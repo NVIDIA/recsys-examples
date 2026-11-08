@@ -63,6 +63,7 @@ from ..dynamicemb_config import (
     TORCHREC_OUTPUT_DIST,
     DynamicEmbTableOptions,
 )
+from ..scored_kjt import get_scores
 from .hier_output_dist import HierSharding, RwSequenceHierEmbeddingDist
 from .input_dist import RwSparseFeaturesDist
 
@@ -113,6 +114,21 @@ def dist_type_per_feature(
         for feature_name in info.embedding_config.feature_names:
             per_feature[feature_name] = dist_type
     return per_feature
+
+
+def sharding_takes_scores(sharding_infos: List[EmbeddingShardingInfo]) -> bool:
+    """Whether the tables of one sharding take a score per key.
+
+    The collection has settled that its DynamicEmb tables all do or none does
+    (:func:`~dynamicemb.shard.per_key_score.collect_per_key_score`), so any one
+    table that does says the sharding's input carries scores. A table that is
+    not DynamicEmb's has no options, and no say.
+    """
+    for info in sharding_infos:
+        options = (info.fused_params or {}).get("dynamicemb_options")
+        if options is not None and options.takes_score_per_key:
+            return True
+    return False
 
 
 def built_output_dist(kind: str) -> str:
@@ -199,11 +215,13 @@ class GroupedEmbeddingsLookup(_GroupedEmbeddingsLookup):
         forward_stream: Optional[torch.cuda.Stream] = None,
     ) -> None:
         """TorchRec's, but a DynamicEmb group's tables also get its keys'
-        weights, their frequency counters, as its forward gives them. TorchRec
+        weights, their frequency counters, and the keys' scores where the
+        tables take a score per key, as its forward gives them. TorchRec
         passes keys and offsets alone. Under the prefetch pipelines the LFU
         scores and admission counters would then differ from the plain loop's
         wherever weights count occurrences: index dedup's (whatever the
-        output dist)."""
+        output dist); and tables that take a score per key refuse a prefetch
+        without the scores."""
         if not self._need_prefetch:
             return
         for emb_op, features in zip(
@@ -216,6 +234,7 @@ class GroupedEmbeddingsLookup(_GroupedEmbeddingsLookup):
                     features.offsets().long(),
                     forward_stream=forward_stream,
                     frequency_counters=features.weights_or_none(),
+                    scores=get_scores(features) if emb.per_key_score else None,
                 )
                 continue
             if (
@@ -328,6 +347,7 @@ class RwSequenceDynamicEmbeddingSharding(RwSequenceEmbeddingSharding):
         self._dist_type_per_feature: Dict[str, str] = dist_type_per_feature(
             sharding_infos
         )
+        self._per_key_score: bool = sharding_takes_scores(sharding_infos)
         self._hier: Optional[HierSharding] = None
         options = output_dist_options(sharding_infos)
         if (
@@ -352,8 +372,10 @@ class RwSequenceDynamicEmbeddingSharding(RwSequenceEmbeddingSharding):
     ) -> Optional[HierSharding]:
         """The hierarchical dist of ``output_dist="fused"`` (or ``"auto"``),
         or None (with a warning) where it does not apply and the sharding
-        stays on TorchRec's dists. Decided from the sharding alone, so the
-        same on every rank."""
+        stays on TorchRec's dists. Tables that take a score per key
+        (``PRECISE_CUSTOMIZED``) raise ValueError under ``"fused"`` and stay
+        on TorchRec's dists under ``"auto"``. Decided from the sharding
+        alone, so the same on every rank."""
         asked = options.output_dist
         why = None
         if self._pg.size() == 1:
@@ -371,6 +393,21 @@ class RwSequenceDynamicEmbeddingSharding(RwSequenceEmbeddingSharding):
                 f'output_dist="{asked}" does not apply here ({why}); '
                 "using TorchRec's dists"
             )
+            return None
+        if self._per_key_score:
+            # A key crosses it with one float32 weight, which a proxy adds up
+            # over the key's occurrences, and nothing beside it: an int64
+            # score, the largest of the key's occurrences', has no way through.
+            refusal = (
+                "it does not carry a score per key (the tables' score_strategy "
+                "PRECISE_CUSTOMIZED)"
+            )
+            if asked == FUSED_OUTPUT_DIST:
+                raise ValueError(
+                    f'output_dist="{asked}": {refusal}; use '
+                    f'output_dist="{TORCHREC_OUTPUT_DIST}"'
+                )
+            warnings.warn(f'output_dist="{asked}": {refusal}; using TorchRec\'s dists')
             return None
         # The rows of the lookup output: an EmbeddingCollection's tables share
         # one dim, and the lookup casts to the sharder's output_dtype (fp32 by
@@ -421,6 +458,7 @@ class RwSequenceDynamicEmbeddingSharding(RwSequenceEmbeddingSharding):
             dist_types=[
                 self._dist_type_per_feature[name] for name in self.feature_names()
             ],
+            per_key_score=self._per_key_score,
             hier=self._hier,
         )
 
@@ -512,6 +550,7 @@ class RwPooledDynamicEmbeddingSharding(RwPooledEmbeddingSharding):
         self._dist_type_per_feature: Dict[str, str] = dist_type_per_feature(
             sharding_infos
         )
+        self._per_key_score: bool = sharding_takes_scores(sharding_infos)
 
     def create_input_dist(
         self,
@@ -530,6 +569,7 @@ class RwPooledDynamicEmbeddingSharding(RwPooledEmbeddingSharding):
             dist_types=[
                 self._dist_type_per_feature[name] for name in self.feature_names()
             ],
+            per_key_score=self._per_key_score,
         )
 
     def create_lookup(

@@ -23,6 +23,7 @@ import torch.distributed as dist
 from dynamicemb.batched_dynamicemb_tables import BatchedDynamicEmbeddingTablesV2
 from dynamicemb.dynamicemb_config import DynamicEmbPoolingMode, DynamicEmbTableOptions
 from dynamicemb.planner import DynamicEmbParameterSharding
+from dynamicemb.scored_kjt import get_scores
 from fbgemm_gpu.split_table_batched_embeddings_ops_training import PoolingMode
 from torch import nn
 from torchrec.distributed.batched_embedding_kernel import (
@@ -409,6 +410,13 @@ class BatchedDynamicEmbeddingBag(
     def purge(self) -> None:
         self._emb_module.reset_cache_states()
 
+    def _scores_of(self, features) -> Optional[torch.Tensor]:
+        """The scores of ``features``, if the tables take a score per key.
+
+        A collection that does not take them ignores the ones its input carries.
+        """
+        return get_scores(features) if self._emb_module.per_key_score else None
+
     def forward(self, features) -> torch.Tensor:
         # Only take the KJT weights as pooling weights when the collection was
         # actually declared weighted. The weights channel is shared: TorchRec
@@ -423,6 +431,7 @@ class BatchedDynamicEmbeddingBag(
             indices=features.values().long(),
             offsets=features.offsets().long(),
             pooling_weights=pooling_weights,
+            scores=self._scores_of(features),
         )
 
 
@@ -537,9 +546,17 @@ class BatchedDynamicEmbedding(BaseBatchedEmbedding[torch.Tensor]):
     def purge(self) -> None:
         self._emb_module.reset_cache_states()
 
+    def _scores_of(self, features) -> Optional[torch.Tensor]:
+        """The scores of ``features``, if the tables take a score per key.
+
+        A collection that does not take them ignores the ones its input carries.
+        """
+        return get_scores(features) if self._emb_module.per_key_score else None
+
     def forward(self, features) -> torch.Tensor:
         return self._emb_module(
             indices=features.values().long(),
             offsets=features.offsets().long(),
             frequency_counters=features.weights_or_none(),
+            scores=self._scores_of(features),
         )

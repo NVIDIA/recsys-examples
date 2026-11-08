@@ -204,7 +204,10 @@ It serves `ROW_WISE` sequence shardings (`EmbeddingCollection`) of
 `"roundrobin"` and `"hash_roundrobin"` tables (`dist_type`), under index
 dedup. Without `use_index_dedup=True` on the sharder, or with a
 `"continuous"` table, `"fused"` raises `ValueError` at the first
-`input_dist()` and `"auto"` takes TorchRec's dists (section 6). Pooled
+`input_dist()` and `"auto"` takes TorchRec's dists (section 6). The op
+carries no score per key: with tables that take one (`score_strategy`
+`PRECISE_CUSTOMIZED`), `"fused"` raises `ValueError` when the model is
+sharded and `"auto"` takes TorchRec's dists. Pooled
 shardings (`EmbeddingBagCollection`) ignore `output_dist`. All DynamicEmb
 tables of one sharding must agree on `output_dist`, `output_dist_capacity`
 and `node_dedup`, whatever their `output_dist`; otherwise building the
@@ -265,7 +268,7 @@ every rank before you drop a model (section 4.6).
 
 | option | default | meaning |
 |---|---|---|
-| `output_dist` | `"torchrec"` | `"torchrec"`: TorchRec's dists. `"fused"`: the hierarchical dist. It needs `output_dist_capacity` (without it, making the options raises `ValueError`), index dedup and tables of `dist_type` `"roundrobin"` or `"hash_roundrobin"` (without them, the first `input_dist()` raises `ValueError`), and a build without NCCL ≥ 2.30.7 raises `ImportError` when the model is sharded. `"auto"`: `"fused"` where the build has it, `output_dist_capacity` is set, the keys are index-deduplicated and no table is `"continuous"`, else TorchRec's dists, with a warning. Any other value raises `ValueError`. |
+| `output_dist` | `"torchrec"` | `"torchrec"`: TorchRec's dists. `"fused"`: the hierarchical dist. It needs `output_dist_capacity` (without it, making the options raises `ValueError`), index dedup and tables of `dist_type` `"roundrobin"` or `"hash_roundrobin"` (without them, the first `input_dist()` raises `ValueError`), and a build without NCCL ≥ 2.30.7 raises `ImportError` when the model is sharded. It carries no score per key: with tables that take one (`PRECISE_CUSTOMIZED`), it raises `ValueError` when the model is sharded. `"auto"`: `"fused"` where the build has it, `output_dist_capacity` is set, the keys are index-deduplicated and no table is `"continuous"` or takes a score per key, else TorchRec's dists, with a warning. Any other value raises `ValueError`. |
 | `output_dist_capacity` | `None` | The capacities of the op's buffers, in keys (section 5). An int sets `lookup_keys` and `remote_keys` to that many. A dict sets them by name: `lookup_keys`, and across nodes also `remote_keys` (one node uses `lookup_keys` alone). Each capacity is a positive int below 2^31 − 1024; other values or names raise `ValueError` when the options are made. A call that needs more of one raises `RuntimeError` at its second wait, on every rank (section 5.4). TorchRec's dists ignore it. |
 | `node_dedup` | `True` | Across nodes, the proxy sends one key per (table, key), and the node adds up its gradient rows before they cross back. `False` sends each GPU's occurrence on its own (more IB traffic) and keeps TorchRec's gradient rows (section 18). Gradient clipping turns it off by itself. |
 
@@ -504,6 +507,7 @@ state that every rank shares.
 | a build without NCCL ≥ 2.30.7 | when sharding | `"fused"`: `ImportError`; `"auto"`: a warning, TorchRec's dists |
 | `"auto"` without `output_dist_capacity` | when sharding | a warning, TorchRec's dists |
 | one rank in the sharding; a table of the sharding that is not a DynamicEmb table; feature processors | when sharding | a warning, TorchRec's dists |
+| tables that take a score per key (`score_strategy` `PRECISE_CUSTOMIZED`): a key crosses with one float32 weight, which a proxy adds up, and no score | when sharding | `"fused"`: `ValueError`; `"auto"`: a warning, TorchRec's dists |
 | ranks that would build the op from different options, capacities or environment values | first `input_dist()`, before the op is built | `ValueError` on every rank, naming the first rank and value that differ |
 | ranks that are not whole nodes; `world_size × num_features` of 2^31 − 1024 or more; rows not a multiple of 16 bytes | first `input_dist()` | a warning, TorchRec's dists |
 | keys that are not index-deduplicated (a sharder without `use_index_dedup=True`) | first `input_dist()`, before the op is built | `"fused"`: `ValueError` on every rank; `"auto"`: a warning, TorchRec's dists |
@@ -1019,9 +1023,9 @@ finds their identities with a hash table and numbers them with a scan
   index-deduplicated) takes `local_size` rows, all its occurrences take the
   key's row, and the call raises at its second wait (section 5.4).
 * **Weights** ride along when the keys carry them: index dedup's frequency
-  counters, with LFU scores (which count how often each key is seen) or an
-  admission strategy. The proxy adds them up per node-unique key, as whole
-  numbers.
+  counters, where a table of the sharding has LFU scores (which count how
+  often each key is seen) or an admission strategy. The proxy adds them up
+  per node-unique key, as whole numbers.
 * **`node_dedup=False`** (or gradient clipping): every occurrence is a
   node-unique key of its own. Inside each (owner node, feature) the keys
   go requester after requester, each requester's in its bucketized order.
@@ -2400,6 +2404,9 @@ KJT offsets.
 * **Owner rules**: `roundrobin` and `hash_roundrobin` only. A sharding with
   a `continuous` table takes TorchRec's dists under `"auto"`, and raises
   `ValueError` under `"fused"` (section 6).
+* **No score per key**: tables of `score_strategy` `PRECISE_CUSTOMIZED` take
+  TorchRec's dists under `"auto"`, and raise `ValueError` under `"fused"`
+  (section 6).
 * **One key dtype**: the GPUs of a node give the op keys of one dtype
   (`int32` or `int64`) in a call. The op does not check it (section 9).
 * **Fixed capacities**: a call that needs more raises, on every rank

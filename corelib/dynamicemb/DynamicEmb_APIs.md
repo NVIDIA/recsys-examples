@@ -19,6 +19,7 @@ This document consists of two parts, one is the introduction to the API, which c
 - [replay_increment](#replay_increment)
 - [pop_evicted_keys](#pop_evicted_keys)
 - [pop_erased_keys](#pop_erased_keys)
+- [erase_by_score_async](#erase_by_score_async)
 - [get_score](#get_score)
 - [set_score](#set_score)
 - [Counter](#counter)
@@ -354,7 +355,8 @@ dynamicemb provides the following strategies to set the score.
 
         dynamicemb allows configuring scores by table.
         For a table, the scores in the subsequent forward passes are larger than those in the previous ones for modes TIMESTAMP and STEP.
-        Users can also provide customized score(mode CUSTOMIZED) for each table's forward pass.
+        Users can also provide customized score(mode CUSTOMIZED) for each table's forward pass,
+        or a score for every key (mode PRECISE_CUSTOMIZED).
         Attributes
         ----------
         TIMESTAMP:
@@ -370,10 +372,13 @@ dynamicemb provides the following strategies to set the score.
             Users have to set the score before every forward pass using `set_score` interface.
         LFU:
             If there are not enough slots inside the bucket to store new keys, the least used key in the bucket will be evicted.
+        PRECISE_CUSTOMIZED:
+            Like CUSTOMIZED, but every key has a score of its own: the module is called with a `ScoredKeyedJaggedTensor`
+            whose `scores` hold an int64 for each key. See "Per-key score" below.
         NO_EVICTION:
             The table’s capacity doubles whenever there are not enough slots for new keys, and this continues until available memory is exhausted.
             When the memory resources are insufficient, there will be a warning message, and training can continue but the accuracy of eviction cannot be guaranteed.
-            Used alone, it keeps no score. It can be combined with `CUSTOMIZED` as `(NO_EVICTION, CUSTOMIZED)` (either order), which keeps the user's score.
+            Used alone, it keeps no score. It can be combined with `CUSTOMIZED` or `PRECISE_CUSTOMIZED` as `(NO_EVICTION, CUSTOMIZED)` (either order), which keeps the user's score. With such a combination **do not use a score of 0**: an erased key's slot is cleared to 0, and a full bucket gives up the slot with the smallest score, so a key scored 0 ties with an erased slot and can be the one that is given up.
             `incremental_dump` skips such tables (with a warning) and `replay_increment` refuses them.
         """
 
@@ -382,6 +387,7 @@ dynamicemb provides the following strategies to set the score.
         CUSTOMIZED = 2
         LFU = 3
         NO_EVICTION = 4
+        PRECISE_CUSTOMIZED = 5
     ```
 
     Users can specify the `DynamicEmbScoreStrategy` using `score_strategy` in `DynamicEmbTableOptions` per table.
@@ -419,6 +425,13 @@ the table keeps **one** score, `CUSTOMIZED`'s. Set it with `set_score` before a 
 pass exactly as for a plain `CUSTOMIZED` table. `NO_EVICTION` used alone keeps **no**
 score. Neither form supports `incremental_dump` / `replay_increment`: such a table has
 no timestamp to take a delta by, and its erased keys are the user's to manage.
+
+With `(NO_EVICTION, CUSTOMIZED)` or `(NO_EVICTION, PRECISE_CUSTOMIZED)`, **scores must be at
+least 1**. An erased key leaves its slot with score 0, and when a bucket has no free slot
+left the key with the smallest score is the one given up, so an erased slot is always
+taken before a key that is in use -- unless that key is also scored 0, in which case the
+two tie and the key can be lost. (`NO_EVICTION` alone has no score to set; the table
+writes 1 for each key it stores, which gives it the same guarantee.)
 
 ### Customized eviction via `score_function`
 
@@ -471,6 +484,65 @@ table_options = DynamicEmbTableOptions(
     score_function=lru_lfu_decay_score,
 )
 ```
+
+### Per-key score (`PRECISE_CUSTOMIZED`)
+
+By default a CUSTOMIZED table scores every key of a batch with one number
+(`set_score`). With `score_strategy=DynamicEmbScoreStrategy.PRECISE_CUSTOMIZED`, the input
+carries **a score for each key** instead, and the table stores it as that key's
+score. A key's score then decides its eviction (lowest first) like any other
+CUSTOMIZED score.
+
+The scores travel beside the keys, not in `weights`, in a
+`ScoredKeyedJaggedTensor` -- a `KeyedJaggedTensor` with one extra int64 tensor
+`scores`, 1-D, one entry per value:
+
+```python
+from dynamicemb import ScoredKeyedJaggedTensor
+
+features = ScoredKeyedJaggedTensor(
+    keys=["f0", "f1"], values=values, lengths=lengths, scores=scores
+)
+embeddings = model(features)
+```
+
+Scores are sent to the table's rank by their own all2all, kept in step with the
+keys through the bucketize, and never mixed with the frequency counters that LFU
+and admission use.
+
+Rules:
+
+- **All or none.** Every table of an `EmbeddingCollection` /
+  `EmbeddingBagCollection` uses it, or none does, and a collection
+  that sets it holds DynamicEmb tables only. While training, when set, the input must be a
+  `ScoredKeyedJaggedTensor` (a plain `KeyedJaggedTensor` raises); evaluation reads
+  no score, so it takes either. When not set,
+  the scores of a `ScoredKeyedJaggedTensor` are ignored.
+- **Score strategy.** `PRECISE_CUSTOMIZED`, alone or with `NO_EVICTION` as
+  `(NO_EVICTION, PRECISE_CUSTOMIZED)`. Not with `admit_strategy`. It is its own
+  strategy, so it cannot be combined with LFU.
+- **Sharding.** Row-wise only (EC and EBC), on TorchRec's dists: the
+  [hierarchical sequence dist](#hierarchical-sequence-dist) carries no score, so
+  in an `EmbeddingCollection` `output_dist="fused"` raises `ValueError` when the
+  model is sharded (a one-rank sharding warns instead) and `"auto"` takes
+  TorchRec's dists; an `EmbeddingBagCollection` ignores `output_dist`. No
+  variable batch size per key
+  (VBE). Tables with a host/hybrid storage tier (`HybridStorage`) are not
+  supported yet. Neither is an `external_storage` that is the only
+  tier (no cache and no HBM for values); with a cache above it, it is fine.
+- **Training pipeline.** Not with TorchRec's `TrainPipelineSparseDist` or its
+  variants while training: they fuse the splits all2all of the keys, which has
+  no channel for scores, and the input dist raises `NotImplementedError`.
+  Evaluation sends no scores, so it is not affected.
+- **Repeated keys.** Within one batch -- including across ranks, and with
+  `use_index_dedup` -- a key takes the **largest** score the batch gave it.
+- **Across batches.** The score is assigned on every hit, so the latest batch
+  wins, even if its score is lower; a key a batch does not contain keeps its
+  score. Backward does not change scores.
+- **`set_score`** raises for such a table: the scores come from the input.
+- Scores must be int64. A negative score is read by the table as a very large
+  one, so with `safe_check_mode` `ERROR` it raises, with `WARNING` it warns, and
+  with `IGNORE` it is not looked for.
 
 ## DynamicEmbPoolingMode
 
@@ -906,11 +978,12 @@ Fields declared first (through `device_id`) are **planner/runtime-heavy**: `Dyna
             owners and the looked-up rows back. ``"torchrec"`` (default): TorchRec's input and
             output dists. ``"fused"``: DynamicEmb's hierarchical dist, which needs
             ``output_dist_capacity``, DynamicEmb built against NCCL >= 2.30.7, index dedup and
-            tables of ``dist_type`` ``roundrobin`` or ``hash_roundrobin``. Every GPU of a node
+            tables of ``dist_type`` ``roundrobin`` or ``hash_roundrobin``; it carries no score
+            per key (``PRECISE_CUSTOMIZED`` tables raise ``ValueError``). Every GPU of a node
             gives it keys of one dtype in a call, which it does not check. ``"auto"``: ``"fused"``
             where the build has it, ``output_dist_capacity`` is set, the keys are
-            index-deduplicated and no table is ``continuous``, else TorchRec's dists. See
-            ``docs/hier_output_dist.md``, section 4.
+            index-deduplicated and no table is ``continuous`` or takes a score per key, else
+            TorchRec's dists. See ``docs/hier_output_dist.md``, section 4.
         node_dedup : bool, optional
             With ``"fused"`` (or ``"auto"``) across nodes, a node sends each key once and adds
             up its gradient rows before they cross back. ``False`` sends every occurrence.
@@ -1184,7 +1257,7 @@ The same rule is enforced per key inside the kernel — a slot that does not lan
 
 > **Precondition:** writing a key at its source slot **overwrites whatever occupies that slot** in the target. That is what makes a replica converge — if the source evicted key `B` to make room for `A`, a same-capacity replica must do the same. It also means a replayed table must be built *only* by loading/replaying from its source: a table that also takes independent writes can lose a key whose slot a delta key claims.
 
-*Rows and erases.* A storage keeps a value row per key, apart from the key's slot, and an erased key leaves its slot reclaimed, still owning its row. For a replica to keep the same rows, an erase that should be replayed has to be **retained**: `erase_keys(..., mode=EvictedItemMode.RETAIN_KEY)`. A table that erased keys **without** `RETAIN_KEY` (on any rank of the dumping group) is marked, `meta["erase_untracked"]` is set, and `replay_increment` raises `ValueError` for its deltas; the mark is sticky, so rebuild the replica from a full checkpoint after such an erase. Within a delta the order is: erase by key, recreate the reclaimed slots (`meta["erased_slot_index"]`), then upsert.
+*Rows and erases.* A storage keeps a value row per key, apart from the key's slot, and an erased key leaves its slot reclaimed, still owning its row. For a replica to keep the same rows, an erase that should be replayed has to be **retained**: `erase_keys(..., mode=EvictedItemMode.RETAIN_KEY)`. A table that erased keys **without** `RETAIN_KEY` (on any rank of the dumping group) -- by `erase_keys`, or by [`erase_by_score_async`](#erase_by_score_async), which retains nothing -- is marked, `meta["erase_untracked"]` is set, and `replay_increment` raises `ValueError` for its deltas; the mark is sticky, so rebuild the replica from a full checkpoint after such an erase. Within a delta the order is: erase by key, recreate the reclaimed slots (`meta["erased_slot_index"]`), then upsert.
 
 *The source growing ends the delta chain.* A target's capacity does not change on its own. Once the source table expands (rehash), its capacity no longer matches the target's, and every delta dumped from then on is rejected (`capacity` mismatch). Rebuild the target from a full checkpoint of the grown source and replay what comes after it.
 
@@ -1320,6 +1393,98 @@ Only these keys are removals a replica has to perform for itself, which is why `
         erase call's decision, not the table's, so there is nothing to
         filter on. Arguments are identical to pop_evicted_keys.
         """
+    ```
+
+## erase_by_score_async
+
+**Background**
+Remove, in the background of training, every key whose score is below a threshold you give: an expiry ("drop what has not been seen for a week"), or making room in a table that never evicts. For a table with [`NO_EVICTION`](#dynamicembscorestrategy) it is a way to free keys: the slots and value rows an erase frees are what the keys that come next take, so a table that is erased as it is filled stops growing once it holds what the window holds.
+
+The call returns at once with a handle; the scan runs on a thread of its own, on a CUDA stream of its own, beside the forward, the backward and the prefetch of the training.
+
+**Behavior**
+- *Which tables.* Those whose score strategy has the one you name as a member, so `CUSTOMIZED` takes `CUSTOMIZED` and `(NO_EVICTION, CUSTOMIZED)` tables, and `PRECISE_CUSTOMIZED` takes `PRECISE_CUSTOMIZED` and `(NO_EVICTION, PRECISE_CUSTOMIZED)` tables. A table that is `NO_EVICTION` alone keeps no score and is never picked; naming `NO_EVICTION` is an error. With no table that qualifies the call is not an error: the handle is done at once and says `(0, 0)`. A table that keeps two score words (`(TIMESTAMP, LFU)`) cannot be erased by either: it is an error if you name one of its members.
+- *The threshold.* A key is erased when its score is **strictly below** `threshold`, an int in `[0, 2**64)`, in the unit the score has: the number you set or gave per key, a step, a frequency, or for `TIMESTAMP` the device clock, which you read with `dynamicemb_extensions.device_timestamp()`. For `(NO_EVICTION, CUSTOMIZED)` and `(NO_EVICTION, PRECISE_CUSTOMIZED)` tables the scores of the keys you keep must be at least 1: an erased slot is cleared to 0, so a key scored 0 ties with one.
+- *Layouts.* Supported: GPU-only tables, and a cache over host storage (only the storage behind the cache is erased; the cache is neither read nor changed, so a key it still holds can be written back when the cache lets it go). Refused when a table of the module would be scanned: host-only tables, `HybridStorage`, and any layout with an `external_storage`.
+- *What is spared.* Best effort. A key a prefetched batch is using -- from its prefetch to its backward -- is not erased even if its score is below the threshold; it is counted as spared instead. A key whose score is raised or lowered while the scan runs is erased or not by the score it has when the scan reaches it. If the table is expanded while it is scanned (the training inserted more keys than it has room for), that table is scanned again from its first bucket.
+- *What it overlaps.* Forward, backward and prefetch. **Not** dump, load, `incremental_dump`, `replay_increment`, `pop_evicted_keys`, `pop_erased_keys` or evaluation: call `wait()` on the handle first; this is not checked. The prefetch of a batch waits for the chunk the scan is in and the few it has in flight, not for the whole scan.
+- *Which stream.* By default each module makes one stream of its own and keeps it, and the scan overlaps the training. You can pass a stream of the tables' device. The one the training runs on, the default stream or the prefetch stream also work, but the scan is then queued among the training's kernels, does not overlap them, and a `UserWarning` says so.
+- *Chunks.* The scan goes a chunk of at most `chunk_slots` slots at a time, with at most `max_in_flight` chunks launched and not yet finished on the device. They set how much the scan disturbs the training and how long it takes: smaller and fewer disturb it less and take longer. The defaults (`2**22` slots, `2`) were measured on an H100 with a table of `2**29` slots at half load and training steps of 0.7 ms, scans running back to back: a step was slowed by about 10%; with `2**24` slots it was slowed by 110%, with `2**26` it took about eight times as long, and with no limit on chunks in flight (`max_in_flight` large) a step took about six times as long as without a scan. A smaller chunk makes the scan take longer (in the same 300 steps, 13 to 15 scans finished with `2**22` slots and 115 with `2**24`). Those scans only read; erasing is slower (134 million keys removed in 21 ms, with chunks of `2**24` slots, against 3.4 ms to look at the table), and the disturbance while it erases was not measured. A real training step is longer than the 0.7 ms used, so the same disturbance should cost it proportionally less; that was not measured either. Both parameters are worth tuning for your tables.
+- *Ranks.* The call is local: each rank erases what it holds, there is no collective in it, and `result()` is what this rank erased. Add it up across the ranks with a collective if you need the total.
+- *What it does not do.* The keys it erases are not recorded for `pop_erased_keys` or `replay_increment`. So a table it removed any key from is marked (`meta["erase_untracked"]` of an [incremental_dump](#incremental_dump) delta, sticky), and `replay_increment` refuses that table's deltas: a replica would otherwise keep the keys the source erased, and their rows. A call that removes nothing does not mark. `NO_EVICTION` tables are not replayed at all. After such an erase, rebuild the replica from a full checkpoint.
+
+The handle (`EraseHandle`, also importable from `dynamicemb`):
+
+| Call | Meaning |
+| --- | --- |
+| `done()` | Whether the erase has finished on the device. Does not block. |
+| `wait()` | Blocks the calling thread until it has finished on the device. |
+| `wait_stream(stream=None)` | Makes `stream` (default: the current one) wait for it, blocking the calling thread only until everything has been launched. |
+| `result()` | `(erased, spared)`: keys removed, and keys left because a batch held them. Blocks until it has finished. |
+
+Anything the background thread raised is raised by whichever of these you call. Given a model, the call finds every dynamic embedding table in it the way `DynamicEmbDump` does and returns one handle for all of them (its `result()` adds theirs up). Everything is checked before anything starts, so an error leaves nothing erased.
+
+    ```python
+    #How to import
+    from dynamicemb import erase_by_score_async, EraseHandle
+
+    #API arguments
+    def erase_by_score_async(
+        model: nn.Module,
+        score_strategy: DynamicEmbScoreStrategy,
+        threshold: int,
+        stream: Optional[torch.cuda.Stream] = None,
+        chunk_slots: int = 1 << 22,
+        max_in_flight: int = 2,
+    ) -> EraseHandle:
+        """Erase, in the background of training, the keys whose score is below ``threshold``
+        from every dynamic embedding table of ``model`` that scores its keys by ``score_strategy``.
+
+        Parameters
+        ----------
+        model : nn.Module
+            The model containing dynamic embedding tables.
+        score_strategy : DynamicEmbScoreStrategy
+            Which tables to erase from, and how their scores read. A table qualifies when its
+            score strategy has this as a member. ``NO_EVICTION`` alone is an error.
+        threshold : int
+            A key is erased when its score is strictly below it. In [0, 2**64).
+        stream : Optional[torch.cuda.Stream]
+            The stream the erase launches on, on the tables' device. Default: one of its own per
+            module, which lets the erase overlap the training.
+        chunk_slots : int
+            The most slots one chunk of the scan covers, in whole buckets. Default 2**22.
+        max_in_flight : int
+            At most this many chunks launched and not yet finished on the device. Default 2.
+
+        Returns
+        -------
+        EraseHandle
+            done(), wait(), wait_stream(stream) and result() -> (erased, spared).
+        """
+    ```
+
+The same call is a method of `BatchedDynamicEmbeddingTablesV2`, `module.erase_by_score_async(score_strategy, threshold, stream=None, chunk_slots=..., max_in_flight=...)`, for the tables of that one module.
+
+    ```python
+    # Keep the last 1000 steps. Every key is given the step it was seen in, as its score
+    # (a table of (NO_EVICTION, PRECISE_CUSTOMIZED), scores at least 1).
+    handle = None
+    for step, batch in enumerate(loader, start=1):
+        loss = model(batch).sum()
+        loss.backward()
+        optimizer.step()
+        if step % 100 == 0 and step > 1000:
+            if handle is not None:
+                handle.wait()            # the previous one is done before another starts
+            handle = erase_by_score_async(
+                model, DynamicEmbScoreStrategy.PRECISE_CUSTOMIZED, threshold=step - 1000
+            )
+
+    # Before a dump: the erase must be finished.
+    if handle is not None:
+        erased, spared = handle.result()   # this rank's
+    DynamicEmbDump(path, model)
     ```
 
 ## get_score
@@ -1594,6 +1759,7 @@ Due to limited resources, the dynamic embedding table does not pre allocate memo
 
 - Set `output_dist_capacity` from what the model's batches need: `hier_needs` and `hier_capacities` in `benchmark/benchmark_utils.py` count it.
 - Use tables of `dist_type` `roundrobin` (the default) or `hash_roundrobin`, and a sharder with `use_index_dedup=True`. With a `continuous` table, or without index dedup, `"fused"` raises `ValueError` at the first `input_dist()`, and `"auto"` takes TorchRec's dists ([docs/hier_output_dist.md](./docs/hier_output_dist.md), section 6).
+- The dist carries no score per key. With tables that take one (`PRECISE_CUSTOMIZED`), `"fused"` raises `ValueError` when the model is sharded, and `"auto"` takes TorchRec's dists ([docs/hier_output_dist.md](./docs/hier_output_dist.md), section 6).
 - Give the dist keys of one dtype (`int32` or `int64`) on every GPU of a node in a call, as TorchRec's dists need on every rank. Mixed dtypes are not detected: a GPU can then get a key's row from the key's owner in the other dtype, and send its gradient there ([docs/hier_output_dist.md](./docs/hier_output_dist.md), section 9).
 - Give every DynamicEmb table of a sharding the same `output_dist`, `output_dist_capacity` and `node_dedup`, and every rank the same options and environment variables ([docs/hier_output_dist.md](./docs/hier_output_dist.md), section 4.1).
 - Set `NCCL_CROSS_NIC=0` for multi-node jobs, before the first NCCL communicator is created, so that NCCL connects GIN on the rails alone.
@@ -1646,9 +1812,18 @@ Users can specify the initial capacity of a table on a single GPU. When the tabl
 **Trigger conditions:**
 
 - **Non–NO_EVICTION**: When `max_load_factor` would be exceeded or (if set) at `max_capacity`, the table(s) that need it are doubled. See `init_capacity`, `max_load_factor`, `max_capacity` in `DynamicEmbTableOptions`.
-- **NO_EVICTION**: The option `max_load_factor` is not used. The key_index_map is sized and expanded with a fixed effective max load factor of **0.5**: at creation its capacity is ceil(init_capacity/0.5) rounded up to whole buckets, and the embedding (value) buffer has **exactly half** that many rows, so the key_index_map is twice the embedding buffer at creation and after every expansion. A table is sized by the **rows it has handed out**, not by the keys it holds: an erased key's slot keeps its row until another key takes that slot, so rows can outnumber live keys, and expansion is triggered when `rows handed out + new unique keys` exceed the embedding buffer's rows. The growth is not capped by `max_capacity`.
+- **NO_EVICTION**: The option `max_load_factor` is not used. The key_index_map and the embedding (value) buffer grow **separately**, each by what it has to hold. At creation the key_index_map has ceil(init_capacity/0.5) slots rounded up to whole buckets and the embedding buffer half that many rows.
+  - The **key_index_map** is sized by the keys it holds, with a fixed effective max load factor of **0.5**: it grows when `keys held + new unique keys` exceed half its capacity. Erasing keys therefore makes room for new ones without growing it.
+  - The **embedding buffer** is sized by the rows it has handed out. A key takes a row when it takes a slot that has never held one; an erased key's slot keeps its row, and a later key that takes that slot uses it. So after erases the rows handed out can outnumber the keys held, and the buffer grows when `rows handed out + new unique keys` exceed its rows -- at least doubling, but never beyond the number of slots in the key_index_map, since a slot owns one row and no more rows than slots can be handed out. A table whose keys keep being replaced therefore settles at one row per slot instead of growing without bound.
+  The growth is not capped by `max_capacity`.
 - **Loading a checkpoint** (`DynamicEmbStorage.load`): the table is sized for the keys **this rank keeps** from the file (counted from the key file with the rank's ownership filter), not for every key in it, since a checkpoint may hold other ranks' keys as well.
 
+
+## Erasing keys by score
+
+A hash table has no dense index to slice, so removing the keys whose score is below a threshold -- an expiry, or room for new keys in a table that never evicts -- is a call of its own that scans the table. It runs in the background of training, on a stream and a thread of its own, and a prefetch waits for it for at most a chunk.
+
+Please see `erase_by_score_async` in [APIs Doc](./DynamicEmb_APIs.md) for more information, and [DynamicEmbScoreStrategy](#dynamicembscorestrategy) for which strategies keep a score it can use.
 
 ## Dump/Load and Incremental dump
 
