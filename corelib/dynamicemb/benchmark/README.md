@@ -644,41 +644,46 @@ More runs on the same configuration:
   that do not fit.
 
 A large-batch workload: one table of 268 million rows, bf16, and 16,384
-samples per GPU with 1,536 keys each (about 25 million keys per GPU and
-iteration). The rows of a proxy for one call (3.1 GB on 2 nodes, 4.6 GB on
-4 nodes) go through its ring in laps. The ring is 512 MiB at most by default
-(`DYNAMICEMB_HIER_PROXY_MB`, [docs/hier_output_dist.md](../docs/hier_output_dist.md),
-sections 12.1 and 15.3). A larger cap holds the whole stream in one lap:
+samples per GPU, each with 1 to 1,536 keys drawn uniformly (jagged
+lengths: about 12.6 million keys per GPU and iteration):
 
 ```bash
 LARGE="--num_tables 1 --num_embeddings 268435456 --local_batch_size 16384 \
-       --max_seq_len 1536 --seq_len_dist fixed --emb_dtype bf16 --output_dtype bf16 \
+       --max_seq_len 1536 --seq_len_dist uniform --emb_dtype bf16 --output_dtype bf16 \
        --num_iterations 10 --warmup 3 --use_index_dedup"
-$LAUNCH $BENCH $LARGE --output_dist hierarchical --kernel_times                    # laps
-DYNAMICEMB_HIER_PROXY_MB=12288 $LAUNCH $BENCH $LARGE --output_dist hierarchical --kernel_times  # one lap
+$LAUNCH $BENCH $LARGE --output_dist hierarchical --kernel_times   # on 1, 2 and 4 nodes
 ```
 
-On Eos (H100, 8 GPUs per node), the kernels of the output dist take these
-times, in ms (the median of 2 runs, with the default ring):
+The runs below use the defaults: a payload of 512 KiB per chunk
+(`DYNAMICEMB_HIER_PAYLOAD_KB`) and a ring of 512 MiB at most
+(`DYNAMICEMB_HIER_PROXY_MB`;
+[docs/hier_output_dist.md](../docs/hier_output_dist.md), sections 4.4, 12.1
+and 15.3). Across nodes, a proxy's stream for one call (1.57 GB on 2 nodes,
+2.36 GB on 4) is more than its ring holds, so it passes through the ring in
+laps: 3 on 2 nodes, 5 on 4.
 
-| keys | nodes | laps | forward kernel | backward kernel |
-|---|---|---|---|---|
-| uniform | 2 | 6 | 49.0 | 48.9 |
-| uniform | 4 | 9 | 70.5 | 70.3 |
-| power-law | 4 | | 16.9 | 29.6 |
+On Eos (H100 nodes of 8 GPUs, with a 400 Gb/s NIC per GPU), the output
+dist's kernels take these times (the median of 3 runs). A kernel's bandwidth
+is the busiest GPU's bytes per call on the link that bounds it, over the
+kernel's time (`output_dist_kernel_ms_median`). The bytes are those of
+`traffic_max` (*Metrics*; one call per iteration here), in rows of 256
+bytes: across nodes `rows_ib`, what its NIC moves in the busier direction;
+on one node the larger of `rows_nvlink` and `rows_served`, what it pulls
+from its node peers and what they pull from it. The ceiling of IB is
+50 GB/s per NIC and direction. That of NVLink is the best all-to-all rate
+per GPU that `nvlink_ceiling.cu` measured on the same node
+(*NVLink ceiling*): 330 GB/s with SM loads, as the forward pulls, and
+352 GB/s with SM stores, as the backward pushes.
 
-These times are from chunks of 2 MiB of rows, before
-`DYNAMICEMB_HIER_PAYLOAD_KB` (512 by default):
-`DYNAMICEMB_HIER_PAYLOAD_KB=2048` gives those chunks
-([docs/hier_output_dist.md](../docs/hier_output_dist.md), section 4.4).
+| nodes (GPUs) | link | GB per GPU and call | forward ms | forward GB/s (% of ceiling) | backward ms | backward GB/s (% of ceiling) |
+|---|---|---|---|---|---|---|
+| 1 (8) | NVLink | 2.76 | 8.33 | 331.6 (100%) | 7.94 | 348.1 (99%) |
+| 2 (16) | IB | 1.34 | 28.29 | 47.5 (95%) | 32.20 | 41.8 (84%) |
+| 4 (32) | IB | 2.02 | 41.93 | 48.1 (96%) | 41.82 | 48.2 (96%) |
 
-The laps cost little. A ring that holds the whole stream in one lap makes no
-kernel more than 2.5% faster (47.9 and 49.2 ms on 2 nodes, 70.3 and 71.0 ms
-on 4 nodes, measured on the commit before). On 4 nodes, the NICs move rows
-96–97% of the time, with laps or without. On 2 nodes, the laps cost more
-when the workers took their tasks in a fixed order: 50.7 and 52.7 ms on the
-same nodes. Now a worker takes the remote tasks that do not wait first (see
-[docs/hier_output_dist.md](../docs/hier_output_dist.md), section 11.1).
+On 2 nodes the backward reaches 84% because of the ring's laps: a ring that
+holds the stream in one lap (`DYNAMICEMB_HIER_PROXY_MB=12288`) gives
+28.55 ms there (47.1 GB/s, 94%, in 2 runs); on 4 nodes the laps cost little.
 
 #### Options
 
@@ -725,6 +730,7 @@ names are in backticks. The JSON line holds more than these measures.
 | stages | `stages` | Profiled iterations: per stage of the forward or the backward (`fwd/input_dist`, `fwd/lookup`, `bwd/output_dist`, ...), the GPU ms per iteration of its kernels (`ms`) and their count (`kernels`), the mean over ranks. `net_ms` is the time of the output dist's kernels that move rows between GPUs: NCCL's, or `fwd_kernel` and `bwd_kernel`. |
 | output dist, events | `output_dist_event_ms_median` | Plain loop, `hierarchical`: CUDA events right before and after the output dist's forward and backward launches, in the timed iterations, with no profiler running; the median over calls of the mean over ranks. They hold the kernel's wait at its start for the other ranks and, when the GPU is idle at the launch, the launch's own CPU time. |
 | output-dist kernels | `output_dist_kernel_ms_median` | `--kernel_times`: the GPU ms of every call's forward and backward kernel under a CUDA-only profiler, the median over calls. |
+| rows per iteration | `traffic_mean`, `traffic_max` | The output dist's rows of the timed iterations, per rank and iteration: the mean or the most over the ranks (`traffic_per_rank` holds each rank's). `hierarchical`: `rows_self`, the rows it asks of itself as owner; `rows_nvlink`, the rows it pulls from its node peers; `rows_served`, the rows other GPUs ask of it as owner; across nodes `rows_ib_out` and `rows_ib_in`, the rows its NIC puts and receives in the forward (the backward moves them the other way), `rows_ib`, the larger of the two, `rows_remote`, the rows of its proxy's stream, and `chunks`, that stream's chunks per call. `torchrec`: the forward's rows to itself, to its node peers and to other nodes (`rows_self`, `rows_nvlink`, `rows_ib`), and from other nodes (`rows_ib_in`). |
 
 **InfiniBand.** A NIC's bytes in a direction are the more of what it sends
 and what it receives (rows × row bytes, from the dist's plan).
@@ -748,6 +754,10 @@ backward. Divide them by its `exited − enter_first`, from its entry barrier
 to its exit barrier. Take the median over calls 1 and up, then over runs,
 and compare it with the one-port ceiling of `nvlink_ceiling.cu` for that
 pattern (SM loads with one GPU sending, SM stores with one GPU receiving).
+The large batch's table takes a simpler basis, as every GPU moves about as
+much there: the busiest GPU's rows in `traffic_max` over the kernel's time
+from `--kernel_times`, which includes its wait at the start, against the
+all-to-all ceiling.
 
 **NVLink and IB at the same time** (`--trace`, from the 10 µs timelines of
 each kernel; a bin that is partly inside a window counts in proportion):
@@ -781,12 +791,15 @@ SM stores, at several CTA counts. It runs an all-to-all with all GPUs
 sending and receiving at once. It also runs one GPU sending to all
 (fan-out: a hot owner's rows read by every peer). And it runs one GPU
 receiving from all (fan-in: every peer storing gradient rows into a hot
-owner). Its one-GPU figures are the ceilings that NVLink use is compared
-with. On H100 nodes it measured 375.4–375.6 GB/s for one GPU sending (SM
-loads), and 376.0–376.1 GB/s for one GPU receiving (SM stores). With every
-GPU exchanging with every other, it measured 330.8–331.6 GB/s (SM loads) and
-351.2–352.8 GB/s (SM stores, `all-to-all in rounds`). So NVLink moves about
-7 times as much per GPU as one NIC (50 GB/s).
+owner). Its one-GPU figures are the ceilings of a hot owner's port
+(*Metrics*, **NVLink**), and its best all-to-all figures those of every GPU
+at once (the large batch on one node). On H100 nodes it measured
+375.4–375.6 GB/s for one GPU sending (SM loads), and 376.0–376.1 GB/s for
+one GPU receiving (SM stores). With every GPU exchanging with every other,
+on the node of the large batch's one-node runs, it measured at best
+330.3 GB/s with SM loads (32 CTAs) and 352.4 GB/s with SM stores
+(`all-to-all in rounds`, 264 CTAs; 345.7 GB/s with stores to every peer at
+once). So NVLink moves about 7 times as much per GPU as one NIC (50 GB/s).
 
 The hierarchical dist's output dist needs the plans its own input dist makes,
 so this benchmark times it in place (`--kernel_times`, `--trace`).
