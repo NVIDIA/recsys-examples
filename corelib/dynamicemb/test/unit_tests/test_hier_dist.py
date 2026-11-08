@@ -26,9 +26,10 @@ checks:
 * the input dist's host syncs, and in the second step an eval forward,
   which takes TorchRec's dists.
 
-Before the cases: the sharding shapes, the ranks' agreement and the options
-(a model without index dedup raises under ``"fused"`` and takes TorchRec's
-dists under ``"auto"``).
+Before the cases: the sharding shapes, the ranks' agreement, a sharding with
+a ``continuous`` feature outside a model, and the options (a model without
+index dedup, and a sharding with a ``continuous`` table: ``"fused"`` raises
+``ValueError`` at its first input dist, ``"auto"`` takes TorchRec's dists).
 After them: an input dist that waits for the device nowhere but in its
 second wait, the output dist's call orders, the backward run to run, the
 window and the trace APIs, failed constructions, across nodes a proxy rows
@@ -134,15 +135,9 @@ def all_true(ok: bool) -> bool:
 
 def bucketize_rules(num_features: int, world_size: int):
     """The bucketize's rule of each of ``num_features`` features, roundrobin
-    over ``world_size`` ranks, as an op is built with them: block sizes
-    (int64) and dist types (int32), on the GPU."""
-    block_sizes = torch.full(
-        (num_features,), -(-NUM_EMBEDDINGS // world_size), dtype=torch.int64
-    )
-    dist_types = torch.full(
-        (num_features,), DIST_TYPE_CODES["roundrobin"], dtype=torch.int32
-    )
-    return block_sizes.cuda(), dist_types.cuda()
+    over ``world_size`` ranks, as ``HierSharding.setup`` takes them: a
+    1-tuple of their DistType codes (a list)."""
+    return ([DIST_TYPE_CODES["roundrobin"]] * num_features,)
 
 
 def standalone(group) -> HierSharding:
@@ -315,9 +310,13 @@ CASES = [
     # node dedup off by the tables' option: every requester's row crosses,
     # and each 16-bit gradient row is TorchRec's
     Case("bf16, node dedup off", dtype="bf16", node_dedup=False),
-    # continuous: a key's owner is its range, and the key is rewritten to its
-    # place there, so different owners' keys collide at a proxy
-    Case("fp32 continuous", dist_type="continuous", key_range=NUM_EMBEDDINGS),
+    # the bucketize reads each feature's rule at run time; DynamicEmb puts the
+    # tables of each rule in a lookup group of their own
+    Case(
+        "fp32 pow-law, a rule per table",
+        keys="pow-law",
+        rules=("hash_roundrobin", "hash_roundrobin", "roundrobin"),
+    ),
     Case("fp32 pow-law hash_roundrobin", keys="pow-law", dist_type="hash_roundrobin"),
     # LFU on one table, admission on the others: the keys carry index dedup's
     # frequency counters, for both
@@ -483,12 +482,11 @@ def sharded_ec(model: DistributedModelParallel) -> ShardedDynamicEmbeddingCollec
 
 
 def bucketized_owners(
-    keys: torch.Tensor, world_size: int, dist_type: str, block_size: int
+    keys: torch.Tensor, world_size: int, dist_type: str
 ) -> torch.Tensor:
     """The rank TorchRec's path in DynamicEmb sends each key to: DynamicEmb's
     bucketize run on the keys as given (one sample of one feature), so by the
-    rule of their own width, with the block size converted to their dtype as
-    the input dist converts it. A key's owner is the bucket its place in the
+    rule of their own width. A key's owner is the bucket its place in the
     bucketized keys falls in."""
     if keys.numel() == 0:
         return torch.empty(0, dtype=torch.int64, device=keys.device)
@@ -500,7 +498,8 @@ def bucketized_owners(
         dist_type_per_feature=torch.tensor(
             [DIST_TYPE_CODES[dist_type]], dtype=torch.int32, device=keys.device
         ),
-        block_sizes=torch.tensor([block_size], device=keys.device).to(keys.dtype),
+        # the cyclic rules read no block size
+        block_sizes=torch.ones(1, dtype=keys.dtype, device=keys.device),
         my_size=world_size,
         weights=None,
         batch_size_per_feature=None,
@@ -509,44 +508,34 @@ def bucketized_owners(
     return torch.searchsorted(torch.cumsum(lengths, 0), places.long(), right=True)
 
 
-def owner_rule(case: Case, ec: Optional[ShardedDynamicEmbeddingCollection]) -> Callable:
+def owner_rule(case: Case) -> Callable:
     """``owner_of(keys, feature)`` of the case's row-wise sharding: the rank
-    its tables' ``dist_type`` gives each key on TorchRec's path
-    (:func:`bucketized_owners`; ``continuous``: by the blocks of rows of the
-    sizes TorchRec's input dist takes, from the sharding of ``ec``, the
-    case's EC)."""
+    its table's ``dist_type`` gives each key on TorchRec's path
+    (:func:`bucketized_owners`)."""
     world_size = dist.get_world_size()
-    blocks: Dict[str, int] = {}
-    if case.dist_type == "continuous":
-        sharding = rw_sharding(ec)
-        blocks = {
-            feature: -(-hash_size // world_size)
-            for feature, hash_size in zip(
-                sharding.feature_names(), sharding._get_feature_hash_sizes()
-            )
-        }
-    return lambda keys, feature: bucketized_owners(
-        keys, world_size, case.dist_type, blocks.get(feature, 1)
-    )
+    rule_of = {
+        feature: case.rules[table] if case.rules else case.dist_type
+        for table, feats in enumerate(case.tables)
+        for feature in feats
+    }
+    return lambda keys, feature: bucketized_owners(keys, world_size, rule_of[feature])
 
 
 def capacities_for(
     case: Case,
     calls: Sequence[KeyedJaggedTensor],
     local_size: int,
-    ec: Optional[ShardedDynamicEmbeddingCollection] = None,
 ) -> Dict:
     """The case's ``output_dist_capacity`` for its ``calls`` (this rank's KJT
-    of each; ``ec`` gives the blocks of ``continuous`` keys): the most any
-    rank needs (``hier_needs``, collective), times 1.25 and at least 4096
-    more."""
+    of each): the most any rank needs (``hier_needs``, collective), times
+    1.25 and at least 4096 more."""
     tables = {
         feature: table for table, feats in enumerate(case.tables) for feature in feats
     }
     needs = hier_needs(
         calls,
         tables,
-        owner_rule(case, ec),
+        owner_rule(case),
         local_size,
         index_dedup=case.dedup,
         node_dedup=case.node_dedup and not case.clip,
@@ -801,7 +790,7 @@ class Pair:
         torch.manual_seed(case_idx)
         self.ref_model = build_model(case, "torchrec", world_size, local_size)
         self.ref = sharded_ec(self.ref_model)
-        capacity = capacities_for(case, calls, local_size, self.ref)
+        capacity = capacities_for(case, calls, local_size)
         torch.manual_seed(case_idx)
         with warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter("always")
@@ -1045,7 +1034,8 @@ def run_case(
             if case.plain
             else state is not None
             and state.takes_hier_dist is True
-            and groups == (2 if case.groups or case.mixed else 1)
+            and groups
+            == (2 if case.groups or case.mixed or len(set(case.rules)) > 1 else 1)
         )
         ok_op = (hier_run.result is None) == bool(case.plain)
         ok_eval = True
@@ -1216,9 +1206,10 @@ def run_options(rank: int, world_size: int, local_size: int, log: Callable) -> i
     dist it does not know (naming those it knows); tables of one sharding
     that ask for different capacities raise it when the model is sharded;
     ``"auto"`` without a capacity takes TorchRec's dists with a warning, and
-    trains as they do. A model without index dedup: under ``"fused"`` its
-    first input dist raises ValueError on every rank alike, under ``"auto"``
-    it warns and trains as TorchRec's dists do."""
+    trains as they do. A model without index dedup, and a sharding with a
+    ``continuous`` table: under ``"fused"`` its first input dist raises
+    ValueError on every rank alike, under ``"auto"`` it warns and trains as
+    TorchRec's dists do."""
     every_capacity = dict.fromkeys(OUTPUT_DIST_CAPACITY_NAMES, 1 << 16)
     unknown = option_error(output_dist="hierarchical", output_dist_capacity=4)
     checks = {
@@ -1273,10 +1264,45 @@ def run_options(rank: int, world_size: int, local_size: int, log: Callable) -> i
         and any("index-deduplicated" in str(warning.message) for warning in caught)
         and same_outputs(plain, ref_plain_run.out, auto_plain_run.out, True)
     )
-    failures = report("options", checks, log, f": {msg}; {unknown}; {refused}")
+    # one continuous table among cyclic ones refuses the whole sharding
+    mixed = replace(case, rules=("roundrobin", "hash_roundrobin", "continuous"))
+    kjt = batch_of(mixed, 142, 0, rank, world_size)
+    fused_cont = sharded_ec(
+        build_model(mixed, "fused", world_size, local_size, every_capacity)
+    )
+    refused_cont = expect_error(
+        ValueError, fused_cont.input_dist, fused_cont.create_context(), kjt
+    )
+    checks["fused with a continuous table"] = (
+        '"continuous"' in refused_cont
+        and same_everywhere(refused_cont)
+        and hier_of(fused_cont).op is None
+    )
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        auto_cont = sharded_ec(
+            build_model(mixed, "auto", world_size, local_size, every_capacity)
+        )
+        auto_cont_run = run_model(auto_cont, kjt, False)
+    ref_cont = sharded_ec(build_model(mixed, "torchrec", world_size, local_size))
+    ref_cont_run = run_model(ref_cont, kjt, False)
+    checks["auto with a continuous table"] = (
+        hier_of(auto_cont).takes_hier_dist is False
+        and auto_cont_run.result is None
+        and any(
+            '"continuous"' in str(warning.message)
+            and "using TorchRec" in str(warning.message)
+            for warning in caught
+        )
+        and same_outputs(mixed, ref_cont_run.out, auto_cont_run.out, True)
+    )
+    failures = report(
+        "options", checks, log, f": {msg}; {unknown}; {refused}; {refused_cont}"
+    )
     torch.cuda.synchronize()  # before the tables' memory goes with the models
     del auto, ref, auto_run, ref_run, fused, auto_plain, ref_plain
     del auto_plain_run, ref_plain_run
+    del fused_cont, auto_cont, ref_cont, auto_cont_run, ref_cont_run
     return failures + gc_models(log)
 
 
@@ -1329,6 +1355,45 @@ def run_agreement(rank: int, world_size: int, local_size: int, log: Callable) ->
     return report("op agreement", checks, log, f": {messages}")
 
 
+def run_rule_refusal(rank: int, world_size: int, local_size: int, log: Callable) -> int:
+    """A sharding with a ``continuous`` feature, outside a model: "fused"
+    raises the same ValueError on every rank, naming the rule, and builds no
+    op; "auto" warns and takes TorchRec's dists."""
+    capacity = dict.fromkeys(OUTPUT_DIST_CAPACITY_NAMES, 1 << 16)
+    (dist_types,) = bucketize_rules(3, world_size)
+    dist_types[2] = DIST_TYPE_CODES["continuous"]
+    checks: Dict[str, bool] = {}
+    msg = ""
+    for asked in ("fused", "auto"):
+        with environ("DYNAMICEMB_GIN_PROXY_MB", 16):
+            hier = HierSharding(
+                dist.group.WORLD, 3, 32, torch.float32, capacity, asked=asked
+            )
+        SHARDINGS.append(weakref.ref(hier))
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            if asked == "fused":
+                msg = expect_error(ValueError, hier.setup, dist_types, False, True)
+                checks["fused raised"] = (
+                    '"continuous"' in msg and same_everywhere(msg) and hier.op is None
+                )
+            else:
+                took = hier.setup(dist_types, False, True)
+                checks["auto takes TorchRec's dists"] = (
+                    took is False
+                    and hier.op is None
+                    and any(
+                        '"continuous"' in str(warning.message)
+                        and "using TorchRec" in str(warning.message)
+                        for warning in caught
+                    )
+                )
+        del hier
+    torch.cuda.synchronize()
+    dist.barrier()
+    return report("a continuous feature outside a model", checks, log, f": {msg}")
+
+
 def run_construction_failure(
     rank: int, world_size: int, local_size: int, log: Callable
 ) -> int:
@@ -1372,7 +1437,7 @@ def run_no_sync(rank: int, world_size: int, local_size: int, log: Callable) -> i
     """The input dist and its first wait wait for the device nowhere (the
     second wait is the call's one host sync): they run under the sync debug
     mode "error", where c10 raises on an op that syncs, inside C++ too. With
-    index dedup, keys with weights, three owner rules, and a call that does
+    index dedup, keys with weights, a rule per table, and a call that does
     not fit the capacities (its second wait then raises, naming the capacity
     to raise, and the next call that fits runs)."""
     failures = 0
@@ -1382,8 +1447,8 @@ def run_no_sync(rank: int, world_size: int, local_size: int, log: Callable) -> i
         (
             132,
             Case(
-                "no sync, three owner rules",
-                rules=("roundrobin", "hash_roundrobin", "continuous"),
+                "no sync, a rule per table",
+                rules=("roundrobin", "hash_roundrobin", "roundrobin"),
             ),
             1 << 16,
         ),
@@ -1743,6 +1808,8 @@ def main() -> None:
     log(f"op sharding groups: [{'ok' if good else 'FAIL'}]")
     failures += gc_models(log)
     failures += run_agreement(rank, world_size, local_size, log)
+    failures += gc_models(log)
+    failures += run_rule_refusal(rank, world_size, local_size, log)
     failures += gc_models(log)
     failures += run_options(rank, world_size, local_size, log)
     for case_idx, case in enumerate(CASES):

@@ -259,17 +259,17 @@ class HierSharding:
 
     def setup(
         self,
-        block_sizes: torch.Tensor,
-        dist_types: torch.Tensor,
+        dist_types: Sequence[int],
         weights: bool,
         index_dedup: bool,
     ) -> bool:
         """Whether this sharding takes the hierarchical dist, the same on
         every rank. The first call builds the operator, collectively, with
-        the bucketize's rule of each feature and whether the keys carry
-        weights. Ranks whose arguments differ raise the same ValueError. A
-        sharding the operator does not apply to takes TorchRec's dists with a
-        warning. A configuration it refuses, or keys that are not
+        the bucketize's rule of each feature (DistType codes) and whether the
+        keys carry weights. Ranks whose arguments differ raise the same
+        ValueError. A sharding the operator does not apply to takes
+        TorchRec's dists with a warning. A configuration it refuses (a
+        ``continuous`` table among them), or keys that are not
         index-deduplicated (``index_dedup`` False), raises ValueError under
         ``"fused"`` and takes TorchRec's dists with a warning under
         ``"auto"``. If a rank cannot build it, every rank warns and takes
@@ -286,8 +286,7 @@ class HierSharding:
         self.takes_hier_dist = False
         arguments = dict(
             self._arguments,
-            block_sizes=block_sizes,
-            dist_types=dist_types,
+            dist_types=list(dist_types),
             weights=weights,
         )
         refusal = (

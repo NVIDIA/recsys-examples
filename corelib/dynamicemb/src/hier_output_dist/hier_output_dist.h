@@ -149,10 +149,10 @@ class SymmetricWindow {
 //
 // Across nodes a requester's keys for an owner on another node go to its
 // proxy, the GPU of its own node on the owner's rail. The proxy deduplicates
-// them per (owner node, table, key) and puts each node-unique key to the
-// owner once, over InfiniBand on that rail (NCCL GIN). The output dist moves
-// the rows of those keys the same way: one row per node-unique key over
-// InfiniBand, the node's own copies over NVLink.
+// them per (table, key) and puts each node-unique key to the owner once,
+// over InfiniBand on that rail (NCCL GIN). The output dist moves the rows of
+// those keys the same way: one row per node-unique key over InfiniBand, the
+// node's own copies over NVLink.
 //
 // The op's window is static: its constructor allocates it once, at the
 // capacities of its configuration, and it never grows; a call's own tables
@@ -194,10 +194,10 @@ class HierOutputDist {
   // why, and holds nothing. A rank that fails inside the registration throws
   // alone, and the others wait there, as in NCCL's own initialization.
   HierOutputDist(const std::string &unique_id, int64_t rank, int64_t world_size, int64_t local_size,
-                 const std::vector<int64_t> &feature_tables, const at::Tensor &block_sizes,
-                 const at::Tensor &dist_types, int64_t dim, at::ScalarType dtype, bool weights,
-                 bool node_dedup, int64_t lookup_keys, int64_t remote_keys, int64_t proxy_bytes,
-                 double timeout_s, int64_t ctas, int64_t reduce_ctas, int64_t chunk_kb);
+                 const std::vector<int64_t> &feature_tables, const std::vector<int64_t> &dist_types,
+                 int64_t dim, at::ScalarType dtype, bool weights, bool node_dedup,
+                 int64_t lookup_keys, int64_t remote_keys, int64_t proxy_bytes, double timeout_s,
+                 int64_t ctas, int64_t reduce_ctas, int64_t chunk_kb);
   // Local: waits for this rank's kernels. Then, unless the op was quiesced
   // after the last kernel of every rank, it waits at most min(timeout, 30 s)
   // for every node and rail peer to reach its own teardown. It lets go of

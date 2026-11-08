@@ -319,8 +319,8 @@ void InChannel::node_key_push(const BucketizedKeys &bucketized,
                               const c10::optional<at::Tensor> &weights, const NodeLayout &node,
                               const at::Tensor &src) const {
   const int64_t rows = bucketized.inv.numel();
-  const GatherRows gather{bucketized.inv.data_ptr<int32_t>(), bucketized.stored.data_ptr<int64_t>(),
-                          weights.has_value() ? weights->data_ptr<float>() : nullptr};
+  const GatherRows gather =
+      gather_rows_of(bucketized.inv, bucketized.values, weights.value_or(at::Tensor()));
   const PushPlaces places{bucketized.bucket_feature_of_row.data_ptr<int32_t>(),
                           bucketized.offset_per_bucket.data_ptr<int64_t>(),
                           node.destination_base.data_ptr<int64_t>(), node.skip.data_ptr<bool>()};

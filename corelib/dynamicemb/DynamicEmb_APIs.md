@@ -69,6 +69,8 @@ bucketize by the same rule -- the supported `dist_type` values are:
 
 `hash_roundrobin` hashes the raw key before rank assignment and is intended to reduce sensitivity to pathological raw-key patterns that can break plain modulo-based `roundrobin`. It is an opt-in routing mode; the default remains `roundrobin` for compatibility with existing checkpoints. It should be understood as a routing robustness improvement, not as a general solution to arbitrary hot-key or Zipf-skew load balancing.
 
+The hierarchical dist (`output_dist="fused"`, see [Hierarchical sequence dist](#hierarchical-sequence-dist)) takes `roundrobin` and `hash_roundrobin` only.
+
     ```python
     #How to import
     from dynamicemb.planner import DynamicEmbeddingShardingPlanner
@@ -903,9 +905,12 @@ Fields declared first (through `device_id`) are **planner/runtime-heavy**: `Dyna
             How a row-wise sequence (``EmbeddingCollection``) sharding moves keys to their
             owners and the looked-up rows back. ``"torchrec"`` (default): TorchRec's input and
             output dists. ``"fused"``: DynamicEmb's hierarchical dist, which needs
-            ``output_dist_capacity`` and DynamicEmb built against NCCL >= 2.30.7. ``"auto"``:
-            ``"fused"`` where the build has it and ``output_dist_capacity`` is set, else
-            TorchRec's dists. See ``docs/hier_output_dist.md``, section 4.
+            ``output_dist_capacity``, DynamicEmb built against NCCL >= 2.30.7, index dedup and
+            tables of ``dist_type`` ``roundrobin`` or ``hash_roundrobin``. Every GPU of a node
+            gives it keys of one dtype in a call, which it does not check. ``"auto"``: ``"fused"``
+            where the build has it, ``output_dist_capacity`` is set, the keys are
+            index-deduplicated and no table is ``continuous``, else TorchRec's dists. See
+            ``docs/hier_output_dist.md``, section 4.
         node_dedup : bool, optional
             With ``"fused"`` (or ``"auto"``) across nodes, a node sends each key once and adds
             up its gradient rows before they cross back. ``False`` sends every occurrence.
@@ -1588,6 +1593,8 @@ Due to limited resources, the dynamic embedding table does not pre allocate memo
 `output_dist="fused"` in `DynamicEmbTableOptions` replaces TorchRec's input and output dists of row-wise `EmbeddingCollection` shardings with DynamicEmb's hierarchical dist.
 
 - Set `output_dist_capacity` from what the model's batches need: `hier_needs` and `hier_capacities` in `benchmark/benchmark_utils.py` count it.
+- Use tables of `dist_type` `roundrobin` (the default) or `hash_roundrobin`, and a sharder with `use_index_dedup=True`. With a `continuous` table, or without index dedup, `"fused"` raises `ValueError` at the first `input_dist()`, and `"auto"` takes TorchRec's dists ([docs/hier_output_dist.md](./docs/hier_output_dist.md), section 6).
+- Give the dist keys of one dtype (`int32` or `int64`) on every GPU of a node in a call, as TorchRec's dists need on every rank. Mixed dtypes are not detected: a GPU can then get a key's row from the key's owner in the other dtype, and send its gradient there ([docs/hier_output_dist.md](./docs/hier_output_dist.md), section 9).
 - Give every DynamicEmb table of a sharding the same `output_dist`, `output_dist_capacity` and `node_dedup`, and every rank the same options and environment variables ([docs/hier_output_dist.md](./docs/hier_output_dist.md), section 4.1).
 - Set `NCCL_CROSS_NIC=0` for multi-node jobs, before the first NCCL communicator is created, so that NCCL connects GIN on the rails alone.
 - Call [quiesce](#quiesce) on every rank before dropping the model.

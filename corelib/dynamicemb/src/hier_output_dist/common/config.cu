@@ -20,9 +20,11 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 
 #include <algorithm>
 #include <stdexcept>
+#include <unordered_map>
 
 #include "hier_output_dist/common/common.h"
 #include "hier_output_dist/common/config.h"
+#include "utils.h"
 
 namespace dyn_emb {
 namespace hier_output_dist {
@@ -58,11 +60,40 @@ void check_capacity(const char *name, int64_t value) {
     refuse("the capacity ", name, " must be in [1, 2^31 - 1024), got ", value);
 }
 
+// The rule of each feature (dist_types, DistType codes, src/utils.h). The
+// bucketize places keys by roundrobin (kCyclic) and hash_roundrobin
+// (kHashedCyclic), which keep the key, and a table's features share one rule,
+// so a key's owner follows from its table and the key. "continuous" (kBlock)
+// stores a key as its offset in its owner's block, so equal stored keys of two
+// owners are different keys: the op refuses it.
+void check_rules(const Config &config) {
+  const int64_t features = config.num_features();
+  const std::vector<int> &code = config.dist_types;
+  if ((int64_t)code.size() != features)
+    refuse("it takes a dist_type per feature, got ", code.size(), " for ", features, " features");
+  std::unordered_map<int, int64_t> first_of_table;  // a table's first feature
+  for (int64_t f = 0; f < features; ++f) {
+    if (code[f] != (int)DistType::kCyclic && code[f] != (int)DistType::kHashedCyclic) {
+      const std::string rule = code[f] == (int)DistType::kBlock
+                                   ? "\"continuous\" (set its table's dist_type to one of those, "
+                                     "or output_dist to \"torchrec\")"
+                                   : c10::str("dist_type code ", code[f]);
+      refuse("it places keys by dist_type \"roundrobin\" or \"hash_roundrobin\" only, and ",
+             "the sharding's feature ", f, " has ", rule);
+    }
+    const int64_t first = first_of_table.emplace(config.feature_tables[f], f).first->second;
+    if (code[first] != code[f])
+      refuse("the sharding's features ", first, " and ", f,
+             " share a table but not its dist_type (", code[first], " and ", code[f], ")");
+  }
+}
+
 }  // namespace
 
 void Config::validate() const {
   const std::string why = unsupported(world_size, local_size, num_features(), row_bytes());
   if (!why.empty()) refuse(why);
+  check_rules(*this);
   if (dtype != at::kFloat && dtype != at::kBFloat16 && dtype != at::kHalf)
     refuse("rows of the lookup output must be fp32, bf16 or fp16, got ", dtype);
   check_capacity("lookup_keys", capacities.lookup_keys);
@@ -100,17 +131,16 @@ std::string invalid(const Config &config) {
 }
 
 Config config_of(int64_t rank, int64_t world_size, int64_t local_size,
-                 const std::vector<int64_t> &feature_tables, const at::Tensor &block_sizes,
-                 const at::Tensor &dist_types, int64_t dim, at::ScalarType dtype, bool weights,
-                 bool node_dedup, int64_t lookup_keys, int64_t remote_keys, int64_t proxy_bytes,
-                 double timeout_s, int64_t ctas, int64_t reduce_ctas, int64_t chunk_kb) {
+                 const std::vector<int64_t> &feature_tables, const std::vector<int64_t> &dist_types,
+                 int64_t dim, at::ScalarType dtype, bool weights, bool node_dedup,
+                 int64_t lookup_keys, int64_t remote_keys, int64_t proxy_bytes, double timeout_s,
+                 int64_t ctas, int64_t reduce_ctas, int64_t chunk_kb) {
   Config config;
   config.rank = (int)rank;
   config.world_size = (int)world_size;
   config.local_size = (int)local_size;
   config.feature_tables.assign(feature_tables.begin(), feature_tables.end());
-  config.block_sizes = block_sizes;
-  config.dist_types = dist_types;
+  config.dist_types.assign(dist_types.begin(), dist_types.end());
   config.dim = dim;
   config.dtype = dtype;
   config.weights = weights;

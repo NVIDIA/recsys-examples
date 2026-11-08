@@ -62,22 +62,20 @@ __global__ void __launch_bounds__(kThreads)
 }
 
 // A thread per position of the occurrences sorted by key: the identity tag
-// of the occurrence there, owner node * num_tables + the table of its
-// feature, or num_nodes * num_tables for an invalid one (which sorts it last).
+// of the occurrence there, the table of its feature, or num_tables for an
+// invalid one (which sorts it last). The op places a key by its table's rule
+// and the key alone (Config::validate), so equal keys of a table have one
+// owner node when the node's keys are of one dtype (proxy_keys, planner.h):
+// the tag leaves the owner node out.
 __global__ void __launch_bounds__(kThreads)
     identity_tags_kernel(const int32_t *by_key, const bool *valid,
                          const int32_t *node_bucket_feature_of_row, const int32_t *tables,
-                         int64_t entries, int64_t num_nodes, int64_t num_features,
-                         int64_t num_tables, int32_t *tag) {
+                         int64_t entries, int64_t num_features, int64_t num_tables, int32_t *tag) {
   for (int64_t position = first_item(); position < entries; position += item_stride()) {
     const int32_t occurrence = by_key[position];
-    int64_t identity_tag = num_nodes * num_tables;
-    if (valid[occurrence]) {
-      const int64_t bucket_feature = node_bucket_feature_of_row[occurrence];
-      identity_tag = owner_node_of(bucket_feature, num_features, num_nodes) * num_tables +
-                     tables[bucket_feature % num_features];
-    }
-    tag[position] = (int32_t)identity_tag;
+    tag[position] = valid[occurrence]
+                        ? tables[node_bucket_feature_of_row[occurrence] % num_features]
+                        : (int32_t)num_tables;
   }
 }
 
@@ -165,11 +163,10 @@ __global__ void __launch_bounds__(kThreads) identity_bucket_features_kernel(
 __global__ void __launch_bounds__(kThreads) key_tables_kernel(
     const int32_t *identity_of_key, const int32_t *node_bucket_feature_of_unique_row,
     const int32_t *identity_start, const int32_t *order, const int64_t *occurrence_keys,
-    const int64_t *weight_ends, const int64_t *node_offset_per_bucket,
-    const int64_t *node_num_uniques, int64_t entries, int64_t num_nodes, int64_t num_features,
-    int32_t *key_of_identity, bool *valid_key, int32_t *key_count, int32_t *key_first,
-    int32_t *key_node, int32_t *key_uniq, int64_t *node_unique_keys, float *node_unique_key_weights,
-    int64_t *key_rows) {
+    const int64_t *weight_ends, const int64_t *node_num_uniques, int64_t entries, int64_t num_nodes,
+    int64_t num_features, int32_t *key_of_identity, bool *valid_key, int32_t *key_count,
+    int32_t *key_first, int32_t *key_node, int64_t *node_unique_keys,
+    float *node_unique_key_weights, int64_t *key_rows) {
   const int64_t valid_keys = *node_num_uniques;
   int32_t most = 0;  // the most occurrences of this thread's valid keys
   for (int64_t key = first_item(); key < entries; key += item_stride()) {
@@ -183,7 +180,6 @@ __global__ void __launch_bounds__(kThreads) key_tables_kernel(
     if (key < valid_keys) most = max(most, end - first);
     key_first[key] = first;
     key_node[key] = (int32_t)owner_node;
-    key_uniq[key] = (int32_t)(key - node_offset_per_bucket[owner_node]);
     node_unique_keys[key] = occurrence_keys[order[min(first, (int32_t)entries - 1)]];
     if (node_unique_key_weights != nullptr)
       node_unique_key_weights[key] = (float)(weight_ends[end] - weight_ends[first]);
@@ -609,17 +605,17 @@ ProxyKeys proxy_keys(const ProxyInput &input, const Sizes &sizes, bool node_dedu
       entries, keys.occurrence_count.data_ptr<int64_t>(), keys.key_rows.data_ptr<int64_t>(),
       keys.valid.data_ptr<bool>(), index.data_ptr<int32_t>());
   C10_CUDA_KERNEL_LAUNCH_CHECK();
-  // The identities (owner node, table, key): the occurrences sorted by key,
-  // then stably by (owner node, table), the invalid ones last.
+  // The identities (table, key): the occurrences sorted by key, then stably
+  // by table, the invalid ones last.
   const at::Tensor by_key = sort_pairs(input.node_keys, index, 64).second;
   const at::Tensor tag = at::empty({entries}, int_options);
   identity_tags_kernel<<<item_grid(entries), kThreads, 0, stream>>>(
       by_key.data_ptr<int32_t>(), keys.valid.data_ptr<bool>(),
       input.node_bucket_feature_of_row.data_ptr<int32_t>(), input.tables.data_ptr<int32_t>(),
-      entries, num_nodes, num_features, num_tables, tag.data_ptr<int32_t>());
+      entries, num_features, num_tables, tag.data_ptr<int32_t>());
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   at::Tensor tag_sorted;
-  std::tie(tag_sorted, keys.order) = sort_pairs(tag, by_key, bits_for(num_nodes * num_tables + 1));
+  std::tie(tag_sorted, keys.order) = sort_pairs(tag, by_key, bits_for(num_tables + 1));
   // The identity at each sorted position and where each identity starts.
   // Per identity: its smallest feature, and the sum of its weights, exact as
   // integers, when the records carry it (the keys carry weights then).
@@ -675,7 +671,6 @@ ProxyKeys proxy_keys(const ProxyInput &input, const Sizes &sizes, bool node_dedu
   keys.key_count = at::empty({entries}, int_options);
   keys.key_first = at::empty({entries}, int_options);
   keys.key_node = at::empty({entries}, int_options);
-  keys.key_uniq = at::empty({entries}, int_options);
   keys.node_unique_keys = at::empty({entries}, long_options);
   if (sizes.weighted_records())
     keys.node_unique_key_weights =
@@ -684,11 +679,10 @@ ProxyKeys proxy_keys(const ProxyInput &input, const Sizes &sizes, bool node_dedu
       identity_of_key.data_ptr<int32_t>(), node_bucket_feature_of_unique_row.data_ptr<int32_t>(),
       identity_start.data_ptr<int32_t>(), keys.order.data_ptr<int32_t>(),
       input.node_keys.data_ptr<int64_t>(), data_or_null<int64_t>(weight_ends),
-      keys.node_offset_per_bucket.data_ptr<int64_t>(), keys.node_num_uniques.data_ptr<int64_t>(),
-      entries, num_nodes, num_features, key_of_identity.data_ptr<int32_t>(),
-      keys.valid_key.data_ptr<bool>(), keys.key_count.data_ptr<int32_t>(),
-      keys.key_first.data_ptr<int32_t>(), keys.key_node.data_ptr<int32_t>(),
-      keys.key_uniq.data_ptr<int32_t>(), keys.node_unique_keys.data_ptr<int64_t>(),
+      keys.node_num_uniques.data_ptr<int64_t>(), entries, num_nodes, num_features,
+      key_of_identity.data_ptr<int32_t>(), keys.valid_key.data_ptr<bool>(),
+      keys.key_count.data_ptr<int32_t>(), keys.key_first.data_ptr<int32_t>(),
+      keys.key_node.data_ptr<int32_t>(), keys.node_unique_keys.data_ptr<int64_t>(),
       data_or_null<float>(keys.node_unique_key_weights), keys.key_rows.data_ptr<int64_t>());
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   keys.key_at = at::empty({entries}, int_options);
@@ -828,7 +822,6 @@ ProxyPlan proxy_push_order(ProxyKeys keys, ProxyChunks chunks, const at::Tensor 
         push_key.data_ptr<int64_t>(), index.data_ptr<int32_t>());
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     keys.valid.reset();
-    keys.key_uniq.reset();
     keys.key_node.reset();
     chunks.requester_of.reset();
     chunks.key_chunk.reset();

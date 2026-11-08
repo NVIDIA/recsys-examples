@@ -20,10 +20,11 @@ rail's layout, status, owner tables and the put lists
 (``hier_output_dist_requester_tables``).
 
 The test plays every rank of an N-node job: each rank's bucketized rows (by
-owner and feature, and past the valid ones index dedup's bound), index-
-deduplicated (a rank has each (table, key) once, so a node-unique key has at
-most local_size occurrences at its proxy), whose keys and weights are in the
-order of its KJT (a random permutation, inv), its node layout
+owner and feature, and past the valid ones index dedup's bound; a key's owner
+follows from the key, as under roundrobin), index-deduplicated (a rank has
+each (table, key) once, so a node-unique key has at most local_size
+occurrences at its proxy), whose keys and weights are in the order of its KJT
+(a random permutation, inv), its node layout
 (``hier_output_dist_node_layout``), and between the steps what the comm
 kernels do: the node's offsets (each requester's offset_per_bucket_feature),
 the pushes into node_keys (``hier_output_dist_node_push``), the count
@@ -34,8 +35,8 @@ requester binding gathers the proxies' words itself). The windows hold
 garbage before the call. The checks:
 
 * each proxy against a plain reference of the planner's rules: its
-  node-unique keys (identities (owner node, table, key), each in the bucket
-  feature (owner node, feature) of its smallest feature, key order inside a
+  node-unique keys (identities (table, key), each in the bucket feature
+  (owner node, feature) of its smallest feature, key order inside a
   bucket feature), their records, the chunks of its stream
   (levels of each owner node's weights: a key's rows, but at least the chunk
   weight; packed, in laps when they pass the ring), their bounds,
@@ -545,8 +546,9 @@ CASES = [
 
 def random_job(case: Case, generator) -> List[Tuple]:
     """Each rank's rows: its keys for each bucket feature (owner, feature),
-    and their weights. Index dedup (case.dedup) keeps a rank's first row of
-    each (table, key)."""
+    and their weights. The keys are placed as under roundrobin: a drawn x of
+    owner o is the key x * world_size + o. Index dedup (case.dedup) keeps a
+    rank's first row of each (table, key)."""
     num_bucket_features = case.world_size * case.num_features
     job = []
     for _ in range(case.world_size):
@@ -557,10 +559,13 @@ def random_job(case: Case, generator) -> List[Tuple]:
         keys = torch.randint(0, case.key_range, (valid,), generator=generator)
         keys[torch.rand(valid, generator=generator) < case.hot] = 7
         weights = torch.randint(1, 4, (valid,), generator=generator).float()
+        bucket_feature = torch.repeat_interleave(
+            torch.arange(num_bucket_features), counts
+        )
+        # a key's owner follows from it (roundrobin: key mod world_size), so
+        # one (table, key) has one owner, as the op's rules give it
+        keys = keys * case.world_size + bucket_feature // case.num_features
         if case.dedup:
-            bucket_feature = torch.repeat_interleave(
-                torch.arange(num_bucket_features), counts
-            )
             seen, keep = set(), []
             for row, key in enumerate(keys.tolist()):
                 identity = (
@@ -580,8 +585,8 @@ def bucketized_rows(case: Case, counts, keys, weights, generator) -> Dict:
     """A rank's bucketized rows as the planner takes them: by bucket feature
     (owner * num_features + feature), then index dedup's bound (garbage
     keys). Their keys and weights stay in the order of its KJT, as the
-    bucketize leaves them (stored, kjt_weights): bucketized row ``row`` is KJT
-    row inv[row], a random permutation."""
+    bucketize leaves them (values, kjt_weights: the KJT's): bucketized row
+    ``row`` is KJT row inv[row], a random permutation."""
     num_bucket_features = counts.numel()
     offset_per_bucket_feature = torch.cat(
         [torch.zeros(1, dtype=torch.int64), counts.cumsum(0)]
@@ -591,15 +596,15 @@ def bucketized_rows(case: Case, counts, keys, weights, generator) -> Dict:
     )
     row_weights = torch.cat([weights, torch.full((case.bound,), 1e9)])
     inv = torch.randperm(row_keys.numel(), generator=generator)
-    stored, kjt_weights = torch.empty_like(row_keys), torch.empty_like(row_weights)
-    stored[inv], kjt_weights[inv] = row_keys, row_weights
+    values, kjt_weights = torch.empty_like(row_keys), torch.empty_like(row_weights)
+    values[inv], kjt_weights[inv] = row_keys, row_weights
     return dict(
         offset_per_bucket_feature_list=offset_per_bucket_feature.tolist(),
         keys_list=keys.tolist(),
         weights_list=weights.tolist(),
         valid=int(counts.sum()),
         counts=counts,
-        stored=stored.cuda(),
+        values=values.cuda(),
         inv=inv.int().cuda(),
         kjt_weights=kjt_weights.cuda(),
         bucket_feature_of_row=torch.cat(
@@ -719,12 +724,16 @@ def proxy_reference(case: Case, occurrences: List, node: int, remote_keys: int) 
     )
     ring, room = case.num_proxy_rows, chunk_room(case)
     capacity = max_chunks(case, remote_keys)
-    # node-unique keys: (owner node, table, key), or each occurrence; numbered
-    # by (owner node, smallest feature), then key order (then occurrence)
+    # node-unique keys: (table, key), or each occurrence; numbered by (owner
+    # node, smallest feature), then key order (then occurrence). A (table,
+    # key) has one owner node: its owner follows from the key (random_job).
     members: Dict = {}
-    for occ, (_, _, owner_node, feature, value, _) in enumerate(occurrences):
-        identity = (owner_node, case.tables[feature], value) if case.node_dedup else occ
+    for occ, (_, _, _, feature, value, _) in enumerate(occurrences):
+        identity = (case.tables[feature], value) if case.node_dedup else occ
         members.setdefault(identity, []).append(occ)
+    assert all(
+        len({occurrences[occ][2] for occ in group}) == 1 for group in members.values()
+    ), "a (table, key) of two owner nodes"
     keys = sorted(
         (
             occurrences[group[0]][2],
@@ -934,8 +943,8 @@ def dedup_by_merge_rank(case: Case, occurrences: List) -> Dict:
         base += sum(counts)
     members: Dict = {}
     for occ in sorted(rank_of, key=rank_of.get):
-        owner_node, feature, key = occurrences[occ][2:5]
-        identity = (owner_node, case.tables[feature], key) if case.node_dedup else occ
+        feature, key = occurrences[occ][3:5]
+        identity = (case.tables[feature], key) if case.node_dedup else occ
         members.setdefault(identity, []).append(occ)
     records_of: Dict = {}
     for group in members.values():
@@ -1049,7 +1058,7 @@ def run_call(
         node, local_rank = divmod(rank, local_size)
         planner(
             hier_output_dist_node_push,
-            bucketized["stored"],
+            bucketized["values"],
             bucketized["inv"],
             bucketized["kjt_weights"] if case.weights else None,
             bucketized["bucket_feature_of_row"],

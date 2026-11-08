@@ -40,6 +40,7 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 #include "hier_output_dist/hier_output_dist.h"
 #include "hier_output_dist/input_dist/input_dist.h"
 #include "hier_output_dist/input_dist/planner.h"
+#include "utils.h"
 
 namespace dyn_emb {
 namespace hier_output_dist {
@@ -50,14 +51,21 @@ namespace {
 
 // The bucketize of a KJT (bucketize_keys), by name, with each owner's feature
 // offsets relative to its block (feature_start [world_size][num_features + 1]),
-// which TorchRec's bucketize gives, and the keys as their owners store them in
-// the KJT's order (stored, what the push gathers). dist_types are the rules'
-// codes on the host; their copy to the GPU does not wait for the device (the
-// tests run the planner under the sync debug mode "error").
+// which TorchRec's bucketize gives. The keys by owner are the KJT's keys
+// gathered at inv, widened to int64 with their sign. dist_types are the
+// rules' codes on the host, kCyclic or kHashedCyclic, the op's (it raises for
+// any other, as Config::validate refuses them); their copy to the GPU does
+// not wait for the device (the tests run the planner under the sync debug
+// mode "error").
 std::map<std::string, at::Tensor> bucketize_test(
     at::Tensor values, c10::optional<at::Tensor> offsets, c10::optional<at::Tensor> lengths,
-    int64_t batch_size, c10::optional<at::Tensor> weights, at::Tensor block_sizes,
-    std::vector<int> dist_types, int64_t world_size, at::Tensor input_offsets) {
+    int64_t batch_size, c10::optional<at::Tensor> weights, std::vector<int> dist_types,
+    int64_t world_size, at::Tensor input_offsets) {
+  for (const int code : dist_types)
+    TORCH_CHECK(code == (int)DistType::kCyclic || code == (int)DistType::kHashedCyclic,
+                "hier_output_dist: the bucketize takes dist_type codes ", (int)DistType::kCyclic,
+                " (roundrobin) and ", (int)DistType::kHashedCyclic, " (hash_roundrobin), got ",
+                code);
   c10::cuda::CUDAGuard guard(values.device());
   PlanInput input;
   input.values = values;
@@ -66,15 +74,13 @@ std::map<std::string, at::Tensor> bucketize_test(
   input.batch_size = batch_size;
   input.weights = weights;
   input.input_offsets = input_offsets;
-  const OwnerRules rules{at::tensor(dist_types, at::kInt)
-                             .pin_memory()
-                             .to(values.options().dtype(at::kInt), /*non_blocking=*/true),
-                         block_sizes};
+  const at::Tensor rules = at::tensor(dist_types, at::kInt)
+                               .pin_memory()
+                               .to(values.options().dtype(at::kInt), /*non_blocking=*/true);
   const BucketizedKeys bucketized = bucketize_keys(input, rules, world_size);
   const int64_t num_features = (int64_t)dist_types.size();
   std::map<std::string, at::Tensor> named{
       {"keys", bucketized.keys},
-      {"stored", bucketized.stored},
       {"inv", bucketized.inv},
       {"bucket_feature_of_row", bucketized.bucket_feature_of_row},
       {"offset_per_bucket_feature", bucketized.offset_per_bucket_feature},
@@ -164,14 +170,15 @@ std::map<std::string, at::Tensor> node_layout_test(at::Tensor node_offsets, int6
   return named;
 }
 
-// One requester's push (push_to_node_keys: node_key_push's push_rows) on what its bucketize
-// gives (bucketize_rows: stored and inv, its KJT's weights or None, bucket_feature_of_row and
-// offset_per_bucket) and its node layout (destination_base, skip), into stand-ins for its
-// targets' node_keys: row t of node_keys ([local_size][lookup_keys + remote_keys]), of
-// node_key_weights (given exactly with weights) and across nodes of node_bucket_feature_of_row
-// ([local_size][remote_keys]); on one node also src (int32 [rows]). It writes them in place: an
-// entry it pushes nothing to keeps what it held, and a place outside a row is not stored.
-void node_push_test(at::Tensor stored, at::Tensor inv, c10::optional<at::Tensor> weights,
+// One requester's push (push_to_node_keys: node_key_push's push_rows) of its KJT's keys (values,
+// int32 or int64) and weights (or None), on what its bucketize gives (bucketize_rows: inv,
+// bucket_feature_of_row and offset_per_bucket) and its node layout (destination_base, skip),
+// into stand-ins for its targets' node_keys: row t of node_keys ([local_size][lookup_keys +
+// remote_keys]), of node_key_weights (given exactly with weights) and across nodes of
+// node_bucket_feature_of_row ([local_size][remote_keys]); on one node also src (int32 [rows]).
+// It writes them in place: an entry it pushes nothing to keeps what it held, and a place outside
+// a row is not stored.
+void node_push_test(at::Tensor values, at::Tensor inv, c10::optional<at::Tensor> weights,
                     at::Tensor bucket_feature_of_row, at::Tensor offset_per_bucket,
                     at::Tensor destination_base, at::Tensor skip, int64_t num_nodes,
                     int64_t local_size, int64_t node, int64_t local_rank, int64_t num_features,
@@ -182,8 +189,9 @@ void node_push_test(at::Tensor stored, at::Tensor inv, c10::optional<at::Tensor>
   c10::cuda::CUDAGuard guard(inv.device());
   const Topo topo = topo_of(num_nodes, local_size, node, local_rank);
   const int64_t rows = inv.numel();
-  TORCH_CHECK(num_features >= 1 && is_cuda_array(stored, at::kLong, rows) &&
-                  is_cuda_array(inv, at::kInt, rows) &&
+  TORCH_CHECK(num_features >= 1 && values.is_cuda() && values.is_contiguous() &&
+                  (values.scalar_type() == at::kInt || values.scalar_type() == at::kLong) &&
+                  values.numel() == rows && is_cuda_array(inv, at::kInt, rows) &&
                   (!weights.has_value() || is_cuda_array(*weights, at::kFloat, rows)) &&
                   is_cuda_array(bucket_feature_of_row, at::kInt, rows) &&
                   is_cuda_array(offset_per_bucket, at::kLong, topo.world_size + 1) &&
@@ -195,7 +203,7 @@ void node_push_test(at::Tensor stored, at::Tensor inv, c10::optional<at::Tensor>
   NodeLayout layout;
   layout.destination_base = destination_base;
   layout.skip = skip;
-  push_to_node_keys(stored, inv, weights.value_or(at::Tensor()), bucket_feature_of_row,
+  push_to_node_keys(values, inv, weights.value_or(at::Tensor()), bucket_feature_of_row,
                     offset_per_bucket, layout, topo, num_features, lookup_keys, remote_keys,
                     node_keys, node_key_weights.value_or(at::Tensor()),
                     node_bucket_feature_of_row.value_or(at::Tensor()), src.value_or(at::Tensor()));
@@ -477,12 +485,12 @@ void bind_testing(py::module &py_module) {
                 "The next construction of an op in this process fails to allocate",
                 py::arg("fail_alloc"));
   py_module.def("hier_output_dist_bucketize", &bucketize_test,
-                "The keys bucketized by owner, their bucket features and offsets, the keys as "
-                "their owners store them in the KJT's order, and the input's per-feature totals, "
+                "The keys bucketized by owner (widened to int64 with their sign), their rows in "
+                "the KJT, their bucket features and offsets, and the input's per-feature totals, "
                 "by name",
                 py::arg("values"), py::arg("offsets"), py::arg("lengths"), py::arg("batch_size"),
-                py::arg("weights"), py::arg("block_sizes"), py::arg("dist_types"),
-                py::arg("world_size"), py::arg("input_offsets"));
+                py::arg("weights"), py::arg("dist_types"), py::arg("world_size"),
+                py::arg("input_offsets"));
   py_module.def("hier_output_dist_fanout", &fanout_test,
                 "Index dedup's fan-out of the bucketized rows, by name", py::arg("reverse_indices"),
                 py::arg("inv"));
@@ -496,7 +504,7 @@ void bind_testing(py::module &py_module) {
   py_module.def("hier_output_dist_node_push", &node_push_test,
                 "One requester's push of its bucketized rows into stand-ins for its targets' "
                 "node_keys ([local_size] rows), in place",
-                py::arg("stored"), py::arg("inv"), py::arg("weights"),
+                py::arg("values"), py::arg("inv"), py::arg("weights"),
                 py::arg("bucket_feature_of_row"), py::arg("offset_per_bucket"),
                 py::arg("destination_base"), py::arg("skip"), py::arg("num_nodes"),
                 py::arg("local_size"), py::arg("node"), py::arg("local_rank"),

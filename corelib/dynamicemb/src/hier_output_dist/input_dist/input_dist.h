@@ -110,7 +110,7 @@ class InChannel {
   ncclWindow_t window_;
   ncclDevComm dev_;
   Sizes sizes_;
-  OwnerRules rules_;  // the bucketize's
+  at::Tensor dist_types_;  // int32 [num_features] on the GPU: the bucketize's rule of each feature
   bool weights_, node_dedup_;
   int device_;
   int64_t seq_ = 0;  // the calls run so far: the current one's sequence number

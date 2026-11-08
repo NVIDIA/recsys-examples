@@ -111,7 +111,7 @@ NodeLayout node_layout(const at::Tensor &node_offsets, const Topo &topo, int64_t
   return node;
 }
 
-void push_to_node_keys(const at::Tensor &stored, const at::Tensor &inv, const at::Tensor &weights,
+void push_to_node_keys(const at::Tensor &values, const at::Tensor &inv, const at::Tensor &weights,
                        const at::Tensor &bucket_feature_of_row, const at::Tensor &offset_per_bucket,
                        const NodeLayout &node, const Topo &topo, int64_t num_features,
                        int64_t lookup_keys, int64_t remote_keys, const at::Tensor &node_keys,
@@ -132,8 +132,7 @@ void push_to_node_keys(const at::Tensor &stored, const at::Tensor &inv, const at
               "(lookup_keys + remote_keys)), node_key_weights exactly with weights, across nodes "
               "node_bucket_feature_of_row (local_size x remote_keys), and on one node src");
   if (rows == 0) return;
-  const GatherRows gather{inv.data_ptr<int32_t>(), stored.data_ptr<int64_t>(),
-                          data_or_null<float>(weights)};
+  const GatherRows gather = gather_rows_of(inv, values, weights);
   const PushPlaces places{bucket_feature_of_row.data_ptr<int32_t>(),
                           offset_per_bucket.data_ptr<int64_t>(),
                           node.destination_base.data_ptr<int64_t>(), node.skip.data_ptr<bool>()};

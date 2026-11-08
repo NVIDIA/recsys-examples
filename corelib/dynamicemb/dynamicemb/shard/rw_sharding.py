@@ -380,7 +380,7 @@ class RwSequenceDynamicEmbeddingSharding(RwSequenceEmbeddingSharding):
         if hasattr(output_dtype, "as_dtype"):  # an fbgemm SparseType
             output_dtype = output_dtype.as_dtype()
         # The table of each feature, in the sharding's feature order: across
-        # nodes a key is its owner node, table and value.
+        # nodes a key is its table and value.
         tables = [
             table_idx
             for table_idx, table in enumerate(self.embedding_tables())

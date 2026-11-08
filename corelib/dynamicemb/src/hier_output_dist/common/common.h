@@ -198,9 +198,9 @@ struct ChunkPiece {
   uint32_t start, end;
 };
 // A node-unique key as its proxy sends it to the owner (key_stage, then the
-// owner's rail_keys), after the chunks of the owner's node: the key as its
-// owner stores it, and when the owner's KJT carries weights
-// (Sizes::weighted_records, record_bytes 16) the weight of its occurrences.
+// owner's rail_keys), after the chunks of the owner's node: the key, and when
+// the owner's KJT carries weights (Sizes::weighted_records, record_bytes 16)
+// the weight of its occurrences.
 struct KeyRecord {
   static constexpr bool kWeighted = false;
   int64_t key;

@@ -74,10 +74,9 @@ operator per sharding, `HierOutputDist`, does the work (section 7):
   first goes over NVLink to the *proxy*: the GPU of its own node on the
   owner's rail. The proxy sends it over that rail's InfiniBand link to the
   owner. No traffic crosses rails.
-* **Node dedup.** The proxy sends each (owner node, table, key) of its node
-  once. So the owner looks the key up once per node, its row crosses
-  InfiniBand once per node, and the node adds up its gradients before they
-  cross back.
+* **Node dedup.** The proxy sends each (table, key) of its node once. So
+  the owner looks the key up once per node, its row crosses InfiniBand once
+  per node, and the node adds up its gradients before they cross back.
 * **No static limit on the nodes, GPUs per node or features.** The kernels
   keep no table sized by them, and a GIN warp's lanes take any number of
   rail peers in turn.
@@ -142,8 +141,8 @@ this dist with TorchRec's dists.
   batch has the key (every rank is both). **Proxy**: for an owner on another
   node, the GPU of the requester's node on the owner's rail.
 * **Occurrence**: one place where a key appears in a requester's batch.
-  **Node-unique key**: one (owner node, table, key) as the proxy sends it
-  on, however many occurrences its node has.
+  **Node-unique key**: one (table, key) as the proxy sends it on, however
+  many occurrences its node has.
 * **Lookup output**: the owner's rows for the keys it looks up, in its
   buffer `lookup_rows`. **Proxy rows** (`proxy_rows`): the proxy's buffer
   for the rows that pass between its node and the other nodes, in both
@@ -193,15 +192,16 @@ DynamicEmbTableOptions(
     ...,
     output_dist="fused",              # "torchrec" (default), "fused" or "auto"
     output_dist_capacity=capacities,  # an int, or a dict by name (section 5)
-    node_dedup=True,                  # across nodes: one key per (owner node, table, key)
+    node_dedup=True,                  # across nodes: one key per (table, key)
 )
 DynamicEmbeddingCollectionSharder(..., use_index_dedup=True)  # the op takes no other keys
 ```
 
-It serves `ROW_WISE` sequence shardings (`EmbeddingCollection`) under index
-dedup: without `use_index_dedup=True` on the sharder, `"fused"` raises
-`ValueError` at the first `input_dist()` and `"auto"` takes TorchRec's
-dists (section 6). Pooled
+It serves `ROW_WISE` sequence shardings (`EmbeddingCollection`) of
+`"roundrobin"` and `"hash_roundrobin"` tables (`dist_type`), under index
+dedup. Without `use_index_dedup=True` on the sharder, or with a
+`"continuous"` table, `"fused"` raises `ValueError` at the first
+`input_dist()` and `"auto"` takes TorchRec's dists (section 6). Pooled
 shardings (`EmbeddingBagCollection`) ignore `output_dist`. All DynamicEmb
 tables of one sharding must agree on `output_dist`, `output_dist_capacity`
 and `node_dedup`, whatever their `output_dist`; otherwise building the
@@ -237,6 +237,11 @@ every rank before you drop a model (section 4.6).
 * Index dedup: the sharder's `use_index_dedup=True`. Each rank then sends
   each (table, key) of a call once, so a key has at most `local_size`
   occurrences at its proxy (section 9).
+* Tables of `dist_type` `"roundrobin"` (the default) or `"hash_roundrobin"`.
+  The tables of a sharding can have different rules. The op refuses
+  `"continuous"` (sections 6 and 10.1).
+* Keys of one dtype, `int32` or `int64`, on all GPUs of a node in a call
+  (section 9). TorchRec's dists need one key dtype on every rank too.
 * Capacities (`output_dist_capacity`) that fit the calls (section 5).
 * Every rank makes the same calls in the same order, as with NCCL
   collectives (operations that all ranks run together).
@@ -257,9 +262,9 @@ every rank before you drop a model (section 4.6).
 
 | option | default | meaning |
 |---|---|---|
-| `output_dist` | `"torchrec"` | `"torchrec"`: TorchRec's dists. `"fused"`: the hierarchical dist. It needs `output_dist_capacity` (without it, making the options raises `ValueError`) and index dedup (without it, the first `input_dist()` raises `ValueError`), and a build without NCCL ≥ 2.30.7 raises `ImportError` when the model is sharded. `"auto"`: `"fused"` where the build has it, `output_dist_capacity` is set and the keys are index-deduplicated, else TorchRec's dists, with a warning. Any other value raises `ValueError`. |
+| `output_dist` | `"torchrec"` | `"torchrec"`: TorchRec's dists. `"fused"`: the hierarchical dist. It needs `output_dist_capacity` (without it, making the options raises `ValueError`), index dedup and tables of `dist_type` `"roundrobin"` or `"hash_roundrobin"` (without them, the first `input_dist()` raises `ValueError`), and a build without NCCL ≥ 2.30.7 raises `ImportError` when the model is sharded. `"auto"`: `"fused"` where the build has it, `output_dist_capacity` is set, the keys are index-deduplicated and no table is `"continuous"`, else TorchRec's dists, with a warning. Any other value raises `ValueError`. |
 | `output_dist_capacity` | `None` | The capacities of the op's buffers, in keys (section 5). An int sets `lookup_keys` and `remote_keys` to that many. A dict sets them by name: `lookup_keys`, and across nodes also `remote_keys` (one node uses `lookup_keys` alone). Each capacity is a positive int below 2^31 − 1024; other values or names raise `ValueError` when the options are made. A call that needs more of one raises `RuntimeError` at its second wait, on every rank (section 5.4). TorchRec's dists ignore it. |
-| `node_dedup` | `True` | Across nodes, the proxy sends one key per (owner node, table, key), and the node adds up its gradient rows before they cross back. `False` sends each GPU's occurrence on its own (more IB traffic) and keeps TorchRec's gradient rows (section 18). Gradient clipping turns it off by itself. |
+| `node_dedup` | `True` | Across nodes, the proxy sends one key per (table, key), and the node adds up its gradient rows before they cross back. `False` sends each GPU's occurrence on its own (more IB traffic) and keeps TorchRec's gradient rows (section 18). Gradient clipping turns it off by itself. |
 
 ### 4.4 Environment variables
 
@@ -498,10 +503,22 @@ state that every rank shares.
 | ranks that would build the op from different options, capacities or environment values | first `input_dist()`, before the op is built | `ValueError` on every rank, naming the first rank and value that differ |
 | ranks that are not whole nodes; `world_size × num_features` of 2^31 − 1024 or more; rows not a multiple of 16 bytes | first `input_dist()` | a warning, TorchRec's dists |
 | keys that are not index-deduplicated (a sharder without `use_index_dedup=True`) | first `input_dist()`, before the op is built | `"fused"`: `ValueError` on every rank; `"auto"`: a warning, TorchRec's dists |
+| a DynamicEmb table of the sharding with `dist_type` `"continuous"` (below) | first `input_dist()`, before the op is built | `"fused"`: `ValueError` on every rank; `"auto"`: a warning, TorchRec's dists |
 | a configuration the op cannot take: across nodes, capacities without `remote_keys`; a proxy cap below the least rows of its ring (section 15.3); a `remote_keys` whose stream could pass position 2^32 (section 12.1); rows that are not fp32, bf16 or fp16; an environment value it refuses (section 4.4) | first `input_dist()`, before the op is built | `"fused"`: `ValueError` on every rank; `"auto"`: a warning, TorchRec's dists |
 | On some rank: the NCCL LSA team is not the whole node. Or, across nodes, GIN does not connect the rails, has fewer than 4 contexts, or its signals do not start at 0. Or the window cannot be allocated. | first `input_dist()`, collectively | a warning that names each rank and why, TorchRec's dists on every rank |
 | an eval forward | per call | TorchRec's dists for that call |
 | a call that does not fit the capacities, or a proxy that gets one key more than `local_size` times | per call, at its second wait | `RuntimeError` on every rank, naming the capacity to raise or the key's occurrences (section 5.4) |
+
+The op places keys by `roundrobin` and `hash_roundrobin` only
+(section 10.1). One op serves all tables of a sharding, so one
+`continuous` table refuses the whole sharding. Under `"fused"` the error
+names the first such feature, in the sharding's feature order
+(`feature_names()`):
+`output_dist="fused": it places keys by dist_type "roundrobin" or
+"hash_roundrobin" only, and the sharding's feature 2 has "continuous" (set
+its table's dist_type to one of those, or output_dist to "torchrec")`.
+Under `"auto"` the warning starts with `output_dist="auto":`, has the same
+words, and ends with `; using TorchRec's dists`.
 
 ## 7. The operator
 
@@ -527,10 +544,10 @@ class HierOutputDist {  // one per sharding
   // std::invalid_argument (Python: ValueError), on every rank alike.
   HierOutputDist(const std::string &unique_id, int64_t rank, int64_t world_size,
                  int64_t local_size, const std::vector<int64_t> &feature_tables,
-                 const at::Tensor &block_sizes, const at::Tensor &dist_types, int64_t dim,
-                 at::ScalarType dtype, bool weights, bool node_dedup, int64_t lookup_keys,
-                 int64_t remote_keys, int64_t proxy_bytes, double timeout_s, int64_t ctas,
-                 int64_t reduce_ctas, int64_t chunk_kb);
+                 const std::vector<int64_t> &dist_types, int64_t dim, at::ScalarType dtype,
+                 bool weights, bool node_dedup, int64_t lookup_keys, int64_t remote_keys,
+                 int64_t proxy_bytes, double timeout_s, int64_t ctas, int64_t reduce_ctas,
+                 int64_t chunk_kb);
   ~HierOutputDist();  // local (section 4.6)
 
   // The whole input dist of a call, with no host sync: (values, weights,
@@ -555,7 +572,26 @@ class HierOutputDist {  // one per sharding
 The constructor takes the configuration (`Config`'s fields): the ranks, the
 table and the bucketize's rule of each feature, the rows and their weights,
 `node_dedup`, the capacities (with the proxy cap in bytes) and the knobs of
-section 4.4. `input_dist()` takes the requester's KJT, index-deduplicated
+section 4.4. A rule is a `DistType` code (`src/utils.h`) on the host: 1
+(`roundrobin`) or 2 (`hash_roundrobin`), one for all features of a table.
+The constructor and `hier_output_dist_invalid()` refuse any other code, a
+table whose features have different codes, and a list without a code per
+feature (`Config::validate`). Their messages:
+
+* `it places keys by dist_type "roundrobin" or "hash_roundrobin" only, and
+  the sharding's feature 2 has "continuous" (set its table's dist_type to
+  one of those, or output_dist to "torchrec")`; for an unknown code, `...
+  has dist_type code 7`;
+* `the sharding's features 0 and 1 share a table but not its dist_type (1
+  and 2)`;
+* `it takes a dist_type per feature, got 2 for 3 features`.
+
+Python gives each table's `dist_type` to all its features, and
+`DynamicEmbTableOptions` takes no `dist_type` but `"continuous"`,
+`"roundrobin"` and `"hash_roundrobin"`. So from Python only the
+`"continuous"` refusal can come (section 6).
+
+`input_dist()` takes the requester's KJT, index-deduplicated
 (its values; offsets, or lengths when it has none; its batch size; its
 weights or none), the offsets of the input KJT before index dedup, which
 `construct_jagged_tensors` reads, and index dedup's reverse indices. It
@@ -625,9 +661,10 @@ same point on every rank:
    names that rank and the first value that differs. Else every rank has
    the same configuration, so every rank decides alike. If the op does not
    apply (`hier_output_dist_unsupported()`, section 6), every rank warns and
-   takes TorchRec's dists. If the op refuses the configuration, or the keys
-   are not index-deduplicated, `"fused"` raises `ValueError` on every rank
-   and `"auto"` warns and takes TorchRec's dists.
+   takes TorchRec's dists. If the op refuses the configuration (a
+   `continuous` table, say), or the keys are not index-deduplicated,
+   `"fused"` raises `ValueError` on every rank and `"auto"` warns and takes
+   TorchRec's dists.
 2. Else every rank builds the op with that id. The constructor checks the
    configuration again (it throws before any collective if it refuses it),
    then makes the communicator and its device communicator: LSA inside the
@@ -757,6 +794,10 @@ goes once its kernel is queued, and autograd keeps the backward's
   gradients. So the sharding skips TorchRec's own expansion for that call
   (it clears the context's reverse indices when the call starts). A call on
   TorchRec's dists (an eval forward) keeps it.
+* **Owner rules.** The op takes `roundrobin` and `hash_roundrobin` tables
+  only (`Config::validate`): a sharding with a `continuous` table takes
+  TorchRec's dists under `"auto"`, and raises `ValueError` under `"fused"`,
+  at its first input dist (section 6).
 * **The lookup.** For the owner's KJT of a call on the op, the sharding
   takes the call's rows, the first `num_recv` rows of the `lookup_rows`
   that `op.input_dist()` gave, and each DynamicEmb lookup group writes its
@@ -930,11 +971,27 @@ its node's requesters ask of the owners of its rail on the other nodes, and
 in `node_bucket_feature_of_row` the (owner node, feature) of each. Its planner
 numbers them with stable radix sorts (section 10.4):
 
-* **Identity: (owner node, table, key).** The owner node is part of it
-  because the `continuous` rule (`dist_type`) rewrites a key for its owner,
-  so equal stored keys of two owners are different keys. Features of one
-  table share keys. A sort by key, then one by (owner node, table), brings
-  each identity's occurrences together, in the order of the remote part.
+* **Identity: (table, key).** Equal keys of a table are one node-unique
+  key, whichever requesters and features asked for them. Features of one
+  table share keys. A sort by key, then one by table, brings each
+  identity's occurrences together, in the order of the remote part.
+* **Why (table, key) is enough.** The op places a key by its table's rule,
+  `roundrobin` or `hash_roundrobin` (section 10.1). Python gives each
+  table's rule to all its features, and the op refuses a table whose
+  features have different rules (section 7.1). Both rules keep the key and
+  compute the owner from the key alone. So equal keys of a table, of one
+  dtype, have one owner, and so one owner node: the owner node adds nothing
+  to the identity. (`continuous` rewrites a key to its offset in its
+  owner's block, so equal stored keys of two owners would be different
+  keys. The op refuses it, section 6.)
+* **One key dtype.** Both rules work in the width of the key: `roundrobin`
+  takes a negative `int32` key as `2^32 + key`, and `hash_roundrobin` takes
+  the low 32 bits of the hash of an `int32` key. So a key can have one
+  owner as `int32` and another as `int64`. The GPUs of a node must give the
+  op keys of one dtype in a call (TorchRec's dists need one dtype on every
+  rank). Else a proxy can merge an `int32` key and the same `int64` key of
+  two owner nodes, and serve both from the owner node of the first of them
+  in its remote part.
 * **Representative feature.** A node-unique key's feature is the table's
   smallest feature under which the node asked for the key; a sort of the
   (identity, feature) pairs finds it. The owner looks the key up under it.
@@ -1018,23 +1075,23 @@ bucketize (`bucketize_rows`, `bucketize.cu`), named after TorchRec's
    places each key by the rules of its own width (see below). TorchRec's
    path in DynamicEmb (an eval forward) does the same.
 2. **The keys by owner.** Each key's feature comes from the KJT's offsets, and
-   its owner and the key its owner stores from the bucketize's rules
-   (`dist_type`, and `continuous`'s key rewrite), in the arithmetic of the
-   keys' own width (see below). The kernel reads the rule of each key's
-   feature at run time, so the features of a sharding can have different
-   rules. A warp's keys are consecutive, so all but a few warps have the
-   keys of one feature and take one branch. Then one stable radix sort by
-   bucket feature (an int32, owner × `num_features` + feature) puts the
-   keys' rows in `[owner][feature][sample][position]` order: `inv` holds
-   each one's row in the KJT; the keys past the valid
-   ones (index dedup) go last. The keys as their owners store them stay in
-   the KJT's order, as `int64` (`stored`): bucketized row `row` is key
-   `stored[inv[row]]`, and its weight is the KJT's at `inv[row]`. The
+   its owner from its feature's rule (`dist_type`: `roundrobin` or
+   `hash_roundrobin`), in the arithmetic of the keys' own width (see
+   below). The kernel reads the rule of each key's feature at run time, so
+   the tables of a sharding can have different rules. A warp's keys are
+   consecutive, so all but a few warps have the keys of one feature and
+   take one branch. Then one stable radix sort by bucket feature (an
+   int32, owner × `num_features` + feature) puts the keys' rows in
+   `[owner][feature][sample][position]` order: `inv` holds each one's row
+   in the KJT; the keys past the valid ones (index dedup) go last. Both
+   rules keep the key, so the keys stay in the KJT: bucketized row `row` is
+   the KJT's key at `inv[row]`, widened to `int64` with its sign, and its
+   weight is the KJT's at `inv[row]`. The
    bucketize does not gather the keys into that order. The push does, as it
    stores them (`node_key_push`, section 10.2). Searches of the sorted
    bucket features give where each bucket feature's and each owner's keys start
    (`offset_per_bucket_feature`, `offset_per_bucket`). It also gives the
-   input KJT's per-feature totals. Its outputs take 16 bytes per key, with
+   input KJT's per-feature totals. Its outputs take 8 bytes per key, with
    or without weights, and nothing of size `world_size × samples`.
 3. **The fan-out table**: for each deduplicated row, its
    original rows in increasing order, from a stable radix sort of the
@@ -1043,27 +1100,28 @@ bucketize (`bucketize_rows`, `bucketize.cu`), named after TorchRec's
    by cumulative sums in row order.
 
 **The owner rules by key width.** On TorchRec's path DynamicEmb bucketizes
-the KJT as the caller gave it. `bucketize_kjt_before_all2all` converts the
-block sizes to the keys' dtype, and the bucketize reads each key as an
+the KJT as the caller gave it, and the bucketize reads each key as an
 unsigned number of the keys' width (a negative `int32` key as
-`2^32 + key`). `bucketize_rows` computes the same way, on the keys' bits in `int64`
-tensors, whose products wrap as the bucketize's do. So on both paths a key
-goes to the same owner:
+`2^32 + key`). `bucketize_rows` computes the same way, in the keys' own
+type. So on both paths a key goes to the same owner:
 
 | `dist_type` | `int64` keys | `int32` keys |
 |---|---|---|
 | `roundrobin` | key mod `world_size` | the same, in 32 bits |
 | `hash_roundrobin` | the key's 64-bit hash mod `world_size` | the low 32 bits of the hash of the key (zero-extended), mod `world_size` |
-| `continuous` | key / block size below block size × `world_size`, else key mod `world_size` | the same in 32 bits: the block size's low 32 bits, and a product with `world_size` that wraps at 32 bits, as the bucketize's `int` product does |
 
-`continuous` also rewrites the key: to its offset in its block, or past the
-blocks to key / `world_size`. The other rules keep it. The owner stores an
-`int32` key as the `int32` the bucketize writes, widened with its sign to
-`int64`: the 64-bit key DynamicEmb's lookup makes of an `int32` key on
-TorchRec's path. So a model may take either path call by call (eval
+Both rules keep the key. The owner gets an `int32` key widened with its
+sign to `int64`: the 64-bit key DynamicEmb's lookup makes of an `int32` key
+on TorchRec's path. So a model may take either path call by call (eval
 forwards, calls that do not fit) and finds its rows. Checkpoint loading and
 delta replay (`dynamicemb/key_ownership.py`) follow another rule for some
 `int32` keys (section 19).
+
+The op does not take `continuous`, TorchRec's block rule. That rule
+rewrites a key to its offset in its owner's block, so equal stored keys of
+two owners would be different keys, and node dedup's identity (table, key)
+would merge them (section 9). With a `continuous` table, `"fused"` raises
+`ValueError` and `"auto"` takes TorchRec's dists (section 6).
 
 ### 10.2 The comm kernels
 
@@ -1087,11 +1145,12 @@ their memory order and why no wait hangs.
   before the barrier: section 13 says why that is safe.
 * **`node_key_push`** (threads stride over the bucketized rows, at most two
   CTAs per SM): the bucketize's gather. For each of this rank's valid rows
-  it reads the key, `stored[inv[row]]`, and its weight, and stores them into
-  the target's `node_keys` (and `node_key_weights`) over NVLink, at the
-  place the node layout gives. Across nodes a key for an owner on another
-  node also writes its bucket feature (owner node × `num_features` +
-  feature) into the target's `node_bucket_feature_of_row`. Consecutive keys
+  it reads the KJT's key at `inv[row]` (an `int32` key widened with its
+  sign) and its weight, and stores them into the target's `node_keys` (and
+  `node_key_weights`) over NVLink, at the place the node layout gives.
+  Across nodes a key for an owner on another node also writes its bucket
+  feature (owner node × `num_features` + feature) into the target's
+  `node_bucket_feature_of_row`. Consecutive keys
   of a bucket feature go to consecutive places, so the stores coalesce. On
   one node it also writes each row's place in its owner's KJT into `src`,
   the requester's map (a row past the valid ones gets its own index). Under
@@ -1222,7 +1281,7 @@ read:
 **Names.** A table that holds data from another step is named after that
 data where it came from, with a prefix for where it is now. The requesters
 push their keys and weights in bucketized order, which the push gathers
-from `stored` and the KJT's weights, and their bucket features
+from the KJT's keys and weights, and their bucket features
 (`bucket_feature_of_row`) into `node_keys`, `node_key_weights` and
 `node_bucket_feature_of_row`. Node
 dedup gives `node_unique_keys`, `node_num_uniques`, `node_reverse_indices`
@@ -1838,16 +1897,19 @@ The capacities are the ones in place (section 5), and `row_bytes` and
 | the proxy's rows before each key (`node_exp_off`) | `8 × remote_keys` | per call |
 | the put lists and the ready counters | `24 × max_chunks + 16 × owner_chunks + 32 × num_nodes × num_features` | per call |
 | index dedup's fan-out table | about 13 bytes per original key (on this path the deduplicated KJT keeps the original length) | per call |
-| the bucketize, in the caller's pool | at its peak 32 bytes per key, its outputs (16) included, the same for any owner rules; about 60 with index dedup while the fan-out table is made | transient |
+| the bucketize, in the caller's pool | at its peak 32 bytes per key, its outputs (8) included, for either owner rule; about 60 with index dedup while the fan-out table is made | transient |
 | the planner, in the caller's pool | its largest step: across nodes the proxy's about 99 bytes per entry of `remote_keys`, the requester's about 73 per key, or the owner's gather about 65 per entry of `lookup_keys`, at most 2^22 entries at a time; on one node about 20 bytes per key | transient |
 
 The transient figures are upper bounds from the peaks measured with the
 benchmark's batches (bytes in live tensors; the caching allocator's rounding
 and the cached blocks it hands out add up to about 13%), but the one-node
 planner's, which comes from the code. They were measured before the chunks
-had weights. With `chunk_weight` above 1, as by default, the proxy's step
-also holds each key's weight (int32) and the weights before each key
-(int64) while it cuts its chunks and gives the slots.
+had weights, and while the bucketize also kept each key as `int64` (8
+bytes per key, until the input dist returned). It no longer does: the push
+reads the KJT's keys (section 10.1). With `chunk_weight` above 1, as by
+default, the proxy's step also holds each key's weight (int32) and the
+weights before each key (int64) while it cuts its chunks and gives the
+slots.
 
 The constructors of the layouts size the window's buffers as above
 (`CtrlLayout`, `KeysLayout` and `RowsLayout`, in `window.h`). The buffers
@@ -2129,6 +2191,11 @@ hooks, and `test_hier_dedup.py` every rank of an N-node job.
 
 * **Scope**: row-wise sequence shardings of DynamicEmb tables, within the
   limits of section 4.2.
+* **Owner rules**: `roundrobin` and `hash_roundrobin` only. A sharding with
+  a `continuous` table takes TorchRec's dists under `"auto"`, and raises
+  `ValueError` under `"fused"` (section 6).
+* **One key dtype**: the GPUs of a node give the op keys of one dtype
+  (`int32` or `int64`) in a call. The op does not check it (section 9).
 * **Fixed capacities**: a call that needs more raises, on every rank
   (section 5.4); the capacities must hold the largest call.
 * **Errors no agreement covers**: an NCCL error while the op makes its

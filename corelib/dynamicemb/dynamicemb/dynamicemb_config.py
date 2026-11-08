@@ -611,7 +611,11 @@ class DynamicEmbTableOptions:
     dist_type : str
         Input distribution policy for row-wise sharding. Supported values are
         ``continuous``, ``roundrobin``, and ``hash_roundrobin``. Defaults to
-        ``roundrobin``.
+        ``roundrobin``. ``output_dist="fused"`` takes ``roundrobin`` and
+        ``hash_roundrobin`` only: a row-wise sequence sharding with a
+        ``continuous`` table raises ``ValueError`` at its first
+        ``input_dist()`` (``"auto"`` takes TorchRec's dists there, with a
+        warning).
     node_index : Optional[int], optional
         Pins this table to a node, under ``TABLE_ROW_WISE`` sharding. Leave it
         unset -- the default -- and the planner's
@@ -725,10 +729,14 @@ class DynamicEmbTableOptions:
     keys and rows move over NVLink inside a node and over the rails (NCCL
     GIN) between nodes, with one host sync per call. It needs DynamicEmb
     built against NCCL >= 2.30.7 (else ``ImportError`` when the model is
-    sharded), ``output_dist_capacity`` and index dedup (the sharder's
+    sharded), ``output_dist_capacity``, index dedup (the sharder's
     ``use_index_dedup=True``; else ``ValueError`` at the first
-    ``input_dist()``). ``"auto"`` is ``"fused"`` where the build has it,
-    ``output_dist_capacity`` is set and the keys are index-deduplicated, and
+    ``input_dist()``) and tables of ``dist_type`` ``"roundrobin"`` or
+    ``"hash_roundrobin"`` (likewise). Every GPU of a node gives it keys of
+    one dtype (``int32`` or ``int64``) in a call, which it does not check
+    (docs/hier_output_dist.md, section 9). ``"auto"`` is ``"fused"`` where the
+    build has it, ``output_dist_capacity`` is set, the keys are
+    index-deduplicated and no table of the sharding is ``"continuous"``, and
     TorchRec's dists (with a warning) elsewhere. Pooled shardings ignore it.
     Every DynamicEmb table of a sharding sets ``output_dist``,
     ``output_dist_capacity`` and ``node_dedup`` alike. See

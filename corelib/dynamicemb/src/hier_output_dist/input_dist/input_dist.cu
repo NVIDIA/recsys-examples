@@ -79,11 +79,12 @@ InChannel::InChannel(const Config &config, const Sizes &sizes, ncclWindow_t wind
     : window_(window),
       dev_(dev),
       sizes_(sizes),
-      rules_{config.dist_types, config.block_sizes},
       weights_(config.weights),
       node_dedup_(config.node_dedup),
       device_(device) {
   const auto options = at::TensorOptions().device(at::kCUDA, device);
+  // the bucketize's rules, on one node too (before its return below)
+  dist_types_ = at::tensor(config.dist_types, at::kInt).to(options);
   auto view = [&](void *buffer, at::IntArrayRef shape, at::ScalarType dtype) {
     return at::from_blob(buffer, shape, options.dtype(dtype));
   };
@@ -125,10 +126,10 @@ InDist InChannel::input_dist(const PlanInput &input) {
               "hier_output_dist: the keys carry weights exactly when the op was made with "
               "weights (",
               weights_ ? "with" : "without", ")");
-  check_bucketize_input(input, rules_, sizes_.topo.world_size);
+  check_bucketize_input(input, dist_types_, sizes_.topo.world_size);
   check_fanout_input(input.reverse_indices);
   // The bucketize up to its gather (the push gathers), and the fan-out of its rows.
-  const BucketizedKeys bucketized = bucketize_rows(input, rules_, sizes_.topo.world_size);
+  const BucketizedKeys bucketized = bucketize_rows(input, dist_types_, sizes_.topo.world_size);
   const FanoutTables fanout = fanout_tables(input.reverse_indices, bucketized.inv);
   const Topo &topo = sizes_.topo;
   const int64_t local_size = topo.local_size, num_nodes = topo.num_nodes,

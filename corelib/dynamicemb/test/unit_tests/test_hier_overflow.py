@@ -134,7 +134,7 @@ CASES = [
             placement=True,
             dist_type=dist_type,
         )
-        for dist_type in ("roundrobin", "hash_roundrobin", "continuous")
+        for dist_type in ("roundrobin", "hash_roundrobin")
     ),
     Case("variable batch per feature", "lookup_keys", vbe=True),
     Case("two lookup groups", "lookup_keys", groups=True),
@@ -310,10 +310,9 @@ def rw_index(ec: ShardedDynamicEmbeddingCollection) -> int:
 
 def placement_keys() -> torch.Tensor:
     """The keys of the ``placement`` cases, the same on every rank: 4096 from
-    the whole int32 range, 512 below NUM_EMBEDDINGS (inside ``continuous``'s
-    blocks), and both ends of the range, but the four keys the tables reserve
-    (-4 to -1: their int64 keys are the hash tables' empty, locked and
-    reclaimed slots)."""
+    the whole int32 range, 512 below NUM_EMBEDDINGS, and both ends of the
+    range, but the four keys the tables reserve (-4 to -1: their int64 keys
+    are the hash tables' empty, locked and reclaimed slots)."""
     generator = torch.Generator().manual_seed(4093)
     keys = torch.cat(
         [

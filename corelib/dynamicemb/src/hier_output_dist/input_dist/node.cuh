@@ -16,8 +16,8 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 ******************************************************************************/
 // The device code of the node's part of a call (planner.h) that the comm kernels, the
 // planner's kernels and the bucketize share: the node layout from the node's offsets
-// (node_layout_of), and the bucketize's gather (gather_rows). The push (push_rows) is that
-// gather too.
+// (node_layout_of), and the bucketize's gather of the KJT's keys (gather_rows, and
+// gather_rows_of on the host). The push (push_rows) is that gather too.
 //
 // It does not include device.cuh, so planner.cu and bucketize.cu do not get nccl_device.h. The
 // build has no relocatable device code: everything here is inline or a template.
@@ -205,13 +205,26 @@ __device__ inline void node_layout_of(const int64_t *offsets, const Topo &topo,
 }
 
 // A requester's bucketize up to its gather (bucketize_rows), as the gather reads it.
-// Bucketized row `row` is KJT row inv[row]: its key is stored[inv[row]] and its weight
+// Bucketized row `row` is KJT row inv[row]: its key is the KJT's key there, widened to int64
+// with its sign (the 64-bit key DynamicEmb's lookup makes of an int32 key), and its weight
 // weights[inv[row]] (weights nullptr: none).
 struct GatherRows {
-  const int32_t *inv;     // [rows]
-  const int64_t *stored;  // [rows]: KJT order
-  const float *weights;   // [rows]: KJT order, or nullptr
+  const int32_t *inv;    // [rows]
+  const void *values;    // [rows]: the KJT's keys, int32 or int64, in its order
+  bool int32_keys;       // values are int32
+  const float *weights;  // [rows]: KJT order, or nullptr
+  __device__ __forceinline__ int64_t key(int64_t source) const {
+    return int32_keys ? (int64_t) static_cast<const int32_t *>(values)[source]
+                      : static_cast<const int64_t *>(values)[source];
+  }
 };
+// The gather of the bucketized rows inv (int32) from the KJT's keys (values: int32 or int64)
+// and weights (fp32, or undefined).
+inline GatherRows gather_rows_of(const at::Tensor &inv, const at::Tensor &values,
+                                 const at::Tensor &weights) {
+  return GatherRows{inv.data_ptr<int32_t>(), values.data_ptr(), values.scalar_type() == at::kInt,
+                    weights.defined() ? weights.data_ptr<float>() : nullptr};
+}
 
 // The bucketize's gather. Every thread of a grid over the rows, a thread per row: each of the
 // first `rows` rows goes to put(row, key, weight).
@@ -219,7 +232,7 @@ template <typename Put>
 __device__ __forceinline__ void gather_rows(const GatherRows &in, int64_t rows, Put &&put) {
   for (int64_t row = first_item(); row < rows; row += item_stride()) {
     const int64_t source = in.inv[row];
-    put(row, in.stored[source], in.weights != nullptr ? in.weights[source] : 0.f);
+    put(row, in.key(source), in.weights != nullptr ? in.weights[source] : 0.f);
   }
 }
 
@@ -252,8 +265,7 @@ __device__ __forceinline__ void push_rows(const GatherRows &in, int64_t rows,
     if (src != nullptr) src[row] = (int32_t)place;
     if (row >= valid) continue;
     const int64_t source = in.inv[row], owner = bucket_feature / num_features;
-    put(owner % local_size, place, in.stored[source],
-        in.weights != nullptr ? in.weights[source] : 0.f,
+    put(owner % local_size, place, in.key(source), in.weights != nullptr ? in.weights[source] : 0.f,
         (int32_t)(owner / local_size * num_features + bucket_feature % num_features));
   }
 }

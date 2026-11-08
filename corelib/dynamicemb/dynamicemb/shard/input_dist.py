@@ -220,6 +220,9 @@ class RwSparseFeaturesDist(_RwSparseFeaturesDist):
             dist_type_codes(dist_types, device=device),
             persistent=False,
         )
+        # the same codes on the host, which the hierarchical dist takes
+        # (dist_type_codes checked them)
+        self._dist_type_codes: List[int] = [DIST_TYPE_CODES[t] for t in dist_types]
         self.hier = hier
 
     def forward(
@@ -255,12 +258,7 @@ class RwSparseFeaturesDist(_RwSparseFeaturesDist):
         dist's rule of each feature. ``weights``: the keys carry weights;
         ``index_dedup``: they are index-deduplicated, which the hierarchical
         dist needs."""
-        return self.hier.setup(
-            self._feature_block_sizes_tensor,
-            self._dist_type_tensor,
-            weights,
-            index_dedup,
-        )
+        return self.hier.setup(self._dist_type_codes, weights, index_dedup)
 
     def hier_forward(
         self,
@@ -276,7 +274,8 @@ class RwSparseFeaturesDist(_RwSparseFeaturesDist):
         capacities. See docs/hier_output_dist.md, sections 7.3 and 10.
 
         Args:
-            features: the keys to send, ``int32`` or ``int64``,
+            features: the keys to send, ``int32`` or ``int64`` (one dtype on
+                every GPU of the node: docs/hier_output_dist.md, section 9),
                 index-deduplicated: only the first keys are valid, and only
                 the device knows how many.
             input_features: the KJT ``construct_jagged_tensors`` reads (the

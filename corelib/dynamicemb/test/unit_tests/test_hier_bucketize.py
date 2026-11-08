@@ -15,14 +15,18 @@
 """The planner's bucketize and node layout of the hierarchical input dist,
 and the push of its node's keys, on one GPU, on plain tensors:
 
+* the op's owner rules: its configuration check (``hier_output_dist_invalid``)
+  refuses every ``dist_type`` but ``roundrobin`` and ``hash_roundrobin``, and
+  a table whose features have different rules, and the bucketize's hook
+  raises for those codes;
 * the bucketize (``hier_output_dist_bucketize``) against the bucketize of
   TorchRec's dists in DynamicEmb (``block_bucketize_sparse_features``) on the
   same KJT, bit for bit: the keys by owner, their rows in the KJT (``inv``),
   their weights, their bucket features, where each owner's and each (owner,
   feature)'s keys start, and the input's per-feature totals, for many world
-  sizes (most not powers of two). The keys by owner are the keys as their
-  owners store them in the KJT's order (``stored``) at ``inv``. A second run
-  gives the same bits;
+  sizes (most not powers of two). The keys by owner, those past the valid
+  ones too, are the KJT's keys at ``inv``, widened to int64 with their sign,
+  as the push gathers them. A second run gives the same bits;
 * index dedup's fan-out (``hier_output_dist_fanout``) against a torch
   reference: the original rows of each row, its heavy rows of more than 64,
   their slots and consecutive sub-tasks, and where the bucketize put each of
@@ -33,12 +37,13 @@ and the push of its node's keys, on one GPU, on plain tensors:
   ``offset_per_bucket_feature`` stacked). It checks each rank's layout
   against counts of the requesters' rows: the needs and the skip, and where
   it puts each key in its target's parts. Then every requester pushes its
-  keys into one set of stand-ins for the node's targets, which hold garbage.
-  Each target's own part holds its node's keys in its KJT order, and its
-  remote part requester-major, then owner node, then feature-major. The
-  entries past them, and under skip every entry, keep their garbage. On one
-  node it also checks each requester's map into its owners' KJTs (``src``)
-  and each owner's KJT.
+  KJT's keys (int64, or int32 widened with their sign) into one set of
+  stand-ins for the node's targets, which hold garbage. Each target's own
+  part holds its node's keys in its KJT order, and its remote part
+  requester-major, then owner node, then feature-major. The entries past
+  them, and under skip every entry, keep their garbage. On one node it also
+  checks each requester's map into its owners' KJTs (``src``) and each
+  owner's KJT.
 
 Every call of the planner runs under ``torch.cuda.set_sync_debug_mode
 ("error")``, so an op that waits for the device fails the test.
@@ -64,6 +69,7 @@ from dynamicemb_extensions import (
     block_bucketize_sparse_features,
     hier_output_dist_bucketize,
     hier_output_dist_fanout,
+    hier_output_dist_invalid,
     hier_output_dist_node_layout,
     hier_output_dist_node_push,
 )
@@ -71,9 +77,11 @@ from dynamicemb_extensions import (
 # Owners of a case: the bucketize's 32-bit rules give other owners than the
 # 64-bit ones where world_size is not a power of two.
 WORLD_SIZES = (1, 2, 3, 5, 6, 7, 8, 12, 24, 32, 100, 255, 256)
-CONTINUOUS, ROUNDROBIN, HASH_ROUNDROBIN = (
-    DIST_TYPE_CODES[name] for name in ("continuous", "roundrobin", "hash_roundrobin")
+ROUNDROBIN, HASH_ROUNDROBIN = (
+    DIST_TYPE_CODES[name] for name in ("roundrobin", "hash_roundrobin")
 )
+# the op refuses it (run_rule_refusals)
+CONTINUOUS = DIST_TYPE_CODES["continuous"]
 HEAVY = 64  # kHeavy: a row of more original rows is heavy
 
 
@@ -112,8 +120,7 @@ class Case:
     # the table of each feature: features 0 and 1 share table 0
     tables: Tuple[int, ...] = (0, 0, 1, 2)
     # dist_type of each table
-    rules: Tuple[int, ...] = (ROUNDROBIN, HASH_ROUNDROBIN, CONTINUOUS)
-    hash_sizes: Tuple[int, ...] = (5000, 300, 1 << 20)  # rows of each table
+    rules: Tuple[int, ...] = (ROUNDROBIN, HASH_ROUNDROBIN, ROUNDROBIN)
     key_range: Tuple[int, int] = (0, 6000)
     values: torch.dtype = torch.int64
     lengths: torch.dtype = torch.int64
@@ -128,9 +135,6 @@ class Case:
 CASES = [
     Case("roundrobin", rules=(ROUNDROBIN, ROUNDROBIN, ROUNDROBIN)),
     Case("hash_roundrobin", rules=(HASH_ROUNDROBIN, HASH_ROUNDROBIN, HASH_ROUNDROBIN)),
-    Case(
-        "continuous: keys past the blocks", rules=(CONTINUOUS, CONTINUOUS, CONTINUOUS)
-    ),
     Case(
         "roundrobin and hash_roundrobin",
         rules=(ROUNDROBIN, HASH_ROUNDROBIN, HASH_ROUNDROBIN),
@@ -147,43 +151,27 @@ CASES = [
     Case("no keys", empty=(0, 1, 2, 3)),
     Case("hot key", hot=0.7, max_len=40, weights=True),
     Case(
-        "negative keys, continuous and roundrobin",
-        rules=(CONTINUOUS, ROUNDROBIN, HASH_ROUNDROBIN),
+        "negative keys, both rules",
+        rules=(HASH_ROUNDROBIN, ROUNDROBIN, HASH_ROUNDROBIN),
         key_range=(-(1 << 40), 1 << 40),
     ),
     Case(
         "negative int32 keys",
-        rules=(CONTINUOUS, ROUNDROBIN, HASH_ROUNDROBIN),
+        rules=(HASH_ROUNDROBIN, ROUNDROBIN, HASH_ROUNDROBIN),
         key_range=(-(1 << 31), 1 << 31),
         values=torch.int32,
     ),
     Case(
         "int32 keys at the edges",
-        rules=(CONTINUOUS, ROUNDROBIN, HASH_ROUNDROBIN),
+        rules=(HASH_ROUNDROBIN, ROUNDROBIN, HASH_ROUNDROBIN),
         key_range=(-(1 << 31), 1 << 31),
         values=torch.int32,
         edges=0.5,
     ),
     Case(
         "int64 keys at the edges",
-        rules=(CONTINUOUS, ROUNDROBIN, HASH_ROUNDROBIN),
+        rules=(HASH_ROUNDROBIN, ROUNDROBIN, HASH_ROUNDROBIN),
         key_range=(-(1 << 40), 1 << 40),
-        edges=0.5,
-    ),
-    Case(
-        "int32 keys, continuous blocks whose int32 product wraps",
-        rules=(CONTINUOUS, CONTINUOUS, CONTINUOUS),
-        hash_sizes=(1 << 32, 3 << 31, (1 << 34) + 5),
-        key_range=(-(1 << 31), 1 << 31),
-        values=torch.int32,
-        lengths=torch.int32,
-        edges=0.5,
-    ),
-    Case(
-        "int64 keys, continuous blocks of 2^62 rows and more",
-        rules=(CONTINUOUS, CONTINUOUS, CONTINUOUS),
-        hash_sizes=(1 << 62, (1 << 63) - 1, 1 << 40),
-        key_range=(-(1 << 62), 1 << 62),
         edges=0.5,
     ),
     Case("index dedup's bound", bound=777, weights=True),
@@ -203,10 +191,7 @@ CASES = [
         batch_size=64,
         max_len=8,
         tables=tuple(feature // 2 for feature in range(300)),
-        rules=tuple(
-            (ROUNDROBIN, HASH_ROUNDROBIN, CONTINUOUS)[table % 3] for table in range(150)
-        ),
-        hash_sizes=tuple(1000 + 37 * table for table in range(150)),
+        rules=tuple((ROUNDROBIN, HASH_ROUNDROBIN)[table % 2] for table in range(150)),
         world_sizes=(8, 129, 1024),
     ),
 ]
@@ -228,20 +213,12 @@ def offsets_of(lengths: torch.Tensor) -> torch.Tensor:
     return torch.cat([zero, torch.cumsum(lengths, 0).to(lengths.dtype)])
 
 
-def block_size(case: Case, feature: int, world_size: int) -> int:
-    """A feature's block size, TorchRec's: its table's rows over
-    ``world_size``, rounded up."""
-    return -(-case.hash_sizes[case.tables[feature]] // world_size)
-
-
-def edge_keys(dtype: torch.dtype, block: int, world_size: int) -> List[int]:
-    """Keys near the edges of a feature's rules, as ``dtype`` holds them: near
-    0, ``2^31``, ``2^32``, ``2^63`` and ``world_size``, and near the ends of
-    the first and the last ``continuous`` block in ``dtype``'s arithmetic."""
+def edge_keys(dtype: torch.dtype, world_size: int) -> List[int]:
+    """Keys near the edges of the rules, as ``dtype`` holds them: near 0,
+    ``2^31``, ``2^32``, ``2^63`` and ``world_size``."""
     bits = 32 if dtype == torch.int32 else 64
     mask, sign = (1 << bits) - 1, 1 << (bits - 1)
-    blocks_end = ((block & mask) * world_size) & mask
-    near = (0, 1 << 31, 1 << 32, 1 << 63, world_size, block, blocks_end)
+    near = (0, 1 << 31, 1 << 32, 1 << 63, world_size)
     return [
         (((point + step) & mask) ^ sign) - sign
         for point in near
@@ -267,22 +244,13 @@ def make_batch(case: Case, seed: int, world_size: int = 1) -> Batch:
     )
     values[:valid][torch.rand(valid, generator=generator) < case.hot] = 7
     if case.edges:
-        # each feature's edge keys, at a share of its places
-        feature_of = torch.repeat_interleave(
-            torch.arange(num_features), lengths.view(num_features, batch_size).sum(1)
-        )
-        chosen = torch.rand(valid, generator=generator) < case.edges
-        for feature in range(num_features):
-            keys = torch.tensor(
-                edge_keys(
-                    case.values, block_size(case, feature, world_size), world_size
-                )
-            )
-            places = torch.nonzero(chosen & (feature_of == feature)).flatten()
-            picks = torch.randint(
-                0, keys.numel(), (places.numel(),), generator=generator
-            )
-            values[places] = keys[picks]
+        # the edge keys, at a share of the places
+        keys = torch.tensor(edge_keys(case.values, world_size))
+        places = torch.nonzero(
+            torch.rand(valid, generator=generator) < case.edges
+        ).flatten()
+        picks = torch.randint(0, keys.numel(), (places.numel(),), generator=generator)
+        values[places] = keys[picks]
     weights = None
     if case.weights:
         weights = torch.rand(
@@ -306,23 +274,18 @@ def make_batch(case: Case, seed: int, world_size: int = 1) -> Batch:
     )
 
 
-def rules_of(case: Case, world_size: int) -> Tuple[List[int], torch.Tensor]:
-    """Each feature's dist_type, and its block size (:func:`block_size`,
-    int64, on the GPU)."""
-    dist_types = [case.rules[table] for table in case.tables]
-    block_sizes = torch.tensor(
-        [block_size(case, feature, world_size) for feature in range(len(case.tables))],
-        dtype=torch.int64,
-    )
-    return dist_types, block_sizes.cuda()
+def rules_of(case: Case) -> List[int]:
+    """Each feature's dist_type, its table's."""
+    return [case.rules[table] for table in case.tables]
 
 
 def reference(
-    case: Case, batch: Batch, world_size: int, dist_types, block_sizes
+    case: Case, batch: Batch, world_size: int, dist_types
 ) -> Dict[str, torch.Tensor]:
-    """The bucketize on the KJT as it is, as TorchRec's dists run it: the
-    block sizes converted to the keys' dtype, and the keys it writes widened
-    to int64 with their sign."""
+    """The bucketize on the KJT as it is, as TorchRec's dists run it, and the
+    keys it writes widened to int64 with their sign. Its block sizes, one
+    per feature in the keys' dtype, are ones: the cyclic rules do not read
+    them."""
     num_features, batch_size, valid = len(case.tables), case.batch_size, batch.valid
     new_lengths, new_values, new_weights, _, perm = block_bucketize_sparse_features(
         batch.lengths,
@@ -330,7 +293,7 @@ def reference(
         bucketize_pos=False,
         sequence=True,
         dist_type_per_feature=torch.tensor(dist_types, dtype=torch.int32).cuda(),
-        block_sizes=block_sizes.to(batch.values.dtype),
+        block_sizes=torch.ones(num_features, dtype=batch.values.dtype).cuda(),
         my_size=world_size,
         weights=batch.weights,
         batch_size_per_feature=None,
@@ -387,7 +350,6 @@ def bucketize(
     batch: Batch,
     world_size: int,
     dist_types,
-    block_sizes,
     lengths: bool = False,
 ) -> Dict[str, torch.Tensor]:
     """The bucketize of the batch, from its offsets, or (``lengths``) from its
@@ -399,18 +361,67 @@ def bucketize(
         batch.lengths if lengths else None,
         case.batch_size,
         batch.weights,
-        block_sizes,
         dist_types,
         world_size,
         batch.in_offsets,
     )
 
 
+def run_rule_refusals() -> Dict[str, bool]:
+    """The op's configuration check (``hier_output_dist_invalid``, which
+    builds nothing and waits for nothing) refuses every dist_type but
+    roundrobin and hash_roundrobin, and a table whose features have
+    different rules; the bucketize's hook raises for those codes."""
+
+    def why(feature_tables: List[int], codes: List[int]) -> str:
+        return planner(
+            hier_output_dist_invalid,
+            rank=0,
+            world_size=8,
+            local_size=8,
+            feature_tables=feature_tables,
+            dist_types=codes,
+            dim=32,
+            dtype=torch.float32,
+            weights=False,
+            node_dedup=True,
+            lookup_keys=4096,
+            remote_keys=0,
+            proxy_bytes=16 << 20,
+            timeout_s=60.0,
+            ctas=0,
+            reduce_ctas=8,
+            chunk_kb=512,
+        )
+
+    def bucketize_error(rules: Tuple[int, ...]) -> str:
+        case = Case("a refused rule", rules=rules)
+        batch = make_batch(case, 99)
+        try:
+            bucketize(case, batch, 8, rules_of(case))
+        except RuntimeError as error:
+            return str(error)
+        return ""
+
+    return {
+        "cyclic rules": why([0, 0, 1], [ROUNDROBIN, ROUNDROBIN, HASH_ROUNDROBIN]) == "",
+        "continuous": '"continuous"'
+        in why([0, 0, 1], [ROUNDROBIN, ROUNDROBIN, CONTINUOUS]),
+        "an unknown code": "code 7" in why([0, 1, 2], [ROUNDROBIN, HASH_ROUNDROBIN, 7]),
+        "two rules in a table": "share a table"
+        in why([0, 0, 1], [ROUNDROBIN, HASH_ROUNDROBIN, ROUNDROBIN]),
+        "a rule per feature": "per feature" in why([0, 0, 1], [ROUNDROBIN, ROUNDROBIN]),
+        "bucketize": f"got {CONTINUOUS}"
+        in bucketize_error((ROUNDROBIN, HASH_ROUNDROBIN, CONTINUOUS))
+        and bucketize_error((ROUNDROBIN, HASH_ROUNDROBIN, ROUNDROBIN)) == "",
+    }
+
+
 def run_case(case: Case, seed: int, world_size: int) -> Dict[str, bool]:
     batch = make_batch(case, seed, world_size)
-    dist_types, block_sizes = rules_of(case, world_size)
-    ref = reference(case, batch, world_size, dist_types, block_sizes)
-    out = bucketize(case, batch, world_size, dist_types, block_sizes)
+    dist_types = rules_of(case)
+    ref = reference(case, batch, world_size, dist_types)
+    out = bucketize(case, batch, world_size, dist_types)
     valid, num_keys = batch.valid, batch.values.numel()
     checks = {
         "keys": out["keys"].dtype == torch.int64
@@ -419,11 +430,9 @@ def run_case(case: Case, seed: int, world_size: int) -> Dict[str, bool]:
         "inv": out["inv"].dtype == torch.int32
         and torch.equal(out["inv"].cpu().long()[:valid], ref["inv"])
         and torch.equal(out["inv"].cpu().long()[valid:], torch.arange(valid, num_keys)),
-        # the keys as their owners store them, in the KJT's order: the keys by
-        # owner are them at inv
-        "stored": out["stored"].dtype == torch.int64
-        and out["stored"].numel() == num_keys
-        and torch.equal(out["keys"], out["stored"][out["inv"].long()]),
+        # every row, the keys past the valid ones too, is the KJT's key at inv,
+        # widened to int64 with its sign
+        "gather": torch.equal(out["keys"], batch.values.long()[out["inv"].long()]),
         "weights": ("weights" in out) == (batch.weights is not None)
         and (
             batch.weights is None
@@ -451,9 +460,9 @@ def run_case(case: Case, seed: int, world_size: int) -> Dict[str, bool]:
             for name, tensor in out.items()
         )
 
-    checks["again"] = same(bucketize(case, batch, world_size, dist_types, block_sizes))
+    checks["again"] = same(bucketize(case, batch, world_size, dist_types))
     checks["lengths"] = same(
-        bucketize(case, batch, world_size, dist_types, block_sizes, lengths=True)
+        bucketize(case, batch, world_size, dist_types, lengths=True)
     )
     return checks
 
@@ -594,6 +603,7 @@ class NodeCase:
     max_len: int = 6
     bound: int = 0  # index dedup: keys past the valid ones
     weights: bool = False
+    values: torch.dtype = torch.int64  # the KJT's keys
     empty: Tuple[int, ...] = ()
     hot: float = 0.0  # share of places that hold key 7, which one owner holds
     # the capacities: the node's largest part plus this (below 0: the call
@@ -648,6 +658,9 @@ NODE_CASES = [
     NodeCase("one node of 40, 70 features", 1, 40, num_features=70, max_len=3),
     NodeCase("2 nodes of 36, 70 features", 2, 36, num_features=70, node=1, max_len=3),
     NodeCase("40 nodes of 2", 40, 2, num_features=3, node=33),
+    # the key range wraps to int32 keys, negative ones among them: the push
+    # widens each with its sign, as the bucketize's gather does
+    NodeCase("2 nodes, int32 keys", 2, 4, values=torch.int32),
 ]
 
 
@@ -674,20 +687,18 @@ def run_node_case(case: NodeCase, seed: int) -> Dict[str, bool]:
         max_len=case.max_len,
         tables=tuple(range(num_features)),
         rules=(HASH_ROUNDROBIN,) * num_features,
-        hash_sizes=(1 << 20,) * num_features,
         key_range=(-(1 << 40), 1 << 40),
+        values=case.values,
         weights=case.weights,
         empty=case.empty,
         hot=case.hot,
         bound=case.bound,
     )
-    dist_types, block_sizes = rules_of(kjt, world_size)
+    dist_types = rules_of(kjt)
     batches = [
         make_batch(kjt, seed * 100 + local_rank) for local_rank in range(local_size)
     ]
-    ranks = [
-        bucketize(kjt, batch, world_size, dist_types, block_sizes) for batch in batches
-    ]
+    ranks = [bucketize(kjt, batch, world_size, dist_types) for batch in batches]
     valid = [batch.valid for batch in batches]
     offset_per_bucket_feature = [
         bucketized["offset_per_bucket_feature"].tolist() for bucketized in ranks
@@ -892,7 +903,7 @@ def run_node_case(case: NodeCase, seed: int) -> Dict[str, bool]:
     for local_rank, bucketized in enumerate(ranks):
         planner(
             hier_output_dist_node_push,
-            bucketized["stored"],
+            batches[local_rank].values,
             bucketized["inv"],
             batches[local_rank].weights,
             bucketized["bucket_feature_of_row"],
@@ -1029,7 +1040,7 @@ def report(label: str, checks: Dict[str, bool]) -> bool:
 
 def main() -> None:
     torch.cuda.set_device(0)
-    failures = 0
+    failures = int(not report("rule refusals", run_rule_refusals()))
     for case_idx, case in enumerate(CASES):
         for world_size in case.world_sizes:
             checks = run_case(case, 100 + case_idx, world_size)

@@ -115,10 +115,9 @@ constexpr int64_t kMinChunkKb = 64;
 struct Config {
   int rank = 0, world_size = 0, local_size = 0;  // ranks are node-contiguous
   std::vector<int> feature_tables;               // the table of each feature: across nodes a key is
-                                                 // its owner node, table and value
-  at::Tensor block_sizes;  // [num_features] int64 on the GPU: the bucketize's rule
-  at::Tensor dist_types;   // [num_features] int32 on the GPU: of each feature
-  int64_t dim = 0;         // a row of the lookup output: dim values of dtype
+                                                 // its table and value
+  std::vector<int> dist_types;  // [num_features]: each feature's DistType code (src/utils.h)
+  int64_t dim = 0;              // a row of the lookup output: dim values of dtype
   at::ScalarType dtype = at::kFloat;
   bool weights = false;    // the requesters' keys carry weights, and so the owner's KJT:
                            // whole counts of at least 0, which the proxy adds as integers
@@ -136,16 +135,18 @@ struct Config {
   int64_t row_bytes() const { return dim * (int64_t)c10::elementSize(dtype); }
   // Throws std::invalid_argument (Python: ValueError) for a configuration the
   // op cannot take. It builds nothing, so the ranks can compare their
-  // configurations and answers before any of them builds the op.
+  // configurations and answers before any of them builds the op. It also
+  // refuses a rule other than roundrobin and hash_roundrobin, and a table
+  // whose features have different rules (check_rules).
   void validate() const;
 };
 
 // A configuration of these fields (Config's), as Python gives them.
 Config config_of(int64_t rank, int64_t world_size, int64_t local_size,
-                 const std::vector<int64_t> &feature_tables, const at::Tensor &block_sizes,
-                 const at::Tensor &dist_types, int64_t dim, at::ScalarType dtype, bool weights,
-                 bool node_dedup, int64_t lookup_keys, int64_t remote_keys, int64_t proxy_bytes,
-                 double timeout_s, int64_t ctas, int64_t reduce_ctas, int64_t chunk_kb);
+                 const std::vector<int64_t> &feature_tables, const std::vector<int64_t> &dist_types,
+                 int64_t dim, at::ScalarType dtype, bool weights, bool node_dedup,
+                 int64_t lookup_keys, int64_t remote_keys, int64_t proxy_bytes, double timeout_s,
+                 int64_t ctas, int64_t reduce_ctas, int64_t chunk_kb);
 
 // Why the op does not apply to a sharding of these ranks, features and rows
 // (ranks that are not whole nodes, int32 bucket feature numbers, rows the

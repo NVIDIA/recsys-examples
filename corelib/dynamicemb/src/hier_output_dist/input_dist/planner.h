@@ -70,23 +70,16 @@ struct PlanInput {
   at::Tensor reverse_indices;         // int64 [original rows]: original row -> row of the KJT
 };
 
-// The rule that places the keys of each feature on their owners, the
-// bucketize's: a DistType code (src/utils.h; codes other than kCyclic and
-// kHashedCyclic are kBlock), which the bucketize reads at run time, and the
-// block size kBlock divides by.
-struct OwnerRules {
-  at::Tensor dist_types;   // [num_features] int32 on the GPU
-  at::Tensor block_sizes;  // [num_features] int64 on the GPU
-};
-
 // A call's keys by owner, bucketized: [owner][feature][sample][position],
 // the order of TorchRec's bucketize. B is values.numel(); the valid keys are
 // offset_per_bucket[world_size] of them (index dedup leaves fewer). A
 // requester's "bucketized rows" are these, in this order.
 struct BucketizedKeys {
-  at::Tensor keys;         // int64 [B]: each valid key as its owner stores it (bucketize_keys only)
+  at::Tensor keys;         // int64 [B]: each key, widened to int64 with its sign (bucketize_keys
+                           // only)
   at::Tensor key_weights;  // fp32 [B], or undefined: their weights (bucketize_keys only)
-  at::Tensor stored;       // int64 [B]: each KJT key as its owner stores it, in the KJT's order
+  at::Tensor values;       // int32 or int64 [B]: the KJT's keys (input.values, no copy), which the
+                           // push gathers
   at::Tensor inv;          // int32 [B]: the KJT row of each (a permutation; row past the valid)
   at::Tensor bucket_feature_of_row;  // int32 [B]: the bucket feature owner * num_features + feature
                                      // of each, world_size * num_features past the valid
@@ -95,18 +88,26 @@ struct BucketizedKeys {
   at::Tensor offset_per_bucket;          // int64 [world_size + 1]: where each bucket (owner) starts
   at::Tensor input_length_per_key;       // int64 [num_features]: keys per feature of the input KJT
 };
+
+// The bucketize places the keys of each feature on their owners by the feature's rule, its
+// dist_types entry (int32 [num_features] on the keys' GPU): a DistType code (src/utils.h),
+// kCyclic or kHashedCyclic (Config::validate refuses the others), which it reads at run time.
+
 // The checks of the bucketize's inputs (the keys, offsets or lengths, the input KJT's offsets,
 // weights, the rules) and of the fan-out's (reverse_indices). Each throws (TORCH_CHECK) with the
 // message of its check. InChannel::input_dist calls both before it takes a sequence number.
 // bucketize_rows and fanout_tables call them too (the hooks).
-void check_bucketize_input(const PlanInput &input, const OwnerRules &rules, int64_t world_size);
+void check_bucketize_input(const PlanInput &input, const at::Tensor &dist_types,
+                           int64_t world_size);
 void check_fanout_input(const at::Tensor &reverse_indices);
 // The bucketize up to its gather: the in channel's (its push gathers the keys as it pushes them).
 // keys and key_weights stay undefined.
-BucketizedKeys bucketize_rows(const PlanInput &input, const OwnerRules &rules, int64_t world_size);
+BucketizedKeys bucketize_rows(const PlanInput &input, const at::Tensor &dist_types,
+                              int64_t world_size);
 // The whole bucketize: bucketize_rows, then the keys (and weights) gathered into bucketized order
-// (gather_rows): the tests'. stored stays.
-BucketizedKeys bucketize_keys(const PlanInput &input, const OwnerRules &rules, int64_t world_size);
+// (gather_rows): the tests'.
+BucketizedKeys bucketize_keys(const PlanInput &input, const at::Tensor &dist_types,
+                              int64_t world_size);
 
 // Index dedup's fan-out of the deduplicated rows to the original rows, in the
 // format of Fanout (common.h): a row's original rows are
@@ -172,11 +173,11 @@ NodeLayout empty_node_layout(const Topo &topo, int64_t num_features,
 // The push of node_key_push (push_rows, node.cuh) into a test's stand-ins for its targets'
 // node_keys: row t of node_keys ([local_size][lookup_keys + remote_keys]), of node_key_weights
 // (the same shape, or undefined) and across nodes of node_bucket_feature_of_row
-// ([local_size][remote_keys]) is target t's. Its inputs are bucketize_rows' outputs (stored, inv,
-// bucket_feature_of_row, offset_per_bucket), the KJT's weights (or undefined) and the node
-// layout. With src defined (one node) it also writes src. A place outside a stand-in's row is
-// not stored.
-void push_to_node_keys(const at::Tensor &stored, const at::Tensor &inv, const at::Tensor &weights,
+// ([local_size][remote_keys]) is target t's. Its inputs are the KJT's keys (values: int32 or
+// int64) and weights (or undefined), bucketize_rows' outputs (inv, bucket_feature_of_row,
+// offset_per_bucket) and the node layout. With src defined (one node) it also writes src. A place
+// outside a stand-in's row is not stored.
+void push_to_node_keys(const at::Tensor &values, const at::Tensor &inv, const at::Tensor &weights,
                        const at::Tensor &bucket_feature_of_row, const at::Tensor &offset_per_bucket,
                        const NodeLayout &node, const Topo &topo, int64_t num_features,
                        int64_t lookup_keys, int64_t remote_keys, const at::Tensor &node_keys,
@@ -211,13 +212,13 @@ OneNodeOwner one_node_owner(const NodeLayout &node, const at::Tensor &node_keys,
 // tables of the ones before (proxy.cu).
 //
 // The occurrences are the entries of the remote part (occurrence index occ).
-// A node-unique key is an identity (owner node, table, key), or each
-// occurrence without node dedup; its key index u numbers the node-unique keys
-// owner node after owner node, each owner node's by the smallest feature of
-// the key, then in key order. Index dedup leaves each requester each (table,
-// key) once, so a key has at most local_size occurrences (Sizes::max_key_rows)
-// and a row of proxy_rows for each. Entries past the valid part of the remote
-// part, and keys past the valid ones, hold garbage that no one reads.
+// A node-unique key is an identity (table, key), or each occurrence without
+// node dedup; its key index u numbers the node-unique keys owner node after
+// owner node, each owner node's by the smallest feature of the key, then in
+// key order. Index dedup leaves each requester each (table, key) once, so a
+// key has at most local_size occurrences (Sizes::max_key_rows) and a row of
+// proxy_rows for each. Entries past the valid part of the remote part, and
+// keys past the valid ones, hold garbage that no one reads.
 
 // The proxy's inputs: its remote part (views of its buffers) and what the
 // node layout says of it.
@@ -268,8 +269,7 @@ struct ProxyKeys {
   at::Tensor key_count;         // int32 [remote_keys]: its occurrences
   at::Tensor key_first;         // int32 [remote_keys]: the sorted position of its first occurrence
   at::Tensor key_node;          // int32 [remote_keys]: its owner node
-  at::Tensor key_uniq;          // int32 [remote_keys]: u among its owner node's
-  at::Tensor node_unique_keys;  // int64 [remote_keys]: the key, as its owner stores it
+  at::Tensor node_unique_keys;  // int64 [remote_keys]: the key
   at::Tensor node_unique_key_weights;  // fp32 [remote_keys]: the weight of its record, its
                                        // occurrences' weights, or undefined (8-byte records)
   at::Tensor node_length_per_bucket_feature;  // int64 [num_nodes * num_features]: the keys of each
@@ -277,8 +277,12 @@ struct ProxyKeys {
   at::Tensor node_offset_per_bucket;  // int64 [num_nodes + 1]: the first key of each owner node
   at::Tensor node_length_per_bucket;  // int64 [num_nodes]: the keys of each owner node
 };
-// node_dedup: equal keys of an owner node and table are one node-unique key.
-// Weights must be whole numbers (frequency counts): they are summed as int64.
+// node_dedup: equal keys of a table are one node-unique key. A table's rule
+// places equal keys on one owner when the node's requesters give the op keys
+// of one dtype: both rules work in the key's own width, so an int32 key and
+// the same int64 key can have different owners, and the proxy then serves
+// both from the owner node of the key's first occurrence. Weights must be
+// whole numbers (frequency counts): they are summed as int64.
 ProxyKeys proxy_keys(const ProxyInput &input, const Sizes &sizes, bool node_dedup);
 
 // Step 2: the rows of the keys, the chunks of the stream and where they
