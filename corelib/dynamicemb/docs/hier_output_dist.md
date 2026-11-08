@@ -996,10 +996,18 @@ finds their identities with a hash table and numbers them with a scan
   part. So the key's feature is the table's smallest feature under which the
   node asked for the key. The owner looks the key up under it.
 * **Numbering.** The node-unique keys are numbered (`uniq`) per owner node,
-  feature by feature (the representative's), and in their representatives'
-  order inside each (owner node, feature): requester by requester, each
-  requester's in its bucketized order. That order follows the requesters'
-  index dedup, not the key's value.
+  feature by feature (the representative's), and inside each (owner node,
+  feature), under node dedup, with the requesters in turn: each requester's
+  first representative there, requester after requester, then each one's
+  second, and so on (a requester with no more is passed over), each
+  requester's in its bucketized order. So a chunk of the stream mostly
+  holds keys of all the node's requesters, and in the backward its pushes
+  mostly come from all of them. Requester by requester, with uniform keys
+  at 2 nodes of 8 GPUs, a chunk's pushes came from 3 requesters (the
+  median), about half of them from one; in turn they come from all 8, the
+  largest share 0.13 (the median, a CPU study). That order follows the
+  requesters' index dedup, not the key's value. Without node dedup the
+  keys go requester after requester (below).
 * **Rows.** In `proxy_rows` a key takes one row per occurrence. Index
   dedup leaves each requester each (table, key) once, so a key has at most
   `local_size` occurrences, however hot it is (`max_key_rows`, section
@@ -1014,7 +1022,13 @@ finds their identities with a hash table and numbers them with a scan
   admission strategy. The proxy adds them up per node-unique key, as whole
   numbers.
 * **`node_dedup=False`** (or gradient clipping): every occurrence is a
-  node-unique key of its own.
+  node-unique key of its own. Inside each (owner node, feature) the keys
+  go requester after requester, each requester's in its bucketized order.
+  So the rows of a (table, key) that several requesters ask reach the
+  owner's lookup in requester order every run. With the requesters in
+  turn their order would follow the requesters' index dedup, which can
+  change between runs, and so could the bits of the lookup's fp32 sum of
+  them. A chunk's pushes come from a few requesters, as above.
 
 **The owner's KJT** has `num_sources = local_size + num_nodes − 1` columns
 per feature (its stride): its lengths go by (feature, source), at index
@@ -1346,10 +1360,22 @@ hash table, the pass and the scan:
 * a pass marks the representatives, and a CUB scan (three launches) counts
   them before each occurrence;
 * one CTA counts the representatives of each block: the keys of each
-  bucket feature, and where each block's keys start;
+  bucket feature, and where they start;
 * a thread per occurrence takes its key `uniq` from its representative,
   and its rank among its key's occurrences from the list. The
-  representative writes its key's tables.
+  representative writes its key's tables. The representative is the `k`-th
+  representative (from 0) of its block (`r`, `b`), and `reps(r', b)` is
+  the representatives of block (`r'`, `b`). With node dedup its key is
+  where the keys of `b` start, plus the sum over `r'` of
+  `min(k, reps(r', b))`, plus the requesters `r' < r` with
+  `reps(r', b) > k`: before it come every representative of `b` of place
+  below `k`, of every requester, and those of place `k` of the requesters
+  before `r`. So the keys of `b` go by (`k`, `r`), the requesters in turn
+  (section 9), one key per representative. That takes about four loads per
+  requester and occurrence, the same words for every occurrence of `b`.
+  Without node dedup the keys of `b` go requester after requester: the key
+  is where they start, plus the occurrences of `b` at the requesters
+  before `r`, plus `k`.
 
 The bucket is the high bits of `murmur3_fmix64(key ^ seed)`, mixed with
 the table. An owner rule fixes the low bits of the key (`roundrobin`) or of
@@ -2128,8 +2154,8 @@ features, and 125 MB at 256 nodes and 1,000 features. Per call, the
 bucketize's `offset_per_bucket_feature` and the node layout's places are
 sized by `world_size` too (`8 × world_size × num_features` bytes each),
 and so are the proxy's block tables while its node dedup runs (about
-`16 × world_size × num_features` bytes). Apart from these, `num_nodes`
-enters only through:
+`8 × (world_size + num_nodes) × num_features` bytes). Apart from these,
+`num_nodes` enters only through:
 
 * the share `(num_nodes − 1) / num_nodes`;
 * the control words, most of them the count messages: this rank's, and a
@@ -2313,9 +2339,12 @@ the output rows and the gradient handed to the lookup are the same bits every
 run. That holds on one node and across nodes, whether a stream wraps its
 ring or not. The keys in the owner's KJT columns follow DynamicEmb's
 `unique` numbering: the same-node requesters' columns directly, and the
-other nodes' columns through their representatives' order (section 9). So
+other nodes' columns through their representatives' places in their
+requesters' orders, with node dedup the requesters in turn (section 9). So
 do the rows of `lookup_grad`, and across nodes the chunk cuts and the put
 lists. That numbering may change between runs; the value per key does not.
+Without node dedup such a column can hold a key once per requester that
+asked it, and those rows come in requester order every run.
 DynamicEmb's
 lookup backward adds a hot key's partial sums with 16-bit atomic additions on
 every dist, so tables of 16-bit rows may still differ from run to run.

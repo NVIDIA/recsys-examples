@@ -229,11 +229,14 @@ OneNodeOwner one_node_owner(const NodeLayout &node, const at::Tensor &node_keys,
 // feature (owner node, feature), and of those the first. Its key index u
 // numbers the node-unique keys by their representative's bucket feature
 // (owner node after owner node, each owner node's by the smallest feature of
-// the key), then in their representative's order. Index dedup leaves each
-// requester each (table, key) once, so a key has at most local_size
-// occurrences (Sizes::max_key_rows) and a row of proxy_rows for each. Entries
-// past the valid part of the remote part, and keys past the valid ones, hold
-// garbage that no one reads.
+// the key), then, under node dedup, with the requesters in turn: the first
+// representative of each requester there, requester after requester, then
+// the second, and so on, each requester's in its order; without node dedup
+// requester after requester (proxy.cu: key_of_representative). Index
+// dedup leaves each requester each (table, key) once, so a key has at most
+// local_size occurrences (Sizes::max_key_rows) and a row of proxy_rows for
+// each. Entries past the valid part of the remote part, and keys past the
+// valid ones, hold garbage that no one reads.
 
 // The proxy's inputs: its remote part (views of its buffers) and what the
 // node layout says of it.

@@ -40,7 +40,9 @@ namespace {
 // insert (dedup_chain.cuh). Integer atomics give the identity its
 // representative, its occurrences, a list of them and the sum of their
 // weights. A scan of the representatives and their counts per (requester,
-// bucket feature) block then number the node-unique keys. No result depends
+// bucket feature) block then number the node-unique keys, inside a bucket
+// feature the requesters in turn with node dedup and requester after
+// requester without it (key_of_representative). No result depends
 // on the order of the atomics: the representative is a minimum, the counts
 // and weights are integer sums, a list is read as a set, and the occurrence
 // that claims an identity only holds its state. Nor on the hash: no step
@@ -118,11 +120,10 @@ __device__ __forceinline__ uint64_t identity_bucket(int64_t key, int32_t table, 
 }
 
 // The int64 words of the blocks' tables (prepare_kernel, blocks_kernel): per
-// requester where its blocks start and where its range ends, per (requester,
-// bucket feature) a base, and per bucket feature where its keys start, and
-// their end.
+// requester where its blocks start and where its range ends, and per bucket
+// feature where its keys start, and their end.
 inline int64_t block_scratch(int64_t local_size, int64_t bucket_features) {
-  return local_size * (2 * bucket_features + 1) + bucket_features + 1;
+  return (local_size + 1) * (bucket_features + 1);
 }
 
 // A thread per bucket of the hash table (`buckets`; none without node dedup)
@@ -221,18 +222,80 @@ __global__ void __launch_bounds__(kThreads)
         occurrence < count && representative_of(ids.rep[ids.identity_of[occurrence]]) == occurrence;
 }
 
+// The representatives before occurrence `occurrence`: its entry of
+// reps_before, or the occurrence itself without node dedup (reps_before
+// nullptr), where each occurrence is one.
+__device__ __forceinline__ int64_t reps_before_of(const int32_t *reps_before, int64_t occurrence) {
+  return reps_before != nullptr ? reps_before[occurrence] : occurrence;
+}
+
+// The representatives of block (r, b), its node-unique keys: those before
+// the block's next entry of block_start ([local_size][columns]; a
+// requester's last entry is the end of its range) less those before its own.
+__device__ __forceinline__ int64_t block_reps(const int64_t *block_start, int64_t columns,
+                                              const int32_t *reps_before, int64_t requester,
+                                              int64_t bucket_feature) {
+  const int64_t *start = block_start + requester * columns + bucket_feature;
+  return reps_before_of(reps_before, start[1]) - reps_before_of(reps_before, start[0]);
+}
+
+// The key u of representative `rep` of block (r, b). With node dedup
+// (kNodeDedup), inside bucket feature b the requesters take turns: the k-th
+// representative (k from 0, in occurrence order) of block (r, b), k =
+// reps_before[rep] - reps_before[block_start[r][b]], is key
+//   u = key_start[b] + sum over r' of min(k, reps(r', b))
+//                    + #{r' < r : reps(r', b) > k},
+// reps(r', b) the representatives of block (r', b) (block_reps). Before it
+// come every representative of b of index below k, of every requester, and
+// those of index k of the requesters before r: the keys of b are b's
+// representatives in (k, r) order, a bijection onto [key_start[b],
+// key_start[b + 1]). So a chunk mostly takes keys of all the node's
+// requesters, and its pushes mostly come from all of them. (Requester after
+// requester, as below, a chunk's pushes come from a few requesters, about
+// half of them from one.) O(local_size) loads per occurrence: per requester
+// two words of block_start and two of reps_before, the same for every
+// occurrence of b.
+// Without node dedup each occurrence is a key, and the keys of b go
+// requester after requester, each requester's in occurrence order: u =
+// key_start[b] + the occurrences of b at the requesters before r + rep's
+// place in its block. So the rows of a (table, key) that several requesters
+// ask reach the owner's lookup in requester order. With the requesters in
+// turn their order would follow index dedup's order of each requester's
+// keys, which can change from run to run, and so could the lookup's fp32
+// sum of them.
+template <bool kNodeDedup>
+__device__ __forceinline__ int64_t key_of_representative(
+    const int64_t *block_start, const int64_t *key_start, const int32_t *reps_before,
+    int64_t local_size, int64_t columns, int64_t requester, int64_t bucket_feature, int64_t rep) {
+  int64_t key = key_start[bucket_feature];
+  if constexpr (kNodeDedup) {
+    const int64_t k =
+        reps_before[rep] - reps_before[block_start[requester * columns + bucket_feature]];
+    for (int64_t other = 0; other < local_size; ++other) {
+      const int64_t *start = block_start + other * columns + bucket_feature;
+      const int64_t reps = reps_before[start[1]] - reps_before[start[0]];
+      key += min(k, reps) + (other < requester && reps > k);
+    }
+  } else {
+    key += rep - block_start[requester * columns + bucket_feature];
+    for (int64_t other = 0; other < requester; ++other) {
+      const int64_t *start = block_start + other * columns + bucket_feature;
+      key += start[1] - start[0];
+    }
+  }
+  return key;
+}
+
 // One CTA: the node-unique keys of each block of the remote part
-// (prepare_kernel), its representatives: reps_before[end] - reps_before[start]
-// (reps_before: the representatives before each occurrence; nullptr without
-// node dedup, where each occurrence is one). From them: the node-unique keys
-// of each bucket feature and of each owner node, and base[r][b], the keys of
-// the bucket features before b and of b at the requesters before r, less the
-// representatives before block (r, b). Key u = base[r][b] + reps_before[rep]
-// is the representative rep's of block (r, b): the keys go by bucket feature,
-// then in their representatives' order. local_size * num_nodes * num_features
-// blocks on one CTA, whose reads do not wait on each other: the order of the
-// node layout's row_shift (world_size * num_features entries), also
-// one CTA's. scratch: block_scratch words, block_start written.
+// (prepare_kernel), its representatives (block_reps; reps_before: the
+// representatives before each occurrence, nullptr without node dedup, where
+// each occurrence is one). From them: the node-unique keys of each bucket
+// feature and where they start (key_start: key_of_representative numbers
+// each bucket feature's keys from there), and those of each owner node.
+// local_size * num_nodes * num_features blocks on one CTA, whose reads do
+// not wait on each other: the order of the node layout's row_shift
+// (world_size * num_features entries), also one CTA's. scratch:
+// block_scratch words, block_start written.
 __global__ void __launch_bounds__(kThreads)
     blocks_kernel(const int32_t *reps_before, int64_t local_size, int64_t num_nodes,
                   int64_t num_features, int64_t *scratch, int64_t *node_length_per_bucket_feature,
@@ -240,23 +303,15 @@ __global__ void __launch_bounds__(kThreads)
                   int64_t *node_num_uniques) {
   const int64_t bucket_features = num_nodes * num_features, columns = bucket_features + 1;
   // [requester][bucket feature]: where each block starts, then where the
-  // requester's range ends; the bases; where the keys of each bucket feature
-  // start, then their end
-  int64_t *block_start = scratch, *base = block_start + local_size * columns,
-          *key_start = base + local_size * bucket_features;
-  auto before = [&](int64_t occurrence) -> int64_t {
-    return reps_before != nullptr ? reps_before[occurrence] : occurrence;
-  };
-  // the node-unique keys of block (r, b)
-  auto keys_of = [&](int64_t requester, int64_t bucket_feature) {
-    const int64_t *start = block_start + requester * columns + bucket_feature;
-    return before(start[1]) - before(start[0]);
-  };
+  // requester's range ends; where the keys of each bucket feature start, then
+  // their end
+  const int64_t *block_start = scratch;
+  int64_t *key_start = scratch + local_size * columns;
   for (int64_t bucket_feature = threadIdx.x; bucket_feature < bucket_features;
        bucket_feature += kThreads) {
     int64_t keys = 0;
     for (int64_t requester = 0; requester < local_size; ++requester)
-      keys += keys_of(requester, bucket_feature);
+      keys += block_reps(block_start, columns, reps_before, requester, bucket_feature);
     node_length_per_bucket_feature[bucket_feature] = keys;
   }
   __syncthreads();
@@ -271,22 +326,14 @@ __global__ void __launch_bounds__(kThreads)
           key_start[(owner_node + 1) * num_features] - key_start[owner_node * num_features];
   }
   if (threadIdx.x == 0) *node_num_uniques = total;
-  for (int64_t bucket_feature = threadIdx.x; bucket_feature < bucket_features;
-       bucket_feature += kThreads) {
-    int64_t key = key_start[bucket_feature];  // the first key of the next block
-    for (int64_t requester = 0; requester < local_size; ++requester) {
-      base[requester * bucket_features + bucket_feature] =
-          key - before(block_start[requester * columns + bucket_feature]);
-      key += keys_of(requester, bucket_feature);
-    }
-  }
 }
 
 // A thread per valid occurrence: its node-unique key u (node_reverse_indices)
 // from its identity's representative rep (itself without node dedup,
-// kNodeDedup false), u = base[rep's requester][rep's bucket feature] +
-// reps_before[rep] (blocks_kernel); and its rank among its key's occurrences
-// in occurrence order, the occurrences in its identity's list before it. A
+// kNodeDedup false): rep's key in its block (rep's requester, rep's bucket
+// feature), key_of_representative (block_start and key_start:
+// blocks_kernel's scratch); and its rank among its key's occurrences in
+// occurrence order, the occurrences in its identity's list before it. A
 // list holds at most max_key_rows occurrences in a call that fits. A key of
 // more makes the call raise (kNeedKeyRows): its occurrences take rank
 // max_key_rows without a walk, which gives them the key's row. The
@@ -298,22 +345,21 @@ __global__ void __launch_bounds__(kThreads)
     key_tables_kernel(const int64_t *occurrence_keys, const float *weights,
                       const int32_t *node_bucket_feature_of_row, const int64_t *requester_start,
                       const int64_t *occurrence_count, Identities ids, const int32_t *reps_before,
-                      const int64_t *base, int64_t entries, int64_t local_size, int64_t num_nodes,
-                      int64_t num_features, int32_t max_key_rows, int32_t *node_reverse_indices,
-                      int32_t *occurrence_rank, int32_t *key_count, int32_t *key_node,
-                      int64_t *node_unique_keys, float *node_unique_key_weights,
-                      int64_t *key_rows) {
+                      const int64_t *block_start, const int64_t *key_start, int64_t entries,
+                      int64_t local_size, int64_t num_nodes, int64_t num_features,
+                      int32_t max_key_rows, int32_t *node_reverse_indices, int32_t *occurrence_rank,
+                      int32_t *key_count, int32_t *key_node, int64_t *node_unique_keys,
+                      float *node_unique_key_weights, int64_t *key_rows) {
   const int64_t count = *occurrence_count, bucket_features = num_nodes * num_features;
   int32_t most = 0;  // the most occurrences of this thread's keys
   for (int64_t occurrence = first_item(); occurrence < count; occurrence += item_stride()) {
-    int64_t rep = occurrence, bucket_feature = 0, reps = occurrence;
+    int64_t rep = occurrence, bucket_feature = 0;
     int32_t identity = 0, occurrences = 1, rank = 0;
     if constexpr (kNodeDedup) {
       identity = ids.identity_of[occurrence];
       const unsigned long long word = ids.rep[identity];
       rep = representative_of(word);
       bucket_feature = representative_bucket_feature(word);
-      reps = reps_before[rep];
       occurrences = ids.count[identity];
       if (occurrences > max_key_rows)
         rank = max_key_rows;
@@ -324,9 +370,11 @@ __global__ void __launch_bounds__(kThreads)
       bucket_feature = node_bucket_feature_of_row[occurrence];
     }
     const int64_t requester = requester_of_occurrence(requester_start, local_size, rep);
-    const int64_t key = clamp_index(
-        base[requester * bucket_features + clamp_index(bucket_feature, bucket_features)] + reps,
-        entries);
+    const int64_t key =
+        clamp_index(key_of_representative<kNodeDedup>(
+                        block_start, key_start, reps_before, local_size, bucket_features + 1,
+                        requester, clamp_index(bucket_feature, bucket_features), rep),
+                    entries);
     node_reverse_indices[occurrence] = (int32_t)key;
     occurrence_rank[occurrence] = rank;
     if (rep != occurrence) continue;
@@ -731,8 +779,8 @@ ProxyKeys proxy_keys(const ProxyInput &input, const Sizes &sizes, bool node_dedu
   ProxyKeys keys;
   keys.occurrence_count = at::empty({}, long_options);
   keys.key_rows = at::empty({}, long_options);
-  // the blocks per (requester, bucket feature), and the bases of the key
-  // indices (block_scratch)
+  // where each (requester, bucket feature) block starts, and where the keys
+  // of each bucket feature start (block_scratch)
   const at::Tensor block_tables =
       at::empty({block_scratch(local_size, bucket_features)}, long_options);
   // Under node dedup the identities: a hash table of the call, its buckets at
@@ -786,8 +834,8 @@ ProxyKeys proxy_keys(const ProxyInput &input, const Sizes &sizes, bool node_dedu
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     reps_before = exclusive_ends(is_rep, at::kInt);
   }
-  // The node-unique keys of the blocks: per bucket feature and per owner
-  // node, and the bases of the key indices.
+  // The node-unique keys of the blocks: per bucket feature, where they
+  // start, and per owner node.
   keys.node_length_per_bucket_feature = at::empty({bucket_features}, long_options);
   keys.node_offset_per_bucket = at::empty({num_nodes + 1}, long_options);
   keys.node_length_per_bucket = at::empty({num_nodes}, long_options);
@@ -798,7 +846,8 @@ ProxyKeys proxy_keys(const ProxyInput &input, const Sizes &sizes, bool node_dedu
       keys.node_offset_per_bucket.data_ptr<int64_t>(),
       keys.node_length_per_bucket.data_ptr<int64_t>(), keys.node_num_uniques.data_ptr<int64_t>());
   C10_CUDA_KERNEL_LAUNCH_CHECK();
-  // per occurrence its key and its rank there, and per key its tables
+  // per occurrence its key (with node dedup the requesters in turn inside
+  // each bucket feature) and its rank there, and per key its tables
   keys.node_reverse_indices = at::empty({entries}, int_options);
   keys.occurrence_rank = at::empty({entries}, int_options);
   keys.key_count = at::empty({entries}, int_options);
@@ -812,6 +861,7 @@ ProxyKeys proxy_keys(const ProxyInput &input, const Sizes &sizes, bool node_dedu
         input.node_keys.data_ptr<int64_t>(), weights,
         input.node_bucket_feature_of_row.data_ptr<int32_t>(), requester_start,
         keys.occurrence_count.data_ptr<int64_t>(), ids, data_or_null<int32_t>(reps_before),
+        block_tables.data_ptr<int64_t>(),
         block_tables.data_ptr<int64_t>() + local_size * (bucket_features + 1), entries, local_size,
         num_nodes, num_features, (int32_t)sizes.max_key_rows(),
         keys.node_reverse_indices.data_ptr<int32_t>(), keys.occurrence_rank.data_ptr<int32_t>(),

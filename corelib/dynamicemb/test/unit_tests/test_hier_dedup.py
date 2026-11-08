@@ -37,10 +37,12 @@ windows hold garbage before the call. The checks:
 * each proxy against a plain reference of the planner's rules: its
   node-unique keys (identities (table, key), each in the bucket feature
   (owner node, feature) of its representative, its occurrence of the least
-  bucket feature and of those the first; in their representatives' order
-  inside a bucket feature), their records, the chunks of its stream
-  (levels of each owner node's weights: a key's rows, but at least the chunk
-  weight; packed, in laps when they pass the ring), their bounds,
+  bucket feature and of those the first; inside a bucket feature the
+  requesters in turn: each one's first representative, requester after
+  requester, then each one's second, and so on; without node dedup each
+  occurrence, requester after requester), their records, the chunks of its
+  stream (levels of each owner node's weights: a key's rows, but at least
+  the chunk weight; packed, in laps when they pass the ring), their bounds,
   and where each lies, each occurrence's row and slot (the first
   occurrence's row, then duplicate slots), push positions, push tables and
   the rows before each key; its records of each bucket feature against a
@@ -234,8 +236,10 @@ def same_place_job(case: Case, generator) -> List[Tuple]:
     second lap's first chunk (second_lap_key) lies where key 0 does. Requester
     1 asks those two keys too. Requester 0's occurrences come first in the
     proxy's remote part, so they are the keys' representatives and hold their
-    key rows: the keys are numbered in key order, and requester 0's rows of the
-    two keys are two rows of one slot in two chunks."""
+    key rows. Requester 0 holds every representative and requester 1 none, so
+    with the requesters in turn the k-th key is requester 0's k-th: the keys
+    are numbered in key order, and requester 0's rows of the two keys are two
+    rows of one slot in two chunks."""
     keys = case.num_proxy_rows + 2 * chunk_room(case)
     return one_owner_job(case, [list(range(keys)), [0, second_lap_key(case)]])
 
@@ -734,10 +738,13 @@ def proxy_reference(case: Case, occurrences: List, node: int, remote_keys: int) 
     capacity = max_chunks(case, remote_keys)
     # node-unique keys: (table, key), or each occurrence. A key's
     # representative is its occurrence of the least bucket feature (owner
-    # node, feature), and of those the first; the keys are numbered by their
-    # representative's bucket feature, then in their representatives' order.
-    # A (table, key) has one owner node: its owner follows from the key
-    # (random_job).
+    # node, feature), and of those the first. The keys are numbered by their
+    # representative's bucket feature, then, under node dedup, with the
+    # requesters in turn: by (k, requester), the representative the k-th
+    # (from 0, in occurrence order) of its requester's representatives of
+    # that bucket feature; without node dedup requester after requester, in
+    # occurrence order. A (table, key) has one owner node: its owner follows
+    # from the key (random_job).
     members: Dict = {}
     for occ, (_, _, _, feature, value, _) in enumerate(occurrences):
         identity = (case.tables[feature], value) if case.node_dedup else occ
@@ -752,6 +759,16 @@ def proxy_reference(case: Case, occurrences: List, node: int, remote_keys: int) 
         )
         keys.append((owner_node, feature, rep, group))
     keys.sort()
+    if case.node_dedup:
+        # each representative's k: its requester's representatives of its
+        # bucket feature before it
+        nth: Dict = {}
+        ks: Dict = {}
+        for owner_node, feature, rep, _ in keys:
+            block = (occurrences[rep][0], owner_node, feature)
+            ks[rep] = nth.get(block, 0)
+            nth[block] = ks[rep] + 1
+        keys.sort(key=lambda key: (key[0], key[1], ks[key[2]], occurrences[key[2]][0]))
     node_num_uniques = len(keys)
     key_of = [0] * len(occurrences)
     for key, (*_, group) in enumerate(keys):
