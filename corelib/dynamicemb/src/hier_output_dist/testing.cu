@@ -263,7 +263,8 @@ Sizes plan_sizes(const std::map<std::string, int64_t> &named) {
 // (count_message), by name. It writes remote_map, key_stage and
 // proxy_header (a proxy header, ProxyHeader) as the steps write those
 // buffers of its window. Also the node-unique key of each occurrence
-// (node_reverse_indices), for the test's reference.
+// (node_reverse_indices, garbage past the valid ones), for the test's
+// reference.
 std::map<std::string, at::Tensor> proxy_plan_test(
     at::Tensor node_keys, c10::optional<at::Tensor> node_key_weights,
     at::Tensor node_bucket_feature_of_row, at::Tensor requester_start, at::Tensor skip,
@@ -300,8 +301,7 @@ std::map<std::string, at::Tensor> proxy_plan_test(
   const ProxyBuffers buffers = proxy_buffers(remote_map.view({RemoteMap::kArrays, entries}),
                                              key_stage, header, proxy_header.options());
   ProxyKeys proxy = proxy_keys(input, sizes, node_dedup);
-  const at::Tensor node_reverse_indices =
-      at::empty_like(proxy.key_at).index_copy_(0, proxy.order.to(at::kLong), proxy.key_at);
+  const at::Tensor node_reverse_indices = proxy.node_reverse_indices;  // the push order drops it
   ProxyChunks chunks = proxy_chunks_and_slots(proxy, requester_start, buffers, sizes);
   const ProxyPlan plan =
       proxy_push_order(std::move(proxy), std::move(chunks), requester_start, buffers, sizes);

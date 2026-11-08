@@ -225,12 +225,15 @@ OneNodeOwner one_node_owner(const NodeLayout &node, const at::Tensor &node_keys,
 //
 // The occurrences are the entries of the remote part (occurrence index occ).
 // A node-unique key is an identity (table, key), or each occurrence without
-// node dedup; its key index u numbers the node-unique keys owner node after
-// owner node, each owner node's by the smallest feature of the key, then in
-// key order. Index dedup leaves each requester each (table, key) once, so a
-// key has at most local_size occurrences (Sizes::max_key_rows) and a row of
-// proxy_rows for each. Entries past the valid part of the remote part, and
-// keys past the valid ones, hold garbage that no one reads.
+// node dedup. Its representative is its occurrence of the smallest bucket
+// feature (owner node, feature), and of those the first. Its key index u
+// numbers the node-unique keys by their representative's bucket feature
+// (owner node after owner node, each owner node's by the smallest feature of
+// the key), then in their representative's order. Index dedup leaves each
+// requester each (table, key) once, so a key has at most local_size
+// occurrences (Sizes::max_key_rows) and a row of proxy_rows for each. Entries
+// past the valid part of the remote part, and keys past the valid ones, hold
+// garbage that no one reads.
 
 // The proxy's inputs: its remote part (views of its buffers) and what the
 // node layout says of it.
@@ -264,26 +267,26 @@ struct ProxyBuffers {
 ProxyBuffers proxy_buffers(at::Tensor remote_map, at::Tensor key_stage, const ProxyHeader &header,
                            const at::TensorOptions &options);
 
-// Step 1: the node-unique keys, by sorts of the occurrences. Node dedup is
-// index dedup over the node's keys, and its sort by owner node is the
-// bucketize: their tables take index dedup's and the bucketize's names with
-// a node_ prefix (docs/hier_output_dist.md, section 10.4).
+// Step 1: the node-unique keys, by a hash table of the identities and a scan
+// of their representatives (proxy.cu). Node dedup is index dedup over the
+// node's keys, and its grouping by owner node is the bucketize: their tables
+// take index dedup's and the bucketize's names with a node_ prefix
+// (docs/hier_output_dist.md, section 10.4). The tables per occurrence and per
+// key hold garbage past the valid ones (occurrence_count, node_num_uniques).
 struct ProxyKeys {
   at::Tensor occurrence_count;  // int64 0-dim: the valid occurrences (0 when the node skips)
   at::Tensor node_num_uniques;  // int64 0-dim: the node-unique keys
   at::Tensor key_rows;          // int64 0-dim: the most occurrences of one (kNeedKeyRows)
-  // per sorted position q: the occurrences in identity order, each identity's in occ order
-  at::Tensor valid;   // bool [remote_keys]: q < occurrence_count (also per occurrence)
-  at::Tensor order;   // int32 [remote_keys]: the occurrence at q
-  at::Tensor key_at;  // int32 [remote_keys]: the node-unique key of the occurrence at q
+  // per occurrence occ
+  at::Tensor node_reverse_indices;  // int32 [remote_keys]: its node-unique key u
+  at::Tensor occurrence_rank;       // int32 [remote_keys]: its key's occurrences before it, in
+                                    // occ order (max_key_rows for a key of more occurrences)
   // per node-unique key u
-  at::Tensor valid_key;         // bool [remote_keys]: u < node_num_uniques
-  at::Tensor key_count;         // int32 [remote_keys]: its occurrences
-  at::Tensor key_first;         // int32 [remote_keys]: the sorted position of its first occurrence
-  at::Tensor key_node;          // int32 [remote_keys]: its owner node
-  at::Tensor node_unique_keys;  // int64 [remote_keys]: the key
-  at::Tensor node_unique_key_weights;  // fp32 [remote_keys]: the weight of its record, its
-                                       // occurrences' weights, or undefined (8-byte records)
+  at::Tensor key_count;                       // int32 [remote_keys]: its occurrences
+  at::Tensor key_node;                        // int32 [remote_keys]: its owner node
+  at::Tensor node_unique_keys;                // int64 [remote_keys]: the key
+  at::Tensor node_unique_key_weights;         // fp32 [remote_keys]: the weight of its record, its
+                                              // occurrences' weights, or undefined (8-byte records)
   at::Tensor node_length_per_bucket_feature;  // int64 [num_nodes * num_features]: the keys of each
                                               // (owner node, feature)
   at::Tensor node_offset_per_bucket;  // int64 [num_nodes + 1]: the first key of each owner node
@@ -291,20 +294,21 @@ struct ProxyKeys {
 };
 // node_dedup: equal keys of a table are one node-unique key. A table's rule
 // places equal keys on one owner when the node's requesters give the op keys
-// of one dtype: both rules work in the key's own width, so an int32 key and
-// the same int64 key can have different owners, and the proxy then serves
-// both from the owner node of the key's first occurrence. Weights must be
-// whole numbers (frequency counts): they are summed as int64.
+// of one dtype. Both rules work in the key's own width, so an int32 key and
+// the same int64 key can have different owners. The op's contract excludes
+// that, but the proxy would then serve both from its representative's owner
+// node, the smallest of them. Weights must be whole numbers (frequency
+// counts): they are summed as int64.
 ProxyKeys proxy_keys(const ProxyInput &input, const Sizes &sizes, bool node_dedup);
 
 // Step 2: the rows of the keys, the chunks of the stream and where they
 // lie, each occurrence's slot. A key's rows are its key row and its
 // duplicates' slots, a row per occurrence (max_key_rows at most: a key of
-// more occurrences, which the call raises for, takes max_key_rows, and those
-// past them get no slot of their own). Writes remote_map's key rows and
+// more occurrences, which the call raises for, takes max_key_rows, and all
+// its occurrences take its key row). Writes remote_map's key rows and
 // slots, the chunks and records of key_stage, and the proxy header's chunks,
 // end and ends; drops keys.node_unique_keys and keys.node_unique_key_weights, which only the
-// records need.
+// records need, and keys.occurrence_rank, which only the slots need.
 struct ProxyChunks {
   at::Tensor num_chunks;  // int64 0-dim: the chunks of the stream
   at::Tensor chunks;      // int32 [max_chunks][8]: Chunk, in stream order (zeros past them)

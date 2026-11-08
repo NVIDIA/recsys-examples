@@ -967,12 +967,13 @@ Why `NCCL_CROSS_NIC=0`: section 4.5.
 A proxy holds, in the remote part of its `node_keys`, every occurrence that
 its node's requesters ask of the owners of its rail on the other nodes, and
 in `node_bucket_feature_of_row` the (owner node, feature) of each. Its planner
-numbers them with stable radix sorts (section 10.4):
+finds their identities with a hash table and numbers them with a scan
+(section 10.4):
 
 * **Identity: (table, key).** Equal keys of a table are one node-unique
   key, whichever requesters and features asked for them. Features of one
-  table share keys. A sort by key, then one by table, brings each
-  identity's occurrences together, in the order of the remote part.
+  table share keys. A hash table of the call finds each occurrence's
+  identity.
 * **Why (table, key) is enough.** The op places a key by its table's rule,
   `roundrobin` or `hash_roundrobin` (section 10.1). Python gives each
   table's rule to all its features, and the op refuses a table whose
@@ -988,14 +989,17 @@ numbers them with stable radix sorts (section 10.4):
   owner as `int32` and another as `int64`. The GPUs of a node must give the
   op keys of one dtype in a call (TorchRec's dists need one dtype on every
   rank). Else a proxy can merge an `int32` key and the same `int64` key of
-  two owner nodes, and serve both from the owner node of the first of them
-  in its remote part.
-* **Representative feature.** A node-unique key's feature is the table's
-  smallest feature under which the node asked for the key; a sort of the
-  (identity, feature) pairs finds it. The owner looks the key up under it.
+  two owner nodes, and serve both from the smaller owner node, its
+  representative's (below).
+* **Representative.** A node-unique key's representative is its occurrence
+  of the least (owner node, feature), and of those the first in the remote
+  part. So the key's feature is the table's smallest feature under which the
+  node asked for the key. The owner looks the key up under it.
 * **Numbering.** The node-unique keys are numbered (`uniq`) per owner node,
-  feature by feature (the representative's), and in key order (signed
-  `int64`) inside each (owner node, feature).
+  feature by feature (the representative's), and in their representatives'
+  order inside each (owner node, feature): requester by requester, each
+  requester's in its bucketized order. That order follows the requesters'
+  index dedup, not the key's value.
 * **Rows.** In `proxy_rows` a key takes one row per occurrence. Index
   dedup leaves each requester each (table, key) once, so a key has at most
   `local_size` occurrences, however hot it is (`max_key_rows`, section
@@ -1003,8 +1007,8 @@ numbers them with stable radix sorts (section 10.4):
   in the forward, and in the backward that occurrence's gradient row and
   then the key's sum go there. Each other occurrence holds a duplicate's
   slot for its gradient row. A key of more occurrences (keys that are not
-  index-deduplicated) takes `local_size` rows, its other occurrences take
-  the key's row, and the call raises at its second wait (section 5.4).
+  index-deduplicated) takes `local_size` rows, all its occurrences take the
+  key's row, and the call raises at its second wait (section 5.4).
 * **Weights** ride along when the keys carry them: index dedup's frequency
   counters, with LFU scores (which count how often each key is seen) or an
   admission strategy. The proxy adds them up per node-unique key, as whole
@@ -1060,10 +1064,13 @@ With the benchmark's configuration (8 features, one owner rule), the
 bucketize queues 29 kernels and copies per call (DynamicEmb's index dedup
 and the fan-out table included: 38 when the fan-out took 10 launches after
 its sort, where it now takes one), and the steps after it 5 on one node and
-about 85 across nodes, CUB's included. The node's part of a call is three
-comm kernels (`node_exchange`, `node_key_push`, `node_done`); on one node a
-fourth kernel copies the own part. Across nodes the rail's part is three
-more (`rail_exchange`, `rail_key_push`, `rail_done`).
+about 50 across nodes, CUB's included. The 50 is an estimate from the code,
+not a measurement: about 88 were measured at 2 nodes while the proxy's node
+dedup took 44 launches (three radix sorts), and it now takes 8. The node's
+part of a call is three comm kernels (`node_exchange`, `node_key_push`,
+`node_done`); on one node a fourth kernel copies the own part. Across
+nodes the rail's part is three more (`rail_exchange`, `rail_key_push`,
+`rail_done`).
 
 ### 10.1 The bucketize (requester, caller's stream, local)
 
@@ -1318,6 +1325,32 @@ read:
   of each chunk start (the last: where they end), relative to that
   requester's push order.
 
+**Its node dedup** takes eight launches and no sort (`proxy_keys`,
+`input_dist/proxy.cu`); with `node_dedup=False` it takes three, without the
+hash table, the pass and the scan:
+
+* one kernel clears a hash table of the call: a power of two of at least
+  `2 × remote_keys` int32 slots, from the caching allocator. Its threads
+  also find each (requester, bucket feature) block of the remote part, by a
+  binary search: a requester's occurrences go by owner node, then feature;
+* a thread per occurrence finds its identity (table, key) by linear
+  probing, or takes an empty slot with `atomicCAS`. On the identity it then
+  lowers the representative with an `atomicMin` of (bucket feature,
+  occurrence), counts the occurrence, puts it in a list of the identity's
+  occurrences, and adds its weight as an `int64`;
+* a pass marks the representatives, and a CUB scan (three launches) counts
+  them before each occurrence;
+* one CTA counts the representatives of each block: the keys of each
+  bucket feature, and where each block's keys start;
+* a thread per occurrence takes its key `uniq` from its representative,
+  and its rank among its key's occurrences from the list. The
+  representative writes its key's tables.
+
+The slot is the high bits of `murmur3_fmix64(key ^ seed)`, mixed with the
+table. An owner rule fixes the low bits of the key (`roundrobin`) or of
+`murmur3_fmix64(key)` (`hash_roundrobin`) for all keys of one owner, so
+neither gives the slot.
+
 **Names.** A table that holds data from another step is named after that
 data where it came from, with a prefix for where it is now. The requesters
 push their keys and weights in bucketized order, which the push gathers
@@ -1326,10 +1359,9 @@ from the KJT's keys and weights, and their bucket features
 `node_bucket_feature_of_row`. Node
 dedup gives `node_unique_keys`, `node_num_uniques`, `node_reverse_indices`
 and `node_exp_off`, as index dedup gives `unique_keys`, `num_uniques`,
-`reverse_indices` and `exp_off`, and its sort by owner node gives
-`node_bucket_feature_of_unique_row`, `node_offset_per_bucket(_feature)` and
-`node_length_per_bucket(_feature)`, as the bucketize gives
-`bucket_feature_of_row` and `offset_per_bucket(_feature)`. An owner keeps
+`reverse_indices` and `exp_off`, and its grouping by owner node gives
+`node_offset_per_bucket(_feature)` and `node_length_per_bucket(_feature)`,
+as the bucketize gives `offset_per_bucket(_feature)`. An owner keeps
 the proxies' counts as `node_length_per_source(_feature)`, and a requester
 the proxies' tables as `proxy_chunks`, `proxy_ends` and
 `proxy_push_tables`.
@@ -1684,13 +1716,13 @@ the code for several nodes (section 11.1).
 
 A proxy's `proxy_rows` is a ring of `num_proxy_rows` rows, and its rows of
 a call are a *stream* of chunks through it. A chunk is consecutive
-node-unique keys of one owner node. Its rows are its keys' rows (the
-representatives), then their duplicates' slots (for the backward), each
-key's in key order. Its *payload* is what it moves over IB: one row per
-key. Under node dedup a key has up to `max_key_rows` rows in the ring, but
-one row of payload. So the chunks are cut by weight. A key's *weight* is
-its rows, but at least `chunk_weight`: a chunk's most rows in the ring
-over the payload rows that `DYNAMICEMB_GIN_CHUNK_KB` sets
+node-unique keys of one owner node. Its rows are its keys' rows (each
+key's first occurrence's), then their duplicates' slots (for the backward),
+key after key in `uniq` order. Its *payload* is what it moves over IB: one
+row per key. Under node dedup a key has up to `max_key_rows` rows in the
+ring, but one row of payload. So the chunks are cut by weight. A key's
+*weight* is its rows, but at least `chunk_weight`: a chunk's most rows in
+the ring over the payload rows that `DYNAMICEMB_GIN_CHUNK_KB` sets
 (`ring_rows / payload_rows`, section 15.3). A chunk takes the keys
 whose weights before them, among the owner node's, fall in one span of
 `chunk_room` (level `j`: the owner node's chunk `j`). A key weighs at most
@@ -1987,18 +2019,27 @@ The capacities are the ones in place (section 5), and `row_bytes` and
 | the put lists and the ready counters | `24 × max_chunks + 16 × owner_chunks + 32 × num_nodes × num_features` | per call |
 | index dedup's fan-out table | about 13 bytes per original key (on this path the deduplicated KJT keeps the original length) | per call |
 | the bucketize, in the caller's pool | at its peak 32 bytes per key, its outputs (8) included, for either owner rule; about 60 with index dedup, measured while the fan-out table was made by scans, when the fan-out's own tensors reached about 53 bytes per key; they now reach about 28 at most, during its sort (from the code) | transient |
-| the planner, in the caller's pool | its largest step: across nodes the proxy's about 99 bytes per entry of `remote_keys`, the requester's about 73 per key, or the owner's gather about 65 per entry of `lookup_keys`, at most 2^22 entries at a time; on one node about 20 bytes per key | transient |
+| the planner, in the caller's pool | its largest step: across nodes the proxy's about 64 bytes per entry of `remote_keys` (60 without weights), the requester's about 73 per key, or the owner's gather about 65 per entry of `lookup_keys`, at most 2^22 entries at a time; on one node about 20 bytes per key | transient |
 
 The transient figures are upper bounds from the peaks measured with the
 benchmark's batches (bytes in live tensors; the caching allocator's rounding
 and the cached blocks it hands out add up to about 13%), but the one-node
-planner's, which comes from the code. They were measured before the chunks
-had weights, and while the bucketize also kept each key as `int64` (8
-bytes per key, until the input dist returned). It no longer does: the push
-reads the KJT's keys (section 10.1). With `chunk_weight` above 1, as by
-default, the proxy's step also holds each key's weight (int32) and the
-weights before each key (int64) while it cuts its chunks and gives the
-slots.
+planner's and the proxy's, which come from the code. They were measured
+before the chunks had weights, and while the bucketize also kept each key
+as `int64` (8 bytes per key, until the input dist returned). It no longer
+does: the push reads the KJT's keys (section 10.1).
+
+The proxy's figure counts its steps' live tensors. Its node dedup holds
+about 52 bytes per entry, 64 with weights: during the insert its hash table
+(8 to 16 bytes) and each identity's state (24, or 32 with weights), then
+that state, the representatives before each occurrence and its tables per
+occurrence and per key. By the same count its sorts held about 79 bytes
+per entry, and 99 with weights. The 99 measured earlier with the
+benchmark's batches, which carry no weights, was of an older proxy. With
+`chunk_weight` above 1, as by default, its next step holds each key's
+weight (int32) and the weights before each key (int64) while it cuts its
+chunks and gives the slots: about 60 bytes per entry, 64 with weights, now
+its largest.
 
 The constructors of the layouts size the window's buffers as above
 (`CtrlLayout`, `KeysLayout` and `RowsLayout`, in `window.h`). The buffers
@@ -2078,8 +2119,10 @@ int64 words per GPU of the node. It takes `8 × local_size × (world_size ×
 num_features + 1)` bytes: 1 MB at 32 nodes, 8 GPUs per node and 64
 features, and 125 MB at 256 nodes and 1,000 features. Per call, the
 bucketize's `offset_per_bucket_feature` and the node layout's places are
-sized by `world_size` too (`8 × world_size × num_features` bytes each).
-Apart from these, `num_nodes` enters only through:
+sized by `world_size` too (`8 × world_size × num_features` bytes each),
+and so are the proxy's block tables while its node dedup runs (about
+`16 × world_size × num_features` bytes). Apart from these, `num_nodes`
+enters only through:
 
 * the share `(num_nodes − 1) / num_nodes`;
 * the control words, most of them the count messages: this rank's, and a
@@ -2120,9 +2163,9 @@ section 15.2. It assumes uniform keys, mean loads, no weights, one owner
 rule and 8 GPUs per node; it is not measured. It counts chunks of 2 MiB of
 rows (`chunk_weight` 1). The default chunks make the chunk tables, a small
 part of each figure, up to `chunk_weight` times as large, and add to the
-proxy's step (section 15.2). GB per rank. "Persistent" is
-the window: `lookup_rows` + `proxy_rows` + its other buffers (the ctrl and
-keys sections); "per call" is one call's tensors;
+proxy's step (section 15.2), which stays below the largest. GB per rank.
+"Persistent" is the window: `lookup_rows` + `proxy_rows` + its other
+buffers (the ctrl and keys sections); "per call" is one call's tensors;
 "planner" is the planner's largest step's working memory, and "bucketize"
 the bucketize's, both in the caller's pool.
 
@@ -2130,22 +2173,25 @@ the bucketize's, both in the caller's pool.
 |---|---|---|---|---|---|---|---|---|---|
 | the benchmark: 540,672 keys per rank, fp32 dim 128, `uniq_share` 0.935 | 1 (8) | 0.35 | – | 0.005 | **0.35** | 0.010 | 0.011 | 0.014 | – |
 | | 2 (16) | 0.34 | 0.17 | 0.021 | **0.53** | 0.018 | 0.043 | 0.014 | 1 |
-| | 4 (32) | 0.33 | 0.26 | 0.027 | **0.62** | 0.019 | 0.050 | 0.014 | 1 |
-| | 8 (64) | 0.33 | 0.30 | 0.029 | **0.66** | 0.020 | 0.059 | 0.014 | 1 |
-| | 32 (256) | 0.32 | 0.34 | 0.031 | **0.69** | 0.020 | 0.065 | 0.014 | 1 |
+| | 4 (32) | 0.33 | 0.26 | 0.027 | **0.62** | 0.019 | 0.042 | 0.014 | 1 |
+| | 8 (64) | 0.33 | 0.30 | 0.029 | **0.66** | 0.020 | 0.041 | 0.014 | 1 |
+| | 32 (256) | 0.32 | 0.34 | 0.031 | **0.69** | 0.020 | 0.041 | 0.014 | 1 |
 | 16,384 samples × 1,536 keys per sample, 1 feature: 25.2M keys per rank, bf16 dim 128, `uniq_share` 1 | 2 (16) | 8.05 | 0.54 | 1.01 | **9.60** | 0.82 | 1.84 | 0.63 | 7 |
-| | 4 (32) | 8.05 | 0.54 | 1.26 | **9.85** | 0.90 | 2.34 | 0.63 | 10 |
-| | 8 (64) | 8.05 | 0.54 | 1.38 | **9.97** | 0.93 | 2.73 | 0.63 | 11 |
-| | 32 (256) | 8.05 | 0.54 | 1.48 | **10.1** | 0.97 | 3.02 | 0.63 | 12 |
+| | 4 (32) | 8.05 | 0.54 | 1.26 | **9.85** | 0.90 | 1.84 | 0.63 | 10 |
+| | 8 (64) | 8.05 | 0.54 | 1.38 | **9.97** | 0.93 | 1.84 | 0.63 | 11 |
+| | 32 (256) | 8.05 | 0.54 | 1.48 | **10.1** | 0.97 | 1.84 | 0.63 | 12 |
 | the same with 2 features: 50.3M keys per rank, fp32 dim 128 | 2 (16) | 32.2 | 0.54 | 2.01 | **34.8** | 1.62 | 3.67 | 1.26 | 25 |
-| | 8 (64) | 32.2 | 0.54 | 2.78 | **35.5** | 1.87 | 5.45 | 1.26 | 43 |
-| | 32 (256) | 32.2 | 0.54 | 2.96 | **35.7** | 1.94 | 6.03 | 1.26 | 47 |
+| | 8 (64) | 32.2 | 0.54 | 2.78 | **35.5** | 1.87 | 3.67 | 1.26 | 43 |
+| | 32 (256) | 32.2 | 0.54 | 2.96 | **35.7** | 1.94 | 3.67 | 1.26 | 47 |
 
 The planner's working memory adds 3% to the persistent memory on one node and
-8–9% across nodes at the benchmark's size, and 11–30% at the large batches
-above. Take 4 nodes, fp32 dim 128, one feature, and every key distinct. For 1,
-4, 16 and 64 Mi keys per rank, the persistent memory is 1.2, 3.4, 12.1 and 47
-GB, in 1, 4, 13 and 49 laps of the ring.
+6–8% across nodes at the benchmark's size, and 10–19% at the large batches
+above. Its largest step is now the owner's gather or the requester's: the
+proxy's step was the largest from 4 nodes on while its node dedup sorted,
+by that earlier measurement (section 15.2; 8–9% and 11–30%). Take 4 nodes,
+fp32 dim 128, one feature, and every key distinct. For 1, 4, 16 and 64 Mi
+keys per rank, the persistent memory is 1.2, 3.4, 12.1 and 47 GB, in 1, 4,
+13 and 49 laps of the ring.
 
 Most of the persistent memory at large batches is `lookup_rows`. It is one
 copy of the owner's rows after node dedup, kept through the dense part
@@ -2240,22 +2286,28 @@ lookup's backward adds up the same terms as TorchRec's:
 
 **Run to run.** Every sum the dist makes has a fixed order: a key's rows at
 its proxy by requester and position, and index dedup's sums by original
-row. The planner numbers keys, slots and tasks with stable sorts and
-cumulative sums, which give the same result every run (all but index
-dedup's heavy slots and their sub-tasks, below), and adds weights as
-whole numbers. None of its steps adds up values with atomics. One step hands
-out slots with an atomic: index dedup's heavy rows take their slots and
-sub-tasks in the order the fan-out's kernel reserves them, which can change
-from run to run (section 10.1). No sum depends on that order: a heavy row's
+row. The planner numbers keys, slots and tasks with stable sorts,
+cumulative sums and integer atomics whose result does not depend on their
+order, which give the same result every run (all but index dedup's heavy
+slots and their sub-tasks, below), and adds weights as whole numbers. The
+proxy's node dedup takes each key's representative with an atomic minimum,
+counts its occurrences and adds its weights with atomic adds, and keeps a
+list of its occurrences that it reads only as a set. No step reads which
+slot of its hash table a key took. None of the planner's steps adds up
+floating-point values with atomics. One step hands out slots with an atomic
+whose order shows: index dedup's heavy rows take their slots and sub-tasks
+in the order the fan-out's kernel reserves them, which can change from run
+to run (section 10.1). No sum depends on that order: a heavy row's
 sub-tasks stay consecutive and in original-row order, so its sums add the
 same rows in the same order. So
 the output rows and the gradient handed to the lookup are the same bits every
 run. That holds on one node and across nodes, whether a stream wraps its
-ring or not. The keys in the owner's
-KJT columns of same-node requesters follow DynamicEmb's `unique` numbering,
-and so do those rows of `lookup_grad` (the other nodes' columns are in key
-order, section 9). That numbering may change between runs; the value per
-key does not. DynamicEmb's
+ring or not. The keys in the owner's KJT columns follow DynamicEmb's
+`unique` numbering: the same-node requesters' columns directly, and the
+other nodes' columns through their representatives' order (section 9). So
+do the rows of `lookup_grad`, and across nodes the chunk cuts and the put
+lists. That numbering may change between runs; the value per key does not.
+DynamicEmb's
 lookup backward adds a hot key's partial sums with 16-bit atomic additions on
 every dist, so tables of 16-bit rows may still differ from run to run.
 
@@ -2320,8 +2372,10 @@ KJT offsets.
   and the hottest owner's need sizes `lookup_keys` on every rank (section
   15).
 * **Host time of the input dist**: across nodes an input dist launches
-  about 115 kernels, CUB's included (section 10), and the training thread
-  spends their host time, also under the train pipelines.
+  about 80 kernels, CUB's included (section 10; an estimate from the code,
+  as 117 were measured before the proxy's node dedup dropped its sorts),
+  and the training thread spends their host time, also under the train
+  pipelines.
 * **Size of one call**: a GPU may receive, deduplicate or look up fewer than
   about 2.1 billion keys of each kind in one call (section 4.3).
 * **Many nodes with many features**: the rail all-gathers count messages of
@@ -2330,7 +2384,11 @@ KJT offsets.
   `16 × num_nodes² × num_features` bytes, and one CTA lays the rail out
   from them. That is 865 KiB each way per call and 1.7 MB of ctrl at 64
   nodes and 26 features, and about 500 MiB each way per call and 0.98 GB of
-  ctrl at 256 nodes and 1,000 features (sections 10.4 and 15.4).
+  ctrl at 256 nodes and 1,000 features (sections 10.4 and 15.4). The
+  proxy's node dedup also counts the keys of its `local_size × num_nodes ×
+  num_features` blocks on one CTA, as many as the node layout's
+  `row_shift` has entries: 16K at 32 nodes of 8 GPUs and 64
+  features, and 2M at 256 nodes and 1,000 features.
 * **Views**: a lookup output is a view of `lookup_rows`, valid until the
   next out kernel, and `lookup_grad` is one, valid until the next lookup
   (sections 11.2 and 11.4).
@@ -2428,8 +2486,9 @@ Paths from `corelib/dynamicemb`.
       CUB calls in `cub.cu` (radix sorts and scans); `planner.cuh`: what the
       planner's kernels share (how they are launched, searches in sorted
       tables, the starts of sorted runs, a CTA's scans). The bucketize is in
-      `bucketize.cu` and the proxy in `proxy.cu` (with the levels of its
-      chunks by weight, `Levels`); the node layout, the push, the count
+      `bucketize.cu` and the proxy in `proxy.cu` (with its node dedup's
+      hash table, `Identities`, and the levels of its chunks by weight,
+      `Levels`); the node layout, the push, the count
       message and the rail layout as the hooks run them (`node_layout`,
       `push_to_node_keys`, `count_message`, `rail_layout`), the owner's KJT
       on one node (`one_node_owner`), the owner's tables, the requester and

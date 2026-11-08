@@ -170,8 +170,8 @@ struct Fanout {
 // ring of num_proxy_rows rows. A chunk is consecutive node-unique keys of one
 // owner node: those whose weights before them (Sizes::max_key_weight), among their owner
 // node's, fall in one span of chunk_room (level j: the owner node's chunk j). Its rows are its
-// keys' rows (the representatives), then its duplicates' slots, each key's in order: at most
-// chunk_rows. The stream takes the chunks level after level, owner node
+// keys' rows (each key's first occurrence's), then its duplicates' slots, each key's in order:
+// at most chunk_rows. The stream takes the chunks level after level, owner node
 // after owner node in a level from the node after the proxy's own (so the proxies of a rail serve
 // different owner nodes at a time), each right after the one before. Its positions are unwrapped: a
 // stream that fits the ring lies as it is; else its chunks take laps of lap_room rows of starts,

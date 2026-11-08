@@ -36,8 +36,9 @@ windows hold garbage before the call. The checks:
 
 * each proxy against a plain reference of the planner's rules: its
   node-unique keys (identities (table, key), each in the bucket feature
-  (owner node, feature) of its smallest feature, key order inside a
-  bucket feature), their records, the chunks of its stream
+  (owner node, feature) of its representative, its occurrence of the least
+  bucket feature and of those the first; in their representatives' order
+  inside a bucket feature), their records, the chunks of its stream
   (levels of each owner node's weights: a key's rows, but at least the chunk
   weight; packed, in laps when they pass the ring), their bounds,
   and where each lies, each occurrence's row and slot (the first
@@ -208,27 +209,35 @@ def one_owner_job(case: Case, keys_of_rank: List[List[int]]) -> List[Tuple]:
     return job
 
 
-def same_place_job(case: Case, generator) -> List[Tuple]:
-    """Requester 1 asks owner (node 1, 0) for enough keys, once each, for the
-    stream to pass the ring; then the first key of the second lap's first
-    chunk lies where key 0 does. Requester 0 asks those two keys too: two
-    rows of one slot in two chunks."""
+def second_lap_key(case: Case) -> int:
+    """The first key of the second lap's first chunk in same_place_job's stream
+    (its keys 0, 1, ... in key order; key 0 of two occurrences, the keys up to
+    this one of one each)."""
     room, ring = chunk_room(case), case.num_proxy_rows
     lap_room = ring - case.slot_rows + 1
     keys = ring + 2 * room
-    # a key's weights before it: key 0 has two occurrences, the keys up to the
-    # second lap's first one each
     first, weight = key_weight(case, 2), key_weight(case, 1)
     level = [0] + [
         (first + (key - 1) * weight) // room for key in range(1, keys)
     ]  # each key's chunk
-    rows_before, second_lap = 0, 0  # the stream's rows before each chunk
+    rows_before = 0  # the stream's rows before each chunk
     for chunk in range(level[-1] + 1):
         if rows_before >= lap_room:
-            second_lap = level.index(chunk)
-            break
+            return level.index(chunk)
         rows_before += level.count(chunk) + (chunk == 0)
-    return one_owner_job(case, [[0, second_lap], list(range(keys))])
+    return 0
+
+
+def same_place_job(case: Case, generator) -> List[Tuple]:
+    """Requester 0 asks owner (node 1, 0) for enough keys, once each and in
+    key order, for the stream to pass the ring; then the first key of the
+    second lap's first chunk (second_lap_key) lies where key 0 does. Requester
+    1 asks those two keys too. Requester 0's occurrences come first in the
+    proxy's remote part, so they are the keys' representatives and hold their
+    key rows: the keys are numbered in key order, and requester 0's rows of the
+    two keys are two rows of one slot in two chunks."""
+    keys = case.num_proxy_rows + 2 * chunk_room(case)
+    return one_owner_job(case, [list(range(keys)), [0, second_lap_key(case)]])
 
 
 def wide_node_job(case: Case, generator) -> List[Tuple]:
@@ -723,9 +732,12 @@ def proxy_reference(case: Case, occurrences: List, node: int, remote_keys: int) 
     )
     ring, room = case.num_proxy_rows, chunk_room(case)
     capacity = max_chunks(case, remote_keys)
-    # node-unique keys: (table, key), or each occurrence; numbered by (owner
-    # node, smallest feature), then key order (then occurrence). A (table,
-    # key) has one owner node: its owner follows from the key (random_job).
+    # node-unique keys: (table, key), or each occurrence. A key's
+    # representative is its occurrence of the least bucket feature (owner
+    # node, feature), and of those the first; the keys are numbered by their
+    # representative's bucket feature, then in their representatives' order.
+    # A (table, key) has one owner node: its owner follows from the key
+    # (random_job).
     members: Dict = {}
     for occ, (_, _, _, feature, value, _) in enumerate(occurrences):
         identity = (case.tables[feature], value) if case.node_dedup else occ
@@ -733,16 +745,13 @@ def proxy_reference(case: Case, occurrences: List, node: int, remote_keys: int) 
     assert all(
         len({occurrences[occ][2] for occ in group}) == 1 for group in members.values()
     ), "a (table, key) of two owner nodes"
-    keys = sorted(
-        (
-            occurrences[group[0]][2],
-            min(occurrences[occ][3] for occ in group),
-            occurrences[group[0]][4],
-            group[0],
-            group,
+    keys = []  # each key's (owner node, feature, representative, occurrences)
+    for group in members.values():
+        owner_node, feature, rep = min(
+            (occurrences[occ][2], occurrences[occ][3], occ) for occ in group
         )
-        for group in members.values()
-    )
+        keys.append((owner_node, feature, rep, group))
+    keys.sort()
     node_num_uniques = len(keys)
     key_of = [0] * len(occurrences)
     for key, (*_, group) in enumerate(keys):
@@ -830,13 +839,16 @@ def proxy_reference(case: Case, occurrences: List, node: int, remote_keys: int) 
             chunk_of[key], key_row[key] = chunk, at + key - key_lo
             duplicate_base[key], slot = slot, slot + rows[key] - 1
     # each occurrence's key row and slot (one past its key's rows: the key's
-    # row), and its place in its requester's push order
+    # row; each of a key of more occurrences, in a call that raises: the
+    # key's row), and its place in its requester's push order
     word0, slots = [0] * len(occurrences), [0] * len(occurrences)
     for key, (*_, group) in enumerate(keys):
         for nth, occ in enumerate(group):
             word0[occ] = key_row[key]
             slots[occ] = (
-                duplicate_base[key] + nth - 1 if 0 < nth < rows[key] else key_row[key]
+                duplicate_base[key] + nth - 1
+                if 0 < nth < rows[key] and len(group) <= max_key_rows(case)
+                else key_row[key]
             )
 
     position = [0] * len(occurrences)
@@ -859,11 +871,11 @@ def proxy_reference(case: Case, occurrences: List, node: int, remote_keys: int) 
     node_exp_off = list(accumulate([0] + rows))
     # records: the key and, in 16 bytes, its weights' sum
     records = []
-    for *_, value, _, group in keys:
+    for *_, rep, group in keys:
         weight = 0.0
         if case.weights:
             weight = float(sum(occurrences[occ][5] for occ in group))
-        records.append((value, weight))
+        records.append((occurrences[rep][4], weight))
     slice_bytes = [
         0
         if owner_node == node
@@ -1605,7 +1617,7 @@ def check_rail(
 def check_owner(case: Case, rank: int, ranks: List[Dict], refs: Dict, out: Dict):
     """An owner's KJT: per feature its node's keys, each requester's in its
     order, then each other node's node-unique keys of its rail's proxy there,
-    in key order."""
+    in that proxy's key order (u)."""
     num_nodes, local_size, num_features = (
         case.num_nodes,
         case.local_size,
@@ -1905,9 +1917,13 @@ def run_case(case: Case, seed: int) -> Tuple[Dict[str, List[str]], str]:
         if not torch.equal(owners[rank][name], tensor)
     ]
     if case.job is same_place_job:
-        # requester 0's two rows at proxy 0: chunks in two laps, one slot
+        # requester 0's rows of key 0 and of the second lap's first key at
+        # proxy 0: chunks in two laps, one slot
         dst = requesters[0]["dst"].tolist()
-        checks["shape"] = [] if laps >= 2 and dst[0] == dst[1] else ["the case's shape"]
+        second = second_lap_key(case)
+        checks["shape"] = (
+            [] if laps >= 2 and dst[0] == dst[second] else ["the case's shape"]
+        )
     return checks, stats
 
 
