@@ -18,7 +18,8 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 // values only: dynamicemb_extensions.HierOutputDist (the op), and
 // hier_output_dist_unique_id, hier_output_dist_unsupported,
 // hier_output_dist_invalid and hier_output_dist_traced; the test-only ones
-// are in testing.cu.
+// are in testing.cu. hier_output_dist_max_capacity, which every build needs,
+// is bound in src/dynamic_emb_op.cu.
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 #include <torch/extension.h>

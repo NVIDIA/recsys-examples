@@ -536,14 +536,18 @@ words, and ends with `; using TorchRec's dists`.
 
 The op is a C++ class with a small interface, which takes and gives tensors
 and plain values only. Python reaches it through pybind11, as
-`dynamicemb_extensions.HierOutputDist`, beside four functions of the
+`dynamicemb_extensions.HierOutputDist`, beside five functions of the
 module: `hier_output_dist_unique_id()` (the id of the op's communicator,
 made on one rank), `hier_output_dist_unsupported()` and
 `hier_output_dist_invalid()` (why the op does not apply to a sharding, or
-refuses a configuration, or ""; they build nothing, section 7.2), and
-`hier_output_dist_traced()`. Each call of the op queues its work on the
-caller's current stream (section 7.3). What a call gives back is data that
-the caller hands to the next call: nothing else keeps a call's state.
+refuses a configuration, or ""; they build nothing, section 7.2),
+`hier_output_dist_traced()`, and `hier_output_dist_max_capacity()` (the
+bound every capacity stays below, `kMaxEntries`, which
+`dynamicemb_config.py` checks `output_dist_capacity` against: every build
+has it, with the op or without, from `src/dynamic_emb_op.cu`). Each call
+of the op queues its work on the caller's current stream (section 7.3).
+What a call gives back is data that the caller hands to the next call:
+nothing else keeps a call's state.
 
 ```cpp
 namespace dyn_emb::hier_output_dist {
@@ -2496,8 +2500,9 @@ Paths from `corelib/dynamicemb`.
     and what it owns: its communicator (`Communicator`), its window
     (`SymmetricWindow`) and its two channels; its construction, teardown and
     calls, and the kernels of its setup and teardown;
-  * `bind.cu`: the Python bindings; `testing.cu`: bindings for the tests and
-    the benchmark only.
+  * `bind.cu`: the Python bindings (but `hier_output_dist_max_capacity()`,
+    which `src/dynamic_emb_op.cu` binds in every build); `testing.cu`:
+    bindings for the tests and the benchmark only.
   * `common/`, what both dists share:
     * `common.h`: what host and device code share: the constants, the ranks
       of a sharding (`Topo`) and the op's sizes (`Sizes`), the formats of the

@@ -81,13 +81,10 @@ inline bool is_cuda_array(const at::Tensor &tensor, at::ScalarType dtype, int64_
 // What an op is built from (Config), its capacities among them, read once:
 // the op never changes them.
 
-// The planner numbers the entries of a capacity with int32 indices, so each
-// stays below this.
-constexpr int64_t kMaxEntries = (int64_t{1} << 31) - 1024;
-
 // How much a call may hold, in entries; a call that needs more of one is an
 // error, which the caller raises at the call's second wait. On one node only
-// lookup_keys is used.
+// lookup_keys is used. lookup_keys and remote_keys stay below kMaxEntries
+// (common.h).
 struct Capacities {
   int64_t lookup_keys = 0;  // keys an owner looks up (rows of lookup_rows)
   int64_t remote_keys = 0;  // keys of other nodes' owners a proxy deduplicates for its node

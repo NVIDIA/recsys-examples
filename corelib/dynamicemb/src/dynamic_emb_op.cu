@@ -21,6 +21,7 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 #include "ATen/ATen.h"
 #include "ATen/cuda/CUDAContext.h"
 #include "check.h"
+#include "hier_output_dist/common/common.h"
 #include "lookup_backward.h"
 #include "lookup_forward.h"
 #include "lookup_kernel.cuh"
@@ -976,6 +977,15 @@ void bind_dyn_emb_op(py::module &m) {
   // Keep plain ints working at the boundary so existing callers -- and
   // DynamicEmbPoolingMode, which is an IntEnum -- can be passed straight through.
   py::implicitly_convertible<py::int_, dyn_emb::PoolingMode>();
+
+  // Single source of truth for the bound of the hierarchical dist's
+  // capacities (kMaxEntries): dynamicemb_config.py checks
+  // output_dist_capacity against it. Bound here, in every build, since the
+  // dist's own bindings (bind.cu) are built only with NCCL >= 2.30.7.
+  m.def(
+      "hier_output_dist_max_capacity",
+      []() { return dyn_emb::hier_output_dist::kMaxEntries; },
+      "Every capacity of the hierarchical dist stays below this many entries");
 
   m.def("reduce_grads", &reduce_grads, "reduce grads",
         py::arg("inverse_index"), py::arg("grads"), py::arg("num_unique"),

@@ -42,6 +42,7 @@ from dynamicemb.utils import DTYPE_NUM_BYTES
 # keep the two apart wherever both are in scope.
 from dynamicemb_extensions import DistType, DynamicEmbDataType, EvictStrategy
 from dynamicemb_extensions import PoolingMode as BagPoolingMode
+from dynamicemb_extensions import hier_output_dist_max_capacity
 from torchrec.modules.embedding_configs import BaseEmbeddingConfig
 from torchrec.types import DataType
 
@@ -81,8 +82,12 @@ SUPPORTED_OUTPUT_DISTS: Tuple[str, ...] = (
 # and across nodes "remote_keys" too.
 OUTPUT_DIST_CAPACITY_NAMES: Tuple[str, ...] = ("lookup_keys", "remote_keys")
 # Every capacity stays below this many entries: the planner numbers the keys
-# with int32 indices.
-MAX_OUTPUT_DIST_CAPACITY = (1 << 31) - 1024
+# with int32 indices. The value is C++'s (kMaxEntries), which every build
+# binds, with the op or without. The rest of this block has no C++ value to
+# take: the op never sees output_dist (rw_sharding.py picks the dist), and
+# the capacity names are the keys of a user option, which the op takes as
+# keyword arguments of the same names (pybind11 matches them by name).
+MAX_OUTPUT_DIST_CAPACITY: int = hier_output_dist_max_capacity()
 # Must match ``MappingEmbeddingGenerator`` mod in ``debug_init`` (initializer.cu).
 DEBUG_EMB_INITIALIZER_MOD = 100_000
 # Default hashtable bucket width in rows; keep in sync with
@@ -907,13 +912,13 @@ class DynamicEmbTableOptions:
             ):
                 raise ValueError(
                     f"output_dist_capacity as a dict sets {OUTPUT_DIST_CAPACITY_NAMES} "
-                    '("remote_keys" across nodes) to positive ints below 2^31 - 1024; '
-                    f"got {cap}."
+                    '("remote_keys" across nodes) to positive ints below '
+                    f"{MAX_OUTPUT_DIST_CAPACITY}; got {cap}."
                 )
         elif not is_capacity(cap):
             raise ValueError(
-                "output_dist_capacity must be a positive int below 2^31 - 1024, or a "
-                f"dict of capacities; got {cap!r}."
+                "output_dist_capacity must be a positive int below "
+                f"{MAX_OUTPUT_DIST_CAPACITY}, or a dict of capacities; got {cap!r}."
             )
 
     def __eq__(self, other):

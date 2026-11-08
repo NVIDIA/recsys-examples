@@ -140,6 +140,13 @@ struct Sizes {
   }
 };
 
+// The planner numbers the entries of a capacity (Capacities, config.h) with
+// int32 indices, so each stays below this. Every build binds it, with the op
+// or without (hier_output_dist_max_capacity(), src/dynamic_emb_op.cu), for
+// Python's check of output_dist_capacity (MAX_OUTPUT_DIST_CAPACITY); so it
+// is here, in a header that needs no NCCL.
+constexpr int64_t kMaxEntries = (int64_t{1} << 31) - 1024;
+
 // Each buffer of the window starts at a multiple of kBufferAlign: a buffer of
 // `bytes` takes buffer_end(bytes).
 constexpr uint64_t kBufferAlign = 4096;
