@@ -12,26 +12,33 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""The planner's bucketize and node layout of the hierarchical input dist on
-one GPU, on plain tensors:
+"""The planner's bucketize and node layout of the hierarchical input dist,
+and the push of its node's keys, on one GPU, on plain tensors:
 
 * the bucketize (``hier_output_dist_bucketize``) against the bucketize of
   TorchRec's dists in DynamicEmb (``block_bucketize_sparse_features``) on the
   same KJT, bit for bit: the keys by owner, their rows in the KJT (``inv``),
   their weights, their bucket features, where each owner's and each (owner,
   feature)'s keys start, and the input's per-feature totals, for many world
-  sizes (most not powers of two). A second run gives the same bits;
+  sizes (most not powers of two). The keys by owner are the keys as their
+  owners store them in the KJT's order (``stored``) at ``inv``. A second run
+  gives the same bits;
 * index dedup's fan-out (``hier_output_dist_fanout``) against a torch
   reference: the original rows of each row, its heavy rows of more than 64,
   their slots and consecutive sub-tasks, and where the bucketize put each of
   them;
-* the node layout (``hier_output_dist_node_layout``): the test plays every
-  rank of one node (the bucketize of a batch of its own, the node's counts stacked
-  from their count vectors), pushes their keys where the layout says, and
-  checks that each target's own part holds its node's keys in its KJT order
-  and its remote part requester-major, then owner node, then feature-major,
-  the needs and the skip; on one node also the owner's KJT and each
-  requester's map into it.
+* the node layout and the push (``hier_output_dist_node_layout``,
+  ``hier_output_dist_node_push``): the test plays every rank of one node (the
+  bucketize of a batch of its own; the node's offsets, their
+  ``offset_per_bucket_feature`` stacked). It checks each rank's layout
+  against counts of the requesters' rows: the needs and the skip, and where
+  it puts each key in its target's parts. Then every requester pushes its
+  keys into one set of stand-ins for the node's targets, which hold garbage.
+  Each target's own part holds its node's keys in its KJT order, and its
+  remote part requester-major, then owner node, then feature-major. The
+  entries past them, and under skip every entry, keep their garbage. On one
+  node it also checks each requester's map into its owners' KJTs (``src``)
+  and each owner's KJT.
 
 Every call of the planner runs under ``torch.cuda.set_sync_debug_mode
 ("error")``, so an op that waits for the device fails the test.
@@ -39,6 +46,12 @@ Every call of the planner runs under ``torch.cuda.set_sync_debug_mode
 Run it on one GPU, from ``corelib/dynamicemb``::
 
     python test/unit_tests/test_hier_bucketize.py
+
+Under memcheck, turn off the caching allocator. Then each tensor is an
+allocation of its own, and memcheck sees an access past a tensor's end::
+
+    export PYTORCH_NO_CUDA_MEMORY_CACHING=1
+    compute-sanitizer --tool memcheck python test/unit_tests/test_hier_bucketize.py
 """
 
 import sys
@@ -52,6 +65,7 @@ from dynamicemb_extensions import (
     hier_output_dist_bucketize,
     hier_output_dist_fanout,
     hier_output_dist_node_layout,
+    hier_output_dist_node_push,
 )
 
 # Owners of a case: the bucketize's 32-bit rules give other owners than the
@@ -71,6 +85,23 @@ def planner(binding, *args, **kwargs):
         return binding(*args, **kwargs)
     finally:
         torch.cuda.set_sync_debug_mode("default")
+
+
+def garbage(shape: Tuple[int, ...], dtype: torch.dtype, generator) -> torch.Tensor:
+    """Random bits of ``dtype`` on the GPU, as memory holds before a call."""
+    bits = torch.randint(-(1 << 31), (1 << 31) - 1, shape, generator=generator)
+    if dtype == torch.int64:
+        bits = (bits << 32) ^ torch.randint(0, 1 << 32, shape, generator=generator)
+    return bits.to(torch.int32 if dtype == torch.float32 else dtype).view(dtype).cuda()
+
+
+def same_bits(got: torch.Tensor, want: torch.Tensor) -> bool:
+    """Whether two tensors hold the same bits (garbage floats can be NaNs)."""
+    if got.dtype != want.dtype or got.shape != want.shape:
+        return False
+    if got.dtype == torch.float32:
+        got, want = got.view(torch.int32), want.view(torch.int32)
+    return torch.equal(got, want)
 
 
 @dataclass
@@ -388,6 +419,11 @@ def run_case(case: Case, seed: int, world_size: int) -> Dict[str, bool]:
         "inv": out["inv"].dtype == torch.int32
         and torch.equal(out["inv"].cpu().long()[:valid], ref["inv"])
         and torch.equal(out["inv"].cpu().long()[valid:], torch.arange(valid, num_keys)),
+        # the keys as their owners store them, in the KJT's order: the keys by
+        # owner are them at inv
+        "stored": out["stored"].dtype == torch.int64
+        and out["stored"].numel() == num_keys
+        and torch.equal(out["keys"], out["stored"][out["inv"].long()]),
         "weights": ("weights" in out) == (batch.weights is not None)
         and (
             batch.weights is None
@@ -559,6 +595,7 @@ class NodeCase:
     bound: int = 0  # index dedup: keys past the valid ones
     weights: bool = False
     empty: Tuple[int, ...] = ()
+    hot: float = 0.0  # share of places that hold key 7, which one owner holds
     # the capacities: the node's largest part plus this (below 0: the call
     # does not fit, and the node skips it)
     lookup_slack: int = 5
@@ -572,6 +609,17 @@ NODE_CASES = [
     NodeCase("one node of 4, empty features", 1, 4, num_features=5, empty=(0, 3)),
     NodeCase("one node, exact fit", 1, 4, lookup_slack=0),
     NodeCase("one node, lookup_keys overflow", 1, 4, lookup_slack=-1),
+    # The hot key makes one part the largest by far, so that part alone
+    # overflows, by one key. Of 2 nodes of 4, rank 5 (on node 1) owns key 7:
+    # node 1 holds its keys in an own part, and node 0 in a remote part.
+    NodeCase(
+        "one node, hot key: one own part overflows by one, bound",
+        1,
+        4,
+        hot=0.5,
+        bound=20,
+        lookup_slack=-1,
+    ),
     NodeCase("2 nodes of 2", num_nodes=2, local_size=2, num_features=2),
     NodeCase("2 nodes of 8, node 1, weights", 2, 8, node=1, weights=True),
     NodeCase("3 nodes of 4, node 2, bound", 3, 4, num_features=2, node=2, bound=40),
@@ -581,29 +629,36 @@ NODE_CASES = [
     NodeCase("2 nodes, exact fit", 2, 4, node=1, lookup_slack=0, remote_slack=0),
     NodeCase("2 nodes, remote_keys overflow", 2, 4, remote_slack=-1),
     NodeCase("2 nodes, lookup_keys overflow", 2, 4, node=1, lookup_slack=-1),
+    NodeCase(
+        "2 nodes, node 1, hot key: one own part overflows by one",
+        2,
+        4,
+        node=1,
+        hot=0.5,
+        lookup_slack=-1,
+    ),
+    NodeCase(
+        "2 nodes, hot key: one remote part overflows by one, weights",
+        2,
+        4,
+        hot=0.5,
+        weights=True,
+        remote_slack=-1,
+    ),
     NodeCase("one node of 40, 70 features", 1, 40, num_features=70, max_len=3),
     NodeCase("2 nodes of 36, 70 features", 2, 36, num_features=70, node=1, max_len=3),
     NodeCase("40 nodes of 2", 40, 2, num_features=3, node=33),
 ]
 
 
-def count_vector(
-    bucket_feature_of_row: torch.Tensor, valid: int, case: NodeCase
-) -> torch.Tensor:
-    """A requester's counts for its node, from its rows' bucket features:
-    its keys for each target's remote part, then for each owner of the node
-    and feature."""
-    num_nodes, local_size, num_features = (
-        case.num_nodes,
-        case.local_size,
-        case.num_features,
-    )
-    world_size = num_nodes * local_size
-    counts = torch.bincount(
-        bucket_feature_of_row[:valid].long(), minlength=world_size * num_features
-    ).view(num_nodes, local_size, num_features)
-    same = counts[case.node]
-    return torch.cat([counts.sum((0, 2)) - same.sum(1), same.flatten()])
+def gathered(values: List[torch.Tensor], rows: List[Tuple[int, ...]]) -> torch.Tensor:
+    """``values[requester][row]`` of each ``(requester, row, ...)`` of
+    ``rows``, in order."""
+    starts = [0]
+    for tensor in values:
+        starts.append(starts[-1] + tensor.numel())
+    index = [starts[source] + row for source, row, *_ in rows]
+    return torch.cat(values)[torch.tensor(index, dtype=torch.int64)]
 
 
 def run_node_case(case: NodeCase, seed: int) -> Dict[str, bool]:
@@ -623,6 +678,7 @@ def run_node_case(case: NodeCase, seed: int) -> Dict[str, bool]:
         key_range=(-(1 << 40), 1 << 40),
         weights=case.weights,
         empty=case.empty,
+        hot=case.hot,
         bound=case.bound,
     )
     dist_types, block_sizes = rules_of(kjt, world_size)
@@ -636,51 +692,40 @@ def run_node_case(case: NodeCase, seed: int) -> Dict[str, bool]:
     offset_per_bucket_feature = [
         bucketized["offset_per_bucket_feature"].tolist() for bucketized in ranks
     ]
-    # every rank's count vector, [requester][words]
-    node_counts = torch.stack(
+    # The node's offsets, as node_exchange gathers them: row r is requester
+    # r's offset_per_bucket_feature.
+    node_offsets = torch.stack(
+        [bucketized["offset_per_bucket_feature"] for bucketized in ranks]
+    )
+    # The reference: each requester's keys of each owner and feature, counted
+    # from its rows. [requester][owner node][target][feature].
+    counts = torch.stack(
         [
-            count_vector(
-                bucketized["bucket_feature_of_row"].cpu(), valid[local_rank], case
+            torch.bincount(
+                bucketized["bucket_feature_of_row"].cpu()[: valid[local_rank]].long(),
+                minlength=world_size * num_features,
             )
             for local_rank, bucketized in enumerate(ranks)
         ]
-    )
-    remote_counts = node_counts[:, :local_size]  # [requester][target]
-    same_counts = node_counts[:, local_size:].view(
-        local_size, local_size, num_features
-    )  # [requester][owner][feature]
+    ).view(local_size, num_nodes, local_size, num_features)
+    same_counts = counts[:, node]  # [requester][target][feature]
+    # [requester][target]: its keys for the owners on the target's rail on the
+    # other nodes, which go to the target's remote part
+    remote_counts = counts.sum((1, 3)) - same_counts.sum(2)
     own_lengths = same_counts.permute(1, 2, 0).reshape(local_size, -1)
     own_total, remote_total = own_lengths.sum(1), remote_counts.sum(0)
-
-    def exchanged(local_rank: int) -> List[torch.Tensor]:
-        """What node_count_exchange gives a rank: the count vectors' sum over
-        the node and over the ranks before it, and each requester's counts
-        for it (its remote part, then each feature of its own part)."""
-        own_columns = node_counts[:, local_size + local_rank * num_features :][
-            :, :num_features
-        ]
-        mine = torch.cat(
-            [remote_counts[:, local_rank : local_rank + 1], own_columns], 1
-        )
-        return [
-            node_counts.sum(0).cuda(),
-            node_counts[:local_rank].sum(0).cuda(),
-            mine.contiguous().view(-1).cuda(),
-        ]
-
     need_lookup, need_remote = int(own_total.max()), int(remote_total.max())
     lookup_keys = need_lookup + case.lookup_slack
     remote_keys = need_remote + case.remote_slack if num_nodes > 1 else 0
     skip = need_lookup > lookup_keys or need_remote > remote_keys
+    generator = torch.Generator().manual_seed(seed)
 
     def layout_of(local_rank: int, **owner) -> Dict[str, torch.Tensor]:
-        bucketized = ranks[local_rank]
-        out = planner(
+        """A rank's layout from the node's offsets, on the GPU. On one node,
+        given its own part and its src, also its KJT."""
+        return planner(
             hier_output_dist_node_layout,
-            *exchanged(local_rank),
-            bucketized["offset_per_bucket_feature"],
-            bucketized["offset_per_bucket"],
-            bucketized["bucket_feature_of_row"],
+            node_offsets,
             num_nodes,
             local_size,
             node,
@@ -690,14 +735,13 @@ def run_node_case(case: NodeCase, seed: int) -> Dict[str, bool]:
             remote_keys,
             **owner,
         )
-        return {name: tensor.cpu() for name, tensor in out.items()}
 
-    layouts = [layout_of(local_rank) for local_rank in range(local_size)]
+    # Each rank's layout: on the GPU for its push, and on the host.
+    on_gpu = [layout_of(local_rank) for local_rank in range(local_size)]
+    layouts = [
+        {name: tensor.cpu() for name, tensor in layout.items()} for layout in on_gpu
+    ]
     checks = {
-        "counts": all(
-            torch.equal(layout["count_vector"], node_counts[local_rank])
-            for local_rank, layout in enumerate(layouts)
-        ),
         "own_lengths": all(
             torch.equal(layout["own_lengths"], own_lengths[local_rank])
             and torch.equal(
@@ -708,10 +752,8 @@ def run_node_case(case: NodeCase, seed: int) -> Dict[str, bool]:
             for local_rank, layout in enumerate(layouts)
         ),
         "needs": all(
-            int(layout["need_lookup"]) == need_lookup
-            and bool(layout["skip"]) == skip
-            and int(layout["rows_to_push"]) == (0 if skip else valid[local_rank])
-            for local_rank, layout in enumerate(layouts)
+            int(layout["need_lookup"]) == need_lookup and bool(layout["skip"]) == skip
+            for layout in layouts
         ),
     }
     if num_nodes > 1:  # one node has no remote part
@@ -730,106 +772,227 @@ def run_node_case(case: NodeCase, seed: int) -> Dict[str, bool]:
         checks["need_remote"] = all(
             int(layout["need_remote"]) == need_remote for layout in layouts
         )
-    if skip:
-        return checks
+    else:  # one node: a rank's own part is its KJT as owner
+        checks["kjt_offsets"] = all(
+            torch.equal(
+                layout["kjt_offsets"],
+                torch.cat(
+                    [
+                        torch.zeros(1, dtype=torch.int64),
+                        own_lengths[local_rank].cumsum(0),
+                    ]
+                ),
+            )
+            for local_rank, layout in enumerate(layouts)
+        )
+        checks["length_per_key"] = all(
+            torch.equal(
+                layout["length_per_key"],
+                own_lengths[local_rank].view(num_features, local_size).sum(1),
+            )
+            for local_rank, layout in enumerate(layouts)
+        )
 
     def rows_of(source: int, owner: int, feature: int) -> range:
         bucket_feature = owner * num_features + feature
         return range(*offset_per_bucket_feature[source][bucket_feature:][:2])
 
-    # Every requester pushes its valid rows where its layout says: rows of
-    # (target, destination, requester, row).
-    pushes = []
-    for local_rank in range(local_size):
-        bucket_feature = (
-            ranks[local_rank]["bucket_feature_of_row"].cpu()[: valid[local_rank]].long()
-        )
-        rows = torch.arange(valid[local_rank])
-        pushes.append(
-            torch.stack(
-                [
-                    bucket_feature // num_features % local_size,
-                    layouts[local_rank]["destination_base"][bucket_feature] + rows,
-                    torch.full_like(rows, local_rank),
-                    rows,
-                ],
-                1,
-            )
-        )
-    pushes = torch.cat(pushes)
-    places = pushes[:, 0] * (lookup_keys + remote_keys) + pushes[:, 1]
-    checks["one row a place"] = places.unique().numel() == places.numel()
-    own_order, own_good, remote_good = [], True, True
-    for target in range(local_size):
+    def own_order(target: int) -> List[Tuple[int, int]]:
+        """(requester, row) of each key of a target's own part, in the
+        owner's KJT order: [feature][requester][requester's order]."""
         owner = node * local_size + target
-        mine = pushes[pushes[:, 0] == target]
-        own = mine[mine[:, 1] < lookup_keys]
-        own = own[own[:, 1].argsort()]
-        # the owner's KJT order: [feature][requester][requester's order]
-        order = [
+        return [
             (source, row)
             for feature in range(num_features)
             for source in range(local_size)
             for row in rows_of(source, owner, feature)
         ]
-        own_order.append(order)
-        own_good &= torch.equal(
-            own[:, 1], torch.arange(int(own_total[target]))
-        ) and own[:, 2:].tolist() == [list(entry) for entry in order]
-        remote = mine[mine[:, 1] >= lookup_keys]
-        remote = remote[remote[:, 1].argsort()]
-        # requester-major, then owner node, then [feature][position]
-        order = [
-            [source, row]
+
+    def remote_order(target: int) -> List[Tuple[int, int, int]]:
+        """(requester, row, bucket feature) of each key of a target's remote
+        part: requester-major, then owner node, then [feature][position]. The
+        bucket feature is owner node * num_features + feature."""
+        return [
+            (source, row, owner_node * num_features + feature)
             for source in range(local_size)
             for owner_node in range(num_nodes)
             if owner_node != node
             for feature in range(num_features)
             for row in rows_of(source, owner_node * local_size + target, feature)
         ]
-        remote_good &= (
-            torch.equal(
-                remote[:, 1] - lookup_keys, torch.arange(int(remote_total[target]))
-            )
-            and remote[:, 2:].tolist() == order
-        )
-    checks["own parts"] = own_good
-    checks["remote parts"] = remote_good
-    if num_nodes > 1:
-        return checks
 
-    # One node: each owner's KJT from its node_keys after the pushes, and each
-    # requester's map into its owners' KJTs.
+    if not skip:
+        # Where each requester's valid rows are in its targets' parts, as its
+        # layout says (destination_base): rows of (target, destination,
+        # requester, row).
+        pushes = []
+        for local_rank in range(local_size):
+            bucket_feature = (
+                ranks[local_rank]["bucket_feature_of_row"]
+                .cpu()[: valid[local_rank]]
+                .long()
+            )
+            rows = torch.arange(valid[local_rank])
+            pushes.append(
+                torch.stack(
+                    [
+                        bucket_feature // num_features % local_size,
+                        layouts[local_rank]["destination_base"][bucket_feature] + rows,
+                        torch.full_like(rows, local_rank),
+                        rows,
+                    ],
+                    1,
+                )
+            )
+        pushes = torch.cat(pushes)
+        places = pushes[:, 0] * (lookup_keys + remote_keys) + pushes[:, 1]
+        checks["one row a place"] = places.unique().numel() == places.numel()
+        own_good, remote_good = True, True
+        for target in range(local_size):
+            mine = pushes[pushes[:, 0] == target]
+            own = mine[mine[:, 1] < lookup_keys]
+            own = own[own[:, 1].argsort()]
+            own_good &= torch.equal(
+                own[:, 1], torch.arange(int(own_total[target]))
+            ) and own[:, 2:].tolist() == [list(entry) for entry in own_order(target)]
+            remote = mine[mine[:, 1] >= lookup_keys]
+            remote = remote[remote[:, 1].argsort()]
+            remote_good &= torch.equal(
+                remote[:, 1] - lookup_keys, torch.arange(int(remote_total[target]))
+            ) and remote[:, 2:].tolist() == [
+                [source, row] for source, row, _ in remote_order(target)
+            ]
+        checks["own parts"] = own_good
+        checks["remote parts"] = remote_good
+
+    # Every requester pushes its valid rows into one set of stand-ins for the
+    # node's targets (row t: target t's node_keys, node_key_weights and
+    # node_bucket_feature_of_row), which hold garbage. Each stand-in is the
+    # first local_size rows of a tensor with one more row, a guard that keeps
+    # its garbage: a push past the end of the last target's row stores there.
+    # On one node each requester also writes its map into its owners' KJTs
+    # (src) over garbage.
+    entries = lookup_keys + remote_keys  # of a target's node_keys
+    widths = dict(node_keys=(entries, torch.int64))
+    if case.weights:
+        widths["node_key_weights"] = (entries, torch.float32)
+    if num_nodes > 1:
+        widths["node_bucket_feature_of_row"] = (remote_keys, torch.int32)
+    guarded = {
+        name: garbage((local_size + 1, width), dtype, generator)
+        for name, (width, dtype) in widths.items()
+    }
+    held = {name: tensor.cpu() for name, tensor in guarded.items()}
+    srcs = [
+        garbage((bucketized["inv"].numel(),), torch.int32, generator)
+        if num_nodes == 1
+        else None
+        for bucketized in ranks
+    ]
+    for local_rank, bucketized in enumerate(ranks):
+        planner(
+            hier_output_dist_node_push,
+            bucketized["stored"],
+            bucketized["inv"],
+            batches[local_rank].weights,
+            bucketized["bucket_feature_of_row"],
+            bucketized["offset_per_bucket"],
+            on_gpu[local_rank]["destination_base"],
+            on_gpu[local_rank]["skip"],
+            num_nodes,
+            local_size,
+            node,
+            local_rank,
+            num_features,
+            lookup_keys,
+            remote_keys,
+            src=srcs[local_rank],
+            **{name: tensor[:local_size] for name, tensor in guarded.items()},
+        )
+
+    # Each target's row once every requester pushed. Its own part holds its
+    # node's keys in its KJT order. Across nodes its remote part holds its
+    # node's keys for its rail requester-major, then owner node, then
+    # [feature][position], with their bucket features. Every other entry and
+    # the guard row keep their garbage. Under skip no requester pushes, and
+    # every entry keeps its garbage.
+    got = {name: tensor.cpu() for name, tensor in guarded.items()}
     keys = [bucketized["keys"].cpu() for bucketized in ranks]
     weights = (
         [bucketized["weights"].cpu() for bucketized in ranks] if case.weights else None
     )
+    own_good, remote_good, kept = True, True, True
+    for target in range(local_size):
+        own = [] if skip else own_order(target)
+        remote = [] if skip else remote_order(target)
+        remote_end = lookup_keys + len(remote)
+        for name, values in (("node_keys", keys), ("node_key_weights", weights)):
+            if name not in got:
+                continue
+            row, held_row = got[name][target], held[name][target]
+            own_good &= same_bits(row[: len(own)], gathered(values, own))
+            remote_good &= same_bits(
+                row[lookup_keys:remote_end], gathered(values, remote)
+            )
+            kept &= same_bits(
+                row[len(own) : lookup_keys], held_row[len(own) : lookup_keys]
+            ) and same_bits(row[remote_end:], held_row[remote_end:])
+        if num_nodes > 1:
+            row = got["node_bucket_feature_of_row"][target]
+            held_row = held["node_bucket_feature_of_row"][target]
+            bucket_features = [bucket_feature for _, _, bucket_feature in remote]
+            remote_good &= same_bits(
+                row[: len(remote)], torch.tensor(bucket_features, dtype=torch.int32)
+            )
+            kept &= same_bits(row[len(remote) :], held_row[len(remote) :])
+    kept &= all(same_bits(got[name][-1], held[name][-1]) for name in got)
+    if not skip:
+        checks["pushed own parts"] = own_good
+        if num_nodes > 1:
+            checks["pushed remote parts"] = remote_good
+    checks["parts untouched" if skip else "untouched tails"] = kept
+    if num_nodes > 1:
+        return checks
+
+    # One node: each requester's map into its owners' KJTs, which its push
+    # writes under skip too: a valid row's place in its owner's KJT, and a
+    # row past them its own index.
     place = [
         torch.full((valid[local_rank],), -1, dtype=torch.int64)
         for local_rank in range(local_size)
     ]
+    for target in range(local_size):
+        for position, (source, row) in enumerate(own_order(target)):
+            place[source][row] = position
+    checks["src"] = all(
+        src.dtype == torch.int32
+        and torch.equal(
+            src.cpu().long(),
+            torch.cat(
+                [place[local_rank], torch.arange(valid[local_rank], src.numel())]
+            ),
+        )
+        for local_rank, src in enumerate(srcs)
+    )
+    # Each owner's KJT from its own part once every requester pushed: its
+    # lengths and offsets, and a copy of its keys (none under skip). The copy
+    # is a tensor of its own, because the node's next call rewrites node_keys.
     owner_good = True
     for target in range(local_size):
-        mine = pushes[pushes[:, 0] == target]
-        node_keys = torch.zeros(lookup_keys, dtype=torch.int64)
-        node_key_weights = torch.zeros(lookup_keys)
-        for source in range(local_size):
-            sent = mine[mine[:, 2] == source]
-            node_keys[sent[:, 1]] = keys[source][sent[:, 3]]
-            if weights:
-                node_key_weights[sent[:, 1]] = weights[source][sent[:, 3]]
-        out = layout_of(
-            target,
-            node_keys=node_keys.cuda(),
-            node_key_weights=node_key_weights.cuda() if weights else None,
+        own_part = {
+            name: tensor[target, :lookup_keys] for name, tensor in guarded.items()
+        }
+        out = layout_of(target, src=srcs[target], **own_part)
+        copied = (
+            out["kjt_values"].untyped_storage().data_ptr()
+            != guarded["node_keys"].untyped_storage().data_ptr()
         )
-        order = own_order[target]
-        num_recv = len(order)
-        lengths = own_lengths[target]
-        for position, (source, row) in enumerate(order):
-            place[source][row] = position
+        out = {name: tensor.cpu() for name, tensor in out.items()}
+        own, lengths = own_order(target), own_lengths[target]
         owner_good &= (
-            int(out["num_recv"]) == num_recv
+            copied
+            and out["kjt_values"].shape == (lookup_keys,)
+            and int(out["num_recv"]) == len(own)
             and torch.equal(out["kjt_lengths"], lengths)
             and torch.equal(
                 out["kjt_offsets"],
@@ -838,26 +1001,18 @@ def run_node_case(case: NodeCase, seed: int) -> Dict[str, bool]:
             and torch.equal(
                 out["length_per_key"], lengths.view(num_features, local_size).sum(1)
             )
-            and out["kjt_values"].tolist()[:num_recv]
-            == [int(keys[source][row]) for source, row in order]
+            and torch.equal(out["src"], srcs[target].cpu())
+            and ("kjt_weights" in out) == bool(weights)
             and (
-                ("kjt_weights" in out) == bool(weights)
+                skip  # nothing copied
+                or same_bits(out["kjt_values"][: len(own)], gathered(keys, own))
                 and (
                     not weights
-                    or out["kjt_weights"].tolist()[:num_recv]
-                    == [float(weights[source][row]) for source, row in order]
+                    or same_bits(out["kjt_weights"][: len(own)], gathered(weights, own))
                 )
             )
         )
-        layouts[target]["src"] = out["src"]
     checks["owner KJTs"] = owner_good
-    checks["src"] = all(
-        layouts[local_rank]["src"].dtype == torch.int32
-        and torch.equal(
-            layouts[local_rank]["src"][: valid[local_rank]].long(), place[local_rank]
-        )
-        for local_rank in range(local_size)
-    )
     return checks
 
 

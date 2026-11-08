@@ -18,12 +18,12 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 // node peers and the rail peers, and the in channel's functions that launch
 // them (input_dist.h). The planner's steps (planner.h) run between
 // them on the same stream, in the order of InChannel::input_dist:
-//   node_count_exchange   the node barrier of the call, and the node's
-//                         counts as this rank needs them;
-//   node_key_push         this rank's keys into its targets' node_keys over
-//                         NVLink;
-//   node_done             tells each target its keys are there, and waits
-//                         until every requester of the node told it;
+//   node_exchange         this rank's offsets into node_offsets at each node peer, over NVLink;
+//                         the node barrier of the call; the node layout from the node's offsets;
+//   node_key_push         the bucketize's gather: this rank's keys into their places in their
+//                         targets' node_keys, over NVLink;
+//   node_done             tells each target its keys are there, and waits until every requester
+//                         of the node told it;
 //   rail_count_exchange   (across nodes) its count message to each rail
 //                         peer, and theirs;
 //   rail_key_exchange     (across nodes) its key records to each rail owner
@@ -34,16 +34,18 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 //                         peer's;
 //   peer_gather           (across nodes) words of the node peers' remote_map
 //                         or proxy header.
-// A kernel that waits runs on one CTA and waits only for the same kernel (the
-// same seq) of its node or rail peers; the others never wait. Its threads (or
-// lanes) take the peers in turn, so any number of them. Memory order:
-// what peers wrote is read only after an acquire of their flag or signal, by
-// the comm kernel that acquired it (with ld.global.cg) or by a later kernel
-// on the stream (peer_gather with ld.global.cg, the planner's steps with
-// plain loads). What this rank writes for its peers (its own stores, or
-// the planner's earlier on the stream) is ordered before the flag it
-// releases or the put it makes: by fence.sc.sys, or in node_count_exchange
-// by the release itself after the CTA's barrier.
+// A kernel that waits runs on one CTA (or warp). It waits only for the same kernel (the same seq)
+// of its node or rail peers. Its threads (or lanes) take the peers in turn, so any number of them.
+// Memory order:
+// - What peers wrote is read only after an acquire of their flag or signal. The comm kernel that
+//   acquired it reads with ld.global.cg. A later kernel on the stream reads it too: peer_gather
+//   with ld.global.cg, the planner's steps with plain loads.
+// - What this rank writes for its peers (its own stores, or the planner's earlier on the stream)
+//   comes before the flag it releases or the put it makes: fence.sc.sys orders it.
+// - What it stores into a peer's buffer comes after an acquire, earlier on the stream, of the
+//   peer's flag that says the peer read that buffer: node_exchange's barrier for node_keys (a
+//   peer publishes it once every kernel of its call before ended), node_done's of the call before
+//   for node_offsets (a peer tells it after its node_exchange read them).
 
 #include <ATen/cuda/CUDAContext.h>
 #include <nccl_device.h>
@@ -55,6 +57,7 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 #include "hier_output_dist/common/device.cuh"
 #include "hier_output_dist/common/window.h"
 #include "hier_output_dist/input_dist/input_dist.h"
+#include "hier_output_dist/input_dist/node.cuh"
 
 namespace dyn_emb {
 namespace hier_output_dist {
@@ -63,85 +66,70 @@ namespace hier_output_dist {
 // communicator), its sizes, and if it waits the call's sequence number
 // (seq, in_seq): then the call's tensors.
 
-// 1 CTA: this rank's count vector (CountVector, planner.h) into its
-// count_vector of the call, the node barrier, then the node's count vectors
-// as this rank needs them: their sum (totals) and that of the ranks before
-// it (before), both [words], and each requester's counts for this rank (mine
-// [local_size][num_features + 1]: its keys for its remote part, then for
-// each feature of its own part). Passing the barrier also means every peer
-// finished its previous call's in channel, whose steps read what this call
-// writes into their copies of the window.
-__global__ void node_count_exchange_kernel(ncclWindow_t window, Sizes sizes, int64_t seq,
-                                           const int64_t *my_counts, int64_t *totals,
-                                           int64_t *before, int64_t *mine) {
-  const int local_size = sizes.topo.local_size, num_features = (int)sizes.num_features,
-            me = sizes.topo.local_rank, tid = threadIdx.x;
-  const CountVector format{local_size, num_features};
-  const int64_t words = format.words();
+// 1 CTA: this rank's offsets (its bucketize's offset_per_bucket_feature) go into its row of
+// node_offsets at each node peer, its own too, over NVLink. Then a system fence, and its
+// in_started gets the call (the node barrier). It waits until each peer's in_started holds the
+// call: every peer's offsets are then in node_offsets here. From them it makes the node layout
+// (node_layout_of; on one node also the owner's KJT offsets). Passing the barrier also means
+// every peer finished its previous call's in channel, whose steps read what this call writes
+// into their copies of the window (node_keys). delay_ns (the test hook delay_node_reads, 0:
+// none): thread 0 waits that long after the barrier, so the layout reads node_offsets late.
+__global__ void __launch_bounds__(kThreads)
+    node_exchange_kernel(ncclWindow_t window, Sizes sizes, int64_t seq,
+                         const int64_t *offset_per_bucket_feature, int64_t *scratch,
+                         int64_t delay_ns, NodeLayoutView layout) {
+  const int local_size = sizes.topo.local_size, me = sizes.topo.local_rank, tid = threadIdx.x;
   const NodeWindow node(window, me);
-  const CtrlLayout ctrl = node.layout(sizes).ctrl;
-  int64_t *counts = ctrl.count_vector(seq);
-  for (int i = tid; i < words; i += blockDim.x) counts[i] = my_counts[i];
+  const KeysLayout keys = node.layout(sizes).keys;
+  const int64_t words = keys.offset_words();
+  int64_t *mine = keys.node_offsets(me);
+  for (int64_t i = tid; i < local_size * words; i += blockDim.x)
+    node.peer(mine, (int)(i / words))[i % words] = offset_per_bucket_feature[i % words];
   __syncthreads();
-  const NodeBarrier barrier{sizes, node, ctrl.in_started(), seq};
-  if (tid == 0) barrier.publish();
-  for (int peer = tid; peer < local_size; peer += blockDim.x)
-    barrier.wait(peer, "in-channel node barrier");
+  const NodeBarrier barrier{sizes, node, node.layout(sizes).ctrl.in_started(), seq};
+  if (tid == 0) {
+    fence_sc_sys();
+    barrier.publish();
+  }
+  for (int peer = tid; peer < local_size; peer += blockDim.x) barrier.wait(peer, "node offsets");
+  if (tid == 0 && delay_ns > 0) {
+    const uint64_t start = now_ns();
+    while (now_ns() - start < (uint64_t)delay_ns) __nanosleep(1000);
+  }
   __syncthreads();
-  auto count_of = [&](int peer, int64_t word) {
-    return (int64_t)__ldcg((const unsigned long long *)(node.peer(counts, peer) + word));
-  };
-  for (int i = tid; i < words; i += blockDim.x) {
-    int64_t total = 0, earlier = 0;
-    for (int peer = 0; peer < local_size; ++peer) {
-      const int64_t count = count_of(peer, i);
-      total += count;
-      if (peer < me) earlier += count;
-    }
-    totals[i] = total;
-    before[i] = earlier;
-  }
-  for (int i = tid; i < local_size * (num_features + 1); i += blockDim.x) {
-    const int peer = i / (num_features + 1), column = i % (num_features + 1);
-    mine[i] = count_of(peer, column == 0 ? format.remote(me) : format.own(me, column - 1));
-  }
+  node_layout_of(keys.node_offsets(0), sizes.topo, sizes.num_features, sizes.lookup_keys,
+                 sizes.remote_keys, scratch, layout);
 }
 
-// Every CTA, a thread per row: bucketized row `row` (row < *rows_to_push) goes
-// to destination_base[bucket_feature] + row of node_keys (and node_key_weights) of
-// its target, the owner's local rank; a destination from remote_start on is an
-// occurrence of the target's remote part, whose bucket feature (owner node *
-// num_features + feature) goes to node_bucket_feature_of_row. Consecutive rows of a
-// bucket feature go to consecutive destinations. Each CTA's stores are fenced
-// at system scope before it ends.
+// Every CTA, a thread per bucketized row (push_rows): the bucketize's gather. Each valid row's
+// key (and weight; across nodes a remote row's bucket feature too) goes to its place in its
+// target's node_keys, over NVLink; on one node each row's place in its owner's KJT goes to src.
+// It does not wait: node_exchange, before it on the stream, passed the node barrier. Each CTA
+// fences its stores at system scope before it ends.
 __global__ void __launch_bounds__(kThreads)
-    node_key_push_kernel(ncclWindow_t window, Sizes sizes, const int64_t *keys,
-                         const float *weights, const int32_t *bucket_feature_of_row,
-                         const int64_t *destination_base, const int64_t *rows_to_push) {
-  const int local_size = sizes.topo.local_size, num_features = (int)sizes.num_features;
+    node_key_push_kernel(ncclWindow_t window, Sizes sizes, GatherRows rows, int64_t num_rows,
+                         PushPlaces places, int32_t *src) {
   const NodeWindow node(window, sizes.topo.local_rank);
-  const KeysLayout keys_layout = node.layout(sizes).keys;
-  const int64_t remote_start = keys_layout.remote_start();
-  const int64_t rows = *rows_to_push;
-  for (int64_t row = blockIdx.x * (int64_t)blockDim.x + threadIdx.x; row < rows;
-       row += (int64_t)gridDim.x * blockDim.x) {
-    const int bucket_feature = bucket_feature_of_row[row];
-    const int owner = bucket_feature / num_features, target = owner % local_size;
-    const int64_t destination = destination_base[bucket_feature] + row;
-    node.peer(keys_layout.node_keys(), target)[destination] = keys[row];
-    if (weights != nullptr)
-      node.peer(keys_layout.node_key_weights(), target)[destination] = weights[row];
-    if (destination >= remote_start)
-      node.peer(keys_layout.node_bucket_feature_of_row(), target)[destination - remote_start] =
-          owner / local_size * num_features + bucket_feature % num_features;
-  }
+  const KeysLayout keys = node.layout(sizes).keys;
+  const int64_t remote_start = keys.remote_start();
+  push_rows(rows, num_rows, places, sizes.topo, sizes.num_features, src,
+            [&](int64_t target, int64_t place, int64_t key, float weight, int32_t feature) {
+              node.peer(keys.node_keys(), (int)target)[place] = key;
+              if (rows.weights != nullptr)
+                node.peer(keys.node_key_weights(), (int)target)[place] = weight;
+              if (place >= remote_start)
+                node.peer(keys.node_bucket_feature_of_row(), (int)target)[place - remote_start] =
+                    feature;
+            });
   __syncthreads();
   if (threadIdx.x == 0) fence_sc_sys();
 }
 
 // 1 warp: each thread, after a system fence of its own, tells its node peers
 // (peer = thread, thread + 32, ...) that this rank's keys are in their
-// node_keys, then waits until each of them told this rank.
+// node_keys, then waits until each of them told this rank. The tell also says that this rank's
+// node_exchange read node_offsets, so its peers may write them again in the next call. node_done
+// runs in every call, also with no rows and under skip.
 __global__ void node_done_kernel(ncclWindow_t window, Sizes sizes, int64_t seq) {
   const NodeWindow node(window, sizes.topo.local_rank);
   const PeerFlags written{sizes, node, node.layout(sizes).ctrl.in_written(), seq};
@@ -312,38 +300,32 @@ __global__ void __launch_bounds__(kThreads)
 
 // The launchers.
 
-namespace {
-
-cudaStream_t current_stream() { return at::cuda::getCurrentCUDAStream(); }
-
-// CTAs of kThreads threads for `work` items on the current device.
-int grid_of(int64_t work) {
-  return grid_for(work, at::cuda::getCurrentDeviceProperties()->multiProcessorCount);
-}
-
-}  // namespace
-
-std::tuple<at::Tensor, at::Tensor, at::Tensor> InChannel::node_count_exchange(
-    const at::Tensor &my_counts) const {
-  at::Tensor totals = at::empty_like(my_counts), before = at::empty_like(my_counts);
-  at::Tensor mine =
-      at::empty({sizes_.topo.local_size, sizes_.num_features + 1}, my_counts.options());
-  node_count_exchange_kernel<<<1, kThreads, 0, current_stream()>>>(
-      window_, sizes_, seq_, my_counts.data_ptr<int64_t>(), totals.data_ptr<int64_t>(),
-      before.data_ptr<int64_t>(), mine.data_ptr<int64_t>());
+NodeLayout InChannel::node_exchange(const BucketizedKeys &bucketized, int64_t delay_ns) {
+  const auto options = bucketized.offset_per_bucket.options();
+  NodeLayout node = empty_node_layout(sizes_.topo, sizes_.num_features, options);
+  const at::Tensor scratch =
+      at::empty({node_layout_scratch(sizes_.topo, sizes_.num_features)}, options);
+  // The call's sequence number. seq_ takes it only once the kernel is launched.
+  const int64_t seq = seq_ + 1;
+  node_exchange_kernel<<<kOneCta, kThreads, 0, current_stream()>>>(
+      window_, sizes_, seq, bucketized.offset_per_bucket_feature.data_ptr<int64_t>(),
+      scratch.data_ptr<int64_t>(), delay_ns, view_of(node));
   C10_CUDA_KERNEL_LAUNCH_CHECK();
-  return {totals, before, mine};
+  seq_ = seq;
+  return node;
 }
 
-void InChannel::node_key_push(const at::Tensor &keys, const at::Tensor &weights,
-                              const at::Tensor &bucket_feature_of_row,
-                              const at::Tensor &destination_base,
-                              const at::Tensor &rows_to_push) const {
-  node_key_push_kernel<<<grid_of(keys.numel()), kThreads, 0, current_stream()>>>(
-      window_, sizes_, keys.data_ptr<int64_t>(),
-      weights.defined() ? weights.data_ptr<float>() : nullptr,
-      bucket_feature_of_row.data_ptr<int32_t>(), destination_base.data_ptr<int64_t>(),
-      rows_to_push.data_ptr<int64_t>());
+void InChannel::node_key_push(const BucketizedKeys &bucketized,
+                              const c10::optional<at::Tensor> &weights, const NodeLayout &node,
+                              const at::Tensor &src) const {
+  const int64_t rows = bucketized.inv.numel();
+  const GatherRows gather{bucketized.inv.data_ptr<int32_t>(), bucketized.stored.data_ptr<int64_t>(),
+                          weights.has_value() ? weights->data_ptr<float>() : nullptr};
+  const PushPlaces places{bucketized.bucket_feature_of_row.data_ptr<int32_t>(),
+                          bucketized.offset_per_bucket.data_ptr<int64_t>(),
+                          node.destination_base.data_ptr<int64_t>(), node.skip.data_ptr<bool>()};
+  node_key_push_kernel<<<item_grid(rows), kThreads, 0, current_stream()>>>(
+      window_, sizes_, gather, rows, places, data_or_null<int32_t>(src));
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
@@ -388,7 +370,7 @@ at::Tensor InChannel::peer_gather(GatherFrom from, const at::Tensor &peer,
   const int words = gather_words(from);
   at::Tensor out = at::empty({words, items}, peer.options());
   const auto launch = [&](auto kernel) {
-    kernel<<<grid_of(items * words), kThreads, 0, current_stream()>>>(
+    kernel<<<item_grid(items * words), kThreads, 0, current_stream()>>>(
         window_, sizes_, peer.data_ptr<int32_t>(), first_word.data_ptr<int64_t>(), items,
         out.data_ptr<int32_t>());
   };

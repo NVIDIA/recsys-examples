@@ -15,10 +15,12 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 # limitations under the License.
 ******************************************************************************/
 // Test-only bindings of the hierarchical dist. Most run the planner's steps
-// outside an op, on plain tensors: the bucketize, the node layout, and one
-// rank's proxy, rail and requester steps across nodes. Last, a hook that makes
-// the next construction fail, and the GPU clock the benchmark aligns timelines
-// by (a build with DYNAMICEMB_HIER_TRACE=1).
+// outside an op, on plain tensors: the bucketize, the node layout, a
+// requester's push into stand-ins for its targets' node_keys, and one rank's
+// proxy, rail and requester steps across nodes. Last, a hook that makes the
+// next construction fail, a hook that delays the reads of node_offsets and
+// node_keys of later input dists, and the GPU clock the benchmark aligns
+// timelines by (a build with DYNAMICEMB_HIER_TRACE=1).
 
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
@@ -36,6 +38,7 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 #include "hier_output_dist/common/device.cuh"
 #include "hier_output_dist/common/window.h"
 #include "hier_output_dist/hier_output_dist.h"
+#include "hier_output_dist/input_dist/input_dist.h"
 #include "hier_output_dist/input_dist/planner.h"
 
 namespace dyn_emb {
@@ -47,9 +50,10 @@ namespace {
 
 // The bucketize of a KJT (bucketize_keys), by name, with each owner's feature
 // offsets relative to its block (feature_start [world_size][num_features + 1]),
-// which TorchRec's bucketize gives. dist_types are the rules' codes on the
-// host; their copy to the GPU does not wait for the device (the tests run the
-// planner under the sync debug mode "error").
+// which TorchRec's bucketize gives, and the keys as their owners store them in
+// the KJT's order (stored, what the push gathers). dist_types are the rules'
+// codes on the host; their copy to the GPU does not wait for the device (the
+// tests run the planner under the sync debug mode "error").
 std::map<std::string, at::Tensor> bucketize_test(
     at::Tensor values, c10::optional<at::Tensor> offsets, c10::optional<at::Tensor> lengths,
     int64_t batch_size, c10::optional<at::Tensor> weights, at::Tensor block_sizes,
@@ -70,6 +74,7 @@ std::map<std::string, at::Tensor> bucketize_test(
   const int64_t num_features = (int64_t)dist_types.size();
   std::map<std::string, at::Tensor> named{
       {"keys", bucketized.keys},
+      {"stored", bucketized.stored},
       {"inv", bucketized.inv},
       {"bucket_feature_of_row", bucketized.bucket_feature_of_row},
       {"offset_per_bucket_feature", bucketized.offset_per_bucket_feature},
@@ -92,60 +97,108 @@ std::map<std::string, at::Tensor> fanout_test(at::Tensor reverse_indices, at::Te
           {"first", fanout.first}};
 }
 
-// One rank of a node: its count vector (node_count_vector), and its node
-// layout (node_layout) on the node's counts (totals, before, mine) as
-// node_count_exchange would give them, by name (requester_start and
-// need_remote across nodes). On one node, with the owner's node_keys (and
-// node_key_weights) after every requester pushed, also its KJT and src
-// (one_node_owner).
-std::map<std::string, at::Tensor> node_layout_test(
-    at::Tensor totals, at::Tensor before, at::Tensor mine, at::Tensor offset_per_bucket_feature,
-    at::Tensor offset_per_bucket, at::Tensor bucket_feature_of_row, int64_t num_nodes,
-    int64_t local_size, int64_t node, int64_t local_rank, int64_t num_features, int64_t lookup_keys,
-    int64_t remote_keys, c10::optional<at::Tensor> node_keys,
-    c10::optional<at::Tensor> node_key_weights) {
-  c10::cuda::CUDAGuard guard(offset_per_bucket_feature.device());
-  const int world_size = (int)(num_nodes * local_size);
-  const Topo topo{world_size,
-                  (int)local_size,
-                  (int)num_nodes,
-                  (int)(local_size + num_nodes - 1),
-                  (int)(node * local_size + local_rank),
-                  (int)local_rank,
-                  (int)node};
-  const int64_t words = local_size * (num_features + 1);
-  TORCH_CHECK(is_cuda_array(totals, at::kLong, words) && is_cuda_array(before, at::kLong, words) &&
-                  is_cuda_array(mine, at::kLong, words),
-              "hier_output_dist: node_layout's counts");
-  const NodeLayout layout = node_layout(
-      NodeCounts{totals, before, mine.view({local_size, num_features + 1})},
-      offset_per_bucket_feature, offset_per_bucket, topo, num_features, lookup_keys, remote_keys);
-  std::map<std::string, at::Tensor> named{
-      {"count_vector", node_count_vector(offset_per_bucket_feature, topo, num_features)},
-      {"own_lengths", layout.own_lengths},
-      {"own_offsets", layout.own_offsets},
-      {"own_total", layout.own_total},
-      {"need_lookup", layout.need_lookup},
-      {"skip", layout.skip},
-      {"rows_to_push", layout.rows_to_push},
-      {"destination_base", layout.destination_base}};
+// The ranks of a sharding of num_nodes nodes of local_size GPUs, as rank
+// local_rank of node `node` sees them.
+Topo topo_of(int64_t num_nodes, int64_t local_size, int64_t node, int64_t local_rank) {
+  TORCH_CHECK(num_nodes >= 1 && local_size >= 1 && node >= 0 && node < num_nodes &&
+                  local_rank >= 0 && local_rank < local_size,
+              "hier_output_dist: the ranks of a node (num_nodes, local_size, node, local_rank)");
+  return Topo{(int)(num_nodes * local_size),
+              (int)local_size,
+              (int)num_nodes,
+              (int)(local_size + num_nodes - 1),
+              (int)(node * local_size + local_rank),
+              (int)local_rank,
+              (int)node};
+}
+
+// One rank of a node: its node layout (node_layout) on the node's offsets (node_offsets: int64
+// [local_size][world_size * num_features + 1], row r requester r's offset_per_bucket_feature, as
+// node_exchange gathers them), by name (requester_start and need_remote across nodes,
+// kjt_offsets and length_per_key on one node). On one node, given the own part of its node_keys
+// once every requester pushed (node_keys, and node_key_weights with weights: [lookup_keys]) and
+// the src its own push wrote, also its KJT and src (one_node_owner).
+std::map<std::string, at::Tensor> node_layout_test(at::Tensor node_offsets, int64_t num_nodes,
+                                                   int64_t local_size, int64_t node,
+                                                   int64_t local_rank, int64_t num_features,
+                                                   int64_t lookup_keys, int64_t remote_keys,
+                                                   c10::optional<at::Tensor> node_keys,
+                                                   c10::optional<at::Tensor> node_key_weights,
+                                                   c10::optional<at::Tensor> src) {
+  c10::cuda::CUDAGuard guard(node_offsets.device());
+  const Topo topo = topo_of(num_nodes, local_size, node, local_rank);
+  TORCH_CHECK(num_features >= 1 && lookup_keys >= 0 && remote_keys >= 0 &&
+                  (num_nodes > 1 || remote_keys == 0),
+              "hier_output_dist: node_layout's sizes (remote_keys 0 on one node)");
+  const NodeLayout layout = node_layout(node_offsets, topo, num_features, lookup_keys, remote_keys);
+  std::map<std::string, at::Tensor> named{{"own_lengths", layout.own_lengths},
+                                          {"own_offsets", layout.own_offsets},
+                                          {"own_total", layout.own_total},
+                                          {"need_lookup", layout.need_lookup},
+                                          {"skip", layout.skip},
+                                          {"destination_base", layout.destination_base}};
   if (num_nodes > 1) {
     named["requester_start"] = layout.requester_start;
     named["need_remote"] = layout.need_remote;
+  } else {
+    named["kjt_offsets"] = layout.kjt_offsets;
+    named["length_per_key"] = layout.length_per_key;
   }
-  if (node_keys.has_value()) {
-    const OneNodeOwner owner = one_node_owner(
-        layout, bucket_feature_of_row, *node_keys,
-        node_key_weights.has_value() ? *node_key_weights : at::Tensor(), topo, num_features);
-    named["kjt_values"] = owner.kjt_values;
-    if (owner.kjt_weights.defined()) named["kjt_weights"] = owner.kjt_weights;
-    named["kjt_lengths"] = owner.kjt_lengths;
-    named["kjt_offsets"] = owner.kjt_offsets;
-    named["num_recv"] = owner.num_recv;
-    named["length_per_key"] = owner.length_per_key;
-    named["src"] = owner.src;
-  }
+  TORCH_CHECK(node_keys.has_value()
+                  ? num_nodes == 1 && is_cuda_array(*node_keys, at::kLong, lookup_keys) &&
+                        (!node_key_weights.has_value() ||
+                         is_cuda_array(*node_key_weights, at::kFloat, lookup_keys)) &&
+                        src.has_value() && src->is_cuda() && src->scalar_type() == at::kInt
+                  : !node_key_weights.has_value() && !src.has_value(),
+              "hier_output_dist: node_layout's own part (one node: node_keys and src)");
+  if (!node_keys.has_value()) return named;
+  const OneNodeOwner owner =
+      one_node_owner(layout, *node_keys, node_key_weights.value_or(at::Tensor()), *src, topo);
+  named["kjt_values"] = owner.kjt_values;
+  if (owner.kjt_weights.defined()) named["kjt_weights"] = owner.kjt_weights;
+  named["kjt_lengths"] = owner.kjt_lengths;
+  named["kjt_offsets"] = owner.kjt_offsets;
+  named["num_recv"] = owner.num_recv;
+  named["length_per_key"] = owner.length_per_key;
+  named["src"] = owner.src;
   return named;
+}
+
+// One requester's push (push_to_node_keys: node_key_push's push_rows) on what its bucketize
+// gives (bucketize_rows: stored and inv, its KJT's weights or None, bucket_feature_of_row and
+// offset_per_bucket) and its node layout (destination_base, skip), into stand-ins for its
+// targets' node_keys: row t of node_keys ([local_size][lookup_keys + remote_keys]), of
+// node_key_weights (given exactly with weights) and across nodes of node_bucket_feature_of_row
+// ([local_size][remote_keys]); on one node also src (int32 [rows]). It writes them in place: an
+// entry it pushes nothing to keeps what it held, and a place outside a row is not stored.
+void node_push_test(at::Tensor stored, at::Tensor inv, c10::optional<at::Tensor> weights,
+                    at::Tensor bucket_feature_of_row, at::Tensor offset_per_bucket,
+                    at::Tensor destination_base, at::Tensor skip, int64_t num_nodes,
+                    int64_t local_size, int64_t node, int64_t local_rank, int64_t num_features,
+                    int64_t lookup_keys, int64_t remote_keys, at::Tensor node_keys,
+                    c10::optional<at::Tensor> node_key_weights,
+                    c10::optional<at::Tensor> node_bucket_feature_of_row,
+                    c10::optional<at::Tensor> src) {
+  c10::cuda::CUDAGuard guard(inv.device());
+  const Topo topo = topo_of(num_nodes, local_size, node, local_rank);
+  const int64_t rows = inv.numel();
+  TORCH_CHECK(num_features >= 1 && is_cuda_array(stored, at::kLong, rows) &&
+                  is_cuda_array(inv, at::kInt, rows) &&
+                  (!weights.has_value() || is_cuda_array(*weights, at::kFloat, rows)) &&
+                  is_cuda_array(bucket_feature_of_row, at::kInt, rows) &&
+                  is_cuda_array(offset_per_bucket, at::kLong, topo.world_size + 1) &&
+                  is_cuda_array(destination_base, at::kLong, topo.world_size * num_features + 1) &&
+                  is_cuda_array(skip, at::kBool, 1) &&
+                  node_bucket_feature_of_row.has_value() == (num_nodes > 1),
+              "hier_output_dist: node_push's inputs (node_bucket_feature_of_row exactly across "
+              "nodes)");
+  NodeLayout layout;
+  layout.destination_base = destination_base;
+  layout.skip = skip;
+  push_to_node_keys(stored, inv, weights.value_or(at::Tensor()), bucket_feature_of_row,
+                    offset_per_bucket, layout, topo, num_features, lookup_keys, remote_keys,
+                    node_keys, node_key_weights.value_or(at::Tensor()),
+                    node_bucket_feature_of_row.value_or(at::Tensor()), src.value_or(at::Tensor()));
 }
 
 // The sizes of a call across nodes (Sizes) by name: num_nodes, local_size,
@@ -157,9 +210,7 @@ Sizes plan_sizes(const std::map<std::string, int64_t> &named) {
   const int num_nodes = (int)named.at("num_nodes"), local_size = (int)named.at("local_size"),
             node = (int)named.at("node"), local_rank = (int)named.at("local_rank");
   Sizes sizes{};
-  sizes.topo =
-      Topo{num_nodes * local_size,         local_size, num_nodes, local_size + num_nodes - 1,
-           node * local_size + local_rank, local_rank, node};
+  sizes.topo = topo_of(num_nodes, local_size, node, local_rank);
   sizes.num_features = named.at("num_features");
   sizes.num_tables = named.at("num_tables");
   sizes.lookup_keys = named.at("lookup_keys");
@@ -417,8 +468,9 @@ void bind_testing(py::module &py_module) {
                 "The next construction of an op in this process fails to allocate",
                 py::arg("fail_alloc"));
   py_module.def("hier_output_dist_bucketize", &bucketize_test,
-                "The keys bucketized by owner, their bucket features and offsets, and the input's "
-                "per-feature totals, by name",
+                "The keys bucketized by owner, their bucket features and offsets, the keys as "
+                "their owners store them in the KJT's order, and the input's per-feature totals, "
+                "by name",
                 py::arg("values"), py::arg("offsets"), py::arg("lengths"), py::arg("batch_size"),
                 py::arg("weights"), py::arg("block_sizes"), py::arg("dist_types"),
                 py::arg("world_size"), py::arg("input_offsets"));
@@ -426,14 +478,28 @@ void bind_testing(py::module &py_module) {
                 "Index dedup's fan-out of the bucketized rows, by name", py::arg("reverse_indices"),
                 py::arg("inv"));
   py_module.def("hier_output_dist_node_layout", &node_layout_test,
-                "One rank's count vector and node layout on its node's counts, and on one node "
-                "with its node_keys its KJT and src, by name",
-                py::arg("totals"), py::arg("before"), py::arg("mine"),
-                py::arg("offset_per_bucket_feature"), py::arg("offset_per_bucket"),
-                py::arg("bucket_feature_of_row"), py::arg("num_nodes"), py::arg("local_size"),
+                "One rank's node layout on its node's offsets, and on one node given its own "
+                "part of node_keys and its src its KJT, by name",
+                py::arg("node_offsets"), py::arg("num_nodes"), py::arg("local_size"),
                 py::arg("node"), py::arg("local_rank"), py::arg("num_features"),
                 py::arg("lookup_keys"), py::arg("remote_keys"), py::arg("node_keys") = py::none(),
-                py::arg("node_key_weights") = py::none());
+                py::arg("node_key_weights") = py::none(), py::arg("src") = py::none());
+  py_module.def("hier_output_dist_node_push", &node_push_test,
+                "One requester's push of its bucketized rows into stand-ins for its targets' "
+                "node_keys ([local_size] rows), in place",
+                py::arg("stored"), py::arg("inv"), py::arg("weights"),
+                py::arg("bucket_feature_of_row"), py::arg("offset_per_bucket"),
+                py::arg("destination_base"), py::arg("skip"), py::arg("num_nodes"),
+                py::arg("local_size"), py::arg("node"), py::arg("local_rank"),
+                py::arg("num_features"), py::arg("lookup_keys"), py::arg("remote_keys"),
+                py::arg("node_keys"), py::arg("node_key_weights") = py::none(),
+                py::arg("node_bucket_feature_of_row") = py::none(), py::arg("src") = py::none());
+  py_module.def("hier_output_dist_delay_node_reads", &delay_node_reads,
+                "Each later input dist of this process waits ns on the GPU twice (0: none): in "
+                "node_exchange between the node barrier and the read of node_offsets, and between "
+                "node_done and the first read of node_keys. Its rank reads the node's offsets and "
+                "keys late",
+                py::arg("ns"));
   py_module.def("hier_output_dist_proxy_plan", &proxy_plan_test,
                 "One proxy's steps of a call across nodes on plain tensors, which it writes as "
                 "its buffers of the window, and its count messages, by name",

@@ -17,9 +17,11 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 // The planner: the steps of a call between and around the comm kernels, on
 // the current stream: kernels of their own (what they share: planner.cuh)
 // and CUB's radix sorts and scans (cub.cu), none of which waits for the
-// device. The bucketize, the node layout, the proxy, the rail and the owner,
-// the requester, and the put lists. Every table of a step is sized by the op's
-// sizes (Sizes, from its configuration: config.h), never by a device value.
+// device. The bucketize, the owner's KJT on one node, the proxy, the rail and
+// the owner, the requester, and the put lists. node_exchange makes the node
+// layout (node_layout_of, node.cuh); node_layout() and push_to_node_keys()
+// here are the hooks'. Every table of a step is sized by the op's sizes
+// (Sizes, from its configuration: config.h), never by a device value.
 #pragma once
 
 #include <ATen/ATen.h>
@@ -82,8 +84,9 @@ struct OwnerRules {
 // offset_per_bucket[world_size] of them (index dedup leaves fewer). A
 // requester's "bucketized rows" are these, in this order.
 struct BucketizedKeys {
-  at::Tensor keys;         // int64 [B]: each valid key as its owner stores it
-  at::Tensor key_weights;  // fp32 [B], or undefined: their weights
+  at::Tensor keys;         // int64 [B]: each valid key as its owner stores it (bucketize_keys only)
+  at::Tensor key_weights;  // fp32 [B], or undefined: their weights (bucketize_keys only)
+  at::Tensor stored;       // int64 [B]: each KJT key as its owner stores it, in the KJT's order
   at::Tensor inv;          // int32 [B]: the KJT row of each (a permutation; row past the valid)
   at::Tensor bucket_feature_of_row;  // int32 [B]: the bucket feature owner * num_features + feature
                                      // of each, world_size * num_features past the valid
@@ -92,6 +95,17 @@ struct BucketizedKeys {
   at::Tensor offset_per_bucket;          // int64 [world_size + 1]: where each bucket (owner) starts
   at::Tensor input_length_per_key;       // int64 [num_features]: keys per feature of the input KJT
 };
+// The checks of the bucketize's inputs (the keys, offsets or lengths, the input KJT's offsets,
+// weights, the rules) and of the fan-out's (reverse_indices). Each throws (TORCH_CHECK) with the
+// message of its check. InChannel::input_dist calls both before it takes a sequence number.
+// bucketize_rows and fanout_tables call them too (the hooks).
+void check_bucketize_input(const PlanInput &input, const OwnerRules &rules, int64_t world_size);
+void check_fanout_input(const at::Tensor &reverse_indices);
+// The bucketize up to its gather: the in channel's (its push gathers the keys as it pushes them).
+// keys and key_weights stay undefined.
+BucketizedKeys bucketize_rows(const PlanInput &input, const OwnerRules &rules, int64_t world_size);
+// The whole bucketize: bucketize_rows, then the keys (and weights) gathered into bucketized order
+// (gather_rows): the tests'. stored stays.
 BucketizedKeys bucketize_keys(const PlanInput &input, const OwnerRules &rules, int64_t world_size);
 
 // Index dedup's fan-out of the deduplicated rows to the original rows, in the
@@ -113,38 +127,22 @@ struct FanoutTables {
 // inv, whose size is the number of deduplicated rows.
 FanoutTables fanout_tables(const at::Tensor &reverse_indices, const at::Tensor &inv);
 
-// The node's part of a call (the in channel): this rank's
-// counts for its node, the layout every rank of the node computes alike from
-// the counts the node exchanged, and on one node the owner's KJT and the
-// requester's map (planner.cu).
+// The node's part of a call (the in channel): the layout every rank of the node computes alike
+// from the node's offsets, and the push of this rank's keys into their places (planner.cu,
+// node.cuh).
 //
-// node_keys of a target holds its own part at [0, lookup_keys), the keys of
-// its node for the target as owner, in the owner's KJT order
-// ([feature][requester][requester's order]); and across nodes its remote
-// part at [lookup_keys, lookup_keys + remote_keys), the keys of its node for
-// the owners on its rail of the other nodes, which it deduplicates as their
-// proxy: requester-major, then owner node, then [feature][position].
+// Each requester pushes its bucketize's offset_per_bucket_feature into its row of every node
+// peer's node_offsets (window.h). From the node's offsets each rank knows where every key of the
+// node goes, and pushes its keys straight to their places in their targets' node_keys.
+// node_keys of a target holds its own part at [0, lookup_keys), the keys of its node for the
+// target as owner, in the owner's KJT order ([feature][requester][requester's order]); and across
+// nodes its remote part at [lookup_keys, lookup_keys + remote_keys), the keys of its node for the
+// owners on its rail of the other nodes, which it deduplicates as their proxy: requester-major,
+// then owner node, then [feature][position].
 
-// This rank's count vector for its node (CountVector, window.h), int64
-// [local_size * (num_features + 1)]: first its keys for each target's remote
-// part, then its keys for each owner of its node, [owner][feature]. From
-// the bucketize's offset_per_bucket_feature.
-at::Tensor node_count_vector(const at::Tensor &offset_per_bucket_feature, const Topo &topo,
-                             int64_t num_features);
-
-// The node's count vectors as node_count_exchange gives them to this rank.
-struct NodeCounts {
-  at::Tensor totals;  // int64 [local_size * (num_features + 1)]: their sum over the node
-  at::Tensor before;  // int64 [local_size * (num_features + 1)]: their sum over the ranks
-                      // before this one
-  at::Tensor mine;    // int64 [local_size][num_features + 1]: each requester's keys for this
-                      // rank: for its remote part, then for each feature of its own part
-};
-
-// The layout of the node's keys, from the node's counts and this rank's part
-// 1. Under a need above a capacity no rank of the node pushes (skip). One
-// node has no remote part: there requester_start and need_remote stay
-// undefined.
+// The layout of the node's keys, from the node's offsets. Under a need above a capacity no rank
+// of the node pushes (skip). One node has no remote part: there requester_start and need_remote
+// stay undefined. Across nodes kjt_offsets and length_per_key stay undefined.
 struct NodeLayout {
   at::Tensor own_lengths;       // int64 [num_features * local_size]: keys of each (feature,
                                 // requester) in this rank's own part
@@ -156,20 +154,39 @@ struct NodeLayout {
   at::Tensor need_lookup;       // int64 0-dim: the largest own part of the node
   at::Tensor need_remote;       // int64 0-dim: the largest remote part of the node
   at::Tensor skip;              // bool 0-dim: a need above its capacity
-  at::Tensor rows_to_push;      // int64 0-dim: this rank's valid rows, 0 under skip
   at::Tensor destination_base;  // int64 [world_size * num_features + 1]: bucketized row `row`
                                 // goes to destination_base[bucket_feature_of_row[row]] + row
                                 // in node_keys of its target
+  at::Tensor kjt_offsets;       // (one node) int64 [num_features * local_size + 1]
+  at::Tensor length_per_key;    // (one node) int64 [num_features]
 };
-NodeLayout node_layout(const NodeCounts &counts, const at::Tensor &offset_per_bucket_feature,
-                       const at::Tensor &offset_per_bucket, const Topo &topo, int64_t num_features,
+// The layout as node_exchange makes it, from the node's offsets (node_offsets: int64
+// [local_size][world_size * num_features + 1], row r requester r's offset_per_bucket_feature).
+NodeLayout node_layout(const at::Tensor &node_offsets, const Topo &topo, int64_t num_features,
                        int64_t lookup_keys, int64_t remote_keys);
+// The tensors of a NodeLayout, empty: requester_start and need_remote across nodes, kjt_offsets
+// and length_per_key on one node.
+NodeLayout empty_node_layout(const Topo &topo, int64_t num_features,
+                             const at::TensorOptions &options);
 
-// On one node, the KJT of this rank as owner, a copy of its own part of
-// node_keys once every requester of the node pushed (node_keys, and
-// node_key_weights when the keys carry weights: views of the own part), and its
-// map as requester: its rows' places in their owners' KJTs, which are where
-// it pushed them.
+// The push of node_key_push (push_rows, node.cuh) into a test's stand-ins for its targets'
+// node_keys: row t of node_keys ([local_size][lookup_keys + remote_keys]), of node_key_weights
+// (the same shape, or undefined) and across nodes of node_bucket_feature_of_row
+// ([local_size][remote_keys]) is target t's. Its inputs are bucketize_rows' outputs (stored, inv,
+// bucket_feature_of_row, offset_per_bucket), the KJT's weights (or undefined) and the node
+// layout. With src defined (one node) it also writes src. A place outside a stand-in's row is
+// not stored.
+void push_to_node_keys(const at::Tensor &stored, const at::Tensor &inv, const at::Tensor &weights,
+                       const at::Tensor &bucket_feature_of_row, const at::Tensor &offset_per_bucket,
+                       const NodeLayout &node, const Topo &topo, int64_t num_features,
+                       int64_t lookup_keys, int64_t remote_keys, const at::Tensor &node_keys,
+                       const at::Tensor &node_key_weights,
+                       const at::Tensor &node_bucket_feature_of_row, const at::Tensor &src);
+
+// On one node, the KJT of this rank as owner, a copy of its own part of node_keys once every
+// requester of the node pushed (node_keys, and node_key_weights when the keys carry weights:
+// views of the own part), and its map as requester (src: its rows' places in their owners' KJTs,
+// which the push wrote).
 struct OneNodeOwner {
   at::Tensor kjt_values;      // int64 [lookup_keys]: the first num_recv are the KJT's
   at::Tensor kjt_weights;     // fp32 [lookup_keys], or undefined
@@ -177,12 +194,12 @@ struct OneNodeOwner {
   at::Tensor kjt_offsets;     // int64 [num_features * local_size + 1]
   at::Tensor num_recv;        // int64 0-dim: the keys it looks up
   at::Tensor length_per_key;  // int64 [num_features]
-  at::Tensor src;  // int32 [bucket_feature_of_row.numel()]: the place of each row in its owner's
-                   // KJT (and its dst)
+  at::Tensor src;             // int32 [rows]: the place of each row in its owner's KJT (and
+                              // its dst)
 };
-OneNodeOwner one_node_owner(const NodeLayout &node, const at::Tensor &bucket_feature_of_row,
-                            const at::Tensor &node_keys, const at::Tensor &node_key_weights,
-                            const Topo &topo, int64_t num_features);
+OneNodeOwner one_node_owner(const NodeLayout &node, const at::Tensor &node_keys,
+                            const at::Tensor &node_key_weights, const at::Tensor &src,
+                            const Topo &topo);
 
 // The proxy's part of a call across nodes (the in channel, after
 // node_done). The remote part of its node_keys holds the keys its node
@@ -416,8 +433,9 @@ struct PeerWords {
 // The remote_map words of this requester's rows (bucket_feature_of_row,
 // offset_per_bucket: the bucketize's; destination_base: the node layout's),
 // kGatherRemoteMap: a row of another node's owner is occurrence destination -
-// lookup_keys of its proxy, the owner's rank on this node; it reads that entry
-// of each RemoteMap array.
+// lookup_keys of its proxy, the owner's rank on this node (its place in its
+// proxy's remote part, where it pushed it); it reads that entry of each
+// RemoteMap array.
 PeerWords remote_rows(const at::Tensor &bucket_feature_of_row, const at::Tensor &offset_per_bucket,
                       const at::Tensor &destination_base, const Sizes &sizes);
 // The words of the node's proxy headers this requester reads

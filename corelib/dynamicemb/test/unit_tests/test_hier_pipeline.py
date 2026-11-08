@@ -20,7 +20,8 @@ must give the same outputs and tables, bit for bit
 (with a power-of-two world size of at most 128, every sum is exact). Its
 last steps also count the host syncs and the kernels of each call. Then
 calls over the capacities, which raise, under each loop and pipeline,
-stress runs, shardings that take TorchRec's dists, and the teardown with a
+stress runs (on one node also a rank that reads its node's offsets and keys
+late), shardings that take TorchRec's dists, and the teardown with a
 pipeline in flight. On one
 GPU the sharding takes TorchRec's dists. On a build without the op (NCCL
 older than 2.30.7), "fused" raises and "auto" takes TorchRec's dists.
@@ -93,7 +94,7 @@ from torchrec.streamable import Pipelineable
 # The build has the hierarchical dist (NCCL >= 2.30.7).
 GIN = hasattr(dynamicemb_extensions, "HierOutputDist")
 if GIN:
-    from dynamicemb_extensions import HierOutputDist
+    from dynamicemb_extensions import HierOutputDist, hier_output_dist_delay_node_reads
 
 # The capacities are counted as the benchmark counts them.
 sys.path.insert(
@@ -136,6 +137,10 @@ SYNC_CALLS = (
 )
 # How late the late rank of the teardown cases drops its model, in seconds.
 LATE = 10.0
+# How late rank 1 reads its node's offsets and its node's keys in the skew
+# case (one node), in ns: long enough that its node peers' next call would
+# overwrite them first if it did not wait.
+SKEW_NS = 20_000_000
 # The ranks of a node, and whether every table sum is exact (main sets them).
 LOCAL = 1
 EXACT = True
@@ -1242,6 +1247,7 @@ def run_matrix(rank: int, log: Callable, core: bool, need_megatron: bool) -> int
     del torchrec_run, semisync
     failures += gc_models(log)
     failures += run_stress(rank, log)
+    failures += run_skew(rank, log)
     return failures
 
 
@@ -1352,6 +1358,42 @@ def run_stress(rank: int, log: Callable) -> int:
         failures += compare(f"{spec.name}: {kind} vs the plain loop", got, plain, log)
         failures += gc_models(log)
     return failures
+
+
+def run_skew(rank: int, log: Callable) -> int:
+    """On one node, a rank that reads its node's offsets and keys late,
+    against the plain loop. Rank 1's input dists wait SKEW_NS on the GPU
+    twice (hier_output_dist_delay_node_reads): in node_exchange after the
+    node barrier, before they read node_offsets, and after node_done, before
+    they read node_keys. TrainPipelineSparseDist starts the next batch's
+    input dist before this batch's forward, and the forward waits only for
+    its own rank's input dist. So rank 1's node peers start the next batch's
+    input dist while rank 1 has not read this batch's offsets and keys yet.
+    A peer writes its next offsets into rank 1's node_offsets only after its
+    node_done got rank 1's tell (in_written), which rank 1 sends after its
+    node_exchange read them. A peer pushes its next keys into rank 1's
+    node_keys only after the node barrier of the next call: rank 1 publishes
+    its in_started only at its next node_exchange, once this call ended
+    there. Across nodes in_done holds the peers too, so only one node opens
+    the race. 20 steps."""
+    if dist.get_world_size() != LOCAL:
+        return 0
+    spec = replace(UNIFORM, name="uniform, 20 steps", sizes=(SIZES * 4)[:20])
+    plain = run(spec, "fused", "plain", rank)
+    if rank == 1:
+        hier_output_dist_delay_node_reads(SKEW_NS)
+    try:
+        got = run(spec, "fused", "sparse_dist", rank)
+    finally:
+        hier_output_dist_delay_node_reads(0)
+    failures = compare(
+        f"{spec.name}: sparse_dist, rank 1 reads its node's offsets and keys"
+        f" {SKEW_NS / 1e6:.0f} ms late, vs the plain loop",
+        got,
+        plain,
+        log,
+    )
+    return failures + gc_models(log)
 
 
 # ── shardings on TorchRec's dists ────────────────────────────────────────────

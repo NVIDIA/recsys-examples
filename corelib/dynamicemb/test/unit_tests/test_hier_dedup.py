@@ -22,9 +22,12 @@ rail's layout, status, owner tables and the put lists
 The test plays every rank of an N-node job: each rank's bucketized rows (by
 owner and feature, and past the valid ones index dedup's bound), index-
 deduplicated (a rank has each (table, key) once, so a node-unique key has at
-most local_size occurrences at its proxy), its node layout (``hier_output_dist_node_layout``), and between the steps what the
-comm kernels do: the node's summed counts, the pushes into node_keys, the
-count messages of each rail, the key records each proxy puts into its owners'
+most local_size occurrences at its proxy), whose keys and weights are in the
+order of its KJT (a random permutation, inv), its node layout
+(``hier_output_dist_node_layout``), and between the steps what the comm
+kernels do: the node's offsets (each requester's offset_per_bucket_feature),
+the pushes into node_keys (``hier_output_dist_node_push``), the count
+messages of each rail, the key records each proxy puts into its owners'
 rail_keys and the source_offsets each owner puts into its proxies'
 owner_offsets, the needs and requester_offsets each node exchanges (the
 requester binding gathers the proxies' words itself). The windows hold
@@ -71,6 +74,7 @@ from typing import Callable, Dict, List, Optional, Tuple
 import torch
 from dynamicemb_extensions import (
     hier_output_dist_node_layout,
+    hier_output_dist_node_push,
     hier_output_dist_proxy_plan,
     hier_output_dist_rail_tables,
     hier_output_dist_requester_tables,
@@ -446,24 +450,29 @@ def random_job(case: Case, generator) -> List[Tuple]:
 def bucketized_rows(case: Case, counts, keys, weights, generator) -> Dict:
     """A rank's bucketized rows as the planner takes them: by bucket feature
     (owner * num_features + feature), then index dedup's bound (garbage
-    keys)."""
+    keys). Their keys and weights stay in the order of its KJT, as the
+    bucketize leaves them (stored, kjt_weights): bucketized row ``row`` is KJT
+    row inv[row], a random permutation."""
     num_bucket_features = counts.numel()
     offset_per_bucket_feature = torch.cat(
         [torch.zeros(1, dtype=torch.int64), counts.cumsum(0)]
     )
+    row_keys = torch.cat(
+        [keys, torch.randint(-(1 << 62), 1 << 62, (case.bound,), generator=generator)]
+    )
+    row_weights = torch.cat([weights, torch.full((case.bound,), 1e9)])
+    inv = torch.randperm(row_keys.numel(), generator=generator)
+    stored, kjt_weights = torch.empty_like(row_keys), torch.empty_like(row_weights)
+    stored[inv], kjt_weights[inv] = row_keys, row_weights
     return dict(
         offset_per_bucket_feature_list=offset_per_bucket_feature.tolist(),
         keys_list=keys.tolist(),
         weights_list=weights.tolist(),
         valid=int(counts.sum()),
         counts=counts,
-        keys=torch.cat(
-            [
-                keys,
-                torch.randint(-(1 << 62), 1 << 62, (case.bound,), generator=generator),
-            ]
-        ).cuda(),
-        weights=torch.cat([weights, torch.full((case.bound,), 1e9)]).cuda(),
+        stored=stored.cuda(),
+        inv=inv.int().cuda(),
+        kjt_weights=kjt_weights.cuda(),
         bucket_feature_of_row=torch.cat(
             [
                 torch.repeat_interleave(torch.arange(num_bucket_features), counts),
@@ -487,41 +496,57 @@ def garbage(count: int, dtype: torch.dtype, generator) -> torch.Tensor:
     return bits.to(torch.int32 if dtype == torch.float32 else dtype).view(dtype).cuda()
 
 
-def make_windows(case: Case, lookup_keys: int, remote_keys: int, generator) -> Dict:
-    """A rank's window buffers as the planner across nodes reads and writes
-    them, garbage in each."""
+def make_windows(
+    case: Case, lookup_keys: int, remote_keys: int, generator
+) -> Tuple[Dict, List[Dict]]:
+    """A node's window buffers as the planner across nodes reads and writes
+    them, garbage in each. node_keys, node_key_weights (with weights) and
+    node_bucket_feature_of_row are one tensor each for the node (row r: rank
+    r's), as the push takes its targets'. Returns those, and each rank's
+    window: its row of each, and its other buffers."""
     num_nodes, local_size = case.num_nodes, case.local_size
     chunks = max_chunks(case, remote_keys)
-    windows = dict(
-        node_keys=garbage(lookup_keys + remote_keys, torch.int64, generator),
-        node_bucket_feature_of_row=garbage(remote_keys, torch.int32, generator),
-        remote_map=garbage(3 * remote_keys, torch.int32, generator),
-        key_stage=garbage(
-            chunks * 2 + remote_keys * case.record_bytes // 8 + 2,
-            torch.int64,
-            generator,
-        ),
-        proxy_header=garbage(
-            4 + chunks + local_size * (chunks + 1),
-            torch.int32,
-            generator,
-        ),
-        rail_keys=garbage(
-            (
-                lookup_keys * case.record_bytes
-                + owner_chunks(case, lookup_keys, remote_keys) * 16
-            )
-            // 8,
-            torch.int64,
-            generator,
-        ),
-        owner_offsets=garbage(num_nodes * case.num_features, torch.int64, generator),
+    entries = local_size * (lookup_keys + remote_keys)
+    buffers = dict(
+        node_keys=garbage(entries, torch.int64, generator).view(local_size, -1),
+        node_bucket_feature_of_row=garbage(
+            local_size * remote_keys, torch.int32, generator
+        ).view(local_size, remote_keys),
     )
     if case.weights:
-        windows["node_key_weights"] = garbage(
-            lookup_keys + remote_keys, torch.float32, generator
+        buffers["node_key_weights"] = garbage(entries, torch.float32, generator).view(
+            local_size, -1
         )
-    return windows
+    windows = []
+    for local_rank in range(local_size):
+        window = {name: rows[local_rank] for name, rows in buffers.items()}
+        window.update(
+            remote_map=garbage(3 * remote_keys, torch.int32, generator),
+            key_stage=garbage(
+                chunks * 2 + remote_keys * case.record_bytes // 8 + 2,
+                torch.int64,
+                generator,
+            ),
+            proxy_header=garbage(
+                4 + chunks + local_size * (chunks + 1),
+                torch.int32,
+                generator,
+            ),
+            rail_keys=garbage(
+                (
+                    lookup_keys * case.record_bytes
+                    + owner_chunks(case, lookup_keys, remote_keys) * 16
+                )
+                // 8,
+                torch.int64,
+                generator,
+            ),
+            owner_offsets=garbage(
+                num_nodes * case.num_features, torch.int64, generator
+            ),
+        )
+        windows.append(window)
+    return buffers, windows
 
 
 def proxy_occurrences(case: Case, ranks: List[Dict], node: int, proxy: int) -> List:
@@ -824,16 +849,6 @@ def segments_reference(case: Case, chunks, lengths, kjt_offsets):
 # ── the call ─────────────────────────────────────────────────────────────────
 
 
-def count_vector(case: Case, bucketized: Dict, node: int) -> torch.Tensor:
-    """A requester's counts for its node: its keys for each target's remote
-    part, then for each owner of its node and feature."""
-    counts = bucketized["counts"].view(
-        case.num_nodes, case.local_size, case.num_features
-    )
-    same = counts[node]
-    return torch.cat([counts.sum((0, 2)) - same.sum(1), same.flatten()])
-
-
 def run_call(
     case: Case, ranks: List[Dict], lookup_keys: int, remote_keys: int, generator
 ):
@@ -863,62 +878,58 @@ def run_call(
             record_bytes=case.record_bytes,
         )
 
-    layouts, windows = [], []
-    for rank, bucketized in enumerate(ranks):
-        node, local_rank = divmod(rank, local_size)
-        # node_count_exchange: the count vectors' sum over the node and over
-        # the ranks before this one, and each requester's counts for it
-        vectors = torch.stack(
+    layouts, windows, node_buffers = [], [], []
+    for node in range(num_nodes):
+        # node_exchange: the node's offsets (row r: requester r's
+        # offset_per_bucket_feature), the same in each window of the node, and
+        # each rank's node layout on them
+        node_offsets = torch.stack(
             [
-                count_vector(case, ranks[node * local_size + requester], node)
+                ranks[node * local_size + requester]["offset_per_bucket_feature"]
                 for requester in range(local_size)
             ]
         )
-        own_columns = vectors[:, local_size + local_rank * num_features :][
-            :, :num_features
-        ]
-        mine = torch.cat([vectors[:, local_rank : local_rank + 1], own_columns], 1)
-        layouts.append(
-            planner(
-                hier_output_dist_node_layout,
-                vectors.sum(0).cuda(),
-                vectors[:local_rank].sum(0).cuda(),
-                mine.contiguous().view(-1).cuda(),
-                bucketized["offset_per_bucket_feature"],
-                bucketized["offset_per_bucket"],
-                bucketized["bucket_feature_of_row"],
-                num_nodes,
-                local_size,
-                node,
-                local_rank,
-                num_features,
-                lookup_keys,
-                remote_keys,
+        for local_rank in range(local_size):
+            layouts.append(
+                planner(
+                    hier_output_dist_node_layout,
+                    node_offsets,
+                    num_nodes,
+                    local_size,
+                    node,
+                    local_rank,
+                    num_features,
+                    lookup_keys,
+                    remote_keys,
+                )
             )
-        )
-        windows.append(make_windows(case, lookup_keys, remote_keys, generator))
+        buffers, node_windows = make_windows(case, lookup_keys, remote_keys, generator)
+        node_buffers.append(buffers)
+        windows += node_windows
     # node_key_push: each requester's valid rows into its targets' node_keys
-    # (weights, and the bucket feature (owner node, feature) of each remote
-    # occurrence) where its layout says
+    # (row t of its node's buffers: target t's) where its layout says, with
+    # their weights, and the bucket feature (owner node, feature) of each
+    # remote occurrence
     for rank, bucketized in enumerate(ranks):
-        node = rank // local_size
-        rows = torch.arange(int(layouts[rank]["rows_to_push"]), device="cuda")
-        bucket_feature = bucketized["bucket_feature_of_row"][rows].long()
-        owner = bucket_feature // num_features
-        destination = layouts[rank]["destination_base"][bucket_feature] + rows
-        for target in range(local_size):
-            mine = owner % local_size == target
-            window = windows[node * local_size + target]
-            window["node_keys"][destination[mine]] = bucketized["keys"][rows[mine]]
-            if case.weights:
-                window["node_key_weights"][destination[mine]] = bucketized["weights"][
-                    rows[mine]
-                ]
-            remote = mine & (destination >= lookup_keys)
-            window["node_bucket_feature_of_row"][destination[remote] - lookup_keys] = (
-                (owner[remote] // local_size) * num_features
-                + bucket_feature[remote] % num_features
-            ).int()
+        node, local_rank = divmod(rank, local_size)
+        planner(
+            hier_output_dist_node_push,
+            bucketized["stored"],
+            bucketized["inv"],
+            bucketized["kjt_weights"] if case.weights else None,
+            bucketized["bucket_feature_of_row"],
+            bucketized["offset_per_bucket"],
+            layouts[rank]["destination_base"],
+            layouts[rank]["skip"],
+            num_nodes,
+            local_size,
+            node,
+            local_rank,
+            num_features,
+            lookup_keys,
+            remote_keys,
+            **node_buffers[node],
+        )
     proxies = []
     for rank, window in enumerate(windows):
         layout = layouts[rank]

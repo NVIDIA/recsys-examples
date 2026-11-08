@@ -21,6 +21,7 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 #include <cstdint>
 
 #include "hier_output_dist/common/window.h"
+#include "hier_output_dist/input_dist/node.cuh"
 #include "hier_output_dist/input_dist/planner.cuh"
 #include "hier_output_dist/input_dist/planner.h"
 
@@ -31,201 +32,122 @@ namespace {
 
 // ── the node ──
 
-// One CTA: this rank's count vector (CountVector) from the bucketize's
-// offset_per_bucket_feature.
+// One CTA: the layout of the node's keys (node_layout_of, node.cuh) from the node's offsets, as
+// node_exchange makes it. The hooks' (node_layout).
 __global__ void __launch_bounds__(kThreads)
-    count_vector_kernel(const int64_t *offset_per_bucket_feature, Topo topo, int64_t num_features,
-                        int64_t *counts) {
-  const int64_t local_size = topo.local_size;
-  const CountVector format{local_size, num_features};
-  // its keys for each target's remote part: its blocks of the owners with the
-  // target's local rank on the other nodes
-  for (int64_t target = threadIdx.x; target < local_size; target += kThreads) {
-    int64_t keys = 0;
-    for (int64_t owner_node = 0; owner_node < topo.num_nodes; ++owner_node) {
-      const int64_t owner = owner_node * local_size + target;
-      if (owner_node != topo.node)
-        keys += offset_per_bucket_feature[(owner + 1) * num_features] -
-                offset_per_bucket_feature[owner * num_features];
-    }
-    counts[format.remote(target)] = keys;
-  }
-  // its keys for each owner of its node and feature: the bucket feature's
-  for (int64_t index = threadIdx.x; index < local_size * num_features; index += kThreads) {
-    const int64_t target = index / num_features, feature = index % num_features;
-    const int64_t bucket_feature = (topo.node * local_size + target) * num_features + feature;
-    counts[format.own(target, feature)] =
-        offset_per_bucket_feature[bucket_feature + 1] - offset_per_bucket_feature[bucket_feature];
-  }
+    node_layout_kernel(const int64_t *node_offsets, Topo topo, int64_t num_features,
+                       int64_t lookup_keys, int64_t remote_keys, int64_t *scratch,
+                       NodeLayoutView out) {
+  node_layout_of(node_offsets, topo, num_features, lookup_keys, remote_keys, scratch, out);
 }
 
-// One CTA: the layout of the node's keys (NodeLayout) from the node's counts
-// (totals, before, mine: NodeCounts) and this rank's bucketized keys.
-// requester_start and need_remote: nullptr on one node.
+// The push of node_key_push (push_rows, node.cuh) into a test's stand-ins for its targets'
+// node_keys (row t: target t's; node_key_weights nullptr: none). The hooks' (push_to_node_keys).
+// A place outside a stand-in's row is not stored.
 __global__ void __launch_bounds__(kThreads)
-    node_layout_kernel(const int64_t *totals, const int64_t *before, const int64_t *mine,
-                       const int64_t *offset_per_bucket_feature, const int64_t *offset_per_bucket,
-                       Topo topo, int64_t num_features, int64_t lookup_keys, int64_t remote_keys,
-                       int64_t *own_lengths, int64_t *own_offsets, int64_t *own_total,
-                       int64_t *requester_start, int64_t *need_lookup, int64_t *need_remote,
-                       bool *skip, int64_t *rows_to_push, int64_t *destination_base) {
-  const int64_t local_size = topo.local_size, num_nodes = topo.num_nodes, node = topo.node;
-  const CountVector words{local_size, num_features};
-  // This rank's own part, in its KJT order [feature][requester]: each
-  // requester's keys of each feature for it (in mine, after those for its
-  // remote part), and where each starts: the ends of every one but the
-  // last.
-  const int64_t num_own_lengths = num_features * local_size;
-  auto own_length = [&](int64_t index) {
-    const int64_t feature = index / local_size, requester = index % local_size;
-    return mine[requester * (num_features + 1) + 1 + feature];
-  };
-  for (int64_t index = threadIdx.x; index < num_own_lengths; index += kThreads)
-    own_lengths[index] = own_length(index);
-  cta_exclusive_ends<int64_t>(num_own_lengths - 1, own_length, own_offsets);
-  // The node's keys for each owner of the node, and the largest own part.
-  for (int64_t target = threadIdx.x; target < local_size; target += kThreads) {
-    int64_t keys = 0;
-    for (int64_t feature = 0; feature < num_features; ++feature)
-      keys += totals[words.own(target, feature)];
-    own_total[target] = keys;
-  }
-  __syncthreads();
-  const int64_t most_own = cta_max<int64_t>(
-      local_size, [&](int64_t target) { return own_total[target]; }, 0);
-  // Across nodes, where each requester's keys start in this rank's remote
-  // part, and the largest remote part. The needs, and whether the node skips
-  // the call, are the same on every rank of the node.
-  bool skips = most_own > lookup_keys;
-  if (num_nodes > 1) {
-    cta_exclusive_ends<int64_t>(
-        local_size, [&](int64_t requester) { return mine[requester * (num_features + 1)]; },
-        requester_start);
-    const int64_t most_remote = cta_max<int64_t>(
-        local_size, [&](int64_t target) { return totals[words.remote(target)]; }, 0);
-    skips = skips || most_remote > remote_keys;
-    if (threadIdx.x == 0) *need_remote = most_remote;
-  }
-  if (threadIdx.x == 0) {
-    *need_lookup = most_own;
-    *skip = skips;
-    *rows_to_push = skips ? 0 : offset_per_bucket[topo.world_size];
-  }
-  // Bucketized row `row` in bucket feature b goes to destination_base[b] +
-  // row. A row of an owner of this node goes to the owner's own part: where
-  // this rank's keys of the feature start there (the node's keys of the
-  // features before, then those of the requesters before), and the rows of
-  // the bucket feature before it. A thread per owner walks its features.
-  for (int64_t target = threadIdx.x; target < local_size; target += kThreads) {
-    int64_t feature_start = 0;  // where the owner's keys of `feature` start in its own part
-    for (int64_t feature = 0; feature < num_features; ++feature) {
-      const int64_t bucket_feature = (node * local_size + target) * num_features + feature;
-      destination_base[bucket_feature] = feature_start + before[words.own(target, feature)] -
-                                         offset_per_bucket_feature[bucket_feature];
-      feature_start += totals[words.own(target, feature)];
-    }
-  }
-  // A remote row of owner (owner node, target) goes to its target's remote
-  // part: after the requesters before this rank, this rank's blocks for the
-  // owner nodes before, and the rows of its block before it. A thread per
-  // (target, feature) walks the nodes.
-  for (int64_t index = threadIdx.x; index < local_size * num_features; index += kThreads) {
-    const int64_t target = index / num_features, feature = index % num_features;
-    int64_t block_place = lookup_keys + before[words.remote(target)];  // where its next block goes
-    for (int64_t owner_node = 0; owner_node < num_nodes; ++owner_node) {
-      if (owner_node == node) continue;
-      const int64_t owner = owner_node * local_size + target;
-      destination_base[owner * num_features + feature] = block_place - offset_per_bucket[owner];
-      block_place += offset_per_bucket[owner + 1] - offset_per_bucket[owner];
-    }
-  }
-  // the rows past the valid ones (bucket feature world_size * num_features)
-  // are never pushed
-  if (threadIdx.x == 0) destination_base[topo.world_size * num_features] = 0;
+    push_to_node_keys_kernel(GatherRows rows, int64_t num_rows, PushPlaces places, Topo topo,
+                             int64_t num_features, int64_t lookup_keys, int64_t remote_keys,
+                             int64_t *node_keys, float *node_key_weights,
+                             int32_t *node_bucket_feature_of_row, int32_t *src) {
+  const int64_t entries = lookup_keys + remote_keys;
+  push_rows(rows, num_rows, places, topo, num_features, src,
+            [&](int64_t target, int64_t place, int64_t key, float weight, int32_t feature) {
+              if (place < 0 || place >= entries) return;
+              node_keys[target * entries + place] = key;
+              if (node_key_weights != nullptr) node_key_weights[target * entries + place] = weight;
+              if (place >= lookup_keys)
+                node_bucket_feature_of_row[target * remote_keys + place - lookup_keys] = feature;
+            });
 }
 
-// A thread per position of the own part, up to the keys this rank looks up
-// (at most the own part): its key and its weight, the owner's KJT.
+// A thread per entry of the own part: the KJT's copy of its first num_recv
+// keys (and weights), at most own_part; none under skip (no requester pushed).
 __global__ void __launch_bounds__(kThreads)
     own_part_keys_kernel(const int64_t *node_keys, const float *node_key_weights,
-                         const int64_t *num_recv, int64_t own_part, int64_t *kjt_values,
-                         float *kjt_weights) {
-  const int64_t keys = min(*num_recv, own_part);
+                         const int64_t *num_recv, const bool *skip, int64_t own_part,
+                         int64_t *kjt_values, float *kjt_weights) {
+  const int64_t keys = *skip ? 0 : min(*num_recv, own_part);
   for (int64_t position = first_item(); position < keys; position += item_stride()) {
     kjt_values[position] = node_keys[position];
     if (node_key_weights != nullptr) kjt_weights[position] = node_key_weights[position];
   }
 }
 
-// One CTA: the owner's KJT offsets, the ends of its lengths (feature,
-// requester), and its keys of each feature.
-__global__ void __launch_bounds__(kThreads)
-    one_node_offsets_kernel(const int64_t *own_lengths, int64_t local_size, int64_t num_features,
-                            int64_t *kjt_offsets, int64_t *length_per_key) {
-  cta_exclusive_ends<int64_t>(
-      num_features * local_size, [&](int64_t index) { return own_lengths[index]; }, kjt_offsets);
-  for (int64_t feature = threadIdx.x; feature < num_features; feature += kThreads)
-    length_per_key[feature] =
-        kjt_offsets[(feature + 1) * local_size] - kjt_offsets[feature * local_size];
-}
-
-// A thread per bucketized row: its place in its owner's KJT, where it was
-// pushed (a row past the valid ones: its own index).
-__global__ void __launch_bounds__(kThreads)
-    one_node_src_kernel(const int32_t *bucket_feature_of_row, const int64_t *destination_base,
-                        int64_t rows, int32_t *src) {
-  for (int64_t row = first_item(); row < rows; row += item_stride())
-    src[row] = (int32_t)(destination_base[bucket_feature_of_row[row]] + row);
-}
-
 }  // namespace
 
-at::Tensor node_count_vector(const at::Tensor &offset_per_bucket_feature, const Topo &topo,
-                             int64_t num_features) {
-  const at::Tensor counts = at::empty({CountVector{topo.local_size, num_features}.words()},
-                                      offset_per_bucket_feature.options());
-  count_vector_kernel<<<kOneCta, kThreads, 0, current_stream()>>>(
-      offset_per_bucket_feature.data_ptr<int64_t>(), topo, num_features,
-      counts.data_ptr<int64_t>());
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
-  return counts;
-}
-
-NodeLayout node_layout(const NodeCounts &counts, const at::Tensor &offset_per_bucket_feature,
-                       const at::Tensor &offset_per_bucket, const Topo &topo, int64_t num_features,
-                       int64_t lookup_keys, int64_t remote_keys) {
+NodeLayout empty_node_layout(const Topo &topo, int64_t num_features,
+                             const at::TensorOptions &options) {
   const int64_t local_size = topo.local_size;
-  const auto long_options = offset_per_bucket_feature.options();
+  const auto long_options = options.dtype(at::kLong);
   NodeLayout node;
   node.own_lengths = at::empty({num_features * local_size}, long_options);
   node.own_offsets = at::empty({num_features * local_size}, long_options);
   node.own_total = at::empty({local_size}, long_options);
   node.need_lookup = at::empty({}, long_options);
   node.skip = at::empty({}, long_options.dtype(at::kBool));
-  node.rows_to_push = at::empty({}, long_options);
   node.destination_base = at::empty({topo.world_size * num_features + 1}, long_options);
   if (topo.num_nodes > 1) {  // one node has no remote part
     node.requester_start = at::empty({local_size + 1}, long_options);
     node.need_remote = at::empty({}, long_options);
+  } else {  // its own part is the owner's KJT
+    node.kjt_offsets = at::empty({num_features * local_size + 1}, long_options);
+    node.length_per_key = at::empty({num_features}, long_options);
   }
+  return node;
+}
+
+NodeLayout node_layout(const at::Tensor &node_offsets, const Topo &topo, int64_t num_features,
+                       int64_t lookup_keys, int64_t remote_keys) {
+  TORCH_CHECK(is_cuda_array(node_offsets, at::kLong,
+                            topo.local_size * (topo.world_size * num_features + 1)),
+              "hier_output_dist: the node's offsets, local_size x (world_size * num_features + 1)");
+  const auto options = node_offsets.options();
+  NodeLayout node = empty_node_layout(topo, num_features, options);
+  const at::Tensor scratch = at::empty({node_layout_scratch(topo, num_features)}, options);
   node_layout_kernel<<<kOneCta, kThreads, 0, current_stream()>>>(
-      counts.totals.data_ptr<int64_t>(), counts.before.data_ptr<int64_t>(),
-      counts.mine.data_ptr<int64_t>(), offset_per_bucket_feature.data_ptr<int64_t>(),
-      offset_per_bucket.data_ptr<int64_t>(), topo, num_features, lookup_keys, remote_keys,
-      node.own_lengths.data_ptr<int64_t>(), node.own_offsets.data_ptr<int64_t>(),
-      node.own_total.data_ptr<int64_t>(), data_or_null<int64_t>(node.requester_start),
-      node.need_lookup.data_ptr<int64_t>(), data_or_null<int64_t>(node.need_remote),
-      node.skip.data_ptr<bool>(), node.rows_to_push.data_ptr<int64_t>(),
-      node.destination_base.data_ptr<int64_t>());
+      node_offsets.data_ptr<int64_t>(), topo, num_features, lookup_keys, remote_keys,
+      scratch.data_ptr<int64_t>(), view_of(node));
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   return node;
 }
 
-OneNodeOwner one_node_owner(const NodeLayout &node, const at::Tensor &bucket_feature_of_row,
-                            const at::Tensor &node_keys, const at::Tensor &node_key_weights,
-                            const Topo &topo, int64_t num_features) {
-  const int64_t own_part = node_keys.numel(), rows = bucket_feature_of_row.numel();
-  const cudaStream_t stream = current_stream();
+void push_to_node_keys(const at::Tensor &stored, const at::Tensor &inv, const at::Tensor &weights,
+                       const at::Tensor &bucket_feature_of_row, const at::Tensor &offset_per_bucket,
+                       const NodeLayout &node, const Topo &topo, int64_t num_features,
+                       int64_t lookup_keys, int64_t remote_keys, const at::Tensor &node_keys,
+                       const at::Tensor &node_key_weights,
+                       const at::Tensor &node_bucket_feature_of_row, const at::Tensor &src) {
+  const int64_t rows = inv.numel(), local_size = topo.local_size,
+                entries = lookup_keys + remote_keys;
+  TORCH_CHECK(lookup_keys >= 0 && remote_keys >= 0 && (topo.num_nodes > 1 || remote_keys == 0) &&
+                  is_cuda_array(node_keys, at::kLong, local_size * entries) &&
+                  weights.defined() == node_key_weights.defined() &&
+                  (!weights.defined() ||
+                   is_cuda_array(node_key_weights, at::kFloat, local_size * entries)) &&
+                  (topo.num_nodes == 1 ||
+                   is_cuda_array(node_bucket_feature_of_row, at::kInt, local_size * remote_keys)) &&
+                  src.defined() == (topo.num_nodes == 1) &&
+                  (!src.defined() || is_cuda_array(src, at::kInt, rows)),
+              "hier_output_dist: the stand-ins for the targets' node_keys (local_size x "
+              "(lookup_keys + remote_keys)), node_key_weights exactly with weights, across nodes "
+              "node_bucket_feature_of_row (local_size x remote_keys), and on one node src");
+  if (rows == 0) return;
+  const GatherRows gather{inv.data_ptr<int32_t>(), stored.data_ptr<int64_t>(),
+                          data_or_null<float>(weights)};
+  const PushPlaces places{bucket_feature_of_row.data_ptr<int32_t>(),
+                          offset_per_bucket.data_ptr<int64_t>(),
+                          node.destination_base.data_ptr<int64_t>(), node.skip.data_ptr<bool>()};
+  push_to_node_keys_kernel<<<item_grid(rows), kThreads, 0, current_stream()>>>(
+      gather, rows, places, topo, num_features, lookup_keys, remote_keys,
+      node_keys.data_ptr<int64_t>(), data_or_null<float>(node_key_weights),
+      data_or_null<int32_t>(node_bucket_feature_of_row), data_or_null<int32_t>(src));
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+OneNodeOwner one_node_owner(const NodeLayout &node, const at::Tensor &node_keys,
+                            const at::Tensor &node_key_weights, const at::Tensor &src,
+                            const Topo &topo) {
+  const int64_t own_part = node_keys.numel();
   OneNodeOwner owner;
   // The own part is the KJT: a copy of its first num_recv keys (wait()
   // narrows it to num_recv). The node's next call rewrites node_keys after
@@ -234,25 +156,15 @@ OneNodeOwner one_node_owner(const NodeLayout &node, const at::Tensor &bucket_fea
   owner.kjt_values = at::empty({own_part}, node_keys.options());
   if (node_key_weights.defined())
     owner.kjt_weights = at::empty({own_part}, node_key_weights.options());
-  own_part_keys_kernel<<<item_grid(own_part), kThreads, 0, stream>>>(
+  own_part_keys_kernel<<<item_grid(own_part), kThreads, 0, current_stream()>>>(
       node_keys.data_ptr<int64_t>(), data_or_null<float>(node_key_weights),
-      owner.num_recv.data_ptr<int64_t>(), own_part, owner.kjt_values.data_ptr<int64_t>(),
-      data_or_null<float>(owner.kjt_weights));
+      owner.num_recv.data_ptr<int64_t>(), node.skip.data_ptr<bool>(), own_part,
+      owner.kjt_values.data_ptr<int64_t>(), data_or_null<float>(owner.kjt_weights));
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   owner.kjt_lengths = node.own_lengths;
-  owner.kjt_offsets = at::empty({node.own_lengths.numel() + 1}, node.own_lengths.options());
-  owner.length_per_key = at::empty({num_features}, node.own_lengths.options());
-  one_node_offsets_kernel<<<kOneCta, kThreads, 0, stream>>>(
-      node.own_lengths.data_ptr<int64_t>(), topo.local_size, num_features,
-      owner.kjt_offsets.data_ptr<int64_t>(), owner.length_per_key.data_ptr<int64_t>());
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
-  owner.src = at::empty({rows}, bucket_feature_of_row.options());
-  if (rows > 0) {
-    one_node_src_kernel<<<item_grid(rows), kThreads, 0, stream>>>(
-        bucket_feature_of_row.data_ptr<int32_t>(), node.destination_base.data_ptr<int64_t>(), rows,
-        owner.src.data_ptr<int32_t>());
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
-  }
+  owner.kjt_offsets = node.kjt_offsets;
+  owner.length_per_key = node.length_per_key;
+  owner.src = src;
   return owner;
 }
 

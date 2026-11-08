@@ -29,6 +29,9 @@ namespace hier_output_dist {
 
 namespace {
 
+// The test hook's wait (delay_node_reads), in ns.
+int64_t g_read_delay_ns = 0;
+
 // One CTA: the call's status (StatusSlots), which the caller copies to the
 // host at the call's second wait. Its needs: across nodes the most of the
 // node's (peer_needs, each rank's of its rail, kNumNeeds each): a rank's
@@ -61,7 +64,15 @@ __global__ void __launch_bounds__(kThreads)
   }
 }
 
+// One thread: waits `ns` on the GPU's clock (delay_node_reads).
+__global__ void delay_kernel(uint64_t ns) {
+  const uint64_t start = now_ns();
+  while (now_ns() - start < ns) __nanosleep(1000);
+}
+
 }  // namespace
+
+void delay_node_reads(int64_t ns) { g_read_delay_ns = ns; }
 
 InChannel::InChannel(const Config &config, const Sizes &sizes, ncclWindow_t window,
                      const ncclDevComm &dev, const WindowLayout &layout, int device)
@@ -106,19 +117,22 @@ InChannel::InChannel(const Config &config, const Sizes &sizes, ncclWindow_t wind
 InDist InChannel::input_dist(const PlanInput &input) {
   c10::cuda::CUDAGuard device_guard(device_);
   at::NoGradGuard no_grad;
+  // The inputs first. A call takes its sequence number when it launches its first comm kernel
+  // (node_exchange). A call that raises before that, on an input check or a failed allocation,
+  // takes none, and its node peers wait at the node barrier for the call that does. A call that
+  // raises between its first and its last comm kernel can leave its peers waiting.
   TORCH_CHECK(input.weights.has_value() == weights_,
               "hier_output_dist: the keys carry weights exactly when the op was made with "
               "weights (",
               weights_ ? "with" : "without", ")");
-  ++seq_;
-  // The bucketize: the call's keys by owner, and the fan-out of its
-  // deduplicated rows.
-  const BucketizedKeys bucketized = bucketize_keys(input, rules_, sizes_.topo.world_size);
+  check_bucketize_input(input, rules_, sizes_.topo.world_size);
+  check_fanout_input(input.reverse_indices);
+  // The bucketize up to its gather (the push gathers), and the fan-out of its rows.
+  const BucketizedKeys bucketized = bucketize_rows(input, rules_, sizes_.topo.world_size);
   const FanoutTables fanout = fanout_tables(input.reverse_indices, bucketized.inv);
   const Topo &topo = sizes_.topo;
   const int64_t local_size = topo.local_size, num_nodes = topo.num_nodes,
-                num_features = sizes_.num_features, lookup_keys = sizes_.lookup_keys,
-                remote_keys = sizes_.remote_keys;
+                num_features = sizes_.num_features;
   const auto long_options = bucketized.offset_per_bucket.options();
   InDist dist;
   FwdPlan &fwd = dist.fwd_plan;
@@ -126,23 +140,27 @@ InDist InChannel::input_dist(const PlanInput &input) {
   fwd.offset_per_bucket = bwd.offset_per_bucket = bucketized.offset_per_bucket;
   fwd.inv = bwd.inv = bucketized.inv;
   fwd.fanout = bwd.fanout = fanout;
-  // The node: every rank's counts (and the node barrier), the layout of the
-  // node's keys, and this rank's keys pushed to their targets.
-  const auto [totals, before, mine] = node_count_exchange(
-      node_count_vector(bucketized.offset_per_bucket_feature, topo, num_features));
-  const NodeLayout node =
-      node_layout(NodeCounts{totals, before, mine}, bucketized.offset_per_bucket_feature,
-                  bucketized.offset_per_bucket, topo, num_features, lookup_keys, remote_keys);
-  node_key_push(bucketized.keys, bucketized.key_weights, bucketized.bucket_feature_of_row,
-                node.destination_base, node.rows_to_push);
+  // The node: every rank's offsets (and the node barrier), and the layout of the node's keys.
+  // Then this rank's keys go to their places in their targets' node_keys, and the node tells
+  // that they are there. src is allocated first: nothing allocates from node_exchange to
+  // node_done. node_done runs in every call, also with no rows and under skip: its tell also
+  // says that this rank's node_exchange read node_offsets, so its peers may write them again.
+  const int64_t rows = bucketized.inv.numel();
+  at::Tensor src;  // one node: each row's place in its owner's KJT
+  if (num_nodes == 1) src = at::empty({rows}, bucketized.inv.options());
+  const NodeLayout node = node_exchange(bucketized, g_read_delay_ns);
+  if (rows > 0) node_key_push(bucketized, input.weights, node, src);
   node_done();
+  if (g_read_delay_ns > 0) {  // the test hook (delay_node_reads)
+    delay_kernel<<<1, 1, 0, current_stream()>>>((uint64_t)g_read_delay_ns);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+  }
   at::Tensor peer_needs, num_recv, length_per_key, occurrences;
   if (num_nodes == 1) {
     // The own part of node_keys is the owner's KJT, and a row's place in its
     // owner's KJT is where it was pushed.
     const OneNodeOwner owner =
-        one_node_owner(node, bucketized.bucket_feature_of_row, own_node_keys_,
-                       own_node_key_weights_, topo, num_features);
+        one_node_owner(node, own_node_keys_, own_node_key_weights_, src, topo);
     fwd.src = bwd.dst = owner.src;
     dist.kjt_values = owner.kjt_values;
     dist.kjt_weights = owner.kjt_weights;

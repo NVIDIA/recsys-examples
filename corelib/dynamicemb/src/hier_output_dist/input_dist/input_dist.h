@@ -72,18 +72,16 @@ class InChannel {
   // The comm kernels (comm_kernels.cu), at the current call's sequence
   // number (seq_), on the current stream; each allocates its outputs there.
 
-  // The node barrier, and the node's count vectors (int64): their sum over
-  // the node and over the ranks before this one ([my_counts.numel()] each),
-  // and each requester's counts for this rank ([local_size][num_features +
-  // 1]), as planner.h's NodeCounts.
-  std::tuple<at::Tensor, at::Tensor, at::Tensor> node_count_exchange(
-      const at::Tensor &my_counts) const;
-  // This rank's first *rows_to_push bucketized rows (keys, weights or
-  // undefined, bucket_feature_of_row) into its targets' node_keys at
-  // destination_base[bucket_feature] + row.
-  void node_key_push(const at::Tensor &keys, const at::Tensor &weights,
-                     const at::Tensor &bucket_feature_of_row, const at::Tensor &destination_base,
-                     const at::Tensor &rows_to_push) const;
+  // This rank's offsets into node_offsets at each node peer, the node barrier, and the layout of
+  // the node's keys from the node's offsets. The call takes its sequence number (seq_) here, once
+  // the kernel is launched: a call that raises before that takes none. delay_ns: the test hook's
+  // wait between the barrier and the layout (delay_node_reads).
+  NodeLayout node_exchange(const BucketizedKeys &bucketized, int64_t delay_ns);
+  // The bucketize's gather: this rank's valid bucketized rows into their places in their
+  // targets' node_keys, over NVLink (none under skip). With src (one node, int32 [rows]) also
+  // each row's place in its owner's KJT.
+  void node_key_push(const BucketizedKeys &bucketized, const c10::optional<at::Tensor> &weights,
+                     const NodeLayout &node, const at::Tensor &src) const;
   // Tells the node this rank's keys are pushed, and waits until every
   // requester of the node told it.
   void node_done() const;
@@ -131,6 +129,12 @@ class InChannel {
   at::Tensor tables_, other_nodes_;
   PeerWords header_gather_;
 };
+
+// A test hook (testing.cu): each later input dist of this process waits `ns` on the GPU twice (0:
+// no wait): in node_exchange between the node barrier and the read of node_offsets, and between
+// node_done and the first read of node_keys. It makes a rank read the node's offsets and keys
+// late.
+void delay_node_reads(int64_t ns);
 
 }  // namespace hier_output_dist
 }  // namespace dyn_emb

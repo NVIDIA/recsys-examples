@@ -22,6 +22,7 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 #include <cstdint>
 #include <type_traits>
 
+#include "hier_output_dist/input_dist/node.cuh"
 #include "hier_output_dist/input_dist/planner.cuh"
 #include "hier_output_dist/input_dist/planner.h"
 #include "murmur_hash.cuh"
@@ -190,16 +191,15 @@ __global__ void __launch_bounds__(kThreads)
   }
 }
 
-// A thread per position of the keys sorted by bucket feature: the key there as
-// its owner stores it, and its weight.
+// A thread per position of the keys sorted by bucket feature (gather_rows,
+// node.cuh): the key there as its owner stores it, and its weight
+// (key_weights nullptr: none).
 __global__ void __launch_bounds__(kThreads)
-    gather_keys_kernel(const int32_t *inv, int64_t num_keys, const int64_t *stored,
-                       const float *weights, int64_t *keys, float *key_weights) {
-  for (int64_t position = first_item(); position < num_keys; position += item_stride()) {
-    const int32_t key = inv[position];
-    keys[position] = stored[key];
-    if (weights != nullptr) key_weights[position] = weights[key];
-  }
+    gather_keys_kernel(GatherRows rows, int64_t num_keys, int64_t *keys, float *key_weights) {
+  gather_rows(rows, num_keys, [&](int64_t row, int64_t key, float weight) {
+    keys[row] = key;
+    if (key_weights != nullptr) key_weights[row] = weight;
+  });
 }
 
 // ── index dedup's fan-out ──
@@ -276,11 +276,10 @@ bool is_index_dtype(const at::Tensor &tensor) {
 
 }  // namespace
 
-BucketizedKeys bucketize_keys(const PlanInput &input, const OwnerRules &rules, int64_t world_size) {
+void check_bucketize_input(const PlanInput &input, const OwnerRules &rules, int64_t world_size) {
   const at::Tensor &values = input.values;
   const int64_t num_keys = values.numel(), batch = input.batch_size,
                 num_features = rules.dist_types.numel();
-  const int64_t bucket_features = world_size * num_features;
   TORCH_CHECK(num_features >= 1 && world_size >= 1 && rules.block_sizes.numel() == num_features,
               "hier_output_dist: a rule and a block size per feature, and some owners");
   TORCH_CHECK(on_gpu_of(rules.dist_types, values) && rules.dist_types.scalar_type() == at::kInt &&
@@ -308,6 +307,22 @@ BucketizedKeys bucketize_keys(const PlanInput &input, const OwnerRules &rules, i
                                              input.weights->scalar_type() == at::kFloat &&
                                              input.weights->numel() == num_keys),
               "hier_output_dist: weights must be contiguous fp32, one per key");
+}
+
+void check_fanout_input(const at::Tensor &reverse_indices) {
+  // Original rows are int32 (exp_idx).
+  TORCH_CHECK(reverse_indices.is_cuda() && reverse_indices.is_contiguous() &&
+                  reverse_indices.scalar_type() == at::kLong && reverse_indices.numel() < INT32_MAX,
+              "hier_output_dist: reverse indices must be contiguous int64 on the GPU, fewer "
+              "than 2^31");
+}
+
+BucketizedKeys bucketize_rows(const PlanInput &input, const OwnerRules &rules, int64_t world_size) {
+  check_bucketize_input(input, rules, world_size);
+  const at::Tensor &values = input.values;
+  const int64_t num_keys = values.numel(), batch = input.batch_size,
+                num_features = rules.dist_types.numel();
+  const int64_t bucket_features = world_size * num_features;
   const auto long_options = values.options().dtype(at::kLong);
   const auto int_options = values.options().dtype(at::kInt);
   const cudaStream_t stream = current_stream();
@@ -352,33 +367,42 @@ BucketizedKeys bucketize_keys(const PlanInput &input, const OwnerRules &rules, i
   }
   std::tie(bucketized.bucket_feature_of_row, bucketized.inv) =
       sort_pairs(bucket_feature, index, bits_for(bucket_features + 1));
-  bucketized.keys = at::empty({num_keys}, long_options);
-  if (input.weights.has_value())
-    bucketized.key_weights = at::empty({num_keys}, values.options().dtype(at::kFloat));
-  if (num_keys > 0) {
-    gather_keys_kernel<<<item_grid(num_keys), kThreads, 0, stream>>>(
-        bucketized.inv.data_ptr<int32_t>(), num_keys, stored.data_ptr<int64_t>(),
-        input.weights.has_value() ? input.weights->data_ptr<float>() : nullptr,
-        bucketized.keys.data_ptr<int64_t>(), data_or_null<float>(bucketized.key_weights));
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
-  }
   // where each bucket feature, and each bucket (owner), starts
   bucketized.offset_per_bucket_feature = at::empty({bucket_features + 1}, long_options);
   bucketized.offset_per_bucket = at::empty({world_size + 1}, long_options);
   run_starts<int32_t, int64_t>(bucketized.bucket_feature_of_row, bucket_features,
                                bucketized.offset_per_bucket_feature, num_features,
                                bucketized.offset_per_bucket);
+  // the keys as their owners store them stay in the KJT's order: the push
+  // gathers them (bucketize_keys here)
+  bucketized.stored = stored;
+  return bucketized;
+}
+
+BucketizedKeys bucketize_keys(const PlanInput &input, const OwnerRules &rules, int64_t world_size) {
+  BucketizedKeys bucketized = bucketize_rows(input, rules, world_size);
+  const at::Tensor &values = input.values;
+  const int64_t num_keys = values.numel();
+  // the keys (and weights) gathered into bucketized order
+  bucketized.keys = at::empty({num_keys}, values.options().dtype(at::kLong));
+  if (input.weights.has_value())
+    bucketized.key_weights = at::empty({num_keys}, values.options().dtype(at::kFloat));
+  if (num_keys > 0) {
+    const GatherRows rows{bucketized.inv.data_ptr<int32_t>(), bucketized.stored.data_ptr<int64_t>(),
+                          input.weights.has_value() ? input.weights->data_ptr<float>() : nullptr};
+    gather_keys_kernel<<<item_grid(num_keys), kThreads, 0, current_stream()>>>(
+        rows, num_keys, bucketized.keys.data_ptr<int64_t>(),
+        data_or_null<float>(bucketized.key_weights));
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+  }
   return bucketized;
 }
 
 FanoutTables fanout_tables(const at::Tensor &reverse_indices, const at::Tensor &inv) {
   const int64_t rows = inv.numel(), originals = reverse_indices.numel();
   // Original and deduplicated rows are int32 (exp_idx, exp_off).
-  TORCH_CHECK(reverse_indices.is_cuda() && reverse_indices.is_contiguous() &&
-                  reverse_indices.scalar_type() == at::kLong && inv.scalar_type() == at::kInt &&
-                  originals < INT32_MAX,
-              "hier_output_dist: reverse indices must be contiguous int64 on the GPU, fewer "
-              "than 2^31, and inv int32");
+  check_fanout_input(reverse_indices);
+  TORCH_CHECK(inv.scalar_type() == at::kInt, "hier_output_dist: inv must be int32");
   const int64_t max_slots = originals / (kHeavy + 1) + 1, max_subs = 2 * originals / kHeavy + 2;
   const auto long_options = inv.options().dtype(at::kLong);
   const auto int_options = inv.options().dtype(at::kInt);

@@ -15,9 +15,9 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 # limitations under the License.
 ******************************************************************************/
 // The op's window and its sections: the control words (CtrlLayout) with
-// the formats of the count vector and the count message, the in channel's
-// data (KeysLayout) with the proxy header and remote_map, the out channel's
-// data (RowsLayout), and the window (WindowLayout).
+// the format of the count message, the in channel's data (KeysLayout) with
+// the proxy header and remote_map, the out channel's data (RowsLayout), and
+// the window (WindowLayout).
 #pragma once
 
 #include <cuda_runtime.h>
@@ -32,22 +32,8 @@ namespace dyn_emb {
 namespace hier_output_dist {
 
 // The ctrl section of the window (CtrlLayout): the control words of both
-// channels and the device state they keep across calls, and the formats of
-// two messages that live there, the count vector and the count message.
-
-// A rank's count vector (int64 words, planner.h): the keys it pushes each
-// GPU of its node, for their remote parts, then for each feature of their
-// own parts.
-struct CountVector {
-  int64_t local_size, num_features;
-  __host__ __device__ int64_t words() const { return local_size * (num_features + 1); }
-  // Its keys for the remote part of node peer `target`.
-  __host__ __device__ int64_t remote(int64_t target) const { return target; }
-  // Its keys of `feature` for the own part of node peer `target`.
-  __host__ __device__ int64_t own(int64_t target, int64_t feature) const {
-    return local_size + target * num_features + feature;
-  }
-};
+// channels and the device state they keep across calls, and the format of a
+// message that lives there, the count message.
 
 // A count message (int64 words, planner.h), all a rail peer needs to lay
 // out the keys its rail puts: a common part, the same for every peer (its
@@ -82,10 +68,10 @@ struct CountMessage {
 // The ctrl section (uint64 words): every control word of both channels and the device state they
 // keep across calls. Its size depends only on local_size, num_nodes, num_features and the most
 // chunks of a stream. Every control word is tagged with its channel's sequence number, is a running
-// total, or is back at its start value when the kernel that uses it ends. The data words (the count
-// vectors, requester_offsets, the needs, the count messages) are written whole in each call, before
-// a tagged word, the node barrier or a signal publishes them. So none is ever reset, and a call
-// that overflowed leaves all of them valid for the next. Words marked (local) are only this rank's:
+// total, or is back at its start value when the kernel that uses it ends. The data words
+// (requester_offsets, the needs, the count messages) are written whole in each call, before a flag
+// (in_done) or a signal publishes them. So none is ever reset, and a call that overflowed leaves
+// all of them valid for the next. Words marked (local) are only this rank's:
 // a GIN warp's place with each peer, which it sets when it starts. Words marked (num_nodes > 1)
 // exist across nodes only. Each accessor returns the address of a word, or of the first of an array
 // of them, in the copy at `base`.
@@ -96,7 +82,6 @@ class CtrlLayout {
         num_nodes_(sizes.topo.num_nodes),
         num_features_(sizes.num_features),
         counters_(sizes.counters()),
-        count_{sizes.topo.local_size, sizes.num_features},
         message_{sizes.topo.num_nodes, sizes.num_features} {
     const int64_t local_size = sizes.topo.local_size, num_nodes = num_nodes_;
     const bool multi = num_nodes > 1;
@@ -107,7 +92,6 @@ class CtrlLayout {
       return at;
     };
     in_started_ = take(1);
-    count_vectors_ = take(2 * count_.words());
     in_written_ = take(local_size);
     requester_offsets_ = take(multi ? local_size * num_features_ : 0);
     in_done_ = take(multi ? 1 + kNumNeeds : 0);
@@ -138,13 +122,12 @@ class CtrlLayout {
   __host__ __device__ uint64_t bytes() const { return 8 * (uint64_t)words_; }
 
   // ── the in channel ──
-  // in_seq of this rank's current node_count_exchange (its node barrier)
+  // in_seq of this rank's current node_exchange (its node barrier). It holds the call once this
+  // rank's offsets of the call are in node_offsets at every node peer.
   __host__ __device__ uint64_t *in_started() const { return word(in_started_); }
-  // This rank's count vector (CountVector) in call in_seq, by its parity.
-  __host__ __device__ int64_t *count_vector(int64_t in_seq) const {
-    return (int64_t *)word(count_vectors_ + (in_seq & 1) * count_.words());
-  }
-  // [local_size] in_seq whose keys each requester pushed into node_keys
+  // [local_size] in_seq whose keys each requester pushed into node_keys here. The tell also says
+  // that the requester's node_exchange read its node_offsets, so this rank may write its row
+  // there again in the next call. node_done tells in every call, also with no rows and under skip.
   __host__ __device__ uint64_t *in_written() const { return word(in_written_); }
   // (num_nodes > 1) [num_features] where the keys of each feature of a
   // same-node requester start in this rank's KJT
@@ -239,10 +222,8 @@ class CtrlLayout {
 
   uint64_t *base_;
   int64_t num_nodes_, num_features_, counters_;
-  CountVector count_;
   CountMessage message_;
-  int64_t in_started_, count_vectors_, in_written_, requester_offsets_, in_done_, count_msg_out_,
-      count_msgs_;
+  int64_t in_started_, in_written_, requester_offsets_, in_done_, count_msg_out_, count_msgs_;
   int64_t out_started_, pushed_, pulled_, arrive_, tasks_, landed_rows_, fwd_tot_, bwd_tot_,
       grant_sent_, bwd_ready_sent_, put_at_, landed_, pulled_rows_, pushed_rows_, posted_,
       slot_free_;
@@ -353,6 +334,9 @@ __host__ __device__ constexpr int gather_words(GatherFrom from) {
 
 // The keys section, its buffers in this order (those marked num_nodes > 1
 // exist across nodes only):
+//   node_offsets  int64 [local_size][world_size * num_features + 1]: row r is the
+//                 offset_per_bucket_feature of the node's requester r in the call, which it
+//                 pushed here (node_exchange)
 //   node_keys     the keys this rank's node pushed to it (node_key_push):
 //                 its own part at [0, lookup_keys), the keys of its node for
 //                 it as owner, in its KJT's order ([feature][requester]
@@ -389,6 +373,7 @@ class KeysLayout {
         num_nodes_(sizes.topo.num_nodes),
         local_size_(sizes.topo.local_size),
         num_features_(sizes.num_features),
+        offset_words_((int64_t)sizes.topo.world_size * sizes.num_features + 1),
         lookup_keys_(sizes.lookup_keys),
         remote_keys_(sizes.remote_keys),
         max_chunks_(sizes.max_chunks) {
@@ -400,6 +385,7 @@ class KeysLayout {
       next += buffer_end(bytes);
       return at;
     };
+    node_offsets_ = take(8 * (uint64_t)(local_size_ * offset_words_));
     node_keys_ = take(8 * entries);
     node_key_weights_ = take(sizes.weights ? 4 * entries : 0);
     node_bucket_feature_of_row_ = take(multi ? 4 * (uint64_t)remote_keys_ : 0);
@@ -418,7 +404,8 @@ class KeysLayout {
   __host__ __device__ uint64_t bytes() const { return bytes_; }
   // Each buffer's name and the bytes it takes (HierOutputDist::memory).
   std::vector<std::pair<const char *, uint64_t>> buffers() const {
-    return {{"node_keys", node_key_weights_ - node_keys_},
+    return {{"node_offsets", node_keys_ - node_offsets_},
+            {"node_keys", node_key_weights_ - node_keys_},
             {"node_key_weights", node_bucket_feature_of_row_ - node_key_weights_},
             {"node_bucket_feature_of_row", remote_map_ - node_bucket_feature_of_row_},
             {"remote_map", proxy_header_ - remote_map_},
@@ -429,6 +416,11 @@ class KeysLayout {
             {"owner_offsets", bytes_ - owner_offsets_}};
   }
 
+  // The words of a row of node_offsets, and requester `requester`'s row.
+  __host__ __device__ int64_t offset_words() const { return offset_words_; }
+  __host__ __device__ int64_t *node_offsets(int64_t requester) const {
+    return (int64_t *)(base_ + node_offsets_) + requester * offset_words_;
+  }
   // node_keys and node_key_weights, [lookup_keys + remote_keys]
   __host__ __device__ int64_t *node_keys() const { return (int64_t *)(base_ + node_keys_); }
   __host__ __device__ float *node_key_weights() const {
@@ -460,9 +452,10 @@ class KeysLayout {
 
  private:
   char *base_;
-  int64_t num_nodes_, local_size_, num_features_, lookup_keys_, remote_keys_, max_chunks_;
-  uint64_t node_keys_, node_key_weights_, node_bucket_feature_of_row_, remote_map_, proxy_header_,
-      key_stage_, rail_keys_, source_offsets_, owner_offsets_, bytes_;
+  int64_t num_nodes_, local_size_, num_features_, offset_words_, lookup_keys_, remote_keys_,
+      max_chunks_;
+  uint64_t node_offsets_, node_keys_, node_key_weights_, node_bucket_feature_of_row_, remote_map_,
+      proxy_header_, key_stage_, rail_keys_, source_offsets_, owner_offsets_, bytes_;
   uint64_t key_stage_bytes_, rail_keys_bytes_;
 };
 
