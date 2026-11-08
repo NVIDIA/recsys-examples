@@ -43,12 +43,15 @@ SIM = H.SIM
 
 class Source:
     """slime RolloutDataSourceWithBuffer, reduced: one prompt per group, requeue buffer popped first, cursor fields
-    and state_dict / load_state_dict / register_consumer as in slime/data/data_source.py."""
+    and state_dict / load_state_dict / register_consumer as in slime/data/data_source.py.
+    """
 
     def __init__(self, args, n_prompts=100000):
         self.args = args
         self.consumers, self._restored_consumers = {}, {}
-        self.epoch_id = self.sample_group_index = self.sample_index = self.sample_offset = 0
+        self.epoch_id = (
+            self.sample_group_index
+        ) = self.sample_index = self.sample_offset = 0
         self.metadata, self.buffer = {}, []
         prompts = []
         for i in range(n_prompts):
@@ -85,9 +88,21 @@ class Source:
     def state_dict(self):
         paused = [(c, c.pause()) for c in self.consumers.values()]
         try:
-            st = {k: copy.deepcopy(getattr(self, k)) for k in
-                  ("sample_offset", "epoch_id", "sample_group_index", "sample_index", "metadata", "buffer")}
-            st["consumers"] = {**self._restored_consumers, **{n: c.state_dict() for n, c in self.consumers.items()}}
+            st = {
+                k: copy.deepcopy(getattr(self, k))
+                for k in (
+                    "sample_offset",
+                    "epoch_id",
+                    "sample_group_index",
+                    "sample_index",
+                    "metadata",
+                    "buffer",
+                )
+            }
+            st["consumers"] = {
+                **self._restored_consumers,
+                **{n: c.state_dict() for n, c in self.consumers.items()},
+            }
             return st
         finally:
             for c, was in paused:
@@ -114,8 +129,14 @@ async def _gen(args, group, sampling_params=None, evaluation=False):
 def _env(S, log_dir, extra=None):
     for k in [k for k in os.environ if k.startswith("ASRT_")]:
         os.environ.pop(k)
-    os.environ.update({"ASRT_ADMIT": "profile", "ASRT_MAX_STALENESS": str(S), "ASRT_LOG_DIR": log_dir,
-                       "ASRT_TICKET_POLL": "0"})
+    os.environ.update(
+        {
+            "ASRT_ADMIT": "profile",
+            "ASRT_MAX_STALENESS": str(S),
+            "ASRT_LOG_DIR": log_dir,
+            "ASRT_TICKET_POLL": "0",
+        }
+    )
     os.environ.update(extra or {})
 
 
@@ -124,17 +145,34 @@ def _process(B, n, conc, steps):
     far = H._stub_slime()
     sys.modules["slime.rollout.sglang_rollout"].generate_and_rm_group = _gen
     far.generate_and_rm_group = _gen
-    for k in [k for k in sys.modules if k.startswith("ai_search_plugin.adapters.slime_admit")]:
+    for k in [
+        k for k in sys.modules if k.startswith("ai_search_plugin.adapters.slime_admit")
+    ]:
         del sys.modules[k]
     Mgr = H.make_manager_class(0.0)
-    args = SimpleNamespace(rollout_batch_size=B, n_samples_per_prompt=n, sglang_server_concurrency=conc, engines=1,
-                           fully_async_group_prefetch_factor=1, rollout_data_transport="ray",
-                           dynamic_sampling_filter_path=None, rollout_sample_filter_path=None, eval_interval=None,
-                           save_interval=None, num_rollout=steps, offload_rollout=False, colocate=False,
-                           debug_rollout_only=False, rollout_shuffle=False)
-    mgr = Mgr(args, "ai_search_plugin.adapters.slime_admit.generate_rollout_fully_async")
+    args = SimpleNamespace(
+        rollout_batch_size=B,
+        n_samples_per_prompt=n,
+        sglang_server_concurrency=conc,
+        engines=1,
+        fully_async_group_prefetch_factor=1,
+        rollout_data_transport="ray",
+        dynamic_sampling_filter_path=None,
+        rollout_sample_filter_path=None,
+        eval_interval=None,
+        save_interval=None,
+        num_rollout=steps,
+        offload_rollout=False,
+        colocate=False,
+        debug_rollout_only=False,
+        rollout_shuffle=False,
+    )
+    mgr = Mgr(
+        args, "ai_search_plugin.adapters.slime_admit.generate_rollout_fully_async"
+    )
     mgr.data_source = Source(args)
     import ai_search_plugin.adapters.slime_admit as sa
+
     return mgr, sa, far
 
 
@@ -144,9 +182,11 @@ def _step(mgr, i, train_s, out, save=None):
     out.append(o)
     time.sleep(train_s)
     if save is not None:
-        save.append(pickle.dumps(mgr.data_source.state_dict()))   # = torch.save(global_dataset_state_dict_i.pt)
+        save.append(
+            pickle.dumps(mgr.data_source.state_dict())
+        )  # = torch.save(global_dataset_state_dict_i.pt)
     was = mgr.pause_rollout_admission()
-    SIM.epoch += 1          # flush-cache-interval 1: abort every in-flight request
+    SIM.epoch += 1  # flush-cache-interval 1: abort every in-flight request
     SIM.version += 1
     time.sleep(0.01)
     mgr.resume_rollout_admission(was)
@@ -173,13 +213,31 @@ def _outstanding(sa, mgr):
     return gis
 
 
-def run_resume(B=8, n=2, conc=40, s=3, overrun=2, N=8, S=2, train_s=0.08, version_reset=False, no_book=False,
-               seed=0):
+def run_resume(
+    B=8,
+    n=2,
+    conc=40,
+    s=3,
+    overrun=2,
+    N=8,
+    S=2,
+    train_s=0.08,
+    version_reset=False,
+    no_book=False,
+    seed=0,
+):
     """no_book: strip the asrt book from the saved worker state (what plain slime saves)."""
     random.seed(seed)
-    SIM.version, SIM.epoch, SIM.gen_s, SIM.flush1, SIM.slow, SIM.slow_s = 0, 0, (0.01, 0.05), True, set(), 0.0
+    SIM.version, SIM.epoch, SIM.gen_s, SIM.flush1, SIM.slow, SIM.slow_s = (
+        0,
+        0,
+        (0.01, 0.05),
+        True,
+        set(),
+        0.0,
+    )
     SIM.slow = {i for i in range(200) if i % 7 == 3}
-    SIM.slow_s = 0.25            # stragglers: DEFER moves them across tickets, so buf holds several tickets
+    SIM.slow_s = 0.25  # stragglers: DEFER moves them across tickets, so buf holds several tickets
     dA, dB = tempfile.mkdtemp(prefix="resA"), tempfile.mkdtemp(prefix="resB")
     # ---------------------------------------------------------------- segment A
     _env(S, dA)
@@ -188,19 +246,23 @@ def run_resume(B=8, n=2, conc=40, s=3, overrun=2, N=8, S=2, train_s=0.08, versio
     for i in range(s + 1 + overrun):
         _step(mgr, i, train_s, outA, save=saved if i == s else None)
         if i == s:
-            v_at_save = SIM.version   # after the update that follows the save (B's engines start here)
+            v_at_save = (
+                SIM.version
+            )  # after the update that follows the save (B's engines start here)
             stA = pickle.loads(saved[0])
-            readyA = {g[0].group_index: [getattr(x, "reward", None) for x in g]
-                      for _, g in stA["consumers"]["fully_async"]["ready"]}
+            readyA = {
+                g[0].group_index: [getattr(x, "reward", None) for x in g]
+                for _, g in stA["consumers"]["fully_async"]["ready"]
+            }
             cursorA = stA["sample_group_index"]
             requeuedA = {g[0].group_index for g in stA["buffer"]}
     mgr.data_source.consumers["fully_async"].close()
     staleA = [r for r in _recs(dA) if r.get("event") == "staleness"]
     state = pickle.loads(saved[0])
-    if no_book:   # slime's queue only, the ticket buffer and the book missing
+    if no_book:  # slime's queue only, the ticket buffer and the book missing
         w = state["consumers"]["fully_async"]
         book = w.pop("asrt")
-        w["ready"] = w["ready"][book["buf_saved"]:]
+        w["ready"] = w["ready"][book["buf_saved"] :]
     # ---------------------------------------------------------------- segment B (new process)
     _env(S, dB)
     SIM.version = 1 if version_reset else v_at_save
@@ -214,39 +276,66 @@ def run_resume(B=8, n=2, conc=40, s=3, overrun=2, N=8, S=2, train_s=0.08, versio
     cursorB = mgr.data_source.sample_group_index
     mgr.data_source.consumers["fully_async"].close()
     recsB = _recs(dB)
-    handed = [g for o in outA[:s + 1] for g in o["groups"]] + [g for o in outB for g in o["groups"]]
-    return SimpleNamespace(outA=outA, outB=outB, handed=handed, left=left, cursorA=cursorA, cursorB=cursorB, tk=tk,
-                           readyA=readyA, requeuedA=requeuedA, staleA=staleA,
-                           staleB=[r for r in recsB if r.get("event") == "staleness"],
-                           ledgerB=[r for r in recsB if r.get("event") == "ticket_ledger"],
-                           resumeB=[r for r in recsB if r.get("event") == "resume"], B=B, s=s, S=S, sa=sa)
+    handed = [g for o in outA[: s + 1] for g in o["groups"]] + [
+        g for o in outB for g in o["groups"]
+    ]
+    return SimpleNamespace(
+        outA=outA,
+        outB=outB,
+        handed=handed,
+        left=left,
+        cursorA=cursorA,
+        cursorB=cursorB,
+        tk=tk,
+        readyA=readyA,
+        requeuedA=requeuedA,
+        staleA=staleA,
+        staleB=[r for r in recsB if r.get("event") == "staleness"],
+        ledgerB=[r for r in recsB if r.get("event") == "ticket_ledger"],
+        resumeB=[r for r in recsB if r.get("event") == "resume"],
+        B=B,
+        s=s,
+        S=S,
+        sa=sa,
+    )
 
 
 def _check_continuity(r):
-    assert len(r.handed) == len(set(r.handed)), "a group was handed out twice across the resume"
+    assert len(r.handed) == len(
+        set(r.handed)
+    ), "a group was handed out twice across the resume"
     assert all(len(o["groups"]) == r.B for o in r.outA + r.outB)
     have = set(r.handed) | r.left
     missing = sorted(set(range(r.cursorB)) - have)
-    assert not missing, (f"prompts drawn but never handed out nor outstanding (skipped across the resume): "
-                         f"{len(missing)} groups, e.g. {missing[:12]}")
+    assert not missing, (
+        f"prompts drawn but never handed out nor outstanding (skipped across the resume): "
+        f"{len(missing)} groups, e.g. {missing[:12]}"
+    )
     assert max(have) < r.cursorB
 
 
 def _check_ledger(r):
     bad = [x for x in r.ledgerB if not x.get("ok")]
     assert not bad, f"ticket ledger BAD after the resume: {bad[:2]}"
-    assert r.ledgerB and r.ledgerB[0]["batch"] == r.s + 1, \
-        f"batch counter restarted: first ledger batch {r.ledgerB[0]['batch'] if r.ledgerB else None} != {r.s + 1}"
+    assert (
+        r.ledgerB and r.ledgerB[0]["batch"] == r.s + 1
+    ), f"batch counter restarted: first ledger batch {r.ledgerB[0]['batch'] if r.ledgerB else None} != {r.s + 1}"
 
 
 def _check_versions(r):
     a = {x["rollout"]: x for x in r.staleA}
     b = {x["rollout"]: x for x in r.staleB}
     assert min(b) == r.s + 1, f"staleness log restarted its rollout count at {min(b)}"
-    for k in sorted(set(a) & set(b)):   # A's overrun rollouts vs B's same rollouts
-        assert a[k]["train_version"] == b[k]["train_version"], (k, a[k]["train_version"], b[k]["train_version"])
+    for k in sorted(set(a) & set(b)):  # A's overrun rollouts vs B's same rollouts
+        assert a[k]["train_version"] == b[k]["train_version"], (
+            k,
+            a[k]["train_version"],
+            b[k]["train_version"],
+        )
     tv = [b[k]["train_version"] for k in sorted(b)]
-    assert tv == list(range(tv[0], tv[0] + len(tv))), f"train versions not continuous: {tv}"
+    assert tv == list(
+        range(tv[0], tv[0] + len(tv))
+    ), f"train versions not continuous: {tv}"
     assert tv[0] == a[r.s]["train_version"] + 1, (tv[0], a[r.s]["train_version"])
     tm = [x["tok_max"] for x in r.staleB if x.get("tok_max") is not None]
     assert tm and max(tm) <= r.S, f"token-level staleness over {r.S}: {tm}"
@@ -260,16 +349,22 @@ def test_resume_book():
     # the same rollout s+1: same groups, and every group complete at the save keeps its result
     a1 = r.outA[r.s + 1]["groups"]
     b1 = r.outB[0]["groups"]
-    assert sorted(a1) == sorted(b1), f"rollout {r.s + 1}: A {sorted(a1)} vs B {sorted(b1)}"
+    assert sorted(a1) == sorted(
+        b1
+    ), f"rollout {r.s + 1}: A {sorted(a1)} vs B {sorted(b1)}"
     assert r.resumeB and r.resumeB[0]["mode"] == "book"
-    print(f"  book: rollout {r.s + 1} groups identical ({len(b1)}), handed {len(r.handed)} + outstanding "
-          f"{len(r.left)} = cursor {r.cursorB}; ledger {len(r.ledgerB)} OK; buf restored "
-          f"{r.resumeB[0].get('buffered_restored')}; tok_max {max(x['tok_max'] for x in r.staleB)}")
+    print(
+        f"  book: rollout {r.s + 1} groups identical ({len(b1)}), handed {len(r.handed)} + outstanding "
+        f"{len(r.left)} = cursor {r.cursorB}; ledger {len(r.ledgerB)} OK; buf restored "
+        f"{r.resumeB[0].get('buffered_restored')}; tok_max {max(x['tok_max'] for x in r.staleB)}"
+    )
 
 
 def test_resume_version_reset_flagged():
     r = run_resume(version_reset=True)
-    assert r.tk.resume_version_bad > 0, "a weight version that restarted after the resume went unnoticed"
+    assert (
+        r.tk.resume_version_bad > 0
+    ), "a weight version that restarted after the resume went unnoticed"
     assert any(not x.get("ok") for x in r.ledgerB)
 
 
@@ -290,7 +385,7 @@ def test_no_resume_state_is_slime_plus_book():
     st = mgr.data_source.state_dict()
     w = st["consumers"]["fully_async"]
     assert set(w) == {"ready", "asrt"} and w["asrt"]["mode"] == "ticket"
-    _step(mgr, 1, 0.05, out)   # the run goes on unchanged after a save
+    _step(mgr, 1, 0.05, out)  # the run goes on unchanged after a save
     mgr.data_source.consumers["fully_async"].close()
     assert [len(o["groups"]) for o in out] == [8, 8]
 
@@ -300,41 +395,62 @@ def test_resume_seed_version():
     import types
 
     from ai_search_plugin.adapters import slime_resume as R
+
     os.environ.pop("ASRT_RESUME_VERSION", None)
     ck = tempfile.mkdtemp(prefix="resck")
     os.makedirs(os.path.join(ck, "rollout"))
     for i in (1, 49):
-        open(os.path.join(ck, "rollout", f"global_dataset_state_dict_{i}.pt"), "w").close()
-    base = tempfile.mkdtemp(prefix="resbase")   # converted Megatron base checkpoint: no data-source state
+        open(
+            os.path.join(ck, "rollout", f"global_dataset_state_dict_{i}.pt"), "w"
+        ).close()
+    base = tempfile.mkdtemp(
+        prefix="resbase"
+    )  # converted Megatron base checkpoint: no data-source state
 
     def ns(**k):
-        d = dict(update_weight_start_version=0, start_rollout_id=None, finetune=False, load=ck)
+        d = dict(
+            update_weight_start_version=0,
+            start_rollout_id=None,
+            finetune=False,
+            load=ck,
+        )
         d.update(k)
         return SimpleNamespace(**d)
+
     a = ns()
     assert R.seed_version(a, 49) == 50 and a.update_weight_start_version == 50
     a = ns(start_rollout_id=0, finetune=True)
-    assert R.seed_version(a, 0) is None and a.update_weight_start_version == 0          # HF load (finetune)
+    assert (
+        R.seed_version(a, 0) is None and a.update_weight_start_version == 0
+    )  # HF load (finetune)
     a = ns(load=base)
-    assert R.seed_version(a, 0) is None and a.update_weight_start_version == 0          # Megatron base, iteration 0
+    assert (
+        R.seed_version(a, 0) is None and a.update_weight_start_version == 0
+    )  # Megatron base, iteration 0
     a = ns(update_weight_start_version=7)
-    assert R.seed_version(a, 49) is None and a.update_weight_start_version == 7         # straw already seeded
+    assert (
+        R.seed_version(a, 49) is None and a.update_weight_start_version == 7
+    )  # straw already seeded
     a = ns(update_weight_mode="full", update_weight_transport="disk")
-    assert R.seed_version(a, 49) is None                                                 # driver counts disk versions
+    assert R.seed_version(a, 49) is None  # driver counts disk versions
     # install on a fake actor module: create_weight_updater sees the seeded value
     key = "slime.backends.megatron_utils.actor"
     saved = sys.modules.get(key)
     mod = types.ModuleType(key)
     seen = {}
     mod.initialize_model_and_optimizer = lambda args, role: ("m", "o", "s", 1)
-    mod.create_weight_updater = lambda args, *x, **k: seen.setdefault("v", args.update_weight_start_version)
+    mod.create_weight_updater = lambda args, *x, **k: seen.setdefault(
+        "v", args.update_weight_start_version
+    )
     sys.modules[key] = mod
     try:
         assert R.install(None)
         a = ns()
         mod.initialize_model_and_optimizer(a, "actor")
         mod.create_weight_updater(a)
-        assert seen["v"] == 2, seen    # 929s: loaded rollout 1 -> start 2 -> first sync publishes 3 (segment a: 3)
+        assert (
+            seen["v"] == 2
+        ), seen  # 929s: loaded rollout 1 -> start 2 -> first sync publishes 3 (segment a: 3)
         os.environ["ASRT_RESUME_VERSION"] = "0"
         assert R.seed_version(ns(), 49) is None
     finally:
@@ -347,7 +463,11 @@ def test_resume_seed_version():
 
 if __name__ == "__main__":
     fails = 0
-    for name, fn in [(k, v) for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]:
+    for name, fn in [
+        (k, v)
+        for k, v in sorted(globals().items())
+        if k.startswith("test_") and callable(v)
+    ]:
         t0 = time.time()
         try:
             fn()

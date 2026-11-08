@@ -38,10 +38,12 @@ _state = {"tool": None, "patched": [], "gen": None, "calls": 0}
 
 
 def _no_cache():
-    """ final tool error documents are not cached (ASRT_TOOLCACHE_NOCACHE_RE; '' disables)."""
+    """final tool error documents are not cached (ASRT_TOOLCACHE_NOCACHE_RE; '' disables)."""
     import re
 
-    pat = os.environ.get("ASRT_TOOLCACHE_NOCACHE_RE", r"tool_error|[Ss]earch failed|service failed")
+    pat = os.environ.get(
+        "ASRT_TOOLCACHE_NOCACHE_RE", r"tool_error|[Ss]e(?:arch) failed|service failed"
+    )
     if not pat:
         return None
     rx = re.compile(pat)
@@ -58,10 +60,14 @@ def cached(fn, capacity: int = None, ttl_s: float = None):
     def tool_for(extra_key):
         t = inner.get(extra_key)
         if t is None:
+
             def call(q, _ek=extra_key):
                 a, kw = _ek_args.get(_ek, ((), {}))
                 return fn(q, *a, **kw)
-            t = inner[extra_key] = CachedTool(call, capacity=capacity, ttl_s=ttl_s, no_cache=_no_cache())
+
+            t = inner[extra_key] = CachedTool(
+                call, capacity=capacity, ttl_s=ttl_s, no_cache=_no_cache()
+            )
         return t
 
     _ek_args = {}
@@ -99,6 +105,7 @@ def _report(w):
     st = w.stats()
     if os.environ.get("ASRT_TOOL_HEDGE"):
         from .tool_hedge import stats as _hs
+
         st["hedge"] = _hs()
     print(f"[asrt] toolcache {st}", flush=True)
     d = os.environ.get("ASRT_LOG_DIR")
@@ -118,8 +125,15 @@ def _resolve(path):
 
 def install(targets=None) -> list:
     """Replace each ``module.attr`` target with one shared cached wrapper."""
-    targets = targets if targets is not None else [
-        t for t in os.environ.get("ASRT_TOOLCACHE_TARGETS", "").split(",") if t.strip()]
+    targets = (
+        targets
+        if targets is not None
+        else [
+            t
+            for t in os.environ.get("ASRT_TOOLCACHE_TARGETS", "").split(",")
+            if t.strip()
+        ]
+    )
     patched = []
     for t in targets:
         try:
@@ -133,13 +147,22 @@ def install(targets=None) -> list:
             patched.append(t)
             continue
         if _state["tool"] is None:
-            if os.environ.get("ASRT_TOOL_HEDGE"):  # hedged tool calls under the cache (ai_search_plugin.adapters.tool_hedge)
+            if os.environ.get(
+                "ASRT_TOOL_HEDGE"
+            ):  # hedged tool calls under the cache (ai_search_plugin.adapters.tool_hedge)
                 from .tool_hedge import allowed, describe, hedged
+
                 if allowed(t):  # read-only targets only (ASRT_TOOL_HEDGE_TARGETS)
                     cur = hedged(cur)
-                    print(f"[asrt] tool_hedge: {describe([x.strip() for x in targets if allowed(x.strip())])}", flush=True)
+                    print(
+                        f"[asrt] tool_hedge: {describe([x.strip() for x in targets if allowed(x.strip())])}",
+                        flush=True,
+                    )
                 else:
-                    print(f"[asrt] tool_hedge: {t} not in ASRT_TOOL_HEDGE_TARGETS, not hedged", flush=True)
+                    print(
+                        f"[asrt] tool_hedge: {t} not in ASRT_TOOL_HEDGE_TARGETS, not hedged",
+                        flush=True,
+                    )
             _state["tool"] = cached(cur)
         setattr(mod, attr, _state["tool"])
         patched.append(t)
@@ -152,12 +175,17 @@ async def generate(args, sample, sampling_params, *a, **kw):
     if _state["gen"] is None:
         target = os.environ.get("ASRT_TOOLCACHE_GENERATE", "").strip()
         if not target:
-            raise RuntimeError("ai_search_plugin toolcache: set ASRT_TOOLCACHE_GENERATE=<module.attr of your real "
-                               "slime generate function> (and ASRT_TOOLCACHE_TARGETS=<module.attr of the tool functions>)")
+            raise RuntimeError(
+                "ai_search_plugin toolcache: set ASRT_TOOLCACHE_GENERATE=<module.attr of your real "
+                "slime generate function> (and ASRT_TOOLCACHE_TARGETS=<module.attr of the tool functions>)"
+            )
         mod, attr = _resolve(target)
         install()
         _state["gen"] = getattr(mod, attr)
-        print(f"[asrt] toolcache: generate={target} patched={_state['patched']}", flush=True)
+        print(
+            f"[asrt] toolcache: generate={target} patched={_state['patched']}",
+            flush=True,
+        )
     return await _state["gen"](args, sample, sampling_params, *a, **kw)
 
 

@@ -26,8 +26,13 @@ def _hooks(call, preset=None):
     env["PYTHONPATH"] = PY
     if preset is not None:
         env["ASRT_SGL_HOOKS"] = preset
-    r = subprocess.run([sys.executable, "-c", CODE.format(call=call)], env=env, capture_output=True, text=True,
-                       timeout=120)
+    r = subprocess.run(
+        [sys.executable, "-c", CODE.format(call=call)],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
     line = [l for l in r.stdout.splitlines() if l.startswith("HOOKS=")]
     assert line, (r.returncode, r.stdout[-500:], r.stderr[-1500:])
     return {h for h in line[-1][6:].split(",") if h}
@@ -39,7 +44,9 @@ def test_sets():
         assert got == want, (name, got, want)
         got = _hooks(call, preset="nosync,fastload")
         assert got == want | {"nosync", "fastload"}, (name, got)
-        print(f"{name}: unset -> {sorted(want)}; preset nosync,fastload -> {sorted(got)}")
+        print(
+            f"{name}: unset -> {sorted(want)}; preset nosync,fastload -> {sorted(got)}"
+        )
 
 
 if __name__ == "__main__":

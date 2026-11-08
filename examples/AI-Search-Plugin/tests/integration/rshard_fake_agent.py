@@ -23,8 +23,12 @@ def serve(n_engines: int, base_port: int):
     """Run E engines on base_port+1.. and a router on base_port (round robin /generate, /workers)."""
     from aiohttp import ClientSession, web
 
-    stats = {"inflight": [0] * n_engines, "max_inflight": [0] * n_engines, "calls": [0] * n_engines,
-             "aborts": [0] * n_engines}
+    stats = {
+        "inflight": [0] * n_engines,
+        "max_inflight": [0] * n_engines,
+        "calls": [0] * n_engines,
+        "aborts": [0] * n_engines,
+    }
     seen = set()
 
     def engine_app(e):
@@ -33,35 +37,70 @@ def serve(n_engines: int, base_port: int):
             ids = body["input_ids"]
             n = int(body["sampling_params"]["max_new_tokens"])
             stats["inflight"][e] += 1
-            stats["max_inflight"][e] = max(stats["max_inflight"][e], stats["inflight"][e])
+            stats["max_inflight"][e] = max(
+                stats["max_inflight"][e], stats["inflight"][e]
+            )
             stats["calls"][e] += 1
             try:
                 await asyncio.sleep(random.uniform(0.005, 0.03))
             finally:
                 stats["inflight"][e] -= 1
-            key = int(hashlib.md5(f"{ids}|{n}".encode()).hexdigest()[:8], 16)  # unique per request content
-            if key % 11 == 0 and key not in seen:  # first attempt of some requests: aborted (weight-sync style)
+            key = int(
+                hashlib.md5(f"{ids}|{n}".encode()).hexdigest()[:8], 16
+            )  # unique per request content
+            if (
+                key % 11 == 0 and key not in seen
+            ):  # first attempt of some requests: aborted (weight-sync style)
                 seen.add(key)
                 stats["aborts"][e] += 1
-                return web.json_response({"text": "", "meta_info": {
-                    "output_token_logprobs": [], "finish_reason": {"type": "abort"}, "completion_tokens": 0,
-                    "prompt_tokens": len(ids), "cached_tokens": 0, "weight_version": "7", "e2e_latency": 0.0}})
+                return web.json_response(
+                    {
+                        "text": "",
+                        "meta_info": {
+                            "output_token_logprobs": [],
+                            "finish_reason": {"type": "abort"},
+                            "completion_tokens": 0,
+                            "prompt_tokens": len(ids),
+                            "cached_tokens": 0,
+                            "weight_version": "7",
+                            "e2e_latency": 0.0,
+                        },
+                    }
+                )
             t = _toks(ids, n)
             lp = [[-((x % 97) / 97.0), x, None] for x in t]
-            return web.json_response({"text": " ".join(map(str, t)), "meta_info": {
-                "output_token_logprobs": lp, "finish_reason": {"type": "length", "length": n},
-                "completion_tokens": n, "prompt_tokens": len(ids), "cached_tokens": 0, "weight_version": "7",
-                "e2e_latency": 0.01}})
+            return web.json_response(
+                {
+                    "text": " ".join(map(str, t)),
+                    "meta_info": {
+                        "output_token_logprobs": lp,
+                        "finish_reason": {"type": "length", "length": n},
+                        "completion_tokens": n,
+                        "prompt_tokens": len(ids),
+                        "cached_tokens": 0,
+                        "weight_version": "7",
+                        "e2e_latency": 0.01,
+                    },
+                }
+            )
 
         async def metrics(_):
-            return web.Response(text=f'sglang:num_running_reqs{{tp_rank="0"}} {stats["inflight"][e]}\n'
-                                     f'sglang:num_queue_reqs{{tp_rank="0"}} 0\n')
+            return web.Response(
+                text=f'sglang:num_running_reqs{{tp_rank="0"}} {stats["inflight"][e]}\n'
+                f'sglang:num_queue_reqs{{tp_rank="0"}} 0\n'
+            )
 
         async def st(_):
             return web.json_response({k: v[e] for k, v in stats.items()})
 
         app = web.Application(client_max_size=1 << 26)
-        app.add_routes([web.post("/generate", generate), web.get("/metrics", metrics), web.get("/stats", st)])
+        app.add_routes(
+            [
+                web.post("/generate", generate),
+                web.get("/metrics", metrics),
+                web.get("/stats", st),
+            ]
+        )
         return app
 
     rr = {"i": 0}
@@ -71,22 +110,41 @@ def serve(n_engines: int, base_port: int):
         e = rr["i"] % n_engines
         rr["i"] += 1
         async with ClientSession() as s:
-            async with s.post(f"http://127.0.0.1:{base_port + 1 + e}/generate", data=body,
-                              headers={"Content-Type": "application/json"}) as r:
-                return web.Response(body=await r.read(), content_type="application/json")
+            async with s.post(
+                f"http://127.0.0.1:{base_port + 1 + e}/generate",
+                data=body,
+                headers={"Content-Type": "application/json"},
+            ) as r:
+                return web.Response(
+                    body=await r.read(), content_type="application/json"
+                )
 
     async def rstats(_):
         return web.json_response({"router_generate": rr["i"]})
 
     async def workers(_):
-        return web.json_response({"workers": [{"id": str(e), "url": f"http://127.0.0.1:{base_port + 1 + e}"}
-                                              for e in range(n_engines)]})
+        return web.json_response(
+            {
+                "workers": [
+                    {"id": str(e), "url": f"http://127.0.0.1:{base_port + 1 + e}"}
+                    for e in range(n_engines)
+                ]
+            }
+        )
 
     async def main():
         runners = []
         router = web.Application(client_max_size=1 << 26)
-        router.add_routes([web.post("/generate", r_generate), web.get("/workers", workers), web.get("/rstats", rstats)])
-        for port, app in [(base_port, router)] + [(base_port + 1 + e, engine_app(e)) for e in range(n_engines)]:
+        router.add_routes(
+            [
+                web.post("/generate", r_generate),
+                web.get("/workers", workers),
+                web.get("/rstats", rstats),
+            ]
+        )
+        for port, app in [(base_port, router)] + [
+            (base_port + 1 + e, engine_app(e)) for e in range(n_engines)
+        ]:
             r = web.AppRunner(app)
             await r.setup()
             await web.TCPSite(r, "127.0.0.1", port).start()
@@ -110,14 +168,24 @@ async def generate(args, sample, sampling_params):
         sample.tokens = _prepare_prompt_ids(sample, state.tokenizer, state.processor)
     for turn in range(TURNS):
         sp = {**sampling_params, "max_new_tokens": 8 + (sample.index % 5) + 4 * turn}
-        out = await post(url, {"input_ids": sample.tokens, "sampling_params": sp, "return_logprob": True})
+        out = await post(
+            url,
+            {"input_ids": sample.tokens, "sampling_params": sp, "return_logprob": True},
+        )
         mi = out["meta_info"]
         if mi["finish_reason"]["type"] == "abort":
             sample.status = Sample.Status.ABORTED
             return sample
         toks = [x[1] for x in mi["output_token_logprobs"]]
         lps = [x[0] for x in mi["output_token_logprobs"]]
-        sample.append_response_tokens(args, tokens=toks, log_probs=lps, trainable=True, meta_info=mi, text=out["text"])
+        sample.append_response_tokens(
+            args,
+            tokens=toks,
+            log_probs=lps,
+            trainable=True,
+            meta_info=mi,
+            text=out["text"],
+        )
         if turn == TURNS - 1:
             break
         await asyncio.sleep(0.002)  # the "tool"

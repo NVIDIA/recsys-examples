@@ -33,7 +33,9 @@ VALIDATED_LAYOUTS = ((1, 1), (2, 2), (4, 3))
 
 def layout_status(pp: int, vpp: Optional[int]) -> str:
     """'validated' for a (PP, VPP) checked in the source, else 'guarded' (correctness relies on the runtime guard)."""
-    return "validated" if (int(pp or 1), int(vpp or 1)) in VALIDATED_LAYOUTS else "guarded"
+    return (
+        "validated" if (int(pp or 1), int(vpp or 1)) in VALIDATED_LAYOUTS else "guarded"
+    )
 
 
 # --------------------------------------------------------------------------------------------------- counting
@@ -64,52 +66,67 @@ def count_plan(lists: Sequence[Sequence], num_experts: int) -> np.ndarray:
     return out
 
 
-def local_expert_columns(glob: np.ndarray, local_expert_start: int, num_local_experts: int) -> np.ndarray:
+def local_expert_columns(
+    glob: np.ndarray, local_expert_start: int, num_local_experts: int
+) -> np.ndarray:
     """[..., E] -> [..., nle]: the columns of this rank's local experts (all a rank needs from the gathered counts)."""
-    return np.ascontiguousarray(glob[..., local_expert_start:local_expert_start + num_local_experts])
+    return np.ascontiguousarray(
+        glob[..., local_expert_start : local_expert_start + num_local_experts]
+    )
 
 
 # --------------------------------------------------------------------------------------------------- attributes
 @dataclass
 class Splits:
     """The dispatcher attributes ``preprocess`` sets (dropless alltoall path), all int64 on the host."""
-    input_splits: np.ndarray                       # [ep]   tokens this rank sends to each EP rank
-    output_splits: np.ndarray                      # [ep]   tokens this rank receives from each EP rank (own TP rank)
-    output_splits_tp: np.ndarray                   # [tp]   tokens received per TP rank (after the TP all-gather)
-    tokens_per_local_expert: np.ndarray            # [nle]  the return value of preprocess
+
+    input_splits: np.ndarray  # [ep]   tokens this rank sends to each EP rank
+    output_splits: np.ndarray  # [ep]   tokens this rank receives from each EP rank (own TP rank)
+    output_splits_tp: np.ndarray  # [tp]   tokens received per TP rank (after the TP all-gather)
+    tokens_per_local_expert: np.ndarray  # [nle]  the return value of preprocess
     num_global_tokens_per_local_expert: np.ndarray  # [tp*ep, nle] (only used by Megatron when nle > 1)
 
 
-def splits_from_counts(local_counts, glob_local, *, ep: int, tp: int, tp_rank: int,
-                       num_local_experts: int) -> Splits:
+def splits_from_counts(
+    local_counts, glob_local, *, ep: int, tp: int, tp_rank: int, num_local_experts: int
+) -> Splits:
     """Dispatcher attributes of one layer call from the plan.
 
     local_counts [E]        this rank's tokens per expert (its row of the gathered counts)
     glob_local   [tp*ep, nle] every tp x ep rank's tokens to THIS rank's local experts, in tp_ep-group rank order
                  (Megatron's tp_ep group is ep-major / tp-minor: group rank = ep_idx * tp + tp_idx)
-    Same arithmetic as ``MoEAlltoAllTokenDispatcher.preprocess`` after its all-gather."""
+    Same arithmetic as ``MoEAlltoAllTokenDispatcher.preprocess`` after its all-gather.
+    """
     nle = int(num_local_experts)
     local_counts = np.asarray(local_counts, dtype=np.int64).reshape(-1)
     glob_local = np.asarray(glob_local, dtype=np.int64)
     if local_counts.size != ep * nle:
-        raise ValueError(f"local counts have {local_counts.size} experts, expected ep*nle = {ep * nle}")
+        raise ValueError(
+            f"local counts have {local_counts.size} experts, expected ep*nle = {ep * nle}"
+        )
     if glob_local.shape != (ep * tp, nle):
-        raise ValueError(f"gathered counts {glob_local.shape}, expected {(ep * tp, nle)}")
+        raise ValueError(
+            f"gathered counts {glob_local.shape}, expected {(ep * tp, nle)}"
+        )
     input_splits = local_counts.reshape(ep, nle).sum(axis=1)
-    ngtle = glob_local.reshape(ep, tp, nle).transpose(1, 0, 2)          # [tp, ep, nle]
-    per_rank = ngtle.sum(axis=2)                                          # [tp, ep]
-    return Splits(input_splits=input_splits,
-                  output_splits=np.ascontiguousarray(per_rank[tp_rank]),
-                  output_splits_tp=per_rank.sum(axis=1),
-                  tokens_per_local_expert=ngtle.sum(axis=(0, 1)),
-                  num_global_tokens_per_local_expert=np.ascontiguousarray(ngtle).reshape(-1, nle))
+    ngtle = glob_local.reshape(ep, tp, nle).transpose(1, 0, 2)  # [tp, ep, nle]
+    per_rank = ngtle.sum(axis=2)  # [tp, ep]
+    return Splits(
+        input_splits=input_splits,
+        output_splits=np.ascontiguousarray(per_rank[tp_rank]),
+        output_splits_tp=per_rank.sum(axis=1),
+        tokens_per_local_expert=ngtle.sum(axis=(0, 1)),
+        num_global_tokens_per_local_expert=np.ascontiguousarray(ngtle).reshape(-1, nle),
+    )
 
 
 # --------------------------------------------------------------------------------------------------- cursor
 REPLAY_STAGES = ("replay_forward", "replay_backward")
 
 
-def replay_cursor(stage: Optional[str], forward_index: int, backward_index: int) -> Optional[int]:
+def replay_cursor(
+    stage: Optional[str], forward_index: int, backward_index: int
+) -> Optional[int]:
     """Micro-batch of the current layer call from slime's RoutingReplay counters.
 
     The router pops its replay entry right before the dispatcher runs, so the entry just used is index - 1 of the
@@ -128,7 +145,8 @@ def replay_cursor(stage: Optional[str], forward_index: int, backward_index: int)
 # --------------------------------------------------------------------------------------------------- eligibility
 def ineligible_reason(dispatcher) -> Optional[str]:
     """Why a dispatcher call cannot use the plan (None = it can).  Config-only, so the answer is the same on every rank
-    of the tp x ep group (a per-rank fallback would desynchronize the group's collectives)."""
+    of the tp x ep group (a per-rank fallback would desynchronize the group's collectives).
+    """
     cfg = getattr(dispatcher, "config", None)
     if getattr(dispatcher, "drop_and_pad", False):
         return "drop_and_pad"
@@ -141,7 +159,10 @@ def ineligible_reason(dispatcher) -> Optional[str]:
     cg = getattr(cfg, "cuda_graph_impl", "none")
     if cg not in (None, "none", False):
         return f"cuda graphs ({cg})"
-    if getattr(dispatcher, "cuda_dtoh_point", "before_permutation_1") != "before_permutation_1":
+    if (
+        getattr(dispatcher, "cuda_dtoh_point", "before_permutation_1")
+        != "before_permutation_1"
+    ):
         return "non-default dtoh point"
     return None
 
@@ -155,7 +176,9 @@ class StepGuard:
                   with the plan (the original values are used, so these steps are exact even if the plan is wrong)
     strict        raise on a mismatch instead of falling back
     On any mismatch (verify difference or device check of the actual routing vs the plan) the plan is switched off
-    for the rest of the run and every later call takes Megatron's original path; a warning names the step."""
+    for the rest of the run and every later call takes Megatron's original path; a warning names the step.
+    """
+
     verify_steps: int = 1
     strict: bool = False
     disabled: bool = False
@@ -167,21 +190,37 @@ class StepGuard:
     def verifying(self) -> bool:
         return not self.disabled and self.planned_steps < self.verify_steps
 
-    def end_step(self, *, mismatch: int, verify_fail: int, planned_calls: int, fallback_calls: int,
-                 built: bool) -> Dict:
+    def end_step(
+        self,
+        *,
+        mismatch: int,
+        verify_fail: int,
+        planned_calls: int,
+        fallback_calls: int,
+        built: bool,
+    ) -> Dict:
         """Close one step.  mismatch / verify_fail: group-wide counts (already reduced).  Returns the step record."""
         was_verifying = self.verifying()
-        rec = {"step": self.steps, "built": bool(built), "verify": bool(built and was_verifying),
-               "planned_calls": int(planned_calls), "fallback_calls": int(fallback_calls),
-               "mismatch": int(mismatch), "verify_fail": int(verify_fail), "disabled": self.disabled}
+        rec = {
+            "step": self.steps,
+            "built": bool(built),
+            "verify": bool(built and was_verifying),
+            "planned_calls": int(planned_calls),
+            "fallback_calls": int(fallback_calls),
+            "mismatch": int(mismatch),
+            "verify_fail": int(verify_fail),
+            "disabled": self.disabled,
+        }
         self.steps += 1
         if built:
             self.planned_steps += 1
         bad = int(mismatch) + int(verify_fail)
         if bad and not self.disabled:
-            what = (f"{verify_fail} verified calls differed from Megatron's preprocess (original values were used)"
-                    if verify_fail else
-                    f"{mismatch} layer calls routed differently from the plan (this step's MoE dispatch is suspect)")
+            what = (
+                f"{verify_fail} verified calls differed from Megatron's preprocess (original values were used)"
+                if verify_fail
+                else f"{mismatch} layer calls routed differently from the plan (this step's MoE dispatch is suspect)"
+            )
             self.disabled = True
             self.disabled_why = f"step {rec['step']}: {what}"
             rec["disabled"] = True

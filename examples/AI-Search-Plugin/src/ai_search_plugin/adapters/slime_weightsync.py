@@ -115,7 +115,9 @@ def _log(rec: dict):
         return
     try:
         os.makedirs(d, exist_ok=True)
-        with open(os.path.join(d, f"weightsync-rank{rec.get('rank', 0)}.jsonl"), "a") as f:
+        with open(
+            os.path.join(d, f"weightsync-rank{rec.get('rank', 0)}.jsonl"), "a"
+        ) as f:
             f.write(json.dumps(rec) + "\n")
     except OSError:
         pass
@@ -123,12 +125,15 @@ def _log(rec: dict):
 
 def _engine_info(actor):
     """Runs inside slime's SGLangEngine actor (``__ray_call__``): where its HTTP server listens."""
-    return (int(getattr(actor, "node_rank", 0) or 0), getattr(actor, "server_host", None),
-            getattr(actor, "server_port", None))
+    return (
+        int(getattr(actor, "node_rank", 0) or 0),
+        getattr(actor, "server_host", None),
+        getattr(actor, "server_port", None),
+    )
 
 
 class KVFreshError(RuntimeError):
-    """ an engine's prefix cache could not be flushed on a kvfresh sync (stale KV would survive)."""
+    """an engine's prefix cache could not be flushed on a kvfresh sync (stale KV would survive)."""
 
 
 def _kv_http(url, method, endpoint, payload=None, timeout=60.0):
@@ -138,12 +143,23 @@ def _kv_http(url, method, endpoint, payload=None, timeout=60.0):
     try:
         r = requests.request(method, f"{url}/{endpoint}", json=payload, timeout=timeout)
         return int(r.status_code), (r.text or "")[:300]
-    except Exception as e:  # connection refused / timeout: counted as a failed attempt, retried
+    except (
+        Exception
+    ) as e:  # connection refused / timeout: counted as a failed attempt, retried
         return -1, repr(e)[:300]
 
 
-def kv_flush_checked(urls, http=_kv_http, *, tries=None, base_s=None, cap_s=None, sleep=time.sleep, log=None):
-    """ flush every engine's prefix (radix) cache while it is paused with mode="retract" and check it.
+def kv_flush_checked(
+    urls,
+    http=_kv_http,
+    *,
+    tries=None,
+    base_s=None,
+    cap_s=None,
+    sleep=time.sleep,
+    log=None,
+):
+    """flush every engine's prefix (radix) cache while it is paused with mode="retract" and check it.
 
     SGLang's ``/flush_cache`` returns 200 only when ``Scheduler.flush_cache`` reset the tree (with the engine-side
     ``kvfresh`` hook: and the tree is empty afterwards); it returns 400 when the engine is not idle (a batch result
@@ -154,13 +170,28 @@ def kv_flush_checked(urls, http=_kv_http, *, tries=None, base_s=None, cap_s=None
     ``ASRT_WS_KV_FLUSH_CAP_S`` 2 s: worst case ~5 s).  Known non-drainable case (slime-cu130 SGLang): requests still
     in the grammar queue only move on during scheduling, which a paused engine never does -> all retries fail ->
     loud KVFreshError (structured-output workloads; none of ours).  ``urls``: per engine "http://host:port" or None (node_rank != 0,
-    skipped like slime's actor).  Returns {"attempts", "retries", "failed": {engine index: last message}}."""
-    tries = int(tries if tries is not None else os.environ.get("ASRT_WS_KV_FLUSH_TRIES", 8))
-    delay = float(base_s if base_s is not None else os.environ.get("ASRT_WS_KV_FLUSH_BASE_S", 0.05))
-    cap = float(cap_s if cap_s is not None else os.environ.get("ASRT_WS_KV_FLUSH_CAP_S", 2.0))
+    skipped like slime's actor).  Returns {"attempts", "retries", "failed": {engine index: last message}}.
+    """
+    tries = int(
+        tries if tries is not None else os.environ.get("ASRT_WS_KV_FLUSH_TRIES", 8)
+    )
+    delay = float(
+        base_s
+        if base_s is not None
+        else os.environ.get("ASRT_WS_KV_FLUSH_BASE_S", 0.05)
+    )
+    cap = float(
+        cap_s if cap_s is not None else os.environ.get("ASRT_WS_KV_FLUSH_CAP_S", 2.0)
+    )
     pending = [i for i, u in enumerate(urls) if u]
-    if not pending:  # nothing addressable = nothing verified: a failure, never a silent pass
-        return {"attempts": 0, "retries": 0, "failed": {-1: "no engine HTTP URL (all None)"}}
+    if (
+        not pending
+    ):  # nothing addressable = nothing verified: a failure, never a silent pass
+        return {
+            "attempts": 0,
+            "retries": 0,
+            "failed": {-1: "no engine HTTP URL (all None)"},
+        }
     last: Dict[int, str] = {}
     attempts = retries = 0
     while pending and attempts < max(1, tries):
@@ -169,7 +200,12 @@ def kv_flush_checked(urls, http=_kv_http, *, tries=None, base_s=None, cap_s=None
             from concurrent.futures import ThreadPoolExecutor
 
             with ThreadPoolExecutor(max_workers=len(pending)) as ex:
-                res = dict(zip(pending, ex.map(lambda i: http(urls[i], "GET", "flush_cache"), pending)))
+                res = dict(
+                    zip(
+                        pending,
+                        ex.map(lambda i: http(urls[i], "GET", "flush_cache"), pending),
+                    )
+                )
         else:
             res = {pending[0]: http(urls[pending[0]], "GET", "flush_cache")}
         failed = [i for i in pending if res[i][0] != 200]
@@ -180,25 +216,46 @@ def kv_flush_checked(urls, http=_kv_http, *, tries=None, base_s=None, cap_s=None
             break
         retries += 1
         if log is not None:
-            log(f"[asrt] kvfresh: flush_cache not done on engines {failed} (attempt {attempts}/{tries}: "
-                f"{[last[i] for i in failed]}); re-retract and retry in {delay:.2f} s")
+            log(
+                f"[asrt] kvfresh: flush_cache not done on engines {failed} (attempt {attempts}/{tries}: "
+                f"{[last[i] for i in failed]}); re-retract and retry in {delay:.2f} s"
+            )
         sleep(delay)
         delay = min(delay * 2, cap)
-        for i in failed:  # drain what kept the engine busy (overlap result, chunked prefill); paused engines only
+        for (
+            i
+        ) in (
+            failed
+        ):  # drain what kept the engine busy (overlap result, chunked prefill); paused engines only
             http(urls[i], "POST", "pause_generation", {"mode": "retract"})
-    return {"attempts": attempts, "retries": retries, "failed": {i: last.get(i, "") for i in pending}}
+    return {
+        "attempts": attempts,
+        "retries": retries,
+        "failed": {i: last.get(i, "") for i in pending},
+    }
 
 
 def kv_flush_or_fail(urls, http=_kv_http, *, on_fail=None, log=print, err=None, **kw):
     """kv_flush_checked + loud failure: ERROR line on stderr (and ``logging``), and unless ``ASRT_WS_KV_ON_FAIL=continue``
-    a KVFreshError (default: a sync that keeps stale KV must not be trained on silently)."""
+    a KVFreshError (default: a sync that keeps stale KV must not be trained on silently).
+    """
     import sys
 
     r = kv_flush_checked(urls, http, log=log, **kw)
     if r["failed"]:
-        on_fail = (on_fail if on_fail is not None else os.environ.get("ASRT_WS_KV_ON_FAIL", "raise")).strip().lower()
-        msg = (f"[asrt] ERROR kvfresh: prefix cache NOT flushed on engines {sorted(r['failed'])} after "
-               f"{r['attempts']} attempts: {r['failed']} -> old-weight KV survives this sync")
+        on_fail = (
+            (
+                on_fail
+                if on_fail is not None
+                else os.environ.get("ASRT_WS_KV_ON_FAIL", "raise")
+            )
+            .strip()
+            .lower()
+        )
+        msg = (
+            f"[asrt] ERROR kvfresh: prefix cache NOT flushed on engines {sorted(r['failed'])} after "
+            f"{r['attempts']} attempts: {r['failed']} -> old-weight KV survives this sync"
+        )
         (err or (lambda s: print(s, file=sys.stderr, flush=True)))(msg)
         try:
             import logging
@@ -220,7 +277,7 @@ def _jsonable_shapes(shapes):
 
 
 class DirectRPC:
-    """ weight-sync control calls straight to each engine's SGLang HTTP server.
+    """weight-sync control calls straight to each engine's SGLang HTTP server.
 
     slime routes every weight-sync call (pause, each bucket's ``update_weights_from_distributed``, commit,
     continue) through the engine's Ray actor: a synchronous, one-call-at-a-time actor living on the rollout
@@ -236,20 +293,28 @@ class DirectRPC:
     def __init__(self, urls):
         from concurrent.futures import ThreadPoolExecutor
 
-        self.urls = list(urls)  # per engine: "http://host:port" or None (node_rank != 0: slime's actor no-ops too)
-        self.pool = ThreadPoolExecutor(max_workers=max(8, 2 * len(self.urls)), thread_name_prefix="asrt-ws-rpc")
+        self.urls = list(
+            urls
+        )  # per engine: "http://host:port" or None (node_rank != 0: slime's actor no-ops too)
+        self.pool = ThreadPoolExecutor(
+            max_workers=max(8, 2 * len(self.urls)), thread_name_prefix="asrt-ws-rpc"
+        )
         self._tl = threading.local()
         self.worst = (0.0, -1, "")
 
     @classmethod
     def build(cls, ray, engines, timeout: float = 60.0):
-        infos = ray.get([e.__ray_call__.remote(_engine_info) for e in engines], timeout=timeout)
+        infos = ray.get(
+            [e.__ray_call__.remote(_engine_info) for e in engines], timeout=timeout
+        )
         urls = []
         for node_rank, host, port in infos:
             if node_rank != 0:
                 urls.append(None)
             elif not host or not port:
-                raise RuntimeError(f"engine without server address: {(node_rank, host, port)}")
+                raise RuntimeError(
+                    f"engine without server address: {(node_rank, host, port)}"
+                )
             else:
                 urls.append(f"http://{host}:{port}")
         return cls(urls)
@@ -274,8 +339,18 @@ class DirectRPC:
 
     def submit(self, idxs, endpoint, payload):
         """payload: dict (same for every engine) or callable(i) -> dict."""
-        return [(i, self.pool.submit(self._post, i, endpoint, payload(i) if callable(payload) else payload))
-                for i in idxs]
+        return [
+            (
+                i,
+                self.pool.submit(
+                    self._post,
+                    i,
+                    endpoint,
+                    payload(i) if callable(payload) else payload,
+                ),
+            )
+            for i in idxs
+        ]
 
     def gather(self, futs, prof=None, what=""):
         outs, ends = [], []
@@ -293,8 +368,16 @@ class DirectRPC:
         return outs
 
 
-def choose_bigbucket(engines: int, pp: int, *, parsync: bool, flatten: bool, async_: bool = False,
-                     mode: Optional[str] = None, fanout: Optional[float] = None):
+def choose_bigbucket(
+    engines: int,
+    pp: int,
+    *,
+    parsync: bool,
+    flatten: bool,
+    async_: bool = False,
+    mode: Optional[str] = None,
+    fanout: Optional[float] = None,
+):
     """Decide the bigbucket path.  Returns (on, reason).
 
     AUTO turns it on only where the measured problem exists: parsync was asked for and its per-engine
@@ -302,8 +385,14 @@ def choose_bigbucket(engines: int, pp: int, *, parsync: bool, flatten: bool, asy
     over one all-engine broadcast each.  Cost model (equal stages, B bytes each, source NIC bw N, one
     all-engine broadcast at bw C ~ N/2 measured): parsync ~ E*B/N, bigbucket ~ PP*B/C -> bigbucket wins
     when E >= (N/C) * PP = fanout * PP."""
-    mode = (mode if mode is not None else os.environ.get("ASRT_WS_BIGBUCKET", "auto")).strip().lower()
-    fanout = float(fanout if fanout is not None else os.environ.get("ASRT_WS_FANOUT", 2))
+    mode = (
+        (mode if mode is not None else os.environ.get("ASRT_WS_BIGBUCKET", "auto"))
+        .strip()
+        .lower()
+    )
+    fanout = float(
+        fanout if fanout is not None else os.environ.get("ASRT_WS_FANOUT", 2)
+    )
     if mode in ("0", "off", "false", "no"):
         return False, "off (ASRT_WS_BIGBUCKET=0)"
     if not flatten or async_:
@@ -311,8 +400,11 @@ def choose_bigbucket(engines: int, pp: int, *, parsync: bool, flatten: bool, asy
     if mode in ("1", "on", "true", "yes", "force"):
         return True, "on (forced)"
     if parsync and engines >= fanout * max(1, pp):
-        return True, f"on (auto: {engines} engines >= {fanout:g} x {pp} PP stages: one broadcast per bucket " \
-                     f"instead of {engines} per-engine sends)"
+        return (
+            True,
+            f"on (auto: {engines} engines >= {fanout:g} x {pp} PP stages: one broadcast per bucket "
+            f"instead of {engines} per-engine sends)",
+        )
     return False, f"off (auto: parsync={parsync}, {engines} engines, {pp} PP stages)"
 
 
@@ -348,7 +440,9 @@ class BigPacker:
         if self.cur is not None:
             return
         if len(self.bufs) < self.nbuf and self.free.empty():
-            self.bufs.append(self.torch.empty(self.cap, dtype=self.torch.uint8, device=self.device))
+            self.bufs.append(
+                self.torch.empty(self.cap, dtype=self.torch.uint8, device=self.device)
+            )
             self.cur = len(self.bufs) - 1
         else:
             t0 = time.perf_counter()
@@ -364,6 +458,7 @@ class BigPacker:
             if not done:
                 done.append(1)
                 self.free.put(idx)
+
         return release
 
     def add(self, named, emit):
@@ -381,22 +476,30 @@ class BigPacker:
             emit(v, [name], [t.dtype], [t.shape], lambda: None)
             return
         self._take()
-        while self.off + nb > self.cap:  # (the deferred tensors that open the next bucket may fill it again)
+        while (
+            self.off + nb > self.cap
+        ):  # (the deferred tensors that open the next bucket may fill it again)
             self.flush(emit)
             self._take()
         if self.off % t.element_size():
             self.deferred.append((name, t))
             return
-        self.bufs[self.cur][self.off:self.off + nb].copy_(t.contiguous().view(-1).view(self.torch.uint8))
+        self.bufs[self.cur][self.off : self.off + nb].copy_(
+            t.contiguous().view(-1).view(self.torch.uint8)
+        )
         self.off += nb
         self.copy_bytes += nb
         self.meta.append((name, t.dtype, t.shape))
-        if self.deferred:  # the offset may be aligned again: place what fits now instead of opening a bucket for it
+        if (
+            self.deferred
+        ):  # the offset may be aligned again: place what fits now instead of opening a bucket for it
             keep = []
             for dn, dt in self.deferred:
                 dnb = dt.numel() * dt.element_size()
                 if self.off % dt.element_size() == 0 and self.off + dnb <= self.cap:
-                    self.bufs[self.cur][self.off:self.off + dnb].copy_(dt.contiguous().view(-1).view(self.torch.uint8))
+                    self.bufs[self.cur][self.off : self.off + dnb].copy_(
+                        dt.contiguous().view(-1).view(self.torch.uint8)
+                    )
                     self.off += dnb
                     self.copy_bytes += dnb
                     self.meta.append((dn, dt.dtype, dt.shape))
@@ -409,8 +512,13 @@ class BigPacker:
         if self.cur is not None and self.meta:
             idx, n = self.cur, self.off
             self.cur = None
-            emit(self.bufs[idx][:n], [m[0] for m in self.meta], [m[1] for m in self.meta],
-                 [m[2] for m in self.meta], self._release_fn(idx))
+            emit(
+                self.bufs[idx][:n],
+                [m[0] for m in self.meta],
+                [m[1] for m in self.meta],
+                [m[2] for m in self.meta],
+                self._release_fn(idx),
+            )
             self.meta = []
         while self.deferred:  # at offset 0 everything is aligned again
             d, self.deferred = self.deferred, []
@@ -428,7 +536,9 @@ class BigPacker:
 
 def _big_mb(inplace: bool = False) -> int:
     v = os.environ.get("ASRT_WS_BUCKET_MB")
-    return int(v) if v else (2048 if inplace else 4096)  # inplace engines hold in-flight buckets: smaller default
+    return (
+        int(v) if v else (2048 if inplace else 4096)
+    )  # inplace engines hold in-flight buckets: smaller default
 
 
 def _big_nbuf() -> int:
@@ -443,7 +553,9 @@ def install(spec: Optional[str] = None, depth: Optional[int] = None) -> list:
         return []
     try:
         import torch  # noqa: F401
-        from slime.backends.megatron_utils.update_weight import update_weight_from_distributed as uwd
+        from slime.backends.megatron_utils.update_weight import (
+            update_weight_from_distributed as uwd,
+        )
     except Exception:
         return []
     if _installed.get("cls") is uwd.UpdateWeightFromDistributed:
@@ -470,7 +582,9 @@ def megatron_init(args):
             print(f"[asrt] slime_weightsync installed: {active}", flush=True)
     except Exception:
         pass
-    if os.environ.get("ASRT_JITFIX"):  # stop torch.compile recompile storms (Megatron @jit_fuser)
+    if os.environ.get(
+        "ASRT_JITFIX"
+    ):  # stop torch.compile recompile storms (Megatron @jit_fuser)
         try:
             import torch.distributed as dist
 
@@ -479,10 +593,16 @@ def megatron_init(args):
             rep = slime_jitfix.install(args=args)
             if not dist.is_initialized() or dist.get_rank() == 0:
                 if rep.get("skipped"):
-                    print(f"[asrt] jitfix: off ({rep['skipped']}; ASRT_JITFIX_FORCE=1 to apply)", flush=True)
+                    print(
+                        f"[asrt] jitfix: off ({rep['skipped']}; ASRT_JITFIX_FORCE=1 to apply)",
+                        flush=True,
+                    )
                 else:
-                    print(f"[asrt] jitfix: mode={rep.get('mode')} limit={rep.get('limit')} model={rep.get('model')} "
-                          f"replaced {len(rep.get('replaced', []))}: {rep.get('replaced', [])[:40]}", flush=True)
+                    print(
+                        f"[asrt] jitfix: mode={rep.get('mode')} limit={rep.get('limit')} model={rep.get('model')} "
+                        f"replaced {len(rep.get('replaced', []))}: {rep.get('replaced', [])[:40]}",
+                        flush=True,
+                    )
         except Exception as e:
             print(f"[asrt] jitfix not installed: {e}", flush=True)
     # other asrt control-plane patches that live in the training actor
@@ -494,11 +614,17 @@ def megatron_init(args):
             import torch.distributed as dist
 
             if dist.is_initialized() and dist.get_rank() == 0:
-                print(f"[asrt] slime_prefetch actor patches installed: {ok} ({sorted(slime_prefetch.opts())})", flush=True)
+                print(
+                    f"[asrt] slime_prefetch actor patches installed: {ok} ({sorted(slime_prefetch.opts())})",
+                    flush=True,
+                )
         except Exception:
             pass
-    if os.environ.get("ASRT_R3CHECK"):  # copy-free R3 validation in the trainer process too
+    if os.environ.get(
+        "ASRT_R3CHECK"
+    ):  # copy-free R3 validation in the trainer process too
         from . import slime_r3check
+
         slime_r3check.install()
     chain = os.environ.get("ASRT_CHAIN_MEGATRON_INIT")
     if chain:  # comma list of further init hooks, called in order
@@ -516,9 +642,9 @@ def megatron_init(args):
 
 
 def _patch(uwd, opts: set, depth: int):
+    import ray
     import torch
     import torch.distributed as dist
-    import ray
     from slime.utils.distributed_utils import get_gloo_group
     from slime.utils.weight_sync import should_flush_cache
 
@@ -539,7 +665,9 @@ def _patch(uwd, opts: set, depth: int):
     flatten = flatten or inplace
     # weight-sync control calls bypass the engines' Ray actors (DirectRPC); ASRT_WS_DIRECT=0 -> slime's path.
     # Only with our sync paths (flatten); profile-only stages keep slime's behaviour untouched.
-    direct_on = flatten and os.environ.get("ASRT_WS_DIRECT", "1").strip().lower() not in ("0", "off", "false", "no")
+    direct_on = flatten and os.environ.get(
+        "ASRT_WS_DIRECT", "1"
+    ).strip().lower() not in ("0", "off", "false", "no")
 
     # keep in-flight requests on a sync slime would flush: slime's --flush-cache-interval (default 1 = EVERY
     # sync) pauses with mode="abort" + flush_cache, which throws away every running request; SGLang's abort-pause then
@@ -549,7 +677,9 @@ def _patch(uwd, opts: set, depth: int):
     # --flush-cache-interval 0 (the 'best slime' baseline knob; tokens before/after the sync are both true behaviour-policy
     # tokens, TIS stays valid), and the in-place path (inplace) is used where enabled.  ASRT_WS_KEEP_INFLIGHT=0 restores
     # slime's abort+flush.  Only with our sync paths (flatten).
-    keep_inflight = flatten and os.environ.get("ASRT_WS_KEEP_INFLIGHT", "1").strip().lower() not in ("0", "off", "false", "no")
+    keep_inflight = flatten and os.environ.get(
+        "ASRT_WS_KEEP_INFLIGHT", "1"
+    ).strip().lower() not in ("0", "off", "false", "no")
 
     # KV freshness after a sync that keeps in-flight requests (keep_inflight, slime's own
     # --flush-cache-interval 0, inplace): SGLang's prefix (radix) cache and the paused requests' KV were computed with
@@ -566,7 +696,8 @@ def _patch(uwd, opts: set, depth: int):
 
     def _kv_urls(self):
         """Engine HTTP base URLs for the checked flush (DirectRPC's when on, else asked from the actors once per
-        engine set); None -> slime's actor flush (it retries 60 x 1 s on HTTP != 200 and raises TimeoutError)."""
+        engine set); None -> slime's actor flush (it retries 60 x 1 s on HTTP != 200 and raises TimeoutError).
+        """
         d = getattr(self, "_asrt_direct", None)
         if d is not None:
             return d.urls
@@ -580,8 +711,10 @@ def _patch(uwd, opts: set, depth: int):
         try:
             urls = DirectRPC.build(ray, list(self.rollout_engines)).urls
         except Exception as e:
-            print(f"[asrt] kvfresh: engine URLs unavailable ({e!r}); using slime's flush_cache (raises after 60 s)",
-                  flush=True)
+            print(
+                f"[asrt] kvfresh: engine URLs unavailable ({e!r}); using slime's flush_cache (raises after 60 s)",
+                flush=True,
+            )
             return None
         self._asrt_kv_urls = (key, urls)
         return urls
@@ -591,10 +724,18 @@ def _patch(uwd, opts: set, depth: int):
         the flush (retry with re-retract + bounded backoff, ERROR + KVFreshError if it still fails), continue.
         Order matters: the retract (running / chunked / just-prefilled requests back to the waiting queue WITH their
         tokens, their KV freed, not inserted) happens BEFORE the flush, so no in-flight request keeps old-weight KV and
-        the flush empties the tree of everything older; requests tokenized before the sync but not prefilled yet hold no KV and find an empty tree afterwards."""
+        the flush empties the tree of everything older; requests tokenized before the sync but not prefilled yet hold no KV and find an empty tree afterwards.
+        """
         t0 = time.perf_counter()
         if not already_paused:
-            _rpc_get(self, _rpc(self, self.rollout_engines, "pause_generation", {"mode": "retract"}), prof, "kv_pause")
+            _rpc_get(
+                self,
+                _rpc(
+                    self, self.rollout_engines, "pause_generation", {"mode": "retract"}
+                ),
+                prof,
+                "kv_pause",
+            )
         urls = _kv_urls(self)
         if urls is None:
             ray.get([e.flush_cache.remote() for e in self.rollout_engines])
@@ -603,23 +744,49 @@ def _patch(uwd, opts: set, depth: int):
                 r = kv_flush_or_fail(urls)
             except KVFreshError:
                 self._asrt_kv_flush_fail = getattr(self, "_asrt_kv_flush_fail", 0) + 1
-                _log({"rank": dist.get_rank(), "op": "kv_flush_fail", "version": self.weight_version,
-                      "fails": self._asrt_kv_flush_fail})
+                _log(
+                    {
+                        "rank": dist.get_rank(),
+                        "op": "kv_flush_fail",
+                        "version": self.weight_version,
+                        "fails": self._asrt_kv_flush_fail,
+                    }
+                )
                 raise
-            if r["failed"]:  # ASRT_WS_KV_ON_FAIL=continue: counted, ERROR already printed
+            if r[
+                "failed"
+            ]:  # ASRT_WS_KV_ON_FAIL=continue: counted, ERROR already printed
                 self._asrt_kv_flush_fail = getattr(self, "_asrt_kv_flush_fail", 0) + 1
-                _log({"rank": dist.get_rank(), "op": "kv_flush_fail", "version": self.weight_version,
-                      "fails": self._asrt_kv_flush_fail, "failed": {str(k): v for k, v in r["failed"].items()}})
+                _log(
+                    {
+                        "rank": dist.get_rank(),
+                        "op": "kv_flush_fail",
+                        "version": self.weight_version,
+                        "fails": self._asrt_kv_flush_fail,
+                        "failed": {str(k): v for k, v in r["failed"].items()},
+                    }
+                )
             if r["retries"]:
                 prof.add("kv_flush_retry", 0.0, r["retries"])
-                self._asrt_kv_flush_retries = getattr(self, "_asrt_kv_flush_retries", 0) + r["retries"]
+                self._asrt_kv_flush_retries = (
+                    getattr(self, "_asrt_kv_flush_retries", 0) + r["retries"]
+                )
         prof.add("kv_flush", time.perf_counter() - t0)
         if not already_paused:
-            _rpc_get(self, _rpc(self, self.rollout_engines, "continue_generation", {}), prof, "kv_continue")
+            _rpc_get(
+                self,
+                _rpc(self, self.rollout_engines, "continue_generation", {}),
+                prof,
+                "kv_continue",
+            )
         self._asrt_kv_refreshed = getattr(self, "_asrt_kv_refreshed", 0) + 1
 
     def _flush_wanted(self, version):
-        want = should_flush_cache(self.args.flush_cache_interval, version, getattr(self.args, "update_weight_start_version", 0))
+        want = should_flush_cache(
+            self.args.flush_cache_interval,
+            version,
+            getattr(self.args, "update_weight_start_version", 0),
+        )
         if want and keep_inflight:
             self._asrt_flush_skipped = True
             return False
@@ -637,18 +804,32 @@ def _patch(uwd, opts: set, depth: int):
         d = getattr(self, "_asrt_direct", None)
         idx = _eidx(self, engines) if d is not None else None
         if idx is None:
-            return ("ray", [getattr(e, method).remote(**(kwargs(e) if callable(kwargs) else kwargs)) for e in engines])
+            return (
+                "ray",
+                [
+                    getattr(e, method).remote(
+                        **(kwargs(e) if callable(kwargs) else kwargs)
+                    )
+                    for e in engines
+                ],
+            )
         if method == "update_weights_from_distributed":
+
             def payload(i, _e=dict(zip(idx, engines))):
                 k = kwargs(_e[i]) if callable(kwargs) else kwargs
-                p = {"names": list(k["names"]), "dtypes": _jsonable_dtypes(k["dtypes"]),
-                     "shapes": _jsonable_shapes(k["shapes"]), "group_name": k["group_name"],
-                     "flush_cache": bool(k.get("flush_cache", False))}
+                p = {
+                    "names": list(k["names"]),
+                    "dtypes": _jsonable_dtypes(k["dtypes"]),
+                    "shapes": _jsonable_shapes(k["shapes"]),
+                    "group_name": k["group_name"],
+                    "flush_cache": bool(k.get("flush_cache", False)),
+                }
                 if k.get("weight_version") is not None:
                     p["weight_version"] = k["weight_version"]
                 if k.get("load_format") is not None:
                     p["load_format"] = k["load_format"]
                 return p
+
         elif method == "pause_generation":
             payload = {"mode": kwargs.get("mode", "abort")}
         elif method == "continue_generation":
@@ -672,22 +853,33 @@ def _patch(uwd, opts: set, depth: int):
             self._asrt_eidx = {e._actor_id.hex(): i for i, e in enumerate(engines)}
             self._asrt_direct = d
             if dist.get_rank() == 0 or getattr(self, "_is_pp_src_rank", False):
-                print(f"[asrt] ws direct: on ({sum(u is not None for u in d.urls)}/{len(d.urls)} engine HTTP servers; "
-                      f"weight-sync calls skip the engine Ray actors)", flush=True)
+                print(
+                    f"[asrt] ws direct: on ({sum(u is not None for u in d.urls)}/{len(d.urls)} engine HTTP servers; "
+                    f"weight-sync calls skip the engine Ray actors)",
+                    flush=True,
+                )
         except Exception as e:  # keep slime's path
             print(f"[asrt] ws direct: off ({e!r})", flush=True)
 
     def _ver(self, version):
         if version != "cur":
             return version
-        return None if getattr(self, "_asrt_inplace_now", False) else str(self.weight_version)
+        return (
+            None
+            if getattr(self, "_asrt_inplace_now", False)
+            else str(self.weight_version)
+        )
 
     def _check_inplace(self, res):
         if getattr(self, "_asrt_inplace_now", False):
             for r in res:
-                if isinstance(r, dict) and "asrt-inplace" not in str(r.get("message", "")):
-                    raise RuntimeError("asrt inplace weight sync: the engine did not take the in-place path "
-                                       f"(ASRT_SGL_HOOKS must include 'inplace' in the SGLang processes): {r}")
+                if isinstance(r, dict) and "asrt-inplace" not in str(
+                    r.get("message", "")
+                ):
+                    raise RuntimeError(
+                        "asrt inplace weight sync: the engine did not take the in-place path "
+                        f"(ASRT_SGL_HOOKS must include 'inplace' in the SGLang processes): {r}"
+                    )
 
     # ---- parsync: one NCCL group per (PP source, engine) ----
     orig_connect = Cls.connect_rollout_engines
@@ -701,8 +893,12 @@ def _patch(uwd, opts: set, depth: int):
                 print(f"[asrt] parsync: disconnect {name} failed: {e!r}", flush=True)
         self._asrt_par = []
 
-    def connect_rollout_engines(self, rollout_engines, rollout_engine_lock, engine_gpu_counts=None, *a, **k):
-        orig_connect(self, rollout_engines, rollout_engine_lock, engine_gpu_counts, *a, **k)
+    def connect_rollout_engines(
+        self, rollout_engines, rollout_engine_lock, engine_gpu_counts=None, *a, **k
+    ):
+        orig_connect(
+            self, rollout_engines, rollout_engine_lock, engine_gpu_counts, *a, **k
+        )
         self._asrt_big = False
         if getattr(self, "_is_pp_src_rank", False) or dist.get_rank() == 0:
             _setup_direct(self, list(rollout_engines))
@@ -710,28 +906,47 @@ def _patch(uwd, opts: set, depth: int):
             return
         try:
             from megatron.core import mpu
+
             pp = mpu.get_pipeline_model_parallel_world_size()
         except Exception:
             pp = int(getattr(self.args, "pipeline_model_parallel_size", 1) or 1)
         # every PP source computes the same decision from the same inputs (all stages must take the same path:
         # a lock-path stage and a lock-free parsync stage could reach the engines in different orders)
-        big, why = choose_bigbucket(len(rollout_engines), pp, parsync=parsync, flatten=flatten, async_=async_)
+        big, why = choose_bigbucket(
+            len(rollout_engines), pp, parsync=parsync, flatten=flatten, async_=async_
+        )
         self._asrt_big = big
-        print(f"[asrt] bigbucket {self._group_name}: {why}"
-              + (f"; buckets of {_big_mb(inplace)} MB x {_big_nbuf()} buffers" if big else ""), flush=True)
+        print(
+            f"[asrt] bigbucket {self._group_name}: {why}"
+            + (
+                f"; buckets of {_big_mb(inplace)} MB x {_big_nbuf()} buffers"
+                if big
+                else ""
+            ),
+            flush=True,
+        )
         if not parsync:
             return
         _drop_par(self)
         if big:
-            print(f"[asrt] parsync: off ({self._group_name}: bigbucket sends one all-engine broadcast per bucket)", flush=True)
+            print(
+                f"[asrt] parsync: off ({self._group_name}: bigbucket sends one all-engine broadcast per bucket)",
+                flush=True,
+            )
             return
         # auto-off: with a single PP stage there is one sender and nothing to parallelize - per-engine groups would
         # only make it send the bytes once per engine instead of one broadcast (measured slower)
         if pp <= 1:
-            print(f"[asrt] parsync: off (single PP stage, nothing to parallelize)", flush=True)
+            print(
+                f"[asrt] parsync: off (single PP stage, nothing to parallelize)",
+                flush=True,
+            )
             return
-        counts = list(engine_gpu_counts) if engine_gpu_counts is not None else \
-            [self.args.rollout_num_gpus_per_engine] * len(rollout_engines)
+        counts = (
+            list(engine_gpu_counts)
+            if engine_gpu_counts is not None
+            else [self.args.rollout_num_gpus_per_engine] * len(rollout_engines)
+        )
         par = []
         for i, eng in enumerate(rollout_engines):
             name = f"{self._group_name}-e{i}"
@@ -739,17 +954,24 @@ def _patch(uwd, opts: set, depth: int):
             while not ray.get(rollout_engine_lock.acquire.remote()):
                 time.sleep(0.05)
             try:
-                grp = uwd.connect_rollout_engines_from_distributed(self.args, name, [eng], engine_gpu_counts=[counts[i]])
+                grp = uwd.connect_rollout_engines_from_distributed(
+                    self.args, name, [eng], engine_gpu_counts=[counts[i]]
+                )
             finally:
                 ray.get(rollout_engine_lock.release.remote())
             par.append((name, grp, eng))
         self._asrt_par = par
-        print(f"[asrt] parsync: {self._group_name} -> {len(par)} per-engine groups", flush=True)
+        print(
+            f"[asrt] parsync: {self._group_name} -> {len(par)} per-engine groups",
+            flush=True,
+        )
 
     def disconnect_rollout_engines(self, *a, **k):
         if parsync:
             _drop_par(self)
-        self._asrt_direct = None  # engines may be replaced (recovery): rebuilt on the next connect
+        self._asrt_direct = (
+            None  # engines may be replaced (recovery): rebuilt on the next connect
+        )
         return orig_disconnect(self, *a, **k)
 
     if parsync or flatten:
@@ -765,26 +987,52 @@ def _patch(uwd, opts: set, depth: int):
             flat, names, dtypes, shapes = named
             nbytes = flat.numel()
             gname = {e._actor_id.hex(): name for name, _, e in self._asrt_par}
-            refs = _rpc(self, [eng for _, _, eng in self._asrt_par], "update_weights_from_distributed",
-                        lambda e: dict(names=names, dtypes=dtypes, shapes=shapes, group_name=gname[e._actor_id.hex()],
-                                       weight_version=ver, load_format="flattened_bucket"))
+            refs = _rpc(
+                self,
+                [eng for _, _, eng in self._asrt_par],
+                "update_weights_from_distributed",
+                lambda e: dict(
+                    names=names,
+                    dtypes=dtypes,
+                    shapes=shapes,
+                    group_name=gname[e._actor_id.hex()],
+                    weight_version=ver,
+                    load_format="flattened_bucket",
+                ),
+            )
             with ctx:
                 if ready_event is not None:
                     torch.cuda.current_stream().wait_event(ready_event)
-                hs = [dist.broadcast(flat, 0, group=grp, async_op=True) for _, grp, _ in self._asrt_par]
+                hs = [
+                    dist.broadcast(flat, 0, group=grp, async_op=True)
+                    for _, grp, _ in self._asrt_par
+                ]
                 for h in hs:
                     h.wait()
         else:
             nbytes = sum(t.numel() * t.element_size() for _, t in named)
             gname = {e._actor_id.hex(): name for name, _, e in self._asrt_par}
-            refs = _rpc(self, [eng for _, _, eng in self._asrt_par], "update_weights_from_distributed",
-                        lambda e: dict(names=[n for n, _ in named], dtypes=[t.dtype for _, t in named],
-                                       shapes=[t.shape for _, t in named], group_name=gname[e._actor_id.hex()],
-                                       weight_version=ver, load_format=None))
+            refs = _rpc(
+                self,
+                [eng for _, _, eng in self._asrt_par],
+                "update_weights_from_distributed",
+                lambda e: dict(
+                    names=[n for n, _ in named],
+                    dtypes=[t.dtype for _, t in named],
+                    shapes=[t.shape for _, t in named],
+                    group_name=gname[e._actor_id.hex()],
+                    weight_version=ver,
+                    load_format=None,
+                ),
+            )
             with ctx:
                 if ready_event is not None:
                     torch.cuda.current_stream().wait_event(ready_event)
-                hs = [dist.broadcast(t.data, 0, group=grp, async_op=True) for _, t in named for _, grp, _ in self._asrt_par]
+                hs = [
+                    dist.broadcast(t.data, 0, group=grp, async_op=True)
+                    for _, t in named
+                    for _, grp, _ in self._asrt_par
+                ]
                 for h in hs:
                     h.wait()
         t1 = time.perf_counter()
@@ -796,7 +1044,9 @@ def _patch(uwd, opts: set, depth: int):
         _check_inplace(self, res)
         if stream is not None:
             stream.synchronize()
-        elif getattr(self, "_asrt_inplace_now", False):  # engine returned before the bytes arrived
+        elif getattr(
+            self, "_asrt_inplace_now", False
+        ):  # engine returned before the bytes arrived
             torch.cuda.current_stream().synchronize()
         prof.add("lock_wait", 0.0)
         prof.add("bcast_issue", t1 - t0, nbytes)
@@ -810,10 +1060,25 @@ def _patch(uwd, opts: set, depth: int):
         offset, which needs offset % element_size == 0 -> order by element
         size, largest first (stable), so every offset stays aligned."""
         named = sorted(named, key=lambda nt: -nt[1].element_size())
-        flat = torch.cat([t.detach().contiguous().view(-1).view(torch.uint8) for _, t in named])
-        return flat, [n for n, _ in named], [t.dtype for _, t in named], [t.shape for _, t in named]
+        flat = torch.cat(
+            [t.detach().contiguous().view(-1).view(torch.uint8) for _, t in named]
+        )
+        return (
+            flat,
+            [n for n, _ in named],
+            [t.dtype for _, t in named],
+            [t.shape for _, t in named],
+        )
 
-    def _transfer(self, named, prof: _Prof, stream=None, ready_event=None, version="cur", pause_each=False):
+    def _transfer(
+        self,
+        named,
+        prof: _Prof,
+        stream=None,
+        ready_event=None,
+        version="cur",
+        pause_each=False,
+    ):
         """Lock -> RPC -> broadcast -> wait engines -> unlock (one bucket).
         pause_each: pause the engines (in_place) just for this bucket, inside the lock.  SGLang
         only skips its model-update writer lock when paused, and that lock waits for every
@@ -821,7 +1086,9 @@ def _patch(uwd, opts: set, depth: int):
         if parsync and not pause_each and getattr(self, "_asrt_par", None):
             return _par_transfer(self, named, prof, stream, ready_event, version)
         t0 = time.perf_counter()
-        poll = 0.002 if getattr(self, "_asrt_big", False) else 0.01  # bigbucket: PP stages hand the lock over often
+        poll = (
+            0.002 if getattr(self, "_asrt_big", False) else 0.01
+        )  # bigbucket: PP stages hand the lock over often
         while not ray.get(self.rollout_engine_lock.acquire.remote()):
             time.sleep(poll)
         t1 = time.perf_counter()
@@ -829,20 +1096,40 @@ def _patch(uwd, opts: set, depth: int):
         paused = False
         try:
             if pause_each:
-                _rpc_get(self, _rpc(self, self.rollout_engines, "pause_generation", {"mode": "in_place"}))
+                _rpc_get(
+                    self,
+                    _rpc(
+                        self,
+                        self.rollout_engines,
+                        "pause_generation",
+                        {"mode": "in_place"},
+                    ),
+                )
                 paused = True
                 prof.add("bucket_pause", time.perf_counter() - t1)
             if flatten:
                 flat, names, dtypes, shapes = named
                 nbytes = flat.numel()
-                refs = _rpc(self, self.rollout_engines, "update_weights_from_distributed",
-                            dict(names=names, dtypes=dtypes, shapes=shapes, group_name=self._group_name,
-                                 weight_version=_ver(self, version), load_format="flattened_bucket"))
+                refs = _rpc(
+                    self,
+                    self.rollout_engines,
+                    "update_weights_from_distributed",
+                    dict(
+                        names=names,
+                        dtypes=dtypes,
+                        shapes=shapes,
+                        group_name=self._group_name,
+                        weight_version=_ver(self, version),
+                        load_format="flattened_bucket",
+                    ),
+                )
                 ctx = torch.cuda.stream(stream) if stream is not None else _nullctx()
                 with ctx:
                     if ready_event is not None:
                         torch.cuda.current_stream().wait_event(ready_event)
-                    h = dist.broadcast(flat, 0, group=self._model_update_groups, async_op=True)
+                    h = dist.broadcast(
+                        flat, 0, group=self._model_update_groups, async_op=True
+                    )
                     h.wait()
             else:
                 nbytes = sum(t.numel() * t.element_size() for _, t in named)
@@ -850,25 +1137,39 @@ def _patch(uwd, opts: set, depth: int):
                 with ctx:
                     if ready_event is not None:
                         torch.cuda.current_stream().wait_event(ready_event)
-                    refs = ("ray", uwd.update_weights_from_distributed(
-                        self._group_name, self._model_update_groups, self.weight_version,
-                        self.rollout_engines, named,
-                    ))
+                    refs = (
+                        "ray",
+                        uwd.update_weights_from_distributed(
+                            self._group_name,
+                            self._model_update_groups,
+                            self.weight_version,
+                            self.rollout_engines,
+                            named,
+                        ),
+                    )
             t2 = time.perf_counter()
             res = _rpc_get(self, refs, prof, "bucket")
             t3 = time.perf_counter()
-            for r in res:  # SGLang returns (success, message) through slime's engine wrapper
+            for (
+                r
+            ) in (
+                res
+            ):  # SGLang returns (success, message) through slime's engine wrapper
                 if isinstance(r, dict) and r.get("success") is False:
                     raise RuntimeError(f"engine weight load failed: {r}")
             _check_inplace(self, res)
             if stream is not None:
                 stream.synchronize()  # buffers may be freed/reused by the producer's stream after this
-            elif getattr(self, "_asrt_inplace_now", False):  # engine returned before the bytes arrived
+            elif getattr(
+                self, "_asrt_inplace_now", False
+            ):  # engine returned before the bytes arrived
                 torch.cuda.current_stream().synchronize()
         finally:
             if paused:
                 tc = time.perf_counter()
-                _rpc_get(self, _rpc(self, self.rollout_engines, "continue_generation", {}))
+                _rpc_get(
+                    self, _rpc(self, self.rollout_engines, "continue_generation", {})
+                )
                 prof.add("bucket_continue", time.perf_counter() - tc)
             ray.get(self.rollout_engine_lock.release.remote())
         t4 = time.perf_counter()
@@ -900,7 +1201,9 @@ def _patch(uwd, opts: set, depth: int):
                 except BaseException as e:  # surface on main thread
                     err.append(e)
                 finally:
-                    if release is not None:  # bigbucket: buffer back to the pool (also after an error: no hang)
+                    if (
+                        release is not None
+                    ):  # bigbucket: buffer back to the pool (also after an error: no hang)
                         release()
 
         th = None
@@ -926,14 +1229,28 @@ def _patch(uwd, opts: set, depth: int):
                 if pbar is not None:
                     pbar.update(1)
 
-        big = flatten and src and getattr(self, "_asrt_big", False) and getattr(self, "_asrt_stage", None) is None
-        packer = BigPacker(_big_mb(inplace) << 20, _big_nbuf(), device=torch.cuda.current_device()) if big else None
+        big = (
+            flatten
+            and src
+            and getattr(self, "_asrt_big", False)
+            and getattr(self, "_asrt_stage", None) is None
+        )
+        packer = (
+            BigPacker(
+                _big_mb(inplace) << 20, _big_nbuf(), device=torch.cuda.current_device()
+            )
+            if big
+            else None
+        )
 
         def emit(flat, names, dtypes, shapes, release):
             submit((flat, names, dtypes, shapes), release)
 
         try:
-            for chunk_iter in (self._iter_non_expert_chunks(), self._iter_expert_chunks()):
+            for chunk_iter in (
+                self._iter_non_expert_chunks(),
+                self._iter_expert_chunks(),
+            ):
                 it = iter(chunk_iter)
                 while True:
                     t0 = time.perf_counter()
@@ -947,7 +1264,9 @@ def _patch(uwd, opts: set, depth: int):
                     if packer is not None:
                         t1 = time.perf_counter()
                         w0 = packer.wait_s
-                        packer.add(hf_chunk, emit)  # may emit full buckets (and wait for a free buffer)
+                        packer.add(
+                            hf_chunk, emit
+                        )  # may emit full buckets (and wait for a free buffer)
                         hf_chunk.clear()  # the buffers own the bytes now
                         prof.add("buf_wait", packer.wait_s - w0)
                         prof.add("pack", time.perf_counter() - t1)
@@ -959,7 +1278,9 @@ def _patch(uwd, opts: set, depth: int):
                     prof.add("gather_convert", time.perf_counter() - t0)
                     if getattr(self, "_asrt_stage", None) is not None:
                         t1 = time.perf_counter()
-                        self._asrt_stage.append(_stage(self, payload, len(self._asrt_stage)))
+                        self._asrt_stage.append(
+                            _stage(self, payload, len(self._asrt_stage))
+                        )
                         prof.add("stage_copy", time.perf_counter() - t1)
                         continue
                     submit(payload)
@@ -981,7 +1302,8 @@ def _patch(uwd, opts: set, depth: int):
 
     def _stage(self, payload, idx):
         """Copy one flat bucket out of the trainer's way: pinned host (default, reused across
-        steps) or a GPU clone (stage_gpu).  Returns (buffer, names, dtypes, shapes, ready_event)."""
+        steps) or a GPU clone (stage_gpu).  Returns (buffer, names, dtypes, shapes, ready_event).
+        """
         flat, names, dtypes, shapes = payload
         if stage_gpu:
             buf = flat  # already a fresh tensor owned by us
@@ -1011,12 +1333,23 @@ def _patch(uwd, opts: set, depth: int):
             for i, (buf, names, dtypes, shapes, ev) in enumerate(stage):
                 ev.synchronize()
                 with torch.cuda.stream(stream):
-                    flat = buf if buf.is_cuda else buf.to(torch.cuda.current_device(), non_blocking=True)
+                    flat = (
+                        buf
+                        if buf.is_cuda
+                        else buf.to(torch.cuda.current_device(), non_blocking=True)
+                    )
                     ready = torch.cuda.Event()
                     ready.record()
                 last = i == len(stage) - 1
-                _transfer(self, (flat, names, dtypes, shapes), prof, stream, ready,
-                          version=str(self._asrt_bg_version) if last else None, pause_each=True)
+                _transfer(
+                    self,
+                    (flat, names, dtypes, shapes),
+                    prof,
+                    stream,
+                    ready,
+                    version=str(self._asrt_bg_version) if last else None,
+                    pause_each=True,
+                )
                 del flat
                 stage[i] = None
             if kv_fresh and dist.get_rank() == 0:
@@ -1024,8 +1357,13 @@ def _patch(uwd, opts: set, depth: int):
                 # there)
                 _kv_refresh(self, prof)
             prof.add("bg_total", time.perf_counter() - t0)
-            _log({"rank": dist.get_rank(), "bg_version": self._asrt_bg_version,
-                  **{k: round(v, 4) for k, v in prof.t.items()}})
+            _log(
+                {
+                    "rank": dist.get_rank(),
+                    "bg_version": self._asrt_bg_version,
+                    **{k: round(v, 4) for k, v in prof.t.items()},
+                }
+            )
         except BaseException as e:
             self._asrt_bg_err = e
 
@@ -1063,16 +1401,26 @@ def _patch(uwd, opts: set, depth: int):
             if self._is_pp_src_rank and stage:
                 self._asrt_device = torch.cuda.current_device()
                 self._asrt_bg_version = self.weight_version
-                self._asrt_bg = threading.Thread(target=_bg_send, args=(self, stage, _Prof()),
-                                                 daemon=True, name="asrt-weight-bg")
+                self._asrt_bg = threading.Thread(
+                    target=_bg_send,
+                    args=(self, stage, _Prof()),
+                    daemon=True,
+                    name="asrt-weight-bg",
+                )
                 self._asrt_bg.start()
             if first or verify or os.environ.get("ASRT_WEIGHTSYNC_BLOCKING") == "1":
                 _join_bg(self)
             dist.barrier(group=get_gloo_group())
             self._asrt_synced_once = True
-        elif inplace and getattr(self, "_asrt_synced_once", False) and not (
-                self.quantization_config and self.quantization_config["quant_method"] in ["compressed-tensors"]) \
-                and not _flush_wanted(self, self.weight_version + 1):
+        elif (
+            inplace
+            and getattr(self, "_asrt_synced_once", False)
+            and not (
+                self.quantization_config
+                and self.quantization_config["quant_method"] in ["compressed-tensors"]
+            )
+            and not _flush_wanted(self, self.weight_version + 1)
+        ):
             # engines keep generating: buckets go out un-paused and unlabelled, rank 0 commits at the end
             self.weight_version += 1
             t1 = time.perf_counter()
@@ -1089,15 +1437,34 @@ def _patch(uwd, opts: set, depth: int):
             if rank0:
                 t3 = time.perf_counter()
                 gname = getattr(self, "_group_name", None) or "asrt-commit"
-                res = _rpc_get(self, _rpc(self, self.rollout_engines, "update_weights_from_distributed",
-                                          dict(names=[], dtypes=[], shapes=[], group_name=gname,
-                                               weight_version=str(self.weight_version), load_format="flattened_bucket")),
-                               prof, "commit")
+                res = _rpc_get(
+                    self,
+                    _rpc(
+                        self,
+                        self.rollout_engines,
+                        "update_weights_from_distributed",
+                        dict(
+                            names=[],
+                            dtypes=[],
+                            shapes=[],
+                            group_name=gname,
+                            weight_version=str(self.weight_version),
+                            load_format="flattened_bucket",
+                        ),
+                    ),
+                    prof,
+                    "commit",
+                )
                 for r in res:
-                    if isinstance(r, dict) and (r.get("success") is False or "asrt-inplace" not in str(r.get("message", ""))):
+                    if isinstance(r, dict) and (
+                        r.get("success") is False
+                        or "asrt-inplace" not in str(r.get("message", ""))
+                    ):
                         raise RuntimeError(f"asrt inplace commit failed: {r}")
                 prof.add("commit", time.perf_counter() - t3)
-                if kv_fresh:   # requests that ran through the window hold KV of both versions: rebuild
+                if (
+                    kv_fresh
+                ):  # requests that ran through the window hold KV of both versions: rebuild
                     _kv_refresh(self, prof)
             t4 = time.perf_counter()
             dist.barrier(group=get_gloo_group())
@@ -1117,12 +1484,26 @@ def _patch(uwd, opts: set, depth: int):
             flush_cache = _flush_wanted(self, self.weight_version)
             t0 = time.perf_counter()
             if rank0:
-                _rpc_get(self, _rpc(self, self.rollout_engines, "pause_generation",
-                                    {"mode": "abort" if flush_cache else ("retract" if kv_fresh else "in_place")}),
-                         prof, "pause")
+                _rpc_get(
+                    self,
+                    _rpc(
+                        self,
+                        self.rollout_engines,
+                        "pause_generation",
+                        {
+                            "mode": "abort"
+                            if flush_cache
+                            else ("retract" if kv_fresh else "in_place")
+                        },
+                    ),
+                    prof,
+                    "pause",
+                )
                 if flush_cache:
                     ray.get([e.flush_cache.remote() for e in self.rollout_engines])
-                if self.quantization_config and self.quantization_config["quant_method"] in ["compressed-tensors"]:
+                if self.quantization_config and self.quantization_config[
+                    "quant_method"
+                ] in ["compressed-tensors"]:
                     uwd.post_process_weights(True, False, self.rollout_engines)
             prof.add("pause", time.perf_counter() - t0)
             t1 = time.perf_counter()
@@ -1138,19 +1519,31 @@ def _patch(uwd, opts: set, depth: int):
             prof.add("sources_done", time.perf_counter() - t1b)
             t2 = time.perf_counter()
             if rank0:
-                if self.quantization_config and self.quantization_config["quant_method"] in ["compressed-tensors"]:
+                if self.quantization_config and self.quantization_config[
+                    "quant_method"
+                ] in ["compressed-tensors"]:
                     uwd.post_process_weights(False, True, self.rollout_engines)
                 if kv_fresh and not flush_cache:
                     _kv_refresh(self, prof, already_paused=True)
-                _rpc_get(self, _rpc(self, self.rollout_engines, "continue_generation", {}), prof, "continue")
+                _rpc_get(
+                    self,
+                    _rpc(self, self.rollout_engines, "continue_generation", {}),
+                    prof,
+                    "continue",
+                )
             dist.barrier(group=get_gloo_group())
             prof.add("continue", time.perf_counter() - t2)
         total = time.perf_counter() - t_start
         self._asrt_synced_once = True
         if verify and (async_ or not no_pause):
             _verify(self)
-        rec = {"rank": dist.get_rank(), "src": bool(self._is_pp_src_rank), "version": self.weight_version,
-               "opts": sorted(opts), "total_s": round(total, 4)}
+        rec = {
+            "rank": dist.get_rank(),
+            "src": bool(self._is_pp_src_rank),
+            "version": self.weight_version,
+            "opts": sorted(opts),
+            "total_s": round(total, 4),
+        }
         rec.update({k: round(v, 4) for k, v in prof.t.items()})
         rec["bytes"] = int(prof.n.get("bcast_issue", 0))
         rec["buckets"] = int(prof.n.get("transfer_total", 0))
@@ -1159,24 +1552,37 @@ def _patch(uwd, opts: set, depth: int):
         rec["kv"] = "fresh" if kv_fresh else "keep"
         if getattr(self, "_asrt_kv_refreshed", 0):
             rec["kv_refreshed"] = self._asrt_kv_refreshed
-        if kv_fresh:  # cumulative: flushes that needed a retry / that failed after all retries
+        if (
+            kv_fresh
+        ):  # cumulative: flushes that needed a retry / that failed after all retries
             rec["kv_flush_retries"] = getattr(self, "_asrt_kv_flush_retries", 0)
             rec["kv_flush_fail"] = getattr(self, "_asrt_kv_flush_fail", 0)
-        if getattr(self, "_asrt_flush_skipped", False):  # slime asked for abort+flush; kept in-flight requests instead
+        if getattr(
+            self, "_asrt_flush_skipped", False
+        ):  # slime asked for abort+flush; kept in-flight requests instead
             rec["flush_skipped"] = True
             self._asrt_flush_skipped = False
         d = getattr(self, "_asrt_direct", None)
         if d is not None:
             rec["direct"] = True
-            if d.worst[0] > 0:  # slowest engine reply of this sync (seconds behind the fastest, which engine, which call)
+            if (
+                d.worst[0] > 0
+            ):  # slowest engine reply of this sync (seconds behind the fastest, which engine, which call)
                 rec["rpc_slow"] = [round(d.worst[0], 3), d.worst[1], d.worst[2]]
             d.worst = (0.0, -1, "")
         if self._is_pp_src_rank or rank0:
             _log(rec)
             if rank0:
-                print(f"[asrt] weight sync v{self.weight_version}: {json.dumps(rec)}", flush=True)
+                print(
+                    f"[asrt] weight sync v{self.weight_version}: {json.dumps(rec)}",
+                    flush=True,
+                )
         for k, v in rec.items():
-            if isinstance(v, (int, float)) and not isinstance(v, bool) and k not in ("rank", "version"):
+            if (
+                isinstance(v, (int, float))
+                and not isinstance(v, bool)
+                and k not in ("rank", "version")
+            ):
                 self.update_weight_metrics[f"update_weights/asrt_{k}"] = float(v)
 
     def _verify(self):
@@ -1186,7 +1592,12 @@ def _patch(uwd, opts: set, depth: int):
         def checksum():
             if not rank0:
                 return None
-            out = ray.get([e.check_weights.remote(action="checksum") for e in self.rollout_engines])
+            out = ray.get(
+                [
+                    e.check_weights.remote(action="checksum")
+                    for e in self.rollout_engines
+                ]
+            )
             return json.dumps(out, sort_keys=True, default=str)
 
         a = checksum()
@@ -1205,23 +1616,43 @@ def _patch(uwd, opts: set, depth: int):
             diff = []
             if not ok:  # name the differing tensors
                 try:
+
                     def flat(js):
                         out = {}
                         for ei, eng in enumerate(json.loads(js)):
-                            for ri, rk in enumerate((eng or {}).get("ranks", []) if isinstance(eng, dict) else []):
+                            for ri, rk in enumerate(
+                                (eng or {}).get("ranks", [])
+                                if isinstance(eng, dict)
+                                else []
+                            ):
                                 for n, c in (rk.get("checksums") or {}).items():
                                     out[f"e{ei}r{ri}:{n}"] = c
                         return out
+
                     fa, fb = flat(a), flat(b)
-                    diff = sorted(k for k in set(fa) | set(fb) if fa.get(k) != fb.get(k))
+                    diff = sorted(
+                        k for k in set(fa) | set(fb) if fa.get(k) != fb.get(k)
+                    )
                 except Exception as e:
                     diff = [f"(could not parse: {e!r})"]
-            print(f"[asrt] verify v{self.weight_version}: asrt-vs-slime engine checksums equal = {ok}"
-                  + (f"; {len(diff)} differ: {diff[:12]}" if diff else ""), flush=True)
-            _log({"rank": 0, "verify_version": self.weight_version, "equal": ok,
-                  "checksum_head": (a or "")[:300], "differ": diff[:200]})
+            print(
+                f"[asrt] verify v{self.weight_version}: asrt-vs-slime engine checksums equal = {ok}"
+                + (f"; {len(diff)} differ: {diff[:12]}" if diff else ""),
+                flush=True,
+            )
+            _log(
+                {
+                    "rank": 0,
+                    "verify_version": self.weight_version,
+                    "equal": ok,
+                    "checksum_head": (a or "")[:300],
+                    "differ": diff[:200],
+                }
+            )
             if not ok:
-                raise RuntimeError("asrt weight sync verification failed: engine checksums differ")
+                raise RuntimeError(
+                    "asrt weight sync verification failed: engine checksums differ"
+                )
 
     def _send_dispatch(self, pbar):
         if getattr(self, "_asrt_in_orig", False):

@@ -11,7 +11,9 @@ solvers = None  # no C++ extension in ai_search_plugin
 def query_key(q: str) -> int:
     """Stable 64-bit key of a normalized search query."""
     norm = " ".join(q.lower().split())
-    return int.from_bytes(hashlib.blake2b(norm.encode(), digest_size=8).digest(), "little") & ((1 << 63) - 1)
+    return int.from_bytes(
+        hashlib.blake2b(norm.encode(), digest_size=8).digest(), "little"
+    ) & ((1 << 63) - 1)
 
 
 def _tool_cache_impl(capacity, ttl_s):
@@ -33,8 +35,14 @@ class CachedTool:
     `key_fn` maps a query to the cache key (default: case/space-normalized).
     """
 
-    def __init__(self, fn: Callable[[str], Awaitable[str]], capacity: int = 1 << 20, ttl_s: float = 7 * 86400,
-                 key_fn: Optional[Callable[[str], int]] = None, no_cache: Optional[Callable[[str], bool]] = None):
+    def __init__(
+        self,
+        fn: Callable[[str], Awaitable[str]],
+        capacity: int = 1 << 20,
+        ttl_s: float = 7 * 86400,
+        key_fn: Optional[Callable[[str], int]] = None,
+        no_cache: Optional[Callable[[str], bool]] = None,
+    ):
         import threading
 
         # no_cache(out) -> True: a returned value that must not be cached (e.g. a tool's final error document,
@@ -44,7 +52,9 @@ class CachedTool:
 
         self.fn = fn
         self.cache, self._R = _tool_cache_impl(capacity, ttl_s)
-        self.backend = "cpp" if solvers is not None and hasattr(solvers, "ToolCache") else "python"
+        self.backend = (
+            "cpp" if solvers is not None and hasattr(solvers, "ToolCache") else "python"
+        )
         self.key_fn = key_fn or query_key
         self._waiters: Dict[int, List] = {}
         self._next = 0
@@ -85,8 +95,13 @@ class CachedTool:
         return out
 
     def stats(self):
-        return {"hits": self.cache.hits, "joins": self.cache.joins, "misses": self.cache.misses,
-                "backend": self.backend, "errors_not_cached": self.errors_not_cached}
+        return {
+            "hits": self.cache.hits,
+            "joins": self.cache.joins,
+            "misses": self.cache.misses,
+            "backend": self.backend,
+            "errors_not_cached": self.errors_not_cached,
+        }
 
 
 def _set_result(f, v):
@@ -99,10 +114,13 @@ def _set_exc(f, e):
         f.set_exception(e)
 
 
-def balanced_partitions(seqlens: Sequence[int], k: int, equal_size: bool = True, quad_coef: float = 0.0) -> List[List[int]]:
+def balanced_partitions(
+    seqlens: Sequence[int], k: int, equal_size: bool = True, quad_coef: float = 0.0
+) -> List[List[int]]:
     """Cost-balanced k-way partition (cost = L + quad_coef * L^2).
 
     Same contract as verl/slime `get_seqlen_balanced_partitions(seqlen_list,
     k_partitions, equal_size)`: returns k lists of indices."""
     from ..partition_py import balanced_partitions as _bp
+
     return [sorted(p) for p in _bp(list(map(int, seqlens)), k, equal_size, quad_coef)]

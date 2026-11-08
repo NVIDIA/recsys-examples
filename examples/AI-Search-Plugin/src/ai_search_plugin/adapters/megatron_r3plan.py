@@ -56,12 +56,40 @@ from .. import r3plan as core
 
 log = logging.getLogger("ai_search_plugin.megatron_r3plan")
 
-STATS = {"steps": 0, "builds": 0, "build_skipped": 0, "planned_calls": 0, "fallback_calls": 0, "verified_calls": 0,
-         "verify_fail": 0, "mismatch": 0, "build_ms_host": []}
-_S = {"installed": False, "orig": None, "source": None, "plan": None, "need": True, "built": False,
-      "dev": {}, "verify_fail_step": 0, "guard": None, "gather": None, "mapper": None, "why": "", "layout": None}
+STATS = {
+    "steps": 0,
+    "builds": 0,
+    "build_skipped": 0,
+    "planned_calls": 0,
+    "fallback_calls": 0,
+    "verified_calls": 0,
+    "verify_fail": 0,
+    "mismatch": 0,
+    "build_ms_host": [],
+}
+_S = {
+    "installed": False,
+    "orig": None,
+    "source": None,
+    "plan": None,
+    "need": True,
+    "built": False,
+    "dev": {},
+    "verify_fail_step": 0,
+    "guard": None,
+    "gather": None,
+    "mapper": None,
+    "why": "",
+    "layout": None,
+}
 
-_ATTRS = ("input_splits", "output_splits", "output_splits_tp", "num_out_tokens", "num_global_tokens_per_local_expert")
+_ATTRS = (
+    "input_splits",
+    "output_splits",
+    "output_splits_tp",
+    "num_out_tokens",
+    "num_global_tokens_per_local_expert",
+)
 
 
 def _env_int(name, default):
@@ -73,8 +101,10 @@ def _env_int(name, default):
 
 def guard() -> core.StepGuard:
     if _S["guard"] is None:
-        _S["guard"] = core.StepGuard(verify_steps=_env_int("ASRT_R3PLAN_VERIFY_STEPS", 1),
-                                     strict=os.environ.get("ASRT_R3PLAN_STRICT", "0") == "1")
+        _S["guard"] = core.StepGuard(
+            verify_steps=_env_int("ASRT_R3PLAN_VERIFY_STEPS", 1),
+            strict=os.environ.get("ASRT_R3PLAN_STRICT", "0") == "1",
+        )
     return _S["guard"]
 
 
@@ -88,7 +118,8 @@ def set_source(source) -> None:
 
 def set_route_mapper(fn: Optional[Callable]) -> None:
     """fn(layer_pos, ids_tensor) -> ids as the router will see them, for components that remap expert ids at replay
-    time (e.g. expert re-placement).  Call ``invalidate()`` collectively whenever the mapping changes."""
+    time (e.g. expert re-placement).  Call ``invalidate()`` collectively whenever the mapping changes.
+    """
     _S["mapper"] = fn
 
 
@@ -137,27 +168,53 @@ class Plan:
         self.E = int(disp.num_experts)
         self.nle = int(disp.num_local_experts)
         self.lo = int(disp.local_expert_indices[0])
-        self.T = [[int(lists[li][m].shape[0]) for li in range(self.L)] for m in range(self.M)]
+        self.T = [
+            [int(lists[li][m].shape[0]) for li in range(self.L)] for m in range(self.M)
+        ]
         local = torch.empty((self.M, self.L, self.E), dtype=torch.int32, device=device)
         for m in range(self.M):
             keys = []
-            for li, lst in enumerate(lists):   # key = layer * E + expert; holes (< 0) go to the spare last bin
+            for li, lst in enumerate(
+                lists
+            ):  # key = layer * E + expert; holes (< 0) go to the spare last bin
                 t = lst[m].to(device, torch.int64, non_blocking=True).reshape(-1)
-                keys.append(torch.where(t >= 0, t + li * self.E, torch.full_like(t, self.L * self.E)))
+                keys.append(
+                    torch.where(
+                        t >= 0, t + li * self.E, torch.full_like(t, self.L * self.E)
+                    )
+                )
             key = torch.cat(keys)
-            cnt = torch.zeros(self.L * self.E + 1, dtype=torch.int32, device=device)  # scatter_add: bincount syncs
-            cnt.scatter_add_(0, key.reshape(-1), torch.ones(key.numel(), dtype=torch.int32, device=device))
-            local[m] = cnt[:self.L * self.E].view(self.L, self.E)
-        glob = _gather(disp.tp_ep_group, local)                                   # [G, M, L, E]: the plan's one
-        self.G = int(glob.shape[0])                                               # count collective of the step
+            cnt = torch.zeros(
+                self.L * self.E + 1, dtype=torch.int32, device=device
+            )  # scatter_add: bincount syncs
+            cnt.scatter_add_(
+                0,
+                key.reshape(-1),
+                torch.ones(key.numel(), dtype=torch.int32, device=device),
+            )
+            local[m] = cnt[: self.L * self.E].view(self.L, self.E)
+        glob = _gather(disp.tp_ep_group, local)  # [G, M, L, E]: the plan's one
+        self.G = int(glob.shape[0])  # count collective of the step
         self.local_dev = local
-        self.glob_local_dev = glob[..., self.lo:self.lo + self.nle].to(torch.int64).contiguous()  # [G, M, L, nle]
-        self.local_host = local.to(torch.int64).cpu().numpy()                     # host copies: the step's only
-        self.glob_local_host = self.glob_local_dev.cpu().numpy()                  # host sync of the plan
+        self.glob_local_dev = (
+            glob[..., self.lo : self.lo + self.nle].to(torch.int64).contiguous()
+        )  # [G, M, L, nle]
+        self.local_host = (
+            local.to(torch.int64).cpu().numpy()
+        )  # host copies: the step's only
+        self.glob_local_host = (
+            self.glob_local_dev.cpu().numpy()
+        )  # host sync of the plan
 
     def splits(self, disp, m, li) -> core.Splits:
-        return core.splits_from_counts(self.local_host[m, li], self.glob_local_host[:, m, li], ep=disp.ep_size,
-                                       tp=disp.tp_size, tp_rank=disp.tp_rank, num_local_experts=self.nle)
+        return core.splits_from_counts(
+            self.local_host[m, li],
+            self.glob_local_host[:, m, li],
+            ep=disp.ep_size,
+            tp=disp.tp_size,
+            tp_rank=disp.tp_rank,
+            num_local_experts=self.nle,
+        )
 
 
 def _device(disp):
@@ -177,7 +234,9 @@ def _entries():
         return []
     mapper = _S["mapper"]
     if entries and mapper is not None:
-        entries = [(d, [mapper(li, t) for t in lst]) for li, (d, lst) in enumerate(entries)]
+        entries = [
+            (d, [mapper(li, t) for t in lst]) for li, (d, lst) in enumerate(entries)
+        ]
     return entries
 
 
@@ -191,23 +250,37 @@ def _build(disp):
     _S["why"] = ""
     device = _device(disp)
     entries = _entries()
-    ok = bool(entries) and all(len(lst) == len(entries[0][1]) and len(lst) > 0 for _, lst in entries)
+    ok = bool(entries) and all(
+        len(lst) == len(entries[0][1]) and len(lst) > 0 for _, lst in entries
+    )
     ok = ok and all(core.ineligible_reason(d) is None for d, _ in entries)
     M = len(entries[0][1]) if ok else 0
-    meta = torch.tensor([int(ok), M, len(entries) if ok else 0, int(disp.num_experts)], dtype=torch.int64,
-                        device=device)
-    allm = _gather(disp.tp_ep_group, meta).cpu().numpy()                     # [G, 4]
-    if not bool((allm[:, 0] == 1).all()) or not bool((allm[:, 1:] == allm[0, 1:]).all()):
+    meta = torch.tensor(
+        [int(ok), M, len(entries) if ok else 0, int(disp.num_experts)],
+        dtype=torch.int64,
+        device=device,
+    )
+    allm = _gather(disp.tp_ep_group, meta).cpu().numpy()  # [G, 4]
+    if not bool((allm[:, 0] == 1).all()) or not bool(
+        (allm[:, 1:] == allm[0, 1:]).all()
+    ):
         STATS["build_skipped"] += 1
-        _S["why"] = _S["why"] or ("a rank has no replay data" if not bool((allm[:, 0] == 1).all())
-                                  else "ranks disagree on micro-batches / layers / experts")
+        _S["why"] = _S["why"] or (
+            "a rank has no replay data"
+            if not bool((allm[:, 0] == 1).all())
+            else "ranks disagree on micro-batches / layers / experts"
+        )
         return None
-    with torch.cuda.nvtx.range("r3plan_build") if torch.cuda.is_available() else _null():
+    with torch.cuda.nvtx.range(
+        "r3plan_build"
+    ) if torch.cuda.is_available() else _null():
         plan = Plan(entries, disp, device)
     _S["plan"] = plan
     _S["built"] = True
     STATS["builds"] += 1
-    STATS["build_ms_host"] = (STATS["build_ms_host"] + [round((time.perf_counter() - t0) * 1e3, 2)])[-4:]
+    STATS["build_ms_host"] = (
+        STATS["build_ms_host"] + [round((time.perf_counter() - t0) * 1e3, 2)]
+    )[-4:]
     return plan
 
 
@@ -243,16 +316,27 @@ def _planned_values(disp, plan, m, li, routing_map):
     import torch
 
     sp = plan.splits(disp, m, li)
-    vals = {"input_splits": sp.input_splits, "output_splits": sp.output_splits,
-            "output_splits_tp": sp.output_splits_tp,
-            "num_out_tokens": int(routing_map.size(0)) * int(disp.config.moe_router_topk)}
+    vals = {
+        "input_splits": sp.input_splits,
+        "output_splits": sp.output_splits,
+        "output_splits_tp": sp.output_splits_tp,
+        "num_out_tokens": int(routing_map.size(0)) * int(disp.config.moe_router_topk),
+    }
     if plan.nle > 1:
-        if disp.config.moe_permute_fusion:   # Megatron keeps this one on the device under permute fusion
+        if (
+            disp.config.moe_permute_fusion
+        ):  # Megatron keeps this one on the device under permute fusion
             ep, tp, nle = disp.ep_size, disp.tp_size, plan.nle
             vals["num_global_tokens_per_local_expert"] = (
-                plan.glob_local_dev[:, m, li].reshape(ep, tp, nle).transpose(0, 1).reshape(-1, nle))
+                plan.glob_local_dev[:, m, li]
+                .reshape(ep, tp, nle)
+                .transpose(0, 1)
+                .reshape(-1, nle)
+            )
         else:
-            vals["num_global_tokens_per_local_expert"] = torch.from_numpy(sp.num_global_tokens_per_local_expert)
+            vals["num_global_tokens_per_local_expert"] = torch.from_numpy(
+                sp.num_global_tokens_per_local_expert
+            )
     return torch.from_numpy(sp.tokens_per_local_expert), vals
 
 
@@ -273,14 +357,19 @@ def _verify_call(disp, routing_map, orig, plan, m, li):
         STATS["verify_fail"] += 1
         _S["verify_fail_step"] += 1
         _S["why"] = f"verify: layer {li} micro-batch {m}: {bad}"
-    return tok   # original values stay in place: a verify step is exact either way
+    return tok  # original values stay in place: a verify step is exact either way
 
 
 def preprocess_planned(disp, routing_map, orig):
     """Replacement body of ``MoEAlltoAllTokenDispatcher.preprocess``."""
     src = _S["source"]
     g = guard()
-    if g.disabled or src is None or core.ineligible_reason(disp) is not None or not src.active():
+    if (
+        g.disabled
+        or src is None
+        or core.ineligible_reason(disp) is not None
+        or not src.active()
+    ):
         return _fallback(disp, routing_map, orig)
     if _S["need"]:
         _build(disp)
@@ -290,27 +379,37 @@ def preprocess_planned(disp, routing_map, orig):
     if plan is None or li is None or m is None or not 0 <= m < plan.M:
         return _fallback(disp, routing_map, orig)
     if int(routing_map.shape[0]) != plan.T[m][li]:
-        raise RuntimeError(f"r3 EP plan: layer {li} micro-batch {m} has {int(routing_map.shape[0])} tokens, the plan "
-                           f"{plan.T[m][li]} (replay data changed after the plan was built?); a single rank cannot "
-                           "fall back without desynchronizing the tp x ep group")
+        raise RuntimeError(
+            f"r3 EP plan: layer {li} micro-batch {m} has {int(routing_map.shape[0])} tokens, the plan "
+            f"{plan.T[m][li]} (replay data changed after the plan was built?); a single rank cannot "
+            "fall back without desynchronizing the tp x ep group"
+        )
     if g.verifying():
         return _verify_call(disp, routing_map, orig, plan, m, li)
     import torch
 
     cnt = _counter(routing_map.device)
-    cnt += (routing_map.sum(dim=0).to(torch.int32) != plan.local_dev[m, li].to(routing_map.device)).any().to(
-        torch.int64)
+    cnt += (
+        (
+            routing_map.sum(dim=0).to(torch.int32)
+            != plan.local_dev[m, li].to(routing_map.device)
+        )
+        .any()
+        .to(torch.int64)
+    )
     tok, vals = _planned_values(disp, plan, m, li, routing_map)
     for a, v in vals.items():
         setattr(disp, a, v)
-    disp.cuda_sync_point = "no_sync"   # every count is already on the host
+    disp.cuda_sync_point = "no_sync"  # every count is already on the host
     STATS["planned_calls"] += 1
     return tok
 
 
 def _fallback(disp, routing_map, orig):
     STATS["fallback_calls"] += 1
-    disp.cuda_sync_point = "no_sync"   # recomputed by the original (a planned call left it at no_sync)
+    disp.cuda_sync_point = (
+        "no_sync"  # recomputed by the original (a planned call left it at no_sync)
+    )
     return orig(disp, routing_map)
 
 
@@ -319,7 +418,9 @@ def install() -> bool:
     if _S["installed"]:
         return True
     try:
-        from megatron.core.transformer.moe.token_dispatcher import MoEAlltoAllTokenDispatcher as D
+        from megatron.core.transformer.moe.token_dispatcher import (
+            MoEAlltoAllTokenDispatcher as D,
+        )
     except Exception as e:  # pragma: no cover - needs Megatron
         log.warning("r3 EP plan: Megatron alltoall dispatcher not importable (%s)", e)
         return False
@@ -351,7 +452,11 @@ def _reduce_max(vals: List[int]) -> List[int]:
 
         if not dist.is_initialized():
             return vals
-        dev = torch.device("cuda", torch.cuda.current_device()) if torch.cuda.is_available() else torch.device("cpu")
+        dev = (
+            torch.device("cuda", torch.cuda.current_device())
+            if torch.cuda.is_available()
+            else torch.device("cpu")
+        )
         t = torch.tensor(vals, dtype=torch.int64, device=dev)
         dist.all_reduce(t, op=dist.ReduceOp.MAX)
         return [int(x) for x in t.tolist()]
@@ -380,8 +485,13 @@ def check_step() -> dict:
     _S["plan"] = None
     _S["need"] = True
     try:
-        rec = guard().end_step(mismatch=mismatch, verify_fail=vf, planned_calls=planned - prev[0],
-                               fallback_calls=fallback - prev[1], built=bool(built_any))
+        rec = guard().end_step(
+            mismatch=mismatch,
+            verify_fail=vf,
+            planned_calls=planned - prev[0],
+            fallback_calls=fallback - prev[1],
+            built=bool(built_any),
+        )
     finally:
         out = snapshot()
         _log_rec(out)
@@ -392,9 +502,16 @@ def check_step() -> dict:
 def snapshot() -> dict:
     g = guard()
     s = dict(STATS)
-    s.update(disabled=g.disabled, disabled_why=g.disabled_why, verify_steps=g.verify_steps,
-             planned_steps=g.planned_steps, why=_S["why"],
-             layout=None if _S["layout"] is None else "PP{}/VPP{} ({})".format(*_S["layout"]))
+    s.update(
+        disabled=g.disabled,
+        disabled_why=g.disabled_why,
+        verify_steps=g.verify_steps,
+        planned_steps=g.planned_steps,
+        why=_S["why"],
+        layout=None
+        if _S["layout"] is None
+        else "PP{}/VPP{} ({})".format(*_S["layout"]),
+    )
     return s
 
 
@@ -418,7 +535,28 @@ def _log_rec(rec):
 
 
 def _reset_for_tests():
-    STATS.update(steps=0, builds=0, build_skipped=0, planned_calls=0, fallback_calls=0, verified_calls=0,
-                 verify_fail=0, mismatch=0, build_ms_host=[])
-    _S.update(source=None, plan=None, need=True, built=False, dev={}, verify_fail_step=0, guard=None, gather=None,
-              mapper=None, why="", layout=None, prev_calls=(0, 0))
+    STATS.update(
+        steps=0,
+        builds=0,
+        build_skipped=0,
+        planned_calls=0,
+        fallback_calls=0,
+        verified_calls=0,
+        verify_fail=0,
+        mismatch=0,
+        build_ms_host=[],
+    )
+    _S.update(
+        source=None,
+        plan=None,
+        need=True,
+        built=False,
+        dev={},
+        verify_fail_step=0,
+        guard=None,
+        gather=None,
+        mapper=None,
+        why="",
+        layout=None,
+        prev_calls=(0, 0),
+    )

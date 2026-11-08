@@ -14,10 +14,24 @@ import os
 import ai_search_plugin as asp
 
 ap = argparse.ArgumentParser()
-ap.add_argument("--components", default="default", help='"default", "all", or a comma list ("default,-tool_hedge")')
-ap.add_argument("--generate", default="", help="module.attr of your slime custom generate function (for toolcache)")
-ap.add_argument("--tools", default="", help="comma list of module.attr read-only tool functions (toolcache / hedge)")
-ap.add_argument("--num-experts", type=int, default=0, help="MoE expert count (r3_transfer)")
+ap.add_argument(
+    "--components",
+    default="default",
+    help='"default", "all", or a comma list ("default,-tool_hedge")',
+)
+ap.add_argument(
+    "--generate",
+    default="",
+    help="module.attr of your slime custom generate function (for toolcache)",
+)
+ap.add_argument(
+    "--tools",
+    default="",
+    help="comma list of module.attr read-only tool functions (toolcache / hedge)",
+)
+ap.add_argument(
+    "--num-experts", type=int, default=0, help="MoE expert count (r3_transfer)"
+)
 ap.add_argument("--log-dir", default="")
 ap.add_argument("--out", default="runtime_env.json")
 ap.add_argument("--args-out", default="plugin_args.txt")
@@ -31,4 +45,6 @@ env = plan.full_env(os.environ.get("PYTHONPATH", ""))
 json.dump({"env_vars": env}, open(a.out, "w"), indent=1)
 open(a.args_out, "w").write(" ".join(plan.args) + "\n")
 print(plan.shell())
-print(f"\nwrote {a.out} and {a.args_out}; trainer launcher: {' '.join(plan.launcher) or 'python3'} <slime>/train.py")
+print(
+    f"\nwrote {a.out} and {a.args_out}; trainer launcher: {' '.join(plan.launcher) or 'python3'} <slime>/train.py"
+)

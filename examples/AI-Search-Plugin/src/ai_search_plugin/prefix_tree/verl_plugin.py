@@ -14,5 +14,8 @@ import os
 from . import install_verl
 
 installed = install_verl()
-if installed and os.environ.get('ASRT_VERL_QUIET', '0') != '1':
-    print(f'[asrt] ai_search_plugin prefix_tree verl pid={os.getpid()} hooks={installed}', flush=True)
+if installed and os.environ.get("ASRT_VERL_QUIET", "0") != "1":
+    print(
+        f"[asrt] ai_search_plugin prefix_tree verl pid={os.getpid()} hooks={installed}",
+        flush=True,
+    )

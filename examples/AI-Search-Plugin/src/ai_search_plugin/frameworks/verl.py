@@ -76,7 +76,11 @@ def plan(components="default", options: Optional[dict] = None) -> Plan:
     if o.get("log_dir"):
         env["ASRT_LOG_DIR"] = str(o["log_dir"])
     env["ASRT_VERL"] = ",".join(feats) if feats else "off"
-    mods = [m for m in os.environ.get("VERL_USE_EXTERNAL_MODULES", "").split(",") if m.strip()]
+    mods = [
+        m
+        for m in os.environ.get("VERL_USE_EXTERNAL_MODULES", "").split(",")
+        if m.strip()
+    ]
     if "ai_search_plugin.verl_plugin" not in mods:
         mods.append("ai_search_plugin.verl_plugin")
     if "prefix_tree" in names:
@@ -85,20 +89,29 @@ def plan(components="default", options: Optional[dict] = None) -> Plan:
             mods.append("ai_search_plugin.prefix_tree.verl_plugin")
     env["VERL_USE_EXTERNAL_MODULES"] = ",".join(mods)
     if "verl_inplace" in names:
-        p.notes.append("verl_inplace: requests that span a weight sync see old/mixed/new weights (behaviour logprobs "
-                       "stay exact); kvepoch is installed with it")
+        p.notes.append(
+            "verl_inplace: requests that span a weight sync see old/mixed/new weights (behaviour logprobs "
+            "stay exact); kvepoch is installed with it"
+        )
     p.components = names
     return p
 
 
-def install(components="default", options: Optional[dict] = None, environ=None, patch_now: bool = False) -> Plan:
+def install(
+    components="default",
+    options: Optional[dict] = None,
+    environ=None,
+    patch_now: bool = False,
+) -> Plan:
     """``plan()`` + write the env into ``environ`` (default ``os.environ``).
 
     patch_now=True additionally installs the verl patches in THIS process (what ``ai_search_plugin.verl_plugin``
-    does in every verl process); use it when you call ``install`` from inside a verl process yourself."""
+    does in every verl process); use it when you call ``install`` from inside a verl process yourself.
+    """
     p = plan(components, options)
     apply_env(p, environ)
     if patch_now:
         from ..adapters import verl as V
+
         V.install(p.env["ASRT_VERL"])
     return p

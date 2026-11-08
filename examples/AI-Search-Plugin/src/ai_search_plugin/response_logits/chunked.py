@@ -34,11 +34,19 @@ import torch.distributed as dist
 try:
     import triton
     import triton.language as tl
+
     _HAVE_TRITON = True
 except Exception:  # pragma: no cover
     _HAVE_TRITON = False
 
-_STATS = {'calls': 0, 'rows': 0, 'chunks': 0, 'bwd_calls': 0, 'fused_wgrad': 0, 'wgrad_impl': 'torch'}
+_STATS = {
+    "calls": 0,
+    "rows": 0,
+    "chunks": 0,
+    "bwd_calls": 0,
+    "fused_wgrad": 0,
+    "wgrad_impl": "torch",
+}
 
 
 def stats():
@@ -47,33 +55,41 @@ def stats():
 
 # --------------------------------------------------------------------------------------------- config
 def mode():
-    v = os.environ.get('RESPONSE_LOGITS_CHUNK', 'auto').strip().lower()
-    if v in ('', 'auto'):
-        return 'auto', 0
-    if v in ('0', 'off', 'false', 'no'):
-        return 'off', 0
-    if v in ('1', 'on', 'true', 'yes'):
-        return 'on', 0
+    v = os.environ.get("RESPONSE_LOGITS_CHUNK", "auto").strip().lower()
+    if v in ("", "auto"):
+        return "auto", 0
+    if v in ("0", "off", "false", "no"):
+        return "off", 0
+    if v in ("1", "on", "true", "yes"):
+        return "on", 0
     n = int(v)
     if n < 0:
-        raise ValueError(f'RESPONSE_LOGITS_CHUNK must be auto|on|off|<rows>, got {v!r}')
-    return 'on', n
+        raise ValueError(f"RESPONSE_LOGITS_CHUNK must be auto|on|off|<rows>, got {v!r}")
+    return "on", n
 
 
 def impl():
-    v = os.environ.get('RESPONSE_LOGITS_CHUNK_IMPL', 'triton' if _HAVE_TRITON else 'torch').strip().lower()
-    if v == 'triton' and not _HAVE_TRITON:
-        v = 'torch'
+    v = (
+        os.environ.get(
+            "RESPONSE_LOGITS_CHUNK_IMPL", "triton" if _HAVE_TRITON else "torch"
+        )
+        .strip()
+        .lower()
+    )
+    if v == "triton" and not _HAVE_TRITON:
+        v = "torch"
     return v
 
 
 def budget_bytes():
-    return int(float(os.environ.get('RESPONSE_LOGITS_CHUNK_MB', '2048')) * 2**20)
+    return int(float(os.environ.get("RESPONSE_LOGITS_CHUNK_MB", "2048")) * 2**20)
 
 
 def auto_rows(vocab_local, impl_name=None):
     """Rows per block so that the block working set stays within the budget."""
-    per = 2 if (impl_name or impl()) == 'triton' else 14  # bf16 block | bf16 + 3 fp32 temporaries
+    per = (
+        2 if (impl_name or impl()) == "triton" else 14
+    )  # bf16 block | bf16 + 3 fp32 temporaries
     rows = budget_bytes() // max(1, vocab_local * per)
     return max(128, rows // 128 * 128)
 
@@ -82,19 +98,33 @@ def decide(n_rows, vocab_local):
     """Chunk rows to use for a micro-batch with n_rows compact rows (0 = keep the unchunked path).
     Depends only on (n_rows, vocab_local, env), so every TP rank decides the same."""
     m, forced = mode()
-    if m == 'off':
+    if m == "off":
         return 0
     rows = forced or auto_rows(vocab_local)
-    if m == 'auto' and n_rows * vocab_local * 4 <= budget_bytes():
+    if m == "auto" and n_rows * vocab_local * 4 <= budget_bytes():
         return 0
     return rows
 
 
 # --------------------------------------------------------------------------------------------- kernels
 if _HAVE_TRITON:
+
     @triton.jit
-    def _fwd_stats_kernel(Z, stride_z, TGT, TEMP, M_OUT, S_OUT, T_OUT, ZT_OUT, V, vstart,
-                          HAS_TEMP_VEC: tl.constexpr, temp_scalar, BLOCK: tl.constexpr):
+    def _fwd_stats_kernel(
+        Z,
+        stride_z,
+        TGT,
+        TEMP,
+        M_OUT,
+        S_OUT,
+        T_OUT,
+        ZT_OUT,
+        V,
+        vstart,
+        HAS_TEMP_VEC: tl.constexpr,
+        temp_scalar,
+        BLOCK: tl.constexpr,
+    ):
         row = tl.program_id(0).to(tl.int64)
         if HAS_TEMP_VEC:
             temp = tl.load(TEMP + row)
@@ -102,7 +132,7 @@ if _HAVE_TRITON:
             temp = temp_scalar
         base = Z + row * stride_z
         cols0 = tl.arange(0, BLOCK)
-        m = tl.full([], float('-inf'), tl.float32)
+        m = tl.full([], float("-inf"), tl.float32)
         s = tl.zeros([], tl.float32)
         t = tl.zeros([], tl.float32)
         for off in range(0, V, BLOCK):
@@ -110,7 +140,7 @@ if _HAVE_TRITON:
             msk = cols < V
             z = tl.load(base + cols, mask=msk, other=0.0).to(tl.float32)
             z = tl.math.div_rn(z, temp)
-            z = tl.where(msk, z, float('-inf'))
+            z = tl.where(msk, z, float("-inf"))
             m_new = tl.maximum(m, tl.max(z, 0))
             alpha = tl.exp(m - m_new)
             e = tl.exp(z - m_new)
@@ -127,8 +157,22 @@ if _HAVE_TRITON:
         tl.store(ZT_OUT + row, zt)
 
     @triton.jit
-    def _bwd_kernel(Z, stride_z, TGT, TEMP, LSE, EZ, GLP, GENT, V, vstart,
-                    HAS_TEMP_VEC: tl.constexpr, temp_scalar, HAS_ENT: tl.constexpr, BLOCK: tl.constexpr):
+    def _bwd_kernel(
+        Z,
+        stride_z,
+        TGT,
+        TEMP,
+        LSE,
+        EZ,
+        GLP,
+        GENT,
+        V,
+        vstart,
+        HAS_TEMP_VEC: tl.constexpr,
+        temp_scalar,
+        HAS_ENT: tl.constexpr,
+        BLOCK: tl.constexpr,
+    ):
         """In place: Z (bf16 logits block) <- d loss / d logits (bf16)."""
         row = tl.program_id(0).to(tl.int64)
         if HAS_TEMP_VEC:
@@ -158,16 +202,29 @@ if _HAVE_TRITON:
 
 
 def _block():
-    return int(os.environ.get('RESPONSE_LOGITS_CHUNK_BLOCK', '4096'))
+    return int(os.environ.get("RESPONSE_LOGITS_CHUNK_BLOCK", "4096"))
 
 
 def _stats_triton(z, tgt, temp_vec, temp_scalar, vstart):
     c, V = z.shape
     out = torch.empty(4, c, device=z.device, dtype=torch.float32)
     if c:
-        _fwd_stats_kernel[(c,)](z, z.stride(0), tgt, temp_vec if temp_vec is not None else out, out[0], out[1],
-                                out[2], out[3], V, vstart, HAS_TEMP_VEC=temp_vec is not None,
-                                temp_scalar=float(temp_scalar), BLOCK=_block(), num_warps=8)
+        _fwd_stats_kernel[(c,)](
+            z,
+            z.stride(0),
+            tgt,
+            temp_vec if temp_vec is not None else out,
+            out[0],
+            out[1],
+            out[2],
+            out[3],
+            V,
+            vstart,
+            HAS_TEMP_VEC=temp_vec is not None,
+            temp_scalar=float(temp_scalar),
+            BLOCK=_block(),
+            num_warps=8,
+        )
     return out
 
 
@@ -181,7 +238,7 @@ def _stats_torch(z, tgt, temp_vec, temp_scalar, vstart):
     m = zf.max(dim=1).values
     e = (zf - m.unsqueeze(1)).exp_()
     s = e.sum(dim=1)
-    t = torch.einsum('ij,ij->i', e, zf)
+    t = torch.einsum("ij,ij->i", e, zf)
     del e
     lt = tgt - vstart
     own = (lt >= 0) & (lt < V)
@@ -217,46 +274,85 @@ def _bwd_torch(z, tgt, temp_vec, temp_scalar, vstart, lse, ez, glp, gent):
 def _bwd_triton(z, tgt, temp_vec, temp_scalar, vstart, lse, ez, glp, gent):
     c, V = z.shape
     if c:
-        _bwd_kernel[(c,)](z, z.stride(0), tgt, temp_vec if temp_vec is not None else lse, lse,
-                          ez if ez is not None else lse, glp, gent if gent is not None else lse, V, vstart,
-                          HAS_TEMP_VEC=temp_vec is not None, temp_scalar=float(temp_scalar),
-                          HAS_ENT=gent is not None, BLOCK=_block(), num_warps=8)
+        _bwd_kernel[(c,)](
+            z,
+            z.stride(0),
+            tgt,
+            temp_vec if temp_vec is not None else lse,
+            lse,
+            ez if ez is not None else lse,
+            glp,
+            gent if gent is not None else lse,
+            V,
+            vstart,
+            HAS_TEMP_VEC=temp_vec is not None,
+            temp_scalar=float(temp_scalar),
+            HAS_ENT=gent is not None,
+            BLOCK=_block(),
+            num_warps=8,
+        )
 
 
 # --------------------------------------------------------------------------------------------- wgrad
 def _wgrad_accum_fn():
     """f(x [c, h], dy [c, V], out [V, h] fp32): out += dy^T @ x with fp32 accumulation and no temporary.
     apex fused_weight_gradient_mlp_cuda (what Megatron's ColumnParallelLinear uses) if present, else Transformer
-    Engine's general_gemm(accumulate=True) (what TE linear layers use for main_grad), else None."""
-    if 'wgrad' in _CACHE:
-        return _CACHE['wgrad']
+    Engine's general_gemm(accumulate=True) (what TE linear layers use for main_grad), else None.
+    """
+    if "wgrad" in _CACHE:
+        return _CACHE["wgrad"]
     fn = None
-    if os.environ.get('RESPONSE_LOGITS_CHUNK_WGRAD', 'auto') in ('auto', 'apex'):
+    if os.environ.get("RESPONSE_LOGITS_CHUNK_WGRAD", "auto") in ("auto", "apex"):
         try:
             import fused_weight_gradient_mlp_cuda as f
+
             fn = f.wgrad_gemm_accum_fp32
-            _STATS['wgrad_impl'] = 'apex'
+            _STATS["wgrad_impl"] = "apex"
         except Exception:
             fn = None
-    if fn is None and os.environ.get('RESPONSE_LOGITS_CHUNK_WGRAD', 'auto') in ('auto', 'te'):
+    if fn is None and os.environ.get("RESPONSE_LOGITS_CHUNK_WGRAD", "auto") in (
+        "auto",
+        "te",
+    ):
         try:
             import inspect
+
             from transformer_engine.pytorch.cpp_extensions import general_gemm
+
             params = inspect.signature(general_gemm).parameters
             ws = None
-            if 'workspace' in params:
+            if "workspace" in params:
                 from transformer_engine.pytorch.module.base import get_workspace
+
                 ws = get_workspace
 
             def fn(x, dy, out, _g=general_gemm, _ws=ws):
                 if _ws is not None:
-                    _g(x, dy, _ws(), out_dtype=torch.float32, layout='NT', grad=True, out=out, accumulate=True)
+                    _g(
+                        x,
+                        dy,
+                        _ws(),
+                        out_dtype=torch.float32,
+                        layout="NT",
+                        grad=True,
+                        out=out,
+                        accumulate=True,
+                    )
                 else:
-                    _g(x, dy, out_dtype=torch.float32, layout='NT', grad=True, out=out, accumulate=True)
-            _STATS['wgrad_impl'] = 'te'
+                    _g(
+                        x,
+                        dy,
+                        out_dtype=torch.float32,
+                        layout="NT",
+                        grad=True,
+                        out=out,
+                        accumulate=True,
+                    )
+
+            _STATS["wgrad_impl"] = "te"
         except Exception:
             fn = None
-    _CACHE['wgrad'] = fn
+    _CACHE["wgrad"] = fn
     return fn
 
 
@@ -281,11 +377,32 @@ def _accum_wgrad(out, x, dy):
 
 class Spec:
     """Non-tensor arguments of the op."""
-    __slots__ = ('tp_group', 'vstart', 'temperature', 'with_entropy', 'entropy_grad', 'chunk', 'grad_accum_fusion',
-                 'allreduce_dgrad', 'impl')
 
-    def __init__(self, *, tp_group=None, vstart=0, temperature=1.0, with_entropy=True, entropy_grad=True,
-                 chunk=4096, grad_accum_fusion=False, allreduce_dgrad=True, impl_name=None):
+    __slots__ = (
+        "tp_group",
+        "vstart",
+        "temperature",
+        "with_entropy",
+        "entropy_grad",
+        "chunk",
+        "grad_accum_fusion",
+        "allreduce_dgrad",
+        "impl",
+    )
+
+    def __init__(
+        self,
+        *,
+        tp_group=None,
+        vstart=0,
+        temperature=1.0,
+        with_entropy=True,
+        entropy_grad=True,
+        chunk=4096,
+        grad_accum_fusion=False,
+        allreduce_dgrad=True,
+        impl_name=None,
+    ):
         self.tp_group = tp_group
         self.vstart = int(vstart)
         self.temperature = float(temperature)
@@ -303,8 +420,9 @@ _WS = {}
 def _block_buf(c, V, like):
     """[c, V] scratch for one logits block. With RESPONSE_LOGITS_CHUNK_WS=1 (default off: no reserved-memory gain was measured, +2 GiB allocated) one persistent buffer per device is
     reused by every call (forward and backward never overlap on a stream), so the caching allocator does not have to find
-    a fresh multi-GiB hole for every block (repeated large allocations fragment the pool and grow the reserved memory)."""
-    if os.environ.get('RESPONSE_LOGITS_CHUNK_WS', '0') != '1':
+    a fresh multi-GiB hole for every block (repeated large allocations fragment the pool and grow the reserved memory).
+    """
+    if os.environ.get("RESPONSE_LOGITS_CHUNK_WS", "0") != "1":
         return torch.empty(c, V, device=like.device, dtype=like.dtype)
     key = (like.device, like.dtype)
     buf = _WS.get(key)
@@ -313,7 +431,7 @@ def _block_buf(c, V, like):
         del buf
         buf = torch.empty(c * V, device=like.device, dtype=like.dtype)
         _WS[key] = buf
-    return buf[:c * V].view(c, V)
+    return buf[: c * V].view(c, V)
 
 
 def release_workspace():
@@ -331,17 +449,24 @@ class _ChunkedLMHeadLogProb(torch.autograd.Function):
     def forward(ctx, x, weight, targets, temp_vec, spec):
         n, h = x.shape
         V = weight.size(0)
-        stats_fn = _stats_triton if spec.impl == 'triton' else _stats_torch
+        stats_fn = _stats_triton if spec.impl == "triton" else _stats_torch
         st = torch.empty(4, n, device=x.device, dtype=torch.float32)
         w_t = weight.t()
         cmax = min(n, spec.chunk)
         for a in range(0, n, spec.chunk):
             b = min(n, a + spec.chunk)
-            z = torch.mm(x[a:b], w_t, out=_block_buf(cmax, V, x)[:b - a])  # [c, V/TP] (= the output layer's GEMM)
-            st[:, a:b] = stats_fn(z, targets[a:b], None if temp_vec is None else temp_vec[a:b], spec.temperature,
-                                  spec.vstart)
+            z = torch.mm(
+                x[a:b], w_t, out=_block_buf(cmax, V, x)[: b - a]
+            )  # [c, V/TP] (= the output layer's GEMM)
+            st[:, a:b] = stats_fn(
+                z,
+                targets[a:b],
+                None if temp_vec is None else temp_vec[a:b],
+                spec.temperature,
+                spec.vstart,
+            )
             del z
-            _STATS['chunks'] += 1
+            _STATS["chunks"] += 1
         m_loc, s_loc, t_loc, zt = st[0], st[1], st[2], st[3]
         tp = _tp_size(spec.tp_group)
         if tp > 1:
@@ -363,8 +488,8 @@ class _ChunkedLMHeadLogProb(torch.autograd.Function):
         if not spec.entropy_grad:
             ctx.mark_non_differentiable(entropy)
         ctx.set_materialize_grads(False)
-        _STATS['calls'] += 1
-        _STATS['rows'] += n
+        _STATS["calls"] += 1
+        _STATS["rows"] += n
         return log_prob, entropy
 
     @staticmethod
@@ -376,28 +501,47 @@ class _ChunkedLMHeadLogProb(torch.autograd.Function):
         need_x, need_w = ctx.needs_input_grad[0], ctx.needs_input_grad[1]
         if g_lp is None and g_ent is None:
             return None, None, None, None, None
-        g_lp = torch.zeros_like(lse) if g_lp is None else g_lp.float().reshape(-1).contiguous()
+        g_lp = (
+            torch.zeros_like(lse)
+            if g_lp is None
+            else g_lp.float().reshape(-1).contiguous()
+        )
         if not spec.entropy_grad or g_ent is None:
             g_ent = None
         else:
             g_ent = g_ent.float().reshape(-1).contiguous()
-        bwd = _bwd_triton if spec.impl == 'triton' else _bwd_torch
+        bwd = _bwd_triton if spec.impl == "triton" else _bwd_torch
         dx = torch.empty_like(x) if need_x else None
         fused = False
         dw32 = None
         if need_w:
-            if spec.grad_accum_fusion and hasattr(weight, 'main_grad') and weight.main_grad is not None:
+            if (
+                spec.grad_accum_fusion
+                and hasattr(weight, "main_grad")
+                and weight.main_grad is not None
+            ):
                 fused = True  # accumulate straight into Megatron's main_grad (as ColumnParallelLinear does)
             else:
-                dw32 = torch.zeros(weight.shape, device=weight.device, dtype=torch.float32)
+                dw32 = torch.zeros(
+                    weight.shape, device=weight.device, dtype=torch.float32
+                )
         w_t = weight.t()
         V = weight.size(0)
         cmax = min(n, spec.chunk)
         for a in range(0, n, spec.chunk):
             b = min(n, a + spec.chunk)
-            z = torch.mm(x[a:b], w_t, out=_block_buf(cmax, V, x)[:b - a])
-            bwd(z, targets[a:b], None if temp_vec is None else temp_vec[a:b], spec.temperature, spec.vstart,
-                lse[a:b], ez[a:b], g_lp[a:b], None if g_ent is None else g_ent[a:b])
+            z = torch.mm(x[a:b], w_t, out=_block_buf(cmax, V, x)[: b - a])
+            bwd(
+                z,
+                targets[a:b],
+                None if temp_vec is None else temp_vec[a:b],
+                spec.temperature,
+                spec.vstart,
+                lse[a:b],
+                ez[a:b],
+                g_lp[a:b],
+                None if g_ent is None else g_ent[a:b],
+            )
             if need_x:
                 torch.mm(z, weight, out=dx[a:b])
             if need_w:
@@ -408,23 +552,30 @@ class _ChunkedLMHeadLogProb(torch.autograd.Function):
         dw = None
         if need_w:
             if fused:
-                _STATS['fused_wgrad'] += 1
-                if hasattr(weight, 'grad_added_to_main_grad'):  # Megatron convention (DDP skips the add)
-                    if getattr(weight, 'zero_out_wgrad', False):
-                        dw = torch.zeros(weight.main_grad.shape, dtype=x.dtype, device=x.device)
+                _STATS["fused_wgrad"] += 1
+                if hasattr(
+                    weight, "grad_added_to_main_grad"
+                ):  # Megatron convention (DDP skips the add)
+                    if getattr(weight, "zero_out_wgrad", False):
+                        dw = torch.zeros(
+                            weight.main_grad.shape, dtype=x.dtype, device=x.device
+                        )
                     else:
-                        dw = torch.empty(weight.main_grad.shape, dtype=x.dtype, device=x.device)
+                        dw = torch.empty(
+                            weight.main_grad.shape, dtype=x.dtype, device=x.device
+                        )
                     weight.grad_added_to_main_grad = True
             else:
                 dw = dw32.to(weight.dtype)
-        _STATS['bwd_calls'] += 1
+        _STATS["bwd_calls"] += 1
         return dx, dw, None, None, None
 
 
 def lm_head_logprob_entropy(x, weight, targets, spec, temp_vec=None):
     """x [n, h] (rows already TP-replicated), weight [V/TP, h] (vocab shard starting at spec.vstart), targets [n]
     global token ids, temp_vec optional fp32 [n] per-row temperature (else spec.temperature).
-    Returns (log_prob [n] fp32, entropy [n] fp32 or [0] when spec.with_entropy is False)."""
+    Returns (log_prob [n] fp32, entropy [n] fp32 or [0] when spec.with_entropy is False).
+    """
     x = x.contiguous()
     targets = targets.reshape(-1).long().contiguous()
     if temp_vec is not None:

@@ -36,8 +36,20 @@ class World:
 
     def __init__(self, seed=0):
         rng = np.random.default_rng(seed)
-        self.routes = {r: [[torch.from_numpy(np.stack([rng.choice(E, K, replace=False) for _ in range(int(T))]))
-                            for _ in range(L)] for T in rng.integers(4, 20, size=M)] for r in range(G)}
+        self.routes = {
+            r: [
+                [
+                    torch.from_numpy(
+                        np.stack(
+                            [rng.choice(E, K, replace=False) for _ in range(int(T))]
+                        )
+                    )
+                    for _ in range(L)
+                ]
+                for T in rng.integers(4, 20, size=M)
+            ]
+            for r in range(G)
+        }
         self.cur = None
         self.meta_override = None
 
@@ -45,26 +57,41 @@ class World:
         return torch.bincount(self.routes[r][m][li].reshape(-1), minlength=E)
 
     def gather(self, group, t):
-        if t.ndim == 1 and t.numel() == 4:                       # build meta
+        if t.ndim == 1 and t.numel() == 4:  # build meta
             rows = [t.clone() for _ in range(G)]
             if self.meta_override is not None:
                 rows[1] = torch.tensor(self.meta_override, dtype=t.dtype)
             return torch.stack(rows)
-        if t.ndim == 3:                                           # plan counts [M, L, E]
-            return torch.stack([torch.stack([torch.stack([self.counts(r, m, li) for li in range(L)])
-                                             for m in range(M)]).to(t.dtype) for r in range(G)])
-        m, li = self.cur                                          # original preprocess: one layer call's counts
+        if t.ndim == 3:  # plan counts [M, L, E]
+            return torch.stack(
+                [
+                    torch.stack(
+                        [
+                            torch.stack([self.counts(r, m, li) for li in range(L)])
+                            for m in range(M)
+                        ]
+                    ).to(t.dtype)
+                    for r in range(G)
+                ]
+            )
+        m, li = self.cur  # original preprocess: one layer call's counts
         return torch.stack([self.counts(r, m, li) for r in range(G)]).to(t.dtype)
 
 
 class FakeDispatcher:
     """Megatron MoEAlltoAllTokenDispatcher.preprocess arithmetic (dropless, ep*tp > 1)."""
+
     calls = 0
 
     def __init__(self, world, rank, fusion=True):
         self.world = world
-        self.config = SimpleNamespace(moe_router_topk=K, moe_permute_fusion=fusion, moe_expert_capacity_factor=None,
-                                      moe_router_padding_for_quantization=False, cuda_graph_impl="none")
+        self.config = SimpleNamespace(
+            moe_router_topk=K,
+            moe_permute_fusion=fusion,
+            moe_expert_capacity_factor=None,
+            moe_router_padding_for_quantization=False,
+            cuda_graph_impl="none",
+        )
         self.drop_and_pad = False
         self.cuda_dtoh_point = "before_permutation_1"
         self.cuda_sync_point = "no_sync"
@@ -80,8 +107,14 @@ class FakeDispatcher:
         local = routing_map.sum(dim=0).long()
         self.num_out_tokens = routing_map.size(0) * K
         self.input_splits = local.reshape(EP, NLE).sum(axis=1)
-        glob = self.world.gather(self.tp_ep_group, local).reshape(EP, TP, E).transpose(0, 1)
-        ngtle = glob[:, :, self.local_expert_indices[0]:self.local_expert_indices[-1] + 1].contiguous()
+        glob = (
+            self.world.gather(self.tp_ep_group, local)
+            .reshape(EP, TP, E)
+            .transpose(0, 1)
+        )
+        ngtle = glob[
+            :, :, self.local_expert_indices[0] : self.local_expert_indices[-1] + 1
+        ].contiguous()
         per_rank = ngtle.sum(axis=2)
         self.output_splits = per_rank[self.tp_rank]
         self.output_splits_tp = per_rank.sum(axis=1)
@@ -95,7 +128,7 @@ class Source:
     def __init__(self, world, rank, disps):
         self.world, self.rank, self.disps = world, rank, disps
         self.on = True
-        self.shift = 0          # wrong micro-batch mapping when != 0
+        self.shift = 0  # wrong micro-batch mapping when != 0
         self.empty = False
 
     def active(self):
@@ -104,7 +137,10 @@ class Source:
     def lists(self):
         if self.empty:
             return []
-        return [(d, [self.world.routes[self.rank][m][li] for m in range(M)]) for li, d in enumerate(self.disps)]
+        return [
+            (d, [self.world.routes[self.rank][m][li] for m in range(M)])
+            for li, d in enumerate(self.disps)
+        ]
 
     def index(self, li):
         return (self.world.cur[0] + self.shift) % M
@@ -114,7 +150,13 @@ def _rmap(ids):
     return torch.zeros(ids.shape[0], E, dtype=torch.bool).scatter_(1, ids.long(), True)
 
 
-ATTRS = ("input_splits", "output_splits", "output_splits_tp", "num_out_tokens", "num_global_tokens_per_local_expert")
+ATTRS = (
+    "input_splits",
+    "output_splits",
+    "output_splits_tp",
+    "num_out_tokens",
+    "num_global_tokens_per_local_expert",
+)
 
 
 def _host(v):
@@ -126,7 +168,9 @@ def _host(v):
 @pytest.fixture
 def env(monkeypatch):
     mp._reset_for_tests()
-    monkeypatch.setattr(FakeDispatcher, "preprocess", FakeDispatcher.preprocess)   # restored after the test
+    monkeypatch.setattr(
+        FakeDispatcher, "preprocess", FakeDispatcher.preprocess
+    )  # restored after the test
     for k in ("ASRT_R3PLAN_VERIFY_STEPS", "ASRT_R3PLAN_STRICT", "ASRT_LOG_DIR"):
         monkeypatch.delenv(k, raising=False)
     orig = FakeDispatcher.preprocess
@@ -147,12 +191,23 @@ def _setup(rank, fusion=True, seed=0):
 
 def _step(w, disps, order=None):
     out = []
-    for m in (order or range(M)):
+    for m in order or range(M):
         for li, d in enumerate(disps):
             w.cur = (m, li)
             tok = d.preprocess(_rmap(w.routes[d.tp_ep_group.rank()][m][li]))
-            out.append((m, li, _host(tok), {a: _host(getattr(d, a)) for a in ATTRS if getattr(d, a) is not None},
-                        d.cuda_sync_point))
+            out.append(
+                (
+                    m,
+                    li,
+                    _host(tok),
+                    {
+                        a: _host(getattr(d, a))
+                        for a in ATTRS
+                        if getattr(d, a) is not None
+                    },
+                    d.cuda_sync_point,
+                )
+            )
     return out
 
 
@@ -171,7 +226,11 @@ def test_planned_equals_original_and_skips_it(env, rank, fusion):
     # step 1: verify step (original runs on every call, compared exactly)
     FakeDispatcher.calls = 0
     _step(w, disps)
-    assert FakeDispatcher.calls == M * L and mp.STATS["verified_calls"] == M * L and mp.STATS["verify_fail"] == 0
+    assert (
+        FakeDispatcher.calls == M * L
+        and mp.STATS["verified_calls"] == M * L
+        and mp.STATS["verify_fail"] == 0
+    )
     s = mp.check_step()
     assert not s["disabled"] and s["planned_steps"] == 1
     # step 2: planned, never calls the original
@@ -185,7 +244,9 @@ def test_planned_equals_original_and_skips_it(env, rank, fusion):
         assert sync == "no_sync"
     s = mp.check_step()
     assert s["mismatch"] == 0 and not s["disabled"] and s["builds"] == 2
-    if fusion:   # Megatron keeps num_global_tokens_per_local_expert as a device tensor under permute fusion
+    if (
+        fusion
+    ):  # Megatron keeps num_global_tokens_per_local_expert as a device tensor under permute fusion
         assert torch.is_tensor(disps[0].num_global_tokens_per_local_expert)
 
 
@@ -194,7 +255,11 @@ def test_inactive_and_ineligible_fall_back(env):
     src.on = False
     FakeDispatcher.calls = 0
     _step(w, disps)
-    assert FakeDispatcher.calls == M * L and mp.STATS["fallback_calls"] == M * L and mp.STATS["builds"] == 0
+    assert (
+        FakeDispatcher.calls == M * L
+        and mp.STATS["fallback_calls"] == M * L
+        and mp.STATS["builds"] == 0
+    )
     src.on = True
     for d in disps:
         d.config.moe_expert_capacity_factor = 1.0
@@ -205,19 +270,23 @@ def test_inactive_and_ineligible_fall_back(env):
 def test_guard_wrong_microbatch_falls_back(env, monkeypatch):
     monkeypatch.setenv("ASRT_R3PLAN_VERIFY_STEPS", "0")
     w, disps, src = _setup(1)
-    for li in range(L):                              # equal T across micro-batches, so only the device check
-        T = min(w.routes[1][m][li].shape[0] for m in range(M))   # can see the wrong micro-batch
+    for li in range(L):  # equal T across micro-batches, so only the device check
+        T = min(
+            w.routes[1][m][li].shape[0] for m in range(M)
+        )  # can see the wrong micro-batch
         for m in range(M):
             w.routes[1][m][li] = w.routes[1][m][li][:T]
-    src.shift = 1                                    # plan rows of the wrong micro-batch
+    src.shift = 1  # plan rows of the wrong micro-batch
     FakeDispatcher.calls = 0
     _step(w, disps)
     assert FakeDispatcher.calls == 0 and mp.STATS["planned_calls"] == M * L
     s = mp.check_step()
-    assert s["mismatch"] > 0 and s["disabled"] and s["step_record"]["action"] == "fallback"
+    assert (
+        s["mismatch"] > 0 and s["disabled"] and s["step_record"]["action"] == "fallback"
+    )
     FakeDispatcher.calls = 0
     _step(w, disps)
-    assert FakeDispatcher.calls == M * L          # original path from now on
+    assert FakeDispatcher.calls == M * L  # original path from now on
 
 
 def test_guard_strict_raises(env, monkeypatch):
@@ -245,7 +314,7 @@ def test_verify_step_catches_wrong_mapping_with_original_values(env):
     got = _step(w, disps)
     assert mp.STATS["verify_fail"] > 0
     ref_d = FakeDispatcher(w, 3)
-    for m, li, tok, attrs, _ in got:                 # verify calls kept the original values
+    for m, li, tok, attrs, _ in got:  # verify calls kept the original values
         w.cur = (m, li)
         assert np.array_equal(tok, _host(orig(ref_d, _rmap(w.routes[3][m][li]))))
     s = mp.check_step()
@@ -254,12 +323,16 @@ def test_verify_step_catches_wrong_mapping_with_original_values(env):
 
 def test_build_skipped_symmetrically(env):
     w, disps, src = _setup(0)
-    w.meta_override = [0, 0, 0, E]                  # another rank has no replay data
+    w.meta_override = [0, 0, 0, E]  # another rank has no replay data
     FakeDispatcher.calls = 0
     _step(w, disps)
-    assert mp.STATS["build_skipped"] == 1 and FakeDispatcher.calls == M * L and mp.STATS["planned_calls"] == 0
+    assert (
+        mp.STATS["build_skipped"] == 1
+        and FakeDispatcher.calls == M * L
+        and mp.STATS["planned_calls"] == 0
+    )
     mp.check_step()
-    w.meta_override = [1, M + 1, L, E]              # ranks disagree on the micro-batch count
+    w.meta_override = [1, M + 1, L, E]  # ranks disagree on the micro-batch count
     _step(w, disps)
     assert mp.STATS["build_skipped"] == 2 and "disagree" in mp.snapshot()["why"]
 
@@ -280,7 +353,10 @@ def test_mapper_applied(env, monkeypatch):
     mp.set_route_mapper(lambda li, t: perm[t.long()])
     w.cur = (0, 0)
     p = mp._build(disps[0])
-    assert np.array_equal(p.local_host[0, 0], np.bincount(perm[w.routes[0][0][0].long()].reshape(-1), minlength=E))
+    assert np.array_equal(
+        p.local_host[0, 0],
+        np.bincount(perm[w.routes[0][0][0].long()].reshape(-1), minlength=E),
+    )
 
 
 # ------------------------------------------------------------------------------------------------- slime glue
@@ -291,8 +367,11 @@ def test_slime_source_cursor_and_lists(monkeypatch):
 
     d = object()
     a = [torch.zeros(3, K, dtype=torch.int32)] * M
-    layer = SimpleNamespace(router=SimpleNamespace(routing_replay=RR(a)), token_dispatcher=d,
-                            config=SimpleNamespace(moe_token_dispatcher_type="alltoall"))
+    layer = SimpleNamespace(
+        router=SimpleNamespace(routing_replay=RR(a)),
+        token_dispatcher=d,
+        config=SimpleNamespace(moe_token_dispatcher_type="alltoall"),
+    )
     src = sp.SlimeReplaySource([layer])
     monkeypatch.setenv("ENABLE_ROUTING_REPLAY", "1")
     monkeypatch.setenv("ROUTING_REPLAY_STAGE", "fallthrough")
@@ -307,13 +386,20 @@ def test_slime_source_cursor_and_lists(monkeypatch):
     layer.router.routing_replay.backward_index = 3
     assert src.index(0) == 2
     import sys
+
     mgr = SimpleNamespace(map_routed_ids=lambda lid, t: t + 1 + lid)
-    monkeypatch.setitem(sys.modules, "ai_search_plugin.adapters.slime_placement", SimpleNamespace(_STATE={"mgr": mgr}))
+    monkeypatch.setitem(
+        sys.modules,
+        "ai_search_plugin.adapters.slime_placement",
+        SimpleNamespace(_STATE={"mgr": mgr}),
+    )
     layer.router.routing_replay._asrt_layer = 2
-    assert int(src.lists()[0][1][0][0, 0]) == 3        # placement remap applied like its pop hook
+    assert (
+        int(src.lists()[0][1][0][0, 0]) == 3
+    )  # placement remap applied like its pop hook
     lazy = SimpleNamespace(materialize_for_routing_replay=lambda stage: None)
     layer.router.routing_replay.top_indices_list = [lazy] * M
-    assert src.lists() == []                         # lazy disk refs: no plan
+    assert src.lists() == []  # lazy disk refs: no plan
     layer.router.routing_replay = None
     assert src.lists() == []
     layer.config.moe_token_dispatcher_type = "flex"
@@ -344,11 +430,21 @@ def test_slime_hooks(monkeypatch):
     RR.clear_all()
     assert seen == ["orig"] and mp.STATS["steps"] == 1
 
-    assert sp.megatron_init(SimpleNamespace(use_rollout_routing_replay=False))["r3plan"].startswith("SKIP")
-    assert "flex" in sp.megatron_init(SimpleNamespace(use_rollout_routing_replay=True,
-                                                      moe_token_dispatcher_type="flex"))["r3plan"]
+    assert sp.megatron_init(SimpleNamespace(use_rollout_routing_replay=False))[
+        "r3plan"
+    ].startswith("SKIP")
+    assert (
+        "flex"
+        in sp.megatron_init(
+            SimpleNamespace(
+                use_rollout_routing_replay=True, moe_token_dispatcher_type="flex"
+            )
+        )["r3plan"]
+    )
     monkeypatch.setenv("ASRT_R3PLAN", "0")
-    assert sp.megatron_init(SimpleNamespace(use_rollout_routing_replay=True))["r3plan"].startswith("SKIP")
+    assert sp.megatron_init(SimpleNamespace(use_rollout_routing_replay=True))[
+        "r3plan"
+    ].startswith("SKIP")
     mp._reset_for_tests()
 
 

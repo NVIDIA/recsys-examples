@@ -30,17 +30,27 @@ class AsrtAffinityBalancer(GlobalRequestLoadBalancer):
     def acquire_server(self, request_id, asrt_prefix_key=None, asrt_ntok=0, **extra):
         self._asrt_n += 1
         if self._asrt_every and self._asrt_n % self._asrt_every == 0:
-            rec = {"acquire": self._asrt_n, **self._asrt.st, "inflight": dict(self._inflight_requests)}
+            rec = {
+                "acquire": self._asrt_n,
+                **self._asrt.st,
+                "inflight": dict(self._inflight_requests),
+            }
             print(f"[asrt] verl route {rec}", flush=True)
             _log("route", rec)
-        sid = self._request_id_to_server.get(request_id) if request_id in self._request_id_to_server else None
+        sid = (
+            self._request_id_to_server.get(request_id)
+            if request_id in self._request_id_to_server
+            else None
+        )
         if sid is not None and sid in self._inflight_requests:
             self._asrt.st["sticky"] += 1
             self._inflight_requests[sid] += 1
             return sid, self._servers[sid]
         if not self._inflight_requests:
             raise RuntimeError("No available servers in load balancer")
-        sid = self._asrt.pick(dict(self._inflight_requests), asrt_prefix_key, int(asrt_ntok or 0))
+        sid = self._asrt.pick(
+            dict(self._inflight_requests), asrt_prefix_key, int(asrt_ntok or 0)
+        )
         if sid is None:
             return super().acquire_server(request_id)
         self._request_id_to_server[request_id] = sid

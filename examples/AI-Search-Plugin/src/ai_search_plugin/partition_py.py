@@ -16,8 +16,13 @@ def _cost(x: float, quad: float) -> float:
     return float(x) + quad * float(x) * float(x)
 
 
-def balanced_partitions(values: Sequence[float], k: int, equal_size: bool = True,
-                        quad_coef: float = 0.0, refine_rounds: int = 2) -> List[List[int]]:
+def balanced_partitions(
+    values: Sequence[float],
+    k: int,
+    equal_size: bool = True,
+    quad_coef: float = 0.0,
+    refine_rounds: int = 2,
+) -> List[List[int]]:
     n = len(values)
     assert k >= 1 and n >= k, f"need n >= k (n={n}, k={k})"
     if equal_size:
@@ -59,7 +64,9 @@ def balanced_partitions(values: Sequence[float], k: int, equal_size: bool = True
                         best = (a, None, d)
                 for b in parts[lo]:
                     d = c[a] - c[b]
-                    if 0 < d < gap and (best is None or abs(gap - 2 * d) < abs(gap - 2 * best[2])):
+                    if 0 < d < gap and (
+                        best is None or abs(gap - 2 * d) < abs(gap - 2 * best[2])
+                    ):
                         best = (a, b, d)
             if best is not None:
                 a, b, d = best
@@ -77,5 +84,7 @@ def balanced_partitions(values: Sequence[float], k: int, equal_size: bool = True
     return [sorted(p) for p in parts]
 
 
-def max_load(values: Sequence[float], parts: Sequence[Sequence[int]], quad_coef: float = 0.0) -> float:
+def max_load(
+    values: Sequence[float], parts: Sequence[Sequence[int]], quad_coef: float = 0.0
+) -> float:
     return max(sum(_cost(values[i], quad_coef) for i in p) for p in parts)

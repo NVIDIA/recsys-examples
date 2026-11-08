@@ -13,7 +13,9 @@ import bisect
 from typing import List, Sequence, Tuple
 
 
-def rank_loads(loads: Sequence[float], rank_of: Sequence[int], ranks: int) -> List[float]:
+def rank_loads(
+    loads: Sequence[float], rank_of: Sequence[int], ranks: int
+) -> List[float]:
     """Sum of expert loads per EP rank."""
     out = [0.0] * ranks
     for x, r in zip(loads, rank_of):
@@ -28,11 +30,13 @@ def imbalance(loads: Sequence[float], rank_of: Sequence[int], ranks: int) -> flo
     return max(r) / (s / ranks) if s > 0 else 1.0
 
 
-def rebalance_swaps(loads: Sequence[float], rank_of: Sequence[int], ranks: int,
-                    max_swaps: int = 256) -> Tuple[List[int], int]:
+def rebalance_swaps(
+    loads: Sequence[float], rank_of: Sequence[int], ranks: int, max_swaps: int = 256
+) -> Tuple[List[int], int]:
     """Greedy pairwise swaps that lower the hottest rank's load.
 
-    Returns ``(new_rank_of, moved)``: the new EP rank of every expert and how many experts changed rank."""
+    Returns ``(new_rank_of, moved)``: the new EP rank of every expert and how many experts changed rank.
+    """
     loads = [float(x) for x in loads]
     p = [int(r) for r in rank_of]
     for _ in range(max_swaps):

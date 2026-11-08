@@ -13,7 +13,9 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "src"))
+sys.path.insert(
+    0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "src")
+)
 
 E = 16
 
@@ -61,11 +63,14 @@ def worker(rank, world, q, rank0_skips, port):
     os.environ.update(MASTER_ADDR="127.0.0.1", MASTER_PORT=str(port))
     dist.init_process_group("gloo", rank=rank, world_size=world)
     from ai_search_plugin.adapters.megatron_placement import ExpertPlacementManager
+
     # rank 0 skips (huge threshold) and the others want to move, or the other way round
     me_skips = (rank == 0) == rank0_skips
     os.environ["ASRT_PLACE_MIN_IMB"] = "100" if me_skips else "1.0"
     torch.manual_seed(0)
-    mgr = ExpertPlacementManager([_Model()], None, num_layers=2, num_experts=E, ep_group=None)
+    mgr = ExpertPlacementManager(
+        [_Model()], None, num_layers=2, num_experts=E, ep_group=None
+    )
     mgr.ep, mgr.n_local = 4, 4
     mgr.counts[:, :4] = 100.0  # hot cluster on "EP rank 0"
     # the toy model is not really expert-parallel: test only the decision + perm broadcast, not the data move
@@ -87,7 +92,9 @@ def run(rank0_skips):
     ctx = mp.get_context("spawn")
     q = ctx.Queue()
     port = _free_port()
-    ps = [ctx.Process(target=worker, args=(r, 4, q, rank0_skips, port)) for r in range(4)]
+    ps = [
+        ctx.Process(target=worker, args=(r, 4, q, rank0_skips, port)) for r in range(4)
+    ]
     for p in ps:
         p.start()
     for p in ps:

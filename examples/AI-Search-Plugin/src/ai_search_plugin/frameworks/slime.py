@@ -62,9 +62,15 @@ def plan(components="default", options: Optional[dict] = None) -> Plan:
         targets = ",".join(targets)
     gen = o.get("toolcache_generate") or os.environ.get("ASRT_TOOLCACHE_GENERATE", "")
     if on("toolcache") and not (gen and targets):
-        skip("toolcache", "needs options toolcache_generate=<module.attr> and tool_targets=<module.attr,...>")
+        skip(
+            "toolcache",
+            "needs options toolcache_generate=<module.attr> and tool_targets=<module.attr,...>",
+        )
     if on("tool_hedge") and not (on("toolcache") and targets):
-        skip("tool_hedge", "runs under toolcache and needs tool_targets (read-only tools only)")
+        skip(
+            "tool_hedge",
+            "runs under toolcache and needs tool_targets (read-only tools only)",
+        )
     jdir = o.get("jitcache_dir") or os.environ.get("ASRT_JITCACHE_DIR", "")
     if on("jitcache") and not jdir:
         skip("jitcache", "needs option jitcache_dir=<directory>")
@@ -93,8 +99,10 @@ def plan(components="default", options: Optional[dict] = None) -> Plan:
     ws = ["pipeline", "flatten", "parsync", "profile"] if on("weight_sync") else ["off"]
     if ws_inplace:
         ws.append("inplace")
-        p.notes.append("ws_inplace: run slime with --flush-cache-interval 0; tokens of a request that spans a sync "
-                       "come from old/mixed/new weights (behaviour logprobs stay exact)")
+        p.notes.append(
+            "ws_inplace: run slime with --flush-cache-interval 0; tokens of a request that spans a sync "
+            "come from old/mixed/new weights (behaviour logprobs stay exact)"
+        )
     env["ASRT_WEIGHTSYNC"] = ",".join(ws)
     if on("kvfresh"):
         env["ASRT_WS_KV"] = "fresh"
@@ -115,6 +123,7 @@ def plan(components="default", options: Optional[dict] = None) -> Plan:
         chain.append("ai_search_plugin.prefix_tree.adapters.slime.megatron_init")
     if on("hybridep_overlap"):
         from ..adapters import slime_hybridep
+
         frag = slime_hybridep.plan_fragment(o)
         env.update(frag["env"])
         p.args += frag["args"]
@@ -124,7 +133,10 @@ def plan(components="default", options: Optional[dict] = None) -> Plan:
         chain.append(str(o["chain_megatron_init"]))
     if chain:
         env["ASRT_CHAIN_MEGATRON_INIT"] = ",".join(chain)
-    p.args += ["--custom-megatron-init-path", "ai_search_plugin.frameworks.slime.megatron_init"]
+    p.args += [
+        "--custom-megatron-init-path",
+        "ai_search_plugin.frameworks.slime.megatron_init",
+    ]
 
     # ---- rollout manager: wrapper chain
     pf = []
@@ -160,8 +172,10 @@ def plan(components="default", options: Optional[dict] = None) -> Plan:
         fn = "ai_search_plugin.prefix_tree.adapters.slime_pack.generate_rollout_fully_async"
     if fn != STOCK_ROLLOUT:
         p.args += ["--rollout-function-path", fn]
-        p.notes.append("the rollout chain ends in slime's stock fully-async rollout (needs slime's fully-async mode); "
-                       "a custom --rollout-function-path of your own is replaced")
+        p.notes.append(
+            "the rollout chain ends in slime's stock fully-async rollout (needs slime's fully-async mode); "
+            "a custom --rollout-function-path of your own is replaced"
+        )
 
     # ---- per-sample generate: tool cache (+ hedge underneath)
     if on("toolcache"):
@@ -177,7 +191,8 @@ def plan(components="default", options: Optional[dict] = None) -> Plan:
 
 def install(components="default", options: Optional[dict] = None, environ=None) -> Plan:
     """``plan()`` + write the env into ``environ`` (default ``os.environ``).  slime itself is not imported: the
-    patches install in the slime processes through the hooks listed in ``plan.args`` / ``plan.launcher``."""
+    patches install in the slime processes through the hooks listed in ``plan.args`` / ``plan.launcher``.
+    """
     p = plan(components, options)
     apply_env(p, environ)
     return p
@@ -187,7 +202,8 @@ def megatron_init(args=None, *rest, **kwargs):
     """``--custom-megatron-init-path`` target (runs in every slime training actor).
 
     Runs the weight-sync / resume / jitfix / prefetch / R3-check installers and the
-    chained hooks (ASRT_CHAIN_MEGATRON_INIT: response_logits, jitcache, the user's own init)."""
+    chained hooks (ASRT_CHAIN_MEGATRON_INIT: response_logits, jitcache, the user's own init).
+    """
     from ..adapters import slime_weightsync
 
     return slime_weightsync.megatron_init(args)

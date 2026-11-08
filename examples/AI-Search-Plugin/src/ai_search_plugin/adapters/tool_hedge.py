@@ -32,7 +32,13 @@ import os
 import re
 import time
 
-_STATS = {"calls": 0, "hedged": 0, "hedge_won": 0, "extra_requests": 0, "errors_masked": 0}
+_STATS = {
+    "calls": 0,
+    "hedged": 0,
+    "hedge_won": 0,
+    "extra_requests": 0,
+    "errors_masked": 0,
+}
 
 
 def _cfg():
@@ -70,21 +76,31 @@ _SAFE_DEFAULT = ""
 
 
 def describe(targets=None) -> str:
-    """ one-line startup description: on/off, hedged targets, delay rule, extra-request cap."""
+    """one-line startup description: on/off, hedged targets, delay rule, extra-request cap."""
     spec = _cfg()
     if spec is None:
         return f"off (ASRT_TOOL_HEDGE={os.environ.get('ASRT_TOOL_HEDGE', '')!r})"
     if spec == "auto":
-        d = (f"auto(q{os.environ.get('ASRT_TOOL_HEDGE_Q', '0.9')} x{os.environ.get('ASRT_TOOL_HEDGE_FACTOR', '1.0')}"
-                          f" of last 512, floor {os.environ.get('ASRT_TOOL_HEDGE_MIN', '2.0')} s, 10 s until 64 samples)")
+        d = (
+            f"auto(q{os.environ.get('ASRT_TOOL_HEDGE_Q', '0.9')} x{os.environ.get('ASRT_TOOL_HEDGE_FACTOR', '1.0')}"
+            f" of last 512, floor {os.environ.get('ASRT_TOOL_HEDGE_MIN', '2.0')} s, 10 s until 64 samples)"
+        )
     else:
         d = f"{float(spec):g} s"
-    tg = ",".join(targets) if targets is not None else os.environ.get("ASRT_TOOL_HEDGE_TARGETS", _SAFE_DEFAULT)
+    tg = (
+        ",".join(targets)
+        if targets is not None
+        else os.environ.get("ASRT_TOOL_HEDGE_TARGETS", _SAFE_DEFAULT)
+    )
     return f"on targets={tg} delay={d} max_extra={os.environ.get('ASRT_TOOL_HEDGE_MAX', '2')}"
 
 
 def allowed(target: str) -> bool:
-    ok = {t.strip() for t in os.environ.get("ASRT_TOOL_HEDGE_TARGETS", _SAFE_DEFAULT).split(",") if t.strip()}
+    ok = {
+        t.strip()
+        for t in os.environ.get("ASRT_TOOL_HEDGE_TARGETS", _SAFE_DEFAULT).split(",")
+        if t.strip()
+    }
     return target.strip() in ok
 
 
@@ -92,7 +108,9 @@ def hedged(fn, spec=None, max_extra=None):
     spec = spec if spec is not None else _cfg()
     if spec is None:
         return fn
-    max_extra = int(max_extra if max_extra is not None else os.environ.get("ASRT_TOOL_HEDGE_MAX", 2))
+    max_extra = int(
+        max_extra if max_extra is not None else os.environ.get("ASRT_TOOL_HEDGE_MAX", 2)
+    )
     err_re = re.compile(os.environ.get("ASRT_TOOL_HEDGE_ERR", r"tool_error"))
     delay = _Delay(spec)
 
@@ -112,8 +130,11 @@ def hedged(fn, spec=None, max_extra=None):
             while True:
                 n_more = (len(tasks) - 1) < max_extra
                 timeout = (d * len(tasks) - (time.monotonic() - t0)) if n_more else None
-                done, pending = await asyncio.wait(pending, timeout=None if timeout is None else max(0.0, timeout),
-                                                   return_when=asyncio.FIRST_COMPLETED)
+                done, pending = await asyncio.wait(
+                    pending,
+                    timeout=None if timeout is None else max(0.0, timeout),
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
                 for t in done:
                     exc = t.exception()
                     if exc is not None:
@@ -131,7 +152,9 @@ def hedged(fn, spec=None, max_extra=None):
                     return out
                 if not pending and not n_more:
                     break
-                if not done or not pending:  # hedge delay passed (or every attempt so far failed): one more attempt
+                if (
+                    not done or not pending
+                ):  # hedge delay passed (or every attempt so far failed): one more attempt
                     if (len(tasks) - 1) < max_extra:
                         if len(tasks) == 1:
                             _STATS["hedged"] += 1
@@ -143,7 +166,9 @@ def hedged(fn, spec=None, max_extra=None):
                         break
             if last_err is not None:
                 return last_err
-            raise last_exc if last_exc is not None else RuntimeError("tool_hedge: no attempt finished")
+            raise last_exc if last_exc is not None else RuntimeError(
+                "tool_hedge: no attempt finished"
+            )
         finally:
             for t in tasks:
                 if not t.done():
@@ -155,7 +180,9 @@ def hedged(fn, spec=None, max_extra=None):
 
 def stats():
     s = dict(_STATS)
-    s["extra_ratio"] = round(s["extra_requests"] / s["calls"], 4) if s["calls"] else None
+    s["extra_ratio"] = (
+        round(s["extra_requests"] / s["calls"], 4) if s["calls"] else None
+    )
     return s
 
 

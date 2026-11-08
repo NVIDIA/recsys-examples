@@ -99,7 +99,9 @@ SAMPLING = "sglang.srt.sampling.sampling_batch_info"
 
 
 def _opts():
-    return {s.strip() for s in os.environ.get("ASRT_SGL_HOOKS", "").split(",") if s.strip()}
+    return {
+        s.strip() for s in os.environ.get("ASRT_SGL_HOOKS", "").split(",") if s.strip()
+    }
 
 
 def _log(rec, kind="sgl-weightload"):
@@ -117,30 +119,54 @@ def _log(rec, kind="sgl-weightload"):
 # --------------------------------------------------------------------------------------
 # fastload: record / replay
 # --------------------------------------------------------------------------------------
-_MUTATING_DUNDER = {"__setitem__", "__set__", "__iadd__", "__isub__", "__imul__", "__itruediv__",
-                    "__ifloordiv__", "__imod__", "__ipow__", "__iand__", "__ior__", "__ixor__",
-                    "__ilshift__", "__irshift__"}
+_MUTATING_DUNDER = {
+    "__setitem__",
+    "__set__",
+    "__iadd__",
+    "__isub__",
+    "__imul__",
+    "__itruediv__",
+    "__ifloordiv__",
+    "__imod__",
+    "__ipow__",
+    "__iand__",
+    "__ior__",
+    "__ixor__",
+    "__ilshift__",
+    "__irshift__",
+}
 
 
 _PLANS = {}  # id(WeightUpdater) -> {bucket layout key: _Plan | None}
-_CHECKED = {}  # id(WeightUpdater) -> {tensor kind} covered by a passed fastload self-check
+_CHECKED = (
+    {}
+)  # id(WeightUpdater) -> {tensor kind} covered by a passed fastload self-check
 
 
 def _layout_kinds(key):
-    """ the tensor kinds of a bucket layout: (name with every digit run replaced, dtype, shape) per tensor.
+    """the tensor kinds of a bucket layout: (name with every digit run replaced, dtype, shape) per tensor.
     ``fastload_check`` only runs on a bucket that holds a kind no passed check has covered yet, so it tests a few
     buckets per model instead of every bucket: the per-layout check ran the original loader on every bucket of the
     first replay sync (+10-20 s, e.g. 60 buckets x 0.33 s, on the critical path); ~12.6k checks in
     testing, 0 failures.  Kinds, not whole layouts: big buckets cut layers at arbitrary tensors,
-    so whole-layout signatures never repeat.  ``ASRT_FASTLOAD_CHECK=all`` restores the per-layout check."""
+    so whole-layout signatures never repeat.  ``ASRT_FASTLOAD_CHECK=all`` restores the per-layout check.
+    """
     import re
 
     def norm(n):
         return re.sub(r"\d+", "#", n)
-    if len(key) == 3 and all(isinstance(k, tuple) for k in key) and key[0] and isinstance(key[0][0], str):
+
+    if (
+        len(key) == 3
+        and all(isinstance(k, tuple) for k in key)
+        and key[0]
+        and isinstance(key[0][0], str)
+    ):
         names, dtypes, shapes = key  # flattened_bucket key: (names, dtypes, shapes)
         return {(norm(n), str(d), tuple(sh)) for n, d, sh in zip(names, dtypes, shapes)}
-    return {(norm(e[0]),) + tuple(e[1:3]) for e in key}  # tensor path key: ((name, dtype, shape, stride), ...)
+    return {
+        (norm(e[0]),) + tuple(e[1:3]) for e in key
+    }  # tensor path key: ((name, dtype, shape, stride), ...)
 
 
 def _check_needed(updater_id, key, plan):
@@ -155,7 +181,11 @@ def _check_needed(updater_id, key, plan):
 
 def _check_passed(updater_id, key):
     _CHECKED.setdefault(updater_id, set()).update(_layout_kinds(key))
-_FASTFN = []  # [fastload fn (or None), original load_weights_from_distributed] once the updater is patched
+
+
+_FASTFN = (
+    []
+)  # [fastload fn (or None), original load_weights_from_distributed] once the updater is patched
 
 
 class _FlatBucket(list):
@@ -171,13 +201,17 @@ class _FlatBucket(list):
             for s in shape:
                 n *= int(s)
             nb = n * dt.itemsize
-            self.append((name, flat[off:off + nb].view(dt).reshape(tuple(shape))))
+            self.append((name, flat[off : off + nb].view(dt).reshape(tuple(shape))))
             self.ranges.append((off, off + nb))
             off += nb
 
 
 def _span(size, stride):
-    return 1 + sum((s - 1) * st for s, st in zip(size, stride)) if all(s > 0 for s in size) else 0
+    return (
+        1 + sum((s - 1) * st for s, st in zip(size, stride))
+        if all(s > 0 for s in size)
+        else 0
+    )
 
 
 class _Plan:
@@ -202,13 +236,27 @@ def _build_plan(copies, fallback, n_inputs, params, nbytes):
     plan.checked = False
     recs = []
     for dst, sdt, soff, ssize, sstride in copies:
-        recs.append((dst.untyped_storage().data_ptr(), dst.dtype, dst.storage_offset(), tuple(dst.shape),
-                     tuple(dst.stride()), sdt, soff, ssize, sstride, dst))
+        recs.append(
+            (
+                dst.untyped_storage().data_ptr(),
+                dst.dtype,
+                dst.storage_offset(),
+                tuple(dst.shape),
+                tuple(dst.stride()),
+                sdt,
+                soff,
+                ssize,
+                sstride,
+                dst,
+            )
+        )
     # Coalescing reorders copies, which is only safe if no two copies write overlapping bytes.
     by_store = {}
     for r in recs:
         es = r[1].itemsize
-        by_store.setdefault(r[0], []).append((r[2] * es, (r[2] + _span(r[3], r[4])) * es))
+        by_store.setdefault(r[0], []).append(
+            (r[2] * es, (r[2] + _span(r[3], r[4])) * es)
+        )
     overlap = False
     for iv in by_store.values():
         iv.sort()
@@ -225,7 +273,11 @@ def _build_plan(copies, fallback, n_inputs, params, nbytes):
     else:
         groups = {}
         for r in recs:
-            k = (r[0], r[1], r[3], r[4], r[5], r[7], r[8]) if r[3] == r[7] else ("single", len(groups))
+            k = (
+                (r[0], r[1], r[3], r[4], r[5], r[7], r[8])
+                if r[3] == r[7]
+                else ("single", len(groups))
+            )
             groups.setdefault(k, []).append(r)
         for lst in groups.values():
             # Partition into arithmetic progressions in (dst offset, src offset).  Writes are
@@ -240,7 +292,9 @@ def _build_plan(copies, fallback, n_inputs, params, nbytes):
                     continue
                 used[i] = True
                 best, bd, bs = [], 0, 0
-                cand = [k for k in range(i + 1, min(len(lst), i + 9)) if not used[k]][:4]
+                cand = [k for k in range(i + 1, min(len(lst), i + 9)) if not used[k]][
+                    :4
+                ]
                 for k in cand:
                     d, s = lst[k][2] - r0[2], lst[k][6] - r0[6]
                     if d <= 0 or s < 0:
@@ -258,7 +312,18 @@ def _build_plan(copies, fallback, n_inputs, params, nbytes):
                     for n in best:
                         used[n] = True
                     n = len(best) + 1
-                    ops.append((r0[9], (n,) + r0[3], (bd,) + r0[4], r0[2], r0[5], (n,) + r0[7], (bs,) + r0[8], r0[6]))
+                    ops.append(
+                        (
+                            r0[9],
+                            (n,) + r0[3],
+                            (bd,) + r0[4],
+                            r0[2],
+                            r0[5],
+                            (n,) + r0[7],
+                            (bs,) + r0[8],
+                            r0[6],
+                        )
+                    )
                 else:
                     ops.append((r0[9], r0[3], r0[4], r0[2], r0[5], r0[7], r0[8], r0[6]))
     plan.ops = ops
@@ -271,12 +336,21 @@ def _fingerprint(model):
     import torch
 
     names, sums = [], []
-    for n, t in list(model.named_parameters(remove_duplicate=False)) + list(model.named_buffers(remove_duplicate=False)):
+    for n, t in list(model.named_parameters(remove_duplicate=False)) + list(
+        model.named_buffers(remove_duplicate=False)
+    ):
         if t.numel() == 0 or not t.is_contiguous():
             continue
         v = t.detach().view(-1)
-        v = v.view(torch.int16) if (v.element_size() == 2 or (v.element_size() > 2 and v.numel() * v.element_size() % 2 == 0)) \
-            and v.dtype != torch.bool else v.view(torch.uint8)
+        v = (
+            v.view(torch.int16)
+            if (
+                v.element_size() == 2
+                or (v.element_size() > 2 and v.numel() * v.element_size() % 2 == 0)
+            )
+            and v.dtype != torch.bool
+            else v.view(torch.uint8)
+        )
         names.append(n)
         sums.append(torch.sum(v, dtype=torch.int64))
     return dict(zip(names, torch.stack(sums).tolist())) if sums else {}
@@ -291,9 +365,12 @@ def _replay(plan, flat):
         if b is None:
             es = sdt.itemsize
             b = torch.empty((0,), dtype=sdt, device=flat.device).set_(
-                flat.untyped_storage(), 0, (flat.numel() // es,), (1,))
+                flat.untyped_storage(), 0, (flat.numel() // es,), (1,)
+            )
             bases[sdt] = b
-        torch.as_strided(dst, dsize, dstride, doff).copy_(torch.as_strided(b, ssize, sstride, soff))
+        torch.as_strided(dst, dsize, dstride, doff).copy_(
+            torch.as_strided(b, ssize, sstride, soff)
+        )
 
 
 _REC_CLS = []
@@ -323,7 +400,9 @@ def _record(model, bucket, load_fn):
     import torch
 
     pstore = {}
-    for _, t in list(model.named_parameters(remove_duplicate=False)) + list(model.named_buffers(remove_duplicate=False)):
+    for _, t in list(model.named_parameters(remove_duplicate=False)) + list(
+        model.named_buffers(remove_duplicate=False)
+    ):
         pstore.setdefault(t.untyped_storage().data_ptr(), t)
     flat = bucket.flat
     fptr = flat.untyped_storage().data_ptr()
@@ -337,25 +416,38 @@ def _record(model, bucket, load_fn):
         """index of the input tensor whose bytes ``t`` reads (by storage offset)."""
         b = t.storage_offset() * t.element_size()
         i = bisect.bisect_right(starts, b) - 1
-        if i < 0 or b + _span(t.shape, t.stride()) * t.element_size() > bucket.ranges[i][1] and t.numel() > 0:
+        if (
+            i < 0
+            or b + _span(t.shape, t.stride()) * t.element_size() > bucket.ranges[i][1]
+            and t.numel() > 0
+        ):
             return -1
         return i
 
     def aliases(t):
         try:
-            return isinstance(t, torch.Tensor) and t.untyped_storage().data_ptr() in pstore
+            return (
+                isinstance(t, torch.Tensor) and t.untyped_storage().data_ptr() in pstore
+            )
         except Exception:
             return False
 
     def handler(func, args, kwargs):
         name = getattr(func, "__name__", "")
         cur = state["cur"]
-        inplace = (name.endswith("_") and not name.startswith("__")) or name in _MUTATING_DUNDER
+        inplace = (
+            name.endswith("_") and not name.startswith("__")
+        ) or name in _MUTATING_DUNDER
         if args and inplace and aliases(args[0]):
             dst = args[0]
             src = args[1] if len(args) > 1 else kwargs.get("src")
-            ok = (name == "copy_" and isinstance(src, torch.Tensor) and src.device == dst.device
-                  and src.untyped_storage().data_ptr() == fptr and len(args) <= 3)
+            ok = (
+                name == "copy_"
+                and isinstance(src, torch.Tensor)
+                and src.device == dst.device
+                and src.untyped_storage().data_ptr() == fptr
+                and len(args) <= 3
+            )
             if ok:
                 i = owner(src)
                 if i < 0:
@@ -363,7 +455,16 @@ def _record(model, bucket, load_fn):
                 else:
                     if i != cur:
                         state["mismatch"] = True
-                    copies.append((i, dst, src.dtype, src.storage_offset(), tuple(src.shape), tuple(src.stride())))
+                    copies.append(
+                        (
+                            i,
+                            dst,
+                            src.dtype,
+                            src.storage_offset(),
+                            tuple(src.shape),
+                            tuple(src.stride()),
+                        )
+                    )
                     dptr = dst.untyped_storage().data_ptr()
                     touched[dptr] = pstore[dptr]
             if not ok:
@@ -374,7 +475,10 @@ def _record(model, bucket, load_fn):
         outs = out if isinstance(out, (tuple, list)) else (out,)
         if any(aliases(o) for o in outs):
             bad.add(cur)
-        elif type(func).__name__ in ("OpOverload", "OpOverloadPacket") and name not in ("copy_", "copy"):
+        elif type(func).__name__ in ("OpOverload", "OpOverloadPacket") and name not in (
+            "copy_",
+            "copy",
+        ):
             if any(aliases(x) for x in list(args) + list(kwargs.values())):
                 bad.add(cur)
 
@@ -394,7 +498,11 @@ def _record(model, bucket, load_fn):
         mode.handler = None
     if -1 in bad or (bad and state["mismatch"]):
         return None  # writes we cannot attribute: never replay this layout
-    keep = [(dst, sdt, soff, ssize, sstride) for i, dst, sdt, soff, ssize, sstride in copies if i not in bad]
+    keep = [
+        (dst, sdt, soff, ssize, sstride)
+        for i, dst, sdt, soff, ssize, sstride in copies
+        if i not in bad
+    ]
     params = [(t, t.untyped_storage().data_ptr()) for t in touched.values()]
     return _build_plan(keep, bad, len(bucket), params, flat.numel())
 
@@ -422,11 +530,19 @@ class _TBucket(list):
 
     def __init__(self, named):
         super().__init__(named)
-        self.key = tuple((n, str(t.dtype), tuple(t.shape), tuple(t.stride())) for n, t in named)
+        self.key = tuple(
+            (n, str(t.dtype), tuple(t.shape), tuple(t.stride())) for n, t in named
+        )
         self.spans = []  # (storage ptr, first byte, end byte) per input
         for _, t in named:
             b = t.storage_offset() * t.element_size()
-            self.spans.append((t.untyped_storage().data_ptr(), b, b + _span(t.shape, t.stride()) * t.element_size()))
+            self.spans.append(
+                (
+                    t.untyped_storage().data_ptr(),
+                    b,
+                    b + _span(t.shape, t.stride()) * t.element_size(),
+                )
+            )
 
 
 class _TPlan:
@@ -444,7 +560,9 @@ def _record_tensors(model, bucket, load_fn):
     import torch
 
     pstore = {}
-    for _, t in list(model.named_parameters(remove_duplicate=False)) + list(model.named_buffers(remove_duplicate=False)):
+    for _, t in list(model.named_parameters(remove_duplicate=False)) + list(
+        model.named_buffers(remove_duplicate=False)
+    ):
         pstore.setdefault(t.untyped_storage().data_ptr(), t)
     by_ptr = {}
     for i, (ptr, b0, b1) in enumerate(bucket.spans):
@@ -467,18 +585,27 @@ def _record_tensors(model, bucket, load_fn):
 
     def aliases(t):
         try:
-            return isinstance(t, torch.Tensor) and t.untyped_storage().data_ptr() in pstore
+            return (
+                isinstance(t, torch.Tensor) and t.untyped_storage().data_ptr() in pstore
+            )
         except Exception:
             return False
 
     def handler(func, args, kwargs):
         name = getattr(func, "__name__", "")
         cur = state["cur"]
-        inplace = (name.endswith("_") and not name.startswith("__")) or name in _MUTATING_DUNDER
+        inplace = (
+            name.endswith("_") and not name.startswith("__")
+        ) or name in _MUTATING_DUNDER
         if args and inplace and aliases(args[0]):
             dst = args[0]
             src = args[1] if len(args) > 1 else kwargs.get("src")
-            ok = name == "copy_" and isinstance(src, torch.Tensor) and src.device == dst.device and len(args) <= 3
+            ok = (
+                name == "copy_"
+                and isinstance(src, torch.Tensor)
+                and src.device == dst.device
+                and len(args) <= 3
+            )
             if ok:
                 i, rel = owner(src)
                 if i < 0:
@@ -486,7 +613,9 @@ def _record_tensors(model, bucket, load_fn):
                 else:
                     if i != cur:
                         state["mismatch"] = True
-                    copies.append((i, dst, src.dtype, rel, tuple(src.shape), tuple(src.stride())))
+                    copies.append(
+                        (i, dst, src.dtype, rel, tuple(src.shape), tuple(src.stride()))
+                    )
                     dptr = dst.untyped_storage().data_ptr()
                     touched[dptr] = pstore[dptr]
             if not ok:
@@ -495,7 +624,10 @@ def _record_tensors(model, bucket, load_fn):
         outs = out if isinstance(out, (tuple, list)) else (out,)
         if any(aliases(o) for o in outs):
             bad.add(cur)
-        elif type(func).__name__ in ("OpOverload", "OpOverloadPacket") and name not in ("copy_", "copy"):
+        elif type(func).__name__ in ("OpOverload", "OpOverloadPacket") and name not in (
+            "copy_",
+            "copy",
+        ):
             if any(aliases(x) for x in list(args) + list(kwargs.values())):
                 bad.add(cur)
 
@@ -521,11 +653,21 @@ def _record_tensors(model, bucket, load_fn):
     plan.checked = False
     plan.skip = len(bucket) - len(plan.fallback)
     # writes of different inputs never coalesce; if any two copies overlap, keep record order (one op each)
-    allr = [(dst.untyped_storage().data_ptr(), dst.dtype.itemsize, dst.storage_offset(), tuple(dst.shape),
-             tuple(dst.stride())) for _, dst, *_ in keep]
+    allr = [
+        (
+            dst.untyped_storage().data_ptr(),
+            dst.dtype.itemsize,
+            dst.storage_offset(),
+            tuple(dst.shape),
+            tuple(dst.stride()),
+        )
+        for _, dst, *_ in keep
+    ]
     by_store = {}
     for ptr, es, off, size, stride in allr:
-        by_store.setdefault(ptr, []).append((off * es, (off + _span(size, stride)) * es))
+        by_store.setdefault(ptr, []).append(
+            (off * es, (off + _span(size, stride)) * es)
+        )
     overlap = False
     for iv in by_store.values():
         iv.sort()
@@ -533,15 +675,33 @@ def _record_tensors(model, bucket, load_fn):
             overlap = True
             break
     if overlap:
-        plan.by_src = [(i, [(dst, tuple(dst.shape), tuple(dst.stride()), dst.storage_offset(), sdt, ssize, sstride, rel)])
-                       for i, dst, sdt, rel, ssize, sstride in keep]
+        plan.by_src = [
+            (
+                i,
+                [
+                    (
+                        dst,
+                        tuple(dst.shape),
+                        tuple(dst.stride()),
+                        dst.storage_offset(),
+                        sdt,
+                        ssize,
+                        sstride,
+                        rel,
+                    )
+                ],
+            )
+            for i, dst, sdt, rel, ssize, sstride in keep
+        ]
     else:
         groups = {}
         for i, dst, sdt, rel, ssize, sstride in keep:
             groups.setdefault(i, []).append((dst, sdt, rel, ssize, sstride))
         plan.by_src = []
         for i, lst in groups.items():
-            sub = _build_plan(lst, (), 0, [], 0)  # coalescing only; the offsets are relative to input i
+            sub = _build_plan(
+                lst, (), 0, [], 0
+            )  # coalescing only; the offsets are relative to input i
             plan.by_src.append((i, sub.ops))
     plan.nops = sum(len(ops) for _, ops in plan.by_src)
     return plan
@@ -559,13 +719,19 @@ def _replay_tensors(plan, bucket):
             es = sdt.itemsize
             b = bases.get(sdt)
             if b is None:
-                b = torch.empty((0,), dtype=sdt, device=t.device).set_(st, 0, (st.nbytes() // es,), (1,))
+                b = torch.empty((0,), dtype=sdt, device=t.device).set_(
+                    st, 0, (st.nbytes() // es,), (1,)
+                )
                 bases[sdt] = b
-            torch.as_strided(dst, dsize, dstride, doff).copy_(torch.as_strided(b, ssize, sstride, b0 // es + soff))
+            torch.as_strided(dst, dsize, dstride, doff).copy_(
+                torch.as_strided(b, ssize, sstride, b0 // es + soff)
+            )
 
 
 _TPLANS = {}  # id(WeightUpdater) -> {layout key: _TPlan | None}
-_KEEP = []  # inplace: [(cuda event, tensors)] kept alive until the forward-stream copies reading them are done
+_KEEP = (
+    []
+)  # inplace: [(cuda event, tensors)] kept alive until the forward-stream copies reading them are done
 _TLS_INPL = [False]  # set by the scheduler hook while it runs an in-place tensor update
 
 
@@ -603,17 +769,39 @@ def _patch_tensor_path(mod, C, profile, fastload, check):
             plan.checked = True
             if diff:
                 cache[bucket.key] = None
-                print(f"[asrt] fastload (tensor path) self-check FAILED for a {len(bucket)}-tensor bucket, disabled "
-                      f"for this layout; differing: {diff[:8]}", file=sys.stderr, flush=True)
-                _log({"t": time.time(), "op": "fastload_check", "path": "tensor", "ok": False, "diff": diff[:50]})
+                print(
+                    f"[asrt] fastload (tensor path) self-check FAILED for a {len(bucket)}-tensor bucket, disabled "
+                    f"for this layout; differing: {diff[:8]}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                _log(
+                    {
+                        "t": time.time(),
+                        "op": "fastload_check",
+                        "path": "tensor",
+                        "ok": False,
+                        "diff": diff[:50],
+                    }
+                )
                 return True, "Success", ("check_fail", None)
             _check_passed(id(self), bucket.key)
-            _log({"t": time.time(), "op": "fastload_check", "path": "tensor", "ok": True, "tensors": len(bucket)})
+            _log(
+                {
+                    "t": time.time(),
+                    "op": "fastload_check",
+                    "path": "tensor",
+                    "ok": True,
+                    "tensors": len(bucket),
+                }
+            )
             return True, "Success", ("replay_checked", plan)
         return True, "Success", ("replay", plan)
 
     def update_weights_from_tensor(self, named_tensors, load_format=None):
-        if load_format is not None:  # flattened_bucket (slime colocated), direct, custom loaders: untouched
+        if (
+            load_format is not None
+        ):  # flattened_bucket (slime colocated), direct, custom loaders: untouched
             return orig(self, named_tensors, load_format)
         t0 = time.perf_counter()
         info = None
@@ -625,7 +813,10 @@ def _patch_tensor_path(mod, C, profile, fastload, check):
             mod.monkey_patch_torch_reductions()
             self._assert_weight_cache_inactive("update_weights_from_tensor")
             dev = torch.get_device_module(self.device).current_device()
-            named = [(n, mod._unwrap_tensor(t, tp_rank=self.tp_rank, device=dev)) for n, t in named_tensors]
+            named = [
+                (n, mod._unwrap_tensor(t, tp_rank=self.tp_rank, device=dev))
+                for n, t in named_tensors
+            ]
             try:
                 if fastload:
                     ok, msg, info = _load_tensors(self, named)
@@ -634,11 +825,15 @@ def _patch_tensor_path(mod, C, profile, fastload, check):
                     ok, msg = True, "Success"
             except Exception as e:
                 _TPLANS.get(id(self), {}).clear()
-                msg = (f"Failed to update parameter online: {e}. The full weights of the ModelRunner are "
-                       f"partially updated. Please discard the whole weights.")
+                msg = (
+                    f"Failed to update parameter online: {e}. The full weights of the ModelRunner are "
+                    f"partially updated. Please discard the whole weights."
+                )
                 mod.logger.error(msg)
                 return False, msg
-            if inpl:  # the copies are queued on the forward stream: keep their sources alive until they ran
+            if (
+                inpl
+            ):  # the copies are queued on the forward stream: keep their sources alive until they ran
                 ev = torch.cuda.Event()
                 ev.record()
                 _KEEP.append((ev, [t for _, t in named]))
@@ -647,12 +842,21 @@ def _patch_tensor_path(mod, C, profile, fastload, check):
             out = orig(self, named_tensors, load_format)
         if profile:
             torch.cuda.synchronize()
-            rec = {"t": time.time(), "op": "tload", "s": round(time.perf_counter() - t0, 5),
-                   "tensors": len(named_tensors), "inplace": inpl}
+            rec = {
+                "t": time.time(),
+                "op": "tload",
+                "s": round(time.perf_counter() - t0, 5),
+                "tensors": len(named_tensors),
+                "inplace": inpl,
+            }
             if info is not None:
                 rec["mode"] = info[0]
                 if info[1] is not None:
-                    rec.update(copies=info[1].ncopies, ops=info[1].nops, fallback=len(info[1].fallback))
+                    rec.update(
+                        copies=info[1].ncopies,
+                        ops=info[1].nops,
+                        fallback=len(info[1].fallback),
+                    )
             _log(rec)
         return out
 
@@ -666,13 +870,24 @@ def patch_weight_updater(mod):
     if C is None or getattr(C, "_asrt_patched", False):
         return
     opts = _opts()
-    profile, fastload, check = "profile" in opts, "fastload" in opts, "fastload_check" in opts
-    if not hasattr(C, "receive_weights_from_distributed"):  # SGLang 0.5.20 (verl's pin): tensor path only
-        if hasattr(C, "update_weights_from_tensor") and ({"profile", "fastload", "inplace"} & opts):
+    profile, fastload, check = (
+        "profile" in opts,
+        "fastload" in opts,
+        "fastload_check" in opts,
+    )
+    if not hasattr(
+        C, "receive_weights_from_distributed"
+    ):  # SGLang 0.5.20 (verl's pin): tensor path only
+        if hasattr(C, "update_weights_from_tensor") and (
+            {"profile", "fastload", "inplace"} & opts
+        ):
             _patch_tensor_path(mod, C, profile, fastload, check)
         C._asrt_patched = True
-        print(f"[asrt] sgl weight-updater hooks installed (tensor path only): {sorted(opts)} (pid {os.getpid()})",
-              file=sys.stderr, flush=True)
+        print(
+            f"[asrt] sgl weight-updater hooks installed (tensor path only): {sorted(opts)} (pid {os.getpid()})",
+            file=sys.stderr,
+            flush=True,
+        )
         return
     recv, load = C.receive_weights_from_distributed, C.load_weights_from_distributed
 
@@ -680,9 +895,18 @@ def patch_weight_updater(mod):
         t0 = time.perf_counter()
         if fastload and kw.get("load_format") == "flattened_bucket":
             group_name = kw["group_name"]
-            assert group_name in self._model_update_group, f"Group {group_name} not initialized"
-            names, shapes = list(kw["names"]), [tuple(int(x) for x in s) for s in kw["shapes"]]
-            dtypes = [d if isinstance(d, torch.dtype) else getattr(torch, str(d).replace("torch.", "")) for d in kw["dtypes"]]
+            assert (
+                group_name in self._model_update_group
+            ), f"Group {group_name} not initialized"
+            names, shapes = list(kw["names"]), [
+                tuple(int(x) for x in s) for s in kw["shapes"]
+            ]
+            dtypes = [
+                d
+                if isinstance(d, torch.dtype)
+                else getattr(torch, str(d).replace("torch.", ""))
+                for d in kw["dtypes"]
+            ]
             nbytes = 0
             for dt, shape in zip(dtypes, shapes):
                 n = 1
@@ -690,15 +914,32 @@ def patch_weight_updater(mod):
                     n *= s
                 nbytes += n * dt.itemsize
             flat = torch.empty(nbytes, dtype=torch.uint8, device=self.device)
-            torch.distributed.broadcast(flat, src=0, group=self._model_update_group[group_name])
-            out = _FlatBucket(flat, names, dtypes, shapes, (tuple(names), tuple(map(str, dtypes)), tuple(shapes)))
+            torch.distributed.broadcast(
+                flat, src=0, group=self._model_update_group[group_name]
+            )
+            out = _FlatBucket(
+                flat,
+                names,
+                dtypes,
+                shapes,
+                (tuple(names), tuple(map(str, dtypes)), tuple(shapes)),
+            )
         else:
             out = recv(self, **kw)
         if profile:
             torch.cuda.synchronize()
             n = sum(t.numel() * t.element_size() for _, t in out)
-            _log({"t": time.time(), "op": "recv", "s": round(time.perf_counter() - t0, 5), "bytes": n,
-                  "tensors": len(out), "fmt": kw.get("load_format"), "group": kw.get("group_name")})
+            _log(
+                {
+                    "t": time.time(),
+                    "op": "recv",
+                    "s": round(time.perf_counter() - t0, 5),
+                    "bytes": n,
+                    "tensors": len(out),
+                    "fmt": kw.get("load_format"),
+                    "group": kw.get("group_name"),
+                }
+            )
         return out
 
     def _fast(self, bucket):
@@ -707,7 +948,9 @@ def patch_weight_updater(mod):
         if error is not None:
             return False, error, None
         model = self.get_model()
-        cache = _PLANS.setdefault(id(self), {})  # WeightUpdater is a slots dataclass: no attributes of ours
+        cache = _PLANS.setdefault(
+            id(self), {}
+        )  # WeightUpdater is a slots dataclass: no attributes of ours
         plan = cache.get(bucket.key, False)
         try:
             if plan is False or (plan is not None and not plan.valid(bucket.flat)):
@@ -730,18 +973,46 @@ def patch_weight_updater(mod):
                 plan.checked = True
                 if diff:
                     cache[bucket.key] = None
-                    print(f"[asrt] fastload self-check FAILED for a {len(bucket)}-tensor bucket, disabled for this "
-                          f"layout; differing: {diff[:8]}", file=sys.stderr, flush=True)
-                    _log({"t": time.time(), "op": "fastload_check", "ok": False, "diff": diff[:50]})
-                    return True, "Succeeded to update parameter online.", ("check_fail", None)
+                    print(
+                        f"[asrt] fastload self-check FAILED for a {len(bucket)}-tensor bucket, disabled for this "
+                        f"layout; differing: {diff[:8]}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    _log(
+                        {
+                            "t": time.time(),
+                            "op": "fastload_check",
+                            "ok": False,
+                            "diff": diff[:50],
+                        }
+                    )
+                    return (
+                        True,
+                        "Succeeded to update parameter online.",
+                        ("check_fail", None),
+                    )
                 _check_passed(id(self), bucket.key)
-                _log({"t": time.time(), "op": "fastload_check", "ok": True, "tensors": len(bucket)})
-                return True, "Succeeded to update parameter online.", ("replay_checked", plan)
+                _log(
+                    {
+                        "t": time.time(),
+                        "op": "fastload_check",
+                        "ok": True,
+                        "tensors": len(bucket),
+                    }
+                )
+                return (
+                    True,
+                    "Succeeded to update parameter online.",
+                    ("replay_checked", plan),
+                )
             return True, "Succeeded to update parameter online.", ("replay", plan)
         except Exception as e:
             cache.pop(bucket.key, None)
-            msg = (f"Failed to update parameter online: {e}. The full weights of the ModelRunner are "
-                   f"partially updated. Please discard the whole weights.")
+            msg = (
+                f"Failed to update parameter online: {e}. The full weights of the ModelRunner are "
+                f"partially updated. Please discard the whole weights."
+            )
             mod.logger.error(msg)
             return False, msg, None
 
@@ -755,28 +1026,47 @@ def patch_weight_updater(mod):
             out = load(self, named_tensors)
         if profile:
             torch.cuda.synchronize()
-            rec = {"t": time.time(), "op": "load", "s": round(time.perf_counter() - t0, 5), "tensors": len(named_tensors)}
+            rec = {
+                "t": time.time(),
+                "op": "load",
+                "s": round(time.perf_counter() - t0, 5),
+                "tensors": len(named_tensors),
+            }
             if info is not None:
                 mode, plan = info
                 rec["mode"] = mode
                 if plan is not None:
-                    rec.update(copies=plan.ncopies, ops=len(plan.ops), fallback=len(plan.fallback))
+                    rec.update(
+                        copies=plan.ncopies,
+                        ops=len(plan.ops),
+                        fallback=len(plan.fallback),
+                    )
             _log(rec)
         return out
 
     C.receive_weights_from_distributed = receive_weights_from_distributed
     C.load_weights_from_distributed = load_weights_from_distributed
-    if hasattr(C, "update_weights_from_tensor") and ({"profile", "fastload", "inplace"} & opts):
+    if hasattr(C, "update_weights_from_tensor") and (
+        {"profile", "fastload", "inplace"} & opts
+    ):
         _patch_tensor_path(mod, C, profile, fastload, check)
     C._asrt_patched = True
     _FASTFN[:] = [(_fast if fastload else None), load]
-    print(f"[asrt] sgl weight-updater hooks installed: {sorted(opts)} (pid {os.getpid()})", file=sys.stderr, flush=True)
+    print(
+        f"[asrt] sgl weight-updater hooks installed: {sorted(opts)} (pid {os.getpid()})",
+        file=sys.stderr,
+        flush=True,
+    )
 
 
 # --------------------------------------------------------------------------------------
 # inplace: weight updates without pausing / draining the engine; tokstat: token timeline
 # --------------------------------------------------------------------------------------
-_CNT = {"out": 0, "pre": 0, "it": 0}  # this scheduler process: output tokens / prefill tokens / iterations
+_CNT = {
+    "out": 0,
+    "pre": 0,
+    "it": 0,
+}  # this scheduler process: output tokens / prefill tokens / iterations
 
 
 def _is_rank0():
@@ -817,7 +1107,13 @@ class _TokStat:
         if now < self.t_bin + self.BIN and not force:
             return
         d = {k: _CNT[k] - self.last[k] for k in _CNT}
-        self.buf.append({"t": round(self.t_bin, 3), "dt": round(min(now, self.t_bin + self.BIN) - self.t_bin, 3), **d})
+        self.buf.append(
+            {
+                "t": round(self.t_bin, 3),
+                "dt": round(min(now, self.t_bin + self.BIN) - self.t_bin, 3),
+                **d,
+            }
+        )
         self.last = dict(_CNT)
         self.t_bin = now
         if len(self.buf) >= 40 or force:
@@ -835,7 +1131,9 @@ class _TokStat:
         if d and self.buf:
             try:
                 os.makedirs(d, exist_ok=True)
-                with open(os.path.join(d, f"sgl-tokstat-{os.getpid()}.jsonl"), "a") as f:
+                with open(
+                    os.path.join(d, f"sgl-tokstat-{os.getpid()}.jsonl"), "a"
+                ) as f:
                     f.write("".join(json.dumps(r) + "\n" for r in self.buf))
             except OSError:
                 pass
@@ -849,12 +1147,16 @@ _KVF = {"flush": 0, "flush_fail": 0, "retract_calls": 0, "retracted": 0}
 
 
 def _kvfresh_on():
-    return "kvfresh" in _opts() or os.environ.get("ASRT_WS_KV", "").strip().lower() == "fresh"
+    return (
+        "kvfresh" in _opts()
+        or os.environ.get("ASRT_WS_KV", "").strip().lower() == "fresh"
+    )
 
 
 def _tree_tokens(tc):
     """Tokens held by the prefix tree (evictable + protected), or None when the cache exposes neither counter
-    (unknown cache type: the emptiness check cannot be made - reported as unchecked, never as a silent pass)."""
+    (unknown cache type: the emptiness check cannot be made - reported as unchecked, never as a silent pass).
+    """
     n, seen = 0, False
     for f in ("evictable_size", "protected_size"):
         try:
@@ -876,12 +1178,23 @@ def _tree_children(tc):
 
 def _sched_busy(sch):
     out = {}
-    for k, f in (("running", lambda: len(sch.running_batch.reqs)), ("waiting", lambda: len(sch.waiting_queue)),
-                 ("chunked", lambda: int(sch.chunked_req is not None)),
-                 ("last_batch", lambda: int(sch.last_batch is not None and not sch.last_batch.is_empty())),
-                 ("result_queue", lambda: len(sch.result_queue) if getattr(sch, "enable_overlap", False) else 0),
-                 ("grammar", lambda: len(sch.grammar_manager.grammar_queue)),
-                 ("paused", lambda: int(bool(sch._engine_paused)))):
+    for k, f in (
+        ("running", lambda: len(sch.running_batch.reqs)),
+        ("waiting", lambda: len(sch.waiting_queue)),
+        ("chunked", lambda: int(sch.chunked_req is not None)),
+        (
+            "last_batch",
+            lambda: int(sch.last_batch is not None and not sch.last_batch.is_empty()),
+        ),
+        (
+            "result_queue",
+            lambda: len(sch.result_queue)
+            if getattr(sch, "enable_overlap", False)
+            else 0,
+        ),
+        ("grammar", lambda: len(sch.grammar_manager.grammar_queue)),
+        ("paused", lambda: int(bool(sch._engine_paused))),
+    ):
         try:
             out[k] = f()
         except Exception:
@@ -890,7 +1203,7 @@ def _sched_busy(sch):
 
 
 def _patch_kvfresh(S):
-    """ ``kvfresh`` (also on with ASRT_WS_KV=fresh): make the weight-sync flush verifiable.
+    """``kvfresh`` (also on with ASRT_WS_KV=fresh): make the weight-sync flush verifiable.
 
     * ``flush_cache``: after SGLang's own reset, the prefix tree must hold 0 tokens (evictable + protected) and the root
       no children; otherwise the call reports failure (HTTP 400 -> the trainer re-retracts and retries).  Every call
@@ -908,24 +1221,48 @@ def _patch_kvfresh(S):
         ok = bool(orig_flush(self, *a, **k))
         after, kids = _tree_tokens(tc), _tree_children(tc)
         why = ""
-        if after is None:  # cannot verify this cache type: loud, counted, the flush result itself still stands
+        if (
+            after is None
+        ):  # cannot verify this cache type: loud, counted, the flush result itself still stands
             _KVF["unchecked"] = _KVF.get("unchecked", 0) + 1
             if _KVF["unchecked"] == 1:
-                print(f"[asrt] ERROR kvfresh: cannot check tree emptiness for {type(tc).__name__} "
-                      f"(no evictable_size/protected_size); flush results are UNCHECKED (pid {os.getpid()})",
-                      file=sys.stderr, flush=True)
+                print(
+                    f"[asrt] ERROR kvfresh: cannot check tree emptiness for {type(tc).__name__} "
+                    f"(no evictable_size/protected_size); flush results are UNCHECKED (pid {os.getpid()})",
+                    file=sys.stderr,
+                    flush=True,
+                )
         if ok and ((after or 0) or kids):
-            ok, why = False, f"tree not empty after reset: {after} tokens, {kids} root children"
+            ok, why = (
+                False,
+                f"tree not empty after reset: {after} tokens, {kids} root children",
+            )
         elif not ok:
             why = f"engine not idle: {busy}"
         _KVF["flush"] += 1
         if not ok:
             _KVF["flush_fail"] += 1
-            print(f"[asrt] ERROR kvfresh flush_cache failed (pid {os.getpid()}): {why}", file=sys.stderr, flush=True)
+            print(
+                f"[asrt] ERROR kvfresh flush_cache failed (pid {os.getpid()}): {why}",
+                file=sys.stderr,
+                flush=True,
+            )
         if not ok or _is_rank0():
-            _log({"t": time.time(), "op": "flush", "ok": ok, "checked": after is not None, "tree_before": before,
-                  "tree_after": after,
-                  "root_children": kids, "busy": busy, "why": why, **_KVF}, kind="sgl-kvfresh")
+            _log(
+                {
+                    "t": time.time(),
+                    "op": "flush",
+                    "ok": ok,
+                    "checked": after is not None,
+                    "tree_before": before,
+                    "tree_after": after,
+                    "root_children": kids,
+                    "busy": busy,
+                    "why": why,
+                    **_KVF,
+                },
+                kind="sgl-kvfresh",
+            )
         return ok
 
     def pause_generation(self, recv_req):
@@ -943,26 +1280,40 @@ def _patch_kvfresh(S):
             _KVF["retract_calls"] += 1
             _KVF["retracted"] += max(0, n)
             if _is_rank0():
-                _log({"t": time.time(), "op": "retract", "n": n, "waiting": w0 + n,
-                      "tree": _tree_tokens(getattr(self, "tree_cache", None)), **_KVF}, kind="sgl-kvfresh")
+                _log(
+                    {
+                        "t": time.time(),
+                        "op": "retract",
+                        "n": n,
+                        "waiting": w0 + n,
+                        "tree": _tree_tokens(getattr(self, "tree_cache", None)),
+                        **_KVF,
+                    },
+                    kind="sgl-kvfresh",
+                )
         return out
 
     S.flush_cache = flush_cache
     S.pause_generation = pause_generation
     S._asrt_kvfresh = True
-    print(f"[asrt] sgl kvfresh installed: checked flush_cache + retract count (pid {os.getpid()})",
-          file=sys.stderr, flush=True)
+    print(
+        f"[asrt] sgl kvfresh installed: checked flush_cache + retract count (pid {os.getpid()})",
+        file=sys.stderr,
+        flush=True,
+    )
 
 
 def _r3keep_on():
-    return _kvfresh_on() and os.environ.get("ASRT_KVFRESH_R3KEEP", "1").strip().lower() not in ("0", "off", "no", "false")
+    return _kvfresh_on() and os.environ.get(
+        "ASRT_KVFRESH_R3KEEP", "1"
+    ).strip().lower() not in ("0", "off", "no", "false")
 
 
 _R3K = {"reqs": 0, "rows": 0, "rows_flipped": 0, "spliced": 0}
 
 
 def _r3_stash(reqs, req_to_token_pool):
-    """ before a retract frees a request's KV: keep the routed-expert rows R3 already holds for it.
+    """before a retract frees a request's KV: keep the routed-expert rows R3 already holds for it.
 
     SGLang captures routed experts per KV SLOT (state_capturer get_topk reads host_cache.buffer[req_to_token[...]]) and
     gathers them only when the request finishes.  A retract frees the slots; the re-prefill after the sync recomputes the
@@ -970,9 +1321,11 @@ def _r3_stash(reqs, req_to_token_pool):
     for the tokens generated (or prefilled) before the retract are no longer the routes those tokens were computed with
     - R3 then replays routes that do not match their rollout logprobs (measured: train/rollout logp diff rises under
     kvfresh on a retract-heavy MoE run; flat without retracts).  Rows [routed_experts_start_len, current length - 1)
-    are kept here and spliced back at collection (first computation wins, like an in-place pause)."""
+    are kept here and spliced back at collection (first computation wins, like an in-place pause).
+    """
     try:
         from sglang.srt.state_capturer.routed_experts import get_global_experts_capturer
+
         cap = get_global_experts_capturer()
     except Exception:
         return
@@ -995,24 +1348,44 @@ def _r3_stash(reqs, req_to_token_pool):
                 hi = min(hi, int(kc))
             if hi <= start:
                 continue
-            rows = cap.get_topk(req_pool_idx=idx, seqlen=hi + 1, req_to_token_pool=req_to_token_pool, start_len=start)
+            rows = cap.get_topk(
+                req_pool_idx=idx,
+                seqlen=hi + 1,
+                req_to_token_pool=req_to_token_pool,
+                start_len=start,
+            )
             prev = getattr(req, "_asrt_r3_keep", None)
-            if prev is not None:   # retracted again: the oldest computation of each row wins
-                if len(prev) >= len(rows):   # e.g. retracted again mid chunked RE-prefill: nothing new to add
+            if (
+                prev is not None
+            ):  # retracted again: the oldest computation of each row wins
+                if len(prev) >= len(
+                    rows
+                ):  # e.g. retracted again mid chunked RE-prefill: nothing new to add
                     rows = prev
                 else:
                     import torch
-                    rows = torch.cat([prev, rows[len(prev):]], dim=0)
+
+                    rows = torch.cat([prev, rows[len(prev) :]], dim=0)
             req._asrt_r3_keep = rows.clone()
             _R3K["reqs"] += 1
         except Exception as e:  # never break a retract
-            print(f"[asrt] kvfresh r3keep stash failed: {e!r}", file=sys.stderr, flush=True)
+            print(
+                f"[asrt] kvfresh r3keep stash failed: {e!r}",
+                file=sys.stderr,
+                flush=True,
+            )
 
 
 def patch_brp(mod):
-    """ splice the rows kept at retract into the routed experts gathered at request finish."""
+    """splice the rows kept at retract into the routed experts gathered at request finish."""
     C = getattr(mod, "BatchResultProcessor", None) or next(
-        (v for v in vars(mod).values() if isinstance(v, type) and hasattr(v, "_maybe_collect_routed_experts")), None)
+        (
+            v
+            for v in vars(mod).values()
+            if isinstance(v, type) and hasattr(v, "_maybe_collect_routed_experts")
+        ),
+        None,
+    )
     if C is None or getattr(C, "_asrt_r3keep", False) or not _r3keep_on():
         return
     orig = C._maybe_collect_routed_experts
@@ -1028,15 +1401,21 @@ def patch_brp(mod):
                 # route SETS per (token, layer) (top-k order ignored): how many the re-prefill would have changed
                 a = kk.reshape(k, -1, kk.shape[-1]).sort(dim=-1).values
                 b = re_[:k].reshape(k, -1, re_.shape[-1]).sort(dim=-1).values
-                diff_tl = (a != b).any(dim=-1)                       # [rows, layers]
+                diff_tl = (a != b).any(dim=-1)  # [rows, layers]
                 # how many of the top-k experts differ in a changed (token, layer) set: 1-of-k = a near-tie flip
                 # (drift / numerics), most of k = a different token's row (misalignment) - review of 063
-                inter = (a.unsqueeze(-1) == b.unsqueeze(-2)).any(dim=-1).sum(dim=-1)   # [rows, layers]
+                inter = (
+                    (a.unsqueeze(-1) == b.unsqueeze(-2)).any(dim=-1).sum(dim=-1)
+                )  # [rows, layers]
                 ndiff = (a.shape[-1] - inter)[diff_tl]
                 hist = [int((ndiff == j).sum()) for j in range(1, a.shape[-1] + 1)]
-                _R3K["ndiff_hist"] = [x + y for x, y in zip(_R3K.get("ndiff_hist", [0] * len(hist)), hist)]
+                _R3K["ndiff_hist"] = [
+                    x + y for x, y in zip(_R3K.get("ndiff_hist", [0] * len(hist)), hist)
+                ]
                 zero_rows = int((kk.reshape(k, -1) == 0).all(dim=1).sum())
-                zero_final = int((re_[:k].reshape(k, -1) == 0).all(dim=1).sum())   # before the splice overwrites them
+                zero_final = int(
+                    (re_[:k].reshape(k, -1) == 0).all(dim=1).sum()
+                )  # before the splice overwrites them
                 flipped = int(diff_tl.any(dim=1).sum())
                 re_[:k] = kk
                 _R3K["rows"] += k
@@ -1045,21 +1424,38 @@ def patch_brp(mod):
                 _R3K["tl"] = _R3K.get("tl", 0) + int(diff_tl.numel())
                 _R3K["tl_flipped"] = _R3K.get("tl_flipped", 0) + int(diff_tl.sum())
                 if _is_rank0():
-                    _log({"t": time.time(), "op": "r3keep", "req_rows": k, "req_rows_route_changed": flipped,
-                          "req_token_layers": int(diff_tl.numel()), "req_token_layers_changed": int(diff_tl.sum()),
-                          "req_ndiff_hist": hist, "req_zero_rows_kept": zero_rows,
-                          "req_zero_rows_final": zero_final,
-                          "total_rows": int(re_.shape[0]), **{"cum_" + x: v for x, v in _R3K.items()}},
-                         kind="sgl-kvfresh")
+                    _log(
+                        {
+                            "t": time.time(),
+                            "op": "r3keep",
+                            "req_rows": k,
+                            "req_rows_route_changed": flipped,
+                            "req_token_layers": int(diff_tl.numel()),
+                            "req_token_layers_changed": int(diff_tl.sum()),
+                            "req_ndiff_hist": hist,
+                            "req_zero_rows_kept": zero_rows,
+                            "req_zero_rows_final": zero_final,
+                            "total_rows": int(re_.shape[0]),
+                            **{"cum_" + x: v for x, v in _R3K.items()},
+                        },
+                        kind="sgl-kvfresh",
+                    )
             except Exception as e:
-                print(f"[asrt] kvfresh r3keep splice failed: {e!r}", file=sys.stderr, flush=True)
+                print(
+                    f"[asrt] kvfresh r3keep splice failed: {e!r}",
+                    file=sys.stderr,
+                    flush=True,
+                )
             req._asrt_r3_keep = None
         return out
 
     C._maybe_collect_routed_experts = _maybe_collect_routed_experts
     C._asrt_r3keep = True
-    print(f"[asrt] sgl kvfresh r3keep installed: retracted requests keep their routed-expert rows (pid {os.getpid()})",
-          file=sys.stderr, flush=True)
+    print(
+        f"[asrt] sgl kvfresh r3keep installed: retracted requests keep their routed-expert rows (pid {os.getpid()})",
+        file=sys.stderr,
+        flush=True,
+    )
 
 
 def patch_scheduler(mod):
@@ -1070,17 +1466,29 @@ def patch_scheduler(mod):
         _patch_kvfresh(S)
     ra = getattr(mod, "retract_all", None)
     if ra is not None and _r3keep_on() and not getattr(ra, "_asrt_r3keep", False):
-        def retract_all(*a, **k):   # scheduler.pause_generation(retract) -> retract_all(reqs=..., req_to_token_pool=...)
+
+        def retract_all(
+            *a, **k
+        ):  # scheduler.pause_generation(retract) -> retract_all(reqs=..., req_to_token_pool=...)
             reqs = k.get("reqs", a[0] if a else None)
             pool = k.get("req_to_token_pool", a[1] if len(a) > 1 else None)
             if reqs and pool is not None:
                 _r3_stash(reqs, pool)
             return ra(*a, **k)
+
         retract_all._asrt_r3keep = True
         mod.retract_all = retract_all
-    if S is None or getattr(S, "_asrt_patched", False) or not ({"inplace", "tokstat"} & opts):
+    if (
+        S is None
+        or getattr(S, "_asrt_patched", False)
+        or not ({"inplace", "tokstat"} & opts)
+    ):
         return
-    orig_pbr, orig_pause, orig_cont = S.process_batch_result, S.pause_generation, S.continue_generation
+    orig_pbr, orig_pause, orig_cont = (
+        S.process_batch_result,
+        S.pause_generation,
+        S.continue_generation,
+    )
 
     def process_batch_result(self, batch, result):
         _TS.tick()
@@ -1093,7 +1501,9 @@ def patch_scheduler(mod):
             if fm.is_decode():
                 _CNT["out"] += n
             elif fm.is_extend():
-                _CNT["out"] += n  # each request whose prefill (chunk) ran; ~1 sampled token each
+                _CNT[
+                    "out"
+                ] += n  # each request whose prefill (chunk) ran; ~1 sampled token each
                 _CNT["pre"] += int(getattr(batch, "extend_num_tokens", 0) or 0)
         except Exception:
             pass
@@ -1111,12 +1521,24 @@ def patch_scheduler(mod):
     S.pause_generation = pause_generation
     S.continue_generation = continue_generation
     S._asrt_patched = True
-    print(f"[asrt] sgl scheduler hooks installed: {sorted(opts & {'inplace', 'tokstat'})} (pid {os.getpid()})",
-          file=sys.stderr, flush=True)
+    print(
+        f"[asrt] sgl scheduler hooks installed: {sorted(opts & {'inplace', 'tokstat'})} (pid {os.getpid()})",
+        file=sys.stderr,
+        flush=True,
+    )
 
 
 class _Inplace:
-    __slots__ = ("pending", "recv_stream", "win_t0", "snap", "old", "tok0", "it0", "stats")
+    __slots__ = (
+        "pending",
+        "recv_stream",
+        "win_t0",
+        "snap",
+        "old",
+        "tok0",
+        "it0",
+        "stats",
+    )
 
     def __init__(self):
         self.pending = []  # [(group, bucket, recv_event, t_posted)] in arrival order
@@ -1128,8 +1550,12 @@ class _Inplace:
         self.stats = {}
 
 
-_INPL_FMT = "asrt_inplace"  # load_format the tokenizer gives un-paused flattened_bucket updates
-_INPLACE = {}  # id(SchedulerWeightUpdaterManager) -> _Inplace (the manager is a slots dataclass)
+_INPL_FMT = (
+    "asrt_inplace"  # load_format the tokenizer gives un-paused flattened_bucket updates
+)
+_INPLACE = (
+    {}
+)  # id(SchedulerWeightUpdaterManager) -> _Inplace (the manager is a slots dataclass)
 
 
 def _live_reqs(sch):
@@ -1152,7 +1578,11 @@ def patch_sched_updater(mod):
 
     C = getattr(mod, "SchedulerWeightUpdaterManager", None)
     opts = _opts()
-    if C is None or getattr(C, "_asrt_patched", False) or not ({"inplace", "tokstat"} & opts):
+    if (
+        C is None
+        or getattr(C, "_asrt_patched", False)
+        or not ({"inplace", "tokstat"} & opts)
+    ):
         return
     inplace = "inplace" in opts
     trace = "inplace_trace" in opts
@@ -1164,7 +1594,9 @@ def patch_sched_updater(mod):
         sch = self.scheduler
         s = getattr(sch, "forward_stream", None) if sch is not None else None
         if s is None:
-            s = getattr(getattr(self.tp_worker, "model_runner", None), "forward_stream", None)
+            s = getattr(
+                getattr(self.tp_worker, "model_runner", None), "forward_stream", None
+            )
         return s if s is not None else torch.cuda.current_stream()
 
     def _open_window(self, st):
@@ -1173,12 +1605,20 @@ def patch_sched_updater(mod):
 
         st.win_t0 = time.time()
         st.tok0, st.it0 = _CNT["out"], _CNT["it"]
-        st.stats = {"buckets": 0, "bytes": 0, "host_apply_s": 0.0, "forced": 0, "post_s": 0.0}
+        st.stats = {
+            "buckets": 0,
+            "bytes": 0,
+            "host_apply_s": 0.0,
+            "forced": 0,
+            "post_s": 0.0,
+        }
         sch = self.scheduler
         live = _live_reqs(sch) if sch is not None else set()
         st.snap = {id(r) for r in live if getattr(r, "output_ids", None)}
         st.old = get_serving().weight_version
-        record_weight_version_events(live, old_version=st.old)  # closes the pure-old segment of live requests
+        record_weight_version_events(
+            live, old_version=st.old
+        )  # closes the pure-old segment of live requests
         _TS.event("inplace_open", live=len(live))
 
     def _apply(self, st, item):
@@ -1203,13 +1643,25 @@ def patch_sched_updater(mod):
                 if not ok:
                     break
             bucket.flat.record_stream(fwd)
-        st.stats["host_apply_s"] = st.stats.get("host_apply_s", 0.0) + time.perf_counter() - t0
-        if trace:  # TP consistency check: every TP rank must apply each bucket at the same iteration
+        st.stats["host_apply_s"] = (
+            st.stats.get("host_apply_s", 0.0) + time.perf_counter() - t0
+        )
+        if (
+            trace
+        ):  # TP consistency check: every TP rank must apply each bucket at the same iteration
             import torch.distributed as dist
 
-            _log({"op": "apply", "rank": dist.get_rank() if dist.is_initialized() else 0, "it": _CNT["it"],
-                  "first": bucket[0][0] if len(bucket) else "", "n": len(bucket), "group": group},
-                 kind="sgl-inplace-trace")
+            _log(
+                {
+                    "op": "apply",
+                    "rank": dist.get_rank() if dist.is_initialized() else 0,
+                    "it": _CNT["it"],
+                    "first": bucket[0][0] if len(bucket) else "",
+                    "n": len(bucket),
+                    "group": group,
+                },
+                kind="sgl-inplace-trace",
+            )
         if not ok:
             raise RuntimeError(msg)
 
@@ -1218,7 +1670,9 @@ def patch_sched_updater(mod):
 
         while st.pending:
             _apply(self, st, st.pending.pop(0))
-        torch.cuda.current_stream().wait_stream(_fwd(self))  # control ops after this see the new weights
+        torch.cuda.current_stream().wait_stream(
+            _fwd(self)
+        )  # control ops after this see the new weights
         sch = self.scheduler
         if version is None or sch is None:
             return
@@ -1226,10 +1680,18 @@ def patch_sched_updater(mod):
         if st.win_t0 is not None:
             live = _live_reqs(sch)
             record_weight_version_events(live, old_version=f"{st.old}~{version}")
-            rec.update(old=st.old, window_s=round(time.time() - st.win_t0, 4),
-                       tokens_in_window=_CNT["out"] - st.tok0, iters_in_window=_CNT["it"] - st.it0,
-                       live_reqs=len(live), spanning_reqs=sum(1 for r in live if id(r) in st.snap),
-                       **{k: (round(v, 4) if isinstance(v, float) else v) for k, v in st.stats.items()})
+            rec.update(
+                old=st.old,
+                window_s=round(time.time() - st.win_t0, 4),
+                tokens_in_window=_CNT["out"] - st.tok0,
+                iters_in_window=_CNT["it"] - st.it0,
+                live_reqs=len(live),
+                spanning_reqs=sum(1 for r in live if id(r) in st.snap),
+                **{
+                    k: (round(v, 4) if isinstance(v, float) else v)
+                    for k, v in st.stats.items()
+                },
+            )
             st.win_t0 = None
         sch.record_weight_version_change(new_version=version)
         if _is_rank0():
@@ -1245,11 +1707,18 @@ def patch_sched_updater(mod):
         paused = sch is None or getattr(sch, "_engine_paused", False)
         if not mine:
             st = _INPLACE.get(id(self))
-            if st is not None and st.pending:  # keep order: nothing of ours may land after a later update
+            if (
+                st is not None and st.pending
+            ):  # keep order: nothing of ours may land after a later update
                 _commit(self, st, None)
             t0 = time.time()
             out = orig(self, recv_req)
-            _TS.event("upd", dur=round(time.time() - t0, 4), n=len(recv_req.names), paused=bool(paused))
+            _TS.event(
+                "upd",
+                dur=round(time.time() - t0, 4),
+                n=len(recv_req.names),
+                paused=bool(paused),
+            )
             return out
         st = _INPLACE.setdefault(id(self), _Inplace())
         try:
@@ -1259,20 +1728,32 @@ def patch_sched_updater(mod):
             t0 = time.perf_counter()
             group = recv_req.group_name
             keep = []
-            for it in st.pending:  # the same sender only sends bucket k after k-1 has fully arrived
+            for (
+                it
+            ) in (
+                st.pending
+            ):  # the same sender only sends bucket k after k-1 has fully arrived
                 if it[0] == group:
                     _apply(self, st, it)
                 else:
                     keep.append(it)
             st.pending = keep
-            while len(st.pending) >= maxpend:  # bound staging memory (GPU then waits for that receive)
+            while (
+                len(st.pending) >= maxpend
+            ):  # bound staging memory (GPU then waits for that receive)
                 _apply(self, st, st.pending.pop(0))
                 st.stats["forced"] = st.stats.get("forced", 0) + 1
             target = self.tp_worker.model_runner.weight_updater
             assert group in target._model_update_group, f"Group {group} not initialized"
-            names, shapes = list(recv_req.names), [tuple(int(x) for x in sh) for sh in recv_req.shapes]
-            dtypes = [d if isinstance(d, torch.dtype) else getattr(torch, str(d).replace("torch.", ""))
-                      for d in recv_req.dtypes]
+            names, shapes = list(recv_req.names), [
+                tuple(int(x) for x in sh) for sh in recv_req.shapes
+            ]
+            dtypes = [
+                d
+                if isinstance(d, torch.dtype)
+                else getattr(torch, str(d).replace("torch.", ""))
+                for d in recv_req.dtypes
+            ]
             nbytes = 0
             for dt, shape in zip(dtypes, shapes):
                 n = 1
@@ -1283,12 +1764,16 @@ def patch_sched_updater(mod):
                 st.recv_stream = torch.cuda.Stream(device=target.device)
             with torch.cuda.stream(st.recv_stream):
                 flat = torch.empty(nbytes, dtype=torch.uint8, device=target.device)
-                work = torch.distributed.broadcast(flat, src=0, group=target._model_update_group[group], async_op=True)
+                work = torch.distributed.broadcast(
+                    flat, src=0, group=target._model_update_group[group], async_op=True
+                )
                 work.wait()  # recv stream waits for the NCCL stream; the host does not
                 ev = torch.cuda.Event()
                 ev.record()
             key = (tuple(names), tuple(map(str, dtypes)), tuple(shapes))
-            st.pending.append((group, _FlatBucket(flat, names, dtypes, shapes, key), ev, time.time()))
+            st.pending.append(
+                (group, _FlatBucket(flat, names, dtypes, shapes, key), ev, time.time())
+            )
             if st.win_t0 is None:
                 _open_window(self, st)
             st.stats["buckets"] = st.stats.get("buckets", 0) + 1
@@ -1303,6 +1788,7 @@ def patch_sched_updater(mod):
     orig_t = getattr(C, "update_weights_from_tensor", None)
     twait = os.environ.get("ASRT_SGL_INPLACE_WAIT", "1") != "0"
     if orig_t is not None:
+
         def update_weights_from_tensor(self, recv_req):
             # verl path: plain named tensors over CUDA IPC.  An update the tokenizer tagged "asrt_inplace" (sent while
             # not paused) is loaded on the FORWARD stream: after the forward in flight, before the next one (same TP
@@ -1311,8 +1797,13 @@ def patch_sched_updater(mod):
             t0 = time.time()
             if not mine:
                 out = orig_t(self, recv_req)
-                _TS.event("upd", dur=round(time.time() - t0, 4), n=len(recv_req.serialized_named_tensors),
-                          path="tensor", paused=bool(getattr(self.scheduler, "_engine_paused", False)))
+                _TS.event(
+                    "upd",
+                    dur=round(time.time() - t0, 4),
+                    n=len(recv_req.serialized_named_tensors),
+                    path="tensor",
+                    paused=bool(getattr(self.scheduler, "_engine_paused", False)),
+                )
                 return out
             recv_req.load_format = None
             recv_req.flush_cache = False
@@ -1333,13 +1824,19 @@ def patch_sched_updater(mod):
                 ev.record(fwd)
                 ev.synchronize()
             _prune_keep()
-            _TS.event("upd", dur=round(time.time() - t0, 4), path="tensor", inplace=True)
+            _TS.event(
+                "upd", dur=round(time.time() - t0, 4), path="tensor", inplace=True
+            )
             return out
 
         C.update_weights_from_tensor = update_weights_from_tensor
     C._asrt_patched = True
-    print(f"[asrt] sgl scheduler weight-update hooks installed: inplace={inplace} maxpend={maxpend} "
-          f"(pid {os.getpid()})", file=sys.stderr, flush=True)
+    print(
+        f"[asrt] sgl scheduler weight-update hooks installed: inplace={inplace} maxpend={maxpend} "
+        f"(pid {os.getpid()})",
+        file=sys.stderr,
+        flush=True,
+    )
 
 
 def patch_tokenizer(mod):
@@ -1359,7 +1856,9 @@ def patch_tokenizer(mod):
         if paused:
             return await orig(self, obj, request)
         self.auto_create_handle_loop()
-        obj.load_format = _INPL_FMT  # tells the scheduler hook: in place (not paused, no writer lock)
+        obj.load_format = (
+            _INPL_FMT  # tells the scheduler hook: in place (not paused, no writer lock)
+        )
         results = await self.update_weights_from_distributed_communicator(obj)
         success, message = mod.FanOutCommunicator.merge_results(results)
         if success and obj.weight_version is not None:
@@ -1369,18 +1868,26 @@ def patch_tokenizer(mod):
     M.update_weights_from_distributed = update_weights_from_distributed
     orig_t = getattr(M, "update_weights_from_tensor", None)
     if orig_t is not None:
+
         async def update_weights_from_tensor(self, obj, request=None):
             # plain named-tensor updates (load_format None, e.g. verl) sent while NOT paused: no writer lock (it waits
             # for every running request = drains the engine), no cache flush (it asserts an idle engine).
-            if getattr(obj, "load_format", None) is not None or getattr(obj, "abort_all_requests", False):
+            if getattr(obj, "load_format", None) is not None or getattr(
+                obj, "abort_all_requests", False
+            ):
                 return await orig_t(self, obj, request)
             async with self.is_pause_cond:
                 paused = self.is_pause
             if paused:
                 return await orig_t(self, obj, request)
             self.auto_create_handle_loop()
-            obj.serialized_named_tensors = mod.normalize_serialized_named_tensor_payloads(obj.serialized_named_tensors) \
-                if hasattr(mod, "normalize_serialized_named_tensor_payloads") else obj.serialized_named_tensors
+            obj.serialized_named_tensors = (
+                mod.normalize_serialized_named_tensor_payloads(
+                    obj.serialized_named_tensors
+                )
+                if hasattr(mod, "normalize_serialized_named_tensor_payloads")
+                else obj.serialized_named_tensors
+            )
             obj.load_format = _INPL_FMT
             obj.flush_cache = False
             results = await self.update_weights_from_tensor_communicator(obj)
@@ -1391,7 +1898,11 @@ def patch_tokenizer(mod):
 
         M.update_weights_from_tensor = update_weights_from_tensor
     M._asrt_patched = True
-    print(f"[asrt] sgl tokenizer inplace hook installed (pid {os.getpid()})", file=sys.stderr, flush=True)
+    print(
+        f"[asrt] sgl tokenizer inplace hook installed (pid {os.getpid()})",
+        file=sys.stderr,
+        flush=True,
+    )
 
 
 def _wants_top_p_logprobs(req):
@@ -1407,34 +1918,53 @@ def patch_sampling_info(mod):
     if getattr(C, "_asrt_nosync", False):
         return
     import dataclasses
-    fields = {f.name for f in dataclasses.fields(C)} if dataclasses.is_dataclass(C) else set(vars(C))
+
+    fields = (
+        {f.name for f in dataclasses.fields(C)}
+        if dataclasses.is_dataclass(C)
+        else set(vars(C))
+    )
     if "return_top_p_log_probs" not in fields:
         # stock SGLang (e.g. 0.5.20 pinned by verl): no top-p logprob mask, so no per-step sync to remove
-        print(f"[asrt] sgl nosync: not needed on this SGLang (no return_top_p_log_probs) (pid {os.getpid()})",
-              file=sys.stderr, flush=True)
+        print(
+            f"[asrt] sgl nosync: not needed on this SGLang (no return_top_p_log_probs) (pid {os.getpid()})",
+            file=sys.stderr,
+            flush=True,
+        )
         C._asrt_nosync = True
         return
     import torch
+
     orig_adjust = C.adjusted_from_schedule_batch
     orig_merge = C.merge_batch
 
     def adjusted_from_schedule_batch(self, batch, vocab_size):
         orig_adjust(self, batch, vocab_size)
-        if self.return_top_p_log_probs is not None and not any(_wants_top_p_logprobs(r) for r in batch.reqs):
+        if self.return_top_p_log_probs is not None and not any(
+            _wants_top_p_logprobs(r) for r in batch.reqs
+        ):
             self.return_top_p_log_probs = None
 
     def merge_batch(self, other):
         a, b = self.return_top_p_log_probs, other.return_top_p_log_probs
         if a is None and b is not None:
-            self.return_top_p_log_probs = torch.zeros(len(self), dtype=torch.bool, device=b.device)
+            self.return_top_p_log_probs = torch.zeros(
+                len(self), dtype=torch.bool, device=b.device
+            )
         elif b is None and a is not None:
-            other.return_top_p_log_probs = torch.zeros(len(other), dtype=torch.bool, device=a.device)
+            other.return_top_p_log_probs = torch.zeros(
+                len(other), dtype=torch.bool, device=a.device
+            )
         return orig_merge(self, other)
 
     C.adjusted_from_schedule_batch = adjusted_from_schedule_batch
     C.merge_batch = merge_batch
     C._asrt_nosync = True
-    print(f"[asrt] sgl nosync hook installed (pid {os.getpid()})", file=sys.stderr, flush=True)
+    print(
+        f"[asrt] sgl nosync hook installed (pid {os.getpid()})",
+        file=sys.stderr,
+        flush=True,
+    )
 
 
 TOK_MGR = "sglang.srt.managers.tokenizer_manager"
@@ -1442,7 +1972,7 @@ _KVE = {"epoch": 0, "tagged": 0, "updates": 0}
 
 
 def patch_kvepoch(mod):
-    """ ``kvepoch``: no request may reuse prefix-cache KV computed with older weights.
+    """``kvepoch``: no request may reuse prefix-cache KV computed with older weights.
 
     SGLang keeps its radix (prefix) cache across weight updates unless the update flushes it (slime only flushes at
     ``--flush-cache-interval`` syncs and pauses with abort; with flush 0 / asrt keep_inflight / inplace / verl keepkv it
@@ -1454,7 +1984,8 @@ def patch_kvepoch(mod):
     that advances on every weight-update call (before and after it).  RadixKey matching requires equal extra_key, so a
     request started after an update can only hit KV inserted by requests started after it; old-epoch KV is never matched
     again and is evicted by LRU.  In-flight requests keep their own KV (their tokens are already accounted to the earliest
-    version).  Cost: one extra prefill of each trajectory's context after each update (measured per run)."""
+    version).  Cost: one extra prefill of each trajectory's context after each update (measured per run).
+    """
     if "kvepoch" not in _opts():
         return
     C = getattr(mod, "TokenizerManager", None)
@@ -1464,8 +1995,11 @@ def patch_kvepoch(mod):
 
     orig_create = getattr(C, "_create_tokenized_object", None)
     if orig_create is None:
-        print(f"[asrt] sgl kvepoch NOT installed: no TokenizerManager._create_tokenized_object (pid {os.getpid()})",
-              file=sys.stderr, flush=True)
+        print(
+            f"[asrt] sgl kvepoch NOT installed: no TokenizerManager._create_tokenized_object (pid {os.getpid()})",
+            file=sys.stderr,
+            flush=True,
+        )
         return
 
     def _create_tokenized_object(self, obj, *a, **k):
@@ -1484,24 +2018,46 @@ def patch_kvepoch(mod):
         return out
 
     C._create_tokenized_object = _create_tokenized_object
-    names = [n for n in ("update_weights_from_distributed", "update_weights_from_tensor", "update_weights_from_disk",
-                         "update_weights_from_ipc") if hasattr(C, n)]
+    names = [
+        n
+        for n in (
+            "update_weights_from_distributed",
+            "update_weights_from_tensor",
+            "update_weights_from_disk",
+            "update_weights_from_ipc",
+        )
+        if hasattr(C, n)
+    ]
 
     def make(name):
         async def upd(self, *a, **k):
-            _KVE["epoch"] += 1          # requests created during the update window: their own epoch
+            _KVE[
+                "epoch"
+            ] += 1  # requests created during the update window: their own epoch
             _KVE["updates"] += 1
             try:
-                return await getattr(super(C, self), name)(*a, **k)   # resolved per call: keeps later mixin patches
+                return await getattr(super(C, self), name)(
+                    *a, **k
+                )  # resolved per call: keeps later mixin patches
             finally:
-                _KVE["epoch"] += 1      # requests after the update: never share KV with anything older
-                if _KVE["updates"] % int(os.environ.get("ASRT_KVEPOCH_LOG_EVERY", 50)) == 1:
-                    _log({"t": time.time(), "op": "kvepoch", **_KVE}, kind="sgl-kvepoch")
+                _KVE[
+                    "epoch"
+                ] += 1  # requests after the update: never share KV with anything older
+                if (
+                    _KVE["updates"] % int(os.environ.get("ASRT_KVEPOCH_LOG_EVERY", 50))
+                    == 1
+                ):
+                    _log(
+                        {"t": time.time(), "op": "kvepoch", **_KVE}, kind="sgl-kvepoch"
+                    )
+
         upd.__name__ = name
         return upd
 
     for n in names:
-        if n in C.__dict__:  # defined on TokenizerManager itself (not the mixin): wrap that function directly
+        if (
+            n in C.__dict__
+        ):  # defined on TokenizerManager itself (not the mixin): wrap that function directly
             inner = C.__dict__[n]
 
             def make_direct(inner, n=n):
@@ -1512,13 +2068,18 @@ def patch_kvepoch(mod):
                         return await inner(self, *a, **k)
                     finally:
                         _KVE["epoch"] += 1
+
                 return upd
+
             setattr(C, n, make_direct(inner))
         else:
             setattr(C, n, make(n))
     C._asrt_kvepoch = True
-    print(f"[asrt] sgl kvepoch installed: radix extra_key += @wv<epoch>, epoch advances on {names} (pid {os.getpid()})",
-          file=sys.stderr, flush=True)
+    print(
+        f"[asrt] sgl kvepoch installed: radix extra_key += @wv<epoch>, epoch advances on {names} (pid {os.getpid()})",
+        file=sys.stderr,
+        flush=True,
+    )
 
 
 def _patchers():

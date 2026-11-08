@@ -4,15 +4,19 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-
 from ai_search_plugin.adapters.slime_r3check import make_fast
 
 calls = {"orig": 0}
 
 
-def orig(experts, args, *, sample_index=None, expected_rows=None):  # minimal stand-in with slime's error classes
+def orig(
+    experts, args, *, sample_index=None, expected_rows=None
+):  # minimal stand-in with slime's error classes
     calls["orig"] += 1
-    if experts.ndim != 3 or tuple(experts.shape[1:]) != (args.num_layers, args.moe_router_topk):
+    if experts.ndim != 3 or tuple(experts.shape[1:]) != (
+        args.num_layers,
+        args.moe_router_topk,
+    ):
         raise ValueError("shape")
     if expected_rows is not None and experts.shape[0] != expected_rows:
         raise ValueError("rows")
@@ -24,7 +28,9 @@ def orig(experts, args, *, sample_index=None, expected_rows=None):  # minimal st
         raise ValueError("missing layer")
 
 
-ARGS = SimpleNamespace(num_layers=4, moe_router_topk=3, num_experts=16, moe_layer_freq=[1, 1, 1, 1])
+ARGS = SimpleNamespace(
+    num_layers=4, moe_router_topk=3, num_experts=16, moe_layer_freq=[1, 1, 1, 1]
+)
 
 
 def test_good_tensor_skips_original():
@@ -34,7 +40,9 @@ def test_good_tensor_skips_original():
     assert f(x, ARGS, sample_index=0, expected_rows=100) is None and calls["orig"] == 0
 
 
-@pytest.mark.parametrize("bad,err", [("range", "range"), ("layer", "missing layer"), ("rows", "rows")])
+@pytest.mark.parametrize(
+    "bad,err", [("range", "range"), ("layer", "missing layer"), ("rows", "rows")]
+)
 def test_irregular_goes_to_original(bad, err):
     f = make_fast(orig)
     x = torch.randint(1, 16, (100, 4, 3), dtype=torch.int32)

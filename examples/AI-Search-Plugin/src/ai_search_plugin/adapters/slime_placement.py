@@ -69,14 +69,19 @@ def _ensure_manager(actor):
         return None
     if _STATE["mgr"] is None:
         from .megatron_placement import ExpertPlacementManager, _find_moe_layers
+
         args = actor.args
         if not getattr(args, "num_experts", None) or not _find_moe_layers(actor.model):
             _STATE["off"] = True
             print("[asrt] place: no MoE layers -> off", flush=True)
             return None
-        _STATE["mgr"] = ExpertPlacementManager(actor.model, actor.optimizer, num_layers=args.num_layers,
-                                               num_experts=args.num_experts,
-                                               threshold=_env("ASRT_PLACE_THRESH", 1.05))
+        _STATE["mgr"] = ExpertPlacementManager(
+            actor.model,
+            actor.optimizer,
+            num_layers=args.num_layers,
+            num_experts=args.num_experts,
+            threshold=_env("ASRT_PLACE_THRESH", 1.05),
+        )
         if not getattr(args, "use_rollout_routing_replay", False):
             _STATE["mgr"].install_router_counters()
     return _STATE["mgr"]
@@ -87,6 +92,7 @@ def _log(rec):
     if not path:
         return
     import torch.distributed as dist
+
     if not dist.is_initialized() or dist.get_rank() == 0:
         with open(path, "a") as f:
             f.write(json.dumps(rec) + "\n")
@@ -97,14 +103,19 @@ def _count_rollout_routes(mgr, values, stride):
     from slime.utils.routed_experts import materialize_routed_experts
 
     from ..r3pack import is_lazy_ref, sampled_rows
+
     t0 = time.perf_counter()
     for v in values:
         if v is None:
             continue
-        if is_lazy_ref(v):  # lazy route reference: count a few row chunks, scaled; never load the whole tensor
+        if is_lazy_ref(
+            v
+        ):  # lazy route reference: count a few row chunks, scaled; never load the whole tensor
             a, scale = sampled_rows(v)
             c0 = mgr.counts.clone()
-            mgr.add_logical_ids(torch.as_tensor(a).to(mgr.counts.device, non_blocking=True))
+            mgr.add_logical_ids(
+                torch.as_tensor(a).to(mgr.counts.device, non_blocking=True)
+            )
             mgr.counts.add_((mgr.counts - c0) * (scale / max(stride, 1) - 1.0))
             continue
         t = materialize_routed_experts(v) if not isinstance(v, torch.Tensor) else v
@@ -128,11 +139,16 @@ def _live_classes(cls, method):
     """The module class plus Ray's per-actor wrapper subclass (which carries its own
     copies of every method, so patching only the module class is bypassed)."""
     import gc
+
     out = [cls]
     for o in gc.get_objects():
         try:
-            if type(o) is type and o is not cls and type.__getattribute__(o, "__name__") == cls.__name__ \
-                    and method in type.__getattribute__(o, "__dict__"):
+            if (
+                type(o) is type
+                and o is not cls
+                and type.__getattribute__(o, "__name__") == cls.__name__
+                and method in type.__getattribute__(o, "__dict__")
+            ):
                 out.append(o)
         except Exception:
             continue
@@ -150,7 +166,7 @@ _TLS = threading.local()
 
 
 def _selfcheck_mode():
-    return os.environ.get("ASRT_PLACE_SELFCHECK", "raise")   # raise | warn | off
+    return os.environ.get("ASRT_PLACE_SELFCHECK", "raise")  # raise | warn | off
 
 
 def _fail(msg):
@@ -162,7 +178,8 @@ def _fail(msg):
 
 def _map_export(name, param):
     """Megatron-named tensor on its way to HF conversion -> logical order (no-op while unmoved); records the
-    layer for the self-check. Re-entrancy guard: an outer wrapper and the core hook never both map."""
+    layer for the self-check. Re-entrancy guard: an outer wrapper and the core hook never both map.
+    """
     mgr = _STATE["mgr"]
     if mgr is None or getattr(_TLS, "busy", False):
         return name, param
@@ -176,9 +193,11 @@ def _install_export_hook(M2H):
     gives update_weight_from_distributed its own convert_to_hf wrapper) - looks up at call time. Matching the
     convert_to_hf objects by identity would miss such wrappers: SGLang would then get experts in physical
     order and the R3 ids it returns would be mapped a second time (log-prob drift).
-    Fallback for a slime without the core function: wrap every module's *current* convert_to_hf."""
+    Fallback for a slime without the core function: wrap every module's *current* convert_to_hf.
+    """
     core = getattr(M2H, "_convert_to_hf_core", None)
     if core is not None and not getattr(core, "_asrt_place", False):
+
         def _convert_to_hf_core(args, model_name, name, param, *a, **k):
             name2, param2 = _map_export(name, param)
             _TLS.busy = True
@@ -186,6 +205,7 @@ def _install_export_hook(M2H):
                 return core(args, model_name, name2, param2, *a, **k)
             finally:
                 _TLS.busy = False
+
         _convert_to_hf_core._asrt_place = True
         M2H._convert_to_hf_core = _convert_to_hf_core
         _STATE["hook"] = "core"
@@ -204,6 +224,7 @@ def _wrap_convert(fn):
             return fn(args, model_name, name2, param2, *a, **k)
         finally:
             _TLS.busy = False
+
     convert_to_hf._asrt_place = True
     return convert_to_hf
 
@@ -214,8 +235,13 @@ def _rescan_convert_wrappers():
         return
     for mn, m in list(sys.modules.items()):
         f = getattr(m, "convert_to_hf", None) if m is not None else None
-        if callable(f) and not getattr(f, "_asrt_place", False) and \
-                (mn.startswith("slime") or "convert_to_hf" in getattr(m, "__dict__", {})):
+        if (
+            callable(f)
+            and not getattr(f, "_asrt_place", False)
+            and (
+                mn.startswith("slime") or "convert_to_hf" in getattr(m, "__dict__", {})
+            )
+        ):
             try:
                 setattr(m, "convert_to_hf", _wrap_convert(f))
             except Exception:
@@ -224,7 +250,8 @@ def _rescan_convert_wrappers():
 
 def _bind_replays(mgr, RoutingReplay):
     """Bind each R3 replay buffer to its layer through the router that owns it (slime registers
-    `router.routing_replay`), not through list order; check the bound set equals the re-placed set."""
+    `router.routing_replay`), not through list order; check the bound set equals the re-placed set.
+    """
     by_obj = {}
     for lid, moe in mgr.layers:
         rp = getattr(moe.router, "routing_replay", None)
@@ -236,11 +263,17 @@ def _bind_replays(mgr, RoutingReplay):
         for rp, lid in by_obj.values():
             rp._asrt_layer = lid
             bound.append(lid)
-        stray = [i for i, rp in enumerate(allrp) if id(rp) not in by_obj and getattr(rp, "_asrt_layer", None) is None]
+        stray = [
+            i
+            for i, rp in enumerate(allrp)
+            if id(rp) not in by_obj and getattr(rp, "_asrt_layer", None) is None
+        ]
     else:  # replay object not reachable from the router: slime's own order (= ascending global layer id)
         lids = mgr.local_layer_ids()
         if len(allrp) != len(lids):
-            _fail(f"R3 replay buffers ({len(allrp)}) != re-placed MoE layers ({len(lids)}: {lids})")
+            _fail(
+                f"R3 replay buffers ({len(allrp)}) != re-placed MoE layers ({len(lids)}: {lids})"
+            )
         for rp, lid in zip(allrp, lids):
             rp._asrt_layer = lid
         bound, stray = lids[: len(allrp)], []
@@ -248,8 +281,10 @@ def _bind_replays(mgr, RoutingReplay):
         _STATE["bind_checked"] = True
         bad = mgr.check_replay_binding(bound)
         if bad or stray:
-            _fail(f"R3 replay layers {sorted(bound)} != re-placed layers {mgr.local_layer_ids()} "
-                  f"(mismatch {bad}, unbound replay buffers #{stray})")
+            _fail(
+                f"R3 replay layers {sorted(bound)} != re-placed layers {mgr.local_layer_ids()} "
+                f"(mismatch {bad}, unbound replay buffers #{stray})"
+            )
         _log({"selfcheck": "r3_bind", "layers": len(bound), "ok": not (bad or stray)})
 
 
@@ -257,7 +292,9 @@ def _external_exporter():
     """Name of a registered model-specific weight exporter that does its own logical-order mapping, or None.
     Exporters opt in by setting `_asrt_external_export = "<name>"` on slime's UpdateWeightFromDistributed
     (and map expert rows themselves through ``get_manager()``)."""
-    m = sys.modules.get("slime.backends.megatron_utils.update_weight.update_weight_from_distributed")
+    m = sys.modules.get(
+        "slime.backends.megatron_utils.update_weight.update_weight_from_distributed"
+    )
     C = getattr(m, "UpdateWeightFromDistributed", None) if m is not None else None
     if C is None:
         return None
@@ -273,10 +310,13 @@ def _self_check_export(mgr):
         return
     import torch
     import torch.distributed as dist
+
     saw = len(mgr.export_seen) > 0
     missing = mgr.check_export(saw_any=saw)
     if dist.is_initialized():
-        t = torch.tensor([1.0 if saw else 0.0, float(len(missing))], device=mgr.counts.device)
+        t = torch.tensor(
+            [1.0 if saw else 0.0, float(len(missing))], device=mgr.counts.device
+        )
         dist.all_reduce(t)
         n_saw, n_missing = int(t[0]), int(t[1])
     else:
@@ -284,19 +324,30 @@ def _self_check_export(mgr):
     first = not _STATE.get("export_checked")
     _STATE["export_checked"] = True
     if first or n_missing or n_saw == 0:
-        _log({"selfcheck": "export", "hook": _STATE.get("hook"), "ranks_converting": n_saw,
-              "missing_layers_total": n_missing, "moved": len(mgr.moved_local_layers())})
+        _log(
+            {
+                "selfcheck": "export",
+                "hook": _STATE.get("hook"),
+                "ranks_converting": n_saw,
+                "missing_layers_total": n_missing,
+                "moved": len(mgr.moved_local_layers()),
+            }
+        )
     if n_saw == 0 and _external_exporter():
         # a model-specific exporter replaced slime's conversion and maps expert rows itself via get_manager()
         if first:
             _log({"selfcheck": "export", "delegated_to": _external_exporter()})
         return
     if n_saw == 0:
-        _fail("weight export never passed through the placement hook (hook=%s): the rollout engine would get "
-              "experts in physical order after a re-placement" % _STATE.get("hook"))
+        _fail(
+            "weight export never passed through the placement hook (hook=%s): the rollout engine would get "
+            "experts in physical order after a re-placement" % _STATE.get("hook")
+        )
     elif missing:
-        _fail(f"this rank exported weights but MoE layers {missing} never went through the placement mapping "
-              f"(seen {sorted(mgr.export_seen)})")
+        _fail(
+            f"this rank exported weights but MoE layers {missing} never went through the placement mapping "
+            f"(seen {sorted(mgr.export_seen)})"
+        )
     elif n_missing:
         _fail(f"{n_missing} MoE layer(s) on other ranks missed the placement mapping")
 
@@ -314,7 +365,9 @@ def install():
     cls = A.MegatronTrainRayActor
     step = {"n": 0}
 
-    def _fill_and_bind(self, orig_fill, mgr, data_iterator, num_microbatches, rollout_data):
+    def _fill_and_bind(
+        self, orig_fill, mgr, data_iterator, num_microbatches, rollout_data
+    ):
         out = orig_fill(self, data_iterator, num_microbatches, rollout_data)
         _bind_replays(mgr, RR.RoutingReplay)
         return out
@@ -325,12 +378,14 @@ def install():
             if mgr is None:
                 return orig_fill(self, data_iterator, num_microbatches, rollout_data)
             if not _STATE.get("bind_checked"):
-                _bind_replays(mgr, RR.RoutingReplay)   # self-check before the first move
+                _bind_replays(mgr, RR.RoutingReplay)  # self-check before the first move
             if step.get("acted", False):
                 # fill_routing_replay can run more than once per rollout (log-prob passes, several train calls)
                 # and not the same number of times on every rank: re-place at most once per rollout, at the first
                 # call, so every rank takes part in the same collectives
-                return _fill_and_bind(self, orig_fill, mgr, data_iterator, num_microbatches, rollout_data)
+                return _fill_and_bind(
+                    self, orig_fill, mgr, data_iterator, num_microbatches, rollout_data
+                )
             step["acted"] = True
             if step["n"] > 0:
                 # export self-check of the weight sync(s) since the last rollout (that sync produced the routes
@@ -345,19 +400,29 @@ def install():
                 step["skip_left"] -= 1
                 rec["probe_skip"] = step["skip_left"]
             elif step["n"] % every == 0:
-                rec["count_s"] = _count_rollout_routes(mgr, rollout_data.get("rollout_routed_experts", []), stride)
+                rec["count_s"] = _count_rollout_routes(
+                    mgr, rollout_data.get("rollout_routed_experts", []), stride
+                )
                 force = None
-                if os.environ.get("ASRT_PLACE_RANDOM") == "1":  # stress test: random permutation of every layer
+                if (
+                    os.environ.get("ASRT_PLACE_RANDOM") == "1"
+                ):  # stress test: random permutation of every layer
                     g = torch.Generator().manual_seed(4242 + step["n"])
-                    force = {lid: torch.randperm(mgr.E, generator=g).tolist() for lid in range(mgr.L)}
+                    force = {
+                        lid: torch.randperm(mgr.E, generator=g).tolist()
+                        for lid in range(mgr.L)
+                    }
                 info = mgr.maybe_rebalance(force)
                 _after_move(self, info)
                 rec.update(info)
                 if info.get("skipped") and force is None:
                     step["skip_left"] = max(0, _env("ASRT_PLACE_PROBE_EVERY", 4) - 1)
-            out = _fill_and_bind(self, orig_fill, mgr, data_iterator, num_microbatches, rollout_data)
+            out = _fill_and_bind(
+                self, orig_fill, mgr, data_iterator, num_microbatches, rollout_data
+            )
             _log(rec)
             return out
+
         return fill_routing_replay
 
     _patch_method(cls, "fill_routing_replay", make_fill)
@@ -370,6 +435,7 @@ def install():
             if lid is None or mgr is None or t is None:
                 return t
             return mgr.map_routed_ids(lid, t)
+
         return pop
 
     RR.RoutingReplay.pop_forward = _wrap_pop(RR.RoutingReplay.pop_forward)
@@ -386,9 +452,12 @@ def install():
                     _after_move(self, info)
                     _log({"step": step["n"], **info})
             try:
-                return orig_train_actor(self, rollout_id, rollout_data, external_data=external_data)
+                return orig_train_actor(
+                    self, rollout_id, rollout_data, external_data=external_data
+                )
             finally:
                 step["n"] += 1
+
         return train_actor
 
     _patch_method(cls, "train_actor", make_train_actor)
@@ -398,11 +467,15 @@ def install():
     def make_update(orig_update):
         def update_weights(self, *a, **k):
             mgr = _STATE["mgr"]
-            skip = mgr is None or getattr(self.args, "debug_train_only", False) or \
-                getattr(self.args, "debug_rollout_only", False)
+            skip = (
+                mgr is None
+                or getattr(self.args, "debug_train_only", False)
+                or getattr(self.args, "debug_rollout_only", False)
+            )
             if not skip:
-                _rescan_convert_wrappers()   # modules wrapped by model init hooks after install()
+                _rescan_convert_wrappers()  # modules wrapped by model init hooks after install()
             return orig_update(self, *a, **k)
+
         return update_weights
 
     if hasattr(cls, "update_weights"):
@@ -418,9 +491,15 @@ def install():
             try:
                 return orig_save(self, *a, **k)
             finally:
-                perms = {lid: saved[lid].tolist() for lid in range(mgr.L)
-                         if not torch.equal(saved[lid], torch.arange(mgr.E, device=saved.device))}
+                perms = {
+                    lid: saved[lid].tolist()
+                    for lid in range(mgr.L)
+                    if not torch.equal(
+                        saved[lid], torch.arange(mgr.E, device=saved.device)
+                    )
+                }
                 mgr.apply(perms)  # from identity, perm == old slot_of
+
         return save_model
 
     _patch_method(cls, "save_model", make_save)
@@ -434,10 +513,14 @@ def megatron_init(args=None, *rest, **kwargs):
     install()
     try:
         import torch.distributed as dist
+
         if not dist.is_initialized() or dist.get_rank() == 0:
             from slime.backends.megatron_utils import actor as A
+
             n = len(_live_classes(A.MegatronTrainRayActor, "fill_routing_replay"))
-            print(f"[asrt] slime_placement installed on {n} class object(s)", flush=True)
+            print(
+                f"[asrt] slime_placement installed on {n} class object(s)", flush=True
+            )
     except Exception:
         pass
     return "expert_placement: installed"

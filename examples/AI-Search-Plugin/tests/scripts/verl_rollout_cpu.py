@@ -25,8 +25,16 @@ def _mod(name, **attrs):
 
 
 # ---------------------------------------------------------------- fake verl
-for p in ["verl", "verl.workers", "verl.workers.rollout", "verl.workers.rollout.sglang_rollout", "verl.utils",
-          "verl.experimental", "verl.experimental.agent_loop", "verl.checkpoint_engine"]:
+for p in [
+    "verl",
+    "verl.workers",
+    "verl.workers.rollout",
+    "verl.workers.rollout.sglang_rollout",
+    "verl.utils",
+    "verl.experimental",
+    "verl.experimental.agent_loop",
+    "verl.checkpoint_engine",
+]:
     _mod(p).__path__ = []
 
 
@@ -41,6 +49,7 @@ def auto_await(func):
         except RuntimeError:
             return asyncio.run(coro)
         return coro
+
     return wrapper
 
 
@@ -80,15 +89,20 @@ class GlobalRequestLoadBalancer:  # verl router.py (sticky + least in-flight)
 CREATED = {}
 
 
-def get_router_handle(servers, router_config_path=None, full_determinism=False, load_balancer_cls=None):
+def get_router_handle(
+    servers, router_config_path=None, full_determinism=False, load_balancer_cls=None
+):
     cls = load_balancer_cls or GlobalRequestLoadBalancer
     lb = cls(servers=servers, max_cache_size=10000)
     CREATED["lb"] = lb
     return lb
 
 
-_mod("verl.workers.rollout.router", GlobalRequestLoadBalancer=GlobalRequestLoadBalancer,
-     get_router_handle=get_router_handle)
+_mod(
+    "verl.workers.rollout.router",
+    GlobalRequestLoadBalancer=GlobalRequestLoadBalancer,
+    get_router_handle=get_router_handle,
+)
 
 
 class LLMServerClient:
@@ -98,12 +112,16 @@ class LLMServerClient:
 
     async def _acquire_server(self, request_id, **extra):
         if self._lb_require_acquire_fields is None:
-            self._lb_require_acquire_fields = list(self._load_balancer.require_acquire_fields())
+            self._lb_require_acquire_fields = list(
+                self._load_balancer.require_acquire_fields()
+            )
         fields = {n: extra[n] for n in self._lb_require_acquire_fields if n in extra}
         return self._load_balancer.acquire_server(request_id=request_id, **fields)
 
     async def generate(self, request_id, *, prompt_ids, sampling_params, **kw):
-        sid, _ = await self._acquire_server(request_id, prompt_ids=prompt_ids, sampling_params=sampling_params)
+        sid, _ = await self._acquire_server(
+            request_id, prompt_ids=prompt_ids, sampling_params=sampling_params
+        )
         return sid
 
 
@@ -120,7 +138,10 @@ class SGLangHttpServer:
         EVENTS.append("resume+flush")
 
 
-_mod("verl.workers.rollout.sglang_rollout.async_sglang_server", SGLangHttpServer=SGLangHttpServer)
+_mod(
+    "verl.workers.rollout.sglang_rollout.async_sglang_server",
+    SGLangHttpServer=SGLangHttpServer,
+)
 
 
 class Req:
@@ -137,7 +158,10 @@ class AsyncHttpServerAdapter:
         EVENTS.append(f"bucket flush={req.flush_cache}")
 
 
-_mod("verl.workers.rollout.sglang_rollout.http_server_engine", AsyncHttpServerAdapter=AsyncHttpServerAdapter)
+_mod(
+    "verl.workers.rollout.sglang_rollout.http_server_engine",
+    AsyncHttpServerAdapter=AsyncHttpServerAdapter,
+)
 
 
 class ServerAdapter:
@@ -156,8 +180,15 @@ TOK_CALLS = []
 
 
 class AgentLoopBase:
-    async def ct_build_initial_tokens(self, messages, tools=None, images=None, videos=None, audios=None,
-                                      mm_inputs_out=None):
+    async def ct_build_initial_tokens(
+        self,
+        messages,
+        tools=None,
+        images=None,
+        videos=None,
+        audios=None,
+        mm_inputs_out=None,
+    ):
         TOK_CALLS.append(1)
         await asyncio.sleep(0.01)
         return [len(m["content"]) for m in messages]
@@ -177,6 +208,7 @@ class CheckpointEngineManager:
 
     def build_process_group(self, rollout):
         import time
+
         time.sleep(0.01)
 
     @auto_await
@@ -220,6 +252,7 @@ def test_route():
     V.install("route")
     servers = {f"s{i}": object() for i in range(4)}
     import verl.workers.rollout.router as router
+
     lb = router.get_router_handle(servers)
     assert type(lb).__name__ == "AsrtAffinityBalancer", type(lb)
     cl = LLMServerClient(lb)
@@ -231,10 +264,13 @@ def test_route():
         tasks = []
         for g, p in enumerate(prompts):
             for i in range(4):
-                tasks.append((g, cl.generate(f"r{g}-{i}", prompt_ids=p, sampling_params={})))
+                tasks.append(
+                    (g, cl.generate(f"r{g}-{i}", prompt_ids=p, sampling_params={}))
+                )
         for g, t in tasks:
             out.setdefault(g, set()).add(await t)
         return out
+
     res = asyncio.run(run())
     same = sum(1 for v in res.values() if len(v) == 1)
     loads = lb._inflight_requests
@@ -252,10 +288,17 @@ def test_route():
         out = {}
         for g, p in enumerate(prompts):
             for i in range(4):
-                out.setdefault(g, set()).add(await cb.generate(f"q{g}-{i}", prompt_ids=p, sampling_params={}))
+                out.setdefault(g, set()).add(
+                    await cb.generate(f"q{g}-{i}", prompt_ids=p, sampling_params={})
+                )
         return out
+
     rb = asyncio.run(run_b())
-    print("plain verl: groups on one server", sum(1 for v in rb.values() if len(v) == 1), "/16")
+    print(
+        "plain verl: groups on one server",
+        sum(1 for v in rb.values() if len(v) == 1),
+        "/16",
+    )
 
 
 def test_keepkv():
@@ -268,6 +311,7 @@ def test_keepkv():
         await ServerAdapter().update_weights(None, global_steps=1)
         await s.resume_kv_cache()
         await AsyncHttpServerAdapter().flush_cache()  # outside a weight update: still flushes
+
     asyncio.run(run())
     print("keepkv events", EVENTS, R.stats()["keepkv"])
     assert EVENTS == ["bucket flush=False", "bucket flush=False", "flush"], EVENTS
@@ -280,10 +324,13 @@ def test_tokcache_profile():
     async def run():
         a = AgentLoopBase()
         msgs = [{"role": "user", "content": "x" * 100}]
-        outs = await asyncio.gather(*[a.ct_build_initial_tokens(msgs) for _ in range(4)])
+        outs = await asyncio.gather(
+            *[a.ct_build_initial_tokens(msgs) for _ in range(4)]
+        )
         outs.append(await a.ct_build_initial_tokens(msgs))
         outs.append(await a.ct_build_initial_tokens([{"role": "user", "content": "y"}]))
         return outs
+
     outs = asyncio.run(run())
     assert outs[0] == outs[4] == [100] and outs[5] == [1], outs
     assert len(TOK_CALLS) == 2, TOK_CALLS
@@ -293,10 +340,17 @@ def test_tokcache_profile():
     assert m.update_weights(3) == {"ok": 1}
     import glob
     import json
-    recs = [json.loads(l) for f in glob.glob(f"{LOG}/verl-sync-*.jsonl") for l in open(f)]
+
+    recs = [
+        json.loads(l) for f in glob.glob(f"{LOG}/verl-sync-*.jsonl") for l in open(f)
+    ]
     print("tokcache", R.stats()["tokcache"], "sync record", recs[-1])
     r = recs[-1]
-    assert r["step"] == 3 and r["release_kv_cache_replicas"] >= 0.015 and r["transfer_finalize_s"] >= 0.02, r
+    assert (
+        r["step"] == 3
+        and r["release_kv_cache_replicas"] >= 0.015
+        and r["transfer_finalize_s"] >= 0.02
+    ), r
 
 
 if __name__ == "__main__":

@@ -3,12 +3,12 @@
 """Pure-Python placement planner (ai_search_plugin.placement_py): no torch, no numpy, no C++ extension."""
 import random
 
-from ai_search_plugin.placement_py import imbalance, rank_loads, rebalance_swaps
 from ai_search_plugin.adapters.megatron_placement import placement_to_perm
+from ai_search_plugin.placement_py import imbalance, rank_loads, rebalance_swaps
 
 
 def test_imbalance_basics():
-    assert imbalance([0, 0, 0, 0], [0, 0, 1, 1], 2) == 1.0          # no load at all
+    assert imbalance([0, 0, 0, 0], [0, 0, 1, 1], 2) == 1.0  # no load at all
     assert imbalance([1, 1, 1, 1], [0, 0, 1, 1], 2) == 1.0
     assert abs(imbalance([3, 3, 1, 1], [0, 0, 1, 1], 2) - 1.5) < 1e-12
     assert rank_loads([3, 3, 1, 1], [0, 1, 0, 1], 2) == [4.0, 4.0]
@@ -21,8 +21,8 @@ def test_rebalance_hot_cluster():
     assert imbalance(loads, cur, 4) > 2.0
     new, moved = rebalance_swaps(loads, cur, 4)
     assert moved > 0
-    assert sorted(new) == sorted(cur)                         # experts per rank unchanged
-    assert imbalance(loads, new, 4) < 1.01                    # one hot expert per rank
+    assert sorted(new) == sorted(cur)  # experts per rank unchanged
+    assert imbalance(loads, new, 4) < 1.01  # one hot expert per rank
     # every hot expert on its own rank
     assert sorted(new[:4]) == [0, 1, 2, 3]
 
@@ -38,7 +38,10 @@ def test_rebalance_never_worse_and_balanced_noop():
         rng.shuffle(cur)
         new, moved = rebalance_swaps(loads, cur, ranks)
         assert sorted(new) == sorted(cur)
-        assert max(rank_loads(loads, new, ranks)) <= max(rank_loads(loads, cur, ranks)) + 1e-9
+        assert (
+            max(rank_loads(loads, new, ranks))
+            <= max(rank_loads(loads, cur, ranks)) + 1e-9
+        )
         assert moved == sum(1 for a, b in zip(new, cur) if a != b)
     # perfectly balanced: nothing to do
     new, moved = rebalance_swaps([5.0] * 8, [0, 1, 2, 3] * 2, 4)
@@ -55,6 +58,7 @@ def _reference_numpy(loads, rank_of, ranks, max_swaps=256):
         out = np.zeros(ranks)
         np.add.at(out, np.asarray(p), np.asarray(loads, dtype=float))
         return out
+
     loads = [float(x) for x in loads]
     p = list(rank_of)
     for _ in range(max_swaps):
@@ -91,6 +95,7 @@ def _reference_numpy(loads, rank_of, ranks, max_swaps=256):
 
 def test_same_result_as_numpy_reference():
     import pytest
+
     pytest.importorskip("numpy")
     rng = random.Random(1)
     for _ in range(40):
@@ -109,6 +114,6 @@ def test_placement_to_perm():
     perm = placement_to_perm(cur, new, n_local)
     assert sorted(perm) == list(range(16))
     for s in range(16):
-        assert perm[s] // n_local == new[s]          # slot lands on the planned rank
+        assert perm[s] // n_local == new[s]  # slot lands on the planned rank
         if new[s] == cur[s]:
-            assert perm[s] == s                      # unmoved experts keep their slot
+            assert perm[s] == s  # unmoved experts keep their slot

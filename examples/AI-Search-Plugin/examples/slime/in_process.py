@@ -8,9 +8,21 @@ import ai_search_plugin as asp
 
 plan = asp.install(
     framework="slime",
-    components=["ticket_admission", "pool_fill", "prefetch", "weight_sync", "sampler_nosync", "response_logits"],
+    components=[
+        "ticket_admission",
+        "pool_fill",
+        "prefetch",
+        "weight_sync",
+        "sampler_nosync",
+        "response_logits",
+    ],
     options={"max_staleness": 2, "log_dir": "/tmp/asp-logs"},
 )
 print(plan.shell())
 slime_argv = ["--your", "--usual", "--slime", "--args"] + plan.args
-print("launch:", " ".join(plan.launcher or ["python3"]), "<slime>/train.py", " ".join(slime_argv))
+print(
+    "launch:",
+    " ".join(plan.launcher or ["python3"]),
+    "<slime>/train.py",
+    " ".join(slime_argv),
+)

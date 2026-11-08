@@ -32,7 +32,9 @@ import sys
 
 
 def _wrapped(obj):
-    return callable(obj) and getattr(obj, "_torchdynamo_orig_callable", None) is not None
+    return (
+        callable(obj) and getattr(obj, "_torchdynamo_orig_callable", None) is not None
+    )
 
 
 def model_kind(args) -> str | None:
@@ -41,15 +43,31 @@ def model_kind(args) -> str | None:
     if args is None:
         return None
     moe = bool(getattr(args, "num_experts", None))
-    gdn = any(getattr(args, a, None) for a in ("linear_attention_freq", "linear_attention_type",
-                                               "experimental_attention_variant"))
+    gdn = any(
+        getattr(args, a, None)
+        for a in (
+            "linear_attention_freq",
+            "linear_attention_type",
+            "experimental_attention_variant",
+        )
+    )
     try:
         import json
-        with open(os.path.join(getattr(args, "hf_checkpoint", None) or "", "config.json")) as f:
+
+        with open(
+            os.path.join(getattr(args, "hf_checkpoint", None) or "", "config.json")
+        ) as f:
             c = json.load(f)
         c = c.get("text_config", c)
-        moe = moe or bool(c.get("num_experts") or c.get("n_routed_experts") or c.get("num_local_experts"))
-        gdn = gdn or bool(c.get("linear_num_value_heads") or "linear_attention" in (c.get("layer_types") or []))
+        moe = moe or bool(
+            c.get("num_experts")
+            or c.get("n_routed_experts")
+            or c.get("num_local_experts")
+        )
+        gdn = gdn or bool(
+            c.get("linear_num_value_heads")
+            or "linear_attention" in (c.get("layer_types") or [])
+        )
     except Exception:
         pass
     kinds = [k for k, on in (("moe", moe), ("gdn", gdn)) if on]
@@ -63,8 +81,11 @@ def install(modes: str | None = None, args=None) -> dict:
         return {"active": False}
     kind = model_kind(args)
     if kind == "dense" and os.environ.get("ASRT_JITFIX_FORCE", "0") != "1":
-        return {"active": False, "skipped": "dense model (no MoE / GDN layers): eager would only lose fused kernels",
-                "model": kind}
+        return {
+            "active": False,
+            "skipped": "dense model (no MoE / GDN layers): eager would only lose fused kernels",
+            "model": kind,
+        }
     import torch
 
     rep = {"active": True, "opts": sorted(opts), "replaced": []}
@@ -85,7 +106,9 @@ def install(modes: str | None = None, args=None) -> dict:
     def repl(orig):
         if mode == "eager":
             return orig
-        if id(orig) not in cache:  # one compiled wrapper per original (shared by all references)
+        if (
+            id(orig) not in cache
+        ):  # one compiled wrapper per original (shared by all references)
             cache[id(orig)] = torch.compile(orig, dynamic=True)
             made.add(id(cache[id(orig)]))
         return cache[id(orig)]
@@ -96,7 +119,11 @@ def install(modes: str | None = None, args=None) -> dict:
 
         import megatron.core.jit as mjit
 
-        mjit.jit_fuser = mjit.noop_decorator if mode == "eager" else functools.partial(torch.compile, dynamic=True)
+        mjit.jit_fuser = (
+            mjit.noop_decorator
+            if mode == "eager"
+            else functools.partial(torch.compile, dynamic=True)
+        )
     except Exception:
         pass
 
@@ -105,10 +132,16 @@ def install(modes: str | None = None, args=None) -> dict:
         if not name.startswith("megatron.") or mod is None:
             continue
         for attr, val in list(vars(mod).items()):
-            if _wrapped(val) and id(val) not in made and getattr(val, "__module__", name) == name:
+            if (
+                _wrapped(val)
+                and id(val) not in made
+                and getattr(val, "__module__", name) == name
+            ):
                 setattr(mod, attr, repl(val._torchdynamo_orig_callable))
                 rep["replaced"].append(f"{name}.{attr}")
-            elif isinstance(val, type) and val.__module__ == name and id(val) not in seen:
+            elif (
+                isinstance(val, type) and val.__module__ == name and id(val) not in seen
+            ):
                 seen.add(id(val))
                 for a, v in list(vars(val).items()):
                     if _wrapped(v) and id(v) not in made:

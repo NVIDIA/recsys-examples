@@ -57,7 +57,9 @@ BOARD_NAME = "asrt_prefetch_board"
 
 
 def opts() -> set:
-    return {s.strip() for s in os.environ.get("ASRT_PREFETCH", "").split(",") if s.strip()}
+    return {
+        s.strip() for s in os.environ.get("ASRT_PREFETCH", "").split(",") if s.strip()
+    }
 
 
 def _log(kind: str, rec: dict):
@@ -103,11 +105,16 @@ def install_manager(num_experts: Optional[int] = None) -> bool:
         vals = rollout_data.get("rollout_routed_experts")
         if not vals:
             return
-        dt = compact_dtype(num_experts or int(os.environ.get("ASRT_NUM_EXPERTS", "65536")))
+        dt = compact_dtype(
+            num_experts or int(os.environ.get("ASRT_NUM_EXPERTS", "65536"))
+        )
         if dt is None:
             return
         rollout_data["rollout_routed_experts"] = [
-            v.to(dt) if isinstance(v, torch.Tensor) and v.dtype in (torch.int32, torch.int64) else v for v in vals
+            v.to(dt)
+            if isinstance(v, torch.Tensor) and v.dtype in (torch.int32, torch.int64)
+            else v
+            for v in vals
         ]
 
     bb.tensorize_rollout_data_for_training = tensorize
@@ -127,8 +134,11 @@ def _live_classes(name: str, method: str) -> list:
     out = []
     for o in gc.get_objects():
         try:
-            if type(o) is type and type.__getattribute__(o, "__name__") == name \
-                    and method in type.__getattribute__(o, "__dict__"):
+            if (
+                type(o) is type
+                and type.__getattribute__(o, "__name__") == name
+                and method in type.__getattribute__(o, "__dict__")
+            ):
                 out.append(o)
         except Exception:
             continue
@@ -137,7 +147,8 @@ def _live_classes(name: str, method: str) -> list:
 
 class _SkipFinishRollout:
     """One-shot stand-in for the ServingCluster handle: ``finish_rollout.remote()`` returns the
-    manager's current server snapshot without probing, then the real handle is restored."""
+    manager's current server snapshot without probing, then the real handle is restored.
+    """
 
     def __init__(self, mgr, real):
         self._mgr, self._real = mgr, real
@@ -180,16 +191,24 @@ def install_manager_health_guard() -> bool:
         orig_gen = C._generate
 
         def health_monitoring_resume(self, _hm=orig_hm):
-            w = getattr(getattr(self, "data_source", None), "consumers", {}).get("fully_async")
+            w = getattr(getattr(self, "data_source", None), "consumers", {}).get(
+                "fully_async"
+            )
             if w is not None and getattr(w, "paused", False):
-                print("[asrt] generate during weight update: health monitor left paused for this call", flush=True)
+                print(
+                    "[asrt] generate during weight update: health monitor left paused for this call",
+                    flush=True,
+                )
                 self._asrt_gen_in_update = True
                 return None
             return _hm(self)
 
         def _generate(self, rollout_id, start_time, _g=orig_gen):
             out = _g(self, rollout_id, start_time)
-            if getattr(self, "_asrt_gen_in_update", False) and getattr(self, "serving", None) is not None:
+            if (
+                getattr(self, "_asrt_gen_in_update", False)
+                and getattr(self, "serving", None) is not None
+            ):
                 # generate() next calls serving.finish_rollout(), which probes every engine once;
                 # the engines are paused for the weight update -> probe fails -> engine declared
                 # dead.  Skip that one probe (it only prunes failed engines early).
@@ -203,28 +222,37 @@ def install_manager_health_guard() -> bool:
     return _hm_installed
 
 
-def generate_rollout_fully_async(args, rollout_id, data_buffer, evaluation: bool = False):
+def generate_rollout_fully_async(
+    args, rollout_id, data_buffer, evaluation: bool = False
+):
     """Drop-in for ``--rollout-function-path``: installs manager-side patches
     then calls slime's fully-async rollout."""
     from . import slime_pool
 
-    slime_pool.autosize(args)               # in-flight pool >= one batch (GRPO n=16: 1/4 batch otherwise)
+    slime_pool.autosize(
+        args
+    )  # in-flight pool >= one batch (GRPO n=16: 1/4 batch otherwise)
     install_manager(getattr(args, "num_experts", None))
     from . import slime_r3check
-    slime_r3check.install()                      # ASRT_R3CHECK=fast: copy-free R3 validation in the manager
+
+    slime_r3check.install()  # ASRT_R3CHECK=fast: copy-free R3 validation in the manager
     if os.environ.get("ASRT_R3PACK") == "1":
         from . import slime_r3pack
 
         slime_r3pack.install()
     if "overlap" in opts():
-        if prebuild_enabled(args):  # before the health guard: the guard must wrap it (paused hand-out -> skip probe)
+        if prebuild_enabled(
+            args
+        ):  # before the health guard: the guard must wrap it (paused hand-out -> skip probe)
             install_manager_prebuild()
         install_manager_health_guard()
     from slime.rollout.fully_async_rollout import generate_rollout_fully_async as orig
 
     out = orig(args, rollout_id, data_buffer, evaluation=evaluation)
     d = float(os.environ.get("ASRT_TEST_ROLLOUT_DELAY_S", "0") or 0)
-    if d > 0:  # TEST ONLY: emulate slow manager-side straw I/O (~16 s per generate on a shared filesystem)
+    if (
+        d > 0
+    ):  # TEST ONLY: emulate slow manager-side straw I/O (~16 s per generate on a shared filesystem)
         time.sleep(d)
     return out
 
@@ -243,13 +271,16 @@ def install_reservation(D) -> bool:
     """Make ``D.prefetch`` (slime DistributedRollout: the collector pulls results while
     ``pending + ready < demand + prefetch``) read ``prefetch - _asrt_reserved``.  A prebuild pops B groups from
     ``ready`` early; reserving B keeps that comparison exactly where it would be had they not been popped, so the
-    workers admit nothing earlier than in slime.  Cleared at hand-out and at ``pause`` (weight update)."""
+    workers admit nothing earlier than in slime.  Cleared at hand-out and at ``pause`` (weight update).
+    """
     if isinstance(D.__dict__.get("prefetch"), property):
         return True
 
     def _get(self):
         d = self.__dict__
-        return max(0, d.get("_asrt_pf", d.get("prefetch", 0)) - d.get("_asrt_reserved", 0))
+        return max(
+            0, d.get("_asrt_pf", d.get("prefetch", 0)) - d.get("_asrt_reserved", 0)
+        )
 
     def _set(self, v):
         self.__dict__["_asrt_pf"] = v
@@ -268,10 +299,15 @@ def install_reservation(D) -> bool:
 
 def install_batch_ids(BB) -> bool:
     """slime BatchBuilder keeps ONE current batch (``training_completed(i)`` raises unless ``rollout_id == i``).
-    With a prebuild, batch i+1 is begun before training_completed(i): remember each rollout's batch id."""
+    With a prebuild, batch i+1 is begun before training_completed(i): remember each rollout's batch id.
+    """
     if getattr(BB, "_asrt_batch_ids_patched", False):
         return True
-    orig_begin, orig_replay, orig_tc = BB.begin, BB.replay_converted, BB.training_completed
+    orig_begin, orig_replay, orig_tc = (
+        BB.begin,
+        BB.replay_converted,
+        BB.training_completed,
+    )
 
     def _remember(self):
         ids = self.__dict__.setdefault("_asrt_batch_ids", {})
@@ -299,7 +335,11 @@ def install_batch_ids(BB) -> bool:
 
             ray.get(self.controller.finish_batch.remote(bid))
 
-    BB.begin, BB.replay_converted, BB.training_completed = begin, replay_converted, training_completed
+    BB.begin, BB.replay_converted, BB.training_completed = (
+        begin,
+        replay_converted,
+        training_completed,
+    )
     BB._asrt_batch_ids_patched = True
     return True
 
@@ -316,7 +356,9 @@ class _Prebuild:
 
 
 def _consumer(mgr):
-    return getattr(getattr(mgr, "data_source", None), "consumers", {}).get("fully_async")
+    return getattr(getattr(mgr, "data_source", None), "consumers", {}).get(
+        "fully_async"
+    )
 
 
 def prebuild_blocked(mgr, rid: int, D=None) -> Optional[str]:
@@ -324,12 +366,18 @@ def prebuild_blocked(mgr, rid: int, D=None) -> Optional[str]:
     a = mgr.args
     if rid >= getattr(a, "num_rollout", 1 << 30):
         return "last"
-    if getattr(a, "dynamic_sampling_filter_path", None) or getattr(a, "rollout_sample_filter_path", None):
+    if getattr(a, "dynamic_sampling_filter_path", None) or getattr(
+        a, "rollout_sample_filter_path", None
+    ):
         return "filters"  # ready groups may be dropped -> cannot know B kept groups are queued
     if getattr(a, "eval_interval", None) is not None:
         return "eval"
-    if getattr(a, "offload_rollout", False) or getattr(a, "colocate", False) or getattr(a, "debug_rollout_only", False) \
-            or getattr(a, "load_debug_rollout_data", None):
+    if (
+        getattr(a, "offload_rollout", False)
+        or getattr(a, "colocate", False)
+        or getattr(a, "debug_rollout_only", False)
+        or getattr(a, "load_debug_rollout_data", None)
+    ):
         return "offload/colocate/debug"
     rec = getattr(mgr, "recovery", None)
     if rec is not None and rid in getattr(rec, "batches", {}):
@@ -337,7 +385,12 @@ def prebuild_blocked(mgr, rid: int, D=None) -> Optional[str]:
     try:  # checkpoint after train(rid-1) snapshots the queue/builder: do not pop before it
         from slime.utils.misc import should_run_periodic_action
 
-        if should_run_periodic_action(rid - 1, getattr(a, "save_interval", None), None, getattr(a, "num_rollout", None)):
+        if should_run_periodic_action(
+            rid - 1,
+            getattr(a, "save_interval", None),
+            None,
+            getattr(a, "num_rollout", None),
+        ):
             return "save"
     except Exception:
         pass
@@ -357,14 +410,21 @@ def _prebuild_main(mgr, pb: _Prebuild, inner, post=None):
     need = int(mgr.args.rollout_batch_size)
     while True:
         with w.condition:
-            ok = (not w.paused) and (not w.demand) and len(w.ready) >= need and w.error is None
+            ok = (
+                (not w.paused)
+                and (not w.demand)
+                and len(w.ready) >= need
+                and w.error is None
+            )
         with pb.lock:
             if pb.cancel or w.error is not None:
                 pb.done.set()
                 return
             if ok:
                 pb.started = True
-                w.__dict__["_asrt_reserved"] = need   # the B popped groups keep counting until hand-out
+                w.__dict__[
+                    "_asrt_reserved"
+                ] = need  # the B popped groups keep counting until hand-out
                 break
         time.sleep(0.02)
     pb.t_start = time.time()
@@ -403,13 +463,20 @@ def make_prebuild_generate(inner, D=None, post=None, log=None):
                 if pb.err is not None:
                     raise pb.err
                 if pb.rid != rollout_id:  # never drop popped groups silently
-                    raise RuntimeError(f"asrt prebuild built rollout {pb.rid} but rollout {rollout_id} was asked")
+                    raise RuntimeError(
+                        f"asrt prebuild built rollout {pb.rid} but rollout {rollout_id} was asked"
+                    )
                 out = pb.out
-                rec.update(prebuilt=True, build_s=round(pb.t_end - pb.t_start, 3),
-                           ready_before_ask_s=round(max(0.0, t_ask - pb.t_end), 3),
-                           join_s=round(time.time() - t_ask, 3))
+                rec.update(
+                    prebuilt=True,
+                    build_s=round(pb.t_end - pb.t_start, 3),
+                    ready_before_ask_s=round(max(0.0, t_ask - pb.t_end), 3),
+                    join_s=round(time.time() - t_ask, 3),
+                )
             else:
-                rec.update(prebuilt=False, why="fewer than B completed groups before hand-out")
+                rec.update(
+                    prebuilt=False, why="fewer than B completed groups before hand-out"
+                )
         else:
             rec.update(prebuilt=False, why="none scheduled")
         w = _consumer(self)
@@ -424,8 +491,12 @@ def make_prebuild_generate(inner, D=None, post=None, log=None):
         if why is None:
             nxt = _Prebuild(rollout_id + 1)
             self._asrt_pb = nxt
-            threading.Thread(target=_prebuild_main, args=(self, nxt, inner, post), name="asrt-prebuild",
-                             daemon=True).start()
+            threading.Thread(
+                target=_prebuild_main,
+                args=(self, nxt, inner, post),
+                name="asrt-prebuild",
+                daemon=True,
+            ).start()
         else:
             rec["next_prebuild_off"] = why
         log(rec)
@@ -457,9 +528,14 @@ def install_manager_prebuild() -> bool:
     install_batch_ids(BatchBuilder)
     classes = _live_classes("RolloutManager", "_generate")
     for C in classes:
-        C._generate = make_prebuild_generate(C.__dict__["_generate"], DistributedRollout, _post_to_board)
+        C._generate = make_prebuild_generate(
+            C.__dict__["_generate"], DistributedRollout, _post_to_board
+        )
     _pb_installed = bool(classes)
-    print(f"[asrt] slime_prefetch prebuild installed on {len(classes)} RolloutManager class(es)", flush=True)
+    print(
+        f"[asrt] slime_prefetch prebuild installed on {len(classes)} RolloutManager class(es)",
+        flush=True,
+    )
     return _pb_installed
 
 
@@ -489,7 +565,10 @@ def _board_cls():
 
             async with self.cv:
                 try:
-                    await asyncio.wait_for(self.cv.wait_for(lambda: any(k > last_id for k in self.items)), timeout)
+                    await asyncio.wait_for(
+                        self.cv.wait_for(lambda: any(k > last_id for k in self.items)),
+                        timeout,
+                    )
                 except asyncio.TimeoutError:
                     return None
                 k = min(k for k in self.items if k > last_id)
@@ -504,15 +583,22 @@ def get_or_create_board():
     try:
         return ray.get_actor(BOARD_NAME)
     except ValueError:
-        return _board_cls().options(name=BOARD_NAME, get_if_exists=True, lifetime="detached").remote()
-
+        return (
+            _board_cls()
+            .options(name=BOARD_NAME, get_if_exists=True, lifetime="detached")
+            .remote()
+        )
 
 
 _straw_cache = {}
 
 
 def _straw_key(ref):
-    return (getattr(ref, "batch_id", None), getattr(ref, "rank", None), getattr(ref, "plan_digest", None))
+    return (
+        getattr(ref, "batch_id", None),
+        getattr(ref, "rank", None),
+        getattr(ref, "plan_digest", None),
+    )
 
 
 def _install_straw_cache():
@@ -525,8 +611,13 @@ def _install_straw_cache():
     orig = T.unpack_rollout_payload
 
     def unpack_rollout_payload(value):
-        hit = _straw_cache.pop(_straw_key(value), None) if type(value).__name__ == "TrainBatchRef" else None
+        hit = (
+            _straw_cache.pop(_straw_key(value), None)
+            if type(value).__name__ == "TrainBatchRef"
+            else None
+        )
         return hit if hit is not None else orig(value)
+
     unpack_rollout_payload.__wrapped_orig__ = orig
     T.unpack_rollout_payload = unpack_rollout_payload
 
@@ -550,8 +641,8 @@ def install_actor() -> bool:
     if _actor_installed or not o:
         return _actor_installed
     try:
-        import torch
         import ray
+        import torch
         from slime.backends.megatron_utils import actor as act
         from slime.backends.megatron_utils import cp_utils
     except Exception as e:
@@ -563,7 +654,10 @@ def install_actor() -> bool:
 
         def new_buf(rows, num_layers, topk, reference):
             buf = orig_buf(rows, num_layers, topk, reference)
-            if buf.dtype in (torch.int16, torch.uint8):  # keep the replay contract: int32 ids
+            if buf.dtype in (
+                torch.int16,
+                torch.uint8,
+            ):  # keep the replay contract: int32 ids
                 return torch.empty_like(buf, dtype=torch.int32)
             return buf
 
@@ -584,10 +678,16 @@ def install_actor() -> bool:
     # patching the module class alone is bypassed; patch every live class that defines it.
     if "overlap" in o:
         _install_straw_cache()
-    classes = _live_classes("MegatronTrainRayActor", "_get_rollout_data") or [act.MegatronTrainRayActor]
+    classes = _live_classes("MegatronTrainRayActor", "_get_rollout_data") or [
+        act.MegatronTrainRayActor
+    ]
     if act.MegatronTrainRayActor not in classes:
         classes.append(act.MegatronTrainRayActor)
-    orig_by_cls = {C: C.__dict__["_get_rollout_data"] for C in classes if "_get_rollout_data" in C.__dict__}
+    orig_by_cls = {
+        C: C.__dict__["_get_rollout_data"]
+        for C in classes
+        if "_get_rollout_data" in C.__dict__
+    }
     orig_get = act.MegatronTrainRayActor.__dict__["_get_rollout_data"]
     overlap = "overlap" in o
 
@@ -615,19 +715,30 @@ def install_actor() -> bool:
 
     def _dp_rank_size():
         from megatron.core import mpu
-        return (mpu.get_data_parallel_rank(with_context_parallel=False),
-                mpu.get_data_parallel_world_size(with_context_parallel=False))
+
+        return (
+            mpu.get_data_parallel_rank(with_context_parallel=False),
+            mpu.get_data_parallel_world_size(with_context_parallel=False),
+        )
 
     def _warm(refs, dp_rank):
-        val = ray.get(refs[dp_rank].inner)        # object-store: bytes now local; straw: small batch ref
+        val = ray.get(
+            refs[dp_rank].inner
+        )  # object-store: bytes now local; straw: small batch ref
         held = [val]
         try:
             from slime.data.transport import TrainBatchRef, unpack_rollout_payload
+
             if isinstance(val, TrainBatchRef):
-                held.append(unpack_rollout_payload.__wrapped_orig__(val)
-                            if hasattr(unpack_rollout_payload, "__wrapped_orig__") else unpack_rollout_payload(val))
+                held.append(
+                    unpack_rollout_payload.__wrapped_orig__(val)
+                    if hasattr(unpack_rollout_payload, "__wrapped_orig__")
+                    else unpack_rollout_payload(val)
+                )
                 _straw_cache[_straw_key(val)] = held[-1]
-                while len(_straw_cache) > 2:      # a missed batch must not pin GBs (dicts keep insertion order)
+                while (
+                    len(_straw_cache) > 2
+                ):  # a missed batch must not pin GBs (dicts keep insertion order)
                     _straw_cache.pop(next(iter(_straw_cache)))
         except Exception:
             pass
@@ -647,11 +758,20 @@ def install_actor() -> bool:
                 last = rid
                 k = _key(refs)
                 with self._asrt_lock:
-                    if k in self._asrt_claimed:          # main thread is already fetching it itself
+                    if (
+                        k in self._asrt_claimed
+                    ):  # main thread is already fetching it itself
                         continue
-                    for kk in [kk for kk, v in self._asrt_pref.items() if v["rid"] < rid - 1]:
+                    for kk in [
+                        kk for kk, v in self._asrt_pref.items() if v["rid"] < rid - 1
+                    ]:
                         del self._asrt_pref[kk]
-                    ent = {"event": threading.Event(), "held": None, "err": None, "rid": rid}
+                    ent = {
+                        "event": threading.Event(),
+                        "held": None,
+                        "err": None,
+                        "rid": rid,
+                    }
                     self._asrt_pref[k] = ent
                 t0 = time.perf_counter()
                 try:  # only this local entry object is touched (train() may pop it from the dict meanwhile)
@@ -674,7 +794,9 @@ def install_actor() -> bool:
             self._asrt_pref = {}
             self._asrt_claimed = set()
             self._asrt_lock = threading.Lock()
-            self._asrt_bg = threading.Thread(target=_bg_loop, args=(self,), daemon=True, name="asrt-prefetch")
+            self._asrt_bg = threading.Thread(
+                target=_bg_loop, args=(self,), daemon=True, name="asrt-prefetch"
+            )
             self._asrt_bg.start()
         t0 = time.perf_counter()
         ent = None
@@ -683,7 +805,7 @@ def install_actor() -> bool:
             with self._asrt_lock:
                 ent = self._asrt_pref.pop(k, None)
                 if ent is None:
-                    self._asrt_claimed.add(k)            # bg thread will skip this batch
+                    self._asrt_claimed.add(k)  # bg thread will skip this batch
                     if len(self._asrt_claimed) > 8:
                         self._asrt_claimed = set(list(self._asrt_claimed)[-4:])
         waited = None
@@ -692,11 +814,22 @@ def install_actor() -> bool:
             waited = round(time.perf_counter() - t0, 4)
             if not ok:
                 ent = {"err": f"warm not done after {wait_cap:.0f} s"}
-        out, dt = _timed_get(self, rollout_data_ref)    # slime's own path, main thread (hits warmed data)
-        rec = {"rank": rank, "prefetched": bool(ent is not None and not ent.get("err")), "fetch_s": round(dt, 4),
-               "ray_get_s": _rg()}
+        out, dt = _timed_get(
+            self, rollout_data_ref
+        )  # slime's own path, main thread (hits warmed data)
+        rec = {
+            "rank": rank,
+            "prefetched": bool(ent is not None and not ent.get("err")),
+            "fetch_s": round(dt, 4),
+            "ray_get_s": _rg(),
+        }
         if ent is not None:
-            rec.update(rid=ent.get("rid"), warm_s=round(ent.get("warm_s", 0) or 0, 4), wait_s=waited, err=ent.get("err"))
+            rec.update(
+                rid=ent.get("rid"),
+                warm_s=round(ent.get("warm_s", 0) or 0, 4),
+                wait_s=waited,
+                err=ent.get("err"),
+            )
         _log("prefetch", rec)
         return out
 

@@ -62,12 +62,19 @@ import json
 import os
 import time
 
-from .common import CachedTool, query_key  # noqa: F401
 from ._hooks import patch_method, when_imported
+from .common import CachedTool, query_key  # noqa: F401
 
-solvers = None  # no C++ extension in ai_search_plugin (pure-Python partitioner / router only)
+solvers = (
+    None  # no C++ extension in ai_search_plugin (pure-Python partitioner / router only)
+)
 
-_STATS = {"balance_calls": 0, "balance_ours": 0, "balance_gain_sum": 0.0, "toolcache": None}
+_STATS = {
+    "balance_calls": 0,
+    "balance_ours": 0,
+    "balance_gain_sum": 0.0,
+    "toolcache": None,
+}
 _INSTALLED = set()
 
 _BALANCE_IMPORTERS = [
@@ -87,8 +94,10 @@ def balanced_partitions(values, k, equal_size=True, quad_coef=0.0):
     """asrt partitioner; C++ when the extension is built, else pure Python."""
     if solvers is not None and hasattr(solvers, "balanced_partitions"):
         from .common import balanced_partitions as cpp
+
         return cpp(values, k, equal_size, quad_coef)
     from ..partition_py import balanced_partitions as py
+
     return py(values, k, equal_size, quad_coef)
 
 
@@ -106,9 +115,15 @@ def _log(kind, rec):
 
 # ----------------------------------------------------------------------------- balance
 
+
 def _make_partitioner(orig, quad_coef, mode):
     def get_seqlen_balanced_partitions(seqlen_list, k_partitions, equal_size):
-        vals = [float(x) for x in (seqlen_list.tolist() if hasattr(seqlen_list, "tolist") else seqlen_list)]
+        vals = [
+            float(x)
+            for x in (
+                seqlen_list.tolist() if hasattr(seqlen_list, "tolist") else seqlen_list
+            )
+        ]
         ours = balanced_partitions(vals, k_partitions, equal_size, quad_coef)
         if any(len(p) == 0 for p in ours):
             ours = None
@@ -121,7 +136,10 @@ def _make_partitioner(orig, quad_coef, mode):
             return base
 
         def mx(parts):
-            return max(sum(vals[i] + quad_coef * vals[i] * vals[i] for i in p) for p in parts)
+            return max(
+                sum(vals[i] + quad_coef * vals[i] * vals[i] for i in p) for p in parts
+            )
+
         mo, mb = mx(ours), mx(base)
         if mo < mb:
             _STATS["balance_ours"] += 1
@@ -129,17 +147,28 @@ def _make_partitioner(orig, quad_coef, mode):
             out = ours
         else:
             out = base
-        if (_STATS["balance_calls"] - 1) % int(os.environ.get("ASRT_VERL_BALANCE_LOG_EVERY", 50)) == 0:
-            rec = {"n": len(vals), "k": k_partitions, "equal": bool(equal_size), "max_verl": mb, "max_asrt": mo,
-                   **{k: v for k, v in _STATS.items() if k.startswith("balance")}}
+        if (_STATS["balance_calls"] - 1) % int(
+            os.environ.get("ASRT_VERL_BALANCE_LOG_EVERY", 50)
+        ) == 0:
+            rec = {
+                "n": len(vals),
+                "k": k_partitions,
+                "equal": bool(equal_size),
+                "max_verl": mb,
+                "max_asrt": mo,
+                **{k: v for k, v in _STATS.items() if k.startswith("balance")},
+            }
             print(f"[asrt] verl balance {rec}", flush=True)
             _log("balance", rec)
         return out
+
     get_seqlen_balanced_partitions.__asrt_patched__ = True
     return get_seqlen_balanced_partitions
 
 
-def install_balanced_partitions(quad_coef: float = 0.0, mode: str = None, cost=None) -> list:
+def install_balanced_partitions(
+    quad_coef: float = 0.0, mode: str = None, cost=None
+) -> list:
     """Patch verl's partitioner (+ optionally the workload model). Modules not yet
     imported are patched on import. Returns modules patched so far."""
     mode = mode or os.environ.get("ASRT_VERL_BALANCE", "best")
@@ -159,7 +188,8 @@ def install_balanced_partitions(quad_coef: float = 0.0, mode: str = None, cost=N
             a, b = (float(x) for x in str(cost).split(","))
 
             def calculate_workload(seqlen_list):
-                return a * seqlen_list + b * seqlen_list ** 2
+                return a * seqlen_list + b * seqlen_list**2
+
             state["cw_orig"] = mod.calculate_workload
             state["cw"] = calculate_workload
             mod.calculate_workload = calculate_workload
@@ -167,13 +197,18 @@ def install_balanced_partitions(quad_coef: float = 0.0, mode: str = None, cost=N
 
     def on_importer(mod):
         import verl.utils.seqlen_balancing  # noqa: F401  (fires on_sb first)
+
         if getattr(mod, "get_seqlen_balanced_partitions", None) is state.get("orig"):
             mod.get_seqlen_balanced_partitions = state["impl"]
             patched.append(mod.__name__)
-        if "cw" in state and getattr(mod, "calculate_workload", None) is state["cw_orig"]:
+        if (
+            "cw" in state
+            and getattr(mod, "calculate_workload", None) is state["cw_orig"]
+        ):
             mod.calculate_workload = state["cw"]
 
     import importlib.util
+
     try:
         have_verl = importlib.util.find_spec("verl") is not None
     except Exception:
@@ -189,6 +224,7 @@ def install_balanced_partitions(quad_coef: float = 0.0, mode: str = None, cost=N
 
 # ----------------------------------------------------------------------------- tool cache
 
+
 def _norm_args(args):
     if isinstance(args, str):
         return " ".join(args.lower().split())
@@ -203,7 +239,9 @@ class VerlToolCache:
     """Cache in front of ToolAgentLoop._call_tool (keyed by tool name + args)."""
 
     def __init__(self, patterns=None, capacity=None, ttl_s=None):
-        pats = patterns or os.environ.get("ASRT_VERL_TOOLCACHE_TOOLS", "*search*,*retriev*")
+        pats = patterns or os.environ.get(
+            "ASRT_VERL_TOOLCACHE_TOOLS", "*search*,*retriev*"
+        )
         self.patterns = [p.strip() for p in pats.split(",") if p.strip()]
         self._pending = {}
         cap = int(capacity or os.environ.get("ASRT_TOOLCACHE_CAPACITY", 1 << 20))
@@ -219,7 +257,9 @@ class VerlToolCache:
         resp, reward, res = await call()
         if any(getattr(resp, a, None) is not None for a in ("image", "video")):
             raise _Uncacheable((resp, reward, res))
-        return json.dumps({"text": resp.text, "reward": reward, "res": res}, default=str)
+        return json.dumps(
+            {"text": resp.text, "reward": reward, "res": res}, default=str
+        )
 
     def stats(self):
         s = self.tool.stats()
@@ -254,7 +294,9 @@ def install_tool_cache(patterns=None) -> bool:
                 except Exception:
                     return await orig(self, tool_call, tools_kwargs, agent_data)
                 key = name + "\x00" + json.dumps(_norm_args(args), sort_keys=True)
-                tc._pending.setdefault(key, lambda: orig(self, tool_call, tools_kwargs, agent_data))
+                tc._pending.setdefault(
+                    key, lambda: orig(self, tool_call, tools_kwargs, agent_data)
+                )
                 try:
                     out = json.loads(await tc.tool(key))
                 except _Uncacheable as u:
@@ -267,13 +309,18 @@ def install_tool_cache(patterns=None) -> bool:
                     print(f"[asrt] verl toolcache {st}", flush=True)
                     _log("toolcache", st)
                 return ToolResponse(text=out["text"]), out["reward"], out["res"]
+
             return _call_tool
+
         patch_method(mod.ToolAgentLoop, "_call_tool", make)
 
     when_imported("verl.experimental.agent_loop.tool_agent_loop", on_import)
     targets = os.environ.get("ASRT_TOOLCACHE_TARGETS")
     if targets:
-        from .slime_toolcache import install as install_targets  # generic module.attr patcher
+        from .slime_toolcache import (
+            install as install_targets,  # generic module.attr patcher
+        )
+
         for t in targets.split(","):
             mod = t.strip().rpartition(".")[0]
             when_imported(mod, lambda _m, _t=t.strip(): install_targets([_t]))
@@ -285,14 +332,17 @@ def stats() -> dict:
     out = {k: v for k, v in _STATS.items() if k != "toolcache"}
     if _INSTALLED & {"route", "keepkv", "tokcache", "profile"}:
         from .verl_rollout import stats as rstats
+
         out["rollout"] = rstats()
     if _INSTALLED & {"sglhooks", "inplace"}:
         from .verl_engine import stats as estats
+
         out["engine"] = estats()
     if _STATS["toolcache"] is not None:
         out["toolcache"] = _STATS["toolcache"].stats()
     try:
         from .slime_toolcache import stats as target_stats
+
         ts = target_stats()
         if ts:
             out["toolcache_targets"] = ts
@@ -316,7 +366,19 @@ def stats() -> dict:
 #   sglhooks  SGLang engine hooks inside verl's rollout servers (ai_search_plugin.adapters.verl_engine; default
 #             nosync,fastload: nosync installs nothing where SGLang has no per-step check, fastload falls back to
 #             the stock loader for layouts it cannot replay). `engine` is an alias.
-FULL = ["profile", "offpol", "route", "keepkv", "inplace", "tokcache", "balance", "toolcache", "response_logits", "sglhooks", "jitcache"]
+FULL = [
+    "profile",
+    "offpol",
+    "route",
+    "keepkv",
+    "inplace",
+    "tokcache",
+    "balance",
+    "toolcache",
+    "response_logits",
+    "sglhooks",
+    "jitcache",
+]
 # NOTE (ai_search_plugin): `full` is the original code base's everything-on list and contains items whose benefit is
 # still undecided (route / keepkv / tokcache / balance).  ai_search_plugin.install() never uses `full`; it passes an
 # explicit list built from the component registry.
@@ -333,10 +395,14 @@ def expand(features) -> list:
         f = (f or "").strip()
         if not f or f == "off":
             continue
-        for g in (FULL if f == "full" else [_ALIAS.get(f, f)]):
+        for g in FULL if f == "full" else [_ALIAS.get(f, f)]:
             if g not in out:
                 out.append(g)
-    drop = {_ALIAS.get(d.strip(), d.strip()) for d in os.environ.get("ASRT_VERL_DROP", "").split(",") if d.strip()}
+    drop = {
+        _ALIAS.get(d.strip(), d.strip())
+        for d in os.environ.get("ASRT_VERL_DROP", "").split(",")
+        if d.strip()
+    }
     return [f for f in out if f not in drop]
 
 
@@ -344,14 +410,18 @@ def _install_response_logits():
     """response_logits in verl's Megatron actor processes (ai_search_plugin.response_logits.adapters.verl), installed
     when verl's Megatron engine module is imported (actor workers only: rollout servers / agent workers never import
     it, so they pay nothing), plus the per-micro-batch guard below (_guard_response_logits).  The adapter itself falls
-    back to the stock path when its preconditions fail (e.g. use_fused_kernels=True, value model, MTP training)."""
+    back to the stock path when its preconditions fail (e.g. use_fused_kernels=True, value model, MTP training).
+    """
 
     def on_engine(mod):
         res = {}
         try:
             from ..response_logits.adapters import verl as RV
+
             res["response_logits"] = RV.install()
-        except Exception as e:  # torch / verl / megatron missing or incompatible -> stock path
+        except (
+            Exception
+        ) as e:  # torch / verl / megatron missing or incompatible -> stock path
             res["response_logits_error"] = repr(e)[:200]
         res["rlogits_guard"] = _guard_response_logits()
         print(f"[asrt] verl response_logits pid={os.getpid()} {res}", flush=True)
@@ -384,6 +454,7 @@ def _guard_response_logits():
     its getter wrapper). Returns True when installed."""
     try:
         import inspect
+
         from ..response_logits.adapters import verl as RV
     except Exception:
         return False
@@ -422,6 +493,7 @@ def _guard_response_logits():
             if every and n % every == 1:
                 _log("rlogits", dict(_RL))
             return wrapped(*args, **kwargs) if use else fn(*args, **kwargs)
+
         forward_fn._response_logits = True
         cache[fn] = forward_fn
         return forward_fn
@@ -441,10 +513,13 @@ def install(features=None) -> set:
     explicit = {(x or "").strip() for x in raw}
     feats = expand(features)
     from .verl_rollout import kvfresh_wanted
+
     if kvfresh_wanted():  # ASRT_VERL_KVFRESH=1
         bad = [f for f in feats if f in ("keepkv", "inplace")]
         if bad:
-            raise RuntimeError(f"asrt verl kvfresh: {bad} keep old-weight KV on purpose; set ASRT_VERL_DROP=keepkv,inplace")
+            raise RuntimeError(
+                f"asrt verl kvfresh: {bad} keep old-weight KV on purpose; set ASRT_VERL_DROP=keepkv,inplace"
+            )
         if "kvfresh" not in feats:
             feats.append("kvfresh")
         explicit.add("kvfresh")
@@ -468,6 +543,7 @@ def _install_one(f):
         _INSTALLED.add("response_logits")
     elif f == "jitcache":
         from . import jitcache
+
         jitcache.install()
         _INSTALLED.add(f)
     elif f == "toolcache":
@@ -475,42 +551,56 @@ def _install_one(f):
     elif f == "balance":
         q = float(os.environ.get("ASRT_VERL_QUAD", 0.0))
         install_balanced_partitions(q)
-    elif f == "place":  # expert re-placement (verl_placement; Megatron engine, MoE only, auto-off when balanced)
+    elif (
+        f == "place"
+    ):  # expert re-placement (verl_placement; Megatron engine, MoE only, auto-off when balanced)
         from .verl_placement import install as install_place
+
         install_place()
         _INSTALLED.add(f)
     elif f == "sglhooks":
         from .verl_engine import install_sglhooks
+
         install_sglhooks()
         _INSTALLED.add(f)
     elif f == "inplace":
         from .verl_engine import install_inplace
+
         install_inplace()
         _INSTALLED.update({"inplace", "keepkv", "sglhooks"})
     elif f == "ceiling":  # staleness ceiling S (verl_ceiling)
         from .verl_ceiling import install as install_ceiling
+
         install_ceiling()
         _INSTALLED.add(f)
-    elif f == "offpol":  # measurement only: submitted / trained / dropped per step (verl_offpol)
+    elif (
+        f == "offpol"
+    ):  # measurement only: submitted / trained / dropped per step (verl_offpol)
         from .verl_offpol import install as install_offpol
+
         install_offpol()
         _INSTALLED.add(f)
-    elif f == "kvfresh":  # checked flush + earliest version (verl_rollout.install_kvfresh)
+    elif (
+        f == "kvfresh"
+    ):  # checked flush + earliest version (verl_rollout.install_kvfresh)
         if _INSTALLED & {"keepkv", "inplace"}:
-            raise RuntimeError("asrt verl kvfresh: keepkv/inplace keep old-weight KV on purpose; drop them "
-                               "(ASRT_VERL_DROP=keepkv,inplace)")
+            raise RuntimeError(
+                "asrt verl kvfresh: keepkv/inplace keep old-weight KV on purpose; drop them "
+                "(ASRT_VERL_DROP=keepkv,inplace)"
+            )
         from . import verl_rollout
+
         verl_rollout.install_kvfresh()
         _INSTALLED.add(f)
     elif f == "kvprobe":  # measurement only (kvsync / kvcall logs)
         from . import verl_rollout
+
         verl_rollout.install_kvprobe()
         _INSTALLED.add(f)
     elif f in ("route", "keepkv", "tokcache", "profile"):
         from . import verl_rollout
+
         getattr(verl_rollout, "install_" + f)()
         _INSTALLED.add(f)
     else:
         raise ValueError(f"unknown asrt verl feature {f!r}")
-
-

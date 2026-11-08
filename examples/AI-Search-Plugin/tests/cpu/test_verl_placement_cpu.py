@@ -21,7 +21,13 @@ import placement_toy as T  # noqa: E402
 
 @pytest.fixture
 def env(monkeypatch):
-    for k in ("ASRT_PLACE_RANDOM", "ASRT_PLACE_LOG", "ASRT_PLACE_EVERY", "ASRT_PLACE_VERIFY", "ASRT_PLACE_VERIFY_FWD"):
+    for k in (
+        "ASRT_PLACE_RANDOM",
+        "ASRT_PLACE_LOG",
+        "ASRT_PLACE_EVERY",
+        "ASRT_PLACE_VERIFY",
+        "ASRT_PLACE_VERIFY_FWD",
+    ):
         monkeypatch.delenv(k, raising=False)
     monkeypatch.setenv("ASRT_PLACE_STRIDE", "1")
     monkeypatch.setenv("ASRT_PLACE_THRESH", "1.01")
@@ -49,6 +55,7 @@ def _fake_verl():
 
         def record_indices(self, topk_indices):
             self.recorded = topk_indices
+
     defs["verl.utils.megatron.router_replay_patch"] = dict(RouterReplay=RouterReplay)
 
     class BaseEngine:
@@ -61,7 +68,9 @@ def _fake_verl():
             self.module, self.optimizer = [model], opt
             self.tf_config = types.SimpleNamespace(num_layers=2, num_moe_experts=T.E)
             self.engine_config = types.SimpleNamespace(
-                forward_only=False, router_replay=types.SimpleNamespace(mode="R3" if r3 else "disabled"))
+                forward_only=False,
+                router_replay=types.SimpleNamespace(mode="R3" if r3 else "disabled"),
+            )
 
         def initialize(self):
             pass
@@ -70,14 +79,29 @@ def _fake_verl():
             m = self.module[0]
             out = []
             for li, layer in enumerate(m.layers):
-                out.append((f"model.layers.{li}.mlp.gate.weight", layer.mlp.router.weight.detach().clone()))
+                out.append(
+                    (
+                        f"model.layers.{li}.mlp.gate.weight",
+                        layer.mlp.router.weight.detach().clone(),
+                    )
+                )
                 for s, ex in enumerate(layer.mlp.experts.local_experts):
-                    out.append((f"model.layers.{li}.mlp.experts.{s}.up_proj.weight", ex.fc1.detach().clone()))
+                    out.append(
+                        (
+                            f"model.layers.{li}.mlp.experts.{s}.up_proj.weight",
+                            ex.fc1.detach().clone(),
+                        )
+                    )
             return iter(out), None
 
         def save_checkpoint(self, *a, **k):
-            self.saved = {n: p.detach().clone() for n, p in self.module[0].named_parameters()}
-    defs["verl.workers.engine.megatron.transformer_impl"] = dict(MegatronEngine=MegatronEngine)
+            self.saved = {
+                n: p.detach().clone() for n, p in self.module[0].named_parameters()
+            }
+
+    defs["verl.workers.engine.megatron.transformer_impl"] = dict(
+        MegatronEngine=MegatronEngine
+    )
 
     class TrainingWorker:
         def __init__(self, engine):
@@ -85,6 +109,7 @@ def _fake_verl():
 
         def train_mini_batch(self, data):
             return self.engine.train_batch(data, None)
+
     defs["verl.workers.engine_workers"] = dict(TrainingWorker=TrainingWorker)
 
     class Finder(importlib.abc.MetaPathFinder, importlib.abc.Loader):
@@ -99,11 +124,13 @@ def _fake_verl():
         def exec_module(self, module):
             module.__path__ = []
             module.__dict__.update(defs.get(module.__name__, {}))
+
     return Finder()
 
 
 def _setup(r3=True):
     from ai_search_plugin.adapters import verl_placement as VP
+
     VP.install()
     ti = importlib.import_module("verl.workers.engine.megatron.transformer_impl")
     ew = importlib.import_module("verl.workers.engine_workers")
@@ -126,7 +153,10 @@ def test_r3_replace_replay_export_save(env):
     y0 = m(x).detach()
     snap = {n: p.detach().clone() for n, p in m.named_parameters()}
     # R3 routes of this batch: hot logical experts 0..3, padded batch [bs, seq, L, topk]
-    routes = torch.cat([torch.randint(0, 4, (4, 50, 2, T.K)), torch.randint(0, T.E, (4, 20, 2, T.K))], 1)
+    routes = torch.cat(
+        [torch.randint(0, 4, (4, 50, 2, T.K)), torch.randint(0, T.E, (4, 20, 2, T.K))],
+        1,
+    )
     routes[:, -5:] = 0  # padding rows
     with redirect_stdout(io.StringIO()):
         w.train_mini_batch({"routed_experts": routes})
@@ -143,10 +173,14 @@ def test_r3_replace_replay_export_save(env):
     gen, _ = eng.get_per_tensor_param()
     with redirect_stdout(io.StringIO()):
         out = dict(gen)
-    assert torch.equal(out["model.layers.0.mlp.gate.weight"], snap["layers.0.mlp.router.weight"])
+    assert torch.equal(
+        out["model.layers.0.mlp.gate.weight"], snap["layers.0.mlp.router.weight"]
+    )
     for e in range(T.E):
-        assert torch.equal(out[f"model.layers.0.mlp.experts.{e}.up_proj.weight"],
-                           snap[f"layers.0.mlp.experts.local_experts.{e}.fc1"]), e
+        assert torch.equal(
+            out[f"model.layers.0.mlp.experts.{e}.up_proj.weight"],
+            snap[f"layers.0.mlp.experts.local_experts.{e}.fc1"],
+        ), e
     # checkpoint in logical order, placement re-applied after
     before = mgr.slot_of.clone()
     eng.save_checkpoint("x")
@@ -164,7 +198,9 @@ def test_auto_off_probe_backoff(env):
         for _ in range(4):
             w.train_mini_batch({"routed_experts": uniform})
     # step 0 checks and skips, steps 1-2 back off (no counting, no collective), step 3 probes again
-    assert len(mgr.history) == 2 and all(h.get("skipped") for h in mgr.history), mgr.history
+    assert len(mgr.history) == 2 and all(
+        h.get("skipped") for h in mgr.history
+    ), mgr.history
     assert mgr.is_identity() and eng.trained == 4
 
 
@@ -172,35 +208,54 @@ def test_export_selfcheck(env):
     VP, m, x, eng, mgr, w = _setup()
     g = torch.Generator().manual_seed(3)
     with redirect_stdout(io.StringIO()):
-        mgr.maybe_rebalance(force_perms={lid: torch.randperm(T.E, generator=g).tolist() for lid in range(2)})
-        full = [(f"model.layers.{l}.mlp.experts.{e}.gate_proj.weight", torch.zeros(1))
-                for l in (0, 1) for e in range(T.E)]
+        mgr.maybe_rebalance(
+            force_perms={
+                lid: torch.randperm(T.E, generator=g).tolist() for lid in range(2)
+            }
+        )
+        full = [
+            (f"model.layers.{l}.mlp.experts.{e}.gate_proj.weight", torch.zeros(1))
+            for l in (0, 1)
+            for e in range(T.E)
+        ]
         out = list(VP._checked_export(mgr, iter(full)))
     assert len(out) == len(full)
-    logical = {int(n.split(".experts.")[1].split(".")[0]) for n, _ in out if ".layers.0." in n}
+    logical = {
+        int(n.split(".experts.")[1].split(".")[0]) for n, _ in out if ".layers.0." in n
+    }
     assert logical == set(range(T.E))
     with pytest.raises(RuntimeError, match="export covered MoE layers"):
         with redirect_stdout(io.StringIO()):
-            list(VP._checked_export(mgr, iter(full[: T.E])))   # layer 1 never exported under a matching name
+            list(
+                VP._checked_export(mgr, iter(full[: T.E]))
+            )  # layer 1 never exported under a matching name
 
 
 def test_dense_model_no_manager(env):
     from ai_search_plugin.adapters import verl_placement as VP
+
     m = T.Dense()
-    eng = types.SimpleNamespace(module=[m], optimizer=None, tf_config=types.SimpleNamespace(num_layers=2))
+    eng = types.SimpleNamespace(
+        module=[m], optimizer=None, tf_config=types.SimpleNamespace(num_layers=2)
+    )
     with redirect_stdout(io.StringIO()):
         assert VP.build_manager(eng) is None
 
 
 def test_verl_feature_place_installs(env):
     from ai_search_plugin.adapters import verl as V
+
     env.setattr(V, "_INSTALLED", set())
     V._install_one("place")
     assert "place" in V._INSTALLED
     from ai_search_plugin.adapters import verl_placement as VP
+
     assert VP._S["installed"]
-    for mod in ("verl.utils.megatron.router_replay_patch", "verl.workers.engine.megatron.transformer_impl",
-                "verl.workers.engine_workers"):   # fire (and so consume) the post-import hooks it registered
+    for mod in (
+        "verl.utils.megatron.router_replay_patch",
+        "verl.workers.engine.megatron.transformer_impl",
+        "verl.workers.engine_workers",
+    ):  # fire (and so consume) the post-import hooks it registered
         importlib.import_module(mod)
     ti = sys.modules["verl.workers.engine.megatron.transformer_impl"]
     assert getattr(ti.MegatronEngine.train_batch, "__asrt_patched__", False)

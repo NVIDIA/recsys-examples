@@ -1,6 +1,7 @@
 """Regression for the prefetch race seen on the effect line and the 32-GPU real model: the trainer pops a
 prefetch entry while the background thread is still warming it. The waiter must always be released."""
-import threading, time
+import threading
+import time
 
 
 def test_entry_object_released_even_if_popped():
@@ -18,7 +19,8 @@ def test_entry_object_released_even_if_popped():
         finally:
             ent["event"].set()
 
-    t = threading.Thread(target=bg); t.start()
+    t = threading.Thread(target=bg)
+    t.start()
     with lock:
         got = pref.pop("k", None)  # trainer takes the entry while bg is mid-fetch
     assert got is ent and got["event"].wait(timeout=5)

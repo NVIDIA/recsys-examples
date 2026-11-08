@@ -11,4 +11,7 @@ from .adapters import verl as _verl
 
 installed = _verl.install()
 if installed and os.environ.get("ASRT_VERL_QUIET", "0") != "1":
-    print(f"[asrt] ai_search_plugin verl pid={os.getpid()} features={sorted(installed)}", flush=True)
+    print(
+        f"[asrt] ai_search_plugin verl pid={os.getpid()} features={sorted(installed)}",
+        flush=True,
+    )

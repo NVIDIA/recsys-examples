@@ -26,7 +26,13 @@ import time
 
 import numpy as np
 
-from ..r3pack import is_lazy_ref, pack_microbatches, pack_microbatches_fast, route_hist, sample_hist
+from ..r3pack import (
+    is_lazy_ref,
+    pack_microbatches,
+    pack_microbatches_fast,
+    route_hist,
+    sample_hist,
+)
 
 log = logging.getLogger("ai_search_plugin.slime_r3pack")
 _state = {"installed": False, "routes": None}
@@ -46,7 +52,16 @@ def _hist(v, num_experts, layers, stride):
     return sample_hist(_routes_np(v), num_experts, layers, stride)
 
 
-def repack(args, tpc, total_lengths, rollout_indices, global_batch_size, result, routes, num_experts):
+def repack(
+    args,
+    tpc,
+    total_lengths,
+    rollout_indices,
+    global_batch_size,
+    result,
+    routes,
+    num_experts,
+):
     """Return a new (partitions, micro_batch_indices, num_microbatches, gbs) or None to keep slime's."""
     partitions_o, mbi_o, nmb, gbs = result
     dp, cp = tpc["dp_size"], tpc["cp_size"]
@@ -64,18 +79,34 @@ def repack(args, tpc, total_lengths, rollout_indices, global_batch_size, result,
     new_nmb = []
     step_off = [0] * dp
     for s, n_mb in enumerate(nmb):
-        idx = [p for rid in rids[s * global_batch_size:(s + 1) * global_batch_size] for p in groups_of[rid]]
+        idx = [
+            p
+            for rid in rids[s * global_batch_size : (s + 1) * global_batch_size]
+            for p in groups_of[rid]
+        ]
         lens = [int(total_lengths[i]) for i in idx]
         if any(routes[i] is None for i in idx):
             _state["why"] = f"step {s}: missing routes"
             return None
-        H = np.stack([_hist(routes[i], num_experts, layers, stride) for i in idx]).astype(np.float32)
+        H = np.stack(
+            [_hist(routes[i], num_experts, layers, stride) for i in idx]
+        ).astype(np.float32)
         plan = None
-        inc = tpc.get("microbatch_group_size_per_vp_stage", 1) if tpc.get("vpp_size", 1) > 1 else 1
+        inc = (
+            tpc.get("microbatch_group_size_per_vp_stage", 1)
+            if tpc.get("vpp_size", 1) > 1
+            else 1
+        )
         extra = int(os.environ.get("ASRT_R3PACK_EXTRA_MB", "2"))
-        algo = os.environ.get("ASRT_R3PACK_ALGO", "fast")  # fast: round-based assignment (O(S/G) numpy rounds)
-        greedy_max = int(os.environ.get("ASRT_R3PACK_GREEDY_MAX", "4096"))  # per-sample greedy only up to this size
-        for n_try in [n_mb + j * inc for j in range(extra + 1)]:  # slime packs tight; allow a few extra micro-steps
+        algo = os.environ.get(
+            "ASRT_R3PACK_ALGO", "fast"
+        )  # fast: round-based assignment (O(S/G) numpy rounds)
+        greedy_max = int(
+            os.environ.get("ASRT_R3PACK_GREEDY_MAX", "4096")
+        )  # per-sample greedy only up to this size
+        for n_try in [
+            n_mb + j * inc for j in range(extra + 1)
+        ]:  # slime packs tight; allow a few extra micro-steps
             if algo != "greedy":
                 plan = pack_microbatches_fast(H, lens, n_try, dp, cap)
             if plan is None and (algo == "greedy" or len(idx) <= greedy_max):
@@ -83,8 +114,10 @@ def repack(args, tpc, total_lengths, rollout_indices, global_batch_size, result,
             if plan is not None:
                 break
         if plan is None:
-            _state["why"] = (f"step {s}: does not fit in {n_mb}+{extra} micro-steps x {dp} (cap {cap}, "
-                             f"tokens {sum(lens)}, max sample {max(lens)})")
+            _state["why"] = (
+                f"step {s}: does not fit in {n_mb}+{extra} micro-steps x {dp} (cap {cap}, "
+                f"tokens {sum(lens)}, max sample {max(lens)})"
+            )
             return None
         new_nmb.append(len(plan))
         for bins in plan:
@@ -93,9 +126,15 @@ def repack(args, tpc, total_lengths, rollout_indices, global_batch_size, result,
                 partitions[r].extend(idx[i] for i in bins[r])
                 mbi[r].append(list(range(start, start + len(bins[r]))))
         P = H.sum(0) / max(H.sum(), 1)
+
         def _dev(groups):
-            d = [float(np.abs(H[g].sum(0) / max(H[g].sum(), 1) - P).sum()) for g in groups if g]
+            d = [
+                float(np.abs(H[g].sum(0) / max(H[g].sum(), 1) - P).sum())
+                for g in groups
+                if g
+            ]
             return float(np.mean(d)) if d else 0.0
+
         groups = [[i for b in bins for i in b] for bins in plan]
         # slime's own micro-steps for this step (local positions), for the gain check
         pos = {gi: k for k, gi in enumerate(idx)}
@@ -108,8 +147,16 @@ def repack(args, tpc, total_lengths, rollout_indices, global_batch_size, result,
             orig.append(g)
         for r in range(dp):
             step_off[r] += n_mb
-        stats.append({"step": s, "n_mb": n_mb, "n_mb_packed": len(plan), "samples": len(idx),
-                      "hist_l1_dev_mean": _dev(groups), "hist_l1_dev_orig": _dev(orig) if mbi_o is not None else None})
+        stats.append(
+            {
+                "step": s,
+                "n_mb": n_mb,
+                "n_mb_packed": len(plan),
+                "samples": len(idx),
+                "hist_l1_dev_mean": _dev(groups),
+                "hist_l1_dev_orig": _dev(orig) if mbi_o is not None else None,
+            }
+        )
     return (partitions, mbi, new_nmb, gbs), stats
 
 
@@ -123,7 +170,8 @@ def _log_rec(rec):
 
 def _routes_of(data):
     """Route values for the batch: a dict (object-store transport) or, with --rollout-data-transport straw, a
-    disk payload reference -> read only the route field (lazy straw TensorRefs, no tensor bytes)."""
+    disk payload reference -> read only the route field (lazy straw TensorRefs, no tensor bytes).
+    """
     if isinstance(data, dict):
         return data.get("rollout_routed_experts")
     if hasattr(data, "load"):
@@ -131,7 +179,13 @@ def _routes_of(data):
             sel = data.load(selection={"rollout_routed_experts": None})
             return sel.get("rollout_routed_experts") if isinstance(sel, dict) else None
         except Exception as e:  # never break slime's own schedule
-            _log_rec({"t": time.time(), "applied": False, "why": f"straw route refs unreadable: {e!r}"[:300]})
+            _log_rec(
+                {
+                    "t": time.time(),
+                    "applied": False,
+                    "why": f"straw route refs unreadable: {e!r}"[:300],
+                }
+            )
     return None
 
 
@@ -153,26 +207,72 @@ def install() -> bool:
         finally:
             _state["routes"] = None
 
-    def build_dp_schedule(args, tpc, total_lengths, *, global_batch_size, rollout_indices):
-        res = orig_build(args, tpc, total_lengths, global_batch_size=global_batch_size, rollout_indices=rollout_indices)
+    def build_dp_schedule(
+        args, tpc, total_lengths, *, global_batch_size, rollout_indices
+    ):
+        res = orig_build(
+            args,
+            tpc,
+            total_lengths,
+            global_batch_size=global_batch_size,
+            rollout_indices=rollout_indices,
+        )
         routes = _state["routes"]
-        if not routes or not args.use_dynamic_batch_size or len(routes) != len(total_lengths):
-            _log_rec({"t": time.time(), "applied": False, "why": "no routes / static batch / length mismatch",
-                      "n_routes": len(routes) if routes else 0, "n": len(total_lengths)})
+        if (
+            not routes
+            or not args.use_dynamic_batch_size
+            or len(routes) != len(total_lengths)
+        ):
+            _log_rec(
+                {
+                    "t": time.time(),
+                    "applied": False,
+                    "why": "no routes / static batch / length mismatch",
+                    "n_routes": len(routes) if routes else 0,
+                    "n": len(total_lengths),
+                }
+            )
             return res
         t0 = time.perf_counter()
         if _state.get("skip", 0) > 0:  # auto-off backoff: packing did not help recently
             _state["skip"] -= 1
-            _log_rec({"t": time.time(), "applied": False, "why": "auto-off backoff", "skip_left": _state["skip"]})
+            _log_rec(
+                {
+                    "t": time.time(),
+                    "applied": False,
+                    "why": "auto-off backoff",
+                    "skip_left": _state["skip"],
+                }
+            )
             return res
-        ne = int(os.environ.get("ASRT_NUM_EXPERTS", getattr(args, "num_experts", None) or 0)) or None
+        ne = (
+            int(
+                os.environ.get(
+                    "ASRT_NUM_EXPERTS", getattr(args, "num_experts", None) or 0
+                )
+            )
+            or None
+        )
         try:
-            out = repack(args, tpc, total_lengths, rollout_indices, global_batch_size, res, routes, ne or 512)
+            out = repack(
+                args,
+                tpc,
+                total_lengths,
+                rollout_indices,
+                global_batch_size,
+                res,
+                routes,
+                ne or 512,
+            )
         except Exception as e:
             log.warning("asrt r3pack failed, using slime schedule: %r", e)
             _state["why"] = repr(e)[:500]
             out = None
-        rec = {"t": time.time(), "s": time.perf_counter() - t0, "applied": out is not None}
+        rec = {
+            "t": time.time(),
+            "s": time.perf_counter() - t0,
+            "applied": out is not None,
+        }
         if out is None:
             rec["why"] = _state.pop("why", "unknown")
         else:
@@ -199,13 +299,18 @@ def install() -> bool:
     return True
 
 
-def generate_rollout_fully_async(args, rollout_id, data_buffer, evaluation: bool = False):
+def generate_rollout_fully_async(
+    args, rollout_id, data_buffer, evaluation: bool = False
+):
     """Drop-in for ``--rollout-function-path`` (installs the packer in the rollout manager)."""
     from . import slime_pool
 
-    slime_pool.autosize(args)               # in-flight pool >= one batch (GRPO n=16: 1/4 batch otherwise)
+    slime_pool.autosize(
+        args
+    )  # in-flight pool >= one batch (GRPO n=16: 1/4 batch otherwise)
     install()
     from . import slime_r3check
+
     slime_r3check.install()
     from slime.rollout.fully_async_rollout import generate_rollout_fully_async as orig
 

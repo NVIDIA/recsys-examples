@@ -27,7 +27,9 @@ from typing import List, Optional, Sequence
 import numpy as np
 
 
-def sample_hist(routes, num_experts: int, layers: Optional[Sequence[int]] = None, stride: int = 1) -> np.ndarray:
+def sample_hist(
+    routes, num_experts: int, layers: Optional[Sequence[int]] = None, stride: int = 1
+) -> np.ndarray:
     """routes [tokens, layers, topk] (np/torch, logical ids) -> flat [L*E] float32 histogram."""
     r = np.asarray(routes)
     if stride > 1:
@@ -40,14 +42,20 @@ def sample_hist(routes, num_experts: int, layers: Optional[Sequence[int]] = None
     return np.bincount(idx, minlength=L * num_experts).astype(np.float32) * stride
 
 
-def pack_microsteps(hists: np.ndarray, lengths: Sequence[int], n_groups: int, cap: float) -> List[List[int]]:
+def pack_microsteps(
+    hists: np.ndarray, lengths: Sequence[int], n_groups: int, cap: float
+) -> List[List[int]]:
     H = np.asarray(hists, dtype=np.float64)
     T = np.asarray(lengths, dtype=np.float64)
     S = len(T)
     if n_groups <= 1 or S <= n_groups:
-        return [list(range(S))] if n_groups <= 1 else [[i] for i in range(S)] + [[] for _ in range(n_groups - S)]
-    P = H.sum(0) / max(T.sum(), 1.0)                 # expert density per token
-    D = np.zeros((n_groups, H.shape[1]))             # G_g - P*tok_g
+        return (
+            [list(range(S))]
+            if n_groups <= 1
+            else [[i] for i in range(S)] + [[] for _ in range(n_groups - S)]
+        )
+    P = H.sum(0) / max(T.sum(), 1.0)  # expert density per token
+    D = np.zeros((n_groups, H.shape[1]))  # G_g - P*tok_g
     tok = np.zeros(n_groups)
     groups: List[List[int]] = [[] for _ in range(n_groups)]
     for s in np.argsort(-T, kind="stable"):
@@ -60,11 +68,15 @@ def pack_microsteps(hists: np.ndarray, lengths: Sequence[int], n_groups: int, ca
             # tie-break toward emptier groups so token counts stay even
             score = score + 1e-9 * tok[ok]
             g = int(ok[np.argmin(score)])
-        groups[g].append(int(s)); D[g] += d; tok[g] += T[s]
+        groups[g].append(int(s))
+        D[g] += d
+        tok[g] += T[s]
     return groups
 
 
-def split_group(members: Sequence[int], lengths: Sequence[int], n_bins: int, cap: float) -> Optional[List[List[int]]]:
+def split_group(
+    members: Sequence[int], lengths: Sequence[int], n_bins: int, cap: float
+) -> Optional[List[List[int]]]:
     """First-fit-decreasing of a micro-step's samples into n_bins micro-batches of <= cap tokens.
     Returns None if it does not fit (caller falls back). Empty bins are allowed only if
     there are fewer samples than bins."""
@@ -77,13 +89,16 @@ def split_group(members: Sequence[int], lengths: Sequence[int], n_bins: int, cap
                 return None
             cand = [b for b in range(n_bins) if load[b] == 0]
         b = min(cand, key=lambda b: load[b])
-        bins[b].append(s); load[b] += lengths[s]
+        bins[b].append(s)
+        load[b] += lengths[s]
     if len(members) >= n_bins and any(not b for b in bins):
         return None
     return bins
 
 
-def microstep_imbalance(hists: np.ndarray, groups: List[List[int]], rank_of: np.ndarray, num_experts: int) -> float:
+def microstep_imbalance(
+    hists: np.ndarray, groups: List[List[int]], rank_of: np.ndarray, num_experts: int
+) -> float:
     """Token-weighted mean over (group, layer) of max/mean EP-rank load. rank_of [L, E] or [E]."""
     H = np.asarray(hists)
     L = H.shape[1] // num_experts
@@ -98,15 +113,18 @@ def microstep_imbalance(hists: np.ndarray, groups: List[List[int]], rank_of: np.
             load = np.bincount(ro[l], weights=c[l], minlength=ep)
             w = load.sum()
             if w > 0:
-                num += w * load.max() / load.mean(); den += w
+                num += w * load.max() / load.mean()
+                den += w
     return num / max(den, 1.0)
 
 
-def pack_microbatches(hists: np.ndarray, lengths: Sequence[int], n_groups: int, n_bins: int,
-                      cap: float) -> Optional[List[List[List[int]]]]:
+def pack_microbatches(
+    hists: np.ndarray, lengths: Sequence[int], n_groups: int, n_bins: int, cap: float
+) -> Optional[List[List[List[int]]]]:
     """Like pack_microsteps, but places every sample directly into one of n_bins micro-batches
     (<= cap tokens each) of its micro-step, so the per-micro-batch cap always holds.
-    Returns plan[g][b] = sample indices, or None if the samples do not fit / a bin stays empty."""
+    Returns plan[g][b] = sample indices, or None if the samples do not fit / a bin stays empty.
+    """
     H = np.asarray(hists, dtype=np.float64)
     T = np.asarray(lengths, dtype=np.float64)
     P = H.sum(0) / max(T.sum(), 1.0)
@@ -116,9 +134,13 @@ def pack_microbatches(hists: np.ndarray, lengths: Sequence[int], n_groups: int, 
     order = np.argsort(-T, kind="stable")
     need_full = len(T) >= n_groups * n_bins
     for k, s in enumerate(order):
-        room = (load + T[s] <= cap) | ((load == 0) & (T[s] > cap))  # oversize sample: alone in its own micro-batch (as slime does)
+        room = (load + T[s] <= cap) | (
+            (load == 0) & (T[s] > cap)
+        )  # oversize sample: alone in its own micro-batch (as slime does)
         if need_full and (len(T) - k) <= int((load == 0).sum()):
-            room &= (load == 0)  # just enough samples left to give every empty micro-batch one
+            room &= (
+                load == 0
+            )  # just enough samples left to give every empty micro-batch one
         ok = np.where(room.any(1))[0]
         if len(ok) == 0:
             return None
@@ -128,7 +150,9 @@ def pack_microbatches(hists: np.ndarray, lengths: Sequence[int], n_groups: int, 
         g = int(ok[np.argmin(score)])
         cand = np.where(room[g])[0]
         b = int(cand[np.argmin(load[g, cand])])
-        plan[g][b].append(int(s)); load[g, b] += T[s]; D[g] += d
+        plan[g][b].append(int(s))
+        load[g, b] += T[s]
+        D[g] += d
     if len(T) >= n_groups * n_bins and any(not b for grp in plan for b in grp):
         return None
     return plan
@@ -156,13 +180,15 @@ def _assign(cost: np.ndarray) -> np.ndarray:
         return out
 
 
-def pack_microbatches_fast(hists: np.ndarray, lengths: Sequence[int], n_groups: int, n_bins: int,
-                           cap: float) -> Optional[List[List[List[int]]]]:
+def pack_microbatches_fast(
+    hists: np.ndarray, lengths: Sequence[int], n_groups: int, n_bins: int, cap: float
+) -> Optional[List[List[List[int]]]]:
     """Same contract and objective as ``pack_microbatches`` but dealt in rounds: the next n_groups samples
     (longest first) get one micro-step each, chosen by a min-cost assignment on the score matrix
     (sample deviation . group deviation) computed with one matmul per round.  O(S/G) numpy rounds instead of S
     Python iterations; also keeps the micro-steps' token counts even (one sample per micro-step per round).
-    Inside the micro-step the sample goes to the least-loaded micro-batch (the one with the most room)."""
+    Inside the micro-step the sample goes to the least-loaded micro-batch (the one with the most room).
+    """
     H = np.asarray(hists, dtype=np.float32)
     T = np.asarray(lengths, dtype=np.float64)
     S = len(T)
@@ -173,35 +199,45 @@ def pack_microbatches_fast(hists: np.ndarray, lengths: Sequence[int], n_groups: 
     order = np.argsort(-T, kind="stable")
     BIG = 1e30
     for r0 in range(0, S, n_groups):
-        rows = order[r0:r0 + n_groups]
+        rows = order[r0 : r0 + n_groups]
         Tr = T[rows]
-        d = H[rows] - P[None, :] * Tr[:, None].astype(np.float32)                 # [c, F]
-        minl = load.min(1)                                                        # most room per micro-step
-        feas = (minl[None, :] + Tr[:, None] <= cap) | ((minl[None, :] == 0) & (Tr[:, None] > cap))
+        d = H[rows] - P[None, :] * Tr[:, None].astype(np.float32)  # [c, F]
+        minl = load.min(1)  # most room per micro-step
+        feas = (minl[None, :] + Tr[:, None] <= cap) | (
+            (minl[None, :] == 0) & (Tr[:, None] > cap)
+        )
         if not feas.any(1).all():
             return None
-        cost = (d @ D.T).astype(np.float64)                                       # [c, G]
-        cost += 1e-6 * load.sum(1)[None, :] * np.abs(d).sum(1, dtype=np.float64)[:, None]
+        cost = (d @ D.T).astype(np.float64)  # [c, G]
+        cost += (
+            1e-6 * load.sum(1)[None, :] * np.abs(d).sum(1, dtype=np.float64)[:, None]
+        )
         cost[~feas] = BIG
         g_of = _assign(cost)
         bad = (g_of < 0) | ~feas[np.arange(len(rows)), np.maximum(g_of, 0)]
-        for i in np.where(bad)[0]:                                                # rare: forbidden cell picked
+        for i in np.where(bad)[0]:  # rare: forbidden cell picked
             s = rows[i]
             taken = set(int(x) for x in g_of[~bad])
             ml = load.min(1)
-            ok = [g for g in np.where((ml + T[s] <= cap) | ((ml == 0) & (T[s] > cap)))[0] if g not in taken]
+            ok = [
+                g
+                for g in np.where((ml + T[s] <= cap) | ((ml == 0) & (T[s] > cap)))[0]
+                if g not in taken
+            ]
             if not ok:
                 return None
             g_of[i] = ok[int(np.argmin(cost[i, ok]))]
             bad[i] = False
-        b_of = np.argmin(load[g_of], axis=1)                                      # micro-steps distinct this round
+        b_of = np.argmin(load[g_of], axis=1)  # micro-steps distinct this round
         load[g_of, b_of] += Tr
         D[g_of] += d
         for s, g, b in zip(rows.tolist(), g_of.tolist(), b_of.tolist()):
             plan[g][b].append(s)
         if (load[g_of, b_of] > cap).any():
             over = load[g_of, b_of] > cap
-            if not np.all(load[g_of, b_of][over] == Tr[over]):                    # only an oversize sample alone
+            if not np.all(
+                load[g_of, b_of][over] == Tr[over]
+            ):  # only an oversize sample alone
                 return None
     if S >= n_groups * n_bins and any(not b for grp in plan for b in grp):
         return None
@@ -210,16 +246,23 @@ def pack_microbatches_fast(hists: np.ndarray, lengths: Sequence[int], n_groups: 
 
 def is_lazy_ref(v) -> bool:
     """A lazily loaded route reference (slime --rollout-data-transport straw: straw.tensor.TensorRef), which
-    supports len() and contiguous row-slice reads.  Loading it whole would undo the streaming handoff."""
+    supports len() and contiguous row-slice reads.  Loading it whole would undo the streaming handoff.
+    """
     import numpy as _np
+
     try:
         import torch as _torch
+
         if isinstance(v, _torch.Tensor):
             return False
     except Exception:  # pragma: no cover
         pass
-    return not isinstance(v, (_np.ndarray, list, tuple)) and hasattr(v, "load") and hasattr(v, "__getitem__") \
+    return (
+        not isinstance(v, (_np.ndarray, list, tuple))
+        and hasattr(v, "load")
+        and hasattr(v, "__getitem__")
         and hasattr(v, "__len__")
+    )
 
 
 def sampled_rows(v, chunks: int = 4, rows: int = 512):
@@ -229,7 +272,7 @@ def sampled_rows(v, chunks: int = 4, rows: int = 512):
         a = v[0:n]
         return (a.numpy() if hasattr(a, "numpy") else np.asarray(a)), 1.0
     starts = [int(i * (n - rows) / (chunks - 1)) for i in range(chunks)]
-    parts = [v[st:st + rows] for st in starts]
+    parts = [v[st : st + rows] for st in starts]
     parts = [p.numpy() if hasattr(p, "numpy") else np.asarray(p) for p in parts]
     return np.concatenate(parts), n / (chunks * rows)
 

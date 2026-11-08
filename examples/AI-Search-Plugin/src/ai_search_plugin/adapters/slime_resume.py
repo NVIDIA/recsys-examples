@@ -36,7 +36,12 @@ _ACTOR = "slime.backends.megatron_utils.actor"
 
 
 def _on() -> bool:
-    return os.environ.get("ASRT_RESUME_VERSION", "1").strip().lower() not in ("0", "off", "no", "false")
+    return os.environ.get("ASRT_RESUME_VERSION", "1").strip().lower() not in (
+        "0",
+        "off",
+        "no",
+        "false",
+    )
 
 
 def _rank0() -> bool:
@@ -58,12 +63,17 @@ def seed_version(args, loaded_rollout_id):
         return None
     if lr < 0 or getattr(args, "finetune", False):
         return None  # fresh run (HF / base model, nothing loaded): slime's 0 is right
-    if getattr(args, "update_weight_mode", None) == "full" and getattr(args, "update_weight_transport", None) == "disk":
+    if (
+        getattr(args, "update_weight_mode", None) == "full"
+        and getattr(args, "update_weight_transport", None) == "disk"
+    ):
         # full disk transport: the driver numbers weight_v<N> dirs itself from its own counter (actor_group.py:59,
         # 184-187), which stays 0 - seeding only the actor would make the two disagree
         return None
     load = getattr(args, "load", None)
-    if not load or not os.path.exists(os.path.join(str(load), "rollout", f"global_dataset_state_dict_{lr}.pt")):
+    if not load or not os.path.exists(
+        os.path.join(str(load), "rollout", f"global_dataset_state_dict_{lr}.pt")
+    ):
         # only a slime resume: a slime save writes the rollout data-source state next to the model.  A converted
         # Megatron base checkpoint loaded with --load (real-weight runs, iteration 0) has none and stays unchanged
         return None
@@ -75,20 +85,24 @@ def seed_version(args, loaded_rollout_id):
     if cur != 0:
         return None  # straw / training recovery already seeded the version
     sid = getattr(args, "start_rollout_id", None)
-    start = int(sid) if sid is not None else lr + 1   # = actor.py:150-151
+    start = int(sid) if sid is not None else lr + 1  # = actor.py:150-151
     if start <= 0:
         return None
     args.update_weight_start_version = start
     if _rank0():
-        print(f"[asrt] resume: weight version continues from {start} (loaded rollout {lr}; first sync publishes "
-              f"{start + 1}; slime left it at 0 for a non-straw resume)", flush=True)
+        print(
+            f"[asrt] resume: weight version continues from {start} (loaded rollout {lr}; first sync publishes "
+            f"{start + 1}; slime left it at 0 for a non-straw resume)",
+            flush=True,
+        )
     return start
 
 
 def install(args=None) -> bool:
     """Patch the actor module's initialize_model_and_optimizer (records the loaded rollout id) and
     create_weight_updater (seeds the version first).  Both are looked up as module globals at call time inside
-    MegatronTrainRayActor.init, which calls the custom Megatron init hook before either."""
+    MegatronTrainRayActor.init, which calls the custom Megatron init hook before either.
+    """
     if not _on():
         return False
     mod = sys.modules.get(_ACTOR)
@@ -105,8 +119,11 @@ def install(args=None) -> bool:
     orig_init = getattr(mod, "initialize_model_and_optimizer", None)
     orig_cwu = getattr(mod, "create_weight_updater", None)
     if orig_init is None or orig_cwu is None:
-        print("[asrt] slime_resume: actor module has no initialize_model_and_optimizer/create_weight_updater; "
-              "version seeding not installed", flush=True)
+        print(
+            "[asrt] slime_resume: actor module has no initialize_model_and_optimizer/create_weight_updater; "
+            "version seeding not installed",
+            flush=True,
+        )
         return False
     seen = {}
 

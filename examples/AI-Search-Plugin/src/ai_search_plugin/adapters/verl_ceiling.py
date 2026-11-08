@@ -39,9 +39,8 @@ import os
 import sys
 import time
 
-from ._hooks import set_kept
-
 from . import staleness_core as SC
+from ._hooks import set_kept
 
 _FLAG = "_asrt_ceiling"
 
@@ -57,14 +56,18 @@ class Ceiling:
     def __init__(self, S):
         self.S = S
         self.active = S is not None
-        self.B = None          # groups per global step (train_batch_size)
-        self.Bs = None         # groups per sample() call (train_batch_size // parameter_sync_step)
+        self.B = None  # groups per global step (train_batch_size)
+        self.Bs = (
+            None  # groups per sample() call (train_batch_size // parameter_sync_step)
+        )
         self.total_steps = None
-        self.owed = 0          # prompts verl asked for that are deferred
-        self.cut = {}          # uid -> info (running cut: evicted by verl's stale path when it finishes)
+        self.owed = 0  # prompts verl asked for that are deferred
+        self.cut = (
+            {}
+        )  # uid -> info (running cut: evicted by verl's stale path when it finishes)
         self.cut_logged = set()
         self.n_cut = self.n_cut_time = self.n_cut_mandatory = self.n_cut_over_budget = 0
-        self.submit_t = {}     # uid -> (time, global_steps at submission)
+        self.submit_t = {}  # uid -> (time, global_steps at submission)
         self.step_s = collections.deque(maxlen=32)
         self._t_last = None
         self.verified = False
@@ -75,8 +78,15 @@ class Ceiling:
 
     @staticmethod
     def _fresh():
-        return {"admitted": 0, "deferred_new": 0, "refused_calls": 0, "released": 0, "dropped": 0, "wait_s": 0.0,
-                "wait_polls": 0}
+        return {
+            "admitted": 0,
+            "deferred_new": 0,
+            "refused_calls": 0,
+            "released": 0,
+            "dropped": 0,
+            "wait_s": 0.0,
+            "wait_polls": 0,
+        }
 
     # ------------------------------------------------------------------ version math
     def lb(self, tag_steps):
@@ -140,29 +150,55 @@ class Ceiling:
         rb = getattr(tr, "replay_buffer", None)
         if getattr(tr, "trainer_mode", "") == "sync":
             self.active = False
-            print("[asrt] verl ceiling: trainer mode sync (on-policy, staleness 0) -> nothing to cap", flush=True)
+            print(
+                "[asrt] verl ceiling: trainer mode sync (on-policy, staleness 0) -> nothing to cap",
+                flush=True,
+            )
             return
-        if rb is None or not any(C.__dict__.get(_FLAG, False) for C in type(rb).__mro__):
-            raise RuntimeError(f"[asrt] staleness ceiling S={self.S} configured but replay buffer "
-                               f"{type(rb).__name__} is not patched (custom sampler?) - refusing to run uncapped")
+        if rb is None or not any(
+            C.__dict__.get(_FLAG, False) for C in type(rb).__mro__
+        ):
+            raise RuntimeError(
+                f"[asrt] staleness ceiling S={self.S} configured but replay buffer "
+                f"{type(rb).__name__} is not patched (custom sampler?) - refusing to run uncapped"
+            )
         try:
             skip = bool(cfg.skip.rollout_tq.enable)
         except Exception:
             skip = False
         if skip:
             self.active = False
-            print("[asrt] verl ceiling: rollout_tq skip enabled -> ceiling off", flush=True)
+            print(
+                "[asrt] verl ceiling: rollout_tq skip enabled -> ceiling off",
+                flush=True,
+            )
             return
         budget = self.budget()
         dl = os.environ.get("ASRT_TICKET_DROP_S", "auto")
-        print(SC.active_line(self.S, f"reader verl(ticket): {type(rb).__name__}, batch {self.B} groups (sample "
-                             f"{self.Bs}), admission <= (S+1) x batch = {(self.S + 1) * self.B} live groups after a sync, "
-                             f"deadline step = start version + {self.S + 1}, EDF sampling + wait at the deadline, cut "
-                             f"ASRT_TICKET_DROP_S={dl} budget {budget} groups; verl threshold "
-                             f"{getattr(rb, 'max_off_policy_threshold', None)} ({getattr(rb, 'max_off_policy_strategy', None)}) "
-                             f"kept underneath"), flush=True)
-        SC.log_admit({"event": "ceiling_active", "t": time.time(), "S": self.S, "readers": {"verl(ticket)": (self.S + 1) * self.B},
-                      "batch": self.B, "budget": budget, "drop_s": dl, "framework": "verl"})
+        print(
+            SC.active_line(
+                self.S,
+                f"reader verl(ticket): {type(rb).__name__}, batch {self.B} groups (sample "
+                f"{self.Bs}), admission <= (S+1) x batch = {(self.S + 1) * self.B} live groups after a sync, "
+                f"deadline step = start version + {self.S + 1}, EDF sampling + wait at the deadline, cut "
+                f"ASRT_TICKET_DROP_S={dl} budget {budget} groups; verl threshold "
+                f"{getattr(rb, 'max_off_policy_threshold', None)} ({getattr(rb, 'max_off_policy_strategy', None)}) "
+                f"kept underneath",
+            ),
+            flush=True,
+        )
+        SC.log_admit(
+            {
+                "event": "ceiling_active",
+                "t": time.time(),
+                "S": self.S,
+                "readers": {"verl(ticket)": (self.S + 1) * self.B},
+                "batch": self.B,
+                "budget": budget,
+                "drop_s": dl,
+                "framework": "verl",
+            }
+        )
 
     def budget(self):
         return SC.cut_budget((self.total_steps or 0) * (self.B or 0))
@@ -205,22 +241,38 @@ class Ceiling:
             self.n_cut_mandatory += 1
             over = self.n_cut > self.budget()
             self.n_cut_over_budget += over
-        rec = {"event": "verl_cut", "t": time.time(), "step": int(s), "uid": uid, "reason": reason, "over_budget": over,
-               "cut_total": self.n_cut, **info}
-        print(f"[asrt] ticket cut: step {s} group {uid} ({reason}, age {info.get('age_steps')} steps / "
-              f"{info.get('age_s')} s, start version {info.get('start_version')}, deadline step {info.get('deadline')}); "
-              f"cut {self.n_cut} so far, budget {self.budget()} (compare: verl untrained in the same window)", flush=True)
+        rec = {
+            "event": "verl_cut",
+            "t": time.time(),
+            "step": int(s),
+            "uid": uid,
+            "reason": reason,
+            "over_budget": over,
+            "cut_total": self.n_cut,
+            **info,
+        }
+        print(
+            f"[asrt] ticket cut: step {s} group {uid} ({reason}, age {info.get('age_steps')} steps / "
+            f"{info.get('age_s')} s, start version {info.get('start_version')}, deadline step {info.get('deadline')}); "
+            f"cut {self.n_cut} so far, budget {self.budget()} (compare: verl untrained in the same window)",
+            flush=True,
+        )
         SC.log_admit(rec)
 
     def _age(self, uid, tag_steps, s):
         t = self.submit_t.get(uid, (None, None))[0]
-        return {"age_steps": int(s) - int(tag_steps), "age_s": round(time.time() - t, 1) if t is not None else None,
-                "enqueue_step": int(tag_steps)}
+        return {
+            "age_steps": int(s) - int(tag_steps),
+            "age_s": round(time.time() - t, 1) if t is not None else None,
+            "enqueue_step": int(tag_steps),
+        }
 
     def overdue_finished(self, rb, s, pid):
         """Finished groups that cannot be trained at step s or later (+ finished groups cut while running)."""
         pgs = rb.prompt_global_steps.get(pid, {})
-        fin = set(rb.finished_keys.get(pid, set())) | set(rb.failure_keys.get(pid, set()))
+        fin = set(rb.finished_keys.get(pid, set())) | set(
+            rb.failure_keys.get(pid, set())
+        )
         tm = self.traj_min(rb.partitions.get(pid, {}))
         out = set()
         for u in fin:
@@ -231,8 +283,16 @@ class Ceiling:
                 v = tm[u]
                 d = SC.deadline(v, self.S)
                 if d < int(s):
-                    self._cut(u, "overdue_finished", s, {"start_version": v, "deadline": d,
-                                                          **self._age(u, pgs.get(u, s), s)})
+                    self._cut(
+                        u,
+                        "overdue_finished",
+                        s,
+                        {
+                            "start_version": v,
+                            "deadline": d,
+                            **self._age(u, pgs.get(u, s), s),
+                        },
+                    )
                     out.add(u)
         return out
 
@@ -240,7 +300,9 @@ class Ceiling:
         """Running groups the batch of step s has to wait for (EDF feasibility), [] if none."""
         pgs = rb.prompt_global_steps.get(pid, {})
         fin = set(rb.finished_keys.get(pid, set()))
-        run = set(rb.pending_keys.get(pid, set())) | set(rb.running_keys.get(pid, set()))
+        run = set(rb.pending_keys.get(pid, set())) | set(
+            rb.running_keys.get(pid, set())
+        )
         tm = self.traj_min(rb.partitions.get(pid, {}))
         dl = self.deadlines({u: pgs[u] for u in (fin | run) if u in pgs}, fin, tm)
         ds = sorted({d for d in dl.values() if d >= int(s)})
@@ -269,8 +331,12 @@ class Ceiling:
             self.step_s.append(now - self._t_last)
         self._t_last = now
         mins = []
-        for tag in (getattr(batch, "tags", None) or []):
-            if isinstance(tag, dict) and not tag.get("is_padding", False) and tag.get("min_global_steps") is not None:
+        for tag in getattr(batch, "tags", None) or []:
+            if (
+                isinstance(tag, dict)
+                and not tag.get("is_padding", False)
+                and tag.get("min_global_steps") is not None
+            ):
                 mins.append(int(tag["min_global_steps"]))
         ws = [SC.worst(s, m) for m in mins]
         mx = max(ws) if ws else None
@@ -281,23 +347,58 @@ class Ceiling:
             self.wait_since = None
         self.tot["wait_s"] += self.cur["wait_s"]
         self.tot["refused"] += self.cur["refused_calls"]
-        rec = {"event": "verl_step", "t": now, "step": int(s), "admitted": self.cur["admitted"],
-               "released": self.cur["released"], "deferred": self.owed, "deferred_new": self.cur["deferred_new"],
-               "refused": self.cur["refused_calls"], "dropped": self.cur["dropped"], "dropped_total": self.n_cut,
-               "dropped_time": self.n_cut_time, "dropped_mandatory": self.n_cut_mandatory,
-               "over_budget": self.n_cut_over_budget, "budget": self.budget(), "wait_s": round(self.cur["wait_s"], 1),
-               "n_traj": len(ws), "worst_max": mx, "worst_mean": round(mean, 4), "over_cap": over, "S": self.S,
-               "admitted_total": self.tot["admitted"], "deferred_total": self.tot["deferred"]}
+        rec = {
+            "event": "verl_step",
+            "t": now,
+            "step": int(s),
+            "admitted": self.cur["admitted"],
+            "released": self.cur["released"],
+            "deferred": self.owed,
+            "deferred_new": self.cur["deferred_new"],
+            "refused": self.cur["refused_calls"],
+            "dropped": self.cur["dropped"],
+            "dropped_total": self.n_cut,
+            "dropped_time": self.n_cut_time,
+            "dropped_mandatory": self.n_cut_mandatory,
+            "over_budget": self.n_cut_over_budget,
+            "budget": self.budget(),
+            "wait_s": round(self.cur["wait_s"], 1),
+            "n_traj": len(ws),
+            "worst_max": mx,
+            "worst_mean": round(mean, 4),
+            "over_cap": over,
+            "S": self.S,
+            "admitted_total": self.tot["admitted"],
+            "deferred_total": self.tot["deferred"],
+        }
         SC.log_admit(rec)
-        print(SC.staleness_line(int(s), mean, mx if mx is not None else -1, self.S, over / max(1, len(ws)),
-                                f" (n {len(ws)}, verl step {s}; admitted {rec['admitted']} deferred {self.owed} "
-                                f"dropped {self.cur['dropped']} (total {self.n_cut}) wait {rec['wait_s']} s)"), flush=True)
+        print(
+            SC.staleness_line(
+                int(s),
+                mean,
+                mx if mx is not None else -1,
+                self.S,
+                over / max(1, len(ws)),
+                f" (n {len(ws)}, verl step {s}; admitted {rec['admitted']} deferred {self.owed} "
+                f"dropped {self.cur['dropped']} (total {self.n_cut}) wait {rec['wait_s']} s)",
+            ),
+            flush=True,
+        )
         if over:
-            print(f"[asrt] verl ceiling BREACH: step {s} {over} trajectories above S={self.S}", flush=True)
+            print(
+                f"[asrt] verl ceiling BREACH: step {s} {over} trajectories above S={self.S}",
+                flush=True,
+            )
         if isinstance(metrics, dict):
-            metrics.update({"asrt_ceiling/worst_max": float(mx if mx is not None else -1), "asrt_ceiling/over_cap": float(over),
-                            "asrt_ceiling/dropped_total": float(self.n_cut), "asrt_ceiling/deferred": float(self.owed),
-                            "asrt_ceiling/wait_s": float(self.cur["wait_s"])})
+            metrics.update(
+                {
+                    "asrt_ceiling/worst_max": float(mx if mx is not None else -1),
+                    "asrt_ceiling/over_cap": float(over),
+                    "asrt_ceiling/dropped_total": float(self.n_cut),
+                    "asrt_ceiling/deferred": float(self.owed),
+                    "asrt_ceiling/wait_s": float(self.cur["wait_s"]),
+                }
+            )
         self.cur = self._fresh()
 
 
@@ -318,7 +419,10 @@ def patch_replay_buffer(C) -> bool:
     """Patch an async ReplayBuffer class (own __dict__ flag: subclasses inherit attributes, see verl_offpol)."""
     if C.__dict__.get(_FLAG, False):
         return False
-    if "_has_enough_samples" not in C.__dict__ and "wait_for_sampleable" not in C.__dict__:
+    if (
+        "_has_enough_samples" not in C.__dict__
+        and "wait_for_sampleable" not in C.__dict__
+    ):
         return False  # the sync ReplayBuffer: on-policy, nothing to cap
     o_reasons = C._terminal_eviction_reasons
     o_enough = C._has_enough_samples
@@ -335,14 +439,22 @@ def patch_replay_buffer(C) -> bool:
             return r
         return (set(r[0]) | extra,) + tuple(r[1:])
 
-    def _has_enough_samples(self, global_steps, partition_id, batch_size, sampleable_keys, _o=o_enough):
+    def _has_enough_samples(
+        self, global_steps, partition_id, batch_size, sampleable_keys, _o=o_enough
+    ):
         ok = _o(self, global_steps, partition_id, batch_size, sampleable_keys)
         c = _C[0]
         if c is None or not c.active or partition_id != "train" or c.B is None:
             return ok
         tr = getattr(getattr(self, "refill_fn", None), "__self__", None)
-        if c.owed > 0 and tr is not None:  # deferred prompts: release while there is room (cuts free slots)
-            live = sum(1 for u in self.prompt_global_steps.get(partition_id, {}) if u not in c.cut)
+        if (
+            c.owed > 0 and tr is not None
+        ):  # deferred prompts: release while there is room (cuts free slots)
+            live = sum(
+                1
+                for u in self.prompt_global_steps.get(partition_id, {})
+                if u not in c.cut
+            )
             c.submit(tr, 0, _ORIG["add_prompts"], live=live)
         blk, dl = c.blocking(self, global_steps, partition_id)
         if blk:
@@ -350,13 +462,23 @@ def patch_replay_buffer(C) -> bool:
             budget = c.budget()
             pgs = self.prompt_global_steps.get(partition_id, {})
             if dsec is not None:
-                for u in sorted(blk, key=lambda u: c.submit_t.get(u, (time.time(),))[0]):
+                for u in sorted(
+                    blk, key=lambda u: c.submit_t.get(u, (time.time(),))[0]
+                ):
                     t0 = c.submit_t.get(u, (None,))[0]
                     if t0 is None or time.time() - t0 <= dsec or c.n_cut_time >= budget:
                         continue
-                    c._cut(u, "deadline_s", global_steps, {"start_version": c.lb(pgs.get(u, global_steps)),
-                                                           "deadline": dl.get(u), "drop_s": round(dsec, 1),
-                                                           **c._age(u, pgs.get(u, global_steps), global_steps)})
+                    c._cut(
+                        u,
+                        "deadline_s",
+                        global_steps,
+                        {
+                            "start_version": c.lb(pgs.get(u, global_steps)),
+                            "deadline": dl.get(u),
+                            "drop_s": round(dsec, 1),
+                            **c._age(u, pgs.get(u, global_steps), global_steps),
+                        },
+                    )
                 blk, _ = c.blocking(self, global_steps, partition_id)
         if not blk and c.wait_since is not None:
             c.cur["wait_s"] += time.time() - c.wait_since
@@ -366,13 +488,18 @@ def patch_replay_buffer(C) -> bool:
                 c.wait_since = time.time()
             c.cur["wait_polls"] += 1
             if c.cur["wait_polls"] in (1, 30) or c.cur["wait_polls"] % 150 == 0:
-                print(f"[asrt] verl ceiling: step {global_steps} waits: needs more finished groups among {len(blk)} "
-                      f"running ones due by step {max(dl.get(u, 0) for u in blk)} (e.g. {sorted(blk)[:2]}), finished "
-                      f"sampleable {len(sampleable_keys)}", flush=True)
+                print(
+                    f"[asrt] verl ceiling: step {global_steps} waits: needs more finished groups among {len(blk)} "
+                    f"running ones due by step {max(dl.get(u, 0) for u in blk)} (e.g. {sorted(blk)[:2]}), finished "
+                    f"sampleable {len(sampleable_keys)}",
+                    flush=True,
+                )
             return False
         return ok
 
-    def _select_prompt_uids(self, partition_id, sampleable_keys, batch_size, _o=o_select):
+    def _select_prompt_uids(
+        self, partition_id, sampleable_keys, batch_size, _o=o_select
+    ):
         c = _C[0]
         if c is None or not c.active or partition_id != "train" or c.B is None:
             return _o(self, partition_id, sampleable_keys, batch_size)
@@ -383,6 +510,7 @@ def patch_replay_buffer(C) -> bool:
         def key(u):
             v = tm.get(u, c.lb(pgs.get(u, 0)))
             return (SC.deadline(v, c.S), pgs.get(u, 0))
+
         ordered = sorted(sampleable_keys, key=key)
         return ordered[:batch_size], part, pgs
 
@@ -392,7 +520,7 @@ def patch_replay_buffer(C) -> bool:
         if c is None or not c.active or partition_id != "train" or c.B is None:
             return out
         try:
-            batch, metrics = (out if isinstance(out, tuple) else (out, None))
+            batch, metrics = out if isinstance(out, tuple) else (out, None)
             c.step_done(global_steps, batch, metrics)
         except Exception as e:  # never break training for a log line
             print(f"[asrt] verl ceiling step log failed: {e!r}", flush=True)
@@ -455,7 +583,9 @@ def install(S=None):
 
     S = S if S is not None else _S()
     if S is None:
-        print("[asrt] verl ceiling: ASRT_MAX_STALENESS=off -> not installed", flush=True)
+        print(
+            "[asrt] verl ceiling: ASRT_MAX_STALENESS=off -> not installed", flush=True
+        )
         return False
     if _C[0] is None:
         _C[0] = Ceiling(S)
@@ -463,9 +593,16 @@ def install(S=None):
     def on_rb(mod):
         n = 0
         for v in list(vars(mod).values()):
-            if isinstance(v, type) and v.__module__ == mod.__name__ and hasattr(v, "_terminal_eviction_reasons"):
+            if (
+                isinstance(v, type)
+                and v.__module__ == mod.__name__
+                and hasattr(v, "_terminal_eviction_reasons")
+            ):
                 n += bool(patch_replay_buffer(v))
-        print(f"[asrt] verl ceiling: patched {n} async replay-buffer classes, S={S} (pid {os.getpid()})", flush=True)
+        print(
+            f"[asrt] verl ceiling: patched {n} async replay-buffer classes, S={S} (pid {os.getpid()})",
+            flush=True,
+        )
 
     def on_tb(mod):
         patch_trainer(mod.PPOTrainer)

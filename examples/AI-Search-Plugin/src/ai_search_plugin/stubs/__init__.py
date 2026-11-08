@@ -10,4 +10,6 @@ class NotPortedError(NotImplementedError):
 
 
 def not_ported(name: str):
-    raise NotPortedError(f"ai_search_plugin component {name!r} is a stub (not ported yet); see docs/IMPLEMENTATION-NOTES.md")
+    raise NotPortedError(
+        f"ai_search_plugin component {name!r} is a stub (not ported yet); see docs/IMPLEMENTATION-NOTES.md"
+    )

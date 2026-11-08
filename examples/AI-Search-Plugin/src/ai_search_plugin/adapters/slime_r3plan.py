@@ -49,10 +49,16 @@ class SlimeReplaySource:
         return os.environ.get("ROUTING_REPLAY_STAGE")
 
     def active(self) -> bool:
-        return os.environ.get("ENABLE_ROUTING_REPLAY", "0") == "1" and self.stage() in core.REPLAY_STAGES
+        return (
+            os.environ.get("ENABLE_ROUTING_REPLAY", "0") == "1"
+            and self.stage() in core.REPLAY_STAGES
+        )
 
     def _replays(self):
-        return [getattr(getattr(layer, "router", None), "routing_replay", None) for layer in self.layers]
+        return [
+            getattr(getattr(layer, "router", None), "routing_replay", None)
+            for layer in self.layers
+        ]
 
     def lists(self):
         out = []
@@ -61,12 +67,20 @@ class SlimeReplaySource:
             cfg = getattr(layer, "config", None)
             if getattr(cfg, "moe_token_dispatcher_type", "alltoall") != "alltoall":
                 return []
-            if rr is None or not rr.top_indices_list or any(
-                    hasattr(t, "materialize_for_routing_replay") for t in rr.top_indices_list):
+            if (
+                rr is None
+                or not rr.top_indices_list
+                or any(
+                    hasattr(t, "materialize_for_routing_replay")
+                    for t in rr.top_indices_list
+                )
+            ):
                 return []
             ids = list(rr.top_indices_list)
             remap = _placement_remap(rr)
-            if remap is not None:     # expert placement maps logical -> physical ids at pop time: do the same
+            if (
+                remap is not None
+            ):  # expert placement maps logical -> physical ids at pop time: do the same
                 ids = [remap(t) for t in ids]
             out.append((layer.token_dispatcher, ids))
             rrs.append(rr)
@@ -95,7 +109,11 @@ def _placement_remap(rr):
         return None
     import torch
 
-    dev = torch.device("cuda", torch.cuda.current_device()) if torch.cuda.is_available() else torch.device("cpu")
+    dev = (
+        torch.device("cuda", torch.cuda.current_device())
+        if torch.cuda.is_available()
+        else torch.device("cpu")
+    )
     return lambda t: mgr.map_routed_ids(lid, t.to(dev, non_blocking=True))
 
 
@@ -146,9 +164,24 @@ def _on_clear_all():
         except Exception:
             rank0 = True
         if rank0:
-            keep = ("steps", "builds", "build_skipped", "planned_calls", "fallback_calls", "verified_calls",
-                    "verify_fail", "mismatch", "build_ms_host", "disabled", "disabled_why", "layout", "why")
-            print(f"[asrt] r3plan step {n}: {({k: s.get(k) for k in keep})}", flush=True)
+            keep = (
+                "steps",
+                "builds",
+                "build_skipped",
+                "planned_calls",
+                "fallback_calls",
+                "verified_calls",
+                "verify_fail",
+                "mismatch",
+                "build_ms_host",
+                "disabled",
+                "disabled_why",
+                "layout",
+                "why",
+            )
+            print(
+                f"[asrt] r3plan step {n}: {({k: s.get(k) for k in keep})}", flush=True
+            )
     return s
 
 
@@ -174,7 +207,10 @@ def install(args=None) -> dict:
     if _state["installed"]:
         return {"installed": True}
     if not mp.install():
-        return {"installed": False, "why": "Megatron alltoall dispatcher not importable"}
+        return {
+            "installed": False,
+            "why": "Megatron alltoall dispatcher not importable",
+        }
     _register_layers()
     try:
         from slime.utils.routing_replay import RoutingReplay
@@ -184,20 +220,27 @@ def install(args=None) -> dict:
         return {"installed": False, "why": "slime.utils.routing_replay not importable"}
     mp.set_source(SlimeReplaySource())
     if args is not None:
-        mp.set_layout(getattr(args, "pipeline_model_parallel_size", 1),
-                      getattr(args, "virtual_pipeline_model_parallel_size", None))
+        mp.set_layout(
+            getattr(args, "pipeline_model_parallel_size", 1),
+            getattr(args, "virtual_pipeline_model_parallel_size", None),
+        )
     _state["installed"] = True
     return {"installed": True, "layout": mp.snapshot()["layout"]}
 
 
 def megatron_init(args=None, *rest, **kwargs):
     """slime ``--custom-megatron-init-path`` target (or an entry of ASRT_CHAIN_MEGATRON_INIT).  Acts only with R3
-    (``--use-rollout-routing-replay``) and the ``alltoall`` dispatcher; otherwise reports SKIP and changes nothing."""
+    (``--use-rollout-routing-replay``) and the ``alltoall`` dispatcher; otherwise reports SKIP and changes nothing.
+    """
     if os.environ.get("ASRT_R3PLAN", "1") in ("0", "off"):
         return {"r3plan": "SKIP: ASRT_R3PLAN=0"}
     if args is not None and not getattr(args, "use_rollout_routing_replay", False):
         return {"r3plan": "SKIP: R3 off (--use-rollout-routing-replay not set)"}
-    disp = getattr(args, "moe_token_dispatcher_type", "alltoall") if args is not None else "alltoall"
+    disp = (
+        getattr(args, "moe_token_dispatcher_type", "alltoall")
+        if args is not None
+        else "alltoall"
+    )
     if disp != "alltoall":
         return {"r3plan": f"SKIP: dispatcher {disp} (only alltoall is planned)"}
     r = install(args)

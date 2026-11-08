@@ -23,14 +23,18 @@ class _OtherLoader(importlib.abc.Loader):
         self.inner = inner
 
     def create_module(self, spec):
-        return self.inner.create_module(spec) if hasattr(self.inner, "create_module") else None
+        return (
+            self.inner.create_module(spec)
+            if hasattr(self.inner, "create_module")
+            else None
+        )
 
     def exec_module(self, module):
         self.inner.exec_module(module)
         fired.append("other")
 
 
-class OtherFinder(importlib.abc.MetaPathFinder):   # = such a shim's finder
+class OtherFinder(importlib.abc.MetaPathFinder):  # = such a shim's finder
     TARGET = "asrt_reentry_target"
 
     def find_spec(self, name, path, target=None):
@@ -49,7 +53,9 @@ class OtherFinder(importlib.abc.MetaPathFinder):   # = such a shim's finder
 
 def test_no_recursion_both_hooks_fire():
     _hooks.when_imported("asrt_reentry_target", lambda m: fired.append("asrt"))
-    sys.meta_path.insert(0, OtherFinder())       # in front of asrt's finder, like the real launch order
+    sys.meta_path.insert(
+        0, OtherFinder()
+    )  # in front of asrt's finder, like the real launch order
     try:
         import asrt_reentry_target  # noqa: F401
     except RecursionError:
@@ -68,9 +74,10 @@ def test_asrt_first_then_other():
     i = next(i for i, f in enumerate(sys.meta_path) if isinstance(f, _hooks._Finder))
     other = next(f for f in sys.meta_path if isinstance(f, OtherFinder))
     sys.meta_path.remove(other)
-    sys.meta_path.insert(i + 1, other)          # asrt first, other right after it
-    importlib.invalidate_caches()               # the file was written after the directory listing was cached
+    sys.meta_path.insert(i + 1, other)  # asrt first, other right after it
+    importlib.invalidate_caches()  # the file was written after the directory listing was cached
     import asrt_reentry_target2  # noqa: F401
+
     assert sorted(fired) == ["asrt", "other"], fired
     print("asrt finder first: no recursion, both hooks once")
 

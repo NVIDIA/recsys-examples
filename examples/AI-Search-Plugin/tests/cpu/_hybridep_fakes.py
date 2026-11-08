@@ -7,18 +7,39 @@ import types
 
 from ai_search_plugin.adapters import megatron_hybridep as mh
 
-ALL_FIELDS = mh.DISPATCHER_FIELDS + mh.OVERLAP_FIELDS + ("moe_hybridep_routing_map_mode",)
-MODULES = ("megatron", "megatron.core", "megatron.core.package_info", "megatron.core.transformer",
-           "megatron.core.transformer.moe", mh._FUSED_A2A, mh._MOE_LAYER, mh._TCONFIG, "megatron.core.tensor_parallel",
-           "deep_ep")
+ALL_FIELDS = (
+    mh.DISPATCHER_FIELDS + mh.OVERLAP_FIELDS + ("moe_hybridep_routing_map_mode",)
+)
+MODULES = (
+    "megatron",
+    "megatron.core",
+    "megatron.core.package_info",
+    "megatron.core.transformer",
+    "megatron.core.transformer.moe",
+    mh._FUSED_A2A,
+    mh._MOE_LAYER,
+    mh._TCONFIG,
+    "megatron.core.tensor_parallel",
+    "deep_ep",
+)
 
 
 class FakeHybridEPBufferAPI:
     """Signature-only HybridEPBuffer (the validated parameter names)."""
 
-    def dispatch_with_permute(self, hidden, routing_map=None, probs=None, scaling_factor=None,
-                              num_of_experts_per_rank=None, pad_multiple=None, num_permuted_tokens=None,
-                              non_blocking=False, num_of_tokens_per_rank=None, handle=None):
+    def dispatch_with_permute(
+        self,
+        hidden,
+        routing_map=None,
+        probs=None,
+        scaling_factor=None,
+        num_of_experts_per_rank=None,
+        pad_multiple=None,
+        num_permuted_tokens=None,
+        non_blocking=False,
+        num_of_tokens_per_rank=None,
+        handle=None,
+    ):
         raise NotImplementedError
 
     def combine_with_unpermute(self, hidden, probs=None, handle=None):
@@ -54,8 +75,15 @@ def hide_megatron(monkeypatch):
         monkeypatch.setitem(sys.modules, name, None)
 
 
-def install_fake_megatron(monkeypatch, version=(0, 19, 0), have_hybridep=True, fields=ALL_FIELDS,
-                          buffer_cls=FakeHybridEPBufferAPI, moe_layer_cls=None, buffer=None):
+def install_fake_megatron(
+    monkeypatch,
+    version=(0, 19, 0),
+    have_hybridep=True,
+    fields=ALL_FIELDS,
+    buffer_cls=FakeHybridEPBufferAPI,
+    moe_layer_cls=None,
+    buffer=None,
+):
     """Register fake modules in sys.modules; returns a namespace with the pieces."""
     ns = types.SimpleNamespace()
 
@@ -64,7 +92,12 @@ def install_fake_megatron(monkeypatch, version=(0, 19, 0), have_hybridep=True, f
         monkeypatch.setitem(sys.modules, name, m)
         return m
 
-    for name in ("megatron", "megatron.core", "megatron.core.transformer", "megatron.core.transformer.moe"):
+    for name in (
+        "megatron",
+        "megatron.core",
+        "megatron.core.transformer",
+        "megatron.core.transformer.moe",
+    ):
         mod(name)
     pi = mod("megatron.core.package_info")
     pi.MAJOR, pi.MINOR, pi.PATCH = version
@@ -81,7 +114,9 @@ def install_fake_megatron(monkeypatch, version=(0, 19, 0), have_hybridep=True, f
     ns.fused_a2a = fa
 
     tc = mod(mh._TCONFIG)
-    tc.TransformerConfig = dataclasses.make_dataclass("TransformerConfig", [(f, object, None) for f in fields])
+    tc.TransformerConfig = dataclasses.make_dataclass(
+        "TransformerConfig", [(f, object, None) for f in fields]
+    )
 
     de = mod("deep_ep")
     if buffer_cls is not None:
@@ -114,7 +149,13 @@ def cuda_env(tmp_path, **extra):
 
 
 def moe_args(**kw):
-    a = dict(num_experts=8, expert_tensor_parallel_size=1, moe_token_dispatcher_type="flex",
-             moe_flex_dispatcher_backend="hybridep", moe_expert_capacity_factor=None, fp8=None)
+    a = dict(
+        num_experts=8,
+        expert_tensor_parallel_size=1,
+        moe_token_dispatcher_type="flex",
+        moe_flex_dispatcher_backend="hybridep",
+        moe_expert_capacity_factor=None,
+        fp8=None,
+    )
     a.update(kw)
     return types.SimpleNamespace(**a)

@@ -10,7 +10,9 @@ import types
 
 import torch
 
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "src"))
+sys.path.insert(
+    0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "src")
+)
 T = types.SimpleNamespace(E=8)  # toy MoE size used by the fake engine below
 
 REAL = os.environ.get("VERL_REAL") == "1"
@@ -38,13 +40,19 @@ def fake_verl():
         return [sorted(p) for p in parts]
 
     def calculate_workload(x):
-        return 24576 * x + x ** 2
-    defs["verl.utils.seqlen_balancing"] = dict(get_seqlen_balanced_partitions=kk, calculate_workload=calculate_workload)
-    defs["verl.trainer.ppo.ray_trainer"] = dict(get_seqlen_balanced_partitions=kk, calculate_workload=calculate_workload)
+        return 24576 * x + x**2
+
+    defs["verl.utils.seqlen_balancing"] = dict(
+        get_seqlen_balanced_partitions=kk, calculate_workload=calculate_workload
+    )
+    defs["verl.trainer.ppo.ray_trainer"] = dict(
+        get_seqlen_balanced_partitions=kk, calculate_workload=calculate_workload
+    )
 
     class ToolResponse:
         def __init__(self, text=None, image=None, video=None):
             self.text, self.image, self.video = text, image, video
+
     defs["verl.tools.schemas"] = dict(ToolResponse=ToolResponse)
 
     calls = []
@@ -55,7 +63,10 @@ def fake_verl():
             await asyncio.sleep(0.01)
             q = json.loads(tool_call.arguments).get("query", "")
             return ToolResponse(text=f"docs:{q.lower()}"), 0.0, {"n": 1}
-    defs["verl.experimental.agent_loop.tool_agent_loop"] = dict(ToolAgentLoop=ToolAgentLoop)
+
+    defs["verl.experimental.agent_loop.tool_agent_loop"] = dict(
+        ToolAgentLoop=ToolAgentLoop
+    )
 
     class RouterReplay:
         router_instances = []
@@ -69,6 +80,7 @@ def fake_verl():
 
         def record_indices(self, topk_indices):
             self.recorded = topk_indices
+
     defs["verl.utils.megatron.router_replay_patch"] = dict(RouterReplay=RouterReplay)
 
     class BaseEngine:
@@ -81,7 +93,9 @@ def fake_verl():
             self.module, self.optimizer = [model], opt
             self.tf_config = types.SimpleNamespace(num_layers=2, num_moe_experts=T.E)
             self.engine_config = types.SimpleNamespace(
-                forward_only=False, router_replay=types.SimpleNamespace(mode="R3" if r3 else "disabled"))
+                forward_only=False,
+                router_replay=types.SimpleNamespace(mode="R3" if r3 else "disabled"),
+            )
 
         def initialize(self):
             pass
@@ -90,14 +104,29 @@ def fake_verl():
             m = self.module[0]
             out = []
             for li, layer in enumerate(m.layers):
-                out.append((f"model.layers.{li}.mlp.gate.weight", layer.mlp.router.weight.detach().clone()))
+                out.append(
+                    (
+                        f"model.layers.{li}.mlp.gate.weight",
+                        layer.mlp.router.weight.detach().clone(),
+                    )
+                )
                 for s, ex in enumerate(layer.mlp.experts.local_experts):
-                    out.append((f"model.layers.{li}.mlp.experts.{s}.up_proj.weight", ex.fc1.detach().clone()))
+                    out.append(
+                        (
+                            f"model.layers.{li}.mlp.experts.{s}.up_proj.weight",
+                            ex.fc1.detach().clone(),
+                        )
+                    )
             return iter(out), None
 
         def save_checkpoint(self, *a, **k):
-            self.saved = {n: p.detach().clone() for n, p in self.module[0].named_parameters()}
-    defs["verl.workers.engine.megatron.transformer_impl"] = dict(MegatronEngine=MegatronEngine)
+            self.saved = {
+                n: p.detach().clone() for n, p in self.module[0].named_parameters()
+            }
+
+    defs["verl.workers.engine.megatron.transformer_impl"] = dict(
+        MegatronEngine=MegatronEngine
+    )
 
     class TrainingWorker:
         def __init__(self, engine):
@@ -105,6 +134,7 @@ def fake_verl():
 
         def train_mini_batch(self, data):
             return self.engine.train_batch(data, None)
+
     defs["verl.workers.engine_workers"] = dict(TrainingWorker=TrainingWorker)
 
     class Finder(importlib.abc.MetaPathFinder, importlib.abc.Loader):
@@ -119,19 +149,26 @@ def fake_verl():
         def exec_module(self, module):
             module.__path__ = []
             module.__dict__.update(defs.get(module.__name__, {}))
+
     sys.meta_path.append(Finder())
     return calls, RouterReplay
 
 
 def test_balance():
     from ai_search_plugin.adapters import verl as V
+
     V.install_balanced_partitions(mode="best")
     import importlib
+
     sb = importlib.import_module("verl.utils.seqlen_balancing")
-    assert getattr(sb.get_seqlen_balanced_partitions, "__asrt_patched__", False), "partitioner not patched"
+    assert getattr(
+        sb.get_seqlen_balanced_partitions, "__asrt_patched__", False
+    ), "partitioner not patched"
     if not REAL:
         rt = importlib.import_module("verl.trainer.ppo.ray_trainer")
-        assert rt.get_seqlen_balanced_partitions is sb.get_seqlen_balanced_partitions, "importer not patched"
+        assert (
+            rt.get_seqlen_balanced_partitions is sb.get_seqlen_balanced_partitions
+        ), "importer not patched"
     g = torch.Generator().manual_seed(0)
     lens = (torch.randint(200, 30000, (64,), generator=g)).tolist()
     w = [24576 * x + x * x for x in lens]
@@ -145,9 +182,11 @@ def test_balance():
 
 def test_toolcache(calls):
     from ai_search_plugin.adapters import verl as V
+
     os.environ["ASRT_VERL_TOOLCACHE_TOOLS"] = "search"
     V.install_tool_cache()
     import importlib
+
     tal = importlib.import_module("verl.experimental.agent_loop.tool_agent_loop")
     loop = tal.ToolAgentLoop()
 
@@ -155,14 +194,24 @@ def test_toolcache(calls):
         return types.SimpleNamespace(name=name, arguments=json.dumps({"query": q}))
 
     async def main():
-        rs = await asyncio.gather(*[loop._call_tool(tc("search", "Paris  France"), {}, None) for _ in range(8)],
-                                  loop._call_tool(tc("search", "paris france"), {}, None),
-                                  loop._call_tool(tc("search", "berlin"), {}, None),
-                                  loop._call_tool(tc("code", "x"), {}, None))
+        rs = await asyncio.gather(
+            *[
+                loop._call_tool(tc("search", "Paris  France"), {}, None)
+                for _ in range(8)
+            ],
+            loop._call_tool(tc("search", "paris france"), {}, None),
+            loop._call_tool(tc("search", "berlin"), {}, None),
+            loop._call_tool(tc("code", "x"), {}, None),
+        )
         again = await loop._call_tool(tc("search", "PARIS FRANCE"), {}, None)
         return rs, again
+
     rs, again = asyncio.run(main())
-    assert rs[0][0].text == "docs:paris  france" and rs[8][0].text == rs[0][0].text and again[0].text == rs[0][0].text
+    assert (
+        rs[0][0].text == "docs:paris  france"
+        and rs[8][0].text == rs[0][0].text
+        and again[0].text == rs[0][0].text
+    )
     assert rs[0][2] == {"n": 1}
     assert calls.count("search") == 2 and calls.count("code") == 1, calls
     st = V.stats()["toolcache"]
@@ -170,9 +219,9 @@ def test_toolcache(calls):
     print("toolcache OK", st)
 
 
-
 def test_full_expand():
     from ai_search_plugin.adapters import verl as V
+
     os.environ.pop("ASRT_VERL_DROP", None)
     assert V.expand("full") == V.FULL
     assert V.expand("profile,full,route") == V.FULL
@@ -186,9 +235,13 @@ def test_full_expand():
 def test_rlogits_guard():
     """response_logits only where answers are a small part of the rows (else verl's own forward)."""
     import types
+
     import ai_search_plugin
-    rl = types.ModuleType("ai_search_plugin.response_logits"); rl.__path__ = []
-    ad = types.ModuleType("ai_search_plugin.response_logits.adapters"); ad.__path__ = []
+
+    rl = types.ModuleType("ai_search_plugin.response_logits")
+    rl.__path__ = []
+    ad = types.ModuleType("ai_search_plugin.response_logits.adapters")
+    ad.__path__ = []
     rv = types.ModuleType("ai_search_plugin.response_logits.adapters.verl")
     rl.adapters, ad.verl = ad, rv
     calls = []
@@ -197,27 +250,49 @@ def test_rlogits_guard():
         def w(*a, **k):
             calls.append("compact")
             return fn(*a, **k)
+
         return w
+
     rv._wrap_forward_fn = _wrap_forward_fn
-    names = ("ai_search_plugin.response_logits", "ai_search_plugin.response_logits.adapters",
-             "ai_search_plugin.response_logits.adapters.verl")
+    names = (
+        "ai_search_plugin.response_logits",
+        "ai_search_plugin.response_logits.adapters",
+        "ai_search_plugin.response_logits.adapters.verl",
+    )
     saved = {k: sys.modules.get(k) for k in names}
     saved_attr = getattr(ai_search_plugin, "response_logits", None)
     sys.modules.update(dict(zip(names, (rl, ad, rv))))
     ai_search_plugin.response_logits = rl
     try:
         from ai_search_plugin.adapters import verl as V
+
         assert V._guard_response_logits()
 
         def fwd(model, input_ids, logits_processor=None, logits_processor_args=None):
             calls.append("stock")
 
         def nt(lens):
-            return torch.nested.nested_tensor_from_jagged(torch.ones(sum(lens)), offsets=torch.tensor([0] + list(torch.tensor(lens).cumsum(0))))
+            return torch.nested.nested_tensor_from_jagged(
+                torch.ones(sum(lens)),
+                offsets=torch.tensor([0] + list(torch.tensor(lens).cumsum(0))),
+            )
+
         g = rv._wrap_forward_fn(fwd)
-        g(None, nt([100, 100]), logits_processor=1, logits_processor_args={"loss_mask": nt([10, 20])})   # 15% -> compact
-        g(None, nt([100, 100]), logits_processor=1, logits_processor_args={"loss_mask": nt([90, 95])})   # 92% -> stock
-        assert calls == ["compact", "stock", "stock"] and rv._wrap_forward_fn(fwd) is g, calls
+        g(
+            None,
+            nt([100, 100]),
+            logits_processor=1,
+            logits_processor_args={"loss_mask": nt([10, 20])},
+        )  # 15% -> compact
+        g(
+            None,
+            nt([100, 100]),
+            logits_processor=1,
+            logits_processor_args={"loss_mask": nt([90, 95])},
+        )  # 92% -> stock
+        assert (
+            calls == ["compact", "stock", "stock"] and rv._wrap_forward_fn(fwd) is g
+        ), calls
     finally:
         for k, v in saved.items():
             if v is None:

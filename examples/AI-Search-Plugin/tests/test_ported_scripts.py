@@ -17,8 +17,22 @@ NAMES = sorted(f for f in os.listdir(SCRIPTS) if f.endswith(".py"))
 def test_script(name, tmp_path):
     env = {k: v for k, v in os.environ.items() if not k.startswith("ASRT_")}
     env["PYTHONPATH"] = os.pathsep.join([SRC, SCRIPTS])
-    r = subprocess.run([sys.executable, os.path.join(SCRIPTS, name)], cwd=str(tmp_path), env=env,
-                       capture_output=True, text=True, timeout=900)
-    if r.returncode == 77:   # the script needs an optional external source (e.g. slime's fully_async_rollout.py)
-        pytest.skip(r.stdout.strip().splitlines()[-1] if r.stdout.strip() else "skipped by the script")
-    assert r.returncode == 0, f"{name} exit {r.returncode}\n--- stdout\n{r.stdout[-3000:]}\n--- stderr\n{r.stderr[-3000:]}"
+    r = subprocess.run(
+        [sys.executable, os.path.join(SCRIPTS, name)],
+        cwd=str(tmp_path),
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=900,
+    )
+    if (
+        r.returncode == 77
+    ):  # the script needs an optional external source (e.g. slime's fully_async_rollout.py)
+        pytest.skip(
+            r.stdout.strip().splitlines()[-1]
+            if r.stdout.strip()
+            else "skipped by the script"
+        )
+    assert (
+        r.returncode == 0
+    ), f"{name} exit {r.returncode}\n--- stdout\n{r.stdout[-3000:]}\n--- stderr\n{r.stderr[-3000:]}"

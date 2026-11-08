@@ -37,12 +37,14 @@ def install_verl():
         return []
     from ..adapters._hooks import when_imported
     from .adapters import verl_driver
+
     out = []
     if verl_driver.install():
         out.append("driver:" + verl_driver.TRAINER_MODULE)
 
     def on_engine(_mod):
         from .adapters import verl as V
+
         rep = V.install()
         print(f"[asrt] prefix_tree verl engine pid={os.getpid()} {rep}", flush=True)
 
@@ -56,6 +58,7 @@ def install(framework="slime"):
     verl -> the verl hooks (same as importing verl_plugin)."""
     if framework == "slime":
         from .adapters import slime
+
         return slime.megatron_init()
     if framework == "verl":
         return install_verl()

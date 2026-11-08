@@ -50,7 +50,7 @@ def _here():
 
 
 def install_sglhooks(extra=(), defaults=True) -> set:
-    """defaults=False: when ASRT_SGL_HOOKS is unset, install only `extra` (not DEFAULT_HOOKS). 
+    """defaults=False: when ASRT_SGL_HOOKS is unset, install only `extra` (not DEFAULT_HOOKS).
     kvfresh needs only its own engine hook; pulling in fastload/nosync re-enabled what ASRT_VERL_DROP=sglhooks had
     turned off on purpose (e.g. a model where fastload was seen to drift)."""
     env = os.environ.get("ASRT_SGL_HOOKS")
@@ -60,32 +60,51 @@ def install_sglhooks(extra=(), defaults=True) -> set:
     hooks.discard("off")
     os.environ["ASRT_SGL_HOOKS"] = ",".join(sorted(hooks))
     boot = os.path.join(_here(), "sgl_boot")
-    root = os.path.dirname(os.path.dirname(_here()))  # the directory that contains ai_search_plugin/
+    root = os.path.dirname(
+        os.path.dirname(_here())
+    )  # the directory that contains ai_search_plugin/
     pp = [p for p in os.environ.get("PYTHONPATH", "").split(":") if p]
     new = [boot] + ([root] if root not in pp else []) + [p for p in pp if p != boot]
     os.environ["PYTHONPATH"] = ":".join(new)
     from . import slime_sglang_hooks
+
     slime_sglang_hooks.register_import_hooks()
     _STATE["sglhooks"] = sorted(hooks)
-    print(f"[asrt] verl engine hook set: ASRT_SGL_HOOKS={os.environ['ASRT_SGL_HOOKS']} (pid {os.getpid()})", flush=True)
+    print(
+        f"[asrt] verl engine hook set: ASRT_SGL_HOOKS={os.environ['ASRT_SGL_HOOKS']} (pid {os.getpid()})",
+        flush=True,
+    )
     return hooks
 
 
 def install_inplace() -> bool:
     from . import verl_rollout
+
     verl_rollout.install_keepkv()
-    if os.environ.get("ASRT_VERL_KVEPOCH", "1") == "0" and os.environ.get("ASRT_VERL_INPLACE_STALE_KV", "0") != "1":
+    if (
+        os.environ.get("ASRT_VERL_KVEPOCH", "1") == "0"
+        and os.environ.get("ASRT_VERL_INPLACE_STALE_KV", "0") != "1"
+    ):
         # in-place sync keeps the running requests (no abort), so their KV and SGLang's prefix cache stay
         # computed with the old weights and are reused under the new ones (this verl image's SGLang cannot flush the
         # prefix cache while requests are queued) - multi-turn agents then sample from mixed versions (measured:
         # train/rollout logp diff 0.017 -> 0.12-0.33).  keepkv installs the kvepoch engine hook by default (
         # new requests never match old-epoch prefix KV); without it (ASRT_VERL_KVEPOCH=0) inplace is off unless forced.
-        print("[asrt] verl inplace: OFF (kvepoch off -> stale prefix KV across weight syncs; ASRT_VERL_INPLACE_STALE_KV=1 "
-              "to force) - keepkv stays on", flush=True)
+        print(
+            "[asrt] verl inplace: OFF (kvepoch off -> stale prefix KV across weight syncs; ASRT_VERL_INPLACE_STALE_KV=1 "
+            "to force) - keepkv stays on",
+            flush=True,
+        )
         return False
     # fastload keeps the scheduler thread short during the un-paused load; ASRT_VERL_INPLACE_FASTLOAD=0 = original loader
-    fl = ("fastload",) if os.environ.get("ASRT_VERL_INPLACE_FASTLOAD", "1") != "0" else ()
-    install_sglhooks(extra=("inplace",) + fl, defaults=False)   # only what inplace needs (no implicit nosync)
+    fl = (
+        ("fastload",)
+        if os.environ.get("ASRT_VERL_INPLACE_FASTLOAD", "1") != "0"
+        else ()
+    )
+    install_sglhooks(
+        extra=("inplace",) + fl, defaults=False
+    )  # only what inplace needs (no implicit nosync)
     st = _STATE["inplace"]
 
     def on_ckpt(mod):
@@ -106,6 +125,7 @@ def install_inplace() -> bool:
                     st[key] += 1
                     return None
                 return await inner(self, *a, **k)
+
             new = keep_attrs(auto_await(f), fn)
             new.__asrt_inplace__ = True
             setattr(M, name, new)
@@ -118,13 +138,16 @@ def install_inplace() -> bool:
             return
 
         async def update_weights(self, global_steps=None, *a, **k):
-            if self.backend == "naive":  # colocated: weights only move while the engine sleeps
+            if (
+                self.backend == "naive"
+            ):  # colocated: weights only move while the engine sleeps
                 return await inner(self, global_steps, *a, **k)
             tok = _IN_SYNC.set(True)
             try:
                 return await inner(self, global_steps, *a, **k)
             finally:
                 _IN_SYNC.reset(tok)
+
         new = auto_await(update_weights)
         new.__asrt_inplace__ = True
         M.update_weights = new

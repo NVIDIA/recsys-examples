@@ -40,22 +40,37 @@ def plan_fragment(options: Optional[dict] = None) -> Dict[str, object]:
     ``hybridep_max_tokens`` (default 32768, multiple of 64), ``hybridep_sms`` (dispatch/combine SMs, default: Megatron's).
     """
     o = dict(options or {})
-    env = {"ASRT_HYBRIDEP": str(o.get("hybridep_mode", "auto")),
-           "ASRT_HYBRIDEP_CHUNKS": str(int(o.get("hybridep_chunks", mh.DEFAULT_CHUNKS))),
-           "ASRT_HYBRIDEP_MAX_TOKENS": str(int(o.get("hybridep_max_tokens", mh.DEFAULT_MAX_TOKENS)))}
+    env = {
+        "ASRT_HYBRIDEP": str(o.get("hybridep_mode", "auto")),
+        "ASRT_HYBRIDEP_CHUNKS": str(int(o.get("hybridep_chunks", mh.DEFAULT_CHUNKS))),
+        "ASRT_HYBRIDEP_MAX_TOKENS": str(
+            int(o.get("hybridep_max_tokens", mh.DEFAULT_MAX_TOKENS))
+        ),
+    }
     if o.get("hybridep_sms") is not None:
         env["ASRT_HYBRIDEP_SMS"] = str(int(o["hybridep_sms"]))
     spec = mh.parse_spec(env)  # validate now, not in the actors
     if spec.mode == "off":
         raise ValueError("hybridep_mode=off: leave the component out instead")
-    notes = ["hybridep_overlap needs Megatron-Core with the HybridEP flex backend and DeepEP built from its hybrid-ep "
-             "branch (HybridEPBuffer) in the training image, plus $CUDA_HOME/bin/nvcc at run time; the overlap patch "
-             "is validated on Megatron-Core 0.19 only (others keep the plain HybridEP dispatcher in auto mode); "
-             f"mode={spec.mode}: " + ("missing pieces raise" if spec.mode == "on" else
-                                      "missing pieces switch it off (dispatcher back to alltoall)"),
-             f"hybridep_overlap: micro-batches must stay <= {spec.max_tokens} tokens per rank "
-             "(ASRT_HYBRIDEP_MAX_TOKENS / option hybridep_max_tokens)"]
-    return {"env": env, "args": mh.megatron_args(spec.sms), "chain": [INIT_HOOK], "notes": notes}
+    notes = [
+        "hybridep_overlap needs Megatron-Core with the HybridEP flex backend and DeepEP built from its hybrid-ep "
+        "branch (HybridEPBuffer) in the training image, plus $CUDA_HOME/bin/nvcc at run time; the overlap patch "
+        "is validated on Megatron-Core 0.19 only (others keep the plain HybridEP dispatcher in auto mode); "
+        f"mode={spec.mode}: "
+        + (
+            "missing pieces raise"
+            if spec.mode == "on"
+            else "missing pieces switch it off (dispatcher back to alltoall)"
+        ),
+        f"hybridep_overlap: micro-batches must stay <= {spec.max_tokens} tokens per rank "
+        "(ASRT_HYBRIDEP_MAX_TOKENS / option hybridep_max_tokens)",
+    ]
+    return {
+        "env": env,
+        "args": mh.megatron_args(spec.sms),
+        "chain": [INIT_HOOK],
+        "notes": notes,
+    }
 
 
 def _is_rank0() -> bool:
@@ -114,7 +129,9 @@ def args_problems(args) -> Dict[str, List[str]]:
 
 def apply_args(args, spec: mh.Spec, fields=None) -> Dict[str, object]:
     """Write the HybridEP dispatcher configuration into the parsed Megatron args (before the model is built)."""
-    o = mh.config_overrides(spec.sms, fields if fields is not None else _config_fields())
+    o = mh.config_overrides(
+        spec.sms, fields if fields is not None else _config_fields()
+    )
     for a in _arg_targets(args):
         for k, v in o.items():
             setattr(a, k, v)
@@ -125,8 +142,10 @@ def revert_args(args) -> bool:
     """auto mode, HybridEP unusable: back to Megatron's alltoall dispatcher (only if hybridep was selected)."""
     changed = False
     for a in _arg_targets(args):
-        if getattr(a, "moe_token_dispatcher_type", None) == "flex" and \
-                getattr(a, "moe_flex_dispatcher_backend", None) == "hybridep":
+        if (
+            getattr(a, "moe_token_dispatcher_type", None) == "flex"
+            and getattr(a, "moe_flex_dispatcher_backend", None) == "hybridep"
+        ):
             a.moe_token_dispatcher_type = "alltoall"
             changed = True
     return changed
@@ -136,7 +155,12 @@ def megatron_init(args=None, environ=None) -> dict:
     """``ASRT_CHAIN_MEGATRON_INIT`` target (every slime training actor).  Returns a small report (also logged)."""
     env = os.environ if environ is None else environ
     spec = mh.parse_spec(env)
-    rep: Dict[str, object] = {"mode": spec.mode, "chunks": spec.chunks, "hybridep": False, "overlap": False}
+    rep: Dict[str, object] = {
+        "mode": spec.mode,
+        "chunks": spec.chunks,
+        "hybridep": False,
+        "overlap": False,
+    }
     if spec.mode == "off":
         rep["why"] = "ASRT_HYBRIDEP=off"
         return rep
@@ -152,10 +176,14 @@ def megatron_init(args=None, environ=None) -> dict:
     if chk["hybridep"]:
         why = "; ".join(chk["hybridep"])
         if spec.mode == "on":
-            raise RuntimeError(f"ai_search_plugin hybridep_overlap (ASRT_HYBRIDEP=on): HybridEP not usable: {why}")
+            raise RuntimeError(
+                f"ai_search_plugin hybridep_overlap (ASRT_HYBRIDEP=on): HybridEP not usable: {why}"
+            )
         reverted = revert_args(args)
         rep["why"] = why
-        _log(f"off, HybridEP not usable ({why}); dispatcher {'reverted to alltoall' if reverted else 'unchanged'}")
+        _log(
+            f"off, HybridEP not usable ({why}); dispatcher {'reverted to alltoall' if reverted else 'unchanged'}"
+        )
         return rep
     rep["args"] = apply_args(args, spec)
     rep["hybridep"] = True
@@ -166,13 +194,17 @@ def megatron_init(args=None, environ=None) -> dict:
     if ovl:
         why = "; ".join(ovl)
         if spec.mode == "on" and spec.chunks >= 2:
-            raise RuntimeError(f"ai_search_plugin hybridep_overlap (ASRT_HYBRIDEP=on): overlap patch not applicable: "
-                               f"{why}")
+            raise RuntimeError(
+                f"ai_search_plugin hybridep_overlap (ASRT_HYBRIDEP=on): overlap patch not applicable: "
+                f"{why}"
+            )
         rep["why"] = why
         _log(f"HybridEP dispatcher on, chunked overlap off ({why})")
         return rep
     rep["install"] = mh.install(spec.chunks, spec.max_tokens)
     rep["overlap"] = True
-    _log(f"HybridEP dispatcher on, {spec.chunks}-chunk overlap installed (max_tokens={spec.max_tokens}, "
-         f"Megatron {chk['version']})")
+    _log(
+        f"HybridEP dispatcher on, {spec.chunks}-chunk overlap installed (max_tokens={spec.max_tokens}, "
+        f"Megatron {chk['version']})"
+    )
     return rep

@@ -39,9 +39,23 @@ import time
 import uuid
 
 _STATE = {"installed": False, "items": [], "root": None, "tag": None}
-_C = {"l2_file_hit": 0, "l2_group_hit": 0, "l2_group_partial": 0, "l2_miss": 0, "l2_put": 0, "l2_put_skip": 0,
-      "l2_put_err": 0, "l2_read_err": 0, "bytes_in": 0, "bytes_out": 0, "copy_s": 0.0, "autotune_forced": 0,
-      "cudnn_seeded": 0, "cudnn_published": 0, "cudnn_err": 0}
+_C = {
+    "l2_file_hit": 0,
+    "l2_group_hit": 0,
+    "l2_group_partial": 0,
+    "l2_miss": 0,
+    "l2_put": 0,
+    "l2_put_skip": 0,
+    "l2_put_err": 0,
+    "l2_read_err": 0,
+    "bytes_in": 0,
+    "bytes_out": 0,
+    "copy_s": 0.0,
+    "autotune_forced": 0,
+    "cudnn_seeded": 0,
+    "cudnn_published": 0,
+    "cudnn_err": 0,
+}
 _LOCK = threading.Lock()
 DEFAULT_ITEMS = ("triton", "autotune", "inductor", "cudnn")
 
@@ -64,16 +78,23 @@ def _tag():
     if not gpu:
         try:
             import torch
-            gpu = torch.cuda.get_device_name(torch.cuda.current_device()) if torch.cuda.is_available() else "nogpu"
+
+            gpu = (
+                torch.cuda.get_device_name(torch.cuda.current_device())
+                if torch.cuda.is_available()
+                else "nogpu"
+            )
         except Exception:
             gpu = "unknown"
     try:
         import triton
+
         tv = triton.__version__
     except Exception:
         tv = "x"
     try:
         import torch
+
         pv = torch.__version__
     except Exception:
         pv = "x"
@@ -90,7 +111,9 @@ def store_dir(sub=""):
 def _atomic_write(path, data):
     d = os.path.dirname(path)
     os.makedirs(d, exist_ok=True)
-    tmp = os.path.join(d, f".tmp.{os.getpid()}.{uuid.uuid4().hex}.{os.path.basename(path)[:60]}")
+    tmp = os.path.join(
+        d, f".tmp.{os.getpid()}.{uuid.uuid4().hex}.{os.path.basename(path)[:60]}"
+    )
     with open(tmp, "wb") as f:
         f.write(data)
     os.replace(tmp, path)
@@ -109,7 +132,9 @@ def _make_manager():
 
         def __init__(self, key, override=False, dump=False):
             super().__init__(key, override=override, dump=dump)
-            self._l2 = None if (override or dump) else os.path.join(store_dir("triton"), key)
+            self._l2 = (
+                None if (override or dump) else os.path.join(store_dir("triton"), key)
+            )
 
         # ---- reads
         def get_file(self, filename):
@@ -152,8 +177,16 @@ def _make_manager():
                             _C["l2_group_partial"] += 1
                         return None
                     blobs[c] = (os.path.basename(p), _read(sp))
-                local = {c: FileCacheManager.put(self, data, fname) for c, (fname, data) in blobs.items()}
-                FileCacheManager.put(self, json.dumps({"child_paths": local}), f"__grp__{filename}", binary=False)  # level 1 only
+                local = {
+                    c: FileCacheManager.put(self, data, fname)
+                    for c, (fname, data) in blobs.items()
+                }
+                FileCacheManager.put(
+                    self,
+                    json.dumps({"child_paths": local}),
+                    f"__grp__{filename}",
+                    binary=False,
+                )  # level 1 only
                 with _LOCK:
                     _C["l2_group_hit"] += 1
                     _C["bytes_in"] += sum(len(d) for _, d in blobs.values())
@@ -197,17 +230,21 @@ def _make_manager():
 
 def _install_triton():
     from triton import knobs
+
     cur = knobs.cache.manager_class
     if cur is not None and getattr(cur, "__name__", "") == "TwoLevelCacheManager":
         return "already"
     if cur is not None:
         return f"SKIP: a custom TRITON_CACHE_MANAGER is already set ({cur!r})"
-    knobs.cache.manager_class = _make_manager()  # python-level knob: no env propagation to children
+    knobs.cache.manager_class = (
+        _make_manager()
+    )  # python-level knob: no env propagation to children
     return "on"
 
 
 def _install_autotune():
     from triton.runtime import autotuner as ta
+
     if getattr(ta.Autotuner.run, "_asrt_jitcache", False):
         return "already"
     orig = ta.Autotuner.run
@@ -218,6 +255,7 @@ def _install_autotune():
             with _LOCK:
                 _C["autotune_forced"] += 1
         return orig(self, *a, **k)
+
     run._asrt_jitcache = True
     ta.Autotuner.run = run
     return "on"
@@ -225,9 +263,12 @@ def _install_autotune():
 
 def _install_inductor():
     d = store_dir("inductor") if os.environ.get("ASRT_JITCACHE_GPU") else None
-    if d is None:  # tag needs the GPU name; resolve without touching CUDA: nvidia-smi-free fallback = env/torch lazily
+    if (
+        d is None
+    ):  # tag needs the GPU name; resolve without touching CUDA: nvidia-smi-free fallback = env/torch lazily
         try:
             import torch
+
             if torch.cuda.is_available() and torch.cuda.is_initialized():
                 d = store_dir("inductor")
         except Exception:
@@ -255,18 +296,25 @@ CUDNN_SUB = "cudnn_frontend"
 def cudnn_l1():
     base = os.environ.get("CUDNN_FRONTEND_COMPILED_CACHE")
     if not base:
-        xdg = os.environ.get("XDG_CACHE_HOME") or os.path.join(os.path.expanduser("~"), ".cache")
+        xdg = os.environ.get("XDG_CACHE_HOME") or os.path.join(
+            os.path.expanduser("~"), ".cache"
+        )
         base = os.path.join(xdg, "cudnn_frontend", "compiled_plans")
     return base
 
 
 def cudnn_l2():
-    return os.path.join(_STATE["root"] or os.environ.get("ASRT_JITCACHE_DIR", ""), CUDNN_SUB, "compiled_plans")
+    return os.path.join(
+        _STATE["root"] or os.environ.get("ASRT_JITCACHE_DIR", ""),
+        CUDNN_SUB,
+        "compiled_plans",
+    )
 
 
 def _sync_cudnn(src, dst, counter):
     """Copy every COMPLETE entry (entry.json present) of src that dst lacks: kernel.o first, entry.json last, each by
-    temp file + os.replace; manifest.json per environment.  Returns the number of entries copied."""
+    temp file + os.replace; manifest.json per environment.  Returns the number of entries copied.
+    """
     n = 0
     if not src or not dst or not os.path.isdir(src):
         return 0
@@ -282,21 +330,31 @@ def _sync_cudnn(src, dst, counter):
             for ent in sorted(os.listdir(ed)):
                 e = os.path.join(ed, ent)
                 rec, obj = os.path.join(e, "entry.json"), os.path.join(e, "kernel.o")
-                if not os.path.isdir(e) or not os.path.isfile(rec) or not os.path.isfile(obj):
+                if (
+                    not os.path.isdir(e)
+                    or not os.path.isfile(rec)
+                    or not os.path.isfile(obj)
+                ):
                     continue
                 out = os.path.join(dst, schema, env, ent)
                 if os.path.isfile(os.path.join(out, "entry.json")):
                     continue
                 try:
-                    if not os.path.isfile(os.path.join(dst, schema, env, "manifest.json")):
-                        _atomic_write(os.path.join(dst, schema, env, "manifest.json"), _read(man))
+                    if not os.path.isfile(
+                        os.path.join(dst, schema, env, "manifest.json")
+                    ):
+                        _atomic_write(
+                            os.path.join(dst, schema, env, "manifest.json"), _read(man)
+                        )
                     data = _read(obj)
                     r = _read(rec)
                     _atomic_write(os.path.join(out, "kernel.o"), data)
                     _atomic_write(os.path.join(out, "entry.json"), r)
                     n += 1
                     with _LOCK:
-                        _C["bytes_in" if counter == "cudnn_seeded" else "bytes_out"] += len(data) + len(r)
+                        _C[
+                            "bytes_in" if counter == "cudnn_seeded" else "bytes_out"
+                        ] += len(data) + len(r)
                 except Exception:
                     with _LOCK:
                         _C["cudnn_err"] += 1
@@ -315,7 +373,8 @@ def cudnn_seed():
 
 def publish():
     """Publish new level-1 cuDNN FROST entries to the shared store (Triton publishes itself on every put).
-    Called after training calls (when a training hook calls it) and at exit; cheap when nothing is new."""
+    Called after training calls (when a training hook calls it) and at exit; cheap when nothing is new.
+    """
     if "cudnn" not in _STATE["items"]:
         return 0
     return _sync_cudnn(cudnn_l1(), cudnn_l2(), "cudnn_published")
@@ -331,6 +390,7 @@ def _torch_triton():
     try:
         import torch
         import triton
+
         return f"triton{triton.__version__}-torch{torch.__version__}"
     except Exception:
         return "x"
@@ -340,7 +400,10 @@ def stats():
     with _LOCK:
         out = dict(_C)
     out["copy_s"] = round(out["copy_s"], 3)
-    out.update(items=_STATE["items"], store=os.path.join(_STATE["root"] or "", _STATE["tag"] or "?"))
+    out.update(
+        items=_STATE["items"],
+        store=os.path.join(_STATE["root"] or "", _STATE["tag"] or "?"),
+    )
     return out
 
 
@@ -364,12 +427,20 @@ def install(items=None):
     spec = items if items is not None else os.environ.get("ASRT_JITCACHE", "")
     if not root or spec in ("0", "off"):
         return {"jitcache": "off"}
-    want = [x.strip() for x in (spec or ",".join(DEFAULT_ITEMS)).split(",") if x.strip() and x.strip() not in ("1", "on")]
+    want = [
+        x.strip()
+        for x in (spec or ",".join(DEFAULT_ITEMS)).split(",")
+        if x.strip() and x.strip() not in ("1", "on")
+    ]
     want = want or list(DEFAULT_ITEMS)
     _STATE.update(installed=True, root=root, items=want)
     rep = {}
-    for it, fn in (("triton", _install_triton), ("autotune", _install_autotune), ("inductor", _install_inductor),
-                   ("cudnn", _install_cudnn)):
+    for it, fn in (
+        ("triton", _install_triton),
+        ("autotune", _install_autotune),
+        ("inductor", _install_inductor),
+        ("cudnn", _install_cudnn),
+    ):
         if it not in want:
             continue
         try:
@@ -387,5 +458,8 @@ def megatron_init(args=None, *rest, **kwargs):
     return install()
 
 
-if os.environ.get("ASRT_JITCACHE_DIR") and os.environ.get("ASRT_JITCACHE", "") not in ("0", "off"):
+if os.environ.get("ASRT_JITCACHE_DIR") and os.environ.get("ASRT_JITCACHE", "") not in (
+    "0",
+    "off",
+):
     install()

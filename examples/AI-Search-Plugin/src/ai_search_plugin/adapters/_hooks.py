@@ -22,7 +22,11 @@ class _Loader(importlib.abc.Loader):
         self.inner = inner
 
     def create_module(self, spec):
-        return self.inner.create_module(spec) if hasattr(self.inner, "create_module") else None
+        return (
+            self.inner.create_module(spec)
+            if hasattr(self.inner, "create_module")
+            else None
+        )
 
     def exec_module(self, module):
         self.inner.exec_module(module)
@@ -54,7 +58,7 @@ class _Finder(importlib.abc.MetaPathFinder):
         # only the finders AFTER us: the import system already asked the ones before us (they declined, or one of them
         # is the wrapping finder that is delegating to us right now - asking it again would wrap the loader twice)
         mp = list(sys.meta_path)
-        later = mp[mp.index(self) + 1:] if self in mp else mp
+        later = mp[mp.index(self) + 1 :] if self in mp else mp
         try:
             for f in later:
                 if f is self or not hasattr(f, "find_spec"):
@@ -82,7 +86,10 @@ def _fire(name, module):
 def when_imported(name: str, fn: Callable) -> None:
     global _finder
     mod = sys.modules.get(name)
-    if mod is not None and getattr(getattr(mod, "__spec__", None), "_initializing", False) is False:
+    if (
+        mod is not None
+        and getattr(getattr(mod, "__spec__", None), "_initializing", False) is False
+    ):
         fn(mod)
         return
     with _lock:
@@ -144,11 +151,16 @@ def patch_method(cls, name: str, make: Callable) -> int:
     same __name__ that carries its own copy of the method (Ray actor wrapper
     subclasses copy methods). Idempotent per class. Returns #classes patched."""
     import gc
+
     targets = [cls]
     for o in gc.get_objects():
         try:
-            if type(o) is type and o is not cls and type.__getattribute__(o, "__name__") == cls.__name__ \
-                    and name in type.__getattribute__(o, "__dict__"):
+            if (
+                type(o) is type
+                and o is not cls
+                and type.__getattribute__(o, "__name__") == cls.__name__
+                and name in type.__getattribute__(o, "__dict__")
+            ):
                 targets.append(o)
         except Exception:
             continue

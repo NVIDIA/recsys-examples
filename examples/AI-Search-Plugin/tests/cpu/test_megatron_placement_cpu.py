@@ -27,8 +27,9 @@ def env(monkeypatch):
 
 def _mgr(m, opt):
     from ai_search_plugin.adapters.megatron_placement import ExpertPlacementManager
+
     mgr = ExpertPlacementManager([m], opt, num_layers=2, num_experts=T.E, ep_group=None)
-    mgr.ep, mgr.n_local = 4, 4   # pretend EP4 for the planner; moves are local (world 1)
+    mgr.ep, mgr.n_local = 4, 4  # pretend EP4 for the planner; moves are local (world 1)
     return mgr
 
 
@@ -39,25 +40,37 @@ def test_rename_equivalence_and_maps(env):
     st0 = {n: opt.state[p]["exp_avg"].clone() for n, p in m.named_parameters()}
     mgr = _mgr(m, opt)
     g = torch.Generator().manual_seed(1)
-    mgr.maybe_rebalance(force_perms={lid: torch.randperm(T.E, generator=g).tolist() for lid in range(2)})
+    mgr.maybe_rebalance(
+        force_perms={lid: torch.randperm(T.E, generator=g).tolist() for lid in range(2)}
+    )
     assert torch.allclose(m(x).detach(), y0, atol=1e-3)
     # optimizer state followed: expert at its new slot has the old moments of its logical expert
     for lid in range(2):
         for e in range(T.E):
             s = int(mgr.slot_of[lid][e])
             p = m.layers[lid].mlp.experts.local_experts[s].fc1
-            assert torch.equal(opt.state[p]["exp_avg"], st0[f"layers.{lid}.mlp.experts.local_experts.{e}.fc1"])
-        r = m.layers[lid].mlp.router.weight     # router Adam rows permuted too
-        assert torch.equal(opt.state[r]["exp_avg"][mgr.slot_of[lid]], st0[f"layers.{lid}.mlp.router.weight"])
+            assert torch.equal(
+                opt.state[p]["exp_avg"],
+                st0[f"layers.{lid}.mlp.experts.local_experts.{e}.fc1"],
+            )
+        r = m.layers[lid].mlp.router.weight  # router Adam rows permuted too
+        assert torch.equal(
+            opt.state[r]["exp_avg"][mgr.slot_of[lid]],
+            st0[f"layers.{lid}.mlp.router.weight"],
+        )
     # R3 ids: logical -> physical
     ids = torch.tensor([[0, 3], [5, 7]])
     assert torch.equal(mgr.map_routed_ids(0, ids), mgr.slot_of[0][ids])
     # export: names / router rows back to logical order
-    _, w = mgr.export_name_and_tensor("module.decoder.layers.0.mlp.router.weight",
-                                      m.layers[0].mlp.router.weight.detach())
+    _, w = mgr.export_name_and_tensor(
+        "module.decoder.layers.0.mlp.router.weight",
+        m.layers[0].mlp.router.weight.detach(),
+    )
     assert torch.equal(w, snap["layers.0.mlp.router.weight"])
     s = int(mgr.slot_of[1][5])
-    n2, _ = mgr.export_name_and_tensor(f"module.decoder.layers.1.mlp.experts.linear_fc1.weight{s}", None)
+    n2, _ = mgr.export_name_and_tensor(
+        f"module.decoder.layers.1.mlp.experts.linear_fc1.weight{s}", None
+    )
     assert n2.endswith("weight5"), n2
     # a second permutation composes; then restoring identity is bit exact
     mgr.maybe_rebalance(force_perms={0: torch.randperm(T.E, generator=g).tolist()})
@@ -80,13 +93,13 @@ def test_planner_balances_hot_cluster(env):
     assert info["imbalance_before"] > 1.5 and info["imbalance_after_pred"] < 1.2, info
     assert info["experts_moved"] > 0 and not mgr.is_identity()
     assert torch.allclose(m(x).detach(), y0, atol=1e-3)
-    assert float(mgr.counts.abs().sum()) == 0.0          # counts cleared after a step
+    assert float(mgr.counts.abs().sum()) == 0.0  # counts cleared after a step
 
 
 def test_auto_off_when_balanced(env, monkeypatch):
     m, opt, _ = T.trained_model()
     mgr = _mgr(m, opt)
-    mgr.counts += 10.0                                    # perfectly balanced
+    mgr.counts += 10.0  # perfectly balanced
     info = mgr.maybe_rebalance()
     assert info.get("skipped") and info["experts_moved"] == 0 and mgr.is_identity()
     # mildly unbalanced, below the default 1.15: still off
@@ -104,7 +117,9 @@ def test_auto_off_when_balanced(env, monkeypatch):
 def test_r3_counting(env):
     m, opt, _ = T.trained_model()
     mgr = _mgr(m, opt)
-    routes = torch.tensor([[[0, 1], [2, 3]], [[0, 5], [2, 7]]])   # [tokens=2, layers=2, topk=2]
+    routes = torch.tensor(
+        [[[0, 1], [2, 3]], [[0, 5], [2, 7]]]
+    )  # [tokens=2, layers=2, topk=2]
     mgr.add_logical_ids(routes)
     assert mgr.counts[0].tolist()[:6] == [2, 1, 0, 0, 0, 1]
     assert mgr.counts[1].tolist()[:8] == [0, 0, 2, 1, 0, 0, 0, 1]
@@ -113,6 +128,7 @@ def test_r3_counting(env):
 def test_place_verify_flags_corruption(env, monkeypatch):
     monkeypatch.setenv("ASRT_PLACE_VERIFY", "1")
     from ai_search_plugin.adapters import place_verify as V
+
     logs = []
     monkeypatch.setattr(V, "_log", lambda rec: logs.append(rec))
     m, opt, x = T.trained_model(lr=1e-6)
@@ -121,10 +137,13 @@ def test_place_verify_flags_corruption(env, monkeypatch):
         m(x).pow(2).mean().backward()
         opt.step()
         opt.zero_grad()
+
     mgr = _mgr(m, opt)
     g = torch.Generator().manual_seed(1)
     pre = V.before_step(mgr, 0)
-    mgr.maybe_rebalance(force_perms={lid: torch.randperm(T.E, generator=g).tolist() for lid in range(2)})
+    mgr.maybe_rebalance(
+        force_perms={lid: torch.randperm(T.E, generator=g).tolist() for lid in range(2)}
+    )
     V.after_move(mgr, 0, pre)
     mv = logs[-1]
     assert mv["phase"] == "post-move" and mv["worst"] < 1e-9, mv
@@ -143,7 +162,8 @@ def test_place_verify_flags_corruption(env, monkeypatch):
 
 def test_modules_import_without_torch():
     """No torch / numpy / megatron / slime / verl at import time (the registry imports every module)."""
-    code = textwrap.dedent("""
+    code = textwrap.dedent(
+        """
         import importlib.abc, sys
         class Block(importlib.abc.MetaPathFinder):
             def find_spec(self, name, path, target=None):
@@ -157,7 +177,14 @@ def test_modules_import_without_torch():
         import ai_search_plugin.adapters.place_verify
         assert P.rebalance_swaps([9, 8, 1, 1], [0, 0, 1, 1], 2)[1] == 2
         print("ok")
-    """)
+    """
+    )
     envv = dict(os.environ, PYTHONPATH=SRC)
-    r = subprocess.run([sys.executable, "-c", code], env=envv, capture_output=True, text=True, timeout=120)
+    r = subprocess.run(
+        [sys.executable, "-c", code],
+        env=envv,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
     assert r.returncode == 0 and r.stdout.strip().endswith("ok"), r.stderr[-2000:]

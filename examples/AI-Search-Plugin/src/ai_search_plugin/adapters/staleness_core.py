@@ -53,7 +53,8 @@ def worst(global_steps: int, min_global_steps: int) -> int:
 
 def drop_deadline(step_s, default: str = "") -> float | None:
     """Seconds after which a straggler at the ceiling may be cut (see module doc); None = never.
-    step_s: recent batch hand-out intervals (s).  default: value when ASRT_TICKET_DROP_S is unset."""
+    step_s: recent batch hand-out intervals (s).  default: value when ASRT_TICKET_DROP_S is unset.
+    """
     v = os.environ.get("ASRT_TICKET_DROP_S", default).strip().lower()
     if v in ("", "0", "off"):
         return None
@@ -63,18 +64,25 @@ def drop_deadline(step_s, default: str = "") -> float | None:
             e = os.environ.get("ASRT_TICKET_DROP_EARLY_S", "").strip()
             return float(e) if e else None
         # lower quartile, not median: stalled steps (the thing being fixed) inflate the median
-        return max(floor, float(os.environ.get("ASRT_TICKET_DROP_STEPS", "4")) * sorted(step_s)[len(step_s) // 4])
+        return max(
+            floor,
+            float(os.environ.get("ASRT_TICKET_DROP_STEPS", "4"))
+            * sorted(step_s)[len(step_s) // 4],
+        )
     return float(v)
 
 
 def cut_budget(total_groups: int) -> int:
     """Whole-run cut budget in groups: ASRT_TICKET_DROP_BUDGET if set, else max(ASRT_TICKET_DROP_MIN (3),
-    ASRT_TICKET_DROP_RUNFRAC (1%) x total_groups) - the baseline's slow-not-trained share."""
+    ASRT_TICKET_DROP_RUNFRAC (1%) x total_groups) - the baseline's slow-not-trained share.
+    """
     b = os.environ.get("ASRT_TICKET_DROP_BUDGET", "").strip()
     if b:
         return max(0, int(b))
-    return max(int(os.environ.get("ASRT_TICKET_DROP_MIN", "3")),
-               int(float(os.environ.get("ASRT_TICKET_DROP_RUNFRAC", "0.01")) * total_groups))
+    return max(
+        int(os.environ.get("ASRT_TICKET_DROP_MIN", "3")),
+        int(float(os.environ.get("ASRT_TICKET_DROP_RUNFRAC", "0.01")) * total_groups),
+    )
 
 
 def log_admit(rec: dict):
@@ -97,8 +105,10 @@ def active_line(S: int, detail: str) -> str:
 
 def staleness_line(rollout, mean, mx, S, frac_over, tail: str = "") -> str:
     """Per-rollout / per-step staleness line in the format the staleness audit parses."""
-    return (f"[asrt] staleness rollout {rollout} (train version - earliest sample version): mean {mean:.3f} "
-            f"max {mx} over cap {S}: {100 * frac_over:.1f}%{tail}")
+    return (
+        f"[asrt] staleness rollout {rollout} (train version - earliest sample version): mean {mean:.3f} "
+        f"max {mx} over cap {S}: {100 * frac_over:.1f}%{tail}"
+    )
 
 
 # Cut accounting by SLOW-GROUP SHARE.  A group is slow when it has been running

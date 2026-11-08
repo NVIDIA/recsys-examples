@@ -27,12 +27,18 @@ log = logging.getLogger("ai_search_plugin.slime_train")
 
 def _supported(args) -> bool:
     return not (
-        args.colocate or args.offload_train or args.offload_rollout or args.use_critic
+        args.colocate
+        or args.offload_train
+        or args.offload_rollout
+        or args.use_critic
         # object-store and straw both hand the trainer a reference that slime's own _get_rollout_data resolves;
         # with straw (slime's streaming handoff) this adds the TRAINER-side half: next batch pulled during the sync
-        or getattr(args, "rollout_data_transport", "object-store") not in ("object-store", "straw")
-        or getattr(args, "rollout_external", False) or getattr(args, "use_fault_tolerance", False)
-        or getattr(args, "release_train", False) or getattr(args, "debug_train_only", False)
+        or getattr(args, "rollout_data_transport", "object-store")
+        not in ("object-store", "straw")
+        or getattr(args, "rollout_external", False)
+        or getattr(args, "use_fault_tolerance", False)
+        or getattr(args, "release_train", False)
+        or getattr(args, "debug_train_only", False)
         or getattr(args, "debug_rollout_only", False)
     )
 
@@ -45,8 +51,12 @@ def make_train(orig_train, T):
 
     def train(args, pgs, rollout_manager, num_rollout_per_epoch, restore_plan):
         if "overlap" not in slime_prefetch.opts() or not _supported(args):
-            log.warning("asrt overlap disabled for this configuration; using slime's loop")
-            return orig_train(args, pgs, rollout_manager, num_rollout_per_epoch, restore_plan)
+            log.warning(
+                "asrt overlap disabled for this configuration; using slime's loop"
+            )
+            return orig_train(
+                args, pgs, rollout_manager, num_rollout_per_epoch, restore_plan
+            )
         should = T.should_run_periodic_action
         board = slime_prefetch.get_or_create_board()
         actor_model, _ = T.create_training_models(args, pgs, rollout_manager)
@@ -59,7 +69,11 @@ def make_train(orig_train, T):
 
         pending = None  # (rollout_id, ObjectRef of generate)
         for rollout_id in range(args.start_rollout_id, args.num_rollout):
-            if args.eval_interval is not None and rollout_id == 0 and not args.skip_eval_before_train:
+            if (
+                args.eval_interval is not None
+                and rollout_id == 0
+                and not args.skip_eval_before_train
+            ):
                 ray.get(rollout_manager.eval.remote(rollout_id))
             t0 = time.time()
             if pending is None or pending[0] != rollout_id:
@@ -69,8 +83,17 @@ def make_train(orig_train, T):
             t_gen = time.time() - t0
             ray.get(actor_model.async_train(rollout_id, rollout_data_ref))
             ray.get(rollout_manager.training_completed.remote(rollout_id))
-            if should(rollout_id, args.save_interval, num_rollout_per_epoch, args.num_rollout):
-                T.save_checkpoint(args, rollout_id, actor_model, None, rollout_manager, actor_trains=True)
+            if should(
+                rollout_id, args.save_interval, num_rollout_per_epoch, args.num_rollout
+            ):
+                T.save_checkpoint(
+                    args,
+                    rollout_id,
+                    actor_model,
+                    None,
+                    rollout_manager,
+                    actor_trains=True,
+                )
             actor_model.clear_memory()
 
             nxt = rollout_id + 1
@@ -100,9 +123,12 @@ def make_train(orig_train, T):
                 # train(nxt) joins that pull instead of starting its own
                 refs = ray.get(gen)
                 board.post.remote(nxt, refs)
-            print(f"[asrt] step {rollout_id}: wait_generate {t_gen:.1f}s update_weights {t_upd:.1f}s "
-                  f"next_batch_posted_during_update={posted_at is not None}"
-                  + (f" at +{posted_at:.1f}s" if posted_at is not None else ""), flush=True)
+            print(
+                f"[asrt] step {rollout_id}: wait_generate {t_gen:.1f}s update_weights {t_upd:.1f}s "
+                f"next_batch_posted_during_update={posted_at is not None}"
+                + (f" at +{posted_at:.1f}s" if posted_at is not None else ""),
+                flush=True,
+            )
             if eval_now:
                 ray.get(rollout_manager.eval.remote(rollout_id))
 
@@ -111,7 +137,9 @@ def make_train(orig_train, T):
 
 def _threaded_manager():
     """Make ``RolloutManager.options(...)`` add max_concurrency (threaded actor)."""
-    from slime.ray import rollout as pgm  # create_rollout_manager does `from .rollout import RolloutManager`
+    from slime.ray import (
+        rollout as pgm,  # create_rollout_manager does `from .rollout import RolloutManager`
+    )
 
     RM = pgm.RolloutManager
     if getattr(RM, "_asrt_wrapped", False):
@@ -137,7 +165,9 @@ def _threaded_manager():
 def main(argv=None):
     argv = list(sys.argv[1:] if argv is None else argv)
     if not argv or not argv[0].endswith(".py"):
-        raise SystemExit("usage: python -m ai_search_plugin.adapters.slime_train <path/to/slime>/train.py <slime args>")
+        raise SystemExit(
+            "usage: python -m ai_search_plugin.adapters.slime_train <path/to/slime>/train.py <slime args>"
+        )
     script = os.path.abspath(argv[0])
     sys.argv = [script] + argv[1:]
     sys.path.insert(0, os.path.dirname(script))

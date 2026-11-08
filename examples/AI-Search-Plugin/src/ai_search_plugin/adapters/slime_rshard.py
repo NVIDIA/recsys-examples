@@ -70,7 +70,9 @@ def _mode() -> str:
     o = opts()
     if not o or "off" in o or "0" in o:
         return "off"
-    if "measure" in o:  # stock slime + client/engine counters in rshard.jsonl (the A/B baseline arm)
+    if (
+        "measure" in o
+    ):  # stock slime + client/engine counters in rshard.jsonl (the A/B baseline arm)
         return "measure"
     if "on" in o or "1" in o or "shard" in o:
         return "on"
@@ -100,12 +102,15 @@ def _pct(xs, q):
 
 
 # ============================================================================================ client probe
-_PRIO = contextvars.ContextVar("asrt_rs_prio", default=0)  # admission order of the group a request belongs to
+_PRIO = contextvars.ContextVar(
+    "asrt_rs_prio", default=0
+)  # admission order of the group a request belongs to
 
 
 class PrioSemaphore:
     """Counting semaphore whose waiters are served lowest priority value first (= oldest group first), FIFO
-    within a priority.  Lets the groups the trainer needs next finish first when requests queue in the shard."""
+    within a priority.  Lets the groups the trainer needs next finish first when requests queue in the shard.
+    """
 
     def __init__(self, n: int):
         self.free = int(n)
@@ -124,7 +129,9 @@ class PrioSemaphore:
         try:
             await fut
         except asyncio.CancelledError:
-            if fut.done() and not fut.cancelled():  # granted, but the waiter was cancelled: pass the slot on
+            if (
+                fut.done() and not fut.cancelled()
+            ):  # granted, but the waiter was cancelled: pass the slot on
                 self.release()
             raise
 
@@ -139,7 +146,8 @@ class PrioSemaphore:
 
 class ClientProbe:
     """Wraps slime.utils.http_utils._post (module global, used by every ``post``) for /generate calls: optional
-    in-flight cap (asyncio semaphore), in-flight / waiting counts, slot-wait and HTTP latency, output tokens."""
+    in-flight cap (asyncio semaphore), in-flight / waiting counts, slot-wait and HTTP latency, output tokens.
+    """
 
     def __init__(self, cap=None, url=None):
         self.cap, self.url = cap, url
@@ -202,11 +210,20 @@ class ClientProbe:
     def stats(self) -> dict:
         now = time.time()
         dt = max(1e-6, now - self.win["t"])
-        rec = {"url": self.url, "inflight": self.inflight, "waiting": self.waiting, "calls": self.calls,
-               "errors": self.errors, "out_tok": self.out_tok,
-               "calls_s": round(self.win["calls"] / dt, 2), "tok_s": round(self.win["tok"] / dt, 1),
-               "http_p50": _pct(self.lat_http, 0.5), "http_p99": _pct(self.lat_http, 0.99),
-               "wait_p50": _pct(self.lat_wait, 0.5), "wait_p99": _pct(self.lat_wait, 0.99)}
+        rec = {
+            "url": self.url,
+            "inflight": self.inflight,
+            "waiting": self.waiting,
+            "calls": self.calls,
+            "errors": self.errors,
+            "out_tok": self.out_tok,
+            "calls_s": round(self.win["calls"] / dt, 2),
+            "tok_s": round(self.win["tok"] / dt, 1),
+            "http_p50": _pct(self.lat_http, 0.5),
+            "http_p99": _pct(self.lat_http, 0.99),
+            "wait_p50": _pct(self.lat_wait, 0.5),
+            "wait_p99": _pct(self.lat_wait, 0.99),
+        }
         self.win = {"calls": 0, "tok": 0, "t": now}
         self.lat_http.clear()
         self.lat_wait.clear()
@@ -220,10 +237,17 @@ class RShard:
 
     def __init__(self, args, idx: int, url: str, cap: int, conc: int, env: dict):
         os.environ.update(env or {})
-        self.idx, self.url, self.cap, self.conc = idx, url, max(1, int(cap)), max(1, int(conc))
+        self.idx, self.url, self.cap, self.conc = (
+            idx,
+            url,
+            max(1, int(cap)),
+            max(1, int(conc)),
+        )
         host, port = _host_port(url)
         a = copy.copy(args)
-        a.sglang_router_ip, a.sglang_router_port = (f"[{host}]" if ":" in host else host), port  # slime wraps IPv6
+        a.sglang_router_ip, a.sglang_router_port = (
+            f"[{host}]" if ":" in host else host
+        ), port  # slime wraps IPv6
         a.use_distributed_post = False
         a.use_wandb = a.use_tensorboard = False
         self.args = a
@@ -239,16 +263,28 @@ class RShard:
 
         from slime.rollout.sglang_rollout import GenerateState
 
-        GenerateState(self.args, concurrency=self.conc)  # singleton: tokenizer + generation semaphore of this shard
-        return {"idx": self.idx, "pid": os.getpid(), "host": socket.gethostname(), "url": self.url, "cap": self.cap}
+        GenerateState(
+            self.args, concurrency=self.conc
+        )  # singleton: tokenizer + generation semaphore of this shard
+        return {
+            "idx": self.idx,
+            "pid": os.getpid(),
+            "host": socket.gethostname(),
+            "url": self.url,
+            "cap": self.cap,
+        }
 
     async def run_group(self, group, sampling_params, evaluation=False, prio=0):
         from slime.rollout.sglang_rollout import GenerateState, generate_and_rm_group
 
         GenerateState(self.args, concurrency=self.conc)
         self.groups += 1
-        _PRIO.set(prio)  # inherited by the per-sample tasks generate_and_rm_group creates
-        return await generate_and_rm_group(self.args, group, sampling_params, evaluation=evaluation)
+        _PRIO.set(
+            prio
+        )  # inherited by the per-sample tasks generate_and_rm_group creates
+        return await generate_and_rm_group(
+            self.args, group, sampling_params, evaluation=evaluation
+        )
 
     async def stats(self):
         return {"shard": self.idx, "groups": self.groups, **self.probe.stats()}
@@ -266,7 +302,9 @@ def _engine_urls(args) -> list:
     """Live engine URLs behind slime's router (GET /workers), in a stable order."""
     import requests
 
-    r = requests.get(f"http://{args.sglang_router_ip}:{args.sglang_router_port}/workers", timeout=30)
+    r = requests.get(
+        f"http://{args.sglang_router_ip}:{args.sglang_router_port}/workers", timeout=30
+    )
     r.raise_for_status()
     urls = sorted({w["url"] for w in r.json().get("workers", []) if w.get("url")})
     return urls
@@ -276,8 +314,12 @@ def _scrape(url: str, timeout: float = 2.0) -> dict:
     """Engine #running / #queue / gen throughput from SGLang's Prometheus /metrics (max over TP ranks)."""
     import requests
 
-    want = {"sglang:num_running_reqs": "running", "sglang:num_queue_reqs": "queue",
-            "sglang:gen_throughput": "gen_tok_s", "sglang:token_usage": "kv_usage"}
+    want = {
+        "sglang:num_running_reqs": "running",
+        "sglang:num_queue_reqs": "queue",
+        "sglang:gen_throughput": "gen_tok_s",
+        "sglang:token_usage": "kv_usage",
+    }
     out = {}
     try:
         txt = requests.get(f"{url}/metrics", timeout=timeout).text
@@ -318,22 +360,41 @@ class ShardPool:
         inf = os.environ.get("ASRT_RS_INFLIGHT", "auto").strip().lower()
         if inf in ("", "auto"):
             mr = getattr(args, "sglang_max_running_requests", None)
-            cap_e = int(mr) if mr else int(getattr(args, "sglang_server_concurrency", 512))
+            cap_e = (
+                int(mr) if mr else int(getattr(args, "sglang_server_concurrency", 512))
+            )
         else:
             cap_e = int(inf)
         cap_s = max(1, math.ceil(cap_e / per))
-        conc_s = max(64, math.ceil(pool_samples / K) * 4)  # trajectories per shard: never the binding limit
-        env = {k: v for k, v in os.environ.items() if k.startswith(_ENV_PREFIXES) or k in _ENV_KEYS}
-        nodes = {nd["NodeManagerAddress"]: nd["NodeID"] for nd in ray.nodes() if nd.get("Alive")}
+        conc_s = max(
+            64, math.ceil(pool_samples / K) * 4
+        )  # trajectories per shard: never the binding limit
+        env = {
+            k: v
+            for k, v in os.environ.items()
+            if k.startswith(_ENV_PREFIXES) or k in _ENV_KEYS
+        }
+        nodes = {
+            node["NodeManagerAddress"]: node["NodeID"]
+            for node in ray.nodes()
+            if node.get("Alive")
+        }
         Actor = ray.remote(RShard)
         self.shards, self.urls, self.engine_of = [], urls, []
 
         def make(k, url):
             host = _host_port(url)[0]
-            opt = dict(num_cpus=float(os.environ.get("ASRT_RS_CPUS", "0.01")), max_concurrency=1 << 20,
-                       max_restarts=0, max_task_retries=0, runtime_env={"env_vars": env})
+            opt = dict(
+                num_cpus=float(os.environ.get("ASRT_RS_CPUS", "0.01")),
+                max_concurrency=1 << 20,
+                max_restarts=0,
+                max_task_retries=0,
+                runtime_env={"env_vars": env},
+            )
             if host in nodes:
-                opt["scheduling_strategy"] = NodeAffinitySchedulingStrategy(nodes[host], soft=True)
+                opt["scheduling_strategy"] = NodeAffinitySchedulingStrategy(
+                    nodes[host], soft=True
+                )
             return Actor.options(**opt).remote(args, k, url, cap_s, conc_s, env)
 
         for k in range(K):
@@ -347,13 +408,25 @@ class ShardPool:
         self.local_groups = 0
         self.closing = False
         self.seq = 0
-        self.prio = os.environ.get("ASRT_RS_PRIO", "1") != "0"  # oldest group's requests first in the shard queue
-        self.cfg = {"engines": E, "shards": K, "per_engine": per, "inflight_per_engine": cap_e,
-                    "inflight_per_shard": cap_s, "conc_per_shard": conc_s, "pool_samples": pool_samples,
-                    "urls": urls, "shard_hosts": sorted({i["host"] for i in info})}
+        self.prio = (
+            os.environ.get("ASRT_RS_PRIO", "1") != "0"
+        )  # oldest group's requests first in the shard queue
+        self.cfg = {
+            "engines": E,
+            "shards": K,
+            "per_engine": per,
+            "inflight_per_engine": cap_e,
+            "inflight_per_shard": cap_s,
+            "conc_per_shard": conc_s,
+            "pool_samples": pool_samples,
+            "urls": urls,
+            "shard_hosts": sorted({i["host"] for i in info}),
+        }
         self._stop = False
         if "profile" in opts():
-            threading.Thread(target=self._monitor, name="asrt-rshard-mon", daemon=True).start()
+            threading.Thread(
+                target=self._monitor, name="asrt-rshard-mon", daemon=True
+            ).start()
 
     def close(self):
         """Worker shutdown: stop the shards so in-flight groups return at once (slime drains for 30 s otherwise)."""
@@ -383,7 +456,11 @@ class ShardPool:
             return ray.get([self.shards[k].stats.remote() for k in live], timeout=30)
 
         def extra():
-            return {"local_groups": self.local_groups, "dead": sorted(self.dead), "load_samples": list(self.load)}
+            return {
+                "local_groups": self.local_groups,
+                "dead": sorted(self.dead),
+                "load_samples": list(self.load),
+            }
 
         _monitor_loop(client, self.urls, extra, lambda: self._stop)
 
@@ -403,10 +480,16 @@ def _monitor_loop(client, urls, extra=None, stop=lambda: False):
         eng = []
         for e, url in enumerate(urls):
             ss = [x for x in st if x.get("url") == url]
-            eng.append({"engine": e, "client_inflight": sum(x["inflight"] for x in ss),
-                        "client_waiting": sum(x["waiting"] for x in ss),
-                        "calls_s": round(sum(x["calls_s"] for x in ss), 2),
-                        "client_tok_s": round(sum(x["tok_s"] for x in ss), 1), **_scrape(url)})
+            eng.append(
+                {
+                    "engine": e,
+                    "client_inflight": sum(x["inflight"] for x in ss),
+                    "client_waiting": sum(x["waiting"] for x in ss),
+                    "calls_s": round(sum(x["calls_s"] for x in ss), 2),
+                    "client_tok_s": round(sum(x["tok_s"] for x in ss), 1),
+                    **_scrape(url),
+                }
+            )
         rec["engines"] = eng
         rec["client"] = st
         _log(rec)
@@ -425,32 +508,50 @@ async def _sharded_group(args, group, sampling_params, evaluation=False):
     pool = _S["pool"]
     orig = _S["orig_group"]
     if pool is None or evaluation:
-        return await orig(args, group, sampling_params=sampling_params, evaluation=evaluation)
+        return await orig(
+            args, group, sampling_params=sampling_params, evaluation=evaluation
+        )
     k = pool.pick()
     if k is None:
         pool.local_groups += 1
-        return await orig(args, group, sampling_params=sampling_params, evaluation=evaluation)
+        return await orig(
+            args, group, sampling_params=sampling_params, evaluation=evaluation
+        )
     n = _n_samples(group)
     pool.load[k] += n
     pool.seq += 1
     prio = pool.seq if pool.prio else 0
     try:
-        out = await pool.shards[k].run_group.remote(group, sampling_params, evaluation, prio)
+        out = await pool.shards[k].run_group.remote(
+            group, sampling_params, evaluation, prio
+        )
     except Exception as e:  # noqa: BLE001
         from ray.exceptions import RayActorError, RayTaskError
 
         _fill_done(n)
-        if isinstance(e, RayTaskError):  # the generation itself failed: same as stock (task crashed)
+        if isinstance(
+            e, RayTaskError
+        ):  # the generation itself failed: same as stock (task crashed)
             raise e.as_instanceof_cause()
         if not isinstance(e, RayActorError):
             raise
-        if pool.closing:  # slime is shutting the worker down: hand the untouched input group back (requeued)
+        if (
+            pool.closing
+        ):  # slime is shutting the worker down: hand the untouched input group back (requeued)
             return group
-        pool.dead.add(k)  # shard process gone: its groups run in the manager (stock path) from now on
-        _log({"t": time.time(), "event": "shard_dead", "shard": k, "err": repr(e)[:300]})
+        pool.dead.add(
+            k
+        )  # shard process gone: its groups run in the manager (stock path) from now on
+        _log(
+            {"t": time.time(), "event": "shard_dead", "shard": k, "err": repr(e)[:300]}
+        )
         pool.local_groups += 1
-        _fill_done(-n)  # the stock path below counts its own samples (slime_fill wraps generate_and_rm)
-        return await orig(args, group, sampling_params=sampling_params, evaluation=evaluation)
+        _fill_done(
+            -n
+        )  # the stock path below counts its own samples (slime_fill wraps generate_and_rm)
+        return await orig(
+            args, group, sampling_params=sampling_params, evaluation=evaluation
+        )
     finally:
         pool.load[k] -= n
     _fill_done(n)
@@ -483,7 +584,9 @@ def _decide(worker):
         why = "measure only"
     elif m == "auto" and pool_samples < int(os.environ.get("ASRT_RS_MIN", "256")):
         why = f"auto: trajectory pool {pool_samples} < ASRT_RS_MIN {os.environ.get('ASRT_RS_MIN', '256')}"
-    elif getattr(args, "rollout_external", False) or not getattr(args, "sglang_router_ip", None):
+    elif getattr(args, "rollout_external", False) or not getattr(
+        args, "sglang_router_ip", None
+    ):
         why = "no slime router (external rollout)"
     elif getattr(args, "sglang_config", None):
         why = "multi-model --sglang-config"
@@ -496,16 +599,29 @@ def _decide(worker):
             _S["pool"] = None
         else:
             cfg = _S["pool"].cfg
-            print(f"[asrt] slime_rshard ON: {cfg['shards']} shards ({cfg['per_engine']}/engine) x {cfg['engines']} "
-                  f"engines, in-flight cap {cfg['inflight_per_engine']}/engine ({cfg['inflight_per_shard']}/shard), "
-                  f"trajectory pool {pool_samples}, start {time.time() - t0:.1f}s, hosts {cfg['shard_hosts']}",
-                  flush=True)
-            _log({"t": time.time(), "event": "on", "start_s": round(time.time() - t0, 2), **cfg})
+            print(
+                f"[asrt] slime_rshard ON: {cfg['shards']} shards ({cfg['per_engine']}/engine) x {cfg['engines']} "
+                f"engines, in-flight cap {cfg['inflight_per_engine']}/engine ({cfg['inflight_per_shard']}/shard), "
+                f"trajectory pool {pool_samples}, start {time.time() - t0:.1f}s, hosts {cfg['shard_hosts']}",
+                flush=True,
+            )
+            _log(
+                {
+                    "t": time.time(),
+                    "event": "on",
+                    "start_s": round(time.time() - t0, 2),
+                    **cfg,
+                }
+            )
     if why is not None:
         _S["why"] = why
         print(f"[asrt] slime_rshard off: {why}", flush=True)
-        _log({"t": time.time(), "event": "off", "why": why, "pool_samples": pool_samples})
-        if "profile" in opts() or m == "measure":  # stock path: same counters, measured in the manager
+        _log(
+            {"t": time.time(), "event": "off", "why": why, "pool_samples": pool_samples}
+        )
+        if (
+            "profile" in opts() or m == "measure"
+        ):  # stock path: same counters, measured in the manager
             try:
                 from slime.utils import http_utils as hu
 
@@ -513,15 +629,20 @@ def _decide(worker):
                 probe.install(hu)
                 urls = _engine_urls(args)
 
-                threading.Thread(target=_monitor_loop, args=(lambda: [probe.stats()], urls), name="asrt-rshard-mon",
-                                 daemon=True).start()
+                threading.Thread(
+                    target=_monitor_loop,
+                    args=(lambda: [probe.stats()], urls),
+                    name="asrt-rshard-mon",
+                    daemon=True,
+                ).start()
             except Exception as e:  # noqa: BLE001
                 print(f"[asrt] slime_rshard measure failed: {e!r}", flush=True)
 
 
 def install(args=None) -> bool:
     """Patch slime's fully-async worker: generate_and_rm_group (looked up in the module at call time) and
-    AsyncRolloutWorker.start (decide + start the shards before the first group is admitted)."""
+    AsyncRolloutWorker.start (decide + start the shards before the first group is admitted).
+    """
     global _patched
     if _patched or _mode() == "off":
         return _patched
@@ -553,7 +674,9 @@ def install(args=None) -> bool:
 _inner_fn = None
 
 
-def generate_rollout_fully_async(args, rollout_id, data_buffer, evaluation: bool = False):
+def generate_rollout_fully_async(
+    args, rollout_id, data_buffer, evaluation: bool = False
+):
     """``--rollout-function-path`` entry: installs the patches, then runs ASRT_RS_INNER."""
     global _inner_fn
     if _mode() != "off":

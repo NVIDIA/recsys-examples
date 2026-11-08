@@ -15,8 +15,10 @@ import shlex
 from dataclasses import dataclass, field
 from typing import Dict, List
 
-PKG_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))     # .../ai_search_plugin
-SRC_ROOT = os.path.dirname(PKG_DIR)                                       # directory that contains ai_search_plugin/
+PKG_DIR = os.path.dirname(
+    os.path.dirname(os.path.abspath(__file__))
+)  # .../ai_search_plugin
+SRC_ROOT = os.path.dirname(PKG_DIR)  # directory that contains ai_search_plugin/
 SGL_BOOT_DIR = os.path.join(PKG_DIR, "adapters", "sgl_boot")
 
 
@@ -24,34 +26,54 @@ SGL_BOOT_DIR = os.path.join(PKG_DIR, "adapters", "sgl_boot")
 class Plan:
     framework: str
     components: List[str]
-    env: Dict[str, str] = field(default_factory=dict)          # every Ray process of the job needs these
-    pythonpath_prepend: List[str] = field(default_factory=list)  # put first on PYTHONPATH (engine sitecustomize)
-    args: List[str] = field(default_factory=list)              # framework CLI arguments to add / replace
-    launcher: List[str] = field(default_factory=list)          # prefix for the training entry script (slime)
-    skipped: Dict[str, str] = field(default_factory=dict)      # component -> reason it was not enabled
+    env: Dict[str, str] = field(
+        default_factory=dict
+    )  # every Ray process of the job needs these
+    pythonpath_prepend: List[str] = field(
+        default_factory=list
+    )  # put first on PYTHONPATH (engine sitecustomize)
+    args: List[str] = field(
+        default_factory=list
+    )  # framework CLI arguments to add / replace
+    launcher: List[str] = field(
+        default_factory=list
+    )  # prefix for the training entry script (slime)
+    skipped: Dict[str, str] = field(
+        default_factory=dict
+    )  # component -> reason it was not enabled
     notes: List[str] = field(default_factory=list)
 
     def full_env(self, base_pythonpath: str = "") -> Dict[str, str]:
         """``env`` plus PYTHONPATH (prepend dirs + ``base_pythonpath``) - what to pass as Ray runtime_env env_vars."""
         env = dict(self.env)
         if self.pythonpath_prepend:
-            parts = list(self.pythonpath_prepend) + [p for p in base_pythonpath.split(":") if p]
+            parts = list(self.pythonpath_prepend) + [
+                p for p in base_pythonpath.split(":") if p
+            ]
             env["PYTHONPATH"] = ":".join(dict.fromkeys(parts))
         return env
 
     def shell(self) -> str:
         """A human-readable recipe (export lines + CLI arguments)."""
-        lines = [f"# ai_search_plugin plan for {self.framework}: {', '.join(self.components) or '(nothing)'}"]
+        lines = [
+            f"# ai_search_plugin plan for {self.framework}: {', '.join(self.components) or '(nothing)'}"
+        ]
         for k, v in self.skipped.items():
             lines.append(f"# skipped {k}: {v}")
         for n in self.notes:
             lines.append(f"# note: {n}")
         if self.pythonpath_prepend:
-            lines.append(f"export PYTHONPATH={shlex.quote(':'.join(self.pythonpath_prepend))}:$PYTHONPATH")
+            lines.append(
+                f"export PYTHONPATH={shlex.quote(':'.join(self.pythonpath_prepend))}:$PYTHONPATH"
+            )
         for k, v in sorted(self.env.items()):
             lines.append(f"export {k}={shlex.quote(v)}")
         if self.launcher:
-            lines.append("# launch the trainer as:  " + " ".join(self.launcher) + " <path/to/slime>/train.py <args>")
+            lines.append(
+                "# launch the trainer as:  "
+                + " ".join(self.launcher)
+                + " <path/to/slime>/train.py <args>"
+            )
         if self.args:
             lines.append("# add to the framework arguments:")
             lines.append("  " + " ".join(shlex.quote(a) for a in self.args))
@@ -64,4 +86,6 @@ def apply_env(plan: Plan, environ=None) -> None:
     for k, v in plan.env.items():
         environ[k] = v
     if plan.pythonpath_prepend:
-        environ["PYTHONPATH"] = plan.full_env(environ.get("PYTHONPATH", ""))["PYTHONPATH"]
+        environ["PYTHONPATH"] = plan.full_env(environ.get("PYTHONPATH", ""))[
+            "PYTHONPATH"
+        ]

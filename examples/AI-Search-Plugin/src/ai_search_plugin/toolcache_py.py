@@ -31,7 +31,9 @@ class ToolCache:
         self._lock = threading.Lock()
         self.hits = self.joins = self.misses = 0
 
-    def lookup(self, key: int, now: float, ticket: int = 0) -> Tuple[ToolCacheResult, Optional[bytes]]:
+    def lookup(
+        self, key: int, now: float, ticket: int = 0
+    ) -> Tuple[ToolCacheResult, Optional[bytes]]:
         with self._lock:
             e = self._d.get(key)
             if e is not None:

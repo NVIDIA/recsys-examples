@@ -57,6 +57,7 @@ def _env(name, default):
 
 def _rank0():
     import torch.distributed as dist
+
     return not dist.is_initialized() or dist.get_rank() == 0
 
 
@@ -72,7 +73,9 @@ def _log(rec):
 def _iter_routers(model_chunks):
     for chunk in model_chunks:
         for name, m in chunk.named_modules():
-            if "mtp" in name:  # MTP layers restart layer numbering at 1 (alias decoder layers); never re-placed
+            if (
+                "mtp" in name
+            ):  # MTP layers restart layer numbering at 1 (alias decoder layers); never re-placed
                 continue
             if type(m).__name__.endswith("TopKRouter") or hasattr(m, "router_replay"):
                 ln = getattr(m, "layer_number", None)
@@ -108,15 +111,22 @@ def _bind(engine, mgr):
 def build_manager(engine):
     """The placement manager, or None on a dense model (no MoE layers found: placement off)."""
     from .megatron_placement import ExpertPlacementManager, _find_moe_layers
+
     tf = engine.tf_config
     if not _find_moe_layers(engine.module):
         if _rank0():
             print("[asrt] place: no MoE layers -> off", flush=True)
         return None
-    mgr = ExpertPlacementManager(engine.module, engine.optimizer, num_layers=tf.num_layers,
-                                 num_experts=getattr(tf, "num_moe_experts", None),
-                                 threshold=_env("ASRT_PLACE_THRESH", 1.05))
-    mgr._asrt_r3 = getattr(engine.engine_config.router_replay, "mode", "disabled") == "R3"
+    mgr = ExpertPlacementManager(
+        engine.module,
+        engine.optimizer,
+        num_layers=tf.num_layers,
+        num_experts=getattr(tf, "num_moe_experts", None),
+        threshold=_env("ASRT_PLACE_THRESH", 1.05),
+    )
+    mgr._asrt_r3 = (
+        getattr(engine.engine_config.router_replay, "mode", "disabled") == "R3"
+    )
     if not mgr._asrt_r3:
         mgr.install_router_counters()
     bound = _bind(engine, mgr)
@@ -124,16 +134,22 @@ def build_manager(engine):
     if mgr._asrt_r3 and os.environ.get("ASRT_PLACE_SELFCHECK", "raise") != "off":
         bad = mgr.check_replay_binding(bound)
         if bad:
-            _fail(f"R3 replay bound to layers {bound} but re-placed layers are {mgr.local_layer_ids()} "
-                  f"(mismatch {bad})")
+            _fail(
+                f"R3 replay bound to layers {bound} but re-placed layers are {mgr.local_layer_ids()} "
+                f"(mismatch {bad})"
+            )
     if _rank0():
-        print(f"[asrt] verl placement manager: layers={len(mgr.layers)} E={mgr.E} ep={mgr.ep} "
-              f"r3={mgr._asrt_r3} bound_replay={nb}", flush=True)
+        print(
+            f"[asrt] verl placement manager: layers={len(mgr.layers)} E={mgr.E} ep={mgr.ep} "
+            f"r3={mgr._asrt_r3} bound_replay={nb}",
+            flush=True,
+        )
     return mgr
 
 
 def _count_routes(mgr, routed, stride):
     import torch
+
     if routed is None:
         return 0
     t = routed.values() if getattr(routed, "is_nested", False) else routed
@@ -160,10 +176,13 @@ def _hf_map(mgr, name, tensor):
             return name, tensor
         if lid < mgr.L:
             logical = int(mgr.physical_to_logical(lid)[slot])
-            return name[: m.start(2)] + str(logical) + name[m.end(2):], tensor
+            return name[: m.start(2)] + str(logical) + name[m.end(2) :], tensor
         return name, tensor
-    m = re.search(r"layers\.(\d+)\.mlp\.(gate\.weight|gate\.e_score_correction_bias|router\.weight|"
-                  r"experts\.[A-Za-z_]+(?:\.weight)?)$", name)
+    m = re.search(
+        r"layers\.(\d+)\.mlp\.(gate\.weight|gate\.e_score_correction_bias|router\.weight|"
+        r"experts\.[A-Za-z_]+(?:\.weight)?)$",
+        name,
+    )
     if m:
         mgr.export_seen.add(int(m.group(1)))
     if m and tensor is not None and int(m.group(1)) < mgr.L:
@@ -173,8 +192,14 @@ def _hf_map(mgr, name, tensor):
                 tensor = tensor.index_select(0, mgr.slot_of[lid].to(tensor.device))
                 _S["export_remapped"] = _S.get("export_remapped", 0) + 1
             from . import place_verify
-            place_verify.on_export(mgr, name, tensor, lid, "gate" if "gate.weight" in name or "router" in name
-                                   else m.group(2))
+
+            place_verify.on_export(
+                mgr,
+                name,
+                tensor,
+                lid,
+                "gate" if "gate.weight" in name or "router" in name else m.group(2),
+            )
         elif not mgr._ident[lid]:
             # an expert / router tensor that is not [E, ...] (e.g. an EP-local chunk) cannot be put back in
             # logical order here -> the rollout engine would get experts in physical order
@@ -197,10 +222,19 @@ def _checked_export(mgr, gen):
     _S["export_checked"] = True
     missing = mgr.check_export()
     if first or missing:
-        _log({"selfcheck": "export", "tensors": n, "moe_layers_seen": len(mgr.export_seen), "missing": missing})
+        _log(
+            {
+                "selfcheck": "export",
+                "tensors": n,
+                "moe_layers_seen": len(mgr.export_seen),
+                "missing": missing,
+            }
+        )
     if missing:
-        _fail(f"export covered MoE layers {sorted(mgr.export_seen)} but not {missing} (HF names not matched -> "
-              f"those experts would reach the rollout engine in physical order)")
+        _fail(
+            f"export covered MoE layers {sorted(mgr.export_seen)} but not {missing} (HF names not matched -> "
+            f"those experts would reach the rollout engine in physical order)"
+        )
 
 
 def install():
@@ -215,8 +249,11 @@ def install():
             def set_target_indices(self, topk_indices, replay_mask=None):
                 b = getattr(self, "_asrt", None)
                 if b is not None and topk_indices is not None:
-                    topk_indices = b[0].map_routed_ids(b[1], topk_indices)  # no-op while the layer is unmoved
+                    topk_indices = b[0].map_routed_ids(
+                        b[1], topk_indices
+                    )  # no-op while the layer is unmoved
                 return orig(self, topk_indices, replay_mask)
+
             return set_target_indices
 
         def make_rec(orig):
@@ -226,6 +263,7 @@ def install():
                     inv = b[0].physical_to_logical(b[1]).to(topk_indices.device)
                     topk_indices = inv[topk_indices.long()].to(topk_indices.dtype)
                 return orig(self, topk_indices)
+
             return record_indices
 
         patch_method(RR, "set_target_indices", make_set)
@@ -238,10 +276,14 @@ def install():
             def initialize(self, *a, **k):
                 out = orig(self, *a, **k)
                 self._asrt_mgr = None
-                if not self.engine_config.forward_only and getattr(self, "optimizer", None) is not None \
-                        and (getattr(self.tf_config, "num_moe_experts", None) or 0) > 0:
+                if (
+                    not self.engine_config.forward_only
+                    and getattr(self, "optimizer", None) is not None
+                    and (getattr(self.tf_config, "num_moe_experts", None) or 0) > 0
+                ):
                     self._asrt_mgr = build_manager(self)
                 return out
+
             return initialize
 
         def make_train(orig):
@@ -253,10 +295,16 @@ def install():
                     step = _S["step"]
                     _S["step"] += 1
                     from . import place_verify
+
                     if _S.get("export_remapped") or _S.get("export_bad"):
                         # what the last weight sync(s) did: tensors put back in logical order / not remappable
-                        _log({"step": step, "export_remapped": _S.pop("export_remapped", 0),
-                              "export_bad": _S.pop("export_bad", [])[:8]})
+                        _log(
+                            {
+                                "step": step,
+                                "export_remapped": _S.pop("export_remapped", 0),
+                                "export_bad": _S.pop("export_bad", [])[:8],
+                            }
+                        )
                     pre = place_verify.before_step(mgr, step)
                     every = _env("ASRT_PLACE_EVERY", 1)
                     # probe / back-off (same as slime_placement): after a balanced check (imbalance <
@@ -271,20 +319,29 @@ def install():
                         rec = {"step": step}
                         t0 = time.perf_counter()
                         if mgr._asrt_r3:
-                            rec["tokens_counted"] = _count_routes(mgr, pend.get("routed"), _env("ASRT_PLACE_STRIDE", 4))
+                            rec["tokens_counted"] = _count_routes(
+                                mgr, pend.get("routed"), _env("ASRT_PLACE_STRIDE", 4)
+                            )
                         rec["count_s"] = time.perf_counter() - t0
                         force = None
                         if os.environ.get("ASRT_PLACE_RANDOM") == "1":
                             import torch
+
                             g = torch.Generator().manual_seed(4242 + step)
-                            force = {lid: torch.randperm(mgr.E, generator=g).tolist() for lid in range(mgr.L)}
+                            force = {
+                                lid: torch.randperm(mgr.E, generator=g).tolist()
+                                for lid in range(mgr.L)
+                            }
                         rec.update(mgr.maybe_rebalance(force))
                         if rec.get("layers"):
                             place_verify.after_move(mgr, step, pre)
                         if rec.get("skipped") and force is None:
-                            _S["skip_left"] = max(0, _env("ASRT_PLACE_PROBE_EVERY", 4) - 1)
+                            _S["skip_left"] = max(
+                                0, _env("ASRT_PLACE_PROBE_EVERY", 4) - 1
+                            )
                         _log(rec)
                 return orig(self, data, loss_function)
+
             return train_batch
 
         def make_export(orig):
@@ -294,6 +351,7 @@ def install():
                 if mgr is None:
                     return gen, peft
                 return _checked_export(mgr, gen), peft
+
             return get_per_tensor_param
 
         def make_shard(orig):
@@ -302,9 +360,13 @@ def install():
                     _S["frozen"] = True
                     if not self._asrt_mgr.is_identity():
                         self._asrt_mgr.restore_identity()
-                    print("[asrt] verl placement: delta_sharded export not supported -> placement frozen "
-                          "at identity", flush=True)
+                    print(
+                        "[asrt] verl placement: delta_sharded export not supported -> placement frozen "
+                        "at identity",
+                        flush=True,
+                    )
                 return orig(self, *a, **k)
+
             return get_per_tensor_param_shard
 
         def make_save(orig):
@@ -313,13 +375,21 @@ def install():
                 if mgr is None or mgr.is_identity():
                     return orig(self, *a, **k)
                 import torch
+
                 saved = mgr.slot_of.clone()
                 mgr.restore_identity()
                 try:
                     return orig(self, *a, **k)
                 finally:
                     ar = torch.arange(mgr.E, device=saved.device)
-                    mgr.apply({lid: saved[lid].tolist() for lid in range(mgr.L) if not torch.equal(saved[lid], ar)})
+                    mgr.apply(
+                        {
+                            lid: saved[lid].tolist()
+                            for lid in range(mgr.L)
+                            if not torch.equal(saved[lid], ar)
+                        }
+                    )
+
             return save_checkpoint
 
         def make_infer(orig):
@@ -328,7 +398,9 @@ def install():
                 if mgr is None or not os.environ.get("ASRT_PLACE_VERIFY_FWD"):
                     return orig(self, data, loss_function=loss_function)
                 from . import place_verify
+
                 return place_verify.forward_ab(self, mgr, orig, data, loss_function)
+
             return infer_batch
 
         if hasattr(E, "infer_batch"):
@@ -354,6 +426,7 @@ def install():
                         routed = None
                     eng._asrt_pending = {"routed": routed}
                 return orig(self, data)
+
             return train_mini_batch
 
         patch_method(W, "train_mini_batch", make_tmb)

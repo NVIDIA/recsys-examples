@@ -15,8 +15,12 @@ import torch
 
 E, H, F, K = 16, 8, 6, 2
 
-_PLACEMENT_MODS = ("ai_search_plugin.adapters.slime_placement", "ai_search_plugin.adapters.verl_placement",
-                   "ai_search_plugin.adapters.megatron_placement", "ai_search_plugin.adapters.place_verify")
+_PLACEMENT_MODS = (
+    "ai_search_plugin.adapters.slime_placement",
+    "ai_search_plugin.adapters.verl_placement",
+    "ai_search_plugin.adapters.megatron_placement",
+    "ai_search_plugin.adapters.place_verify",
+)
 
 
 def fake_env(monkeypatch):
@@ -34,14 +38,20 @@ def fake_env(monkeypatch):
     monkeypatch.setattr(torch.cuda, "current_device", lambda: "cpu")
     monkeypatch.setattr(torch.cuda, "synchronize", lambda *a, **k: None)
     import ai_search_plugin.adapters as pkg
-    for m in _PLACEMENT_MODS:   # fresh module state (_STATE / _S / _V) for every test
+
+    for m in _PLACEMENT_MODS:  # fresh module state (_STATE / _S / _V) for every test
         monkeypatch.delitem(sys.modules, m, raising=False)
-        monkeypatch.delattr(pkg, m.rsplit(".", 1)[1], raising=False)   # `from pkg import mod` reads the attribute
+        monkeypatch.delattr(
+            pkg, m.rsplit(".", 1)[1], raising=False
+        )  # `from pkg import mod` reads the attribute
 
     def cleanup():
         for k in list(sys.modules):
-            if k not in before and (k.split(".")[0] in ("slime", "verl", "megatron") or k in _PLACEMENT_MODS):
+            if k not in before and (
+                k.split(".")[0] in ("slime", "verl", "megatron") or k in _PLACEMENT_MODS
+            ):
                 sys.modules.pop(k, None)
+
     return cleanup
 
 
@@ -86,7 +96,7 @@ class MoE(torch.nn.Module):
         for s in range(E):
             sel = rm[:, s]
             if sel.any():
-                w = torch.softmax(x[sel] @ self.router.weight.t(), -1)[:, s:s + 1]
+                w = torch.softmax(x[sel] @ self.router.weight.t(), -1)[:, s : s + 1]
                 out[sel] += w * self.experts.local_experts[s](x[sel])
         return out
 

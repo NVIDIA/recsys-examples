@@ -16,7 +16,16 @@ from typing import Optional
 from .registry import COMPONENTS, Component, get, list_components, resolve  # noqa: F401
 
 __version__ = "0.1.0"
-__all__ = ["install", "plan", "list_components", "get", "resolve", "COMPONENTS", "Component", "__version__"]
+__all__ = [
+    "install",
+    "plan",
+    "list_components",
+    "get",
+    "resolve",
+    "COMPONENTS",
+    "Component",
+    "__version__",
+]
 
 
 def plan(framework: str, components="default", options: Optional[dict] = None):
@@ -30,7 +39,13 @@ def plan(framework: str, components="default", options: Optional[dict] = None):
     return F.plan(components, options)
 
 
-def install(framework: str, components="default", options: Optional[dict] = None, environ=None, **kw):
+def install(
+    framework: str,
+    components="default",
+    options: Optional[dict] = None,
+    environ=None,
+    **kw,
+):
     """Enable ``components`` for ``framework`` and return the plan.
 
     framework: ``"slime"`` or ``"verl"``.
@@ -44,8 +59,10 @@ def install(framework: str, components="default", options: Optional[dict] = None
     """
     if framework == "slime":
         from .frameworks import slime as F
+
         return F.install(components, options, environ)
     if framework == "verl":
         from .frameworks import verl as F
+
         return F.install(components, options, environ, **kw)
     raise ValueError(f"framework must be 'slime' or 'verl', got {framework!r}")
