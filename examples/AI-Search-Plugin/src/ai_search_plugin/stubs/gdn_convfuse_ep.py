@@ -3,7 +3,7 @@
 What it does: GDN short-conv fusion plus four EP communication items from the training-speed line.
 
 Model family: GDN / MoE.  Frameworks: slime.
-Status, source location and what is left: docs/PORTING.md (section ``gdn_convfuse_ep``).
+What it would do and what is left: docs/IMPLEMENTATION-NOTES.md (section ``gdn_convfuse_ep``).
 """
 from . import not_ported
 

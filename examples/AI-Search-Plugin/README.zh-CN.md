@@ -103,7 +103,7 @@ AI 搜属于"多轮调工具"的 RL 训练，和代码智能体、多轮游戏�
 
 `weight_sync` 里的直连 HTTP 路径（`ws direct`）默认关闭：在 80B 模型上偶发卡死（每 60 次同步 1 次），根因未确认。
 
-还有 5 个组件只登记了名字、还没有代码（MTP 投机解码、DSA 选块回放、3 个 GDN 相关），见 [docs/PORTING.md](docs/PORTING.md)。
+还有 5 个组件只登记了名字、还没有代码（MTP 投机解码、DSA 选块回放、3 个 GDN 相关），见 [docs/IMPLEMENTATION-NOTES.md](docs/IMPLEMENTATION-NOTES.md)。
 
 ---
 

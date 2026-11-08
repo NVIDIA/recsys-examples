@@ -10,9 +10,9 @@ entry and module.
 - **switch**: what `ai_search_plugin.install()` sets for you.  Env variables keep the `ASRT_` prefix of the original
   code base; logs are prefixed `[asrt]` and go to `$ASRT_LOG_DIR/*.jsonl` when that is set.
 - **status**: *ported* = the code is in this package; *stub* = registry entry + stub module only (see
-  [PORTING.md](PORTING.md)).
+  [IMPLEMENTATION-NOTES.md](IMPLEMENTATION-NOTES.md)).
 
-Sparse-attention kernels and other components specific to one proprietary model are not part of this plugin.
+Components that only fit one specific model structure are not part of this plugin.
 
 ### model-agnostic
 

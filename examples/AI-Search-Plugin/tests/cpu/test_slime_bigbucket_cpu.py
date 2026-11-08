@@ -198,7 +198,7 @@ class FakeEngine:
     def __init__(self, i, stats):
         self.i, self.stats = i, stats
         # Ray actor handles carry _actor_id (the parsync path keys its per-engine groups by it).  Added in the port:
-        # the original fixture lacked it, so these tests failed in the source repo too (stale fixture, not a code bug).
+        # the original fixture lacked it, so these tests failed with that fixture too (stale fixture, not a code bug).
         self._actor_id = bytes([i]) * 16
         self.inbox = {}  # group -> list of received tensors
         self.state = {}

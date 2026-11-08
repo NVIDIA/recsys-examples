@@ -812,7 +812,7 @@ def test_cut_group_requeue_no_deadlock():
 
 def test_flush1_cut_requeue_e2e(timeout_s=120.0, attempts=4):
     """Port note: whether a cut group is still running at a later sync (the cut+requeue path) is timing dependent -
-    in the source repo this test also missed the path in ~1 of 4 isolated runs.  Every attempt checks all
+    this test also missed the path in about 1 of 4 isolated runs.  Every attempt checks all
     correctness assertions; the path-coverage assertion only needs one of `attempts` runs to exercise the path."""
     for i in range(attempts):
         if _flush1_cut_requeue_e2e_once(timeout_s):

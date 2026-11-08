@@ -3,7 +3,7 @@
 What it does: cuDNN gated-delta-net (GDN) forward/backward kernels in training in place of the FLA Triton kernels (slime only; the verl use was deprecated).
 
 Model family: GDN linear attention.  Frameworks: slime.
-Status, source location and what is left: docs/PORTING.md (section ``gdn_cudnn``).
+What it would do and what is left: docs/IMPLEMENTATION-NOTES.md (section ``gdn_cudnn``).
 """
 from . import not_ported
 

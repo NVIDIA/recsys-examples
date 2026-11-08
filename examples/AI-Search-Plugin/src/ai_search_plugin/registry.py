@@ -15,7 +15,7 @@ Categories
 
 Status
     ``ported``: code is in this package (see ``modules``); ``stub``: only a registry entry and a stub module that
-    raises on install - see docs/PORTING.md for where the source lives and what is left.
+    raises on install - see docs/IMPLEMENTATION-NOTES.md for what is left.
 
 Dropping a component later = deleting its ``Component(...)`` entry (and its module).  Nothing else refers to a
 component by name except the registry, the framework entry points (which read the registry) and the tests.
@@ -265,7 +265,7 @@ def resolve(framework: str, components="default") -> List[Component]:
         if not c.applies_to(framework):
             raise ValueError(f"component {n!r} does not apply to {framework} (frameworks: {c.frameworks})")
         if c.status != PORTED:
-            raise ValueError(f"component {n!r} is a stub (not ported yet, see docs/PORTING.md)")
+            raise ValueError(f"component {n!r} is a stub (not ported yet, see docs/IMPLEMENTATION-NOTES.md)")
         if n not in chosen:
             chosen.append(n)
     out = [get(n) for n in chosen]

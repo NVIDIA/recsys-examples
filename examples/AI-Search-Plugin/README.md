@@ -103,7 +103,7 @@ Two easy mistakes in any multi-turn tool-using RL: pass **token IDs** between tu
 
 The direct-HTTP path of `weight_sync` (`ws direct`) is off by default: it caused rare hangs on the 80B model (1 in 60 syncs); root cause not confirmed.
 
-Five more components are registered by name but have no code yet (MTP speculative decoding, DSA selection replay, three GDN items); see [docs/PORTING.md](docs/PORTING.md).
+Five more components are registered by name but have no code yet (MTP speculative decoding, DSA selection replay, three GDN items); see [docs/IMPLEMENTATION-NOTES.md](docs/IMPLEMENTATION-NOTES.md).
 
 ---
 
