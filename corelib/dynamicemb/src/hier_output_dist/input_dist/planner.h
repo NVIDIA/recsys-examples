@@ -112,9 +112,11 @@ BucketizedKeys bucketize_keys(const PlanInput &input, const at::Tensor &dist_typ
 // Index dedup's fan-out of the deduplicated rows to the original rows, in the
 // format of Fanout (common.h): a row's original rows are
 // exp_idx[exp_off[row] .. exp_off[row + 1]), in increasing order. A row of
-// more than kHeavy is heavy: it takes a slot (by increasing row) and
-// consecutive sub-tasks of kHeavy original rows. Entries past `count` are
-// clamped garbage nobody reads.
+// more than kHeavy is heavy: it takes a slot and consecutive sub-tasks of
+// kHeavy original rows, slot s the sub-tasks [first[s], first[s + 1]) (the
+// last slot's up to count[1]). The slots go in the order the kernel reserves
+// them, which can change from run to run; no sum depends on it (bucketize.cu,
+// fanout_runs_kernel). Entries past `count` are clamped garbage nobody reads.
 struct FanoutTables {
   at::Tensor exp_off;  // int32 [rows + 1]
   at::Tensor exp_idx;  // int32 [original rows]
@@ -124,9 +126,17 @@ struct FanoutTables {
   at::Tensor pos;      // int32 [max_slots]: the bucketized row each slot's row went to
   at::Tensor first;    // int32 [max_slots]: the first sub-task of each slot
 };
-// From reverse_indices (original row -> deduplicated row) and the bucketize's
-// inv, whose size is the number of deduplicated rows.
-FanoutTables fanout_tables(const at::Tensor &reverse_indices, const at::Tensor &inv);
+// The words the fan-out's kernel keeps across its CTAs: the counter of the
+// heavy rows' slots and sub-tasks, and the CTA ticket (int64 each). They are
+// 0 between calls: the kernel's last CTA resets them.
+constexpr int64_t kFanoutWords = 2;
+// From reverse_indices (original row -> deduplicated row, in [0, rows)) and
+// the bucketize's inv, whose size is the number of deduplicated rows (rows).
+// words: int64 [kFanoutWords] on the GPU of inv, zeroed once, which the calls
+// share (the in channel's: its input dists run on one stream); undefined, a
+// zeroed tensor of this call's (the hook's).
+FanoutTables fanout_tables(const at::Tensor &reverse_indices, const at::Tensor &inv,
+                           const at::Tensor &words = at::Tensor());
 
 // The node's part of a call (the in channel): the layout every rank of the node computes alike
 // from the node's offsets, and the push of this rank's keys into their places (planner.cu,

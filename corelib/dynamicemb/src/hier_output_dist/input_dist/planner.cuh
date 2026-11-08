@@ -24,7 +24,9 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 // and chunks) runs on one CTA of kThreads threads (kOneCta), which loops over
 // them and syncs with __syncthreads; its scans are cub::BlockScan, a tile at
 // a time. No kernel waits for another CTA: a step that needs every item done
-// goes on in its next kernel.
+// goes on in its next kernel, or in the kernel's last CTA out (the fan-out's
+// count, bucketize.cu: each CTA takes a ticket once its items are done, and
+// the one that takes the last goes on; none waits for it).
 #pragma once
 
 #include <ATen/ATen.h>

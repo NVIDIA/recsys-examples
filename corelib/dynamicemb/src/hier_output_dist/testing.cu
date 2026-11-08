@@ -94,10 +94,13 @@ std::map<std::string, at::Tensor> bucketize_test(
   return named;
 }
 
-// Index dedup's fan-out (fanout_tables), by name.
-std::map<std::string, at::Tensor> fanout_test(at::Tensor reverse_indices, at::Tensor inv) {
+// Index dedup's fan-out (fanout_tables), by name. words: the kernel's words
+// (int64 [kFanoutWords]), as the in channel keeps them across calls; none, a
+// zeroed tensor of this call's.
+std::map<std::string, at::Tensor> fanout_test(at::Tensor reverse_indices, at::Tensor inv,
+                                              c10::optional<at::Tensor> words) {
   c10::cuda::CUDAGuard guard(inv.device());
-  const FanoutTables fanout = fanout_tables(reverse_indices, inv);
+  const FanoutTables fanout = fanout_tables(reverse_indices, inv, words.value_or(at::Tensor()));
   return {{"exp_off", fanout.exp_off}, {"exp_idx", fanout.exp_idx}, {"slot", fanout.slot},
           {"sub", fanout.sub},         {"count", fanout.count},     {"pos", fanout.pos},
           {"first", fanout.first}};
@@ -487,8 +490,9 @@ void bind_testing(py::module &py_module) {
                 py::arg("weights"), py::arg("dist_types"), py::arg("world_size"),
                 py::arg("input_offsets"));
   py_module.def("hier_output_dist_fanout", &fanout_test,
-                "Index dedup's fan-out of the bucketized rows, by name", py::arg("reverse_indices"),
-                py::arg("inv"));
+                "Index dedup's fan-out of the bucketized rows, by name; words: the kernel's "
+                "counter and CTA ticket (int64 [2], zero), which it leaves at zero, or None",
+                py::arg("reverse_indices"), py::arg("inv"), py::arg("words") = py::none());
   py_module.def("hier_output_dist_node_layout", &node_layout_test,
                 "One rank's node layout on its node's offsets, and on one node given its own "
                 "part of node_keys and its src its KJT, by name",

@@ -1043,8 +1043,12 @@ or a few ordinary kernels. A kernel over items (keys, rows, occurrences)
 runs a thread per item; a kernel over a step's small tables (sized by the
 nodes, ranks, features and chunks) runs on one CTA, which loops over them.
 No kernel waits for another CTA: a step that needs every item done goes on
-in its next kernel. The tensors' sizes are what the host knows from the
-call's keys, the capacities and the topology. The counts that only the
+in its next kernel, or in the kernel's last CTA out. That is the fan-out
+table's counts (section 10.1): each CTA takes a ticket once its items are
+done, and the CTA that takes the last ticket goes on. It goes on because
+every other CTA has already arrived, not because it waited for one. The
+tensors' sizes are what the host knows from the call's keys, the
+capacities and the topology. The counts that only the
 device knows (valid keys, node-unique keys, chunks) stay on the device, and
 no tensor's size depends on them; a kernel reads such a count to bound its
 own loop. So the host reads no device value before the second wait, and no
@@ -1053,8 +1057,9 @@ an index taken from device data is clamped first: a call that does not fit
 runs every step on what arrived and stays in bounds.
 
 With the benchmark's configuration (8 features, one owner rule), the
-bucketize queues 38 kernels and copies per call (DynamicEmb's index dedup
-and the fan-out table included), and the steps after it 5 on one node and
+bucketize queues 29 kernels and copies per call (DynamicEmb's index dedup
+and the fan-out table included: 38 when the fan-out took 10 launches after
+its sort, where it now takes one), and the steps after it 5 on one node and
 about 85 across nodes, CUB's included. The node's part of a call is three
 comm kernels (`node_exchange`, `node_key_push`, `node_done`); on one node a
 fourth kernel copies the own part. Across nodes the rail's part is three
@@ -1095,8 +1100,32 @@ bucketize (`bucketize_rows`, `bucketize.cu`), named after TorchRec's
 3. **The fan-out table**: for each deduplicated row, its
    original rows in increasing order, from a stable radix sort of the
    reverse indices. A row with more than 64 original rows is a *heavy row*:
-   it gets a slot and consecutive sub-tasks of 64 original rows, numbered
-   by cumulative sums in row order.
+   it gets a slot and consecutive sub-tasks of 64 original rows. Two
+   kernels make the table, one before the sort (`original_rows_kernel`)
+   and one after it (`fanout_runs_kernel`):
+   * The kernel before the sort writes each original row's sort key and
+     index, and where the bucketize put each row.
+   * The kernel after the sort runs a thread per sorted position. The
+     first position of each row's run writes where the row's original rows
+     start, and so do the rows without original rows around it, with
+     grid-wide loops for those before the first run and after the last
+     (index dedup leaves many rows past the valid ones).
+   * A run of more than 64 positions is a heavy row, and its warp takes
+     it. The warp finds where the run ends, 32 probes at a time: one round
+     for a run of up to 96 positions, seven for a million. The run's first
+     thread then reserves the row's slot and its sub-tasks with one 64-bit
+     atomic add: the slot is the old word's high half, the first sub-task
+     its low half. So consecutive slots have consecutive ranges of
+     sub-tasks. The warp writes the sub-tasks, 32 at a time.
+   * The kernel's last CTA out writes the counts (heavy rows, sub-tasks)
+     and sets the counter and the ticket back to 0. The in channel keeps
+     them from call to call.
+
+   The slots go in the order the heavy rows reserve them, which can
+   differ between two calls on the same keys. No sum depends on that
+   order: a heavy row's
+   sub-tasks stay consecutive and in original-row order, so the heavy
+   rows' sums and the gradient keep their bits (section 18).
 
 **The owner rules by key width.** On TorchRec's path DynamicEmb bucketizes
 the KJT as the caller gave it, and the bucketize reads each key as an
@@ -1954,7 +1983,7 @@ The capacities are the ones in place (section 5), and `row_bytes` and
 | the proxy's rows before each key (`node_exp_off`) | `8 × remote_keys` | per call |
 | the put lists and the ready counters | `24 × max_chunks + 16 × owner_chunks + 32 × num_nodes × num_features` | per call |
 | index dedup's fan-out table | about 13 bytes per original key (on this path the deduplicated KJT keeps the original length) | per call |
-| the bucketize, in the caller's pool | at its peak 32 bytes per key, its outputs (8) included, for either owner rule; about 60 with index dedup while the fan-out table is made | transient |
+| the bucketize, in the caller's pool | at its peak 32 bytes per key, its outputs (8) included, for either owner rule; about 60 with index dedup, measured while the fan-out table was made by scans, when the fan-out's own tensors reached about 53 bytes per key; they now reach about 28 at most, during its sort (from the code) | transient |
 | the planner, in the caller's pool | its largest step: across nodes the proxy's about 99 bytes per entry of `remote_keys`, the requester's about 73 per key, or the owner's gather about 65 per entry of `lookup_keys`, at most 2^22 entries at a time; on one node about 20 bytes per key | transient |
 
 The transient figures are upper bounds from the peaks measured with the
@@ -2209,8 +2238,14 @@ lookup's backward adds up the same terms as TorchRec's:
 **Run to run.** Every sum the dist makes has a fixed order: a key's rows at
 its proxy by requester and position, and index dedup's sums by original
 row. The planner numbers keys, slots and tasks with stable sorts and
-cumulative sums, which give the same result every run, and adds weights as
-whole numbers. None of its steps adds up or hands out slots with atomics. So
+cumulative sums, which give the same result every run (all but index
+dedup's heavy slots and their sub-tasks, below), and adds weights as
+whole numbers. None of its steps adds up values with atomics. One step hands
+out slots with an atomic: index dedup's heavy rows take their slots and
+sub-tasks in the order the fan-out's kernel reserves them, which can change
+from run to run (section 10.1). No sum depends on that order: a heavy row's
+sub-tasks stay consecutive and in original-row order, so its sums add the
+same rows in the same order. So
 the output rows and the gradient handed to the lookup are the same bits every
 run. That holds on one node and across nodes, whether a stream wraps its
 ring or not. The keys in the owner's
@@ -2282,7 +2317,7 @@ KJT offsets.
   and the hottest owner's need sizes `lookup_keys` on every rank (section
   15).
 * **Host time of the input dist**: across nodes an input dist launches
-  about 125 kernels, CUB's included (section 10), and the training thread
+  about 115 kernels, CUB's included (section 10), and the training thread
   spends their host time, also under the train pipelines.
 * **Size of one call**: a GPU may receive, deduplicate or look up fewer than
   about 2.1 billion keys of each kind in one call (section 4.3).

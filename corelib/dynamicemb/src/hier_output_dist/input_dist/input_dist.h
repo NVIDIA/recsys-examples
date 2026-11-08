@@ -111,6 +111,9 @@ class InChannel {
   ncclDevComm dev_;
   Sizes sizes_;
   at::Tensor dist_types_;  // int32 [num_features] on the GPU: the bucketize's rule of each feature
+  // int64 [kFanoutWords] on the GPU: the fan-out kernel's counter and CTA ticket (fanout_tables),
+  // zeroed once; each call's kernel leaves them at 0
+  at::Tensor fanout_words_;
   bool weights_, node_dedup_;
   int device_;
   int64_t seq_ = 0;  // the calls run so far: the current one's sequence number

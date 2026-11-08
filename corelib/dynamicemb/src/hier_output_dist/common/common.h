@@ -152,6 +152,7 @@ __host__ __device__ inline uint64_t buffer_end(uint64_t bytes) {
 // rows (the bucketize's): a row's are
 // exp_idx[exp_off[row] .. exp_off[row + 1]), in increasing order. A row with
 // more than kHeavy is heavy, and split into sub-tasks of kHeavy original rows.
+// Its slot can change from run to run (planner.h).
 struct Fanout {
   const int32_t *exp_off;  // [rows + 1]
   const int32_t *exp_idx;  // [original rows]
@@ -160,7 +161,8 @@ struct Fanout {
                            // a row's sub-tasks consecutive and in entry order
   const int64_t *count;    // [2] heavy rows (slots), heavy sub-tasks
   const int32_t *pos;      // [slots] the bucketized row of each heavy row
-  const int32_t *first;    // [slots] its first sub-task
+  const int32_t *first;    // [slots] its first sub-task: slot s has [first[s], first[s + 1]),
+                           // the last slot up to count[1]
 };
 
 // ── the proxy's stream and push orders (num_nodes > 1) ──────────────────────

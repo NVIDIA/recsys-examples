@@ -30,7 +30,13 @@ and the push of its node's keys, on one GPU, on plain tensors:
 * index dedup's fan-out (``hier_output_dist_fanout``) against a torch
   reference: the original rows of each row, its heavy rows of more than 64,
   their slots and consecutive sub-tasks, and where the bucketize put each of
-  them;
+  them. The kernel numbers the slots in the order its heavy rows reserve
+  them, which can change from run to run, so the heavy tables are compared
+  per row, and the numbering is checked: the heavy rows' slots a
+  permutation of [0, heavy rows), each slot's sub-tasks a range of its own
+  row's, the ranges in slot order from 0. Two more calls with the words the
+  in channel keeps across calls give the same tables per row, and leave the
+  words at 0;
 * the node layout and the push (``hier_output_dist_node_layout``,
   ``hier_output_dist_node_push``): the test plays every rank of one node (the
   bucketize of a batch of its own; the node's offsets, their
@@ -503,6 +509,16 @@ FANOUT_CASES = [
     FanoutCase("one row", rows=1, valid=1, originals=1000),
     FanoutCase("no rows", rows=0, valid=0, originals=0),
     FanoutCase("no original rows", rows=50, valid=50, originals=0),
+    # about 15,000 sub-tasks of one row, and many rows past the valid ones
+    FanoutCase("a very hot row", rows=200000, valid=1000, originals=1000000, hot=0.98),
+    # rows 0-2 hold no original rows, so the first run is row 3's (heavy)
+    FanoutCase(
+        "rows before the first run",
+        rows=500,
+        valid=500,
+        originals=4000,
+        fixed=((0, 0), (1, 0), (2, 0), (3, 70)),
+    ),
 ]
 
 
@@ -529,7 +545,8 @@ def fanout_reference(
     """On the host: each row's original rows in increasing order; the heavy
     rows (more than HEAVY) in row order, each with its slot and its
     sub-tasks of HEAVY original rows, consecutive and in entry order; and
-    each heavy row's place among the bucketized keys (inv's inverse)."""
+    each heavy row's place among the bucketized keys (inv's inverse). The
+    slots go in row order, as fanout_by_row renumbers the kernel's."""
     counts = torch.bincount(reverse_indices, minlength=rows)
     exp_off = torch.cat([torch.zeros(1, dtype=torch.int64), torch.cumsum(counts, 0)])
     heavy_rows = torch.nonzero(counts > HEAVY).flatten()
@@ -554,6 +571,47 @@ def fanout_reference(
     }
 
 
+def fanout_by_row(
+    out: Dict[str, torch.Tensor],
+) -> Tuple[Optional[Dict[str, torch.Tensor]], bool]:
+    """The heavy tables of the kernel's fan-out with its slots renumbered in
+    row order, as fanout_reference numbers them (None when they cannot be),
+    and whether its numbering holds: the heavy rows' slots a permutation of
+    [0, heavy rows), and slot s's sub-tasks [first[s], first[s + 1]) (the
+    last slot's up to count[1]) from 0 on, each slot's of its own row."""
+    slot = out["slot"].cpu().long()
+    slots, subs = out["count"].cpu().tolist()
+    heavy_rows = torch.nonzero(slot >= 0).flatten()
+    heavy_slots = slot[heavy_rows]  # the slot of each heavy row, in row order
+    if heavy_rows.numel() != slots or not torch.equal(
+        torch.sort(heavy_slots).values, torch.arange(slots)
+    ):
+        return None, False
+    first = out["first"].cpu().long()[:slots]
+    ends = torch.cat([first[1:], torch.tensor([subs])])
+    sub = out["sub"].cpu().long()[: 2 * subs].view(-1, 2)
+    row_of_slot = torch.empty(slots, dtype=torch.int64)
+    row_of_slot[heavy_slots] = heavy_rows
+    sound = (
+        (slots > 0 or subs == 0)
+        and (slots == 0 or int(first[0]) == 0)
+        and bool((ends > first).all())
+        and torch.equal(sub[:, 0], torch.repeat_interleave(row_of_slot, ends - first))
+    )
+    if not sound:
+        return None, False
+    renumbered = slot.clone()
+    renumbered[heavy_rows] = torch.arange(slots)
+    row_subs = (ends - first)[heavy_slots]
+    return {
+        "slot": renumbered,
+        # each slot's sub-tasks are its row's, in order: a stable sort by row
+        "sub": sub[torch.sort(sub[:, 0], stable=True).indices].flatten(),
+        "pos": out["pos"].cpu().long()[heavy_slots],
+        "first": torch.cumsum(row_subs, 0) - row_subs,
+    }, True
+
+
 def run_fanout_case(case: FanoutCase, seed: int) -> Dict[str, bool]:
     generator = torch.Generator().manual_seed(seed)
     reverse_indices = reverse_indices_of(case, generator)
@@ -562,30 +620,47 @@ def run_fanout_case(case: FanoutCase, seed: int) -> Dict[str, bool]:
     ref = fanout_reference(reverse_indices, inv.long(), case.rows)
     max_slots = case.originals // (HEAVY + 1) + 1
     max_subs = 2 * case.originals // HEAVY + 2
-    slots, subs = ref["count"].tolist()
-    # dtype and size of each table, and its entries that hold something
+    # dtype and size of each table
     tables = {
-        "exp_off": (torch.int32, case.rows + 1, None),
-        "exp_idx": (torch.int32, case.originals, None),
-        "slot": (torch.int32, case.rows, None),
-        "sub": (torch.int64, 2 * max_subs, 2 * subs),
-        "count": (torch.int64, 2, None),
-        "pos": (torch.int32, max_slots, slots),
-        "first": (torch.int32, max_slots, slots),
+        "exp_off": (torch.int32, case.rows + 1),
+        "exp_idx": (torch.int32, case.originals),
+        "slot": (torch.int32, case.rows),
+        "sub": (torch.int64, 2 * max_subs),
+        "count": (torch.int64, 2),
+        "pos": (torch.int32, max_slots),
+        "first": (torch.int32, max_slots),
     }
     checks = {
         "shapes": all(
             (out[name].dtype, out[name].numel()) == (dtype, size)
-            for name, (dtype, size, _) in tables.items()
+            for name, (dtype, size) in tables.items()
         )
     }
-    for name, (_, _, valid) in tables.items():
-        checks[name] = torch.equal(out[name].cpu().long()[:valid], ref[name])
-    again = planner(hier_output_dist_fanout, reverse_indices.cuda(), inv.cuda())
-    checks["again"] = all(
-        torch.equal(again[name][:valid], out[name][:valid])
-        for name, (_, _, valid) in tables.items()
-    )
+    exact = ("exp_off", "exp_idx", "count")
+    for name in exact:
+        checks[name] = torch.equal(out[name].cpu().long(), ref[name])
+    # the heavy tables per row: the -1 slots exactly, and each heavy row's
+    # slot (renumbered), pos, first sub-task and sub-tasks
+    by_row, checks["slots"] = fanout_by_row(out)
+    for name in ("slot", "sub", "pos", "first"):
+        checks[name] = by_row is not None and torch.equal(by_row[name], ref[name])
+    # again, twice, with the words the in channel keeps across calls (int64
+    # [2], zeroed once): the same tables per row, and the words back at 0
+    words = torch.zeros(2, dtype=torch.int64, device="cuda")
+    checks["again"] = checks["words"] = True
+    for _ in range(2):
+        again = planner(
+            hier_output_dist_fanout, reverse_indices.cuda(), inv.cuda(), words
+        )
+        again_by_row, sound = fanout_by_row(again)
+        checks["again"] = (
+            checks["again"]
+            and sound
+            and by_row is not None
+            and all(torch.equal(again_by_row[name], by_row[name]) for name in by_row)
+            and all(torch.equal(again[name], out[name]) for name in exact)
+        )
+        checks["words"] = checks["words"] and not bool(words.any())
     return checks
 
 
