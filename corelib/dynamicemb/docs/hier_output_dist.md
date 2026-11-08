@@ -1329,15 +1329,20 @@ read:
 `input_dist/proxy.cu`); with `node_dedup=False` it takes three, without the
 hash table, the pass and the scan:
 
-* one kernel clears a hash table of the call: a power of two of at least
-  `2 × remote_keys` int32 slots, from the caching allocator. Its threads
-  also find each (requester, bucket feature) block of the remote part, by a
+* one kernel clears a hash table of the call, from the caching allocator:
+  a power of two of at least `2 × remote_keys` buckets, each the int32
+  head of a chain, and an int32 chain link per occurrence. Its threads also
+  find each (requester, bucket feature) block of the remote part, by a
   binary search: a requester's occurrences go by owner node, then feature;
-* a thread per occurrence finds its identity (table, key) by linear
-  probing, or takes an empty slot with `atomicCAS`. On the identity it then
-  lowers the representative with an `atomicMin` of (bucket feature,
-  occurrence), counts the occurrence, puts it in a list of the identity's
-  occurrences, and adds its weight as an `int64`;
+* a thread per occurrence finds its identity (table, key) with index
+  dedup's chained insert (`chain_insert`, `src/dedup_chain.cuh`, which
+  `segmented_unique` runs too). A chain links the occurrences that claimed
+  an identity, one per identity. The occurrence walks its bucket's chain
+  and ends on its identity's occurrence, or appends itself at the end with
+  an `atomicCAS` and claims a new identity. On the identity it then lowers
+  the representative with an `atomicMin` of (bucket feature, occurrence),
+  counts the occurrence, puts it in a list of the identity's occurrences,
+  and adds its weight as an `int64`;
 * a pass marks the representatives, and a CUB scan (three launches) counts
   them before each occurrence;
 * one CTA counts the representatives of each block: the keys of each
@@ -1346,10 +1351,12 @@ hash table, the pass and the scan:
   and its rank among its key's occurrences from the list. The
   representative writes its key's tables.
 
-The slot is the high bits of `murmur3_fmix64(key ^ seed)`, mixed with the
-table. An owner rule fixes the low bits of the key (`roundrobin`) or of
+The bucket is the high bits of `murmur3_fmix64(key ^ seed)`, mixed with
+the table. An owner rule fixes the low bits of the key (`roundrobin`) or of
 `murmur3_fmix64(key)` (`hash_roundrobin`) for all keys of one owner, so
-neither gives the slot.
+neither gives the bucket. On a proxy's keys under either rule, a CPU study
+of up to 4 million occurrences finds what random buckets give: chains of a
+few occurrences, and fewer than one comparison per occurrence on average.
 
 **Names.** A table that holds data from another step is named after that
 data where it came from, with a prefix for where it is now. The requesters
@@ -2031,15 +2038,15 @@ does: the push reads the KJT's keys (section 10.1).
 
 The proxy's figure counts its steps' live tensors. Its node dedup holds
 about 52 bytes per entry, 64 with weights: during the insert its hash table
-(8 to 16 bytes) and each identity's state (24, or 32 with weights), then
-that state, the representatives before each occurrence and its tables per
-occurrence and per key. By the same count its sorts held about 79 bytes
-per entry, and 99 with weights. The 99 measured earlier with the
-benchmark's batches, which carry no weights, was of an older proxy. With
-`chunk_weight` above 1, as by default, its next step holds each key's
-weight (int32) and the weights before each key (int64) while it cuts its
-chunks and gives the slots: about 60 bytes per entry, 64 with weights, now
-its largest.
+(the bucket heads, 8 to 16 bytes, and the chain links, 4) and each
+identity's state (24, or 32 with weights), then that state, the
+representatives before each occurrence and its tables per occurrence and
+per key. By the same count its sorts held about 79 bytes per entry, and 99
+with weights. The 99 measured earlier with the benchmark's batches, which
+carry no weights, was of an older proxy. With `chunk_weight` above 1, as by
+default, its next step holds each key's weight (int32) and the weights
+before each key (int64) while it cuts its chunks and gives the slots: about
+60 bytes per entry, 64 with weights, now its largest.
 
 The constructors of the layouts size the window's buffers as above
 (`CtrlLayout`, `KeysLayout` and `RowsLayout`, in `window.h`). The buffers
@@ -2293,7 +2300,9 @@ slots and their sub-tasks, below), and adds weights as whole numbers. The
 proxy's node dedup takes each key's representative with an atomic minimum,
 counts its occurrences and adds its weights with atomic adds, and keeps a
 list of its occurrences that it reads only as a set. No step reads which
-slot of its hash table a key took. None of the planner's steps adds up
+bucket of its hash table a key took, and no result depends on which of its
+occurrences claimed it: that occurrence only holds the key's state. None of
+the planner's steps adds up
 floating-point values with atomics. One step hands out slots with an atomic
 whose order shows: index dedup's heavy rows take their slots and sub-tasks
 in the order the fan-out's kernel reserves them, which can change from run
@@ -2487,7 +2496,8 @@ Paths from `corelib/dynamicemb`.
       planner's kernels share (how they are launched, searches in sorted
       tables, the starts of sorted runs, a CTA's scans). The bucketize is in
       `bucketize.cu` and the proxy in `proxy.cu` (with its node dedup's
-      hash table, `Identities`, and the levels of its chunks by weight,
+      hash table, `Identities`, which takes index dedup's chained insert
+      from `src/dedup_chain.cuh`, and the levels of its chunks by weight,
       `Levels`); the node layout, the push, the count
       message and the rail layout as the hooks run them (`node_layout`,
       `push_to_node_keys`, `count_message`, `rail_layout`), the owner's KJT

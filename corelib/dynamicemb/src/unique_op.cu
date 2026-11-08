@@ -16,6 +16,7 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 ******************************************************************************/
 
 #include "check.h"
+#include "dedup_chain.cuh"
 #include "lookup_forward.h"
 #include "torch_utils.h"
 #include "unique_op.h"
@@ -45,70 +46,8 @@ constexpr int BLOCK_SIZE = 256;
 // block hides the scattered-probe latency with a full complement of warps.
 constexpr int SHARED_BLOCK_SIZE = 1024;
 
-// MurmurHash3_32 hash function
-template <typename Key, uint32_t m_seed = 0> struct MurmurHash3_32 {
-  __forceinline__ __host__ __device__ static uint32_t rotl32(uint32_t x,
-                                                             int8_t r) {
-    return (x << r) | (x >> (32 - r));
-  }
-
-  __forceinline__ __host__ __device__ static uint32_t fmix32(uint32_t h) {
-    h ^= h >> 16;
-    h *= 0x85ebca6b;
-    h ^= h >> 13;
-    h *= 0xc2b2ae35;
-    h ^= h >> 16;
-    return h;
-  }
-
-  __forceinline__ __host__ __device__ static uint32_t hash(const Key &key) {
-    constexpr int len = sizeof(Key);
-    const uint8_t *const data = reinterpret_cast<const uint8_t *>(&key);
-    constexpr int nblocks = len / 4;
-    uint32_t h1 = m_seed;
-    constexpr uint32_t c1 = 0xcc9e2d51;
-    constexpr uint32_t c2 = 0x1b873593;
-
-    const uint32_t *const blocks =
-        reinterpret_cast<const uint32_t *>(data + nblocks * 4);
-    for (int i = -nblocks; i; i++) {
-      uint32_t k1 = blocks[i];
-      k1 *= c1;
-      k1 = rotl32(k1, 15);
-      k1 *= c2;
-      h1 ^= k1;
-      h1 = rotl32(h1, 13);
-      h1 = h1 * 5 + 0xe6546b64;
-    }
-
-    const uint8_t *tail = data + nblocks * 4;
-    uint32_t k1 = 0;
-    switch (len & 3) {
-    case 3:
-      k1 ^= tail[2] << 16;
-      [[fallthrough]];
-    case 2:
-      k1 ^= tail[1] << 8;
-      [[fallthrough]];
-    case 1:
-      k1 ^= tail[0];
-      k1 *= c1;
-      k1 = rotl32(k1, 15);
-      k1 *= c2;
-      h1 ^= k1;
-    }
-
-    h1 ^= len;
-    return fmix32(h1);
-  }
-
-  // Combine two hash values (for compound keys)
-  __forceinline__ __host__ __device__ static uint32_t
-  hash_combine(uint32_t h1, uint32_t h2) {
-    h1 ^= h2 + 0x9e3779b9 + (h1 << 6) + (h1 >> 2);
-    return h1;
-  }
-};
+// (MurmurHash3_32, the bucket hash, and the chained insert, chain_insert, are
+// in dedup_chain.cuh, which the hierarchical dist's node dedup shares.)
 
 // Atomic operation overloads for 64-bit types
 __forceinline__ __device__ long atomicAdd(long *address, long val) {
@@ -230,10 +169,11 @@ __global__ void segmented_unique_prepare(int *head, int *next_arr,
 //   - table_id t comes from a binary search on segmented_range cached in shared;
 //     the bucket space is PER-TABLE (offset 4*seg[t], size 4*table_size) so the
 //     hash is just hash(key) -- no table_id stored, hashed, or verified;
-//   - dedup is a lock-free tail-append: walk d_head[bucket] -> d_next -> ...; a
-//     key match (d_keys[cur]==key; the input array is immutable, always readable)
-//     is a duplicate; at the tail, ::atomicCAS(-1, idx) appends a new node, and
-//     the loser of the CAS re-walks the new tail (collapsing same-key races);
+//   - dedup is a lock-free tail-append (chain_insert, dedup_chain.cuh): walk
+//     d_head[bucket] -> d_next -> ...; a key match (d_keys[cur]==key; the
+//     input array is immutable, always readable) is a duplicate; at the tail,
+//     ::atomicCAS(-1, idx) appends a new node, and the loser of the CAS
+//     re-walks the new tail (collapsing same-key races);
 //   - the per-table unique counter is PRIVATIZED: claimers warp-aggregate into a
 //     shared per-wave counter s_wc, then ONE global atomicAdd per table per wave
 //     reserves the index range (s_base);
@@ -289,36 +229,11 @@ segmented_unique_core(
       const size_t bucket = static_cast<size_t>(4ull * static_cast<uint64_t>(seg_t) +
                                                 (Hasher::hash(key) % nbkt));
 
-      // Lock-free tail-append dedup.
-      int cur = d_head[bucket];
-      if (cur == -1) {
-        const int old = ::atomicCAS(&d_head[bucket], -1, static_cast<int>(idx));
-        if (old == -1) {
-          kind = 1;
-          rep = static_cast<int>(idx);
-        } else {
-          cur = old;
-        }
-      }
-      while (kind == 0) {
-        if (d_keys[cur] == key) {
-          kind = 2;
-          rep = cur;
-          break;
-        }
-        const int nxt = d_next[cur];
-        if (nxt == -1) {
-          const int old = ::atomicCAS(&d_next[cur], -1, static_cast<int>(idx));
-          if (old == -1) {
-            kind = 1;
-            rep = static_cast<int>(idx);
-            break;
-          }
-          cur = old;
-        } else {
-          cur = nxt;
-        }
-      }
+      // Lock-free tail-append dedup (chain_insert, dedup_chain.cuh).
+      const ChainEntry entry =
+          chain_insert(d_head, d_next, bucket, idx, [&](int node) { return d_keys[node] == key; });
+      kind = entry.claimed ? 1 : 2;
+      rep = entry.node;
     }
 
     // Warp-aggregate the shared per-table counter bump for claimers: lanes

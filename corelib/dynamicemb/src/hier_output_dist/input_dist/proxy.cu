@@ -23,6 +23,7 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 #include <tuple>
 #include <utility>
 
+#include "dedup_chain.cuh"
 #include "hier_output_dist/common/common.h"
 #include "hier_output_dist/input_dist/planner.cuh"
 #include "hier_output_dist/input_dist/planner.h"
@@ -35,13 +36,15 @@ namespace {
 
 // ── step 1: the node-unique keys ──
 //
-// A hash table finds each occurrence's identity. Integer atomics give the
-// identity its representative, its occurrences, a list of them and the sum of
-// their weights. A scan of the representatives and their counts per
-// (requester, bucket feature) block then number the node-unique keys. No
-// result depends on the order of the atomics: the representative is a
-// minimum, the counts and weights are integer sums, and a list is read as a
-// set. Nor on the hash: no step reads which slot an identity took.
+// A hash table finds each occurrence's identity, by index dedup's chained
+// insert (dedup_chain.cuh). Integer atomics give the identity its
+// representative, its occurrences, a list of them and the sum of their
+// weights. A scan of the representatives and their counts per (requester,
+// bucket feature) block then number the node-unique keys. No result depends
+// on the order of the atomics: the representative is a minimum, the counts
+// and weights are integer sums, a list is read as a set, and the occurrence
+// that claims an identity only holds its state. Nor on the hash: no step
+// reads which bucket an identity took.
 
 // The owner node of a bucket feature owner node * num_features + feature
 // (clamped to the last node: an index).
@@ -73,42 +76,45 @@ __device__ __forceinline__ int64_t representative_bucket_feature(unsigned long l
   return (int64_t)(word >> 32);
 }
 
-// The hash table of a call's identities (table, key) under node dedup: open
-// addressing with linear probing over 2^slot_bits slots, at least
-// 2 * remote_keys. A slot is empty (-1) or holds the occurrence that took it
-// for its identity. That occurrence names the identity, and the identity's
-// state is at its index. proxy_keys allocates the table for the call, and
-// prepare_kernel clears it.
+// The hash table of a call's identities (table, key) under node dedup: index
+// dedup's chained insert (dedup_chain.cuh) over one bucket space of
+// 2^bucket_bits buckets, at least 2 * remote_keys. A chain links the
+// occurrences that claimed an identity, one per identity: that occurrence
+// names the identity, and the identity's state is at its index. A list links
+// each identity's occurrences; it shares no array with the chains.
+// proxy_keys allocates the table for the call, and prepare_kernel clears it.
 struct Identities {
-  int32_t *slot;  // [2^slot_bits]
-  int slot_bits;
-  // per identity (an occurrence that took a slot)
+  // the chains: int32 occurrences, -1 for none
+  int32_t *bucket_head;  // [2^bucket_bits]: the first identity of each bucket's chain
+  int bucket_bits;
+  int32_t *chain_next;  // [remote_keys]: per identity, the next one in its bucket's chain
+  // per identity (the occurrence that claimed it)
   unsigned long long *rep;  // [remote_keys]: its representative (representative_word)
   int32_t *count;           // [remote_keys]: its occurrences
-  int32_t *head;            // [remote_keys]: the last of them in its list (-1: none)
+  int32_t *list_head;       // [remote_keys]: the last of them in its list (-1: none)
   int64_t *weight;          // [remote_keys]: the sum of their weights, or nullptr
   // per occurrence
-  int32_t *next;         // [remote_keys]: the one before it in its identity's list (-1: none)
+  int32_t *list_next;    // [remote_keys]: the one before it in its identity's list (-1: none)
   int32_t *identity_of;  // [remote_keys]: its identity
 };
 
-// The seeds of identity_slot's hash.
+// The seeds of identity_bucket's hash.
 constexpr uint64_t kKeySeed = 0x9e3779b97f4a7c15ull, kTableSeed = 0xc2b2ae3d27d4eb4full;
 
-// Where the probe for identity (table, key) starts. The owner rule fixes some
-// bits for all keys of one owner: under roundrobin the key's low bits (key %
-// world_size), under hash_roundrobin the low bits of murmur3_fmix64(key) (its
-// hash % world_size). All of a proxy's keys share them up to the largest
-// power of two dividing local_size (that value % local_size is the proxy's
-// rail), at any world size. So the slot comes from neither. The hash is
-// fmix64 of the key xor a seed, a function other than the rule's, xor the
-// table times another seed (equal keys of two tables go apart). The slot is
-// its high bits, which every bit of the key moves: they are those of fmix64's
-// last product (its last step changes only the low 31 bits), and only a
-// factor's low bits move a product's low bits.
-__device__ __forceinline__ uint64_t identity_slot(int64_t key, int32_t table, int slot_bits) {
+// The bucket of identity (table, key). The owner rule fixes some bits for all
+// keys of one owner: under roundrobin the key's low bits (key % world_size),
+// under hash_roundrobin the low bits of murmur3_fmix64(key) (its hash %
+// world_size). All of a proxy's keys share them up to the largest power of
+// two dividing local_size (that value % local_size is the proxy's rail), at
+// any world size. So the bucket comes from neither. The hash is fmix64 of the
+// key xor a seed, a function other than the rule's, xor the table times
+// another seed (equal keys of two tables go apart). The bucket is its high
+// bits, which every bit of the key moves: they are those of fmix64's last
+// product (its last step changes only the low 31 bits), and only a factor's
+// low bits move a product's low bits.
+__device__ __forceinline__ uint64_t identity_bucket(int64_t key, int32_t table, int bucket_bits) {
   const uint64_t hash = murmur3_fmix64((uint64_t)key ^ kKeySeed) ^ (uint64_t)table * kTableSeed;
-  return hash >> (64 - slot_bits);
+  return hash >> (64 - bucket_bits);
 }
 
 // The int64 words of the blocks' tables (prepare_kernel, blocks_kernel): per
@@ -119,36 +125,39 @@ inline int64_t block_scratch(int64_t local_size, int64_t bucket_features) {
   return local_size * (2 * bucket_features + 1) + bucket_features + 1;
 }
 
-// A thread per slot of the hash table (`slots`; none without node dedup) and
-// per (requester, bucket feature) block of the remote part. The table of this
-// call is cleared: every slot empty, and each identity's state without a
-// representative, occurrences, a list or weights. A block is the occurrences
-// of a bucket feature in a requester's range. Inside a requester's range the
-// occurrences come by owner node, then feature, then position (node.cuh:
-// row_shift puts a row of owner (n, t) after the requester's rows for
-// the owner nodes before n, at its offset in its bucket, which is
-// feature-major). So node_bucket_feature_of_row does not decrease there, and a
-// binary search finds where each block starts: block_start [local_size]
-// [bucket_features + 1], each requester's last entry the end of its range.
+// A thread per bucket of the hash table (`buckets`; none without node dedup)
+// and per (requester, bucket feature) block of the remote part. The table of
+// this call is cleared: every bucket's chain empty, each valid occurrence
+// without a next in a chain (any of them may claim an identity), and each
+// identity's state without a representative, occurrences, a list or weights.
+// A block is the occurrences of a bucket feature in a requester's range.
+// Inside a requester's range the occurrences come by owner node, then
+// feature, then position (node.cuh: row_shift puts a row of owner (n, t)
+// after the requester's rows for the owner nodes before n, at its offset in
+// its bucket, which is feature-major). So node_bucket_feature_of_row does not
+// decrease there, and a binary search finds where each block starts:
+// block_start [local_size][bucket_features + 1], each requester's last entry
+// the end of its range.
 // The first thread writes the count of the valid occurrences, those the node
 // layout counts for this proxy (none when the node skips the call), and
 // key_rows' start.
 __global__ void __launch_bounds__(kThreads)
     prepare_kernel(const bool *skip, const int64_t *requester_start,
                    const int32_t *node_bucket_feature_of_row, int64_t local_size,
-                   int64_t bucket_features, int64_t entries, int64_t slots, Identities ids,
+                   int64_t bucket_features, int64_t entries, int64_t buckets, Identities ids,
                    int64_t *block_start, int64_t *occurrence_count, int64_t *key_rows) {
   const int64_t count = *skip ? 0 : requester_start[local_size], columns = bucket_features + 1;
   if (first_item() == 0) {
     *occurrence_count = count;
     *key_rows = 0;
   }
-  for (int64_t index = first_item(); index < slots; index += item_stride()) {
-    ids.slot[index] = -1;
+  for (int64_t index = first_item(); index < buckets; index += item_stride()) {
+    ids.bucket_head[index] = -1;
+    if (index < count) ids.chain_next[index] = -1;
     if (index >= entries) continue;
     ids.rep[index] = ~0ull;
     ids.count[index] = 0;
-    ids.head[index] = -1;
+    ids.list_head[index] = -1;
     if (ids.weight != nullptr) ids.weight[index] = 0;
   }
   for (int64_t index = first_item(); index < local_size * columns; index += item_stride()) {
@@ -163,40 +172,36 @@ __global__ void __launch_bounds__(kThreads)
 }
 
 // A thread per valid occurrence, under node dedup: its identity (table, key),
-// the table of its feature (dense_tables). The probe goes from identity_slot
-// to the identity's slot, or to the first empty one, which it takes. Of the
-// occurrences that race for an empty slot, one takes it (atomicCAS) and the
-// others compare their identity with its. A plain load of a slot sees -1 or
-// its final occurrence: a stale -1 only sends the thread to the atomicCAS.
-// The table has at least twice the slots of the occurrences, so a probe ends.
+// the table of its feature (dense_tables). The chained insert (chain_insert,
+// dedup_chain.cuh) walks the chain of the identity's bucket (identity_bucket)
+// to the occurrence that claimed the identity, or claims it at the chain's
+// end: then the occurrence itself names it. Of the occurrences of one
+// identity, one claims it, whatever their order, and the others end on it.
 // Then, on the identity: its representative (atomicMin), the occurrence
-// counted (atomicAdd) and put first in the list (atomicExch of its head: the
-// occurrence's `next` is the old head), and its weight, a whole number, added
-// as an int64.
+// counted (atomicAdd) and put first in the list (atomicExch of its list head:
+// the occurrence's list_next is the old head), and its weight, a whole
+// number, added as an int64.
 __global__ void __launch_bounds__(kThreads)
     insert_kernel(const int64_t *occurrence_keys, const float *weights,
                   const int32_t *node_bucket_feature_of_row, const int32_t *tables,
                   const int64_t *occurrence_count, int64_t num_features, Identities ids) {
   const int64_t count = *occurrence_count;
-  const uint64_t last_slot = (1ull << ids.slot_bits) - 1;
   for (int64_t occurrence = first_item(); occurrence < count; occurrence += item_stride()) {
     const int64_t key = occurrence_keys[occurrence];
     const int32_t bucket_feature = node_bucket_feature_of_row[occurrence];
     const int32_t table = tables[bucket_feature % num_features];
-    int32_t identity = (int32_t)occurrence;  // a new one, unless the probe finds it
-    for (uint64_t slot = identity_slot(key, table, ids.slot_bits);; slot = (slot + 1) & last_slot) {
-      int32_t taken = ids.slot[slot];
-      if (taken < 0) taken = atomicCAS(&ids.slot[slot], -1, (int32_t)occurrence);
-      if (taken < 0) break;  // the occurrence took the slot
-      if (occurrence_keys[taken] == key &&
-          tables[node_bucket_feature_of_row[taken] % num_features] == table) {
-        identity = taken;
-        break;
-      }
-    }
+    // a chain node of the same identity: the same key, of the same table
+    const auto same_identity = [&](int32_t node) {
+      return occurrence_keys[node] == key &&
+             tables[node_bucket_feature_of_row[node] % num_features] == table;
+    };
+    const ChainEntry entry =
+        chain_insert(ids.bucket_head, ids.chain_next, identity_bucket(key, table, ids.bucket_bits),
+                     occurrence, same_identity);
+    const int32_t identity = entry.node;  // the occurrence that claimed it
     atomicMin(&ids.rep[identity], representative_word(bucket_feature, occurrence));
     atomicAdd(&ids.count[identity], 1);
-    ids.next[occurrence] = atomicExch(&ids.head[identity], (int32_t)occurrence);
+    ids.list_next[occurrence] = atomicExch(&ids.list_head[identity], (int32_t)occurrence);
     if (ids.weight != nullptr)
       atomicAdd((unsigned long long *)&ids.weight[identity],
                 (unsigned long long)(int64_t)weights[occurrence]);
@@ -313,7 +318,7 @@ __global__ void __launch_bounds__(kThreads)
       if (occurrences > max_key_rows)
         rank = max_key_rows;
       else
-        for (int32_t other = ids.head[identity]; other >= 0; other = ids.next[other])
+        for (int32_t other = ids.list_head[identity]; other >= 0; other = ids.list_next[other])
           rank += other < occurrence;
     } else {
       bucket_feature = node_bucket_feature_of_row[occurrence];
@@ -730,36 +735,38 @@ ProxyKeys proxy_keys(const ProxyInput &input, const Sizes &sizes, bool node_dedu
   // indices (block_scratch)
   const at::Tensor block_tables =
       at::empty({block_scratch(local_size, bucket_features)}, long_options);
-  // Under node dedup the identities: a hash table of the call, at least twice
-  // the occurrences' slots, cleared, then every valid occurrence's identity
-  // in it, and each identity's state.
-  const int slot_bits = node_dedup ? bits_for(2 * entries) : 0;
-  const int64_t slots = node_dedup ? int64_t{1} << slot_bits : 0;
-  at::Tensor slot, rep, count, head, next, identity_of, weight_sum;
+  // Under node dedup the identities: a hash table of the call, its buckets at
+  // least twice the occurrences and its chain links, cleared, then every
+  // valid occurrence's identity in it, and each identity's state and list.
+  const int bucket_bits = node_dedup ? bits_for(2 * entries) : 0;
+  const int64_t buckets = node_dedup ? int64_t{1} << bucket_bits : 0;
+  at::Tensor bucket_head, chain_next, rep, count, list_head, list_next, identity_of, weight_sum;
   Identities ids{};
   if (node_dedup) {
-    slot = at::empty({slots}, int_options);
+    bucket_head = at::empty({buckets}, int_options);
+    chain_next = at::empty({entries}, int_options);
     rep = at::empty({entries}, long_options);
     count = at::empty({entries}, int_options);
-    head = at::empty({entries}, int_options);
-    next = at::empty({entries}, int_options);
+    list_head = at::empty({entries}, int_options);
+    list_next = at::empty({entries}, int_options);
     identity_of = at::empty({entries}, int_options);
     if (sum_weights) weight_sum = at::empty({entries}, long_options);
-    ids = Identities{slot.data_ptr<int32_t>(),
-                     slot_bits,
+    ids = Identities{bucket_head.data_ptr<int32_t>(),
+                     bucket_bits,
+                     chain_next.data_ptr<int32_t>(),
                      reinterpret_cast<unsigned long long *>(rep.data_ptr<int64_t>()),
                      count.data_ptr<int32_t>(),
-                     head.data_ptr<int32_t>(),
+                     list_head.data_ptr<int32_t>(),
                      data_or_null<int64_t>(weight_sum),
-                     next.data_ptr<int32_t>(),
+                     list_next.data_ptr<int32_t>(),
                      identity_of.data_ptr<int32_t>()};
   }
-  prepare_kernel<<<item_grid(std::max(slots, local_size * (bucket_features + 1))), kThreads, 0,
-                   stream>>>(input.skip.data_ptr<bool>(), requester_start,
-                             input.node_bucket_feature_of_row.data_ptr<int32_t>(), local_size,
-                             bucket_features, entries, slots, ids, block_tables.data_ptr<int64_t>(),
-                             keys.occurrence_count.data_ptr<int64_t>(),
-                             keys.key_rows.data_ptr<int64_t>());
+  prepare_kernel<<<item_grid(std::max(buckets, local_size * (bucket_features + 1))), kThreads, 0,
+                   stream>>>(
+      input.skip.data_ptr<bool>(), requester_start,
+      input.node_bucket_feature_of_row.data_ptr<int32_t>(), local_size, bucket_features, entries,
+      buckets, ids, block_tables.data_ptr<int64_t>(), keys.occurrence_count.data_ptr<int64_t>(),
+      keys.key_rows.data_ptr<int64_t>());
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   // The representatives before each occurrence (without node dedup each
   // occurrence is one: none needed).
@@ -770,8 +777,9 @@ ProxyKeys proxy_keys(const ProxyInput &input, const Sizes &sizes, bool node_dedu
         input.node_bucket_feature_of_row.data_ptr<int32_t>(), input.tables.data_ptr<int32_t>(),
         keys.occurrence_count.data_ptr<int64_t>(), num_features, ids);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
-    slot.reset();  // the probes are done
-    ids.slot = nullptr;
+    bucket_head.reset();  // the inserts are done
+    chain_next.reset();
+    ids.bucket_head = ids.chain_next = nullptr;
     const at::Tensor is_rep = at::empty({entries}, input.node_keys.options().dtype(at::kBool));
     representatives_kernel<<<item_grid(entries), kThreads, 0, stream>>>(
         ids, keys.occurrence_count.data_ptr<int64_t>(), entries, is_rep.data_ptr<bool>());
