@@ -1,0 +1,694 @@
+{
+ "expression": {
+  "spark_class": "org.apache.spark.sql.catalyst.expressions.Cast (also AnsiCast/TryCast in 3.5 via EvalMode)",
+  "gpu_class": "org.apache.spark.sql.rapids.GpuCast  (com.nvidia.spark.rapids.GpuCast, GpuCast.scala:1644)",
+  "deterministic": true,
+  "rowwise": true,
+  "null_semantics": "NullIntolerant: null in => null out. Exception: out can be NULL for non-null input in float->timestamp (NaN/Inf), timestamp->int/short/byte on Spark 4.0 (nullifyOverflows), try_cast overflow, date->numeric. Cast.forceNullable(from,to) decides output nullability; fused output nullability must equal GpuCast.nullable.",
+  "non_ansi_behavior": "Integral narrowing wraps (modular). float/double->integral: truncate, saturate, NaN->0 (byte/short go through int then wrap on CPU). int/long->float/double RN. double->float RN, overflow Inf. timestamp->long floor seconds; ->double micros/1e6. long->timestamp saturating multiply. float/double->timestamp NaN/Inf=>NULL. bool<->numeric 0/1. float->bool x!=0.",
+  "ansi_behavior": "Throws ArithmeticException (CAST_OVERFLOW) for out-of-range narrowing, float->integral NaN/Inf/out of range, timestamp->narrow-int overflow; try_cast returns NULL instead. GpuCast.hasSideEffects returns true for these (GpuCast.scala:1666-1695) => must not be fused / not reordered in v1.",
+  "rapids_notes": [
+   "GpuCast.doCast is a single big match (GpuCast.scala:295); the default branch is cudf castTo(static_cast) (:641).",
+   "Special code: (Float,Long)|(Double,Int|Long) NaN->0 first (:544); timestamps via floorDiv (:324-376); long->timestamp saturating (:1611); bool/int->timestamp via TIMESTAMP_SECONDS (:524-533); date->numeric -> all NULL (:314).",
+   "Config gates: spark.rapids.sql.castFloatToIntegralTypes.enabled (default true, :114), castFloatToDecimal, castDecimalToFloat, castFloatToString, castStringToFloat, castStringToTimestamp (not relevant to numeric matrix).",
+   "Spark-version shims: CastTimeToIntShim.ifNullifyOverflows false on spark330-35x, true from 4.0/db143 (timestamp->int/short/byte).",
+   "Fusion reference semantics = unfused GPU; CPU-vs-GPU diffs (e.g. float->byte/short) must be recorded in KNOWN-DIFFS and the fused kernel should match the GPU path (or fall back).",
+   "Cast chain nuance: casts within the same region are independent device functions; for exactness never merge (float)(int)x style chains algebraically."
+  ],
+  "whitelist": "v1 (non-ANSI, numeric/bool/date/timestamp subset)",
+  "whitelist_reason": "Deterministic rowwise, fixed width. v1: integral widen/narrow (wrap), int/long->float/double, float->double, double->float, any numeric->bool, bool->numeric, float/double->int/long, timestamp->long/double, small-int->timestamp, long->timestamp (non-ANSI), timestamp<->date in UTC only. v2: float/double->byte/short, timestamp->int/short/byte (version dependent), timestamp->float, non-UTC tz. NO: ANSI/try_cast with throwing, float/double->timestamp, date->numeric, string, decimal (precision/scale + 128-bit + overflow-to-null logic, castFloat/DecimalToX config differences)."
+ },
+ "matrix": [
+  {
+   "from": "byte",
+   "to": "short",
+   "cpu": "sign-extend, exact",
+   "gpu": "default branch input.castTo (GpuCast.scala:641); exact",
+   "ansi": "same as non-ANSI (no overflow)",
+   "whitelist": "v1",
+   "device_function_hint": "out=(int16_t)in",
+   "notes": ""
+  },
+  {
+   "from": "byte",
+   "to": "int",
+   "cpu": "sign-extend, exact",
+   "gpu": "default branch input.castTo (GpuCast.scala:641); exact",
+   "ansi": "same as non-ANSI (no overflow)",
+   "whitelist": "v1",
+   "device_function_hint": "out=(int32_t)in",
+   "notes": ""
+  },
+  {
+   "from": "byte",
+   "to": "long",
+   "cpu": "sign-extend, exact",
+   "gpu": "default branch input.castTo (GpuCast.scala:641); exact",
+   "ansi": "same as non-ANSI (no overflow)",
+   "whitelist": "v1",
+   "device_function_hint": "out=(int64_t)in",
+   "notes": ""
+  },
+  {
+   "from": "short",
+   "to": "byte",
+   "cpu": "two's-complement wraparound (Scala toInt/toShort/toByte)",
+   "gpu": "default castTo = C static_cast truncation = wraparound (:641)",
+   "ansi": "throws ArithmeticException overflow if out of range; GPU does min/max range check via assertValuesInRange then castTo (:409-445); hasSideEffects=true (:1671-1673)",
+   "whitelist": "v1 (non-ANSI only)",
+   "device_function_hint": "out=(int8_t)in  /* modular, matches Java */",
+   "notes": "ANSI mode: exclude (side effects / throws)."
+  },
+  {
+   "from": "short",
+   "to": "int",
+   "cpu": "sign-extend, exact",
+   "gpu": "default branch input.castTo (GpuCast.scala:641); exact",
+   "ansi": "same as non-ANSI (no overflow)",
+   "whitelist": "v1",
+   "device_function_hint": "out=(int32_t)in",
+   "notes": ""
+  },
+  {
+   "from": "short",
+   "to": "long",
+   "cpu": "sign-extend, exact",
+   "gpu": "default branch input.castTo (GpuCast.scala:641); exact",
+   "ansi": "same as non-ANSI (no overflow)",
+   "whitelist": "v1",
+   "device_function_hint": "out=(int64_t)in",
+   "notes": ""
+  },
+  {
+   "from": "int",
+   "to": "byte",
+   "cpu": "two's-complement wraparound (Scala toInt/toShort/toByte)",
+   "gpu": "default castTo = C static_cast truncation = wraparound (:641)",
+   "ansi": "throws ArithmeticException overflow if out of range; GPU does min/max range check via assertValuesInRange then castTo (:409-445); hasSideEffects=true (:1671-1673)",
+   "whitelist": "v1 (non-ANSI only)",
+   "device_function_hint": "out=(int8_t)in  /* modular, matches Java */",
+   "notes": "ANSI mode: exclude (side effects / throws)."
+  },
+  {
+   "from": "int",
+   "to": "short",
+   "cpu": "two's-complement wraparound (Scala toInt/toShort/toByte)",
+   "gpu": "default castTo = C static_cast truncation = wraparound (:641)",
+   "ansi": "throws ArithmeticException overflow if out of range; GPU does min/max range check via assertValuesInRange then castTo (:409-445); hasSideEffects=true (:1671-1673)",
+   "whitelist": "v1 (non-ANSI only)",
+   "device_function_hint": "out=(int16_t)in  /* modular, matches Java */",
+   "notes": "ANSI mode: exclude (side effects / throws)."
+  },
+  {
+   "from": "int",
+   "to": "long",
+   "cpu": "sign-extend, exact",
+   "gpu": "default branch input.castTo (GpuCast.scala:641); exact",
+   "ansi": "same as non-ANSI (no overflow)",
+   "whitelist": "v1",
+   "device_function_hint": "out=(int64_t)in",
+   "notes": ""
+  },
+  {
+   "from": "long",
+   "to": "byte",
+   "cpu": "two's-complement wraparound (Scala toInt/toShort/toByte)",
+   "gpu": "default castTo = C static_cast truncation = wraparound (:641)",
+   "ansi": "throws ArithmeticException overflow if out of range; GPU does min/max range check via assertValuesInRange then castTo (:409-445); hasSideEffects=true (:1671-1673)",
+   "whitelist": "v1 (non-ANSI only)",
+   "device_function_hint": "out=(int8_t)in  /* modular, matches Java */",
+   "notes": "ANSI mode: exclude (side effects / throws)."
+  },
+  {
+   "from": "long",
+   "to": "short",
+   "cpu": "two's-complement wraparound (Scala toInt/toShort/toByte)",
+   "gpu": "default castTo = C static_cast truncation = wraparound (:641)",
+   "ansi": "throws ArithmeticException overflow if out of range; GPU does min/max range check via assertValuesInRange then castTo (:409-445); hasSideEffects=true (:1671-1673)",
+   "whitelist": "v1 (non-ANSI only)",
+   "device_function_hint": "out=(int16_t)in  /* modular, matches Java */",
+   "notes": "ANSI mode: exclude (side effects / throws)."
+  },
+  {
+   "from": "long",
+   "to": "int",
+   "cpu": "two's-complement wraparound (Scala toInt/toShort/toByte)",
+   "gpu": "default castTo = C static_cast truncation = wraparound (:641)",
+   "ansi": "throws ArithmeticException overflow if out of range; GPU does min/max range check via assertValuesInRange then castTo (:409-445); hasSideEffects=true (:1671-1673)",
+   "whitelist": "v1 (non-ANSI only)",
+   "device_function_hint": "out=(int32_t)in  /* modular, matches Java */",
+   "notes": "ANSI mode: exclude (side effects / throws)."
+  },
+  {
+   "from": "byte",
+   "to": "float",
+   "cpu": "round-to-nearest-even (Java (float)long); exact for double up to 2^53 else RN",
+   "gpu": "default castTo (cudf static_cast) (:641); RN on device",
+   "ansi": "no exception",
+   "whitelist": "v1",
+   "device_function_hint": "out=__int2float_rn(in) / __ll2float_rn / __ll2double_rn; use explicit RN intrinsics, never fast-math",
+   "notes": "long->float/double rounding must be RN; build with --fmad=false and no -use_fast_math"
+  },
+  {
+   "from": "byte",
+   "to": "double",
+   "cpu": "round-to-nearest-even (Java (float)long); exact for double up to 2^53 else RN",
+   "gpu": "default castTo (cudf static_cast) (:641); RN on device",
+   "ansi": "no exception",
+   "whitelist": "v1",
+   "device_function_hint": "out=__int2float_rn(in) / __ll2float_rn / __ll2double_rn; use explicit RN intrinsics, never fast-math",
+   "notes": "long->float/double rounding must be RN; build with --fmad=false and no -use_fast_math"
+  },
+  {
+   "from": "short",
+   "to": "float",
+   "cpu": "round-to-nearest-even (Java (float)long); exact for double up to 2^53 else RN",
+   "gpu": "default castTo (cudf static_cast) (:641); RN on device",
+   "ansi": "no exception",
+   "whitelist": "v1",
+   "device_function_hint": "out=__int2float_rn(in) / __ll2float_rn / __ll2double_rn; use explicit RN intrinsics, never fast-math",
+   "notes": "long->float/double rounding must be RN; build with --fmad=false and no -use_fast_math"
+  },
+  {
+   "from": "short",
+   "to": "double",
+   "cpu": "round-to-nearest-even (Java (float)long); exact for double up to 2^53 else RN",
+   "gpu": "default castTo (cudf static_cast) (:641); RN on device",
+   "ansi": "no exception",
+   "whitelist": "v1",
+   "device_function_hint": "out=__int2float_rn(in) / __ll2float_rn / __ll2double_rn; use explicit RN intrinsics, never fast-math",
+   "notes": "long->float/double rounding must be RN; build with --fmad=false and no -use_fast_math"
+  },
+  {
+   "from": "int",
+   "to": "float",
+   "cpu": "round-to-nearest-even (Java (float)long); exact for double up to 2^53 else RN",
+   "gpu": "default castTo (cudf static_cast) (:641); RN on device",
+   "ansi": "no exception",
+   "whitelist": "v1",
+   "device_function_hint": "out=__int2float_rn(in) / __ll2float_rn / __ll2double_rn; use explicit RN intrinsics, never fast-math",
+   "notes": "long->float/double rounding must be RN; build with --fmad=false and no -use_fast_math"
+  },
+  {
+   "from": "int",
+   "to": "double",
+   "cpu": "round-to-nearest-even (Java (float)long); exact for double up to 2^53 else RN",
+   "gpu": "default castTo (cudf static_cast) (:641); RN on device",
+   "ansi": "no exception",
+   "whitelist": "v1",
+   "device_function_hint": "out=__int2float_rn(in) / __ll2float_rn / __ll2double_rn; use explicit RN intrinsics, never fast-math",
+   "notes": "long->float/double rounding must be RN; build with --fmad=false and no -use_fast_math"
+  },
+  {
+   "from": "long",
+   "to": "float",
+   "cpu": "round-to-nearest-even (Java (float)long); exact for double up to 2^53 else RN",
+   "gpu": "default castTo (cudf static_cast) (:641); RN on device",
+   "ansi": "no exception",
+   "whitelist": "v1",
+   "device_function_hint": "out=__int2float_rn(in) / __ll2float_rn / __ll2double_rn; use explicit RN intrinsics, never fast-math",
+   "notes": "long->float/double rounding must be RN; build with --fmad=false and no -use_fast_math"
+  },
+  {
+   "from": "long",
+   "to": "double",
+   "cpu": "round-to-nearest-even (Java (float)long); exact for double up to 2^53 else RN",
+   "gpu": "default castTo (cudf static_cast) (:641); RN on device",
+   "ansi": "no exception",
+   "whitelist": "v1",
+   "device_function_hint": "out=__int2float_rn(in) / __ll2float_rn / __ll2double_rn; use explicit RN intrinsics, never fast-math",
+   "notes": "long->float/double rounding must be RN; build with --fmad=false and no -use_fast_math"
+  },
+  {
+   "from": "float",
+   "to": "byte",
+   "cpu": "Scala x.toByte/toShort = (int)x saturating then narrowing => values outside int8/int16 WRAP (e.g. 300.0f->44), NaN->0, +-Inf -> saturated int then wrap (Inf->-1 for byte)",
+   "gpu": "default castTo (:641): cudf static_cast<int8/16>(float); not specially handled for NaN/saturation",
+   "ansi": "throws ArithmeticException [CAST_OVERFLOW] for NaN/Inf/out-of-range; GPU: assertValuesInRange (:448-486); hasSideEffects=true; gated by spark.rapids.sql.castFloatToIntegralTypes.enabled (default true) (:114)",
+   "whitelist": "v2 (blocked until differential test confirms GPU==CPU==fused; GPU path may saturate instead of wrap)",
+   "device_function_hint": "out=(int8/16)(saturating_int(in)) [Java semantic]; verify vs GPU",
+   "notes": "CPU range check uses floor(x)<=MAX&&ceil(x)>=MIN with integral bounds since 3.1; doc compatibility.md:818. Note (float->int) MAX as float rounds to 2^31 : in>=2147483648.0f must saturate to Int.MaxValue."
+  },
+  {
+   "from": "float",
+   "to": "short",
+   "cpu": "Scala x.toByte/toShort = (int)x saturating then narrowing => values outside int8/int16 WRAP (e.g. 300.0f->44), NaN->0, +-Inf -> saturated int then wrap (Inf->-1 for byte)",
+   "gpu": "default castTo (:641): cudf static_cast<int8/16>(float); not specially handled for NaN/saturation",
+   "ansi": "throws ArithmeticException [CAST_OVERFLOW] for NaN/Inf/out-of-range; GPU: assertValuesInRange (:448-486); hasSideEffects=true; gated by spark.rapids.sql.castFloatToIntegralTypes.enabled (default true) (:114)",
+   "whitelist": "v2 (blocked until differential test confirms GPU==CPU==fused; GPU path may saturate instead of wrap)",
+   "device_function_hint": "out=(int8/16)(saturating_int(in)) [Java semantic]; verify vs GPU",
+   "notes": "CPU range check uses floor(x)<=MAX&&ceil(x)>=MIN with integral bounds since 3.1; doc compatibility.md:818. Note (float->int) MAX as float rounds to 2^31 : in>=2147483648.0f must saturate to Int.MaxValue."
+  },
+  {
+   "from": "float",
+   "to": "int",
+   "cpu": "truncate toward zero, saturate to MIN/MAX, NaN->0 (Java d2i/d2l semantics)",
+   "gpu": "default castTo (:641) for float->int (NaN->0 by CUDA cvt)",
+   "ansi": "throws ArithmeticException [CAST_OVERFLOW] for NaN/Inf/out-of-range; GPU: assertValuesInRange (:448-486); hasSideEffects=true; gated by spark.rapids.sql.castFloatToIntegralTypes.enabled (default true) (:114)",
+   "whitelist": "v1",
+   "device_function_hint": "out = isnan(in)?0 : in>=MAX_AS_FP? MAX : in<=MIN? MIN : (int32_t)in  (explicit, do not rely on UB)",
+   "notes": "CPU range check uses floor(x)<=MAX&&ceil(x)>=MIN with integral bounds since 3.1; doc compatibility.md:818. Note (float->int) MAX as float rounds to 2^31 : in>=2147483648.0f must saturate to Int.MaxValue."
+  },
+  {
+   "from": "float",
+   "to": "long",
+   "cpu": "truncate toward zero, saturate to MIN/MAX, NaN->0 (Java d2i/d2l semantics)",
+   "gpu": "FloatUtils.nanToZero(input) then castTo (:544-550): NaN->0 explicit; +-Inf and out-of-range rely on CUDA conversion saturation",
+   "ansi": "throws ArithmeticException [CAST_OVERFLOW] for NaN/Inf/out-of-range; GPU: assertValuesInRange (:448-486); hasSideEffects=true; gated by spark.rapids.sql.castFloatToIntegralTypes.enabled (default true) (:114)",
+   "whitelist": "v1",
+   "device_function_hint": "out = isnan(in)?0 : in>=MAX_AS_FP? MAX : in<=MIN? MIN : (int64_t)in  (explicit, do not rely on UB)",
+   "notes": "CPU range check uses floor(x)<=MAX&&ceil(x)>=MIN with integral bounds since 3.1; doc compatibility.md:818. Note (float->int) MAX as float rounds to 2^31 : in>=2147483648.0f must saturate to Int.MaxValue."
+  },
+  {
+   "from": "double",
+   "to": "byte",
+   "cpu": "Scala x.toByte/toShort = (int)x saturating then narrowing => values outside int8/int16 WRAP (e.g. 300.0f->44), NaN->0, +-Inf -> saturated int then wrap (Inf->-1 for byte)",
+   "gpu": "default castTo (:641): cudf static_cast<int8/16>(float); not specially handled for NaN/saturation",
+   "ansi": "throws ArithmeticException [CAST_OVERFLOW] for NaN/Inf/out-of-range; GPU: assertValuesInRange (:448-486); hasSideEffects=true; gated by spark.rapids.sql.castFloatToIntegralTypes.enabled (default true) (:114)",
+   "whitelist": "v2 (blocked until differential test confirms GPU==CPU==fused; GPU path may saturate instead of wrap)",
+   "device_function_hint": "out=(int8/16)(saturating_int(in)) [Java semantic]; verify vs GPU",
+   "notes": "CPU range check uses floor(x)<=MAX&&ceil(x)>=MIN with integral bounds since 3.1; doc compatibility.md:818. Note (float->int) MAX as float rounds to 2^31 : in>=2147483648.0f must saturate to Int.MaxValue."
+  },
+  {
+   "from": "double",
+   "to": "short",
+   "cpu": "Scala x.toByte/toShort = (int)x saturating then narrowing => values outside int8/int16 WRAP (e.g. 300.0f->44), NaN->0, +-Inf -> saturated int then wrap (Inf->-1 for byte)",
+   "gpu": "default castTo (:641): cudf static_cast<int8/16>(float); not specially handled for NaN/saturation",
+   "ansi": "throws ArithmeticException [CAST_OVERFLOW] for NaN/Inf/out-of-range; GPU: assertValuesInRange (:448-486); hasSideEffects=true; gated by spark.rapids.sql.castFloatToIntegralTypes.enabled (default true) (:114)",
+   "whitelist": "v2 (blocked until differential test confirms GPU==CPU==fused; GPU path may saturate instead of wrap)",
+   "device_function_hint": "out=(int8/16)(saturating_int(in)) [Java semantic]; verify vs GPU",
+   "notes": "CPU range check uses floor(x)<=MAX&&ceil(x)>=MIN with integral bounds since 3.1; doc compatibility.md:818. Note (float->int) MAX as float rounds to 2^31 : in>=2147483648.0f must saturate to Int.MaxValue."
+  },
+  {
+   "from": "double",
+   "to": "int",
+   "cpu": "truncate toward zero, saturate to MIN/MAX, NaN->0 (Java d2i/d2l semantics)",
+   "gpu": "FloatUtils.nanToZero(input) then castTo (:544-550): NaN->0 explicit; +-Inf and out-of-range rely on CUDA conversion saturation",
+   "ansi": "throws ArithmeticException [CAST_OVERFLOW] for NaN/Inf/out-of-range; GPU: assertValuesInRange (:448-486); hasSideEffects=true; gated by spark.rapids.sql.castFloatToIntegralTypes.enabled (default true) (:114)",
+   "whitelist": "v1",
+   "device_function_hint": "out = isnan(in)?0 : in>=MAX_AS_FP? MAX : in<=MIN? MIN : (int32_t)in  (explicit, do not rely on UB)",
+   "notes": "CPU range check uses floor(x)<=MAX&&ceil(x)>=MIN with integral bounds since 3.1; doc compatibility.md:818. Note (float->int) MAX as float rounds to 2^31 : in>=2147483648.0f must saturate to Int.MaxValue."
+  },
+  {
+   "from": "double",
+   "to": "long",
+   "cpu": "truncate toward zero, saturate to MIN/MAX, NaN->0 (Java d2i/d2l semantics)",
+   "gpu": "FloatUtils.nanToZero(input) then castTo (:544-550): NaN->0 explicit; +-Inf and out-of-range rely on CUDA conversion saturation",
+   "ansi": "throws ArithmeticException [CAST_OVERFLOW] for NaN/Inf/out-of-range; GPU: assertValuesInRange (:448-486); hasSideEffects=true; gated by spark.rapids.sql.castFloatToIntegralTypes.enabled (default true) (:114)",
+   "whitelist": "v1",
+   "device_function_hint": "out = isnan(in)?0 : in>=MAX_AS_FP? MAX : in<=MIN? MIN : (int64_t)in  (explicit, do not rely on UB)",
+   "notes": "CPU range check uses floor(x)<=MAX&&ceil(x)>=MIN with integral bounds since 3.1; doc compatibility.md:818. Note (float->int) MAX as float rounds to 2^31 : in>=2147483648.0f must saturate to Int.MaxValue."
+  },
+  {
+   "from": "float",
+   "to": "double",
+   "cpu": "exact widening; NaN stays NaN (payload may differ), -0.0 preserved",
+   "gpu": "default castTo",
+   "ansi": "none",
+   "whitelist": "v1",
+   "device_function_hint": "out=(double)in",
+   "notes": "normalize NaN in comparisons"
+  },
+  {
+   "from": "double",
+   "to": "float",
+   "cpu": "round-to-nearest-even; overflow -> +-Inf; underflow -> denormal/0; NaN stays NaN",
+   "gpu": "default castTo",
+   "ansi": "none",
+   "whitelist": "v1",
+   "device_function_hint": "out=__double2float_rn(in)",
+   "notes": "do not use fast-math"
+  },
+  {
+   "from": "byte",
+   "to": "bool",
+   "cpu": "x != 0 (NaN != 0 => true; -0.0 => false)",
+   "gpu": "default castTo static_cast<bool>; NaN->true",
+   "ansi": "none",
+   "whitelist": "v1",
+   "device_function_hint": "out=(in!=0)",
+   "notes": "for float use in != 0 (NaN != 0 true)"
+  },
+  {
+   "from": "bool",
+   "to": "byte",
+   "cpu": "true->1, false->0",
+   "gpu": "default castTo",
+   "ansi": "none",
+   "whitelist": "v1",
+   "device_function_hint": "out=(int8_t)(in?1:0)",
+   "notes": ""
+  },
+  {
+   "from": "short",
+   "to": "bool",
+   "cpu": "x != 0 (NaN != 0 => true; -0.0 => false)",
+   "gpu": "default castTo static_cast<bool>; NaN->true",
+   "ansi": "none",
+   "whitelist": "v1",
+   "device_function_hint": "out=(in!=0)",
+   "notes": "for float use in != 0 (NaN != 0 true)"
+  },
+  {
+   "from": "bool",
+   "to": "short",
+   "cpu": "true->1, false->0",
+   "gpu": "default castTo",
+   "ansi": "none",
+   "whitelist": "v1",
+   "device_function_hint": "out=(int16_t)(in?1:0)",
+   "notes": ""
+  },
+  {
+   "from": "int",
+   "to": "bool",
+   "cpu": "x != 0 (NaN != 0 => true; -0.0 => false)",
+   "gpu": "default castTo static_cast<bool>; NaN->true",
+   "ansi": "none",
+   "whitelist": "v1",
+   "device_function_hint": "out=(in!=0)",
+   "notes": "for float use in != 0 (NaN != 0 true)"
+  },
+  {
+   "from": "bool",
+   "to": "int",
+   "cpu": "true->1, false->0",
+   "gpu": "default castTo",
+   "ansi": "none",
+   "whitelist": "v1",
+   "device_function_hint": "out=(int32_t)(in?1:0)",
+   "notes": ""
+  },
+  {
+   "from": "long",
+   "to": "bool",
+   "cpu": "x != 0 (NaN != 0 => true; -0.0 => false)",
+   "gpu": "default castTo static_cast<bool>; NaN->true",
+   "ansi": "none",
+   "whitelist": "v1",
+   "device_function_hint": "out=(in!=0)",
+   "notes": "for float use in != 0 (NaN != 0 true)"
+  },
+  {
+   "from": "bool",
+   "to": "long",
+   "cpu": "true->1, false->0",
+   "gpu": "default castTo",
+   "ansi": "none",
+   "whitelist": "v1",
+   "device_function_hint": "out=(int64_t)(in?1:0)",
+   "notes": ""
+  },
+  {
+   "from": "float",
+   "to": "bool",
+   "cpu": "x != 0 (NaN != 0 => true; -0.0 => false)",
+   "gpu": "default castTo static_cast<bool>; NaN->true",
+   "ansi": "none",
+   "whitelist": "v1",
+   "device_function_hint": "out=(in!=0)",
+   "notes": "for float use in != 0 (NaN != 0 true)"
+  },
+  {
+   "from": "bool",
+   "to": "float",
+   "cpu": "true->1, false->0",
+   "gpu": "default castTo",
+   "ansi": "none",
+   "whitelist": "v1",
+   "device_function_hint": "out=(float)(in?1:0)",
+   "notes": ""
+  },
+  {
+   "from": "double",
+   "to": "bool",
+   "cpu": "x != 0 (NaN != 0 => true; -0.0 => false)",
+   "gpu": "default castTo static_cast<bool>; NaN->true",
+   "ansi": "none",
+   "whitelist": "v1",
+   "device_function_hint": "out=(in!=0)",
+   "notes": "for float use in != 0 (NaN != 0 true)"
+  },
+  {
+   "from": "bool",
+   "to": "double",
+   "cpu": "true->1, false->0",
+   "gpu": "default castTo",
+   "ansi": "none",
+   "whitelist": "v1",
+   "device_function_hint": "out=(double)(in?1:0)",
+   "notes": ""
+  },
+  {
+   "from": "bool",
+   "to": "bool",
+   "cpu": "identity",
+   "gpu": "structural equality shortcut returns copy (:306)",
+   "ansi": "none",
+   "whitelist": "v1",
+   "device_function_hint": "out=in",
+   "notes": ""
+  },
+  {
+   "from": "timestamp",
+   "to": "long",
+   "cpu": "floorDiv(micros,1_000_000) (seconds, floor for negative)",
+   "gpu": "input.castTo(INT64).floorDiv(1000000) (:370-376)",
+   "ansi": "same, no overflow possible",
+   "whitelist": "v1",
+   "device_function_hint": "out=floordiv64(in,1000000LL) // q=in/1e6; if(in%1e6<0) q--",
+   "notes": ""
+  },
+  {
+   "from": "timestamp",
+   "to": "int",
+   "cpu": "timestampToLong (floor) then .toInt/.toShort/.toByte => wraparound on Spark 3.x; Spark 4.0 (nullifyOverflows) overflow->NULL",
+   "gpu": "floorDiv via INT64 then castTo (:331-369); nullifyOverflows from CastTimeToIntShim: false on spark330..35x (wrap), true on spark350db143/4.0 (NULL on overflow)",
+   "ansi": "ANSI: throws overflow if out of range (assertValuesInRange :337-346); hasSideEffects=true",
+   "whitelist": "v2 (version dependent: wrap vs NULL; pick at plan time from Spark version) ; ANSI no",
+   "device_function_hint": "q=floordiv64(in,1000000); out=(int32_t)q; [Spark4: valid=(q==(wide)out)]",
+   "notes": "Check shim for the Spark version under test; 3.5.x => wrap."
+  },
+  {
+   "from": "timestamp",
+   "to": "short",
+   "cpu": "timestampToLong (floor) then .toInt/.toShort/.toByte => wraparound on Spark 3.x; Spark 4.0 (nullifyOverflows) overflow->NULL",
+   "gpu": "floorDiv via INT64 then castTo (:331-369); nullifyOverflows from CastTimeToIntShim: false on spark330..35x (wrap), true on spark350db143/4.0 (NULL on overflow)",
+   "ansi": "ANSI: throws overflow if out of range (assertValuesInRange :337-346); hasSideEffects=true",
+   "whitelist": "v2 (version dependent: wrap vs NULL; pick at plan time from Spark version) ; ANSI no",
+   "device_function_hint": "q=floordiv64(in,1000000); out=(int16_t)q; [Spark4: valid=(q==(wide)out)]",
+   "notes": "Check shim for the Spark version under test; 3.5.x => wrap."
+  },
+  {
+   "from": "timestamp",
+   "to": "byte",
+   "cpu": "timestampToLong (floor) then .toInt/.toShort/.toByte => wraparound on Spark 3.x; Spark 4.0 (nullifyOverflows) overflow->NULL",
+   "gpu": "floorDiv via INT64 then castTo (:331-369); nullifyOverflows from CastTimeToIntShim: false on spark330..35x (wrap), true on spark350db143/4.0 (NULL on overflow)",
+   "ansi": "ANSI: throws overflow if out of range (assertValuesInRange :337-346); hasSideEffects=true",
+   "whitelist": "v2 (version dependent: wrap vs NULL; pick at plan time from Spark version) ; ANSI no",
+   "device_function_hint": "q=floordiv64(in,1000000); out=(int8_t)q; [Spark4: valid=(q==(wide)out)]",
+   "notes": "Check shim for the Spark version under test; 3.5.x => wrap."
+  },
+  {
+   "from": "timestamp",
+   "to": "float",
+   "cpu": "micros / 1000000.0 (double division), then .toFloat for float",
+   "gpu": "castTo INT64 then trueDiv(1e6 as double, out type) (:324-330); for float result precision path not double-then-round guaranteed",
+   "ansi": "none",
+   "whitelist": "v1 for double; v2 for float (verify double-then-round)",
+   "device_function_hint": "out=(double)in/1000000.0 ; float: (float)((double)in/1000000.0)",
+   "notes": "Division exact IEEE; do not multiply by reciprocal."
+  },
+  {
+   "from": "timestamp",
+   "to": "double",
+   "cpu": "micros / 1000000.0 (double division), then .toFloat for float",
+   "gpu": "castTo INT64 then trueDiv(1e6 as double, out type) (:324-330); for float result precision path not double-then-round guaranteed",
+   "ansi": "none",
+   "whitelist": "v1 for double; v2 for float (verify double-then-round)",
+   "device_function_hint": "out=(double)in/1000000.0 ; float: (float)((double)in/1000000.0)",
+   "notes": "Division exact IEEE; do not multiply by reciprocal."
+  },
+  {
+   "from": "byte",
+   "to": "timestamp",
+   "cpu": "seconds*1_000_000 as micros (cannot overflow for <=int)",
+   "gpu": "castTo INT64 -> TIMESTAMP_SECONDS -> TIMESTAMP_MICROSECONDS (:527-533)",
+   "ansi": "none",
+   "whitelist": "v1",
+   "device_function_hint": "out=(int64)in*1000000LL",
+   "notes": ""
+  },
+  {
+   "from": "short",
+   "to": "timestamp",
+   "cpu": "seconds*1_000_000 as micros (cannot overflow for <=int)",
+   "gpu": "castTo INT64 -> TIMESTAMP_SECONDS -> TIMESTAMP_MICROSECONDS (:527-533)",
+   "ansi": "none",
+   "whitelist": "v1",
+   "device_function_hint": "out=(int64)in*1000000LL",
+   "notes": ""
+  },
+  {
+   "from": "int",
+   "to": "timestamp",
+   "cpu": "seconds*1_000_000 as micros (cannot overflow for <=int)",
+   "gpu": "castTo INT64 -> TIMESTAMP_SECONDS -> TIMESTAMP_MICROSECONDS (:527-533)",
+   "ansi": "none",
+   "whitelist": "v1",
+   "device_function_hint": "out=(int64)in*1000000LL",
+   "notes": ""
+  },
+  {
+   "from": "long",
+   "to": "timestamp",
+   "cpu": "Math.multiplyExact-like saturating: SECONDS.toMicros => clamps to Long.Min/Max on overflow (Spark 3.x); Spark 3.3+ SPARK-39209 ANSI throws",
+   "gpu": "castLongToTimestamp: mul then clamp when |x|>Long.Max/1e6 (:534-537, :1611-1640)",
+   "ansi": "ANSI: Spark 3.3+ throws overflow; GPU doc: GPU handles instead (compatibility.md:886)",
+   "whitelist": "v1 non-ANSI",
+   "device_function_hint": "out = in>MAXS? INT64_MAX : in<-MAXS? INT64_MIN : in*1000000  where MAXS=INT64_MAX/1000000",
+   "notes": "Saturating, not wrapping. Clamp lower bound is -MAXS (not Long.MIN/1e6)."
+  },
+  {
+   "from": "float",
+   "to": "timestamp",
+   "cpu": "NaN/+-Inf -> NULL (non-ANSI); else (long)(x*1e6) truncation; float upcast to double first on 3.2+",
+   "gpu": "nansToNulls, infinityToNulls, then mul by 1e6 into INT64 (:487-517); in ANSI uses AnsiUtil; GpuTypeShims.hasSideEffectsIfCastFloatToTimestamp=true on 330+ (even non-ANSI)",
+   "ansi": "throws on NaN/Inf/out of range (Spark 3.3+)",
+   "whitelist": "no (v2)",
+   "device_function_hint": "out_valid=isfinite(in); out=(int64)((double)in*1e6)",
+   "notes": "hasSideEffects=true => spark-rapids itself treats as unsafe in conditionals; produces NULLs from non-null input (nullability changes). Exclude v1."
+  },
+  {
+   "from": "double",
+   "to": "timestamp",
+   "cpu": "NaN/+-Inf -> NULL (non-ANSI); else (long)(x*1e6) truncation; float upcast to double first on 3.2+",
+   "gpu": "nansToNulls, infinityToNulls, then mul by 1e6 into INT64 (:487-517); in ANSI uses AnsiUtil; GpuTypeShims.hasSideEffectsIfCastFloatToTimestamp=true on 330+ (even non-ANSI)",
+   "ansi": "throws on NaN/Inf/out of range (Spark 3.3+)",
+   "whitelist": "no (v2)",
+   "device_function_hint": "out_valid=isfinite(in); out=(int64)((double)in*1e6)",
+   "notes": "hasSideEffects=true => spark-rapids itself treats as unsafe in conditionals; produces NULLs from non-null input (nullability changes). Exclude v1."
+  },
+  {
+   "from": "timestamp",
+   "to": "date",
+   "cpu": "local date in session timezone: floorDiv(micros + offset)/86400e6",
+   "gpu": "UTC: castTo; non-UTC needs timeZoneId: GpuTimeZoneDB.fromUtcTimestampToTimestamp then castTo (:630-635); cast meta isTimeZoneSupported true (:90)",
+   "ansi": "none",
+   "whitelist": "v1 only for UTC session tz; non-UTC => v2 needs tz transition table",
+   "device_function_hint": "UTC: out=(int)floordiv64(in,86400000000LL)",
+   "notes": "Non-UTC needs DST rules table on device; reject non-UTC in v1."
+  },
+  {
+   "from": "date",
+   "to": "timestamp",
+   "cpu": "midnight of date in session tz, micros = days*86400e6 (UTC)",
+   "gpu": "UTC: castTo; non-UTC: castTo then fromTimestampToUtcTimestamp (:636-640)",
+   "ansi": "none",
+   "whitelist": "v1 only for UTC; non-UTC v2",
+   "device_function_hint": "out=(int64)in*86400000000LL",
+   "notes": "Non-UTC DST gaps/overlaps."
+  },
+  {
+   "from": "date",
+   "to": "bool",
+   "cpu": "Spark: non-numeric semantic; GpuCast returns all NULL (comment :314)",
+   "gpu": "columnVectorFromNull (:314-317)",
+   "ansi": "analysis error / null per version",
+   "whitelist": "no",
+   "device_function_hint": "",
+   "notes": "Rare; excluded: changes output to constant null, not rowwise-computed."
+  },
+  {
+   "from": "date",
+   "to": "byte",
+   "cpu": "Spark: non-numeric semantic; GpuCast returns all NULL (comment :314)",
+   "gpu": "columnVectorFromNull (:314-317)",
+   "ansi": "analysis error / null per version",
+   "whitelist": "no",
+   "device_function_hint": "",
+   "notes": "Rare; excluded: changes output to constant null, not rowwise-computed."
+  },
+  {
+   "from": "date",
+   "to": "short",
+   "cpu": "Spark: non-numeric semantic; GpuCast returns all NULL (comment :314)",
+   "gpu": "columnVectorFromNull (:314-317)",
+   "ansi": "analysis error / null per version",
+   "whitelist": "no",
+   "device_function_hint": "",
+   "notes": "Rare; excluded: changes output to constant null, not rowwise-computed."
+  },
+  {
+   "from": "date",
+   "to": "int",
+   "cpu": "Spark: non-numeric semantic; GpuCast returns all NULL (comment :314)",
+   "gpu": "columnVectorFromNull (:314-317)",
+   "ansi": "analysis error / null per version",
+   "whitelist": "no",
+   "device_function_hint": "",
+   "notes": "Rare; excluded: changes output to constant null, not rowwise-computed."
+  },
+  {
+   "from": "date",
+   "to": "long",
+   "cpu": "Spark: non-numeric semantic; GpuCast returns all NULL (comment :314)",
+   "gpu": "columnVectorFromNull (:314-317)",
+   "ansi": "analysis error / null per version",
+   "whitelist": "no",
+   "device_function_hint": "",
+   "notes": "Rare; excluded: changes output to constant null, not rowwise-computed."
+  },
+  {
+   "from": "date",
+   "to": "float",
+   "cpu": "Spark: non-numeric semantic; GpuCast returns all NULL (comment :314)",
+   "gpu": "columnVectorFromNull (:314-317)",
+   "ansi": "analysis error / null per version",
+   "whitelist": "no",
+   "device_function_hint": "",
+   "notes": "Rare; excluded: changes output to constant null, not rowwise-computed."
+  },
+  {
+   "from": "date",
+   "to": "double",
+   "cpu": "Spark: non-numeric semantic; GpuCast returns all NULL (comment :314)",
+   "gpu": "columnVectorFromNull (:314-317)",
+   "ansi": "analysis error / null per version",
+   "whitelist": "no",
+   "device_function_hint": "",
+   "notes": "Rare; excluded: changes output to constant null, not rowwise-computed."
+  },
+  {
+   "from": "date",
+   "to": "date",
+   "cpu": "identity",
+   "gpu": "",
+   "ansi": "",
+   "whitelist": "v1",
+   "device_function_hint": "out=in",
+   "notes": ""
+  },
+  {
+   "from": "timestamp",
+   "to": "timestamp",
+   "cpu": "identity",
+   "gpu": "",
+   "ansi": "",
+   "whitelist": "v1",
+   "device_function_hint": "out=in",
+   "notes": ""
+  },
+  {
+   "from": "date",
+   "to": "string / timestamp",
+   "cpu": "string",
+   "gpu": "castToString",
+   "ansi": "",
+   "whitelist": "no (string)",
+   "device_function_hint": "",
+   "notes": "strings out of scope v1"
+  }
+ ],
+ "excluded_types_note": "string (variable width, cuDF string columns), decimal (32/64/128 backing, overflow->NULL, rounding HALF_UP, config-gated float<->decimal) and nested/interval types are out of v1 scope."
+}

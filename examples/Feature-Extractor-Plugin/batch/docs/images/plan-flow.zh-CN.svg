@@ -1,0 +1,169 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1180" height="1121" viewBox="0 0 1180 1121">
+<defs><marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#52514e"/></marker><marker id="ahb" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#2a78d6"/></marker><marker id="aho" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#eb6834"/></marker></defs>
+<rect x="0" y="0" width="1180" height="1121" rx="12" fill="#ffffff"/>
+<text x="24" y="36" font-size="18" text-anchor="start" font-weight="600" fill="#1f1f1d" font-family="Inter, 'Helvetica Neue', Helvetica, Arial, 'PingFang SC', 'Microsoft YaHei', 'Noto Sans CJK SC', sans-serif">一条查询的规划过程：Spark -&gt; spark-rapids -&gt; 融合插件</text>
+<text x="24" y="58" font-size="13" text-anchor="start" font-weight="normal" fill="#52514e" font-family="Inter, 'Helvetica Neue', Helvetica, Arial, 'PingFang SC', 'Microsoft YaHei', 'Noto Sans CJK SC', sans-serif">KuaiRand 用例 C（过滤 + 5 个特征）的真实执行计划，由 Spark 3.5.9 / spark-rapids 26.08.1 打印，表达式有缩短</text>
+<rect x="24" y="78" width="330" height="210" rx="10" fill="#f2f1ed" stroke="#c9c8c2" stroke-width="1.5"/>
+<text x="38" y="100" font-size="14" text-anchor="start" font-weight="700" fill="#1f1f1d" font-family="Inter, 'Helvetica Neue', Helvetica, Arial, 'PingFang SC', 'Microsoft YaHei', 'Noto Sans CJK SC', sans-serif">SQL</text>
+<text x="38" y="122" font-size="11.5" text-anchor="start" font-weight="normal" fill="#1f1f1d" font-family="'JetBrains Mono', 'DejaVu Sans Mono', Menlo, Consolas, 'PingFang SC', 'Microsoft YaHei', 'Noto Sans CJK SC', monospace">SELECT user_id, video_id,</text>
+<text x="38" y="138" font-size="11.5" text-anchor="start" font-weight="normal" fill="#1f1f1d" font-family="'JetBrains Mono', 'DejaVu Sans Mono', Menlo, Consolas, 'PingFang SC', 'Microsoft YaHei', 'Noto Sans CJK SC', monospace">  least(play_time_ms /</text>
+<text x="38" y="154" font-size="11.5" text-anchor="start" font-weight="normal" fill="#1f1f1d" font-family="'JetBrains Mono', 'DejaVu Sans Mono', Menlo, Consolas, 'PingFang SC', 'Microsoft YaHei', 'Noto Sans CJK SC', monospace">        (duration_ms + 1D), 5D),</text>
+<text x="38" y="170" font-size="11.5" text-anchor="start" font-weight="normal" fill="#1f1f1d" font-family="'JetBrains Mono', 'DejaVu Sans Mono', Menlo, Consolas, 'PingFang SC', 'Microsoft YaHei', 'Noto Sans CJK SC', monospace">  log(1D + play_time_ms / 1000D),</text>
+<text x="38" y="186" font-size="11.5" text-anchor="start" font-weight="normal" fill="#1f1f1d" font-family="'JetBrains Mono', 'DejaVu Sans Mono', Menlo, Consolas, 'PingFang SC', 'Microsoft YaHei', 'Noto Sans CJK SC', monospace">  CASE WHEN duration_ms &lt; 15000 ...,</text>
+<text x="38" y="202" font-size="11.5" text-anchor="start" font-weight="normal" fill="#1f1f1d" font-family="'JetBrains Mono', 'DejaVu Sans Mono', Menlo, Consolas, 'PingFang SC', 'Microsoft YaHei', 'Noto Sans CJK SC', monospace">  is_like + is_follow + ...</text>
+<text x="38" y="218" font-size="11.5" text-anchor="start" font-weight="normal" fill="#1f1f1d" font-family="'JetBrains Mono', 'DejaVu Sans Mono', Menlo, Consolas, 'PingFang SC', 'Microsoft YaHei', 'Noto Sans CJK SC', monospace">FROM log</text>
+<text x="38" y="234" font-size="11.5" text-anchor="start" font-weight="normal" fill="#1f1f1d" font-family="'JetBrains Mono', 'DejaVu Sans Mono', Menlo, Consolas, 'PingFang SC', 'Microsoft YaHei', 'Noto Sans CJK SC', monospace">WHERE duration_ms &gt; 0 AND is_rand = 0</text>
+<text x="38" y="250" font-size="11.5" text-anchor="start" font-weight="normal" fill="#1f1f1d" font-family="'JetBrains Mono', 'DejaVu Sans Mono', Menlo, Consolas, 'PingFang SC', 'Microsoft YaHei', 'Noto Sans CJK SC', monospace">  AND play_time_ms &gt;= 0</text>
+<text x="38" y="266" font-size="11.5" text-anchor="start" font-weight="normal" fill="#1f1f1d" font-family="'JetBrains Mono', 'DejaVu Sans Mono', Menlo, Consolas, 'PingFang SC', 'Microsoft YaHei', 'Noto Sans CJK SC', monospace">  AND (play_time_ms &gt; 3000 OR is_click = 1)</text>
+<rect x="400" y="78" width="240" height="176" rx="10" fill="#ffffff" stroke="#4a3aa7" stroke-width="1.6"/>
+<rect x="400" y="78" width="240" height="44" rx="10" fill="#ebe8f7"/>
+<rect x="400" y="108" width="240" height="14" fill="#ebe8f7"/>
+<text x="414" y="98" font-size="14" text-anchor="start" font-weight="700" fill="#1f1f1d" font-family="Inter, 'Helvetica Neue', Helvetica, Arial, 'PingFang SC', 'Microsoft YaHei', 'Noto Sans CJK SC', sans-serif">解析后的逻辑计划</text>
+<text x="414" y="115" font-size="11.5" text-anchor="start" font-weight="normal" fill="#52514e" font-family="Inter, 'Helvetica Neue', Helvetica, Arial, 'PingFang SC', 'Microsoft YaHei', 'Noto Sans CJK SC', sans-serif">解析器：名字还没解析</text>
+<rect x="414" y="132" width="212" height="32" rx="6" fill="#f2f1ed" stroke="#c9c8c2" stroke-width="1.3"/>
+<text x="424" y="146" font-size="12" text-anchor="start" font-weight="600" fill="#1f1f1d" font-family="'JetBrains Mono', 'DejaVu Sans Mono', Menlo, Consolas, 'PingFang SC', 'Microsoft YaHei', 'Noto Sans CJK SC', monospace">'Project</text>
+<text x="424" y="159" font-size="10.5" text-anchor="start" font-weight="normal" fill="#52514e" font-family="Inter, 'Helvetica Neue', Helvetica, Arial, 'PingFang SC', 'Microsoft YaHei', 'Noto Sans CJK SC', sans-serif">'least(...), 'log(...), ...</text>
+<rect x="422" y="172" width="204" height="32" rx="6" fill="#f2f1ed" stroke="#c9c8c2" stroke-width="1.3"/>
+<text x="432" y="186" font-size="12" text-anchor="start" font-weight="600" fill="#1f1f1d" font-family="'JetBrains Mono', 'DejaVu Sans Mono', Menlo, Consolas, 'PingFang SC', 'Microsoft YaHei', 'Noto Sans CJK SC', monospace">'Filter</text>
+<text x="432" y="199" font-size="10.5" text-anchor="start" font-weight="normal" fill="#52514e" font-family="Inter, 'Helvetica Neue', Helvetica, Arial, 'PingFang SC', 'Microsoft YaHei', 'Noto Sans CJK SC', sans-serif">('duration_ms &gt; 0) AND ...</text>
+<rect x="430" y="212" width="196" height="32" rx="6" fill="#f2f1ed" stroke="#c9c8c2" stroke-width="1.3"/>
+<text x="440" y="226" font-size="12" text-anchor="start" font-weight="600" fill="#1f1f1d" font-family="'JetBrains Mono', 'DejaVu Sans Mono', Menlo, Consolas, 'PingFang SC', 'Microsoft YaHei', 'Noto Sans CJK SC', monospace">'UnresolvedRelation</text>
+<text x="440" y="239" font-size="10.5" text-anchor="start" font-weight="normal" fill="#52514e" font-family="Inter, 'Helvetica Neue', Helvetica, Arial, 'PingFang SC', 'Microsoft YaHei', 'Noto Sans CJK SC', sans-serif">[log]</text>
+<rect x="660" y="78" width="240" height="176" rx="10" fill="#ffffff" stroke="#4a3aa7" stroke-width="1.6"/>
+<rect x="660" y="78" width="240" height="44" rx="10" fill="#ebe8f7"/>
+<rect x="660" y="108" width="240" height="14" fill="#ebe8f7"/>
+<text x="674" y="98" font-size="14" text-anchor="start" font-weight="700" fill="#1f1f1d" font-family="Inter, 'Helvetica Neue', Helvetica, Arial, 'PingFang SC', 'Microsoft YaHei', 'Noto Sans CJK SC', sans-serif">分析后的逻辑计划</text>
+<text x="674" y="115" font-size="11.5" text-anchor="start" font-weight="normal" fill="#52514e" font-family="Inter, 'Helvetica Neue', Helvetica, Arial, 'PingFang SC', 'Microsoft YaHei', 'Noto Sans CJK SC', sans-serif">分析器：解析出列和类型</text>
+<rect x="674" y="132" width="212" height="32" rx="6" fill="#f2f1ed" stroke="#c9c8c2" stroke-width="1.3"/>
+<text x="684" y="146" font-size="12" text-anchor="start" font-weight="600" fill="#1f1f1d" font-family="'JetBrains Mono', 'DejaVu Sans Mono', Menlo, Consolas, 'PingFang SC', 'Microsoft YaHei', 'Noto Sans CJK SC', monospace">Project</text>
+<text x="684" y="159" font-size="10.5" text-anchor="start" font-weight="normal" fill="#52514e" font-family="Inter, 'Helvetica Neue', Helvetica, Arial, 'PingFang SC', 'Microsoft YaHei', 'Noto Sans CJK SC', sans-serif">cast(play_time_ms as double) / ...</text>
+<rect x="682" y="172" width="204" height="32" rx="6" fill="#f2f1ed" stroke="#c9c8c2" stroke-width="1.3"/>
+<text x="692" y="186" font-size="12" text-anchor="start" font-weight="600" fill="#1f1f1d" font-family="'JetBrains Mono', 'DejaVu Sans Mono', Menlo, Consolas, 'PingFang SC', 'Microsoft YaHei', 'Noto Sans CJK SC', monospace">Filter</text>
+<text x="692" y="199" font-size="10.5" text-anchor="start" font-weight="normal" fill="#52514e" font-family="Inter, 'Helvetica Neue', Helvetica, Arial, 'PingFang SC', 'Microsoft YaHei', 'Noto Sans CJK SC', sans-serif">(duration_ms#53 &gt; 0) AND ...</text>
+<rect x="690" y="212" width="196" height="32" rx="6" fill="#f2f1ed" stroke="#c9c8c2" stroke-width="1.3"/>
+<text x="700" y="226" font-size="12" text-anchor="start" font-weight="600" fill="#1f1f1d" font-family="'JetBrains Mono', 'DejaVu Sans Mono', Menlo, Consolas, 'PingFang SC', 'Microsoft YaHei', 'Noto Sans CJK SC', monospace">Relation parquet</text>
+<text x="700" y="239" font-size="10.5" text-anchor="start" font-weight="normal" fill="#52514e" font-family="Inter, 'Helvetica Neue', Helvetica, Arial, 'PingFang SC', 'Microsoft YaHei', 'Noto Sans CJK SC', sans-serif">14 个带类型的列</text>
+<rect x="920" y="78" width="240" height="176" rx="10" fill="#ffffff" stroke="#4a3aa7" stroke-width="1.6"/>
+<rect x="920" y="78" width="240" height="44" rx="10" fill="#ebe8f7"/>
+<rect x="920" y="108" width="240" height="14" fill="#ebe8f7"/>
+<text x="934" y="98" font-size="14" text-anchor="start" font-weight="700" fill="#1f1f1d" font-family="Inter, 'Helvetica Neue', Helvetica, Arial, 'PingFang SC', 'Microsoft YaHei', 'Noto Sans CJK SC', sans-serif">优化后的逻辑计划</text>
+<text x="934" y="115" font-size="11.5" text-anchor="start" font-weight="normal" fill="#52514e" font-family="Inter, 'Helvetica Neue', Helvetica, Arial, 'PingFang SC', 'Microsoft YaHei', 'Noto Sans CJK SC', sans-serif">优化器：执行改写规则</text>
+<rect x="934" y="132" width="212" height="32" rx="6" fill="#f2f1ed" stroke="#c9c8c2" stroke-width="1.3"/>
+<text x="944" y="146" font-size="12" text-anchor="start" font-weight="600" fill="#1f1f1d" font-family="'JetBrains Mono', 'DejaVu Sans Mono', Menlo, Consolas, 'PingFang SC', 'Microsoft YaHei', 'Noto Sans CJK SC', monospace">Project</text>
+<text x="944" y="159" font-size="10.5" text-anchor="start" font-weight="normal" fill="#52514e" font-family="Inter, 'Helvetica Neue', Helvetica, Arial, 'PingFang SC', 'Microsoft YaHei', 'Noto Sans CJK SC', sans-serif">LOG(E(), x) -&gt; LOG(2.718..., x)</text>
+<rect x="942" y="172" width="204" height="32" rx="6" fill="#f2f1ed" stroke="#c9c8c2" stroke-width="1.3"/>
+<text x="952" y="186" font-size="12" text-anchor="start" font-weight="600" fill="#1f1f1d" font-family="'JetBrains Mono', 'DejaVu Sans Mono', Menlo, Consolas, 'PingFang SC', 'Microsoft YaHei', 'Noto Sans CJK SC', monospace">Filter</text>
+<text x="952" y="199" font-size="10.5" text-anchor="start" font-weight="normal" fill="#52514e" font-family="Inter, 'Helvetica Neue', Helvetica, Arial, 'PingFang SC', 'Microsoft YaHei', 'Noto Sans CJK SC', sans-serif">+ 补上 isnotnull(...)</text>
+<rect x="950" y="212" width="196" height="32" rx="6" fill="#f2f1ed" stroke="#c9c8c2" stroke-width="1.3"/>
+<text x="960" y="226" font-size="12" text-anchor="start" font-weight="600" fill="#1f1f1d" font-family="'JetBrains Mono', 'DejaVu Sans Mono', Menlo, Consolas, 'PingFang SC', 'Microsoft YaHei', 'Noto Sans CJK SC', monospace">Relation parquet</text>
+<text x="960" y="239" font-size="10.5" text-anchor="start" font-weight="normal" fill="#52514e" font-family="Inter, 'Helvetica Neue', Helvetica, Arial, 'PingFang SC', 'Microsoft YaHei', 'Noto Sans CJK SC', sans-serif"></text>
+<line x1="356" y1="180" x2="394" y2="180" stroke="#52514e" stroke-width="1.6" marker-end="url(#ah)"/>
+<line x1="642" y1="180" x2="654" y2="180" stroke="#52514e" stroke-width="1.6" marker-end="url(#ah)"/>
+<line x1="902" y1="180" x2="914" y2="180" stroke="#52514e" stroke-width="1.6" marker-end="url(#ah)"/>
+<text x="24" y="316" font-size="13" text-anchor="start" font-weight="600" fill="#52514e" font-family="Inter, 'Helvetica Neue', Helvetica, Arial, 'PingFang SC', 'Microsoft YaHei', 'Noto Sans CJK SC', sans-serif">逻辑计划 = 算什么。物理计划 = 用哪些算子、在哪个设备上、按什么顺序算。</text>
+<rect x="24" y="400" width="360" height="216" rx="10" fill="#ffffff" stroke="#8f8e88" stroke-width="1.6"/>
+<rect x="24" y="400" width="360" height="44" rx="10" fill="#f2f1ed"/>
+<rect x="24" y="430" width="360" height="14" fill="#f2f1ed"/>
+<text x="38" y="420" font-size="14" text-anchor="start" font-weight="700" fill="#1f1f1d" font-family="Inter, 'Helvetica Neue', Helvetica, Arial, 'PingFang SC', 'Microsoft YaHei', 'Noto Sans CJK SC', sans-serif">Spark 物理计划（CPU）</text>
+<text x="38" y="437" font-size="11.5" text-anchor="start" font-weight="normal" fill="#52514e" font-family="Inter, 'Helvetica Neue', Helvetica, Arial, 'PingFang SC', 'Microsoft YaHei', 'Noto Sans CJK SC', sans-serif">规划器：SparkStrategies</text>
+<rect x="38" y="454" width="332" height="32" rx="6" fill="#f2f1ed" stroke="#c9c8c2" stroke-width="1.3"/>
+<text x="48" y="468" font-size="12" text-anchor="start" font-weight="600" fill="#1f1f1d" font-family="'JetBrains Mono', 'DejaVu Sans Mono', Menlo, Consolas, 'PingFang SC', 'Microsoft YaHei', 'Noto Sans CJK SC', monospace">*(1) Project</text>
+<text x="48" y="481" font-size="10.5" text-anchor="start" font-weight="normal" fill="#52514e" font-family="Inter, 'Helvetica Neue', Helvetica, Arial, 'PingFang SC', 'Microsoft YaHei', 'Noto Sans CJK SC', sans-serif">整段生成 Java 代码，一行一行算</text>
+<rect x="46" y="494" width="324" height="32" rx="6" fill="#f2f1ed" stroke="#c9c8c2" stroke-width="1.3"/>
+<text x="56" y="508" font-size="12" text-anchor="start" font-weight="600" fill="#1f1f1d" font-family="'JetBrains Mono', 'DejaVu Sans Mono', Menlo, Consolas, 'PingFang SC', 'Microsoft YaHei', 'Noto Sans CJK SC', monospace">*(1) Filter</text>
+<text x="56" y="521" font-size="10.5" text-anchor="start" font-weight="normal" fill="#52514e" font-family="Inter, 'Helvetica Neue', Helvetica, Arial, 'PingFang SC', 'Microsoft YaHei', 'Noto Sans CJK SC', sans-serif">在同一个生成的 Java 函数里</text>
+<rect x="54" y="534" width="316" height="32" rx="6" fill="#f2f1ed" stroke="#c9c8c2" stroke-width="1.3"/>
+<text x="64" y="548" font-size="12" text-anchor="start" font-weight="600" fill="#1f1f1d" font-family="'JetBrains Mono', 'DejaVu Sans Mono', Menlo, Consolas, 'PingFang SC', 'Microsoft YaHei', 'Noto Sans CJK SC', monospace">*(1) ColumnarToRow</text>
+<text x="64" y="561" font-size="10.5" text-anchor="start" font-weight="normal" fill="#52514e" font-family="Inter, 'Helvetica Neue', Helvetica, Arial, 'PingFang SC', 'Microsoft YaHei', 'Noto Sans CJK SC', sans-serif">列批 -&gt; 行</text>
+<rect x="62" y="574" width="308" height="32" rx="6" fill="#f2f1ed" stroke="#c9c8c2" stroke-width="1.3"/>
+<text x="72" y="588" font-size="12" text-anchor="start" font-weight="600" fill="#1f1f1d" font-family="'JetBrains Mono', 'DejaVu Sans Mono', Menlo, Consolas, 'PingFang SC', 'Microsoft YaHei', 'Noto Sans CJK SC', monospace">FileScan parquet</text>
+<text x="72" y="601" font-size="10.5" text-anchor="start" font-weight="normal" fill="#52514e" font-family="Inter, 'Helvetica Neue', Helvetica, Arial, 'PingFang SC', 'Microsoft YaHei', 'Noto Sans CJK SC', sans-serif">CPU 解码，过滤条件下推</text>
+<rect x="410" y="400" width="360" height="460" rx="10" fill="#ffffff" stroke="#2a78d6" stroke-width="1.6"/>
+<rect x="410" y="400" width="360" height="44" rx="10" fill="#e6effb"/>
+<rect x="410" y="430" width="360" height="14" fill="#e6effb"/>
+<text x="424" y="420" font-size="14" text-anchor="start" font-weight="700" fill="#1f1f1d" font-family="Inter, 'Helvetica Neue', Helvetica, Arial, 'PingFang SC', 'Microsoft YaHei', 'Noto Sans CJK SC', sans-serif">spark-rapids 物理计划</text>
+<text x="424" y="437" font-size="11.5" text-anchor="start" font-weight="normal" fill="#52514e" font-family="Inter, 'Helvetica Neue', Helvetica, Arial, 'PingFang SC', 'Microsoft YaHei', 'Noto Sans CJK SC', sans-serif">GpuOverrides (preColumnarTransitions)</text>
+<rect x="424" y="454" width="332" height="32" rx="6" fill="#f2f1ed" stroke="#c9c8c2" stroke-width="1.3"/>
+<text x="434" y="468" font-size="12" text-anchor="start" font-weight="600" fill="#1f1f1d" font-family="'JetBrains Mono', 'DejaVu Sans Mono', Menlo, Consolas, 'PingFang SC', 'Microsoft YaHei', 'Noto Sans CJK SC', monospace">GpuColumnarToRow</text>
+<text x="434" y="481" font-size="10.5" text-anchor="start" font-weight="normal" fill="#52514e" font-family="Inter, 'Helvetica Neue', Helvetica, Arial, 'PingFang SC', 'Microsoft YaHei', 'Noto Sans CJK SC', sans-serif">最后转回行</text>
+<rect x="432" y="494" width="324" height="150" rx="6" fill="#f2f1ed" stroke="#c9c8c2" stroke-width="1.3"/>
+<text x="442" y="508" font-size="12" text-anchor="start" font-weight="600" fill="#1f1f1d" font-family="'JetBrains Mono', 'DejaVu Sans Mono', Menlo, Consolas, 'PingFang SC', 'Microsoft YaHei', 'Noto Sans CJK SC', monospace">GpuProject</text>
+<text x="442" y="521" font-size="10.5" text-anchor="start" font-weight="normal" fill="#52514e" font-family="Inter, 'Helvetica Neue', Helvetica, Arial, 'PingFang SC', 'Microsoft YaHei', 'Noto Sans CJK SC', sans-serif">14 个算子，每个一次 cuDF 调用</text>
+<rect x="440" y="527" width="308" height="114" rx="4" fill="#ffffff" stroke="#c9c8c2" stroke-width="1"/>
+<text x="446" y="540" font-size="10.5" text-anchor="start" font-weight="normal" fill="#1f1f1d" font-family="'JetBrains Mono', 'DejaVu Sans Mono', Menlo, Consolas, 'PingFang SC', 'Microsoft YaHei', 'Noto Sans CJK SC', monospace">每批 50 个 kernel：</text>
+<text x="446" y="556" font-size="10.5" text-anchor="start" font-weight="normal" fill="#1f1f1d" font-family="'JetBrains Mono', 'DejaVu Sans Mono', Menlo, Consolas, 'PingFang SC', 'Microsoft YaHei', 'Noto Sans CJK SC', monospace">16 x binop static_kernel</text>
+<text x="446" y="572" font-size="10.5" text-anchor="start" font-weight="normal" fill="#1f1f1d" font-family="'JetBrains Mono', 'DejaVu Sans Mono', Menlo, Consolas, 'PingFang SC', 'Microsoft YaHei', 'Noto Sans CJK SC', monospace">13 x count_set_bits_kernel</text>
+<text x="446" y="588" font-size="10.5" text-anchor="start" font-weight="normal" fill="#1f1f1d" font-family="'JetBrains Mono', 'DejaVu Sans Mono', Menlo, Consolas, 'PingFang SC', 'Microsoft YaHei', 'Noto Sans CJK SC', monospace"> 8 x transform_kernel</text>
+<text x="446" y="604" font-size="10.5" text-anchor="start" font-weight="normal" fill="#1f1f1d" font-family="'JetBrains Mono', 'DejaVu Sans Mono', Menlo, Consolas, 'PingFang SC', 'Microsoft YaHei', 'Noto Sans CJK SC', monospace"> 6 x copy_if_else_kernel</text>
+<text x="446" y="620" font-size="10.5" text-anchor="start" font-weight="normal" fill="#1f1f1d" font-family="'JetBrains Mono', 'DejaVu Sans Mono', Menlo, Consolas, 'PingFang SC', 'Microsoft YaHei', 'Noto Sans CJK SC', monospace"> 4 x offset_bitmask_binop</text>
+<text x="446" y="636" font-size="10.5" text-anchor="start" font-weight="normal" fill="#1f1f1d" font-family="'JetBrains Mono', 'DejaVu Sans Mono', Menlo, Consolas, 'PingFang SC', 'Microsoft YaHei', 'Noto Sans CJK SC', monospace"> 3 x copy_range / replace</text>
+<rect x="440" y="652" width="316" height="32" rx="6" fill="#f2f1ed" stroke="#c9c8c2" stroke-width="1.3"/>
+<text x="450" y="666" font-size="12" text-anchor="start" font-weight="600" fill="#1f1f1d" font-family="'JetBrains Mono', 'DejaVu Sans Mono', Menlo, Consolas, 'PingFang SC', 'Microsoft YaHei', 'Noto Sans CJK SC', monospace">GpuCoalesceBatches</text>
+<text x="450" y="679" font-size="10.5" text-anchor="start" font-weight="normal" fill="#52514e" font-family="Inter, 'Helvetica Neue', Helvetica, Arial, 'PingFang SC', 'Microsoft YaHei', 'Noto Sans CJK SC', sans-serif">过滤后合并小批</text>
+<rect x="448" y="692" width="308" height="118" rx="6" fill="#f2f1ed" stroke="#c9c8c2" stroke-width="1.3"/>
+<text x="458" y="706" font-size="12" text-anchor="start" font-weight="600" fill="#1f1f1d" font-family="'JetBrains Mono', 'DejaVu Sans Mono', Menlo, Consolas, 'PingFang SC', 'Microsoft YaHei', 'Noto Sans CJK SC', monospace">GpuFilter</text>
+<text x="458" y="719" font-size="10.5" text-anchor="start" font-weight="normal" fill="#52514e" font-family="Inter, 'Helvetica Neue', Helvetica, Arial, 'PingFang SC', 'Microsoft YaHei', 'Noto Sans CJK SC', sans-serif">15 个算子，每个一次 cuDF 调用</text>
+<rect x="456" y="725" width="292" height="82" rx="4" fill="#ffffff" stroke="#c9c8c2" stroke-width="1"/>
+<text x="462" y="738" font-size="10.5" text-anchor="start" font-weight="normal" fill="#1f1f1d" font-family="'JetBrains Mono', 'DejaVu Sans Mono', Menlo, Consolas, 'PingFang SC', 'Microsoft YaHei', 'Noto Sans CJK SC', monospace">每批 27 个 kernel：</text>
+<text x="462" y="754" font-size="10.5" text-anchor="start" font-weight="normal" fill="#1f1f1d" font-family="'JetBrains Mono', 'DejaVu Sans Mono', Menlo, Consolas, 'PingFang SC', 'Microsoft YaHei', 'Noto Sans CJK SC', monospace">12 x binop static_kernel</text>
+<text x="462" y="770" font-size="10.5" text-anchor="start" font-weight="normal" fill="#1f1f1d" font-family="'JetBrains Mono', 'DejaVu Sans Mono', Menlo, Consolas, 'PingFang SC', 'Microsoft YaHei', 'Noto Sans CJK SC', monospace">12 x count_set_bits_kernel</text>
+<text x="462" y="786" font-size="10.5" text-anchor="start" font-weight="normal" fill="#1f1f1d" font-family="'JetBrains Mono', 'DejaVu Sans Mono', Menlo, Consolas, 'PingFang SC', 'Microsoft YaHei', 'Noto Sans CJK SC', monospace"> 3 x transform_kernel</text>
+<text x="462" y="802" font-size="10.5" text-anchor="start" font-weight="normal" fill="#8a8984" font-family="'JetBrains Mono', 'DejaVu Sans Mono', Menlo, Consolas, 'PingFang SC', 'Microsoft YaHei', 'Noto Sans CJK SC', monospace">+ 14 个用于按掩码挑行</text>
+<rect x="456" y="818" width="300" height="32" rx="6" fill="#f2f1ed" stroke="#c9c8c2" stroke-width="1.3"/>
+<text x="466" y="832" font-size="12" text-anchor="start" font-weight="600" fill="#1f1f1d" font-family="'JetBrains Mono', 'DejaVu Sans Mono', Menlo, Consolas, 'PingFang SC', 'Microsoft YaHei', 'Noto Sans CJK SC', monospace">GpuFileGpuScan parquet</text>
+<text x="466" y="845" font-size="10.5" text-anchor="start" font-weight="normal" fill="#52514e" font-family="Inter, 'Helvetica Neue', Helvetica, Arial, 'PingFang SC', 'Microsoft YaHei', 'Noto Sans CJK SC', sans-serif">在 GPU 上解码</text>
+<rect x="796" y="400" width="360" height="380" rx="10" fill="#ffffff" stroke="#eb6834" stroke-width="1.6"/>
+<rect x="796" y="400" width="360" height="44" rx="10" fill="#fdebe3"/>
+<rect x="796" y="430" width="360" height="14" fill="#fdebe3"/>
+<text x="810" y="420" font-size="14" text-anchor="start" font-weight="700" fill="#1f1f1d" font-family="Inter, 'Helvetica Neue', Helvetica, Arial, 'PingFang SC', 'Microsoft YaHei', 'Noto Sans CJK SC', sans-serif">+ 融合插件</text>
+<text x="810" y="437" font-size="11.5" text-anchor="start" font-weight="normal" fill="#52514e" font-family="Inter, 'Helvetica Neue', Helvetica, Arial, 'PingFang SC', 'Microsoft YaHei', 'Noto Sans CJK SC', sans-serif">FusionRule (postColumnarTransitions)</text>
+<rect x="810" y="454" width="332" height="32" rx="6" fill="#f2f1ed" stroke="#c9c8c2" stroke-width="1.3"/>
+<text x="820" y="468" font-size="12" text-anchor="start" font-weight="600" fill="#1f1f1d" font-family="'JetBrains Mono', 'DejaVu Sans Mono', Menlo, Consolas, 'PingFang SC', 'Microsoft YaHei', 'Noto Sans CJK SC', monospace">GpuColumnarToRow</text>
+<text x="820" y="481" font-size="10.5" text-anchor="start" font-weight="normal" fill="#52514e" font-family="Inter, 'Helvetica Neue', Helvetica, Arial, 'PingFang SC', 'Microsoft YaHei', 'Noto Sans CJK SC', sans-serif">不变</text>
+<rect x="818" y="494" width="324" height="102" rx="6" fill="#fdebe3" stroke="#eb6834" stroke-width="1.3"/>
+<text x="828" y="508" font-size="12" text-anchor="start" font-weight="600" fill="#1f1f1d" font-family="'JetBrains Mono', 'DejaVu Sans Mono', Menlo, Consolas, 'PingFang SC', 'Microsoft YaHei', 'Noto Sans CJK SC', monospace">FusedGpuProjectExec</text>
+<text x="828" y="521" font-size="10.5" text-anchor="start" font-weight="normal" fill="#52514e" font-family="Inter, 'Helvetica Neue', Helvetica, Arial, 'PingFang SC', 'Microsoft YaHei', 'Noto Sans CJK SC', sans-serif">14 个算子 -&gt; 1 个生成的 kernel</text>
+<rect x="826" y="527" width="308" height="66" rx="4" fill="#ffffff" stroke="#c9c8c2" stroke-width="1"/>
+<text x="832" y="540" font-size="10.5" text-anchor="start" font-weight="normal" fill="#1f1f1d" font-family="'JetBrains Mono', 'DejaVu Sans Mono', Menlo, Consolas, 'PingFang SC', 'Microsoft YaHei', 'Noto Sans CJK SC', monospace">每批 5 个 kernel：</text>
+<text x="832" y="556" font-size="10.5" text-anchor="start" font-weight="normal" fill="#1f1f1d" font-family="'JetBrains Mono', 'DejaVu Sans Mono', Menlo, Consolas, 'PingFang SC', 'Microsoft YaHei', 'Noto Sans CJK SC', monospace">1 x fused_727b555473fc3846</text>
+<text x="832" y="572" font-size="10.5" text-anchor="start" font-weight="normal" fill="#1f1f1d" font-family="'JetBrains Mono', 'DejaVu Sans Mono', Menlo, Consolas, 'PingFang SC', 'Microsoft YaHei', 'Noto Sans CJK SC', monospace">4 x count_set_bits_kernel</text>
+<text x="832" y="588" font-size="10.5" text-anchor="start" font-weight="normal" fill="#1f1f1d" font-family="'JetBrains Mono', 'DejaVu Sans Mono', Menlo, Consolas, 'PingFang SC', 'Microsoft YaHei', 'Noto Sans CJK SC', monospace">    （统计输出列的空值数）</text>
+<rect x="826" y="604" width="316" height="32" rx="6" fill="#f2f1ed" stroke="#c9c8c2" stroke-width="1.3"/>
+<text x="836" y="618" font-size="12" text-anchor="start" font-weight="600" fill="#1f1f1d" font-family="'JetBrains Mono', 'DejaVu Sans Mono', Menlo, Consolas, 'PingFang SC', 'Microsoft YaHei', 'Noto Sans CJK SC', monospace">GpuCoalesceBatches</text>
+<text x="836" y="631" font-size="10.5" text-anchor="start" font-weight="normal" fill="#52514e" font-family="Inter, 'Helvetica Neue', Helvetica, Arial, 'PingFang SC', 'Microsoft YaHei', 'Noto Sans CJK SC', sans-serif">不变</text>
+<rect x="834" y="644" width="308" height="86" rx="6" fill="#fdebe3" stroke="#eb6834" stroke-width="1.3"/>
+<text x="844" y="658" font-size="12" text-anchor="start" font-weight="600" fill="#1f1f1d" font-family="'JetBrains Mono', 'DejaVu Sans Mono', Menlo, Consolas, 'PingFang SC', 'Microsoft YaHei', 'Noto Sans CJK SC', monospace">FusedGpuFilterExec</text>
+<text x="844" y="671" font-size="10.5" text-anchor="start" font-weight="normal" fill="#52514e" font-family="Inter, 'Helvetica Neue', Helvetica, Arial, 'PingFang SC', 'Microsoft YaHei', 'Noto Sans CJK SC', sans-serif">15 个算子 -&gt; 1 个掩码 kernel</text>
+<rect x="842" y="677" width="292" height="50" rx="4" fill="#ffffff" stroke="#c9c8c2" stroke-width="1"/>
+<text x="848" y="690" font-size="10.5" text-anchor="start" font-weight="normal" fill="#1f1f1d" font-family="'JetBrains Mono', 'DejaVu Sans Mono', Menlo, Consolas, 'PingFang SC', 'Microsoft YaHei', 'Noto Sans CJK SC', monospace">每批 1 个 kernel：</text>
+<text x="848" y="706" font-size="10.5" text-anchor="start" font-weight="normal" fill="#1f1f1d" font-family="'JetBrains Mono', 'DejaVu Sans Mono', Menlo, Consolas, 'PingFang SC', 'Microsoft YaHei', 'Noto Sans CJK SC', monospace">1 x filt_10d674684724f049</text>
+<text x="848" y="722" font-size="10.5" text-anchor="start" font-weight="normal" fill="#8a8984" font-family="'JetBrains Mono', 'DejaVu Sans Mono', Menlo, Consolas, 'PingFang SC', 'Microsoft YaHei', 'Noto Sans CJK SC', monospace">+ 14 个用于按掩码挑行（cuDF）</text>
+<rect x="842" y="738" width="300" height="32" rx="6" fill="#f2f1ed" stroke="#c9c8c2" stroke-width="1.3"/>
+<text x="852" y="752" font-size="12" text-anchor="start" font-weight="600" fill="#1f1f1d" font-family="'JetBrains Mono', 'DejaVu Sans Mono', Menlo, Consolas, 'PingFang SC', 'Microsoft YaHei', 'Noto Sans CJK SC', monospace">GpuFileGpuScan parquet</text>
+<text x="852" y="765" font-size="10.5" text-anchor="start" font-weight="normal" fill="#52514e" font-family="Inter, 'Helvetica Neue', Helvetica, Arial, 'PingFang SC', 'Microsoft YaHei', 'Noto Sans CJK SC', sans-serif">不变</text>
+<path d="M 1040 300 C 1040 350, 204 340, 204 392" fill="none" stroke="#52514e" stroke-width="1.6" marker-end="url(#ah)"/>
+<text x="620" y="334" font-size="12" text-anchor="middle" font-weight="normal" fill="#52514e" font-family="Inter, 'Helvetica Neue', Helvetica, Arial, 'PingFang SC', 'Microsoft YaHei', 'Noto Sans CJK SC', sans-serif">生成物理计划（SparkStrategies）</text>
+<line x1="388" y1="560" x2="404" y2="560" stroke="#52514e" stroke-width="1.6" marker-end="url(#ah)"/>
+<line x1="774" y1="560" x2="790" y2="560" stroke="#52514e" stroke-width="1.6" marker-end="url(#ah)"/>
+<text x="424" y="878" font-size="12.5" text-anchor="start" font-weight="700" fill="#1f1f1d" font-family="Inter, 'Helvetica Neue', Helvetica, Arial, 'PingFang SC', 'Microsoft YaHei', 'Noto Sans CJK SC', sans-serif">过滤 + 投影：每批 91 个 kernel</text>
+<text x="810" y="878" font-size="12.5" text-anchor="start" font-weight="700" fill="#1f1f1d" font-family="Inter, 'Helvetica Neue', Helvetica, Arial, 'PingFang SC', 'Microsoft YaHei', 'Noto Sans CJK SC', sans-serif">过滤 + 投影：每批 20 个 kernel</text>
+<text x="424" y="896" font-size="11" text-anchor="start" font-weight="normal" fill="#8a8984" font-family="Inter, 'Helvetica Neue', Helvetica, Arial, 'PingFang SC', 'Microsoft YaHei', 'Noto Sans CJK SC', sans-serif">kernel 名字和个数来自用例 C 的 nsys 实测（1 张 L20）</text>
+<rect x="24" y="916" width="360" height="150" rx="10" fill="#f2f1ed" stroke="#c9c8c2" stroke-width="1.5"/>
+<text x="38" y="940" font-size="13.5" text-anchor="start" font-weight="700" fill="#1f1f1d" font-family="Inter, 'Helvetica Neue', Helvetica, Arial, 'PingFang SC', 'Microsoft YaHei', 'Noto Sans CJK SC', sans-serif">Spark 做了什么</text>
+<text x="38" y="964" font-size="12.5" text-anchor="start" font-weight="normal" fill="#52514e" font-family="Inter, 'Helvetica Neue', Helvetica, Arial, 'PingFang SC', 'Microsoft YaHei', 'Noto Sans CJK SC', sans-serif">同一阶段里串在一起的算子，被编译成</text>
+<text x="38" y="984" font-size="12.5" text-anchor="start" font-weight="normal" fill="#52514e" font-family="Inter, 'Helvetica Neue', Helvetica, Arial, 'PingFang SC', 'Microsoft YaHei', 'Noto Sans CJK SC', sans-serif">一个 Java 函数（WholeStageCodegen），</text>
+<text x="38" y="1004" font-size="12.5" text-anchor="start" font-weight="normal" fill="#52514e" font-family="Inter, 'Helvetica Neue', Helvetica, Arial, 'PingFang SC', 'Microsoft YaHei', 'Noto Sans CJK SC', sans-serif">这是 Spark 自己在 CPU 上的"融合"。</text>
+<rect x="410" y="916" width="360" height="150" rx="10" fill="#e6effb" stroke="#2a78d6" stroke-width="1.5"/>
+<text x="424" y="940" font-size="13.5" text-anchor="start" font-weight="700" fill="#1f1f1d" font-family="Inter, 'Helvetica Neue', Helvetica, Arial, 'PingFang SC', 'Microsoft YaHei', 'Noto Sans CJK SC', sans-serif">spark-rapids 改了什么</text>
+<text x="424" y="964" font-size="12.5" text-anchor="start" font-weight="normal" fill="#52514e" font-family="Inter, 'Helvetica Neue', Helvetica, Arial, 'PingFang SC', 'Microsoft YaHei', 'Noto Sans CJK SC', sans-serif">把每个支持的算子换成 Gpu* 版本，</text>
+<text x="424" y="984" font-size="12.5" text-anchor="start" font-weight="normal" fill="#52514e" font-family="Inter, 'Helvetica Neue', Helvetica, Arial, 'PingFang SC', 'Microsoft YaHei', 'Noto Sans CJK SC', sans-serif">加上 GPU 和 CPU 之间的转换。数据是</text>
+<text x="424" y="1004" font-size="12.5" text-anchor="start" font-weight="normal" fill="#52514e" font-family="Inter, 'Helvetica Neue', Helvetica, Arial, 'PingFang SC', 'Microsoft YaHei', 'Noto Sans CJK SC', sans-serif">cuDF 列；表达式树按节点逐个计算，</text>
+<text x="424" y="1024" font-size="12.5" text-anchor="start" font-weight="normal" fill="#52514e" font-family="Inter, 'Helvetica Neue', Helvetica, Arial, 'PingFang SC', 'Microsoft YaHei', 'Noto Sans CJK SC', sans-serif">每个节点一次 cuDF 调用。</text>
+<rect x="796" y="916" width="360" height="150" rx="10" fill="#fdebe3" stroke="#eb6834" stroke-width="1.5"/>
+<text x="810" y="940" font-size="13.5" text-anchor="start" font-weight="700" fill="#1f1f1d" font-family="Inter, 'Helvetica Neue', Helvetica, Arial, 'PingFang SC', 'Microsoft YaHei', 'Noto Sans CJK SC', sans-serif">插件改了什么</text>
+<text x="810" y="964" font-size="12.5" text-anchor="start" font-weight="normal" fill="#52514e" font-family="Inter, 'Helvetica Neue', Helvetica, Arial, 'PingFang SC', 'Microsoft YaHei', 'Noto Sans CJK SC', sans-serif">只改 Project / Filter / 聚合输入里的</text>
+<text x="810" y="984" font-size="12.5" text-anchor="start" font-weight="normal" fill="#52514e" font-family="Inter, 'Helvetica Neue', Helvetica, Arial, 'PingFang SC', 'Microsoft YaHei', 'Noto Sans CJK SC', sans-serif">表达式。把表达式树翻译成 CUDA C++，</text>
+<text x="810" y="1004" font-size="12.5" text-anchor="start" font-weight="normal" fill="#52514e" font-family="Inter, 'Helvetica Neue', Helvetica, Arial, 'PingFang SC', 'Microsoft YaHei', 'Noto Sans CJK SC', sans-serif">用 NVRTC 编译，跑一个 kernel。</text>
+<text x="810" y="1024" font-size="12.5" text-anchor="start" font-weight="normal" fill="#52514e" font-family="Inter, 'Helvetica Neue', Helvetica, Arial, 'PingFang SC', 'Microsoft YaHei', 'Noto Sans CJK SC', sans-serif">不支持的部分保持 spark-rapids 原样。</text>
+<text x="24" y="1096" font-size="13" text-anchor="start" font-weight="600" fill="#1f1f1d" font-family="Inter, 'Helvetica Neue', Helvetica, Arial, 'PingFang SC', 'Microsoft YaHei', 'Noto Sans CJK SC', sans-serif">结果和 spark-rapids（基准）逐位一致；插件的每个决定，融合与否，都会连同原因记进日志。</text>
+</svg>
