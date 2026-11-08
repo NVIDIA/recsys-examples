@@ -24,6 +24,7 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 #include "hier_output_dist/input_dist/node.cuh"
 #include "hier_output_dist/input_dist/planner.cuh"
 #include "hier_output_dist/input_dist/planner.h"
+#include "hier_output_dist/input_dist/rail.cuh"
 
 namespace dyn_emb {
 namespace hier_output_dist {
@@ -171,144 +172,20 @@ OneNodeOwner one_node_owner(const NodeLayout &node, const at::Tensor &node_keys,
 
 namespace {
 
-// One CTA: the count message this rank sends its rail (CountMessage), word
-// by word: the common part (its node's largest remote part, its own part as
-// owner, and as proxy the most occurrences of one of its keys, its
-// node-unique keys and its chunks per owner node), then for each node its
-// node-unique keys of each feature there.
+// One CTA: a rank's count message (count_message_of, rail.cuh), as rail_exchange makes it. The
+// hooks' (count_message).
 __global__ void __launch_bounds__(kThreads)
-    count_message_kernel(const int64_t *need_remote, const int64_t *own_total,
-                         const int64_t *key_rows, const int64_t *node_length_per_bucket,
-                         const int64_t *chunk_length_per_bucket,
-                         const int64_t *node_length_per_bucket_feature, CountMessage format,
+    count_message_kernel(CountParts parts, CountMessage format, int64_t local_size,
                          int64_t *message) {
-  for (int64_t word = threadIdx.x; word < format.out_words(); word += kThreads) {
-    int64_t value;
-    if (word == CountMessage::kNeedRemote)
-      value = *need_remote;
-    else if (word == CountMessage::kOwnTotal)
-      value = *own_total;
-    else if (word == CountMessage::kKeyRows)
-      value = *key_rows;
-    else if (word < format.chunk_length_per_bucket(0))
-      value = node_length_per_bucket[word - format.node_length_per_bucket(0)];
-    else if (word < format.common())
-      value = chunk_length_per_bucket[word - format.chunk_length_per_bucket(0)];
-    else
-      value = node_length_per_bucket_feature[word - format.common()];
-    message[word] = value;
-  }
+  count_message_of(parts, format, local_size, message, nullptr);
 }
 
-// One CTA: the rail's layout (RailLayout) from the count messages this rank got
-// (messages [num_nodes][CountMessage::length], its own too) and its own part's
-// lengths (own_lengths, [feature][requester]). A slice a proxy puts holds the
-// owner node's chunks (ChunkPiece, 16 bytes each), then its records; none to
-// its own node.
+// One CTA: the rail's layout (rail_layout_of, rail.cuh) from the rail's count messages (messages
+// [num_nodes][CountMessage::length]), as rail_exchange makes it. The hooks' (rail_layout).
 __global__ void __launch_bounds__(kThreads)
-    rail_layout_kernel(const int64_t *messages, const int64_t *own_lengths,
-                       const int64_t *other_nodes, Sizes sizes, int64_t *put_dst,
-                       int64_t *put_bytes, bool *put_skip, int64_t *kjt_lengths,
-                       int64_t *kjt_offsets, int64_t *num_recv, int64_t *length_per_key,
-                       int64_t *slice_in, int64_t *node_length_per_source,
-                       int64_t *node_length_per_source_feature, int64_t *source_offsets,
-                       int64_t *requester_offsets, int64_t *needs) {
-  const int64_t num_nodes = sizes.topo.num_nodes, node = sizes.topo.node,
-                local_size = sizes.topo.local_size, num_features = sizes.num_features,
-                num_sources = sizes.topo.num_sources;
-  const CountMessage format{num_nodes, num_features};
-  // word `word` of the message from the rail peer on node `source`
-  auto message = [&](int64_t source, int64_t word) {
-    return messages[source * format.length() + word];
-  };
-  // the bytes of the slice the proxy on `source` puts at the owner on `owner_node`
-  auto slice_bytes = [&](int64_t source, int64_t owner_node) -> int64_t {
-    if (source == owner_node) return 0;
-    return message(source, format.chunk_length_per_bucket(owner_node)) *
-               (int64_t)sizeof(ChunkPiece) +
-           message(source, format.node_length_per_bucket(owner_node)) * sizes.record_bytes;
-  };
-  // the keys the owner on `owner_node` looks up: those of its own node, and
-  // the node-unique keys every proxy of the rail has for it
-  auto recv = [&](int64_t owner_node) {
-    int64_t keys = message(owner_node, CountMessage::kOwnTotal);
-    for (int64_t source = 0; source < num_nodes; ++source)
-      keys += message(source, format.node_length_per_bucket(owner_node));
-    return keys;
-  };
-  // As proxy: where its slice starts at each owner (after the slices of the
-  // nodes before it), its bytes, and whether it puts none (the owner
-  // overflows lookup_keys, or it is on this node).
-  for (int64_t owner_node = threadIdx.x; owner_node < num_nodes; owner_node += kThreads) {
-    int64_t dst = 0;
-    for (int64_t source = 0; source < node; ++source) dst += slice_bytes(source, owner_node);
-    put_dst[owner_node] = dst;
-    put_bytes[owner_node] = slice_bytes(node, owner_node);
-    put_skip[owner_node] = owner_node == node || recv(owner_node) > sizes.lookup_keys;
-  }
-  // As owner: each source node's slice in its rail_keys (byte offset,
-  // chunks of this node), its node-unique keys, and its keys of each feature
-  // (the part of its message for this node).
-  for (int64_t source = threadIdx.x; source < num_nodes; source += kThreads) {
-    int64_t start = 0;
-    for (int64_t earlier = 0; earlier < source; ++earlier) start += slice_bytes(earlier, node);
-    slice_in[2 * source] = start;
-    slice_in[2 * source + 1] =
-        source == node ? 0 : message(source, format.chunk_length_per_bucket(node));
-    node_length_per_source[source] = message(source, format.node_length_per_bucket(node));
-  }
-  for (int64_t index = threadIdx.x; index < num_nodes * num_features; index += kThreads)
-    node_length_per_source_feature[index] =
-        message(index / num_features, format.common() + index % num_features);
-  // Its KJT's lengths, (feature, source) feature-major: its node's
-  // requesters, then the other nodes in order. Then where each requester of
-  // its node has its keys of each feature in it, and each other node (what it
-  // sends that node's proxy; its own node: 0).
-  auto kjt_length = [&](int64_t index) {
-    const int64_t feature = index / num_sources, source = index % num_sources;
-    return source < local_size
-               ? own_lengths[feature * local_size + source]
-               : message(other_nodes[source - local_size], format.common() + feature);
-  };
-  const int64_t num_lengths = num_features * num_sources;
-  for (int64_t index = threadIdx.x; index < num_lengths; index += kThreads)
-    kjt_lengths[index] = kjt_length(index);
-  cta_exclusive_ends<int64_t>(num_lengths, kjt_length, kjt_offsets);
-  for (int64_t feature = threadIdx.x; feature < num_features; feature += kThreads)
-    length_per_key[feature] =
-        kjt_offsets[(feature + 1) * num_sources] - kjt_offsets[feature * num_sources];
-  for (int64_t index = threadIdx.x; index < local_size * num_features; index += kThreads) {
-    const int64_t requester = index / num_features, feature = index % num_features;
-    requester_offsets[index] = kjt_offsets[feature * num_sources + requester];
-  }
-  for (int64_t feature = threadIdx.x; feature < num_features; feature += kThreads)
-    source_offsets[node * num_features + feature] = 0;
-  for (int64_t index = threadIdx.x; index < (num_nodes - 1) * num_features; index += kThreads) {
-    const int64_t column = index / num_features, feature = index % num_features;
-    source_offsets[other_nodes[column] * num_features + feature] =
-        kjt_offsets[feature * num_sources + local_size + column];
-  }
-  // The keys it looks up, and the most the rail needs of each capacity.
-  const int64_t most_recv = cta_max<int64_t>(num_nodes, recv, 0);
-  const int64_t most_remote = cta_max<int64_t>(
-      num_nodes, [&](int64_t source) { return message(source, CountMessage::kNeedRemote); }, 0);
-  const int64_t most_key_rows = cta_max<int64_t>(
-      num_nodes, [&](int64_t source) { return message(source, CountMessage::kKeyRows); }, 0);
-  if (threadIdx.x == 0) {
-    *num_recv = recv(node);
-    needs[kNeedLookupKeys] = most_recv;
-    needs[kNeedRemoteKeys] = most_remote;
-    needs[kNeedKeyRows] = most_key_rows;
-  }
-}
-
-// One CTA: what this rank publishes to its node, its rail's needs, then
-// where each requester of its node has its keys of each feature in its KJT.
-__global__ void __launch_bounds__(kThreads)
-    status_publish_kernel(const int64_t *needs, const int64_t *requester_offsets,
-                          int64_t offset_words, int64_t *publish) {
-  for (int64_t word = threadIdx.x; word < kNumNeeds + offset_words; word += kThreads)
-    publish[word] = word < kNumNeeds ? needs[word] : requester_offsets[word - kNumNeeds];
+    rail_layout_kernel(const int64_t *messages, CountMessage format, const int64_t *own_lengths,
+                       Sizes sizes, int64_t *scratch, RailLayoutView out) {
+  rail_layout_of(RailCounts{messages, format.length(), format}, own_lengths, sizes, scratch, out);
 }
 
 // One CTA: where each source node's chunks start in fwd_chunks, from the
@@ -400,30 +277,32 @@ at::Tensor other_nodes_of(const Topo &topo, const at::TensorOptions &options) {
 }
 
 at::Tensor count_message(const at::Tensor &need_remote, const at::Tensor &own_total,
-                         const at::Tensor &key_rows, const at::Tensor &node_length_per_bucket,
-                         const at::Tensor &chunk_length_per_bucket,
+                         const at::Tensor &key_rows, const at::Tensor &chunk_length_per_bucket,
+                         const at::Tensor &own_lengths,
                          const at::Tensor &node_length_per_bucket_feature) {
-  const int64_t num_nodes = node_length_per_bucket.numel();
+  const int64_t num_nodes = chunk_length_per_bucket.numel();
   const CountMessage format{num_nodes, node_length_per_bucket_feature.numel() / num_nodes};
-  const at::Tensor message = at::empty({format.out_words()}, node_length_per_bucket.options());
+  const at::Tensor message = at::empty({format.length()}, chunk_length_per_bucket.options());
+  const CountParts parts{
+      need_remote.data_ptr<int64_t>(), own_total.data_ptr<int64_t>(),
+      key_rows.data_ptr<int64_t>(),    chunk_length_per_bucket.data_ptr<int64_t>(),
+      own_lengths.data_ptr<int64_t>(), node_length_per_bucket_feature.data_ptr<int64_t>()};
   count_message_kernel<<<kOneCta, kThreads, 0, current_stream()>>>(
-      need_remote.data_ptr<int64_t>(), own_total.data_ptr<int64_t>(), key_rows.data_ptr<int64_t>(),
-      node_length_per_bucket.data_ptr<int64_t>(), chunk_length_per_bucket.data_ptr<int64_t>(),
-      node_length_per_bucket_feature.data_ptr<int64_t>(), format, message.data_ptr<int64_t>());
+      parts, format, own_lengths.numel() / format.num_features, message.data_ptr<int64_t>());
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   return message;
 }
 
-RailLayout rail_layout(const at::Tensor &messages, const at::Tensor &own_lengths,
-                       const at::Tensor &other_nodes, const Sizes &sizes) {
+RailLayout empty_rail_layout(const Sizes &sizes, const at::TensorOptions &options) {
   const int64_t num_nodes = sizes.topo.num_nodes, local_size = sizes.topo.local_size,
                 num_features = sizes.num_features,
                 num_lengths = num_features * sizes.topo.num_sources;
-  const auto long_options = messages.options();
+  const auto long_options = options.dtype(at::kLong);
   RailLayout rail;
   rail.put_dst = at::empty({num_nodes}, long_options);
   rail.put_bytes = at::empty({num_nodes}, long_options);
   rail.put_skip = at::empty({num_nodes}, long_options.dtype(at::kBool));
+  rail.owner_offsets = at::empty({num_nodes, num_features}, long_options);
   rail.kjt_lengths = at::empty({num_lengths}, long_options);
   rail.kjt_offsets = at::empty({num_lengths + 1}, long_options);
   rail.num_recv = at::empty({}, long_options);
@@ -434,28 +313,20 @@ RailLayout rail_layout(const at::Tensor &messages, const at::Tensor &own_lengths
   rail.source_offsets = at::empty({num_nodes, num_features}, long_options);
   rail.requester_offsets = at::empty({local_size, num_features}, long_options);
   rail.needs = at::empty({kNumNeeds}, long_options);
-  rail_layout_kernel<<<kOneCta, kThreads, 0, current_stream()>>>(
-      messages.data_ptr<int64_t>(), own_lengths.data_ptr<int64_t>(),
-      other_nodes.data_ptr<int64_t>(), sizes, rail.put_dst.data_ptr<int64_t>(),
-      rail.put_bytes.data_ptr<int64_t>(), rail.put_skip.data_ptr<bool>(),
-      rail.kjt_lengths.data_ptr<int64_t>(), rail.kjt_offsets.data_ptr<int64_t>(),
-      rail.num_recv.data_ptr<int64_t>(), rail.length_per_key.data_ptr<int64_t>(),
-      rail.slice_in.data_ptr<int64_t>(), rail.node_length_per_source.data_ptr<int64_t>(),
-      rail.node_length_per_source_feature.data_ptr<int64_t>(),
-      rail.source_offsets.data_ptr<int64_t>(), rail.requester_offsets.data_ptr<int64_t>(),
-      rail.needs.data_ptr<int64_t>());
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
   return rail;
 }
 
-at::Tensor status_publish(const RailLayout &rail) {
-  const int64_t offset_words = rail.requester_offsets.numel();
-  const at::Tensor publish = at::empty({kNumNeeds + offset_words}, rail.needs.options());
-  status_publish_kernel<<<kOneCta, kThreads, 0, current_stream()>>>(
-      rail.needs.data_ptr<int64_t>(), rail.requester_offsets.data_ptr<int64_t>(), offset_words,
-      publish.data_ptr<int64_t>());
+RailLayout rail_layout(const at::Tensor &messages, const at::Tensor &own_lengths,
+                       const Sizes &sizes) {
+  const auto options = messages.options();
+  RailLayout rail = empty_rail_layout(sizes, options);
+  const at::Tensor scratch =
+      at::empty({rail_layout_scratch(sizes.topo, sizes.num_features)}, options);
+  rail_layout_kernel<<<kOneCta, kThreads, 0, current_stream()>>>(
+      messages.data_ptr<int64_t>(), CountMessage{sizes.topo.num_nodes, sizes.num_features},
+      own_lengths.data_ptr<int64_t>(), sizes, scratch.data_ptr<int64_t>(), view_of(rail));
   C10_CUDA_KERNEL_LAUNCH_CHECK();
-  return publish;
+  return rail;
 }
 
 OwnerTables owner_tables(const RailLayout &rail, const at::Tensor &own_offsets,

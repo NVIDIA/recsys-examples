@@ -440,19 +440,6 @@ struct Credits {
   __device__ __forceinline__ void flush_warp() const { gin.flush(ncclCoopWarp{}); }
 };
 
-// A put on the rail without a signal: `bytes` from `src` in this rank's copy
-// of the window into the place of `dst` in the rail peer's copy on node
-// peer_node (both pointers name places in this rank's copy). It makes no
-// release of its own: the caller makes one system-scope fence after the
-// writes it carries and before it.
-__device__ __forceinline__ void rail_put(const ncclGin &gin, const ncclTeam &rail,
-                                         const NodeWindow &node, int peer_node, const void *dst,
-                                         const void *src, size_t bytes) {
-  gin.put(rail, peer_node, node.window, node.offset(dst), node.window, node.offset(src), bytes,
-          ncclGin_None{}, ncclGin_None{}, ncclCoopThread{}, ncclGin_None{},
-          cuda::thread_scope_system, cuda::thread_scope_system);
-}
-
 // Puts of rows on the rail, from the rows at `src_rows` into those at
 // `dst_rows` of a rail peer (both in this rank's copy of the window: the
 // peer's at the same place), each adding its rows to the peer's signal
@@ -495,10 +482,10 @@ struct RowPut {
 // rail peer one message of each kind, which adds 1 to the peer's signal of
 // that kind for this rank's node (`sig`). So a signal counts the calls whose
 // message from that node has landed, a running total that reaches in_seq
-// once this call's has. A message is one put, without a release of its own
-// (as RowPut's: the caller makes one system-scope fence after the writes it
-// carries and before the put); a put without a signal before it on the same
-// context lands before it.
+// once this call's has. A message is one put (the signal is strong: a peer
+// that sees it also sees the put), or a payload-free signal when it carries
+// nothing, without a release of its own (as RowPut's: the caller makes one
+// system-scope fence after the writes it carries and before the put).
 struct RailMessage {
   const ncclGin &gin;
   const ncclTeam &rail;
@@ -514,6 +501,11 @@ struct RailMessage {
     gin.put(rail, peer_node, node.window, node.offset(dst), node.window, node.offset(src), bytes,
             sig, ncclGin_None{}, ncclCoopThread{}, ncclGin_None{}, cuda::thread_scope_system,
             cuda::thread_scope_system);
+  }
+  // A message of no bytes to the rail peer on node peer_node: the signal alone.
+  __device__ __forceinline__ void signal(int peer_node) const {
+    gin.signal(rail, peer_node, sig, ncclCoopThread{}, ncclGin_None{}, cuda::thread_scope_system,
+               cuda::thread_scope_system);
   }
 };
 

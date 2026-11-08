@@ -24,18 +24,19 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 //                         targets' node_keys, over NVLink;
 //   node_done             tells each target its keys are there, and waits until every requester
 //                         of the node told it;
-//   rail_count_exchange   (across nodes) its count message to each rail
-//                         peer, and theirs;
-//   rail_key_exchange     (across nodes) its key records to each rail owner
-//                         and its source_offsets to each rail proxy, and
-//                         theirs;
-//   node_status_exchange  (across nodes) its rail's needs and
-//                         requester_offsets to its node, and every node
-//                         peer's;
-//   peer_gather           (across nodes) words of the node peers' remote_map
-//                         or proxy header.
+//   rail_exchange         (across nodes) its count message to every rail peer, and theirs; the
+//                         rail's layout from the rail's messages (rail.cuh);
+//   rail_key_push         (across nodes) its key records to each rail owner; it does not wait;
+//   node_status_exchange  (across nodes) its rail's needs and requester_offsets to its node, and
+//                         every node peer's;
+//   peer_gather           (across nodes) words of the node peers' remote_map or proxy header;
+//   rail_done             (across nodes) waits for every rail proxy's key records, and flushes
+//                         this rank's puts; just before owner_tables, the first reader of
+//                         rail_keys.
 // A kernel that waits runs on one CTA (or warp). It waits only for the same kernel (the same seq)
-// of its node or rail peers. Its threads (or lanes) take the peers in turn, so any number of them.
+// of its node or rail peers, but rail_done, which waits for its rail peers' rail_key_push of the
+// call, a kernel that never waits. Its threads (or lanes) take the peers in turn, so any number of
+// them.
 // Memory order:
 // - What peers wrote is read only after an acquire of their flag or signal. The comm kernel that
 //   acquired it reads with ld.global.cg. A later kernel on the stream reads it too: peer_gather
@@ -45,7 +46,23 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 // - What it stores into a peer's buffer comes after an acquire, earlier on the stream, of the
 //   peer's flag that says the peer read that buffer: node_exchange's barrier for node_keys (a
 //   peer publishes it once every kernel of its call before ended), node_done's of the call before
-//   for node_offsets (a peer tells it after its node_exchange read them).
+//   for node_offsets (a peer tells it after its node_exchange read them), rail_exchange's count
+//   message of the call for rail_keys (a rail owner sends it after its owner_tables of the call
+//   before read them).
+// - A buffer the NIC reads is written again only after a flush, earlier on the stream, of the puts
+//   that read it: rail_exchange's own for count_msg_out, rail_done's for key_stage.
+// - The key round is waited for late. rail_key_push only posts the puts (each slice with a strong
+//   signal, so the owner that sees the signal sees the slice). rail_done acquires every rail
+//   proxy's key signal and flushes this rank's puts. Between the two run node_status_exchange,
+//   peer_gather, remote_rows and requester_tables: none of them reads rail_keys or writes
+//   key_stage. The first reader of rail_keys, owner_tables, runs after rail_done on the stream, and
+//   the planner reads the rail's offsets from the layout's tensors, not from the window. The next
+//   call writes key_stage in its proxy steps, after this rail_done (and its flush: the NIC read
+//   the slices) on the stream, and its rail proxies put into rail_keys only once they have this
+//   rank's count message of that call, which its rail_exchange sends after this call's rail_done
+//   and owner_tables. The count messages keep their in_seq parity: a rail peer's message of call
+//   seq + 2 needs this rank's of seq + 1, which it sends after its rail_exchange of seq read the
+//   slots.
 
 #include <ATen/cuda/CUDAContext.h>
 #include <nccl_device.h>
@@ -58,6 +75,7 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 #include "hier_output_dist/common/window.h"
 #include "hier_output_dist/input_dist/input_dist.h"
 #include "hier_output_dist/input_dist/node.cuh"
+#include "hier_output_dist/input_dist/rail.cuh"
 
 namespace dyn_emb {
 namespace hier_output_dist {
@@ -139,41 +157,33 @@ __global__ void node_done_kernel(ncclWindow_t window, Sizes sizes, int64_t seq) 
     written.wait(peer, "pushed keys");
 }
 
-// 1 CTA (8 warps): this rank's count messages (CountMessage::out_words
-// words) into its count_msg_out, and its own message (the common part and
-// the part for its own node) into the call's count_msg from its node. Then
-// warp 1's lanes, each taking rail peers in turn, put each peer its message
-// in two puts into the same place in the peer's copy: the common part, then
-// the part for the peer's node, which signals (the signal also covers the
-// first put). Warp 0's lanes wait for the rail peers' messages, and every
-// peer's lands in messages [num_nodes][CountMessage::length]. The count
-// messages go by in_seq parity: a peer's message of call seq + 2 needs this
-// rank's of seq + 1, which it sends once call seq ended here.
-__global__ void rail_count_exchange_kernel(ncclWindow_t window, ncclDevComm dev, Sizes sizes,
-                                           int64_t seq, const int64_t *message, int64_t *messages) {
+// 1 CTA: this rank's count message (count_message_of, rail.cuh: the same for every rail peer) into
+// its count_msg_out and into the call's count_msg slot of its own node. Then warp 1's lanes, each
+// taking rail peers in turn, put each peer the message into the same slot in the peer's copy, one
+// put that signals count[node]. Warp 0's lanes wait for the rail peers' messages. From the rail's
+// num_nodes messages, read in their slots of the call, the CTA lays out the rail (rail_layout_of)
+// into the call's tensors: every rank of the rail computes it from the same messages. The count
+// messages go by in_seq parity: a peer's message of call seq + 2 needs this rank's of seq + 1,
+// which it sends once call seq ended here.
+__global__ void __launch_bounds__(kThreads)
+    rail_exchange_kernel(ncclWindow_t window, ncclDevComm dev, Sizes sizes, int64_t seq,
+                         CountParts parts, int64_t *scratch, RailLayoutView layout) {
   const int num_nodes = sizes.topo.num_nodes, node = sizes.topo.node, tid = threadIdx.x,
             warp = tid >> 5, lane = tid & 31;
   const CountMessage format{num_nodes, sizes.num_features};
-  const int64_t common = format.common(), length = format.length();
   const NodeWindow node_window(window, sizes.topo.local_rank);
   const CtrlLayout ctrl = node_window.layout(sizes).ctrl;
   int64_t *out = ctrl.count_msg_out();
   int64_t *own = ctrl.count_msg(seq, node);
-  for (int i = tid; i < format.out_words(); i += blockDim.x) out[i] = message[i];
-  for (int i = tid; i < length; i += blockDim.x)
-    own[i] = message[i < common ? i : format.part(node) + (i - common)];
+  count_message_of(parts, format, sizes.topo.local_size, out, own);
   __syncthreads();
   ncclGin gin(dev, kCtxIn);
   const ncclTeam rail = ncclTeamRail(dev);
   if (warp == 1) {
     const RailMessage counts(gin, rail, node_window, sig_count(node));
     fence_sc_sys();
-    for (int peer_node = lane; peer_node < num_nodes; peer_node += 32) {
-      if (peer_node == node) continue;
-      rail_put(gin, rail, node_window, peer_node, own, out, (size_t)common * 8);
-      counts.put(peer_node, own + common, out + format.part(peer_node),
-                 (size_t)sizes.num_features * 8);
-    }
+    for (int peer_node = lane; peer_node < num_nodes; peer_node += 32)
+      if (peer_node != node) counts.put(peer_node, own, out, (size_t)format.length() * 8);
   }
   if (warp == 0) {
     Spin spin(sizes.timeout_ns);
@@ -182,79 +192,58 @@ __global__ void rail_count_exchange_kernel(ncclWindow_t window, ncclDevComm dev,
         spin.pause("count message", peer_node, seq, sizes.topo.rank);
   }
   __syncthreads();
-  for (int i = tid; i < num_nodes * length; i += blockDim.x)
-    messages[i] =
-        (int64_t)__ldcg((const unsigned long long *)(ctrl.count_msg(seq, i / length) + i % length));
+  rail_layout_of(RailCounts{ctrl.count_msg(seq, 0), format.slot_words(), format}, parts.own_lengths,
+                 sizes, scratch, layout);
   // count_msg_out may be written again once the NIC has read it.
   if (warp == 1) gin.flush(ncclCoopThread{});
 }
 
-// 1 CTA (2 warps): warp 1's lanes, each taking rail peers in turn, send each
-// peer o this call's key stream: as proxy, this rank's slice of key_stage
-// (bytes [put_src[o], put_src[o] + put_bytes[o])) into the owner's rail_keys at
-// put_dst[o], unless put_skip[o] (the owner overflows lookup_keys); then as
-// owner, where that proxy's keys of each feature start in its KJT (row o of
-// source_offsets) into the proxy's owner_offsets, which signals keys[node]. Its
-// system fence orders the planner's writes of key_stage and source_offsets
-// before the puts. Warp 0 waits for the other nodes' key streams. A proxy puts
-// only after it has the owner's count message of the call, which the owner
-// sends once its previous call ended.
-__global__ void rail_key_exchange_kernel(ncclWindow_t window, ncclDevComm dev, Sizes sizes,
-                                         int64_t seq, const int64_t *put_src,
-                                         const int64_t *put_dst, const int64_t *put_bytes,
-                                         const bool *put_skip) {
-  const int num_nodes = sizes.topo.num_nodes, node = sizes.topo.node, warp = threadIdx.x >> 5,
-            lane = threadIdx.x & 31;
+// 1 warp: its lanes, each taking rail peers in turn, send each owner o this call's key stream:
+// this proxy's slice of key_stage (bytes [put_src[o], put_src[o] + put_bytes[o])) into the owner's
+// rail_keys at put_dst[o], one put that signals keys[node]; the signal alone when it puts no key
+// (put_skip[o]: the owner overflows lookup_keys; or an empty slice). Its system fence orders the
+// planner's writes of key_stage before the puts. It does not wait: rail_done waits for the rail's
+// key streams and flushes these puts. A proxy puts only after it has the owner's count message of
+// the call (rail_exchange, earlier on the stream), which the owner sends once its previous call
+// read rail_keys.
+__global__ void rail_key_push_kernel(ncclWindow_t window, ncclDevComm dev, Sizes sizes,
+                                     const int64_t *put_src, const int64_t *put_dst,
+                                     const int64_t *put_bytes, const bool *put_skip) {
+  const int num_nodes = sizes.topo.num_nodes, node = sizes.topo.node;
   ncclGin gin(dev, kCtxIn);
   const ncclTeam rail = ncclTeamRail(dev);
-  if (warp == 1) {
-    const NodeWindow node_window(window, sizes.topo.local_rank);
-    const KeysLayout keys = node_window.layout(sizes).keys;
-    const RailMessage key_stream(gin, rail, node_window, sig_keys(num_nodes, node));
-    const size_t offsets_bytes = 8 * (size_t)sizes.num_features;
-    fence_sc_sys();
-    for (int owner_node = lane; owner_node < num_nodes; owner_node += 32) {
-      if (owner_node == node) continue;
-      if (!put_skip[owner_node])
-        rail_put(gin, rail, node_window, owner_node, keys.rail_keys() + put_dst[owner_node],
-                 keys.key_stage() + put_src[owner_node], (size_t)put_bytes[owner_node]);
-      key_stream.put(owner_node, keys.owner_offsets(node), keys.source_offsets(owner_node),
-                     offsets_bytes);
-    }
+  const NodeWindow node_window(window, sizes.topo.local_rank);
+  const KeysLayout keys = node_window.layout(sizes).keys;
+  const RailMessage key_stream(gin, rail, node_window, sig_keys(num_nodes, node));
+  fence_sc_sys();
+  for (int owner_node = threadIdx.x; owner_node < num_nodes; owner_node += blockDim.x) {
+    if (owner_node == node) continue;
+    const int64_t bytes = put_skip[owner_node] ? 0 : put_bytes[owner_node];
+    if (bytes > 0)
+      key_stream.put(owner_node, keys.rail_keys() + put_dst[owner_node],
+                     keys.key_stage() + put_src[owner_node], (size_t)bytes);
+    else
+      key_stream.signal(owner_node);
   }
-  if (warp == 0) {
-    Spin spin(sizes.timeout_ns);
-    for (int peer_node = lane; peer_node < num_nodes; peer_node += 32)
-      while (peer_node != node && (int64_t)gin.readSignal(sig_keys(num_nodes, peer_node)) < seq)
-        spin.pause("key stream", peer_node, seq, sizes.topo.rank);
-  }
-  // key_stage and source_offsets may be written again once the NIC has read
-  // them.
-  if (warp == 1) gin.flush(ncclCoopThread{});
 }
 
-// 1 CTA: this rank's publish vector (its rail's kNumNeeds needs, then its
-// requester offsets [requester][feature]) into its needs and requester_offsets
-// words; after a system fence, which also orders the planner's writes of
-// remote_map and the proxy header before it, in_done gets seq. Once every node
-// peer's has it, every peer's needs land in peer_needs [local_size] [kNumNeeds]
+// 1 CTA: this rank's rail's kNumNeeds needs and its requester offsets [requester][feature] (the
+// rail layout's) into its needs and requester_offsets words; after a system fence, which also
+// orders the planner's writes of remote_map and the proxy header before it, in_done gets seq.
+// Once every node peer's has it, every peer's needs land in peer_needs [local_size] [kNumNeeds]
 // and where each one's KJT holds this requester's keys of each feature in
 // offset_per_owner_feature [local_size][num_features].
 __global__ void node_status_exchange_kernel(ncclWindow_t window, Sizes sizes, int64_t seq,
-                                            const int64_t *publish, int64_t *peer_needs,
+                                            const int64_t *needs, const int64_t *requester_offsets,
+                                            int64_t *peer_needs,
                                             int64_t *offset_per_owner_feature) {
   const int local_size = sizes.topo.local_size, num_features = (int)sizes.num_features,
             me = sizes.topo.local_rank, tid = threadIdx.x;
   const NodeWindow node(window, me);
   const CtrlLayout ctrl = node.layout(sizes).ctrl;
-  for (int i = tid; i < kNumNeeds + local_size * num_features; i += blockDim.x) {
-    if (i < kNumNeeds) {
-      ctrl.needs()[i] = publish[i];
-    } else {
-      const int index = i - kNumNeeds;  // requester * num_features + feature
-      ctrl.requester_offsets(index / num_features)[index % num_features] = publish[i];
-    }
-  }
+  for (int i = tid; i < kNumNeeds; i += blockDim.x) ctrl.needs()[i] = needs[i];
+  for (int i = tid; i < local_size * num_features; i += blockDim.x)  // requester * F + feature
+    ctrl.requester_offsets(i / num_features)[i % num_features] = requester_offsets[i];
   __syncthreads();
   const NodeBarrier status{sizes, node, ctrl.in_done(), seq};
   if (tid == 0) {
@@ -298,6 +287,22 @@ __global__ void __launch_bounds__(kThreads)
   }
 }
 
+// 1 warp: its lanes, each taking rail peers in turn, wait until every rail proxy's key stream of
+// the call has landed here: its key signal (the slice it put, which the strong signal covers, or
+// the signal alone). Then the warp flushes this rank's puts on the in channel's context, so the
+// NIC has read its key_stage slices before the next call's proxy steps write key_stage again. It
+// runs just before owner_tables, the first reader of rail_keys, so the key round overlaps the
+// steps after rail_key_push.
+__global__ void rail_done_kernel(ncclDevComm dev, Sizes sizes, int64_t seq) {
+  const int num_nodes = sizes.topo.num_nodes, node = sizes.topo.node;
+  ncclGin gin(dev, kCtxIn);
+  Spin spin(sizes.timeout_ns);
+  for (int peer_node = threadIdx.x; peer_node < num_nodes; peer_node += blockDim.x)
+    while (peer_node != node && (int64_t)gin.readSignal(sig_keys(num_nodes, peer_node)) < seq)
+      spin.pause("key stream", peer_node, seq, sizes.topo.rank);
+  gin.flush(ncclCoopWarp{});
+}
+
 // The launchers.
 
 NodeLayout InChannel::node_exchange(const BucketizedKeys &bucketized, int64_t delay_ns) {
@@ -334,31 +339,38 @@ void InChannel::node_done() const {
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
-at::Tensor InChannel::rail_count_exchange(const at::Tensor &message) const {
-  const int num_nodes = sizes_.topo.num_nodes;
-  const CountMessage format{num_nodes, sizes_.num_features};
-  at::Tensor messages = at::empty({num_nodes, format.length()}, message.options());
-  rail_count_exchange_kernel<<<1, 256, 0, current_stream()>>>(
-      window_, dev_, sizes_, seq_, message.data_ptr<int64_t>(), messages.data_ptr<int64_t>());
+RailLayout InChannel::rail_exchange(const NodeLayout &node, const ProxyPlan &proxy) const {
+  const auto options = node.own_lengths.options();
+  RailLayout rail = empty_rail_layout(sizes_, options);
+  const at::Tensor scratch =
+      at::empty({rail_layout_scratch(sizes_.topo, sizes_.num_features)}, options);
+  const CountParts parts{node.need_remote.data_ptr<int64_t>(),
+                         node.own_total.data_ptr<int64_t>() + sizes_.topo.local_rank,
+                         proxy.key_rows.data_ptr<int64_t>(),
+                         proxy.chunk_length_per_bucket.data_ptr<int64_t>(),
+                         node.own_lengths.data_ptr<int64_t>(),
+                         proxy.node_length_per_bucket_feature.data_ptr<int64_t>()};
+  rail_exchange_kernel<<<kOneCta, kThreads, 0, current_stream()>>>(
+      window_, dev_, sizes_, seq_, parts, scratch.data_ptr<int64_t>(), view_of(rail));
   C10_CUDA_KERNEL_LAUNCH_CHECK();
-  return messages;
+  return rail;
 }
 
-void InChannel::rail_key_exchange(const at::Tensor &put_src, const at::Tensor &put_dst,
-                                  const at::Tensor &put_bytes, const at::Tensor &put_skip) const {
-  rail_key_exchange_kernel<<<1, 64, 0, current_stream()>>>(
-      window_, dev_, sizes_, seq_, put_src.data_ptr<int64_t>(), put_dst.data_ptr<int64_t>(),
-      put_bytes.data_ptr<int64_t>(), put_skip.data_ptr<bool>());
+void InChannel::rail_key_push(const at::Tensor &put_src, const RailLayout &rail) const {
+  rail_key_push_kernel<<<1, 32, 0, current_stream()>>>(
+      window_, dev_, sizes_, put_src.data_ptr<int64_t>(), rail.put_dst.data_ptr<int64_t>(),
+      rail.put_bytes.data_ptr<int64_t>(), rail.put_skip.data_ptr<bool>());
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
-std::pair<at::Tensor, at::Tensor> InChannel::node_status_exchange(const at::Tensor &publish) const {
+std::pair<at::Tensor, at::Tensor> InChannel::node_status_exchange(const RailLayout &rail) const {
   const int local_size = sizes_.topo.local_size;
-  at::Tensor peer_needs = at::empty({local_size, kNumNeeds}, publish.options());
-  at::Tensor offset_per_owner_feature =
-      at::empty({local_size, sizes_.num_features}, publish.options());
+  const auto options = rail.needs.options();
+  at::Tensor peer_needs = at::empty({local_size, kNumNeeds}, options);
+  at::Tensor offset_per_owner_feature = at::empty({local_size, sizes_.num_features}, options);
   node_status_exchange_kernel<<<1, 256, 0, current_stream()>>>(
-      window_, sizes_, seq_, publish.data_ptr<int64_t>(), peer_needs.data_ptr<int64_t>(),
+      window_, sizes_, seq_, rail.needs.data_ptr<int64_t>(),
+      rail.requester_offsets.data_ptr<int64_t>(), peer_needs.data_ptr<int64_t>(),
       offset_per_owner_feature.data_ptr<int64_t>());
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   return {peer_needs, offset_per_owner_feature};
@@ -380,6 +392,11 @@ at::Tensor InChannel::peer_gather(GatherFrom from, const at::Tensor &peer,
     launch(peer_gather_kernel<kGatherRemoteMap>);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   return out;
+}
+
+void InChannel::rail_done() const {
+  rail_done_kernel<<<1, 32, 0, current_stream()>>>(dev_, sizes_, seq_);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
 }  // namespace hier_output_dist

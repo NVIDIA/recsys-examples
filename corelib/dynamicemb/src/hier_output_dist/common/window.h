@@ -35,27 +35,28 @@ namespace hier_output_dist {
 // channels and the device state they keep across calls, and the format of a
 // message that lives there, the count message.
 
-// A count message (int64 words, planner.h), all a rail peer needs to lay
-// out the keys its rail puts: a common part, the same for every peer (its
-// node's largest remote part, the keys of its own node it looks up as owner,
-// and as proxy the most occurrences of one of its node-unique keys, its
-// node-unique keys and its chunks per owner node), then the part for the
-// peer's node alone (its node-unique keys of each feature there).
+// A count message (int64 words, planner.h): what a rank sends each rail peer, the same message to
+// every one (the rail allgathers them), from which every rank of the rail lays out the keys the
+// rail puts (rail.cuh). Its node's largest remote part, the keys of its own node it looks up as
+// owner (its own part), as proxy the most occurrences of one of its node-unique keys and its
+// chunks per owner node; then its own part's keys of each feature, and as proxy its node-unique
+// keys of each (owner node, feature). 3 + num_nodes + (num_nodes + 1) * num_features words.
 struct CountMessage {
   static constexpr int kNeedRemote = 0, kOwnTotal = 1, kKeyRows = 2;
   int64_t num_nodes, num_features;
-  __host__ __device__ int64_t node_length_per_bucket(int64_t owner_node) const {
+  __host__ __device__ int64_t chunk_length_per_bucket(int64_t owner_node) const {
     return 3 + owner_node;
   }
-  __host__ __device__ int64_t chunk_length_per_bucket(int64_t owner_node) const {
-    return 3 + num_nodes + owner_node;
+  __host__ __device__ int64_t own_length_per_feature(int64_t feature) const {
+    return 3 + num_nodes + feature;
   }
-  __host__ __device__ int64_t common() const { return 3 + 2 * num_nodes; }
-  // A message as a peer gets it: the common part, then the part for its node.
-  __host__ __device__ int64_t length() const { return common() + num_features; }
-  // What a rank sends from: the common part, then the part for each node.
-  __host__ __device__ int64_t out_words() const { return common() + num_nodes * num_features; }
-  __host__ __device__ int64_t part(int64_t node) const { return common() + node * num_features; }
+  __host__ __device__ int64_t node_length_per_bucket_feature(int64_t owner_node,
+                                                             int64_t feature) const {
+    return 3 + num_nodes + (owner_node + 1) * num_features + feature;
+  }
+  __host__ __device__ int64_t length() const {
+    return 3 + num_nodes + (num_nodes + 1) * num_features;
+  }
   // A slot a message lands in: whole 16-byte units.
   __host__ __device__ int64_t slot_words() const { return (length() + 1) / 2 * 2; }
 };
@@ -95,7 +96,7 @@ class CtrlLayout {
     in_written_ = take(local_size);
     requester_offsets_ = take(multi ? local_size * num_features_ : 0);
     in_done_ = take(multi ? 1 + kNumNeeds : 0);
-    count_msg_out_ = take(multi ? message_.out_words() : 0);
+    count_msg_out_ = take(multi ? message_.length() : 0);
     count_msgs_ = take(multi ? 2 * num_nodes * message_.slot_words() : 0);
     out_started_ = take(1);
     pushed_ = take(local_size);
@@ -138,13 +139,13 @@ class CtrlLayout {
   __host__ __device__ uint64_t *in_done() const { return word(in_done_); }
   // (num_nodes > 1) [kNumNeeds] its rail's needs, which in_done publishes
   __host__ __device__ int64_t *needs() const { return (int64_t *)word(in_done_ + 1); }
-  // (num_nodes > 1) the count message this rank sends its rail peers
-  // (CountMessage::out_words)
+  // (num_nodes > 1) the count message this rank sends each rail peer
+  // (CountMessage::length)
   __host__ __device__ int64_t *count_msg_out() const { return (int64_t *)word(count_msg_out_); }
   // (num_nodes > 1) the count message of call in_seq from the rail peer on
   // `node` (this rank's own too), by in_seq parity: a peer's message of call
   // seq + 2 needs this rank's of seq + 1, which it sends once call seq ended
-  // here.
+  // here. A parity's slots are consecutive, node after node.
   __host__ __device__ int64_t *count_msg(int64_t in_seq, int64_t node) const {
     return (int64_t *)word(count_msgs_ +
                            ((in_seq & 1) * num_nodes_ + node) * message_.slot_words());
@@ -358,13 +359,6 @@ __host__ __device__ constexpr int gather_words(GatherFrom from) {
 //   rail_keys     (num_nodes > 1) the key records the rail proxies put, one
 //                 slice per source node in node order, each the chunks of
 //                 this rank's node there, then its records in uniq order
-//   source_offsets
-//                 (num_nodes > 1) int64 [num_nodes][num_features]: as owner,
-//                 where each rail proxy's node's keys of each feature start
-//                 in its KJT, what it puts to that proxy
-//   owner_offsets (num_nodes > 1) int64 [num_nodes][num_features]: as proxy,
-//                 where its node's keys of each feature start in each rail
-//                 owner's KJT, as the owners put them
 // Each accessor returns its buffer in the copy at `base`.
 class KeysLayout {
  public:
@@ -372,7 +366,6 @@ class KeysLayout {
       : base_(base),
         num_nodes_(sizes.topo.num_nodes),
         local_size_(sizes.topo.local_size),
-        num_features_(sizes.num_features),
         offset_words_((int64_t)sizes.topo.world_size * sizes.num_features + 1),
         lookup_keys_(sizes.lookup_keys),
         remote_keys_(sizes.remote_keys),
@@ -397,8 +390,6 @@ class KeysLayout {
     rail_keys_bytes_ =
         multi ? lookup_keys_ * sizes.record_bytes + sizes.owner_chunks() * sizeof(ChunkPiece) : 0;
     rail_keys_ = take(rail_keys_bytes_);
-    source_offsets_ = take(multi ? 8 * (uint64_t)(num_nodes_ * num_features_) : 0);
-    owner_offsets_ = take(multi ? 8 * (uint64_t)(num_nodes_ * num_features_) : 0);
     bytes_ = next;
   }
   __host__ __device__ uint64_t bytes() const { return bytes_; }
@@ -411,9 +402,7 @@ class KeysLayout {
             {"remote_map", proxy_header_ - remote_map_},
             {"proxy_header", key_stage_ - proxy_header_},
             {"key_stage", rail_keys_ - key_stage_},
-            {"rail_keys", source_offsets_ - rail_keys_},
-            {"source_offsets", owner_offsets_ - source_offsets_},
-            {"owner_offsets", bytes_ - owner_offsets_}};
+            {"rail_keys", bytes_ - rail_keys_}};
   }
 
   // The words of a row of node_offsets, and requester `requester`'s row.
@@ -442,20 +431,12 @@ class KeysLayout {
   __host__ __device__ uint64_t key_stage_bytes() const { return key_stage_bytes_; }
   __host__ __device__ char *rail_keys() const { return base_ + rail_keys_; }
   __host__ __device__ uint64_t rail_keys_bytes() const { return rail_keys_bytes_; }
-  // [num_features] of a node
-  __host__ __device__ int64_t *source_offsets(int64_t node) const {
-    return (int64_t *)(base_ + source_offsets_) + node * num_features_;
-  }
-  __host__ __device__ int64_t *owner_offsets(int64_t node) const {
-    return (int64_t *)(base_ + owner_offsets_) + node * num_features_;
-  }
 
  private:
   char *base_;
-  int64_t num_nodes_, local_size_, num_features_, offset_words_, lookup_keys_, remote_keys_,
-      max_chunks_;
+  int64_t num_nodes_, local_size_, offset_words_, lookup_keys_, remote_keys_, max_chunks_;
   uint64_t node_offsets_, node_keys_, node_key_weights_, node_bucket_feature_of_row_, remote_map_,
-      proxy_header_, key_stage_, rail_keys_, source_offsets_, owner_offsets_, bytes_;
+      proxy_header_, key_stage_, rail_keys_, bytes_;
   uint64_t key_stage_bytes_, rail_keys_bytes_;
 };
 

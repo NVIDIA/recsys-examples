@@ -337,12 +337,15 @@ ProxyPlan proxy_push_order(ProxyKeys keys, ProxyChunks chunks, const at::Tensor 
                            const ProxyBuffers &buffers, const Sizes &sizes);
 
 // The rail's part of a call across nodes (the in channel). A rank's rail is the
-// ranks with its local rank, one on each node. Each rank sends each rail peer a
-// count message; from the messages it gets, a rank computes as proxy where its
-// key records land at each owner, and as owner its KJT and where each proxy's
-// keys of each feature start in it, which it sends back to that proxy. Then the
-// needs and requester offsets a rank publishes to its node, and the owner's
-// tables: its KJT's keys and what its forward put list sends (planner.cu).
+// ranks with its local rank, one on each node. Each rank sends every rail peer
+// the same count message (the rail allgathers them); from the rail's messages
+// every rank computes the rail's layout (rail_layout_of, rail.cuh): as proxy
+// where its key records land at each owner and where its keys of each feature
+// start in each owner's KJT, as owner its KJT and where each proxy's keys of
+// each feature start in it (the same function as the proxies'), and the rail's
+// needs, which with its requester offsets a rank publishes to its node. Then the
+// owner's tables: its KJT's keys and what its forward put list sends
+// (planner.cu).
 //
 // An owner's KJT has num_sources = local_size + num_nodes - 1 lengths per
 // feature (its stride), feature-major: its node's requesters, then the other
@@ -356,30 +359,34 @@ ProxyPlan proxy_push_order(ProxyKeys keys, ProxyChunks chunks, const at::Tensor 
 // the op.
 at::Tensor other_nodes_of(const Topo &topo, const at::TensorOptions &options);
 
-// The count messages this rank sends its rail (int64 [CountMessage::out_words],
-// window.h): the common part, its node's largest remote part (need_remote), the
-// keys of its own node it looks up as owner (own_total, its own part), and as
-// proxy the most occurrences of one of its keys (key_rows), its node-unique
-// keys and its chunks per owner node (node_length_per_bucket, chunk_length_per_bucket); then for
-// each node its node-unique keys of each feature there (node_length_per_bucket_feature, [owner
-// node][feature]).
+// The count message this rank sends each rail peer (int64 [CountMessage::length], window.h), as
+// rail_exchange makes it (count_message_of, rail.cuh): its node's largest remote part
+// (need_remote), the keys of its own node it looks up as owner (own_total, its own part), as proxy
+// the most occurrences of one of its keys (key_rows) and its chunks per owner node
+// (chunk_length_per_bucket); then its own part's keys of each feature (own_lengths [feature]
+// [requester], summed over its node's requesters), and as proxy its node-unique keys of each
+// (owner node, feature) (node_length_per_bucket_feature). The hooks'.
 at::Tensor count_message(const at::Tensor &need_remote, const at::Tensor &own_total,
-                         const at::Tensor &key_rows, const at::Tensor &node_length_per_bucket,
-                         const at::Tensor &chunk_length_per_bucket,
+                         const at::Tensor &key_rows, const at::Tensor &chunk_length_per_bucket,
+                         const at::Tensor &own_lengths,
                          const at::Tensor &node_length_per_bucket_feature);
 
-// The rail's layout, from the messages this rank got (int64 [num_nodes]
-// [CountMessage::length], its own too) and its own part's lengths (the node
-// layout's own_lengths). Each slice a proxy puts holds the owner node's chunks
-// (ChunkPiece, 16 bytes each), then its records (record_bytes each).
+// The rail's layout, from the rail's count messages (int64 [num_nodes]
+// [CountMessage::length], row n the rail peer's on node n, this rank's own too)
+// and its own part's lengths (the node layout's own_lengths). Each slice a proxy
+// puts holds the owner node's chunks (ChunkPiece, 16 bytes each), then its
+// records (record_bytes each).
 struct RailLayout {
   // as proxy, to each owner of the rail (its slice in key_stage is the proxy's
   // stage_offset_per_bucket)
-  at::Tensor put_dst;    // int64 [num_nodes]: where its slice lands in the owner's rail_keys
-                         // (bytes)
-  at::Tensor put_bytes;  // int64 [num_nodes]
-  at::Tensor put_skip;   // bool [num_nodes]: no put of keys (the owner overflows
-                         // lookup_keys, or it is on this node)
+  at::Tensor put_dst;        // int64 [num_nodes]: where its slice lands in the owner's rail_keys
+                             // (bytes)
+  at::Tensor put_bytes;      // int64 [num_nodes]
+  at::Tensor put_skip;       // bool [num_nodes]: no put of keys (the owner overflows
+                             // lookup_keys, or it is on this node)
+  at::Tensor owner_offsets;  // int64 [num_nodes][num_features]: where its node's keys of each
+                             // feature start in each owner's KJT, that owner's source_offsets row
+                             // for this node (its own node: 0)
   // as owner
   at::Tensor kjt_lengths;             // int64 [num_features * num_sources]: per (feature, source)
   at::Tensor kjt_offsets;             // int64 [num_features * num_sources + 1]
@@ -391,19 +398,18 @@ struct RailLayout {
   at::Tensor node_length_per_source_feature;  // int64 [num_nodes][num_features]: of each source
                                               // node, per feature (its own node: 0)
   at::Tensor source_offsets;     // int64 [num_nodes][num_features]: where the keys of each
-                                 // source node start in its KJT, what it sends the node's proxy
-                                 // (its own node: 0)
+                                 // source node start in its KJT, what that node's proxy computes as
+                                 // its owner_offsets row for this node (its own node: 0)
   at::Tensor requester_offsets;  // int64 [local_size][num_features]: where each requester of
                                  // its node's (feature, requester) keys start in its KJT
   at::Tensor needs;              // int64 [kNumNeeds]: the most the rail needs of each
                                  // capacity (Need)
 };
+// The layout as rail_exchange makes it (rail_layout_of, rail.cuh). The hooks'.
 RailLayout rail_layout(const at::Tensor &messages, const at::Tensor &own_lengths,
-                       const at::Tensor &other_nodes, const Sizes &sizes);
-
-// What this rank publishes to its node (int64 [kNumNeeds + local_size *
-// num_features]): its rail's needs, then requester_offsets.
-at::Tensor status_publish(const RailLayout &rail);
+                       const Sizes &sizes);
+// The tensors of a RailLayout, empty.
+RailLayout empty_rail_layout(const Sizes &sizes, const at::TensorOptions &options);
 
 // The owner's tables, once the rail's proxies put their records into its
 // rail_keys (int64 view) and its node's requesters their keys into the own
@@ -496,11 +502,11 @@ struct PutLists {
 // The backward list from the proxy's chunks (chunks, chunk_offset_per_bucket,
 // chunk_inv: ProxyChunks'), its node-unique keys per (owner node, feature)
 // and where its keys of each feature start in each rail owner's KJT
-// (owner_offsets, int64 [num_nodes][num_features], as the owners put them). The
-// forward list from the chunks of this owner's node in each source node's
-// stream (fwd_chunks, fwd_chunk_start: OwnerTables'), its keys per feature
-// (node_length_per_source_feature) and where those keys start in the owner's KJT
-// (source_offsets).
+// (owner_offsets, int64 [num_nodes][num_features]: the rail layout's, the
+// owners' source_offsets). The forward list from the chunks of this owner's
+// node in each source node's stream (fwd_chunks, fwd_chunk_start:
+// OwnerTables'), its keys per feature (node_length_per_source_feature) and
+// where those keys start in the owner's KJT (source_offsets).
 PutLists put_lists(const at::Tensor &chunks, const at::Tensor &chunk_offset_per_bucket,
                    const at::Tensor &chunk_inv, const at::Tensor &node_offset_per_bucket,
                    const at::Tensor &node_length_per_bucket_feature,

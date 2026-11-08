@@ -28,11 +28,11 @@ occurrences at its proxy), whose keys and weights are in the order of its KJT
 (``hier_output_dist_node_layout``), and between the steps what the comm
 kernels do: the node's offsets (each requester's offset_per_bucket_feature),
 the pushes into node_keys (``hier_output_dist_node_push``), the count
-messages of each rail, the key records each proxy puts into its owners'
-rail_keys and the source_offsets each owner puts into its proxies'
-owner_offsets, the needs and requester_offsets each node exchanges (the
-requester binding gathers the proxies' words itself). The windows hold
-garbage before the call. The checks:
+messages of each rail (each rank's one message to every rail peer: every rank
+of a rail lays the rail out from the same messages), the key records each
+proxy puts into its owners' rail_keys, the needs and requester_offsets each
+node exchanges (the requester binding gathers the proxies' words itself). The
+windows hold garbage before the call. The checks:
 
 * each proxy against a plain reference of the planner's rules: its
   node-unique keys (identities (table, key), each in the bucket feature
@@ -51,11 +51,13 @@ garbage before the call. The checks:
   (each counting its rows in its chunk's pushed_rows, which must reach the
   chunk's rows once every row is in) and the proxies' reducers, each key's
   rows its key row and then its duplicates' slots;
-* the rail: each proxy's slices start where its owners' offsets say, and
-  each owner sends each proxy its KJT's offsets of that node's features
-  (source_offsets); each owner's KJT and the chunks it got; each rank's put
-  lists (as proxy and as owner) against a plain loop over the chunks and
-  features; the needs, the same on every rank.
+* the rail: each proxy's slices start where its owners' offsets say; each
+  owner's KJT offsets of each other node's features (source_offsets), and
+  each proxy's of its node's features at each owner (owner_offsets) equal to
+  those owners' source_offsets; each owner's KJT and the chunks it got; each
+  rank's put lists (as proxy and as owner) against a plain loop over the
+  chunks and features, at the offsets its owners computed; the needs, the
+  same on every rank.
 
 Calls that do not fit, and calls whose keys are not index-deduplicated (a
 key past local_size occurrences: the need key_rows), check the needs alone
@@ -638,7 +640,7 @@ def make_windows(
     node_bucket_feature_of_row are one tensor each for the node (row r: rank
     r's), as the push takes its targets'. Returns those, and each rank's
     window: its row of each, and its other buffers."""
-    num_nodes, local_size = case.num_nodes, case.local_size
+    local_size = case.local_size
     chunks = max_chunks(case, remote_keys)
     entries = local_size * (lookup_keys + remote_keys)
     buffers = dict(
@@ -674,9 +676,6 @@ def make_windows(
                 // 8,
                 torch.int64,
                 generator,
-            ),
-            owner_offsets=garbage(
-                num_nodes * case.num_features, torch.int64, generator
             ),
         )
         windows.append(window)
@@ -1004,7 +1003,6 @@ def run_call(
     )
     world_size = case.world_size
     tables = torch.tensor(case.tables, dtype=torch.int32, device="cuda")
-    common = 3 + 2 * num_nodes  # a count message's common part (CountMessage::common)
 
     def sizes(rank: int) -> Dict[str, int]:
         return dict(
@@ -1088,6 +1086,7 @@ def run_call(
                 tables,
                 layout["need_remote"],
                 layout["own_total"][rank % local_size : rank % local_size + 1],
+                layout["own_lengths"],
                 window["remote_map"],
                 window["key_stage"],
                 window["proxy_header"],
@@ -1096,18 +1095,16 @@ def run_call(
             )
         )
 
-    # rail_count_exchange: each rank gets from the rail peer on each node its
-    # common part and its part for this rank's node
+    # rail_exchange: each rank sends every rail peer the same count message,
+    # so every rank of a rail gets the rail's messages, node after node
     def messages_of(rank: int) -> torch.Tensor:
-        node, rail_rank = divmod(rank, local_size)
-        rows = []
-        for source in range(num_nodes):
-            message = proxies[source * local_size + rail_rank]["message"]
-            first = common + node * num_features
-            rows.append(
-                torch.cat([message[:common], message[first : first + num_features]])
-            )
-        return torch.stack(rows)
+        rail_rank = rank % local_size
+        return torch.stack(
+            [
+                proxies[source * local_size + rail_rank]["message"]
+                for source in range(num_nodes)
+            ]
+        )
 
     def rail_tables(rank: int, **later) -> Dict:
         return planner(
@@ -1125,8 +1122,7 @@ def run_call(
         )
 
     rails = [rail_tables(rank) for rank in range(world_size)]
-    # rail_key_exchange: each proxy's slice for each owner of its rail, and
-    # each owner's source_offsets for each proxy of its rail
+    # rail_key_push: each proxy's slice for each owner of its rail
     problems = []
     for rank, rail in enumerate(rails):
         node, rail_rank = divmod(rank, local_size)
@@ -1138,23 +1134,19 @@ def run_call(
                 rail["put_bytes"].tolist(),
             )
         ):
-            if owner_node == node:
+            if owner_node == node or skip:
                 continue
             owner = owner_node * local_size + rail_rank
-            windows[rank]["owner_offsets"].view(num_nodes, num_features)[
-                owner_node
-            ] = rails[owner]["source_offsets"][node]
-            if skip:
-                continue
             rail_keys = windows[owner]["rail_keys"]
             if dst + size > 8 * rail_keys.numel():
                 problems.append("a put past rail_keys")
                 continue
             source = windows[rank]["key_stage"][put_src[owner_node] // 8 :]
             rail_keys[dst // 8 : (dst + size) // 8] = source[: size // 8]
-    # node_status_exchange, then the owners' tables, the proxies' put lists
-    # and the requesters' tables
-    publish = torch.stack([rail["publish"] for rail in rails]).view(
+    # node_status_exchange: each rank's needs and requester_offsets to its
+    # node; then the owners' tables, the proxies' put lists and the
+    # requesters' tables
+    needs = torch.stack([rail["needs"] for rail in rails]).view(
         num_nodes, local_size, -1
     )
     owners, requesters = [], []
@@ -1163,7 +1155,6 @@ def run_call(
         owners.append(
             rail_tables(
                 rank,
-                owner_offsets=window["owner_offsets"],
                 rail_keys=window["rail_keys"],
                 node_keys=window["node_keys"][:lookup_keys],
                 node_key_weights=window["node_key_weights"][:lookup_keys]
@@ -1171,8 +1162,12 @@ def run_call(
                 else None,
             )
         )
-        requester_offsets = publish[node, :, 3:].view(
-            local_size, local_size, num_features
+        # [owner][requester][feature]: each owner's of the node
+        requester_offsets = torch.stack(
+            [
+                rails[node * local_size + owner]["requester_offsets"]
+                for owner in range(local_size)
+            ]
         )
         node_ranks = range(node * local_size, (node + 1) * local_size)
         requesters.append(
@@ -1196,7 +1191,7 @@ def run_call(
         rails=rails,
         owners=owners,
         requesters=requesters,
-        publish=publish,
+        needs=needs,
         problems=problems,
     )
 
@@ -1547,8 +1542,9 @@ def check_rail(
 ):
     """What a rank as proxy computed of its rail's owners against what they
     computed: where its slice starts there and its puts; the KJT offsets of
-    its node's features each owner sends it (source_offsets); and its own
-    requester_offsets as owner."""
+    its node's features at each owner (its owner_offsets, the owner's
+    source_offsets: the owner's KJT offsets); and its own requester_offsets
+    as owner."""
     num_nodes, local_size, num_features = (
         case.num_nodes,
         case.local_size,
@@ -1565,14 +1561,21 @@ def check_rail(
         if mine["put_skip"][owner_node] != skip:
             problems.append("put_skip")
         if owner_node == node:
+            if mine["owner_offsets"][node] != [0] * num_features:
+                problems.append("owner_offsets of its own node")
             continue
         column = node if node < owner_node else node - 1
         offsets, slice_in = owner["kjt_offsets"].tolist(), owner["slice_in"].tolist()
-        if owner["source_offsets"].tolist()[node] != [
+        kjt_offsets = [
             offsets[feature * num_sources + local_size + column]
             for feature in range(num_features)
-        ]:
+        ]
+        if owner["source_offsets"].tolist()[node] != kjt_offsets:
             problems.append("source_offsets != the owner's KJT offsets")
+        if mine["owner_offsets"][owner_node] != kjt_offsets:
+            problems.append("owner_offsets != the owner's KJT offsets")
+        if mine["owner_offsets"][owner_node] != owner["source_offsets"].tolist()[node]:
+            problems.append("owner_offsets != the owner's source_offsets")
         if mine["put_dst"][owner_node] != slice_in[node][0]:
             problems.append("put_dst != the owner's slice_in")
         uniq = (
@@ -1661,7 +1664,9 @@ def check_owner(case: Case, rank: int, ranks: List[Dict], refs: Dict, out: Dict)
 
 def check_put_lists(case: Case, rank: int, refs: Dict, out: Dict, owner_offsets):
     """A rank's put lists, as proxy the backward's and as owner the
-    forward's, and the chunks it got as owner, against a plain loop."""
+    forward's, and the chunks it got as owner, against a plain loop.
+    owner_offsets: where its node's keys of each feature start in each rail
+    owner's KJT, as the owners computed them."""
     num_nodes, local_size, num_features = (
         case.num_nodes,
         case.local_size,
@@ -1686,7 +1691,7 @@ def check_put_lists(case: Case, rank: int, refs: Dict, out: Dict, owner_offsets)
         return out_chunks
 
     # the backward's owner nodes: this proxy's chunks and its keys of each
-    # feature, at the rows its owners sent (owner_offsets); then the forward's
+    # feature, at the rows its owners computed (owner_offsets); then the forward's
     # proxy nodes: each source node's chunks for this owner, numbered in the
     # order it got them, at its features' rows in this owner's KJT
     chunks = [
@@ -1796,7 +1801,7 @@ def run_case(case: Case, seed: int) -> Tuple[Dict[str, List[str]], str]:
     laps = max(-(-ref["stream_end"] // case.num_proxy_rows) for ref in refs.values())
     call = run_call(case, ranks, lookup_keys, remote_keys, generator)
     # each node's agreed needs: the most of what its ranks publish
-    agreed = call["publish"][:, :, :3].amax(1).tolist()
+    agreed = call["needs"].amax(1).tolist()
     checks = {"puts": call["problems"]}
     stats = (
         f"chunks {max(ref['num_chunks'] for ref in refs.values())}, laps {laps}, "
@@ -1872,6 +1877,8 @@ def run_case(case: Case, seed: int) -> Tuple[Dict[str, List[str]], str]:
         ),
         [],
     )
+    # the put lists against the offsets the owners computed (each owner's
+    # source_offsets row for the proxy's node; its own node's: 0)
     checks["put lists"] = sum(
         (
             check_put_lists(
@@ -1879,9 +1886,12 @@ def run_case(case: Case, seed: int) -> Tuple[Dict[str, List[str]], str]:
                 rank,
                 refs,
                 owners[rank],
-                call["windows"][rank]["owner_offsets"]
-                .view(num_nodes, num_features)
-                .tolist(),
+                [
+                    rails[owner_node * local_size + rank % local_size][
+                        "source_offsets"
+                    ][rank // local_size].tolist()
+                    for owner_node in range(num_nodes)
+                ],
             )
             for rank in range(world_size)
         ),

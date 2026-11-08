@@ -85,20 +85,16 @@ class InChannel {
   // Tells the node this rank's keys are pushed, and waits until every
   // requester of the node told it.
   void node_done() const;
-  // Sends each rail peer its count message (message: CountMessage::out_words,
-  // the common part and the part for each node); returns the messages this
-  // rank got, int64 [num_nodes][CountMessage::length].
-  at::Tensor rail_count_exchange(const at::Tensor &message) const;
-  // Puts this proxy's key_stage slices into its rail owners' rail_keys (each
-  // [num_nodes], int64 but put_skip) and its source_offsets rows into its rail
-  // proxies' owner_offsets, and waits for the other nodes' key streams.
-  void rail_key_exchange(const at::Tensor &put_src, const at::Tensor &put_dst,
-                         const at::Tensor &put_bytes, const at::Tensor &put_skip) const;
-  // Publishes this rank's needs and requester offsets to its node (publish,
-  // int64 [kNumNeeds + local_size * num_features]); returns every node peer's
-  // needs (int64 [local_size][kNumNeeds]) and where each one's KJT holds this
+  // Sends every rail peer this rank's count message (CountMessage, from its node layout `node`
+  // and its proxy plan), gets theirs, and returns the rail's layout from the rail's messages.
+  RailLayout rail_exchange(const NodeLayout &node, const ProxyPlan &proxy) const;
+  // Puts this proxy's key_stage slices (put_src: where each starts there, int64 [num_nodes]) into
+  // its rail owners' rail_keys, where `rail` says (put_dst, put_bytes, put_skip). It does not wait.
+  void rail_key_push(const at::Tensor &put_src, const RailLayout &rail) const;
+  // Publishes this rank's needs and requester offsets (the rail layout's) to its node; returns
+  // every node peer's needs (int64 [local_size][kNumNeeds]) and where each one's KJT holds this
   // requester's keys of each feature (int64 [local_size][num_features]).
-  std::pair<at::Tensor, at::Tensor> node_status_exchange(const at::Tensor &publish) const;
+  std::pair<at::Tensor, at::Tensor> node_status_exchange(const RailLayout &rail) const;
   // Words of the node peers' `from` (GatherFrom), int32 [words][items]: item
   // i reads node peer peer[i]'s word first_word[i] of its proxy header (1
   // word), or entry first_word[i] of each array of its remote_map
@@ -106,6 +102,10 @@ class InChannel {
   // peer keeps what the allocation held.
   at::Tensor peer_gather(GatherFrom from, const at::Tensor &peer,
                          const at::Tensor &first_word) const;
+  // Waits until every rail proxy's key records of the call are in this rank's rail_keys, and
+  // flushes this rank's puts on the rail (the NIC read its key_stage). Just before the owner's
+  // tables, the first reader of rail_keys.
+  void rail_done() const;
 
   ncclWindow_t window_;
   ncclDevComm dev_;
@@ -117,12 +117,11 @@ class InChannel {
   // This rank's buffers the steps read and write, views of its copy of the
   // window without an allocator (the window outlives them): the own part of
   // node_keys (and node_key_weights), and across nodes its remote part,
-  // node_bucket_feature_of_row, the buffers the proxy writes, rail_keys,
-  // source_offsets and owner_offsets.
+  // node_bucket_feature_of_row, the buffers the proxy writes and rail_keys.
   at::Tensor own_node_keys_, own_node_key_weights_;
   at::Tensor remote_node_keys_, remote_node_key_weights_, node_bucket_feature_of_row_;
   ProxyBuffers proxy_buffers_;
-  at::Tensor rail_keys_, source_offsets_, owner_offsets_;
+  at::Tensor rail_keys_;
   // Constants of the op across nodes: the table of each feature (numbered
   // densely), the other nodes, and the words of the proxy headers this
   // requester reads.

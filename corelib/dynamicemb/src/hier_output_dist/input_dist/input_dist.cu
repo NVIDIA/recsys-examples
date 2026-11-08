@@ -98,7 +98,6 @@ InChannel::InChannel(const Config &config, const Sizes &sizes, ncclWindow_t wind
     own_node_key_weights_ = node_key_weights.narrow(0, 0, keys.remote_start());
   }
   if (!sizes_.multi_node()) return;
-  const int64_t num_nodes = sizes_.topo.num_nodes, num_features = sizes_.num_features;
   remote_node_keys_ = node_keys.narrow(0, keys.remote_start(), remote_keys);
   if (config.weights)
     remote_node_key_weights_ = node_key_weights.narrow(0, keys.remote_start(), remote_keys);
@@ -108,8 +107,6 @@ InChannel::InChannel(const Config &config, const Sizes &sizes, ncclWindow_t wind
                     view(keys.key_stage(), {(int64_t)keys.key_stage_bytes() / 8}, at::kLong),
                     keys.proxy_header(), options);
   rail_keys_ = view(keys.rail_keys(), {(int64_t)keys.rail_keys_bytes() / 8}, at::kLong);
-  source_offsets_ = view(keys.source_offsets(0), {num_nodes, num_features}, at::kLong);
-  owner_offsets_ = view(keys.owner_offsets(0), {num_nodes, num_features}, at::kLong);
   tables_ = at::tensor(dense_tables(config.feature_tables), at::kInt).to(options);
   other_nodes_ = other_nodes_of(sizes_.topo, options);
   header_gather_ = header_gather(sizes_, options);
@@ -180,22 +177,16 @@ InDist InChannel::input_dist(const PlanInput &input) {
     ProxyChunks chunks = proxy_chunks_and_slots(keys, node.requester_start, proxy_buffers_, sizes_);
     const ProxyPlan proxy = proxy_push_order(std::move(keys), std::move(chunks),
                                              node.requester_start, proxy_buffers_, sizes_);
-    // The rail: the count messages, the layout of the rail, then the
-    // proxies' key records into the owners' rail_keys and the owners'
-    // source_offsets into the proxies' owner_offsets.
-    const at::Tensor message =
-        count_message(node.need_remote, node.own_total.select(0, topo.local_rank), proxy.key_rows,
-                      proxy.node_length_per_bucket, proxy.chunk_length_per_bucket,
-                      proxy.node_length_per_bucket_feature);
-    const at::Tensor messages = rail_count_exchange(message);
-    const RailLayout rail = rail_layout(messages, node.own_lengths, other_nodes_, sizes_);
-    source_offsets_.copy_(rail.source_offsets);
-    rail_key_exchange(proxy.stage_offset_per_bucket, rail.put_dst, rail.put_bytes, rail.put_skip);
+    // The rail: every rank's count message to its rail, and the rail's layout
+    // from them; then the proxy's key records into its owners' rail_keys,
+    // which rail_done waits for just before the owner's tables.
+    const RailLayout rail = rail_exchange(node, proxy);
+    rail_key_push(proxy.stage_offset_per_bucket, rail);
     // The node again: the call's needs, where the node's owners hold this
     // requester's keys of each feature, and what the node's proxies published
     // for it.
     at::Tensor offset_per_owner_feature;
-    std::tie(peer_needs, offset_per_owner_feature) = node_status_exchange(status_publish(rail));
+    std::tie(peer_needs, offset_per_owner_feature) = node_status_exchange(rail);
     const at::Tensor headers =
         peer_gather(kGatherProxyHeader, header_gather_.peer, header_gather_.first_word)
             .view({local_size, ProxyHeader::of(sizes_).gathered_words()});
@@ -206,11 +197,14 @@ InDist InChannel::input_dist(const PlanInput &input) {
         words, headers, offset_per_owner_feature, bucketized.bucket_feature_of_row,
         bucketized.offset_per_bucket_feature, bucketized.offset_per_bucket, sizes_);
     words = at::Tensor();  // requester_tables is its one reader: free it before the owner tables
+    // Every rail proxy's key records are in rail_keys, and the NIC read this
+    // proxy's (comm_kernels.cu says why nothing before reads or writes them).
+    rail_done();
     const OwnerTables owner = owner_tables(rail, node.own_offsets, own_node_keys_,
                                            own_node_key_weights_, rail_keys_, other_nodes_, sizes_);
     const PutLists lists = put_lists(
         proxy.chunks, proxy.chunk_offset_per_bucket, proxy.chunk_inv, proxy.node_offset_per_bucket,
-        proxy.node_length_per_bucket_feature, owner_offsets_, owner.fwd_chunks,
+        proxy.node_length_per_bucket_feature, rail.owner_offsets, owner.fwd_chunks,
         owner.fwd_chunk_start, rail.node_length_per_source_feature, rail.source_offsets, sizes_);
     // The plans: the requester's maps and its tables of the node's proxies,
     // the owner's and the proxy's tables, the proxy's rows before each key

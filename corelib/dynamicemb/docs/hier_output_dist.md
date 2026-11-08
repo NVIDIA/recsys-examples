@@ -56,7 +56,7 @@ operator per sharding, `HierOutputDist`, does the work (section 7):
   them, as TorchRec's training loop and train pipelines do (section 16).
 * **The input dist does all the planning, with one host sync.** Keys move
   over NVLink inside a node and over InfiniBand between nodes, sent by the
-  GPU itself (NCCL GIN). Seven custom kernels move them and wait for peers
+  GPU itself (NCCL GIN). Eight custom kernels move them and wait for peers
   (the *comm kernels*); the steps between them are kernels of its own and
   CUB's sorts and scans (the *planner*). `input_dist()` queues all of it at
   once. At the end every owner has a ready KeyedJaggedTensor (KJT) of the
@@ -82,9 +82,11 @@ operator per sharding, `HierOutputDist`, does the work (section 7):
   rail peers in turn.
 * **Memory that grows little with the number of GPUs.** Apart from
   `node_offsets` (a row of `world_size × num_features + 1` offsets per GPU
-  of the node: 1 MB at 32 nodes, 8 GPUs per node and 64 features) and small
-  tables that grow linearly with the nodes and with the features (section
-  15.4), no buffer is sized by the number of GPUs. The proxy's buffer for
+  of the node: 1 MB at 32 nodes, 8 GPUs per node and 64 features), the
+  rail's count messages (about `16 × num_nodes² × num_features` bytes:
+  1.0 MB at 32 nodes and 64 features) and small tables that grow linearly
+  with the nodes and with the features (section 15.4), no buffer is sized
+  by the number of GPUs. The proxy's buffer for
   rows (`proxy_rows`) is a ring with a fixed cap: a call's rows stream
   through it, chunk after chunk, and a chunk's rows are taken again once
   every reader is done with them. By default a chunk takes at most 2 MiB
@@ -124,9 +126,10 @@ this dist with TorchRec's dists.
   returns plain data, which the next step takes. **Plans**: what the input
   dist of a call gives the output dist, the forward's (`FwdPlan`) and the
   backward's (`BwdPlan`): the requester's maps and the call's tables.
-* **Comm kernel**: one of the input dist's seven custom kernels, each of
+* **Comm kernel**: one of the input dist's eight custom kernels, each of
   which moves data between GPUs or waits for peers (section 10.2). The
-  first, `node_exchange`, also lays out the node's keys (section 10.3).
+  first, `node_exchange`, also lays out the node's keys (section 10.3), and
+  `rail_exchange` the rail's (section 10.4).
   **Planner**: the input dist's other steps, which lay a call out: kernels
   of its own, and the radix sorts and scans of CUB (NVIDIA's library of GPU
   algorithms), called from C++ (section 10).
@@ -641,8 +644,8 @@ in it, by name (`ctrl` for the ctrl section; sections 7.5 and 15.2).
 Python reads the options and the environment when the sharding is built,
 and hands them over when it builds the op. The benchmark reads a call's
 tables from its plans (`HierCall`, `shard/hier_output_dist.py`). The tests
-run the planner's steps, and the node layout and the push of the comm
-kernels, on plain tensors through functions of `testing.cu`. It also has a
+run the planner's steps, and the node layout, the push and the rail layout
+of the comm kernels, on plain tensors through functions of `testing.cu`. It also has a
 hook that makes the next construction fail, a hook that makes a rank read
 its node's offsets and keys late (section 18), and the GPU clock by which
 the benchmark aligns its timelines.
@@ -731,13 +734,12 @@ the planner's kernels, with CUB's sorts and scans.
 | owner's KJT (one node) | kernel | a copy of the own part of `node_keys` | 10.3 |
 | node dedup | kernels, CUB | the proxy's node-unique keys, rows, the chunks of its stream and their slots | 9, 10.4 |
 | push order | kernels, CUB | its requesters' push orders and push tables | 10.4 |
-| count message | kernel | what this rank's rail peers must know of it | 10.4 |
-| `rail_count_exchange` | comm | its count message to each rail peer, and theirs | 10.2 |
-| rail layout | kernel | where each proxy's key records land, this owner's KJT layout, and where each proxy node's keys of each feature start in it (`source_offsets`) | 10.4 |
-| `rail_key_exchange` | comm | its key records to its rail owners and its `source_offsets` to its rail proxies, and theirs | 10.2 |
+| `rail_exchange` | comm | its count message to every rail peer, and theirs; then the rail layout from the rail's messages: where each proxy's key records land, this owner's KJT layout, where each other node's keys of each feature start in it (`source_offsets`) and where its node's start in each rail owner's KJT (`owner_offsets`); the rail's needs | 10.2, 10.4 |
+| `rail_key_push` | comm | its key records to its rail owners; it does not wait | 10.2 |
 | `node_status_exchange` | comm | the needs and `requester_offsets` of the node; the call's needs | 10.2 |
 | `peer_gather`, twice | comm (and a kernel) | the node's proxy headers, then the requester's gather list and its rows' `remote_map` words | 10.2, 10.4 |
 | requester tables | kernels, CUB | its maps, push order, push tables and task starts | 10.4 |
+| `rail_done` | comm | waits until every rail proxy's key records are in; flushes this rank's key puts | 10.2, 13 |
 | owner tables | kernels | its KJT's keys, and the chunks its forward put list sends | 10.4 |
 | put lists | kernels, CUB | the owner's forward and the proxy's backward put lists | 10.4 |
 | status | kernel | the call's status, which the second wait copies to the host | 10.5 |
@@ -846,8 +848,8 @@ first, so the places of their buffers take the least to compute):
 | section | size | buffers |
 |---|---|---|
 | rows | `lookup_keys` rows; across nodes also `proxy_rows` | `lookup_rows` (the lookup output, then its gradient). Across nodes also `proxy_rows`. |
-| ctrl | its control words (section 15.2: 89 KB at 32 nodes, 8 GPUs per node and 64 features), most of them the count messages | one buffer, `ctrl`: the control words of both channels (sequence numbers, running totals, the credits sent, the count messages, each GIN warp's place with each rail peer) |
-| keys | from `lookup_keys`, across nodes `remote_keys`, and from `local_size × world_size × num_features` (`node_offsets`) | `node_offsets`, `node_keys` and, with weights, `node_key_weights`. Across nodes also `node_bucket_feature_of_row`, `remote_map`, `proxy_header`, `key_stage`, `rail_keys`, `source_offsets` and `owner_offsets`. |
+| ctrl | its control words (section 15.2: 1.1 MB at 32 nodes, 8 GPUs per node and 64 features), most of them the count messages | one buffer, `ctrl`: the control words of both channels (sequence numbers, running totals, the credits sent, the count messages, each GIN warp's place with each rail peer) |
+| keys | from `lookup_keys`, across nodes `remote_keys`, and from `local_size × world_size × num_features` (`node_offsets`) | `node_offsets`, `node_keys` and, with weights, `node_key_weights`. Across nodes also `node_bucket_feature_of_row`, `remote_map`, `proxy_header`, `key_stage` and `rail_keys`. |
 
 `node_offsets` holds a row per GPU of the node, of `world_size ×
 num_features + 1` int64 words: row `r` is the bucketize's
@@ -870,11 +872,7 @@ nodes has:
 * `key_stage`: per other owner node the slice one key put sends: that
   node's chunks (`ChunkPiece`), then its node-unique keys' records;
 * `rail_keys`: the slices the rail proxies put into this owner, one per
-  source node, in node order;
-* `source_offsets`: as owner, where each rail proxy's node's keys of each
-  feature start in its KJT, which it puts to that proxy;
-* `owner_offsets`: as proxy, where its node's keys of each feature start in
-  each rail owner's KJT, as the owners put them.
+  source node, in node order.
 
 The window is made when the op is built, from `ncclMemAlloc` and
 `ncclCommWindowRegister`. It has the same size on every rank, is rounded up
@@ -902,7 +900,7 @@ sizes, the window and the communicator stay in the op's C++ classes:
 Python never sees them. A place has the same offset in every rank's copy:
 `NodeWindow::peer(pointer, peer)` gives a node peer's copy of the place a
 pointer names in this rank's copy, and a GIN put to a rail peer takes
-pointers into this rank's copy for both of its ends (`rail_put`, `RowPut`,
+pointers into this rank's copy for both of its ends (`RowPut`,
 `RailMessage`).
 
 ## 8. The path and rail alignment
@@ -959,7 +957,7 @@ running totals, so it is never reset.
 |---|---|---|
 | 0 | forward rows, owner → proxy | `fwd_rows[owner node]` at the proxy |
 | 1 | backward rows, proxy → owner | `bwd_rows[proxy node]` at the owner; when the proxy's stream wraps its ring, its put counters (chunk `c` counts on counter `c % counters`, `counters` = `min(max_chunks, 64)`) |
-| 2 | the input dist: count messages, key puts and `source_offsets` | `count[node]`, `keys[node]` |
+| 2 | the input dist: count messages and key puts | `count[node]`, `keys[node]` |
 | 3 | credits and teardown | `grant[node]`, `bwd_ready[owner node]`, `closing[node]` |
 
 Why `NCCL_CROSS_NIC=0`: section 4.5.
@@ -1038,7 +1036,7 @@ four. In the backward GPU 3 pushes its gradient rows into GPU 2's
 ## 10. The input dist's steps
 
 `input_dist()` queues the bucketize and the steps after it on the caller's
-stream, in the order of section 7.3. Seven of them are the comm kernels (section 10.2). The planner
+stream, in the order of section 7.3. Eight of them are the comm kernels (section 10.2). The planner
 does the rest (`src/hier_output_dist/input_dist/planner.h`): kernels of its
 own and CUB's radix sorts and scans, on the current stream. Each step is one
 or a few ordinary kernels. A kernel over items (keys, rows, occurrences)
@@ -1057,9 +1055,10 @@ runs every step on what arrived and stays in bounds.
 With the benchmark's configuration (8 features, one owner rule), the
 bucketize queues 38 kernels and copies per call (DynamicEmb's index dedup
 and the fan-out table included), and the steps after it 5 on one node and
-about 90 across nodes, CUB's included. The node's part of a call is three
+about 85 across nodes, CUB's included. The node's part of a call is three
 comm kernels (`node_exchange`, `node_key_push`, `node_done`); on one node a
-fourth kernel copies the own part.
+fourth kernel copies the own part. Across nodes the rail's part is three
+more (`rail_exchange`, `rail_key_push`, `rail_done`).
 
 ### 10.1 The bucketize (requester, caller's stream, local)
 
@@ -1126,11 +1125,13 @@ would merge them (section 9). With a `continuous` table, `"fused"` raises
 ### 10.2 The comm kernels
 
 They are in `input_dist/comm_kernels.cu`. A comm kernel that waits runs on
-one CTA and takes the call's sequence number `in_seq`, the same on every
-rank. It waits only for the same kernel (the same `in_seq`) of its node or
-rail peers. Its threads take the peers in turn (thread `t` the peers `t`,
-`t + 32`, ... in a warp), so it serves any number of them. Section 13 gives
-their memory order and why no wait hangs.
+one CTA (or one warp) and takes the call's sequence number `in_seq`, the
+same on every rank. It waits only for the same kernel (the same `in_seq`) of
+its node or rail peers. The one exception is `rail_done`: it waits for its
+rail peers' `rail_key_push` of the call, a kernel that does not wait. Its
+threads take the peers in turn (thread `t` the peers `t`, `t + 32`, ... in a
+warp), so it serves any number of them. Section 13 gives their memory order
+and why no wait hangs.
 
 * **`node_exchange`** (1 CTA): stores this rank's offsets, its bucketize's
   `offset_per_bucket_feature` (`world_size × num_features + 1` int64
@@ -1162,28 +1163,28 @@ their memory order and why no wait hangs.
   `node_exchange` read `node_offsets`, so the peers may store their rows
   there again in the next call. It runs in every call, also with no rows
   and under skip.
-* **`rail_count_exchange`** (1 CTA, across nodes): copies this rank's
-  count messages (section 10.4) into its `count_msg_out` words: the common
-  part, then the part for each node. Its own message goes into its
-  `count_msg` slot of its own node: the slots go by `in_seq` parity and
-  source node. Then it puts each rail peer its message into the same slot
-  in the peer's copy, in two puts: the common part, then the part for the
-  peer's node, which carries a GIN signal (context 2). A signal is seen only
-  after the earlier puts of its context to that peer, so it covers both.
-  Then it waits until the message of every rail peer has landed, and reads
-  them from its `count_msg` slots of the call.
-* **`rail_key_exchange`** (1 CTA, across nodes): for each rail peer, puts
-  this proxy's `key_stage` slice for the owner there into the owner's
-  `rail_keys` (none when the owner's keys would pass `lookup_keys`), then,
-  as owner, the peer's node's row of `source_offsets` (where that node's
-  keys of each feature start in this owner's KJT) into this node's row of
-  the peer's `owner_offsets`, with a GIN signal. Then it waits for the key
-  stream of every other node. A proxy puts only once it has the owner's
-  count message of the call, which the owner sends after its previous call
-  ended.
+* **`rail_exchange`** (1 CTA, across nodes): writes this rank's count
+  message (section 10.4), the same for every rail peer, into its
+  `count_msg_out` words and into its `count_msg` slot of its own node: the
+  slots go by `in_seq` parity and source node. Then the lanes of one warp,
+  which take the rail peers in turn, put each peer the message into the
+  same slot in the peer's copy: one put, which carries a GIN signal
+  (context 2). The lanes of another warp wait until the message of every
+  rail peer has landed. From the `num_nodes` messages of the call, read in
+  their slots, the CTA lays out the rail (section 10.4) into the call's
+  tensors: every rank of the rail computes it from the same messages.
+  Before it ends, the putting warp flushes its puts.
+* **`rail_key_push`** (1 warp, across nodes): its lanes, which take the
+  rail owners in turn, put this proxy's `key_stage` slice for each owner
+  into the owner's `rail_keys`, where the rail layout says, with a GIN
+  signal. When it puts no keys (the owner's keys would pass `lookup_keys`,
+  or the slice is empty), it sends the signal alone. A proxy puts only once
+  it has the owner's count message of the call, which the owner sends after
+  its previous call read `rail_keys`. It does not wait.
 * **`node_status_exchange`** (1 CTA, across nodes): writes this rank's rail
-  needs and where each requester of its node starts in its KJT into its
-  `needs` and `requester_offsets` words, sets its `in_done` word to
+  needs and where each requester of its node starts in its KJT (the rail
+  layout's `needs` and `requester_offsets`) into its `needs` and
+  `requester_offsets` words, sets its `in_done` word to
   `in_seq`, and waits until every node peer has. Then it reads every peer's
   needs, and where each peer's KJT holds this requester's keys.
 * **`peer_gather`** (threads stride over the words, at most two CTAs per SM;
@@ -1192,6 +1193,13 @@ their memory order and why no wait hangs.
   (`RemoteMap`: per item, an occurrence's entry in each of the three
   arrays). The peers wrote them before the `in_done` that
   `node_status_exchange` waited for.
+* **`rail_done`** (1 warp, across nodes): its lanes, which take the rail
+  proxies in turn, wait until the key signal of every rail proxy of the
+  call has landed. Then the warp flushes this rank's puts on context 2, so
+  the NIC has read its `key_stage` slices. It runs just before the owner's
+  tables, the first step that reads `rail_keys`. So the key puts overlap
+  `node_status_exchange`, the `peer_gather`s and the requester's tables
+  (section 13).
 
 ### 10.3 The node layout, and the owner's KJT on one node
 
@@ -1303,21 +1311,44 @@ take no search. A key's rows are its key row, then its duplicates' slots
 in occurrence order; `node_exp_off` holds the rows before each key, and
 where the rows lie follows from the chunk (section 12.1).
 
-**The rail.** Each rank sends each rail peer a count message
-(`CountMessage`, int64 words). Its common part, the same for every peer:
-its node's largest remote part; as owner the keys of its own node it looks
-up; as proxy the most occurrences of one of its keys, and its node-unique
-keys and its chunks per owner node. Then the part
-for the peer's node alone: its node-unique keys there per feature. From the
-`num_nodes` messages it gets, a rank computes: as proxy, where its slice
-lands in each owner's `rail_keys` (a slice per source node, in node order);
-as owner, its KJT lengths and offsets, and where each other node's keys of
-each feature start in its KJT (`source_offsets`, which `rail_key_exchange`
-puts to that node's proxy, into its `owner_offsets`); and the rail's needs,
-as every owner's keys are in the common parts.
+**The rail.** The rail all-gathers its counts, as the node gathers its
+offsets. Each rank sends every rail peer the same count message
+(`CountMessage`, int64 words): its node's largest remote part; as owner,
+the keys of its own node that it looks up, in total and per feature; as
+proxy, the most occurrences of one of its keys, its chunks per owner node,
+and its node-unique keys per (owner node, feature). That is
+`3 + num_nodes + (num_nodes + 1) × num_features` words. From the
+`num_nodes` messages of the call, its own too, every rank of the rail
+computes the layout of the whole rail (`rail_layout_of`,
+`input_dist/rail.cuh`):
+
+* as proxy, where its slice lands in each owner's `rail_keys` (a slice per
+  source node, in node order), and where its node's keys of each feature
+  start in each owner's KJT (`owner_offsets`);
+* as owner, its KJT lengths and offsets, and where each other node's keys of
+  each feature start in its KJT (`source_offsets`);
+* the rail's needs: every owner's keys are in the messages.
+
+One function (`source_offset`) gives both offsets from the same messages.
+So a proxy's `owner_offsets` row for an owner is that owner's
+`source_offsets` row for the proxy's node, bit for bit, and no owner sends
+its offsets back: `rail_key_push` puts only the keys.
 `node_status_exchange` then gives every rank its node's rail needs. Their
 maximum is the call's needs, the same on every rank: a rank's rail covers
 every node, and its node holds one rank of every rail.
+
+**The all-gather's scale.** A count message has about
+`num_nodes × num_features` words. A rank sends it to its `num_nodes − 1`
+rail peers and gets as many. So per call a rank sends about
+`num_nodes² × num_features` words, and gets as many: 13 KiB at 8 nodes and
+26 features, 201 KiB at 16 nodes and 100 features, 865 KiB at 64 nodes and
+26 features (about the size of `node_offsets` at 8 GPUs per node), and
+about 500 MiB at 256 nodes and 1,000 features. The ctrl section keeps the
+messages in a slot per `in_seq` parity and node: about
+`16 × num_nodes² × num_features` bytes (section 15.2). And `rail_exchange`
+lays out the rail on one CTA, which reads the `num_nodes² × num_features`
+counts a few times. All three grow with the square of the nodes (section
+19).
 
 **The requester.** Two `peer_gather`s read what the node's proxies wrote. One
 reads the words of their headers it needs: the chunks, the stream's end, each
@@ -1763,6 +1794,14 @@ A call that does not fit raises and runs no out kernel, so it sends and
 takes no credit. The credits of the last out kernel wait for the next call that takes
 the op.
 
+The in channel sends no credit of its own. On context 2, `count[node]` and
+`keys[node]` count the count messages and the key streams of the rail peer
+on that node, one of each per call. So `rail_exchange` waits until each
+peer's `count` reaches `in_seq`, and `rail_done` until each one's `keys`
+does. A rank's count message of a call also lets its rail proxies put into
+its `rail_keys` again: it sends it after `rail_done` and the owner's tables
+of the call before (section 13).
+
 ## 13. Memory order, and why nothing hangs
 
 * **NVLink.** A writer stores rows with 16-byte stores, waits at a warp or
@@ -1798,7 +1837,8 @@ the op.
   lane read.
 * **The in channel.** What peers wrote is read only after an acquire of
   their flag or signal. The comm kernel that acquired it reads past the L1
-  cache (`node_exchange` reads `node_offsets` with `__ldcg`), and so does
+  cache (`node_exchange` reads `node_offsets`, and `rail_exchange` the count
+  messages, with `__ldcg`), and so does
   `peer_gather` later on the stream; the planner's kernels read with plain
   loads. What this rank writes for its peers, with its own stores or with
   the planner's kernels earlier on the stream, comes before the flag it
@@ -1806,15 +1846,32 @@ the op.
   `node_exchange` thread 0 makes the fence after the CTA's barrier, so it
   covers the offsets that every thread stored, then releases `in_started`.
   Each CTA of the push ends with one, and `node_done`,
-  `node_status_exchange` and each lane that puts in the rail exchanges make
-  one before their flag or put. The rail exchanges flush their puts before
-  they end. What this rank stores into a peer's buffer comes after an
-  acquire, earlier on the stream, of the peer's flag that says the peer
-  read that buffer (the table below).
+  `node_status_exchange`, the warp of `rail_exchange` that puts and
+  `rail_key_push` make one before their flag or puts. `rail_exchange`
+  flushes its puts before it ends, and `rail_done` flushes those of
+  `rail_key_push` (below). What this rank stores into a peer's buffer comes
+  after an acquire, earlier on the stream, of the peer's flag that says the
+  peer read that buffer (the table below).
+* **The late key wait.** `rail_key_push` only posts its puts. Each slice
+  carries a strong signal, so an owner that sees the signal also sees the
+  slice. `rail_done` acquires every rail proxy's key signal (system scope),
+  then flushes this rank's puts. A flush waits until the NIC has done every
+  put in the context's queue to each peer, from any kernel. Between the
+  push and `rail_done` run `node_status_exchange`, the `peer_gather`s, the
+  requester's `remote_rows` and its tables: none of them reads `rail_keys`
+  or writes `key_stage`, and the planner reads the rail's offsets from the
+  layout's tensors, not from the window. The first reader of `rail_keys`,
+  the owner's tables, runs after `rail_done` on the stream. The next call
+  writes `key_stage` in its proxy steps, after this `rail_done` on the
+  stream, so after the NIC read the slices. Its rail proxies put into
+  `rail_keys` only once they have this rank's count message of that call,
+  which its `rail_exchange` sends after this call's `rail_done` and owner's
+  tables.
 * **No hang.** A kernel that waits for peers waits only for the same kernel
-  on its peers, for credits from earlier out kernels, and for its own
-  rank's earlier work. The planner's kernels, the push and the gathers never
-  wait. The op orders nothing across streams: the caller orders the kernels
+  on its peers (`rail_done` for its rail peers' `rail_key_push`, which
+  never waits), for credits from earlier out kernels, and for its own
+  rank's earlier work. The planner's kernels, the pushes and the gathers
+  never wait. The op orders nothing across streams: the caller orders the kernels
   the same way on every rank (section 4.2). It makes the same calls in the
   same order, runs the input dists on one stream and the out kernels on one
   stream, with the same waits between its streams. So every rank issues the
@@ -1835,9 +1892,10 @@ once no peer still reads what call `in_seq` wrote there. The words marked
 | `node_offsets` | node peers' `node_exchange`, and this rank its own row | this rank's `node_exchange` | a peer stores its row of the next call before that call's node barrier, but only after its `node_done` of this call got this rank's tell, which this rank sends after its `node_exchange` read the rows; `node_done` runs in every call, so the rows need no slot per `in_seq` parity |
 | `node_keys`, `node_key_weights`, `node_bucket_feature_of_row` | node peers' push | this rank's planner | the peers push only after the next call's node barrier, which this rank publishes only once its in channel finished the call |
 | `remote_map`, `proxy_header` | this rank's planner | node peers' gathers | this rank writes them after the next call's node barrier, which every peer publishes only once its in channel finished the call |
-| `key_stage`, `source_offsets`, `count_msg_out` (ctrl) | this rank | the NIC | the rail exchanges flush their puts before they end |
-| `rail_keys`, `owner_offsets` | rail peers' key and offset puts | this rank's planner | a rail peer puts only after it has this rank's count message of the next call, which this rank sends after the call ended here |
-| `count_msg` (ctrl) | rail peers' count puts, and this rank its own | this rank's `rail_count_exchange` | a slot per `in_seq` parity (and source node): a peer's message of call `in_seq + 2` needs this rank's of call `in_seq + 1` |
+| `key_stage` | this rank's planner (the proxy) | the NIC | `rail_done` flushes the key puts before the owner's tables, so before the next call's proxy steps |
+| `count_msg_out` (ctrl) | this rank's `rail_exchange` | the NIC | `rail_exchange` flushes its puts before it ends |
+| `rail_keys` | rail proxies' key puts | this rank's owner tables | a rail proxy puts only after it has this rank's count message of the next call, which this rank's `rail_exchange` sends after this call's `rail_done` and owner tables |
+| `count_msg` (ctrl) | rail peers' count puts, and this rank its own | this rank's `rail_exchange` | a slot per `in_seq` parity (and source node): a peer's message of call `in_seq + 2` needs this rank's of call `in_seq + 1`, which this rank sends after its `rail_exchange` of call `in_seq` read the slots |
 | `requester_offsets`, `needs` and `in_done` (ctrl) | this rank | node peers' `node_status_exchange`, which copies them out | this rank writes them after the next call's node barrier |
 
 ## 14. The CTA budget
@@ -1879,7 +1937,7 @@ The capacities are the ones in place (section 5), and `row_bytes` and
 
 | buffer | bytes | kind |
 |---|---|---|
-| `ctrl` (the ctrl section) | one node: `16 × local_size + 72`; across nodes about `8 × (num_features × (local_size + 3 × num_nodes) + 4 × num_nodes² + 16 × num_nodes + 2 × local_size + 3 × max_chunks + 64)`, most of it the count messages: 89 KB at 32 nodes, 8 GPUs per node and 64 features, 8.0 MB at 256 nodes and 1,000 features, and 24 bytes per chunk of `max_chunks` | persistent |
+| `ctrl` (the ctrl section) | one node: `16 × local_size + 72`; across nodes about `8 × (num_features × (local_size + (2 × num_nodes + 1) × (num_nodes + 1)) + 2 × num_nodes² + 15 × num_nodes + 2 × local_size + 3 × max_chunks + 64)`, most of it the count messages (this rank's, and a slot per `in_seq` parity and node): 1.1 MB at 32 nodes, 8 GPUs per node and 64 features, 0.98 GB at 256 nodes and 1,000 features, and 24 bytes per chunk of `max_chunks` | persistent |
 | `node_offsets` | `8 × local_size × (world_size × num_features + 1)`: 16 KB at 4 nodes of 8 GPUs and 8 features | persistent |
 | `node_keys` | `8 × (lookup_keys + remote_keys)` (one node: `lookup_keys` alone) | persistent |
 | `node_key_weights` | with weights, `4 × (lookup_keys + remote_keys)` | persistent |
@@ -1888,7 +1946,6 @@ The capacities are the ones in place (section 5), and `row_bytes` and
 | `proxy_header` | `4 × (4 + max_chunks + local_size × (max_chunks + 1))` | persistent |
 | `key_stage` | `record_bytes × remote_keys + 16 × max_chunks + 16` | persistent |
 | `rail_keys` | `record_bytes × lookup_keys + 16 × owner_chunks` | persistent |
-| `source_offsets`, `owner_offsets` | `8 × num_nodes × num_features` each | persistent |
 | `lookup_rows` | `row_bytes × lookup_keys` | persistent |
 | `proxy_rows` | `row_bytes × num_proxy_rows` (section 15.3) | persistent |
 | the requester's maps | 8 bytes per key on one node (`inv`, `src`), 16 across nodes (also `dst`, `push_order`) | per call |
@@ -1913,7 +1970,7 @@ slots.
 
 The constructors of the layouts size the window's buffers as above
 (`CtrlLayout`, `KeysLayout` and `RowsLayout`, in `window.h`). The buffers
-from `node_bucket_feature_of_row` to `owner_offsets`, and `proxy_rows`, exist
+from `node_bucket_feature_of_row` to `rail_keys`, and `proxy_rows`, exist
 across nodes only, and `node_key_weights` with weights
 only: else they take 0 bytes. Each buffer, the ctrl section too, takes a whole number of 4 KiB
 units (`kBufferAlign`). So the window's bytes are the sum of its buffers,
@@ -1993,10 +2050,14 @@ sized by `world_size` too (`8 × world_size × num_features` bytes each).
 Apart from these, `num_nodes` enters only through:
 
 * the share `(num_nodes − 1) / num_nodes`;
-* the control words and the KJT offsets (`source_offsets`, `owner_offsets`):
-  linear in `num_nodes × num_features`, plus `32 × num_nodes²` bytes of the
-  count messages' common parts. That is 0.12 MB at 32 nodes, 8 GPUs per node
-  and 64 features, and 12 MB at 256 nodes and 1,000 features;
+* the control words, most of them the count messages: this rank's, and a
+  slot per `in_seq` parity and node, about
+  `8 × (2 × num_nodes + 1) × (num_nodes + 1) × num_features` bytes, which
+  grow with the square of the nodes. With the other control words that is
+  1.1 MB at 32 nodes, 8 GPUs per node and 64 features, and 0.98 GB at 256
+  nodes and 1,000 features (section 10.4 gives what a call sends). Per
+  call, the rail layout's KJT offsets (`source_offsets`, `owner_offsets`)
+  are linear in `num_nodes × num_features`;
 * GIN's queues to `num_nodes − 1` rail peers per context (with
   `NCCL_CROSS_NIC=0`);
 * the chunk tables, which grow with `max_chunks` (linear in
@@ -2011,9 +2072,11 @@ Apart from these, `num_nodes` enters only through:
 `local_size` enters through `node_offsets` (a row per GPU of the node),
 and through the tables kept per GPU of the node: the proxy header's push
 tables, and per call the requester's tables of each proxy and the proxy's
-push starts of each requester. No table holds a count per (node, node,
-feature). `node_offsets` holds one per (GPU of the node, GPU, feature): the
-bucketize's `offset_per_bucket_feature` of each GPU of the node.
+push starts of each requester. Two tables hold a count per (sender,
+receiver, feature). The count messages hold one per (node, node, feature):
+each rail peer's node-unique keys per owner node and feature. `node_offsets`
+holds one per (GPU of the node, GPU, feature): the bucketize's
+`offset_per_bucket_feature` of each GPU of the node.
 
 Everything else is linear in the capacities, except `proxy_rows` (capped: a
 larger call's stream takes more laps of the ring).
@@ -2184,8 +2247,17 @@ The node's part of a call has hooks of its own in `testing.cu`:
   tables where every sum is exact (a power-of-two world size of at most
   128).
 
+The rail's part has two: `hier_output_dist_proxy_plan` gives a proxy's plan
+and its count message (`"message"`), and `hier_output_dist_rail_tables` one
+rank's rail layout from its rail's messages (row `n` the message of the rail
+peer on node `n`, as `rail_exchange` reads them) and, given its `rail_keys`
+and the own part of its `node_keys`, its owner tables and put lists. Both
+run the device code of `rail_exchange` (`input_dist/rail.cuh`).
+
 `test_hier_bucketize.py` plays every rank of one node with the first two
-hooks, and `test_hier_dedup.py` every rank of an N-node job.
+hooks, and `test_hier_dedup.py` every rank of an N-node job. Among its
+checks: each proxy's `owner_offsets` equal its owners' `source_offsets` and
+KJT offsets.
 
 ## 19. Limitations
 
@@ -2210,10 +2282,17 @@ hooks, and `test_hier_dedup.py` every rank of an N-node job.
   and the hottest owner's need sizes `lookup_keys` on every rank (section
   15).
 * **Host time of the input dist**: across nodes an input dist launches
-  about 130 kernels, CUB's included (section 10), and the training thread
+  about 125 kernels, CUB's included (section 10), and the training thread
   spends their host time, also under the train pipelines.
 * **Size of one call**: a GPU may receive, deduplicate or look up fewer than
   about 2.1 billion keys of each kind in one call (section 4.3).
+* **Many nodes with many features**: the rail all-gathers count messages of
+  about `num_nodes × num_features` words. So per call a rank sends and gets
+  about `num_nodes² × num_features` words, its ctrl section keeps about
+  `16 × num_nodes² × num_features` bytes, and one CTA lays the rail out
+  from them. That is 865 KiB each way per call and 1.7 MB of ctrl at 64
+  nodes and 26 features, and about 500 MiB each way per call and 0.98 GB of
+  ctrl at 256 nodes and 1,000 features (sections 10.4 and 15.4).
 * **Views**: a lookup output is a view of `lookup_rows`, valid until the
   next out kernel, and `lookup_grad` is one, valid until the next lookup
   (sections 11.2 and 11.4).
@@ -2287,7 +2366,7 @@ Paths from `corelib/dynamicemb`.
       with a memory order, bounded waits, warp and CTA helpers, a search, row
       vectors, the window as the node's GPUs map it (`NodeWindow`), the syncs
       on its control words (`NodeBarrier`, `PeerFlags`), and GIN on the rail
-      (`gin_context`, `issuer_sharing`, `rail_put`, `RowPut`, `RailMessage`,
+      (`gin_context`, `issuer_sharing`, `RowPut`, `RailMessage`,
       `Credits`);
   * `input_dist/`, the input dist:
     * `input_dist.h`, `input_dist.cu`: what the input dist of a call gives
@@ -2302,15 +2381,21 @@ Paths from `corelib/dynamicemb`.
       comm kernels, the planner's kernels and the bucketize share: the node
       layout from the node's offsets (`node_layout_of`), the bucketize's
       gather (`gather_rows`) and the push (`push_rows`);
+    * `rail.cuh`: the device code of the rail's part of a call, which
+      `rail_exchange` and the hooks share: a rank's count message
+      (`count_message_of`) and the rail's layout from the rail's messages
+      (`rail_layout_of`), with the one function that gives both
+      `source_offsets` and `owner_offsets` (`source_offset`);
     * `planner.h`: the planner: the declarations of every step, and of the
       CUB calls in `cub.cu` (radix sorts and scans); `planner.cuh`: what the
       planner's kernels share (how they are launched, searches in sorted
       tables, the starts of sorted runs, a CTA's scans). The bucketize is in
       `bucketize.cu` and the proxy in `proxy.cu` (with the levels of its
-      chunks by weight, `Levels`); the node layout and the
-      push as the hooks run them (`node_layout`, `push_to_node_keys`), the
-      owner's KJT on one node (`one_node_owner`), the rail and the owner,
-      the requester and the put lists are in `planner.cu`;
+      chunks by weight, `Levels`); the node layout, the push, the count
+      message and the rail layout as the hooks run them (`node_layout`,
+      `push_to_node_keys`, `count_message`, `rail_layout`), the owner's KJT
+      on one node (`one_node_owner`), the owner's tables, the requester and
+      the put lists are in `planner.cu`;
   * `output_dist/`, the output dist:
     * `output_dist.h`, `output_dist.cu`: the out channel (`OutChannel`),
       which launches the out kernels, and their trace (`Trace`).
