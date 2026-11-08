@@ -411,15 +411,6 @@ _SYNCS = (
 )
 
 
-def _plan_syncs() -> Tuple:
-    """The hierarchical dist's one sync per call, in C++: its operator's
-    second wait (where the build has it)."""
-    import dynamicemb_extensions
-
-    op = getattr(dynamicemb_extensions, "HierOutputDist", None)
-    return () if op is None else ((op, "wait", False),)
-
-
 _TORCH_DIR = os.path.dirname(torch.__file__) + os.sep
 
 
@@ -464,7 +455,7 @@ class _HostSyncs:
         return wrapped
 
     def install(self) -> None:
-        for owner, name, cuda_only in _SYNCS + _plan_syncs():
+        for owner, name, cuda_only in _SYNCS:
             self._saved.append((owner, name, owner.__dict__.get(name)))
             setattr(owner, name, self._sync(getattr(owner, name), cuda_only))
 
