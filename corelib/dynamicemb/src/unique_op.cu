@@ -46,8 +46,73 @@ constexpr int BLOCK_SIZE = 256;
 // block hides the scattered-probe latency with a full complement of warps.
 constexpr int SHARED_BLOCK_SIZE = 1024;
 
-// (MurmurHash3_32, the bucket hash, and the chained insert, chain_insert, are
-// in dedup_chain.cuh, which the hierarchical dist's node dedup shares.)
+// MurmurHash3_32 hash function
+template <typename Key, uint32_t m_seed = 0> struct MurmurHash3_32 {
+  __forceinline__ __host__ __device__ static uint32_t rotl32(uint32_t x,
+                                                             int8_t r) {
+    return (x << r) | (x >> (32 - r));
+  }
+
+  __forceinline__ __host__ __device__ static uint32_t fmix32(uint32_t h) {
+    h ^= h >> 16;
+    h *= 0x85ebca6b;
+    h ^= h >> 13;
+    h *= 0xc2b2ae35;
+    h ^= h >> 16;
+    return h;
+  }
+
+  __forceinline__ __host__ __device__ static uint32_t hash(const Key &key) {
+    constexpr int len = sizeof(Key);
+    const uint8_t *const data = reinterpret_cast<const uint8_t *>(&key);
+    constexpr int nblocks = len / 4;
+    uint32_t h1 = m_seed;
+    constexpr uint32_t c1 = 0xcc9e2d51;
+    constexpr uint32_t c2 = 0x1b873593;
+
+    const uint32_t *const blocks =
+        reinterpret_cast<const uint32_t *>(data + nblocks * 4);
+    for (int i = -nblocks; i; i++) {
+      uint32_t k1 = blocks[i];
+      k1 *= c1;
+      k1 = rotl32(k1, 15);
+      k1 *= c2;
+      h1 ^= k1;
+      h1 = rotl32(h1, 13);
+      h1 = h1 * 5 + 0xe6546b64;
+    }
+
+    const uint8_t *tail = data + nblocks * 4;
+    uint32_t k1 = 0;
+    switch (len & 3) {
+    case 3:
+      k1 ^= tail[2] << 16;
+      [[fallthrough]];
+    case 2:
+      k1 ^= tail[1] << 8;
+      [[fallthrough]];
+    case 1:
+      k1 ^= tail[0];
+      k1 *= c1;
+      k1 = rotl32(k1, 15);
+      k1 *= c2;
+      h1 ^= k1;
+    }
+
+    h1 ^= len;
+    return fmix32(h1);
+  }
+
+  // Combine two hash values (for compound keys)
+  __forceinline__ __host__ __device__ static uint32_t
+  hash_combine(uint32_t h1, uint32_t h2) {
+    h1 ^= h2 + 0x9e3779b9 + (h1 << 6) + (h1 >> 2);
+    return h1;
+  }
+};
+
+// (The chained insert, chain_insert, is in dedup_chain.cuh, which the
+// hierarchical dist's node dedup shares.)
 
 // Atomic operation overloads for 64-bit types
 __forceinline__ __device__ long atomicAdd(long *address, long val) {
