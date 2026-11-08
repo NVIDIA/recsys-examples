@@ -243,7 +243,7 @@ class HierOutputDist {
 
  private:
   void release() noexcept;
-  bool exit_round() noexcept;
+  bool teardown_handshake() noexcept;
 
   Config config_;
   Sizes sizes_;

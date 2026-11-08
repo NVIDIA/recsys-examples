@@ -144,10 +144,10 @@ struct Pull {
   int peer;       // the node peer whose window the task reads (a remote task: its proxy)
   int64_t chunk;  // a remote task: its chunk of the proxy's stream
   int num_rows;
-  int64_t out_row;  // the lane's deduplicated row, whose original rows its row goes to
-  const char *src;  // its row
+  int64_t dedup_row;  // the lane's deduplicated row, whose original rows its row goes to
+  const char *src;    // its row
   __device__ __forceinline__ explicit Pull(int me)
-      : remote(false), peer(me), chunk(0), out_row(0), src(nullptr) {}
+      : remote(false), peer(me), chunk(0), dedup_row(0), src(nullptr) {}
 };
 
 // Across nodes: every row of chunk `chunk` of a proxy's stream has landed in
@@ -173,8 +173,9 @@ __device__ __forceinline__ void wait_landed_warp(const Sizes &sizes, int64_t seq
 // landed (by then, or soon), and proxy_rows keeps it until the kernel ends. A
 // proxy whose stream wraps the ring takes other rows there again while the
 // kernel runs, so the row's remote task copied it to its first original row,
-// and once every row this rank pulls from that proxy is in (ready[rail]) the
-// sub-task copies it on from there (staged). Every lane of the warp.
+// and once every row this rank pulls from that proxy is in
+// (pulled_from_proxy[rail]) the sub-task copies it on from there (staged).
+// Every lane of the warp.
 template <bool kMulti, bool kLate>
 __device__ void heavy_sub_warp(const Sizes &sizes, int64_t seq, const FwdArgs &args,
                                const OutTables &tables, int64_t sub, int lane) {
@@ -184,7 +185,7 @@ __device__ void heavy_sub_warp(const Sizes &sizes, int64_t seq, const FwdArgs &a
   const int64_t dedup_row = fanout.sub[2 * sub], first = fanout.exp_off[dedup_row];
   const int64_t begin = fanout.sub[2 * sub + 1],
                 end = min(begin + kHeavy, (int64_t)fanout.exp_off[dedup_row + 1]);
-  const int32_t row = fanout.pos[fanout.slot[dedup_row]];
+  const int32_t row = fanout.pos[fanout.heavy_slot[dedup_row]];
   const int owner = tables.owner_of(row), rail = owner % local_size;
   const bool remote = kMulti && owner / local_size != sizes.topo.node,
              staged = remote && plan.wraps(rail);
@@ -195,7 +196,7 @@ __device__ void heavy_sub_warp(const Sizes &sizes, int64_t seq, const FwdArgs &a
   if (staged) {
     if (lane == 0) {
       Spin spin(sizes.timeout_ns);
-      while ((int64_t)ld_acquire_gpu((const uint64_t *)&args.ready[rail]) <
+      while ((int64_t)ld_acquire_gpu((const uint64_t *)&args.pulled_from_proxy[rail]) <
              plan.push_order_off[rail + 1] - plan.push_order_off[rail])
         spin.pause("rows pulled from a proxy", rail, dedup_row, sizes.topo.rank);
     }
@@ -218,20 +219,20 @@ __device__ void heavy_sub_warp(const Sizes &sizes, int64_t seq, const FwdArgs &a
 // Row task `index` of the node's owners: its rows of the owner's
 // lookup_rows. False when the task is past the end of that owner's block.
 __device__ __forceinline__ bool local_pull(const FwdArgs &args, const OutTables &tables,
-                                           const LocalRows &local_rows, int64_t index, int lane,
+                                           const RowTasks &row_tasks, int64_t index, int lane,
                                            Pull &pull) {
   const FwdPlanView &plan = args.plan;
   const char *src = nullptr;
-  int64_t out_row = 0;
-  const RowTask job = local_rows.task(index);
+  int64_t dedup_row = 0;
+  const RowTask job = row_tasks.task(index);
   if (job.count == 0) return false;
   if (lane < job.count) {
     const int64_t row = job.row0 + lane;
     src = tables.lookup_row(job.owner, plan.src[row]);
-    out_row = plan.inv[row];
+    dedup_row = plan.inv[row];
   }
   pull.src = src;
-  pull.out_row = out_row;
+  pull.dedup_row = dedup_row;
   pull.num_rows = job.count;
   pull.peer = job.owner;
   return true;
@@ -246,23 +247,23 @@ __device__ __forceinline__ bool remote_pull_warp(const Sizes &sizes, int64_t seq
                                                  int64_t task, int lane, Pull &pull) {
   const FwdPlanView &plan = args.plan;
   const int local_size = sizes.topo.local_size, me = sizes.topo.local_rank;
-  const RemoteTask place(plan.remote_task_offsets, plan.max_chunks * local_size, task);
+  const TaskPlace place(plan.remote_task_offsets, plan.max_chunks * local_size, task);
   const int64_t chunk = place.entry / local_size;
   const int proxy = (int)((me + place.entry % local_size) % local_size);
   const int64_t pos0 = plan.push_offset(proxy, chunk) + place.nth * kTaskRows;
   const int num_rows = (int)min((int64_t)kTaskRows, plan.push_offset(proxy, chunk + 1) - pos0);
   if (num_rows <= 0) return false;
   const char *src = nullptr;
-  int64_t out_row = 0;
+  int64_t dedup_row = 0;
   if (lane < num_rows) {
     const int32_t row = plan.push_order[pos0 + lane];
     src = tables.proxy_row(proxy, plan.src[row]);
-    out_row = plan.inv[row];
+    dedup_row = plan.inv[row];
   }
   wait_landed_warp(sizes, seq, tables, proxy, chunk, lane);
   pull.remote = true;
   pull.src = src;
-  pull.out_row = out_row;
+  pull.dedup_row = dedup_row;
   pull.num_rows = num_rows;
   pull.chunk = chunk;
   pull.peer = proxy;
@@ -271,19 +272,20 @@ __device__ __forceinline__ bool remote_pull_warp(const Sizes &sizes, int64_t seq
 
 // Every lane of the warp: the task's rows into the output; a remote task's,
 // when its proxy's stream wraps the ring, counted pulled at the proxy and
-// (staged: index dedup's heavy rows across nodes) at this rank; and the task
-// into the timeline. The warp copy keeps kVectors vectors in flight per lane.
+// (count_pulls: index dedup's heavy rows across nodes) at this rank; and the
+// task into the timeline. The warp copy keeps kVectors vectors in flight per
+// lane.
 template <int kVectors>
 __device__ __forceinline__ void pull_warp(const Sizes &sizes, const FwdArgs &args,
-                                          const OutTables &tables, const Pull &pull, bool staged,
-                                          int lane) {
+                                          const OutTables &tables, const Pull &pull,
+                                          bool count_pulls, int lane) {
   const FwdPlanView &plan = args.plan;
   const int me = sizes.topo.local_rank, row_bytes = sizes.row_bytes, vec = sizes.row_vecs();
   const int num_rows = pull.num_rows, peer = pull.peer;
   const bool remote = pull.remote;
   const OutTimeline timeline{args.trace, sizes.topo.local_size};
   const unsigned long long start = timeline.on() ? now_ns() : 0;
-  warp_copy_fanout<kVectors>(pull.src, pull.out_row, num_rows, vec, lane, plan.fanout, args.out,
+  warp_copy_fanout<kVectors>(pull.src, pull.dedup_row, num_rows, vec, lane, plan.fanout, args.out,
                              row_bytes, remote);
   if (remote && plan.wraps(peer)) {
     // The task's rows are out of proxy_rows (the warp's loads, before the
@@ -291,7 +293,8 @@ __device__ __forceinline__ void pull_warp(const Sizes &sizes, const FwdArgs &arg
     __syncwarp();
     if (lane == 0) {
       red_release_sys(tables.pulled_rows(peer, pull.chunk), (uint64_t)num_rows);
-      if (staged) red_release_gpu((uint64_t *)&args.ready[peer], (uint64_t)num_rows);
+      if (count_pulls)
+        red_release_gpu((uint64_t *)&args.pulled_from_proxy[peer], (uint64_t)num_rows);
     }
   }
   if (timeline.on()) {
@@ -365,7 +368,7 @@ __device__ __forceinline__ int64_t grant_warp(const Credits &credits, const FwdP
     // the pulled_rows polls of every lane (each one's acquire is its fence).
     __syncwarp();
     if (owner >= 0 && (same >> lane) == 1u)
-      credits.raise(owner, sig_grant(node), tag_of(seq, end), ctrl.grant_sent(owner));
+      credits.raise(owner, sig_grant(node), tagged(seq, end), ctrl.grant_sent(owner));
     const int run = ballot_run(now);
     granted += run;
     if (run < 32) return granted;
@@ -417,7 +420,7 @@ __device__ void ProxyRelay::run(ncclWindow_t window, const ncclDevComm &dev, con
   const OutTimeline timeline{args.trace, sizes.topo.local_size};
   for (int owner_node = lane; owner_node < num_nodes; owner_node += 32)
     if (owner_node != node)
-      credits.raise(owner_node, sig_grant(node), tag_of(seq, ring), ctrl.grant_sent(owner_node));
+      credits.raise(owner_node, sig_grant(node), tagged(seq, ring), ctrl.grant_sent(owner_node));
   const int64_t count = *plan.num_chunks;
   const bool wraps = count > 0 && plan.chunks[count - 1].end > ring;
   if (wraps) {
@@ -569,7 +572,7 @@ __device__ void OwnerIssuer::run(ncclWindow_t window, const ncclDevComm &dev, co
         const uint64_t grant = credits.read_relaxed(sig_grant(proxy_node));
         for (; seg < end; ++seg) {
           const PutSeg segment = plan.put_list[seg];
-          if (grant < tag_of(seq, plan.fwd_chunks[segment.chunk].end)) break;
+          if (grant < tagged(seq, plan.fwd_chunks[segment.chunk].end)) break;
           if (!posted) timeline.stamp_earliest(kTraceFirstPut);
           posted = true;
           put.put(proxy_node, segment.dst, segment.src, segment.rows, false, 0);
@@ -664,7 +667,7 @@ __device__ void next_kernel_credits_warp(ncclWindow_t window, const ncclDevComm 
     if (peer_node == node) continue;
     credits.raise(peer_node, sig_bwd_ready(num_nodes, node), (uint64_t)seq + 1,
                   ctrl.bwd_ready_sent(peer_node));
-    credits.raise(peer_node, sig_grant(node), tag_of(seq + 1, (uint64_t)sizes.num_proxy_rows),
+    credits.raise(peer_node, sig_grant(node), tagged(seq + 1, (uint64_t)sizes.num_proxy_rows),
                   ctrl.grant_sent(peer_node));
   }
   __syncwarp();
@@ -729,8 +732,8 @@ __global__ void __launch_bounds__(kThreads, 1)
   const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
   const OutTimeline timeline{args.trace, local_size};
   timeline.begin_cta();
-  const int workers = num_nodes > 1 && blockIdx.x == 0 ? kThreads - 64 : kThreads;
-  if (tid >= workers) {
+  const int worker_threads = num_nodes > 1 && blockIdx.x == 0 ? kThreads - 64 : kThreads;
+  if (tid >= worker_threads) {
     if constexpr (kMulti) {
       if (warp == kWarps - 1)
         fwd::ProxyRelay::run<kGin>(window, dev, sizes, seq, args);
@@ -739,24 +742,26 @@ __global__ void __launch_bounds__(kThreads, 1)
     }
   } else {
     const OutTables tables(window, sizes, args.plan);
-    const int64_t heavy = fanout.count[1];
-    // index dedup's heavy rows of other nodes at a proxy whose stream wraps
-    // the ring copy on from their first original row (fwd::heavy_sub_warp)
-    const bool staged = num_nodes > 1 && heavy > 0;
-    if (staged && blockIdx.x == 0) {
+    const int64_t heavy_subs = fanout.count[1];
+    // the rows pulled from each proxy are counted (pulled_from_proxy): index
+    // dedup's heavy rows of other nodes at a proxy whose stream wraps the ring
+    // copy on from their first original row (fwd::heavy_sub_warp)
+    const bool count_pulls = num_nodes > 1 && heavy_subs > 0;
+    if (count_pulls && blockIdx.x == 0) {
       // Counters this kernel counts from 0, before this rank publishes its
       // out_seq: everything that counts on them runs after the entry.
-      for (int proxy = tid; proxy < local_size; proxy += workers) args.ready[proxy] = 0;
-      cta_sync(workers);
+      for (int proxy = tid; proxy < local_size; proxy += worker_threads)
+        args.pulled_from_proxy[proxy] = 0;
+      cta_sync(worker_threads);
     }
-    pass_entry_barrier(window, sizes, seq, timeline, workers);
+    pass_entry_barrier(window, sizes, seq, timeline, worker_threads);
     // this node's owners' rows
     const int64_t *local_offset_per_bucket = plan.offset_per_bucket + node * local_size;
-    const LocalRows local_rows{local_offset_per_bucket, local_size, me};
-    const int64_t rows = local_rows.count(), local = rows + heavy;
+    const RowTasks row_tasks{local_offset_per_bucket, local_size, me};
+    const int64_t num_row_tasks = row_tasks.count(), local = num_row_tasks + heavy_subs;
     const int64_t remote =
         num_nodes > 1 ? plan.remote_task_offsets[plan.max_chunks * local_size] : 0;
-    const int64_t late = num_nodes > 1 ? heavy : 0;
+    const int64_t late = num_nodes > 1 ? heavy_subs : 0;
     const CtrlLayout ctrl = tables.layout().ctrl;
     ReadyFirst tasks{TaskQueue{ctrl.task(kQueueLocal)}, TaskQueue{ctrl.task(kQueueRemote)}, local,
                      remote + late};
@@ -766,7 +771,7 @@ __global__ void __launch_bounds__(kThreads, 1)
     int64_t landed_entry = -1;
     const auto ready = [&](int64_t next) {
       if (next >= remote) return false;
-      const RemoteTask place(plan.remote_task_offsets, plan.max_chunks * local_size, next);
+      const TaskPlace place(plan.remote_task_offsets, plan.max_chunks * local_size, next);
       if (place.entry == landed_entry) return true;
       const int proxy = (int)((me + place.entry % local_size) % local_size);
       if ((int64_t)ld_acquire_sys(tables.landed(proxy, place.entry / local_size)) < seq)
@@ -780,18 +785,18 @@ __global__ void __launch_bounds__(kThreads, 1)
         continue;
       }
       int64_t index = 0;
-      if (task < local && Interleave{rows, heavy}.is_sub(task, index)) {
+      if (task < local && Interleave{num_row_tasks, heavy_subs}.is_sub(task, index)) {
         fwd::heavy_sub_warp<kMulti, false>(sizes, seq, args, tables, index, lane);
         continue;
       }
       fwd::Pull pull(me);
       if (task < local) {
-        if (!fwd::local_pull(args, tables, local_rows, index, lane, pull)) continue;
+        if (!fwd::local_pull(args, tables, row_tasks, index, lane, pull)) continue;
       } else {
         if (!fwd::remote_pull_warp(sizes, seq, args, tables, task - local, lane, pull)) continue;
       }
       fwd::pull_warp<kMulti ? fwd::kPullVectorsMulti : fwd::kPullVectors>(sizes, args, tables, pull,
-                                                                          staged, lane);
+                                                                          count_pulls, lane);
     }
   }
   if (!arrive_cta(window, sizes, arrive0, timeline)) return;  // the last CTA goes on

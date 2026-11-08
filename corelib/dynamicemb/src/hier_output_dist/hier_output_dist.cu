@@ -66,7 +66,7 @@ std::string why_not(int readiness, int local_size) {
 
 // Signals and counters of every GIN context start at 0: `bad` counts those
 // that do not.
-__global__ void gin_zero_kernel(ncclDevComm dev, int signals, int counters, int *bad) {
+__global__ void gin_nonzero_kernel(ncclDevComm dev, int signals, int counters, int *bad) {
   ncclGin gin(dev, blockIdx.x);
   for (int signal = threadIdx.x; signal < signals; signal += blockDim.x)
     if (gin.readSignal(signal) != 0) atomicAdd(bad, 1);
@@ -74,15 +74,16 @@ __global__ void gin_zero_kernel(ncclDevComm dev, int signals, int counters, int 
     if (gin.readCounter(counter) != 0) atomicAdd(bad, 1);
 }
 
-// Teardown, 1 warp: tell the node this rank reads no window any more (its
-// closing word) and, across nodes, its rail peers that it sends nothing more
-// (a closing signal on the credits' context, behind every credit it sent
-// them on the same QPs), both before waiting for anyone; then wait (at most
-// limit_ns) until every node peer and every rail peer said the same, each
-// lane taking peers in turn. Records in its closed word whether they all
+// The teardown handshake, 1 warp: tell the node this rank reads no window any
+// more (its closing word) and, across nodes, its rail peers that it sends
+// nothing more (a closing signal on the credits' context, behind every credit
+// it sent them on the same QPs), both before waiting for anyone; then wait
+// (at most limit_ns) until every node peer and every rail peer said the same,
+// each lane taking peers in turn. Records in its closed word whether they all
 // did. Its waits are loops of their own: after limit_ns they give up and
 // record it, where Spin would trap.
-__global__ void exit_kernel(ncclWindow_t window, ncclDevComm dev, Sizes sizes, uint64_t limit_ns) {
+__global__ void teardown_kernel(ncclWindow_t window, ncclDevComm dev, Sizes sizes,
+                                uint64_t limit_ns) {
   const Topo &topo = sizes.topo;
   const int lane = threadIdx.x, num_nodes = topo.num_nodes;
   const NodeWindow node(window, topo.local_rank);
@@ -126,9 +127,9 @@ __global__ void exit_kernel(ncclWindow_t window, ncclDevComm dev, Sizes sizes, u
   if (lane == 0) *ctrl.closed() = all ? 1 : 0;
 }
 
-cudaError_t launch_exit_kernel(ncclWindow_t window, const ncclDevComm &dev, const Sizes &sizes,
-                               uint64_t limit_ns) {
-  exit_kernel<<<1, 32>>>(window, dev, sizes, limit_ns);
+cudaError_t launch_teardown_kernel(ncclWindow_t window, const ncclDevComm &dev, const Sizes &sizes,
+                                   uint64_t limit_ns) {
+  teardown_kernel<<<1, 32>>>(window, dev, sizes, limit_ns);
   return cudaGetLastError();
 }
 
@@ -156,8 +157,8 @@ bool gin_signals_zero(const ncclDevComm &dev, int num_nodes, int counters) {
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream(device);
   auto bad = at::empty({1}, at::TensorOptions().device(at::kCUDA, device).dtype(at::kInt));
   HIER_CUDA_CHECK(cudaMemsetAsync(bad.data_ptr<int>(), 0, sizeof(int), stream));
-  gin_zero_kernel<<<kGinContexts, 32, 0, stream>>>(dev, kGinSignalsPerNode * num_nodes, counters,
-                                                   bad.data_ptr<int>());
+  gin_nonzero_kernel<<<kGinContexts, 32, 0, stream>>>(dev, kGinSignalsPerNode * num_nodes, counters,
+                                                      bad.data_ptr<int>());
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   return bad.item<int>() == 0;
 }
@@ -258,12 +259,12 @@ HierOutputDist::HierOutputDist(const std::string &unique_id, int64_t rank, int64
 
 HierOutputDist::~HierOutputDist() { release(); }
 
-// Runs exit_kernel; true when every node and rail peer reached its teardown
-// within the limit.
-bool HierOutputDist::exit_round() noexcept {
+// Runs teardown_kernel; true when every node and rail peer reached its
+// teardown within the limit.
+bool HierOutputDist::teardown_handshake() noexcept {
   const double limit_s = std::min(config_.timeout_s, 30.0);
-  cudaError_t err = launch_exit_kernel(window_->handle(), communicator_->dev(), sizes_,
-                                       (uint64_t)(limit_s * 1e9));
+  cudaError_t err = launch_teardown_kernel(window_->handle(), communicator_->dev(), sizes_,
+                                           (uint64_t)(limit_s * 1e9));
   if (err == cudaSuccess) err = cudaDeviceSynchronize();
   uint64_t closed = 0;
   if (err == cudaSuccess)
@@ -290,13 +291,13 @@ bool HierOutputDist::exit_round() noexcept {
 // kernels have ended, and rail peers may still send it the credits each out
 // kernel sends for the next one at its end, which nobody waits for. So
 // before freeing it every node peer and every rail peer must have reached
-// its teardown too (the exit round; a rail peer's closing signal comes
-// behind its credits), unless every rank quiesced the op after its last
-// kernel. If the device sync reports an error (a kernel that trapped), or
-// the exit round reports a CUDA error, or a peer does not reach its teardown
-// in time, the op keeps its window and communicator until the process exits.
-// Else it lets go of its window, whose memory goes with the last view of
-// lookup_rows.
+// its teardown too (the teardown handshake; a rail peer's closing signal
+// comes behind its credits), unless every rank quiesced the op after its last
+// kernel. If the device sync reports an error (a kernel that trapped), or the
+// teardown handshake reports a CUDA error, or a peer does not reach its
+// teardown in time, the op keeps its window and communicator until the
+// process exits. Else it lets go of its window, whose memory goes with the
+// last view of lookup_rows.
 void HierOutputDist::release() noexcept {
   c10::cuda::OptionalCUDAGuard guard;
   try {
@@ -310,7 +311,7 @@ void HierOutputDist::release() noexcept {
       window_->release(/*keep=*/true);
       return;
     }
-    if (!quiesced_ && !exit_round()) {
+    if (!quiesced_ && !teardown_handshake()) {
       window_->release(/*keep=*/true);
       return;
     }

@@ -56,10 +56,10 @@ __host__ __device__ __forceinline__ constexpr auto ceil_div(Count count) {
 // The ranks of a sharding: its nodes and each rank's place in them.
 
 // Who is who. Ranks are node-contiguous: rank = node * local_size +
-// local_rank. The owner's KJT has num_sources = local_size + num_nodes - 1
+// local_rank. The owner's KJT has kjt_stride = local_size + num_nodes - 1
 // columns: its node's requesters, then the other nodes.
 struct Topo {
-  int world_size, local_size, num_nodes, num_sources;
+  int world_size, local_size, num_nodes, kjt_stride;
   int rank, local_rank, node;
 };
 
@@ -79,7 +79,7 @@ struct Sizes {
   int64_t remote_keys;       // remote occurrences a proxy deduplicates (a capacity)
   int64_t num_proxy_rows;    // rows of proxy_rows, the proxy's ring
   int64_t row_bytes;         // an embedding row (lookup_rows, proxy_rows)
-  int64_t chunk_rows;        // the most rows of a chunk in the ring: 2 MiB, or its payload if
+  int64_t max_chunk_rows;    // the most rows of a chunk in the ring: 2 MiB, or its payload if
                              // more, at most half the ring
   int64_t rows_per_payload;  // the ring rows a chunk may spend per row it sends over IB (4 at
                              // 512 KiB): its ring rows, before the least of two keys of the
@@ -104,20 +104,21 @@ struct Sizes {
   // A key counts in its chunk for its rows, but for at least rows_per_payload:
   // its counted rows. A key sends one row over IB, and it has a row in the
   // ring per occurrence. So a chunk of keys of few rows holds about
-  // chunk_rows / rows_per_payload keys (its payload). A chunk of keys of many
-  // rows stops at chunk_rows rows. The most counted rows of a key:
+  // max_chunk_rows / rows_per_payload keys (its payload). A chunk of keys of
+  // many rows stops at max_chunk_rows rows. The most counted rows of a key:
   __host__ __device__ int64_t max_counted_rows() const {
     return max_key_rows() > rows_per_payload ? max_key_rows() : rows_per_payload;
   }
   // A chunk takes the keys whose counted rows before them, among their owner
   // node's, fall in one span of this many counted rows (chunk_span). A key
   // counts at most max_counted_rows, and its rows are at most its counted
-  // rows. So a chunk's counted rows, and so its rows, stay within chunk_rows.
-  __host__ __device__ int64_t chunk_span() const { return chunk_rows - max_counted_rows() + 1; }
+  // rows. So a chunk's counted rows, and so its rows, stay within
+  // max_chunk_rows.
+  __host__ __device__ int64_t chunk_span() const { return max_chunk_rows - max_counted_rows() + 1; }
   // A stream that does not fit the ring takes laps, a lap's chunks starting
   // in a span of this many stream rows (lap_span); a chunk has at most
-  // chunk_rows rows, so a lap's rows stay within the ring.
-  __host__ __device__ int64_t lap_span() const { return num_proxy_rows - chunk_rows + 1; }
+  // max_chunk_rows rows, so a lap's rows stay within the ring.
+  __host__ __device__ int64_t lap_span() const { return num_proxy_rows - max_chunk_rows + 1; }
   // The GIN counters of the backward's puts (kMaxCounters).
   __host__ __device__ int64_t counters() const {
     return max_chunks < kMaxCounters ? max_chunks : kMaxCounters;
@@ -128,7 +129,7 @@ struct Sizes {
   // rows_per_payload times its rows, and a proxy's rows are at most
   // remote_keys. A key counts at most max_counted_rows too, and this owner
   // looks up at most lookup_keys keys (or no proxy puts to it).
-  __host__ __device__ int64_t owner_chunks() const {
+  __host__ __device__ int64_t max_owner_chunks() const {
     const int64_t others = topo.num_nodes - 1, span = chunk_span();
     const int64_t by_proxy = others * remote_keys, by_owner = max_counted_rows() * lookup_keys;
     // min(rows_per_payload * by_proxy, by_owner): the product only when it is
@@ -153,17 +154,17 @@ __host__ __device__ inline uint64_t buffer_end(uint64_t bytes) {
 // rows (the bucketize's): a row's are
 // exp_idx[exp_off[row] .. exp_off[row + 1]), in increasing order. A row with
 // more than kHeavy is heavy, and split into sub-tasks of kHeavy original rows.
-// Its slot can change from run to run (planner.h).
+// Its heavy slot can change from run to run (planner.h).
 struct Fanout {
-  const int32_t *exp_off;  // [rows + 1]
-  const int32_t *exp_idx;  // [original rows]
-  const int32_t *slot;     // [rows] heavy slot of a row, -1 if it is not heavy
-  const int64_t *sub;      // [2 * subs] (row, first entry) of each heavy sub-task,
-                           // a row's sub-tasks consecutive and in entry order
-  const int64_t *count;    // [2] heavy rows (slots), heavy sub-tasks
-  const int32_t *pos;      // [slots] the bucketized row of each heavy row
-  const int32_t *first;    // [slots] its first sub-task: slot s has [first[s], first[s + 1]),
-                           // the last slot up to count[1]
+  const int32_t *exp_off;     // [rows + 1]
+  const int32_t *exp_idx;     // [original rows]
+  const int32_t *heavy_slot;  // [rows] heavy slot of a row, -1 if it is not heavy
+  const int64_t *sub;         // [2 * subs] (row, first entry) of each heavy sub-task,
+                              // a row's sub-tasks consecutive and in entry order
+  const int64_t *count;       // [2] heavy rows (heavy slots), heavy sub-tasks
+  const int32_t *pos;         // [heavy slots] the bucketized row of each heavy row
+  const int32_t *first;       // [heavy slots] its first sub-task: heavy slot s has
+                              // [first[s], first[s + 1]), the last up to count[1]
 };
 
 // ── the proxy's stream and push orders (num_nodes > 1) ──────────────────────
@@ -172,7 +173,7 @@ struct Fanout {
 // owner node: those whose counted rows before them (Sizes::max_counted_rows), among their owner
 // node's, fall in one span of chunk_span (the owner node's chunk j, in the stream's round j). Its
 // rows are its keys' rows (each key's first occurrence's), then its duplicates' slots, each key's
-// in order: at most chunk_rows. The stream takes the chunks round after round, owner node
+// in order: at most max_chunk_rows. The stream takes the chunks round after round, owner node
 // after owner node in a round from the node after the proxy's own (so the proxies of a rail serve
 // different owner nodes at a time), each right after the one before. Its positions are unwrapped: a
 // stream that fits the ring lies as it is; else its chunks take laps, the chunks of a lap starting
@@ -195,10 +196,10 @@ struct Chunk {
   int32_t unused;
 };
 // A chunk as its owner reads it (each slice of key_stage starts with the
-// chunks of its owner node): its keys [uniq_lo, uniq_hi) among the owner
-// node's, and its unwrapped start and end.
-struct ChunkPiece {
-  int32_t uniq_lo, uniq_hi;
+// chunks of its owner node): its keys' records [record_lo, record_hi) among
+// the owner node's, and its unwrapped start and end.
+struct OwnerChunk {
+  int32_t record_lo, record_hi;
   uint32_t start, end;
 };
 // A node-unique key as its proxy sends it to the owner (key_stage, then the
@@ -221,10 +222,10 @@ __host__ __device__ inline int64_t min_proxy_rows_for(int64_t max_key_rows) {
   return 4 * max_key_rows;
 }
 // A segment of a put list: `rows` rows from src to dst (rows of the source and
-// destination buffers), all in one chunk and in one (feature, source) of the
+// destination buffers), all in one chunk and in one (feature, column) of the
 // owner's KJT; and its chunk, in the list's chunks: the backward's the
-// proxy's (whose ready counter it waits for), the forward's the pieces its
-// owner got (whose end it waits for in the grant).
+// proxy's (whose ready counter it waits for), the forward's the owner chunks
+// its owner got (whose end it waits for in the grant).
 struct PutSeg {
   int32_t src, dst, rows, chunk;
 };
@@ -279,9 +280,9 @@ __host__ __device__ inline int status_words(int num_features) {
 //                              the others' puts count on none);
 //   context 2 (in channel)     count[node] counts the count messages from the
 //                              rail peer on that node, keys[node] its key
-//                              streams (one put, or a payload-free signal, per
-//                              call each);
-//   context 3 (credits)        grant[node] = tag_of(out_seq, position): the
+//                              messages (one put, or a payload-free signal,
+//                              per call each);
+//   context 3 (credits)        grant[node] = tagged(out_seq, position): the
 //                              proxy on that node lets this owner fill the
 //                              rows of its stream below that position
 //                              (unwrapped), bwd_ready[owner_node] = the out_seq
@@ -309,7 +310,7 @@ __host__ __device__ inline int sig_bwd_ready(int num_nodes, int owner_node) {
 __host__ __device__ inline int sig_closing(int num_nodes, int node) { return 2 * num_nodes + node; }
 // A word that names an out kernel and a value of it (a position of a stream,
 // a chunk), which grows with both.
-__host__ __device__ inline uint64_t tag_of(int64_t out_seq, uint64_t value) {
+__host__ __device__ inline uint64_t tagged(int64_t out_seq, uint64_t value) {
   return ((uint64_t)out_seq << 32) | value;
 }
 
@@ -356,27 +357,26 @@ enum TraceSlots : int {
                                  // (backward: and its lookup_grad is complete)
   kTraceStartLast,               // the last CTA started
   // sums
-  kTraceNvBytes,     // bytes the workers moved over NVLink: rows loaded from node
-                     // peers' lookup_rows and proxy_rows (forward), stored into them
-                     // (backward)
-  kTraceLocalBytes,  // bytes of rows the workers moved within this GPU (its own
-                     // lookup_rows or proxy_rows to its output, its gradient to its
-                     // own lookup_rows or proxy_rows)
-  kTraceIbIn,        // (num_nodes > 1) rows other nodes sent this rank, as the relay
-                     // (forward) or the watcher (backward) saw them land
-  kTraceIbOut,       // (num_nodes > 1) rows this rank put over GIN
+  kTraceNvBytes,    // bytes the workers moved over NVLink: rows loaded from node
+                    // peers' lookup_rows and proxy_rows (forward), stored into them
+                    // (backward)
+  kTraceSelfBytes,  // bytes of rows the workers moved within this GPU (its own
+                    // lookup_rows or proxy_rows to its output, its gradient to its
+                    // own lookup_rows or proxy_rows)
+  kTraceIbRowsIn,   // (num_nodes > 1) rows other nodes sent this rank, as the relay
+                    // (forward) or the watcher (backward) saw them land
+  kTraceIbRowsOut,  // (num_nodes > 1) rows this rank put over GIN
   kNumTrace
 };
-// Then three timelines of kTraceBins bins, bin i holding what happened from
-// i to i + 1 bin widths (kTraceBinNs) after the start of the CTA that saw it,
-// the last bin also what came later: bytes moved over NVLink, rows landed
-// from other nodes, rows posted to other nodes. They span 5.12 ms.
+// Then three timelines of kTraceBins bins from kTraceTimelines, bin i holding
+// what happened from i to i + 1 bin widths (kTraceBinNs) after the start of
+// the CTA that saw it, the last bin also what came later: bytes moved over
+// NVLink, rows landed from other nodes, rows posted to other nodes. They span
+// 5.12 ms.
 constexpr int kTraceBins = 512;
 constexpr unsigned long long kTraceBinNs = 10000;  // width of a bin: 10 us
-constexpr int kTraceBinNv = kNumTrace;
-constexpr int kTraceBinIbIn = kTraceBinNv + kTraceBins;
-constexpr int kTraceBinIbOut = kTraceBinIbIn + kTraceBins;
-constexpr int kTraceWords = kTraceBinIbOut + kTraceBins;
+constexpr int kTraceTimelines = kNumTrace;
+constexpr int kTraceWords = kTraceTimelines + 3 * kTraceBins;
 constexpr int kTraceRing = 64;  // rows of each direction's ring
 // A CTA's shared copy (dynamic shared memory, only when tracing): its start,
 // then the slots it keeps (first and last NVLink task, first landing, the
@@ -388,11 +388,11 @@ enum TraceSmSlots : int {
   kSmFirstLanded,
   kSmNvLast,
   kSmNvBytes,
-  kSmLocalBytes,
-  kSmIbIn,
-  kSmIbOut,
-  kSmLanded,                 // [32], a word per lane
-  kSmBins = kSmLanded + 32,  // [3][kTraceBins], as in the row
+  kSmSelfBytes,
+  kSmIbRowsIn,
+  kSmIbRowsOut,
+  kSmWatcherSeen,                 // [32], a word per lane
+  kSmBins = kSmWatcherSeen + 32,  // [3][kTraceBins], as in the row
   kTraceSmWords = kSmBins + 3 * kTraceBins
 };
 

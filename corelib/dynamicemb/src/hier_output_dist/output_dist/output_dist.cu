@@ -77,10 +77,10 @@ const void *backward_kernel(at::ScalarType dtype, ncclGinType_t gin) {
 
 // The heavy rows' sub-tasks of a backward whose gradient rows are of `dtype`
 // (checked by backward_kernel).
-const void *heavy_kernel(at::ScalarType dtype) {
-  return dtype == at::kFloat      ? (const void *)bwd_heavy_kernel<float>
-         : dtype == at::kBFloat16 ? (const void *)bwd_heavy_kernel<__nv_bfloat16>
-                                  : (const void *)bwd_heavy_kernel<__half>;
+const void *heavy_partial_kernel(at::ScalarType dtype) {
+  return dtype == at::kFloat      ? (const void *)bwd_heavy_partial_kernel<float>
+         : dtype == at::kBFloat16 ? (const void *)bwd_heavy_partial_kernel<__nv_bfloat16>
+                                  : (const void *)bwd_heavy_partial_kernel<__half>;
 }
 
 }  // namespace
@@ -157,12 +157,14 @@ at::Tensor OutChannel::forward(const FwdPlan &plan, const at::Tensor &lookup_out
       lookup_out.numel() == 0 || (lookup_out.is_cuda() && lookup_out.data_ptr() == lookup_rows_),
       "hier_output_dist: the lookup output must be the rows lookup_rows() returned");
   at::Tensor out = output(plan.num_out());
-  at::Tensor ready;  // the kernel zeroes it
-  if (multi_node_) ready = at::empty({sizes_.topo.local_size}, out.options().dtype(at::kLong));
+  at::Tensor pulled_from_proxy;  // the kernel zeroes it
+  if (multi_node_)
+    pulled_from_proxy = at::empty({sizes_.topo.local_size}, out.options().dtype(at::kLong));
   FwdArgs args{};
   args.plan = plan.view(sizes_);
   args.out = (char *)out.data_ptr();
-  args.ready = ready.defined() ? ready.data_ptr<int64_t>() : nullptr;
+  args.pulled_from_proxy =
+      pulled_from_proxy.defined() ? pulled_from_proxy.data_ptr<int64_t>() : nullptr;
   launch(forward_kernel(gin_), OutKernel::kForward, out_ctas(OutKernel::kForward), args);
   return out;
 }
@@ -196,8 +198,8 @@ void OutChannel::backward(const BwdPlan &plan, at::Tensor grad, bool divide) {
     const int grid =
         (int)std::min<int64_t>((plan.heavy_subs + per_cta - 1) / per_cta, 4 * (int64_t)sms_);
     void *params[] = {&sizes_, &args};
-    HIER_CUDA_CHECK(
-        cudaLaunchKernel(heavy_kernel(grad.scalar_type()), grid, kThreads, params, 0, stream));
+    HIER_CUDA_CHECK(cudaLaunchKernel(heavy_partial_kernel(grad.scalar_type()), grid, kThreads,
+                                     params, 0, stream));
     int dim = (int)grad.size(1);
     const int sum_grid = (int)std::min<int64_t>(plan.fanout.pos.numel(), 8 * (int64_t)sms_);
     void *sum_params[] = {&args, &dim};

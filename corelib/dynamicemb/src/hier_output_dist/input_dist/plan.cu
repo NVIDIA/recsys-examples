@@ -35,7 +35,7 @@ Fanout fanout_view(const FanoutTables &tables) {
   Fanout fanout{};
   fanout.exp_off = data_of<int32_t>(tables.exp_off);
   fanout.exp_idx = data_of<int32_t>(tables.exp_idx);
-  fanout.slot = data_of<int32_t>(tables.slot);
+  fanout.heavy_slot = data_of<int32_t>(tables.heavy_slot);
   fanout.sub = data_of<int64_t>(tables.sub);
   fanout.count = data_of<int64_t>(tables.count);
   fanout.pos = data_of<int32_t>(tables.pos);
@@ -51,7 +51,7 @@ PlanView plan_view(const Plan &plan, const Sizes &sizes) {
   view.inv = data_of<int32_t>(plan.inv);
   view.fanout = fanout_view(plan.fanout);
   view.push_order = data_of<int32_t>(plan.push_order);
-  view.proxy_chunks = data_of<int64_t>(plan.proxy_chunks);
+  view.proxy_num_chunks = data_of<int64_t>(plan.proxy_num_chunks);
   view.proxy_ends = data_of<int64_t>(plan.proxy_ends);
   view.proxy_push_tables = data_of<int32_t>(plan.proxy_push_tables);
   view.remote_task_offsets = data_of<int64_t>(plan.remote_task_offsets);
@@ -74,13 +74,13 @@ auto fwd_tensors(Plan &plan) -> std::vector<decltype(&plan.src)> {
           &plan.inv,
           &plan.fanout.exp_off,
           &plan.fanout.exp_idx,
-          &plan.fanout.slot,
+          &plan.fanout.heavy_slot,
           &plan.fanout.sub,
           &plan.fanout.count,
           &plan.fanout.pos,
           &plan.fanout.first,
           &plan.push_order,
-          &plan.proxy_chunks,
+          &plan.proxy_num_chunks,
           &plan.proxy_ends,
           &plan.proxy_push_tables,
           &plan.remote_task_offsets,
@@ -104,13 +104,13 @@ auto bwd_tensors(Plan &plan) -> std::vector<decltype(&plan.dst)> {
           &plan.inv,
           &plan.fanout.exp_off,
           &plan.fanout.exp_idx,
-          &plan.fanout.slot,
+          &plan.fanout.heavy_slot,
           &plan.fanout.sub,
           &plan.fanout.count,
           &plan.fanout.pos,
           &plan.fanout.first,
           &plan.push_order,
-          &plan.proxy_chunks,
+          &plan.proxy_num_chunks,
           &plan.proxy_ends,
           &plan.proxy_push_tables,
           &plan.remote_task_offsets,
@@ -131,7 +131,7 @@ FwdPlanView FwdPlan::view(const Sizes &sizes) const {
   static_cast<PlanView &>(view) = plan_view(*this, sizes);
   view.src = data_of<int32_t>(src);
   view.push_order_off = data_of<int64_t>(push_order_off);
-  view.fwd_chunks = data_of<ChunkPiece, int32_t>(fwd_chunks);
+  view.fwd_chunks = data_of<OwnerChunk, int32_t>(fwd_chunks);
   view.chunk_offset_per_bucket = data_of<int64_t>(chunk_offset_per_bucket);
   view.chunk_inv = data_of<int32_t>(chunk_inv);
   view.node_length_per_bucket = data_of<int64_t>(node_length_per_bucket);

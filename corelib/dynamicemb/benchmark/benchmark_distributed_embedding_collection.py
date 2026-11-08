@@ -955,7 +955,7 @@ _HIER_TRACE = {
     "exited": 11,
     "start_last": 12,
     "nv_bytes": 13,
-    "local_bytes": 14,
+    "self_bytes": 14,
     "ib_in": 15,
     "ib_out": 16,
 }
@@ -977,7 +977,7 @@ _HIER_TRACE_FIELDS = (
         for name, slot in sorted(_HIER_TRACE.items(), key=lambda item: item[1])
         if 0 < slot < _HIER_TRACE_TIMES
     ]
-    + ["nv_bytes", "local_bytes", "ib_in", "ib_out"]
+    + ["nv_bytes", "self_bytes", "ib_in", "ib_out"]
     + ["start_abs", "enter_abs", "bytes_out", "bytes_in"]
     # plain loop: the call's input dist start and lookup start, in us after
     # the forward kernel's start (negative, the rank's own clock); the keys
@@ -1096,7 +1096,7 @@ def trace_records(
                 rec.append(float("nan") if unset else (stamp - start) / 1e3)
             rec += [
                 float(row[_HIER_TRACE[field]])
-                for field in ("nv_bytes", "local_bytes", "ib_in", "ib_out")
+                for field in ("nv_bytes", "self_bytes", "ib_in", "ib_out")
             ]
             enter_first = row[_HIER_TRACE["enter_first"]]
             rec += [
@@ -1431,7 +1431,9 @@ def device_used() -> int:
 # backward's, and the two that sum the heavy rows before the backward's.
 _OUTPUT_DIST_FWD_RE = re.compile(r"\bhier_output_dist::fwd_kernel\b")
 _OUTPUT_DIST_BWD_RE = re.compile(r"\bhier_output_dist::bwd_kernel\b")
-_OUTPUT_DIST_HEAVY_RE = re.compile(r"\bhier_output_dist::bwd_heavy_(?:sum_)?kernel\b")
+_OUTPUT_DIST_HEAVY_RE = re.compile(
+    r"\bhier_output_dist::bwd_heavy_(?:partial|sum)_kernel\b"
+)
 
 
 def output_dist_kernel_times(prof) -> List[List[float]]:
@@ -1616,7 +1618,7 @@ def check_against_torchrec(
     flags = torch.tensor([int(ok), int(ran)], device=device)
     dist.all_reduce(flags, op=dist.ReduceOp.MIN)
     # The models go when this returns: the hierarchical dist then frees its
-    # windows at once, without its teardown's exit round.
+    # windows at once, without its teardown handshake.
     quiesce(hier_model)
     ok, ran = flags.tolist()
     if not ran:

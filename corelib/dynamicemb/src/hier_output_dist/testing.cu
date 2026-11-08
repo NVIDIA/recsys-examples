@@ -101,9 +101,10 @@ std::map<std::string, at::Tensor> fanout_test(at::Tensor reverse_indices, at::Te
                                               c10::optional<at::Tensor> words) {
   c10::cuda::CUDAGuard guard(inv.device());
   const FanoutTables fanout = fanout_tables(reverse_indices, inv, words.value_or(at::Tensor()));
-  return {{"exp_off", fanout.exp_off}, {"exp_idx", fanout.exp_idx}, {"slot", fanout.slot},
-          {"sub", fanout.sub},         {"count", fanout.count},     {"pos", fanout.pos},
-          {"first", fanout.first}};
+  return {
+      {"exp_off", fanout.exp_off}, {"exp_idx", fanout.exp_idx}, {"heavy_slot", fanout.heavy_slot},
+      {"sub", fanout.sub},         {"count", fanout.count},     {"pos", fanout.pos},
+      {"first", fanout.first}};
 }
 
 // The ranks of a sharding of num_nodes nodes of local_size GPUs, as rank
@@ -214,13 +215,13 @@ void node_push_test(at::Tensor values, at::Tensor inv, c10::optional<at::Tensor>
 
 // The sizes of a call across nodes (Sizes) by name: num_nodes, local_size,
 // node, local_rank, num_features, num_tables, lookup_keys, remote_keys,
-// num_proxy_rows, chunk_rows, record_bytes, and payload_rows (the rows of a
-// chunk's payload; chunk_rows when not given). rows_per_payload is
-// rows_per_payload_for(chunk_rows, payload_rows): here chunk_rows stands for
-// sizes_of's ring_rows. The two differ only when sizes_of's least of 2 *
-// max_key_rows sets chunk_rows. Then max_chunks follows, and weights with
-// record_bytes. No step of the planner reads the others (row_bytes), which
-// stay 0.
+// num_proxy_rows, max_chunk_rows, record_bytes, and payload_rows (the rows of
+// a chunk's payload; max_chunk_rows when not given). rows_per_payload is
+// rows_per_payload_for(max_chunk_rows, payload_rows): here max_chunk_rows
+// stands for sizes_of's chunk_ring_rows. The two differ only when sizes_of's
+// least of 2 * max_key_rows sets max_chunk_rows. Then max_chunks follows, and
+// weights with record_bytes. No step of the planner reads the others
+// (row_bytes), which stay 0.
 Sizes plan_sizes(const std::map<std::string, int64_t> &named) {
   const int num_nodes = (int)named.at("num_nodes"), local_size = (int)named.at("local_size"),
             node = (int)named.at("node"), local_rank = (int)named.at("local_rank");
@@ -231,11 +232,11 @@ Sizes plan_sizes(const std::map<std::string, int64_t> &named) {
   sizes.lookup_keys = named.at("lookup_keys");
   sizes.remote_keys = named.at("remote_keys");
   sizes.num_proxy_rows = named.at("num_proxy_rows");
-  sizes.chunk_rows = named.at("chunk_rows");
+  sizes.max_chunk_rows = named.at("max_chunk_rows");
   const auto payload = named.find("payload_rows");
-  const int64_t payload_rows = payload != named.end() ? payload->second : sizes.chunk_rows;
+  const int64_t payload_rows = payload != named.end() ? payload->second : sizes.max_chunk_rows;
   TORCH_CHECK(payload_rows >= 1, "hier_output_dist: a chunk's payload of at least one row");
-  sizes.rows_per_payload = rows_per_payload_for(sizes.chunk_rows, payload_rows);
+  sizes.rows_per_payload = rows_per_payload_for(sizes.max_chunk_rows, payload_rows);
   sizes.record_bytes = named.at("record_bytes");
   sizes.weights = sizes.weighted_records();
   // a chunk holds two keys of the most counted rows (sizes_of's do)
@@ -245,8 +246,8 @@ Sizes plan_sizes(const std::map<std::string, int64_t> &named) {
                   sizes.num_tables >= 1 && sizes.num_tables <= sizes.num_features &&
                   sizes.lookup_keys >= 1 && sizes.lookup_keys < INT32_MAX &&
                   sizes.remote_keys >= 1 && sizes.remote_keys < INT32_MAX &&
-                  sizes.chunk_rows >= 2 * sizes.max_counted_rows() &&
-                  sizes.num_proxy_rows >= 2 * sizes.chunk_rows &&
+                  sizes.max_chunk_rows >= 2 * sizes.max_counted_rows() &&
+                  sizes.num_proxy_rows >= 2 * sizes.max_chunk_rows &&
                   (sizes.record_bytes == 8 || sizes.record_bytes == 16),
               "hier_output_dist: the sizes of a call across nodes");
   sizes.max_chunks = max_chunks_for(sizes);
@@ -307,7 +308,7 @@ std::map<std::string, at::Tensor> proxy_plan_test(
       proxy_push_order(std::move(proxy), std::move(chunks), remote_offsets, buffers, sizes);
   return {{"num_chunks", plan.num_chunks},
           {"occurrence_count", plan.occurrence_count},
-          {"key_rows", plan.key_rows},
+          {"need_key_rows", plan.need_key_rows},
           {"node_length_per_bucket_feature", plan.node_length_per_bucket_feature},
           {"node_offset_per_bucket", plan.node_offset_per_bucket},
           {"node_length_per_bucket", plan.node_length_per_bucket},
@@ -318,8 +319,8 @@ std::map<std::string, at::Tensor> proxy_plan_test(
           {"stage_offset_per_bucket", plan.stage_offset_per_bucket},
           {"reduce_task_offsets", plan.reduce_task_offsets},
           {"node_exp_off", plan.node_exp_off},
-          {"message", count_message(need_remote.reshape({}), own_total.reshape({}), plan.key_rows,
-                                    plan.chunk_length_per_bucket, own_lengths,
+          {"message", count_message(need_remote.reshape({}), own_total.reshape({}),
+                                    plan.need_key_rows, plan.chunk_length_per_bucket, own_lengths,
                                     plan.node_length_per_bucket_feature)},
           {"node_reverse_indices", node_reverse_indices}};
 }
@@ -403,8 +404,8 @@ std::map<std::string, at::Tensor> rail_tables_test(
 // [remote_keys], RemoteMap; proxy_headers: int32 [local_size]
 // [ProxyHeader::words]) and where its node's owners put its keys of each
 // feature (offset_per_owner_feature, as node_status_exchange gives it). The two
-// gathers read them as peer_gather would, on the word lists of remote_rows and
-// header_gather; an item a gather skips holds -1.
+// gathers read them as peer_gather would, on the word lists of
+// remote_map_gather and header_gather; an item a gather skips holds -1.
 std::map<std::string, at::Tensor> requester_tables_test(
     at::Tensor remote_maps, at::Tensor proxy_headers, at::Tensor offset_per_owner_feature,
     at::Tensor bucket_feature_of_row, at::Tensor offset_per_bucket_feature,
@@ -438,7 +439,7 @@ std::map<std::string, at::Tensor> requester_tables_test(
   };
   const at::Tensor words =
       gather(remote_maps.view({local_size, -1}),
-             remote_rows(bucket_feature_of_row, offset_per_bucket, row_shift, sizes),
+             remote_map_gather(bucket_feature_of_row, offset_per_bucket, row_shift, sizes),
              RemoteMap::kArrays, sizes.remote_keys);
   const at::Tensor headers = gather(proxy_headers.view({local_size, -1}),
                                     header_gather(sizes, bucket_feature_of_row.options()), 1, 0)
@@ -451,7 +452,7 @@ std::map<std::string, at::Tensor> requester_tables_test(
           {"push_order", tables.push_order},
           {"push_order_off", tables.push_order_off},
           {"proxy_push_tables", tables.proxy_push_tables},
-          {"proxy_chunks", tables.proxy_chunks},
+          {"proxy_num_chunks", tables.proxy_num_chunks},
           {"proxy_ends", tables.proxy_ends},
           {"remote_task_offsets", tables.remote_task_offsets}};
 }

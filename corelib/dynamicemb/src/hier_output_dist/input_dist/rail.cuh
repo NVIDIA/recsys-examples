@@ -36,12 +36,12 @@ namespace dyn_emb {
 namespace hier_output_dist {
 
 // The tables a rank's count message (CountMessage) is made of, in its order: of its node layout
-// need_remote, own_total (this rank's own part) and own_lengths, and of its proxy plan key_rows,
-// chunk_length_per_bucket and node_length_per_bucket_feature.
+// need_remote, own_total (this rank's own part) and own_lengths, and of its proxy plan
+// need_key_rows, chunk_length_per_bucket and node_length_per_bucket_feature.
 struct CountParts {
   const int64_t *need_remote;                     // 0-dim
   const int64_t *own_total;                       // 0-dim
-  const int64_t *key_rows;                        // 0-dim
+  const int64_t *need_key_rows;                   // 0-dim
   const int64_t *chunk_length_per_bucket;         // [num_nodes]
   const int64_t *own_lengths;                     // [num_features][local_size]
   const int64_t *node_length_per_bucket_feature;  // [num_nodes][num_features]
@@ -52,18 +52,17 @@ struct CountParts {
 // node's local_size requesters (own_lengths).
 __device__ inline void count_message_of(const CountParts &in, const CountMessage &format,
                                         int64_t local_size, int64_t *message, int64_t *copy) {
-  const int64_t own_first = format.own_length_per_feature(0),
-                keys_first = format.node_length_per_bucket_feature(0, 0);
+  const int64_t own_first = format.own_length_word(0), keys_first = format.node_length_word(0, 0);
   for (int64_t word = threadIdx.x; word < format.length(); word += kThreads) {
     int64_t value;
-    if (word == CountMessage::kNeedRemote) {
+    if (word == CountMessage::kNeedRemoteWord) {
       value = *in.need_remote;
-    } else if (word == CountMessage::kOwnTotal) {
+    } else if (word == CountMessage::kOwnTotalWord) {
       value = *in.own_total;
-    } else if (word == CountMessage::kKeyRows) {
-      value = *in.key_rows;
+    } else if (word == CountMessage::kNeedKeyRowsWord) {
+      value = *in.need_key_rows;
     } else if (word < own_first) {
-      value = in.chunk_length_per_bucket[word - format.chunk_length_per_bucket(0)];
+      value = in.chunk_length_per_bucket[word - format.chunk_length_word(0)];
     } else if (word < keys_first) {
       const int64_t *lengths = in.own_lengths + (word - own_first) * local_size;
       value = 0;
@@ -92,14 +91,14 @@ struct RailCounts {
   // `owner_node`, and its chunks of that owner node
   __device__ __forceinline__ int64_t keys(int64_t source, int64_t owner_node,
                                           int64_t feature) const {
-    return at(source, format.node_length_per_bucket_feature(owner_node, feature));
+    return at(source, format.node_length_word(owner_node, feature));
   }
   __device__ __forceinline__ int64_t chunks(int64_t source, int64_t owner_node) const {
-    return at(source, format.chunk_length_per_bucket(owner_node));
+    return at(source, format.chunk_length_word(owner_node));
   }
   // as owner, the keys of feature `feature` of node `owner_node`'s own part
   __device__ __forceinline__ int64_t own(int64_t owner_node, int64_t feature) const {
-    return at(owner_node, format.own_length_per_feature(feature));
+    return at(owner_node, format.own_length_word(feature));
   }
 };
 
@@ -130,7 +129,8 @@ inline RailLayoutView view_of(const RailLayout &rail) {
 }
 
 // The int64 words rail_layout_of works in: per (source node, owner node) the source's node-unique
-// keys for the owner, and the offsets of every rail owner's KJT features, owner after owner.
+// keys for the owner (node_length_per_source_bucket), and the offsets of every rail owner's KJT
+// features, owner after owner.
 __host__ __device__ inline int64_t rail_layout_scratch(const Topo &topo, int64_t num_features) {
   const int64_t num_nodes = topo.num_nodes;
   return num_nodes * num_nodes + num_nodes * num_features + 1;
@@ -167,18 +167,19 @@ __device__ __forceinline__ int64_t source_offset(const RailCounts &in,
 // Every thread of a CTA of kThreads: the rail's layout (RailLayout) into `out`, from the rail's
 // count messages (`in`) and this rank's own part's lengths (own_lengths [feature][requester], the
 // node layout's). scratch: rail_layout_scratch words. A slice a proxy puts holds the owner node's
-// chunks (ChunkPiece, 16 bytes each), then its records; none to its own node. A proxy's keys of an
+// chunks (OwnerChunk, 16 bytes each), then its records; none to its own node. A proxy's keys of an
 // owner node are the sum of its keys of each feature there, as proxy_keys counts them.
 __device__ inline void rail_layout_of(const RailCounts &in, const int64_t *own_lengths,
                                       const Sizes &sizes, int64_t *scratch,
                                       const RailLayoutView &out) {
   const int64_t num_nodes = sizes.topo.num_nodes, node = sizes.topo.node,
                 local_size = sizes.topo.local_size, num_features = sizes.num_features,
-                num_sources = sizes.topo.num_sources;
+                kjt_stride = sizes.topo.kjt_stride;
   // [source][owner node]: the source's node-unique keys for the owner node, a warp each, its lanes
   // taking the features. [owner node][feature] (and the total): the offsets of each owner's KJT
   // features, owner after owner.
-  int64_t *node_keys = scratch, *feature_offsets = node_keys + num_nodes * num_nodes;
+  int64_t *node_length_per_source_bucket = scratch,
+          *feature_offsets = node_length_per_source_bucket + num_nodes * num_nodes;
   const int lane = threadIdx.x & 31;
   for (int64_t index = threadIdx.x >> 5; index < num_nodes * num_nodes; index += kWarps) {
     const int64_t source = index / num_nodes, owner_node = index % num_nodes;
@@ -187,9 +188,9 @@ __device__ inline void rail_layout_of(const RailCounts &in, const int64_t *own_l
       keys += in.keys(source, owner_node, feature);
     for (int offset = 16; offset > 0; offset >>= 1)
       keys += __shfl_xor_sync(0xffffffffu, keys, offset);
-    if (lane == 0) node_keys[index] = keys;
+    if (lane == 0) node_length_per_source_bucket[index] = keys;
   }
-  // (its first __syncthreads makes node_keys whole)
+  // (its first __syncthreads makes node_length_per_source_bucket whole)
   cta_offsets_of<int64_t>(
       num_nodes * num_features,
       [&](int64_t index) {
@@ -199,15 +200,15 @@ __device__ inline void rail_layout_of(const RailCounts &in, const int64_t *own_l
   // the bytes of the slice the proxy on `source` puts at the owner on `owner_node`
   auto slice_bytes = [&](int64_t source, int64_t owner_node) -> int64_t {
     if (source == owner_node) return 0;
-    return in.chunks(source, owner_node) * (int64_t)sizeof(ChunkPiece) +
-           node_keys[source * num_nodes + owner_node] * sizes.record_bytes;
+    return in.chunks(source, owner_node) * (int64_t)sizeof(OwnerChunk) +
+           node_length_per_source_bucket[source * num_nodes + owner_node] * sizes.record_bytes;
   };
   // the keys the owner on `owner_node` looks up: those of its own node, and
   // the node-unique keys every proxy of the rail has for it
   auto recv = [&](int64_t owner_node) {
-    int64_t keys = in.at(owner_node, CountMessage::kOwnTotal);
+    int64_t keys = in.at(owner_node, CountMessage::kOwnTotalWord);
     for (int64_t source = 0; source < num_nodes; ++source)
-      keys += node_keys[source * num_nodes + owner_node];
+      keys += node_length_per_source_bucket[source * num_nodes + owner_node];
     return keys;
   };
   // As proxy: where its slice starts at each owner (after the slices of the
@@ -227,47 +228,47 @@ __device__ inline void rail_layout_of(const RailCounts &in, const int64_t *own_l
     for (int64_t earlier = 0; earlier < source; ++earlier) start += slice_bytes(earlier, node);
     out.slice_in[2 * source] = start;
     out.slice_in[2 * source + 1] = source == node ? 0 : in.chunks(source, node);
-    out.node_length_per_source[source] = node_keys[source * num_nodes + node];
+    out.node_length_per_source[source] = node_length_per_source_bucket[source * num_nodes + node];
   }
   for (int64_t index = threadIdx.x; index < num_nodes * num_features; index += kThreads)
     out.node_length_per_source_feature[index] =
         in.keys(index / num_features, node, index % num_features);
-  // Its KJT's lengths, (feature, source) feature-major: its node's
+  // Its KJT's lengths, (feature, column) feature-major: its node's
   // requesters, then the other nodes in order. Then where each requester of
   // its node has its keys of each feature in it.
   auto kjt_length = [&](int64_t index) {
-    const int64_t feature = index / num_sources, source = index % num_sources;
-    if (source < local_size) return own_lengths[feature * local_size + source];
-    const int64_t column = source - local_size;  // the other nodes, in order
-    return in.keys(column < node ? column : column + 1, node, feature);
+    const int64_t feature = index / kjt_stride, column = index % kjt_stride;
+    if (column < local_size) return own_lengths[feature * local_size + column];
+    const int64_t other = column - local_size;  // the other nodes, in order
+    return in.keys(other < node ? other : other + 1, node, feature);
   };
-  const int64_t num_lengths = num_features * num_sources;
+  const int64_t num_lengths = num_features * kjt_stride;
   for (int64_t index = threadIdx.x; index < num_lengths; index += kThreads)
     out.kjt_lengths[index] = kjt_length(index);
   cta_offsets_of<int64_t>(num_lengths, kjt_length, out.kjt_offsets);
   for (int64_t feature = threadIdx.x; feature < num_features; feature += kThreads)
     out.length_per_key[feature] =
-        out.kjt_offsets[(feature + 1) * num_sources] - out.kjt_offsets[feature * num_sources];
+        out.kjt_offsets[(feature + 1) * kjt_stride] - out.kjt_offsets[feature * kjt_stride];
   for (int64_t index = threadIdx.x; index < local_size * num_features; index += kThreads) {
     const int64_t requester = index / num_features, feature = index % num_features;
-    out.requester_offsets[index] = out.kjt_offsets[feature * num_sources + requester];
+    out.requester_offsets[index] = out.kjt_offsets[feature * kjt_stride + requester];
   }
   // As owner, where each other node's keys of each feature start in its KJT (what that node's
   // proxy computes as its owner_offsets); as proxy, where its node's start in each other node's
   // owner's KJT (what that owner computes as its source_offsets). Its own node: 0.
   for (int64_t index = threadIdx.x; index < num_nodes * num_features; index += kThreads) {
-    const int64_t other = index / num_features, feature = index % num_features;
+    const int64_t other_node = index / num_features, feature = index % num_features;
     out.source_offsets[index] =
-        other == node ? 0 : source_offset(in, feature_offsets, node, other, feature);
+        other_node == node ? 0 : source_offset(in, feature_offsets, node, other_node, feature);
     out.owner_offsets[index] =
-        other == node ? 0 : source_offset(in, feature_offsets, other, node, feature);
+        other_node == node ? 0 : source_offset(in, feature_offsets, other_node, node, feature);
   }
   // The keys it looks up, and the most the rail needs of each capacity.
   const int64_t most_recv = cta_max<int64_t>(num_nodes, recv, 0);
   const int64_t most_remote = cta_max<int64_t>(
-      num_nodes, [&](int64_t source) { return in.at(source, CountMessage::kNeedRemote); }, 0);
+      num_nodes, [&](int64_t source) { return in.at(source, CountMessage::kNeedRemoteWord); }, 0);
   const int64_t most_key_rows = cta_max<int64_t>(
-      num_nodes, [&](int64_t source) { return in.at(source, CountMessage::kKeyRows); }, 0);
+      num_nodes, [&](int64_t source) { return in.at(source, CountMessage::kNeedKeyRowsWord); }, 0);
   if (threadIdx.x == 0) {
     *out.num_recv = recv(node);
     out.needs[kNeedLookupKeys] = most_recv;

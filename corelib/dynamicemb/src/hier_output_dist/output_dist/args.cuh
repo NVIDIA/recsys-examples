@@ -34,10 +34,10 @@ namespace hier_output_dist {
 // fwd_kernel's call.
 struct FwdArgs {
   FwdPlanView plan;
-  char *out;                  // [num_out, row] the requester's output
-  int64_t *ready;             // across nodes [local_size]: rows it pulled from each proxy (heavy
-                              // rows wait for them); the kernel zeroes it
-  unsigned long long *trace;  // [kTraceWords] this kernel's timeline, or nullptr
+  char *out;                   // [num_out, row] the requester's output
+  int64_t *pulled_from_proxy;  // across nodes [local_size]: rows it pulled from each proxy
+                               // (heavy rows wait for them); the kernel zeroes it
+  unsigned long long *trace;   // [kTraceWords] this kernel's timeline, or nullptr
 };
 
 // The backward's call (the heavy rows' kernels' and bwd_kernel's).

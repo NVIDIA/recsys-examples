@@ -192,9 +192,9 @@ InDist InChannel::input_dist(const PlanInput &input) {
     const at::Tensor headers =
         peer_gather(kGatherProxyHeader, header_gather_.peer, header_gather_.first_word)
             .view({local_size, ProxyHeader::of(sizes_).gathered_words()});
-    const PeerWords rows = remote_rows(bucketized.bucket_feature_of_row,
-                                       bucketized.offset_per_bucket, node.row_shift, sizes_);
-    at::Tensor words = peer_gather(kGatherRemoteMap, rows.peer, rows.first_word);
+    const PeerWords map_gather = remote_map_gather(
+        bucketized.bucket_feature_of_row, bucketized.offset_per_bucket, node.row_shift, sizes_);
+    at::Tensor words = peer_gather(kGatherRemoteMap, map_gather.peer, map_gather.first_word);
     const RequesterTables requester = requester_tables(
         words, headers, offset_per_owner_feature, bucketized.bucket_feature_of_row,
         bucketized.offset_per_bucket_feature, bucketized.offset_per_bucket, sizes_);
@@ -214,7 +214,7 @@ InDist InChannel::input_dist(const PlanInput &input) {
     fwd.src = requester.src;
     bwd.dst = requester.dst;
     fwd.push_order = bwd.push_order = requester.push_order;
-    fwd.proxy_chunks = bwd.proxy_chunks = requester.proxy_chunks;
+    fwd.proxy_num_chunks = bwd.proxy_num_chunks = requester.proxy_num_chunks;
     fwd.proxy_ends = bwd.proxy_ends = requester.proxy_ends;
     fwd.proxy_push_tables = bwd.proxy_push_tables = requester.proxy_push_tables;
     fwd.remote_task_offsets = bwd.remote_task_offsets = requester.remote_task_offsets;

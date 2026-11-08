@@ -478,7 +478,7 @@ struct RowPut {
 };
 
 // One kind of the in channel's messages on the rail (GIN context kCtxIn, the
-// caller's `gin`): a count message or a key stream. Every call sends each
+// caller's `gin`): a count message or a key message. Every call sends each
 // rail peer one message of each kind, which adds 1 to the peer's signal of
 // that kind for this rank's node (`sig`). So a signal counts the calls whose
 // message from that node has landed, a running total that reaches in_seq

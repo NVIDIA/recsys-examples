@@ -71,9 +71,9 @@ struct OutTimeline {
     }
   }
   // A worker's task (lane 0), started at `start`: it moved `nv` bytes over
-  // NVLink and `local` bytes of rows within this GPU.
+  // NVLink and `self` bytes of rows within this GPU.
   __device__ __forceinline__ void task(unsigned long long start, unsigned long long nv,
-                                       unsigned long long local) const {
+                                       unsigned long long self) const {
     if constexpr (kTrace) {
       unsigned long long *sm = shared();
       if (nv > 0) {
@@ -83,7 +83,7 @@ struct OutTimeline {
         atomicAdd(sm + kSmNvBytes, nv);
         add(sm + kSmBins, 0, now, nv);
       }
-      if (local > 0) atomicAdd(sm + kSmLocalBytes, local);
+      if (self > 0) atomicAdd(sm + kSmSelfBytes, self);
     }
   }
   // Rows from another node landed (`rows` more, the first ones when `first`).
@@ -92,7 +92,7 @@ struct OutTimeline {
       unsigned long long *sm = shared();
       const unsigned long long now = now_ns();
       if (first) atomicMin(sm + kSmFirstLanded, now);
-      atomicAdd(sm + kSmIbIn, rows);
+      atomicAdd(sm + kSmIbRowsIn, rows);
       add(sm + kSmBins, 1, now, rows);
     }
   }
@@ -102,14 +102,14 @@ struct OutTimeline {
     if constexpr (kTrace) {
       const unsigned long long now = now_ns();
       if (first) atomicMin(trace + kTraceFirstLanded, now);
-      atomicAdd(trace + kTraceIbIn, rows);
-      add(trace + kTraceBinNv, 1, now, rows);
+      atomicAdd(trace + kTraceIbRowsIn, rows);
+      add(trace + kTraceTimelines, 1, now, rows);
     }
   }
   // Rows put to another node (`rows` more).
   __device__ __forceinline__ void posted(unsigned long long rows) const {
     if constexpr (kTrace) {
-      atomicAdd(shared() + kSmIbOut, rows);
+      atomicAdd(shared() + kSmIbRowsOut, rows);
       add(shared() + kSmBins, 2, now_ns(), rows);
     }
   }
@@ -125,14 +125,14 @@ struct OutTimeline {
         if (sm[kSmFirstLanded] != ~0ull) atomicMin(row + kTraceFirstLanded, sm[kSmFirstLanded]);
         if (sm[kSmNvLast] != 0) atomicMax(row + kTraceNvLast, sm[kSmNvLast]);
         const int sums[4][2] = {{kSmNvBytes, kTraceNvBytes},
-                                {kSmLocalBytes, kTraceLocalBytes},
-                                {kSmIbIn, kTraceIbIn},
-                                {kSmIbOut, kTraceIbOut}};
+                                {kSmSelfBytes, kTraceSelfBytes},
+                                {kSmIbRowsIn, kTraceIbRowsIn},
+                                {kSmIbRowsOut, kTraceIbRowsOut}};
         for (int i = 0; i < 4; ++i)
           if (sm[sums[i][0]] != 0) atomicAdd(row + sums[i][1], sm[sums[i][0]]);
       }
       for (int i = threadIdx.x; i < 3 * kTraceBins; i += blockDim.x)
-        if (sm[kSmBins + i] != 0) atomicAdd(row + kTraceBinNv + i, sm[kSmBins + i]);
+        if (sm[kSmBins + i] != 0) atomicAdd(row + kTraceTimelines + i, sm[kSmBins + i]);
     }
   }
 
@@ -201,10 +201,10 @@ struct OutTables {
   __device__ __forceinline__ uint64_t *pushed_rows(int proxy, int64_t chunk) const {
     return node.peer(layout().ctrl.pushed_rows(chunk), proxy);
   }
-  __device__ __forceinline__ const uint64_t *slot_free(int proxy) const {
-    return node.peer(layout().ctrl.slot_free(), proxy);
+  __device__ __forceinline__ const uint64_t *bwd_free_end(int proxy) const {
+    return node.peer(layout().ctrl.bwd_free_end(), proxy);
   }
-  // The most of a proxy's slot_free word that this CTA's warps saw.
+  // The most of a proxy's bwd_free_end word that this CTA's warps saw.
   __device__ __forceinline__ uint64_t *free_seen(int proxy) const {
     return (uint64_t *)out_shared() + proxy;
   }
@@ -291,7 +291,7 @@ struct RowTask {
 };
 // The row tasks of the node's owners (offset_per_bucket: theirs, this rank `me`
 // of local_size): every owner gets as many as the largest block needs.
-struct LocalRows {
+struct RowTasks {
   const int64_t *offset_per_bucket;
   int local_size, me;
   __device__ __forceinline__ int64_t count() const {
@@ -322,12 +322,13 @@ struct Interleave {
   }
 };
 
-// A task of the remote tasks laid out by (chunk, proxy in turn): its entry
-// in their task offsets (offsets [entries + 1]: the tasks before each entry),
-// the entry it falls in, and its place there.
-struct RemoteTask {
+// A task's place among tasks laid out by entries, by their task offsets
+// (offsets [entries + 1]: the tasks before each entry): the entry it falls
+// in, and its place there. The remote tasks are laid out by (chunk, proxy in
+// turn), the reducers' tasks by chunk.
+struct TaskPlace {
   int64_t entry, nth;
-  __device__ __forceinline__ RemoteTask(const int64_t *offsets, int64_t entries, int64_t task)
+  __device__ __forceinline__ TaskPlace(const int64_t *offsets, int64_t entries, int64_t task)
       : entry(seg_search(offsets, (int)entries, task)), nth(task - offsets[entry]) {}
 };
 

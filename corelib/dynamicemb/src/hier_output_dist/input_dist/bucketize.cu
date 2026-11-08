@@ -211,30 +211,32 @@ __device__ __forceinline__ int64_t warp_run_end(const int32_t *sorted, int64_t n
 // position, a warp's lanes at consecutive positions. Position q starts the
 // run of row r = sorted[q] when q is 0 or sorted[q - 1] differs. Its thread
 // writes exp_off[r] = q, and for the rows between the previous run's row and
-// r, which have no original rows, exp_off q and slot -1. The rows before the
-// first run get exp_off 0 and those after the last exp_off n (exp_off[rows]
-// too), slot -1, in loops over the whole grid: index dedup leaves many rows
-// past the valid ones. With no original rows, every row is such a row.
+// r, which have no original rows, exp_off q and heavy_slot -1. The rows
+// before the first run get exp_off 0 and those after the last exp_off n
+// (exp_off[rows] too), heavy_slot -1, in loops over the whole grid: index
+// dedup leaves many rows past the valid ones. With no original rows, every
+// row is such a row.
 //
 // The run is heavy when it has more than kHeavy positions: sorted[q + kHeavy]
-// is r too (r not heavy: slot[r] = -1). Its warp takes it: the warp finds its
-// end, and the run-start thread reserves its slot and its ceil(length /
-// kHeavy) sub-tasks with one 64-bit atomicAdd of (1 << 32) | subs on the
-// counter word: the old word's high half is its slot, its low half its first
-// sub-task. So consecutive slots have consecutive sub-task ranges, and
-// first[s + 1] - first[s] counts slot s's sub-tasks (the last slot's end at
-// count[1]). The thread writes slot[r], pos (where the bucketize put r) and
-// first; then the warp writes the run's sub-tasks (r, q + t * kHeavy), 32 at
-// a time, so a row of a million original rows (15,625 sub-tasks) takes 489
-// rounds of one warp, not 15,625 stores of one thread. Slots past max_slots
-// and sub-tasks past max_subs are not written (reverse indices in [0, rows)
-// never reach them).
+// is r too (r not heavy: heavy_slot[r] = -1). Its warp takes it: the warp
+// finds its end, and the run-start thread reserves its heavy slot and its
+// ceil(length / kHeavy) sub-tasks with one 64-bit atomicAdd of
+// (1 << 32) | subs on the counter word: the old word's high half is its heavy
+// slot, its low half its first sub-task. So consecutive heavy slots have
+// consecutive sub-task ranges, and first[s + 1] - first[s] counts slot s's
+// sub-tasks (the last slot's end at count[1]). The thread writes
+// heavy_slot[r], pos (where the bucketize put r) and first; then the warp
+// writes the run's sub-tasks (r, q + t * kHeavy), 32 at a time, so a row of
+// a million original rows (15,625 sub-tasks) takes 489 rounds of one warp,
+// not 15,625 stores of one thread. Heavy slots past max_heavy_slots and
+// sub-tasks past max_subs are not written (reverse indices in [0, rows) never
+// reach them).
 //
-// The heavy rows' slots are so numbered in the order their runs reserve them,
+// The heavy slots are so numbered in the order their runs reserve them,
 // which can differ between two calls on the same rows. No sum depends on the
 // numbering: a row's sub-tasks stay consecutive and in original-row order, so
 // the backward adds up each heavy row's original rows in the same order
-// whatever its slot, and the gradient keeps its bits.
+// whatever its heavy slot, and the gradient keeps its bits.
 //
 // count ([heavy rows, sub-tasks]) is the counter once every run reserved:
 // each CTA, once its threads are done, takes a ticket (words[1]), and the
@@ -247,21 +249,21 @@ __device__ __forceinline__ int64_t warp_run_end(const int32_t *sorted, int64_t n
 // ticket], 0 when the kernel starts (kFanoutWords).
 __global__ void __launch_bounds__(kThreads)
     fanout_runs_kernel(const int32_t *sorted, int64_t n, int64_t rows, const int32_t *position_of,
-                       int64_t max_slots, int64_t max_subs, int32_t *exp_off, int32_t *slot,
-                       int32_t *pos, int32_t *first, int64_t *sub, int64_t *count,
-                       unsigned long long *words) {
+                       int64_t max_heavy_slots, int64_t max_subs, int32_t *exp_off,
+                       int32_t *heavy_slot, int32_t *pos, int32_t *first, int64_t *sub,
+                       int64_t *count, unsigned long long *words) {
   const int lane = threadIdx.x & 31;
   // the rows before the first run and after the last
   const int64_t head = n > 0 ? min(max((int64_t)sorted[0], (int64_t)0), rows + 1) : rows + 1;
   for (int64_t row = first_item(); row < head; row += item_stride()) {
     exp_off[row] = 0;
-    if (row < rows) slot[row] = -1;
+    if (row < rows) heavy_slot[row] = -1;
   }
   const int64_t tail =
       n > 0 ? min(max((int64_t)sorted[n - 1] + 1, (int64_t)0), rows + 1) : rows + 1;
   for (int64_t row = tail + first_item(); row <= rows; row += item_stride()) {
     exp_off[row] = (int32_t)n;
-    if (row < rows) slot[row] = -1;
+    if (row < rows) heavy_slot[row] = -1;
   }
   // a warp's positions at a time, so every lane takes part in its heavy runs
   for (int64_t base = first_item() - lane; base < n; base += item_stride()) {
@@ -275,11 +277,11 @@ __global__ void __launch_bounds__(kThreads)
         const int64_t from = q == 0 ? row : (int64_t)sorted[q - 1] + 1;
         for (int64_t gap = max(from, (int64_t)0); gap <= min((int64_t)row, rows); ++gap) {
           exp_off[gap] = (int32_t)q;
-          if (gap < row && gap < rows) slot[gap] = -1;
+          if (gap < row && gap < rows) heavy_slot[gap] = -1;
         }
         if (row >= 0 && row < rows) {
           heavy = q + kHeavy < n && sorted[q + kHeavy] == row;
-          if (!heavy) slot[row] = -1;
+          if (!heavy) heavy_slot[row] = -1;
         }
       }
     }
@@ -292,11 +294,11 @@ __global__ void __launch_bounds__(kThreads)
       unsigned long long reserved = 0;
       if (lane == starter) {
         reserved = atomicAdd(&words[0], (1ull << 32) | (unsigned long long)subs);
-        const int64_t heavy_slot = (int64_t)(reserved >> 32);
-        slot[run_row] = (int32_t)heavy_slot;
-        if (heavy_slot < max_slots) {
-          pos[heavy_slot] = position_of[run_row];
-          first[heavy_slot] = (int32_t)(reserved & 0xffffffffull);
+        const int64_t run_slot = (int64_t)(reserved >> 32);
+        heavy_slot[run_row] = (int32_t)run_slot;
+        if (run_slot < max_heavy_slots) {
+          pos[run_slot] = position_of[run_row];
+          first[run_slot] = (int32_t)(reserved & 0xffffffffull);
         }
       }
       const int64_t first_sub =
@@ -461,7 +463,8 @@ FanoutTables fanout_tables(const at::Tensor &reverse_indices, const at::Tensor &
                                    words.numel() == kFanoutWords),
               "hier_output_dist: the fan-out's words must be ", kFanoutWords,
               " contiguous int64 on the GPU of inv");
-  const int64_t max_slots = originals / (kHeavy + 1) + 1, max_subs = 2 * originals / kHeavy + 2;
+  const int64_t max_heavy_slots = originals / (kHeavy + 1) + 1,
+                max_subs = 2 * originals / kHeavy + 2;
   const auto long_options = inv.options().dtype(at::kLong);
   const auto int_options = inv.options().dtype(at::kInt);
   const cudaStream_t stream = current_stream();
@@ -470,35 +473,36 @@ FanoutTables fanout_tables(const at::Tensor &reverse_indices, const at::Tensor &
   // sort of the reverse indices, which keeps them in increasing order (the
   // sort's inputs live until it is done)
   const at::Tensor position_of = at::empty({rows}, int_options);
-  at::Tensor sorted_row;
+  at::Tensor sorted_dedup_row;
   {
-    const at::Tensor original_row = at::empty({originals}, int_options);
+    const at::Tensor dedup_row = at::empty({originals}, int_options);
     const at::Tensor index = at::empty({originals}, int_options);
     const int64_t items = std::max(originals, rows);
     if (items > 0) {
       original_rows_kernel<<<item_grid(items), kThreads, 0, stream>>>(
           reverse_indices.data_ptr<int64_t>(), originals, inv.data_ptr<int32_t>(), rows,
-          original_row.data_ptr<int32_t>(), index.data_ptr<int32_t>(),
+          dedup_row.data_ptr<int32_t>(), index.data_ptr<int32_t>(),
           position_of.data_ptr<int32_t>());
       C10_CUDA_KERNEL_LAUNCH_CHECK();
     }
-    std::tie(sorted_row, fanout.exp_idx) = sort_pairs(original_row, index, bits_for(rows));
+    std::tie(sorted_dedup_row, fanout.exp_idx) = sort_pairs(dedup_row, index, bits_for(rows));
   }
   // the runs of the sorted rows, in one kernel: exp_off, and the heavy rows'
   // slots and sub-tasks, numbered in the order the kernel reserves them
   // (fanout_runs_kernel); the hook's call gets words of its own
   fanout.exp_off = at::empty({rows + 1}, int_options);
-  fanout.slot = at::empty({rows}, int_options);
+  fanout.heavy_slot = at::empty({rows}, int_options);
   fanout.sub = at::empty({2 * max_subs}, long_options);
   fanout.count = at::empty({2}, long_options);
-  fanout.pos = at::empty({max_slots}, int_options);
-  fanout.first = at::empty({max_slots}, int_options);
+  fanout.pos = at::empty({max_heavy_slots}, int_options);
+  fanout.first = at::empty({max_heavy_slots}, int_options);
   const at::Tensor counter = words.defined() ? words : at::zeros({kFanoutWords}, long_options);
   fanout_runs_kernel<<<item_grid(std::max(originals, rows + 1)), kThreads, 0, stream>>>(
-      sorted_row.data_ptr<int32_t>(), originals, rows, position_of.data_ptr<int32_t>(), max_slots,
-      max_subs, fanout.exp_off.data_ptr<int32_t>(), fanout.slot.data_ptr<int32_t>(),
-      fanout.pos.data_ptr<int32_t>(), fanout.first.data_ptr<int32_t>(),
-      fanout.sub.data_ptr<int64_t>(), fanout.count.data_ptr<int64_t>(),
+      sorted_dedup_row.data_ptr<int32_t>(), originals, rows, position_of.data_ptr<int32_t>(),
+      max_heavy_slots, max_subs, fanout.exp_off.data_ptr<int32_t>(),
+      fanout.heavy_slot.data_ptr<int32_t>(), fanout.pos.data_ptr<int32_t>(),
+      fanout.first.data_ptr<int32_t>(), fanout.sub.data_ptr<int64_t>(),
+      fanout.count.data_ptr<int64_t>(),
       reinterpret_cast<unsigned long long *>(counter.data_ptr<int64_t>()));
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   return fanout;

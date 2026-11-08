@@ -66,7 +66,7 @@ T *data_or_null(const at::Tensor &tensor) {
 }
 
 // A tensor of int32 (or int64) words as the records it holds (Chunk,
-// ChunkPiece, PutSeg: whole words).
+// OwnerChunk, PutSeg: whole words).
 template <typename Record>
 Record *records_of(const at::Tensor &table) {
   static_assert(sizeof(Record) % 4 == 0, "a record is whole int32 words");

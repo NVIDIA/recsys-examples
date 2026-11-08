@@ -14,10 +14,10 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 # See the License for the specific language governing permissions and
 # limitations under the License.
 ******************************************************************************/
-// The output dist's backward: its row sums, the kernel for the heavy rows'
-// sums (bwd_heavy_kernel), the requester's pushes, the proxy's reducer, the
-// GIN warps (the proxy's issuer and the landing watcher), and the backward
-// kernel (bwd_kernel).
+// The output dist's backward: its row sums, the kernels for the heavy rows'
+// sums (bwd_heavy_partial_kernel, bwd_heavy_sum_kernel), the requester's
+// pushes, the proxy's reducer, the GIN warps (the proxy's issuer and the
+// landing watcher), and the backward kernel (bwd_kernel).
 #pragma once
 
 #include <nccl_device.h>
@@ -146,18 +146,18 @@ __device__ __forceinline__ void scaled_copy_rows(const char *src, char *dst, int
 
 // Vector `col` (when `live`) of a key's `count` rows in this rank's
 // proxy_rows (`rows`): its row `key_row`, then its duplicates' slots from
-// `duplicates` on, summed in fp32 in that order into acc, 8 rows' loads in
-// flight.
+// `first_duplicate_slot` on, summed in fp32 in that order into acc, 8 rows'
+// loads in flight.
 template <typename RowT>
 __device__ __forceinline__ void sum_key_rows(const RowsLayout &rows, int64_t key_row,
-                                             int64_t duplicates, int64_t count, int col, bool live,
-                                             float *acc) {
+                                             int64_t first_duplicate_slot, int64_t count, int col,
+                                             bool live, float *acc) {
   constexpr int kValues = Vec16<RowT>::kValues;
   for (int64_t first = 0; first < count; first += 8) {
     int4 vecs[8];
 #pragma unroll
     for (int step = 0; step < 8; ++step) {
-      const int64_t row = first + step, slot = row == 0 ? key_row : duplicates + row - 1;
+      const int64_t row = first + step, slot = row == 0 ? key_row : first_duplicate_slot + row - 1;
       vecs[step] = row < count && live ? __ldcg((const int4 *)rows.proxy_row(slot) + col)
                                        : make_int4(0, 0, 0, 0);
     }
@@ -176,22 +176,24 @@ __device__ __forceinline__ void sum_key_rows(const RowsLayout &rows, int64_t key
 // The backward's sums of index dedup's heavy rows, before the backward kernel
 // when the call has heavy rows. A heavy row (more than kHeavy original rows)
 // has a sub-task per kHeavy of its original rows. Two kernels:
-//   bwd_heavy_kernel      each sub-task sums its original rows in fp32, in
-//                         order, into an fp32 partial of its own (partial,
-//                         [heavy_subs][dim] fp32). A group of lanes takes a
-//                         sub-task: as many lanes as a row has 16-byte
-//                         vectors, at most 32 (heavy_group_lanes), so a warp
-//                         takes several sub-tasks of narrow rows at once.
-//   bwd_heavy_sum_kernel  a CTA per heavy row adds the row's partials, in
-//                         sub-task order, into its first one: the row's sum,
-//                         which the backward kernel's task of the row reads,
-//                         scales and rounds once. A thread takes a value of
-//                         the row and keeps kSumDepth partials in flight.
+//   bwd_heavy_partial_kernel  each sub-task sums its original rows in fp32,
+//                             in order, into an fp32 partial of its own
+//                             (partial, [heavy_subs][dim] fp32). A group of
+//                             lanes takes a sub-task: as many lanes as a row
+//                             has 16-byte vectors, at most 32
+//                             (heavy_group_lanes), so a warp takes several
+//                             sub-tasks of narrow rows at once.
+//   bwd_heavy_sum_kernel      a CTA per heavy row adds the row's partials, in
+//                             sub-task order, into its first one: the row's
+//                             sum, which the backward kernel's task of the
+//                             row reads, scales and rounds once. A thread
+//                             takes a value of the row and keeps kSumDepth
+//                             partials in flight.
 // The kernel boundary orders the two. Neither waits for a peer, and both can
 // use all SMs. Each sum keeps its order, so the gradient does not change.
 
-// Lanes of a sub-task in bwd_heavy_kernel, for rows of `vec` 16-byte vectors:
-// the power of 2 at or above vec, at most 32.
+// Lanes of a sub-task in bwd_heavy_partial_kernel, for rows of `vec` 16-byte
+// vectors: the power of 2 at or above vec, at most 32.
 __host__ __device__ inline int heavy_group_lanes(int vec) {
   int lanes = 1;
   while (lanes < vec && lanes < 32) lanes *= 2;
@@ -208,7 +210,7 @@ constexpr int kSumThreads = 128;
 // takes the op's sizes and the call (args: the fan-out table, the gradient
 // and partial).
 template <typename RowT>
-__global__ void __launch_bounds__(kThreads) bwd_heavy_kernel(Sizes sizes, BwdArgs args) {
+__global__ void __launch_bounds__(kThreads) bwd_heavy_partial_kernel(Sizes sizes, BwdArgs args) {
   constexpr int kValues = Vec16<RowT>::kValues;
   const Fanout &fanout = args.plan.fanout;
   const int vec = sizes.row_vecs(), dim = vec * kValues, lanes = heavy_group_lanes(vec);
@@ -232,10 +234,11 @@ __global__ void __launch_bounds__(kThreads) bwd_heavy_kernel(Sizes sizes, BwdArg
 // the values tid, tid + kSumThreads, ... of the rows.
 __global__ void __launch_bounds__(kSumThreads) bwd_heavy_sum_kernel(BwdArgs args, int dim) {
   const Fanout &fanout = args.plan.fanout;
-  const int64_t slots = fanout.count[0], subs = fanout.count[1];
-  for (int64_t slot = blockIdx.x; slot < slots; slot += gridDim.x) {
-    const int64_t first = fanout.first[slot];
-    const int64_t num_subs = (slot + 1 < slots ? (int64_t)fanout.first[slot + 1] : subs) - first;
+  const int64_t heavy_slots = fanout.count[0], subs = fanout.count[1];
+  for (int64_t heavy_slot = blockIdx.x; heavy_slot < heavy_slots; heavy_slot += gridDim.x) {
+    const int64_t first = fanout.first[heavy_slot];
+    const int64_t num_subs =
+        (heavy_slot + 1 < heavy_slots ? (int64_t)fanout.first[heavy_slot + 1] : subs) - first;
     float *sums = args.partial + first * dim;
     for (int col = threadIdx.x; col < dim; col += kSumThreads) {
       float acc = __ldcg(sums + col);
@@ -263,12 +266,12 @@ __global__ void __launch_bounds__(kSumThreads) bwd_heavy_sum_kernel(BwdArgs args
 //     in stream order;
 //   - local: the row tasks of the node's owners.
 // A task sums each of its rows over its original rows, or for a heavy row
-// takes its sum from bwd_heavy_kernel, and stores it where the row goes. A
-// warp takes the next remote task when it is ready (a push whose rows of the
-// ring are free), else a local task: the pushes feed the proxies' NICs as
+// takes its sum from bwd_heavy_sum_kernel, and stores it where the row goes.
+// A warp takes the next remote task when it is ready (a push whose rows of
+// the ring are free), else a local task: the pushes feed the proxies' NICs as
 // fast as their rings free rows, while the local rows fill the time between.
 // A push into a chunk whose rows are past the ring's first lap waits until
-// the proxy freed them (slot_free), which needs only the pushes of earlier
+// the proxy freed them (bwd_free_end), which needs only the pushes of earlier
 // chunks, earlier in the remote queue. The kernel runs the task loop
 // (bwd_kernel); these functions are its steps.
 
@@ -284,8 +287,8 @@ struct ProxyPush {
 // Before a push into chunk `chunk` of a proxy's stream: rows of the ring's
 // first lap (the stream's positions below num_proxy_rows) are free from the
 // start (the previous out kernel was done with proxy_rows before this one's
-// entry); the chunk's are free once the proxy freed the rows of its stream
-// up to the chunk's end (slot_free), when the NIC had read the sums of the
+// entry); the chunk's are free once the proxy freed the rows of its stream up
+// to the chunk's end (bwd_free_end), when the NIC had read the sums of the
 // chunks there before. What one warp of the CTA saw is kept for the others
 // (free_seen), so most tasks read no word of the proxy. seq: the backward's
 // out_seq. Every lane of the warp.
@@ -295,11 +298,11 @@ __device__ __forceinline__ void wait_free_warp(const Sizes &sizes, int64_t seq,
   const int64_t end = tables.plan.proxy_end(proxy, chunk);
   if (end <= sizes.num_proxy_rows) return;
   if (lane == 0) {
-    const uint64_t want = tag_of(seq, (uint64_t)end);
+    const uint64_t want = tagged(seq, (uint64_t)end);
     if (ld_acquire_cta(tables.free_seen(proxy)) < want) {
       Spin spin(sizes.timeout_ns);
       uint64_t word;
-      while ((word = ld_acquire_sys(tables.slot_free(proxy))) < want)
+      while ((word = ld_acquire_sys(tables.bwd_free_end(proxy))) < want)
         spin.pause("rows of a proxy's ring", proxy, chunk, sizes.topo.rank);
       red_max_release_cta(tables.free_seen(proxy), word);
     }
@@ -313,9 +316,9 @@ __device__ __forceinline__ bool rows_free_lane(const Sizes &sizes, int64_t seq,
                                                const OutTables &tables, int proxy, int64_t chunk) {
   const int64_t end = tables.plan.proxy_end(proxy, chunk);
   if (end <= sizes.num_proxy_rows) return true;
-  const uint64_t want = tag_of(seq, (uint64_t)end);
+  const uint64_t want = tagged(seq, (uint64_t)end);
   if (ld_acquire_cta(tables.free_seen(proxy)) >= want) return true;
-  const uint64_t word = ld_acquire_sys(tables.slot_free(proxy));
+  const uint64_t word = ld_acquire_sys(tables.bwd_free_end(proxy));
   if (word < want) return false;
   red_max_release_cta(tables.free_seen(proxy), word);
   return true;
@@ -333,7 +336,7 @@ __device__ __forceinline__ void count_pushed_warp(const OutTables &tables, int p
 // Each lane's `dst` gets the gradient of its deduplicated row `dedup_row`,
 // the sum over its original rows: rows of one original row (most) in one
 // warp copy, those of 2..kHeavy then one at a time, and heavy ones from
-// their sums (bwd_heavy_kernel). Every lane of the warp.
+// their sums (bwd_heavy_sum_kernel). Every lane of the warp.
 template <typename RowT>
 __device__ void push_rows_warp(const Sizes &sizes, const BwdArgs &args, int64_t dedup_row,
                                char *dst, int num_rows, int lane) {
@@ -364,7 +367,8 @@ __device__ void push_rows_warp(const Sizes &sizes, const BwdArgs &args, int64_t 
       continue;
     }
     // a heavy row: its sum is its first partial
-    const float *sum = args.partial + (int64_t)fanout.first[fanout.slot[lane_dedup_row]] * dim;
+    const float *sum =
+        args.partial + (int64_t)fanout.first[fanout.heavy_slot[lane_dedup_row]] * dim;
     for (int col = lane; col < vec; col += 32) {
       float acc[Vec16<RowT>::kValues];
       sum_fp32<Vec16<RowT>::kValues>(sum, 1, dim, col, acc);
@@ -378,7 +382,7 @@ __device__ void push_rows_warp(const Sizes &sizes, const BwdArgs &args, int64_t 
 __device__ __forceinline__ void remote_push(const Sizes &sizes, const BwdPlanView &plan,
                                             int64_t remote_task, ProxyPush &push) {
   const int local_size = sizes.topo.local_size, me = sizes.topo.local_rank;
-  const RemoteTask place(plan.remote_task_offsets, plan.max_chunks * local_size, remote_task);
+  const TaskPlace place(plan.remote_task_offsets, plan.max_chunks * local_size, remote_task);
   push.chunk = place.entry / local_size;
   push.proxy = (int)((me + place.entry % local_size) % local_size);
   push.nth = place.nth;
@@ -419,13 +423,12 @@ __device__ __forceinline__ void push_rows_task_warp(const Sizes &sizes, int64_t 
 // lookup_rows. Every lane of the warp.
 template <typename RowT>
 __device__ __forceinline__ void local_push_warp(const Sizes &sizes, const BwdArgs &args,
-                                                const OutTables &tables,
-                                                const LocalRows &local_rows, int64_t index,
-                                                int lane) {
+                                                const OutTables &tables, const RowTasks &row_tasks,
+                                                int64_t index, int lane) {
   const BwdPlanView &plan = args.plan;
   const int me = sizes.topo.local_rank, row_bytes = sizes.row_bytes;
   const OutTimeline timeline{args.trace, sizes.topo.local_size};
-  const RowTask job = local_rows.task(index);
+  const RowTask job = row_tasks.task(index);
   if (job.count == 0) return;
   const int num_rows = job.count;
   int64_t dedup_row = 0;
@@ -480,7 +483,7 @@ __device__ void ProxyReducer<RowT>::run(ncclWindow_t window, const Sizes &sizes,
   const TaskQueue queue{layout.ctrl.task(kQueueReduce)};
   for (int64_t task = queue.next_warp(); task < total; task = queue.next_warp()) {
     // The task: keys [key_lo + sub * 32, ...) of its chunk, at most 32.
-    const RemoteTask place(plan.reduce_task_offsets, plan.max_chunks, task);
+    const TaskPlace place(plan.reduce_task_offsets, plan.max_chunks, task);
     const Chunk chunk = plan.chunks[place.entry];
     const int64_t uniq_lo = chunk.key_lo + place.nth * kTaskRows;
     const int num_keys = (int)min((int64_t)kTaskRows, (int64_t)chunk.key_lo + chunk.keys - uniq_lo);
@@ -490,13 +493,13 @@ __device__ void ProxyReducer<RowT>::run(ncclWindow_t window, const Sizes &sizes,
     // the chunk's keys' rows and the duplicates of the chunk's keys before
     // it). Then the wait for the rows of the chunk.
     const int64_t at = (int64_t)chunk.start % sizes.num_proxy_rows;
-    int64_t count = 0, key_row = 0, duplicates = 0;
+    int64_t count = 0, key_row = 0, first_duplicate_slot = 0;
     if (lane < num_keys) {
       const int64_t key = uniq_lo + lane, before = key - chunk.key_lo;
       const int64_t begin = plan.node_exp_off[key];
       count = plan.node_exp_off[key + 1] - begin;
       key_row = at + before;
-      duplicates = at + chunk.keys + begin - plan.node_exp_off[chunk.key_lo] - before;
+      first_duplicate_slot = at + chunk.keys + begin - plan.node_exp_off[chunk.key_lo] - before;
     }
     if (lane == 0) {
       const uint64_t *pushed = layout.ctrl.pushed_rows(place.entry);
@@ -511,13 +514,14 @@ __device__ void ProxyReducer<RowT>::run(ncclWindow_t window, const Sizes &sizes,
     for (unsigned many = __ballot_sync(kFull, count > 1); many; many &= many - 1) {
       const int src_lane = __ffs(many) - 1;
       const int64_t lane_row = __shfl_sync(kFull, key_row, src_lane),
-                    lane_duplicates = __shfl_sync(kFull, duplicates, src_lane),
+                    lane_first_duplicate_slot = __shfl_sync(kFull, first_duplicate_slot, src_lane),
                     lane_count = __shfl_sync(kFull, count, src_lane);
       char *dst = layout.rows.proxy_row(lane_row);
       for (int col_base = 0; col_base < vec; col_base += 32) {
         const int col = col_base + lane;
         float acc[Vec16<RowT>::kValues];
-        sum_key_rows<RowT>(layout.rows, lane_row, lane_duplicates, lane_count, col, col < vec, acc);
+        sum_key_rows<RowT>(layout.rows, lane_row, lane_first_duplicate_slot, lane_count, col,
+                           col < vec, acc);
         if (col < vec) *((int4 *)dst + col) = Vec16<RowT>::pack(acc);
       }
     }
@@ -549,19 +553,20 @@ struct ChunkReady {
 
 // The chunks of an owner node's put list that the issuer polls in a pass, at
 // most: the bits of a mask.
-constexpr int kIssueWindow = 8;
+constexpr int kIssueLookahead = 8;
 
-// The window of an owner node's put list in a pass: at most kIssueWindow
-// chunks (a chunk's segments are consecutive) from the first segment not yet
-// put (done), each below `limit`. Bit i of `ready`: the i-th chunk is ready
-// to put, as the reducers counted all its keys (Chunk::keys) ready; of
-// `put_before`: it was put in an earlier pass. The loads of the ready words
-// are relaxed: the caller makes a fence after them before it puts.
-__device__ __forceinline__ void poll_window(const BwdPlanView &plan, const int64_t *ready_words,
-                                            int64_t done, int64_t end, int64_t limit,
-                                            unsigned &ready, unsigned &put_before) {
+// The look-ahead of an owner node's put list in a pass: at most
+// kIssueLookahead chunks (a chunk's segments are consecutive) from the first
+// segment not yet put (done), each below `limit`. Bit i of `ready`: the i-th
+// chunk is ready to put, as the reducers counted all its keys (Chunk::keys)
+// ready; of `put_before`: it was put in an earlier pass. The loads of the
+// ready words are relaxed: the caller makes a fence after them before it
+// puts.
+__device__ __forceinline__ void poll_lookahead(const BwdPlanView &plan, const int64_t *ready_words,
+                                               int64_t done, int64_t end, int64_t limit,
+                                               unsigned &ready, unsigned &put_before) {
   int64_t seg = done;
-  for (int i = 0; i < kIssueWindow && seg < end; ++i) {
+  for (int i = 0; i < kIssueLookahead && seg < end; ++i) {
     const int32_t chunk = plan.put_list[seg].chunk;
     if (chunk >= limit) break;
     const ChunkReady state{ld_relaxed_sys((const uint64_t *)&ready_words[chunk])};
@@ -574,18 +579,19 @@ __device__ __forceinline__ void poll_window(const BwdPlanView &plan, const int64
   }
 }
 
-// After the fence, the puts of the window's ready chunks (poll_window's
-// masks; one lane, `ready` not 0): all the segments of each such chunk, each
-// adding its rows to the owner's bwd_rows signal, then the chunk's posted
-// bit. When the stream wraps, each put also counts on the counter of its
-// chunk, and posted(counter) counts the puts. Returns where the segments not
-// yet put start: done moves over the first chunks of the window, as long as
-// they are put. The put list's places are int32 (put_offsets).
-__device__ __forceinline__ int64_t post_window(const RowPut &put, const BwdPlanView &plan,
-                                               const BwdArgs &args, const CtrlLayout &ctrl,
-                                               const OutTimeline &timeline, int owner_node,
-                                               int64_t done, int64_t end, unsigned ready,
-                                               unsigned put_before, bool wraps, int counters) {
+// After the fence, the puts of the look-ahead's ready chunks
+// (poll_lookahead's masks; one lane, `ready` not 0): all the segments of each
+// such chunk, each adding its rows to the owner's bwd_rows signal, then the
+// chunk's posted bit. When the stream wraps, each put also counts on the
+// counter of its chunk, and posted(counter) counts the puts. Returns where
+// the segments not yet put start: done moves over the first chunks of the
+// look-ahead, as long as they are put. The put list's places are int32
+// (put_offsets).
+__device__ __forceinline__ int64_t post_lookahead(const RowPut &put, const BwdPlanView &plan,
+                                                  const BwdArgs &args, const CtrlLayout &ctrl,
+                                                  const OutTimeline &timeline, int owner_node,
+                                                  int64_t done, int64_t end, unsigned ready,
+                                                  unsigned put_before, bool wraps, int counters) {
   const int prefix = ballot_run(ready | put_before);  // the first chunks, which are all put
   const int walk = max(32 - __clz(ready), prefix);    // the chunks to walk over
   const int last = (int)end;
@@ -617,26 +623,27 @@ __device__ __forceinline__ int64_t post_window(const RowPut &put, const BwdPlanV
 // into its lookup_rows, if the previous kernel (a backward too) could not:
 // its lookup_grad was still live. Then, for each owner node once the owner
 // there let it (bwd_ready), it puts that node's chunks, each once the
-// reducers counted all its keys ready and it is within kIssueWindow chunks
+// reducers counted all its keys ready and it is within kIssueLookahead chunks
 // of the first chunk not yet put. It polls the owner nodes in turn and waits
 // for no single one; its place in each one's segments is in this rank's
-// put_at words. In a pass each lane polls the window of its owner node
-// (poll_window, relaxed loads); then the warp makes one system fence if a
+// put_at words. In a pass each lane polls the look-ahead of its owner node
+// (poll_lookahead, relaxed loads); then the warp makes one system fence if a
 // lane found a ready chunk, and each lane puts the ready chunks of its
-// window in list order (post_window): each one's segments from proxy_rows to
-// their rows of the owner's lookup_rows. So chunks go out of order only
-// within the window. With more than 32 nodes, the lanes take 32 owner nodes
-// at a time, with a fence for each 32. When the stream wraps the ring, each
-// put also counts on the put counter of its chunk (chunk % counters) once
-// the NIC has read it, and a chunk is put only within `counters` chunks of
-// the first not yet read, so no two chunks in flight share a counter. At the
-// end of a pass the warp then marks chunks read in order, lane i the i-th
-// from the first not yet read, once their puts are posted and their counter
-// reaches the puts posted on it, and lane 0 frees the rows of the stream
-// they hold (slot_free), one store for the pass. Once the NIC has read
-// proxy_rows (no wrap: the warp's flush, as in the forward; a wrap: every
-// chunk read), the lanes grant each rail owner the ring's rows of the next
-// kernel's stream, and the warp flushes the credits' context.
+// look-ahead in list order (post_lookahead): each one's segments from
+// proxy_rows to their rows of the owner's lookup_rows. So chunks go out of
+// order only within the look-ahead. With more than 32 nodes, the lanes take
+// 32 owner nodes at a time, with a fence for each 32. When the stream wraps
+// the ring, each put also counts on the put counter of its chunk
+// (chunk % counters) once the NIC has read it, and a chunk is put only
+// within `counters` chunks of the first not yet read, so no two chunks in
+// flight share a counter. At the end of a pass the warp then marks chunks
+// read in order, lane i the i-th from the first not yet read, once their
+// puts are posted and their counter reaches the puts posted on it, and
+// lane 0 frees the rows of the stream they hold (bwd_free_end), one store
+// for the pass. Once the NIC has read proxy_rows (no wrap: the warp's flush,
+// as in the forward; a wrap: every chunk read), the lanes grant each rail
+// owner the ring's rows of the next kernel's stream, and the warp flushes
+// the credits' context.
 struct ProxyIssuer {
   // Every lane of the issuer warp, in backward seq.
   template <ncclGinType_t kGin>
@@ -688,13 +695,13 @@ __device__ void ProxyIssuer::run(ncclWindow_t window, const ncclDevComm &dev, co
     for (int base = 0; base < num_nodes; base += 32) {
       const int owner_node = base + lane;
       int64_t done = 0, end = 0;           // the owner node's segments: those before done are put
-      unsigned ready = 0, put_before = 0;  // its window's chunks (poll_window)
+      unsigned ready = 0, put_before = 0;  // its look-ahead's chunks (poll_lookahead)
       if (owner_node < num_nodes && owner_node != node) {
         done = *layout.ctrl.put_at(owner_node);
         end = plan.bwd_put_offset(owner_node + 1);
         if (done < end &&
             (int64_t)credits.read_relaxed(sig_bwd_ready(num_nodes, owner_node)) >= seq)
-          poll_window(plan, args.ready, done, end, limit, ready, put_before);
+          poll_lookahead(plan, args.ready, done, end, limit, ready, put_before);
       }
       // One system fence for the warp when a lane found a ready chunk: the
       // acquire of the relaxed polls above (the credit and the ready words),
@@ -703,8 +710,8 @@ __device__ void ProxyIssuer::run(ncclWindow_t window, const ncclDevComm &dev, co
       if (ready != 0) {
         if (first) timeline.stamp_earliest(kTraceFirstPut);
         first = false;
-        done = post_window(put, plan, args, layout.ctrl, timeline, owner_node, done, end, ready,
-                           put_before, wraps, (int)counters);
+        done = post_lookahead(put, plan, args, layout.ctrl, timeline, owner_node, done, end, ready,
+                              put_before, wraps, (int)counters);
         *layout.ctrl.put_at(owner_node) = done;
         moved = true;
       }
@@ -715,7 +722,7 @@ __device__ void ProxyIssuer::run(ncclWindow_t window, const ncclDevComm &dev, co
     // the i-th from the first not yet read (its puts posted, and its counter
     // at the puts posted on it). Only the lanes below `counters` look, so no
     // two of them read one counter. Then lane 0 frees the rows of the stream
-    // they hold (slot_free), one store for the pass. The counter reads are
+    // they hold (bwd_free_end), one store for the pass. The counter reads are
     // relaxed: the __syncwarp orders them before lane 0's release.
     if (wraps) {
       const int64_t chunk = read + lane;
@@ -734,7 +741,7 @@ __device__ void ProxyIssuer::run(ncclWindow_t window, const ncclDevComm &dev, co
           const int64_t free_end = (read < count ? (int64_t)plan.chunks[read].start
                                                  : (int64_t)plan.chunks[count - 1].end) +
                                    ring;
-          st_release_sys(layout.ctrl.slot_free(), tag_of(seq, (uint64_t)free_end));
+          st_release_sys(layout.ctrl.bwd_free_end(), tagged(seq, (uint64_t)free_end));
         }
         moved = true;
       }
@@ -757,7 +764,7 @@ __device__ void ProxyIssuer::run(ncclWindow_t window, const ncclDevComm &dev, co
   __syncwarp();
   for (int owner_node = lane; owner_node < num_nodes; owner_node += 32)
     if (owner_node != node)
-      credits.raise(owner_node, sig_grant(node), tag_of(seq + 1, (uint64_t)ring),
+      credits.raise(owner_node, sig_grant(node), tagged(seq + 1, (uint64_t)ring),
                     layout.ctrl.grant_sent(owner_node));
   __syncwarp();
   credits.flush_warp();
@@ -830,7 +837,7 @@ __device__ void LandingWatcher::run(ncclWindow_t window, const ncclDevComm &dev,
     if (__shfl_sync(kFull, rest, 0)) break;
     spin.pause("gradient rows of the proxy nodes", lane, (long long)need, sizes.topo.rank);
   }
-  timeline.shared()[kSmLanded + lane] = seen;
+  timeline.shared()[kSmWatcherSeen + lane] = seen;
 }
 
 template <ncclGinType_t kGin>
@@ -838,7 +845,7 @@ __device__ void LandingWatcher::rest(ncclWindow_t window, const ncclDevComm &dev
                                      const Sizes &sizes, const BwdArgs &args, int lane) {
   const OutTimeline timeline{args.trace, sizes.topo.local_size};
   ncclGin rows = gin_context<kGin>(dev, kCtxBwd);
-  uint64_t seen = timeline.shared()[kSmLanded + lane], got = 0, need = 0;
+  uint64_t seen = timeline.shared()[kSmWatcherSeen + lane], got = 0, need = 0;
   lane_landed_rows(window, sizes, args, rows, lane, got, need);
   if (seen >= need) return;
   Spin spin(sizes.timeout_ns);
@@ -862,10 +869,10 @@ __device__ void LandingWatcher::rest(ncclWindow_t window, const ncclDevComm &dev
 // once, so nothing is zeroed and nothing scattered. A row's gradient is
 // first summed over its original rows (index dedup's fan-in), in fp32 and in
 // the fan-out's order, which is fixed (increasing original row); a heavy
-// row's sum comes from bwd_heavy_kernel, which ran before, in that order too.
-// Under TorchRec's gradient division it is then multiplied by 1 / world_size
-// in fp32 and rounded once to the row dtype, which is what TorchRec's
-// div_(world_size) at the owner computes.
+// row's sum comes from bwd_heavy_sum_kernel, which ran before, in that order
+// too. Under TorchRec's gradient division it is then multiplied by
+// 1 / world_size in fp32 and rounded once to the row dtype, which is what
+// TorchRec's div_(world_size) at the owner computes.
 //   same-node owner: into its lookup_rows at the row's own place;
 //   remote owner (across nodes): into the proxy's proxy_rows in the proxy's
 //     push order, at the row's slot (its key's row, a duplicate's slot), each
@@ -966,9 +973,9 @@ __global__ void __launch_bounds__(kThreads, 1)
   const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
   const OutTimeline timeline{args.trace, local_size};
   timeline.begin_cta();
-  const int gin = num_nodes == 1 || blockIdx.x != 0 ? 0 : timeline.on() ? 64 : 32;
-  const int workers = kThreads - gin;
-  if (tid >= workers) {
+  const int gin_threads = num_nodes == 1 || blockIdx.x != 0 ? 0 : timeline.on() ? 64 : 32;
+  const int worker_threads = kThreads - gin_threads;
+  if (tid >= worker_threads) {
     if constexpr (kMulti) {
       if (warp == kWarps - 1)
         bwd::ProxyIssuer::run<kGin>(window, dev, sizes, seq, args);
@@ -981,23 +988,23 @@ __global__ void __launch_bounds__(kThreads, 1)
   } else {
     const OutTables tables(window, sizes, args.plan);
     // free_seen starts at 0; the entry barrier's sync publishes it
-    for (int proxy = tid; proxy < local_size; proxy += workers) *tables.free_seen(proxy) = 0;
+    for (int proxy = tid; proxy < local_size; proxy += worker_threads) *tables.free_seen(proxy) = 0;
     if (blockIdx.x == 0 && num_nodes > 1) {
       // Counters this kernel counts from 0, before this rank publishes its
       // out_seq: everything that counts on them runs after the entry.
       const CtrlLayout ctrl = tables.layout().ctrl;
-      for (int64_t i = tid; i < *plan.num_chunks; i += workers) {
+      for (int64_t i = tid; i < *plan.num_chunks; i += worker_threads) {
         args.ready[i] = 0;
         *ctrl.pushed_rows(i) = 0;
       }
-      cta_sync(workers);
+      cta_sync(worker_threads);
     }
-    pass_entry_barrier(window, sizes, seq, timeline, workers);
+    pass_entry_barrier(window, sizes, seq, timeline, worker_threads);
     const int64_t *local_offset_per_bucket = plan.offset_per_bucket + node * local_size;
     const int64_t remote =
         num_nodes > 1 ? plan.remote_task_offsets[plan.max_chunks * local_size] : 0;
-    const LocalRows local_rows{local_offset_per_bucket, local_size, me};
-    const int64_t local = local_rows.count();
+    const RowTasks row_tasks{local_offset_per_bucket, local_size, me};
+    const int64_t local = row_tasks.count();
     const CtrlLayout ctrl = tables.layout().ctrl;
     ReadyFirst tasks{TaskQueue{ctrl.task(kQueueLocal)}, TaskQueue{ctrl.task(kQueueRemote)}, local,
                      remote};
@@ -1005,7 +1012,7 @@ __global__ void __launch_bounds__(kThreads, 1)
     // free. The warp keeps the last (chunk, proxy) entry it saw free.
     int64_t free_entry = -1;
     const auto ready = [&](int64_t next) {
-      const RemoteTask place(plan.remote_task_offsets, plan.max_chunks * local_size, next);
+      const TaskPlace place(plan.remote_task_offsets, plan.max_chunks * local_size, next);
       if (place.entry == free_entry) return true;
       const int proxy = (int)((me + place.entry % local_size) % local_size);
       if (!bwd::rows_free_lane(sizes, seq, tables, proxy, place.entry / local_size)) return false;
@@ -1019,7 +1026,7 @@ __global__ void __launch_bounds__(kThreads, 1)
         bwd::push_rows_task_warp<RowT>(sizes, seq, args, tables, push, lane);
         continue;
       }
-      bwd::local_push_warp<RowT>(sizes, args, tables, local_rows, task, lane);
+      bwd::local_push_warp<RowT>(sizes, args, tables, row_tasks, task, lane);
     }
   }
   if (!arrive_cta(window, sizes, arrive0, timeline)) return;  // the last CTA goes on

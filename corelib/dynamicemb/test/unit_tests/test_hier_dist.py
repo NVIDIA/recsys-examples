@@ -1668,20 +1668,20 @@ def grad_in_key_order(
     case: Case, kjt: KeyedJaggedTensor, grad: torch.Tensor
 ) -> torch.Tensor:
     """The rows of the gradient of an owner's lookup output, ordered by
-    (table, key, source column), and in KJT order within one (each comes
+    (table, key, column), and in KJT order within one (each comes
     once under index dedup, and across nodes in another node's column)."""
-    num_features, num_sources = len(kjt.keys()), kjt.stride()
+    num_features, kjt_stride = len(kjt.keys()), kjt.stride()
     lengths = kjt.lengths().view(-1)
     feature_tables = torch.tensor(
         [case.table_of[feature] for feature in kjt.keys()], device=grad.device
     )
     tables = torch.repeat_interleave(
-        feature_tables.repeat_interleave(num_sources), lengths
+        feature_tables.repeat_interleave(kjt_stride), lengths
     )
     cols = torch.repeat_interleave(
-        torch.arange(num_sources, device=grad.device).repeat(num_features), lengths
+        torch.arange(kjt_stride, device=grad.device).repeat(num_features), lengths
     )
-    ids = (tables * (1 << 40) + kjt.values().long()) * num_sources + cols
+    ids = (tables * (1 << 40) + kjt.values().long()) * kjt_stride + cols
     return grad[torch.argsort(ids, stable=True)]
 
 
@@ -1689,7 +1689,7 @@ def run_determinism(rank: int, world_size: int, local_size: int, log: Callable) 
     """The backward is the same bit for bit from run to run: the same batch
     twice, with random fp32 output gradients (whose sums depend on their
     order), hands each owner's lookup the same gradient for every (table,
-    key, source). Heavy rows included."""
+    key, column). Heavy rows included."""
     failures = 0
     case_idx = 108
     for case in (replace(HEAVY_ROWS, name="determinism"),):
@@ -1739,7 +1739,7 @@ def fd2_into(out: List[str]):
 
 
 def run_teardown(rank: int, world_size: int, local_size: int, log: Callable) -> int:
-    """The teardown's exit round, on an op of its own (built, no call). A
+    """The teardown handshake, on an op of its own (built, no call). A
     rank that drops its hierarchical dist 3 s after the others is waited
     for by its node peers and (across nodes) its rail peers: nobody leaks,
     and their drop lasts those 3 s. One that keeps it past the limit of the
@@ -1788,8 +1788,8 @@ def run_teardown_credits(
 ) -> int:
     """Every rank drops its model right after a forward, whose out kernel
     sent the credits for the next kernel at its end (across nodes, to its
-    rail peers, which nobody waits for): the teardown's exit round still
-    frees everything, without a warning and without a hang."""
+    rail peers, which nobody waits for): the teardown handshake still frees
+    everything, without a warning and without a hang."""
     case = Case("teardown with credits out")
     calls = [batch_of(case, 121, 0, rank, world_size)]
     model = fused_model(case, world_size, local_size, calls)

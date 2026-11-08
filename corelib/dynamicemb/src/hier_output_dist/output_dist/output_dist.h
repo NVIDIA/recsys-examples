@@ -80,7 +80,7 @@ class OutChannel {
   // its node's proxies, into a new tensor of plan.num_out() rows. lookup_out
   // must be the rows of lookup_rows the lookup wrote (zero copy).
   at::Tensor forward(const FwdPlan &plan, const at::Tensor &lookup_out);
-  // bwd_kernel on the current stream, after bwd_heavy_kernel and
+  // bwd_kernel on the current stream, after bwd_heavy_partial_kernel and
   // bwd_heavy_sum_kernel when the call has heavy rows: the gradient of this rank's rows back into
   // the lookup_rows of their owners (across nodes through the proxies, which sum each node-unique
   // key's), times 1 / world_size if `divide`. There each owner's lookup backward reads it.

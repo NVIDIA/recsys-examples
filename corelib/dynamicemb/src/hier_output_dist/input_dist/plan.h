@@ -54,7 +54,7 @@ struct PlanView {
   Fanout fanout;
   // across nodes, the requester's
   const int32_t *push_order;         // [rows] its remote rows by proxy and push order
-  const int64_t *proxy_chunks;       // [local_size] the chunks of each same-node proxy's stream
+  const int64_t *proxy_num_chunks;   // [local_size] the chunks of each same-node proxy's stream
   const int64_t *proxy_ends;         // [local_size][max_chunks + 1] each one's chunk ends, then its
                                      // stream's end
   const int32_t *proxy_push_tables;  // [local_size][max_chunks + 1] where its rows of each chunk at
@@ -92,8 +92,8 @@ struct PlanView {
   // The chunk of a same-node proxy's stream that holds row `at` of its ring,
   // when the stream fits the ring: the first that ends past it.
   __device__ __forceinline__ int64_t chunk_at(int proxy, int64_t at) const {
-    const int64_t chunks = proxy_chunks[proxy];
-    int64_t lo = 0, hi = chunks;
+    const int64_t count = proxy_num_chunks[proxy];
+    int64_t lo = 0, hi = count;
     while (lo < hi) {
       const int64_t mid = (lo + hi) / 2;
       if (proxy_end(proxy, mid) <= at)
@@ -101,7 +101,7 @@ struct PlanView {
       else
         hi = mid;
     }
-    return min(lo, max(chunks - 1, (int64_t)0));
+    return min(lo, max(count - 1, (int64_t)0));
   }
 };
 
@@ -112,8 +112,8 @@ struct FwdPlanView : PlanView {
   const int64_t *push_order_off;  // [local_size + 1] where its rows for each proxy start in
                                   // push_order
   // across nodes, the owner's
-  const ChunkPiece *fwd_chunks;  // [owner_chunks] the chunks of its node in each source node's
-                                 // stream, its forward put list's (PutSeg::chunk)
+  const OwnerChunk *fwd_chunks;  // [max_owner_chunks] the chunks of its node in each source
+                                 // node's stream, its forward put list's (PutSeg::chunk)
   // across nodes, the proxy's
   const int64_t *chunk_offset_per_bucket;  // [num_nodes + 1] where each owner node's chunks start
                                            // in chunk_inv
@@ -157,7 +157,7 @@ struct FwdPlan {
   at::Tensor inv;                // int32 [rows]
   FanoutTables fanout;
   // across nodes, the tables both kernels read
-  at::Tensor push_order, proxy_chunks, proxy_ends, proxy_push_tables, remote_task_offsets,
+  at::Tensor push_order, proxy_num_chunks, proxy_ends, proxy_push_tables, remote_task_offsets,
       num_chunks, chunks, node_offset_per_bucket, put_list, put_offsets;
   // across nodes, the forward's own
   at::Tensor push_order_off, fwd_chunks, chunk_offset_per_bucket, chunk_inv, node_length_per_bucket;
@@ -179,7 +179,7 @@ struct BwdPlan {
   at::Tensor inv;                // int32 [rows]
   FanoutTables fanout;
   // across nodes, the tables both kernels read
-  at::Tensor push_order, proxy_chunks, proxy_ends, proxy_push_tables, remote_task_offsets,
+  at::Tensor push_order, proxy_num_chunks, proxy_ends, proxy_push_tables, remote_task_offsets,
       num_chunks, chunks, node_offset_per_bucket, put_list, put_offsets;
   // across nodes, the backward's own
   at::Tensor node_length_per_source, reduce_task_offsets, node_exp_off;

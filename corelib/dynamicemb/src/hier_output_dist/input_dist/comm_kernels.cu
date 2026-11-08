@@ -54,7 +54,7 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 // - The key puts are waited for late. rail_key_push only posts the puts (each slice with a strong
 //   signal, so the owner that sees the signal sees the slice). rail_done acquires every rail
 //   proxy's key signal and flushes this rank's puts. Between the two run node_status_exchange,
-//   peer_gather, remote_rows and requester_tables: none of them reads rail_keys or writes
+//   peer_gather, remote_map_gather and requester_tables: none of them reads rail_keys or writes
 //   key_stage. The first reader of rail_keys, owner_tables, runs after rail_done on the stream, and
 //   the planner reads the rail's offsets from the layout's tensors, not from the window. The next
 //   call writes key_stage in its proxy steps, after this rail_done (and its flush: the NIC read
@@ -130,15 +130,16 @@ __global__ void __launch_bounds__(kThreads)
   const NodeWindow node(window, sizes.topo.local_rank);
   const KeysLayout keys = node.layout(sizes).keys;
   const int64_t remote_offset = keys.remote_offset();
-  push_rows(rows, num_rows, places, sizes.topo, sizes.num_features, src,
-            [&](int64_t target, int64_t place, int64_t key, float weight, int32_t feature) {
-              node.peer(keys.node_keys(), (int)target)[place] = key;
-              if (rows.weights != nullptr)
-                node.peer(keys.node_key_weights(), (int)target)[place] = weight;
-              if (place >= remote_offset)
-                node.peer(keys.node_bucket_feature_of_row(), (int)target)[place - remote_offset] =
-                    feature;
-            });
+  push_rows(
+      rows, num_rows, places, sizes.topo, sizes.num_features, src,
+      [&](int64_t target, int64_t place, int64_t key, float weight, int32_t node_bucket_feature) {
+        node.peer(keys.node_keys(), (int)target)[place] = key;
+        if (rows.weights != nullptr)
+          node.peer(keys.node_key_weights(), (int)target)[place] = weight;
+        if (place >= remote_offset)
+          node.peer(keys.node_bucket_feature_of_row(), (int)target)[place - remote_offset] =
+              node_bucket_feature;
+      });
   __syncthreads();
   if (threadIdx.x == 0) fence_sc_sys();
 }
@@ -198,12 +199,12 @@ __global__ void __launch_bounds__(kThreads)
   if (warp == 1) gin.flush(ncclCoopThread{});
 }
 
-// 1 warp: its lanes, each taking rail peers in turn, send each owner o this call's key stream:
+// 1 warp: its lanes, each taking rail peers in turn, send each owner o this call's key message:
 // this proxy's slice of key_stage (bytes [put_src[o], put_src[o] + put_bytes[o])) into the owner's
 // rail_keys at put_dst[o], one put that signals keys[node]; the signal alone when it puts no key
 // (put_skip[o]: the owner overflows lookup_keys; or an empty slice). Its system fence orders the
 // planner's writes of key_stage before the puts. It does not wait: rail_done waits for the rail's
-// key streams and flushes these puts. A proxy puts only after it has the owner's count message of
+// key messages and flushes these puts. A proxy puts only after it has the owner's count message of
 // the call (rail_exchange, earlier on the stream), which the owner sends once its previous call
 // read rail_keys.
 __global__ void rail_key_push_kernel(ncclWindow_t window, ncclDevComm dev, Sizes sizes,
@@ -214,22 +215,22 @@ __global__ void rail_key_push_kernel(ncclWindow_t window, ncclDevComm dev, Sizes
   const ncclTeam rail = ncclTeamRail(dev);
   const NodeWindow node_window(window, sizes.topo.local_rank);
   const KeysLayout keys = node_window.layout(sizes).keys;
-  const RailMessage key_stream(gin, rail, node_window, sig_keys(num_nodes, node));
+  const RailMessage key_message(gin, rail, node_window, sig_keys(num_nodes, node));
   fence_sc_sys();
   for (int owner_node = threadIdx.x; owner_node < num_nodes; owner_node += blockDim.x) {
     if (owner_node == node) continue;
     const int64_t bytes = put_skip[owner_node] ? 0 : put_bytes[owner_node];
     if (bytes > 0)
-      key_stream.put(owner_node, keys.rail_keys() + put_dst[owner_node],
-                     keys.key_stage() + put_src[owner_node], (size_t)bytes);
+      key_message.put(owner_node, keys.rail_keys() + put_dst[owner_node],
+                      keys.key_stage() + put_src[owner_node], (size_t)bytes);
     else
-      key_stream.signal(owner_node);
+      key_message.signal(owner_node);
   }
 }
 
 // 1 CTA: this rank's rail's kNumNeeds needs and its requester offsets [requester][feature] (the
 // rail layout's) into its needs and requester_offsets words; after a system fence, which also
-// orders the planner's writes of remote_map and the proxy header before it, in_done gets seq.
+// orders the planner's writes of remote_map and the proxy header before it, in_status gets seq.
 // Once every node peer's has it, every peer's needs land in peer_needs [local_size] [kNumNeeds]
 // and where each one's KJT holds this requester's keys of each feature in
 // offset_per_owner_feature [local_size][num_features].
@@ -245,7 +246,7 @@ __global__ void node_status_exchange_kernel(ncclWindow_t window, Sizes sizes, in
   for (int i = tid; i < local_size * num_features; i += blockDim.x)  // requester * F + feature
     ctrl.requester_offsets(i / num_features)[i % num_features] = requester_offsets[i];
   __syncthreads();
-  const NodeBarrier status{sizes, node, ctrl.in_done(), seq};
+  const NodeBarrier status{sizes, node, ctrl.in_status(), seq};
   if (tid == 0) {
     fence_sc_sys();
     status.publish();
@@ -267,7 +268,7 @@ __global__ void node_status_exchange_kernel(ncclWindow_t window, Sizes sizes, in
 // first_word[i] of its proxy header (kFrom kGatherProxyHeader, k = 0) or
 // entry first_word[i] of array k of its remote_map (kGatherRemoteMap), into
 // out[k][i] (none when peer[i] < 0). The peers published them before the
-// in_done this rank's node_status_exchange acquired earlier on the stream.
+// in_status this rank's node_status_exchange acquired earlier on the stream.
 template <GatherFrom kFrom>
 __global__ void __launch_bounds__(kThreads)
     peer_gather_kernel(ncclWindow_t window, Sizes sizes, const int32_t *peer,
@@ -287,7 +288,7 @@ __global__ void __launch_bounds__(kThreads)
   }
 }
 
-// 1 warp: its lanes, each taking rail peers in turn, wait until every rail proxy's key stream of
+// 1 warp: its lanes, each taking rail peers in turn, wait until every rail proxy's key message of
 // the call has landed here: its key signal (the slice it put, which the strong signal covers, or
 // the signal alone). Then the warp flushes this rank's puts on the in channel's context, so the
 // NIC has read its key_stage slices before the next call's proxy steps write key_stage again. It
@@ -299,7 +300,7 @@ __global__ void rail_done_kernel(ncclDevComm dev, Sizes sizes, int64_t seq) {
   Spin spin(sizes.timeout_ns);
   for (int peer_node = threadIdx.x; peer_node < num_nodes; peer_node += blockDim.x)
     while (peer_node != node && (int64_t)gin.readSignal(sig_keys(num_nodes, peer_node)) < seq)
-      spin.pause("key stream", peer_node, seq, sizes.topo.rank);
+      spin.pause("key message", peer_node, seq, sizes.topo.rank);
   gin.flush(ncclCoopWarp{});
 }
 
@@ -346,7 +347,7 @@ RailLayout InChannel::rail_exchange(const NodeLayout &node, const ProxyPlan &pro
       at::empty({rail_layout_scratch(sizes_.topo, sizes_.num_features)}, options);
   const CountParts parts{node.need_remote.data_ptr<int64_t>(),
                          node.own_total.data_ptr<int64_t>() + sizes_.topo.local_rank,
-                         proxy.key_rows.data_ptr<int64_t>(),
+                         proxy.need_key_rows.data_ptr<int64_t>(),
                          proxy.chunk_length_per_bucket.data_ptr<int64_t>(),
                          node.own_lengths.data_ptr<int64_t>(),
                          proxy.node_length_per_bucket_feature.data_ptr<int64_t>()};

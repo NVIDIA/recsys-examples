@@ -1374,7 +1374,7 @@ def run_skew(rank: int, log: Callable) -> int:
     node_exchange read them. A peer pushes its next keys into rank 1's
     node_keys only after the node barrier of the next call: rank 1 publishes
     its in_started only at its next node_exchange, once this call ended
-    there. Across nodes in_done holds the peers too, so only one node opens
+    there. Across nodes in_status holds the peers too, so only one node opens
     the race. 20 steps."""
     if dist.get_world_size() != LOCAL:
         return 0
@@ -1529,9 +1529,9 @@ def run_teardown(rank: int, world_size: int, log: Callable) -> int:
     next batch's input dist done, its second wait not). After quiesce() the
     last rank drops it LATE seconds late and nobody waits for it; a call
     after quiesce() undoes it, and the late rank's node and rail peers wait
-    for it in the exit round; without quiesce() the exit rounds free
-    everything. Never a warning, and no hierarchical dist is left. A rank
-    waited if its drop took more than half of LATE."""
+    for it in the teardown handshake; without quiesce() the teardown
+    handshakes free everything. Never a warning, and no hierarchical dist is
+    left. A rank waited if its drop took more than half of LATE."""
     failures = 0
     last = rank == world_size - 1
     peer = not last and (

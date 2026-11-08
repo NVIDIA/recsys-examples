@@ -42,16 +42,13 @@ namespace hier_output_dist {
 // chunks per owner node; then its own part's keys of each feature, and as proxy its node-unique
 // keys of each (owner node, feature). 3 + num_nodes + (num_nodes + 1) * num_features words.
 struct CountMessage {
-  static constexpr int kNeedRemote = 0, kOwnTotal = 1, kKeyRows = 2;
+  static constexpr int kNeedRemoteWord = 0, kOwnTotalWord = 1, kNeedKeyRowsWord = 2;
   int64_t num_nodes, num_features;
-  __host__ __device__ int64_t chunk_length_per_bucket(int64_t owner_node) const {
-    return 3 + owner_node;
-  }
-  __host__ __device__ int64_t own_length_per_feature(int64_t feature) const {
+  __host__ __device__ int64_t chunk_length_word(int64_t owner_node) const { return 3 + owner_node; }
+  __host__ __device__ int64_t own_length_word(int64_t feature) const {
     return 3 + num_nodes + feature;
   }
-  __host__ __device__ int64_t node_length_per_bucket_feature(int64_t owner_node,
-                                                             int64_t feature) const {
+  __host__ __device__ int64_t node_length_word(int64_t owner_node, int64_t feature) const {
     return 3 + num_nodes + (owner_node + 1) * num_features + feature;
   }
   __host__ __device__ int64_t length() const {
@@ -71,7 +68,7 @@ struct CountMessage {
 // chunks of a stream. Every control word is tagged with its channel's sequence number, is a running
 // total, or is back at its start value when the kernel that uses it ends. The data words
 // (requester_offsets, the needs, the count messages) are written whole in each call, before a flag
-// (in_done) or a signal publishes them. So none is ever reset, and a call that overflowed leaves
+// (in_status) or a signal publishes them. So none is ever reset, and a call that overflowed leaves
 // all of them valid for the next. Words marked (local) are only this rank's:
 // a GIN warp's place with each peer, which it sets when it starts. Words marked (num_nodes > 1)
 // exist across nodes only. Each accessor returns the address of a word, or of the first of an array
@@ -83,7 +80,7 @@ class CtrlLayout {
         num_nodes_(sizes.topo.num_nodes),
         num_features_(sizes.num_features),
         counters_(sizes.counters()),
-        message_{sizes.topo.num_nodes, sizes.num_features} {
+        count_format_{sizes.topo.num_nodes, sizes.num_features} {
     const int64_t local_size = sizes.topo.local_size, num_nodes = num_nodes_;
     const bool multi = num_nodes > 1;
     int64_t next = 0;
@@ -95,9 +92,9 @@ class CtrlLayout {
     in_started_ = take(1);
     in_written_ = take(local_size);
     requester_offsets_ = take(multi ? local_size * num_features_ : 0);
-    in_done_ = take(multi ? 1 + kNumNeeds : 0);
-    count_msg_out_ = take(multi ? message_.length() : 0);
-    count_msgs_ = take(multi ? 2 * num_nodes * message_.slot_words() : 0);
+    in_status_ = take(multi ? 1 + kNumNeeds : 0);
+    count_msg_out_ = take(multi ? count_format_.length() : 0);
+    count_msgs_ = take(multi ? 2 * num_nodes * count_format_.slot_words() : 0);
     out_started_ = take(1);
     pushed_ = take(local_size);
     pulled_ = take(1);
@@ -113,7 +110,7 @@ class CtrlLayout {
     pulled_rows_ = take(multi ? sizes.max_chunks : 0);
     pushed_rows_ = take(multi ? sizes.max_chunks : 0);
     posted_ = take(multi ? counters_ : 0);
-    slot_free_ = take(multi ? 1 : 0);
+    bwd_free_end_ = take(multi ? 1 : 0);
     closing_ = take(1);
     closed_ = take(1);
     words_ = next;
@@ -136,9 +133,9 @@ class CtrlLayout {
     return (int64_t *)word(requester_offsets_ + requester * num_features_);
   }
   // (num_nodes > 1) in_seq of this rank's node_status_exchange
-  __host__ __device__ uint64_t *in_done() const { return word(in_done_); }
-  // (num_nodes > 1) [kNumNeeds] its rail's needs, which in_done publishes
-  __host__ __device__ int64_t *needs() const { return (int64_t *)word(in_done_ + 1); }
+  __host__ __device__ uint64_t *in_status() const { return word(in_status_); }
+  // (num_nodes > 1) [kNumNeeds] its rail's needs, which in_status publishes
+  __host__ __device__ int64_t *needs() const { return (int64_t *)word(in_status_ + 1); }
   // (num_nodes > 1) the count message this rank sends each rail peer
   // (CountMessage::length)
   __host__ __device__ int64_t *count_msg_out() const { return (int64_t *)word(count_msg_out_); }
@@ -148,7 +145,7 @@ class CtrlLayout {
   // here. A parity's slots are consecutive, node after node.
   __host__ __device__ int64_t *count_msg(int64_t in_seq, int64_t node) const {
     return (int64_t *)word(count_msgs_ +
-                           ((in_seq & 1) * num_nodes_ + node) * message_.slot_words());
+                           ((in_seq & 1) * num_nodes_ + node) * count_format_.slot_words());
   }
 
   // ── the out channel ──
@@ -207,10 +204,10 @@ class CtrlLayout {
   // (num_nodes > 1, local) [counters] backward puts this proxy posted on each
   // put counter, in calls whose stream wraps: what the counter counts
   __host__ __device__ uint64_t *posted(int64_t counter) const { return word(posted_ + counter); }
-  // (num_nodes > 1) tag_of(out_seq, position): this proxy's node may push
+  // (num_nodes > 1) tagged(out_seq, position): this proxy's node may push
   // the gradient rows of that backward's stream below that position into
   // its proxy_rows (the rows below num_proxy_rows need none)
-  __host__ __device__ uint64_t *slot_free() const { return word(slot_free_); }
+  __host__ __device__ uint64_t *bwd_free_end() const { return word(bwd_free_end_); }
 
   // ── teardown ──
   // this rank reads no window any more
@@ -223,11 +220,11 @@ class CtrlLayout {
 
   uint64_t *base_;
   int64_t num_nodes_, num_features_, counters_;
-  CountMessage message_;
-  int64_t in_started_, in_written_, requester_offsets_, in_done_, count_msg_out_, count_msgs_;
+  CountMessage count_format_;
+  int64_t in_started_, in_written_, requester_offsets_, in_status_, count_msg_out_, count_msgs_;
   int64_t out_started_, pushed_, pulled_, arrive_, tasks_, landed_rows_, fwd_tot_, bwd_tot_,
       grant_sent_, bwd_ready_sent_, put_at_, landed_, pulled_rows_, pushed_rows_, posted_,
-      slot_free_;
+      bwd_free_end_;
   int64_t closing_, closed_, words_;
 };
 
@@ -245,7 +242,7 @@ struct GatheredHeader;  // below
 // start in its push order there (chunk max_chunks: their end). A requester
 // gathers the words it reads (planner.h) by their word numbers.
 struct ProxyHeader {
-  static constexpr int64_t kChunksWord = 0, kEndWord = 1, kEndsWord = 4;
+  static constexpr int64_t kNumChunksWord = 0, kEndWord = 1, kEndsWord = 4;
   int32_t *base;
   int64_t local_size, max_chunks;
   // The header of a proxy of these sizes at `base` (nullptr: its word numbers
@@ -258,7 +255,7 @@ struct ProxyHeader {
     return kEndsWord + max_chunks + requester * push_words();
   }
   __host__ __device__ int64_t words() const { return push_table_word(local_size); }
-  __host__ __device__ int32_t *chunks() const { return base + kChunksWord; }
+  __host__ __device__ int32_t *num_chunks() const { return base + kNumChunksWord; }
   __host__ __device__ uint32_t *end() const { return (uint32_t *)(base + kEndWord); }
   __host__ __device__ uint32_t *ends() const { return (uint32_t *)(base + kEndsWord); }
   __host__ __device__ int32_t *push_table(int64_t requester) const {
@@ -266,7 +263,7 @@ struct ProxyHeader {
   }
   // What a requester gathers of a header, in this order: the chunks, the
   // end, each chunk's end, then its own push table.
-  static constexpr int64_t kGatheredChunks = 0, kGatheredEnd = 1, kGatheredEnds = 2;
+  static constexpr int64_t kGatheredNumChunks = 0, kGatheredEnd = 1, kGatheredEnds = 2;
   __host__ __device__ int64_t gathered_push_table() const { return kGatheredEnds + max_chunks; }
   __host__ __device__ int64_t gathered_words() const {
     return gathered_push_table() + push_words();
@@ -282,7 +279,7 @@ struct ProxyHeader {
 struct GatheredHeader {
   const int32_t *words;
   int64_t max_chunks;
-  __host__ __device__ int64_t chunks() const { return words[ProxyHeader::kGatheredChunks]; }
+  __host__ __device__ int64_t num_chunks() const { return words[ProxyHeader::kGatheredNumChunks]; }
   // chunk c's end for c < max_chunks, the stream's end for c = max_chunks
   __host__ __device__ int64_t end(int64_t chunk) const {
     const int64_t word =
@@ -353,7 +350,7 @@ __host__ __device__ constexpr int gather_words(GatherFrom from) {
 //   remote_map    (num_nodes > 1) RemoteMap
 //   proxy_header  (num_nodes > 1) ProxyHeader
 //   key_stage     (num_nodes > 1) the node-unique key records of each owner
-//                 node, each slice after the node's chunks (ChunkPiece): what
+//                 node, each slice after the node's chunks (OwnerChunk): what
 //                 one key put sends; then 16 bytes that take what no key
 //                 writes
 //   rail_keys     (num_nodes > 1) the key records the rail proxies put, one
@@ -385,10 +382,11 @@ class KeysLayout {
     remote_map_ = take(multi ? 4 * RemoteMap::kArrays * (uint64_t)remote_keys_ : 0);
     proxy_header_ = take(multi ? 4 * (uint64_t)ProxyHeader::of(sizes).words() : 0);
     key_stage_bytes_ =
-        multi ? max_chunks_ * sizeof(ChunkPiece) + remote_keys_ * sizes.record_bytes + 16 : 0;
+        multi ? max_chunks_ * sizeof(OwnerChunk) + remote_keys_ * sizes.record_bytes + 16 : 0;
     key_stage_ = take(key_stage_bytes_);
     rail_keys_bytes_ =
-        multi ? lookup_keys_ * sizes.record_bytes + sizes.owner_chunks() * sizeof(ChunkPiece) : 0;
+        multi ? lookup_keys_ * sizes.record_bytes + sizes.max_owner_chunks() * sizeof(OwnerChunk)
+              : 0;
     rail_keys_ = take(rail_keys_bytes_);
     bytes_ = next;
   }
