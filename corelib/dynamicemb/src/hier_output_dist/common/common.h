@@ -87,7 +87,7 @@ struct Sizes {
                              // least this many rows in its chunk (max_counted_rows)
   int64_t max_chunks;        // the most chunks of a proxy's stream in a call
   int64_t record_bytes;      // a key record: 8, or 16 with its weight
-  bool weights;              // the requesters' keys carry weights
+  bool weighted;             // the requesters' keys carry weights
   uint64_t timeout_ns;       // how long a kernel waits for a peer before it traps
 
   __host__ __device__ bool multi_node() const { return topo.num_nodes > 1; }

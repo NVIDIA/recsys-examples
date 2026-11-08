@@ -95,22 +95,23 @@ struct Capacities {
 };
 
 // The payload of a chunk of a proxy's stream, the rows it sends over IB, one
-// per key (Sizes::rows_per_payload): at least about Config::chunk_kb KiB, by
-// default kChunkBytes. Python reads chunk_kb from DYNAMICEMB_GIN_CHUNK_KB when
-// it builds the sharding, and the ranks compare it with the other arguments,
-// so every rank has the same value. Config::validate refuses a value below
-// kMinChunkKb or not a multiple of 16. A chunk's rows in the ring, a row per
-// occurrence of its keys, stop at kChunkRowCapBytes, or at the payload if it
-// is larger (Sizes::max_chunk_rows). A chunk of keys of one row each sends
-// about chunk_ring_rows / rows_per_payload rows over IB (sizes_of). When the
-// ring holds two chunks at the cap, that is chunk_kb rounded up to 2 MiB /
-// floor(2 MiB / chunk_kb), and chunk_kb from 2048 KiB. It is chunk_kb at 64,
-// 128, 256, 512 and 1024 KiB. Other values give up to about twice chunk_kb;
-// above 512 KiB, 528..672 KiB give 682 KiB, 688..1008 KiB give 1 MiB, and
-// 1040..2032 KiB give 2 MiB.
-constexpr int64_t kChunkBytes = int64_t{512} << 10;
+// per key (Sizes::rows_per_payload): at least about Config::payload_kb KiB, by
+// default kDefaultPayloadKb. Python reads payload_kb from
+// DYNAMICEMB_HIER_PAYLOAD_KB when it builds the sharding, and the ranks compare
+// it with the other arguments, so every rank has the same value.
+// Config::validate refuses a value below kMinPayloadKb or not a multiple of 16.
+// A chunk's rows in the ring, a row per occurrence of its keys, stop at
+// kChunkRowCapBytes, or at the payload if it is larger (Sizes::max_chunk_rows).
+// A chunk of keys of one row each sends about chunk_ring_rows /
+// rows_per_payload rows over IB (sizes_of). When the ring holds two chunks at
+// the cap, that is payload_kb rounded up to 2 MiB / floor(2 MiB / payload_kb),
+// and payload_kb from 2048 KiB. It is payload_kb at 64, 128, 256, 512 and
+// 1024 KiB. Other values give up to about twice payload_kb; above 512 KiB,
+// 528..672 KiB give 682 KiB, 688..1008 KiB give 1 MiB, and 1040..2032 KiB
+// give 2 MiB.
+constexpr int64_t kDefaultPayloadKb = 512;
 constexpr int64_t kChunkRowCapBytes = int64_t{2} << 20;
-constexpr int64_t kMinChunkKb = 64;
+constexpr int64_t kMinPayloadKb = 64;
 
 struct Config {
   int rank = 0, world_size = 0, local_size = 0;  // ranks are node-contiguous
@@ -119,16 +120,16 @@ struct Config {
   std::vector<int> dist_types;  // [num_features]: each feature's DistType code (src/utils.h)
   int64_t dim = 0;              // a row of the lookup output: dim values of dtype
   at::ScalarType dtype = at::kFloat;
-  bool weights = false;    // the requesters' keys carry weights, and so the owner's KJT:
+  bool weighted = false;   // the requesters' keys carry weights, and so the owner's KJT:
                            // whole counts of at least 0, which the proxy adds as integers
   bool node_dedup = true;  // across nodes a node sends a key once (else each
                            // occurrence)
   Capacities capacities;
   double timeout_s = 120;  // the longest a kernel waits for a peer before it traps
-  int ctas = 0;            // CTAs of an out kernel (0: its default)
+  int out_ctas = 0;        // CTAs of an out kernel (0: its default)
   int reduce_ctas = 8;     // CTAs of the backward across nodes that reduce
   // across nodes, the least payload (about) of a chunk of a proxy's stream, in KiB
-  int64_t chunk_kb = kChunkBytes >> 10;
+  int64_t payload_kb = kDefaultPayloadKb;
 
   int num_features() const { return (int)feature_tables.size(); }
   int num_nodes() const { return world_size / local_size; }
@@ -144,9 +145,9 @@ struct Config {
 // A configuration of these fields (Config's), as Python gives them.
 Config config_of(int64_t rank, int64_t world_size, int64_t local_size,
                  const std::vector<int64_t> &feature_tables, const std::vector<int64_t> &dist_types,
-                 int64_t dim, at::ScalarType dtype, bool weights, bool node_dedup,
+                 int64_t dim, at::ScalarType dtype, bool weighted, bool node_dedup,
                  int64_t lookup_keys, int64_t remote_keys, int64_t proxy_bytes, double timeout_s,
-                 int64_t ctas, int64_t reduce_ctas, int64_t chunk_kb);
+                 int64_t out_ctas, int64_t reduce_ctas, int64_t payload_kb);
 
 // Why the op does not apply to a sharding of these ranks, features and rows
 // (ranks that are not whole nodes, int32 bucket feature numbers, rows the
@@ -168,7 +169,7 @@ Sizes sizes_of(const Config &config);
 // (sizes_of's, and Config::validate's), across nodes:
 //   num_proxy_rows    min(max(remote_keys, min_proxy_rows_for(max_key_rows)),
 //                     proxy_bytes / row_bytes)
-//   payload_rows      max(payload / row_bytes, kTaskRows), the payload chunk_kb KiB
+//   payload_rows      max(payload / row_bytes, kTaskRows), payload = payload_kb KiB
 //   chunk_ring_rows   min(max(max(payload, kChunkRowCapBytes) / row_bytes, kTaskRows),
 //                     num_proxy_rows / 2)
 //   max_chunk_rows    max(chunk_ring_rows, 2 * max_key_rows)

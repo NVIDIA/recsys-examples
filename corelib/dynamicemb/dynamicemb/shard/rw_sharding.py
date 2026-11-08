@@ -59,12 +59,12 @@ from ..batched_dynamicemb_compute_kernel import (
 from ..batched_dynamicemb_tables import BatchedDynamicEmbeddingTablesV2
 from ..dynamicemb_config import (
     AUTO_OUTPUT_DIST,
-    FUSED_OUTPUT_DIST,
+    HIERARCHICAL_OUTPUT_DIST,
     TORCHREC_OUTPUT_DIST,
     DynamicEmbTableOptions,
 )
 from ..scored_kjt import get_scores
-from .hier_output_dist import HierSharding, RwSequenceHierEmbeddingDist
+from .hier_output_dist import HierDist, RwSequenceHierEmbeddingDist
 from .input_dist import RwSparseFeaturesDist
 
 
@@ -133,23 +133,23 @@ def sharding_takes_scores(sharding_infos: List[EmbeddingShardingInfo]) -> bool:
 
 def built_output_dist(kind: str) -> str:
     """Output dist ``kind`` as this build of DynamicEmb runs it: ``"auto"`` is
-    ``"fused"`` when the build has it (``HierOutputDist``, which needs NCCL >=
-    2.30.7), else TorchRec's dists (with a warning); ``"fused"`` raises
-    ``ImportError`` when it does not."""
+    ``"hierarchical"`` when the build has it (``HierOutputDist``, which needs
+    NCCL >= 2.30.7), else TorchRec's dists (with a warning);
+    ``"hierarchical"`` raises ``ImportError`` when it does not."""
     import dynamicemb_extensions
 
     built = hasattr(dynamicemb_extensions, "HierOutputDist")
     if kind == AUTO_OUTPUT_DIST:
         if built:
-            return FUSED_OUTPUT_DIST
+            return HIERARCHICAL_OUTPUT_DIST
         warnings.warn(
             'output_dist="auto": DynamicEmb was built without NCCL >= 2.30.7, so '
             "without its hierarchical dist; using TorchRec's dists"
         )
         return TORCHREC_OUTPUT_DIST
-    if kind == FUSED_OUTPUT_DIST and not built:
+    if kind == HIERARCHICAL_OUTPUT_DIST and not built:
         raise ImportError(
-            'output_dist="fused" needs dynamicemb built against NCCL >= 2.30.7 '
+            'output_dist="hierarchical" needs dynamicemb built against NCCL >= 2.30.7 '
             "(this build has no hierarchical dist; set NCCL_HOME to a newer NCCL "
             'and rebuild, or use "auto")'
         )
@@ -272,14 +272,14 @@ class HierGroupedEmbeddingsLookup(GroupedEmbeddingsLookup):
     module's mode. For such a call each group writes its rows straight into
     the call's rows of ``op.lookup_rows``, through the tables'
     ``output_alloc``. The groups' outputs come back as those rows, without a
-    copy (``HierSharding.lookup``). See docs/hier_output_dist.md, section
+    copy (``HierDist.lookup``). See docs/hier_output_dist.md, section
     7.4.
     """
 
     def __init__(
         self,
         grouped_configs: List[GroupedEmbeddingConfig],
-        hier: HierSharding,
+        hier: HierDist,
         pg: Optional[dist.ProcessGroup] = None,
         device: Optional[torch.device] = None,
     ) -> None:
@@ -348,33 +348,33 @@ class RwSequenceDynamicEmbeddingSharding(RwSequenceEmbeddingSharding):
             sharding_infos
         )
         self._per_key_score: bool = sharding_takes_scores(sharding_infos)
-        self._hier: Optional[HierSharding] = None
+        self._hier: Optional[HierDist] = None
         options = output_dist_options(sharding_infos)
         if (
             options is None
-            or built_output_dist(options.output_dist) != FUSED_OUTPUT_DIST
+            or built_output_dist(options.output_dist) != HIERARCHICAL_OUTPUT_DIST
         ):
             return
         if options.output_dist_capacity is None:
-            # "auto" alone gets here without one: "fused" needs it
+            # "auto" alone gets here without one: "hierarchical" needs it
             # (DynamicEmbTableOptions).
             warnings.warn(
                 f'output_dist="{options.output_dist}" without output_dist_capacity; '
                 "using TorchRec's dists"
             )
             return
-        self._hier = self._hier_sharding(sharding_infos, options)
+        self._hier = self._hier_dist(sharding_infos, options)
 
-    def _hier_sharding(
+    def _hier_dist(
         self,
         sharding_infos: List[EmbeddingShardingInfo],
         options: DynamicEmbTableOptions,
-    ) -> Optional[HierSharding]:
-        """The hierarchical dist of ``output_dist="fused"`` (or ``"auto"``),
-        or None (with a warning) where it does not apply and the sharding
-        stays on TorchRec's dists. Tables that take a score per key
-        (``PRECISE_CUSTOMIZED``) raise ValueError under ``"fused"`` and stay
-        on TorchRec's dists under ``"auto"``. Decided from the sharding
+    ) -> Optional[HierDist]:
+        """The hierarchical dist of ``output_dist="hierarchical"`` (or
+        ``"auto"``), or None (with a warning) where it does not apply and the
+        sharding stays on TorchRec's dists. Tables that take a score per key
+        (``PRECISE_CUSTOMIZED``) raise ValueError under ``"hierarchical"`` and
+        stay on TorchRec's dists under ``"auto"``. Decided from the sharding
         alone, so the same on every rank."""
         asked = options.output_dist
         why = None
@@ -402,7 +402,7 @@ class RwSequenceDynamicEmbeddingSharding(RwSequenceEmbeddingSharding):
                 "it does not carry a score per key (the tables' score_strategy "
                 "PRECISE_CUSTOMIZED)"
             )
-            if asked == FUSED_OUTPUT_DIST:
+            if asked == HIERARCHICAL_OUTPUT_DIST:
                 raise ValueError(
                     f'output_dist="{asked}": {refusal}; use '
                     f'output_dist="{TORCHREC_OUTPUT_DIST}"'
@@ -430,7 +430,7 @@ class RwSequenceDynamicEmbeddingSharding(RwSequenceEmbeddingSharding):
             (sharding_info.fused_params or {}).get("gradient_clipping", False)
             for sharding_info in sharding_infos
         )
-        return HierSharding(
+        return HierDist(
             self._pg,
             self._get_num_features(),
             info.embedding_config.embedding_dim,

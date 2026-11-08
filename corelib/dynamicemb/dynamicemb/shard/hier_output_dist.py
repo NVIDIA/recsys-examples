@@ -13,16 +13,16 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """The hierarchical dist of a row-wise sequence sharding
-(``output_dist="fused"``) on the C++ operator ``HierOutputDist``
+(``output_dist="hierarchical"``) on the C++ operator ``HierOutputDist``
 (``src/hier_output_dist``). Keys and rows move over NVLink inside a node and
 over the rails (NCCL GIN) between nodes, with one host sync per call. Design:
 docs/hier_output_dist.md (section 7.4 for this file).
 
-:class:`HierSharding` builds the operator at the first ``input_dist()`` and
+:class:`HierDist` builds the operator at the first ``input_dist()`` and
 holds what the calls share. The operator takes index-deduplicated keys
 (the sharder's ``use_index_dedup=True``). The input dist is in input_dist.py
 (``RwSparseFeaturesDist.hier_forward``). The lookup writes its rows into the
-operator's window (:meth:`HierSharding.lookup`), and
+operator's window (:meth:`HierDist.lookup`), and
 :class:`RwSequenceHierEmbeddingDist` moves them. A call that does not fit the
 capacities raises at its second wait; every eval forward runs on TorchRec's
 dists. :func:`quiesce` lets every rank free the operators at once.
@@ -49,10 +49,10 @@ from ..dynamicemb_config import OUTPUT_DIST_CAPACITY_NAMES
 
 
 def _timeout_s(pg: dist.ProcessGroup) -> float:
-    """How long a kernel may wait for a peer: ``DYNAMICEMB_GIN_TIMEOUT_S``,
+    """How long a kernel may wait for a peer: ``DYNAMICEMB_HIER_TIMEOUT_S``,
     else the process group's own timeout (how long its NCCL collectives
     wait)."""
-    env = os.environ.get("DYNAMICEMB_GIN_TIMEOUT_S")
+    env = os.environ.get("DYNAMICEMB_HIER_TIMEOUT_S")
     if env is not None:
         return float(env)
     try:
@@ -182,8 +182,8 @@ class DynamicEmbSequenceShardingContext(SequenceShardingContext):
             self.hier_result.record_stream(stream)
 
 
-class HierSharding:
-    """One row-wise sequence sharding on the hierarchical dist: its operator,
+class HierDist:
+    """The hierarchical dist of one row-wise sequence sharding: its operator,
     built at the first ``input_dist()`` (:meth:`setup`), and what its calls
     share. The knobs are read here, from the environment
     (docs/hier_output_dist.md, section 4.4).
@@ -194,9 +194,9 @@ class HierSharding:
         embedding_dim: columns of a row of the lookup output.
         output_dtype: the lookup output's dtype.
         capacity: ``output_dist_capacity``.
-        asked: the tables' ``output_dist``, ``"fused"`` or ``"auto"``:
-            ``"fused"`` raises where ``"auto"`` warns and takes TorchRec's
-            dists.
+        asked: the tables' ``output_dist``, ``"hierarchical"`` or
+            ``"auto"``: ``"hierarchical"`` raises where ``"auto"`` warns and
+            takes TorchRec's dists.
         tables: the table of each feature.
         node_dedup: across nodes a node sends each key once.
     """
@@ -208,7 +208,7 @@ class HierSharding:
         embedding_dim: int,
         output_dtype: torch.dtype,
         capacity: Union[int, Dict[str, int]],
-        asked: str = "fused",
+        asked: str = "hierarchical",
         tables: Optional[List[int]] = None,
         node_dedup: bool = True,
     ) -> None:
@@ -222,9 +222,9 @@ class HierSharding:
         self.dtype = output_dtype  # of the lookup output's rows
         if isinstance(capacity, int):
             capacity = dict.fromkeys(OUTPUT_DIST_CAPACITY_NAMES, capacity)
-        proxy_mb = float(os.environ.get("DYNAMICEMB_GIN_PROXY_MB", 512))
+        proxy_mb = float(os.environ.get("DYNAMICEMB_HIER_PROXY_MB", 512))
         # What the operator is built from, but the bucketize's rules and the
-        # weights (setup()). One node needs lookup_keys alone.
+        # weighted flag (setup()). One node needs lookup_keys alone.
         self._arguments = dict(
             world_size=world_size,
             local_size=local_size,
@@ -236,9 +236,9 @@ class HierSharding:
             remote_keys=capacity.get("remote_keys", 0),
             proxy_bytes=int(proxy_mb * (1 << 20)),
             timeout_s=_timeout_s(pg),
-            ctas=int(os.environ.get("DYNAMICEMB_GIN_CTAS", 0)),
-            reduce_ctas=int(os.environ.get("DYNAMICEMB_GIN_REDUCE_CTAS", 8)),
-            chunk_kb=int(os.environ.get("DYNAMICEMB_GIN_CHUNK_KB", 512)),
+            out_ctas=int(os.environ.get("DYNAMICEMB_HIER_OUT_CTAS", 0)),
+            reduce_ctas=int(os.environ.get("DYNAMICEMB_HIER_REDUCE_CTAS", 8)),
+            payload_kb=int(os.environ.get("DYNAMICEMB_HIER_PAYLOAD_KB", 512)),
         )
         self.op = None  # the HierOutputDist, once setup() made it
         # Whether the sharding takes the hierarchical dist; None until setup().
@@ -260,7 +260,7 @@ class HierSharding:
     def setup(
         self,
         dist_types: Sequence[int],
-        weights: bool,
+        weighted: bool,
         index_dedup: bool,
     ) -> bool:
         """Whether this sharding takes the hierarchical dist, the same on
@@ -271,7 +271,7 @@ class HierSharding:
         TorchRec's dists with a warning. A configuration it refuses (a
         ``continuous`` table among them), or keys that are not
         index-deduplicated (``index_dedup`` False), raises ValueError under
-        ``"fused"`` and takes TorchRec's dists with a warning under
+        ``"hierarchical"`` and takes TorchRec's dists with a warning under
         ``"auto"``. If a rank cannot build it, every rank warns and takes
         TorchRec's dists. See docs/hier_output_dist.md, sections 6 and 7.2."""
         if self.takes_hier_dist is not None:
@@ -287,7 +287,7 @@ class HierSharding:
         arguments = dict(
             self._arguments,
             dist_types=list(dist_types),
-            weights=weights,
+            weighted=weighted,
         )
         refusal = (
             hier_output_dist_invalid(rank=self._rank, **arguments)
@@ -324,8 +324,8 @@ class HierSharding:
             return False
         # Every rank has rank 0's arguments, so every rank refuses alike.
         if refusal:
-            if self._asked == "fused":
-                raise ValueError(f'output_dist="fused": {refusal}')
+            if self._asked == "hierarchical":
+                raise ValueError(f'output_dist="hierarchical": {refusal}')
             warnings.warn(
                 f'output_dist="{self._asked}": {refusal}; using TorchRec\'s dists'
             )
@@ -543,7 +543,7 @@ class RwSequenceHierEmbeddingDist(
 
     def __init__(
         self,
-        hier: HierSharding,
+        hier: HierDist,
         pg: dist.ProcessGroup,
         num_features: int,
         device: Optional[torch.device] = None,

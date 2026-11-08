@@ -69,11 +69,11 @@ SUPPORTED_DIST_TYPES: Tuple[str, ...] = tuple(DIST_TYPE_CODES)
 # of shard/hier_output_dist.py, or that one where the build has it and
 # TorchRec's elsewhere.
 TORCHREC_OUTPUT_DIST = "torchrec"
-FUSED_OUTPUT_DIST = "fused"
+HIERARCHICAL_OUTPUT_DIST = "hierarchical"
 AUTO_OUTPUT_DIST = "auto"
 SUPPORTED_OUTPUT_DISTS: Tuple[str, ...] = (
     TORCHREC_OUTPUT_DIST,
-    FUSED_OUTPUT_DIST,
+    HIERARCHICAL_OUTPUT_DIST,
     AUTO_OUTPUT_DIST,
 )
 # The capacities of output_dist_capacity, by name (see
@@ -642,7 +642,7 @@ class DynamicEmbTableOptions:
     dist_type : str
         Input distribution policy for row-wise sharding. Supported values are
         ``continuous``, ``roundrobin``, and ``hash_roundrobin``. Defaults to
-        ``roundrobin``. ``output_dist="fused"`` takes ``roundrobin`` and
+        ``roundrobin``. ``output_dist="hierarchical"`` takes ``roundrobin`` and
         ``hash_roundrobin`` only: a row-wise sequence sharding with a
         ``continuous`` table raises ``ValueError`` at its first
         ``input_dist()`` (``"auto"`` takes TorchRec's dists there, with a
@@ -756,9 +756,9 @@ class DynamicEmbTableOptions:
     output_dist: str = "torchrec"
     """How a row-wise sequence (EmbeddingCollection) sharding moves keys to
     the ranks that own them and looked-up rows back. ``"torchrec"`` is
-    TorchRec's input and output dists. ``"fused"`` is the hierarchical dist:
-    keys and rows move over NVLink inside a node and over the rails (NCCL
-    GIN) between nodes, with one host sync per call. It needs DynamicEmb
+    TorchRec's input and output dists. ``"hierarchical"`` is the hierarchical
+    dist: keys and rows move over NVLink inside a node and over the rails
+    (NCCL GIN) between nodes, with one host sync per call. It needs DynamicEmb
     built against NCCL >= 2.30.7 (else ``ImportError`` when the model is
     sharded), ``output_dist_capacity``, index dedup (the sharder's
     ``use_index_dedup=True``; else ``ValueError`` at the first
@@ -767,8 +767,8 @@ class DynamicEmbTableOptions:
     of ``score_strategy`` ``PRECISE_CUSTOMIZED`` make it raise ``ValueError``
     when the model is sharded. Every GPU of a node gives it keys of
     one dtype (``int32`` or ``int64``) in a call, which it does not check
-    (docs/hier_output_dist.md, section 9). ``"auto"`` is ``"fused"`` where the
-    build has it, ``output_dist_capacity`` is set, the keys are
+    (docs/hier_output_dist.md, section 9). ``"auto"`` is ``"hierarchical"``
+    where the build has it, ``output_dist_capacity`` is set, the keys are
     index-deduplicated and no table of the sharding is ``"continuous"`` or
     takes a score per key, and TorchRec's dists (with a warning) elsewhere.
     Pooled shardings ignore it.
@@ -777,18 +777,18 @@ class DynamicEmbTableOptions:
     docs/hier_output_dist.md, section 4."""
 
     node_dedup: bool = True
-    """With ``output_dist="fused"`` (or ``"auto"``) across nodes, a node sends
-    each key once and sums its gradient rows before they cross back. With
-    bf16 or fp16 rows that sum adds one rounding to TorchRec's. ``False``
-    sends every occurrence instead, as TorchRec does (more InfiniBand
-    traffic). Gradient clipping turns it off. Other output dists ignore it,
-    but every DynamicEmb table of a sharding sets it alike. See
+    """With ``output_dist="hierarchical"`` (or ``"auto"``) across nodes, a
+    node sends each key once and sums its gradient rows before they cross
+    back. With bf16 or fp16 rows that sum adds one rounding to TorchRec's.
+    ``False`` sends every occurrence instead, as TorchRec does (more
+    InfiniBand traffic). Gradient clipping turns it off. Other output dists
+    ignore it, but every DynamicEmb table of a sharding sets it alike. See
     docs/hier_output_dist.md, section 9."""
 
     output_dist_capacity: Optional[Union[int, Dict[str, int]]] = None
-    """The capacities of ``output_dist="fused"`` (and ``"auto"``), in entries,
-    fixed for the model's life: its buffers are made once, at the first
-    ``input_dist()``. A dict sets each by name:
+    """The capacities of ``output_dist="hierarchical"`` (and ``"auto"``), in
+    entries, fixed for the model's life: its buffers are made once, at the
+    first ``input_dist()``. A dict sets each by name:
 
     * ``"lookup_keys"``: the keys an owner looks up;
     * ``"remote_keys"`` (across nodes): the keys of other nodes' owners a GPU
@@ -796,10 +796,10 @@ class DynamicEmbTableOptions:
 
     An int sets both. Each is a positive int below 2^31 - 1024. A call that
     needs more raises RuntimeError at its second wait, on every rank, naming
-    the capacity to raise. ``"fused"`` needs it, and ``"auto"`` without it
-    takes TorchRec's dists. Other output dists ignore it, but every DynamicEmb
-    table of a sharding sets it alike. See docs/hier_output_dist.md,
-    section 5."""
+    the capacity to raise. ``"hierarchical"`` needs it, and ``"auto"``
+    without it takes TorchRec's dists. Other output dists ignore it, but
+    every DynamicEmb table of a sharding sets it alike. See
+    docs/hier_output_dist.md, section 5."""
 
     optimizer_state_dtype: Optional[torch.dtype] = None
     """Precision the optimizer state is kept at, and the ``optim_state_dtype`` a
@@ -893,10 +893,10 @@ class DynamicEmbTableOptions:
             )
 
         if cap is None:
-            if self.output_dist == FUSED_OUTPUT_DIST:
+            if self.output_dist == HIERARCHICAL_OUTPUT_DIST:
                 raise ValueError(
-                    'output_dist="fused" needs output_dist_capacity: an int, or a '
-                    f"dict of {OUTPUT_DIST_CAPACITY_NAMES}."
+                    'output_dist="hierarchical" needs output_dist_capacity: an int, '
+                    f"or a dict of {OUTPUT_DIST_CAPACITY_NAMES}."
                 )
             return
         if isinstance(cap, dict):

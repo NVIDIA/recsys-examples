@@ -187,13 +187,13 @@ void fail_next_construction(bool fail_alloc) { g_fail_alloc = fail_alloc; }
 HierOutputDist::HierOutputDist(const std::string &unique_id, int64_t rank, int64_t world_size,
                                int64_t local_size, const std::vector<int64_t> &feature_tables,
                                const std::vector<int64_t> &dist_types, int64_t dim,
-                               at::ScalarType dtype, bool weights, bool node_dedup,
+                               at::ScalarType dtype, bool weighted, bool node_dedup,
                                int64_t lookup_keys, int64_t remote_keys, int64_t proxy_bytes,
-                               double timeout_s, int64_t ctas, int64_t reduce_ctas,
-                               int64_t chunk_kb)
+                               double timeout_s, int64_t out_ctas, int64_t reduce_ctas,
+                               int64_t payload_kb)
     : config_(validated(config_of(rank, world_size, local_size, feature_tables, dist_types, dim,
-                                  dtype, weights, node_dedup, lookup_keys, remote_keys, proxy_bytes,
-                                  timeout_s, ctas, reduce_ctas, chunk_kb))),
+                                  dtype, weighted, node_dedup, lookup_keys, remote_keys,
+                                  proxy_bytes, timeout_s, out_ctas, reduce_ctas, payload_kb))),
       sizes_(sizes_of(config_)),
       device_(current_device()) {
   c10::cuda::CUDAGuard guard(device_);

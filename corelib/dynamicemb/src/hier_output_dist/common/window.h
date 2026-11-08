@@ -377,7 +377,7 @@ class KeysLayout {
     };
     node_offsets_ = take(8 * (uint64_t)(local_size_ * offset_words_));
     node_keys_ = take(8 * entries);
-    node_key_weights_ = take(sizes.weights ? 4 * entries : 0);
+    node_key_weights_ = take(sizes.weighted ? 4 * entries : 0);
     node_bucket_feature_of_row_ = take(multi ? 4 * (uint64_t)remote_keys_ : 0);
     remote_map_ = take(multi ? 4 * RemoteMap::kArrays * (uint64_t)remote_keys_ : 0);
     proxy_header_ = take(multi ? 4 * (uint64_t)ProxyHeader::of(sizes).words() : 0);

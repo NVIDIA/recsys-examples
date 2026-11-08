@@ -562,17 +562,17 @@ to move keys and rows between GPUs (`--output_dist`):
 
 * `torchrec`: TorchRec's input and output dists (bucketize and NCCL
   all-to-alls; reorder, all-to-all, `index_select`).
-* `fused`: DynamicEmb's hierarchical dist
+* `hierarchical`: DynamicEmb's hierarchical dist
   ([docs/hier_output_dist.md](../docs/hier_output_dist.md)). Its own input
   dist does all the planning, with one host sync per call. Its output dist
   only moves rows, one kernel per direction. Its capacities come from the
   benchmark's own batches (`--capacity`). It takes index-deduplicated keys:
   it needs `--use_index_dedup`.
-* `auto`: `fused` where the build has it, else `torchrec`.
+* `auto`: `hierarchical` where the build has it, else `torchrec`.
 
 ### How to run
 
-`fused` needs DynamicEmb built against NCCL 2.30.7 or newer
+`hierarchical` needs DynamicEmb built against NCCL 2.30.7 or newer
 ([docs/hier_output_dist.md](../docs/hier_output_dist.md), section 4.2);
 `auto` takes TorchRec's dists on a build without it, and `torchrec` runs on
 any build. Run from `corelib/dynamicemb`, with DynamicEmb installed, one
@@ -590,11 +590,11 @@ export NCCL_CROSS_NIC=0                            # GIN on the rails only (reco
 export NCCL_NET_PLUGIN=none NCCL_GIN_PLUGIN=none   # only where NCCL's plugin cannot run GIN (Eos)
 
 # 1 node, 8 GPUs
-torchrun --nproc_per_node 8 $BENCH $ARGS --output_dist fused
+torchrun --nproc_per_node 8 $BENCH $ARGS --output_dist hierarchical
 
 # 2 or 4 nodes under Slurm, one task per GPU
-srun -N 2 --ntasks-per-node 8 python $BENCH $ARGS --output_dist fused
-srun -N 4 --ntasks-per-node 8 python $BENCH $ARGS --output_dist fused
+srun -N 2 --ntasks-per-node 8 python $BENCH $ARGS --output_dist hierarchical
+srun -N 4 --ntasks-per-node 8 python $BENCH $ARGS --output_dist hierarchical
 ```
 
 * The script reads torchrun's variables, or makes them from Slurm's: `RANK`,
@@ -608,9 +608,9 @@ srun -N 4 --ntasks-per-node 8 python $BENCH $ARGS --output_dist fused
 * Run one multi-node job step at a time, and compare setups on the same
   nodes, in turn (the network is shared and nodes differ).
 
-Before it builds the model, `fused` counts what the benchmark's own batches
-need of each capacity (`--capacity measure`, the default), and takes
-`--capacity_headroom` (1.25) times that. So every call fits: a call that
+Before it builds the model, `hierarchical` counts what the benchmark's own
+batches need of each capacity (`--capacity measure`, the default), and takes
+`--capacity_factor` (1.25) times that. So every call fits: a call that
 does not raises at its second wait, naming the capacity to raise.
 
 The configuration above has 8 tables of 4,000,000 rows, dim 128, fp32, SGD,
@@ -618,8 +618,8 @@ The configuration above has 8 tables of 4,000,000 rows, dim 128, fp32, SGD,
 GPU and iteration) and index dedup. Two workloads, each with both dists:
 
 ```bash
-for DIST in torchrec fused; do
-  EXTRA="--nic_counters"; [ $DIST = fused ] && EXTRA="$EXTRA --kernel_times"
+for DIST in torchrec hierarchical; do
+  EXTRA="--nic_counters"; [ $DIST = hierarchical ] && EXTRA="$EXTRA --kernel_times"
   $LAUNCH $BENCH $ARGS --output_dist $DIST $EXTRA                     # uniform keys
   $LAUNCH $BENCH $ARGS --output_dist $DIST $EXTRA --key_dist pow-law  # power-law keys
 done      # $LAUNCH: the torchrun or srun prefix above
@@ -635,7 +635,7 @@ More runs on the same configuration:
   TorchRec's dists.
 * `--pipeline sparse_dist` or `--pipeline prefetch`: TorchRec's
   `TrainPipelineSparseDist` or `PrefetchTrainPipelineSparseDist`.
-* `--trace --trace_out run.npz` (`fused`, on a build with
+* `--trace --trace_out run.npz` (`hierarchical`, on a build with
   `DYNAMICEMB_HIER_TRACE=1`): the output dist's kernel timelines, IB and
   NVLink use and their overlap. A traced build is slower, so take times from
   a build without the trace.
@@ -647,15 +647,15 @@ A large-batch workload: one table of 268 million rows, bf16, and 16,384
 samples per GPU with 1,536 keys each (about 25 million keys per GPU and
 iteration). The rows of a proxy for one call (3.1 GB on 2 nodes, 4.6 GB on
 4 nodes) go through its ring in laps. The ring is 512 MiB at most by default
-(`DYNAMICEMB_GIN_PROXY_MB`, [docs/hier_output_dist.md](../docs/hier_output_dist.md),
+(`DYNAMICEMB_HIER_PROXY_MB`, [docs/hier_output_dist.md](../docs/hier_output_dist.md),
 sections 12.1 and 15.3). A larger cap holds the whole stream in one lap:
 
 ```bash
 LARGE="--num_tables 1 --num_embeddings 268435456 --local_batch_size 16384 \
        --max_seq_len 1536 --seq_len_dist fixed --emb_dtype bf16 --output_dtype bf16 \
        --num_iterations 10 --warmup 3 --use_index_dedup"
-$LAUNCH $BENCH $LARGE --output_dist fused --kernel_times                    # laps
-DYNAMICEMB_GIN_PROXY_MB=12288 $LAUNCH $BENCH $LARGE --output_dist fused --kernel_times  # one lap
+$LAUNCH $BENCH $LARGE --output_dist hierarchical --kernel_times                    # laps
+DYNAMICEMB_HIER_PROXY_MB=12288 $LAUNCH $BENCH $LARGE --output_dist hierarchical --kernel_times  # one lap
 ```
 
 On Eos (H100, 8 GPUs per node), the kernels of the output dist take these
@@ -668,9 +668,9 @@ times, in ms (the median of 2 runs, with the default ring):
 | power-law | 4 | | 16.9 | 29.6 |
 
 These times are from chunks of 2 MiB of rows, before
-`DYNAMICEMB_GIN_CHUNK_KB` (512 by default): `DYNAMICEMB_GIN_CHUNK_KB=2048`
-gives those chunks ([docs/hier_output_dist.md](../docs/hier_output_dist.md),
-section 4.4).
+`DYNAMICEMB_HIER_PAYLOAD_KB` (512 by default):
+`DYNAMICEMB_HIER_PAYLOAD_KB=2048` gives those chunks
+([docs/hier_output_dist.md](../docs/hier_output_dist.md), section 4.4).
 
 The laps cost little. A ring that holds the whole stream in one lap makes no
 kernel more than 2.5% faster (47.9 and 49.2 ms on 2 nodes, 70.3 and 71.0 ms
@@ -684,9 +684,9 @@ same nodes. Now a worker takes the remote tasks that do not wait first (see
 
 | option | default | meaning |
 |---|---|---|
-| `--output_dist` | `torchrec` | `torchrec`, `fused` or `auto` (see above); `fused` and `auto` need `--use_index_dedup` |
-| `--capacity` | `measure` | The hierarchical dist's `output_dist_capacity`. An int sets `lookup_keys` and `remote_keys` to that many keys. `measure` counts what the benchmark's own batches need of each, as the dist counts it, before the model is built (`hier_needs` in `benchmark_utils.py`, on a process group made for it and destroyed after). It takes `--capacity_headroom` times that, and at least 4096 entries more (`hier_capacities`). A call that does not fit raises at its second wait. |
-| `--capacity_headroom` | 1.25 | with `--capacity measure`: the capacities over the measured needs |
+| `--output_dist` | `torchrec` | `torchrec`, `hierarchical` or `auto` (see above); `hierarchical` and `auto` need `--use_index_dedup` |
+| `--capacity` | `measure` | The hierarchical dist's `output_dist_capacity`. An int sets `lookup_keys` and `remote_keys` to that many keys. `measure` counts what the benchmark's own batches need of each, as the dist counts it, before the model is built (`hier_needs` in `benchmark_utils.py`, on a process group made for it and destroyed after). It takes `--capacity_factor` times that, and at least 4096 entries more (`hier_capacities`). A call that does not fit raises at its second wait. |
+| `--capacity_factor` | 1.25 | with `--capacity measure`: the capacities over the measured needs |
 | `--pipeline` | `none` | `none`: plain loop (forward, then backward, one batch at a time); `sparse_dist`: `TrainPipelineSparseDist`; `prefetch`: `PrefetchTrainPipelineSparseDist`. Under a pipeline the report gives whole iterations, and `--check` runs the checked model under it |
 | `--num_tables` | 8 | tables |
 | `--features_per_table` | 1 | features sharing each table (keys drawn alike for each) |
@@ -698,12 +698,12 @@ same nodes. Now a worker takes the remote tasks that do not wait first (see
 | `--key_range` | `--num_embeddings` | uniform keys are drawn from [0, key_range), pow-law ones from [1, key_range) |
 | `--dist_type` | `roundrobin` | which rank owns a key: `roundrobin` (key mod ranks) or `hash_roundrobin` (hashed key mod ranks) |
 | `--emb_dtype`, `--output_dtype` | `fp32` | `fp32`, `bf16` or `fp16` |
-| `--use_index_dedup` | off | TorchRec's index dedup: each rank removes its own repeated keys before the input dist. The hierarchical dist (`fused`, `auto`, `--check`) needs it |
+| `--use_index_dedup` | off | TorchRec's index dedup: each rank removes its own repeated keys before the input dist. The hierarchical dist (`hierarchical`, `auto`, `--check`) needs it |
 | `--optimizer`, `--learning_rate` | `sgd`, 0.01 | `sgd`, `adam`, `exact_adagrad` or `rowwise_adagrad` |
 | `--num_iterations`, `--warmup` | 30, 10 | timed and untimed iterations, at least 1 each |
 | `--seed` | 1234 | seed of the batches (different for each rank) |
 | `--profile_iterations` | 5 | that many more iterations under `torch.profiler`, for the per-stage kernel times and counts; 0 skips them |
-| `--check` | off | Before timing, train 4 steps of two models side by side: one on TorchRec's dists, and one on the hierarchical dist (`--output_dist`'s, or `fused` when that is `torchrec`), both with `--use_index_dedup`, which it needs. Both start from the DEBUG initializer, where a key's row is a function of the key. They use SGD at learning rate 1, and keys from an eighth of the table, so nothing is evicted. The capacities are `--capacity`, or measured on the check's own batches. Then print PASSED or FAILED. Outputs must match bit for bit when `--emb_dtype` and `--output_dtype` are both `fp32` and the world size is a power of two. Otherwise they must match bit for bit at the first step, and within 1e-2 after it. The checked model must also have launched its own output dist's kernels at every step, both ways. A sharding that took TorchRec's dists (one rank, for example) prints `FAILED (the <dist> model fell back to TorchRec's dists)`, where `<dist>` is `fused` or `auto`. A failure exits with status 1. |
+| `--check` | off | Before timing, train 4 steps of two models side by side: one on TorchRec's dists, and one on the hierarchical dist (`--output_dist`'s, or `hierarchical` when that is `torchrec`), both with `--use_index_dedup`, which it needs. Both start from the DEBUG initializer, where a key's row is a function of the key. They use SGD at learning rate 1, and keys from an eighth of the table, so nothing is evicted. The capacities are `--capacity`, or measured on the check's own batches. Then print PASSED or FAILED. Outputs must match bit for bit when `--emb_dtype` and `--output_dtype` are both `fp32` and the world size is a power of two. Otherwise they must match bit for bit at the first step, and within 1e-2 after it. The checked model must also have launched its own output dist's kernels at every step, both ways. A sharding that took TorchRec's dists (one rank, for example) prints `FAILED (the <dist> model fell back to TorchRec's dists)`, where `<dist>` is `hierarchical` or `auto`. A failure exits with status 1. |
 | `--trace` | off | The hierarchical dist's kernel timelines. It needs DynamicEmb built with `DYNAMICEMB_HIER_TRACE=1` (`docs/hier_output_dist.md`, section 4.4), and else stops with `--trace: rebuild with DYNAMICEMB_HIER_TRACE=1`. It keeps the timelines of the last 64 calls of each direction (every timed call at 64 iterations or fewer), and puts every rank's time stamps on rank 0's clock. It reports the traced metrics below (IB, NVLink and their overlap). A traced build traces every output-dist kernel: two memsets per kernel and counters in shared memory; `--trace` adds two clock stamps per input dist. So its times and kernel counts do not compare with an untraced build's. |
 | `--trace_out` | none | with `--trace`: save every rank's traced kernels of the timed iterations to this `.npz` file, for offline analysis |
 | `--kernel_times` | off | After the timed iterations, as many again under a CUDA-only profiler. It reports every call's output-dist kernel times, with their wait at the start for the other ranks (the hierarchical dist only). |
@@ -723,7 +723,7 @@ names are in backticks. The JSON line holds more than these measures.
 | step | `iter_ms_host` | Wall time of the timed iterations divided by their number, on rank 0 (`time.perf_counter` around the loop, which ends with a device sync), for the plain loop or a pipeline. |
 | input-dist segment | `in_seg_ms_mean`, `in_seg_ms_per_call`, `in_seg_steps_ms` | Plain loop. Four CUDA events on the caller's stream: before `input_dist()`, after it, after the first wait, and after the second wait, when the lookup may start. The segment runs from the first event to the last, idle time from host syncs included. `in_seg_ms_mean` is its mean over calls and ranks, `in_seg_ms_per_call` holds every call, and `in_seg_steps_ms` the three steps. TorchRec's input dist is measured the same way. The first timed call is slow on every dist, because the GPU waits for the CPU when the loop starts. |
 | stages | `stages` | Profiled iterations: per stage of the forward or the backward (`fwd/input_dist`, `fwd/lookup`, `bwd/output_dist`, ...), the GPU ms per iteration of its kernels (`ms`) and their count (`kernels`), the mean over ranks. `net_ms` is the time of the output dist's kernels that move rows between GPUs: NCCL's, or `fwd_kernel` and `bwd_kernel`. |
-| output dist, events | `output_dist_event_ms_median` | Plain loop, `fused`: CUDA events right before and after the output dist's forward and backward launches, in the timed iterations, with no profiler running; the median over calls of the mean over ranks. They hold the kernel's wait at its start for the other ranks and, when the GPU is idle at the launch, the launch's own CPU time. |
+| output dist, events | `output_dist_event_ms_median` | Plain loop, `hierarchical`: CUDA events right before and after the output dist's forward and backward launches, in the timed iterations, with no profiler running; the median over calls of the mean over ranks. They hold the kernel's wait at its start for the other ranks and, when the GPU is idle at the launch, the launch's own CPU time. |
 | output-dist kernels | `output_dist_kernel_ms_median` | `--kernel_times`: the GPU ms of every call's forward and backward kernel under a CUDA-only profiler, the median over calls. |
 
 **InfiniBand.** A NIC's bytes in a direction are the more of what it sends
@@ -731,13 +731,13 @@ and what it receives (rows × row bytes, from the dist's plan).
 
 | metric | JSON field | definition |
 |---|---|---|
-| IB event basis | `ib_event_basis_calls` | Plain loop, `fused`: each NIC's bytes over its GPU's output-dist time from the events above; the median over calls of the mean over NICs (`mean`), and of the busiest NIC's bytes over the slowest GPU's time (`bottleneck`). |
+| IB event basis | `ib_event_basis_calls` | Plain loop, `hierarchical`: each NIC's bytes over its GPU's output-dist time from the events above; the median over calls of the mean over NICs (`mean`), and of the busiest NIC's bytes over the slowest GPU's time (`bottleneck`). |
 | IB in-kernel | `trace[dir]["ib_inkern"]` | `--trace`: the bytes over the kernel's time once every rank has started, `end_us − skew_all`: its time to its exit, less its wait for the latest rank to start. |
 | IB windows | `trace[dir]["ib_win_out"]`, `trace[dir]["ib_win_in"]` | `--trace`: the bytes sent, from the first put until all puts are done; and the bytes received, from the earlier of the first landing and the senders' first put until all rows have landed. |
 | first IB put | `trace[dir]["first_put"]` | `--trace`: µs from the kernel's start to its first IB put. |
 | TorchRec's IB basis | `ib_kernel_basis` (`pxn`) | Profiled iterations, `torchrec`: each NIC's bytes over the node's longest NCCL kernel (`net_ms`). They are counted as NCCL's PXN routing sends them: the NIC of a node on a rail sends that node's rows for the GPUs of that rail on the other nodes. |
 | NIC counters | `nic_bytes_per_iter` | `--nic_counters`: the bytes each InfiniBand port of each node sent and received per iteration, from the port counters. |
-| node dedup ratio | `traffic_mean` | `fused`: `rows_ib_out / rows_remote`, the rows owners put over IB over the rows asked of owners on other nodes, per iteration. |
+| node dedup ratio | `traffic_mean` | `hierarchical`: `rows_ib_out / rows_remote`, the rows owners put over IB over the rows asked of owners on other nodes, per iteration. |
 
 **NVLink.** On one node, NVLink use is that of the busiest port, which the
 benchmark does not print. Per call and direction, take the rank that
@@ -793,7 +793,7 @@ is also a single `.cu` file with its build and run lines at the top (`nvcc
 -O3 -arch=sm_90 ... -lnccl`, then `srun` with one process per GPU on 2 or
 more nodes). Each GPU sends a stream of 2 MiB chunks (the tool's default
 chunk size, its second argument, and the dist's chunks before
-`DYNAMICEMB_GIN_CHUNK_KB`) with GIN puts to the GPUs of its rail on the
+`DYNAMICEMB_HIER_PAYLOAD_KB`) with GIN puts to the GPUs of its rail on the
 other nodes, in the order in which the proxies of the hierarchical dist
 send their chunks (`docs/hier_output_dist.md`, section 12.1): 16 of the
 stream's rounds, each of one chunk for each other node. It sends the stream

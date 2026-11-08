@@ -153,7 +153,7 @@ class Case:
     max_block: int = 6  # a requester's keys of one (owner, feature), at most
     key_range: int = 40
     hot: float = 0.0  # share of keys that are key 7
-    weights: bool = False  # the keys carry weights (whole numbers: frequency counts)
+    weighted: bool = False  # the keys carry weights (whole numbers: frequency counts)
     # index dedup: a rank keeps each (table, key) once (False: the call breaks
     # the bound of local_size occurrences per key, a need)
     dedup: bool = True
@@ -186,7 +186,7 @@ class Case:
 
     @property
     def record_bytes(self) -> int:
-        return 16 if self.weights else 8
+        return 16 if self.weighted else 8
 
     @property
     def max_chunk_rows(self) -> int:
@@ -283,7 +283,7 @@ CASES = [
         max_block=40,
         key_range=30,
         hot=0.5,
-        weights=True,
+        weighted=True,
         max_chunk_rows_arg=300,
     ),
     Case(
@@ -294,7 +294,7 @@ CASES = [
         max_block=40,
         key_range=30,
         hot=0.5,
-        weights=True,
+        weighted=True,
         max_chunk_rows_arg=60,
         payload_rows=10,
     ),
@@ -312,7 +312,7 @@ CASES = [
         max_block=200,
         key_range=400,
         hot=0.08,
-        weights=True,
+        weighted=True,
         num_proxy_rows=1280,
     ),
     Case(
@@ -330,7 +330,7 @@ CASES = [
         max_block=10,
         key_range=60,
         hot=0.3,
-        weights=True,
+        weighted=True,
         node_dedup=False,
     ),
     Case(
@@ -338,7 +338,7 @@ CASES = [
         max_block=10,
         key_range=60,
         hot=0.3,
-        weights=True,
+        weighted=True,
         node_dedup=False,
         max_chunk_rows_arg=30,
         payload_rows=10,
@@ -377,7 +377,7 @@ CASES = [
         max_block=200,
         key_range=400,
         hot=0.08,
-        weights=True,
+        weighted=True,
         num_proxy_rows=3840,
         seeds=1,
     ),
@@ -386,7 +386,7 @@ CASES = [
         max_block=200,
         key_range=400,
         hot=0.08,
-        weights=True,
+        weighted=True,
         num_proxy_rows=960,
         max_chunk_rows_arg=400,
         payload_rows=50,
@@ -399,7 +399,7 @@ CASES = [
         max_block=250,
         key_range=3000,
         hot=0.1,
-        weights=True,
+        weighted=True,
         num_proxy_rows=2560,
         seeds=1,
     ),
@@ -427,7 +427,7 @@ CASES = [
         payload_rows=10,
     ),
     Case("4 nodes of 8", local_size=8, max_block=3, key_range=20, hot=0.1, seeds=1),
-    Case("index dedup's bound", bound=50, weights=True, hot=0.2),
+    Case("index dedup's bound", bound=50, weighted=True, hot=0.2),
     Case("an empty call", max_block=0),
     Case("an empty call, index dedup's bound", max_block=0, bound=20),
     Case(
@@ -471,7 +471,7 @@ CASES = [
     Case(
         "remote_keys overflow, weights, bound",
         max_block=20,
-        weights=True,
+        weighted=True,
         bound=30,
         remote_slack=-1,
     ),
@@ -480,7 +480,7 @@ CASES = [
         "lookup_keys past one gather slice",
         num_nodes=2,
         local_size=2,
-        weights=True,
+        weighted=True,
         lookup_slack=1 << 22,
         seeds=1,
     ),
@@ -543,7 +543,7 @@ CASES = [
         max_block=200,
         key_range=400,
         hot=0.08,
-        weights=True,
+        weighted=True,
         dedup=False,
         num_proxy_rows=1280,
     ),
@@ -666,7 +666,7 @@ def make_windows(
             local_size * remote_keys, torch.int32, generator
         ).view(local_size, remote_keys),
     )
-    if case.weights:
+    if case.weighted:
         buffers["node_key_weights"] = garbage(entries, torch.float32, generator).view(
             local_size, -1
         )
@@ -895,7 +895,7 @@ def proxy_reference(case: Case, occurrences: List, node: int, remote_keys: int) 
     records = []
     for *_, rep, group in keys:
         weight = 0.0
-        if case.weights:
+        if case.weighted:
             weight = float(sum(occurrences[occ][5] for occ in group))
         records.append((occurrences[rep][4], weight))
     slice_bytes = [
@@ -983,7 +983,7 @@ def dedup_by_merge_rank(case: Case, occurrences: List) -> Dict:
     for group in members.values():
         owner_node, feature, key = occurrences[group[0]][2:5]
         weight = 0.0
-        if case.weights:
+        if case.weighted:
             weight = float(sum(occurrences[occ][5] for occ in group))
         records_of.setdefault((owner_node, feature), []).append((key, weight))
     return {
@@ -1092,7 +1092,7 @@ def run_call(
             hier_output_dist_node_push,
             bucketized["values"],
             bucketized["inv"],
-            bucketized["kjt_weights"] if case.weights else None,
+            bucketized["kjt_weights"] if case.weighted else None,
             bucketized["bucket_feature_of_row"],
             bucketized["offset_per_bucket"],
             layouts[rank]["row_shift"],
@@ -1113,7 +1113,7 @@ def run_call(
             planner(
                 hier_output_dist_proxy_plan,
                 window["node_keys"][lookup_keys:],
-                window["node_key_weights"][lookup_keys:] if case.weights else None,
+                window["node_key_weights"][lookup_keys:] if case.weighted else None,
                 window["node_bucket_feature_of_row"],
                 layout["remote_offsets"],
                 layout["skip"],
@@ -1192,7 +1192,7 @@ def run_call(
                 rail_keys=window["rail_keys"],
                 node_keys=window["node_keys"][:lookup_keys],
                 node_key_weights=window["node_key_weights"][:lookup_keys]
-                if case.weights
+                if case.weighted
                 else None,
             )
         )
@@ -1671,7 +1671,8 @@ def check_owner(case: Case, rank: int, ranks: List[Dict], refs: Dict, out: Dict)
             lengths.append(len(rows))
             keys += [bucketized["keys_list"][row] for row in rows]
             weights += [
-                bucketized["weights_list"][row] if case.weights else 1.0 for row in rows
+                bucketized["weights_list"][row] if case.weighted else 1.0
+                for row in rows
             ]
         for other_node in others:
             ref = refs[(other_node, rail)]

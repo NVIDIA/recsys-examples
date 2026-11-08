@@ -12,7 +12,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""The hierarchical dist (``output_dist="fused"``) against TorchRec's dists.
+"""The hierarchical dist (``output_dist="hierarchical"``) against TorchRec's
+dists.
 
 Each case builds the same EmbeddingCollection of DynamicEmb tables twice, on
 TorchRec's dists and on the hierarchical dist, and trains both on the same
@@ -28,10 +29,10 @@ checks:
 
 Before the cases: the sharding shapes, the ranks' agreement, a sharding with
 a ``continuous`` feature outside a model, and the options (a model without
-index dedup, and a sharding with a ``continuous`` table: ``"fused"`` raises
-``ValueError`` at its first input dist, ``"auto"`` takes TorchRec's dists).
-After them: an input dist that waits for the device nowhere but in its
-second wait, the output dist's call orders, the backward run to run, the
+index dedup, and a sharding with a ``continuous`` table: ``"hierarchical"``
+raises ``ValueError`` at its first input dist, ``"auto"`` takes TorchRec's
+dists). After them: an input dist that waits for the device nowhere but in
+its second wait, the output dist's call orders, the backward run to run, the
 window and the trace APIs, failed constructions, across nodes a proxy rows
 cap below the least rows of the proxy's ring, and the teardown.
 
@@ -41,7 +42,7 @@ across nodes under Slurm)::
     torchrun --nproc_per_node 8 test/unit_tests/test_hier_dist.py
     srun --ntasks-per-node 8 python test/unit_tests/test_hier_dist.py
 
-Across nodes, run it as is, and with ``DYNAMICEMB_GIN_PROXY_MB=1`` in the
+Across nodes, run it as is, and with ``DYNAMICEMB_HIER_PROXY_MB=1`` in the
 environment (a proxy rows cap of 1 MiB: the larger calls' streams of rows
 wrap the proxy's ring).
 """
@@ -83,7 +84,7 @@ from dynamicemb.planner import (
 )
 from dynamicemb.shard import DynamicEmbeddingCollectionSharder
 from dynamicemb.shard.embedding import ShardedDynamicEmbeddingCollection
-from dynamicemb.shard.hier_output_dist import HierSharding
+from dynamicemb.shard.hier_output_dist import HierDist
 from dynamicemb_extensions import (
     block_bucketize_sparse_features,
     hier_output_dist_fail_next_construction,
@@ -115,7 +116,7 @@ DTYPES = {
     "fp16": (DataType.FP16, SparseType.FP16),
 }
 # Every hierarchical dist built so far, to check its teardown ran.
-SHARDINGS: List[weakref.ref] = []
+HIER_DISTS: List[weakref.ref] = []
 SYNC_CALLS = (
     "cudaStreamSynchronize",
     "cudaEventSynchronize",
@@ -135,20 +136,20 @@ def all_true(ok: bool) -> bool:
 
 def bucketize_rules(num_features: int, world_size: int):
     """The bucketize's rule of each of ``num_features`` features, roundrobin
-    over ``world_size`` ranks, as ``HierSharding.setup`` takes them: a
+    over ``world_size`` ranks, as ``HierDist.setup`` takes them: a
     1-tuple of their DistType codes (a list)."""
     return ([DIST_TYPE_CODES["roundrobin"]] * num_features,)
 
 
-def standalone(group) -> HierSharding:
+def standalone(group) -> HierDist:
     """A hierarchical dist of 3 features of 32 fp32 columns on ``group``,
     outside any model, with capacities of 65536 entries and a proxy rows cap
     of 16 MiB (above the least rows of the proxy's ring); its op is built by
     ``setup``."""
     capacity = dict.fromkeys(OUTPUT_DIST_CAPACITY_NAMES, 1 << 16)
-    with environ("DYNAMICEMB_GIN_PROXY_MB", 16):
-        hier = HierSharding(group, 3, 32, torch.float32, capacity)
-    SHARDINGS.append(weakref.ref(hier))
+    with environ("DYNAMICEMB_HIER_PROXY_MB", 16):
+        hier = HierDist(group, 3, 32, torch.float32, capacity)
+    HIER_DISTS.append(weakref.ref(hier))
     return hier
 
 
@@ -475,7 +476,7 @@ def rw_sharding(ec: ShardedDynamicEmbeddingCollection):
     return list(ec._sharding_type_to_sharding.values())[rw_index(ec)]
 
 
-def hier_of(ec: ShardedDynamicEmbeddingCollection) -> Optional[HierSharding]:
+def hier_of(ec: ShardedDynamicEmbeddingCollection) -> Optional[HierDist]:
     """The row-wise sharding's hierarchical dist (None: TorchRec's)."""
     return getattr(rw_sharding(ec), "_hier", None)
 
@@ -487,7 +488,7 @@ def sharded_ec(model: DistributedModelParallel) -> ShardedDynamicEmbeddingCollec
         if isinstance(module, ShardedDynamicEmbeddingCollection)
     )
     if hier_of(ec) is not None:
-        SHARDINGS.append(weakref.ref(hier_of(ec)))
+        HIER_DISTS.append(weakref.ref(hier_of(ec)))
     return ec
 
 
@@ -569,13 +570,13 @@ def environ(name: str, value: Optional[object]):
             os.environ[name] = saved
 
 
-def fused_model(
+def hierarchical_model(
     case: Case, world_size: int, local_size: int, calls: Sequence[KeyedJaggedTensor]
 ) -> DistributedModelParallel:
     """The case's EC on the hierarchical dist alone, with the capacities its
     ``calls`` need."""
     capacity = capacities_for(case, calls, local_size)
-    return build_model(case, "fused", world_size, local_size, capacity)
+    return build_model(case, "hierarchical", world_size, local_size, capacity)
 
 
 class Probe:
@@ -805,7 +806,7 @@ class Pair:
         with warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter("always")
             self.hier_model = build_model(
-                case, "fused", world_size, local_size, capacity
+                case, "hierarchical", world_size, local_size, capacity
             )
         self.fell_back = any(
             "does not apply here" in str(warning.message) for warning in caught
@@ -1165,27 +1166,27 @@ def run_windows(rank: int, world_size: int, local_size: int, log: Callable) -> i
 
 def run_proxy_rows(rank: int, world_size: int, local_size: int, log: Callable) -> int:
     """Across nodes, a proxy rows cap below the least rows of the proxy's
-    ring: "fused" raises the same ValueError on every rank, naming the cap's
-    knob, and "auto" warns and takes TorchRec's dists."""
+    ring: "hierarchical" raises the same ValueError on every rank, naming the
+    cap's knob, and "auto" warns and takes TorchRec's dists."""
     # min_proxy_rows_for in common.h: two chunks of keys of the most rows (a
     # row per GPU of the node)
     least_rows = 4 * local_size
     cap_mb = least_rows * 4 * 32 / 2 / (1 << 20)  # half their fp32 rows of 32 columns
     capacity = dict.fromkeys(OUTPUT_DIST_CAPACITY_NAMES, 1 << 16)
     checks: Dict[str, bool] = {}
-    for asked in ("fused", "auto"):
-        with environ("DYNAMICEMB_GIN_PROXY_MB", cap_mb):
-            hier = HierSharding(
+    for asked in ("hierarchical", "auto"):
+        with environ("DYNAMICEMB_HIER_PROXY_MB", cap_mb):
+            hier = HierDist(
                 dist.group.WORLD, 3, 32, torch.float32, capacity, asked=asked
             )
         with warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter("always")
-            if asked == "fused":
+            if asked == "hierarchical":
                 msg = expect_error(
                     ValueError, hier.setup, *bucketize_rules(3, world_size), False, True
                 )
-                named = "DYNAMICEMB_GIN_PROXY_MB" in msg
-                checks["fused raised"] = named and same_everywhere(msg)
+                named = "DYNAMICEMB_HIER_PROXY_MB" in msg
+                checks["hierarchical raised"] = named and same_everywhere(msg)
             else:
                 took = hier.setup(*bucketize_rules(3, world_size), False, True)
                 checks["auto takes TorchRec's dists"] = took is False and any(
@@ -1212,23 +1213,26 @@ def option_error(**kwargs) -> str:
 
 def run_options(rank: int, world_size: int, local_size: int, log: Callable) -> int:
     """``output_dist`` and ``output_dist_capacity``: DynamicEmbTableOptions
-    raises ValueError for ``"fused"`` without a capacity and for an output
-    dist it does not know (naming those it knows); tables of one sharding
-    that ask for different capacities raise it when the model is sharded;
-    ``"auto"`` without a capacity takes TorchRec's dists with a warning, and
-    trains as they do. Tables that take a score per key
-    (``PRECISE_CUSTOMIZED``) raise ValueError under ``"fused"`` when the model
-    is sharded, on every rank alike; under ``"auto"`` the sharding warns and
-    takes TorchRec's dists. A model without index dedup, and a sharding with a
-    ``continuous`` table: under ``"fused"`` its first input dist raises
-    ValueError on every rank alike, under ``"auto"`` it warns and trains as
-    TorchRec's dists do."""
+    raises ValueError for ``"hierarchical"`` without a capacity and for an
+    output dist it does not know (naming those it knows); tables of one
+    sharding that ask for different capacities raise it when the model is
+    sharded; ``"auto"`` without a capacity takes TorchRec's dists with a
+    warning, and trains as they do. Tables that take a score per key
+    (``PRECISE_CUSTOMIZED``) raise ValueError under ``"hierarchical"`` when
+    the model is sharded, on every rank alike; under ``"auto"`` the sharding
+    warns and takes TorchRec's dists. A model without index dedup, and a
+    sharding with a ``continuous`` table: under ``"hierarchical"`` its first
+    input dist raises ValueError on every rank alike, under ``"auto"`` it
+    warns and trains as TorchRec's dists do."""
     every_capacity = dict.fromkeys(OUTPUT_DIST_CAPACITY_NAMES, 1 << 16)
-    unknown = option_error(output_dist="hierarchical", output_dist_capacity=4)
+    # the old name of "hierarchical" is refused (no alias)
+    unknown = option_error(output_dist="fused", output_dist_capacity=4)
     checks = {
-        "fused without a capacity": "output_dist" in option_error(output_dist="fused"),
+        "hierarchical without a capacity": (
+            "output_dist" in option_error(output_dist="hierarchical")
+        ),
         "an unknown output dist": all(
-            f"'{name}'" in unknown for name in ("torchrec", "fused", "auto")
+            f"'{name}'" in unknown for name in ("torchrec", "hierarchical", "auto")
         ),
     }
     case = Case("options")
@@ -1236,7 +1240,7 @@ def run_options(rank: int, world_size: int, local_size: int, log: Callable) -> i
         ValueError,
         build_model,
         case,
-        "fused",
+        "hierarchical",
         world_size,
         local_size,
         [every_capacity, {**every_capacity, "lookup_keys": 1 << 17}, every_capacity],
@@ -1244,10 +1248,16 @@ def run_options(rank: int, world_size: int, local_size: int, log: Callable) -> i
     checks["tables that disagree"] = "must agree on output_dist" in msg
     scored = replace(case, scored=True)
     refused_scored = expect_error(
-        ValueError, build_model, scored, "fused", world_size, local_size, every_capacity
+        ValueError,
+        build_model,
+        scored,
+        "hierarchical",
+        world_size,
+        local_size,
+        every_capacity,
     )
     # same_everywhere first: a collective, which every rank must reach
-    checks["fused with a score per key"] = same_everywhere(refused_scored) and (
+    checks["hierarchical with a score per key"] = same_everywhere(refused_scored) and (
         "does not carry a score per key" in refused_scored
     )
     with warnings.catch_warnings(record=True) as caught:
@@ -1273,12 +1283,14 @@ def run_options(rank: int, world_size: int, local_size: int, log: Callable) -> i
     )
     plain = replace(case, dedup=False)
     kjt = batch_of(plain, 141, 0, rank, world_size)
-    fused = sharded_ec(
-        build_model(plain, "fused", world_size, local_size, every_capacity)
+    hierarchical = sharded_ec(
+        build_model(plain, "hierarchical", world_size, local_size, every_capacity)
     )
-    refused = expect_error(ValueError, fused.input_dist, fused.create_context(), kjt)
+    refused = expect_error(
+        ValueError, hierarchical.input_dist, hierarchical.create_context(), kjt
+    )
     checks[
-        "fused without index dedup"
+        "hierarchical without index dedup"
     ] = "index-deduplicated" in refused and same_everywhere(refused)
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
@@ -1296,16 +1308,19 @@ def run_options(rank: int, world_size: int, local_size: int, log: Callable) -> i
     # one continuous table among cyclic ones refuses the whole sharding
     mixed = replace(case, rules=("roundrobin", "hash_roundrobin", "continuous"))
     kjt = batch_of(mixed, 142, 0, rank, world_size)
-    fused_cont = sharded_ec(
-        build_model(mixed, "fused", world_size, local_size, every_capacity)
+    hierarchical_cont = sharded_ec(
+        build_model(mixed, "hierarchical", world_size, local_size, every_capacity)
     )
     refused_cont = expect_error(
-        ValueError, fused_cont.input_dist, fused_cont.create_context(), kjt
+        ValueError,
+        hierarchical_cont.input_dist,
+        hierarchical_cont.create_context(),
+        kjt,
     )
-    checks["fused with a continuous table"] = (
+    checks["hierarchical with a continuous table"] = (
         '"continuous"' in refused_cont
         and same_everywhere(refused_cont)
-        and hier_of(fused_cont).op is None
+        and hier_of(hierarchical_cont).op is None
     )
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
@@ -1329,22 +1344,22 @@ def run_options(rank: int, world_size: int, local_size: int, log: Callable) -> i
         "options", checks, log, f": {msg}; {unknown}; {refused}; {refused_cont}"
     )
     torch.cuda.synchronize()  # before the tables' memory goes with the models
-    del auto, ref, auto_run, ref_run, fused, auto_plain, ref_plain
+    del auto, ref, auto_run, ref_run, hierarchical, auto_plain, ref_plain
     del auto_plain_run, ref_plain_run, auto_scored
-    del fused_cont, auto_cont, ref_cont, auto_cont_run, ref_cont_run
+    del hierarchical_cont, auto_cont, ref_cont, auto_cont_run, ref_cont_run
     return failures + gc_models(log)
 
 
 def run_agreement(rank: int, world_size: int, local_size: int, log: Callable) -> int:
     """Ranks whose arguments differ raise the same ValueError on every rank,
     naming the first rank and argument that differ, and none hangs: an
-    environment variable set on one rank (under ``"fused"``), and a capacity
-    that differs on one rank (under ``"auto"``). Then an op on the same group
-    builds."""
+    environment variable set on one rank (under ``"hierarchical"``), and a
+    capacity that differs on one rank (under ``"auto"``). Then an op on the
+    same group builds."""
     checks: Dict[str, bool] = {}
     last = world_size - 1
     messages = []
-    with environ("DYNAMICEMB_GIN_TIMEOUT_S", 60 if rank == last else None):
+    with environ("DYNAMICEMB_HIER_TIMEOUT_S", 60 if rank == last else None):
         hier = standalone(dist.group.WORLD)
     msg = expect_error(
         ValueError, hier.setup, *bucketize_rules(3, world_size), False, True
@@ -1359,11 +1374,9 @@ def run_agreement(rank: int, world_size: int, local_size: int, log: Callable) ->
     capacity = dict.fromkeys(OUTPUT_DIST_CAPACITY_NAMES, 1 << 16)
     if rank == last:
         capacity["lookup_keys"] = 1 << 15
-    with environ("DYNAMICEMB_GIN_PROXY_MB", 16):
-        hier = HierSharding(
-            dist.group.WORLD, 3, 32, torch.float32, capacity, asked="auto"
-        )
-    SHARDINGS.append(weakref.ref(hier))
+    with environ("DYNAMICEMB_HIER_PROXY_MB", 16):
+        hier = HierDist(dist.group.WORLD, 3, 32, torch.float32, capacity, asked="auto")
+    HIER_DISTS.append(weakref.ref(hier))
     msg = expect_error(
         ValueError, hier.setup, *bucketize_rules(3, world_size), False, True
     )
@@ -1385,25 +1398,25 @@ def run_agreement(rank: int, world_size: int, local_size: int, log: Callable) ->
 
 
 def run_rule_refusal(rank: int, world_size: int, local_size: int, log: Callable) -> int:
-    """A sharding with a ``continuous`` feature, outside a model: "fused"
-    raises the same ValueError on every rank, naming the rule, and builds no
-    op; "auto" warns and takes TorchRec's dists."""
+    """A sharding with a ``continuous`` feature, outside a model:
+    "hierarchical" raises the same ValueError on every rank, naming the rule,
+    and builds no op; "auto" warns and takes TorchRec's dists."""
     capacity = dict.fromkeys(OUTPUT_DIST_CAPACITY_NAMES, 1 << 16)
     (dist_types,) = bucketize_rules(3, world_size)
     dist_types[2] = DIST_TYPE_CODES["continuous"]
     checks: Dict[str, bool] = {}
     msg = ""
-    for asked in ("fused", "auto"):
-        with environ("DYNAMICEMB_GIN_PROXY_MB", 16):
-            hier = HierSharding(
+    for asked in ("hierarchical", "auto"):
+        with environ("DYNAMICEMB_HIER_PROXY_MB", 16):
+            hier = HierDist(
                 dist.group.WORLD, 3, 32, torch.float32, capacity, asked=asked
             )
-        SHARDINGS.append(weakref.ref(hier))
+        HIER_DISTS.append(weakref.ref(hier))
         with warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter("always")
-            if asked == "fused":
+            if asked == "hierarchical":
                 msg = expect_error(ValueError, hier.setup, dist_types, False, True)
-                checks["fused raised"] = (
+                checks["hierarchical raised"] = (
                     '"continuous"' in msg and same_everywhere(msg) and hier.op is None
                 )
             else:
@@ -1483,7 +1496,9 @@ def run_no_sync(rank: int, world_size: int, local_size: int, log: Callable) -> i
         ),
         (133, Case("no sync, a call that does not fit"), 64),
     ):
-        ec = sharded_ec(build_model(case, "fused", world_size, local_size, capacity))
+        ec = sharded_ec(
+            build_model(case, "hierarchical", world_size, local_size, capacity)
+        )
         kjt = batch_of(case, case_idx, 0, rank, world_size)
         # The first input_dist() builds the op (collective).
         ec.input_dist(ec.create_context(), kjt)
@@ -1695,7 +1710,7 @@ def run_determinism(rank: int, world_size: int, local_size: int, log: Callable) 
     for case in (replace(HEAVY_ROWS, name="determinism"),):
         torch.manual_seed(case_idx)
         calls = [batch_of(case, case_idx, 0, rank, world_size)]
-        ec = sharded_ec(fused_model(case, world_size, local_size, calls))
+        ec = sharded_ec(hierarchical_model(case, world_size, local_size, calls))
         probe = Probe(ec, case.dim)
         grads, on_op = [], True
         for _ in range(2):
@@ -1757,7 +1772,7 @@ def run_teardown(rank: int, world_size: int, local_size: int, log: Callable) -> 
         ("a peer drops it 3 s late", 20.0, 3.0),
         ("a peer keeps it past the limit", 2.0, 6.0),
     ):
-        with environ("DYNAMICEMB_GIN_TIMEOUT_S", timeout_s):
+        with environ("DYNAMICEMB_HIER_TIMEOUT_S", timeout_s):
             hier = standalone(dist.group.WORLD)
         ok = hier.setup(*bucketize_rules(3, world_size), False, True)
         dist.barrier()
@@ -1792,7 +1807,7 @@ def run_teardown_credits(
     everything, without a warning and without a hang."""
     case = Case("teardown with credits out")
     calls = [batch_of(case, 121, 0, rank, world_size)]
-    model = fused_model(case, world_size, local_size, calls)
+    model = hierarchical_model(case, world_size, local_size, calls)
     run = run_model(sharded_ec(model), batch_of(case, 121, 0, rank, world_size), False)
     on_op = run.result is not None
     torch.cuda.synchronize()
@@ -1803,7 +1818,7 @@ def run_teardown_credits(
     good = all_true(
         on_op
         and "[hier_output_dist]" not in err[0]
-        and all(ref() is None for ref in SHARDINGS)
+        and all(ref() is None for ref in HIER_DISTS)
     )
     log(f"teardown, right after a forward: [{'ok' if good else 'FAIL'}]")
     return int(not good)
@@ -1812,14 +1827,14 @@ def run_teardown_credits(
 def gc_models(log: Callable) -> int:
     """Drop a case's models on every rank at the same point (the hierarchical
     dist's teardown waits for its node peers'), and check it ran: no
-    HierSharding is left."""
+    HierDist is left."""
     torch.cuda.synchronize()
     dist.barrier()
     gc.collect()
     torch.cuda.empty_cache()
-    good = all_true(all(ref() is None for ref in SHARDINGS))
+    good = all_true(all(ref() is None for ref in HIER_DISTS))
     if not good:
-        log("teardown: a HierSharding outlived its model [FAIL]")
+        log("teardown: a HierDist outlived its model [FAIL]")
     return int(not good)
 
 

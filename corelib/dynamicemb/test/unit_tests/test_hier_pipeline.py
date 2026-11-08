@@ -12,7 +12,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""The hierarchical dist (``output_dist="fused"``) under the train pipelines.
+"""The hierarchical dist (``output_dist="hierarchical"``) under the train
+pipelines.
 
 Each loop and pipeline trains on the same batches as the plain loop, or as
 TorchRec's dists, under index dedup (which the hierarchical dist takes), and
@@ -24,7 +25,7 @@ stress runs (on one node also a rank that reads its node's offsets and keys
 late), shardings that take TorchRec's dists, and the teardown with a
 pipeline in flight. On one
 GPU the sharding takes TorchRec's dists. On a build without the op (NCCL
-older than 2.30.7), "fused" raises and "auto" takes TorchRec's dists.
+older than 2.30.7), "hierarchical" raises and "auto" takes TorchRec's dists.
 
 Run it from ``corelib/dynamicemb`` with ``examples`` on ``PYTHONPATH``, one
 process per GPU (on one node, or across nodes under Slurm)::
@@ -74,7 +75,7 @@ from dynamicemb.planner import (
 )
 from dynamicemb.shard import DynamicEmbeddingCollectionSharder, quiesce
 from dynamicemb.shard.embedding import ShardedDynamicEmbeddingCollection
-from dynamicemb.shard.hier_output_dist import HierSharding
+from dynamicemb.shard.hier_output_dist import HierDist
 from dynamicemb.shard.rw_sharding import RwSequenceDynamicEmbeddingSharding
 from fbgemm_gpu.split_embedding_configs import SparseType
 from torch.autograd import DeviceType
@@ -92,8 +93,8 @@ from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 from torchrec.streamable import Pipelineable
 
 # The build has the hierarchical dist (NCCL >= 2.30.7).
-GIN = hasattr(dynamicemb_extensions, "HierOutputDist")
-if GIN:
+HAS_HIER_DIST = hasattr(dynamicemb_extensions, "HierOutputDist")
+if HAS_HIER_DIST:
     from dynamicemb_extensions import HierOutputDist, hier_output_dist_delay_node_reads
 
 # The capacities are counted as the benchmark counts them.
@@ -517,7 +518,7 @@ def optimizer_of(model: DistributedModelParallel):
     return KeyedOptimizerWrapper(dense, lambda params: torch.optim.SGD(params, lr=0.25))
 
 
-def hiers_of(model) -> List[Optional[HierSharding]]:
+def hiers_of(model) -> List[Optional[HierDist]]:
     """The hierarchical dist of each EC's row-wise sharding (None: TorchRec's
     dists), the first EC's first."""
     return [
@@ -529,7 +530,7 @@ def hiers_of(model) -> List[Optional[HierSharding]]:
     ]
 
 
-def hier_of(model) -> Optional[HierSharding]:
+def hier_of(model) -> Optional[HierDist]:
     """The first EC's row-wise sharding's hierarchical dist (None:
     TorchRec's dists)."""
     hiers = hiers_of(model)
@@ -658,24 +659,24 @@ def instrument() -> None:
     """Ranges around the hierarchical dist's steps, in which the profiler
     counts host syncs and launches: ``hier::input`` (the EC's
     ``input_dist``, which queues the op's whole input dist), ``hier::wait``
-    (the second wait of a call, ``HierSharding.finish``), ``hier::forward``
+    (the second wait of a call, ``HierDist.finish``), ``hier::forward``
     and ``hier::backward`` (the output dist's kernels)."""
     _in_range(ShardedDynamicEmbeddingCollection, "input_dist", "hier::input")
-    if not GIN:
+    if not HAS_HIER_DIST:
         return
-    _in_range(HierSharding, "finish", "hier::wait")
+    _in_range(HierDist, "finish", "hier::wait")
     _in_range(HierOutputDist, "output_dist_fwd", "hier::forward")
     _in_range(HierOutputDist, "output_dist_bwd", "hier::backward")
 
 
 # Every hierarchical dist built, to check its teardown ran.
-SHARDINGS: List[weakref.ref] = []
+HIER_DISTS: List[weakref.ref] = []
 
 
 def track(model) -> None:
     for hier in hiers_of(model):
         if hier is not None:
-            SHARDINGS.append(weakref.ref(hier))
+            HIER_DISTS.append(weakref.ref(hier))
 
 
 def gc_models(log: Callable) -> int:
@@ -685,7 +686,7 @@ def gc_models(log: Callable) -> int:
     dist.barrier()
     gc.collect()
     torch.cuda.empty_cache()
-    good = all_true(all(ref() is None for ref in SHARDINGS))
+    good = all_true(all(ref() is None for ref in HIER_DISTS))
     if not good:
         log("teardown: a hierarchical dist outlived its model [FAIL]")
     return int(not good)
@@ -1111,7 +1112,7 @@ def run_against(
     *,
     rank: int,
     log: Callable,
-    output_dist: str = "fused",
+    output_dist: str = "hierarchical",
     **kwargs,
 ) -> Tuple[int, Result]:
     """A run of ``spec`` in a loop of ``kind`` against ``ref``, then its
@@ -1194,7 +1195,7 @@ def run_matrix(rank: int, log: Callable, core: bool, need_megatron: bool) -> int
         )[0]
     del torchrec_run, plain
 
-    ref = run(EVAL, "fused", "eval_plain", rank)
+    ref = run(EVAL, "hierarchical", "eval_plain", rank)
     failures += against(
         "EvalPipelineSparseDist between training epochs", ref, EVAL, "eval_epochs"
     )[0]
@@ -1240,7 +1241,7 @@ def run_matrix(rank: int, log: Callable, core: bool, need_megatron: bool) -> int
         )[0]
     torchrec_run = run(VBE, "torchrec", "plain", rank)
     failures += against("plain loop vs TorchRec's dists", torchrec_run, VBE, "plain")[0]
-    semisync = run(UNIFORM, "fused", "semisync", rank)
+    semisync = run(UNIFORM, "hierarchical", "semisync", rank)
     failures += against(
         "semisync vs itself without rehashes", semisync, REHASH, "semisync"
     )[0]
@@ -1269,7 +1270,7 @@ def run_overflows(rank: int, log: Callable, megatron_kinds: List[str]) -> int:
     ):
         for kind in spec_kinds:
             try:
-                run(spec, "fused", kind, rank)
+                run(spec, "hierarchical", kind, rank)
                 raised = ""
             except RuntimeError as error:
                 raised = str(error)
@@ -1285,8 +1286,8 @@ def run_stress(rank: int, log: Callable) -> int:
     """Pipelines under stress against the plain loop."""
     failures = 0
     spec = Spec("EC beside an EBC on TorchRec's dists", ebc=True)
-    plain = run(spec, "fused", "plain", rank)
-    got = run(spec, "fused", "sparse_dist", rank, Stress(sleep_kernel=True))
+    plain = run(spec, "hierarchical", "plain", rank)
+    got = run(spec, "hierarchical", "sparse_dist", rank, Stress(sleep_kernel=True))
     failures += compare(
         f"{spec.name}: sparse_dist, the data dist's stream delayed by a sleep"
         " kernel, vs the plain loop",
@@ -1298,8 +1299,8 @@ def run_stress(rank: int, log: Callable) -> int:
     # The host runs steps ahead of the default stream (no sync waits for it):
     # the blocks a backward's prefetched state frees must not reach the next
     # prefetch before that backward has run.
-    plain = run(UNIFORM, "fused", "plain", rank)
-    got = run(UNIFORM, "fused", "prefetch", rank, Stress(behind=200_000_000))
+    plain = run(UNIFORM, "hierarchical", "plain", rank)
+    got = run(UNIFORM, "hierarchical", "prefetch", rank, Stress(behind=200_000_000))
     failures += compare(
         f"{UNIFORM.name}: prefetch, the default stream behind the host by a sleep"
         " kernel per step, vs the plain loop",
@@ -1316,7 +1317,7 @@ def run_stress(rank: int, log: Callable) -> int:
             ("the lookup's stream delayed", Stress(lookup_delay=True)),
             ("the default stream behind the host", Stress(behind=20_000_000)),
         ):
-            got = run(UNIFORM, "fused", "fused_new", rank, stress)
+            got = run(UNIFORM, "hierarchical", "fused_new", rank, stress)
             failures += compare(
                 f"{UNIFORM.name}: fused_new, {what} by a sleep kernel per step, vs"
                 " the plain loop",
@@ -1326,11 +1327,11 @@ def run_stress(rank: int, log: Callable) -> int:
             )
             failures += gc_models(log)
     spec = Spec("dense layer under DDP", dense=True)
-    plain = run(spec, "fused", "plain", rank)
-    with environ(DYNAMICEMB_GIN_CTAS=4):
+    plain = run(spec, "hierarchical", "plain", rank)
+    with environ(DYNAMICEMB_HIER_OUT_CTAS=4):
         got = run(
             spec,
-            "fused",
+            "hierarchical",
             "sparse_dist",
             rank,
             Stress(host_sleeps=True, gemms=True),
@@ -1348,13 +1349,13 @@ def run_stress(rank: int, log: Callable) -> int:
     # next batch's beside this one's out kernels.
     spec = Spec("two ECs on the same features", second=True)
     torchrec_run = run(spec, "torchrec", "plain", rank)
-    plain = run(spec, "fused", "plain", rank)
+    plain = run(spec, "hierarchical", "plain", rank)
     failures += compare(
         f"{spec.name}: plain loop vs TorchRec's dists", plain, torchrec_run, log
     )
     failures += gc_models(log)
     for kind in ("sparse_dist", "prefetch"):
-        got = run(spec, "fused", kind, rank)
+        got = run(spec, "hierarchical", kind, rank)
         failures += compare(f"{spec.name}: {kind} vs the plain loop", got, plain, log)
         failures += gc_models(log)
     return failures
@@ -1379,11 +1380,11 @@ def run_skew(rank: int, log: Callable) -> int:
     if dist.get_world_size() != LOCAL:
         return 0
     spec = replace(UNIFORM, name="uniform, 20 steps", sizes=(SIZES * 4)[:20])
-    plain = run(spec, "fused", "plain", rank)
+    plain = run(spec, "hierarchical", "plain", rank)
     if rank == 1:
         hier_output_dist_delay_node_reads(SKEW_NS)
     try:
-        got = run(spec, "fused", "sparse_dist", rank)
+        got = run(spec, "hierarchical", "sparse_dist", rank)
     finally:
         hier_output_dist_delay_node_reads(0)
     failures = compare(
@@ -1417,7 +1418,7 @@ def run_torchrec_shardings(rank: int, log: Callable, core: bool) -> int:
     spec = Spec("a plain table in the row-wise sharding", plain=True)
     torchrec_run = run(spec, "torchrec", "plain", rank)
     got, fell = warned(
-        lambda: run(spec, "fused", "sparse_dist", rank), "does not apply here"
+        lambda: run(spec, "hierarchical", "sparse_dist", rank), "does not apply here"
     )
     got.checks["fell back"] = fell
     failures += compare(
@@ -1438,7 +1439,7 @@ def run_torchrec_shardings(rank: int, log: Callable, core: bool) -> int:
     RwSequenceDynamicEmbeddingSharding._init_customized_distributor = with_processor
     try:
         model, fell = warned(
-            lambda: build(UNIFORM, "fused", capacities), "has feature processors"
+            lambda: build(UNIFORM, "hierarchical", capacities), "has feature processors"
         )
     finally:
         RwSequenceDynamicEmbeddingSharding._init_customized_distributor = (
@@ -1467,30 +1468,30 @@ def run_torchrec_shardings(rank: int, log: Callable, core: bool) -> int:
 
 
 def run_one_rank(rank: int, log: Callable) -> int:
-    """A job of one rank (world size 1): ``"fused"`` falls back to
+    """A job of one rank (world size 1): ``"hierarchical"`` falls back to
     TorchRec's dists, with a warning, and trains exactly as they do."""
     spec = replace(UNIFORM, name="one rank (world size 1)", sizes=SIZES[:3])
     torchrec_run = run(spec, "torchrec", "plain", rank)
     got, fell = warned(
-        lambda: run(spec, "fused", "plain", rank), "the sharding has one rank"
+        lambda: run(spec, "hierarchical", "plain", rank), "the sharding has one rank"
     )
     got.checks["fell back"] = fell
     failures = compare(f"{spec.name}: plain loop vs TorchRec's", got, torchrec_run, log)
     return failures + gc_models(log)
 
 
-def run_nonccl(rank: int, log: Callable) -> int:
-    """A build without NCCL >= 2.30.7: "fused" raises ImportError when the
-    model is sharded; "auto" with a capacity warns, once per model, and
+def run_without_hier_dist(rank: int, log: Callable) -> int:
+    """A build without NCCL >= 2.30.7: "hierarchical" raises ImportError when
+    the model is sharded; "auto" with a capacity warns, once per model, and
     trains on TorchRec's dists (plain loop and TrainPipelineSparseDist)
     exactly as "torchrec" does."""
     checks = {}
     capacities = capacities_of(UNIFORM, rank)
     try:
-        build(UNIFORM, "fused", capacities)
-        checks["fused raised"] = False
+        build(UNIFORM, "hierarchical", capacities)
+        checks["hierarchical raised"] = False
     except ImportError as err:
-        checks["fused raised"] = "NCCL >= 2.30.7" in str(err)
+        checks["hierarchical raised"] = "NCCL >= 2.30.7" in str(err)
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
         auto = run(UNIFORM, "auto", "plain", rank)
@@ -1544,7 +1545,7 @@ def run_teardown(rank: int, world_size: int, log: Callable) -> int:
         (f"a call after quiesce(), a rank {LATE:.0f} s late", True, True, LATE),
         ("without quiesce()", False, False, 0.0),
     ):
-        model = build(spec, "fused", capacities)
+        model = build(spec, "hierarchical", capacities)
         track(model)
         pipe = pipelines.TrainPipelineSparseDist(model, optimizer_of(model), this_gpu())
         batch_iter = iter(batches_of(spec, rank))
@@ -1567,7 +1568,7 @@ def run_teardown(rank: int, world_size: int, log: Callable) -> int:
         waited = took > LATE / 2
         checks = {
             "no warning": "[hier_output_dist]" not in err[0],
-            "freed": all(ref() is None for ref in SHARDINGS),
+            "freed": all(ref() is None for ref in HIER_DISTS),
             "waits": last or not late or waited == (again and peer),
         }
         took_max = torch.tensor([0.0 if last else took], device=DEV)
@@ -1595,7 +1596,7 @@ def main() -> None:
     )
     args = parser.parse_args()
     # Spins that trap after two minutes instead of the process group's timeout.
-    os.environ.setdefault("DYNAMICEMB_GIN_TIMEOUT_S", "120")
+    os.environ.setdefault("DYNAMICEMB_HIER_TIMEOUT_S", "120")
     rank, world_size, _, LOCAL = init_distributed()
     EXACT = (world_size & (world_size - 1)) == 0 and world_size <= 128
 
@@ -1606,11 +1607,11 @@ def main() -> None:
     log(
         f"torchrec {torchrec.__version__}, {world_size} ranks on"
         f" {world_size // LOCAL} node(s), a build"
-        f" {'with' if GIN else 'without'} the hierarchical dist"
+        f" {'with' if HAS_HIER_DIST else 'without'} the hierarchical dist"
     )
     instrument()
-    if not GIN:
-        failures = run_nonccl(rank, log)
+    if not HAS_HIER_DIST:
+        failures = run_without_hier_dist(rank, log)
     elif world_size == 1:
         failures = run_one_rank(rank, log)
     else:

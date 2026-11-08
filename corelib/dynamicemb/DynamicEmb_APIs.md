@@ -70,7 +70,7 @@ bucketize by the same rule -- the supported `dist_type` values are:
 
 `hash_roundrobin` hashes the raw key before rank assignment and is intended to reduce sensitivity to pathological raw-key patterns that can break plain modulo-based `roundrobin`. It is an opt-in routing mode; the default remains `roundrobin` for compatibility with existing checkpoints. It should be understood as a routing robustness improvement, not as a general solution to arbitrary hot-key or Zipf-skew load balancing.
 
-The hierarchical dist (`output_dist="fused"`, see [Hierarchical sequence dist](#hierarchical-sequence-dist)) takes `roundrobin` and `hash_roundrobin` only.
+The hierarchical dist (`output_dist="hierarchical"`, see [Hierarchical sequence dist](#hierarchical-sequence-dist)) takes `roundrobin` and `hash_roundrobin` only.
 
     ```python
     #How to import
@@ -523,9 +523,9 @@ Rules:
   strategy, so it cannot be combined with LFU.
 - **Sharding.** Row-wise only (EC and EBC), on TorchRec's dists: the
   [hierarchical sequence dist](#hierarchical-sequence-dist) carries no score, so
-  in an `EmbeddingCollection` `output_dist="fused"` raises `ValueError` when the
-  model is sharded (a one-rank sharding warns instead) and `"auto"` takes
-  TorchRec's dists; an `EmbeddingBagCollection` ignores `output_dist`. No
+  in an `EmbeddingCollection` `output_dist="hierarchical"` raises `ValueError`
+  when the model is sharded (a one-rank sharding warns instead) and `"auto"`
+  takes TorchRec's dists; an `EmbeddingBagCollection` ignores `output_dist`. No
   variable batch size per key
   (VBE). Tables with a host/hybrid storage tier (`HybridStorage`) are not
   supported yet. Neither is an `external_storage` that is the only
@@ -976,22 +976,22 @@ Fields declared first (through `device_id`) are **planner/runtime-heavy**: `Dyna
         output_dist : str, optional
             How a row-wise sequence (``EmbeddingCollection``) sharding moves keys to their
             owners and the looked-up rows back. ``"torchrec"`` (default): TorchRec's input and
-            output dists. ``"fused"``: DynamicEmb's hierarchical dist, which needs
+            output dists. ``"hierarchical"``: DynamicEmb's hierarchical dist, which needs
             ``output_dist_capacity``, DynamicEmb built against NCCL >= 2.30.7, index dedup and
             tables of ``dist_type`` ``roundrobin`` or ``hash_roundrobin``; it carries no score
             per key (``PRECISE_CUSTOMIZED`` tables raise ``ValueError``). Every GPU of a node
-            gives it keys of one dtype in a call, which it does not check. ``"auto"``: ``"fused"``
-            where the build has it, ``output_dist_capacity`` is set, the keys are
-            index-deduplicated and no table is ``continuous`` or takes a score per key, else
-            TorchRec's dists. See ``docs/hier_output_dist.md``, section 4.
+            gives it keys of one dtype in a call, which it does not check. ``"auto"``:
+            ``"hierarchical"`` where the build has it, ``output_dist_capacity`` is set, the
+            keys are index-deduplicated and no table is ``continuous`` or takes a score per
+            key, else TorchRec's dists. See ``docs/hier_output_dist.md``, section 4.
         node_dedup : bool, optional
-            With ``"fused"`` (or ``"auto"``) across nodes, a node sends each key once and adds
-            up its gradient rows before they cross back. ``False`` sends every occurrence.
-            Default ``True``. See ``docs/hier_output_dist.md``, section 4.3.
+            With ``"hierarchical"`` (or ``"auto"``) across nodes, a node sends each key once
+            and adds up its gradient rows before they cross back. ``False`` sends every
+            occurrence. Default ``True``. See ``docs/hier_output_dist.md``, section 4.3.
         output_dist_capacity : Optional[Union[int, Dict[str, int]]], optional
-            The capacities of ``"fused"`` (and ``"auto"``), in keys: an int for both, or a
-            dict of ``"lookup_keys"`` and, across nodes, ``"remote_keys"``. Other names raise
-            ``ValueError``. Default ``None``. See ``docs/hier_output_dist.md``, section 5.
+            The capacities of ``"hierarchical"`` (and ``"auto"``), in keys: an int for both,
+            or a dict of ``"lookup_keys"`` and, across nodes, ``"remote_keys"``. Other names
+            raise ``ValueError``. Default ``None``. See ``docs/hier_output_dist.md``, section 5.
         optimizer_state_dtype : Optional[torch.dtype], optional
             Precision the optimizer state is kept at, and the ``optim_state_dtype`` a dump
             records. ``None`` (default) keeps each optimizer's default. Only
@@ -1721,7 +1721,7 @@ way to get UNIFORM bounds derived from a table's row count.
 
 ## quiesce
 
-Lets a model on the hierarchical dist (`output_dist="fused"`, or `"auto"`) free its communication buffers at once when it is dropped. Call it on every rank, after the model's last call and before the model is dropped.
+Lets a model on the hierarchical dist (`output_dist="hierarchical"`, or `"auto"`) free its communication buffers at once when it is dropped. Call it on every rank, after the model's last call and before the model is dropped.
 
     ```python
     #How to import
@@ -1755,11 +1755,11 @@ Due to limited resources, the dynamic embedding table does not pre allocate memo
 
 ## Hierarchical sequence dist
 
-`output_dist="fused"` in `DynamicEmbTableOptions` replaces TorchRec's input and output dists of row-wise `EmbeddingCollection` shardings with DynamicEmb's hierarchical dist.
+`output_dist="hierarchical"` in `DynamicEmbTableOptions` replaces TorchRec's input and output dists of row-wise `EmbeddingCollection` shardings with DynamicEmb's hierarchical dist.
 
 - Set `output_dist_capacity` from what the model's batches need: `hier_needs` and `hier_capacities` in `benchmark/benchmark_utils.py` count it.
-- Use tables of `dist_type` `roundrobin` (the default) or `hash_roundrobin`, and a sharder with `use_index_dedup=True`. With a `continuous` table, or without index dedup, `"fused"` raises `ValueError` at the first `input_dist()`, and `"auto"` takes TorchRec's dists ([docs/hier_output_dist.md](./docs/hier_output_dist.md), section 6).
-- The dist carries no score per key. With tables that take one (`PRECISE_CUSTOMIZED`), `"fused"` raises `ValueError` when the model is sharded, and `"auto"` takes TorchRec's dists ([docs/hier_output_dist.md](./docs/hier_output_dist.md), section 6).
+- Use tables of `dist_type` `roundrobin` (the default) or `hash_roundrobin`, and a sharder with `use_index_dedup=True`. With a `continuous` table, or without index dedup, `"hierarchical"` raises `ValueError` at the first `input_dist()`, and `"auto"` takes TorchRec's dists ([docs/hier_output_dist.md](./docs/hier_output_dist.md), section 6).
+- The dist carries no score per key. With tables that take one (`PRECISE_CUSTOMIZED`), `"hierarchical"` raises `ValueError` when the model is sharded, and `"auto"` takes TorchRec's dists ([docs/hier_output_dist.md](./docs/hier_output_dist.md), section 6).
 - Give the dist keys of one dtype (`int32` or `int64`) on every GPU of a node in a call, as TorchRec's dists need on every rank. Mixed dtypes are not detected: a GPU can then get a key's row from the key's owner in the other dtype, and send its gradient there ([docs/hier_output_dist.md](./docs/hier_output_dist.md), section 9).
 - Give every DynamicEmb table of a sharding the same `output_dist`, `output_dist_capacity` and `node_dedup`, and every rank the same options and environment variables ([docs/hier_output_dist.md](./docs/hier_output_dist.md), section 4.1).
 - Set `NCCL_CROSS_NIC=0` for multi-node jobs, before the first NCCL communicator is created, so that NCCL connects GIN on the rails alone.
@@ -1847,6 +1847,6 @@ The following environment variables control runtime behavior of dynamicemb:
 | `DYNAMICEMB_CSTM_SCORE_CHECK` | `1` | When set to `0`, suppresses warnings in `set_score` when a new score is less than the previous one (CUSTOMIZED eviction mode). |
 | `DEMB_DETERMINISM_MODE` | unset | When set, enables deterministic eviction of keys with equal scores during cache eviction and final table eviction. |
 | `DYNAMICEMB_DEBUG` | unset | When set to any non-empty value, enables extra runtime validation in `segmented_unique_cuda`. Copies `segmented_range` to CPU and verifies: (1) `segmented_range[0] == 0`, (2) `segmented_range[num_tables] == num_keys`, (3) monotonically non-decreasing. Raises an error with a descriptive message on violation. Intended for development and testing only; incurs one device-to-host copy per call. |
-| `DYNAMICEMB_GIN_PROXY_MB` | `512` | Hierarchical dist (`output_dist="fused"`): cap, in MiB, of the rows a GPU passes between its node and the other nodes (in both directions); a call whose rows do not fit moves them in laps of its ring. |
-| `DYNAMICEMB_GIN_TIMEOUT_S` | the process group's timeout | Hierarchical dist: how long a kernel waits for a peer before it prints what it waited for and traps. |
-| `DYNAMICEMB_GIN_CTAS`, `DYNAMICEMB_GIN_REDUCE_CTAS`, `LOCAL_WORLD_SIZE` | – | Hierarchical dist: its CTA counts and the GPUs per node: [docs/hier_output_dist.md](./docs/hier_output_dist.md), section 4.4, which also gives the build option of its trace. |
+| `DYNAMICEMB_HIER_PROXY_MB` | `512` | Hierarchical dist (`output_dist="hierarchical"`): cap, in MiB, of the rows a GPU passes between its node and the other nodes (in both directions); a call whose rows do not fit moves them in laps of its ring. |
+| `DYNAMICEMB_HIER_TIMEOUT_S` | the process group's timeout | Hierarchical dist: how long a kernel waits for a peer before it prints what it waited for and traps. |
+| `DYNAMICEMB_HIER_OUT_CTAS`, `DYNAMICEMB_HIER_REDUCE_CTAS`, `LOCAL_WORLD_SIZE` | – | Hierarchical dist: its CTA counts and the GPUs per node: [docs/hier_output_dist.md](./docs/hier_output_dist.md), section 4.4, which also gives the build option of its trace. |

@@ -37,7 +37,7 @@ from torchrec.fx.utils import assert_fx_safe
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 
 from ..scored_kjt import ScoredKeyedJaggedTensor
-from .hier_output_dist import DynamicEmbSequenceShardingContext, HierSharding
+from .hier_output_dist import DynamicEmbSequenceShardingContext, HierDist
 
 torch.fx.wrap("len")
 
@@ -270,7 +270,7 @@ class RwSparseFeaturesDist(_RwSparseFeaturesDist):
         need_pos: bool = False,
         dist_types: Optional[List[str]] = None,
         per_key_score: bool = False,
-        hier: Optional[HierSharding] = None,
+        hier: Optional[HierDist] = None,
     ) -> None:
         super().__init__(
             pg=pg,
@@ -363,13 +363,13 @@ class RwSparseFeaturesDist(_RwSparseFeaturesDist):
             dist_type_per_feature=self._dist_type_tensor,
         )
 
-    def hier_setup(self, weights: bool, index_dedup: bool) -> bool:
+    def hier_setup(self, weighted: bool, index_dedup: bool) -> bool:
         """Whether the sharding takes its hierarchical dist; the first call
-        builds it, collectively (``HierSharding.setup``), with this input
-        dist's rule of each feature. ``weights``: the keys carry weights;
+        builds it, collectively (``HierDist.setup``), with this input
+        dist's rule of each feature. ``weighted``: the keys carry weights;
         ``index_dedup``: they are index-deduplicated, which the hierarchical
         dist needs."""
-        return self.hier.setup(self._dist_type_codes, weights, index_dedup)
+        return self.hier.setup(self._dist_type_codes, weighted, index_dedup)
 
     def hier_forward(
         self,
@@ -447,7 +447,7 @@ class HierKJTAwaitable(Awaitable[KeyedJaggedTensor]):
 
     def __init__(
         self,
-        hier: HierSharding,
+        hier: HierDist,
         in_dist: Tuple,
         inputs: Tuple,
         keys: List[str],

@@ -124,7 +124,7 @@ class BenchConfig:
     use_index_dedup: bool = False
     output_dist: str = "torchrec"
     capacity: str = "measure"  # an int, or measure: from the batches
-    capacity_headroom: float = 1.25
+    capacity_factor: float = 1.25
     # the output_dist_capacity the models are built with (from capacity)
     output_dist_capacity: Optional[Union[int, Dict[str, int]]] = None
     num_iterations: int = 30
@@ -317,7 +317,7 @@ def resolve_capacity(
     An int ``--capacity`` is used as it is. Otherwise each capacity is what
     the hierarchical dist needs for ``batches`` on its busiest rank
     (``hier_needs``, collective, outside the timed iterations), times
-    ``cfg.capacity_headroom``, and at least 4096 entries over the need."""
+    ``cfg.capacity_factor``, and at least 4096 entries over the need."""
     if cfg.output_dist == "torchrec":
         return cfg
     if cfg.capacity != "measure":
@@ -343,12 +343,12 @@ def resolve_capacity(
     )
     dist.destroy_process_group(group)
     return replace(
-        cfg, output_dist_capacity=hier_capacities(needs, cfg.capacity_headroom)
+        cfg, output_dist_capacity=hier_capacities(needs, cfg.capacity_factor)
     )
 
 
-def _hier_shardings(model) -> List:
-    """The model's hierarchical dists, one HierSharding per sharding."""
+def _hier_dists(model) -> List:
+    """The model's hierarchical dists, one HierDist per sharding."""
     return [
         output_dist._hier
         for module in model.modules()
@@ -359,7 +359,7 @@ def _hier_shardings(model) -> List:
 
 def _hier_op(model):
     """The model's HierOutputDist (the first sharding's), or None."""
-    return next((hier.op for hier in _hier_shardings(model)), None)
+    return next((hier.op for hier in _hier_dists(model)), None)
 
 
 def embedding_loss(out, weight: Optional[torch.Tensor] = None) -> torch.Tensor:
@@ -1538,7 +1538,7 @@ def check_against_torchrec(
     cfg: BenchConfig, device, world_size, local_size, rank, steps: int = 4
 ) -> Optional[str]:
     """Same inputs through a model on TorchRec's dists and one on the
-    hierarchical dist (``--output_dist``'s, or ``fused`` when that is
+    hierarchical dist (``--output_dist``'s, or ``hierarchical`` when that is
     ``torchrec``): None when they match, else why not, the same on every rank.
 
     Both models start from the DEBUG initializer (a key's row is a function of
@@ -1570,13 +1570,15 @@ def check_against_torchrec(
     torch.manual_seed(7)
     weight = torch.randn(cfg.embedding_dim, device=device).sign()
     debug = DynamicEmbInitializerMode.DEBUG
-    fused = cfg.output_dist if cfg.output_dist != "torchrec" else "fused"
+    output_dist = cfg.output_dist if cfg.output_dist != "torchrec" else "hierarchical"
     batches = generate_batches(cfg, rank, device, steps)
-    cfg = resolve_capacity(replace(cfg, output_dist=fused), batches, local_size)
+    cfg = resolve_capacity(replace(cfg, output_dist=output_dist), batches, local_size)
     torchrec_model = build_model(
         cfg, device, world_size, local_size, "torchrec", debug, weight
     )
-    hier_model = build_model(cfg, device, world_size, local_size, fused, debug, weight)
+    hier_model = build_model(
+        cfg, device, world_size, local_size, output_dist, debug, weight
+    )
     pipeline = train_pipeline(cfg, hier_model) if cfg.pipeline != "none" else None
     fed = iter([Batch(kjt) for kjt in batches])
     exact = (
@@ -1608,7 +1610,8 @@ def check_against_torchrec(
                 print(
                     f"[rank {rank}] step {step} feature {name}: {bad.numel()} of"
                     f" {expected.shape[0]} rows differ, max abs diff {diff:.3e}; row {row}:"
-                    f" torchrec {expected[row, :4].tolist()} fused {got[row, :4].tolist()}",
+                    f" torchrec {expected[row, :4].tolist()}"
+                    f" hierarchical {got[row, :4].tolist()}",
                     flush=True,
                 )
         loss_torchrec.backward()
@@ -1622,7 +1625,7 @@ def check_against_torchrec(
     quiesce(hier_model)
     ok, ran = flags.tolist()
     if not ran:
-        return f"the {fused} model fell back to TorchRec's dists"
+        return f"the {output_dist} model fell back to TorchRec's dists"
     return None if ok else "the outputs differ"
 
 
@@ -1780,7 +1783,7 @@ def run(cfg: BenchConfig) -> Dict:
         torch.cuda.max_memory_reserved(),
         sum(
             sum(hier.op.memory()["windows"].values())
-            for hier in _hier_shardings(model)
+            for hier in _hier_dists(model)
             if hier.takes_hier_dist
         ),
         input_bytes,
@@ -2384,10 +2387,10 @@ def parse_args(argv: List[str]) -> BenchConfig:
     )
     parser.add_argument(
         "--output_dist",
-        choices=["torchrec", "fused", "auto"],
+        choices=["torchrec", "hierarchical", "auto"],
         default=defaults.output_dist,
-        help="TorchRec's dists, or the hierarchical dist (fused, or auto; with"
-        " --use_index_dedup)",
+        help="TorchRec's dists, or the hierarchical dist (hierarchical, or auto;"
+        " with --use_index_dedup)",
     )
     parser.add_argument(
         "--pipeline",
@@ -2402,9 +2405,9 @@ def parse_args(argv: List[str]) -> BenchConfig:
         " batches)",
     )
     parser.add_argument(
-        "--capacity_headroom",
+        "--capacity_factor",
         type=float,
-        default=defaults.capacity_headroom,
+        default=defaults.capacity_factor,
         help="with --capacity measure: the capacities over the needs",
     )
     parser.add_argument("--num_iterations", type=int, default=defaults.num_iterations)
@@ -2455,8 +2458,8 @@ def parse_args(argv: List[str]) -> BenchConfig:
         parser.error("--capacity is an int or measure")
     if (cfg.output_dist != "torchrec" or cfg.check) and not cfg.use_index_dedup:
         parser.error(
-            "the hierarchical dist (--output_dist fused or auto, --check) takes"
-            " index-deduplicated keys: add --use_index_dedup"
+            "the hierarchical dist (--output_dist hierarchical or auto, --check)"
+            " takes index-deduplicated keys: add --use_index_dedup"
         )
     return cfg
 

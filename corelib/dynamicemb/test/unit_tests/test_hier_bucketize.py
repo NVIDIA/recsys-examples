@@ -130,7 +130,7 @@ class Case:
     key_range: Tuple[int, int] = (0, 6000)
     values: torch.dtype = torch.int64
     lengths: torch.dtype = torch.int64
-    weights: bool = False
+    weighted: bool = False
     empty: Tuple[int, ...] = ()  # features without keys
     hot: float = 0.0  # share of places that hold key 7
     edges: float = 0.0  # share of places that hold keys at the edges (edge_keys)
@@ -152,10 +152,10 @@ CASES = [
     ),
     Case("int32 keys, int64 lengths", values=torch.int32),
     Case("int64 keys, int32 lengths", lengths=torch.int32),
-    Case("weights", weights=True),
-    Case("empty features", empty=(0, 3), weights=True),
+    Case("weights", weighted=True),
+    Case("empty features", empty=(0, 3), weighted=True),
     Case("no keys", empty=(0, 1, 2, 3)),
-    Case("hot key", hot=0.7, max_len=40, weights=True),
+    Case("hot key", hot=0.7, max_len=40, weighted=True),
     Case(
         "negative keys, both rules",
         rules=(HASH_ROUNDROBIN, ROUNDROBIN, HASH_ROUNDROBIN),
@@ -180,7 +180,7 @@ CASES = [
         key_range=(-(1 << 40), 1 << 40),
         edges=0.5,
     ),
-    Case("index dedup's bound", bound=777, weights=True),
+    Case("index dedup's bound", bound=777, weighted=True),
     Case(
         "long sequences", batch_size=3, max_len=5000, hot=0.2, world_sizes=(8, 32, 256)
     ),
@@ -189,7 +189,7 @@ CASES = [
         batch_size=4096,
         max_len=40,
         hot=0.1,
-        weights=True,
+        weighted=True,
         world_sizes=(1, 8, 32, 256),
     ),
     Case(
@@ -258,7 +258,7 @@ def make_batch(case: Case, seed: int, world_size: int = 1) -> Batch:
         picks = torch.randint(0, keys.numel(), (places.numel(),), generator=generator)
         values[places] = keys[picks]
     weights = None
-    if case.weights:
+    if case.weighted:
         weights = torch.rand(
             valid + case.bound, generator=generator, dtype=torch.float32
         )
@@ -389,15 +389,15 @@ def run_rule_refusals() -> Dict[str, bool]:
             dist_types=codes,
             dim=32,
             dtype=torch.float32,
-            weights=False,
+            weighted=False,
             node_dedup=True,
             lookup_keys=4096,
             remote_keys=0,
             proxy_bytes=16 << 20,
             timeout_s=60.0,
-            ctas=0,
+            out_ctas=0,
             reduce_ctas=8,
-            chunk_kb=512,
+            payload_kb=512,
         )
 
     def bucketize_error(rules: Tuple[int, ...]) -> str:
@@ -679,7 +679,7 @@ class NodeCase:
     batch_size: int = 16
     max_len: int = 6
     bound: int = 0  # index dedup: keys past the valid ones
-    weights: bool = False
+    weighted: bool = False
     values: torch.dtype = torch.int64  # the KJT's keys
     empty: Tuple[int, ...] = ()
     hot: float = 0.0  # share of places that hold key 7, which one owner holds
@@ -692,7 +692,7 @@ class NodeCase:
 NODE_CASES = [
     NodeCase("one GPU", num_nodes=1, local_size=1, num_features=1),
     NodeCase("one node of 2", num_nodes=1, local_size=2),
-    NodeCase("one node of 8, weights, bound", 1, 8, weights=True, bound=50),
+    NodeCase("one node of 8, weights, bound", 1, 8, weighted=True, bound=50),
     NodeCase("one node of 4, empty features", 1, 4, num_features=5, empty=(0, 3)),
     NodeCase("one node, exact fit", 1, 4, lookup_slack=0),
     NodeCase("one node, lookup_keys overflow", 1, 4, lookup_slack=-1),
@@ -708,7 +708,7 @@ NODE_CASES = [
         lookup_slack=-1,
     ),
     NodeCase("2 nodes of 2", num_nodes=2, local_size=2, num_features=2),
-    NodeCase("2 nodes of 8, node 1, weights", 2, 8, node=1, weights=True),
+    NodeCase("2 nodes of 8, node 1, weights", 2, 8, node=1, weighted=True),
     NodeCase("3 nodes of 4, node 2, bound", 3, 4, num_features=2, node=2, bound=40),
     NodeCase("4 nodes of 3, node 1", 4, 3, num_features=1, node=1),
     NodeCase("2 nodes of 1", num_nodes=2, local_size=1),
@@ -729,7 +729,7 @@ NODE_CASES = [
         2,
         4,
         hot=0.5,
-        weights=True,
+        weighted=True,
         remote_slack=-1,
     ),
     NodeCase("one node of 40, 70 features", 1, 40, num_features=70, max_len=3),
@@ -766,7 +766,7 @@ def run_node_case(case: NodeCase, seed: int) -> Dict[str, bool]:
         rules=(HASH_ROUNDROBIN,) * num_features,
         key_range=(-(1 << 40), 1 << 40),
         values=case.values,
-        weights=case.weights,
+        weighted=case.weighted,
         empty=case.empty,
         hot=case.hot,
         bound=case.bound,
@@ -962,7 +962,7 @@ def run_node_case(case: NodeCase, seed: int) -> Dict[str, bool]:
     # (src) over garbage.
     entries = lookup_keys + remote_keys  # of a target's node_keys
     widths = dict(node_keys=(entries, torch.int64))
-    if case.weights:
+    if case.weighted:
         widths["node_key_weights"] = (entries, torch.float32)
     if num_nodes > 1:
         widths["node_bucket_feature_of_row"] = (remote_keys, torch.int32)
@@ -1007,7 +1007,7 @@ def run_node_case(case: NodeCase, seed: int) -> Dict[str, bool]:
     got = {name: tensor.cpu() for name, tensor in guarded.items()}
     keys = [bucketized["keys"].cpu() for bucketized in ranks]
     weights = (
-        [bucketized["weights"].cpu() for bucketized in ranks] if case.weights else None
+        [bucketized["weights"].cpu() for bucketized in ranks] if case.weighted else None
     )
     own_good, remote_good, kept = True, True, True
     for target in range(local_size):

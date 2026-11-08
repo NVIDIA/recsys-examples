@@ -56,18 +56,18 @@ void bind_hier_output_dist(py::module &py_module) {
       "hier_output_dist_invalid",
       [](int64_t rank, int64_t world_size, int64_t local_size,
          const std::vector<int64_t> &feature_tables, const std::vector<int64_t> &dist_types,
-         int64_t dim, at::ScalarType dtype, bool weights, bool node_dedup, int64_t lookup_keys,
-         int64_t remote_keys, int64_t proxy_bytes, double timeout_s, int64_t ctas,
-         int64_t reduce_ctas, int64_t chunk_kb) {
+         int64_t dim, at::ScalarType dtype, bool weighted, bool node_dedup, int64_t lookup_keys,
+         int64_t remote_keys, int64_t proxy_bytes, double timeout_s, int64_t out_ctas,
+         int64_t reduce_ctas, int64_t payload_kb) {
         return dyn_emb::hier_output_dist::invalid(dyn_emb::hier_output_dist::config_of(
-            rank, world_size, local_size, feature_tables, dist_types, dim, dtype, weights,
-            node_dedup, lookup_keys, remote_keys, proxy_bytes, timeout_s, ctas, reduce_ctas,
-            chunk_kb));
+            rank, world_size, local_size, feature_tables, dist_types, dim, dtype, weighted,
+            node_dedup, lookup_keys, remote_keys, proxy_bytes, timeout_s, out_ctas, reduce_ctas,
+            payload_kb));
       },
       py::arg("rank"), py::arg("world_size"), py::arg("local_size"), py::arg("feature_tables"),
-      py::arg("dist_types"), py::arg("dim"), py::arg("dtype"), py::arg("weights"),
+      py::arg("dist_types"), py::arg("dim"), py::arg("dtype"), py::arg("weighted"),
       py::arg("node_dedup"), py::arg("lookup_keys"), py::arg("remote_keys"), py::arg("proxy_bytes"),
-      py::arg("timeout_s"), py::arg("ctas"), py::arg("reduce_ctas"), py::arg("chunk_kb"),
+      py::arg("timeout_s"), py::arg("out_ctas"), py::arg("reduce_ctas"), py::arg("payload_kb"),
       "Why the op refuses the configuration the constructor would take, or an empty string; "
       "builds nothing");
 
@@ -80,9 +80,9 @@ void bind_hier_output_dist(py::module &py_module) {
                     int64_t, int64_t, double, int64_t, int64_t, int64_t>(),
            py::arg("unique_id"), py::arg("rank"), py::arg("world_size"), py::arg("local_size"),
            py::arg("feature_tables"), py::arg("dist_types"), py::arg("dim"), py::arg("dtype"),
-           py::arg("weights"), py::arg("node_dedup"), py::arg("lookup_keys"),
-           py::arg("remote_keys"), py::arg("proxy_bytes"), py::arg("timeout_s"), py::arg("ctas"),
-           py::arg("reduce_ctas"), py::arg("chunk_kb"),
+           py::arg("weighted"), py::arg("node_dedup"), py::arg("lookup_keys"),
+           py::arg("remote_keys"), py::arg("proxy_bytes"), py::arg("timeout_s"),
+           py::arg("out_ctas"), py::arg("reduce_ctas"), py::arg("payload_kb"),
            py::call_guard<py::gil_scoped_release>())  // the constructor's collectives
       .def("input_dist", &HierOutputDist::input_dist, py::arg("values"), py::arg("offsets"),
            py::arg("lengths"), py::arg("batch_size"), py::arg("weights"), py::arg("input_offsets"),

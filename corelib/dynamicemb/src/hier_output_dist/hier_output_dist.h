@@ -195,9 +195,9 @@ class HierOutputDist {
   // alone, and the others wait there, as in NCCL's own initialization.
   HierOutputDist(const std::string &unique_id, int64_t rank, int64_t world_size, int64_t local_size,
                  const std::vector<int64_t> &feature_tables, const std::vector<int64_t> &dist_types,
-                 int64_t dim, at::ScalarType dtype, bool weights, bool node_dedup,
+                 int64_t dim, at::ScalarType dtype, bool weighted, bool node_dedup,
                  int64_t lookup_keys, int64_t remote_keys, int64_t proxy_bytes, double timeout_s,
-                 int64_t ctas, int64_t reduce_ctas, int64_t chunk_kb);
+                 int64_t out_ctas, int64_t reduce_ctas, int64_t payload_kb);
   // Local: waits for this rank's kernels. Then, unless the op was quiesced
   // after the last kernel of every rank, it waits at most min(timeout, 30 s)
   // for every node and rail peer to reach its own teardown. It lets go of

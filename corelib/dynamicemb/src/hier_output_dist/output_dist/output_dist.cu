@@ -100,14 +100,14 @@ OutChannel::OutChannel(const Config &config, const Sizes &sizes, ncclWindow_t wi
       world_size_(config.world_size),
       device_(device),
       sms_(sms_of(device)),
-      ctas_(config.ctas),
+      out_ctas_(config.out_ctas),
       reduce_ctas_(config.reduce_ctas),
       multi_node_(sizes.multi_node()),
       gin_(multi_node_ ? gin : NCCL_GIN_TYPE_NONE),
       trace_(device) {}
 
-// DYNAMICEMB_GIN_CTAS if set. Else on one node 32 for the forward and 64 for
-// the backward: inside a node pulls saturate NVLink at about 32 CTAs, and
+// DYNAMICEMB_HIER_OUT_CTAS if set. Else on one node 32 for the forward and 64
+// for the backward: inside a node pulls saturate NVLink at about 32 CTAs, and
 // pushes keep improving up to about 64. Across nodes 32 for both: InfiniBand
 // bounds them under uniform keys, and under skew the hot owner's NVLink and
 // the proxies' sums do (more CTAs crowd the backward's pushes). Every
@@ -117,7 +117,7 @@ OutChannel::OutChannel(const Config &config, const Sizes &sizes, ncclWindow_t wi
 // (its issuer) and a reducing CTA at least.
 int OutChannel::out_ctas(OutKernel which) const {
   const bool forward = which == OutKernel::kForward;
-  const int want = ctas_ > 0 ? ctas_ : (forward || multi_node_ ? 32 : 64);
+  const int want = out_ctas_ > 0 ? out_ctas_ : (forward || multi_node_ ? 32 : 64);
   const int least = multi_node_ && !forward ? 2 : 1;
   return std::max(least, std::min(want, sms_ - 2 - kNcclReserve));
 }

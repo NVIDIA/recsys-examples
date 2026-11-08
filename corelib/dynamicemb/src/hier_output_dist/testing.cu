@@ -220,7 +220,7 @@ void node_push_test(at::Tensor values, at::Tensor inv, c10::optional<at::Tensor>
 // rows_per_payload_for(max_chunk_rows, payload_rows): here max_chunk_rows
 // stands for sizes_of's chunk_ring_rows. The two differ only when sizes_of's
 // least of 2 * max_key_rows sets max_chunk_rows. Then max_chunks follows, and
-// weights with record_bytes. No step of the planner reads the others
+// weighted with record_bytes. No step of the planner reads the others
 // (row_bytes), which stay 0.
 Sizes plan_sizes(const std::map<std::string, int64_t> &named) {
   const int num_nodes = (int)named.at("num_nodes"), local_size = (int)named.at("local_size"),
@@ -238,7 +238,7 @@ Sizes plan_sizes(const std::map<std::string, int64_t> &named) {
   TORCH_CHECK(payload_rows >= 1, "hier_output_dist: a chunk's payload of at least one row");
   sizes.rows_per_payload = rows_per_payload_for(sizes.max_chunk_rows, payload_rows);
   sizes.record_bytes = named.at("record_bytes");
-  sizes.weights = sizes.weighted_records();
+  sizes.weighted = sizes.weighted_records();
   // a chunk holds two keys of the most counted rows (sizes_of's do)
   TORCH_CHECK(num_nodes >= 2 && local_size >= 1 && node >= 0 && node < num_nodes &&
                   local_rank >= 0 && local_rank < local_size && sizes.num_features >= 1 &&

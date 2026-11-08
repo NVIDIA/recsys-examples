@@ -97,9 +97,9 @@ void Config::validate() const {
   if (dtype != at::kFloat && dtype != at::kBFloat16 && dtype != at::kHalf)
     refuse("rows of the lookup output must be fp32, bf16 or fp16, got ", dtype);
   check_capacity("lookup_keys", capacities.lookup_keys);
-  if (chunk_kb < kMinChunkKb || chunk_kb % 16 != 0)
-    refuse("DYNAMICEMB_GIN_CHUNK_KB must be at least ", kMinChunkKb,
-           " KiB and a multiple of 16, got ", chunk_kb);
+  if (payload_kb < kMinPayloadKb || payload_kb % 16 != 0)
+    refuse("DYNAMICEMB_HIER_PAYLOAD_KB must be at least ", kMinPayloadKb,
+           " KiB and a multiple of 16, got ", payload_kb);
   if (num_nodes() > 1) {
     check_capacity("remote_keys", capacities.remote_keys);
     const Sizes sizes = sizes_of(*this);
@@ -110,14 +110,14 @@ void Config::validate() const {
              rows, " rows of ", row_bytes(),
              " bytes, and its ring takes two chunks of keys of the ", "most rows: at least ", least,
              " (", (least * row_bytes() + (1 << 20) - 1) >> 20,
-             " MiB); raise DYNAMICEMB_GIN_PROXY_MB");
+             " MiB); raise DYNAMICEMB_HIER_PROXY_MB");
     // the positions of a proxy's stream, unwrapped, stay below 2^32 (tagged)
     if (2 * capacities.remote_keys + sizes.num_proxy_rows > (int64_t)UINT32_MAX)
       refuse("a proxy's stream of remote_keys rows through proxy_rows of ", sizes.num_proxy_rows,
              " rows may pass position 2^32; lower remote_keys");
   }
   if (!(timeout_s > 0)) refuse("the timeout must be positive, got ", timeout_s);
-  if (ctas < 0 || reduce_ctas < 1)
+  if (out_ctas < 0 || reduce_ctas < 1)
     refuse("out kernel CTAs must not be negative, and the backward needs a reducing CTA");
 }
 
@@ -132,9 +132,9 @@ std::string invalid(const Config &config) {
 
 Config config_of(int64_t rank, int64_t world_size, int64_t local_size,
                  const std::vector<int64_t> &feature_tables, const std::vector<int64_t> &dist_types,
-                 int64_t dim, at::ScalarType dtype, bool weights, bool node_dedup,
+                 int64_t dim, at::ScalarType dtype, bool weighted, bool node_dedup,
                  int64_t lookup_keys, int64_t remote_keys, int64_t proxy_bytes, double timeout_s,
-                 int64_t ctas, int64_t reduce_ctas, int64_t chunk_kb) {
+                 int64_t out_ctas, int64_t reduce_ctas, int64_t payload_kb) {
   Config config;
   config.rank = (int)rank;
   config.world_size = (int)world_size;
@@ -143,13 +143,13 @@ Config config_of(int64_t rank, int64_t world_size, int64_t local_size,
   config.dist_types.assign(dist_types.begin(), dist_types.end());
   config.dim = dim;
   config.dtype = dtype;
-  config.weights = weights;
+  config.weighted = weighted;
   config.node_dedup = node_dedup;
   config.capacities = Capacities{lookup_keys, remote_keys, proxy_bytes};
   config.timeout_s = timeout_s;
-  config.ctas = (int)ctas;
+  config.out_ctas = (int)out_ctas;
   config.reduce_ctas = (int)reduce_ctas;
-  config.chunk_kb = chunk_kb;
+  config.payload_kb = payload_kb;
   return config;
 }
 
@@ -184,14 +184,14 @@ Sizes sizes_of(const Config &config) {
   sizes.num_tables = tables.empty() ? 0 : *std::max_element(tables.begin(), tables.end()) + 1;
   sizes.lookup_keys = config.capacities.lookup_keys;
   sizes.row_bytes = config.row_bytes();
-  sizes.weights = config.weights;
+  sizes.weighted = config.weighted;
   sizes.timeout_ns = (uint64_t)(std::min(config.timeout_s, 1e9) * 1e9);
   if (num_nodes > 1) {
     sizes.remote_keys = config.capacities.remote_keys;
     const int64_t max_key_rows = sizes.max_key_rows();
     sizes.num_proxy_rows = std::min(std::max(sizes.remote_keys, min_proxy_rows_for(max_key_rows)),
                                     config.capacities.proxy_bytes / sizes.row_bytes);
-    // A chunk's payload over IB, chunk_kb KiB of rows (a row per key), and
+    // A chunk's payload over IB, payload_kb KiB of rows (a row per key), and
     // its rows in the ring (a row per occurrence): kChunkRowCapBytes of rows,
     // or the payload if larger, at most half the ring (the ring holds two
     // chunks at least), and at least two keys of the most rows. When its keys
@@ -200,8 +200,8 @@ Sizes sizes_of(const Config &config) {
     // least of two keys of the most rows, so it is 1 when the payload is at
     // least the cap. The payload stops at 2^52 KiB (2^62 bytes, in int64): half
     // the ring is at most proxy_bytes / 2, which is fewer bytes, so a larger
-    // chunk_kb changes nothing.
-    const int64_t payload_bytes = std::min<int64_t>(config.chunk_kb, int64_t{1} << 52) << 10;
+    // payload_kb changes nothing.
+    const int64_t payload_bytes = std::min<int64_t>(config.payload_kb, int64_t{1} << 52) << 10;
     const int64_t payload_rows = std::max<int64_t>(kTaskRows, payload_bytes / sizes.row_bytes);
     const int64_t cap_rows =
         std::max<int64_t>(kTaskRows, std::max(payload_bytes, kChunkRowCapBytes) / sizes.row_bytes);
@@ -209,7 +209,7 @@ Sizes sizes_of(const Config &config) {
     sizes.max_chunk_rows = std::max(chunk_ring_rows, 2 * max_key_rows);
     sizes.rows_per_payload = rows_per_payload_for(chunk_ring_rows, payload_rows);
     sizes.max_chunks = max_chunks_for(sizes);
-    sizes.record_bytes = config.weights ? 16 : 8;
+    sizes.record_bytes = config.weighted ? 16 : 8;
   }
   return sizes;
 }

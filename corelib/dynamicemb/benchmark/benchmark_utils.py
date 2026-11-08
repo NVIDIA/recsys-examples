@@ -104,12 +104,13 @@ def hier_needs(
     node_dedup: bool = True,
     group: Optional[dist.ProcessGroup] = None,
 ) -> Dict[str, int]:
-    """What the hierarchical dist (``output_dist="fused"``) of one row-wise
-    sharding needs of each capacity for some calls: the most any rank needs
-    in any of them, counted as the op counts its needs. ``remote_keys`` comes
-    from the keys each GPU gets from its node for the owners of other nodes;
-    ``lookup_keys`` from the keys of its own node each owner receives and
-    the node-unique (table, key) it receives from each other node.
+    """What the hierarchical dist (``output_dist="hierarchical"``) of one
+    row-wise sharding needs of each capacity for some calls: the most any
+    rank needs in any of them, counted as the op counts its needs.
+    ``remote_keys`` comes from the keys each GPU gets from its node for the
+    owners of other nodes; ``lookup_keys`` from the keys of its own node
+    each owner receives and the node-unique (table, key) it receives from
+    each other node.
 
     Args:
         batches: this rank's KeyedJaggedTensor of each call. Only the keys of
@@ -191,12 +192,12 @@ def hier_needs(
 
 
 def hier_capacities(
-    needs: Mapping[str, int], headroom: float = 1.25, room: int = 4096
+    needs: Mapping[str, int], factor: float = 1.25, min_extra: int = 4096
 ) -> Dict[str, int]:
     """``output_dist_capacity`` for ``needs`` (:func:`hier_needs`): each
-    capacity ``headroom`` times its need, and at least ``room`` entries more
-    (small calls)."""
+    capacity ``factor`` times its need, and at least ``min_extra`` entries
+    more (small calls)."""
     return {
-        name: max(math.ceil(headroom * needs[name]), needs[name] + room)
+        name: max(math.ceil(factor * needs[name]), needs[name] + min_extra)
         for name in HIER_CAPACITY_NAMES
     }

@@ -114,7 +114,7 @@ class InChannel {
   // int64 [kFanoutWords] on the GPU: the fan-out kernel's counter and CTA ticket (fanout_tables),
   // zeroed once; each call's kernel leaves them at 0
   at::Tensor fanout_words_;
-  bool weights_, node_dedup_;
+  bool weighted_, node_dedup_;
   int device_;
   int64_t seq_ = 0;  // the calls run so far: the current one's sequence number
   // This rank's buffers the steps read and write, views of its copy of the

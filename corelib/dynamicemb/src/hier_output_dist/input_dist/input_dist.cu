@@ -79,7 +79,7 @@ InChannel::InChannel(const Config &config, const Sizes &sizes, ncclWindow_t wind
     : window_(window),
       dev_(dev),
       sizes_(sizes),
-      weights_(config.weights),
+      weighted_(config.weighted),
       node_dedup_(config.node_dedup),
       device_(device) {
   const auto options = at::TensorOptions().device(at::kCUDA, device);
@@ -95,13 +95,13 @@ InChannel::InChannel(const Config &config, const Sizes &sizes, ncclWindow_t wind
   const at::Tensor node_keys = view(keys.node_keys(), {lookup_keys + remote_keys}, at::kLong);
   own_node_keys_ = node_keys.narrow(0, 0, keys.remote_offset());
   at::Tensor node_key_weights;
-  if (config.weights) {
+  if (config.weighted) {
     node_key_weights = view(keys.node_key_weights(), {lookup_keys + remote_keys}, at::kFloat);
     own_node_key_weights_ = node_key_weights.narrow(0, 0, keys.remote_offset());
   }
   if (!sizes_.multi_node()) return;
   remote_node_keys_ = node_keys.narrow(0, keys.remote_offset(), remote_keys);
-  if (config.weights)
+  if (config.weighted)
     remote_node_key_weights_ = node_key_weights.narrow(0, keys.remote_offset(), remote_keys);
   node_bucket_feature_of_row_ = view(keys.node_bucket_feature_of_row(), {remote_keys}, at::kInt);
   proxy_buffers_ =
@@ -121,10 +121,10 @@ InDist InChannel::input_dist(const PlanInput &input) {
   // (node_exchange). A call that raises before that, on an input check or a failed allocation,
   // takes none, and its node peers wait at the node barrier for the call that does. A call that
   // raises between its first and its last comm kernel can leave its peers waiting.
-  TORCH_CHECK(input.weights.has_value() == weights_,
+  TORCH_CHECK(input.weights.has_value() == weighted_,
               "hier_output_dist: the keys carry weights exactly when the op was made with "
               "weights (",
-              weights_ ? "with" : "without", ")");
+              weighted_ ? "with" : "without", ")");
   check_bucketize_input(input, dist_types_, sizes_.topo.world_size);
   check_fanout_input(input.reverse_indices);
   // The bucketize up to its gather (the push gathers), and the fan-out of its rows.

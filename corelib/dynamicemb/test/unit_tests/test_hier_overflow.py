@@ -12,9 +12,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""A call over the hierarchical dist's capacities (``output_dist="fused"``)
-raises at its second wait, on every rank alike, and the op takes the calls
-after it.
+"""A call over the hierarchical dist's capacities
+(``output_dist="hierarchical"``) raises at its second wait, on every rank
+alike, and the op takes the calls after it.
 
 Each case trains three models, under index dedup (which the hierarchical
 dist takes): on the hierarchical dist with ample capacities (whose calls
@@ -505,7 +505,9 @@ def run_case(case: Case, checks: Checks, rank: int, world_size: int, local_size:
     # The ample capacities, whose calls give the needs; then TorchRec's dists
     # on the small calls alone.
     ample_capacity = dict.fromkeys(OUTPUT_DIST_CAPACITY_NAMES, AMPLE)
-    ample_model = build_model(case, "fused", ample_capacity, world_size, local_size)
+    ample_model = build_model(
+        case, "hierarchical", ample_capacity, world_size, local_size
+    )
     ample, ample_raised = run(ample_model, case, batches, signs)
     checks.check(f"{label}: ample runs every call", not ample_raised)
     if case.placement:
@@ -517,7 +519,7 @@ def run_case(case: Case, checks: Checks, rank: int, world_size: int, local_size:
     reference, _ = run(reference_model, case, batches, signs, skip=case.expected)
     del reference_model
     capacity = tight_capacity(case, needs)
-    tight_model = build_model(case, "fused", capacity, world_size, local_size)
+    tight_model = build_model(case, "hierarchical", capacity, world_size, local_size)
     tight, raised = run(tight_model, case, batches, signs)
 
     def same_rows() -> bool:
@@ -561,7 +563,7 @@ def run_case(case: Case, checks: Checks, rank: int, world_size: int, local_size:
 
 def main() -> None:
     rank, world_size, _, local_size = init_distributed()
-    os.environ.setdefault("DYNAMICEMB_GIN_TIMEOUT_S", "120")
+    os.environ.setdefault("DYNAMICEMB_HIER_TIMEOUT_S", "120")
     multi_node = world_size // local_size > 1
     checks = Checks(rank)
     for case in CASES:

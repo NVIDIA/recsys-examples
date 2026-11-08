@@ -1,7 +1,7 @@
 # Hierarchical input and output dist (NVLink inside a node, NCCL GIN between nodes)
 
-Turn it on per table with `DynamicEmbTableOptions(output_dist="fused")` and
-the capacities of its buffers (`output_dist_capacity`), or with `"auto"`
+Turn it on per table with `DynamicEmbTableOptions(output_dist="hierarchical")`
+and the capacities of its buffers (`output_dist_capacity`), or with `"auto"`
 (section 4).
 
 **Contents**
@@ -153,9 +153,9 @@ this dist with TorchRec's dists.
   of **chunks**; a stream that does not fit the ring takes it again, lap
   after lap (section 12.1). A chunk holds the rows of some keys of one
   owner node. In the ring it takes a row per occurrence of its keys: at
-  most 2 MiB of rows (or `DYNAMICEMB_GIN_CHUNK_KB`, if that is more). Over
+  most 2 MiB of rows (or `DYNAMICEMB_HIER_PAYLOAD_KB`, if that is more). Over
   IB it moves one row per key, its **payload**. When its keys have few
-  occurrences, that is about `DYNAMICEMB_GIN_CHUNK_KB` (512 KiB by
+  occurrences, that is about `DYNAMICEMB_HIER_PAYLOAD_KB` (512 KiB by
   default) or more, up to about twice that (section 4.4).
 * **Dedup** (deduplication): removing repeated keys. **Index dedup**:
   TorchRec's `use_index_dedup`. Each rank removes its own repeated keys
@@ -193,7 +193,7 @@ from dynamicemb.shard import DynamicEmbeddingCollectionSharder
 
 DynamicEmbTableOptions(
     ...,
-    output_dist="fused",              # "torchrec" (default), "fused" or "auto"
+    output_dist="hierarchical",       # "torchrec" (default), "hierarchical" or "auto"
     output_dist_capacity=capacities,  # an int, or a dict by name (section 5)
     node_dedup=True,                  # across nodes: one key per (table, key)
 )
@@ -203,10 +203,10 @@ DynamicEmbeddingCollectionSharder(..., use_index_dedup=True)  # the op takes no 
 It serves `ROW_WISE` sequence shardings (`EmbeddingCollection`) of
 `"roundrobin"` and `"hash_roundrobin"` tables (`dist_type`), under index
 dedup. Without `use_index_dedup=True` on the sharder, or with a
-`"continuous"` table, `"fused"` raises `ValueError` at the first
+`"continuous"` table, `"hierarchical"` raises `ValueError` at the first
 `input_dist()` and `"auto"` takes TorchRec's dists (section 6). The op
 carries no score per key: with tables that take one (`score_strategy`
-`PRECISE_CUSTOMIZED`), `"fused"` raises `ValueError` when the model is
+`PRECISE_CUSTOMIZED`), `"hierarchical"` raises `ValueError` when the model is
 sharded and `"auto"` takes TorchRec's dists. Pooled
 shardings (`EmbeddingBagCollection`) ignore `output_dist`. All DynamicEmb
 tables of one sharding must agree on `output_dist`, `output_dist_capacity`
@@ -268,7 +268,7 @@ every rank before you drop a model (section 4.6).
 
 | option | default | meaning |
 |---|---|---|
-| `output_dist` | `"torchrec"` | `"torchrec"`: TorchRec's dists. `"fused"`: the hierarchical dist. It needs `output_dist_capacity` (without it, making the options raises `ValueError`), index dedup and tables of `dist_type` `"roundrobin"` or `"hash_roundrobin"` (without them, the first `input_dist()` raises `ValueError`), and a build without NCCL ≥ 2.30.7 raises `ImportError` when the model is sharded. It carries no score per key: with tables that take one (`PRECISE_CUSTOMIZED`), it raises `ValueError` when the model is sharded. `"auto"`: `"fused"` where the build has it, `output_dist_capacity` is set, the keys are index-deduplicated and no table is `"continuous"` or takes a score per key, else TorchRec's dists, with a warning. Any other value raises `ValueError`. |
+| `output_dist` | `"torchrec"` | `"torchrec"`: TorchRec's dists. `"hierarchical"`: the hierarchical dist. It needs `output_dist_capacity` (without it, making the options raises `ValueError`), index dedup and tables of `dist_type` `"roundrobin"` or `"hash_roundrobin"` (without them, the first `input_dist()` raises `ValueError`), and a build without NCCL ≥ 2.30.7 raises `ImportError` when the model is sharded. It carries no score per key: with tables that take one (`PRECISE_CUSTOMIZED`), it raises `ValueError` when the model is sharded. `"auto"`: `"hierarchical"` where the build has it, `output_dist_capacity` is set, the keys are index-deduplicated and no table is `"continuous"` or takes a score per key, else TorchRec's dists, with a warning. Any other value raises `ValueError`. |
 | `output_dist_capacity` | `None` | The capacities of the op's buffers, in keys (section 5). An int sets `lookup_keys` and `remote_keys` to that many. A dict sets them by name: `lookup_keys`, and across nodes also `remote_keys` (one node uses `lookup_keys` alone). Each capacity is a positive int below 2^31 − 1024; other values or names raise `ValueError` when the options are made. A call that needs more of one raises `RuntimeError` at its second wait, on every rank (section 5.4). TorchRec's dists ignore it. |
 | `node_dedup` | `True` | Across nodes, the proxy sends one key per (table, key), and the node adds up its gradient rows before they cross back. `False` sends each GPU's occurrence on its own (more IB traffic) and keeps TorchRec's gradient rows (section 18). Gradient clipping turns it off by itself. |
 
@@ -276,28 +276,28 @@ every rank before you drop a model (section 4.6).
 
 None is needed. All of them are read when the model is sharded (when the
 sharding is built). A value the op refuses (a timeout of 0 or less, a
-negative CTA count, a `DYNAMICEMB_GIN_REDUCE_CTAS` below 1, or a
-`DYNAMICEMB_GIN_CHUNK_KB` below 64 or not a multiple of 16) fails on every
+negative CTA count, a `DYNAMICEMB_HIER_REDUCE_CTAS` below 1, or a
+`DYNAMICEMB_HIER_PAYLOAD_KB` below 64 or not a multiple of 16) fails on every
 rank alike (section 6).
 
 | variable | default | meaning |
 |---|---|---|
-| `DYNAMICEMB_GIN_PROXY_MB` | `512` | Cap of `proxy_rows`, in MiB (section 15.3). |
-| `DYNAMICEMB_GIN_TIMEOUT_S` | the process group's NCCL timeout | How long a kernel waits for a peer before it prints what it waited for and traps (stops, which loses the CUDA context). |
-| `DYNAMICEMB_GIN_CTAS` | `0` | CTAs of the output-dist kernels. `0`: 32 for the forward and 64 for the backward on one node, 32 for both across nodes (section 14). |
-| `DYNAMICEMB_GIN_REDUCE_CTAS` | `8` | Across nodes: the backward's CTAs that add up the proxy's rows (1 or more; the kernel uses at most its CTAs minus one). |
-| `DYNAMICEMB_GIN_CHUNK_KB` | `512` | Across nodes: the payload of a chunk of keys of few occurrences, the rows it moves over IB, in KiB: about this value or more (below). At least 64, and a multiple of 16. |
+| `DYNAMICEMB_HIER_PROXY_MB` | `512` | Cap of `proxy_rows`, in MiB (section 15.3). |
+| `DYNAMICEMB_HIER_TIMEOUT_S` | the process group's NCCL timeout | How long a kernel waits for a peer before it prints what it waited for and traps (stops, which loses the CUDA context). |
+| `DYNAMICEMB_HIER_OUT_CTAS` | `0` | CTAs of the output-dist kernels. `0`: 32 for the forward and 64 for the backward on one node, 32 for both across nodes (section 14). |
+| `DYNAMICEMB_HIER_REDUCE_CTAS` | `8` | Across nodes: the backward's CTAs that add up the proxy's rows (1 or more; the kernel uses at most its CTAs minus one). |
+| `DYNAMICEMB_HIER_PAYLOAD_KB` | `512` | Across nodes: the payload of a chunk of keys of few occurrences, the rows it moves over IB, in KiB: about this value or more (below). At least 64, and a multiple of 16. |
 | `LOCAL_WORLD_SIZE` | TorchRec's `get_local_size` | GPUs per node (`local_size`); torchrun sets it. |
 
 Across nodes the dist moves rows over IB in chunks (section 12.1). A chunk
 takes a row of the ring per occurrence of its keys: at most 2 MiB of rows
-(or `DYNAMICEMB_GIN_CHUNK_KB`, if that is more). Over IB it moves one row
+(or `DYNAMICEMB_HIER_PAYLOAD_KB`, if that is more). Over IB it moves one row
 per key, its payload. When the proxy cuts its chunks, it counts each key
 as its rows, but at least `rows_per_payload` (its counted rows, section
 12.1). Section 15.3 gives the exact rule; what follows holds for rows that
 are small beside a chunk. When the ring holds two chunks of 2 MiB and the
 value is at most 2048, `rows_per_payload` is about 2048 /
-`DYNAMICEMB_GIN_CHUNK_KB`, rounded down. So a chunk of keys of at most
+`DYNAMICEMB_HIER_PAYLOAD_KB`, rounded down. So a chunk of keys of at most
 `rows_per_payload` occurrences each moves about 2 MiB / `rows_per_payload`
 of rows over IB: about the value when it divides 2048, else up to about
 twice the value. A chunk of keys of more occurrences moves less. A value
@@ -407,9 +407,9 @@ do):
   It is collective: every rank of the sharding's process group calls it with
   its own batches. `tables` maps each feature of the sharding to its table,
   and `owner_of(keys, feature)` gives the rank that owns each key.
-* `hier_capacities(needs, headroom=1.25, room=4096)` makes the dict for
-  `output_dist_capacity`: each capacity `headroom` times its need, and at
-  least `room` entries more (small calls).
+* `hier_capacities(needs, factor=1.25, min_extra=4096)` makes the dict for
+  `output_dist_capacity`: each capacity `factor` times its need, and at
+  least `min_extra` entries more (small calls).
 
 ```python
 import sys
@@ -426,7 +426,7 @@ needs = hier_needs(
     lambda keys, feature: owning_shard(keys, world_size, "roundrobin"),
     local_world_size,
 )
-capacities = hier_capacities(needs, headroom=1.25)
+capacities = hier_capacities(needs, factor=1.25)
 ```
 
 * **An int** sets both capacities alike. It is the simplest choice: it must
@@ -438,7 +438,7 @@ capacities = hier_capacities(needs, headroom=1.25)
   it needed (section 5.4).
 * **The benchmark** counts the needs of its own batches before it builds
   the model (`--capacity measure`, the default) and takes
-  `--capacity_headroom` (1.25) times them, and at least 4096 entries more
+  `--capacity_factor` (1.25) times them, and at least 4096 entries more
   (`benchmark/README.md`, section 3). The tests size their capacities the
   same way.
 
@@ -469,8 +469,8 @@ some capacity than the op has:
 
 * **Its second wait raises RuntimeError, on every rank alike.** The error
   names each capacity the call overflowed, how large it is, and what the
-  call needed of it. For example: `output_dist="fused": a call needs more
-  than the capacities hold; raise output_dist_capacity's lookup_keys from
+  call needed of it. For example: `output_dist="hierarchical": a call needs
+  more than the capacities hold; raise output_dist_capacity's lookup_keys from
   541000 to at least 541801`. The call makes no lookup and no output dist.
 * Its input dist still ran every step, and its comm kernels sent their
   messages, so the sequence numbers and running totals stay valid: the op
@@ -486,11 +486,12 @@ some capacity than the op has:
 
 A call whose keys are not index-deduplicated, so that a proxy gets one key
 more than `local_size` times, also raises at its second wait, on every rank
-alike: `output_dist="fused": a proxy got one key 9 times from the 8 GPUs of
-its node; the keys must be index-deduplicated, each table's at most once per
-GPU`. Its status carries that need too (`key_rows`, against `local_size`).
-The proxy gives such a key `local_size` rows (section 9), so the input dist
-stays in bounds, and the call makes no lookup and no output dist.
+alike: `output_dist="hierarchical": a proxy got one key 9 times from the 8
+GPUs of its node; the keys must be index-deduplicated, each table's at most
+once per GPU`. Its status carries that need too (`key_rows`, against
+`local_size`). The proxy gives such a key `local_size` rows (section 9), so
+the input dist stays in bounds, and the call makes no lookup and no output
+dist.
 
 ## 6. When a sharding takes TorchRec's dists
 
@@ -502,28 +503,28 @@ state that every rank shares.
 | condition | decided | result |
 |---|---|---|
 | `output_dist="torchrec"` (the default) | when sharding | TorchRec's dists |
-| an unknown `output_dist`; an `output_dist_capacity` that is not a positive int below 2^31 − 1024, or a dict that sets `lookup_keys` (and maybe `remote_keys`) to such ints; `"fused"` without `output_dist_capacity` | when the options are made | `ValueError` |
+| an unknown `output_dist`; an `output_dist_capacity` that is not a positive int below 2^31 − 1024, or a dict that sets `lookup_keys` (and maybe `remote_keys`) to such ints; `"hierarchical"` without `output_dist_capacity` | when the options are made | `ValueError` |
 | tables of one sharding that disagree on `output_dist`, `output_dist_capacity` or `node_dedup` | when sharding | `ValueError` |
 | a lookup group whose output dtype is not the sharding's | when sharding | `ValueError` |
-| a build without NCCL ≥ 2.30.7 | when sharding | `"fused"`: `ImportError`; `"auto"`: a warning, TorchRec's dists |
+| a build without NCCL ≥ 2.30.7 | when sharding | `"hierarchical"`: `ImportError`; `"auto"`: a warning, TorchRec's dists |
 | `"auto"` without `output_dist_capacity` | when sharding | a warning, TorchRec's dists |
 | one rank in the sharding; a table of the sharding that is not a DynamicEmb table; feature processors | when sharding | a warning, TorchRec's dists |
-| tables that take a score per key (`score_strategy` `PRECISE_CUSTOMIZED`): a key crosses with one float32 weight, which a proxy adds up, and no score | when sharding | `"fused"`: `ValueError`; `"auto"`: a warning, TorchRec's dists |
+| tables that take a score per key (`score_strategy` `PRECISE_CUSTOMIZED`): a key crosses with one float32 weight, which a proxy adds up, and no score | when sharding | `"hierarchical"`: `ValueError`; `"auto"`: a warning, TorchRec's dists |
 | ranks that would build the op from different options, capacities or environment values | first `input_dist()`, before the op is built | `ValueError` on every rank, naming the first rank and value that differ |
 | ranks that are not whole nodes; `world_size × num_features` of 2^31 − 1024 or more; rows not a multiple of 16 bytes | first `input_dist()` | a warning, TorchRec's dists |
-| keys that are not index-deduplicated (a sharder without `use_index_dedup=True`) | first `input_dist()`, before the op is built | `"fused"`: `ValueError` on every rank; `"auto"`: a warning, TorchRec's dists |
-| a DynamicEmb table of the sharding with `dist_type` `"continuous"` (below) | first `input_dist()`, before the op is built | `"fused"`: `ValueError` on every rank; `"auto"`: a warning, TorchRec's dists |
-| a configuration the op cannot take: across nodes, capacities without `remote_keys`; a proxy cap below the least rows of its ring (section 15.3); a `remote_keys` whose stream could pass position 2^32 (section 12.1); rows that are not fp32, bf16 or fp16; an environment value it refuses (section 4.4) | first `input_dist()`, before the op is built | `"fused"`: `ValueError` on every rank; `"auto"`: a warning, TorchRec's dists |
+| keys that are not index-deduplicated (a sharder without `use_index_dedup=True`) | first `input_dist()`, before the op is built | `"hierarchical"`: `ValueError` on every rank; `"auto"`: a warning, TorchRec's dists |
+| a DynamicEmb table of the sharding with `dist_type` `"continuous"` (below) | first `input_dist()`, before the op is built | `"hierarchical"`: `ValueError` on every rank; `"auto"`: a warning, TorchRec's dists |
+| a configuration the op cannot take: across nodes, capacities without `remote_keys`; a proxy cap below the least rows of its ring (section 15.3); a `remote_keys` whose stream could pass position 2^32 (section 12.1); rows that are not fp32, bf16 or fp16; an environment value it refuses (section 4.4) | first `input_dist()`, before the op is built | `"hierarchical"`: `ValueError` on every rank; `"auto"`: a warning, TorchRec's dists |
 | On some rank: the NCCL LSA team is not the whole node. Or, across nodes, GIN does not connect the rails, has fewer than 4 contexts, or its signals do not start at 0. Or the window cannot be allocated. | first `input_dist()`, collectively | a warning that names each rank and why, TorchRec's dists on every rank |
 | an eval forward | per call | TorchRec's dists for that call |
 | a call that does not fit the capacities, or a proxy that gets one key more than `local_size` times | per call, at its second wait | `RuntimeError` on every rank, naming the capacity to raise or the key's occurrences (section 5.4) |
 
 The op places keys by `roundrobin` and `hash_roundrobin` only
 (section 10.1). One op serves all tables of a sharding, so one
-`continuous` table refuses the whole sharding. Under `"fused"` the error
-names the first such feature, in the sharding's feature order
+`continuous` table refuses the whole sharding. Under `"hierarchical"` the
+error names the first such feature, in the sharding's feature order
 (`feature_names()`):
-`output_dist="fused": it places keys by dist_type "roundrobin" or
+`output_dist="hierarchical": it places keys by dist_type "roundrobin" or
 "hash_roundrobin" only, and the sharding's feature 2 has "continuous" (set
 its table's dist_type to one of those, or output_dist to "torchrec")`.
 Under `"auto"` the warning starts with `output_dist="auto":`, has the same
@@ -554,9 +555,9 @@ class HierOutputDist {  // one per sharding
   HierOutputDist(const std::string &unique_id, int64_t rank, int64_t world_size,
                  int64_t local_size, const std::vector<int64_t> &feature_tables,
                  const std::vector<int64_t> &dist_types, int64_t dim, at::ScalarType dtype,
-                 bool weights, bool node_dedup, int64_t lookup_keys, int64_t remote_keys,
-                 int64_t proxy_bytes, double timeout_s, int64_t ctas, int64_t reduce_ctas,
-                 int64_t chunk_kb);
+                 bool weighted, bool node_dedup, int64_t lookup_keys, int64_t remote_keys,
+                 int64_t proxy_bytes, double timeout_s, int64_t out_ctas, int64_t reduce_ctas,
+                 int64_t payload_kb);
   ~HierOutputDist();  // local (section 4.6)
 
   // The whole input dist of a call, with no host sync: (values, weights,
@@ -671,8 +672,8 @@ same point on every rank:
    apply (`hier_output_dist_unsupported()`, section 6), every rank warns and
    takes TorchRec's dists. If the op refuses the configuration (a
    `continuous` table, say), or the keys are not index-deduplicated,
-   `"fused"` raises `ValueError` on every rank and `"auto"` warns and takes
-   TorchRec's dists.
+   `"hierarchical"` raises `ValueError` on every rank and `"auto"` warns and
+   takes TorchRec's dists.
 2. Else every rank builds the op with that id. The constructor checks the
    configuration again (it throws before any collective if it refuses it),
    then makes the communicator and its device communicator: LSA inside the
@@ -785,7 +786,7 @@ goes once its kernel is queued, and autograd keeps the backward's
   the whole input dist (`op.input_dist()`) and returns an awaitable, whose
   wait (the first wait) returns the second awaitable at once; waiting on it
   again returns the same. The second wait copies the status to the host
-  (`HierSharding.finish`), raises `RuntimeError` on every rank if the call
+  (`HierDist.finish`), raises `RuntimeError` on every rank if the call
   does not fit (section 5.4), and returns the owner's KJT, built from views
   of the input dist's tensors with no copy. It also sets the input KJT's
   per-feature totals from the status, so TorchRec's
@@ -795,7 +796,7 @@ goes once its kernel is queued, and autograd keeps the backward's
   pipelines call, also records the plans' tensors.
 * **Index dedup.** The op takes index-deduplicated keys only: a sharding
   whose sharder has no `use_index_dedup=True` takes TorchRec's dists under
-  `"auto"`, and raises `ValueError` under `"fused"`, at its first input
+  `"auto"`, and raises `ValueError` under `"hierarchical"`, at its first input
   dist. For a call that takes the op, the output dist itself writes each
   deduplicated row to all its original positions, and sums their
   gradients. So the sharding skips TorchRec's own expansion for that call
@@ -803,8 +804,8 @@ goes once its kernel is queued, and autograd keeps the backward's
   TorchRec's dists (an eval forward) keeps it.
 * **Owner rules.** The op takes `roundrobin` and `hash_roundrobin` tables
   only (`Config::validate`): a sharding with a `continuous` table takes
-  TorchRec's dists under `"auto"`, and raises `ValueError` under `"fused"`,
-  at its first input dist (section 6).
+  TorchRec's dists under `"auto"`, and raises `ValueError` under
+  `"hierarchical"`, at its first input dist (section 6).
 * **The lookup.** For the owner's KJT of a call on the op, the sharding
   takes the call's rows, the first `num_recv` rows of the `lookup_rows`
   that `op.input_dist()` gave, and each DynamicEmb lookup group writes its
@@ -1174,8 +1175,8 @@ delta replay (`dynamicemb/key_ownership.py`) follow another rule for some
 The op does not take `continuous`, TorchRec's block rule. That rule
 rewrites a key to its offset in its owner's block, so equal stored keys of
 two owners would be different keys, and node dedup's identity (table, key)
-would merge them (section 9). With a `continuous` table, `"fused"` raises
-`ValueError` and `"auto"` takes TorchRec's dists (section 6).
+would merge them (section 9). With a `continuous` table, `"hierarchical"`
+raises `ValueError` and `"auto"` takes TorchRec's dists (section 6).
 
 ### 10.2 The comm kernels
 
@@ -1762,7 +1763,7 @@ row per key. Under node dedup a key has up to `max_key_rows` rows in the
 ring, but one row of payload. So the chunks are cut by counted rows. A
 key's *counted rows* are its rows, but at least `rows_per_payload`: the
 ring rows a chunk may spend per row it sends over IB, its most rows in the
-ring over the payload rows that `DYNAMICEMB_GIN_CHUNK_KB` sets
+ring over the payload rows that `DYNAMICEMB_HIER_PAYLOAD_KB` sets
 (`chunk_ring_rows / payload_rows`, section 15.3; 4 at 512 KiB). A chunk
 takes the keys whose counted rows before them, among the owner node's, fall
 in one span of `chunk_span` counted rows: the owner node's chunk `j`, which
@@ -1772,7 +1773,7 @@ goes in the stream's round `j`. A key counts at most `max_counted_rows`, and
 * a chunk's counted rows are at most `max_chunk_rows`, and so are its rows,
   as a key's rows are at most its counted rows. A chunk takes at most
   `max_chunk_rows` rows of the ring: 2 MiB of rows, or
-  `DYNAMICEMB_GIN_CHUNK_KB` if that is more, and at most half the ring
+  `DYNAMICEMB_HIER_PAYLOAD_KB` if that is more, and at most half the ring
   (section 15.3);
 * a chunk of keys of at most `rows_per_payload` rows each holds about
   `max_chunk_rows / rows_per_payload` keys: by default about 512 KiB of
@@ -2016,9 +2017,9 @@ on another stream (a pipeline's data_dist stream). NCCL's own kernels may wait
 too. So an out kernel takes `min(want, SMs − 34)` CTAs: it leaves one SM to
 such a comm kernel, 32 to NCCL's kernels, and one to spare. It takes at least
 1 CTA, and the backward across nodes at least 2 (its issuer's CTA and a
-reducing one). `want` is `DYNAMICEMB_GIN_CTAS` when set, else 32, or 64 for
-the backward on one node (section 4.4). The input dist's other kernels never
-wait (section 13), so they need no SM of their own. The kernels of the
+reducing one). `want` is `DYNAMICEMB_HIER_OUT_CTAS` when set, else 32, or 64
+for the backward on one node (section 4.4). The input dist's other kernels
+never wait (section 13), so they need no SM of their own. The kernels of the
 heavy rows do not wait for peers either. They can use all SMs. **Example**, H100 (132
 SMs): an out kernel may take up to 98 CTAs, so the out kernels keep their 32,
 and the backward on one node its 64.
@@ -2109,8 +2110,8 @@ key.
 ```
 num_proxy_rows   = min(max(remote_keys, 4 × max_key_rows), proxy_bytes / row_bytes)   (rounded down)
 max_key_rows     = local_size
-payload_rows     = max(chunk_kb KiB / row_bytes, 32)
-cap_rows         = max(max(chunk_kb KiB, 2 MiB) / row_bytes, 32)
+payload_rows     = max(payload_kb KiB / row_bytes, 32)
+cap_rows         = max(max(payload_kb KiB, 2 MiB) / row_bytes, 32)
 chunk_ring_rows  = min(cap_rows, num_proxy_rows / 2)
 max_chunk_rows   = max(chunk_ring_rows, 2 × max_key_rows)
 rows_per_payload = max(chunk_ring_rows / payload_rows, 1)                             (rounded down)
@@ -2118,8 +2119,8 @@ max_counted_rows = max(max_key_rows, rows_per_payload)
 chunk_span       = max_chunk_rows − max_counted_rows + 1
 max_chunks       = rows_per_payload × remote_keys / chunk_span + num_nodes
 max_owner_chunks = (num_nodes − 1) + min(rows_per_payload × (num_nodes − 1) × remote_keys, max_counted_rows × lookup_keys) / chunk_span
-proxy_bytes      = DYNAMICEMB_GIN_PROXY_MB MiB (512 by default)
-chunk_kb         = DYNAMICEMB_GIN_CHUNK_KB (512 by default)
+proxy_bytes      = DYNAMICEMB_HIER_PROXY_MB MiB (512 by default)
+payload_kb       = DYNAMICEMB_HIER_PAYLOAD_KB (512 by default)
 ```
 
 `payload_rows` is a chunk's payload in rows, and `cap_rows` the most rows
@@ -2130,7 +2131,7 @@ at least. `rows_per_payload` is `chunk_ring_rows / payload_rows`, rounded
 down and at least 1: the ring rows a chunk may spend per row it sends over
 IB. A key of fewer rows counts that many, so a chunk of such keys holds
 about `max_chunk_rows / rows_per_payload` keys. `rows_per_payload` is 1 when
-half the ring holds less than the payload, and when `chunk_kb` is 1040 or
+half the ring holds less than the payload, and when `payload_kb` is 1040 or
 more (but with very large rows). The counted rows are then the rows.
 
 So the ring holds a call's rows in one lap when `remote_keys` rows fit under
@@ -2406,10 +2407,10 @@ KJT offsets.
   limits of section 4.2.
 * **Owner rules**: `roundrobin` and `hash_roundrobin` only. A sharding with
   a `continuous` table takes TorchRec's dists under `"auto"`, and raises
-  `ValueError` under `"fused"` (section 6).
+  `ValueError` under `"hierarchical"` (section 6).
 * **No score per key**: tables of `score_strategy` `PRECISE_CUSTOMIZED` take
-  TorchRec's dists under `"auto"`, and raise `ValueError` under `"fused"`
-  (section 6).
+  TorchRec's dists under `"auto"`, and raise `ValueError` under
+  `"hierarchical"` (section 6).
 * **One key dtype**: the GPUs of a node give the op keys of one dtype
   (`int32` or `int64`) in a call. The op does not check it (section 9).
 * **Fixed capacities**: a call that needs more raises, on every rank
@@ -2460,7 +2461,7 @@ KJT offsets.
   (section 18).
 * **Skewed keys**: lower IB use in the backward, and a slow rank's lookup
   delays the other ranks' output-dist kernels. A chunk of hot keys, which
-  have many rows in the ring, moves less than `DYNAMICEMB_GIN_CHUNK_KB`
+  have many rows in the ring, moves less than `DYNAMICEMB_HIER_PAYLOAD_KB`
   over IB: down to `max_chunk_rows / max_counted_rows` rows (section 12.1).
 * **`int32` keys**: checkpoint loading and delta replay
   (`dynamicemb/key_ownership.py`) place every `roundrobin` and
@@ -2483,7 +2484,7 @@ KJT offsets.
 Paths from `corelib/dynamicemb`.
 
 * **Python** (`dynamicemb/shard/`): `hier_output_dist.py` holds
-  `HierSharding` (the op, what a sharding's calls share, and a call's
+  `HierDist` (the op, what a sharding's calls share, and a call's
   second wait, `finish`), what a call leaves its output dist (`HierCall`),
   the output dist and `quiesce`; `input_dist.py` the hierarchical input
   dist (`hier_forward` and its two awaitables); `rw_sharding.py` the choice
@@ -2505,9 +2506,10 @@ Paths from `corelib/dynamicemb`.
       call's tables, the call's status, the GIN contexts and signals, and the
       trace's build flag and row format;
     * `config.h`, `config.cu`: error checks and small host helpers, the op's
-      configuration (`Config`) and its checks, the sizes of a chunk
-      (`kChunkBytes`, `kChunkRowCapBytes`, `kMinChunkKb`), and the op's
-      sizes (`sizes_of`, `rows_per_payload_for`, `max_chunks_for`);
+      configuration (`Config`) and its checks, the payload of a chunk and its
+      cap in the ring (`kDefaultPayloadKb`, `kMinPayloadKb`,
+      `kChunkRowCapBytes`), and the op's sizes (`sizes_of`,
+      `rows_per_payload_for`, `max_chunks_for`);
     * `window.h`: the window's layout (`WindowLayout`) over its sections:
       `CtrlLayout` (with the format of the count message), `KeysLayout`
       (with `ProxyHeader`, `RemoteMap` and what `peer_gather` reads) and

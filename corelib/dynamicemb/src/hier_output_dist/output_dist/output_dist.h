@@ -114,7 +114,7 @@ class OutChannel {
   int64_t dim_;
   at::ScalarType dtype_;
   int world_size_, device_, sms_;
-  int ctas_, reduce_ctas_;  // Config's (0: out_ctas' default)
+  int out_ctas_, reduce_ctas_;  // Config's (0: out_ctas()'s default)
   bool multi_node_;
   ncclGinType_t gin_;
   Trace trace_;
