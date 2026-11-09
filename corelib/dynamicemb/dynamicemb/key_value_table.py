@@ -396,20 +396,29 @@ def get_uvm_tensor(dim, dtype, device, is_managed=False):
     )
 
 
-def get_table_ptrs(
-    tables: List[ExtendableBuffer], device: torch.device
-) -> torch.Tensor:
-    """Build a device tensor of current value-buffer base pointers for *tables*.
+def _base_pointers(tables: List[ExtendableBuffer]) -> List[int]:
+    """The base address of each value buffer of *tables*, as the kernels address them.
 
-    Uses ``buffer.tensor().data_ptr()`` so results stay valid until the next
-    ``ExtendableBuffer.extend()``; after extend, rebuild into ``table_ptrs_dev``
-    (or another buffer) via this function.
+    A buffer keeps its address when it is extended (a device buffer maps new pages after
+    the old ones, a host buffer commits pages inside the address range it reserved), so
+    what a kernel queued earlier holds stays valid. See :func:`publish_table_ptrs`.
     """
-    return torch.tensor(
-        [b.tensor().data_ptr() for b in tables],
-        dtype=torch.int64,
-        device=device,
-    )
+    return [b.tensor().data_ptr() for b in tables]
+
+
+def publish_table_ptrs(state: "DynamicEmbTableState") -> None:
+    """Bring ``state.table_ptrs_dev`` up to date with the value buffers.
+
+    The addresses are compared on the host: when none has changed, which is every growth
+    of a buffer that never moves, nothing is uploaded. A buffer that did move (an
+    extension built before buffers were address-stable) is published by a queued copy of
+    the whole list on the current stream, the growth stream, inside the growth section.
+    """
+    ptrs = _base_pointers(state.tables)
+    if ptrs == state.table_ptrs_host:
+        return
+    sf.copy_i64_into(state.table_ptrs_dev, ptrs)
+    state.table_ptrs_host = ptrs
 
 
 # ---------------------------------------------------------------------------
@@ -427,7 +436,8 @@ class DynamicEmbTableState:
     key_index_map: Any
     capacity: int
     tables: List[ExtendableBuffer]
-    # Per-table value buffer base pointers on ``device``; refreshed on init and expand.
+    # Per-table value buffer base pointers on ``device``, set on init and refreshed by
+    # :func:`publish_table_ptrs` when a buffer moves.
     table_ptrs_dev: torch.Tensor
     table_emb_dims: torch.Tensor
     # Persistent host (CPU) copy of table_emb_dims as a tensor (the ``_cpu`` field
@@ -465,6 +475,9 @@ class DynamicEmbTableState:
     # :class:`GrowthOrder`); ``None`` for a state that cannot grow, which has
     # nothing to order.
     growth: Optional[GrowthOrder] = None
+    # What ``table_ptrs_dev`` holds, as host integers: a growth compares the addresses
+    # of the buffers with it and uploads only when one has changed.
+    table_ptrs_host: List[int] = field(default_factory=list)
     # How many times ``key_index_map`` has been replaced (an expansion builds a
     # new one and drops the old). A slot number means something only in the map it
     # was read from, so whoever walks the slots across calls -- an erase by score,
@@ -687,6 +700,7 @@ def create_table_state(
         props.multi_processor_count * props.max_threads_per_multi_processor
     )
     can_still_grow = _tables_can_grow(options, no_eviction, key_index_map_caps)
+    table_ptrs = _base_pointers(tables)
 
     return DynamicEmbTableState(
         options_list=options,
@@ -698,7 +712,8 @@ def create_table_state(
         key_index_map=key_index_map,
         capacity=capacity,
         tables=tables,
-        table_ptrs_dev=get_table_ptrs(tables, device),
+        table_ptrs_dev=sf.upload_i64(table_ptrs, device),
+        table_ptrs_host=table_ptrs,
         table_emb_dims=table_emb_dims,
         table_emb_dims_host=table_emb_dims_host,
         table_value_dims=table_value_dims,
@@ -762,11 +777,6 @@ def collect_row_counts_to_device(state: DynamicEmbTableState) -> torch.Tensor:
     needs to grow to and no further.
     """
     return state.key_index_map.row_counters_.to(torch.int64)
-
-
-# DYNAMICEMB_EXACT_GROWTH=1 makes every expansion decision wait for the device sizes,
-# as it did before the estimate below existed. A checkpoint load always does.
-_EXACT_GROWTH = os.environ.get("DYNAMICEMB_EXACT_GROWTH", "0") == "1"
 
 
 def _tables_can_grow(
@@ -878,8 +888,8 @@ class SizeSnapshots:
 
     def rebase_exact(self, sizes: torch.Tensor, rows: Optional[torch.Tensor]) -> None:
         """Start over from numbers the host has just read from the device, blocking
-        (a checkpoint load, a test, ``DYNAMICEMB_EXACT_GROWTH=1``): the snapshots still
-        in flight are older than they are and are dropped.
+        (a checkpoint load, a test): the snapshots still in flight are older than they
+        are and are dropped.
 
         Inserts that were enqueued on another stream than the one that read the
         numbers may be missing from them; that is the exposure the blocking read has
@@ -930,7 +940,7 @@ def request_size_snapshot(state: DynamicEmbTableState) -> None:
     state that can still grow. Call it on the stream that performs the state's
     inserts, after the ones it should count."""
     snapshots = state.size_snapshots
-    if snapshots is None or _EXACT_GROWTH or not can_grow(state):
+    if snapshots is None or not can_grow(state):
         return
     snapshots.enqueue(
         collect_table_sizes_to_device(state),
@@ -948,22 +958,48 @@ def _note_forwarded(state: DynamicEmbTableState, bound: torch.Tensor) -> None:
     request_size_snapshot(state)
 
 
+def read_table_sizes_now(
+    state: DynamicEmbTableState,
+) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    """The keys every table holds and, for a table that never evicts, the rows it has
+    handed out, read from the device NOW: ``(sizes, rows)`` as CPU int64 tensors, ``rows``
+    ``None`` for a state that has none.
+
+    One blocking read (:func:`dynamicemb.sync_free.read_now`, a single pinned transfer
+    of both vectors), for a checkpoint load, which sizes the tables for the keys it is
+    about to insert and is not on the training path. A step decides from the estimate
+    (:class:`SizeSnapshots`) and never comes here.
+    """
+    sizes = collect_table_sizes_to_device(state)
+    if state.no_eviction:
+        host_sizes, host_rows = sf.read_now(sizes, collect_row_counts_to_device(state))
+        return host_sizes, host_rows
+    return sf.read_now(sizes)[0], None
+
+
 def collect_table_sizes_for_state(
     state: DynamicEmbTableState, non_blocking: bool = True
 ) -> None:
     """Copy device table sizes into ``state.estimated_table_sizes`` when flag is set.
 
-    A blocking copy gives the exact numbers, which the size estimate of the state
-    restarts from."""
+    A blocking copy (one :func:`read_table_sizes_now`) gives the exact numbers, which
+    the size estimate of the state restarts from."""
     if not state.collect_table_sizes_flag:
         return
-    table_sizes = collect_table_sizes_to_device(state)
-    state.estimated_table_sizes.copy_(table_sizes, non_blocking=non_blocking)
-    if state.estimated_row_counts is not None:
-        state.estimated_row_counts.copy_(
-            collect_row_counts_to_device(state), non_blocking=non_blocking
+    if non_blocking:
+        state.estimated_table_sizes.copy_(
+            collect_table_sizes_to_device(state), non_blocking=True
         )
-    if not non_blocking and state.size_snapshots is not None:
+        if state.estimated_row_counts is not None:
+            state.estimated_row_counts.copy_(
+                collect_row_counts_to_device(state), non_blocking=True
+            )
+        return
+    sizes, rows = read_table_sizes_now(state)
+    state.estimated_table_sizes.copy_(sizes)
+    if rows is not None and state.estimated_row_counts is not None:
+        state.estimated_row_counts.copy_(rows)
+    if state.size_snapshots is not None:
         state.size_snapshots.rebase_exact(
             state.estimated_table_sizes, state.estimated_row_counts
         )
@@ -1089,7 +1125,7 @@ def _rehash_into(
                     state.tables[i].extend((add_rows, vd))
             else:
                 state.tables[i].extend(state.tables[i].shape)
-    state.table_ptrs_dev.copy_(get_table_ptrs(state.tables, device))
+    publish_table_ptrs(state)
 
     old_key_index_map = state.key_index_map
     for table_id in range(state.num_tables):
@@ -1361,7 +1397,7 @@ def _grow_values_only(state: DynamicEmbTableState, need_rows: List[int]) -> None
                 state.tables[i].extend(
                     (targets[i] - rows, state.table_value_dims_cpu[i])
                 )
-        state.table_ptrs_dev.copy_(get_table_ptrs(state.tables, state.device))
+        publish_table_ptrs(state)
         state.key_index_map.set_row_limits([t.shape[0] for t in state.tables])
 
 
@@ -1477,8 +1513,7 @@ def _expand_if_need_no_eviction(
 
     est_results, _ = get_expand_info(state, keys_est, unique_size_per_table)
     if any(est_results) or rows_short(rows_est):
-        keys = collect_table_sizes_to_device(state).cpu()
-        rows = collect_row_counts_to_device(state).cpu()
+        keys, rows = read_table_sizes_now(state)
         keys_est.copy_(keys)
         rows_est.copy_(rows)
         results, targets = get_expand_info(state, keys, unique_size_per_table)
@@ -1536,8 +1571,8 @@ def _expand_if_need_exact(
     (num_tables,) with per-table unique counts).
     When a second opinion on table sizes is needed, calls
     :func:`collect_table_sizes_for_state` with ``non_blocking=False``: the decision
-    waits for the device. This is what :func:`expand_if_need_impl` does for a
-    checkpoint load and under ``DYNAMICEMB_EXACT_GROWTH=1``.
+    waits for the device (one :func:`read_table_sizes_now`). This is what
+    :func:`expand_if_need_impl` does for a checkpoint load.
     """
     assert (
         unique_size_per_table.device.type == "cpu"
@@ -1594,9 +1629,9 @@ def expand_if_need_impl(
     device (``ExtendableBuffer.extend``), but a table at its ``max_capacity`` never
     gets there.
 
-    ``exact`` (and ``DYNAMICEMB_EXACT_GROWTH=1``) decides from the device sizes
-    instead, waiting for them when an estimate says a table might grow. A checkpoint
-    load asks for it.
+    ``exact`` decides from the device sizes instead, waiting for them (one read,
+    :func:`read_table_sizes_now`) when an estimate says a table might grow. A checkpoint
+    load asks for it, which is a call that returns after host I/O anyway.
 
     ``inserts_in_forward`` says the batch's keys are inserted by its forward, not by
     this call's caller: until the forward reports back (:meth:`note_forwarded` of the
@@ -1606,7 +1641,7 @@ def expand_if_need_impl(
         unique_size_per_table.device.type == "cpu"
     ), "unique_size_per_table must be a CPU tensor"
     snapshots = state.size_snapshots
-    if exact or _EXACT_GROWTH:
+    if exact:
         # The exact path used to be able to expand from its running sum, without
         # confirming, once an asynchronous copy at the start of every prefetch had
         # refreshed it (the flag below). Nothing refreshes it in the background any

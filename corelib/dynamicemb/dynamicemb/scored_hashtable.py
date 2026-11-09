@@ -426,10 +426,15 @@ class LinearBucketTable(ScoredHashTable):
         self.num_buckets_ = bucket_offset_list[-1]
         self.capacity_ = self.num_buckets_ * self.bucket_capacity_
 
-        self.table_bucket_offsets_ = torch.tensor(
-            bucket_offset_list, dtype=torch.int64, device=self.device
+        # The first bucket of every table, on the device for the kernels and on the
+        # host for whoever slices by table. The host copies are built from the list,
+        # not read back from the device, and the upload is queued, not waited for
+        # (a rehash makes a key map in the middle of a step).
+        self.bucket_offsets_host_: List[int] = list(bucket_offset_list)
+        self.table_bucket_offsets_ = sf.upload_i64(bucket_offset_list, self.device)
+        self.table_bucket_offsets_cpu_ = torch.tensor(
+            bucket_offset_list, dtype=torch.int64
         )
-        self.table_bucket_offsets_cpu_ = self.table_bucket_offsets_.cpu()
 
         total_input_capacity = sum(capacity)
         if self.capacity_ != total_input_capacity:
@@ -472,9 +477,7 @@ class LinearBucketTable(ScoredHashTable):
             # Rows a table's value buffer has. A slot is never more than one row
             # of its own, so the table's capacity is the most that can be handed
             # out; a buffer that is smaller says so through ``set_row_limits``.
-            self.row_limits_ = torch.tensor(
-                self.per_table_capacity_, dtype=torch.int64, device=self.device
-            )
+            self.row_limits_ = sf.upload_i64(self.per_table_capacity_, self.device)
         else:
             self.rows_ = None
             self.row_counters_ = None
@@ -649,12 +652,13 @@ class LinearBucketTable(ScoredHashTable):
 
         Allocating a row at or past its table's limit is asserted on the device
         (no host sync), so a caller that sizes the buffer wrongly fails loudly
-        instead of writing past it. Call again whenever a buffer grows.
+        instead of writing past it. Call again whenever a buffer grows. The copy is
+        queued on the current stream, not waited for; a growth calls this inside its
+        section (see ``GrowthOrder``), which orders it against the kernels that read
+        the limits.
         """
         assert self.use_rows_ and len(limits) == self.num_tables_
-        self.row_limits_.copy_(
-            torch.tensor(limits, dtype=torch.int64), non_blocking=False
-        )
+        sf.copy_i64_into(self.row_limits_, limits)
 
     def num_rows(self, table_id: int) -> int:
         """Rows handed out so far for ``table_id``: rows ``[0, num_rows)`` are
@@ -1888,10 +1892,10 @@ class LinearBucketTable(ScoredHashTable):
         assert (
             self.per_table_capacity_[table_id] == other.per_table_capacity_[table_id]
         ), "copy_table_from requires same per-table capacity"
-        b_start = int(self.table_bucket_offsets_cpu_[table_id].item())
-        b_end = int(self.table_bucket_offsets_cpu_[table_id + 1].item())
-        o_b_start = int(other.table_bucket_offsets_cpu_[table_id].item())
-        o_b_end = int(other.table_bucket_offsets_cpu_[table_id + 1].item())
+        b_start = self.bucket_offsets_host_[table_id]
+        b_end = self.bucket_offsets_host_[table_id + 1]
+        o_b_start = other.bucket_offsets_host_[table_id]
+        o_b_end = other.bucket_offsets_host_[table_id + 1]
         assert (b_end - b_start) == (o_b_end - o_b_start)
         # Main table: keys, digests, scores, bucket_sizes, ref_counter
         self.keys_[b_start:b_end, :].copy_(other.keys_[o_b_start:o_b_end, :])
@@ -1951,8 +1955,8 @@ class LinearBucketTable(ScoredHashTable):
         assert self.num_scores_ == other.num_scores_, "num_scores mismatch"
         if src_slots.numel() == 0:
             return
-        src_bkt_begin = int(other.table_bucket_offsets_cpu_[table_id].item())
-        dst_bkt_begin = int(self.table_bucket_offsets_cpu_[table_id].item())
+        src_bkt_begin = other.bucket_offsets_host_[table_id]
+        dst_bkt_begin = self.bucket_offsets_host_[table_id]
         table_copy_score_blocks(
             other.table_storage_,
             other.bucket_capacity_,

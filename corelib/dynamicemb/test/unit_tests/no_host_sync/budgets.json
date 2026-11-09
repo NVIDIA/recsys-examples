@@ -199,28 +199,28 @@
  },
  "cache_storage_growth": {
   "all_hit": {"plain": 0, "prefetch": 0},
-  "miss": {"plain": 3.375, "prefetch": 3.375},
-  "growth": {"plain": 3.375, "prefetch": 3.375}
+  "miss": {"plain": 1.5, "prefetch": 1.5},
+  "growth": {"plain": 1.5, "prefetch": 1.5}
  },
  "hbm_only_growth": {
   "all_hit": {"plain": 0, "prefetch": 0},
-  "miss": {"plain": 3.375, "prefetch": 3.375},
-  "growth": {"plain": 3.375, "prefetch": 3.375}
+  "miss": {"plain": 1.5, "prefetch": 1.5},
+  "growth": {"plain": 1.5, "prefetch": 1.5}
  },
  "host_only_growth": {
   "all_hit": {"plain": 0, "prefetch": 0},
-  "miss": {"plain": 3.375, "prefetch": 3.375},
-  "growth": {"plain": 3.375, "prefetch": 3.375}
+  "miss": {"plain": 1.5, "prefetch": 1.5},
+  "growth": {"plain": 1.5, "prefetch": 1.5}
  },
  "cache_storage_noevict": {
   "all_hit": {"plain": 0, "prefetch": 0},
-  "miss": {"plain": 4.125, "prefetch": 4.125},
-  "growth": {"plain": 4.125, "prefetch": 4.125}
+  "miss": {"plain": 1.5, "prefetch": 1.5},
+  "growth": {"plain": 1.5, "prefetch": 1.5}
  },
  "hbm_only_noevict": {
   "all_hit": {"plain": 0, "prefetch": 0},
-  "miss": {"plain": 4.125, "prefetch": 4.125},
-  "growth": {"plain": 4.125, "prefetch": 4.125}
+  "miss": {"plain": 1.5, "prefetch": 1.5},
+  "growth": {"plain": 1.5, "prefetch": 1.5}
  },
  "cache_storage_determ": {
   "all_hit": {"plain": 1, "prefetch": 1},

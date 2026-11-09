@@ -44,7 +44,7 @@ the calling thread is inside one of them.
 import contextlib
 import os
 import threading
-from typing import Callable, List, Optional, Tuple, Union
+from typing import Callable, Dict, List, Optional, Sequence, Tuple, Union
 
 import dynamicemb_extensions
 import torch
@@ -576,6 +576,107 @@ class StagedUpload:
     def __reduce__(self):
         # Staging buffers and events are not copied; see DeferredRead.__reduce__.
         return (StagedUpload, (self.device, self.ring))
+
+
+# ---------------------------------------------------------------------------
+# Small uploads
+# ---------------------------------------------------------------------------
+
+# The metadata of a key map and of its value buffers -- the first bucket of every table,
+# the rows each table may hand out, the base address of each value buffer -- are a few
+# int64 per table, built on the host. ``torch.tensor(values, device=...)`` copies them
+# from pageable memory and waits for the copy, which is a host sync per growth; the
+# functions below stage them in pinned memory instead and queue the copy.
+_UPLOAD_SLOTS = 8
+_UPLOAD_SLOT_NUMEL = 4096
+
+
+class _UploadSlot:
+    """One pinned staging buffer of an ``_UploadRing`` and the event of its last copy."""
+
+    __slots__ = ("buf", "event")
+
+    def __init__(self) -> None:
+        self.buf = torch.empty(_UPLOAD_SLOT_NUMEL, dtype=torch.int64, pin_memory=True)
+        self.event = torch.cuda.Event()
+
+
+class _UploadRing:
+    """Pinned staging buffers for the uploads of one device, allocated once.
+
+    A buffer is written again only after the copy it fed has run (its event), so a
+    growth that uploads several small arrays one after the other neither waits nor
+    allocates pinned memory. When every buffer is still in flight, or a list does not
+    fit one, the upload takes a pinned tensor of its own: still no wait.
+    """
+
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.slots = [_UploadSlot() for _ in range(_UPLOAD_SLOTS)]
+        self.next = 0
+
+    def free_slot(self, numel: int) -> Optional[_UploadSlot]:
+        """A buffer whose last copy has landed (None when there is none, or ``numel``
+        does not fit). The lock is held."""
+        if numel > _UPLOAD_SLOT_NUMEL:
+            return None
+        for k in range(_UPLOAD_SLOTS):
+            slot = self.slots[(self.next + k) % _UPLOAD_SLOTS]
+            if slot.event.query():
+                self.next = (self.next + k + 1) % _UPLOAD_SLOTS
+                return slot
+        return None
+
+
+_UPLOAD_RINGS: Dict[int, _UploadRing] = {}
+_UPLOAD_RINGS_LOCK = threading.Lock()
+
+
+def _upload_ring(device: torch.device) -> _UploadRing:
+    index = device.index if device.index is not None else torch.cuda.current_device()
+    with _UPLOAD_RINGS_LOCK:
+        ring = _UPLOAD_RINGS.get(index)
+        if ring is None:
+            ring = _UPLOAD_RINGS[index] = _UploadRing()
+        return ring
+
+
+def copy_i64_into(dst: torch.Tensor, values: Sequence[int]) -> None:
+    """``dst`` (a CUDA int64 tensor of ``len(values)`` elements) := ``values``, on the
+    current stream; the host waits for nothing.
+
+    The values go through a pinned staging buffer and an asynchronous copy, so the list
+    may go out of scope at once. The copy is ordered like any other work of the stream:
+    a reader on another stream has to be ordered after it by the caller.
+    """
+    numel = len(values)
+    if numel == 0:
+        return
+    ring = _upload_ring(dst.device)
+    stream = torch.cuda.current_stream(dst.device)
+    with ring.lock:
+        slot = ring.free_slot(numel)
+        if slot is not None:
+            staged = slot.buf[:numel]
+            staged.copy_(torch.as_tensor(values, dtype=torch.int64))
+            dst.copy_(staged, non_blocking=True)
+            slot.event.record(stream)
+            return
+    # No buffer is free (or the list is long): a pinned tensor of its own, which the host
+    # allocator keeps until the copy has run. Still no wait.
+    # sync-ok: pinned staging of a short list, never a wait
+    host = torch.tensor(list(values), dtype=torch.int64, pin_memory=True)
+    dst.copy_(host, non_blocking=True)
+
+
+def upload_i64(
+    values: Sequence[int], device: Union[torch.device, str, int]
+) -> torch.Tensor:
+    """``values`` as a new CUDA int64 tensor, copied on the current stream; the host
+    waits for nothing (see :func:`copy_i64_into`)."""
+    out = torch.empty(len(values), dtype=torch.int64, device=device)
+    copy_i64_into(out, values)
+    return out
 
 
 # ---------------------------------------------------------------------------

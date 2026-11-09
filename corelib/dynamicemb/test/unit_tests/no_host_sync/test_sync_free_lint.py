@@ -1259,9 +1259,20 @@ TARGETS: List[Target] = (
         "_after_growth",
         "_grow_values_only",
         "_expand_if_need_no_eviction_estimated",
+        "publish_table_ptrs",
+        "_base_pointers",
+        "read_table_sizes_now",
+        "collect_table_sizes_for_state",
     )
-    + _new(SHT, "LinearBucketTable.record_stream")
+    + _new(
+        SHT,
+        "LinearBucketTable.record_stream",
+        "LinearBucketTable.set_row_limits",
+        "LinearBucketTable.copy_table_from",
+        "LinearBucketTable.copy_score_blocks_from",
+    )
     + _new(BDF, "_note_table_users")
+    + _new(SF, "copy_i64_into", "upload_i64")
 )
 
 ENFORCE_ALL = os.environ.get("SYNC_LINT_ENFORCE_ALL") == "1"
@@ -1988,7 +1999,70 @@ def _allowed(hit_key: Tuple[str, str, str]) -> bool:
 # the tree. The text has to be unique enough that it does not name a line the change keeps.
 # SYNC_LINT_FINAL=1 (the last commit of the series) also wants every line that left the baseline
 # to be claimed here, so that no removal goes unreviewed.
-EXPECTED_GONE: List[Tuple[str, str, str, str]] = []
+EXPECTED_GONE: List[Tuple[str, str, str, str]] = [
+    # G2: the metadata of a key map is built from the host list, uploaded from pinned
+    # memory without a wait, and the sizes of an exact decision are one sf.read_now
+    (
+        "dynamicemb/scored_hashtable.py",
+        "cpu",
+        "self.table_bucket_offsets_cpu_ = self.table_bucket_offsets_.cpu()",
+        "G2",
+    ),
+    (
+        "dynamicemb/scored_hashtable.py",
+        "blocking_copy",
+        "torch.tensor(limits, dtype=torch.int64), non_blocking=False",
+        "G2",
+    ),
+    (
+        "dynamicemb/scored_hashtable.py",
+        "item",
+        "b_start = int(self.table_bucket_offsets_cpu_[table_id].item())",
+        "G2",
+    ),
+    (
+        "dynamicemb/scored_hashtable.py",
+        "item",
+        "b_end = int(self.table_bucket_offsets_cpu_[table_id + 1].item())",
+        "G2",
+    ),
+    (
+        "dynamicemb/scored_hashtable.py",
+        "item",
+        "o_b_start = int(other.table_bucket_offsets_cpu_[table_id].item())",
+        "G2",
+    ),
+    (
+        "dynamicemb/scored_hashtable.py",
+        "item",
+        "o_b_end = int(other.table_bucket_offsets_cpu_[table_id + 1].item())",
+        "G2",
+    ),
+    (
+        "dynamicemb/scored_hashtable.py",
+        "item",
+        "src_bkt_begin = int(other.table_bucket_offsets_cpu_[table_id].item())",
+        "G2",
+    ),
+    (
+        "dynamicemb/scored_hashtable.py",
+        "item",
+        "dst_bkt_begin = int(self.table_bucket_offsets_cpu_[table_id].item())",
+        "G2",
+    ),
+    (
+        "dynamicemb/key_value_table.py",
+        "cpu",
+        "keys = collect_table_sizes_to_device(state).cpu()",
+        "G2",
+    ),
+    (
+        "dynamicemb/key_value_table.py",
+        "cpu",
+        "rows = collect_row_counts_to_device(state).cpu()",
+        "G2",
+    ),
+]
 
 
 def _claim_matches(claim: Tuple[str, str, str, str], key: Tuple[str, str, str]) -> bool:

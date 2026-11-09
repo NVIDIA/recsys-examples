@@ -10,8 +10,8 @@ What this checks is that the estimate is never too low -- a table never grows la
 than the exact rule would grow it, and a table that never evicts never runs out of
 value rows, even when the GPU is far behind the host -- that it does not drift for a
 key set that stays the same, and that deciding costs the host no wait and no
-allocation. ``DYNAMICEMB_EXACT_GROWTH=1`` (``kvt._EXACT_GROWTH``) is the exact rule
-the estimate is compared to.
+allocation. The exact rule, which a checkpoint load applies (``exact=True`` of
+``expand_if_need``, one blocking read), is what the estimate is compared to.
 """
 
 import itertools
@@ -54,13 +54,6 @@ HOST = 0  # no HBM for values: host storage, inserted into by the forward
 def current_device():
     assert torch.cuda.is_available()
     return torch.cuda.current_device()
-
-
-@pytest.fixture(autouse=True)
-def estimated_growth(monkeypatch):
-    """Every test starts on the estimate, whatever DYNAMICEMB_EXACT_GROWTH says; the
-    ones that compare it to the exact rule switch that on themselves."""
-    monkeypatch.setattr(kvt, "_EXACT_GROWTH", False)
 
 
 @pytest.fixture
@@ -308,7 +301,14 @@ def test_the_estimate_grows_a_table_never_later_than_the_exact_rule(
     batches that are small against the table, a little is under a doubling."""
     steps, new, repeated = 80, 64, 64
     estimated = capacity_trace(current_device, steps, new, repeated)
-    monkeypatch.setattr(kvt, "_EXACT_GROWTH", True)
+    real = kvt.expand_if_need_impl
+    monkeypatch.setattr(
+        kvt,
+        "expand_if_need_impl",
+        lambda state, unique, *, exact=False, inserts_in_forward=False: real(
+            state, unique, exact=True, inserts_in_forward=inserts_in_forward
+        ),
+    )
     exact = capacity_trace(current_device, steps, new, repeated)
 
     assert exact[-1] > exact[0], "the trace never made the table grow"
@@ -329,18 +329,26 @@ def test_a_key_set_that_stays_the_same_stops_growing(current_device):
     assert capacities(model) == [1024]
 
 
-def test_exact_growth_takes_no_snapshot(current_device, monkeypatch):
-    monkeypatch.setattr(kvt, "_EXACT_GROWTH", True)
+def test_an_exact_decision_reads_the_sizes_once_and_drops_the_snapshots(
+    current_device, read_now_calls
+):
+    """The decision a checkpoint load makes: one blocking read of the device sizes when
+    an estimate says a table might grow (``read_table_sizes_now``), which restarts the
+    estimate from the numbers read and drops the snapshots still in flight."""
     device = torch.device("cuda", current_device)
     model = build_model(current_device)
-    snapshots = model._storage._state.size_snapshots
-    for step in range(5):
-        train_step(
-            model, one_table_batch(list(range(step * 300, (step + 1) * 300)), device)
-        )
+    state = model._storage._state
+    snapshots = state.size_snapshots
+    train_step(model, one_table_batch(list(range(10, 20)), device))
+    torch.cuda.synchronize()
+    before = read_now_calls.delta
+
+    model._storage.expand_if_need(torch.tensor([4_000], dtype=torch.int64), exact=True)
+
+    assert read_now_calls.delta - before == 1
+    assert capacities(model)[0] > 1024
     assert not snapshots.pending
     assert snapshots.ring.free_slots() == snapshots.slots
-    assert capacities(model)[0] > 1024
 
 
 # --- a table that never evicts must never run out of rows ---------------------------
@@ -468,3 +476,148 @@ def test_a_table_with_few_keys_does_not_grow_for_a_table_with_many(current_devic
     assert after[1] == before[1]
     model(*batch).sum().backward()
     torch.cuda.synchronize()
+
+
+# --- the metadata of a growth is uploaded without waiting ----------------------------
+
+
+def pointers_of(state) -> List[int]:
+    return [buffer.tensor().data_ptr() for buffer in state.tables]
+
+
+@pytest.mark.parametrize("hbm", [HBM, HOST], ids=["hbm", "host"])
+def test_the_pointer_table_follows_the_buffers_and_is_uploaded_only_when_one_moved(
+    current_device, hbm, monkeypatch
+):
+    """A device buffer keeps its address when it grows, and with it the table the
+    kernels read: nothing is uploaded. A buffer that does move is published by one
+    queued copy. Either way the table on the device ends up as the buffers are."""
+    option = options_of(current_device, local_hbm_for_values=hbm, init_capacity=1024)
+    state = create_table_state([option], AdamDynamicEmbeddingOptimizer(OptimizerArgs()))
+    assert state.table_ptrs_host == pointers_of(state)
+    assert state.table_ptrs_dev.tolist() == pointers_of(state)
+    uploads = []
+    real = sf.copy_i64_into
+    monkeypatch.setattr(
+        sf,
+        "copy_i64_into",
+        lambda dst, values: (uploads.append(dst), real(dst, values)),
+    )
+    before = pointers_of(state)
+
+    kvt._expand_tables_impl(state, [True], [4096])
+
+    moved = pointers_of(state) != before
+    published = [u for u in uploads if u is state.table_ptrs_dev]
+    assert len(published) == (1 if moved else 0)
+    torch.cuda.synchronize()
+    assert state.table_ptrs_dev.tolist() == pointers_of(state)
+    assert state.table_ptrs_host == pointers_of(state)
+    if hbm:
+        assert not moved, "a device value buffer must keep its address when it grows"
+
+
+def test_small_uploads_do_not_wait_and_do_not_allocate_pinned_memory(
+    current_device, monkeypatch
+):
+    """The bucket offsets, the row limits and the pointer table of a growth are a few
+    int64 each, uploaded one after the other: through the ring of pinned buffers, with
+    no wait and no pinned allocation, however many of them are in flight."""
+    device = torch.device("cuda", current_device)
+    sf.upload_i64([1, 2, 3], device)  # the ring is made here, not in the window
+    torch.cuda.synchronize()
+    pinned = []
+    for name in ("empty", "zeros", "tensor"):
+        real = getattr(torch, name)
+
+        def spy(*args, __real=real, __name=name, **kwargs):
+            if kwargs.get("pin_memory"):
+                pinned.append(__name)
+            return __real(*args, **kwargs)
+
+        monkeypatch.setattr(torch, name, spy)
+
+    torch.cuda._sleep(50_000_000)  # the copies queue behind it: every buffer in flight
+    torch.cuda.set_sync_debug_mode("error")
+    try:
+        small = [
+            sf.upload_i64([i, i + 1, i + 2], device) for i in range(sf._UPLOAD_SLOTS)
+        ]
+    finally:
+        torch.cuda.set_sync_debug_mode("default")
+    assert not pinned, pinned
+    torch.cuda.synchronize()
+    assert [t.tolist() for t in small] == [
+        [i, i + 1, i + 2] for i in range(sf._UPLOAD_SLOTS)
+    ]
+
+    # More uploads than buffers while the first are still in flight, and a list that
+    # does not fit a buffer, take a pinned tensor of their own: still no wait.
+    torch.cuda._sleep(50_000_000)
+    wide = list(range(sf._UPLOAD_SLOT_NUMEL + 5))
+    torch.cuda.set_sync_debug_mode("error")
+    try:
+        many = [sf.upload_i64([i], device) for i in range(2 * sf._UPLOAD_SLOTS)]
+        long = sf.upload_i64(wide, device)
+    finally:
+        torch.cuda.set_sync_debug_mode("default")
+    torch.cuda.synchronize()
+    assert [t.tolist() for t in many] == [[i] for i in range(2 * sf._UPLOAD_SLOTS)]
+    assert long.tolist() == wide
+
+
+def test_a_key_map_is_built_without_waiting(current_device):
+    from dynamicemb.scored_hashtable import ScoreSpec, get_scored_table
+
+    device = torch.device("cuda", current_device)
+    get_scored_table(  # the first one allocates the ring and its pinned buffers
+        capacity=[256, 256],
+        bucket_capacity=128,
+        score_specs=[ScoreSpec(name="s", policy=ScorePolicy.ASSIGN)],
+        use_rows=True,
+    )
+    torch.cuda.synchronize()
+    torch.cuda.set_sync_debug_mode("error")
+    try:
+        table = get_scored_table(
+            capacity=[512, 1024],
+            bucket_capacity=128,
+            score_specs=[ScoreSpec(name="s", policy=ScorePolicy.ASSIGN)],
+            use_rows=True,
+        )
+        table.set_row_limits([100, 200])
+    finally:
+        torch.cuda.set_sync_debug_mode("default")
+    torch.cuda.synchronize()
+    assert table.table_bucket_offsets_.tolist() == [0, 4, 12]
+    assert table.bucket_offsets_host_ == [0, 4, 12]
+    assert table.table_bucket_offsets_cpu_.tolist() == [0, 4, 12]
+    assert table.row_limits_.tolist() == [100, 200]
+    assert table.device == device
+
+
+@pytest.mark.parametrize("no_eviction", [False, True], ids=["evicting", "no_eviction"])
+def test_the_exact_sizes_are_one_read(current_device, no_eviction, read_now_calls):
+    device = torch.device("cuda", current_device)
+    option = options_of(
+        current_device,
+        init_capacity=1 << 15,
+        local_hbm_for_values=0,
+        score_strategy=DynamicEmbScoreStrategy.NO_EVICTION
+        if no_eviction
+        else DynamicEmbScoreStrategy.TIMESTAMP,
+    )
+    state = create_table_state(
+        [option], AdamDynamicEmbeddingOptimizer(OptimizerArgs()), use_rows=True
+    )
+    insert_keys(state, 0, 100, device)
+    if no_eviction:
+        state.key_index_map.reserve_rows(0, 150)  # rows handed out beyond the keys
+    torch.cuda.synchronize()
+
+    sizes, rows = kvt.read_table_sizes_now(state)
+
+    assert read_now_calls.delta == 1
+    assert sizes.tolist() == [100]
+    assert (rows.tolist() == [150]) if no_eviction else (rows is None)
+    assert not sizes.is_cuda
