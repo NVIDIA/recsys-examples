@@ -1034,12 +1034,16 @@ def _expand_tables_impl(
 
     For tables that need expand: (1) create new key_index_map with new per_table_capacity
     for those tables; (2) extend existing ExtendableBuffer for those tables; (3) for each
-    such table, for each export batch (key, score, src_index): insert that batch into new
-    key_index_map, load values at src_index, collect (dst_index, values), then store each
-    batch's values to dst_index (no key concatenation; load-then-store per batch avoids
-    src/dst overlap). For tables that do not expand, key_index_map for that table is
-    copied directly from the old key_index_map (copy_table_from). Updates key_index_map,
-    capacity (expansion does not change the key set). Mutates state.
+    such table, insert its old key column into the new key_index_map a chunk at a time
+    (:meth:`LinearBucketTable.rehash_table_from`: the empty, reclaimed and locked slots hold
+    reserved keys, which insert nothing, so nothing is compacted and no count is read),
+    carrying the value rows, reference counters and score words of the keys along. A table
+    that stores no row moves its values by slot: every chunk's values are loaded before
+    any is stored, so that a store never lands on a row that was not read yet. For tables
+    that do not expand, key_index_map for that table is copied directly from the old
+    key_index_map (copy_table_from). Updates key_index_map, capacity (expansion does not
+    change the key set). Mutates state. The kernels run on the current stream inside a
+    growth section (:class:`GrowthOrder`); the host reads nothing back.
 
     A table that never evicts keeps its value buffer out of this: it is sized by the
     rows the table has handed out, not by the key map (see
@@ -1055,6 +1059,7 @@ def _expand_tables_impl(
     key_caps = state.key_index_map.per_table_capacity_
     new_caps = []
     for i in range(state.num_tables):
+        # sync-ok: tables_to_expand is a list of Python bools, decided on the host
         if tables_to_expand[i]:
             if (
                 target_capacities is not None
@@ -1096,6 +1101,19 @@ def _expand_tables_impl(
         )
 
 
+def _load_chunk_values(
+    state: DynamicEmbTableState,
+    table_id: int,
+    moves: List[Tuple[torch.Tensor, torch.Tensor]],
+    src_slots: torch.Tensor,
+    dst_slots: torch.Tensor,
+) -> None:
+    """``on_chunk`` of a rehash of a table whose value row is its slot: load the values
+    of the chunk's live keys from their old slots, to store them at ``dst_slots`` when
+    every chunk has been loaded. A lane that carries no key has slot ``-1`` in both."""
+    moves.append((dst_slots, load_from_flat_single_table(state, src_slots, table_id)))
+
+
 def _rehash_into(
     state: DynamicEmbTableState,
     new_key_index_map,
@@ -1107,8 +1125,8 @@ def _rehash_into(
     """The part of :func:`_expand_tables_impl` that runs inside the growth section, on
     ``stream``: extend the value buffers, move every table into ``new_key_index_map``
     and make it the state's."""
-    device = state.device
     for i in range(state.num_tables):
+        # sync-ok: tables_to_expand is a list of Python bools, decided on the host
         if tables_to_expand[i]:
             if state.no_eviction:
                 continue  # its value buffer follows the rows, see the docstring
@@ -1129,75 +1147,29 @@ def _rehash_into(
 
     old_key_index_map = state.key_index_map
     for table_id in range(state.num_tables):
+        # sync-ok: tables_to_expand is a list of Python bools, decided on the host
         if not tables_to_expand[table_id]:
             new_key_index_map.copy_table_from(old_key_index_map, table_id)
             continue
-        # The ref counters are flat over the tables: the counter of a table's
-        # slot is at its first bucket times the bucket capacity, plus the slot.
-        src_base, dst_base = [
-            int(key_map.table_bucket_offsets_cpu_[table_id].item())
-            * key_map.bucket_capacity_
-            for key_map in (old_key_index_map, new_key_index_map)
-        ]
-        dst_values_list: List[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
-        for (
-            keys,
-            named_scores,
-            src_rows,
-            src_slots,
-        ) in old_key_index_map._batched_export_keys_scores(
-            [state.score_policy.name],
-            device,
+        # The values of a table that does not store rows follow their keys: every chunk
+        # of the rehash loads the values of its live keys (a lane that carries no key
+        # has slot -1, which the load and the store skip), and they are stored once the
+        # last chunk was loaded -- a store may land on a row that an earlier chunk's
+        # keys have not been read from yet.
+        moves: List[Tuple[torch.Tensor, torch.Tensor]] = []
+        # The padded rehash: no count is read, the table's own key column is the input.
+        new_key_index_map.rehash_table_from(
+            old_key_index_map,
             table_id,
-            thresholds=None,
-            batch_size=65536,
-            return_index=True,
-            return_slots=True,
-        ):
-            if keys.numel() == 0:
-                continue
-            assert src_slots is not None, "return_slots=True requires slots"
-            scores_batch = named_scores[state.score_policy.name].to(torch.uint64)
-
-            score_arg = ScoreArg(
-                name=state.score_policy.name,
-                value=scores_batch,
-                policy=ScorePolicy.ASSIGN,
-            )
-            if new_key_index_map.use_rows_:
-                # The key keeps the row its value sits in, so the value stays put.
-                dst_slots = new_key_index_map.insert_carrying_rows(
-                    keys, table_id, score_arg, src_rows
-                )
-            else:
-                tid_tensor = torch.full(
-                    (keys.numel(),), table_id, dtype=torch.int64, device=device
-                )
-                dst_slots = new_key_index_map.insert(keys, tid_tensor, score_arg)
-            # Single-value re-insert above only restores the leading score word.
-            # For multi-word layouts (LruLfu: timestamp + frequency) copy the
-            # whole score block so the frequency (and exact timestamp) survive
-            # rehash; otherwise LFU eviction would see all frequencies reset to 0.
-            if new_key_index_map.num_scores_ > 1:
-                new_key_index_map.copy_score_blocks_from(
-                    old_key_index_map, table_id, src_slots, dst_slots
-                )
-            if new_key_index_map._ref_counter is not None:
-                new_key_index_map._ref_counter[
-                    dst_base + dst_slots
-                ] = old_key_index_map._ref_counter[src_base + src_slots]
-
-            if not new_key_index_map.use_rows_:
-                # Value row == hash slot: the value has to follow its key.
-                values_batch = load_from_flat_single_table(state, src_slots, table_id)
-                dst_values_list.append((dst_slots, table_id, values_batch))
-
+            on_chunk=None
+            if new_key_index_map.use_rows_
+            else functools.partial(_load_chunk_values, state, table_id, moves),
+        )
         if new_key_index_map.use_rows_:
             # Reclaimed (erased) slots still own their rows; keep them too.
             new_key_index_map.carry_rows_from(old_key_index_map, table_id)
-
-        for dst_indices, table_id, values_batch in dst_values_list:
-            store_to_flat_single_table(state, dst_indices, table_id, values_batch)
+        for dst_slots, values in moves:
+            store_to_flat_single_table(state, dst_slots, table_id, values)
 
     state.key_index_map = new_key_index_map
     state.key_map_generation += 1

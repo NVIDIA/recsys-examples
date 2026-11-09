@@ -195,20 +195,28 @@ at::Tensor table_resolve_rows(at::Tensor rows, at::Tensor row_counters,
                               int64_t bucket_capacity, at::Tensor slots,
                               at::Tensor table_ids, bool allocate);
 
-// Rehash support. table_collect_reclaimed_rows returns the rows owned by the
-// reclaimed slots of buckets [bkt_begin, bkt_end) as int64[num_rows], where
-// num_rows is how many there are (the table's row counter minus its live
-// keys). table_place_reclaimed_rows then gives each of those rows a free slot
-// of the (new) table's bucket range, marking the slot reclaimed: its key becomes
-// ReclaimKey and its digest that key's.
-at::Tensor table_collect_reclaimed_rows(at::Tensor keys, at::Tensor rows,
-                                        int64_t bkt_begin, int64_t bkt_end,
-                                        int64_t bucket_capacity,
-                                        int64_t num_rows);
-void table_place_reclaimed_rows(at::Tensor keys, at::Tensor digests,
-                                at::Tensor rows, at::Tensor carried,
-                                int64_t bkt_begin, int64_t bkt_end,
-                                int64_t bucket_capacity);
+// Rehash support, with no count on the host (see table_rows.cu).
+// table_carry_slot_state moves what is keyed by the slot -- the value row and the
+// reference counter -- from the old table's slots of a chunk of its key column to the
+// slots the keys got in the new table (`slots`, -1 for a reserved key, which carries
+// nothing); a real key without a slot is asserted on the device. The row pair and the
+// counter pair are each given whole or left out.
+void table_carry_slot_state(at::Tensor keys, at::Tensor slots, int64_t dst_base,
+                            std::optional<at::Tensor> src_rows,
+                            std::optional<at::Tensor> dst_rows,
+                            std::optional<at::Tensor> src_ref,
+                            std::optional<at::Tensor> dst_ref);
+// table_carry_reclaimed_rows gives the row of every reclaimed slot of the old
+// table's bucket range [old_bkt_begin, old_bkt_end) that still owns one a free slot
+// of the new table's range, marking the slot reclaimed: its key becomes ReclaimKey
+// and its digest that key's. `count` (int64[1], on the device) is how many such rows
+// there are: the table's row counter minus its live keys.
+void table_carry_reclaimed_rows(at::Tensor old_keys, at::Tensor old_rows,
+                                int64_t old_bkt_begin, int64_t old_bkt_end,
+                                int64_t bucket_capacity, at::Tensor new_keys,
+                                at::Tensor new_digests, at::Tensor new_rows,
+                                int64_t new_bkt_begin, int64_t new_bkt_end,
+                                at::Tensor count);
 
 // Restore the reclaimed slots a dump's [n, 2] (slot, row) int64 names, owning
 // their rows, on a replica: an empty slot becomes reclaimed with the row, a

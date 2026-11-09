@@ -1263,6 +1263,9 @@ TARGETS: List[Target] = (
         "_base_pointers",
         "read_table_sizes_now",
         "collect_table_sizes_for_state",
+        "_expand_tables_impl",
+        "_rehash_into",
+        "_load_chunk_values",
     )
     + _new(
         SHT,
@@ -1270,6 +1273,12 @@ TARGETS: List[Target] = (
         "LinearBucketTable.set_row_limits",
         "LinearBucketTable.copy_table_from",
         "LinearBucketTable.copy_score_blocks_from",
+        "LinearBucketTable.rehash_table_from",
+        "LinearBucketTable.carry_rows_from",
+        "LinearBucketTable.insert_carrying_rows",
+        "LinearBucketTable._insert_for_rehash",
+        "LinearBucketTable._flat_base",
+        "LinearBucketTable._require_rehash_kernels",
     )
     + _new(BDF, "_note_table_users")
     + _new(SF, "copy_i64_into", "upload_i64")
@@ -2061,6 +2070,49 @@ EXPECTED_GONE: List[Tuple[str, str, str, str]] = [
         "cpu",
         "rows = collect_row_counts_to_device(state).cpu()",
         "G2",
+    ),
+    # G3: the rehash exports no batch, reads no count and asserts on the device
+    (
+        "dynamicemb/scored_hashtable.py",
+        "any_all_in_cond",
+        'assert bool((slots >= 0).all()), "rehash insert must not reject keys"',
+        "G3",
+    ),
+    (
+        "dynamicemb/scored_hashtable.py",
+        "item",
+        "(other.row_counters_[table_id] - other.bucket_sizes[o_b0:o_b1].sum()).item()",
+        "G3",
+    ),
+    (
+        "dynamicemb/scored_hashtable.py",
+        "item",
+        "o_b0 = int(other.table_bucket_offsets_cpu_[table_id].item())",
+        "G3",
+    ),
+    (
+        "dynamicemb/scored_hashtable.py",
+        "item",
+        "o_b1 = int(other.table_bucket_offsets_cpu_[table_id + 1].item())",
+        "G3",
+    ),
+    (
+        "dynamicemb/scored_hashtable.py",
+        "item",
+        "b0 = int(self.table_bucket_offsets_cpu_[table_id].item())",
+        "G3",
+    ),
+    (
+        "dynamicemb/scored_hashtable.py",
+        "item",
+        "b1 = int(self.table_bucket_offsets_cpu_[table_id + 1].item())",
+        "G3",
+    ),
+    (
+        "dynamicemb/key_value_table.py",
+        "item",
+        "int(key_map.table_bucket_offsets_cpu_[table_id].item())",
+        "G3",
     ),
 ]
 
