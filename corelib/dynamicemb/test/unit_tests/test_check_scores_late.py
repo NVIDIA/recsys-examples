@@ -5,10 +5,12 @@
 """A table that takes a score per key (``PRECISE_CUSTOMIZED``) can be asked to look for
 a negative score, which the table would read as a very large one
 (``safe_check_mode``). Looking waits for the device if the answer is read at once, so
-it is read late: the check is started by the call that carries the scores, its answer is
-copied back without waiting, and the next call that finds it landed -- or ``flush`` --
-raises (``ERROR``) or warns (``WARNING``). A call that finds every slot of the ring of
-answers still in flight waits for the oldest of them rather than skip its own check.
+it is read late: the device counts the calls that carried a negative score, the call that
+carries the scores copies a snapshot of the count back without waiting, and the next call
+that finds a snapshot landed with a larger count -- or ``flush`` -- raises (``ERROR``) or
+warns (``WARNING``). A call that finds every slot of the ring of snapshots still in flight
+does not wait for one: its check is in the count, and the next snapshot (or ``flush``)
+carries it.
 """
 
 import warnings
@@ -163,6 +165,19 @@ def build_lagging_model(current_device: int, mode: DynamicEmbCheckMode):
     return model, indices, scores
 
 
+def count_waits(monkeypatch):
+    """The tickets that the host blocked on (``DeferredRead.wait``) from here on."""
+    waited = []
+    real = sf.DeferredRead.wait
+
+    def spy(self, ticket):
+        waited.append(ticket)
+        return real(self, ticket)
+
+    monkeypatch.setattr(sf.DeferredRead, "wait", spy)
+    return waited
+
+
 @pytest.mark.parametrize(
     "mode,outcome",
     [
@@ -170,18 +185,22 @@ def build_lagging_model(current_device: int, mode: DynamicEmbCheckMode):
         (DynamicEmbCheckMode.WARNING, "warns"),
     ],
 )
-def test_a_check_is_not_dropped_when_the_ring_is_full(current_device, mode, outcome):
+def test_a_check_is_not_dropped_when_the_ring_is_full(
+    current_device, mode, outcome, monkeypatch
+):
     """The device is a whole ring of checks behind, so the call with the negative score
-    finds no free slot. It waits for the oldest answer and takes its slot, instead of
-    leaving its own check unmade."""
+    finds no free slot. It does not wait for one, and its check is not lost: the count
+    has it, and ``flush`` reports it."""
     model, indices, scores = build_lagging_model(current_device, mode)
     slots = model._score_ring.slots
+    waited = count_waits(monkeypatch)
     for _ in range(slots):
         model._check_scores(scores, indices)
     assert len(model._score_pending) == slots  # none has landed: the ring is full
 
     model._check_scores(-scores, indices)
-    assert len(model._score_pending) == slots
+    assert len(model._score_pending) == slots  # no slot, so no snapshot of its own
+    assert not waited, "a check waited for the device"
 
     if outcome == "raises":
         with pytest.raises(ValueError, match="scores must be non-negative"):
@@ -189,6 +208,10 @@ def test_a_check_is_not_dropped_when_the_ring_is_full(current_device, mode, outc
     else:
         with pytest.warns(UserWarning, match="scores must be non-negative"):
             model.flush()
+    assert waited, "flush is an explicit call: it waits for the answers"
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        model.flush()  # nothing is left to report
 
 
 @pytest.mark.parametrize(
@@ -198,26 +221,110 @@ def test_a_check_is_not_dropped_when_the_ring_is_full(current_device, mode, outc
         (DynamicEmbCheckMode.WARNING, "warns"),
     ],
 )
-def test_the_call_that_waits_for_a_slot_reports_the_oldest_answer(
-    current_device, mode, outcome
+def test_the_first_call_that_finds_the_oldest_answer_landed_reports_it(
+    current_device, mode, outcome, monkeypatch
 ):
-    """The answer it waits for is reported like any other: by that call, once."""
+    """Nothing waits for the oldest answer: once the device catches up, the next call
+    reports it, once, however many calls came in between."""
     model, indices, scores = build_lagging_model(current_device, mode)
     slots = model._score_ring.slots
+    waited = count_waits(monkeypatch)
     model._check_scores(-scores, indices)  # the oldest answer
-    for _ in range(slots - 1):
+    for _ in range(slots):  # the last of them finds the ring full
         model._check_scores(scores, indices)
     assert len(model._score_pending) == slots
+    assert not waited, "a check waited for the device"
 
+    torch.cuda.synchronize()  # the device catches up: every answer has landed
     if outcome == "raises":
         with pytest.raises(ValueError, match="scores must be non-negative"):
             model._check_scores(scores, indices)
     else:
         with pytest.warns(UserWarning, match="scores must be non-negative"):
             model._check_scores(scores, indices)
+    assert not waited
     with warnings.catch_warnings():
         warnings.simplefilter("error")
         model.flush()  # nothing is left to report
+
+
+def test_negative_batches_that_found_no_slot_are_reported_once(current_device):
+    """Each negative batch that gets a snapshot of its own is reported by it; those that
+    find the ring full share the one that ``flush`` takes, and are reported once."""
+    model, indices, scores = build_lagging_model(
+        current_device, DynamicEmbCheckMode.WARNING
+    )
+    for _ in range(model._score_ring.slots):
+        model._check_scores(scores, indices)  # the ring is full
+    for _ in range(3):
+        model._check_scores(-scores, indices)  # no snapshot of their own
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        model.flush()
+    reported = [w for w in caught if "non-negative" in str(w.message)]
+    assert len(reported) == 1, caught
+
+
+def test_a_check_whose_call_raised_an_earlier_report_is_still_counted(current_device):
+    """The call that raises the report of an earlier check has counted its own check
+    already: ``flush`` reports it, and then nothing is left."""
+    device = torch.device("cuda", current_device)
+    model = build_model(current_device, DynamicEmbCheckMode.ERROR)
+    indices, _, scores = batch(0, device)
+    model._check_scores(-scores, indices)
+    torch.cuda.synchronize()  # its answer has landed
+    with pytest.raises(ValueError, match="scores must be non-negative"):
+        model._check_scores(-scores, indices)  # raises the first, carries a second
+    torch.cuda.synchronize()
+    with pytest.raises(ValueError, match="scores must be non-negative"):
+        model.flush()  # the second
+    model.flush()  # nothing is left
+
+
+def test_flush_on_another_stream_sees_a_check_that_found_no_slot(current_device):
+    """The checks run on a side stream that is a whole ring behind, and the last call,
+    which carries the negative score, finds no slot. ``flush`` on the default stream,
+    with nothing in between that waits for the side stream, must still report it: its
+    snapshot has to come after the side stream's count."""
+    device = torch.device("cuda", current_device)
+    model = build_model(current_device, DynamicEmbCheckMode.ERROR)
+    indices, _, scores = batch(0, device)
+    side = torch.cuda.Stream()
+    side.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(side):
+        model._check_scores(scores, indices)  # the first launch of the kernels
+    side.synchronize()
+    model.flush()
+
+    slots = model._score_ring.slots
+    with torch.cuda.stream(side):
+        torch.cuda._sleep(100_000_000)
+        for _ in range(slots):
+            model._check_scores(scores, indices)
+        model._check_scores(-scores, indices)
+    assert len(model._score_pending) == slots  # the last check has no snapshot
+    with pytest.raises(ValueError, match="scores must be non-negative"):
+        model.flush()
+
+
+def test_checks_on_two_streams_are_all_counted(current_device):
+    """Each check is a read-modify-write of one count, which two streams must not run
+    at once; the checks of the two streams are ordered and none is lost."""
+    device = torch.device("cuda", current_device)
+    model = build_model(current_device, DynamicEmbCheckMode.ERROR)
+    indices, _, scores = batch(0, device)
+    streams = [torch.cuda.Stream(), torch.cuda.Stream()]
+    for stream in streams:
+        stream.wait_stream(torch.cuda.current_stream())
+    for i in range(12):
+        with torch.cuda.stream(streams[i % 2]):
+            model._check_scores(scores, indices)
+    with torch.cuda.stream(streams[1]):
+        model._check_scores(-scores, indices)
+    with pytest.raises(ValueError, match="scores must be non-negative"):
+        model.flush()
+    torch.cuda.synchronize()
+    assert int(model._score_neg_total) == 1
 
 
 def test_scores_that_are_not_negative_report_nothing(current_device):
@@ -228,6 +335,32 @@ def test_scores_that_are_not_negative_report_nothing(current_device):
         model(indices, offsets, scores=scores).sum().backward()
     torch.cuda.synchronize()
     model.flush()
+
+
+def test_a_check_mode_switched_on_later_makes_its_ring_and_waits_for_nothing(
+    current_device,
+):
+    """The options are mutable: a module built without a check that is asked to check
+    afterwards has no ring yet. It makes one on its first check instead of reading the
+    scores at once, which would wait for the device."""
+    device = torch.device("cuda", current_device)
+    model = build_model(current_device, DynamicEmbCheckMode.IGNORE)
+    assert model._score_ring is None
+    for option in model._dynamicemb_options:
+        option.safe_check_mode = DynamicEmbCheckMode.ERROR
+    indices, _, scores = batch(0, device)
+    model._check_scores(scores, indices)  # makes the ring, once
+    assert model._score_ring is not None
+    torch.cuda.synchronize()
+    model.flush()
+    torch.cuda.set_sync_debug_mode("error")
+    try:
+        model._check_scores(-scores, indices)
+    finally:
+        torch.cuda.set_sync_debug_mode("default")
+    torch.cuda.synchronize()
+    with pytest.raises(ValueError, match="scores must be non-negative"):
+        model.flush()
 
 
 def test_a_table_that_does_not_check_has_no_ring(current_device):

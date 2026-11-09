@@ -536,7 +536,11 @@ Rules:
 - **`set_score`** raises for such a table: the scores come from the input.
 - Scores must be int64. A negative score is read by the table as a very large
   one, so with `safe_check_mode` `ERROR` it raises, with `WARNING` it warns, and
-  with `IGNORE` it is not looked for.
+  with `IGNORE` it is not looked for. The check runs on the device and never makes
+  the host wait: the first later call that finds its result reports it, and so does
+  `flush()`, which waits. When the host runs more than four checks ahead of the
+  device, the negative batches among the extra ones are reported together, by the
+  next result.
 
 ## DynamicEmbPoolingMode
 

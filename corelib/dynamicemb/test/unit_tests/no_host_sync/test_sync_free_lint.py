@@ -1244,8 +1244,14 @@ TARGETS: List[Target] = (
         "MultiTableFrequencyAdmitter.admit",
         "MultiTableProbabilisticAdmitter.admit",
     )
-    + _legacy(BDT, "BatchedDynamicEmbeddingTablesV2._check_scores")
-    + _new(BDT, "BatchedDynamicEmbeddingTablesV2._table_key_bounds")
+    + _new(
+        BDT,
+        "BatchedDynamicEmbeddingTablesV2._check_scores",
+        "BatchedDynamicEmbeddingTablesV2._count_negative_scores",
+        "BatchedDynamicEmbeddingTablesV2._settle_oldest",
+        "BatchedDynamicEmbeddingTablesV2._drain_score_checks",
+        "BatchedDynamicEmbeddingTablesV2._table_key_bounds",
+    )
 )
 
 ENFORCE_ALL = os.environ.get("SYNC_LINT_ENFORCE_ALL") == "1"
@@ -1286,10 +1292,6 @@ LEGACY_BASELINE: Dict[str, Dict[str, int]] = {
     },
     "dynamicemb/embedding_admission.py::MultiTableFrequencyAdmitter.admit": {
         "host-read-helper": 1,
-    },
-    "dynamicemb/batched_dynamicemb_tables.py::BatchedDynamicEmbeddingTablesV2._check_scores": {
-        "reduction-in-branch": 1,
-        "scalar-of-tensor": 1,
     },
 }
 
@@ -1911,8 +1913,8 @@ ALLOWED_NEW_HITS: List[Tuple[str, Optional[str], str]] = [
     (
         "dynamicemb/batched_dynamicemb_tables.py",
         "any_all_in_cond",
-        "_check_scores_now: the check for scores the host holds, or a module without a ring; "
-        "the late check of a CUDA score goes through the ring",
+        "_check_scores_now: the check for scores the host holds (a CPU tensor: nothing to "
+        "wait for); the late check of a CUDA score goes through the ring",
     ),
     (
         "dynamicemb/key_value_table.py",
