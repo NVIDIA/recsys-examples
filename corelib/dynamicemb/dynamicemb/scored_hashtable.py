@@ -1495,8 +1495,20 @@ class LinearBucketTable(ScoredHashTable):
             num_shards = dist.get_world_size() if dist.is_initialized() else 1
             shard_index = dist.get_rank() if dist.is_initialized() else 0
 
-        dump_timestamp = device_timestamp()
+        # a timestamp is only looked at for a score that is one
+        dump_timestamp = (
+            device_timestamp()
+            if any(
+                spec.policy == ScorePolicy.GLOBAL_TIMER for spec in self.score_specs_
+            )
+            else 0
+        )
 
+        # The batches are read and filtered on the host and cross to the device through
+        # pinned staging buffers, without a wait for the copy (see
+        # ``sync_free.StagedUpload``).
+        keys_ring = sf.StagedUpload(device)
+        scores_ring = sf.StagedUpload(device)
         batch_size = 65536
         for start in range(0, num_keys, batch_size):
             num_keys_to_read = min(num_keys - start, batch_size)
@@ -1511,7 +1523,6 @@ class LinearBucketTable(ScoredHashTable):
             keys = torch.tensor(
                 np.frombuffer(keys_bytes, dtype=torch_dtype_to_np_dtype[KEY_TYPE]),
                 dtype=KEY_TYPE,
-                device=device,
             )
             scores_dict: Dict[str, torch.Tensor] = {}
             for score_name, score_bytes in score_bytes_dict.items():
@@ -1520,7 +1531,6 @@ class LinearBucketTable(ScoredHashTable):
                         score_bytes, dtype=torch_dtype_to_np_dtype[SCORE_TYPE]
                     ),
                     dtype=SCORE_TYPE,
-                    device=device,
                 )
                 index = self.score_names_.index(score_name)
                 if self.score_specs_[index].policy == ScorePolicy.GLOBAL_TIMER:
@@ -1539,8 +1549,11 @@ class LinearBucketTable(ScoredHashTable):
 
             assert len(scores_dict) == 1, "Only single score is supported."
             score_name, scores = next(iter(scores_dict.items()))
+            keys = keys_ring.upload(keys)
             score_arg = ScoreArg(
-                name=score_name, value=scores, policy=ScorePolicy.ASSIGN
+                name=score_name,
+                value=scores_ring.upload(scores),
+                policy=ScorePolicy.ASSIGN,
             )
             tid = torch.full(
                 (keys.numel(),), load_table_id, dtype=torch.int64, device=device

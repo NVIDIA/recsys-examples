@@ -1987,6 +1987,12 @@ ALLOWED_NEW_HITS: List[Tuple[str, Optional[str], str]] = [
         "LinearBucketTable.dump (the admission counter's checkpoint) writes the pinned host "
         "batches that pull_live_prefixes brought over, one wait per batch",
     ),
+    (
+        "dynamicemb/key_value_table.py",
+        "int_bool_of_tensor",
+        "_count_owned_keys counts the owned keys of a checkpoint file on a CPU tensor: no "
+        "device is involved",
+    ),
 ]
 
 
@@ -2085,6 +2091,20 @@ EXPECTED_GONE: List[Tuple[str, str, str, str]] = [
         "numpy",
         "fscores[name].write(scores.cpu().numpy().tobytes())",
         "E2",
+    ),
+    # E3: the owned keys of a checkpoint file are counted on the host, not copied to the
+    # device batch by batch and read back
+    (
+        "dynamicemb/key_value_table.py",
+        "item",
+        "owned += int(mask.sum().item()) if mask is not None else n",
+        "E3",
+    ),
+    (
+        "dynamicemb/key_value_table.py",
+        "int_bool_of_tensor",
+        "owned += int(mask.sum().item()) if mask is not None else n",
+        "E3",
     ),
     # E1: the overflow offset of an export is the host list the device tensor was built from
     (

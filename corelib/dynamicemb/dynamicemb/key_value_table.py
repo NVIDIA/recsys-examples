@@ -2929,6 +2929,10 @@ def _count_owned_keys(
     Reads only the key file, with the filter :func:`_iter_batches_from_files`
     applies. A checkpoint can hold many ranks' keys while a rank keeps only its
     own share, so the file's size is not what a rank has to make room for.
+
+    The count is made on the host, on the keys as they come out of the file: nothing
+    is copied to the device and nothing waits for it (``device`` is kept for callers
+    that pass it).
     """
     num_keys = os.path.getsize(emb_key_path) // KEY_TYPE.itemsize
     shard_index, num_shards = _resolve_shard(shard_index, num_shards)
@@ -2938,16 +2942,11 @@ def _count_owned_keys(
     with open(emb_key_path, "rb") as fkey:
         for start in range(0, num_keys, batch_size):
             n = min(num_keys - start, batch_size)
-            keys = torch.tensor(
-                np.frombuffer(
-                    fkey.read(KEY_TYPE.itemsize * n),
-                    dtype=torch_dtype_to_np_dtype[KEY_TYPE],
-                ),
-                dtype=KEY_TYPE,
-                device=device,
+            keys = torch.frombuffer(
+                bytearray(fkey.read(KEY_TYPE.itemsize * n)), dtype=KEY_TYPE
             )
             mask = owned_key_mask(keys, shard_index, num_shards, dist_type)
-            owned += int(mask.sum().item()) if mask is not None else n
+            owned += int(mask.sum()) if mask is not None else n
     return owned
 
 
@@ -2988,6 +2987,14 @@ def _iter_batches_from_files(
 
     Handles file I/O, deserialization, and keeping only the keys this rank owns.
 
+    The keys this rank does not own are dropped on the host, before anything goes to
+    the device (the ownership rule is plain tensor arithmetic, which runs on a CPU tensor
+    as it does on a CUDA one), and each column crosses through a ring of pinned staging
+    buffers (:class:`sync_free.StagedUpload`) with a non-blocking copy: the host reads
+    and filters the next batch while the device takes this one, and does not wait for it
+    but for a buffer, when the device is still busy with the transfer two batches back.
+    The tensors yielded are valid on the current stream.
+
     *dist_type* selects the ownership rule, which is the table's own -- the load
     path checks it against the checkpoint's before getting here
     (``_validate_load_meta``). It matters in two ways. When the checkpoint's
@@ -3009,6 +3016,12 @@ def _iter_batches_from_files(
 
     shard_index, num_shards = _resolve_shard(shard_index, num_shards)
 
+    host = torch.device("cpu")
+    keys_ring = sf.StagedUpload(device)
+    embeddings_ring = sf.StagedUpload(device)
+    scores_ring = sf.StagedUpload(device)
+    opt_ring = sf.StagedUpload(device)
+
     try:
         for start in range(0, num_keys, batch_size):
             n = min(num_keys - start, batch_size)
@@ -3017,11 +3030,10 @@ def _iter_batches_from_files(
             keys = torch.tensor(
                 np.frombuffer(keys_bytes, dtype=torch_dtype_to_np_dtype[KEY_TYPE]),
                 dtype=KEY_TYPE,
-                device=device,
             )
 
             emb_bytes = fembedding.read(emb_dtype.itemsize * dim * n)
-            embeddings = _tensor_from_bytes(emb_bytes, emb_dtype, device).view(-1, dim)
+            embeddings = _tensor_from_bytes(emb_bytes, emb_dtype, host).view(-1, dim)
 
             scores = None
             if fscore:
@@ -3031,7 +3043,6 @@ def _iter_batches_from_files(
                         score_bytes, dtype=torch_dtype_to_np_dtype[SCORE_TYPE]
                     ),
                     dtype=SCORE_TYPE,
-                    device=device,
                 )
                 if num_scores > 1:
                     scores = scores.view(-1, num_scores)
@@ -3039,9 +3050,9 @@ def _iter_batches_from_files(
             opt_states = None
             if fopt:
                 opt_bytes = fopt.read(opt_state_dtype.itemsize * optstate_dim * n)
-                opt_states = _tensor_from_bytes(
-                    opt_bytes, opt_state_dtype, device
-                ).view(-1, optstate_dim)
+                opt_states = _tensor_from_bytes(opt_bytes, opt_state_dtype, host).view(
+                    -1, optstate_dim
+                )
 
             masks = owned_key_mask(keys, shard_index, num_shards, dist_type)
             if masks is not None:
@@ -3052,7 +3063,12 @@ def _iter_batches_from_files(
                 if opt_states is not None:
                     opt_states = opt_states[masks]
 
-            yield keys, embeddings, scores, opt_states
+            yield (
+                keys_ring.upload(keys),
+                embeddings_ring.upload(embeddings),
+                None if scores is None else scores_ring.upload(scores),
+                None if opt_states is None else opt_ring.upload(opt_states),
+            )
     finally:
         fkey.close()
         fembedding.close()

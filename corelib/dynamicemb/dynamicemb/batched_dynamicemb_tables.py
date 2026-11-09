@@ -2146,6 +2146,7 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
             else None
         )
         missing_table_names = []
+        ts: Optional[int] = None
         for table_id, table_name in enumerate(self._table_names):
             if table_name not in set(table_names):
                 continue
@@ -2172,7 +2173,8 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
 
             num_key_files = len(emb_key_files)
             self._shard_barrier(pg)
-            ts = device_timestamp()
+            if ts is None:
+                ts = self._checkpoint_timestamp()
             for i in range(num_key_files):
                 loaded_score = storage.load(
                     table_id,
