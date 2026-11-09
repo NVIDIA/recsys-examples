@@ -36,6 +36,12 @@ namespace dyn_emb {
 // needed for the default eviction path.
 void demb_set_lex_fatbin(const void *lex, size_t lex_size);
 
+// Load the default (Lex) evictor module into the CURRENT context now, so that the
+// first insert of a step does not pay for cuModuleLoadData. A no-op when the fatbin
+// has not been set, when no CUDA context is current yet, and when the module of this
+// device is loaded already (the load is cached per device).
+void demb_load_lex_module();
+
 // Link a numba-compiled user_score_fn (LTO-IR) into the custom evict fatbin
 // (passed here only when a score_function is actually used) for the given device
 // compute capability, and cache the resulting entries under `key`. Idempotent

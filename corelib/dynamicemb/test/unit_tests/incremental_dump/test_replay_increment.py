@@ -859,6 +859,96 @@ def test_replay_counts_its_keys_in_the_growth_estimate(current_device):
     assert int(estimated_keys[0]) >= stats.upserted
 
 
+def test_replaying_a_delta_again_leaves_no_excess_in_the_growth_estimate(
+    current_device,
+):
+    """The bound that a replay adds to the size estimate counts every key it writes,
+    the ones the table holds already too, so a delta replayed again would count its
+    keys twice, and a replica that applies a chain of deltas the union of them many
+    times over. What takes the bound back is the snapshot the replay takes when it is
+    over: it has the keys, carries the bound in its mark, and once it has landed the
+    estimate is what the table holds. Replayed three times, a table 30 percent full is
+    not estimated at 90, and a small batch after it does not make it grow (which would
+    end the delta chain: a replica's capacity must not change)."""
+    device = torch.device(f"cuda:{current_device}")
+    cfg = dict(max_capacity=4096, init_capacity=1024, bucket_capacity=128)
+    src = make_model(current_device, **cfg)
+    dst = make_model(current_device, **cfg)
+
+    keys = list(range(1001, 1301))
+    touch(src, keys, device)
+    delta = dump_all(src)
+
+    state = dst._storage._state
+    snapshots = state.size_snapshots
+    capacity = state.key_index_map.per_table_capacity_[0]
+    replays = 3
+    for _ in range(replays):
+        dst.replay_increment(delta)
+        torch.cuda.synchronize()  # the snapshot that this replay took has landed
+    snapshots.poll()
+    assert int(snapshots.issued[0]) == replays * len(keys)
+    estimated_keys, _ = snapshots.estimate()
+    assert int(estimated_keys[0]) == len(keys)
+
+    # 30 percent full: one more key does not push it past its load factor
+    dst._storage.expand_if_need(torch.tensor([1], dtype=torch.int64))
+    assert state.key_index_map.per_table_capacity_[0] == capacity
+
+
+def test_a_replay_that_wrote_nothing_takes_no_snapshot(current_device):
+    """A delta that carries no key (only removals, or nothing) has nothing to add to the
+    estimate and nothing a snapshot would see."""
+    device = torch.device(f"cuda:{current_device}")
+    cfg = dict(max_capacity=4096, init_capacity=1024, bucket_capacity=128)
+    src = make_model(current_device, **cfg)
+    dst = make_model(current_device, **cfg)
+    touch(src, list(range(1001, 1101)), device)
+    delta = dump_all(src)
+    _mask_delta(delta, torch.zeros_like(delta.keys[0], dtype=torch.bool))
+
+    snapshots = dst._storage._state.size_snapshots
+    dst.replay_increment(delta)
+    assert int(snapshots.issued[0]) == 0
+    assert not snapshots.pending
+
+
+def test_the_storages_count_the_keys_of_a_replay_that_can_grow(current_device):
+    """``note_replayed``: a plain storage counts every key of the delta, a hybrid one only
+    the keys routed to its host tier (``slot_index`` bit 63), because only that tier grows,
+    and a storage that cannot grow counts nothing."""
+    import types
+
+    from dynamicemb.key_value_table import (
+        DynamicEmbStorage,
+        HybridStorage,
+        SizeSnapshots,
+    )
+
+    plain_snapshots = SizeSnapshots(2, with_rows=False)
+    plain = types.SimpleNamespace(
+        _state=types.SimpleNamespace(size_snapshots=plain_snapshots)
+    )
+    DynamicEmbStorage.note_replayed(plain, 1, torch.arange(5, dtype=torch.int64))
+    DynamicEmbStorage.note_replayed(plain, 0, torch.empty(0, dtype=torch.int64))
+    assert plain_snapshots.issued.tolist() == [0, 5]
+
+    host_bit = -(2**63)  # bit 63 of an int64
+    slot_index = torch.tensor(
+        [3, host_bit + 5, 9, host_bit + 11, host_bit + 12], dtype=torch.int64
+    )
+    hybrid_snapshots = SizeSnapshots(2, with_rows=False)
+    hybrid = types.SimpleNamespace(
+        _host=types.SimpleNamespace(size_snapshots=hybrid_snapshots)
+    )
+    HybridStorage.note_replayed(hybrid, 0, slot_index)
+    assert hybrid_snapshots.issued.tolist() == [3, 0]
+
+    # nothing for a host tier that cannot grow
+    full = types.SimpleNamespace(_host=types.SimpleNamespace(size_snapshots=None))
+    HybridStorage.note_replayed(full, 0, slot_index)
+
+
 def test_replay_rechecks_layout_after_cache_flush_expansion(current_device):
     """A cache flush may rehash storage, invalidating the source slot plan."""
     device = torch.device(f"cuda:{current_device}")

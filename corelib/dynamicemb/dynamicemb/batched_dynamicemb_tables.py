@@ -839,6 +839,9 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
         self._create_cache_storage()
         self._create_initializers()
         self._create_admitter()
+        # A blocking read of a step (read_now) must not allocate pinned memory on its
+        # first call: its buffer is made here, on the thread that builds the module.
+        sf.reserve_read_scratch(torch.device(self.device_id))
         # The counters ride the KJT weights channel of a whole sharding, so a
         # group with no use for them -- CUSTOMIZED tables next to LFU ones --
         # is handed some all the same and must drop them, or they would be
@@ -863,8 +866,9 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
         self._score_neg_total: Optional[Tensor] = None
         # The largest count the host has reported on; ``_score_error`` is what the last
         # check asked for (raise or warn), ``_score_last_stream`` the ``cuda_stream`` of
-        # the stream that made it, and ``_score_uncovered`` says that the last check
-        # found no free slot in the ring, so no snapshot has the count it made.
+        # the stream that last wrote the count (the one that made it, until a check has
+        # run), and ``_score_uncovered`` says that the last check found no free slot in
+        # the ring, so no snapshot has the count it made.
         self._score_neg_seen = 0
         self._score_error = False
         self._score_last_stream: Optional[int] = None
@@ -1552,10 +1556,22 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
 
     def _make_score_ring(self, device: torch.device) -> None:
         """The pinned ring of snapshots and the device count that ``_check_scores``
-        reports from. Pinned memory is allocated here, never in a step: when the module
-        is built if a table asks to be checked then, else on the first check."""
-        self._score_ring = sf.DeferredRead((1,), torch.int64, 4)
-        self._score_neg_total = torch.zeros(1, dtype=torch.int64, device=device)
+        reports from. Pinned memory is allocated here, once: when the module is built if
+        a table asks to be checked then, else on the first check of a module whose check
+        mode was switched on later.
+
+        Two things hold whichever call makes them. They are made outside inference mode:
+        a count or a slot made inside it is an inference tensor, which a training step
+        may not update in place, and the first check can be an evaluation forward. And the
+        count is zero-filled on the current stream, which nothing but ``_score_last_stream``
+        orders before the first check on another stream: a check that added to the count
+        before the fill ran would have its increment overwritten by the fill, or its
+        snapshot copy would read memory the fill has not reached.
+        """
+        with torch.inference_mode(False):
+            self._score_ring = sf.DeferredRead((1,), torch.int64, 4)
+            self._score_neg_total = torch.zeros(1, dtype=torch.int64, device=device)
+        self._score_last_stream = torch.cuda.current_stream(device).cuda_stream
 
     def _count_negative_scores(self, scores: Tensor) -> None:
         """Add one to the device count if ``scores`` has a negative entry: a few small
@@ -2659,7 +2675,16 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
             plan = self._plan_replay(delta, content, storage)
 
         ts = device_timestamp()
-        return {job.name: self._apply_replay(job, content, storage, ts) for job in plan}
+        stats = {
+            job.name: self._apply_replay(job, content, storage, ts) for job in plan
+        }
+        if any(table_stats.upserted for table_stats in stats.values()):
+            # One snapshot of the sizes, after the writes of every table (not one per
+            # table: the ring of snapshots has four slots). The keys that _apply_replay
+            # counted in the growth estimate are a bound, which includes the keys a table
+            # held already; once this snapshot lands the estimate is the real sizes again.
+            storage.request_size_snapshot()
+        return stats
 
     @staticmethod
     def _refuse_no_eviction(
@@ -2937,6 +2962,9 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                 timestamp=ts,
             )
         )
+        # The keys are in the table, and no batch announced them to the estimate that its
+        # next growth is decided from.
+        storage.note_replayed(job.table_id, slot_index)
         if job.num_rows is not None:
             # Rows are restored verbatim, so the counter has to cover every row
             # the source had handed out, not just the ones this delta names.

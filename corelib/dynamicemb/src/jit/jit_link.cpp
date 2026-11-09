@@ -174,6 +174,16 @@ void demb_set_lex_fatbin(const void *lex, size_t lex_size) {
                       static_cast<const char *>(lex) + lex_size);
 }
 
+void demb_load_lex_module() {
+  std::lock_guard<std::mutex> lk(g_mu);
+  if (g_lex_fatbin.empty())
+    return;
+  CUcontext ctx = nullptr;
+  if (cuCtxGetCurrent(&ctx) != CUDA_SUCCESS || ctx == nullptr)
+    return;
+  get_module_locked(current_device(), 0);
+}
+
 void demb_register_score_function(int64_t key, const void *ltoir,
                                   size_t ltoir_size, const void *cust,
                                   size_t cust_size, int cc_major,

@@ -307,9 +307,13 @@ def test_flush_on_another_stream_sees_a_check_that_found_no_slot(current_device)
         model.flush()
 
 
-def test_checks_on_two_streams_are_all_counted(current_device):
-    """Each check is a read-modify-write of one count, which two streams must not run
-    at once; the checks of the two streams are ordered and none is lost."""
+def test_checks_that_alternate_between_two_streams_count_each_negative_once(
+    current_device,
+):
+    """Checks that alternate between two streams, one of them with a negative score:
+    the count ends at one, and ``flush`` reports it. (Two adds that overlap in time
+    and lose one of the increments cannot be made to happen on demand: the test below
+    pins the order that rules them out.)"""
     device = torch.device("cuda", current_device)
     model = build_model(current_device, DynamicEmbCheckMode.ERROR)
     indices, _, scores = batch(0, device)
@@ -325,6 +329,87 @@ def test_checks_on_two_streams_are_all_counted(current_device):
         model.flush()
     torch.cuda.synchronize()
     assert int(model._score_neg_total) == 1
+
+
+def test_a_snapshot_taken_on_another_stream_counts_the_checks_before_it(
+    current_device,
+):
+    """Every add to the count is ordered after the one before it, whichever stream made
+    it, so that a snapshot taken after a check has all of them. Stream A is a sleep behind
+    and carries a negative check; the next call, from stream B, runs on the device at once
+    and takes its snapshot: it has to wait for A's add, on the device. A snapshot that did
+    not would read the count before the negative check had been added to it."""
+    device = torch.device("cuda", current_device)
+    model = build_model(current_device, DynamicEmbCheckMode.ERROR)
+    indices, _, scores = batch(0, device)
+    a, b = torch.cuda.Stream(), torch.cuda.Stream()
+    for stream in (a, b):
+        stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(a):
+        model._check_scores(scores, indices)  # the first launch of the kernels
+    a.synchronize()
+    model.flush()
+
+    with torch.cuda.stream(a):
+        torch.cuda._sleep(200_000_000)
+        model._check_scores(-scores, indices)  # its add comes after the sleep
+    with torch.cuda.stream(b):
+        model._check_scores(scores, indices)  # clean; its snapshot is taken at once
+    (ticket, _) = model._score_pending[-1]
+    torch.cuda.synchronize()
+    assert int(model._score_ring.value(ticket)[0]) == 1
+    with pytest.raises(ValueError, match="scores must be non-negative"):
+        model.flush()
+
+
+def test_the_first_check_on_another_stream_is_ordered_after_the_count_was_made(
+    current_device,
+):
+    """The count is zero-filled on the stream that makes it, and the first check may run
+    on another (the prefetch stream, say) right after the module is built. The fill is
+    queued behind a sleep here, and the check runs on a side stream with nothing that
+    makes it wait for the default stream but the module itself: an add that ran before
+    the fill would be wiped out by it."""
+    device = torch.device("cuda", current_device)
+    model = build_model(current_device, DynamicEmbCheckMode.IGNORE)
+    for option in model._dynamicemb_options:
+        option.safe_check_mode = DynamicEmbCheckMode.ERROR
+    indices, _, scores = batch(0, device)
+    side = torch.cuda.Stream()
+    torch.cuda.synchronize()
+
+    torch.cuda._sleep(200_000_000)
+    model._make_score_ring(device)  # the fill of the count waits for the sleep
+    with torch.cuda.stream(side):
+        model._check_scores(-scores, indices)
+    torch.cuda.synchronize()
+    assert int(model._score_neg_total) == 1, "the fill came after the add"
+    with pytest.raises(ValueError, match="scores must be non-negative"):
+        model.flush()
+
+
+def test_a_ring_made_inside_inference_mode_takes_the_checks_of_a_training_step(
+    current_device,
+):
+    """A module whose check mode was switched on later makes its ring on its first check,
+    which can be an evaluation forward under ``torch.inference_mode()``. What it made
+    there has to be updated by the training steps after it: an inference tensor may not
+    be updated in place outside inference mode."""
+    device = torch.device("cuda", current_device)
+    model = build_model(current_device, DynamicEmbCheckMode.IGNORE)
+    for option in model._dynamicemb_options:
+        option.safe_check_mode = DynamicEmbCheckMode.ERROR
+    indices, _, scores = batch(0, device)
+    with torch.inference_mode():
+        model._check_scores(scores, indices)  # makes the ring, here
+    assert not model._score_neg_total.is_inference()
+    model._check_scores(scores, indices)  # updates the count, copies into the ring
+    torch.cuda.synchronize()
+    model.flush()
+    model._check_scores(-scores, indices)
+    torch.cuda.synchronize()
+    with pytest.raises(ValueError, match="scores must be non-negative"):
+        model.flush()
 
 
 def test_scores_that_are_not_negative_report_nothing(current_device):

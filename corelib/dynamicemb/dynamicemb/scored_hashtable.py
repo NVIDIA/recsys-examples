@@ -536,6 +536,16 @@ class LinearBucketTable(ScoredHashTable):
             )
             self._ovf_counter = None
 
+        if len(self.score_types_) > 1 and score_fn_key == 0:
+            # The default evictor's module is loaded into this table's device now, not by
+            # the first insert of a step. Last, after the allocations above: loading a
+            # module needs the device's context to be current, and does nothing before
+            # one exists.
+            from dynamicemb.jit.score_jit import load_lex_module
+
+            with torch.cuda.device(self.device):
+                load_lex_module()
+
     def _init_table(
         self,
         keys,
@@ -1634,9 +1644,8 @@ class LinearBucketTable(ScoredHashTable):
                             named_scores[score_name] = (
                                 score[:actual_length].to(SCORE_TYPE).to(target_device)
                             )
-                    # Where the overflow slots of this table start in the output
-                    # numbering is the capacity of its main region: the host list
-                    # that overflow_output_offsets_ is made from.
+                    # overflow_output_offsets_ is built from per_table_capacity_: no
+                    # read of the device for a number the host has
                     ovf_out_offset = (
                         self.per_table_capacity_[table_id]
                         if return_index or return_slots

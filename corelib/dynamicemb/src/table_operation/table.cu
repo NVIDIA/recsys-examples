@@ -248,6 +248,9 @@ void bind_table_operation(py::module &m) {
       },
       "Register the packaged default (Lex) LruLfu evict fatbin.",
       py::arg("lex"));
+  m.def("demb_load_lex_module", &dyn_emb::demb_load_lex_module,
+        "Load the default (Lex) LruLfu evict module into the current context "
+        "now, so that the first insert of a step does not.");
   m.def(
       "demb_register_score_function",
       [](int64_t key, py::bytes ltoir, py::bytes custom, int cc_major,
