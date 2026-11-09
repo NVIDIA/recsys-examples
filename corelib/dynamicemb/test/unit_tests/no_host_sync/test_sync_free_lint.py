@@ -2024,6 +2024,13 @@ EXPECTED_GONE: List[Tuple[str, str, str, str]] = [
         "out = torch.unique(keys[mask], dim=0 if keys.dim() > 1 else None)",
         "E5",
     ),
+    # E1: the overflow offset of an export is the host list the device tensor was built from
+    (
+        "dynamicemb/scored_hashtable.py",
+        "item",
+        "int(self.overflow_output_offsets_[table_id].item())",
+        "E1",
+    ),
 ]
 
 

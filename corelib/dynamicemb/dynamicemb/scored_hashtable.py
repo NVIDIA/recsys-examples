@@ -1634,8 +1634,10 @@ class LinearBucketTable(ScoredHashTable):
                             named_scores[score_name] = (
                                 score[:actual_length].to(SCORE_TYPE).to(target_device)
                             )
+                    # overflow_output_offsets_ is built from per_table_capacity_: no
+                    # read of the device for a number the host has
                     ovf_out_offset = (
-                        int(self.overflow_output_offsets_[table_id].item())
+                        self.per_table_capacity_[table_id]
                         if return_index or return_slots
                         else 0
                     )
@@ -1649,6 +1651,80 @@ class LinearBucketTable(ScoredHashTable):
                         *((ovf_slots,) if return_slots else ()),
                     )
                 ovf_offset += batch_size
+
+    def _export_batches_masked(
+        self,
+        table_id: int,
+        batch_size: int = 65536,
+    ) -> Iterator[Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]]:
+        """:meth:`_batched_export_keys_scores` without reading a count: the same scan of
+        the table's main region and then its overflow region, a batch of ``batch_size``
+        slots at a time, but every batch comes at full length and the host never learns
+        how many keys it has.
+
+        Yields ``(count, keys, scores, slots)``: ``count`` is the ``int64[1]`` on the
+        device that the export kernel filled, and the first ``count`` entries of the other
+        three are the batch's keys (in the table's key type), their first score word
+        (int64) and the table-relative slots they sit in (an overflow slot is past
+        ``per_table_capacity_[table_id]``, as in the other export). Past ``count`` the
+        keys and scores are whatever the buffers held: only ``slots`` is made inert
+        (``-1``), so that a kernel that skips a negative slot never reads the rest. A
+        caller either masks the keys with the slots (``sf.mask_keys``), or copies the
+        first ``count`` entries once the count has reached the host.
+
+        Nothing here waits for the device; ``count`` is the one thing a caller has to
+        read, and a pipelined one can read it for the next batch while it copies this one.
+        """
+        begin_slot = (
+            int(self.table_bucket_offsets_cpu_[table_id]) * self.bucket_capacity_
+        )
+        end_slot = (
+            int(self.table_bucket_offsets_cpu_[table_id + 1]) * self.bucket_capacity_
+        )
+        # (storage, bucket capacity, first slot of the table in it, slots, offset of the
+        # slots a batch reports)
+        regions = [
+            (
+                self.table_storage_,
+                self.bucket_capacity_,
+                begin_slot,
+                end_slot - begin_slot,
+                0,
+            )
+        ]
+        if self.enable_overflow_:
+            ovf_cap = self.overflow_bucket_capacity_
+            regions.append(
+                (
+                    self.overflow_table_storage_,
+                    ovf_cap,
+                    table_id * ovf_cap,
+                    ovf_cap,
+                    self.per_table_capacity_[table_id],
+                )
+            )
+        for storage, bucket_capacity, first, length, slot_offset in regions:
+            offset = 0
+            while offset < length:
+                batch_ = min(batch_size, length - offset)
+                counter, keys, score, indices = table_export_batch(
+                    storage,
+                    bucket_capacity,
+                    batch_,
+                    first + offset,
+                    self.key_type_,
+                    None,
+                    first,
+                    num_scores=self.num_scores_,
+                    score_index=0,
+                )
+                live = (
+                    torch.arange(batch_, dtype=torch.int64, device=counter.device)
+                    < counter
+                )
+                slots = indices if slot_offset == 0 else indices + slot_offset
+                yield counter, keys, score, torch.where(live, slots, -1)
+                offset += batch_size
 
     def dump(
         self,

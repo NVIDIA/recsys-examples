@@ -60,6 +60,7 @@ FWD_BWD_TEST_FILES=(
     # per batch of a call that moves data in batches), never per table, column or chunk.
     "test/unit_tests/no_host_sync/test_explicit_api_syncs.py"
     "test/unit_tests/no_host_sync/test_pop_one_pass.py"
+    "test/unit_tests/no_host_sync/test_flush_masked.py"
 )
 
 LOAD_DUMP_TEST_FILES=(

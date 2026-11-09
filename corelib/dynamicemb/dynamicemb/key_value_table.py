@@ -5525,6 +5525,41 @@ def _write_back_evicted_masked(
             )
 
 
+# What a flush loads from the cache per batch at most, in bytes of values. The batches
+# of the flush are full length (the host does not learn how many entries a batch holds),
+# so each one loads ``[batch, value_dim]`` whatever it holds: a wide row makes the batch
+# shorter instead of the buffer 800 MB.
+FLUSH_BATCH_BYTES = 256 << 20
+
+
+def _flush_batch_rows(state: DynamicEmbTableState) -> int:
+    """How many slots a flush of this cache scans per batch: a wave of threads, as
+    many as the values it loads for them fit in :data:`FLUSH_BATCH_BYTES`."""
+    row_bytes = max(1, state.value_dim * state.emb_dtype.itemsize)
+    rows = min(state.threads_in_wave, max(32, FLUSH_BATCH_BYTES // row_bytes))
+    # a multiple of the export kernel's tile, when there is room for one
+    return rows - rows % 32 if rows >= 32 else rows
+
+
+def _wait_for_pending_evicted(state: DynamicEmbTableState) -> None:
+    """Wait for the newest count that is on its way to the host and fold what landed.
+
+    For an explicit call that appends many entries and may wait: the host runs ahead of
+    the device, and every entry keeps its arrays (``16 * N`` bytes) until its count lands.
+    The events of one stream are ordered, so waiting for the newest ticket is waiting for
+    the ones before it (an entry made on another stream is folded when its own count lands,
+    as it is anyway).
+    """
+    ring = state.retain_ring
+    newest = None
+    for entry in state.evicted_pending:
+        if entry[3] is not None:
+            newest = entry[3]
+    if ring is not None and newest is not None:
+        ring.wait(newest)
+    _resolve_pending_evicted(state, block=False)
+
+
 def flush_cache(
     cache: DynamicEmbCache,
     storage: DynamicEmbStorage,
@@ -5535,21 +5570,51 @@ def flush_cache(
     Storage keeps the scores, so a key it still has only has its value
     updated. One it has evicted goes to ``external_storage``, or is dropped
     when there is none: it is not re-inserted, which would evict another row.
+
+    Without an ``external_storage`` the flush waits for nothing: each batch of the cache
+    is exported at full length with its entries past the count made inert (the reserved
+    key, table id and slot ``-1``) and written back with :func:`_write_back_evicted_masked`,
+    which skips them, so no count is read. A storage that retains evicted keys has the
+    arrays of each batch pending until their counts land; every ``retain_ring`` of
+    batches the flush waits for the newest count (it is an explicit call), so that they do
+    not pile up behind a host that is far ahead of the device. An ``external_storage``
+    takes exact-length tensors on the host side of its contract, so each batch is read
+    and compacted for it as before.
     """
     state = cache._state
-    batch_size = state.threads_in_wave
+    if external_storage is not None:
+        batch_size = state.threads_in_wave
+        for t in range(state.num_tables):
+            for keys, _, indices in state.key_index_map._batched_export_keys_scores(
+                [state.score_policy.name],
+                state.device,
+                batch_size=batch_size,
+                return_index=True,
+                table_id=t,
+            ):
+                tid = torch.full(
+                    (keys.numel(),), t, dtype=torch.int64, device=keys.device
+                )
+                values = load_from_flat(state, indices, tid, copy_mode=CopyMode.VALUE)
+                _write_back_evicted(storage, external_storage, keys, tid, values)
+        return
 
+    batch_size = _flush_batch_rows(state)
+    retaining = EvictedItemMode.RETAIN_KEY in storage._state.evicted_item_mode
+    ring = storage._state.retain_ring
     for t in range(state.num_tables):
-        for keys, _, indices in state.key_index_map._batched_export_keys_scores(
-            [state.score_policy.name],
-            state.device,
-            batch_size=batch_size,
-            return_index=True,
-            table_id=t,
+        batches = 0
+        for _, keys, _, slots in state.key_index_map._export_batches_masked(
+            t, batch_size
         ):
-            tid = torch.full((keys.numel(),), t, dtype=torch.int64, device=keys.device)
-            values = load_from_flat(state, indices, tid, copy_mode=CopyMode.VALUE)
-            _write_back_evicted(storage, external_storage, keys, tid, values)
+            live = slots >= 0
+            tid = torch.where(live, torch.full_like(slots, t), -1)
+            rows = state.key_index_map._rows_of(slots, tid, False)
+            values = load_from_flat(state, rows, tid, copy_mode=CopyMode.VALUE)
+            _write_back_evicted(storage, None, sf.mask_keys(keys, live), tid, values)
+            batches += 1
+            if retaining and ring is not None and batches % ring.slots == 0:
+                _wait_for_pending_evicted(storage._state)
 
 
 # ---------------------------------------------------------------------------
