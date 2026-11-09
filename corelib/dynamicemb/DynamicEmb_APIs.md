@@ -1782,6 +1782,8 @@ Users can specify the initial capacity of a table on a single GPU. When the tabl
   The growth is not capped by `max_capacity`.
 - **Loading a checkpoint** (`DynamicEmbStorage.load`): the table is sized for the keys **this rank keeps** from the file (counted from the key file with the rank's ownership filter), not for every key in it, since a checkpoint may hold other ranks' keys as well.
 
+**When the decision is made.** The check does not wait for the GPU. It compares the load factor with the last landed snapshot of the table sizes plus the number of keys the batches since could add (for a table, the key count of its own features when the input carries it, never read from the device), so a table can grow by up to a few batches' keys earlier than an exact check would, and never later. Set `DYNAMICEMB_EXACT_GROWTH=1` for the blocking exact check. Growing itself remaps memory and synchronizes the device.
+
 
 ## Erasing keys by score
 
@@ -1797,6 +1799,28 @@ So dynamicemb provides dedicated interface to load/save models' states, and prov
 
 Please see `DynamicEmbDump`, `DynamicEmbLoad`, `incremental_dump` in [APIs Doc](./DynamicEmb_APIs.md) for more information.
 
+## Host syncs
+
+A step of the lookup -- the prefetch, the forward and the backward, or an eval forward -- does not make the CPU wait for the GPU, so the CPU keeps enqueuing work ahead of the device and a step does not stall a prefetch pipeline. This holds for every storage layout (a cache over a storage, HBM only, host only, hybrid), with or without admission, `RETAIN_KEY`, LFU, per-key scores, and for tables that grow.
+
+The unique keys of a batch stay as long as the input, with the count of unique keys left on the device. A row past the count is *inert*: its key is the reserved all-ones key and its table id and slot are `-1`, and the table, load/store, counter and optimizer kernels skip such rows. A key that takes no part in a step (a hit, when the misses are inserted; a key an admitter refused) is replaced by the reserved key instead of being compacted away, so nothing needs a count on the host.
+
+What it costs:
+
+- The miss path (the storage lookup, the initialization of new rows, the inserts, the eviction and the write-back) runs on every step, also when nothing missed, because the host does not know that. A step launches the same kernels whether its keys hit or miss. An all-hit step launches about twenty more kernels than before, which shows only when a step is CPU-bound; a step that misses launches fewer, and no longer waits for the GPU several times.
+- The buffers of the miss path (`values`, `evicted_values`: `N x value_dim`, with `N` the number of keys of the batch, duplicates included) are allocated at the length of the input instead of the number of misses. A group whose buffers would exceed `DYNAMICEMB_SYNC_FREE_MAX_BYTES` takes the previous path, which reads the counts.
+
+What can still wait for the GPU. Each of these reads goes through `sync_free.read_now` or is outside DynamicEmb, so searching the package for `read_now` lists them:
+
+- an external `Storage` (a parameter server) and user-defined `MultiTableAdmitter`, `Counter`, `Cache` or `Storage` classes: their contract takes keys sized to the request and returns host counts. They run the previous, exact-length path after one read of the unique counts per step;
+- table growth: the decision to grow is made without waiting (see [Table expansion](#table-expansion)), but growing a table remaps memory and synchronizes the device; it never happens when `init_capacity` equals `max_capacity`;
+- `DEMB_DETERMINISM_MODE`, which reads two counts per insert;
+- dump, load, export, `pop_*` and the incremental dump, which move data to the host by design, and `cache_metrics()`, which reads the hit counts when it is called;
+- the one-time setup of a table, and its teardown, which waits for queued work before freeing memory;
+- the input distribution of TorchRec (the split sizes of the all-to-all of keys live on the host).
+
+`DYNAMICEMB_SYNC_FREE=0` restores the previous lookup paths for comparison, and the `sync_free` helpers and `test/unit_tests/no_host_sync` (a probe that counts the syncs of a step per layout and scenario, and a ratchet against `budgets.json`) show where a sync comes from.
+
 ## Deterministic mode
 
 When handling cache eviction and final table eviction, dynamicemb encounters randomness in the eviction of keys with the same score. To eliminate this uncertainty, dynamicemb provides a deterministic mode. Enabling this mode ensures that, under the same training script, the evicted keys will be determined.
@@ -1811,3 +1835,7 @@ The following environment variables control runtime behavior of dynamicemb:
 | `DYNAMICEMB_CSTM_SCORE_CHECK` | `1` | When set to `0`, suppresses warnings in `set_score` when a new score is less than the previous one (CUSTOMIZED eviction mode). |
 | `DEMB_DETERMINISM_MODE` | unset | When set, enables deterministic eviction of keys with equal scores during cache eviction and final table eviction. |
 | `DYNAMICEMB_DEBUG` | unset | When set to any non-empty value, enables extra runtime validation in `segmented_unique_cuda`. A one-block kernel verifies on the device: (1) `segmented_range[0] == 0`, (2) `segmented_range[num_tables] == num_keys`, (3) monotonically non-decreasing. A violation is a device-side assert that prints the failed condition (the CUDA context is unusable afterwards), not an exception. Intended for development and testing only; costs one small kernel launch per call and no host synchronization. |
+| `DYNAMICEMB_SYNC_FREE` | `1` | When set to `0`, the lookup takes the previous paths that compact the missing keys and read their counts, for comparison and as a kill switch. See [Host syncs](#host-syncs). |
+| `DYNAMICEMB_MISS_PATH_GATE` | `always` | How a step decides whether to run the miss path: `always` launches it every step (no host read), `poll` skips it when a non-blocking poll shows that nothing missed (the control flow depends on timing; the results do not), `read` reads the miss count with one blocking copy. `read` is used for `DEMB_DETERMINISM_MODE` and an external storage. |
+| `DYNAMICEMB_SYNC_FREE_MAX_BYTES` | `4294967296` | A group whose miss-path buffers (`2 x N x value_dim x element size`) would exceed this takes the previous, count-reading path. |
+| `DYNAMICEMB_EXACT_GROWTH` | `0` | When set to `1`, `expand_if_need` confirms a table's size with a blocking copy before growing it, as `load()` always does, instead of deciding from the last landed size snapshot and the bounds of the batches since. |
