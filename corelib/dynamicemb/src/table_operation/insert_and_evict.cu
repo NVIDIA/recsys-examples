@@ -88,6 +88,7 @@ void launch_table_insert_and_evict_kernel(
     p.bucket_capacity = table.bucket_capacity_;
     p.num_scores = table.num_scores_;
     p.table_bucket_offsets = table_bucket_offsets_ptr;
+    p.table_global_capacities = table.global_capacities_;
     p.bucket_sizes = bucket_sizes_ptr;
     p.batch = num_total;
     p.input_keys = reinterpret_cast<const int64_t *>(keys_ptr);
@@ -140,7 +141,7 @@ void table_insert_and_evict_single_score(
     at::Tensor evicted_keys, at::Tensor evicted_indices,
     at::Tensor evicted_scores, at::Tensor evicted_table_ids,
     std::optional<at::Tensor> counter, int64_t num_scores,
-    int64_t score_fn_key) {
+    int64_t score_fn_key, int64_t const *global_caps_ptr) {
 
   auto key_type = get_data_type(keys);
 
@@ -196,7 +197,8 @@ void table_insert_and_evict_single_score(
     using Table = LinearBucketTable<Bucket>;
 
     auto table = Table(reinterpret_cast<uint8_t *>(table_storage.data_ptr()),
-                       num_buckets, bucket_capacity, num_scores);
+                       num_buckets, bucket_capacity, num_scores,
+                       global_caps_ptr);
 
     DISPATCH_SCORE_POLICY(policy_type, PolicyTypeV, [&] {
       if (num_total % 32 == 0) {
@@ -253,7 +255,8 @@ static void table_insert_and_evict_with_counter_and_overflow_single_score(
     at::Tensor evicted_scores, at::Tensor evicted_table_ids, at::Tensor counter,
     at::Tensor ovf_storage, int64_t ovf_bucket_capacity,
     at::Tensor ovf_bucket_sizes, at::Tensor ovf_counter,
-    at::Tensor ovf_output_offsets, int64_t num_scores, int64_t score_fn_key) {
+    at::Tensor ovf_output_offsets, int64_t num_scores, int64_t score_fn_key,
+    int64_t const *global_caps_ptr) {
 
   auto key_type = get_data_type(keys);
 
@@ -312,7 +315,8 @@ static void table_insert_and_evict_with_counter_and_overflow_single_score(
     using Table = LinearBucketTable<Bucket>;
 
     auto table = Table(reinterpret_cast<uint8_t *>(table_storage.data_ptr()),
-                       num_buckets, bucket_capacity, num_scores);
+                       num_buckets, bucket_capacity, num_scores,
+                       global_caps_ptr);
 
     int64_t ovf_bucket_bytes = ovf_bucket_capacity * total_size;
     int64_t ovf_num_buckets =
@@ -384,7 +388,8 @@ table_insert_and_evict(at::Tensor table_storage,
                        std::optional<at::Tensor> ovf_bucket_sizes,
                        std::optional<at::Tensor> ovf_counter,
                        std::optional<at::Tensor> ovf_output_offsets,
-                       int64_t num_scores, int64_t score_fn_key) {
+                       int64_t num_scores, int64_t score_fn_key,
+                       std::optional<at::Tensor> table_global_capacities) {
 
   int64_t num_total = keys.size(0);
   if (num_total == 0) {
@@ -417,6 +422,8 @@ table_insert_and_evict(at::Tensor table_storage,
       torch::empty({num_total}, keys.options().dtype(torch::kLong));
 
   bool use_overflow = ovf_storage.has_value() && ovf_storage.value().defined();
+  auto global_caps_ptr =
+      global_capacities_ptr(table_global_capacities, table_bucket_offsets);
 
   if (use_overflow) {
     TORCH_CHECK(counter.has_value(),
@@ -427,13 +434,14 @@ table_insert_and_evict(at::Tensor table_storage,
         score_output, num_evicted, evicted_keys, evicted_indices,
         evicted_scores, evicted_table_ids, counter.value(), ovf_storage.value(),
         ovf_bucket_capacity, ovf_bucket_sizes.value(), ovf_counter.value(),
-        ovf_output_offsets.value(), num_scores, score_fn_key);
+        ovf_output_offsets.value(), num_scores, score_fn_key, global_caps_ptr);
   } else {
     table_insert_and_evict_single_score(
         table_storage, table_bucket_offsets, bucket_capacity, bucket_sizes,
         keys, table_ids, score_input, policy_type, indices, insert_results,
         score_output, num_evicted, evicted_keys, evicted_indices,
-        evicted_scores, evicted_table_ids, counter, num_scores, score_fn_key);
+        evicted_scores, evicted_table_ids, counter, num_scores, score_fn_key,
+        global_caps_ptr);
   }
 
   return std::make_tuple(indices, num_evicted, evicted_keys, evicted_indices,

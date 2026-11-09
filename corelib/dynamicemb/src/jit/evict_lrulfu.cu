@@ -61,7 +61,7 @@ __device__ __forceinline__ void run_evict(const EvictParams &p,
                          /*OutputScore=*/true, EnableOverflow>;
 
   EvictTable table(p.table_storage, p.num_buckets, p.bucket_capacity,
-                   p.num_scores);
+                   p.num_scores, p.table_global_capacities);
   EvictTable ovf_table =
       EnableOverflow ? EvictTable(p.ovf_storage, p.ovf_num_buckets,
                                   p.ovf_bucket_capacity, p.num_scores)
@@ -96,7 +96,7 @@ __device__ __forceinline__ void run_insert(const EvictParams &p,
                          /*OutputScore=*/true>;
 
   EvictTable table(p.table_storage, p.num_buckets, p.bucket_capacity,
-                   p.num_scores);
+                   p.num_scores, p.table_global_capacities);
 
   insert_body<EvictTable, KernelTraits, RankedEvictor<EvictComparator>>(
       table, p.table_bucket_offsets, p.bucket_sizes, p.batch, p.input_keys,
@@ -121,7 +121,7 @@ __device__ __forceinline__ void run_insert_collect(const EvictParams &p,
                          /*OutputScore=*/true>;
 
   EvictTable table(p.table_storage, p.num_buckets, p.bucket_capacity,
-                   p.num_scores);
+                   p.num_scores, p.table_global_capacities);
 
   insert_body<EvictTable, KernelTraits, RankedEvictor<EvictComparator>,
               /*CollectEvicted=*/true>(

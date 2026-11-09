@@ -953,6 +953,7 @@ void bind_dyn_emb_op(py::module &m) {
       .value("KBlock", dyn_emb::DistType::kBlock)
       .value("KCyclic", dyn_emb::DistType::kCyclic)
       .value("KHashedCyclic", dyn_emb::DistType::kHashedCyclic)
+      .value("KHashedBucket", dyn_emb::DistType::kHashedBucket)
       .export_values();
 
   py::enum_<dyn_emb::PoolingMode>(m, "PoolingMode")

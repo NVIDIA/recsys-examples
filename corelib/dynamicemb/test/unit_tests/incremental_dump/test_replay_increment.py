@@ -54,6 +54,8 @@ def make_model(
     local_hbm_for_values: int = 1024**3,
     evicted_item_mode: EvictedItemMode = EvictedItemMode.DISCARD,
     optimizer: EmbOptimType = EmbOptimType.SGD,
+    dist_type: str = "roundrobin",
+    global_capacity: Optional[int] = None,
     **opt_params,
 ) -> BatchedDynamicEmbeddingTablesV2:
     options = DynamicEmbTableOptions(
@@ -63,6 +65,8 @@ def make_model(
         dim=DIM,
         max_capacity=max_capacity,
         bucket_capacity=bucket_capacity,
+        dist_type=dist_type,
+        global_capacity=global_capacity,
         safe_check_mode=DynamicEmbCheckMode.IGNORE,
         # A cache only exists when the values do not fit in HBM
         # (``total_memory > local_hbm``), so a caching test has to shrink this --
@@ -419,6 +423,45 @@ def test_replay_rejects_layout_mismatch(current_device):
 
     # Rejection must be total: no partial write is left behind.
     assert dump_all(dst).keys[0].numel() == 0
+
+
+def test_replay_rejects_global_capacity_mismatch(current_device):
+    """Two hash_bucket tables of one capacity but different whole-table
+    capacities hash a key into different buckets, so a source slot means
+    nothing to the target; same capacity, same bucket_capacity, still rejected."""
+    device = torch.device(f"cuda:{current_device}")
+    src = make_model(
+        current_device,
+        max_capacity=DEFAULT_CAPACITY,
+        init_capacity=DEFAULT_CAPACITY,
+        dist_type="hash_bucket",
+        global_capacity=DEFAULT_CAPACITY * 2,
+    )
+    dst = make_model(
+        current_device,
+        max_capacity=DEFAULT_CAPACITY,
+        init_capacity=DEFAULT_CAPACITY,
+        dist_type="hash_bucket",
+        global_capacity=DEFAULT_CAPACITY * 4,
+    )
+    touch(src, list(range(1001, 1051)), device)
+    delta = dump_all(src)
+    with pytest.raises(ValueError, match="global_capacity mismatch"):
+        dst.replay_increment(delta)
+    assert dump_all(dst).keys[0].numel() == 0, "rejection must be total"
+
+    # The same layout replays: the slot-for-slot write-back lands every key.
+    twin = make_model(
+        current_device,
+        max_capacity=DEFAULT_CAPACITY,
+        init_capacity=DEFAULT_CAPACITY,
+        dist_type="hash_bucket",
+        global_capacity=DEFAULT_CAPACITY * 2,
+    )
+    twin.replay_increment(delta)
+    assert torch.equal(
+        dump_all(twin).keys[0].sort().values, delta.keys[0].sort().values
+    )
 
 
 def test_replay_rejects_score_strategy_mismatch(current_device):
