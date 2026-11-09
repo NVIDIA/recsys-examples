@@ -61,6 +61,16 @@ def device():
     return torch.device("cuda", torch.cuda.current_device())
 
 
+@pytest.fixture(params=[False, True], ids=["default", "determinism"])
+def deterministic(request, monkeypatch):
+    """The HBM tier of a HybridStorage inserts with the sorted kernels in DEMB_DETERMINISM_MODE
+    (``_insert_and_evict_keys(..., async_count=True)``, the non-overflow evicting variant).
+    """
+    if request.param:
+        monkeypatch.setenv("DEMB_DETERMINISM_MODE", "1")
+    return request.param
+
+
 # ---------------------------------------------------------------------------
 # Storages
 # ---------------------------------------------------------------------------
@@ -580,7 +590,10 @@ def test_refresh_equals_reference(device, lfu, training):
 
 def _spill_batches(device, lfu):
     """Three batches into an HBM tier of 128 slots: the first fits, the second evicts
-    the lowest-scored of the first, the third scores below everything (refused)."""
+    the lowest-scored of the first, the third scores below everything: each of its keys
+    still evicts the lowest-scored resident (a low score never refuses a key, a newcomer is
+    compared with the largest score there is), and no key of the call is evicted by the
+    call, which is what keeps every value on its key."""
     out = []
     for first, last, score in [(1, 101, None), (101, 161, None), (1001, 1011, 1)]:
         keys = torch.arange(first, last, dtype=torch.int64, device=device)
@@ -594,9 +607,10 @@ def _spill_batches(device, lfu):
 
 
 @pytest.mark.parametrize("lfu", [False, True])
-def test_insert_spills_what_the_hbm_tier_cannot_keep(device, lfu):
-    """What the HBM tier evicts or refuses lands in the host tier with its value and
-    score; nothing is lost, and the result equals the reference's."""
+def test_insert_spills_what_the_hbm_tier_cannot_keep(device, lfu, deterministic):
+    """What the HBM tier evicts lands in the host tier with its value and score; nothing
+    is lost, and the result equals the reference's. (What it refuses is
+    ``test_a_key_the_hbm_tier_refuses_reaches_the_host_tier_with_its_own_row``.)"""
     a, b = _hybrid(lfu), _hybrid(lfu)
     batches = _spill_batches(device, lfu)
     for keys, scores in batches:
@@ -617,9 +631,54 @@ def test_insert_spills_what_the_hbm_tier_cannot_keep(device, lfu):
         _assert_same_contents(a, b, carried, lfu)
 
 
+@pytest.mark.parametrize("variant", ["plain", "interleaved"])
+@pytest.mark.parametrize("lfu", [False, True])
+def test_a_key_the_hbm_tier_refuses_reaches_the_host_tier_with_its_own_row(
+    device, lfu, variant, deterministic
+):
+    """One call brings more new keys than the HBM tier has slots (one bucket of 128; the
+    tier keeps no reference counters, so this is the way it refuses a key). The keys it has
+    no slot for come back from the insert as evicted entries of index ``-(input position +
+    1)``, and ``HybridStorage.insert`` hands each to the host tier with its OWN row
+    (``_select_refused_values``), also with masked lanes among the keys, whose positions
+    count. Nothing is lost, no key is in both tiers, the HBM tier is full. In the
+    determinism mode the keys of a bucket are inserted in key order, so the tier keeps the
+    smallest keys of the call."""
+    storage = _hybrid(lfu)
+    keys = torch.arange(1, 201, dtype=torch.int64, device=device)
+    n = keys.numel()
+    real = (
+        torch.ones(n, dtype=torch.bool, device=device)
+        if variant == "plain"
+        else torch.arange(n, device=device) % 4 != 3
+    )
+    nan_rows = torch.full((n, DIM), float("nan"), device=device)
+    values = torch.where(real.unsqueeze(1), _values(keys), nan_rows)
+    storage.insert(
+        sf.mask_keys(keys, real),
+        torch.zeros_like(keys),
+        values,
+        (keys + 9) if lfu else None,
+    )
+
+    found, rows, _ = _contents(storage, keys)
+    assert torch.equal(found, real), "a key was lost between the tiers"
+    assert torch.equal(rows[found], _values(keys)[found]), "a key got another key's row"
+    (in_hbm, _), (in_host, _) = _tier_scores(storage, keys)
+    assert int(in_hbm.sum()) == BUCKET, "the HBM tier is full"
+    assert (
+        int(in_host.sum()) == int(real.sum()) - BUCKET
+    ), "the rest is in the host tier"
+    if deterministic:
+        admitted = real & (torch.cumsum(real.to(torch.int64), 0) <= BUCKET)
+        assert torch.equal(in_hbm, admitted), "the smallest keys of the call are kept"
+
+
 @pytest.mark.parametrize("variant", ["tail", "interleaved"])
 @pytest.mark.parametrize("lfu", [False, True])
-def test_insert_with_reserved_lanes_equals_the_exact_insert(device, lfu, variant):
+def test_insert_with_reserved_lanes_equals_the_exact_insert(
+    device, lfu, variant, deterministic
+):
     """Arrays with lanes that must not take part (a padded tail of the reserved key
     and table id -1, or masked keys among real ones) insert exactly the real keys."""
     a, b = _hybrid(lfu), _hybrid(lfu)

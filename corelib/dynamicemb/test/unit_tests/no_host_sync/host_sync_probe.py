@@ -86,9 +86,6 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 #       request-sized host tensors, so DynamicEmb reads the dedup count and the
 #       miss counts in front of every PS call (every step, hits included), and
 #       the PS stand-in's own host code adds more.
-#   I3  DEMB_DETERMINISM_MODE (*_determ) in the training scenarios: the wave
-#       loop of a deterministic insert needs host counts and the miss path is
-#       gated by one blocking read in that mode.
 #   I4  table growth events (*_growth, *_noevict in the miss scenario, and the
 #       growth scenario): new buffers are sized on the host and
 #       ExtendableBuffer.extend / HostVMMTensor.extend synchronize the device.
@@ -114,19 +111,12 @@ _PS_WHY = (
     "tensors (DynamicEmb reads the dedup and miss counts before each PS call) and "
     "the stand-in itself reads CUDA tensors on the host (PyDictStorage.find/insert)"
 )
-_DETERM_WHY = (
-    "DEMB_DETERMINISM_MODE: the wave count of a deterministic insert is a host "
-    "loop bound, and the miss path is gated by one blocking read in this mode"
-)
 INHERENT: Dict[Tuple[str, ...], str] = {
     ("*", "growth"): _GROWTH_WHY,
     ("*_growth", "miss"): _GROWTH_WHY,
     ("*_noevict", "miss"): _GROWTH_WHY,
     ("cache_ps*", "*"): _PS_WHY,
 }
-for _scenario in ("all_hit", "miss", "miss_evict", "tier2_hit"):
-    INHERENT[("*_determ", _scenario)] = _DETERM_WHY
-del _scenario
 
 KINDS = ("ss", "ds", "es", "ms", "pd", "al")
 KIND_DOC = {
@@ -297,6 +287,19 @@ def _build_configs() -> "collections.OrderedDict[str, Cfg]":
         determ=True,
     )
     add("hbm_only_determ", "hbm", "HBM-only with DEMB_DETERMINISM_MODE=ON", determ=True)
+    add(
+        "hybrid_determ",
+        "hybrid",
+        "HybridStorage with DEMB_DETERMINISM_MODE=ON",
+        determ=True,
+    )
+    add(
+        "cache_storage_admit_determ",
+        "cache",
+        "cache layout + FrequencyAdmissionStrategy with DEMB_DETERMINISM_MODE=ON",
+        admit=True,
+        determ=True,
+    )
     return out
 
 

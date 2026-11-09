@@ -19,16 +19,17 @@ The sorted insert (src/table_operation/sorted_insert.cuh) lets ONE thread insert
 bucket one after another, so a key's plain stores (its digest, its score) are followed, in the
 same thread, by the next key's probe (16-byte digest loads) and by the next eviction scan (an
 asynchronous ``cp.async`` copy of the scores). Program order is what makes the stores visible; a
-fence (``__threadfence_block``, compiled in unless built with
-``-DDEMB_SORTED_INSERT_THREADFENCE=0``) is there until these tests have passed on every
-architecture the library is built for. The file also holds the check of the lock protocol with
-other work on the same table on a second stream, a smoke test small enough for
-``compute-sanitizer``, the bound on the serial overflow pass and the cost of a batch of reserved
-keys, which is what every step of a cache hands the insert when all its keys hit.
+fence (``__threadfence_block``, on by default in the header) is there until these tests have
+passed on every architecture the library is built for. The slots a run took stay locked until the
+run is done, which is also what keeps a scan that misread one of them from choosing it. The file
+also holds the check of the lock protocol with other work on the same table on a second stream, a
+smoke test small enough for ``compute-sanitizer``, the bound on the serial overflow pass and the
+cost of a batch of reserved keys, which is what every step of a cache hands the insert when all
+its keys hit.
 
 Each test is self-contained (no oracle needed for the sanitizer ones) and says PASS or FAIL.
 
-    pytest -q -s test_sorted_insert_hw.py     # -s shows the times and the timestamp lead
+    pytest -q -s test_sorted_insert_hw.py     # -s shows the times
 
     # the memory checkers see only what cudaMalloc made: switch the caching allocator off, and run the
     # smoke test (the oracle's blocking reads are not what is being checked)
@@ -36,6 +37,10 @@ Each test is self-contained (no oracle needed for the sanitizer ones) and says P
     PYTORCH_NO_CUDA_MEMORY_CACHING=1 compute-sanitizer --tool initcheck pytest -q -x -k sanitizer test_sorted_insert_hw.py
     PYTORCH_NO_CUDA_MEMORY_CACHING=1 compute-sanitizer --tool racecheck pytest -q -x -k sanitizer test_sorted_insert_hw.py
     PYTORCH_NO_CUDA_MEMORY_CACHING=1 compute-sanitizer --tool synccheck pytest -q -x -k sanitizer test_sorted_insert_hw.py
+
+    # the out-of-bounds write of the compact bucketize that the segmented sort replaced for the keys of
+    # a last table without buckets (a guard in BucketizeOutput): only a memory checker sees it
+    PYTORCH_NO_CUDA_MEMORY_CACHING=1 compute-sanitizer --tool memcheck pytest -q -x -k last_table_without_buckets test_bucketize_segmented.py
 """
 
 import os
@@ -100,11 +105,13 @@ def assert_no_locked_slot(table):
 @pytest.mark.parametrize("seed", range(25))
 def test_same_thread_store_then_scan_chain(key_type, seed):
     """One bucket of 128 slots, so that ONE thread inserts the whole batch: 300 new keys and 10
-    residents of a bucket that holds 60 live keys, 30 reclaimed slots and 38 empty ones. The call
-    runs Insert-into-Empty, Reclaim and Evict one after another in that thread, each followed by
-    the digest and score stores the next key's probe and eviction scan must see (random ASSIGN
-    scores: a stale score changes the victim). The result must be the one of the waves, which had
-    a kernel boundary between two keys."""
+    residents of a bucket that holds 60 live keys, 30 reclaimed slots and 38 empty ones. The
+    residents sort first and are assigned; then the new keys take the 38 empty slots, the 30
+    reclaimed ones and 50 of the live ones (Insert, Reclaim and Evict one after another in that
+    thread, each followed by the digest and score stores the next key's probe and eviction scan
+    must see: random ASSIGN scores, so a victim chosen on a stale score is another key), and the
+    rest of the batch is refused, every slot being locked by then. The result must be the one of
+    the waves that keep what they took, which had a kernel boundary between two keys."""
     old, new = make_pair(key_type, ScorePolicy.ASSIGN, [128], 128)
     gen = torch.Generator().manual_seed(seed)
     resident = torch.randperm(10_000, generator=gen)[:90] + 1
@@ -358,10 +365,9 @@ def test_a_batch_of_reserved_keys_costs_little(key_type, op):
 @pytest.mark.parametrize("key_type", KEY_TYPES)
 def test_timer_floor_in_a_long_run(key_type):
     """4,096 keys into one bucket of 128 slots in one call (the skewed batch of the design: one
-    thread works for a few milliseconds): the survivors are the 128 largest keys, their
-    timestamps strictly increase with the key, and the stored timestamps run ahead of the device
-    timer after the call by at most the number of keys of the run, in nanoseconds (4,096 ns).
-    """
+    thread works for a few milliseconds): the 128 smallest keys take the slots (the others are
+    refused, a key of a call is never evicted by the call) and their timestamps strictly increase
+    with the key, whatever the timer does in between."""
     table = make_table(key_type, TIMER, [128], 128)
     gen = torch.Generator().manual_seed(1)
     keys_cpu = torch.randperm(1_000_000, generator=gen)[:4096] + 1
@@ -373,15 +379,11 @@ def test_timer_floor_in_a_long_run(key_type):
         TIMER,
     )
     torch.cuda.synchronize()
-    now = ext.device_timestamp()
     flat = i64(table.keys_).flatten()
     present = flat[flat > 0]
-    assert sorted(present.tolist()) == sorted(keys_cpu.tolist())[-128:]
+    assert sorted(present.tolist()) == sorted(keys_cpu.tolist())[:128]
     by_key = i64(table.scores_list[0]).flatten()[flat > 0][torch.argsort(present)]
     assert bool((by_key[1:] > by_key[:-1]).all())
-    ahead = int(by_key.max()) - int(now)
-    print("stored timestamps run %d ns ahead of the device timer (bound 4096)" % ahead)
-    assert ahead <= 4096
 
 
 def test_the_fence_switch_is_documented_in_the_kernel_header():

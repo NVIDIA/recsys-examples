@@ -17,10 +17,14 @@
 
 ``table_insert_sorted`` / ``table_insert_and_evict_sorted`` sort the keys of a batch by
 (home bucket, key) and let one thread insert the keys of each bucket, smallest first
-(src/table_operation/sorted_insert.cuh). The waves (``wave_oracle.py``, the code that
-the library used to run) did the same per bucket with one launch per rank of a key in its
-bucket. Two fresh tables with the same construction are driven with the same batches, one
-by the waves and one by the sorted insert, and must stay equal:
+(src/table_operation/sorted_insert.cuh). A slot a key takes stays locked until the run of
+its bucket is done, as in the ordinary insert kernels: no key of a call is evicted by a later
+key of the call, and a bucket that gets more new keys than it has free or evictable slots
+refuses the last of them. The waves (``wave_oracle.py``, the code that the library used to
+run, with the slots a wave took pinned until the last wave) did the same per bucket with one
+launch per rank of a key in its bucket. Two fresh tables with the same construction (the
+oracle's one has reference counters, which it pins with) are driven with the same batches,
+one by the waves and one by the sorted insert, and must stay equal:
 
 * the key table: keys and digests, the scores of every policy but GLOBAL_TIMER (their values
   come from the device timer and differ between two runs, their order inside a bucket does
@@ -36,10 +40,13 @@ A call that spills more than once per table cannot be compared with the waves: t
 the overflow slots between two waves, so a later spill may evict an earlier one, which the
 sorted insert never does (a slot a spill takes stays locked until every spill of the call is
 placed). ``test_multi_spill_keeps_the_keys_of_the_call`` states what the new pass guarantees
-instead.
+instead. The batches of a ``cache`` comparison keep every bucket to at most its capacity of
+new keys (``at_most_per_bucket``) and pin nothing, so that no key is refused and nothing
+spills; the spills have their own tests.
 
-The tests drive the extension through ``new_insert`` / ``new_insert_and_evict``, which are
-what ``LinearBucketTable._deterministic_insert*`` do.
+The tests drive the library through ``new_insert`` / ``new_insert_and_evict``, which call
+``LinearBucketTable._deterministic_insert*``: the Python glue (the indices of the final lookup,
+the evicted arrays, the host form of the count) is covered with the kernels.
 """
 
 import os
@@ -49,7 +56,7 @@ import dynamicemb_extensions as ext
 import pytest
 import torch
 from dynamicemb.scored_hashtable import ScoreArg, ScoreSpec, get_scored_table
-from dynamicemb_extensions import InsertResult, ScorePolicy, table_lookup
+from dynamicemb_extensions import InsertResult, ScorePolicy
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 if HERE not in sys.path:
@@ -122,98 +129,44 @@ def make_table(key_type, policy, capacity, bucket, overflow=False, ref_counter=T
 
 
 def make_pair(key_type, policy, capacity, bucket, overflow=False, ref_counter=True):
-    return tuple(
-        make_table(key_type, policy, capacity, bucket, overflow, ref_counter)
-        for _ in range(2)
-    )
-
-
-def overflow_args(table):
-    return dict(
-        ovf_storage=table.overflow_table_storage_,
-        ovf_bucket_capacity=table.overflow_bucket_capacity_,
-        ovf_bucket_sizes=table.overflow_bucket_sizes,
-        ovf_counter=table._ovf_counter,
-        ovf_output_offsets=table.overflow_output_offsets_,
-    )
-
-
-def lookup_args(table):
+    """``(oracle table, table under test)``, equal tables except for ``ref_counter``, which
+    only the second one follows: the waves pin the slots they took with the counters, which
+    are all zero outside the oracle's own pins, so the oracle decides as a table without them
+    does."""
     return (
-        table.table_storage_,
-        table.table_bucket_offsets_,
-        table.bucket_capacity_,
+        make_table(key_type, policy, capacity, bucket, overflow, True),
+        make_table(key_type, policy, capacity, bucket, overflow, ref_counter),
     )
 
 
 def new_insert(
     table, keys, tids, score_value, policy, insert_results=None, score_out=None
 ):
-    """The sorted insert, through the extension (``_deterministic_insert``)."""
-    ext.table_insert_sorted(
-        *lookup_args(table),
-        table.bucket_sizes,
-        keys,
-        tids,
-        score_value,
-        policy,
-        table._ref_counter,
-        insert_results,
-        score_out,
-        num_scores=table.num_scores_,
+    """The sorted insert, through the library (``LinearBucketTable._deterministic_insert``)."""
+    return table._deterministic_insert(
+        keys, tids, score_value, policy, insert_results, score_out
     )
-    _, _, indices = table_lookup(
-        *lookup_args(table), keys, tids, None, ScorePolicy.CONST
-    )
-    return indices
 
 
 def new_insert_and_evict(
     table, keys, tids, score_value, policy, insert_results=None, score_out=None
 ):
-    """The sorted insert that reports its evictions (``_deterministic_insert_and_evict*``):
-    ``(indices, num_evicted [1] on the device, evicted keys, indices, scores, table ids)``,
-    the evicted arrays as long as ``keys``."""
-    overflow = table.enable_overflow_
-    ovf = overflow_args(table) if overflow else {}
-    (
-        num_evicted,
-        ev_keys,
-        ev_indices,
-        ev_scores,
-        ev_tids,
-    ) = ext.table_insert_and_evict_sorted(
-        *lookup_args(table),
-        table.bucket_sizes,
+    """The sorted insert that reports its evictions (``_deterministic_insert_and_evict`` and
+    ``..._with_overflow``): ``(indices, num_evicted [1] on the device, evicted keys, indices,
+    scores, table ids)``, the evicted arrays as long as ``keys``."""
+    insert = (
+        table._deterministic_insert_and_evict_with_overflow
+        if table.enable_overflow_
+        else table._deterministic_insert_and_evict
+    )
+    return insert(
         keys,
         tids,
         score_value,
         policy,
-        table._ref_counter,
-        insert_results,
-        score_out,
-        num_scores=table.num_scores_,
-        **ovf,
-    )
-    lookup_ovf = (
-        dict(
-            ovf_storage=table.overflow_table_storage_,
-            ovf_bucket_capacity=table.overflow_bucket_capacity_,
-            ovf_output_offsets=table.overflow_output_offsets_,
-        )
-        if overflow
-        else {}
-    )
-    _, _, indices = table_lookup(
-        *lookup_args(table), keys, tids, None, ScorePolicy.CONST, **lookup_ovf
-    )
-    return (
-        indices,
-        num_evicted,
-        ev_keys,
-        ev_indices,
-        ev_scores.view(torch.uint64),
-        ev_tids,
+        async_count=True,
+        insert_results=insert_results,
+        score_out=score_out,
     )
 
 
@@ -304,6 +257,32 @@ def make_batch(gen, n, num_tables, key_type, policy, pad=0.1, zeros=False):
         keys.cuda().view(key_type),
         tids.cuda(),
         None if scores is None else u64(scores),
+    )
+
+
+def at_most_per_bucket(table, keys, tids, limit):
+    """``keys`` / ``tids`` with every key past the first ``limit`` of its bucket (in key order)
+    made a padding lane (the reserved key, table id -1): no bucket gets more than ``limit`` new
+    keys. With ``limit`` the capacity of a bucket and no pinned slot a call cannot refuse a
+    key: a bucket always has a slot that is empty or holds a resident, and the keys of the call
+    lock one each. Done with the sort of the sorted insert, on the device."""
+    _, inverse, segments = ext.bucketize_keys_segmented(
+        keys,
+        tids,
+        table.table_bucket_offsets_,
+        table.num_buckets_,
+        table.bucket_capacity_,
+    )
+    rank = torch.arange(keys.numel(), device=keys.device) - torch.searchsorted(
+        segments, segments
+    )
+    drop = torch.zeros(keys.numel(), dtype=torch.bool, device=keys.device)
+    drop[inverse] = rank >= limit
+    return (
+        torch.where(drop, torch.full_like(i64(keys), EMPTY), i64(keys)).view(
+            keys.dtype
+        ),
+        torch.where(drop, torch.full_like(tids, -1), tids),
     )
 
 
@@ -441,12 +420,15 @@ def test_equals_the_waves(key_type, policy, geometry, op):
         keys, tids, scores = make_batch(
             gen, n, num_tables, key_type, policy, zeros=step % 2 == 1
         )
+        if op == "cache":
+            # no refusal, so nothing spills: the overflow bucket is compared as it is
+            keys, tids = at_most_per_bucket(new, keys, tids, bucket)
         if previous is not None:
             # erase a quarter of the last batch (reclaimed slots), move the pins
             erase_some((old, new), gen, *previous)
             if pinned is not None:
                 unpin((old, new), pinned)
-            if op != "insert":
+            if op == "insert_and_evict":
                 pinned = pin_some((old, new), gen, *previous)
         idx_old, rec_old = run_old(old, op, keys, tids, scores, policy)
         insert_results = torch.full(
@@ -517,6 +499,8 @@ def test_no_score_input(key_type, policy, op):
     old, new = make_pair(key_type, policy, [64, 64], 16, overflow=op == "cache")
     gen = torch.Generator().manual_seed(9)
     keys, tids, _ = make_batch(gen, 600, 2, key_type, policy, pad=0.2)
+    if op == "cache":
+        keys, tids = at_most_per_bucket(new, keys, tids, 16)  # nothing spills
     idx_old, rec_old = run_old(old, op, keys, tids, None, policy)
     insert_results = torch.empty(keys.numel(), dtype=torch.uint8, device="cuda")
     idx_new, rec_new = run_new(new, op, keys, tids, None, policy, insert_results)
@@ -739,6 +723,97 @@ def test_multi_spill_is_the_same_on_every_run(key_type):
 
 
 # ---------------------------------------------------------------------------
+# a key of the call is never evicted by the call
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize("key_type", KEY_TYPES)
+@pytest.mark.parametrize("policy", [ScorePolicy.ASSIGN, ScorePolicy.ACCUMULATE])
+def test_a_newcomer_is_not_evicted_by_the_next_one(key_type, policy):
+    """One bucket of 128 slots, full, and ten new keys that each score below every resident (the
+    batches of ``test_hybrid_masked.py``: 160 keys scoring 10..169 go in, the 32 lowest are
+    evicted, then ten keys scoring 1 arrive). The first newcomer takes the slot of the lowest
+    resident, key 33, with score 1, which makes it the lowest of the bucket for the second one:
+    if its slot were released between the two keys the second would evict it, the third the
+    second, and the records would name one slot ten times. The cache and HybridStorage read the
+    rows of the evicted slots before they store the rows of the new keys, so nine of the ten
+    values would be written back under the wrong key. The slots of the call stay locked: each
+    newcomer evicts a resident of its own, the lowest ones, in the order of the keys."""
+    table = make_table(key_type, policy, [128], 128)
+
+    def zeros(n):
+        return torch.zeros(n, dtype=torch.int64, device="cuda")
+
+    for first, last in ((1, 101), (101, 161)):
+        keys = torch.arange(first, last, dtype=torch.int64, device="cuda")
+        new_insert(
+            table, keys.view(key_type), zeros(last - first), u64(keys + 9), policy
+        )
+    newcomers = torch.arange(1001, 1011, dtype=torch.int64, device="cuda")
+    results = torch.empty(10, dtype=torch.uint8, device="cuda")
+    indices, rec = run_new(
+        table,
+        "insert_and_evict",
+        newcomers.view(key_type),
+        zeros(10),
+        u64(torch.ones(10, dtype=torch.int64, device="cuda")),
+        policy,
+        results,
+    )
+    count, ev_keys, ev_indices, _, _ = rec
+    # the residents are 33..160, scoring 42..169: the ten lowest are keys 33..42
+    assert count == 10
+    assert i64(ev_keys).tolist() == list(range(33, 43)), "a resident each, lowest first"
+    assert len(set(ev_indices.tolist())) == 10, "ten evictions, ten slots"
+    assert bool((results == InsertResult.EVICT.value).all())
+    # all ten are in the table, in the slots of their victims
+    assert sorted(indices.tolist()) == sorted(ev_indices.tolist())
+    score = ScoreArg(name="score", value=None, policy=ScorePolicy.CONST)
+    _, founds, _ = table.lookup(newcomers.view(key_type), zeros(10), score)
+    assert bool(founds.all())
+
+
+@pytest.mark.parametrize("key_type", KEY_TYPES)
+@pytest.mark.parametrize("op", ["insert", "insert_and_evict"])
+def test_a_bucket_refuses_the_new_keys_it_has_no_slot_for(key_type, op):
+    """One bucket of 16 slots and 40 new keys in one call: the 16 smallest take the slots, the
+    other 24 are refused (BUSY, no index). The waves evicted the earlier newcomers of the call
+    and kept the largest keys; a key of the call is never evicted by the call. The evictions
+    report each refused key as an entry of its own key and score and index
+    ``-(input position + 1)``."""
+    table = make_table(key_type, ScorePolicy.ASSIGN, [16], 16)
+    gen = torch.Generator().manual_seed(5)
+    keys_cpu = torch.randperm(10_000, generator=gen)[:40] + 1
+    keys = keys_cpu.cuda().view(key_type)
+    tids = torch.zeros(40, dtype=torch.int64, device="cuda")
+    scores_cpu = torch.randint(1, 1000, (40,), generator=gen)
+    results = torch.empty(40, dtype=torch.uint8, device="cuda")
+    indices, rec = run_new(
+        table, op, keys, tids, u64(scores_cpu), ScorePolicy.ASSIGN, results
+    )
+    values = keys_cpu.tolist()
+    smallest = set(sorted(values)[:16])
+    live = i64(table.keys_).flatten()
+    assert sorted(live[live > 0].tolist()) == sorted(smallest)
+    expected = [
+        InsertResult.INSERT.value if k in smallest else InsertResult.BUSY.value
+        for k in values
+    ]
+    assert results.tolist() == expected
+    assert (indices >= 0).tolist() == [k in smallest for k in values]
+    if op == "insert":
+        return
+    count, ev_keys, ev_indices, ev_scores, _ = rec
+    refused = {i: k for i, k in enumerate(values) if k not in smallest}
+    assert count == 24
+    assert dict(zip(ev_indices.tolist(), i64(ev_keys).tolist())) == {
+        -(i + 1): k for i, k in refused.items()
+    }
+    assert dict(zip(i64(ev_keys).tolist(), i64(ev_scores).tolist())) == {
+        k: int(scores_cpu[i]) for i, k in refused.items()
+    }
+    assert i64(ev_keys).tolist() == sorted(refused.values()), "in (bucket, key) order"
+
+
+# ---------------------------------------------------------------------------
 # determinism of the key table
 # ---------------------------------------------------------------------------
 @pytest.mark.parametrize("key_type", KEY_TYPES)
@@ -799,32 +874,34 @@ def test_run_to_run_and_batch_order(key_type, policy, op):
 @pytest.mark.parametrize("key_type", KEY_TYPES)
 @pytest.mark.parametrize("seed", range(10))
 def test_timer_ties_do_not_break_the_lru_order(key_type, seed):
-    """One bucket of 16 slots, 48 distinct keys in one call. The keys of a bucket are inserted
-    in ascending order, so the survivors of an LRU table are the 16 largest: the oldest key
-    goes first. Two inserts of one thread can read the same device timer; without the strict
-    floor of the sorted kernel the lowest slot would win such a tie instead of the oldest key.
-    The stored timestamps run strictly up with the insertion order, and ahead of the device
-    timer by no more than the number of keys of the run, in nanoseconds."""
-    table = make_table(key_type, TIMER, [16], 16)
+    """One bucket of 128 slots: 128 distinct keys in one call, 128 others in a second. The device
+    timer ticks more slowly than one insert takes, so two inserts of one thread can read the
+    same value, and two equal timestamps would make the lowest slot win a tie in a later call
+    instead of the oldest key. The sorted kernel keeps the timestamps of a run strictly
+    increasing (score = max(timer, previous + 1)): the timestamps of the first call grow with
+    the key, and the second call, whose keys each evict the least recently used resident, evicts
+    the keys of the first in that order. (How far a timestamp can run ahead of the timer, the
+    length of its run in nanoseconds, follows from that line and is below what a timer read
+    after the call can resolve.)"""
+    table = make_table(key_type, TIMER, [128], 128)
     gen = torch.Generator().manual_seed(seed)
-    keys_cpu = torch.randperm(10_000, generator=gen)[:48] + 1
-    keys = keys_cpu.cuda().view(torch.int64).view(key_type)
-    tids = torch.zeros(48, dtype=torch.int64, device="cuda")
-    new_insert(table, keys, tids, None, TIMER)
-    torch.cuda.synchronize()
-    now = ext.device_timestamp()
-    present = i64(table.keys_).flatten()
-    present = present[present > 0]
-    assert sorted(present.tolist()) == sorted(keys_cpu.tolist())[-16:]
-    # the timestamps, in the order of the keys, are strictly increasing
-    scores = i64(table.scores_list[0]).flatten()[i64(table.keys_).flatten() > 0]
-    by_key = scores[torch.argsort(present)]
+    universe = torch.randperm(100_000, generator=gen) + 1
+    first, second = universe[:128], universe[128:256]
+    tids = torch.zeros(128, dtype=torch.int64, device="cuda")
+    new_insert(table, first.cuda().view(key_type), tids, None, TIMER)
+    flat = i64(table.keys_).flatten()
+    live = flat > 0
+    assert sorted(flat[live].tolist()) == sorted(first.tolist())
+    by_key = i64(table.scores_list[0]).flatten()[live][torch.argsort(flat[live])]
     assert bool(
         (by_key[1:] > by_key[:-1]).all()
     ), "stored timestamps are strictly ordered"
-    assert (
-        int(by_key.max()) - int(now) <= 48
-    ), "the floor runs ahead of the timer by <= the run"
+    _, rec = run_new(
+        table, "insert_and_evict", second.cuda().view(key_type), tids, None, TIMER
+    )
+    count, ev_keys = rec[0], rec[1]
+    assert count == 128
+    assert i64(ev_keys).tolist() == sorted(first.tolist()), "the oldest key goes first"
 
 
 # ---------------------------------------------------------------------------

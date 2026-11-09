@@ -27,12 +27,25 @@ device on purpose (``nonzero``, ``.item()``) and must never be imported by the p
 The functions are the code of ``LinearBucketTable._bucketize_and_pad``,
 ``_deterministic_insert``, ``_deterministic_insert_and_evict`` and
 ``_deterministic_insert_and_evict_with_overflow`` of the tree before the change
-(355a1f61), verbatim, with these mechanical edits only: ``self`` is ``table``,
-``self.bucketize_keys`` is the extension call it made, and the pre-filter of
-``bucketize_and_pad`` also drops the keys of a table without buckets (see there).
+(355a1f61), with these edits only: ``self`` is ``table``, ``self.bucketize_keys`` is the
+extension call it made, the pre-filter of ``bucketize_and_pad`` also drops the keys of a table
+without buckets (see there), and the waves hold what they took (below).
+
+The waves hold what they took. The ordinary insert kernel leaves every slot it takes locked
+until the end of the call, so a key of a call is never evicted by a later key of the call; each
+launch of the waves ended with its own unlock, so a later wave could evict a newcomer of an
+earlier one, which the cache and ``HybridStorage`` write back wrongly (the sorted insert does
+not do it, see I3 of sorted_insert.cuh). After every wave but the last the oracle therefore pins
+the slots the keys of that wave hold with the reference counter of the table, which the
+eviction scan skips exactly as it skips a locked slot, and it removes the pins after the last
+wave. That needs a table built with ``use_ref_counter=True``; the counters are all zero outside
+the oracle's own pins, so the table decides as one without counters does. What this oracle
+gives is the sorted insert's result bit for bit, except the overflow bucket of a call with more
+than one spill per table: the waves apply a table's spills one launch at a time, the overflow
+pass of the sorted insert in one thread.
 """
 
-from typing import Optional, Tuple, Union
+from typing import List, Optional, Tuple, Union
 
 import torch
 from dynamicemb import sync_free as sf
@@ -43,6 +56,34 @@ from dynamicemb_extensions import (
     table_insert_and_evict,
     table_lookup,
 )
+
+
+class _Pins:
+    """The slots the waves have taken, pinned until the last wave is done.
+
+    ``keep`` pins what the keys of one wave hold in the table (``slots_of`` gives ``-1`` for a
+    key that holds no slot: refused, reserved, or placed in the overflow bucket, and the
+    counter kernel skips it); ``release`` removes every pin.
+    """
+
+    def __init__(self, table):
+        if table._ref_counter is None:
+            raise RuntimeError(
+                "the wave oracle pins the slots a wave took with the reference counters of "
+                "the table: build its table with use_ref_counter=True"
+            )
+        self.table = table
+        self.pinned: List[Tuple[torch.Tensor, torch.Tensor]] = []
+
+    def keep(self, keys: torch.Tensor, table_ids: torch.Tensor) -> None:
+        slots = self.table.slots_of(keys, table_ids)
+        self.table.increment_counter(slots, table_ids)
+        self.pinned.append((slots, table_ids))
+
+    def release(self) -> None:
+        for slots, table_ids in self.pinned:
+            self.table.decrement_counter(slots, table_ids)
+        self.pinned.clear()
 
 
 def bucketize_and_pad(
@@ -156,6 +197,7 @@ def insert(
         return torch.empty(0, dtype=torch.int64, device=keys.device)
 
     keys_t, tids_t, scores_t = bucketize_and_pad(table, keys, table_ids, score_value)
+    pins = _Pins(table)
     for i in range(keys_t.size(0)):
         # The rows are passed as padded: the pad key is reserved, so its lanes
         # take no part in the insert (Illegal), and there is nothing to read
@@ -171,6 +213,9 @@ def insert(
             policy,
             table._ref_counter,
         )
+        if i + 1 < keys_t.size(0):
+            pins.keep(keys_t[i], tids_t[i])
+    pins.release()
 
     _, _, indices = table_lookup(
         table.table_storage_,
@@ -241,6 +286,7 @@ def insert_and_evict(
     evicted_tids_buf = torch.full((size,), -1, dtype=torch.int64, device=device)
     num_evicted_accum = torch.zeros(1, dtype=torch.int64, device=device)
     lane = torch.arange(width, device=device)
+    pins = _Pins(table)
     for i in range(keys_t.size(0)):
         (
             _wave_idx,
@@ -266,6 +312,9 @@ def insert_and_evict(
         evicted_scores_buf[dst] = ev_scores
         evicted_tids_buf[dst] = ev_tids
         num_evicted_accum += num_ev
+        if i + 1 < keys_t.size(0):
+            pins.keep(keys_t[i], tids_t[i])
+    pins.release()
 
     _, _, indices = table_lookup(
         table.table_storage_,
@@ -346,6 +395,7 @@ def insert_and_evict_with_overflow(
     evicted_tids_buf = torch.full((size,), -1, dtype=torch.int64, device=device)
     num_evicted_accum = torch.zeros(1, dtype=torch.int64, device=device)
     lane = torch.arange(width, device=device)
+    pins = _Pins(table)
     for i in range(keys_t.size(0)):
         (
             _wave_idx,
@@ -376,6 +426,9 @@ def insert_and_evict_with_overflow(
         evicted_scores_buf[dst] = ev_scores
         evicted_tids_buf[dst] = ev_tids
         num_evicted_accum += num_ev
+        if i + 1 < keys_t.size(0):
+            pins.keep(keys_t[i], tids_t[i])
+    pins.release()
 
     _, _, indices = table_lookup(
         table.table_storage_,

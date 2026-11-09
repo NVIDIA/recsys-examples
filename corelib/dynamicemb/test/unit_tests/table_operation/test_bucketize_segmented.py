@@ -283,8 +283,13 @@ def test_the_compact_bucketize_skips_the_keys_of_a_last_table_without_buckets(
     """``bucketize_keys`` sends a key of a table without buckets to the first bucket of the
     next table, which for the last table is one past the end. It used to write its
     ``buckets_end`` / ``mask`` entries there, out of bounds; now those keys sort last and
-    no offset covers them."""
-    geometry = Geometry([2, 0], 16)
+    no offset covers them. 64 buckets, so that the int64 array of ``buckets_end`` fills its
+    512-byte block of the caching allocator and the old write landed in the next block (with
+    fewer it went into the padding of its own and nothing showed); a sure check is a memory
+    checker with the allocator off:
+    ``PYTORCH_NO_CUDA_MEMORY_CACHING=1 compute-sanitizer --tool memcheck pytest -q -x -k
+    last_table_without_buckets test_bucketize_segmented.py``."""
+    geometry = Geometry([64, 0], 16)
     n = 200
     rng = random.Random(11)
     values = rng.sample(range(1, 10**6), n)

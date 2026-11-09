@@ -9,7 +9,7 @@ pytest test/unit_tests/table_operation/test_multitable_ref_counter.py -s
 
 pytest test/unit_tests/table_operation/test_async_count.py -s
 
-pytest test/unit_tests/table_operation/test_determinism_stage1.py -s
+pytest test/unit_tests/table_operation/test_determinism_mode.py -s
 
 pytest test/unit_tests/table_operation/test_bucketize_segmented.py -s
 

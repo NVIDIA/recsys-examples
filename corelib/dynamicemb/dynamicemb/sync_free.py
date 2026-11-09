@@ -71,6 +71,10 @@ INIT_SKIPS_NEGATIVE: bool = _extension_flag("initializer_skips_negative_index")
 PADDED_OPT_SKIPS_NEGATIVE: bool = _extension_flag(
     "padded_optimizer_skips_negative_table_id"
 )
+# table_insert_sorted / table_insert_and_evict_sorted exist: DEMB_DETERMINISM_MODE
+# inserts with them. A build without them has no fallback (a data-dependent number of
+# launches cannot be made without a read): the mode raises and says to rebuild.
+SORTED_INSERT: bool = _extension_flag("sorted_insert")
 
 # How a step decides whether its miss path has to run:
 #   "read":   one blocking read of the miss count;
@@ -78,7 +82,7 @@ PADDED_OPT_SKIPS_NEGATIVE: bool = _extension_flag(
 #   "always": launch it every step and read nothing.
 # "always" is the default: a step whose keys all hit runs the miss path on inert rows,
 # which changes nothing, and the CPU never waits for the GPU. DYNAMICEMB_MISS_PATH_GATE
-# selects another mode, and an external storage or determinism mode use "read".
+# selects another mode, and an external storage uses "read".
 _MISS_GATE_MODES = ("always", "poll", "read")
 _DEFAULT_MISS_GATE = "always"
 
@@ -439,13 +443,13 @@ def read_now(*dev_tensors: torch.Tensor) -> List[torch.Tensor]:
     """THE blocking read: the host needs these values now.
 
     Only inherent syncs come here: an external parameter server or user class
-    that wants host sizes, a public API that returns host data, determinism
-    mode, exact growth, the "read" miss gate. The tensors are flattened, cast to
-    int64 and concatenated on the current stream, copied to host in one pinned
-    transfer, and waited for with one event. Returns CPU int64 tensors shaped like
-    the inputs; a CPU input is returned as it is. The pinned buffer is reused
-    (one per thread and device, grown to the largest request), so a steady state
-    allocates nothing; the results do not alias it.
+    that wants host sizes, a public API that returns host data (the host count of
+    ``insert_and_evict``), exact growth, the "read" miss gate. The tensors are
+    flattened, cast to int64 and concatenated on the current stream, copied to
+    host in one pinned transfer, and waited for with one event. Returns CPU int64
+    tensors shaped like the inputs; a CPU input is returned as it is. The pinned
+    buffer is reused (one per thread and device, grown to the largest request), so
+    a steady state allocates nothing; the results do not alias it.
 
     ``READ_NOW_CALLS`` counts the calls.
     """
@@ -586,14 +590,14 @@ class StagedUpload:
 def miss_gate_mode(rng: bool, ps: bool = False) -> str:
     """How this step decides whether to launch its miss path: always, poll or read.
 
-    "read" under determinism mode, which already syncs and must not run its wave
-    loop for nothing, and with an external parameter server, which needs the count
-    anyway. Otherwise ``MISS_GATE``, except that "poll" becomes "always" when the
-    miss path draws random numbers (``rng``): a seeded probabilistic admitter must
-    not consume a timing-dependent number of draws, while "read" is exact and so
-    reproducible.
+    "read" with an external parameter server, which needs the count anyway.
+    Otherwise ``MISS_GATE``, except that "poll" becomes "always" when the miss path
+    draws random numbers (``rng``): a seeded probabilistic admitter must not consume
+    a timing-dependent number of draws, while "read" is exact and so reproducible.
+    The determinism mode does not change the gate: its inserts read nothing, so an
+    "always" step that finds no miss costs a few launches and no wait.
     """
-    if ps or os.environ.get("DEMB_DETERMINISM_MODE") is not None:
+    if ps:
         return "read"
     if rng and MISS_GATE == "poll":
         return "always"

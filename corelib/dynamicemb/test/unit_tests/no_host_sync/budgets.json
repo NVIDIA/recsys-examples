@@ -223,17 +223,32 @@
   "growth": {"plain": 4.125, "prefetch": 4.125}
  },
  "cache_storage_determ": {
-  "all_hit": {"plain": 1, "prefetch": 1},
-  "miss": {"plain": 7, "prefetch": 7},
-  "miss_evict": {"plain": 7, "prefetch": 7},
-  "tier2_hit": {"plain": 5, "prefetch": 5},
+  "all_hit": {"plain": 0, "prefetch": 0},
+  "miss": {"plain": 0, "prefetch": 0},
+  "miss_evict": {"plain": 0, "prefetch": 0},
+  "tier2_hit": {"plain": 0, "prefetch": 0},
   "eval": {"plain": 0},
   "eval_miss": {"plain": 0}
  },
  "hbm_only_determ": {
-  "all_hit": {"plain": 1, "prefetch": 1},
-  "miss": {"plain": 4, "prefetch": 4},
-  "miss_evict": {"plain": 4, "prefetch": 4},
+  "all_hit": {"plain": 0, "prefetch": 0},
+  "miss": {"plain": 0, "prefetch": 0},
+  "miss_evict": {"plain": 0, "prefetch": 0},
+  "eval": {"plain": 0},
+  "eval_miss": {"plain": 0}
+ },
+ "hybrid_determ": {
+  "all_hit": {"plain": 0, "prefetch": 0},
+  "miss": {"plain": 0, "prefetch": 0},
+  "miss_evict": {"plain": 0, "prefetch": 0},
+  "tier2_hit": {"plain": 0, "prefetch": 0},
+  "eval": {"plain": 0},
+  "eval_miss": {"plain": 0}
+ },
+ "cache_storage_admit_determ": {
+  "all_hit": {"plain": 0, "prefetch": 0},
+  "miss": {"plain": 0, "prefetch": 0},
+  "miss_evict": {"plain": 0, "prefetch": 0},
   "eval": {"plain": 0},
   "eval_miss": {"plain": 0}
  }
