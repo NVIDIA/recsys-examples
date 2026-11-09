@@ -2029,6 +2029,20 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
         with open(meta_file_path, "w") as meta_file:
             json.dump(meta_data, meta_file, indent=4)
 
+    def _checkpoint_timestamp(self) -> int:
+        """The device clock a checkpoint takes the ages of its scores against.
+
+        A wait for the device, so it is read once per call, not per table, and not at all
+        when no score is a timestamp: the in-tree storages only look at it for a table
+        that evicts by recency, and ignore the 0 they are given otherwise.
+        """
+        if isinstance(self._storage, (DynamicEmbStorage, HybridStorage)) and not any(
+            option.evict_strategy == DynamicEmbEvictStrategy.LRU
+            for option in self._dynamicemb_options
+        ):
+            return 0
+        return device_timestamp()
+
     def dump(
         self,
         save_dir: str,
@@ -2048,6 +2062,7 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
         self.flush()
 
         counter_table = self._admission_counter
+        ts: Optional[int] = None
         for table_id, table_name in enumerate(self._table_names):
             if table_name not in set(table_names):
                 continue
@@ -2074,7 +2089,8 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
 
             storage = self._storage
             self._shard_barrier(pg)
-            ts = device_timestamp()
+            if ts is None:
+                ts = self._checkpoint_timestamp()
             storage.dump(
                 table_id,
                 meta_file_path,

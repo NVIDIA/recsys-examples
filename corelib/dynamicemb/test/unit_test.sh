@@ -61,6 +61,7 @@ FWD_BWD_TEST_FILES=(
     "test/unit_tests/no_host_sync/test_explicit_api_syncs.py"
     "test/unit_tests/no_host_sync/test_pop_one_pass.py"
     "test/unit_tests/no_host_sync/test_flush_masked.py"
+    "test/unit_tests/no_host_sync/test_dump_pipelined.py"
 )
 
 LOAD_DUMP_TEST_FILES=(

@@ -1975,6 +1975,18 @@ ALLOWED_NEW_HITS: List[Tuple[str, Optional[str], str]] = [
         "_all_gather_evicted_many: a single rank returns what it was given on the host (the keys "
         "of a pop are host tensors, so nothing is copied); the helper's result is host data",
     ),
+    (
+        "dynamicemb/key_value_table.py",
+        "numpy",
+        "_dump_table writes the pinned host batches that pull_live_prefixes brought over, one "
+        "wait per batch: a checkpoint file is host data by contract",
+    ),
+    (
+        "dynamicemb/scored_hashtable.py",
+        "numpy",
+        "LinearBucketTable.dump (the admission counter's checkpoint) writes the pinned host "
+        "batches that pull_live_prefixes brought over, one wait per batch",
+    ),
 ]
 
 
@@ -2023,6 +2035,56 @@ EXPECTED_GONE: List[Tuple[str, str, str, str]] = [
         "unique",
         "out = torch.unique(keys[mask], dim=0 if keys.dim() > 1 else None)",
         "E5",
+    ),
+    # E2: a dump copies the live rows of a batch to pinned memory (one wait per batch) instead
+    # of a pageable copy per column
+    (
+        "dynamicemb/key_value_table.py",
+        "cpu",
+        "fkey.write(keys.cpu().numpy().tobytes())",
+        "E2",
+    ),
+    (
+        "dynamicemb/key_value_table.py",
+        "numpy",
+        "fkey.write(keys.cpu().numpy().tobytes())",
+        "E2",
+    ),
+    (
+        "dynamicemb/key_value_table.py",
+        "cpu",
+        "fscore.write(scores.cpu().numpy().tobytes())",
+        "E2",
+    ),
+    (
+        "dynamicemb/key_value_table.py",
+        "numpy",
+        "fscore.write(scores.cpu().numpy().tobytes())",
+        "E2",
+    ),
+    (
+        "dynamicemb/scored_hashtable.py",
+        "cpu",
+        "fkey.write(keys.cpu().numpy().tobytes())",
+        "E2",
+    ),
+    (
+        "dynamicemb/scored_hashtable.py",
+        "numpy",
+        "fkey.write(keys.cpu().numpy().tobytes())",
+        "E2",
+    ),
+    (
+        "dynamicemb/scored_hashtable.py",
+        "cpu",
+        "fscores[name].write(scores.cpu().numpy().tobytes())",
+        "E2",
+    ),
+    (
+        "dynamicemb/scored_hashtable.py",
+        "numpy",
+        "fscores[name].write(scores.cpu().numpy().tobytes())",
+        "E2",
     ),
     # E1: the overflow offset of an export is the host list the device tensor was built from
     (

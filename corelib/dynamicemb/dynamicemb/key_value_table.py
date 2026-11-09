@@ -64,6 +64,7 @@ from dynamicemb.scored_hashtable import (
     ScorePolicy,
     ScoreSpec,
     get_scored_table,
+    pull_live_prefixes,
 )
 from dynamicemb.types import (
     EMBEDDING_TYPE,
@@ -2771,6 +2772,71 @@ def export_keys_values_iter(
         )
 
 
+def _dump_batches(
+    state: DynamicEmbTableState,
+    table_id: int,
+    include_optim: bool,
+    batch_size: int = 65536,
+) -> Iterator[Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], torch.Tensor]]:
+    """What :func:`export_keys_values_iter` yields for a table, as HOST tensors and with
+    one wait for the device per batch (see :func:`pull_live_prefixes`).
+
+    The batches are exported at full length, with their count on the device; the
+    embeddings (and the optimizer state, when ``include_optim`` wants it) are gathered
+    for every lane, a lane past the count at row ``-1``, which the gather skips. Only the
+    first ``count`` rows of the keys, the values and the scores are copied to the host,
+    where the optimizer state is split off the values and the score columns are put in the
+    user's order. Yields ``(keys, embeddings, opt_states, scores)`` for each batch that
+    holds a key: ``keys`` are int64, ``opt_states`` is ``None`` unless ``include_optim``
+    and the table keeps one, ``scores`` are int64 ``[n]`` or ``[n, num_scores]``.
+    """
+    emb_dim_t = state.table_emb_dims_cpu[table_id]
+    optim_state_dim = state.table_value_dims_cpu[table_id] - emb_dim_t
+    with_opt = include_optim and optim_state_dim != 0
+    key_index_map = state.key_index_map
+    num_scores = key_index_map.num_scores_
+    dump_perm = None
+    if num_scores > 1:
+        # Multi-word score layouts (e.g. LruLfu: timestamp + frequency) must persist ALL
+        # words, not just the exported column, so the checkpoint can restore them exactly,
+        # in the user's configured (logical) order. Identity when it is the physical one.
+        dump_perm = score_dump_permutation(state.options_list[table_id].score_strategy)
+        if dump_perm == list(range(num_scores)):
+            dump_perm = None
+
+    def launches():
+        for count, keys, scores, slots in key_index_map._export_batches_masked(
+            table_id, batch_size
+        ):
+            rows = key_index_map._rows_of(
+                slots, torch.full_like(slots, table_id), False
+            )
+            values = load_from_flat_single_table(state, rows, table_id)
+            if num_scores > 1:
+                # score blocks are keyed by slot, the values by row (the same thing unless
+                # the table stores rows); a slot of -1 gives zeros
+                scores = key_index_map.gather_score_blocks(table_id, slots)
+            # the embedding columns of the value rows are a strided view: only the rows
+            # that are copied are made contiguous
+            yield count, [
+                sf.as_i64(keys),
+                values if with_opt else values[:, :emb_dim_t],
+                scores,
+            ]
+
+    for n, (keys, values, scores) in pull_live_prefixes(launches()):
+        if n == 0:
+            continue
+        if dump_perm is not None:
+            scores = scores[:, dump_perm].contiguous()
+        yield (
+            keys,
+            values[:, :emb_dim_t] if with_opt else values,
+            values[:, -optim_state_dim:] if with_opt else None,
+            scores,
+        )
+
+
 def _dump_table(
     state: DynamicEmbTableState,
     table_id: int,
@@ -2785,7 +2851,6 @@ def _dump_table(
     current_score: Optional[int] = None,
     append: bool = False,
 ) -> None:
-    device = torch.device(f"cuda:{torch.cuda.current_device()}")
     if not append and include_meta:
         meta_data = {}
         meta_data.update(state.optimizer.get_opt_args())
@@ -2816,14 +2881,15 @@ def _dump_table(
     fscore = open(score_file_path, mode)
     fopt_states = open(opt_file_path, mode) if include_optim else None
 
-    for keys, embeddings, opt_states_batch, scores in export_keys_values_iter(
-        state, device=device, table_id=table_id
+    # One wait for the device per batch, and only the keys the table holds are copied.
+    for keys, embeddings, opt_states_batch, scores in _dump_batches(
+        state, table_id, include_optim
     ):
-        fkey.write(keys.cpu().numpy().tobytes())
+        fkey.write(keys.numpy().tobytes())
         fembedding.write(_raw_bytes(embeddings))
         if state.evict_strategy == EvictStrategy.KLru:
             scores = timestamp - scores
-        fscore.write(scores.cpu().numpy().tobytes())
+        fscore.write(scores.numpy().tobytes())
         if fopt_states and opt_states_batch is not None:
             to_write = state.optimizer.states_for_checkpoint(
                 opt_states_batch,
