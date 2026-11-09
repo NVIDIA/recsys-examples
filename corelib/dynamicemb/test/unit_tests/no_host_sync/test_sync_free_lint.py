@@ -1908,6 +1908,54 @@ ALLOWED_NEW_HITS: List[Tuple[str, Optional[str], str]] = [
         None,
         "the audited home of every read that remains: read_now, DeferredRead.wait, pull_to_host",
     ),
+    (
+        "dynamicemb/batched_dynamicemb_tables.py",
+        "any_all_in_cond",
+        "_check_scores_now: the check for scores the host holds, or a module without a ring; "
+        "the late check of a CUDA score goes through the ring",
+    ),
+    (
+        "dynamicemb/key_value_table.py",
+        "blocking_copy",
+        "a docstring that names non_blocking=False (the exact growth confirmation), not a call",
+    ),
+    (
+        "dynamicemb/key_value_table.py",
+        "flagged_compact",
+        "_compact_missing: the one read of the public Storage.find, whose contract returns a "
+        "host count; a caller that can mask uses lookup_masked",
+    ),
+    (
+        "dynamicemb/key_value_table.py",
+        "tolist",
+        "rows_est and unique_size_per_table are CPU tensors (the host's growth estimates): "
+        "no device read",
+    ),
+    (
+        "dynamicemb/scored_hashtable.py",
+        "item",
+        "DEMB_DETERMINISM_MODE reads the count of the evictions it accumulated over its waves: "
+        "inherent to that opt-in mode",
+    ),
+    (
+        "dynamicemb/scored_hashtable.py",
+        "nonzero",
+        "DEMB_DETERMINISM_MODE drops the reserved keys of a batch before it buckets them: "
+        "one read in that opt-in mode",
+    ),
+    (
+        "dynamicemb/scored_hashtable.py",
+        "repeat_interleave",
+        "the call passes output_size on its next line (the lint sees the first line of a "
+        "multi-line call)",
+    ),
+    (
+        "dynamicemb/key_value_table.py",
+        "pin_memory",
+        "construction-time pinned buffers (create_table_state, the size snapshot rings): "
+        "allocated once, never in a step; the estimated_row_counts line existed before and "
+        "black joined its lines",
+    ),
 ]
 
 
