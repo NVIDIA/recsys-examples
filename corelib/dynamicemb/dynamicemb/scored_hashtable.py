@@ -57,6 +57,15 @@ from dynamicemb_extensions import (
 REHASH_CHUNK_SLOTS = 1 << 20
 
 
+def rehash_chunk_buckets(
+    num_buckets: int, bucket_capacity: int, chunk_slots: int = REHASH_CHUNK_SLOTS
+) -> int:
+    """How many buckets one chunk of the rehash of a table of ``num_buckets`` buckets
+    covers: ``chunk_slots`` slots as whole buckets, at least one and at most the table.
+    """
+    return max(1, min(num_buckets, chunk_slots // bucket_capacity))
+
+
 @dataclass(frozen=True)
 class ScoreSpec:
     name: str
@@ -1061,7 +1070,7 @@ class LinearBucketTable(ScoredHashTable):
         n_b0 = self.bucket_offsets_host_[table_id]
         src_base = o_b0 * cap
         dst_base = n_b0 * cap
-        chunk_buckets = max(1, min(o_nb, chunk_slots // cap))
+        chunk_buckets = rehash_chunk_buckets(o_nb, cap, chunk_slots)
         table_ids = torch.full(
             (chunk_buckets * cap,), table_id, dtype=torch.int64, device=self.device
         )

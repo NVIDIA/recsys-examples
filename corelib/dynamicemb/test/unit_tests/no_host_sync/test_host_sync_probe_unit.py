@@ -267,9 +267,12 @@ def test_check_zero_site_level_and_case_level_inherent():
         and "synthetic_ps/miss/plain" in bad[0]
     ), bad
     assert "key_value_table.py" in bad[0] or "dynamicemb" in bad[0]
-    # a growth case is excused as a whole
-    g = result_of("hbm_only_growth", "growth")
+    # an external-PS case is excused as a whole
+    g = result_of("cache_ps", "miss")
     assert g["inherent"] and hsp.check_zero(report_of(g)) == []
+    # table growth is not excused: the same numbers are a violation
+    grew = result_of("hbm_only_growth", "growth")
+    assert not grew["inherent"] and len(hsp.check_zero(report_of(grew))) == 1
     # the same numbers in a non-inherent scenario are a violation
     n = result_of("hbm_only", "all_hit")
     assert len(hsp.check_zero(report_of(n))) == 1
@@ -292,13 +295,22 @@ def test_check_zero_site_level_and_case_level_inherent():
 
 
 def test_inherent_matching():
-    # I4, growth events
-    assert hsp.inherent_reason("hbm_only_growth", "growth")
-    assert hsp.inherent_reason("cache_storage_growth", "miss")
-    assert hsp.inherent_reason("hbm_only_noevict", "miss")
-    assert (
-        hsp.inherent_reason("hbm_only_growth", "all_hit") is None
-    )  # a steady state step does not grow a table
+    # table growth is not inherent: a growth is queued, ordered against the other streams
+    # and reads nothing back, in every layout and in the scenarios that grow a table
+    for config in (
+        "hbm_only_growth",
+        "cache_storage_growth",
+        "host_only_growth",
+        "hbm_only_noevict",
+        "cache_storage_noevict",
+        "hybrid_growth",
+        "host_only_noevict",
+        "hbm_only_growth_wide",
+        "host_only_growth_wide",
+        "hbm_only_noevict_wide",
+    ):
+        for scenario in hsp.SCENARIO_DOC:
+            assert hsp.inherent_reason(config, scenario) is None, (config, scenario)
     assert hsp.inherent_reason("hbm_only", "miss") is None
     # I1, the external PS, in every scenario: the dedup and miss counts are read before each PS call
     assert hsp.inherent_reason("cache_ps", "all_hit")
@@ -318,11 +330,38 @@ def test_inherent_matching():
         "hybrid_retain",
     ):
         for scenario in hsp.SCENARIO_DOC:
-            if scenario != "growth":
-                assert hsp.inherent_reason(config, scenario) is None, (config, scenario)
+            assert hsp.inherent_reason(config, scenario) is None, (config, scenario)
     assert (
         hsp.inherent_site_globs("cache_ps_sum", "miss") == []
     )  # no call-site level entry today
+
+
+def test_the_wide_growth_configs_cross_the_vmm_granule_and_the_narrow_ones_do_not():
+    """A device value buffer is mapped in granules of 2 MiB and a growth inside the granule
+    already mapped never reaches the driver calls that could wait (cuMemMap, cuMemSetAccess):
+    the rows of the default width stay under it in the growth window, the wide ones do not.
+    """
+    granule = 2 << 20
+    window_rows = 8192  # the most rows a table holds in the growth window (see plan_of)
+    for name, cfg in hsp.CONFIGS.items():
+        if not cfg.growth:
+            continue
+        dim = cfg.dim or hsp.DIM
+        crosses = window_rows * dim * 4 > granule
+        assert crosses == name.endswith("_wide"), (name, dim)
+    for name in (
+        "hbm_only_growth_wide",
+        "host_only_growth_wide",
+        "hbm_only_noevict_wide",
+    ):
+        assert hsp.CONFIGS[name].growth and hsp.CONFIGS[name].dim > hsp.DIM
+
+
+def test_the_growth_configs_cover_every_layout_that_grows():
+    layouts = {c.layout for c in hsp.CONFIGS.values() if c.growth}
+    assert layouts == {"cache", "hbm", "host", "hybrid"}
+    noevict = {c.layout for c in hsp.CONFIGS.values() if c.growth and c.noevict}
+    assert noevict == {"cache", "hbm", "host"}  # HybridStorage cannot hold NO_EVICTION
 
 
 def test_every_inherent_entry_excuses_a_case_the_probe_measures():

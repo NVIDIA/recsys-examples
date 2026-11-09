@@ -77,7 +77,19 @@ class ExtendableBuffer(abc.ABC):
 
     @abc.abstractmethod
     def extend(self, shape: Union[List[int], Tuple[int, ...]]) -> None:
-        """Extend buffer by the number of elements given by product(shape)."""
+        """Extend buffer by the number of elements given by product(shape).
+
+        Does not wait for the device. The pages that are already there are neither
+        unmapped nor moved, so kernels queued on them are not affected; whoever
+        uses the new pages from another stream orders itself after the growth that
+        made them (``GrowthOrder``)."""
+
+    def check_extend(self, shape: Union[List[int], Tuple[int, ...]]) -> None:
+        """Raise, before anything has changed, if ``extend(shape)`` is known to fail for a
+        reason that needs no attempt (a host buffer that would outgrow the address space
+        it reserved). A caller that grows several buffers for one decision checks them
+        all first, so that the one that cannot grow does not leave the others grown. The
+        base class knows no such reason."""
 
     @abc.abstractmethod
     def tensor(self) -> torch.Tensor:
@@ -137,7 +149,6 @@ class DeviceExtendableBuffer(ExtendableBuffer):
         numel_add = _shape_to_numel(shape)
         if numel_add <= 0:
             return
-        torch.cuda.synchronize()
         new_logical_numel = _shape_to_numel(self._shape) + numel_add
         self.vmm_tensor.extend(new_logical_numel)
         self._shape = _merge_extend_shape(self._shape, shape, numel_add)
@@ -174,29 +185,50 @@ class HostExtendableBuffer(ExtendableBuffer):
         else:
             self.vmm_tensor = HostVMMTensor(numel, dtype, device_id)
 
-    def extend(self, shape: Union[List[int], Tuple[int, ...]]) -> None:
-        numel_add = _shape_to_numel(shape)
-        if numel_add <= 0:
-            return
+    def _require_in_place(self) -> None:
         if not _HOST_IN_PLACE:
             raise RuntimeError(
                 "growing a host value buffer needs a dynamicemb_extensions that grows it "
                 "in place (HostVMMTensor takes the number of elements to reserve); "
                 "rebuild it: python setup.py build_ext --inplace"
             )
-        torch.cuda.synchronize()
+
+    @staticmethod
+    def _beyond_reservation(detail: str) -> RuntimeError:
+        return RuntimeError(
+            f"{detail}. A host value buffer grows inside the address range it reserved "
+            "when it was created: a table that evicts reserves its max_capacity, "
+            "one that never evicts DYNAMICEMB_HOST_RESERVE_FACTOR times its "
+            "max_capacity (at least 64 GiB); raise either."
+        )
+
+    def check_extend(self, shape: Union[List[int], Tuple[int, ...]]) -> None:
+        """Raise, with the buffer untouched, if ``extend(shape)`` needs an extension that
+        cannot grow it in place or more address space than it reserved."""
+        numel_add = _shape_to_numel(shape)
+        if numel_add <= 0:
+            return
+        self._require_in_place()
+        needed = (_shape_to_numel(self._shape) + numel_add) * self.element_size
+        reserved = self.reserved_bytes()
+        if needed > reserved:
+            raise self._beyond_reservation(
+                f"growing a host value buffer to {needed} bytes needs more address "
+                f"space than the {reserved} bytes reserved when it was created"
+            )
+
+    def extend(self, shape: Union[List[int], Tuple[int, ...]]) -> None:
+        numel_add = _shape_to_numel(shape)
+        if numel_add <= 0:
+            return
+        self.check_extend(shape)
         new_logical_numel = _shape_to_numel(self._shape) + numel_add
         try:
             self.vmm_tensor.extend(new_logical_numel)
         except RuntimeError as exc:
             if "address space" not in str(exc):
                 raise
-            raise RuntimeError(
-                f"{exc}. A host value buffer grows inside the address range it reserved "
-                "when it was created: a table that evicts reserves its max_capacity, "
-                "one that never evicts DYNAMICEMB_HOST_RESERVE_FACTOR times its "
-                "max_capacity (at least 64 GiB); raise either."
-            ) from exc
+            raise self._beyond_reservation(str(exc)) from exc
         self._shape = _merge_extend_shape(self._shape, shape, numel_add)
 
     def reserved_bytes(self) -> int:

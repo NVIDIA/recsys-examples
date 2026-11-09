@@ -372,6 +372,10 @@ def test_vmm_buffer(init_capacity, dtype, buffer_cls):
 
             # synchronize is necessary to avoid IMA, we will add device synchronization to extend.
             # stream synchronization and device synchronization in C++ not worked.
+            # (That was the state of extend when this was written. It no longer waits for the
+            # device: test_extend_does_not_wait_for_a_running_kernel and the hardware gates
+            # in growth/gates look at it under load. The synchronize stays so that a fault
+            # shows in the iteration that caused it.)
             torch.cuda.synchronize()
 
             logical_b = buffer.num_bytes()
@@ -525,6 +529,58 @@ def test_a_failed_growth_leaves_the_buffer_usable():
     assert "REFUSED" in child.stdout and "USABLE" in child.stdout, (
         child.stdout + child.stderr
     )
+
+
+@requires_cuda
+@pytest.mark.parametrize("buffer_cls", _EXTENDABLE_BUFFER_PARAMS)
+@pytest.mark.parametrize("growth", [1 << 10, 1 << 22], ids=["small", "many_pages"])
+def test_extend_does_not_wait_for_a_running_kernel(buffer_cls, growth):
+    """``extend`` returns while a kernel that is running on the buffer has not finished.
+
+    Whether a driver call waits for the kernels in flight is not something to read off a
+    profiler's names, so the test looks at the time the host comes back: a long sleep runs
+    on a stream, a kernel that reads and writes every old element is queued behind it, and
+    the host grows the buffer meanwhile. If ``extend`` waited for the device the sleep
+    would be over when it returned. The pages that were mapped before must not be hurt
+    (the kernel after the sleep runs on them) and the new ones must be usable at once, by a
+    kernel on another stream.
+    """
+    if buffer_cls is HostExtendableBuffer and not extendable_tensor._HOST_IN_PLACE:
+        pytest.skip("growing a host buffer needs the rebuilt extension")
+    device = _cuda_device()
+    old = 1 << 20
+    buf = buffer_cls((old,), torch.float32, device)
+    stream, other = torch.cuda.Stream(), torch.cuda.Stream()
+    view = buf.tensor().reshape(-1)
+    # launch every kernel once first: with lazy loading the first launch of a kernel can
+    # wait for the kernels that are already running
+    view.zero_()
+    view.add_(1.0)
+    view.zero_()
+    scratch = torch.empty(16, device=device)
+    scratch.fill_(0.0)
+    torch.cuda._sleep(1)
+    torch.cuda.synchronize()
+
+    with torch.cuda.stream(stream):
+        torch.cuda._sleep(_gpu_delay_cycles(device))
+        view.add_(
+            1.0
+        )  # queued behind the sleep: runs on the pages after extend returned
+        done = torch.cuda.Event()
+        done.record(stream)
+    buf.extend((growth,))
+    returned_while_running = not done.query()
+    tail = buf.tensor().reshape(-1)[old:]
+    with torch.cuda.stream(other):
+        tail.fill_(3.0)
+    torch.cuda.synchronize()
+
+    assert returned_while_running, "extend waited for the device"
+    assert buf.numel() == old + growth
+    everything = buf.tensor().reshape(-1)
+    assert bool((everything[:old] == 1.0).all()), "the old pages were hurt by extend"
+    assert bool((everything[old:] == 3.0).all()), "the new pages are not usable"
 
 
 if __name__ == "__main__":

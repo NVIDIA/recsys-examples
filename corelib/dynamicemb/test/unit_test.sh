@@ -28,15 +28,24 @@ FWD_BWD_TEST_FILES=(
     # A growth queues its kernels on one stream and returns; the order it keeps against
     # the streams that use the table (the logic needs no GPU).
     "test/unit_tests/growth/test_growth_order_logic.py"
+    # Every public method of a storage orders the stream after a growth or says why it
+    # need not (reads the source, no GPU).
+    "test/unit_tests/growth/test_growth_hooks.py"
     "test/unit_tests/growth/test_growth_order.py"
     # The rehash of a key map reads no count: key for key against the old table, in
     # chunks, and nothing waits for the device.
     "test/unit_tests/growth/test_rehash_padded.py"
+    # Why the values of a table that keeps them at the slot of their key can move one
+    # chunk at a time when it grows by a whole multiple (a model, no GPU).
+    "test/unit_tests/growth/test_value_move_model.py"
     # A host value buffer grows inside the address range it reserved: its address never
     # changes.
     "test/unit_tests/growth/test_host_value_buffer.py"
     # The real HostVMMTensor against a fake CUDA runtime: needs a C++ compiler, no GPU.
     "test/unit_tests/growth/host_only/test_host_only_vmm.py"
+    # The kernels of the rehash (table_carry_slot_state, table_carry_reclaimed_rows) against
+    # the pair they replaced, on the CPU: needs a C++ compiler, no GPU.
+    "test/unit_tests/growth/host_only/test_host_only_rehash_kernels.py"
     "test/unit_tests/no_host_sync/test_expand_async.py"
     "test/unit_tests/no_host_sync/test_outstanding_keys.py"
     "test/unit_tests/test_check_scores_late.py"

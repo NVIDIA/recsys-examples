@@ -15,6 +15,7 @@ allocation. The exact rule, which a checkpoint load applies (``exact=True`` of
 """
 
 import itertools
+import warnings
 from typing import List, Sequence
 
 import pytest
@@ -621,3 +622,21 @@ def test_the_exact_sizes_are_one_read(current_device, no_eviction, read_now_call
     assert sizes.tolist() == [100]
     assert (rows.tolist() == [150]) if no_eviction else (rows is None)
     assert not sizes.is_cuda
+
+
+def test_the_removed_exact_growth_switch_warns_and_changes_nothing(monkeypatch):
+    """DYNAMICEMB_EXACT_GROWTH made every decision wait for the device; no environment
+    variable may, so it is gone. A script that sets it is told, once, when the module is
+    imported, and keeps running on the estimate."""
+    monkeypatch.setenv("DYNAMICEMB_EXACT_GROWTH", "1")
+    with pytest.warns(UserWarning, match="DYNAMICEMB_EXACT_GROWTH was removed"):
+        kvt._warn_if_exact_growth_is_set()
+    for quiet in ("0", ""):
+        monkeypatch.setenv("DYNAMICEMB_EXACT_GROWTH", quiet)
+        with warnings.catch_warnings():
+            warnings.simplefilter("error")
+            kvt._warn_if_exact_growth_is_set()
+    monkeypatch.delenv("DYNAMICEMB_EXACT_GROWTH")
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        kvt._warn_if_exact_growth_is_set()

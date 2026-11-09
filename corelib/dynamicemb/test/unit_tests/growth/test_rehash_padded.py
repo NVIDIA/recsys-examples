@@ -284,20 +284,7 @@ def test_the_exact_length_api_still_carries_rows():
 # --- no count comes back, nothing is waited for --------------------------------------
 
 
-class _NoDeviceBarrier:
-    """``torch`` as ``extendable_tensor`` sees it, without the device-wide wait of
-    ``ExtendableBuffer.extend``: that wait is not what is under test here."""
-
-    def __init__(self):
-        import types
-
-        self.cuda = types.SimpleNamespace(synchronize=lambda *a, **k: None)
-
-    def __getattr__(self, name):
-        return getattr(torch, name)
-
-
-def option(on_host, no_eviction=False, lru_lfu=False, init_capacity=256):
+def option(on_host, no_eviction=False, lru_lfu=False, init_capacity=256, dim=16):
     strategy = (
         (DynamicEmbScoreStrategy.TIMESTAMP, DynamicEmbScoreStrategy.LFU)
         if lru_lfu
@@ -306,7 +293,7 @@ def option(on_host, no_eviction=False, lru_lfu=False, init_capacity=256):
         else DynamicEmbScoreStrategy.TIMESTAMP
     )
     return DynamicEmbTableOptions(
-        dim=16,
+        dim=dim,
         init_capacity=init_capacity,
         max_capacity=1 << 20,
         bucket_capacity=128,
@@ -322,14 +309,12 @@ def option(on_host, no_eviction=False, lru_lfu=False, init_capacity=256):
     "kind",
     ["hbm_rows", "host_rows", "no_eviction", "lru_lfu_rows", "hybrid_host_tier"],
 )
-def test_a_growth_reads_nothing_back(kind, monkeypatch):
+def test_a_growth_reads_nothing_back(kind):
     """Every kind of growth, under ``no_sync`` (``.item()``, ``.cpu()``, a device or
     stream wait: errors) and PyTorch's sync-debug mode, grows the table, and every key
-    keeps its value. ``sf.read_now`` is not called either."""
-    from dynamicemb import extendable_tensor
-
+    keeps its value. ``sf.read_now`` is not called either. ``ExtendableBuffer.extend``
+    is the real one: a ``torch.cuda.synchronize()`` put back into it fails here."""
     no_sync = _load_no_sync()
-    monkeypatch.setattr(extendable_tensor, "torch", _NoDeviceBarrier())
     on_host = kind in ("host_rows", "hybrid_host_tier")
     opt = option(
         on_host, no_eviction=kind == "no_eviction", lru_lfu=kind == "lru_lfu_rows"
@@ -371,11 +356,15 @@ def test_a_growth_reads_nothing_back(kind, monkeypatch):
     assert got[:, 0].tolist() == before.to(torch.float32).tolist()
 
 
+@pytest.mark.parametrize(
+    "target", [4096, 2944], ids=["a_whole_multiple", "not_a_multiple"]
+)
 @pytest.mark.parametrize("chunk_buckets", [1, 2])
-def test_values_follow_their_keys_across_chunks(chunk_buckets, monkeypatch):
+def test_values_follow_their_keys_across_chunks(chunk_buckets, target, monkeypatch):
     """A table whose value row is its slot moves the values of its live keys: each chunk
     loads, the stores come after the last load, so a store never lands on a row that was
-    not read yet -- with chunks of one and two buckets, where it would."""
+    not read yet -- with chunks of one and two buckets, where it would -- for a growth by
+    a whole multiple and for one by a size that is not."""
     real = LinearBucketTable.rehash_table_from
     monkeypatch.setattr(
         LinearBucketTable,
@@ -401,13 +390,124 @@ def test_values_follow_their_keys_across_chunks(chunk_buckets, monkeypatch):
     values = keys.to(torch.float32).unsqueeze(1).expand(-1, vdim).contiguous()
     kvt.store_to_flat_single_table(state, rows, 0, values)
 
-    kvt._expand_tables_impl(state, [True], [4096])
+    kvt._expand_tables_impl(state, [True], [target])
     torch.cuda.synchronize()
 
+    assert state.key_index_map.per_table_capacity_[0] == target
     founds, new_rows, _ = lookup(state.key_index_map, 0, keys)
     assert bool(founds.all())
     got = kvt.load_from_flat_single_table(state, new_rows, 0)
     assert torch.equal(got, values)
+
+
+# --- the staging of a value move is allocated before anything changes -----------------
+
+
+def values_state(slots, dim):
+    """The host tier of a hybrid storage: values on the host, a value row that is the
+    slot, no reference counter."""
+    return kvt.create_table_state(
+        [option(on_host=True, init_capacity=slots, dim=dim)],
+        AdamDynamicEmbeddingOptimizer(OptimizerArgs()),
+        use_rows=False,
+        use_ref_counter=False,
+    )
+
+
+def put_values(state, first, count):
+    keys = make_keys(first, count, torch.int64)
+    arg = ScoreArg(
+        name=state.score_policy.name,
+        value=torch.ones(count, dtype=torch.uint64, device=DEVICE),
+        policy=ScorePolicy.ASSIGN,
+    )
+    rows, _ = state.key_index_map.insert(
+        keys, torch.zeros_like(keys), arg, return_slots=True
+    )
+    vdim = state.table_value_dims_cpu[0]
+    values = keys.to(torch.float32).unsqueeze(1).expand(-1, vdim).contiguous()
+    kvt.store_to_flat_single_table(state, rows, 0, values)
+    return keys, values
+
+
+def test_a_doubling_stages_one_chunk_of_values_not_the_table(monkeypatch):
+    """A growth to a whole multiple of the size moves the values chunk by chunk: a key goes
+    to the bucket it was in or to one past the old table, so a chunk is stored before the
+    next is read. The growth peaks at one chunk of staging (here 1 MiB, against 25 MiB for
+    every slot of the old table) over its key map, whatever the table, and every key
+    keeps its value."""
+    monkeypatch.setattr(kvt, "REHASH_STAGING_BYTES", 1 << 20)
+    slots, dim = 1 << 15, 64
+    state = values_state(slots, dim)
+    keys, values = put_values(state, 90_000, 9_000)
+    whole_table = slots * state.table_value_dims_cpu[0] * 4
+    assert whole_table > 20 << 20
+    torch.cuda.synchronize()
+    torch.cuda.reset_peak_memory_stats()
+    base = torch.cuda.memory_allocated()
+
+    kvt._expand_tables_impl(state, [True], [2 * slots])
+    torch.cuda.synchronize()
+
+    peak = torch.cuda.max_memory_allocated() - base
+    # the staging, the key map of 2**16 slots (about 1 MiB) and the temporaries of a chunk
+    assert peak <= (1 << 20) + (6 << 20), (peak, whole_table)
+    founds, new_rows, _ = lookup(state.key_index_map, 0, keys)
+    assert bool(founds.all())
+    assert torch.equal(kvt.load_from_flat_single_table(state, new_rows, 0), values)
+
+
+def test_a_growth_that_is_not_a_multiple_stages_the_values_of_the_old_table():
+    """The last growth of a table, which ``max_capacity`` clamps, hashes its keys to
+    unrelated buckets: the values of every slot of the old table are staged in HBM, once
+    (the documented bound), and the staging is what the growth peaks at above its key map.
+    """
+    slots, dim = 1 << 14, 64
+    state = values_state(slots, dim)
+    keys, values = put_values(state, 70_000, 3_000)
+    staging = slots * state.table_value_dims_cpu[0] * 4
+    torch.cuda.synchronize()
+    torch.cuda.reset_peak_memory_stats()
+    base = torch.cuda.memory_allocated()
+
+    kvt._expand_tables_impl(state, [True], [slots + slots // 2])  # 1.5 times
+    torch.cuda.synchronize()
+
+    peak = torch.cuda.max_memory_allocated() - base
+    assert staging <= peak <= staging + (8 << 20), (peak, staging)
+    founds, new_rows, _ = lookup(state.key_index_map, 0, keys)
+    assert bool(founds.all())
+    assert torch.equal(kvt.load_from_flat_single_table(state, new_rows, 0), values)
+
+
+def test_a_device_that_cannot_give_the_staging_fails_with_the_table_as_it_was(
+    monkeypatch,
+):
+    state = values_state(1 << 12, 16)
+    keys, values = put_values(state, 5_000, 500)
+    key_map, rows = state.key_index_map, state.tables[0].shape[0]
+    generation = state.key_map_generation
+    torch.cuda.synchronize()
+
+    def refuse(device, nbytes):
+        raise torch.cuda.OutOfMemoryError("CUDA out of memory (a stand-in)")
+
+    with monkeypatch.context() as patched:
+        patched.setattr(kvt, "_allocate_staging", refuse)
+        with pytest.raises(
+            torch.cuda.OutOfMemoryError, match="moves its values through device memory"
+        ):
+            kvt._expand_tables_impl(state, [True], [1 << 13])
+    # the allocation comes before the growth section and before the first buffer grows
+    assert state.key_index_map is key_map
+    assert state.key_map_generation == generation
+    assert state.tables[0].shape[0] == rows
+
+    kvt._expand_tables_impl(state, [True], [1 << 13])  # and a device that can, grows it
+    torch.cuda.synchronize()
+    founds, new_rows, _ = lookup(state.key_index_map, 0, keys)
+    assert bool(founds.all())
+    assert torch.equal(kvt.load_from_flat_single_table(state, new_rows, 0), values)
 
 
 # --- what goes wrong is a device assert ----------------------------------------------
@@ -509,30 +609,36 @@ def test_a_stale_extension_says_to_rebuild(monkeypatch):
             call()
 
 
-# --- a long old column is cut into many chunks without allocating per chunk ----------
+# --- a long old column is cut into many chunks without keeping anything per chunk ------
 
 
-def test_the_temporaries_of_a_chunk_are_reused_by_the_next_one():
-    """40 chunks allocate what 2 do: a chunk's temporaries are freed to the caching
-    allocator and handed out again, so a rehash allocates per growth, not per chunk."""
-    old = make_table([BUCKET * 64])
-    keys = make_keys(10_000, 300, torch.int64)
+@pytest.mark.parametrize(
+    "chunk_slots", [1 << 14, 1 << 18], ids=["chunk_2e14", "chunk_2e18"]
+)
+def test_the_temporaries_of_a_rehash_are_those_of_one_chunk_not_of_the_table(
+    chunk_slots,
+):
+    """A table of 2**22 slots is rehashed in chunks of 2**14 or 2**18: what the rehash
+    holds above the tables it works on is the temporaries of ONE chunk (about 40 bytes a
+    slot of it), whatever the number of chunks. Whatever a chunk allocates and a later
+    chunk does not free would show here as 16 or 256 times that; a table this small never
+    shows it in the number of segments (every temporary of a 1024-slot table fits one
+    2 MiB segment), which is why the peak of allocated bytes is what is bounded."""
+    slots = 1 << 22
+    old = make_table([slots])
+    keys = make_keys(1_000, 1 << 18, torch.int64)
     populate(old, 0, keys, False)
-    warm = make_table([BUCKET * 128])
-    rehash(old, warm, 0, 32)  # two chunks: the allocator now holds their sizes
+    new = make_table([2 * slots])
+    torch.cuda.synchronize()
+    torch.cuda.reset_peak_memory_stats()
+    base = torch.cuda.memory_allocated()
+
+    new.rehash_table_from(old, 0, chunk_slots=chunk_slots)
+    new.carry_rows_from(old, 0)
     torch.cuda.synchronize()
 
-    def segments():
-        return torch.cuda.memory_stats()["segment.all.allocated"]
-
-    few, many = make_table([BUCKET * 128]), make_table([BUCKET * 128])
-    torch.cuda.synchronize()
-    before = segments()
-    rehash(old, few, 0, 32)
-    torch.cuda.synchronize()
-    with_few = segments() - before
-    before = segments()
-    rehash(old, many, 0, 1)  # 64 chunks
-    torch.cuda.synchronize()
-    with_many = segments() - before
-    assert with_many <= with_few + 2, (with_few, with_many)
+    peak = torch.cuda.max_memory_allocated() - base
+    # sixteen int64 vectors of a chunk (128 bytes a slot, three times what it takes) and
+    # a megabyte for the little that does not scale
+    assert peak <= 16 * 8 * chunk_slots + (1 << 20), (peak, chunk_slots)
+    assert int(new.bucket_sizes.sum()) == int(old.bucket_sizes.sum())

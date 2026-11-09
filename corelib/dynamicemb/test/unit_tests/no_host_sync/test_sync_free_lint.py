@@ -1165,6 +1165,7 @@ SF = "dynamicemb/sync_free.py"
 ADM = "dynamicemb/embedding_admission.py"
 BDT = "dynamicemb/batched_dynamicemb_tables.py"
 GRO = "dynamicemb/growth_order.py"
+EXT = "dynamicemb/extendable_tensor.py"
 
 
 def _new(file: str, *qualnames: str) -> List[Target]:
@@ -1258,14 +1259,20 @@ TARGETS: List[Target] = (
         "_growth_section",
         "_after_growth",
         "_grow_values_only",
+        "_value_growth",
+        "_check_values_can_grow",
         "_expand_if_need_no_eviction_estimated",
         "publish_table_ptrs",
         "_base_pointers",
         "read_table_sizes_now",
         "collect_table_sizes_for_state",
         "_expand_tables_impl",
+        "_value_extensions",
+        "_check_value_buffers",
         "_rehash_into",
-        "_load_chunk_values",
+        "_ValueMove.*",
+        "_stage_value_moves",
+        "_allocate_staging",
         "_host_value_rows_reserve",
         "_host_reserve_factor",
     )
@@ -1284,6 +1291,9 @@ TARGETS: List[Target] = (
     )
     + _new(BDF, "_note_table_users")
     + _new(SF, "copy_i64_into", "upload_i64")
+    # growing a value buffer waits for nothing: the pages are mapped (a device buffer) or
+    # committed (a host buffer) after the ones that are in use
+    + _legacy(EXT, "DeviceExtendableBuffer.extend", "HostExtendableBuffer.extend")
 )
 
 ENFORCE_ALL = os.environ.get("SYNC_LINT_ENFORCE_ALL") == "1"
@@ -1994,20 +2004,64 @@ ALLOWED_NEW_HITS: List[Tuple[str, Optional[str], str]] = [
         "allocated once, never in a step; the estimated_row_counts line existed before and "
         "black joined its lines",
     ),
+]
+
+# The same for a new line that has to be named: (file, label, the start of the line with its
+# whitespace collapsed, why). A later line of the same label in the same file is not allowed
+# by one of these; an entry that matches no line is stale (the test below says so).
+ALLOWED_NEW_LINES: List[Tuple[str, str, str, str]] = [
+    # a growth of a host buffer commits, locks and registers only the new tail and
+    # unregisters each registered range once, in the destructor: host-memory management of
+    # O(the growth) bytes that waits for no kernel
     (
         "src/vmm_tensor.cu",
         "alloc_free",
-        "a growth of a host buffer commits, locks and registers only the new tail and "
-        "unregisters each registered range once, in the destructor: host-memory "
-        "management of O(the growth) bytes that waits for no kernel",
+        "cudaHostUnregister(piece.first);",
+        "the destructor unregisters each piece once, by the address it registered it with",
+    ),
+    (
+        "src/vmm_tensor.cu",
+        "alloc_free",
+        "cudaError_t err = cudaHostRegister(",
+        "the registration of the new tail of a host buffer: O(the growth), waits for no kernel",
+    ),
+    (
+        "src/vmm_tensor.cu",
+        "alloc_free",
+        "p, bytes, cudaHostRegisterMapped | cudaHostRegisterPortable);",
+        "the arguments of that registration (the call spans two lines)",
+    ),
+    (
+        "src/vmm_tensor.cu",
+        "alloc_free",
+        "cudaHostUnregister(p);",
+        "a tail whose device pointer does not continue the buffer is unregistered at once, "
+        "before any kernel has used it",
+    ),
+    (
+        "src/vmm_tensor.cu",
+        "alloc_free",
+        'std::string("cudaHostRegister/cudaHostGetDevicePointer (host buffer) "',
+        "the text of the error for that failure",
+    ),
+    (
+        "dynamicemb/key_value_table.py",
+        "sync_call",
+        "torch.cuda.current_stream(device).synchronize()",
+        "create_table_state ends with one wait, once per state, for the queued uploads of its "
+        "metadata: nothing else orders the first use of a new state, on another stream, "
+        "after its construction",
     ),
 ]
 
 
 def _allowed(hit_key: Tuple[str, str, str]) -> bool:
-    file, label, _ = hit_key
+    file, label, text = hit_key
     return any(
         file == f and (lab is None or lab == label) for f, lab, _ in ALLOWED_NEW_HITS
+    ) or any(
+        file == f and label == lab and text.startswith(prefix)
+        for f, lab, prefix, _ in ALLOWED_NEW_LINES
     )
 
 
@@ -2164,6 +2218,10 @@ EXPECTED_GONE: List[Tuple[str, str, str, str]] = [
         'std::string msg = std::string("cudaHostRegister/cudaHostGetDevicePointer "',
         "G4",
     ),
+    # G5: ExtendableBuffer.extend no longer waits for the device (the last commit of the lane,
+    # gated on the hardware experiments E1 to E3)
+    ("dynamicemb/extendable_tensor.py", "sync_call", "torch.cuda.synchronize()", "G5"),
+    ("dynamicemb/extendable_tensor.py", "cuda_sync", "torch.cuda.synchronize()", "G5"),
 ]
 
 
@@ -2314,6 +2372,29 @@ def test_the_allow_list_is_well_formed():
         assert file.startswith(("dynamicemb/", "src/")), file
         assert label is None or label in labels, (file, label)
         assert why.strip(), "an allowed hit needs its reason: %s" % file
+    for file, label, prefix, why in ALLOWED_NEW_LINES:
+        assert file.startswith(("dynamicemb/", "src/")), file
+        assert label in labels, (file, label)
+        assert prefix.strip() and why.strip(), (file, label, prefix)
+
+
+def test_every_allowed_line_is_a_line_of_the_tree():
+    """An entry of ALLOWED_NEW_LINES that matches nothing is stale: the line it allowed is
+    gone, and the entry would allow the next one that starts like it."""
+    keys = [
+        (file, label, " ".join(text.split()))
+        for file, label, text in (
+            (h["file"], h["label"], h["text"]) for h in _current_hits()
+        )
+    ]
+    stale = [
+        (file, label, prefix)
+        for file, label, prefix, _ in ALLOWED_NEW_LINES
+        if not any(
+            k[0] == file and k[1] == label and k[2].startswith(prefix) for k in keys
+        )
+    ]
+    assert not stale, "these allowed lines match no line of the tree: %s" % stale
 
 
 def main() -> int:

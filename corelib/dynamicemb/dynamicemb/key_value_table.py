@@ -16,6 +16,7 @@
 import collections
 import contextlib
 import functools
+import inspect
 import json
 import math
 import os
@@ -61,11 +62,17 @@ from dynamicemb.extendable_tensor import (
 from dynamicemb.growth_order import GrowthOrder
 from dynamicemb.key_ownership import owned_key_mask
 from dynamicemb.optimizer import BaseDynamicEmbeddingOptimizer
+from dynamicemb.rehash_plan import (
+    chunks_are_independent,
+    lands_in_the_bucket_of_origin_or_a_new_one,
+)
 from dynamicemb.scored_hashtable import (
+    REHASH_CHUNK_SLOTS,
     ScoreArg,
     ScorePolicy,
     ScoreSpec,
     get_scored_table,
+    rehash_chunk_buckets,
 )
 from dynamicemb.types import (
     EMBEDDING_TYPE,
@@ -553,24 +560,45 @@ NO_EVICTION_LOAD_FACTOR = 0.5
 
 
 def _host_reserve_factor() -> float:
+    """``DYNAMICEMB_HOST_RESERVE_FACTOR``: how many times its ``max_capacity`` the value
+    buffer of a host table that never evicts reserves address space for. Read when such
+    a table is made, not when the package is imported, so that it can be set by the
+    program that makes the tables."""
     value = os.environ.get("DYNAMICEMB_HOST_RESERVE_FACTOR", "8")
     try:
         factor = float(value)
     except ValueError:
         factor = 0.0
-    if not factor >= 1.0:
+    # sync-ok: factor is a Python float, parsed from the environment
+    if not (math.isfinite(factor) and factor >= 1.0):
         raise ValueError(
-            f"DYNAMICEMB_HOST_RESERVE_FACTOR must be a number of at least 1, got {value!r}."
+            "DYNAMICEMB_HOST_RESERVE_FACTOR must be a finite number of at least 1, "
+            f"got {value!r}."
         )
     return factor
 
 
+def _warn_if_exact_growth_is_set() -> None:
+    """``DYNAMICEMB_EXACT_GROWTH=1`` made every expansion decision wait for the device
+    sizes. No environment variable may make a step wait for the device, so it is gone;
+    a script that still sets it keeps running, on the estimate."""
+    if os.environ.get("DYNAMICEMB_EXACT_GROWTH", "0") == "1":
+        warnings.warn(
+            "DYNAMICEMB_EXACT_GROWTH was removed: a table grows from the size estimate "
+            "and never makes a training step wait for the device. A checkpoint load "
+            "still reads the exact sizes (once).",
+            stacklevel=2,
+        )
+
+
+_warn_if_exact_growth_is_set()
+
 # How much address space a host value buffer of a table that never evicts reserves when
-# it is created, for it to grow in place: this many times the table's max_capacity,
-# and at least _HOST_RESERVE_FLOOR_BYTES. Address space only: it costs no memory, but
-# it is not unlimited, which is why a table that evicts reserves exactly what its
-# max_capacity can need.
-_HOST_RESERVE_FACTOR = _host_reserve_factor()
+# it is created, for it to grow in place: DYNAMICEMB_HOST_RESERVE_FACTOR times the
+# table's max_capacity, and at least _HOST_RESERVE_FLOOR_BYTES. Address space only: it
+# costs no memory, but it is not unlimited (every table of the process reserves its own,
+# and a buffer made when the process has run out of it gets what is left, down to what it
+# holds), which is why a table that evicts reserves exactly what its max_capacity can need.
 _HOST_RESERVE_FLOOR_BYTES = 64 << 30
 
 
@@ -583,15 +611,17 @@ def _host_value_rows_reserve(
     A table that evicts never has more rows than its key map has slots, which
     :func:`get_expand_info` keeps to ``max_capacity`` (rounded up to a bucket, and a
     bucket more for a rounded target): that is exact. A table that never evicts is not
-    capped by ``max_capacity``, so it gets a margin of ``DYNAMICEMB_HOST_RESERVE_FACTOR``
-    times it, and no less than 64 GiB; growing past that is an error that names the
-    knob.
+    capped by ``max_capacity`` on the key map, but its host value buffer is capped by
+    what it reserves: ``DYNAMICEMB_HOST_RESERVE_FACTOR`` times it, and no less than
+    64 GiB (at most the installed memory, which a pinned buffer cannot pass anyway).
+    Growing past that is an error that names the knob, raised before anything is
+    changed (:meth:`ExtendableBuffer.check_extend`).
     """
     bucket = opt.bucket_capacity
     if no_eviction or opt.max_capacity is None:
         planned = rows_now if opt.max_capacity is None else opt.max_capacity
         rows = max(
-            int(_HOST_RESERVE_FACTOR * planned),
+            int(_host_reserve_factor() * planned),
             -(-_HOST_RESERVE_FLOOR_BYTES // row_bytes),
         )
     else:
@@ -762,7 +792,7 @@ def create_table_state(
     )
     table_ptrs = _base_pointers(tables)
 
-    return DynamicEmbTableState(
+    state = DynamicEmbTableState(
         options_list=options,
         num_tables=num_tables,
         device=device,
@@ -809,6 +839,14 @@ def create_table_state(
         if EvictedItemMode.RETAIN_KEY in evicted_item_mode
         else None,
     )
+    # The key map's bucket offsets, the row limits and the pointer table above are
+    # uploaded by queued copies on this stream. A state that grows orders its users
+    # after the last growth, but nothing orders the first use of a new state, on another
+    # stream, after its own construction: one wait here, once per state, as the blocking
+    # copies these replaced gave.
+    # sync-ok: construction, once per state, never in a step
+    torch.cuda.current_stream(device).synchronize()
+    return state
 
 
 def collect_table_sizes_to_device(state: DynamicEmbTableState) -> torch.Tensor:
@@ -1030,11 +1068,11 @@ def read_table_sizes_now(
     about to insert and is not on the training path. A step decides from the estimate
     (:class:`SizeSnapshots`) and never comes here.
     """
-    sizes = collect_table_sizes_to_device(state)
+    on_device = [collect_table_sizes_to_device(state)]
     if state.no_eviction:
-        host_sizes, host_rows = sf.read_now(sizes, collect_row_counts_to_device(state))
-        return host_sizes, host_rows
-    return sf.read_now(sizes)[0], None
+        on_device.append(collect_row_counts_to_device(state))
+    on_host = sf.read_now(*on_device)
+    return on_host[0], (on_host[1] if state.no_eviction else None)
 
 
 def collect_table_sizes_for_state(
@@ -1149,60 +1187,246 @@ def _expand_tables_impl(
         # And whether it counts references at all.
         use_ref_counter=state.key_index_map.use_ref_counter_,
     )
+    # What each value buffer has to grow by, and whether every one of them can: checked
+    # before anything is changed, so that a buffer that cannot grow (a host buffer past
+    # the address space it reserved) does not leave the others grown.
+    extensions = _value_extensions(
+        state, tables_to_expand, target_capacities, key_caps, new_key_index_map
+    )
+    _check_value_buffers(state, extensions)
+    # The device memory the values of a table that stores no row are moved through (see
+    # _ValueMove) is allocated before anything changes, too.
+    moves = _stage_value_moves(state, new_key_index_map, tables_to_expand, key_caps)
     stream = torch.cuda.current_stream(device)
     with _growth_section(state, stream):
         _rehash_into(
-            state,
-            new_key_index_map,
-            tables_to_expand,
-            target_capacities,
-            key_caps,
-            stream,
+            state, new_key_index_map, tables_to_expand, extensions, moves, stream
         )
 
 
-def _load_chunk_values(
+# The device memory a value move stages values in, at most, while a table grows by a whole
+# multiple of its size (see _ValueMove): the values of one chunk of the rehash.
+REHASH_STAGING_BYTES = 256 << 20
+
+
+def _allocate_staging(device: torch.device, nbytes: int) -> torch.Tensor:
+    """The device memory a value move stages values in: ``nbytes`` of one flat tensor."""
+    return torch.empty(nbytes, dtype=torch.uint8, device=device)
+
+
+class _ValueMove:
+    """Moves the values of a table whose value row is its hash slot (the host tier of a
+    hybrid storage) from the slots of the key map a rehash replaces to the slots of the
+    one that replaces it: the ``on_chunk`` of :meth:`LinearBucketTable.rehash_table_from`.
+
+    A value stays where it is, so it has to be copied when its key gets another slot, and
+    a store must not land on a row that has not been read yet. Every chunk of the rehash
+    loads the values of its keys from their old slots into a staging tensor (a lane that
+    carries no key has slot ``-1``, which the load and the store skip). Two cases, told
+    apart on the host by the two sizes (:func:`~dynamicemb.rehash_plan.chunks_are_independent`):
+
+    * **The new table is a whole multiple of the old one**, which is every growth that
+      doubles. A key of old bucket ``b`` lands in bucket ``b + j * old_buckets`` of the new
+      table: its own bucket, whose rows the chunk has just read, or a bucket past the end
+      of the old table, whose rows hold nothing. So a chunk is stored before the next one
+      is read, and the staging holds one chunk, at most ``REHASH_STAGING_BYTES``, however
+      big the table. A device assert says that every key did land that way.
+    * **Any other size** (the last growth of a table, which ``max_capacity`` clamps) sends
+      the keys of a bucket to unrelated buckets: every chunk is loaded before any is
+      stored, and the staging holds a row for every slot of the OLD table,
+      ``old slots * value_dim * itemsize`` bytes of device memory, which is more than the
+      values of the keys it holds.
+
+    Either way the staging is allocated before the growth changes anything
+    (:func:`_stage_value_moves`), so that a device that cannot give it fails with a message
+    and the table as it was.
+    """
+
+    def __init__(
+        self,
+        state: DynamicEmbTableState,
+        table_id: int,
+        old_slots: int,
+        new_slots: int,
+        bucket_capacity: int,
+    ):
+        self.state = state
+        self.table_id = table_id
+        self.bucket_capacity = bucket_capacity
+        self.old_buckets = old_slots // bucket_capacity
+        value_dim = state.table_value_dims_cpu[table_id]
+        self.row_bytes = value_dim * state.emb_dtype.itemsize
+        self.chunk_by_chunk = chunks_are_independent(old_slots, new_slots)
+        if self.chunk_by_chunk:
+            self.chunk_slots = max(
+                bucket_capacity,
+                min(REHASH_CHUNK_SLOTS, REHASH_STAGING_BYTES // self.row_bytes),
+            )
+            self.staged_rows = (
+                rehash_chunk_buckets(
+                    self.old_buckets, bucket_capacity, self.chunk_slots
+                )
+                * bucket_capacity
+            )
+        else:
+            self.chunk_slots = REHASH_CHUNK_SLOTS
+            self.staged_rows = old_slots
+        self.staged_bytes = self.staged_rows * self.row_bytes
+        self.staging: Optional[torch.Tensor] = None
+        self.offset = 0
+        self.pending: List[Tuple[torch.Tensor, torch.Tensor]] = []
+
+    def bind(self, area: torch.Tensor) -> None:
+        """Use the first ``staged_bytes`` of ``area`` (flat, uint8) as the staging."""
+        value_dim = self.state.table_value_dims_cpu[self.table_id]
+        self.staging = (
+            area[: self.staged_bytes]
+            .view(self.state.emb_dtype)
+            .view(self.staged_rows, value_dim)
+        )
+
+    def __call__(self, src_slots: torch.Tensor, dst_slots: torch.Tensor) -> None:
+        staging = self.staging
+        # sync-ok: a host object (set by bind), not a tensor
+        assert (
+            staging is not None
+        ), "the staging of a value move is bound before it runs"
+        lanes = src_slots.numel()
+        if self.chunk_by_chunk:
+            values = staging[:lanes]
+        else:
+            values = staging[self.offset : self.offset + lanes]
+            self.offset += lanes
+        load_from_flat_single_table(self.state, src_slots, self.table_id, output=values)
+        if not self.chunk_by_chunk:
+            self.pending.append((dst_slots, values))
+            return
+        # Every key must have landed in the bucket it came from or in one the growth added
+        # (see the class): then the store below only touches rows this chunk has read, or
+        # rows that hold nothing.
+        torch._assert_async(
+            (
+                (dst_slots < 0)
+                | lands_in_the_bucket_of_origin_or_a_new_one(
+                    src_slots, dst_slots, self.bucket_capacity, self.old_buckets
+                )
+            ).all()
+        )
+        store_to_flat_single_table(self.state, dst_slots, self.table_id, values)
+
+    def finish(self) -> None:
+        """Store what every chunk loaded, once the last one has (nothing, when each chunk
+        was stored as it was loaded)."""
+        pending, self.pending = self.pending, []
+        for dst_slots, values in pending:
+            store_to_flat_single_table(self.state, dst_slots, self.table_id, values)
+        self.offset = 0
+
+
+def _stage_value_moves(
     state: DynamicEmbTableState,
-    table_id: int,
-    moves: List[Tuple[torch.Tensor, torch.Tensor]],
-    src_slots: torch.Tensor,
-    dst_slots: torch.Tensor,
+    new_key_index_map,
+    tables_to_expand: List[bool],
+    key_caps: List[int],
+) -> Dict[int, _ValueMove]:
+    """The value moves of a growth of a table that stores no row, by table, with the
+    staging they need allocated, once and as large as the largest (the tables are moved
+    one after the other). Allocated before the growth changes anything: a device that
+    cannot give it raises :class:`torch.cuda.OutOfMemoryError` naming the table and the
+    size, and the tables are as they were."""
+    moves: Dict[int, _ValueMove] = {}
+    if new_key_index_map.use_rows_:
+        return moves
+    for i in range(state.num_tables):
+        # sync-ok: tables_to_expand is a list of Python bools, decided on the host
+        if tables_to_expand[i]:
+            moves[i] = _ValueMove(
+                state,
+                i,
+                key_caps[i],
+                new_key_index_map.per_table_capacity_[i],
+                new_key_index_map.bucket_capacity_,
+            )
+    # sync-ok: a dict of host objects
+    if not moves:
+        return moves
+    largest = max(moves, key=lambda i: moves[i].staged_bytes)
+    nbytes = moves[largest].staged_bytes
+    try:
+        area = _allocate_staging(state.device, nbytes)
+    except torch.cuda.OutOfMemoryError as exc:
+        raise torch.cuda.OutOfMemoryError(
+            f"growing table {largest} moves its values through device memory, because "
+            "its value row is its hash slot: it needs "
+            f"{moves[largest].staged_rows} rows of {moves[largest].row_bytes} bytes "
+            f"({nbytes} bytes) at once, and the device cannot give them. Nothing was "
+            "changed. Free device memory, or give the table a max_capacity that is its "
+            "init_capacity times a power of two: a growth to a whole multiple of the "
+            "table's size stages one chunk at a time, the last one, which max_capacity "
+            "clamps, stages the whole old table."
+        ) from exc
+    for move in moves.values():
+        move.bind(area)
+    return moves
+
+
+def _value_extensions(
+    state: DynamicEmbTableState,
+    tables_to_expand: List[bool],
+    target_capacities: Optional[List[int]],
+    key_caps: List[int],
+    new_key_index_map,
+) -> List[Tuple[int, Tuple[int, ...]]]:
+    """The value buffers a rehash extends and by how much: ``(table, shape to add)``.
+
+    A table that never evicts keeps its value buffer out of it, which follows the rows
+    (:func:`_grow_values_only`). Host arithmetic only.
+    """
+    extensions: List[Tuple[int, Tuple[int, ...]]] = []
+    if state.no_eviction:
+        return extensions
+    for i in range(state.num_tables):
+        # sync-ok: tables_to_expand is a list of Python bools, decided on the host
+        if not tables_to_expand[i]:
+            continue
+        if (
+            target_capacities is not None
+            and i < len(target_capacities)
+            and target_capacities[i] >= 0
+        ):
+            # Hash buckets can round the requested target up. Grow values
+            # by the actual key-map capacity change, including that padding.
+            add_rows = new_key_index_map.per_table_capacity_[i] - key_caps[i]
+            if add_rows > 0:
+                extensions.append((i, (add_rows, state.table_value_dims_cpu[i])))
+        else:
+            extensions.append((i, state.tables[i].shape))
+    return extensions
+
+
+def _check_value_buffers(
+    state: DynamicEmbTableState, extensions: List[Tuple[int, Tuple[int, ...]]]
 ) -> None:
-    """``on_chunk`` of a rehash of a table whose value row is its slot: load the values
-    of the chunk's live keys from their old slots, to store them at ``dst_slots`` when
-    every chunk has been loaded. A lane that carries no key has slot ``-1`` in both."""
-    moves.append((dst_slots, load_from_flat_single_table(state, src_slots, table_id)))
+    """Raise, with every buffer as it was, if one of ``extensions`` cannot be made
+    (:meth:`ExtendableBuffer.check_extend`)."""
+    for i, shape in extensions:
+        state.tables[i].check_extend(shape)
 
 
 def _rehash_into(
     state: DynamicEmbTableState,
     new_key_index_map,
     tables_to_expand: List[bool],
-    target_capacities: Optional[List[int]],
-    key_caps: List[int],
+    extensions: List[Tuple[int, Tuple[int, ...]]],
+    moves: Dict[int, _ValueMove],
     stream: torch.cuda.Stream,
 ) -> None:
     """The part of :func:`_expand_tables_impl` that runs inside the growth section, on
-    ``stream``: extend the value buffers, move every table into ``new_key_index_map``
-    and make it the state's."""
-    for i in range(state.num_tables):
-        # sync-ok: tables_to_expand is a list of Python bools, decided on the host
-        if tables_to_expand[i]:
-            if state.no_eviction:
-                continue  # its value buffer follows the rows, see the docstring
-            if (
-                target_capacities is not None
-                and i < len(target_capacities)
-                and target_capacities[i] >= 0
-            ):
-                # Hash buckets can round the requested target up. Grow values
-                # by the actual key-map capacity change, including that padding.
-                add_rows = new_key_index_map.per_table_capacity_[i] - key_caps[i]
-                vd = state.table_value_dims_cpu[i]
-                if add_rows > 0:
-                    state.tables[i].extend((add_rows, vd))
-            else:
-                state.tables[i].extend(state.tables[i].shape)
+    ``stream``: extend the value buffers by ``extensions``, move every table into
+    ``new_key_index_map`` (a table that stores no row moves its values by ``moves``) and
+    make it the state's."""
+    for i, shape in extensions:
+        state.tables[i].extend(shape)
     publish_table_ptrs(state)
 
     old_key_index_map = state.key_index_map
@@ -1211,25 +1435,19 @@ def _rehash_into(
         if not tables_to_expand[table_id]:
             new_key_index_map.copy_table_from(old_key_index_map, table_id)
             continue
-        # The values of a table that does not store rows follow their keys: every chunk
-        # of the rehash loads the values of its live keys (a lane that carries no key
-        # has slot -1, which the load and the store skip), and they are stored once the
-        # last chunk was loaded -- a store may land on a row that an earlier chunk's
-        # keys have not been read from yet.
-        moves: List[Tuple[torch.Tensor, torch.Tensor]] = []
+        move = moves.get(table_id)
         # The padded rehash: no count is read, the table's own key column is the input.
         new_key_index_map.rehash_table_from(
             old_key_index_map,
             table_id,
-            on_chunk=None
-            if new_key_index_map.use_rows_
-            else functools.partial(_load_chunk_values, state, table_id, moves),
+            on_chunk=move,
+            chunk_slots=REHASH_CHUNK_SLOTS if move is None else move.chunk_slots,
         )
         if new_key_index_map.use_rows_:
             # Reclaimed (erased) slots still own their rows; keep them too.
             new_key_index_map.carry_rows_from(old_key_index_map, table_id)
-        for dst_slots, values in moves:
-            store_to_flat_single_table(state, dst_slots, table_id, values)
+        if move is not None:
+            move.finish()
 
     state.key_index_map = new_key_index_map
     state.key_map_generation += 1
@@ -1405,6 +1623,40 @@ def _value_rows_target(current_rows: int, need_rows: int, key_capacity: int) -> 
     return max(current_rows, min(key_capacity, max(2 * current_rows, need_rows)))
 
 
+def _value_growth(
+    state: DynamicEmbTableState, need_rows: List[int], key_capacities: List[int]
+) -> List[Tuple[int, Tuple[int, ...]]]:
+    """What the value buffers of a table that never evicts grow by, ``(table, shape to
+    add)``, for ``need_rows`` rows handed out and key maps of ``key_capacities`` slots (a
+    slot owns one row, so a buffer never has more rows than that). Host arithmetic."""
+    extensions: List[Tuple[int, Tuple[int, ...]]] = []
+    for i in range(state.num_tables):
+        rows = state.tables[i].shape[0]
+        target = _value_rows_target(rows, need_rows[i], key_capacities[i])
+        if target > rows:
+            extensions.append((i, (target - rows, state.table_value_dims_cpu[i])))
+    return extensions
+
+
+def _check_values_can_grow(
+    state: DynamicEmbTableState,
+    expand: List[bool],
+    targets: List[int],
+    need_rows: List[int],
+) -> None:
+    """Before the key map of a decision that grows both it and the value buffers is
+    replaced: raise, with nothing changed, if a value buffer cannot make the growth the
+    decision will ask of it once the key map has its new size (``expand`` and ``targets``
+    are :func:`get_expand_info`'s). The check of :func:`_grow_values_only` that follows
+    the key map's growth is then the same one and passes."""
+    key_capacities = [
+        # sync-ok: expand is a list of Python bools, decided on the host
+        targets[i] if expand[i] else state.key_index_map.per_table_capacity_[i]
+        for i in range(state.num_tables)
+    ]
+    _check_value_buffers(state, _value_growth(state, need_rows, key_capacities))
+
+
 def _grow_values_only(state: DynamicEmbTableState, need_rows: List[int]) -> None:
     """Grow the value buffer of a table that never evicts, leaving its key map.
 
@@ -1412,23 +1664,17 @@ def _grow_values_only(state: DynamicEmbTableState, need_rows: List[int]) -> None
     it has handed out, which can be more (an erased key's slot keeps its row until
     another key takes the slot) but never more than the key map's slots.
     """
-    targets = [
-        _value_rows_target(
-            state.tables[i].shape[0],
-            need_rows[i],
-            state.key_index_map.per_table_capacity_[i],
-        )
-        for i in range(state.num_tables)
-    ]
-    if not any(targets[i] > state.tables[i].shape[0] for i in range(state.num_tables)):
+    extensions = _value_growth(
+        state, need_rows, state.key_index_map.per_table_capacity_
+    )
+    # sync-ok: a list of host tuples
+    if not extensions:
         return
+    # Every buffer that has to grow can, or none does (see _check_value_buffers).
+    _check_value_buffers(state, extensions)
     with _growth_section(state, torch.cuda.current_stream(state.device)):
-        for i in range(state.num_tables):
-            rows = state.tables[i].shape[0]
-            if targets[i] > rows:
-                state.tables[i].extend(
-                    (targets[i] - rows, state.table_value_dims_cpu[i])
-                )
+        for i, shape in extensions:
+            state.tables[i].extend(shape)
         publish_table_ptrs(state)
         state.key_index_map.set_row_limits([t.shape[0] for t in state.tables])
 
@@ -1550,6 +1796,8 @@ def _expand_if_need_no_eviction(
         rows_est.copy_(rows)
         results, targets = get_expand_info(state, keys, unique_size_per_table)
         need_rows = (rows + unique_size_per_table).tolist()
+        # A value buffer that cannot make the growth is found before the key map is replaced.
+        _check_values_can_grow(state, results, targets, need_rows)
         # The key map and the value buffers are one growth.
         with _growth_section(state, torch.cuda.current_stream(state.device)):
             if any(results):
@@ -1585,6 +1833,8 @@ def _expand_if_need_no_eviction_estimated(
         for i in range(state.num_tables)
     )
     if any(results) or rows_short:
+        # A value buffer that cannot make the growth is found before the key map is replaced.
+        _check_values_can_grow(state, results, targets, need_rows)
         # The key map and the value buffers are one growth.
         with _growth_section(state, torch.cuda.current_stream(state.device)):
             if any(results):
@@ -1657,9 +1907,9 @@ def expand_if_need_impl(
     cannot be lower. The decision comes from the size estimate of the state
     (:class:`SizeSnapshots`): it never waits for the device, and never comes too
     late; it can come earlier than an exact read would have put it, by about the keys
-    of the batches that are in flight. The expansion itself still synchronizes the
-    device (``ExtendableBuffer.extend``), but a table at its ``max_capacity`` never
-    gets there.
+    of the batches that are in flight. The expansion does not wait for the device
+    either: its kernels are queued on the current stream, ordered against the other
+    streams that use the table by :class:`GrowthOrder`.
 
     ``exact`` decides from the device sizes instead, waiting for them (one read,
     :func:`read_table_sizes_now`) when an estimate says a table might grow. A checkpoint
@@ -1977,12 +2227,28 @@ def load_from_flat_single_table(
     state: DynamicEmbTableState,
     indices: torch.Tensor,
     table_id: int,
+    output: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    """Load full values for a single table. Returns compact [N, value_dim_t]."""
+    """Load full values for a single table. Returns compact [N, value_dim_t].
+
+    ``output`` is an existing ``[N, value_dim_t]`` buffer of ``state.emb_dtype`` (whose rows
+    are contiguous) to load into instead of a fresh one; a row whose index is negative is
+    skipped and keeps what it held. It is the buffer that is returned.
+    """
     indices = indices.to(device=state.device, dtype=torch.int64)
     N = indices.numel()
     vdim = state.table_value_dims_cpu[table_id]
-    output = torch.empty(N, vdim, dtype=state.emb_dtype, device=state.device)
+    if output is None:
+        output = torch.empty(N, vdim, dtype=state.emb_dtype, device=state.device)
+    else:
+        assert tuple(output.shape) == (N, vdim), (
+            f"load_from_flat_single_table: output has shape {tuple(output.shape)}, "
+            f"expected {(N, vdim)}"
+        )
+        assert output.dtype == state.emb_dtype and output.is_contiguous(), (
+            "load_from_flat_single_table: output must be a contiguous buffer of "
+            f"{state.emb_dtype}"
+        )
     if N > 0:
         _load_contiguous(
             state.table_ptrs_dev,
@@ -3672,7 +3938,16 @@ def _select_refused_values(
 def _after_growth(method):
     """Make a public method of a storage order the current stream after the last growth
     of the state(s) it reads before it launches anything (``wait_for_growth``): a growth
-    only queues its kernels on the stream that decided to grow."""
+    only queues its kernels on the stream that decided to grow.
+
+    Not for a generator: its body runs at the first ``next()``, on whatever stream is
+    current then, while this wrapper would order the stream that made the iterator. A
+    generator calls ``self.wait_for_growth()`` itself, in its body."""
+    # sync-ok: a Python bool about a function, decided when the class is made
+    assert not inspect.isgeneratorfunction(method), (
+        f"{method.__qualname__} is a generator: call self.wait_for_growth() in its body "
+        "instead of decorating it with _after_growth"
+    )
 
     @functools.wraps(method)
     def ordered(self, *args, **kwargs):
@@ -4425,7 +4700,6 @@ class DynamicEmbStorage(Storage):
 
     # -- Export --
 
-    @_after_growth
     def export_keys_values(
         self,
         device: torch.device,
@@ -4434,6 +4708,9 @@ class DynamicEmbStorage(Storage):
     ) -> Iterator[
         Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], torch.Tensor]
     ]:
+        # A generator: the order is made when it runs, not when the iterator is made
+        # (see _after_growth).
+        self.wait_for_growth()
         yield from export_keys_values_iter(self._state, device, batch_size, table_id)
 
     # -- Property accessors --
@@ -5277,7 +5554,6 @@ class HybridStorage(Storage):
 
     # -- Export: yield from both tiers --
 
-    @_after_growth
     def export_keys_values(
         self,
         device: torch.device,
@@ -5294,6 +5570,10 @@ class HybridStorage(Storage):
         are left unchanged. This **mutates** host storage (same as a logical cleanup
         before host export).
         """
+        # A generator: the order is made when it runs, not when the iterator is made
+        # (see _after_growth), and again where the consumer's loop body may have taken
+        # any time: the erase and the export of the host tier come after it.
+        self.wait_for_growth()
         hbm_key_parts: List[torch.Tensor] = []
         for batch in export_keys_values_iter(self._hbm, device, batch_size, table_id):
             keys, embeddings, opt_states, scores = batch
@@ -5305,6 +5585,7 @@ class HybridStorage(Storage):
         else:
             hbm_unique = torch.empty(0, dtype=torch.int64, device=device)
 
+        self.wait_for_growth()
         if hbm_unique.numel() > 0:
             host_dev = self._host.device
             keys_erase = hbm_unique.to(host_dev)

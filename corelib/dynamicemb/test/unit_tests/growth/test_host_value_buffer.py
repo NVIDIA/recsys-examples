@@ -109,10 +109,34 @@ def test_a_table_that_never_evicts_reserves_a_margin():
 def test_the_margin_is_a_factor_of_at_least_one(monkeypatch):
     monkeypatch.setenv("DYNAMICEMB_HOST_RESERVE_FACTOR", "16")
     assert kvt._host_reserve_factor() == 16.0
-    for bad in ("0.5", "-3", "lots", "nan"):
+    for bad in ("0.5", "-3", "lots", "nan", "inf", "-inf"):
         monkeypatch.setenv("DYNAMICEMB_HOST_RESERVE_FACTOR", bad)
         with pytest.raises(ValueError, match="DYNAMICEMB_HOST_RESERVE_FACTOR"):
             kvt._host_reserve_factor()
+
+
+@pytest.mark.skipif(
+    not address_space_is_unlimited(), reason="the reservation halves under RLIMIT_AS"
+)
+def test_the_factor_is_read_when_a_table_is_made(monkeypatch):
+    """Not when the package is imported: the program that makes the tables sets it."""
+    # a floor below the margin, so that the factor decides
+    monkeypatch.setattr(kvt, "_HOST_RESERVE_FLOOR_BYTES", PAGE)
+    reserved = []
+    for factor in ("1", "4"):
+        monkeypatch.setenv("DYNAMICEMB_HOST_RESERVE_FACTOR", factor)
+        state = host_state(256, 512, no_eviction=True)
+        reserved.append(state.tables[0].reserved_bytes())
+    row_bytes = state.table_value_dims_cpu[0] * 4
+    assert reserved == [round_up(512 * row_bytes), round_up(4 * 512 * row_bytes)]
+
+
+def test_a_bad_factor_matters_to_the_tables_that_use_it_and_to_no_other(monkeypatch):
+    monkeypatch.setenv("DYNAMICEMB_HOST_RESERVE_FACTOR", "lots")
+    # a table that evicts reserves exactly what its max_capacity can need: no factor
+    assert host_state(256, 300).tables[0].reserved_bytes() > 0
+    with pytest.raises(ValueError, match="DYNAMICEMB_HOST_RESERVE_FACTOR"):
+        host_state(256, 512, no_eviction=True)
 
 
 # --- growth keeps the address -------------------------------------------------------
@@ -194,3 +218,105 @@ def test_outgrowing_the_reservation_is_an_error_that_leaves_the_table_as_it_was(
     torch.cuda.synchronize()
     assert state.key_index_map.per_table_capacity_[0] == 384
     assert state.tables[0].shape[0] == 384
+
+
+# --- an error that comes before anything has changed ---------------------------------
+
+
+def test_check_extend_says_so_without_touching_the_buffer():
+    buf = extendable_tensor.HostExtendableBuffer(
+        (1024,),
+        torch.float32,
+        torch.device("cuda", torch.cuda.current_device()),
+        max_shape=(4096,),
+    )
+    pointer = buf.tensor().data_ptr()
+    buf.check_extend((1024,))  # inside the reservation: nothing to say
+    buf.check_extend((0,))
+    with pytest.raises(RuntimeError, match="address space") as info:
+        buf.check_extend((1 << 20,))
+    assert "DYNAMICEMB_HOST_RESERVE_FACTOR" in str(info.value)
+    assert buf.numel() == 1024 and buf.tensor().data_ptr() == pointer
+
+
+def test_a_rehash_that_needs_more_than_the_reservation_changes_nothing():
+    state = host_state(256, 300)  # evicts: 300 rounds to 3 buckets, reserves 4
+    key_map, rows = state.key_index_map, state.tables[0].shape[0]
+    generation = state.key_map_generation
+    with pytest.raises(RuntimeError, match="address space"):
+        kvt._expand_tables_impl(state, [True], [1 << 20])
+    # the check comes before the section and before the first buffer grows
+    assert state.key_index_map is key_map
+    assert state.key_map_generation == generation
+    assert state.tables[0].shape[0] == rows
+    kvt._expand_tables_impl(state, [True], [300])  # the regular growth still works
+    torch.cuda.synchronize()
+    assert state.tables[0].shape[0] == 384
+
+
+def test_a_growth_that_one_buffer_cannot_make_changes_none_of_them(monkeypatch):
+    """Two tables that never evict, the second with a reservation the first has no
+    shortage of: when the second cannot make the growth the decision asks of it, the
+    first, which could, does not grow either, and the error names the variable."""
+    monkeypatch.setattr(kvt, "_HOST_RESERVE_FLOOR_BYTES", PAGE)
+    monkeypatch.setenv("DYNAMICEMB_HOST_RESERVE_FACTOR", "1")
+    state = kvt.create_table_state(
+        [
+            host_options(256, 4096, no_eviction=True),
+            host_options(256, 512, no_eviction=True),
+        ],
+        AdamDynamicEmbeddingOptimizer(OptimizerArgs()),
+        use_rows=True,
+    )
+    # the key maps are not capped by max_capacity, and the buffers follow their rows
+    kvt._expand_tables_impl(state, [True, True], [4096, 4096])
+    torch.cuda.synchronize()
+    assert state.key_index_map.per_table_capacity_ == [4096, 4096]
+    rows = [t.shape[0] for t in state.tables]
+    pointers = [t.tensor().data_ptr() for t in state.tables]
+    generation = state.key_map_generation
+    reserved_rows = state.tables[1].reserved_bytes() // (
+        state.table_value_dims_cpu[1] * 4
+    )
+
+    # table 0 may have 1000 rows (it reserved 4096), table 1 wants more than it reserved
+    with pytest.raises(RuntimeError, match="DYNAMICEMB_HOST_RESERVE_FACTOR"):
+        kvt._grow_values_only(state, [1000, reserved_rows + 100])
+    assert [t.shape[0] for t in state.tables] == rows
+    assert [t.tensor().data_ptr() for t in state.tables] == pointers
+    assert state.key_map_generation == generation
+
+    kvt._grow_values_only(state, [1000, 100])  # the table that can, alone, does
+    torch.cuda.synchronize()
+    assert [t.shape[0] for t in state.tables] == [1000, rows[1]]
+
+
+def test_a_decision_that_grows_the_key_map_does_not_replace_it_if_a_buffer_cannot_grow(
+    monkeypatch,
+):
+    """A table that never evicts grows its key map and then its value buffers, one decision.
+    The buffers are checked before the key map is replaced, so a checkpoint load (or a step)
+    that needs more rows than a host buffer reserved fails with the key map as it was.
+    """
+    monkeypatch.setattr(kvt, "_HOST_RESERVE_FLOOR_BYTES", PAGE)
+    monkeypatch.setenv("DYNAMICEMB_HOST_RESERVE_FACTOR", "1")
+    state = kvt.create_table_state(
+        [
+            host_options(256, 4096, no_eviction=True),
+            host_options(256, 512, no_eviction=True),
+        ],
+        AdamDynamicEmbeddingOptimizer(OptimizerArgs()),
+        use_rows=True,
+    )
+    key_map = state.key_index_map
+    rows = [t.shape[0] for t in state.tables]
+    generation = state.key_map_generation
+
+    # 2000 new keys for the second table, which reserved room for 512 rows
+    unique = torch.tensor([10, 2000], dtype=torch.int64)
+    with pytest.raises(RuntimeError, match="DYNAMICEMB_HOST_RESERVE_FACTOR"):
+        kvt.expand_if_need_impl(state, unique, exact=True)
+
+    assert state.key_index_map is key_map
+    assert state.key_map_generation == generation
+    assert [t.shape[0] for t in state.tables] == rows

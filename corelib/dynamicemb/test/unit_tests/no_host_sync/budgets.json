@@ -12,6 +12,23 @@
    "torch": "2.13.0a0+9186a08b2c.nv26.07",
    "cuda": "13.3",
    "python": "3.12.3"
+  },
+  "unmeasured": {
+   "what": "the cells below are claims, not measurements: the commit that deleted the device synchronize of ExtendableBuffer.extend set them to 0 before a census could run on a GPU. Take the census (host_sync_probe.py --json census.json; sync_budgets.py --from-report census.json --write) once the hardware gates of growth/gates have passed; a cell that measures above its claim names the call that still waits.",
+   "lowered_to_zero": [
+    "cache_storage_growth",
+    "hbm_only_growth",
+    "host_only_growth",
+    "cache_storage_noevict",
+    "hbm_only_noevict"
+   ],
+   "new_configs": [
+    "hybrid_growth",
+    "host_only_noevict",
+    "hbm_only_growth_wide",
+    "host_only_growth_wide",
+    "hbm_only_noevict_wide"
+   ]
   }
  },
  "cache_storage": {
@@ -199,28 +216,53 @@
  },
  "cache_storage_growth": {
   "all_hit": {"plain": 0, "prefetch": 0},
-  "miss": {"plain": 0.375, "prefetch": 0.375},
-  "growth": {"plain": 0.375, "prefetch": 0.375}
+  "miss": {"plain": 0, "prefetch": 0},
+  "growth": {"plain": 0, "prefetch": 0}
  },
  "hbm_only_growth": {
   "all_hit": {"plain": 0, "prefetch": 0},
-  "miss": {"plain": 0.375, "prefetch": 0.375},
-  "growth": {"plain": 0.375, "prefetch": 0.375}
+  "miss": {"plain": 0, "prefetch": 0},
+  "growth": {"plain": 0, "prefetch": 0}
  },
  "host_only_growth": {
   "all_hit": {"plain": 0, "prefetch": 0},
-  "miss": {"plain": 0.375, "prefetch": 0.375},
-  "growth": {"plain": 0.375, "prefetch": 0.375}
+  "miss": {"plain": 0, "prefetch": 0},
+  "growth": {"plain": 0, "prefetch": 0}
  },
  "cache_storage_noevict": {
   "all_hit": {"plain": 0, "prefetch": 0},
-  "miss": {"plain": 0.375, "prefetch": 0.375},
-  "growth": {"plain": 0.375, "prefetch": 0.375}
+  "miss": {"plain": 0, "prefetch": 0},
+  "growth": {"plain": 0, "prefetch": 0}
  },
  "hbm_only_noevict": {
   "all_hit": {"plain": 0, "prefetch": 0},
-  "miss": {"plain": 0.375, "prefetch": 0.375},
-  "growth": {"plain": 0.375, "prefetch": 0.375}
+  "miss": {"plain": 0, "prefetch": 0},
+  "growth": {"plain": 0, "prefetch": 0}
+ },
+ "hybrid_growth": {
+  "all_hit": {"plain": 0, "prefetch": 0},
+  "miss": {"plain": 0, "prefetch": 0},
+  "growth": {"plain": 0, "prefetch": 0}
+ },
+ "host_only_noevict": {
+  "all_hit": {"plain": 0, "prefetch": 0},
+  "miss": {"plain": 0, "prefetch": 0},
+  "growth": {"plain": 0, "prefetch": 0}
+ },
+ "hbm_only_growth_wide": {
+  "all_hit": {"plain": 0, "prefetch": 0},
+  "miss": {"plain": 0, "prefetch": 0},
+  "growth": {"plain": 0, "prefetch": 0}
+ },
+ "host_only_growth_wide": {
+  "all_hit": {"plain": 0, "prefetch": 0},
+  "miss": {"plain": 0, "prefetch": 0},
+  "growth": {"plain": 0, "prefetch": 0}
+ },
+ "hbm_only_noevict_wide": {
+  "all_hit": {"plain": 0, "prefetch": 0},
+  "miss": {"plain": 0, "prefetch": 0},
+  "growth": {"plain": 0, "prefetch": 0}
  },
  "cache_storage_determ": {
   "all_hit": {"plain": 1, "prefetch": 1},

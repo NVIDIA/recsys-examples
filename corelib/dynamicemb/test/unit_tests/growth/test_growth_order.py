@@ -10,13 +10,13 @@ after the growth, without the host waiting. These tests put a long ``torch.cuda.
 on the stream whose work the growth has to wait for, or on the growth stream itself, so
 that a missing edge shows as a wrong result instead of as a race that is usually won.
 
-What they can show depends on how much of a growth still blocks the host: while the
-rehash reads back counts (``.item()``) the growth stream is idle when the call returns and
-the host has waited for it, so the hazards of the late edges are hidden and the tests pass
-without exercising them; they are written for the rehash that reads nothing back. The edge
-of the growth towards work queued on another stream (``H1``) is visible in every case where
-no device-wide wait happens before the rehash: a table that never evicts and only grows its
-key map.
+They are written for a growth that makes the host wait for nothing: the rehash reads no
+count back and ``ExtendableBuffer.extend`` does not wait for the device. Were one of those to
+wait (a ``.item()`` in the rehash, a ``torch.cuda.synchronize()`` in ``extend``), the growth
+stream would be idle when the call returned and the late edges would be hidden: the tests
+would pass without exercising them. The edge of the growth towards work queued on another
+stream (``H1``) is shown by the table that never evicts, which only grows its key map, so
+nothing else is in the way of the rehash.
 """
 
 import contextlib
@@ -33,6 +33,7 @@ from dynamicemb import (
     EmbOptimType,
 )
 from dynamicemb import key_value_table as kvt
+from dynamicemb import sync_free as sf
 from dynamicemb.batched_dynamicemb_tables import BatchedDynamicEmbeddingTablesV2
 from dynamicemb.key_value_table import DynamicEmbStorage
 from dynamicemb.optimizer import AdamDynamicEmbeddingOptimizer, OptimizerArgs
@@ -246,6 +247,31 @@ def test_a_public_api_on_another_stream_comes_after_the_growth(
     torch.cuda.synchronize()
 
 
+def test_an_export_is_ordered_when_it_runs_not_when_the_iterator_is_made(
+    device, monkeypatch
+):
+    """The iterator is made on one stream, before the growth, and walked on a third
+    that nothing orders after the growth stream: the order has to be made by the first
+    ``next()``, on the stream that runs the kernels."""
+    storage = build_storage(device, num_tables=2)
+    state = storage._state
+    count = 300
+    keys = torch.arange(11_000, 11_000 + count, dtype=torch.int64, device=device)
+    fill(storage, keys, table_id=1)
+    prefetch, walker = torch.cuda.Stream(), torch.cuda.Stream()
+    iterator = storage.export_keys_values(device, table_id=1)
+
+    with late_rehash(monkeypatch):
+        with torch.cuda.stream(prefetch):
+            double(state, table_id=1, num_tables=2)
+        exported = set()
+        with torch.cuda.stream(walker):
+            for batch in iterator:
+                exported |= set(batch[0].tolist())
+    torch.cuda.synchronize()
+    assert exported == set(keys.tolist())
+
+
 def test_flush_orders_the_storage_below_the_cache_after_its_growth(device, monkeypatch):
     """``flush_cache`` writes into the storage below the cache, which grows on the
     prefetch stream."""
@@ -293,6 +319,34 @@ def test_the_replaced_key_map_is_not_reused_while_the_rehash_may_read_it(
     fresh = [torch.empty(size, dtype=torch.uint8, device=device) for _ in range(4)]
     for tensor in fresh:
         assert not (block <= tensor.data_ptr() < block + size), "the block was reused"
+    torch.cuda.synchronize()
+
+
+# --- a new state ---------------------------------------------------------------------
+
+
+def test_a_new_state_is_complete_when_it_is_returned(device, monkeypatch):
+    """The pointer table, the row limits and the bucket offsets are uploaded by queued
+    copies on the stream that makes the state; the first use of it can be on another
+    stream that nothing orders after that one. The upload is made late here: the state
+    still has to be complete when ``create_table_state`` returns."""
+    real = sf.upload_i64
+
+    def late(values, dev):
+        torch.cuda._sleep(SLEEP)
+        return real(values, dev)
+
+    monkeypatch.setattr(sf, "upload_i64", late)
+    construction = torch.cuda.Stream()
+    with torch.cuda.stream(construction):
+        state = kvt.create_table_state(
+            [options_of(device)], AdamDynamicEmbeddingOptimizer(OptimizerArgs())
+        )
+    # the default stream, with nothing that orders it after ``construction``
+    assert state.table_ptrs_dev.tolist() == state.table_ptrs_host
+    assert state.key_index_map.table_bucket_offsets_.tolist() == (
+        state.key_index_map.bucket_offsets_host_
+    )
     torch.cuda.synchronize()
 
 
