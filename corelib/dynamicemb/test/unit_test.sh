@@ -30,6 +30,9 @@ FWD_BWD_TEST_FILES=(
     "test/unit_tests/test_check_scores_late.py"
     "test/unit_tests/test_table_rows.py"
     "test/unit_tests/test_write_back_masked.py"
+    # The padded Storage contract (find_masked / insert_masked) and the adapter that
+    # serves a class that has not adopted it.
+    "test/unit_tests/padded_contract/test_storage_adapters.py"
     "test/unit_tests/test_cache_metrics_device.py"
     "test/unit_tests/test_find_load_primitives.py"
     "test/unit_tests/test_int64_weights_channel.py"

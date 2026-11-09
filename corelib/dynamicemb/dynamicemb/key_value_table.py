@@ -27,7 +27,6 @@ from typing import (
     Dict,
     Iterator,
     List,
-    NamedTuple,
     Optional,
     Sequence,
     Set,
@@ -72,6 +71,8 @@ from dynamicemb.types import (
     SCORE_TYPE,
     Cache,
     CopyMode,
+    MaskedFind,
+    PaddedFind,
     ReplayStats,
     Storage,
     torch_dtype_to_np_dtype,
@@ -3266,6 +3267,9 @@ def _erase_state_keys(
 
 
 class DynamicEmbCache(Cache):
+    # The padded lookup paths read this class's table state (see ``Cache``).
+    accepts_empty_keys = True
+
     def __init__(
         self,
         options: List[DynamicEmbTableOptions],
@@ -3449,27 +3453,6 @@ class DynamicEmbCache(Cache):
 # ---------------------------------------------------------------------------
 
 
-class MaskedFind(NamedTuple):
-    """What :meth:`DynamicEmbStorage.lookup_masked` (or the hybrid one) found.
-
-    Nothing is compacted and no count is read back: every field is as long as
-    the keys that were looked up, and a lane whose key is the reserved all-ones
-    key (``sf.mask_keys``) is not found and owns no row, so a caller leaves a key
-    out of a lookup, and out of the load that follows it, by masking the key.
-    """
-
-    founds: Tensor  # bool[N]
-    # The full-length score tensor the lookups used (``None`` for an LRU table and
-    # for a const lookup). A later insert, or the lookup of a second tier, takes
-    # it as is: the kernels read ``score_input[i]`` for every lane, masked ones
-    # included, so it must never be compacted.
-    score_in: Optional[Tensor]
-    scores: Tensor  # int64[N]
-    # Opaque token for ``load_masked``: the value rows (a tensor, ``-1`` where
-    # there is none), or one such tensor per tier for a ``HybridStorage``.
-    rows: Any
-
-
 def _compact_missing(
     state: DynamicEmbTableState,
     unique_keys: torch.Tensor,
@@ -3530,6 +3513,11 @@ def _select_refused_values(
 
 
 class DynamicEmbStorage(Storage):
+    # The padded contract of ``Storage``: ``lookup_masked`` / ``load_masked`` /
+    # ``find_masked`` / ``insert_masked`` below take arrays of the batch's length with
+    # inert rows and read nothing back. This is the reference implementation.
+    accepts_empty_keys = True
+
     def __init__(
         self,
         options: List[DynamicEmbTableOptions],
@@ -3792,13 +3780,16 @@ class DynamicEmbStorage(Storage):
         table_ids: torch.Tensor,
         lfu_accumulated_frequency: Optional[torch.Tensor] = None,
         key_scores: Optional[torch.Tensor] = None,
+        copy_mode: Optional[CopyMode] = None,
     ) -> MaskedFind:
         """:meth:`find` without the host count: one lookup of every key.
 
         The lookup scores exactly as :meth:`find` does (const outside training).
         Nothing is compacted and nothing is read back; a key that must not take
         part is replaced by the reserved key (``sf.mask_keys``) and comes back
-        not found, with row ``-1`` and its score untouched.
+        not found, with row ``-1`` and its score untouched. ``copy_mode`` is
+        accepted for the signature of :meth:`Storage.lookup_masked` and ignored:
+        the rows are loaded by :meth:`load_masked`.
         """
         r = _find_keys(
             self._state,
@@ -3824,6 +3815,32 @@ class DynamicEmbStorage(Storage):
         return load_from_flat(
             self._state, found.rows, table_ids, copy_mode, output=output
         )
+
+    def find_masked(
+        self,
+        keys: torch.Tensor,
+        table_ids: torch.Tensor,
+        copy_mode: CopyMode,
+        lfu_accumulated_frequency: Optional[torch.Tensor] = None,
+        key_scores: Optional[torch.Tensor] = None,
+    ) -> PaddedFind:
+        """The padded :meth:`Storage.find_masked`: a lookup and a load of every lane."""
+        found = self.lookup_masked(
+            keys, table_ids, lfu_accumulated_frequency, key_scores
+        )
+        return PaddedFind(found.founds, self.load_masked(found, table_ids, copy_mode))
+
+    def insert_masked(
+        self,
+        keys: torch.Tensor,
+        table_ids: torch.Tensor,
+        values: torch.Tensor,
+        scores: Optional[torch.Tensor] = None,
+        preserve_existing: bool = False,
+    ) -> None:
+        # ``insert`` already has the padded semantics: a reserved key gets no row
+        # and no store.
+        self.insert(keys, table_ids, values, scores, preserve_existing)
 
     def find(
         self,
@@ -4320,6 +4337,9 @@ class DynamicEmbStorage(Storage):
 class HybridStorage(Storage):
     """Two-tier storage: HBM (GPU) table + host table, disjoint partitions."""
 
+    # The padded contract of ``Storage`` (see ``DynamicEmbStorage``).
+    accepts_empty_keys = True
+
     def __init__(
         self,
         hbm_options: List[DynamicEmbTableOptions],
@@ -4467,6 +4487,7 @@ class HybridStorage(Storage):
         table_ids: torch.Tensor,
         lfu_accumulated_frequency: Optional[torch.Tensor] = None,
         key_scores: Optional[torch.Tensor] = None,
+        copy_mode: Optional[CopyMode] = None,
     ) -> MaskedFind:
         """:meth:`find` without the host counts: both tiers, no compaction.
 
@@ -4527,6 +4548,31 @@ class HybridStorage(Storage):
         return load_from_flat(
             self._host, found.rows[1], table_ids, copy_mode, output=values
         )
+
+    def find_masked(
+        self,
+        keys: torch.Tensor,
+        table_ids: torch.Tensor,
+        copy_mode: CopyMode,
+        lfu_accumulated_frequency: Optional[torch.Tensor] = None,
+        key_scores: Optional[torch.Tensor] = None,
+    ) -> PaddedFind:
+        """The padded :meth:`Storage.find_masked`: a lookup and a load of every lane."""
+        found = self.lookup_masked(
+            keys, table_ids, lfu_accumulated_frequency, key_scores
+        )
+        return PaddedFind(found.founds, self.load_masked(found, table_ids, copy_mode))
+
+    def insert_masked(
+        self,
+        keys: torch.Tensor,
+        table_ids: torch.Tensor,
+        values: torch.Tensor,
+        scores: Optional[torch.Tensor] = None,
+        preserve_existing: bool = False,
+    ) -> None:
+        # ``insert`` already has the padded semantics (see there).
+        self.insert(keys, table_ids, values, scores, preserve_existing)
 
     def find(
         self,
