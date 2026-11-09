@@ -325,6 +325,36 @@ struct GatheredMap {
   __host__ __device__ int32_t position(int64_t row) const { return words[2 * rows + row]; }
 };
 
+// A requester's row of node_offsets (NodeRow): what the node layout (node.cuh) reads of its
+// bucketize's offset_per_bucket_feature (opbf, [world_size * num_features + 1]), which it pushes
+// to every node peer. Across nodes first, for each target t of the node, its keys for the owners
+// (n, t) of the other nodes, which go to t's remote part (x0 = local_size words; none on one
+// node); then its offsets at the bucket features of its own node's owners, opbf[node *
+// local_size * num_features + j] for j in [0, local_size * num_features] (X); then a 0 that fills
+// a whole 16-byte unit.
+struct NodeRow {
+  int64_t x0, words;
+  __host__ __device__ static NodeRow of(const Topo &topo, int64_t num_features) {
+    const int64_t x0 = topo.num_nodes > 1 ? topo.local_size : 0;
+    return NodeRow{x0, (x0 + topo.local_size * num_features + 2) / 2 * 2};
+  }
+  // Word w of a requester's row, from its offset_per_bucket_feature.
+  __device__ __forceinline__ int64_t word(const int64_t *opbf, const Topo &topo,
+                                          int64_t num_features, int64_t w) const {
+    const int64_t local_size = topo.local_size, node_features = local_size * num_features;
+    if (w < x0) {
+      int64_t keys = 0;
+      for (int64_t node = 0; node < topo.num_nodes; ++node) {
+        if (node == topo.node) continue;
+        const int64_t owner = node * local_size + w;
+        keys += opbf[(owner + 1) * num_features] - opbf[owner * num_features];
+      }
+      return keys;
+    }
+    return w - x0 <= node_features ? opbf[topo.node * node_features + w - x0] : 0;
+  }
+};
+
 // The buffers of the keys section whose words a requester gathers from its
 // node peers (peer_gather): of a proxy header, one word per item (its word
 // number); of remote_map, the RemoteMap::kArrays words of an occurrence (its
@@ -337,9 +367,9 @@ __host__ __device__ constexpr int gather_words(GatherFrom from) {
 
 // The keys section, its buffers in this order (those marked num_nodes > 1
 // exist across nodes only):
-//   node_offsets  int64 [local_size][world_size * num_features + 1]: row r is the
-//                 offset_per_bucket_feature of the node's requester r in the call, which it
-//                 pushed here (node_exchange)
+//   node_offsets  int64 [local_size][NodeRow::words]: row r is the node's requester r's row in
+//                 the call (NodeRow: what the node layout reads of its
+//                 offset_per_bucket_feature), which it pushed here (node_exchange)
 //   node_keys     the keys this rank's node pushed to it (node_key_push):
 //                 its own part at [0, lookup_keys), the keys of its node for
 //                 it as owner, in its KJT's order ([feature][requester]
@@ -366,7 +396,7 @@ class KeysLayout {
   __host__ __device__ KeysLayout(const Sizes &sizes, char *base)
       : base_(base),
         local_size_(sizes.topo.local_size),
-        offset_words_((int64_t)sizes.topo.world_size * sizes.num_features + 1),
+        offset_words_(NodeRow::of(sizes.topo, sizes.num_features).words),
         lookup_keys_(sizes.lookup_keys),
         remote_keys_(sizes.remote_keys),
         max_chunks_(sizes.max_chunks) {
@@ -406,7 +436,7 @@ class KeysLayout {
             {"rail_keys", bytes_ - rail_keys_}};
   }
 
-  // The words of a row of node_offsets, and requester `requester`'s row.
+  // The words of a row of node_offsets (NodeRow::words), and requester `requester`'s row.
   __host__ __device__ int64_t offset_words() const { return offset_words_; }
   __host__ __device__ int64_t *node_offsets(int64_t requester) const {
     return (int64_t *)(base_ + node_offsets_) + requester * offset_words_;

@@ -18,8 +18,11 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 // node peers and the rail peers, and the in channel's functions that launch
 // them (input_dist.h). The planner's steps (planner.h) run between
 // them on the same stream, in the order of InChannel::input_dist:
-//   node_exchange         this rank's offsets into node_offsets at each node peer, over NVLink;
-//                         the node barrier of the call; the node layout from the node's offsets;
+//   node_exchange         this rank's row (NodeRow) into node_offsets at each node peer, over
+//                         NVLink (a large row: node_rows_push, a grid that does not wait, just
+//                         before); the node barrier of the call; the node layout from the node's
+//                         rows (its items on a grid just after when they are many:
+//                         node_layout_items);
 //   node_key_push         the bucketize's gather: this rank's keys into their places in their
 //                         targets' node_keys, over NVLink;
 //   node_done             tells each target its keys are there, and waits until every requester
@@ -84,25 +87,61 @@ namespace hier_output_dist {
 // communicator), its sizes, and if it waits the call's sequence number
 // (seq, in_seq): then the call's tensors.
 
-// 1 CTA: this rank's offsets (its bucketize's offset_per_bucket_feature) go into its row of
-// node_offsets at each node peer, its own too, over NVLink. Then a system fence, and its
-// in_started gets the call (the node barrier). It waits until each peer's in_started holds the
-// call: every peer's offsets are then in node_offsets here. From them it makes the node layout
-// (node_layout_of; on one node also the owner's KJT offsets). Passing the barrier also means
-// every peer finished its previous call's in channel, whose steps read what this call writes
-// into their copies of the window (node_keys). delay_ns (the test hook delay_node_reads, 0:
-// none): thread 0 waits that long after the barrier, so the layout reads node_offsets late.
+// This rank's row of node_offsets (NodeRow, from its bucketize's offset_per_bucket_feature) into
+// its place at every node peer, its own too, over NVLink, in 16-byte units: items [first, end) in
+// steps of `stride`, an item a unit at a peer, peer after peer.
+__device__ __forceinline__ void push_node_row(const NodeWindow &node, const KeysLayout &keys,
+                                              const Sizes &sizes, const int64_t *opbf,
+                                              int64_t first, int64_t stride) {
+  const NodeRow row = NodeRow::of(sizes.topo, sizes.num_features);
+  const int64_t units = row.words / 2;
+  int4 *mine = (int4 *)keys.node_offsets(sizes.topo.local_rank);
+  for (int64_t item = first; item < sizes.topo.local_size * units; item += stride) {
+    const int64_t peer = item / units, unit = item % units;
+    const int64_t lo = row.word(opbf, sizes.topo, sizes.num_features, 2 * unit),
+                  hi = row.word(opbf, sizes.topo, sizes.num_features, 2 * unit + 1);
+    int4 value;
+    value.x = (int)(uint32_t)lo;
+    value.y = (int)(uint32_t)((uint64_t)lo >> 32);
+    value.z = (int)(uint32_t)hi;
+    value.w = (int)(uint32_t)((uint64_t)hi >> 32);
+    node.peer(mine, (int)peer)[unit] = value;
+  }
+}
+
+// Every CTA, a thread per 16-byte unit of the row at a peer: the push of this rank's row
+// (push_node_row) when it is too large for node_exchange's CTA. It does not wait: this rank's
+// node_done of the call before, earlier on the stream, saw every peer tell it read its
+// node_offsets. Each CTA fences its stores at system scope before it ends, so node_exchange's
+// release, after it on the stream, publishes them.
+__global__ void __launch_bounds__(kThreads)
+    node_rows_push_kernel(ncclWindow_t window, Sizes sizes,
+                          const int64_t *offset_per_bucket_feature) {
+  const NodeWindow node(window, sizes.topo.local_rank);
+  push_node_row(node, node.layout(sizes).keys, sizes, offset_per_bucket_feature, first_item(),
+                item_stride());
+  __syncthreads();
+  if (threadIdx.x == 0) fence_sc_sys();
+}
+
+// 1 CTA: this rank's row (NodeRow: what the node layout reads of its bucketize's
+// offset_per_bucket_feature) goes into its place in node_offsets at each node peer, its own too,
+// over NVLink, unless node_rows_push did (push false). Then a system fence, and its in_started
+// gets the call (the node barrier). It waits until each peer's in_started holds the call: every
+// peer's row is then in node_offsets here. From them it makes the node layout (node_layout_small;
+// and its items (node_layout_items) unless node_layout_items_kernel does them just after, items
+// false; on one node also the owner's KJT offsets). Passing the barrier also means every peer
+// finished its previous call's in channel, whose steps read what this call writes into their
+// copies of the window (node_keys). delay_ns (the test hook delay_node_reads, 0: none): thread 0
+// waits that long after the barrier, so the layout reads node_offsets late.
 __global__ void __launch_bounds__(kThreads)
     node_exchange_kernel(ncclWindow_t window, Sizes sizes, int64_t seq,
-                         const int64_t *offset_per_bucket_feature, int64_t *scratch,
-                         int64_t delay_ns, NodeLayoutView layout) {
+                         const int64_t *offset_per_bucket_feature, bool push, bool items,
+                         int64_t *scratch, int64_t delay_ns, NodeLayoutView layout) {
   const int local_size = sizes.topo.local_size, me = sizes.topo.local_rank, tid = threadIdx.x;
   const NodeWindow node(window, me);
   const KeysLayout keys = node.layout(sizes).keys;
-  const int64_t words = keys.offset_words();
-  int64_t *mine = keys.node_offsets(me);
-  for (int64_t i = tid; i < local_size * words; i += blockDim.x)
-    node.peer(mine, (int)(i / words))[i % words] = offset_per_bucket_feature[i % words];
+  if (push) push_node_row(node, keys, sizes, offset_per_bucket_feature, tid, blockDim.x);
   __syncthreads();
   const NodeBarrier barrier{sizes, node, node.layout(sizes).ctrl.in_started(), seq};
   if (tid == 0) {
@@ -115,8 +154,27 @@ __global__ void __launch_bounds__(kThreads)
     while (now_ns() - start < (uint64_t)delay_ns) __nanosleep(1000);
   }
   __syncthreads();
-  node_layout_of(keys.node_offsets(0), sizes.topo, sizes.num_features, sizes.lookup_keys,
-                 sizes.remote_keys, scratch, layout);
+  const NodeRows rows{keys.node_offsets(0), NodeRow::of(sizes.topo, sizes.num_features)};
+  node_layout_small(rows, offset_per_bucket_feature, sizes.topo, sizes.num_features,
+                    sizes.lookup_keys, sizes.remote_keys, scratch, layout);
+  if (!items) return;
+  __syncthreads();
+  node_layout_items(rows, offset_per_bucket_feature, sizes.topo, sizes.num_features, scratch, tid,
+                    blockDim.x, layout);
+}
+
+// Every CTA, a thread per item: the node layout's items (node_layout_items) when they are too
+// many for node_exchange's CTA, just after it on the stream, from node_layout_small's scratch. It
+// reads node_offsets before this rank's node_done of the call, as node_exchange does.
+__global__ void __launch_bounds__(kThreads)
+    node_layout_items_kernel(ncclWindow_t window, Sizes sizes,
+                             const int64_t *offset_per_bucket_feature, const int64_t *scratch,
+                             NodeLayoutView layout) {
+  const NodeWindow node(window, sizes.topo.local_rank);
+  const NodeRows rows{node.layout(sizes).keys.node_offsets(0),
+                      NodeRow::of(sizes.topo, sizes.num_features)};
+  node_layout_items(rows, offset_per_bucket_feature, sizes.topo, sizes.num_features, scratch,
+                    first_item(), item_stride(), layout);
 }
 
 // Every CTA, a thread per bucketized row (push_rows): the bucketize's gather. Each valid row's
@@ -303,18 +361,48 @@ __global__ void rail_done_kernel(ncclDevComm dev, Sizes sizes, int64_t seq) {
 
 // The launchers.
 
+namespace {
+// The test hook's paths of node_exchange (force_node_paths): -1 as the sizes choose, 0 a grid,
+// 1 its CTA.
+int64_t g_node_push = -1, g_node_items = -1;
+}  // namespace
+
+void force_node_paths(int64_t push, int64_t items) {
+  g_node_push = push;
+  g_node_items = items;
+}
+
 NodeLayout InChannel::node_exchange(const BucketizedKeys &bucketized, int64_t delay_ns) {
   const auto options = bucketized.offset_per_bucket.options();
-  NodeLayout node = empty_node_layout(sizes_.topo, sizes_.num_features, options);
-  const at::Tensor scratch =
-      at::empty({node_layout_scratch(sizes_.topo, sizes_.num_features)}, options);
+  const Topo &topo = sizes_.topo;
+  NodeLayout node = empty_node_layout(topo, sizes_.num_features, options);
+  const at::Tensor scratch = at::empty({node_layout_scratch(topo, sizes_.num_features)}, options);
+  const int64_t *opbf = bucketized.offset_per_bucket_feature.data_ptr<int64_t>();
+  // node_exchange's CTA pushes the row and lays out the items when they are few; else a grid
+  // just before it pushes, and one just after lays out (no allocation in between: see
+  // input_dist.cu).
+  const NodeRow row = NodeRow::of(topo, sizes_.num_features);
+  const int64_t items = node_layout_items_of(topo, sizes_.num_features);
+  const bool push =
+      g_node_push >= 0 ? g_node_push > 0 : topo.local_size * row.words <= kNodeRowWordsInCta;
+  const bool lay_out = g_node_items >= 0 ? g_node_items > 0 : items <= kNodeItemsInCta;
+  if (!push) {
+    node_rows_push_kernel<<<item_grid(topo.local_size * row.words / 2), kThreads, 0,
+                            current_stream()>>>(window_, sizes_, opbf);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+  }
   // The call's sequence number. seq_ takes it only once the kernel is launched.
   const int64_t seq = seq_ + 1;
   node_exchange_kernel<<<kOneCta, kThreads, 0, current_stream()>>>(
-      window_, sizes_, seq, bucketized.offset_per_bucket_feature.data_ptr<int64_t>(),
-      scratch.data_ptr<int64_t>(), delay_ns, view_of(node));
+      window_, sizes_, seq, opbf, push, lay_out, scratch.data_ptr<int64_t>(), delay_ns,
+      view_of(node));
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   seq_ = seq;
+  if (!lay_out) {
+    node_layout_items_kernel<<<item_grid(items), kThreads, 0, current_stream()>>>(
+        window_, sizes_, opbf, scratch.data_ptr<int64_t>(), view_of(node));
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+  }
   return node;
 }
 

@@ -293,10 +293,10 @@ __device__ __forceinline__ int64_t key_of_representative(
 // each occurrence is one). From them: the node-unique keys of each bucket
 // feature and where they start (key_offsets: key_of_representative numbers
 // each bucket feature's keys from there), and those of each owner node.
-// local_size * num_nodes * num_features blocks on one CTA, whose reads do
-// not wait on each other: the order of the node layout's row_shift
-// (world_size * num_features entries), also one CTA's. scratch:
-// block_scratch words, block_offsets written.
+// local_size * num_nodes * num_features blocks on one CTA, a tile of
+// kScanItems bucket features per thread at a time (cta_scan_blocked), whose
+// reads do not wait on each other. scratch: block_scratch words,
+// block_offsets written.
 __global__ void __launch_bounds__(kThreads)
     blocks_kernel(const int32_t *reps_before, int64_t local_size, int64_t num_nodes,
                   int64_t num_features, int64_t *scratch, int64_t *node_length_per_bucket_feature,
@@ -308,18 +308,19 @@ __global__ void __launch_bounds__(kThreads)
   // their end
   const int64_t *block_offsets = scratch;
   int64_t *key_offsets = scratch + local_size * columns;
-  for (int64_t bucket_feature = threadIdx.x; bucket_feature < bucket_features;
-       bucket_feature += kThreads) {
-    int64_t keys = 0;
-    for (int64_t requester = 0; requester < local_size; ++requester)
-      keys += block_reps(block_offsets, columns, reps_before, requester, bucket_feature);
-    node_length_per_bucket_feature[bucket_feature] = keys;
-  }
-  __syncthreads();
-  const int64_t total = cta_offsets_of<int64_t>(
+  // each bucket feature's keys and where they start, a tile of loads at a time
+  const int64_t total = cta_scan_blocked<kScanItems, int64_t>(
       bucket_features,
-      [&](int64_t bucket_feature) { return node_length_per_bucket_feature[bucket_feature]; },
-      key_offsets);
+      [&](int64_t bucket_feature) {
+        int64_t keys = 0;
+        for (int64_t requester = 0; requester < local_size; ++requester)
+          keys += block_reps(block_offsets, columns, reps_before, requester, bucket_feature);
+        node_length_per_bucket_feature[bucket_feature] = keys;
+        return keys;
+      },
+      [&](int64_t bucket_feature, int64_t offset) { key_offsets[bucket_feature] = offset; });
+  if (threadIdx.x == 0) key_offsets[bucket_features] = total;
+  __syncthreads();
   for (int64_t owner_node = threadIdx.x; owner_node <= num_nodes; owner_node += kThreads) {
     node_offset_per_bucket[owner_node] = key_offsets[owner_node * num_features];
     if (owner_node < num_nodes)

@@ -123,24 +123,24 @@ Topo topo_of(int64_t num_nodes, int64_t local_size, int64_t node, int64_t local_
 }
 
 // One rank of a node: its node layout (node_layout) on the node's offsets (node_offsets: int64
-// [local_size][world_size * num_features + 1], row r requester r's offset_per_bucket_feature, as
-// node_exchange gathers them), by name (remote_offsets and need_remote across nodes,
-// kjt_offsets and length_per_key on one node). On one node, given the own part of its node_keys
+// [local_size][world_size * num_features + 1], row r requester r's offset_per_bucket_feature, of
+// which node_exchange gathers the rows they push), by name (remote_offsets and need_remote across
+// nodes, kjt_offsets and length_per_key on one node). items_in_cta: lay the items out on one CTA
+// or on a grid (none: as node_exchange chooses). On one node, given the own part of its node_keys
 // once every requester pushed (node_keys, and node_key_weights with weights: [lookup_keys]) and
 // the src its own push wrote, also its KJT and src (one_node_owner).
-std::map<std::string, at::Tensor> node_layout_test(at::Tensor node_offsets, int64_t num_nodes,
-                                                   int64_t local_size, int64_t node,
-                                                   int64_t local_rank, int64_t num_features,
-                                                   int64_t lookup_keys, int64_t remote_keys,
-                                                   c10::optional<at::Tensor> node_keys,
-                                                   c10::optional<at::Tensor> node_key_weights,
-                                                   c10::optional<at::Tensor> src) {
+std::map<std::string, at::Tensor> node_layout_test(
+    at::Tensor node_offsets, int64_t num_nodes, int64_t local_size, int64_t node,
+    int64_t local_rank, int64_t num_features, int64_t lookup_keys, int64_t remote_keys,
+    c10::optional<at::Tensor> node_keys, c10::optional<at::Tensor> node_key_weights,
+    c10::optional<at::Tensor> src, c10::optional<bool> items_in_cta) {
   c10::cuda::CUDAGuard guard(node_offsets.device());
   const Topo topo = topo_of(num_nodes, local_size, node, local_rank);
   TORCH_CHECK(num_features >= 1 && lookup_keys >= 0 && remote_keys >= 0 &&
                   (num_nodes > 1 || remote_keys == 0),
               "hier_output_dist: node_layout's sizes (remote_keys 0 on one node)");
-  const NodeLayout layout = node_layout(node_offsets, topo, num_features, lookup_keys, remote_keys);
+  const NodeLayout layout =
+      node_layout(node_offsets, topo, num_features, lookup_keys, remote_keys, items_in_cta);
   std::map<std::string, at::Tensor> named{{"own_lengths", layout.own_lengths},
                                           {"own_offsets", layout.own_offsets},
                                           {"own_total", layout.own_total},
@@ -516,7 +516,8 @@ void bind_testing(py::module &py_module) {
                 py::arg("node_offsets"), py::arg("num_nodes"), py::arg("local_size"),
                 py::arg("node"), py::arg("local_rank"), py::arg("num_features"),
                 py::arg("lookup_keys"), py::arg("remote_keys"), py::arg("node_keys") = py::none(),
-                py::arg("node_key_weights") = py::none(), py::arg("src") = py::none());
+                py::arg("node_key_weights") = py::none(), py::arg("src") = py::none(),
+                py::arg("items_in_cta") = py::none());
   py_module.def("hier_output_dist_node_push", &node_push_test,
                 "One requester's push of its bucketized rows into stand-ins for its targets' "
                 "node_keys ([local_size] rows), in place",
@@ -533,6 +534,11 @@ void bind_testing(py::module &py_module) {
                 "node_done and the first read of node_keys. Its rank reads the node's offsets and "
                 "keys late",
                 py::arg("ns"));
+  py_module.def("hier_output_dist_node_paths", &force_node_paths,
+                "Each later input dist of this process pushes its row of node_offsets (push) and "
+                "lays out the node's items (items) on node_exchange's CTA (1) or on a grid (0), or "
+                "as their sizes choose (-1)",
+                py::arg("push"), py::arg("items"));
   py_module.def(
       "hier_output_dist_proxy_plan", &proxy_plan_test,
       "One proxy's steps of a call across nodes on plain tensors, which it writes as "

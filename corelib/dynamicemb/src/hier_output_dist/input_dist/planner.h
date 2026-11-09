@@ -19,8 +19,8 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 // and CUB's radix sorts and scans (cub.cu), none of which waits for the
 // device. The bucketize, the owner's KJT on one node, the proxy, the rail and
 // the owner, and the requester. node_exchange makes the node
-// layout (node_layout_of, node.cuh); node_layout() and push_to_node_keys()
-// here are the hooks'. Every table of a step is sized by the op's sizes
+// layout (node_layout_small and node_layout_items, node.cuh); node_layout()
+// and push_to_node_keys() here are the hooks'. Every table of a step is sized by the op's sizes
 // (Sizes, from its configuration: config.h), never by a device value.
 #pragma once
 
@@ -175,9 +175,12 @@ struct NodeLayout {
   at::Tensor length_per_key;  // (one node) int64 [num_features]
 };
 // The layout as node_exchange makes it, from the node's offsets (node_offsets: int64
-// [local_size][world_size * num_features + 1], row r requester r's offset_per_bucket_feature).
+// [local_size][world_size * num_features + 1], row r requester r's offset_per_bucket_feature):
+// from the rows the requesters push (NodeRow, window.h). items_in_cta: whether one CTA lays out
+// the items (node_layout_items, node.cuh) or a grid does (none: as node_exchange chooses).
 NodeLayout node_layout(const at::Tensor &node_offsets, const Topo &topo, int64_t num_features,
-                       int64_t lookup_keys, int64_t remote_keys);
+                       int64_t lookup_keys, int64_t remote_keys,
+                       c10::optional<bool> items_in_cta = c10::nullopt);
 // The tensors of a NodeLayout, empty: remote_offsets and need_remote across nodes, kjt_offsets
 // and length_per_key on one node.
 NodeLayout empty_node_layout(const Topo &topo, int64_t num_features,

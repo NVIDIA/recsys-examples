@@ -121,8 +121,10 @@ InChannel::InChannel(const Config &config, const Sizes &sizes, ncclWindow_t wind
 InDist InChannel::input_dist(const PlanInput &input) {
   c10::cuda::CUDAGuard device_guard(device_);
   at::NoGradGuard no_grad;
-  // The inputs first. A call takes its sequence number when it launches its first comm kernel
-  // (node_exchange). A call that raises before that, on an input check or a failed allocation,
+  // The inputs first. A call takes its sequence number when it launches its first waiting comm
+  // kernel (node_exchange; a large row's push runs just before it and waits for nothing: no peer
+  // reads the row before this rank's in_started holds the call, and a later call writes it
+  // again). A call that raises before that, on an input check or a failed allocation,
   // takes none, and its node peers wait at the node barrier for the call that does. A call that
   // raises between its first and its last comm kernel can leave its peers waiting.
   TORCH_CHECK(input.weights.has_value() == weighted_,
@@ -144,11 +146,12 @@ InDist InChannel::input_dist(const PlanInput &input) {
   fwd.offset_per_bucket = bwd.offset_per_bucket = bucketized.offset_per_bucket;
   fwd.inv = bwd.inv = bucketized.inv;
   fwd.fanout = bwd.fanout = fanout;
-  // The node: every rank's offsets (and the node barrier), and the layout of the node's keys.
-  // Then this rank's keys go to their places in their targets' node_keys, and the node tells
-  // that they are there. src is allocated first: nothing allocates from node_exchange to
-  // node_done. node_done runs in every call, also with no rows and under skip: its tell also
-  // says that this rank's node_exchange read node_offsets, so its peers may write them again.
+  // The node: every rank's row of offsets (and the node barrier), and the layout of the node's
+  // keys. Then this rank's keys go to their places in their targets' node_keys, and the node
+  // tells that they are there. src is allocated first: nothing allocates from node_exchange (and
+  // its row push) to node_done. node_done runs in every call, also with no rows and under skip: its
+  // tell also says that this rank's node_exchange read node_offsets, so its peers may write them
+  // again.
   const int64_t rows = bucketized.inv.numel();
   at::Tensor src;  // one node: each row's place in its owner's KJT
   if (num_nodes == 1) src = at::empty({rows}, bucketized.inv.options());

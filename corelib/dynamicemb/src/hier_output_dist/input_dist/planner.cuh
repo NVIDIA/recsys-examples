@@ -66,7 +66,7 @@ T *data_or_null(const at::Tensor &tensor) {
 }
 
 // A tensor of int32 (or int64) words as the records it holds (Chunk,
-// OwnerChunk, PutSeg: whole words).
+// OwnerChunk: whole words).
 template <typename Record>
 Record *records_of(const at::Tensor &table) {
   static_assert(sizeof(Record) % 4 == 0, "a record is whole int32 words");
@@ -175,6 +175,46 @@ __device__ T cta_offsets_of(int64_t n, Value value, T *offsets) {
   __syncthreads();
   return total;
 }
+
+// Every thread of the CTA: the offsets of n values, as cta_offsets_of, a tile of kThreads *
+// kItems values at a time, each thread kItems consecutive ones, all of whose values it reads
+// before the tile's one BlockScan: a tile costs one wait for its loads, so a long table costs
+// kItems times fewer. value(index) is called once for each index below n; write(index, offset)
+// gets each offset, and the total goes to every thread (no offsets[n]).
+template <int kItems, typename T, typename Value, typename Write>
+__device__ T cta_scan_blocked(int64_t n, Value value, Write write) {
+  using Scan = cub::BlockScan<T, kThreads>;
+  __shared__ typename Scan::TempStorage scan;
+  __shared__ T carry;
+  if (threadIdx.x == 0) carry = 0;
+  __syncthreads();
+  for (int64_t tile = 0; tile < n; tile += (int64_t)kThreads * kItems) {
+    const int64_t first = tile + (int64_t)threadIdx.x * kItems;
+    T values[kItems];
+    T sum = 0;
+#pragma unroll
+    for (int i = 0; i < kItems; ++i) {
+      values[i] = first + i < n ? (T)value(first + i) : (T)0;
+      sum += values[i];
+    }
+    T before, total;
+    Scan(scan).ExclusiveSum(sum, before, total);
+    T at = carry + before;
+#pragma unroll
+    for (int i = 0; i < kItems; ++i) {
+      if (first + i < n) write(first + i, at);
+      at += values[i];
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) carry += total;
+    __syncthreads();
+  }
+  const T total = carry;
+  __syncthreads();
+  return total;
+}
+// The values a thread of cta_scan_blocked takes at a time.
+constexpr int kScanItems = 8;
 
 // Every thread of the CTA: the largest of value(index) for index in [0, n)
 // (`least` when n is 0), to every thread.

@@ -49,7 +49,9 @@ and the push of its node's keys, on one GPU, on plain tensors:
   requester-major, then owner node, then feature-major. The entries past
   them, and under skip every entry, keep their garbage. On one node it also
   checks each requester's map into its owners' KJTs (``src``) and each
-  owner's KJT.
+  owner's KJT. The layout's items, laid out on one CTA and on a grid
+  (node_exchange's two paths), give the same tables; cases of 127 to 300
+  features take the grid by default.
 
 Every call of the planner runs under ``torch.cuda.set_sync_debug_mode
 ("error")``, so an op that waits for the device fails the test.
@@ -713,6 +715,15 @@ NODE_CASES = [
     NodeCase("4 nodes of 3, node 1", 4, 3, num_features=1, node=1),
     NodeCase("2 nodes of 1", num_nodes=2, local_size=1),
     NodeCase("4 nodes of 8", 4, 8, num_features=4, node=3),
+    # many features: the rows past one CTA's 64 KiB, the items past its share
+    # (node_exchange's grids); odd local_size * num_features
+    NodeCase("one node of 3, 127 features", 1, 3, num_features=127, max_len=2),
+    NodeCase(
+        "2 nodes of 8, 300 features, node 1", 2, 8, num_features=300, node=1, max_len=2
+    ),
+    NodeCase(
+        "3 nodes of 3, 129 features, node 2", 3, 3, num_features=129, node=2, max_len=2
+    ),
     NodeCase("2 nodes, exact fit", 2, 4, node=1, lookup_slack=0, remote_slack=0),
     NodeCase("2 nodes, remote_keys overflow", 2, 4, remote_slack=-1),
     NodeCase("2 nodes, lookup_keys overflow", 2, 4, node=1, lookup_slack=-1),
@@ -829,7 +840,18 @@ def run_node_case(case: NodeCase, seed: int) -> Dict[str, bool]:
     layouts = [
         {name: tensor.cpu() for name, tensor in layout.items()} for layout in on_gpu
     ]
+    # node_exchange lays the items out on its one CTA or on a grid after it:
+    # both give the same tables
+    both_paths = all(
+        all(
+            torch.equal(tensor.cpu(), layouts[local_rank][name])
+            for name, tensor in layout_of(local_rank, items_in_cta=in_cta).items()
+        )
+        for local_rank in range(local_size)
+        for in_cta in (True, False)
+    )
     checks = {
+        "items on a CTA or a grid": both_paths,
         "own_lengths": all(
             torch.equal(layout["own_lengths"], own_lengths[local_rank])
             and torch.equal(

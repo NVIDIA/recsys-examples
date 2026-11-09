@@ -31,10 +31,13 @@ Before the cases: the sharding shapes, the ranks' agreement, a sharding with
 a ``continuous`` feature outside a model, and the options (a model without
 index dedup, and a sharding with a ``continuous`` table: ``"hierarchical"``
 raises ``ValueError`` at its first input dist, ``"auto"`` takes TorchRec's
-dists). After them: an input dist that waits for the device nowhere but in
-its second wait, the output dist's call orders, the backward run to run, the
-window and the trace APIs, failed constructions, across nodes a proxy rows
-cap below the least rows of the proxy's ring, and the teardown.
+dists). After the cases, two of them again with node_exchange's grids (the
+row's push before it and the layout's items after it, which only many
+features and nodes take: ``hier_output_dist_node_paths``). Then: an input
+dist that waits for the device nowhere but in its second wait, the output
+dist's call orders, the backward run to run, the window and the trace APIs,
+failed constructions, across nodes a proxy rows cap below the least rows of
+the proxy's ring, and the teardown.
 
 Run it from ``corelib/dynamicemb``, one process per GPU (on one node, or
 across nodes under Slurm)::
@@ -88,6 +91,7 @@ from dynamicemb.shard.hier_output_dist import HierDist
 from dynamicemb_extensions import (
     block_bucketize_sparse_features,
     hier_output_dist_fail_next_construction,
+    hier_output_dist_node_paths,
     hier_output_dist_traced,
 )
 from fbgemm_gpu.split_embedding_configs import SparseType
@@ -1853,6 +1857,23 @@ def main() -> None:
     for case_idx, case in enumerate(CASES):
         failures += run_case(case_idx, case, rank, world_size, local_size, log)
         failures += gc_models(log)
+    # Again with node_exchange's grids, which only many features and nodes
+    # take: the row's push before it, the layout's items after it.
+    hier_output_dist_node_paths(0, 0)
+    try:
+        for case_idx, case in enumerate(CASES):
+            if case.name in ("fp32", "fp32, 80 features"):
+                failures += run_case(
+                    case_idx,
+                    replace(case, name=f"{case.name}, node_exchange's grids"),
+                    rank,
+                    world_size,
+                    local_size,
+                    log,
+                )
+                failures += gc_models(log)
+    finally:
+        hier_output_dist_node_paths(-1, -1)
     failures += run_no_sync(rank, world_size, local_size, log)
     failures += run_orders(rank, world_size, local_size, log)
     for run in (

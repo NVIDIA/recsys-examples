@@ -141,6 +141,10 @@ class InChannel {
 // node_done and the first read of node_keys. It makes a rank read the node's offsets and keys
 // late.
 void delay_node_reads(int64_t ns);
+// A test hook (testing.cu): each later input dist of this process pushes its row of node_offsets
+// (push) and lays out the node's items (items) on node_exchange's CTA (1) or on a grid (0), or as
+// their sizes choose (-1).
+void force_node_paths(int64_t push, int64_t items);
 
 }  // namespace hier_output_dist
 }  // namespace dyn_emb

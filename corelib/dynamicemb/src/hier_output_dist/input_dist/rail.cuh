@@ -285,10 +285,18 @@ __device__ inline void rail_layout_of(const RailCounts &in, const int64_t *own_l
     const int64_t other = column - local_size;  // the other nodes, in order
     return in.feature_keys(other < node ? other : other + 1, feature);
   };
+  // the lengths and their offsets in one pass, a tile of loads at a time
   const int64_t num_lengths = num_features * kjt_stride;
-  for (int64_t index = threadIdx.x; index < num_lengths; index += kThreads)
-    out.kjt_lengths[index] = kjt_length(index);
-  cta_offsets_of<int64_t>(num_lengths, kjt_length, out.kjt_offsets);
+  const int64_t kjt_keys = cta_scan_blocked<kScanItems, int64_t>(
+      num_lengths,
+      [&](int64_t index) {
+        const int64_t length = kjt_length(index);
+        out.kjt_lengths[index] = length;
+        return length;
+      },
+      [&](int64_t index, int64_t offset) { out.kjt_offsets[index] = offset; });
+  if (threadIdx.x == 0) out.kjt_offsets[num_lengths] = kjt_keys;
+  __syncthreads();
   for (int64_t feature = threadIdx.x; feature < num_features; feature += kThreads)
     out.length_per_key[feature] =
         out.kjt_offsets[(feature + 1) * kjt_stride] - out.kjt_offsets[feature * kjt_stride];
