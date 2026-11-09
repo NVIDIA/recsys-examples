@@ -2068,7 +2068,11 @@ The capacities are the ones in place (section 5), and `row_bytes` and
 
 The transient figures come from the code: bytes in live tensors. The
 caching allocator's rounding and the cached blocks it hands out add up to
-about 13% (measured with the benchmark's batches).
+about 13% (measured with the benchmark's batches). Smaller requests add
+more, as the allocator takes a 20 MiB segment for each request of 1 to
+10 MiB: in the HSTU E2E benchmark's exp6, whose input dist runs on a stream
+of its own, that pool reserves about 200 MiB more than with TorchRec's
+dists (`examples/hstu/training/benchmark/E2E_BENCHMARK.md`).
 
 The proxy's figure counts its steps' live tensors. Its node dedup holds
 about 52 bytes per entry, 64 with weights: during the insert its hash table
