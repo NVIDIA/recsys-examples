@@ -177,11 +177,13 @@ class HierOutputDist {
   // undefined, lengths, offsets; values and weights hold lookup_keys
   // entries, the first num_recv the owner's), lookup_rows ([lookup_keys,
   // dim], a view of the window: the call's lookup writes its first num_recv
-  // rows), the call's status (int64 [status_words], StatusSlots), and the
-  // forward's and the backward's plans (FwdPlan::tensors(),
-  // BwdPlan::tensors()).
-  using InDistTensors = std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor,
-                                   at::Tensor, std::vector<at::Tensor>, std::vector<at::Tensor>>;
+  // rows), the call's row map (int32 [lookup_keys], or undefined when the
+  // KJT's key i takes row i: OwnerTables::row_map), the call's status (int64
+  // [status_words], StatusSlots), and the forward's and the backward's plans
+  // (FwdPlan::tensors(), BwdPlan::tensors()).
+  using InDistTensors =
+      std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor,
+                 std::vector<at::Tensor>, std::vector<at::Tensor>>;
 
   // Collective: every rank of the sharding with the same unique id
   // (Communicator::unique_id) and configuration (Config's fields, but its
@@ -197,7 +199,8 @@ class HierOutputDist {
                  const std::vector<int64_t> &feature_tables, const std::vector<int64_t> &dist_types,
                  int64_t dim, at::ScalarType dtype, bool weighted, bool node_dedup,
                  int64_t lookup_keys, int64_t remote_keys, int64_t proxy_bytes, double timeout_s,
-                 int64_t out_ctas, int64_t reduce_ctas, int64_t payload_kb);
+                 int64_t out_ctas, int64_t reduce_ctas, int64_t payload_kb,
+                 const std::vector<int64_t> &lookup_groups);
   // Local: waits for this rank's kernels. Then, unless the op was quiesced
   // after the last kernel of every rank, it waits at most min(timeout, 30 s)
   // for every node and rail peer to reach its own teardown. It lets go of

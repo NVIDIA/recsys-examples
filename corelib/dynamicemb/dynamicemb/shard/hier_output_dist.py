@@ -94,8 +94,8 @@ def _first_difference(every: List[Dict]) -> Optional[str]:
 # Where the tensors the benchmark reads are in the plans' lists (the order of
 # FwdPlan::tensors() and BwdPlan::tensors(), in
 # src/hier_output_dist/input_dist/plan.cu).
-_FWD_OFFSET_PER_BUCKET, _FWD_NUM_CHUNKS, _FWD_NODE_LENGTH_PER_BUCKET = 0, 14, 22
-_BWD_NODE_LENGTH_PER_SOURCE = 18
+_FWD_OFFSET_PER_BUCKET, _FWD_NUM_CHUNKS, _FWD_NODE_LENGTH_PER_BUCKET = 0, 14, 23
+_BWD_NODE_LENGTH_PER_SOURCE = 20
 
 
 class HierCall:
@@ -190,6 +190,9 @@ class HierDist:
             takes TorchRec's dists.
         tables: the table of each feature.
         node_dedup: across nodes a node sends each key once.
+        groups: the features of each lookup group, in feature order (the
+            sharding's grouped configs); each group's rows take a slice of
+            the call's rows of their own (None: one group).
     """
 
     def __init__(
@@ -202,6 +205,7 @@ class HierDist:
         asked: str = "hierarchical",
         tables: Optional[List[int]] = None,
         node_dedup: bool = True,
+        groups: Optional[List[int]] = None,
     ) -> None:
         self._pg = pg
         self._rank = dist.get_rank(pg)
@@ -220,6 +224,7 @@ class HierDist:
             world_size=world_size,
             local_size=local_size,
             feature_tables=list(range(num_features) if tables is None else tables),
+            lookup_groups=list(groups or []),
             dim=embedding_dim,
             dtype=output_dtype,
             node_dedup=node_dedup,
@@ -235,13 +240,15 @@ class HierDist:
         # Whether the sharding takes the hierarchical dist; None until setup().
         self.takes_hier_dist: Optional[bool] = None
         # The owner's KJT of each call on this path, as its second wait
-        # returned it, and the rows its lookup writes (owns(), lookup()).
-        self._rows: "weakref.WeakKeyDictionary[KeyedJaggedTensor, torch.Tensor]" = (
+        # returned it: the rows its lookup writes, and the row of each key
+        # there (owns(), lookup()).
+        self._rows: "weakref.WeakKeyDictionary[KeyedJaggedTensor, Tuple[torch.Tensor, Optional[torch.Tensor]]]" = (
             weakref.WeakKeyDictionary()
         )
-        # While a lookup runs (lookup()): the call's rows, and how many of
-        # them the lookup groups took so far (lookup_buffer()).
+        # While a lookup runs (lookup()): the call's rows and row map, and how
+        # many of them the lookup groups took so far (lookup_buffer()).
         self._lookup_rows: Optional[torch.Tensor] = None
+        self._lookup_map: Optional[torch.Tensor] = None
         self._rows_taken = 0
 
     @property
@@ -350,13 +357,14 @@ class HierDist:
         rank's. Else ``input_features`` gets the totals
         ``construct_jagged_tensors`` reads, ``sharding_ctx`` what the output
         dist takes, and the call's lookup will write the first num_recv rows
-        of ``lookup_rows``."""
+        of ``lookup_rows``, each key's where the row map says."""
         (
             values,
             weights,
             lengths,
             offsets,
             lookup_rows,
+            row_map,
             status,
             fwd_plan,
             bwd_plan,
@@ -416,21 +424,65 @@ class HierDist:
             length_per_key=length_per_key,
             offset_per_key=[0] + list(accumulate(length_per_key)),
         )
-        self._rows[kjt] = lookup_rows[:num_recv]
+        self._rows[kjt] = (
+            lookup_rows[:num_recv],
+            None if row_map is None else row_map[:num_recv],
+        )
         return kjt
+
+    def key_rows(self, kjt: KeyedJaggedTensor) -> Optional[torch.Tensor]:
+        """The row of each key of ``kjt`` (an owner's KJT of a call on this
+        path, :meth:`owns`) among the call's rows that its lookup writes, int64
+        on the GPU; None when key i takes row i. The lookup output's rows in
+        the keys' order are those rows of it. No host sync: the group sizes
+        come from the KJT's lengths per key, on the host."""
+        row_map = self._rows[kjt][1]
+        if row_map is None:
+            return None
+        groups = self._arguments["lookup_groups"] or [len(kjt.keys())]
+        per_key = iter(kjt.length_per_key())
+        group_keys = [sum(next(per_key) for _ in range(group)) for group in groups]
+        # each key's group's first row (fills, no copy from the host)
+        starts = torch.cat(
+            [
+                torch.full((keys,), start, dtype=torch.long, device=row_map.device)
+                for start, keys in zip(accumulate([0] + group_keys), group_keys)
+            ]
+        )
+        return row_map.long() + starts
 
     def lookup_buffer(
         self, rows: int, cols: int, dtype: torch.dtype
-    ) -> Optional[torch.Tensor]:
-        """``output_alloc`` of the sharding's DynamicEmb tables. Inside
-        :meth:`lookup` it gives the next ``rows`` rows of the call's rows, so
-        the lookup groups take consecutive slices in feature order. Elsewhere
-        it gives None, and a lookup on TorchRec's dists allocates as usual."""
+    ) -> Optional[Tuple[torch.Tensor, Optional[torch.Tensor]]]:
+        """``output_alloc`` of the sharding's DynamicEmb tables
+        (``OutputAlloc``). Inside :meth:`lookup` it gives the next ``rows``
+        rows of the call's rows, so the lookup groups take consecutive slices
+        in feature order, and the row of each of the group's keys in its
+        slice (int32), or None when key i takes row i. Within its slice a
+        group's rows lie in the order the rail puts them: its keys of this
+        node, then those of each other node (docs/hier_output_dist.md,
+        section 11.2). Elsewhere it gives None, and a lookup on TorchRec's
+        dists allocates as usual."""
         if self._lookup_rows is None:
             return None
         taken = self._rows_taken
         self._rows_taken += rows
-        return self._lookup_rows.narrow(0, taken, rows)
+        row_map = self._lookup_map
+        return (
+            self._lookup_rows.narrow(0, taken, rows),
+            None if row_map is None else row_map.narrow(0, taken, rows),
+        )
+
+    def in_key_order(self, out: torch.Tensor) -> torch.Tensor:
+        """The rows of the lookup group that took the last slice
+        (:meth:`lookup_buffer`) in its keys' order: ``out`` itself when key i
+        took row i, else a copy."""
+        row_map = self._lookup_map
+        if row_map is None:
+            return out
+        return out.view(-1, out.shape[-1]).index_select(
+            0, row_map.narrow(0, self._rows_taken - out.shape[0], out.shape[0])
+        )
 
     def lookup(
         self, kjt: KeyedJaggedTensor, look_ups: Sequence[Callable[[], torch.Tensor]]
@@ -441,15 +493,19 @@ class HierDist:
         outputs come back as those rows, flat, without a copy. The rows are
         valid until the next out kernel. See docs/hier_output_dist.md,
         section 11.2."""
-        rows = self._rows[kjt]
+        rows, row_map = self._rows[kjt]
         # The lookup may run on a stream of its own (TorchRec's fused
-        # pipeline), on which nobody else records the KJT's use.
-        kjt.record_stream(torch.cuda.current_stream())
-        self._lookup_rows, self._rows_taken = rows, 0
+        # pipeline), on which nobody else records the use of the KJT and of
+        # the row map (which the lookup's backward reads too).
+        stream = torch.cuda.current_stream()
+        kjt.record_stream(stream)
+        if row_map is not None:
+            row_map.record_stream(stream)
+        self._lookup_rows, self._lookup_map, self._rows_taken = rows, row_map, 0
         try:
             outs = [look_up() for look_up in look_ups]
         finally:
-            self._lookup_rows = None
+            self._lookup_rows = self._lookup_map = None
         return _LookupOutput.apply(rows, *outs)
 
 

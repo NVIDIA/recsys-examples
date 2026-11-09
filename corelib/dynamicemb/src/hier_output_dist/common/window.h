@@ -35,25 +35,31 @@ namespace hier_output_dist {
 // channels and the device state they keep across calls, and the format of a
 // message that lives there, the count message.
 
-// A count message (int64 words, planner.h): what a rank sends each rail peer, the same message to
-// every one (the rail allgathers them), from which every rank of the rail lays out the keys the
-// rail puts (rail.cuh). Its node's largest remote part, the keys of its own node it looks up as
-// owner (its own part), as proxy the most occurrences of one of its node-unique keys and its
-// chunks per owner node; then its own part's keys of each feature, and as proxy its node-unique
-// keys of each (owner node, feature). 3 + num_nodes + (num_nodes + 1) * num_features words.
+// A count message (int64 words, planner.h): what a rank sends a rail peer, from which every rank of
+// the rail lays out the keys the rail puts and the rows they come from and go to (rail.cuh). First
+// a header, the same to every peer (the rail allgathers it): its node's largest remote part, as
+// proxy the most occurrences of one of its node-unique keys; the keys of each lookup group of its
+// own part (as owner: the keys of its own node it looks up); as proxy its chunks per owner node and
+// its node-unique keys of each (owner node, lookup group). Then the part of the receiver alone: as
+// proxy its node-unique keys of each feature of the receiver's node. 2 + num_groups + num_nodes *
+// (num_groups + 1) + num_features words.
 struct CountMessage {
-  static constexpr int kNeedRemoteWord = 0, kOwnTotalWord = 1, kNeedKeyRowsWord = 2;
-  int64_t num_nodes, num_features;
-  __host__ __device__ int64_t chunk_length_word(int64_t owner_node) const { return 3 + owner_node; }
-  __host__ __device__ int64_t own_length_word(int64_t feature) const {
-    return 3 + num_nodes + feature;
+  static constexpr int kNeedRemoteWord = 0, kNeedKeyRowsWord = 1;
+  int64_t num_nodes, num_features, num_groups;
+  __host__ __device__ int64_t own_total_word(int64_t group) const { return 2 + group; }
+  __host__ __device__ int64_t chunk_length_word(int64_t owner_node) const {
+    return 2 + num_groups + owner_node;
   }
-  __host__ __device__ int64_t node_length_word(int64_t owner_node, int64_t feature) const {
-    return 3 + num_nodes + (owner_node + 1) * num_features + feature;
+  __host__ __device__ int64_t key_total_word(int64_t owner_node, int64_t group) const {
+    return 2 + num_groups + num_nodes + owner_node * num_groups + group;
   }
-  __host__ __device__ int64_t length() const {
-    return 3 + num_nodes + (num_nodes + 1) * num_features;
+  __host__ __device__ int64_t header_length() const {
+    return 2 + num_groups + num_nodes * (num_groups + 1);
   }
+  __host__ __device__ int64_t key_length_word(int64_t feature) const {
+    return header_length() + feature;
+  }
+  __host__ __device__ int64_t length() const { return header_length() + num_features; }
   // A slot a message lands in: whole 16-byte units.
   __host__ __device__ int64_t slot_words() const { return (length() + 1) / 2 * 2; }
 };
@@ -64,10 +70,10 @@ struct CountMessage {
 // channel the output dist's kernels, whose number (out_seq) counts them.
 
 // The ctrl section (uint64 words): every control word of both channels and the device state they
-// keep across calls. Its size depends only on local_size, num_nodes, num_features and the most
-// chunks of a stream. Every control word is tagged with its channel's sequence number, is a running
-// total, or is back at its start value when the kernel that uses it ends. The data words
-// (requester_offsets, the needs, the count messages) are written whole in each call, before a flag
+// keep across calls. Its size depends only on local_size, num_nodes, num_features, num_groups and
+// the most chunks of a stream. Every control word is tagged with its channel's sequence number, is
+// a running total, or is back at its start value when the kernel that uses it ends. The data words
+// (group_shift, the needs, the count messages) are written whole in each call, before a flag
 // (in_status) or a signal publishes them. So none is ever reset, and a call that overflowed leaves
 // all of them valid for the next. Words marked (local) are only this rank's:
 // a GIN warp's place with each peer, which it sets when it starts. Words marked (num_nodes > 1)
@@ -78,8 +84,7 @@ class CtrlLayout {
   __host__ __device__ CtrlLayout(const Sizes &sizes, void *base)
       : base_((uint64_t *)base),
         num_nodes_(sizes.topo.num_nodes),
-        num_features_(sizes.num_features),
-        count_format_{sizes.topo.num_nodes, sizes.num_features} {
+        count_format_{sizes.topo.num_nodes, sizes.num_features, sizes.num_groups} {
     const int64_t local_size = sizes.topo.local_size, num_nodes = num_nodes_;
     const bool multi = num_nodes > 1;
     int64_t next = 0;
@@ -90,9 +95,9 @@ class CtrlLayout {
     };
     in_started_ = take(1);
     in_written_ = take(local_size);
-    requester_offsets_ = take(multi ? local_size * num_features_ : 0);
+    group_shift_ = take(multi ? sizes.num_groups : 0);
     in_status_ = take(multi ? 1 + kNumNeeds : 0);
-    count_msg_out_ = take(multi ? count_format_.length() : 0);
+    count_msg_out_ = take(multi ? num_nodes * count_format_.slot_words() : 0);
     count_msgs_ = take(multi ? 2 * num_nodes * count_format_.slot_words() : 0);
     out_started_ = take(1);
     pushed_ = take(local_size);
@@ -126,18 +131,19 @@ class CtrlLayout {
   // that the requester's node_exchange read its node_offsets, so this rank may write its row
   // there again in the next call. node_done tells in every call, also with no rows and under skip.
   __host__ __device__ uint64_t *in_written() const { return word(in_written_); }
-  // (num_nodes > 1) [num_features] where the keys of each feature of a
-  // same-node requester start in this rank's KJT
-  __host__ __device__ int64_t *requester_offsets(int64_t requester) const {
-    return (int64_t *)word(requester_offsets_ + requester * num_features_);
-  }
+  // (num_nodes > 1) [num_groups] per lookup group of this rank's KJT, the rows of its
+  // lookup_rows before the group's own part, less the own part's keys before it: a key of its own
+  // part lies at its place there plus its group's shift (rail.cuh)
+  __host__ __device__ int64_t *group_shift() const { return (int64_t *)word(group_shift_); }
   // (num_nodes > 1) in_seq of this rank's node_status_exchange
   __host__ __device__ uint64_t *in_status() const { return word(in_status_); }
   // (num_nodes > 1) [kNumNeeds] its rail's needs, which in_status publishes
   __host__ __device__ int64_t *needs() const { return (int64_t *)word(in_status_ + 1); }
-  // (num_nodes > 1) the count message this rank sends each rail peer
-  // (CountMessage::length)
-  __host__ __device__ int64_t *count_msg_out() const { return (int64_t *)word(count_msg_out_); }
+  // (num_nodes > 1) the count message this rank sends the rail peer on
+  // `node` ([num_nodes][CountMessage::slot_words]: the header in every one)
+  __host__ __device__ int64_t *count_msg_out(int64_t node) const {
+    return (int64_t *)word(count_msg_out_ + node * count_format_.slot_words());
+  }
   // (num_nodes > 1) the count message of call in_seq from the rail peer on
   // `node` (this rank's own too), by in_seq parity: a peer's message of call
   // seq + 2 needs this rank's of seq + 1, which it sends once call seq ended
@@ -180,8 +186,8 @@ class CtrlLayout {
   __host__ __device__ uint64_t *bwd_ready_sent(int64_t proxy_node) const {
     return word(bwd_ready_sent_ + proxy_node);
   }
-  // (num_nodes > 1, local) an issuer's place in its put list for the rail
-  // peer on node peer_node: its next segment
+  // (num_nodes > 1, local) an issuer's place among the chunks it puts for
+  // the rail peer on node peer_node: its next chunk
   __host__ __device__ int64_t *put_at(int64_t peer_node) const {
     return (int64_t *)word(put_at_ + peer_node);
   }
@@ -218,9 +224,9 @@ class CtrlLayout {
   __host__ __device__ uint64_t *word(int64_t at) const { return base_ + at; }
 
   uint64_t *base_;
-  int64_t num_nodes_, num_features_;
+  int64_t num_nodes_;
   CountMessage count_format_;
-  int64_t in_started_, in_written_, requester_offsets_, in_status_, count_msg_out_, count_msgs_;
+  int64_t in_started_, in_written_, group_shift_, in_status_, count_msg_out_, count_msgs_;
   int64_t out_started_, pushed_, pulled_, arrive_, tasks_, landed_rows_, fwd_tot_, bwd_tot_,
       grant_sent_, bwd_ready_sent_, put_at_, landed_, pulled_rows_, pushed_rows_, posted_,
       bwd_free_end_;
@@ -439,8 +445,10 @@ class KeysLayout {
 
 // The rows section, its buffers in this order (those marked num_nodes > 1
 // exist across nodes only):
-//   lookup_rows  the owner's lookup output, row i for its KJT's key i; the
-//                backward writes the gradient of that output over it
+//   lookup_rows  the owner's lookup output, a row per key of its KJT, each
+//                lookup group's in a slice of their own, in the order they
+//                arrive (common.h, GroupRuns); the backward writes the
+//                gradient of that output over it
 //   proxy_rows   (num_nodes > 1) the proxy's ring, its stream of chunks
 //                (common.h): the rows of the node-unique keys the rail owners
 //                put (forward), the gradient rows of its node's requesters

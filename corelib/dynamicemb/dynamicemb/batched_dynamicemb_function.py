@@ -53,6 +53,15 @@ from dynamicemb_extensions import (
     select_insert_failed_values,
 )
 
+# An output dist's allocator of a sequence lookup's rows (output_alloc): for
+# (rows, columns, dtype), None (no buffer: the lookup allocates its own), or a
+# buffer of those rows and the row of each key there (int32 [rows]), None when
+# key i takes row i. The hierarchical dist places the rows in the order its
+# GIN puts read and write them (shard/hier_output_dist.py, lookup_buffer).
+OutputAlloc = Callable[
+    [int, int, torch.dtype], Optional[Tuple[torch.Tensor, Optional[torch.Tensor]]]
+]
+
 
 def _copy_cuda_tensor_to_pinned_cpu(tensor: torch.Tensor) -> torch.Tensor:
     if not tensor.is_cuda:
@@ -975,9 +984,7 @@ def dynamicemb_eval_forward(
     evict_strategy=None,
     frequency_counters: Optional[torch.Tensor] = None,
     pooling_weights: Optional[torch.Tensor] = None,
-    output_alloc: Optional[
-        Callable[[int, int, torch.dtype], Optional[torch.Tensor]]
-    ] = None,
+    output_alloc: Optional[OutputAlloc] = None,
 ) -> torch.Tensor:
     """Eval-only forward for all storage configurations (no autograd).
 
@@ -1011,13 +1018,16 @@ def dynamicemb_eval_forward(
                 initializer,
                 cache=cache,
             )
-            out = (
+            alloc = (
                 output_alloc(*layout.sequence_shape(), output_dtype)
                 if output_alloc is not None
                 else None
             )
-            if out is not None:
-                return out.copy_(output_embs)
+            if alloc is not None:
+                out, out_rows = alloc
+                if out_rows is None:
+                    return out.copy_(output_embs)
+                return out.index_copy_(0, out_rows.long(), output_embs.to(out.dtype))
             if output_dtype != emb_dtype:
                 output_embs = output_embs.to(output_dtype)
             return output_embs
@@ -1212,10 +1222,9 @@ class DynamicEmbeddingFunction(torch.autograd.Function):
         # op and runs its backward.
         empty_tensor: Optional[torch.Tensor] = None,
         # Allocates the sequence output; an output dist may provide it (the
-        # hierarchical dist puts it in a window its node peers read in place).
-        output_alloc: Optional[
-            Callable[[int, int, torch.dtype], Optional[torch.Tensor]]
-        ] = None,
+        # hierarchical dist puts it in a window its node peers read in place,
+        # each key's row where its row map says).
+        output_alloc: Optional[OutputAlloc] = None,
     ):
         with torch.cuda.nvtx.range("DynamicEmbeddingFunction.forward"):
             max_emb_dim = storage.max_embedding_dim()
@@ -1296,6 +1305,7 @@ class DynamicEmbeddingFunction(torch.autograd.Function):
                 unique_embs = unique_values[:, :max_emb_dim]
 
             device = prefetch_state.unique_keys.device
+            out_rows = None  # each key's output row, None: key i's is row i
             if is_pooling:
                 output_embs = torch.empty(
                     *layout.pooled_shape(),
@@ -1317,18 +1327,20 @@ class DynamicEmbeddingFunction(torch.autograd.Function):
                         layout.feature_dims_vec4,
                     )
             else:
-                output_embs = (
+                alloc = (
                     output_alloc(*layout.sequence_shape(), output_dtype)
                     if output_alloc is not None
                     else None
                 )
                 # None: no allocator, or it has no buffer for this batch.
-                if output_embs is None:
+                if alloc is None:
                     output_embs = torch.empty(
                         *layout.sequence_shape(),
                         dtype=output_dtype,
                         device=device,
                     )
+                else:
+                    output_embs, out_rows = alloc
                 if direct:
                     with torch.cuda.nvtx.range("op:load_from_flat"):
                         load_from_flat_by(
@@ -1337,15 +1349,21 @@ class DynamicEmbeddingFunction(torch.autograd.Function):
                             prefetch_state.unique_table_ids,
                             prefetch_state.reverse_indices,
                             output_embs,
+                            out_rows,
                         )
                 else:
                     with torch.cuda.nvtx.range("op:gather_embedding"):
                         gather_embedding(
-                            unique_embs, output_embs, prefetch_state.reverse_indices
+                            unique_embs,
+                            output_embs,
+                            prefetch_state.reverse_indices,
+                            out_rows,
                         )
 
             ctx.unique_keys = prefetch_state.unique_keys
             ctx.reverse_indices = prefetch_state.reverse_indices
+            # The backward reads key i's gradient from the row its output took.
+            ctx.out_rows = out_rows
             ctx.unique_table_ids = prefetch_state.unique_table_ids
             ctx.cache = cache
             ctx.storage = storage
@@ -1411,6 +1429,7 @@ class DynamicEmbeddingFunction(torch.autograd.Function):
                         ctx.unique_keys.numel(),
                         layout.batch_size,
                         ctx.max_emb_dim,
+                        grad_rows=ctx.out_rows,
                     )
 
             optimizer.step()

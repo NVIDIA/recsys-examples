@@ -88,12 +88,36 @@ void check_rules(const Config &config) {
   }
 }
 
+// The lookup groups: each takes at least one feature, and they take every
+// feature, in order.
+void check_groups(const Config &config) {
+  int64_t features = 0;
+  for (const int group : config.lookup_groups) {
+    if (group < 1) refuse("every lookup group takes features, got a group of ", group, " features");
+    features += group;
+  }
+  if (!config.lookup_groups.empty() && features != config.num_features())
+    refuse("the lookup groups take ", features, " features, and the sharding has ",
+           config.num_features());
+}
+
 }  // namespace
+
+std::vector<int64_t> Config::group_starts() const {
+  std::vector<int64_t> starts{0};
+  if (lookup_groups.empty()) {
+    starts.push_back(num_features());
+  } else {
+    for (const int group : lookup_groups) starts.push_back(starts.back() + group);
+  }
+  return starts;
+}
 
 void Config::validate() const {
   const std::string why = unsupported(world_size, local_size, num_features(), row_bytes());
   if (!why.empty()) refuse(why);
   check_rules(*this);
+  check_groups(*this);
   if (dtype != at::kFloat && dtype != at::kBFloat16 && dtype != at::kHalf)
     refuse("rows of the lookup output must be fp32, bf16 or fp16, got ", dtype);
   check_capacity("lookup_keys", capacities.lookup_keys);
@@ -132,15 +156,18 @@ std::string invalid(const Config &config) {
 
 Config config_of(int64_t rank, int64_t world_size, int64_t local_size,
                  const std::vector<int64_t> &feature_tables, const std::vector<int64_t> &dist_types,
-                 int64_t dim, at::ScalarType dtype, bool weighted, bool node_dedup,
-                 int64_t lookup_keys, int64_t remote_keys, int64_t proxy_bytes, double timeout_s,
-                 int64_t out_ctas, int64_t reduce_ctas, int64_t payload_kb) {
+                 const std::vector<int64_t> &lookup_groups, int64_t dim, at::ScalarType dtype,
+                 bool weighted, bool node_dedup, int64_t lookup_keys, int64_t remote_keys,
+                 int64_t proxy_bytes, double timeout_s, int64_t out_ctas, int64_t reduce_ctas,
+                 int64_t payload_kb) {
   Config config;
   config.rank = (int)rank;
   config.world_size = (int)world_size;
   config.local_size = (int)local_size;
   config.feature_tables.assign(feature_tables.begin(), feature_tables.end());
   config.dist_types.assign(dist_types.begin(), dist_types.end());
+  for (const int64_t group : lookup_groups)  // a group past int's range is refused as empty
+    config.lookup_groups.push_back(group > 0 && group <= INT32_MAX ? (int)group : 0);
   config.dim = dim;
   config.dtype = dtype;
   config.weighted = weighted;
@@ -180,6 +207,7 @@ Sizes sizes_of(const Config &config) {
                     local_size + num_nodes - 1, config.rank, config.rank % local_size,
                     config.rank / local_size};
   sizes.num_features = config.num_features();
+  sizes.num_groups = config.num_groups();
   sizes.lookup_keys = config.capacities.lookup_keys;
   sizes.row_bytes = config.row_bytes();
   sizes.weighted = config.weighted;

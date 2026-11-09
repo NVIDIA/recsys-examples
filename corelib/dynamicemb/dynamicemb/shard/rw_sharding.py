@@ -308,10 +308,11 @@ class HierGroupedEmbeddingsLookup(GroupedEmbeddingsLookup):
 
     def _look_up(self, emb_op, features: KeyedJaggedTensor) -> torch.Tensor:
         lookup = emb_op(features)
-        # TorchRec's model delta tracker, from TorchRec 1.5 on.
+        # TorchRec's model delta tracker, from TorchRec 1.5 on. It reads the
+        # rows in the keys' order.
         tracker = getattr(self, "optim_state_tracker_fn", None)
         if tracker is not None:
-            tracker(features, lookup.view(-1), emb_op)
+            tracker(features, self._hier.in_key_order(lookup).view(-1), emb_op)
         return lookup
 
 
@@ -439,6 +440,11 @@ class RwSequenceDynamicEmbeddingSharding(RwSequenceEmbeddingSharding):
             asked=asked,
             tables=tables,
             node_dedup=options.node_dedup and not clipping,
+            # the lookup groups (HierGroupedEmbeddingsLookup's), in the
+            # sharding's feature order
+            groups=[
+                config.num_features() for config in self._grouped_embedding_configs
+            ],
         )
 
     def create_input_dist(

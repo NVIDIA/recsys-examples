@@ -40,10 +40,13 @@ namespace hier_output_dist {
 
 // What the input dist of a call gives: the owner's KJT, whose values (and
 // weights) hold lookup_keys entries, the first num_recv its own (num_recv:
-// in the status); the call's status (StatusSlots); and the output dist's
+// in the status); the row of each of its keys in its lookup group's slice of
+// lookup_rows (row_map, OwnerTables'; undefined when key i of a group takes
+// the group's row i); the call's status (StatusSlots); and the output dist's
 // plans, the backward's but for its counts, which the status gives.
 struct InDist {
   at::Tensor kjt_values, kjt_weights, kjt_lengths, kjt_offsets;  // weights: undefined without
+  at::Tensor row_map;                                            // int32 [lookup_keys]
   at::Tensor status;                                             // int64 [status_words]
   FwdPlan fwd_plan;
   BwdPlan bwd_plan;
@@ -91,9 +94,9 @@ class InChannel {
   // Puts this proxy's key_stage slices (put_src: where each starts there, int64 [num_nodes]) into
   // its rail owners' rail_keys, where `rail` says (put_dst, put_bytes, put_skip). It does not wait.
   void rail_key_push(const at::Tensor &put_src, const RailLayout &rail) const;
-  // Publishes this rank's needs and requester offsets (the rail layout's) to its node; returns
-  // every node peer's needs (int64 [local_size][kNumNeeds]) and where each one's KJT holds this
-  // requester's keys of each feature (int64 [local_size][num_features]).
+  // Publishes this rank's needs and group shifts (the rail layout's) to its node; returns every
+  // node peer's needs (int64 [local_size][kNumNeeds]) and group shifts (int64
+  // [local_size][num_groups]).
   std::pair<at::Tensor, at::Tensor> node_status_exchange(const RailLayout &rail) const;
   // Words of the node peers' `from` (GatherFrom), int32 [words][items]: item
   // i reads node peer peer[i]'s word first_word[i] of its proxy header (1
@@ -126,9 +129,10 @@ class InChannel {
   ProxyBuffers proxy_buffers_;
   at::Tensor rail_keys_;
   // Constants of the op across nodes: the table of each feature (numbered
-  // densely), the other nodes, and the words of the proxy headers this
-  // requester reads.
-  at::Tensor tables_, other_nodes_;
+  // densely), the other nodes, the lookup group of each feature (int32) and
+  // each group's first feature (int64 [num_groups + 1], then num_features),
+  // and the words of the proxy headers this requester reads.
+  at::Tensor tables_, other_nodes_, group_of_feature_, group_starts_;
   PeerWords header_gather_;
 };
 

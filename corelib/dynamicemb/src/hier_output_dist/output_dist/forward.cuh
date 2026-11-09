@@ -511,13 +511,15 @@ __device__ void ProxyRelay::run(ncclWindow_t window, const ncclDevComm &dev, con
 
 // The owner's issuer in the forward (across nodes; a warp of CTA 0, whose
 // lanes take the rail proxies in turn, so one QP each). For each proxy node
-// it puts the rows of lookup_rows the node asks for (the forward put list:
-// its segments in stream order, each in one chunk and one feature),
-// each once the proxy granted the rows of its stream up to the end of the
-// segment's chunk, in one put that adds its rows to the proxy's fwd_rows
-// signal. It polls the proxy nodes in turn and waits for no single one: in
-// a pass it reads each one's grant once and puts every segment the grant
-// covers. Its place in each one's segments is in this rank's put_at words.
+// it puts the rows of lookup_rows the node asks for: each chunk of this
+// owner's node in the proxy's stream (fwd_chunks, in stream order), once the
+// proxy granted the rows of its stream up to the chunk's end, in one put per
+// lookup group the chunk's records span (fwd_groups: a group's rows of a
+// node are consecutive in lookup_rows, so a chunk of one group is one put),
+// each adding its rows to the proxy's fwd_rows signal. It polls the proxy
+// nodes in turn and waits for no single one: in a pass it reads each one's
+// grant once and puts every chunk the grant covers. Its place in each one's
+// chunks is in this rank's put_at words.
 // Then the warp flushes. The lookup wrote lookup_rows before the kernel: one
 // system fence, then puts that make no release of their own. No node barrier
 // is needed first. The grants are read relaxed, with no fence after them:
@@ -555,33 +557,42 @@ __device__ void OwnerIssuer::run(ncclWindow_t window, const ncclDevComm &dev, co
                    layout.rows.lookup_rows(),
                    sizes.row_bytes,
                    sig_rows(node)};
+  const int64_t ring = sizes.num_proxy_rows;
   for (int proxy_node = lane; proxy_node < num_nodes; proxy_node += 32)
-    *layout.ctrl.put_at(proxy_node) = plan.fwd_put_offset(proxy_node);
+    *layout.ctrl.put_at(proxy_node) = plan.fwd_chunk_offsets[proxy_node];
   put.fence();
   bool posted = false;  // this lane put rows
   Spin spin(sizes.timeout_ns);
   for (;;) {
-    bool moved = false, left = false;  // segments of the lane's proxy nodes are left
+    bool moved = false, left = false;  // chunks of the lane's proxy nodes are left
     for (int proxy_node = lane; proxy_node < num_nodes; proxy_node += 32) {
       if (proxy_node == node) continue;
       int64_t *at = layout.ctrl.put_at(proxy_node);
-      int64_t seg = *at;
-      const int64_t end = plan.fwd_put_offset(proxy_node + 1);
-      if (seg < end) {
+      int64_t entry = *at;
+      const int64_t end = plan.fwd_chunk_offsets[proxy_node + 1];
+      if (entry < end) {
         // the proxy's grant, once for the pass (relaxed: see above)
         const uint64_t grant = credits.read_relaxed(sig_grant(proxy_node));
-        for (; seg < end; ++seg) {
-          const PutSeg segment = plan.put_list[seg];
-          if (grant < tagged(seq, plan.fwd_chunks[segment.chunk].end)) break;
+        for (; entry < end; ++entry) {
+          const OwnerChunk chunk = plan.fwd_chunks[entry];
+          if (grant < tagged(seq, chunk.end)) break;
           if (!posted) timeline.stamp_earliest(kTraceFirstPut);
           posted = true;
-          put.put(proxy_node, segment.dst, segment.src, segment.rows, false, 0);
-          if (timeline.on()) timeline.posted((unsigned long long)segment.rows);
+          // its records' rows into the chunk's rows of the proxy's ring
+          const int64_t first_row = chunk.start % ring;
+          plan.fwd_groups.for_each_run(proxy_node, chunk.record_lo, chunk.record_hi,
+                                       [&](int64_t lo, int64_t hi, int64_t shift) {
+                                         put.put(proxy_node,
+                                                 (int)(first_row + lo - chunk.record_lo),
+                                                 (int)(lo + shift), (int)(hi - lo), false, 0);
+                                         if (timeline.on())
+                                           timeline.posted((unsigned long long)(hi - lo));
+                                       });
           moved = true;
         }
       }
-      *at = seg;
-      left = left || seg < end;
+      *at = entry;
+      left = left || entry < end;
     }
     if (!__any_sync(kFull, left)) break;
     if (!__any_sync(kFull, moved)) spin.pause("grant of proxy_rows", lane, 0, sizes.topo.rank);

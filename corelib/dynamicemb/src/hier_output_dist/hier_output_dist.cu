@@ -189,10 +189,11 @@ HierOutputDist::HierOutputDist(const std::string &unique_id, int64_t rank, int64
                                at::ScalarType dtype, bool weighted, bool node_dedup,
                                int64_t lookup_keys, int64_t remote_keys, int64_t proxy_bytes,
                                double timeout_s, int64_t out_ctas, int64_t reduce_ctas,
-                               int64_t payload_kb)
-    : config_(validated(config_of(rank, world_size, local_size, feature_tables, dist_types, dim,
-                                  dtype, weighted, node_dedup, lookup_keys, remote_keys,
-                                  proxy_bytes, timeout_s, out_ctas, reduce_ctas, payload_kb))),
+                               int64_t payload_kb, const std::vector<int64_t> &lookup_groups)
+    : config_(validated(config_of(rank, world_size, local_size, feature_tables, dist_types,
+                                  lookup_groups, dim, dtype, weighted, node_dedup, lookup_keys,
+                                  remote_keys, proxy_bytes, timeout_s, out_ctas, reduce_ctas,
+                                  payload_kb))),
       sizes_(sizes_of(config_)),
       device_(current_device()) {
   c10::cuda::CUDAGuard guard(device_);
@@ -346,6 +347,7 @@ HierOutputDist::InDistTensors HierOutputDist::input_dist(const at::Tensor &value
           dist.kjt_lengths,
           dist.kjt_offsets,
           window_->lookup_rows(sizes_.lookup_keys, config_.dim, config_.dtype),
+          dist.row_map,
           dist.status,
           dist.fwd_plan.tensors(),
           dist.bwd_plan.tensors()};

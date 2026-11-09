@@ -18,7 +18,7 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 // the current stream: kernels of their own (what they share: planner.cuh)
 // and CUB's radix sorts and scans (cub.cu), none of which waits for the
 // device. The bucketize, the owner's KJT on one node, the proxy, the rail and
-// the owner, the requester, and the put lists. node_exchange makes the node
+// the owner, and the requester. node_exchange makes the node
 // layout (node_layout_of, node.cuh); node_layout() and push_to_node_keys()
 // here are the hooks'. Every table of a step is sized by the op's sizes
 // (Sizes, from its configuration: config.h), never by a device value.
@@ -357,14 +357,14 @@ ProxyPlan proxy_push_order(ProxyKeys keys, ProxyChunks chunks, const at::Tensor 
 
 // The rail's part of a call across nodes (the in channel). A rank's rail is the
 // ranks with its local rank, one on each node. Each rank sends every rail peer
-// the same count message (the rail allgathers them); from the rail's messages
-// every rank computes the rail's layout (rail_layout_of, rail.cuh): as proxy
-// where its key records land at each owner and where its keys of each feature
-// start in each owner's KJT, as owner its KJT and where each proxy's keys of
-// each feature start in it (the same function as the proxies'), and the rail's
-// needs, which with its requester offsets a rank publishes to its node. Then the
-// owner's tables: its KJT's keys and what its forward put list sends
-// (planner.cu).
+// a count message, the same header to all (the rail allgathers it) and the
+// peer's own part; from the rail's messages every rank computes the rail's
+// layout (rail_layout_of, rail.cuh): as proxy where its key records land at
+// each owner and where their rows lie in each owner's lookup_rows (the same
+// function as the owners'), as owner its KJT and where each proxy's rows lie
+// in its lookup_rows, and the rail's needs, which with its group shifts a rank
+// publishes to its node. Then the owner's tables: its KJT's keys, the chunks
+// its forward puts and the row map of its lookup (planner.cu).
 //
 // An owner's KJT has kjt_stride = local_size + num_nodes - 1 lengths per
 // feature (its stride), feature-major: its node's requesters, then the other
@@ -372,40 +372,42 @@ ProxyPlan proxy_push_order(ProxyKeys keys, ProxyChunks chunks, const at::Tensor 
 // another node's are the node-unique keys of that node's proxy on its rail,
 // whose records the proxy puts into its rail_keys: one slice per other node
 // in node order, each the chunks of this owner's node in the proxy's stream
-// (OwnerChunk), then its records.
+// (OwnerChunk), then its records. Its lookup_rows hold each lookup group's
+// rows in a slice of their own, in the order they arrive (common.h,
+// GroupRuns), so a chunk's rows cross the rail in a put per group.
 
 // The nodes but this rank's, in order (int64 [num_nodes - 1]): a constant of
 // the op.
 at::Tensor other_nodes_of(const Topo &topo, const at::TensorOptions &options);
 
-// The count message this rank sends each rail peer (int64 [CountMessage::length], window.h), as
-// rail_exchange makes it (count_message_of, rail.cuh): its node's largest remote part
-// (need_remote), the keys of its own node it looks up as owner (own_total, its own part), as proxy
-// the most occurrences of one of its keys (need_key_rows) and its chunks per owner node
-// (chunk_length_per_bucket); then its own part's keys of each feature (own_lengths [feature]
-// [requester], summed over its node's requesters), and as proxy its node-unique keys of each
-// (owner node, feature) (node_length_per_bucket_feature). The hooks'.
-at::Tensor count_message(const at::Tensor &need_remote, const at::Tensor &own_total,
+// The count messages this rank sends its rail peers (int64 [num_nodes][CountMessage::length], row
+// n to the peer on node n, window.h), as rail_exchange makes them (count_messages_of, rail.cuh): a
+// header, the same in every row: its node's largest remote part (need_remote), as proxy the most
+// occurrences of one of its keys (need_key_rows), the keys of each lookup group (group_starts:
+// int64 [num_groups + 1], each group's first feature, then num_features) of its own part
+// (own_lengths [feature][requester], summed over its node's requesters), as proxy its chunks per
+// owner node (chunk_length_per_bucket) and its node-unique keys of each (owner node, group); then
+// row n's own part: its node-unique keys of each feature of node n
+// (node_length_per_bucket_feature). The hooks'.
+at::Tensor count_message(const at::Tensor &need_remote, const at::Tensor &own_lengths,
                          const at::Tensor &need_key_rows, const at::Tensor &chunk_length_per_bucket,
-                         const at::Tensor &own_lengths,
-                         const at::Tensor &node_length_per_bucket_feature);
+                         const at::Tensor &node_length_per_bucket_feature,
+                         const at::Tensor &group_starts);
 
-// The rail's layout, from the rail's count messages (int64 [num_nodes]
-// [CountMessage::length], row n the rail peer's on node n, this rank's own too)
-// and its own part's lengths (the node layout's own_lengths). Each slice a proxy
-// puts holds the owner node's chunks (OwnerChunk, 16 bytes each), then its
-// records (record_bytes each).
+// The rail's layout, from the rail's count messages to this rank (int64 [num_nodes]
+// [CountMessage::length], row n the message of the rail peer on node n, this rank's own too) and
+// its own part's lengths (the node layout's own_lengths). Each slice a proxy puts holds the owner
+// node's chunks (OwnerChunk, 16 bytes each), then its records (record_bytes each).
 struct RailLayout {
   // as proxy, to each owner of the rail (its slice in key_stage is the proxy's
   // stage_offset_per_bucket)
-  at::Tensor put_dst;        // int64 [num_nodes]: where its slice lands in the owner's rail_keys
-                             // (bytes)
-  at::Tensor put_bytes;      // int64 [num_nodes]
-  at::Tensor put_skip;       // bool [num_nodes]: no put of keys (the owner overflows
-                             // lookup_keys, or it is on this node)
-  at::Tensor owner_offsets;  // int64 [num_nodes][num_features]: where its node's keys of each
-                             // feature start in each owner's KJT, that owner's source_offsets row
-                             // for this node (its own node: 0)
+  at::Tensor put_dst;     // int64 [num_nodes]: where its slice lands in the owner's rail_keys
+                          // (bytes)
+  at::Tensor put_bytes;   // int64 [num_nodes]
+  at::Tensor put_skip;    // bool [num_nodes]: no put of keys (the owner overflows
+                          // lookup_keys, or it is on this node)
+  at::Tensor bwd_groups;  // int64 [num_nodes][2 * num_groups + 1]: the group runs (GroupRuns,
+                          // common.h) of its node-unique keys of each owner node (its own: 0)
   // as owner
   at::Tensor kjt_lengths;             // int64 [num_features * kjt_stride]: per (feature, column)
   at::Tensor kjt_offsets;             // int64 [num_features * kjt_stride + 1]
@@ -416,13 +418,14 @@ struct RailLayout {
   at::Tensor node_length_per_source;  // int64 [num_nodes]: the node-unique keys of each source node
   at::Tensor node_length_per_source_feature;  // int64 [num_nodes][num_features]: of each source
                                               // node, per feature (its own node: 0)
-  at::Tensor source_offsets;     // int64 [num_nodes][num_features]: where the keys of each
-                                 // source node start in its KJT, what that node's proxy computes as
-                                 // its owner_offsets row for this node (its own node: 0)
-  at::Tensor requester_offsets;  // int64 [local_size][num_features]: where each requester of
-                                 // its node's (feature, requester) keys start in its KJT
-  at::Tensor needs;              // int64 [kNumNeeds]: the most the rail needs of each
-                                 // capacity (Need)
+  at::Tensor fwd_groups;     // int64 [num_nodes][2 * num_groups + 1]: the group runs of the records
+                             // of each source node (its own node: 0)
+  at::Tensor group_offsets;  // int64 [num_groups + 1]: where each lookup group's slice starts in
+                             // its lookup_rows (then the keys it looks up)
+  at::Tensor group_shift;    // int64 [num_groups]: per lookup group, the rows before its own part
+                             // less the own part's keys before it (CtrlLayout::group_shift)
+  at::Tensor needs;          // int64 [kNumNeeds]: the most the rail needs of each
+                             // capacity (Need)
 };
 // The layout as rail_exchange makes it (rail_layout_of, rail.cuh). The hooks'.
 RailLayout rail_layout(const at::Tensor &messages, const at::Tensor &own_lengths,
@@ -438,20 +441,26 @@ struct OwnerTables {
   at::Tensor kjt_values;         // int64 [lookup_keys]: the first num_recv are its KJT's keys
   at::Tensor kjt_weights;        // fp32 [lookup_keys]: their weights, or undefined (8-byte
                                  // records)
-  at::Tensor fwd_chunks;         // int32 [max_owner_chunks][4]: what its forward put list sends,
-                                 // the chunks of its node in each source node's stream (OwnerChunk,
-                                 // first in its slice), source node after source node
+  at::Tensor fwd_chunks;         // int32 [max_owner_chunks][4]: what its forward puts, the chunks
+                                 // of its node in each source node's stream (OwnerChunk, first in
+                                 // its slice), source node after source node
   at::Tensor fwd_chunk_offsets;  // int64 [num_nodes + 1]: where each source node's start there
+  at::Tensor row_map;            // int32 [lookup_keys]: per key of its KJT (the first num_recv),
+                                 // its row in its lookup group's slice of lookup_rows (common.h,
+                                 // GroupRuns), where the lookup writes it; undefined when key i of
+                                 // a group's keys takes row i (no group of more than one feature)
 };
+// group_of_feature: int32 [num_features], the lookup group of each feature; group_starts: int64
+// [num_groups + 1], each group's first feature, then num_features.
 OwnerTables owner_tables(const RailLayout &rail, const at::Tensor &own_offsets,
                          const at::Tensor &node_keys, const at::Tensor &node_key_weights,
                          const at::Tensor &rail_keys, const at::Tensor &other_nodes,
-                         const Sizes &sizes);
+                         const at::Tensor &group_of_feature, const Sizes &sizes);
 
 // The requester's part of a call across nodes (the in channel): its maps to
 // the rows of its keys, from what its node's proxies published (two
 // peer_gathers: their headers, and its rows' words of their remote_map) and
-// where its owners on its node put its keys of each feature (planner.cu).
+// where its owners on its node put the rows of its keys (planner.cu).
 
 // What a peer_gather reads (GatherFrom says which words): for each item a
 // node peer (negative: none) and its first int32 word to read there.
@@ -492,48 +501,16 @@ struct RequesterTables {
 // words: int32 [3][bucket_feature_of_row.numel()], the remote_map words of its
 // rows (remote_map_gather's; rows of its node's owners and past the valid rows
 // hold anything); headers: int32 [local_size][ProxyHeader::gathered_words]
-// (header_gather's); offset_per_owner_feature: int64
-// [local_size][num_features], where its keys of each feature start in each
-// owner's KJT on its node (node_status_exchange).
+// (header_gather's); owner_group_shift: int64 [local_size][num_groups], each
+// owner's group shifts on its node (node_status_exchange: a row of an owner of
+// its node lies at its place in the owner's own part, row + row_shift, plus
+// its group's shift); row_shift: the node layout's; group_of_feature: int32
+// [num_features].
 RequesterTables requester_tables(const at::Tensor &words, const at::Tensor &headers,
-                                 const at::Tensor &offset_per_owner_feature,
+                                 const at::Tensor &owner_group_shift,
                                  const at::Tensor &bucket_feature_of_row,
-                                 const at::Tensor &offset_per_bucket_feature,
+                                 const at::Tensor &row_shift, const at::Tensor &group_of_feature,
                                  const at::Tensor &offset_per_bucket, const Sizes &sizes);
-
-// The put lists of a call across nodes (the in channel), made in one step:
-// the rows that cross the rail between an owner's KJT and a proxy's
-// proxy_rows. The proxy's backward list sends the summed gradient rows of
-// its node-unique keys to their owners; the owner's forward list sends its
-// rows to the proxies that asked for them. Each cuts a node's keys at its
-// chunks and at the ends of its keys of each feature, so that a segment lies
-// in one chunk and one feature (planner.cu).
-
-// Both lists, in one tensor, of 2 * num_nodes nodes: the backward's owner
-// nodes, then the forward's proxy nodes. A list's segments are in (node,
-// key) order, so a node's chunks follow each other in stream order.
-struct PutLists {
-  at::Tensor
-      list;  // int32 [bound][4]: PutSeg {src, dst, rows, chunk}; the backward's src is a
-             // row of proxy_rows, its dst a row of the owner's KJT and its chunk the
-             // proxy's; the forward's the other way round, its chunk one of the owner's fwd_chunks
-  at::Tensor offsets;  // int32 [2 * num_nodes + 1]: where each node's segments start
-};
-// The backward list from the proxy's chunks (chunks, chunk_offset_per_bucket,
-// chunk_inv: ProxyChunks'), its node-unique keys per (owner node, feature)
-// and where its keys of each feature start in each rail owner's KJT
-// (owner_offsets, int64 [num_nodes][num_features]: the rail layout's, the
-// owners' source_offsets). The forward list from the chunks of this owner's
-// node in each source node's stream (fwd_chunks, fwd_chunk_offsets:
-// OwnerTables'), its keys per feature (node_length_per_source_feature) and
-// where those keys start in the owner's KJT (source_offsets).
-PutLists put_lists(const at::Tensor &chunks, const at::Tensor &chunk_offset_per_bucket,
-                   const at::Tensor &chunk_inv, const at::Tensor &node_offset_per_bucket,
-                   const at::Tensor &node_length_per_bucket_feature,
-                   const at::Tensor &owner_offsets, const at::Tensor &fwd_chunks,
-                   const at::Tensor &fwd_chunk_offsets,
-                   const at::Tensor &node_length_per_source_feature,
-                   const at::Tensor &source_offsets, const Sizes &sizes);
 
 }  // namespace hier_output_dist
 }  // namespace dyn_emb

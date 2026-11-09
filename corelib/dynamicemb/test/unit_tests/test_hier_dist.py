@@ -577,23 +577,32 @@ def hierarchical_model(
 
 class Probe:
     """What a model's row-wise lookup saw in the last iteration: its KJT and
-    the gradient of its output (a copy)."""
+    the gradient of its output (a copy), its rows in the KJT's order (on the
+    hierarchical dist a lookup group's rows lie in the order they arrive:
+    ``HierDist.key_rows``)."""
 
     def __init__(self, ec: ShardedDynamicEmbeddingCollection, dim: int) -> None:
         self.kjt: Optional[KeyedJaggedTensor] = None
         self.grad: Optional[torch.Tensor] = None
         lookup = ec._lookups[rw_index(ec)]
         orig = lookup.forward
+        hier = getattr(lookup, "_hier", None)
 
         def forward(features):
             out = orig(features)
             self.kjt = features
+            rows = (
+                hier.key_rows(features)
+                if hier is not None and hier.owns(features)
+                else None
+            )
             if out.requires_grad:
-                out.register_hook(keep)
+                out.register_hook(lambda grad: keep(grad, rows))
             return out
 
-        def keep(grad):
-            self.grad = grad.detach().view(-1, dim).clone()
+        def keep(grad, rows):
+            grad = grad.detach().view(-1, dim)
+            self.grad = (grad if rows is None else grad[rows]).clone()
 
         lookup.forward = forward
 

@@ -527,70 +527,65 @@ struct ChunkReady {
   __device__ bool posted() const { return (word >> kPostedBit) != 0; }
 };
 
-// The chunks of an owner node's put list that the issuer polls in a pass, at
-// most: the bits of a mask.
+// The chunks of an owner node that the issuer polls in a pass, at most: the
+// bits of a mask.
 constexpr int kIssueLookahead = 8;
 
-// The look-ahead of an owner node's put list in a pass: at most
-// kIssueLookahead chunks (a chunk's segments are consecutive) from the first
-// segment not yet put (done), each below `limit`. Bit i of `ready`: the i-th
-// chunk is ready to put, as the reducers counted all its keys (Chunk::keys)
-// ready; of `put_before`: it was put in an earlier pass. The loads of the
-// ready words are relaxed: the caller makes a fence after them before it
-// puts.
+// The look-ahead of an owner node's chunks in a pass: at most kIssueLookahead
+// of them, in order (entries of chunk_inv), from the first not yet put
+// (done), each below `limit`. Bit i of `ready`: the i-th chunk is ready to
+// put, as the reducers counted all its keys (Chunk::keys) ready; of
+// `put_before`: it was put in an earlier pass. The loads of the ready words
+// are relaxed: the caller makes a fence after them before it puts.
 __device__ __forceinline__ void poll_lookahead(const BwdPlanView &plan, const int64_t *ready_words,
                                                int64_t done, int64_t end, int64_t limit,
                                                unsigned &ready, unsigned &put_before) {
-  int64_t seg = done;
-  for (int i = 0; i < kIssueLookahead && seg < end; ++i) {
-    const int32_t chunk = plan.put_list[seg].chunk;
+  for (int i = 0; i < kIssueLookahead && done + i < end; ++i) {
+    const int32_t chunk = plan.chunk_inv[done + i];
     if (chunk >= limit) break;
     const ChunkReady state{ld_relaxed_sys((const uint64_t *)&ready_words[chunk])};
     if (state.posted())
       put_before |= 1u << i;
     else if (state.keys() >= plan.chunks[chunk].keys)
       ready |= 1u << i;
-    while (++seg < end && plan.put_list[seg].chunk == chunk) {
-    }
   }
 }
 
 // After the fence, the puts of the look-ahead's ready chunks
-// (poll_lookahead's masks; one lane, `ready` not 0): all the segments of each
-// such chunk, each adding its rows to the owner's bwd_rows signal, then the
-// chunk's posted bit. When the stream wraps, each put also counts on the
-// counter of its chunk, and posted(counter) counts the puts. Returns where
-// the segments not yet put start: done moves over the first chunks of the
-// look-ahead, as long as they are put. The put list's places are int32
-// (put_offsets).
+// (poll_lookahead's masks; one lane, `ready` not 0), in order: each such
+// chunk's sums from its rows of proxy_rows into the owner's lookup_rows, one
+// put per lookup group its keys span (bwd_groups: a group's rows of a node
+// are consecutive there), each adding its rows to the owner's bwd_rows
+// signal, then the chunk's posted bit. When the stream wraps, each put also
+// counts on the counter of its chunk, and posted(counter) counts the puts.
+// Returns where the chunks not yet put start: done moves over the first
+// chunks of the look-ahead, as long as they are put.
 __device__ __forceinline__ int64_t post_lookahead(const RowPut &put, const BwdPlanView &plan,
                                                   const BwdArgs &args, const CtrlLayout &ctrl,
                                                   const OutTimeline &timeline, int owner_node,
-                                                  int64_t done, int64_t end, unsigned ready,
-                                                  unsigned put_before, bool wraps, int counters) {
+                                                  int64_t done, unsigned ready, unsigned put_before,
+                                                  bool wraps, int counters) {
   const int prefix = ballot_run(ready | put_before);  // the first chunks, which are all put
-  const int walk = max(32 - __clz(ready), prefix);    // the chunks to walk over
-  const int last = (int)end;
-  int seg = (int)done;
-  PutSeg segment = plan.put_list[seg];
-  for (int i = 0; i < walk; ++i) {
-    const int32_t chunk = segment.chunk;
+  // its keys among the proxy's node-unique keys of the owner node
+  const int64_t first_key = plan.node_offset_per_bucket[owner_node];
+  for (unsigned bits = ready; bits != 0; bits &= bits - 1) {
+    const int32_t chunk = plan.chunk_inv[done + __ffs(bits) - 1];
+    const Chunk place = plan.chunks[chunk];
     const int counter = chunk % counters;
-    const bool now = ((ready >> i) & 1u) != 0;
-    const int first = seg;
-    do {
-      if (now) put.put(owner_node, segment.dst, segment.src, segment.rows, wraps, counter);
-      if (++seg < last) segment = plan.put_list[seg];
-    } while (seg < last && segment.chunk == chunk);
-    if (now) {
-      if (wraps) *ctrl.posted(counter) += (uint64_t)(seg - first);
-      // its segments' rows: a row per key
-      if (timeline.on()) timeline.posted((unsigned long long)plan.chunks[chunk].keys);
-      atomicOr((unsigned long long *)&args.ready[chunk], 1ull << ChunkReady::kPostedBit);
-    }
-    if (i < prefix) done = seg;
+    const int64_t key_lo = place.key_lo - first_key, first_row = place.start % plan.ring;
+    uint64_t puts = 0;
+    plan.bwd_groups.for_each_run(
+        owner_node, key_lo, key_lo + place.keys, [&](int64_t lo, int64_t hi, int64_t shift) {
+          put.put(owner_node, (int)(lo + shift), (int)(first_row + lo - key_lo), (int)(hi - lo),
+                  wraps, counter);
+          ++puts;
+        });
+    if (wraps) *ctrl.posted(counter) += puts;
+    // its rows: a row per key
+    if (timeline.on()) timeline.posted((unsigned long long)place.keys);
+    atomicOr((unsigned long long *)&args.ready[chunk], 1ull << ChunkReady::kPostedBit);
   }
-  return done;
+  return done + prefix;
 }
 
 // The proxy's issuer in the backward (across nodes; the last warp of CTA 0,
@@ -601,13 +596,13 @@ __device__ __forceinline__ int64_t post_lookahead(const RowPut &put, const BwdPl
 // there let it (bwd_ready), it puts that node's chunks, each once the
 // reducers counted all its keys ready and it is within kIssueLookahead chunks
 // of the first chunk not yet put. It polls the owner nodes in turn and waits
-// for no single one; its place in each one's segments is in this rank's
+// for no single one; its place in each one's chunks is in this rank's
 // put_at words. In a pass each lane polls the look-ahead of its owner node
 // (poll_lookahead, relaxed loads); then the warp makes one system fence if a
 // lane found a ready chunk, and each lane puts the ready chunks of its
-// look-ahead in list order (post_lookahead): each one's segments from
-// proxy_rows to their rows of the owner's lookup_rows. So chunks go out of
-// order only within the look-ahead. With more than 32 nodes, the lanes take
+// look-ahead in order (post_lookahead): each one's rows of proxy_rows into
+// their rows of the owner's lookup_rows, a put per lookup group they span.
+// So chunks go out of order only within the look-ahead. With more than 32 nodes, the lanes take
 // 32 owner nodes at a time, with a fence for each 32. When the stream wraps
 // the ring, each put also counts on the put counter of its chunk
 // (chunk % counters) once the NIC has read it, and a chunk is put only
@@ -652,7 +647,7 @@ __device__ void ProxyIssuer::run(ncclWindow_t window, const ncclDevComm &dev, co
   const int64_t count = *plan.num_chunks;
   const bool wraps = count > 0 && plan.chunks[count - 1].end > ring;
   for (int owner_node = lane; owner_node < num_nodes; owner_node += 32)
-    *layout.ctrl.put_at(owner_node) = plan.bwd_put_offset(owner_node);
+    *layout.ctrl.put_at(owner_node) = plan.chunk_offset_per_bucket[owner_node];
   __syncwarp();
   // rows of proxy_rows into the rail owners' lookup_rows
   const RowPut put{rows,
@@ -665,16 +660,16 @@ __device__ void ProxyIssuer::run(ncclWindow_t window, const ncclDevComm &dev, co
   int64_t read = 0;   // chunks the NIC has read, in order (the same in every lane)
   bool first = true;  // the lane has put nothing yet
   for (;;) {
-    bool moved = false, left = false;  // segments of the lane's owner nodes are left
+    bool moved = false, left = false;  // chunks of the lane's owner nodes are left
     const int64_t limit = wraps ? read + counters : count;  // chunks it may put
     // the owner nodes 32 at a time, a lane each
     for (int base = 0; base < num_nodes; base += 32) {
       const int owner_node = base + lane;
-      int64_t done = 0, end = 0;           // the owner node's segments: those before done are put
+      int64_t done = 0, end = 0;  // the owner node's chunks (chunk_inv): those before done are put
       unsigned ready = 0, put_before = 0;  // its look-ahead's chunks (poll_lookahead)
       if (owner_node < num_nodes && owner_node != node) {
         done = *layout.ctrl.put_at(owner_node);
-        end = plan.bwd_put_offset(owner_node + 1);
+        end = plan.chunk_offset_per_bucket[owner_node + 1];
         if (done < end &&
             (int64_t)credits.read_relaxed(sig_bwd_ready(num_nodes, owner_node)) >= seq)
           poll_lookahead(plan, args.ready, done, end, limit, ready, put_before);
@@ -686,7 +681,7 @@ __device__ void ProxyIssuer::run(ncclWindow_t window, const ncclDevComm &dev, co
       if (ready != 0) {
         if (first) timeline.stamp_earliest(kTraceFirstPut);
         first = false;
-        done = post_lookahead(put, plan, args, layout.ctrl, timeline, owner_node, done, end, ready,
+        done = post_lookahead(put, plan, args, layout.ctrl, timeline, owner_node, done, ready,
                               put_before, wraps, (int)counters);
         *layout.ctrl.put_at(owner_node) = done;
         moved = true;

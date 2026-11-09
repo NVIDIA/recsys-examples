@@ -86,10 +86,12 @@ void scatter_combine(const SrcType *src_ptr, DstType *dst_ptr,
   copy_multi_to_one(desc, feature_dims_vec4, stream);
 }
 
+// Row i of dst (row out_row[i] with out_row, int32) gets row inverse_idx[i]
+// of src.
 void scatter_fused(void *src_ptr, void *dst_ptr, void *inverse_idx_ptr,
                    int num_emb, int ev_size, int src_stride, DataType src_type,
                    DataType dst_type, DataType offset_type, int device_num_sms,
-                   cudaStream_t stream);
+                   cudaStream_t stream, const int32_t *out_row = nullptr);
 
 void get_new_length_and_offsets(uint64_t *d_unique_offsets,
                                 int64_t *d_table_offsets_in_feature,

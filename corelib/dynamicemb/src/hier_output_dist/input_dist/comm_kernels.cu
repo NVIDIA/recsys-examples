@@ -24,10 +24,10 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 //                         targets' node_keys, over NVLink;
 //   node_done             tells each target its keys are there, and waits until every requester
 //                         of the node told it;
-//   rail_exchange         (across nodes) its count message to every rail peer, and theirs; the
+//   rail_exchange         (across nodes) its count message to each rail peer, and theirs; the
 //                         rail's layout from the rail's messages (rail.cuh);
 //   rail_key_push         (across nodes) its key records to each rail owner; it does not wait;
-//   node_status_exchange  (across nodes) its rail's needs and requester_offsets to its node, and
+//   node_status_exchange  (across nodes) its rail's needs and its group shifts to its node, and
 //                         every node peer's;
 //   peer_gather           (across nodes) words of the node peers' remote_map or proxy header;
 //   rail_done             (across nodes) waits for every rail proxy's key records, and flushes
@@ -56,7 +56,7 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 //   proxy's key signal and flushes this rank's puts. Between the two run node_status_exchange,
 //   peer_gather, remote_map_gather and requester_tables: none of them reads rail_keys or writes
 //   key_stage. The first reader of rail_keys, owner_tables, runs after rail_done on the stream, and
-//   the planner reads the rail's offsets from the layout's tensors, not from the window. The next
+//   the planner reads the rail's layout from the layout's tensors, not from the window. The next
 //   call writes key_stage in its proxy steps, after this rail_done (and its flush: the NIC read
 //   the slices) on the stream, and its rail proxies put into rail_keys only once they have this
 //   rank's count message of that call, which its rail_exchange sends after this call's rail_done
@@ -158,25 +158,25 @@ __global__ void node_done_kernel(ncclWindow_t window, Sizes sizes, int64_t seq) 
     written.wait(peer, "pushed keys");
 }
 
-// 1 CTA: this rank's count message (count_message_of, rail.cuh: the same for every rail peer) into
-// its count_msg_out and into the call's count_msg slot of its own node. Then warp 1's lanes, each
-// taking rail peers in turn, put each peer the message into the same slot in the peer's copy, one
-// put that signals count[node]. Warp 0's lanes wait for the rail peers' messages. From the rail's
-// num_nodes messages, read in their slots of the call, the CTA lays out the rail (rail_layout_of)
-// into the call's tensors: every rank of the rail computes it from the same messages. The count
-// messages go by in_seq parity: a peer's message of call seq + 2 needs this rank's of seq + 1,
-// which it sends once call seq ended here.
+// 1 CTA: this rank's count messages (count_messages_of, rail.cuh: a header the same for every
+// rail peer, then the peer's own part) into count_msg_out, a row per peer, and its own into the
+// call's count_msg slot of its own node. Then warp 1's lanes, each taking rail peers in turn, put
+// each peer its row into the same slot in the peer's copy, one put that signals count[node]. Warp
+// 0's lanes wait for the rail peers' messages. From the rail's num_nodes messages, read in their
+// slots of the call, the CTA lays out the rail (rail_layout_of) into the call's tensors: every rank
+// of the rail computes the rail's runs and shifts from the same headers. The count messages go by
+// in_seq parity: a peer's message of call seq + 2 needs this rank's of seq + 1, which it sends
+// once call seq ended here.
 __global__ void __launch_bounds__(kThreads)
     rail_exchange_kernel(ncclWindow_t window, ncclDevComm dev, Sizes sizes, int64_t seq,
                          CountParts parts, int64_t *scratch, RailLayoutView layout) {
   const int num_nodes = sizes.topo.num_nodes, node = sizes.topo.node, tid = threadIdx.x,
             warp = tid >> 5, lane = tid & 31;
-  const CountMessage format{num_nodes, sizes.num_features};
+  const CountMessage format{num_nodes, sizes.num_features, sizes.num_groups};
   const NodeWindow node_window(window, sizes.topo.local_rank);
   const CtrlLayout ctrl = node_window.layout(sizes).ctrl;
-  int64_t *out = ctrl.count_msg_out();
   int64_t *own = ctrl.count_msg(seq, node);
-  count_message_of(parts, format, sizes.topo.local_size, out, own);
+  count_messages_of(parts, format, sizes.topo.local_size, node, ctrl.count_msg_out(0), own);
   __syncthreads();
   ncclGin gin(dev, kCtxIn);
   const ncclTeam rail = ncclTeamRail(dev);
@@ -184,7 +184,8 @@ __global__ void __launch_bounds__(kThreads)
     const RailMessage counts(gin, rail, node_window, sig_count(node));
     fence_sc_sys();
     for (int peer_node = lane; peer_node < num_nodes; peer_node += 32)
-      if (peer_node != node) counts.put(peer_node, own, out, (size_t)format.length() * 8);
+      if (peer_node != node)
+        counts.put(peer_node, own, ctrl.count_msg_out(peer_node), (size_t)format.length() * 8);
   }
   if (warp == 0) {
     Spin spin(sizes.timeout_ns);
@@ -228,23 +229,20 @@ __global__ void rail_key_push_kernel(ncclWindow_t window, ncclDevComm dev, Sizes
   }
 }
 
-// 1 CTA: this rank's rail's kNumNeeds needs and its requester offsets [requester][feature] (the
-// rail layout's) into its needs and requester_offsets words; after a system fence, which also
-// orders the planner's writes of remote_map and the proxy header before it, in_status gets seq.
-// Once every node peer's has it, every peer's needs land in peer_needs [local_size] [kNumNeeds]
-// and where each one's KJT holds this requester's keys of each feature in
-// offset_per_owner_feature [local_size][num_features].
+// 1 CTA: this rank's rail's kNumNeeds needs and its group shifts [group] (the rail layout's) into
+// its needs and group_shift words; after a system fence, which also orders the planner's writes of
+// remote_map and the proxy header before it, in_status gets seq. Once every node peer's has it,
+// every peer's needs land in peer_needs [local_size][kNumNeeds] and its group shifts in
+// owner_group_shift [local_size][num_groups].
 __global__ void node_status_exchange_kernel(ncclWindow_t window, Sizes sizes, int64_t seq,
-                                            const int64_t *needs, const int64_t *requester_offsets,
-                                            int64_t *peer_needs,
-                                            int64_t *offset_per_owner_feature) {
-  const int local_size = sizes.topo.local_size, num_features = (int)sizes.num_features,
+                                            const int64_t *needs, const int64_t *group_shift,
+                                            int64_t *peer_needs, int64_t *owner_group_shift) {
+  const int local_size = sizes.topo.local_size, num_groups = (int)sizes.num_groups,
             me = sizes.topo.local_rank, tid = threadIdx.x;
   const NodeWindow node(window, me);
   const CtrlLayout ctrl = node.layout(sizes).ctrl;
   for (int i = tid; i < kNumNeeds; i += blockDim.x) ctrl.needs()[i] = needs[i];
-  for (int i = tid; i < local_size * num_features; i += blockDim.x)  // requester * F + feature
-    ctrl.requester_offsets(i / num_features)[i % num_features] = requester_offsets[i];
+  for (int i = tid; i < num_groups; i += blockDim.x) ctrl.group_shift()[i] = group_shift[i];
   __syncthreads();
   const NodeBarrier status{sizes, node, ctrl.in_status(), seq};
   if (tid == 0) {
@@ -259,9 +257,8 @@ __global__ void node_status_exchange_kernel(ncclWindow_t window, Sizes sizes, in
   };
   for (int i = tid; i < local_size * kNumNeeds; i += blockDim.x)
     peer_needs[i] = word_of(i / kNumNeeds, ctrl.needs() + i % kNumNeeds);
-  for (int i = tid; i < local_size * num_features; i += blockDim.x)
-    offset_per_owner_feature[i] =
-        word_of(i / num_features, ctrl.requester_offsets(me) + i % num_features);
+  for (int i = tid; i < local_size * num_groups; i += blockDim.x)
+    owner_group_shift[i] = word_of(i / num_groups, ctrl.group_shift() + i % num_groups);
 }
 
 // Every CTA, a thread per word: word k of item i is node peer peer[i]'s word
@@ -344,13 +341,13 @@ RailLayout InChannel::rail_exchange(const NodeLayout &node, const ProxyPlan &pro
   const auto options = node.own_lengths.options();
   RailLayout rail = empty_rail_layout(sizes_, options);
   const at::Tensor scratch =
-      at::empty({rail_layout_scratch(sizes_.topo, sizes_.num_features)}, options);
+      at::empty({rail_layout_scratch(sizes_.topo, sizes_.num_groups)}, options);
   const CountParts parts{node.need_remote.data_ptr<int64_t>(),
-                         node.own_total.data_ptr<int64_t>() + sizes_.topo.local_rank,
+                         node.own_lengths.data_ptr<int64_t>(),
                          proxy.need_key_rows.data_ptr<int64_t>(),
                          proxy.chunk_length_per_bucket.data_ptr<int64_t>(),
-                         node.own_lengths.data_ptr<int64_t>(),
-                         proxy.node_length_per_bucket_feature.data_ptr<int64_t>()};
+                         proxy.node_length_per_bucket_feature.data_ptr<int64_t>(),
+                         group_starts_.data_ptr<int64_t>()};
   rail_exchange_kernel<<<kOneCta, kThreads, 0, current_stream()>>>(
       window_, dev_, sizes_, seq_, parts, scratch.data_ptr<int64_t>(), view_of(rail));
   C10_CUDA_KERNEL_LAUNCH_CHECK();
@@ -368,13 +365,12 @@ std::pair<at::Tensor, at::Tensor> InChannel::node_status_exchange(const RailLayo
   const int local_size = sizes_.topo.local_size;
   const auto options = rail.needs.options();
   at::Tensor peer_needs = at::empty({local_size, kNumNeeds}, options);
-  at::Tensor offset_per_owner_feature = at::empty({local_size, sizes_.num_features}, options);
+  at::Tensor owner_group_shift = at::empty({local_size, sizes_.num_groups}, options);
   node_status_exchange_kernel<<<1, 256, 0, current_stream()>>>(
-      window_, sizes_, seq_, rail.needs.data_ptr<int64_t>(),
-      rail.requester_offsets.data_ptr<int64_t>(), peer_needs.data_ptr<int64_t>(),
-      offset_per_owner_feature.data_ptr<int64_t>());
+      window_, sizes_, seq_, rail.needs.data_ptr<int64_t>(), rail.group_shift.data_ptr<int64_t>(),
+      peer_needs.data_ptr<int64_t>(), owner_group_shift.data_ptr<int64_t>());
   C10_CUDA_KERNEL_LAUNCH_CHECK();
-  return {peer_needs, offset_per_owner_feature};
+  return {peer_needs, owner_group_shift};
 }
 
 at::Tensor InChannel::peer_gather(GatherFrom from, const at::Tensor &peer,

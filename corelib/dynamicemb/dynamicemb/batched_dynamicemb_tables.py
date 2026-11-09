@@ -48,6 +48,7 @@ from dynamicemb.async_erase import (
 )
 from dynamicemb.batched_dynamicemb_function import (
     DynamicEmbeddingFunction,
+    OutputAlloc,
     PrefetchState,
     dynamicemb_eval_forward,
     dynamicemb_prefetch,
@@ -69,11 +70,11 @@ from dynamicemb.dynamicemb_config import (
 from dynamicemb.initializer import MultiTableInitializer
 from dynamicemb.key_ownership import owned_key_mask, owned_keys
 from dynamicemb.key_value_table import (
+    ERASE_CHUNK_SLOTS,
+    ERASE_MAX_CHUNKS_IN_FLIGHT,
     Cache,
     DynamicEmbCache,
     DynamicEmbStorage,
-    ERASE_CHUNK_SLOTS,
-    ERASE_MAX_CHUNKS_IN_FLIGHT,
     HybridStorage,
     Storage,
     flush_cache,
@@ -814,10 +815,8 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
         self._prefetch_states: Deque[PrefetchState] = deque()
         # Hook of the hierarchical dist (shard/hier_output_dist.py, set by
         # HierGroupedEmbeddingsLookup): where to put the sequence lookup
-        # output, in training and in eval.
-        self.output_alloc: Optional[
-            Callable[[int, int, torch.dtype], Optional[Tensor]]
-        ] = None
+        # output, in training and in eval (OutputAlloc).
+        self.output_alloc: Optional[OutputAlloc] = None
 
         # TODO:1->10
         self._empty_tensor = nn.Parameter(

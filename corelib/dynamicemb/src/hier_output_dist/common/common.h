@@ -74,6 +74,8 @@ struct Topo {
 struct Sizes {
   Topo topo;
   int64_t num_features;
+  int64_t num_groups;        // the lookup groups: consecutive runs of the features, each group's
+                             // rows in a slice of lookup_rows of its own (Config::lookup_groups)
   int64_t lookup_keys;       // keys an owner looks up (a capacity)
   int64_t remote_keys;       // remote occurrences a proxy deduplicates (a capacity)
   int64_t num_proxy_rows;    // rows of proxy_rows, the proxy's ring
@@ -154,7 +156,8 @@ __host__ __device__ inline uint64_t buffer_end(uint64_t bytes) {
 }
 
 // Formats of the tables the kernels of a call share (host and device): index
-// dedup's fan-out, the proxy's chunks and push orders, and put lists.
+// dedup's fan-out, the proxy's chunks and push orders, and the lookup groups'
+// runs of the rows the rail puts.
 
 // Index dedup's fan-out of the requester's deduplicated rows to its original
 // rows (the bucketize's): a row's are
@@ -227,13 +230,59 @@ static_assert(sizeof(KeyRecord) == 8 && sizeof(WeightedKeyRecord) == 16, "record
 __host__ __device__ inline int64_t min_proxy_rows_for(int64_t max_key_rows) {
   return 4 * max_key_rows;
 }
-// A segment of a put list: `rows` rows from src to dst (rows of the source and
-// destination buffers), all in one chunk and in one (feature, column) of the
-// owner's KJT; and its chunk, in the list's chunks: the backward's the
-// proxy's (whose ready counter it waits for), the forward's the owner chunks
-// its owner got (whose end it waits for in the grant).
-struct PutSeg {
-  int32_t src, dst, rows, chunk;
+
+// ── the rows the rail puts (num_nodes > 1) ──
+// An owner's lookup_rows hold each lookup group's rows in a slice of their own,
+// the groups in feature order, as its KJT holds their keys. Within its slice a
+// group's rows lie in the order they arrive: the rows of the owner's own part
+// (its node's keys, in their order there), then those of each other node in
+// node order, each in the order of the records its proxy sent (uniq order).
+// The lookup writes each key's row where the call's row map says (planner.h,
+// OwnerTables::row_map). A rail peer's keys of a call, the records of a source
+// node at an owner and the node-unique keys of an owner node at a proxy, are
+// feature-major, so a group's are consecutive: its run. A chunk's keys then
+// lie in one run of rows of the owner's lookup_rows per group they span, and
+// a rail put moves each run whole.
+
+// The runs of each rail peer's keys (as the owner's forward reads them: the
+// records of each source node; as the proxy's backward: its node-unique keys
+// of each owner node), [num_nodes][2 * num_groups + 1] int64 words: per peer
+// node, where each group's keys start among its keys (first, num_groups + 1
+// words: the last is the end of its keys), then each group's shift: key k of
+// group g lies at row k + shift(g) of the owner's lookup_rows.
+struct GroupRuns {
+  const int64_t *words;
+  int64_t num_groups;
+  __host__ __device__ static int64_t words_per_node(int64_t num_groups) {
+    return 2 * num_groups + 1;
+  }
+  __device__ __forceinline__ const int64_t *first(int64_t node) const {
+    return words + node * words_per_node(num_groups);
+  }
+  __device__ __forceinline__ const int64_t *shift(int64_t node) const {
+    return first(node) + num_groups + 1;
+  }
+  // Calls run(lo', hi', shift) for each group's run of the peer's keys
+  // [lo, hi), in key order, but empty ones: keys [lo', hi') at rows lo' +
+  // shift of the owner's lookup_rows.
+  template <typename Run>
+  __device__ __forceinline__ void for_each_run(int64_t node, int64_t lo, int64_t hi,
+                                               Run &&run) const {
+    const int64_t *starts = first(node), *shifts = shift(node);
+    // the first group that ends past lo (a binary search)
+    int64_t group = 0, end = num_groups;
+    while (group < end) {
+      const int64_t mid = (group + end) / 2;
+      if (starts[mid + 1] <= lo)
+        group = mid + 1;
+      else
+        end = mid;
+    }
+    for (; group < num_groups && starts[group] < hi; ++group) {
+      const int64_t run_lo = max(lo, starts[group]), run_hi = min(hi, starts[group + 1]);
+      if (run_lo < run_hi) run(run_lo, run_hi, shifts[group]);
+    }
+  }
 };
 
 // A call's status, which the host reads once per call: what it needs of

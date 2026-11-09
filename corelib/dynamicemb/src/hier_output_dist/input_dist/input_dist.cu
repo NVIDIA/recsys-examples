@@ -109,6 +109,12 @@ InChannel::InChannel(const Config &config, const Sizes &sizes, ncclWindow_t wind
   rail_keys_ = view(keys.rail_keys(), {(int64_t)keys.rail_keys_bytes() / 8}, at::kLong);
   tables_ = at::tensor(dense_tables(config.feature_tables), at::kInt).to(options);
   other_nodes_ = other_nodes_of(sizes_.topo, options);
+  const std::vector<int64_t> starts = config.group_starts();
+  std::vector<int> group_of_feature;
+  for (int64_t group = 0; group + 1 < (int64_t)starts.size(); ++group)
+    group_of_feature.insert(group_of_feature.end(), starts[group + 1] - starts[group], (int)group);
+  group_of_feature_ = at::tensor(group_of_feature, at::kInt).to(options);
+  group_starts_ = at::tensor(starts, at::kLong).to(options);
   header_gather_ = header_gather(sizes_, options);
 }
 
@@ -182,33 +188,30 @@ InDist InChannel::input_dist(const PlanInput &input) {
     // which rail_done waits for just before the owner's tables.
     const RailLayout rail = rail_exchange(node, proxy);
     rail_key_push(proxy.stage_offset_per_bucket, rail);
-    // The node again: the call's needs, where the node's owners hold this
-    // requester's keys of each feature, and what the node's proxies published
-    // for it.
-    at::Tensor offset_per_owner_feature;
-    std::tie(peer_needs, offset_per_owner_feature) = node_status_exchange(rail);
+    // The node again: the call's needs, the group shifts of the node's
+    // owners, and what the node's proxies published for this requester.
+    at::Tensor owner_group_shift;
+    std::tie(peer_needs, owner_group_shift) = node_status_exchange(rail);
     const at::Tensor headers =
         peer_gather(kGatherProxyHeader, header_gather_.peer, header_gather_.first_word)
             .view({local_size, ProxyHeader::of(sizes_).gathered_words()});
     const PeerWords map_gather = remote_map_gather(
         bucketized.bucket_feature_of_row, bucketized.offset_per_bucket, node.row_shift, sizes_);
     at::Tensor words = peer_gather(kGatherRemoteMap, map_gather.peer, map_gather.first_word);
-    const RequesterTables requester = requester_tables(
-        words, headers, offset_per_owner_feature, bucketized.bucket_feature_of_row,
-        bucketized.offset_per_bucket_feature, bucketized.offset_per_bucket, sizes_);
+    const RequesterTables requester =
+        requester_tables(words, headers, owner_group_shift, bucketized.bucket_feature_of_row,
+                         node.row_shift, group_of_feature_, bucketized.offset_per_bucket, sizes_);
     words = at::Tensor();  // requester_tables is its one reader: free it before the owner tables
     // Every rail proxy's key records are in rail_keys, and the NIC read this
     // proxy's (comm_kernels.cu says why nothing before reads or writes them).
     rail_done();
-    const OwnerTables owner = owner_tables(rail, node.own_offsets, own_node_keys_,
-                                           own_node_key_weights_, rail_keys_, other_nodes_, sizes_);
-    const PutLists lists = put_lists(
-        proxy.chunks, proxy.chunk_offset_per_bucket, proxy.chunk_inv, proxy.node_offset_per_bucket,
-        proxy.node_length_per_bucket_feature, rail.owner_offsets, owner.fwd_chunks,
-        owner.fwd_chunk_offsets, rail.node_length_per_source_feature, rail.source_offsets, sizes_);
+    const OwnerTables owner =
+        owner_tables(rail, node.own_offsets, own_node_keys_, own_node_key_weights_, rail_keys_,
+                     other_nodes_, group_of_feature_, sizes_);
     // The plans: the requester's maps and its tables of the node's proxies,
     // the owner's and the proxy's tables, the proxy's rows before each key
-    // and the put lists. Then the owner's KJT.
+    // and the group runs of the rows the rail puts. Then the owner's KJT and
+    // its row map.
     fwd.src = requester.src;
     bwd.dst = requester.dst;
     fwd.push_order = bwd.push_order = requester.push_order;
@@ -218,19 +221,21 @@ InDist InChannel::input_dist(const PlanInput &input) {
     fwd.remote_task_offsets = bwd.remote_task_offsets = requester.remote_task_offsets;
     fwd.num_chunks = bwd.num_chunks = proxy.num_chunks;
     fwd.chunks = bwd.chunks = proxy.chunks;
-    fwd.node_offset_per_bucket = proxy.node_offset_per_bucket;
-    fwd.put_list = bwd.put_list = lists.list;
-    fwd.put_offsets = bwd.put_offsets = lists.offsets;
+    fwd.chunk_offset_per_bucket = bwd.chunk_offset_per_bucket = proxy.chunk_offset_per_bucket;
+    fwd.chunk_inv = bwd.chunk_inv = proxy.chunk_inv;
+    fwd.node_offset_per_bucket = bwd.node_offset_per_bucket = proxy.node_offset_per_bucket;
     fwd.push_order_off = requester.push_order_off;
     fwd.fwd_chunks = owner.fwd_chunks;
-    fwd.chunk_offset_per_bucket = proxy.chunk_offset_per_bucket;
-    fwd.chunk_inv = proxy.chunk_inv;
+    fwd.fwd_chunk_offsets = owner.fwd_chunk_offsets;
+    fwd.fwd_groups = rail.fwd_groups;
     fwd.node_length_per_bucket = proxy.node_length_per_bucket;
+    bwd.bwd_groups = rail.bwd_groups;
     bwd.node_length_per_source = rail.node_length_per_source;
     bwd.reduce_task_offsets = proxy.reduce_task_offsets;
     bwd.node_exp_off = proxy.node_exp_off;
     dist.kjt_values = owner.kjt_values;
     dist.kjt_weights = owner.kjt_weights;
+    dist.row_map = owner.row_map;
     dist.kjt_lengths = rail.kjt_lengths;
     dist.kjt_offsets = rail.kjt_offsets;
     occurrences = proxy.occurrence_count;
