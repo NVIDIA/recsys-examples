@@ -25,6 +25,7 @@ import sys
 import textwrap
 from typing import List
 
+import dynamicemb  # noqa: F401  (imports torch before the extension)
 import dynamicemb_extensions
 import numpy as np
 import pytest
