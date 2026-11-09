@@ -405,7 +405,11 @@ insert_body(Table table, int64_t const *__restrict__ table_bucket_offsets,
     }
     if (table_cap == 0) {
       if constexpr (OutputScore) {
-        score_output[i] = static_cast<int64_t>(score);
+        // Null-safe, like the write at the end of the body: the LruLfu cubin
+        // fixes OutputScore=true and decides at runtime. This branch takes a
+        // reserved key (a padded tail) and a table without buckets.
+        if (score_output != nullptr)
+          score_output[i] = static_cast<int64_t>(score);
       }
       table_key_slots[i] = nullptr;
       indices[i] = -1;

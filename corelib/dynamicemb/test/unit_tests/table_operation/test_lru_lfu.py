@@ -712,7 +712,7 @@ def test_lru_lfu_custom_score_function_batched_v2(current_device):
     ir = torch.empty(n, dtype=table.result_type, device=device).fill_(
         InsertResult.INIT.value
     )
-    idx = table.insert(keys, tids, _sa(ones), ir)
+    table.insert(keys, tids, _sa(ones), ir)
 
     for i in range(n):
         reps = 1 + (i * 7) % 5
@@ -873,6 +873,64 @@ def test_lru_lfu_plain_insert_evicts_via_cubin(current_device):
     assert not bool(
         founds.any()
     ), "plain insert must evict the high-freq keys via the custom cubin (DefaultEvictor would have kept them)"
+
+
+def test_lru_lfu_insert_reserved_keys_without_score_out(current_device):
+    """A reserved key in a plain insert is skipped, whether or not the caller
+    asks for the score output.
+
+    The LruLfu insert kernels are JIT-compiled once, with the score output
+    switched on; a call that passes no ``score_out`` hands them a null pointer.
+    A reserved key -- the all-ones EmptyKey and the three keys next to it, none of
+    which a table can store -- leaves the kernel by an early exit that used to
+    write that output unchecked and so faulted. Such keys are what the padded
+    tail of a unique batch holds. They must get no slot (index -1), leave the
+    real keys of the batch alone, and not fault, on the plain insert and on the
+    one that collects the evicted keys."""
+    device = torch.cuda.current_device()
+    keys = torch.tensor(
+        [1001, -1, 1002, -2, -3, -4, 1003], dtype=torch.int64, device=device
+    )
+    tids = torch.zeros(keys.numel(), dtype=torch.int64, device=device)
+    is_real = torch.tensor(
+        [True, False, True, False, False, False, True], device=device
+    )
+
+    def freq(n):
+        return ScoreArg(
+            name="frequency",
+            value=torch.ones(n, dtype=torch.uint64, device=device),
+            policy=ScorePolicy.LRU_LFU,
+        )
+
+    def check_indices(idx):
+        torch.cuda.synchronize()
+        assert torch.all(idx[is_real] >= 0), "a real key got no slot"
+        assert torch.all(idx[~is_real] == -1), "a reserved key got a slot"
+
+    # Plain insert, no score_out; then again, when the real keys are stored.
+    table = _lru_lfu_table(4096)
+    idx = table.insert(keys, tids, freq(keys.numel()))
+    check_indices(idx)
+    assert table.size() == 3
+    check_indices(table.insert(keys, tids, freq(keys.numel())))
+    assert table.size() == 3
+
+    # Only the keys that are already stored: the same slots, still no score_out.
+    n_real = int(is_real.sum())
+    again = table.insert(keys[is_real], tids[is_real], freq(n_real))
+    torch.cuda.synchronize()
+    assert torch.equal(again, idx[is_real])
+
+    # The insert that collects the evicted keys (nothing is evicted here).
+    table = _lru_lfu_table(4096)
+    idx, num_evicted, evicted_keys, evicted_tids = table.insert(
+        keys, tids, freq(keys.numel()), collect_evicted=True
+    )
+    check_indices(idx)
+    assert int(num_evicted) == 0
+    assert torch.all(evicted_keys == -1) and torch.all(evicted_tids == -1)
+    assert table.size() == 3
 
 
 def test_lru_lfu_insert_after_erase_no_phantom_frequency(current_device):
