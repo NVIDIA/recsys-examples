@@ -392,7 +392,7 @@ class TestTheBroadcastSeam:
 # --- where the refusal happens ---------------------------------------------
 
 
-def _dynamicemb_constraints(*names, hbm_budget=GB):
+def _dynamicemb_constraints(*names, hbm_budget=GB, **options_kwargs):
     """Row-wise DynamicEmb constraints, one per key, all of one budget.
 
     The keys are whatever `constraints` accepts -- a bare table name or a
@@ -402,7 +402,9 @@ def _dynamicemb_constraints(*names, hbm_budget=GB):
         name: DynamicEmbParameterConstraints(
             sharding_types=[ShardingType.ROW_WISE.value],
             use_dynamicemb=True,
-            dynamicemb_options=DynamicEmbTableOptions(global_hbm_for_values=hbm_budget),
+            dynamicemb_options=DynamicEmbTableOptions(
+                global_hbm_for_values=hbm_budget, **options_kwargs
+            ),
         )
         for name in names
     }
@@ -777,6 +779,47 @@ class TestGroupedTiers:
         )
         grouped = get_group_value_bytes_by_tier([(small, None), (large, None)])
         assert all(s == make_storage(hbm=grouped[0], ddr=grouped[1]) for s in spent)
+
+
+# --- caching with no HBM budget ---------------------------------------------
+
+
+class TestCachingWithoutHbmBudget:
+    """`caching=True` asks for an HBM tier; a table with no HBM budget cannot have one.
+
+    The runtime would build it a one-bucket cache whose finite overflow cannot
+    absorb a batch's admitted keys, so the planner takes caching off before
+    grouping or the cost model reads the field.
+    """
+
+    def test_zero_budget_caching_is_normalized_off_before_grouping(self):
+        """Both tables ask for caching=True; only the funded one keeps it, and
+        the two no longer share a grouped key, so they cannot be fused into one
+        module. The zero-budget one is costed as the host-only table it will
+        actually be."""
+        module = _Model(_ebc(table_names=["zero", "funded"]))
+        with pytest.warns(UserWarning, match="local_hbm_for_values of zero"):
+            planner = _plan_dynamicemb(
+                module,
+                {
+                    **_dynamicemb_constraints("zero", hbm_budget=0, caching=True),
+                    **_dynamicemb_constraints(
+                        "funded", hbm_budget=2 * GB, caching=True
+                    ),
+                },
+            )
+        options = planner._dyn_emb_options
+        zero = options[TableKey("sparse.ebc", "zero")]
+        funded = options[TableKey("sparse.ebc", "funded")]
+        assert zero.caching is False
+        assert funded.caching is True
+        assert zero.get_grouped_key() != funded.get_grouped_key()
+        # ... and costed as the host-only table it will actually be: no HBM,
+        # its whole (per-rank) size on the host tier.
+        assert get_group_value_bytes_by_tier([(zero, None)]) == (
+            0,
+            zero.max_capacity * zero.dim * 4,
+        )
 
 
 # --- optimizer_types: which optimizer each table trains with ----------------

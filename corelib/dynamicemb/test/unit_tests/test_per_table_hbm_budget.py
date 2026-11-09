@@ -25,6 +25,7 @@ from typing import List
 
 import pytest
 import torch
+
 from dynamicemb import (
     DynamicEmbPoolingMode,
     DynamicEmbScoreStrategy,
@@ -87,14 +88,14 @@ def assert_on_device(state):
         ), f"table {i}'s HBM rows were allocated as {type(buf).__name__}"
 
 
-def train_one_step(model, current_device):
-    """Every table answers a lookup and takes a gradient."""
+def train_one_step(model, current_device, bags=2):
+    """Every table answers a lookup and takes a gradient, `bags` bags apiece."""
     n = len(model._dynamicemb_options)
     device = torch.device(f"cuda:{current_device}")
-    indices = torch.arange(2 * n, dtype=torch.int64, device=device)
-    offsets = torch.arange(2 * n + 1, dtype=torch.int64, device=device)
+    indices = torch.arange(bags * n, dtype=torch.int64, device=device)
+    offsets = torch.arange(bags * n + 1, dtype=torch.int64, device=device)
     out = model(indices, offsets)
-    assert out.shape == (2, n * DIM)
+    assert out.shape == (bags, n * DIM)
     out.sum().backward()
     torch.cuda.synchronize()
 
@@ -123,17 +124,52 @@ def test_each_table_keeps_its_own_share(current_device, caching):
     train_one_step(model, current_device)
 
 
-@pytest.mark.parametrize("caching", [True, False])
-def test_a_table_without_a_budget_does_not_take_its_groupmates(current_device, caching):
-    """The first table has no budget, so it gets the one-bucket floor and the
-    second keeps all of its own. Listed first, it must not move the group's
-    HBM rows to the host either."""
-    model = build(current_device, [0, TABLE_BYTES * 3 // 4], caching=caching)
+def test_a_table_without_a_budget_does_not_take_its_groupmates(current_device):
+    """A hybrid split gives the first table, which has no budget, the
+    one-bucket floor and the second all of its own. Listed first, it must not
+    move the group's HBM rows to the host either.
+
+    The same budgets with caching=True are a different case: the cache that
+    zero-budget table would get is refused, in the test below."""
+    model = build(current_device, [0, TABLE_BYTES * 3 // 4], caching=False)
 
     hbm = hbm_tier(model)
     assert hbm.key_index_map.per_table_capacity_ == [CACHE_BUCKET, ROWS * 3 // 4]
     assert_on_device(hbm)
     train_one_step(model, current_device)
+
+
+@pytest.mark.parametrize(
+    "budget", [0, TABLE_BYTES * 3 // 4], ids=["zero_budget", "funded"]
+)
+def test_zero_hbm_budget_takes_caching_off_the_table(current_device, budget):
+    """caching=True with a zero local_hbm_for_values is normalized off, with a
+    warning, before the grouping check: a cache is an HBM tier, and the
+    one-bucket cache the runtime would build cannot absorb a batch. A positive
+    local budget keeps the cache with global_hbm_for_values left at its
+    default, which direct construction never reads."""
+    if budget == 0:
+        with pytest.warns(UserWarning, match="local_hbm_for_values of zero"):
+            model = build(current_device, [0], caching=True)
+        assert model._cache is None
+        assert model._storage_layout == StorageLayout.HOST_ONLY
+        # More unique keys than the former one-bucket cache plus its overflow
+        # (1024 + 3 * 1024 rows) could ever hold.
+        train_one_step(model, current_device, bags=8192)
+    else:
+        model = build(current_device, [budget], caching=True)
+        assert model._storage_layout == StorageLayout.CACHING
+        assert model._cache is not None
+
+
+def test_mixed_caching_left_by_normalization_is_refused(current_device):
+    """The zero-budget tablemate loses its cache to normalization, the funded
+    one keeps it, and one fused module cannot hold both layouts -- so the
+    group is refused, by name, rather than built with a broken half-cache."""
+    with pytest.warns(UserWarning, match="local_hbm_for_values of zero"), pytest.raises(
+        ValueError, match="caching was disabled for t_0"
+    ):
+        build(current_device, [0, TABLE_BYTES * 3 // 4], caching=True)
 
 
 def test_a_group_that_fits_its_summed_budget_stays_in_hbm(current_device):

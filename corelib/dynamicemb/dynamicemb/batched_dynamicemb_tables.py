@@ -63,6 +63,7 @@ from dynamicemb.dynamicemb_config import (
     get_eviction_score_strategy,
     get_score_part,
     has_no_eviction,
+    normalize_caching_against_hbm_budget,
     score_strategy_has_timestamp_column,
     warning_for_cstm_score,
 )
@@ -636,6 +637,32 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
     ) -> None:
         super().__init__()
         assert len(table_options) >= 1
+        # A cache is an HBM tier, so a table whose resolved HBM value budget
+        # is zero cannot have one: the runtime would build it a single-bucket
+        # cache whose overflow cannot absorb a batch. Caching comes off such
+        # a table before the grouped-key check below -- the planner makes the
+        # same change before it groups and costs tables
+        # (``_prepare_dynemb_table_options``), so both see one answer.
+        table_labels = (
+            table_names
+            if table_names is not None
+            else [f"table {i}" for i in range(len(table_options))]
+        )
+        lost_caching = [
+            label
+            for label, option in zip(table_labels, table_options)
+            if normalize_caching_against_hbm_budget(option, label=label)
+        ]
+        if lost_caching and len({option.caching for option in table_options}) > 1:
+            # Only the normalization above can leave a group mixed in caching:
+            # options that arrived mixed are refused by the check just below.
+            raise ValueError(
+                f"caching was disabled for {', '.join(lost_caching)} "
+                "(local_hbm_for_values of zero) but kept for the other tables: "
+                "the tables of one fused module must share one storage layout. "
+                "Give every table a positive local_hbm_for_values, or pass "
+                "caching=False for all of them."
+            )
         table_option = table_options[0]
         for other_option in table_options:
             assert (

@@ -533,6 +533,9 @@ class DynamicEmbTableOptions:
         High-bandwidth memory allocated for local values, in bytes. Default is 0.
         With ``DynamicEmbeddingShardingPlanner``, this is set to
         ``ceil(global_hbm_for_values / world_size)`` per rank.
+        A value of zero also turns ``caching`` off for the table, with a
+        warning -- a cache is an HBM tier the table has no budget for (see
+        :func:`normalize_caching_against_hbm_budget`).
     device_id : Optional[int], optional
         CUDA device index.
     training: bool
@@ -565,6 +568,11 @@ class DynamicEmbTableOptions:
             set **`caching=True`** will create a GPU table and a host table, and make GPU table serves as a cache;
             set **`caching=False`** will create a hybrid table which use GPU and host memory in a concatenated way to store value.
             All keys and other meta data are always stored on GPU for both cases.
+        A table whose resolved ``local_hbm_for_values`` is zero has caching
+        turned off, with a warning, at plan/construction time: a cache is an
+        HBM tier, and without a budget it would be a single bucket whose
+        overflow cannot absorb a batch's admitted keys. See
+        :func:`normalize_caching_against_hbm_budget`.
     init_capacity : Optional[int], optional
         The initial capacity of the table. If not set, it defaults to max_capacity after sharding.
         If `init_capacity` is provided, it will serve as the initial table capacity on a single GPU.
@@ -841,6 +849,43 @@ class DynamicEmbTableOptions:
     def __hash__(self):
         group_keys = self.get_grouped_key()
         return hash(tuple(group_keys.items()))
+
+
+def normalize_caching_against_hbm_budget(
+    options: "DynamicEmbTableOptions", *, label: str = ""
+) -> bool:
+    """Take ``caching`` off a table whose resolved HBM value budget is zero.
+
+    A cache is an HBM tier: with no budget the runtime would build the table a
+    single-bucket cache whose finite overflow cannot absorb a batch's admitted
+    keys, which the prefetch path assumes it can. The table goes to the
+    non-caching host / external-storage paths instead.
+
+    This runs before ``caching`` is read for anything else: the field is part
+    of the grouping key (:meth:`DynamicEmbTableOptions.get_grouped_key`), so a
+    change here decides which tables fuse, and the planner's cost model
+    (:func:`get_group_value_bytes_by_tier`) reads the same field. The planner
+    calls it once ``local_hbm_for_values`` is resolved from
+    ``global_hbm_for_values``; direct construction calls it on the options as
+    given, where a positive ``local_hbm_for_values`` keeps caching however
+    ``global_hbm_for_values`` is set.
+
+    Returns whether it disabled ``caching``. Mutates ``options``.
+    """
+    if options.caching and options.local_hbm_for_values <= 0:
+        options.caching = False
+        prefix = f"DynamicEmb table {label}: " if label else "DynamicEmb table: "
+        warnings.warn(
+            prefix + "caching=True with a local_hbm_for_values of zero. A cache is an "
+            "HBM tier: without a budget the table would hold a single bucket "
+            "whose overflow cannot absorb a batch's admitted keys. Disabling "
+            "caching for this table; it will use the non-caching host or "
+            "external-storage paths instead. Set caching=False or a positive "
+            "local_hbm_for_values to silence this warning.",
+            UserWarning,
+        )
+        return True
+    return False
 
 
 def data_type_to_dyn_emb(data_type: DataType) -> DynamicEmbDataType:
