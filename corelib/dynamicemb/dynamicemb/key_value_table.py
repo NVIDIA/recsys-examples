@@ -552,6 +552,53 @@ class DynamicEmbTableState:
 NO_EVICTION_LOAD_FACTOR = 0.5
 
 
+def _host_reserve_factor() -> float:
+    value = os.environ.get("DYNAMICEMB_HOST_RESERVE_FACTOR", "8")
+    try:
+        factor = float(value)
+    except ValueError:
+        factor = 0.0
+    if not factor >= 1.0:
+        raise ValueError(
+            f"DYNAMICEMB_HOST_RESERVE_FACTOR must be a number of at least 1, got {value!r}."
+        )
+    return factor
+
+
+# How much address space a host value buffer of a table that never evicts reserves when
+# it is created, for it to grow in place: this many times the table's max_capacity,
+# and at least _HOST_RESERVE_FLOOR_BYTES. Address space only: it costs no memory, but
+# it is not unlimited, which is why a table that evicts reserves exactly what its
+# max_capacity can need.
+_HOST_RESERVE_FACTOR = _host_reserve_factor()
+_HOST_RESERVE_FLOOR_BYTES = 64 << 30
+
+
+def _host_value_rows_reserve(
+    opt: DynamicEmbTableOptions, rows_now: int, row_bytes: int, no_eviction: bool
+) -> int:
+    """The rows of address space the host value buffer of a table that can grow
+    reserves (see :class:`HostExtendableBuffer`).
+
+    A table that evicts never has more rows than its key map has slots, which
+    :func:`get_expand_info` keeps to ``max_capacity`` (rounded up to a bucket, and a
+    bucket more for a rounded target): that is exact. A table that never evicts is not
+    capped by ``max_capacity``, so it gets a margin of ``DYNAMICEMB_HOST_RESERVE_FACTOR``
+    times it, and no less than 64 GiB; growing past that is an error that names the
+    knob.
+    """
+    bucket = opt.bucket_capacity
+    if no_eviction or opt.max_capacity is None:
+        planned = rows_now if opt.max_capacity is None else opt.max_capacity
+        rows = max(
+            int(_HOST_RESERVE_FACTOR * planned),
+            -(-_HOST_RESERVE_FLOOR_BYTES // row_bytes),
+        )
+    else:
+        rows = ((opt.max_capacity + bucket - 1) // bucket + 1) * bucket
+    return max(rows_now, rows)
+
+
 def create_table_state(
     options: List[DynamicEmbTableOptions],
     optimizer: BaseDynamicEmbeddingOptimizer,
@@ -681,6 +728,7 @@ def create_table_state(
     # budget: a host tier zeroes every table's budget, while an HBM tier may
     # hold a table with no budget of its own beside one that has some.
     on_host = all(opt.local_hbm_for_values == 0 for opt in options)
+    can_still_grow = _tables_can_grow(options, no_eviction, key_index_map_caps)
     tables: List[ExtendableBuffer] = []
     for i, (cap, vd) in enumerate(zip(table_caps, value_dims)):
         total_cap = cap
@@ -688,7 +736,20 @@ def create_table_state(
             total_cap += overflow_caps_list[i]
         shape = (total_cap, vd)
         if on_host:
-            tables.append(HostExtendableBuffer(shape, emb_dtype, device))
+            # A host buffer grows in place, inside the address range it reserves now:
+            # exactly what it has if it can never grow.
+            reserve_rows = (
+                _host_value_rows_reserve(
+                    options[i], total_cap, vd * emb_dtype.itemsize, no_eviction
+                )
+                if can_still_grow
+                else total_cap
+            )
+            tables.append(
+                HostExtendableBuffer(
+                    shape, emb_dtype, device, max_shape=(reserve_rows, vd)
+                )
+            )
         else:
             tables.append(DeviceExtendableBuffer(shape, emb_dtype, device))
 
@@ -699,7 +760,6 @@ def create_table_state(
     threads_in_wave = (
         props.multi_processor_count * props.max_threads_per_multi_processor
     )
-    can_still_grow = _tables_can_grow(options, no_eviction, key_index_map_caps)
     table_ptrs = _base_pointers(tables)
 
     return DynamicEmbTableState(

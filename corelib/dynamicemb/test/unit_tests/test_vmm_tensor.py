@@ -23,10 +23,17 @@ import time
 
 import pytest
 import torch
+from dynamicemb import extendable_tensor
 from dynamicemb.extendable_tensor import DeviceExtendableBuffer, HostExtendableBuffer
 
 requires_cuda = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="CUDA required"
+)
+
+# A host buffer that grows in place needs the extension built with it.
+requires_in_place_host = pytest.mark.skipif(
+    platform.system() != "Linux" or not extendable_tensor._HOST_IN_PLACE,
+    reason="HostExtendableBuffer growth in place needs Linux and the rebuilt extension",
 )
 
 _EXTENDABLE_BUFFER_PARAMS = [
@@ -397,6 +404,127 @@ def test_vmm_buffer(init_capacity, dtype, buffer_cls):
             f"logical={_format_mem_bytes(logical_b)} allocated={_format_mem_bytes(alloc_b)} "
             f"base_ptr={pointer:#x} tensor_ptr={buffer.tensor().data_ptr():#x}"
         )
+
+
+@requires_cuda
+@requires_in_place_host
+def test_host_buffer_grows_in_place():
+    """A host buffer commits pages inside the address range it reserved: the base address
+    of its tensor is the same after every growth (and with it every pointer table a kernel
+    holds), the values of the first pages are where they were, and a kernel can read and
+    write across the boundaries of the pieces the range is registered in."""
+    device = _cuda_device()
+    buf = HostExtendableBuffer((1024,), torch.float32, device, max_shape=(1 << 16,))
+    pointer = buf.tensor().data_ptr()
+    assert buf.reserved_bytes() >= (1 << 16) * 4
+    buf.tensor().copy_(torch.arange(1024, device=device, dtype=torch.float32))
+    total, allocated = 1024, buf.allocated_bytes()
+    for step in range(20):  # sub-page and multi-page growths
+        buf.extend((1 + 150 * step,))
+        total += 1 + 150 * step
+        torch.cuda.synchronize()
+        assert buf.tensor().data_ptr() == pointer
+        assert buf.numel() == total
+        assert buf.allocated_bytes() >= max(allocated, total * 4)
+        allocated = buf.allocated_bytes()
+    first = torch.arange(1024, device=device, dtype=torch.float32)
+    torch.testing.assert_close(buf.tensor()[:1024], first)
+    # one kernel over the whole buffer, which crosses every boundary
+    everything = buf.tensor().reshape(-1)
+    everything.copy_(torch.arange(total, device=device, dtype=torch.float32))
+    everything.add_(1.0)
+    torch.cuda.synchronize()
+    expected = torch.arange(total, device=device, dtype=torch.float32) + 1.0
+    torch.testing.assert_close(buf.tensor().reshape(-1).clone(), expected)
+
+
+@requires_cuda
+@requires_in_place_host
+def test_host_buffer_cannot_outgrow_its_reservation_and_stays_usable():
+    device = _cuda_device()
+    buf = HostExtendableBuffer((1024,), torch.float32, device, max_shape=(4096,))
+    pointer = buf.tensor().data_ptr()
+    buf.tensor().fill_(3.0)
+    torch.cuda.synchronize()
+
+    with pytest.raises(RuntimeError, match="address space") as info:
+        buf.extend((1 << 20,))
+    # the error says what to turn
+    assert "DYNAMICEMB_HOST_RESERVE_FACTOR" in str(info.value)
+
+    assert buf.numel() == 1024 and buf.shape == (1024,)
+    assert buf.tensor().data_ptr() == pointer
+    buf.extend((1024,))  # still inside the reservation
+    torch.cuda.synchronize()
+    assert buf.numel() == 2048
+    assert bool((buf.tensor().reshape(-1)[:1024] == 3.0).all())
+
+
+@requires_cuda
+def test_a_stale_extension_says_to_rebuild(monkeypatch):
+    if platform.system() != "Linux":
+        pytest.skip("HostExtendableBuffer is only supported on Linux")
+    monkeypatch.setattr(extendable_tensor, "_HOST_IN_PLACE", False)
+    buf = HostExtendableBuffer((16,), torch.float32, _cuda_device())
+    with pytest.raises(RuntimeError, match="rebuild"):
+        buf.extend((16,))
+    assert buf.numel() == 16
+
+
+_MEMLOCK_SCRIPT = """
+import os, resource, sys, torch
+from dynamicemb.extendable_tensor import HostExtendableBuffer
+
+device = torch.device("cuda", torch.cuda.current_device())
+page = os.sysconf("SC_PAGE_SIZE")
+buf = HostExtendableBuffer((page // 4,), torch.float32, device, max_shape=(1 << 22,))
+buf.tensor().fill_(5.0)
+torch.cuda.synchronize()
+
+def locked():
+    for line in open("/proc/self/status"):
+        if line.startswith("VmLck:"):
+            return int(line.split()[1]) * 1024
+
+limit = locked() + 4 * page
+resource.setrlimit(resource.RLIMIT_MEMLOCK, (limit, resource.getrlimit(resource.RLIMIT_MEMLOCK)[1]))
+try:
+    buf.extend((64 * page // 4,))  # 64 more pages: over the limit
+except RuntimeError as exc:
+    assert "mlock" in str(exc), exc
+    print("REFUSED")
+else:
+    print("NOT_ENFORCED")  # root, or CAP_IPC_LOCK: the limit does not apply
+    sys.exit(0)
+assert buf.numel() == page // 4, buf.numel()
+assert bool((buf.tensor() == 5.0).all())
+buf.extend((page // 4,))  # one more page fits
+torch.cuda.synchronize()
+assert buf.numel() == 2 * (page // 4)
+assert bool((buf.tensor().reshape(-1)[: page // 4] == 5.0).all())
+print("USABLE")
+"""
+
+
+@requires_cuda
+@requires_in_place_host
+def test_a_failed_growth_leaves_the_buffer_usable():
+    """RLIMIT_MEMLOCK refuses the pages of a growth: the error comes out of extend, the
+    range it tried is address space again, the buffer has the size and the values it had,
+    and a growth that fits works. In a child process: the limit is the process's."""
+    child = subprocess.run(
+        [sys.executable, "-c", _MEMLOCK_SCRIPT],
+        capture_output=True,
+        text=True,
+        timeout=300.0,
+        env={**os.environ, "PYTHONPATH": os.pathsep.join(sys.path)},
+    )
+    assert child.returncode == 0, child.stdout + child.stderr
+    if "NOT_ENFORCED" in child.stdout:
+        pytest.skip("RLIMIT_MEMLOCK is not enforced for this user")
+    assert "REFUSED" in child.stdout and "USABLE" in child.stdout, (
+        child.stdout + child.stderr
+    )
 
 
 if __name__ == "__main__":

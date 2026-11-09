@@ -1266,6 +1266,8 @@ TARGETS: List[Target] = (
         "_expand_tables_impl",
         "_rehash_into",
         "_load_chunk_values",
+        "_host_value_rows_reserve",
+        "_host_reserve_factor",
     )
     + _new(
         SHT,
@@ -1992,6 +1994,13 @@ ALLOWED_NEW_HITS: List[Tuple[str, Optional[str], str]] = [
         "allocated once, never in a step; the estimated_row_counts line existed before and "
         "black joined its lines",
     ),
+    (
+        "src/vmm_tensor.cu",
+        "alloc_free",
+        "a growth of a host buffer commits, locks and registers only the new tail and "
+        "unregisters each registered range once, in the destructor: host-memory "
+        "management of O(the growth) bytes that waits for no kernel",
+    ),
 ]
 
 
@@ -2113,6 +2122,47 @@ EXPECTED_GONE: List[Tuple[str, str, str, str]] = [
         "item",
         "int(key_map.table_bucket_offsets_cpu_[table_id].item())",
         "G3",
+    ),
+    # G4: a host value buffer grows in place: no unregister, no mremap, no registration of
+    # the whole range again (restore_to_size goes: nothing is moved, so nothing is restored)
+    (
+        "src/vmm_tensor.cu",
+        "alloc_free",
+        '"cudaHostRegister/cudaHostGetDevicePointer (init) failed: ") +',
+        "G4",
+    ),
+    ("src/vmm_tensor.cu", "alloc_free", "cudaHostRegister(m_addr_h, m_size,", "G4"),
+    (
+        "src/vmm_tensor.cu",
+        "alloc_free",
+        "cudaHostRegisterMapped | cudaHostRegisterPortable);",
+        "G4",
+    ),
+    ("src/vmm_tensor.cu", "alloc_free", "cudaHostUnregister(m_addr_h);", "G4"),
+    (
+        "src/vmm_tensor.cu",
+        "alloc_free",
+        "cudaHostRegister(m_addr_h, restore_bytes,",
+        "G4",
+    ),
+    (
+        "src/vmm_tensor.cu",
+        "alloc_free",
+        'return std::string("cudaHostRegister(") + std::to_string(restore_bytes) +',
+        "G4",
+    ),
+    (
+        "src/vmm_tensor.cu",
+        "alloc_free",
+        "CUDA_CHECK(cudaHostUnregister(m_addr_h));",
+        "G4",
+    ),
+    ("src/vmm_tensor.cu", "alloc_free", "cudaHostRegister(m_addr_h, new_bytes,", "G4"),
+    (
+        "src/vmm_tensor.cu",
+        "alloc_free",
+        'std::string msg = std::string("cudaHostRegister/cudaHostGetDevicePointer "',
+        "G4",
     ),
 ]
 

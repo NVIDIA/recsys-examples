@@ -15,10 +15,18 @@
 
 import abc
 import platform
-from typing import List, Tuple, Union
+from typing import List, Optional, Tuple, Union
 
+import dynamicemb_extensions
 import torch
 from dynamicemb_extensions import HostVMMTensor, VMMTensor
+
+# Whether the extension grows a host buffer in place: it reserves the address range the
+# buffer can grow to when the buffer is created and commits, locks and registers only the
+# new tail when it grows, so the base address never changes and growing never unregisters
+# (which waits for the kernels that use the range) or moves memory. An extension built
+# before that has neither, and a host buffer cannot grow.
+_HOST_IN_PLACE: bool = bool(getattr(dynamicemb_extensions, "host_vmm_in_place", False))
 
 
 def _shape_to_numel(shape: Union[List[int], Tuple[int, ...]]) -> int:
@@ -54,7 +62,10 @@ class ExtendableBuffer(abc.ABC):
 
     The buffer owns its memory; the tensors from tensor() do not keep it alive.
     Dropping the buffer waits for the GPU work queued before the drop, then frees
-    the memory."""
+    the memory. ``extend`` never moves the buffer: a device buffer maps the new
+    pages after the old ones, a host buffer commits pages inside the address range
+    it reserved when it was created, so the base address of ``tensor()`` is the same
+    for the life of the buffer and a kernel that holds it stays valid."""
 
     @abc.abstractmethod
     def num_bytes(self) -> int:
@@ -133,13 +144,20 @@ class DeviceExtendableBuffer(ExtendableBuffer):
 
 
 class HostExtendableBuffer(ExtendableBuffer):
-    """Extendable buffer in host memory (UVM). shape is (list or tuple) initial dimensions."""
+    """Extendable buffer in host memory (UVM). shape is (list or tuple) initial dimensions.
+
+    ``max_shape`` is the largest shape the buffer can grow to: the address range for it
+    is reserved when the buffer is created (address space only, nothing is committed or
+    counted against the memory limits) and growing commits the next pages of it. It
+    defaults to eight times the initial size, at least 1 GiB.
+    """
 
     def __init__(
         self,
         shape: Union[List[int], Tuple[int, ...]],
         dtype: torch.dtype,
         device: torch.device,
+        max_shape: Optional[Union[List[int], Tuple[int, ...]]] = None,
     ):
         if platform.system() != "Linux":
             raise RuntimeError("Only support extendable host buffer on Linux platform.")
@@ -150,16 +168,40 @@ class HostExtendableBuffer(ExtendableBuffer):
         self._shape = tuple(int(d) for d in shape)
         self._dtype = dtype
         self._device = device
-        self.vmm_tensor = HostVMMTensor(numel, dtype, device_id)
+        if _HOST_IN_PLACE:
+            reserve = 0 if max_shape is None else _shape_to_numel(max_shape)
+            self.vmm_tensor = HostVMMTensor(numel, dtype, device_id, reserve)
+        else:
+            self.vmm_tensor = HostVMMTensor(numel, dtype, device_id)
 
     def extend(self, shape: Union[List[int], Tuple[int, ...]]) -> None:
         numel_add = _shape_to_numel(shape)
         if numel_add <= 0:
             return
+        if not _HOST_IN_PLACE:
+            raise RuntimeError(
+                "growing a host value buffer needs a dynamicemb_extensions that grows it "
+                "in place (HostVMMTensor takes the number of elements to reserve); "
+                "rebuild it: python setup.py build_ext --inplace"
+            )
         torch.cuda.synchronize()
         new_logical_numel = _shape_to_numel(self._shape) + numel_add
-        self.vmm_tensor.extend(new_logical_numel)
+        try:
+            self.vmm_tensor.extend(new_logical_numel)
+        except RuntimeError as exc:
+            if "address space" not in str(exc):
+                raise
+            raise RuntimeError(
+                f"{exc}. A host value buffer grows inside the address range it reserved "
+                "when it was created: a table that evicts reserves its max_capacity, "
+                "one that never evicts DYNAMICEMB_HOST_RESERVE_FACTOR times its "
+                "max_capacity (at least 64 GiB); raise either."
+            ) from exc
         self._shape = _merge_extend_shape(self._shape, shape, numel_add)
+
+    def reserved_bytes(self) -> int:
+        """Bytes of address space reserved: what the buffer can grow to in place."""
+        return int(self.vmm_tensor.reserved_bytes())
 
     def tensor(self) -> torch.Tensor:
         """Return buffer as tensor with logical shape (size from C++)."""

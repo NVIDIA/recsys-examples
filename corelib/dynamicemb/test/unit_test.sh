@@ -32,6 +32,11 @@ FWD_BWD_TEST_FILES=(
     # The rehash of a key map reads no count: key for key against the old table, in
     # chunks, and nothing waits for the device.
     "test/unit_tests/growth/test_rehash_padded.py"
+    # A host value buffer grows inside the address range it reserved: its address never
+    # changes.
+    "test/unit_tests/growth/test_host_value_buffer.py"
+    # The real HostVMMTensor against a fake CUDA runtime: needs a C++ compiler, no GPU.
+    "test/unit_tests/growth/host_only/test_host_only_vmm.py"
     "test/unit_tests/no_host_sync/test_expand_async.py"
     "test/unit_tests/no_host_sync/test_outstanding_keys.py"
     "test/unit_tests/test_check_scores_late.py"

@@ -15,15 +15,19 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 # limitations under the License.
 ******************************************************************************/
 
-// Needed for mremap()/MREMAP_MAYMOVE (a GNU extension); must be defined before
-// any libc header pulls in <sys/mman.h>.
+// Needed for the GNU extensions of <sys/mman.h> (MAP_ANONYMOUS, MAP_NORESERVE);
+// must be defined before any libc header pulls it in.
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
 #endif
 
+#include <algorithm>
+#include <atomic>
 #include <cstdint>
 #include <iostream>
+#include <mutex>
 #include <stdexcept>
+#include <utility>
 #include <vector>
 
 #include <cstdlib>
@@ -215,8 +219,13 @@ public:
   }
 
   // Set logical size to new_total_logical_numel; uses alignment slack first,
-  // allocates only when needed.
+  // allocates only when needed. The base address never changes: new pages are
+  // mapped after the old ones, and the old ones are neither unmapped nor
+  // remapped, so kernels that are queued or running on them are not affected. It
+  // only calls driver functions and touches the members of this object, so the
+  // binding releases the GIL.
   void extend(std::size_t new_total_logical_numel) {
+    std::lock_guard<std::mutex> lock(m_mutex);
     if (new_total_logical_numel <= m_logical_numel) {
       return;
     }
@@ -266,6 +275,7 @@ public:
   }
 
   at::Tensor data() const {
+    std::lock_guard<std::mutex> lock(m_mutex);
     auto m_dev_ptr = reinterpret_cast<void *>(m_addr);
     auto scalar_type = static_cast<torch::ScalarType>(dtype_);
     auto dtype_bytes = get_size(scalar_type);
@@ -281,15 +291,22 @@ public:
     return data_;
   }
 
-  std::size_t logical_numel() const { return m_logical_numel; }
+  std::size_t logical_numel() const {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    return m_logical_numel;
+  }
 
   std::size_t allocated_numel() const {
+    std::lock_guard<std::mutex> lock(m_mutex);
     auto dtype_bytes = get_size(static_cast<torch::ScalarType>(dtype_));
     return m_size / dtype_bytes;
   }
 
   /// Bytes actually mapped / backed (page-aligned); >= logical size in bytes.
-  std::size_t allocated_bytes() const { return m_size; }
+  std::size_t allocated_bytes() const {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    return m_size;
+  }
 
   ~VMMTensor() {
     // Kernels queued before this free may still use the memory.
@@ -323,12 +340,35 @@ private:
   std::size_t m_reserved = 0;
   std::size_t m_page_size = 0;
   std::vector<CUmemGenericAllocationHandle> handles;
+  mutable std::mutex m_mutex; // extend() runs without the GIL
 };
 
+// A buffer in pinned host memory that the GPU reads and writes through a mapped
+// device pointer. It grows IN PLACE: the address range it can ever need is
+// reserved when it is created (PROT_NONE + MAP_NORESERVE: address space only,
+// nothing is committed and nothing counts against the overcommit limit), and
+// growing makes the next pages of that range readable, resident, locked and
+// registered with CUDA. The pages already registered are never unregistered,
+// remapped or moved, so the base address (and with it the pointer table the
+// kernels read) never changes and no kernel that is queued or running is
+// affected. That is what lets a growth go without waiting for the device:
+// unregistering a range blocks until the kernels that use it have finished, and
+// moving it would leave them with a stale pointer.
+//
+// The range is registered in pieces, one per growth. The device pointer of each
+// piece must continue the first one's (it does wherever a registered range has
+// the device pointer of its host pointer, which is every Linux system with
+// unified addressing); a piece for which it does not is rolled back and the
+// growth fails with an error, the buffer is unchanged and can still be used.
 class HostVMMTensor {
 
 public:
-  HostVMMTensor(std::size_t numel, torch::Dtype dtype, int device)
+  // `reserve_numel` is the number of elements the buffer can grow to (0: eight
+  // times what it needs now, at least 1 GiB). It is clamped to the installed
+  // memory, and halved while the kernel refuses that much address space, down
+  // to what the buffer needs now.
+  HostVMMTensor(std::size_t numel, torch::Dtype dtype, int device,
+                std::size_t reserve_numel = 0)
       : dtype_(dtype), device_(device), m_logical_numel(numel) {
 
     if (numel == 0) {
@@ -347,7 +387,8 @@ public:
     // exceed installed RAM; reject early with a clear message.
     std::size_t total_ram = getTotalPhysicalMemory();
     if (required_bytes > total_ram) {
-      throw std::runtime_error("Requested HostVMMTensor size exceeds total physical memory");
+      throw std::runtime_error(
+          "Requested HostVMMTensor size exceeds total physical memory");
     }
 
     int canMap = 0;
@@ -363,217 +404,99 @@ public:
       throw std::runtime_error("sysconf error\n");
     }
     m_page_size = page_size;
-    m_size =
-        (required_bytes + m_page_size - 1) / m_page_size * m_page_size;
-    // Map exactly the bytes we back. The previous implementation mmap'd the
-    // whole machine's RAM per tensor as a "reservation"; with many tables those
-    // multi-TB mappings accumulate and exhaust the process virtual address
-    // space, so mmap eventually fails with ENOMEM even for tiny tensors.
-    // extend() grows this mapping on demand via mremap() instead.
-    m_reserved = m_size;
+    m_size.store(round_up(required_bytes), std::memory_order_relaxed);
 
-    m_addr_h = mmap(nullptr, m_size, PROT_READ | PROT_WRITE,
-                    MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    // Address space only. A reservation of the whole machine's RAM per tensor,
+    // as an earlier version made, exhausts the process's address space once
+    // there are dozens of tables, so the caller says what the buffer can ever
+    // need; the kernel can still refuse (RLIMIT_AS, a container), and the
+    // reservation then halves, down to the bytes the buffer needs now.
+    std::size_t reserve_bytes;
+    if (reserve_numel > 0) {
+      reserve_bytes = reserve_numel > total_ram / dtype_bytes
+                          ? total_ram
+                          : reserve_numel * dtype_bytes;
+    } else {
+      reserve_bytes = std::min<std::size_t>(
+          std::max<std::size_t>(8 * required_bytes, std::size_t(1) << 30),
+          total_ram);
+    }
+    const std::size_t initial_bytes = m_size.load(std::memory_order_relaxed);
+    m_reserved = std::max(round_up(reserve_bytes), initial_bytes);
+    for (;;) {
+      m_addr_h = mmap(nullptr, m_reserved, PROT_NONE,
+                      MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+      if (m_addr_h != MAP_FAILED || m_reserved <= initial_bytes) {
+        break;
+      }
+      m_reserved = std::max(initial_bytes, round_up(m_reserved / 2));
+    }
     if (m_addr_h == MAP_FAILED) {
-      throw std::runtime_error(std::string("mmap host memory failed (size=") +
-                               std::to_string(m_size) +
-                               " bytes): " + std::strerror(errno));
-    }
-
-    // MADV_WILLNEED is only a readahead hint; the memset loop below and mlock()
-    // are what actually fault in and pin the pages, so a failure here is
-    // non-fatal. Surface it as a warning rather than aborting (or swallowing).
-    if (madvise(m_addr_h, m_size, MADV_WILLNEED) == -1) {
-      std::cerr << "HostVMMTensor: madvise(MADV_WILLNEED) failed: "
-                << std::strerror(errno) << " (non-fatal)\n";
-    }
-
-    // memset(m_addr_h, 0, m_size);
-    uintptr_t aligned_ptr =
-        (((uintptr_t)m_addr_h + m_page_size - 1) & ~(m_page_size - 1));
-    for (uintptr_t p = aligned_ptr; p < ((uintptr_t)m_addr_h + m_size);
-         p += m_page_size) {
-      memset((void *)p, 0, 1);
-    }
-
-    // Lock the physical page corresponding to the virtual address
-    if (mlock(m_addr_h, m_size) == -1) {
-      munmap(m_addr_h, m_reserved);
-      m_addr_h = nullptr;
-      throw std::runtime_error("mlock initial physical memory failed");
-    }
-
-    // On failure, free the already mmap'd + mlocked buffer before throwing: the
-    // constructor is not done, so ~HostVMMTensor() will not run to clean it up.
-    cudaError_t err =
-        cudaHostRegister(m_addr_h, m_size,
-                         cudaHostRegisterMapped | cudaHostRegisterPortable);
-    if (err == cudaSuccess) {
-      err = cudaHostGetDevicePointer((void **)&m_addr_d, (void *)m_addr_h, 0);
-    }
-    if (err != cudaSuccess) {
-      cudaGetLastError();
-      munlock(m_addr_h, m_reserved);
-      munmap(m_addr_h, m_reserved);
       m_addr_h = nullptr;
       throw std::runtime_error(
-          std::string(
-              "cudaHostRegister/cudaHostGetDevicePointer (init) failed: ") +
-          cudaGetErrorString(err));
+          std::string("mmap host address range failed (size=") +
+          std::to_string(m_reserved) + " bytes): " + std::strerror(errno));
+    }
+
+    // The constructor is not done if this throws, so ~HostVMMTensor() will not
+    // run: give the range back here.
+    try {
+      commit(0, initial_bytes);
+    } catch (...) {
+      munmap(m_addr_h, m_reserved);
+      m_addr_h = nullptr;
+      throw;
     }
   }
 
-  // Best-effort recovery for extend(): bring the buffer back to a working,
-  // self-consistent state at `restore_bytes` after a failed grow. The mapping
-  // may currently be larger than restore_bytes (mremap already succeeded) and
-  // may be registered at either size, so: drop any CUDA registration, shrink
-  // the mapping back, then re-register and refresh the device pointer. Updates
-  // m_addr_h / m_reserved / m_addr_d so that afterwards m_size == m_reserved ==
-  // restore_bytes. Returns an empty string on success, or a description if the
-  // recovery itself fails (the buffer is then unusable and must be destroyed).
-  std::string restore_to_size(std::size_t restore_bytes) {
-    // CUDA registration pins the pages, so it must be dropped before remapping.
-    // The buffer may already be unregistered here; ignore that error and clear
-    // the sticky CUDA error so it cannot leak into an unrelated CUDA_CHECK.
-    cudaHostUnregister(m_addr_h);
-    cudaGetLastError();
-
-    if (m_reserved != restore_bytes) {
-      // Shrinking never needs MREMAP_MAYMOVE and keeps the base address; the
-      // truncated tail is unmapped (and thereby munlocked) for us.
-      void *p = mremap(m_addr_h, m_reserved, restore_bytes, 0);
-      if (p == MAP_FAILED) {
-        return std::string("mremap shrink to ") +
-               std::to_string(restore_bytes) +
-               " bytes failed: " + std::strerror(errno);
-      }
-      m_addr_h = p;
-      m_reserved = restore_bytes;
-    }
-
-    cudaError_t err =
-        cudaHostRegister(m_addr_h, restore_bytes,
-                         cudaHostRegisterMapped | cudaHostRegisterPortable);
-    if (err != cudaSuccess) {
-      cudaGetLastError();
-      return std::string("cudaHostRegister(") + std::to_string(restore_bytes) +
-             ") failed: " + cudaGetErrorString(err);
-    }
-    err = cudaHostGetDevicePointer((void **)&m_addr_d, (void *)m_addr_h, 0);
-    if (err != cudaSuccess) {
-      cudaGetLastError();
-      return std::string("cudaHostGetDevicePointer failed: ") +
-             cudaGetErrorString(err);
-    }
-    return std::string();
-  }
-
-  // Set logical size to new_total_logical_numel; uses slack first, grows the
-  // backing mapping (via mremap) only when needed. On any failure after the
-  // mapping has grown, the buffer is rolled back to its previous size via
-  // restore_to_size() so the object stays consistent (m_size == m_reserved)
-  // and is safe to use or retry.
+  // Set logical size to new_total_logical_numel; uses slack first, commits more
+  // of the reserved range only when needed: the new tail alone is touched,
+  // locked and registered. It only does host memory management and CUDA
+  // registration (no wait for the device), so the binding releases the GIL. A
+  // failure leaves the buffer as it was and usable, and extend() can be tried
+  // again.
+  //
+  // m_mutex only keeps two growers apart. The commit of a multi-GB tail takes
+  // seconds, and a thread that asks for data() or a size meanwhile does so with
+  // the GIL held (these are plain bindings), so none of the readers takes the
+  // mutex: the two sizes they read are atomics, which a growth stores in the
+  // order that keeps `logical * element size <= committed bytes` for a reader
+  // that loads them in the opposite order.
   void extend(std::size_t new_total_logical_numel) {
+    std::lock_guard<std::mutex> lock(m_mutex);
     if (m_addr_h == nullptr) {
       throw std::runtime_error("Not initlialized.");
     }
-    if (new_total_logical_numel <= m_logical_numel) {
+    if (new_total_logical_numel <=
+        m_logical_numel.load(std::memory_order_relaxed)) {
       return;
     }
     auto scalar_type = static_cast<torch::ScalarType>(dtype_);
     auto dtype_bytes = get_size(scalar_type);
     std::size_t required_bytes = new_total_logical_numel * dtype_bytes;
-    if (required_bytes <= m_size) {
-      m_logical_numel = new_total_logical_numel;
+    const std::size_t committed = m_size.load(std::memory_order_relaxed);
+    if (required_bytes <= committed) {
+      m_logical_numel.store(new_total_logical_numel, std::memory_order_release);
       return;
     }
 
-    std::size_t new_bytes =
-        (required_bytes + m_page_size - 1) / m_page_size * m_page_size;
+    std::size_t new_bytes = round_up(required_bytes);
     std::size_t total_ram = getTotalPhysicalMemory();
-    std::size_t total_ram_aligned =
-        (total_ram + m_page_size - 1) / m_page_size * m_page_size;
-    if (new_bytes > total_ram_aligned) {
+    if (new_bytes > round_up(total_ram)) {
       throw std::runtime_error(
           "Requested HostVMMTensor size exceeds total physical memory");
     }
-
-    std::size_t old_size = m_size; // == m_reserved on entry (consistent state)
-    std::size_t delta = new_bytes - old_size;
-
-    // CUDA registration is tied to the current virtual address, so drop it
-    // before remapping. If this throws, nothing has changed and the buffer is
-    // still valid at its old size.
-    CUDA_CHECK(cudaHostUnregister(m_addr_h));
-
-    // mremap() may relocate the buffer (MREMAP_MAYMOVE); that is safe because
-    // callers rebuild value-buffer pointers after extend() (get_table_ptrs()).
-    void *new_addr = mremap(m_addr_h, old_size, new_bytes, MREMAP_MAYMOVE);
-    if (new_addr == MAP_FAILED) {
-      int saved_errno = errno; // mremap left the old mapping intact.
-      std::string rec = restore_to_size(old_size);
-      std::string msg = std::string("mremap (extend) failed (old=") +
-                        std::to_string(old_size) + " new=" +
-                        std::to_string(new_bytes) +
-                        " bytes): " + std::strerror(saved_errno);
-      if (!rec.empty()) {
-        msg += "; buffer recovery also failed: " + rec;
-      }
-      throw std::runtime_error(msg);
+    if (new_bytes > m_reserved) {
+      throw std::runtime_error(std::string("HostVMMTensor: growing to ") +
+                               std::to_string(new_bytes) +
+                               " bytes needs more address space than the " +
+                               std::to_string(m_reserved) +
+                               " bytes reserved when it was created");
     }
-    m_addr_h = new_addr;
-    // The mapping is now new_bytes large at new_addr; record the true extent
-    // before anything below can throw so the destructor and restore_to_size()
-    // always see the real mapping size.
-    m_reserved = new_bytes;
-
-    // MADV_WILLNEED is only a readahead hint; the memset loop and mlock() below
-    // are what actually fault in and pin the pages, so a failure here is
-    // non-fatal. Surface it as a warning rather than aborting or swallowing.
-    uintptr_t tail_start = (uintptr_t)m_addr_h + old_size;
-    if (madvise((void *)tail_start, delta, MADV_WILLNEED) == -1) {
-      std::cerr << "HostVMMTensor::extend: madvise(MADV_WILLNEED) failed: "
-                << std::strerror(errno) << " (non-fatal)\n";
-    }
-    uintptr_t aligned_ptr =
-        (((uintptr_t)tail_start + m_page_size - 1) & ~(m_page_size - 1));
-    for (uintptr_t p = aligned_ptr; p < ((uintptr_t)m_addr_h + new_bytes);
-         p += m_page_size) {
-      memset((void *)p, 0, 1);
-    }
-
-    if (mlock(m_addr_h, new_bytes) == -1) {
-      int saved_errno = errno;
-      std::string rec = restore_to_size(old_size);
-      std::string msg =
-          std::string("mlock (extend) failed: ") + std::strerror(saved_errno);
-      if (!rec.empty()) {
-        msg += "; buffer recovery also failed: " + rec;
-      }
-      throw std::runtime_error(msg);
-    }
-
-    cudaError_t err =
-        cudaHostRegister(m_addr_h, new_bytes,
-                         cudaHostRegisterMapped | cudaHostRegisterPortable);
-    if (err == cudaSuccess) {
-      err = cudaHostGetDevicePointer((void **)&m_addr_d, (void *)m_addr_h, 0);
-    }
-    if (err != cudaSuccess) {
-      cudaGetLastError();
-      std::string primary = cudaGetErrorString(err);
-      std::string rec = restore_to_size(old_size);
-      std::string msg = std::string("cudaHostRegister/cudaHostGetDevicePointer "
-                                     "(extend) failed: ") +
-                        primary;
-      if (!rec.empty()) {
-        msg += "; buffer recovery also failed: " + rec;
-      }
-      throw std::runtime_error(msg);
-    }
-
-    m_size = new_bytes;
-    m_logical_numel = new_total_logical_numel;
+    commit(committed, new_bytes);
+    // The committed bytes first, then the logical size that needs them.
+    m_size.store(new_bytes, std::memory_order_release);
+    m_logical_numel.store(new_total_logical_numel, std::memory_order_release);
   }
 
   at::Tensor data() const {
@@ -581,40 +504,56 @@ public:
     auto scalar_type = static_cast<torch::ScalarType>(dtype_);
     auto dtype_bytes = get_size(scalar_type);
 
-    if (m_logical_numel * dtype_bytes > m_size) {
+    // The logical size first, then the committed bytes: a growth stores them in
+    // the opposite order, so the bytes read here cover the size read here.
+    const std::size_t logical = m_logical_numel.load(std::memory_order_acquire);
+    const std::size_t committed = m_size.load(std::memory_order_acquire);
+    if (logical * dtype_bytes > committed) {
       throw std::runtime_error(
           "HostVMMTensor logical numel exceeds allocated size");
     }
 
     auto data_ = at::from_blob(
-        m_dev_ptr, {static_cast<int64_t>(m_logical_numel)},
+        m_dev_ptr, {static_cast<int64_t>(logical)},
         at::TensorOptions().dtype(dtype_).device(at::kCUDA, device_));
     return data_;
   }
 
-  std::size_t logical_numel() const { return m_logical_numel; }
+  std::size_t logical_numel() const {
+    return m_logical_numel.load(std::memory_order_acquire);
+  }
 
   std::size_t allocated_numel() const {
     auto dtype_bytes = get_size(static_cast<torch::ScalarType>(dtype_));
-    return m_size / dtype_bytes;
+    return m_size.load(std::memory_order_acquire) / dtype_bytes;
   }
 
-  /// Bytes actually locked + registered (page-aligned); >= logical size in bytes.
-  std::size_t allocated_bytes() const { return m_size; }
+  /// Bytes actually locked + registered (page-aligned); >= logical size in
+  /// bytes.
+  std::size_t allocated_bytes() const {
+    return m_size.load(std::memory_order_acquire);
+  }
+
+  /// Bytes of address space reserved: what the buffer can grow to in place
+  /// (fixed when the buffer is made).
+  std::size_t reserved_bytes() const { return m_reserved; }
 
   ~HostVMMTensor() {
 
-    if (m_size > 0) {
+    if (m_addr_h != nullptr) {
       // Kernels queued before this free may still read or write the memory
       // through the mapped device pointer. Wait for them explicitly: whether
       // cudaHostUnregister also waits is driver behavior the CUDA docs do not
       // promise.
       wait_for_device_work(device_);
-      munlock(m_addr_h, m_reserved);
       // Best-effort: a destructor must never throw, so do not CUDA_CHECK here.
-      // Clear the sticky error so it cannot surface in an unrelated check.
-      cudaHostUnregister(m_addr_h);
+      // Each piece is unregistered by the address it was registered with. Clear
+      // the sticky error so it cannot surface in an unrelated check.
+      for (auto const &piece : m_registered) {
+        cudaHostUnregister(piece.first);
+      }
       cudaGetLastError();
+      munlock(m_addr_h, m_size.load(std::memory_order_relaxed));
       munmap(m_addr_h, m_reserved);
     }
   }
@@ -623,15 +562,96 @@ private:
   HostVMMTensor(const HostVMMTensor &) = delete;
   HostVMMTensor &operator=(const HostVMMTensor &) = delete;
 
+  std::size_t round_up(std::size_t bytes) const {
+    return (bytes + m_page_size - 1) / m_page_size * m_page_size;
+  }
+
+  // Makes [begin, end) of the reservation (page aligned, begin == 0 or the end
+  // of what is committed) readable, resident, locked and registered with CUDA.
+  // On any failure the range is address space only again, nothing else has
+  // changed and the exception is thrown.
+  void commit(std::size_t begin, std::size_t end) {
+    char *p = static_cast<char *>(m_addr_h) + begin;
+    std::size_t bytes = end - begin;
+
+    // Drops the pages and the lock and makes the range inaccessible again.
+    auto give_back = [&] {
+      (void)mmap(p, bytes, PROT_NONE,
+                 MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE | MAP_FIXED, -1,
+                 0);
+    };
+
+    if (mprotect(p, bytes, PROT_READ | PROT_WRITE) != 0) {
+      throw std::runtime_error(
+          std::string("mprotect (host buffer) failed (size=") +
+          std::to_string(bytes) + " bytes): " + std::strerror(errno));
+    }
+    // Fault the pages in, zero filled. (Not a memset of the whole range for the
+    // sake of the time: one store per page is what takes them.)
+    volatile char *touch = p;
+    for (std::size_t off = 0; off < bytes; off += m_page_size) {
+      touch[off] = 0;
+    }
+    if (mlock(p, bytes) == -1) {
+      int saved_errno = errno;
+      give_back();
+      throw std::runtime_error(
+          std::string("mlock (host buffer) failed (size=") +
+          std::to_string(bytes) + " bytes): " + std::strerror(saved_errno));
+    }
+
+    void *device_ptr = nullptr;
+    cudaError_t err = cudaHostRegister(
+        p, bytes, cudaHostRegisterMapped | cudaHostRegisterPortable);
+    bool registered = (err == cudaSuccess);
+    if (registered) {
+      err = cudaHostGetDevicePointer(&device_ptr, p, 0);
+    }
+    if (err == cudaSuccess && begin == 0) {
+      m_addr_d = reinterpret_cast<CUdeviceptr>(device_ptr);
+    }
+    if (err == cudaSuccess &&
+        reinterpret_cast<std::uintptr_t>(device_ptr) !=
+            static_cast<std::uintptr_t>(m_addr_d) + begin) {
+      // The device addresses of the pieces are not contiguous on this system: a
+      // kernel addressing base + row * stride would leave the first piece.
+      err = cudaErrorNotSupported;
+    }
+    if (err != cudaSuccess) {
+      cudaGetLastError();
+      std::string what = cudaGetErrorString(err);
+      if (registered) {
+        // The tail only: no kernel has used it, so this returns at once.
+        cudaHostUnregister(p);
+        cudaGetLastError();
+      }
+      munlock(p, bytes);
+      give_back();
+      throw std::runtime_error(
+          std::string("cudaHostRegister/cudaHostGetDevicePointer (host buffer) "
+                      "failed (size=") +
+          std::to_string(bytes) + " bytes): " + what);
+    }
+    m_registered.emplace_back(p, bytes);
+  }
+
   torch::Dtype dtype_ = at::kChar;
   int device_ = -1;
 
+  // Fixed when the buffer is made, so every thread can read them without a lock:
+  // the host range, the device address of its first byte (every piece continues
+  // it), the page size and the size of the reservation.
   void *m_addr_h = nullptr;
   CUdeviceptr m_addr_d = 0;
   std::size_t m_page_size = 0;
-  std::size_t m_size = 0;           // allocated bytes (page-aligned)
-  std::size_t m_logical_numel = 0;  // user-visible element count
-  std::size_t m_reserved = 0;
+  std::size_t m_reserved = 0; // address space reserved (page-aligned)
+  // What a growth changes, and what the readers load (see extend()).
+  std::atomic<std::size_t> m_size{0};          // committed bytes (page-aligned)
+  std::atomic<std::size_t> m_logical_numel{0}; // user-visible element count
+  // The pieces registered with CUDA: the address of each, as it was registered.
+  // Only a grower (and the destructor) touches it.
+  std::vector<std::pair<void *, std::size_t>> m_registered;
+  std::mutex m_mutex; // keeps two extend() calls apart; extend() runs without the GIL
 };
 
 } // namespace dyn_emb
@@ -643,7 +663,8 @@ void bind_vmm_op(py::module &m) {
            py::arg("dtype"), py::arg("device"))
       .def("extend", &dyn_emb::VMMTensor::extend,
            py::arg("new_total_logical_numel"),
-           "Set logical size to new_total_logical_numel; uses slack, then allocates if needed.")
+           py::call_guard<py::gil_scoped_release>(),
+           "Set logical size to new_total_logical_numel; uses slack, then allocates if needed. The base address never changes.")
       .def("data", &dyn_emb::VMMTensor::data, "data")
       .def("logical_numel", &dyn_emb::VMMTensor::logical_numel,
            "Logical element count (user-visible size).")
@@ -653,16 +674,26 @@ void bind_vmm_op(py::module &m) {
            "Bytes actually mapped (page-aligned); >= logical bytes.");
 
   py::class_<dyn_emb::HostVMMTensor>(m, "HostVMMTensor")
-      .def(py::init<std::size_t, torch::Dtype, int>(), py::arg("numel"),
-           py::arg("dtype"), py::arg("device"))
+      .def(py::init<std::size_t, torch::Dtype, int, std::size_t>(),
+           py::arg("numel"), py::arg("dtype"), py::arg("device"),
+           py::arg("reserve_numel") = 0)
       .def("extend", &dyn_emb::HostVMMTensor::extend,
            py::arg("new_total_logical_numel"),
-           "Set logical size to new_total_logical_numel; uses slack, then allocates if needed.")
+           py::call_guard<py::gil_scoped_release>(),
+           "Set logical size to new_total_logical_numel; uses slack, then commits "
+           "more of the address range reserved at creation. The base address never changes.")
       .def("data", &dyn_emb::HostVMMTensor::data, "data")
       .def("logical_numel", &dyn_emb::HostVMMTensor::logical_numel,
            "Logical element count (user-visible size).")
       .def("allocated_numel", &dyn_emb::HostVMMTensor::allocated_numel,
            "Allocated element count (may be larger due to alignment).")
       .def("allocated_bytes", &dyn_emb::HostVMMTensor::allocated_bytes,
-           "Bytes actually locked+registered (page-aligned); >= logical bytes.");
+           "Bytes actually locked+registered (page-aligned); >= logical bytes.")
+      .def("reserved_bytes", &dyn_emb::HostVMMTensor::reserved_bytes,
+           "Bytes of address space reserved: what the buffer can grow to in place.");
+
+  // Capability flag, read by callers with getattr(..., False): a HostVMMTensor
+  // takes the number of elements to reserve address space for and grows in place
+  // (its base address never changes; extend() never waits for the device).
+  m.attr("host_vmm_in_place") = py::bool_(true);
 }
