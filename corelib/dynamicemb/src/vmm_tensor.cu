@@ -99,29 +99,56 @@ namespace {
 // is not allowed during CUDA graph capture, so a drop during a capture breaks
 // that capture.
 //
-// ~VMMTensor() calls this, so it never throws. If the wait fails, for example
-// after a sticky error from an earlier kernel or during a graph capture, the
-// caller still frees the memory. It never creates a CUDA context: if the
+// ~VMMTensor() and ~HostVMMTensor() call this, so it never throws. If the wait
+// fails, for example after a sticky error from an earlier kernel or during a
+// graph capture, it logs the failed step and the caller still frees the memory.
+// It never creates a CUDA context: if the
 // device has no active primary context, as after CUDA has shut down at exit,
 // no work can be queued on it.
 void wait_for_device_work(int device) {
+  // A failed wait is reported, not thrown (this runs in destructors). The
+  // memory is still freed, so the log is the only trace of the cause if a later
+  // kernel then faults on it.
+  auto report = [device](const char *step, CUresult result) {
+    const char *name = nullptr;
+    cuGetErrorName(result, &name);
+    std::cerr << "dynamicemb: wait for queued GPU work on device " << device
+              << " failed in " << step << ": " << (name ? name : "unknown")
+              << "; freeing the memory anyway\n";
+  };
   CUdevice device_handle;
+  CUresult result = cuDeviceGet(&device_handle, device);
+  if (result != CUDA_SUCCESS) {
+    report("cuDeviceGet", result);
+    return;
+  }
   unsigned int context_flags = 0;
   int context_active = 0;
-  if (cuDeviceGet(&device_handle, device) != CUDA_SUCCESS ||
-      cuDevicePrimaryCtxGetState(device_handle, &context_flags,
-                                 &context_active) != CUDA_SUCCESS ||
-      !context_active) {
+  result = cuDevicePrimaryCtxGetState(device_handle, &context_flags,
+                                      &context_active);
+  if (result != CUDA_SUCCESS) {
+    report("cuDevicePrimaryCtxGetState", result);
+    return;
+  }
+  if (!context_active) {
     return;
   }
   CUcontext context = nullptr;
-  if (cuDevicePrimaryCtxRetain(&context, device_handle) != CUDA_SUCCESS) {
+  result = cuDevicePrimaryCtxRetain(&context, device_handle);
+  if (result != CUDA_SUCCESS) {
+    report("cuDevicePrimaryCtxRetain", result);
     return;
   }
   // Push and pop leave the caller's current context and device as they were.
-  if (cuCtxPushCurrent(context) == CUDA_SUCCESS) {
-    cuCtxSynchronize();
+  result = cuCtxPushCurrent(context);
+  if (result == CUDA_SUCCESS) {
+    result = cuCtxSynchronize();
+    if (result != CUDA_SUCCESS) {
+      report("cuCtxSynchronize", result);
+    }
     cuCtxPopCurrent(&context);
+  } else {
+    report("cuCtxPushCurrent", result);
   }
   cuDevicePrimaryCtxRelease(device_handle);
 }
@@ -578,11 +605,12 @@ public:
   ~HostVMMTensor() {
 
     if (m_size > 0) {
+      // Kernels queued before this free may still read or write the memory
+      // through the mapped device pointer. Wait for them explicitly: whether
+      // cudaHostUnregister also waits is driver behavior the CUDA docs do not
+      // promise.
+      wait_for_device_work(device_);
       munlock(m_addr_h, m_reserved);
-      // cudaHostUnregister waits for the GPU work queued before it, so kernels
-      // that still use the memory finish before munmap() frees it. The CUDA
-      // docs do not promise this: it is measured driver behavior (CUDA 13.3),
-      // and the host cases of test_drop_waits_for_queued_gpu_work check it.
       // Best-effort: a destructor must never throw, so do not CUDA_CHECK here.
       // Clear the sticky error so it cannot surface in an unrelated check.
       cudaHostUnregister(m_addr_h);

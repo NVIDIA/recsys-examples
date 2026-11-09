@@ -215,9 +215,9 @@ def test_is_device_buffer_device_vs_host():
 
 
 # Long enough that the work queued behind it still waits when the buffer is
-# dropped: about half a second at 2 GHz, while the host reaches the drop within
+# dropped: half a second of GPU clock, while the host reaches the drop within
 # microseconds.
-_GPU_DELAY_CYCLES = 1_000_000_000
+_GPU_DELAY_SEC = 0.5
 _DROP_FILL_VALUE = 7
 _DROP_DONE_MESSAGE = "queued work finished"
 _DROP_CHILD_TIMEOUT_SEC = 300.0
@@ -236,6 +236,12 @@ _QUEUED_ON_PARAMS = [
         ),
     ),
 ]
+
+
+def _gpu_delay_cycles(device: torch.device) -> int:
+    # torch.cuda._sleep counts GPU clock cycles; clock_rate is in kHz.
+    clock_khz = torch.cuda.get_device_properties(device).clock_rate
+    return int(_GPU_DELAY_SEC * clock_khz * 1000)
 
 
 def _drop_buffer_with_queued_gpu_work(buffer_cls, queued_on: str) -> None:
@@ -271,7 +277,7 @@ def _drop_buffer_with_queued_gpu_work(buffer_cls, queued_on: str) -> None:
             view.clone()
             torch.cuda.synchronize()
 
-            torch.cuda._sleep(_GPU_DELAY_CYCLES)
+            torch.cuda._sleep(_gpu_delay_cycles(device))
             view.fill_(_DROP_FILL_VALUE)
             snapshot = view.clone()
     current_device = torch.cuda.current_device()
