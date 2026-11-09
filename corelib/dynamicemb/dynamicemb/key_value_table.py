@@ -950,9 +950,11 @@ def _erase_state_by_score(
     chunk_slots: int = ERASE_CHUNK_SLOTS,
     chunk_guard: Optional[Callable[[], ContextManager]] = None,
     max_in_flight: int = ERASE_MAX_CHUNKS_IN_FLIGHT,
+    score_word: Optional[int] = None,
 ) -> None:
     """Erase the keys of ``table_ids`` whose score is below ``threshold``, a chunk
-    of slots at a time (:func:`next_erase_chunk_end`).
+    of slots at a time (:func:`next_erase_chunk_end`). ``score_word`` is the word
+    compared, as in :meth:`LinearBucketTable.erase_by_score`.
 
     No more than ``max_in_flight`` chunks are launched and unfinished at once: before
     launching one, the thread waits -- outside the guard, so holding nothing and not
@@ -1016,7 +1018,12 @@ def _erase_state_by_score(
                         position, table_slots, key_map.bucket_capacity_, chunk_slots
                     )
                     key_map.erase_by_score(
-                        table_id, threshold, table_counts, begin=position, end=end
+                        table_id,
+                        threshold,
+                        table_counts,
+                        score_word=score_word,
+                        begin=position,
+                        end=end,
                     )
                     position = end
                     finished = position >= table_slots
@@ -2901,6 +2908,7 @@ class DynamicEmbStorage(Storage):
         table_ids: Sequence[int],
         counts: Tensor,
         *,
+        score_word: Optional[int] = None,
         chunk_slots: int = ERASE_CHUNK_SLOTS,
         chunk_guard: Optional[Callable[[], ContextManager]] = None,
         max_in_flight: int = ERASE_MAX_CHUNKS_IN_FLIGHT,
@@ -2915,9 +2923,11 @@ class DynamicEmbStorage(Storage):
         the current stream and nothing waits for them, except that at the end of each table
         the count of its removals is read back, to know whether to mark it (below).
 
-        Single-score tables only, as :meth:`LinearBucketTable.erase_by_score`. A table the
-        scan removed a key from is marked (:meth:`erase_untracked`): the removals are not
-        recorded, so a delta dumped from it cannot be replayed exactly.
+        One score word is compared, as in :meth:`LinearBucketTable.erase_by_score`:
+        ``score_word`` names it for an ``LRU_LFU`` table (``0`` the last-access
+        timestamp, ``1`` the frequency) and is left out for a single-score one. A table
+        the scan removed a key from is marked (:meth:`erase_untracked`): the removals are
+        not recorded, so a delta dumped from it cannot be replayed exactly.
         """
         _erase_state_by_score(
             self._state,
@@ -2927,6 +2937,7 @@ class DynamicEmbStorage(Storage):
             chunk_slots,
             chunk_guard,
             max_in_flight,
+            score_word,
         )
 
     @property

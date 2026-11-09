@@ -449,8 +449,11 @@ reader from seeing a half-filled buffer.
   least 1. Then, per module, the tables (`erasable_table_ids`) and the layout; a stream on
   another device than the tables is refused. The model function does all of it for every
   module before it starts the first, so an error leaves nothing erased.
-- **Score column**: single-score tables only; a table that keeps two score words
-  (`(TIMESTAMP, LFU)`) is an error when one of its members is named.
+- **Score column**: one word is compared. A single-score table has one; a
+  `(TIMESTAMP, LFU)` table has two, and the strategy named picks the word through
+  `get_physical_score_order` (`TIMESTAMP` word 0, `LFU` word 1, in either tuple order),
+  passed to the kernel as `score_index`. The kernel clears every score word of what it
+  erases.
 - **The call names the kind of table it erases from** (`DynamicEmbScoreStrategy`), because
   one threshold means different things for different strategies. **Strategy matching** is
   by member, on the part of the strategy that scores (`get_score_part`): `CUSTOMIZED`

@@ -271,8 +271,8 @@ def parse_args():
             parser.error("--erase_retention must be > 0")
         if args.score_strategy == "lru_lfu":
             parser.error(
-                "--erase_interval needs --score_strategy step or timestamp: a "
-                "(TIMESTAMP, LFU) table cannot be erased by either of its scores"
+                "--erase_interval needs --score_strategy step or timestamp: the "
+                "example erases by the tables' single score"
             )
         if args.external_storage:
             parser.error("--erase_interval does not support --external_storage")

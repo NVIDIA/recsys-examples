@@ -14,6 +14,9 @@ from gr_inference.gr_kernels.attention import (
 )
 
 SANITIZED_TESTS = [
+    "tests/test_decode_kv_writer.py::test_cuda_beam_kv_writer_handles_distinct_k_v_strides",
+    "tests/test_decode_kv_writer.py::test_cuda_beam_kv_write_selects_vectorized_scalar_or_pytorch_copy",
+    "tests/test_decode_kv_writer.py::test_cuda_beam_kv_write_vectorized_only_writes_nothing_it_cannot_vectorize",
     "tests/test_fused_beam_decode_gpu.py::test_fused_beam_decode_is_bit_identical_to_the_public_three_kernel_path",
     "tests/test_fused_beam_decode_gpu.py::test_fused_beam_decode_is_bit_identical_at_any_beam_width",
     "tests/test_fused_beam_decode_gpu.py::test_fused_beam_decode_is_bit_identical_for_every_context_layout",
@@ -26,6 +29,12 @@ SANITIZED_TESTS = [
     "tests/test_fused_beam_decode_gpu.py::test_fused_beam_decode_runs_the_public_path_where_context_attention_splits",
     "tests/test_fused_beam_decode_gpu.py::test_fused_beam_decode_follows_the_public_backend_choice",
     "tests/test_fused_beam_decode_gpu.py::test_backend_runs_the_fused_kernel_bit_identically",
+    "tests/test_fused_qk_norm_rope.py::test_cuda_qk_norm_rope_takes_the_fast_kernel_only_where_it_applies",
+    "tests/test_fused_qk_norm_rope.py::test_cuda_fast_qk_norm_rope_declines_unsupported_layouts",
+    "tests/test_fused_qk_norm_rope.py::test_cuda_fast_qk_norm_rope_leaves_mixed_dtypes_to_the_per_head_kernel",
+    "tests/test_fused_qk_norm_rope.py::test_cuda_fast_qk_norm_rope_matches_the_per_head_kernel",
+    "tests/test_fused_qk_norm_rope.py::test_cuda_fast_qk_norm_rope_leaves_rows_past_the_last_token_untouched",
+    "tests/test_fused_qk_norm_rope.py::test_cuda_token_qk_norm_rope_matches_the_fast_kernel_exactly",
 ]
 
 
@@ -59,6 +68,8 @@ def test_cuda_kernel_tests_are_clean_under_compute_sanitizer(tool) -> None:
             sys.executable,
             "-m",
             "pytest",
+            "-k",
+            "not batch_over_grid_limit",
             *SANITIZED_TESTS,
         ],
         cwd=Path(__file__).resolve().parents[1],

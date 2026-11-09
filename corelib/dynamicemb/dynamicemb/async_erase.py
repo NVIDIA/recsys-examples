@@ -42,7 +42,7 @@ import collections
 import contextlib
 import threading
 from concurrent.futures import Future, ThreadPoolExecutor
-from typing import Callable, ContextManager, Optional, Tuple
+from typing import Callable, ContextManager, List, Optional, Sequence, Tuple
 
 import torch
 from dynamicemb.dynamicemb_config import DynamicEmbScoreStrategy
@@ -337,17 +337,33 @@ def table_section(
     return contextlib.nullcontext() if gate is None else gate()
 
 
+def check_table_names(table_names: Optional[Sequence[str]]) -> None:
+    """Raise if ``table_names`` is not ``None`` or a non-empty sequence of names."""
+    if isinstance(table_names, str):
+        raise TypeError(
+            f"table_names must be a sequence of table names, not a str: {table_names!r}."
+        )
+    if table_names is not None and len(table_names) == 0:
+        raise ValueError(
+            "table_names is empty: leave it out (None) to erase from every table "
+            "that qualifies."
+        )
+
+
 def check_erase_arguments(
     score_strategy: DynamicEmbScoreStrategy,
     threshold: int,
     stream: Optional[torch.cuda.Stream],
     chunk_slots: int,
     max_in_flight: int,
+    table_names: Optional[Sequence[str]] = None,
 ) -> None:
     """Raise if what an erase by score is asked for cannot mean anything, whatever the
     tables are. Both calls make it first, so a wrong argument is an error even where
-    there is no table to erase from. (Whether the stream is on the tables' device is for
-    each call to compare, as it needs the tables.)"""
+    there is no table to erase from. (Whether the stream is on the tables' device, and
+    whether ``table_names`` are tables that can be erased, is for each call to check, as
+    it needs the tables.)"""
+    check_table_names(table_names)
     if not isinstance(score_strategy, DynamicEmbScoreStrategy):
         raise TypeError(
             "score_strategy must be a DynamicEmbScoreStrategy, got "
@@ -380,14 +396,22 @@ def erase_by_score_async(
     stream: Optional[torch.cuda.Stream] = None,
     chunk_slots: int = ERASE_CHUNK_SLOTS,
     max_in_flight: int = ERASE_MAX_CHUNKS_IN_FLIGHT,
+    table_names: Optional[Sequence[str]] = None,
+    strict: bool = True,
 ) -> EraseHandle:
     """Erase, in the background of training, the keys whose score is below ``threshold``
-    from every dynamic embedding table of ``model`` that scores its keys by ``score_strategy``.
+    from every dynamic embedding table of ``model`` that scores its keys by ``score_strategy``,
+    or only from the tables named in ``table_names``.
 
     A table qualifies when its score strategy has ``score_strategy`` as a member, so
-    ``CUSTOMIZED`` takes ``CUSTOMIZED`` and ``(NO_EVICTION, CUSTOMIZED)`` tables; a table
-    with no score (``NO_EVICTION`` alone) never does. With no table that qualifies the
-    call is not an error: the handle is done at once and its result is ``(0, 0)``.
+    ``CUSTOMIZED`` takes ``CUSTOMIZED`` and ``(NO_EVICTION, CUSTOMIZED)`` tables, and both
+    ``TIMESTAMP`` and ``LFU`` take ``(TIMESTAMP, LFU)`` tables; a table with no score
+    (``NO_EVICTION`` alone) never does. With no table that qualifies the call is not an
+    error: the handle is done at once and its result is ``(0, 0)``.
+
+    A ``(TIMESTAMP, LFU)`` table keeps two score words, its last-access timestamp and its
+    frequency; ``score_strategy`` says which one is compared (either tuple order), the
+    other is not looked at, and an erased key loses both.
 
     Parameters
     ----------
@@ -396,9 +420,12 @@ def erase_by_score_async(
     score_strategy : DynamicEmbScoreStrategy
         Which tables to erase from, and how their scores read: ``threshold`` is in the
         unit of that score. For ``TIMESTAMP`` take it from
-        ``dynamicemb_extensions.device_timestamp()``; for ``(NO_EVICTION, CUSTOMIZED)`` and
+        ``dynamicemb.device_timestamp()``; for ``(NO_EVICTION, CUSTOMIZED)`` and
         ``(NO_EVICTION, PRECISE_CUSTOMIZED)`` tables, the scores of live keys must be at
-        least 1, because an erased slot is cleared to 0.
+        least 1, because an erased slot is cleared to 0. For ``LFU`` the score is the raw
+        access count, which never decays (a ``score_function`` only changes how evictions
+        rank), and a key just admitted has a small one: an erase by ``LFU`` alone also
+        removes the keys that came in recently.
     threshold : int
         A key is erased when its score is *strictly below* it. In ``[0, 2**64)``.
     stream : torch.cuda.Stream, optional
@@ -418,6 +445,19 @@ def erase_by_score_async(
         At most this many chunks are launched and not yet finished on the device. What
         the training takes the tables for next waits for them: fewer disturb it less and
         slow the scan more. Default 2; at least 1.
+    table_names : Sequence[str], optional
+        Erase only from these tables, by name, wherever they are in ``model``; each must
+        qualify for ``score_strategy``. ``None`` (the default) is every table that
+        qualifies. A name that is in no module, or names a table that does not qualify,
+        and an empty list, are errors. Tables that need different thresholds -- a TTL of a
+        day on one and of 90 days on another -- take one call each.
+    strict : bool
+        With ``strict=False``, a name in ``table_names`` that no module of this
+        rank's ``model`` holds is skipped instead of being an error, so one call
+        works on every rank when tables are not on every rank (``TABLE_ROW_WISE``).
+        A rank that holds none of the names erases nothing and its result is
+        ``(0, 0)``. A name that is held but does not qualify is an error either
+        way. Default ``True``.
 
     Returns
     -------
@@ -441,23 +481,44 @@ def erase_by_score_async(
     # Not at the top of the file: dump_load imports the tables, and they import this file.
     from dynamicemb.dump_load import get_dynamic_emb_module
 
-    check_erase_arguments(score_strategy, threshold, stream, chunk_slots, max_in_flight)
-    modules = []
+    check_erase_arguments(
+        score_strategy, threshold, stream, chunk_slots, max_in_flight, table_names
+    )
+    modules: List[Tuple[nn.Module, Optional[List[str]]]] = []
+    found = set()
     for module in get_dynamic_emb_module(model):
-        if module.erasable_table_ids(score_strategy):
+        names = None
+        if table_names is not None:
+            names = [name for name in table_names if name in module.table_names]
+            if not names:
+                continue
+            found.update(names)
+        if module.get_erase_table_ids(score_strategy, names):
             if stream is not None and stream.device != torch.device(
                 "cuda", module.device_id
             ):
                 raise ValueError(
                     f"stream is on {stream.device}, the tables are on cuda:{module.device_id}."
                 )
-            modules.append(module)
+            modules.append((module, names))
+    if table_names is not None and strict:
+        missing = [name for name in table_names if name not in found]
+        if missing:
+            raise ValueError(
+                f"table_names {missing} are not tables of any dynamic embedding module "
+                "of the model."
+            )
     # Everything was accepted above, so each of these starts.
     return EraseHandleGroup(
         [
             module.erase_by_score_async(
-                score_strategy, threshold, stream, chunk_slots, max_in_flight
+                score_strategy,
+                threshold,
+                stream,
+                chunk_slots,
+                max_in_flight,
+                table_names=names,
             )
-            for module in modules
+            for module, names in modules
         ]
     )

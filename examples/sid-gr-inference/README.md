@@ -174,8 +174,10 @@ Core implementation points:
 - Online serving warms up the common batch, pool-window, and `/generate
   ignore_eos` shapes at startup, then freezes new graph capture by default.
 - QK norm and RoPE prefer the fastest available SGLang-style in-place kernels,
-  with FlashInfer/Torch fallback. Experimental branches are not part of the
-  serving hot path.
+  with FlashInfer/Torch fallback. On SM10x with bf16, head_dim 128 and 24 to 32
+  q/k heads, they use the fused CUDA q/k-norm + RoPE op instead unless
+  `GR_INFERENCE_KERNEL_QK_NORM_ROPE` is set. Experimental branches are not part
+  of the serving hot path.
 - Prefill uses SGLang-style piecewise CUDA graph by default. The current
   Qwen3-1.7B bs4/ctx1000 shape captures six graph pieces: embed, four layer
   chunks, and output.
@@ -189,10 +191,28 @@ Fallback to eager decode:
 GR_INFERENCE_DISABLE_DECODE_CUDA_GRAPH=1
 ```
 
+On SM10x, the CUDA fused q/k-norm + RoPE op runs one block per token from
+1,024 tokens (bf16, head_dim 128, NeoX RoPE, up to 32 q/k heads). To force the
+token kernel on (`1`) or off (`0`):
+
+```bash
+GR_INFERENCE_TRTLLM_QK_NORM_ROPE_TOKEN_KERNEL=0
+```
+
 Disable SID-GR experimental JIT kernels:
 
 ```bash
 GR_INFERENCE_GR_TRTLLM_KERNELS_JIT=0
+```
+
+The decode beam-KV write copies 16 bytes per thread when the K/V rows are
+16-byte aligned, and uses the PyTorch copy otherwise.
+`GR_INFERENCE_GR_TRTLLM_BEAM_KV_WRITE_JIT=1` uses the scalar CUDA kernel instead
+of the PyTorch copy, and `=0` always uses the PyTorch copy. To disable the
+vectorized copy:
+
+```bash
+GR_INFERENCE_TRTLLM_BEAM_KV_WRITE_VECTORIZE=0
 ```
 
 Decode graph cache size can be configured with:
