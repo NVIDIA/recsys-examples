@@ -19,7 +19,7 @@ import torch
 from dynamicemb.dynamicemb_config import DIST_TYPE_CODES
 from dynamicemb_extensions import block_bucketize_sparse_features  # pyre-ignore
 from torch import distributed as dist
-from torchrec.distributed.dist_data import KJTAllToAll, KJTAllToAllTensorsAwaitable
+from torchrec.distributed.dist_data import KJTAllToAllTensorsAwaitable
 from torchrec.distributed.embedding_sharding import (
     KJTSplitsAllToAllMeta,
     _fx_wrap_batch_size_per_feature,
@@ -224,20 +224,47 @@ class _ScoredTensorsAwaitable(KJTAllToAllTensorsAwaitable):
 
 
 class _ScoredSplitsAwaitable(Awaitable[KJTAllToAllTensorsAwaitable]):
-    """The first level of the keys' all2all and of the scores'.
+    """The first level of the keys' all2all, and the scores' tensors all2all after it.
 
-    The keys' tensors are waited for before the scores', on every rank, so the
-    two all2alls are issued in the same order everywhere.
+    The scores are sent as the values of a KJT with the keys' lengths, so they go out and
+    come in in exactly the keys' splits. The keys' splits all2all, which this waits for,
+    already says how many there are: the scores' tensors all2all is built from it
+    instead of exchanging, reading and uploading the same splits a second time (a
+    ``KJTAllToAll`` of their own did it all: the lengths per key from the device, the
+    splits to the device and back).
+
+    The keys' tensors are issued before the scores' on every rank, so the two all2alls
+    are in the same order everywhere.
     """
 
-    def __init__(self, keys_awaitable, scores_awaitable) -> None:
+    def __init__(
+        self, keys_awaitable: Awaitable[KJTAllToAllTensorsAwaitable], scores_kjt
+    ) -> None:
         super().__init__()
         self._keys_awaitable = keys_awaitable
-        self._scores_awaitable = scores_awaitable
+        self._scores_kjt = scores_kjt
 
     def _wait_impl(self) -> KJTAllToAllTensorsAwaitable:
         keys = self._keys_awaitable.wait()
-        return _ScoredTensorsAwaitable(keys, self._scores_awaitable.wait())
+        # What TorchRec itself reads of this awaitable (_set_sharding_context_intra_a2a):
+        # the splits by label, which the scores' labels ("lengths", "values") find in the
+        # keys' ones, whether or not the keys also carry weights.
+        scores_kjt = self._scores_kjt
+        labels = scores_kjt.dist_labels()
+        scores = KJTAllToAllTensorsAwaitable(
+            pg=keys._pg,
+            input=scores_kjt,
+            splits=keys._splits,
+            input_splits=[keys._input_splits[label] for label in labels],
+            output_splits=[keys._output_splits[label] for label in labels],
+            input_tensors=scores_kjt.dist_tensors(),
+            labels=labels,
+            keys=keys._keys,
+            device=keys._device,
+            stagger=keys._stagger,
+            stride_per_rank=keys._stride_per_rank,
+        )
+        return _ScoredTensorsAwaitable(keys, scores)
 
 
 def _determine_output_weights(kjt, pos, bucketize_pos, bucketized_weights):
@@ -281,8 +308,8 @@ class RwSparseFeaturesDist(_RwSparseFeaturesDist):
             ``t``, and building them together here is what keeps them aligned.
         per_key_score: the sparse features carry a score per key
             (:class:`~dynamicemb.scored_kjt.ScoredKeyedJaggedTensor`), sent by
-            an all2all of their own beside the keys', and handed on with the
-            received keys.
+            an all2all of their own beside the keys' (in the splits the keys'
+            all2all exchanged), and handed on with the received keys.
     """
 
     # What the index dedup of the embedding collection asks before it hands over its
@@ -317,11 +344,7 @@ class RwSparseFeaturesDist(_RwSparseFeaturesDist):
             dist_type_codes(dist_types, device=device),
             persistent=False,
         )
-        self._score_dist: Optional[KJTAllToAll] = (
-            KJTAllToAll(pg=pg, splits=[num_features] * pg.size())
-            if per_key_score
-            else None
-        )
+        self._per_key_score = per_key_score
 
     def forward(
         self,
@@ -333,7 +356,7 @@ class RwSparseFeaturesDist(_RwSparseFeaturesDist):
         # an input that has them (``without_scores``), so what arrives here is
         # scored exactly when training: the same on every rank, which the
         # all2all of the scores, a collective, needs.
-        takes_scores = self._score_dist is not None and isinstance(
+        has_scores = self._per_key_score and isinstance(
             sparse_features, ScoredKeyedJaggedTensor
         )
         bucketized_features, unbucketize_permute = bucketize_kjt_before_all2all(
@@ -342,7 +365,7 @@ class RwSparseFeaturesDist(_RwSparseFeaturesDist):
             block_sizes=self._feature_block_sizes_tensor,
             # The scores are moved by it too, though only a sequence embedding
             # needs it afterwards.
-            output_permute=self._is_sequence or takes_scores,
+            output_permute=self._is_sequence or has_scores,
             bucketize_pos=(
                 self._has_feature_processor
                 if sparse_features.weights_or_none() is None
@@ -350,7 +373,7 @@ class RwSparseFeaturesDist(_RwSparseFeaturesDist):
             ),
             dist_type_per_feature=self._dist_type_tensor,
         )
-        scores = sparse_features.scores() if takes_scores else None
+        scores = sparse_features.scores() if has_scores else None
         unbucketize_permute, scores = cut_to_length_per_key(
             bucketized_features, unbucketize_permute, scores
         )
@@ -359,7 +382,7 @@ class RwSparseFeaturesDist(_RwSparseFeaturesDist):
         )
 
         keys_dist = self._dist(bucketized_features)
-        if not takes_scores:
+        if not has_scores:
             return keys_dist
 
         # TrainPipelineSparseDist swaps ``_dist.forward`` for one that returns
@@ -384,5 +407,7 @@ class RwSparseFeaturesDist(_RwSparseFeaturesDist):
             values=scores,
             lengths=bucketized_features.lengths().clone(),
             stride=bucketized_features.stride(),
+            # The same lengths: the sum per key, which the cut above read, is known.
+            length_per_key=bucketized_features.length_per_key(),
         )
-        return _ScoredSplitsAwaitable(keys_dist, self._score_dist(scores_kjt))
+        return _ScoredSplitsAwaitable(keys_dist, scores_kjt)

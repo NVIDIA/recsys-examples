@@ -1256,7 +1256,12 @@ TARGETS: List[Target] = (
     )
     # the index dedup of the embedding collection and the distributor that cuts its arrays
     + _new(SHARD_EMB, "ShardedDynamicEmbeddingCollection._dedup_indices")
-    + _new(SHARD_IN, "cut_to_length_per_key", "RwSparseFeaturesDist.forward")
+    + _new(
+        SHARD_IN,
+        "cut_to_length_per_key",
+        "RwSparseFeaturesDist.forward",
+        "_ScoredSplitsAwaitable._wait_impl",
+    )
 )
 
 ENFORCE_ALL = os.environ.get("SYNC_LINT_ENFORCE_ALL") == "1"

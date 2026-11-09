@@ -140,6 +140,21 @@ def _spy_row_wise_dist():
     return seen, lambda: setattr(RwSparseFeaturesDist, "forward", real)
 
 
+def _spy_splits_all2all():
+    """Record the splits all2alls of KJTs that are built (one per KJTAllToAll call)."""
+    from torchrec.distributed.dist_data import KJTAllToAllSplitsAwaitable
+
+    built = []
+    real = KJTAllToAllSplitsAwaitable.__init__
+
+    def spy(self, *args, **kwargs):
+        built.append(self)
+        real(self, *args, **kwargs)
+
+    KJTAllToAllSplitsAwaitable.__init__ = spy
+    return built, lambda: setattr(KJTAllToAllSplitsAwaitable, "__init__", real)
+
+
 def check_input_dist(use_index_dedup: bool) -> None:
     model, feature_names = _input_model(use_index_dedup=use_index_dedup)
     ((_, _, sharded),) = find_sharded_modules(model, "")
@@ -158,13 +173,18 @@ def check_input_dist(use_index_dedup: bool) -> None:
 
     # A scored one reaches the distributor with its scores beside its keys.
     seen, restore = _spy_row_wise_dist()
+    built, restore_splits = _spy_splits_all2all()
     try:
         scored = ScoredKeyedJaggedTensor(scores=scores, **fields)
         context = sharded.create_context()
         distributed = sharded.input_dist(context, scored).wait().wait()
     finally:
         restore()
+        restore_splits()
     assert len(seen) == 1, len(seen)
+    # The scores go out in the splits that the keys' all2all exchanged: one splits
+    # exchange for the sharding, not a second one of their own.
+    assert len(built) == 1, len(built)
     (received,) = seen
     assert isinstance(received, ScoredKeyedJaggedTensor), type(received)
     # What the lengths add up to is what is real. With use_index_dedup the unique keys

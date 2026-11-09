@@ -360,6 +360,31 @@ def test_padded_input_without_scores_distributes_like_exact_input(
 
 
 @cuda_only
+def test_the_scores_go_out_in_the_splits_of_the_keys(one_rank, monkeypatch):
+    """One splits exchange per sharding: the scores' all2all is built from the splits of
+    the keys' all2all, not from a KJTAllToAll of its own (which would exchange, read and
+    upload the same splits again)."""
+    from torchrec.distributed.dist_data import KJTAllToAllSplitsAwaitable
+
+    built = []
+    real = KJTAllToAllSplitsAwaitable.__init__
+
+    def spy(self, *args, **kwargs):
+        built.append(self)
+        real(self, *args, **kwargs)
+
+    monkeypatch.setattr(KJTAllToAllSplitsAwaitable, "__init__", spy)
+    device = torch.device("cuda", torch.cuda.current_device())
+    values, lengths, scores, _ = _real_arrays(device)
+    scored = _distribute(
+        _distributor(one_rank, per_key_score=True),
+        _scored(KEYS, lengths, values, scores, None),
+    )
+    assert len(built) == 1, len(built)
+    assert torch.equal(scored["scores"], scores)
+
+
+@cuda_only
 def test_a_distribution_of_exact_arrays_is_not_cut(one_rank):
     """Exact arrays are not shortened: the permute handed to the output distribution has
     one place for every key."""
