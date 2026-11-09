@@ -20,6 +20,7 @@ Each experiment below adds **one** optimization on top of the previous, so the s
 | 3 | **DynamicEmb Caching** | Cache hot DynamicEmb rows in GPU HBM while keeping the full table in host memory. |
 | 4 | **Hash-RoundRobin Sharding** | Use row-wise `hash_roundrobin` placement for DynamicEmb tables to distribute IDs more evenly across ranks. |
 | 5 | **Prefetch Pipeline** | Enable the prefetch pipeline on top of caching and Hash-RoundRobin sharding. |
+| 6 | **Hierarchical Dist** | Move the DynamicEmb tables' keys and rows with DynamicEmb's hierarchical dist instead of TorchRec's dists. Inside a node they move over NVLink; between nodes, one copy of each (table, key) per node moves over InfiniBand. Needs DynamicEmb built against NCCL 2.30.7 or newer. |
 
 ### Benchmark Configuration
 
@@ -80,6 +81,8 @@ Synthetic data with Zipf-distributed sequence lengths simulates the heavy-tailed
 | 4 | +Hash-RoundRobin | 308.6 | 31.21 | 336.9 | 34.06 | 4.08× | Row-wise `hash_roundrobin` DynamicEmb placement |
 | 5 | +Prefetch Pipeline | 310.6 | 31.40 | 338.1 | 34.19 | 4.11× | Prefetch pipeline on top of caching + Hash-RoundRobin |
 
+> **TODO**: this run predates experiment 6 (+Hierarchical Dist), and it had the contextual tables, which `experiments.txt` no longer generates. Rerun exp0-exp6 in one 2-node batch and replace this table.
+
 ### Key Takeaways
 
 1. **CUTLASS attention is the main jump**: Replacing Triton attention with CUTLASS raises average throughput from 115.8 TFLOPS/GPU to 302.6 TFLOPS/GPU after the shuffler step, and reaches 329.4 peak TFLOPS/GPU.
@@ -106,6 +109,7 @@ Synthetic data with Zipf-distributed sequence lengths simulates the heavy-tailed
 ### Prerequisites
 
 - Docker image built from `docker/Dockerfile`, or an equivalent environment with HSTU kernels and DynamicEmb compiled.
+- Experiment 6 needs DynamicEmb built against, and run with, NCCL 2.30.7 or newer. If DynamicEmb was built against an older NCCL, the training raises `ImportError` when it shards the model. [Section 4](../../../../corelib/dynamicemb/docs/hier_output_dist.md#4-using-it) of DynamicEmb's hierarchical dist document lists its requirements and NCCL settings. Export any NCCL setting you use (such as `NCCL_CROSS_NIC=0` across nodes) before you start the batch, so that every experiment runs with it, not exp6 alone.
 - All commands below assume **working directory** = `recsys-examples/examples/hstu`.
 
 ```bash
@@ -123,9 +127,16 @@ exp2_cutlass,--balanced_shuffler --kernel_backend cutlass --value_dist zipf --va
 exp3_caching,--balanced_shuffler --kernel_backend cutlass --caching --value_dist zipf --value_dist_alpha 1.05
 exp4_caching_hr,--balanced_shuffler --kernel_backend cutlass --caching --dist_type hash_roundrobin --value_dist zipf --value_dist_alpha 1.05
 exp5_prefetch,--balanced_shuffler --kernel_backend cutlass --caching --dist_type hash_roundrobin --pipeline_type prefetch --value_dist zipf --value_dist_alpha 1.05
+exp6_hier,--balanced_shuffler --kernel_backend cutlass --caching --dist_type hash_roundrobin --pipeline_type prefetch --output_dist hierarchical --value_dist zipf --value_dist_alpha 1.05
 ```
 
 Each line is `exp_name,options_for_generate_gin_config.py`. The script `generate_gin_config.py` produces a complete gin config file from these flags.
+
+`--output_dist hierarchical` sets `output_dist` on every DynamicEmb table. When the config sets no `DynamicEmbeddingArgs.output_dist_capacity` (the generator sets none), the training sizes the capacity so that every call fits: world size × batch size per GPU × the most keys a sample has, summed over the DynamicEmb tables' features. In `experiments.txt`, `item` is the only DynamicEmb table, so that is 16 × 32 × 4096 keys on 2 nodes; `--include-contextual` adds `user_id`, one key a sample.
+
+This bound is safe but large. On 2 nodes the dist's window takes about 1.6 GiB per GPU: `lookup_rows` alone is 1 GiB, and it grows by 64 MiB for each GPU in the job. For larger runs, set a smaller `output_dist_capacity` on every DynamicEmb table (`item_embedding/DynamicEmbeddingArgs.output_dist_capacity`, plus `user_id_emb` with `--include-contextual`). [Section 5.2](../../../../corelib/dynamicemb/docs/hier_output_dist.md#52-how-to-choose-them) of the hierarchical dist document shows how to choose it. The scripts generate the config on every run, so add the line to the template in `generate_gin_config.py`. A call that needs more than the capacity raises `RuntimeError`, which names the capacity to raise.
+
+In some cases DynamicEmb only warns and takes TorchRec's dists, for example when GIN does not connect the rails on some rank, or when the window cannot be allocated ([section 6](../../../../corelib/dynamicemb/docs/hier_output_dist.md#6-when-a-sharding-takes-torchrecs-dists) of the document lists the cases). The training turns that warning into an error, so exp6 stops with the reason instead of measuring TorchRec's dists.
 
 ### Debug environment variables
 
@@ -226,6 +237,8 @@ training/benchmark/results/
     ├── exp4_caching_hr/
     │   └── ...
     ├── exp5_prefetch/
+    │   └── ...
+    ├── exp6_hier/
     │   └── ...
     ├── summary.txt                           # batch summary
     └── comparison.png                         # TFLOPS + MFU comparison chart

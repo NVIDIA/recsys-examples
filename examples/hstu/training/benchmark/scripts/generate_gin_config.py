@@ -43,7 +43,7 @@ def get_baseline_template():
 #   - Workload Balancer: {balanced_shuffler}
 #   - DynamicEmb Caching: {caching}
 #   - Cache Ratio: {ratio}
-#   - Eviction Strategy: {evict}
+#   - Eviction Strategy: {evict}{output_dist_comment}
 #   - Pipeline: {pipeline_type}
 #   - Tensor Parallel: {tp_size}
 #   - Attention Heads: {num_attention_heads}
@@ -103,7 +103,7 @@ item_embedding/DynamicEmbeddingArgs.item_vocab_size_or_capacity = 50000000  # 50
 item_embedding/DynamicEmbeddingArgs.item_vocab_gpu_capacity_ratio = {ratio}
 item_embedding/DynamicEmbeddingArgs.evict_strategy = '{evict}'
 item_embedding/DynamicEmbeddingArgs.caching = {caching}
-item_embedding/DynamicEmbeddingArgs.dist_type = '{dist_type}'
+item_embedding/DynamicEmbeddingArgs.dist_type = '{dist_type}'{item_output_dist_line}
 
 # Action embedding
 action_embedding/EmbeddingArgs.feature_names = ['action']
@@ -229,6 +229,17 @@ Examples:
         choices=["continuous", "roundrobin", "hash_roundrobin"],
         default="roundrobin",
         help="DynamicEmb input distribution policy for row-wise sharding (default: roundrobin)",
+    )
+
+    parser.add_argument(
+        "--output_dist",
+        type=str,
+        choices=["torchrec", "hierarchical", "auto"],
+        default="torchrec",
+        help="How the DynamicEmb tables move keys and rows between GPUs: TorchRec's "
+        "dists, DynamicEmb's hierarchical dist (needs NCCL >= 2.30.7; not with "
+        "--dist_type continuous), or the hierarchical dist where the build has it "
+        "(default: torchrec)",
     )
 
     parser.add_argument(
@@ -375,6 +386,16 @@ def generate_config(args):
         value_dist_section = "# Item-ID value distribution: uniform (default)"
         user_id_value_dist_section = ""
 
+    # TorchRec's dists are the default. As with the shuffler line, leave
+    # output_dist out for them, so that the other experiments' configs do not
+    # change.
+    def output_dist_line(scope):
+        if args.output_dist == "torchrec":
+            return ""
+        return f"\n{scope}/DynamicEmbeddingArgs.output_dist = '{args.output_dist}'"
+
+    user_id_output_dist_line = output_dist_line("user_id_emb")
+
     if not args.include_contextual:
         contextual_feature_section = (
             "# Contextual features are omitted. Pass --include-contextual to "
@@ -409,7 +430,7 @@ user_id_emb/DynamicEmbeddingArgs.item_vocab_size_or_capacity = 50000000  # 50M
 user_id_emb/DynamicEmbeddingArgs.item_vocab_gpu_capacity_ratio = {ratio}
 user_id_emb/DynamicEmbeddingArgs.evict_strategy = '{args.evict}'
 user_id_emb/DynamicEmbeddingArgs.caching = {args.caching}
-user_id_emb/DynamicEmbeddingArgs.dist_type = '{args.dist_type}'
+user_id_emb/DynamicEmbeddingArgs.dist_type = '{args.dist_type}'{user_id_output_dist_line}
 
 user_age_emb/EmbeddingArgs.feature_names = ['user_age']
 user_age_emb/EmbeddingArgs.table_name = 'user_age'
@@ -444,6 +465,10 @@ item_cat_l1_emb/EmbeddingArgs.sharding_type = 'data_parallel'
         ratio=ratio,  # Use auto-corrected ratio
         evict=args.evict,
         dist_type=args.dist_type,
+        output_dist_comment=""
+        if args.output_dist == "torchrec"
+        else f"\n#   - DynamicEmb Output Dist: {args.output_dist}",
+        item_output_dist_line=output_dist_line("item_embedding"),
         pipeline_type=args.pipeline_type,
         tp_size=args.tp_size,
         num_attention_heads=args.num_attention_heads,

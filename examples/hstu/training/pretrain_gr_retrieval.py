@@ -17,6 +17,11 @@ import warnings
 # Ignore all FutureWarnings
 warnings.filterwarnings("ignore", category=FutureWarning)
 warnings.filterwarnings("ignore", category=SyntaxWarning)
+# Where output_dist="hierarchical" cannot run, DynamicEmb warns and takes
+# TorchRec's dists. Raise instead, whatever PYTHONWARNINGS says, so that a run
+# never reports TorchRec's dists as the hierarchical dist. "auto" still falls
+# back.
+warnings.filterwarnings("error", message='output_dist="hierarchical"')
 import argparse
 from typing import List, Union
 
@@ -39,6 +44,7 @@ from trainer.utils import (
     get_data_loader,
     get_dataset_and_embedding_args,
     get_embedding_vector_storage_multiplier,
+    get_feature_to_max_seqlen,
 )
 from utils import (  # from hstu.utils
     BenchmarkDatasetArgs,
@@ -108,6 +114,9 @@ def main():
         embedding_dim_multiplier=get_embedding_vector_storage_multiplier(
             optimizer_args.optimizer_str
         ),
+        world_size=torch.distributed.get_world_size(),
+        batch_size=trainer_args.train_batch_size,
+        feature_to_max_seqlen=get_feature_to_max_seqlen(dataset_args),
     )
     optimizer_param = create_optimizer_params(optimizer_args)
     model_train, dense_optimizer = make_optimizer_and_shard(
@@ -159,6 +168,9 @@ def main():
         test_dataloader,
         dense_optimizer,
     )
+    from dynamicemb.shard import quiesce
+
+    quiesce(model_train)
     init.destroy_global_state()
 
 
