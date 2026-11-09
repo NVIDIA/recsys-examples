@@ -18,10 +18,11 @@
 No environment variable selects a blocking path. What remains are tuning knobs that never change
 what a step reads from the device: ``DYNAMICEMB_MISS_PATH_GATE`` (how the miss path is launched)
 and ``DYNAMICEMB_MISS_PATH_BUFFER_BYTES`` (how many rows of the miss path's buffers one chunk
-allocates). This file checks the parsing of the second and the arithmetic of the chunk plan
+allocates). This file checks the parsing of both and the arithmetic of the chunk plan
 (``sync_free.row_chunks``), which is pure host code and runs without a GPU.
 """
 import os
+import re
 import warnings
 
 import pytest
@@ -40,6 +41,46 @@ def _plain_budget(monkeypatch):
     monkeypatch.setattr(sf, "BUFFER_BYTES", 4 * GIB)
     monkeypatch.setattr(sf, "CHUNK_ROWS", None)
     monkeypatch.setattr(sf, "_WARNED_SMALL_CHUNK", False)
+    monkeypatch.setattr(sf, "_WARNED_UNCHUNKED", set())
+
+
+# --------------------------------------------------------------------------
+# DYNAMICEMB_MISS_PATH_GATE
+# --------------------------------------------------------------------------
+@pytest.mark.parametrize(
+    "text, mode",
+    [
+        (None, "always"),
+        ("", "always"),
+        ("always", "always"),
+        ("Always", "always"),
+        ("poll", "poll"),
+        ("POLL", "poll"),
+    ],
+)
+def test_the_gate_variable_picks_one_of_two_modes(monkeypatch, text, mode):
+    if text is None:
+        monkeypatch.delenv("DYNAMICEMB_MISS_PATH_GATE", raising=False)
+    else:
+        monkeypatch.setenv("DYNAMICEMB_MISS_PATH_GATE", text)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        assert sf._miss_gate_from_env() == mode
+    assert sf._MISS_GATE_MODES == ("always", "poll"), "neither mode waits for the GPU"
+
+
+def test_the_removed_read_mode_warns_and_the_default_is_used(monkeypatch):
+    """A script that still asks for the blocking mode keeps running, without the wait."""
+    monkeypatch.setenv("DYNAMICEMB_MISS_PATH_GATE", "read")
+    with pytest.warns(UserWarning, match="DYNAMICEMB_MISS_PATH_GATE=read was removed"):
+        assert sf._miss_gate_from_env() == "always"
+
+
+@pytest.mark.parametrize("text", ["block", "sync", "0", "1", "never"])
+def test_any_other_gate_value_is_refused_loudly(monkeypatch, text):
+    monkeypatch.setenv("DYNAMICEMB_MISS_PATH_GATE", text)
+    with pytest.raises(ValueError, match="DYNAMICEMB_MISS_PATH_GATE"):
+        sf._miss_gate_from_env()
 
 
 # --------------------------------------------------------------------------
@@ -144,6 +185,59 @@ def test_the_plan_depends_on_host_facts_only():
 
 
 # --------------------------------------------------------------------------
+# a buffer that is not split into chunks
+# --------------------------------------------------------------------------
+def test_an_unchunked_buffer_over_the_budget_is_named_once_per_site(monkeypatch):
+    """Eval's unique rows and a DEFAULT-mode forward's value block are one row per key and cannot
+    run in chunks: the budget does not bound them, so the step says so before it allocates.
+    """
+    monkeypatch.setattr(sf, "BUFFER_BYTES", 1000)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        sf.warn_if_unchunked_over_budget(
+            5, 100, "a pooled evaluation"
+        )  # 2 x 500 <= 1000
+    with pytest.warns(UserWarning, match="a pooled evaluation") as caught:
+        sf.warn_if_unchunked_over_budget(6, 100, "a pooled evaluation")
+    text = str(caught[0].message)
+    assert (
+        "6 rows of 100 bytes" in text
+        and "DYNAMICEMB_MISS_PATH_BUFFER_BYTES=1000" in text
+    )
+    assert "not split into chunks" in text
+    with warnings.catch_warnings():  # once per site and process
+        warnings.simplefilter("error")
+        sf.warn_if_unchunked_over_budget(60, 100, "a pooled evaluation")
+    with pytest.warns(UserWarning, match="a forward"):
+        sf.warn_if_unchunked_over_budget(6, 100, "a forward")
+
+
+@pytest.mark.parametrize(
+    "n, row_bytes, over",
+    [
+        (
+            4 * (1 << 20),
+            128 * 4,
+            False,
+        ),  # 4M keys of 128 fp32 columns: the old guard's edge
+        (4 * (1 << 20) + 1, 128 * 4, True),
+        (1_398_101, 384 * 4, False),  # Adam's value rows
+        (1_398_102, 384 * 4, True),
+    ],
+)
+def test_the_warning_starts_where_the_old_memory_guard_switched_paths(
+    monkeypatch, n, row_bytes, over
+):
+    """The guard of the first masked paths sent a group with ``2 * n * row_bytes`` over 4 GiB down
+    a path with ``O(unique keys)`` buffers; those batches now allocate ``O(n)`` and are named.
+    """
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        sf.warn_if_unchunked_over_budget(n, row_bytes, "a buffer")
+    assert bool(caught) == over
+
+
+# --------------------------------------------------------------------------
 # what is not there any more
 # --------------------------------------------------------------------------
 def _package_sources():
@@ -162,16 +256,36 @@ def _package_sources():
 
 def test_no_variable_selects_a_blocking_path():
     """The kill switch (DYNAMICEMB_SYNC_FREE) and the old name of the budget
-    (DYNAMICEMB_SYNC_FREE_MAX_BYTES) are not read by the package: a source search finds no use,
-    whatever the file."""
+    (DYNAMICEMB_SYNC_FREE_MAX_BYTES) select nothing: a source search finds no use, whatever the
+    file, but the table of retired variables that only warns (``sync_free._RETIRED_VARIABLES``).
+    """
     forbidden = ("SYNC_FREE", "MAX_BYTES")
-    found = [
-        "%s: %s" % (path, token)
-        for path, source in _package_sources()
-        for token in forbidden
-        if token in source
-    ]
+    found = []
+    for path, source in _package_sources():
+        if path == "sync_free.py":
+            source = re.sub(
+                r"\n_RETIRED_VARIABLES = \{.*?\n\}\n", "\n", source, flags=re.S
+            )
+        found += ["%s: %s" % (path, token) for token in forbidden if token in source]
     assert not found, "\n".join(found)
+
+
+@pytest.mark.parametrize(
+    "name", ["DYNAMICEMB_SYNC_FREE", "DYNAMICEMB_SYNC_FREE_MAX_BYTES"]
+)
+def test_a_retired_variable_warns_and_changes_nothing(monkeypatch, name):
+    """A script that still sets one is told so, once, and everything runs as without it."""
+    for other in ("DYNAMICEMB_MISS_PATH_GATE", "DYNAMICEMB_MISS_PATH_BUFFER_BYTES"):
+        monkeypatch.delenv(other, raising=False)
+    monkeypatch.setenv(name, "0")
+    with pytest.warns(UserWarning, match="%s is not read any more" % name):
+        sf._warn_retired_variables()
+    assert sf._miss_gate_from_env() == "always"
+    assert sf._buffer_bytes_from_env() == 4 * GIB
+    monkeypatch.delenv(name)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        sf._warn_retired_variables()
 
 
 def test_the_legacy_bodies_are_not_in_the_package():

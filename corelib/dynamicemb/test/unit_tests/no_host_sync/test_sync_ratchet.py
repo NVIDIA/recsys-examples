@@ -193,7 +193,7 @@ def test_sync_ratchet(config, census, budgets):
         # a step that has reached steady state allocates nothing; the allocator may
         # still grow once, and a growth event allocates by design
         events = r["mean"]["al"] * r["iters"]
-        if events > sb.ALLOC_EVENTS_MAX + sb.EPS and not hsp.inherent_reason(
+        if events > sb.ALLOC_EVENTS_MAX + sb.EPS and not hsp.allocations_excused(
             r["config"], r["scenario"]
         ):
             problems.append(
@@ -219,7 +219,8 @@ def test_sync_ratchet(config, census, budgets):
 # the forward adds its output and the unique embeddings, the backward its gradients: at most
 # about five of them are live at once, so this leaves room for the index arrays and a
 # little more, and catches an extra full-size buffer or worse. A first estimate, to be
-# tightened with the measured census.
+# tightened with a measurement: the test prints a MEMORY line for each config (pytest -s), and
+# about 1.25 times the largest of them is the bound.
 ABSOLUTE_BOUND = 8.0
 # CHUNKED: what the miss path of the whole batch adds over a miss path that runs in 64-row
 # chunks (a chunk's worth of buffers instead of the batch's): the two buffers and a half.
@@ -260,6 +261,11 @@ def test_hit_step_memory_growth_is_bounded(config, gpu, sf, monkeypatch):
     top_tier = mod._cache if mod._cache is not None else mod._storage
     itemsize = torch.empty(0, dtype=top_tier.embedding_dtype()).element_size()
     unit = batch.indices.numel() * top_tier.max_value_dim() * itemsize
+    print(
+        "MEMORY %s: an all-hit step peaks at %.2f buffers of N x value_dim over its start, "
+        "%.2f with the miss path in 64-row chunks (one buffer is %d bytes)"
+        % (config, whole / unit, chunked / unit, unit)
+    )
     assert whole <= ABSOLUTE_BOUND * unit, (
         "%s: an all-hit step peaks at %d bytes over its start, %.2f buffers of N x value_dim "
         "(%d bytes); the bound is %.1f"

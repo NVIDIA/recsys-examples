@@ -100,6 +100,6 @@ Notes:
 
 - For detailed explanations of specific APIs and parameters, please refer to [API Doc](../DynamicEmb_APIs.md).
 
-- For usage of external storage, refer to the `PyDictStorage` demo in the [unit test](../test/test_batched_dynamic_embedding_tables_v2.py).
+- For usage of external storage, see [External storage](../DynamicEmb_APIs.md#external-storage) (the two contracts, and what each costs the host) and the `PyDictStorage` demo (the host-sized contract) in the [unit test](../test/test_batched_dynamic_embedding_tables_v2.py); the stand-ins of the padded contract are in [ps_standins.py](../test/ps_standins.py).
 
 ***dynamicemb** supports not only `EmbeddingCollection` but also `EmbeddingBagCollection`. However, due to the requirements of generative recommendations, dynamicemb focuses on performance optimization of `EmbeddingCollection` while providing full functional support for `EmbeddingBagCollection`. And we use `EmbeddingCollection` as an example.*

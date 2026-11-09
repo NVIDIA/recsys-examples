@@ -74,7 +74,16 @@ ROOMY = [
     "hybrid_lfu",
     "host_only",
 ]
-PRESSURE = ["cache_storage", "hbm_only", "hybrid"]
+# the tiers too small for the stream, the retaining ones included: every chunk then hands its
+# victims to the pending list of retained keys
+PRESSURE = [
+    "cache_storage",
+    "hbm_only",
+    "hybrid",
+    "cache_storage_retain",
+    "hbm_only_retain",
+]
+POLL = ["cache_storage", "cache_storage_admit", "hbm_only", "hybrid"]
 CHUNKS = [1, 7, 64]
 PRESSURE_CHUNKS = [None, 3, 64]
 
@@ -151,13 +160,16 @@ def _baseline(config):
     return _BASELINES[config]
 
 
-def _run_trace(config, chunk):
+def _run_trace(config, chunk, gate=None):
     cfg, mod, maker = _build(config, "miss")
     batches = _trace(cfg, maker)
     if mod._cache is not None:
         mod.set_record_cache_metrics(True)
     outputs, metrics = [], []
     sf.CHUNK_ROWS = chunk  # the budget's test hook; always put back
+    gate_before = sf.MISS_GATE
+    if gate is not None:
+        sf.MISS_GATE = gate
     try:
         for batch in batches:
             outputs.append(_step(mod, cfg, batch).cpu())
@@ -166,6 +178,7 @@ def _run_trace(config, chunk):
         torch.cuda.synchronize()
     finally:
         sf.CHUNK_ROWS = None
+        sf.MISS_GATE = gate_before
     state = _export(mod)
     pinned = []
     for holder in (getattr(mod, "_cache", None), getattr(mod, "_storage", None)):
@@ -201,6 +214,32 @@ def test_a_chunked_step_is_the_unchunked_step_when_every_tier_has_room(config, c
     assert (
         pinned_a == pinned_b == [0] * len(pinned_a)
     ), "nothing is pinned after the backward"
+
+
+@pytest.mark.parametrize("config", POLL)
+@pytest.mark.parametrize("chunk", [7, 64])
+def test_the_poll_gate_gives_the_results_of_the_always_gate_with_chunks(config, chunk):
+    """``poll`` skips the miss path of a step when a count that has already landed says that
+    nothing missed: a control flow that depends on timing, a chunk plan or not. The results are
+    those of the always gate (the cache metrics are not: a skipped step does not record its
+    insert)."""
+    outputs_a, state_a, _, pinned_a = _baseline(config)
+    outputs_b, state_b, _, pinned_b = _run_trace(config, chunk, gate="poll")
+
+    for step, (a, b) in enumerate(zip(outputs_a, outputs_b)):
+        assert torch.equal(a, b), "%s: step %d differs under poll, chunk=%d" % (
+            config,
+            step,
+            chunk,
+        )
+    for name in state_a:
+        assert torch.equal(state_a[name][0], state_b[name][0]), (
+            "%s: the keys differ" % name
+        )
+        assert torch.equal(state_a[name][1], state_b[name][1]), (
+            "%s: the rows differ" % name
+        )
+    assert pinned_a == pinned_b == [0] * len(pinned_a), "nothing is pinned afterwards"
 
 
 @pytest.mark.parametrize("config", ["cache_storage", "hbm_only"])
@@ -264,9 +303,14 @@ def test_a_row_is_never_another_keys_data_under_eviction(config, chunk, monkeypa
 
 
 def test_the_chunked_miss_path_adds_memory_in_proportion_to_the_budget(monkeypatch):
-    """The peak memory a step with new keys adds over its start: with one chunk it holds the
-    whole batch's ``values`` and ``evicted_values``; with a budget of 64 rows only 64 rows' worth.
-    Compared with each other, so that what the batch costs in index arrays cancels."""
+    """The peak memory a prefetch with new keys adds over its start: with one chunk it holds the
+    whole batch's ``values`` and ``evicted_values``; with 64-row chunks only 64 rows' worth.
+    Compared with each other, so that what the batch costs in index arrays cancels.
+
+    The prefetch alone is measured: the peak of a whole step may well be the backward's (its
+    output, the gradient the test hands it and the unique rows' gradients are three buffers of
+    the batch's size, against the two of the miss path), and chunking would then show nothing
+    in it."""
     monkeypatch.setattr(hsp, "DIM", 256)
     itemsize = 4
 
@@ -280,10 +324,15 @@ def test_the_chunked_miss_path_adds_memory_in_proportion_to_the_budget(monkeypat
         torch.cuda.synchronize()
         base = torch.cuda.memory_allocated()
         torch.cuda.reset_peak_memory_stats()
-        _step(mod, cfg, batch)
+        mod.prefetch(batch.indices, batch.offsets)
+        torch.cuda.synchronize()
+        grown = torch.cuda.max_memory_allocated() - base
+        _step(
+            mod, cfg, batch
+        )  # its forward takes the prefetched state; the keys are unpinned
         torch.cuda.synchronize()
         monkeypatch.setattr(sf, "CHUNK_ROWS", None)
-        return torch.cuda.max_memory_allocated() - base, batch.indices.numel()
+        return grown, batch.indices.numel()
 
     whole, n = peak(None)
     chunked, _ = peak(64)
@@ -291,7 +340,11 @@ def test_the_chunked_miss_path_adds_memory_in_proportion_to_the_budget(monkeypat
     saved = (
         2 * (n - 64) * value_dim * itemsize
     )  # values and evicted_values, minus a chunk's
+    print(
+        "MEMORY prefetch: %d bytes over its start in one chunk, %d in 64-row chunks, %d expected "
+        "to be saved" % (whole, chunked, saved)
+    )
     assert whole - chunked >= 0.5 * saved, (
-        "a step with 64-row chunks peaked at %d bytes over its start, one chunk at %d: the "
+        "a prefetch with 64-row chunks peaked at %d bytes over its start, one chunk at %d: the "
         "miss path should add about %d bytes less" % (chunked, whole, saved)
     )

@@ -69,7 +69,7 @@ DynamicEmbTableOptions(
 
 Nothing tied these together. Set the first and forget the second and the model
 built fine, then died on the first forward that missed, inside
-`_apply_admission`, with `AttributeError: 'NoneType' object has no attribute
+`_apply_admission` (since replaced by `MultiTableAdmitter.admit_masked`), with `AttributeError: 'NoneType' object has no attribute
 'add'` — the three admission paths called `admission_counter.add(...)`
 unconditionally. And a counter's capacity is a property of *frequency-based
 admission*, not of an embedding table: a probabilistic strategy needs no counter

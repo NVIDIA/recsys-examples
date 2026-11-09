@@ -4700,6 +4700,13 @@ class HybridStorage(Storage):
         # (``sf.row_chunks``), each chunk moving to the host tier before the next is
         # read, and all of them before the new rows overwrite their slots: the two tiers
         # are disjoint, so the host insert and the HBM store commute.
+        #
+        # The loop is not atomic. An exception in it (a caught out-of-memory error of a
+        # chunk's buffer or of the host tier's insert) leaves the new keys in the key map
+        # of the HBM tier while their rows still hold the victims' values, so a later
+        # lookup would return another key's row: a tier that has raised here is not to
+        # be used again. ``_insert_and_evict_keys`` above has the same window up to the
+        # store (an out-of-memory error of the evicted values), a little narrower.
         for start, stop in sf.row_chunks(
             evicted_keys.numel(),
             self._hbm.value_dim * self._hbm.emb_dtype.itemsize,

@@ -558,14 +558,28 @@ class Storage(abc.ABC, Generic[OptionsT, OptimizerT]):
         torch.Tensor,
         torch.Tensor,
         torch.Tensor,
+        Optional[torch.Tensor],
         torch.Tensor,
         torch.Tensor,
         torch.Tensor,
     ]:
+        """The host-sized lookup: ``unique_keys`` and ``table_ids`` hold exactly the live keys.
+
+        Returns eight values, in this order (every implementation in the package does, and
+        :class:`OldContractStorage` indexes them): ``num_missing`` (a host int),
+        ``missing_keys``, ``missing_indices`` (the positions of the missing keys among
+        ``unique_keys``), ``missing_table_ids``, ``missing_scores`` (what a later
+        insert of the missing keys takes as ``scores``, aligned with ``missing_keys``; ``None``
+        for a store that keeps none), ``founds`` (bool, one per key), ``output_scores`` and
+        ``values`` (``[len(unique_keys), width]``, ``width`` that of ``copy_mode``; the rows of
+        the keys that were not found are unspecified). DynamicEmb reads the count, the missing
+        indices, the missing scores, ``founds`` and ``values``.
+        """
         num_missing: int
         missing_keys: torch.Tensor
         missing_indices: torch.Tensor
-        missing_scores: torch.Tensor
+        missing_table_ids: torch.Tensor
+        missing_scores: Optional[torch.Tensor]
         founds: torch.Tensor
         output_scores: torch.Tensor
         values: torch.Tensor
@@ -573,6 +587,7 @@ class Storage(abc.ABC, Generic[OptionsT, OptimizerT]):
             num_missing,
             missing_keys,
             missing_indices,
+            missing_table_ids,
             missing_scores,
             founds,
             output_scores,

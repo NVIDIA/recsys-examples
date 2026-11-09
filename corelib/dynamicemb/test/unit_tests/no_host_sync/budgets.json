@@ -223,7 +223,7 @@
   "growth": {"plain": 4.125, "prefetch": 4.125}
  },
  "cache_storage_determ": {
-  "all_hit": {"plain": 1, "prefetch": 1},
+  "all_hit": {"plain": 2, "prefetch": 2},
   "miss": {"plain": 7, "prefetch": 7},
   "miss_evict": {"plain": 7, "prefetch": 7},
   "tier2_hit": {"plain": 5, "prefetch": 5},

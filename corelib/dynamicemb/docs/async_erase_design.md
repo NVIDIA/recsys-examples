@@ -41,7 +41,7 @@ answers with an already-finished handle, whatever its layout.
    event or CPU lock on the table path.
 2. **A prefetched batch borrows slots until backward.** Prefetch resolves keys to
    `slot_indices` (kept in `PrefetchState`) and `increment_counter`s them; backward
-   `decrement_counter`s them (`_prefetch_cache_path`, `_prefetch_hbm_direct_path`,
+   `decrement_counter`s them (`_prefetch_cache_path_masked`, `_prefetch_hbm_direct_path_masked`,
    backward).
 3. **The ref counter is the existing pin.** The evict kernel re-reads `counter[slot]`
    after `try_lock` and skips a slot with `counter > 0`. `_ref_counter` used to be
@@ -329,7 +329,7 @@ the way a cached copy of any key storage has evicted does.
 Why that is safe (checked, not assumed):
 
 - **Scores live only in storage.** The cache ranks by timestamp, and prefetch
-  `_find_keys` every key in storage, hits included (step 2 of `_prefetch_cache_path`).
+  `_find_keys` every key in storage, hits included (step 2 of `_prefetch_cache_path_masked`).
   "Score below the threshold" is decided on storage.
 - **"In storage but not in cache" and "in cache but not in storage" are both already
   legal states.** `_write_back_evicted` looks each key the cache evicts up in storage: one
@@ -352,7 +352,7 @@ Accepted consequences (cache mode):
 2. Tables with an `external_storage` are **not supported** (§2), so there is no PS for a
    cached copy to be written back to and nothing to go stale there. For the record, the
    argument that settled it: a lookup asks the cache first and the PS only for keys both
-   the cache and the storage lack (`_lookup_next_tier`), and the cache's eviction writes
+   the cache and the storage lack (`next_tier.lookup_masked` in `_cache_miss_chunk`), and the cache's eviction writes
    the key back over whatever older copy the PS held (`_write_back_evicted`), so a cached
    key never reads a stale PS value. What it did not cover is a key that is not cached
    when it is erased but has an older copy in the PS (nothing deletes from the PS when a

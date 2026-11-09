@@ -86,12 +86,18 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 #       contract (cache_ps*): its find / insert take tensors of exactly the number
 #       of live rows, so DynamicEmb reads that number once per PS call (an all-hit
 #       step reads the miss count once and calls nothing), and the PS stand-in's own
-#       host code adds more. A PS of the padded contract costs DynamicEmb nothing:
-#       cache_dps*, host_dps run the in-tree storage as the device-resident PS and
-#       are measured at zero.
+#       host code adds more. Only those two are excused, by call site: the reads of
+#       DynamicEmb are sync_free.read_now's wait (types._live_rows,
+#       batched_dynamicemb_function._read_miss_counts), the stand-in's are in its
+#       own file, and any other sync of these cases is a violation like anywhere
+#       else. A PS of the padded contract costs DynamicEmb nothing: cache_dps*,
+#       host_dps run the in-tree storage as the device-resident PS and are measured
+#       at zero.
 #   I3  DEMB_DETERMINISM_MODE (*_determ) in the training scenarios: the wave
-#       loop of a deterministic insert needs host counts and the miss path is
-#       gated by one blocking read in that mode.
+#       loop of a deterministic insert needs host counts, and so does the drop of
+#       the reserved keys in front of it. The miss gate does not depend on the mode,
+#       so a step that missed nothing still runs its inserts on inert rows and pays
+#       those reads: two in a cache layout (storage and cache), one with HBM only.
 #   I4  table growth events (*_growth, *_noevict in the miss scenario, and the
 #       growth scenario): new buffers are sized on the host and
 #       ExtendableBuffer.extend / HostVMMTensor.extend synchronize the device.
@@ -107,26 +113,36 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 # is declared inherent.
 # --------------------------------------------------------------------------
 PS_STANDIN = "*test_batched_dynamic_embedding_tables_v2.py"
+# The innermost frame of the wait of ``sync_free.read_now``, the one audited read of the
+# package (see test_audited_reads.py): every read DynamicEmb makes for a participant that
+# is host-sized by its contract is a call site in this file.
+READ_NOW_SITE = "*sync_free.py"
 _GROWTH_WHY = (
     "table growth is an event: the new tables are sized on the host and the "
     "device is synchronized while values move (ExtendableBuffer.extend, "
     "HostVMMTensor.extend)"
 )
-_PS_WHY = (
+_PS_READ_WHY = (
     "external parameter server of the host-sized contract: its find / insert take "
     "tensors of exactly the number of live rows, so DynamicEmb reads that number once "
-    "per PS call (types._live_rows), and the stand-in itself reads CUDA tensors on the "
-    "host (PyDictStorage.find/insert)"
+    "per PS call (types._live_rows) and the number of misses once per step "
+    "(batched_dynamicemb_function._read_miss_counts), both through sync_free.read_now"
+)
+_PS_STANDIN_WHY = (
+    "the stand-in of that parameter server reads CUDA tensors on the host "
+    "(PyDictStorage.find/insert): its own code, not DynamicEmb's"
 )
 _DETERM_WHY = (
     "DEMB_DETERMINISM_MODE: the wave count of a deterministic insert is a host "
-    "loop bound, and the miss path is gated by one blocking read in this mode"
+    "loop bound"
 )
 INHERENT: Dict[Tuple[str, ...], str] = {
     ("*", "growth"): _GROWTH_WHY,
     ("*_growth", "miss"): _GROWTH_WHY,
     ("*_noevict", "miss"): _GROWTH_WHY,
-    ("cache_ps*", "*"): _PS_WHY,
+    # call-site level: the rest of these cases has to read nothing
+    ("cache_ps*", "*", READ_NOW_SITE): _PS_READ_WHY,
+    ("cache_ps*", "*", PS_STANDIN): _PS_STANDIN_WHY,
 }
 for _scenario in ("all_hit", "miss", "miss_evict", "tier2_hit"):
     INHERENT[("*_determ", _scenario)] = _DETERM_WHY
@@ -1509,7 +1525,7 @@ def run_case(
     res["seconds"] = round(time.time() - t0, 2)
     res["inherent"] = inherent_reason(cfg.name, scenario)
     sg = inherent_site_globs(cfg.name, scenario)
-    res["inherent_sites"] = sg[0][1] if sg else None
+    res["inherent_sites"] = "; ".join(why for _, why in sg) if sg else None
     return res
 
 
@@ -1811,6 +1827,18 @@ def inherent_site_globs(config: str, scenario: str) -> List[Tuple[str, str]]:
         ):
             out.append((key[2], why))
     return out
+
+
+def allocations_excused(config: str, scenario: str) -> bool:
+    """Whether the cudaMalloc / cudaFree events of the case are not bounded (see
+    test_sync_ratchet.py): the case is excused as a whole (a growth event allocates by
+    design), or part of it is the code of a stand-in. A stand-in that keeps device tensors
+    in a Python dict grows the allocator in steady state, and an allocation has no call
+    site to excuse it by, so such a case is excused here as it was when it was one whole.
+    """
+    return bool(
+        inherent_reason(config, scenario) or inherent_site_globs(config, scenario)
+    )
 
 
 def _git_info(root: str) -> str:

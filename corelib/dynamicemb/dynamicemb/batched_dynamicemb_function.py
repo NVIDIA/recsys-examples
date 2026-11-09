@@ -626,7 +626,10 @@ def _prefetch_cache_path_masked(
                 # An earlier chunk's insert into storage may have evicted a key this
                 # chunk found there, and handed its row to the key that evicted it:
                 # loading the old row would copy another key's value. Look the rows up
-                # again, as storage is now (const: no score changes).
+                # again, as storage is now (const: no score changes). A key that is gone
+                # is asked of the tier below, which has it (the insert spilled it); with
+                # none it is new to this step and initialized afresh, where the unchunked
+                # step returns its trained row (DynamicEmb_APIs.md, Chunked miss path).
                 r = _find_keys(
                     storage._state, keys_c, ids_c, const_lookup=True, compact=False
                 )
@@ -844,9 +847,8 @@ def _prefetch_hbm_direct_path_masked(
     key is replaced by the reserved all-ones key, which the table kernels skip
     without reading its table id, or its slot and row stay -1, which the load,
     store and counter kernels skip. Nothing here blocks on a count from the
-    device, except for the miss gate: in mode ``read`` it waits for the number
-    of misses, to decide whether the path is launched at all (``poll`` only takes
-    a count that has already landed, ``always`` does not look at one).
+    device. The miss gate decides whether the path is launched at all: ``poll``
+    only takes a count that has already landed, ``always`` does not look at one.
 
     The lookup and the pin of every hit are done once for the whole batch; the miss
     path, which allocates ``[rows, value_dim]`` buffers, runs in consecutive row chunks
@@ -861,10 +863,9 @@ def _prefetch_hbm_direct_path_masked(
     the optional ``accumulated_frequency`` and ``key_scores`` have one entry per
     row; a table kernel reads a lane's score before it looks at its key.
 
-    Returns ``(slot_indices, non_admitted_mask, value_row_indices)`` like the
-    host-sized form, except that the refused keys are a bool mask over the rows
-    (``True``: refused) and not their positions. The mask is ``None`` without an
-    admitter, and when the miss path did not run.
+    Returns ``(slot_indices, non_admitted_mask, value_row_indices)``: the refused keys
+    are a bool mask over the rows (``True``: refused), not their positions. The mask is
+    ``None`` without an admitter, and when the miss path did not run.
     """
     with torch.cuda.nvtx.range("_prefetch_hbm_direct_path"):
         storage, _ = _participants(StorageMode.HBM_DIRECT, None, storage, None)
@@ -1081,14 +1082,12 @@ def dynamicemb_prefetch(
 
     ``table_key_bounds`` (CPU int64, one per table) is what the caller knows, without
     the device, of how many keys each table's part of the batch can have: the key
-    counts of its features. A group that does not read the dedup count back (the
-    mask form) sizes the growth of the storage from it, and bounds every table by
-    the whole batch when it is not given. A group that reads the count anyway (the
-    host-sized form) has the exact number of unique keys per table, which is never
-    above the bound, and uses that.
+    counts of its features. The growth of the storage is sized from it (the exact number
+    of unique keys per table is on the device and is never read), and every table is
+    bounded by the whole batch when it is not given.
 
-    The unique arrays of the mask form are as long as ``indices``, not as the number
-    of unique keys, which only the device knows; see ``segmented_unique`` and
+    The unique arrays are as long as ``indices``, not as the number of unique keys,
+    which only the device knows; see ``segmented_unique`` and
     ``PrefetchState.unique_valid``.
     """
     with torch.cuda.nvtx.range("dynamicemb_prefetch"):
@@ -1329,6 +1328,11 @@ def dynamicemb_eval_forward(
             unique_indices, unique_table_ids, table_num
         )
 
+        sf.warn_if_unchunked_over_budget(
+            unique_indices.numel(),
+            storage.max_embedding_dim() * emb_dtype.itemsize,
+            "the unique rows of a pooled evaluation",
+        )
         unique_embs = eval_lookup(
             storage,
             unique_indices,
@@ -1390,7 +1394,7 @@ def _generic_forward_path_masked(
     Returns (unique_values, persisted_mask). ``persisted_mask`` is the bool
     mask over the unique rows of the keys ``storage`` holds after this forward
     (lookup hit or admitted insert), which the backward re-inserts: never true
-    for padding. ``None`` (only for exact arrays, ``valid=None``) means every
+    for padding. ``None`` (only when every row is real, ``valid=None``) means every
     row is.
     """
     with torch.cuda.nvtx.range("_generic_forward_path"):
@@ -1399,6 +1403,11 @@ def _generic_forward_path_masked(
         # that serves its find / insert after one read of the live rows per call.
         storage, _ = _participants(StorageMode.DEFAULT, None, storage, None)
         n, device = unique_keys.numel(), unique_keys.device
+        sf.warn_if_unchunked_over_budget(
+            n,
+            max_val_dim * emb_dtype.itemsize,
+            "the value block of a forward over a host or hybrid storage",
+        )
         unique_values = torch.empty(n, max_val_dim, dtype=emb_dtype, device=device)
         if n == 0:
             return unique_values, None

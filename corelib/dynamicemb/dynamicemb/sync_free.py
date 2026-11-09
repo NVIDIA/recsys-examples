@@ -78,19 +78,29 @@ PADDED_OPT_SKIPS_NEGATIVE: bool = _extension_flag(
     "padded_optimizer_skips_negative_table_id"
 )
 
-# How a step decides whether its miss path has to run:
-#   "read":   one blocking read of the miss count;
-#   "poll":   skip it only when a non-blocking copy already landed a zero;
-#   "always": launch it every step and read nothing.
+# How a step decides whether its miss path has to run. Neither mode waits for the GPU:
+#   "always": launch it every step and read nothing;
+#   "poll":   skip it only when a non-blocking copy already landed a zero.
 # "always" is the default: a step whose keys all hit runs the miss path on inert rows,
 # which changes nothing, and the CPU never waits for the GPU. DYNAMICEMB_MISS_PATH_GATE
-# selects another mode, and an external storage or determinism mode use "read".
-_MISS_GATE_MODES = ("always", "poll", "read")
+# selects the other. Nothing else does: neither the storage, an external one included, nor
+# the determinism mode. What a class that counts its own rows reads is its contract
+# (types.OldContractStorage), not the gate's.
+_MISS_GATE_MODES = ("always", "poll")
 _DEFAULT_MISS_GATE = "always"
 
 
 def _miss_gate_from_env() -> str:
     mode = (os.environ.get("DYNAMICEMB_MISS_PATH_GATE") or _DEFAULT_MISS_GATE).lower()
+    if mode == "read":
+        # A mode of the first masked paths, which blocked on the count of misses. A
+        # script that still asks for it keeps running, without the wait.
+        warnings.warn(
+            "DYNAMICEMB_MISS_PATH_GATE=read was removed: no miss-gate mode waits for the "
+            f"GPU any more ({', '.join(_MISS_GATE_MODES)}); using {_DEFAULT_MISS_GATE!r}.",
+            stacklevel=2,
+        )
+        return _DEFAULT_MISS_GATE
     if mode not in _MISS_GATE_MODES:
         raise ValueError(
             "DYNAMICEMB_MISS_PATH_GATE must be one of "
@@ -128,6 +138,28 @@ BUFFER_BYTES: int = _buffer_bytes_from_env()
 # time, never an environment variable). 0 and None leave the budget in charge.
 CHUNK_ROWS: Optional[int] = None
 _WARNED_SMALL_CHUNK = False
+# Buffers that are not split into chunks and were named once as over the budget.
+_WARNED_UNCHUNKED: set = set()
+
+# Variables of the first masked paths that nothing reads any more. A script that still sets
+# one gets a warning and nothing else: no variable selects a path that reads.
+_RETIRED_VARIABLES = {
+    "DYNAMICEMB_SYNC_FREE": "a kill switch that sent every lookup down the paths that read "
+    "counts from the device is gone, no variable selects such a path",
+    "DYNAMICEMB_SYNC_FREE_MAX_BYTES": "the budget is DYNAMICEMB_MISS_PATH_BUFFER_BYTES now, "
+    "and a batch over it is split into chunks, not sent down another path",
+}
+
+
+def _warn_retired_variables() -> None:
+    for name, what in _RETIRED_VARIABLES.items():
+        if os.environ.get(name) is not None:
+            warnings.warn(
+                f"{name} is not read any more: {what}.", UserWarning, stacklevel=3
+            )
+
+
+_warn_retired_variables()
 
 # Number of read_now calls so far; tests snapshot it to assert how many blocking
 # reads a step costs.
@@ -324,6 +356,10 @@ def compact_by_count(
     read (``read_now``) from the same mask. A stable sort brings the selected
     rows to the front, so there is no ``nonzero`` and no boolean-mask index. A
     ``None`` array stays ``None``.
+
+    Not dead code: the adapters of a participant that is host-sized by its contract
+    compact with it (``types._live_rows``, ``initialize_masked(dense=True)``, and through
+    ``_live_rows`` ``OldContractStorage`` and ``embedding_admission.admit_padded``).
     """
     selected_first = torch.sort(mask.to(torch.int8), descending=True, stable=True)
     order = selected_first.indices[:count]
@@ -352,6 +388,34 @@ def row_chunks(n: int, row_bytes: int, buffers: int = 2) -> List[Tuple[int, int]
             UserWarning,
         )
     return [(start, min(start + rows, n)) for start in range(0, n, rows)]
+
+
+def warn_if_unchunked_over_budget(
+    n: int, row_bytes: int, what: str, buffers: int = 2
+) -> None:
+    """Say, once per ``what`` and process, that a buffer that is not split into chunks is
+    over the budget: ``n`` rows of ``row_bytes`` (``buffers`` of them, as ``row_chunks``
+    counts).
+
+    Evaluation allocates the unique rows of a pooled lookup, and a DEFAULT-mode forward
+    its value block, with one row per key of the batch, duplicates included: they cannot
+    run in chunks (the gather that follows would have to accumulate across them), so
+    ``DYNAMICEMB_MISS_PATH_BUFFER_BYTES`` does not bound them, and a batch that fits no
+    longer sends them down a path of their own. The caller says so before it allocates,
+    so that an allocation that fails has its cause named. Pure host arithmetic: nothing
+    is read, and nothing changes but the warning.
+    """
+    if buffers * n * row_bytes <= BUFFER_BYTES or what in _WARNED_UNCHUNKED:
+        return
+    _WARNED_UNCHUNKED.add(what)
+    warnings.warn(
+        f"{what} holds {n} rows of {row_bytes} bytes at once ({buffers} such buffers are "
+        f"over DYNAMICEMB_MISS_PATH_BUFFER_BYTES={BUFFER_BYTES}). It has one row per key of "
+        "the batch, duplicates included, and is not split into chunks, so that budget does "
+        "not bound it: if the allocation fails, send fewer keys per step.",
+        UserWarning,
+        stacklevel=2,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -666,18 +730,14 @@ class StagedUpload:
 # ---------------------------------------------------------------------------
 
 
-def miss_gate_mode(rng: bool, ps: bool = False) -> str:
-    """How this step decides whether to launch its miss path: always, poll or read.
+def miss_gate_mode(rng: bool) -> str:
+    """How this step decides whether to launch its miss path: always or poll.
 
-    "read" under determinism mode, which already syncs and must not run its wave
-    loop for nothing, and with an external parameter server, which needs the count
-    anyway. Otherwise ``MISS_GATE``, except that "poll" becomes "always" when the
-    miss path draws random numbers (``rng``): a seeded probabilistic admitter must
-    not consume a timing-dependent number of draws, while "read" is exact and so
-    reproducible.
+    ``MISS_GATE``, except that "poll" becomes "always" when the miss path draws random
+    numbers (``rng``): a seeded probabilistic admitter must not consume a
+    timing-dependent number of draws. Nothing else decides it, not the storage and not
+    the determinism mode.
     """
-    if ps or os.environ.get("DEMB_DETERMINISM_MODE") is not None:
-        return "read"
     if rng and MISS_GATE == "poll":
         return "always"
     return MISS_GATE
@@ -688,7 +748,7 @@ _Pending = Optional[Tuple[_Ticket, torch.Tensor]]
 
 
 class MissGate:
-    """Decides whether a step's miss path has to be launched.
+    """Decides whether a step's miss path has to be launched, without waiting for the GPU.
 
     One per table state; it owns its ring. The decision never changes a result:
     a miss path that finds no miss is a no-op, so a skipped launch only saves work.
@@ -697,37 +757,26 @@ class MissGate:
     def __init__(self) -> None:
         self.ring = DeferredRead((1,), torch.int64, slots=4)
 
-    def begin(
-        self, is_miss: torch.Tensor, *, rng: bool = False, ps: bool = False
-    ) -> _Pending:
+    def begin(self, is_miss: torch.Tensor, *, rng: bool = False) -> _Pending:
         """Start counting the misses of ``is_miss`` (bool[N]) for ``needed``.
 
-        Returns what ``needed`` takes: None for "always" (no device work),
-        otherwise ``(ticket, count)``, the ticket being None for "read". Call it
-        as early as possible, right after the mask exists, so a polled count has
-        time to land.
+        Returns what ``needed`` takes: None for "always" (no device work) or when
+        the ring has no free slot (nothing to poll, so the miss path simply runs),
+        otherwise ``(ticket, count)``. Call it as early as possible, right after the
+        mask exists, so a polled count has time to land.
         """
-        mode = miss_gate_mode(rng, ps)
-        if mode == "always":
+        if miss_gate_mode(rng) == "always":
             return None
         count = is_miss.sum().reshape(1)
-        if mode == "poll":
-            ticket = self.ring.enqueue(count)
-            # No free slot: nothing to poll, so the miss path simply runs.
-            return None if ticket is None else (ticket, count)
-        return (None, count)
+        ticket = self.ring.enqueue(count)
+        return None if ticket is None else (ticket, count)
 
     def needed(self, pending: _Pending) -> bool:
-        """True when the miss path has to be launched.
-
-        "read" blocks on the count. "poll" answers False only if the count has
-        landed and is zero, so a late copy costs a launch, never a result.
-        """
+        """True when the miss path has to be launched: unless a polled count that has
+        already landed is zero. A late copy costs a launch, never a result."""
         if pending is None:
             return True
-        ticket, count = pending
-        if ticket is None:
-            return _first_int(read_now(count)[0]) != 0
+        ticket, _ = pending
         landed_zero = (
             self.ring.ready(ticket) and _first_int(self.ring.value(ticket)) == 0
         )
