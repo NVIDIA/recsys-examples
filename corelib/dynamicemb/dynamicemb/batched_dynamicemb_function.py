@@ -229,6 +229,13 @@ def _slots_after_rehash(
     prefetch did not admit stays without a slot. Value rows do not move: a
     storage keeps each key's row through a rehash, and a cache does not
     rehash."""
+    # Only a table that stores a row per key keeps its value rows through a
+    # rehash (``use_rows_``). Without it the row is the slot and the value moves
+    # with the key, so ``value_row_indices`` would go stale too: not handled here.
+    assert state.key_index_map.use_rows_, (
+        "a rehash since the prefetch is only handled for a table that stores a "
+        "value row per key (DynamicEmbStorage); a cache does not rehash"
+    )
     slots = _find_keys(
         state, unique_keys, unique_table_ids, const_lookup=True, return_slots=True
     )[-1]
