@@ -40,6 +40,11 @@ coordinator subprocess, and runs the in-process DynamicEmb delta producers.
 The NVHashMap host caches are empty when loaded and are populated by inference;
 their contents are not exported.
 
+For an orchestrator that sends the same update payload to independent AOTI
+inference processes, each owning its own Subscriber, see the
+[deployment-separated demo](deployment_separated/README.md). It reuses this
+example's data and checks while keeping the original workflow unchanged.
+
 This example uses unpooled lookup, supported from 26.06 in the modern path.
 Pooled collections require 26.07+ (or legacy 26.05); Host collections require
 26.09+. See [NVE compatibility and rebuild requirements](../../docs/nve_tier_updates.md).
