@@ -211,7 +211,8 @@ class DynamicEmbScoreStrategy(enum.IntEnum):
 
     dynamicemb allows configuring scores by table.
     For a table, the scores in the subsequent forward passes are larger than those in the previous ones for modes TIMESTAMP and STEP.
-    Users can also provide customized score(mode CUSTOMIZED) for each table's forward pass.
+    Users can also provide customized score(mode CUSTOMIZED) for each table's forward pass,
+    or a score for every key (mode PRECISE_CUSTOMIZED).
     Attributes
     ----------
     TIMESTAMP:
@@ -227,8 +228,22 @@ class DynamicEmbScoreStrategy(enum.IntEnum):
         Users have to set the score before every forward pass using `set_score` interface.
     LFU:
         If there are not enough slots inside the bucket to store new keys, the least used key in the bucket will be evicted.
+    PRECISE_CUSTOMIZED:
+        Like CUSTOMIZED, but every key has a score of its own instead of one score per table: the module is
+        called with a `ScoredKeyedJaggedTensor`, whose `scores` hold an int64 for each key, and a key's score
+        is the one it came with. Users must not set scores with `set_score` under this mode.
+        A key that repeats in a batch takes the largest of its scores; a later batch assigns, so the latest
+        score of a key wins. While training the input must be a `ScoredKeyedJaggedTensor`; evaluation reads
+        no score and takes either kind. Row-wise sharding only; no `admit_strategy`; no variable batch size
+        per key; no HybridStorage. May be combined with NO_EVICTION as `(NO_EVICTION, PRECISE_CUSTOMIZED)`.
+        Within one collection either every table uses it or none does, and a collection that does holds
+        DynamicEmb tables only.
     NO_EVICTION:
         The table’s capacity doubles whenever there are not enough slots for new keys, and this continues until available memory is exhausted.
+        Alone it keeps no score; it may be combined with CUSTOMIZED or PRECISE_CUSTOMIZED as `(NO_EVICTION, CUSTOMIZED)`.
+        With such a combination do not use a score of 0: an erased key's slot is cleared to 0, and a full bucket gives up
+        the slot with the smallest score, so a key scored 0 ties with an erased slot and can be the one given up.
+        Incremental dump and replay are not supported for such tables.
         When the memory resources are insufficient, there will be a warning message, and training can continue but the accuracy of eviction cannot be guaranteed.
     """
 
@@ -237,6 +252,7 @@ class DynamicEmbScoreStrategy(enum.IntEnum):
     CUSTOMIZED = 2
     LFU = 3
     NO_EVICTION = 4
+    PRECISE_CUSTOMIZED = 5
 
 
 # A score strategy is either a single :class:`DynamicEmbScoreStrategy` or a
@@ -246,15 +262,54 @@ class DynamicEmbScoreStrategy(enum.IntEnum):
 # eviction ranking. The user's tuple order is the *logical* order that
 # checkpoints are written in; the on-device *physical* layout stays fixed (see
 # :func:`get_physical_score_order`). The tuple form keeps the interface open for
-# future combinations; only ``(TIMESTAMP, LFU)`` (in either order) is supported
-# for now.
+# future combinations; only ``(TIMESTAMP, LFU)``, ``(NO_EVICTION, CUSTOMIZED)`` and
+# ``(NO_EVICTION, PRECISE_CUSTOMIZED)`` (in either order) are supported for now.
 ScoreStrategy = Union[DynamicEmbScoreStrategy, Tuple[DynamicEmbScoreStrategy, ...]]
 
 # Supported compound strategies, as unordered element sets. Both orderings of a
 # supported set are accepted; only the checkpoint column order differs.
 SUPPORTED_COMPOUND_SCORE_STRATEGIES: Tuple[frozenset, ...] = (
     frozenset({DynamicEmbScoreStrategy.TIMESTAMP, DynamicEmbScoreStrategy.LFU}),
+    # NO_EVICTION is a mode rather than a score: the table never evicts and grows
+    # instead. Alone it keeps no score; with CUSTOMIZED the score is CUSTOMIZED's.
+    frozenset(
+        {DynamicEmbScoreStrategy.NO_EVICTION, DynamicEmbScoreStrategy.CUSTOMIZED}
+    ),
+    frozenset(
+        {
+            DynamicEmbScoreStrategy.NO_EVICTION,
+            DynamicEmbScoreStrategy.PRECISE_CUSTOMIZED,
+        }
+    ),
 )
+
+
+def has_no_eviction(score_strategy: "ScoreStrategy") -> bool:
+    """Whether the table never evicts: ``NO_EVICTION`` alone, or in a compound."""
+    if isinstance(score_strategy, tuple):
+        return DynamicEmbScoreStrategy.NO_EVICTION in score_strategy
+    return score_strategy == DynamicEmbScoreStrategy.NO_EVICTION
+
+
+def get_score_part(score_strategy: "ScoreStrategy") -> Optional["ScoreStrategy"]:
+    """The part of *score_strategy* that decides the stored score, without the
+    no-eviction mode: ``None`` for ``NO_EVICTION`` alone (no score is kept),
+    ``CUSTOMIZED`` for ``(NO_EVICTION, CUSTOMIZED)``, anything else unchanged."""
+    if not has_no_eviction(score_strategy):
+        return score_strategy
+    if not isinstance(score_strategy, tuple):
+        return None
+    rest = tuple(s for s in score_strategy if s != DynamicEmbScoreStrategy.NO_EVICTION)
+    return rest[0] if len(rest) == 1 else rest
+
+
+def takes_score_per_key(score_strategy: Optional["ScoreStrategy"]) -> bool:
+    """Whether the table takes a score for every key from its input: its score
+    strategy, without the no-eviction mode, is ``PRECISE_CUSTOMIZED``."""
+    return (
+        score_strategy is not None
+        and get_score_part(score_strategy) == DynamicEmbScoreStrategy.PRECISE_CUSTOMIZED
+    )
 
 
 def normalize_score_strategy(score_strategy: ScoreStrategy) -> ScoreStrategy:
@@ -267,7 +322,8 @@ def normalize_score_strategy(score_strategy: ScoreStrategy) -> ScoreStrategy:
     A single :class:`DynamicEmbScoreStrategy` is returned unchanged. A one-element
     tuple ``(X,)`` is unwrapped to the single strategy ``X`` (a single score column
     has no ordering to preserve). A multi-element tuple must form a supported
-    compound set (currently only ``{TIMESTAMP, LFU}``) and is returned as a tuple.
+    compound set (``{TIMESTAMP, LFU}``, ``{NO_EVICTION, CUSTOMIZED}`` or
+    ``{NO_EVICTION, PRECISE_CUSTOMIZED}``) and is returned as a tuple.
 
     Raises
     ------
@@ -327,7 +383,13 @@ def get_eviction_score_strategy(
     """
     if isinstance(score_strategy, tuple):
         non_timestamp = [
-            s for s in score_strategy if s != DynamicEmbScoreStrategy.TIMESTAMP
+            s
+            for s in score_strategy
+            if s
+            not in (
+                DynamicEmbScoreStrategy.TIMESTAMP,
+                DynamicEmbScoreStrategy.NO_EVICTION,
+            )
         ]
         # Supported compounds always contain exactly one non-TIMESTAMP element.
         return non_timestamp[0] if non_timestamp else DynamicEmbScoreStrategy.TIMESTAMP
@@ -355,8 +417,14 @@ def get_physical_score_order(
     A single strategy occupies one word. The compound ``{TIMESTAMP, LFU}`` maps to
     the underlying ``LruLfu`` policy whose physical layout is always
     ``(TIMESTAMP, LFU)`` -- word 0 is the last-access timestamp, word 1 the
-    frequency -- regardless of the user's configured (logical) order.
+    frequency -- regardless of the user's configured (logical) order. The
+    no-eviction mode stores no word of its own: ``NO_EVICTION`` alone keeps one
+    unused word, and in a compound the layout is that of the other strategy.
     """
+    part = get_score_part(score_strategy)
+    if part is None:
+        return (DynamicEmbScoreStrategy.NO_EVICTION,)
+    score_strategy = part
     if isinstance(score_strategy, tuple):
         if frozenset(score_strategy) == frozenset(
             {DynamicEmbScoreStrategy.TIMESTAMP, DynamicEmbScoreStrategy.LFU}
@@ -377,6 +445,7 @@ def score_dump_permutation(score_strategy: ScoreStrategy) -> List[int]:
     strategies and for compounds whose logical order already matches the physical
     layout.
     """
+    score_strategy = get_score_part(score_strategy)
     if not isinstance(score_strategy, tuple):
         return [0]
     physical = get_physical_score_order(score_strategy)
@@ -391,6 +460,7 @@ def score_load_permutation(score_strategy: ScoreStrategy) -> List[int]:
     ``logical[:, perm]``, where ``perm[p]`` is the logical column holding the strategy
     stored at physical word ``p``.
     """
+    score_strategy = get_score_part(score_strategy)
     if not isinstance(score_strategy, tuple):
         return [0]
     physical = get_physical_score_order(score_strategy)
@@ -463,6 +533,9 @@ class DynamicEmbTableOptions:
         High-bandwidth memory allocated for local values, in bytes. Default is 0.
         With ``DynamicEmbeddingShardingPlanner``, this is set to
         ``ceil(global_hbm_for_values / world_size)`` per rank.
+        A value of zero also turns ``caching`` off for the table, with a
+        warning -- a cache is an HBM tier the table has no budget for (see
+        :func:`normalize_caching_against_hbm_budget`).
     device_id : Optional[int], optional
         CUDA device index.
     training: bool
@@ -495,6 +568,11 @@ class DynamicEmbTableOptions:
             set **`caching=True`** will create a GPU table and a host table, and make GPU table serves as a cache;
             set **`caching=False`** will create a hybrid table which use GPU and host memory in a concatenated way to store value.
             All keys and other meta data are always stored on GPU for both cases.
+        A table whose resolved ``local_hbm_for_values`` is zero has caching
+        turned off, with a warning, at plan/construction time: a cache is an
+        HBM tier, and without a budget it would be a single bucket whose
+        overflow cannot absorb a batch's admitted keys. See
+        :func:`normalize_caching_against_hbm_budget`.
     init_capacity : Optional[int], optional
         The initial capacity of the table. If not set, it defaults to max_capacity after sharding.
         If `init_capacity` is provided, it will serve as the initial table capacity on a single GPU.
@@ -723,6 +801,17 @@ class DynamicEmbTableOptions:
                 "strategy (TIMESTAMP, LFU) in either order; got "
                 f"score_strategy={self.score_strategy}."
             )
+        if self.takes_score_per_key and self.admit_strategy is not None:
+            raise ValueError(
+                "score_strategy PRECISE_CUSTOMIZED cannot be combined with "
+                "admit_strategy: both are decided per key from the input, and a "
+                "key's score is not its occurrence count."
+            )
+
+    @property
+    def takes_score_per_key(self) -> bool:
+        """Whether the table takes a score for every key from its input."""
+        return takes_score_per_key(self.score_strategy)
 
     def __eq__(self, other):
         if not isinstance(other, DynamicEmbTableOptions):
@@ -760,6 +849,43 @@ class DynamicEmbTableOptions:
     def __hash__(self):
         group_keys = self.get_grouped_key()
         return hash(tuple(group_keys.items()))
+
+
+def normalize_caching_against_hbm_budget(
+    options: "DynamicEmbTableOptions", *, label: str = ""
+) -> bool:
+    """Take ``caching`` off a table whose resolved HBM value budget is zero.
+
+    A cache is an HBM tier: with no budget the runtime would build the table a
+    single-bucket cache whose finite overflow cannot absorb a batch's admitted
+    keys, which the prefetch path assumes it can. The table goes to the
+    non-caching host / external-storage paths instead.
+
+    This runs before ``caching`` is read for anything else: the field is part
+    of the grouping key (:meth:`DynamicEmbTableOptions.get_grouped_key`), so a
+    change here decides which tables fuse, and the planner's cost model
+    (:func:`get_group_value_bytes_by_tier`) reads the same field. The planner
+    calls it once ``local_hbm_for_values`` is resolved from
+    ``global_hbm_for_values``; direct construction calls it on the options as
+    given, where a positive ``local_hbm_for_values`` keeps caching however
+    ``global_hbm_for_values`` is set.
+
+    Returns whether it disabled ``caching``. Mutates ``options``.
+    """
+    if options.caching and options.local_hbm_for_values <= 0:
+        options.caching = False
+        prefix = f"DynamicEmb table {label}: " if label else "DynamicEmb table: "
+        warnings.warn(
+            prefix + "caching=True with a local_hbm_for_values of zero. A cache is an "
+            "HBM tier: without a budget the table would hold a single bucket "
+            "whose overflow cannot absorb a batch's admitted keys. Disabling "
+            "caching for this table; it will use the non-caching host or "
+            "external-storage paths instead. Set caching=False or a positive "
+            "local_hbm_for_values to silence this warning.",
+            UserWarning,
+        )
+        return True
+    return False
 
 
 def data_type_to_dyn_emb(data_type: DataType) -> DynamicEmbDataType:
@@ -1013,15 +1139,19 @@ def get_group_value_bytes_by_tier(
 ) -> Tuple[int, int]:
     """What one rank spends on a set of tables the runtime will fuse, as ``(hbm, host)``.
 
-    The runtime decides per **grouped module**, not per table:
+    The runtime chooses the layout per **grouped module**, not per table:
     ``BatchedDynamicEmbeddingTablesV2._create_cache_storage`` sums both the
-    tables' bytes and their ``local_hbm_for_values`` and takes one
-    HBM-or-host decision for the sum. That is not the same as deciding for each
-    table and adding up, because a table whose budget exceeds its size lends the
-    remainder to its groupmates: ``sum(min(total, budget))`` is at most
+    tables' bytes and their ``local_hbm_for_values``, and a group whose rows fit
+    the summed budget is HBM_ONLY. There a table whose budget exceeds its size
+    covers its groupmates: ``sum(min(total, budget))`` is at most
     ``min(sum total, sum budget)``, so counting per table **under-states HBM**
     and over-states host. Under-stating HBM is the unsafe direction -- the
     planner would believe there is room it will not find.
+
+    A group that does not fit splits each table on its own budget: table *i*
+    keeps ``min(total_i, budget_i)`` of its bytes in HBM, and a spare budget is
+    not lent to the others. Charging the summed budget there would over-state
+    HBM by the spare and under-state the host tier by as much.
 
     ``caching`` and ``external_storage`` are both part of the grouping key
     (``DynamicEmbTableOptions.get_grouped_key``), so every member of a real
@@ -1048,21 +1178,28 @@ def get_group_value_bytes_by_tier(
 
     total = 0
     hbm_budget = 0
+    # What the tables keep in HBM when the group does not fit: each its own
+    # budget, up to its own size.
+    hbm_kept = 0
     for options, optimizer_type in members:
-        hbm_budget += options.local_hbm_for_values
+        budget = options.local_hbm_for_values
+        hbm_budget += budget
         dim = options.dim
         dtype = options.embedding_dtype
         if not dim or dtype is None or not options.max_capacity:
             # Nothing to size from: count it as filling its own budget, so a
             # lone unsized table still reports (budget, 0).
-            total += options.local_hbm_for_values
+            total += budget
+            hbm_kept += budget
             continue
         state_dim = (
             get_optimizer_state_dim(optimizer_type, dim, dtype)
             if optimizer_type is not None
             else 0
         )
-        total += options.max_capacity * DTYPE_NUM_BYTES[dtype] * (dim + state_dim)
+        table_bytes = options.max_capacity * DTYPE_NUM_BYTES[dtype] * (dim + state_dim)
+        total += table_bytes
+        hbm_kept += min(table_bytes, budget)
 
     first = members[0][0]
     caching = first.caching
@@ -1076,10 +1213,10 @@ def get_group_value_bytes_by_tier(
     # a 20 GiB budget cost 20 + 4 where the runtime spends 4 and nothing.
     if total > hbm_budget:
         if caching:
-            return hbm_budget, 0 if external else total
+            return hbm_kept, 0 if external else total
         if external and hbm_budget <= 0:
             return 0, 0
-        return hbm_budget, total - hbm_budget
+        return hbm_kept, total - hbm_kept
     return total, 0
 
 

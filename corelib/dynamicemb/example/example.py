@@ -24,6 +24,7 @@ from dynamicemb import (
     DynamicEmbTableOptions,
     FrequencyAdmissionStrategy,
     KVCounter,
+    erase_by_score_async,
     get_sharded_table_capacity,
     get_table_value_bytes,
 )
@@ -191,6 +192,24 @@ def parse_args():
     )
 
     parser.add_argument(
+        "--erase_interval",
+        type=int,
+        default=0,
+        help="With --train or --dump: every N batches, ask for an erase_by_score_async "
+        "of the keys not seen for --erase_retention (0, the default, disables it). "
+        "It runs in the background of training. Needs --score_strategy step or "
+        "timestamp, and cannot be combined with --external_storage or "
+        "--incremental_dump.",
+    )
+    parser.add_argument(
+        "--erase_retention",
+        type=int,
+        default=1000,
+        help="With --erase_interval: how long a key is kept without being seen -- "
+        "batches when --score_strategy is step, seconds when it is timestamp.",
+    )
+
+    parser.add_argument(
         "--data_path",
         type=str,
         default="./ml-1m",
@@ -245,6 +264,23 @@ def parse_args():
     args = parser.parse_args()
     if args.num_workers < 0:
         parser.error("--num_workers must be >= 0")
+    if args.erase_interval < 0:
+        parser.error("--erase_interval must be >= 0")
+    if args.erase_interval > 0:
+        if args.erase_retention <= 0:
+            parser.error("--erase_retention must be > 0")
+        if args.score_strategy == "lru_lfu":
+            parser.error(
+                "--erase_interval needs --score_strategy step or timestamp: the "
+                "example erases by the tables' single score"
+            )
+        if args.external_storage:
+            parser.error("--erase_interval does not support --external_storage")
+        if args.incremental_dump:
+            parser.error(
+                "--erase_interval cannot be combined with --incremental_dump: an "
+                "erase by score is not recorded, so the deltas could not be replayed"
+            )
     return args
 
 
@@ -790,6 +826,29 @@ def create_model(args, runtime: RuntimeContext, training=True):
     return model
 
 
+def start_erase(model, args):
+    """Ask for an erase of the keys not seen for ``--erase_retention``, in the
+    background of the training; returns the handle, or None if there is nothing to
+    erase yet.
+
+    The threshold is read from the tables' own score: the step they are at, or the
+    device clock in nanoseconds. A key is erased when its score is below it.
+    """
+    scores = get_score(model)
+    if not scores:
+        return None
+    now = min(score for tables in scores.values() for score in tables.values())
+    if args.score_strategy == "step":
+        strategy = DynamicEmbScoreStrategy.STEP
+        threshold = now - args.erase_retention
+    else:
+        strategy = DynamicEmbScoreStrategy.TIMESTAMP
+        threshold = now - args.erase_retention * 10**9
+    if threshold <= 0:  # the run is younger than the retention: nothing is old enough
+        return None
+    return erase_by_score_async(model, strategy, threshold)
+
+
 def train_one_epoch(
     model,
     train_loader,
@@ -798,9 +857,13 @@ def train_one_epoch(
     epoch,
     total_epochs,
     runtime: RuntimeContext,
+    args=None,
 ):
     model.train()
     total_loss = 0
+    erase_interval = args.erase_interval if args is not None else 0
+    erase_handle = None
+    erased = spared = 0
 
     for batch_idx, (features, labels) in enumerate(train_loader):
         features = features.to(runtime.device)
@@ -815,13 +878,34 @@ def train_one_epoch(
 
         total_loss += loss.item()
 
+        if erase_interval > 0 and (batch_idx + 1) % erase_interval == 0:
+            if erase_handle is not None:
+                # One erase at a time: the previous one is finished before another
+                # starts, and what it removed is counted.
+                done_erased, done_spared = erase_handle.result()
+                erased, spared = erased + done_erased, spared + done_spared
+            erase_handle = start_erase(model, args)
+
         if batch_idx % 100 == 0:
             print(
                 f"Epoch {epoch+1}/{total_epochs}, Batch {batch_idx}/{len(train_loader)}, Loss: {loss.item():.4f}"
             )
 
+    if erase_handle is not None:
+        # An erase does not overlap a dump or an evaluation, which follow the epoch:
+        # wait for it here.
+        done_erased, done_spared = erase_handle.result()
+        erased, spared = erased + done_erased, spared + done_spared
     avg_loss = total_loss / len(train_loader)
     print(f"Epoch {epoch+1}/{total_epochs}, Average Loss: {avg_loss:.4f}")
+    if erase_interval > 0:
+        # This rank's: the call is local, each rank erases what it holds.
+        print(
+            f"Epoch {epoch+1}/{total_epochs}, rank {runtime.rank}: erased {erased} keys "
+            f"not seen for {args.erase_retention} "
+            f"{'batches' if args.score_strategy == 'step' else 'seconds'}, "
+            f"{spared} spared"
+        )
 
 
 def test_one_epoch(
@@ -864,7 +948,14 @@ def train(args, runtime: RuntimeContext):
     for epoch in range(args.epochs):
         train_sampler.set_epoch(epoch)
         train_one_epoch(
-            model, train_loader, optimizer, criterion, epoch, args.epochs, runtime
+            model,
+            train_loader,
+            optimizer,
+            criterion,
+            epoch,
+            args.epochs,
+            runtime,
+            args,
         )
         test_one_epoch(model, test_loader, criterion, epoch, args.epochs, runtime)
 
@@ -888,7 +979,14 @@ def dump(args, runtime: RuntimeContext):
     for epoch in range(args.epochs):
         train_sampler.set_epoch(epoch)
         train_one_epoch(
-            model, train_loader, optimizer, criterion, epoch, args.epochs, runtime
+            model,
+            train_loader,
+            optimizer,
+            criterion,
+            epoch,
+            args.epochs,
+            runtime,
+            args,
         )
 
         # ShardedDyanmicEmbeddingCollection.state_dict() will return a dummy tensor.

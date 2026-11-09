@@ -17,7 +17,7 @@ import os
 import random
 import shutil
 from itertools import product
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import click
 import torch
@@ -75,6 +75,13 @@ def idx_to_name(embedding_collection_idx: int, embedding_idx: int) -> Tuple[str,
     return (
         f"feature_{embedding_collection_idx}_{embedding_idx}",
         f"{TABLE_SCOPE}/{table_name}" if TABLE_SCOPE else table_name,
+    )
+
+
+def data_parallel_idx_to_name(embedding_collection_idx: int) -> Tuple[str, str]:
+    return (
+        f"data_parallel_feature_{embedding_collection_idx}",
+        f"data_parallel_table_{embedding_collection_idx}",
     )
 
 
@@ -300,7 +307,12 @@ def apply_dmp(
     cache_capacity_ratio: float = 0.5,
     admit_strategy: AdmissionStrategy = None,
     global_hbm_budget_scale: float = 1.0,
+    table_option_overrides: Optional[Dict[str, Dict[str, Any]]] = None,
+    data_parallel_table_names: Sequence[str] = (),
 ):
+    """``table_option_overrides`` maps a table name to ``DynamicEmbTableOptions``
+    fields that replace the ones every table otherwise shares, for a collection
+    whose tables are not configured alike."""
     eb_configs: List[EmbeddingConfig] = []
     for _, m in model.named_modules():
         if type(m) in TORCHREC_TYPES:
@@ -324,7 +336,7 @@ def apply_dmp(
         else:
             global_hbm = int(value_bytes * global_hbm_budget_scale)
 
-        dynamicemb_options_dict[eb_config.name] = DynamicEmbTableOptions(
+        option_kwargs = dict(
             global_hbm_for_values=global_hbm,
             score_strategy=score_strategy,
             dist_type=dist_type,
@@ -336,9 +348,13 @@ def apply_dmp(
             caching=caching,
             admit_strategy=admit_strategy,
         )
+        option_kwargs.update((table_option_overrides or {}).get(eb_config.name, {}))
+        dynamicemb_options_dict[eb_config.name] = DynamicEmbTableOptions(
+            **option_kwargs
+        )
     planner = get_planner(
         eb_configs,
-        {},
+        set(data_parallel_table_names),
         dynamicemb_options_dict,
         device,
     )
@@ -376,10 +392,29 @@ def create_model(
     cache_capacity_ratio: float = 0.5,
     admit_strategy: AdmissionStrategy = None,
     global_hbm_budget_scale: float = 1.0,
+    table_option_overrides: Optional[Dict[str, Dict[str, Any]]] = None,
+    data_parallel_table: bool = False,
 ):
     ebc_list = []
+    data_parallel_table_names = []
     for embedding_collection_id in range(num_embedding_collections):
         eb_configs = []
+        if data_parallel_table:
+            # A TorchRec table sharded data parallel, declared first. The
+            # collection then has two shardings, and this one comes first.
+            feature_name, table_name = data_parallel_idx_to_name(
+                embedding_collection_id
+            )
+            eb_configs.append(
+                EmbeddingConfig(
+                    name=table_name,
+                    embedding_dim=embedding_dim,
+                    num_embeddings=100,
+                    feature_names=[feature_name],
+                    data_type=DataType.FP32,
+                )
+            )
+            data_parallel_table_names.append(table_name)
         for embedding_id, num_embedding in enumerate(num_embeddings):
             feature_name, embedding_name = idx_to_name(
                 embedding_collection_id, embedding_id
@@ -414,6 +449,8 @@ def create_model(
         cache_capacity_ratio=cache_capacity_ratio,
         admit_strategy=admit_strategy,
         global_hbm_budget_scale=global_hbm_budget_scale,
+        table_option_overrides=table_option_overrides,
+        data_parallel_table_names=data_parallel_table_names,
     )
     return model
 

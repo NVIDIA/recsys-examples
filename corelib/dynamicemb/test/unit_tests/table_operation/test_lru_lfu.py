@@ -276,11 +276,15 @@ def _lru_lfu_storage(
 def _read_score_blocks(storage, keys, tids):
     """Look up keys and gather their full [N, num_scores] score blocks."""
     name = storage._state.score_policy.name
-    _, founds, idx = storage.key_index_map.lookup(
+    _, founds, _ = storage.key_index_map.lookup(
         keys, tids, ScoreArg(name=name, policy=ScorePolicy.CONST)
     )
     assert torch.all(founds), "all keys must be present"
-    return storage.key_index_map.gather_score_blocks(0, idx)
+    # Score blocks are keyed by slot, which is not what lookup reports for a
+    # table that stores a row per key.
+    return storage.key_index_map.gather_score_blocks(
+        0, storage.key_index_map.slots_of(keys, tids)
+    )
 
 
 @pytest.mark.parametrize(
@@ -717,7 +721,8 @@ def test_lru_lfu_custom_score_function_batched_v2(current_device):
             table.lookup(one, one_tid, _sa(one_val))
         torch.cuda.synchronize()
 
-    blk = table.gather_score_blocks(0, idx).cpu().numpy()
+    # Score blocks are keyed by slot; ``idx`` are rows for a table that stores them.
+    blk = table.gather_score_blocks(0, table.slots_of(keys, tids)).cpu().numpy()
     ts = blk[:, 0].astype(np.uint64)
     freq = blk[:, 1].astype(np.float64)
 

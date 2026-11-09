@@ -24,7 +24,10 @@ from commons.ops.triton_ops.common import (
 )
 from configs import HSTUConfig, InferenceHSTUConfig, RankingConfig
 from modules.hstu_block_inference import HSTUBlockInference
-from recsys_kvcache_manager.host_kvstorage_manager import HostKVTaskStatus
+from recsys_kvcache_manager.host_kvstorage_manager import (
+    HostKVBackend,
+    HostKVTaskStatus,
+)
 from recsys_kvcache_manager.kvcache_config import KVCacheConfig
 from recsys_kvcache_manager.kvcache_manager import KVCacheManager
 from recsys_kvcache_manager.kvcache_metadata import (
@@ -366,7 +369,8 @@ class InferenceDenseModule(torch.nn.Module):
                 onboard_handle is not None
                 and onboard_handle.handle is not None
                 and onboard_handle.status != HostKVTaskStatus.SKIPPED
-                and onboard_handle.backend == "flexkv"
+                and onboard_handle.backend == HostKVBackend.FLEXKV
+                and not onboard_handle.is_layerwise
             ):
                 torch.cuda.nvtx.range_push("recsys.kvcache.onboard_wait")
                 try:
@@ -374,32 +378,54 @@ class InferenceDenseModule(torch.nn.Module):
                 finally:
                     torch.cuda.nvtx.range_pop()
 
-            # num_tokens = batch.features.values().shape[0]
-            num_tokens = jagged_data.values.shape[0]
-            if self.use_cudagraph:
-                self._hidden_states[:num_tokens, ...].copy_(
-                    jagged_data.values, non_blocking=True
-                )
-                copy_jagged_metadata(self._jagged_metadata, jagged_data)
-                copy_kvcache_metadata(self._kvcache_metadata, kvcache_metadata)
+            hstu_error: Optional[BaseException] = None
+            try:
+                # num_tokens = batch.features.values().shape[0]
+                num_tokens = jagged_data.values.shape[0]
+                if self.use_cudagraph:
+                    self._hidden_states[:num_tokens, ...].copy_(
+                        jagged_data.values, non_blocking=True
+                    )
+                    copy_jagged_metadata(self._jagged_metadata, jagged_data)
+                    copy_kvcache_metadata(self._kvcache_metadata, kvcache_metadata)
 
-                hstu_output = self._hstu_block.predict(
-                    batch.batch_size,
-                    num_tokens,
-                    self._hidden_states,
-                    self._jagged_metadata,
-                    kvcache_metadata,
-                )
-                jagged_data.values = hstu_output
-            else:
-                hstu_output = self._hstu_block.predict(
-                    batch.batch_size,
-                    num_tokens,
-                    jagged_data.values,
-                    jagged_data,
-                    kvcache_metadata,
-                )
-                jagged_data.values = hstu_output
+                    hstu_output = self._hstu_block.predict(
+                        batch.batch_size,
+                        num_tokens,
+                        self._hidden_states,
+                        self._jagged_metadata,
+                        kvcache_metadata,
+                    )
+                    jagged_data.values = hstu_output
+                else:
+                    hstu_output = self._hstu_block.predict(
+                        batch.batch_size,
+                        num_tokens,
+                        jagged_data.values,
+                        jagged_data,
+                        kvcache_metadata,
+                    )
+                    jagged_data.values = hstu_output
+            except BaseException as err:
+                hstu_error = err
+                raise
+            finally:
+                if (
+                    onboard_handle is not None
+                    and onboard_handle.handle is not None
+                    and onboard_handle.status != HostKVTaskStatus.SKIPPED
+                    and onboard_handle.backend == HostKVBackend.FLEXKV
+                    and onboard_handle.is_layerwise
+                ):
+                    torch.cuda.nvtx.range_push("recsys.kvcache.onboard_wait")
+                    try:
+                        self.kvcache.onboard_wait(kv_index_meta, onboard_handle)
+                    except BaseException as wait_err:
+                        if hstu_error is None:
+                            raise
+                        raise hstu_error from wait_err
+                    finally:
+                        torch.cuda.nvtx.range_pop()
 
             self.kvcache.offload_try_wait()
             self.kvcache.offload_launch(kv_index_meta, kvcache_metadata)

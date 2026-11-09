@@ -1022,3 +1022,77 @@ def test_overflow_with_counter(key_type, table_config):
 
     print("Phase 7 passed: reset verified")
     print("test_overflow_with_counter PASSED")
+
+
+@pytest.mark.parametrize("key_type", [torch.int64, torch.uint64])
+@pytest.mark.parametrize(
+    "score_name, score_policy",
+    [
+        ("score1", ScorePolicy.ASSIGN),
+        ("score1", ScorePolicy.GLOBAL_TIMER),
+        ("score1", ScorePolicy.ACCUMULATE),
+        # Two score words: victims are picked by ``reduce_ranked``, not ``reduce``.
+        ("frequency", ScorePolicy.LRU_LFU),
+    ],
+)
+def test_table_without_ref_counter(key_type, score_name, score_policy):
+    """A table built with ``use_ref_counter=False`` keeps no counter, evicts like
+    any other (the evict kernels must not read a counter that is not there), and
+    refuses to pin a slot."""
+    assert torch.cuda.is_available()
+    device = torch.cuda.current_device()
+
+    bucket_capacity, num_buckets, num_tables = 128, 16, 2
+    capacity = [num_buckets * bucket_capacity] * num_tables
+    table = get_scored_table(
+        capacity=capacity,
+        bucket_capacity=bucket_capacity,
+        key_type=key_type,
+        score_specs=[ScoreSpec(name=score_name, policy=score_policy)],
+        use_ref_counter=False,
+    )
+    assert table.use_ref_counter_ is False
+    assert table._ref_counter is None
+
+    slots = torch.arange(4, dtype=torch.int64, device=device)
+    tids = torch.zeros(4, dtype=torch.int64, device=device)
+    with pytest.raises(RuntimeError, match="use_ref_counter=False"):
+        table.increment_counter(slots, tids)
+    with pytest.raises(RuntimeError, match="use_ref_counter=False"):
+        table.decrement_counter(slots, tids)
+
+    # Keep inserting new keys. Once every bucket is full each insert has to evict
+    # a resident key, and with no counter nothing is pinned, so any key can go.
+    batch, offset = 4096, 0
+    score_arg = ScoreArg(name=score_name, policy=score_policy)
+    sizes = []
+    max_rounds = 4 * sum(capacity) // batch + 4
+    for _ in range(max_rounds):
+        keys = (torch.randperm(batch, device=device, dtype=torch.int64) + offset).to(
+            key_type
+        )
+        offset += batch
+        table_ids = torch.randint(
+            num_tables, (batch,), dtype=torch.int64, device=device
+        )
+        score_arg.value = torch.full((batch,), 7, dtype=torch.uint64, device=device)
+        insert_results = torch.empty(
+            batch, dtype=table.result_type, device=device
+        ).fill_(InsertResult.INIT.value)
+        (_, num_evicted, *_rest) = table.insert_and_evict(
+            keys, table_ids, score_arg, insert_results
+        )
+        evicted = (insert_results == InsertResult.EVICT.value).sum()
+        failed = (insert_results == InsertResult.BUSY.value).sum()
+        assert int(num_evicted) == int(evicted + failed)
+        assert table.size() <= table.capacity()
+        sizes.append(table.size())
+        # Full: the size stopped growing for two rounds, and evictions happened.
+        if len(sizes) >= 3 and sizes[-1] == sizes[-2] == sizes[-3] and int(evicted) > 0:
+            break
+    else:
+        pytest.fail(f"the table never filled up: sizes {sizes[-4:]}")
+
+    table.reset()
+    assert table.size() == 0
+    assert table._ref_counter is None

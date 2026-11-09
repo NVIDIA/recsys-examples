@@ -26,6 +26,7 @@ from ops.pt_ops.torch_addmm import torch_addmm_silu_fwd
 from ops.triton_ops.triton_addmm import triton_addmm_silu_fwd
 from ops.triton_ops.triton_layer_norm import triton_weighted_layer_norm_fwd
 from ops.triton_ops.triton_norm_mul_dropout import triton_layer_norm_mul_dropout_fwd
+from recsys_kvcache_manager.host_kvstorage_manager import HostKVBackend
 
 from .debug.debug_paged_hstu_layer import dump, dump_paged_hstu_forward_naive
 
@@ -365,7 +366,12 @@ class PagedHSTUInferLayer(torch.nn.Module):
             )
 
             if not self._export_mode and kv_cache_metadata.kv_onload_handle is not None:
-                kv_cache_metadata.kv_onload_handle.stream_wait_layer(self.layer_idx)
+                handle = kv_cache_metadata.kv_onload_handle
+                if handle.backend == HostKVBackend.FLEXKV:
+                    if handle.is_layerwise:
+                        handle.wait_layer(self.layer_idx)
+                else:
+                    handle.stream_wait_layer(self.layer_idx)
             if self._export_mode:
                 jagged_attn_output = self.hstu_attn_export_impl(
                     query,
