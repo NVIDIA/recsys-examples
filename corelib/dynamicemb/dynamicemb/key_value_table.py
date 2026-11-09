@@ -331,6 +331,22 @@ def _tensor_from_bytes(
     return torch.frombuffer(bytearray(buf), dtype=dtype).to(device)
 
 
+def _upload_async(t: torch.Tensor, device: torch.device) -> torch.Tensor:
+    """``t`` on ``device``, without making the host wait for the copy.
+
+    A pageable host tensor is copied to pinned memory first (a host-to-device copy
+    from pageable memory is a wait for the stream); the pinned block is not reused
+    before the copy has landed. A tensor that is on the device already comes back as
+    it is. For the explicit APIs that hand host data to the device: the result is valid
+    on the current stream.
+    """
+    if t.is_cuda:
+        return t.to(device, non_blocking=True)
+    if t.numel() == 0:
+        return torch.empty(tuple(t.shape), dtype=t.dtype, device=device)
+    return t.pin_memory().to(device, non_blocking=True)
+
+
 def get_score_policy(score_strategy):
     """Build the physical :class:`ScoreSpec` for a (validated) score strategy.
 
@@ -2287,6 +2303,125 @@ def _append_erased(
         )
 
 
+_INT64_MIN = -(1 << 63)
+
+
+def _key_order_view(keys: torch.Tensor) -> torch.Tensor:
+    """``keys`` as int64 numbers whose signed order is the order of the keys.
+
+    An int64 key is its own number. A uint64 key goes through the int64 view of its
+    bits with the top bit flipped, which maps ``0 .. 2**64 - 1`` onto
+    ``-2**63 .. 2**63 - 1`` in order: sorting these sorts the keys as unsigned, and
+    the same flip undoes it.
+    """
+    signed = sf.as_i64(keys)
+    return signed ^ _INT64_MIN if keys.dtype == torch.uint64 else signed
+
+
+def _host_sorted_unique(keys: torch.Tensor) -> torch.Tensor:
+    """The distinct keys of a 1-D host tensor, ascending in the key type's order."""
+    if keys.numel() <= 1:
+        return keys
+    ordered = torch.sort(_key_order_view(keys)).values
+    first = torch.ones(ordered.numel(), dtype=torch.bool)
+    first[1:] = ordered[1:] != ordered[:-1]
+    ordered = ordered[first]
+    if keys.dtype == torch.uint64:
+        ordered = ordered ^ _INT64_MIN
+    return ordered.view(keys.dtype)
+
+
+def _gather_rows(a: torch.Tensor, order: torch.Tensor) -> torch.Tensor:
+    """``a[order]`` along the first dimension; a uint64 array goes through its int64
+    view (uint64 has no advanced indexing)."""
+    return torch.index_select(sf.as_i64(a), 0, order).view(a.dtype)
+
+
+def _exact(t: torch.Tensor, n: int) -> torch.Tensor:
+    """The first ``n`` rows of ``t`` as a tensor of their own: a slice would keep the
+    whole sorted buffer alive for as long as the few rows that are left in it."""
+    return t if n == t.size(0) else t[:n].clone()
+
+
+def _drain_chunks(
+    key_chunks: List[torch.Tensor],
+    tid_chunks: List[torch.Tensor],
+    table_ids: Sequence[int],
+    num_tables: int,
+) -> Tuple[torch.Tensor, List[int], torch.Tensor, torch.Tensor]:
+    """The one pass every pop of retained keys is made of, over a (key, table_id)
+    chunk buffer, with one read of the device for everything it needs to know.
+
+    The rows of the tables in ``table_ids`` are sorted by (table, key), reduced to
+    the distinct keys and put first; the rows of the other tables are put first in a
+    second array, in the order they came; a row with table id ``-1`` is a sentinel
+    (an inert entry of a masked append), which is neither and is dropped. A chunk
+    may hold any number of sentinels, so the arrays of a lazy append can be given
+    as they are. Keys are 1-D, or ``[n, 2]`` (the (slot, row) pairs of a slot
+    index: distinct rows).
+
+    Returns ``(taken, counts, rest_keys, rest_tids)``: ``taken`` has the distinct
+    keys of the wanted tables, table after table in table order, ``counts[t]`` of
+    table ``t``; ``rest_*`` are the rows of the other tables. All are exact: the
+    sizes are what the single read returns, and nothing else waits.
+    """
+    keys = torch.cat(key_chunks)
+    tids = torch.cat(tid_chunks)
+    device = keys.device
+    size = keys.size(0)
+    wanted = torch.zeros(num_tables, dtype=torch.bool, device=device)
+    for table_id in table_ids:
+        # a kernel with the scalar as its argument; a list of ids would be an upload
+        wanted[table_id].fill_(True)
+    in_table = tids >= 0
+    row_wanted = wanted[tids.clamp(min=0)]
+    keep = in_table & ~row_wanted
+
+    # Order the rows by (table, key): stable sorts by one column after another,
+    # the least significant first.
+    if keys.dim() == 1:
+        columns = [_key_order_view(keys)]
+    else:
+        columns = [keys[:, j] for j in range(keys.size(1) - 1, -1, -1)]
+    order = torch.arange(size, device=device)
+    for column in columns + [tids]:
+        order = order[torch.sort(column[order], stable=True).indices]
+    sorted_keys = _gather_rows(keys, order)
+    sorted_tids = tids[order]
+
+    # A row starts a run of equal (table, key) rows, or it is a repeat.
+    if keys.dim() == 1:
+        sorted_view = sf.as_i64(sorted_keys)
+        differs = sorted_view[1:] != sorted_view[:-1]
+    else:
+        differs = (sorted_keys[1:] != sorted_keys[:-1]).any(dim=1)
+    differs = differs | (sorted_tids[1:] != sorted_tids[:-1])
+    first = torch.ones(size, dtype=torch.bool, device=device)
+    first[1:] = differs
+    take = (sorted_tids >= 0) & wanted[sorted_tids.clamp(min=0)] & first
+    counts = torch.zeros(num_tables, dtype=torch.int64, device=device)
+    counts.scatter_add_(0, sorted_tids.clamp(min=0), take.to(torch.int64))
+
+    # Moving the members of a mask to the front: a stable sort of the mask, so their
+    # order is kept and there is no boolean-mask index.
+    front = torch.sort(take.to(torch.int8), descending=True, stable=True).indices
+    taken = _gather_rows(keys, order[front])
+    rest_order = torch.sort(keep.to(torch.int8), descending=True, stable=True).indices
+    rest_keys = _gather_rows(keys, rest_order)
+    rest_tids = tids[rest_order]
+
+    # The one read: how many rows each wanted table gets, and how many are left.
+    host = sf.read_now(torch.cat([counts, keep.sum().reshape(1)]))[0]
+    per_table = [int(host[t]) for t in range(num_tables)]
+    num_rest = int(host[num_tables])
+    return (
+        _exact(taken, sum(per_table)),
+        per_table,
+        _exact(rest_keys, num_rest),
+        _exact(rest_tids, num_rest),
+    )
+
+
 def _pop_chunked_keys(
     key_chunks: List[torch.Tensor],
     tid_chunks: List[torch.Tensor],
@@ -2298,7 +2433,9 @@ def _pop_chunked_keys(
 
     Concatenates the chunks, selects this table's rows, de-duplicates, and
     returns the rebuilt chunk lists holding only the OTHER tables' rows -- so
-    this table's keys are cleared while the rest stay for their own pop.
+    this table's keys are cleared while the rest stay for their own pop. The
+    result is on the device; the call waits for it once, to know how many rows
+    there are (see :func:`_drain_chunks`).
     """
     if not key_chunks:
         # Match the non-empty path's dtype: chunks carry key_index_map.key_type
@@ -2311,26 +2448,98 @@ def _pop_chunked_keys(
             device=state.device,
         )
         return empty, [], []
-    keys = torch.cat(key_chunks)
-    tids = torch.cat(tid_chunks)
-    mask = tids == table_id
-    out = torch.unique(keys[mask], dim=0 if keys.dim() > 1 else None)
+    out, _, rest_keys, rest_tids = _drain_chunks(
+        key_chunks, tid_chunks, [table_id], state.num_tables
+    )
     # A row with table id -1 is a sentinel (an inert entry of a masked append), not
-    # another table's key: leaving it in the remainder would keep it there for ever.
-    keep = (tids != table_id) & (tids >= 0)
-    if bool(keep.any()):
-        return out, [keys[keep]], [tids[keep]]
+    # another table's key: it is dropped, not left in the remainder for ever.
+    if rest_keys.size(0) > 0:
+        return out, [rest_keys], [rest_tids]
     return out, [], []
+
+
+def _pop_chunked_keys_to_host(
+    key_chunks: List[torch.Tensor],
+    tid_chunks: List[torch.Tensor],
+    table_ids: Sequence[int],
+    state: DynamicEmbTableState,
+) -> Tuple[Dict[int, torch.Tensor], List[torch.Tensor], List[torch.Tensor]]:
+    """:func:`_pop_chunked_keys` for several tables at once, with the keys on the host.
+
+    Two waits for the whole call, however many tables and chunks: one read of how many
+    rows each table gets, then one copy of exactly those rows (the rows of the tables
+    that stay are not copied). Each table's tensor is its own, in the chunks' key type.
+    """
+    if not key_chunks:
+        return (
+            {t: torch.empty(0, dtype=state.key_index_map.key_type) for t in table_ids},
+            [],
+            [],
+        )
+    taken, counts, rest_keys, rest_tids = _drain_chunks(
+        key_chunks, tid_chunks, table_ids, state.num_tables
+    )
+    host = (
+        sf.pull_to_host(taken)[0]
+        if taken.size(0) > 0
+        else torch.empty(0, dtype=taken.dtype)
+    )
+    wanted = set(table_ids)
+    out: Dict[int, torch.Tensor] = {}
+    start = 0
+    for t in range(state.num_tables):
+        if t in wanted:
+            # a copy: the pulled buffer is pinned memory, which a caller keeps no claim on
+            out[t] = host[start : start + counts[t]].clone()
+        start += counts[t]
+    if rest_keys.size(0) > 0:
+        return out, [rest_keys], [rest_tids]
+    return out, [], []
+
+
+def _pending_evicted_arrays(
+    state: DynamicEmbTableState,
+) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
+    """The evictions still pending, as the arrays they were made of.
+
+    A pop that sorts by (table, key) does not need the number each entry holds: the
+    arrays are N long with the table id ``-1`` for the lanes that are not evictions,
+    and the pass drops those. So nothing waits for a count (and the entries that never
+    got a ring slot need no read of their own). What a pop owes the entries is the
+    order: each was made on some stream, and the current stream has to come after it.
+    """
+    keys: List[torch.Tensor] = []
+    tids: List[torch.Tensor] = []
+    current = torch.cuda.current_stream()
+    for entry_keys, entry_tids, _count, _ticket, stream in state.evicted_pending:
+        _wait_for_stream(stream)
+        entry_keys.record_stream(current)
+        entry_tids.record_stream(current)
+        keys.append(entry_keys)
+        tids.append(entry_tids)
+    return keys, tids
+
+
+def _release_pending_evicted(state: DynamicEmbTableState) -> None:
+    """Forget the pending evictions a pop has taken, giving their ring slots back.
+    A count that was never read is not waited for: a slot that is given back is not
+    reused before the copy of its count has landed."""
+    if state.retain_ring is not None:
+        for _keys, _tids, _count, ticket, _stream in state.evicted_pending:
+            state.retain_ring.release(ticket)
+    state.evicted_pending = []
 
 
 def _pop_state_evicted_keys(state: DynamicEmbTableState, table_id: int) -> torch.Tensor:
     """Pop (return + clear) the unique keys ``table_id`` had evicted."""
-    # A pop returns data of a data-dependent size, so waiting for the counts of
-    # the evictions that are still pending is part of its cost.
-    _resolve_pending_evicted(state, block=True)
+    pending_keys, pending_tids = _pending_evicted_arrays(state)
     out, state.evicted_key_chunks, state.evicted_tid_chunks = _pop_chunked_keys(
-        state.evicted_key_chunks, state.evicted_tid_chunks, table_id, state
+        state.evicted_key_chunks + pending_keys,
+        state.evicted_tid_chunks + pending_tids,
+        table_id,
+        state,
     )
+    _release_pending_evicted(state)
     return out
 
 
@@ -2356,6 +2565,54 @@ def _pop_state_erased_slot_index(
         dtype=torch.int64,
     )
     return out.reshape(-1, 2)
+
+
+def _pop_state_many(
+    state: DynamicEmbTableState, evicted: bool, table_ids: Sequence[int]
+) -> Dict[int, torch.Tensor]:
+    """Pop (return + clear) the keys of every table in ``table_ids`` at once, as host
+    tensors: what :func:`_pop_state_evicted_keys` (``evicted``) or
+    :func:`_pop_state_erased_keys` returns for each, from one pass over the chunks."""
+    if evicted:
+        pending_keys, pending_tids = _pending_evicted_arrays(state)
+        (
+            out,
+            state.evicted_key_chunks,
+            state.evicted_tid_chunks,
+        ) = _pop_chunked_keys_to_host(
+            state.evicted_key_chunks + pending_keys,
+            state.evicted_tid_chunks + pending_tids,
+            table_ids,
+            state,
+        )
+        _release_pending_evicted(state)
+    else:
+        (
+            out,
+            state.erased_key_chunks,
+            state.erased_tid_chunks,
+        ) = _pop_chunked_keys_to_host(
+            state.erased_key_chunks, state.erased_tid_chunks, table_ids, state
+        )
+    return out
+
+
+_POP_METHODS = ("pop_evicted_keys", "pop_erased_keys")
+
+
+def _check_pop_method(method: str) -> None:
+    if method not in _POP_METHODS:
+        raise ValueError(f"method must be one of {_POP_METHODS}, got {method!r}")
+
+
+def _union_of_tiers(parts: List[torch.Tensor], key_type: torch.dtype) -> torch.Tensor:
+    """The distinct keys of the host results of several tiers, in key order."""
+    parts = [p for p in parts if p.numel() > 0]
+    if not parts:
+        return torch.empty(0, dtype=key_type)
+    if len(parts) == 1:
+        return parts[0]  # a tier's result is distinct and sorted already
+    return _host_sorted_unique(torch.cat(parts))
 
 
 def _insert_key_values(
@@ -3789,6 +4046,16 @@ class DynamicEmbStorage(Storage):
         rows)."""
         return _pop_state_erased_slot_index(self._state, table_id)
 
+    def pop_many(self, method: str, table_ids: Sequence[int]) -> Dict[int, Tensor]:
+        """What ``method`` (``"pop_evicted_keys"`` or ``"pop_erased_keys"``) returns for
+        each of ``table_ids``, as host tensors from one pass over the retained keys: the
+        call waits for the device twice, however many tables there are, where one
+        :meth:`pop_evicted_keys` per table waits for each."""
+        _check_pop_method(method)
+        if not table_ids:
+            return {}
+        return _pop_state_many(self._state, method == "pop_evicted_keys", table_ids)
+
     # -- Storage interface --
 
     def lookup_masked(
@@ -4463,6 +4730,21 @@ class HybridStorage(Storage):
                 0, dtype=self._host.key_index_map.key_type, device=self._host.device
             )
         return torch.unique(torch.cat(parts))
+
+    def pop_many(self, method: str, table_ids: Sequence[int]) -> Dict[int, Tensor]:
+        """:meth:`DynamicEmbStorage.pop_many` for the two tiers: the evicted keys of the
+        host tier, the erased keys of both, merged per table on the host. A pass per
+        tier, so four waits at most for the call, whatever the number of tables."""
+        _check_pop_method(method)
+        if not table_ids:
+            return {}
+        if method == "pop_evicted_keys":
+            return _pop_state_many(self._host, True, table_ids)
+        drained = [_pop_state_many(s, False, table_ids) for s in self.tables]
+        key_type = self._host.key_index_map.key_type
+        return {
+            t: _union_of_tiers([d[t] for d in drained], key_type) for t in table_ids
+        }
 
     # -- Two-tier find (with values) --
 

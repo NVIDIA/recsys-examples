@@ -59,6 +59,7 @@ FWD_BWD_TEST_FILES=(
     # The explicit APIs return host data and so wait for the device, once per call (or
     # per batch of a call that moves data in batches), never per table, column or chunk.
     "test/unit_tests/no_host_sync/test_explicit_api_syncs.py"
+    "test/unit_tests/no_host_sync/test_pop_one_pass.py"
 )
 
 LOAD_DUMP_TEST_FILES=(

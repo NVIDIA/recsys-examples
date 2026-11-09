@@ -2277,13 +2277,24 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
         if not hasattr(storage, method):
             return {}
         pop = getattr(storage, method)
+        table_ids = [
+            i
+            for i, name in enumerate(self._table_names)
+            if wanted(self._dynamicemb_options[i].evicted_item_mode)
+            and (table_names is None or name in table_names)
+        ]
+        # One pass over the retained keys of every table, when the storage has one:
+        # the keys come back on the host after two waits for the device, however many
+        # tables there are.
+        pop_many = getattr(storage, "pop_many", None)
+        popped = pop_many(method, table_ids) if pop_many is not None else None
         result: Dict[str, Tensor] = {}
-        for i, name in enumerate(self._table_names):
-            if not wanted(self._dynamicemb_options[i].evicted_item_mode):
-                continue
-            if table_names is not None and name not in table_names:
-                continue
-            result[name] = pop(i).cpu()  # host tensor
+        for i in table_ids:
+            name = self._table_names[i]
+            if popped is not None:
+                result[name] = popped[i]
+            else:
+                result[name] = pop(i).cpu()  # host tensor
         return result
 
     def incremental_dump(
@@ -2945,7 +2956,11 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
 
         if not wanted or not hasattr(storage, method):
             return None
-        out = getattr(storage, method)(table_id)
+        pop_many = getattr(storage, "pop_many", None)
+        if pop_many is not None:
+            out = pop_many(method, [table_id])[table_id]  # on the host already
+        else:
+            out = getattr(storage, method)(table_id)
         if pg is not None:
             out = _all_gather_evicted_keys(out, pg)
         return out.cpu()

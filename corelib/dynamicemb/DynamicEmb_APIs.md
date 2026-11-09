@@ -1807,6 +1807,7 @@ An API whose result is host data (a checkpoint file, a pop, a metrics read, an e
 | --- | --- |
 | `cache.cache_metrics` | once per read. Read it when the numbers are needed, not on every step; the `CACHE_DEBUG=1` hook of the examples reads it each forward and is a debugging aid. |
 | `EraseHandle.result()` | once per handle; `wait()` once; `wait_stream()` until the erase has been launched (paced by the device, see [erase_by_score_async](#erase_by_score_async)). |
+| `pop_evicted_keys`, `pop_erased_keys` | twice per module, however many tables it has and however many evictions are still pending: one read of how many keys each table gets, one copy of exactly those keys. With `pg`, twice more per module for the gather of its tables: one read of every rank's sizes, one copy of the gathered keys. |
 
 ## Host syncs
 

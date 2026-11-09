@@ -1963,6 +1963,18 @@ ALLOWED_NEW_HITS: List[Tuple[str, Optional[str], str]] = [
         "worker thread (the host allocator caches it), which makes EraseHandle.result() one "
         "wait for the device",
     ),
+    (
+        "dynamicemb/key_value_table.py",
+        "pin_memory",
+        "_upload_async: the explicit APIs (pop, replay, erase_keys) hand host data to the device "
+        "through a pinned copy and a non-blocking transfer, not a pageable copy that waits",
+    ),
+    (
+        "dynamicemb/incremental_dump.py",
+        "cpu",
+        "_all_gather_evicted_many: a single rank returns what it was given on the host (the keys "
+        "of a pop are host tensors, so nothing is copied); the helper's result is host data",
+    ),
 ]
 
 
@@ -1984,6 +1996,34 @@ EXPECTED_GONE: List[Tuple[str, str, str, str]] = [
     # for, instead of a second, pageable copy after it
     ("dynamicemb/async_erase.py", "cpu", "erased, spared = counts.cpu()", "E10"),
     ("dynamicemb/async_erase.py", "tolist", "erased, spared = counts.cpu()", "E10"),
+    # E5: a pop is one pass over the retained chunks, and the gather of the group is one
+    # stacked size read and one padded copy, not a read per rank and table
+    ("dynamicemb/incremental_dump.py", "cpu", "return keys.cpu()", "E5"),
+    ("dynamicemb/incremental_dump.py", "cpu", "return keys[:0].cpu()", "E5"),
+    (
+        "dynamicemb/incremental_dump.py",
+        "cpu",
+        "return torch.unique(torch.cat(parts)).cpu()",
+        "E5",
+    ),
+    (
+        "dynamicemb/incremental_dump.py",
+        "unique",
+        "return torch.unique(torch.cat(parts)).cpu()",
+        "E5",
+    ),
+    (
+        "dynamicemb/incremental_dump.py",
+        "tensor_to_device",
+        "local_size = torch.tensor([keys.numel()], device=device, dtype=torch.int64)",
+        "E5",
+    ),
+    (
+        "dynamicemb/key_value_table.py",
+        "unique",
+        "out = torch.unique(keys[mask], dim=0 if keys.dim() > 1 else None)",
+        "E5",
+    ),
 ]
 
 
