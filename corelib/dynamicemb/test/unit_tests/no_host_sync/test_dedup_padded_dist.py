@@ -25,8 +25,8 @@ What is checked here, on one GPU (a process group of one rank; the two-rank run 
 per_key_score/test_per_key_score_dist.py):
 
 * ``_dedup_indices`` waits for nothing when the distributor of the sharding takes padded
-  arrays, and still reads the count when it is a distributor of TorchRec's, which does
-  not;
+  arrays, and reads the count (once, through ``sync_free.read_now``) when it is a
+  distributor of TorchRec's, which does not; in a collection of both, only for the latter;
 * the cut itself: exact arrays are left alone, padded ones are cut, whichever of the keys,
   weights, permute and scores are padded;
 * ``forward`` hands the all2all, the permute of the scores and the output distribution
@@ -192,7 +192,9 @@ def _batch_with_duplicates(device):
 
 
 @cuda_only
-def test_the_dedup_of_a_distributor_that_takes_padded_arrays_reads_nothing(no_sync):
+def test_the_dedup_of_a_distributor_that_takes_padded_arrays_reads_nothing(
+    no_sync, read_now_calls
+):
     device = torch.device("cuda", torch.cuda.current_device())
     collection = _Collection([types.SimpleNamespace(accepts_padded_dedup=True)], device)
     features = _batch_with_duplicates(device)
@@ -201,6 +203,7 @@ def test_the_dedup_of_a_distributor_that_takes_padded_arrays_reads_nothing(no_sy
         (deduped,) = ShardedDynamicEmbeddingCollection._dedup_indices(
             collection, context, [features]
         )
+    assert read_now_calls.delta == 0
     # The arrays keep the length of the input; what is past the real keys is inert.
     count = int(deduped.lengths().sum())
     assert 0 < count < features.values().numel()
@@ -209,22 +212,49 @@ def test_the_dedup_of_a_distributor_that_takes_padded_arrays_reads_nothing(no_sy
 
 
 @cuda_only
-def test_the_dedup_of_a_distributor_of_torchrec_still_reads_the_count(no_sync):
+def test_the_dedup_of_a_distributor_of_torchrec_reads_the_count_once(
+    no_sync, read_now_calls
+):
+    """A distributor of TorchRec's takes exact arrays, so the dedup cuts them with the
+    number of unique keys: the one blocking read that is left in it, made through the
+    audited ``sync_free.read_now`` (which the guard lets through), not a raw ``.item()``.
+    """
     device = torch.device("cuda", torch.cuda.current_device())
     collection = _Collection([types.SimpleNamespace()], device)
     features = _batch_with_duplicates(device)
     context = DynamicEmbeddingCollectionContext()
     with torch.no_grad(), no_sync():
-        with pytest.raises(AssertionError, match="host sync outside sf.read_now"):
-            ShardedDynamicEmbeddingCollection._dedup_indices(
-                collection, context, [features]
-            )
-    # outside the guard it gives the exact arrays that such a distributor needs
-    with torch.no_grad():
         (deduped,) = ShardedDynamicEmbeddingCollection._dedup_indices(
-            collection, DynamicEmbeddingCollectionContext(), [features]
+            collection, context, [features]
         )
+    assert read_now_calls.delta == 1
+    # the exact arrays that such a distributor needs
     assert deduped.values().numel() == int(deduped.lengths().sum())
+
+
+@cuda_only
+def test_a_collection_of_both_kinds_reads_the_count_for_the_one_that_needs_it(
+    no_sync, read_now_calls
+):
+    """The decision is made per sharding: a DynamicEmb row-wise sharding next to one of
+    another kind (a data-parallel table, say) keeps its arrays padded and reads nothing,
+    and the other gets exact arrays for one read."""
+    device = torch.device("cuda", torch.cuda.current_device())
+    collection = _Collection(
+        [types.SimpleNamespace(accepts_padded_dedup=True), types.SimpleNamespace()],
+        device,
+    )
+    features = [_batch_with_duplicates(device), _batch_with_duplicates(device)]
+    context = DynamicEmbeddingCollectionContext()
+    with torch.no_grad(), no_sync():
+        padded, exact = ShardedDynamicEmbeddingCollection._dedup_indices(
+            collection, context, features
+        )
+    assert read_now_calls.delta == 1
+    real = int(exact.lengths().sum())
+    assert int(padded.lengths().sum()) == real  # the same batch twice
+    assert exact.values().numel() == real
+    assert padded.values().numel() == features[0].values().numel() > real
 
 
 def test_only_the_dynamicemb_distributor_takes_padded_arrays():
@@ -381,6 +411,237 @@ def test_the_scores_go_out_in_the_splits_of_the_keys(one_rank, monkeypatch):
         _scored(KEYS, lengths, values, scores, None),
     )
     assert len(built) == 1, len(built)
+    assert torch.equal(scored["scores"], scores)
+
+
+# --------------------------------------------------------------------------
+# the scores' all2all depends on the constructor and the state of TorchRec's awaitable
+# --------------------------------------------------------------------------
+def test_this_torchrec_lets_the_scores_reuse_the_splits_of_the_keys():
+    """The scored input dist builds the scores' all2all with the constructor of TorchRec's
+    ``KJTAllToAllTensorsAwaitable`` and from the private state of the keys' one. This
+    TorchRec must be one that has them: on another the distributor falls back (with a
+    warning) and a test run says so here, with the reason."""
+    assert input_dist_module.splits_reuse_problem() is None
+
+
+class _Awaitable:
+    """What TorchRec's constructor does with one worker: set its state and return."""
+
+    def __init__(
+        self,
+        pg,
+        input,
+        splits,
+        input_splits,
+        output_splits,
+        input_tensors,
+        labels,
+        keys,
+        device,
+        stagger,
+        stride_per_rank,
+    ):
+        self._pg, self._splits, self._keys = pg, splits, keys
+        self._input_splits = dict(zip(labels, input_splits))
+        self._output_splits = dict(zip(labels, output_splits))
+        self._device, self._stagger = device, stagger
+        self._stride_per_rank = stride_per_rank
+
+
+class _AwaitableWithAnOptionalArgument(_Awaitable):
+    def __init__(
+        self,
+        pg,
+        input,
+        splits,
+        input_splits,
+        output_splits,
+        input_tensors,
+        labels,
+        keys,
+        device,
+        stagger,
+        stride_per_rank,
+        tag=None,
+    ):
+        super().__init__(
+            pg,
+            input,
+            splits,
+            input_splits,
+            output_splits,
+            input_tensors,
+            labels,
+            keys,
+            device,
+            stagger,
+            stride_per_rank,
+        )
+
+
+class _AwaitableWithARequiredArgument(_AwaitableWithAnOptionalArgument):
+    def __init__(
+        self,
+        pg,
+        input,
+        splits,
+        input_splits,
+        output_splits,
+        input_tensors,
+        labels,
+        keys,
+        device,
+        stagger,
+        stride_per_rank,
+        tag,
+    ):
+        super().__init__(
+            pg,
+            input,
+            splits,
+            input_splits,
+            output_splits,
+            input_tensors,
+            labels,
+            keys,
+            device,
+            stagger,
+            stride_per_rank,
+        )
+
+
+class _AwaitableWithARenamedArgument(_Awaitable):
+    def __init__(
+        self,
+        process_group,
+        input,
+        splits,
+        input_splits,
+        output_splits,
+        input_tensors,
+        labels,
+        keys,
+        device,
+        stagger,
+        stride_per_rank,
+    ):
+        super().__init__(
+            process_group,
+            input,
+            splits,
+            input_splits,
+            output_splits,
+            input_tensors,
+            labels,
+            keys,
+            device,
+            stagger,
+            stride_per_rank,
+        )
+
+
+class _AwaitableWithoutItsSplits(_Awaitable):
+    def __init__(
+        self,
+        pg,
+        input,
+        splits,
+        input_splits,
+        output_splits,
+        input_tensors,
+        labels,
+        keys,
+        device,
+        stagger,
+        stride_per_rank,
+    ):
+        super().__init__(
+            pg,
+            input,
+            splits,
+            input_splits,
+            output_splits,
+            input_tensors,
+            labels,
+            keys,
+            device,
+            stagger,
+            stride_per_rank,
+        )
+        del self._splits
+
+
+class _AwaitableThatKeepsItsSplitsInAList(_Awaitable):
+    def __init__(
+        self,
+        pg,
+        input,
+        splits,
+        input_splits,
+        output_splits,
+        input_tensors,
+        labels,
+        keys,
+        device,
+        stagger,
+        stride_per_rank,
+    ):
+        super().__init__(
+            pg,
+            input,
+            splits,
+            input_splits,
+            output_splits,
+            input_tensors,
+            labels,
+            keys,
+            device,
+            stagger,
+            stride_per_rank,
+        )
+        self._input_splits = list(input_splits)
+
+
+def test_a_changed_awaitable_is_told_from_one_that_fits():
+    problem = input_dist_module.splits_reuse_problem
+    assert problem(_Awaitable) is None
+    assert problem(_AwaitableWithAnOptionalArgument) is None
+    assert "tag" in problem(_AwaitableWithARequiredArgument)
+    assert "process_group" in problem(_AwaitableWithARenamedArgument)
+    assert "_splits" in problem(_AwaitableWithoutItsSplits)
+    assert "_input_splits" in problem(_AwaitableThatKeepsItsSplitsInAList)
+
+
+@cuda_only
+def test_a_torchrec_that_does_not_fit_gets_the_scores_their_own_splits_exchange(
+    one_rank, monkeypatch
+):
+    """The fallback is what the scores did before: an all2all of their own, with its own
+    splits exchange (so two per sharding, the keys' and the scores'), the same result, and
+    a warning when the distributor is built."""
+    from torchrec.distributed.dist_data import KJTAllToAllSplitsAwaitable
+
+    built = []
+    real = KJTAllToAllSplitsAwaitable.__init__
+
+    def spy(self, *args, **kwargs):
+        built.append(self)
+        real(self, *args, **kwargs)
+
+    monkeypatch.setattr(KJTAllToAllSplitsAwaitable, "__init__", spy)
+    monkeypatch.setattr(
+        input_dist_module,
+        "splits_reuse_problem",
+        lambda *args: "a TorchRec of the test",
+    )
+    with pytest.warns(RuntimeWarning, match="a TorchRec of the test"):
+        distributor = _distributor(one_rank, per_key_score=True)
+    device = torch.device("cuda", torch.cuda.current_device())
+    values, lengths, scores, _ = _real_arrays(device)
+    scored = _distribute(distributor, _scored(KEYS, lengths, values, scores, None))
+    assert len(built) == 2, len(built)
+    assert torch.equal(scored["values"], values)
     assert torch.equal(scored["scores"], scores)
 
 

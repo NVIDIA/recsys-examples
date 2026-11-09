@@ -1786,7 +1786,9 @@ Users can specify the initial capacity of a table on a single GPU. When the tabl
   The growth is not capped by `max_capacity`.
 - **Loading a checkpoint** (`DynamicEmbStorage.load`): the table is sized for the keys **this rank keeps** from the file (counted from the key file with the rank's ownership filter), not for every key in it, since a checkpoint may hold other ranks' keys as well.
 
-**When the decision is made.** The check does not wait for the GPU. It compares the load factor with the last landed snapshot of the table sizes plus the number of keys the batches since could add (for a table, the key count of its own features when the input carries it, never read from the device) and, until the snapshot that a `replay_increment` takes after its writes has landed, the keys it wrote, so a table can grow by up to a few batches' keys earlier than an exact check would, and never later. Set `DYNAMICEMB_EXACT_GROWTH=1` for the blocking exact check. Growing itself remaps memory and synchronizes the device.
+**When the decision is made.** The check does not wait for the GPU. It compares the load factor with the last landed snapshot of the table sizes plus the number of keys the batches since could add (for a table, the key count of its own features when the input carries it, never read from the device), so a table can grow by up to a few batches' keys earlier than an exact check would, and never later. Set `DYNAMICEMB_EXACT_GROWTH=1` for the blocking exact check. Growing itself remaps memory and synchronizes the device.
+
+**After a replay.** `replay_increment` writes keys at the slots of the source, outside any batch. They count in that estimate (the ones the table holds already too, so replaying the same delta again counts them again) until the snapshot that the call takes when its writes are done has landed, which nothing waits for. From then on the estimate is what the table holds, so a replica does not grow because it has applied many deltas. The replay itself never grows a table: its capacity has to stay the source's.
 
 
 ## Erasing keys by score
@@ -1821,7 +1823,7 @@ What can still wait for the GPU. Each of these reads goes through `sync_free.rea
 - `DEMB_DETERMINISM_MODE`, which reads two counts per insert;
 - dump, load, export, `pop_*` and the incremental dump, which move data to the host by design, and `cache_metrics()`, which reads the hit counts when it is called;
 - the one-time setup of a table, and its teardown, which waits for queued work before freeing memory;
-- the input distribution of TorchRec (the split sizes of the all-to-all of keys live on the host). With `use_index_dedup`, a sharding that is not DynamicEmb's row-wise one (a data-parallel table next to DynamicEmb tables, say) also needs the number of its unique keys on the host, one read per step; the row-wise sharding of DynamicEmb tables reads none beyond the split sizes.
+- the input distribution of TorchRec (the split sizes of the all-to-all of keys live on the host). With `use_index_dedup`, a sharding that is not DynamicEmb's row-wise one (a data-parallel table next to DynamicEmb tables, say) also needs the number of its unique keys on the host, one read per step; the row-wise sharding of DynamicEmb tables reads none beyond the split sizes. With a score per key (`PRECISE_CUSTOMIZED`) the scores travel in an all2all of their own, a second one of TorchRec's, which makes two more of its reads per step: the upload of the permutation it reorders by and the lengths per key of what it received (the split sizes are not exchanged again).
 
 `DYNAMICEMB_SYNC_FREE=0` restores the previous lookup paths for comparison, and the `sync_free` helpers and `test/unit_tests/no_host_sync` (a probe that counts the syncs of a step per layout and scenario, and a ratchet against `budgets.json`) show where a sync comes from.
 

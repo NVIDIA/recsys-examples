@@ -1166,6 +1166,8 @@ ADM = "dynamicemb/embedding_admission.py"
 BDT = "dynamicemb/batched_dynamicemb_tables.py"
 SHARD_EMB = "dynamicemb/shard/embedding.py"
 SHARD_IN = "dynamicemb/shard/input_dist.py"
+SHARD_RW = "dynamicemb/shard/rw_sharding.py"
+INIT = "dynamicemb/initializer.py"
 
 
 def _new(file: str, *qualnames: str) -> List[Target]:
@@ -1256,6 +1258,36 @@ TARGETS: List[Target] = (
     )
     # the index dedup of the embedding collection and the distributor that cuts its arrays
     + _new(SHARD_EMB, "ShardedDynamicEmbeddingCollection._dedup_indices")
+    # the entry points of a step that are clean today, so that they stay clean: the module's
+    # prefetch / forward, the table calls every path makes, the initializer and the lookup's
+    # prefetch (the functions that still hold a legacy branch are targets of their own lane)
+    + _new(
+        BDT,
+        "BatchedDynamicEmbeddingTablesV2.forward",
+        "BatchedDynamicEmbeddingTablesV2.prefetch",
+        "BatchedDynamicEmbeddingTablesV2._counters_for_group",
+        "BatchedDynamicEmbeddingTablesV2._reduce_table_scores",
+    )
+    + _new(
+        KVT,
+        "DynamicEmbStorage.insert",
+        "_insert_key_values",
+        "load_from_flat",
+        "store_to_flat",
+        "get_find_score_arg",
+        "get_insert_score_arg",
+        "DynamicEmbCache.increment_counter",
+        "DynamicEmbCache.decrement_counter",
+    )
+    + _new(
+        SHT,
+        "LinearBucketTable.lookup",
+        "LinearBucketTable.lookup_with_overflow",
+        "LinearBucketTable.increment_counter",
+        "LinearBucketTable.decrement_counter",
+    )
+    + _new(INIT, "MultiTableInitializer.__call__")
+    + _new(SHARD_RW, "GroupedEmbeddingsLookup.prefetch")
     + _new(
         SHARD_IN,
         "cut_to_length_per_key",
@@ -1948,12 +1980,6 @@ ALLOWED_NEW_HITS: List[Tuple[str, Optional[str], str]] = [
         "item",
         "DEMB_DETERMINISM_MODE reads the count of the evictions it accumulated over its waves: "
         "inherent to that opt-in mode",
-    ),
-    (
-        "dynamicemb/shard/embedding.py",
-        "item",
-        "_dedup_indices: the unique count that a distributor of TorchRec's needs (it takes exact "
-        "arrays); a DynamicEmb row-wise distributor cuts the padded arrays itself",
     ),
     (
         "dynamicemb/scored_hashtable.py",

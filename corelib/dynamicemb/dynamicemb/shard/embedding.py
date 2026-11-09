@@ -49,6 +49,7 @@ from torchrec.distributed.types import (
 from torchrec.modules.embedding_modules import EmbeddingCollection
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 
+from .. import sync_free as sf
 from ..batched_dynamicemb_function import largest_score_per_unique_key
 from ..dynamicemb_config import (
     DynamicEmbKernel,
@@ -343,8 +344,9 @@ class ShardedDynamicEmbeddingCollection(ShardedEmbeddingCollection):
                 if getattr(self._input_dists[i], "accepts_padded_dedup", False):
                     total_unique = num_elements
                 else:
-                    # sync-ok: the count that such a distributor needs
-                    total_unique = int(num_uniques.item())
+                    # The one read of a step that is left here: the count that such a
+                    # distributor needs, through the audited read like any other.
+                    total_unique = int(sf.read_now(num_uniques)[0])
                 unique_keys = unique_keys[:total_unique]
 
                 dedup_features = KeyedJaggedTensor(

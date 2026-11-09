@@ -108,8 +108,8 @@ def case_keys() -> List[Case]:
     for cfg in hsp.CONFIGS.values():
         for scenario in hsp.scenarios_of(cfg):
             for mode in hsp.MODES:
-                if scenario in hsp.EVAL_SCENARIOS and mode != "plain":
-                    continue  # prefetch is a no-op in eval
+                if scenario in hsp.PLAIN_ONLY_SCENARIOS and mode != "plain":
+                    continue  # prefetch is a no-op in eval; queue_ahead is plain only
                 out.append((cfg.name, scenario, mode))
     return out
 

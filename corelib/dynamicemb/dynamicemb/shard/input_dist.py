@@ -13,13 +13,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import inspect
+import warnings
 from typing import List, Optional, Tuple
 
 import torch
 from dynamicemb.dynamicemb_config import DIST_TYPE_CODES
 from dynamicemb_extensions import block_bucketize_sparse_features  # pyre-ignore
 from torch import distributed as dist
-from torchrec.distributed.dist_data import KJTAllToAllTensorsAwaitable
+from torchrec.distributed.dist_data import KJTAllToAll, KJTAllToAllTensorsAwaitable
 from torchrec.distributed.embedding_sharding import (
     KJTSplitsAllToAllMeta,
     _fx_wrap_batch_size_per_feature,
@@ -223,6 +225,102 @@ class _ScoredTensorsAwaitable(KJTAllToAllTensorsAwaitable):
         return ScoredKeyedJaggedTensor.from_kjt(keys, scores.values())
 
 
+# What the scores' tensors all2all is built with (see :class:`_ScoredSplitsAwaitable`): the
+# arguments of the constructor of TorchRec's ``KJTAllToAllTensorsAwaitable``, and the
+# attributes of the keys' instance that they are read from. Both are TorchRec's to change.
+# They are the same in v1.2.0, v1.3.0, v1.5.0-rc2, v1.6.0-rc1, v1.8.0-rc1 (the image's) and
+# the nightly of 2026-05-18; ``splits_reuse_problem`` checks the TorchRec in use.
+_TENSORS_AWAITABLE_ARGS = (
+    "pg",
+    "input",
+    "splits",
+    "input_splits",
+    "output_splits",
+    "input_tensors",
+    "labels",
+    "keys",
+    "device",
+    "stagger",
+    "stride_per_rank",
+)
+_TENSORS_AWAITABLE_STATE = (
+    "_pg",
+    "_splits",
+    "_input_splits",
+    "_output_splits",
+    "_keys",
+    "_device",
+    "_stagger",
+    "_stride_per_rank",
+)
+
+
+class _OneWorker:
+    """A process group of one rank, as much of one as the constructor of the awaitable
+    asks before it returns (it has nothing to exchange with one worker)."""
+
+    def size(self) -> int:
+        return 1
+
+    def rank(self) -> int:
+        return 0
+
+
+def splits_reuse_problem(
+    awaitable_cls: type = KJTAllToAllTensorsAwaitable,
+) -> Optional[str]:
+    """Why the scores' tensors all2all cannot be built from the splits of the keys' one
+    with ``awaitable_cls`` (TorchRec's tensors awaitable), or None when it can.
+
+    :class:`_ScoredSplitsAwaitable` calls its constructor with the arguments below and
+    reads the keys' awaitable through private attributes; a TorchRec that changed either
+    would fail at the first scored step with a ``TypeError`` or an ``AttributeError``. The
+    distributor asks once, when it is built, and a scored sharding falls back to a
+    ``KJTAllToAll`` of its own for the scores when the answer is not None.
+    """
+    try:
+        params = inspect.signature(awaitable_cls).parameters
+    except (TypeError, ValueError) as error:
+        return f"its constructor has no signature ({error})"
+    missing = [name for name in _TENSORS_AWAITABLE_ARGS if name not in params]
+    required = [
+        name
+        for name, param in params.items()
+        if name not in _TENSORS_AWAITABLE_ARGS
+        and param.default is param.empty
+        and param.kind not in (param.VAR_POSITIONAL, param.VAR_KEYWORD)
+    ]
+    if missing or required:
+        return (
+            f"its constructor takes {list(params)}, not the arguments "
+            f"{list(_TENSORS_AWAITABLE_ARGS)} (missing {missing}, others required {required})"
+        )
+    try:
+        # With one worker the constructor sets the state and returns.
+        probe = awaitable_cls(
+            pg=_OneWorker(),
+            input=None,
+            splits=[0],
+            input_splits=[[0]],
+            output_splits=[[0]],
+            input_tensors=[],
+            labels=["lengths"],
+            keys=[],
+            device=torch.device("cpu"),
+            stagger=1,
+            stride_per_rank=None,
+        )
+    except Exception as error:
+        return f"it cannot be built to look at ({type(error).__name__}: {error})"
+    lost = [name for name in _TENSORS_AWAITABLE_STATE if not hasattr(probe, name)]
+    if lost:
+        return f"it keeps no {lost}"
+    for name in ("_input_splits", "_output_splits"):
+        if not isinstance(getattr(probe, name), dict):
+            return f"its {name} is not a dict by label"
+    return None
+
+
 class _ScoredSplitsAwaitable(Awaitable[KJTAllToAllTensorsAwaitable]):
     """The first level of the keys' all2all, and the scores' tensors all2all after it.
 
@@ -233,19 +331,36 @@ class _ScoredSplitsAwaitable(Awaitable[KJTAllToAllTensorsAwaitable]):
     ``KJTAllToAll`` of their own did it all: the lengths per key from the device, the
     splits to the device and back).
 
+    What is left of the scores' all2all is TorchRec's own and cannot be skipped from
+    here: its constructor uploads the permutation that the receiver reorders by (a
+    pageable copy, which waits for the stream), and the KJT it hands back reads its
+    lengths per key from the device. A scored sharding therefore makes two more such
+    calls per step than an unscored one, though fewer than a ``KJTAllToAll`` of the
+    scores' own did.
+
+    A TorchRec whose awaitable does not fit (see :func:`splits_reuse_problem`) gets the
+    ``KJTAllToAll`` it used to, passed in as ``scores_awaitable``: the scores exchange
+    their own splits, which costs those calls and the others.
+
     The keys' tensors are issued before the scores' on every rank, so the two all2alls
     are in the same order everywhere.
     """
 
     def __init__(
-        self, keys_awaitable: Awaitable[KJTAllToAllTensorsAwaitable], scores_kjt
+        self,
+        keys_awaitable: Awaitable[KJTAllToAllTensorsAwaitable],
+        scores_kjt,
+        scores_awaitable: Optional[Awaitable[KJTAllToAllTensorsAwaitable]] = None,
     ) -> None:
         super().__init__()
         self._keys_awaitable = keys_awaitable
         self._scores_kjt = scores_kjt
+        self._scores_awaitable = scores_awaitable
 
     def _wait_impl(self) -> KJTAllToAllTensorsAwaitable:
         keys = self._keys_awaitable.wait()
+        if self._scores_awaitable is not None:
+            return _ScoredTensorsAwaitable(keys, self._scores_awaitable.wait())
         # What TorchRec itself reads of this awaitable (_set_sharding_context_intra_a2a):
         # the splits by label, which the scores' labels ("lengths", "values") find in the
         # keys' ones, whether or not the keys also carry weights.
@@ -316,6 +431,9 @@ class RwSparseFeaturesDist(_RwSparseFeaturesDist):
     # unique keys at the length of its input, the real ones first, instead of cutting
     # them to length with a read of their count: ``forward`` cuts them (see
     # :func:`cut_to_length_per_key`). A distributor of TorchRec's gets exact arrays.
+    # It is a property of ``forward``, not of the class: a subclass that overrides
+    # ``forward`` without the cut must set it to False, or the all2all is handed arrays
+    # longer than its split sizes add up to.
     accepts_padded_dedup: bool = True
 
     def __init__(
@@ -345,6 +463,21 @@ class RwSparseFeaturesDist(_RwSparseFeaturesDist):
             persistent=False,
         )
         self._per_key_score = per_key_score
+        # The scores are sent in the splits of the keys' all2all (see
+        # _ScoredSplitsAwaitable). A TorchRec that does not let them gets an all2all of
+        # their own, as before, and is told once.
+        self._score_dist: Optional[KJTAllToAll] = None
+        if per_key_score:
+            problem = splits_reuse_problem()
+            if problem is not None:
+                warnings.warn(
+                    "The scores of a table with score_strategy PRECISE_CUSTOMIZED are "
+                    "sent with an all2all of their own, which waits for the device more "
+                    "than it has to: this TorchRec's KJTAllToAllTensorsAwaitable is not "
+                    f"the one the input distribution was written against ({problem}).",
+                    RuntimeWarning,
+                )
+                self._score_dist = KJTAllToAll(pg=pg, splits=[num_features] * pg.size())
 
     def forward(
         self,
@@ -410,4 +543,8 @@ class RwSparseFeaturesDist(_RwSparseFeaturesDist):
             # The same lengths: the sum per key, which the cut above read, is known.
             length_per_key=bucketized_features.length_per_key(),
         )
+        if self._score_dist is not None:
+            return _ScoredSplitsAwaitable(
+                keys_dist, scores_kjt, self._score_dist(scores_kjt)
+            )
         return _ScoredSplitsAwaitable(keys_dist, scores_kjt)
