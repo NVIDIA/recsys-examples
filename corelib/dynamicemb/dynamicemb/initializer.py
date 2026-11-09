@@ -121,6 +121,16 @@ class MultiTableInitializer(abc.ABC):
         rows, not another thing to line up with them. The kernels check the
         lengths, so lining something up with ``indices`` instead is refused
         rather than read past the end of.
+
+        An entry of ``indices`` that is negative (``-1`` by convention) selects
+        no row: nothing is written for it and nothing is read from ``keys`` or
+        ``table_ids`` on its behalf. That lets a caller keep ``indices`` as long
+        as the batch and mark the rows it wants left alone, instead of
+        compacting them out. An extension that predates this does not check, so
+        a negative entry is only legal when
+        ``dynamicemb_extensions.initializer_skips_negative_index`` is true;
+        :func:`dynamicemb.sync_free.initialize_masked` tests that, and gives
+        the same result without it.
         """
         ...
 

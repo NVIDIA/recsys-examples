@@ -255,7 +255,8 @@ class BaseDynamicEmbeddingOptimizer(abc.ABC):
 
         ``optim_states`` is the state region only -- ``(rows, state_width)`` --
         never the embedding, so an optimizer cannot reach outside what it owns.
-        ``indices`` selects which rows to write; ``None`` means all of them.
+        ``indices`` selects which rows to write, as an int64 tensor of row
+        numbers; ``None`` means all of them.
 
         Callers that hold a fused value buffer should slice the state region off
         first and pass ``indices`` rather than indexing rows first: basic
@@ -278,7 +279,21 @@ class BaseDynamicEmbeddingOptimizer(abc.ABC):
         if indices is None:
             optim_states.fill_(fill)
         else:
-            optim_states[indices] = fill
+            # Not ``optim_states[indices] = fill``: assigning a Python scalar
+            # through a CUDA index tensor copies the scalar to the device
+            # synchronously. index_fill_ takes it as a kernel argument.
+            optim_states.index_fill_(0, indices, fill)
+
+    def needs_row_dims(self) -> bool:
+        """Whether :meth:`reset_optimizer_states` reads ``emb_dims``.
+
+        False means the reset is a uniform fill, so a caller can leave
+        ``emb_dims`` out instead of gathering the width of every row's table.
+        Ask it at every reset rather than once: the initial state can change
+        after construction (:meth:`set_initial_optimizer_state`, or loading a
+        checkpoint), and with it the answer.
+        """
+        return False
 
     def _check_state_width(
         self,
@@ -957,6 +972,10 @@ class FTRLDynamicEmbeddingOptimizer(BaseDynamicEmbeddingOptimizer):
     def get_state_dim(self, emb_dim: int) -> int:
         return get_optimizer_state_dim(DynamicEmbOptimType.FTRL, emb_dim)
 
+    def needs_row_dims(self) -> bool:
+        # A zero accumulator makes both halves start at zero: a uniform fill.
+        return self._opt_args.initial_accumulator_value != 0.0
+
     def reset_optimizer_states(
         self,
         optim_states: torch.Tensor,
@@ -983,8 +1002,11 @@ class FTRLDynamicEmbeddingOptimizer(BaseDynamicEmbeddingOptimizer):
                 optim_states[:, :emb_dims] = 0.0
                 optim_states[:, emb_dims : 2 * emb_dims] = accum
             else:
-                optim_states[indices, :emb_dims] = 0.0
-                optim_states[indices, emb_dims : 2 * emb_dims] = accum
+                # Column slices are views, so index_fill_ writes through them;
+                # unlike a scalar assigned through ``indices`` it needs no
+                # synchronous copy of the scalar to the device.
+                optim_states[:, :emb_dims].index_fill_(0, indices, 0.0)
+                optim_states[:, emb_dims : 2 * emb_dims].index_fill_(0, indices, accum)
             return
 
         # Per-row widths: build the row image and assign it in one write.

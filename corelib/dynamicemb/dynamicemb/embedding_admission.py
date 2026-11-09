@@ -19,7 +19,8 @@ import warnings
 from typing import List, Optional
 
 import torch
-from dynamicemb.initializer import MultiTableInitializer
+from dynamicemb import sync_free as sf
+from dynamicemb.initializer import _INITIALIZERS, MultiTableInitializer
 from dynamicemb.scored_hashtable import (
     ScoreArg,
     ScorePolicy,
@@ -272,6 +273,18 @@ class MultiTableFrequencyAdmitter(MultiTableAdmitter):
         table_ids: torch.Tensor,
         frequencies: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        """Count these keys, and admit the ones whose count reached the threshold.
+
+        ``keys`` may be as long as a whole batch, holding the reserved all-ones
+        key at the positions the caller is not asking about, and ``table_ids``
+        may be ``-1`` past the end of the batch. The built-in
+        :class:`MultiTableKVCounter` skips those, but reports a skipped key's
+        input frequency as its count, which can reach the threshold. So the mask
+        is only meaningful where the caller asked: the caller has to AND it with
+        its own mask of those positions. Any other counter is only promised
+        dense keys, so with one ``keys`` must hold none of that (see
+        :func:`admitter_accepts_empty_keys`).
+        """
         if frequencies is None:
             frequencies = torch.ones(
                 keys.shape[0], dtype=torch.int64, device=keys.device
@@ -286,14 +299,22 @@ class MultiTableFrequencyAdmitter(MultiTableAdmitter):
         admit_mask = accumulated >= self._threshold
 
         # A key that got in is no longer waiting, so it stops taking up room.
-        # This repeats a compaction the caller also makes over the same mask;
-        # one pass over the missing keys is worth keeping the counter's whole
-        # lifecycle in the one place that knows the counter exists.
-        _, _, (admitted_keys, admitted_table_ids) = flagged_compact(
-            admit_mask, [keys, table_ids]
-        )
-        if admitted_keys.numel() > 0:
-            self._counter.erase(admitted_keys, admitted_table_ids)
+        # Erasing it here keeps the counter's whole lifecycle in the one place
+        # that knows the counter exists.
+        if type(self._counter) is MultiTableKVCounter:
+            # The counter's erase passes over the reserved key without reading
+            # its table id, so blank the keys that stay instead of compacting
+            # the admitted ones: compacting would read their count back to the
+            # host on every call.
+            self._counter.erase(sf.mask_keys(keys, admit_mask), table_ids)
+        else:
+            # A counter of the user's own is only promised dense keys. Exact
+            # type, not isinstance: a subclass may override erase.
+            _, _, (admitted_keys, admitted_table_ids) = flagged_compact(
+                admit_mask, [keys, table_ids]
+            )
+            if admitted_keys.numel() > 0:
+                self._counter.erase(admitted_keys, admitted_table_ids)
         return admit_mask
 
     def state(self) -> Optional[Counter]:
@@ -325,8 +346,8 @@ class ProbabilisticAdmissionStrategy(AdmissionStrategy):
     Notes
     -----
     The draws come from ``torch.rand``, so they follow ``torch.manual_seed``
-    and survive CUDA graph capture. A seeded run repeats, but the draws are
-    consumed in the order keys go missing, so changing the batch size or the
+    and survive CUDA graph capture. A seeded run repeats, but which draw a key
+    gets depends on where its batch puts it, so changing the batch size or the
     data order changes which keys get in.
     """
 
@@ -363,6 +384,10 @@ class ProbabilisticAdmissionStrategy(AdmissionStrategy):
 class MultiTableProbabilisticAdmitter(MultiTableAdmitter):
     """What :class:`ProbabilisticAdmissionStrategy` becomes for one module."""
 
+    # admit draws from torch.rand, so the module must not let timing decide
+    # whether it runs: a seeded run would then draw a different amount each time.
+    uses_rng = True
+
     def __init__(self, probability: float, non_admitted_initializer=None):
         self._probability = probability
         # log(1 - probability), for compounding a batch's repeats below. Only
@@ -377,6 +402,12 @@ class MultiTableProbabilisticAdmitter(MultiTableAdmitter):
         table_ids: torch.Tensor,
         frequencies: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        """Toss once for every entry of ``keys``, and say which tosses won.
+
+        ``keys`` may be as long as a whole batch, holding the reserved all-ones
+        key where the caller is not asking about a position. Those positions
+        take a toss like any other, and the caller ignores their answer.
+        """
         num_keys = keys.shape[0]
         if self._probability <= 0.0:
             return torch.zeros(num_keys, dtype=torch.bool, device=keys.device)
@@ -400,3 +431,47 @@ class MultiTableProbabilisticAdmitter(MultiTableAdmitter):
     @property
     def non_admitted_initializer(self):
         return self._non_admitted_initializer
+
+
+# The admitters of this module, written against the contract of
+# ``MultiTableAdmitter.accepts_empty_keys``: ``admit`` tolerates the reserved
+# all-ones key and a table id of -1. They are told apart by their exact type, so
+# a user's subclass of one of these, which may override ``admit``, is not in it.
+# Being in it is necessary but not enough, because an admitter hands those
+# arrays on to others: ask :func:`admitter_accepts_empty_keys`.
+IN_TREE_ADMITTERS = (MultiTableFrequencyAdmitter, MultiTableProbabilisticAdmitter)
+
+
+def admitter_accepts_empty_keys(admitter: Optional[MultiTableAdmitter]) -> bool:
+    """Whether the module may call ``admitter.admit`` with whole-batch arrays.
+
+    That is the contract of :attr:`MultiTableAdmitter.accepts_empty_keys`. The
+    class alone does not settle it, because the arrays go on to what the
+    admitter holds:
+
+    * The frequency admitter passes them to its counter, and only the built-in
+      :class:`MultiTableKVCounter` skips the reserved key. One built by hand
+      around a counter of the user's own, or around a subclass of the built-in
+      one, has been promised dense keys like any other ``Counter``.
+    * The module may call ``non_admitted_initializer`` with a negative index at
+      every row it must leave alone, which only the initializers of
+      :mod:`dynamicemb.initializer` are written for.
+
+    Both are matched by exact type, as the admitters are. ``None``, no admission
+    at all, has nothing to call. An admitter that is not in
+    :data:`IN_TREE_ADMITTERS` qualifies only by an ``accepts_empty_keys`` in its
+    own class ``__dict__``, never an inherited one.
+    """
+    if admitter is None:
+        return True
+    kind = type(admitter)
+    if kind in IN_TREE_ADMITTERS:
+        if (
+            kind is MultiTableFrequencyAdmitter
+            and type(admitter.state()) is not MultiTableKVCounter
+        ):
+            return False
+    elif not kind.__dict__.get("accepts_empty_keys", False):
+        return False
+    initializer = admitter.non_admitted_initializer
+    return initializer is None or type(initializer) in _INITIALIZERS.values()

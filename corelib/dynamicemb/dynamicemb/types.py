@@ -362,7 +362,6 @@ class Storage(abc.ABC, Generic[OptionsT, OptimizerT]):
         scalar cannot describe an optimizer whose state regions start at
         different values.
         """
-        pass
 
     @abc.abstractmethod
     def export_keys_values(
@@ -588,7 +587,35 @@ class MultiTableAdmitter(abc.ABC):
 
     Built by :meth:`AdmissionStrategy.create_admitter`, and the only half that
     holds anything -- whatever deciding takes, it owns.
+
+    Two class attributes say how the module may call :meth:`admit`. Both
+    default to the cautious answer, so an admitter that sets neither is called
+    exactly as it always was.
+
+    ``accepts_empty_keys``: True lets the module call ``admit`` with arrays as
+    long as the whole batch of unique keys, rather than only the missing keys,
+    so that it never has to ask the device how many are missing. Positions
+    that are not missing keys hold the reserved all-ones key (``-1`` for int64
+    keys, ``0xFFFFFFFFFFFFFFFF`` for uint64 ones; no table stores it), and
+    positions past the end of the batch also have the table id ``-1``. What
+    ``frequencies`` holds at them is unspecified. The module ignores the answer
+    for those positions. Set it on your own class only if ``admit`` copes with
+    all of that, does not count those positions as keys, and returns a mask as
+    long as ``keys``. The module may then mark the rows its initializers must
+    leave alone with a negative index, which only dynamicemb's own initializers
+    are written for, so an admitter whose ``non_admitted_initializer`` is
+    anything else is still called the old way. The attribute is read from the
+    class's own ``__dict__``: a subclass of an admitter that opted in has to
+    opt in itself, so that overriding ``admit`` never inherits a promise the
+    new code did not make.
+
+    ``uses_rng``: True for an admitter whose ``admit`` draws random numbers.
+    The module then never lets timing decide whether to call it for a batch,
+    so a seeded run consumes the same draws every time.
     """
+
+    accepts_empty_keys: bool = False
+    uses_rng: bool = False
 
     @abc.abstractmethod
     def admit(
@@ -600,7 +627,9 @@ class MultiTableAdmitter(abc.ABC):
         """Which of these missing keys may enter the table.
 
         Args:
-            keys (torch.Tensor): The keys to decide on, deduplicated.
+            keys (torch.Tensor): The keys to decide on, deduplicated. With
+                ``accepts_empty_keys`` also the reserved all-ones key at the
+                positions that are not missing keys; see the class docstring.
             table_ids (torch.Tensor): The table each key belongs to. One module
                 spans several, so a decision may be made per table.
             frequencies (Optional[torch.Tensor]): How often each key occurred in
