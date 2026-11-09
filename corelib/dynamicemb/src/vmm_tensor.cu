@@ -78,6 +78,83 @@ namespace py = pybind11;
 
 namespace dyn_emb {
 
+namespace {
+
+// Waits until the GPU has finished all work queued on `device`.
+//
+// cudaFree waits like this before it frees memory, but cuMemUnmap and
+// cuMemRelease do not. The tensors that VMMTensor::data() returns do not own
+// the memory, so without this wait, dropping the last reference to a VMMTensor
+// would free the memory while kernels that use it still wait in a stream.
+// Those kernels would then read or write unmapped memory and fail with an
+// illegal memory access. The wait covers every stream of the device, because
+// DynamicEmb kernels run on whichever stream is current, and TorchRec
+// pipelines use several. PyTorch also waits for queued work before it unmaps
+// an expandable segment.
+//
+// Like any device sync, this also waits for queued collectives, such as NCCL
+// kernels. If a peer launches its side of one only after a host-side step (a
+// barrier, a store wait) that this rank reaches after the drop, the ranks
+// deadlock; finish pending collectives before dropping a table. A device sync
+// is not allowed during CUDA graph capture, so a drop during a capture breaks
+// that capture.
+//
+// ~VMMTensor() and ~HostVMMTensor() call this, so it never throws. If the wait
+// fails, for example after a sticky error from an earlier kernel or during a
+// graph capture, it logs the failed step and the caller still frees the memory.
+// It never creates a CUDA context: if the
+// device has no active primary context, as after CUDA has shut down at exit,
+// no work can be queued on it.
+void wait_for_device_work(int device) {
+  // A failed wait is reported, not thrown (this runs in destructors). The
+  // memory is still freed, so the log is the only trace of the cause if a later
+  // kernel then faults on it.
+  auto report = [device](const char *step, CUresult result) {
+    const char *name = nullptr;
+    cuGetErrorName(result, &name);
+    std::cerr << "dynamicemb: wait for queued GPU work on device " << device
+              << " failed in " << step << ": " << (name ? name : "unknown")
+              << "; freeing the memory anyway\n";
+  };
+  CUdevice device_handle;
+  CUresult result = cuDeviceGet(&device_handle, device);
+  if (result != CUDA_SUCCESS) {
+    report("cuDeviceGet", result);
+    return;
+  }
+  unsigned int context_flags = 0;
+  int context_active = 0;
+  result = cuDevicePrimaryCtxGetState(device_handle, &context_flags,
+                                      &context_active);
+  if (result != CUDA_SUCCESS) {
+    report("cuDevicePrimaryCtxGetState", result);
+    return;
+  }
+  if (!context_active) {
+    return;
+  }
+  CUcontext context = nullptr;
+  result = cuDevicePrimaryCtxRetain(&context, device_handle);
+  if (result != CUDA_SUCCESS) {
+    report("cuDevicePrimaryCtxRetain", result);
+    return;
+  }
+  // Push and pop leave the caller's current context and device as they were.
+  result = cuCtxPushCurrent(context);
+  if (result == CUDA_SUCCESS) {
+    result = cuCtxSynchronize();
+    if (result != CUDA_SUCCESS) {
+      report("cuCtxSynchronize", result);
+    }
+    cuCtxPopCurrent(&context);
+  } else {
+    report("cuCtxPushCurrent", result);
+  }
+  cuDevicePrimaryCtxRelease(device_handle);
+}
+
+} // namespace
+
 class VMMTensor {
 
 public:
@@ -215,6 +292,8 @@ public:
   std::size_t allocated_bytes() const { return m_size; }
 
   ~VMMTensor() {
+    // Kernels queued before this free may still use the memory.
+    wait_for_device_work(device_);
     if (m_size > 0) {
       cuMemUnmap(m_addr, m_size);
     }
@@ -526,6 +605,11 @@ public:
   ~HostVMMTensor() {
 
     if (m_size > 0) {
+      // Kernels queued before this free may still read or write the memory
+      // through the mapped device pointer. Wait for them explicitly: whether
+      // cudaHostUnregister also waits is driver behavior the CUDA docs do not
+      // promise.
+      wait_for_device_work(device_);
       munlock(m_addr_h, m_reserved);
       // Best-effort: a destructor must never throw, so do not CUDA_CHECK here.
       // Clear the sticky error so it cannot surface in an unrelated check.

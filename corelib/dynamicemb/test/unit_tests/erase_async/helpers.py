@@ -53,6 +53,7 @@ def build_de_table(
     local_hbm_for_values: int = 1024**3,
     max_capacity: int = 1 << 20,
     init_capacity: int = 1 << 10,
+    names: Optional[List[str]] = None,
     **options,
 ) -> BatchedDynamicEmbeddingTablesV2:
     """``num_tables`` tables of one feature each, values that show whose they are, and an
@@ -81,7 +82,7 @@ def build_de_table(
     return BatchedDynamicEmbeddingTablesV2(
         table_options=[one() for _ in range(num_tables)],
         output_dtype=torch.float32,
-        table_names=table_names(num_tables),
+        table_names=table_names(num_tables) if names is None else names,
         feature_table_map=list(range(num_tables)),
         pooling_mode=DynamicEmbPoolingMode.SUM,
         use_index_dedup=False,

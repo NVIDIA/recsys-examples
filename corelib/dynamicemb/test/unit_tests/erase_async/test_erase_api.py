@@ -49,10 +49,15 @@ S = DynamicEmbScoreStrategy
         ((S.NO_EVICTION, S.PRECISE_CUSTOMIZED), S.PRECISE_CUSTOMIZED, [0]),
         (S.LFU, S.LFU, [0]),
         (S.TIMESTAMP, S.TIMESTAMP, [0]),
+        ((S.TIMESTAMP, S.LFU), S.TIMESTAMP, [0]),
+        ((S.TIMESTAMP, S.LFU), S.LFU, [0]),
+        ((S.LFU, S.TIMESTAMP), S.TIMESTAMP, [0]),
+        ((S.LFU, S.TIMESTAMP), S.LFU, [0]),
         # A member, not a family: the other strategy, or no score at all, is not asked for.
         (S.CUSTOMIZED, S.PRECISE_CUSTOMIZED, []),
         ((S.NO_EVICTION, S.CUSTOMIZED), S.PRECISE_CUSTOMIZED, []),
         (S.LFU, S.CUSTOMIZED, []),
+        ((S.TIMESTAMP, S.LFU), S.CUSTOMIZED, []),
         (S.NO_EVICTION, S.CUSTOMIZED, []),
     ],
 )
@@ -138,14 +143,6 @@ def test_the_chunk_and_the_limit_in_flight_given_are_the_ones_the_scan_gets(devi
         (1 << 19, 1),
         (ERASE_CHUNK_SLOTS, ERASE_MAX_CHUNKS_IN_FLIGHT),
     ]
-
-
-def test_a_table_of_two_score_words_cannot_be_erased_by_either(device):
-    two_words = build_de_table(device.index, (S.TIMESTAMP, S.LFU))
-    for member in (S.TIMESTAMP, S.LFU):
-        with pytest.raises(NotImplementedError, match="reads one"):
-            two_words.erasable_table_ids(member)
-    assert two_words.erasable_table_ids(S.CUSTOMIZED) == []
 
 
 @pytest.mark.parametrize(
