@@ -832,6 +832,33 @@ def test_replay_with_caching(current_device):
     torch.testing.assert_close(out_vals, src_vals)
 
 
+def test_replay_counts_its_keys_in_the_growth_estimate(current_device):
+    """Replay writes keys at the slots of the source, outside any batch, so no
+    ``expand_if_need`` announced them. The size estimate that a growth is decided from --
+    the newest landed snapshot plus the bounds issued since -- must never be below what
+    the table holds, or a following step would decide to grow one batch late."""
+    device = torch.device(f"cuda:{current_device}")
+    cfg = dict(max_capacity=4096, init_capacity=1024, bucket_capacity=128)
+    src = make_model(current_device, **cfg)
+    dst = make_model(current_device, **cfg)
+
+    keys = list(range(1001, 1301))
+    touch(src, keys, device)
+    delta = dump_all(src)
+
+    snapshots = dst._storage._state.size_snapshots
+    assert snapshots is not None, "a table that can still grow keeps a size estimate"
+    issued = int(snapshots.issued[0])
+    stats = dst.replay_increment(delta)[TABLE_NAME]
+    assert stats.upserted == len(keys)
+
+    assert int(snapshots.issued[0]) - issued == len(keys)
+    # Before any snapshot has landed: the estimate is the replayed keys, an upper
+    # bound of what the table holds.
+    estimated_keys, _ = snapshots.estimate()
+    assert int(estimated_keys[0]) >= stats.upserted
+
+
 def test_replay_rechecks_layout_after_cache_flush_expansion(current_device):
     """A cache flush may rehash storage, invalidating the source slot plan."""
     device = torch.device(f"cuda:{current_device}")

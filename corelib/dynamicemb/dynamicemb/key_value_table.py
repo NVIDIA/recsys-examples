@@ -926,6 +926,22 @@ def _note_forwarded(state: DynamicEmbTableState, bound: torch.Tensor) -> None:
     request_size_snapshot(state)
 
 
+def _note_replayed(state: DynamicEmbTableState, table_id: int, count: int) -> None:
+    """A replay wrote ``count`` keys into table ``table_id`` of ``state``, which no batch
+    announced to ``expand_if_need``: add them to what the size estimate has to cover.
+
+    The estimate is the newest snapshot that has landed plus the bounds issued after the
+    inserts it saw, and it must never be below what the table holds -- a growth decided
+    from a low one comes late, and for a table that never evicts the device assert on the
+    row limit is the only net left. A snapshot that was enqueued after the replay wrote
+    has these keys already, and its mark has this bound, so nothing is counted twice
+    once it lands. A host int; nothing is read from the device.
+    """
+    snapshots = state.size_snapshots
+    if snapshots is not None:
+        snapshots.issued[table_id] += count
+
+
 def collect_table_sizes_for_state(
     state: DynamicEmbTableState, non_blocking: bool = True
 ) -> None:
@@ -3205,6 +3221,7 @@ def _replay_state_increment(
         insert_score,
         content,
     )
+    _note_replayed(state, table_id, n)
     return stats
 
 

@@ -1786,7 +1786,7 @@ Users can specify the initial capacity of a table on a single GPU. When the tabl
   The growth is not capped by `max_capacity`.
 - **Loading a checkpoint** (`DynamicEmbStorage.load`): the table is sized for the keys **this rank keeps** from the file (counted from the key file with the rank's ownership filter), not for every key in it, since a checkpoint may hold other ranks' keys as well.
 
-**When the decision is made.** The check does not wait for the GPU. It compares the load factor with the last landed snapshot of the table sizes plus the number of keys the batches since could add (for a table, the key count of its own features when the input carries it, never read from the device), so a table can grow by up to a few batches' keys earlier than an exact check would, and never later. Set `DYNAMICEMB_EXACT_GROWTH=1` for the blocking exact check. Growing itself remaps memory and synchronizes the device.
+**When the decision is made.** The check does not wait for the GPU. It compares the load factor with the last landed snapshot of the table sizes plus the number of keys the batches since could add (for a table, the key count of its own features when the input carries it, never read from the device) and the keys a `replay_increment` wrote, so a table can grow by up to a few batches' keys earlier than an exact check would, and never later. Set `DYNAMICEMB_EXACT_GROWTH=1` for the blocking exact check. Growing itself remaps memory and synchronizes the device.
 
 
 ## Erasing keys by score
