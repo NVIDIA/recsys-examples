@@ -55,6 +55,20 @@ def pooling_mode_to_dynamicemb(pooling: PoolingMode) -> DynamicEmbPoolingMode:
         raise Exception(f"Invalid pooling type {pooling}")
 
 
+def _feature_key_counts(
+    emb_module: BatchedDynamicEmbeddingTablesV2, features
+) -> Optional[List[int]]:
+    """The key count of each feature of ``features``, for the growth of ``emb_module``'s
+    storage, when it uses them and the KeyedJaggedTensor already holds them.
+
+    ``length_per_key_or_none`` only reads what the tensor cached; ``length_per_key()``
+    would compute it, waiting for the device. The splitting of a sharding's features
+    into one KeyedJaggedTensor per group computes it for the whole input, so the
+    groups carry theirs.
+    """
+    return features.length_per_key_or_none() if emb_module.needs_key_bounds else None
+
+
 def _placement_rank(placement) -> int:
     if placement is None:
         raise ValueError("Shard metadata without a placement has no rank.")
@@ -432,6 +446,7 @@ class BatchedDynamicEmbeddingBag(
             offsets=features.offsets().long(),
             pooling_weights=pooling_weights,
             scores=self._scores_of(features),
+            feature_key_counts=_feature_key_counts(self._emb_module, features),
         )
 
 
@@ -562,6 +577,7 @@ class BatchedDynamicEmbedding(BaseBatchedEmbedding[torch.Tensor]):
             offsets=features.offsets(),
             forward_stream=forward_stream,
             scores=self._scores_of(features),
+            feature_key_counts=_feature_key_counts(self._emb_module, features),
         )
 
     def forward(self, features) -> torch.Tensor:
@@ -570,4 +586,5 @@ class BatchedDynamicEmbedding(BaseBatchedEmbedding[torch.Tensor]):
             offsets=features.offsets().long(),
             frequency_counters=features.weights_or_none(),
             scores=self._scores_of(features),
+            feature_key_counts=_feature_key_counts(self._emb_module, features),
         )

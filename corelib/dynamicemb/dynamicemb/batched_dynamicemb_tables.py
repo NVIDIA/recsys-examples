@@ -40,6 +40,7 @@ from typing import (
 
 import torch  # usort:skip
 import torch.distributed as dist
+from dynamicemb import sync_free as sf
 from dynamicemb.async_erase import (
     AsyncEraser,
     EraseHandle,
@@ -49,6 +50,7 @@ from dynamicemb.async_erase import (
 )
 from dynamicemb.batched_dynamicemb_function import (
     DynamicEmbeddingFunction,
+    OutstandingKeys,
     PrefetchState,
     dynamicemb_eval_forward,
     dynamicemb_prefetch,
@@ -570,6 +572,17 @@ class _ReplayJob:
     erased_slot_index: Optional[Tensor] = None
 
 
+class _TicketQueue(deque):
+    """The tickets of the reads in flight on a ``DeferredRead`` ring, oldest first.
+
+    A copy of the module (copy.deepcopy, pickle) gets a ring of its own, in which none
+    of them is in flight, so it starts without any.
+    """
+
+    def __reduce__(self):
+        return (_TicketQueue, ())
+
+
 class BatchedDynamicEmbeddingTablesV2(nn.Module):
     """
     Dynamic Embedding uses a GPU-optimized scored hash table backend.
@@ -702,7 +715,8 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
         self.use_index_dedup = use_index_dedup
         self._enable_prefetch = prefetch_pipeline
         self.prefetch_stream = None
-        self._prefetch_outstanding_keys = torch.tensor(0, dtype=torch.int64)
+        # What the batches prefetched and not yet forwarded pin in the cache.
+        self._prefetch_outstanding_keys = OutstandingKeys()
         # Who may touch the tables now: prefetch, and an erase running beside the
         # training. See async_erase.py.
         self._table_gate = TableAccessGate()
@@ -840,6 +854,19 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
         self.per_key_score: bool = any(
             option.takes_score_per_key for option in self._dynamicemb_options
         )
+        # The check for a negative score is read back late (see _check_scores), through
+        # a pinned ring made here, and only for tables that ask to be checked.
+        self._score_ring: Optional[sf.DeferredRead] = (
+            sf.DeferredRead((1,), torch.int64, 4)
+            if self.per_key_score
+            and any(
+                option.safe_check_mode != DynamicEmbCheckMode.IGNORE
+                for option in self._dynamicemb_options
+            )
+            else None
+        )
+        # (ring ticket, whether an ERROR table asked for it), oldest first
+        self._score_pending: Deque[Tuple[int, bool]] = _TicketQueue()
         self._prefetch_states: Deque[PrefetchState] = deque()
 
         # TODO:1->10
@@ -1251,11 +1278,14 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
     def flush(self) -> None:
         if self._caching and self._cache is not None:
             flush_cache(self._cache, self._storage, self._external_storage)
+        # A negative score the batches found since the last call is reported here at
+        # the latest (see _check_scores); ``dump`` flushes first.
+        self._drain_score_checks(block=True)
 
     def reset_cache_states(self) -> None:
         if self._caching and self._cache is not None:
             self._cache.reset()
-            self._prefetch_outstanding_keys.zero_()
+            self._prefetch_outstanding_keys.reset()
 
     @property
     def table_names(self) -> List[str]:
@@ -1304,8 +1334,13 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
         batch_size_per_feature_per_rank: Optional[List[List[int]]] = None,
         total_unique_indices: Optional[int] = None,
         scores: Optional[Tensor] = None,
+        # The key count of each feature, when the caller already holds it (see
+        # ``prefetch``).
+        feature_key_counts: Optional[List[int]] = None,
     ) -> List[Tensor]:
-        self._check_scores(scores, indices)
+        # In training the prefetch of this batch, made below or earlier by the pipeline,
+        # checks the same scores: only evaluation, which prefetches nothing, does here.
+        self._check_scores(scores, indices, late=not self.training)
         if indices.dtype != self.index_type:
             indices = indices.to(self.index_type)
 
@@ -1413,7 +1448,11 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
 
         if not self._prefetch_states:
             self.prefetch(
-                indices, offsets, frequency_counters=frequency_counters, scores=scores
+                indices,
+                offsets,
+                frequency_counters=frequency_counters,
+                scores=scores,
+                feature_key_counts=feature_key_counts,
             )
         prefetch_state = self._prefetch_states.popleft()
 
@@ -1438,10 +1477,21 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
 
         return res
 
-    def _check_scores(self, scores: Optional[Tensor], indices: Tensor) -> None:
+    def _check_scores(
+        self, scores: Optional[Tensor], indices: Tensor, late: bool = True
+    ) -> None:
         """The scores must come exactly when the tables take a score per key.
 
         Evaluation reads no score, so it may go without them.
+
+        A negative score is looked for on the device, and what it found is reported
+        late: the answer is copied back without waiting, and the next call that finds
+        it landed raises (``ERROR``) or warns (``WARNING``), as does ``flush``. The
+        batch that carried the score has been processed by then, and a device assert
+        would poison the context. A call that finds every slot of the ring still in
+        flight -- the host is that far ahead of the device -- waits for the oldest
+        answer to make room, so that no check goes unmade. ``late=False`` leaves the
+        device out: the caller knows another call checks the same scores.
         """
         if scores is None:
             if self.per_key_score and self.training:
@@ -1459,18 +1509,111 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                 "scores must be int64, one per index; got "
                 f"{scores.dtype} x {scores.numel()} for {indices.numel()} indices."
             )
-        # Reading the values to look for a negative one waits for the device, so
-        # it is done only for a table that asked to be checked: an error stops
-        # on it, a warning says so.
+        # Looking for a negative value is done only for a table that asked to be
+        # checked: an error stops on it, a warning says so.
         modes = {option.safe_check_mode for option in self._dynamicemb_options}
-        if modes == {DynamicEmbCheckMode.IGNORE} or not bool((scores < 0).any()):
+        if not late or modes == {DynamicEmbCheckMode.IGNORE}:
             return
-        if DynamicEmbCheckMode.ERROR in modes:
+        error = DynamicEmbCheckMode.ERROR in modes
+        if self._score_ring is None or not scores.is_cuda:
+            self._check_scores_now(scores, error)
+            return
+        self._drain_score_checks(block=False)
+        # The check runs after this call returns: the scores' memory must not be
+        # handed to another stream before it has.
+        scores.record_stream(torch.cuda.current_stream())
+        found = (scores < 0).any().reshape(1).to(torch.int64)
+        ticket = self._score_ring.enqueue(found)
+        while ticket is None:
+            # Every slot holds an answer that has not landed. A check dropped for want
+            # of a slot would be a negative score nobody hears of, so wait for the
+            # oldest answer and take its slot: the only wait a check makes, and it
+            # holds the host back only while the device is a whole ring behind.
+            self._wait_for_oldest_score_check()
+            ticket = self._score_ring.enqueue(found)
+        self._score_pending.append((ticket, error))
+
+    def _check_scores_now(self, scores: Tensor, error: bool) -> None:
+        """The check that does not wait for a later call, for scores it cannot copy
+        back late: ones the host holds, or a module whose check mode was changed after
+        construction and has no ring."""
+        if bool((scores < 0).any()):
+            self._report_negative_scores(error)
+
+    @staticmethod
+    def _report_negative_scores(error: bool) -> None:
+        if error:
             raise ValueError("scores must be non-negative.")
         warnings.warn(
             "scores must be non-negative; a negative one is read as a very large "
             "score by the table."
         )
+
+    def _wait_for_oldest_score_check(self) -> None:
+        """Report what the oldest check in flight found, waiting for its answer, and
+        give its slot back."""
+        ticket, error = self._score_pending[0]
+        negative = bool(self._score_ring.wait(ticket)[0])
+        self._score_ring.release(ticket)
+        self._score_pending.popleft()
+        if negative:
+            self._report_negative_scores(error)
+
+    def _drain_score_checks(self, block: bool) -> None:
+        """Report what the checks started by ``_check_scores`` found: those that have
+        landed, or all of them, waiting for each, with ``block``."""
+        while self._score_pending:
+            ticket, error = self._score_pending[0]
+            if block:
+                negative = bool(self._score_ring.wait(ticket)[0])
+            elif self._score_ring.ready(ticket):
+                negative = bool(self._score_ring.value(ticket)[0])
+            else:
+                return
+            self._score_ring.release(ticket)
+            self._score_pending.popleft()
+            if negative:
+                self._report_negative_scores(error)
+
+    @property
+    def needs_key_bounds(self) -> bool:
+        """Whether the growth of this module's storage can use the key count of each
+        feature of a call (``feature_key_counts``): it has several tables and one of
+        them can still grow. A host fact. With one table the bound of its keys is the
+        whole batch, which the prefetch knows."""
+        if len(self._dynamicemb_options) <= 1:
+            return False
+        storage = self._storage
+        if isinstance(storage, DynamicEmbStorage):
+            states = [storage._state]
+        elif isinstance(storage, HybridStorage):
+            # Only the host tier grows.
+            states = [storage._host]
+        else:
+            return False
+        return any(state.size_snapshots is not None for state in states)
+
+    def _table_key_bounds(
+        self, feature_key_counts: Optional[List[int]], num_keys: Optional[int] = None
+    ) -> Optional[Tensor]:
+        """How many keys each table's part of a call has at most (CPU int64, one per
+        table), from the key count of each feature, or None when it is not known or
+        not wanted (see :attr:`needs_key_bounds`).
+
+        The storage sizes its growth from it. Without it every table is bounded by the
+        whole batch, which can only make a table grow earlier than it had to, and a
+        module of several tables, T-fold.
+        """
+        if feature_key_counts is None or not self.needs_key_bounds:
+            return None
+        if len(feature_key_counts) != len(self.feature_table_map) or (
+            num_keys is not None and sum(feature_key_counts) != num_keys
+        ):
+            return None
+        bounds = [0] * len(self._dynamicemb_options)
+        for count, table in zip(feature_key_counts, self.feature_table_map):
+            bounds[table] += count
+        return torch.tensor(bounds, dtype=torch.int64)
 
     def _counters_for_group(
         self, frequency_counters: Optional[Tensor]
@@ -1486,6 +1629,11 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
         batch_size_per_feature_per_rank: Optional[List[List[int]]] = None,
         frequency_counters: Optional[Tensor] = None,
         scores: Optional[Tensor] = None,
+        # The key count of each feature of the call (``length_per_key`` of its
+        # KeyedJaggedTensor, which must already be known: asking for it would wait
+        # for the device). It bounds what each table's keys can add, for the growth
+        # of the storage; without it every table is bounded by the whole batch.
+        feature_key_counts: Optional[List[int]] = None,
     ) -> None:
         self._check_scores(scores, indices)
         if not self.training:
@@ -1535,6 +1683,9 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                 external_storage=self._external_storage,
                 scores=scores,
                 table_gate=self._table_gate,
+                table_key_bounds=self._table_key_bounds(
+                    feature_key_counts, indices.numel()
+                ),
             )
         )
         self._update_score()

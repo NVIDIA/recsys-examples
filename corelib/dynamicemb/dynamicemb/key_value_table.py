@@ -455,6 +455,10 @@ class DynamicEmbTableState:
     # key map grows with the keys it holds and its value buffer with the rows.
     estimated_row_counts: Optional[torch.Tensor] = None
     collect_table_sizes_flag: bool = False
+    # What a state that can still grow decides its expansions from, without waiting
+    # for the device (see :class:`SizeSnapshots`). ``None`` for a state that cannot
+    # grow, which then has nothing to estimate.
+    size_snapshots: Optional["SizeSnapshots"] = None
     # How many times ``key_index_map`` has been replaced (an expansion builds a
     # new one and drops the old). A slot number means something only in the map it
     # was read from, so whoever walks the slots across calls -- an erase by score,
@@ -699,6 +703,11 @@ def create_table_state(
         )
         if no_eviction
         else None,
+        # Its pinned ring is allocated here, once; a state that never grows (a cache,
+        # a table at its max_capacity) gets no ring and no per-step work at all.
+        size_snapshots=SizeSnapshots(num_tables, with_rows=no_eviction)
+        if _tables_can_grow(options, no_eviction, key_index_map_caps)
+        else None,
         evicted_item_mode=evicted_item_mode,
         miss_gate=sf.MissGate(),
         retain_ring=sf.DeferredRead((1,), torch.int64, slots=8)
@@ -735,10 +744,197 @@ def collect_row_counts_to_device(state: DynamicEmbTableState) -> torch.Tensor:
     return state.key_index_map.row_counters_.to(torch.int64)
 
 
+# DYNAMICEMB_EXACT_GROWTH=1 makes every expansion decision wait for the device sizes,
+# as it did before the estimate below existed. A checkpoint load always does.
+_EXACT_GROWTH = os.environ.get("DYNAMICEMB_EXACT_GROWTH", "0") == "1"
+
+
+def _tables_can_grow(
+    options: Sequence[DynamicEmbTableOptions],
+    no_eviction: bool,
+    per_table_capacity: Sequence[int],
+) -> bool:
+    """Whether some table could still be expanded: the skips :func:`get_expand_info`
+    makes for a table, less the one that depends on the batch (no new key)."""
+    for opt, cap in zip(options, per_table_capacity):
+        max_lf = NO_EVICTION_LOAD_FACTOR if no_eviction else opt.max_load_factor
+        if max_lf <= 0:
+            continue
+        # A table that never evicts is not capped by max_capacity.
+        if no_eviction or opt.max_capacity is None or cap < opt.max_capacity:
+            return True
+    return False
+
+
+def can_grow(state: DynamicEmbTableState) -> bool:
+    """Whether some table of ``state`` could still be expanded. A state that cannot
+    (a cache, tables at their ``max_capacity``) has nothing to estimate."""
+    return _tables_can_grow(
+        state.options_list, state.no_eviction, state.key_index_map.per_table_capacity_
+    )
+
+
+class SizeSnapshots:
+    """What a growable state decides its expansions from, without waiting for the device.
+
+    The host needs two numbers to decide whether a batch makes a table grow: the keys
+    each table holds and, for a table that never evicts, the value rows it has handed
+    out. Both live on the device. Instead of reading them back at the moment of the
+    decision, a snapshot of both is copied into a pinned ring slot as the state's
+    inserts are enqueued, and the estimate is
+
+        the newest snapshot that has landed
+        + the bound of every batch issued after the inserts that snapshot saw.
+
+    It is never too low, which is what lets a growth decision go without a confirming
+    read: the snapshot is ordered, on the stream that performs the state's inserts,
+    after every insert enqueued on that stream before it, and a later batch adds at
+    most its bound to a table (its unique keys there). It can be too high -- a bound
+    counts keys the table already has, and a snapshot that has not landed yet leaves
+    its batches in the sum -- which makes a table grow earlier than an exact read
+    would, by about the keys of the batches in flight.
+
+    Where the snapshot is enqueued depends on where the state is inserted into. A
+    cache's backing storage and an HBM-only storage are inserted into by the prefetch,
+    so :func:`request_size_snapshot` is called there. A host or hybrid storage is
+    inserted into by the forward, on another stream, and a batch is prefetched before
+    it is forwarded: those batches are ``inflight`` until the forward calls
+    ``note_forwarded``, and are left out of what a snapshot saw.
+
+    Everything here is host bookkeeping on plain CPU tensors and the pinned ring,
+    which is allocated in the constructor: a step allocates nothing and waits for
+    nothing. All of it runs on the one thread that issues the batches.
+    """
+
+    def __init__(self, num_tables: int, with_rows: bool, slots: int = 4):
+        self.T = num_tables
+        self.with_rows = with_rows
+        self.slots = slots
+        # A snapshot is the keys per table, then the rows per table when it has them.
+        self.ring = sf.DeferredRead(
+            (2 * num_tables if with_rows else num_tables,), torch.int64, slots
+        )
+        # The sum of every bound given to ``expand_if_need``, and the part of it whose
+        # inserts are still to come (a batch prefetched but not yet forwarded).
+        self.issued = torch.zeros(num_tables, dtype=torch.int64)
+        self.inflight = torch.zeros(num_tables, dtype=torch.int64)
+        # The newest snapshot that has landed, and ``issued - inflight`` when it was
+        # enqueued: the bounds of the batches it already counted.
+        self.base_sizes = torch.zeros(num_tables, dtype=torch.int64)
+        self.base_rows = torch.zeros(num_tables, dtype=torch.int64)
+        self.base_issued = torch.zeros(num_tables, dtype=torch.int64)
+        # (ring ticket, ``issued - inflight`` at enqueue), oldest first.
+        self.pending = collections.deque()
+
+    def enqueue(
+        self, sizes_dev: torch.Tensor, rows_dev: Optional[torch.Tensor]
+    ) -> None:
+        """Start the copy of a snapshot. Call it on the stream that performs the
+        state's inserts, after the inserts it should include. Never blocks; when every
+        ring slot is still in flight the snapshot is dropped, which only leaves the
+        base older (a looser estimate)."""
+        packed = torch.cat([sizes_dev, rows_dev]) if self.with_rows else sizes_dev
+        ticket = self.ring.enqueue(packed)
+        if ticket is not None:
+            self.pending.append((ticket, self.issued - self.inflight))
+
+    def poll(self) -> None:
+        """Adopt the newest snapshot that has landed, if any. Never blocks."""
+        while self.pending and self.ring.ready(self.pending[0][0]):
+            ticket, mark = self.pending.popleft()
+            landed = self.ring.value(ticket)
+            self.base_sizes.copy_(landed[: self.T])
+            if self.with_rows:
+                self.base_rows.copy_(landed[self.T :])
+            self.base_issued.copy_(mark)
+            self.ring.release(ticket)
+
+    def estimate(self) -> Tuple[torch.Tensor, torch.Tensor]:
+        """``(keys, rows)`` per table: an upper bound of what the tables hold once every
+        batch issued so far has been inserted. ``rows`` means nothing for a state
+        without them."""
+        since = self.issued - self.base_issued
+        return self.base_sizes + since, self.base_rows + since
+
+    def rebase_exact(self, sizes: torch.Tensor, rows: Optional[torch.Tensor]) -> None:
+        """Start over from numbers the host has just read from the device, blocking
+        (a checkpoint load, a test, ``DYNAMICEMB_EXACT_GROWTH=1``): the snapshots still
+        in flight are older than they are and are dropped.
+
+        Inserts that were enqueued on another stream than the one that read the
+        numbers may be missing from them; that is the exposure the blocking read has
+        always had."""
+        for ticket, _ in self.pending:
+            self.ring.release(ticket)
+        self.pending.clear()
+        self.base_sizes.copy_(sizes)
+        if rows is None:
+            self.base_rows.zero_()
+        else:
+            self.base_rows.copy_(rows)
+        self.base_issued.copy_(self.issued - self.inflight)
+
+    def __reduce__(self):
+        # A copy of the state (copy.deepcopy, pickle) gets a ring of its own, so
+        # nothing is in flight in it. What was adopted so far still bounds its tables.
+        return (
+            _restore_size_snapshots,
+            (
+                self.T,
+                self.with_rows,
+                self.slots,
+                self.issued,
+                self.inflight,
+                self.base_sizes,
+                self.base_rows,
+                self.base_issued,
+            ),
+        )
+
+
+def _restore_size_snapshots(
+    num_tables, with_rows, slots, issued, inflight, base_sizes, base_rows, base_issued
+) -> SizeSnapshots:
+    snapshots = SizeSnapshots(num_tables, with_rows, slots)
+    snapshots.issued.copy_(issued)
+    snapshots.inflight.copy_(inflight)
+    snapshots.base_sizes.copy_(base_sizes)
+    snapshots.base_rows.copy_(base_rows)
+    snapshots.base_issued.copy_(base_issued)
+    return snapshots
+
+
+def request_size_snapshot(state: DynamicEmbTableState) -> None:
+    """Start reading the sizes of ``state`` back, to decide expansions from later
+    (see :class:`SizeSnapshots`). A few launches and an asynchronous copy, only for a
+    state that can still grow. Call it on the stream that performs the state's
+    inserts, after the ones it should count."""
+    snapshots = state.size_snapshots
+    if snapshots is None or _EXACT_GROWTH or not can_grow(state):
+        return
+    snapshots.enqueue(
+        collect_table_sizes_to_device(state),
+        collect_row_counts_to_device(state) if state.no_eviction else None,
+    )
+
+
+def _note_forwarded(state: DynamicEmbTableState, bound: torch.Tensor) -> None:
+    """The forward of a batch whose keys ``bound`` bounded has inserted them, on the
+    current stream: it is no longer in flight, and a snapshot taken now counts it."""
+    snapshots = state.size_snapshots
+    if snapshots is None:
+        return
+    snapshots.inflight -= bound
+    request_size_snapshot(state)
+
+
 def collect_table_sizes_for_state(
     state: DynamicEmbTableState, non_blocking: bool = True
 ) -> None:
-    """Copy device table sizes into ``state.estimated_table_sizes`` when flag is set."""
+    """Copy device table sizes into ``state.estimated_table_sizes`` when flag is set.
+
+    A blocking copy gives the exact numbers, which the size estimate of the state
+    restarts from."""
     if not state.collect_table_sizes_flag:
         return
     table_sizes = collect_table_sizes_to_device(state)
@@ -746,6 +942,10 @@ def collect_table_sizes_for_state(
     if state.estimated_row_counts is not None:
         state.estimated_row_counts.copy_(
             collect_row_counts_to_device(state), non_blocking=non_blocking
+        )
+    if not non_blocking and state.size_snapshots is not None:
+        state.size_snapshots.rebase_exact(
+            state.estimated_table_sizes, state.estimated_row_counts
         )
 
 
@@ -1227,7 +1427,37 @@ def _expand_if_need_no_eviction(
     rows_est.add_(unique_size_per_table)
 
 
-def expand_if_need_impl(
+def _expand_if_need_no_eviction_estimated(
+    state: DynamicEmbTableState,
+    keys_est: torch.Tensor,
+    rows_est: torch.Tensor,
+    unique_size_per_table: torch.Tensor,
+) -> None:
+    """:func:`_expand_if_need_no_eviction` from the size estimate of the state
+    (:class:`SizeSnapshots`), with no confirming read of the device.
+
+    ``keys_est`` and ``rows_est`` never fall below what the table holds, so a growth
+    that is needed is never decided late; the device assert that a row is below the
+    table's row limit stays as the safety net, and relies on that. They can be too
+    high, and then the table grows earlier than it had to.
+    """
+    results, targets = get_expand_info(state, keys_est, unique_size_per_table)
+    need_rows = (rows_est + unique_size_per_table).tolist()
+    # See _expand_if_need_no_eviction: a buffer that has a row for every slot of the
+    # key map has nothing more to grow to, so the rows it is asked for are no pressure.
+    rows_short = any(
+        need_rows[i] > state.tables[i].shape[0]
+        and state.tables[i].shape[0] < state.key_index_map.per_table_capacity_[i]
+        for i in range(state.num_tables)
+    )
+    if any(results):
+        _expand_tables_impl(state, results, targets)
+    # The value buffers follow the rows, whether or not the key map grew.
+    if any(results) or rows_short:
+        _grow_values_only(state, need_rows)
+
+
+def _expand_if_need_exact(
     state: DynamicEmbTableState,
     unique_size_per_table: torch.Tensor,
 ) -> None:
@@ -1236,7 +1466,9 @@ def expand_if_need_impl(
     unique_size_per_table is the CPU tensor from segmented_unique (shape
     (num_tables,) with per-table unique counts).
     When a second opinion on table sizes is needed, calls
-    :func:`collect_table_sizes_for_state` with ``non_blocking=False``.
+    :func:`collect_table_sizes_for_state` with ``non_blocking=False``: the decision
+    waits for the device. This is what :func:`expand_if_need_impl` does for a
+    checkpoint load and under ``DYNAMICEMB_EXACT_GROWTH=1``.
     """
     assert (
         unique_size_per_table.device.type == "cpu"
@@ -1273,6 +1505,77 @@ def expand_if_need_impl(
         state.collect_table_sizes_flag = False
     state.estimated_table_sizes.add_(unique_size_per_table)
     return
+
+
+def expand_if_need_impl(
+    state: DynamicEmbTableState,
+    unique_size_per_table: torch.Tensor,
+    *,
+    exact: bool = False,
+    inserts_in_forward: bool = False,
+) -> None:
+    """Expand the tables of ``state`` that a batch's keys would overfill.
+
+    ``unique_size_per_table`` (CPU, one int64 per table) is an upper bound of the
+    keys the batch can add to each table -- its unique keys there, or any number that
+    cannot be lower. The decision comes from the size estimate of the state
+    (:class:`SizeSnapshots`): it never waits for the device, and never comes too
+    late; it can come earlier than an exact read would have put it, by about the keys
+    of the batches that are in flight. The expansion itself still synchronizes the
+    device (``ExtendableBuffer.extend``), but a table at its ``max_capacity`` never
+    gets there.
+
+    ``exact`` (and ``DYNAMICEMB_EXACT_GROWTH=1``) decides from the device sizes
+    instead, waiting for them when an estimate says a table might grow. A checkpoint
+    load asks for it.
+
+    ``inserts_in_forward`` says the batch's keys are inserted by its forward, not by
+    this call's caller: until the forward reports back (:meth:`note_forwarded` of the
+    storage), the batch is in flight.
+    """
+    assert (
+        unique_size_per_table.device.type == "cpu"
+    ), "unique_size_per_table must be a CPU tensor"
+    snapshots = state.size_snapshots
+    if exact or _EXACT_GROWTH:
+        # The exact path used to be able to expand from its running sum, without
+        # confirming, once an asynchronous copy at the start of every prefetch had
+        # refreshed it (the flag below). Nothing refreshes it in the background any
+        # more, so it confirms against the device whenever the sum says a table might
+        # grow.
+        state.collect_table_sizes_flag = False
+        _expand_if_need_exact(state, unique_size_per_table)
+        if snapshots is not None:
+            # The batch still counts for the estimate. Where the exact path reads the
+            # device sizes it restarts the estimate from them, through
+            # collect_table_sizes_for_state; its own running sum is no tighter than
+            # the estimate and is not taken over.
+            snapshots.issued += unique_size_per_table
+            if inserts_in_forward:
+                snapshots.inflight += unique_size_per_table
+        return
+    if snapshots is None:
+        # No table can grow: nothing to estimate and nothing to read.
+        return
+    snapshots.poll()
+    keys_est, rows_est = snapshots.estimate()
+    if state.no_eviction:
+        _expand_if_need_no_eviction_estimated(
+            state, keys_est, rows_est, unique_size_per_table
+        )
+    else:
+        results, targets = get_expand_info(state, keys_est, unique_size_per_table)
+        # From the over-estimate: never late, possibly early by the batches in flight.
+        if any(results):
+            _expand_tables_impl(state, results, targets)
+    snapshots.issued += unique_size_per_table
+    if inserts_in_forward:
+        snapshots.inflight += unique_size_per_table
+    # What the attributes mean everywhere else: the estimate, this batch included.
+    if state.estimated_table_sizes is not None:
+        state.estimated_table_sizes.copy_(keys_est + unique_size_per_table)
+    if state.estimated_row_counts is not None:
+        state.estimated_row_counts.copy_(rows_est + unique_size_per_table)
 
 
 # ---------------------------------------------------------------------------
@@ -3429,9 +3732,35 @@ class DynamicEmbStorage(Storage):
                 if _lf_within_tol():
                     break
 
-    def expand_if_need(self, unique_size_per_table: torch.Tensor) -> None:
-        """Accumulate per-table unique counts, optionally collect size and expand."""
-        expand_if_need_impl(self._state, unique_size_per_table)
+    def expand_if_need(
+        self,
+        unique_size_per_table: torch.Tensor,
+        *,
+        exact: bool = False,
+        inserts_in_forward: bool = False,
+    ) -> None:
+        """Expand the tables that a batch's keys would overfill.
+
+        ``unique_size_per_table`` bounds, per table, the keys the batch can add. The
+        decision does not wait for the device unless ``exact`` is set; see
+        :func:`expand_if_need_impl`."""
+        expand_if_need_impl(
+            self._state,
+            unique_size_per_table,
+            exact=exact,
+            inserts_in_forward=inserts_in_forward,
+        )
+
+    def request_size_snapshot(self) -> None:
+        """Start reading the table sizes back for the next expansion decision; on the
+        stream that inserts into this storage. Does nothing for a table that cannot
+        grow."""
+        request_size_snapshot(self._state)
+
+    def note_forwarded(self, bound: torch.Tensor) -> None:
+        """The forward of a batch bounded by ``bound`` has inserted its keys (see
+        ``inserts_in_forward`` of :meth:`expand_if_need`)."""
+        _note_forwarded(self._state, bound)
 
     def collect_table_sizes(self, non_blocking: bool = True) -> None:
         """Collect per-table sizes from key_index_map into estimated_table_sizes (async copy)."""
@@ -3647,7 +3976,8 @@ class DynamicEmbStorage(Storage):
             shard_index=shard_index,
             num_shards=num_shards,
         )
-        self.expand_if_need(unique_size_per_table)
+        # A checkpoint load waits for the exact sizes: it is not on the training path.
+        self.expand_if_need(unique_size_per_table, exact=True)
 
         num_scores = self._state.key_index_map.num_scores_
         # The checkpoint stores multi-word scores in the user's configured
@@ -4078,9 +4408,32 @@ class HybridStorage(Storage):
     def num_tables(self) -> int:
         return self._hbm.num_tables
 
-    def expand_if_need(self, unique_size_per_table: torch.Tensor) -> None:
-        """Accumulate per-table unique counts (on host), optionally collect size and expand."""
-        expand_if_need_impl(self._host, unique_size_per_table)
+    def expand_if_need(
+        self,
+        unique_size_per_table: torch.Tensor,
+        *,
+        exact: bool = False,
+        inserts_in_forward: bool = False,
+    ) -> None:
+        """Expand the host tier if a batch's keys would overfill it (the HBM tier is not
+        expanded). ``unique_size_per_table`` bounds, per table, the keys the batch can
+        add; see :func:`expand_if_need_impl`."""
+        expand_if_need_impl(
+            self._host,
+            unique_size_per_table,
+            exact=exact,
+            inserts_in_forward=inserts_in_forward,
+        )
+
+    def request_size_snapshot(self) -> None:
+        """Start reading the host tier's sizes back for the next expansion decision;
+        on the stream that inserts into it. Does nothing if it cannot grow."""
+        request_size_snapshot(self._host)
+
+    def note_forwarded(self, bound: torch.Tensor) -> None:
+        """The forward of a batch bounded by ``bound`` has inserted its keys (see
+        ``inserts_in_forward`` of :meth:`expand_if_need`)."""
+        _note_forwarded(self._host, bound)
 
     def collect_table_sizes(self, non_blocking: bool = True) -> None:
         """Collect per-table sizes from key_index_map into estimated_table_sizes (host tier only, async copy)."""
@@ -4640,7 +4993,8 @@ class HybridStorage(Storage):
             - self._hbm.tables[table_id].tensor().size(0),
         )
 
-        self.expand_if_need(unique_size_per_table)
+        # A checkpoint load waits for the exact sizes: it is not on the training path.
+        self.expand_if_need(unique_size_per_table, exact=True)
 
         device = torch.device(f"cuda:{torch.cuda.current_device()}")
 

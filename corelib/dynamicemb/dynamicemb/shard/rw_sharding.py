@@ -125,6 +125,15 @@ class GroupedEmbeddingsLookup(_GroupedEmbeddingsLookup):
             and emb_op.emb_module.per_key_score
             for emb_op in self._emb_modules
         )
+        # Whether the growth of a table wants the key count of each feature of its
+        # group, which is what the kernel's own prefetch gets from the KeyedJaggedTensor
+        # (TorchRec's goes to the tables with the values and offsets only). A
+        # collection that has a kernel of TorchRec's among them keeps TorchRec's
+        # prefetch, which knows how to prefetch for that kernel; the key counts only
+        # tighten the growth, so going without them is safe.
+        self._key_bounds: bool = all(
+            isinstance(emb_op, BatchedDynamicEmbedding) for emb_op in self._emb_modules
+        ) and any(emb_op.emb_module.needs_key_bounds for emb_op in self._emb_modules)
 
     def prefetch(
         self,
@@ -132,9 +141,11 @@ class GroupedEmbeddingsLookup(_GroupedEmbeddingsLookup):
         forward_stream: Optional[torch.cuda.Stream] = None,
     ) -> None:
         """TorchRec's prefetch, which hands the tables only the values and offsets
-        of each group, so that the scores split off with them would be left behind.
+        of each group, so that the scores split off with them would be left behind,
+        and so would the key counts of the features, which bound the growth of the
+        tables.
         """
-        if not self._per_key_score:
+        if not (self._per_key_score or self._key_bounds):
             return super().prefetch(sparse_features, forward_stream)
         features_by_group = sparse_features.split(self._feature_splits)
         for emb_op, features in zip(self._emb_modules, features_by_group):

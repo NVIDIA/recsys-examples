@@ -515,8 +515,18 @@ def check_external_storage_alone_is_refused() -> None:
         raise AssertionError("PRECISE_CUSTOMIZED was accepted with a lone store")
 
 
+def _flush_tables(model) -> None:
+    """What the tables found out about the scores of a batch is reported by the next
+    call that carries scores, or by ``flush``: the check does not wait for the
+    device."""
+    for _, _, sharded in find_sharded_modules(model, ""):
+        for module in get_dynamic_emb_module(sharded):
+            module.flush()
+
+
 def check_negative_score() -> None:
-    """A negative score warns under WARNING and raises under ERROR."""
+    """A negative score warns under WARNING and raises under ERROR, reported late: by
+    ``flush``, here."""
     device = torch.device(f"cuda:{torch.cuda.current_device()}")
     for mode in (DynamicEmbCheckMode.WARNING, DynamicEmbCheckMode.ERROR):
         model, feature_names, _ = _ec_model(safe_check_mode=mode)
@@ -532,10 +542,12 @@ def check_negative_score() -> None:
             with warnings.catch_warnings(record=True) as caught:
                 warnings.simplefilter("always")
                 model(negative).sum().backward()
+                _flush_tables(model)
             assert any("non-negative" in str(w.message) for w in caught), caught
         else:
             try:
                 model(negative)
+                _flush_tables(model)
             except ValueError as error:
                 assert "non-negative" in str(error), error
             else:

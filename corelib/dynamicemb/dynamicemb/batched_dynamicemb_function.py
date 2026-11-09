@@ -18,6 +18,7 @@ from enum import Enum, auto
 from typing import Callable, ContextManager, Optional, Tuple
 
 import torch
+from dynamicemb import sync_free as sf
 from dynamicemb.async_erase import table_section
 from dynamicemb.dynamicemb_config import EvictedItemMode
 from dynamicemb.initializer import MultiTableInitializer
@@ -182,6 +183,115 @@ def largest_score_per_unique_key(
     )
 
 
+class _OutstandingEntry:
+    """One prefetched batch's claim on the cache, see :class:`OutstandingKeys`."""
+
+    __slots__ = ("bound", "total", "exact")
+
+    def __init__(
+        self, bound: int, total: Optional[torch.Tensor], exact: Optional[int]
+    ) -> None:
+        self.bound = bound
+        self.total = total
+        self.exact = exact
+
+
+class OutstandingKeys:
+    """The keys that prefetched batches, not forwarded yet, pin in the cache.
+
+    A cache cannot evict a key a prefetched batch still has to use, so those batches
+    must fit in it together, and prefetching more than fits is an error. What has to
+    fit is their unique keys. Reading each batch's unique count back from the device
+    would make every prefetch wait, so the check is made in two steps:
+
+    * ``bound`` adds up what each batch says it can be at most -- a host number, the
+      batch's key count. When that fits, the unique keys fit too, and nothing else
+      is done.
+    * Only when it does not fit is the exact count asked for from the device, late:
+      through a pinned ring and an event that nothing waits for. A cache that really
+      is over-subscribed raises, with the exact count, one or two prefetches after
+      the batch that did it; a cache that only sees batches full of duplicates never
+      raises.
+
+    A batch whose unique count is known on the host (``exact``) is checked at once.
+    """
+
+    def __init__(self) -> None:
+        self.bound = 0
+        # entry id -> entry, in the order the batches were prefetched
+        self._live = {}
+        self._ring = sf.DeferredRead((1,), torch.int64, 4)
+        # (ring ticket, the part of that count the host knew), for the counts in flight
+        self._pend = []
+
+    def reset(self) -> None:
+        """Forget every batch: the cache was reset, nothing is pinned in it any more."""
+        for ticket, _ in self._pend:
+            self._ring.release(ticket)
+        self.bound, self._live, self._pend = 0, {}, []
+
+    def add(
+        self, bound: int, total: Optional[torch.Tensor], exact: Optional[int]
+    ) -> _OutstandingEntry:
+        """Count a prefetched batch in. ``bound`` is a host int that its unique keys
+        cannot pass; ``total`` is their count as a 0-d tensor on the device, or None
+        when ``exact`` -- the same count as a host int -- is known. Returns the entry
+        to hand to :meth:`release`."""
+        entry = _OutstandingEntry(bound, total, exact)
+        self.bound += bound
+        self._live[id(entry)] = entry
+        return entry
+
+    def release(self, entry: Optional[_OutstandingEntry]) -> None:
+        """The batch has been forwarded (whether or not its backward will run): it no
+        longer pins anything that a later prefetch has to make room for."""
+        if self._live.pop(id(entry), None) is not None:
+            self.bound -= entry.bound
+
+    @staticmethod
+    def _raise(outstanding: int, capacity: int) -> None:
+        raise RuntimeError(
+            f"Outstanding prefetched keys ({outstanding}) "
+            f"exceed cache capacity ({capacity}). "
+            "Reduce prefetch pipeline depth or increase cache size."
+        )
+
+    def check(self, capacity: int) -> None:
+        """Raise if the batches counted in do not fit in a cache of ``capacity`` keys.
+        Never waits for the device and never raises for a cache that does fit."""
+        # A count asked for earlier that has landed since.
+        for pending in list(self._pend):
+            ticket, host_part = pending
+            if self._ring.ready(ticket):
+                outstanding = int(self._ring.value(ticket)[0]) + host_part
+                self._ring.release(ticket)
+                self._pend.remove(pending)
+                if outstanding > capacity:
+                    self._raise(outstanding, capacity)
+        if self.bound <= capacity:
+            # The unique keys are at most the bound: they fit, nothing to count.
+            return
+        live = list(self._live.values())
+        device_totals = [e.total.reshape(()) for e in live if e.exact is None]
+        # Host ints only: a device tensor made from one would be a blocking upload.
+        host_part = sum(e.exact for e in live if e.exact is not None)
+        if not device_totals:
+            # Every batch's count is known on the host: decide now.
+            if host_part > capacity:
+                self._raise(host_part, capacity)
+            return
+        # Not decided: count the unique keys exactly, one stacked sum, read late.
+        if self._ring.free_slots() > 0:
+            ticket = self._ring.enqueue(torch.stack(device_totals).sum().reshape(1))
+            if ticket is not None:
+                self._pend.append((ticket, host_part))
+
+    def __reduce__(self):
+        # A copy of the module (copy.deepcopy, pickle) starts with nothing outstanding
+        # and a ring of its own.
+        return (OutstandingKeys, ())
+
+
 class StorageMode(Enum):
     DEFAULT = auto()
     CACHE = auto()
@@ -211,10 +321,16 @@ class PrefetchState:
     # One int64 per unique key, for tables that take a score per key.
     unique_scores: Optional[torch.Tensor] = None
     num_prefetched_keys: int = 0
-    outstanding_keys_ref: Optional[torch.Tensor] = None
+    outstanding_keys_ref: Optional[OutstandingKeys] = None
     # The key_map_generation (rehash count) of the table state the slots were found in: a later
     # prefetch may expand it before this batch's backward runs.
     key_map_generation: int = 0
+    # This batch's entry in ``outstanding_keys_ref``, released by the forward.
+    outstanding_entry: Optional[object] = None
+    # What the growth of the storage was told this batch can add to each table (CPU
+    # int64 per table); a forward that inserts the batch reports it back (see
+    # ``note_forwarded`` of the storages).
+    table_key_bounds: Optional[torch.Tensor] = None
 
 
 def _slots_after_rehash(
@@ -832,10 +948,12 @@ def dynamicemb_prefetch(
     evict_strategy=None,
     frequency_counters: Optional[torch.Tensor] = None,
     admitter: Optional[MultiTableAdmitter] = None,
-    outstanding_keys_ref: Optional[torch.Tensor] = None,
+    outstanding_keys_ref: Optional[OutstandingKeys] = None,
     external_storage: Optional[Storage] = None,
     scores: Optional[torch.Tensor] = None,
     table_gate: Optional[Callable[[], ContextManager]] = None,
+    *,
+    table_key_bounds: Optional[torch.Tensor] = None,
 ) -> PrefetchState:
     """Unified prefetch for all storage types (cache, HBM-direct, generic).
 
@@ -851,6 +969,12 @@ def dynamicemb_prefetch(
     ``async_erase.TableAccessGate``). Prefetch holds it while it reads or changes the
     tables -- from the expansion through the find and the counter increment -- so
     that a key it found is pinned before an erase can look at it.
+
+    ``table_key_bounds`` (CPU int64, one per table) is what the caller knows, without
+    the device, of how many keys each table's part of the batch can have: the key
+    counts of its features. A front end that does not read the dedup count back
+    sizes the growth of the storage from it; this one has the exact count of unique
+    keys per table, which is never above the bound, and uses that.
     """
     with torch.cuda.nvtx.range("dynamicemb_prefetch"):
         table_num = feature_offsets.numel() - 1
@@ -866,8 +990,14 @@ def dynamicemb_prefetch(
         if frequency_counters is not None:
             frequency_counts_int64 = frequency_counters.long()
 
-        if hasattr(storage, "collect_table_sizes"):
-            storage.collect_table_sizes(non_blocking=True)
+        # The sizes the expansion below decides from are read back without waiting, on
+        # the stream that inserts into the storage: this one, for a cache's storage
+        # and an HBM storage. A host or hybrid storage is inserted into by the
+        # forward, which takes its snapshot there (``note_forwarded``).
+        if hasattr(storage, "request_size_snapshot") and (
+            caching or _is_hbm_storage(storage)
+        ):
+            storage.request_size_snapshot()
 
         indices_table_range = get_table_range(offsets, feature_offsets)
         (
@@ -908,23 +1038,21 @@ def dynamicemb_prefetch(
         else:
             storage_mode = StorageMode.DEFAULT
 
+        outstanding_entry = None
         with table_section(table_gate):
             if hasattr(storage, "expand_if_need"):
-                storage.expand_if_need(unique_size_per_table)
+                storage.expand_if_need(
+                    unique_size_per_table,
+                    inserts_in_forward=(storage_mode == StorageMode.DEFAULT),
+                )
 
             if storage_mode == StorageMode.CACHE:
                 if outstanding_keys_ref is not None:
-                    outstanding_keys_ref += num_prefetched_keys
-                    cache_capacity = cache._state.capacity
-                    outstanding_keys = _scalar_item(outstanding_keys_ref)
-                    if outstanding_keys > cache_capacity:
-                        raise RuntimeError(
-                            f"Outstanding prefetched keys "
-                            f"({outstanding_keys}) "
-                            f"exceed cache capacity ({cache_capacity}). "
-                            "Reduce prefetch pipeline depth or increase "
-                            "cache size."
-                        )
+                    # The unique count is known here, so this is checked at once.
+                    outstanding_entry = outstanding_keys_ref.add(
+                        num_prefetched_keys, None, num_prefetched_keys
+                    )
+                    outstanding_keys_ref.check(cache._state.capacity)
                 (
                     slot_indices,
                     non_admitted_positions,
@@ -979,6 +1107,8 @@ def dynamicemb_prefetch(
             unique_scores=unique_scores,
             num_prefetched_keys=num_prefetched_keys,
             outstanding_keys_ref=outstanding_keys_ref,
+            outstanding_entry=outstanding_entry,
+            table_key_bounds=unique_size_per_table,
             value_row_indices=value_row_indices,
             key_map_generation=key_map_generation,
         )
@@ -1342,9 +1472,19 @@ class DynamicEmbeddingFunction(torch.autograd.Function):
             # Recover outstanding count at end of forward so it is decremented
             # even when backward is not run, avoiding overflow.
             if prefetch_state.outstanding_keys_ref is not None:
-                prefetch_state.outstanding_keys_ref -= (
-                    prefetch_state.num_prefetched_keys
+                prefetch_state.outstanding_keys_ref.release(
+                    prefetch_state.outstanding_entry
                 )
+
+            # A storage that is inserted into here, not by the prefetch, has the keys
+            # of this batch now: tell its growth estimate, which takes a snapshot of
+            # the sizes on this stream, after the inserts.
+            if (
+                prefetch_state.storage_mode == StorageMode.DEFAULT
+                and prefetch_state.table_key_bounds is not None
+                and hasattr(storage, "note_forwarded")
+            ):
+                storage.note_forwarded(prefetch_state.table_key_bounds)
 
             return output_embs
 
