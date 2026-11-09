@@ -750,6 +750,26 @@ One run of each point. TorchRec's dists are the same before and after.
   (the median rank's backward kernel is that much longer). The step of one
   run varies by a few ms for that reason.
 
+Three rounds on another set of four nodes, before and after in
+alternating order, give the same picture (medians over the rounds, in ms):
+
+| features × batch (keys per sample) | nodes | hier step before → after | fwd kernel before → after | bwd kernel before → after | input dist before → after |
+|---|---|---|---|---|---|
+| 8 × 4096 (1-32) | 2 | 8.8 → 9.1 | 2.96 → 3.10 | 2.91 → 2.96 | 0.76 → 0.77 |
+| 8 × 4096 (1-32) | 4 | 11.3 → 11.2 | 4.07 → 4.07 | 4.14 → 4.14 | 0.85 → 0.84 |
+| 1024 × 512 (1) | 2 | 32.1 → 28.6 | 4.87 → 2.79 | 4.50 → 2.88 | 1.26 → 0.92 |
+| 1024 × 512 (1) | 4 | 32.5 → 30.6 | 4.71 → 3.96 | 4.97 → 4.02 | 1.48 → 1.01 |
+| 4096 × 128 (1) | 2 | 119.9 → 107.8 | 15.87 → 2.86 | 13.20 → 3.01 | 2.60 → 1.30 |
+| 4096 × 128 (1) | 4 | 129.6 → 109.2 | 17.29 → 3.96 | 15.52 → 4.17 | 3.53 → 1.42 |
+| 4096 × 1024 (1) | 2 | 171.3 → 142.7 | 24.29 → 14.75 | 35.50 → 16.24 | 5.04 → 3.50 |
+| 4096 × 1024 (1) | 4 | 189.1 → 151.7 | 25.10 → 20.70 | 45.88 → 20.99 | 6.16 → 3.97 |
+
+At 1,024 and 4,096 features every round after is faster than every round
+before, in both kernels and the input dist, and in the step but for one
+round of 1,024 × 512 on 4 nodes. At 8 features neither is: in every run
+of both, the forward kernel's fastest call takes 2.72-2.74 ms on 2 nodes
+and 4.01-4.04 ms on 4.
+
 #### Options
 
 | option | default | meaning |
