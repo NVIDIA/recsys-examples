@@ -21,6 +21,7 @@ and ``DYNAMICEMB_MISS_PATH_BUFFER_BYTES`` (how many rows of the miss path's buff
 allocates). This file checks the parsing of the second and the arithmetic of the chunk plan
 (``sync_free.row_chunks``), which is pure host code and runs without a GPU.
 """
+import os
 import warnings
 
 import pytest
@@ -140,3 +141,74 @@ def test_the_plan_depends_on_host_facts_only():
     first = sf.row_chunks(12345, 1536, buffers=3)
     assert first == sf.row_chunks(12345, 1536, buffers=3)
     assert all(isinstance(a, int) and isinstance(b, int) for a, b in first)
+
+
+# --------------------------------------------------------------------------
+# what is not there any more
+# --------------------------------------------------------------------------
+def _package_sources():
+    package = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(__file__)))),
+        "dynamicemb",
+    )
+    for dirpath, dirnames, filenames in os.walk(package):
+        dirnames[:] = [d for d in dirnames if d != "__pycache__"]
+        for name in filenames:
+            if name.endswith(".py"):
+                path = os.path.join(dirpath, name)
+                with open(path) as f:
+                    yield os.path.relpath(path, package), f.read()
+
+
+def test_no_variable_selects_a_blocking_path():
+    """The kill switch (DYNAMICEMB_SYNC_FREE) and the old name of the budget
+    (DYNAMICEMB_SYNC_FREE_MAX_BYTES) are not read by the package: a source search finds no use,
+    whatever the file."""
+    forbidden = ("SYNC_FREE", "MAX_BYTES")
+    found = [
+        "%s: %s" % (path, token)
+        for path, source in _package_sources()
+        for token in forbidden
+        if token in source
+    ]
+    assert not found, "\n".join(found)
+
+
+def test_the_legacy_bodies_are_not_in_the_package():
+    """The host-sized lookup bodies live on only as the test oracle (``legacy_oracle``)."""
+    import dynamicemb.batched_dynamicemb_function as bdf
+    import dynamicemb.key_value_table as kvt
+
+    for module, names in (
+        (
+            bdf,
+            (
+                "_prefetch_cache_path",
+                "_prefetch_cache_path_legacy",
+                "_prefetch_hbm_direct_path",
+                "_prefetch_hbm_direct_path_legacy",
+                "_generic_forward_path",
+                "_generic_forward_path_legacy",
+                "_apply_admission",
+                "_lookup_next_tier",
+                "_read_unique_offsets",
+                "_masked_dispatch",
+                "_SYNC_FREE",
+                "_MAX_BYTES",
+            ),
+        ),
+        (
+            kvt,
+            (
+                "_select",
+                "_eval_lookup_storage_legacy",
+                "_eval_lookup_cached_legacy",
+                "_masked_eval_applies",
+            ),
+        ),
+    ):
+        for name in names:
+            assert not hasattr(module, name), "%s.%s is still there" % (
+                module.__name__,
+                name,
+            )

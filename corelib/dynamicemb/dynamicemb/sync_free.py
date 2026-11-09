@@ -250,6 +250,8 @@ def initialize_masked(
     keys: torch.Tensor,
     table_ids: torch.Tensor,
     mask: torch.Tensor,
+    *,
+    dense: bool = False,
 ) -> None:
     """Run ``initializer`` on the rows of ``out`` where ``mask`` is True, in place.
 
@@ -257,11 +259,23 @@ def initialize_masked(
     ``stride(1) == 1`` (a column slice of the value block is fine); ``keys``,
     ``table_ids`` and ``mask`` are ``N`` long, one entry per row of ``out``. A
     masked-out row may carry ``EMPTY_KEY`` and table id ``-1``.
+
+    ``dense`` is for an initializer written for index lists that name only the rows to
+    write (a user's ``non_admitted_initializer`` that did not declare
+    ``skips_negative_index``): the number of rows in ``mask`` is read once, by that
+    initializer's contract, and it is called with exactly those indices (not at all when
+    there are none).
     """
     n = out.size(0)
     if n == 0:
         return
     rows = torch.arange(n, dtype=torch.int64, device=out.device)
+    if dense:
+        count = int(read_now(mask.sum())[0])
+        if count:
+            (picked,) = compact_by_count(mask, count, rows)
+            initializer(out, keys, table_ids, picked)
+        return
     if INIT_SKIPS_NEGATIVE:
         # A row whose index is -1 is skipped before anything else is read.
         initializer(out, keys, table_ids, torch.where(mask, rows, -1))
@@ -506,14 +520,15 @@ def _read_scratch(
 def read_now(*dev_tensors: torch.Tensor) -> List[torch.Tensor]:
     """THE blocking read: the host needs these values now.
 
-    Only inherent syncs come here: an external parameter server or user class
-    that wants host sizes, a public API that returns host data, determinism
-    mode, exact growth, the "read" miss gate. The tensors are flattened, cast to
-    int64 and concatenated on the current stream, copied to host in one pinned
-    transfer, and waited for with one event. Returns CPU int64 tensors shaped like
-    the inputs; a CPU input is returned as it is. The pinned buffer is reused
-    (one per thread and device, grown to the largest request), so a steady state
-    allocates nothing; the results do not alias it.
+    Only inherent syncs come here: a class written against exact-length tensors
+    that wants host sizes (an external storage, a user admitter, counter or
+    initializer that did not declare the padded contract: ``types._live_rows``,
+    ``initialize_masked(dense=True)``), a public API that returns host data. The
+    tensors are flattened, cast to int64 and concatenated on the current stream,
+    copied to host in one pinned transfer, and waited for with one event. Returns
+    CPU int64 tensors shaped like the inputs; a CPU input is returned as it is. The
+    pinned buffer is reused (one per thread and device, grown to the largest
+    request), so a steady state allocates nothing; the results do not alias it.
 
     ``READ_NOW_CALLS`` counts the calls.
     """

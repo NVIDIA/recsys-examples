@@ -410,7 +410,7 @@ class OldContractStorage:
         if count:
             d_keys, d_ids, d_freq, d_scores = dense
             # Only what there is: a store written before per-key scores has no such
-            # parameter, and the legacy calls did not pass an empty frequency either.
+            # parameter, and the host-sized bodies did not pass an empty frequency either.
             kwargs = {}
             if d_freq is not None:
                 kwargs["lfu_accumulated_frequency"] = d_freq
@@ -905,7 +905,18 @@ class Counter(abc.ABC):
     """
     Interface of a counter table which maps a key to a counter.
     Supports multi-table via table_ids parameter.
+
+    ``accepts_empty_keys``: True, declared in the counter's own class body (an inherited
+    declaration does not count), says that ``add`` and ``erase`` accept the reserved
+    all-ones key (``-1`` for int64 keys, ``0xFFFFFFFFFFFFFFFF`` for uint64 ones) at any
+    position, with any table id there (``-1`` past the end of a batch), and do nothing for
+    it: ``erase`` removes no key, and ``add`` counts nothing and returns its input
+    frequency. A frequency admitter whose counter declares it passes whole-batch arrays on
+    to it; otherwise the counter is only ever given dense keys, and an ``erase`` of the
+    admitted keys costs one read of how many they are.
     """
+
+    accepts_empty_keys: bool = False
 
     @abc.abstractmethod
     def add(
@@ -1062,21 +1073,46 @@ class MultiTableAdmitter(abc.ABC):
     ``frequencies`` holds at them is unspecified. The module ignores the answer
     for those positions. Set it on your own class only if ``admit`` copes with
     all of that, does not count those positions as keys, and returns a mask as
-    long as ``keys``. The module may then mark the rows its initializers must
-    leave alone with a negative index, which only dynamicemb's own initializers
-    are written for, so an admitter whose ``non_admitted_initializer`` is
-    anything else is still called the old way. The attribute is read from the
-    class's own ``__dict__``: a subclass of an admitter that opted in has to
-    opt in itself, so that overriding ``admit`` never inherits a promise the
-    new code did not make.
+    long as ``keys``; what ``state()`` returns has to have declared it too
+    (:class:`Counter`). The attribute is read from the class's own ``__dict__``:
+    a subclass of an admitter that opted in has to opt in itself, so that
+    overriding ``admit`` never inherits a promise the new code did not make.
+    Left False, the module still serves the admitter, with dense keys (only the
+    missing ones, in order) after one blocking read of how many there are per
+    call of ``admit``, which is not made at all when none is missing.
 
     ``uses_rng``: True for an admitter whose ``admit`` draws random numbers.
     The module then never lets timing decide whether to call it for a batch,
     so a seeded run consumes the same draws every time.
+
+    What writes the rows this admitter rejects, ``non_admitted_initializer``, is
+    asked separately: the module marks the rows it must leave alone with a
+    negative index, which only an initializer that declared
+    ``skips_negative_index = True`` in its own class body is written for (the
+    initializers of :mod:`dynamicemb.initializer` all did). Any other is given
+    exact index lists, after one blocking read of how many rows there are.
     """
 
     accepts_empty_keys: bool = False
     uses_rng: bool = False
+
+    def admit_masked(
+        self,
+        keys: torch.Tensor,
+        table_ids: torch.Tensor,
+        frequencies: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """What the lookup paths call: :meth:`admit` over arrays of the batch's length.
+
+        Calls ``admit`` as it is when this admitter declared ``accepts_empty_keys``
+        (and what it holds did); otherwise with the live keys only, dense, and the
+        answer scattered back. The result is a bool mask over ``keys``; the answer for a
+        position that is not a live key means nothing.
+        """
+        # Late: that module imports this one.
+        from dynamicemb.embedding_admission import admit_padded
+
+        return admit_padded(self, keys, table_ids, frequencies)
 
     @abc.abstractmethod
     def admit(
@@ -1091,6 +1127,7 @@ class MultiTableAdmitter(abc.ABC):
             keys (torch.Tensor): The keys to decide on, deduplicated. With
                 ``accepts_empty_keys`` also the reserved all-ones key at the
                 positions that are not missing keys; see the class docstring.
+                Without it, only the missing keys, in order.
             table_ids (torch.Tensor): The table each key belongs to. One module
                 spans several, so a decision may be made per table.
             frequencies (Optional[torch.Tensor]): How often each key occurred in

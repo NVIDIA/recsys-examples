@@ -54,6 +54,10 @@ class MultiTableInitializer(abc.ABC):
     buffer -- only where the parameters come from differs.
     """
 
+    # True, declared in a class's own body (an inherited declaration does not count),
+    # says that ``__call__`` understands a negative entry of ``indices`` (see there).
+    skips_negative_index: bool = False
+
     @staticmethod
     def create(
         args_list: List[DynamicEmbInitializerArgs],
@@ -131,11 +135,19 @@ class MultiTableInitializer(abc.ABC):
         ``dynamicemb_extensions.initializer_skips_negative_index`` is true;
         :func:`dynamicemb.sync_free.initialize_masked` tests that, and gives
         the same result without it.
+
+        A class declares that it understands negative entries with
+        ``skips_negative_index = True`` in its own body (an inherited declaration
+        does not count); every initializer of this module does. A user's
+        ``MultiTableInitializer`` that does not is only given index lists that name
+        the rows to write, after one blocking read of how many there are.
         """
         ...
 
 
 class NormalInitializer(MultiTableInitializer):
+    skips_negative_index = True
+
     def __init__(self, args, table_params=None):
         super().__init__(args, table_params)
         self._curand_state = CurandStateContext()
@@ -164,6 +176,8 @@ class NormalInitializer(MultiTableInitializer):
 
 
 class TruncatedNormalInitializer(MultiTableInitializer):
+    skips_negative_index = True
+
     def __init__(self, args, table_params=None):
         super().__init__(args, table_params)
         self._curand_state = CurandStateContext()
@@ -194,6 +208,8 @@ class TruncatedNormalInitializer(MultiTableInitializer):
 
 
 class UniformInitializer(MultiTableInitializer):
+    skips_negative_index = True
+
     def __init__(self, args, table_params=None):
         super().__init__(args, table_params)
         self._curand_state = CurandStateContext()
@@ -222,6 +238,8 @@ class UniformInitializer(MultiTableInitializer):
 
 
 class ConstantInitializer(MultiTableInitializer):
+    skips_negative_index = True
+
     @staticmethod
     def table_param_rows(args_list):
         return [[args.value] for args in args_list]
@@ -239,6 +257,8 @@ class ConstantInitializer(MultiTableInitializer):
 
 
 class DebugInitializer(MultiTableInitializer):
+    skips_negative_index = True
+
     # Fills a row from its key, so it takes no parameters at all and its tables
     # cannot disagree. Inherits table_param_rows, which then reports no
     # parameters for every table, so create never builds a tensor for it.

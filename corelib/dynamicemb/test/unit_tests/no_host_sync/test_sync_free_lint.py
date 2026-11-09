@@ -1186,12 +1186,13 @@ TARGETS: List[Target] = (
         "_hbm_miss_chunk",
         "_rows",
         # the contract of the participants and what the padded bodies do with them
-        "_insert_into_storage_masked",
+        "_insert_into_storage",
         "_participants",
         "_require",
         "_miss_gate_of",
     )
-    + _legacy(
+    # the front ends: one body for every group now, nothing is left to excuse
+    + _new(
         BDF,
         "dynamicemb_prefetch",
         "dynamicemb_eval_forward",
@@ -1279,9 +1280,6 @@ FINAL = os.environ.get("SYNC_LINT_FINAL") == "1"
 # its baseline, so that the baseline goes down with the change that removed the violation; the
 # entry of a target that is flipped to `enforce` goes away.
 LEGACY_BASELINE: Dict[str, Dict[str, int]] = {
-    "dynamicemb/batched_dynamicemb_function.py::dynamicemb_prefetch": {
-        "host-read-helper": 1,
-    },
     "dynamicemb/key_value_table.py::DynamicEmbCache.lookup": {
         "sync-call": 1,
     },
@@ -1983,7 +1981,78 @@ def _allowed(hit_key: Tuple[str, str, str]) -> bool:
 # the tree. The text has to be unique enough that it does not name a line the change keeps.
 # SYNC_LINT_FINAL=1 (the last commit of the series) also wants every line that left the baseline
 # to be claimed here, so that no removal goes unreviewed.
-EXPECTED_GONE: List[Tuple[str, str, str, str]] = []
+EXPECTED_GONE: List[Tuple[str, str, str, str]] = [
+    # contract C3: the write-back to a tier below storage is the padded one, no compaction
+    (
+        "dynamicemb/key_value_table.py",
+        "flagged_compact",
+        "num_present, present, (present_keys, present_tids) = flagged_compact(",
+        "contract-C3",
+    ),
+    (
+        "dynamicemb/key_value_table.py",
+        "flagged_compact",
+        "_, gone, (gone_keys, gone_tids) = flagged_compact(",
+        "contract-C3",
+    ),
+    # contract C4: the legacy bodies (host-sized arrays, their counts and compactions) are
+    # gone from the package; a copy lives on in test/unit_tests/legacy_oracle.py, which is not
+    # scanned
+    (
+        "dynamicemb/batched_dynamicemb_function.py",
+        "flagged_compact",
+        "_, _, (non_admitted_indices,) = flagged_compact(",
+        "contract-C4",
+    ),
+    (
+        "dynamicemb/batched_dynamicemb_function.py",
+        "flagged_compact",
+        ") = flagged_compact(",
+        "contract-C4",
+    ),
+    (
+        "dynamicemb/batched_dynamicemb_function.py",
+        "flagged_compact",
+        "num_asked, asked, (asked_keys, asked_tids) = flagged_compact(",
+        "contract-C4",
+    ),
+    (
+        "dynamicemb/batched_dynamicemb_function.py",
+        "flagged_compact",
+        "num_refused, _, (refused_pos,) = flagged_compact(",
+        "contract-C4",
+    ),
+    (
+        "dynamicemb/batched_dynamicemb_function.py",
+        "flagged_compact",
+        "num_adm, adm_rows, (adm_keys, adm_tids) = flagged_compact(",
+        "contract-C4",
+    ),
+    (
+        "dynamicemb/batched_dynamicemb_function.py",
+        "flagged_compact",
+        "num_st, into_storage, (st_keys, st_tids, st_score_input) = flagged_compact(",
+        "contract-C4",
+    ),
+    (
+        "dynamicemb/batched_dynamicemb_function.py",
+        "flagged_compact",
+        "_, persisted_unique_indices, _ = flagged_compact(",
+        "contract-C4",
+    ),
+    (
+        "dynamicemb/batched_dynamicemb_function.py",
+        "any_all_in_cond",
+        "if non_admit.any():",
+        "contract-C4",
+    ),
+    (
+        "dynamicemb/key_value_table.py",
+        "flagged_compact",
+        "h_num_miss, miss_compact_idx, (missing_keys, missing_table_ids) = flagged_compact(",
+        "contract-C4",
+    ),
+]
 
 
 def _claim_matches(claim: Tuple[str, str, str, str], key: Tuple[str, str, str]) -> bool:

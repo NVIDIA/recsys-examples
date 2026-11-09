@@ -18,11 +18,14 @@
 The eval initializer is a constant, so a key found nowhere takes it; a key the cache
 has takes the cache's row, one only the storage has the storage's. The masked eval
 looks every key up and writes each lane at most once; it is checked against what the
-keys are known to be, and against the exact-length functions it replaces
-(``_eval_lookup_*_legacy``), for a storage, a hybrid storage and a cache in front of
-a storage, over a batch with duplicates and keys found nowhere, and over the same
+keys are known to be, and against the exact-length functions it replaced
+(``legacy_oracle.legacy_eval_lookup_*``), for a storage, a hybrid storage and a cache in
+front of a storage, over a batch with duplicates and keys found nowhere, and over the same
 batch padded with lanes that must not take part (the reserved key, table id -1).
+A storage that has not declared the padded contract is served through its own ``find``.
 """
+import os
+import sys
 
 import pytest
 import torch
@@ -40,14 +43,15 @@ from dynamicemb.key_value_table import (
     DynamicEmbCache,
     DynamicEmbStorage,
     HybridStorage,
-    _eval_lookup_cached_legacy,
-    _eval_lookup_storage_legacy,
     _find_keys,
     _insert_key_values,
     eval_lookup,
     store_to_flat,
 )
 from dynamicemb.optimizer import OptimizerArgs, SGDDynamicEmbeddingOptimizer
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import legacy_oracle  # noqa: E402
 
 DIM = 8
 BUCKET = 128
@@ -161,8 +165,12 @@ def _batch(device):
 
 def _legacy(storage, cache, keys, tids, initializer):
     if cache is None:
-        return _eval_lookup_storage_legacy(storage, keys, tids, initializer)
-    return _eval_lookup_cached_legacy(cache, storage, keys, tids, initializer)
+        return legacy_oracle.legacy_eval_lookup_storage(
+            storage, keys, tids, initializer
+        )
+    return legacy_oracle.legacy_eval_lookup_cached(
+        cache, storage, keys, tids, initializer
+    )
 
 
 def _scores(state, keys):
@@ -282,17 +290,18 @@ class _CountingStorage(DynamicEmbStorage):
         return super().find(*args, **kwargs)
 
 
-@pytest.mark.parametrize("switch", ["kill_switch", "subclass"])
-def test_exact_functions_are_kept_where_the_masked_ones_do_not_apply(
+@pytest.mark.parametrize("switch", ["env", "subclass"])
+def test_the_environment_selects_nothing_and_a_subclass_is_served_through_its_find(
     device, monkeypatch, switch
 ):
-    """``DYNAMICEMB_SYNC_FREE=0`` and a storage that is not exactly an in-tree one
-    take the exact-length functions (through ``Storage.find``); the answer is the
-    same either way."""
+    """No environment variable selects a path: the old kill switch has no effect and the in-tree
+    ``find`` is never called by eval. A storage that is not exactly an in-tree one (a subclass
+    that overrides ``find`` without declaring the padded contract itself) is served through that
+    ``find``, once, with the live keys; the answer is the same either way."""
     keys, tids = _batch(device)
     initializer = _initializer(device)
     _CountingStorage.finds = 0
-    if switch == "kill_switch":
+    if switch == "env":
         monkeypatch.setenv("DYNAMICEMB_SYNC_FREE", "0")
         storage, cache = _build("cache_storage", device)
         spy_calls = []
@@ -304,7 +313,9 @@ def test_exact_functions_are_kept_where_the_masked_ones_do_not_apply(
 
         monkeypatch.setattr(DynamicEmbStorage, "find", spy)
         out = eval_lookup(storage, keys, tids, initializer, cache=cache)
-        assert len(spy_calls) == 1
+        assert (
+            spy_calls == []
+        ), "the variable is not read: the padded path never calls find"
     else:
         storage = _CountingStorage(
             [_options(8 * BUCKET, BUCKET, host=False)],
@@ -317,3 +328,26 @@ def test_exact_functions_are_kept_where_the_masked_ones_do_not_apply(
         out = eval_lookup(storage, keys, tids, initializer)
         assert _CountingStorage.finds == 1
     assert torch.equal(out, _expected(BATCH, cache is not None, device))
+
+
+class _DeclaringStorage(_CountingStorage):
+    """The same subclass, that declares the padded contract itself: it is called natively."""
+
+    accepts_empty_keys = True
+
+
+def test_a_subclass_that_declares_the_contract_in_its_own_body_is_called_natively(
+    device,
+):
+    keys, tids = _batch(device)
+    _CountingStorage.finds = 0
+    storage = _DeclaringStorage(
+        [_options(8 * BUCKET, BUCKET, host=False)], _optimizer(), use_ref_counter=False
+    )
+    stored = _keys(*STORAGE_KEYS, device)
+    storage.insert(stored, torch.zeros_like(stored), _rows(stored))
+
+    out = eval_lookup(storage, keys, tids, _initializer(device))
+
+    assert _CountingStorage.finds == 0, "its lookup_masked is used, not find"
+    assert torch.equal(out, _expected(BATCH, False, device))

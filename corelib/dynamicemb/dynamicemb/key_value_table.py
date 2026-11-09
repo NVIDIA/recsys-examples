@@ -5206,17 +5206,6 @@ class HybridStorage(Storage):
 # ---------------------------------------------------------------------------
 
 
-def _select(values: torch.Tensor, rows: torch.Tensor, all_rows: bool) -> torch.Tensor:
-    """``values[rows]`` -- ``flagged_compact`` only takes 1-D inputs.
-
-    ``all_rows`` says the caller's mask kept every row; ``flagged_compact`` emits
-    its index in ascending order, so ``rows`` is then the identity and the gather
-    is skipped. The row count alone cannot say that: an index of the same length
-    may still permute the rows.
-    """
-    return values if all_rows else values[rows]
-
-
 def _write_back_evicted(
     storage: DynamicEmbStorage,
     next_tier: Optional[Storage],
@@ -5332,7 +5321,7 @@ def _eval_lookup_storage(
     initializer: Callable,
     valid: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    """Eval lookup of an in-tree storage: no host count, no compaction.
+    """Eval lookup of a storage of the padded contract: no host count, no compaction.
 
     ``valid`` (bool, one entry per key) marks the real keys of a batch whose tail
     is padding (the reserved key, table id ``-1``); ``None`` means every key is
@@ -5344,34 +5333,6 @@ def _eval_lookup_storage(
     embs = storage.load_masked(found, table_ids, CopyMode.EMBEDDING)
     missing = ~found.founds if valid is None else valid & ~found.founds
     sf.initialize_masked(initializer, embs, keys, table_ids, missing)
-    return embs
-
-
-def _eval_lookup_storage_legacy(
-    storage: Storage,
-    keys: torch.Tensor,
-    table_ids: torch.Tensor,
-    initializer: Callable,
-) -> torch.Tensor:
-    """Exact-length eval lookup through ``Storage.find`` (any ``Storage``)."""
-    (
-        h_num_missing,
-        _,
-        missing_indices,
-        _,
-        _,
-        _,
-        _,
-        embs,
-    ) = storage.find(
-        keys,
-        table_ids,
-        copy_mode=CopyMode.EMBEDDING,
-    )
-
-    if h_num_missing > 0:
-        initializer(embs, keys, table_ids, missing_indices)
-
     return embs
 
 
@@ -5401,66 +5362,6 @@ def _eval_lookup_cached(
     storage.load_masked(found, table_ids, CopyMode.EMBEDDING, output=embs)
     sf.initialize_masked(initializer, embs, keys, table_ids, miss & ~found.founds)
     return embs
-
-
-def _eval_lookup_cached_legacy(
-    cache: Cache,
-    storage: Storage,
-    keys: torch.Tensor,
-    table_ids: torch.Tensor,
-    initializer: Callable,
-) -> torch.Tensor:
-    """Exact-length eval lookup through ``Storage.find`` (any ``Storage``)."""
-    _, founds, cache_indices = cache.lookup(keys, table_ids)
-
-    embs = load_from_flat(
-        cache._state, cache_indices, table_ids, copy_mode=CopyMode.EMBEDDING
-    )
-
-    missing_mask = ~founds
-    h_num_miss, miss_compact_idx, (missing_keys, missing_table_ids) = flagged_compact(
-        missing_mask, [keys, table_ids]
-    )
-
-    if h_num_miss == 0:
-        return embs
-
-    (
-        h_num_missing_in_storage,
-        _,
-        missing_indices_in_storage,
-        _,
-        _,
-        _,
-        _,
-        storage_embs,
-    ) = storage.find(
-        missing_keys,
-        missing_table_ids,
-        copy_mode=CopyMode.EMBEDDING,
-    )
-
-    if h_num_missing_in_storage > 0:
-        initializer(
-            storage_embs, missing_keys, missing_table_ids, missing_indices_in_storage
-        )
-
-    embs[miss_compact_idx, :] = storage_embs
-
-    return embs
-
-
-def _masked_eval_applies(storage: Storage, cache: Optional[Cache]) -> bool:
-    """Whether an eval lookup may take the masked path (host facts only).
-
-    Any storage may: one that has not declared the padded contract is served
-    through its ``find`` (see :func:`as_padded`). ``DYNAMICEMB_SYNC_FREE=0``, the
-    switch that restores the legacy paths, keeps the exact-length functions. It is
-    read from the environment at every call, not from the flag the prefetch
-    dispatchers hold (that module imports this one): a test flips it with
-    ``monkeypatch.setenv``.
-    """
-    return os.environ.get("DYNAMICEMB_SYNC_FREE", "1") != "0"
 
 
 def eval_lookup(
@@ -5496,34 +5397,15 @@ def eval_lookup(
             device=keys.device,
         )
 
-    if valid is not None or _masked_eval_applies(storage, cache):
-        if cache is not None and not (
-            type(cache) is DynamicEmbCache or has_padded_contract(cache)
-        ):
-            raise TypeError(
-                "eval_lookup reads the table state of its cache: only a DynamicEmbCache "
-                f"(or a subclass that sets accepts_empty_keys = True in its own body) can "
-                f"be the cache, got {type(cache).__name__}."
-            )
-        storage = as_padded(storage)
-        if cache is None:
-            return _eval_lookup_storage(storage, keys, table_ids, initializer, valid)
-        return _eval_lookup_cached(
-            cache,
-            storage,
-            keys,
-            table_ids,
-            initializer,
-            valid,
+    if cache is not None and not (
+        type(cache) is DynamicEmbCache or has_padded_contract(cache)
+    ):
+        raise TypeError(
+            "eval_lookup reads the table state of its cache: only a DynamicEmbCache "
+            "(or a subclass that sets accepts_empty_keys = True in its own body) can "
+            f"be the cache, got {type(cache).__name__}."
         )
-
+    storage = as_padded(storage)
     if cache is None:
-        return _eval_lookup_storage_legacy(storage, keys, table_ids, initializer)
-
-    return _eval_lookup_cached_legacy(
-        cache,
-        storage,
-        keys,
-        table_ids,
-        initializer,
-    )
+        return _eval_lookup_storage(storage, keys, table_ids, initializer, valid)
+    return _eval_lookup_cached(cache, storage, keys, table_ids, initializer, valid)

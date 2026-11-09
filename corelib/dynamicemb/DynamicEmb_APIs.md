@@ -1685,6 +1685,8 @@ class MultiTableAdmitter(abc.ABC):
         """
 ```
 
+An admitter that sets `accepts_empty_keys = True` **in its own class body** (an inherited declaration does not count) is called with arrays as long as the whole batch: every position that is not a missing key holds the reserved all-ones key (`-1` as int64) and positions past the batch also have table id `-1`; it must not count those as keys and returns a mask as long as `keys`. What `state()` returns has to have declared it too (`Counter.accepts_empty_keys`). Any other admitter is called as before, with the missing keys only, dense and in order, after one blocking read of how many there are per call of `admit` (it is not called when none missed). The same rule decides how `non_admitted_initializer` is called: with `skips_negative_index = True` in its own class body it is given a negative index for every row it must leave alone, otherwise exact index lists after one read of how many rows there are. `uses_rng = True` marks an admitter whose `admit` draws random numbers (a seeded run then consumes the same draws whatever the timing).
+
 **dynamicemb** provides two pairs.
 
 `FrequencyAdmissionStrategy` admits a key once it has been seen often enough,
@@ -1823,14 +1825,14 @@ What it costs:
 What can still wait for the GPU. Each of these reads goes through `sync_free.read_now` or is outside DynamicEmb, so searching the package for `read_now` lists them:
 
 - an external `Storage` (a parameter server) that has not declared the padded contract (`accepts_empty_keys = True`, see [External storage](#external-storage)): its `find` / `insert` take exactly as many rows as are live, so one blocking read of that number precedes each call into it, and nothing else in DynamicEmb waits on its behalf. A class that declared the contract costs nothing;
-- user-defined `MultiTableAdmitter`, `Counter` and `Cache` classes: their contract takes keys sized to the request and returns host counts. They run the previous, exact-length path after one read of the unique counts per step;
+- a user-defined `MultiTableAdmitter`, `Counter` or non-admitted-row initializer that has not declared the padded contract (`accepts_empty_keys = True`, `skips_negative_index = True`; see [AdmissionStrategy and MultiTableAdmitter](#admissionstrategy-and-multitableadmitter)): its methods take keys sized to the request, so one blocking read of how many rows are live precedes each call into it (an `admit` that has nothing to decide on is not called), and nothing else waits on its behalf. A class that declared it costs nothing. A `Cache` cannot be replaced: only `DynamicEmbCache` is accepted;
 - table growth: the decision to grow is made without waiting (see [Table expansion](#table-expansion)), but growing a table remaps memory and synchronizes the device; it never happens when `init_capacity` equals `max_capacity`;
 - `DEMB_DETERMINISM_MODE`, which reads two counts per insert;
 - dump, load, export, `pop_*` and the incremental dump, which move data to the host by design, and `cache_metrics()`, which reads the hit counts when it is called;
 - the one-time setup of a table, and its teardown, which waits for queued work before freeing memory;
 - the input distribution of TorchRec (the split sizes of the all-to-all of keys live on the host).
 
-`DYNAMICEMB_SYNC_FREE=0` restores the previous lookup paths for comparison, and the `sync_free` helpers and `test/unit_tests/no_host_sync` (a probe that counts the syncs of a step per layout and scenario, and a ratchet against `budgets.json`) show where a sync comes from.
+No environment variable selects a path that reads. The `sync_free` helpers and `test/unit_tests/no_host_sync` (a probe that counts the syncs of a step per layout and scenario, and a ratchet against `budgets.json`) show where a sync comes from.
 
 ### Chunked miss path
 
@@ -1854,7 +1856,6 @@ The following environment variables control runtime behavior of dynamicemb:
 | `DYNAMICEMB_CSTM_SCORE_CHECK` | `1` | When set to `0`, suppresses warnings in `set_score` when a new score is less than the previous one (CUSTOMIZED eviction mode). |
 | `DEMB_DETERMINISM_MODE` | unset | When set, enables deterministic eviction of keys with equal scores during cache eviction and final table eviction. |
 | `DYNAMICEMB_DEBUG` | unset | When set to any non-empty value, enables extra runtime validation in `segmented_unique_cuda`. A one-block kernel verifies on the device: (1) `segmented_range[0] == 0`, (2) `segmented_range[num_tables] == num_keys`, (3) monotonically non-decreasing. A violation is a device-side assert that prints the failed condition (the CUDA context is unusable afterwards), not an exception. Intended for development and testing only; costs one small kernel launch per call and no host synchronization. |
-| `DYNAMICEMB_SYNC_FREE` | `1` | When set to `0`, the lookup takes the previous paths that compact the missing keys and read their counts, for comparison and as a kill switch. See [Host syncs](#host-syncs). |
 | `DYNAMICEMB_MISS_PATH_GATE` | `always` | How a step decides whether to run the miss path: `always` launches it every step (no host read), `poll` skips it when a non-blocking poll shows that nothing missed (the control flow depends on timing; the results do not), `read` reads the miss count with one blocking copy. `read` is used for `DEMB_DETERMINISM_MODE`. |
 | `DYNAMICEMB_MISS_PATH_BUFFER_BYTES` | `4294967296` | The bytes of `[rows, value_dim]` buffers one chunk of the miss path may allocate (2 x rows x value_dim x element size, 4 with an external storage below the cache). A bigger batch is processed in several chunks, never by another path. See [Chunked miss path](#chunked-miss-path). |
 | `DYNAMICEMB_EXACT_GROWTH` | `0` | When set to `1`, `expand_if_need` confirms a table's size with a blocking copy before growing it, as `load()` always does, instead of deciding from the last landed size snapshot and the bounds of the batches since. |
