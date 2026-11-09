@@ -163,6 +163,39 @@ def permute_scores_like_keys(
     return torch.empty_like(scores).index_copy_(0, unbucketize_permute, scores)
 
 
+def cut_to_length_per_key(
+    kjt: KeyedJaggedTensor,
+    unbucketize_permute: Optional[torch.Tensor] = None,
+    scores: Optional[torch.Tensor] = None,
+) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+    """Cut the arrays that are longer than the keys the lengths of ``kjt`` describe.
+
+    The index dedup of an embedding collection keeps its unique keys at the length of its
+    input -- the host does not know how many there are -- with the real ones first, and
+    the bucketize allocates its outputs at that length and fills a prefix: what follows is
+    not data, and is not even written. Everything that goes into the all2all has to be
+    exactly as long as the lengths say (c10d wants the split sizes to add up to the
+    tensor), and the permute of the sequence output has to hold only places that exist.
+
+    The number of keys is the sum of ``kjt.length_per_key()``, the read the all2all
+    makes next anyway; it stays cached on ``kjt``, so asking for it here adds none. The
+    values and weights of ``kjt`` are cut in place (``kjt`` is the caller's own, fresh
+    from the bucketize); ``unbucketize_permute`` and ``scores`` are returned cut. An array
+    that is the right length is returned as it is, so a distribution of exact arrays
+    (no dedup) is untouched.
+    """
+    total = sum(kjt.length_per_key())
+    if kjt._values.numel() != total:
+        kjt._values = kjt._values[:total]
+    if kjt._weights is not None and kjt._weights.numel() != total:
+        kjt._weights = kjt._weights[:total]
+    if unbucketize_permute is not None and unbucketize_permute.numel() != total:
+        unbucketize_permute = unbucketize_permute[:total]
+    if scores is not None and scores.numel() != total:
+        scores = scores[:total]
+    return unbucketize_permute, scores
+
+
 class _ScoredTensorsAwaitable(KJTAllToAllTensorsAwaitable):
     """The keys' tensors all2all, waiting for the scores' too.
 
@@ -252,6 +285,12 @@ class RwSparseFeaturesDist(_RwSparseFeaturesDist):
             received keys.
     """
 
+    # What the index dedup of the embedding collection asks before it hands over its
+    # unique keys at the length of its input, the real ones first, instead of cutting
+    # them to length with a read of their count: ``forward`` cuts them (see
+    # :func:`cut_to_length_per_key`). A distributor of TorchRec's gets exact arrays.
+    accepts_padded_dedup: bool = True
+
     def __init__(
         self,
         pg: dist.ProcessGroup,
@@ -311,6 +350,10 @@ class RwSparseFeaturesDist(_RwSparseFeaturesDist):
             ),
             dist_type_per_feature=self._dist_type_tensor,
         )
+        scores = sparse_features.scores() if takes_scores else None
+        unbucketize_permute, scores = cut_to_length_per_key(
+            bucketized_features, unbucketize_permute, scores
+        )
         self.unbucketize_permute_tensor = (
             unbucketize_permute if self._is_sequence else None
         )
@@ -332,7 +375,7 @@ class RwSparseFeaturesDist(_RwSparseFeaturesDist):
                 "per-key scores. Run the model without the pipeline."
             )
 
-        scores = permute_scores_like_keys(sparse_features.scores(), unbucketize_permute)
+        scores = permute_scores_like_keys(scores, unbucketize_permute)
         # The scores are sent as the values of a KJT of the keys' shape. Its
         # lengths are a copy: ``clear_inputs`` frees what an all2all was given
         # once that all2all is done, and must not take the other's lengths away.

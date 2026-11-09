@@ -1821,7 +1821,7 @@ What can still wait for the GPU. Each of these reads goes through `sync_free.rea
 - `DEMB_DETERMINISM_MODE`, which reads two counts per insert;
 - dump, load, export, `pop_*` and the incremental dump, which move data to the host by design, and `cache_metrics()`, which reads the hit counts when it is called;
 - the one-time setup of a table, and its teardown, which waits for queued work before freeing memory;
-- the input distribution of TorchRec (the split sizes of the all-to-all of keys live on the host).
+- the input distribution of TorchRec (the split sizes of the all-to-all of keys live on the host). With `use_index_dedup`, a sharding that is not DynamicEmb's row-wise one (a data-parallel table next to DynamicEmb tables, say) also needs the number of its unique keys on the host, one read per step; the row-wise sharding of DynamicEmb tables reads none beyond the split sizes.
 
 `DYNAMICEMB_SYNC_FREE=0` restores the previous lookup paths for comparison, and the `sync_free` helpers and `test/unit_tests/no_host_sync` (a probe that counts the syncs of a step per layout and scenario, and a ratchet against `budgets.json`) show where a sync comes from.
 

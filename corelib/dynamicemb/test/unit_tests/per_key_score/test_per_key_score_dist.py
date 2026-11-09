@@ -167,11 +167,15 @@ def check_input_dist(use_index_dedup: bool) -> None:
     assert len(seen) == 1, len(seen)
     (received,) = seen
     assert isinstance(received, ScoredKeyedJaggedTensor), type(received)
+    # What the lengths add up to is what is real. With use_index_dedup the unique keys
+    # come at the length of the input, the real ones first and the rest inert; the
+    # distributor cuts them.
+    real = sum(received.length_per_key())
     if use_index_dedup:
-        assert received.values().numel() <= scores.numel()
+        assert real <= scores.numel() == received.values().numel()
     else:
-        assert received.values().numel() == scores.numel()
-    assert torch.equal(received.scores(), received.values() * 10 + 1)
+        assert real == received.values().numel() == scores.numel()
+    assert torch.equal(received.scores()[:real], received.values()[:real] * 10 + 1)
 
     # What comes out of the all2all: scores still beside their keys (the default
     # dist_type keeps a key global), and as many of them as were sent.
@@ -183,7 +187,7 @@ def check_input_dist(use_index_dedup: bool) -> None:
     (sharding_context,) = context.sharding_contexts
     assert sharding_context.input_splits and sharding_context.output_splits
     counts = torch.tensor(
-        [received.values().numel(), arrived.values().numel()],
+        [real, arrived.values().numel()],
         dtype=torch.int64,
         device=device,
     )
@@ -275,6 +279,136 @@ def check_lookup_gets_scores(sharded, arrived) -> None:
         # Every score is still beside its key (the default dist_type keeps a key
         # global).
         assert torch.equal(scores, indices * 10 + 1), name
+
+
+def _poison_the_bucketize():
+    """The bucketize allocates its outputs at the length of its input and writes a prefix:
+    put junk in the rest, which is what that memory can hold, and check the permute it
+    returns on the way (``bucketized[permute[i]]`` is input key ``i``). Returns the
+    function that puts the bucketize back."""
+    import dynamicemb.shard.input_dist as input_dist_module
+
+    real = input_dist_module.bucketize_kjt_before_all2all
+
+    def poisoned(*args, **kwargs):
+        kjt, permute = real(*args, **kwargs)
+        total = int(kjt.lengths().sum())
+        if permute is not None:
+            assert torch.equal(
+                kjt._values[:total][permute[:total]], args[0].values()[:total]
+            )
+        kjt._values[total:] = 2**62 + 12345
+        if kjt._weights is not None:
+            kjt._weights[total:] = float("nan")
+        if permute is not None:
+            permute[total:] = 2**40
+        return kjt, permute
+
+    input_dist_module.bucketize_kjt_before_all2all = poisoned
+    return lambda: setattr(input_dist_module, "bucketize_kjt_before_all2all", real)
+
+
+def _rebuilt(kjt):
+    """A new object with the arrays of ``kjt``: whatever was noted on the old one, and
+    the lengths it had worked out, are gone."""
+    fields = dict(
+        keys=kjt.keys(),
+        values=kjt.values(),
+        lengths=kjt.lengths(),
+        weights=kjt.weights_or_none(),
+    )
+    if isinstance(kjt, ScoredKeyedJaggedTensor):
+        return ScoredKeyedJaggedTensor(scores=kjt.scores(), **fields)
+    return KeyedJaggedTensor(**fields)
+
+
+def _distribute(sharded, features):
+    """What one rank receives from the input distribution, with the permute that the
+    output distribution reads."""
+    context = sharded.create_context()
+    (arrived,) = sharded.input_dist(context, features).wait().wait()
+    (sharding_context,) = context.sharding_contexts
+    scored = isinstance(arrived, ScoredKeyedJaggedTensor)
+    weights = arrived.weights_or_none()
+    out = {
+        "values": arrived.values().clone(),
+        "lengths": arrived.lengths().clone(),
+        "scores": arrived.scores().clone() if scored else None,
+        "weights": None if weights is None else weights.clone(),
+        "permute": sharding_context.unbucketize_permute_tensor.clone(),
+    }
+    torch.cuda.synchronize()
+    return out
+
+
+def _canonical_order(out):
+    """The rows of a distribution by (key, frequency): the same key of two tables can
+    differ in its frequency, and in nothing else a test can see."""
+    order = torch.arange(out["values"].numel(), device=out["values"].device)
+    if out["weights"] is not None:
+        order = order[torch.sort(out["weights"][order], stable=True).indices]
+    return order[torch.sort(out["values"][order], stable=True).indices]
+
+
+def _same_distribution(got, want):
+    """Equal up to the order of the unique keys inside a call, which the dedup kernel
+    does not fix (the permute follows that order, so it is checked where it is made,
+    see ``_poison_the_bucketize``)."""
+    assert torch.equal(got["lengths"], want["lengths"])
+    assert got["values"].shape == want["values"].shape, (
+        got["values"].shape,
+        want["values"].shape,
+    )
+    order_got, order_want = _canonical_order(got), _canonical_order(want)
+    for name in ("values", "scores", "weights"):
+        if want[name] is None:
+            assert got[name] is None, name
+        else:
+            assert torch.equal(got[name][order_got], want[name][order_want]), name
+    assert got["permute"].shape == want["permute"].shape
+
+
+def check_padded_dedup_is_cut(per_key_score: bool) -> None:
+    """The unique arrays of the dedup are as long as its input, with junk in the memory
+    past the keys: the collection must send, permute and receive what it does without
+    the junk, also when the padded input was rebuilt on the way to the distributor.
+
+    The scored variant also covers the scores and their permute; the other one is an LFU
+    collection, whose frequency counters travel as weights and are padded too.
+    """
+    device = torch.device(f"cuda:{torch.cuda.current_device()}")
+    if per_key_score:
+        model, feature_names = _input_model(use_index_dedup=True)
+    else:
+        model, feature_names, _ = _ec_model(
+            use_index_dedup=True, score_strategy=DynamicEmbScoreStrategy.LFU
+        )
+    ((_, _, sharded),) = find_sharded_modules(model, "")
+    fields, scores = _input_features(feature_names, device)
+
+    def features():
+        if per_key_score:
+            return ScoredKeyedJaggedTensor(scores=scores, **fields)
+        return KeyedJaggedTensor(**fields)
+
+    # The first call builds the distributors; it is also the reference.
+    reference = _distribute(sharded, features())
+    restore = _poison_the_bucketize()
+    try:
+        _same_distribution(_distribute(sharded, features()), reference)
+
+        dedup = sharded._dedup_indices
+
+        def rebuilt(ctx, input_feature_splits):
+            return [_rebuilt(f) for f in dedup(ctx, input_feature_splits)]
+
+        sharded._dedup_indices = rebuilt
+        try:
+            _same_distribution(_distribute(sharded, features()), reference)
+        finally:
+            del sharded._dedup_indices
+    finally:
+        restore()
 
 
 # --- 2. scores in an EmbeddingCollection's tables ------------------------------
@@ -668,6 +802,10 @@ if __name__ == "__main__":
     dist.init_process_group(backend="nccl")
     check_input_dist(use_index_dedup=False)
     check_input_dist(use_index_dedup=True)
+    # The dedup does not cut its arrays to length (that would read their count): the
+    # distributor does, and junk past the keys must not reach anything.
+    check_padded_dedup_is_cut(per_key_score=True)
+    check_padded_dedup_is_cut(per_key_score=False)
     check_ec_scores(use_index_dedup=False)
     # Merging the repeats of a key before the all2all, as use_index_dedup does,
     # must leave the tables holding what they hold without it.

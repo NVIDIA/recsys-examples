@@ -1164,6 +1164,8 @@ SHT = "dynamicemb/scored_hashtable.py"
 SF = "dynamicemb/sync_free.py"
 ADM = "dynamicemb/embedding_admission.py"
 BDT = "dynamicemb/batched_dynamicemb_tables.py"
+SHARD_EMB = "dynamicemb/shard/embedding.py"
+SHARD_IN = "dynamicemb/shard/input_dist.py"
 
 
 def _new(file: str, *qualnames: str) -> List[Target]:
@@ -1252,6 +1254,9 @@ TARGETS: List[Target] = (
         "BatchedDynamicEmbeddingTablesV2._drain_score_checks",
         "BatchedDynamicEmbeddingTablesV2._table_key_bounds",
     )
+    # the index dedup of the embedding collection and the distributor that cuts its arrays
+    + _new(SHARD_EMB, "ShardedDynamicEmbeddingCollection._dedup_indices")
+    + _new(SHARD_IN, "cut_to_length_per_key", "RwSparseFeaturesDist.forward")
 )
 
 ENFORCE_ALL = os.environ.get("SYNC_LINT_ENFORCE_ALL") == "1"
@@ -1940,6 +1945,12 @@ ALLOWED_NEW_HITS: List[Tuple[str, Optional[str], str]] = [
         "inherent to that opt-in mode",
     ),
     (
+        "dynamicemb/shard/embedding.py",
+        "item",
+        "_dedup_indices: the unique count that a distributor of TorchRec's needs (it takes exact "
+        "arrays); a DynamicEmb row-wise distributor cuts the padded arrays itself",
+    ),
+    (
         "dynamicemb/scored_hashtable.py",
         "nonzero",
         "DEMB_DETERMINISM_MODE drops the reserved keys of a batch before it buckets them: "
@@ -1981,6 +1992,14 @@ EXPECTED_GONE: List[Tuple[str, str, str, str]] = [
         "item",
         "int(self.overflow_output_offsets_[table_id].item())",
         "step: delete dead code, read the overflow offset on the host",
+    ),
+    # The index dedup of the embedding collection no longer reads its unique count for a
+    # DynamicEmb row-wise distributor, which cuts the padded arrays itself.
+    (
+        "dynamicemb/shard/embedding.py",
+        "item",
+        "total_unique = num_uniques.item()",
+        "step: the dedup of the embedding collection reads no count",
     ),
     # Code that nothing called (offsets_to_table_features_offsets, DeviceCounter).
     (

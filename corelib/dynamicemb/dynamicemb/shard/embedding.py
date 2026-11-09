@@ -334,9 +334,17 @@ class ShardedDynamicEmbeddingCollection(ShardedEmbeddingCollection):
                     total_B,
                 )
 
-                # Get unique values for the KJT
-                # .item() implicitly syncs GPU to CPU
-                total_unique = num_uniques.item()
+                # The unique arrays are as long as the input, the real keys first and an
+                # inert tail (key EMPTY_KEY, count 0) after them: the host does not know
+                # how many there are, and need not. A DynamicEmb distributor cuts them to
+                # the lengths in its forward, with the read of the split sizes that the
+                # all2all makes anyway. A distributor of TorchRec's (the table of another
+                # sharding type, not DynamicEmb's) takes exact arrays and gets them here.
+                if getattr(self._input_dists[i], "accepts_padded_dedup", False):
+                    total_unique = num_elements
+                else:
+                    # sync-ok: the count that such a distributor needs
+                    total_unique = int(num_uniques.item())
                 unique_keys = unique_keys[:total_unique]
 
                 dedup_features = KeyedJaggedTensor(
