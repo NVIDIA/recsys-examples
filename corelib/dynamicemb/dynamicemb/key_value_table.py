@@ -31,11 +31,13 @@ from typing import (
     Sequence,
     Set,
     Tuple,
+    Union,
 )
 
 import numpy as np
 import torch  # usort:skip
 import torch.distributed as dist
+from dynamicemb import sync_free as sf
 from dynamicemb.dynamicemb_config import (
     DynamicEmbScoreStrategy,
     DynamicEmbTableOptions,
@@ -475,6 +477,20 @@ class DynamicEmbTableState:
     evicted_item_mode: EvictedItemMode = EvictedItemMode.DISCARD
     evicted_key_chunks: List[torch.Tensor] = field(default_factory=list)
     evicted_tid_chunks: List[torch.Tensor] = field(default_factory=list)
+    # Evictions whose count has not been read back yet: [keys, table_ids, count,
+    # ticket, stream] per entry (``stream`` is the ``cuda_stream`` handle of the
+    # stream that made it), appended by ``_append_evicted_masked`` and folded into
+    # the chunks above by ``_resolve_pending_evicted`` once ``count`` has landed on
+    # the host (or, on a pop, by waiting for it). ``retain_ring`` is the pinned ring
+    # those counts land in, allocated here so that no step allocates; only a table
+    # that retains evicted keys has one. A copy of the state (``copy.deepcopy``,
+    # pickle) gets a ring of its own, which does not know the tickets of the entries
+    # still pending: pop before copying.
+    evicted_pending: List[list] = field(default_factory=list)
+    retain_ring: Optional[sf.DeferredRead] = None
+    # Whether a step's miss path has to run (see ``sf.MissGate``). One per state:
+    # it owns a ring of its own, so two states never share a ticket.
+    miss_gate: Optional[sf.MissGate] = None
     erased_key_chunks: List[torch.Tensor] = field(default_factory=list)
     erased_tid_chunks: List[torch.Tensor] = field(default_factory=list)
     # A table that stores a row per key also records where each erased key sat:
@@ -683,6 +699,10 @@ def create_table_state(
         if no_eviction
         else None,
         evicted_item_mode=evicted_item_mode,
+        miss_gate=sf.MissGate(),
+        retain_ring=sf.DeferredRead((1,), torch.int64, slots=8)
+        if EvictedItemMode.RETAIN_KEY in evicted_item_mode
+        else None,
     )
 
 
@@ -1441,7 +1461,21 @@ def load_from_flat(
     indices: torch.Tensor,
     table_ids: torch.Tensor,
     copy_mode: CopyMode,
+    output: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
+    """Gather the rows ``indices`` of every table into one ``[N, dim]`` buffer.
+
+    ``dim`` is ``state.emb_dim`` for ``CopyMode.EMBEDDING`` and ``state.value_dim``
+    otherwise. A row whose index is negative is skipped: its output row is left
+    as it was, uninitialised in a fresh buffer.
+
+    ``output`` is an existing ``[N, dim]`` buffer of ``state.emb_dtype`` to load
+    into instead of a fresh one. Only the rows with a non-negative index are
+    written (the embedding at ``[0, edim_t)`` and, for ``CopyMode.VALUE``, the
+    optimizer state at ``[max_emb_dim, ...)``), so a caller can fill the buffer
+    with defaults first, load what the table has over them, and have only the
+    rows the table lacks keep the defaults. It is the buffer that is returned.
+    """
     # The key map hands rows back on the host after a dump.
     indices = indices.to(device=state.device, dtype=torch.int64)
     N = indices.numel()
@@ -1451,7 +1485,20 @@ def load_from_flat(
     else:
         max_dim = state.value_dim
         _load = _load_value
-    output = torch.empty(N, max_dim, dtype=state.emb_dtype, device=state.device)
+    if output is None:
+        output = torch.empty(N, max_dim, dtype=state.emb_dtype, device=state.device)
+    else:
+        assert tuple(output.shape) == (N, max_dim), (
+            f"load_from_flat: output has shape {tuple(output.shape)}, "
+            f"expected {(N, max_dim)}"
+        )
+        assert (
+            output.dtype == state.emb_dtype
+        ), f"load_from_flat: output is {output.dtype}, the table holds {state.emb_dtype}"
+        # The kernels address a row by ``stride(0)`` and its columns contiguously.
+        assert (
+            max_dim == 1 or output.stride(1) == 1
+        ), "load_from_flat: the columns of output must be contiguous"
     if N > 0:
         _load(
             state.table_ptrs_dev,
@@ -1675,6 +1722,7 @@ def _find_keys(
     *,
     const_lookup: bool = False,
     return_slots: bool = False,
+    compact: bool = True,
 ) -> Tuple:
     """Key-only find: lookup in hash table, return missing info + indices.
 
@@ -1684,6 +1732,16 @@ def _find_keys(
 
     ``score_input`` is the one tensor a table's score is made from, as
     :func:`score_source` chose it (see :func:`get_find_score_arg`).
+
+    With ``compact=False`` the call is the lookup and nothing else: the misses are
+    not compacted, so no count is read back and the host does not wait for the
+    device. The first four elements are then ``None`` and the fifth is the
+    full-length score tensor the lookup used (``None`` for an LRU or a const
+    lookup), so that a later insert of the same keys can reuse it. A caller that
+    takes this form works with masks over arrays of the length of
+    ``unique_keys`` (``~founds`` is the misses); a key it must not touch is the
+    reserved all-ones key, which the lookup reports as not found. An empty batch
+    returns the same empty result with either ``compact``.
     """
     if unique_keys.dtype != state.key_index_map.key_type:
         unique_keys = unique_keys.to(state.key_index_map.key_type)
@@ -1728,6 +1786,19 @@ def _find_keys(
     else:
         score_out, founds, indices = km.lookup(unique_keys, table_ids, score_arg)
 
+    if not compact:
+        return (
+            None,
+            None,
+            None,
+            None,
+            score_arg.value,
+            founds,
+            score_out,
+            indices,
+            *((slots,) * return_slots),
+        )
+
     missing = torch.logical_not(founds)
     (
         h_num_missing,
@@ -1755,21 +1826,137 @@ def _append_evicted(
     state: DynamicEmbTableState,
     evicted_keys: torch.Tensor,
     evicted_table_ids: torch.Tensor,
-    num_evicted: torch.Tensor,
+    num_evicted: Union[int, torch.Tensor],
 ) -> None:
     """Append this insert's evicted (key, table_id) to the state's retain chunks.
 
     ``evicted_keys`` / ``evicted_table_ids`` are sized at the batch upper bound;
-    only the first ``num_evicted`` entries are valid, so we slice + clone (freeing
-    the large per-batch buffers and keeping only the compact evicted rows). No
-    de-duplication here -- that happens on pop. One D2H sync per evicting insert
-    to read the count, acceptable since retain is opt-in.
+    only the first ``num_evicted`` entries are valid. No de-duplication here --
+    that happens on pop.
+
+    ``num_evicted`` on the host (an int or a CPU tensor) is exact: slice + clone,
+    freeing the large per-batch buffers and keeping only the compact evicted rows.
+
+    ``num_evicted`` on the device (what the insert kernels produce) is not read:
+    reading it would make every insert into a retaining table wait for the
+    device, even one that evicted nothing. The arrays are kept whole, with the
+    entries past the count made inert, and folded into the chunks later (see
+    :func:`_append_evicted_masked`); a pop folds what is still pending.
     """
-    n = int(num_evicted.item())
-    if n <= 0:
+    if not (isinstance(num_evicted, torch.Tensor) and num_evicted.is_cuda):
+        n = int(num_evicted)
+        if n > 0:
+            state.evicted_key_chunks.append(evicted_keys[:n].clone())
+            state.evicted_tid_chunks.append(evicted_table_ids[:n].clone())
         return
-    state.evicted_key_chunks.append(evicted_keys[:n].clone())
-    state.evicted_tid_chunks.append(evicted_table_ids[:n].clone())
+    # The kernels fill the first ``num_evicted`` entries (a prefix count): make the
+    # rest inert (a no-op when the extension already did), then it is the same
+    # as any array whose non-members carry the sentinels.
+    keys, tids = sf.inert_collected(num_evicted, evicted_keys, evicted_table_ids)
+    _append_evicted_masked(state, keys, tids)
+
+
+def _wait_for_stream(handle: Optional[int]) -> None:
+    """Order the current stream after what the stream with this ``cuda_stream``
+    handle has been given so far (``None``: no stream). The handle is a plain int,
+    so that whatever holds it (a state, a cache) can still be copied."""
+    current = torch.cuda.current_stream()
+    if handle is None or handle == current.cuda_stream:
+        return
+    default = torch.cuda.default_stream()
+    if handle == default.cuda_stream:
+        # The default stream's handle is 0, which ``ExternalStream`` takes for "no
+        # stream given": it would return an idle stream of the pool, and waiting for
+        # that orders nothing. Ask for the default stream by name.
+        other = default
+    else:
+        other = torch.cuda.ExternalStream(handle)
+    current.wait_stream(other)
+
+
+def _append_evicted_masked(
+    state: DynamicEmbTableState,
+    keys: torch.Tensor,
+    table_ids: torch.Tensor,
+) -> None:
+    """Append evicted keys given as arrays with sentinels, without reading a count.
+
+    ``keys`` / ``table_ids`` are N long and mark the entries that are not evicted
+    keys as inert: the reserved all-ones key and table id ``-1``. The members may
+    sit anywhere in the arrays, not only in a prefix, and the number of them is
+    derived on the device from the table ids. It is never a parameter: a masked
+    array must not be appended with a count and sliced ``[:n]``, because its
+    members are scattered and the slice would retain the wrong keys.
+
+    The count is copied to a pinned ring without waiting for it; an entry is
+    folded into ``evicted_key_chunks`` / ``evicted_tid_chunks`` by
+    :func:`_resolve_pending_evicted` once the count has landed, so the arrays
+    stay alive until then (``16 * N`` bytes an entry).
+    """
+    assert state.retain_ring is not None, "the table does not retain evicted keys"
+    if keys.numel() == 0:
+        return
+    _resolve_pending_evicted(state, block=False)  # fold what has already landed
+    count = (table_ids >= 0).sum().reshape(1)  # int64[1], stays on the device
+    # A full ring gives no ticket: the entry is retried by a later call, on this
+    # stream (the one the count was produced on), or read by a blocking pop.
+    state.evicted_pending.append(
+        [
+            keys,
+            table_ids,
+            count,
+            state.retain_ring.enqueue(count),
+            torch.cuda.current_stream().cuda_stream,
+        ]
+    )
+
+
+def _resolve_pending_evicted(state: DynamicEmbTableState, block: bool) -> None:
+    """Fold the pending evicted keys of ``state`` into its chunk lists.
+
+    Without ``block`` only the entries whose count has already landed on the host
+    are folded; nothing waits. With ``block`` every entry is folded, waiting for
+    its count: for a pop, whose result has a data-dependent size anyway.
+
+    An entry is folded by moving its members to the front with a stable sort of
+    the membership flag (the order of the keys is kept) and cutting ``[:n]``.
+    """
+    if not state.evicted_pending:
+        return
+    ring = state.retain_ring
+    cur = torch.cuda.current_stream()
+    keep = []
+    for keys, tids, count, ticket, stream in state.evicted_pending:
+        if ticket is None and ring is not None and stream == cur.cuda_stream:
+            # The ring was full when the entry was made. A ticket is requested only
+            # on the stream that produced ``count``: the copy and its event are
+            # ordered by that stream.
+            ticket = ring.enqueue(count)
+        if ticket is not None and not (block or ring.ready(ticket)):
+            keep.append([keys, tids, count, ticket, stream])
+            continue
+        if ticket is not None:
+            n = int((ring.wait(ticket) if block else ring.value(ticket))[0])
+            ring.release(ticket)
+        elif block:
+            # No ticket and a pop that must have the number: one read. It runs on
+            # this stream, so order it after the one that produced the count.
+            _wait_for_stream(stream)
+            n = int(sf.read_now(count)[0])
+        else:
+            keep.append([keys, tids, count, None, stream])
+            continue
+        if n > 0:
+            # The arrays belong to the stream that made them; the sort and the
+            # gathers below run on this one, and the arrays are dropped here.
+            keys.record_stream(cur)
+            tids.record_stream(cur)
+            order = torch.sort(
+                (tids >= 0).to(torch.int8), descending=True, stable=True
+            ).indices[:n]
+            state.evicted_key_chunks.append(sf.as_i64(keys)[order].view(keys.dtype))
+            state.evicted_tid_chunks.append(tids[order])
+    state.evicted_pending = keep
 
 
 def _append_erased(
@@ -1828,7 +2015,9 @@ def _pop_chunked_keys(
     tids = torch.cat(tid_chunks)
     mask = tids == table_id
     out = torch.unique(keys[mask], dim=0 if keys.dim() > 1 else None)
-    keep = ~mask
+    # A row with table id -1 is a sentinel (an inert entry of a masked append), not
+    # another table's key: leaving it in the remainder would keep it there for ever.
+    keep = (tids != table_id) & (tids >= 0)
     if bool(keep.any()):
         return out, [keys[keep]], [tids[keep]]
     return out, [], []
@@ -1836,6 +2025,9 @@ def _pop_chunked_keys(
 
 def _pop_state_evicted_keys(state: DynamicEmbTableState, table_id: int) -> torch.Tensor:
     """Pop (return + clear) the unique keys ``table_id`` had evicted."""
+    # A pop returns data of a data-dependent size, so waiting for the counts of
+    # the evictions that are still pending is part of its cost.
+    _resolve_pending_evicted(state, block=True)
     out, state.evicted_key_chunks, state.evicted_tid_chunks = _pop_chunked_keys(
         state.evicted_key_chunks, state.evicted_tid_chunks, table_id, state
     )
@@ -1905,13 +2097,29 @@ def _insert_and_evict_keys(
     table_ids: torch.Tensor,
     scores: Optional[torch.Tensor] = None,
     preserve_existing: bool = False,
-) -> Tuple[torch.Tensor, int, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    *,
+    async_count: bool = False,
+) -> Tuple[
+    torch.Tensor,
+    Union[int, torch.Tensor],
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+]:
     """Key-only insert_and_evict. Returns (indices, num_evicted, evicted_keys,
     evicted_table_ids, evicted_indices, evicted_scores).
     Caller is responsible for loading evicted values and storing new values.
 
     *preserve_existing* is forwarded to :func:`get_insert_score_arg` (e.g. backward
     re-insert should use True so existing slot scores are not overwritten).
+
+    By default ``num_evicted`` is a host int and the four evicted arrays hold
+    exactly that many entries, which costs a read of the count from the device.
+    With *async_count* nothing is read: ``num_evicted`` stays an ``int64[1]`` tensor
+    on the device and the evicted arrays are as long as ``keys``, the entries
+    past ``num_evicted`` inert (the reserved all-ones key, index and table id
+    ``-1``). A caller that takes this form must not branch on ``num_evicted``.
     """
     score_arg = get_insert_score_arg(
         state,
@@ -1927,7 +2135,9 @@ def _insert_and_evict_keys(
         evicted_indices,
         evicted_scores,
         evicted_table_ids,
-    ) = state.key_index_map.insert_and_evict(keys, table_ids, score_arg)
+    ) = state.key_index_map.insert_and_evict(
+        keys, table_ids, score_arg, async_count=async_count
+    )
 
     return (
         indices,
@@ -2762,7 +2972,13 @@ class DynamicEmbCache(Cache):
         optimizer: BaseDynamicEmbeddingOptimizer,
     ):
         self._state = create_table_state(options, optimizer, enable_overflow=True)
-        self._cache_metrics = torch.zeros(10, dtype=torch.long, device="cpu")
+        # The metrics live on the device and are read only when somebody asks (see
+        # ``cache_metrics``): the lookups fill them without waiting for anything.
+        # Allocated when recording is switched on, never inside a step.
+        self._metrics_dev: Optional[torch.Tensor] = None
+        # The ``cuda_stream`` handles of the streams the last lookup and the last
+        # insert ran on, for a reader that is on another one.
+        self._metrics_streams: List[Optional[int]] = [None, None]
         self._record_cache_metrics = False
 
     # -- Cache interface --
@@ -2801,9 +3017,12 @@ class DynamicEmbCache(Cache):
             unique_keys, table_ids, score_arg
         )
         if self._record_cache_metrics:
-            self._cache_metrics[0] = unique_keys.size(0)
-            founds = result[1]
-            self._cache_metrics[1] = founds.sum().item()
+            m = self._metrics_dev
+            # Counted on the device. A reserved key (the inert padding of a batch)
+            # is not a key, and it is reported as not found.
+            m[0].copy_(sf.valid_keys(unique_keys).sum())
+            m[1].copy_(result[1].sum())
+            self._metrics_streams[0] = torch.cuda.current_stream().cuda_stream
         return result
 
     def insert_and_evict(
@@ -2811,18 +3030,39 @@ class DynamicEmbCache(Cache):
         keys: torch.Tensor,
         table_ids: torch.Tensor,
         scores: Optional[torch.Tensor] = None,
+        *,
+        async_count: bool = False,
     ) -> Tuple[
-        torch.Tensor, int, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
+        torch.Tensor,
+        Union[int, torch.Tensor],
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
     ]:
-        """Insert with counter-aware eviction and overflow fallback."""
+        """Insert with counter-aware eviction and overflow fallback.
+
+        With ``async_count`` the count of evictions is not read: ``num_evicted``
+        stays an ``int64[1]`` tensor on the device and the four evicted arrays are
+        as long as ``keys``, their entries past ``num_evicted`` inert (the
+        reserved all-ones key, index and table id ``-1``).
+        """
         state = self._state
         score_arg = get_insert_score_arg(state, keys.numel(), keys.device, scores)
         result = state.key_index_map.insert_and_evict_with_counter_and_overflow(
-            keys, table_ids, score_arg
+            keys, table_ids, score_arg, async_count=async_count
         )
         if self._record_cache_metrics:
-            self._cache_metrics[2] = keys.numel()
-            self._cache_metrics[3] = result[1]  # num_evicted
+            m = self._metrics_dev
+            m[2].copy_(sf.valid_keys(keys).sum())
+            if async_count:
+                m[3].copy_(result[1].reshape(()))  # num_evicted, on the device
+            else:
+                # ``m[3] = n`` copies a CPU scalar tensor to the device (a transfer
+                # from pageable memory); ``fill_`` is a kernel taking ``n`` as an
+                # argument.
+                m[3].fill_(int(result[1]))
+            self._metrics_streams[1] = torch.cuda.current_stream().cuda_stream
         return result
 
     def reset(self) -> None:
@@ -2830,9 +3070,30 @@ class DynamicEmbCache(Cache):
 
     @property
     def cache_metrics(self) -> Optional[torch.Tensor]:
-        return self._cache_metrics if self._record_cache_metrics else None
+        """What the last lookups did, as a CPU ``int64[10]`` tensor; ``None`` unless
+        recording was switched on with :meth:`set_record_cache_metrics`.
+
+        ``[0]`` is the number of unique keys of the last lookup and ``[1]`` how many
+        of them were found; ``[2]`` the number of keys of the last insert and ``[3]``
+        how many entries it evicted. The counters are kept on the device, so
+        reading them is where the host waits for the device, not the lookups: one
+        batched copy per read. It is a snapshot, a later lookup does not change
+        a tensor returned earlier.
+        """
+        if not self._record_cache_metrics:
+            return None
+        # The lookup and the insert may have run on streams other than the reader's
+        # (and than each other's): take what each of them has done so far.
+        for handle in set(self._metrics_streams):
+            _wait_for_stream(handle)
+        # read_now reuses one pinned buffer for every read, so keep a copy.
+        return sf.read_now(self._metrics_dev)[0].clone()
 
     def set_record_cache_metrics(self, record: bool) -> None:
+        if record and self._metrics_dev is None:
+            self._metrics_dev = torch.zeros(
+                10, dtype=torch.long, device=self._state.device
+            )
         self._record_cache_metrics = record
 
     # -- Score management --
@@ -4444,15 +4705,30 @@ def _write_back_evicted(
     keys: torch.Tensor,
     table_ids: torch.Tensor,
     values: torch.Tensor,
+    slots: Optional[torch.Tensor] = None,
 ) -> None:
     """Return what the cache evicted to the tier below it.
 
     A key still in storage keeps its score, so only the value moves. One storage
     has evicted since goes to ``next_tier``; with none it is dropped, kept as an
     evicted key when storage retains them.
+
+    Without a ``next_tier`` this is :func:`_write_back_evicted_masked`: the arrays
+    may be of any length, padded with inert entries, and nothing is counted or
+    compacted, so the host does not wait for the device. ``slots`` are the
+    evicted indices the insert reported (see there).
+
+    With a ``next_tier`` (an external store, which takes host-sized tensors and is
+    written by code that may run on the host) the keys are compacted into the
+    ones storage has and the ones it has evicted since, each with a count read.
+    The arrays are then exact, and ``slots`` is not consulted.
     """
+    if keys.numel() == 0:
+        return
+    if next_tier is None:
+        return _write_back_evicted_masked(storage, keys, table_ids, values, slots)
     st = storage._state
-    in_storage = _find_keys(st, keys, table_ids, const_lookup=True)[5]
+    in_storage = _find_keys(st, keys, table_ids, const_lookup=True, compact=False)[5]
     with torch.cuda.nvtx.range("op:flagged_compact"):
         num_present, present, (present_keys, present_tids) = flagged_compact(
             in_storage, [keys, table_ids]
@@ -4475,10 +4751,47 @@ def _write_back_evicted(
                     ~in_storage, [keys, table_ids]
                 )
             gone_values = values[gone]
-        if next_tier is not None:
-            next_tier.insert(gone_keys, gone_tids, gone_values)
-        elif EvictedItemMode.RETAIN_KEY in st.evicted_item_mode:
-            _append_evicted(st, gone_keys, gone_tids, torch.tensor(gone_keys.numel()))
+        next_tier.insert(gone_keys, gone_tids, gone_values)
+
+
+def _write_back_evicted_masked(
+    storage: DynamicEmbStorage,
+    keys: torch.Tensor,
+    table_ids: torch.Tensor,
+    values: torch.Tensor,
+    slots: Optional[torch.Tensor],
+) -> None:
+    """:func:`_write_back_evicted` without a next tier, over arrays of any length.
+
+    ``keys`` / ``table_ids`` / ``values`` are as long as the evicted arrays of an
+    insert, an entry that is not an eviction being inert: the reserved all-ones
+    key and table id ``-1``. The keys storage still has get their value written to
+    the row they hold (``store_to_flat`` skips a row of ``-1``): storage keeps the
+    score of a key, only the value moves, so this is what an insert that keeps
+    existing scores does, without the insert. Without a store below it a key
+    storage has evicted since is dropped, or retained when storage retains
+    evicted keys.
+
+    ``slots`` is the index the insert reported for each entry (``None`` for an
+    array that has none, as in a flush). A negative one is not an eviction: the
+    insert refused that key (its bucket and overflow are all pinned) and reports
+    it as an evicted entry with index ``-(i + 1)``, a row of ``values`` that was
+    never loaded. Such an entry is neither written back nor retained.
+    """
+    st = storage._state
+    with torch.cuda.nvtx.range("op:write_back_evicted"):
+        # A const lookup: it leaves the scores as they are.
+        found = _find_keys(st, keys, table_ids, const_lookup=True, compact=False)
+        found_rows = found[7]
+        live = None if slots is None else (slots >= 0)
+        rows = found_rows if live is None else torch.where(live, found_rows, -1)
+        store_to_flat(st, rows, table_ids, values)
+        if EvictedItemMode.RETAIN_KEY in st.evicted_item_mode:
+            # Keys storage no longer has were evicted by it in the meantime.
+            gone = (found_rows < 0) if live is None else ((found_rows < 0) & live)
+            _append_evicted_masked(
+                st, sf.mask_keys(keys, gone), torch.where(gone, table_ids, -1)
+            )
 
 
 def flush_cache(

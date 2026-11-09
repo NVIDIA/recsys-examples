@@ -407,6 +407,20 @@ class Cache(abc.ABC):
         Returns:
             indices, num_evicted, evicted_keys, evicted_indices,
             evicted_scores, evicted_table_ids.
+
+        ``num_evicted`` is a host ``int`` and each of the four ``evicted_*``
+        tensors holds exactly that many entries: this is the contract of every
+        implementation. A key the cache refuses (its bucket and overflow are all
+        pinned) is reported as an evicted entry whose index is ``-(i + 1)`` for
+        its position ``i`` in ``keys``, a value row that was never in the cache.
+
+        The in-tree :class:`~dynamicemb.key_value_table.DynamicEmbCache` also
+        takes the keyword-only argument ``async_count=True``, which a user cache
+        does not have to implement (it is passed only to that class). Then the
+        count is not read: ``num_evicted`` stays an ``int64[1]`` tensor on the
+        device and the evicted tensors are as long as ``keys``, their entries
+        past ``num_evicted`` inert (the reserved all-ones key, index and table
+        id ``-1``).
         """
         ...
 

@@ -3384,6 +3384,8 @@ def test_multi_table_caching_flush(opt_type, opt_params):
         _ = embs2.mean()
 
     torch.cuda.synchronize()
+    # cache_metrics is a snapshot taken when it is read: read it again
+    metrics = cache.cache_metrics
     assert metrics[0].item() == metrics[1].item() == 4
 
     bdeb.flush()

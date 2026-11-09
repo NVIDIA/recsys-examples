@@ -6,6 +6,9 @@ set -e
 # Table + storage level (single GPU).
 pytest test/unit_tests/retain_evicted_keys/test_insert_collect_evicted.py -s
 
+# Lazy retained keys: counts left on the device, folded later (single GPU).
+pytest test/unit_tests/retain_evicted_keys/test_lazy_retain.py -s
+
 # Module level (single GPU).
 pytest test/unit_tests/retain_evicted_keys/test_pop_evicted_keys.py -s
 
