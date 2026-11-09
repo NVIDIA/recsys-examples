@@ -76,9 +76,11 @@ PADDED_OPT_SKIPS_NEGATIVE: bool = _extension_flag(
 #   "read":   one blocking read of the miss count;
 #   "poll":   skip it only when a non-blocking copy already landed a zero;
 #   "always": launch it every step and read nothing.
-# The default stays the conservative "read" until the unconditional path is validated.
+# "always" is the default: a step whose keys all hit runs the miss path on inert rows,
+# which changes nothing, and the CPU never waits for the GPU. DYNAMICEMB_MISS_PATH_GATE
+# selects another mode, and an external storage or determinism mode use "read".
 _MISS_GATE_MODES = ("always", "poll", "read")
-_DEFAULT_MISS_GATE = "read"
+_DEFAULT_MISS_GATE = "always"
 
 
 def _miss_gate_from_env() -> str:
