@@ -1972,7 +1972,82 @@ def _allowed(hit_key: Tuple[str, str, str]) -> bool:
 # the tree. The text has to be unique enough that it does not name a line the change keeps.
 # SYNC_LINT_FINAL=1 (the last commit of the series) also wants every line that left the baseline
 # to be claimed here, so that no removal goes unreviewed.
-EXPECTED_GONE: List[Tuple[str, str, str, str]] = []
+EXPECTED_GONE: List[Tuple[str, str, str, str]] = [
+    # The export read the overflow offset of a table from the device, a value the host holds.
+    (
+        "dynamicemb/scored_hashtable.py",
+        "item",
+        "int(self.overflow_output_offsets_[table_id].item())",
+        "step: delete dead code, read the overflow offset on the host",
+    ),
+    # Code that nothing called (offsets_to_table_features_offsets, DeviceCounter).
+    (
+        "src/dynamic_emb_op.cu",
+        "cudaStreamSynchronize",
+        "AT_CUDA_CHECK(cudaStreamSynchronize(stream));",
+        "step: delete dead code, read the overflow offset on the host",
+    ),
+    (
+        "src/dynamic_emb_op.cu",
+        "cpu_item",
+        "h_features_offsets[table_offsets_in_feature[i]].item<int64_t>();",
+        "step: delete dead code, read the overflow offset on the host",
+    ),
+    (
+        "src/utils.h",
+        "device_counter",
+        "class DeviceCounter {",
+        "step: delete dead code, read the overflow offset on the host",
+    ),
+    (
+        "src/utils.h",
+        "device_counter",
+        "DeviceCounter() {",
+        "step: delete dead code, read the overflow offset on the host",
+    ),
+    (
+        "src/utils.h",
+        "alloc_free",
+        "CUDACHECK(cudaMalloc((void **)&d_counter, sizeof(uint64_t)));",
+        "step: delete dead code, read the overflow offset on the host",
+    ),
+    (
+        "src/utils.h",
+        "alloc_free",
+        "~DeviceCounter() { CUDACHECK(cudaFree(d_counter)); }",
+        "step: delete dead code, read the overflow offset on the host",
+    ),
+    (
+        "src/utils.h",
+        "device_counter",
+        "~DeviceCounter() { CUDACHECK(cudaFree(d_counter)); }",
+        "step: delete dead code, read the overflow offset on the host",
+    ),
+    (
+        "src/utils.h",
+        "device_counter",
+        "DeviceCounter &reset(const cudaStream_t &stream) {",
+        "step: delete dead code, read the overflow offset on the host",
+    ),
+    (
+        "src/utils.h",
+        "device_counter",
+        "DeviceCounter &sync(const cudaStream_t &stream) {",
+        "step: delete dead code, read the overflow offset on the host",
+    ),
+    (
+        "src/utils.h",
+        "cudaMemcpyAsync_D2H",
+        "cudaMemcpyDeviceToHost, stream));",
+        "step: delete dead code, read the overflow offset on the host",
+    ),
+    (
+        "src/utils.h",
+        "cudaStreamSynchronize",
+        "CUDACHECK(cudaStreamSynchronize(stream));",
+        "step: delete dead code, read the overflow offset on the host",
+    ),
+]
 
 
 def _claim_matches(claim: Tuple[str, str, str, str], key: Tuple[str, str, str]) -> bool:

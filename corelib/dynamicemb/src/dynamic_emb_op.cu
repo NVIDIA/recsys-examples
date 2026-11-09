@@ -39,45 +39,6 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 namespace py = pybind11;
 using namespace dyn_emb;
 
-template <typename scalar_t>
-__global__ void
-compact_offsets(const scalar_t *offsets, scalar_t *features_offsets,
-                const int64_t num_features, const int64_t batch_size) {
-  for (int tid = threadIdx.x + blockIdx.x * blockDim.x; tid < num_features;
-       tid += blockDim.x * gridDim.x) {
-    features_offsets[tid] = offsets[tid * batch_size];
-  }
-  if (threadIdx.x == 0) {
-    features_offsets[num_features] = offsets[num_features * batch_size];
-  }
-}
-
-std::vector<int64_t> offsets_to_table_features_offsets(
-    const at::Tensor &offsets, const std::vector<int> &table_offsets_in_feature,
-    const int64_t batch_size, cudaStream_t stream) {
-  int64_t table_num = table_offsets_in_feature.size() - 1;
-  int64_t num_features = (offsets.numel() - 1) / batch_size;
-  at::Tensor h_features_offsets =
-      at::empty({num_features + 1},
-                offsets.options().device(at::kCPU).pinned_memory(true));
-  if (num_features == 0) {
-    return {0, 0};
-  }
-  AT_DISPATCH_INTEGRAL_TYPES(offsets.scalar_type(), "compact_offsets", [&] {
-    compact_offsets<<<num_features / 1024 + 1, 1024, 0, stream>>>(
-        offsets.data_ptr<scalar_t>(), h_features_offsets.data_ptr<scalar_t>(),
-        num_features, batch_size);
-  });
-  AT_CUDA_CHECK(cudaStreamSynchronize(stream));
-  std::vector<int64_t> table_features_offsets(table_offsets_in_feature.size(),
-                                              0);
-  for (int i = 0; i < table_offsets_in_feature.size(); ++i) {
-    table_features_offsets[i] =
-        h_features_offsets[table_offsets_in_feature[i]].item<int64_t>();
-  }
-  return table_features_offsets;
-}
-
 void gather_embedding(at::Tensor input, at::Tensor output, at::Tensor index) {
   auto stream = at::cuda::getCurrentCUDAStream().stream();
   auto &device_prop = DeviceProp::getDeviceProp(index.device().index());

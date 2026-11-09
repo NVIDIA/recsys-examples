@@ -1634,8 +1634,11 @@ class LinearBucketTable(ScoredHashTable):
                             named_scores[score_name] = (
                                 score[:actual_length].to(SCORE_TYPE).to(target_device)
                             )
+                    # Where the overflow slots of this table start in the output
+                    # numbering is the capacity of its main region: the host list
+                    # that overflow_output_offsets_ is made from.
                     ovf_out_offset = (
-                        int(self.overflow_output_offsets_[table_id].item())
+                        self.per_table_capacity_[table_id]
                         if return_index or return_slots
                         else 0
                     )
