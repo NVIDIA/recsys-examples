@@ -217,7 +217,7 @@ void node_push_test(at::Tensor values, at::Tensor inv, c10::optional<at::Tensor>
 // node, local_rank, num_features, lookup_keys, remote_keys, num_proxy_rows,
 // max_chunk_rows, record_bytes, and payload_rows (the rows of a chunk's
 // payload; max_chunk_rows when not given); and the lookup groups (the
-// features of each, Config::lookup_groups: empty, one group). rows_per_payload is
+// number of features of each, Config::lookup_groups: empty, one group). rows_per_payload is
 // rows_per_payload_for(max_chunk_rows, payload_rows): here max_chunk_rows
 // stands for sizes_of's chunk_ring_rows. The two differ only when sizes_of's
 // least of 2 * max_key_rows sets max_chunk_rows. Then max_chunks follows, and

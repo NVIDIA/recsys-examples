@@ -57,19 +57,26 @@ operator per sharding, `HierOutputDist`, does the work (section 7):
 * **The input dist does all the planning, with one host sync.** Keys move
   over NVLink inside a node and over InfiniBand between nodes, sent by the
   GPU itself (NCCL GIN). Eight custom kernels move them and wait for peers
-  (the *comm kernels*); the steps between them are kernels of its own and
-  CUB's sorts and scans (the *planner*). `input_dist()` queues all of it at
-  once. At the end every owner has a ready KeyedJaggedTensor (KJT) of the
-  keys it looks up, and every GPU has the per-row maps of the output dist.
+  (the *comm kernels*; with many features the first may take two grids
+  beside it); the steps between them are kernels of its own and CUB's sorts and
+  scans (the *planner*). `input_dist()` queues all of it at once. At the
+  end every owner has a ready KeyedJaggedTensor (KJT) of the keys it looks
+  up and the row of each key in its lookup output, and every GPU has the
+  per-row maps of the output dist.
   The CPU waits for the GPU once per call, at the call's second wait, in
   one blocking copy of a small status (`8 × (2 × num_features + 6)` bytes)
   to the host.
 * **The lookup only looks up.** DynamicEmb's lookup writes its rows straight
-  into a buffer that the output dist reads (zero copy).
+  into a buffer that the output dist reads (zero copy). Across nodes each
+  lookup group's rows lie there in the order they cross the rail: the
+  lookup writes each key's row where the input dist's row map says
+  (section 11.2).
 * **The output dist only moves rows.** The forward uses one kernel. The
   backward uses one kernel. When the call has heavy rows, two short kernels
   add up their gradients first (section 11.4). The output dist computes no
-  index.
+  per-row index. Across nodes its issuers cut each chunk at the runs of the
+  lookup groups, by a binary search in the plan's group runs, and move it in
+  one GIN put per lookup group that its keys span (section 10.4).
 * **Rail-aligned path.** A key that a GPU asks of an owner on another node
   first goes over NVLink to the *proxy*: the GPU of its own node on the
   owner's rail. The proxy sends it over that rail's InfiniBand link to the
@@ -80,13 +87,13 @@ operator per sharding, `HierOutputDist`, does the work (section 7):
 * **No static limit on the nodes, GPUs per node or features.** The kernels
   keep no table sized by them, and a GIN warp's lanes take any number of
   rail peers in turn.
-* **Memory that grows little with the number of GPUs.** Apart from
-  `node_offsets` (a row of `world_size × num_features + 1` offsets per GPU
-  of the node: 1 MB at 32 nodes, 8 GPUs per node and 64 features), the
-  rail's count messages (about `16 × num_nodes² × num_features` bytes:
-  1.0 MB at 32 nodes and 64 features) and small tables that grow linearly
-  with the nodes and with the features (section 15.4), no buffer is sized
-  by the number of GPUs. The proxy's buffer for
+* **Memory that grows little with the number of GPUs.** Apart from the
+  rail's count messages (`3 × num_nodes` messages of `num_features +
+  (num_nodes + 1) × (num_groups + 1) + 1` int64 words each, `num_groups`
+  the sharding's lookup groups) and small tables that grow linearly with
+  the nodes and with the features (section 15.4), no buffer is sized by
+  the number of GPUs. `node_offsets` holds a row of about `local_size ×
+  (num_features + 1)` words per GPU of the node. The proxy's buffer for
   rows (`proxy_rows`) is a ring with a fixed cap: a call's rows stream
   through it, chunk after chunk, and a chunk's rows are taken again once
   every reader is done with them. By default a chunk takes at most 2 MiB
@@ -129,7 +136,10 @@ this dist with TorchRec's dists.
 * **Comm kernel**: one of the input dist's eight custom kernels, each of
   which moves data between GPUs or waits for peers (section 10.2). The
   first, `node_exchange`, also lays out the node's keys (section 10.3), and
-  `rail_exchange` the rail's (section 10.4).
+  `rail_exchange` the rail's (section 10.4). When a call has many features
+  (or many nodes), `node_exchange` may take a grid on each side, which does
+  not wait: the one before it pushes its row, the one after it lays out the
+  node's items (section 10.2).
   **Planner**: the input dist's other steps, which lay a call out: kernels
   of its own, and the radix sorts and scans of CUB (NVIDIA's library of GPU
   algorithms), called from C++ (section 10).
@@ -146,8 +156,15 @@ this dist with TorchRec's dists.
 * **Occurrence**: one place where a key appears in a requester's batch.
   **Node-unique key**: one (table, key) as the proxy sends it on, however
   many occurrences its node has.
+* **Lookup group**: the tables that one of TorchRec's lookup modules
+  serves, a grouped config of the sharding (`GroupedEmbeddingConfig`). Its
+  features are consecutive among the sharding's features. `num_groups` is
+  the number of lookup groups.
 * **Lookup output**: the owner's rows for the keys it looks up, in its
-  buffer `lookup_rows`. **Proxy rows** (`proxy_rows`): the proxy's buffer
+  buffer `lookup_rows`, each lookup group's rows in a slice of their own.
+  Across nodes a group's rows lie in its slice in the order they cross the
+  rail, and the **row map** gives the row of each key of the owner's KJT
+  there (section 11.2). **Proxy rows** (`proxy_rows`): the proxy's buffer
   for the rows that pass between its node and the other nodes, in both
   directions: a **ring**, through which a call's rows pass as a **stream**
   of **chunks**; a stream that does not fit the ring takes it again, lap
@@ -380,7 +397,7 @@ The words used in this section and in section 15:
 
 | capacity | what it bounds | what it sizes | with uniform keys, about |
 |---|---|---|---|
-| `lookup_keys` | the keys an owner looks up: those of its own node and, across nodes, one per node-unique key of each other node | `lookup_rows` (the lookup output), the own part of `node_keys` and, across nodes, `rail_keys`; per call, the owner's KJT | `num_keys × (1 + (num_nodes − 1) × uniq_share) / num_nodes`, at most `num_keys` |
+| `lookup_keys` | the keys an owner looks up: those of its own node and, across nodes, one per node-unique key of each other node | `lookup_rows` (the lookup output), the own part of `node_keys` and, across nodes, `rail_keys`; per call, the owner's KJT and its row map | `num_keys × (1 + (num_nodes − 1) × uniq_share) / num_nodes`, at most `num_keys` |
 | `remote_keys` | across nodes: the occurrences a proxy deduplicates, the keys its node sends the owners of its rail on the other nodes | the remote part of `node_keys`, `node_bucket_feature_of_row`, `remote_map` and `key_stage`; `proxy_rows`, up to its cap; per call, the proxy's lists | `num_keys × (num_nodes − 1) / num_nodes` |
 
 Two more sizes follow from these (section 15.3): `proxy_rows` holds
@@ -451,7 +468,7 @@ formula.
 
 | capacity | in the window | elsewhere |
 |---|---|---|
-| `lookup_keys` | `row_bytes` (`lookup_rows`) + 8 (`node_keys`; 12 when the keys carry weights) + across nodes `record_bytes` (`rail_keys`) | per call, 8 (12 with weights) for the owner's KJT |
+| `lookup_keys` | `row_bytes` (`lookup_rows`) + 8 (`node_keys`; 12 when the keys carry weights) + across nodes `record_bytes` (`rail_keys`) | per call, 8 (12 with weights) for the owner's KJT, and across nodes 4 for its row map when a lookup group has more than one feature |
 | `remote_keys` | 8 (`node_keys`; 12 with weights) + 4 (`node_bucket_feature_of_row`) + 12 (`remote_map`) + `record_bytes` (`key_stage`), and `row_bytes` in `proxy_rows`, up to its cap | per call, 8 (the proxy's rows before each key, `node_exp_off`) |
 
 The input dist's working memory comes on top, in the caching allocator's
@@ -561,11 +578,11 @@ class HierOutputDist {  // one per sharding
                  const std::vector<int64_t> &dist_types, int64_t dim, at::ScalarType dtype,
                  bool weighted, bool node_dedup, int64_t lookup_keys, int64_t remote_keys,
                  int64_t proxy_bytes, double timeout_s, int64_t out_ctas, int64_t reduce_ctas,
-                 int64_t payload_kb);
+                 int64_t payload_kb, const std::vector<int64_t> &lookup_groups);
   ~HierOutputDist();  // local (section 4.6)
 
   // The whole input dist of a call, with no host sync: (values, weights,
-  // lengths, offsets, lookup_rows, status, fwd_plan, bwd_plan).
+  // lengths, offsets, lookup_rows, row_map, status, fwd_plan, bwd_plan).
   InDistTensors input_dist(const at::Tensor &values, const c10::optional<at::Tensor> &offsets,
                            const c10::optional<at::Tensor> &lengths, int64_t batch_size,
                            const c10::optional<at::Tensor> &weights,
@@ -585,12 +602,18 @@ class HierOutputDist {  // one per sharding
 
 The constructor takes the configuration (`Config`'s fields): the ranks, the
 table and the bucketize's rule of each feature, the rows and their weights,
-`node_dedup`, the capacities (with the proxy cap in bytes) and the knobs of
-section 4.4. A rule is a `DistType` code (`src/utils.h`) on the host: 1
-(`roundrobin`) or 2 (`hash_roundrobin`), one for all features of a table.
+`node_dedup`, the capacities (with the proxy cap in bytes), the knobs of
+section 4.4, and last the lookup groups (`lookup_groups`: the number of
+features of each group, in feature order, each group's features after the
+previous group's; empty, the default, is one group of every feature).
+`hier_output_dist_invalid()` takes the same fields, the lookup groups last
+too. A rule is a `DistType` code (`src/utils.h`) on the host:
+1 (`roundrobin`) or 2 (`hash_roundrobin`), one for all features of a table.
 The constructor and `hier_output_dist_invalid()` refuse any other code, a
 table whose features have different codes, and a list without a code per
-feature (`Config::validate`). Their messages:
+feature. They also refuse lookup groups that are not runs of the features:
+a group of no feature, or groups whose features are not the sharding's
+features in all (`Config::validate`). Their messages:
 
 * `it places keys by dist_type "roundrobin" or "hash_roundrobin" only, and
   the sharding's feature 2 has "continuous" (set its table's dist_type to
@@ -598,9 +621,12 @@ feature (`Config::validate`). Their messages:
   has dist_type code 7`;
 * `the sharding's features 0 and 1 share a table but not its dist_type (1
   and 2)`;
-* `it takes a dist_type per feature, got 2 for 3 features`.
+* `it takes a dist_type per feature, got 2 for 3 features`;
+* `every lookup group takes features, got a group of 0 features`;
+* `the lookup groups take 3 features, and the sharding has 4`.
 
-Python gives each table's `dist_type` to all its features, and
+Python gives each table's `dist_type` to all its features, and the number
+of features of each of the sharding's grouped configs as its lookup groups.
 `DynamicEmbTableOptions` takes no `dist_type` but `"continuous"`,
 `"roundrobin"` and `"hash_roundrobin"`. So from Python only the
 `"continuous"` refusal can come (section 6).
@@ -616,6 +642,11 @@ returns:
   entry per (feature, column), `num_features × kjt_stride` of them;
 * `lookup_rows`, `[lookup_keys, dim]`, a view of the window: the call's
   lookup writes its first `num_recv` rows;
+* the row map, `int32 [lookup_keys]`, or `None`: for each of the first
+  `num_recv` keys of the owner's KJT, its row in its lookup group's slice
+  of `lookup_rows`, where the lookup writes it (sections 10.4 and 11.2).
+  It is `None` on one node, and when every lookup group has one feature:
+  key `i` of a group then takes the group's row `i`;
 * the call's status, `int64 [2 × num_features + 6]` on the device (section
   10.5): the needs, `num_recv`, the backward's count, the remote
   occurrences this rank deduplicated as proxy, and the totals per feature;
@@ -625,7 +656,8 @@ returns:
 One training step in Python, as the sharding runs it (section 7.4):
 
 ```python
-values, weights, lengths, offsets, rows, status, fwd_plan, bwd_plan = op.input_dist(
+(values, weights, lengths, offsets, rows, row_map, status,
+ fwd_plan, bwd_plan) = op.input_dist(
     values, offsets, lengths, batch_size, weights,
     input_offsets, reverse_indices)  # input_dist()
 words = status.cpu().tolist()  # the second wait, the call's one host sync
@@ -634,7 +666,8 @@ num_recv, heavy_subs = words[3:5]
 kjt = KeyedJaggedTensor(  # the lookup's input (HierDist.finish)
     keys, values[:num_recv], lengths=lengths, offsets=offsets,
     stride=local_size + num_nodes - 1, length_per_key=words[6:6 + num_features])
-...                            # the lookup writes its rows into rows[:num_recv]
+...                            # the lookup writes its rows into rows[:num_recv],
+                               # each key's where row_map[:num_recv] says (11.2)
 out = op.output_dist_fwd(fwd_plan, rows[:num_recv])
 ...                            # the dense forward and backward
 lookup_grad = op.output_dist_bwd(bwd_plan, [num_recv, heavy_subs], grad_out, divide)
@@ -659,8 +692,9 @@ tables from its plans (`HierCall`, `shard/hier_output_dist.py`). The tests
 run the planner's steps, and the node layout, the push and the rail layout
 of the comm kernels, on plain tensors through functions of `testing.cu`. It also has a
 hook that makes the next construction fail, a hook that makes a rank read
-its node's offsets and keys late (section 18), and the GPU clock by which
-the benchmark aligns its timelines.
+its node's offsets and keys late, a hook that makes `node_exchange` push its
+row and lay out the node's items on its CTA or on its grids (section 18),
+and the GPU clock by which the benchmark aligns its timelines.
 
 ### 7.2 Construction
 
@@ -720,7 +754,8 @@ input_dist() (op.input_dist()): the bucketize (the keys sorted by owner),
 first wait:    nothing
 second wait:   a blocking copy of the status to the host, the call's one
                host sync; then the owner's KJT
-lookup:        writes its rows into lookup_rows (zero copy)
+lookup:        writes its rows into lookup_rows (zero copy), each key's
+               where the row map says
 forward kernel (op.output_dist_fwd(fwd_plan, rows)): the rows
 ... dense forward and backward ...
 backward kernel (op.output_dist_bwd(bwd_plan, counts, grad, divide)): gradient
@@ -740,38 +775,44 @@ the planner's kernels, with CUB's sorts and scans.
 
 | step | kind | what it does | section |
 |---|---|---|---|
-| `node_exchange` | comm | this rank's offsets into `node_offsets` at each GPU of its node, the node barrier, then the node layout from the node's offsets: where each rank of the node pushes its keys; the node's needs | 10.2, 10.3 |
+| `node_exchange` | comm | this rank's row of offsets into `node_offsets` at each GPU of its node (a large row: a grid just before it), the node barrier, then the node layout from the node's rows (many items: a grid just after it): where each rank of the node pushes its keys; the node's needs | 10.2, 10.3 |
 | `node_key_push` | comm | the bucketize's gather: this rank's keys into their places in its targets' `node_keys` over NVLink; on one node also the requester's map | 10.2 |
 | `node_done` | comm | tells its targets; waits until every requester of the node told it | 10.2 |
 | owner's KJT (one node) | kernel | a copy of the own part of `node_keys` | 10.3 |
 | node dedup | kernels, CUB | the proxy's node-unique keys, rows, the chunks of its stream and their slots | 9, 10.4 |
 | push order | kernels, CUB | its requesters' push orders and push tables | 10.4 |
-| `rail_exchange` | comm | its count message to every rail peer, and theirs; then the rail layout from the rail's messages: where each proxy's key records land, this owner's KJT layout, where each other node's keys of each feature start in it (`source_offsets`) and where its node's start in each rail owner's KJT (`owner_offsets`); the rail's needs | 10.2, 10.4 |
+| `rail_exchange` | comm | its count message to each rail peer (a header the same to all, then the peer's own part), and theirs; then the rail layout from the rail's messages: where each proxy's key records land, this owner's KJT layout, where each lookup group's rows lie in its `lookup_rows` (`group_offsets`, `group_shift`), and the group runs of each source node's records here (`fwd_groups`) and of its node's keys at each rail owner (`bwd_groups`); the rail's needs | 10.2, 10.4 |
 | `rail_key_push` | comm | its key records to its rail owners; it does not wait | 10.2 |
-| `node_status_exchange` | comm | the needs and `requester_offsets` of the node; the call's needs | 10.2 |
+| `node_status_exchange` | comm | the needs and the group shifts of the node's owners; the call's needs | 10.2 |
 | `peer_gather`, twice | comm (and a kernel) | the node's proxy headers, then the requester's gather list and its rows' `remote_map` words | 10.2, 10.4 |
 | requester tables | kernels, CUB | its maps, push order, push tables and remote task offsets | 10.4 |
 | `rail_done` | comm | waits until every rail proxy's key records are in; flushes this rank's key puts | 10.2, 13 |
-| owner tables | kernels | its KJT's keys, and the chunks its forward put list sends | 10.4 |
-| put lists | kernels, CUB | the owner's forward and the proxy's backward put lists | 10.4 |
+| owner tables | kernels | its KJT's keys, the chunks its forward puts, and its row map | 10.4 |
 | status | kernel | the call's status, which the second wait copies to the host | 10.5 |
 
 One node runs the first three steps, the owner's KJT and the status; across
 nodes every step runs but the owner's KJT. A call with no rows launches no
-`node_key_push`.
+`node_key_push`. Whether `node_exchange` takes its grids follows from the
+op's sizes alone, the same in every call: the grid before it when the node's
+rows of `node_offsets` (`local_size` rows of `NodeRow` words) pass 8192
+words, the grid after it when the layout's items (`(world_size +
+local_size) × num_features + 1`) pass 8192 (section 10.2; the test hook
+`hier_output_dist_node_paths` can force either).
 
 The second wait queues nothing after its sync: the owner's KJT is a view of
 the first `num_recv` of its values.
 
 `input_dist()` checks the call's inputs first. The call takes the in
 channel's next sequence number when it launches its first comm kernel,
-`node_exchange`. Every rank runs the same calls in the same order, so a
-call has the same number on every rank. A call that raises before
-`node_exchange`, on an input check or a failed allocation, takes no
-sequence number and launches no comm kernel. On one node the call
+`node_exchange`. The grid that pushes a large row just before it waits for
+nothing: no peer reads the row before this rank's `in_started` holds the
+call, and a later call writes the row again. Every rank runs the same calls
+in the same order, so a call has the same number on every rank. A call that
+raises before `node_exchange`, on an input check or a failed allocation,
+takes no sequence number and launches no comm kernel. On one node the call
 allocates the requester's map (`src`) before `node_exchange`. So nothing
-allocates between `node_exchange` and `node_done`, where a raise would
-leave the node peers waiting in `node_done`.
+allocates from `node_exchange` (and the grid before it) to `node_done`,
+where a raise would leave the node peers waiting in `node_done`.
 A call whose awaitables are dropped still ran its input dist
 (TorchRec's prefetch pipeline runs the input dist of its first batch
 twice): every rank does the same, so nothing goes out of step. The second
@@ -784,17 +825,21 @@ goes once its kernel is queued, and autograd keeps the backward's
 ### 7.4 Around the operator: the Python sharding
 
 * **When the sharding is built** (no collective): Python reads the options,
-  the capacities and the environment, and sets each DynamicEmb table's
-  `output_alloc` to the sharding. In each call on the op, the sharding then
-  hands each lookup group the next rows of the call's rows of `lookup_rows`
-  (section 11.2).
+  the capacities and the environment, and the lookup groups: the number of
+  features of each of the sharding's grouped configs, in feature order
+  (`HierDist(groups=...)`, the op's `lookup_groups`). It sets each
+  DynamicEmb table's `output_alloc` to the sharding (`lookup_buffer`). In
+  each call on the op, the sharding then hands each lookup group the next
+  rows of the call's rows of `lookup_rows`, and the row of each of the
+  group's keys there: its slice of the row map, or `None` (section 11.2).
 * **The input dist.** On a call that takes the op, `input_dist()` queues
   the whole input dist (`op.input_dist()`) and returns an awaitable, whose
   wait (the first wait) returns the second awaitable at once; waiting on it
   again returns the same. The second wait copies the status to the host
   (`HierDist.finish`), raises `RuntimeError` on every rank if the call
   does not fit (section 5.4), and returns the owner's KJT, built from views
-  of the input dist's tensors with no copy. It also sets the input KJT's
+  of the input dist's tensors with no copy. It keeps the call's rows and
+  row map for the KJT's lookup. It also sets the input KJT's
   per-feature totals from the status, so TorchRec's
   `construct_jagged_tensors` needs no host sync. The sharding context
   carries what the output dist takes (`hier_result`, a `HierCall`: the
@@ -814,10 +859,18 @@ goes once its kernel is queued, and autograd keeps the backward's
   `"hierarchical"`, at its first input dist (section 6).
 * **The lookup.** For the owner's KJT of a call on the op, the sharding
   takes the call's rows, the first `num_recv` rows of the `lookup_rows`
-  that `op.input_dist()` gave, and each DynamicEmb lookup group writes its
-  rows straight into the next rows of them. The lookup returns those rows,
-  which cover all groups, with no copy. Any other KJT (an eval forward, on
-  TorchRec's dists) takes TorchRec's lookup path.
+  that `op.input_dist()` gave, and their row map. Each DynamicEmb lookup
+  group writes its rows straight into the next rows of them, each key's at
+  its row in the group's slice (section 11.2). The lookup returns those
+  rows, which cover all groups, with no copy. With a row map their order is
+  not the KJT's: code that reads them by key reads them through it.
+  `HierDist.key_rows(kjt)` gives the row of each key of the KJT among the
+  call's rows (`None` without a row map), with no host sync; the tests read
+  the lookup's gradient by key with it. TorchRec's model delta tracker gets
+  each group's rows in its keys' order (`HierDist.in_key_order`): with a
+  row map a copy, else the lookup output itself.
+  Any other KJT (an eval forward, on TorchRec's dists) takes TorchRec's
+  lookup path.
 * **The output dist.** It takes the call's plans from the sharding context.
   An autograd function runs the forward kernel with the forward's plan
   (`op.output_dist_fwd()`), and keeps the backward's plan as saved tensors
@@ -832,9 +885,10 @@ goes once its kernel is queued, and autograd keeps the backward's
   awaitable, like those of TorchRec's own dists, makes the stream that
   waits on it wait for the forward kernel (an event), and records the rows'
   use there. So a dense forward on another stream reads the rows after the
-  kernel. The lookup records the owner's KJT, and the output dist's forward
-  the plans, on the stream they run on, which may be one of their own
-  (TorchRec's fused pipeline). Section 16 covers the pipelines.
+  kernel. The lookup records the owner's KJT and its row map (which the
+  lookup's backward reads too), and the output dist's forward the plans, on
+  the stream they run on, which may be one of their own (TorchRec's fused
+  pipeline). Section 16 covers the pipelines.
 
 ### 7.5 The channels and the window
 
@@ -843,8 +897,9 @@ goes once its kernel is queued, and autograd keeps the backward's
 * The **in channel** is the input dist's steps (section 7.3), on the current
   stream. It keeps views of this rank's own buffers: tensors over its copy
   of the window, without an allocator. It also keeps a few constant tensors,
-  made when the op is built: the table of each feature, the other nodes, and
-  the words of the proxy headers that this requester reads. The **out
+  made when the op is built: the table of each feature, the other nodes, the
+  lookup group of each feature and each group's first feature, and the
+  words of the proxy headers that this requester reads. The **out
   channel** is the forward and backward kernels, cooperative kernels on the
   current stream. The caller runs them on one stream, in the same order on
   every rank (section 13). The in channel starts each call, and the out
@@ -859,14 +914,19 @@ first, so the places of their buffers take the least to compute):
 
 | section | size | buffers |
 |---|---|---|
-| rows | `lookup_keys` rows; across nodes also `proxy_rows` | `lookup_rows` (the lookup output, then its gradient). Across nodes also `proxy_rows`. |
-| ctrl | its control words (section 15.2: 1.1 MB at 32 nodes, 8 GPUs per node and 64 features), most of them the count messages | one buffer, `ctrl`: the control words of both channels (sequence numbers, running totals, the credits sent, the count messages, each GIN warp's place with each rail peer) |
-| keys | from `lookup_keys`, across nodes `remote_keys`, and from `local_size × world_size × num_features` (`node_offsets`) | `node_offsets`, `node_keys` and, with weights, `node_key_weights`. Across nodes also `node_bucket_feature_of_row`, `remote_map`, `proxy_header`, `key_stage` and `rail_keys`. |
+| rows | `lookup_keys` rows; across nodes also `proxy_rows` | `lookup_rows` (the lookup output, each lookup group's rows in a slice of their own, then its gradient). Across nodes also `proxy_rows`. |
+| ctrl | its control words (section 15.2). Across nodes these are chiefly `3 × num_nodes` count messages (`3 × num_nodes × message` words, `message` the words of one, section 15.2), three words per chunk of `max_chunks` and a word per put counter, at most 64 (`3 × max_chunks + min(max_chunks, 64)` words). The count messages are most of it only when the nodes are many. | one buffer, `ctrl`: the control words of both channels (sequence numbers, running totals, the credits sent, the needs and group shifts a rank publishes to its node, the count messages it sends, a row per rail peer, and those it gets, each GIN warp's place with each rail peer) |
+| keys | from `lookup_keys`, across nodes `remote_keys`, and from `local_size² × (num_features + 1)` (`node_offsets`) | `node_offsets`, `node_keys` and, with weights, `node_key_weights`. Across nodes also `node_bucket_feature_of_row`, `remote_map`, `proxy_header`, `key_stage` and `rail_keys`. |
 
-`node_offsets` holds a row per GPU of the node, of `world_size ×
-num_features + 1` int64 words: row `r` is the bucketize's
-`offset_per_bucket_feature` of the node's requester `r` in the call, which
-that requester stores there (`node_exchange`, section 10.2). `node_keys`
+`node_offsets` holds a row per GPU of the node (`NodeRow`): row `r` is what
+the node layout reads of the bucketize's `offset_per_bucket_feature` of the
+node's requester `r` in the call, which that requester stores there
+(`node_exchange`, sections 10.2 and 10.3). Across nodes the row first holds
+the requester's keys for each target's remote part (`local_size` words),
+then its offsets at its own node's bucket features (`local_size ×
+num_features + 1` words), then a 0 when the words before it are odd in
+number, so that a row is whole 16-byte units. On one node it holds the
+offsets alone, padded the same way. `node_keys`
 holds the keys a GPU's node pushes to it: its *own part*, which
 it looks up as owner, and across nodes its *remote part*, which it
 deduplicates as proxy (section 10.3). The buffers that only an op across
@@ -1051,7 +1111,11 @@ node-unique keys of the `nth` other node whose representative feature is
 that feature, in `uniq` order.
 The other nodes are counted from 0, in node order, with this node left out.
 The KJT comes with its lengths, offsets and per-feature totals. So the
-TorchRec code that splits it per lookup group needs no host sync.
+TorchRec code that splits it per lookup group needs no host sync. Across
+nodes, the owner's `lookup_rows` hold the rows of a lookup group of more
+than one feature in another order: its own part first, then each other
+node's records in node order (section 11.2). A group of one feature keeps
+the KJT's order.
 
 **Example** (2 nodes × 2 GPUs; features `f0`, `f1` of one table; owner =
 key mod 4). GPUs 0 and 1 are node 0; GPUs 2 and 3 are node 1. Node 1 asks
@@ -1066,12 +1130,18 @@ four. In the backward GPU 3 pushes its gradient rows into GPU 2's
 ## 10. The input dist's steps
 
 `input_dist()` queues the bucketize and the steps after it on the caller's
-stream, in the order of section 7.3. Eight of them are the comm kernels (section 10.2). The planner
+stream, in the order of section 7.3. Eight of them are the comm kernels,
+and `node_exchange` may take two grids beside it (section 10.2). The planner
 does the rest (`src/hier_output_dist/input_dist/planner.h`): kernels of its
 own and CUB's radix sorts and scans, on the current stream. Each step is one
 or a few ordinary kernels. A kernel over items (keys, rows, occurrences)
 runs a thread per item; a kernel over a step's small tables (sized by the
 nodes, ranks, features and chunks) runs on one CTA, which loops over them.
+A long scan on one CTA takes its values a tile at a time: each thread reads
+8 consecutive values of the tile before the tile's one block scan, so it
+waits once per tile for its loads (`cta_scan_blocked`, `planner.cuh`). The
+proxy's keys per bucket feature, the owner's KJT offsets on the rail, and
+the owner's record offsets of each other node (a CTA per node) take it.
 No kernel waits for another CTA: a step that needs every item done goes on
 in its next kernel, or in the kernel's last CTA out. That is the fan-out
 table's counts (section 10.1): each CTA takes a ticket once its items are
@@ -1089,10 +1159,11 @@ runs every step on what arrived and stays in bounds.
 With the benchmark's configuration (8 features, one owner rule), the
 bucketize queues 29 kernels and copies per call (DynamicEmb's index dedup
 and the fan-out table included), and the steps after it 5 on one node and
-about 50 across nodes (an estimate from the code), CUB's included. The
+about 40 across nodes (an estimate from the code), CUB's included. The
 node's part of a call is three comm kernels (`node_exchange`,
 `node_key_push`, `node_done`); on one node a fourth kernel copies the own
-part. Across nodes the rail's part is three more (`rail_exchange`,
+part. With many features, `node_exchange`'s grids add one or two more.
+Across nodes the rail's part is three more (`rail_exchange`,
 `rail_key_push`, `rail_done`).
 
 ### 10.1 The bucketize (requester, caller's stream, local)
@@ -1189,20 +1260,38 @@ same on every rank. It waits only for the same kernel (the same `in_seq`) of
 its node or rail peers. The one exception is `rail_done`: it waits for its
 rail peers' `rail_key_push` of the call, a kernel that does not wait. Its
 threads take the peers in turn (thread `t` the peers `t`, `t + 32`, ... in a
-warp), so it serves any number of them. Section 13 gives their memory order
+warp), so it serves any number of them. `node_exchange` may take two grids
+beside it, which do not wait (below). Section 13 gives their memory order
 and why no wait hangs.
 
-* **`node_exchange`** (1 CTA): stores this rank's offsets, its bucketize's
-  `offset_per_bucket_feature` (`world_size × num_features + 1` int64
-  words), into its row of `node_offsets` at every GPU of its node, its own
-  too, over NVLink. Then thread 0 makes a system fence and sets its
-  `in_started` word to `in_seq`, and the CTA waits until every node peer
-  has (the node barrier of the call). Every peer's offsets are then in this
+* **`node_exchange`** (1 CTA): stores this rank's row of `node_offsets`
+  (`NodeRow`: what the node layout reads of its bucketize's
+  `offset_per_bucket_feature`, about `local_size × (num_features + 1)` int64
+  words, section 7.5) into its place at every GPU of its node, its own too,
+  over NVLink, in 16-byte stores. Then thread 0 makes a system fence and
+  sets its `in_started` word to `in_seq`, and the CTA waits until every node
+  peer has (the node barrier of the call). Every peer's row is then in this
   rank's `node_offsets`. From them the CTA computes the node layout
-  (section 10.3) into the call's tensors. Passing the barrier also means
-  that every peer finished its previous call's in channel, whose steps read
-  what this call writes into their copies of the window. The offsets go out
-  before the barrier: section 13 says why that is safe.
+  (section 10.3) into the call's tensors: its small tables, then its items.
+  Passing the barrier also means that every peer finished its previous
+  call's in channel, whose steps read what this call writes into their
+  copies of the window. The rows go out before the barrier: section 13 says
+  why that is safe.
+* **`node_exchange`'s grids** (threads stride over the items, every CTA;
+  neither waits). When the row's `local_size` copies take more than 8192
+  words (64 KiB, `kNodeRowWordsInCta`), `node_rows_push_kernel` stores
+  them, a thread per 16-byte unit of the row at a peer, just before
+  `node_exchange` on the stream, and `node_exchange` stores none. Its
+  stores need no wait: this rank's `node_done` of the call before, earlier
+  on the stream, saw every peer tell it read its `node_offsets`. Each of
+  its CTAs ends with a system fence, so `node_exchange`'s release publishes
+  the stores. When the node layout has more than 8192 items
+  (`kNodeItemsInCta`), `node_layout_items_kernel` computes them, a thread
+  per item, just after `node_exchange` on the stream, from the small tables
+  that `node_exchange` left in the call's scratch. It reads `node_offsets`
+  before this rank's `node_done`, as `node_exchange` does. With 8 GPUs per
+  node, the push takes its grid from about 128 features on, and the items
+  take theirs when `(world_size + 8) × num_features` reaches 8192.
 * **`node_key_push`** (threads stride over the bucketized rows, at most two
   CTAs per SM): the bucketize's gather. For each of this rank's valid rows
   it reads the KJT's key at `inv[row]` (an `int32` key widened with its
@@ -1219,20 +1308,22 @@ and why no wait hangs.
 * **`node_done`** (1 warp): makes a system fence, tells each node peer that
   this rank's keys are there (its flag in the peer's `in_written` words),
   then waits until every peer told it. The tell also says that this rank's
-  `node_exchange` read `node_offsets`, so the peers may store their rows
-  there again in the next call. It runs in every call, also with no rows
-  and under skip.
+  `node_exchange` (and the grid of its items) read `node_offsets`, so the
+  peers may store their rows there again in the next call. It runs in
+  every call, also with no rows and under skip.
 * **`rail_exchange`** (1 CTA, across nodes): writes this rank's count
-  message (section 10.4), the same for every rail peer, into its
-  `count_msg_out` words and into its `count_msg` slot of its own node: the
-  slots go by `in_seq` parity and source node. Then the lanes of one warp,
-  which take the rail peers in turn, put each peer the message into the
+  messages (section 10.4) into its `count_msg_out` words, a row per rail
+  peer (the header, the same in every row, then that peer's own part), and
+  its message to its own node into its `count_msg` slot of its own node:
+  the slots go by `in_seq` parity and source node. Then the lanes of one
+  warp, which take the rail peers in turn, put each peer its row into the
   same slot in the peer's copy: one put, which carries a GIN signal
   (context 2). The lanes of another warp wait until the message of every
-  rail peer has landed. From the `num_nodes` messages of the call, read in
-  their slots, the CTA lays out the rail (section 10.4) into the call's
-  tensors: every rank of the rail computes it from the same messages.
-  Before it ends, the putting warp flushes its puts.
+  rail peer has landed. From the `num_nodes` messages of the call to this
+  rank, read in their slots, the CTA lays out the rail (section 10.4) into
+  the call's tensors: every rank of the rail computes the rail's group runs
+  and shifts from the same headers. Before it ends, the putting warp
+  flushes its puts.
 * **`rail_key_push`** (1 warp, across nodes): its lanes, which take the
   rail owners in turn, put this proxy's `key_stage` slice for each owner
   into the owner's `rail_keys`, where the rail layout says, with a GIN
@@ -1241,11 +1332,13 @@ and why no wait hangs.
   it has the owner's count message of the call, which the owner sends after
   its previous call read `rail_keys`. It does not wait.
 * **`node_status_exchange`** (1 CTA, across nodes): writes this rank's rail
-  needs and where each requester of its node starts in its KJT (the rail
-  layout's `needs` and `requester_offsets`) into its `needs` and
-  `requester_offsets` words, sets its `in_status` word to
-  `in_seq`, and waits until every node peer has. Then it reads every peer's
-  needs, and where each peer's KJT holds this requester's keys.
+  needs and its group shifts (the rail layout's `needs` and `group_shift`,
+  `num_groups` words: where each lookup group's own part lies in its
+  `lookup_rows`, section 10.4) into its `needs` and `group_shift` words,
+  sets its `in_status` word to `in_seq`, and waits until every node peer
+  has. Then it reads every peer's needs and group shifts
+  (`owner_group_shift`), from which the requester places its rows in its
+  node's owners' `lookup_rows`.
 * **`peer_gather`** (threads stride over the words, at most two CTAs per SM;
   across nodes, twice per call): reads words of node peers' proxy headers
   (`ProxyHeader`: one word per item, by its word number) or `remote_map`
@@ -1262,27 +1355,41 @@ and why no wait hangs.
 
 ### 10.3 The node layout, and the owner's KJT on one node
 
-`node_exchange` lays out the node's keys on its CTA, from the node's
-offsets (`node_layout_of`, `input_dist/node.cuh`). Every rank of the node
-reads the same offsets, so all compute the same needs and skip. Row `r` of
-`node_offsets`, `O[r]`, is requester `r`'s `offset_per_bucket_feature`. So
-requester `r` has:
+`node_exchange` lays out the node's keys from the node's rows of
+`node_offsets` (`input_dist/node.cuh`). Every rank of the node reads the
+same rows, so all compute the same needs and skip. Requester `r`'s
+bucketize gives `O[r]`, its `offset_per_bucket_feature`, and its row of
+`node_offsets` (`NodeRow`, section 7.5) holds what the layout reads of it.
+Requester `r` has:
 
-* `c(r, t, f) = O[r][b + 1] − O[r][b]` keys of feature `f` for owner `t` of
-  this node, whose bucket feature is
-  `b = (node × local_size + t) × num_features + f`;
+* `c(r, t, f) = X[r][j + 1] − X[r][j]` keys of feature `f` for owner `t` of
+  this node, with `j = t × num_features + f`. Its row holds `X[r][j] =
+  O[r][node × local_size × num_features + j]` for `j` from 0 to
+  `local_size × num_features`: its offsets at its own node's bucket
+  features. The bucket feature of `(t, f)` is
+  `b = node × local_size × num_features + j`;
 * `R(r, t)` keys for the owners `(n, t)` of the other nodes, which go to the
   remote part of target `t`: the sum over the other nodes `n` of its block,
   `O[r][(n × local_size + t + 1) × num_features] − O[r][(n × local_size + t) × num_features]`.
+  Across nodes its row holds `R(r, t)` for each target `t`, which the
+  requester sums from `O[r]` as it pushes the row.
 
-The layout, with `me` this rank's local rank:
+The layout is closed-form: each of its entries adds up words of at most
+`local_size` rows, and of this rank's own offsets. `S[j]`, the sum of
+`X[r][j]` over every requester `r`, counts the node's keys before the
+bucket feature of `j`, so `S[j'] − S[j]` is the node's keys of its own
+node's bucket features from `j` to `j'`. With `me` this rank's local rank:
 
 * the *own part* of an owner's `node_keys`, at `[0, lookup_keys)`, holds the
   keys of its node for it in its KJT's order: feature after feature, then
-  requester after requester, each in the requester's order. This rank's
-  lengths are `own_lengths[f × local_size + r] = c(r, me, f)`, and
-  `own_offsets` gives where each starts. Owner `t`'s own part holds
-  `own_total[t]` keys, the sum of `c(r, t, f)` over `r` and `f`;
+  requester after requester, each in the requester's order. Owner `t`'s own
+  part holds `own_total[t] = S[(t + 1) × num_features] − S[t ×
+  num_features]` keys. This rank's lengths are `own_lengths[f × local_size
+  + r] = c(r, me, f)`, and requester `r`'s keys of feature `f` start at
+  `own_offsets[f × local_size + r]`: after the node's keys of the features
+  before `f` (`S[j] − S[me × num_features]`, with `j = me × num_features +
+  f`) and those of the requesters before `r` (the sum of `c(r', me, f)` over
+  `r' < r`);
 * across nodes the *remote part* of a proxy's `node_keys`, at
   `[lookup_keys, lookup_keys + remote_keys)`, holds the keys of its node for
   the owners of its rail on the other nodes. They are requester after
@@ -1300,23 +1407,37 @@ this rank's rows of `b` start there, less `O[me][b]`, where they start among
 its bucketized rows. So one add places a row, wherever it is inside `b`:
 
 * for an owner `t` of this node, this rank's rows of `b` start after the
-  node's keys for `t` of the features before `f` (the sum of `c(r, t, f')`
-  over every `r` and `f' < f`) and those of the requesters before this rank
-  in `f` (the sum of `c(r, t, f)` over `r < me`);
+  node's keys for `t` of the features before `f` (`S[j] − S[t ×
+  num_features]`, the sum of `c(r, t, f')` over every `r` and `f' < f`) and
+  those of the requesters before this rank in `f` (the sum of `c(r, t, f)`
+  over `r < me`);
 * for an owner `(n, t)` of another node, they start at `lookup_keys`, after
   the keys of the requesters before this rank in `t`'s remote part (the sum
   of `R(r, t)` over `r < me`) and this rank's blocks for the owners
-  `(n', t)` of the other nodes before `n`. That block holds every feature of
-  the owner in the bucketize's order, so `row_shift[b]` is this start less
-  `O[me][(n × local_size + t) × num_features]` for every feature of the
-  owner;
+  `(n', t)` of the other nodes before `n`, which it reads in its own
+  `O[me]`. That block holds every feature of the owner in the bucketize's
+  order, so `row_shift[b]` is this start less `O[me][(n × local_size + t) ×
+  num_features]` for every feature of the owner;
 * the rows past the valid ones (bucket feature `world_size × num_features`)
   are never pushed: their `row_shift` is 0, so each is at its own index.
 
+Two parts compute the layout. The *small part* (`node_layout_small`, on
+`node_exchange`'s CTA) computes the tables of an entry per GPU of the node
+or per owner: `S` at the first bucket feature of each target, the own
+parts, the needs and skip, and across nodes `remote_offsets` and the row
+shift of each remote owner, with the offsets of this rank's blocks for
+them. The *items* (`node_layout_items`) take `O(local_size)` work each: the row
+shift of each of the `world_size × num_features + 1` bucket features, and
+the length and offset of each of the `local_size × num_features`
+(feature, requester) entries of this rank's own part. `node_exchange`'s CTA
+computes the items too when they are at most 8192; else its grid after it
+does, a thread per item (section 10.2).
+
 On one node the own part is the owner's KJT. Its lengths are `own_lengths`,
-and `node_exchange` also gives its offsets (`kjt_offsets`, `num_features ×
+and the items also give its offsets (`kjt_offsets`, `num_features ×
 local_size + 1` of them, whose first ones are `own_offsets`) and its keys of
-each feature (`length_per_key[f]`, the sum of `c(r, me, f)` over `r`). After
+each feature (`length_per_key[f] = S[j + 1] − S[j]` with `j = me ×
+num_features + f`: the sum of `c(r, me, f)` over `r`). After
 `node_done` the owner copies the first `min(own_total[me], lookup_keys)`
 keys of its own part into the call's KJT values, of `lookup_keys` entries
 (`one_node_owner`; the second wait narrows them to the keys that arrived).
@@ -1370,7 +1491,7 @@ hash table, the pass and the scan:
 * a pass marks the representatives, and a CUB scan (three launches) counts
   them before each occurrence;
 * one CTA counts the representatives of each block: the keys of each
-  bucket feature, and where they start;
+  bucket feature, and where they start (a blocked scan, section 10);
 * a thread per occurrence takes its key `uniq` from its representative,
   and its rank among its key's occurrences from the list. The
   representative writes its key's tables. The representative is the `k`-th
@@ -1419,52 +1540,77 @@ in occurrence order; `node_exp_off` holds the rows before each key, and
 where the rows lie follows from the chunk (section 12.1).
 
 **The rail.** The rail all-gathers its counts, as the node gathers its
-offsets. Each rank sends every rail peer the same count message
-(`CountMessage`, int64 words): its node's largest remote part; as owner,
-the keys of its own node that it looks up, in total and per feature; as
-proxy, the most occurrences of one of its keys, its chunks per owner node,
-and its node-unique keys per (owner node, feature). That is
-`3 + num_nodes + (num_nodes + 1) × num_features` words. From the
-`num_nodes` messages of the call, its own too, every rank of the rail
-computes the layout of the whole rail (`rail_layout_of`,
-`input_dist/rail.cuh`):
+offsets. Each rank sends each rail peer a count message (`CountMessage`,
+int64 words, `count_messages_of`) in two parts:
+
+* a header, the same to every peer: its node's largest remote part; as
+  proxy, the most occurrences of one of its keys; as owner, the keys of
+  each lookup group of its own part (those of its own node that it looks
+  up); as proxy, its chunks per owner node and its node-unique keys per
+  (owner node, lookup group). That is `(num_nodes + 1) × (num_groups + 1) +
+  1` words;
+* a part for that peer alone: as proxy, its node-unique keys of each
+  feature of the peer's node, `num_features` words.
+
+From the `num_nodes` messages of the call to it, its own too, every rank of
+the rail computes the layout of the rail (`rail_layout_of`,
+`input_dist/rail.cuh`). Its tables of every node and lookup group come from
+the headers, which every rank of the rail reads alike: first, for each
+owner, the rows of its `lookup_rows` before each group's slice. Its KJT's
+lengths of the other nodes come from the parts to it. It computes:
 
 * as proxy, where its slice lands in each owner's `rail_keys` (a slice per
-  source node, in node order), and where its node's keys of each feature
-  start in each owner's KJT (`owner_offsets`);
-* as owner, its KJT lengths and offsets, and where each other node's keys of
-  each feature start in its KJT (`source_offsets`);
-* the rail's needs: every owner's keys are in the messages.
+  source node, in node order), and the group runs of its node-unique keys
+  of each owner node (`bwd_groups`, below);
+* as owner, its KJT lengths and offsets (a blocked scan, section 10), where
+  each lookup group's slice starts in its `lookup_rows` (`group_offsets`),
+  each group's shift (`group_shift`: the rows before the group's own part,
+  less the own part's keys before it), and the group runs of each source
+  node's records (`fwd_groups`);
+* the rail's needs: every owner's keys are in the headers.
 
-One function (`source_offset`) gives both offsets from the same messages.
-So a proxy's `owner_offsets` row for an owner is that owner's
-`source_offsets` row for the proxy's node, bit for bit, and no owner sends
-its offsets back: `rail_key_push` puts only the keys.
-`node_status_exchange` then gives every rank its node's rail needs. Their
-maximum is the call's needs, the same on every rank: a rank's rail covers
-every node, and its node holds one rank of every rail.
+The same two functions give a group run's start and shift (`group_first`,
+`group_shift_of`) for the owner on one node and the proxy on another, from
+the same headers. So a proxy's `bwd_groups` row for an owner is that
+owner's `fwd_groups` row for the proxy's node, bit for bit: the proxy's
+backward puts land where the owner's lookup wrote. No owner sends its
+layout back: `rail_key_push` puts only the keys. `node_status_exchange`
+then gives every rank its node's rail needs, and its node's owners' group
+shifts. The maximum of the needs is the call's needs, the same on every
+rank: a rank's rail covers every node, and its node holds one rank of every
+rail.
 
-**The all-gather's scale.** A count message has about
-`num_nodes × num_features` words. A rank sends it to its `num_nodes − 1`
-rail peers and gets as many. So per call a rank sends about
-`num_nodes² × num_features` words, and gets as many: 13 KiB at 8 nodes and
-26 features, 201 KiB at 16 nodes and 100 features, 865 KiB at 64 nodes and
-26 features (about the size of `node_offsets` at 8 GPUs per node), and
-about 500 MiB at 256 nodes and 1,000 features. The ctrl section keeps the
-messages in a slot per `in_seq` parity and node: about
-`16 × num_nodes² × num_features` bytes (section 15.2). And `rail_exchange`
-lays out the rail on one CTA, which reads the `num_nodes² × num_features`
-counts a few times. All three grow with the square of the nodes (section
-19).
+**The all-gather's scale.** A count message has `num_features + (num_nodes +
+1) × (num_groups + 1) + 1` words. A rank sends one to each of its
+`num_nodes − 1` rail peers and gets as many, in one round: about
+`num_nodes × (num_features + num_nodes × (num_groups + 1))` words each way
+per call. The ctrl section keeps this rank's messages (`count_msg_out`, a
+row per rail peer) and the rail's in a slot per `in_seq` parity and node:
+`3 × num_nodes` messages (section 15.2). `rail_exchange` lays out the rail
+on one CTA. From the headers it reads the chunk count of each (source
+node, owner node) and the key count of each (source node, owner node,
+lookup group), `num_nodes² × (num_groups + 1)` words, a few times. The start of each group
+run is a sum over the groups before it (`group_first`), so for the runs it
+also reads the keys between its own node and each other node, in both
+directions: about `2 × num_nodes × num_groups²` loads in all. From the
+parts to it, it reads the other nodes' keys of each feature, `(num_nodes −
+1) × num_features` words. So the messages grow with the features times the
+nodes, and with the square of the nodes times the lookup groups plus one:
+each header holds a chunk count per owner node and a key count per (owner
+node, lookup group). The layout's loads also grow with the nodes times the
+square of the lookup groups (section 19).
 
 **The requester.** Two `peer_gather`s read what the node's proxies wrote. One
 reads the words of their headers it needs: the chunks, the stream's end, each
 chunk's end and its own push table, by word lists made when the op is built. The other reads, for
 each of its keys for an owner on another node, its occurrence's entry in the
-three `remote_map` arrays at its proxy. From them, and from where its node's
-owners hold its keys (`node_status_exchange`), it makes its maps. `src` is
-where the forward reads each key's row: a row of its owner's `lookup_rows`
-when the owner is on its node, else the key's row in its proxy's `proxy_rows`.
+three `remote_map` arrays at its proxy. From them, and from its node's
+owners' group shifts (`node_status_exchange`), it makes its maps. `src` is
+where the forward reads each key's row. When the owner is on its node, it
+is a row of the owner's `lookup_rows`: the key's place in the owner's own
+part (`row + row_shift`, where the push put it, section 10.3) plus the
+shift of the key's lookup group there (section 11.2). Else it is the key's
+row in its proxy's `proxy_rows`.
 `dst` is where the backward writes the row's gradient: the same row, or its
 own slot in `proxy_rows`. It also makes its rows in push order at each proxy,
 its push tables with absolute positions, and the remote task offsets of each
@@ -1473,23 +1619,48 @@ its push tables with absolute positions, and the remote task offsets of each
 **The owner.** Its KJT has `kjt_stride = local_size + num_nodes − 1`
 columns per feature (section 9). Its keys come from two places: its own
 node's columns from the own part of `node_keys`, the other nodes' from their
-records in `rail_keys`. Its forward put list sends each source node the rows
-of the chunks of this owner's node in that node's stream, which come first
-in its slice (`fwd_chunks`).
+records in `rail_keys`. One kernel finds the records (`owner_slices_kernel`):
+a CTA per other node finds where its records start in its slice, and where
+those of each feature start (a blocked scan over the features); CTA 0 reads
+the chunks of this owner's node in each source node's stream, which come
+first in its slice, into `fwd_chunks` (`fwd_chunk_offsets`: where each source
+node's start), the chunks its forward puts (section 11.3). Then a thread per
+position of the KJT takes its key and weight, and with a row map its row
+(`owner_kjt_kernel`).
 
-**The put lists.** One step (`put_lists`) makes both, in one tensor: the
-owner's forward list, which cuts the chunks of each source node's stream at
-the features of its KJT they fill (`source_offsets`), and the proxy's
-backward list, which cuts its own chunks at where its keys of each feature
-start in each owner's KJT (`owner_offsets`). A node's node-unique keys are
-cut at its chunks and where its keys of each feature end; each part between
-two cuts is one segment, with its rows in `proxy_rows` and in the owner's
-KJT, and its chunk (the proxy's, or the owner's `fwd_chunks` entry). A
-list's segments are sorted by (node, key): node after node, so a node's
-chunks come in stream order and the segments of a chunk follow each other;
-a table gives the first segment of each node. The cuts are the chunks and
-the ends of the (node, feature) keys, so the lists hold at most
-`max_chunks + max_owner_chunks + 2 × num_nodes × num_features` segments.
+**The row map.** A lookup group's keys lie in the KJT feature by feature,
+each feature's columns in turn, and in `lookup_rows` in the order they cross
+the rail (section 11.2). When a group has more than one feature the two
+orders differ, and the owner's row map gives each key of the KJT its row in
+its group's slice (`OwnerTables::row_map`, int32 `[lookup_keys]`, the first
+`num_recv` valid). A key of its own node, the `nth` of column `r` of feature
+`f`, is at its place in the own part, `own_offsets[f × local_size + r] +
+nth`, plus its group's shift (`group_shift`). Another node's key is at its
+place among that node's records plus its group run's shift (`fwd_groups`).
+Each is less where its group's slice starts (`group_offsets`).
+`input_dist()` returns the row map after `lookup_rows`. When every group has
+one feature the two orders agree, and there is no row map.
+
+**The group runs.** A rail peer's keys are feature-major: the records a
+source node puts into an owner's `rail_keys`, and the node-unique keys a
+proxy has of an owner node, go feature by feature, in `uniq` order (section
+9). So a lookup group's keys among them are consecutive: the group's *run*.
+A run's rows are consecutive in the owner's `lookup_rows` too (section
+11.2). The rail layout gives the runs of each rail peer as `GroupRuns`
+(`common.h`, `2 × num_groups + 1` int64 words per peer node): where each
+group's keys start among the peer's keys (the last word: where they end),
+and each group's shift: the peer's key `k` (its index among the peer's
+keys), a key of group `g`, lies at row `k + shift(g)` of the owner's
+`lookup_rows`. The owner's forward reads the runs of each source node's
+records (`fwd_groups`), the proxy's backward the runs of its node-unique
+keys of each owner node (`bwd_groups`). For a chunk's keys `[lo, hi)` among
+its node's keys, the out kernel's issuer finds the first group that ends
+past `lo` by a binary search; then the groups follow in turn
+(`GroupRuns::for_each_run`), and the chunk crosses in one put per group it
+spans (none for an empty group). So no step of the input dist lists the
+puts: the chunks of one owner node in a proxy's stream take at most their
+number plus `num_groups − 1` puts in each direction, one per chunk when the
+sharding has one lookup group.
 
 ### 10.5 The status and the one host sync
 
@@ -1545,10 +1716,12 @@ add up the gradients of the heavy rows (section 11.4).
   entry barrier. A GIN warp's lane `l` serves the rail peers on nodes `l`,
   `l + 32`, ... It polls them in turn and waits for no single one, so no
   order in which peers move can stall it; what it keeps of a peer between
-  polls is in its words for that peer in the ctrl section (`put_at`,
-  `grant_sent`, ...). Every kernel ends by sending the credits for the next
-  out kernel (GIN context 3) and flushing them. So no credit is in flight
-  once a kernel has ended.
+  polls is in its words for that peer in the ctrl section (`put_at`, where
+  that peer's chunks not yet put start; `grant_sent`, ...), and for the
+  backward's issuer also in the posted bit of each chunk's `ready` word
+  (section 11.4). Every kernel ends by sending the credits for the next out
+  kernel (GIN context 3) and flushing them. So no credit is in flight once
+  a kernel has ended.
 * **Arguments.** Each out kernel takes the op's window, its GIN device
   communicator and its sizes, its `out_seq` and the `arrive` word before
   it, and its call (`FwdArgs`, `BwdArgs`): the call's plan and tensors.
@@ -1561,9 +1734,12 @@ add up the gradients of the heavy rows (section 11.4).
   registers than they have (128 for each thread, at 512 threads for each
   CTA), and the compiler would move values to local memory (spills). With
   the code of one backend, and with 4 vectors in flight per lane in the
-  pulls of the forward across nodes (section 11.3), there are no spills:
-  `ptxas -v` shows 0 bytes of spill stores and loads for each out kernel,
-  for sm_75 to sm_120 (CUDA 13.2).
+  pulls of the forward across nodes (section 11.3), the forward kernel has
+  no spills: `ptxas -v` shows 0 bytes of spill stores and loads for it, for
+  sm_75 to sm_120 (CUDA 13.2). The backward kernel on one node, on GDAKI and
+  on GPI has no spills either. On the proxy backend the backward kernel
+  spills on sm_75 to sm_90 (28 to 36 bytes of spill stores, 36 to 40 bytes
+  of spill loads), and not on sm_100 and sm_120.
 * **QP sharing and polls.** Only the issuer warp of CTA 0 uses the QPs of
   its rows context, and one lane posts on each QP (lane `l` on those of the
   rail peers on nodes `l`, `l + 32`, ...). So the issuers take the sharing
@@ -1586,14 +1762,18 @@ add up the gradients of the heavy rows (section 11.4).
   `BwdArgs`). Each table is a tensor of a plan. Both read the requester's
   `offset_per_bucket` and maps, and across nodes its push order and its
   tables of the node's proxies (`proxy_ends`, `proxy_push_tables`,
-  `remote_task_offsets`), the proxy's chunks (`num_chunks`, `chunks`) and
-  the put lists (`put_list`, `put_offsets`). The forward also reads the
+  `remote_task_offsets`), and the proxy's chunks (`num_chunks`, `chunks`)
+  with where each owner node's chunks and keys start
+  (`chunk_offset_per_bucket`, `chunk_inv`, `node_offset_per_bucket`). The
+  forward also reads the
   requester's `src`, `push_order_off` and `proxy_num_chunks`, the owner's
-  `fwd_chunks` and the proxy's `node_offset_per_bucket`,
-  `chunk_offset_per_bucket`, `chunk_inv` and `node_length_per_bucket`. The
-  backward reads its `dst`, the owner's `node_length_per_source`, and the
-  proxy's `reduce_task_offsets` and `node_exp_off`. Their strides are
-  `max_chunks` and `num_nodes`. The call also holds what the op gives the
+  chunks and the group runs of their records (`fwd_chunks`,
+  `fwd_chunk_offsets`, `fwd_groups`), and the proxy's
+  `node_length_per_bucket`. The backward reads its `dst`, the owner's
+  `node_length_per_source`, and the proxy's group runs of its keys
+  (`bwd_groups`), `reduce_task_offsets` and `node_exp_off`. Their strides
+  are `max_chunks` and `num_nodes`, and `2 × num_groups + 1` words per node
+  for the group runs. The call also holds what the op gives the
   kernel for it: the forward's output, the backward's gradient and its
   scratch (the heavy rows' sums, `partial`), across nodes the counts the
   kernel zeroes (the forward's `pulled_from_proxy`, the backward's `ready`),
@@ -1611,9 +1791,38 @@ The lookup takes the call's rows, the first `num_recv` rows of the
 `lookup_rows` that `op.input_dist()` gave: a view, valid until the next out
 kernel. Each
 DynamicEmb lookup group writes its rows straight into the next rows of the
-call's rows: the tables' `output_alloc`. The lookup returns the call's rows,
-which cover all groups, with no copy into a new tensor; the forward checks
-that it gets them. The lookup writes where the last backward left
+call's rows: the tables' `output_alloc`. So each group's rows take a slice
+of their own, the groups in feature order, as the owner's KJT holds their
+keys. The lookup returns the call's rows, which cover all groups, with no
+copy into a new tensor; the forward checks that it gets them.
+
+**The order of a group's rows.** Across nodes a group's rows lie in its
+slice in the order they cross the rail: first its own part (its node's
+keys of the group, in their order in the own part of `node_keys`: feature,
+requester, position), then the records of each other node, in node order,
+each node's in the order its proxy sent them (`uniq` order, feature by
+feature). The keys of one group of a rail peer are consecutive among the
+peer's keys (section 10.4), so their rows are consecutive here, and a chunk
+crosses IB in one put per group its keys span. The KJT holds a group's keys
+feature by feature, each feature's columns in turn: the same order when the
+group has one feature.
+
+**The row map.** So the lookup places each key's row. The input dist gives
+the call's row map (section 10.4): for each key of the KJT, its row in its
+group's slice. With its slice of the call's rows, `output_alloc` gives each
+group its slice of the row map (`lookup_buffer`). DynamicEmb's lookup writes
+key `i`'s row at row `row_map[i]` of the slice: `load_from_flat_table_kernel`
+(and its vector form) and `scatter_fused` take the row of each output row
+(`out_row`), and a lookup in eval mode copies its rows there
+(`index_copy_`). Its backward reads key `i`'s gradient at the same row:
+`reduce_grads` takes the rows (`grad_rows`) into each key's gradient entry,
+and sorts the entries by the lookup's inverse index (each key's unique key)
+as it does without them. So it adds the same rows in the same order, bit
+for bit, whatever the order of `lookup_rows`. On one node, and when every
+group has one feature, there is no row map (`None`): key `i` of a group
+takes the group's row `i`.
+
+The lookup writes where the last backward left
 `lookup_grad` (section 11.4). So the caller runs it after the lookup's
 backward that reads that gradient: on the same stream, or on one it ordered
 after it. TorchRec's loops do: autograd runs a backward on the stream of its
@@ -1624,23 +1833,32 @@ forward, so the lookup and its backward share a stream.
 * **Owner** (across nodes): one warp of CTA 0, whose lanes take the rail
   proxies in turn, each over its own QP. First one system fence. Then, chunk
   by chunk as each proxy grants the rows of its stream they take, it puts
-  straight from `lookup_rows` into that proxy's `proxy_rows`, one put per
-  segment of its forward put list (a part of one chunk's payload). In a
-  pass it reads each proxy's grant once, relaxed, and puts every segment
-  that the grant covers. Each put adds its row count to the proxy's
-  `fwd_rows` signal. Then a flush.
+  straight from `lookup_rows` into that proxy's `proxy_rows`: each chunk of
+  this owner's node in the proxy's stream (`fwd_chunks`, in stream order)
+  into the chunk's first rows in the ring, in one put per lookup group its
+  records span (`fwd_groups`, section 10.4). In a pass it reads each
+  proxy's grant once, relaxed, and puts every chunk that the grant covers.
+  Each put adds its row count to the proxy's `fwd_rows` signal. Then a
+  flush.
 * **Proxy relay** (across nodes): the last warp of CTA 0, whose lanes take
   the owner nodes in turn. In a pass it polls with relaxed loads, then
   makes one system fence if a poll found news. It counts the rows of each
   owner node that have landed (`landed_rows`), and gives each chunk all of
   whose rows have landed this `out_seq` in its `landed` word, where its
-  node's requesters read it. When its stream wraps its ring, it marks the
-  chunks done with in order, once every requester of the node has pulled
-  all their rows of them (their `pulled_rows` words count the pulls): lane
-  `i` looks at the `i`-th chunk from the first not done with. Then it
-  grants each owner node, once for the pass (once for each 32 chunks it
-  grants), the rows that this frees: up to the end of the node's last
-  chunk that ends within them (sections 12.1 and 12.2).
+  node's requesters read it. The relay has one signal per owner node
+  (`fwd_rows`), which counts rows, not chunks. An owner's issuer puts to a
+  proxy from one lane over one QP, which runs in order. It puts its chunks
+  in stream order (`fwd_chunks`) and each chunk's group runs in key order
+  (`GroupRuns::for_each_run`). So an owner node's rows land in the order of
+  its node-unique keys: when `r` of its rows have landed, each of its
+  chunks whose keys end at or before `r` has landed. When the proxy's
+  stream wraps its ring, the relay marks the chunks done with in order,
+  once every requester of the node has pulled all their rows of them (their
+  `pulled_rows` words count the pulls): lane `i` looks at the `i`-th chunk
+  from the first not done with. Then it grants each owner node, once for
+  the pass (once for each 32 chunks it grants), the rows that this frees:
+  up to the end of the node's last chunk that ends within them (sections
+  12.1 and 12.2).
 * **Requester** (all other warps): pulls each of its rows from the
   same-node owner's `lookup_rows`, or, once its chunk has landed, from its
   proxy's `proxy_rows`, and writes it to every original row of its
@@ -1719,27 +1937,36 @@ the code for several nodes (section 11.1).
   nodes in turn. Once an owner's `bwd_ready` is in, it puts the chunks of
   that owner node into the owner's `lookup_rows`, each once the reducers
   counted all its keys ready. In a pass each lane polls the look-ahead of its
-  owner node's put list, with relaxed loads: at most 8 chunks
-  (`kIssueLookahead`) from the first chunk not yet put. Then the warp makes
-  one system fence if a lane found a ready chunk, and each lane puts the
-  ready chunks of its look-ahead in list order, all the segments of each. So
-  an owner node's chunks go out of order only within the look-ahead. Each put
-  adds to the owner's `bwd_rows` signal. With more than 32 owner nodes, the
+  owner node's chunks (in order, from `chunk_inv`), with relaxed loads: at
+  most 8 chunks (`kIssueLookahead`) from the first chunk not yet put (its
+  `put_at` word); a chunk put in an earlier pass has the posted bit of its
+  `ready` word set and is not put again. Then the warp makes one system
+  fence if a lane found a ready chunk, and each lane puts the ready chunks
+  of its look-ahead in order, each from its key rows in `proxy_rows` in one
+  put per lookup group its keys span (`bwd_groups`, section 10.4): to the
+  rows of the owner's `lookup_rows` that its lookup wrote. So an owner
+  node's chunks go out of order only within the look-ahead. Each put adds
+  to the owner's `bwd_rows` signal. With more than 32 owner nodes, the
   lanes take 32 at a time, with a fence for each 32. When its stream wraps
-  its ring, its puts count on the put counters. Then, after the puts of
-  each pass, the warp marks the chunks the NIC has read, in order (lane `i`
-  looks at the `i`-th from the first not yet read), and lane 0 frees their
-  rows with one store (`bwd_free_end`, section 12.1). At the end it grants
+  its ring, each put of chunk `c` adds 1 to counter `c mod counters` once
+  the NIC has read its rows. A chunk takes one put per lookup group its
+  keys span, so the issuer adds the puts it posts on each counter to that
+  counter's `posted` word in the ctrl section. After the puts of each pass,
+  the warp marks chunks read, in order, each one once its posted bit is set
+  and its counter has reached the counter's `posted` word (lane `i` looks
+  at the `i`-th from the first not yet read), and lane 0 frees their rows
+  with one store (`bwd_free_end`, section 12.1). At the end it grants
   each rail owner the ring's rows of the next kernel.
 * **Landing watcher** (a traced build only, across nodes: section 4.4):
   the warp before the issuer bins the gradient rows the rail proxies put
   into this rank's `lookup_rows` as they land, for the timeline.
 * **Owner**: waits until every same-node requester has pushed and every
   rail proxy's rows have landed. Its `lookup_grad`, the gradient of its
-  lookup output, is a view of `lookup_rows`. Every row of `lookup_grad` is
-  written exactly once, so nothing is zeroed or scattered. The owner hands
-  it to the lookup's backward. It is valid until the next lookup, which
-  writes `lookup_rows` (section 11.2).
+  lookup output, is a view of `lookup_rows`, its rows in the lookup
+  output's order (section 11.2). Every row of `lookup_grad` is written
+  exactly once, so nothing is zeroed or scattered. The owner hands it to the
+  lookup's backward, which reads each key's gradient at the key's row. It
+  is valid until the next lookup, which writes `lookup_rows` (section 11.2).
 * **Task order.**
   * Remote queue (across nodes): the push tasks of the proxies' streams,
     chunk after chunk, the proxies in turn. Thus the chunks fill in stream
@@ -1794,9 +2021,9 @@ each 0.3% slower.
 Only the cut of the chunks uses counted rows. A chunk's rows and its place
 in the ring, a key's rows and slots, and the requesters' push orders and
 tables count rows. With `rows_per_payload` 1 the counted rows are the rows.
-A chunk is the unit of every step of the rows across the rail: one IB put
-list per chunk and owner, grants and frees of whole chunks, and the
-reducers' tasks of a chunk.
+A chunk is the unit of every step of the rows across the rail: its IB puts
+(one per lookup group its keys span, section 10.4), grants and frees of
+whole chunks, and the reducers' tasks of a chunk.
 
 ```
 the stream   [ round 0: owner node a's chunk 0 | b's chunk 0 | ... ][ round 1: a's chunk 1 | ... ] ...
@@ -1831,27 +2058,38 @@ the ring     its chunks one after another; when the stream passes the ring, laps
 * Every row of the ring is free when an out kernel starts. A chunk is done
   with in the forward once every requester of the node pulled it (the
   relay counts their pulls), in the backward once the NIC read its sums
-  (the issuer counts the reads on the put counters). Chunks are done with
-  in order. The rows of chunk `c` may be written once the first chunk not
-  done with starts at `end(c) − num_proxy_rows` or later: in the forward
-  the relay grants its owner those rows, in the backward the issuer frees
-  them for the node's requesters (`bwd_free_end`). Each does so once per pass
-  of its warp (the relay once per owner node for each 32 chunks it
-  grants), for all the chunks done with in the pass (section 12.2).
+  (the issuer compares each put counter with the puts it posted on it,
+  `posted`). Chunks are done with in order. The rows of chunk `c` may be
+  written once the first chunk not done with starts at `end(c) −
+  num_proxy_rows` or later: in the forward the relay grants its owner
+  those rows, in the backward the issuer frees them for the node's
+  requesters (`bwd_free_end`). Each does so once per pass of its warp (the
+  relay once per owner node for each 32 chunks it grants), for all the
+  chunks done with in the pass (section 12.2).
 * Every agent takes the chunks in stream order: an owner puts its chunks at
   a proxy in order, a requester takes its tasks chunk after chunk at every
-  proxy, the reducers take theirs chunk after chunk. The backward's issuer
-  puts an owner node's chunks out of order only within its look-ahead, which
-  starts at the node's first chunk not yet put (section 11.4). So no task
-  waits behind one that needs a later chunk, and the first chunk not done
-  with can always be done with: its rows were free before it.
+  proxy, the reducers take theirs chunk after chunk. An issuer's `put_at`
+  word for a rail peer holds the first of that peer's chunks it has not
+  put. For the owner's issuer it is an entry of `fwd_chunks`: that issuer
+  puts the chunks in order, so it is the next chunk it puts. For the
+  proxy's issuer it is an entry of `chunk_inv`, where its look-ahead
+  starts (section 11.4). That issuer puts an owner node's chunks out of
+  order only within its look-ahead, so it can already have put later
+  chunks of it. Each such chunk has the posted bit of its `ready` word set,
+  so a later pass does not put it again, and `put_at` moves past the
+  chunks at the start of the look-ahead once all of them are put. So no
+  task waits behind one that needs a later chunk, and the first chunk not
+  done with can always be done with: its rows were free before it.
 * The ring changes no result: every sum keeps its order (section 18). The
   tests across nodes also run with a 1 MiB proxy cap, where the larger
   calls' streams wrap the ring, against TorchRec's dists.
 * When the stream wraps the ring, the backward's puts of chunk `c` count on
   GIN counter `c mod counters` (`counters = min(max_chunks, 64)`), and the
   issuer puts a chunk only within `counters` chunks of the first one not yet
-  read, so two chunks in flight never share a counter.
+  read, so two chunks in flight never share a counter. A counter counts
+  puts, not chunks (a chunk takes a put per lookup group its keys span), so
+  the issuer reads it against the puts it posted on it (`posted`, section
+  11.4).
 
 ### 12.2 Credits and sequence numbers
 
@@ -1947,14 +2185,18 @@ of the call before (section 13).
 * **The in channel.** What peers wrote is read only after an acquire of
   their flag or signal. The comm kernel that acquired it reads past the L1
   cache (`node_exchange` reads `node_offsets`, and `rail_exchange` the count
-  messages, with `__ldcg`), and so does
-  `peer_gather` later on the stream; the planner's kernels read with plain
-  loads. What this rank writes for its peers, with its own stores or with
-  the planner's kernels earlier on the stream, comes before the flag it
-  releases or the put it makes: a system fence orders it. In
+  messages, with `__ldcg`), and so do `node_exchange`'s grid of the items
+  (`node_layout_items_kernel`, after it on the stream, before `node_done`)
+  and `peer_gather` later on the stream; the planner's kernels read with
+  plain loads. What this rank writes for its peers, with its own stores or
+  with the planner's kernels earlier on the stream, comes before the flag
+  it releases or the put it makes: a system fence orders it. In
   `node_exchange` thread 0 makes the fence after the CTA's barrier, so it
-  covers the offsets that every thread stored, then releases `in_started`.
-  Each CTA of the push ends with one, and `node_done`,
+  covers the row that every thread stored, then releases `in_started`.
+  When the grid before it stored the row (`node_rows_push_kernel`), each of
+  that grid's CTAs ended with a system fence after its stores, and the
+  release after it on the stream publishes them. Each CTA of the push ends
+  with one, and `node_done`,
   `node_status_exchange`, the warp of `rail_exchange` that puts and
   `rail_key_push` make one before their flag or puts. `rail_exchange`
   flushes its puts before it ends, and `rail_done` flushes those of
@@ -1979,8 +2221,8 @@ of the call before (section 13).
 * **No hang.** A kernel that waits for peers waits only for the same kernel
   on its peers (`rail_done` for its rail peers' `rail_key_push`, which
   never waits), for credits from earlier out kernels, and for its own
-  rank's earlier work. The planner's kernels, the pushes and the gathers
-  never wait. The op orders nothing across streams: the caller orders the kernels
+  rank's earlier work. The planner's kernels, the pushes, `node_exchange`'s
+  grids and the gathers never wait. The op orders nothing across streams: the caller orders the kernels
   the same way on every rank (section 4.2). It makes the same calls in the
   same order, runs the input dists on one stream and the out kernels on one
   stream, with the same waits between its streams. So every rank issues the
@@ -1998,14 +2240,14 @@ once no peer still reads what call `in_seq` wrote there. The words marked
 
 | buffer or word | written by | last read by | why that is safe |
 |---|---|---|---|
-| `node_offsets` | node peers' `node_exchange`, and this rank its own row | this rank's `node_exchange` | a peer stores its row of the next call before that call's node barrier, but only after its `node_done` of this call got this rank's tell, which this rank sends after its `node_exchange` read the rows; `node_done` runs in every call, so the rows need no slot per `in_seq` parity |
+| `node_offsets` | node peers' `node_exchange` (or the grid just before it, `node_rows_push_kernel`), and this rank its own row | this rank's `node_exchange` (or the grid of the items just after it, `node_layout_items_kernel`) | a peer stores its row of the next call before that call's node barrier, but only after its `node_done` of this call got this rank's tell, which this rank sends after its `node_exchange` and the grid after it read the rows; `node_done` runs in every call, so the rows need no slot per `in_seq` parity |
 | `node_keys`, `node_key_weights`, `node_bucket_feature_of_row` | node peers' push | this rank's planner | the peers push only after the next call's node barrier, which this rank publishes only once its in channel finished the call |
 | `remote_map`, `proxy_header` | this rank's planner | node peers' gathers | this rank writes them after the next call's node barrier, which every peer publishes only once its in channel finished the call |
 | `key_stage` | this rank's planner (the proxy) | the NIC | `rail_done` flushes the key puts before the owner's tables, so before the next call's proxy steps |
-| `count_msg_out` (ctrl) | this rank's `rail_exchange` | the NIC | `rail_exchange` flushes its puts before it ends |
+| `count_msg_out` (ctrl), a row per rail peer | this rank's `rail_exchange` | the NIC | `rail_exchange` flushes its puts before it ends |
 | `rail_keys` | rail proxies' key puts | this rank's owner tables | a rail proxy puts only after it has this rank's count message of the next call, which this rank's `rail_exchange` sends after this call's `rail_done` and owner tables |
 | `count_msg` (ctrl) | rail peers' count puts, and this rank its own | this rank's `rail_exchange` | a slot per `in_seq` parity (and source node): a peer's message of call `in_seq + 2` needs this rank's of call `in_seq + 1`, which this rank sends after its `rail_exchange` of call `in_seq` read the slots |
-| `requester_offsets`, `needs` and `in_status` (ctrl) | this rank | node peers' `node_status_exchange`, which copies them out | this rank writes them after the next call's node barrier |
+| `group_shift`, `needs` and `in_status` (ctrl) | this rank | node peers' `node_status_exchange`, which copies them out | this rank writes them after the next call's node barrier |
 
 ## 14. The CTA budget
 
@@ -2018,8 +2260,9 @@ too. So an out kernel takes `min(want, SMs − 34)` CTAs: it leaves one SM to
 such a comm kernel, 32 to NCCL's kernels, and one to spare. It takes at least
 1 CTA, and the backward across nodes at least 2 (its issuer's CTA and a
 reducing one). `want` is `DYNAMICEMB_HIER_OUT_CTAS` when set, else 32, or 64
-for the backward on one node (section 4.4). The input dist's other kernels
-never wait (section 13), so they need no SM of their own. The kernels of the
+for the backward on one node (section 4.4). The input dist's other kernels,
+`node_exchange`'s grids among them, never wait (section 13), so they need no
+SM of their own. The kernels of the
 heavy rows do not wait for peers either. They can use all SMs. **Example**, H100 (132
 SMs): an out kernel may take up to 98 CTAs, so the out kernels keep their 32,
 and the backward on one node its 64.
@@ -2046,8 +2289,8 @@ The capacities are the ones in place (section 5), and `row_bytes` and
 
 | buffer | bytes | kind |
 |---|---|---|
-| `ctrl` (the ctrl section) | one node: `16 × local_size + 72`; across nodes about `8 × (num_features × (local_size + (2 × num_nodes + 1) × (num_nodes + 1)) + 2 × num_nodes² + 15 × num_nodes + 2 × local_size + 3 × max_chunks + 64)`, most of it the count messages (this rank's, and a slot per `in_seq` parity and node): 1.1 MB at 32 nodes, 8 GPUs per node and 64 features, 0.98 GB at 256 nodes and 1,000 features, and 24 bytes per chunk of `max_chunks` | persistent |
-| `node_offsets` | `8 × local_size × (world_size × num_features + 1)`: 16 KB at 4 nodes of 8 GPUs and 8 features | persistent |
+| `ctrl` (the ctrl section) | one node: `16 × local_size + 72`; across nodes `8 × (3 × num_nodes × message + 6 × num_nodes + 2 × local_size + num_groups + 3 × max_chunks + min(max_chunks, 64) + 14)`, `message` a count message's `num_features + (num_nodes + 1) × (num_groups + 1) + 1` words rounded up to an even number (section 10.4): chiefly the count messages (this rank's, a row per rail peer, and a slot per `in_seq` parity and node), 24 bytes per chunk of `max_chunks` and 8 per put counter; the count messages are most of it only when the nodes are many | persistent |
+| `node_offsets` | `8 × local_size × row`, `row` a requester's row (`NodeRow`): `local_size × (num_features + 1) + 1` words across nodes and `local_size × num_features + 1` on one node, rounded up to an even number | persistent |
 | `node_keys` | `8 × (lookup_keys + remote_keys)` (one node: `lookup_keys` alone) | persistent |
 | `node_key_weights` | with weights, `4 × (lookup_keys + remote_keys)` | persistent |
 | `node_bucket_feature_of_row` | `4 × remote_keys` | persistent |
@@ -2060,11 +2303,14 @@ The capacities are the ones in place (section 5), and `row_bytes` and
 | the requester's maps | 8 bytes per key on one node (`inv`, `src`), 16 across nodes (also `dst`, `push_order`) | per call |
 | the call's small tables across nodes: the requester's of the node's proxies and its remote task offsets, the owner's and the proxy's (section 11.1) | about `20 × local_size × max_chunks + 48 × max_chunks + 16 × max_owner_chunks`, plus a few KB | per call |
 | the owner's KJT values | `8 × lookup_keys` (12 with weights), from the input dist until the forward | per call |
+| the owner's KJT lengths and offsets, and the call's status | `16 × num_features × kjt_stride + 8` (`kjt_stride = local_size + num_nodes − 1`; on one node `local_size`), as long as the owner's KJT; the status `8 × (2 × num_features + 6)` (section 10.5) | per call |
+| the owner's row map | across nodes, when a lookup group has more than one feature: `4 × lookup_keys`, from the input dist until the lookup's backward | per call |
 | the proxy's rows before each key (`node_exp_off`) | `8 × remote_keys` | per call |
-| the put lists and the ready counters | `24 × max_chunks + 16 × max_owner_chunks + 32 × num_nodes × num_features` | per call |
+| the group runs and the backward's ready counters | `16 × num_nodes × (2 × num_groups + 1) + 8 × max_chunks` | per call |
 | index dedup's fan-out table | about 13 bytes per original key (on this path the deduplicated KJT keeps the original length) | per call |
 | the bucketize, in the caller's pool | at its peak about 36 bytes per key, during the fan-out's sort: its outputs (`inv` and `bucket_feature_of_row`, 8), where it put each row (4), the sort's keys and values in and out (16) and CUB's extra key and value buffers (8); before that the keys by owner hold at most 24, their outputs included, or 16 when their sort takes one pass (`world_size × num_features` below 256); for either owner rule, with or without weights | transient |
-| the planner, in the caller's pool | its largest step: across nodes the proxy's, about 64 bytes per entry of `remote_keys` with weights, 60 without (52 when `rows_per_payload` is 1); the requester's holds about 24 bytes per key besides its maps (the gathered `remote_map` words, 12, and the peer and word each comes from, 12), and the owner's adds only its KJT values (per call); on one node nothing per key beyond the per-call tensors | transient |
+| the planner, in the caller's pool | its largest step: across nodes the proxy's, about 64 bytes per entry of `remote_keys` with weights, 60 without (52 when `rows_per_payload` is 1); the requester's holds about 24 bytes per key besides its maps (the gathered `remote_map` words, 12, and the peer and word each comes from, 12), and the owner's adds only its KJT values and row map (per call); on one node nothing per key beyond the per-call tensors | transient |
+| the input dist's tables per (rank, feature), in the caller's pool | the bucketize's `offset_per_bucket_feature` and the node layout's `row_shift`, about `8 × world_size × num_features` each; across nodes, while the proxy's node dedup runs, its block tables, about `8 × (world_size + num_nodes) × num_features` (section 15.4) | transient |
 
 The transient figures come from the code: bytes in live tensors. The
 caching allocator's rounding and the cached blocks it hands out add up to
@@ -2101,7 +2347,8 @@ bytes. That is about 39 bytes per key at 2 nodes, and 58 at 32 nodes. The
 per-call tensors take about 44 to 49 bytes per key across nodes: 16 for the
 requester's maps, about 13 for index dedup's fan-out table, about 10 for the
 owner's KJT until the forward, and `8 × 1.25 × (num_nodes − 1) / num_nodes`
-for the proxy's rows before each key.
+for the proxy's rows before each key. When a lookup group has more than one
+feature, the owner's row map adds half the KJT's: about 5.
 
 ### 15.3 `proxy_rows` and its ring
 
@@ -2157,26 +2404,26 @@ most `max_counted_rows` each. The laps of a stream follow from its rows
 
 ### 15.4 How memory scales
 
-**With the number of GPUs and features.** Only one buffer of the window is
-sized by `world_size`: `node_offsets`, a row of `world_size × num_features + 1`
-int64 words per GPU of the node. It takes `8 × local_size × (world_size ×
-num_features + 1)` bytes: 1 MB at 32 nodes, 8 GPUs per node and 64
-features, and 125 MB at 256 nodes and 1,000 features. Per call, the
-bucketize's `offset_per_bucket_feature` and the node layout's places are
-sized by `world_size` too (`8 × world_size × num_features` bytes each),
-and so are the proxy's block tables while its node dedup runs (about
+**With the number of GPUs and features.** No buffer of the window is sized
+by `world_size`. `node_offsets` holds a row of about `local_size ×
+(num_features + 1)` int64 words per GPU of the node (section 15.2). Per
+call, the bucketize's `offset_per_bucket_feature` and the node layout's row
+shifts are sized by `world_size` (`8 × world_size × num_features` bytes
+each), and so are the proxy's block tables while its node dedup runs (about
 `8 × (world_size + num_nodes) × num_features` bytes). Apart from these,
 `num_nodes` enters only through:
 
 * the share `(num_nodes − 1) / num_nodes`;
-* the control words, most of them the count messages: this rank's, and a
-  slot per `in_seq` parity and node, about
-  `8 × (2 × num_nodes + 1) × (num_nodes + 1) × num_features` bytes, which
-  grow with the square of the nodes. With the other control words that is
-  1.1 MB at 32 nodes, 8 GPUs per node and 64 features, and 0.98 GB at 256
-  nodes and 1,000 features (section 10.4 gives what a call sends). Per
-  call, the rail layout's KJT offsets (`source_offsets`, `owner_offsets`)
-  are linear in `num_nodes × num_features`;
+* the control words, mostly through the count messages: this rank's, a
+  row per rail peer, and a slot per `in_seq` parity and node, `3 ×
+  num_nodes` messages of `num_features + (num_nodes + 1) × (num_groups + 1)
+  + 1` words (section 15.2). They grow with the nodes times the features,
+  and with the square of the nodes times the lookup groups plus one
+  (section 10.4 gives what a call sends). Per call, the rail layout's
+  tables are linear in the nodes: the owner's KJT lengths and offsets and
+  its keys of each source node and feature (linear in `(local_size +
+  num_nodes) × num_features`), and the group runs (`num_nodes × (2 ×
+  num_groups + 1)` words each);
 * GIN's queues to `num_nodes − 1` rail peers per context (with
   `NCCL_CROSS_NIC=0`);
 * the chunk tables, which grow with `max_chunks` (linear in
@@ -2185,17 +2432,19 @@ and so are the proxy's block tables while its node dedup runs (about
   proxies (which also grow with `local_size`) and the proxy's; and the
   chunks an owner gets (`max_owner_chunks`: `rail_keys` and the owner's
   tables), which grow with `num_nodes` until
-  `max_counted_rows × lookup_keys / chunk_span`;
-* the put lists, a segment per chunk and per (node, feature).
+  `max_counted_rows × lookup_keys / chunk_span`.
 
-`local_size` enters through `node_offsets` (a row per GPU of the node),
-and through the tables kept per GPU of the node: the proxy header's push
-tables, and per call the requester's tables of each proxy and the proxy's
-`part_offsets` of each requester. Two tables hold a count per (sender,
-receiver, feature). The count messages hold one per (node, node, feature):
-each rail peer's node-unique keys per owner node and feature. `node_offsets`
-holds one per (GPU of the node, GPU, feature): the bucketize's
-`offset_per_bucket_feature` of each GPU of the node.
+`local_size` enters through `node_offsets` (a row of about `local_size ×
+(num_features + 1)` words per GPU of the node), and through the tables kept
+per GPU of the node: the proxy header's push tables, and per call the
+requester's tables of each proxy and the proxy's `part_offsets` of each
+requester. Two tables hold a count per (sender, receiver, feature), of a
+rail or of a node. A count message's part to a rail peer holds one per
+feature of the peer's node: the sender's node-unique keys of each; its
+header holds one per (owner node, lookup group). `node_offsets` holds one
+per (GPU of the node, GPU of the node, feature): each GPU's offsets at its
+own node's bucket features, and one per (GPU of the node, GPU of the node)
+for the owners on the other nodes.
 
 Everything else is linear in the capacities, except `proxy_rows` (capped: a
 larger call's stream takes more laps of the ring).
@@ -2230,6 +2479,15 @@ bytes per key, is during the fan-out's sort (section 15.2).
 | the same with 2 features: 50.3M keys per rank, fp32 dim 128 | 2 (16) | 32.2 | 0.54 | 2.01 | **34.8** | 2.20 | 1.64 | 1.81 | 25 |
 | | 8 (64) | 32.2 | 0.54 | 2.78 | **35.5** | 2.39 | 2.86 | 1.81 | 43 |
 | | 32 (256) | 32.2 | 0.54 | 2.96 | **35.7** | 2.44 | 3.17 | 1.81 | 47 |
+
+The table was computed for the earlier code. Its "per call" column leaves
+out the owner's row map, which that code did not have: across nodes, when a
+lookup group has more than one feature, a call also holds `4 ×
+lookup_keys` bytes of it until the lookup's backward (section 15.2). The
+table's other differences from this code are small parts of its figures:
+that code's lists of its IB puts (`16 × (max_chunks + max_owner_chunks) +
+32 × num_nodes × num_features` bytes per call), and its `node_offsets` and
+count messages, larger by less than 1 MB per rank.
 
 The planner's working memory adds nothing per key on one node, 3–5% to the
 persistent memory across nodes at the benchmark's size, and 5–16% at the
@@ -2278,11 +2536,12 @@ Under skewed keys its hot owner's buffers grow with
   `record_stream` for the streams they hand a call to, and it records the
   plans' tensors there too (`HierCall.record_stream`). With `emb_lookup_stream="new"`, TorchRec's fused pipeline runs the
   lookup and the output dist on that stream but records the context on the
-  default stream only. So the lookup records the owner's KJT, and the
-  output dist's forward the plans, on the stream they run on: the forward's
-  plan goes as soon as the forward kernel is queued, and without the record
-  the input dist of the next call, on the data_dist stream, could get its
-  memory while the kernel still reads it. The op records no stream itself.
+  default stream only. So the lookup records the owner's KJT and its row
+  map (which the lookup's backward reads too), and the output dist's
+  forward the plans, on the stream they run on: the forward's plan goes as
+  soon as the forward kernel is queued, and without the record the input
+  dist of the next call, on the data_dist stream, could get its memory while
+  the kernel still reads it. The op records no stream itself.
 * A call's tensors live from its bucketize to its backward (section 15.1), so
   under `TrainPipelineSparseDist` the next batch's are alive during this
   batch's forward and backward.
@@ -2329,6 +2588,17 @@ lookup's backward adds up the same terms as TorchRec's:
 * Gradient clipping clamps each row before the per-key sum, so it turns node
   dedup off and keeps TorchRec's meaning.
 
+The order of the rows in `lookup_rows` (section 11.2) changes no bit of a
+result: the lookup writes each key's row at its place in the row map, and
+its backward reads each key's gradient at that place and adds the keys'
+gradients in the order it adds them without a row map. On Eos, the outputs
+and gradients are the same bits as with the code before the row map, which
+kept `lookup_rows` in the KJT's order, on 1, 2 and 4 nodes, and on 4 nodes
+with a ring of 32 MiB too. The check hashes, per rank, the first forward's
+output rows and three backwards' gradients of the lookup output (put back
+in the KJT's order), on the benchmark's model with uniform and with
+power-law keys under index dedup, and a random gradient per element.
+
 **Run to run.** Every sum the dist makes has a fixed order: a key's rows at
 its proxy by requester and position, and index dedup's sums by original
 row. The planner numbers keys, slots and tasks with stable sorts,
@@ -2353,8 +2623,9 @@ ring or not. The keys in the owner's KJT columns follow DynamicEmb's
 `unique` numbering: the same-node requesters' columns directly, and the
 other nodes' columns through their representatives' places in their
 requesters' orders, with node dedup the requesters in turn (section 9). So
-do the rows of `lookup_grad`, and across nodes the chunk cuts and the put
-lists. That numbering may change between runs; the value per key does not.
+do the rows of `lookup_grad` in each lookup group's slice, and across nodes
+the chunk cuts, and so the rows each put moves. That numbering may change
+between runs; the value per key does not.
 Without node dedup such a column can hold a key once per requester that
 asked it, and those rows come in requester order every run.
 DynamicEmb's
@@ -2365,7 +2636,10 @@ every dist, so tables of 16-bit rows may still differ from run to run.
 `test_hier_dist.py`, `test_hier_overflow.py` and `test_hier_pipeline.py`;
 each module's docstring says what it checks and how to run it. On one node
 `test_hier_dist.sh`, `test_hier_overflow.sh` and `test_hier_pipeline.sh`
-run them, and `test/unit_test.sh` runs those. End to end,
+run them, and `test/unit_test.sh` runs those. `test_hier_dist.py` compares
+the lookup's gradient per (table, key) with TorchRec's: its probe reads the
+gradient of the lookup output in the KJT's key order, through
+`HierDist.key_rows` (section 7.4). End to end,
 `examples/hstu/test/test_hierarchical_dist.py` trains the HSTU ranking model
 on the hierarchical dist and on TorchRec's dists, under the example's
 JaggedMegatron pipelines, and compares them: the first step's loss and logits
@@ -2382,9 +2656,11 @@ The node's part of a call has hooks of its own in `testing.cu`:
 * `hier_output_dist_node_layout(node_offsets, num_nodes, local_size, node,
   local_rank, num_features, lookup_keys, remote_keys, ...)` gives one rank's
   node layout on its node's offsets (row `r` holds requester `r`'s
-  `offset_per_bucket_feature`, as `node_exchange` gathers them). On one
-  node, given the own part of its `node_keys` after every requester pushed
-  and the `src` of its own push, it also gives its KJT;
+  `offset_per_bucket_feature`; it makes from them the rows that the
+  requesters push, as `node_exchange` gets them). `items_in_cta` lays the
+  items out on one CTA or on a grid (by default as `node_exchange` would).
+  On one node, given the own part of its `node_keys` after every requester
+  pushed and the `src` of its own push, it also gives its KJT;
 * `hier_output_dist_node_push` runs one requester's push (`push_rows`, as
   `node_key_push` runs it) into stand-ins for its targets' `node_keys`;
 * `hier_output_dist_delay_node_reads(ns)` makes each later input dist of the
@@ -2395,19 +2671,33 @@ The node's part of a call has hooks of its own in `testing.cu`:
   offsets and keys 20 ms late, while its node peers start the next call.
   Its outputs must equal the plain loop's bit for bit, and so must its
   tables where every sum is exact (a power-of-two world size of at most
-  128).
+  128);
+* `hier_output_dist_node_paths(push, items)` makes each later input dist of
+  the process push its row of `node_offsets` (`push`) and lay out the
+  node's items (`items`) on `node_exchange`'s CTA (1) or on its grid (0), or
+  as their sizes choose (−1). `test_hier_dist.py` runs its cases "fp32" and
+  "fp32, 80 features" again with both grids, which otherwise only many
+  features and nodes take.
 
 The rail's part has two: `hier_output_dist_proxy_plan` gives a proxy's plan
-and its count message (`"message"`), and `hier_output_dist_rail_tables` one
-rank's rail layout from its rail's messages (row `n` the message of the rail
-peer on node `n`, as `rail_exchange` reads them) and, given its `rail_keys`
-and the own part of its `node_keys`, its owner tables and put lists. Both
-run the device code of `rail_exchange` (`input_dist/rail.cuh`).
+and its count messages (`"message"`, row `n` the one to the rail peer on
+node `n`), and `hier_output_dist_rail_tables` one rank's rail layout from
+the messages to it (row `n` the message of the rail peer on node `n`, as
+`rail_exchange` reads them) and, given its `rail_keys` and the own part of
+its `node_keys`, its owner tables: its KJT, the chunks its forward puts, and
+its row map. Both take the lookup groups, and both run the device code of
+`rail_exchange` (`input_dist/rail.cuh`).
 
 `test_hier_bucketize.py` plays every rank of one node with the first two
-hooks, and `test_hier_dedup.py` every rank of an N-node job. Among its
-checks: each proxy's `owner_offsets` equal its owners' `source_offsets` and
-KJT offsets.
+hooks. Among its checks: each rank's node layout is the same with the items
+on one CTA and on a grid (`items_in_cta`), also with 127 to 300 features.
+`test_hier_dedup.py` plays every rank of an N-node job, also with 2 and 3
+lookup groups and a group per feature. Among its checks: each owner's row
+map, where its groups' slices start, its group shifts and the group runs of
+each source node's records, against a plain reference of the order in which
+the rows cross the rail; each proxy's group runs of its keys at each owner
+equal to that owner's runs of its records (so the backward's puts land
+where the owner's lookup wrote); and with a group per feature, no row map.
 
 ## 19. Limitations
 
@@ -2435,22 +2725,33 @@ KJT offsets.
   and the hottest owner's need sizes `lookup_keys` on every rank (section
   15).
 * **Host time of the input dist**: across nodes an input dist launches
-  about 80 kernels, CUB's included (section 10; an estimate from the code),
+  about 70 kernels, CUB's included (section 10; an estimate from the code),
   and the training thread spends their host time, also under the train
   pipelines.
 * **Size of one call**: a GPU may receive, deduplicate or look up fewer than
   about 2.1 billion keys of each kind in one call (section 4.3).
-* **Many nodes with many features**: the rail all-gathers count messages of
-  about `num_nodes × num_features` words. So per call a rank sends and gets
-  about `num_nodes² × num_features` words, its ctrl section keeps about
-  `16 × num_nodes² × num_features` bytes, and one CTA lays the rail out
-  from them. That is 865 KiB each way per call and 1.7 MB of ctrl at 64
-  nodes and 26 features, and about 500 MiB each way per call and 0.98 GB of
-  ctrl at 256 nodes and 1,000 features (sections 10.4 and 15.4). The
+* **Many nodes with many features or lookup groups**: a count message has
+  `num_features + (num_nodes + 1) × (num_groups + 1) + 1` words. So per call
+  a rank sends and gets about `num_nodes × (num_features + num_nodes ×
+  (num_groups + 1))` words, and its ctrl section keeps `3 × num_nodes`
+  messages: they grow with the nodes times the features, and with the
+  square of the nodes times the lookup groups plus one (sections 10.4 and
+  15.4). One CTA (`rail_exchange`) writes this rank's `num_nodes` messages
+  and lays the rail out from the messages to it. It reads the headers'
+  `num_nodes² × (num_groups + 1)` counts a few times, and for the starts of
+  the group runs the keys between its own node and each other node: about
+  `2 × num_nodes × num_groups²` loads in all. It copies the other nodes'
+  keys of each feature (`num_nodes × num_features` counts) and scans its
+  KJT's `num_features × kjt_stride` lengths: at 256 nodes of 8 GPUs and
+  1,000 features, about 0.4M words of messages, 0.26M counts and 0.26M
+  lengths. So its work grows with the features times `local_size +
+  num_nodes`, with the square of the nodes times the lookup groups plus
+  one, and with the nodes times the square of the lookup groups. The
   proxy's node dedup also counts the keys of its `local_size × num_nodes ×
-  num_features` blocks on one CTA, as many as the node layout's
-  `row_shift` has entries: 16K at 32 nodes of 8 GPUs and 64
-  features, and 2M at 256 nodes and 1,000 features.
+  num_features` blocks on one CTA, in a blocked scan: as many as the node
+  layout's `row_shift` has entries, 16K at 32 nodes of 8 GPUs and 64
+  features, and 2M at 256 nodes and 1,000 features. The node layout
+  computes its row shifts on a grid when they are many (section 10.2).
 * **Views**: a lookup output is a view of `lookup_rows`, valid until the
   next out kernel, and `lookup_grad` is one, valid until the next lookup
   (sections 11.2 and 11.4).
@@ -2464,6 +2765,12 @@ KJT offsets.
 * **The owner's KJT**: code that reads it (trackers, for example) sees
   `kjt_stride` columns per feature and one entry per (other node, table,
   key) (section 9).
+* **The lookup output's order**: across nodes, when a lookup group has more
+  than one feature, the lookup output's rows are not in the order of the
+  KJT's keys (section 11.2). Code that reads them by key reads them through
+  the row map (`HierDist.key_rows`). TorchRec's model delta tracker gets
+  each group's rows in key order, a copy per lookup group
+  (`HierDist.in_key_order`, section 7.4).
 * **16-bit rows with node dedup** get one more rounding per node sum
   (section 18).
 * **Skewed keys**: lower IB use in the backward, and a slow rank's lookup
@@ -2491,13 +2798,20 @@ KJT offsets.
 Paths from `corelib/dynamicemb`.
 
 * **Python** (`dynamicemb/shard/`): `hier_output_dist.py` holds
-  `HierDist` (the op, what a sharding's calls share, and a call's
-  second wait, `finish`), what a call leaves its output dist (`HierCall`),
-  the output dist and `quiesce`; `input_dist.py` the hierarchical input
-  dist (`hier_forward` and its two awaitables); `rw_sharding.py` the choice
-  of dist and the lookup; `embedding.py` the choice per call (eval
-  forwards take TorchRec's dists). The
+  `HierDist` (the op, what a sharding's calls share, a call's second wait,
+  `finish`, and the lookup's rows and row map: `lookup_buffer`, `key_rows`,
+  `in_key_order`), what a call leaves its output dist (`HierCall`), the
+  output dist and `quiesce`; `input_dist.py` the hierarchical input dist
+  (`hier_forward` and its two awaitables); `rw_sharding.py` the choice of
+  dist, the lookup groups and the lookup; `embedding.py` the choice per call
+  (eval forwards take TorchRec's dists). The
   table options are in `dynamicemb/dynamicemb_config.py`.
+* **DynamicEmb's lookup**, where it takes a row map (section 11.2):
+  `dynamicemb/batched_dynamicemb_function.py` (`OutputAlloc`, the forward
+  and its backward's `grad_rows`), `dynamicemb/key_value_table.py`
+  (`load_from_flat_by`), `src/dynamic_emb_op.cu`
+  (`load_from_flat_table_kernel` and its vector form, `gather_embedding`,
+  `reduce_grads`) and `src/lookup_forward.cu` (`scatter_fused`).
 * **C++** (`src/hier_output_dist/`, namespace `dyn_emb::hier_output_dist`):
   the op's own files, and a folder for what both dists share and one for
   each dist.
@@ -2511,16 +2825,18 @@ Paths from `corelib/dynamicemb`.
   * `common/`, what both dists share:
     * `common.h`: what host and device code share: the constants, the ranks
       of a sharding (`Topo`) and the op's sizes (`Sizes`), the formats of the
-      call's tables, the call's status, the GIN contexts and signals, and the
-      trace's build flag and row format;
+      call's tables (among them the group runs, `GroupRuns`), the call's
+      status, the GIN contexts and signals, and the trace's build flag and
+      row format;
     * `config.h`, `config.cu`: error checks and small host helpers, the op's
-      configuration (`Config`) and its checks, the payload of a chunk and its
-      cap in the ring (`kDefaultPayloadKb`, `kMinPayloadKb`,
+      configuration (`Config`, with its lookup groups) and its checks, the
+      payload of a chunk and its cap in the ring (`kDefaultPayloadKb`, `kMinPayloadKb`,
       `kChunkRowCapBytes`), and the op's sizes (`sizes_of`,
       `rows_per_payload_for`, `max_chunks_for`);
     * `window.h`: the window's layout (`WindowLayout`) over its sections:
-      `CtrlLayout` (with the format of the count message), `KeysLayout`
-      (with `ProxyHeader`, `RemoteMap` and what `peer_gather` reads) and
+      `CtrlLayout` (with the format of the count message, `CountMessage`),
+      `KeysLayout` (with a requester's row of `node_offsets`, `NodeRow`,
+      `ProxyHeader`, `RemoteMap` and what `peer_gather` reads) and
       `RowsLayout`;
     * `device.cuh`: the kernels' building blocks: loads, stores and fences
       with a memory order, bounded waits, warp and CTA helpers, a search, row
@@ -2535,29 +2851,33 @@ Paths from `corelib/dynamicemb`.
     * `plan.h`, `plan.cu`: the output dist's plans (`FwdPlan`, `BwdPlan`),
       and the same as the out kernels read them (`FwdPlanView`,
       `BwdPlanView`);
-    * `comm_kernels.cu`: the comm kernels, and the in channel's functions
-      that launch them;
+    * `comm_kernels.cu`: the comm kernels, `node_exchange`'s grids
+      (`node_rows_push_kernel`, `node_layout_items_kernel`) and the hook
+      that forces their paths (`force_node_paths`), and the in channel's
+      functions that launch them;
     * `node.cuh`: the device code of the node's part of a call, which the
       comm kernels, the planner's kernels and the bucketize share: the node
-      layout from the node's offsets (`node_layout_of`), the bucketize's
-      gather (`gather_rows`) and the push (`push_rows`);
+      layout from the node's rows (`NodeRows`, `node_layout_small`,
+      `node_layout_items`), the bucketize's gather (`gather_rows`) and the
+      push (`push_rows`);
     * `rail.cuh`: the device code of the rail's part of a call, which
-      `rail_exchange` and the hooks share: a rank's count message
-      (`count_message_of`) and the rail's layout from the rail's messages
-      (`rail_layout_of`), with the one function that gives both
-      `source_offsets` and `owner_offsets` (`source_offset`);
+      `rail_exchange` and the hooks share: a rank's count messages
+      (`count_messages_of`) and the rail's layout from the rail's messages
+      (`rail_layout_of`), with the two functions that give both the owner's
+      and the proxy's group runs (`group_first`, `group_shift_of`);
     * `planner.h`: the planner: the declarations of every step, and of the
       CUB calls in `cub.cu` (radix sorts and scans); `planner.cuh`: what the
       planner's kernels share (how they are launched, searches in sorted
-      tables, the offsets of sorted runs, a CTA's scans). The bucketize is in
+      tables, the offsets of sorted runs, a CTA's scans, among them the
+      blocked one, `cta_scan_blocked`). The bucketize is in
       `bucketize.cu` and the proxy in `proxy.cu` (with its node dedup's
       hash table, `Identities`, which takes index dedup's chained insert
       from `src/dedup_chain.cuh`, and the rounds of its chunks, cut by
       counted rows, `Rounds`); the node layout, the push, the count
       message and the rail layout as the hooks run them (`node_layout`,
       `push_to_node_keys`, `count_message`, `rail_layout`), the owner's KJT
-      on one node (`one_node_owner`), the owner's tables, the requester and
-      the put lists are in `planner.cu`;
+      on one node (`one_node_owner`), the owner's tables (with its row map)
+      and the requester are in `planner.cu`;
   * `output_dist/`, the output dist:
     * `output_dist.h`, `output_dist.cu`: the out channel (`OutChannel`),
       which launches the out kernels, and their trace (`Trace`).
@@ -2569,8 +2889,9 @@ Paths from `corelib/dynamicemb`.
       call's tables as a requester's warps read them, their task schedule
       and their protocol); `forward.cuh` and `backward.cuh`: the forward and
       backward kernels, with their GIN warps (the forward's relay and its
-      grants, `grant_warp`; the backward's issuer and its look-ahead,
-      `poll_lookahead` and `post_lookahead`).
+      grants, `grant_warp`, and its issuer, `OwnerIssuer`; the backward's
+      issuer and its look-ahead, `poll_lookahead` and `post_lookahead`),
+      each issuer a put per chunk and lookup group.
 * `setup.py` builds `src/hier_output_dist/` only against NCCL ≥ 2.30.7, and
   else defines `DEMB_NO_HIER_OUTPUT_DIST`. With `DYNAMICEMB_HIER_TRACE=1` it
   defines `DEMB_HIER_TRACE=1` (section 4.4).

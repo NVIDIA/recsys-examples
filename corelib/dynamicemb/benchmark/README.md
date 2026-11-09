@@ -686,6 +686,70 @@ On 2 nodes the backward reaches 84% because of the ring's laps: a ring that
 holds the stream in one lap (`DYNAMICEMB_HIER_PROXY_MB=12288`) gives
 28.55 ms there (47.1 GB/s, 94%, in 2 runs); on 4 nodes the laps cost little.
 
+Many features. These runs keep the keys per GPU about the same while the
+features grow: 8 tables of 4,000,000 rows (dim 128, fp32, SGD), each with
+`--features_per_table` P features (F = 8P in all), index dedup, plain loop,
+about 540,000 keys per GPU and iteration (4.2 million in the two runs marked
+`b`: 1,024 × 4,096 and 4,096 × 1,024 in the table):
+
+```bash
+MANY="--num_tables 8 --num_embeddings 4000000 --use_index_dedup --num_iterations 20 --warmup 5"
+$LAUNCH $BENCH $MANY --features_per_table 1   --local_batch_size 4096 --max_seq_len 32       --output_dist hierarchical
+$LAUNCH $BENCH $MANY --features_per_table 8   --local_batch_size 4096 --max_seq_len 3        --output_dist hierarchical
+$LAUNCH $BENCH $MANY --features_per_table 32  --local_batch_size 2048 --max_seq_len 1 --seq_len_dist fixed --output_dist hierarchical
+$LAUNCH $BENCH $MANY --features_per_table 128 --local_batch_size 512  --max_seq_len 1 --seq_len_dist fixed --output_dist hierarchical
+$LAUNCH $BENCH $MANY --features_per_table 512 --local_batch_size 128  --max_seq_len 1 --seq_len_dist fixed --output_dist hierarchical
+$LAUNCH $BENCH $MANY --features_per_table 128 --local_batch_size 4096 --max_seq_len 1 --seq_len_dist fixed --output_dist hierarchical  # b
+$LAUNCH $BENCH $MANY --features_per_table 512 --local_batch_size 1024 --max_seq_len 1 --seq_len_dist fixed --output_dist hierarchical  # b
+```
+
+On Eos, before and after the changes for many features (the hierarchical
+dist puts each chunk once per lookup group; its count messages, node rows
+and planner tables grow with the features once, not with the features
+times the nodes; [docs/hier_output_dist.md](../docs/hier_output_dist.md),
+sections 10 and 11), in ms: the step (`iter_ms_host`), the output dist's
+kernels as the rank that arrives last runs them (per call the least time
+over the ranks, then the median over the calls: what the dist takes, without
+the wait for a slower rank's host), and the input dist (`in_seg_ms_mean`).
+One run of each point. TorchRec's dists are the same before and after.
+
+| features × batch (keys per sample) | nodes | TorchRec step | hier step before → after | fwd kernel before → after | bwd kernel before → after | input dist before → after |
+|---|---|---|---|---|---|---|
+| 8 × 4096 (1-32) | 1 | 7.0 | 4.1 → 4.0 | 0.75 → 0.75 | 0.72 → 0.72 | 0.35 → 0.33 |
+| 8 × 4096 (1-32) | 2 | 11.9 | 8.7 → 8.6 | 2.74 → 2.75 | 2.84 → 2.85 | 0.79 → 0.77 |
+| 8 × 4096 (1-32) | 4 | 15.7 | 11.3 → 11.2 | 4.06 → 4.07 | 4.14 → 4.14 | 0.87 → 0.78 |
+| 64 × 4096 (1-3) | 1 | 8.5 | 4.5 → 4.8 | 0.72 → 0.72 | 0.70 → 0.70 | 0.36 → 0.36 |
+| 64 × 4096 (1-3) | 2 | 14.6 | 9.1 → 9.2 | 2.71 → 2.67 | 2.86 → 2.77 | 0.76 → 0.85 |
+| 64 × 4096 (1-3) | 4 | 20.9 | 11.5 → 11.5 | 3.95 → 3.97 | 4.03 → 4.03 | 0.85 → 0.78 |
+| 256 × 2048 (1) | 1 | 13.3 | 9.2 → 9.2 | 0.72 → 0.72 | 0.70 → 0.70 | 0.39 → 0.40 |
+| 256 × 2048 (1) | 2 | 19.8 | 12.6 → 13.6 | 2.94 → 2.66 | 3.23 → 2.76 | 0.83 → 0.81 |
+| 256 × 2048 (1) | 4 | 29.3 | 14.0 → 14.2 | 3.95 → 3.96 | 4.06 → 4.02 | 1.10 → 0.94 |
+| 1024 × 512 (1) | 1 | 29.7 | 24.9 → 24.9 | 0.72 → 0.72 | 0.70 → 0.70 | 0.50 → 0.44 |
+| 1024 × 512 (1) | 2 | 37.9 | 32.1 → 28.1 | 4.83 → 2.68 | 4.57 → 2.80 | 1.27 → 0.86 |
+| 1024 × 512 (1) | 4 | 49.3 | 32.5 → 30.5 | 4.68 → 3.96 | 4.96 → 4.02 | 1.49 → 0.97 |
+| 4096 × 128 (1) | 1 | 119.3 | 104.0 → 104.4 | 0.72 → 0.72 | 0.85 → 0.91 | 0.91 → 0.59 |
+| 4096 × 128 (1) | 2 | 138.3 | 126.3 → 120.0 | 15.78 → 2.69 | 13.15 → 2.85 | 2.62 → 1.28 |
+| 4096 × 128 (1) | 4 | 166.2 | 139.8 → 118.3 | 17.23 → 3.96 | 15.47 → 4.15 | 3.60 → 1.45 |
+| 1024 × 4096 (1) | 1 | 71.4 | 36.8 → 37.0 | 5.24 → 5.24 | 5.03 → 5.03 | 1.37 → 1.30 |
+| 1024 × 4096 (1) | 2 | 127.9 | 61.6 → 58.5 | 15.29 → 14.26 | 19.77 → 16.45 | 3.28 → 2.97 |
+| 1024 × 4096 (1) | 4 | 195.1 | 75.2 → 67.8 | 20.67 → 20.70 | 25.43 → 20.79 | 3.98 → 3.43 |
+| 4096 × 1024 (1) | 1 | 164.8 | 130.0 → 130.6 | 5.25 → 5.25 | 5.13 → 5.13 | 1.86 → 1.54 |
+| 4096 × 1024 (1) | 2 | 229.0 | 178.7 → 150.2 | 24.58 → 14.35 | 35.77 → 16.29 | 5.44 → 3.65 |
+| 4096 × 1024 (1) | 4 | 313.5 | 189.5 → 157.7 | 24.87 → 20.74 | 46.09 → 20.82 | 6.25 → 4.10 |
+
+* The output dist's kernels take the same time at 4,096 features as at 8,
+  for the same keys per GPU. Before, at 4,096 features on 2 and 4 nodes,
+  they took 13-17 ms where 8 features take 2.7-4.1 ms: a chunk's rows went
+  over InfiniBand in one put per feature.
+* The input dist at 4,096 features takes 1.3-1.5 ms on 2 and 4 nodes
+  (0.5-0.7 ms more than at 8 features), against 12.2 and 23.6 ms for
+  TorchRec's.
+* At many features the step is the benchmark's own model: it makes and
+  sums a JaggedTensor per feature, so its host work grows with the features,
+  and at 4,096 features the ranks reach the backward kernel 12-16 ms apart
+  (the median rank's backward kernel is that much longer). The step of one
+  run varies by a few ms for that reason.
+
 #### Options
 
 | option | default | meaning |

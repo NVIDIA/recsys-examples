@@ -248,8 +248,9 @@ __host__ __device__ inline int64_t min_proxy_rows_for(int64_t max_key_rows) {
 // records of each source node; as the proxy's backward: its node-unique keys
 // of each owner node), [num_nodes][2 * num_groups + 1] int64 words: per peer
 // node, where each group's keys start among its keys (first, num_groups + 1
-// words: the last is the end of its keys), then each group's shift: key k of
-// group g lies at row k + shift(g) of the owner's lookup_rows.
+// words: the last is the end of its keys), then each group's shift: the
+// peer's key k (its place among all the peer's keys), of group g, lies at row
+// k + shift(g) of the owner's lookup_rows.
 struct GroupRuns {
   const int64_t *words;
   int64_t num_groups;

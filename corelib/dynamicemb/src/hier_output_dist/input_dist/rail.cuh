@@ -194,8 +194,9 @@ __device__ __forceinline__ int64_t group_shift_of(const RailCounts &in, const in
 // count messages (`in`) and this rank's own part's lengths (own_lengths [feature][requester], the
 // node layout's). scratch: rail_layout_scratch words. A slice a proxy puts holds the owner node's
 // chunks (OwnerChunk, 16 bytes each), then its records; none to its own node. The per-node and
-// per-group tables come from the headers alone (O(num_nodes^2 * num_groups) words read); this
-// rank's KJT from the parts of the messages to it.
+// per-group tables come from the headers alone (their num_nodes^2 * (num_groups + 1) words, read a
+// few times, and the groups' runs about 2 * num_nodes * num_groups^2 more); this rank's KJT from
+// the parts of the messages to it.
 __device__ inline void rail_layout_of(const RailCounts &in, const int64_t *own_lengths,
                                       const Sizes &sizes, int64_t *scratch,
                                       const RailLayoutView &out) {

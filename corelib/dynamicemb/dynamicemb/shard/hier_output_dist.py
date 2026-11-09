@@ -190,7 +190,7 @@ class HierDist:
             takes TorchRec's dists.
         tables: the table of each feature.
         node_dedup: across nodes a node sends each key once.
-        groups: the features of each lookup group, in feature order (the
+        groups: the number of features of each lookup group, in feature order (the
             sharding's grouped configs); each group's rows take a slice of
             the call's rows of their own (None: one group).
     """

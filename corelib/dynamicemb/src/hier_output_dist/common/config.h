@@ -114,11 +114,11 @@ struct Config {
   int rank = 0, world_size = 0, local_size = 0;  // ranks are node-contiguous
   std::vector<int> feature_tables;               // the table of each feature: across nodes a key is
                                                  // its table and value
-  std::vector<int> lookup_groups;  // the features of each lookup group, in feature order: the
-                                   // lookup writes each group's rows into a slice of lookup_rows of
-                                   // their own (empty: one group of every feature)
-  std::vector<int> dist_types;     // [num_features]: each feature's DistType code (src/utils.h)
-  int64_t dim = 0;                 // a row of the lookup output: dim values of dtype
+  std::vector<int> lookup_groups;  // the number of features of each lookup group, in feature order:
+                                   // the lookup writes each group's rows into a slice of
+                                   // lookup_rows of their own (empty: one group of every feature)
+  std::vector<int> dist_types;  // [num_features]: each feature's DistType code (src/utils.h)
+  int64_t dim = 0;              // a row of the lookup output: dim values of dtype
   at::ScalarType dtype = at::kFloat;
   bool weighted = false;   // the requesters' keys carry weights, and so the owner's KJT:
                            // whole counts of at least 0, which the proxy adds as integers
