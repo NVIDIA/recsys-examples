@@ -1970,12 +1970,6 @@ ALLOWED_NEW_HITS: List[Tuple[str, Optional[str], str]] = [
         "through a pinned copy and a non-blocking transfer, not a pageable copy that waits",
     ),
     (
-        "dynamicemb/incremental_dump.py",
-        "cpu",
-        "_all_gather_evicted_many: a single rank returns what it was given on the host (the keys "
-        "of a pop are host tensors, so nothing is copied); the helper's result is host data",
-    ),
-    (
         "dynamicemb/key_value_table.py",
         "numpy",
         "_dump_table writes the pinned host batches that pull_live_prefixes brought over, one "
@@ -1986,12 +1980,6 @@ ALLOWED_NEW_HITS: List[Tuple[str, Optional[str], str]] = [
         "numpy",
         "LinearBucketTable.dump (the admission counter's checkpoint) writes the pinned host "
         "batches that pull_live_prefixes brought over, one wait per batch",
-    ),
-    (
-        "dynamicemb/key_value_table.py",
-        "int_bool_of_tensor",
-        "_count_owned_keys counts the owned keys of a checkpoint file on a CPU tensor: no "
-        "device is involved",
     ),
 ]
 

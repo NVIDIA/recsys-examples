@@ -60,6 +60,7 @@ from dynamicemb.extendable_tensor import (
 from dynamicemb.key_ownership import owned_key_mask
 from dynamicemb.optimizer import BaseDynamicEmbeddingOptimizer
 from dynamicemb.scored_hashtable import (
+    LIVE_PREFIX_BATCHES_IN_FLIGHT,
     ScoreArg,
     ScorePolicy,
     ScoreSpec,
@@ -503,7 +504,8 @@ class DynamicEmbTableState:
     # ticket, stream] per entry (``stream`` is the ``cuda_stream`` handle of the
     # stream that made it), appended by ``_append_evicted_masked`` and folded into
     # the chunks above by ``_resolve_pending_evicted`` once ``count`` has landed on
-    # the host (or, on a pop, by waiting for it). ``retain_ring`` is the pinned ring
+    # the host (a pop does not wait for it: it takes the arrays whole, see
+    # ``_pending_evicted_arrays``). ``retain_ring`` is the pinned ring
     # those counts land in, allocated here so that no step allocates; only a table
     # that retains evicted keys has one. A copy of the state (``copy.deepcopy``,
     # pickle) gets a ring of its own, which does not know the tickets of the entries
@@ -2215,10 +2217,10 @@ def _append_evicted_masked(
     assert state.retain_ring is not None, "the table does not retain evicted keys"
     if keys.numel() == 0:
         return
-    _resolve_pending_evicted(state, block=False)  # fold what has already landed
+    _resolve_pending_evicted(state)  # fold what has already landed
     count = (table_ids >= 0).sum().reshape(1)  # int64[1], stays on the device
     # A full ring gives no ticket: the entry is retried by a later call, on this
-    # stream (the one the count was produced on), or read by a blocking pop.
+    # stream (the one the count was produced on), or taken whole by a pop.
     state.evicted_pending.append(
         [
             keys,
@@ -2230,12 +2232,12 @@ def _append_evicted_masked(
     )
 
 
-def _resolve_pending_evicted(state: DynamicEmbTableState, block: bool) -> None:
+def _resolve_pending_evicted(state: DynamicEmbTableState) -> None:
     """Fold the pending evicted keys of ``state`` into its chunk lists.
 
-    Without ``block`` only the entries whose count has already landed on the host
-    are folded; nothing waits. With ``block`` every entry is folded, waiting for
-    its count: for a pop, whose result has a data-dependent size anyway.
+    Only the entries whose count has already landed on the host are folded; nothing
+    waits. (A pop does not come here: it takes the pending arrays whole, the members of
+    each marked by their table id, see :func:`_pending_evicted_arrays`.)
 
     An entry is folded by moving its members to the front with a stable sort of
     the membership flag (the order of the keys is kept) and cutting ``[:n]``.
@@ -2251,20 +2253,11 @@ def _resolve_pending_evicted(state: DynamicEmbTableState, block: bool) -> None:
             # on the stream that produced ``count``: the copy and its event are
             # ordered by that stream.
             ticket = ring.enqueue(count)
-        if ticket is not None and not (block or ring.ready(ticket)):
+        if ticket is None or not ring.ready(ticket):
             keep.append([keys, tids, count, ticket, stream])
             continue
-        if ticket is not None:
-            n = int((ring.wait(ticket) if block else ring.value(ticket))[0])
-            ring.release(ticket)
-        elif block:
-            # No ticket and a pop that must have the number: one read. It runs on
-            # this stream, so order it after the one that produced the count.
-            _wait_for_stream(stream)
-            n = int(sf.read_now(count)[0])
-        else:
-            keep.append([keys, tids, count, None, stream])
-            continue
+        n = int(ring.value(ticket)[0])
+        ring.release(ticket)
         if n > 0:
             # The arrays belong to the stream that made them; the sort and the
             # gathers below run on this one, and the arrays are dropped here.
@@ -2774,6 +2767,29 @@ def export_keys_values_iter(
         )
 
 
+# What a dump holds on the device for the values of its batches, in bytes, all the batches in
+# flight together. The batches of a dump are full length (the host does not learn how many
+# keys a batch holds before the rows are cut), so each one gathers ``[batch, value_dim]``
+# whatever it holds, and :func:`pull_live_prefixes` keeps several alive: a wide row makes the
+# batch shorter instead of the dump of a table at 1% fill a few GB of transients, at the time
+# a checkpoint is taken and the device is full of the tables.
+DUMP_BATCH_BYTES = 256 << 20
+
+
+def _dump_batch_rows(
+    state: DynamicEmbTableState, table_id: int, batch_size: int = 65536
+) -> int:
+    """How many slots a dump of this table scans per batch: ``batch_size``, or fewer when
+    the value rows are wide enough for the batches in flight, and the contiguous copy of the
+    embedding columns that is made while one of them is pulled, not to fit in
+    :data:`DUMP_BATCH_BYTES`. What the files hold does not depend on it."""
+    row_bytes = max(1, state.table_value_dims_cpu[table_id] * state.emb_dtype.itemsize)
+    in_flight = LIVE_PREFIX_BATCHES_IN_FLIGHT + 1
+    rows = min(batch_size, max(32, DUMP_BATCH_BYTES // (in_flight * row_bytes)))
+    # a multiple of the export kernel's tile, when there is room for one
+    return rows - rows % 32 if rows >= 32 else rows
+
+
 def _dump_batches(
     state: DynamicEmbTableState,
     table_id: int,
@@ -2791,7 +2807,11 @@ def _dump_batches(
     user's order. Yields ``(keys, embeddings, opt_states, scores)`` for each batch that
     holds a key: ``keys`` are int64, ``opt_states`` is ``None`` unless ``include_optim``
     and the table keeps one, ``scores`` are int64 ``[n]`` or ``[n, num_scores]``.
+
+    A batch is ``batch_size`` slots at most; a table of wide rows has shorter ones, so that
+    the values of the batches in flight stay inside :data:`DUMP_BATCH_BYTES`.
     """
+    batch_size = _dump_batch_rows(state, table_id, batch_size)
     emb_dim_t = state.table_emb_dims_cpu[table_id]
     optim_state_dim = state.table_value_dims_cpu[table_id] - emb_dim_t
     with_opt = include_optim and optim_state_dim != 0
@@ -2802,7 +2822,11 @@ def _dump_batches(
         # Multi-word score layouts (e.g. LruLfu: timestamp + frequency) must persist ALL
         # words, not just the exported column, so the checkpoint can restore them exactly,
         # in the user's configured (logical) order. Identity when it is the physical one.
-        dump_perm = score_dump_permutation(state.options_list[table_id].score_strategy)
+        score_strategy = state.options_list[table_id].score_strategy
+        assert (
+            score_strategy is not None
+        ), "a table with several score words has a strategy"
+        dump_perm = score_dump_permutation(score_strategy)
         if dump_perm == list(range(num_scores)):
             dump_perm = None
 
@@ -2944,7 +2968,7 @@ def _count_owned_keys(
                 bytearray(fkey.read(KEY_TYPE.itemsize * n)), dtype=KEY_TYPE
             )
             mask = owned_key_mask(keys, shard_index, num_shards, dist_type)
-            owned += int(mask.sum()) if mask is not None else n
+            owned += n if mask is None else keys[mask].numel()
     return owned
 
 
@@ -3350,6 +3374,43 @@ def _load_key_values(
 # ---------------------------------------------------------------------------
 
 
+def _replay_wants_state(
+    state: DynamicEmbTableState, table_id: int, content: ReplayContent
+) -> bool:
+    """Whether a replay writes the optimizer state the delta carries for this table: the
+    content asks for it and the table keeps some."""
+    return (
+        ReplayContent.OPTIMIZER_STATE in content
+        and state.optimizer.get_state_dim(state.table_emb_dims_cpu[table_id]) > 0
+    )
+
+
+def _check_replay_optimizer_states(
+    state: DynamicEmbTableState,
+    table_id: int,
+    optimizer_states: Optional[torch.Tensor],
+) -> torch.Tensor:
+    """Raise ``ValueError`` for a delta whose optimizer state this table cannot take: it
+    carries none, or a block that is not as wide as the table's checkpoint rows. Looks
+    at the shape of the host block only, so a replay can run it before it writes.
+    Returns the block."""
+    if optimizer_states is None:
+        raise ValueError(
+            f"replay_increment: table {table_id} keeps optimizer state per "
+            "row, but the delta carries none. Drop "
+            "ReplayContent.OPTIMIZER_STATE, or replay a delta dumped from a "
+            "table with the same optimizer."
+        )
+    ckpt_dim = state.optimizer.get_ckpt_state_dim(state.table_emb_dims_cpu[table_id])
+    if optimizer_states.dim() != 2 or optimizer_states.size(1) != ckpt_dim:
+        raise ValueError(
+            f"replay_increment: table {table_id} dumps {ckpt_dim} "
+            f"optimizer-state column(s) per row, but the delta carries a "
+            f"block of shape {tuple(optimizer_states.shape)}."
+        )
+    return optimizer_states
+
+
 def _replay_write_values(
     state: DynamicEmbTableState,
     table_id: int,
@@ -3381,30 +3442,17 @@ def _replay_write_values(
     emb_dim_cfg = state.table_emb_dims_cpu[table_id]
     optstate_dim = state.optimizer.get_state_dim(emb_dim_cfg)
     embeddings = embeddings.to(dtype=state.emb_dtype)
-    want_opt = ReplayContent.OPTIMIZER_STATE in content and optstate_dim > 0
+    want_opt = _replay_wants_state(state, table_id, content)
 
     if optstate_dim == 0:
         store_to_flat_single_table(state, rows, table_id, embeddings)
         return
 
     if want_opt:
-        if optimizer_states is None:
-            raise ValueError(
-                f"replay_increment: table {table_id} keeps optimizer state per "
-                "row, but the delta carries none. Drop "
-                "ReplayContent.OPTIMIZER_STATE, or replay a delta dumped from a "
-                "table with the same optimizer."
-            )
-        ckpt_dim = state.optimizer.get_ckpt_state_dim(emb_dim_cfg)
-        if optimizer_states.dim() != 2 or optimizer_states.size(1) != ckpt_dim:
-            raise ValueError(
-                f"replay_increment: table {table_id} dumps {ckpt_dim} "
-                f"optimizer-state column(s) per row, but the delta carries a "
-                f"block of shape {tuple(optimizer_states.shape)}."
-            )
+        checked = _check_replay_optimizer_states(state, table_id, optimizer_states)
         # Back to the runtime width the fused value row expects.
         opt = state.optimizer.states_from_checkpoint(
-            optimizer_states.to(device=embeddings.device),
+            checked.to(device=embeddings.device),
             emb_dim_cfg,
             state.emb_dtype,
             embeddings.device,
@@ -3600,13 +3648,10 @@ def _replay_write(
         dtype=state.emb_dtype
     )
     # the state of the delta is only written when the content asks for it
-    wants_state = (
-        ReplayContent.OPTIMIZER_STATE in content
-        and state.optimizer.get_state_dim(state.table_emb_dims_cpu[table_id]) > 0
-    )
     optimizer_states = (
         uploads.optimizer_states.upload(tier.optimizer_states[placed.start : end])
-        if wants_state and tier.optimizer_states is not None
+        if _replay_wants_state(state, table_id, content)
+        and tier.optimizer_states is not None
         else None
     )
     _replay_write_values(
@@ -3643,19 +3688,31 @@ def _replay_tiers(
     used to wait for the number of unplaced keys of every batch, and for the two masks
     of the write of each.
 
+    What the host can tell is wrong with the delta (a score block or an optimizer state
+    that is not as wide as the table's, or none where the table needs it) is raised before
+    the first key is placed, so that it cannot leave a table placed and not written. A key
+    that the device could not place is not that: the keys of every batch that did land
+    are in the key map, where each took the slot of whatever was in it, and no row and no
+    value was written for them (``replay_increment`` of the module says what to do).
+
     The delta is on the host, so the second phase takes its columns from it again: only
     one byte a key (which keys were in their slot already) is kept on the device between
     the phases.
     """
     stats = ReplayStats()
+    live = [(index, tier) for index, tier in enumerate(tiers) if tier.keys.numel() > 0]
+    if not live:
+        return stats
+    for _, tier in live:
+        if ReplayContent.SCORE in content and tier.scores is not None:
+            # no rows, so only the shape of the block is looked at
+            _replay_score_block(tier.state, table_id, tier.scores[:0], timestamp)
+        if _replay_wants_state(tier.state, table_id, content):
+            _check_replay_optimizer_states(tier.state, table_id, tier.optimizer_states)
+    uploads = _ReplayUploads(live[0][1].state.device)
     placed: List[_ReplayPlaced] = []
-    uploads = None
-    for index, tier in enumerate(tiers):
+    for index, tier in live:
         n = tier.keys.numel()
-        if n == 0:
-            continue
-        if uploads is None:
-            uploads = _ReplayUploads(tier.state.device)
         batch = tier.state.threads_in_wave
         for start in range(0, n, batch):
             end = min(start + batch, n)
@@ -5777,7 +5834,7 @@ def _wait_for_pending_evicted(state: DynamicEmbTableState) -> None:
             newest = entry[3]
     if ring is not None and newest is not None:
         ring.wait(newest)
-    _resolve_pending_evicted(state, block=False)
+    _resolve_pending_evicted(state)
 
 
 def flush_cache(
@@ -5831,7 +5888,7 @@ def flush_cache(
             tid = torch.where(live, torch.full_like(slots, t), -1)
             rows = state.key_index_map._rows_of(slots, tid, False)
             values = load_from_flat(state, rows, tid, copy_mode=CopyMode.VALUE)
-            _write_back_evicted(storage, None, sf.mask_keys(keys, live), tid, values)
+            _write_back_evicted(storage, None, keys, tid, values)
             batches += 1
             if retaining and ring is not None and batches % ring.slots == 0:
                 _wait_for_pending_evicted(storage._state)

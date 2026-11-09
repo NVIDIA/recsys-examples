@@ -704,7 +704,9 @@ def _all_gather_evicted_many(
         return []
     world_size = dist.get_world_size(pg)
     if world_size <= 1:
-        return [keys.cpu() for keys in keys_list]
+        # what a pop returns is on the host already, and comes back as it is; keys that are
+        # not (a storage without pop_many) are copied together, with one wait
+        return list(sf.pull_to_host(*keys_list))
     device = torch.device("cuda", torch.cuda.current_device())
     num = len(keys_list)
     dtypes = [keys.dtype for keys in keys_list]

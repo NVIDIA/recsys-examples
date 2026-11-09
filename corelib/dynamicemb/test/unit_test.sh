@@ -64,6 +64,8 @@ FWD_BWD_TEST_FILES=(
     "test/unit_tests/no_host_sync/test_dump_pipelined.py"
     "test/unit_tests/no_host_sync/test_load_staged.py"
     "test/unit_tests/no_host_sync/test_replay_two_phase.py"
+    # The same calls on a two-tier storage and, for the pops, over a group of ranks.
+    "test/unit_tests/no_host_sync/test_two_tier_explicit_apis.py"
 )
 
 LOAD_DUMP_TEST_FILES=(

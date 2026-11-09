@@ -66,7 +66,7 @@ def eraser():
     worker.shutdown()
 
 
-def test_a_handles_result_is_one_wait(gpu, count_syncs, eraser):
+def test_a_handles_result_is_one_wait(gpu, count_syncs, instruments_ok, eraser):
     """The counts ride the erase stream into pinned memory ahead of the event that
     ``wait`` waits for: ``result()`` waits for the device once, not once for the erase
     and once more for a copy of the counts."""
@@ -82,7 +82,9 @@ def test_a_handles_result_is_one_wait(gpu, count_syncs, eraser):
     assert count.blocking <= 1.0, count.describe()
 
 
-def test_a_group_of_handles_waits_once_per_handle(gpu, count_syncs, eraser):
+def test_a_group_of_handles_waits_once_per_handle(
+    gpu, count_syncs, instruments_ok, eraser
+):
     async_erase = _need("dynamicemb.async_erase")
     device = _device()
     stream = torch.cuda.Stream()
@@ -142,7 +144,7 @@ def _cache(device):
     return cache
 
 
-def test_reading_the_cache_metrics_is_one_wait(gpu, count_syncs):
+def test_reading_the_cache_metrics_is_one_wait(gpu, count_syncs, instruments_ok):
     """The lookups only write device counters; the getter is where the host waits, once,
     for the whole batch of them."""
     device = _device()

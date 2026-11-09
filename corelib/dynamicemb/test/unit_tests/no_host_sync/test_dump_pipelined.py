@@ -56,7 +56,7 @@ def _device():
     return torch.device("cuda", torch.cuda.current_device())
 
 
-def _storage(batches, optimizer="sgd", strategy="timestamp"):
+def _storage(batches, optimizer="sgd", strategy="timestamp", key_type=torch.int64):
     dynamicemb = _need("dynamicemb")
     config = _need("dynamicemb.dynamicemb_config")
     opt = _need("dynamicemb.optimizer")
@@ -78,7 +78,7 @@ def _storage(batches, optimizer="sgd", strategy="timestamp"):
     }[optimizer]
     options = [
         config.DynamicEmbTableOptions(
-            index_type=torch.int64,
+            index_type=key_type,
             embedding_dtype=torch.float32,
             device_id=torch.cuda.current_device(),
             dim=DIM,
@@ -94,13 +94,22 @@ def _storage(batches, optimizer="sgd", strategy="timestamp"):
     return kvt.DynamicEmbStorage(options, optimizer_cls(args))
 
 
-def _fill(storage, num_keys, seed, strategy):
+def _key_numbers(num_keys, seed, key_type):
+    """Random keys; with a uint64 table half of them are above ``2**63``, whose int64 bit
+    pattern is negative: they come after the others as unsigned numbers."""
+    numbers = random.Random(seed).sample(range(1, 1 << 40), num_keys)
+    if key_type == torch.uint64:
+        numbers = [v | (1 << 63) if v % 2 else v for v in numbers]
+    return [v - (1 << 64) if v >= (1 << 63) else v for v in numbers]
+
+
+def _fill(storage, num_keys, seed, strategy, key_type=torch.int64):
     """``num_keys`` random keys with random values (the optimizer state included)."""
     device = _device()
     rng = random.Random(seed)
     keys = torch.tensor(
-        rng.sample(range(1, 1 << 40), num_keys), dtype=torch.int64, device=device
-    )
+        _key_numbers(num_keys, seed, key_type), dtype=torch.int64, device=device
+    ).view(key_type)
     state = storage._state
     values = torch.randn(num_keys, state.value_dim, device=device)
     scores = None
@@ -114,7 +123,8 @@ def _fill(storage, num_keys, seed, strategy):
             dtype=torch.uint64,
             device=device,
         )
-    storage.insert(keys, torch.zeros_like(keys), values, scores=scores)
+    table_ids = torch.zeros(num_keys, dtype=torch.int64, device=device)
+    storage.insert(keys, table_ids, values, scores=scores)
     torch.cuda.synchronize()
     return keys
 
@@ -174,15 +184,16 @@ CASES = [
 ]
 
 
+@pytest.mark.parametrize("key_type", [torch.int64, torch.uint64])
 @pytest.mark.parametrize("optimizer, strategy, include_optim", CASES)
 def test_the_files_are_the_files_of_the_exact_dump(
-    gpu, tmp_path, optimizer, strategy, include_optim
+    gpu, tmp_path, optimizer, strategy, include_optim, key_type
 ):
     kvt = _need("dynamicemb.key_value_table")
     ext = _need("dynamicemb_extensions")
-    storage = _storage(4, optimizer, strategy)  # 4 batches
+    storage = _storage(4, optimizer, strategy, key_type)  # 4 batches
     num_keys = 30000
-    _fill(storage, num_keys, 3, strategy)
+    _fill(storage, num_keys, 3, strategy, key_type)
     state = storage._state
     timestamp = ext.device_timestamp()
     new = [str(tmp_path / ("new_" + n)) for n in ("keys", "emb", "scores", "opt")]
@@ -343,7 +354,9 @@ def _dump_once(kvt, state, tmp_path, include_optim=False):
 
 
 @pytest.mark.parametrize("batches", [1, 8])
-def test_a_dump_waits_once_per_batch(gpu, count_syncs, tmp_path, batches):
+def test_a_dump_waits_once_per_batch(
+    gpu, count_syncs, instruments_ok, tmp_path, batches
+):
     """``batches`` batches: the count of the first, then one copy per batch. The exact dump
     waited for the count, the keys, the values and the scores of each (4 per batch)."""
     kvt = _need("dynamicemb.key_value_table")
@@ -374,6 +387,63 @@ def test_a_dump_copies_the_rows_the_table_holds_not_the_slots_it_scans(
     assert sum(copied) <= num_keys * row + batches + 1, sum(copied)
     # the exact dump's batches at full length would have been
     assert sum(copied) < batches * BATCH * row // 10
+
+
+def test_the_batches_of_a_dump_stay_inside_their_byte_budget(
+    gpu, tmp_path, monkeypatch
+):
+    """The batches are full length and the pipeline keeps several alive, so a wide row has to
+    make the batch shorter: the device holds the values of ``DUMP_BATCH_BYTES``, not of
+    3 x 65,536 rows. What the files hold does not depend on the length of a batch."""
+    kvt = _need("dynamicemb.key_value_table")
+    scored = _need("dynamicemb.scored_hashtable")
+    ext = _need("dynamicemb_extensions")
+    storage = _storage(1, "adam")
+    _fill(storage, 3000, 7, "timestamp")
+    state = storage._state
+    row_bytes = state.table_value_dims_cpu[0] * state.emb_dtype.itemsize
+    in_flight = scored.LIVE_PREFIX_BATCHES_IN_FLIGHT + 1
+    budget = in_flight * row_bytes * 1024  # 1024 rows a batch
+    monkeypatch.setattr(kvt, "DUMP_BATCH_BYTES", budget)
+    rows = kvt._dump_batch_rows(state, 0)
+    assert rows == 1024 and rows % 32 == 0
+    # a narrow row does not make a batch longer than the 65,536 slots it was asked for
+    monkeypatch.setattr(kvt, "DUMP_BATCH_BYTES", 1 << 40)
+    assert kvt._dump_batch_rows(state, 0) == 65536
+    assert kvt._dump_batch_rows(state, 0, 4096) == 4096
+    # and a row too wide for any budget is still a tile of slots
+    monkeypatch.setattr(kvt, "DUMP_BATCH_BYTES", 1)
+    assert kvt._dump_batch_rows(state, 0) == 32
+
+    monkeypatch.setattr(kvt, "DUMP_BATCH_BYTES", budget)
+    timestamp = ext.device_timestamp()
+    new = [str(tmp_path / ("new_" + n)) for n in ("keys", "emb", "scores", "opt")]
+    old = [str(tmp_path / ("old_" + n)) for n in ("keys", "emb", "scores", "opt")]
+    torch.cuda.synchronize()
+    before = torch.cuda.memory_allocated()
+    torch.cuda.reset_peak_memory_stats()
+    kvt._dump_table(
+        state,
+        0,
+        str(tmp_path / "meta.json"),
+        *new,
+        include_optim=True,
+        include_meta=False,
+        timestamp=timestamp,
+    )
+    torch.cuda.synchronize()
+    peak = torch.cuda.max_memory_allocated() - before
+    # the keys, scores and slots of a batch ride along, 8 bytes each a slot: a little more
+    # than the values, and far from the 3 x 65,536 rows of an unbounded dump
+    assert peak <= 3 * budget, "the dump held %d bytes of transients" % peak
+
+    reference_dump(state, 0, old, True, timestamp)
+    opt_width = state.optimizer.get_ckpt_state_dim(DIM)
+    got = _records(new, state.key_index_map.num_scores_, opt_width)
+    expected = _records(old, state.key_index_map.num_scores_, opt_width)
+    assert got["keys"].numel() == 3000
+    for column in got:
+        assert torch.equal(got[column], expected[column]), column
 
 
 def test_the_pipeline_yields_the_live_rows_and_launches_ahead(gpu):
@@ -423,7 +493,7 @@ def test_the_pipeline_of_nothing_and_of_one_batch(gpu):
 
 
 def test_the_pipeline_waits_once_per_batch_and_once_for_the_first_count(
-    gpu, count_syncs
+    gpu, count_syncs, instruments_ok
 ):
     scored = _need("dynamicemb.scored_hashtable")
     device = _device()
@@ -545,7 +615,9 @@ def test_a_counter_with_a_timer_score_dumps_ages(gpu, tmp_path):
 
 
 @pytest.mark.parametrize("batches", [1, 8])
-def test_a_counter_dump_waits_once_per_batch(gpu, count_syncs, tmp_path, batches):
+def test_a_counter_dump_waits_once_per_batch(
+    gpu, count_syncs, instruments_ok, tmp_path, batches
+):
     scored = _need("dynamicemb.scored_hashtable")
     ext = _need("dynamicemb_extensions")
     table = _counter_table(batches * BATCH, "frequency")

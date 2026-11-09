@@ -39,6 +39,7 @@ from dynamicemb.key_value_table import (
     _append_evicted_masked,
     _pop_state_evicted_keys,
     _resolve_pending_evicted,
+    _wait_for_pending_evicted,
     _wait_for_stream,
     get_insert_score_arg,
 )
@@ -126,7 +127,7 @@ def test_masked_append_retains_the_scattered_members(device, key_type):
     assert tids[: len(members)].ge(0).sum().item() < len(members)
 
     _append_evicted_masked(state, keys, tids)
-    _resolve_pending_evicted(state, block=True)
+    _wait_for_pending_evicted(state)
 
     assert not state.evicted_pending
     assert _chunk_keys(state, 0) == [7, 11, 13]
@@ -141,7 +142,7 @@ def test_masked_append_of_nothing_retains_nothing(device):
     state = _storage()._state
     keys, tids = _masked_arrays([], 8, device)
     _append_evicted_masked(state, keys, tids)
-    _resolve_pending_evicted(state, block=True)
+    _wait_for_pending_evicted(state)
     assert not state.evicted_pending
     assert state.evicted_key_chunks == [] and state.evicted_tid_chunks == []
     # arrays of no entries are not even kept
@@ -224,9 +225,10 @@ def test_pending_entries_stay_few_when_the_counts_land(device):
     assert set(_pop_state_evicted_keys(state, 0).tolist()) == expected
 
 
-def test_a_full_ring_degrades_to_a_blocking_read(device):
-    """With every ring slot in flight the append neither blocks nor loses the entry;
-    the pop reads what it needs."""
+def test_a_full_ring_loses_no_entry(device):
+    """With every ring slot in flight the append neither blocks nor loses the entry; the
+    pop takes the arrays of the entries whole, with a ticket or without, and gives the
+    tickets back without waiting for a count."""
     state = _storage()._state
     state.retain_ring = sf.DeferredRead((1,), torch.int64, slots=1)
     expected = set()
@@ -262,11 +264,11 @@ def test_entries_without_a_ticket_are_retried_when_a_slot_frees(device):
     torch.cuda.synchronize()
     # the first count has landed: folding it frees the slot, and the entry without
     # a ticket is given it by the same call (on the stream that made the entry)
-    _resolve_pending_evicted(state, block=False)
+    _resolve_pending_evicted(state)
     assert _chunk_keys(state, 0) in ([1], [1, 2])
     assert all(e[3] is not None for e in state.evicted_pending)
     torch.cuda.synchronize()
-    _resolve_pending_evicted(state, block=False)
+    _resolve_pending_evicted(state)
     assert not state.evicted_pending
     assert _chunk_keys(state, 0) == [1, 2]
 
@@ -274,8 +276,9 @@ def test_entries_without_a_ticket_are_retried_when_a_slot_frees(device):
 @pytest.mark.parametrize("slots", [8, 1])
 def test_a_pop_on_another_stream_than_the_appends(device, slots):
     """The arrays and their counts are made on a side stream that is still busy when
-    the default stream pops. With a free ring the pop waits for the event of the
-    count; with a full one it reads the count after the producing stream."""
+    the default stream pops. The pop orders itself after that stream and takes the
+    arrays whole: it reads nothing per entry, whether the ring had a slot for the count
+    of an entry or not, and its one read (how many keys each table gets) is the same."""
     state = _storage()._state
     state.retain_ring = sf.DeferredRead((1,), torch.int64, slots=slots)
     side = torch.cuda.Stream()
@@ -294,8 +297,9 @@ def test_a_pop_on_another_stream_than_the_appends(device, slots):
     popped = _pop_state_evicted_keys(state, 0)
     assert set(popped.tolist()) == expected
     assert popped.numel() == len(expected)
-    if slots == 1:
-        assert sf.READ_NOW_CALLS > reads, "two of the entries had no ticket"
+    assert (
+        sf.READ_NOW_CALLS == reads + 1
+    ), "one read, however many entries had no ticket"
     # the chunks were made on the default stream out of arrays of `side`
     torch.cuda.synchronize()
 
@@ -321,11 +325,11 @@ def test_waiting_for_a_stream_orders_the_current_stream_after_it(
     assert seen.item() == 7
 
 
-def test_a_pop_on_a_side_stream_reads_the_counts_the_default_stream_made(device):
-    """The entries without a ticket are read by the pop itself, after the stream that
-    made them: here the default stream (its handle is 0) and the pop is on a side
-    stream. The counts of the last two entries are made behind a long kernel that
-    the wait for the first entry's ticket does not cover."""
+def test_a_pop_on_a_side_stream_takes_the_arrays_the_default_stream_made(device):
+    """The entries without a ticket are taken by the pop after the stream that made
+    them: here the default stream (its handle is 0) and the pop is on a side stream.
+    The arrays of the last two entries are made behind a long kernel that the event
+    of the first entry's ticket does not cover."""
     state = _storage()._state
     state.retain_ring = sf.DeferredRead((1,), torch.int64, slots=1)
     entries = [
@@ -355,7 +359,7 @@ def test_a_ready_entry_is_folded_by_another_stream_without_waiting(device):
     with torch.cuda.stream(side):
         _append_evicted_masked(state, *_masked_arrays([(0, 21), (1, 22)], 8, device))
     side.synchronize()
-    _resolve_pending_evicted(state, block=False)
+    _resolve_pending_evicted(state)
     assert not state.evicted_pending
     torch.cuda.synchronize()
     assert _chunk_keys(state, 0) == [21] and _chunk_keys(state, 1) == [22]

@@ -53,11 +53,11 @@ def _device():
     return torch.device("cuda", torch.cuda.current_device())
 
 
-def _options(dim, capacity, bucket, evict, strategy, retain):
+def _options(dim, capacity, bucket, evict, strategy, retain, key_type=torch.int64):
     dynamicemb = _need("dynamicemb")
     config = _need("dynamicemb.dynamicemb_config")
     return config.DynamicEmbTableOptions(
-        index_type=torch.int64,
+        index_type=key_type,
         embedding_dtype=torch.float32,
         device_id=torch.cuda.current_device(),
         dim=dim,
@@ -76,9 +76,18 @@ def _options(dim, capacity, bucket, evict, strategy, retain):
     )
 
 
+def _keys(values, key_type, device):
+    """A key tensor of ``key_type`` for small non-negative numbers."""
+    return torch.tensor(values, dtype=torch.int64, device=device).view(key_type)
+
+
+def _bits(keys):
+    return keys.view(torch.int64) if keys.dtype == torch.uint64 else keys
+
+
 def _cache_value(keys, dim, device):
-    """What the cache holds for each of ``keys`` (an int64 tensor): ``key + column / 16``."""
-    base = keys.to(device=device, dtype=torch.float32).unsqueeze(1)
+    """What the cache holds for each of ``keys``: ``key + column / 16``."""
+    base = _bits(keys).to(device=device, dtype=torch.float32).unsqueeze(1)
     return base + torch.arange(dim, dtype=torch.float32, device=device) / 16
 
 
@@ -86,7 +95,7 @@ def _storage_value(keys, dim, device):
     return -_cache_value(keys, dim, device)
 
 
-def _pair(retain=False, dim=8):
+def _pair(retain=False, dim=8, key_type=torch.int64):
     """A cache over a storage, as the module builds them, with known contents.
 
     Table 0: the cache holds keys 1..1024, each pinned (a prefetched batch holds it), so
@@ -110,6 +119,7 @@ def _pair(retain=False, dim=8):
                 config.DynamicEmbEvictStrategy.LRU,
                 dynamicemb.DynamicEmbScoreStrategy.TIMESTAMP,
                 False,
+                key_type,
             )
             for _ in range(2)
         ],
@@ -124,6 +134,7 @@ def _pair(retain=False, dim=8):
                 config.DynamicEmbEvictStrategy.LRU,
                 dynamicemb.DynamicEmbScoreStrategy.TIMESTAMP,
                 retain,
+                key_type,
             )
             for _ in range(2)
         ],
@@ -140,8 +151,8 @@ def _pair(retain=False, dim=8):
         1: [k for k in cache_keys[1] if k % 3 != 0] + [9100, 9101],
     }
     for table in (0, 1):
-        keys = torch.tensor(in_storage[table], dtype=torch.int64, device=device)
-        tids = torch.full_like(keys, table)
+        keys = _keys(in_storage[table], key_type, device)
+        tids = torch.full(keys.shape, table, dtype=torch.int64, device=device)
         storage.insert(keys, tids, _storage_value(keys, dim, device))
     for table, pin in ((0, True), (1, False)):
         # the pinned keys first, so that the others find the bucket full
@@ -149,8 +160,8 @@ def _pair(retain=False, dim=8):
         for group in groups:
             if not group:
                 continue
-            keys = torch.tensor(group, dtype=torch.int64, device=device)
-            tids = torch.full_like(keys, table)
+            keys = _keys(group, key_type, device)
+            tids = torch.full(keys.shape, table, dtype=torch.int64, device=device)
             indices = cache.insert_and_evict(keys, tids)[0]
             kvt.store_to_flat(
                 cache._state, indices, tids, _cache_value(keys, dim, device)
@@ -213,11 +224,45 @@ def test_the_scenario_reaches_the_overflow(gpu, retain):
     assert len(seen) == 1024 + 50
 
 
+@pytest.mark.parametrize("key_type", [torch.int64, torch.uint64])
+def test_the_tails_of_a_masked_export_are_inert(gpu, monkeypatch, key_type):
+    """Past the count a batch has the reserved key, score 0 and slot -1, whatever the export
+    kernel left in its buffers (they are uninitialised): valid-looking keys, scores and
+    slots are written there, and the arrays still come out inert, so that a consumer can
+    treat them as any padded array of the step path."""
+    scored = _need("dynamicemb.scored_hashtable")
+    cache, _, _ = _pair(key_type=key_type)
+    table = cache._state.key_index_map
+    real = scored.table_export_batch
+
+    def scribbling(*args, **kwargs):
+        counter, keys, score, indices = real(*args, **kwargs)
+        n = int(counter)
+        _bits(keys)[n:] = 77
+        score[n:] = 99
+        indices[n:] = 5
+        return counter, keys, score, indices
+
+    monkeypatch.setattr(scored, "table_export_batch", scribbling)
+    seen = 0
+    for count, keys, score, slots in table._export_batches_masked(0, 128):
+        n = int(count)
+        seen += n
+        assert keys.dtype == key_type
+        bits = _bits(keys)
+        assert bool((bits[n:] == -1).all()), "the reserved key"
+        assert bool((score[n:] == 0).all())
+        assert bool((slots[n:] == -1).all())
+        assert bool((bits[:n] != -1).all()) and bool((slots[:n] >= 0).all())
+    assert seen == 1024 + 50
+
+
+@pytest.mark.parametrize("key_type", [torch.int64, torch.uint64])
 @pytest.mark.parametrize("retain", [False, True])
-def test_the_flush_leaves_the_storage_as_the_exact_flush_does(gpu, retain):
+def test_the_flush_leaves_the_storage_as_the_exact_flush_does(gpu, retain, key_type):
     kvt = _need("dynamicemb.key_value_table")
-    cache, storage, cache_keys = _pair(retain)
-    ref_cache, ref_storage, _ = _pair(retain)
+    cache, storage, cache_keys = _pair(retain, key_type=key_type)
+    ref_cache, ref_storage, _ = _pair(retain, key_type=key_type)
     before = _contents(storage, 0, 8)
 
     kvt.flush_cache(cache, storage)
@@ -298,14 +343,16 @@ def small_batches(monkeypatch):
     return 64
 
 
-def test_a_flush_waits_for_nothing(gpu, count_syncs, small_batches):
+def test_a_flush_waits_for_nothing(gpu, count_syncs, instruments_ok, small_batches):
     kvt = _need("dynamicemb.key_value_table")
     cache, storage, _ = _pair()
     count = count_syncs(lambda i: kvt.flush_cache(cache, storage))
     assert count.blocking == 0, count.describe()
 
 
-def test_a_flush_of_an_empty_cache_waits_for_nothing(gpu, count_syncs, small_batches):
+def test_a_flush_of_an_empty_cache_waits_for_nothing(
+    gpu, count_syncs, instruments_ok, small_batches
+):
     kvt = _need("dynamicemb.key_value_table")
     cache, storage, _ = _pair()
     cache.reset()
@@ -314,7 +361,7 @@ def test_a_flush_of_an_empty_cache_waits_for_nothing(gpu, count_syncs, small_bat
 
 
 def test_a_storage_that_retains_evictions_costs_a_wait_per_ring_of_batches(
-    gpu, count_syncs, small_batches
+    gpu, count_syncs, instruments_ok, small_batches
 ):
     """Its entries keep their arrays until their counts land, so the flush waits for the
     newest count once in ``retain_ring.slots`` batches: an explicit call may, and the

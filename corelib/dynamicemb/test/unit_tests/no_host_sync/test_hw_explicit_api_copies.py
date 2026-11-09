@@ -36,8 +36,8 @@ call that waits for the device shows up as a call that takes about a second):
   arrives is the host tensor, also when the host tensor is overwritten right after;
 * ``sync_free.pull_to_host`` waits for the work queued before it, and for nothing else;
 * a ring of two staging buffers waits for a buffer when the device is still busy with the
-  transfer two uploads back: the floor that load and replay state (a wait at most once a
-  ring turn while the device is the bottleneck, none while the host is).
+  transfer two uploads back: the floor that load and replay state (about one wait per
+  upload while the device is the bottleneck, none while the host is).
 """
 
 import importlib

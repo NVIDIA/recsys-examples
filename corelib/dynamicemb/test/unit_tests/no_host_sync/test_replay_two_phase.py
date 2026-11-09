@@ -59,7 +59,7 @@ def _device():
     return torch.device("cuda", torch.cuda.current_device())
 
 
-def _storage(optimizer="adam"):
+def _storage(optimizer="adam", key_type=torch.int64):
     dynamicemb = _need("dynamicemb")
     config = _need("dynamicemb.dynamicemb_config")
     opt = _need("dynamicemb.optimizer")
@@ -70,7 +70,7 @@ def _storage(optimizer="adam"):
     }[optimizer]
     options = [
         config.DynamicEmbTableOptions(
-            index_type=torch.int64,
+            index_type=key_type,
             embedding_dtype=torch.float32,
             device_id=torch.cuda.current_device(),
             dim=DIM,
@@ -87,18 +87,27 @@ def _storage(optimizer="adam"):
     return kvt.DynamicEmbStorage(options, optimizer_cls(opt.OptimizerArgs()))
 
 
-def _fill(storage, num_keys, seed):
-    """``num_keys`` random keys with random values (the optimizer state included)."""
+def _numbers(values, key_type):
+    """The numbers the int64 bit patterns of a delta's keys stand for in ``key_type``."""
+    return [v & ((1 << 64) - 1) if key_type == torch.uint64 else v for v in values]
+
+
+def _fill(storage, num_keys, seed, key_type=torch.int64):
+    """``num_keys`` random keys with random values (the optimizer state included). With a
+    uint64 table half of the keys are above ``2**63``, whose int64 bit pattern is negative:
+    they come after the others as unsigned numbers."""
     device = _device()
-    rng = random.Random(seed)
-    keys = torch.tensor(
-        rng.sample(range(1, 1 << 40), num_keys), dtype=torch.int64, device=device
-    )
+    numbers = random.Random(seed).sample(range(1, 1 << 40), num_keys)
+    if key_type == torch.uint64:
+        numbers = [v | (1 << 63) if v % 2 else v for v in numbers]
+    bits = [v - (1 << 64) if v >= (1 << 63) else v for v in numbers]
+    keys = torch.tensor(bits, dtype=torch.int64, device=device).view(key_type)
     values = torch.randn(num_keys, storage._state.value_dim, device=device)
     scores = torch.as_tensor(
         list(range(1, num_keys + 1)), dtype=torch.uint64, device=device
     )
-    storage.insert(keys, torch.zeros_like(keys), values, scores=scores)
+    table_ids = torch.zeros(num_keys, dtype=torch.int64, device=device)
+    storage.insert(keys, table_ids, values, scores=scores)
     torch.cuda.synchronize()
 
 
@@ -135,11 +144,14 @@ def _contents(storage):
     return out
 
 
-def test_the_keys_in_their_slot_keep_their_state_and_the_others_start_over(gpu):
+@pytest.mark.parametrize("key_type", [torch.int64, torch.uint64])
+def test_the_keys_in_their_slot_keep_their_state_and_the_others_start_over(
+    gpu, key_type
+):
     kvt = _need("dynamicemb.key_value_table")
     device = _device()
-    source, target = _storage(), _storage()
-    _fill(source, 3000, 1)
+    source, target = _storage(key_type=key_type), _storage(key_type=key_type)
+    _fill(source, 3000, 1, key_type)
     keys, values, opt, scores, slot_index = delta = _delta(source)
     n = keys.numel()
     half = n // 2
@@ -179,12 +191,13 @@ def test_the_keys_in_their_slot_keep_their_state_and_the_others_start_over(gpu):
             ), "a key that took the slot starts over"
 
 
-def test_a_key_that_cannot_be_placed_raises_before_anything_is_written(gpu):
+@pytest.mark.parametrize("key_type", [torch.int64, torch.uint64])
+def test_a_key_that_cannot_be_placed_raises_before_anything_is_written(gpu, key_type):
     """The failing key is in the second of two batches: the first batch's rows and values
     must not have been written either."""
     _need("dynamicemb.key_value_table")
-    source, target = _storage(), _storage()
-    _fill(source, 400, 2)
+    source, target = _storage(key_type=key_type), _storage(key_type=key_type)
+    _fill(source, 400, 2, key_type)
     keys, values, opt, scores, slot_index = _delta(source)
     n = keys.numel()
     state = target._state
@@ -200,9 +213,15 @@ def test_a_key_that_cannot_be_placed_raises_before_anything_is_written(gpu):
     values_before = state.tables[0].tensor().clone()
     torch.cuda.synchronize()
 
-    with pytest.raises(RuntimeError, match=r"1 of %d keys could not be written" % n):
+    with pytest.raises(
+        RuntimeError, match=r"1 of %d keys could not be written" % n
+    ) as raised:
         _replay(target, (keys, values, opt, scores, bad), "ALL")
     torch.cuda.synchronize()
+    # the key it names is the key, not its int64 bit pattern
+    assert "(e.g. key %d)" % _numbers([int(keys[victim])], key_type)[0] in str(
+        raised.value
+    )
 
     assert torch.equal(kim.rows_, rows_before), "no key was given a row"
     assert torch.equal(kim.row_counters_, counters_before)
@@ -212,8 +231,32 @@ def test_a_key_that_cannot_be_placed_raises_before_anything_is_written(gpu):
     assert stats.upserted == n
 
 
+@pytest.mark.parametrize("case", ["none", "wide"])
+def test_a_delta_the_host_can_tell_is_wrong_places_no_key(gpu, case):
+    """An optimizer state that the delta lacks, or that is not as wide as the table's rows,
+    is an error that needs no device: it is raised before the first key is placed, not after
+    every batch has put its keys in the key map."""
+    source, target = _storage(), _storage()
+    _fill(source, 400, 5)
+    keys, values, opt, scores, slot_index = _delta(source)
+    block = None if case == "none" else torch.cat([opt, opt[:, :1]], dim=1)
+    target._state.threads_in_wave = keys.numel() // 3  # a few batches
+
+    with pytest.raises(ValueError, match="optimizer"):
+        _replay(target, (keys, values, block, scores, slot_index), "ALL")
+    torch.cuda.synchronize()
+
+    assert _contents(target) == {}, "a key was placed before the error was raised"
+    # the same delta with its state goes through on the same target
+    assert _replay(target, (keys, values, opt, scores, slot_index), "ALL").upserted == (
+        keys.numel()
+    )
+
+
 @pytest.mark.parametrize("batches", [1, 16])
-def test_a_replay_waits_once_however_many_batches_it_has(gpu, count_syncs, batches):
+def test_a_replay_waits_once_however_many_batches_it_has(
+    gpu, count_syncs, instruments_ok, batches
+):
     source, target = _storage(), _storage()
     _fill(source, 3200, 3)
     delta = _delta(source)
@@ -226,29 +269,33 @@ def test_a_replay_waits_once_however_many_batches_it_has(gpu, count_syncs, batch
     )
     # the one read of the placement, and the staging rings' back-pressure: a wait for a
     # buffer when the device is still busy with the transfer two batches back, which a
-    # device that keeps up never makes (so a quarter of the ring turns is a generous bound)
+    # device that keeps up never makes; a device that is the slower side makes it about once
+    # a batch, and this test is host-bound on purpose (so a quarter of the batches is generous)
     assert count.blocking <= 1.0 + batches // 4, count.describe()
 
 
-def _erase_fixture(count):
-    storage = _storage("sgd")
-    _fill(storage, count, 4)
+def _erase_fixture(count, key_type=torch.int64):
+    storage = _storage("sgd", key_type)
+    _fill(storage, count, 4, key_type)
     keys, _, slot_index, _, _ = storage.incremental_dump(0, 0, None)
     return storage, keys, slot_index
 
 
-def test_erase_keys_returns_the_count_and_retains_what_was_there(gpu):
+@pytest.mark.parametrize("key_type", [torch.int64, torch.uint64])
+def test_erase_keys_returns_the_count_and_retains_what_was_there(gpu, key_type):
     config = _need("dynamicemb.dynamicemb_config")
-    storage, keys, slot_index = _erase_fixture(600)
+    storage, keys, slot_index = _erase_fixture(600, key_type)
     present = keys[:200].tolist()
     asked = torch.tensor(
         present + [(1 << 41) + i for i in range(50)], dtype=torch.int64
-    )
+    ).view(key_type)
 
     removed = storage.erase_keys(0, asked, mode=config.EvictedItemMode.RETAIN_KEY)
 
     assert removed == 200
-    assert storage.pop_erased_keys(0).tolist() == sorted(present)
+    popped = storage.pop_erased_keys(0)
+    assert popped.dtype == key_type
+    assert popped.tolist() == sorted(_numbers(present, key_type))
     by_key = {k: tuple(s) for k, s in zip(keys.tolist(), slot_index.tolist())}
     got = storage.pop_erased_slot_index(0).tolist()
     assert sorted(map(tuple, got)) == sorted(
@@ -260,7 +307,7 @@ def test_erase_keys_returns_the_count_and_retains_what_was_there(gpu):
 
 
 @pytest.mark.parametrize("retain", [False, True])
-def test_erase_keys_waits_once(gpu, count_syncs, retain):
+def test_erase_keys_waits_once(gpu, count_syncs, instruments_ok, retain):
     """The count it returns is the one wait. Each measured call puts the keys back first
     (an insert, which waits for nothing), so that each call really removes them."""
     config = _need("dynamicemb.dynamicemb_config")

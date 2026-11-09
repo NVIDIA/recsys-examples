@@ -1743,11 +1743,12 @@ class LinearBucketTable(ScoredHashTable):
         device that the export kernel filled, and the first ``count`` entries of the other
         three are the batch's keys (in the table's key type), their first score word
         (int64) and the table-relative slots they sit in (an overflow slot is past
-        ``per_table_capacity_[table_id]``, as in the other export). Past ``count`` the
-        keys and scores are whatever the buffers held: only ``slots`` is made inert
-        (``-1``), so that a kernel that skips a negative slot never reads the rest. A
-        caller either masks the keys with the slots (``sf.mask_keys``), or copies the
-        first ``count`` entries once the count has reached the host.
+        ``per_table_capacity_[table_id]``, as in the other export). The rest of the three
+        is inert, as in every padded array of the step path: the reserved key, score 0 and
+        slot ``-1`` (the export kernel's buffers are uninitialised past the count, and a
+        kernel that is handed a key with a table id would take it for a real one). So a
+        caller can use the arrays as they are, or copy the first ``count`` entries once the
+        count has reached the host.
 
         Nothing here waits for the device; ``count`` is the one thing a caller has to
         read, and a pipelined one can read it for the next batch while it copies this one
@@ -1801,7 +1802,12 @@ class LinearBucketTable(ScoredHashTable):
                     < counter
                 )
                 slots = indices if slot_offset == 0 else indices + slot_offset
-                yield counter, keys, score, torch.where(live, slots, -1)
+                yield (
+                    counter,
+                    sf.mask_keys(keys, live),
+                    torch.where(live, score, 0),
+                    torch.where(live, slots, -1),
+                )
                 offset += batch_size
 
     def dump(

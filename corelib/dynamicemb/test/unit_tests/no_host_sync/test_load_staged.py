@@ -34,6 +34,7 @@ growth path's).
 
 import importlib
 import random
+import types
 
 import pytest
 
@@ -88,6 +89,39 @@ def test_the_owner_of_a_key_is_the_same_on_the_host_the_device_and_in_the_book(
     assert host.tolist() == book
 
 
+def test_a_checkpoint_reads_the_device_clock_only_where_a_score_is_a_timestamp(
+    gpu, monkeypatch
+):
+    """The ages of a recency score are taken against the device clock, which is a wait for
+    the device: a checkpoint of tables that score by frequency or by the user's numbers
+    reads none, and a storage that is not one of the in-tree ones is given the clock
+    whatever the tables are, because it may look at it."""
+    module = _need("dynamicemb.batched_dynamicemb_tables")
+    kvt = _need("dynamicemb.key_value_table")
+    config = _need("dynamicemb.dynamicemb_config")
+    reads = []
+    monkeypatch.setattr(module, "device_timestamp", lambda: reads.append(1) or 12345)
+
+    def tables(storage_class, *strategies):
+        return types.SimpleNamespace(
+            _storage=object.__new__(storage_class),
+            _dynamicemb_options=[
+                types.SimpleNamespace(evict_strategy=s) for s in strategies
+            ],
+        )
+
+    class Foreign:  # a user's storage
+        pass
+
+    clock = module.BatchedDynamicEmbeddingTablesV2._checkpoint_timestamp
+    lru, lfu = config.DynamicEmbEvictStrategy.LRU, config.DynamicEmbEvictStrategy.LFU
+    for storage_class in (kvt.DynamicEmbStorage, kvt.HybridStorage):
+        assert clock(tables(storage_class, lfu, lfu)) == 0 and not reads
+        assert clock(tables(storage_class, lfu, lru)) == 12345 and len(reads) == 1
+        reads.clear()
+    assert clock(tables(Foreign, lfu)) == 12345 and len(reads) == 1
+
+
 def _write(path, tensor):
     with open(path, "wb") as f:
         f.write(tensor.numpy().tobytes())
@@ -122,7 +156,7 @@ def _checkpoint(tmp_path, keys, num_scores=1, opt_dim=0, seed=0):
 
 @pytest.mark.parametrize("shard, num_shards", [(0, 1), (0, 2), (1, 2), (2, 3)])
 def test_the_owned_keys_of_a_file_are_counted_on_the_host(
-    gpu, count_syncs, tmp_path, shard, num_shards
+    gpu, count_syncs, instruments_ok, tmp_path, shard, num_shards
 ):
     kvt = _need("dynamicemb.key_value_table")
     keys = _random_keys(3 * BATCH // 2, 2)
@@ -192,10 +226,12 @@ def test_the_batches_of_a_checkpoint_are_the_rows_this_shard_owns(
 
 
 def test_reading_the_batches_waits_for_the_device_at_most_for_a_buffer(
-    gpu, count_syncs, tmp_path
+    gpu, count_syncs, instruments_ok, tmp_path
 ):
     """Nothing is waited for but a staging buffer, and only when the device is still busy
-    with the transfer of the batch two before: at most once a ring turn."""
+    with the transfer of the batch two before. That is about once per batch when the device
+    is the slower side and never when the host is, which it is here (it reads the files and
+    filters them while the device takes the previous batch): one wait at most."""
     kvt = _need("dynamicemb.key_value_table")
     keys = _random_keys(3 * BATCH, 4)
     paths, _ = _checkpoint(tmp_path, keys)
@@ -389,7 +425,9 @@ def _load_cost(directory, num_keys, count_syncs):
     )
 
 
-def test_the_waits_of_a_load_do_not_grow_with_its_batches(gpu, count_syncs, tmp_path):
+def test_the_waits_of_a_load_do_not_grow_with_its_batches(
+    gpu, count_syncs, instruments_ok, tmp_path
+):
     """4 batches of keys against 1: what a load costs besides its batches (the exact size
     confirmation of the growth path, once) is in both numbers, and the batches add at most
     the ring's back-pressure waits. The load used to add about nine a batch."""

@@ -312,7 +312,9 @@ def test_pop_many_of_some_tables_leaves_the_others(gpu):
     assert storage.pop_many("pop_evicted_keys", []) == {}
 
 
-def test_pop_many_with_nothing_retained_is_empty_and_does_not_wait(gpu, count_syncs):
+def test_pop_many_with_nothing_retained_is_empty_and_does_not_wait(
+    gpu, count_syncs, instruments_ok
+):
     storage = _storage(2)
     count = count_syncs(lambda i: storage.pop_many("pop_evicted_keys", [0, 1]))
     assert count.blocking == 0, count.describe()
@@ -344,7 +346,7 @@ def test_pending_entries_of_another_stream_are_popped_in_order(gpu):
     assert {t: set(v.tolist()) for t, v in got.items()} == expected
 
 
-def test_a_full_ring_costs_the_pop_nothing_more(gpu, count_syncs):
+def test_a_full_ring_costs_the_pop_nothing_more(gpu, count_syncs, instruments_ok):
     """Entries that never got a ring slot used to need a read of their own."""
     sf = _need("dynamicemb.sync_free")
     kvt = _need("dynamicemb.key_value_table")
@@ -409,7 +411,7 @@ def _module(num_tables, retain=True):
 
 @pytest.mark.parametrize("num_tables", [2, 8])
 def test_a_module_pop_waits_twice_however_many_tables_there_are(
-    gpu, count_syncs, num_tables
+    gpu, count_syncs, instruments_ok, num_tables
 ):
     kvt = _need("dynamicemb.key_value_table")
     device = _device()
