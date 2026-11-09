@@ -178,6 +178,16 @@ std::vector<at::Tensor> bucketize_keys(at::Tensor keys, at::Tensor table_ids,
                                        int64_t num_buckets,
                                        int64_t bucket_capacity);
 
+// The sort of bucketize_keys without its read back: returns (sorted keys,
+// inverse, segment of every sorted position), where the segment is the key's home
+// bucket, or num_buckets for a key that takes no part in an insert. Nothing is
+// compacted, so no shape depends on the data (see bucketize.cu).
+std::vector<at::Tensor> bucketize_keys_segmented(at::Tensor keys,
+                                                 at::Tensor table_ids,
+                                                 at::Tensor table_bucket_offsets,
+                                                 int64_t num_buckets,
+                                                 int64_t bucket_capacity);
+
 void table_update_counter_with_layout(
     at::Tensor counter, at::Tensor slot_indices, int32_t delta,
     at::Tensor table_bucket_offsets, int64_t bucket_capacity,

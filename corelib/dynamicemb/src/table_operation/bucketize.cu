@@ -62,6 +62,11 @@ struct BucketizeOutput {
 
   __host__ __device__ __forceinline__ void
   operator()(ComposeKey *compose_keys, IndexType tid, IndexType segment_id) {
+    // A key of a table without buckets that is the last table is sent by
+    // BucketizeFunctor to segment num_buckets, one past the arrays below.
+    if (segment_id >= num_buckets) {
+      return;
+    }
     if (tid + 1 < batch) {
       if (compose_keys[tid + 1].segment_id != segment_id) {
         buckets_end[segment_id] = tid + 1;
@@ -73,6 +78,7 @@ struct BucketizeOutput {
     }
   }
   int64_t batch;
+  int64_t num_buckets;
   bool *__restrict__ mask;
   int64_t *__restrict__ buckets_end;
 };
@@ -108,6 +114,56 @@ __global__ void decompose_segmented_key_kernel(
     ComposeKey compose = compose_keys[tid];
     keys[tid] = compose.key;
     out_func(compose_keys, tid, compose.segment_id);
+  }
+}
+
+// The segment a key sorts into for the sorted insert: its home bucket, or
+// `num_buckets` ("no bucket", sorted after every real one) for a key that takes
+// no part in an insert: a reserved key (the padding of an N-aligned batch, whose
+// table id is -1 and is not read), a key of a table that does not exist, or a
+// key of a table without buckets. The home bucket is the arithmetic of the table
+// kernels (insert_body): bkt_begin + (hash % table_cap) / bucket_capacity.
+template <typename KeyType, typename IndexType, typename BucketType>
+struct SortedSegmentFunctor {
+
+  __device__ __forceinline__ IndexType operator()(KeyType key, IndexType pos) {
+    if (!BucketType::is_valid(key)) {
+      return static_cast<IndexType>(num_buckets);
+    }
+    int64_t t_id = table_ids[pos];
+    if (t_id < 0 || t_id >= num_tables) {
+      return static_cast<IndexType>(num_buckets);
+    }
+    int64_t bkt_begin = table_bucket_offsets[t_id];
+    int64_t table_cap =
+        (table_bucket_offsets[t_id + 1] - bkt_begin) * bucket_capacity;
+    if (table_cap <= 0) {
+      return static_cast<IndexType>(num_buckets);
+    }
+    int64_t hashcode = BucketType::hash(key);
+    return static_cast<IndexType>(bkt_begin +
+                                  (hashcode % table_cap) / bucket_capacity);
+  }
+  int64_t const *__restrict__ table_ids;
+  int64_t const *__restrict__ table_bucket_offsets;
+  int64_t bucket_capacity;
+  int64_t num_tables;
+  int64_t num_buckets;
+};
+
+// Sorted compose keys -> the keys and their segment ids, as two plain arrays.
+template <typename KeyType, typename IndexType, typename ComposeKey>
+__global__ void split_segmented_key_kernel(
+    int64_t const num_total, ComposeKey const *__restrict__ compose_keys,
+    KeyType *__restrict__ keys, IndexType *__restrict__ segments) {
+
+  int64_t tid = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  int64_t const stride = static_cast<int64_t>(gridDim.x) * blockDim.x;
+
+  for (; tid < num_total; tid += stride) {
+    ComposeKey compose = compose_keys[tid];
+    keys[tid] = compose.key;
+    segments[tid] = compose.segment_id;
   }
 }
 
@@ -209,7 +265,7 @@ std::vector<at::Tensor> bucketize_keys(at::Tensor keys, at::Tensor table_ids,
 
     // 3. decompose sorted keys
     using SegmentOutput = BucketizeOutput<KeyType, IndexType, ComposeKey>;
-    SegmentOutput out_func{num_total, mask_, buckets_end_};
+    SegmentOutput out_func{num_total, num_buckets, mask_, buckets_end_};
     auto keys_out_ = get_pointer<KeyType>(keys_out);
     decompose_segmented_key_kernel<KeyType, IndexType, ComposeKey,
                                    SegmentOutput>
@@ -230,6 +286,99 @@ std::vector<at::Tensor> bucketize_keys(at::Tensor keys, at::Tensor table_ids,
   result.push_back(inverse);
   DEMB_CUDA_KERNEL_LAUNCH_CHECK();
   return result;
+}
+
+// The sort of bucketize_keys for the sorted insert: the same compose and the
+// same radix sort, so the keys of one bucket come out in the same order, but
+// nothing is compacted and nothing is read back. Returns
+//   {sorted_keys [N] (the dtype of keys), inverse [N] int64, segments [N] int64}
+// with sorted_keys[j] = keys[inverse[j]], and segments[j] the global bucket of
+// that key, or num_buckets for a key that takes no part (a reserved key, a key of
+// a table that does not exist or has no buckets; see SortedSegmentFunctor): those
+// sort after all the others. segments is non-decreasing, the keys of one segment
+// ascend (signed for int64 keys, unsigned for uint64 ones) and equal keys of one
+// segment keep their input order. num_buckets is the bucket count of the table
+// (table_bucket_offsets[-1]), which the caller knows: no shape here depends on
+// the data, and there is no read back.
+std::vector<at::Tensor>
+bucketize_keys_segmented(at::Tensor keys, at::Tensor table_ids,
+                         at::Tensor table_bucket_offsets, int64_t num_buckets,
+                         int64_t bucket_capacity) {
+
+  int64_t num_total = keys.size(0);
+  TORCH_CHECK(num_buckets >= 0, "num_buckets must be non-negative");
+  TORCH_CHECK(bucket_capacity > 0, "bucket_capacity must be positive");
+  TORCH_CHECK(table_ids.scalar_type() == at::kLong &&
+                  table_bucket_offsets.scalar_type() == at::kLong,
+              "table_ids and table_bucket_offsets must be int64");
+  TORCH_CHECK(table_ids.numel() >= num_total,
+              "table_ids must have an entry for every key");
+
+  auto i64 = at::TensorOptions().dtype(at::kLong).device(keys.device());
+  if (num_total == 0) {
+    return {at::empty_like(keys), at::empty(0, i64), at::empty(0, i64)};
+  }
+
+  int64_t num_tables = table_bucket_offsets.numel() - 1;
+  auto natural = at::arange(0, num_total, i64);
+  auto inverse = at::empty(num_total, i64);
+  auto segments = at::empty(num_total, i64);
+  auto keys_out = at::empty_like(keys);
+
+  auto key_type = get_data_type(keys);
+
+  auto stream = at::cuda::getCurrentCUDAStream().stream();
+
+  constexpr int BLOCK_SIZE = 256;
+
+  using IndexType = int64_t;
+
+  DISPATCH_KEY_TYPE(key_type, KeyType, [&] {
+    using Bucket = LinearBucket<KeyType>;
+    using ComposeKey = SegmentedKey<KeyType, IndexType>;
+    using SegmentFunc = SortedSegmentFunctor<KeyType, IndexType, Bucket>;
+
+    // 1.  compose keys
+    SegmentFunc func{get_pointer<IndexType>(table_ids),
+                     get_pointer<IndexType>(table_bucket_offsets),
+                     bucket_capacity, num_tables, num_buckets};
+    auto compose_keys_in = at::empty(
+        {num_total * static_cast<int64_t>(sizeof(ComposeKey))},
+        at::TensorOptions().dtype(torch::kChar).device(keys.device()));
+    auto compose_keys_in_ = get_pointer<ComposeKey>(compose_keys_in);
+
+    compose_segmented_key_kernel<KeyType, IndexType, ComposeKey, SegmentFunc>
+        <<<(num_total + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE, 0, stream>>>(
+            num_total, get_pointer<KeyType>(keys), compose_keys_in_, func);
+
+    // 2. sort compose keys(segment, key)
+    uint64_t cub_sort_temp_bytes_ = 0;
+    cub::DeviceRadixSort::SortPairs<ComposeKey, IndexType>(
+        nullptr, cub_sort_temp_bytes_, nullptr, nullptr, nullptr, nullptr,
+        num_total, ComposeKey::Decomposer{}, 0, sizeof(ComposeKey) * 8);
+    auto cub_sort_temp_buffer_ = at::empty(
+        {static_cast<int64_t>(cub_sort_temp_bytes_)},
+        at::TensorOptions().dtype(torch::kChar).device(keys.device()));
+    auto compose_keys_out = at::empty(
+        {num_total * static_cast<int64_t>(sizeof(ComposeKey))},
+        at::TensorOptions().dtype(torch::kChar).device(keys.device()));
+    auto compose_keys_out_ = get_pointer<ComposeKey>(compose_keys_out);
+
+    cub::DeviceRadixSort::SortPairs<ComposeKey, IndexType>(
+        cub_sort_temp_buffer_.data_ptr(), cub_sort_temp_bytes_,
+        compose_keys_in_, compose_keys_out_, get_pointer<IndexType>(natural),
+        get_pointer<IndexType>(inverse), num_total, ComposeKey::Decomposer{}, 0,
+        sizeof(ComposeKey) * 8, stream);
+
+    // 3. split the sorted compose keys into keys and segments
+    split_segmented_key_kernel<KeyType, IndexType, ComposeKey>
+        <<<(num_total + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE, 0, stream>>>(
+            num_total, compose_keys_out_, get_pointer<KeyType>(keys_out),
+            get_pointer<IndexType>(segments));
+  });
+
+  DEMB_CUDA_KERNEL_LAUNCH_CHECK();
+  return {keys_out, inverse, segments};
 }
 
 } // namespace dyn_emb

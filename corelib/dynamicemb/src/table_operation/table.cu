@@ -199,6 +199,14 @@ void bind_table_operation(py::module &m) {
         py::arg("keys"), py::arg("table_ids"), py::arg("table_bucket_offsets"),
         py::arg("num_buckets"), py::arg("bucket_capacity"));
 
+  m.def("bucketize_keys_segmented", &dyn_emb::bucketize_keys_segmented,
+        "sort keys by (home bucket, key) and return (sorted keys, inverse "
+        "indices, the segment of every sorted position: its home bucket, or "
+        "num_buckets for a key that takes no part in an insert). Reads nothing "
+        "back, so no shape depends on the data.",
+        py::arg("keys"), py::arg("table_ids"), py::arg("table_bucket_offsets"),
+        py::arg("num_buckets"), py::arg("bucket_capacity"));
+
   m.def("table_update_counter_with_layout",
         &dyn_emb::table_update_counter_with_layout,
         "update counters at per-table slot indices (conversion done in kernel)",

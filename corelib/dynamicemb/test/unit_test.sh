@@ -54,6 +54,7 @@ FWD_BWD_TEST_FILES=(
     "test/unit_tests/no_host_sync/test_sync_free_lint.py"
     "test/unit_tests/no_host_sync/test_sync_free_helpers.py"
     "test/unit_tests/no_host_sync/test_tail_invariants.py"
+    "test/unit_tests/no_host_sync/test_sorted_insert_syncs.py"
     "test/unit_tests/no_host_sync/test_sync_ratchet.py"
     "test/unit_tests/no_host_sync/test_no_host_syncs.py"
 )
