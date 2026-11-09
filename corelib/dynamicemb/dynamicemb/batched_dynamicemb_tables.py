@@ -71,11 +71,11 @@ from dynamicemb.dynamicemb_config import (
 from dynamicemb.initializer import MultiTableInitializer
 from dynamicemb.key_ownership import owned_key_mask, owned_keys
 from dynamicemb.key_value_table import (
+    ERASE_CHUNK_SLOTS,
+    ERASE_MAX_CHUNKS_IN_FLIGHT,
     Cache,
     DynamicEmbCache,
     DynamicEmbStorage,
-    ERASE_CHUNK_SLOTS,
-    ERASE_MAX_CHUNKS_IN_FLIGHT,
     HybridStorage,
     Storage,
     flush_cache,
@@ -1399,6 +1399,13 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
             pooling_weights,
             self._empty_tensor,
         )
+        # Grad-mode forwards keep their slot pins until backward. Without an
+        # autograd graph, release on this stream after the gather consumed them.
+        if not res.requires_grad and prefetch_state.slot_indices is not None:
+            counter_owner = self._cache if self._cache is not None else self._storage
+            counter_owner.decrement_counter(
+                prefetch_state.slot_indices, prefetch_state.unique_table_ids
+            )
         if isinstance(self._cache, DynamicEmbCache):
             self._cache.training = False
         if isinstance(self._storage, (DynamicEmbStorage, HybridStorage)):
