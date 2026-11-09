@@ -180,6 +180,9 @@ class EraseHandle:
         future: "Future[Optional[torch.Tensor]]",
         event: Optional[torch.cuda.Event],
     ) -> None:
+        # The future's value is the pinned host tensor ``[erased, spared]`` that the
+        # worker copied back on the erase stream before it recorded ``event`` (see
+        # ``AsyncEraser.submit``); ``None`` for work that had nothing to do.
         self._future = future
         self._event = event
         self._result: Optional[Tuple[int, int]] = None
@@ -212,6 +215,13 @@ class EraseHandle:
         Blocks the calling thread until the worker has launched every kernel -- an
         event that was not recorded yet orders nothing -- but not until they have
         run: that is left to the stream.
+
+        That is still a wait for the device, a paced one: the worker launches a chunk
+        only while fewer than ``max_in_flight`` are unfinished on the device, so the
+        launches end about when the scan does, less its last ``max_in_flight``
+        chunks. An explicit call that blocks by contract, like ``wait`` (which also
+        waits for those last chunks) and ``result``; none of them is for a training
+        step.
         """
         self._future.result()
         if self._event is not None:
@@ -220,14 +230,16 @@ class EraseHandle:
     def result(self) -> Tuple[int, int]:
         """``(erased, spared)``: keys removed, and keys left because a batch held them.
 
-        Blocks until the erase has finished.
+        Blocks until the erase has finished, and waits for the device once: the
+        counts were copied into pinned memory by the erase stream, ahead of the event
+        that :meth:`wait` waits for, so reading them waits for nothing more.
         """
         if self._result is None:
             self.wait()
             counts = self._future.result()
             assert counts is not None
-            erased, spared = counts.cpu().tolist()
-            self._result = (int(erased), int(spared))
+            # ``counts`` is the pinned host copy: reading it is a host read.
+            self._result = (int(counts[0]), int(counts[1]))
         return self._result
 
 
@@ -242,7 +254,9 @@ class EraseHandleGroup(EraseHandle):
     ``__init__`` and answers every question through the handles it holds.
     """
 
-    def __init__(self, handles: "list[EraseHandle]") -> None:  # noqa: super-init-not-called
+    def __init__(
+        self, handles: "list[EraseHandle]"
+    ) -> None:  # noqa: super-init-not-called
         self._handles = list(handles)
 
     def done(self) -> bool:
@@ -259,7 +273,10 @@ class EraseHandleGroup(EraseHandle):
 
     def result(self) -> Tuple[int, int]:
         results = [handle.result() for handle in self._handles]
-        return (sum(erased for erased, _ in results), sum(spared for _, spared in results))
+        return (
+            sum(erased for erased, _ in results),
+            sum(spared for _, spared in results),
+        )
 
 
 class AsyncEraser:
@@ -298,6 +315,11 @@ class AsyncEraser:
         ``counts`` is two int64 on the stream's device, zero; ``work`` adds to them
         (erased, spared) and launches, it does not wait for the device. The handle
         comes back at once.
+
+        After the work the thread copies ``counts`` into pinned host memory on the same
+        stream and only then records the event the handle waits for, so the event
+        covers the copy: ``result()`` is one wait for the device, and it reads the
+        pinned tensor, which is what the future carries.
         """
         event = torch.cuda.Event()
         device = stream.device
@@ -306,8 +328,13 @@ class AsyncEraser:
             with torch.cuda.device(device), torch.cuda.stream(stream):
                 counts = torch.zeros(2, dtype=torch.int64, device=device)
                 work(counts)
+                # Allocated on this thread, off the training thread, and handed back
+                # with the future; the host allocator keeps it from being reused
+                # before the copy has landed.
+                host = torch.empty(2, dtype=torch.int64, pin_memory=True)
+                host.copy_(counts, non_blocking=True)
                 event.record(stream)
-            return counts
+            return host
 
         return EraseHandle(self._thread().submit(run), event)
 

@@ -1956,6 +1956,13 @@ ALLOWED_NEW_HITS: List[Tuple[str, Optional[str], str]] = [
         "allocated once, never in a step; the estimated_row_counts line existed before and "
         "black joined its lines",
     ),
+    (
+        "dynamicemb/async_erase.py",
+        "pin_memory",
+        "AsyncEraser.submit: the pinned landing buffer of an erase's counts, allocated on the "
+        "worker thread (the host allocator caches it), which makes EraseHandle.result() one "
+        "wait for the device",
+    ),
 ]
 
 
@@ -1972,7 +1979,12 @@ def _allowed(hit_key: Tuple[str, str, str]) -> bool:
 # the tree. The text has to be unique enough that it does not name a line the change keeps.
 # SYNC_LINT_FINAL=1 (the last commit of the series) also wants every line that left the baseline
 # to be claimed here, so that no removal goes unreviewed.
-EXPECTED_GONE: List[Tuple[str, str, str, str]] = []
+EXPECTED_GONE: List[Tuple[str, str, str, str]] = [
+    # E10: the counts of an erase come back in pinned memory behind the event result() waits
+    # for, instead of a second, pageable copy after it
+    ("dynamicemb/async_erase.py", "cpu", "erased, spared = counts.cpu()", "E10"),
+    ("dynamicemb/async_erase.py", "tolist", "erased, spared = counts.cpu()", "E10"),
+]
 
 
 def _claim_matches(claim: Tuple[str, str, str, str], key: Tuple[str, str, str]) -> bool:

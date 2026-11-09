@@ -1392,8 +1392,8 @@ The handle (`EraseHandle`, also importable from `dynamicemb`):
 | --- | --- |
 | `done()` | Whether the erase has finished on the device. Does not block. |
 | `wait()` | Blocks the calling thread until it has finished on the device. |
-| `wait_stream(stream=None)` | Makes `stream` (default: the current one) wait for it, blocking the calling thread only until everything has been launched. |
-| `result()` | `(erased, spared)`: keys removed, and keys left because a batch held them. Blocks until it has finished. |
+| `wait_stream(stream=None)` | Makes `stream` (default: the current one) wait for it, blocking the calling thread only until everything has been launched. The thread launches a chunk only while fewer than `max_in_flight` are unfinished, so this wait is paced by the device: it lasts about as long as the scan, less its last `max_in_flight` chunks. |
+| `result()` | `(erased, spared)`: keys removed, and keys left because a batch held them. Blocks until it has finished: one wait for the device, since the counts are copied to pinned memory by the erase stream ahead of the event `wait()` waits for. |
 
 Anything the background thread raised is raised by whichever of these you call. Given a model, the call finds every dynamic embedding table in it the way `DynamicEmbDump` does and returns one handle for all of them (its `result()` adds theirs up). Everything is checked before anything starts, so an error leaves nothing erased.
 
@@ -1798,6 +1798,15 @@ Dump/Load and incremental dump is different from general module in PyTorch, beca
 So dynamicemb provides dedicated interface to load/save models' states, and provide conditional dump to support online training.
 
 Please see `DynamicEmbDump`, `DynamicEmbLoad`, `incremental_dump` in [APIs Doc](./DynamicEmb_APIs.md) for more information.
+
+### What the explicit calls wait for
+
+An API whose result is host data (a checkpoint file, a pop, a metrics read, an erase count) has to wait for the device, because the data does not exist before the device made it. What it should not do is wait several times for one piece of data: each call below waits once per call, or once per batch of a call that moves data in batches, and nothing in it waits per table, per column or per chunk.
+
+| Call | Waits for the device |
+| --- | --- |
+| `cache.cache_metrics` | once per read. Read it when the numbers are needed, not on every step; the `CACHE_DEBUG=1` hook of the examples reads it each forward and is a debugging aid. |
+| `EraseHandle.result()` | once per handle; `wait()` once; `wait_stream()` until the erase has been launched (paced by the device, see [erase_by_score_async](#erase_by_score_async)). |
 
 ## Host syncs
 

@@ -3379,6 +3379,11 @@ class DynamicEmbCache(Cache):
         reading them is where the host waits for the device, not the lookups: one
         batched copy per read. It is a snapshot, a later lookup does not change
         a tensor returned earlier.
+
+        A read is one wait for the device whatever it returns, the least an API
+        that hands out host numbers can do. Read it when the numbers are needed,
+        not on every step: the ``CACHE_DEBUG=1`` hook of the examples does, which is
+        a debugging aid and not for a run that is being timed.
         """
         if not self._record_cache_metrics:
             return None

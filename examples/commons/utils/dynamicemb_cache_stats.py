@@ -5,6 +5,10 @@ importing this module.  When enabled, a ``register_forward_hook`` is
 attached to every ``BatchedDynamicEmbeddingTable`` that has a GPU cache,
 logging per-table, per-rank hit/miss statistics after each forward pass.
 
+Reading the counters (``cache_metrics``) makes the host wait for the device once
+per forward, by contract, so a run with ``CACHE_DEBUG=1`` is a debugging run, not
+a timed one.
+
 Usage::
 
     from commons.utils.dynamicemb_cache_stats import auto_install
