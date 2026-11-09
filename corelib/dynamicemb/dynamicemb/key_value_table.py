@@ -27,6 +27,7 @@ from typing import (
     Dict,
     Iterator,
     List,
+    NamedTuple,
     Optional,
     Sequence,
     Set,
@@ -3149,6 +3150,86 @@ class DynamicEmbCache(Cache):
 # ---------------------------------------------------------------------------
 
 
+class MaskedFind(NamedTuple):
+    """What :meth:`DynamicEmbStorage.lookup_masked` (or the hybrid one) found.
+
+    Nothing is compacted and no count is read back: every field is as long as
+    the keys that were looked up, and a lane whose key is the reserved all-ones
+    key (``sf.mask_keys``) is not found and owns no row, so a caller leaves a key
+    out of a lookup, and out of the load that follows it, by masking the key.
+    """
+
+    founds: Tensor  # bool[N]
+    # The full-length score tensor the lookups used (``None`` for an LRU table and
+    # for a const lookup). A later insert, or the lookup of a second tier, takes
+    # it as is: the kernels read ``score_input[i]`` for every lane, masked ones
+    # included, so it must never be compacted.
+    score_in: Optional[Tensor]
+    scores: Tensor  # int64[N]
+    # Opaque token for ``load_masked``: the value rows (a tensor, ``-1`` where
+    # there is none), or one such tensor per tier for a ``HybridStorage``.
+    rows: Any
+
+
+def _compact_missing(
+    state: DynamicEmbTableState,
+    unique_keys: torch.Tensor,
+    table_ids: torch.Tensor,
+    founds: torch.Tensor,
+    score_in: Optional[torch.Tensor],
+) -> Tuple[int, torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+    """The one read of the public ``find``: compact what was not found.
+
+    ``Storage.find`` returns the number of missing keys as a host int and the
+    missing keys, their positions among ``unique_keys`` (ascending), table ids
+    and scores sized by it, so this is a stream compaction with a count read
+    back. A caller that can mask does not come here: it uses ``lookup_masked``.
+    """
+    # ``_find_keys`` compacted keys already converted to the key map's dtype.
+    if unique_keys.dtype != state.key_index_map.key_type:
+        unique_keys = unique_keys.to(state.key_index_map.key_type)
+    (
+        num_missing,
+        missing_indices,
+        (missing_keys, missing_table_ids, missing_scores),
+    ) = flagged_compact(~founds, [unique_keys, table_ids, score_in])
+    return (
+        num_missing,
+        missing_keys,
+        missing_indices,
+        missing_table_ids,
+        missing_scores,
+    )
+
+
+def _select_refused_values(
+    evicted_indices: torch.Tensor,
+    evicted_table_ids: torch.Tensor,
+    values: torch.Tensor,
+    evicted_values: torch.Tensor,
+) -> None:
+    """Give a key the table refused its own row of ``evicted_values``.
+
+    ``insert_and_evict`` reports a refused insert as an evicted entry whose index
+    ``-(i + 1)`` names row ``i`` of the input, and ``load_from_flat`` leaves that
+    entry's row of ``evicted_values`` unwritten; ``select_insert_failed_values``
+    copies ``values[i]`` into it. Evicted arrays that end in an inert tail must
+    not send the tail through that kernel: the tail's index is ``-1`` too, the
+    refused insert of row 0 as far as the kernel can tell, and it takes ONE row
+    stride, ``values.size(1)``, for the rows it reads and the rows it writes. Row
+    0 would be copied over every tail row, and over rows of real evictions when
+    ``values`` is narrower than ``evicted_values`` (``HybridStorage.load`` passes
+    the compact row of its table, the state's rows are as wide as its widest
+    table). The tail is told apart by its table id ``-1`` and hidden behind index
+    0, which the kernel skips; the indices it resets are a copy nobody reads.
+    """
+    select_insert_failed_values(
+        torch.where(evicted_table_ids >= 0, evicted_indices, 0),
+        values,
+        evicted_values,
+    )
+
+
 class DynamicEmbStorage(Storage):
     def __init__(
         self,
@@ -3380,6 +3461,45 @@ class DynamicEmbStorage(Storage):
 
     # -- Storage interface --
 
+    def lookup_masked(
+        self,
+        unique_keys: torch.Tensor,
+        table_ids: torch.Tensor,
+        lfu_accumulated_frequency: Optional[torch.Tensor] = None,
+        key_scores: Optional[torch.Tensor] = None,
+    ) -> MaskedFind:
+        """:meth:`find` without the host count: one lookup of every key.
+
+        The lookup scores exactly as :meth:`find` does (const outside training).
+        Nothing is compacted and nothing is read back; a key that must not take
+        part is replaced by the reserved key (``sf.mask_keys``) and comes back
+        not found, with row ``-1`` and its score untouched.
+        """
+        r = _find_keys(
+            self._state,
+            unique_keys,
+            table_ids,
+            score_source(self._state, lfu_accumulated_frequency, key_scores),
+            compact=False,
+        )
+        return MaskedFind(founds=r[5], score_in=r[4], scores=r[6], rows=r[7])
+
+    def load_masked(
+        self,
+        found: MaskedFind,
+        table_ids: torch.Tensor,
+        copy_mode: CopyMode,
+        output: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Load the rows ``found`` names; a lane without a row (``-1``) is left alone.
+
+        With ``output`` the rows are written into that ``[N, dim]`` buffer, whose
+        other lanes keep what they hold, instead of into a new one.
+        """
+        return load_from_flat(
+            self._state, found.rows, table_ids, copy_mode, output=output
+        )
+
     def find(
         self,
         unique_keys: torch.Tensor,
@@ -3397,24 +3517,21 @@ class DynamicEmbStorage(Storage):
         torch.Tensor,
         torch.Tensor,
     ]:
-        result = _find_keys(
-            self._state,
-            unique_keys,
-            table_ids,
-            score_source(self._state, lfu_accumulated_frequency, key_scores),
+        # The host-int contract is the one read this costs (see _compact_missing);
+        # a caller that does not need the count uses lookup_masked / load_masked.
+        found = self.lookup_masked(
+            unique_keys, table_ids, lfu_accumulated_frequency, key_scores
         )
+        values = self.load_masked(found, table_ids, copy_mode)
         (
             h_num_missing,
             missing_keys,
             missing_indices,
             missing_table_ids,
             missing_scores,
-            founds,
-            score_out,
-            indices,
-        ) = result
-        flat_rows = indices
-        values = load_from_flat(self._state, flat_rows, table_ids, copy_mode=copy_mode)
+        ) = _compact_missing(
+            self._state, unique_keys, table_ids, found.founds, found.score_in
+        )
 
         return (
             h_num_missing,
@@ -3422,8 +3539,8 @@ class DynamicEmbStorage(Storage):
             missing_indices,
             missing_table_ids,
             missing_scores,
-            founds,
-            score_out,
+            found.founds,
+            found.scores,
             values,
         )
 
@@ -3995,6 +4112,73 @@ class HybridStorage(Storage):
 
     # -- Two-tier find (with values) --
 
+    def lookup_masked(
+        self,
+        unique_keys: torch.Tensor,
+        table_ids: torch.Tensor,
+        lfu_accumulated_frequency: Optional[torch.Tensor] = None,
+        key_scores: Optional[torch.Tensor] = None,
+    ) -> MaskedFind:
+        """:meth:`find` without the host counts: both tiers, no compaction.
+
+        Both lookups score exactly as :meth:`find` always did (non-const while
+        ``training``), so LRU timestamps and LFU counts of both tiers move the same
+        way. ``MaskedFind.rows`` is the pair of the tiers' rows for
+        :meth:`load_masked`.
+        """
+        if key_scores is not None:
+            raise NotImplementedError(
+                "A score per key is not supported by HybridStorage."
+            )
+        r_hbm = _find_keys(
+            self._hbm,
+            unique_keys,
+            table_ids,
+            score_source(self._hbm, lfu_accumulated_frequency),
+            compact=False,
+        )
+        founds_hbm, score_in = r_hbm[5], r_hbm[4]
+        # The host tier is asked only about what the HBM tier lacks: an HBM hit
+        # becomes the reserved key, which is not found and touches no table, so
+        # the host tier's scores move for exactly those keys without compacting
+        # them first. The host lookup takes the HBM lookup's full-length score
+        # tensor, never a compacted one (the kernels read it for every lane).
+        r_host = _find_keys(
+            self._host,
+            sf.mask_keys(unique_keys, ~founds_hbm),
+            table_ids,
+            score_in,
+            compact=False,
+        )
+        founds_host = r_host[5]
+        return MaskedFind(
+            founds=founds_hbm | founds_host,
+            score_in=score_in,
+            # a lane the host tier did not find keeps the HBM lookup's score
+            scores=torch.where(founds_host, r_host[6], r_hbm[6]),
+            rows=(r_hbm[7], r_host[7]),
+        )
+
+    def load_masked(
+        self,
+        found: MaskedFind,
+        table_ids: torch.Tensor,
+        copy_mode: CopyMode,
+        output: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Load the rows ``found`` names from both tiers.
+
+        A key lives in one tier, so the host tier's load writes exactly the lanes
+        the HBM tier's left alone (row ``-1``), into the same buffer: both tiers
+        share their dims.
+        """
+        values = load_from_flat(
+            self._hbm, found.rows[0], table_ids, copy_mode, output=output
+        )
+        return load_from_flat(
+            self._host, found.rows[1], table_ids, copy_mode, output=values
+        )
+
     def find(
         self,
         unique_keys: torch.Tensor,
@@ -4012,107 +4196,30 @@ class HybridStorage(Storage):
         torch.Tensor,
         torch.Tensor,
     ]:
-        if key_scores is not None:
-            raise NotImplementedError(
-                "A score per key is not supported by HybridStorage."
-            )
-        result_hbm = _find_keys(
-            self._hbm,
-            unique_keys,
-            table_ids,
-            score_source(self._hbm, lfu_accumulated_frequency),
+        # The missing arrays are those of the keys neither tier has, and the host
+        # count is the one read of this call (see _compact_missing); a caller that
+        # does not need it uses lookup_masked / load_masked.
+        found = self.lookup_masked(
+            unique_keys, table_ids, lfu_accumulated_frequency, key_scores
         )
+        values = self.load_masked(found, table_ids, copy_mode)
         (
-            h_num_missing_hbm,
-            missing_keys_hbm,
-            missing_indices_hbm,
-            missing_table_ids_hbm,
-            missing_scores_hbm,
-            founds_hbm,
-            scores_hbm,
-            indices_hbm,
-        ) = result_hbm
-
-        flat_hbm = indices_hbm
-        values = load_from_flat(self._hbm, flat_hbm, table_ids, copy_mode=copy_mode)
-
-        if h_num_missing_hbm == 0:
-            return (
-                0,
-                missing_keys_hbm,
-                missing_indices_hbm,
-                missing_table_ids_hbm,
-                missing_scores_hbm,
-                founds_hbm,
-                scores_hbm,
-                values,
-            )
-
-        result_host = _find_keys(
-            self._host,
-            missing_keys_hbm,
-            missing_table_ids_hbm,
-            missing_scores_hbm,
+            h_num_missing,
+            missing_keys,
+            missing_indices,
+            missing_table_ids,
+            missing_scores,
+        ) = _compact_missing(
+            self._hbm, unique_keys, table_ids, found.founds, found.score_in
         )
-        (
-            h_num_missing_both,
-            missing_keys_both,
-            missing_indices_both,
-            missing_table_ids_both,
-            missing_scores_both,
-            founds_host,
-            scores_host,
-            indices_host,
-        ) = result_host
-
-        flat_host = indices_host
-        host_vals = load_from_flat(
-            self._host, flat_host, missing_table_ids_hbm, copy_mode=copy_mode
-        )
-
-        host_found_mask = founds_host
-        if host_found_mask.any():
-            values[missing_indices_hbm[host_found_mask]] = host_vals[host_found_mask]
-
-        founds_combined = founds_hbm.clone()
-        founds_combined[missing_indices_hbm[host_found_mask]] = True
-
-        # Merge host-tier scores into output: for keys found in _host, return scores_host
-        # so caller sees correct score (scores_hbm has no valid value for those positions).
-        output_scores = scores_hbm.clone()
-        output_scores[missing_indices_hbm[host_found_mask]] = scores_host[
-            host_found_mask
-        ]
-
-        global_missing_indices = missing_indices_hbm[missing_indices_both]
-        global_missing_scores = missing_scores_both
-
-        if (
-            self._hbm.evict_strategy == EvictStrategy.KLfu
-            and self._host.evict_strategy == EvictStrategy.KLfu
-            and lfu_accumulated_frequency is not None
-        ):
-            if global_missing_indices.numel() == 0:
-                assert (
-                    global_missing_scores is None or global_missing_scores.numel() == 0
-                )
-            else:
-                assert global_missing_scores is not None
-                assert global_missing_scores.numel() == global_missing_indices.numel()
-                expected = lfu_accumulated_frequency[global_missing_indices]
-                assert torch.equal(
-                    global_missing_scores.long(),
-                    expected.long(),
-                )
-
         return (
-            h_num_missing_both,
-            missing_keys_both,
-            global_missing_indices,
-            missing_table_ids_both,
-            global_missing_scores,
-            founds_combined,
-            output_scores,
+            h_num_missing,
+            missing_keys,
+            missing_indices,
+            missing_table_ids,
+            missing_scores,
+            found.founds,
+            found.scores,
             values,
         )
 
@@ -4135,58 +4242,31 @@ class HybridStorage(Storage):
           Performs the same two-tier lookup as :meth:`find`, and only
           ``store_to_flat`` updates rows that already exist in HBM or host. Keys
           absent from both tiers are ignored.
+
+        Nothing is read back, so the arrays may be longer than the keys that matter:
+        a key that must not take part is the reserved key (``sf.mask_keys``), which
+        no table accepts and no store writes.
         """
+        if unique_keys.numel() == 0:
+            return
         if preserve_existing:
-            if unique_keys.numel() == 0:
-                return
-            (
-                h_num_missing_hbm,
-                missing_keys_hbm,
-                missing_indices_hbm,
-                missing_table_ids_hbm,
-                missing_scores_hbm,
-                founds_hbm,
-                scores_hbm,
-                indices_hbm,
-            ) = _find_keys(self._hbm, unique_keys, table_ids)
-            if founds_hbm.any():
-                flat_hbm = indices_hbm
-                store_to_flat(
-                    self._hbm,
-                    flat_hbm[founds_hbm],
-                    table_ids[founds_hbm],
-                    unique_values[founds_hbm],
-                )
-            if h_num_missing_hbm > 0:
-                (
-                    _h_num_missing_both,
-                    _missing_keys_both,
-                    _missing_indices_both,
-                    _missing_table_ids_both,
-                    _missing_scores_both,
-                    founds_host,
-                    scores_host,
-                    indices_host,
-                ) = _find_keys(
-                    self._host,
-                    missing_keys_hbm,
-                    missing_table_ids_hbm,
-                    missing_scores_hbm,
-                )
-                if founds_host.any():
-                    orig_rows = missing_indices_hbm[founds_host]
-                    flat_host = indices_host
-                    store_to_flat(
-                        self._host,
-                        flat_host[founds_host],
-                        missing_table_ids_hbm[founds_host],
-                        unique_values[orig_rows],
-                    )
+            # Both lookups score as ``find`` does (non-const while ``training``).
+            r_hbm = _find_keys(self._hbm, unique_keys, table_ids, compact=False)
+            # A lane with no row (``-1``) is skipped by the store.
+            store_to_flat(self._hbm, r_hbm[7], table_ids, unique_values)
+            r_host = _find_keys(
+                self._host,
+                sf.mask_keys(unique_keys, ~r_hbm[5]),
+                table_ids,
+                r_hbm[4],
+                compact=False,
+            )
+            store_to_flat(self._host, r_host[7], table_ids, unique_values)
             return
 
         (
             indices,
-            num_evicted,
+            _num_evicted,
             evicted_keys,
             evicted_table_ids,
             evicted_indices,
@@ -4197,22 +4277,28 @@ class HybridStorage(Storage):
             table_ids,
             scores,
             preserve_existing=False,
+            async_count=True,
         )
 
+        # The count of evictions stays on the device: the evicted arrays are as long
+        # as the batch and inert past the evictions (reserved key, table id and row
+        # ``-1``), so the load, the store and the host insert below run over all of
+        # them and skip the rest. The select would not: it is given the tail hidden.
         evicted_values = load_from_flat(
             self._hbm, evicted_indices, evicted_table_ids, copy_mode=CopyMode.VALUE
         )
-        select_insert_failed_values(evicted_indices, unique_values, evicted_values)
+        _select_refused_values(
+            evicted_indices, evicted_table_ids, unique_values, evicted_values
+        )
         store_to_flat(self._hbm, indices, table_ids, unique_values)
 
-        if num_evicted != 0:
-            _insert_key_values(
-                self._host,
-                evicted_keys,
-                evicted_table_ids,
-                evicted_values,
-                evicted_scores,
-            )
+        _insert_key_values(
+            self._host,
+            evicted_keys,
+            evicted_table_ids,
+            evicted_values,
+            evicted_scores,
+        )
 
     def incremental_dump(
         self,
@@ -4610,30 +4696,38 @@ class HybridStorage(Storage):
 
             (
                 ins_indices,
-                num_evicted,
+                _num_evicted,
                 evicted_keys,
                 evicted_table_ids,
                 evicted_indices,
                 evicted_scores,
-            ) = _insert_and_evict_keys(self._hbm, keys, tids, file_scores)
+            ) = _insert_and_evict_keys(
+                self._hbm, keys, tids, file_scores, async_count=True
+            )
 
+            # As in :meth:`insert`: the count of evictions stays on the device and
+            # the evicted arrays are inert past it, so nothing is sliced or tested.
+            # ``values`` is this table's compact row, narrower than the evicted rows
+            # (the state's widest) for a table narrower than the widest of its
+            # tier: the inert tail must stay out of the select.
             evicted_values = load_from_flat(
                 self._hbm,
                 evicted_indices,
                 evicted_table_ids,
                 copy_mode=CopyMode.VALUE,
             )
-            select_insert_failed_values(evicted_indices, values, evicted_values)
+            _select_refused_values(
+                evicted_indices, evicted_table_ids, values, evicted_values
+            )
             store_to_flat_single_table(self._hbm, ins_indices, table_id, values)
 
-            if num_evicted != 0:
-                _insert_key_values(
-                    self._host,
-                    evicted_keys,
-                    evicted_table_ids,
-                    evicted_values,
-                    evicted_scores,
-                )
+            _insert_key_values(
+                self._host,
+                evicted_keys,
+                evicted_table_ids,
+                evicted_values,
+                evicted_scores,
+            )
 
         return params.meta_data.get("step_score", None)
 
@@ -4831,7 +4925,29 @@ def _eval_lookup_storage(
     keys: torch.Tensor,
     table_ids: torch.Tensor,
     initializer: Callable,
+    valid: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
+    """Eval lookup of an in-tree storage: no host count, no compaction.
+
+    ``valid`` (bool, one entry per key) marks the real keys of a batch whose tail
+    is padding (the reserved key, table id ``-1``); ``None`` means every key is
+    real. A key found nowhere takes the constant of the eval initializer, which
+    is written over its row only: padding is neither loaded nor initialized.
+    """
+    found = storage.lookup_masked(keys, table_ids)  # const: not training in eval
+    embs = storage.load_masked(found, table_ids, CopyMode.EMBEDDING)
+    missing = ~found.founds if valid is None else valid & ~found.founds
+    sf.initialize_masked(initializer, embs, keys, table_ids, missing)
+    return embs
+
+
+def _eval_lookup_storage_legacy(
+    storage: Storage,
+    keys: torch.Tensor,
+    table_ids: torch.Tensor,
+    initializer: Callable,
+) -> torch.Tensor:
+    """Exact-length eval lookup through ``Storage.find`` (any ``Storage``)."""
     (
         h_num_missing,
         _,
@@ -4859,7 +4975,34 @@ def _eval_lookup_cached(
     keys: torch.Tensor,
     table_ids: torch.Tensor,
     initializer: Callable,
+    valid: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
+    """:func:`_eval_lookup_storage` behind a cache, asking storage only about the
+    cache's misses.
+
+    A key the cache has (or padding) is replaced by the reserved key, which finds
+    nothing and loads nothing, so the storage lookup and load run over every lane
+    without overwriting the embeddings the cache gave.
+    """
+    _, founds, cache_indices = cache.lookup(keys, table_ids)
+    embs = load_from_flat(
+        cache._state, cache_indices, table_ids, copy_mode=CopyMode.EMBEDDING
+    )
+    miss = ~founds if valid is None else valid & ~founds
+    found = storage.lookup_masked(sf.mask_keys(keys, miss), table_ids)
+    storage.load_masked(found, table_ids, CopyMode.EMBEDDING, output=embs)
+    sf.initialize_masked(initializer, embs, keys, table_ids, miss & ~found.founds)
+    return embs
+
+
+def _eval_lookup_cached_legacy(
+    cache: Cache,
+    storage: Storage,
+    keys: torch.Tensor,
+    table_ids: torch.Tensor,
+    initializer: Callable,
+) -> torch.Tensor:
+    """Exact-length eval lookup through ``Storage.find`` (any ``Storage``)."""
     _, founds, cache_indices = cache.lookup(keys, table_ids)
 
     embs = load_from_flat(
@@ -4899,12 +5042,31 @@ def _eval_lookup_cached(
     return embs
 
 
+def _masked_eval_applies(storage: Storage, cache: Optional[Cache]) -> bool:
+    """Whether an eval lookup may take the masked path (host facts only).
+
+    The masked functions need ``lookup_masked`` / ``load_masked``, which only the
+    in-tree storages have, by exact type: a subclass may override ``find``. Any
+    other ``Storage`` or ``Cache`` keeps the exact-length functions, as does
+    ``DYNAMICEMB_SYNC_FREE=0``, the switch that restores the legacy paths. It is
+    read from the environment at every call, not from the flag the prefetch
+    dispatchers hold (that module imports this one): a test flips it with
+    ``monkeypatch.setenv``.
+    """
+    return (
+        os.environ.get("DYNAMICEMB_SYNC_FREE", "1") != "0"
+        and type(storage) in (DynamicEmbStorage, HybridStorage)
+        and (cache is None or type(cache) is DynamicEmbCache)
+    )
+
+
 def eval_lookup(
     storage: Storage,
     keys: torch.Tensor,
     table_ids: torch.Tensor,
     initializer: Callable,
     cache: Optional[Cache] = None,
+    valid: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Eval-only lookup (no insertion, no admission, no backward).
 
@@ -4912,6 +5074,11 @@ def eval_lookup(
     When *cache* is provided, looks up from cache first, then falls back to
     *storage* for cache misses.  Only embedding columns are copied
     (``CopyMode.EMBEDDING``); optimizer states are never touched.
+
+    *valid* (bool, one entry per key) marks the real keys of a batch padded to a
+    fixed length: the others are the reserved key with table id ``-1``, and their
+    rows are neither looked up nor written (they hold garbage). It needs the
+    in-tree storage; ``None`` means every key is real.
 
     Returns the embedding tensor of shape ``[len(keys), emb_dim]``.
     """
@@ -4924,10 +5091,22 @@ def eval_lookup(
             device=keys.device,
         )
 
-    if cache is None:
-        return _eval_lookup_storage(storage, keys, table_ids, initializer)
+    if valid is not None or _masked_eval_applies(storage, cache):
+        if cache is None:
+            return _eval_lookup_storage(storage, keys, table_ids, initializer, valid)
+        return _eval_lookup_cached(
+            cache,
+            storage,
+            keys,
+            table_ids,
+            initializer,
+            valid,
+        )
 
-    return _eval_lookup_cached(
+    if cache is None:
+        return _eval_lookup_storage_legacy(storage, keys, table_ids, initializer)
+
+    return _eval_lookup_cached_legacy(
         cache,
         storage,
         keys,

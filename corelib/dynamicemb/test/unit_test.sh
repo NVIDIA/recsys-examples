@@ -4,6 +4,8 @@ FWD_BWD_TEST_FILES=(
     "test/unit_tests/erase_async/test_erase_async.sh"
     "test/unit_tests/retain_evicted_keys/test_retain_evicted_keys.sh"
     "test/unit_tests/test_hybrid_storage_export.sh"
+    "test/unit_tests/test_hybrid_masked.py"
+    "test/unit_tests/test_eval_masked.py"
     "test/unit_tests/test_lfu_scores.sh"
     "test/test_batched_dynamic_embedding_tables_v2.py"
     "test/test_unique_op.py"
