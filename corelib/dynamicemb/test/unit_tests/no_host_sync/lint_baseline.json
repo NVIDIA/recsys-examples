@@ -1,0 +1,1520 @@
+[
+ {
+  "file": "dynamicemb/async_erase.py",
+  "line": 207,
+  "label": "sync_call",
+  "text": "self._event.synchronize()"
+ },
+ {
+  "file": "dynamicemb/async_erase.py",
+  "line": 229,
+  "label": "cpu",
+  "text": "erased, spared = counts.cpu().tolist()"
+ },
+ {
+  "file": "dynamicemb/async_erase.py",
+  "line": 229,
+  "label": "tolist",
+  "text": "erased, spared = counts.cpu().tolist()"
+ },
+ {
+  "file": "dynamicemb/batched_dynamicemb_function.py",
+  "line": 57,
+  "label": "pinned_copy_helper",
+  "text": "def _copy_cuda_tensor_to_pinned_cpu(tensor: torch.Tensor) -> torch.Tensor:"
+ },
+ {
+  "file": "dynamicemb/batched_dynamicemb_function.py",
+  "line": 59,
+  "label": "cpu",
+  "text": "return tensor.detach().cpu()"
+ },
+ {
+  "file": "dynamicemb/batched_dynamicemb_function.py",
+  "line": 64,
+  "label": "pin_memory",
+  "text": "pin_memory=True,"
+ },
+ {
+  "file": "dynamicemb/batched_dynamicemb_function.py",
+  "line": 67,
+  "label": "sync_call",
+  "text": "torch.cuda.current_stream(tensor.device).synchronize()"
+ },
+ {
+  "file": "dynamicemb/batched_dynamicemb_function.py",
+  "line": 71,
+  "label": "pinned_copy_helper",
+  "text": "def _scalar_item(tensor: torch.Tensor):"
+ },
+ {
+  "file": "dynamicemb/batched_dynamicemb_function.py",
+  "line": 76,
+  "label": "item",
+  "text": "return _copy_cuda_tensor_to_pinned_cpu(tensor.reshape(1))[0].item()"
+ },
+ {
+  "file": "dynamicemb/batched_dynamicemb_function.py",
+  "line": 76,
+  "label": "pinned_copy_helper",
+  "text": "return _copy_cuda_tensor_to_pinned_cpu(tensor.reshape(1))[0].item()"
+ },
+ {
+  "file": "dynamicemb/batched_dynamicemb_function.py",
+  "line": 79,
+  "label": "pinned_copy_helper",
+  "text": "def _bool_item(tensor: torch.Tensor) -> bool:"
+ },
+ {
+  "file": "dynamicemb/batched_dynamicemb_function.py",
+  "line": 80,
+  "label": "pinned_copy_helper",
+  "text": "return bool(_scalar_item(tensor))"
+ },
+ {
+  "file": "dynamicemb/batched_dynamicemb_function.py",
+  "line": 150,
+  "label": "pinned_copy_helper",
+  "text": "table_offsets_cpu = _copy_cuda_tensor_to_pinned_cpu(table_offsets)"
+ },
+ {
+  "file": "dynamicemb/batched_dynamicemb_function.py",
+  "line": 151,
+  "label": "item",
+  "text": "total_unique = table_offsets_cpu[num_tables].item()"
+ },
+ {
+  "file": "dynamicemb/batched_dynamicemb_function.py",
+  "line": 297,
+  "label": "flagged_compact",
+  "text": "_, _, (non_admitted_indices,) = flagged_compact("
+ },
+ {
+  "file": "dynamicemb/batched_dynamicemb_function.py",
+  "line": 322,
+  "label": "flagged_compact",
+  "text": ") = flagged_compact("
+ },
+ {
+  "file": "dynamicemb/batched_dynamicemb_function.py",
+  "line": 376,
+  "label": "flagged_compact",
+  "text": "num_asked, asked, (asked_keys, asked_tids) = flagged_compact("
+ },
+ {
+  "file": "dynamicemb/batched_dynamicemb_function.py",
+  "line": 501,
+  "label": "flagged_compact",
+  "text": "num_hit, _, (hit_slots, hit_tids) = flagged_compact("
+ },
+ {
+  "file": "dynamicemb/batched_dynamicemb_function.py",
+  "line": 534,
+  "label": "flagged_compact",
+  "text": ") = flagged_compact("
+ },
+ {
+  "file": "dynamicemb/batched_dynamicemb_function.py",
+  "line": 565,
+  "label": "flagged_compact",
+  "text": ") = flagged_compact(is_new, [miss_keys, miss_tids, miss_freq, miss_pos])"
+ },
+ {
+  "file": "dynamicemb/batched_dynamicemb_function.py",
+  "line": 570,
+  "label": "flagged_compact",
+  "text": "num_refused, _, (refused_pos,) = flagged_compact("
+ },
+ {
+  "file": "dynamicemb/batched_dynamicemb_function.py",
+  "line": 583,
+  "label": "flagged_compact",
+  "text": ") = flagged_compact(to_cache, [miss_keys, miss_tids, miss_pos])"
+ },
+ {
+  "file": "dynamicemb/batched_dynamicemb_function.py",
+  "line": 590,
+  "label": "flagged_compact",
+  "text": "num_adm, adm_rows, (adm_keys, adm_tids) = flagged_compact("
+ },
+ {
+  "file": "dynamicemb/batched_dynamicemb_function.py",
+  "line": 604,
+  "label": "flagged_compact",
+  "text": "num_st, into_storage, (st_keys, st_tids, st_score_input) = flagged_compact("
+ },
+ {
+  "file": "dynamicemb/batched_dynamicemb_function.py",
+  "line": 743,
+  "label": "any_all_in_cond",
+  "text": "if non_admit.any():"
+ },
+ {
+  "file": "dynamicemb/batched_dynamicemb_function.py",
+  "line": 807,
+  "label": "any_all_in_cond",
+  "text": "if inserted_mask.any():"
+ },
+ {
+  "file": "dynamicemb/batched_dynamicemb_function.py",
+  "line": 919,
+  "label": "pinned_copy_helper",
+  "text": "outstanding_keys = _scalar_item(outstanding_keys_ref)"
+ },
+ {
+  "file": "dynamicemb/batched_dynamicemb_function.py",
+  "line": 1196,
+  "label": "flagged_compact",
+  "text": "_, persisted_unique_indices, _ = flagged_compact("
+ },
+ {
+  "file": "dynamicemb/batched_dynamicemb_tables.py",
+  "line": 1466,
+  "label": "any_all_in_cond",
+  "text": "if modes == {DynamicEmbCheckMode.IGNORE} or not bool((scores < 0).any()):"
+ },
+ {
+  "file": "dynamicemb/batched_dynamicemb_tables.py",
+  "line": 2135,
+  "label": "cpu",
+  "text": "result[name] = pop(i).cpu()  # host tensor"
+ },
+ {
+  "file": "dynamicemb/batched_dynamicemb_tables.py",
+  "line": 2250,
+  "label": "item",
+  "text": "int(t.item())"
+ },
+ {
+  "file": "dynamicemb/batched_dynamicemb_tables.py",
+  "line": 2262,
+  "label": "item",
+  "text": "bool(t.item())"
+ },
+ {
+  "file": "dynamicemb/batched_dynamicemb_tables.py",
+  "line": 2678,
+  "label": "item",
+  "text": "stats.skipped = int(keys.numel() - mask.sum().item())"
+ },
+ {
+  "file": "dynamicemb/batched_dynamicemb_tables.py",
+  "line": 2800,
+  "label": "cpu",
+  "text": "return out.cpu()"
+ },
+ {
+  "file": "dynamicemb/construct_twin_module.py",
+  "line": 556,
+  "label": "unique",
+  "text": "uniq_key, inv, counts = torch.unique("
+ },
+ {
+  "file": "dynamicemb/construct_twin_module.py",
+  "line": 561,
+  "label": "tensor_to_device",
+  "text": "torch.cat([torch.tensor([0], device=sorted_key.device), counts[:-1]]),"
+ },
+ {
+  "file": "dynamicemb/dump_load.py",
+  "line": 149,
+  "label": "sync_call",
+  "text": "torch.cuda.synchronize()"
+ },
+ {
+  "file": "dynamicemb/dump_load.py",
+  "line": 149,
+  "label": "cuda_sync",
+  "text": "torch.cuda.synchronize()"
+ },
+ {
+  "file": "dynamicemb/dump_load.py",
+  "line": 205,
+  "label": "sync_call",
+  "text": "torch.cuda.synchronize()"
+ },
+ {
+  "file": "dynamicemb/dump_load.py",
+  "line": 205,
+  "label": "cuda_sync",
+  "text": "torch.cuda.synchronize()"
+ },
+ {
+  "file": "dynamicemb/dump_load.py",
+  "line": 261,
+  "label": "sync_call",
+  "text": "torch.cuda.synchronize()"
+ },
+ {
+  "file": "dynamicemb/dump_load.py",
+  "line": 261,
+  "label": "cuda_sync",
+  "text": "torch.cuda.synchronize()"
+ },
+ {
+  "file": "dynamicemb/dump_load.py",
+  "line": 299,
+  "label": "sync_call",
+  "text": "torch.cuda.synchronize()"
+ },
+ {
+  "file": "dynamicemb/dump_load.py",
+  "line": 299,
+  "label": "cuda_sync",
+  "text": "torch.cuda.synchronize()"
+ },
+ {
+  "file": "dynamicemb/embedding_admission.py",
+  "line": 292,
+  "label": "flagged_compact",
+  "text": "_, _, (admitted_keys, admitted_table_ids) = flagged_compact("
+ },
+ {
+  "file": "dynamicemb/exportable_tables.py",
+  "line": 206,
+  "label": "tensor_to_device",
+  "text": "torch.tensor(bucket_offset_list, dtype=torch.int64, device=device),"
+ },
+ {
+  "file": "dynamicemb/exportable_tables.py",
+  "line": 322,
+  "label": "tensor_to_device",
+  "text": "torch.tensor(feature_table_map, dtype=torch.int64, device=device),"
+ },
+ {
+  "file": "dynamicemb/exportable_tables.py",
+  "line": 326,
+  "label": "tensor_to_device",
+  "text": "torch.tensor(feature_offsets, dtype=torch.int64, device=device),"
+ },
+ {
+  "file": "dynamicemb/exportable_tables.py",
+  "line": 330,
+  "label": "tensor_to_device",
+  "text": "torch.tensor(capacities, dtype=torch.int64, device=device),"
+ },
+ {
+  "file": "dynamicemb/exportable_tables.py",
+  "line": 355,
+  "label": "item",
+  "text": "total_rows = int(self.capacity_list_.sum().item())"
+ },
+ {
+  "file": "dynamicemb/exportable_tables.py",
+  "line": 355,
+  "label": "int_bool_of_tensor",
+  "text": "total_rows = int(self.capacity_list_.sum().item())"
+ },
+ {
+  "file": "dynamicemb/exportable_tables.py",
+  "line": 411,
+  "label": "item",
+  "text": "self.table_offsets_[table_id].item(), :"
+ },
+ {
+  "file": "dynamicemb/exportable_tables.py",
+  "line": 416,
+  "label": "item",
+  "text": "].item()  # table_offsets_ already skipped the reserved row"
+ },
+ {
+  "file": "dynamicemb/exportable_tables.py",
+  "line": 417,
+  "label": "item",
+  "text": "original_offsets = self.table_offsets_[table_id].item() - table_id - 1"
+ },
+ {
+  "file": "dynamicemb/exportable_tables.py",
+  "line": 419,
+  "label": "item",
+  "text": "int(self.capacity_list_[table_id].item()) - 1"
+ },
+ {
+  "file": "dynamicemb/exportable_tables.py",
+  "line": 563,
+  "label": "item",
+  "text": "num_failed = (~valid_mask).sum().item()"
+ },
+ {
+  "file": "dynamicemb/exportable_tables.py",
+  "line": 572,
+  "label": "item",
+  "text": "max_index = valid_indices.max().item()"
+ },
+ {
+  "file": "dynamicemb/exportable_tables.py",
+  "line": 573,
+  "label": "item",
+  "text": "table_cap = int(self.capacity_list_[table_id].item())"
+ },
+ {
+  "file": "dynamicemb/extendable_tensor.py",
+  "line": 129,
+  "label": "sync_call",
+  "text": "torch.cuda.synchronize()"
+ },
+ {
+  "file": "dynamicemb/extendable_tensor.py",
+  "line": 129,
+  "label": "cuda_sync",
+  "text": "torch.cuda.synchronize()"
+ },
+ {
+  "file": "dynamicemb/extendable_tensor.py",
+  "line": 159,
+  "label": "sync_call",
+  "text": "torch.cuda.synchronize()"
+ },
+ {
+  "file": "dynamicemb/extendable_tensor.py",
+  "line": 159,
+  "label": "cuda_sync",
+  "text": "torch.cuda.synchronize()"
+ },
+ {
+  "file": "dynamicemb/incremental_dump.py",
+  "line": 686,
+  "label": "cpu",
+  "text": "return keys.cpu()"
+ },
+ {
+  "file": "dynamicemb/incremental_dump.py",
+  "line": 689,
+  "label": "tensor_to_device",
+  "text": "local_size = torch.tensor([keys.numel()], device=device, dtype=torch.int64)"
+ },
+ {
+  "file": "dynamicemb/incremental_dump.py",
+  "line": 692,
+  "label": "item",
+  "text": "sizes = [int(s.item()) for s in size_list]"
+ },
+ {
+  "file": "dynamicemb/incremental_dump.py",
+  "line": 704,
+  "label": "cpu",
+  "text": "return keys[:0].cpu()"
+ },
+ {
+  "file": "dynamicemb/incremental_dump.py",
+  "line": 705,
+  "label": "cpu",
+  "text": "return torch.unique(torch.cat(parts)).cpu()"
+ },
+ {
+  "file": "dynamicemb/incremental_dump.py",
+  "line": 705,
+  "label": "unique",
+  "text": "return torch.unique(torch.cat(parts)).cpu()"
+ },
+ {
+  "file": "dynamicemb/incremental_dump.py",
+  "line": 719,
+  "label": "cpu",
+  "text": "return [tensor.cpu()]"
+ },
+ {
+  "file": "dynamicemb/incremental_dump.py",
+  "line": 723,
+  "label": "tensor_to_device",
+  "text": "local_size = torch.tensor([tensor.size(0)], device=device, dtype=torch.int64)"
+ },
+ {
+  "file": "dynamicemb/incremental_dump.py",
+  "line": 726,
+  "label": "item",
+  "text": "sizes = [int(s.item()) for s in size_list]"
+ },
+ {
+  "file": "dynamicemb/incremental_dump.py",
+  "line": 737,
+  "label": "cpu",
+  "text": "return [g[:sz].cpu() for g, sz in zip(gathered, sizes)]"
+ },
+ {
+  "file": "dynamicemb/initializer.py",
+  "line": 82,
+  "label": "tensor_to_device",
+  "text": "table_params = torch.tensor(rows, dtype=torch.float32, device=device)"
+ },
+ {
+  "file": "dynamicemb/key_value_table.py",
+  "line": 108,
+  "label": "tensor_to_device",
+  "text": "d_count = torch.tensor([n], dtype=torch.long, device=device)"
+ },
+ {
+  "file": "dynamicemb/key_value_table.py",
+  "line": 111,
+  "label": "item",
+  "text": "counts = [int(c.item()) for c in gathered_counts]"
+ },
+ {
+  "file": "dynamicemb/key_value_table.py",
+  "line": 126,
+  "label": "cpu",
+  "text": ").cpu()"
+ },
+ {
+  "file": "dynamicemb/key_value_table.py",
+  "line": 313,
+  "label": "cpu",
+  "text": "return tensor.detach().cpu().contiguous().view(torch.uint8).numpy().tobytes()"
+ },
+ {
+  "file": "dynamicemb/key_value_table.py",
+  "line": 313,
+  "label": "numpy",
+  "text": "return tensor.detach().cpu().contiguous().view(torch.uint8).numpy().tobytes()"
+ },
+ {
+  "file": "dynamicemb/key_value_table.py",
+  "line": 604,
+  "label": "tensor_to_device",
+  "text": "table_emb_dims = torch.tensor(dims, dtype=torch.int64, device=device)"
+ },
+ {
+  "file": "dynamicemb/key_value_table.py",
+  "line": 606,
+  "label": "tensor_to_device",
+  "text": "table_value_dims = torch.tensor(value_dims, dtype=torch.int64, device=device)"
+ },
+ {
+  "file": "dynamicemb/key_value_table.py",
+  "line": 678,
+  "label": "pin_memory",
+  "text": "num_tables, dtype=torch.int64, pin_memory=True"
+ },
+ {
+  "file": "dynamicemb/key_value_table.py",
+  "line": 681,
+  "label": "pin_memory",
+  "text": "num_tables, dtype=torch.int64, pin_memory=True"
+ },
+ {
+  "file": "dynamicemb/key_value_table.py",
+  "line": 826,
+  "label": "item",
+  "text": "int(key_map.table_bucket_offsets_cpu_[table_id].item())"
+ },
+ {
+  "file": "dynamicemb/key_value_table.py",
+  "line": 1021,
+  "label": "sync_call",
+  "text": "in_flight.popleft().synchronize()"
+ },
+ {
+  "file": "dynamicemb/key_value_table.py",
+  "line": 1117,
+  "label": "item",
+  "text": "current_size = table_sizes[table_id].item()"
+ },
+ {
+  "file": "dynamicemb/key_value_table.py",
+  "line": 1118,
+  "label": "item",
+  "text": "n_new = unique_per_table[table_id].item()"
+ },
+ {
+  "file": "dynamicemb/key_value_table.py",
+  "line": 1175,
+  "label": "pin_memory",
+  "text": "state.num_tables, dtype=torch.int64, pin_memory=True"
+ },
+ {
+  "file": "dynamicemb/key_value_table.py",
+  "line": 1195,
+  "label": "cpu",
+  "text": "keys = collect_table_sizes_to_device(state).cpu()"
+ },
+ {
+  "file": "dynamicemb/key_value_table.py",
+  "line": 1196,
+  "label": "cpu",
+  "text": "rows = collect_row_counts_to_device(state).cpu()"
+ },
+ {
+  "file": "dynamicemb/key_value_table.py",
+  "line": 1200,
+  "label": "tolist",
+  "text": "need_rows = (rows + unique_size_per_table).tolist()"
+ },
+ {
+  "file": "dynamicemb/key_value_table.py",
+  "line": 1218,
+  "label": "blocking_copy",
+  "text": ":func:`collect_table_sizes_for_state` with ``non_blocking=False``."
+ },
+ {
+  "file": "dynamicemb/key_value_table.py",
+  "line": 1225,
+  "label": "pin_memory",
+  "text": "state.num_tables, dtype=torch.int64, pin_memory=True"
+ },
+ {
+  "file": "dynamicemb/key_value_table.py",
+  "line": 1241,
+  "label": "blocking_copy",
+  "text": "collect_table_sizes_for_state(state, non_blocking=False)"
+ },
+ {
+  "file": "dynamicemb/key_value_table.py",
+  "line": 1292,
+  "label": "int_bool_of_tensor",
+  "text": "assert int(slot_indices.max()) < ("
+ },
+ {
+  "file": "dynamicemb/key_value_table.py",
+  "line": 1736,
+  "label": "flagged_compact",
+  "text": ") = flagged_compact("
+ },
+ {
+  "file": "dynamicemb/key_value_table.py",
+  "line": 1768,
+  "label": "item",
+  "text": "n = int(num_evicted.item())"
+ },
+ {
+  "file": "dynamicemb/key_value_table.py",
+  "line": 1830,
+  "label": "unique",
+  "text": "out = torch.unique(keys[mask], dim=0 if keys.dim() > 1 else None)"
+ },
+ {
+  "file": "dynamicemb/key_value_table.py",
+  "line": 1832,
+  "label": "any_all_in_cond",
+  "text": "if bool(keep.any()):"
+ },
+ {
+  "file": "dynamicemb/key_value_table.py",
+  "line": 1832,
+  "label": "int_bool_of_tensor",
+  "text": "if bool(keep.any()):"
+ },
+ {
+  "file": "dynamicemb/key_value_table.py",
+  "line": 2055,
+  "label": "cpu",
+  "text": "fkey.write(keys.cpu().numpy().tobytes())"
+ },
+ {
+  "file": "dynamicemb/key_value_table.py",
+  "line": 2055,
+  "label": "numpy",
+  "text": "fkey.write(keys.cpu().numpy().tobytes())"
+ },
+ {
+  "file": "dynamicemb/key_value_table.py",
+  "line": 2059,
+  "label": "cpu",
+  "text": "fscore.write(scores.cpu().numpy().tobytes())"
+ },
+ {
+  "file": "dynamicemb/key_value_table.py",
+  "line": 2059,
+  "label": "numpy",
+  "text": "fscore.write(scores.cpu().numpy().tobytes())"
+ },
+ {
+  "file": "dynamicemb/key_value_table.py",
+  "line": 2117,
+  "label": "item",
+  "text": "owned += int(mask.sum().item()) if mask is not None else n"
+ },
+ {
+  "file": "dynamicemb/key_value_table.py",
+  "line": 2117,
+  "label": "int_bool_of_tensor",
+  "text": "owned += int(mask.sum().item()) if mask is not None else n"
+ },
+ {
+  "file": "dynamicemb/key_value_table.py",
+  "line": 2574,
+  "label": "any_all_in_cond",
+  "text": "if bool(keep.any()):"
+ },
+ {
+  "file": "dynamicemb/key_value_table.py",
+  "line": 2574,
+  "label": "int_bool_of_tensor",
+  "text": "if bool(keep.any()):"
+ },
+ {
+  "file": "dynamicemb/key_value_table.py",
+  "line": 2577,
+  "label": "any_all_in_cond",
+  "text": "if bool(fresh.any()):"
+ },
+ {
+  "file": "dynamicemb/key_value_table.py",
+  "line": 2577,
+  "label": "int_bool_of_tensor",
+  "text": "if bool(fresh.any()):"
+ },
+ {
+  "file": "dynamicemb/key_value_table.py",
+  "line": 2639,
+  "label": "item",
+  "text": "num_unplaced = int(n - placed.sum().item())"
+ },
+ {
+  "file": "dynamicemb/key_value_table.py",
+  "line": 2641,
+  "label": "item",
+  "text": "example = int(keys[torch.logical_not(placed)][0].item())"
+ },
+ {
+  "file": "dynamicemb/key_value_table.py",
+  "line": 2742,
+  "label": "item",
+  "text": "num_removed = int(removed.sum().item())"
+ },
+ {
+  "file": "dynamicemb/key_value_table.py",
+  "line": 2742,
+  "label": "int_bool_of_tensor",
+  "text": "num_removed = int(removed.sum().item())"
+ },
+ {
+  "file": "dynamicemb/key_value_table.py",
+  "line": 2806,
+  "label": "item",
+  "text": "self._cache_metrics[1] = founds.sum().item()"
+ },
+ {
+  "file": "dynamicemb/key_value_table.py",
+  "line": 3005,
+  "label": "item",
+  "text": "return int(sz.item())"
+ },
+ {
+  "file": "dynamicemb/key_value_table.py",
+  "line": 3037,
+  "label": "unique",
+  "text": "keys, uniq_counts = torch.unique(keys, return_counts=True)"
+ },
+ {
+  "file": "dynamicemb/key_value_table.py",
+  "line": 3254,
+  "label": "blocking_copy",
+  "text": "collect_table_sizes_for_state(self._state, non_blocking=False)"
+ },
+ {
+  "file": "dynamicemb/key_value_table.py",
+  "line": 3367,
+  "label": "cpu",
+  "text": "value = value.cpu()"
+ },
+ {
+  "file": "dynamicemb/key_value_table.py",
+  "line": 3368,
+  "label": "cpu",
+  "text": "key = key.cpu() if key.is_cuda else key"
+ },
+ {
+  "file": "dynamicemb/key_value_table.py",
+  "line": 3369,
+  "label": "cpu",
+  "text": "slot = slot.cpu()"
+ },
+ {
+  "file": "dynamicemb/key_value_table.py",
+  "line": 3370,
+  "label": "cpu",
+  "text": "score_block = score_block.cpu()"
+ },
+ {
+  "file": "dynamicemb/key_value_table.py",
+  "line": 3371,
+  "label": "cpu",
+  "text": "opt = opt.cpu() if opt is not None else None"
+ },
+ {
+  "file": "dynamicemb/key_value_table.py",
+  "line": 3423,
+  "label": "cpu",
+  "text": "keys_cat = keys_cat.cpu()"
+ },
+ {
+  "file": "dynamicemb/key_value_table.py",
+  "line": 3424,
+  "label": "cpu",
+  "text": "values_cat = values_cat.cpu()"
+ },
+ {
+  "file": "dynamicemb/key_value_table.py",
+  "line": 3425,
+  "label": "cpu",
+  "text": "slots_cat = slots_cat.cpu()"
+ },
+ {
+  "file": "dynamicemb/key_value_table.py",
+  "line": 3426,
+  "label": "cpu",
+  "text": "scores_cat = scores_cat.cpu()"
+ },
+ {
+  "file": "dynamicemb/key_value_table.py",
+  "line": 3427,
+  "label": "cpu",
+  "text": "opts_cat = opts_cat.cpu() if opts_cat is not None else None"
+ },
+ {
+  "file": "dynamicemb/key_value_table.py",
+  "line": 3733,
+  "label": "unique",
+  "text": "return torch.unique(torch.cat(parts))"
+ },
+ {
+  "file": "dynamicemb/key_value_table.py",
+  "line": 3813,
+  "label": "any_all_in_cond",
+  "text": "if host_found_mask.any():"
+ },
+ {
+  "file": "dynamicemb/key_value_table.py",
+  "line": 3842,
+  "label": "equal_allclose",
+  "text": "assert torch.equal("
+ },
+ {
+  "file": "dynamicemb/key_value_table.py",
+  "line": 3891,
+  "label": "any_all_in_cond",
+  "text": "if founds_hbm.any():"
+ },
+ {
+  "file": "dynamicemb/key_value_table.py",
+  "line": 3915,
+  "label": "any_all_in_cond",
+  "text": "if founds_host.any():"
+ },
+ {
+  "file": "dynamicemb/key_value_table.py",
+  "line": 4019,
+  "label": "cpu",
+  "text": "value = value.cpu()"
+ },
+ {
+  "file": "dynamicemb/key_value_table.py",
+  "line": 4020,
+  "label": "cpu",
+  "text": "key = key.cpu() if key.is_cuda else key"
+ },
+ {
+  "file": "dynamicemb/key_value_table.py",
+  "line": 4021,
+  "label": "cpu",
+  "text": "slot = slot.cpu()"
+ },
+ {
+  "file": "dynamicemb/key_value_table.py",
+  "line": 4022,
+  "label": "cpu",
+  "text": "score_block = score_block.cpu()"
+ },
+ {
+  "file": "dynamicemb/key_value_table.py",
+  "line": 4023,
+  "label": "cpu",
+  "text": "opt = opt.cpu() if opt is not None else None"
+ },
+ {
+  "file": "dynamicemb/key_value_table.py",
+  "line": 4070,
+  "label": "cpu",
+  "text": "keys_cat = keys_cat.cpu()"
+ },
+ {
+  "file": "dynamicemb/key_value_table.py",
+  "line": 4071,
+  "label": "cpu",
+  "text": "values_cat = values_cat.cpu()"
+ },
+ {
+  "file": "dynamicemb/key_value_table.py",
+  "line": 4072,
+  "label": "cpu",
+  "text": "slots_cat = slots_cat.cpu()"
+ },
+ {
+  "file": "dynamicemb/key_value_table.py",
+  "line": 4073,
+  "label": "cpu",
+  "text": "scores_cat = scores_cat.cpu()"
+ },
+ {
+  "file": "dynamicemb/key_value_table.py",
+  "line": 4074,
+  "label": "cpu",
+  "text": "opts_cat = opts_cat.cpu() if opts_cat is not None else None"
+ },
+ {
+  "file": "dynamicemb/key_value_table.py",
+  "line": 4135,
+  "label": "any_all_in_cond",
+  "text": "if not bool(sel.any()):"
+ },
+ {
+  "file": "dynamicemb/key_value_table.py",
+  "line": 4135,
+  "label": "int_bool_of_tensor",
+  "text": "if not bool(sel.any()):"
+ },
+ {
+  "file": "dynamicemb/key_value_table.py",
+  "line": 4281,
+  "label": "blocking_copy",
+  "text": "collect_table_sizes_for_state(self._hbm, non_blocking=False)"
+ },
+ {
+  "file": "dynamicemb/key_value_table.py",
+  "line": 4284,
+  "label": "blocking_copy",
+  "text": "collect_table_sizes_for_state(self._host, non_blocking=False)"
+ },
+ {
+  "file": "dynamicemb/key_value_table.py",
+  "line": 4292,
+  "label": "item",
+  "text": "+ self._hbm.estimated_table_sizes[table_id].item()"
+ },
+ {
+  "file": "dynamicemb/key_value_table.py",
+  "line": 4404,
+  "label": "unique",
+  "text": "hbm_unique = torch.unique(torch.cat(hbm_key_parts, dim=0))"
+ },
+ {
+  "file": "dynamicemb/key_value_table.py",
+  "line": 4457,
+  "label": "flagged_compact",
+  "text": "num_present, present, (present_keys, present_tids) = flagged_compact("
+ },
+ {
+  "file": "dynamicemb/key_value_table.py",
+  "line": 4474,
+  "label": "flagged_compact",
+  "text": "_, gone, (gone_keys, gone_tids) = flagged_compact("
+ },
+ {
+  "file": "dynamicemb/key_value_table.py",
+  "line": 4557,
+  "label": "flagged_compact",
+  "text": "h_num_miss, miss_compact_idx, (missing_keys, missing_table_ids) = flagged_compact("
+ },
+ {
+  "file": "dynamicemb/scored_hashtable.py",
+  "line": 431,
+  "label": "cpu",
+  "text": "self.table_bucket_offsets_cpu_ = self.table_bucket_offsets_.cpu()"
+ },
+ {
+  "file": "dynamicemb/scored_hashtable.py",
+  "line": 655,
+  "label": "blocking_copy",
+  "text": "torch.tensor(limits, dtype=torch.int64), non_blocking=False"
+ },
+ {
+  "file": "dynamicemb/scored_hashtable.py",
+  "line": 662,
+  "label": "item",
+  "text": "return int(self.row_counters_[table_id].item())"
+ },
+ {
+  "file": "dynamicemb/scored_hashtable.py",
+  "line": 854,
+  "label": "item",
+  "text": "h_num_evicted = num_evicted.cpu().item()"
+ },
+ {
+  "file": "dynamicemb/scored_hashtable.py",
+  "line": 854,
+  "label": "cpu",
+  "text": "h_num_evicted = num_evicted.cpu().item()"
+ },
+ {
+  "file": "dynamicemb/scored_hashtable.py",
+  "line": 908,
+  "label": "any_all_in_cond",
+  "text": "assert bool((slots >= 0).all()), \"rehash insert must not reject keys\""
+ },
+ {
+  "file": "dynamicemb/scored_hashtable.py",
+  "line": 916,
+  "label": "item",
+  "text": "int(self.table_bucket_offsets_cpu_[table_id].item()) * self.bucket_capacity_"
+ },
+ {
+  "file": "dynamicemb/scored_hashtable.py",
+  "line": 968,
+  "label": "item",
+  "text": "o_b0 = int(other.table_bucket_offsets_cpu_[table_id].item())"
+ },
+ {
+  "file": "dynamicemb/scored_hashtable.py",
+  "line": 969,
+  "label": "item",
+  "text": "o_b1 = int(other.table_bucket_offsets_cpu_[table_id + 1].item())"
+ },
+ {
+  "file": "dynamicemb/scored_hashtable.py",
+  "line": 973,
+  "label": "item",
+  "text": "(other.row_counters_[table_id] - other.bucket_sizes[o_b0:o_b1].sum()).item()"
+ },
+ {
+  "file": "dynamicemb/scored_hashtable.py",
+  "line": 979,
+  "label": "item",
+  "text": "b0 = int(self.table_bucket_offsets_cpu_[table_id].item())"
+ },
+ {
+  "file": "dynamicemb/scored_hashtable.py",
+  "line": 980,
+  "label": "item",
+  "text": "b1 = int(self.table_bucket_offsets_cpu_[table_id + 1].item())"
+ },
+ {
+  "file": "dynamicemb/scored_hashtable.py",
+  "line": 1152,
+  "label": "item",
+  "text": "h_num_evicted = num_evicted.cpu().item()"
+ },
+ {
+  "file": "dynamicemb/scored_hashtable.py",
+  "line": 1152,
+  "label": "cpu",
+  "text": "h_num_evicted = num_evicted.cpu().item()"
+ },
+ {
+  "file": "dynamicemb/scored_hashtable.py",
+  "line": 1259,
+  "label": "item",
+  "text": "bucket_begin = int(self.table_bucket_offsets_cpu_[table_id].item())"
+ },
+ {
+  "file": "dynamicemb/scored_hashtable.py",
+  "line": 1260,
+  "label": "item",
+  "text": "bucket_end = int(self.table_bucket_offsets_cpu_[table_id + 1].item())"
+ },
+ {
+  "file": "dynamicemb/scored_hashtable.py",
+  "line": 1437,
+  "label": "item",
+  "text": "int(self.table_bucket_offsets_cpu_[table_id].item()) * self.bucket_capacity_"
+ },
+ {
+  "file": "dynamicemb/scored_hashtable.py",
+  "line": 1440,
+  "label": "item",
+  "text": "int(self.table_bucket_offsets_cpu_[table_id + 1].item())"
+ },
+ {
+  "file": "dynamicemb/scored_hashtable.py",
+  "line": 1484,
+  "label": "item",
+  "text": "actual_length = d_counter.item()"
+ },
+ {
+  "file": "dynamicemb/scored_hashtable.py",
+  "line": 1532,
+  "label": "item",
+  "text": "actual_length = d_counter.item()"
+ },
+ {
+  "file": "dynamicemb/scored_hashtable.py",
+  "line": 1541,
+  "label": "item",
+  "text": "int(self.overflow_output_offsets_[table_id].item())"
+ },
+ {
+  "file": "dynamicemb/scored_hashtable.py",
+  "line": 1588,
+  "label": "cpu",
+  "text": "fkey.write(keys.cpu().numpy().tobytes())"
+ },
+ {
+  "file": "dynamicemb/scored_hashtable.py",
+  "line": 1588,
+  "label": "numpy",
+  "text": "fkey.write(keys.cpu().numpy().tobytes())"
+ },
+ {
+  "file": "dynamicemb/scored_hashtable.py",
+  "line": 1593,
+  "label": "cpu",
+  "text": "fscores[name].write(scores.cpu().numpy().tobytes())"
+ },
+ {
+  "file": "dynamicemb/scored_hashtable.py",
+  "line": 1593,
+  "label": "numpy",
+  "text": "fscores[name].write(scores.cpu().numpy().tobytes())"
+ },
+ {
+  "file": "dynamicemb/scored_hashtable.py",
+  "line": 1655,
+  "label": "item",
+  "text": "int(self.table_bucket_offsets_cpu_[table_id].item()) * self.bucket_capacity_"
+ },
+ {
+  "file": "dynamicemb/scored_hashtable.py",
+  "line": 1658,
+  "label": "item",
+  "text": "int(self.table_bucket_offsets_cpu_[table_id + 1].item())"
+ },
+ {
+  "file": "dynamicemb/scored_hashtable.py",
+  "line": 1674,
+  "label": "item",
+  "text": "total_matched = d_num_matched.cpu().item()"
+ },
+ {
+  "file": "dynamicemb/scored_hashtable.py",
+  "line": 1674,
+  "label": "cpu",
+  "text": "total_matched = d_num_matched.cpu().item()"
+ },
+ {
+  "file": "dynamicemb/scored_hashtable.py",
+  "line": 1689,
+  "label": "item",
+  "text": "total_matched += d_ovf_matched.cpu().item()"
+ },
+ {
+  "file": "dynamicemb/scored_hashtable.py",
+  "line": 1689,
+  "label": "cpu",
+  "text": "total_matched += d_ovf_matched.cpu().item()"
+ },
+ {
+  "file": "dynamicemb/scored_hashtable.py",
+  "line": 1770,
+  "label": "item",
+  "text": "b_start = int(self.table_bucket_offsets_cpu_[table_id].item())"
+ },
+ {
+  "file": "dynamicemb/scored_hashtable.py",
+  "line": 1771,
+  "label": "item",
+  "text": "b_end = int(self.table_bucket_offsets_cpu_[table_id + 1].item())"
+ },
+ {
+  "file": "dynamicemb/scored_hashtable.py",
+  "line": 1772,
+  "label": "item",
+  "text": "o_b_start = int(other.table_bucket_offsets_cpu_[table_id].item())"
+ },
+ {
+  "file": "dynamicemb/scored_hashtable.py",
+  "line": 1773,
+  "label": "item",
+  "text": "o_b_end = int(other.table_bucket_offsets_cpu_[table_id + 1].item())"
+ },
+ {
+  "file": "dynamicemb/scored_hashtable.py",
+  "line": 1833,
+  "label": "item",
+  "text": "src_bkt_begin = int(other.table_bucket_offsets_cpu_[table_id].item())"
+ },
+ {
+  "file": "dynamicemb/scored_hashtable.py",
+  "line": 1834,
+  "label": "item",
+  "text": "dst_bkt_begin = int(self.table_bucket_offsets_cpu_[table_id].item())"
+ },
+ {
+  "file": "dynamicemb/scored_hashtable.py",
+  "line": 1851,
+  "label": "item",
+  "text": "bkt_begin = int(self.table_bucket_offsets_cpu_[table_id].item())"
+ },
+ {
+  "file": "dynamicemb/scored_hashtable.py",
+  "line": 1867,
+  "label": "item",
+  "text": "bkt_begin = int(self.table_bucket_offsets_cpu_[table_id].item())"
+ },
+ {
+  "file": "dynamicemb/scored_hashtable.py",
+  "line": 1950,
+  "label": "item",
+  "text": "bkt_begin = int(self.table_bucket_offsets_cpu_[table_id].item())"
+ },
+ {
+  "file": "dynamicemb/scored_hashtable.py",
+  "line": 1951,
+  "label": "item",
+  "text": "bkt_end = int(self.table_bucket_offsets_cpu_[table_id + 1].item())"
+ },
+ {
+  "file": "dynamicemb/scored_hashtable.py",
+  "line": 2020,
+  "label": "item",
+  "text": "max_len = int(lengths.max().item()) if num_buckets > 0 else 0"
+ },
+ {
+  "file": "dynamicemb/scored_hashtable.py",
+  "line": 2020,
+  "label": "int_bool_of_tensor",
+  "text": "max_len = int(lengths.max().item()) if num_buckets > 0 else 0"
+ },
+ {
+  "file": "dynamicemb/scored_hashtable.py",
+  "line": 2032,
+  "label": "repeat_interleave",
+  "text": "bucket_idx = torch.repeat_interleave("
+ },
+ {
+  "file": "dynamicemb/scored_hashtable.py",
+  "line": 2035,
+  "label": "repeat_interleave",
+  "text": "starts = torch.repeat_interleave(offsets[:-1], lengths)"
+ },
+ {
+  "file": "dynamicemb/scored_hashtable.py",
+  "line": 2074,
+  "label": "any_all_in_cond",
+  "text": "if not valid.any():"
+ },
+ {
+  "file": "dynamicemb/scored_hashtable.py",
+  "line": 2134,
+  "label": "any_all_in_cond",
+  "text": "if not valid.any():"
+ },
+ {
+  "file": "dynamicemb/scored_hashtable.py",
+  "line": 2161,
+  "label": "item",
+  "text": "h_num_ev = num_ev.cpu().item()"
+ },
+ {
+  "file": "dynamicemb/scored_hashtable.py",
+  "line": 2161,
+  "label": "cpu",
+  "text": "h_num_ev = num_ev.cpu().item()"
+ },
+ {
+  "file": "dynamicemb/scored_hashtable.py",
+  "line": 2216,
+  "label": "any_all_in_cond",
+  "text": "if not valid.any():"
+ },
+ {
+  "file": "dynamicemb/scored_hashtable.py",
+  "line": 2248,
+  "label": "item",
+  "text": "h_num_ev = num_ev.cpu().item()"
+ },
+ {
+  "file": "dynamicemb/scored_hashtable.py",
+  "line": 2248,
+  "label": "cpu",
+  "text": "h_num_ev = num_ev.cpu().item()"
+ },
+ {
+  "file": "dynamicemb/scored_kjt.py",
+  "line": 94,
+  "label": "pin_memory",
+  "text": "super().pin_memory(),"
+ },
+ {
+  "file": "dynamicemb/scored_kjt.py",
+  "line": 95,
+  "label": "pin_memory",
+  "text": "_scores=self._scores.pin_memory(),"
+ },
+ {
+  "file": "dynamicemb/utils.py",
+  "line": 147,
+  "label": "equal_allclose",
+  "text": "if not torch.allclose(tensor1, tensor2, atol=atol, rtol=rtol):"
+ },
+ {
+  "file": "dynamicemb/utils.py",
+  "line": 148,
+  "label": "nonzero",
+  "text": "differences = (tensor1 != tensor2).nonzero(as_tuple=True)"
+ },
+ {
+  "file": "dynamicemb/utils.py",
+  "line": 151,
+  "label": "item",
+  "text": "f\"Difference at index {idx}: tensor1={tensor1[idx].item()}, tensor2={tensor2[idx].item()}\""
+ },
+ {
+  "file": "dynamicemb/jit/score_jit.py",
+  "line": 154,
+  "label": "nonzero",
+  "text": "key = int(digest[:15], 16)  # 60 bits, always positive, nonzero in practice"
+ },
+ {
+  "file": "dynamicemb/shard/embedding.py",
+  "line": 339,
+  "label": "item",
+  "text": "total_unique = num_uniques.item()"
+ },
+ {
+  "file": "dynamicemb/shard/input_dist.py",
+  "line": 67,
+  "label": "tensor_to_device",
+  "text": "return torch.tensor(codes, dtype=torch.int32, device=device)"
+ },
+ {
+  "file": "src/dynamic_emb_op.cu",
+  "line": 71,
+  "label": "cudaStreamSynchronize",
+  "text": "AT_CUDA_CHECK(cudaStreamSynchronize(stream));"
+ },
+ {
+  "file": "src/dynamic_emb_op.cu",
+  "line": 76,
+  "label": "cpu_item",
+  "text": "h_features_offsets[table_offsets_in_feature[i]].item<int64_t>();"
+ },
+ {
+  "file": "src/index_calculation.cu",
+  "line": 221,
+  "label": "cpu_item",
+  "text": "int64_t h_count = num_selected.cpu().item<int64_t>();"
+ },
+ {
+  "file": "src/index_calculation.cu",
+  "line": 221,
+  "label": "returns_host_count",
+  "text": "int64_t h_count = num_selected.cpu().item<int64_t>();"
+ },
+ {
+  "file": "src/index_calculation.cu",
+  "line": 222,
+  "label": "returns_host_count",
+  "text": "auto sliced_indices = out_indices.slice(0, 0, h_count);"
+ },
+ {
+  "file": "src/index_calculation.cu",
+  "line": 227,
+  "label": "returns_host_count",
+  "text": "full_outputs[real_positions[j]] = real_outputs[j].slice(0, 0, h_count);"
+ },
+ {
+  "file": "src/index_calculation.cu",
+  "line": 230,
+  "label": "returns_host_count",
+  "text": "return {h_count, sliced_indices, full_outputs};"
+ },
+ {
+  "file": "src/initializer.cu",
+  "line": 50,
+  "label": "cudaDeviceSynchronize",
+  "text": "CUDACHECK(cudaDeviceSynchronize());"
+ },
+ {
+  "file": "src/initializer.cu",
+  "line": 51,
+  "label": "alloc_free",
+  "text": "CUDACHECK(cudaFree(states_));"
+ },
+ {
+  "file": "src/torch_utils.cu",
+  "line": 28,
+  "label": "device_counter",
+  "text": "class DeviceTimestamp {"
+ },
+ {
+  "file": "src/torch_utils.cu",
+  "line": 30,
+  "label": "device_counter",
+  "text": "DeviceTimestamp() {"
+ },
+ {
+  "file": "src/torch_utils.cu",
+  "line": 31,
+  "label": "alloc_free",
+  "text": "CUDACHECK(cudaMalloc((void **)&d_timestamp, sizeof(uint64_t)));"
+ },
+ {
+  "file": "src/torch_utils.cu",
+  "line": 34,
+  "label": "alloc_free",
+  "text": "~DeviceTimestamp() { CUDACHECK(cudaFree(d_timestamp)); }"
+ },
+ {
+  "file": "src/torch_utils.cu",
+  "line": 34,
+  "label": "device_counter",
+  "text": "~DeviceTimestamp() { CUDACHECK(cudaFree(d_timestamp)); }"
+ },
+ {
+  "file": "src/torch_utils.cu",
+  "line": 40,
+  "label": "cudaMemcpyAsync_D2H",
+  "text": "cudaMemcpyDeviceToHost, stream));"
+ },
+ {
+  "file": "src/torch_utils.cu",
+  "line": 41,
+  "label": "cudaStreamSynchronize",
+  "text": "CUDACHECK(cudaStreamSynchronize(stream));"
+ },
+ {
+  "file": "src/torch_utils.cu",
+  "line": 56,
+  "label": "device_counter",
+  "text": "static DeviceTimestamp timestamp;"
+ },
+ {
+  "file": "src/unique_op.cu",
+  "line": 579,
+  "label": "cpu_item",
+  "text": "at::Tensor sr_cpu = segmented_range.to(at::kCPU);"
+ },
+ {
+  "file": "src/utils.h",
+  "line": 267,
+  "label": "device_counter",
+  "text": "class DeviceCounter {"
+ },
+ {
+  "file": "src/utils.h",
+  "line": 269,
+  "label": "device_counter",
+  "text": "DeviceCounter() {"
+ },
+ {
+  "file": "src/utils.h",
+  "line": 270,
+  "label": "alloc_free",
+  "text": "CUDACHECK(cudaMalloc((void **)&d_counter, sizeof(uint64_t)));"
+ },
+ {
+  "file": "src/utils.h",
+  "line": 273,
+  "label": "alloc_free",
+  "text": "~DeviceCounter() { CUDACHECK(cudaFree(d_counter)); }"
+ },
+ {
+  "file": "src/utils.h",
+  "line": 273,
+  "label": "device_counter",
+  "text": "~DeviceCounter() { CUDACHECK(cudaFree(d_counter)); }"
+ },
+ {
+  "file": "src/utils.h",
+  "line": 275,
+  "label": "device_counter",
+  "text": "DeviceCounter &reset(const cudaStream_t &stream) {"
+ },
+ {
+  "file": "src/utils.h",
+  "line": 282,
+  "label": "device_counter",
+  "text": "DeviceCounter &sync(const cudaStream_t &stream) {"
+ },
+ {
+  "file": "src/utils.h",
+  "line": 284,
+  "label": "cudaMemcpyAsync_D2H",
+  "text": "cudaMemcpyDeviceToHost, stream));"
+ },
+ {
+  "file": "src/utils.h",
+  "line": 285,
+  "label": "cudaStreamSynchronize",
+  "text": "CUDACHECK(cudaStreamSynchronize(stream));"
+ },
+ {
+  "file": "src/vmm_tensor.cu",
+  "line": 145,
+  "label": "cudaDeviceSynchronize",
+  "text": "result = cuCtxSynchronize();"
+ },
+ {
+  "file": "src/vmm_tensor.cu",
+  "line": 147,
+  "label": "cudaDeviceSynchronize",
+  "text": "report(\"cuCtxSynchronize\", result);"
+ },
+ {
+  "file": "src/vmm_tensor.cu",
+  "line": 409,
+  "label": "alloc_free",
+  "text": "cudaHostRegister(m_addr_h, m_size,"
+ },
+ {
+  "file": "src/vmm_tensor.cu",
+  "line": 410,
+  "label": "alloc_free",
+  "text": "cudaHostRegisterMapped | cudaHostRegisterPortable);"
+ },
+ {
+  "file": "src/vmm_tensor.cu",
+  "line": 421,
+  "label": "alloc_free",
+  "text": "\"cudaHostRegister/cudaHostGetDevicePointer (init) failed: \") +"
+ },
+ {
+  "file": "src/vmm_tensor.cu",
+  "line": 438,
+  "label": "alloc_free",
+  "text": "cudaHostUnregister(m_addr_h);"
+ },
+ {
+  "file": "src/vmm_tensor.cu",
+  "line": 455,
+  "label": "alloc_free",
+  "text": "cudaHostRegister(m_addr_h, restore_bytes,"
+ },
+ {
+  "file": "src/vmm_tensor.cu",
+  "line": 456,
+  "label": "alloc_free",
+  "text": "cudaHostRegisterMapped | cudaHostRegisterPortable);"
+ },
+ {
+  "file": "src/vmm_tensor.cu",
+  "line": 459,
+  "label": "alloc_free",
+  "text": "return std::string(\"cudaHostRegister(\") + std::to_string(restore_bytes) +"
+ },
+ {
+  "file": "src/vmm_tensor.cu",
+  "line": 507,
+  "label": "alloc_free",
+  "text": "CUDA_CHECK(cudaHostUnregister(m_addr_h));"
+ },
+ {
+  "file": "src/vmm_tensor.cu",
+  "line": 557,
+  "label": "alloc_free",
+  "text": "cudaHostRegister(m_addr_h, new_bytes,"
+ },
+ {
+  "file": "src/vmm_tensor.cu",
+  "line": 558,
+  "label": "alloc_free",
+  "text": "cudaHostRegisterMapped | cudaHostRegisterPortable);"
+ },
+ {
+  "file": "src/vmm_tensor.cu",
+  "line": 566,
+  "label": "alloc_free",
+  "text": "std::string msg = std::string(\"cudaHostRegister/cudaHostGetDevicePointer \""
+ },
+ {
+  "file": "src/vmm_tensor.cu",
+  "line": 616,
+  "label": "alloc_free",
+  "text": "cudaHostUnregister(m_addr_h);"
+ },
+ {
+  "file": "src/table_operation/bucketize.cu",
+  "line": 225,
+  "label": "cpu_item",
+  "text": "int64_t num_active_buckets_ = num_active_buckets.item<int64_t>();"
+ }
+]

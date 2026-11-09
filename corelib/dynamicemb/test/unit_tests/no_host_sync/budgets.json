@@ -1,0 +1,241 @@
+{
+ "_meta": {
+  "what": "mean host syncs per iteration each probe case may make; see sync_budgets.py",
+  "metric": "blocking",
+  "iters": 8,
+  "warmup": 3,
+  "seed": 1234,
+  "alloc_events_max": 1,
+  "measured": {
+   "label": "origin/main d03198c3 (base tree)",
+   "time": "2026-11-09 06:25:46",
+   "device": "NVIDIA H100 80GB HBM3",
+   "torch": "2.13.0a0+9186a08b2c.nv26.07",
+   "cuda": "13.3",
+   "python": "3.12.3"
+  }
+ },
+ "cache_storage": {
+  "all_hit": {"plain": 4, "prefetch": 4},
+  "miss": {"plain": 8, "prefetch": 8},
+  "miss_evict": {"plain": 10, "prefetch": 10},
+  "tier2_hit": {"plain": 10, "prefetch": 10},
+  "eval": {"plain": 1},
+  "eval_miss": {"plain": 2}
+ },
+ "cache_storage_sum": {
+  "all_hit": {"plain": 4, "prefetch": 4},
+  "miss": {"plain": 8, "prefetch": 8},
+  "miss_evict": {"plain": 10, "prefetch": 10},
+  "tier2_hit": {"plain": 10, "prefetch": 10},
+  "eval": {"plain": 2},
+  "eval_miss": {"plain": 3}
+ },
+ "cache_ps": {
+  "all_hit": {"plain": 4, "prefetch": 4},
+  "miss": {"plain": 24, "prefetch": 24},
+  "miss_evict": {"plain": 28, "prefetch": 28},
+  "tier2_hit": {"plain": 25, "prefetch": 25}
+ },
+ "cache_ps_sum": {
+  "all_hit": {"plain": 4, "prefetch": 4},
+  "miss": {"plain": 24, "prefetch": 24},
+  "miss_evict": {"plain": 28, "prefetch": 28},
+  "tier2_hit": {"plain": 25, "prefetch": 25}
+ },
+ "hbm_only": {
+  "all_hit": {"plain": 4, "prefetch": 4},
+  "miss": {"plain": 6, "prefetch": 6},
+  "miss_evict": {"plain": 6, "prefetch": 6},
+  "eval": {"plain": 1},
+  "eval_miss": {"plain": 1}
+ },
+ "hbm_only_sum": {
+  "all_hit": {"plain": 4, "prefetch": 4},
+  "miss": {"plain": 6, "prefetch": 6},
+  "miss_evict": {"plain": 6, "prefetch": 6},
+  "eval": {"plain": 2},
+  "eval_miss": {"plain": 2}
+ },
+ "hybrid": {
+  "all_hit": {"plain": 7, "prefetch": 7},
+  "miss": {"plain": 16, "prefetch": 16},
+  "miss_evict": {"plain": 16, "prefetch": 16},
+  "tier2_hit": {"plain": 17, "prefetch": 17},
+  "eval": {"plain": 1},
+  "eval_miss": {"plain": 7}
+ },
+ "hybrid_sum": {
+  "all_hit": {"plain": 7, "prefetch": 7},
+  "miss": {"plain": 16, "prefetch": 16},
+  "miss_evict": {"plain": 16, "prefetch": 16},
+  "tier2_hit": {"plain": 17, "prefetch": 17},
+  "eval": {"plain": 2},
+  "eval_miss": {"plain": 8}
+ },
+ "host_only": {
+  "all_hit": {"plain": 2, "prefetch": 2},
+  "miss": {"plain": 4, "prefetch": 4},
+  "miss_evict": {"plain": 4, "prefetch": 4},
+  "eval": {"plain": 1},
+  "eval_miss": {"plain": 1}
+ },
+ "host_only_sum": {
+  "all_hit": {"plain": 2, "prefetch": 2},
+  "miss": {"plain": 4, "prefetch": 4},
+  "miss_evict": {"plain": 4, "prefetch": 4},
+  "eval": {"plain": 2},
+  "eval_miss": {"plain": 2}
+ },
+ "cache_storage_admit": {
+  "all_hit": {"plain": 4, "prefetch": 4},
+  "miss": {"plain": 12, "prefetch": 12},
+  "miss_evict": {"plain": 14, "prefetch": 14},
+  "eval": {"plain": 1},
+  "eval_miss": {"plain": 2}
+ },
+ "cache_storage_retain": {
+  "all_hit": {"plain": 4, "prefetch": 4},
+  "miss": {"plain": 9, "prefetch": 9},
+  "miss_evict": {"plain": 12, "prefetch": 12},
+  "tier2_hit": {"plain": 11, "prefetch": 11},
+  "eval": {"plain": 1},
+  "eval_miss": {"plain": 2}
+ },
+ "cache_storage_lfu": {
+  "all_hit": {"plain": 4, "prefetch": 4},
+  "miss": {"plain": 8, "prefetch": 8},
+  "miss_evict": {"plain": 10, "prefetch": 10},
+  "tier2_hit": {"plain": 10, "prefetch": 10},
+  "eval": {"plain": 1},
+  "eval_miss": {"plain": 2}
+ },
+ "hbm_only_admit": {
+  "all_hit": {"plain": 4, "prefetch": 4},
+  "miss": {"plain": 14, "prefetch": 14},
+  "miss_evict": {"plain": 14, "prefetch": 14},
+  "eval": {"plain": 1},
+  "eval_miss": {"plain": 1}
+ },
+ "hbm_only_retain": {
+  "all_hit": {"plain": 4, "prefetch": 4},
+  "miss": {"plain": 7, "prefetch": 7},
+  "miss_evict": {"plain": 7, "prefetch": 7},
+  "eval": {"plain": 1},
+  "eval_miss": {"plain": 1}
+ },
+ "hbm_only_lfu": {
+  "all_hit": {"plain": 4, "prefetch": 4},
+  "miss": {"plain": 6, "prefetch": 6},
+  "miss_evict": {"plain": 6, "prefetch": 6},
+  "eval": {"plain": 1},
+  "eval_miss": {"plain": 1}
+ },
+ "hybrid_admit": {
+  "all_hit": {"plain": 7, "prefetch": 7},
+  "miss": {"plain": 19, "prefetch": 19},
+  "miss_evict": {"plain": 19, "prefetch": 19},
+  "eval": {"plain": 1},
+  "eval_miss": {"plain": 7}
+ },
+ "hybrid_retain": {
+  "all_hit": {"plain": 7, "prefetch": 7},
+  "miss": {"plain": 16, "prefetch": 16},
+  "miss_evict": {"plain": 17, "prefetch": 17},
+  "tier2_hit": {"plain": 17, "prefetch": 17},
+  "eval": {"plain": 1},
+  "eval_miss": {"plain": 7}
+ },
+ "hybrid_lfu": {
+  "all_hit": {"plain": 7, "prefetch": 7},
+  "miss": {"plain": 17, "prefetch": 17},
+  "miss_evict": {"plain": 17, "prefetch": 17},
+  "tier2_hit": {"plain": 20, "prefetch": 20},
+  "eval": {"plain": 1},
+  "eval_miss": {"plain": 7}
+ },
+ "host_only_admit": {
+  "all_hit": {"plain": 2, "prefetch": 2},
+  "miss": {"plain": 7, "prefetch": 7},
+  "miss_evict": {"plain": 7, "prefetch": 7},
+  "eval": {"plain": 1},
+  "eval_miss": {"plain": 1}
+ },
+ "host_only_retain": {
+  "all_hit": {"plain": 3, "prefetch": 3},
+  "miss": {"plain": 6, "prefetch": 6},
+  "miss_evict": {"plain": 6, "prefetch": 6},
+  "eval": {"plain": 1},
+  "eval_miss": {"plain": 1}
+ },
+ "host_only_lfu": {
+  "all_hit": {"plain": 2, "prefetch": 2},
+  "miss": {"plain": 4, "prefetch": 4},
+  "miss_evict": {"plain": 4, "prefetch": 4},
+  "eval": {"plain": 1},
+  "eval_miss": {"plain": 1}
+ },
+ "cache_storage_adam": {
+  "all_hit": {"plain": 4, "prefetch": 4},
+  "miss": {"plain": 8, "prefetch": 8},
+  "miss_evict": {"plain": 10, "prefetch": 10},
+  "tier2_hit": {"plain": 10, "prefetch": 10},
+  "eval": {"plain": 1},
+  "eval_miss": {"plain": 2}
+ },
+ "hbm_only_adam": {
+  "all_hit": {"plain": 4, "prefetch": 4},
+  "miss": {"plain": 6, "prefetch": 6},
+  "miss_evict": {"plain": 6, "prefetch": 6},
+  "eval": {"plain": 1},
+  "eval_miss": {"plain": 1}
+ },
+ "cache_storage_metrics": {
+  "all_hit": {"plain": 5, "prefetch": 5},
+  "miss": {"plain": 9, "prefetch": 9},
+  "miss_evict": {"plain": 11, "prefetch": 11},
+  "tier2_hit": {"plain": 11, "prefetch": 11},
+  "eval": {"plain": 2},
+  "eval_miss": {"plain": 3}
+ },
+ "cache_storage_growth": {
+  "all_hit": {"plain": 4.5, "prefetch": 4.5},
+  "miss": {"plain": 9.75, "prefetch": 9.75},
+  "growth": {"plain": 12.75, "prefetch": 12.75}
+ },
+ "hbm_only_growth": {
+  "all_hit": {"plain": 4.5, "prefetch": 4.5},
+  "miss": {"plain": 7.75, "prefetch": 7.75},
+  "growth": {"plain": 10.75, "prefetch": 10.75}
+ },
+ "host_only_growth": {
+  "all_hit": {"plain": 2.5, "prefetch": 2.5},
+  "miss": {"plain": 5.75, "prefetch": 5.75},
+  "growth": {"plain": 8.75, "prefetch": 8.75}
+ },
+ "cache_storage_noevict": {
+  "all_hit": {"plain": 6, "prefetch": 6},
+  "miss": {"plain": 10.125, "prefetch": 10.125},
+  "growth": {"plain": 11.75, "prefetch": 11.75}
+ },
+ "hbm_only_noevict": {
+  "all_hit": {"plain": 6, "prefetch": 6},
+  "miss": {"plain": 8.125, "prefetch": 8.125},
+  "growth": {"plain": 9.75, "prefetch": 9.75}
+ },
+ "cache_storage_determ": {
+  "all_hit": {"plain": 4, "prefetch": 4},
+  "miss": {"plain": 235.75, "prefetch": 235.75},
+  "miss_evict": {"plain": 789.75, "prefetch": 789.75},
+  "tier2_hit": {"plain": 760.125, "prefetch": 760.125},
+  "eval": {"plain": 1},
+  "eval_miss": {"plain": 2}
+ },
+ "hbm_only_determ": {
+  "all_hit": {"plain": 4, "prefetch": 4},
+  "miss": {"plain": 24.75, "prefetch": 24.75},
+  "miss_evict": {"plain": 64.875, "prefetch": 64.875},
+  "eval": {"plain": 1},
+  "eval_miss": {"plain": 1}
+ }
+}

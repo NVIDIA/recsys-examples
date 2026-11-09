@@ -46,6 +46,16 @@ FWD_BWD_TEST_FILES=(
     "test/unit_tests/sync_free/test_initializer_negative_index.py"
     "test/unit_tests/sync_free/test_evicted_prefill.py"
     "test/unit_tests/sync_free/test_padded_buffer_optimizer_tail.py"
+    # Host syncs on the training thread: the static lint and the probe's own logic
+    # need no GPU; the helpers and the padded-array invariants need one; the ratchet
+    # and the acceptance test take a census with the CUDA profiler and compare it
+    # with budgets.json, which a change that removes syncs lowers.
+    "test/unit_tests/no_host_sync/test_host_sync_probe_unit.py"
+    "test/unit_tests/no_host_sync/test_sync_free_lint.py"
+    "test/unit_tests/no_host_sync/test_sync_free_helpers.py"
+    "test/unit_tests/no_host_sync/test_tail_invariants.py"
+    "test/unit_tests/no_host_sync/test_sync_ratchet.py"
+    "test/unit_tests/no_host_sync/test_no_host_syncs.py"
 )
 
 LOAD_DUMP_TEST_FILES=(
