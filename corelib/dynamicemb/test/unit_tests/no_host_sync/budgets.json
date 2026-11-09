@@ -236,5 +236,35 @@
   "miss_evict": {"plain": 4, "prefetch": 4},
   "eval": {"plain": 0},
   "eval_miss": {"plain": 0}
+ },
+ "cache_storage_chunked": {
+  "all_hit": {"plain": 0, "prefetch": 0},
+  "miss": {"plain": 0, "prefetch": 0},
+  "miss_evict": {"plain": 0, "prefetch": 0},
+  "tier2_hit": {"plain": 0, "prefetch": 0},
+  "eval": {"plain": 0},
+  "eval_miss": {"plain": 0}
+ },
+ "hbm_only_chunked": {
+  "all_hit": {"plain": 0, "prefetch": 0},
+  "miss": {"plain": 0, "prefetch": 0},
+  "miss_evict": {"plain": 0, "prefetch": 0},
+  "eval": {"plain": 0},
+  "eval_miss": {"plain": 0}
+ },
+ "hybrid_chunked": {
+  "all_hit": {"plain": 0, "prefetch": 0},
+  "miss": {"plain": 0, "prefetch": 0},
+  "miss_evict": {"plain": 0, "prefetch": 0},
+  "tier2_hit": {"plain": 0, "prefetch": 0},
+  "eval": {"plain": 0},
+  "eval_miss": {"plain": 0}
+ },
+ "cache_storage_admit_chunked": {
+  "all_hit": {"plain": 0, "prefetch": 0},
+  "miss": {"plain": 0, "prefetch": 0},
+  "miss_evict": {"plain": 0, "prefetch": 0},
+  "eval": {"plain": 0},
+  "eval_miss": {"plain": 0}
  }
 }

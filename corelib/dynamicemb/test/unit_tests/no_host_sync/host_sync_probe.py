@@ -221,6 +221,9 @@ class Cfg:
     noevict: bool = (
         False  # score_strategy=NO_EVICTION (tables expand instead of evicting)
     )
+    # The miss path runs in chunks of this many rows (sync_free.CHUNK_ROWS, around the
+    # build and the measured window): the batch has 576 key slots, so 64 is 9 chunks a step.
+    chunk_rows: int = 0
     doc: str = ""
 
 
@@ -297,6 +300,21 @@ def _build_configs() -> "collections.OrderedDict[str, Cfg]":
         determ=True,
     )
     add("hbm_only_determ", "hbm", "HBM-only with DEMB_DETERMINISM_MODE=ON", determ=True)
+    # The miss path in row chunks: the number of launches grows with the number of chunks,
+    # the number of syncs does not, so the twins of the in-tree configs read the same zero.
+    for twin, layout, extra in (
+        ("cache_storage", "cache", {}),
+        ("hbm_only", "hbm", {}),
+        ("hybrid", "hybrid", {}),
+        ("cache_storage_admit", "cache", {"admit": True}),
+    ):
+        add(
+            twin + "_chunked",
+            layout,
+            out[twin].doc + ", the miss path in 64-row chunks",
+            chunk_rows=64,
+            **extra,
+        )
     return out
 
 
@@ -1327,7 +1345,12 @@ def run_case(
     old_det = os.environ.get("DEMB_DETERMINISM_MODE")
     if cfg.determ:
         os.environ["DEMB_DETERMINISM_MODE"] = "ON"
+    from dynamicemb import sync_free as sf
+
+    old_chunk_rows = sf.CHUNK_ROWS
     try:
+        if cfg.chunk_rows:
+            sf.CHUNK_ROWS = cfg.chunk_rows
         torch.manual_seed(seed)
         plan = plan_of(cfg, scenario)
         res["plan"] = plan
@@ -1427,6 +1450,7 @@ def run_case(
         if probe is not None and probe.stderr_other:
             res["stderr_tail"] = probe.stderr_other[-1500:]
     finally:
+        sf.CHUNK_ROWS = old_chunk_rows
         if cfg.determ:
             if old_det is None:
                 os.environ.pop("DEMB_DETERMINISM_MODE", None)

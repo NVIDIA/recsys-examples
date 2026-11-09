@@ -1808,7 +1808,7 @@ The unique keys of a batch stay as long as the input, with the count of unique k
 What it costs:
 
 - The miss path (the storage lookup, the initialization of new rows, the inserts, the eviction and the write-back) runs on every step, also when nothing missed, because the host does not know that. A step launches the same kernels whether its keys hit or miss. An all-hit step launches about twenty more kernels than before, which shows only when a step is CPU-bound; a step that misses launches fewer, and no longer waits for the GPU several times.
-- The buffers of the miss path (`values`, `evicted_values`: `N x value_dim`, with `N` the number of keys of the batch, duplicates included) are allocated at the length of the input instead of the number of misses. A group whose buffers would exceed `DYNAMICEMB_SYNC_FREE_MAX_BYTES` takes the previous path, which reads the counts.
+- The buffers of the miss path (`values`, `evicted_values`: `N x value_dim`, with `N` the number of keys of the batch, duplicates included) are allocated at the length of the input instead of the number of misses. A step whose buffers would exceed `DYNAMICEMB_MISS_PATH_BUFFER_BYTES` (default 4 GiB) runs its miss path in consecutive row chunks, never by another path: the reads are the same (none), see [Chunked miss path](#chunked-miss-path). Eval allocates `N x embedding_dim` for the unique rows of a pooled lookup and a DEFAULT-mode forward keeps `N x value_dim` until its backward: both are `O(N)`, not `O(unique keys)`, and are not chunked.
 
 What can still wait for the GPU. Each of these reads goes through `sync_free.read_now` or is outside DynamicEmb, so searching the package for `read_now` lists them:
 
@@ -1820,6 +1820,14 @@ What can still wait for the GPU. Each of these reads goes through `sync_free.rea
 - the input distribution of TorchRec (the split sizes of the all-to-all of keys live on the host).
 
 `DYNAMICEMB_SYNC_FREE=0` restores the previous lookup paths for comparison, and the `sync_free` helpers and `test/unit_tests/no_host_sync` (a probe that counts the syncs of a step per layout and scenario, and a ratchet against `budgets.json`) show where a sync comes from.
+
+### Chunked miss path
+
+The miss path allocates `[rows, value_dim]` buffers (the values it loads and initializes, the values it evicts; three of them with an external storage below the cache). Where `2 x rows x value_dim x element size` would exceed `DYNAMICEMB_MISS_PATH_BUFFER_BYTES` it runs in consecutive chunks of rows. The cache lookup, the pin of every hit, the scoring lookup of the storage and the miss gate are done once for the whole batch; each chunk then loads, initializes, inserts, evicts and writes back its own rows, and pins its new cache entries before the next chunk inserts. A batch that fits is one chunk: the kernels of an unchunked step. The number of launches grows with the number of chunks, the number of reads does not.
+
+- With room in every tier (and in every HBM-only step, whose hits the reference counter pins), a chunked step gives what the unchunked step gives: the slots, the forward values, the rows of every tier, the retained keys, the cache metrics (`[2]` and `[3]` of `cache_metrics` are the totals over the chunks) and the decisions of the frequency admitter.
+- The table kernels give no order between the keys of one launch, so running a chunk to completion before the next is one of the orders the single launch could have taken. Under eviction pressure the state of a chunked step is therefore a state the unchunked step could reach.
+- Two differences remain, and neither can put another key's data in a row. A key that the whole-batch lookup found in a *full* storage, whose chunk comes after one that evicted it: the key is read from the tier below if there is one (it was spilled before), else initialized one step earlier than the unchunked step would have lost it. And what is random is random per chunk: the draws of a random initializer, and of a probabilistic admitter, are reproducible for a chunk plan, not across plans.
 
 ## Deterministic mode
 
@@ -1837,5 +1845,5 @@ The following environment variables control runtime behavior of dynamicemb:
 | `DYNAMICEMB_DEBUG` | unset | When set to any non-empty value, enables extra runtime validation in `segmented_unique_cuda`. A one-block kernel verifies on the device: (1) `segmented_range[0] == 0`, (2) `segmented_range[num_tables] == num_keys`, (3) monotonically non-decreasing. A violation is a device-side assert that prints the failed condition (the CUDA context is unusable afterwards), not an exception. Intended for development and testing only; costs one small kernel launch per call and no host synchronization. |
 | `DYNAMICEMB_SYNC_FREE` | `1` | When set to `0`, the lookup takes the previous paths that compact the missing keys and read their counts, for comparison and as a kill switch. See [Host syncs](#host-syncs). |
 | `DYNAMICEMB_MISS_PATH_GATE` | `always` | How a step decides whether to run the miss path: `always` launches it every step (no host read), `poll` skips it when a non-blocking poll shows that nothing missed (the control flow depends on timing; the results do not), `read` reads the miss count with one blocking copy. `read` is used for `DEMB_DETERMINISM_MODE` and an external storage. |
-| `DYNAMICEMB_SYNC_FREE_MAX_BYTES` | `4294967296` | A group whose miss-path buffers (`2 x N x value_dim x element size`) would exceed this takes the previous, count-reading path. |
+| `DYNAMICEMB_MISS_PATH_BUFFER_BYTES` | `4294967296` | The bytes of `[rows, value_dim]` buffers one chunk of the miss path may allocate (2 x rows x value_dim x element size). A bigger batch is processed in several chunks, never by another path. See [Chunked miss path](#chunked-miss-path). |
 | `DYNAMICEMB_EXACT_GROWTH` | `0` | When set to `1`, `expand_if_need` confirms a table's size with a blocking copy before growing it, as `load()` always does, instead of deciding from the last landed size snapshot and the bounds of the batches since. |

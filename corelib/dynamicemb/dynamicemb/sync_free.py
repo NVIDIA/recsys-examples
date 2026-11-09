@@ -33,6 +33,11 @@ with it (the module flags below) and an equivalent PyTorch fallback otherwise;
 the results are the same. The flags are read at call time through this module,
 so tests set them to run the fallbacks.
 
+The miss path allocates ``[rows, value_dim]`` buffers. Where they would not fit
+``BUFFER_BYTES`` (``DYNAMICEMB_MISS_PATH_BUFFER_BYTES``) the path runs in consecutive row
+chunks (``row_chunks``) instead of taking another code path: the number of launches
+grows with the number of chunks, the number of reads does not.
+
 What the host genuinely has to know is read late: ``DeferredRead`` is a ring of
 pinned landing slots with events and never blocks. A read that cannot wait goes
 through one audited place, ``read_now`` (``DeferredRead.wait`` and
@@ -44,6 +49,7 @@ the calling thread is inside one of them.
 import contextlib
 import os
 import threading
+import warnings
 from typing import Callable, List, Optional, Tuple, Union
 
 import dynamicemb_extensions
@@ -94,6 +100,34 @@ def _miss_gate_from_env() -> str:
 
 
 MISS_GATE: str = _miss_gate_from_env()
+
+# The bytes of ``[rows, value_dim]`` buffers one chunk of the miss path may allocate
+# (``row_chunks``): 4 GiB, which is what the memory guard of the first masked paths
+# allowed for two buffers of a whole batch.
+_DEFAULT_BUFFER_BYTES = 4 << 30
+
+
+def _buffer_bytes_from_env() -> int:
+    text = os.environ.get("DYNAMICEMB_MISS_PATH_BUFFER_BYTES")
+    if not text:
+        return _DEFAULT_BUFFER_BYTES
+    try:
+        value = int(text)
+    except ValueError:
+        value = 0
+    if value <= 0:
+        raise ValueError(
+            "DYNAMICEMB_MISS_PATH_BUFFER_BYTES must be a positive number of bytes, "
+            f"got {text!r}."
+        )
+    return value
+
+
+BUFFER_BYTES: int = _buffer_bytes_from_env()
+# Rows per chunk whatever the budget says: a test hook (a module attribute, read at call
+# time, never an environment variable). 0 and None leave the budget in charge.
+CHUNK_ROWS: Optional[int] = None
+_WARNED_SMALL_CHUNK = False
 
 # Number of read_now calls so far; tests snapshot it to assert how many blocking
 # reads a step costs.
@@ -232,12 +266,22 @@ def initialize_masked(
         # A row whose index is -1 is skipped before anything else is read.
         initializer(out, keys, table_ids, torch.where(mask, rows, -1))
         return
-    # Initialize every row of a scratch block, then copy back the masked ones. The
-    # clamp keeps a table id of -1 inside the table-parameter tensor; such a row is
-    # discarded anyway.
-    scratch = torch.empty_like(out, memory_format=torch.contiguous_format)
-    initializer(scratch, keys, table_ids.clamp(min=0), rows)
-    out.copy_(torch.where(mask.unsqueeze(1), scratch, out))
+    # Initialize every row of a scratch block, then copy back the masked ones, in row
+    # chunks so that the scratch stays within the budget. The clamp keeps a table id of
+    # -1 inside the table-parameter tensor; such a row is discarded anyway.
+    for start, stop in row_chunks(n, out.size(1) * out.element_size(), buffers=1):
+        scratch = torch.empty(
+            stop - start, out.size(1), dtype=out.dtype, device=out.device
+        )
+        initializer(
+            scratch,
+            keys[start:stop],
+            table_ids[start:stop].clamp(min=0),
+            rows[: stop - start],
+        )
+        out[start:stop].copy_(
+            torch.where(mask[start:stop].unsqueeze(1), scratch, out[start:stop])
+        )
 
 
 def padded_optimizer_table_ids(table_ids: torch.Tensor) -> torch.Tensor:
@@ -270,6 +314,30 @@ def compact_by_count(
     selected_first = torch.sort(mask.to(torch.int8), descending=True, stable=True)
     order = selected_first.indices[:count]
     return [None if a is None else _take_rows(a, order) for a in arrays]
+
+
+def row_chunks(n: int, row_bytes: int, buffers: int = 2) -> List[Tuple[int, int]]:
+    """Consecutive ``(start, stop)`` covering ``[0, n)``, each short enough that
+    ``buffers`` buffers of ``row_bytes`` per row fit ``BUFFER_BYTES`` (at least one row).
+
+    ``[(0, n)]`` when everything fits, which is every batch the 4 GiB memory guard let
+    through (``2 * n * row_bytes <= BUFFER_BYTES``), and for ``n == 0``. Pure host
+    arithmetic: the length of a chunk never depends on the data.
+    """
+    rows = max(1, int(CHUNK_ROWS or BUFFER_BYTES // max(1, buffers * row_bytes)))
+    if n <= rows:
+        return [(0, n)]
+    global _WARNED_SMALL_CHUNK
+    if not CHUNK_ROWS and rows < 16 and not _WARNED_SMALL_CHUNK:
+        # A budget this small is a misconfiguration: say so once.
+        _WARNED_SMALL_CHUNK = True
+        warnings.warn(
+            f"DYNAMICEMB_MISS_PATH_BUFFER_BYTES={BUFFER_BYTES} allows {rows} row(s) "
+            f"per chunk for {n} keys: the miss path will launch about "
+            f"{-(-n // rows)} chunks per step.",
+            UserWarning,
+        )
+    return [(start, min(start + rows, n)) for start in range(0, n, rows)]
 
 
 # ---------------------------------------------------------------------------

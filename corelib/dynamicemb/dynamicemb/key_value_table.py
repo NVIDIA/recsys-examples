@@ -3336,6 +3336,7 @@ class DynamicEmbCache(Cache):
         scores: Optional[torch.Tensor] = None,
         *,
         async_count: bool = False,
+        accumulate: bool = False,
     ) -> Tuple[
         torch.Tensor,
         Union[int, torch.Tensor],
@@ -3350,6 +3351,10 @@ class DynamicEmbCache(Cache):
         stays an ``int64[1]`` tensor on the device and the four evicted arrays are
         as long as ``keys``, their entries past ``num_evicted`` inert (the
         reserved all-ones key, index and table id ``-1``).
+
+        With ``accumulate`` the insert counts as a further part of the one the
+        metrics describe (a prefetch whose miss path runs in row chunks): ``[2]`` and
+        ``[3]`` of the metrics are added to instead of overwritten.
         """
         state = self._state
         score_arg = get_insert_score_arg(state, keys.numel(), keys.device, scores)
@@ -3358,14 +3363,23 @@ class DynamicEmbCache(Cache):
         )
         if self._record_cache_metrics:
             m = self._metrics_dev
-            m[2].copy_(sf.valid_keys(keys).sum())
+            inserted = sf.valid_keys(keys).sum()
             if async_count:
-                m[3].copy_(result[1].reshape(()))  # num_evicted, on the device
+                evicted = result[1].reshape(())  # num_evicted, on the device
             else:
-                # ``m[3] = n`` copies a CPU scalar tensor to the device (a transfer
-                # from pageable memory); ``fill_`` is a kernel taking ``n`` as an
-                # argument.
-                m[3].fill_(int(result[1]))
+                evicted = int(result[1])
+            if accumulate:
+                m[2].add_(inserted)
+                m[3].add_(evicted)
+            else:
+                m[2].copy_(inserted)
+                if async_count:
+                    m[3].copy_(evicted)
+                else:
+                    # ``m[3] = n`` copies a CPU scalar tensor to the device (a
+                    # transfer from pageable memory); ``fill_`` is a kernel taking
+                    # ``n`` as an argument.
+                    m[3].fill_(evicted)
             self._metrics_streams[1] = torch.cuda.current_stream().cuda_stream
         return result
 
@@ -3379,7 +3393,8 @@ class DynamicEmbCache(Cache):
 
         ``[0]`` is the number of unique keys of the last lookup and ``[1]`` how many
         of them were found; ``[2]`` the number of keys of the last insert and ``[3]``
-        how many entries it evicted. The counters are kept on the device, so
+        how many entries it evicted (of a prefetch whose miss path ran in row chunks,
+        the totals over its chunks). The counters are kept on the device, so
         reading them is where the host waits for the device, not the lookups: one
         batched copy per read. It is a snapshot, a later lookup does not change
         a tensor returned earlier.
@@ -4677,23 +4692,34 @@ class HybridStorage(Storage):
 
         # The count of evictions stays on the device: the evicted arrays are as long
         # as the batch and inert past the evictions (reserved key, table id and row
-        # ``-1``), so the load, the store and the host insert below run over all of
-        # them and skip the rest. The select would not: it is given the tail hidden.
-        evicted_values = load_from_flat(
-            self._hbm, evicted_indices, evicted_table_ids, copy_mode=CopyMode.VALUE
-        )
-        _select_refused_values(
-            evicted_indices, evicted_table_ids, unique_values, evicted_values
-        )
+        # ``-1``), so the load and the host insert below run over all of them and skip
+        # the rest. The select would not: it is given the tail hidden. The victims are
+        # read in row chunks that keep their buffer within the budget
+        # (``sf.row_chunks``), each chunk moving to the host tier before the next is
+        # read, and all of them before the new rows overwrite their slots: the two tiers
+        # are disjoint, so the host insert and the HBM store commute.
+        for start, stop in sf.row_chunks(
+            evicted_keys.numel(),
+            self._hbm.value_dim * self._hbm.emb_dtype.itemsize,
+            buffers=1,
+        ):
+            chunk_indices = evicted_indices[start:stop]
+            chunk_table_ids = evicted_table_ids[start:stop]
+            evicted_values = load_from_flat(
+                self._hbm, chunk_indices, chunk_table_ids, copy_mode=CopyMode.VALUE
+            )
+            # An entry's index is -(i + 1) for row ``i`` of the whole input.
+            _select_refused_values(
+                chunk_indices, chunk_table_ids, unique_values, evicted_values
+            )
+            _insert_key_values(
+                self._host,
+                evicted_keys[start:stop],
+                chunk_table_ids,
+                evicted_values,
+                evicted_scores[start:stop],
+            )
         store_to_flat(self._hbm, indices, table_ids, unique_values)
-
-        _insert_key_values(
-            self._host,
-            evicted_keys,
-            evicted_table_ids,
-            evicted_values,
-            evicted_scores,
-        )
 
     def incremental_dump(
         self,

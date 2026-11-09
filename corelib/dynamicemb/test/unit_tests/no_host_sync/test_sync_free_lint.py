@@ -1181,6 +1181,10 @@ TARGETS: List[Target] = (
         "_prefetch_cache_path_masked",
         "_prefetch_hbm_direct_path_masked",
         "_generic_forward_path_masked",
+        # the chunked miss path: one function per chunk of rows, and the view of a slice
+        "_cache_miss_chunk",
+        "_hbm_miss_chunk",
+        "_rows",
     )
     + _legacy(
         BDF,
@@ -1202,6 +1206,8 @@ TARGETS: List[Target] = (
         "DynamicEmbStorage.load_masked",
         "HybridStorage.lookup_masked",
         "HybridStorage.load_masked",
+        # the victims of the HBM tier move to the host tier in row chunks
+        "HybridStorage.insert",
         "request_size_snapshot",
         "DynamicEmbStorage.request_size_snapshot",
         "HybridStorage.request_size_snapshot",
@@ -1209,7 +1215,6 @@ TARGETS: List[Target] = (
     )
     + _legacy(
         KVT,
-        "HybridStorage.insert",
         "_eval_lookup_storage",
         "_eval_lookup_cached",
         "DynamicEmbCache.lookup",
@@ -1232,6 +1237,7 @@ TARGETS: List[Target] = (
         "initialize_masked",
         "compact_by_count",
         "padded_optimizer_table_ids",
+        "row_chunks",
         "DeferredRead.enqueue",
         "DeferredRead.ready",
         "DeferredRead.value",
@@ -1263,10 +1269,6 @@ FINAL = os.environ.get("SYNC_LINT_FINAL") == "1"
 LEGACY_BASELINE: Dict[str, Dict[str, int]] = {
     "dynamicemb/batched_dynamicemb_function.py::dynamicemb_prefetch": {
         "host-read-helper": 1,
-    },
-    "dynamicemb/key_value_table.py::HybridStorage.insert": {
-        "mask-index": 6,
-        "reduction-in-branch": 2,
     },
     "dynamicemb/key_value_table.py::_eval_lookup_cached": {
         "host-read-helper": 1,

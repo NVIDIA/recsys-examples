@@ -21,7 +21,7 @@ commit that removes syncs lowers the numbers it earned in the same diff, so a re
 sees the claim and nothing can quietly give it back; see sync_budgets.py for the file
 and the command that lowers it. The ratchet also bounds the cudaMalloc/cudaFree events
 of a measured window (steady state allocates nothing) and the transient memory a
-sync-free hit step adds over the legacy path (B8).
+sync-free hit step adds (B8).
 
 Needs a GPU and the CUDA profiler for the census; the checks of the file itself run
 anywhere. The probe's instruments are validated first (the ``instruments_ok``
@@ -212,18 +212,28 @@ def test_sync_ratchet(config, census, budgets):
 # --------------------------------------------------------------------------
 # transient memory of a hit step (GPU), B8
 # --------------------------------------------------------------------------
+# What an all-hit step may add to the memory it started with, in units of one
+# [N, value_dim] buffer (N keys of the batch, duplicates included).
+# ABSOLUTE: the whole step. The miss path runs on inert rows (the host does not know that
+# nothing missed) and holds two such buffers (the loaded values and the evicted ones);
+# the forward adds its output and the unique embeddings, the backward its gradients: at most
+# about five of them are live at once, so this leaves room for the index arrays and a
+# little more, and catches an extra full-size buffer or worse. A first estimate, to be
+# tightened with the measured census.
+ABSOLUTE_BOUND = 8.0
+# CHUNKED: what the miss path of the whole batch adds over a miss path that runs in 64-row
+# chunks (a chunk's worth of buffers instead of the batch's): the two buffers and a half.
+CHUNKED_BOUND = 2.5
+
+
 @pytest.mark.parametrize("config", ["cache_storage", "hbm_only", "host_only", "hybrid"])
-def test_hit_step_memory_growth_is_bounded(config, gpu, bdf, monkeypatch):
-    """The sync-free lookup paths run on arrays of the batch size and hold a
-    [N, value_dim] values buffer and one of evicted values (B8). Their peak memory over
-    the legacy path's, in an all-hit step, stays under 2.5 x N x value_dim x itemsize.
-    The legacy path is the kill switch ``bdf._SYNC_FREE = False``; a tree without it has
-    nothing to compare with."""
+def test_hit_step_memory_growth_is_bounded(config, gpu, sf, monkeypatch):
+    """The padded lookup paths run on arrays of the batch size and hold a [N, value_dim]
+    values buffer and one of evicted values (B8). An all-hit step peaks under ABSOLUTE_BOUND
+    buffers over its start, and under CHUNKED_BOUND over the same step with the miss path in
+    64-row chunks (``sync_free.CHUNK_ROWS``, which makes the chunk buffers negligible).
+    """
     torch = gpu
-    if not hasattr(bdf, "_SYNC_FREE"):
-        pytest.skip(
-            "this tree has no kill switch (bdf._SYNC_FREE), hence no legacy path to compare with"
-        )
     # wide rows, as in a real model: the batch-sized index arrays are then small
     # against the [N, value_dim] buffers the bound is about
     monkeypatch.setattr(hsp, "DIM", 128)
@@ -234,8 +244,8 @@ def test_hit_step_memory_growth_is_bounded(config, gpu, bdf, monkeypatch):
     step = hsp._make_step(mod, cfg, "plain", True)
     mod.train()
 
-    def peak_growth(sync_free):
-        monkeypatch.setattr(bdf, "_SYNC_FREE", sync_free)
+    def peak_growth(chunk_rows):
+        monkeypatch.setattr(sf, "CHUNK_ROWS", chunk_rows)
         for _ in range(4):  # the first steps insert the keys and warm the allocator
             step(batch)
         torch.cuda.synchronize()
@@ -245,13 +255,18 @@ def test_hit_step_memory_growth_is_bounded(config, gpu, bdf, monkeypatch):
         torch.cuda.synchronize()
         return torch.cuda.max_memory_allocated() - base
 
-    legacy = peak_growth(False)
-    masked = peak_growth(True)
+    chunked = peak_growth(64)
+    whole = peak_growth(None)
     top_tier = mod._cache if mod._cache is not None else mod._storage
     itemsize = torch.empty(0, dtype=top_tier.embedding_dtype()).element_size()
-    bound = 2.5 * batch.indices.numel() * top_tier.max_value_dim() * itemsize
-    assert masked - legacy <= bound, (
-        "%s: an all-hit step peaks at %d bytes over its start on the sync-free path and %d on "
-        "the legacy path; the bound on the difference is %d (2.5 x N x value_dim x itemsize)"
-        % (config, masked, legacy, bound)
+    unit = batch.indices.numel() * top_tier.max_value_dim() * itemsize
+    assert whole <= ABSOLUTE_BOUND * unit, (
+        "%s: an all-hit step peaks at %d bytes over its start, %.2f buffers of N x value_dim "
+        "(%d bytes); the bound is %.1f"
+        % (config, whole, whole / unit, unit, ABSOLUTE_BOUND)
+    )
+    assert whole - chunked <= CHUNKED_BOUND * unit, (
+        "%s: an all-hit step peaks at %d bytes over its start in one chunk and %d in 64-row "
+        "chunks; the difference is %.2f buffers of N x value_dim (%d bytes), the bound is %.1f"
+        % (config, whole, chunked, (whole - chunked) / unit, unit, CHUNKED_BOUND)
     )

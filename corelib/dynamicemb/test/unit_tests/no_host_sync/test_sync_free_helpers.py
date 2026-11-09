@@ -391,6 +391,30 @@ def test_initialize_masked_fallback_equals_the_capability_path(monkeypatch, dtyp
     assert torch.equal(results[0], results[1])
 
 
+@pytest.mark.parametrize("device", DEVICES)
+@pytest.mark.parametrize("dtype", KEY_DTYPES)
+@pytest.mark.parametrize("chunk", [1, 5, 16, 100])
+def test_initialize_masked_fallback_in_row_chunks_equals_one_block(
+    monkeypatch, device, dtype, chunk
+):
+    """The scratch of the fallback is bounded by the miss-path budget: initialized and copied
+    back in row chunks it gives the result of one block (an initializer sees only its own
+    chunk's keys, table ids and row numbers)."""
+    monkeypatch.setattr(sf, "INIT_SKIPS_NEGATIVE", False)
+    n, emb = 32, 8
+    g = torch.Generator().manual_seed(9)
+    mask = (torch.rand(n, generator=g) < 0.4).to(device)
+    keys = keys_of(list(range(1000, 1000 + n)), dtype, device)
+    ids = (torch.arange(n, device=device) % 4).to(torch.int64)
+    results = []
+    for rows in (None, chunk):
+        monkeypatch.setattr(sf, "CHUNK_ROWS", rows)
+        out = torch.full((n, emb), -1.0, device=device)
+        sf.initialize_masked(RecordingInitializer(False), out, keys, ids, mask)
+        results.append(out.cpu())
+    assert torch.equal(results[0], results[1])
+
+
 # --------------------------------------------------------------------------
 # the miss gate's mode
 # --------------------------------------------------------------------------
