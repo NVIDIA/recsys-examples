@@ -22,7 +22,7 @@ import torch
 from dynamicemb import sync_free as sf
 from dynamicemb.async_erase import table_section
 from dynamicemb.dynamicemb_config import EvictedItemMode
-from dynamicemb.embedding_admission import IN_TREE_ADMITTERS
+from dynamicemb.embedding_admission import admitter_accepts_empty_keys
 from dynamicemb.initializer import MultiTableInitializer
 from dynamicemb.key_value_table import (
     Cache,
@@ -34,6 +34,7 @@ from dynamicemb.key_value_table import (
     _append_evicted,
     _find_keys,
     _insert_and_evict_keys,
+    _masked_eval_applies,
     _select,
     _write_back_evicted,
     eval_lookup,
@@ -58,43 +59,30 @@ from dynamicemb_extensions import (
 )
 
 
-def _copy_cuda_tensor_to_pinned_cpu(tensor: torch.Tensor) -> torch.Tensor:
-    if not tensor.is_cuda:
-        return tensor.detach().cpu()
-    cpu = torch.empty(
-        tuple(tensor.shape),
-        dtype=tensor.dtype,
-        device=torch.device("cpu"),
-        pin_memory=True,
-    )
-    cpu.copy_(tensor.detach(), non_blocking=True)
-    torch.cuda.current_stream(tensor.device).synchronize()
-    return cpu
-
-
-def _scalar_item(tensor: torch.Tensor):
-    if not isinstance(tensor, torch.Tensor):
-        return tensor
-    if tensor.numel() != 1:
-        raise ValueError(f"expected scalar tensor, got shape {tuple(tensor.shape)}")
-    return _copy_cuda_tensor_to_pinned_cpu(tensor.reshape(1))[0].item()
-
-
-def _bool_item(tensor: torch.Tensor) -> bool:
-    return bool(_scalar_item(tensor))
-
-
 def segmented_unique(
     keys: torch.Tensor,
     segment_range: torch.Tensor,
     evict_strategy: Optional[EvictStrategy] = None,
     frequency_counts: Optional[torch.Tensor] = None,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> Tuple[
+    torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor], torch.Tensor
+]:
     """
     Perform segmented unique operation on keys with segment_range.
 
     This function deduplicates keys within each table segment, using the
     GPU-accelerated segmented_unique_cuda kernel.
+
+    The number of unique keys ``U`` exists only on the device, and reading it
+    would make the host wait for everything queued before this call. So nothing
+    is read and nothing is cut to ``U``: the outputs stay as long as the number
+    of keys ``N`` the host already knows, and the part past the unique keys, rows
+    ``[U, N)``, is padding. A build of the extension that fills it
+    (``sync_free.TAIL_INERT``) leaves the reserved all-ones key there (``-1`` as
+    int64, ``0xFF..FF`` as uint64) and frequency 0; ``sync_free.canonical_unique``
+    gives the keys, and with them the table ids from ``expand_table_ids_cuda``,
+    that convention for any build. Without the fill the frequency of the padding
+    is unspecified, which is fine: it is only read.
 
     Args:
         keys: Input key tensor (int64 or uint64)
@@ -104,11 +92,18 @@ def segmented_unique(
         frequency_counts: Optional input frequency counts per key
 
     Returns:
-        Tuple of (unique_keys, reverse_indices, unique_keys_table_range,
-                  output_scores, unique_size_per_table).
-        unique_size_per_table is a CPU tensor of shape (num_tables,) with
-        per-table unique counts; total unique count is its sum or
-        unique_keys_table_range[-1].
+        Tuple of (unique_keys, reverse_indices, unique_table_offsets,
+                  output_scores, unique_total).
+        unique_keys has N entries: the unique keys grouped by table, then the
+        padding. reverse_indices has an entry per input key: the row of
+        unique_keys that key was merged into, always a real row (below U).
+        unique_table_offsets is int64[num_tables + 1] on the device; table t's
+        unique keys are rows [offsets[t], offsets[t + 1]) and offsets[num_tables]
+        is U. output_scores is the accumulated frequency of each unique key (N
+        entries, padding included), or None when no frequency was asked for.
+        unique_total is a 0-d int64 view of unique_table_offsets[num_tables], U
+        on the device: reading it is the wait this function avoids.
+        With no keys the arrays are empty and unique_table_offsets is zeros.
     """
     with torch.cuda.nvtx.range("op:segmented_unique"):
         num_keys = keys.size(0)
@@ -121,15 +116,12 @@ def segmented_unique(
             d_table_range = torch.zeros(
                 num_tables + 1, dtype=torch.int64, device=device
             )
-            unique_size_per_table = torch.zeros(
-                num_tables, dtype=torch.int64, device="cpu"
-            )
             return (
                 empty_keys,
                 empty_reverse_indices,
                 d_table_range,
                 None,
-                unique_size_per_table,
+                d_table_range[num_tables],
             )
 
         is_lfu_enabled = (
@@ -151,24 +143,16 @@ def segmented_unique(
             freq_counters,
         ) = segmented_unique_cuda(keys, segment_range, num_tables, input_frequencies)
 
-        table_offsets_cpu = _copy_cuda_tensor_to_pinned_cpu(table_offsets)
-        total_unique = table_offsets_cpu[num_tables].item()
-        unique_size_per_table = (
-            table_offsets_cpu[1 : num_tables + 1] - table_offsets_cpu[0:num_tables]
-        )
-
-        unique_keys_out = unique_keys[:total_unique]
-
-        output_scores = None
-        if need_frequency_output and total_unique > 0:
-            output_scores = freq_counters[:total_unique]
+        # The kernel allocates these at N, the most unique keys there can be.
+        output_scores = freq_counters if need_frequency_output else None
 
         return (
-            unique_keys_out,
+            unique_keys,
             reverse_indices,
             table_offsets,
             output_scores,
-            unique_size_per_table,
+            # A view of the offsets: no launch, and nothing reads it here.
+            table_offsets[num_tables],
         )
 
 
@@ -178,7 +162,10 @@ def largest_score_per_unique_key(
     """The score of each unique key: the largest of those its occurrences had.
 
     ``reverse_indices[i]`` is the unique key that input key ``i`` was merged
-    into; a key that was not repeated keeps its own score.
+    into; a key that was not repeated keeps its own score. ``num_unique`` is the
+    length of the result and may exceed the number of unique keys (the unique
+    arrays are padded to the number of keys): the rows nothing was merged into
+    stay 0.
     """
     unique_scores = torch.zeros(num_unique, dtype=torch.int64, device=scores.device)
     return unique_scores.scatter_reduce_(
@@ -323,6 +310,9 @@ class PrefetchState:
     non_admitted_positions: Optional[torch.Tensor] = None
     # One int64 per unique key, for tables that take a score per key.
     unique_scores: Optional[torch.Tensor] = None
+    # How many keys this batch counted for in the outstanding-keys check: its unique
+    # keys when the arrays are exact, otherwise an upper bound of them, the number
+    # of keys of the batch (``unique_total`` has the exact count, on the device).
     num_prefetched_keys: int = 0
     outstanding_keys_ref: Optional[OutstandingKeys] = None
     # The key_map_generation (rehash count) of the table state the slots were found in: a later
@@ -616,16 +606,16 @@ def _in_tree_admitter(admitter) -> bool:
     """Whether the admitter may be asked about padded rows.
 
     A masked path hands ``admit`` arrays that keep the batch's length: the keys it
-    is not asking about are replaced by the reserved EMPTY key. Both in-tree
-    admitters accept that. A user class has to opt in on the class itself; an
-    inherited attribute does not count, because a subclass that overrides ``admit``
-    has not been written against EMPTY keys.
+    is not asking about are replaced by the reserved EMPTY key, and the padding of
+    the unique arrays has table id -1. The in-tree admitters accept that, provided
+    they are made of in-tree parts: one built around a counter or a
+    non-admitted-row initializer of the user's own passes the arrays on to code
+    that was promised dense keys. A user class has to opt in on the class itself;
+    an inherited attribute does not count, because a subclass that overrides
+    ``admit`` has not been written against EMPTY keys. All of that is
+    ``admitter_accepts_empty_keys``.
     """
-    return (
-        admitter is None
-        or type(admitter) in IN_TREE_ADMITTERS
-        or bool(type(admitter).__dict__.get("accepts_empty_keys", False))
-    )
+    return admitter_accepts_empty_keys(admitter)
 
 
 def _uses_rng(admitter) -> bool:
@@ -652,9 +642,12 @@ def _masked_dispatch(
     """Whether a lookup group takes its masked path.
 
     ``n`` is the length of the arrays the path allocates its ``[n, value_dim]``
-    transients for. A caller that routes on the answer asks once and hands it to the
-    path function (``masked=``): asked again for arrays of another length, the size
-    limit can answer differently.
+    transients for: the number of keys of the batch, which is how long the padded
+    unique arrays of the mask form are. The front end asks once, before it knows
+    how many of them are unique, and hands the answer to the path function
+    (``masked=``) together with the arrays made for it: asked again for the exact
+    arrays of the host-sized form, which are shorter, the size limit could answer
+    differently.
     """
     if not (
         _SYNC_FREE
@@ -671,6 +664,45 @@ def _masked_dispatch(
     if mode == StorageMode.HBM_DIRECT:
         return type(storage) is DynamicEmbStorage
     return _in_tree_storage(storage)
+
+
+def _masked_eval_dispatch(
+    cache: Optional[Cache],
+    storage: Storage,
+    n: int,
+    emb_dim: int,
+    itemsize: int,
+) -> bool:
+    """Whether an eval lookup group works on padded unique arrays with a ``valid``
+    mask (``eval_lookup(valid=...)``), as ``_masked_dispatch`` decides for training.
+
+    ``eval_lookup`` takes its masked form whenever it is given ``valid``, so only
+    a group it can serve may be given one: in-tree storage and cache, and
+    DYNAMICEMB_SYNC_FREE not 0 (``_masked_eval_applies``, which reads the
+    environment itself at every call). Eval allocates one ``[n, emb_dim]``
+    transient, held to the same size limit as the training paths.
+    """
+    return (
+        _SYNC_FREE
+        and _masked_eval_applies(storage, cache)
+        and _masked_fits(n, emb_dim, itemsize)
+    )
+
+
+def _read_unique_offsets(
+    unique_table_offsets: torch.Tensor, num_keys: int
+) -> torch.Tensor:
+    """The offsets of a dedup on the host: the one blocking read of a lookup group
+    that works on exact-length arrays (an external storage, a user-defined class,
+    the memory guard, DYNAMICEMB_SYNC_FREE=0).
+
+    ``num_keys`` is the number of keys that went into the dedup. A batch without
+    keys has no unique keys either, so it is answered without waiting for the
+    device.
+    """
+    if num_keys == 0:
+        return torch.zeros(unique_table_offsets.shape, dtype=torch.int64)
+    return sf.read_now(unique_table_offsets)[0]
 
 
 def _miss_gate_of(storage):
@@ -703,9 +735,10 @@ def _prefetch_cache_path_masked(
     length of the unique batch. A key that takes no part in a step is replaced by
     the reserved EMPTY key, which every table kernel skips (found=false, index -1)
     without reading its table id; a slot or row that must not be touched is -1.
-    ``valid`` marks the real rows of a padded batch (None: every row is real). A
-    row that is not real looks like a miss to the lookups, so every miss mask ANDs
-    it.
+    ``valid`` marks the real rows of a padded batch (None: every row is real). The
+    other rows are hidden from the tables as the reserved key, whatever their
+    producer left in them, so they look like misses to the lookups, and every miss
+    mask ANDs ``valid``.
 
     Only for an in-tree cache and storage, without an external storage, and with an
     admitter that takes EMPTY keys (see ``_masked_dispatch``).
@@ -718,6 +751,12 @@ def _prefetch_cache_path_masked(
         state, device, n = cache._state, unique_keys.device, unique_keys.numel()
         if n == 0:
             return torch.empty(0, dtype=torch.int64, device=device), None
+        if valid is not None:
+            # A key the cache holds, left in the padding, would be pinned and its
+            # slot updated by the backward from a gradient nobody computed (one only
+            # the storage holds would get its score bumped). The padding of a
+            # conforming batch is EMPTY already, so this changes nothing for it.
+            unique_keys = sf.mask_keys(unique_keys, valid)
         gate = state.miss_gate
 
         # 1. Look the keys up in the cache and pin every hit before an insert can
@@ -1154,10 +1193,11 @@ def _prefetch_hbm_direct_path_masked(
     of misses, to decide whether the path is launched at all (``poll`` only takes
     a count that has already landed, ``always`` does not look at one).
 
-    ``valid`` marks the real rows (``None``: every row is real). ``unique_keys``,
-    ``unique_table_ids`` and the optional ``accumulated_frequency`` and
-    ``key_scores`` have one entry per row; a table kernel reads a lane's score
-    before it looks at its key.
+    ``valid`` marks the real rows (``None``: every row is real). The other rows are
+    hidden from the table as the reserved key before anything is looked up,
+    whatever their producer left in them. ``unique_keys``, ``unique_table_ids`` and
+    the optional ``accumulated_frequency`` and ``key_scores`` have one entry per
+    row; a table kernel reads a lane's score before it looks at its key.
 
     Returns ``(slot_indices, non_admitted_mask, value_row_indices)`` like the
     host-sized form, except that the refused keys are a bool mask over the rows
@@ -1173,6 +1213,11 @@ def _prefetch_hbm_direct_path_masked(
             empty = torch.empty(0, dtype=torch.int64, device=device)
             return empty, None, empty
 
+        if valid is not None:
+            # A key the table holds, left in the padding, would be found, pinned and
+            # updated by the backward from a gradient nobody computed. The padding of
+            # a conforming batch is EMPTY already, so this changes nothing for it.
+            unique_keys = sf.mask_keys(unique_keys, valid)
         gate = state.miss_gate
 
         # 1. Look every key up (a hit's score is updated), then pin the hits before
@@ -1570,17 +1615,25 @@ def dynamicemb_prefetch(
 
     ``table_key_bounds`` (CPU int64, one per table) is what the caller knows, without
     the device, of how many keys each table's part of the batch can have: the key
-    counts of its features. A front end that does not read the dedup count back
-    sizes the growth of the storage from it; this one has the exact count of unique
-    keys per table, which is never above the bound, and uses that.
+    counts of its features. A group that does not read the dedup count back (the
+    mask form) sizes the growth of the storage from it, and bounds every table by
+    the whole batch when it is not given. A group that reads the count anyway (the
+    host-sized form) has the exact number of unique keys per table, which is never
+    above the bound, and uses that.
+
+    The unique arrays of the mask form are as long as ``indices``, not as the number
+    of unique keys, which only the device knows; see ``segmented_unique`` and
+    ``PrefetchState.unique_valid``.
     """
     with torch.cuda.nvtx.range("dynamicemb_prefetch"):
         table_num = feature_offsets.numel() - 1
         assert table_num != 0
+        assert (
+            table_key_bounds is None or table_key_bounds.numel() == table_num
+        ), "table_key_bounds has one entry per table"
         emb_dtype = storage.embedding_dtype()
         max_emb_dim = storage.max_embedding_dim()
         max_val_dim = storage.max_value_dim()
-        caching = cache is not None
 
         evict_strat = EvictStrategy(evict_strategy.value) if evict_strategy else None
         # todo: double check
@@ -1588,12 +1641,39 @@ def dynamicemb_prefetch(
         if frequency_counters is not None:
             frequency_counts_int64 = frequency_counters.long()
 
+        if cache is not None:
+            storage_mode = StorageMode.CACHE
+        elif _is_hbm_storage(storage):
+            storage_mode = StorageMode.HBM_DIRECT
+        else:
+            storage_mode = StorageMode.DEFAULT
+        # The form of the whole group is decided here, once, from host facts, before
+        # the dedup: how many keys are unique is on the device. In the mask form the
+        # unique arrays keep the length of ``indices`` and ``unique_valid`` marks
+        # their real rows. The other form (an external storage, a user-defined class,
+        # the size limit, DYNAMICEMB_SYNC_FREE=0) is written against exact-length
+        # arrays and gets them after one read of the dedup offsets. The path
+        # functions below take the decision as an argument, so they never decide
+        # again for arrays of another length; a DEFAULT-mode batch carries it to its
+        # forward in the state.
+        num_keys = indices.numel()
+        masked = _masked_dispatch(
+            storage_mode,
+            cache,
+            storage,
+            admitter,
+            external_storage,
+            num_keys,
+            max_val_dim,
+            emb_dtype.itemsize,
+        )
+
         # The sizes the expansion below decides from are read back without waiting, on
         # the stream that inserts into the storage: this one, for a cache's storage
         # and an HBM storage. A host or hybrid storage is inserted into by the
         # forward, which takes its snapshot there (``note_forwarded``).
-        if hasattr(storage, "request_size_snapshot") and (
-            caching or _is_hbm_storage(storage)
+        if storage_mode != StorageMode.DEFAULT and hasattr(
+            storage, "request_size_snapshot"
         ):
             storage.request_size_snapshot()
 
@@ -1601,9 +1681,9 @@ def dynamicemb_prefetch(
         (
             unique_keys,
             reverse_indices,
-            unique_indices_table_range,
+            unique_table_offsets,
             lfu_accumulated_frequency,
-            unique_size_per_table,
+            unique_total,
         ) = segmented_unique(
             indices,
             indices_table_range,
@@ -1617,57 +1697,66 @@ def dynamicemb_prefetch(
                 scores, reverse_indices, unique_keys.numel()
             )
         )
-
-        num_prefetched_keys = unique_keys.numel()
-
         unique_table_ids = expand_table_ids_cuda(
-            unique_indices_table_range,
+            unique_table_offsets,
             unique_keys.numel(),
         )
+
+        if masked:
+            # Past the unique keys the arrays hold the all-ones key and table id -1,
+            # which every table kernel skips; ``unique_valid`` is the mask of the rows
+            # before them.
+            unique_keys, unique_table_ids, unique_valid = sf.canonical_unique(
+                unique_keys, unique_table_ids, table_num
+            )
+            # What each table's keys can add, as far as the host knows without the
+            # count: its features' key counts if the caller has them, otherwise the
+            # whole batch for every table (growth can then come early, never late).
+            per_table_bound = (
+                table_key_bounds
+                if table_key_bounds is not None
+                else torch.full((table_num,), num_keys, dtype=torch.int64)
+            )
+            # A bound, not the unique count; the exact one is on the device
+            # (``unique_total``) and OutstandingKeys reads it late.
+            num_prefetched_keys, exact_unique_count = num_keys, None
+        else:
+            # Host-sized contracts get exact arrays, which costs this group one read.
+            unique_valid, unique_total = None, None
+            unique_offsets = _read_unique_offsets(unique_table_offsets, num_keys)
+            exact_unique_count = int(unique_offsets[table_num])
+            per_table_bound = unique_offsets[1:] - unique_offsets[:-1]
+            unique_keys = unique_keys[:exact_unique_count]
+            unique_table_ids = unique_table_ids[:exact_unique_count]
+            if lfu_accumulated_frequency is not None:
+                lfu_accumulated_frequency = lfu_accumulated_frequency[
+                    :exact_unique_count
+                ]
+            if unique_scores is not None:
+                unique_scores = unique_scores[:exact_unique_count]
+            num_prefetched_keys = exact_unique_count
 
         slot_indices = None
-        non_admitted_positions = None
+        non_admitted = None
         value_row_indices = None
         key_map_generation = 0
-        if caching:
-            storage_mode = StorageMode.CACHE
-        elif _is_hbm_storage(storage):
-            storage_mode = StorageMode.HBM_DIRECT
-        else:
-            storage_mode = StorageMode.DEFAULT
-        # The path of the group is decided once, from host facts, for the arrays as
-        # they are now: exactly the unique count long, every row real (no ``valid``
-        # mask). The cache path takes the decision as an argument; a DEFAULT-mode
-        # batch carries it in its state, because its lookup runs in the forward.
-        masked = _masked_dispatch(
-            storage_mode,
-            cache,
-            storage,
-            admitter,
-            external_storage,
-            unique_keys.numel(),
-            max_val_dim,
-            emb_dtype.itemsize,
-        )
-
         outstanding_entry = None
         with table_section(table_gate):
             if hasattr(storage, "expand_if_need"):
                 storage.expand_if_need(
-                    unique_size_per_table,
+                    per_table_bound,
                     inserts_in_forward=(storage_mode == StorageMode.DEFAULT),
                 )
 
             if storage_mode == StorageMode.CACHE:
                 if outstanding_keys_ref is not None:
-                    # The unique count is known here, so this is checked at once.
                     outstanding_entry = outstanding_keys_ref.add(
-                        num_prefetched_keys, None, num_prefetched_keys
+                        num_prefetched_keys, unique_total, exact_unique_count
                     )
                     outstanding_keys_ref.check(cache._state.capacity)
                 (
                     slot_indices,
-                    non_admitted_positions,
+                    non_admitted,
                 ) = _prefetch_cache_path(
                     cache,
                     storage,
@@ -1682,7 +1771,7 @@ def dynamicemb_prefetch(
                     admitter,
                     external_storage,
                     key_scores=unique_scores,
-                    valid=None,
+                    valid=unique_valid,
                     masked=masked,
                 )
                 # The cache addresses its own value buffer by cache slot: a cache is
@@ -1692,7 +1781,7 @@ def dynamicemb_prefetch(
             elif storage_mode == StorageMode.HBM_DIRECT:
                 (
                     slot_indices,
-                    non_admitted_positions,
+                    non_admitted,
                     value_row_indices,
                 ) = _prefetch_hbm_direct_path(
                     storage,
@@ -1705,19 +1794,14 @@ def dynamicemb_prefetch(
                     lfu_accumulated_frequency,
                     admitter,
                     key_scores=unique_scores,
+                    valid=unique_valid,
+                    masked=masked,
                 )
                 key_map_generation = storage._state.key_map_generation
 
-        # A masked path returns the refused keys as a bool mask over all unique keys,
-        # a legacy path as their int64 positions. What came back says which one ran,
-        # so the label cannot disagree with the path.
-        non_admitted_mask = None
-        if (
-            non_admitted_positions is not None
-            and non_admitted_positions.dtype == torch.bool
-        ):
-            non_admitted_mask, non_admitted_positions = non_admitted_positions, None
-
+        # The mask form returns the refused keys as a bool mask over all unique rows,
+        # the host-sized form as their int64 positions. ``masked`` is what chose the
+        # path, so it also says which one this is.
         return PrefetchState(
             unique_keys=unique_keys,
             reverse_indices=reverse_indices,
@@ -1727,14 +1811,16 @@ def dynamicemb_prefetch(
             emb_dtype=emb_dtype,
             slot_indices=slot_indices,
             storage_mode=storage_mode,
-            non_admitted_positions=non_admitted_positions,
-            non_admitted_mask=non_admitted_mask,
+            non_admitted_positions=None if masked else non_admitted,
+            non_admitted_mask=non_admitted if masked else None,
             generic_masked=masked and storage_mode == StorageMode.DEFAULT,
+            unique_valid=unique_valid,
+            unique_total=unique_total,
             unique_scores=unique_scores,
             num_prefetched_keys=num_prefetched_keys,
             outstanding_keys_ref=outstanding_keys_ref,
             outstanding_entry=outstanding_entry,
-            table_key_bounds=unique_size_per_table,
+            table_key_bounds=per_table_bound,
             value_row_indices=value_row_indices,
             key_map_generation=key_map_generation,
         )
@@ -1753,7 +1839,15 @@ def dynamicemb_eval_forward(
     frequency_counters: Optional[torch.Tensor] = None,
     pooling_weights: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    """Eval-only forward for all storage configurations (no autograd)."""
+    """Eval-only forward for all storage configurations (no autograd).
+
+    A pooled lookup deduplicates its keys like a training prefetch does, and in the
+    same two forms: padded unique arrays with a ``valid`` mask, which read nothing
+    back from the device, or, for what the mask form does not serve, exact arrays
+    after one read of the dedup offsets. A padded row is neither looked up nor
+    written (``eval_lookup`` leaves it as the buffer was) and is never gathered:
+    the pooling reads only the rows ``reverse_indices`` names.
+    """
     with torch.cuda.nvtx.range("dynamicemb_eval_forward"):
         table_num = feature_offsets.numel() - 1
         assert table_num != 0
@@ -1788,12 +1882,22 @@ def dynamicemb_eval_forward(
             frequency_counters.long() if frequency_counters is not None else None
         )
 
+        num_keys = indices.numel()
+        # Decided once, from host facts, before the dedup (see dynamicemb_prefetch).
+        masked = _masked_eval_dispatch(
+            cache,
+            storage,
+            num_keys,
+            storage.max_embedding_dim(),
+            emb_dtype.itemsize,
+        )
+
         (
             unique_indices,
             reverse_indices,
-            unique_indices_table_range,
-            lfu_accumulated_frequency,
-            unique_size_per_table,
+            unique_table_offsets,
+            _,
+            _,
         ) = segmented_unique(
             indices,
             indices_table_range,
@@ -1802,9 +1906,20 @@ def dynamicemb_eval_forward(
         )
 
         unique_table_ids = expand_table_ids_cuda(
-            unique_indices_table_range,
+            unique_table_offsets,
             unique_indices.numel(),
         )
+        if masked:
+            unique_indices, unique_table_ids, unique_valid = sf.canonical_unique(
+                unique_indices, unique_table_ids, table_num
+            )
+        else:
+            unique_valid = None
+            num_unique = int(
+                _read_unique_offsets(unique_table_offsets, num_keys)[table_num]
+            )
+            unique_indices = unique_indices[:num_unique]
+            unique_table_ids = unique_table_ids[:num_unique]
 
         unique_embs = eval_lookup(
             storage,
@@ -1812,6 +1927,7 @@ def dynamicemb_eval_forward(
             unique_table_ids,
             initializer,
             cache=cache,
+            valid=unique_valid,
         )
 
         output_embs = torch.empty(
@@ -1881,6 +1997,10 @@ def _generic_forward_path(
             admitter,
             key_scores,
         )
+    assert valid is None, (
+        "padded unique arrays reached the host-sized generic forward, "
+        "which takes exact-length arrays"
+    )
     return _generic_forward_path_legacy(
         storage,
         optimizer,
