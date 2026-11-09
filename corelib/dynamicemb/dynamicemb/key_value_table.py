@@ -75,6 +75,8 @@ from dynamicemb.types import (
     PaddedFind,
     ReplayStats,
     Storage,
+    as_padded,
+    has_padded_contract,
     torch_dtype_to_np_dtype,
 )
 from dynamicemb_extensions import EvictStrategy, device_timestamp, flagged_compact
@@ -5229,45 +5231,22 @@ def _write_back_evicted(
     has evicted since goes to ``next_tier``; with none it is dropped, kept as an
     evicted key when storage retains them.
 
-    Without a ``next_tier`` this is :func:`_write_back_evicted_masked`: the arrays
-    may be of any length, padded with inert entries, and nothing is counted or
-    compacted, so the host does not wait for the device. ``slots`` are the
-    evicted indices the insert reported (see there).
-
-    With a ``next_tier`` (an external store, which takes host-sized tensors and is
-    written by code that may run on the host) the keys are compacted into the
-    ones storage has and the ones it has evicted since, each with a count read.
-    The arrays are then exact, and ``slots`` is not consulted.
+    This is :func:`_write_back_evicted_masked`: the arrays may be of any length,
+    padded with inert entries, and nothing is counted or compacted, so the host does
+    not wait for the device. ``slots`` are the evicted indices the insert reported
+    (see there). ``next_tier`` is any storage; one that has not declared the padded
+    contract is served through its ``insert`` (see :func:`as_padded`).
     """
     if keys.numel() == 0:
         return
-    if next_tier is None:
-        return _write_back_evicted_masked(storage, keys, table_ids, values, slots)
-    st = storage._state
-    in_storage = _find_keys(st, keys, table_ids, const_lookup=True, compact=False)[5]
-    with torch.cuda.nvtx.range("op:flagged_compact"):
-        num_present, present, (present_keys, present_tids) = flagged_compact(
-            in_storage, [keys, table_ids]
-        )
-    with torch.cuda.nvtx.range("op:storage_insert"):
-        if num_present > 0:
-            storage.insert(
-                present_keys,
-                present_tids,
-                _select(values, present, num_present == keys.numel()),
-                preserve_existing=True,
-            )
-        if num_present == keys.numel():
-            return
-        if num_present == 0:
-            gone_keys, gone_tids, gone_values = keys, table_ids, values
-        else:
-            with torch.cuda.nvtx.range("op:flagged_compact"):
-                _, gone, (gone_keys, gone_tids) = flagged_compact(
-                    ~in_storage, [keys, table_ids]
-                )
-            gone_values = values[gone]
-        next_tier.insert(gone_keys, gone_tids, gone_values)
+    _write_back_evicted_masked(
+        storage,
+        keys,
+        table_ids,
+        values,
+        slots,
+        None if next_tier is None else as_padded(next_tier),
+    )
 
 
 def _write_back_evicted_masked(
@@ -5276,23 +5255,25 @@ def _write_back_evicted_masked(
     table_ids: torch.Tensor,
     values: torch.Tensor,
     slots: Optional[torch.Tensor],
+    next_tier: Optional[Storage] = None,
 ) -> None:
-    """:func:`_write_back_evicted` without a next tier, over arrays of any length.
+    """:func:`_write_back_evicted` over arrays of any length.
 
     ``keys`` / ``table_ids`` / ``values`` are as long as the evicted arrays of an
     insert, an entry that is not an eviction being inert: the reserved all-ones
     key and table id ``-1``. The keys storage still has get their value written to
     the row they hold (``store_to_flat`` skips a row of ``-1``): storage keeps the
     score of a key, only the value moves, so this is what an insert that keeps
-    existing scores does, without the insert. Without a store below it a key
-    storage has evicted since is dropped, or retained when storage retains
-    evicted keys.
+    existing scores does, without the insert. A key storage has evicted since goes
+    to ``next_tier`` (a storage of the padded contract: the keys storage still has
+    are hidden from it as the reserved key), or is dropped without one, or retained
+    when storage retains evicted keys.
 
     ``slots`` is the index the insert reported for each entry (``None`` for an
     array that has none, as in a flush). A negative one is not an eviction: the
     insert refused that key (its bucket and overflow are all pinned) and reports
     it as an evicted entry with index ``-(i + 1)``, a row of ``values`` that was
-    never loaded. Such an entry is neither written back nor retained.
+    never loaded. Such an entry is neither written back nor passed on nor retained.
     """
     st = storage._state
     with torch.cuda.nvtx.range("op:write_back_evicted"):
@@ -5302,9 +5283,11 @@ def _write_back_evicted_masked(
         live = None if slots is None else (slots >= 0)
         rows = found_rows if live is None else torch.where(live, found_rows, -1)
         store_to_flat(st, rows, table_ids, values)
-        if EvictedItemMode.RETAIN_KEY in st.evicted_item_mode:
-            # Keys storage no longer has were evicted by it in the meantime.
-            gone = (found_rows < 0) if live is None else ((found_rows < 0) & live)
+        # Keys storage no longer has were evicted by it in the meantime.
+        gone = (found_rows < 0) if live is None else ((found_rows < 0) & live)
+        if next_tier is not None:
+            next_tier.insert_masked(sf.mask_keys(keys, gone), table_ids, values)
+        elif EvictedItemMode.RETAIN_KEY in st.evicted_item_mode:
             _append_evicted_masked(
                 st, sf.mask_keys(keys, gone), torch.where(gone, table_ids, -1)
             )
@@ -5356,7 +5339,8 @@ def _eval_lookup_storage(
     real. A key found nowhere takes the constant of the eval initializer, which
     is written over its row only: padding is neither loaded nor initialized.
     """
-    found = storage.lookup_masked(keys, table_ids)  # const: not training in eval
+    # const: not training in eval
+    found = storage.lookup_masked(keys, table_ids, copy_mode=CopyMode.EMBEDDING)
     embs = storage.load_masked(found, table_ids, CopyMode.EMBEDDING)
     missing = ~found.founds if valid is None else valid & ~found.founds
     sf.initialize_masked(initializer, embs, keys, table_ids, missing)
@@ -5411,7 +5395,9 @@ def _eval_lookup_cached(
         cache._state, cache_indices, table_ids, copy_mode=CopyMode.EMBEDDING
     )
     miss = ~founds if valid is None else valid & ~founds
-    found = storage.lookup_masked(sf.mask_keys(keys, miss), table_ids)
+    found = storage.lookup_masked(
+        sf.mask_keys(keys, miss), table_ids, copy_mode=CopyMode.EMBEDDING
+    )
     storage.load_masked(found, table_ids, CopyMode.EMBEDDING, output=embs)
     sf.initialize_masked(initializer, embs, keys, table_ids, miss & ~found.founds)
     return embs
@@ -5467,19 +5453,14 @@ def _eval_lookup_cached_legacy(
 def _masked_eval_applies(storage: Storage, cache: Optional[Cache]) -> bool:
     """Whether an eval lookup may take the masked path (host facts only).
 
-    The masked functions need ``lookup_masked`` / ``load_masked``, which only the
-    in-tree storages have, by exact type: a subclass may override ``find``. Any
-    other ``Storage`` or ``Cache`` keeps the exact-length functions, as does
-    ``DYNAMICEMB_SYNC_FREE=0``, the switch that restores the legacy paths. It is
+    Any storage may: one that has not declared the padded contract is served
+    through its ``find`` (see :func:`as_padded`). ``DYNAMICEMB_SYNC_FREE=0``, the
+    switch that restores the legacy paths, keeps the exact-length functions. It is
     read from the environment at every call, not from the flag the prefetch
     dispatchers hold (that module imports this one): a test flips it with
     ``monkeypatch.setenv``.
     """
-    return (
-        os.environ.get("DYNAMICEMB_SYNC_FREE", "1") != "0"
-        and type(storage) in (DynamicEmbStorage, HybridStorage)
-        and (cache is None or type(cache) is DynamicEmbCache)
-    )
+    return os.environ.get("DYNAMICEMB_SYNC_FREE", "1") != "0"
 
 
 def eval_lookup(
@@ -5499,8 +5480,10 @@ def eval_lookup(
 
     *valid* (bool, one entry per key) marks the real keys of a batch padded to a
     fixed length: the others are the reserved key with table id ``-1``, and their
-    rows are neither looked up nor written (they hold garbage). It needs the
-    in-tree storage; ``None`` means every key is real.
+    rows are neither looked up nor written (they hold garbage); ``None`` means
+    every key is real. A *storage* that has not declared the padded contract is
+    asked through its ``find``, after one read of how many keys are live (see
+    :func:`~dynamicemb.types.as_padded`); the *cache* has to be a ``DynamicEmbCache``.
 
     Returns the embedding tensor of shape ``[len(keys), emb_dim]``.
     """
@@ -5514,6 +5497,15 @@ def eval_lookup(
         )
 
     if valid is not None or _masked_eval_applies(storage, cache):
+        if cache is not None and not (
+            type(cache) is DynamicEmbCache or has_padded_contract(cache)
+        ):
+            raise TypeError(
+                "eval_lookup reads the table state of its cache: only a DynamicEmbCache "
+                f"(or a subclass that sets accepts_empty_keys = True in its own body) can "
+                f"be the cache, got {type(cache).__name__}."
+            )
+        storage = as_padded(storage)
         if cache is None:
             return _eval_lookup_storage(storage, keys, table_ids, initializer, valid)
         return _eval_lookup_cached(

@@ -33,6 +33,10 @@ FWD_BWD_TEST_FILES=(
     # The padded Storage contract (find_masked / insert_masked) and the adapter that
     # serves a class that has not adopted it.
     "test/unit_tests/padded_contract/test_storage_adapters.py"
+    # An external storage below the cache and as the only tier, through the padded bodies;
+    # the legacy bodies they replaced are the oracle (test/unit_tests/legacy_oracle.py).
+    "test/unit_tests/padded_contract/test_ps_flows.py"
+    "test/unit_tests/padded_contract/test_host_ps.py"
     # The miss path in row chunks (the budget of its buffers) and the environment surface
     # that feeds the chunk plan.
     "test/unit_tests/test_miss_path_chunks.py"

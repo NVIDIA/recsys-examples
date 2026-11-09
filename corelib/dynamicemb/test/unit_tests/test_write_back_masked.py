@@ -252,3 +252,52 @@ def test_a_next_tier_still_gets_the_keys_storage_no_longer_has(device):
     assert gone_keys == [keys[i].item() for i in gone]
     assert gone_tids == [0] * len(gone)
     assert torch.equal(gone_values, values[gone])
+
+
+class _PaddedTier:
+    """A tier of the padded contract: it records what it is handed, tensors of the evicted arrays'
+    length whose rows storage still has (and the padding) are the reserved key."""
+
+    accepts_empty_keys = True
+
+    def __init__(self):
+        self.calls = []
+
+    def insert_masked(
+        self, keys, table_ids, values, scores=None, preserve_existing=False
+    ):
+        assert keys.is_cuda and table_ids.is_cuda and values.is_cuda
+        self.calls.append((keys.clone(), table_ids.clone(), values.clone()))
+
+
+def test_a_padded_next_tier_gets_the_keys_storage_no_longer_has_as_padded_arrays(
+    device,
+):
+    """No compaction and no count: the tier is handed arrays as long as the evicted ones, in which
+    every entry but the keys storage no longer has (an entry that is present in storage, a refused
+    insert, padding) is the reserved key. A refused insert is not passed on."""
+    rng = random.Random(11)
+    storage, reference = _storage(False, device), _storage(False, device)
+    keys, tids, slots, present, live = _batch(rng, 48, with_pads=True, device=device)
+    values = _new_values(keys.numel(), device)
+    tier = _PaddedTier()
+
+    _write_back_evicted(storage, tier, keys, tids, values, slots)
+    _reference_insert(reference, keys, tids, values, present, live)
+    torch.cuda.synchronize()
+
+    _assert_same_storage(storage, reference, device)
+    assert len(tier.calls) == 1
+    got_keys, got_tids, got_values = tier.calls[0]
+    assert got_keys.shape == keys.shape and got_values.shape == values.shape
+    gone = [
+        key != -1 and not stored and ok
+        for key, stored, ok in zip(keys.tolist(), present, live)
+    ]
+    assert any(gone), "the batch must have keys that storage no longer has"
+    assert got_keys.tolist() == [k if g else -1 for k, g in zip(keys.tolist(), gone)]
+    assert torch.equal(got_values, values)
+    # the rows the tier is to ignore may carry any table id, the ones it is to keep carry theirs
+    for i, g in enumerate(gone):
+        if g:
+            assert got_tids[i].item() == tids[i].item()

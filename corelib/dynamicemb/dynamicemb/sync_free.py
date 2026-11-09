@@ -720,5 +720,20 @@ class MissGate:
         return not landed_zero
 
 
+class _AlwaysGate:
+    """The gate of a storage that has no table state (an external one in DEFAULT mode):
+    it has no ring to poll, so the miss path always runs, which is what ``MISS_GATE``
+    "always" does for everyone else. Same interface as :class:`MissGate`."""
+
+    def begin(self, is_miss: torch.Tensor, *, rng: bool = False) -> _Pending:
+        return None
+
+    def needed(self, pending: _Pending) -> bool:
+        return True
+
+
+ALWAYS_GATE = _AlwaysGate()
+
+
 def _first_int(host_tensor: torch.Tensor) -> int:
     return int(host_tensor.reshape(-1)[0])

@@ -82,10 +82,13 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 # This is the list of "inherent syncs that remain" of the sync-removal design
 # (section 5), cut down to what the measured step of a probe configuration can
 # contain:
-#   I1  an external parameter server (cache_ps*): the Storage interface takes
-#       request-sized host tensors, so DynamicEmb reads the dedup count and the
-#       miss counts in front of every PS call (every step, hits included), and
-#       the PS stand-in's own host code adds more.
+#   I1  an external parameter server written against the host-sized Storage
+#       contract (cache_ps*): its find / insert take tensors of exactly the number
+#       of live rows, so DynamicEmb reads that number once per PS call (an all-hit
+#       step reads the miss count once and calls nothing), and the PS stand-in's own
+#       host code adds more. A PS of the padded contract costs DynamicEmb nothing:
+#       cache_dps*, host_dps run the in-tree storage as the device-resident PS and
+#       are measured at zero.
 #   I3  DEMB_DETERMINISM_MODE (*_determ) in the training scenarios: the wave
 #       loop of a deterministic insert needs host counts and the miss path is
 #       gated by one blocking read in that mode.
@@ -110,9 +113,10 @@ _GROWTH_WHY = (
     "HostVMMTensor.extend)"
 )
 _PS_WHY = (
-    "external parameter server: its Storage interface takes request-sized host "
-    "tensors (DynamicEmb reads the dedup and miss counts before each PS call) and "
-    "the stand-in itself reads CUDA tensors on the host (PyDictStorage.find/insert)"
+    "external parameter server of the host-sized contract: its find / insert take "
+    "tensors of exactly the number of live rows, so DynamicEmb reads that number once "
+    "per PS call (types._live_rows), and the stand-in itself reads CUDA tensors on the "
+    "host (PyDictStorage.find/insert)"
 )
 _DETERM_WHY = (
     "DEMB_DETERMINISM_MODE: the wave count of a deterministic insert is a host "
@@ -209,7 +213,7 @@ WARN_TEXT = "called a synchronizing CUDA operation"
 @dataclasses.dataclass(frozen=True)
 class Cfg:
     name: str
-    layout: str  # cache | cache_ps | hbm | hybrid | host
+    layout: str  # cache | cache_ps | hbm | hybrid | host | host_ps
     pooling: str = "none"  # none | sum
     optimizer: str = "sgd"  # sgd | adam
     admit: bool = False  # FrequencyAdmissionStrategy(threshold=2)
@@ -224,6 +228,10 @@ class Cfg:
     # The miss path runs in chunks of this many rows (sync_free.CHUNK_ROWS, around the
     # build and the measured window): the batch has 576 key slots, so 64 is 9 chunks a step.
     chunk_rows: int = 0
+    # The external storage: "dict" is PyDictStorage (the host-sized contract, the default
+    # of the cache_ps layout), "device" the in-tree DynamicEmbStorage as a device-resident
+    # PS (the padded contract: DynamicEmb and the PS itself read nothing).
+    ps: str = ""
     doc: str = ""
 
 
@@ -300,6 +308,28 @@ def _build_configs() -> "collections.OrderedDict[str, Cfg]":
         determ=True,
     )
     add("hbm_only_determ", "hbm", "HBM-only with DEMB_DETERMINISM_MODE=ON", determ=True)
+    # A device-resident external storage of the padded contract (the in-tree storage
+    # standing in for a GPU PS): the same layouts as the PyDictStorage ones, and the PS
+    # as the only tier. Its step reads nothing, DynamicEmb's side or the PS's.
+    add(
+        "cache_dps",
+        "cache_ps",
+        "HBM cache + storage + a device-resident padded-contract PS",
+        ps="device",
+    )
+    add(
+        "cache_dps_sum",
+        "cache_ps",
+        "HBM cache + storage + a device-resident padded-contract PS, SUM pooling",
+        ps="device",
+        pooling="sum",
+    )
+    add(
+        "host_dps",
+        "host_ps",
+        "a device-resident padded-contract PS as the only tier",
+        ps="device",
+    )
     # The miss path in row chunks: the number of launches grows with the number of chunks,
     # the number of syncs does not, so the twins of the in-tree configs read the same zero.
     for twin, layout, extra in (
@@ -307,6 +337,7 @@ def _build_configs() -> "collections.OrderedDict[str, Cfg]":
         ("hbm_only", "hbm", {}),
         ("hybrid", "hybrid", {}),
         ("cache_storage_admit", "cache", {"admit": True}),
+        ("cache_dps", "cache_ps", {"ps": "device"}),
     ):
         add(
             twin + "_chunked",
@@ -366,6 +397,9 @@ def scenarios_of(cfg: Cfg) -> List[str]:
     if cfg.layout == "cache_ps":
         # the module refuses eval() with an external storage (see forward())
         out = [x for x in out if x not in EVAL_SCENARIOS]
+    if cfg.layout == "host_ps":
+        # the PS is the only tier and has no capacity to evict from; eval reads it
+        out = ["all_hit", "miss", "eval", "eval_miss"]
     return out
 
 
@@ -387,7 +421,7 @@ def plan_of(cfg: Cfg, scenario: str) -> Dict[str, Any]:
         p["max_capacity"], p["hbm_rows"] = (16384, 2048) if evict else (65536, 8192)
     elif cfg.layout == "cache_ps":
         p["max_capacity"], p["hbm_rows"] = (4096, 1024) if evict else (65536, 8192)
-    elif cfg.layout in ("hbm", "host"):
+    elif cfg.layout in ("hbm", "host", "host_ps"):
         p["max_capacity"] = 4096 if evict else 65536
     elif cfg.layout == "hybrid":
         p["max_capacity"], p["hbm_rows"] = (16384, 2048) if evict else (65536, 8192)
@@ -1079,7 +1113,13 @@ class BatchMaker:
         return out
 
 
-def _load_ps_class():
+def _load_ps_class(kind: str = "dict"):
+    """The external storage class of a config: ``dict`` is the PyDictStorage demo, ``device``
+    the in-tree storage standing in for a device-resident PS."""
+    if kind == "device":
+        from dynamicemb.key_value_table import DynamicEmbStorage
+
+        return DynamicEmbStorage
     # The PS stand-in lives in <dynamicemb root>/test; this file is three levels
     # below that directory, and the runner only puts the test file's own
     # directory on sys.path.
@@ -1119,7 +1159,8 @@ def build_module(cfg: Cfg, plan: Dict[str, Any], device_index: int):
         local_hbm = 1024**3
     else:
         local_hbm = 0
-    ps = _load_ps_class() if cfg.layout == "cache_ps" else None
+    ps_kind = cfg.ps or ("dict" if cfg.layout == "cache_ps" else "")
+    ps = _load_ps_class(ps_kind) if ps_kind else None
     admit = None
     if cfg.admit:
         from dynamicemb.embedding_admission import FrequencyAdmissionStrategy, KVCounter
@@ -1197,6 +1238,8 @@ def tier_sizes(mod) -> Dict[str, Dict[str, List[int]]]:
         ps = getattr(mod, "_external_storage", None)
         if ps is not None and hasattr(ps, "dict"):
             out["ps"] = {"size": [len(ps.dict)], "cap": [0]}
+        elif ps is not None and hasattr(ps, "key_index_map"):
+            out["ps"] = of_km(ps.key_index_map, 2)
     except Exception as e:  # diagnostics must never break a run
         out["error"] = {"size": [], "cap": [], "msg": repr(e)}  # type: ignore
     return out

@@ -357,6 +357,9 @@ class _DenseFind(NamedTuple):
     positions: Optional[torch.Tensor]  # where the dense rows sit among the N rows
     found: Optional[torch.Tensor]  # bool[count]
     values: Optional[torch.Tensor]  # [count, width]
+    # The host count of missing keys the class returned from ``find`` (a host int by
+    # its contract); 0 when no row was live, so nothing was asked.
+    num_missing: int = 0
 
 
 class OldContractStorage:
@@ -403,7 +406,7 @@ class OldContractStorage:
             key_scores,
             count=live_count,
         )
-        token, score_in = _DenseFind(None, None, None), None
+        token, score_in = _DenseFind(None, None, None, 0), None
         if count:
             d_keys, d_ids, d_freq, d_scores = dense
             # Only what there is: a store written before per-key scores has no such
@@ -416,7 +419,7 @@ class OldContractStorage:
             result = self.inner.find(d_keys, d_ids, copy_mode=copy_mode, **kwargs)
             d_found = result[5].to(device=device, dtype=torch.bool)
             found[positions] = d_found  # CUDA index, CUDA value: no sync
-            token = _DenseFind(positions, d_found, result[7].to(device))
+            token = _DenseFind(positions, d_found, result[7].to(device), int(result[0]))
             # What the class says a later insert of its missing keys takes as scores:
             # its own ``missing_scores``, N-aligned (None when it returned none).
             if result[4] is not None and result[4].numel() > 0:
@@ -424,6 +427,12 @@ class OldContractStorage:
                     unique_keys.numel(), positions, result[2], result[4]
                 )
         return MaskedFind(founds=found, score_in=score_in, scores=None, rows=token)
+
+    def nothing_missed(self, found: MaskedFind) -> bool:
+        """Whether the lookup that made ``found`` is known to have found every live key:
+        the class returned a host count of the keys it lacked (zero here), so a caller
+        may skip what would only handle the misses without reading anything."""
+        return found.rows.num_missing == 0
 
     def load_masked(self, found, table_ids, copy_mode, output=None):
         """Write the rows ``found`` fetched into ``output`` (``[N, width]``; the lanes

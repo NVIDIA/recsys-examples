@@ -309,8 +309,182 @@ def padded_py_dict_storage():
 
 
 # ---------------------------------------------------------------------------------------
+# which external storage a test runs against
+# ---------------------------------------------------------------------------------------
+# old: the host-sized contract; padded: the same dict behind the padded contract; device: no host
+# code at all; intree: the in-tree storage as a device-resident PS.
+PS_KINDS = ["old", "padded", "device", "intree"]
+
+
+def ps_class(kind):
+    """The external storage class of a kind (see ``PS_KINDS``)."""
+    import sys
+
+    if kind == "old":
+        if HERE not in sys.path:
+            sys.path.insert(0, HERE)
+        from test_batched_dynamic_embedding_tables_v2 import PyDictStorage
+
+        return PyDictStorage
+    if kind == "padded":
+        return padded_py_dict_storage()
+    if kind == "device":
+        return DeviceDictStorage
+    from dynamicemb.key_value_table import DynamicEmbStorage
+
+    return DynamicEmbStorage
+
+
+# ---------------------------------------------------------------------------------------
+# builders shared by the tests of the lookup paths
+# ---------------------------------------------------------------------------------------
+def table_options(
+    *, dim=8, capacity=1024, bucket=128, hbm=False, tables=1, evict=None, **kw
+):
+    """``tables`` identical table options: LRU, host values unless ``hbm``."""
+    from dynamicemb import DynamicEmbCheckMode, DynamicEmbScoreStrategy
+    from dynamicemb.dynamicemb_config import (
+        DynamicEmbEvictStrategy,
+        DynamicEmbTableOptions,
+    )
+
+    return [
+        DynamicEmbTableOptions(
+            index_type=torch.int64,
+            embedding_dtype=torch.float32,
+            device_id=torch.cuda.current_device(),
+            dim=dim,
+            max_capacity=capacity,
+            init_capacity=capacity,
+            bucket_capacity=bucket,
+            safe_check_mode=DynamicEmbCheckMode.IGNORE,
+            local_hbm_for_values=1024**3 if hbm else 0,
+            score_strategy=DynamicEmbScoreStrategy.TIMESTAMP,
+            evict_strategy=DynamicEmbEvictStrategy.LRU,
+            **kw,
+        )
+        for _ in range(tables)
+    ]
+
+
+def sgd_optimizer():
+    from dynamicemb.optimizer import OptimizerArgs, SGDDynamicEmbeddingOptimizer
+
+    return SGDDynamicEmbeddingOptimizer(OptimizerArgs())
+
+
+def constant_initializer(device, value=3.0):
+    """The initializer of a table: every new row is ``value``."""
+    from dynamicemb.dynamicemb_config import (
+        DynamicEmbInitializerArgs,
+        DynamicEmbInitializerMode,
+    )
+    from dynamicemb.initializer import MultiTableInitializer
+
+    args = DynamicEmbInitializerArgs(
+        mode=DynamicEmbInitializerMode.CONSTANT, value=value
+    )
+    return MultiTableInitializer.create([args], device)
+
+
+# ---------------------------------------------------------------------------------------
+# modules of the probe's configs, for the tests that run whole steps
+# ---------------------------------------------------------------------------------------
+def probe_module(config, plan, ps_cls=None):
+    """``(cfg, module, batch maker)`` of a probe config with the DEBUG initializer (a row is a
+    function of its key, so a lost or mixed-up row shows) and, when given, ``ps_cls`` as the
+    external storage."""
+    import sys
+
+    if NO_HOST_SYNC not in sys.path:
+        sys.path.insert(0, NO_HOST_SYNC)
+    import host_sync_probe as hsp
+    from dynamicemb.dynamicemb_config import (
+        DynamicEmbInitializerArgs,
+        DynamicEmbInitializerMode,
+    )
+    from dynamicemb.initializer import MultiTableInitializer
+
+    cfg = config if isinstance(config, hsp.Cfg) else hsp.CONFIGS[config]
+    device = torch.device("cuda", torch.cuda.current_device())
+    real = hsp._load_ps_class
+    if ps_cls is not None:
+        hsp._load_ps_class = lambda kind="dict": ps_cls
+    try:
+        mod = hsp.build_module(cfg, plan, device.index)
+    finally:
+        hsp._load_ps_class = real
+    args = DynamicEmbInitializerArgs(mode=DynamicEmbInitializerMode.DEBUG)
+    mod._initializer = MultiTableInitializer.create([args, args], device)
+    mod.train()
+    return cfg, mod, hsp.BatchMaker(cfg, device, 77)
+
+
+def random_batches(maker, steps, key_range, seed=5):
+    """``steps`` batches of the probe's geometry whose keys are drawn from ``[0, key_range)``
+    (small keys: ``DeviceDictStorage`` has a key domain, ``KEY_SPACE``)."""
+    import numpy as np
+
+    if NO_HOST_SYNC not in __import__("sys").path:
+        __import__("sys").path.insert(0, NO_HOST_SYNC)
+    import host_sync_probe as hsp
+
+    rng = np.random.default_rng(seed)
+    return [
+        maker.build(
+            {
+                t: rng.choice(key_range, size=hsp.UNIQ[t], replace=False).astype(
+                    np.int64
+                )
+                for t in (0, 1)
+            }
+        )
+        for _ in range(steps)
+    ]
+
+
+def overlap_batches(maker, steps, key_space=DeviceDictStorage.KEY_SPACE):
+    """The stream of ``BatchMaker.overlap_stream``, with keys in ``[0, key_space)``.
+
+    Each batch is 45% fresh keys and 45% of the previous batch's, so that an admitter of
+    threshold 2 both refuses and admits keys. The fresh keys are consecutive integers, not
+    the 62-bit hashes of ``BatchMaker.fresh``: the key domain of ``DeviceDictStorage`` is
+    ``KEY_SPACE``, and a key past it indexes past its table. Two makers of one seed give two
+    modules the same batches, as ``overlap_stream`` does.
+    """
+    import sys
+
+    import numpy as np
+
+    if NO_HOST_SYNC not in sys.path:
+        sys.path.insert(0, NO_HOST_SYNC)
+    import host_sync_probe as hsp
+
+    counter = {0: 0, 1: 0}
+    previous = {t: np.zeros(0, dtype=np.int64) for t in (0, 1)}
+    out = []
+    for _ in range(steps):
+        keys = {}
+        for t in (0, 1):
+            fresh = int(0.45 * hsp.ROW_N[t])
+            new = np.arange(counter[t], counter[t] + fresh, dtype=np.int64)
+            counter[t] += fresh
+            keys[t] = np.concatenate([new, previous[t][:fresh]])
+            previous[t] = new
+        out.append(maker.build(keys))
+    assert max(counter.values()) <= key_space, "the stream outgrew the key domain"
+    return out
+
+
+# ---------------------------------------------------------------------------------------
 # the checker
 # ---------------------------------------------------------------------------------------
+def _num_tables(ps) -> int:
+    """How many tables a stand-in or an in-tree storage serves."""
+    options = getattr(ps, "options", None)
+    return len(options) if options is not None else ps._state.num_tables
+
+
 def _live_pairs(keys: torch.Tensor, table_ids: torch.Tensor) -> torch.Tensor:
     k = sf.as_i64(keys)
     live = k != sf.EMPTY_KEY
@@ -323,7 +497,7 @@ def check_padded_call(ps, keys, table_ids, values=None, *, unique: bool) -> None
     assert keys.dim() == 1 and table_ids.shape == keys.shape
     assert table_ids.dtype == torch.int64
     assert values is None or values.size(0) == keys.numel(), "values are N-aligned"
-    num_tables = len(ps.options)
+    num_tables = _num_tables(ps)
     live = sf.as_i64(keys) != sf.EMPTY_KEY
     assert bool((table_ids >= -1).all()), "a table id is -1 or a table"
     assert bool(
@@ -331,7 +505,11 @@ def check_padded_call(ps, keys, table_ids, values=None, *, unique: bool) -> None
     ), "a live row has a real table"
     domain = getattr(ps, "KEY_SPACE", None)
     if domain is not None and bool(live.any()):
-        assert int(sf.as_i64(keys)[live].max()) < domain, "key outside the domain"
+        assert int(sf.as_i64(keys)[live].max()) < domain, (
+            "key outside the key domain [0, %d) of %s: draw the keys of a batch with "
+            "ps_standins.random_batches or overlap_batches, not BatchMaker.fresh (62-bit "
+            "hashes)" % (domain, type(ps).__name__)
+        )
     if unique:
         pairs = _live_pairs(keys, table_ids)
         assert torch.unique(pairs, dim=0).size(0) == pairs.size(
@@ -349,7 +527,7 @@ def check_old_call(ps, keys, table_ids, values=None) -> None:
             (sf.as_i64(keys) != sf.EMPTY_KEY).all()
         ), "a host-sized call has no padding"
         assert bool(
-            ((table_ids >= 0) & (table_ids < len(ps.options))).all()
+            ((table_ids >= 0) & (table_ids < _num_tables(ps))).all()
         ), "a host-sized call has real tables only"
 
 
@@ -357,14 +535,17 @@ def checked(ps_class, scribble: bool = True):
     """``ps_class`` that checks every call it gets against the contract it implements,
     records the calls (``self.calls``: ``(method, number of live rows)``), and, for a
     padded class with ``scribble``, replaces the table id and the values of every inert
-    row by garbage first, to see that they are not looked at."""
+    row by garbage first (a table id of a real table, which the contract allows an inert
+    row to carry), to see that they are not looked at."""
     padded = has_padded_contract(ps_class)
 
-    def scribbled(keys, table_ids, values=None):
+    def scribbled(ps, keys, table_ids, values=None):
         if not scribble:
             return table_ids, values
         inert = sf.as_i64(keys) == sf.EMPTY_KEY
-        garbage = torch.full_like(table_ids, 7)
+        garbage = torch.arange(
+            table_ids.numel(), device=table_ids.device
+        ) % _num_tables(ps)
         table_ids = torch.where(inert, garbage, table_ids)
         if values is not None and values.is_floating_point():
             values = torch.where(
@@ -392,7 +573,7 @@ def checked(ps_class, scribble: bool = True):
         ):
             check_padded_call(self, keys, table_ids, unique=False)
             self.calls.append(("find_masked", n_live(keys)))
-            table_ids, _ = scribbled(keys, table_ids)
+            table_ids, _ = scribbled(self, keys, table_ids)
             found, values = ps_class.find_masked(
                 self, keys, table_ids, copy_mode, lfu_accumulated_frequency, key_scores
             )
@@ -415,12 +596,22 @@ def checked(ps_class, scribble: bool = True):
         ):
             check_padded_call(self, keys, table_ids, values, unique=True)
             self.calls.append(("insert_masked", n_live(keys)))
-            table_ids, values = scribbled(keys, table_ids, values)
+            table_ids, values = scribbled(self, keys, table_ids, values)
             return ps_class.insert_masked(
                 self, keys, table_ids, values, scores, preserve_existing
             )
 
         namespace.update(find_masked=find_masked, insert_masked=insert_masked)
+        if ps_class.lookup_masked is not Storage.lookup_masked:
+            # A class with a lookup of its own (the in-tree storages) is not called through
+            # ``find_masked`` by the lookup protocol: check and record that one as the lookup.
+            def lookup_masked(self, keys, table_ids, *args, **kwargs):
+                check_padded_call(self, keys, table_ids, unique=False)
+                self.calls.append(("find_masked", n_live(keys)))
+                table_ids, _ = scribbled(self, keys, table_ids)
+                return ps_class.lookup_masked(self, keys, table_ids, *args, **kwargs)
+
+            namespace["lookup_masked"] = lookup_masked
     else:
 
         def find(

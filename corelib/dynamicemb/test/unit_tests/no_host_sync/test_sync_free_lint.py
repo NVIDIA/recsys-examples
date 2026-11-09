@@ -1185,6 +1185,11 @@ TARGETS: List[Target] = (
         "_cache_miss_chunk",
         "_hbm_miss_chunk",
         "_rows",
+        # the contract of the participants and what the padded bodies do with them
+        "_insert_into_storage_masked",
+        "_participants",
+        "_require",
+        "_miss_gate_of",
     )
     + _legacy(
         BDF,
@@ -1200,14 +1205,21 @@ TARGETS: List[Target] = (
     + _new(
         KVT,
         "_write_back_evicted_masked",
+        "_write_back_evicted",
         "_append_evicted_masked",
         "_resolve_pending_evicted",
         "DynamicEmbStorage.lookup_masked",
         "DynamicEmbStorage.load_masked",
         "HybridStorage.lookup_masked",
         "HybridStorage.load_masked",
+        "DynamicEmbStorage.find_masked",
+        "DynamicEmbStorage.insert_masked",
+        "HybridStorage.find_masked",
+        "HybridStorage.insert_masked",
         # the victims of the HBM tier move to the host tier in row chunks
         "HybridStorage.insert",
+        "_eval_lookup_storage",
+        "_eval_lookup_cached",
         "request_size_snapshot",
         "DynamicEmbStorage.request_size_snapshot",
         "HybridStorage.request_size_snapshot",
@@ -1215,8 +1227,6 @@ TARGETS: List[Target] = (
     )
     + _legacy(
         KVT,
-        "_eval_lookup_storage",
-        "_eval_lookup_cached",
         "DynamicEmbCache.lookup",
         "DynamicEmbCache.insert_and_evict",
         "expand_if_need_impl",
@@ -1244,6 +1254,8 @@ TARGETS: List[Target] = (
         "DeferredRead.release",
         "MissGate.begin",
         "MissGate.needed",
+        "_AlwaysGate.begin",
+        "_AlwaysGate.needed",
     )
     + _legacy(
         ADM,
@@ -1268,9 +1280,6 @@ FINAL = os.environ.get("SYNC_LINT_FINAL") == "1"
 # entry of a target that is flipped to `enforce` goes away.
 LEGACY_BASELINE: Dict[str, Dict[str, int]] = {
     "dynamicemb/batched_dynamicemb_function.py::dynamicemb_prefetch": {
-        "host-read-helper": 1,
-    },
-    "dynamicemb/key_value_table.py::_eval_lookup_cached": {
         "host-read-helper": 1,
     },
     "dynamicemb/key_value_table.py::DynamicEmbCache.lookup": {
