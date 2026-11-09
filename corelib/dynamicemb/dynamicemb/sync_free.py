@@ -82,7 +82,7 @@ SORTED_INSERT: bool = _extension_flag("sorted_insert")
 #   "always": launch it every step and read nothing.
 # "always" is the default: a step whose keys all hit runs the miss path on inert rows,
 # which changes nothing, and the CPU never waits for the GPU. DYNAMICEMB_MISS_PATH_GATE
-# selects another mode, and an external storage uses "read".
+# selects another mode.
 _MISS_GATE_MODES = ("always", "poll", "read")
 _DEFAULT_MISS_GATE = "always"
 
@@ -443,13 +443,13 @@ def read_now(*dev_tensors: torch.Tensor) -> List[torch.Tensor]:
     """THE blocking read: the host needs these values now.
 
     Only inherent syncs come here: an external parameter server or user class
-    that wants host sizes, a public API that returns host data (the host count of
-    ``insert_and_evict``), exact growth, the "read" miss gate. The tensors are
-    flattened, cast to int64 and concatenated on the current stream, copied to
-    host in one pinned transfer, and waited for with one event. Returns CPU int64
-    tensors shaped like the inputs; a CPU input is returned as it is. The pinned
-    buffer is reused (one per thread and device, grown to the largest request), so
-    a steady state allocates nothing; the results do not alias it.
+    that wants host sizes, a public API that returns host data, exact growth,
+    the "read" miss gate. The tensors are flattened, cast to
+    int64 and concatenated on the current stream, copied to host in one pinned
+    transfer, and waited for with one event. Returns CPU int64 tensors shaped like
+    the inputs; a CPU input is returned as it is. The pinned buffer is reused
+    (one per thread and device, grown to the largest request), so a steady state
+    allocates nothing; the results do not alias it.
 
     ``READ_NOW_CALLS`` counts the calls.
     """
@@ -590,12 +590,11 @@ class StagedUpload:
 def miss_gate_mode(rng: bool, ps: bool = False) -> str:
     """How this step decides whether to launch its miss path: always, poll or read.
 
-    "read" with an external parameter server, which needs the count anyway.
-    Otherwise ``MISS_GATE``, except that "poll" becomes "always" when the miss path
-    draws random numbers (``rng``): a seeded probabilistic admitter must not consume
-    a timing-dependent number of draws, while "read" is exact and so reproducible.
-    The determinism mode does not change the gate: its inserts read nothing, so an
-    "always" step that finds no miss costs a few launches and no wait.
+    "read" when ``ps`` is set (a caller that needs the count anyway; none passes it
+    today). Otherwise ``MISS_GATE``, except that "poll" becomes "always" when the
+    miss path draws random numbers (``rng``): a seeded probabilistic admitter must
+    not consume a timing-dependent number of draws, while "read" is exact and so
+    reproducible.
     """
     if ps:
         return "read"

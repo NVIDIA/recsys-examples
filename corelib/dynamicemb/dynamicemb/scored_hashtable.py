@@ -840,6 +840,9 @@ class LinearBucketTable(ScoredHashTable):
             ``num_evicted`` is a host int and the evicted_* tensors are sliced to
             it, unless ``async_count``.
         If score_out is provided (caller-allocated int64 tensor), it is filled with output scores.
+        In DEMB_DETERMINISM_MODE the evicted entries come in (bucket, key) order of the key
+        that evicted them, a key refused for want of a slot is the entry of index
+        ``-(input position + 1)``, and no key of the call is evicted by the call.
         """
 
         score_value, policy = self._parse_score(score)
@@ -1183,7 +1186,10 @@ class LinearBucketTable(ScoredHashTable):
         """Insert with counter-aware eviction and overflow fallback.
         Returns same tuple as insert_and_evict, ``async_count`` included: the
         evicted_* tensors keep the length of ``keys`` and ``num_evicted`` stays
-        the unread int64[1] device counter."""
+        the unread int64[1] device counter. In DEMB_DETERMINISM_MODE the evicted
+        entries are in (bucket, key) order, a key refused by its bucket and by the
+        overflow bucket is the entry of index ``-(input position + 1)``, and no key
+        of the call (spills included) is evicted by the call."""
         assert (
             self.enable_overflow_
         ), "insert_and_evict_with_counter_and_overflow requires enable_overflow=True"
