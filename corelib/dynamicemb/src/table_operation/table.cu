@@ -282,4 +282,9 @@ void bind_table_operation(py::module &m) {
       .value("ILLEGAL", dyn_emb::InsertResult::Illegal)
       .value("INIT", dyn_emb::InsertResult::Init)
       .export_values();
+
+  // Capability flag, read by callers with getattr(..., False): the evicted_*
+  // arrays of table_insert_and_evict and table_insert_collect_evicted are
+  // pre-filled (keys all ones, indices / scores / table ids -1) past the count.
+  m.attr("evicted_tail_inert") = py::bool_(true);
 }

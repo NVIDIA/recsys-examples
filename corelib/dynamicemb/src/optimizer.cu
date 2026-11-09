@@ -631,4 +631,8 @@ void bind_optimizer_kernel_op(py::module &m) {
         py::arg("emb_dim"), py::arg("value_dim"), py::arg("all_dims_vec4"),
         py::arg("lr"), py::arg("learning_rate_power"), py::arg("beta"),
         py::arg("l1_reg"), py::arg("l2_reg"), py::arg("group_lasso_reg") = 0.0f);
+
+  // Capability flag, read by callers with getattr(..., False): the
+  // *_update_for_padded_buffer ops skip a row whose table id is < 0.
+  m.attr("padded_optimizer_skips_negative_table_id") = py::bool_(true);
 }

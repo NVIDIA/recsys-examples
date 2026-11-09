@@ -345,8 +345,14 @@ table_insert_collect_evicted(
   }
 
   at::Tensor indices = torch::empty({num_total}, i64);
-  at::Tensor evicted_keys = torch::empty({num_total}, keys.options());
-  at::Tensor evicted_table_ids = torch::empty({num_total}, i64);
+  // The kernels write only the first evicted_counter entries of the evicted_*
+  // arrays, which are sized at the batch upper bound. Fill them all with -1:
+  // all ones is EmptyKey as an int64 key and as a uint64 one, and -1 is no
+  // table. One fill over one int64 block, viewed as the two arrays (the keys
+  // as their own dtype: a uint64 view of all ones is all ones too).
+  at::Tensor evicted_block = torch::full({2, num_total}, -1, i64);
+  at::Tensor evicted_keys = evicted_block[0].view(keys.scalar_type());
+  at::Tensor evicted_table_ids = evicted_block[1];
   at::Tensor evicted_counter = torch::zeros({1}, i64);
 
   table_insert_collect_single_score(

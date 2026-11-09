@@ -55,12 +55,14 @@ namespace dyn_emb {
  *         - num_uniques: Tensor of size 1 containing total unique count
  *           (view of table_offsets[num_tables])
  *         - unique_keys: Compacted unique keys with size=num_keys (same as
- *           input). Only first num_uniques elements are valid.
+ *           input). Only the first num_uniques elements are keys; the rest is
+ *           padding, EmptyKey (all ones: -1 as int64, 0xFF..FF as uint64).
  *         - output_indices: Index mapping (input idx -> global unique idx)
  *         - table_offsets: Tensor of size (num_tables + 1) with cumulative
  *           unique counts per table.
- *         - freq_counters: Frequency counts per unique key. Empty if frequency
- *           counting is disabled (input_frequencies was None).
+ *         - freq_counters: Frequency counts per unique key (0 in the padding
+ *           past num_uniques). Empty if frequency counting is disabled
+ *           (input_frequencies was None).
  */
 std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor>
 segmented_unique_cuda(at::Tensor keys, at::Tensor segmented_range,
@@ -76,10 +78,13 @@ segmented_unique_cuda(at::Tensor keys, at::Tensor segmented_range,
  * num_tables is derived from offsets.size(0)-1.
  *
  * @param offsets Jagged tensor offsets (int64, size = num_tables + 1)
- *                offsets[t] is the start index for table t's keys.
- * @param num_elements Total number of elements (keys)
+ *                offsets[t] is the start index for table t's keys;
+ *                offsets[num_tables] is the number of real elements.
+ * @param num_elements Total number of elements (keys): offsets[num_tables], or
+ *                     more for an array padded to its upper bound
  *
- * @return table_ids tensor (int64) with same length as num_elements
+ * @return table_ids tensor (int64) with same length as num_elements; the
+ *         elements past offsets[num_tables] are padding and get table id -1
  */
 at::Tensor expand_table_ids_cuda(at::Tensor offsets, int64_t num_elements);
 

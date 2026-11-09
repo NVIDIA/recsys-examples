@@ -407,14 +407,18 @@ table_insert_and_evict(at::Tensor table_storage,
       torch::empty({num_total}, keys.options().dtype(torch::kInt64));
   at::Tensor num_evicted =
       torch::zeros({1}, keys.options().dtype(torch::kInt64));
-  at::Tensor evicted_keys =
-      torch::empty({num_total}, keys.options().dtype(keys.scalar_type()));
-  at::Tensor evicted_indices =
-      torch::empty({num_total}, keys.options().dtype(torch::kInt64));
-  at::Tensor evicted_scores =
-      torch::empty({num_total}, keys.options().dtype(torch::kInt64));
-  at::Tensor evicted_table_ids =
-      torch::empty({num_total}, keys.options().dtype(torch::kLong));
+  // The kernels write only the first num_evicted entries of the evicted_*
+  // arrays, which are sized at the batch upper bound. Fill them all with -1,
+  // the "nothing evicted here" marker of every consumer: all ones is EmptyKey
+  // as an int64 key and as a uint64 one, and -1 is no index, no score, no
+  // table. One fill over one int64 block, viewed as the four arrays (the keys
+  // as their own dtype: a uint64 view of all ones is all ones too).
+  at::Tensor evicted_block =
+      torch::full({4, num_total}, -1, keys.options().dtype(torch::kInt64));
+  at::Tensor evicted_keys = evicted_block[0].view(keys.scalar_type());
+  at::Tensor evicted_indices = evicted_block[1];
+  at::Tensor evicted_scores = evicted_block[2];
+  at::Tensor evicted_table_ids = evicted_block[3];
 
   bool use_overflow = ovf_storage.has_value() && ovf_storage.value().defined();
 

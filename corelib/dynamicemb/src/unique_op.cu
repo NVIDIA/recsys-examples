@@ -495,6 +495,23 @@ __global__ void segmented_unique_finalize(
       output_indices[idx] = base + rep_local[rep];
     }
   }
+
+  // The compacted outputs are allocated at num_keys (the worst case, all keys
+  // unique), so rows [total_unique, num_keys) would be left uninitialized. Make
+  // them self-describing: EmptyKey (all ones, which Bucket::is_valid rejects,
+  // so a table kernel skips such a row without reading its table id) and
+  // frequency 0. total_unique is the grand total of the block scan, the same
+  // in every block, and these rows are disjoint from the ones written above
+  // (gidx < total_unique).
+  const int64_t total_unique = s_off[num_tables];
+  for (size_t idx = blockIdx.x * blockDim.x + threadIdx.x; idx < num_keys;
+       idx += stride) {
+    if (static_cast<int64_t>(idx) >= total_unique) {
+      output_keys[idx] = static_cast<KeyType>(-1);
+      if (output_freq != nullptr)
+        output_freq[idx] = 0;
+    }
+  }
 }
 
 // ============================================================================
@@ -503,19 +520,45 @@ __global__ void segmented_unique_finalize(
 
 // Expand jagged offsets to per-element table_ids (identity mapping,
 // local_batch_size=1). For each idx, find largest t such that offsets[t] <= idx
-// via binary_search_upper_bound (defined above).
+// via binary_search_upper_bound (defined above). offsets[num_tables] is the
+// number of real elements: a row past it is the padded tail of an array
+// allocated at its upper bound (the unique keys) and belongs to no table, so it
+// gets table id -1 (the search would answer num_tables, which is not a table).
 __global__ void expand_table_ids_kernel(const int64_t *offsets,
                                         int64_t *table_ids, int num_tables,
                                         int64_t num_elements) {
   const int64_t stride = blockDim.x * gridDim.x;
+  const int64_t num_valid = offsets[num_tables];
 
   for (int64_t idx = blockIdx.x * blockDim.x + threadIdx.x; idx < num_elements;
        idx += stride) {
-    table_ids[idx] = binary_search_upper_bound(offsets, num_tables + 1, idx);
+    table_ids[idx] =
+        idx < num_valid
+            ? binary_search_upper_bound(offsets, num_tables + 1, idx)
+            : -1;
   }
 }
 
 // (adjust_output_indices folded into segmented_unique_finalize above.)
+
+// Device-side form of the DYNAMICEMB_DEBUG validation of segmented_range, so
+// that checking it does not read it back to the host. One block, because
+// num_tables is small. A violation is a device-side assert, which names the
+// failed condition.
+__global__ void check_segmented_range_kernel(const int64_t *sr,
+                                             int64_t num_tables,
+                                             int64_t num_keys) {
+  for (int64_t t = threadIdx.x; t <= num_tables; t += blockDim.x) {
+    if (t == 0)
+      CUDA_KERNEL_ASSERT(sr[0] == 0 && "segmented_range[0] must be 0");
+    if (t == num_tables)
+      CUDA_KERNEL_ASSERT(sr[num_tables] == num_keys &&
+                         "segmented_range[num_tables] must equal num_keys");
+    if (t < num_tables)
+      CUDA_KERNEL_ASSERT(sr[t + 1] >= sr[t] &&
+                         "segmented_range must be non-decreasing");
+  }
+}
 
 std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor>
 segmented_unique_cuda(at::Tensor keys, at::Tensor segmented_range,
@@ -574,21 +617,13 @@ segmented_unique_cuda(at::Tensor keys, at::Tensor segmented_range,
   }
 
   // Debug validation of segmented_range (enabled via DYNAMICEMB_DEBUG=1).
-  // Checks: starts at 0, ends at num_keys, monotonically non-decreasing.
+  // Checks: starts at 0, ends at num_keys, monotonically non-decreasing. It
+  // runs on the device (no host read), so a violation surfaces as a device-side
+  // assert instead of an exception.
   if (std::getenv("DYNAMICEMB_DEBUG")) {
-    at::Tensor sr_cpu = segmented_range.to(at::kCPU);
-    const int64_t *sr = sr_cpu.data_ptr<int64_t>();
-    TORCH_CHECK(sr[0] == 0,
-                "segmented_range[0] must be 0, got ", sr[0]);
-    TORCH_CHECK(sr[num_tables] == num_keys,
-                "segmented_range[num_tables] must equal num_keys (", num_keys,
-                "), got ", sr[num_tables]);
-    for (int64_t t = 0; t < num_tables; ++t) {
-      TORCH_CHECK(sr[t + 1] >= sr[t],
-                  "segmented_range must be non-decreasing: "
-                  "segmented_range[", t + 1, "]=", sr[t + 1],
-                  " < segmented_range[", t, "]=", sr[t]);
-    }
+    check_segmented_range_kernel<<<1, BLOCK_SIZE, 0, stream>>>(
+        get_pointer<const int64_t>(segmented_range), num_tables, num_keys);
+    DEMB_CUDA_KERNEL_LAUNCH_CHECK();
   }
 
   // Handle empty input
@@ -901,12 +936,14 @@ Args:
 Returns:
     Tuple of (num_uniques, unique_keys, output_indices, table_offsets, frequency_counters)
     - num_uniques: Tensor of size 1 with total unique count (on device)
-    - unique_keys: Compacted unique keys with size=len(keys). Only first
-                   num_uniques elements are valid.
+    - unique_keys: Compacted unique keys with size=len(keys). Only the first
+                   num_uniques elements are keys; the rest is padding, all
+                   ones (-1 as int64, 0xFF..FF as uint64).
     - output_indices: Index mapping (input idx -> global unique idx)
     - table_offsets: Tensor of size (num_tables + 1) with cumulative unique counts
                      table_offsets[i] is the start index for table i in unique_keys
-    - frequency_counters: Per-unique-key frequency counts (empty if disabled)
+    - frequency_counters: Per-unique-key frequency counts, 0 in the padding
+                          (empty if disabled)
 )doc",
       py::arg("keys"), py::arg("segmented_range"), py::arg("num_tables"),
       py::arg("input_frequencies") = py::none(),
@@ -925,11 +962,14 @@ num_tables is derived from offsets.size(0)-1.
 
 Args:
     offsets: Table boundary offsets (int64, size = num_tables + 1)
-             offsets[t] is the start index for table t's keys.
-    num_elements: Total number of elements (keys)
+             offsets[t] is the start index for table t's keys;
+             offsets[num_tables] is the number of real elements.
+    num_elements: Total number of elements (keys): offsets[num_tables], or more
+                  for an array padded to its upper bound
 
 Returns:
-    table_ids tensor (int64) with same length as num_elements
+    table_ids tensor (int64) with same length as num_elements; the elements
+    past offsets[num_tables] are padding and get table id -1
 )doc",
       py::arg("offsets"), py::arg("num_elements") = 0);
 
@@ -965,5 +1005,10 @@ Returns:
       py::arg("unique_offsets"), py::arg("table_offsets_in_feature"),
       py::arg("num_tables"), py::arg("local_batch_size"),
       py::arg("new_lengths_size"));
+
+  // Capability flag, read by callers with getattr(..., False): the rows past
+  // the unique count are EmptyKey / frequency 0 (segmented_unique_cuda) and
+  // table id -1 (expand_table_ids_cuda). Both ship together.
+  m.attr("segmented_unique_tail_inert") = py::bool_(true);
 }
 #endif

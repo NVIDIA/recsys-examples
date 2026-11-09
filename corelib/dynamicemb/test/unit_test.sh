@@ -31,6 +31,13 @@ FWD_BWD_TEST_FILES=(
     "test/unit_tests/test_planner_plan_cost.py"
     "test/unit_tests/test_planner_placement.py"
     "test/unit_tests/test_table_row_wise.sh"
+    # The padded tail of the unique op's outputs and of the evicted arrays is
+    # marked (EmptyKey, table id -1, index -1) and the table, initializer and
+    # optimizer kernels skip it.
+    "test/unit_tests/sync_free/test_padded_tail.py"
+    "test/unit_tests/sync_free/test_initializer_negative_index.py"
+    "test/unit_tests/sync_free/test_evicted_prefill.py"
+    "test/unit_tests/sync_free/test_padded_buffer_optimizer_tail.py"
 )
 
 LOAD_DUMP_TEST_FILES=(

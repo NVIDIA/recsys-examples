@@ -73,6 +73,12 @@ __global__ void initialize_with_index_addressor_kernel(
   for (; task_id < num_task; task_id += gridDim.x * blockDim.x) {
     int64_t emb_id = task_id / dim;
     int64_t index = indices[emb_id];
+    // -1 marks an entry that selects no row (a padded tail, a masked-out key).
+    // Skip it before anything is read through the index: the generators read
+    // table_ids[index] / keys[index], and the destination row would lie below
+    // the buffer.
+    if (index < 0)
+      continue;
     ValueT *dst = buffer + index * stide;
     auto tmp = gen.generate(index);
     dst[task_id % dim] = TypeConvertFunc<ValueT, float>::convert(tmp);
@@ -354,4 +360,8 @@ void bind_initializer_op(py::module &m) {
 
   m.def("debug_init", &dyn_emb::debug_init, "Debug initializer",
         py::arg("buffer"), py::arg("indices"), py::arg("keys"));
+
+  // Capability flag, read by callers with getattr(..., False): every mode
+  // skips an index < 0 before it reads or writes anything.
+  m.attr("initializer_skips_negative_index") = py::bool_(true);
 }
