@@ -89,9 +89,14 @@ Notes:
   an epoch nothing is old enough to erase. To see keys erased, use a retention shorter than an epoch.
 - Each epoch ends by waiting for the erase in flight, since an erase must not overlap an evaluation or a dump, and prints
   what this rank erased (the call is local: each rank erases what it holds).
-- `--erase_interval` needs `--score_strategy step` or `timestamp` (not `lru_lfu`, whose `(TIMESTAMP, LFU)` tables cannot
-  be erased by either score), and cannot be combined with `--external_storage` or with `--incremental_dump`: an erase by
+- `--erase_interval` needs `--score_strategy step` or `timestamp`, and cannot be combined with `--external_storage` or with `--incremental_dump`: an erase by
   score is not recorded, so the deltas of a table it removed keys from cannot be replayed.
+
+- A `(TIMESTAMP, LFU)` (`lru_lfu`) table can be erased by either of its scores: `erase_by_score_async(model,
+  TIMESTAMP, t)` compares the last-access timestamp, whatever the frequency, and `erase_by_score_async(model, LFU, f)`
+  the frequency, whatever the age. The frequency is a raw count that never decays, and a key just admitted has a small
+  one, so an erase by `LFU` alone also removes the keys that came in recently. The example's `--erase_interval` does
+  not drive `lru_lfu` tables.
 
 - For detailed explanations of specific APIs and parameters, please refer to [API Doc](../DynamicEmb_APIs.md).
 

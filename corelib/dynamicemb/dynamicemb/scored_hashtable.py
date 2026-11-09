@@ -1203,7 +1203,7 @@ class LinearBucketTable(ScoredHashTable):
         threshold: int,
         counts: torch.Tensor,
         *,
-        score_name: Optional[str] = None,
+        score_word: Optional[int] = None,
         begin: Optional[int] = None,
         end: Optional[int] = None,
     ) -> None:
@@ -1221,13 +1221,27 @@ class LinearBucketTable(ScoredHashTable):
         the work is done. Nothing here waits for the GPU; the kernel runs on the
         current stream and the binding releases the GIL.
 
-        A single-score table only (the score is compared as one word), and not one
-        with an overflow area (a cache).
+        One score word is compared. A single-score table has one; an ``LRU_LFU``
+        table has two, and ``score_word`` names the one: ``0`` the last-access
+        timestamp, ``1`` the frequency. Whichever is compared, an erased slot has
+        all its score words cleared. Any other multi-word layout is refused, and so
+        is a table with an overflow area (a cache).
         """
         if self.num_scores_ != 1:
-            raise NotImplementedError(
-                "erase_by_score compares one score word; a multi-word score "
-                f"({self.num_scores_} words) is not supported"
+            if self.score_specs_[0].policy != ScorePolicy.LRU_LFU:
+                raise NotImplementedError(
+                    "erase_by_score compares one score word; a multi-word score "
+                    f"({self.num_scores_} words) other than LRU_LFU is not supported"
+                )
+            if score_word is None or not 0 <= score_word < self.num_scores_:
+                raise ValueError(
+                    f"an LRU_LFU table keeps {self.num_scores_} score words per key "
+                    "(0: last-access timestamp, 1: frequency); score_word must name "
+                    f"the one to compare, got {score_word}"
+                )
+        elif score_word not in (None, 0):
+            raise ValueError(
+                f"a single-score table has score word 0 only, got score_word {score_word}"
             )
         if self.enable_overflow_:
             raise NotImplementedError(
@@ -1240,7 +1254,7 @@ class LinearBucketTable(ScoredHashTable):
             raise ValueError(
                 f"table_id {table_id} is not one of the {self.num_tables_} tables"
             )
-        score_index = 0 if score_name is None else self.score_names_.index(score_name)
+        score_index = 0 if score_word is None else score_word
 
         bucket_begin = int(self.table_bucket_offsets_cpu_[table_id].item())
         bucket_end = int(self.table_bucket_offsets_cpu_[table_id + 1].item())

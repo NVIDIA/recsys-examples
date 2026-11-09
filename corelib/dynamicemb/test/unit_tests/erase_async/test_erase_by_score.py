@@ -227,7 +227,7 @@ def test_the_arguments_are_checked(device):
         key_type=torch.int64,
         score_specs=[ScoreSpec(name=SCORE, policy=ScorePolicy.LRU_LFU)],
     )
-    with pytest.raises(NotImplementedError, match="multi-word"):
+    with pytest.raises(ValueError, match="score_word"):
         lru_lfu.erase_by_score(0, 10, counts)
 
     cache_like = get_scored_table(
