@@ -339,6 +339,22 @@ class PrefetchState:
     table_key_bounds: Optional[torch.Tensor] = None
 
 
+def _note_table_users(storage: Storage, cache: Optional[Cache] = None) -> None:
+    """Order the current stream after the last growth of the tables ``storage`` and
+    ``cache`` keep, and register it as one of their users (``wait_for_growth`` of
+    :class:`~dynamicemb.growth_order.GrowthOrder`).
+
+    A growth only queues its kernels on the prefetch stream and returns, so the forward,
+    the backward and the evaluation, which run on other streams, come first through
+    here. An external storage or a user's class has no tables of ours and nothing to
+    order.
+    """
+    for owner in (storage, cache):
+        wait_for_growth = getattr(owner, "wait_for_growth", None)
+        if wait_for_growth is not None:
+            wait_for_growth()
+
+
 def _slots_after_rehash(
     state: DynamicEmbTableState,
     unique_keys: torch.Tensor,
@@ -1626,6 +1642,7 @@ def dynamicemb_prefetch(
     ``PrefetchState.unique_valid``.
     """
     with torch.cuda.nvtx.range("dynamicemb_prefetch"):
+        _note_table_users(storage, cache)
         table_num = feature_offsets.numel() - 1
         assert table_num != 0
         assert (
@@ -1849,6 +1866,7 @@ def dynamicemb_eval_forward(
     the pooling reads only the rows ``reverse_indices`` names.
     """
     with torch.cuda.nvtx.range("dynamicemb_eval_forward"):
+        _note_table_users(storage, cache)
         table_num = feature_offsets.numel() - 1
         assert table_num != 0
         emb_dtype = storage.embedding_dtype()
@@ -2294,6 +2312,7 @@ class DynamicEmbeddingFunction(torch.autograd.Function):
         *args,
     ):
         with torch.cuda.nvtx.range("DynamicEmbeddingFunction.forward"):
+            _note_table_users(storage, cache)
             max_emb_dim = storage.max_embedding_dim()
             max_val_dim = storage.max_value_dim()
             emb_dtype = storage.embedding_dtype()
@@ -2472,6 +2491,7 @@ class DynamicEmbeddingFunction(torch.autograd.Function):
         with torch.cuda.nvtx.range("DynamicEmbeddingFunction.backward"):
             cache = ctx.cache
             storage = ctx.storage
+            _note_table_users(storage, cache)
             optimizer = ctx.optimizer
             grads = grads.contiguous()
 

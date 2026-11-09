@@ -1164,6 +1164,7 @@ SHT = "dynamicemb/scored_hashtable.py"
 SF = "dynamicemb/sync_free.py"
 ADM = "dynamicemb/embedding_admission.py"
 BDT = "dynamicemb/batched_dynamicemb_tables.py"
+GRO = "dynamicemb/growth_order.py"
 
 
 def _new(file: str, *qualnames: str) -> List[Target]:
@@ -1246,6 +1247,21 @@ TARGETS: List[Target] = (
     )
     + _legacy(BDT, "BatchedDynamicEmbeddingTablesV2._check_scores")
     + _new(BDT, "BatchedDynamicEmbeddingTablesV2._table_key_bounds")
+    # the order of a growth against the streams that use the table: queued waits and
+    # recorded events, never a wait of the host
+    + _new(GRO, "GrowthOrder.*")
+    + _new(
+        KVT,
+        "DynamicEmbTableState.wait_for_growth",
+        "DynamicEmbStorage.wait_for_growth",
+        "HybridStorage.wait_for_growth",
+        "_growth_section",
+        "_after_growth",
+        "_grow_values_only",
+        "_expand_if_need_no_eviction_estimated",
+    )
+    + _new(SHT, "LinearBucketTable.record_stream")
+    + _new(BDF, "_note_table_users")
 )
 
 ENFORCE_ALL = os.environ.get("SYNC_LINT_ENFORCE_ALL") == "1"

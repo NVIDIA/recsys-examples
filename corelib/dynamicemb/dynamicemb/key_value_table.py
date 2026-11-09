@@ -15,6 +15,7 @@
 
 import collections
 import contextlib
+import functools
 import json
 import math
 import os
@@ -57,6 +58,7 @@ from dynamicemb.extendable_tensor import (
     ExtendableBuffer,
     HostExtendableBuffer,
 )
+from dynamicemb.growth_order import GrowthOrder
 from dynamicemb.key_ownership import owned_key_mask
 from dynamicemb.optimizer import BaseDynamicEmbeddingOptimizer
 from dynamicemb.scored_hashtable import (
@@ -459,6 +461,10 @@ class DynamicEmbTableState:
     # for the device (see :class:`SizeSnapshots`). ``None`` for a state that cannot
     # grow, which then has nothing to estimate.
     size_snapshots: Optional["SizeSnapshots"] = None
+    # What orders a growth of this state against the streams that use it (see
+    # :class:`GrowthOrder`); ``None`` for a state that cannot grow, which has
+    # nothing to order.
+    growth: Optional[GrowthOrder] = None
     # How many times ``key_index_map`` has been replaced (an expansion builds a
     # new one and drops the old). A slot number means something only in the map it
     # was read from, so whoever walks the slots across calls -- an erase by score,
@@ -511,6 +517,19 @@ class DynamicEmbTableState:
     # table: the state covers every logical table of a storage, and one table's
     # untracked erase says nothing about the others.
     erase_untracked_tables: Set[int] = field(default_factory=set)
+
+    def wait_for_growth(self) -> None:
+        """Order the current stream after the last growth of this state, and register it
+        as a user of the state (:class:`GrowthOrder`).
+
+        A growth only queues its kernels on the stream that decided to grow and returns,
+        so whoever reads or writes the key map or the value buffers from another stream
+        calls this first. The forward, the backward and the evaluation of the module do,
+        and so does every public method of the storages that reads the state. Nothing
+        waits on the host, and a state that cannot grow does nothing.
+        """
+        if self.growth is not None:
+            self.growth.wait_for_growth()
 
 
 # The key map of a table that never evicts is kept at most this full, so that no
@@ -667,6 +686,7 @@ def create_table_state(
     threads_in_wave = (
         props.multi_processor_count * props.max_threads_per_multi_processor
     )
+    can_still_grow = _tables_can_grow(options, no_eviction, key_index_map_caps)
 
     return DynamicEmbTableState(
         options_list=options,
@@ -704,8 +724,10 @@ def create_table_state(
         # Its pinned ring is allocated here, once; a state that never grows (a cache,
         # a table at its max_capacity) gets no ring and no per-step work at all.
         size_snapshots=SizeSnapshots(num_tables, with_rows=no_eviction)
-        if _tables_can_grow(options, no_eviction, key_index_map_caps)
+        if can_still_grow
         else None,
+        # Likewise: only a state that can grow has streams to order its growth against.
+        growth=GrowthOrder(device) if can_still_grow else None,
         evicted_item_mode=evicted_item_mode,
         miss_gate=sf.MissGate(),
         retain_ring=sf.DeferredRead((1,), torch.int64, slots=8)
@@ -953,6 +975,15 @@ def collect_table_sizes_for_state(
 # ---------------------------------------------------------------------------
 
 
+def _growth_section(state: DynamicEmbTableState, stream: torch.cuda.Stream):
+    """The section one growth of ``state`` runs in, on ``stream`` (see
+    :class:`GrowthOrder`): the other streams that use the state are waited for, on the
+    device, before it, and wait for it after. Nothing for a state that cannot grow."""
+    if state.growth is None:
+        return contextlib.nullcontext()
+    return state.growth.section(stream)
+
+
 def _expand_tables_impl(
     state: DynamicEmbTableState,
     tables_to_expand: List[bool],
@@ -999,6 +1030,8 @@ def _expand_tables_impl(
                 new_caps.append(2 * key_caps[i])
         else:
             new_caps.append(key_caps[i])
+    # Built before the section: allocating and filling the new key map does not depend
+    # on what the other streams queued, so it overlaps their work.
     new_key_index_map = get_scored_table(
         capacity=new_caps,
         bucket_capacity=base_opt.bucket_capacity,
@@ -1015,6 +1048,30 @@ def _expand_tables_impl(
         # And whether it counts references at all.
         use_ref_counter=state.key_index_map.use_ref_counter_,
     )
+    stream = torch.cuda.current_stream(device)
+    with _growth_section(state, stream):
+        _rehash_into(
+            state,
+            new_key_index_map,
+            tables_to_expand,
+            target_capacities,
+            key_caps,
+            stream,
+        )
+
+
+def _rehash_into(
+    state: DynamicEmbTableState,
+    new_key_index_map,
+    tables_to_expand: List[bool],
+    target_capacities: Optional[List[int]],
+    key_caps: List[int],
+    stream: torch.cuda.Stream,
+) -> None:
+    """The part of :func:`_expand_tables_impl` that runs inside the growth section, on
+    ``stream``: extend the value buffers, move every table into ``new_key_index_map``
+    and make it the state's."""
+    device = state.device
     for i in range(state.num_tables):
         if tables_to_expand[i]:
             if state.no_eviction:
@@ -1111,6 +1168,10 @@ def _expand_tables_impl(
     state.capacity = new_key_index_map.capacity()
     if new_key_index_map.use_rows_:
         new_key_index_map.set_row_limits([t.shape[0] for t in state.tables])
+    # The replaced key map goes back to the allocator when this function returns, which
+    # lets the stream it was allocated on take its blocks again, while the rehash that
+    # reads it may not have run yet on ``stream``: the blocks wait for ``stream``.
+    old_key_index_map.record_stream(stream)
 
 
 # ---------------------------------------------------------------------------
@@ -1283,16 +1344,23 @@ def _grow_values_only(state: DynamicEmbTableState, need_rows: List[int]) -> None
     it has handed out, which can be more (an erased key's slot keeps its row until
     another key takes the slot) but never more than the key map's slots.
     """
-    grown = False
-    for i in range(state.num_tables):
-        rows = state.tables[i].shape[0]
-        target = _value_rows_target(
-            rows, need_rows[i], state.key_index_map.per_table_capacity_[i]
+    targets = [
+        _value_rows_target(
+            state.tables[i].shape[0],
+            need_rows[i],
+            state.key_index_map.per_table_capacity_[i],
         )
-        if target > rows:
-            state.tables[i].extend((target - rows, state.table_value_dims_cpu[i]))
-            grown = True
-    if grown:
+        for i in range(state.num_tables)
+    ]
+    if not any(targets[i] > state.tables[i].shape[0] for i in range(state.num_tables)):
+        return
+    with _growth_section(state, torch.cuda.current_stream(state.device)):
+        for i in range(state.num_tables):
+            rows = state.tables[i].shape[0]
+            if targets[i] > rows:
+                state.tables[i].extend(
+                    (targets[i] - rows, state.table_value_dims_cpu[i])
+                )
         state.table_ptrs_dev.copy_(get_table_ptrs(state.tables, state.device))
         state.key_index_map.set_row_limits([t.shape[0] for t in state.tables])
 
@@ -1415,10 +1483,12 @@ def _expand_if_need_no_eviction(
         rows_est.copy_(rows)
         results, targets = get_expand_info(state, keys, unique_size_per_table)
         need_rows = (rows + unique_size_per_table).tolist()
-        if any(results):
-            _expand_tables_impl(state, results, targets)
-        # The value buffers follow the rows, whether or not the key map grew.
-        _grow_values_only(state, need_rows)
+        # The key map and the value buffers are one growth.
+        with _growth_section(state, torch.cuda.current_stream(state.device)):
+            if any(results):
+                _expand_tables_impl(state, results, targets)
+            # The value buffers follow the rows, whether or not the key map grew.
+            _grow_values_only(state, need_rows)
     keys_est.add_(unique_size_per_table)
     rows_est.add_(unique_size_per_table)
 
@@ -1438,6 +1508,7 @@ def _expand_if_need_no_eviction_estimated(
     high, and then the table grows earlier than it had to.
     """
     results, targets = get_expand_info(state, keys_est, unique_size_per_table)
+    # sync-ok: the estimates are CPU tensors, the host's own numbers
     need_rows = (rows_est + unique_size_per_table).tolist()
     # See _expand_if_need_no_eviction: a buffer that has a row for every slot of the
     # key map has nothing more to grow to, so the rows it is asked for are no pressure.
@@ -1446,11 +1517,13 @@ def _expand_if_need_no_eviction_estimated(
         and state.tables[i].shape[0] < state.key_index_map.per_table_capacity_[i]
         for i in range(state.num_tables)
     )
-    if any(results):
-        _expand_tables_impl(state, results, targets)
-    # The value buffers follow the rows, whether or not the key map grew.
     if any(results) or rows_short:
-        _grow_values_only(state, need_rows)
+        # The key map and the value buffers are one growth.
+        with _growth_section(state, torch.cuda.current_stream(state.device)):
+            if any(results):
+                _expand_tables_impl(state, results, targets)
+            # The value buffers follow the rows, whether or not the key map grew.
+            _grow_values_only(state, need_rows)
 
 
 def _expand_if_need_exact(
@@ -3529,6 +3602,19 @@ def _select_refused_values(
     )
 
 
+def _after_growth(method):
+    """Make a public method of a storage order the current stream after the last growth
+    of the state(s) it reads before it launches anything (``wait_for_growth``): a growth
+    only queues its kernels on the stream that decided to grow."""
+
+    @functools.wraps(method)
+    def ordered(self, *args, **kwargs):
+        self.wait_for_growth()
+        return method(self, *args, **kwargs)
+
+    return ordered
+
+
 class DynamicEmbStorage(Storage):
     def __init__(
         self,
@@ -3551,10 +3637,17 @@ class DynamicEmbStorage(Storage):
             use_ref_counter=use_ref_counter,
         )
 
+    def wait_for_growth(self) -> None:
+        """Order the current stream after the last growth of the tables, and register it
+        as one of their users (:meth:`DynamicEmbTableState.wait_for_growth`)."""
+        self._state.wait_for_growth()
+
     @property
     def key_index_map(self):
+        self._state.wait_for_growth()
         return self._state.key_index_map
 
+    @_after_growth
     def erase_by_score(
         self,
         threshold: int,
@@ -3603,6 +3696,7 @@ class DynamicEmbStorage(Storage):
         """
         return [self._state]
 
+    @_after_growth
     def fill_tables(
         self,
         load_factor: float = 0.95,
@@ -3747,6 +3841,7 @@ class DynamicEmbStorage(Storage):
             inserts_in_forward=inserts_in_forward,
         )
 
+    @_after_growth
     def request_size_snapshot(self) -> None:
         """Start reading the table sizes back for the next expansion decision; on the
         stream that inserts into this storage. Does nothing for a table that cannot
@@ -3758,6 +3853,7 @@ class DynamicEmbStorage(Storage):
         ``inserts_in_forward`` of :meth:`expand_if_need`)."""
         _note_forwarded(self._state, bound)
 
+    @_after_growth
     def collect_table_sizes(self, non_blocking: bool = True) -> None:
         """Collect per-table sizes from key_index_map into estimated_table_sizes (async copy)."""
         collect_table_sizes_for_state(self._state, non_blocking=non_blocking)
@@ -3786,6 +3882,7 @@ class DynamicEmbStorage(Storage):
 
     # -- Storage interface --
 
+    @_after_growth
     def lookup_masked(
         self,
         unique_keys: torch.Tensor,
@@ -3809,6 +3906,7 @@ class DynamicEmbStorage(Storage):
         )
         return MaskedFind(founds=r[5], score_in=r[4], scores=r[6], rows=r[7])
 
+    @_after_growth
     def load_masked(
         self,
         found: MaskedFind,
@@ -3825,6 +3923,7 @@ class DynamicEmbStorage(Storage):
             self._state, found.rows, table_ids, copy_mode, output=output
         )
 
+    @_after_growth
     def find(
         self,
         unique_keys: torch.Tensor,
@@ -3869,6 +3968,7 @@ class DynamicEmbStorage(Storage):
             values,
         )
 
+    @_after_growth
     def increment_counter(
         self,
         slot_indices: torch.Tensor,
@@ -3877,6 +3977,7 @@ class DynamicEmbStorage(Storage):
         """Increment ref-counter at given per-table slot indices. table_ids must be provided and aligned with slot_indices."""
         self._state.key_index_map.increment_counter(slot_indices, table_ids)
 
+    @_after_growth
     def decrement_counter(
         self,
         slot_indices: torch.Tensor,
@@ -3885,6 +3986,7 @@ class DynamicEmbStorage(Storage):
         """Decrement ref-counter at given per-table slot indices. table_ids must be provided and aligned with slot_indices."""
         self._state.key_index_map.decrement_counter(slot_indices, table_ids)
 
+    @_after_growth
     def insert(
         self,
         unique_keys: torch.Tensor,
@@ -3902,6 +4004,7 @@ class DynamicEmbStorage(Storage):
             preserve_existing,
         )
 
+    @_after_growth
     def dump(
         self,
         table_id: int,
@@ -3929,6 +4032,7 @@ class DynamicEmbStorage(Storage):
             current_score=current_score,
         )
 
+    @_after_growth
     def load(
         self,
         table_id: int,
@@ -4012,6 +4116,7 @@ class DynamicEmbStorage(Storage):
             )
         return params.meta_data.get("step_score", None)
 
+    @_after_growth
     def incremental_dump(
         self,
         table_id: int,
@@ -4133,6 +4238,7 @@ class DynamicEmbStorage(Storage):
 
     # -- Replay --
 
+    @_after_growth
     def replay_increment(
         self,
         table_id: int,
@@ -4206,6 +4312,7 @@ class DynamicEmbStorage(Storage):
             )
         return stats
 
+    @_after_growth
     def erase_keys(
         self,
         table_id: int,
@@ -4235,6 +4342,7 @@ class DynamicEmbStorage(Storage):
         ``DynamicEmbTableState.erase_untracked_tables``); sticky."""
         return table_id in self._state.erase_untracked_tables
 
+    @_after_growth
     def restore_reclaimed_slots(self, table_id: int, slot_index: Tensor) -> None:
         """Recreate the reclaimed slots a delta reports, with their rows.
 
@@ -4250,6 +4358,7 @@ class DynamicEmbStorage(Storage):
 
     # -- Export --
 
+    @_after_growth
     def export_keys_values(
         self,
         device: torch.device,
@@ -4308,6 +4417,7 @@ class DynamicEmbStorage(Storage):
     def num_tables(self) -> int:
         return self._state.num_tables
 
+    @_after_growth
     def size(self) -> int:
         return self._state.key_index_map.size()
 
@@ -4341,6 +4451,12 @@ class HybridStorage(Storage):
             use_ref_counter=False,
         )
         self.optimizer = optimizer
+
+    def wait_for_growth(self) -> None:
+        """Order the current stream after the last growth of the tiers (only the host
+        tier grows), and register it as one of their users."""
+        self._hbm.wait_for_growth()
+        self._host.wait_for_growth()
 
     @property
     def tables(self) -> List[DynamicEmbTableState]:
@@ -4421,6 +4537,7 @@ class HybridStorage(Storage):
             inserts_in_forward=inserts_in_forward,
         )
 
+    @_after_growth
     def request_size_snapshot(self) -> None:
         """Start reading the host tier's sizes back for the next expansion decision;
         on the stream that inserts into it. Does nothing if it cannot grow."""
@@ -4431,6 +4548,7 @@ class HybridStorage(Storage):
         ``inserts_in_forward`` of :meth:`expand_if_need`)."""
         _note_forwarded(self._host, bound)
 
+    @_after_growth
     def collect_table_sizes(self, non_blocking: bool = True) -> None:
         """Collect per-table sizes from key_index_map into estimated_table_sizes (host tier only, async copy)."""
         collect_table_sizes_for_state(self._host, non_blocking=non_blocking)
@@ -4461,6 +4579,7 @@ class HybridStorage(Storage):
 
     # -- Two-tier find (with values) --
 
+    @_after_growth
     def lookup_masked(
         self,
         unique_keys: torch.Tensor,
@@ -4508,6 +4627,7 @@ class HybridStorage(Storage):
             rows=(r_hbm[7], r_host[7]),
         )
 
+    @_after_growth
     def load_masked(
         self,
         found: MaskedFind,
@@ -4528,6 +4648,7 @@ class HybridStorage(Storage):
             self._host, found.rows[1], table_ids, copy_mode, output=values
         )
 
+    @_after_growth
     def find(
         self,
         unique_keys: torch.Tensor,
@@ -4574,6 +4695,7 @@ class HybridStorage(Storage):
 
     # -- Insert: HBM first, evictions to host --
 
+    @_after_growth
     def insert(
         self,
         unique_keys: torch.Tensor,
@@ -4649,6 +4771,7 @@ class HybridStorage(Storage):
             evicted_scores,
         )
 
+    @_after_growth
     def incremental_dump(
         self,
         table_id: int,
@@ -4772,6 +4895,7 @@ class HybridStorage(Storage):
 
     # -- Replay --
 
+    @_after_growth
     def replay_increment(
         self,
         table_id: int,
@@ -4853,6 +4977,7 @@ class HybridStorage(Storage):
                 )
         return stats
 
+    @_after_growth
     def erase_keys(
         self,
         table_id: int,
@@ -4874,6 +4999,7 @@ class HybridStorage(Storage):
 
     # -- Dump: write host first, then append HBM --
 
+    @_after_growth
     def dump(
         self,
         table_id: int,
@@ -4940,6 +5066,7 @@ class HybridStorage(Storage):
 
     # -- Load: route through HBM, evictions to host --
 
+    @_after_growth
     def load(
         self,
         table_id: int,
@@ -5083,6 +5210,7 @@ class HybridStorage(Storage):
 
     # -- Export: yield from both tiers --
 
+    @_after_growth
     def export_keys_values(
         self,
         device: torch.device,
@@ -5249,6 +5377,10 @@ def flush_cache(
     updated. One it has evicted goes to ``external_storage``, or is dropped
     when there is none: it is not re-inserted, which would evict another row.
     """
+    # The storage below the cache may have grown on another stream (the prefetch).
+    wait_for_growth = getattr(storage, "wait_for_growth", None)
+    if wait_for_growth is not None:
+        wait_for_growth()
     state = cache._state
     batch_size = state.threads_in_wave
 

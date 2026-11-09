@@ -25,6 +25,10 @@ FWD_BWD_TEST_FILES=(
     "test/unit_tests/test_no_eviction_row_indexing.py"
     "test/unit_tests/test_per_table_hbm_budget.py"
     "test/unit_tests/test_expansion_value_capacity.py"
+    # A growth queues its kernels on one stream and returns; the order it keeps against
+    # the streams that use the table (the logic needs no GPU).
+    "test/unit_tests/growth/test_growth_order_logic.py"
+    "test/unit_tests/growth/test_growth_order.py"
     "test/unit_tests/no_host_sync/test_expand_async.py"
     "test/unit_tests/no_host_sync/test_outstanding_keys.py"
     "test/unit_tests/test_check_scores_late.py"

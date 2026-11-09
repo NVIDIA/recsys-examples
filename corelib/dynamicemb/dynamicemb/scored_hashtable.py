@@ -1048,6 +1048,30 @@ class LinearBucketTable(ScoredHashTable):
             )
         self.row_counters_[table_id] = other.row_counters_[table_id]
 
+    def record_stream(self, stream: torch.cuda.Stream) -> None:
+        """Mark every tensor this table owns as used by ``stream``.
+
+        For a table that is replaced (a rehash) while kernels queued on ``stream`` may
+        still read it: the caching allocator then keeps each block until the work
+        queued on ``stream`` when the table is freed has finished, instead of handing
+        it to the next allocation of the stream the table was allocated on at once.
+        The key, digest and score columns are views of ``table_storage_``.
+        """
+        for tensor in (
+            self.table_storage_,
+            self.bucket_sizes,
+            self.table_bucket_offsets_,
+            self._ref_counter,
+            self.rows_,
+            self.row_counters_,
+            self.row_limits_,
+            self.overflow_table_storage_,
+            self.overflow_bucket_sizes,
+            self.overflow_output_offsets_,
+        ):
+            if tensor is not None:
+                tensor.record_stream(stream)
+
     def _check_has_ref_counter(self) -> None:
         if self._ref_counter is None:
             raise RuntimeError(
