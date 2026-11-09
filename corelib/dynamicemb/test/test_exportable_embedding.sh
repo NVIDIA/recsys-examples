@@ -19,7 +19,7 @@ CUDA_VISIBLE_DEVICES= python3 -m pytest -q \
   tests/test_host_embedding.py tests/test_host_incremental_update.py \
   --junitxml="${work_dir}/host-cpu.xml"
 
-# Keep the original Redis workflow, assertions and scheduling intact.
+# Separate eager, Python AOTI and C++ AOTI processes; paused/concurrent updates.
 bash example/exportable_embedding/run_example.sh \
   --work-dir "${work_dir}/incremental" \
   --cpp-replayer "${dynamicemb_root}/example/exportable_embedding/cpp/build/replay_and_verify"

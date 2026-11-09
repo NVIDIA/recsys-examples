@@ -71,6 +71,9 @@ if [[ "${nve_version}" != "26.05" \
     exit 1
   fi
   set -- "$@" --redis-address "127.0.0.1:${redis_port}"
+elif [[ "${nve_version}" != "26.05" && "${redis_disabled}" == "0" ]]; then
+  # Keep START_LOCAL_REDIS=0's existing-server default; explicit CLI args win.
+  set -- --redis-address "127.0.0.1:${REDIS_PORT:-6379}" "$@"
 fi
 
 python3 "${example_dir}/export_and_verify.py" "$@"
