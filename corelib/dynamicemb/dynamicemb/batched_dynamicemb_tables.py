@@ -81,6 +81,7 @@ from dynamicemb.key_value_table import (
     DynamicEmbStorage,
     HybridStorage,
     Storage,
+    _upload_async,
     flush_cache,
 )
 from dynamicemb.lookup_layout import EmbeddingLayout
@@ -2604,7 +2605,9 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                 ``dist_type="continuous"`` across more than one rank.
             RuntimeError: a key could not be written at its source slot even
                 though the metadata matched. Unlike the checks above this fires
-                mid-write, so the table may hold a partial replay.
+                mid-write, so the table may hold a partial replay: the keys of the
+                table that were placed are in its key map, but no row and no value
+                of the table that failed was written.
         """
         storage = self._storage
         if not isinstance(storage, (DynamicEmbStorage, HybridStorage)):
@@ -2950,7 +2953,7 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
             return
         device = torch.device(f"cuda:{torch.cuda.current_device()}")
         self._cache.key_index_map.erase(
-            stale.to(device=device),
+            _upload_async(stale, device),
             torch.full((stale.numel(),), table_id, dtype=torch.int64, device=device),
         )
 

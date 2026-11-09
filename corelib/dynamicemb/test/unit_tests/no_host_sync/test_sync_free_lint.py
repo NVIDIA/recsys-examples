@@ -2106,6 +2106,46 @@ EXPECTED_GONE: List[Tuple[str, str, str, str]] = [
         "owned += int(mask.sum().item()) if mask is not None else n",
         "E3",
     ),
+    # E7: a replay places every key, reads once that they all landed, and writes with masked
+    # stores; erase_keys reads the count it returns and cuts the retained keys with a sort
+    ("dynamicemb/key_value_table.py", "any_all_in_cond", "if bool(keep.any()):", "E7"),
+    (
+        "dynamicemb/key_value_table.py",
+        "int_bool_of_tensor",
+        "if bool(keep.any()):",
+        "E7",
+    ),
+    ("dynamicemb/key_value_table.py", "any_all_in_cond", "if bool(fresh.any()):", "E7"),
+    (
+        "dynamicemb/key_value_table.py",
+        "int_bool_of_tensor",
+        "if bool(fresh.any()):",
+        "E7",
+    ),
+    (
+        "dynamicemb/key_value_table.py",
+        "item",
+        "num_removed = int(removed.sum().item())",
+        "E7",
+    ),
+    (
+        "dynamicemb/key_value_table.py",
+        "int_bool_of_tensor",
+        "num_removed = int(removed.sum().item())",
+        "E7",
+    ),
+    (
+        "dynamicemb/key_value_table.py",
+        "item",
+        "example = int(keys[torch.logical_not(placed)][0].item())",
+        "E7",
+    ),
+    (
+        "dynamicemb/key_value_table.py",
+        "item",
+        "num_unplaced = int(n - placed.sum().item())",
+        "E7",
+    ),
     # E1: the overflow offset of an export is the host list the device tensor was built from
     (
         "dynamicemb/scored_hashtable.py",

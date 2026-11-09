@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import abc
+import contextlib
 import enum
 import os
 import warnings
@@ -294,18 +295,25 @@ def uint64_to_int64(x):
     return x if x < (1 << 63) else x - (1 << 64)
 
 
+# How many batches of ``pull_live_prefixes`` are alive on the device at once: the one whose
+# rows are being copied (and then yielded), the next, and the one launched before the yield.
+LIVE_PREFIX_BATCHES_IN_FLIGHT = 3
+
+
 def pull_live_prefixes(
-    batches: Iterable[Tuple[torch.Tensor, Sequence[Optional[torch.Tensor]]]],
-) -> Iterator[Tuple[int, List[Optional[torch.Tensor]]]]:
+    batches: Iterable[Tuple[torch.Tensor, Sequence[torch.Tensor]]],
+) -> Iterator[Tuple[int, List[torch.Tensor]]]:
     """Bring the live rows of batches that only the device knows the size of to the
     host, one wait for the device per batch.
 
     ``batches`` yields ``(count, columns)``: ``count`` is an ``int64[1]`` on the device
-    and every column is a device tensor (or ``None``) whose first ``count`` rows are the
-    batch's; the rest is not looked at. Iterating it is what launches the work of a batch,
-    so the order below is the order of the launches. Yields ``(n, host_columns)`` with the
-    first ``n`` rows of every column in pinned host memory (``n`` is 0 and the columns are
-    not copied for an empty batch).
+    and every column is a device tensor whose first ``count`` rows are the batch's; the
+    rest is not looked at. Iterating it is what launches the work of a batch, so the order
+    below is the order of the launches. Yields ``(n, host_columns)``: one tensor per
+    column, holding its first ``n`` rows in pinned host memory. A batch that holds no row
+    (``n`` is 0) copies nothing: its columns are empty host tensors of the column's dtype
+    and trailing shape, so that a caller can unpack the columns of every batch without
+    asking for ``n`` first.
 
     Only the live rows cross to the host, so the bytes moved follow the keys the table
     holds and not the slots it scans. The count of a batch has to be known before its rows
@@ -313,7 +321,9 @@ def pull_live_prefixes(
     of the next batch rides the copy of this one's rows, which is queued behind the next
     batch's launch, and a batch after that is launched before the rows in hand are yielded,
     so the device works while the caller writes them. That is one wait per batch (the
-    first batch's count is one more), however many columns there are.
+    first batch's count is one more), however many columns there are, and
+    :data:`LIVE_PREFIX_BATCHES_IN_FLIGHT` batches on the device at once, which a caller
+    that makes a batch large has to budget for.
     """
     iterator = iter(batches)
     current = next(iterator, None)
@@ -327,21 +337,20 @@ def pull_live_prefixes(
         if upcoming is not None:
             wanted.append(upcoming[0])
         if rows > 0:
-            wanted.extend(column[:rows] for column in columns if column is not None)
+            wanted.extend(column[:rows] for column in columns)
         pulled = sf.pull_to_host(*wanted) if wanted else []
         position = 0
         next_rows = 0
         if upcoming is not None:
             next_rows = int(pulled[0][0])
             position = 1
-        host_columns: List[Optional[torch.Tensor]] = []
         if rows > 0:
-            for column in columns:
-                if column is None:
-                    host_columns.append(None)
-                else:
-                    host_columns.append(pulled[position])
-                    position += 1
+            host_columns = list(pulled[position : position + len(columns)])
+        else:
+            host_columns = [
+                torch.empty((0,) + tuple(column.shape[1:]), dtype=column.dtype)
+                for column in columns
+            ]
         after = next(iterator, None)  # the device is busy while the caller writes this
         yield rows, host_columns
         if upcoming is None:
@@ -1810,47 +1819,43 @@ class LinearBucketTable(ScoredHashTable):
             table_id (Optional[int]): if provided, only dump the specified logical table.
         """
 
-        fkey = open(key_file, "wb")
-        fscores: Dict[str, Any] = {}
-        for score_name, score_path in score_files.items():
-            if score_name not in self.score_names_:
-                print(
-                    f"Score name {score_name} not existed, will not dump to {score_path}."
+        with contextlib.ExitStack() as files:
+            fkey = files.enter_context(open(key_file, "wb"))
+            fscores: Dict[str, Any] = {}
+            for score_name, score_path in score_files.items():
+                if score_name not in self.score_names_:
+                    print(
+                        f"Score name {score_name} not existed, will not dump to {score_path}."
+                    )
+                else:
+                    fscores[score_name] = files.enter_context(open(score_path, "wb"))
+
+            # a timestamp is only looked at for a score that is one
+            dump_timestamp = (
+                device_timestamp()
+                if any(
+                    spec.policy == ScorePolicy.GLOBAL_TIMER
+                    for spec in self.score_specs_
                 )
-            else:
-                fscores[score_name] = open(score_path, "wb")
-
-        # a timestamp is only looked at for a score that is one
-        dump_timestamp = (
-            device_timestamp()
-            if any(
-                spec.policy == ScorePolicy.GLOBAL_TIMER for spec in self.score_specs_
+                else 0
             )
-            else 0
-        )
 
-        table_ids = [table_id] if table_id is not None else range(self.num_tables_)
-        for tid in table_ids:
-            batches = (
-                (count, [sf.as_i64(keys), score])
-                for count, keys, score, _ in self._export_batches_masked(tid)
-            )
-            for n, (keys, scores) in pull_live_prefixes(batches):
-                if n == 0:
-                    continue
-                fkey.write(keys.numpy().tobytes())
-                for name in fscores:
-                    index = self.score_names_.index(name)
-                    column = scores
-                    if self.score_specs_[index].policy == ScorePolicy.GLOBAL_TIMER:
-                        column = dump_timestamp - scores
-                    fscores[name].write(column.numpy().tobytes())
-
-        fkey.close()
-        for fscore in fscores.values():
-            fscore.close()
-
-        return
+            table_ids = [table_id] if table_id is not None else range(self.num_tables_)
+            for tid in table_ids:
+                batches = (
+                    (count, [sf.as_i64(keys), score])
+                    for count, keys, score, _ in self._export_batches_masked(tid)
+                )
+                for n, (keys, scores) in pull_live_prefixes(batches):
+                    if n == 0:
+                        continue
+                    fkey.write(keys.numpy().tobytes())
+                    for name in fscores:
+                        index = self.score_names_.index(name)
+                        column = scores
+                        if self.score_specs_[index].policy == ScorePolicy.GLOBAL_TIMER:
+                            column = dump_timestamp - scores
+                        fscores[name].write(column.numpy().tobytes())
 
     def incremental_dump(
         self,

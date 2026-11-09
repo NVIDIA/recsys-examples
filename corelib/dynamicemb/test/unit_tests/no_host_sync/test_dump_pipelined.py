@@ -233,6 +233,98 @@ def test_a_dump_of_an_empty_table_writes_empty_files(gpu, tmp_path):
             assert f.read() == b""
 
 
+def _counts(table):
+    """How many keys each batch of the export of table 0 holds, in the order of the scan."""
+    return [int(count) for count, *_ in table._export_batches_masked(0)]
+
+
+def _has_a_gap(counts):
+    """A batch that holds no key between two that do."""
+    live = [i for i, n in enumerate(counts) if n]
+    return bool(live) and 0 in counts[live[0] : live[-1]]
+
+
+@pytest.mark.parametrize("optimizer, include_optim", [("sgd", False), ("adam", True)])
+def test_a_dump_goes_through_batches_that_hold_no_key(
+    gpu, tmp_path, optimizer, include_optim
+):
+    """A table of 8 batches that holds 6 keys has batches with none: in front of, after and
+    (the layout is looked for among the keys of a few seeds) between the ones that hold a
+    key. The dump writes what the exact dump writes. A table with fewer keys than batches,
+    which is every small table and every new one, is this case."""
+    kvt = _need("dynamicemb.key_value_table")
+    ext = _need("dynamicemb_extensions")
+    for seed in range(1, 60):
+        storage = _storage(8, optimizer)
+        _fill(storage, 6, seed, "timestamp")
+        counts = _counts(storage._state.key_index_map)
+        if _has_a_gap(counts):
+            break
+    else:
+        pytest.fail(
+            "no layout of 6 keys in 8 batches has a batch of none in the middle"
+        )
+    assert sum(counts) == 6
+    state = storage._state
+    timestamp = ext.device_timestamp()
+    new = [str(tmp_path / ("new_" + n)) for n in ("keys", "emb", "scores", "opt")]
+    old = [str(tmp_path / ("old_" + n)) for n in ("keys", "emb", "scores", "opt")]
+
+    kvt._dump_table(
+        state,
+        0,
+        str(tmp_path / "meta.json"),
+        *new,
+        include_optim=include_optim,
+        include_meta=False,
+        timestamp=timestamp,
+    )
+    reference_dump(state, 0, old, include_optim, timestamp)
+
+    num_scores = state.key_index_map.num_scores_
+    opt_width = state.optimizer.get_ckpt_state_dim(DIM) if include_optim else 0
+    got, expected = _records(new, num_scores, opt_width), _records(
+        old, num_scores, opt_width
+    )
+    assert got["keys"].numel() == 6
+    assert sorted(got) == sorted(expected)
+    for column in got:
+        assert torch.equal(got[column], expected[column]), column
+
+
+def test_the_files_of_a_dump_are_closed_when_it_fails(gpu, tmp_path, monkeypatch):
+    """A dump that fails half way does not leave its files open."""
+    kvt = _need("dynamicemb.key_value_table")
+    storage = _storage(2)
+    _fill(storage, 100, 11, "timestamp")
+    opened = []
+    real_open = open
+
+    def spying_open(path, *args, **kwargs):
+        f = real_open(path, *args, **kwargs)
+        opened.append(f)
+        return f
+
+    def broken(*args, **kwargs):
+        raise RuntimeError("the device failed")
+        yield  # a generator, like the batches it replaces
+
+    monkeypatch.setattr(kvt, "open", spying_open, raising=False)
+    monkeypatch.setattr(kvt, "_dump_batches", broken)
+    paths = [str(tmp_path / n) for n in ("keys", "emb", "scores", "opt")]
+    with pytest.raises(RuntimeError, match="the device failed"):
+        kvt._dump_table(
+            storage._state,
+            0,
+            str(tmp_path / "meta.json"),
+            *paths,
+            include_optim=True,
+            include_meta=False,
+            timestamp=0,
+        )
+    assert len(opened) == 4 and all(f.closed for f in opened)
+
+
 def _dump_once(kvt, state, tmp_path, include_optim=False):
     paths = [str(tmp_path / n) for n in ("keys", "emb", "scores", "opt")]
 
@@ -296,22 +388,20 @@ def test_the_pipeline_yields_the_live_rows_and_launches_ahead(gpu):
             column = torch.arange(8, device=device) + 100 * b
             block = column.float().unsqueeze(1).expand(8, 3).contiguous()
             count = torch.tensor([n], dtype=torch.int64, device=device)
-            yield count, [column, None, block]
+            yield count, [column, block]
 
     seen = []
-    for rows, columns in scored.pull_live_prefixes(batches()):
+    for rows, (keys, block) in scored.pull_live_prefixes(batches()):
         b = len(seen)
         log.append(("yield", b))
         seen.append(rows)
         assert rows == counts[b]
-        if rows == 0:
-            assert columns == []
-            continue
-        assert columns[1] is None
-        assert columns[0].tolist() == [100 * b + i for i in range(rows)]
-        assert columns[2].shape == (rows, 3) and columns[2][:, 0].tolist() == [
-            float(100 * b + i) for i in range(rows)
-        ]
+        # a batch that holds nothing has its columns all the same, empty: the columns of
+        # every batch can be unpacked without asking for the count first
+        assert keys.dtype == torch.int64 and keys.shape == (rows,)
+        assert block.dtype == torch.float32 and block.shape == (rows, 3)
+        assert keys.tolist() == [100 * b + i for i in range(rows)]
+        assert block[:, 0].tolist() == [float(100 * b + i) for i in range(rows)]
     assert seen == counts
     # the batch after the next is launched before a batch is handed over, so the device
     # is busy while the caller works on it
@@ -391,6 +481,38 @@ def test_the_admission_counters_dump_is_the_exact_export(gpu, tmp_path):
     got_keys = _read(key_path, torch.int64, 1).view(-1)
     got_freq = _read(score_path, torch.int64, 1).view(-1)
     assert got_keys.numel() == len(keys)
+    assert dict(zip(got_keys.tolist(), got_freq.tolist())) == dict(zip(keys, freq))
+
+
+def test_a_counters_dump_goes_through_batches_that_hold_no_key(gpu, tmp_path):
+    scored = _need("dynamicemb.scored_hashtable")
+    ext = _need("dynamicemb_extensions")
+    for seed in range(1, 60):
+        table = _counter_table(8 * BATCH, "frequency")
+        rng = random.Random(seed)
+        keys = rng.sample(range(1, 1 << 40), 6)
+        freq = [rng.randrange(1, 1000) for _ in keys]
+        arg = scored.ScoreArg(
+            name="frequency",
+            value=torch.tensor(freq, dtype=torch.uint64, device=_device()),
+            policy=ext.ScorePolicy.ASSIGN,
+        )
+        k = torch.tensor(keys, dtype=torch.int64, device=_device())
+        table.insert(k, torch.zeros_like(k), arg)
+        torch.cuda.synchronize()
+        counts = _counts(table)
+        if _has_a_gap(counts):
+            break
+    else:
+        pytest.fail(
+            "no layout of 6 keys in 8 batches has a batch of none in the middle"
+        )
+    key_path, score_path = str(tmp_path / "keys"), str(tmp_path / "freq")
+
+    table.dump(key_path, {"frequency": score_path}, table_id=0)
+
+    got_keys = _read(key_path, torch.int64, 1).view(-1)
+    got_freq = _read(score_path, torch.int64, 1).view(-1)
     assert dict(zip(got_keys.tolist(), got_freq.tolist())) == dict(zip(keys, freq))
 
 
