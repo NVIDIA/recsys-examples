@@ -74,11 +74,11 @@ from dynamicemb.dynamicemb_config import (
 from dynamicemb.initializer import MultiTableInitializer
 from dynamicemb.key_ownership import owned_key_mask, owned_keys
 from dynamicemb.key_value_table import (
+    ERASE_CHUNK_SLOTS,
+    ERASE_MAX_CHUNKS_IN_FLIGHT,
     Cache,
     DynamicEmbCache,
     DynamicEmbStorage,
-    ERASE_CHUNK_SLOTS,
-    ERASE_MAX_CHUNKS_IN_FLIGHT,
     HybridStorage,
     Storage,
     flush_cache,
