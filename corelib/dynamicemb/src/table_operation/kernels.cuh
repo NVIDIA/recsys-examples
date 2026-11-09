@@ -524,22 +524,23 @@ __global__ void table_insert_collect_kernel(
 }
 
 // The overflow tier of an insert whose bucket answered Busy: find or insert the
-// key in the overflow bucket of its table (``ovf_bucket``, bucket ``t_id`` of the
-// overflow table), the way insert_and_evict_body always did. On a success
+// key in the overflow bucket of its table (``ovf_bucket``, bucket ``t_id`` of
+// the overflow table), the way insert_and_evict_body always did. On a success
 // ``index`` is the unified overflow index, ``final_result`` the overflow's
-// result, ``score`` the score the policy stored and ``table_key_slot`` the slot a
-// newly taken overflow slot is locked in (null for an Assign): the caller puts
-// the key back there to unlock it. An overflow Evict also sets
+// result, ``score`` the score the policy stored and ``table_key_slot`` the slot
+// a newly taken overflow slot is locked in (null for an Assign): the caller
+// puts the key back there to unlock it. An overflow Evict also sets
 // ``final_evict_key`` / ``final_evict_index`` to the victim. Nothing is touched
 // when the overflow is Busy too.
 template <typename Policy, typename Bucket, typename KeyType>
-__device__ __forceinline__ void insert_overflow_tier(
-    Bucket &ovf_bucket, KeyType key, int64_t hashcode,
-    int *__restrict__ ovf_bucket_sizes, int64_t t_id,
-    int32_t *__restrict__ ovf_counter, int64_t ovf_output_offset,
-    ScoreType &score, IndexType &index, InsertResult &final_result,
-    KeyType *&table_key_slot, KeyType &final_evict_key,
-    IndexType &final_evict_index) {
+__device__ __forceinline__ void
+insert_overflow_tier(Bucket &ovf_bucket, KeyType key, int64_t hashcode,
+                     int *__restrict__ ovf_bucket_sizes, int64_t t_id,
+                     int32_t *__restrict__ ovf_counter,
+                     int64_t ovf_output_offset, ScoreType &score,
+                     IndexType &index, InsertResult &final_result,
+                     KeyType *&table_key_slot, KeyType &final_evict_key,
+                     IndexType &final_evict_index) {
   using Iter = typename Bucket::Iterator;
   int64_t ovf_bucket_capacity = ovf_bucket.capacity();
   Iter ovf_iter = Iter(hashcode % ovf_bucket_capacity);
@@ -677,10 +678,10 @@ __device__ __forceinline__ void insert_and_evict_body(
     if constexpr (UseOverflow) {
       if (result == InsertResult::Busy && Bucket::is_valid(key)) {
         Bucket ovf_bucket = ovf_table[t_id];
-        insert_overflow_tier<Policy>(ovf_bucket, key, hashcode, ovf_bucket_sizes,
-                                     t_id, ovf_counter, ovf_output_offsets[t_id],
-                                     score, index, final_result, table_key_slot,
-                                     final_evict_key, final_evict_index);
+        insert_overflow_tier<Policy>(
+            ovf_bucket, key, hashcode, ovf_bucket_sizes, t_id, ovf_counter,
+            ovf_output_offsets[t_id], score, index, final_result,
+            table_key_slot, final_evict_key, final_evict_index);
       }
 
       if (result == InsertResult::Evict) {

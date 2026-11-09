@@ -119,10 +119,11 @@ __global__ void decompose_segmented_key_kernel(
 
 // The segment a key sorts into for the sorted insert: its home bucket, or
 // `num_buckets` ("no bucket", sorted after every real one) for a key that takes
-// no part in an insert: a reserved key (the padding of an N-aligned batch, whose
-// table id is -1 and is not read), a key of a table that does not exist, or a
-// key of a table without buckets. The home bucket is the arithmetic of the table
-// kernels (insert_body): bkt_begin + (hash % table_cap) / bucket_capacity.
+// no part in an insert: a reserved key (the padding of an N-aligned batch,
+// whose table id is -1 and is not read), a key of a table that does not exist,
+// or a key of a table without buckets. The home bucket is the arithmetic of the
+// table kernels (insert_body): bkt_begin + (hash % table_cap) /
+// bucket_capacity.
 template <typename KeyType, typename IndexType, typename BucketType>
 struct SortedSegmentFunctor {
 
@@ -291,15 +292,15 @@ std::vector<at::Tensor> bucketize_keys(at::Tensor keys, at::Tensor table_ids,
 // The sort of bucketize_keys for the sorted insert: the same compose and the
 // same radix sort, so the keys of one bucket come out in the same order, but
 // nothing is compacted and nothing is read back. Returns
-//   {sorted_keys [N] (the dtype of keys), inverse [N] int64, segments [N] int64}
+//   {sorted_keys [N] (as keys), inverse [N] int64, segments [N] int64}
 // with sorted_keys[j] = keys[inverse[j]], and segments[j] the global bucket of
-// that key, or num_buckets for a key that takes no part (a reserved key, a key of
-// a table that does not exist or has no buckets; see SortedSegmentFunctor): those
-// sort after all the others. segments is non-decreasing, the keys of one segment
-// ascend (signed for int64 keys, unsigned for uint64 ones) and equal keys of one
-// segment keep their input order. num_buckets is the bucket count of the table
-// (table_bucket_offsets[-1]), which the caller knows: no shape here depends on
-// the data, and there is no read back.
+// that key, or num_buckets for a key that takes no part (a reserved key, a key
+// of a table that does not exist or has no buckets; see SortedSegmentFunctor):
+// those sort after all the others. segments is non-decreasing, the keys of one
+// segment ascend (signed for int64 keys, unsigned for uint64 ones) and equal
+// keys of one segment keep their input order. num_buckets is the bucket count
+// of the table (table_bucket_offsets[-1]), which the caller knows: no shape
+// here depends on the data, and there is no read back.
 std::vector<at::Tensor>
 bucketize_keys_segmented(at::Tensor keys, at::Tensor table_ids,
                          at::Tensor table_bucket_offsets, int64_t num_buckets,
