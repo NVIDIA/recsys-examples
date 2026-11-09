@@ -111,7 +111,7 @@ def build_caching_model(
     NO_EVICTION backing store.
 
     The cache size follows ``local_hbm_for_values / total_value_bytes``
-    (``batched_dynamicemb_tables.py`` picks ``cap_scale`` from that ratio), so a
+    (``batched_dynamicemb_tables.py`` sizes each table's cache by that ratio), so a
     small *cache_fraction* forces real spill traffic between the two tiers.
     """
     value_bytes = max_capacity * torch.finfo(torch.float32).bits // 8 * DIM
