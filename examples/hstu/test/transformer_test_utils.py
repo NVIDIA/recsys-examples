@@ -1,8 +1,9 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES.
 # SPDX-License-Identifier: Apache-2.0
-"""Helpers shared by the FP8 and FA4 Transformer inference layer tests.
+"""Helpers shared by the Transformer inference tests.
 
-The tests that import this module put examples/hstu on sys.path first.
+The tests that import this module put examples/hstu on sys.path first, and
+test_transformer_inference.py also puts corelib's recsys_kvcache_manager there.
 """
 
 import itertools
@@ -10,10 +11,7 @@ from types import SimpleNamespace
 
 import torch
 from modules.transformer_infer_layer import TransformerInferLayer
-
-# The PR's own helpers for building valid KV-cache manager metadata. Importing its test
-# module also puts the PR's corelib on sys.path, as that module does for its own tests.
-from test_transformer_inference import jagged, manager_metadata
+from recsys_kvcache_manager.kvcache_metadata import get_kvcache_metadata_buffer
 from torch import nn
 from torch.nn import functional as F
 
@@ -73,8 +71,66 @@ def cosine(a, b):
     return F.cosine_similarity(a.float().flatten(), b.float().flatten(), dim=0).item()
 
 
-# The PR's cache metadata helper builds two heads of width 64, so the cache tests use a
-# layer of hidden size 128, which every projection width keeps FP8 eligible.
+def offsets(lengths):
+    return torch.tensor(
+        [0] + list(torch.tensor(lengths).cumsum(0).tolist()), dtype=torch.int32
+    )
+
+
+def make_metadata(histories, layers, heads, dim, dtype, page_size=4):
+    counts = [(h + page_size - 1) // page_size for h in histories]
+    pages = sum(counts)
+    return SimpleNamespace(
+        kv_cache_table=[
+            torch.full(
+                (max(1, pages), 2, page_size, heads, dim), float("nan"), dtype=dtype
+            )
+            for _ in range(layers)
+        ],
+        kv_indices=torch.randperm(pages).to(torch.int32),
+        kv_indptr=offsets(counts),
+        total_history_lengths=torch.tensor(histories, dtype=torch.int32),
+        kv_onload_handle=None,
+    )
+
+
+def jagged(lengths, candidates):
+    return SimpleNamespace(
+        seqlen_offsets=offsets(lengths), num_candidates=torch.tensor(candidates)
+    )
+
+
+def manager_metadata(histories, lengths, candidates, device="cpu"):
+    """Build real manager buffers for requests with two heads of width 64."""
+    source = make_metadata(histories, 1, 2, 64, torch.float16)
+    new_history = [n - c for n, c in zip(lengths, candidates)]
+    md = get_kvcache_metadata_buffer(
+        len(histories), sum(new_history), len(source.kv_indices), device=device
+    )
+    md.kv_cache_table = [source.kv_cache_table[0].to(device).normal_()]
+    for name in ("kv_indices", "kv_indptr", "total_history_lengths"):
+        getattr(md, name).copy_(getattr(source, name))
+    md.kv_last_page_len.copy_(
+        torch.tensor([(h - 1) % 4 + 1 if h else 0 for h in histories])
+    )
+    md.total_history_offsets.copy_(offsets(histories))
+    md.new_history_offsets.copy_(offsets(new_history))
+    md.new_history_nnz_cuda.fill_(sum(new_history))
+    md.kv_seqlens.copy_(torch.tensor([h + c for h, c in zip(histories, candidates)]))
+    md.kv_seqlen_offsets.copy_(offsets([h + c for h, c in zip(histories, candidates)]))
+    md.batch_indices.copy_(
+        torch.tensor([u for u, n in enumerate(new_history) for _ in range(n)])
+    )
+    md.position.copy_(
+        torch.tensor(
+            [p for h, n in zip(histories, new_history) for p in range(h - n, h)]
+        )
+    )
+    return md
+
+
+# manager_metadata builds two heads of width 64, so the cache tests use a layer of
+# hidden size 128, which keeps every projection width FP8 eligible.
 CACHE_LAYER = dict(hidden=128, heads=2, head_dim=64, ffn=256, max_seq_len=24)
 
 
@@ -91,7 +147,7 @@ def cache_inputs(seed=1):
 
 
 def cache_metadata(histories, seed):
-    """The PR's manager metadata with a bf16 cache table; the same seed, the same content."""
+    """``manager_metadata`` on CUDA with a bf16 cache table; same seed, same content."""
     torch.manual_seed(seed)
     metadata = manager_metadata(histories, [3, 4], [1, 2], device="cuda")
     metadata.kv_cache_table = [t.to(torch.bfloat16) for t in metadata.kv_cache_table]

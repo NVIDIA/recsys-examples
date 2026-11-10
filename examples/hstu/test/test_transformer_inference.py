@@ -24,9 +24,15 @@ sys.path.insert(0, str(HSTU_ROOT.parents[1] / "corelib/recsys_kvcache_manager"))
 
 from modules.inference_checkpoint import load_dense_state_dict
 from modules.transformer_infer_layer import TransformerInferLayer
-from recsys_kvcache_manager.kvcache_metadata import (
-    copy_kvcache_metadata,
-    get_kvcache_metadata_buffer,
+from recsys_kvcache_manager.kvcache_metadata import copy_kvcache_metadata
+from transformer_test_utils import (
+    dense_batch,
+    dense_config,
+    dense_module,
+    jagged,
+    make_metadata,
+    manager_metadata,
+    offsets,
 )
 
 
@@ -92,12 +98,6 @@ def test_backbone_configuration_defaults_and_validation():
     assert fp16_fa4.transformer_attention == "fa4"
 
 
-def offsets(lengths):
-    return torch.tensor(
-        [0] + list(torch.tensor(lengths).cumsum(0).tolist()), dtype=torch.int32
-    )
-
-
 def reference(layer, x, candidates):
     """Independent unpadded Pre-LN Transformer arithmetic for one user."""
     normed = F.layer_norm(
@@ -153,58 +153,6 @@ def test_ragged_forward_matches_unpadded_reference(dtype, residual, seed):
     )
     actual = layer(x, offsets(lengths), torch.tensor(candidates))
     torch.testing.assert_close(actual, expected, atol=1e-6, rtol=2e-5)
-
-
-def make_metadata(histories, layers, heads, dim, dtype, page_size=4):
-    counts = [(h + page_size - 1) // page_size for h in histories]
-    pages = sum(counts)
-    return SimpleNamespace(
-        kv_cache_table=[
-            torch.full(
-                (max(1, pages), 2, page_size, heads, dim), float("nan"), dtype=dtype
-            )
-            for _ in range(layers)
-        ],
-        kv_indices=torch.randperm(pages).to(torch.int32),
-        kv_indptr=offsets(counts),
-        total_history_lengths=torch.tensor(histories, dtype=torch.int32),
-        kv_onload_handle=None,
-    )
-
-
-def jagged(lengths, candidates):
-    return SimpleNamespace(
-        seqlen_offsets=offsets(lengths), num_candidates=torch.tensor(candidates)
-    )
-
-
-def manager_metadata(histories, lengths, candidates, device="cpu"):
-    """Build real manager buffers for requests with two heads of width 64."""
-    source = make_metadata(histories, 1, 2, 64, torch.float16)
-    new_history = [n - c for n, c in zip(lengths, candidates)]
-    md = get_kvcache_metadata_buffer(
-        len(histories), sum(new_history), len(source.kv_indices), device=device
-    )
-    md.kv_cache_table = [source.kv_cache_table[0].to(device).normal_()]
-    for name in ("kv_indices", "kv_indptr", "total_history_lengths"):
-        getattr(md, name).copy_(getattr(source, name))
-    md.kv_last_page_len.copy_(
-        torch.tensor([(h - 1) % 4 + 1 if h else 0 for h in histories])
-    )
-    md.total_history_offsets.copy_(offsets(histories))
-    md.new_history_offsets.copy_(offsets(new_history))
-    md.new_history_nnz_cuda.fill_(sum(new_history))
-    md.kv_seqlens.copy_(torch.tensor([h + c for h, c in zip(histories, candidates)]))
-    md.kv_seqlen_offsets.copy_(offsets([h + c for h, c in zip(histories, candidates)]))
-    md.batch_indices.copy_(
-        torch.tensor([u for u, n in enumerate(new_history) for _ in range(n)])
-    )
-    md.position.copy_(
-        torch.tensor(
-            [p for h, n in zip(histories, new_history) for p in range(h - n, h)]
-        )
-    )
-    return md
 
 
 def test_copy_cache_metadata_refreshes_history_lengths_and_clears_padding():
@@ -659,7 +607,6 @@ def test_exported_dense_module_serves_more_users_than_the_example():
     from commons.datasets.hstu_batch import HSTUBatch
     from torch.export import Dim
     from torchrec.sparse.jagged_tensor import JaggedTensor, KeyedJaggedTensor
-    from transformer_test_utils import dense_config, dense_module
 
     model = dense_module(0, dense_config(export_mode=True, max_batch_size=8))
     keys, seq, num_candidates = ["context", "item", "action"], 8, 3
@@ -731,7 +678,6 @@ def test_cached_module_runs_a_forward_without_cache_eagerly():
     from configs import InferenceEmbeddingConfig, RankingConfig
     from modules.inference_dense_module import InferenceDenseModule
     from recsys_kvcache_manager.kvcache_config import get_kvcache_config
-    from transformer_test_utils import dense_batch, dense_config
 
     cfg = dense_config()
     kvcache = get_kvcache_config(

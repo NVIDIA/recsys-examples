@@ -31,7 +31,7 @@ from modules.transformer_infer_layer_fa4 import (
     Fa4Fp8TransformerInferLayer,
     Fa4TransformerInferLayer,
 )
-from test_transformer_inference import copy_kvcache_metadata
+from recsys_kvcache_manager.kvcache_metadata import copy_kvcache_metadata
 from transformer_test_utils import (
     CACHE_LAYER,
     cache_inputs,
