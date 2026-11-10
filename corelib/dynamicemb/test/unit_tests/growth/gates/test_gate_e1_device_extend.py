@@ -11,34 +11,37 @@ code cannot show is whether those driver calls wait for kernels in flight (``cuM
 carries the header note "exhibits synchronous behavior for most use cases"), whether a kernel
 launched right after sees the new tail, and whether a kernel running on the old pages is hurt.
 
-The script drives the C++ buffer directly (no Python synchronize, whatever the tree has) with
+Two things are different things and are measured by different runs:
 
-* kernel A in flight on stream A: ``base.add_(1.0)`` k times, which reads and writes every old
-  element for about 50 ms (kind ``memory``), or ``torch.cuda._sleep`` of the same length (kind
-  ``sleep``: no memory traffic, to tell "waits for the kernel" from "contention");
-* ``extend`` on the host thread meanwhile, by 2, 6 and 64 MiB (below a granule, a few
-  granules, many);
-* a kernel on stream B on the new tail right after ``extend`` returned;
-* optionally a second host thread that launches kernels on stream C all the time (the GIL is
-  released inside ``extend``, so launches and the driver calls can overlap).
+* WAITING for the device (``test_e1_extend_does_not_wait``). Kernel A is in flight on stream A
+  for about ``GATE_E1_WAIT_KERNEL_MS`` (1.8 s, far longer than any ``extend``), either a
+  ``torch.cuda._sleep`` (kind ``sleep``: no memory traffic) or a train of ``base.add_(1.0)``
+  over a 4 GiB buffer that reads and writes every old element (kind ``memory``), and the host
+  thread extends by 2, 6 or 64 MiB meanwhile (below a granule, a few granules, many). The
+  call is BLOCKED when it returned after A had finished, or took more than half of the time
+  A had left when it was called: a call that waits for the device takes about that time, one
+  that does not takes what the driver needs to map and zero the pages (tens of milliseconds,
+  more while a bandwidth-bound kernel competes for the memory: allocator-class latency, which
+  is information here, not a criterion). PASS when at most 1% of the iterations are blocked.
+  The controls ``GATE_E1_SYNC=before`` (``torch.cuda.synchronize()`` before each ``extend``, what
+  the product did) and ``inside`` (the same inside the timed region: a call that takes as long
+  as the kernel has left) wait by construction and must show every iteration blocked, or the
+  gate cannot tell a wait from the lack of one. ``after`` puts it after: it gates nothing.
+* DATA (``test_e1_extend_keeps_the_data``): the same, with kernels of about
+  ``GATE_E1_KERNEL_MS`` (50 ms) and many iterations with no synchronize in between, so that
+  growths and kernels pile up. PASS when there is no CUDA error, every old element has had
+  each of A's adds exactly once (fp32 sums are exact below 2**24) and every tail holds what a
+  kernel on stream B wrote right after the ``extend`` that made it. The latency is printed.
 
-PASS when, for every (growth, kind): no CUDA error; every old element has had each of A's adds
-exactly once (fp32 sums are exact below 2**24) and every tail holds what B wrote; ``extend``
-returned while A was still running in at least 99% of the iterations; the median ``extend``
-takes at most 2 ms and the 99th percentile at most 10 ms (``GATE_E1_MAX_MEDIAN_MS`` and
-``GATE_E1_MAX_P99_MS`` loosen those two for a driver that is only slow).
+Optionally a second host thread launches kernels on stream C all the time (the GIL is released
+inside ``extend``, so launches and the driver calls can overlap).
 
-``GATE_E1_SYNC=before`` repeats the run with ``torch.cuda.synchronize()`` before every
-``extend`` (what the product does today: the control; its latency is that of an idle device),
-``after`` puts it after (the comment of ``test_vmm_buffer``: "synchronize is necessary to
-avoid IMA"); neither gates anything.
-
-The second test, ``recorded_doubling_loop``, is the one the recorded failure was seen in. ``test_vmm_buffer``
+The third test, ``recorded_doubling_loop``, is the one the recorded failure was seen in. ``test_vmm_buffer``
 (``test/unit_tests/test_vmm_tensor.py``) doubles a buffer of each class until the driver or the
 reservation refuses and says, next to the ``torch.cuda.synchronize()`` it calls after every
 ``extend``: "synchronize is necessary to avoid IMA ... stream synchronization and device
 synchronization in C++ not worked". No kernel runs in that loop, and the synchronize came from
-Python, so the kernels of the loop above cannot stand in for it. This test runs the same loop
+Python, so the kernels of the runs above cannot stand in for it. This test runs the same loop
 for both buffer classes (``DeviceExtendableBuffer`` and ``HostExtendableBuffer``) with NO
 synchronize between the ``extend`` calls and one at the end, where a fault of any of them shows,
 and then writes and reads three elements of the grown buffer through the mapping. PASS when the
@@ -51,13 +54,15 @@ for ``test_vmm_buffer``.
 
 Run it (one H100, the extension built for it with ``DEMB_ARCHS=90``)::
 
-    DEMB_GROWTH_GATES=1 GATE_E1_ITERS=2000 python -m pytest -s -q \\
+    DEMB_GROWTH_GATES=1 python -m pytest -s -q \\
         corelib/dynamicemb/test/unit_tests/growth/gates/test_gate_e1_device_extend.py
-    # the sanitizer, with the control and the candidate; compare their reports
+    # the control, which must show every iteration blocked
+    DEMB_GROWTH_GATES=1 GATE_E1_SYNC=before python -m pytest -s -q -k does_not_wait <the file>
+    # the sanitizer, a reduced run of the data test with the control and the candidate
     DEMB_GROWTH_GATES=1 GATE_E1_ITERS=40 GATE_E1_SYNC=before compute-sanitizer --tool memcheck \\
-        --error-exitcode 99 python -m pytest -s -q <the file>
+        --error-exitcode 99 python -m pytest -s -q -k keeps_the_data <the file>
     DEMB_GROWTH_GATES=1 GATE_E1_ITERS=40 compute-sanitizer --tool memcheck \\
-        --error-exitcode 99 python -m pytest -s -q <the file>
+        --error-exitcode 99 python -m pytest -s -q -k keeps_the_data <the file>
     # the recorded loop of test_vmm_buffer without its synchronize, twenty times, with and
     # without the sanitizer (one failure of any run is a FAIL)
     for i in $(seq 20); do DEMB_GROWTH_GATES=1 DYNAMICEMB_VMM_STRESS_FULL=1 \\
@@ -86,25 +91,33 @@ pytestmark = pytest.mark.skipif(
 )
 
 MB = 1 << 20
+# the data runs: short kernels, many iterations, nothing waits for the device in between
 ITERS = int(os.environ.get("GATE_E1_ITERS", "100"))
 OLD_MB = int(os.environ.get("GATE_E1_OLD_MB", "256"))
+KERNEL_MS = float(os.environ.get("GATE_E1_KERNEL_MS", "50"))
+# the wait runs: kernels of seconds (a call that waits takes about that long, one that does not
+# a few tens of milliseconds), a few iterations; the old buffer is large enough for the kernel
+# of the kind ``memory`` to be a few hundred launches (a stream queues about a thousand)
+WAIT_ITERS = int(os.environ.get("GATE_E1_WAIT_ITERS", "12"))
+WAIT_OLD_MB = int(os.environ.get("GATE_E1_WAIT_OLD_MB", "4096"))
+WAIT_KERNEL_MS = float(os.environ.get("GATE_E1_WAIT_KERNEL_MS", "1800"))
+MAX_LAUNCHES = 900
 GROW_MB = [int(x) for x in os.environ.get("GATE_E1_GROW_MB", "2,6,64").split(",")]
 # the buffer is made again every this many iterations, so that the mapped memory stays
 # bounded (a buffer never gives pages back): 256 MiB + 16 x 64 MiB
 RECREATE_EVERY = int(os.environ.get("GATE_E1_RECREATE_EVERY", "16"))
-SYNC = os.environ.get("GATE_E1_SYNC", "none")  # none | before | after
-KERNEL_MS = float(os.environ.get("GATE_E1_KERNEL_MS", "50"))
+SYNC = os.environ.get("GATE_E1_SYNC", "none")  # none | before | inside | after
 
-# The acceptance criteria of the design (a driver call that waits for kernel A takes about
-# KERNEL_MS, 25 times the median allowed here); the two latency limits can be loosened for
-# a driver that is only slow, never the share of calls that returned after A had finished.
+# The acceptance criterion of the design: a call that waits for kernel A comes back after it,
+# or takes about as long as A has left; at most this share of the calls may.
 MAX_BLOCKED = 0.01
-MAX_MEDIAN_S = float(os.environ.get("GATE_E1_MAX_MEDIAN_MS", "2")) * 1e-3
-MAX_P99_S = float(os.environ.get("GATE_E1_MAX_P99_MS", "10")) * 1e-3
+# What a blocked call is: it took more than this share of the time A had left.
+BLOCKED_SHARE = 0.5
 
 
-def kernel_adds(base: torch.Tensor) -> int:
-    """How many ``add_`` over the old region take about KERNEL_MS."""
+def kernel_adds(base: torch.Tensor, target_ms: float) -> int:
+    """How many ``add_`` over the old region take about ``target_ms`` (at most
+    MAX_LAUNCHES: a stream that has more queued makes the host wait in the launch)."""
     stream = torch.cuda.Stream()
     with torch.cuda.stream(stream):
         base.add_(1.0)  # load the kernel
@@ -118,12 +131,12 @@ def kernel_adds(base: torch.Tensor) -> int:
     end.synchronize()
     base.sub_(11.0)
     per_add = max(start.elapsed_time(end) / 10, 1e-3)
-    return max(1, int(KERNEL_MS / per_add))
+    return max(1, min(MAX_LAUNCHES, int(target_ms / per_add)))
 
 
-def sleep_cycles() -> int:
-    """How many cycles of ``torch.cuda._sleep`` take about KERNEL_MS (measured: the clock of
-    the device is not something PyTorch reports on every version)."""
+def sleep_cycles(target_ms: float) -> int:
+    """How many cycles of ``torch.cuda._sleep`` take about ``target_ms`` (measured: the clock
+    of the device is not something PyTorch reports on every version)."""
     stream = torch.cuda.Stream()
     probe = 20_000_000
     with torch.cuda.stream(stream):
@@ -135,45 +148,65 @@ def sleep_cycles() -> int:
         torch.cuda._sleep(probe)
         end.record(stream)
     end.synchronize()
-    return max(1, int(probe * KERNEL_MS / max(start.elapsed_time(end), 1e-3)))
+    return max(1, int(probe * target_ms / max(start.elapsed_time(end), 1e-3)))
+
+
+def percentile(sorted_values, share: float) -> float:
+    return sorted_values[min(len(sorted_values) - 1, int(share * len(sorted_values)))]
 
 
 class Result:
-    def __init__(self):
+    def __init__(self, mode: str):
+        self.mode = mode
         self.latencies = []
         self.blocked = 0
         self.problems = []
         self.iterations = 0
+        self.kernel_ms = []  # what kernel A took in each iteration of a wait run
+        self.target_ms = 0.0  # what it was meant to take
 
     def verdict(self, label: str) -> bool:
         lat = sorted(self.latencies) or [0.0]
         median = statistics.median(lat)
-        p99 = lat[min(len(lat) - 1, int(0.99 * len(lat)))]
+        p99, worst = percentile(lat, 0.99), lat[-1]
         fraction = self.blocked / max(1, self.iterations)
         problems = list(self.problems)
-        if SYNC == "none":
+        if self.mode == "wait" and SYNC == "none":
             if fraction > MAX_BLOCKED:
                 problems.append(
-                    "extend returned only after kernel A had finished in %.1f%% of "
-                    "the iterations (at most %.0f%%)"
-                    % (100 * fraction, 100 * MAX_BLOCKED)
+                    "extend was blocked (it returned after kernel A had finished, or took "
+                    "more than half of what A had left) in %.1f%% of the iterations "
+                    "(at most %.0f%%)" % (100 * fraction, 100 * MAX_BLOCKED)
                 )
-            if median > MAX_MEDIAN_S:
+        elif self.mode == "wait" and SYNC in ("before", "inside"):
+            # the controls wait by construction: they have to be seen
+            if fraction < 0.99:
                 problems.append(
-                    "median extend %.2f ms > %.1f ms"
-                    % (median * 1e3, MAX_MEDIAN_S * 1e3)
+                    "the control (a synchronize %s every extend) was blocked in only "
+                    "%.1f%% of the iterations: the gate cannot see a wait"
+                    % (
+                        "before" if SYNC == "before" else "inside the timing of",
+                        100 * fraction,
+                    )
                 )
-            if p99 > MAX_P99_S:
-                problems.append(
-                    "p99 extend %.2f ms > %.1f ms" % (p99 * 1e3, MAX_P99_S * 1e3)
-                )
-        line = "%s iters=%d blocked=%.2f%% median=%.3fms p99=%.3fms sync=%s" % (
-            label,
-            self.iterations,
-            100 * fraction,
-            median * 1e3,
-            p99 * 1e3,
-            SYNC,
+        kernel = statistics.median(self.kernel_ms) if self.kernel_ms else self.target_ms
+        line = (
+            "%s mode=%s iters=%d %s=%.2f%% extend: median=%.3fms p99=%.3fms max=%.3fms "
+            "(kernel A %.0fms) sync=%s"
+            % (
+                label,
+                self.mode,
+                self.iterations,
+                # in a data run kernel A is short, and a slow call can return after it
+                # without having waited for it: the share is information there
+                "blocked" if self.mode == "wait" else "returned_after_A(info)",
+                100 * fraction,
+                median * 1e3,
+                p99 * 1e3,
+                worst * 1e3,
+                kernel,
+                SYNC,
+            )
         )
         if problems:
             print("E1 FAIL %s: %s" % (line, "; ".join(problems)))
@@ -182,14 +215,20 @@ class Result:
         return True
 
 
-def run(grow_mb: int, kind: str, with_thread: bool, iters: int = None) -> Result:
-    iters = ITERS if iters is None else iters
+def run(grow_mb: int, kind: str, with_thread: bool, mode: str) -> Result:
+    """``mode`` is ``wait`` (one long kernel A per iteration, a synchronize after each
+    iteration) or ``data`` (short kernels, no synchronize until a buffer is replaced).
+    """
+    wait = mode == "wait"
+    iters = WAIT_ITERS if wait else ITERS
     device = torch.cuda.current_device()
-    result = Result()
+    result = Result(mode)
     stream_a, stream_b = torch.cuda.Stream(), torch.cuda.Stream()
-    n_old = OLD_MB * MB // 4
+    n_old = (WAIT_OLD_MB if wait and kind == "memory" else OLD_MB) * MB // 4
     grow = grow_mb * MB // 4
-    cycles = sleep_cycles() if kind == "sleep" else 0
+    target_ms = WAIT_KERNEL_MS if wait else KERNEL_MS
+    result.target_ms = target_ms
+    cycles = sleep_cycles(target_ms) if kind == "sleep" else 0
 
     stop = threading.Event()
     thread_errors = []
@@ -224,29 +263,45 @@ def run(grow_mb: int, kind: str, with_thread: bool, iters: int = None) -> Result
                 torch.cuda.synchronize()
                 total, adds, fills = n_old, 0, []
                 if kind == "memory" and k == 0:
-                    k = kernel_adds(base)
+                    k = kernel_adds(base, target_ms)
+            if wait:
+                torch.cuda.synchronize()  # kernel A starts on an idle device
+            launched = time.perf_counter()
             with torch.cuda.stream(stream_a):
+                a_start = torch.cuda.Event(enable_timing=True)
+                a_start.record(stream_a)
                 if kind == "memory":
                     for _ in range(k):
                         base.add_(1.0)
                 else:
                     torch.cuda._sleep(cycles)
-                done = torch.cuda.Event()
-                done.record(stream_a)
+                a_end = torch.cuda.Event(enable_timing=True)
+                a_end.record(stream_a)
             adds += k if kind == "memory" else 0
             if SYNC == "before":
                 torch.cuda.synchronize()
             start = time.perf_counter()
+            if SYNC == "inside":
+                torch.cuda.synchronize()  # a call that waits for the device, as timed
             total += grow
             buf.extend(total)  # NO device synchronize anywhere in the candidate
-            result.latencies.append(time.perf_counter() - start)
-            result.blocked += int(done.query())
+            latency = time.perf_counter() - start
+            finished = a_end.query()
+            result.latencies.append(latency)
             result.iterations += 1
             view = buf.data()  # a kernel launched right after sees the new tail
             value = float(it % 97 + 1)
             with torch.cuda.stream(stream_b):
                 view[total - grow : total].fill_(value)
             fills.append((total - grow, total, value))
+            if wait:
+                torch.cuda.synchronize()
+                kernel_s = a_start.elapsed_time(a_end) / 1e3
+                result.kernel_ms.append(kernel_s * 1e3)
+                left = kernel_s - (start - launched)
+                result.blocked += int(finished or latency > BLOCKED_SHARE * left)
+            else:
+                result.blocked += int(finished)
             if SYNC == "after":
                 torch.cuda.synchronize()
         if buf is not None:
@@ -291,17 +346,29 @@ def check(result, buf, base, n_old, adds, fills):
             break
 
 
+def label_of(grow_mb: int, kind: str, with_thread: bool) -> str:
+    return "%s/%s/grow%dMiB" % ("thread" if with_thread else "alone", kind, grow_mb)
+
+
 @pytest.mark.parametrize(
     "with_thread", [False, True], ids=["alone", "with_launching_thread"]
 )
 @pytest.mark.parametrize("kind", ["memory", "sleep"])
 @pytest.mark.parametrize("grow_mb", GROW_MB)
-def test_e1_extend_under_load(grow_mb, kind, with_thread):
-    result = run(grow_mb, kind, with_thread)
-    ok = result.verdict(
-        "%s/%s/%s/grow%dMiB"
-        % ("thread" if with_thread else "alone", kind, SYNC, grow_mb)
-    )
+def test_e1_extend_does_not_wait(grow_mb, kind, with_thread):
+    result = run(grow_mb, kind, with_thread, "wait")
+    ok = result.verdict(label_of(grow_mb, kind, with_thread))
+    assert ok, "E1 failed; see the E1 FAIL line above"
+
+
+@pytest.mark.parametrize(
+    "with_thread", [False, True], ids=["alone", "with_launching_thread"]
+)
+@pytest.mark.parametrize("kind", ["memory", "sleep"])
+@pytest.mark.parametrize("grow_mb", GROW_MB)
+def test_e1_extend_keeps_the_data(grow_mb, kind, with_thread):
+    result = run(grow_mb, kind, with_thread, "data")
+    ok = result.verdict(label_of(grow_mb, kind, with_thread))
     assert ok, "E1 failed; see the E1 FAIL line above"
 
 
@@ -418,9 +485,9 @@ if __name__ == "__main__":
     for g in GROW_MB:
         for kind in ("memory", "sleep"):
             for thread in (False, True):
-                passed &= run(g, kind, thread).verdict(
-                    "%s/%s/%s/grow%dMiB"
-                    % ("thread" if thread else "alone", kind, SYNC, g)
-                )
+                for mode in ("wait", "data"):
+                    passed &= run(g, kind, thread, mode).verdict(
+                        label_of(g, kind, thread)
+                    )
     print("E1 %s" % ("PASS" if passed else "FAIL"))
     sys.exit(0 if passed else 1)

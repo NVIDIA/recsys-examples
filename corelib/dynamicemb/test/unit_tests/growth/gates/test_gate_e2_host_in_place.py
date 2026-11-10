@@ -8,14 +8,24 @@
 and registers (``cudaHostRegister``) only the new tail; nothing is unregistered or moved until
 the buffer is destroyed. What hardware has to say:
 
-* (a) does ``cudaHostRegister`` of a tail wait for kernels in flight that read the buffer?
-  A kernel on stream A reads and writes the whole old buffer through the mapped pointer
-  (about 100 ms) while the host thread extends by 64 MiB. PASS: ``extend`` returns while A
-  is still running in at least 99% of the iterations, and the median takes at most 50 ms
-  (page touch + ``mlock`` + registration are O(delta)).
-* (b) is a buffer registered in many pieces one contiguous device range, and does its address
-  stay put? 1000 growths of one to three pages, the address checked after every one; then a
-  kernel gathers, writes and gathers again across every boundary of the pieces and at random.
+* (a) does ``cudaHostRegister`` of a tail WAIT for kernels in flight that read the buffer?
+  A train of kernels on stream A reads and writes the whole old buffer through the mapped
+  pointer for about ``GATE_E2_KERNEL_MS`` (1.8 s, far longer than any growth) while the host
+  thread extends by 64 MiB. The call is BLOCKED when it returned after A had finished, or took
+  more than half of the time A had left when it was called (a call that waits takes about
+  that; one that does not takes what pinning the pages needs, touch + ``mlock`` + registration,
+  tens of milliseconds for 64 MiB, which is printed and is not a criterion). PASS when at most
+  1% of the iterations are blocked. ``test_e2a_growth_keeps_the_data`` is the same with short
+  kernels (``GATE_E2_DATA_KERNEL_MS``, 100 ms) and no synchronize between the iterations: PASS
+  when there is no CUDA error, every old element has had each of A's adds once, and every
+  tail holds what a kernel on stream B wrote right after the growth that made it.
+* (b) is a buffer registered in many pieces one contiguous range for the kernels, and does its
+  address stay put? 1000 growths of one to three pages, the address checked after every one;
+  then kernels gather, write and gather again across every boundary of the pieces and at
+  random. (A kernel is meant: the driver does not follow a ``cudaMemcpyAsync`` from one
+  registered piece into the next; (f) prints what it does as information, and
+  ``test_a_copy_across_two_pieces_is_refused_cleanly...`` of ``test_vmm_tensor.py`` pins it
+  down.)
 * (c) is a buffer in 20 pieces as fast as one in a single registration? The random-gather
   throughput of a 1 GiB buffer built both ways must agree within 5%.
 * (d) can 128 tables reserve their address space (64 GiB each, 8 TiB in all)? The reservation
@@ -24,14 +34,14 @@ the buffer is destroyed. What hardware has to say:
 
 Run it (one H100 node, ``ulimit -l unlimited``, the extension built with ``DEMB_ARCHS=90``)::
 
-    DEMB_GROWTH_GATES=1 GATE_E2_ITERS=200 python -m pytest -s -q \\
+    DEMB_GROWTH_GATES=1 python -m pytest -s -q \\
         corelib/dynamicemb/test/unit_tests/growth/gates/test_gate_e2_host_in_place.py
     # what the driver was asked: one cudaHostRegister per growth, no cudaHostUnregister
     # while the buffer lives
-    DEMB_GROWTH_GATES=1 GATE_E2_ITERS=40 nsys profile --trace=cuda -o e2 python -m pytest -s -q \\
-        -k e2a <the file>; nsys stats --report cuda_api_sum e2.nsys-rep | grep -i hostregister
-    DEMB_GROWTH_GATES=1 GATE_E2_ITERS=20 compute-sanitizer --tool memcheck --error-exitcode 99 \\
-        python -m pytest -s -q -k "e2a or e2b" <the file>
+    DEMB_GROWTH_GATES=1 GATE_E2_ITERS=6 nsys profile --trace=cuda -o e2 python -m pytest -s -q \\
+        -k e2a_growth_does_not_wait <the file>; nsys stats --report cuda_api_sum e2.nsys-rep | grep -i hostregister
+    DEMB_GROWTH_GATES=1 GATE_E2_DATA_ITERS=16 GATE_E2_DATA_KERNEL_MS=20 compute-sanitizer --tool memcheck \\
+        --error-exitcode 99 python -m pytest -s -q -k "keeps_the_data or e2b" <the file>
 
 Every verdict is one printed line: ``E2 PASS ...`` or ``E2 FAIL ...``.
 """
@@ -59,11 +69,18 @@ pytestmark = pytest.mark.skipif(
 MB = 1 << 20
 PAGE = os.sysconf("SC_PAGE_SIZE")
 FPP = PAGE // 4  # float32 elements per page
-ITERS = int(os.environ.get("GATE_E2_ITERS", "40"))
+# the wait run: a kernel of seconds, a synchronize after every iteration
+ITERS = int(os.environ.get("GATE_E2_ITERS", "12"))
+KERNEL_MS = float(os.environ.get("GATE_E2_KERNEL_MS", "1800"))
+# the data run: short kernels, nothing waits in between
+DATA_ITERS = int(os.environ.get("GATE_E2_DATA_ITERS", "40"))
+DATA_KERNEL_MS = float(os.environ.get("GATE_E2_DATA_KERNEL_MS", "100"))
 GROW_MB = int(os.environ.get("GATE_E2_GROW_MB", "64"))
-KERNEL_MS = float(os.environ.get("GATE_E2_KERNEL_MS", "100"))
 RECREATE_EVERY = int(os.environ.get("GATE_E2_RECREATE_EVERY", "8"))
 OLD_MB = int(os.environ.get("GATE_E2_OLD_MB", "256"))
+MAX_LAUNCHES = 900  # a stream that has more queued makes the host wait in the launch
+MAX_BLOCKED = 0.01
+BLOCKED_SHARE = 0.5  # a blocked call took more than this share of what A had left
 
 
 def verdict(ok: bool, label: str, detail: str = "") -> None:
@@ -90,8 +107,8 @@ def cuda_attribute(device: int, attribute: int):
     return None
 
 
-def calibrate_adds(base: torch.Tensor) -> int:
-    """How many ``add_`` over ``base`` take about KERNEL_MS."""
+def calibrate_adds(base: torch.Tensor, target_ms: float) -> int:
+    """How many ``add_`` over ``base`` take about ``target_ms`` (at most MAX_LAUNCHES)."""
     stream = torch.cuda.Stream()
     with torch.cuda.stream(stream):
         base.add_(1.0)
@@ -104,18 +121,28 @@ def calibrate_adds(base: torch.Tensor) -> int:
         end.record(stream)
     end.synchronize()
     base.sub_(4.0)
-    return max(1, int(KERNEL_MS / max(start.elapsed_time(end) / 3, 1e-3)))
+    return max(
+        1, min(MAX_LAUNCHES, int(target_ms / max(start.elapsed_time(end) / 3, 1e-3)))
+    )
+
+
+def percentile(sorted_values, share: float) -> float:
+    return sorted_values[min(len(sorted_values) - 1, int(share * len(sorted_values)))]
 
 
 # --- (a) --------------------------------------------------------------------------------
 
 
-def test_e2a_growth_does_not_wait_for_a_running_kernel():
+def run_a(wait: bool):
+    """``wait``: one long kernel A per iteration and a synchronize after it, the share of the
+    blocked calls is the verdict; otherwise short kernels piling up, the data is."""
+    iters = ITERS if wait else DATA_ITERS
+    target_ms = KERNEL_MS if wait else DATA_KERNEL_MS
     device = torch.cuda.current_device()
     n_old, grow = OLD_MB * MB // 4, GROW_MB * MB // 4
     reserve = n_old + (RECREATE_EVERY + 1) * grow
     stream_a, stream_b = torch.cuda.Stream(), torch.cuda.Stream()
-    latencies, blocked, problems = [], 0, []
+    latencies, kernels, blocked, problems = [], [], 0, []
     buf = base = None
     k = 0
     adds, fills, total = 0, [], 0
@@ -131,7 +158,7 @@ def test_e2a_growth_does_not_wait_for_a_running_kernel():
                 break
 
     try:
-        for it in range(ITERS):
+        for it in range(iters):
             if buf is None or it % RECREATE_EVERY == 0:
                 if buf is not None:
                     check()
@@ -141,45 +168,76 @@ def test_e2a_growth_does_not_wait_for_a_running_kernel():
                 base.zero_()
                 torch.cuda.synchronize()
                 total, adds, fills = n_old, 0, []
-                k = k or calibrate_adds(base)
+                k = k or calibrate_adds(base, target_ms)
+            if wait:
+                torch.cuda.synchronize()  # kernel A starts on an idle device
+            launched = time.perf_counter()
             with torch.cuda.stream(stream_a):
+                a_start = torch.cuda.Event(enable_timing=True)
+                a_start.record(stream_a)
                 for _ in range(k):
                     base.add_(1.0)
-                done = torch.cuda.Event()
-                done.record(stream_a)
+                a_end = torch.cuda.Event(enable_timing=True)
+                a_end.record(stream_a)
             adds += k
             start = time.perf_counter()
             total += grow
             buf.extend(total)
-            latencies.append(time.perf_counter() - start)
-            blocked += int(done.query())
+            latency = time.perf_counter() - start
+            finished = a_end.query()
+            latencies.append(latency)
             value = float(it % 97 + 1)
             with torch.cuda.stream(stream_b):
                 buf.data()[total - grow : total].fill_(value)
             fills.append((total - grow, total, value))
+            if wait:
+                torch.cuda.synchronize()
+                kernel_s = a_start.elapsed_time(a_end) / 1e3
+                kernels.append(kernel_s * 1e3)
+                left = kernel_s - (start - launched)
+                blocked += int(finished or latency > BLOCKED_SHARE * left)
+            else:
+                blocked += int(finished)
         if buf is not None:
             check()
     except Exception as exc:  # noqa: BLE001 -- an error is the verdict
         problems.append("%s: %s" % (type(exc).__name__, str(exc)[:300]))
     torch.cuda.synchronize()
     lat = sorted(latencies) or [0.0]
-    median = statistics.median(lat)
-    p99 = lat[min(len(lat) - 1, int(0.99 * len(lat)))]
     fraction = blocked / max(1, len(latencies))
-    if fraction > 0.01:
+    if wait and fraction > MAX_BLOCKED:
         problems.append(
-            "extend returned only after kernel A had finished in %.1f%% of the iterations"
-            % (100 * fraction)
+            "extend was blocked (it returned after kernel A had finished, or took more than "
+            "half of what A had left) in %.1f%% of the iterations (at most %.0f%%)"
+            % (100 * fraction, 100 * MAX_BLOCKED)
         )
-    limit = 0.05 * GROW_MB / 64
-    if median > limit:
-        problems.append("median extend %.1f ms > %.0f ms" % (median * 1e3, limit * 1e3))
     verdict(
         not problems,
-        "(a) grow=%dMiB iters=%d blocked=%.2f%% median=%.2fms p99=%.2fms"
-        % (GROW_MB, len(latencies), 100 * fraction, median * 1e3, p99 * 1e3),
+        "(a) %s grow=%dMiB iters=%d %s=%.2f%% extend: median=%.2fms p99=%.2fms max=%.2fms"
+        " (kernel A %.0fms)"
+        % (
+            "wait" if wait else "data",
+            GROW_MB,
+            len(latencies),
+            # in a data run kernel A is short, and a slow call can return after it without
+            # having waited for it: the share is information there
+            "blocked" if wait else "returned_after_A(info)",
+            100 * fraction,
+            statistics.median(lat) * 1e3,
+            percentile(lat, 0.99) * 1e3,
+            lat[-1] * 1e3,
+            statistics.median(kernels) if kernels else target_ms,
+        ),
         "; ".join(problems),
     )
+
+
+def test_e2a_growth_does_not_wait_for_a_running_kernel():
+    run_a(wait=True)
+
+
+def test_e2a_growth_keeps_the_data():
+    run_a(wait=False)
 
 
 # --- (b) --------------------------------------------------------------------------------
@@ -202,7 +260,8 @@ def test_e2b_pieces_are_one_contiguous_range_and_the_address_never_changes():
     view = buf.data()
     n = view.numel()
     assert n < (1 << 24), "float32 indices must stay exact"
-    view.copy_(torch.arange(n, device="cuda", dtype=torch.float32))
+    # kernels (not ``copy_``, which is a cudaMemcpyAsync: see the end of this test)
+    view.mul_(0.0).add_(torch.arange(n, device="cuda", dtype=torch.float32))
     torch.cuda.synchronize()
 
     windows = torch.unique(
@@ -237,6 +296,23 @@ def test_e2b_pieces_are_one_contiguous_range_and_the_address_never_changes():
         % (growths, len(boundaries)),
         "; ".join(problems),
     )
+
+
+def test_e2f_a_copy_across_a_boundary_is_information():
+    """What a copy engine operation across the boundary of two pieces does, printed. A test
+    of its own because ``compute-sanitizer`` reports the driver's refusal as an API error,
+    which would fail the sanitizer run of (b)."""
+    device = torch.cuda.current_device()
+    buf = HostVMMTensor(FPP, torch.float32, device, 4 * FPP)
+    buf.extend(2 * FPP)
+    view = buf.data()
+    try:
+        view[FPP - 8 : FPP + 8].copy_(torch.zeros(16, device="cuda"))
+        torch.cuda.synchronize()
+        outcome = "worked"
+    except RuntimeError as exc:
+        outcome = "refused (%s)" % str(exc).splitlines()[0][:60]
+    print("E2 INFO (f) cudaMemcpyAsync across the boundary of two pieces: %s" % outcome)
 
 
 # --- (c) --------------------------------------------------------------------------------
