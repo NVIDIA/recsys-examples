@@ -217,18 +217,21 @@ class PrefetchState:
     key_map_generation: int = 0
 
 
-def _slots_after_rehash(
-    state: DynamicEmbTableState,
-    unique_keys: torch.Tensor,
-    unique_table_ids: torch.Tensor,
-    slot_indices: torch.Tensor,
-) -> torch.Tensor:
-    """The slots of a batch's keys in ``state`` as it is now, for a batch
-    whose prefetch found them before a rehash moved them: the keys are looked
-    up again, read only (their ref counts kept them in the table). A key the
-    prefetch did not admit stays without a slot. Value rows do not move: a
-    storage keeps each key's row through a rehash, and a cache does not
-    rehash."""
+def refresh_slots_after_rehash(state: DynamicEmbTableState, batch) -> None:
+    """Bring a batch's slots up to date if a rehash moved its keys.
+
+    ``batch`` is anything that holds what a prefetch found: a ``PrefetchState``,
+    or the ``ctx`` of ``DynamicEmbeddingFunction`` that took it over (``unique_keys``,
+    ``unique_table_ids``, ``slot_indices``, ``key_map_generation``). If ``state`` has
+    rehashed since (a later batch's prefetch may have, before this one's backward or
+    its no-grad forward), the keys are looked up again, read only (their ref counts
+    kept them in the table), and ``batch.slot_indices`` and
+    ``batch.key_map_generation`` are replaced. A key the prefetch did not admit stays
+    without a slot. Value rows do not move: a storage keeps each key's row through a
+    rehash, and a cache does not rehash.
+    """
+    if batch.key_map_generation == state.key_map_generation:
+        return
     # Only a table that stores a row per key keeps its value rows through a
     # rehash (``use_rows_``). Without it the row is the slot and the value moves
     # with the key, so ``value_row_indices`` would go stale too: not handled here.
@@ -237,9 +240,14 @@ def _slots_after_rehash(
         "value row per key (DynamicEmbStorage); a cache does not rehash"
     )
     slots = _find_keys(
-        state, unique_keys, unique_table_ids, const_lookup=True, return_slots=True
+        state,
+        batch.unique_keys,
+        batch.unique_table_ids,
+        const_lookup=True,
+        return_slots=True,
     )[-1]
-    return torch.where(slot_indices >= 0, slots, slot_indices)
+    batch.slot_indices = torch.where(batch.slot_indices >= 0, slots, batch.slot_indices)
+    batch.key_map_generation = state.key_map_generation
 
 
 def _is_hbm_storage(storage: Storage) -> bool:
@@ -1416,11 +1424,7 @@ class DynamicEmbeddingFunction(torch.autograd.Function):
                     # A later batch's prefetch may have rehashed the table
                     # since this one's prefetch (prefetch pipelines, several
                     # forwards before their backwards).
-                    if ctx.key_map_generation != state.key_map_generation:
-                        ctx.slot_indices = _slots_after_rehash(
-                            state, ctx.unique_keys, unique_table_ids, ctx.slot_indices
-                        )
-                        ctx.key_map_generation = state.key_map_generation
+                    refresh_slots_after_rehash(state, ctx)
                     with torch.cuda.nvtx.range("op:optimizer_update_fused"):
                         optimizer.fused_update_for_flat_table(
                             unique_grads.to(ctx.emb_dtype),

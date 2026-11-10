@@ -19,6 +19,7 @@ from dynamicemb import (
     DynamicEmbInitializerArgs,
     DynamicEmbInitializerMode,
     DynamicEmbPoolingMode,
+    DynamicEmbScoreStrategy,
     DynamicEmbTableOptions,
     EmbOptimType,
 )
@@ -206,3 +207,73 @@ def test_no_grad_release_leaves_other_batch_pinned(pooling, layout, admit, grad_
     grad_output = outputs[1 if not grad_first else 0]
     grad_output.backward(torch.zeros_like(grad_output))
     assert torch.count_nonzero(counter).item() == 0
+
+
+@pytest.mark.parametrize("grad_first", [False, True])
+def test_no_grad_release_after_rehash_by_a_later_prefetch(grad_first):
+    """The second batch's prefetch expands the tables (a rehash), which moves the
+    first batch's keys to other slots. Whichever batch runs under no_grad gives
+    its pins back at the slots its keys hold now: no counter goes below 0, the
+    other batch keeps its pins, and every counter is 0 after its backward."""
+    assert torch.cuda.is_available()
+    names = ["t0", "t1"]
+    options = [
+        DynamicEmbTableOptions(
+            dim=DIM,
+            init_capacity=1024,
+            max_capacity=16384,
+            index_type=torch.int64,
+            embedding_dtype=torch.float32,
+            device_id=torch.cuda.current_device(),
+            score_strategy=DynamicEmbScoreStrategy.TIMESTAMP,
+            # The tables fit in HBM: the prefetch counts keys at their slots.
+            local_hbm_for_values=1024**3,
+            caching=False,
+        )
+        for _ in names
+    ]
+    model = BatchedDynamicEmbeddingTablesV2(
+        table_options=options,
+        table_names=names,
+        feature_table_map=[0, 1],
+        pooling_mode=DynamicEmbPoolingMode.SUM,
+        optimizer=EmbOptimType.SGD,
+        learning_rate=0.3,
+    )
+
+    # A rehash replaces the key map, and its ref counter with it: read both afresh.
+    def capacity(table_id):
+        return model.tables.key_index_map.capacity(table_id)
+
+    def counter():
+        return model.tables.key_index_map._ref_counter
+
+    def make_batch(keys):
+        # One key per sample, the same keys for both features.
+        indices = torch.tensor(keys * 2, dtype=torch.int64, device="cuda")
+        return indices, torch.arange(len(indices) + 1, dtype=torch.int64, device="cuda")
+
+    # A table of 1024 slots holds 512 keys. The first batch's 256 keys fit; with the
+    # second's, each table holds 640, so the second prefetch expands both tables.
+    first_keys, second_keys = list(range(256)), list(range(128, 640))
+    batches = [make_batch(first_keys), make_batch(second_keys)]
+    counts = [len(names) * len(first_keys), len(names) * len(second_keys)]
+
+    model.prefetch(*batches[0])
+    capacities = [capacity(t) for t in range(len(names))]
+    model.prefetch(*batches[1])
+    assert all(
+        capacity(t) > capacities[t] for t in range(len(names))
+    ), "the second prefetch did not expand every table"
+    assert pins(counter()) == sum(counts)
+
+    outputs = []
+    for no_grad in [not grad_first, grad_first]:
+        with torch.set_grad_enabled(not no_grad):
+            outputs.append(model(*batches[len(outputs)]))
+        assert (counter() >= 0).all(), "a ref counter went below 0"
+    # Only the no-grad batch gave its pins back.
+    assert pins(counter()) == counts[0 if grad_first else 1]
+    grad_output = outputs[0 if grad_first else 1]
+    grad_output.sum().backward()
+    assert (counter() == 0).all(), "a ref counter is not 0 after the backward"
