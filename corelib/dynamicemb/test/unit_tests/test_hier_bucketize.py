@@ -370,11 +370,11 @@ def reference(
         1,
     )
     inv = torch.empty(valid, dtype=torch.int64)
-    inv[perm.cpu().long()[:valid]] = torch.arange(valid)
+    inv[perm[:valid].cpu().long()] = torch.arange(valid)
     return {
-        "keys": new_values.cpu().long()[:valid],
+        "keys": new_values[:valid].cpu().long(),
         "inv": inv,
-        "weights": new_weights.cpu()[:valid]
+        "weights": new_weights[:valid].cpu()
         if new_weights is not None
         else torch.empty(0),
         "offset_per_bucket": offset_per_bucket,
@@ -646,9 +646,9 @@ def run_case(
     checks = {
         "keys": out["keys"].dtype == torch.int64
         and out["keys"].numel() == num_keys
-        and torch.equal(out["keys"].cpu()[:valid], ref["keys"]),
+        and torch.equal(out["keys"][:valid].cpu(), ref["keys"]),
         "inv": out["inv"].dtype == torch.int32
-        and torch.equal(out["inv"].cpu().long()[:valid], ref["inv"])
+        and torch.equal(out["inv"][:valid].cpu().long(), ref["inv"])
         and torch.equal(out["inv"].cpu().long()[valid:], torch.arange(valid, num_keys)),
         # every row, the keys past the valid ones too, is the KJT's key at inv,
         # widened to int64 with its sign
@@ -656,7 +656,7 @@ def run_case(
         "weights": ("weights" in out) == (batch.weights is not None)
         and (
             batch.weights is None
-            or torch.equal(out["weights"].cpu()[:valid], ref["weights"])
+            or torch.equal(out["weights"][:valid].cpu(), ref["weights"])
         ),
         "offset_per_bucket": torch.equal(
             out["offset_per_bucket"].cpu(), ref["offset_per_bucket"]
@@ -1014,9 +1014,9 @@ def fanout_by_row(
         torch.sort(heavy_slots).values, torch.arange(slots)
     ):
         return None, False
-    first = out["first"].cpu().long()[:slots]
+    first = out["first"][:slots].cpu().long()
     ends = torch.cat([first[1:], torch.tensor([subs])])
-    sub = out["sub"].cpu().long()[: 2 * subs].view(-1, 2)
+    sub = out["sub"][: 2 * subs].cpu().long().view(-1, 2)
     row_of_slot = torch.empty(slots, dtype=torch.int64)
     row_of_slot[heavy_slots] = heavy_rows
     sound = (

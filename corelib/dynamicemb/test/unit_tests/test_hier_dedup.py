@@ -126,9 +126,15 @@ in its push order past its rows at the proxies; no kernel or check may read
 it)::
 
     export PYTORCH_NO_CUDA_MEMORY_CACHING=1
-    compute-sanitizer --tool initcheck python test/unit_tests/test_hier_dedup.py
+    compute-sanitizer --tool initcheck python test/unit_tests/test_hier_dedup.py sanitize
 
 and so with ``--tool memcheck``, ``--tool racecheck`` and ``--tool synccheck``.
+Under initcheck the whole file takes hours (about 2 minutes a case):
+``sanitize`` runs the cases of ``SANITIZE_CASES`` on their first seed, the
+plain and weighted ones, a wrapping ring, node dedup off, an overflow, and
+those of the proxy's live counts (20 times the need, at the need, a count
+of 0, the scans on 2 and 600 CTAs, several rows per payload), its int64 push
+keys and a requester with nothing to send.
 """
 
 import os
@@ -2460,11 +2466,33 @@ def run_case(case: Case, seed: int) -> Tuple[Dict[str, List[str]], str]:
     return checks, stats
 
 
+# python test_hier_dedup.py sanitize: these cases, on their first seed, for
+# compute-sanitizer (the module's docstring)
+SANITIZE_CASES = {
+    "uniform",
+    "weights, 3 nodes of 2, 6 rows per payload, above a key's rows",
+    "2 nodes, a wrapping ring",
+    "node dedup off",
+    "remote_keys overflow",
+    "remote_keys 20 x the need",
+    "remote_keys at the need",
+    "no keys across nodes from node 0",
+    "the proxy's scan on 2 CTAs",
+    "the proxy's scan on 600 CTAs, 20 x the need",
+    "the proxy's scans on 2 CTAs, 2 nodes of 2, 4 rows per payload",
+    "the push order by int64 push keys",
+    "requester 1 asks nothing across nodes, 20 x the need",
+}
+
+
 def main() -> None:
     torch.cuda.set_device(0)
+    sanitize = sys.argv[1:] == ["sanitize"]
     failures = 0
     for case_idx, case in enumerate(CASES):
-        for seed in range(case.seeds):
+        if sanitize and case.name not in SANITIZE_CASES:
+            continue
+        for seed in range(1 if sanitize else case.seeds):
             checks, stats = run_case(case, 1000 + 17 * case_idx + seed)
             good = not any(checks.values())
             failures += not good
