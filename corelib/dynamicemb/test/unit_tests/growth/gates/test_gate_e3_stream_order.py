@@ -42,7 +42,8 @@ the run is expected to FAIL; it prints ``E3 CONTROL <config> sensitive`` when it
 control of ``hbm_no_eviction`` must fail, or the gate cannot tell a missing edge from a
 present one and the verdict of the real run says nothing (that test fails). The others
 print their result only, because a table without reference counters has fewer ways to show
-a lost edge. A failed control can leave the CUDA context unusable: run one configuration
+a lost edge. A failed control can leave the CUDA context unusable (the run then ends with
+its verdict printed, without tearing the context down): run one configuration
 per process (``-k``).
 
 Run it (one H100; ``GATE_E3_STEPS`` is the total, ``GATE_E3_EPOCH_STEPS`` at most 64)::
@@ -251,6 +252,15 @@ class Report:
     peak_allocated_mib: float = 0.0
     peak_reserved_mib: float = 0.0
     values_mib: float = 0.0
+    # A CUDA error (an illegal access, a device assert) leaves the context unusable: its
+    # tensors cannot be freed (the destructor raises and the process aborts), so nothing is
+    # torn down and the process ends with the verdict.
+    faulted: bool = False
+
+
+def is_cuda_fault(exc: BaseException) -> bool:
+    text = str(exc)
+    return "CUDA error" in text or "illegal" in text or "device-side assert" in text
 
 
 def run_epoch(config: str, steps: int, rng, forward, prefetch, report: Report) -> None:
@@ -351,13 +361,16 @@ def run_epoch(config: str, steps: int, rng, forward, prefetch, report: Report) -
     except Exception as exc:  # noqa: BLE001
         # an error (an IMA, a device assert) is the verdict
         problems.append("%s: %s" % (type(exc).__name__, str(exc)[:300]))
+        report.faulted |= is_cuda_fault(exc)
     finally:
         try:
             torch.cuda.synchronize()
         except Exception as exc:  # noqa: BLE001
             problems.append("synchronize: %s" % str(exc)[:300])
-        del outputs, model
-        gc.collect()
+            report.faulted |= is_cuda_fault(exc)
+        if not report.faulted:
+            del outputs, model
+            gc.collect()
 
 
 def run_config(config: str, steps: int) -> Report:
@@ -367,9 +380,15 @@ def run_config(config: str, steps: int) -> Report:
     rng = random.Random(SEED)
     forward, prefetch = torch.cuda.Stream(), torch.cuda.Stream()
     report = Report()
+    # Epochs of (nearly) one size, none longer than EPOCH_STEPS: a short last one (5000 steps
+    # in epochs of 48 leave one of 8) is too short for the host tier of the hybrid layout to
+    # fill and grow, and an epoch that does not grow is a problem of the run.
+    epochs = -(-steps // EPOCH_STEPS)
     done = 0
-    while done < steps and not report.problems:
-        n = min(EPOCH_STEPS, steps - done)
+    for index in range(epochs):
+        if report.problems:
+            break
+        n = steps // epochs + (1 if index < steps % epochs else 0)
         run_epoch(config, n, rng, forward, prefetch, report)
         done += n
         report.epochs += 1
@@ -408,11 +427,22 @@ def test_e3_growth_under_the_pipeline_order(config):
                 pytest.fail(
                     "the negative control did not fail: the gate cannot see a missing edge"
                 )
+        end_if_faulted(report, 0)
         return
     if report.problems:
         print("E3 FAIL %s: %s (%s)" % (config, "; ".join(report.problems), line))
+        end_if_faulted(report, 1)
         pytest.fail("; ".join(report.problems))
     print("E3 PASS %s" % line)
+
+
+def end_if_faulted(report: Report, code: int) -> None:
+    """A faulted context cannot be torn down (see ``Report.faulted``): the verdict is
+    printed, and the process ends here, with ``code``."""
+    if report.faulted:
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os._exit(code)
 
 
 if __name__ == "__main__":
