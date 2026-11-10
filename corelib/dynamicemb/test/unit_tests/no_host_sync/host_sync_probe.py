@@ -82,10 +82,17 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 # This is the list of "inherent syncs that remain" of the sync-removal design
 # (section 5), cut down to what the measured step of a probe configuration can
 # contain:
-#   I1  an external parameter server (cache_ps*): the Storage interface takes
-#       request-sized host tensors, so DynamicEmb reads the dedup count and the
-#       miss counts in front of every PS call (every step, hits included), and
-#       the PS stand-in's own host code adds more.
+#   I1  an external parameter server written against the host-sized Storage
+#       contract (cache_ps*): its find / insert take tensors of exactly the number
+#       of live rows, so DynamicEmb reads that number once per PS call (an all-hit
+#       step reads the miss count once and calls nothing), and the PS stand-in's own
+#       host code adds more. Only those two are excused, by call site: the reads of
+#       DynamicEmb are sync_free.read_now's wait (types._live_rows,
+#       batched_dynamicemb_function._read_miss_counts), the stand-in's are in its
+#       own file, and any other sync of these cases is a violation like anywhere
+#       else. A PS of the padded contract costs DynamicEmb nothing: cache_dps*,
+#       host_dps run the in-tree storage as the device-resident PS and are measured
+#       at zero.
 #   (I4, table growth, is gone: a growth is queued on the stream that decided to grow,
 #       ordered against the streams that use the table by GrowthOrder, and reads
 #       nothing back -- the decision is made from an estimate, the rehash is padded and
@@ -110,13 +117,24 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 # is declared inherent.
 # --------------------------------------------------------------------------
 PS_STANDIN = "*test_batched_dynamic_embedding_tables_v2.py"
-_PS_WHY = (
-    "external parameter server: its Storage interface takes request-sized host "
-    "tensors (DynamicEmb reads the dedup and miss counts before each PS call) and "
-    "the stand-in itself reads CUDA tensors on the host (PyDictStorage.find/insert)"
+# The innermost frame of the wait of ``sync_free.read_now``, the one audited read of the
+# package (see test_audited_reads.py): every read DynamicEmb makes for a participant that
+# is host-sized by its contract is a call site in this file.
+READ_NOW_SITE = "*sync_free.py"
+_PS_READ_WHY = (
+    "external parameter server of the host-sized contract: its find / insert take "
+    "tensors of exactly the number of live rows, so DynamicEmb reads that number once "
+    "per PS call (types._live_rows) and the number of misses once per step "
+    "(batched_dynamicemb_function._read_miss_counts), both through sync_free.read_now"
+)
+_PS_STANDIN_WHY = (
+    "the stand-in of that parameter server reads CUDA tensors on the host "
+    "(PyDictStorage.find/insert): its own code, not DynamicEmb's"
 )
 INHERENT: Dict[Tuple[str, ...], str] = {
-    ("cache_ps*", "*"): _PS_WHY,
+    # call-site level: the rest of these cases has to read nothing
+    ("cache_ps*", "*", READ_NOW_SITE): _PS_READ_WHY,
+    ("cache_ps*", "*", PS_STANDIN): _PS_STANDIN_WHY,
 }
 
 KINDS = ("ss", "ds", "es", "ms", "pd", "al")
@@ -213,7 +231,7 @@ WARN_TEXT = "called a synchronizing CUDA operation"
 @dataclasses.dataclass(frozen=True)
 class Cfg:
     name: str
-    layout: str  # cache | cache_ps | hbm | hybrid | host
+    layout: str  # cache | cache_ps | hbm | hybrid | host | host_ps
     pooling: str = "none"  # none | sum
     optimizer: str = "sgd"  # sgd | adam
     admit: bool = False  # FrequencyAdmissionStrategy(threshold=2)
@@ -226,6 +244,13 @@ class Cfg:
         False  # score_strategy=NO_EVICTION (tables expand instead of evicting)
     )
     dim: int = 0  # embedding dim of every table; 0 is the module-level DIM
+    # The miss path runs in chunks of this many rows (sync_free.CHUNK_ROWS, around the
+    # build and the measured window): the batch has 576 key slots, so 64 is 9 chunks a step.
+    chunk_rows: int = 0
+    # The external storage: "dict" is PyDictStorage (the host-sized contract, the default
+    # of the cache_ps layout), "device" the in-tree DynamicEmbStorage as a device-resident
+    # PS (the padded contract: DynamicEmb and the PS itself read nothing).
+    ps: str = ""
     doc: str = ""
 
 
@@ -352,6 +377,44 @@ def _build_configs() -> "collections.OrderedDict[str, Cfg]":
         admit=True,
         determ=True,
     )
+    # A device-resident external storage of the padded contract (the in-tree storage
+    # standing in for a GPU PS): the same layouts as the PyDictStorage ones, and the PS
+    # as the only tier. Its step reads nothing, DynamicEmb's side or the PS's.
+    add(
+        "cache_dps",
+        "cache_ps",
+        "HBM cache + storage + a device-resident padded-contract PS",
+        ps="device",
+    )
+    add(
+        "cache_dps_sum",
+        "cache_ps",
+        "HBM cache + storage + a device-resident padded-contract PS, SUM pooling",
+        ps="device",
+        pooling="sum",
+    )
+    add(
+        "host_dps",
+        "host_ps",
+        "a device-resident padded-contract PS as the only tier",
+        ps="device",
+    )
+    # The miss path in row chunks: the number of launches grows with the number of chunks,
+    # the number of syncs does not, so the twins of the in-tree configs read the same zero.
+    for twin, layout, extra in (
+        ("cache_storage", "cache", {}),
+        ("hbm_only", "hbm", {}),
+        ("hybrid", "hybrid", {}),
+        ("cache_storage_admit", "cache", {"admit": True}),
+        ("cache_dps", "cache_ps", {"ps": "device"}),
+    ):
+        add(
+            twin + "_chunked",
+            layout,
+            out[twin].doc + ", the miss path in 64-row chunks",
+            chunk_rows=64,
+            **extra,
+        )
     return out
 
 
@@ -403,6 +466,9 @@ def scenarios_of(cfg: Cfg) -> List[str]:
     if cfg.layout == "cache_ps":
         # the module refuses eval() with an external storage (see forward())
         out = [x for x in out if x not in EVAL_SCENARIOS]
+    if cfg.layout == "host_ps":
+        # the PS is the only tier and has no capacity to evict from; eval reads it
+        out = ["all_hit", "miss", "eval", "eval_miss"]
     return out
 
 
@@ -428,7 +494,7 @@ def plan_of(cfg: Cfg, scenario: str) -> Dict[str, Any]:
         p["max_capacity"], p["hbm_rows"] = (16384, 2048) if evict else (65536, 8192)
     elif cfg.layout == "cache_ps":
         p["max_capacity"], p["hbm_rows"] = (4096, 1024) if evict else (65536, 8192)
-    elif cfg.layout in ("hbm", "host"):
+    elif cfg.layout in ("hbm", "host", "host_ps"):
         p["max_capacity"] = 4096 if evict else 65536
     elif cfg.layout == "hybrid":
         p["max_capacity"], p["hbm_rows"] = (16384, 2048) if evict else (65536, 8192)
@@ -1120,7 +1186,13 @@ class BatchMaker:
         return out
 
 
-def _load_ps_class():
+def _load_ps_class(kind: str = "dict"):
+    """The external storage class of a config: ``dict`` is the PyDictStorage demo, ``device``
+    the in-tree storage standing in for a device-resident PS."""
+    if kind == "device":
+        from dynamicemb.key_value_table import DynamicEmbStorage
+
+        return DynamicEmbStorage
     # The PS stand-in lives in <dynamicemb root>/test; this file is three levels
     # below that directory, and the runner only puts the test file's own
     # directory on sys.path.
@@ -1161,7 +1233,8 @@ def build_module(cfg: Cfg, plan: Dict[str, Any], device_index: int):
         local_hbm = 1024**3
     else:
         local_hbm = 0
-    ps = _load_ps_class() if cfg.layout == "cache_ps" else None
+    ps_kind = cfg.ps or ("dict" if cfg.layout == "cache_ps" else "")
+    ps = _load_ps_class(ps_kind) if ps_kind else None
     admit = None
     if cfg.admit:
         from dynamicemb.embedding_admission import FrequencyAdmissionStrategy, KVCounter
@@ -1239,6 +1312,8 @@ def tier_sizes(mod) -> Dict[str, Dict[str, List[int]]]:
         ps = getattr(mod, "_external_storage", None)
         if ps is not None and hasattr(ps, "dict"):
             out["ps"] = {"size": [len(ps.dict)], "cap": [0]}
+        elif ps is not None and hasattr(ps, "key_index_map"):
+            out["ps"] = of_km(ps.key_index_map, 2)
     except Exception as e:  # diagnostics must never break a run
         out["error"] = {"size": [], "cap": [], "msg": repr(e)}  # type: ignore
     return out
@@ -1387,7 +1462,12 @@ def run_case(
     old_det = os.environ.get("DEMB_DETERMINISM_MODE")
     if cfg.determ:
         os.environ["DEMB_DETERMINISM_MODE"] = "ON"
+    from dynamicemb import sync_free as sf
+
+    old_chunk_rows = sf.CHUNK_ROWS
     try:
+        if cfg.chunk_rows:
+            sf.CHUNK_ROWS = cfg.chunk_rows
         torch.manual_seed(seed)
         plan = plan_of(cfg, scenario)
         res["plan"] = plan
@@ -1487,6 +1567,7 @@ def run_case(
         if probe is not None and probe.stderr_other:
             res["stderr_tail"] = probe.stderr_other[-1500:]
     finally:
+        sf.CHUNK_ROWS = old_chunk_rows
         if cfg.determ:
             if old_det is None:
                 os.environ.pop("DEMB_DETERMINISM_MODE", None)
@@ -1502,7 +1583,7 @@ def run_case(
     res["seconds"] = round(time.time() - t0, 2)
     res["inherent"] = inherent_reason(cfg.name, scenario)
     sg = inherent_site_globs(cfg.name, scenario)
-    res["inherent_sites"] = sg[0][1] if sg else None
+    res["inherent_sites"] = "; ".join(why for _, why in sg) if sg else None
     return res
 
 
@@ -1804,6 +1885,18 @@ def inherent_site_globs(config: str, scenario: str) -> List[Tuple[str, str]]:
         ):
             out.append((key[2], why))
     return out
+
+
+def allocations_excused(config: str, scenario: str) -> bool:
+    """Whether the cudaMalloc / cudaFree events of the case are not bounded (see
+    test_sync_ratchet.py): the case is excused as a whole (a growth event allocates by
+    design), or part of it is the code of a stand-in. A stand-in that keeps device tensors
+    in a Python dict grows the allocator in steady state, and an allocation has no call
+    site to excuse it by, so such a case is excused here as it was when it was one whole.
+    """
+    return bool(
+        inherent_reason(config, scenario) or inherent_site_globs(config, scenario)
+    )
 
 
 def _git_info(root: str) -> str:

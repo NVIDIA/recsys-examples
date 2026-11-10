@@ -390,7 +390,7 @@ slot: rows come from a per-table auto-increment counter (`key_value_table.py`
 `_get_no_eviction_insert_scores`), and its key map is sized
 `ceil(init_capacity / 0.5)` -- **twice** the value buffer
 (`key_value_table.py:357-367` vs `:403-411`). `_prefetch_hbm_direct_path`
-translated slot to row on the **insert** branch only:
+(now `_prefetch_hbm_direct_path_masked`) translated slot to row on the **insert** branch only:
 
 ```python
 new_indices = (score_arg.value.to(torch.int64)          # the row

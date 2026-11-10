@@ -33,6 +33,11 @@ with it (the module flags below) and an equivalent PyTorch fallback otherwise;
 the results are the same. The flags are read at call time through this module,
 so tests set them to run the fallbacks.
 
+The miss path allocates ``[rows, value_dim]`` buffers. Where they would not fit
+``BUFFER_BYTES`` (``DYNAMICEMB_MISS_PATH_BUFFER_BYTES``) the path runs in consecutive row
+chunks (``row_chunks``) instead of taking another code path: the number of launches
+grows with the number of chunks, the number of reads does not.
+
 What the host genuinely has to know is read late: ``DeferredRead`` is a ring of
 pinned landing slots with events and never blocks. A read that cannot wait goes
 through one audited place, ``read_now`` (``DeferredRead.wait`` and
@@ -44,7 +49,8 @@ the calling thread is inside one of them.
 import contextlib
 import os
 import threading
-from typing import Callable, Dict, List, Optional, Sequence, Tuple, Union
+import warnings
+from typing import Callable, List, Optional, Tuple, Union
 
 import dynamicemb_extensions
 import torch
@@ -76,19 +82,29 @@ PADDED_OPT_SKIPS_NEGATIVE: bool = _extension_flag(
 # launches cannot be made without a read): the mode raises and says to rebuild.
 SORTED_INSERT: bool = _extension_flag("sorted_insert")
 
-# How a step decides whether its miss path has to run:
-#   "read":   one blocking read of the miss count;
-#   "poll":   skip it only when a non-blocking copy already landed a zero;
-#   "always": launch it every step and read nothing.
+# How a step decides whether its miss path has to run. Neither mode waits for the GPU:
+#   "always": launch it every step and read nothing;
+#   "poll":   skip it only when a non-blocking copy already landed a zero.
 # "always" is the default: a step whose keys all hit runs the miss path on inert rows,
 # which changes nothing, and the CPU never waits for the GPU. DYNAMICEMB_MISS_PATH_GATE
-# selects another mode.
-_MISS_GATE_MODES = ("always", "poll", "read")
+# selects the other. Nothing else does: neither the storage, an external one included, nor
+# the determinism mode. What a class that counts its own rows reads is its contract
+# (types.OldContractStorage), not the gate's.
+_MISS_GATE_MODES = ("always", "poll")
 _DEFAULT_MISS_GATE = "always"
 
 
 def _miss_gate_from_env() -> str:
     mode = (os.environ.get("DYNAMICEMB_MISS_PATH_GATE") or _DEFAULT_MISS_GATE).lower()
+    if mode == "read":
+        # A mode of the first masked paths, which blocked on the count of misses. A
+        # script that still asks for it keeps running, without the wait.
+        warnings.warn(
+            "DYNAMICEMB_MISS_PATH_GATE=read was removed: no miss-gate mode waits for the "
+            f"GPU any more ({', '.join(_MISS_GATE_MODES)}); using {_DEFAULT_MISS_GATE!r}.",
+            stacklevel=2,
+        )
+        return _DEFAULT_MISS_GATE
     if mode not in _MISS_GATE_MODES:
         raise ValueError(
             "DYNAMICEMB_MISS_PATH_GATE must be one of "
@@ -98,6 +114,56 @@ def _miss_gate_from_env() -> str:
 
 
 MISS_GATE: str = _miss_gate_from_env()
+
+# The bytes of ``[rows, value_dim]`` buffers one chunk of the miss path may allocate
+# (``row_chunks``): 4 GiB, which is what the memory guard of the first masked paths
+# allowed for two buffers of a whole batch.
+_DEFAULT_BUFFER_BYTES = 4 << 30
+
+
+def _buffer_bytes_from_env() -> int:
+    text = os.environ.get("DYNAMICEMB_MISS_PATH_BUFFER_BYTES")
+    if not text:
+        return _DEFAULT_BUFFER_BYTES
+    try:
+        value = int(text)
+    except ValueError:
+        value = 0
+    if value <= 0:
+        raise ValueError(
+            "DYNAMICEMB_MISS_PATH_BUFFER_BYTES must be a positive number of bytes, "
+            f"got {text!r}."
+        )
+    return value
+
+
+BUFFER_BYTES: int = _buffer_bytes_from_env()
+# Rows per chunk whatever the budget says: a test hook (a module attribute, read at call
+# time, never an environment variable). 0 and None leave the budget in charge.
+CHUNK_ROWS: Optional[int] = None
+_WARNED_SMALL_CHUNK = False
+# Buffers that are not split into chunks and were named once as over the budget.
+_WARNED_UNCHUNKED: set = set()
+
+# Variables of the first masked paths that nothing reads any more. A script that still sets
+# one gets a warning and nothing else: no variable selects a path that reads.
+_RETIRED_VARIABLES = {
+    "DYNAMICEMB_SYNC_FREE": "a kill switch that sent every lookup down the paths that read "
+    "counts from the device is gone, no variable selects such a path",
+    "DYNAMICEMB_SYNC_FREE_MAX_BYTES": "the budget is DYNAMICEMB_MISS_PATH_BUFFER_BYTES now, "
+    "and a batch over it is split into chunks, not sent down another path",
+}
+
+
+def _warn_retired_variables() -> None:
+    for name, what in _RETIRED_VARIABLES.items():
+        if os.environ.get(name) is not None:
+            warnings.warn(
+                f"{name} is not read any more: {what}.", UserWarning, stacklevel=3
+            )
+
+
+_warn_retired_variables()
 
 # Number of read_now calls so far; tests snapshot it to assert how many blocking
 # reads a step costs.
@@ -220,6 +286,8 @@ def initialize_masked(
     keys: torch.Tensor,
     table_ids: torch.Tensor,
     mask: torch.Tensor,
+    *,
+    dense: bool = False,
 ) -> None:
     """Run ``initializer`` on the rows of ``out`` where ``mask`` is True, in place.
 
@@ -227,21 +295,43 @@ def initialize_masked(
     ``stride(1) == 1`` (a column slice of the value block is fine); ``keys``,
     ``table_ids`` and ``mask`` are ``N`` long, one entry per row of ``out``. A
     masked-out row may carry ``EMPTY_KEY`` and table id ``-1``.
+
+    ``dense`` is for an initializer written for index lists that name only the rows to
+    write (a user's ``non_admitted_initializer`` that did not declare
+    ``skips_negative_index``): the number of rows in ``mask`` is read once, by that
+    initializer's contract, and it is called with exactly those indices (not at all when
+    there are none).
     """
     n = out.size(0)
     if n == 0:
         return
     rows = torch.arange(n, dtype=torch.int64, device=out.device)
+    if dense:
+        count = int(read_now(mask.sum())[0])
+        if count:
+            (picked,) = compact_by_count(mask, count, rows)
+            initializer(out, keys, table_ids, picked)
+        return
     if INIT_SKIPS_NEGATIVE:
         # A row whose index is -1 is skipped before anything else is read.
         initializer(out, keys, table_ids, torch.where(mask, rows, -1))
         return
-    # Initialize every row of a scratch block, then copy back the masked ones. The
-    # clamp keeps a table id of -1 inside the table-parameter tensor; such a row is
-    # discarded anyway.
-    scratch = torch.empty_like(out, memory_format=torch.contiguous_format)
-    initializer(scratch, keys, table_ids.clamp(min=0), rows)
-    out.copy_(torch.where(mask.unsqueeze(1), scratch, out))
+    # Initialize every row of a scratch block, then copy back the masked ones, in row
+    # chunks so that the scratch stays within the budget. The clamp keeps a table id of
+    # -1 inside the table-parameter tensor; such a row is discarded anyway.
+    for start, stop in row_chunks(n, out.size(1) * out.element_size(), buffers=1):
+        scratch = torch.empty(
+            stop - start, out.size(1), dtype=out.dtype, device=out.device
+        )
+        initializer(
+            scratch,
+            keys[start:stop],
+            table_ids[start:stop].clamp(min=0),
+            rows[: stop - start],
+        )
+        out[start:stop].copy_(
+            torch.where(mask[start:stop].unsqueeze(1), scratch, out[start:stop])
+        )
 
 
 def padded_optimizer_table_ids(table_ids: torch.Tensor) -> torch.Tensor:
@@ -270,10 +360,66 @@ def compact_by_count(
     read (``read_now``) from the same mask. A stable sort brings the selected
     rows to the front, so there is no ``nonzero`` and no boolean-mask index. A
     ``None`` array stays ``None``.
+
+    Not dead code: the adapters of a participant that is host-sized by its contract
+    compact with it (``types._live_rows``, ``initialize_masked(dense=True)``, and through
+    ``_live_rows`` ``OldContractStorage`` and ``embedding_admission.admit_padded``).
     """
     selected_first = torch.sort(mask.to(torch.int8), descending=True, stable=True)
     order = selected_first.indices[:count]
     return [None if a is None else _take_rows(a, order) for a in arrays]
+
+
+def row_chunks(n: int, row_bytes: int, buffers: int = 2) -> List[Tuple[int, int]]:
+    """Consecutive ``(start, stop)`` covering ``[0, n)``, each short enough that
+    ``buffers`` buffers of ``row_bytes`` per row fit ``BUFFER_BYTES`` (at least one row).
+
+    ``[(0, n)]`` when everything fits, which is every batch the 4 GiB memory guard let
+    through (``2 * n * row_bytes <= BUFFER_BYTES``), and for ``n == 0``. Pure host
+    arithmetic: the length of a chunk never depends on the data.
+    """
+    rows = max(1, int(CHUNK_ROWS or BUFFER_BYTES // max(1, buffers * row_bytes)))
+    if n <= rows:
+        return [(0, n)]
+    global _WARNED_SMALL_CHUNK
+    if not CHUNK_ROWS and rows < 16 and not _WARNED_SMALL_CHUNK:
+        # A budget this small is a misconfiguration: say so once.
+        _WARNED_SMALL_CHUNK = True
+        warnings.warn(
+            f"DYNAMICEMB_MISS_PATH_BUFFER_BYTES={BUFFER_BYTES} allows {rows} row(s) "
+            f"per chunk for {n} keys: the miss path will launch about "
+            f"{-(-n // rows)} chunks per step.",
+            UserWarning,
+        )
+    return [(start, min(start + rows, n)) for start in range(0, n, rows)]
+
+
+def warn_if_unchunked_over_budget(
+    n: int, row_bytes: int, what: str, buffers: int = 2
+) -> None:
+    """Say, once per ``what`` and process, that a buffer that is not split into chunks is
+    over the budget: ``n`` rows of ``row_bytes`` (``buffers`` of them, as ``row_chunks``
+    counts).
+
+    Evaluation allocates the unique rows of a pooled lookup, and a DEFAULT-mode forward
+    its value block, with one row per key of the batch, duplicates included: they cannot
+    run in chunks (the gather that follows would have to accumulate across them), so
+    ``DYNAMICEMB_MISS_PATH_BUFFER_BYTES`` does not bound them, and a batch that fits no
+    longer sends them down a path of their own. The caller says so before it allocates,
+    so that an allocation that fails has its cause named. Pure host arithmetic: nothing
+    is read, and nothing changes but the warning.
+    """
+    if buffers * n * row_bytes <= BUFFER_BYTES or what in _WARNED_UNCHUNKED:
+        return
+    _WARNED_UNCHUNKED.add(what)
+    warnings.warn(
+        f"{what} holds {n} rows of {row_bytes} bytes at once ({buffers} such buffers are "
+        f"over DYNAMICEMB_MISS_PATH_BUFFER_BYTES={BUFFER_BYTES}). It has one row per key of "
+        "the batch, duplicates included, and is not split into chunks, so that budget does "
+        "not bound it: if the allocation fails, send fewer keys per step.",
+        UserWarning,
+        stacklevel=2,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -442,14 +588,15 @@ def _read_scratch(
 def read_now(*dev_tensors: torch.Tensor) -> List[torch.Tensor]:
     """THE blocking read: the host needs these values now.
 
-    Only inherent syncs come here: an external parameter server or user class
-    that wants host sizes, a public API that returns host data, exact growth,
-    the "read" miss gate. The tensors are flattened, cast to
-    int64 and concatenated on the current stream, copied to host in one pinned
-    transfer, and waited for with one event. Returns CPU int64 tensors shaped like
-    the inputs; a CPU input is returned as it is. The pinned buffer is reused
-    (one per thread and device, grown to the largest request), so a steady state
-    allocates nothing; the results do not alias it.
+    Only inherent syncs come here: a class written against exact-length tensors
+    that wants host sizes (an external storage, a user admitter, counter or
+    initializer that did not declare the padded contract: ``types._live_rows``,
+    ``initialize_masked(dense=True)``), a public API that returns host data. The
+    tensors are flattened, cast to int64 and concatenated on the current stream,
+    copied to host in one pinned transfer, and waited for with one event. Returns
+    CPU int64 tensors shaped like the inputs; a CPU input is returned as it is. The
+    pinned buffer is reused (one per thread and device, grown to the largest
+    request), so a steady state allocates nothing; the results do not alias it.
 
     ``READ_NOW_CALLS`` counts the calls.
     """
@@ -688,17 +835,14 @@ def upload_i64(
 # ---------------------------------------------------------------------------
 
 
-def miss_gate_mode(rng: bool, ps: bool = False) -> str:
-    """How this step decides whether to launch its miss path: always, poll or read.
+def miss_gate_mode(rng: bool) -> str:
+    """How this step decides whether to launch its miss path: always or poll.
 
-    "read" when ``ps`` is set (a caller that needs the count anyway; none passes it
-    today). Otherwise ``MISS_GATE``, except that "poll" becomes "always" when the
-    miss path draws random numbers (``rng``): a seeded probabilistic admitter must
-    not consume a timing-dependent number of draws, while "read" is exact and so
-    reproducible.
+    ``MISS_GATE``, except that "poll" becomes "always" when the miss path draws random
+    numbers (``rng``): a seeded probabilistic admitter must not consume a
+    timing-dependent number of draws. Nothing else decides it, not the storage and not
+    the determinism mode.
     """
-    if ps:
-        return "read"
     if rng and MISS_GATE == "poll":
         return "always"
     return MISS_GATE
@@ -709,7 +853,7 @@ _Pending = Optional[Tuple[_Ticket, torch.Tensor]]
 
 
 class MissGate:
-    """Decides whether a step's miss path has to be launched.
+    """Decides whether a step's miss path has to be launched, without waiting for the GPU.
 
     One per table state; it owns its ring. The decision never changes a result:
     a miss path that finds no miss is a no-op, so a skipped launch only saves work.
@@ -718,42 +862,46 @@ class MissGate:
     def __init__(self) -> None:
         self.ring = DeferredRead((1,), torch.int64, slots=4)
 
-    def begin(
-        self, is_miss: torch.Tensor, *, rng: bool = False, ps: bool = False
-    ) -> _Pending:
+    def begin(self, is_miss: torch.Tensor, *, rng: bool = False) -> _Pending:
         """Start counting the misses of ``is_miss`` (bool[N]) for ``needed``.
 
-        Returns what ``needed`` takes: None for "always" (no device work),
-        otherwise ``(ticket, count)``, the ticket being None for "read". Call it
-        as early as possible, right after the mask exists, so a polled count has
-        time to land.
+        Returns what ``needed`` takes: None for "always" (no device work) or when
+        the ring has no free slot (nothing to poll, so the miss path simply runs),
+        otherwise ``(ticket, count)``. Call it as early as possible, right after the
+        mask exists, so a polled count has time to land.
         """
-        mode = miss_gate_mode(rng, ps)
-        if mode == "always":
+        if miss_gate_mode(rng) == "always":
             return None
         count = is_miss.sum().reshape(1)
-        if mode == "poll":
-            ticket = self.ring.enqueue(count)
-            # No free slot: nothing to poll, so the miss path simply runs.
-            return None if ticket is None else (ticket, count)
-        return (None, count)
+        ticket = self.ring.enqueue(count)
+        return None if ticket is None else (ticket, count)
 
     def needed(self, pending: _Pending) -> bool:
-        """True when the miss path has to be launched.
-
-        "read" blocks on the count. "poll" answers False only if the count has
-        landed and is zero, so a late copy costs a launch, never a result.
-        """
+        """True when the miss path has to be launched: unless a polled count that has
+        already landed is zero. A late copy costs a launch, never a result."""
         if pending is None:
             return True
-        ticket, count = pending
-        if ticket is None:
-            return _first_int(read_now(count)[0]) != 0
+        ticket, _ = pending
         landed_zero = (
             self.ring.ready(ticket) and _first_int(self.ring.value(ticket)) == 0
         )
         self.ring.release(ticket)
         return not landed_zero
+
+
+class _AlwaysGate:
+    """The gate of a storage that has no table state (an external one in DEFAULT mode):
+    it has no ring to poll, so the miss path always runs, which is what ``MISS_GATE``
+    "always" does for everyone else. Same interface as :class:`MissGate`."""
+
+    def begin(self, is_miss: torch.Tensor, *, rng: bool = False) -> _Pending:
+        return None
+
+    def needed(self, pending: _Pending) -> bool:
+        return True
+
+
+ALWAYS_GATE = _AlwaysGate()
 
 
 def _first_int(host_tensor: torch.Tensor) -> int:

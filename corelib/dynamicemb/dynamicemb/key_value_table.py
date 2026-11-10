@@ -29,7 +29,6 @@ from typing import (
     Dict,
     Iterator,
     List,
-    NamedTuple,
     Optional,
     Sequence,
     Set,
@@ -81,8 +80,12 @@ from dynamicemb.types import (
     SCORE_TYPE,
     Cache,
     CopyMode,
+    MaskedFind,
+    PaddedFind,
     ReplayStats,
     Storage,
+    as_padded,
+    has_padded_contract,
     torch_dtype_to_np_dtype,
 )
 from dynamicemb_extensions import EvictStrategy, device_timestamp, flagged_compact
@@ -3672,6 +3675,9 @@ def _erase_state_keys(
 
 
 class DynamicEmbCache(Cache):
+    # The padded lookup paths read this class's table state (see ``Cache``).
+    accepts_empty_keys = True
+
     def __init__(
         self,
         options: List[DynamicEmbTableOptions],
@@ -3738,6 +3744,7 @@ class DynamicEmbCache(Cache):
         scores: Optional[torch.Tensor] = None,
         *,
         async_count: bool = False,
+        accumulate: bool = False,
     ) -> Tuple[
         torch.Tensor,
         Union[int, torch.Tensor],
@@ -3752,6 +3759,10 @@ class DynamicEmbCache(Cache):
         stays an ``int64[1]`` tensor on the device and the four evicted arrays are
         as long as ``keys``, their entries past ``num_evicted`` inert (the
         reserved all-ones key, index and table id ``-1``).
+
+        With ``accumulate`` the insert counts as a further part of the one the
+        metrics describe (a prefetch whose miss path runs in row chunks): ``[2]`` and
+        ``[3]`` of the metrics are added to instead of overwritten.
         """
         state = self._state
         score_arg = get_insert_score_arg(state, keys.numel(), keys.device, scores)
@@ -3760,14 +3771,23 @@ class DynamicEmbCache(Cache):
         )
         if self._record_cache_metrics:
             m = self._metrics_dev
-            m[2].copy_(sf.valid_keys(keys).sum())
+            inserted = sf.valid_keys(keys).sum()
             if async_count:
-                m[3].copy_(result[1].reshape(()))  # num_evicted, on the device
+                evicted = result[1].reshape(())  # num_evicted, on the device
             else:
-                # ``m[3] = n`` copies a CPU scalar tensor to the device (a transfer
-                # from pageable memory); ``fill_`` is a kernel taking ``n`` as an
-                # argument.
-                m[3].fill_(int(result[1]))
+                evicted = int(result[1])
+            if accumulate:
+                m[2].add_(inserted)
+                m[3].add_(evicted)
+            else:
+                m[2].copy_(inserted)
+                if async_count:
+                    m[3].copy_(evicted)
+                else:
+                    # ``m[3] = n`` copies a CPU scalar tensor to the device (a
+                    # transfer from pageable memory); ``fill_`` is a kernel taking
+                    # ``n`` as an argument.
+                    m[3].fill_(evicted)
             self._metrics_streams[1] = torch.cuda.current_stream().cuda_stream
         return result
 
@@ -3781,7 +3801,8 @@ class DynamicEmbCache(Cache):
 
         ``[0]`` is the number of unique keys of the last lookup and ``[1]`` how many
         of them were found; ``[2]`` the number of keys of the last insert and ``[3]``
-        how many entries it evicted. The counters are kept on the device, so
+        how many entries it evicted (of a prefetch whose miss path ran in row chunks,
+        the totals over its chunks). The counters are kept on the device, so
         reading them is where the host waits for the device, not the lookups: one
         batched copy per read. It is a snapshot, a later lookup does not change
         a tensor returned earlier.
@@ -3853,27 +3874,6 @@ class DynamicEmbCache(Cache):
 # ---------------------------------------------------------------------------
 # DynamicEmbStorage – Storage interface (find with values, insert, dump, load)
 # ---------------------------------------------------------------------------
-
-
-class MaskedFind(NamedTuple):
-    """What :meth:`DynamicEmbStorage.lookup_masked` (or the hybrid one) found.
-
-    Nothing is compacted and no count is read back: every field is as long as
-    the keys that were looked up, and a lane whose key is the reserved all-ones
-    key (``sf.mask_keys``) is not found and owns no row, so a caller leaves a key
-    out of a lookup, and out of the load that follows it, by masking the key.
-    """
-
-    founds: Tensor  # bool[N]
-    # The full-length score tensor the lookups used (``None`` for an LRU table and
-    # for a const lookup). A later insert, or the lookup of a second tier, takes
-    # it as is: the kernels read ``score_input[i]`` for every lane, masked ones
-    # included, so it must never be compacted.
-    score_in: Optional[Tensor]
-    scores: Tensor  # int64[N]
-    # Opaque token for ``load_masked``: the value rows (a tensor, ``-1`` where
-    # there is none), or one such tensor per tier for a ``HybridStorage``.
-    rows: Any
 
 
 def _compact_missing(
@@ -3958,6 +3958,11 @@ def _after_growth(method):
 
 
 class DynamicEmbStorage(Storage):
+    # The padded contract of ``Storage``: ``lookup_masked`` / ``load_masked`` /
+    # ``find_masked`` / ``insert_masked`` below take arrays of the batch's length with
+    # inert rows and read nothing back. This is the reference implementation.
+    accepts_empty_keys = True
+
     def __init__(
         self,
         options: List[DynamicEmbTableOptions],
@@ -4231,13 +4236,16 @@ class DynamicEmbStorage(Storage):
         table_ids: torch.Tensor,
         lfu_accumulated_frequency: Optional[torch.Tensor] = None,
         key_scores: Optional[torch.Tensor] = None,
+        copy_mode: Optional[CopyMode] = None,
     ) -> MaskedFind:
         """:meth:`find` without the host count: one lookup of every key.
 
         The lookup scores exactly as :meth:`find` does (const outside training).
         Nothing is compacted and nothing is read back; a key that must not take
         part is replaced by the reserved key (``sf.mask_keys``) and comes back
-        not found, with row ``-1`` and its score untouched.
+        not found, with row ``-1`` and its score untouched. ``copy_mode`` is
+        accepted for the signature of :meth:`Storage.lookup_masked` and ignored:
+        the rows are loaded by :meth:`load_masked`.
         """
         r = _find_keys(
             self._state,
@@ -4264,6 +4272,34 @@ class DynamicEmbStorage(Storage):
         return load_from_flat(
             self._state, found.rows, table_ids, copy_mode, output=output
         )
+
+    @_after_growth
+    def find_masked(
+        self,
+        keys: torch.Tensor,
+        table_ids: torch.Tensor,
+        copy_mode: CopyMode,
+        lfu_accumulated_frequency: Optional[torch.Tensor] = None,
+        key_scores: Optional[torch.Tensor] = None,
+    ) -> PaddedFind:
+        """The padded :meth:`Storage.find_masked`: a lookup and a load of every lane."""
+        found = self.lookup_masked(
+            keys, table_ids, lfu_accumulated_frequency, key_scores
+        )
+        return PaddedFind(found.founds, self.load_masked(found, table_ids, copy_mode))
+
+    @_after_growth
+    def insert_masked(
+        self,
+        keys: torch.Tensor,
+        table_ids: torch.Tensor,
+        values: torch.Tensor,
+        scores: Optional[torch.Tensor] = None,
+        preserve_existing: bool = False,
+    ) -> None:
+        # ``insert`` already has the padded semantics: a reserved key gets no row
+        # and no store.
+        self.insert(keys, table_ids, values, scores, preserve_existing)
 
     @_after_growth
     def find(
@@ -4774,6 +4810,9 @@ class DynamicEmbStorage(Storage):
 class HybridStorage(Storage):
     """Two-tier storage: HBM (GPU) table + host table, disjoint partitions."""
 
+    # The padded contract of ``Storage`` (see ``DynamicEmbStorage``).
+    accepts_empty_keys = True
+
     def __init__(
         self,
         hbm_options: List[DynamicEmbTableOptions],
@@ -4930,6 +4969,7 @@ class HybridStorage(Storage):
         table_ids: torch.Tensor,
         lfu_accumulated_frequency: Optional[torch.Tensor] = None,
         key_scores: Optional[torch.Tensor] = None,
+        copy_mode: Optional[CopyMode] = None,
     ) -> MaskedFind:
         """:meth:`find` without the host counts: both tiers, no compaction.
 
@@ -4991,6 +5031,33 @@ class HybridStorage(Storage):
         return load_from_flat(
             self._host, found.rows[1], table_ids, copy_mode, output=values
         )
+
+    @_after_growth
+    def find_masked(
+        self,
+        keys: torch.Tensor,
+        table_ids: torch.Tensor,
+        copy_mode: CopyMode,
+        lfu_accumulated_frequency: Optional[torch.Tensor] = None,
+        key_scores: Optional[torch.Tensor] = None,
+    ) -> PaddedFind:
+        """The padded :meth:`Storage.find_masked`: a lookup and a load of every lane."""
+        found = self.lookup_masked(
+            keys, table_ids, lfu_accumulated_frequency, key_scores
+        )
+        return PaddedFind(found.founds, self.load_masked(found, table_ids, copy_mode))
+
+    @_after_growth
+    def insert_masked(
+        self,
+        keys: torch.Tensor,
+        table_ids: torch.Tensor,
+        values: torch.Tensor,
+        scores: Optional[torch.Tensor] = None,
+        preserve_existing: bool = False,
+    ) -> None:
+        # ``insert`` already has the padded semantics (see there).
+        self.insert(keys, table_ids, values, scores, preserve_existing)
 
     @_after_growth
     def find(
@@ -5097,23 +5164,41 @@ class HybridStorage(Storage):
 
         # The count of evictions stays on the device: the evicted arrays are as long
         # as the batch and inert past the evictions (reserved key, table id and row
-        # ``-1``), so the load, the store and the host insert below run over all of
-        # them and skip the rest. The select would not: it is given the tail hidden.
-        evicted_values = load_from_flat(
-            self._hbm, evicted_indices, evicted_table_ids, copy_mode=CopyMode.VALUE
-        )
-        _select_refused_values(
-            evicted_indices, evicted_table_ids, unique_values, evicted_values
-        )
+        # ``-1``), so the load and the host insert below run over all of them and skip
+        # the rest. The select would not: it is given the tail hidden. The victims are
+        # read in row chunks that keep their buffer within the budget
+        # (``sf.row_chunks``), each chunk moving to the host tier before the next is
+        # read, and all of them before the new rows overwrite their slots: the two tiers
+        # are disjoint, so the host insert and the HBM store commute.
+        #
+        # The loop is not atomic. An exception in it (a caught out-of-memory error of a
+        # chunk's buffer or of the host tier's insert) leaves the new keys in the key map
+        # of the HBM tier while their rows still hold the victims' values, so a later
+        # lookup would return another key's row: a tier that has raised here is not to
+        # be used again. ``_insert_and_evict_keys`` above has the same window up to the
+        # store (an out-of-memory error of the evicted values), a little narrower.
+        for start, stop in sf.row_chunks(
+            evicted_keys.numel(),
+            self._hbm.value_dim * self._hbm.emb_dtype.itemsize,
+            buffers=1,
+        ):
+            chunk_indices = evicted_indices[start:stop]
+            chunk_table_ids = evicted_table_ids[start:stop]
+            evicted_values = load_from_flat(
+                self._hbm, chunk_indices, chunk_table_ids, copy_mode=CopyMode.VALUE
+            )
+            # An entry's index is -(i + 1) for row ``i`` of the whole input.
+            _select_refused_values(
+                chunk_indices, chunk_table_ids, unique_values, evicted_values
+            )
+            _insert_key_values(
+                self._host,
+                evicted_keys[start:stop],
+                chunk_table_ids,
+                evicted_values,
+                evicted_scores[start:stop],
+            )
         store_to_flat(self._hbm, indices, table_ids, unique_values)
-
-        _insert_key_values(
-            self._host,
-            evicted_keys,
-            evicted_table_ids,
-            evicted_values,
-            evicted_scores,
-        )
 
     @_after_growth
     def incremental_dump(
@@ -5608,17 +5693,6 @@ class HybridStorage(Storage):
 # ---------------------------------------------------------------------------
 
 
-def _select(values: torch.Tensor, rows: torch.Tensor, all_rows: bool) -> torch.Tensor:
-    """``values[rows]`` -- ``flagged_compact`` only takes 1-D inputs.
-
-    ``all_rows`` says the caller's mask kept every row; ``flagged_compact`` emits
-    its index in ascending order, so ``rows`` is then the identity and the gather
-    is skipped. The row count alone cannot say that: an index of the same length
-    may still permute the rows.
-    """
-    return values if all_rows else values[rows]
-
-
 def _write_back_evicted(
     storage: DynamicEmbStorage,
     next_tier: Optional[Storage],
@@ -5633,45 +5707,22 @@ def _write_back_evicted(
     has evicted since goes to ``next_tier``; with none it is dropped, kept as an
     evicted key when storage retains them.
 
-    Without a ``next_tier`` this is :func:`_write_back_evicted_masked`: the arrays
-    may be of any length, padded with inert entries, and nothing is counted or
-    compacted, so the host does not wait for the device. ``slots`` are the
-    evicted indices the insert reported (see there).
-
-    With a ``next_tier`` (an external store, which takes host-sized tensors and is
-    written by code that may run on the host) the keys are compacted into the
-    ones storage has and the ones it has evicted since, each with a count read.
-    The arrays are then exact, and ``slots`` is not consulted.
+    This is :func:`_write_back_evicted_masked`: the arrays may be of any length,
+    padded with inert entries, and nothing is counted or compacted, so the host does
+    not wait for the device. ``slots`` are the evicted indices the insert reported
+    (see there). ``next_tier`` is any storage; one that has not declared the padded
+    contract is served through its ``insert`` (see :func:`as_padded`).
     """
     if keys.numel() == 0:
         return
-    if next_tier is None:
-        return _write_back_evicted_masked(storage, keys, table_ids, values, slots)
-    st = storage._state
-    in_storage = _find_keys(st, keys, table_ids, const_lookup=True, compact=False)[5]
-    with torch.cuda.nvtx.range("op:flagged_compact"):
-        num_present, present, (present_keys, present_tids) = flagged_compact(
-            in_storage, [keys, table_ids]
-        )
-    with torch.cuda.nvtx.range("op:storage_insert"):
-        if num_present > 0:
-            storage.insert(
-                present_keys,
-                present_tids,
-                _select(values, present, num_present == keys.numel()),
-                preserve_existing=True,
-            )
-        if num_present == keys.numel():
-            return
-        if num_present == 0:
-            gone_keys, gone_tids, gone_values = keys, table_ids, values
-        else:
-            with torch.cuda.nvtx.range("op:flagged_compact"):
-                _, gone, (gone_keys, gone_tids) = flagged_compact(
-                    ~in_storage, [keys, table_ids]
-                )
-            gone_values = values[gone]
-        next_tier.insert(gone_keys, gone_tids, gone_values)
+    _write_back_evicted_masked(
+        storage,
+        keys,
+        table_ids,
+        values,
+        slots,
+        None if next_tier is None else as_padded(next_tier),
+    )
 
 
 def _write_back_evicted_masked(
@@ -5680,23 +5731,25 @@ def _write_back_evicted_masked(
     table_ids: torch.Tensor,
     values: torch.Tensor,
     slots: Optional[torch.Tensor],
+    next_tier: Optional[Storage] = None,
 ) -> None:
-    """:func:`_write_back_evicted` without a next tier, over arrays of any length.
+    """:func:`_write_back_evicted` over arrays of any length.
 
     ``keys`` / ``table_ids`` / ``values`` are as long as the evicted arrays of an
     insert, an entry that is not an eviction being inert: the reserved all-ones
     key and table id ``-1``. The keys storage still has get their value written to
     the row they hold (``store_to_flat`` skips a row of ``-1``): storage keeps the
     score of a key, only the value moves, so this is what an insert that keeps
-    existing scores does, without the insert. Without a store below it a key
-    storage has evicted since is dropped, or retained when storage retains
-    evicted keys.
+    existing scores does, without the insert. A key storage has evicted since goes
+    to ``next_tier`` (a storage of the padded contract: the keys storage still has
+    are hidden from it as the reserved key), or is dropped without one, or retained
+    when storage retains evicted keys.
 
     ``slots`` is the index the insert reported for each entry (``None`` for an
     array that has none, as in a flush). A negative one is not an eviction: the
     insert refused that key (its bucket and overflow are all pinned) and reports
     it as an evicted entry with index ``-(i + 1)``, a row of ``values`` that was
-    never loaded. Such an entry is neither written back nor retained.
+    never loaded. Such an entry is neither written back nor passed on nor retained.
     """
     st = storage._state
     with torch.cuda.nvtx.range("op:write_back_evicted"):
@@ -5706,9 +5759,11 @@ def _write_back_evicted_masked(
         live = None if slots is None else (slots >= 0)
         rows = found_rows if live is None else torch.where(live, found_rows, -1)
         store_to_flat(st, rows, table_ids, values)
-        if EvictedItemMode.RETAIN_KEY in st.evicted_item_mode:
-            # Keys storage no longer has were evicted by it in the meantime.
-            gone = (found_rows < 0) if live is None else ((found_rows < 0) & live)
+        # Keys storage no longer has were evicted by it in the meantime.
+        gone = (found_rows < 0) if live is None else ((found_rows < 0) & live)
+        if next_tier is not None:
+            next_tier.insert_masked(sf.mask_keys(keys, gone), table_ids, values)
+        elif EvictedItemMode.RETAIN_KEY in st.evicted_item_mode:
             _append_evicted_masked(
                 st, sf.mask_keys(keys, gone), torch.where(gone, table_ids, -1)
             )
@@ -5757,45 +5812,18 @@ def _eval_lookup_storage(
     initializer: Callable,
     valid: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    """Eval lookup of an in-tree storage: no host count, no compaction.
+    """Eval lookup of a storage of the padded contract: no host count, no compaction.
 
     ``valid`` (bool, one entry per key) marks the real keys of a batch whose tail
     is padding (the reserved key, table id ``-1``); ``None`` means every key is
     real. A key found nowhere takes the constant of the eval initializer, which
     is written over its row only: padding is neither loaded nor initialized.
     """
-    found = storage.lookup_masked(keys, table_ids)  # const: not training in eval
+    # const: not training in eval
+    found = storage.lookup_masked(keys, table_ids, copy_mode=CopyMode.EMBEDDING)
     embs = storage.load_masked(found, table_ids, CopyMode.EMBEDDING)
     missing = ~found.founds if valid is None else valid & ~found.founds
     sf.initialize_masked(initializer, embs, keys, table_ids, missing)
-    return embs
-
-
-def _eval_lookup_storage_legacy(
-    storage: Storage,
-    keys: torch.Tensor,
-    table_ids: torch.Tensor,
-    initializer: Callable,
-) -> torch.Tensor:
-    """Exact-length eval lookup through ``Storage.find`` (any ``Storage``)."""
-    (
-        h_num_missing,
-        _,
-        missing_indices,
-        _,
-        _,
-        _,
-        _,
-        embs,
-    ) = storage.find(
-        keys,
-        table_ids,
-        copy_mode=CopyMode.EMBEDDING,
-    )
-
-    if h_num_missing > 0:
-        initializer(embs, keys, table_ids, missing_indices)
-
     return embs
 
 
@@ -5819,75 +5847,12 @@ def _eval_lookup_cached(
         cache._state, cache_indices, table_ids, copy_mode=CopyMode.EMBEDDING
     )
     miss = ~founds if valid is None else valid & ~founds
-    found = storage.lookup_masked(sf.mask_keys(keys, miss), table_ids)
+    found = storage.lookup_masked(
+        sf.mask_keys(keys, miss), table_ids, copy_mode=CopyMode.EMBEDDING
+    )
     storage.load_masked(found, table_ids, CopyMode.EMBEDDING, output=embs)
     sf.initialize_masked(initializer, embs, keys, table_ids, miss & ~found.founds)
     return embs
-
-
-def _eval_lookup_cached_legacy(
-    cache: Cache,
-    storage: Storage,
-    keys: torch.Tensor,
-    table_ids: torch.Tensor,
-    initializer: Callable,
-) -> torch.Tensor:
-    """Exact-length eval lookup through ``Storage.find`` (any ``Storage``)."""
-    _, founds, cache_indices = cache.lookup(keys, table_ids)
-
-    embs = load_from_flat(
-        cache._state, cache_indices, table_ids, copy_mode=CopyMode.EMBEDDING
-    )
-
-    missing_mask = ~founds
-    h_num_miss, miss_compact_idx, (missing_keys, missing_table_ids) = flagged_compact(
-        missing_mask, [keys, table_ids]
-    )
-
-    if h_num_miss == 0:
-        return embs
-
-    (
-        h_num_missing_in_storage,
-        _,
-        missing_indices_in_storage,
-        _,
-        _,
-        _,
-        _,
-        storage_embs,
-    ) = storage.find(
-        missing_keys,
-        missing_table_ids,
-        copy_mode=CopyMode.EMBEDDING,
-    )
-
-    if h_num_missing_in_storage > 0:
-        initializer(
-            storage_embs, missing_keys, missing_table_ids, missing_indices_in_storage
-        )
-
-    embs[miss_compact_idx, :] = storage_embs
-
-    return embs
-
-
-def _masked_eval_applies(storage: Storage, cache: Optional[Cache]) -> bool:
-    """Whether an eval lookup may take the masked path (host facts only).
-
-    The masked functions need ``lookup_masked`` / ``load_masked``, which only the
-    in-tree storages have, by exact type: a subclass may override ``find``. Any
-    other ``Storage`` or ``Cache`` keeps the exact-length functions, as does
-    ``DYNAMICEMB_SYNC_FREE=0``, the switch that restores the legacy paths. It is
-    read from the environment at every call, not from the flag the prefetch
-    dispatchers hold (that module imports this one): a test flips it with
-    ``monkeypatch.setenv``.
-    """
-    return (
-        os.environ.get("DYNAMICEMB_SYNC_FREE", "1") != "0"
-        and type(storage) in (DynamicEmbStorage, HybridStorage)
-        and (cache is None or type(cache) is DynamicEmbCache)
-    )
 
 
 def eval_lookup(
@@ -5907,8 +5872,10 @@ def eval_lookup(
 
     *valid* (bool, one entry per key) marks the real keys of a batch padded to a
     fixed length: the others are the reserved key with table id ``-1``, and their
-    rows are neither looked up nor written (they hold garbage). It needs the
-    in-tree storage; ``None`` means every key is real.
+    rows are neither looked up nor written (they hold garbage); ``None`` means
+    every key is real. A *storage* that has not declared the padded contract is
+    asked through its ``find``, after one read of how many keys are live (see
+    :func:`~dynamicemb.types.as_padded`); the *cache* has to be a ``DynamicEmbCache``.
 
     Returns the embedding tensor of shape ``[len(keys), emb_dim]``.
     """
@@ -5921,25 +5888,15 @@ def eval_lookup(
             device=keys.device,
         )
 
-    if valid is not None or _masked_eval_applies(storage, cache):
-        if cache is None:
-            return _eval_lookup_storage(storage, keys, table_ids, initializer, valid)
-        return _eval_lookup_cached(
-            cache,
-            storage,
-            keys,
-            table_ids,
-            initializer,
-            valid,
+    if cache is not None and not (
+        type(cache) is DynamicEmbCache or has_padded_contract(cache)
+    ):
+        raise TypeError(
+            "eval_lookup reads the table state of its cache: only a DynamicEmbCache "
+            "(or a subclass that sets accepts_empty_keys = True in its own body) can "
+            f"be the cache, got {type(cache).__name__}."
         )
-
+    storage = as_padded(storage)
     if cache is None:
-        return _eval_lookup_storage_legacy(storage, keys, table_ids, initializer)
-
-    return _eval_lookup_cached_legacy(
-        cache,
-        storage,
-        keys,
-        table_ids,
-        initializer,
-    )
+        return _eval_lookup_storage(storage, keys, table_ids, initializer, valid)
+    return _eval_lookup_cached(cache, storage, keys, table_ids, initializer, valid)

@@ -267,9 +267,14 @@ def test_check_zero_site_level_and_case_level_inherent():
         and "synthetic_ps/miss/plain" in bad[0]
     ), bad
     assert "key_value_table.py" in bad[0] or "dynamicemb" in bad[0]
-    # an external-PS case is excused as a whole
-    g = result_of("cache_ps", "miss")
-    assert g["inherent"] and hsp.check_zero(report_of(g)) == []
+    # a case excused as a whole (no entry of the table is one today, so one is added)
+    whole = ("synthetic_whole*", "miss")
+    hsp.INHERENT[whole] = "a whole-case excuse"
+    try:
+        g = result_of("synthetic_whole", "miss")
+        assert g["inherent"] and hsp.check_zero(report_of(g)) == []
+    finally:
+        del hsp.INHERENT[whole]
     # table growth is not excused: the same numbers are a violation
     grew = result_of("hbm_only_growth", "growth")
     assert not grew["inherent"] and len(hsp.check_zero(report_of(grew))) == 1
@@ -312,10 +317,13 @@ def test_inherent_matching():
         for scenario in hsp.SCENARIO_DOC:
             assert hsp.inherent_reason(config, scenario) is None, (config, scenario)
     assert hsp.inherent_reason("hbm_only", "miss") is None
-    # I1, the external PS, in every scenario: the dedup and miss counts are read before each PS call
-    assert hsp.inherent_reason("cache_ps", "all_hit")
-    assert hsp.inherent_reason("cache_ps_sum", "miss_evict")
-    # nothing else is excused, the determinism mode included: its inserts read nothing
+    # I1, the external PS of the host-sized contract, in every scenario but by call site: the
+    # reads of DynamicEmb (sync_free.read_now) and the stand-in's own code are excused, the rest
+    # of the case is not (see test_the_old_contract_ps_is_excused_by_call_site_only)
+    for config in ("cache_ps", "cache_ps_sum"):
+        for scenario in ("all_hit", "miss", "miss_evict", "tier2_hit"):
+            assert hsp.inherent_reason(config, scenario) is None, (config, scenario)
+    # nothing else is excused, the determinism mode and the growth events included: they read nothing
     for config in (
         "cache_storage",
         "hbm_only",
@@ -330,9 +338,76 @@ def test_inherent_matching():
     ):
         for scenario in hsp.SCENARIO_DOC:
             assert hsp.inherent_reason(config, scenario) is None, (config, scenario)
-    assert (
-        hsp.inherent_site_globs("cache_ps_sum", "miss") == []
-    )  # no call-site level entry today
+    # a PS of the padded contract reads nothing, so none of its cases has an entry
+    for config in ("cache_dps", "cache_dps_sum", "host_dps", "cache_dps_chunked"):
+        for scenario in hsp.SCENARIO_DOC:
+            assert hsp.inherent_site_globs(config, scenario) == [], (config, scenario)
+            assert hsp.inherent_reason(config, scenario) is None, (config, scenario)
+
+
+def _syncs_in(*files):
+    """A python-only probe whose iteration 0 made one explicit sync in each of ``files``
+    (iteration 1 none)."""
+    p = hsp.Probe(use_profiler=False)
+    p.cap.explicit = [
+        {
+            "iter": 0,
+            "tid": 1,
+            "api": "Event.synchronize",
+            "chain": [],
+            "site": (path, 100 + i, "f"),
+        }
+        for i, path in enumerate(files)
+    ]
+    return p
+
+
+def test_the_old_contract_ps_is_excused_by_call_site_only():
+    """DynamicEmb's reads for a PS of the host-sized contract wait in sync_free.read_now and the
+    stand-in's host code is in its own file: those are excused. A sync anywhere else in the same
+    case (a raw .item() added to a PS flow, say) is a violation, which a whole-case excuse hid.
+    """
+    for config in ("cache_ps", "cache_ps_sum"):
+        for scenario in ("all_hit", "miss", "miss_evict", "tier2_hit"):
+            sites = hsp.inherent_site_globs(config, scenario)
+            assert {glob for glob, _ in sites} == {hsp.READ_NOW_SITE, hsp.PS_STANDIN}
+            assert all(why for _, why in sites)
+    globs = [g for g, _ in hsp.inherent_site_globs("cache_ps", "miss")]
+    excused = (
+        "/x/dynamicemb/sync_free.py",
+        "/x/dynamicemb/sync_free.py",
+        "/x/" + PS_FILE,
+    )
+    ps = result_of("cache_ps", "miss", probe=_syncs_in(*excused), globs=globs)
+    assert ps["per_iter_total"] == [3, 0] and ps["inherent_site_per_iter"] == [3, 0]
+    assert hsp.check_zero(report_of(ps)) == []
+    # the same number of syncs with one of them in the module's own code is a violation
+    other = excused[:2] + ("/x/dynamicemb/types.py",)
+    ps = result_of("cache_ps", "miss", probe=_syncs_in(*other), globs=globs)
+    bad = hsp.check_zero(report_of(ps))
+    assert len(bad) == 1 and "cache_ps/miss/plain" in bad[0], bad
+    assert "outside inherent sites" in bad[0]
+
+
+def test_the_allocations_of_a_stand_in_are_excused_as_they_were_with_the_whole_case():
+    """The sync is excused by call site, an allocation has none: a case with a stand-in's
+    code in it (a dict of device tensors that grows the allocator) is not bounded for
+    cudaMalloc events; every other case is, a growth event included (it gets an allowance
+    per growth, see test_sync_ratchet.py)."""
+    for config, scenario in (
+        ("cache_ps", "all_hit"),
+        ("cache_ps_sum", "tier2_hit"),
+    ):
+        assert hsp.allocations_excused(config, scenario), (config, scenario)
+    for config, scenario in (
+        ("cache_storage", "miss"),
+        ("cache_dps", "tier2_hit"),
+        ("host_dps", "miss"),
+        ("hbm_only_growth", "all_hit"),
+        ("hbm_only_growth", "growth"),
+        ("cache_storage_determ", "all_hit"),
+    ):
+        assert not hsp.allocations_excused(config, scenario), (config, scenario)
 
 
 def test_the_wide_growth_configs_cross_the_vmm_granule_and_the_narrow_ones_do_not():

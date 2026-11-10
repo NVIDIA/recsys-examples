@@ -626,6 +626,9 @@ class DynamicEmbTableOptions:
     external_storage: Storage
         The external storage/ParamterServer which inherits the interface of Storage, and can be configured per table.
         If not provided, will using DynamicEmbeddingTable as the Storage.
+        A class that implements the padded contract (``find_masked`` / ``insert_masked``,
+        ``accepts_empty_keys = True``) is called without any read of the device; one that implements only
+        ``find`` / ``insert`` costs one read per call. See ``dynamicemb.types.Storage``.
     index_type : Optional[torch.dtype], optional
         Index type of sparse features, will be set to DEFAULT_INDEX_TYPE(torch.int64) by default.
     dist_type : str

@@ -15,11 +15,13 @@
 
 import abc
 import enum
+import warnings
 from dataclasses import dataclass
-from typing import Generic, Iterator, List, Optional, Tuple, TypeVar
+from typing import Any, Generic, Iterator, List, NamedTuple, Optional, Tuple, TypeVar
 
 import numpy as np
 import torch
+from dynamicemb import sync_free as sf
 
 
 @enum.unique
@@ -219,8 +221,330 @@ class ReplayStats:
         return self
 
 
+class MaskedFind(NamedTuple):
+    """What a storage's ``lookup_masked`` found, for the ``load_masked`` that follows.
+
+    Nothing is compacted and no count is read back: every field is as long as
+    the keys that were looked up, and a lane whose key is the reserved all-ones
+    key (``sync_free.mask_keys``) is not found and owns no row, so a caller leaves a key
+    out of a lookup, and out of the load that follows it, by masking the key.
+    """
+
+    founds: torch.Tensor  # bool[N]
+    # The full-length score tensor the lookups used (``None`` for an LRU table and
+    # for a const lookup). A later insert, or the lookup of a second tier, takes
+    # it as is: the kernels read ``score_input[i]`` for every lane, masked ones
+    # included, so it must never be compacted.
+    score_in: Optional[torch.Tensor]
+    scores: Optional[torch.Tensor]  # int64[N]; None for a storage that keeps none
+    # Opaque token for ``load_masked``: the value rows (a tensor, ``-1`` where
+    # there is none), or one such tensor per tier for a ``HybridStorage``.
+    rows: Any
+
+
+class PaddedFind(NamedTuple):
+    """What :meth:`Storage.find_masked` returns."""
+
+    founds: torch.Tensor  # bool[N]; False for every lane that is not a live key
+    # ``[N, width]``, ``width`` that of the ``CopyMode``; the rows of the lanes that
+    # were not found are unspecified.
+    values: torch.Tensor
+
+
+def has_padded_contract(obj) -> bool:
+    """Whether the class of ``obj`` (or ``obj`` itself, a class) declared
+    ``accepts_empty_keys = True`` in its own body.
+
+    An inherited declaration does not count: a subclass that overrides anything the
+    padded code relies on has not made the promise, so it has to make it itself.
+    """
+    cls = obj if isinstance(obj, type) else type(obj)
+    return bool(cls.__dict__.get("accepts_empty_keys", False))
+
+
+def as_padded(storage):
+    """What the padded lookup code talks to: ``storage`` itself when its class
+    declared the padded contract, else an :class:`OldContractStorage` over it.
+
+    Works for any object that has the old ``find`` / ``insert``, whether it
+    inherits :class:`Storage` or not.
+    """
+    return storage if has_padded_contract(storage) else OldContractStorage(storage)
+
+
+def _check_padded_find(
+    storage, keys: torch.Tensor, found: PaddedFind, width: int
+) -> None:
+    """The host facts of what a padded ``find_masked`` returned, none of which needs a read
+    of the device: a result that does not have them would be lined up with the wrong rows,
+    silently, by the code that loads it."""
+    name = type(storage).__name__
+    founds, values = found
+    n = keys.numel()
+    if not (
+        isinstance(founds, torch.Tensor)
+        and founds.dtype == torch.bool
+        and tuple(founds.shape) == (n,)
+        and founds.device == keys.device
+    ):
+        raise ValueError(
+            f"{name}.find_masked must return founds as a bool tensor with one entry per key "
+            f"([{n}], on {keys.device}), got {_describe(founds)}."
+        )
+    if not (
+        isinstance(values, torch.Tensor)
+        and values.dim() == 2
+        and values.size(0) == n
+        and values.size(1) >= width
+        and values.device == keys.device
+    ):
+        raise ValueError(
+            f"{name}.find_masked must return values as a tensor of [{n}, at least {width}] "
+            f"on {keys.device}, got {_describe(values)}."
+        )
+
+
+def _describe(t) -> str:
+    if not isinstance(t, torch.Tensor):
+        return type(t).__name__
+    return f"{t.dtype} {list(t.shape)} on {t.device}"
+
+
+def _live_rows(keys: torch.Tensor, *aligned: Optional[torch.Tensor], count=None):
+    """``(count, positions, [dense_keys, *dense_aligned])`` for the live rows of ``keys``.
+
+    THE read of every old-contract adapter: a class whose methods take exact-length
+    tensors needs the number of live rows on the host, and that number exists only on
+    the device. It is one ``sync_free.read_now`` per call, placed after everything that
+    fed the arrays was enqueued; a caller that has the count already hands it in
+    (``count``) and nothing is read. ``positions`` (int64, ascending) says where each
+    dense row sits among the ``N`` rows; ``aligned`` arrays may be None (they stay
+    None) or 2-D (rows are selected). A call with no live row returns ``(0, None, [])``.
+    """
+    if keys.numel() == 0:
+        return 0, None, []
+    live = sf.valid_keys(keys)
+    if count is None:
+        count = int(sf.read_now(live.sum())[0])
+    if count == 0:
+        return 0, None, []
+    rows = torch.arange(keys.numel(), dtype=torch.int64, device=keys.device)
+    positions, dense_keys, *dense = sf.compact_by_count(
+        live, count, rows, keys, *aligned
+    )
+    return count, positions, [dense_keys, *dense]
+
+
+def _scatter_rows(
+    size: int, positions: torch.Tensor, where: torch.Tensor, rows: torch.Tensor
+) -> torch.Tensor:
+    """A ``[size]`` tensor of ``rows``' dtype, zero but at ``positions[where]``, where it
+    holds ``rows``. ``where`` indexes the dense array that ``positions`` maps to the
+    ``size`` rows."""
+    out = torch.zeros(size, dtype=rows.dtype, device=positions.device)
+    index = positions[where.to(device=positions.device, dtype=torch.int64)]
+    rows = rows.to(positions.device)
+    if out.dtype == torch.uint64:  # no advanced indexing for uint64
+        out.view(torch.int64)[index] = rows.view(torch.int64)
+    else:
+        out[index] = rows
+    return out
+
+
+class _DenseFind(NamedTuple):
+    """The opaque token of an old-contract lookup (``MaskedFind.rows``)."""
+
+    positions: Optional[torch.Tensor]  # where the dense rows sit among the N rows
+    found: Optional[torch.Tensor]  # bool[count]
+    values: Optional[torch.Tensor]  # [count, width]
+    # The host count of missing keys the class returned from ``find`` (a host int by
+    # its contract); 0 when no row was live, so nothing was asked.
+    num_missing: int = 0
+
+
+class OldContractStorage:
+    """A view of a storage whose class did not declare ``accepts_empty_keys``: the
+    padded methods run the class's old, host-sized ``find`` / ``insert`` on the live
+    rows after one read of how many there are, and scatter the answer back.
+
+    That read is by the old contract (see :class:`Storage`): a method that takes
+    tensors of exactly the length of the live rows needs the length on the host. A
+    class that implements the padded contract is never wrapped and costs nothing.
+    Every other attribute is forwarded to the storage, so ``embedding_dims``,
+    ``max_value_dim``, ``_state`` ... work on the view.
+    """
+
+    accepts_empty_keys = True  # the view itself speaks the padded contract
+
+    def __init__(self, inner):
+        self.inner = inner
+
+    def __getattr__(self, name):  # only for what the view does not define
+        if name == "inner":
+            raise AttributeError(name)
+        return getattr(self.inner, name)
+
+    def lookup_masked(
+        self,
+        unique_keys,
+        table_ids,
+        lfu_accumulated_frequency=None,
+        key_scores=None,
+        copy_mode=None,
+        *,
+        live_count=None,
+    ) -> MaskedFind:
+        """``find`` of the live rows, as a :class:`MaskedFind`. ``live_count`` is the
+        number of live keys when the caller knows it (nothing is then read)."""
+        copy_mode = CopyMode.VALUE if copy_mode is None else copy_mode
+        device = unique_keys.device
+        found = torch.zeros(unique_keys.numel(), dtype=torch.bool, device=device)
+        count, positions, dense = _live_rows(
+            unique_keys,
+            table_ids,
+            lfu_accumulated_frequency,
+            key_scores,
+            count=live_count,
+        )
+        token, score_in = _DenseFind(None, None, None, 0), None
+        if count:
+            d_keys, d_ids, d_freq, d_scores = dense
+            # Only what there is: a store written before per-key scores has no such
+            # parameter, and the host-sized bodies did not pass an empty frequency either.
+            kwargs = {}
+            if d_freq is not None:
+                kwargs["lfu_accumulated_frequency"] = d_freq
+            if d_scores is not None:
+                kwargs["key_scores"] = d_scores
+            result = self.inner.find(d_keys, d_ids, copy_mode=copy_mode, **kwargs)
+            d_found = result[5].to(device=device, dtype=torch.bool)
+            found[positions] = d_found  # CUDA index, CUDA value: no sync
+            token = _DenseFind(positions, d_found, result[7].to(device), int(result[0]))
+            # What the class says a later insert of its missing keys takes as scores:
+            # its own ``missing_scores``, N-aligned (None when it returned none).
+            if result[4] is not None and result[4].numel() > 0:
+                score_in = _scatter_rows(
+                    unique_keys.numel(), positions, result[2], result[4]
+                )
+        return MaskedFind(founds=found, score_in=score_in, scores=None, rows=token)
+
+    def nothing_missed(self, found: MaskedFind) -> bool:
+        """Whether the lookup that made ``found`` is known to have found every live key:
+        the class returned a host count of the keys it lacked (zero here), so a caller
+        may skip what would only handle the misses without reading anything."""
+        return found.rows.num_missing == 0
+
+    def load_masked(self, found, table_ids, copy_mode, output=None):
+        """Write the rows ``found`` fetched into ``output`` (``[N, width]``; the lanes
+        that were not found keep what they hold) or into a new buffer."""
+        token = found.rows
+        width = (
+            self.inner.max_embedding_dim()
+            if copy_mode == CopyMode.EMBEDDING
+            else self.inner.max_value_dim()
+        )
+        if output is None:
+            output = torch.empty(
+                found.founds.numel(),
+                width,
+                dtype=self.inner.embedding_dtype(),
+                device=found.founds.device,
+            )
+        if token.positions is not None:  # the token was built from a count read
+            assert token.values.size(1) >= width, (
+                "load_masked asks for more columns than the lookup fetched: "
+                f"{width} > {token.values.size(1)}"
+            )
+            current = output[token.positions]
+            output[token.positions] = torch.where(
+                token.found.unsqueeze(1),
+                token.values[:, :width].to(output.dtype),
+                current,
+            )
+        return output
+
+    def find_masked(
+        self,
+        keys,
+        table_ids,
+        copy_mode,
+        lfu_accumulated_frequency=None,
+        key_scores=None,
+    ) -> PaddedFind:
+        found = self.lookup_masked(
+            keys, table_ids, lfu_accumulated_frequency, key_scores, copy_mode
+        )
+        return PaddedFind(found.founds, self.load_masked(found, table_ids, copy_mode))
+
+    def insert_masked(
+        self, keys, table_ids, values, scores=None, preserve_existing=False
+    ) -> None:
+        """``insert`` of the live rows; nothing is called when there are none."""
+        count, _, dense = _live_rows(keys, table_ids, values, scores)
+        if count == 0:
+            return
+        d_keys, d_ids, d_values, d_scores = dense
+        # As the old call sites did: the scores only when there are some, the flag
+        # only when it is set, so that a store that predates them keeps working.
+        args = (d_keys, d_ids, d_values) + (() if d_scores is None else (d_scores,))
+        if preserve_existing:
+            self.inner.insert(*args, preserve_existing=True)
+        else:
+            self.inner.insert(*args)
+
+
 # make it standalone to avoid recursive references.
 class Storage(abc.ABC, Generic[OptionsT, OptimizerT]):
+    """A tier that holds keys and their value rows (what ``external_storage`` is).
+
+    **Two contracts.** ``find`` and ``insert`` are the host-sized contract: tensors of
+    exactly the length of the keys that matter, and ``find`` returns a host count of
+    the missing keys. DynamicEmb serves a class that implements only these by reading,
+    once per call, how many of the rows it has are real (one blocking device-to-host
+    read per call), compacting the tensors to that length and calling ``find`` /
+    ``insert`` (:class:`OldContractStorage`).
+
+    The padded contract, ``find_masked`` and ``insert_masked``, takes tensors of
+    the length ``N`` of the whole batch whose rows may be inert (the reserved key), has
+    no count anywhere and must not wait for the device. A class that implements both
+    and declares ``accepts_empty_keys = True`` **in its own class body** is called
+    through them, and DynamicEmb reads nothing from the device on its behalf. The
+    attribute is read from the class's own ``__dict__``: a subclass that overrides
+    anything has not made the promise and has to make it itself.
+
+    Rules of the padded contract:
+
+    * ``N`` is ``keys.numel()``. A *live* row has a key other than the reserved
+      all-ones key (``-1`` as int64, ``0xFF..FF`` as uint64); every other row is
+      *inert*, whatever its table id (``-1`` on the padding past the real rows, or a
+      real table id where DynamicEmb merely hides a key). Do not read the table id or
+      the values row of an inert row except through a mask. ``find_masked`` reports
+      ``founds[i] = False`` for it and leaves ``values[i]`` unspecified;
+      ``insert_masked`` stores nothing for it.
+    * There is no count: nothing takes, returns or branches on a number of live rows.
+    * All tensors are CUDA tensors on the storage's device, produced on the current
+      stream. Enqueue your work on the current stream, do not synchronize it and do not
+      read a device value on the host. DynamicEmb reuses its argument buffers after the
+      call returns, so copy what you keep. The ``values`` that ``find_masked`` returns
+      is a tensor DynamicEmb may write into (the initializer writes the rows of keys
+      found nowhere), so it must not be a view of data you read again.
+    * Live ``(table_id, key)`` pairs are unique within one ``insert_masked`` call (they
+      come from the dedup); an evaluation of a sequence layout may send repeated keys
+      to ``find_masked``. Keys ``0xFF..FC`` to ``0xFF..FE`` are never valid keys and
+      are never sent.
+    * ``values`` have the padded layout of :class:`CopyMode`: ``[N, max_embedding_dim]``
+      for ``EMBEDDING`` and ``[N, max_value_dim]`` for ``VALUE`` (the embedding padded
+      to ``max_embedding_dim``, then the optimizer state), in ``embedding_dtype()``.
+    * The calls of one batch of a cache's backing storage arrive in this order:
+      ``find_masked`` / ``lookup_masked`` (the keys the storage lacks), then
+      ``insert_masked`` (what the storage evicted for room), then ``insert_masked``
+      (what the cache evicted that the storage no longer has).
+
+    The in-tree :class:`~dynamicemb.key_value_table.DynamicEmbStorage` and
+    :class:`~dynamicemb.key_value_table.HybridStorage` are the reference
+    implementations.
+    """
+
     @abc.abstractmethod
     def find(
         self,
@@ -234,14 +558,28 @@ class Storage(abc.ABC, Generic[OptionsT, OptimizerT]):
         torch.Tensor,
         torch.Tensor,
         torch.Tensor,
+        Optional[torch.Tensor],
         torch.Tensor,
         torch.Tensor,
         torch.Tensor,
     ]:
+        """The host-sized lookup: ``unique_keys`` and ``table_ids`` hold exactly the live keys.
+
+        Returns eight values, in this order (every implementation in the package does, and
+        :class:`OldContractStorage` indexes them): ``num_missing`` (a host int),
+        ``missing_keys``, ``missing_indices`` (the positions of the missing keys among
+        ``unique_keys``), ``missing_table_ids``, ``missing_scores`` (what a later
+        insert of the missing keys takes as ``scores``, aligned with ``missing_keys``; ``None``
+        for a store that keeps none), ``founds`` (bool, one per key), ``output_scores`` and
+        ``values`` (``[len(unique_keys), width]``, ``width`` that of ``copy_mode``; the rows of
+        the keys that were not found are unspecified). DynamicEmb reads the count, the missing
+        indices, the missing scores, ``founds`` and ``values``.
+        """
         num_missing: int
         missing_keys: torch.Tensor
         missing_indices: torch.Tensor
-        missing_scores: torch.Tensor
+        missing_table_ids: torch.Tensor
+        missing_scores: Optional[torch.Tensor]
         founds: torch.Tensor
         output_scores: torch.Tensor
         values: torch.Tensor
@@ -249,6 +587,7 @@ class Storage(abc.ABC, Generic[OptionsT, OptimizerT]):
             num_missing,
             missing_keys,
             missing_indices,
+            missing_table_ids,
             missing_scores,
             founds,
             output_scores,
@@ -374,8 +713,145 @@ class Storage(abc.ABC, Generic[OptionsT, OptimizerT]):
     ]:
         pass
 
+    # ---- the padded contract (optional; see the class docstring) ------------------
+
+    # A class sets it to True in ITS OWN body after implementing ``find_masked`` and
+    # ``insert_masked``; an inherited value does not count (``has_padded_contract``).
+    accepts_empty_keys: bool = False
+
+    def __init_subclass__(cls, **kwargs):
+        super().__init_subclass__(**kwargs)
+        own = cls.__dict__
+        defined = [m for m in ("find_masked", "insert_masked") if m in own]
+        if defined and not own.get("accepts_empty_keys", False):
+            warnings.warn(
+                f"{cls.__name__} defines {' and '.join(defined)} but not "
+                "accepts_empty_keys = True in its class body, so DynamicEmb will not "
+                "call them: it serves the class through find / insert, with one "
+                "blocking read per call.",
+                UserWarning,
+                stacklevel=2,
+            )
+
+    def find_masked(
+        self,
+        keys: torch.Tensor,
+        table_ids: torch.Tensor,
+        copy_mode: CopyMode,
+        lfu_accumulated_frequency: Optional[torch.Tensor] = None,
+        key_scores: Optional[torch.Tensor] = None,
+    ) -> PaddedFind:
+        """Padded ``find``: look up every live row of ``keys``.
+
+        ``founds[i]`` says whether live row ``i`` is stored and ``values[i]`` is its
+        row (``copy_mode`` width); an inert row is not found and its values row is
+        unspecified. ``lfu_accumulated_frequency`` and ``key_scores`` (int64[N] or
+        None) are what ``find`` took, aligned with ``keys``: a store that keeps
+        frequencies or scores may use them, others ignore them. No count is returned
+        or needed and the call must not synchronize.
+
+        The default serves a class that did not declare the padded contract through
+        its ``find``, after one blocking read of the number of live rows.
+        """
+        return OldContractStorage(self).find_masked(
+            keys, table_ids, copy_mode, lfu_accumulated_frequency, key_scores
+        )
+
+    def insert_masked(
+        self,
+        keys: torch.Tensor,
+        table_ids: torch.Tensor,
+        values: torch.Tensor,
+        scores: Optional[torch.Tensor] = None,
+        preserve_existing: bool = False,
+    ) -> None:
+        """Padded ``insert``: upsert the live rows (``values[i]`` is ``[max_value_dim]``,
+        aligned with ``keys``; ``scores`` int64[N] or None). Inert rows store nothing.
+
+        ``scores`` is what the ``missing_scores`` of ``find`` would have been: the
+        batch's frequency or score of the key, where the table has one. With
+        ``preserve_existing=True`` the call refreshes the rows of keys the store
+        already has and changes no score; what it does for a key the store does not
+        hold is unspecified (DynamicEmb sends only keys it has just looked up or
+        inserted).
+
+        The default serves a class that did not declare the padded contract through
+        its ``insert``, after one blocking read of the number of live rows.
+        """
+        OldContractStorage(self).insert_masked(
+            keys, table_ids, values, scores, preserve_existing
+        )
+
+    def lookup_masked(
+        self,
+        unique_keys: torch.Tensor,
+        table_ids: torch.Tensor,
+        lfu_accumulated_frequency: Optional[torch.Tensor] = None,
+        key_scores: Optional[torch.Tensor] = None,
+        copy_mode: CopyMode = CopyMode.VALUE,
+    ) -> MaskedFind:
+        """The lookup half of the protocol the padded lookup code uses: look the keys
+        up now, :meth:`load_masked` the rows later into a buffer of its choosing.
+
+        The default is :meth:`find_masked` (the rows are fetched here and kept in
+        ``MaskedFind.rows``); ``score_in`` is the batch's frequency (or score) tensor
+        a later :meth:`insert_masked` takes as ``scores``.
+        """
+        found = PaddedFind(
+            *self.find_masked(
+                unique_keys,
+                table_ids,
+                copy_mode,
+                lfu_accumulated_frequency,
+                key_scores,
+            )
+        )
+        _check_padded_find(
+            self,
+            unique_keys,
+            found,
+            self.max_embedding_dim()
+            if copy_mode == CopyMode.EMBEDDING
+            else self.max_value_dim(),
+        )
+        score_in = (
+            lfu_accumulated_frequency
+            if lfu_accumulated_frequency is not None
+            else key_scores
+        )
+        return MaskedFind(
+            founds=found.founds, score_in=score_in, scores=None, rows=found.values
+        )
+
+    def load_masked(
+        self,
+        found: MaskedFind,
+        table_ids: torch.Tensor,
+        copy_mode: CopyMode,
+        output: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Write the rows ``found`` fetched into ``output`` (``[N, width]``; the lanes
+        that were not found keep what they hold) or return them as a new buffer."""
+        width = (
+            self.max_embedding_dim()
+            if copy_mode == CopyMode.EMBEDDING
+            else self.max_value_dim()
+        )
+        values = found.rows[:, :width]
+        if output is None:
+            return values
+        output.copy_(
+            torch.where(found.founds.unsqueeze(1), values.to(output.dtype), output)
+        )
+        return output
+
 
 class Cache(abc.ABC):
+    # No code path takes a cache other than ``DynamicEmbCache`` (they read its table
+    # state); a subclass of it opts in with ``accepts_empty_keys = True`` in its own
+    # body, as a storage does (see :class:`Storage`).
+    accepts_empty_keys: bool = False
+
     @abc.abstractmethod
     def lookup(
         self,
@@ -444,7 +920,18 @@ class Counter(abc.ABC):
     """
     Interface of a counter table which maps a key to a counter.
     Supports multi-table via table_ids parameter.
+
+    ``accepts_empty_keys``: True, declared in the counter's own class body (an inherited
+    declaration does not count), says that ``add`` and ``erase`` accept the reserved
+    all-ones key (``-1`` for int64 keys, ``0xFFFFFFFFFFFFFFFF`` for uint64 ones) at any
+    position, with any table id there (``-1`` past the end of a batch), and do nothing for
+    it: ``erase`` removes no key, and ``add`` counts nothing and returns its input
+    frequency. A frequency admitter whose counter declares it passes whole-batch arrays on
+    to it; otherwise the counter is only ever given dense keys, and an ``erase`` of the
+    admitted keys costs one read of how many they are.
     """
+
+    accepts_empty_keys: bool = False
 
     @abc.abstractmethod
     def add(
@@ -601,21 +1088,46 @@ class MultiTableAdmitter(abc.ABC):
     ``frequencies`` holds at them is unspecified. The module ignores the answer
     for those positions. Set it on your own class only if ``admit`` copes with
     all of that, does not count those positions as keys, and returns a mask as
-    long as ``keys``. The module may then mark the rows its initializers must
-    leave alone with a negative index, which only dynamicemb's own initializers
-    are written for, so an admitter whose ``non_admitted_initializer`` is
-    anything else is still called the old way. The attribute is read from the
-    class's own ``__dict__``: a subclass of an admitter that opted in has to
-    opt in itself, so that overriding ``admit`` never inherits a promise the
-    new code did not make.
+    long as ``keys``; what ``state()`` returns has to have declared it too
+    (:class:`Counter`). The attribute is read from the class's own ``__dict__``:
+    a subclass of an admitter that opted in has to opt in itself, so that
+    overriding ``admit`` never inherits a promise the new code did not make.
+    Left False, the module still serves the admitter, with dense keys (only the
+    missing ones, in order) after one blocking read of how many there are per
+    call of ``admit``, which is not made at all when none is missing.
 
     ``uses_rng``: True for an admitter whose ``admit`` draws random numbers.
     The module then never lets timing decide whether to call it for a batch,
     so a seeded run consumes the same draws every time.
+
+    What writes the rows this admitter rejects, ``non_admitted_initializer``, is
+    asked separately: the module marks the rows it must leave alone with a
+    negative index, which only an initializer that declared
+    ``skips_negative_index = True`` in its own class body is written for (the
+    initializers of :mod:`dynamicemb.initializer` all did). Any other is given
+    exact index lists, after one blocking read of how many rows there are.
     """
 
     accepts_empty_keys: bool = False
     uses_rng: bool = False
+
+    def admit_masked(
+        self,
+        keys: torch.Tensor,
+        table_ids: torch.Tensor,
+        frequencies: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """What the lookup paths call: :meth:`admit` over arrays of the batch's length.
+
+        Calls ``admit`` as it is when this admitter declared ``accepts_empty_keys``
+        (and what it holds did); otherwise with the live keys only, dense, and the
+        answer scattered back. The result is a bool mask over ``keys``; the answer for a
+        position that is not a live key means nothing.
+        """
+        # Late: that module imports this one.
+        from dynamicemb.embedding_admission import admit_padded
+
+        return admit_padded(self, keys, table_ids, frequencies)
 
     @abc.abstractmethod
     def admit(
@@ -630,6 +1142,7 @@ class MultiTableAdmitter(abc.ABC):
             keys (torch.Tensor): The keys to decide on, deduplicated. With
                 ``accepts_empty_keys`` also the reserved all-ones key at the
                 positions that are not missing keys; see the class docstring.
+                Without it, only the missing keys, in order.
             table_ids (torch.Tensor): The table each key belongs to. One module
                 spans several, so a decision may be made per table.
             frequencies (Optional[torch.Tensor]): How often each key occurred in

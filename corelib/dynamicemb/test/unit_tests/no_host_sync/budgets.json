@@ -48,13 +48,13 @@
   "eval_miss": {"plain": 0}
  },
  "cache_ps": {
-  "all_hit": {"plain": 2, "prefetch": 2},
+  "all_hit": {"plain": 1, "prefetch": 1},
   "miss": {"plain": 18, "prefetch": 18},
   "miss_evict": {"plain": 21, "prefetch": 21},
   "tier2_hit": {"plain": 18, "prefetch": 18}
  },
  "cache_ps_sum": {
-  "all_hit": {"plain": 2, "prefetch": 2},
+  "all_hit": {"plain": 1, "prefetch": 1},
   "miss": {"plain": 18, "prefetch": 18},
   "miss_evict": {"plain": 21, "prefetch": 21},
   "tier2_hit": {"plain": 18, "prefetch": 18}
@@ -293,5 +293,59 @@
   "miss_evict": {"plain": 0, "prefetch": 0},
   "eval": {"plain": 0},
   "eval_miss": {"plain": 0}
+ },
+ "cache_dps": {
+  "all_hit": {"plain": 0, "prefetch": 0},
+  "miss": {"plain": 0, "prefetch": 0},
+  "miss_evict": {"plain": 0, "prefetch": 0},
+  "tier2_hit": {"plain": 0, "prefetch": 0}
+ },
+ "cache_dps_sum": {
+  "all_hit": {"plain": 0, "prefetch": 0},
+  "miss": {"plain": 0, "prefetch": 0},
+  "miss_evict": {"plain": 0, "prefetch": 0},
+  "tier2_hit": {"plain": 0, "prefetch": 0}
+ },
+ "host_dps": {
+  "all_hit": {"plain": 0, "prefetch": 0},
+  "miss": {"plain": 0, "prefetch": 0},
+  "eval": {"plain": 0},
+  "eval_miss": {"plain": 0}
+ },
+ "cache_storage_chunked": {
+  "all_hit": {"plain": 0, "prefetch": 0},
+  "miss": {"plain": 0, "prefetch": 0},
+  "miss_evict": {"plain": 0, "prefetch": 0},
+  "tier2_hit": {"plain": 0, "prefetch": 0},
+  "eval": {"plain": 0},
+  "eval_miss": {"plain": 0}
+ },
+ "hbm_only_chunked": {
+  "all_hit": {"plain": 0, "prefetch": 0},
+  "miss": {"plain": 0, "prefetch": 0},
+  "miss_evict": {"plain": 0, "prefetch": 0},
+  "eval": {"plain": 0},
+  "eval_miss": {"plain": 0}
+ },
+ "hybrid_chunked": {
+  "all_hit": {"plain": 0, "prefetch": 0},
+  "miss": {"plain": 0, "prefetch": 0},
+  "miss_evict": {"plain": 0, "prefetch": 0},
+  "tier2_hit": {"plain": 0, "prefetch": 0},
+  "eval": {"plain": 0},
+  "eval_miss": {"plain": 0}
+ },
+ "cache_storage_admit_chunked": {
+  "all_hit": {"plain": 0, "prefetch": 0},
+  "miss": {"plain": 0, "prefetch": 0},
+  "miss_evict": {"plain": 0, "prefetch": 0},
+  "eval": {"plain": 0},
+  "eval_miss": {"plain": 0}
+ },
+ "cache_dps_chunked": {
+  "all_hit": {"plain": 0, "prefetch": 0},
+  "miss": {"plain": 0, "prefetch": 0},
+  "miss_evict": {"plain": 0, "prefetch": 0},
+  "tier2_hit": {"plain": 0, "prefetch": 0}
  }
 }

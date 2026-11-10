@@ -51,6 +51,21 @@ FWD_BWD_TEST_FILES=(
     "test/unit_tests/test_check_scores_late.py"
     "test/unit_tests/test_table_rows.py"
     "test/unit_tests/test_write_back_masked.py"
+    # The padded Storage contract (find_masked / insert_masked) and the adapter that
+    # serves a class that has not adopted it.
+    "test/unit_tests/padded_contract/test_storage_adapters.py"
+    # Which participants the padded bodies accept (in-tree classes, a subclass that declares the
+    # contract in its own body, any storage on the DEFAULT path), decided by capability only.
+    "test/unit_tests/padded_contract/test_capability_dispatch.py"
+    # An external storage below the cache and as the only tier, through the padded bodies;
+    # the legacy bodies they replaced are the oracle (test/unit_tests/legacy_oracle.py).
+    "test/unit_tests/padded_contract/test_ps_flows.py"
+    "test/unit_tests/padded_contract/test_host_ps.py"
+    "test/unit_tests/padded_contract/test_user_admitter.py"
+    # The miss path in row chunks (the budget of its buffers) and the environment surface
+    # that feeds the chunk plan.
+    "test/unit_tests/test_miss_path_chunks.py"
+    "test/unit_tests/no_host_sync/test_env_surface.py"
     "test/unit_tests/test_cache_metrics_device.py"
     "test/unit_tests/test_find_load_primitives.py"
     "test/unit_tests/test_int64_weights_channel.py"
@@ -67,12 +82,14 @@ FWD_BWD_TEST_FILES=(
     "test/unit_tests/sync_free/test_initializer_negative_index.py"
     "test/unit_tests/sync_free/test_evicted_prefill.py"
     "test/unit_tests/sync_free/test_padded_buffer_optimizer_tail.py"
-    # Host syncs on the training thread: the static lint and the probe's own logic
-    # need no GPU; the helpers and the padded-array invariants need one; the ratchet
-    # and the acceptance test take a census with the CUDA profiler and compare it
-    # with budgets.json, which a change that removes syncs lowers.
+    # Host syncs on the training thread: the static lint, the list of the reads that
+    # are by design and the probe's own logic need no GPU; the helpers and the
+    # padded-array invariants need one; the ratchet and the acceptance test take a
+    # census with the CUDA profiler and compare it with budgets.json, which a change
+    # that removes syncs lowers.
     "test/unit_tests/no_host_sync/test_host_sync_probe_unit.py"
     "test/unit_tests/no_host_sync/test_sync_free_lint.py"
+    "test/unit_tests/no_host_sync/test_audited_reads.py"
     "test/unit_tests/no_host_sync/test_sync_free_helpers.py"
     "test/unit_tests/no_host_sync/test_tail_invariants.py"
     "test/unit_tests/no_host_sync/test_sorted_insert_syncs.py"

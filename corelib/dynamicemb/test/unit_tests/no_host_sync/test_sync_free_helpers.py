@@ -29,6 +29,7 @@ the module, which is what these tests rely on. The file skips on a tree without
 dynamicemb/sync_free.py.
 """
 import copy
+import inspect
 import pickle
 import time
 
@@ -391,28 +392,62 @@ def test_initialize_masked_fallback_equals_the_capability_path(monkeypatch, dtyp
     assert torch.equal(results[0], results[1])
 
 
+@pytest.mark.parametrize("device", DEVICES)
+@pytest.mark.parametrize("dtype", KEY_DTYPES)
+@pytest.mark.parametrize("chunk", [1, 5, 16, 100])
+def test_initialize_masked_fallback_in_row_chunks_equals_one_block(
+    monkeypatch, device, dtype, chunk
+):
+    """The scratch of the fallback is bounded by the miss-path budget: initialized and copied
+    back in row chunks it gives the result of one block (an initializer sees only its own
+    chunk's keys, table ids and row numbers)."""
+    monkeypatch.setattr(sf, "INIT_SKIPS_NEGATIVE", False)
+    n, emb = 32, 8
+    g = torch.Generator().manual_seed(9)
+    mask = (torch.rand(n, generator=g) < 0.4).to(device)
+    keys = keys_of(list(range(1000, 1000 + n)), dtype, device)
+    ids = (torch.arange(n, device=device) % 4).to(torch.int64)
+    results = []
+    for rows in (None, chunk):
+        monkeypatch.setattr(sf, "CHUNK_ROWS", rows)
+        out = torch.full((n, emb), -1.0, device=device)
+        sf.initialize_masked(RecordingInitializer(False), out, keys, ids, mask)
+        results.append(out.cpu())
+    assert torch.equal(results[0], results[1])
+
+
 # --------------------------------------------------------------------------
 # the miss gate's mode
 # --------------------------------------------------------------------------
-@pytest.mark.parametrize("gate", ["always", "poll", "read"])
+@pytest.mark.parametrize("gate", ["always", "poll"])
 @pytest.mark.parametrize("rng", [False, True])
-@pytest.mark.parametrize("ps", [False, True])
-def test_miss_gate_mode(monkeypatch, gate, rng, ps):
-    monkeypatch.delenv("DEMB_DETERMINISM_MODE", raising=False)
+def test_miss_gate_mode(monkeypatch, gate, rng):
     monkeypatch.setattr(sf, "MISS_GATE", gate)
-    expected = "read" if ps else ("always" if (rng and gate == "poll") else gate)
-    assert sf.miss_gate_mode(rng, ps) == expected
+    assert sf.miss_gate_mode(rng) == ("always" if (rng and gate == "poll") else gate)
 
 
-@pytest.mark.parametrize("gate", ["always", "poll", "read"])
-def test_the_determinism_mode_does_not_change_the_gate(monkeypatch, gate):
-    """The sorted inserts of the mode read nothing, so the mode has no reason to read the
-    miss count first: the gate is what DYNAMICEMB_MISS_PATH_GATE says."""
+@pytest.mark.parametrize("gate", ["always", "poll"])
+@pytest.mark.parametrize("rng", [False, True])
+def test_the_determinism_mode_does_not_change_the_gate(monkeypatch, gate, rng):
     monkeypatch.setattr(sf, "MISS_GATE", gate)
     monkeypatch.delenv("DEMB_DETERMINISM_MODE", raising=False)
-    plain = {rng: sf.miss_gate_mode(rng) for rng in (False, True)}
+    without = sf.miss_gate_mode(rng)
     monkeypatch.setenv("DEMB_DETERMINISM_MODE", "ON")
-    assert {rng: sf.miss_gate_mode(rng) for rng in (False, True)} == plain
+    assert sf.miss_gate_mode(rng) == without
+
+
+def test_no_storage_can_choose_the_gate_and_the_gate_has_no_read_in_it():
+    """What kind of storage is below a step does not decide how the step waits (it used to
+    be a parameter, ``ps``, that made the gate read), and nothing in the gate is a read.
+    """
+    assert list(inspect.signature(sf.miss_gate_mode).parameters) == ["rng"]
+    assert list(inspect.signature(sf.MissGate.begin).parameters) == [
+        "self",
+        "is_miss",
+        "rng",
+    ]
+    for obj in (sf.miss_gate_mode, sf.MissGate, sf._AlwaysGate):
+        assert "read_now" not in inspect.getsource(obj), obj
 
 
 # --------------------------------------------------------------------------
@@ -676,7 +711,6 @@ def masks(n=8, miss_at=3):
 
 @cuda_only
 def test_the_always_gate_does_no_device_work(monkeypatch, read_now_calls):
-    monkeypatch.delenv("DEMB_DETERMINISM_MODE", raising=False)
     monkeypatch.setattr(sf, "MISS_GATE", "always")
     gate = sf.MissGate()
     none, some = masks()
@@ -687,20 +721,23 @@ def test_the_always_gate_does_no_device_work(monkeypatch, read_now_calls):
 
 
 @cuda_only
-def test_the_read_gate_reads_the_count(monkeypatch, read_now_calls):
-    monkeypatch.delenv("DEMB_DETERMINISM_MODE", raising=False)
-    monkeypatch.setattr(sf, "MISS_GATE", "read")
-    gate = sf.MissGate()
+@pytest.mark.parametrize("gate", ["always", "poll"])
+def test_the_gate_reads_nothing_in_the_determinism_mode(
+    monkeypatch, read_now_calls, gate
+):
+    monkeypatch.setenv("DEMB_DETERMINISM_MODE", "ON")
+    monkeypatch.setattr(sf, "MISS_GATE", gate)
+    miss_gate = sf.MissGate()
     none, some = masks()
-    assert gate.needed(gate.begin(none)) is False
-    assert read_now_calls.delta == 1
-    assert gate.needed(gate.begin(some)) is True
-    assert read_now_calls.delta == 2
+    pending = miss_gate.begin(none)
+    torch.cuda.synchronize()
+    assert miss_gate.needed(pending) is (gate == "always")
+    assert miss_gate.needed(miss_gate.begin(some)) is True
+    assert read_now_calls.delta == 0
 
 
 @cuda_only
 def test_the_poll_gate_skips_on_a_landed_zero_only(monkeypatch, read_now_calls):
-    monkeypatch.delenv("DEMB_DETERMINISM_MODE", raising=False)
     monkeypatch.setattr(sf, "MISS_GATE", "poll")
     gate = sf.MissGate()
     none, some = masks()
@@ -718,7 +755,6 @@ def test_the_poll_gate_skips_on_a_landed_zero_only(monkeypatch, read_now_calls):
 def test_the_poll_gate_runs_the_path_when_the_count_has_not_landed(
     monkeypatch, read_now_calls
 ):
-    monkeypatch.delenv("DEMB_DETERMINISM_MODE", raising=False)
     monkeypatch.setattr(sf, "MISS_GATE", "poll")
     gate = sf.MissGate()
     none, _ = masks()
@@ -740,7 +776,6 @@ def test_the_poll_gate_follows_the_stream_the_count_was_produced_on(
     busy the count has not landed, and a slot that still holds an older 0 must not read as "no
     miss": needed() is True then, and True once the count landed, because it is not zero. A skip
     on a stale 0 would leave the keys of a step uninserted and uninitialized."""
-    monkeypatch.delenv("DEMB_DETERMINISM_MODE", raising=False)
     monkeypatch.setattr(sf, "MISS_GATE", "poll")
     gate = sf.MissGate()
     none, some = masks()
@@ -769,7 +804,6 @@ def test_the_poll_gate_follows_the_stream_the_count_was_produced_on(
 @cuda_only
 def test_the_poll_gate_cannot_skip_without_a_ticket(monkeypatch):
     """More steps in flight than the ring has slots: those that got no ticket run the path."""
-    monkeypatch.delenv("DEMB_DETERMINISM_MODE", raising=False)
     monkeypatch.setattr(sf, "MISS_GATE", "poll")
     gate = sf.MissGate()
     none, _ = masks()
@@ -782,7 +816,6 @@ def test_the_poll_gate_cannot_skip_without_a_ticket(monkeypatch):
 
 @cuda_only
 def test_a_probabilistic_admitter_is_never_skipped_by_the_poll_gate(monkeypatch):
-    monkeypatch.delenv("DEMB_DETERMINISM_MODE", raising=False)
     monkeypatch.setattr(sf, "MISS_GATE", "poll")
     gate = sf.MissGate()
     none, _ = masks()

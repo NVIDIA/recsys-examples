@@ -20,7 +20,7 @@ from typing import List, Optional
 
 import torch
 from dynamicemb import sync_free as sf
-from dynamicemb.initializer import _INITIALIZERS, MultiTableInitializer
+from dynamicemb.initializer import MultiTableInitializer
 from dynamicemb.scored_hashtable import (
     ScoreArg,
     ScorePolicy,
@@ -36,7 +36,9 @@ from dynamicemb.types import (
     DynamicEmbInitializerMode,
     MemoryType,
     MultiTableAdmitter,
+    _live_rows,
     group_key_of,
+    has_padded_contract,
 )
 from dynamicemb_extensions import flagged_compact
 
@@ -77,6 +79,9 @@ class MultiTableKVCounter(Counter):
     Accepts a list of per-table ``KVCounter`` configs and creates one hash
     table whose capacity list maps to the individual counters.
     """
+
+    # ``add`` and ``erase`` pass over the reserved key without reading its table id.
+    accepts_empty_keys = True
 
     def __init__(
         self,
@@ -257,6 +262,8 @@ class FrequencyAdmissionStrategy(AdmissionStrategy):
 class MultiTableFrequencyAdmitter(MultiTableAdmitter):
     """What :class:`FrequencyAdmissionStrategy` becomes for one fused module."""
 
+    accepts_empty_keys = True
+
     def __init__(
         self,
         threshold: int,
@@ -281,8 +288,9 @@ class MultiTableFrequencyAdmitter(MultiTableAdmitter):
         :class:`MultiTableKVCounter` skips those, but reports a skipped key's
         input frequency as its count, which can reach the threshold. So the mask
         is only meaningful where the caller asked: the caller has to AND it with
-        its own mask of those positions. Any other counter is only promised
-        dense keys, so with one ``keys`` must hold none of that (see
+        its own mask of those positions. A counter that has not declared
+        ``accepts_empty_keys`` in its own class body is only promised dense
+        keys, so with one ``keys`` must hold none of that (see
         :func:`admitter_accepts_empty_keys`).
         """
         if frequencies is None:
@@ -301,15 +309,17 @@ class MultiTableFrequencyAdmitter(MultiTableAdmitter):
         # A key that got in is no longer waiting, so it stops taking up room.
         # Erasing it here keeps the counter's whole lifecycle in the one place
         # that knows the counter exists.
-        if type(self._counter) is MultiTableKVCounter:
+        if has_padded_contract(self._counter):
             # The counter's erase passes over the reserved key without reading
             # its table id, so blank the keys that stay instead of compacting
             # the admitted ones: compacting would read their count back to the
             # host on every call.
             self._counter.erase(sf.mask_keys(keys, admit_mask), table_ids)
         else:
-            # A counter of the user's own is only promised dense keys. Exact
-            # type, not isinstance: a subclass may override erase.
+            # A counter that did not declare the promise (its own class body, not
+            # an inherited one: a subclass may override erase) is only promised
+            # dense keys: ``erase`` takes the admitted keys compacted, which reads
+            # their count. By the counter's contract.
             _, _, (admitted_keys, admitted_table_ids) = flagged_compact(
                 admit_mask, [keys, table_ids]
             )
@@ -387,6 +397,7 @@ class MultiTableProbabilisticAdmitter(MultiTableAdmitter):
     # admit draws from torch.rand, so the module must not let timing decide
     # whether it runs: a seeded run would then draw a different amount each time.
     uses_rng = True
+    accepts_empty_keys = True
 
     def __init__(self, probability: float, non_admitted_initializer=None):
         self._probability = probability
@@ -433,45 +444,75 @@ class MultiTableProbabilisticAdmitter(MultiTableAdmitter):
         return self._non_admitted_initializer
 
 
-# The admitters of this module, written against the contract of
-# ``MultiTableAdmitter.accepts_empty_keys``: ``admit`` tolerates the reserved
-# all-ones key and a table id of -1. They are told apart by their exact type, so
-# a user's subclass of one of these, which may override ``admit``, is not in it.
-# Being in it is necessary but not enough, because an admitter hands those
-# arrays on to others: ask :func:`admitter_accepts_empty_keys`.
-IN_TREE_ADMITTERS = (MultiTableFrequencyAdmitter, MultiTableProbabilisticAdmitter)
-
-
 def admitter_accepts_empty_keys(admitter: Optional[MultiTableAdmitter]) -> bool:
     """Whether the module may call ``admitter.admit`` with whole-batch arrays.
 
-    That is the contract of :attr:`MultiTableAdmitter.accepts_empty_keys`. The
-    class alone does not settle it, because the arrays go on to what the
-    admitter holds:
+    That is the contract of :attr:`MultiTableAdmitter.accepts_empty_keys`: the class
+    declared it in its own body, and so did what the admitter hands the arrays on to,
+    its ``state()`` (the counter of a frequency admitter): one built by hand around a
+    counter of the user's own, or around a subclass of the built-in one that did not
+    redeclare the promise, has been promised dense keys like any other ``Counter``.
+    ``None``, no admission at all, has nothing to call.
 
-    * The frequency admitter passes them to its counter, and only the built-in
-      :class:`MultiTableKVCounter` skips the reserved key. One built by hand
-      around a counter of the user's own, or around a subclass of the built-in
-      one, has been promised dense keys like any other ``Counter``.
-    * The module may call ``non_admitted_initializer`` with a negative index at
-      every row it must leave alone, which only the initializers of
-      :mod:`dynamicemb.initializer` are written for.
-
-    Both are matched by exact type, as the admitters are. ``None``, no admission
-    at all, has nothing to call. An admitter that is not in
-    :data:`IN_TREE_ADMITTERS` qualifies only by an ``accepts_empty_keys`` in its
-    own class ``__dict__``, never an inherited one.
+    An admitter for which this is False is not refused: :func:`admit_padded` serves it
+    with dense keys, after one read of how many keys it is asked about. What its
+    ``non_admitted_initializer`` is promised is a separate question, see
+    :func:`initializer_needs_dense_rows`.
     """
     if admitter is None:
         return True
-    kind = type(admitter)
-    if kind in IN_TREE_ADMITTERS:
-        if (
-            kind is MultiTableFrequencyAdmitter
-            and type(admitter.state()) is not MultiTableKVCounter
-        ):
-            return False
-    elif not kind.__dict__.get("accepts_empty_keys", False):
+    if not has_padded_contract(admitter):
         return False
-    initializer = admitter.non_admitted_initializer
-    return initializer is None or type(initializer) in _INITIALIZERS.values()
+    held = admitter.state()
+    return held is None or has_padded_contract(held)
+
+
+def admit_padded(
+    admitter: MultiTableAdmitter,
+    keys: torch.Tensor,
+    table_ids: torch.Tensor,
+    frequencies: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """``admitter.admit`` over arrays of the batch's length: the bool mask over ``keys``.
+
+    ``keys`` holds the reserved key at every position that is not asked about (and table
+    id ``-1`` past the batch), as for ``accepts_empty_keys``. An admitter that declared
+    it (and holds only what declared it) is called with the arrays as they are. Any other
+    is promised the missing keys only, dense and in order: the number of live keys is read
+    once (``types._live_rows``, by the admitter's contract), ``admit`` is called with
+    that many, and its answer is scattered back. The answer for a position that was not
+    asked about means nothing; the caller ANDs it with its own mask. With no live key
+    ``admit`` is not called.
+    """
+    if admitter_accepts_empty_keys(admitter):
+        return admitter.admit(keys, table_ids, frequencies)
+    count, positions, dense = _live_rows(keys, table_ids, frequencies)
+    admitted = torch.zeros(keys.numel(), dtype=torch.bool, device=keys.device)
+    if count == 0:
+        return admitted
+    dense_keys, dense_table_ids, dense_frequencies = dense
+    admitted[positions] = admitter.admit(
+        dense_keys, dense_table_ids, dense_frequencies
+    ).to(device=keys.device, dtype=torch.bool)
+    return admitted
+
+
+def initializer_needs_dense_rows(initializer) -> bool:
+    """Whether a non-admitted-row initializer has to be called with exact index lists.
+
+    The module marks the rows an initializer must leave alone with a negative index, which
+    an initializer says it understands by declaring ``skips_negative_index = True`` in its own
+    class body (the five of :mod:`dynamicemb.initializer` do). Any other was written for index
+    lists that name only the rows to write, where a negative index is an out-of-bounds write:
+    ``sync_free.initialize_masked(dense=True)`` gives it those, after one read of how many
+    rows there are. ``None``, no initializer of the admitter's own, needs nothing.
+    """
+    return initializer is not None and not has_skips_negative_index(initializer)
+
+
+def has_skips_negative_index(initializer) -> bool:
+    """Whether the class of ``initializer`` declared ``skips_negative_index = True`` in its
+    own body (an inherited declaration does not count, as for ``accepts_empty_keys``).
+    """
+    cls = initializer if isinstance(initializer, type) else type(initializer)
+    return bool(cls.__dict__.get("skips_negative_index", False))
