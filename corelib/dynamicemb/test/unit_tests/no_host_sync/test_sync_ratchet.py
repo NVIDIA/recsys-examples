@@ -158,6 +158,37 @@ def test_a_census_clears_the_claims_it_has_measured():
     assert sb.clear_measured_claims({"iters": 8}, everything) == {"iters": 8}
 
 
+def test_a_partial_census_keeps_the_claims_of_the_cases_it_did_not_run():
+    """A report made with ``--scenarios all_hit --modes plain`` measures some cases of a
+    config and leaves the budgets of the others as they were, claims included: the note that
+    they are claims has to stay until every case of the config has been measured."""
+    meta = {"iters": 8, "unmeasured": {"what": "claims", "lowered_to_zero": ["a", "b"]}}
+    expected = [("a", "s", "plain"), ("a", "s", "prefetch"), ("b", "s", "plain")]
+    partial = _report(("a", "s", "plain", 0.0), ("b", "s", "plain", 0.0))
+    kept = sb.clear_measured_claims(meta, partial, expected=expected)
+    assert kept["unmeasured"]["lowered_to_zero"] == ["a"], "a lacks its prefetch case"
+    full = _report(
+        ("a", "s", "plain", 0.0), ("a", "s", "prefetch", 0.0), ("b", "s", "plain", 0.0)
+    )
+    assert sb.clear_measured_claims(meta, full, expected=expected) == {"iters": 8}
+    # a case that is expected and was skipped is not a measurement either
+    skipped = _report(("a", "s", "plain", 0.0), ("b", "s", "plain", 0.0))
+    skipped["results"].append(
+        {"config": "a", "scenario": "s", "mode": "prefetch", "status": "skipped"}
+    )
+    assert sb.clear_measured_claims(meta, skipped, expected=expected)["unmeasured"][
+        "lowered_to_zero"
+    ] == ["a"]
+    # by default the expected cases are the ones the probe measures
+    config, scenario, mode = sb.case_keys()[0]
+    assert len([k for k in sb.case_keys() if k[0] == config]) > 1
+    real = {"unmeasured": {"what": "claims", "lowered_to_zero": [config]}}
+    one = _report((config, scenario, mode, 0.0))
+    assert sb.clear_measured_claims(real, one) == real
+    everything = _report(*[(c, s, m, 0.0) for (c, s, m) in sb.case_keys()])
+    assert sb.clear_measured_claims(real, everything) == {}
+
+
 def test_a_report_with_errors_or_skips_is_handled():
     report = _report(("cache_storage", "all_hit", "plain", 1.0))
     report["results"].append(

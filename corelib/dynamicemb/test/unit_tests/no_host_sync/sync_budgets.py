@@ -46,7 +46,7 @@ import json
 import math
 import os
 import sys
-from typing import Any, Dict, List, NamedTuple, Optional, Tuple
+from typing import Any, Dict, Iterable, List, NamedTuple, Optional, Set, Tuple
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 if HERE not in sys.path:
@@ -256,24 +256,41 @@ def budgets_from_report(
 
 
 def clear_measured_claims(
-    meta: Dict[str, Any], report: Dict[str, Any]
+    meta: Dict[str, Any],
+    report: Dict[str, Any],
+    expected: Optional[Iterable[Case]] = None,
 ) -> Dict[str, Any]:
     """``meta`` without the claims of ``meta["unmeasured"]`` that ``report`` has measured.
 
     A change that lowers a budget before a census could run (a GPU was not at hand) records
     the cells as claims, by config, in ``_meta["unmeasured"]``. A census that covers a
-    config with every one of its cases measured (none skipped, none in error) turns its
-    cells into measurements, so the note that they are claims is dropped for it -- and the
-    whole note when nothing is left, so that it does not outlive the measurement it warns
-    of. ``meta`` is not changed.
+    config with every one of its cases measured turns its cells into measurements, so the
+    note that they are claims is dropped for it -- and the whole note when nothing is left,
+    so that it does not outlive the measurement it warns of. Every case is every one of
+    ``expected`` (by default the cases the probe measures, ``case_keys()``) that is a case
+    of the config: none missing from the report (a census made with ``--scenarios
+    all_hit`` leaves the budgets of the other cases as they were, claims included), none
+    skipped, none in error. ``meta`` is not changed.
     """
     claims = meta.get("unmeasured")
     if not isinstance(claims, dict):
         return meta
+    wanted: Dict[str, Set[Case]] = {}
+    for case in case_keys() if expected is None else expected:
+        wanted.setdefault(case[0], set()).add((case[0], case[1], case[2]))
     statuses: Dict[str, List[str]] = {}
+    done: Dict[str, Set[Case]] = {}
     for result in report["results"]:
         statuses.setdefault(result["config"], []).append(result.get("status", ""))
-    measured = {c for c, states in statuses.items() if all(x == "ok" for x in states)}
+        if result.get("status") == "ok":
+            done.setdefault(result["config"], set()).add(
+                (result["config"], result["scenario"], result["mode"])
+            )
+    measured = {
+        c
+        for c, states in statuses.items()
+        if all(x == "ok" for x in states) and wanted.get(c, set()) <= done.get(c, set())
+    }
     kept = {
         key: [c for c in value if c not in measured]
         if isinstance(value, list)
