@@ -58,8 +58,8 @@ operator per sharding, `HierOutputDist`, does the work (section 7):
   over NVLink inside a node and over InfiniBand between nodes, sent by the
   GPU itself (NCCL GIN). Eight custom kernels move them and wait for peers
   (the *comm kernels*; with many features the first may take two grids
-  beside it); the steps between them are kernels of its own and CUB's sorts and
-  scans (the *planner*). `input_dist()` queues all of it at once. At the
+  beside it); the steps between them are kernels of its own and CUB's radix
+  sorts (the *planner*). `input_dist()` queues all of it at once. At the
   end every owner has a ready KeyedJaggedTensor (KJT) of the keys it looks
   up and the row of each key in its lookup output, and every GPU has the
   per-row maps of the output dist.
@@ -141,7 +141,7 @@ this dist with TorchRec's dists.
   not wait: the one before it pushes its row, the one after it lays out the
   node's items (section 10.2).
   **Planner**: the input dist's other steps, which lay a call out: kernels
-  of its own, and the radix sorts and scans of CUB (NVIDIA's library of GPU
+  of its own, and the radix sorts of CUB (NVIDIA's library of GPU
   algorithms), called from C++ (section 10).
 * **Capacity**: how many keys a part of the op's buffers holds, fixed when
   the op is built: `lookup_keys` and `remote_keys` (section 5). **Need**:
@@ -771,7 +771,7 @@ pipeline's data_dist stream (section 16).
 
 After the bucketize, `input_dist()` queues these steps, in this order, on
 every rank. A *comm* step is a comm kernel (section 10.2); the others are
-the planner's kernels, with CUB's sorts and scans.
+the planner's kernels, with CUB's radix sorts.
 
 | step | kind | what it does | section |
 |---|---|---|---|
@@ -779,13 +779,13 @@ the planner's kernels, with CUB's sorts and scans.
 | `node_key_push` | comm | the bucketize's gather: this rank's keys into their places in its targets' `node_keys` over NVLink; on one node also the requester's map | 10.2 |
 | `node_done` | comm | tells its targets; waits until every requester of the node told it | 10.2 |
 | owner's KJT (one node) | kernel | a copy of the own part of `node_keys` | 10.3 |
-| node dedup | kernels, CUB | the proxy's node-unique keys, rows, the chunks of its stream and their slots | 9, 10.4 |
+| node dedup | kernels | the proxy's node-unique keys, rows, the chunks of its stream and their slots | 9, 10.4 |
 | push order | kernels, CUB | its requesters' push orders and push tables | 10.4 |
 | `rail_exchange` | comm | its count message to each rail peer (a header the same to all, then the peer's own part), and theirs; then the rail layout from the rail's messages: where each proxy's key records land, this owner's KJT layout, where each lookup group's rows lie in its `lookup_rows` (`group_offsets`, `group_shift`), and the group runs of each source node's records here (`fwd_groups`) and of its node's keys at each rail owner (`bwd_groups`); the rail's needs | 10.2, 10.4 |
 | `rail_key_push` | comm | its key records to its rail owners; it does not wait | 10.2 |
 | `node_status_exchange` | comm | the needs and the group shifts of the node's owners; the call's needs | 10.2 |
 | `peer_gather`, twice | comm (and a kernel) | the node's proxy headers, then the requester's gather list and its rows' `remote_map` words | 10.2, 10.4 |
-| requester tables | kernels, CUB | its maps, push order, push tables and remote task offsets | 10.4 |
+| requester tables | kernels | its maps, push order, push tables and remote task offsets | 10.4 |
 | `rail_done` | comm | waits until every rail proxy's key records are in; flushes this rank's key puts | 10.2, 13 |
 | owner tables | kernels | its KJT's keys, the chunks its forward puts, and its row map | 10.4 |
 | status | kernel | the call's status, which the second wait copies to the host | 10.5 |
@@ -1133,20 +1133,25 @@ four. In the backward GPU 3 pushes its gradient rows into GPU 2's
 stream, in the order of section 7.3. Eight of them are the comm kernels,
 and `node_exchange` may take two grids beside it (section 10.2). The planner
 does the rest (`src/hier_output_dist/input_dist/planner.h`): kernels of its
-own and CUB's radix sorts and scans, on the current stream. Each step is one
+own and CUB's radix sorts, on the current stream. Each step is one
 or a few ordinary kernels. A kernel over items (keys, rows, occurrences)
 runs a thread per item; a kernel over a step's small tables (sized by the
 nodes, ranks, features and chunks) runs on one CTA, which loops over them.
 A long scan on one CTA takes its values a tile at a time: each thread reads
 8 consecutive values of the tile before the tile's one block scan, so it
 waits once per tile for its loads (`cta_scan_blocked`, `planner.cuh`). The
-owner's KJT offsets on the rail and the owner's record offsets of each
-other node (a CTA per node) take it. A scan over a count that only the
-device knows (the proxy's scan of its representatives, section 10.4) runs
-on a grid that the host sizes, in two kernels (`slice_sums_kernel`,
+owner's KJT offsets on the rail, the owner's record offsets of each other
+node (a CTA per node) and the proxy's offsets of its chunks' rows and
+reducer tasks take it. A scan over a count that only the device knows (the
+proxy's scans of its representatives and of its keys' rows, section 10.4)
+runs on a grid that the host sizes, in two kernels (`slice_sums_kernel`,
 `slice_scan_kernel`): each CTA takes a slice of the valid items and sums it,
 then each CTA adds the sums of the slices before its own to the offsets in
-its slice, a tile at a time. Neither reads past the count.
+its slice, a tile at a time. Neither reads past the count. Where registers
+are short, a thread takes 32 bytes of values a tile (4 int64 values, or 2
+pairs of them) rather than 8 values, which keeps its kernel to 64
+registers, two CTAs per SM, without spills: in the scan of the proxy's
+keys' rows (an int64 a key, or a pair of them) and in its chunk layout.
 No kernel waits for another CTA: a step that needs every item done goes on
 in its next kernel, or in the kernel's last CTA out. That is the fan-out
 table's counts (section 10.1): each CTA takes a ticket once its items are
@@ -1157,14 +1162,17 @@ capacities and the topology. The counts that only the
 device knows (valid keys, node-unique keys, chunks) stay on the device, and
 no tensor's size depends on them; a kernel reads such a count to bound its
 own loop. So the host reads no device value before the second wait, and no
-step syncs. Entries past the valid ones hold values that no one reads, and
-an index taken from device data is clamped first: a call that does not fit
-runs every step on what arrived and stays in bounds.
+step syncs. Entries past the valid ones hold values that no one reads, but
+for the proxy's tables of `max_chunks` places, which the requesters and the
+reducers read whole: a grid writes their places past the stream's chunks as
+empty places (section 10.4). An index taken from device data is clamped
+first: a call that does not fit runs every step on what arrived and stays
+in bounds.
 
 With the benchmark's configuration (8 features, one owner rule), the
 bucketize queues 22 kernels and copies per call (DynamicEmb's index dedup
 and the fan-out table included), and the steps after it 5 on one node and
-about 40 across nodes (an estimate from the code), CUB's included. The
+about 37 across nodes (an estimate from the code), CUB's included. The
 node's part of a call is three comm kernels (`node_exchange`,
 `node_key_push`, `node_done`); on one node a fourth kernel copies the own
 part. With many features, `node_exchange`'s grids add one or two more.
@@ -1579,6 +1587,36 @@ few occurrences, and fewer than one comparison per occurrence on average.
 The buckets the call takes are at least twice its valid occurrences, so it
 clears and walks no more of the table than its keys need, whatever
 `remote_keys` is.
+
+**Its rows and chunks** take five launches and 15 allocations (14 with
+`rows_per_payload` 1), and no CUB call (`proxy_chunks_and_slots`; with CUB's
+scans over `remote_keys` they took ten and 18). Only the device knows how
+many node-unique keys there are and how many chunks they make. The host
+sizes the tables by `remote_keys` and `max_chunks`, and the kernels read the
+two counts to bound their loops:
+
+* two kernels count the rows before each key, a row per occurrence and at
+  most `max_key_rows`, and its counted rows before it (section 12.1): a scan
+  over slices of the node-unique keys, one slice per CTA, as the scan of the
+  representatives. With `rows_per_payload` above 1 one scan takes both, a
+  pair of sums per value; else the counted rows are the rows;
+* one CTA lays out the chunks of the stream: each owner node's chunks and
+  where its slice of `key_stage` starts, then a thread per chunk, which
+  finds its round by a binary search over the stream's rounds (the most
+  chunks of an owner node), its owner node by the turn of the round, and
+  its keys by two binary searches of the node's counted rows. Two blocked
+  scans over the chunks give the rows and the reducer tasks before each
+  chunk, and a thread per chunk then places it in the ring (section 12.1).
+  It loops over the chunks and the owner nodes, never over `max_chunks`;
+* a thread per key gives it its chunk, its row and its duplicates' first
+  slot there, and its record in `key_stage`, and counts its occurrences in
+  its chunk's pulls. The same kernel, on a grid that the host sizes by the
+  larger of `remote_keys` and `max_chunks`, then writes the places past the
+  stream's chunks as empty places: an empty chunk, an end of 0 in
+  `proxy_header`, and in `reduce_task_offsets` the reducer tasks of all the
+  chunks. The requesters gather all `max_chunks` ends, and the reducers
+  search `reduce_task_offsets` over all `max_chunks` places;
+* a thread per occurrence gives it its slot.
 
 **Names.** A table that holds data from another step is named after that
 data where it came from, with a prefix for where it is now. The requesters
@@ -2374,7 +2412,7 @@ The capacities are the ones in place (section 5), and `row_bytes` and
 | the group runs and the backward's ready counters | `16 × num_nodes × (2 × num_groups + 1) + 8 × max_chunks` | per call |
 | index dedup's fan-out table | about 13 bytes per original key (on this path the deduplicated KJT keeps the original length) | per call |
 | the bucketize, in the caller's pool | at its peak about 36 bytes per key, during the fan-out's sort: its outputs (`inv` and `bucket_feature_of_row`, 8), where it put each row (4), the sort's keys and values in and out (16) and CUB's extra key and value buffers (8); before that the counting sort by owner holds its outputs alone (8) and a count per CTA and owner (at most about 1 MiB), and above 2,047 owners, or where the counting sort's shared memory does not fit the GPU, the radix sort by bucket feature at most 24, its outputs included; for either owner rule, with or without weights | transient |
-| the planner, in the caller's pool | its largest step: across nodes the proxy's, about 64 bytes per entry of `remote_keys` with weights, 60 without (52 when `rows_per_payload` is 1); the requester's holds about 24 bytes per key besides its maps (the gathered `remote_map` words, 12, and the peer and word each comes from, 12), and the owner's adds only its KJT values and row map (per call); on one node nothing per key beyond the per-call tensors | transient |
+| the planner, in the caller's pool | its largest step: across nodes the proxy's, about 64 bytes per entry of `remote_keys` with weights, 52 without; the requester's holds about 24 bytes per key besides its maps (the gathered `remote_map` words, 12, and the peer and word each comes from, 12), and the owner's adds only its KJT values and row map (per call); on one node nothing per key beyond the per-call tensors | transient |
 | the input dist's tables per (rank, feature), in the caller's pool | the bucketize's `offset_per_bucket_feature` and the node layout's `row_shift`, about `8 × world_size × num_features` each (the bucketize writes only each owner's first entry and its node's owners' entries, section 10.1); across nodes, while the proxy's node dedup runs, its block table, about `8 × world_size × num_features` (section 15.4) | transient |
 
 The transient figures come from the code: bytes in live tensors. The
@@ -2390,10 +2428,10 @@ about 52 bytes per entry, 64 with weights: during the insert its hash table
 (the bucket heads, 8 to 16 bytes, and the chain links, 4) and each
 identity's state (24, or 32 with weights), then that state, the
 representatives before each occurrence and its tables per occurrence and
-per key. With `rows_per_payload` above 1, as by default, its next step holds
-each key's counted rows (int32) and the counted rows before each key (int64)
-while it cuts its chunks and gives the slots: about 60 bytes per entry, 64
-with weights, its largest.
+per key. Its next step holds the rows before each key (int64), and with
+`rows_per_payload` above 1, as by default, the counted rows before each key
+(int64), while it cuts its chunks and gives the slots: about 52 bytes per
+entry, 56 with weights, no more than its node dedup.
 
 The constructors of the layouts size the window's buffers as above
 (`CtrlLayout`, `KeysLayout` and `RowsLayout`, in `window.h`). The buffers
@@ -2521,9 +2559,9 @@ sizing rules in the code, with capacities 1.25 times the needs and at least
 section 15.2. It assumes uniform keys, mean loads, no weights, one owner
 rule and 8 GPUs per node; it is not measured. It counts chunks of 2 MiB of
 rows (`rows_per_payload` 1). The default chunks make the chunk tables, a
-small part of each figure, up to `rows_per_payload` times as large, and the
-proxy's step, the planner's largest, about 15% larger (60 bytes per entry of
-`remote_keys` instead of 52, section 15.2). GB per rank.
+small part of each figure, up to `rows_per_payload` times as large; the
+planner's largest step, the proxy's, stays at 52 bytes per entry of
+`remote_keys` (section 15.2). GB per rank.
 "Persistent" is the window: `lookup_rows` + `proxy_rows` + its other
 buffers (the ctrl and keys sections); "per call" is one call's tensors,
 index dedup's fan-out table (about 13 bytes per key) among them;
@@ -2755,10 +2793,14 @@ its `node_keys`, its owner tables: its KJT, the chunks its forward puts, and
 its row map. Both take the lookup groups, and both run the device code of
 `rail_exchange` (`input_dist/rail.cuh`).
 
-One more hook chooses a path of the proxy's step:
+Two more hooks reach into the proxy's steps.
 `hier_output_dist_scan_ctas(ctas)` makes each later proxy step of the
-process run its scan of the representatives (section 10.4) on `ctas` CTAs,
-or as its sizes choose (0).
+process run its scans over a count only the device knows (of the
+representatives and of the keys' rows, section 10.4) on `ctas` CTAs, or as
+their sizes choose (0). `hier_output_dist_proxy_garbage(fill)` makes each
+later proxy step set every bit of the rows before each key, its chunk table
+and its `reduce_task_offsets` before its kernels write them, so a test sees
+a word they leave out, whatever the caching allocator gave.
 
 `test_hier_bucketize.py` plays every rank of one node with the first two
 hooks. Each rank's offsets are those its in channel writes (section 10.1),
@@ -2773,14 +2815,20 @@ the rows cross the rail; each proxy's group runs of its keys at each owner
 equal to that owner's runs of its records (so the backward's puts land
 where the owner's lookup wrote); and with a group per feature, no row map.
 Its proxies meet counts of valid occurrences far below `remote_keys` (20
-times the largest remote part), equal to it, and of 0 in a call that fits
-(a node whose requesters ask only its own owners); 600 and 1,100 features on
-4 nodes (2,400 and 4,400 bucket features at a proxy, most of their blocks
-empty); and the scan of the representatives on 2, 3, 264 and 600 CTAs in
-calls of a few hundred occurrences a proxy (on 264 also at counts of
-`remote_keys` and of 0), and on 1, 2 and 600 CTAs in calls of 11,000 to
-21,000 (on 1 and 2 slices of several tiles; on 600 slices of about 20 to
-35 occurrences, also in the CTAs past a CTA's 512 threads).
+times the largest remote part, so `max_chunks` far above the chunks),
+equal to it, and of 0 in a call that fits (a node whose requesters ask only
+its own owners); 600 and 1,100 features on 4 nodes (2,400 and 4,400 bucket
+features at a proxy, most of their blocks empty); and the scans on 2, 3,
+264 and 600 CTAs in calls of a few hundred occurrences a proxy (on 264 also
+at counts of `remote_keys` and of 0), and on 1, 2 and 600 CTAs in calls of
+4,000 to 21,000 (on 1 and 2 slices of several tiles; on 600 slices of about
+20 to 35 occurrences, also in the CTAs past a CTA's 512 threads), each with
+`rows_per_payload` 1 and above 1 (the rows' scan of a pair of sums). Its
+proxies fill their rows' offsets, chunk tables and `reduce_task_offsets`
+with garbage first (`hier_output_dist_proxy_garbage`), and its windows hold
+garbage before the call, so the checks of the chunk table,
+`reduce_task_offsets` and the header's chunk ends over all `max_chunks`
+places see a word that the proxy leaves out.
 
 ## 19. Limitations
 
@@ -2808,7 +2856,7 @@ calls of a few hundred occurrences a proxy (on 264 also at counts of
   and the hottest owner's need sizes `lookup_keys` on every rank (section
   15).
 * **Host time of the input dist**: across nodes an input dist launches
-  about 70 kernels, CUB's included (section 10; an estimate from the code),
+  about 60 kernels, CUB's included (section 10; an estimate from the code),
   and the training thread spends their host time, also under the train
   pipelines.
 * **Size of one call**: a GPU may receive, deduplicate or look up fewer than
@@ -2950,16 +2998,17 @@ Paths from `corelib/dynamicemb`.
       (`rail_layout_of`), with the two functions that give both the owner's
       and the proxy's group runs (`group_first`, `group_shift_of`);
     * `planner.h`: the planner: the declarations of every step, and of the
-      CUB calls in `cub.cu` (radix sorts and scans); `planner.cuh`: what the
+      CUB calls in `cub.cu` (radix sorts); `planner.cuh`: what the
       planner's kernels share (how they are launched, searches in sorted
       tables, the offsets of sorted runs, a CTA's scans, among them the
       blocked one, `cta_scan_blocked`, and the scans over a count only the
       device knows, `slice_sums_kernel` and `slice_scan_kernel`). The
       bucketize is in `bucketize.cu` and the proxy in `proxy.cu` (with its
       node dedup's hash table, `Identities`, which takes index dedup's
-      chained insert from `src/dedup_chain.cuh`, the hook that sets the
-      CTAs of its scan of the representatives, `force_scan_ctas`, and the
-      rounds of its chunks, cut by counted rows, `Rounds`); the node
+      chained insert from `src/dedup_chain.cuh`, the hooks that set the
+      CTAs of its scans, `force_scan_ctas`, and fill tables of its second
+      step with garbage first, `fill_proxy_garbage`, and the rounds of its
+      chunks, cut by counted rows, `Rounds`); the node
       layout, the push, the count message and the rail layout as the hooks
       run them (`node_layout`, `push_to_node_keys`, `count_message`,
       `rail_layout`), the owner's KJT on one node (`one_node_owner`), the

@@ -20,8 +20,10 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 // proxy, rail and requester steps across nodes. Last, a hook that makes the
 // next construction fail, a hook that delays the reads of node_offsets and
 // node_keys of later input dists, hooks that choose the paths of later ones
-// (node_exchange's, and the CTAs of the proxy's scan), and the GPU clock the
-// benchmark aligns timelines by (a build with DYNAMICEMB_HIER_TRACE=1).
+// (node_exchange's, and the CTAs of the proxy's scans), a hook that fills
+// tables of the proxy's with garbage before its kernels write them, and the
+// GPU clock the benchmark aligns timelines by (a build with
+// DYNAMICEMB_HIER_TRACE=1).
 
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
@@ -570,9 +572,15 @@ void bind_testing(py::module &py_module) {
                 "as their sizes choose (-1)",
                 py::arg("push"), py::arg("items"));
   py_module.def("hier_output_dist_scan_ctas", &force_scan_ctas,
-                "Each later proxy step of this process runs its scan of the representatives on "
-                "ctas CTAs, or as its sizes choose (0)",
+                "Each later proxy step of this process runs its scans over a device count (of the "
+                "representatives and of the keys' rows) on ctas CTAs, or as their sizes choose (0)",
                 py::arg("ctas"));
+  py_module.def("hier_output_dist_proxy_garbage", &fill_proxy_garbage,
+                "With fill, each later proxy step of this process sets every bit of the rows "
+                "before each key, its chunk tables and reduce_task_offsets before its kernels "
+                "write them, so a word they leave out shows (False: as the caching allocator "
+                "gives them)",
+                py::arg("fill"));
   py_module.def(
       "hier_output_dist_proxy_plan", &proxy_plan_test,
       "One proxy's steps of a call across nodes on plain tensors, which it writes as "

@@ -16,7 +16,7 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 ******************************************************************************/
 // The planner: the steps of a call between and around the comm kernels, on
 // the current stream: kernels of their own (what they share: planner.cuh)
-// and CUB's radix sorts and scans (cub.cu), none of which waits for the
+// and CUB's radix sorts (cub.cu), none of which waits for the
 // device. The bucketize, the owner's KJT on one node, the proxy, the rail and
 // the owner, and the requester. node_exchange makes the node
 // layout (node_layout_small and node_layout_items, node.cuh); node_layout()
@@ -45,11 +45,6 @@ namespace hier_output_dist {
 // must not be negative.
 std::pair<at::Tensor, at::Tensor> sort_pairs(const at::Tensor &keys, const at::Tensor &values,
                                              int end_bit);
-// A sort of int64 keys (not negative) by their bits [0, end_bit).
-at::Tensor sort_keys(const at::Tensor &keys, int end_bit);
-// The offsets of n counts (bool or int32), [0, c0, c0 + c1, ...]: n + 1
-// entries, int64 (or int32 when their sum stays below 2^31).
-at::Tensor offsets_of(const at::Tensor &counts, at::ScalarType dtype = at::kLong);
 
 // The bucketize of a call (the requester's, local, on the caller's stream):
 // its keys by owner, as TorchRec's bucketize orders them (a counting sort by
@@ -325,10 +320,6 @@ struct ProxyKeys {
 // node, the smallest of them. Weights must be whole numbers (frequency
 // counts): they are summed as int64.
 ProxyKeys proxy_keys(const ProxyInput &input, const Sizes &sizes, bool node_dedup);
-// A test hook (testing.cu): each later proxy_keys of this process runs its scan of the
-// representatives (slice_sums_kernel and slice_scan_kernel, planner.cuh) on `ctas` CTAs, or as
-// its sizes choose (0: a thread per entry of remote_keys, at most two CTAs per SM).
-void force_scan_ctas(int64_t ctas);
 
 // Step 2: the rows of the keys, the chunks of the stream and where they
 // lie, each occurrence's slot. A key's rows are its key row and its
@@ -337,7 +328,11 @@ void force_scan_ctas(int64_t ctas);
 // its occurrences take its key row). Writes remote_map's key rows and
 // slots, the chunks and records of key_stage, and the proxy header's chunks,
 // end and ends; drops keys.node_unique_keys and keys.node_unique_key_weights, which only the
-// records need, and keys.occurrence_rank, which only the slots need.
+// records need, and keys.occurrence_rank, which only the slots need. The scan of the keys' rows
+// and the chunks' loops take the node-unique keys and the stream's chunks alone (the kernels read
+// their counts, and the host sizes the tables by remote_keys and max_chunks); a grid writes the
+// places of the tables of max_chunks entries past the chunks as empty places: an empty Chunk, an
+// end of 0 in the proxy header, and the reducer tasks of all the chunks.
 struct ProxyChunks {
   at::Tensor num_chunks;  // int64 0-dim: the chunks of the stream
   at::Tensor chunks;      // int32 [max_chunks][8]: Chunk, in stream order (zeros past them)
@@ -349,12 +344,23 @@ struct ProxyChunks {
   at::Tensor stage_offset_per_bucket;  // int64 [num_nodes]: where its slice for each owner node
                                        // starts in key_stage (bytes)
   at::Tensor reduce_task_offsets;  // int64 [max_chunks + 1]: the reducers' tasks before each chunk
-  at::Tensor node_exp_off;         // int64 [remote_keys + 1]: the rows before each key
+  at::Tensor node_exp_off;         // int64 [remote_keys + 1]: the rows before each key, up to
+                                   // node_num_uniques (garbage past it)
   at::Tensor key_chunk;            // int32 [remote_keys]: the chunk of each key
   at::Tensor requester_of;         // int32 [remote_keys]: the requester of each occurrence
 };
 ProxyChunks proxy_chunks_and_slots(ProxyKeys &keys, const at::Tensor &remote_offsets,
                                    const ProxyBuffers &buffers, const Sizes &sizes);
+// Test hooks (testing.cu). Each later proxy step of this process runs its scans over a device
+// count (slice_sums_kernel and slice_scan_kernel, planner.cuh: proxy_keys' of the
+// representatives, proxy_chunks_and_slots' of the keys' rows) on `ctas` CTAs, or as their sizes
+// choose (0: a thread per entry of remote_keys, at most two CTAs per SM).
+void force_scan_ctas(int64_t ctas);
+// With `fill`, each later proxy_chunks_and_slots of this process sets every bit of its rows'
+// offsets (node_exp_off and the counted rows'), its chunk tables and reduce_task_offsets before
+// its kernels write them, so a test sees a word they leave out (false: as the caching allocator
+// gives them).
+void fill_proxy_garbage(bool fill);
 
 // What the call keeps of the proxy.
 struct ProxyPlan {
@@ -372,8 +378,8 @@ struct ProxyPlan {
   at::Tensor reduce_task_offsets;  // int64 [max_chunks + 1]: its reducers' tasks before each chunk
                                    // (32 keys each)
   at::Tensor node_exp_off;         // int64 [remote_keys + 1]: the rows before each key
-                                   // (ProxyChunks::node_exp_off): key u's are its key row, then its
-                                   // duplicates' slots in order
+                                   // (ProxyChunks::node_exp_off, up to node_num_uniques): key u's
+                                   // are its key row, then its duplicates' slots in order
 };
 // Step 3: each requester's push order (one stable sort by its part, a
 // requester and a chunk) and its push tables. Writes remote_map's positions

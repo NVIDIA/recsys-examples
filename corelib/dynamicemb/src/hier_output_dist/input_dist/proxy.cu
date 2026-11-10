@@ -421,29 +421,63 @@ __global__ void __launch_bounds__(kThreads)
 
 // ── step 2: the rows, the chunks and the slots ──
 
-// A thread per key index: its rows in proxy_rows, one for each occurrence, at
-// most max_key_rows (a call with more raises: kNeedKeyRows), and with
-// `counted_rows` its counted rows in its chunk, its rows but at least
-// rows_per_payload (Sizes::max_counted_rows); 0 past the node-unique keys.
-// Without `counted_rows` rows_per_payload is 1: the counted rows are the rows.
-__global__ void __launch_bounds__(kThreads)
-    key_row_counts_kernel(const int64_t *node_num_uniques, const int32_t *key_occurrences,
-                          int64_t entries, int32_t max_key_rows, int32_t rows_per_payload,
-                          int32_t *rows, int32_t *counted_rows) {
-  const int64_t valid_keys = *node_num_uniques;
-  for (int64_t key = first_item(); key < entries; key += item_stride()) {
-    const bool valid = key < valid_keys;
-    const int32_t row_count = valid ? min(key_occurrences[key], max_key_rows) : 0;
-    rows[key] = row_count;
-    if (counted_rows != nullptr) counted_rows[key] = valid ? max(row_count, rows_per_payload) : 0;
+// The scan of the keys' rows (slice_sums_kernel, slice_scan_kernel) over the
+// node-unique keys: each key's rows in proxy_rows, one for each occurrence, at
+// most max_key_rows (a call with more raises: kNeedKeyRows), and its counted
+// rows in its chunk, its rows but at least rows_per_payload
+// (Sizes::max_counted_rows), the two in one value (RowCounts). Both kernels
+// read each key's occurrences. The scan writes the rows before each key
+// (node_exp_off, int64 [remote_keys + 1]) and the counted rows before each key
+// (counted_off, the same), and at node_num_uniques all of them; past it the
+// tables hold garbage, which no step reads. With rows_per_payload 1 the
+// counted rows are the rows: the scan takes the rows alone (KeyRows), and
+// counted_off is node_exp_off.
+struct RowCounts {
+  int64_t rows, counted;
+  RowCounts() = default;
+  __host__ __device__ RowCounts(int zero) : rows(zero), counted(zero) {}  // the scans' 0
+  __host__ __device__ RowCounts(int64_t key_rows, int64_t counted_rows)
+      : rows(key_rows), counted(counted_rows) {}
+  __host__ __device__ RowCounts operator+(const RowCounts &other) const {
+    return RowCounts(rows + other.rows, counted + other.counted);
   }
-}
+  __host__ __device__ RowCounts &operator+=(const RowCounts &other) {
+    return *this = *this + other;
+  }
+};
+struct KeyRows {
+  const int32_t *key_occurrences;
+  int32_t max_key_rows;
+  __device__ int64_t operator()(int64_t key) const {
+    return min(key_occurrences[key], max_key_rows);
+  }
+};
+struct KeyRowCounts {
+  KeyRows key_rows;
+  int32_t rows_per_payload;
+  __device__ RowCounts operator()(int64_t key) const {
+    const int64_t rows = key_rows(key);
+    return RowCounts(rows, max(rows, (int64_t)rows_per_payload));
+  }
+};
+struct RowsBefore {
+  int64_t *node_exp_off;
+  __device__ void operator()(int64_t key, int64_t rows) const { node_exp_off[key] = rows; }
+};
+struct RowCountsBefore {
+  int64_t *node_exp_off, *counted_off;
+  __device__ void operator()(int64_t key, RowCounts before) const {
+    node_exp_off[key] = before.rows;
+    counted_off[key] = before.counted;
+  }
+};
 
 // The rounds of the proxy's stream (common.h): chunk j of an owner node, in the
 // stream's round j, takes its keys whose counted rows before them, among the
 // node's, are in [j * span, (j + 1) * span) (span: Sizes::chunk_span); a key
 // counts at most span rows, so no chunk is empty. A chunk's rows are its keys'
-// rows (node_exp_off).
+// rows (node_exp_off). The stream has as many rounds as an owner node has
+// chunks at most.
 struct Rounds {
   const int64_t *counted_off;              // [entries + 1]: the counted rows before each key
   const int64_t *node_exp_off;             // [entries + 1]: the rows before each key
@@ -473,7 +507,9 @@ struct Rounds {
 };
 
 // The chunks of the proxy's stream, made by one CTA (chunk_layout_kernel) in
-// three steps.
+// three steps. They loop over the owner nodes and the stream's chunks
+// (num_chunks), not over max_chunks: the tables' places past the chunks are
+// key_rows_kernel's.
 struct ChunkLayoutArgs {
   Rounds rounds;                          // its chunk_length_per_bucket is the first step's
   const int64_t *node_length_per_bucket;  // [num_nodes]
@@ -496,8 +532,10 @@ struct ChunkLayoutArgs {
 // Each owner node's chunks (the round of its last key, plus one; none for
 // this node), where they start in chunk_inv, the stream's chunks (to the
 // proxy header too), and where each owner node's slice starts in key_stage:
-// its chunks (OwnerChunk), then its keys' records. Every thread of the CTA.
-__device__ void chunk_counts(const ChunkLayoutArgs &args) {
+// its chunks (OwnerChunk), then its keys' records. Returns the stream's
+// rounds, the most chunks of an owner node, to every thread. Every thread of
+// the CTA.
+__device__ int64_t chunk_counts(const ChunkLayoutArgs &args) {
   const Rounds &rounds = args.rounds;
   const int64_t num_nodes = rounds.num_nodes, node = args.node, max_chunks = args.max_chunks,
                 record_bytes = args.record_bytes;
@@ -522,15 +560,17 @@ __device__ void chunk_counts(const ChunkLayoutArgs &args) {
     *args.num_chunks = min(total, max_chunks);
     *args.header_num_chunks = (int32_t)min(total, max_chunks);
   }
+  return cta_max<int64_t>(num_nodes, chunks_of, 0);
 }
 
-// A thread per place c of the stream: its chunk, of round j and owner node o
-// (the rounds below j hold before(j) chunks, and in round j the owner nodes
-// with more than j chunks come in turn from the node after the proxy's own:
-// node + 1, node + 2, ... mod num_nodes); zeros past the chunks. Its keys
+// A thread per chunk c of the stream (num_chunks of them), of round j and
+// owner node o (the rounds below j hold before(j) chunks, and in round j the
+// owner nodes with more than j chunks come in turn from the node after the
+// proxy's own: node + 1, node + 2, ... mod num_nodes): its keys
 // (key_rows_kernel adds their occurrences, the rows its requesters pull),
 // its rows (rows_of, for the stream's scan), its reducer tasks of 32 keys,
-// and its place among its owner node's (chunk_inv).
+// and its place among its owner node's (chunk_inv). The rounds are those of
+// chunk_counts (num_rounds): every chunk's is below.
 // The agents take the stream in order on every node at about the same pace,
 // so with the turn the proxies of a rail mostly serve different owner nodes
 // at a place of a round. In node order they would serve the same owner node
@@ -538,70 +578,69 @@ __device__ void chunk_counts(const ChunkLayoutArgs &args) {
 // (backward), or send to several proxies (forward, grants of a stream that
 // wraps the ring), while the other NICs of the rail would sit idle. DeepEP
 // turns its RDMA peers the same way against this incast.
-__device__ void chunk_table(const ChunkLayoutArgs &args) {
+__device__ void chunk_table(const ChunkLayoutArgs &args, int64_t num_rounds) {
   const Rounds &rounds = args.rounds;
   const int64_t count = *args.num_chunks, max_chunks = args.max_chunks;
-  for (int64_t place = threadIdx.x; place < max_chunks; place += kThreads) {
-    Chunk chunk{};
-    int64_t rows = 0;
-    if (place < count) {
-      // the round: the last j whose rounds below hold at most `place` chunks
-      int64_t lo = 0, hi = max_chunks;
-      while (lo < hi) {
-        const int64_t mid = (lo + hi + 1) / 2;
-        if (rounds.before(mid) <= place)
-          lo = mid;
-        else
-          hi = mid - 1;
-      }
-      const int64_t round = lo;
-      int64_t rank = place - rounds.before(round), owner_node = args.node;
-      for (int64_t turn = 1; turn < rounds.num_nodes; ++turn) {
-        owner_node = (args.node + turn) % rounds.num_nodes;
-        if (rounds.chunk_length_per_bucket[owner_node] > round && rank-- == 0) break;
-      }
-      const int64_t first = rounds.node_offset_per_bucket[owner_node];
-      const int64_t lo_key = first + rounds.first_key(owner_node, round),
-                    hi_key = first + rounds.first_key(owner_node, round + 1);
-      chunk.owner_node = (int32_t)owner_node;
-      chunk.key_lo = (int32_t)lo_key;
-      chunk.keys = (int32_t)(hi_key - lo_key);
-      chunk.round = (int32_t)round;
-      rows = rounds.node_exp_off[hi_key] - rounds.node_exp_off[lo_key];
-      args.chunk_inv[clamp_index(args.chunk_offset_per_bucket[owner_node] + round, max_chunks)] =
-          (int32_t)place;
+  for (int64_t place = threadIdx.x; place < count; place += kThreads) {
+    // the round: the last j whose rounds below hold at most `place` chunks
+    // (below num_rounds, whose rounds below hold all of them)
+    int64_t lo = 0, hi = num_rounds;
+    while (lo < hi) {
+      const int64_t mid = (lo + hi + 1) / 2;
+      if (rounds.before(mid) <= place)
+        lo = mid;
+      else
+        hi = mid - 1;
     }
+    const int64_t round = lo;
+    int64_t rank = place - rounds.before(round), owner_node = args.node;
+    for (int64_t turn = 1; turn < rounds.num_nodes; ++turn) {
+      owner_node = (args.node + turn) % rounds.num_nodes;
+      if (rounds.chunk_length_per_bucket[owner_node] > round && rank-- == 0) break;
+    }
+    const int64_t first = rounds.node_offset_per_bucket[owner_node];
+    const int64_t lo_key = first + rounds.first_key(owner_node, round),
+                  hi_key = first + rounds.first_key(owner_node, round + 1);
+    Chunk chunk{};
+    chunk.owner_node = (int32_t)owner_node;
+    chunk.key_lo = (int32_t)lo_key;
+    chunk.keys = (int32_t)(hi_key - lo_key);
+    chunk.round = (int32_t)round;
     args.chunks[place] = chunk;
-    args.rows_of[place] = rows;
+    args.rows_of[place] = rounds.node_exp_off[hi_key] - rounds.node_exp_off[lo_key];
     args.reduce_tasks[place] = ceil_div<kTaskRows>((int64_t)chunk.keys);
+    args.chunk_inv[clamp_index(args.chunk_offset_per_bucket[owner_node] + round, max_chunks)] =
+        (int32_t)place;
   }
 }
 
 // The offsets of the stream's chunks' rows, in stream order (stream_offsets,
 // from rows_of), and the reducer tasks before each chunk (reduce_task_offsets,
-// from reduce_tasks); then, a thread per place c of the stream, where its
-// chunk lies, unwrapped. A stream that fits the ring (ring rows) lies as it
-// is; else lap k takes the chunks whose rows before them are in
+// from reduce_tasks), each a blocked scan over the chunks (cta_scan_blocked)
+// and its total at the chunks' end; then, a thread per chunk c of the stream,
+// where it lies, unwrapped. A stream that fits the ring (ring rows) lies as
+// it is; else lap k takes the chunks whose rows before them are in
 // [k * lap_span, (k + 1) * lap_span), from position k * ring, one after
 // another. Its start and end into its Chunk, its end into the proxy header,
 // and its OwnerChunk, at its round, first in its owner node's slice of
 // key_stage; the stream's end into the header. Every thread of the CTA.
 __device__ void chunk_places(const ChunkLayoutArgs &args) {
-  const int64_t max_chunks = args.max_chunks, ring = args.ring, lap_span = args.lap_span;
+  const int64_t count = *args.num_chunks, ring = args.ring, lap_span = args.lap_span;
   const int64_t *stream_offsets = args.stream_offsets,
                 *node_offset_per_bucket = args.rounds.node_offset_per_bucket;
-  cta_offsets_of<int64_t>(
-      max_chunks, [&](int64_t place) { return args.rows_of[place]; }, args.stream_offsets);
-  cta_offsets_of<int64_t>(
-      max_chunks, [&](int64_t place) { return args.reduce_tasks[place]; },
-      args.reduce_task_offsets);
-  const int64_t count = *args.num_chunks, total = stream_offsets[count];
-  if (threadIdx.x == 0 && count == 0) *args.header_end = 0;
-  for (int64_t place = threadIdx.x; place < max_chunks; place += kThreads) {
-    if (place >= count) {
-      args.header_ends[place] = 0;
-      continue;
-    }
+  const int64_t total = cta_scan_blocked<scan_items<int64_t>(), int64_t>(
+      count, [&](int64_t place) { return args.rows_of[place]; },
+      [&](int64_t place, int64_t offset) { args.stream_offsets[place] = offset; });
+  const int64_t tasks = cta_scan_blocked<scan_items<int64_t>(), int64_t>(
+      count, [&](int64_t place) { return args.reduce_tasks[place]; },
+      [&](int64_t place, int64_t offset) { args.reduce_task_offsets[place] = offset; });
+  if (threadIdx.x == 0) {
+    args.stream_offsets[count] = total;
+    args.reduce_task_offsets[count] = tasks;
+    if (count == 0) *args.header_end = 0;
+  }
+  __syncthreads();
+  for (int64_t place = threadIdx.x; place < count; place += kThreads) {
     int64_t start = stream_offsets[place];
     if (total > ring) {
       const int64_t lap = stream_offsets[place] / lap_span;
@@ -622,9 +661,9 @@ __device__ void chunk_places(const ChunkLayoutArgs &args) {
 
 // One CTA: the chunks of the proxy's stream, their table and their places.
 __global__ void __launch_bounds__(kThreads) chunk_layout_kernel(ChunkLayoutArgs args) {
-  chunk_counts(args);
+  const int64_t num_rounds = chunk_counts(args);
   __syncthreads();
-  chunk_table(args);
+  chunk_table(args, num_rounds);
   __syncthreads();
   chunk_places(args);
 }
@@ -643,13 +682,20 @@ __device__ __forceinline__ int64_t duplicates_between(const int64_t *node_exp_of
 // and its Record (KeyRecord, or WeightedKeyRecord with its weight) in its
 // owner node's slice of key_stage, after the node's chunks. Its occurrences
 // add to its chunk's pulls, a sum per chunk of a warp's keys.
+// Then a thread per place of the stream past its chunks (from num_chunks to
+// max_chunks), which chunk_layout_kernel leaves, as an empty place: an empty
+// Chunk, an end of 0 in the proxy header, and the reducer tasks of every
+// chunk before it (reduce_task_offsets). The reducers' task search
+// (TaskPlace) and the requesters read these words. A valid key's chunk is
+// below num_chunks, so its pulls never meet them.
 template <typename Record>
 __global__ void __launch_bounds__(kThreads)
     key_rows_kernel(Rounds rounds, const int32_t *key_node, const int32_t *key_occurrences,
                     const int64_t *node_unique_keys, const float *node_unique_key_weights,
                     const int32_t *chunk_inv, const int64_t *chunk_offset_per_bucket,
                     const int64_t *stage_offset_per_bucket, const int64_t *node_num_uniques,
-                    int64_t max_chunks, int64_t ring, Chunk *chunks, int32_t *key_chunk,
+                    const int64_t *num_chunks, int64_t max_chunks, int64_t ring, Chunk *chunks,
+                    uint32_t *header_ends, int64_t *reduce_task_offsets, int32_t *key_chunk,
                     int32_t *key_row, int32_t *first_duplicate_slot, char *key_stage) {
   const int64_t valid_keys = *node_num_uniques;
   const int lane = threadIdx.x & 31;
@@ -685,6 +731,12 @@ __global__ void __launch_bounds__(kThreads)
     const unsigned same = __match_any_sync(0xffffffffu, place);
     const int32_t pulls = __reduce_add_sync(same, occurrences);
     if (place >= 0 && lane == __ffs(same) - 1) atomicAdd(&chunks[place].pulls, pulls);
+  }
+  const int64_t count = *num_chunks, tasks = reduce_task_offsets[count];
+  for (int64_t place = count + first_item(); place < max_chunks; place += item_stride()) {
+    chunks[place] = Chunk{};
+    header_ends[place] = 0;
+    reduce_task_offsets[place + 1] = tasks;
   }
 }
 
@@ -783,11 +835,23 @@ __global__ void __launch_bounds__(kThreads)
 // The test hook's CTAs of the scans over a device count (force_scan_ctas): 0,
 // as their sizes choose.
 int64_t g_scan_ctas = 0;
+// The test hook's garbage (fill_proxy_garbage): whether a new table of
+// step 2 holds ones in every bit.
+bool g_proxy_garbage = false;
 
 // The CTAs of a scan over a device count of at most `capacity` items
 // (slice_sums_kernel, slice_scan_kernel): a thread per item, at most two CTAs
 // per SM, the same for both kernels.
 int scan_grid(int64_t capacity) { return g_scan_ctas > 0 ? (int)g_scan_ctas : item_grid(capacity); }
+
+// A new table of step 2 for its kernels to write (at::empty); under the test
+// hook (fill_proxy_garbage) every bit of it set, so a word they leave out
+// shows, whatever the caching allocator gave.
+at::Tensor empty_table(at::IntArrayRef sizes, const at::TensorOptions &options) {
+  at::Tensor table = at::empty(sizes, options);
+  if (g_proxy_garbage) table.fill_(-1);
+  return table;
+}
 
 }  // namespace
 
@@ -797,6 +861,8 @@ void force_scan_ctas(int64_t ctas) {
               "2^31 - 1");
   g_scan_ctas = ctas;
 }
+
+void fill_proxy_garbage(bool fill) { g_proxy_garbage = fill; }
 
 ProxyBuffers proxy_buffers(at::Tensor remote_map, at::Tensor key_stage, const ProxyHeader &header,
                            const at::TensorOptions &options) {
@@ -936,33 +1002,48 @@ ProxyChunks proxy_chunks_and_slots(ProxyKeys &keys, const at::Tensor &remote_off
   const auto int_options = keys.key_occurrences.options().dtype(at::kInt);
   const cudaStream_t stream = current_stream();
   ProxyChunks chunks;
-  // The rows of each key, a row per occurrence (max_key_rows at most), and
-  // the rows before each key; the counted rows of each key, its rows but at
-  // least rows_per_payload, and the counted rows before each key (the rows'
-  // when rows_per_payload is 1).
-  const at::Tensor rows = at::empty({entries}, int_options);
-  const at::Tensor counted_rows =
-      sizes.rows_per_payload > 1 ? at::empty({entries}, int_options) : at::Tensor();
-  key_row_counts_kernel<<<item_grid(entries), kThreads, 0, stream>>>(
-      keys.node_num_uniques.data_ptr<int64_t>(), keys.key_occurrences.data_ptr<int32_t>(), entries,
-      (int32_t)sizes.max_key_rows(), (int32_t)sizes.rows_per_payload, rows.data_ptr<int32_t>(),
-      data_or_null<int32_t>(counted_rows));
+  // The rows before each key, a row per occurrence (max_key_rows at most),
+  // and the counted rows before each key, its rows but at least
+  // rows_per_payload (the rows' when rows_per_payload is 1): a scan over the
+  // node-unique keys' slices, of the same CTAs in both kernels (scan_grid).
+  const int64_t *node_num_uniques = keys.node_num_uniques.data_ptr<int64_t>();
+  const KeyRows key_rows{keys.key_occurrences.data_ptr<int32_t>(), (int32_t)sizes.max_key_rows()};
+  const int scan_ctas = scan_grid(entries);
+  chunks.node_exp_off = empty_table({entries + 1}, long_options);
+  at::Tensor counted_off = chunks.node_exp_off;
+  if (sizes.rows_per_payload > 1) {
+    counted_off = empty_table({entries + 1}, long_options);
+    const at::Tensor partials = at::empty({scan_ctas, 2}, long_options);  // each slice's
+    const KeyRowCounts value{key_rows, (int32_t)sizes.rows_per_payload};
+    slice_sums_kernel<RowCounts><<<scan_ctas, kThreads, 0, stream>>>(
+        node_num_uniques, value, records_of<RowCounts>(partials));
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    slice_scan_kernel<RowCounts><<<scan_ctas, kThreads, 0, stream>>>(
+        node_num_uniques, value, records_of<RowCounts>(partials),
+        RowCountsBefore{chunks.node_exp_off.data_ptr<int64_t>(), counted_off.data_ptr<int64_t>()});
+  } else {
+    const at::Tensor partials = at::empty({scan_ctas}, long_options);  // each slice's
+    slice_sums_kernel<int64_t><<<scan_ctas, kThreads, 0, stream>>>(node_num_uniques, key_rows,
+                                                                   partials.data_ptr<int64_t>());
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    slice_scan_kernel<int64_t><<<scan_ctas, kThreads, 0, stream>>>(
+        node_num_uniques, key_rows, partials.data_ptr<int64_t>(),
+        RowsBefore{chunks.node_exp_off.data_ptr<int64_t>()});
+  }
   C10_CUDA_KERNEL_LAUNCH_CHECK();
-  chunks.node_exp_off = offsets_of(rows);
-  const at::Tensor counted_off =
-      sizes.rows_per_payload > 1 ? offsets_of(counted_rows) : chunks.node_exp_off;
   // The chunks of the stream (each owner node's, cut by its keys' counted
   // rows, round after round), where each lies, and key_stage's slices; the
-  // stream's chunks and their ends to the proxy header too.
+  // stream's chunks and their ends to the proxy header too. The places past
+  // the chunks come with the keys' rows (key_rows_kernel).
   chunks.chunk_length_per_bucket = at::empty({num_nodes}, long_options);
   chunks.chunk_offset_per_bucket = at::empty({num_nodes + 1}, long_options);
   chunks.num_chunks = at::empty({}, long_options);
   chunks.stage_offset_per_bucket = at::empty({num_nodes}, long_options);
-  chunks.chunks = at::empty({max_chunks, 8}, int_options);
+  chunks.chunks = empty_table({max_chunks, 8}, int_options);
   chunks.chunk_inv = at::empty({max_chunks}, int_options);
-  chunks.reduce_task_offsets = at::empty({max_chunks + 1}, long_options);
+  chunks.reduce_task_offsets = empty_table({max_chunks + 1}, long_options);
   // each chunk's rows and reducer tasks, and the offsets of its rows
-  const at::Tensor chunk_tables = at::empty({3, max_chunks + 1}, long_options);
+  const at::Tensor chunk_tables = empty_table({3, max_chunks + 1}, long_options);
   const Rounds rounds{counted_off.data_ptr<int64_t>(),
                       chunks.node_exp_off.data_ptr<int64_t>(),
                       keys.node_offset_per_bucket.data_ptr<int64_t>(),
@@ -996,20 +1077,24 @@ ProxyChunks proxy_chunks_and_slots(ProxyKeys &keys, const at::Tensor &remote_off
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   // Per key: its chunk, its row and its duplicates' first slot there, and
   // its record; each chunk's pulls. The records' keys and weights go once
-  // written.
+  // written. Then the places past the chunks: empty, no end, all the tasks
+  // before them.
   chunks.key_chunk = at::empty({entries}, int_options);
   const at::Tensor key_row = at::empty({entries}, int_options);
   const at::Tensor first_duplicate_slot = at::empty({entries}, int_options);
   with_record(sizes, [&](auto record) {
-    key_rows_kernel<decltype(record)><<<item_grid(entries), kThreads, 0, stream>>>(
-        rounds, keys.key_node.data_ptr<int32_t>(), keys.key_occurrences.data_ptr<int32_t>(),
-        keys.node_unique_keys.data_ptr<int64_t>(),
-        data_or_null<float>(keys.node_unique_key_weights), chunks.chunk_inv.data_ptr<int32_t>(),
-        chunks.chunk_offset_per_bucket.data_ptr<int64_t>(),
-        chunks.stage_offset_per_bucket.data_ptr<int64_t>(),
-        keys.node_num_uniques.data_ptr<int64_t>(), max_chunks, sizes.num_proxy_rows, chunk_records,
-        chunks.key_chunk.data_ptr<int32_t>(), key_row.data_ptr<int32_t>(),
-        first_duplicate_slot.data_ptr<int32_t>(), (char *)buffers.key_stage.data_ptr<int64_t>());
+    key_rows_kernel<decltype(record)>
+        <<<item_grid(std::max(entries, max_chunks)), kThreads, 0, stream>>>(
+            rounds, keys.key_node.data_ptr<int32_t>(), keys.key_occurrences.data_ptr<int32_t>(),
+            keys.node_unique_keys.data_ptr<int64_t>(),
+            data_or_null<float>(keys.node_unique_key_weights), chunks.chunk_inv.data_ptr<int32_t>(),
+            chunks.chunk_offset_per_bucket.data_ptr<int64_t>(),
+            chunks.stage_offset_per_bucket.data_ptr<int64_t>(), node_num_uniques,
+            chunks.num_chunks.data_ptr<int64_t>(), max_chunks, sizes.num_proxy_rows, chunk_records,
+            layout_args.header_ends, chunks.reduce_task_offsets.data_ptr<int64_t>(),
+            chunks.key_chunk.data_ptr<int32_t>(), key_row.data_ptr<int32_t>(),
+            first_duplicate_slot.data_ptr<int32_t>(),
+            (char *)buffers.key_stage.data_ptr<int64_t>());
   });
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   keys.node_unique_keys.reset();

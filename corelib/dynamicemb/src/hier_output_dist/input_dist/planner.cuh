@@ -207,10 +207,14 @@ __device__ T cta_offsets_of(int64_t n, Value value, T *offsets) {
 // kItems values at a time, each thread kItems consecutive ones, all of whose values it reads
 // before the tile's one BlockScan: a tile costs one wait for its loads, so a long table costs
 // kItems times fewer. value(index) is called once for each index below n; write(index, offset)
-// gets each offset, and the total goes to every thread (no offsets[n]).
+// gets each offset, and the total goes to every thread (no offsets[n]). Values wider than int64
+// (a pair of sums) take CUB's warp scans: its raking scan, the default, holds 16 values in each
+// raking thread's registers.
 template <int kItems, typename T, typename Value, typename Write>
 __device__ T cta_scan_blocked(int64_t n, Value value, Write write) {
-  using Scan = cub::BlockScan<T, kThreads>;
+  constexpr cub::BlockScanAlgorithm kAlgorithm =
+      sizeof(T) > sizeof(int64_t) ? cub::BLOCK_SCAN_WARP_SCANS : cub::BLOCK_SCAN_RAKING;
+  using Scan = cub::BlockScan<T, kThreads, kAlgorithm>;
   __shared__ typename Scan::TempStorage scan;
   __shared__ T carry;
   if (threadIdx.x == 0) carry = 0;
@@ -242,6 +246,14 @@ __device__ T cta_scan_blocked(int64_t n, Value value, Write write) {
 }
 // The values a thread of cta_scan_blocked takes at a time.
 constexpr int kScanItems = 8;
+// The values of type T a thread of cta_scan_blocked takes at a time where registers are short:
+// as many as kScanItems int32 values take, 32 bytes (4 int64 values, 2 pairs of int64), so a
+// kernel of kThreads keeps to 64 registers, two CTAs per SM, without spills.
+template <typename T>
+constexpr int scan_items() {
+  constexpr int kBytes = kScanItems * (int)sizeof(int32_t);
+  return (int)sizeof(T) >= kBytes ? 1 : kBytes / (int)sizeof(T);
+}
 
 // Every thread of the CTA: the largest of value(index) for index in [0, n)
 // (`least` when n is 0), to every thread.
@@ -286,12 +298,13 @@ __device__ T cta_sum(int64_t n, Value value) {
 // the slices past n are empty). slice_sums_kernel writes the sum of each
 // slice into partials[c] (T [G]). slice_scan_kernel adds the sums of the
 // slices before its own (a strided reduce, so any G works) to the offsets in
-// its slice (cta_scan_blocked, a tile at a time) and gives each to
-// write(index, offset); CTA G - 1 also gives the total to write(n, total),
-// when its slice is empty too. Each kernel calls value(index) once for each
-// index of its slice, and both must get the same values. No CTA waits for
-// another: the second kernel reads what every CTA of the first one wrote. So
-// the scan reads and writes nothing past n, whatever the capacity.
+// its slice (cta_scan_blocked, a tile of scan_items<T>() values a thread at a
+// time) and gives each to write(index, offset); CTA G - 1 also gives the
+// total to write(n, total), when its slice is empty too. Each kernel calls
+// value(index) once for each index of its slice, and both must get the same
+// values. No CTA waits for another: the second kernel reads what every CTA of
+// the first one wrote. So the scan reads and writes nothing past n, whatever
+// the capacity.
 
 // This CTA's slice of [0, n).
 struct CtaSlice {
@@ -321,7 +334,7 @@ __global__ void __launch_bounds__(kThreads)
   const int64_t n = *count;
   const CtaSlice slice(n);
   const T base = cta_sum<T>(blockIdx.x, [&](int64_t cta) { return partials[cta]; });
-  const T total = cta_scan_blocked<kScanItems, T>(
+  const T total = cta_scan_blocked<scan_items<T>(), T>(
       slice.hi - slice.lo, [&](int64_t index) { return value(slice.lo + index); },
       [&](int64_t index, T offset) { write(slice.lo + index, base + offset); });
   if (blockIdx.x == gridDim.x - 1 && threadIdx.x == 0) write(n, base + total);

@@ -71,14 +71,26 @@ key past local_size occurrences: the need key_rows), check the needs alone
 Most cases size remote_keys at the largest remote part plus 5. Others size
 it 20 times as large (remote_factor) or exactly at it, or give node 0 no
 keys across nodes (its proxies get no occurrence in a call that fits): the
-proxy's hash table and its scan of the representatives take the valid
-occurrences alone, a count only the device knows. A few run that scan on a
-given number of CTAs (``hier_output_dist_scan_ctas``): 2, 3, 264 and 600 on
-calls of a few hundred occurrences a proxy (on 264 and 600, CTAs of one
-occurrence or none; on 264 also a count at remote_keys and a count of 0),
-and 1, 2 and 600 on calls of 11,000 to 21,000 (on 1 and 2, slices of
-several tiles; on 600, slices of about 20 to 35 occurrences, also in the
-CTAs past a CTA's threads).
+proxy's hash table and its scans (of the representatives, and of its keys'
+rows) take the valid occurrences and keys alone, counts only the device
+knows, and so do the loops over its chunks, with max_chunks far above the
+chunks. A few run those scans on a given number of CTAs
+(``hier_output_dist_scan_ctas``): 2, 3, 264 and 600 on calls of a few
+hundred occurrences a proxy (on 264 and 600, CTAs of one occurrence or
+none; on 264 also a count at remote_keys and a count of 0), and 1, 2 and
+600 on calls of 4,000 to 21,000 (on 1 and 2, slices of several tiles; on
+600, slices of about 20 to 35 occurrences, also in the CTAs past a CTA's
+threads); each with rows_per_payload 1 (a scan of the rows alone) and
+above 1 (of the rows and the counted rows together).
+
+The proxy's second step fills the rows before each key, its chunk table and
+reduce_task_offsets with garbage before its kernels write them
+(``hier_output_dist_proxy_garbage``), as the windows hold garbage before
+the call. So the checks of the chunk table, reduce_task_offsets and the
+header's chunk ends, over all max_chunks entries, see a word the proxy
+leaves out past its chunks, whatever the caching allocator gave. With the
+caching allocator off (under compute-sanitizer, below) the proxy leaves
+them as they come, so initcheck sees a read of a word that nothing wrote.
 
 Run it on one GPU, from ``corelib/dynamicemb``::
 
@@ -87,8 +99,9 @@ Run it on one GPU, from ``corelib/dynamicemb``::
 Under compute-sanitizer, turn off the caching allocator. Then each tensor is
 an allocation of its own: memcheck sees an access past a tensor's end, and
 initcheck a read of a word that nothing wrote, whatever the memory held (the
-proxy's hash table keeps garbage past the buckets the call takes, and its
-tables per occurrence and per key past the valid ones; no kernel may read
+proxy keeps garbage in its hash table past the buckets the call takes and in
+its tables per occurrence and per key past the valid ones, and a requester
+in its push order past its rows at the proxies; no kernel or check may read
 it)::
 
     export PYTORCH_NO_CUDA_MEMORY_CACHING=1
@@ -97,6 +110,7 @@ it)::
 and so with ``--tool memcheck``, ``--tool racecheck`` and ``--tool synccheck``.
 """
 
+import os
 import sys
 from bisect import bisect_left, bisect_right
 from dataclasses import dataclass
@@ -107,6 +121,7 @@ import torch
 from dynamicemb_extensions import (
     hier_output_dist_node_layout,
     hier_output_dist_node_push,
+    hier_output_dist_proxy_garbage,
     hier_output_dist_proxy_plan,
     hier_output_dist_rail_tables,
     hier_output_dist_requester_tables,
@@ -114,6 +129,10 @@ from dynamicemb_extensions import (
 )
 
 TASK_ROWS = 32  # kTaskRows: rows of a push task
+# the proxy fills tables of its second step with garbage first, unless the
+# caching allocator is off (then compute-sanitizer's initcheck sees a word
+# that nothing wrote)
+PROXY_GARBAGE = "PYTORCH_NO_CUDA_MEMORY_CACHING" not in os.environ
 
 
 def planner(binding, *args, **kwargs):
@@ -202,8 +221,8 @@ class Case:
     seeds: int = 2
     # the features of each lookup group (Config::lookup_groups); empty: one group
     groups: Tuple[int, ...] = ()
-    # the CTAs of the proxy's scan of the representatives
-    # (hier_output_dist_scan_ctas); 0: as its sizes choose
+    # the CTAs of the proxy's scans, of the representatives and of the keys'
+    # rows (hier_output_dist_scan_ctas); 0: as their sizes choose
     scan_ctas: int = 0
 
     @property
@@ -752,6 +771,117 @@ CASES = [
         "no keys across nodes from node 0, the proxy's scan on 264 CTAs",
         job=local_node_job,
         scan_ctas=264,
+    ),
+    # rows_per_payload above 1: the scan of the keys' rows takes each key's
+    # rows and counted rows together, on 1 and 2 CTAs in slices of several
+    # tiles, on 2 and 3, and on 264 and 600 (CTAs of one key or none, and of
+    # no key at node 0's proxies); the chunks' loops and the places past them,
+    # with max_chunks far above the chunks, in a ring that wraps and without
+    # node dedup
+    Case(
+        "the proxy's scans on 1 CTA, 2 nodes of 2, 4 rows per payload",
+        num_nodes=2,
+        local_size=2,
+        tables=(0, 1),
+        max_block=9000,
+        key_range=30000,
+        hot=0.05,
+        max_chunk_rows_arg=64,
+        payload_rows=16,
+        scan_ctas=1,
+        seeds=1,
+    ),
+    Case(
+        "the proxy's scans on 2 CTAs, 2 nodes of 2, 4 rows per payload",
+        num_nodes=2,
+        local_size=2,
+        tables=(0, 1),
+        max_block=3000,
+        key_range=10000,
+        hot=0.05,
+        max_chunk_rows_arg=64,
+        payload_rows=16,
+        scan_ctas=2,
+        seeds=1,
+    ),
+    Case(
+        "the proxy's scans on 600 CTAs, 2 nodes of 2, 4 rows per payload",
+        num_nodes=2,
+        local_size=2,
+        tables=(0, 1),
+        max_block=9000,
+        key_range=30000,
+        hot=0.05,
+        max_chunk_rows_arg=64,
+        payload_rows=16,
+        scan_ctas=600,
+        seeds=1,
+    ),
+    Case(
+        "the proxy's scans on 2 CTAs, 2 rows per payload",
+        max_block=40,
+        key_range=30,
+        hot=0.5,
+        max_chunk_rows_arg=40,
+        payload_rows=20,
+        scan_ctas=2,
+    ),
+    Case(
+        "the proxy's scans on 3 CTAs, weights, 2 rows per payload",
+        max_block=40,
+        key_range=30,
+        hot=0.5,
+        weighted=True,
+        max_chunk_rows_arg=40,
+        payload_rows=20,
+        scan_ctas=3,
+    ),
+    Case(
+        "the proxy's scans on 264 CTAs, 20 x the need, weights, 3 nodes of 2, "
+        "6 rows per payload",
+        num_nodes=3,
+        local_size=2,
+        tables=(0, 0, 1),
+        max_block=40,
+        key_range=30,
+        hot=0.5,
+        weighted=True,
+        max_chunk_rows_arg=60,
+        payload_rows=10,
+        remote_factor=20,
+        scan_ctas=264,
+    ),
+    Case(
+        "no keys across nodes from node 0, 2 rows per payload, 20 x the need, "
+        "the proxy's scans on 600 CTAs",
+        max_chunk_rows_arg=16,
+        payload_rows=8,
+        remote_factor=20,
+        job=local_node_job,
+        scan_ctas=600,
+    ),
+    Case(
+        "remote_keys 20 x the need, 2 nodes, a wrapping ring, 4 rows per payload",
+        num_nodes=2,
+        max_block=200,
+        key_range=600,
+        hot=0.15,
+        num_proxy_rows=640,
+        max_chunk_rows_arg=160,
+        payload_rows=40,
+        remote_factor=20,
+        seeds=1,
+    ),
+    Case(
+        "remote_keys 20 x the need, node dedup off, 3 rows per payload",
+        max_block=10,
+        key_range=60,
+        hot=0.3,
+        weighted=True,
+        node_dedup=False,
+        max_chunk_rows_arg=30,
+        payload_rows=10,
+        remote_factor=20,
     ),
     # keys not index-deduplicated: the need key_rows
     Case("keys not deduplicated", max_block=40, key_range=30, hot=0.5, dedup=False),
@@ -1744,16 +1874,24 @@ def check_backward(
         ).tolist()
         for rank in node_ranks
     ]
+    # each requester's tables, of its push order the positions it writes (its
+    # rows at the proxies)
     tables = [
         {
-            name: requesters[rank][name].tolist()
-            for name in ("proxy_push_tables", "push_order", "dst")
+            "proxy_push_tables": requesters[rank]["proxy_push_tables"].tolist(),
+            "push_order": requesters[rank]["push_order"][
+                : int(requesters[rank]["push_order_off"][-1])
+            ].tolist(),
+            "dst": requesters[rank]["dst"].tolist(),
         }
         for rank in node_ranks
     ]
     for proxy in range(local_size):
         ref = refs[(node, proxy)]
-        node_exp_off = proxies[node * local_size + proxy]["node_exp_off"].tolist()
+        # the rows before each key, as far as the proxy writes them
+        node_exp_off = proxies[node * local_size + proxy]["node_exp_off"][
+            : ref["node_num_uniques"] + 1
+        ].tolist()
         occurrences_of = [[] for _ in range(ref["node_num_uniques"])]
         for occ, key in enumerate(ref["key_of"]):
             occurrences_of[key].append(ref["occurrences"][occ])
@@ -2065,15 +2203,18 @@ def run_case(case: Case, seed: int) -> Tuple[Dict[str, List[str]], str]:
     need_key_rows = max(ref["need_key_rows"] for ref in refs.values())
     laps = max(-(-ref["stream_end"] // case.num_proxy_rows) for ref in refs.values())
     hier_output_dist_scan_ctas(case.scan_ctas)
+    hier_output_dist_proxy_garbage(PROXY_GARBAGE)
     try:
         call = run_call(case, ranks, lookup_keys, remote_keys, generator)
     finally:
         hier_output_dist_scan_ctas(0)
+        hier_output_dist_proxy_garbage(False)
     # each node's agreed needs: the most of what its ranks publish
     agreed = call["needs"].amax(1).tolist()
     checks = {"puts": call["problems"]}
     stats = (
-        f"chunks {max(ref['num_chunks'] for ref in refs.values())}, laps {laps}, "
+        f"chunks {max(ref['num_chunks'] for ref in refs.values())} "
+        f"of {max_chunks(case, remote_keys)}, laps {laps}, "
         f"most occurrences of a key {need_key_rows}, "
         f"largest remote part {need_remote} of {remote_keys}"
     )
