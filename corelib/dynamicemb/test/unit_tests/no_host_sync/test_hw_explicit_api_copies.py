@@ -18,7 +18,8 @@
 Not part of the CI list (``unit_test.sh``): each check says PASS or FAIL for one assumption
 the code makes about the stack it runs on, and the answer is a property of the machine
 (an H100 with the CUDA 13.3 / PyTorch 2.13 image, in the coordinator's runs) and not of the
-code. Run it alone, and again under the sanitizer::
+code. Run it alone, and again under the sanitizer (``/usr/local/cuda/bin/compute-sanitizer``
+in the CI image, which is not on the ``PATH``)::
 
     python -m pytest -s test/unit_tests/no_host_sync/test_hw_explicit_api_copies.py
     compute-sanitizer --tool memcheck python -m pytest -x -q \\
