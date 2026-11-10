@@ -79,17 +79,25 @@ key past local_size occurrences: the need key_rows), check the needs alone
 Most cases size remote_keys at the largest remote part plus 5. Others size
 it 20 times as large (remote_factor) or exactly at it, or give node 0 no
 keys across nodes (its proxies get no occurrence in a call that fits): the
-proxy's hash table and its scans (of the representatives, and of its keys'
-rows) take the valid occurrences and keys alone, counts only the device
-knows, and so do the loops over its chunks, with max_chunks far above the
-chunks. A few run those scans on a given number of CTAs
-(``hier_output_dist_scan_ctas``): 2, 3, 264 and 600 on calls of a few
-hundred occurrences a proxy (on 264 and 600, CTAs of one occurrence or
-none; on 264 also a count at remote_keys and a count of 0), and 1, 2 and
-600 on calls of 4,000 to 21,000 (on 1 and 2, slices of several tiles; on
-600, slices of about 20 to 35 occurrences, also in the CTAs past a CTA's
-threads); each with rows_per_payload 1 (a scan of the rows alone) and
-above 1 (of the rows and the counted rows together).
+proxy's hash table and the loops over its chunks take the valid
+occurrences, keys and chunks alone, counts only the device knows, with
+max_chunks far above the chunks. Its scans (of the representatives, and of
+its keys' rows) are CUB's, over remote_keys + 1 items in tiles (on an H100
+3,072 int32 values, or 2,688 int64 values or words), and read and write no
+item past the count but the one at it: calls of a few hundred occurrences a
+proxy take a tile or two, and calls of 2,000 to 24,000 up to 9 tiles; each
+with rows_per_payload 1 (a scan of the rows alone) and above 1 (of the rows
+and the counted rows together, in one word, 32 bits each). A few cases
+scan the rows and the counted rows as a pair of int64 sums
+(``hier_output_dist_row_counts64``), which the sizes choose only when
+rows_per_payload x remote_keys reaches 2^32 (tiles of 384 pairs, up to 57).
+In seven cases proxy (0, 0) alone gets occurrences (one_proxy_job): 2,688
+to 3,073 of 2,687 to 3,072 node-unique keys, so the count and the keys fall
+at, before and after the edge of a tile, with remote_keys at the count (the
+scans' last item is the count's; of 2,688 keys, by words and by pairs, it
+is alone in the last tile) or whole tiles past it. Past its node-unique
+keys each word of the proxy's rows before each key keeps the garbage the
+hook filled in: the scan writes none of them.
 
 The proxy lays its chunks out on a grid, a warp per chunk; CUB's scan over
 its max_chunks + 1 places (tiles of 384) then gives the rows and the reducer
@@ -191,10 +199,11 @@ Under initcheck the whole file takes hours (about 2 minutes a case):
 plain and weighted ones, a group per feature (the count messages read every
 offset of the own part's features and of the proxy's bucket features), a
 wrapping ring, node dedup off, an overflow, and those of the proxy's live
-counts (20 times the need, at the need, a count of 0, the scans on 2 and 600
-CTAs, several rows per payload), its chunk layout on 3 CTAs in a wrapping
-ring and on 7 CTAs with no chunks, its int64 push keys and a requester with
-nothing to send; and the requester cases of ``SANITIZE_REQUESTER_CASES``.
+counts (20 times the need, at the need, a count of 0, hot keys, several rows
+per payload, the scans at the edges of CUB's tiles, the keys' rows by int64
+pairs), its chunk layout on 3 CTAs in a wrapping ring and on 7 CTAs with no
+chunks, its int64 push keys and a requester with nothing to send; and the
+requester cases of ``SANITIZE_REQUESTER_CASES``.
 ``sanitize past`` runs the cases of ``SANITIZE_PAST_CASES``, whose proxies'
 chunks pass max_chunks, under memcheck, racecheck and synccheck alone: the
 keys of the chunks past max_chunks read words of chunk_inv that no chunk
@@ -222,7 +231,7 @@ from dynamicemb_extensions import (
     hier_output_dist_rail_tables,
     hier_output_dist_requester_ctas,
     hier_output_dist_requester_tables,
-    hier_output_dist_scan_ctas,
+    hier_output_dist_row_counts64,
 )
 
 TASK_ROWS = 32  # kTaskRows: rows of a push task
@@ -320,9 +329,6 @@ class Case:
     seeds: int = 2
     # the features of each lookup group (Config::lookup_groups); empty: one group
     groups: Tuple[int, ...] = ()
-    # the CTAs of the proxy's scans, of the representatives and of the keys'
-    # rows (hier_output_dist_scan_ctas); 0: as their sizes choose
-    scan_ctas: int = 0
     # the CTAs of the proxy's chunk layout (hier_output_dist_chunk_ctas); 0: as
     # max_chunks chooses (a warp per place, so one CTA up to 16 places)
     chunk_ctas: int = 0
@@ -337,6 +343,10 @@ class Case:
     # the push order's sort by int64 push keys (hier_output_dist_push_keys64);
     # False: by int32 ones, as the sizes choose
     push_keys64: bool = False
+    # with rows_per_payload above 1, the proxy's scan of its keys' rows by a
+    # pair of int64 sums (hier_output_dist_row_counts64); False: by one word,
+    # the two sums in 32 bits each, where they fit, as the sizes choose
+    row_counts64: bool = False
 
     @property
     def num_features(self) -> int:
@@ -413,6 +423,18 @@ def same_place_job(case: Case, generator) -> List[Tuple]:
     rows of one slot in two chunks."""
     keys = case.num_proxy_rows + 2 * chunk_span(case)
     return one_owner_job(case, [list(range(keys)), [0, second_lap_key(case)]])
+
+
+def one_proxy_job(keys: int, again: int) -> Callable:
+    """A job as one_owner_job's: requester 0 of node 0 asks owner (node 1, 0)
+    for keys 0, ..., keys - 1, and requester 1 for the first `again` of them.
+    So proxy (0, 0) gets keys + again occurrences of `keys` node-unique keys
+    (with node dedup), and every other proxy none."""
+
+    def job(case: Case, generator) -> List[Tuple]:
+        return one_owner_job(case, [list(range(keys)), list(range(again))])
+
+    return job
 
 
 def wide_node_job(case: Case, generator) -> List[Tuple]:
@@ -854,89 +876,64 @@ CASES = [
         groups=(1,) * 1100,
         seeds=1,
     ),
-    # the proxy's scan of the representatives on 1, 2, 3, 264 and 600 CTAs: on
-    # one CTA a slice of several tiles (4,096 occurrences each); on many, CTAs
-    # of one occurrence or none (600: more CTAs than a CTA's threads)
+    # the proxy's scans (CUB's, over remote_keys + 1 items) from one tile to
+    # many: calls of a few hundred occurrences a proxy (a tile or two), 20
+    # times the need (items past the count), at the need, with a count of 0,
+    # and of 2,000 to 24,000 occurrences a proxy (several tiles; on an H100 a
+    # tile is 3,072 int32 values, or 2,688 int64 values or words); each with
+    # rows_per_payload 1 (a scan of the rows alone) and above 1 (of the rows
+    # and the counted rows together)
     Case(
-        "the proxy's scan on 1 CTA, 2 nodes of 2",
+        "thousands of occurrences a proxy, 2 nodes of 2",
         num_nodes=2,
         local_size=2,
         tables=(0, 1),
         max_block=9000,
         key_range=30000,
         hot=0.05,
-        scan_ctas=1,
         seeds=1,
     ),
+    Case("hot keys, another job", max_block=40, key_range=30, hot=0.5),
+    Case("hot keys, weights", max_block=40, key_range=30, hot=0.5, weighted=True),
+    Case("uniform, another job"),
+    Case("remote_keys 20 x the need, another job", remote_factor=20, seeds=1),
     Case(
-        "the proxy's scan on 2 CTAs",
-        max_block=40,
-        key_range=30,
-        hot=0.5,
-        scan_ctas=2,
-    ),
-    Case(
-        "the proxy's scan on 3 CTAs, weights",
-        max_block=40,
-        key_range=30,
-        hot=0.5,
-        weighted=True,
-        scan_ctas=3,
-    ),
-    Case("the proxy's scan on 264 CTAs", scan_ctas=264),
-    Case(
-        "the proxy's scan on 600 CTAs, 20 x the need",
-        remote_factor=20,
-        scan_ctas=600,
-        seeds=1,
-    ),
-    # the 1-CTA case's job on 2 CTAs, slices of several tiles after the sum of
-    # the slice before, and on 600 CTAs, slices of about 20 to 35 occurrences:
-    # the CTAs past a CTA's threads hold some, so a later CTA adds up the sums
-    # before its slice in more than one pass of its threads; on 264 CTAs, a
-    # count at remote_keys and a count of 0 (every slice empty)
-    Case(
-        "the proxy's scan on 2 CTAs, 2 nodes of 2",
+        "thousands of occurrences a proxy, 2 nodes of 2, another job",
         num_nodes=2,
         local_size=2,
         tables=(0, 1),
         max_block=9000,
         key_range=30000,
         hot=0.05,
-        scan_ctas=2,
         seeds=1,
     ),
     Case(
-        "the proxy's scan on 600 CTAs, 2 nodes of 2",
+        "thousands of occurrences a proxy, 2 nodes of 2, a third job",
         num_nodes=2,
         local_size=2,
         tables=(0, 1),
         max_block=9000,
         key_range=30000,
         hot=0.05,
-        scan_ctas=600,
         seeds=1,
     ),
     Case(
-        "remote_keys at the need, the proxy's scan on 264 CTAs",
+        "remote_keys at the need, another job",
         max_block=20,
         hot=0.3,
         remote_slack=0,
-        scan_ctas=264,
     ),
-    Case(
-        "no keys across nodes from node 0, the proxy's scan on 264 CTAs",
-        job=local_node_job,
-        scan_ctas=264,
-    ),
+    Case("no keys across nodes from node 0, another job", job=local_node_job),
     # rows_per_payload above 1: the scan of the keys' rows takes each key's
-    # rows and counted rows together, on 1 and 2 CTAs in slices of several
-    # tiles, on 2 and 3, and on 264 and 600 (CTAs of one key or none, and of
-    # no key at node 0's proxies); the chunks' loops and the places past them,
-    # with max_chunks far above the chunks, in a ring that wraps and without
-    # node dedup
+    # rows and counted rows together, in one word, or as a pair of int64 sums
+    # (hier_output_dist_row_counts64, which the sizes choose only when
+    # rows_per_payload * remote_keys reaches 2^32: tiles of 384 pairs on an
+    # H100) in calls of thousands of occurrences a proxy (57 tiles), of hot
+    # keys and of 20 times the need; the chunks' loops and the places past
+    # them, with max_chunks far above the chunks, in a ring that wraps and
+    # without node dedup
     Case(
-        "the proxy's scans on 1 CTA, 2 nodes of 2, 4 rows per payload",
+        "thousands of occurrences a proxy, 2 nodes of 2, 4 rows per payload",
         num_nodes=2,
         local_size=2,
         tables=(0, 1),
@@ -945,11 +942,10 @@ CASES = [
         hot=0.05,
         max_chunk_rows_arg=64,
         payload_rows=16,
-        scan_ctas=1,
         seeds=1,
     ),
     Case(
-        "the proxy's scans on 2 CTAs, 2 nodes of 2, 4 rows per payload",
+        "a few thousand occurrences a proxy, 2 nodes of 2, 4 rows per payload",
         num_nodes=2,
         local_size=2,
         tables=(0, 1),
@@ -958,11 +954,11 @@ CASES = [
         hot=0.05,
         max_chunk_rows_arg=64,
         payload_rows=16,
-        scan_ctas=2,
         seeds=1,
     ),
     Case(
-        "the proxy's scans on 600 CTAs, 2 nodes of 2, 4 rows per payload",
+        "the keys' rows by int64 pairs, thousands of occurrences a proxy, "
+        "2 nodes of 2, 4 rows per payload",
         num_nodes=2,
         local_size=2,
         tables=(0, 1),
@@ -971,30 +967,29 @@ CASES = [
         hot=0.05,
         max_chunk_rows_arg=64,
         payload_rows=16,
-        scan_ctas=600,
+        row_counts64=True,
         seeds=1,
     ),
     Case(
-        "the proxy's scans on 2 CTAs, 2 rows per payload",
+        "the keys' rows by int64 pairs, hot keys, 2 rows per payload",
         max_block=40,
         key_range=30,
         hot=0.5,
         max_chunk_rows_arg=40,
         payload_rows=20,
-        scan_ctas=2,
+        row_counts64=True,
     ),
     Case(
-        "the proxy's scans on 3 CTAs, weights, 2 rows per payload",
+        "hot keys, weights, 2 rows per payload",
         max_block=40,
         key_range=30,
         hot=0.5,
         weighted=True,
         max_chunk_rows_arg=40,
         payload_rows=20,
-        scan_ctas=3,
     ),
     Case(
-        "the proxy's scans on 264 CTAs, 20 x the need, weights, 3 nodes of 2, "
+        "the keys' rows by int64 pairs, 20 x the need, weights, 3 nodes of 2, "
         "6 rows per payload",
         num_nodes=3,
         local_size=2,
@@ -1006,16 +1001,14 @@ CASES = [
         max_chunk_rows_arg=60,
         payload_rows=10,
         remote_factor=20,
-        scan_ctas=264,
+        row_counts64=True,
     ),
     Case(
-        "no keys across nodes from node 0, 2 rows per payload, 20 x the need, "
-        "the proxy's scans on 600 CTAs",
+        "no keys across nodes from node 0, 2 rows per payload, 20 x the need",
         max_chunk_rows_arg=16,
         payload_rows=8,
         remote_factor=20,
         job=local_node_job,
-        scan_ctas=600,
     ),
     Case(
         "remote_keys 20 x the need, 2 nodes, a wrapping ring, 4 rows per payload",
@@ -1253,6 +1246,96 @@ CASES = [
         remote_slack=0,
         dedup=False,
         job=past_bound_job,
+        seeds=1,
+    ),
+    # the proxy's scans at the edges of CUB's tiles on an H100 (3,072 int32
+    # values for the representatives, 2,688 int64 values or words for the
+    # keys' rows, and 384 pairs under the hook): proxy (0, 0) alone gets
+    # occurrences (one_proxy_job), the count and its node-unique keys at a
+    # tile's edge, one before it and one after it, and remote_keys at the
+    # count (the scans' last item is the count's) or past it (whole tiles past
+    # the count). In the last two cases the node-unique keys are remote_keys,
+    # 2,688 (7 tiles of pairs): the item of the rows' scan at their count, the
+    # total, is alone in the last tile, of words and of pairs
+    Case(
+        "3,072 occurrences of 2,688 keys at one proxy, remote_keys at them",
+        num_nodes=2,
+        local_size=2,
+        tables=(0,),
+        max_chunk_rows_arg=64,
+        remote_slack=0,
+        job=one_proxy_job(2688, 384),
+        seeds=1,
+    ),
+    Case(
+        "3,071 occurrences of 2,687 keys at one proxy, remote_keys at them",
+        num_nodes=2,
+        local_size=2,
+        tables=(0,),
+        max_chunk_rows_arg=64,
+        remote_slack=0,
+        job=one_proxy_job(2687, 384),
+        seeds=1,
+    ),
+    Case(
+        "3,072 occurrences of 2,688 keys at one proxy, 4 rows per payload",
+        num_nodes=2,
+        local_size=2,
+        tables=(0,),
+        max_chunk_rows_arg=64,
+        payload_rows=16,
+        remote_slack=0,
+        job=one_proxy_job(2688, 384),
+        seeds=1,
+    ),
+    Case(
+        "3,073 occurrences of 2,689 keys at one proxy, 4 rows per payload, "
+        "remote_keys 6,143",
+        num_nodes=2,
+        local_size=2,
+        tables=(0,),
+        max_chunk_rows_arg=64,
+        payload_rows=16,
+        remote_slack=3070,
+        job=one_proxy_job(2689, 384),
+        seeds=1,
+    ),
+    Case(
+        "3,072 occurrences at one proxy, node dedup off, remote_keys at them",
+        num_nodes=2,
+        local_size=2,
+        tables=(0,),
+        node_dedup=False,
+        max_chunk_rows_arg=64,
+        remote_slack=0,
+        job=one_proxy_job(3072, 0),
+        seeds=1,
+    ),
+    Case(
+        "2,688 occurrences at one proxy, node dedup off, 4 rows per payload, "
+        "remote_keys at them",
+        num_nodes=2,
+        local_size=2,
+        tables=(0,),
+        node_dedup=False,
+        max_chunk_rows_arg=64,
+        payload_rows=16,
+        remote_slack=0,
+        job=one_proxy_job(2688, 0),
+        seeds=1,
+    ),
+    Case(
+        "the keys' rows by int64 pairs, 2,688 occurrences at one proxy, "
+        "node dedup off, 4 rows per payload, remote_keys at them",
+        num_nodes=2,
+        local_size=2,
+        tables=(0,),
+        node_dedup=False,
+        max_chunk_rows_arg=64,
+        payload_rows=16,
+        remote_slack=0,
+        job=one_proxy_job(2688, 0),
+        row_counts64=True,
         seeds=1,
     ),
 ]
@@ -2109,12 +2192,19 @@ def check_proxy(
         {bucket_feature: sorted(group) for bucket_feature, group in records_of.items()},
         dedup_by_merge_rank(case, ref["occurrences"]),
     )
-    # the rows before each key
+    # the rows before each key; past them the scan writes nothing, so each word
+    # keeps the garbage the hook filled in (every bit set)
     expect(
         "node_exp_off",
         out["node_exp_off"][: node_num_uniques + 1].tolist(),
         ref["node_exp_off"],
     )
+    if PROXY_GARBAGE:
+        expect(
+            "node_exp_off past the keys",
+            bool((out["node_exp_off"][node_num_uniques + 1 :] == -1).all()),
+            True,
+        )
     return problems
 
 
@@ -2732,10 +2822,10 @@ def run_case(case: Case, seed: int) -> Tuple[Dict[str, List[str]], str]:
     lookup_keys = max(need_lookup + case.lookup_slack, 1)
     need_key_rows = max(ref["need_key_rows"] for ref in refs.values())
     laps = max(-(-ref["stream_end"] // case.num_proxy_rows) for ref in refs.values())
-    hier_output_dist_scan_ctas(case.scan_ctas)
     hier_output_dist_chunk_ctas(case.chunk_ctas)
     hier_output_dist_proxy_garbage(PROXY_GARBAGE)
     hier_output_dist_push_keys64(case.push_keys64)
+    hier_output_dist_row_counts64(case.row_counts64)
     try:
         call = run_call(
             case,
@@ -2746,10 +2836,10 @@ def run_case(case: Case, seed: int) -> Tuple[Dict[str, List[str]], str]:
             proxies_only=bool(case.max_chunks_arg),
         )
     finally:
-        hier_output_dist_scan_ctas(0)
         hier_output_dist_chunk_ctas(0)
         hier_output_dist_proxy_garbage(False)
         hier_output_dist_push_keys64(False)
+        hier_output_dist_row_counts64(False)
     if case.max_chunks_arg:
         # max_chunks below the chunks of some proxies: the proxies alone, and of
         # a proxy whose chunks pass max_chunks its chunk layout alone
@@ -3397,9 +3487,13 @@ SANITIZE_CASES = {
     "remote_keys 20 x the need",
     "remote_keys at the need",
     "no keys across nodes from node 0",
-    "the proxy's scan on 2 CTAs",
-    "the proxy's scan on 600 CTAs, 20 x the need",
-    "the proxy's scans on 2 CTAs, 2 nodes of 2, 4 rows per payload",
+    "hot keys, another job",
+    "a few thousand occurrences a proxy, 2 nodes of 2, 4 rows per payload",
+    "3,072 occurrences of 2,688 keys at one proxy, remote_keys at them",
+    "3,073 occurrences of 2,689 keys at one proxy, 4 rows per payload, "
+    "remote_keys 6,143",
+    "the keys' rows by int64 pairs, 2,688 occurrences at one proxy, "
+    "node dedup off, 4 rows per payload, remote_keys at them",
     "2 nodes, a wrapping ring, the chunk layout on 3 CTAs",
     "no keys across nodes from node 0, the chunk layout on 7 CTAs",
     "the push order by int64 push keys",

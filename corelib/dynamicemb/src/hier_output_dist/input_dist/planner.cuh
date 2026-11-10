@@ -16,8 +16,7 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 ******************************************************************************/
 // What the planner's kernels share (planner.h's steps, in the .cu files of
 // this folder): how they are launched, searches in sorted tables, the offsets
-// of the runs of a sorted table, a CTA's scans and reductions, and the scans
-// over a count only the device knows.
+// of the runs of a sorted table, and a CTA's scans and reductions.
 //
 // A step's kernels are of two kinds. A kernel over items (keys, rows,
 // occurrences) runs a thread per item in a grid-stride loop (item_grid); the
@@ -28,10 +27,13 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 // a time. No kernel waits for another CTA: a step that needs every item done
 // goes on in its next kernel (the bucketize's counting sort, bucketize.cu:
 // each CTA of its second kernel reads the counts every CTA of the first one
-// wrote; a scan over a device count, slice_scan_kernel: each CTA reads the
-// sums every CTA of slice_sums_kernel wrote), or in the kernel's last CTA out
-// (the fan-out's count, bucketize.cu: each CTA takes a ticket once its items
-// are done, and the one that takes the last goes on; none waits for it).
+// wrote), or in the kernel's last CTA out (the fan-out's count, bucketize.cu:
+// each CTA takes a ticket once its items are done, and the one that takes the
+// last goes on; none waits for it). The proxy's scans over its items are
+// CUB's (cub::DeviceScan, proxy.cu), whose CTAs wait only for CTAs of their
+// own grid that started before them and (from CCCL 3.3, launched by
+// programmatic dependent launch) for the kernel before their own, whose CTAs
+// have all started or ended.
 #pragma once
 
 #include <ATen/ATen.h>
@@ -233,12 +235,10 @@ __device__ T cta_offsets_of(int64_t n, Value value, T *offsets) {
 // kItems values at a time, each thread kItems consecutive ones, all of whose values it reads
 // before the tile's one BlockScan: a tile costs one wait for its loads, so a long table costs
 // kItems times fewer. value(index) is called once for each index below n; write(index, offset)
-// gets each offset, and the total goes to every thread (no offsets[n]). Values wider than int64
-// (a pair of sums) take CUB's warp scans, and so may a caller short of registers (kAlgorithm):
-// its raking scan, the default, holds 16 values in each raking thread's registers.
-template <int kItems, typename T,
-          cub::BlockScanAlgorithm kAlgorithm =
-              (sizeof(T) > sizeof(int64_t) ? cub::BLOCK_SCAN_WARP_SCANS : cub::BLOCK_SCAN_RAKING),
+// gets each offset, and the total goes to every thread (no offsets[n]). A caller short of
+// registers may take CUB's warp scans (kAlgorithm): its raking scan, the default, holds 16 values
+// in each raking thread's registers.
+template <int kItems, typename T, cub::BlockScanAlgorithm kAlgorithm = cub::BLOCK_SCAN_RAKING,
           typename Value, typename Write>
 __device__ T cta_scan_blocked(int64_t n, Value value, Write write) {
   using Scan = cub::BlockScan<T, kThreads, kAlgorithm>;
@@ -274,8 +274,8 @@ __device__ T cta_scan_blocked(int64_t n, Value value, Write write) {
 // The values a thread of cta_scan_blocked takes at a time.
 constexpr int kScanItems = 8;
 // The values of type T a thread of cta_scan_blocked takes at a time where registers are short:
-// as many as kScanItems int32 values take, 32 bytes (4 int64 values, 2 pairs of int64), so a
-// kernel of kThreads keeps to 64 registers, two CTAs per SM, without spills.
+// as many as kScanItems int32 values take, 32 bytes (4 int64 values), so a kernel of kThreads
+// keeps to 64 registers, two CTAs per SM, without spills.
 template <typename T>
 constexpr int scan_items() {
   constexpr int kBytes = kScanItems * (int)sizeof(int32_t);
@@ -305,74 +305,6 @@ __device__ __forceinline__ int64_t warp_sum(int64_t value) {
   for (int offset = 16; offset > 0; offset /= 2)
     value += (int64_t)__shfl_xor_sync(0xffffffffu, (long long)value, offset);
   return value;
-}
-
-// Every thread of the CTA: the sum of value(index) for index in [0, n) (0
-// when n is 0), to every thread.
-template <typename T, typename Value>
-__device__ T cta_sum(int64_t n, Value value) {
-  using Reduce = cub::BlockReduce<T, kThreads>;
-  __shared__ typename Reduce::TempStorage reduce;
-  __shared__ T result;
-  T mine = 0;
-  for (int64_t index = threadIdx.x; index < n; index += kThreads) mine += (T)value(index);
-  const T sum = Reduce(reduce).Sum(mine);
-  if (threadIdx.x == 0) result = sum;
-  __syncthreads();
-  const T out = result;
-  __syncthreads();
-  return out;
-}
-
-// ── scans over a count only the device knows ──
-//
-// The offsets of value(0), ..., value(n - 1), n = *count, by a reduce-then-scan
-// in two kernels on the same G CTAs. G comes from the host (item_grid of the
-// count's capacity), so the host reads no count. CTA c takes the slice
-// [c * per, (c + 1) * per) of [0, n), per = ceil(n / G), cut at n (CtaSlice:
-// the slices past n are empty). slice_sums_kernel writes the sum of each
-// slice into partials[c] (T [G]). slice_scan_kernel adds the sums of the
-// slices before its own (a strided reduce, so any G works) to the offsets in
-// its slice (cta_scan_blocked, a tile of scan_items<T>() values a thread at a
-// time) and gives each to write(index, offset); CTA G - 1 also gives the
-// total to write(n, total), when its slice is empty too. Each kernel calls
-// value(index) once for each index of its slice, and both must get the same
-// values. No CTA waits for another: the second kernel reads what every CTA of
-// the first one wrote. So the scan reads and writes nothing past n, whatever
-// the capacity.
-
-// This CTA's slice of [0, n).
-struct CtaSlice {
-  int64_t lo, hi;
-  __device__ explicit CtaSlice(int64_t n) {
-    const int64_t ctas = gridDim.x, per = (n + ctas - 1) / ctas;
-    lo = min((int64_t)blockIdx.x * per, n);
-    hi = min(lo + per, n);
-  }
-};
-
-// The sum of each CTA's slice into partials[blockIdx.x].
-template <typename T, typename Value>
-__global__ void __launch_bounds__(kThreads)
-    slice_sums_kernel(const int64_t *count, Value value, T *partials) {
-  const CtaSlice slice(*count);
-  const T sum =
-      cta_sum<T>(slice.hi - slice.lo, [&](int64_t index) { return value(slice.lo + index); });
-  if (threadIdx.x == 0) partials[blockIdx.x] = sum;
-}
-
-// The offsets in each CTA's slice, after the sums of the slices before it
-// (partials: slice_sums_kernel's), to write; and from CTA G - 1 the total.
-template <typename T, typename Value, typename Write>
-__global__ void __launch_bounds__(kThreads)
-    slice_scan_kernel(const int64_t *count, Value value, const T *partials, Write write) {
-  const int64_t n = *count;
-  const CtaSlice slice(n);
-  const T base = cta_sum<T>(blockIdx.x, [&](int64_t cta) { return partials[cta]; });
-  const T total = cta_scan_blocked<scan_items<T>(), T>(
-      slice.hi - slice.lo, [&](int64_t index) { return value(slice.lo + index); },
-      [&](int64_t index, T offset) { write(slice.lo + index, base + offset); });
-  if (blockIdx.x == gridDim.x - 1 && threadIdx.x == 0) write(n, base + total);
 }
 
 }  // namespace hier_output_dist

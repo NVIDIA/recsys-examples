@@ -59,7 +59,7 @@ operator per sharding, `HierOutputDist`, does the work (section 7):
   GPU itself (NCCL GIN). Eight custom kernels move them and wait for peers
   (the *comm kernels*; with many features the first may take two grids
   beside it); the steps between them are kernels of its own, CUB's radix
-  sorts and one CUB scan (the *planner*). `input_dist()` queues all of it at
+  sorts and CUB's scans (the *planner*). `input_dist()` queues all of it at
   once. At the end every owner has a ready KeyedJaggedTensor (KJT) of the
   keys it looks up and the row of each key in its lookup output, and every
   GPU has the per-row maps of the output dist.
@@ -141,7 +141,7 @@ this dist with TorchRec's dists.
   not wait: the one before it pushes its row, the one after it lays out the
   node's items (section 10.2).
   **Planner**: the input dist's other steps, which lay a call out: kernels
-  of its own, and the radix sorts and a scan of CUB (NVIDIA's library of GPU
+  of its own, and the radix sorts and scans of CUB (NVIDIA's library of GPU
   algorithms), called from C++ (section 10).
 * **Capacity**: how many keys a part of the op's buffers holds, fixed when
   the op is built: `lookup_keys` and `remote_keys` (section 5). **Need**:
@@ -771,8 +771,8 @@ pipeline's data_dist stream (section 16).
 
 After the bucketize, `input_dist()` queues these steps, in this order, on
 every rank. A *comm* step is a comm kernel (section 10.2); the others are
-the planner's kernels, with CUB's radix sorts and its scan of the proxy's
-chunks.
+the planner's kernels, with CUB's radix sorts and its scans of the
+proxy.
 
 | step | kind | what it does | section |
 |---|---|---|---|
@@ -780,7 +780,7 @@ chunks.
 | `node_key_push` | comm | the bucketize's gather: this rank's keys into their places in its targets' `node_keys` over NVLink; on one node also the requester's map | 10.2 |
 | `node_done` | comm | tells its targets; waits until every requester of the node told it | 10.2 |
 | owner's KJT (one node) | kernel | a copy of the own part of `node_keys` | 10.3 |
-| node dedup | kernels, a CUB scan | the proxy's node-unique keys, rows, the chunks of its stream and their slots | 9, 10.4 |
+| node dedup | kernels, CUB's scans | the proxy's node-unique keys, rows, the chunks of its stream and their slots | 9, 10.4 |
 | push order | CUB, a kernel | its requesters' push orders and push tables | 10.4 |
 | `rail_exchange` | comm | its count message to each rail peer (a header the same to all, then the peer's own part), and theirs; then the rail layout from the rail's messages: where each proxy's key records land, this owner's KJT layout, where each lookup group's rows lie in its `lookup_rows` (`group_offsets`, `group_shift`), and the group runs of each source node's records here (`fwd_groups`) and of its node's keys at each rail owner (`bwd_groups`); the rail's needs | 10.2, 10.4 |
 | `rail_key_push` | comm | its key records to its rail owners; it does not wait | 10.2 |
@@ -1133,8 +1133,8 @@ stream, in the order of section 7.3. Seven of them are the comm kernels,
 `node_exchange` may take two grids beside it, and across nodes the
 requester kernel reads the node peers' windows (section 10.2). The planner
 does the rest (`src/hier_output_dist/input_dist/planner.h`): kernels of its
-own, CUB's radix sorts and CUB's scan of the proxy's chunks, on the current
-stream. Each step is one or a few ordinary kernels. A kernel over items
+own, CUB's radix sorts and CUB's scans of the proxy, on the current stream.
+Each step is one or a few ordinary kernels. A kernel over items
 (keys, rows, occurrences) runs a thread per item; a kernel over a step's
 small tables (sized by the nodes, ranks, features and chunks) runs on one
 CTA, which loops over them, but for the proxy's chunk layout, which runs on
@@ -1144,36 +1144,35 @@ A long scan on one CTA takes its values a tile at a time: each thread reads
 waits once per tile for its loads (`cta_scan_blocked`, `planner.cuh`). The
 owner's KJT offsets on the rail, the owner's record offsets of each other
 node (a CTA per node of the requester kernel) and the requester's remote
-task offsets take it. The proxy's offsets of its chunks' rows and reducer
-tasks take CUB's scan over the `max_chunks + 1` places of its stream, which
-reads and writes no place past the chunks but the one at their count
-(section 10.4). A scan over a count that only the device knows (the proxy's
-scans of its representatives and of its keys' rows, section 10.4)
-runs on a grid that the host sizes, in two kernels (`slice_sums_kernel`,
-`slice_scan_kernel`): each CTA takes a slice of the valid items and sums it,
-then each CTA adds the sums of the slices before its own to the offsets in
-its slice, a tile at a time. Neither reads past the count. Where registers
-are short, a thread takes 32 bytes of values a tile (4 int64 values, or 2
-pairs of them) rather than 8 values, which keeps its kernel to 64
-registers, two CTAs per SM, without spills: in the scan of the proxy's
-keys' rows (an int64 a key, or a pair of them), and in the requester
-kernel, whose remote task offsets also take CUB's warp scans rather than its
-raking scan.
+task offsets take it. The proxy's scans over its items are CUB's exclusive
+scan (`cub::DeviceScan`, two kernels each): of its representatives over the
+`remote_keys + 1` entries of its remote part, of its keys' rows over as many
+keys, and of its chunks' rows and reducer tasks over the `max_chunks + 1`
+places of its stream (section 10.4). The host sizes each by those counts.
+A counting iterator, through a function that gives an item's value below a
+count that only the device knows and 0 past it, feeds it, and a tabulate
+iterator takes its sums, writing the items up to the count and none past
+it. So a scan reads and writes no item past the count but the one at it.
+Where registers are short, a thread takes 32 bytes of values a tile (4
+int64 values) rather than 8 values, which keeps its kernel to 64 registers,
+two CTAs per SM, without spills: in the requester kernel, whose remote task
+offsets also take CUB's warp scans rather than its raking scan.
 No kernel of the planner's own waits for another CTA: a step that needs
 every item done goes on in its next kernel, or in the kernel's last CTA
 out. That is the fan-out table's counts (section 10.1): each CTA takes a
 ticket once its items are done, and the CTA that takes the last ticket goes
 on. It goes on because every other CTA has already arrived, not because it
-waited for one. CUB's scan and its radix sorts' onesweep passes carry each
+waited for one. CUB's scans and its radix sorts' onesweep passes carry each
 tile's sums to the later tiles by decoupled look-back: a CTA waits only for
 CTAs of its own grid that started before it. From CCCL 3.3, CUB also
-launches its scan's two kernels by programmatic dependent launch: a CTA of
+launches each scan's two kernels by programmatic dependent launch: a CTA of
 each may start before the kernel before it ends, and waits for that kernel
 (`cudaGridDependencySynchronize`) before it reads or writes memory. It
 starts only once every CTA of that kernel has started or ended, so it never
-waits for a CTA that cannot run. The scan also lets the next kernel start
-before it stores its sums; the kernel after it, `key_rows_kernel`, is an
-ordinary launch, so it waits for the whole scan. The
+waits for a CTA that cannot run. A scan also lets the next kernel start
+before it stores its sums; the kernels after the proxy's scans
+(`key_tables_kernel`, `chunk_layout_kernel` and `key_rows_kernel`) are
+ordinary launches, so each waits for the whole scan. The
 tensors' sizes are what the host knows from the call's keys, the
 capacities and the topology. The counts that only the
 device knows (valid keys, node-unique keys, chunks) stay on the device, and
@@ -1551,13 +1550,14 @@ read:
   of each chunk start (the last: where they end), relative to that
   requester's push order.
 
-**Its node dedup** takes five launches and no sort (`proxy_keys`,
-`input_dist/proxy.cu`); with `node_dedup=False` it takes two, without the
-hash table and the scan. Only the device knows how many occurrences are
-valid (the count). The host sizes every table and grid by what it knows:
-`remote_keys`, `local_size`, the bucket features (`num_nodes ×
-num_features`) and the SMs. The kernels read the count to bound their
-loops, so none of them reads or clears past the valid occurrences:
+**Its node dedup** takes five launches, two of them CUB's scan, and no sort
+(`proxy_keys`, `input_dist/proxy.cu`); with `node_dedup=False` it takes two,
+without the hash table and the scan. Only the device knows how many
+occurrences are valid (the count). The host sizes every table, grid and the
+scan by what it knows: `remote_keys`, `local_size`, the bucket features
+(`num_nodes × num_features`) and the SMs. The kernels read the count to
+bound their loops, so none of them reads or clears past the valid
+occurrences:
 
 * one kernel clears the part of a hash table of the call that the call
   takes. The caching allocator gives a power of two of at least `2 ×
@@ -1577,11 +1577,18 @@ loops, so none of them reads or clears past the valid occurrences:
   `atomicMin` of (bucket feature, occurrence), counts the occurrence, puts
   it in a list of the identity's occurrences, and adds its weight as an
   `int64`;
-* two kernels count the representatives before each valid occurrence, a
-  scan over slices of the valid occurrences, one slice per CTA (section 10):
-  the first marks each occurrence of its slice that is its identity's
-  representative and sums them, and the second adds the sums of the slices
-  before its own to the offsets in its slice;
+* CUB's exclusive scan (`cub::DeviceScan`, two kernels, `cub_scan`)
+  counts the representatives before each valid occurrence (section 10).
+  The host sizes it by the `remote_keys + 1` entries of the remote part
+  and its end (tiles of 3,072 on an H100), whatever the count. A counting
+  iterator, through a function that tells whether an occurrence below the
+  count is its identity's representative (two loads: its identity, then
+  the identity's representative) and gives 0 past the count, feeds it, and
+  a tabulate iterator takes its sums, writing the occurrences up to the
+  count (at the count all the representatives) and none past it. Its tiles
+  past the count read the count alone and write nothing. Its scratch,
+  8 bytes per tile, comes after the representatives' table, in its
+  allocation;
 * a thread per occurrence takes its key `uniq` from its representative,
   and its rank among its key's occurrences from the list. The
   representative writes its key's tables. The representative is the `k`-th
@@ -1618,22 +1625,38 @@ The buckets the call takes are at least twice its valid occurrences, so it
 clears and walks no more of the table than its keys need, whatever
 `remote_keys` is.
 
-**Its rows and chunks** (`proxy_chunks_and_slots`) take seven launches, two
-of them CUB's scan of the chunks, and 16 allocations (15 with
-`rows_per_payload` 1; two of them the push order's keys and values; the
-scan's scratch comes after the chunks' tables, in their allocation). With
-CUB's scans over `remote_keys` they took ten launches, and with the chunk
-layout on one CTA, its scans included, five launches and as many
-allocations. Only the device knows how many node-unique
-keys there are and how many chunks they make. The host sizes the tables,
-the grids and the scan by `remote_keys` and `max_chunks`, and the kernels
-read the two counts to bound their loops:
+**Its rows and chunks** (`proxy_chunks_and_slots`) take seven launches,
+four of them CUB's scans of the keys' rows and of the chunks, and 15
+allocations (14 with `rows_per_payload` 1; two of them the push order's
+keys and values; the two scans run one after the other on the stream and
+share one scratch, after the chunks' tables, in their allocation). With
+CUB's scans over plain tables of `remote_keys` entries they took ten
+launches; with the scan of the keys' rows on slices of the keys, in two
+kernels of its own, and the chunk layout on one CTA, five launches and 16
+allocations. Only the device knows how many node-unique keys there are and
+how many chunks they make. The host sizes the tables, the grids and the
+scans by `remote_keys` and `max_chunks`, and the kernels read the two
+counts to bound their loops:
 
-* two kernels count the rows before each key, a row per occurrence and at
-  most `max_key_rows`, and its counted rows before it (section 12.1): a scan
-  over slices of the node-unique keys, one slice per CTA, as the scan of the
-  representatives. With `rows_per_payload` above 1 one scan takes both, a
-  pair of sums per value; else the counted rows are the rows;
+* CUB's exclusive scan (`cub_scan`) counts the rows before each key, a row
+  per occurrence and at most `max_key_rows`, and its counted rows before it
+  (section 12.1). As the scan of the representatives, the host sizes it by
+  the `remote_keys + 1` keys of the remote part and their end, whatever
+  the count; a function gives each key's rows below the node-unique keys'
+  count and 0 past it, and the sums go to the keys up to the count (at the
+  count all the rows) and to none past it. With `rows_per_payload` above 1
+  one scan takes both. Where their sums fit in 32 bits each, it takes them
+  in one word per key, the counted rows << 32 | the rows: the rows are at
+  most `remote_keys`, below 2^31, and a key counts at most
+  `rows_per_payload` times its rows, so the host checks that
+  `rows_per_payload × remote_keys` is below 2^32 (at 4 rows per payload,
+  `remote_keys` below 2^30). CUB tunes its tiles for a word as for an int64
+  (2,688 keys on an H100, 16 bytes of scratch per tile). Else, or under the
+  test hook (section 18), it takes a pair of int64 sums per key, for which
+  CUB has no tuning: tiles of 384 keys, 36 bytes each, 7 times as many
+  tiles over the same keys. With `rows_per_payload` 1 the counted rows are
+  the rows, and the scan takes an int64 per key (tiles of 2,688, 16 bytes
+  each);
 * one kernel lays out the chunks of the stream, on a grid that the host
   sizes by `max_chunks`: a warp per place, at most two CTAs per SM (one CTA
   for up to 16 places). Every CTA first keeps each owner node's chunks,
@@ -1648,7 +1671,7 @@ read the two counts to bound their loops:
   warp, 16 probes a round. It gives each chunk its keys, its rows and its
   reducer tasks. It loops over the chunks and the owner nodes, never over
   `max_chunks`;
-* CUB's exclusive scan (`cub::DeviceScan`, two kernels, `scan_chunks`)
+* CUB's exclusive scan (`cub::DeviceScan`, two kernels, `cub_scan`)
   gives each chunk the rows and the reducer tasks of the chunks before it,
   a pair of int64 sums per place. The host sizes it by the `max_chunks + 1`
   places of the stream: a counting iterator, through a function that gives
@@ -2477,9 +2500,9 @@ of the call before (section 13).
   on its peers (`rail_done` for its rail peers' `rail_key_push`, which
   never waits), for credits from earlier out kernels, and for its own
   rank's earlier work. The planner's kernels, the pushes, `node_exchange`'s
-  grids and the requester kernel never wait; in CUB's scan and radix sorts
+  grids and the requester kernel never wait; in CUB's scans and radix sorts
   a CTA waits only for CTAs of its own grid that started before it, and in
-  the scan (from CCCL 3.3) for the kernel before its own, whose CTAs have
+  the scans (from CCCL 3.3) for the kernel before its own, whose CTAs have
   all started or ended (section 10). The
   op orders nothing across streams: the caller orders the kernels the same
   way on every rank (section 4.2). It makes the same calls in the
@@ -2521,8 +2544,8 @@ such a comm kernel, 32 to NCCL's kernels, and one to spare. It takes at least
 reducing one). `want` is `DYNAMICEMB_HIER_OUT_CTAS` when set, else 32, or 64
 for the backward on one node (section 4.4). The input dist's other kernels,
 `node_exchange`'s grids among them, never wait (section 13), so they need no
-SM of their own; a CTA of CUB's scan or radix sorts waits only for CTAs of
-its own grid that started before it, or (the scan's, from CCCL 3.3) for the
+SM of their own; a CTA of CUB's scans or radix sorts waits only for CTAs of
+its own grid that started before it, or (the scans', from CCCL 3.3) for the
 kernel before its own, whose CTAs have all started or ended (section 10).
 The kernels of the
 heavy rows do not wait for peers either. They can use all SMs. **Example**, H100 (132
@@ -2586,17 +2609,21 @@ The proxy's figure counts its steps' live tensors. Its node dedup holds
 about 52 bytes per entry, 64 with weights: during the insert its hash table
 (the bucket heads, 8 to 16 bytes, and the chain links, 4) and each
 identity's state (24, or 32 with weights), then that state, the
-representatives before each occurrence and its tables per occurrence and
-per key. Its next step holds the rows before each key (int64), and with
-`rows_per_payload` above 1, as by default, the counted rows before each key
-(int64), while it cuts its chunks and gives the slots: about 52 bytes per
-entry, 56 with weights, no more than its node dedup. Its tables of the
-chunks take 32 bytes per place of `max_chunks` while it lays them out
-(each chunk's rows and reducer tasks, the rows before it and before its
-lap), and after them CUB's scan of them a few KB of scratch. Its push
-order holds the rows before each key, and the sort's push keys and indices
-in and out with CUB's extra key and index buffers: about 32 bytes per entry
-(44 with int64 push keys).
+representatives before each occurrence (and after them the scratch of CUB's
+scan of them, 8 bytes per 3,072 entries on an H100) and its tables per
+occurrence and per key. Its next step holds the rows before each key
+(int64), and with `rows_per_payload` above 1, as by default, the counted
+rows before each key (int64), while it cuts its chunks and gives the slots:
+about 52 bytes per entry, 56 with weights, no more than its node dedup. Its
+tables of the chunks take 32 bytes per place of `max_chunks` while it lays
+them out (each chunk's rows and reducer tasks, the rows before it and
+before its lap), and after them the scratch of CUB's scans of the keys'
+rows and of the chunks, which take the same bytes in turn: on an H100 16
+bytes per 2,688 entries of `remote_keys` (75 KB at 12.6 million; 36 bytes
+per 384 entries, 1.2 MB, where the keys' rows take a pair of int64 sums
+each), and a few KB for the chunks. Its push order holds the rows before
+each key, and the sort's push keys and indices in and out with CUB's extra
+key and index buffers: about 32 bytes per entry (44 with int64 push keys).
 
 The constructors of the layouts size the window's buffers as above
 (`CtrlLayout`, `KeysLayout` and `RowsLayout`, in `window.h`). The buffers
@@ -2974,12 +3001,9 @@ chunks, as the owner's tables do there.
 of the process run its rows on `ctas` CTAs, or as their sizes choose (0).
 
 Four more hooks reach into the proxy's steps.
-`hier_output_dist_scan_ctas(ctas)` makes each later proxy step of the
-process run its scans over a count only the device knows (of the
-representatives and of the keys' rows, section 10.4) on `ctas` CTAs, or as
-their sizes choose (0). `hier_output_dist_chunk_ctas(ctas)` makes each
-later proxy step lay out the chunks of its stream on `ctas` CTAs, or as
-`max_chunks` chooses (0: a warp per place).
+`hier_output_dist_chunk_ctas(ctas)` makes each later proxy step lay out the
+chunks of its stream on `ctas` CTAs, or as `max_chunks` chooses (0: a warp
+per place).
 `hier_output_dist_proxy_garbage(fill)` makes each later proxy step set
 every bit of the rows before each key, its chunk table, its
 `reduce_task_offsets` and its push keys' indices, and make each push key
@@ -2992,6 +3016,10 @@ stream's chunks may pass (no call that fits `remote_keys` does).
 `hier_output_dist_push_keys64(on)` makes each later proxy step sort its
 push order by int64 push keys, which the sizes choose only for a proxy
 header of 8 GiB or more (section 10.4).
+`hier_output_dist_row_counts64(on)` makes each later proxy step with
+`rows_per_payload` above 1 scan its keys' rows and counted rows as a pair
+of int64 sums, which the sizes choose only when `rows_per_payload ×
+remote_keys` reaches 2^32 (section 10.4).
 
 `test_hier_bucketize.py` plays every rank of one node with the first two
 hooks. Each rank's offsets are those its in channel writes (section 10.1),
@@ -3013,12 +3041,18 @@ group per feature. Its proxies meet counts of valid occurrences far below
 the chunks), equal to it, and of 0 in a call that fits (a node whose
 requesters ask only its own owners); 600 and 1,100 features on 4 nodes
 (2,400 and 4,400 bucket features at a proxy, most of their blocks empty);
-and the scans on 2, 3, 264 and 600 CTAs in calls of a few hundred
-occurrences a proxy (on 264 also at counts of `remote_keys` and of 0), and
-on 1, 2 and 600 CTAs in calls of 4,000 to 21,000 (on 1 and 2 slices of
-several tiles; on 600 slices of about 20 to 35 occurrences, also in the CTAs
-past a CTA's 512 threads), each with `rows_per_payload` 1 and above 1 (the
-rows' scan of a pair of sums). Its proxies lay out their chunks on the grid
+and their scans (CUB's, over `remote_keys + 1` items) in calls of a few
+hundred occurrences a proxy (a tile or two) and of 2,000 to 24,000 (up to 9
+tiles), each with `rows_per_payload` 1 and above 1 (the rows' scan of a
+word of two sums), also with the rows' scan of a pair of int64 sums
+(`hier_output_dist_row_counts64`, up to 57 tiles), and at the edges of a
+tile: a proxy of 2,688 to 3,073 occurrences of 2,687 to 3,072 node-unique
+keys (an H100's tiles are 3,072 int32 values, 2,688 int64 values or words
+and 384 pairs), with `remote_keys` at the count, the total of 2,688 keys'
+rows alone in the last tile of words and of pairs, or whole tiles past it.
+Past its node-unique keys each word of a proxy's rows before each key keeps
+the garbage the hook filled in: the scan writes none of them. Its proxies
+lay out their chunks on the grid
 `max_chunks` chooses (one CTA at 16 places or fewer), and on 1 CTA for up
 to 4,800 chunks (about 300 a warp; CUB's scan of the chunks in 13 tiles of
 384 places), on 3 CTAs in rings of up to 6 laps (and up to 7,000 chunks),
@@ -3235,17 +3269,18 @@ Paths from `corelib/dynamicemb`.
       CUB calls in `cub.cu` (radix sorts); `planner.cuh`: what the
       planner's kernels share (how they are launched, searches in sorted
       tables, among them a warp's and a half warp's, the offsets of sorted
-      runs, a CTA's scans, among them the blocked one, `cta_scan_blocked`,
-      and the scans over a count only the device knows, `slice_sums_kernel`
-      and `slice_scan_kernel`). The bucketize is in `bucketize.cu` and the
+      runs, and a CTA's scans, among them the blocked one,
+      `cta_scan_blocked`). The bucketize is in `bucketize.cu` and the
       proxy in `proxy.cu` (with its node dedup's hash table, `Identities`,
       which takes index dedup's chained insert from `src/dedup_chain.cuh`,
-      the hooks that set the CTAs of its scans, `force_scan_ctas`, and of
-      its chunk layout, `force_chunk_ctas`, fill tables of its second step
-      with garbage first, `fill_proxy_garbage`, and sort its push order by
-      int64 keys, `force_push_keys64`, the rounds of its chunks, cut by
-      counted rows, `Rounds`, its chunk layout on a grid,
-      `chunk_layout_kernel`, CUB's scan of its chunks, `scan_chunks`, on
+      the hooks that set the CTAs of its chunk layout, `force_chunk_ctas`,
+      fill tables of its second step with garbage first,
+      `fill_proxy_garbage`, sort its push order by int64 keys,
+      `force_push_keys64`, and scan its keys' rows by pairs of int64 sums,
+      `force_row_counts64`, the rounds of its chunks, cut by counted rows,
+      `Rounds`, its chunk layout on a grid, `chunk_layout_kernel`, CUB's
+      scans of its representatives, its keys' rows (in one word each where
+      their sums fit, `row_counts_in_word`) and its chunks, `cub_scan`, on
       iterators of its own, and where its chunks lie, `StreamPlaces`); the
       node layout, the push, the count message, the rail layout, the owner's
       records and the requester's tables as the hooks run them

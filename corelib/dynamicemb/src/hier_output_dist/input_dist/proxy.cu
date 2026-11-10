@@ -224,29 +224,25 @@ __global__ void __launch_bounds__(kThreads)
   }
 }
 
-// The scan of the representatives (slice_sums_kernel, slice_scan_kernel):
-// whether each valid occurrence is its identity's representative. The first
-// kernel finds it and keeps it in is_rep (bool [remote_keys], below the count
-// only); the second reads it there. The scan writes reps_before (int32
-// [remote_keys + 1]): the representatives before each valid occurrence, and
-// at the count all of them.
-struct FindRepresentative {
+// The scan of the representatives (CUB's scan over remote_keys + 1
+// occurrences, cub_scan): whether each valid occurrence is its identity's
+// representative, read in the identities' table; past the count 0, which
+// reads nothing. The scan writes reps_before (int32 [remote_keys + 1]): the
+// representatives before each valid occurrence, and at the count all of them;
+// past the count it writes nothing.
+struct IsRepresentative {
+  const int64_t *occurrence_count;
   Identities ids;
-  bool *is_rep;
-  __device__ int32_t operator()(int64_t occurrence) const {
-    const bool rep = representative_of(ids.rep[ids.identity_of[occurrence]]) == occurrence;
-    is_rep[occurrence] = rep;
-    return rep;
+  __device__ int32_t operator()(int occurrence) const {
+    if (occurrence >= *occurrence_count) return 0;
+    return representative_of(ids.rep[ids.identity_of[occurrence]]) == occurrence;
   }
 };
-struct IsRepresentative {
-  const bool *is_rep;
-  __device__ int32_t operator()(int64_t occurrence) const { return is_rep[occurrence]; }
-};
 struct RepsBefore {
+  const int64_t *occurrence_count;
   int32_t *reps_before;
   __device__ void operator()(int64_t occurrence, int32_t reps) const {
-    reps_before[occurrence] = reps;
+    if (occurrence <= *occurrence_count) reps_before[occurrence] = reps;
   }
 };
 
@@ -428,54 +424,77 @@ __global__ void __launch_bounds__(kThreads)
 
 // ── step 2: the rows, the chunks and the slots ──
 
-// The scan of the keys' rows (slice_sums_kernel, slice_scan_kernel) over the
-// node-unique keys: each key's rows in proxy_rows, one for each occurrence, at
-// most max_key_rows (a call with more raises: kNeedKeyRows), and its counted
-// rows in its chunk, its rows but at least rows_per_payload
-// (Sizes::max_counted_rows), the two in one value (RowCounts). Both kernels
-// read each key's occurrences. The scan writes the rows before each key
-// (node_exp_off, int64 [remote_keys + 1]) and the counted rows before each key
-// (counted_off, the same), and at node_num_uniques all of them; past it the
-// tables hold garbage, which no step reads. With rows_per_payload 1 the
-// counted rows are the rows: the scan takes the rows alone (KeyRows), and
-// counted_off is node_exp_off.
+// The scan of the keys' rows (CUB's scan over remote_keys + 1 keys, cub_scan)
+// over the node-unique keys: each key's rows in proxy_rows, one for each
+// occurrence, at most max_key_rows (a call with more raises: kNeedKeyRows),
+// and its counted rows in its chunk, its rows but at least rows_per_payload
+// (Sizes::max_counted_rows), the two in one value (RowCounts); past
+// node_num_uniques 0, which reads nothing. The scan writes the rows before
+// each key (node_exp_off, int64 [remote_keys + 1]) and the counted rows before
+// each key (counted_off, the same), and at node_num_uniques all of them. It
+// writes nothing past node_num_uniques: the tables hold garbage there, which
+// no step reads. With rows_per_payload 1 the counted rows are the rows: the
+// scan takes the rows alone (KeyRows), and counted_off is node_exp_off.
+// Where their sums fit in 32 bits each (row_counts_in_word), the scan takes
+// the two in one word (KeyRowCountsWord, RowCountsWordBefore): CUB tunes its
+// tiles for a word (2,688 keys on an H100), not for a pair (384 keys), and
+// the scan runs over all remote_keys + 1 keys, whatever node_num_uniques is.
 struct RowCounts {
   int64_t rows, counted;
-  RowCounts() = default;
-  __host__ __device__ RowCounts(int zero) : rows(zero), counted(zero) {}  // the scans' 0
-  __host__ __device__ RowCounts(int64_t key_rows, int64_t counted_rows)
-      : rows(key_rows), counted(counted_rows) {}
   __host__ __device__ RowCounts operator+(const RowCounts &other) const {
-    return RowCounts(rows + other.rows, counted + other.counted);
-  }
-  __host__ __device__ RowCounts &operator+=(const RowCounts &other) {
-    return *this = *this + other;
+    return RowCounts{rows + other.rows, counted + other.counted};
   }
 };
+// A key's rows and counted rows in one word: the counted rows << 32 | the
+// rows. A sum of such words is the word of the sums while the sum of the rows
+// stays below 2^32 and that of the counted rows too (row_counts_in_word).
+__device__ __forceinline__ unsigned long long row_counts_word(const RowCounts &counts) {
+  return (unsigned long long)counts.counted << 32 | (unsigned long long)counts.rows;
+}
 struct KeyRows {
+  const int64_t *node_num_uniques;
   const int32_t *key_occurrences;
   int32_t max_key_rows;
-  __device__ int64_t operator()(int64_t key) const {
+  __device__ int64_t operator()(int key) const {
+    if (key >= *node_num_uniques) return 0;
     return min(key_occurrences[key], max_key_rows);
   }
 };
 struct KeyRowCounts {
   KeyRows key_rows;
   int32_t rows_per_payload;
-  __device__ RowCounts operator()(int64_t key) const {
+  __device__ RowCounts operator()(int key) const {
+    if (key >= *key_rows.node_num_uniques) return RowCounts{0, 0};  // not rows_per_payload
     const int64_t rows = key_rows(key);
-    return RowCounts(rows, max(rows, (int64_t)rows_per_payload));
+    return RowCounts{rows, max(rows, (int64_t)rows_per_payload)};
   }
 };
 struct RowsBefore {
+  const int64_t *node_num_uniques;
   int64_t *node_exp_off;
-  __device__ void operator()(int64_t key, int64_t rows) const { node_exp_off[key] = rows; }
+  __device__ void operator()(int64_t key, int64_t rows) const {
+    if (key <= *node_num_uniques) node_exp_off[key] = rows;
+  }
 };
 struct RowCountsBefore {
+  const int64_t *node_num_uniques;
   int64_t *node_exp_off, *counted_off;
-  __device__ void operator()(int64_t key, RowCounts before) const {
+  __device__ void operator()(int64_t key, const RowCounts &before) const {
+    if (key > *node_num_uniques) return;
     node_exp_off[key] = before.rows;
     counted_off[key] = before.counted;
+  }
+};
+struct KeyRowCountsWord {
+  KeyRowCounts key_row_counts;
+  __device__ unsigned long long operator()(int key) const {
+    return row_counts_word(key_row_counts(key));
+  }
+};
+struct RowCountsWordBefore {
+  RowCountsBefore row_counts_before;
+  __device__ void operator()(int64_t key, unsigned long long before) const {
+    row_counts_before(key, RowCounts{(int64_t)(before & 0xffffffffull), (int64_t)(before >> 32)});
   }
 };
 
@@ -506,7 +525,7 @@ struct Rounds {
 // (chunk_counts), then a warp per chunk finds the chunk's keys, its rows and
 // its reducer tasks (chunk_table). CUB's scan over the places then gives the
 // rows and the reducer tasks before each chunk, and the rows before each lap
-// (scan_chunks). Last, a thread per place of key_rows_kernel's grid places
+// (cub_scan). Last, a thread per place of key_rows_kernel's grid places
 // each chunk in the ring (StreamPlaces), and writes the places past the
 // chunks as empty places. The kernels loop over the owner nodes and the
 // stream's chunks (num_chunks), not over max_chunks, but for the empty
@@ -680,7 +699,7 @@ __global__ void __launch_bounds__(kThreads, 2) chunk_layout_kernel(ChunkLayoutAr
               num_rounds);
 }
 
-// The scan over the stream's places (scan_chunks: CUB's exclusive scan,
+// The scan over the stream's places (cub_scan: CUB's exclusive scan,
 // cub::DeviceScan, over max_chunks + 1 places) gives each place the rows and
 // the reducer tasks of the chunks before it, in stream order. It takes its
 // values from a counting iterator through PlaceRowsTasks, and gives its sums
@@ -929,9 +948,6 @@ __global__ void __launch_bounds__(kThreads)
   }
 }
 
-// The test hook's CTAs of the scans over a device count (force_scan_ctas): 0,
-// as their sizes choose.
-int64_t g_scan_ctas = 0;
 // The test hook's CTAs of the chunk layout (force_chunk_ctas): 0, as
 // max_chunks chooses.
 int64_t g_chunk_ctas = 0;
@@ -942,11 +958,9 @@ bool g_proxy_garbage = false;
 // The test hook's push keys (force_push_keys64): whether they are int64
 // whatever their values.
 bool g_push_keys64 = false;
-
-// The CTAs of a scan over a device count of at most `capacity` items
-// (slice_sums_kernel, slice_scan_kernel): a thread per item, at most two CTAs
-// per SM, the same for both kernels.
-int scan_grid(int64_t capacity) { return g_scan_ctas > 0 ? (int)g_scan_ctas : item_grid(capacity); }
+// The test hook's scan of the keys' rows (force_row_counts64): whether it
+// takes a pair of int64 sums whatever the sizes.
+bool g_row_counts64 = false;
 
 // The CTAs of the chunk layout of a stream of at most max_chunks chunks
 // (chunk_layout_kernel): a warp per chunk, at most two CTAs per SM; or the
@@ -955,28 +969,45 @@ int chunk_grid(int64_t max_chunks) {
   return g_chunk_ctas > 0 ? (int)g_chunk_ctas : item_grid(32 * max_chunks);
 }
 
-// The rows and the reducer tasks before each place of a stream of at most
-// max_chunks chunks, and the rows before each lap (offsets: PlaceOffsets),
-// from each chunk's rows and reducer tasks (values: PlaceRowsTasks): CUB's
-// exclusive scan over the max_chunks + 1 places, its two kernels on the
-// current stream, in the `bytes` bytes of scratch at `scratch`. With no
-// scratch it only sets `bytes`, on the host, by the places alone, as CUB's
-// calls do; the caller keeps the scratch after the chunks' tables, in their
-// allocation from the caching allocator on the current stream.
+// The proxy's scans: CUB's exclusive scan (cub::DeviceScan) over `items`
+// items, a count the host knows (remote_keys + 1 for the representatives and
+// for the keys' rows, max_chunks + 1 for the chunks). A counting iterator
+// through `value` gives each item's value, of type T, and a tabulate iterator
+// through `write` takes the sum of the values before each item, from T{} (0).
+// The functors read a count only the device knows: `value` gives 0 past it,
+// which reads nothing, and `write` writes the sums up to it (at it all of
+// them) and nothing past it. Its two kernels run on the current stream, in the
+// `bytes` bytes of scratch at `scratch`. With no scratch it only sets `bytes`,
+// on the host, by the items, T and the GPU alone, as CUB's calls do; the
+// caller keeps the scratch at the end of a table of its own, in its allocation
+// from the caching allocator on the current stream.
 // From CCCL 3.3, CUB launches both kernels by programmatic dependent launch
-// (PDL), and the scan lets the next kernel start before it stores its offsets.
-// key_rows_kernel, which reads them, is a plain launch, so it waits for the
-// whole scan; launched by PDL, it would have to call
-// cudaGridDependencySynchronize() before its first read.
-void scan_chunks(void *scratch, size_t &bytes, const PlaceRowsTasks &values,
-                 const PlaceOffsets &offsets, int64_t max_chunks) {
-  TORCH_CHECK(max_chunks < INT32_MAX,
-              "hier_output_dist: CUB's scan of a stream takes fewer than 2^31 places");
-  const auto in = cuda::make_transform_iterator(cuda::make_counting_iterator(0), values);
-  const auto out = cuda::make_tabulate_output_iterator(offsets);
-  AT_CUDA_CHECK(cub::DeviceScan::ExclusiveScan(scratch, bytes, in, out, cuda::std::plus<>{},
-                                               RowsTasks{0, 0}, (int)max_chunks + 1,
-                                               current_stream()));
+// (PDL): each waits for the kernel before it, then reads or writes memory,
+// and the scan lets the next kernel start before it stores its sums.
+// The kernels that read the sums next (key_tables_kernel, chunk_layout_kernel
+// and key_rows_kernel) are plain launches, so each waits for the whole scan;
+// launched by PDL, one would have to call cudaGridDependencySynchronize()
+// before its first read.
+template <typename T, typename Value, typename Write>
+void cub_scan(void *scratch, size_t &bytes, const Value &value, const Write &write, int64_t items) {
+  TORCH_CHECK(items <= INT32_MAX,
+              "hier_output_dist: CUB's scans of the proxy take fewer than 2^31 items");
+  const auto in = cuda::make_transform_iterator(cuda::make_counting_iterator(0), value);
+  const auto out = cuda::make_tabulate_output_iterator(write);
+  AT_CUDA_CHECK(cub::DeviceScan::ExclusiveScan(scratch, bytes, in, out, cuda::std::plus<>{}, T{},
+                                               (int)items, current_stream()));
+}
+
+// Whether the scan of the keys' rows (rows_per_payload above 1) takes each
+// key's rows and counted rows in one word (row_counts_word), as the host
+// knows: the sums of each fit in 32 bits, and the test hook is off
+// (force_row_counts64). A key has at most a row per valid occurrence, so the
+// keys' rows are at most remote_keys, below 2^31; and it counts at most
+// rows_per_payload times its rows (it has a row at least), so their counted
+// rows are at most rows_per_payload * remote_keys. Else the scan takes a pair
+// of int64 sums (RowCounts).
+bool row_counts_in_word(const Sizes &sizes) {
+  return !g_row_counts64 && sizes.rows_per_payload * sizes.remote_keys <= (int64_t)UINT32_MAX;
 }
 
 // A new table of step 2 for its kernels to write (at::empty); under the test
@@ -1010,13 +1041,6 @@ void with_push_key(const at::Tensor &push_key, Launch &&launch) {
 
 }  // namespace
 
-void force_scan_ctas(int64_t ctas) {
-  TORCH_CHECK(ctas >= 0 && ctas <= INT32_MAX,
-              "hier_output_dist: the scans' CTAs: 0 (as their sizes choose) or a grid of at most "
-              "2^31 - 1");
-  g_scan_ctas = ctas;
-}
-
 void force_chunk_ctas(int64_t ctas) {
   TORCH_CHECK(ctas >= 0 && ctas <= INT32_MAX,
               "hier_output_dist: the chunk layout's CTAs: 0 (as max_chunks chooses) or a grid of "
@@ -1027,6 +1051,8 @@ void force_chunk_ctas(int64_t ctas) {
 void fill_proxy_garbage(bool fill) { g_proxy_garbage = fill; }
 
 void force_push_keys64(bool on) { g_push_keys64 = on; }
+
+void force_row_counts64(bool on) { g_row_counts64 = on; }
 
 ProxyBuffers proxy_buffers(at::Tensor remote_map, at::Tensor key_stage, const ProxyHeader &header,
                            const at::TensorOptions &options) {
@@ -1095,8 +1121,10 @@ ProxyKeys proxy_keys(const ProxyInput &input, const Sizes &sizes, bool node_dedu
                                 keys.need_key_rows.data_ptr<int64_t>());
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   // The representatives before each valid occurrence (without node dedup each
-  // occurrence is one: none needed), a scan over the count's slices of the
-  // same CTAs in both kernels (scan_grid).
+  // occurrence is one: none needed), by CUB's scan over remote_keys + 1
+  // occurrences (cub_scan), which takes the valid ones alone. Its scratch
+  // comes after the representatives' table, in its allocation (cub_scan gives
+  // its bytes on the host).
   at::Tensor reps_before;
   if (node_dedup) {
     insert_kernel<<<item_grid(entries), kThreads, 0, stream>>>(
@@ -1107,18 +1135,13 @@ ProxyKeys proxy_keys(const ProxyInput &input, const Sizes &sizes, bool node_dedu
     bucket_head.reset();  // the inserts are done
     chain_next.reset();
     ids.bucket_head = ids.chain_next = nullptr;
-    const int scan_ctas = scan_grid(entries);
-    const at::Tensor is_rep = at::empty({entries}, input.node_keys.options().dtype(at::kBool));
-    const at::Tensor partials = at::empty({scan_ctas}, int_options);  // each slice's
-    reps_before = at::empty({entries + 1}, int_options);
-    slice_sums_kernel<int32_t><<<scan_ctas, kThreads, 0, stream>>>(
-        keys.occurrence_count.data_ptr<int64_t>(), FindRepresentative{ids, is_rep.data_ptr<bool>()},
-        partials.data_ptr<int32_t>());
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
-    slice_scan_kernel<int32_t><<<scan_ctas, kThreads, 0, stream>>>(
-        keys.occurrence_count.data_ptr<int64_t>(), IsRepresentative{is_rep.data_ptr<bool>()},
-        partials.data_ptr<int32_t>(), RepsBefore{reps_before.data_ptr<int32_t>()});
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    const int64_t *occurrence_count = keys.occurrence_count.data_ptr<int64_t>();
+    size_t scan_bytes = 0;
+    cub_scan<int32_t>(nullptr, scan_bytes, IsRepresentative{}, RepsBefore{}, entries + 1);
+    reps_before = at::empty({entries + 1 + ceil_div<4>((int64_t)scan_bytes)}, int_options);
+    cub_scan<int32_t>(reps_before.data_ptr<int32_t>() + entries + 1, scan_bytes,
+                      IsRepresentative{occurrence_count, ids},
+                      RepsBefore{occurrence_count, reps_before.data_ptr<int32_t>()}, entries + 1);
   }
   // Per occurrence its key (with node dedup the requesters in turn inside
   // each bucket feature) and its rank there, and per key its tables; where
@@ -1170,40 +1193,36 @@ ProxyChunks proxy_chunks_and_slots(ProxyKeys &keys, const at::Tensor &remote_off
   ProxyChunks chunks;
   // The rows before each key, a row per occurrence (max_key_rows at most),
   // and the counted rows before each key, its rows but at least
-  // rows_per_payload (the rows' when rows_per_payload is 1): a scan over the
-  // node-unique keys' slices, of the same CTAs in both kernels (scan_grid).
-  const int64_t *node_num_uniques = keys.node_num_uniques.data_ptr<int64_t>();
-  const KeyRows key_rows{keys.key_occurrences.data_ptr<int32_t>(), (int32_t)sizes.max_key_rows()};
-  const int scan_ctas = scan_grid(entries);
-  chunks.node_exp_off = empty_table({entries + 1}, long_options);
-  at::Tensor counted_off = chunks.node_exp_off;
-  if (sizes.rows_per_payload > 1) {
-    counted_off = empty_table({entries + 1}, long_options);
-    const at::Tensor partials = at::empty({scan_ctas, 2}, long_options);  // each slice's
-    const KeyRowCounts value{key_rows, (int32_t)sizes.rows_per_payload};
-    slice_sums_kernel<RowCounts><<<scan_ctas, kThreads, 0, stream>>>(
-        node_num_uniques, value, records_of<RowCounts>(partials));
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
-    slice_scan_kernel<RowCounts><<<scan_ctas, kThreads, 0, stream>>>(
-        node_num_uniques, value, records_of<RowCounts>(partials),
-        RowCountsBefore{chunks.node_exp_off.data_ptr<int64_t>(), counted_off.data_ptr<int64_t>()});
-  } else {
-    const at::Tensor partials = at::empty({scan_ctas}, long_options);  // each slice's
-    slice_sums_kernel<int64_t><<<scan_ctas, kThreads, 0, stream>>>(node_num_uniques, key_rows,
-                                                                   partials.data_ptr<int64_t>());
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
-    slice_scan_kernel<int64_t><<<scan_ctas, kThreads, 0, stream>>>(
-        node_num_uniques, key_rows, partials.data_ptr<int64_t>(),
-        RowsBefore{chunks.node_exp_off.data_ptr<int64_t>()});
-  }
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
-  // The chunks of the stream (each owner node's, cut by its keys' counted
-  // rows, round after round) and key_stage's slices, a warp per place of
-  // max_chunks (chunk_grid); the stream's chunks to the proxy header too.
-  // Then the rows and the reducer tasks before each chunk, and the rows
-  // before each lap, by CUB's scan over the places (scan_chunks). Where each
+  // rows_per_payload (the rows' when rows_per_payload is 1), by CUB's scan
+  // over remote_keys + 1 keys (cub_scan), which takes the node-unique keys
+  // alone: the two in one word where their sums fit (row_counts_in_word),
+  // else a pair. Then the chunks of the stream (each owner node's, cut by its
+  // keys' counted rows, round after round) and key_stage's slices, a warp per
+  // place of max_chunks (chunk_grid); the stream's chunks to the proxy header
+  // too. Then the rows and the reducer tasks before each chunk, and the rows
+  // before each lap, by CUB's scan over the places (cub_scan). Where each
   // chunk lies, and the places past the chunks, come with the keys' rows
   // (key_rows_kernel).
+  const int64_t *node_num_uniques = keys.node_num_uniques.data_ptr<int64_t>();
+  chunks.node_exp_off = empty_table({entries + 1}, long_options);
+  const at::Tensor counted_off =
+      sizes.rows_per_payload > 1 ? empty_table({entries + 1}, long_options) : chunks.node_exp_off;
+  const KeyRows key_rows{node_num_uniques, keys.key_occurrences.data_ptr<int32_t>(),
+                         (int32_t)sizes.max_key_rows()};
+  const KeyRowCounts key_row_counts{key_rows, (int32_t)sizes.rows_per_payload};
+  const RowCountsBefore row_counts_before{node_num_uniques, chunks.node_exp_off.data_ptr<int64_t>(),
+                                          counted_off.data_ptr<int64_t>()};
+  const auto scan_rows = [&](void *scratch, size_t &bytes) {
+    if (sizes.rows_per_payload > 1 && row_counts_in_word(sizes))
+      cub_scan<unsigned long long>(scratch, bytes, KeyRowCountsWord{key_row_counts},
+                                   RowCountsWordBefore{row_counts_before}, entries + 1);
+    else if (sizes.rows_per_payload > 1)
+      cub_scan<RowCounts>(scratch, bytes, key_row_counts, row_counts_before, entries + 1);
+    else
+      cub_scan<int64_t>(scratch, bytes, key_rows,
+                        RowsBefore{node_num_uniques, chunks.node_exp_off.data_ptr<int64_t>()},
+                        entries + 1);
+  };
   chunks.chunk_length_per_bucket = at::empty({num_nodes}, long_options);
   chunks.chunk_offset_per_bucket = at::empty({num_nodes + 1}, long_options);
   chunks.num_chunks = at::empty({}, long_options);
@@ -1213,16 +1232,20 @@ ProxyChunks proxy_chunks_and_slots(ProxyKeys &keys, const at::Tensor &remote_off
   chunks.reduce_task_offsets = empty_table({max_chunks + 1}, long_options);
   // each chunk's rows and reducer tasks, the rows before each chunk, and the
   // rows before each lap's first chunk (table_words each), then the scratch
-  // of CUB's scan of the chunks (scan_chunks gives its bytes on the host), in
-  // one allocation
+  // of CUB's scans of the keys' rows and of the chunks (cub_scan gives their
+  // bytes on the host), in one allocation. The two scans run one after the
+  // other on the stream, so they share the scratch, of the larger bytes.
   const int64_t table_words = max_chunks + 1;
-  size_t scan_bytes = 0;
-  scan_chunks(nullptr, scan_bytes, PlaceRowsTasks{}, PlaceOffsets{}, max_chunks);
+  size_t rows_bytes = 0, chunk_bytes = 0;
+  scan_rows(nullptr, rows_bytes);
+  cub_scan<RowsTasks>(nullptr, chunk_bytes, PlaceRowsTasks{}, PlaceOffsets{}, max_chunks + 1);
+  size_t scan_bytes = std::max(rows_bytes, chunk_bytes);
   const at::Tensor chunk_tables =
       empty_table({4 * table_words + ceil_div<8>((int64_t)scan_bytes)}, long_options);
   int64_t *rows_of = chunk_tables.data_ptr<int64_t>(), *reduce_tasks = rows_of + table_words,
           *stream_offsets = rows_of + 2 * table_words, *lap_offsets = rows_of + 3 * table_words,
           *scan_scratch = rows_of + 4 * table_words;
+  scan_rows(scan_scratch, scan_bytes);
   const Rounds rounds{counted_off.data_ptr<int64_t>(),
                       chunks.node_exp_off.data_ptr<int64_t>(),
                       keys.node_offset_per_bucket.data_ptr<int64_t>(),
@@ -1249,11 +1272,11 @@ ProxyChunks proxy_chunks_and_slots(ProxyKeys &keys, const at::Tensor &remote_off
       layout_args);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   uint32_t *header_end = (uint32_t *)buffers.end.data_ptr<int32_t>();
-  scan_chunks(
+  cub_scan<RowsTasks>(
       scan_scratch, scan_bytes, PlaceRowsTasks{layout_args.num_chunks, rows_of, reduce_tasks},
       PlaceOffsets{layout_args.num_chunks, rows_of, sizes.lap_span(), max_chunks, stream_offsets,
                    chunks.reduce_task_offsets.data_ptr<int64_t>(), lap_offsets, header_end},
-      max_chunks);
+      max_chunks + 1);
   const StreamPlaces places{stream_offsets, lap_offsets, sizes.num_proxy_rows, sizes.lap_span(),
                             max_chunks};
   // Per key: its chunk, its row and its duplicates' first slot there, and

@@ -15,10 +15,10 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 # limitations under the License.
 ******************************************************************************/
 // The planner's CUB calls on tensors (planner.h): radix sorts, in this one
-// translation unit; the proxy's scan of its chunks, whose iterators are the
-// proxy's own, is in proxy.cu (scan_chunks). Each sizes its scratch on the
-// host first, then runs; the scratch comes from the caching allocator on the
-// current stream.
+// translation unit; the proxy's scans (of its representatives, its keys' rows
+// and its chunks), whose iterators are the proxy's own, are in proxy.cu
+// (cub_scan). Each sizes its scratch on the host first, then runs; the scratch
+// comes from the caching allocator on the current stream.
 
 #include <ATen/cuda/CUDAContext.h>
 

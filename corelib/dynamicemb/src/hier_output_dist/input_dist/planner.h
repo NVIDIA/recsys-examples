@@ -16,8 +16,8 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 ******************************************************************************/
 // The planner: the steps of a call between and around the comm kernels, on
 // the current stream: kernels of their own (what they share: planner.cuh),
-// CUB's radix sorts (cub.cu) and CUB's scan of the proxy's chunks
-// (proxy.cu), none of which waits for the device. The bucketize, the owner's
+// CUB's radix sorts (cub.cu) and CUB's scans of the proxy (proxy.cu), none of
+// which waits for the device. The bucketize, the owner's
 // KJT on one node, the proxy, the rail and the owner, and the requester.
 // node_exchange makes the node
 // layout (node_layout_small and node_layout_items, node.cuh); node_layout()
@@ -293,7 +293,9 @@ ProxyBuffers proxy_buffers(at::Tensor remote_map, at::Tensor key_stage, const Pr
 // (docs/hier_output_dist.md, section 10.4). The tables per occurrence and per
 // key hold garbage past the valid ones (occurrence_count, node_num_uniques).
 // The hash table and the scan take the valid occurrences alone: the kernels
-// read their count, and the host sizes the tables by remote_keys.
+// read their count, and the host sizes the tables by remote_keys. The scan is
+// CUB's, over remote_keys + 1 occurrences, and reads and writes no occurrence
+// past the count but the one at it.
 struct ProxyKeys {
   at::Tensor occurrence_count;  // int64 0-dim: the valid occurrences (0 when the node skips)
   at::Tensor node_num_uniques;  // int64 0-dim: the node-unique keys
@@ -335,7 +337,9 @@ ProxyKeys proxy_keys(const ProxyInput &input, const Sizes &sizes, bool node_dedu
 // occurrence_rank, key_occurrences, key_node, node_unique_keys, node_unique_key_weights), which
 // no later step reads, each once its last kernel is queued. The scan of the keys' rows and the
 // chunks' loops take the node-unique keys and the stream's chunks alone (the kernels read their
-// counts, and the host sizes the tables by remote_keys and max_chunks). The chunks' layout runs
+// counts, and the host sizes the tables by remote_keys and max_chunks): CUB's scan over
+// remote_keys + 1 keys reads and writes no key past the node-unique keys but the one at their
+// count, and shares its scratch with CUB's scan over the places below. The chunks' layout runs
 // on a grid that the host sizes by max_chunks (a warp per chunk). CUB's scan over the places
 // (max_chunks + 1 of them) then gives the rows and the reducer tasks before each chunk, and reads
 // and writes no place past the chunks but the totals. Last, a thread per place of a grid places
@@ -366,13 +370,9 @@ struct ProxyChunks {
 };
 ProxyChunks proxy_chunks_and_slots(ProxyKeys &keys, const at::Tensor &remote_offsets,
                                    const ProxyBuffers &buffers, const Sizes &sizes);
-// Test hooks (testing.cu). Each later proxy step of this process runs its scans over a device
-// count (slice_sums_kernel and slice_scan_kernel, planner.cuh: proxy_keys' of the
-// representatives, proxy_chunks_and_slots' of the keys' rows) on `ctas` CTAs, or as their sizes
-// choose (0: a thread per entry of remote_keys, at most two CTAs per SM).
-void force_scan_ctas(int64_t ctas);
-// Each later proxy_chunks_and_slots of this process lays out its chunks (chunk_layout_kernel) on
-// `ctas` CTAs, or as max_chunks chooses (0: a warp per place, at most two CTAs per SM).
+// Test hooks (testing.cu). Each later proxy_chunks_and_slots of this process lays out its chunks
+// (chunk_layout_kernel) on `ctas` CTAs, or as max_chunks chooses (0: a warp per place, at most two
+// CTAs per SM).
 void force_chunk_ctas(int64_t ctas);
 // With `fill`, each later proxy_chunks_and_slots of this process sets every bit of its rows'
 // offsets (node_exp_off and the counted rows'), its chunk tables, reduce_task_offsets and its push
@@ -385,6 +385,10 @@ void fill_proxy_garbage(bool fill);
 // proxy_push_order sorts (false: int32 ones when local_size * (max_chunks + 1) + 1 is below 2^31,
 // as the sizes choose).
 void force_push_keys64(bool on);
+// With `on`, each later proxy_chunks_and_slots of this process with rows_per_payload above 1
+// scans its keys' rows and counted rows as a pair of int64 sums (false: in one word, 32 bits
+// each, when rows_per_payload * remote_keys is below 2^32, as the sizes choose).
+void force_row_counts64(bool on);
 
 // What the call keeps of the proxy.
 struct ProxyPlan {

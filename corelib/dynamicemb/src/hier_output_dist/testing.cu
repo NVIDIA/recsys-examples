@@ -20,11 +20,11 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 // proxy, rail and requester steps across nodes. Last, a hook that makes the
 // next construction fail, a hook that delays the reads of node_offsets and
 // node_keys of later input dists, hooks that choose the paths of later ones
-// (node_exchange's, the CTAs of the proxy's scans and of its chunk layout, the
-// type of its push keys and the requester kernel's row CTAs), a hook that
-// fills tables of the proxy's with garbage before its kernels write them, and
-// the GPU clock the benchmark aligns timelines by (a build with
-// DYNAMICEMB_HIER_TRACE=1).
+// (node_exchange's, the CTAs of the proxy's chunk layout, the type of its push
+// keys and of the sums of its keys' rows, and the requester kernel's row
+// CTAs), a hook that fills tables of the proxy's with garbage before its
+// kernels write them, and the GPU clock the benchmark aligns timelines by (a
+// build with DYNAMICEMB_HIER_TRACE=1).
 
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
@@ -585,10 +585,6 @@ void bind_testing(py::module &py_module) {
                 "lays out the node's items (items) on node_exchange's CTA (1) or on a grid (0), or "
                 "as their sizes choose (-1)",
                 py::arg("push"), py::arg("items"));
-  py_module.def("hier_output_dist_scan_ctas", &force_scan_ctas,
-                "Each later proxy step of this process runs its scans over a device count (of the "
-                "representatives and of the keys' rows) on ctas CTAs, or as their sizes choose (0)",
-                py::arg("ctas"));
   py_module.def("hier_output_dist_chunk_ctas", &force_chunk_ctas,
                 "Each later proxy step of this process lays out the chunks of its stream on ctas "
                 "CTAs, or as max_chunks chooses (0)",
@@ -602,6 +598,11 @@ void bind_testing(py::module &py_module) {
   py_module.def("hier_output_dist_push_keys64", &force_push_keys64,
                 "With on, each later proxy step of this process sorts its push order by int64 "
                 "push keys (False: by int32 ones where they fit, as its sizes choose)",
+                py::arg("on"));
+  py_module.def("hier_output_dist_row_counts64", &force_row_counts64,
+                "With on, each later proxy step of this process with rows_per_payload above 1 "
+                "scans its keys' rows and counted rows as a pair of int64 sums (False: in one "
+                "word, 32 bits each, where their sums fit, as its sizes choose)",
                 py::arg("on"));
   py_module.def("hier_output_dist_requester_ctas", &force_requester_ctas,
                 "Each later requester kernel of this process runs its rows on ctas CTAs, or as "
