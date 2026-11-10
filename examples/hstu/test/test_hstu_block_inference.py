@@ -108,26 +108,25 @@ def test_hstu_process_inference(backbone):
         items[torch.tensor([2, 4, 5], device=device)], dim=-1, eps=1e-6
     )
     torch.testing.assert_close(post.values, expected_candidates)
-    if backbone == "transformer":
-        output = block(embeddings, batch)
-        assert output.values.shape == (3, 128)
-        assert torch.isfinite(output.values).all()
-        from configs import InferenceEmbeddingConfig, RankingConfig
-        from modules.inference_dense_module import InferenceDenseModule
+    # The block's own forward, which runs the layers through predict, and the dense
+    # module on top of it, for both backbones.
+    output = block(embeddings, batch)
+    assert output.values.shape == (3, 128)
+    assert torch.isfinite(output.values).all()
+    from configs import InferenceEmbeddingConfig, RankingConfig
+    from modules.inference_dense_module import InferenceDenseModule
 
-        task = RankingConfig(
-            embedding_configs=[
-                InferenceEmbeddingConfig(["item"], "item", 16, 128, False)
-            ],
-            prediction_head_arch=[128, 2],
-            num_tasks=2,
-        )
-        dense = (
-            InferenceDenseModule(cfg, None, task, hstu_block=block).bfloat16().eval()
-        )
-        logits = dense(batch, embeddings)
-        expected_logits = dense._mlp(output.values)
-        torch.testing.assert_close(logits, expected_logits)
+    task = RankingConfig(
+        embedding_configs=[InferenceEmbeddingConfig(["item"], "item", 16, 128, False)],
+        prediction_head_arch=[128, 2],
+        num_tasks=2,
+    )
+    dense = InferenceDenseModule(cfg, None, task, hstu_block=block).bfloat16().eval()
+    logits = dense(batch, embeddings)
+    torch.testing.assert_close(logits, dense._mlp(output.values))
+    if backbone == "transformer":
+        # Transformer checkpoints keep the module's parameter names (HSTU ones use the
+        # training layout, see inference_checkpoint.py).
         state = {k: v.clone() for k, v in dense.state_dict().items()}
         dense.load_state_dict(state, strict=True)
         torch.testing.assert_close(dense(batch, embeddings), logits)
