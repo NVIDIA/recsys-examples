@@ -366,26 +366,39 @@ def test_a_rehash_insert_carries_the_rows(key_type):
 
 def test_a_checkpoint_load_is_deterministic(tmp_path, monkeypatch):
     """``load`` inserts the file in chunks through ``insert``: two loads of one file build one
-    table, and every key of the file is in it."""
+    table, and every key of the file is in it, with the score the file holds.
+
+    The keys to look for are the file's own, since it holds what the source table kept: 128 keys
+    in the 128 slots of a table of this geometry crowd three buckets (17, 18 and 18 keys for 16
+    slots), so the source drops five of them before they reach the file, in any mode. 64 keys
+    leave every bucket at most 10 of its 16 slots, and the file is checked to hold all of them.
+    """
     monkeypatch.delenv("DEMB_DETERMINISM_MODE")
     source = _table(torch.int64)
-    keys = torch.arange(1, 129, dtype=torch.int64, device="cuda")
-    tids = torch.zeros(128, dtype=torch.int64, device="cuda")
+    keys = torch.arange(1, 65, dtype=torch.int64, device="cuda")
+    tids = torch.zeros(64, dtype=torch.int64, device="cuda")
     scores = ScoreArg(
         name="score", value=(keys * 3).to(torch.uint64), policy=ScorePolicy.ASSIGN
     )
     source.insert(keys, tids, scores)
     key_file, score_file = str(tmp_path / "keys.bin"), str(tmp_path / "scores.bin")
     source.dump(key_file, {"score": score_file}, table_id=0)
+    with open(key_file, "rb") as f:
+        file_keys = torch.frombuffer(bytearray(f.read()), dtype=torch.int64)
+    assert sorted(file_keys.tolist()) == keys.tolist(), "the file holds all 64 keys"
 
     monkeypatch.setenv("DEMB_DETERMINISM_MODE", "1")
     first, second = _table(torch.int64), _table(torch.int64)
     for table in (first, second):
         table.load(key_file, {"score": score_file}, table_id=0)
     assert torch.equal(first.table_storage_, second.table_storage_)
+    in_file = file_keys.cuda()
+    file_tids = torch.zeros_like(in_file)
     found = ScoreArg(name="score", value=None, policy=ScorePolicy.CONST)
-    _, founds, _ = first.lookup(keys, tids, found)
-    assert bool(founds.all())
+    _, founds, _ = first.lookup(in_file, file_tids, found)
+    assert bool(founds.all()), "a key of the file is missing from the loaded table"
+    stored = _i64(first.scores_list[0]).reshape(-1)[first.slots_of(in_file, file_tids)]
+    assert torch.equal(stored, in_file * 3), "a key was loaded with another score"
 
 
 def test_lru_lfu_is_refused():
