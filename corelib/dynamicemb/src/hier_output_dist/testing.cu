@@ -20,10 +20,10 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 // proxy, rail and requester steps across nodes. Last, a hook that makes the
 // next construction fail, a hook that delays the reads of node_offsets and
 // node_keys of later input dists, hooks that choose the paths of later ones
-// (node_exchange's, the CTAs of the proxy's scans and the type of its push
-// keys), a hook that fills tables of the proxy's with garbage before its
-// kernels write them, and the GPU clock the benchmark aligns timelines by (a
-// build with DYNAMICEMB_HIER_TRACE=1).
+// (node_exchange's, the CTAs of the proxy's scans, the type of its push keys
+// and the requester kernel's row CTAs), a hook that fills tables of the
+// proxy's with garbage before its kernels write them, and the GPU clock the
+// benchmark aligns timelines by (a build with DYNAMICEMB_HIER_TRACE=1).
 
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
@@ -34,6 +34,7 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 #include <cstdint>
 #include <map>
 #include <string>
+#include <tuple>
 #include <vector>
 
 #include "hier_output_dist/common/common.h"
@@ -396,7 +397,10 @@ std::map<std::string, at::Tensor> proxy_plan_test(
 // to its node. Given its rail_keys (int64) and the own part of its node_keys
 // (and node_key_weights) once the rail's proxies and its node's requesters put
 // their keys, also its owner tables (owner_tables: its KJT, the chunks its
-// forward puts and its row map).
+// forward puts and its row map) on its records of each other node, as the
+// requester kernel's owner CTAs make them (owner_records), and the remote task
+// offsets of that kernel's requester tables, which owner_tables completes: all
+// 0, as its node's proxies published no chunks.
 std::map<std::string, at::Tensor> rail_tables_test(at::Tensor messages, at::Tensor own_lengths,
                                                    at::Tensor own_offsets,
                                                    c10::optional<at::Tensor> rail_keys,
@@ -439,11 +443,19 @@ std::map<std::string, at::Tensor> rail_tables_test(at::Tensor messages, at::Tens
       {"group_shift", rail.group_shift},
       {"needs", rail.needs}};
   if (rail_keys.has_value()) {
+    const at::Tensor other_nodes = other_nodes_of(sizes.topo, messages.options());
+    const at::Tensor group_of_feature =
+        group_tables(lookup_groups, num_features, messages.options()).first;
+    RequesterTables requester;
+    OwnerRecords records;
+    std::tie(requester, records) = owner_records(rail, other_nodes, group_of_feature, sizes);
+    // -1 in the entries owner_tables writes, so a check sees one it leaves out
+    requester.remote_task_offsets.narrow(0, 1, local_size * sizes.max_chunks - 1).fill_(-1);
     const OwnerTables owner =
-        owner_tables(rail, own_offsets, *node_keys,
+        owner_tables(rail, records, requester, own_offsets, *node_keys,
                      node_key_weights.has_value() ? *node_key_weights : at::Tensor(), *rail_keys,
-                     other_nodes_of(sizes.topo, messages.options()),
-                     group_tables(lookup_groups, num_features, messages.options()).first, sizes);
+                     other_nodes, group_of_feature, sizes);
+    named["remote_task_offsets"] = requester.remote_task_offsets;
     named["kjt_values"] = owner.kjt_values;
     if (owner.kjt_weights.defined()) named["kjt_weights"] = owner.kjt_weights;
     named["fwd_chunks"] = owner.fwd_chunks;
@@ -457,9 +469,11 @@ std::map<std::string, at::Tensor> rail_tables_test(at::Tensor messages, at::Tens
 // from what its node's proxies published (remote_maps: int32 [local_size][3]
 // [remote_keys], RemoteMap; proxy_headers: int32 [local_size]
 // [ProxyHeader::words]) and its node's owners' group shifts (owner_group_shift
-// [local_size][num_groups], as node_status_exchange gives them). The two
-// gathers read them as peer_gather would, on the word lists of
-// remote_map_gather and header_gather; an item a gather skips holds -1.
+// [local_size][num_groups], as node_status_exchange gives them). The requester
+// kernel reads them as it reads its node peers' copies of the window in the in
+// channel; a row of another node's owner past the valid rows gets -1. Its
+// remote task offsets past its proxies' chunks come from a second kernel, as
+// owner_tables writes them in the in channel.
 std::map<std::string, at::Tensor> requester_tables_test(
     at::Tensor remote_maps, at::Tensor proxy_headers, at::Tensor owner_group_shift,
     at::Tensor bucket_feature_of_row, at::Tensor offset_per_bucket, at::Tensor row_shift,
@@ -478,27 +492,9 @@ std::map<std::string, at::Tensor> requester_tables_test(
           is_cuda_array(offset_per_bucket, at::kLong, sizes.topo.world_size + 1) &&
           is_cuda_array(row_shift, at::kLong, bucket_features + 1),
       "hier_output_dist: requester_tables' inputs");
-  // peer_gather: out[k][item] = word first_word[item] + k * stride of its
-  // peer's buffer (a proxy header: one word; remote_map: entry first_word of
-  // each array, remote_keys words apart)
-  auto gather = [](const at::Tensor &buffers, const PeerWords &items, int64_t words,
-                   int64_t stride) {
-    const at::Tensor first =
-        items.peer.clamp_min(0).to(at::kLong) * buffers.size(1) + items.first_word;
-    const at::Tensor word =
-        at::arange(words, first.options()).view({words, 1}) * stride + first.view({1, -1});
-    return at::where(items.peer.ge(0), buffers.view({-1}).take(word), -1);
-  };
-  const at::Tensor words =
-      gather(remote_maps.view({local_size, -1}),
-             remote_map_gather(bucket_feature_of_row, offset_per_bucket, row_shift, sizes),
-             RemoteMap::kArrays, sizes.remote_keys);
-  const at::Tensor headers = gather(proxy_headers.view({local_size, -1}),
-                                    header_gather(sizes, bucket_feature_of_row.options()), 1, 0)
-                                 .view({local_size, header.gathered_words()});
   const RequesterTables tables = requester_tables(
-      words, headers, owner_group_shift.view({local_size, sizes.num_groups}), bucket_feature_of_row,
-      row_shift, group_tables(lookup_groups, num_features, bucket_feature_of_row.options()).first,
+      remote_maps, proxy_headers, owner_group_shift, bucket_feature_of_row, row_shift,
+      group_tables(lookup_groups, num_features, bucket_feature_of_row.options()).first,
       offset_per_bucket, sizes);
   return {{"src", tables.src},
           {"dst", tables.dst},
@@ -594,6 +590,10 @@ void bind_testing(py::module &py_module) {
                 "With on, each later proxy step of this process sorts its push order by int64 "
                 "push keys (False: by int32 ones where they fit, as its sizes choose)",
                 py::arg("on"));
+  py_module.def("hier_output_dist_requester_ctas", &force_requester_ctas,
+                "Each later requester kernel of this process runs its rows on ctas CTAs, or as "
+                "their sizes choose (0)",
+                py::arg("ctas"));
   py_module.def("hier_output_dist_proxy_plan", &proxy_plan_test,
                 "One proxy's steps of a call across nodes on plain tensors, which it writes as "
                 "its buffers of the window, and the count message its rank sends its rail, by name",

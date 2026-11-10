@@ -784,10 +784,9 @@ the planner's kernels, with CUB's radix sorts.
 | `rail_exchange` | comm | its count message to each rail peer (a header the same to all, then the peer's own part), and theirs; then the rail layout from the rail's messages: where each proxy's key records land, this owner's KJT layout, where each lookup group's rows lie in its `lookup_rows` (`group_offsets`, `group_shift`), and the group runs of each source node's records here (`fwd_groups`) and of its node's keys at each rail owner (`bwd_groups`); the rail's needs | 10.2, 10.4 |
 | `rail_key_push` | comm | its key records to its rail owners; it does not wait | 10.2 |
 | `node_status_exchange` | comm | the needs and the group shifts of the node's owners; the call's needs | 10.2 |
-| `peer_gather`, twice | comm (and a kernel) | the node's proxy headers, then the requester's gather list and its rows' `remote_map` words | 10.2, 10.4 |
-| requester tables | kernels | its maps, push order, push tables and remote task offsets | 10.4 |
+| requester | kernel | its maps, push order, push tables and remote task offsets, from the node's proxy headers and `remote_map` in the peers' copies; on other CTAs the owner's records of each other node | 10.2, 10.4 |
 | `rail_done` | comm | waits until every rail proxy's key records are in; flushes this rank's key puts | 10.2, 13 |
-| owner tables | kernels | its KJT's keys, the chunks its forward puts, and its row map | 10.4 |
+| owner tables | kernel | its KJT's keys, the chunks its forward puts, and its row map; the requester's remote task offsets past its proxies' chunks | 10.4 |
 | status | kernel | the call's status, which the second wait copies to the host | 10.5 |
 
 One node runs the first three steps, the owner's KJT and the status; across
@@ -898,8 +897,7 @@ goes once its kernel is queued, and autograd keeps the backward's
   stream. It keeps views of this rank's own buffers: tensors over its copy
   of the window, without an allocator. It also keeps a few constant tensors,
   made when the op is built: the table of each feature, the other nodes, the
-  lookup group of each feature and each group's first feature, and the
-  words of the proxy headers that this requester reads. The **out
+  lookup group of each feature and each group's first feature. The **out
   channel** is the forward and backward kernels, cooperative kernels on the
   current stream. The caller runs them on one stream, in the same order on
   every rank (section 13). The in channel starts each call, and the out
@@ -1130,8 +1128,9 @@ four. In the backward GPU 3 pushes its gradient rows into GPU 2's
 ## 10. The input dist's steps
 
 `input_dist()` queues the bucketize and the steps after it on the caller's
-stream, in the order of section 7.3. Eight of them are the comm kernels,
-and `node_exchange` may take two grids beside it (section 10.2). The planner
+stream, in the order of section 7.3. Seven of them are the comm kernels,
+`node_exchange` may take two grids beside it, and across nodes the
+requester kernel reads the node peers' windows (section 10.2). The planner
 does the rest (`src/hier_output_dist/input_dist/planner.h`): kernels of its
 own and CUB's radix sorts, on the current stream. Each step is one
 or a few ordinary kernels. A kernel over items (keys, rows, occurrences)
@@ -1141,9 +1140,10 @@ A long scan on one CTA takes its values a tile at a time: each thread reads
 8 consecutive values of the tile before the tile's one block scan, so it
 waits once per tile for its loads (`cta_scan_blocked`, `planner.cuh`). The
 owner's KJT offsets on the rail, the owner's record offsets of each other
-node (a CTA per node) and the proxy's offsets of its chunks' rows and
-reducer tasks take it. A scan over a count that only the device knows (the
-proxy's scans of its representatives and of its keys' rows, section 10.4)
+node (a CTA per node of the requester kernel), the requester's remote task
+offsets and the proxy's offsets of its chunks' rows and reducer tasks take
+it. A scan over a count that only the device knows (the proxy's scans of
+its representatives and of its keys' rows, section 10.4)
 runs on a grid that the host sizes, in two kernels (`slice_sums_kernel`,
 `slice_scan_kernel`): each CTA takes a slice of the valid items and sums it,
 then each CTA adds the sums of the slices before its own to the offsets in
@@ -1151,7 +1151,9 @@ its slice, a tile at a time. Neither reads past the count. Where registers
 are short, a thread takes 32 bytes of values a tile (4 int64 values, or 2
 pairs of them) rather than 8 values, which keeps its kernel to 64
 registers, two CTAs per SM, without spills: in the scan of the proxy's
-keys' rows (an int64 a key, or a pair of them) and in its chunk layout.
+keys' rows (an int64 a key, or a pair of them), in its chunk layout, and in
+the requester kernel, whose remote task offsets also take CUB's warp scans
+rather than its raking scan.
 No kernel waits for another CTA: a step that needs every item done goes on
 in its next kernel, or in the kernel's last CTA out. That is the fan-out
 table's counts (section 10.1): each CTA takes a ticket once its items are
@@ -1163,21 +1165,24 @@ device knows (valid keys, node-unique keys, chunks) stay on the device, and
 no tensor's size depends on them; a kernel reads such a count to bound its
 own loop. So the host reads no device value before the second wait, and no
 step syncs. Entries past the valid ones hold values that no one reads, but
-for the proxy's tables of `max_chunks` places, which the requesters and the
-reducers read whole: a grid writes their places past the stream's chunks as
-empty places (section 10.4). An index taken from device data is clamped
-first: a call that does not fit runs every step on what arrived and stays
-in bounds.
+for the tables of `max_chunks` places, which the out kernels search whole:
+a grid writes the proxy's places past the stream's chunks as empty places,
+and the requester's tables of its node's proxies past their chunks get the
+words the proxies hold there, from the requester kernel's CTA of each proxy
+and from a thread per entry of the owner's grid (section 10.4). An index
+taken from device data is clamped first: a call that does not fit runs
+every step on what arrived and stays in bounds.
 
 With the benchmark's configuration (8 features, one owner rule), the
 bucketize queues 22 kernels and copies per call (DynamicEmb's index dedup
 and the fan-out table included), and the steps after it 5 on one node and
-about 34 across nodes (an estimate from the code), CUB's included. The
+about 29 across nodes (an estimate from the code), CUB's included. The
 node's part of a call is three comm kernels (`node_exchange`,
 `node_key_push`, `node_done`); on one node a fourth kernel copies the own
 part. With many features, `node_exchange`'s grids add one or two more.
 Across nodes the rail's part is three more (`rail_exchange`,
-`rail_key_push`, `rail_done`).
+`rail_key_push`, `rail_done`), and the requester's and the owner's tables
+take one kernel each (the requester kernel, `owner_kjt_kernel`).
 
 ### 10.1 The bucketize (requester, caller's stream, local)
 
@@ -1314,8 +1319,9 @@ its node or rail peers. The one exception is `rail_done`: it waits for its
 rail peers' `rail_key_push` of the call, a kernel that does not wait. Its
 threads take the peers in turn (thread `t` the peers `t`, `t + 32`, ... in a
 warp), so it serves any number of them. `node_exchange` may take two grids
-beside it, which do not wait (below). Section 13 gives their memory order
-and why no wait hangs.
+beside it, and across nodes the requester kernel reads the node peers'
+windows: they do not wait (below). Section 13 gives their memory order and
+why no wait hangs.
 
 * **`node_exchange`** (1 CTA): stores this rank's row of `node_offsets`
   (`NodeRow`: what the node layout reads of its bucketize's
@@ -1393,19 +1399,25 @@ and why no wait hangs.
   has. Then it reads every peer's needs and group shifts
   (`owner_group_shift`), from which the requester places its rows in its
   node's owners' `lookup_rows`.
-* **`peer_gather`** (threads stride over the words, at most two CTAs per SM;
-  across nodes, twice per call): reads words of node peers' proxy headers
-  (`ProxyHeader`: one word per item, by its word number) or `remote_map`
-  (`RemoteMap`: per item, an occurrence's entry in each of the three
-  arrays). The peers wrote them before the `in_status` that
-  `node_status_exchange` waited for.
+* **The requester kernel** (`requester_kernel`, `input_dist/requester.cuh`;
+  across nodes, a grid that does not wait): reads what the node's proxies
+  wrote in their copies of the window, over NVLink, past the L1 cache: of
+  each proxy header (`ProxyHeader`) its chunks, the stream's end, the ends
+  of its chunks and this requester's push table up to its chunks, and of
+  `remote_map` (`RemoteMap`) the entry of each of this rank's rows of
+  another node's owner, in each of the three arrays. It makes the
+  requester's tables from them (section 10.4). The peers wrote them before
+  the `in_status` that `node_status_exchange` waited for, earlier on the
+  stream, and write them again only after the next call's node barrier,
+  which waits for this rank's `in_started` of that call: this rank releases
+  it in its next `node_exchange`, which its stream starts only once this
+  kernel has ended (section 13).
 * **`rail_done`** (1 warp, across nodes): its lanes, which take the rail
   proxies in turn, wait until the key signal of every rail proxy of the
   call has landed. Then the warp flushes this rank's puts on context 2, so
   the NIC has read its `key_stage` slices. It runs just before the owner's
   tables, the first step that reads `rail_keys`. So the key puts overlap
-  `node_status_exchange`, the `peer_gather`s and the requester's tables
-  (section 13).
+  `node_status_exchange` and the requester kernel (section 13).
 
 ### 10.3 The node layout, and the owner's KJT on one node
 
@@ -1618,8 +1630,9 @@ their loops:
   larger of `remote_keys` and `max_chunks`, then writes the places past the
   stream's chunks as empty places: an empty chunk, an end of 0 in
   `proxy_header`, and in `reduce_task_offsets` the reducer tasks of all the
-  chunks. The requesters gather all `max_chunks` ends, and the reducers
-  search `reduce_task_offsets` over all `max_chunks` places;
+  chunks. The reducers search `reduce_task_offsets` over all `max_chunks`
+  places, and the requesters write the ends past a proxy's chunks as these
+  0s (the requester kernel);
 * a thread per entry of the remote part gives each valid occurrence its
   slot and its push key (below), and each entry past them the push key that
   sorts after every part, so the push order's sort reads no word that
@@ -1747,33 +1760,68 @@ owner node and a key count per (owner node, lookup group). The layout's
 loads also grow with the nodes times the square of the lookup groups
 (section 19).
 
-**The requester.** Two `peer_gather`s read what the node's proxies wrote. One
-reads the words of their headers it needs: the chunks, the stream's end, each
-chunk's end and its own push table, by word lists made when the op is built. The other reads, for
-each of its keys for an owner on another node, its occurrence's entry in the
-three `remote_map` arrays at its proxy. From them, and from its node's
-owners' group shifts (`node_status_exchange`), it makes its maps. `src` is
-where the forward reads each key's row. When the owner is on its node, it
-is a row of the owner's `lookup_rows`: the key's place in the owner's own
-part (`row + row_shift`, where the push put it, section 10.3) plus the
-shift of the key's lookup group there (section 11.2). Else it is the key's
-row in its proxy's `proxy_rows`.
-`dst` is where the backward writes the row's gradient: the same row, or its
-own slot in `proxy_rows`. It also makes its rows in push order at each proxy,
-its push tables with absolute positions, and the remote task offsets of each
-(chunk, proxy), which the forward's pulls and the backward's pushes share.
+**The requester.** One kernel (`requester_kernel`, `input_dist/requester.cuh`)
+reads what the node's proxies wrote in their copies of the window, past the
+L1 cache, and makes the requester's tables from it, and from its node's
+owners' group shifts (`node_status_exchange`). Every CTA first finds where
+its rows at each proxy start in its push order (its rows of the owners with
+the proxy's local rank on the other nodes, those at the proxies before it
+first: a warp per proxy sums over the nodes). Then the CTAs take four roles,
+in this order:
+
+* a CTA per proxy: its chunks `C_p` (its header's, clamped into
+  `[0, max_chunks]`), its chunk ends below `C_p` and its stream's end, and
+  this requester's push table up to `C_p` with absolute positions
+  (positions of its push order: its rows at the proxies before come
+  first), in 16-byte loads after the words before the first 16-byte
+  boundary. Then a thread per entry past `C_p`: chunk ends of 0, and in
+  the push table the entry at `C_p`. Those are the words the proxy holds
+  there: its ends are 0 past its chunks, and each requester's push table
+  entries are where its rows end from its chunks on;
+* one CTA: each proxy's `C_p`, a thread per proxy, then the remote task
+  offsets of each (chunk, proxy), chunk after chunk, in a chunk the
+  proxies in turn from its own one, 32 positions of its push order a task,
+  which the forward's pulls and the backward's pushes share. A blocked
+  scan takes the `local_size × maxC` entries of the chunks there are
+  (`maxC`: the most of a proxy); the total goes there and at
+  `local_size × max_chunks`;
+* a CTA per other node: the owner's records of that node (below);
+* the other CTAs, a thread per row, four rows at a time: its maps. `src` is
+  where the forward reads each key's row. When the owner is on its node, it
+  is a row of the owner's `lookup_rows`: the key's place in the owner's own
+  part (`row + row_shift`, where the push put it, section 10.3) plus the
+  shift of the key's lookup group there (section 11.2). Else it is the
+  key's row in its proxy's `proxy_rows`, which the kernel reads in the
+  proxy's `remote_map` at the row's occurrence there (`row + row_shift −
+  lookup_keys`, its place in the proxy's remote part). `dst` is where the
+  backward writes the row's gradient: the same row, or its own slot in
+  `proxy_rows`. A row of another node's owner also takes its place in the
+  requester's push order at the proxy, from its position there in
+  `remote_map`. A row of another node's owner past the valid rows gets −1,
+  which nothing reads.
+
+The owner's tables write the remote task offsets past `local_size × maxC`:
+the total, as a scan over all `local_size × max_chunks` entries leaves
+them. So the requester reads no header word past a proxy's chunks, and its
+row CTAs read no header. The row CTAs take the CTAs that the GPU holds at
+once (two per SM) less the other roles', so on a GPU that runs nothing else
+the whole grid runs at once; they take one per SM when the other roles take
+more.
 
 **The owner.** Its KJT has `kjt_stride = local_size + num_nodes − 1`
 columns per feature (section 9). Its keys come from two places: its own
 node's columns from the own part of `node_keys`, the other nodes' from their
-records in `rail_keys`. One kernel finds the records (`owner_slices_kernel`):
-a CTA per other node finds where its records start in its slice, and where
-those of each feature start (a blocked scan over the features); CTA 0 reads
-the chunks of this owner's node in each source node's stream, which come
-first in its slice, into `fwd_chunks` (`fwd_chunk_offsets`: where each source
-node's start), the chunks its forward puts (section 11.3). Then a thread per
-position of the KJT takes its key and weight, and with a row map its row
-(`owner_kjt_kernel`).
+records in `rail_keys`. A CTA per other node of the requester kernel finds
+where that node's records start in its slice, and where those of each
+feature start (a blocked scan over the features), from the rail layout.
+After `rail_done` one kernel (`owner_kjt_kernel`) makes the owner's tables:
+every CTA finds where each source node's chunks start in `fwd_chunks` (CTA 0
+writes them, `fwd_chunk_offsets`), and a thread per entry reads the chunks
+of this owner's node in each source node's stream, which come first in its
+slice, into `fwd_chunks`, the chunks its forward puts (section 11.3). Then a
+thread per position of the KJT takes its key and weight, and with a row map
+its row. Last, a thread per entry writes the requester's remote task offsets
+past its proxies' chunks.
 
 **The row map.** A lookup group's keys lie in the KJT feature by feature,
 each feature's columns in turn, and in `lookup_rows` in the order they cross
@@ -2334,12 +2382,12 @@ of the call before (section 13).
   cache (`node_exchange` reads `node_offsets`, and `rail_exchange` the count
   messages, with `__ldcg`), and so do `node_exchange`'s grid of the items
   (`node_layout_items_kernel`, after it on the stream, before `node_done`)
-  and `peer_gather` later on the stream; the planner's kernels read with
-  plain loads. What this rank writes for its peers, with its own stores or
-  with the planner's kernels earlier on the stream, comes before the flag
-  it releases or the put it makes: a system fence orders it. In
-  `node_exchange` thread 0 makes the fence after the CTA's barrier, so it
-  covers the row that every thread stored, then releases `in_started`.
+  and the requester kernel later on the stream (below); the planner's
+  kernels read with plain loads. What this rank writes for its peers, with
+  its own stores or with the planner's kernels earlier on the stream, comes
+  before the flag it releases or the put it makes: a system fence orders
+  it. In `node_exchange` thread 0 makes the fence after the CTA's barrier,
+  so it covers the row that every thread stored, then releases `in_started`.
   When the grid before it stored the row (`node_rows_push_kernel`), each of
   that grid's CTAs ended with a system fence after its stores, and the
   release after it on the stream publishes them. Each CTA of the push ends
@@ -2350,16 +2398,37 @@ of the call before (section 13).
   `rail_key_push` (below). What this rank stores into a peer's buffer comes
   after an acquire, earlier on the stream, of the peer's flag that says the
   peer read that buffer (the table below).
+* **The requester's reads of the node's windows.** The requester kernel
+  reads its node peers' proxy headers and `remote_map` in their copies of
+  the window, with `__ldcg`, and keeps nothing of them past the call's
+  tensors. Every word it reads is complete and visible: a peer writes them
+  in its proxy steps, which run before its `node_status_exchange` on its
+  stream, whose thread 0 makes a system fence and then releases its
+  `in_status` (the call's `in_seq`); this rank's `node_status_exchange`
+  acquires every peer's `in_status` before the requester kernel starts on
+  the same stream. No peer writes them while the kernel reads: a peer
+  writes them again only in its next call's proxy steps, after that call's
+  node barrier, which waits for this rank's `in_started` of `in_seq + 1`;
+  this rank releases that in its next `node_exchange`, which its stream
+  starts only once the requester kernel has ended. So a kernel that starts
+  before the kernel before it ends (programmatic dependent launch) must not
+  release `in_started` before then. Nothing else writes them: the out
+  kernels read the requester's tables, the call's own tensors, not the
+  window. So the buffers need no slot per `in_seq` parity, as the count
+  messages do, and calls that overlap under a train pipeline change
+  nothing: their input dists run in issue order on the caller's one input
+  dist stream (section 19), and the out kernels of earlier calls, on other
+  streams, touch neither buffer.
 * **The late key wait.** `rail_key_push` only posts its puts. Each slice
   carries a strong signal, so an owner that sees the signal also sees the
   slice. `rail_done` acquires every rail proxy's key signal (system scope),
   then flushes this rank's puts. A flush waits until the NIC has done every
   put in the context's queue to each peer, from any kernel. Between the
-  push and `rail_done` run `node_status_exchange`, the `peer_gather`s, the
-  requester's `remote_map_gather` and its tables: none of them reads
-  `rail_keys` or writes `key_stage`, and the planner reads the rail's
-  offsets from the layout's tensors, not from the window. The first reader
-  of `rail_keys`, the owner's tables, runs after `rail_done` on the stream.
+  push and `rail_done` run `node_status_exchange` and the requester kernel:
+  neither reads `rail_keys` or writes `key_stage`, and the planner reads
+  the rail's offsets from the layout's tensors, not from the window (the
+  requester kernel's owner CTAs too). The first reader of `rail_keys`, the
+  owner's tables, runs after `rail_done` on the stream.
   The next call writes `key_stage` in its proxy steps, after this
   `rail_done` on the stream, so after the NIC read the slices. Its rail
   proxies put into `rail_keys` only once they have this rank's count message
@@ -2369,7 +2438,7 @@ of the call before (section 13).
   on its peers (`rail_done` for its rail peers' `rail_key_push`, which
   never waits), for credits from earlier out kernels, and for its own
   rank's earlier work. The planner's kernels, the pushes, `node_exchange`'s
-  grids and the gathers never wait. The op orders nothing across streams: the caller orders the kernels
+  grids and the requester kernel never wait. The op orders nothing across streams: the caller orders the kernels
   the same way on every rank (section 4.2). It makes the same calls in the
   same order, runs the input dists on one stream and the out kernels on one
   stream, with the same waits between its streams. So every rank issues the
@@ -2389,7 +2458,7 @@ once no peer still reads what call `in_seq` wrote there. The words marked
 |---|---|---|---|
 | `node_offsets` | node peers' `node_exchange` (or the grid just before it, `node_rows_push_kernel`), and this rank its own row | this rank's `node_exchange` (or the grid of the items just after it, `node_layout_items_kernel`) | a peer stores its row of the next call before that call's node barrier, but only after its `node_done` of this call got this rank's tell, which this rank sends after its `node_exchange` and the grid after it read the rows; `node_done` runs in every call, so the rows need no slot per `in_seq` parity |
 | `node_keys`, `node_key_weights`, `node_bucket_feature_of_row` | node peers' push | this rank's planner | the peers push only after the next call's node barrier, which this rank publishes only once its in channel finished the call |
-| `remote_map`, `proxy_header` | this rank's planner | node peers' gathers | this rank writes them after the next call's node barrier, which every peer publishes only once its in channel finished the call |
+| `remote_map`, `proxy_header` | this rank's planner (the proxy) | node peers' requester kernels | this rank writes them in the next call's proxy steps, after that call's node barrier, which every peer publishes in its next `node_exchange`, after its requester kernel of this call on its stream |
 | `key_stage` | this rank's planner (the proxy) | the NIC | `rail_done` flushes the key puts before the owner's tables, so before the next call's proxy steps |
 | `count_msg_out` (ctrl), a row per rail peer | this rank's `rail_exchange` | the NIC | `rail_exchange` flushes its puts before it ends |
 | `rail_keys` | rail proxies' key puts | this rank's owner tables | a rail proxy puts only after it has this rank's count message of the next call, which this rank's `rail_exchange` sends after this call's `rail_done` and owner tables |
@@ -2456,7 +2525,7 @@ The capacities are the ones in place (section 5), and `row_bytes` and
 | the group runs and the backward's ready counters | `16 × num_nodes × (2 × num_groups + 1) + 8 × max_chunks` | per call |
 | index dedup's fan-out table | about 13 bytes per original key (on this path the deduplicated KJT keeps the original length) | per call |
 | the bucketize, in the caller's pool | at its peak about 36 bytes per key, during the fan-out's sort: its outputs (`inv` and `bucket_feature_of_row`, 8), where it put each row (4), the sort's keys and values in and out (16) and CUB's extra key and value buffers (8); before that the counting sort by owner holds its outputs alone (8) and a count per CTA and owner (at most about 1 MiB), and above 2,047 owners, or where the counting sort's shared memory does not fit the GPU, the radix sort by bucket feature at most 24, its outputs included; for either owner rule, with or without weights | transient |
-| the planner, in the caller's pool | its largest step: across nodes the proxy's, about 64 bytes per entry of `remote_keys` with weights, 52 without; the requester's holds about 24 bytes per key besides its maps (the gathered `remote_map` words, 12, and the peer and word each comes from, 12), and the owner's adds only its KJT values and row map (per call); on one node nothing per key beyond the per-call tensors | transient |
+| the planner, in the caller's pool | its largest step: across nodes the proxy's, about 64 bytes per entry of `remote_keys` with weights, 52 without; the requester's kernel and the owner's add only their tables (per call: the requester's maps, the owner's KJT values and row map), as the requester reads its proxies' words in their windows; on one node nothing per key beyond the per-call tensors | transient |
 | the input dist's tables per (rank, feature), in the caller's pool | the bucketize's `offset_per_bucket_feature` and the node layout's `row_shift`, about `8 × world_size × num_features` each (the bucketize writes only each owner's first entry and its node's owners' entries, section 10.1); across nodes, while the proxy's node dedup runs, its block table, about `8 × world_size × num_features` (section 15.4), and from its node dedup to the end of the input dist its keys of each bucket feature and where they start (`node_length_per_bucket_feature`, `node_offset_per_bucket_feature`: the rail's count messages read them), about `16 × num_nodes × num_features` | transient |
 
 The transient figures come from the code: bytes in live tensors. The
@@ -2839,9 +2908,21 @@ differences give the header's keys of the own part), and
 `hier_output_dist_rail_tables` one rank's rail layout from the messages to
 it (row `n` the message of the rail peer on node `n`, as `rail_exchange`
 reads them) and, given its `rail_keys` and the own part of its `node_keys`,
-its owner tables: its KJT, the chunks its forward puts, and its row map.
-Both take the lookup groups, and both run the device code of `rail_exchange`
+its owner tables: its KJT, the chunks its forward puts, and its row map, on
+its records of each other node from the requester kernel's owner CTAs (on
+node proxies that published no chunks), and that kernel's remote task
+offsets, which the owner tables complete (all 0). Both take the lookup
+groups, and both run the device code of `rail_exchange`
 (`input_dist/rail.cuh`).
+
+The requester's part has two: `hier_output_dist_requester_tables` gives one
+requester's tables from stand-ins for its node's proxies' `remote_map` and
+headers (row `p` proxy `p`'s, as the proxy steps write them): the requester
+kernel reads them as it reads its node peers' windows in the in channel,
+and a second kernel writes the remote task offsets past the proxies'
+chunks, as the owner's tables do there.
+`hier_output_dist_requester_ctas(ctas)` makes each later requester kernel
+of the process run its rows on `ctas` CTAs, or as their sizes choose (0).
 
 Three more hooks reach into the proxy's steps.
 `hier_output_dist_scan_ctas(ctas)` makes each later proxy step of the
@@ -2897,7 +2978,16 @@ with part 0 (`hier_output_dist_proxy_garbage`), and its windows hold
 garbage before the call, so the checks of the chunk table,
 `reduce_task_offsets` and the header's chunk ends over all `max_chunks`
 places see a word that the proxy leaves out, and the checks of the push
-tables and positions a push key it leaves out.
+tables and positions a push key it leaves out. The rail hook's remote task
+offsets hold −1 before the owner tables complete them, so their check sees
+an entry that the owner tables leave out. Its requester cases run the
+requester kernel alone, against a plain reference of the requester's rules,
+on stand-ins for the proxies as the proxy steps leave them: calls of no
+rows, node skips, proxies of no chunks and of `max_chunks`, chunk ends past
+2^31, an odd `max_chunks` (each push table at an odd word, so the kernel's
+16-byte loads peel the words before a 16-byte boundary), 72 GPUs per node
+and 40 nodes (more than a warp's lanes), `max_chunks` past 8,192, the rows
+on 1 and 3 CTAs, and the calls of the design's reference ports.
 
 ## 19. Limitations
 
@@ -3039,8 +3129,7 @@ Paths from `corelib/dynamicemb`.
     * `window.h`: the window's layout (`WindowLayout`) over its sections:
       `CtrlLayout` (with the format of the count message, `CountMessage`),
       `KeysLayout` (with a requester's row of `node_offsets`, `NodeRow`,
-      `ProxyHeader`, `RemoteMap` and what `peer_gather` reads) and
-      `RowsLayout`;
+      `ProxyHeader` and `RemoteMap`) and `RowsLayout`;
     * `device.cuh`: the kernels' building blocks: loads, stores and fences
       with a memory order, bounded waits, warp and CTA helpers, a search, row
       vectors, the window as the node's GPUs map it (`NodeWindow`), the syncs
@@ -3057,7 +3146,8 @@ Paths from `corelib/dynamicemb`.
     * `comm_kernels.cu`: the comm kernels, `node_exchange`'s grids
       (`node_rows_push_kernel`, `node_layout_items_kernel`) and the hook
       that forces their paths (`force_node_paths`), and the in channel's
-      functions that launch them;
+      functions that launch them, the requester kernel's too, on the node
+      peers' windows (`WindowPeers`);
     * `node.cuh`: the device code of the node's part of a call, which the
       comm kernels, the planner's kernels and the bucketize share: the node
       layout from the node's rows (`NodeRows`, `node_layout_small`,
@@ -3068,6 +3158,11 @@ Paths from `corelib/dynamicemb`.
       (`count_messages_of`) and the rail's layout from the rail's messages
       (`rail_layout_of`), with the two functions that give both the owner's
       and the proxy's group runs (`group_first`, `group_shift_of`);
+    * `requester.cuh`: the requester kernel (`requester_kernel`), which the
+      in channel and the hooks share: its CTAs' roles (a CTA per proxy of
+      the node, the scan of the remote task offsets, a CTA per other node
+      for the owner's records, and the rows), each a function of its own,
+      and the entries past the proxies' chunks;
     * `planner.h`: the planner: the declarations of every step, and of the
       CUB calls in `cub.cu` (radix sorts); `planner.cuh`: what the
       planner's kernels share (how they are launched, searches in sorted
@@ -3081,10 +3176,14 @@ Paths from `corelib/dynamicemb`.
       with garbage first, `fill_proxy_garbage`, and sort its push order by
       int64 keys, `force_push_keys64`, and the rounds of its chunks, cut by
       counted rows, `Rounds`); the node
-      layout, the push, the count message and the rail layout as the hooks
-      run them (`node_layout`, `push_to_node_keys`, `count_message`,
-      `rail_layout`), the owner's KJT on one node (`one_node_owner`), the
-      owner's tables (with its row map) and the requester are in
+      layout, the push, the count message, the rail layout, the owner's
+      records and the requester's tables as the hooks run them
+      (`node_layout`, `push_to_node_keys`, `count_message`, `rail_layout`,
+      and `owner_records` and `requester_tables` on stand-ins for the
+      node's proxies, `StandInPeers`, with the hook that sets the requester
+      kernel's row CTAs, `force_requester_ctas`), the owner's KJT on one
+      node (`one_node_owner`) and the owner's tables (with its row map and
+      the requester's remote task offsets past its proxies' chunks) are in
       `planner.cu`;
   * `output_dist/`, the output dist:
     * `output_dist.h`, `output_dist.cu`: the out channel (`OutChannel`),

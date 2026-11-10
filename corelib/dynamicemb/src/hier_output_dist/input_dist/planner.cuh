@@ -208,12 +208,13 @@ __device__ T cta_offsets_of(int64_t n, Value value, T *offsets) {
 // before the tile's one BlockScan: a tile costs one wait for its loads, so a long table costs
 // kItems times fewer. value(index) is called once for each index below n; write(index, offset)
 // gets each offset, and the total goes to every thread (no offsets[n]). Values wider than int64
-// (a pair of sums) take CUB's warp scans: its raking scan, the default, holds 16 values in each
-// raking thread's registers.
-template <int kItems, typename T, typename Value, typename Write>
+// (a pair of sums) take CUB's warp scans, and so may a caller short of registers (kAlgorithm):
+// its raking scan, the default, holds 16 values in each raking thread's registers.
+template <int kItems, typename T,
+          cub::BlockScanAlgorithm kAlgorithm =
+              (sizeof(T) > sizeof(int64_t) ? cub::BLOCK_SCAN_WARP_SCANS : cub::BLOCK_SCAN_RAKING),
+          typename Value, typename Write>
 __device__ T cta_scan_blocked(int64_t n, Value value, Write write) {
-  constexpr cub::BlockScanAlgorithm kAlgorithm =
-      sizeof(T) > sizeof(int64_t) ? cub::BLOCK_SCAN_WARP_SCANS : cub::BLOCK_SCAN_RAKING;
   using Scan = cub::BlockScan<T, kThreads, kAlgorithm>;
   __shared__ typename Scan::TempStorage scan;
   __shared__ T carry;
@@ -270,6 +271,14 @@ __device__ T cta_max(int64_t n, Value value, T least) {
   const T out = result;
   __syncthreads();
   return out;
+}
+
+// Every lane of the warp: the sum of the lanes' values, to every lane.
+__device__ __forceinline__ int64_t warp_sum(int64_t value) {
+#pragma unroll
+  for (int offset = 16; offset > 0; offset /= 2)
+    value += (int64_t)__shfl_xor_sync(0xffffffffu, (long long)value, offset);
+  return value;
 }
 
 // Every thread of the CTA: the sum of value(index) for index in [0, n) (0

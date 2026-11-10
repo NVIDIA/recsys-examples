@@ -115,7 +115,6 @@ InChannel::InChannel(const Config &config, const Sizes &sizes, ncclWindow_t wind
     group_of_feature.insert(group_of_feature.end(), starts[group + 1] - starts[group], (int)group);
   group_of_feature_ = at::tensor(group_of_feature, at::kInt).to(options);
   group_starts_ = at::tensor(starts, at::kLong).to(options);
-  header_gather_ = header_gather(sizes_, options);
 }
 
 InDist InChannel::input_dist(const PlanInput &input) {
@@ -194,26 +193,22 @@ InDist InChannel::input_dist(const PlanInput &input) {
     // which rail_done waits for just before the owner's tables.
     const RailLayout rail = rail_exchange(node, proxy);
     rail_key_push(proxy.stage_offset_per_bucket, rail);
-    // The node again: the call's needs, the group shifts of the node's
-    // owners, and what the node's proxies published for this requester.
+    // The node again: the call's needs, and the group shifts of the node's
+    // owners. Then the requester's tables, read from what the node's proxies
+    // published, and the owner's records of each other node, in one kernel.
     at::Tensor owner_group_shift;
     std::tie(peer_needs, owner_group_shift) = node_status_exchange(rail);
-    const at::Tensor headers =
-        peer_gather(kGatherProxyHeader, header_gather_.peer, header_gather_.first_word)
-            .view({local_size, ProxyHeader::of(sizes_).gathered_words()});
-    const PeerWords map_gather = remote_map_gather(
-        bucketized.bucket_feature_of_row, bucketized.offset_per_bucket, node.row_shift, sizes_);
-    at::Tensor words = peer_gather(kGatherRemoteMap, map_gather.peer, map_gather.first_word);
-    const RequesterTables requester =
-        requester_tables(words, headers, owner_group_shift, bucketized.bucket_feature_of_row,
-                         node.row_shift, group_of_feature_, bucketized.offset_per_bucket, sizes_);
-    words = at::Tensor();  // requester_tables is its one reader: free it before the owner tables
+    RequesterTables requester;
+    OwnerRecords records;
+    std::tie(requester, records) = this->requester(bucketized, node, owner_group_shift, rail);
     // Every rail proxy's key records are in rail_keys, and the NIC read this
     // proxy's (comm_kernels.cu says why nothing before reads or writes them).
     rail_done();
+    // The owner's tables also write the requester's remote task offsets past
+    // its proxies' chunks.
     const OwnerTables owner =
-        owner_tables(rail, node.own_offsets, own_node_keys_, own_node_key_weights_, rail_keys_,
-                     other_nodes_, group_of_feature_, sizes_);
+        owner_tables(rail, records, requester, node.own_offsets, own_node_keys_,
+                     own_node_key_weights_, rail_keys_, other_nodes_, group_of_feature_, sizes_);
     // The plans: the requester's maps and its tables of the node's proxies,
     // the owner's and the proxy's tables, the proxy's rows before each key
     // and the group runs of the rows the rail puts. Then the owner's KJT and

@@ -98,13 +98,14 @@ class InChannel {
   // node peer's needs (int64 [local_size][kNumNeeds]) and group shifts (int64
   // [local_size][num_groups]).
   std::pair<at::Tensor, at::Tensor> node_status_exchange(const RailLayout &rail) const;
-  // Words of the node peers' `from` (GatherFrom), int32 [words][items]: item
-  // i reads node peer peer[i]'s word first_word[i] of its proxy header (1
-  // word), or entry first_word[i] of each array of its remote_map
-  // (RemoteMap::kArrays words), word k into [k][i]; an item of a negative
-  // peer keeps what the allocation held.
-  at::Tensor peer_gather(GatherFrom from, const at::Tensor &peer,
-                         const at::Tensor &first_word) const;
+  // The requester's tables of the call, from what its node's proxies published in their copies of
+  // the window (their headers, and its rows' entries of their remote_map), its node layout and its
+  // node's owners' group shifts (node_status_exchange's); and the owner's records of each other
+  // node, from the rail layout: one grid that does not wait (requester_kernel, requester.cuh).
+  std::pair<RequesterTables, OwnerRecords> requester(const BucketizedKeys &bucketized,
+                                                     const NodeLayout &node,
+                                                     const at::Tensor &owner_group_shift,
+                                                     const RailLayout &rail) const;
   // Waits until every rail proxy's key records of the call are in this rank's rail_keys, and
   // flushes this rank's puts on the rail (the NIC read its key_stage). Just before the owner's
   // tables, the first reader of rail_keys.
@@ -130,10 +131,8 @@ class InChannel {
   at::Tensor rail_keys_;
   // Constants of the op across nodes: the table of each feature (numbered
   // densely), the other nodes, the lookup group of each feature (int32) and
-  // each group's first feature (int64 [num_groups + 1], then num_features),
-  // and the words of the proxy headers this requester reads.
+  // each group's first feature (int64 [num_groups + 1], then num_features).
   at::Tensor tables_, other_nodes_, group_of_feature_, group_starts_;
-  PeerWords header_gather_;
 };
 
 // A test hook (testing.cu): each later input dist of this process waits `ns` on the GPU twice (0:

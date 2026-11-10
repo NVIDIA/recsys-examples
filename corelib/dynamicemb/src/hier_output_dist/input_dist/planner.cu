@@ -17,6 +17,7 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 // The planner's steps of the node, of the rail and the owner, and of the
 // requester (planner.h).
 
+#include <algorithm>
 #include <cstdint>
 
 #include "hier_output_dist/common/window.h"
@@ -24,6 +25,7 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 #include "hier_output_dist/input_dist/planner.cuh"
 #include "hier_output_dist/input_dist/planner.h"
 #include "hier_output_dist/input_dist/rail.cuh"
+#include "hier_output_dist/input_dist/requester.cuh"
 
 namespace dyn_emb {
 namespace hier_output_dist {
@@ -230,58 +232,45 @@ __global__ void __launch_bounds__(kThreads)
   rail_layout_of(RailCounts{messages, format.length(), format}, own_lengths, sizes, scratch, out);
 }
 
-// num_nodes CTAs. CTA c >= 1 takes other node c - 1: where its records start
-// in rail_keys (records_first [other node]) and its records of each feature
-// (record_offsets [feature][other node]), counted in records of record_bytes
-// (a slice and its chunks are whole records): after its chunks, and its
-// records of the features before (a scan of its keys per feature). CTA 0:
-// where each source node's chunks start in fwd_chunks, from the rail's
-// slice_in (its own node sends none; at most max_owner_chunks in all); then
-// a thread per entry of fwd_chunks (max_owner_chunks of them): the chunk at
-// that place, its source node's (the last whose chunks start at or before
-// it), read from its slice of rail_keys (its bytes rail_bytes; a slice starts
-// at a multiple of 8 bytes); zeros past the chunks.
+// What owner_kjt_kernel writes of the chunks the owner's forward puts (OwnerTables::fwd_chunks,
+// [max_owner_chunks], and where each source node's start there, fwd_chunk_offsets), from the
+// rail's slice_in and the chunks first in each source node's slice of rail_keys (its bytes
+// rail_bytes).
+struct ForwardChunks {
+  const int64_t *slice_in;
+  const char *rail_keys;
+  int64_t rail_bytes;
+  int64_t *fwd_chunk_offsets;
+  OwnerChunk *fwd_chunks;
+};
+// The requester's tables whose remote task offsets owner_kjt_kernel completes (RequesterTables'
+// proxy_num_chunks and remote_task_offsets); remote_task_offsets nullptr: none.
+struct RemoteTaskTail {
+  const int64_t *proxy_num_chunks;
+  int64_t *remote_task_offsets;
+};
+
+// Every CTA, a thread per entry over the grid: the entries of the requester's remote task offsets
+// between local_size times its proxies' most chunks (maxC) and local_size * max_chunks get the
+// total, which the requester kernel wrote at both. Past maxC no proxy has a chunk, so each holds
+// the total, as a scan over all local_size * max_chunks entries leaves it, and a search over them
+// (TaskPlace) finds what it finds today.
+__device__ __forceinline__ void remote_task_tail(const RemoteTaskTail &tail, int64_t local_size,
+                                                 int64_t max_chunks) {
+  const int64_t most = cta_max<int64_t>(
+      local_size, [&](int64_t proxy) { return tail.proxy_num_chunks[proxy]; }, 0);
+  const int64_t entries = local_size * max_chunks, total = tail.remote_task_offsets[entries];
+  for (int64_t entry = local_size * most + 1 + first_item(); entry < entries;
+       entry += item_stride())
+    tail.remote_task_offsets[entry] = total;
+}
+
+// A thread per entry: the requester's remote task offsets past its proxies' chunks
+// (remote_task_tail), which owner_kjt_kernel writes in the in channel. The hooks'
+// (requester_tables).
 __global__ void __launch_bounds__(kThreads)
-    owner_slices_kernel(const int64_t *slice_in, const int64_t *node_length_per_source_feature,
-                        const int64_t *other_nodes, const char *rail_keys, int64_t rail_bytes,
-                        Sizes sizes, int64_t *fwd_chunk_offsets, int64_t *records_first,
-                        int64_t *record_offsets, OwnerChunk *fwd_chunks) {
-  const int64_t num_nodes = sizes.topo.num_nodes, num_features = sizes.num_features,
-                bound = sizes.max_owner_chunks();
-  if (blockIdx.x > 0) {
-    const int64_t other = blockIdx.x - 1, source = other_nodes[other];
-    const int64_t first =
-        (slice_in[2 * source] + (int64_t)sizeof(OwnerChunk) * slice_in[2 * source + 1]) /
-        sizes.record_bytes;
-    if (threadIdx.x == 0) records_first[other] = first;
-    cta_scan_blocked<kScanItems, int64_t>(
-        num_features,
-        [&](int64_t feature) {
-          return node_length_per_source_feature[source * num_features + feature];
-        },
-        [&](int64_t feature, int64_t offset) {
-          record_offsets[feature * (num_nodes - 1) + other] = first + offset;
-        });
-    return;
-  }
-  cta_offsets_of<int64_t>(
-      num_nodes, [&](int64_t source) { return slice_in[2 * source + 1]; }, fwd_chunk_offsets);
-  for (int64_t source = threadIdx.x; source <= num_nodes; source += kThreads)
-    fwd_chunk_offsets[source] = min(fwd_chunk_offsets[source], bound);
-  __syncthreads();
-  const int64_t count = fwd_chunk_offsets[num_nodes];
-  constexpr int64_t kOwnerChunk = sizeof(OwnerChunk);
-  for (int64_t index = threadIdx.x; index < bound; index += kThreads) {
-    OwnerChunk owner_chunk{0, 0, 0, 0};
-    if (index < count) {
-      const int64_t source =
-          clamp_index(upper_bound(fwd_chunk_offsets + 1, num_nodes, index), num_nodes);
-      const int64_t byte = slice_in[2 * source] + (index - fwd_chunk_offsets[source]) * kOwnerChunk;
-      owner_chunk =
-          *(const OwnerChunk *)(rail_keys + min(max(byte, (int64_t)0), rail_bytes - kOwnerChunk));
-    }
-    fwd_chunks[index] = owner_chunk;
-  }
+    remote_task_tail_kernel(RemoteTaskTail tail, int64_t local_size, int64_t max_chunks) {
+  remote_task_tail(tail, local_size, max_chunks);
 }
 
 // What owner_kjt_kernel reads of the rail layout to place each key's row
@@ -295,7 +284,13 @@ struct RowMapTables {
   int32_t *row_map;
 };
 
-// A thread per position of the owner's KJT, up to the keys it looks up (at most
+// Every CTA (shared memory: num_nodes + 1 int64 words): where each source node's chunks start in
+// fwd_chunks, from the rail's slice_in (its own node sends none; at most max_owner_chunks in
+// all), which CTA 0 writes to fwd_chunk_offsets; then a thread per entry of fwd_chunks
+// (max_owner_chunks of them): the chunk at that place, its source node's (the last whose chunks
+// start at or before it), read from its slice of rail_keys (a slice starts at a multiple of 8
+// bytes); zeros past the chunks.
+// Then a thread per position of the owner's KJT, up to the keys it looks up (at most
 // lookup_keys): the (feature, column) of the KJT's lengths it is in and its
 // place there. A key of its own node is in the own part of node_keys, another
 // node's in its Record in rail_keys (rail_records of them). With weighted
@@ -304,17 +299,43 @@ struct RowMapTables {
 // at its place in the own part plus its group's shift, another node's record
 // (its record among the node's, from records_first) plus its group run's
 // shift, less where the slice starts.
+// Last, with `tail`, the requester's remote task offsets past its proxies' chunks
+// (remote_task_tail).
 template <typename Record>
 __global__ void __launch_bounds__(kThreads)
-    owner_kjt_kernel(const int64_t *kjt_offsets, const int64_t *num_recv,
+    owner_kjt_kernel(ForwardChunks chunks, const int64_t *kjt_offsets, const int64_t *num_recv,
                      const int64_t *own_offsets, const int64_t *records_first,
                      const int64_t *record_offsets, const int64_t *node_keys,
                      const float *node_key_weights, const Record *rail_records, int64_t rail_count,
-                     const int64_t *other_nodes, RowMapTables rows, Sizes sizes,
-                     int64_t *kjt_values, float *kjt_weights) {
+                     const int64_t *other_nodes, RowMapTables rows, RemoteTaskTail tail,
+                     Sizes sizes, int64_t *kjt_values, float *kjt_weights) {
+  extern __shared__ int64_t chunk_offsets[];  // [num_nodes + 1]: fwd_chunk_offsets
   const int64_t local_size = sizes.topo.local_size, kjt_stride = sizes.topo.kjt_stride,
-                other_columns = sizes.topo.num_nodes - 1, lookup_keys = sizes.lookup_keys,
-                num_lengths = sizes.num_features * kjt_stride;
+                num_nodes = sizes.topo.num_nodes, other_columns = num_nodes - 1,
+                lookup_keys = sizes.lookup_keys, num_lengths = sizes.num_features * kjt_stride,
+                bound = sizes.max_owner_chunks();
+  cta_offsets_of<int64_t>(
+      num_nodes, [&](int64_t source) { return chunks.slice_in[2 * source + 1]; }, chunk_offsets);
+  for (int64_t source = threadIdx.x; source <= num_nodes; source += kThreads)
+    chunk_offsets[source] = min(chunk_offsets[source], bound);
+  __syncthreads();
+  if (blockIdx.x == 0)
+    for (int64_t source = threadIdx.x; source <= num_nodes; source += kThreads)
+      chunks.fwd_chunk_offsets[source] = chunk_offsets[source];
+  const int64_t count = chunk_offsets[num_nodes];
+  constexpr int64_t kOwnerChunk = sizeof(OwnerChunk);
+  for (int64_t index = first_item(); index < bound; index += item_stride()) {
+    OwnerChunk owner_chunk{0, 0, 0, 0};
+    if (index < count) {
+      const int64_t source =
+          clamp_index(upper_bound(chunk_offsets + 1, num_nodes, index), num_nodes);
+      const int64_t byte =
+          chunks.slice_in[2 * source] + (index - chunk_offsets[source]) * kOwnerChunk;
+      owner_chunk = *(const OwnerChunk *)(chunks.rail_keys + min(max(byte, (int64_t)0),
+                                                                 chunks.rail_bytes - kOwnerChunk));
+    }
+    chunks.fwd_chunks[index] = owner_chunk;
+  }
   const int64_t keys = min(*num_recv, lookup_keys);
   for (int64_t position = first_item(); position < keys; position += item_stride()) {
     const int64_t index =
@@ -341,6 +362,7 @@ __global__ void __launch_bounds__(kThreads)
     if (rows.row_map != nullptr)
       rows.row_map[position] = (int32_t)(row - rows.group_offsets[group]);
   }
+  if (tail.remote_task_offsets != nullptr) remote_task_tail(tail, local_size, sizes.max_chunks);
 }
 
 }  // namespace
@@ -415,28 +437,24 @@ RailLayout rail_layout(const at::Tensor &messages, const at::Tensor &own_lengths
   return rail;
 }
 
-OwnerTables owner_tables(const RailLayout &rail, const at::Tensor &own_offsets,
+OwnerTables owner_tables(const RailLayout &rail, const OwnerRecords &records,
+                         const RequesterTables &requester, const at::Tensor &own_offsets,
                          const at::Tensor &node_keys, const at::Tensor &node_key_weights,
                          const at::Tensor &rail_keys, const at::Tensor &other_nodes,
                          const at::Tensor &group_of_feature, const Sizes &sizes) {
   const int64_t num_nodes = sizes.topo.num_nodes, lookup_keys = sizes.lookup_keys,
                 rail_words = rail_keys.numel();
   const auto long_options = rail_keys.options().dtype(at::kLong);
-  const cudaStream_t stream = current_stream();
   OwnerTables tables;
   // Each source node's slice in rail_keys starts with the chunks of this
   // node in its stream, then its records.
   const int64_t bound = sizes.max_owner_chunks();
   tables.fwd_chunk_offsets = at::empty({num_nodes + 1}, long_options);
   tables.fwd_chunks = at::empty({bound, 4}, long_options.dtype(at::kInt));
-  const at::Tensor records_first = at::empty({num_nodes - 1}, long_options);
-  const at::Tensor record_offsets = at::empty({sizes.num_features * (num_nodes - 1)}, long_options);
-  owner_slices_kernel<<<num_nodes, kThreads, 0, stream>>>(
-      rail.slice_in.data_ptr<int64_t>(), rail.node_length_per_source_feature.data_ptr<int64_t>(),
-      other_nodes.data_ptr<int64_t>(), (const char *)rail_keys.data_ptr<int64_t>(), 8 * rail_words,
-      sizes, tables.fwd_chunk_offsets.data_ptr<int64_t>(), records_first.data_ptr<int64_t>(),
-      record_offsets.data_ptr<int64_t>(), records_of<OwnerChunk>(tables.fwd_chunks));
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  const ForwardChunks chunks{rail.slice_in.data_ptr<int64_t>(),
+                             (const char *)rail_keys.data_ptr<int64_t>(), 8 * rail_words,
+                             tables.fwd_chunk_offsets.data_ptr<int64_t>(),
+                             records_of<OwnerChunk>(tables.fwd_chunks)};
   // The KJT's keys, its first num_recv positions: its own node's from
   // the own part of node_keys, the other nodes' from their records in
   // rail_keys. A group of one feature takes its keys' rows in KJT order, so
@@ -451,15 +469,18 @@ OwnerTables owner_tables(const RailLayout &rail, const at::Tensor &own_offsets,
                           rail.group_shift.data_ptr<int64_t>(),
                           rail.group_offsets.data_ptr<int64_t>(),
                           data_or_null<int32_t>(tables.row_map)};
+  const RemoteTaskTail tail{data_or_null<int64_t>(requester.proxy_num_chunks),
+                            data_or_null<int64_t>(requester.remote_task_offsets)};
   with_record(sizes, [&](auto record) {
     using Record = decltype(record);
-    owner_kjt_kernel<Record><<<item_grid(lookup_keys), kThreads, 0, stream>>>(
-        rail.kjt_offsets.data_ptr<int64_t>(), rail.num_recv.data_ptr<int64_t>(),
-        own_offsets.data_ptr<int64_t>(), records_first.data_ptr<int64_t>(),
-        record_offsets.data_ptr<int64_t>(), node_keys.data_ptr<int64_t>(),
+    owner_kjt_kernel<Record><<<item_grid(std::max(lookup_keys, bound)), kThreads,
+                               8 * (num_nodes + 1), current_stream()>>>(
+        chunks, rail.kjt_offsets.data_ptr<int64_t>(), rail.num_recv.data_ptr<int64_t>(),
+        own_offsets.data_ptr<int64_t>(), records.records_first.data_ptr<int64_t>(),
+        records.record_offsets.data_ptr<int64_t>(), node_keys.data_ptr<int64_t>(),
         data_or_null<float>(node_key_weights), (const Record *)rail_keys.data_ptr<int64_t>(),
-        8 * rail_words / (int64_t)sizeof(Record), other_nodes.data_ptr<int64_t>(), rows, sizes,
-        tables.kjt_values.data_ptr<int64_t>(), data_or_null<float>(tables.kjt_weights));
+        8 * rail_words / (int64_t)sizeof(Record), other_nodes.data_ptr<int64_t>(), rows, tail,
+        sizes, tables.kjt_values.data_ptr<int64_t>(), data_or_null<float>(tables.kjt_weights));
   });
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   return tables;
@@ -469,199 +490,77 @@ OwnerTables owner_tables(const RailLayout &rail, const at::Tensor &own_offsets,
 
 namespace {
 
-// A thread per bucketized row: the node peer whose remote_map has its words,
-// for a valid row of another node's owner (its proxy: the owner's local
-// rank; else -1), and its occurrence there: its place, row + row_shift,
-// less lookup_keys, clamped into the remote part.
-__global__ void __launch_bounds__(kThreads)
-    remote_map_gather_kernel(const int32_t *bucket_feature_of_row, const int64_t *offset_per_bucket,
-                             const int64_t *row_shift, int64_t rows, Sizes sizes, int32_t *peer,
-                             int64_t *first_word) {
-  const int64_t local_size = sizes.topo.local_size, world_size = sizes.topo.world_size;
-  const int64_t valid_rows = offset_per_bucket[world_size];
-  for (int64_t row = first_item(); row < rows; row += item_stride()) {
-    const int64_t bucket_feature = bucket_feature_of_row[row];
-    const int64_t owner = min(bucket_feature / sizes.num_features, world_size - 1);
-    const bool remote = owner / local_size != sizes.topo.node && row < valid_rows;
-    peer[row] = remote ? (int32_t)(owner % local_size) : -1;
-    first_word[row] =
-        clamp_index(row_shift[bucket_feature] + row - sizes.lookup_keys, sizes.remote_keys);
+// A test's stand-ins for the buffers of its node's proxies, as the requester kernel reads them
+// (requester.cuh): proxy p's header is row p of `headers` (header_words each, ProxyHeader), its
+// remote_map row p of `remote_maps` (map_words each, RemoteMap). The hooks' (requester_tables,
+// owner_records).
+struct StandInPeers {
+  const int32_t *headers, *remote_maps;
+  int64_t header_words, map_words;
+  __device__ __forceinline__ const int32_t *header(int peer) const {
+    return headers + peer * header_words;
   }
-}
+  __device__ __forceinline__ const int32_t *remote_map(int peer) const {
+    return remote_maps + peer * map_words;
+  }
+};
 
-// One CTA: this requester's tables of its node's proxies, from their
-// gathered headers (headers [local_size][ProxyHeader::gathered_words]): where
-// its rows at each proxy start in its push order (push_order_off: its rows of
-// the owners with the proxy's local rank on the other nodes), each proxy's
-// chunks and chunk ends, its push tables there made absolute (positions in
-// push_order: its rows at the proxies before come first), and the remote
-// task offsets.
-__global__ void __launch_bounds__(kThreads)
-    requester_proxy_tables_kernel(const int32_t *headers, const int64_t *offset_per_bucket,
-                                  Sizes sizes, int64_t *push_order_off, int64_t *proxy_num_chunks,
-                                  int64_t *proxy_ends, int32_t *proxy_push_tables,
-                                  int64_t *remote_task_offsets) {
-  const ProxyHeader header = ProxyHeader::of(sizes);
-  const int64_t local_size = sizes.topo.local_size, me = sizes.topo.local_rank,
-                max_chunks = sizes.max_chunks, entries = max_chunks + 1;
-  // its push table as the proxy published it: positions relative to its push
-  // order there
-  auto published = [&](int64_t proxy) { return header.gathered(headers, proxy).push_table(); };
-  auto chunks_of = [&](int64_t proxy) {
-    return min(max(header.gathered(headers, proxy).num_chunks(), (int64_t)0), max_chunks);
-  };
-  auto rows_at = [&](int64_t proxy) {
-    int64_t rows = 0;
-    for (int64_t owner_node = 0; owner_node < sizes.topo.num_nodes; ++owner_node) {
-      const int64_t owner = owner_node * local_size + proxy;
-      if (owner_node != sizes.topo.node)
-        rows += offset_per_bucket[owner + 1] - offset_per_bucket[owner];
-    }
-    return rows;
-  };
-  cta_offsets_of<int64_t>(local_size, rows_at, push_order_off);
-  for (int64_t proxy = threadIdx.x; proxy < local_size; proxy += kThreads)
-    proxy_num_chunks[proxy] = chunks_of(proxy);
-  // each chunk's end, then the stream's (uint32 words)
-  for (int64_t index = threadIdx.x; index < local_size * entries; index += kThreads) {
-    const int64_t proxy = index / entries, chunk = index % entries;
-    proxy_ends[index] = header.gathered(headers, proxy).end(chunk);
-  }
-  // a thread per entry of a proxy's table
-  for (int64_t index = threadIdx.x; index < local_size * entries; index += kThreads) {
-    const int64_t proxy = index / entries;
-    proxy_push_tables[index] = (int32_t)(published(proxy)[index % entries] + push_order_off[proxy]);
-  }
-  // The remote task offsets, chunk after chunk: in a chunk the proxies in
-  // turn from this rank's own one, kTaskRows positions of its push order a
-  // task; a proxy has none past its chunks. (The push tables' differences are
-  // the same relative or absolute.)
-  cta_offsets_of<int64_t>(
-      max_chunks * local_size,
-      [&](int64_t index) -> int64_t {
-        const int64_t chunk = index / local_size, proxy = (me + index % local_size) % local_size;
-        if (chunk >= chunks_of(proxy)) return 0;
-        const int32_t *table = published(proxy);
-        return ceil_div<kTaskRows>((int64_t)table[chunk + 1] - table[chunk]);
-      },
-      remote_task_offsets);
-}
-
-// A thread per bucketized row. A row of an owner on this node is in the owner's
-// lookup_rows at its place in the owner's own part (where this requester
-// pushed it, row + row_shift) plus the shift of its feature's lookup group
-// there (owner_group_shift [owner][group]), both forward and backward.
-// Another node's row reads its key's row in proxy_rows and pushes its
-// gradient to its slot, from what it gathered of its proxy's remote_map (map);
-// a valid one is at its push position at the proxy in its push order.
-__global__ void __launch_bounds__(kThreads)
-    requester_rows_kernel(GatheredMap map, const int64_t *owner_group_shift,
-                          const int32_t *bucket_feature_of_row, const int64_t *row_shift,
-                          const int32_t *group_of_feature, const int64_t *offset_per_bucket,
-                          const int64_t *push_order_off, int64_t rows, Sizes sizes, int32_t *src,
-                          int32_t *dst, int32_t *push_order) {
-  const int64_t local_size = sizes.topo.local_size, num_features = sizes.num_features,
-                world_size = sizes.topo.world_size;
-  const int64_t valid_rows = offset_per_bucket[world_size];
-  for (int64_t row = first_item(); row < rows; row += item_stride()) {
-    const int64_t bucket_feature = bucket_feature_of_row[row];
-    const int64_t owner = min(bucket_feature / num_features, world_size - 1);
-    const int64_t peer = owner % local_size;  // the owner itself on this node, else its proxy
-    if (owner / local_size == sizes.topo.node) {
-      const int64_t group = group_of_feature[bucket_feature % num_features];
-      const int32_t place = (int32_t)(row + row_shift[bucket_feature] +
-                                      owner_group_shift[peer * sizes.num_groups + group]);
-      src[row] = place;
-      dst[row] = place;
-      continue;
-    }
-    src[row] = map.key_row(row);
-    dst[row] = map.slot(row);
-    // a call that does not fit may read words no one wrote: a position out
-    // of range is dropped
-    const int64_t position = push_order_off[peer] + map.position(row);
-    if (row < valid_rows && position >= 0 && position < rows) push_order[position] = (int32_t)row;
-  }
-}
+// The test hook's row CTAs of the requester kernel (force_requester_ctas): 0, as their sizes
+// choose.
+int64_t g_requester_ctas = 0;
 
 }  // namespace
 
-PeerWords remote_map_gather(const at::Tensor &bucket_feature_of_row,
-                            const at::Tensor &offset_per_bucket, const at::Tensor &row_shift,
-                            const Sizes &sizes) {
-  const int64_t rows = bucket_feature_of_row.numel();
-  PeerWords gather;
-  gather.peer = at::empty({rows}, bucket_feature_of_row.options());
-  gather.first_word = at::empty({rows}, offset_per_bucket.options());
-  if (rows > 0) {
-    remote_map_gather_kernel<<<item_grid(rows), kThreads, 0, current_stream()>>>(
-        bucket_feature_of_row.data_ptr<int32_t>(), offset_per_bucket.data_ptr<int64_t>(),
-        row_shift.data_ptr<int64_t>(), rows, sizes, gather.peer.data_ptr<int32_t>(),
-        gather.first_word.data_ptr<int64_t>());
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
-  }
-  return gather;
+void force_requester_ctas(int64_t ctas) {
+  TORCH_CHECK(ctas >= 0 && ctas <= INT32_MAX / 2,
+              "hier_output_dist: the requester kernel's row CTAs: 0 (as their sizes choose) or a "
+              "grid of at most 2^30 - 1");
+  g_requester_ctas = ctas;
 }
 
-PeerWords header_gather(const Sizes &sizes, const at::TensorOptions &options) {
-  const ProxyHeader header = ProxyHeader::of(sizes);
-  const int64_t local_size = sizes.topo.local_size, words = header.gathered_words(),
-                push_table = header.push_table_word(sizes.topo.local_rank);
-  const auto long_options = options.dtype(at::kLong);
-  // of each proxy's header, in the order of its gathered words: its chunks,
-  // its end, each chunk's end, then its push tables for this requester
-  const at::Tensor first_word = at::cat(
-      {at::arange(ProxyHeader::kNumChunksWord, ProxyHeader::kEndWord + 1, long_options),
-       at::arange(ProxyHeader::kEndsWord, ProxyHeader::kEndsWord + header.max_chunks, long_options),
-       at::arange(push_table, push_table + header.push_words(), long_options)});
-  PeerWords gather;
-  gather.peer = at::arange(local_size, options.dtype(at::kInt))
-                    .view({local_size, 1})
-                    .expand({local_size, words})
-                    .reshape({-1});
-  gather.first_word = first_word.view({1, words}).expand({local_size, words}).reshape({-1});
-  return gather;
+int requester_row_ctas(int64_t rows, int64_t other_ctas) {
+  if (g_requester_ctas > 0) return (int)g_requester_ctas;
+  if (rows == 0) return 0;
+  // the CTAs the GPU holds at once, two per SM, less the other roles' (at least one per SM)
+  const int64_t sms = at::cuda::getCurrentDeviceProperties()->multiProcessorCount;
+  return (int)std::min<int64_t>(item_grid(rows), std::max(2 * sms - other_ctas, sms));
 }
 
-RequesterTables requester_tables(const at::Tensor &words, const at::Tensor &headers,
+RequesterTables requester_tables(const at::Tensor &remote_maps, const at::Tensor &proxy_headers,
                                  const at::Tensor &owner_group_shift,
                                  const at::Tensor &bucket_feature_of_row,
                                  const at::Tensor &row_shift, const at::Tensor &group_of_feature,
                                  const at::Tensor &offset_per_bucket, const Sizes &sizes) {
-  const int64_t rows = bucket_feature_of_row.numel(), local_size = sizes.topo.local_size,
-                max_chunks = sizes.max_chunks;
-  const auto long_options = offset_per_bucket.options().dtype(at::kLong);
-  const auto int_options = offset_per_bucket.options().dtype(at::kInt);
-  const cudaStream_t stream = current_stream();
-  RequesterTables tables;
-  // Per proxy, from its gathered header: its chunks and their ends, and this
-  // requester's push tables there, made absolute; and the remote task offsets.
-  tables.push_order_off = at::empty({local_size + 1}, long_options);
-  tables.proxy_num_chunks = at::empty({local_size}, long_options);
-  tables.proxy_ends = at::empty({local_size, max_chunks + 1}, long_options);
-  tables.proxy_push_tables = at::empty({local_size, max_chunks + 1}, int_options);
-  tables.remote_task_offsets = at::empty({max_chunks * local_size + 1}, long_options);
-  requester_proxy_tables_kernel<<<kOneCta, kThreads, 0, stream>>>(
-      headers.data_ptr<int32_t>(), offset_per_bucket.data_ptr<int64_t>(), sizes,
-      tables.push_order_off.data_ptr<int64_t>(), tables.proxy_num_chunks.data_ptr<int64_t>(),
-      tables.proxy_ends.data_ptr<int64_t>(), tables.proxy_push_tables.data_ptr<int32_t>(),
-      tables.remote_task_offsets.data_ptr<int64_t>());
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
-  tables.src = at::empty({rows}, int_options);
-  tables.dst = at::empty({rows}, int_options);
-  tables.push_order = at::empty({rows}, int_options);
-  if (rows == 0) return tables;
-  // Per row: its src and dst, and its place in the push order, its rows at
-  // each proxy at their push positions there.
-  const GatheredMap map{words.data_ptr<int32_t>(), rows};
-  requester_rows_kernel<<<item_grid(rows), kThreads, 0, stream>>>(
-      map, owner_group_shift.data_ptr<int64_t>(), bucket_feature_of_row.data_ptr<int32_t>(),
-      row_shift.data_ptr<int64_t>(), group_of_feature.data_ptr<int32_t>(),
-      offset_per_bucket.data_ptr<int64_t>(), tables.push_order_off.data_ptr<int64_t>(), rows, sizes,
-      tables.src.data_ptr<int32_t>(), tables.dst.data_ptr<int32_t>(),
-      tables.push_order.data_ptr<int32_t>());
+  const int64_t local_size = sizes.topo.local_size, max_chunks = sizes.max_chunks;
+  const StandInPeers peers{proxy_headers.data_ptr<int32_t>(), remote_maps.data_ptr<int32_t>(),
+                           ProxyHeader::of(sizes).words(), RemoteMap::kArrays * sizes.remote_keys};
+  const RequesterTables tables =
+      requester_tables_of(peers, bucket_feature_of_row, offset_per_bucket, row_shift,
+                          owner_group_shift, group_of_feature, nullptr, at::Tensor(), sizes)
+          .first;
+  // The entries of the remote task offsets that owner_tables writes in the in channel.
+  const RemoteTaskTail tail{tables.proxy_num_chunks.data_ptr<int64_t>(),
+                            tables.remote_task_offsets.data_ptr<int64_t>()};
+  remote_task_tail_kernel<<<item_grid(local_size * max_chunks), kThreads, 0, current_stream()>>>(
+      tail, local_size, max_chunks);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   return tables;
+}
+
+std::pair<RequesterTables, OwnerRecords> owner_records(const RailLayout &rail,
+                                                       const at::Tensor &other_nodes,
+                                                       const at::Tensor &group_of_feature,
+                                                       const Sizes &sizes) {
+  const int64_t local_size = sizes.topo.local_size, header_words = ProxyHeader::of(sizes).words();
+  const auto int_options = other_nodes.options().dtype(at::kInt);
+  const auto long_options = other_nodes.options().dtype(at::kLong);
+  // proxies whose headers hold 0 (no chunks); no row reads a remote_map
+  const at::Tensor headers = at::zeros({local_size, header_words}, int_options);
+  const StandInPeers peers{headers.data_ptr<int32_t>(), nullptr, header_words, 0};
+  return requester_tables_of(
+      peers, at::empty({0}, int_options), at::zeros({sizes.topo.world_size + 1}, long_options),
+      at::zeros({1}, long_options), at::zeros({local_size * sizes.num_groups}, long_options),
+      group_of_feature, &rail, other_nodes, sizes);
 }
 
 }  // namespace hier_output_dist

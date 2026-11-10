@@ -237,15 +237,15 @@ class CtrlLayout {
 // formats of the two buffers in it that the node's requesters read, the proxy
 // header and remote_map.
 
-struct GatheredHeader;  // below
-
 // The proxy header (int32 words), what a proxy publishes to its node's
 // requesters: its stream's chunks at word 0 and its end at word 1 (uint32,
 // unwrapped: past num_proxy_rows when the stream wraps the ring); from word
-// 2 each chunk's end ([max_chunks], uint32); then its push tables
-// [local_size][max_chunks + 1]: where each requester's rows of each chunk
-// start in its push order there (chunk max_chunks: their end). A requester
-// gathers the words it reads (planner.h) by their word numbers.
+// 2 each chunk's end ([max_chunks], uint32: 0 past its chunks); then its push
+// tables [local_size][max_chunks + 1]: where each requester's rows of each
+// chunk start in its push order there (chunk max_chunks: their end; from its
+// chunks on, every entry that end). A requester reads the words it needs in
+// its node peers' copies, by their word numbers (the requester kernel,
+// requester.cuh).
 struct ProxyHeader {
   static constexpr int64_t kNumChunksWord = 0, kEndWord = 1, kEndsWord = 2;
   int32_t *base;
@@ -266,46 +266,14 @@ struct ProxyHeader {
   __host__ __device__ int32_t *push_table(int64_t requester) const {
     return base + push_table_word(requester);
   }
-  // What a requester gathers of a header, in this order: the chunks, the
-  // end, each chunk's end, then its own push table.
-  static constexpr int64_t kGatheredNumChunks = 0, kGatheredEnd = 1, kGatheredEnds = 2;
-  __host__ __device__ int64_t gathered_push_table() const { return kGatheredEnds + max_chunks; }
-  __host__ __device__ int64_t gathered_words() const {
-    return gathered_push_table() + push_words();
-  }
-  // Proxy `proxy`'s words in what a requester gathered of every proxy's
-  // header (`headers`, gathered_words each).
-  __host__ __device__ GatheredHeader gathered(const int32_t *headers, int64_t proxy) const;
 };
-// What a requester gathered of a proxy's header: its stream's chunks, each
-// chunk's end and the stream's end (unwrapped positions), and this
-// requester's push table there (positions relative to its push order at the
-// proxy).
-struct GatheredHeader {
-  const int32_t *words;
-  int64_t max_chunks;
-  __host__ __device__ int64_t num_chunks() const { return words[ProxyHeader::kGatheredNumChunks]; }
-  // chunk c's end for c < max_chunks, the stream's end for c = max_chunks
-  __host__ __device__ int64_t end(int64_t chunk) const {
-    const int64_t word =
-        chunk < max_chunks ? ProxyHeader::kGatheredEnds + chunk : ProxyHeader::kGatheredEnd;
-    return (int64_t)(uint32_t)words[word];
-  }
-  __host__ __device__ const int32_t *push_table() const {
-    return words + ProxyHeader::kGatheredEnds + max_chunks;
-  }
-};
-__host__ __device__ inline GatheredHeader ProxyHeader::gathered(const int32_t *headers,
-                                                                int64_t proxy) const {
-  return GatheredHeader{headers + proxy * gathered_words(), max_chunks};
-}
 
 // remote_map (int32), what a proxy publishes of each occurrence of its
 // remote part (occ) to the occurrence's requester, in three arrays of
 // remote_keys: its key's row in proxy_rows, its slot in proxy_rows (the
 // key's row or a duplicate's) and its position in its requester's push
-// order. A requester gathers an occurrence's words from entry occ of each
-// array (GatheredMap).
+// order. A requester reads an occurrence's words at entry occ of each array,
+// in its node peer's copy (the requester kernel).
 struct RemoteMap {
   static constexpr int kArrays = 3;
   int32_t *base;
@@ -314,15 +282,6 @@ struct RemoteMap {
   __host__ __device__ int32_t *key_row() const { return array(0); }
   __host__ __device__ int32_t *slot() const { return array(1); }
   __host__ __device__ int32_t *position() const { return array(2); }
-};
-// The remote_map words a requester gathered for its rows (peer_gather's
-// [RemoteMap::kArrays][rows]): each row's key row, slot and push position.
-struct GatheredMap {
-  const int32_t *words;
-  int64_t rows;
-  __host__ __device__ int32_t key_row(int64_t row) const { return words[row]; }
-  __host__ __device__ int32_t slot(int64_t row) const { return words[rows + row]; }
-  __host__ __device__ int32_t position(int64_t row) const { return words[2 * rows + row]; }
 };
 
 // A requester's row of node_offsets (NodeRow): what the node layout (node.cuh) reads of its
@@ -354,16 +313,6 @@ struct NodeRow {
     return w - x0 <= node_features ? opbf[topo.node * node_features + w - x0] : 0;
   }
 };
-
-// The buffers of the keys section whose words a requester gathers from its
-// node peers (peer_gather): of a proxy header, one word per item (its word
-// number); of remote_map, the RemoteMap::kArrays words of an occurrence (its
-// entry occ of each array).
-enum GatherFrom : int { kGatherProxyHeader = 0, kGatherRemoteMap };
-// The words peer_gather reads per item.
-__host__ __device__ constexpr int gather_words(GatherFrom from) {
-  return from == kGatherProxyHeader ? 1 : RemoteMap::kArrays;
-}
 
 // The keys section, its buffers in this order (those marked num_nodes > 1
 // exist across nodes only):

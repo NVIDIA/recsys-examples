@@ -491,6 +491,16 @@ RailLayout rail_layout(const at::Tensor &messages, const at::Tensor &own_lengths
 // The tensors of a RailLayout, empty.
 RailLayout empty_rail_layout(const Sizes &sizes, const at::TensorOptions &options);
 
+// The owner's records of each other node in its rail_keys, from the rail layout (slice_in,
+// node_length_per_source_feature), in records of record_bytes (a slice and its chunks are whole
+// records): where they start, after the node's chunks, and where those of each feature start. In
+// the in channel the requester kernel's owner CTAs make them (a CTA per other node, requester.cuh),
+// before rail_done; owner_tables reads them.
+struct OwnerRecords {
+  at::Tensor records_first;   // int64 [num_nodes - 1]: per other node (other_nodes_of)
+  at::Tensor record_offsets;  // int64 [num_features][num_nodes - 1]
+};
+
 // The owner's tables, once the rail's proxies put their records into its
 // rail_keys (int64 view) and its node's requesters their keys into the own
 // part of its node_keys (node_keys, node_key_weights: views of [lookup_keys];
@@ -508,42 +518,18 @@ struct OwnerTables {
                                  // GroupRuns), where the lookup writes it; undefined when key i of
                                  // a group's keys takes row i (no group of more than one feature)
 };
-// group_of_feature: int32 [num_features], the lookup group of each feature; group_starts: int64
-// [num_groups + 1], each group's first feature, then num_features.
-OwnerTables owner_tables(const RailLayout &rail, const at::Tensor &own_offsets,
-                         const at::Tensor &node_keys, const at::Tensor &node_key_weights,
-                         const at::Tensor &rail_keys, const at::Tensor &other_nodes,
-                         const at::Tensor &group_of_feature, const Sizes &sizes);
 
 // The requester's part of a call across nodes (the in channel): its maps to
-// the rows of its keys, from what its node's proxies published (two
-// peer_gathers: their headers, and its rows' words of their remote_map) and
-// where its owners on its node put the rows of its keys (planner.cu).
-
-// What a peer_gather reads (GatherFrom says which words): for each item a
-// node peer (negative: none) and its first int32 word to read there.
-struct PeerWords {
-  at::Tensor peer;        // int32 [items]
-  at::Tensor first_word;  // int64 [items]
-};
-// The remote_map words of this requester's rows (bucket_feature_of_row,
-// offset_per_bucket: the bucketize's; row_shift: the node layout's),
-// kGatherRemoteMap: a row of another node's owner is occurrence
-// row + row_shift - lookup_keys of its proxy, the owner's rank on this node
-// (its place in its proxy's remote part, where it pushed it); it reads that
-// entry of each RemoteMap array.
-PeerWords remote_map_gather(const at::Tensor &bucket_feature_of_row,
-                            const at::Tensor &offset_per_bucket, const at::Tensor &row_shift,
-                            const Sizes &sizes);
-// The words of the node's proxy headers this requester reads
-// (kGatherProxyHeader): ProxyHeader's gathered words of each proxy in turn,
-// a constant of the op.
-PeerWords header_gather(const Sizes &sizes, const at::TensorOptions &options);
-
+// the rows of its keys and its tables of its node's proxies, from what the
+// proxies published in their copies of the window (their headers, and its
+// rows' entries of their remote_map) and where its owners on its node put the
+// rows of its keys. One kernel makes them (requester_kernel, requester.cuh),
+// and on other CTAs of its grid the owner's records (OwnerRecords).
 struct RequesterTables {
   at::Tensor src, dst;    // int32 [bucket_feature_of_row.numel()]: where each row's key is in the
                           // forward (a row of its node: its owner's KJT; else its proxy's
-                          // proxy_rows), and where its gradient goes in the backward
+                          // proxy_rows), and where its gradient goes in the backward (-1: a row
+                          // of another node's owner past the valid rows)
   at::Tensor push_order;  // int32 [bucket_feature_of_row.numel()]: its rows at each proxy in their
                           // push order
   at::Tensor push_order_off;     // int64 [local_size + 1]: where its rows at each proxy start
@@ -554,21 +540,51 @@ struct RequesterTables {
                                  // then its stream's end (past num_proxy_rows when it wraps)
   at::Tensor remote_task_offsets;  // int64 [max_chunks * local_size + 1]: its tasks of rows of
                                    // other nodes before each (chunk, proxy in turn), the forward's
-                                   // pulls and the backward's pushes alike
+                                   // pulls and the backward's pushes alike; owner_tables writes
+                                   // those between local_size times its proxies' most chunks and
+                                   // the last
 };
-// words: int32 [3][bucket_feature_of_row.numel()], the remote_map words of its
-// rows (remote_map_gather's; rows of its node's owners and past the valid rows
-// hold anything); headers: int32 [local_size][ProxyHeader::gathered_words]
-// (header_gather's); owner_group_shift: int64 [local_size][num_groups], each
-// owner's group shifts on its node (node_status_exchange: a row of an owner of
-// its node lies at its place in the owner's own part, row + row_shift, plus
-// its group's shift); row_shift: the node layout's; group_of_feature: int32
-// [num_features].
-RequesterTables requester_tables(const at::Tensor &words, const at::Tensor &headers,
+// Each later requester kernel of this process runs its rows on `ctas` CTAs, or as their sizes
+// choose (0: requester_row_ctas). A test hook (testing.cu).
+void force_requester_ctas(int64_t ctas);
+// The row CTAs of a requester kernel of `rows` bucketized rows beside `other_ctas` CTAs of its
+// other roles: a thread per row, on the CTAs the GPU holds at once (two per SM) less the others,
+// but at least one per SM (none without rows); or the test hook's (force_requester_ctas).
+int requester_row_ctas(int64_t rows, int64_t other_ctas);
+// The tables as the in channel's requester kernel makes them, from stand-ins for its node's
+// proxies' buffers: remote_maps int32 [local_size][RemoteMap::kArrays][remote_keys] and
+// proxy_headers int32 [local_size][ProxyHeader::words], row p proxy p's, as the proxy steps write
+// them; then the entries of remote_task_offsets that owner_tables fills in the in channel.
+// owner_group_shift: int64 [local_size][num_groups], each owner's group shifts on its node
+// (node_status_exchange: a row of an owner of its node lies at its place in the owner's own part,
+// row + row_shift, plus its group's shift); bucket_feature_of_row, offset_per_bucket: the
+// bucketize's; row_shift: the node layout's; group_of_feature: int32 [num_features]. The hooks'.
+RequesterTables requester_tables(const at::Tensor &remote_maps, const at::Tensor &proxy_headers,
                                  const at::Tensor &owner_group_shift,
                                  const at::Tensor &bucket_feature_of_row,
                                  const at::Tensor &row_shift, const at::Tensor &group_of_feature,
                                  const at::Tensor &offset_per_bucket, const Sizes &sizes);
+// The owner's records of each other node as the in channel makes them, on the requester kernel's
+// owner CTAs from the rail layout (other_nodes: other_nodes_of's; group_of_feature: int32
+// [num_features]), with that kernel's requester tables of a call of no rows whose node's proxies
+// published no chunks (headers of 0): owner_tables then makes their remote task offsets all 0. The
+// hooks'.
+std::pair<RequesterTables, OwnerRecords> owner_records(const RailLayout &rail,
+                                                       const at::Tensor &other_nodes,
+                                                       const at::Tensor &group_of_feature,
+                                                       const Sizes &sizes);
+
+// One kernel (owner_kjt_kernel) takes the KJT's keys, and the chunks its forward puts from the
+// rail's slice_in and rail_keys. records: the owner's records of each other node (the requester
+// kernel's owner CTAs'); group_of_feature: int32 [num_features], the lookup group of each
+// feature. Given the requester's tables of the call (the in channel's; the hooks give none), it
+// also writes the entries of remote_task_offsets between local_size times the proxies' most
+// chunks (proxy_num_chunks) and the last: the total, which the requester kernel wrote at both.
+OwnerTables owner_tables(const RailLayout &rail, const OwnerRecords &records,
+                         const RequesterTables &requester, const at::Tensor &own_offsets,
+                         const at::Tensor &node_keys, const at::Tensor &node_key_weights,
+                         const at::Tensor &rail_keys, const at::Tensor &other_nodes,
+                         const at::Tensor &group_of_feature, const Sizes &sizes);
 
 }  // namespace hier_output_dist
 }  // namespace dyn_emb

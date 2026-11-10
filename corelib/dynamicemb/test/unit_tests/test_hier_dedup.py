@@ -31,8 +31,8 @@ messages of each rail (each rank's message to each rail peer: a header the
 same to all, so every rank of a rail lays the rail's rows out from the same
 headers, then the peer's own part), the key records each proxy puts into its
 owners' rail_keys, the needs and group shifts each node exchanges (the
-requester binding gathers the proxies' words itself). The windows hold
-garbage before the call. The checks:
+requester binding reads the proxies' words itself, as its kernel reads its
+node peers' windows). The windows hold garbage before the call. The checks:
 
 * each proxy against a plain reference of the planner's rules: its
   node-unique keys (identities (table, key), each in the bucket feature
@@ -67,6 +67,9 @@ garbage before the call. The checks:
   group's slice starts, the group shifts, and the group runs of each source
   node's records, equal to that node's proxy's runs of its keys of the owner
   (the rows its backward puts land in); the needs, the same on every rank.
+  The owner's records come from the requester kernel's owner CTAs, on
+  proxies of no chunks, and the owner's tables complete that kernel's remote
+  task offsets: all 0.
 
 Calls that do not fit, and calls whose keys are not index-deduplicated (a
 key past local_size occurrences: the need key_rows), check the needs alone
@@ -124,6 +127,26 @@ the caching allocator gave. With the caching allocator off (under
 compute-sanitizer, below) the proxy leaves them as they come, so initcheck
 sees a read of a word that nothing wrote.
 
+The requester's kernel also runs alone (``REQUESTER_CASES``): one
+requester's calls through its binding, on stand-ins for its node's proxies'
+headers and remote_map as the proxy steps leave them (each proxy's chunks;
+each requester's occurrences there in its push order by chunk; chunk ends 0
+past the chunks; push table entries from the chunks on where its rows
+end), against a plain reference of its rules, every table entry, every
+row's src and dst and every push position. The kernel reads a proxy's
+header up to its chunks and writes the entries past them from the entry at
+its chunks; the cases take calls of no rows, of rows past the valid ones
+alone, node skips (stale remote_map words), no keys across nodes, proxies
+of no chunks and of max_chunks, chunk ends past 2^31, an odd max_chunks
+(each push table starts at an odd word, so the kernel's 16-byte loads peel
+the words before a 16-byte boundary), lookup groups, 72 GPUs per node and
+40 nodes (more than a warp's lanes), max_chunks past 8,192 (a table CTA's
+loads in two passes, the scan in many tiles), the rows on 1 and 3 CTAs
+(``hier_output_dist_requester_ctas``: a thread's rows in several steps),
+and the calls of the design's reference ports (ref_requester and
+e2e_requester_check: local_size 1 to 8, 2 to 4 nodes, ends past 2^31, the
+proxies' occurrences of each requester from none to 100, node skips).
+
 Run it on one GPU, from ``corelib/dynamicemb``::
 
     python test/unit_tests/test_hier_dedup.py
@@ -147,10 +170,11 @@ offset of the own part's features and of the proxy's bucket features), a
 wrapping ring, node dedup off, an overflow, and those of the proxy's live
 counts (20 times the need, at the need, a count of 0, the scans on 2 and 600
 CTAs, several rows per payload), its int64 push keys and a requester with
-nothing to send.
+nothing to send; and the requester cases of ``SANITIZE_REQUESTER_CASES``.
 """
 
 import os
+import random
 import sys
 from bisect import bisect_left, bisect_right
 from dataclasses import dataclass
@@ -165,6 +189,7 @@ from dynamicemb_extensions import (
     hier_output_dist_proxy_plan,
     hier_output_dist_push_keys64,
     hier_output_dist_rail_tables,
+    hier_output_dist_requester_ctas,
     hier_output_dist_requester_tables,
     hier_output_dist_scan_ctas,
 )
@@ -2567,6 +2592,13 @@ def run_case(case: Case, seed: int) -> Tuple[Dict[str, List[str]], str]:
         ),
         [],
     )
+    # the owner tables complete the remote task offsets of the requester
+    # kernel whose owner CTAs made their records, here on proxies of no chunks
+    checks["remote task offsets"] = [
+        f"rank {rank}"
+        for rank in range(world_size)
+        if any(owners[rank]["remote_task_offsets"].tolist())
+    ]
     # the owner tables' call computed the rail's tables again
     checks["again"] = [
         name
@@ -2583,6 +2615,489 @@ def run_case(case: Case, seed: int) -> Tuple[Dict[str, List[str]], str]:
             [] if laps >= 2 and dst[0] == dst[second] else ["the case's shape"]
         )
     return checks, stats
+
+
+# ── the requester's kernel on stand-ins ──────────────────────────────────────
+#
+# Calls of one requester through its hook alone, on stand-ins for its node's
+# proxies' headers and remote_map (as the proxy steps write them), against a
+# plain reference of its rules. Each case's fields that are tuples are drawn
+# per call.
+
+
+@dataclass
+class RequesterCase:
+    name: str
+    num_nodes: Tuple[int, ...] = (3,)
+    local_size: Tuple[int, ...] = (4,)
+    num_features: Tuple[int, ...] = (3,)
+    rows: Tuple[int, ...] = (0, 1, 3)  # a requester's rows of one bucket feature
+    bound: Tuple[int, ...] = (0, 5)  # its rows past the valid ones
+    # the other requesters' occurrences at a proxy
+    others: Tuple[int, ...] = (0, 0, 3, 17)
+    # remote_keys at least (raised to the occurrences of a proxy), and with
+    # odd_chunks raised until max_chunks is odd
+    remote_keys: Tuple[int, ...] = (8, 40)
+    odd_chunks: bool = False
+    max_chunk_rows_arg: int = 0  # 0: the least, 2 * local_size
+    payload_rows: int = 0  # 0: max_chunk_rows (rows_per_payload 1)
+    # each proxy's chunks: "random" (none, max_chunks or any), "full"
+    # (max_chunks), "zero_or_full" (alternately), "zero" (no keys across nodes)
+    chunks: str = "random"
+    skip: float = 0.0  # the share of calls whose node skips
+    high_ends: float = 0.0  # the share of proxies whose chunk ends pass 2^31
+    groups: bool = False  # random lookup groups
+    row_ctas: int = 0  # the requester kernel's row CTAs (0: as its sizes choose)
+    calls: int = 4
+
+
+@dataclass
+class RequesterSizes:
+    """What the sizing helpers above read of a Case, for one requester call."""
+
+    num_nodes: int
+    local_size: int
+    max_chunk_rows: int
+    chunk_payload_rows: int
+
+
+def requester_call(case: RequesterCase, rng: random.Random) -> Dict:
+    """One requester's call, with each field of `case` drawn: its node's proxies
+    as the proxy steps leave them, and its bucketized rows. A proxy has C
+    chunks; each requester's occurrences there take chunks below C, and its
+    push order there sorts them by chunk, stably. The proxy's header holds C,
+    its stream's end, each chunk's end (0 past C) and per requester where its
+    rows of each chunk start in its push order, the end of its rows from C
+    on; its remote_map each occurrence's key row and slot (anything) and its
+    push position. Under skip no occurrence is valid: C is 0, each push table
+    entry the requester's -remote_offsets, and remote_map holds stale words
+    (push positions all different, so no two rows take one). The requester's
+    rows of the owners (n, p) of the other nodes are its occurrences at
+    proxy p, in order, where row_shift places them."""
+    draw = {
+        name: rng.choice(getattr(case, name))
+        for name in (
+            "num_nodes",
+            "local_size",
+            "num_features",
+            "rows",
+            "bound",
+            "remote_keys",
+        )
+    }
+    num_nodes, local_size, num_features = (
+        draw["num_nodes"],
+        draw["local_size"],
+        draw["num_features"],
+    )
+    world_size = num_nodes * local_size
+    node, me = rng.randrange(num_nodes), rng.randrange(local_size)
+    skip = rng.random() < case.skip
+    # the sizes as plan_sizes makes them (max_chunks from remote_keys)
+    max_chunk_rows = case.max_chunk_rows_arg or 2 * local_size
+    sized = RequesterSizes(
+        num_nodes, local_size, max_chunk_rows, case.payload_rows or max_chunk_rows
+    )
+    # each proxy's chunks, as a share of max_chunks (0: none, 1: all of them);
+    # "random": none, all, or any, as the design's reference port draws them
+    if case.chunks == "zero":
+        share = [0.0] * local_size
+    elif case.chunks == "full":
+        share = [1.0] * local_size
+    elif case.chunks == "zero_or_full":
+        share = [float(proxy % 2) for proxy in range(local_size)]
+    else:
+        share = [
+            rng.choice([0.0, 1.0, rng.random(), rng.random()])
+            for _ in range(local_size)
+        ]
+    # the requester's rows of each bucket feature: in a call that fits none
+    # of a proxy without chunks
+    counts = []
+    for bucket_feature in range(world_size * num_features):
+        owner = bucket_feature // num_features
+        across = owner // local_size != node
+        none = across and share[owner % local_size] == 0.0 and not skip
+        counts.append(0 if none else rng.randrange(draw["rows"] + 1))
+    offsets = list(accumulate([0] + counts))
+    valid = offsets[-1]
+    num_rows = valid + draw["bound"]
+    # its occurrences at each proxy, in its order there
+    mine = [0] * local_size
+    for bucket_feature, count in enumerate(counts):
+        owner = bucket_feature // num_features
+        if owner // local_size != node:
+            mine[owner % local_size] += count
+    occurrences = [
+        [
+            mine[proxy]
+            if requester == me
+            else (0 if share[proxy] == 0.0 and not skip else rng.choice(case.others))
+            for requester in range(local_size)
+        ]
+        for proxy in range(local_size)
+    ]
+    remote_keys = max([draw["remote_keys"]] + [sum(o) for o in occurrences])
+    while case.odd_chunks and max_chunks(sized, remote_keys) % 2 == 0:
+        remote_keys += 1
+    chunks_max = max_chunks(sized, remote_keys)
+    lookup_keys = rng.choice([1, 7, 1000])
+    words = 2 + chunks_max + local_size * (chunks_max + 1)
+    # under skip, where the requester's rows land in its push order: all
+    # different, some past its rows
+    push_off = list(accumulate([0] + mine))
+    stale_targets = rng.sample(range(-num_rows - 5, 3 * num_rows + 6), sum(mine))
+    headers, remote_maps, before_me = [], [], []
+    for proxy in range(local_size):
+        if skip:
+            chunks = 0
+        else:
+            chunks = min(chunks_max, int(share[proxy] * chunks_max))
+            if 0.0 < share[proxy] < 1.0 and chunks == 0:
+                chunks = 1
+        header = [0] * words
+        header[0] = chunks
+        at = (
+            rng.choice([(1 << 31) - 7, (1 << 32) - 3000])
+            if rng.random() < case.high_ends
+            else rng.randrange(100)
+        )
+        for chunk in range(chunks):
+            at += rng.randrange(1, 4000)
+            header[2 + chunk] = at & 0xFFFFFFFF
+        header[1] = header[1 + chunks] if chunks else 0
+        remote_offsets = list(accumulate([0] + occurrences[proxy]))
+        positions = []
+        for requester in range(local_size):
+            n = occurrences[proxy][requester]
+            chunk_of = [rng.randrange(chunks) if chunks else 0 for _ in range(n)]
+            by_chunk = sorted(range(n), key=lambda o: (chunk_of[o], o))
+            position = [0] * n
+            for place, occurrence in enumerate(by_chunk):
+                position[occurrence] = place
+            if skip and requester == me:
+                first = push_off[proxy]
+                position = [
+                    stale_targets[first + i] - push_off[proxy] for i in range(n)
+                ]
+            elif skip:
+                position = [rng.randrange(-(1 << 20), 1 << 20) for _ in range(n)]
+            positions += position
+            ordered = sorted(chunk_of)
+            table = 2 + chunks_max + requester * (chunks_max + 1)
+            for chunk in range(chunks_max + 1):
+                if skip:
+                    header[table + chunk] = -remote_offsets[requester]
+                elif chunk < chunks:
+                    header[table + chunk] = bisect_left(ordered, chunk)
+                else:
+                    header[table + chunk] = n
+        before_me.append(remote_offsets[me])
+        past = [
+            rng.randrange(-(1 << 20), 1 << 20)
+            for _ in range(remote_keys - len(positions))
+        ]
+        remote_maps.append(
+            [rng.randrange(1 << 20) for _ in range(2 * remote_keys)] + positions + past
+        )
+        headers.append(header)
+    # row_shift: a row of owner (n, p) of another node goes to its occurrence
+    # at p, lookup_keys + its place in p's remote part
+    row_shift = [
+        rng.randrange(-(1 << 20), 1 << 20) for _ in range(world_size * num_features + 1)
+    ]
+    taken = [0] * local_size
+    for bucket_feature, count in enumerate(counts):
+        owner = bucket_feature // num_features
+        if owner // local_size == node or count == 0:
+            continue
+        proxy = owner % local_size
+        row_shift[bucket_feature] = (
+            lookup_keys + before_me[proxy] + taken[proxy] - offsets[bucket_feature]
+        )
+        taken[proxy] += count
+    groups = []
+    if case.groups:
+        cuts = sorted(rng.sample(range(1, num_features), rng.randrange(num_features)))
+        groups = [b - a for a, b in zip([0] + cuts, cuts + [num_features])]
+    num_groups = len(groups) or 1
+    return dict(
+        num_nodes=num_nodes,
+        local_size=local_size,
+        node=node,
+        me=me,
+        num_features=num_features,
+        lookup_keys=lookup_keys,
+        remote_keys=remote_keys,
+        max_chunks=chunks_max,
+        max_chunk_rows=sized.max_chunk_rows,
+        payload_rows=sized.chunk_payload_rows,
+        groups=groups,
+        num_groups=num_groups,
+        skip=skip,
+        headers=headers,
+        remote_maps=remote_maps,
+        counts=counts,
+        offsets=offsets,
+        num_rows=num_rows,
+        row_shift=row_shift,
+        owner_group_shift=[
+            rng.randrange(-1000, 1000) for _ in range(local_size * num_groups)
+        ],
+    )
+
+
+def requester_reference(call: Dict) -> Dict:
+    """The requester's tables by its rules, in plain Python: where its rows at
+    each proxy start in its push order; each proxy's chunks (its header's,
+    clamped into [0, max_chunks]), chunk ends and stream end (uint32 words),
+    and its push table there made absolute; the remote task offsets, chunk
+    after chunk, the proxies in turn from its own, 32 positions a task, none
+    past a proxy's chunks; and per row its src and dst (a row of its node's
+    owner: its place in the owner's own part plus its group's shift; a valid
+    row of another node's owner: its occurrence's key row and slot in its
+    proxy's remote_map; past the valid rows: -1) and its push position."""
+    local_size, num_nodes, num_features = (
+        call["local_size"],
+        call["num_nodes"],
+        call["num_features"],
+    )
+    node, me, chunks_max = call["node"], call["me"], call["max_chunks"]
+    world_size = num_nodes * local_size
+    offsets, row_shift = call["offsets"], call["row_shift"]
+    opb = offsets[::num_features]
+    groups = call["groups"] or [num_features]
+    group_of_feature = [g for g, size in enumerate(groups) for _ in range(size)]
+    push_order_off = list(
+        accumulate(
+            [0]
+            + [
+                sum(
+                    opb[n * local_size + p + 1] - opb[n * local_size + p]
+                    for n in range(num_nodes)
+                    if n != node
+                )
+                for p in range(local_size)
+            ]
+        )
+    )
+    table_word = 2 + chunks_max + me * (chunks_max + 1)
+    headers = call["headers"]
+    num_chunks = [min(max(h[0], 0), chunks_max) for h in headers]
+    ends = [
+        [h[2 + c] & 0xFFFFFFFF for c in range(chunks_max)] + [h[1] & 0xFFFFFFFF]
+        for h in headers
+    ]
+    tables = [
+        [i32(h[table_word + c] + push_order_off[p]) for c in range(chunks_max + 1)]
+        for p, h in enumerate(headers)
+    ]
+    remote_task_offsets = [0]
+    for index in range(chunks_max * local_size):
+        chunk, proxy = index // local_size, (me + index % local_size) % local_size
+        tasks = 0
+        if chunk < num_chunks[proxy]:
+            table = headers[proxy][table_word:]
+            tasks = ceil32(table[chunk + 1] - table[chunk])
+        remote_task_offsets.append(remote_task_offsets[-1] + tasks)
+    remote_keys, lookup_keys = call["remote_keys"], call["lookup_keys"]
+    valid = offsets[-1]
+    bucket_feature_of_row = [
+        bf for bf, count in enumerate(call["counts"]) for _ in range(count)
+    ] + [world_size * num_features] * (call["num_rows"] - valid)
+    src, dst, push_order = [], [], {}
+    for row, bucket_feature in enumerate(bucket_feature_of_row):
+        owner = min(bucket_feature // num_features, world_size - 1)
+        proxy = owner % local_size
+        if owner // local_size == node:
+            group = group_of_feature[bucket_feature % num_features]
+            place = i32(
+                row
+                + row_shift[bucket_feature]
+                + call["owner_group_shift"][proxy * call["num_groups"] + group]
+            )
+            src.append(place)
+            dst.append(place)
+            continue
+        if row >= valid:
+            src.append(-1)
+            dst.append(-1)
+            continue
+        occurrence = min(
+            max(row_shift[bucket_feature] + row - lookup_keys, 0), remote_keys - 1
+        )
+        remote_map = call["remote_maps"][proxy]
+        src.append(remote_map[occurrence])
+        dst.append(remote_map[remote_keys + occurrence])
+        position = push_order_off[proxy] + remote_map[2 * remote_keys + occurrence]
+        if 0 <= position < call["num_rows"]:
+            push_order[position] = row
+    return dict(
+        bucket_feature_of_row=bucket_feature_of_row,
+        push_order_off=push_order_off,
+        proxy_num_chunks=num_chunks,
+        proxy_ends=ends,
+        proxy_push_tables=tables,
+        remote_task_offsets=remote_task_offsets,
+        src=src,
+        dst=dst,
+        push_order=push_order,
+    )
+
+
+def i32(value: int) -> int:
+    """An int64 value cast to int32 (two's complement)."""
+    value &= 0xFFFFFFFF
+    return value - (1 << 32) if value >= 1 << 31 else value
+
+
+def run_requester_case(
+    case: RequesterCase, seed: int
+) -> Tuple[Dict[str, List[str]], str]:
+    """Every call of the case through the hook, against the reference."""
+    rng = random.Random(seed)
+    checks = {"tables": [], "maps": [], "push order": []}
+    stats = dict(calls=0, rows=0, chunks0=0, chunks_full=0, odd_max_chunks=0, skips=0)
+    stats.update(high_ends=0, most_chunks=0, most_proxies=0, most_nodes=0)
+    hier_output_dist_requester_ctas(case.row_ctas)
+    try:
+        for _ in range(case.calls):
+            call = requester_call(case, rng)
+            ref = requester_reference(call)
+            local_size = call["local_size"]
+            out = planner(
+                hier_output_dist_requester_tables,
+                torch.tensor(call["remote_maps"], dtype=torch.int32).cuda(),
+                torch.tensor(call["headers"], dtype=torch.int64)
+                .to(torch.int32)
+                .cuda()
+                .view(-1),
+                torch.tensor(call["owner_group_shift"], dtype=torch.int64).cuda(),
+                torch.tensor(ref["bucket_feature_of_row"], dtype=torch.int32).cuda(),
+                torch.tensor(call["offsets"][:: call["num_features"]]).cuda(),
+                torch.tensor(call["row_shift"]).cuda(),
+                dict(
+                    num_nodes=call["num_nodes"],
+                    local_size=local_size,
+                    node=call["node"],
+                    local_rank=call["me"],
+                    num_features=call["num_features"],
+                    lookup_keys=call["lookup_keys"],
+                    remote_keys=call["remote_keys"],
+                    num_proxy_rows=1 << 20,
+                    max_chunk_rows=call["max_chunk_rows"],
+                    payload_rows=call["payload_rows"],
+                    record_bytes=8,
+                ),
+                call["groups"],
+            )
+            for name in (
+                "push_order_off",
+                "proxy_num_chunks",
+                "proxy_ends",
+                "proxy_push_tables",
+                "remote_task_offsets",
+            ):
+                if out[name].tolist() != ref[name]:
+                    checks["tables"].append(name)
+            if out["src"].tolist() != ref["src"] or out["dst"].tolist() != ref["dst"]:
+                checks["maps"].append("src/dst")
+            # the positions the requester pushes, and only those (initcheck)
+            written = sorted(ref["push_order"])
+            got = out["push_order"][torch.tensor(written, dtype=torch.int64).cuda()]
+            if got.tolist() != [ref["push_order"][p] for p in written]:
+                checks["push order"].append("push order")
+            if not call["skip"] and len(written) != ref["push_order_off"][-1]:
+                checks["push order"].append("a call that fits pushes every row once")
+            chunks = ref["proxy_num_chunks"]
+            stats["calls"] += 1
+            stats["rows"] += call["num_rows"]
+            stats["chunks0"] += chunks.count(0)
+            stats["chunks_full"] += chunks.count(call["max_chunks"])
+            stats["odd_max_chunks"] += call["max_chunks"] % 2
+            stats["skips"] += call["skip"]
+            stats["high_ends"] += sum(
+                1 for row in ref["proxy_ends"] if any(end >= 1 << 31 for end in row)
+            )
+            stats["most_chunks"] = max(stats["most_chunks"], call["max_chunks"])
+            stats["most_proxies"] = max(stats["most_proxies"], local_size)
+            stats["most_nodes"] = max(stats["most_nodes"], call["num_nodes"])
+        torch.cuda.synchronize()  # an access out of range would raise here
+    finally:
+        hier_output_dist_requester_ctas(0)
+    return checks, " ".join(f"{k} {v}" for k, v in stats.items())
+
+
+REQUESTER_CASES = [
+    RequesterCase("uniform"),
+    RequesterCase("no rows", rows=(0,), bound=(0,)),
+    RequesterCase("rows past the valid ones alone", rows=(0,), bound=(1, 40)),
+    RequesterCase("skip", skip=1.0, rows=(2, 5), bound=(0, 3)),
+    RequesterCase("no keys across nodes", chunks="zero"),
+    RequesterCase("proxies of no chunks and of max_chunks", chunks="zero_or_full"),
+    RequesterCase("every proxy at max_chunks", chunks="full"),
+    RequesterCase("chunk ends past 2^31", high_ends=1.0, chunks="full"),
+    # an odd max_chunks starts every push table at an odd word: the 16-byte
+    # loads peel the words before a 16-byte boundary
+    RequesterCase("odd max_chunks", odd_chunks=True, local_size=(1, 2, 3, 4, 8)),
+    RequesterCase("lookup groups", groups=True, num_features=(5,), calls=3),
+    # more proxies than a warp's lanes, more nodes than a warp's lanes
+    RequesterCase("72 GPUs per node", num_nodes=(2,), local_size=(72,), calls=2),
+    RequesterCase(
+        "40 nodes of 2", num_nodes=(40,), local_size=(2,), num_features=(1, 2)
+    ),
+    # a table CTA's loads in more than one pass (8,192 words a pass), and the
+    # scan in tiles of 2,048 entries
+    RequesterCase(
+        "max_chunks past 8,192",
+        num_nodes=(2,),
+        local_size=(2, 3),
+        num_features=(2,),
+        remote_keys=(11000,),
+        max_chunk_rows_arg=8,
+        payload_rows=2,
+        chunks="full",
+        calls=2,
+    ),
+    # the rows on 1 and 3 CTAs: a thread's rows in several steps of 4
+    RequesterCase(
+        "rows on one CTA",
+        num_nodes=(2, 3),
+        local_size=(4,),
+        rows=(1000, 3000),
+        bound=(0, 77),
+        row_ctas=1,
+        calls=2,
+    ),
+    RequesterCase("rows on 3 CTAs", rows=(20, 60), row_ctas=3, calls=2),
+    # the design's reference ports, through the hook: ref_requester's calls
+    # (local_size 1 to 8, 2 to 4 nodes, max_chunks 1 to 16, ends past 2^31)
+    # and e2e_requester_check's (the proxies' occurrences of each requester
+    # from none to 100, node skips)
+    RequesterCase(
+        "the design's requester calls",
+        num_nodes=(2, 3, 4),
+        local_size=(1, 2, 3, 4, 8),
+        num_features=(1, 2, 3, 5),
+        rows=(0, 1, 2, 9),
+        bound=(0, 0, 3),
+        remote_keys=(1, 5, 40),
+        high_ends=0.3,
+        groups=True,
+        calls=120,
+    ),
+    RequesterCase(
+        "the design's end-to-end calls",
+        num_nodes=(2, 3, 4),
+        local_size=(1, 2, 3, 4, 8),
+        num_features=(1, 3),
+        rows=(0, 2, 5),
+        bound=(0, 3),
+        others=(0, 0, 1, 3, 17, 40, 100),
+        skip=0.1,
+        calls=120,
+    ),
+]
 
 
 # python test_hier_dedup.py sanitize: these cases, on their first seed, for
@@ -2602,6 +3117,18 @@ SANITIZE_CASES = {
     "the proxy's scans on 2 CTAs, 2 nodes of 2, 4 rows per payload",
     "the push order by int64 push keys",
     "requester 1 asks nothing across nodes, 20 x the need",
+}
+# and these requester cases
+SANITIZE_REQUESTER_CASES = {
+    "uniform",
+    "no rows",
+    "skip",
+    "proxies of no chunks and of max_chunks",
+    "chunk ends past 2^31",
+    "odd max_chunks",
+    "72 GPUs per node",
+    "40 nodes of 2",
+    "rows on one CTA",
 }
 
 
@@ -2627,6 +3154,23 @@ def main() -> None:
             for area, problems in checks.items():
                 if problems:
                     print(f"    {area}: {sorted(set(problems))[:8]}", flush=True)
+    for case_idx, case in enumerate(REQUESTER_CASES):
+        if sanitize and case.name not in SANITIZE_REQUESTER_CASES:
+            continue
+        checks, stats = run_requester_case(case, 2000 + 31 * case_idx)
+        good = not any(checks.values())
+        failures += not good
+        print(
+            f"requester '{case.name}' ({stats}): "
+            + " ".join(
+                f"{area}={int(not problems)}" for area, problems in checks.items()
+            )
+            + f" [{'ok' if good else 'FAIL'}]",
+            flush=True,
+        )
+        for area, problems in checks.items():
+            if problems:
+                print(f"    {area}: {sorted(set(problems))[:8]}", flush=True)
     print("ALL PASSED" if failures == 0 else f"{failures} FAILED")
     sys.exit(1 if failures else 0)
 

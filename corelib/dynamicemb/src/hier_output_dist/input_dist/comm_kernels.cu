@@ -32,7 +32,9 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 //   rail_key_push         (across nodes) its key records to each rail owner; it does not wait;
 //   node_status_exchange  (across nodes) its rail's needs and its group shifts to its node, and
 //                         every node peer's;
-//   peer_gather           (across nodes) words of the node peers' remote_map or proxy header;
+//   requester             (across nodes) a grid that does not wait: the requester's tables from
+//                         its node peers' proxy headers and remote_map, read in their copies,
+//                         and the owner's records (requester.cuh);
 //   rail_done             (across nodes) waits for every rail proxy's key records, and flushes
 //                         this rank's puts; just before owner_tables, the first reader of
 //                         rail_keys.
@@ -42,8 +44,12 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 // them.
 // Memory order:
 // - What peers wrote is read only after an acquire of their flag or signal. The comm kernel that
-//   acquired it reads with ld.global.cg. A later kernel on the stream reads it too: peer_gather
-//   with ld.global.cg, the planner's steps with plain loads.
+//   acquired it reads with ld.global.cg. A later kernel on the stream reads it too: the requester
+//   kernel with ld.global.cg, the planner's steps with plain loads. A node peer writes its proxy
+//   header and remote_map in its proxy steps, before its node_status_exchange publishes in_status;
+//   it writes them again only in its next call's proxy steps, after that call's node barrier,
+//   which waits for this rank's in_started of that call: this rank releases it in its next
+//   node_exchange, which its stream starts only once its requester kernel of this call has ended.
 // - What this rank writes for its peers (its own stores, or the planner's earlier on the stream)
 //   comes before the flag it releases or the put it makes: fence.sc.sys orders it.
 // - What it stores into a peer's buffer comes after an acquire, earlier on the stream, of the
@@ -56,16 +62,15 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 //   that read it: rail_exchange's own for count_msg_out, rail_done's for key_stage.
 // - The key puts are waited for late. rail_key_push only posts the puts (each slice with a strong
 //   signal, so the owner that sees the signal sees the slice). rail_done acquires every rail
-//   proxy's key signal and flushes this rank's puts. Between the two run node_status_exchange,
-//   peer_gather, remote_map_gather and requester_tables: none of them reads rail_keys or writes
-//   key_stage. The first reader of rail_keys, owner_tables, runs after rail_done on the stream, and
-//   the planner reads the rail's layout from the layout's tensors, not from the window. The next
-//   call writes key_stage in its proxy steps, after this rail_done (and its flush: the NIC read
-//   the slices) on the stream, and its rail proxies put into rail_keys only once they have this
-//   rank's count message of that call, which its rail_exchange sends after this call's rail_done
-//   and owner_tables. The count messages keep their in_seq parity: a rail peer's message of call
-//   seq + 2 needs this rank's of seq + 1, which it sends after its rail_exchange of seq read the
-//   slots.
+//   proxy's key signal and flushes this rank's puts. Between the two run node_status_exchange and
+//   the requester kernel: neither reads rail_keys or writes key_stage. The first reader of
+//   rail_keys, owner_tables, runs after rail_done on the stream, and the planner reads the rail's
+//   layout from the layout's tensors, not from the window. The next call writes key_stage in its
+//   proxy steps, after this rail_done (and its flush: the NIC read the slices) on the stream, and
+//   its rail proxies put into rail_keys only once they have this rank's count message of that
+//   call, which its rail_exchange sends after this call's rail_done and owner_tables. The count
+//   messages keep their in_seq parity: a rail peer's message of call seq + 2 needs this rank's of
+//   seq + 1, which it sends after its rail_exchange of seq read the slots.
 
 #include <ATen/cuda/CUDAContext.h>
 #include <nccl_device.h>
@@ -79,6 +84,7 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 #include "hier_output_dist/input_dist/input_dist.h"
 #include "hier_output_dist/input_dist/node.cuh"
 #include "hier_output_dist/input_dist/rail.cuh"
+#include "hier_output_dist/input_dist/requester.cuh"
 
 namespace dyn_emb {
 namespace hier_output_dist {
@@ -321,29 +327,22 @@ __global__ void node_status_exchange_kernel(ncclWindow_t window, Sizes sizes, in
     owner_group_shift[i] = word_of(i / num_groups, ctrl.group_shift() + i % num_groups);
 }
 
-// Every CTA, a thread per word: word k of item i is node peer peer[i]'s word
-// first_word[i] of its proxy header (kFrom kGatherProxyHeader, k = 0) or
-// entry first_word[i] of array k of its remote_map (kGatherRemoteMap), into
-// out[k][i] (none when peer[i] < 0). The peers published them before the
-// in_status this rank's node_status_exchange acquired earlier on the stream.
-template <GatherFrom kFrom>
-__global__ void __launch_bounds__(kThreads)
-    peer_gather_kernel(ncclWindow_t window, Sizes sizes, const int32_t *peer,
-                       const int64_t *first_word, int64_t items, int32_t *out) {
-  constexpr int kWords = gather_words(kFrom);
-  const NodeWindow node(window, sizes.topo.local_rank);
-  const KeysLayout keys = node.layout(sizes).keys;
-  const ProxyHeader header = keys.proxy_header();
-  const RemoteMap map = keys.remote_map();
-  for (int64_t i = blockIdx.x * (int64_t)blockDim.x + threadIdx.x; i < items * kWords;
-       i += (int64_t)gridDim.x * blockDim.x) {
-    const int64_t item = i % items, word = i / items;
-    const int32_t source = peer[item];
-    // the words that word k of the items is read from, in this rank's copy
-    const int32_t *mine = kFrom == kGatherProxyHeader ? header.base : map.array((int)word);
-    if (source >= 0) out[i] = __ldcg(node.peer(mine, source) + first_word[item]);
+// The node's proxies' buffers as the requester kernel reads them (requester.cuh): node peer p's
+// proxy header and remote_map, in its copy of the window, at the places of this rank's in its own.
+// Their loads go through L2 only. The peers published them before the in_status this rank's
+// node_status_exchange acquired earlier on the stream.
+struct WindowPeers {
+  ncclWindow_t window;
+  Sizes sizes;
+  __device__ __forceinline__ const int32_t *header(int peer) const {
+    const NodeWindow node(window, sizes.topo.local_rank);
+    return node.peer(node.layout(sizes).keys.proxy_header().base, peer);
   }
-}
+  __device__ __forceinline__ const int32_t *remote_map(int peer) const {
+    const NodeWindow node(window, sizes.topo.local_rank);
+    return node.peer(node.layout(sizes).keys.remote_map().base, peer);
+  }
+};
 
 // 1 warp: its lanes, each taking rail peers in turn, wait until every rail proxy's key message of
 // the call has landed here: its key signal (the slice it put, which the strong signal covers, or
@@ -468,22 +467,13 @@ std::pair<at::Tensor, at::Tensor> InChannel::node_status_exchange(const RailLayo
   return {peer_needs, owner_group_shift};
 }
 
-at::Tensor InChannel::peer_gather(GatherFrom from, const at::Tensor &peer,
-                                  const at::Tensor &first_word) const {
-  const int64_t items = peer.numel();
-  const int words = gather_words(from);
-  at::Tensor out = at::empty({words, items}, peer.options());
-  const auto launch = [&](auto kernel) {
-    kernel<<<item_grid(items * words), kThreads, 0, current_stream()>>>(
-        window_, sizes_, peer.data_ptr<int32_t>(), first_word.data_ptr<int64_t>(), items,
-        out.data_ptr<int32_t>());
-  };
-  if (from == kGatherProxyHeader)
-    launch(peer_gather_kernel<kGatherProxyHeader>);
-  else
-    launch(peer_gather_kernel<kGatherRemoteMap>);
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
-  return out;
+std::pair<RequesterTables, OwnerRecords> InChannel::requester(const BucketizedKeys &bucketized,
+                                                              const NodeLayout &node,
+                                                              const at::Tensor &owner_group_shift,
+                                                              const RailLayout &rail) const {
+  return requester_tables_of(WindowPeers{window_, sizes_}, bucketized.bucket_feature_of_row,
+                             bucketized.offset_per_bucket, node.row_shift, owner_group_shift,
+                             group_of_feature_, &rail, other_nodes_, sizes_);
 }
 
 void InChannel::rail_done() const {
