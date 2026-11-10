@@ -618,7 +618,8 @@ def spill_sequence(key_type, calls, spills_per_table=30, seed=4):
     """Two tables of one bucket each, full and pinned, then ``calls`` calls that bring
     ``spills_per_table`` new keys per table: all of them spill into the overflow bucket of
     their table (48 slots). Returns the table and, per call, (keys, table ids, indices,
-    evictions, insert results)."""
+    evictions, insert results, the overflow bucket sizes right after that call): the table
+    itself is only seen after the last call."""
     table = make_table(key_type, ScorePolicy.ASSIGN, [16, 16], 16, overflow=True)
     keys = (
         torch.arange(1, 17, dtype=torch.int64, device="cuda").repeat(2).view(key_type)
@@ -642,7 +643,9 @@ def spill_sequence(key_type, calls, spills_per_table=30, seed=4):
         idx, rec = run_new(
             table, "cache", batch_keys, t, s, ScorePolicy.ASSIGN, results
         )
-        out.append((batch_keys, t, idx, rec, results))
+        out.append(
+            (batch_keys, t, idx, rec, results, table.overflow_bucket_sizes.clone())
+        )
     return table, out
 
 
@@ -653,7 +656,8 @@ def test_multi_spill_keeps_the_keys_of_the_call(key_type):
     key the call put into the overflow bucket stays there: a later spill of the same call
     evicts residents of earlier calls, never the call's own spills."""
     table, calls = spill_sequence(key_type, 2)
-    (keys1, tids1, idx1, rec1, results1), (keys2, tids2, idx2, rec2, results2) = calls
+    keys1, tids1, idx1, rec1, results1, sizes1 = calls[0]
+    keys2, tids2, idx2, rec2, results2, sizes2 = calls[1]
     # the first call: 30 spills per table into an empty overflow bucket: all inserted
     assert rec1[0] == 0, "nothing is evicted while the overflow bucket has room"
     assert bool((results1 == InsertResult.INSERT.value).all())
@@ -661,7 +665,8 @@ def test_multi_spill_keeps_the_keys_of_the_call(key_type):
     for t in range(2):
         mine = idx1[tids1 == t].tolist()
         assert len(set(mine)) == 30, "every spill has a slot of its own"
-    assert table.overflow_bucket_sizes.tolist() == [30, 30]
+    # (the sizes right after this call: ``table`` has seen the second one as well)
+    assert sizes1.tolist() == [30, 30]
     # the second call: 30 more per table; the residents of the first call are not pinned
     # and the scan evicts the first of them it meets before it finds an empty slot
     count2, ev_keys, ev_indices, _, ev_tids = rec2
@@ -686,7 +691,8 @@ def test_multi_spill_keeps_the_keys_of_the_call(key_type):
         int(((results2 == InsertResult.INSERT.value) & (tids2 == t)).sum())
         for t in range(2)
     ]
-    assert table.overflow_bucket_sizes.tolist() == [30 + inserted[0], 30 + inserted[1]]
+    assert sizes2.tolist() == [30 + inserted[0], 30 + inserted[1]]
+    assert table.overflow_bucket_sizes.tolist() == sizes2.tolist()  # the last call
     # the victims of the first call that were not evicted are still found
     _, founds, _ = table.lookup_with_overflow(
         keys1, tids1, ScoreArg(name="score", value=None, policy=ScorePolicy.CONST)
@@ -709,7 +715,7 @@ def test_multi_spill_is_the_same_on_every_run(key_type):
         state = (
             table.overflow_table_storage_.clone(),
             table.overflow_bucket_sizes.clone(),
-            [(rec[0], rec[1].clone(), rec[2].clone()) for _, _, _, rec, _ in calls],
+            [(rec[0], rec[1].clone(), rec[2].clone()) for _, _, _, rec, _, _ in calls],
         )
         if reference is None:
             reference = state
