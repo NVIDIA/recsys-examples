@@ -81,8 +81,8 @@ from dynamicemb.key_value_table import (
     DynamicEmbStorage,
     HybridStorage,
     Storage,
-    _wait_for_stream,
     _upload_async,
+    _wait_for_stream,
     flush_cache,
 )
 from dynamicemb.lookup_layout import EmbeddingLayout
