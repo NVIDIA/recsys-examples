@@ -623,10 +623,10 @@ def test_the_temporaries_of_a_rehash_are_those_of_one_chunk_not_of_the_table(
     """A table of 2**22 slots is rehashed in chunks of 2**14 or 2**18: what the rehash
     holds above the tables it works on is the temporaries of ONE chunk (56 bytes a slot
     of it, measured: seven int64 vectors), whatever the number of chunks. Whatever a chunk
-    allocates and a later
-    chunk does not free would show here as 16 or 256 times that; a table this small never
-    shows it in the number of segments (every temporary of a 1024-slot table fits one
-    2 MiB segment), which is why the peak of allocated bytes is what is bounded."""
+    allocates and a later chunk does not free would show here as 16 or 256 times that; a
+    table this small never shows it in the number of segments (every temporary of a
+    1024-slot table fits one 2 MiB segment), which is why the peak of allocated bytes is
+    what is bounded."""
     slots = 1 << 22
     old = make_table([slots])
     keys = make_keys(1_000, 1 << 18, torch.int64)
