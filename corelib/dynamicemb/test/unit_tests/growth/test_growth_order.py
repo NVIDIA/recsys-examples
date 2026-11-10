@@ -20,6 +20,7 @@ nothing else is in the way of the rehash.
 """
 
 import contextlib
+import dataclasses
 
 import pytest
 import torch
@@ -32,6 +33,7 @@ from dynamicemb import (
     DynamicEmbTableOptions,
     EmbOptimType,
 )
+from dynamicemb import batched_dynamicemb_function as bdf
 from dynamicemb import key_value_table as kvt
 from dynamicemb import sync_free as sf
 from dynamicemb.batched_dynamicemb_tables import BatchedDynamicEmbeddingTablesV2
@@ -323,6 +325,71 @@ def test_the_replaced_key_map_is_not_reused_while_the_rehash_may_read_it(
     for tensor in fresh:
         assert not (block <= tensor.data_ptr() < block + size), "the block was reused"
     torch.cuda.synchronize()
+
+
+# --- the hand-off of a prefetch to the forward stream --------------------------------
+
+
+def _blocks_reused_after_the_host_lets_go(device):
+    """Prefetch a batch on one stream, queue a long wait on the forward stream (the
+    forward and the backward of the batch, late), let go of everything the prefetch made
+    (the host does, once the backward has been queued) and allocate on the prefetch
+    stream, as often as there are free blocks of each size, what the next prefetch would.
+    Returns the blocks of the prefetch that came back out of the allocator."""
+    model = build_model(device)
+    model.train()
+    forward, prefetch = torch.cuda.Stream(), torch.cuda.Stream()
+    with torch.cuda.stream(prefetch):
+        keys, offsets = batch_of(list(range(300, 500)), device)
+    keys.record_stream(forward)
+    offsets.record_stream(forward)
+    with torch.cuda.stream(prefetch):
+        model.prefetch(keys, offsets, forward)
+    (state,) = model._prefetch_states
+    blocks = {}  # the address of the memory of a tensor of the prefetch -> its bytes
+    for field in dataclasses.fields(state):
+        value = getattr(state, field.name)
+        if isinstance(value, torch.Tensor) and value.is_cuda:
+            storage = value.untyped_storage()
+            blocks[storage.data_ptr()] = storage.nbytes()
+    forward.wait_stream(prefetch)
+    with torch.cuda.stream(forward):
+        torch.cuda._sleep(SLEEP)  # the forward and the backward, late
+    model._prefetch_states.clear()  # what the host does after the backward was queued
+    del state
+
+    with torch.cuda.stream(prefetch):
+        fresh = [
+            torch.empty(nbytes, dtype=torch.uint8, device=device)
+            for nbytes in set(blocks.values())
+            for _ in range(32)
+        ]
+    reused = {t.data_ptr() for t in fresh} & set(blocks)
+    del fresh
+    torch.cuda.synchronize()
+    assert blocks, "the prefetch made no device tensor"
+    return reused
+
+
+def test_the_tensors_of_a_prefetch_are_not_reused_while_the_forward_stream_may_read_them(
+    device,
+):
+    """The tensors a prefetch hands to the forward and the backward are made on the
+    prefetch stream and read on the forward stream; the host lets go of them when the
+    backward has been queued, and the caching allocator would give their blocks to the
+    next prefetch at once, while a forward stream that is behind still has the backward
+    to run. The stream order gate (``growth/gates``, E3) found it as an illegal memory
+    access in every layout, with and without a growth."""
+    assert not _blocks_reused_after_the_host_lets_go(device)
+
+
+def test_without_the_recording_the_same_sequence_reuses_a_block(device, monkeypatch):
+    """The control of the test above: it can tell the two apart."""
+    monkeypatch.setattr(bdf, "record_prefetch_state_on", lambda state, stream: None)
+    assert _blocks_reused_after_the_host_lets_go(device), (
+        "the allocator did not hand a block of the prefetch out again: the test above "
+        "guards nothing"
+    )
 
 
 # --- a new state ---------------------------------------------------------------------

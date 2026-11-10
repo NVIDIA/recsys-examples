@@ -36,6 +36,14 @@ to be ordered on the device, and none of them may make the host wait:
 * **Pointers do not change.** A value buffer keeps its address when it grows, so no kernel
   that was queued earlier holds a stale one.
 
+One rule that is not about growth sits beside them, found by the gate that drives growths
+under the order of the prefetch pipeline (``growth/gates``, E3): what a prefetch hands to the
+forward stream is not reused early. The tensors a prefetch makes on its stream are read by the
+forward and the backward on another, and the host lets go of them once the backward has been
+queued, so the allocator would give them to the next prefetch while a late backward still
+reads them (an illegal memory access, with or without a growth). A prefetch records them as
+used by the forward stream (``batched_dynamicemb_function.record_prefetch_state_on``).
+
 ``wait_for_growth`` is the one call a user of the table makes: the forward, the backward and
 the evaluation of the module, and every public method of the storages that reads the
 table. It registers the current stream (for H1 of a later growth) and orders it after the
