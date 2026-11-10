@@ -19,9 +19,10 @@ budgets.json starts as the census of the tree before the sync removal (the cache
 layout reads 4 / 8 / 10 times per step on an all-hit / miss / miss+evict batch). Every
 commit that removes syncs lowers the numbers it earned in the same diff, so a reviewer
 sees the claim and nothing can quietly give it back; see sync_budgets.py for the file
-and the command that lowers it. The ratchet also bounds the cudaMalloc/cudaFree events
-of a measured window (steady state allocates nothing) and the transient memory a
-sync-free hit step adds over the legacy path (B8).
+and the command that lowers it. The ratchet also bounds the allocator events
+(cudaMalloc/cudaFree, pages mapped or registered) of a measured window -- steady state
+allocates nothing, a growth a few events -- and the transient memory a sync-free hit step
+adds over the legacy path (B8).
 
 Needs a GPU and the CUDA profiler for the census; the checks of the file itself run
 anywhere. The probe's instruments are validated first (the ``instruments_ok``
@@ -119,6 +120,44 @@ def test_budgets_are_lowered_by_a_report_and_never_raised():
     )
 
 
+def test_a_census_clears_the_claims_it_has_measured():
+    """budgets.json says which cells are claims, not measurements (_meta["unmeasured"]);
+    --write must not leave that note behind for a config a census has measured."""
+    meta = {
+        "iters": 8,
+        "unmeasured": {
+            "what": "claims",
+            "lowered_to_zero": ["a", "b"],
+            "new_configs": ["c"],
+        },
+    }
+    partial = sb.clear_measured_claims(
+        meta, _report(("a", "s", "plain", 0.0), ("c", "s", "plain", 0.0))
+    )
+    assert partial["unmeasured"] == {
+        "what": "claims",
+        "lowered_to_zero": ["b"],
+        "new_configs": [],
+    }
+    assert partial["iters"] == 8
+    # a config the census skipped is still a claim
+    skipped = _report(("a", "s", "plain", 0.0))
+    skipped["results"].append(
+        {"config": "b", "scenario": "s", "mode": "plain", "status": "skipped"}
+    )
+    assert sb.clear_measured_claims(meta, skipped)["unmeasured"]["lowered_to_zero"] == [
+        "b"
+    ]
+    # everything measured: the note goes, with nothing else
+    everything = _report(
+        ("a", "s", "plain", 0.0), ("b", "s", "plain", 0.0), ("c", "s", "plain", 0.0)
+    )
+    assert sb.clear_measured_claims(meta, everything) == {"iters": 8}
+    # the argument is not changed, and a file without the note is as it was
+    assert meta["unmeasured"]["lowered_to_zero"] == ["a", "b"]
+    assert sb.clear_measured_claims({"iters": 8}, everything) == {"iters": 8}
+
+
 def test_a_report_with_errors_or_skips_is_handled():
     report = _report(("cache_storage", "all_hit", "plain", 1.0))
     report["results"].append(
@@ -156,6 +195,28 @@ def test_validate_flags_a_missing_unknown_and_malformed_budget():
     assert "_meta['iters']" in problems
 
 
+def test_growth_events_counts_the_doublings_of_the_window():
+    def tiers(*caps):
+        return {"storage": {"size": [0] * len(caps), "cap": list(caps)}}
+
+    grew = {"tiers_before": tiers(1024, 1024), "tiers_after": tiers(8192, 2048)}
+    assert sb.growth_events(grew) == 3 + 1
+    # a capacity that did not change, a missing tier and a missing record count for nothing
+    assert sb.growth_events({"tiers_before": tiers(64), "tiers_after": tiers(64)}) == 0
+    assert sb.growth_events({"tiers_before": {}, "tiers_after": tiers(2048, 2048)}) == 0
+    assert sb.growth_events({"status": "error"}) == 0
+    # not a power of two: it still grew, so at least once
+    assert (
+        sb.growth_events({"tiers_before": tiers(1000), "tiers_after": tiers(1001)}) == 1
+    )
+    # every tier counts, a hybrid's host tier as well
+    both = {
+        "tiers_before": {"hbm": {"cap": [4096]}, "host": {"cap": [1024]}},
+        "tiers_after": {"hbm": {"cap": [4096]}, "host": {"cap": [2048]}},
+    }
+    assert sb.growth_events(both) == 1
+
+
 # --------------------------------------------------------------------------
 # the census (GPU)
 # --------------------------------------------------------------------------
@@ -191,15 +252,25 @@ def test_sync_ratchet(config, census, budgets):
                 "budgets.json (sync_budgets.py --from-report)" % (tag, measured, budget)
             )
         # a step that has reached steady state allocates nothing; the allocator may
-        # still grow once, and a growth event allocates by design
+        # still grow once, and a growth event allocates by design (a new key map, new
+        # pages mapped or registered): a few events per growth, not one per step
         events = r["mean"]["al"] * r["iters"]
-        if events > sb.ALLOC_EVENTS_MAX + sb.EPS and not hsp.inherent_reason(
+        allowed = sb.ALLOC_EVENTS_MAX + sb.ALLOC_EVENTS_PER_GROWTH * sb.growth_events(r)
+        if events > allowed + sb.EPS and not hsp.inherent_reason(
             r["config"], r["scenario"]
         ):
             problems.append(
-                "%s: %.3g cudaMalloc/cudaFree events in the measured window, at most %d allowed "
-                "(a per-step allocation of a new size?)"
-                % (tag, events, sb.ALLOC_EVENTS_MAX)
+                "%s: %.3g allocator events (cudaMalloc/cudaFree, mapped or registered pages) "
+                "in the measured window, at most %d allowed: %d, and %d for each of the %d "
+                "growths of the window (a per-step allocation of a new size?)"
+                % (
+                    tag,
+                    events,
+                    allowed,
+                    sb.ALLOC_EVENTS_MAX,
+                    sb.ALLOC_EVENTS_PER_GROWTH,
+                    sb.growth_events(r),
+                )
             )
     detail = ""
     if over:

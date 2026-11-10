@@ -248,18 +248,22 @@ void bind_table_operation(py::module &m) {
         py::arg("table_bucket_offsets"), py::arg("bucket_capacity"),
         py::arg("slots"), py::arg("table_ids"), py::arg("allocate"));
 
-  m.def("table_collect_reclaimed_rows", &dyn_emb::table_collect_reclaimed_rows,
-        "rows owned by the reclaimed slots of a bucket range; num_rows is "
-        "how many there are",
-        py::arg("keys"), py::arg("rows"), py::arg("bkt_begin"),
-        py::arg("bkt_end"), py::arg("bucket_capacity"), py::arg("num_rows"));
+  m.def("table_carry_slot_state", &dyn_emb::table_carry_slot_state,
+        "rehash: move the value row and the reference counter of the old "
+        "slots of a chunk of the key column to the slots their keys got in "
+        "the new table (-1 slots and reserved keys carry nothing)",
+        py::arg("keys"), py::arg("slots"), py::arg("dst_base"),
+        py::arg("src_rows") = py::none(), py::arg("dst_rows") = py::none(),
+        py::arg("src_ref") = py::none(), py::arg("dst_ref") = py::none());
 
-  m.def("table_place_reclaimed_rows", &dyn_emb::table_place_reclaimed_rows,
-        "place carried rows into free slots of a bucket range, marking the "
-        "slots reclaimed (key and digest)",
-        py::arg("keys"), py::arg("digests"), py::arg("rows"),
-        py::arg("carried"), py::arg("bkt_begin"), py::arg("bkt_end"),
-        py::arg("bucket_capacity"));
+  m.def("table_carry_reclaimed_rows", &dyn_emb::table_carry_reclaimed_rows,
+        "rehash: give the row of every reclaimed slot of the old bucket "
+        "range that owns one a free slot of the new range, marking it "
+        "reclaimed; count is how many there are, int64[1] on the device",
+        py::arg("old_keys"), py::arg("old_rows"), py::arg("old_bkt_begin"),
+        py::arg("old_bkt_end"), py::arg("bucket_capacity"),
+        py::arg("new_keys"), py::arg("new_digests"), py::arg("new_rows"),
+        py::arg("new_bkt_begin"), py::arg("new_bkt_end"), py::arg("count"));
 
   m.def("table_restore_reclaimed_slots",
         &dyn_emb::table_restore_reclaimed_slots,
@@ -323,4 +327,10 @@ void bind_table_operation(py::module &m) {
   // table_insert_sorted and table_insert_and_evict_sorted exist, and
   // DEMB_DETERMINISM_MODE inserts with them.
   m.attr("sorted_insert") = py::bool_(true);
+
+  // Capability flag: the rehash (table_carry_slot_state,
+  // table_carry_reclaimed_rows) reads no count from the device. The Python
+  // side raises a rebuild hint where it is absent: there is no blocking
+  // fallback.
+  m.attr("rehash_device_count") = py::bool_(true);
 }

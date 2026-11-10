@@ -43,6 +43,7 @@ writes nothing. Needs only the standard library.
 import argparse
 import copy
 import json
+import math
 import os
 import sys
 from typing import Any, Dict, List, NamedTuple, Optional, Tuple
@@ -65,6 +66,15 @@ CENSUS_SEED = 1234
 # case: the allocator may still grow once after the warm-up; a step that allocates
 # every time shows up as at least `iters` of them.
 ALLOC_EVENTS_MAX = 1
+# What one growth of a table may add to that: the new key map (one cudaMalloc per tensor
+# of it on a cold allocator), the pages mapped or registered for the value buffers, and the
+# staging of the metadata (see growth_events). A design allowance, not a measurement: set it
+# from the first census that has run (the largest allocator count of a growth case of any
+# layout in a warm window, with a margin) and say so in the commit. It cannot see an
+# allocation per chunk of the rehash: the probe's tables are one chunk each, so an event per
+# growth and an event per chunk are the same number there. That is what
+# growth/test_rehash_padded.py's peak-memory test bounds, on a table of 2**22 slots.
+ALLOC_EVENTS_PER_GROWTH = 4
 # Budgets are numbers written with at most 6 decimals; this is the comparison slack.
 EPS = 1e-6
 
@@ -112,6 +122,24 @@ def case_keys() -> List[Case]:
                     continue  # prefetch is a no-op in eval
                 out.append((cfg.name, scenario, mode))
     return out
+
+
+def growth_events(result: Dict[str, Any]) -> int:
+    """How many times a table of the case grew in its measured window: the sum, over the
+    tiers and tables the probe recorded before and after it (``tiers_before`` and
+    ``tiers_after`` of a probe result), of the doublings of the capacity -- a growth at
+    least doubles, so this is the most there were. 0 for a case that did not grow, or
+    that has no record (a skipped or an erroneous one)."""
+    before, after = result.get("tiers_before") or {}, result.get("tiers_after") or {}
+    events = 0
+    for tier, new in after.items():
+        old = before.get(tier)
+        if not old or "cap" not in old or "cap" not in new:
+            continue
+        for was, now in zip(old["cap"], new["cap"]):
+            if was > 0 and now > was:
+                events += max(1, math.ceil(math.log2(now / was) - 1e-9))
+    return events
 
 
 def load_budgets(path: str = BUDGETS_PATH) -> Tuple[Dict[str, Any], Dict[str, Any]]:
@@ -226,6 +254,39 @@ def budgets_from_report(
     return Update(budgets, changes, refused, errors)
 
 
+def clear_measured_claims(
+    meta: Dict[str, Any], report: Dict[str, Any]
+) -> Dict[str, Any]:
+    """``meta`` without the claims of ``meta["unmeasured"]`` that ``report`` has measured.
+
+    A change that lowers a budget before a census could run (a GPU was not at hand) records
+    the cells as claims, by config, in ``_meta["unmeasured"]``. A census that covers a
+    config with every one of its cases measured (none skipped, none in error) turns its
+    cells into measurements, so the note that they are claims is dropped for it -- and the
+    whole note when nothing is left, so that it does not outlive the measurement it warns
+    of. ``meta`` is not changed.
+    """
+    claims = meta.get("unmeasured")
+    if not isinstance(claims, dict):
+        return meta
+    statuses: Dict[str, List[str]] = {}
+    for result in report["results"]:
+        statuses.setdefault(result["config"], []).append(result.get("status", ""))
+    measured = {c for c, states in statuses.items() if all(x == "ok" for x in states)}
+    kept = {
+        key: [c for c in value if c not in measured]
+        if isinstance(value, list)
+        else value
+        for key, value in claims.items()
+    }
+    out = dict(meta)
+    if any(isinstance(v, list) and v for v in kept.values()):
+        out["unmeasured"] = kept
+    else:
+        del out["unmeasured"]
+    return out
+
+
 def format_budgets(meta: Dict[str, Any], budgets: Dict[str, Any]) -> str:
     """The text of budgets.json: one line per scenario, configs and scenarios in the
     probe's order, so that a diff shows exactly the numbers that changed."""
@@ -314,6 +375,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             for k in ("label", "time", "device", "torch", "cuda", "python")
             if report.get("meta", {}).get(k)
         }
+        new_meta = clear_measured_claims(new_meta, report)
         problems = validate(new_meta, update.budgets)
         if problems:
             print(

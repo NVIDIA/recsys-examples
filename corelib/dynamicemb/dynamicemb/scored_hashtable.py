@@ -18,7 +18,7 @@ import enum
 import os
 import warnings
 from dataclasses import dataclass
-from typing import Any, Dict, Iterator, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple, Union
 
 import dynamicemb_extensions
 import numpy as np
@@ -32,7 +32,6 @@ from dynamicemb_extensions import (
     ScorePolicy,
     bucketize_keys,
     device_timestamp,
-    table_collect_reclaimed_rows,
     table_copy_score_blocks,
     table_count_matched,
     table_erase,
@@ -44,13 +43,27 @@ from dynamicemb_extensions import (
     table_insert_collect_evicted,
     table_lookup,
     table_partition,
-    table_place_reclaimed_rows,
     table_resolve_rows,
     table_restore_reclaimed_slots,
     table_scatter_keys_at_slots,
     table_scatter_score_blocks,
     table_update_counter_with_layout,
 )
+
+# The slots of the old key column one chunk of a rehash covers, at most (a chunk is a whole
+# number of buckets, and at least one). The transient memory of a chunk is about 40 bytes
+# a slot: the copy of the keys, the scores and the slots the insert reports, and the
+# insert's own bookkeeping.
+REHASH_CHUNK_SLOTS = 1 << 20
+
+
+def rehash_chunk_buckets(
+    num_buckets: int, bucket_capacity: int, chunk_slots: int = REHASH_CHUNK_SLOTS
+) -> int:
+    """How many buckets one chunk of the rehash of a table of ``num_buckets`` buckets
+    covers: ``chunk_slots`` slots as whole buckets, at least one and at most the table.
+    """
+    return max(1, min(num_buckets, chunk_slots // bucket_capacity))
 
 
 @dataclass(frozen=True)
@@ -427,10 +440,15 @@ class LinearBucketTable(ScoredHashTable):
         self.num_buckets_ = bucket_offset_list[-1]
         self.capacity_ = self.num_buckets_ * self.bucket_capacity_
 
-        self.table_bucket_offsets_ = torch.tensor(
-            bucket_offset_list, dtype=torch.int64, device=self.device
+        # The first bucket of every table, on the device for the kernels and on the
+        # host for whoever slices by table. The host copies are built from the list,
+        # not read back from the device, and the upload is queued, not waited for
+        # (a rehash makes a key map in the middle of a step).
+        self.bucket_offsets_host_: List[int] = list(bucket_offset_list)
+        self.table_bucket_offsets_ = sf.upload_i64(bucket_offset_list, self.device)
+        self.table_bucket_offsets_cpu_ = torch.tensor(
+            bucket_offset_list, dtype=torch.int64
         )
-        self.table_bucket_offsets_cpu_ = self.table_bucket_offsets_.cpu()
 
         total_input_capacity = sum(capacity)
         if self.capacity_ != total_input_capacity:
@@ -473,9 +491,7 @@ class LinearBucketTable(ScoredHashTable):
             # Rows a table's value buffer has. A slot is never more than one row
             # of its own, so the table's capacity is the most that can be handed
             # out; a buffer that is smaller says so through ``set_row_limits``.
-            self.row_limits_ = torch.tensor(
-                self.per_table_capacity_, dtype=torch.int64, device=self.device
-            )
+            self.row_limits_ = sf.upload_i64(self.per_table_capacity_, self.device)
         else:
             self.rows_ = None
             self.row_counters_ = None
@@ -650,12 +666,13 @@ class LinearBucketTable(ScoredHashTable):
 
         Allocating a row at or past its table's limit is asserted on the device
         (no host sync), so a caller that sizes the buffer wrongly fails loudly
-        instead of writing past it. Call again whenever a buffer grows.
+        instead of writing past it. Call again whenever a buffer grows. The copy is
+        queued on the current stream, not waited for; a growth calls this inside its
+        section (see ``GrowthOrder``), which orders it against the kernels that read
+        the limits.
         """
         assert self.use_rows_ and len(limits) == self.num_tables_
-        self.row_limits_.copy_(
-            torch.tensor(limits, dtype=torch.int64), non_blocking=False
-        )
+        sf.copy_i64_into(self.row_limits_, limits)
 
     def num_rows(self, table_id: int) -> int:
         """Rows handed out so far for ``table_id``: rows ``[0, num_rows)`` are
@@ -935,6 +952,57 @@ class LinearBucketTable(ScoredHashTable):
             table_ids,
         )
 
+    def _require_rehash_kernels(self) -> None:
+        if not getattr(dynamicemb_extensions, "rehash_device_count", False):
+            raise RuntimeError(
+                "growing a table needs a dynamicemb_extensions built with the rehash that "
+                "reads no count from the device (table_carry_slot_state, "
+                "table_carry_reclaimed_rows); rebuild it: python setup.py build_ext --inplace"
+            )
+
+    def _flat_base(self, table_id: int) -> int:
+        """The first flat slot of ``table_id``: where its slots start in the per-slot arrays
+        that span all tables (``rows_``, ``_ref_counter``)."""
+        return self.bucket_offsets_host_[table_id] * self.bucket_capacity_
+
+    def _insert_for_rehash(
+        self,
+        keys: torch.Tensor,
+        table_ids: torch.Tensor,
+        score_value: Optional[torch.Tensor],
+        policy: ScorePolicy,
+    ) -> torch.Tensor:
+        """Insert ``keys`` of a rehash chunk; the slots they got, ``-1`` for a lane whose key
+        is reserved (a chunk is a copy of the old key column, whose empty, reclaimed and
+        locked slots hold reserved keys that insert nothing)."""
+        # The bits of the key column and of the scores, as the table's own types.
+        if keys.dtype != self.key_type_:
+            keys = keys.view(self.key_type_)
+        if score_value is not None and score_value.dtype != torch.uint64:
+            score_value = score_value.view(torch.uint64)
+        if os.environ.get("DEMB_DETERMINISM_MODE") is not None:
+            # The deterministic helper reads and writes one score word per key.
+            assert (
+                self.num_scores_ == 1
+            ), "DEMB_DETERMINISM_MODE does not support auxiliary score columns yet."
+            # and drops only the all-ones key: the other reserved keys become that one
+            i64 = sf.as_i64(keys)
+            keys = sf.mask_keys(keys, (i64 >= 0) | (i64 < -4))
+            return self._deterministic_insert(keys, table_ids, score_value, policy)
+        return table_insert(
+            self.table_storage_,
+            self.table_bucket_offsets_,
+            self.bucket_capacity_,
+            self.bucket_sizes,
+            keys,
+            table_ids,
+            score_value,
+            policy,
+            self._ref_counter,
+            num_scores=self.num_scores_,
+            score_fn_key=self.score_fn_key_,
+        )
+
     def insert_carrying_rows(
         self,
         keys: torch.Tensor,
@@ -949,36 +1017,132 @@ class LinearBucketTable(ScoredHashTable):
         Keys have to be unique and the table must have room for all of them (no
         eviction is expected). Returns the hash slots the keys landed in -- what
         the caller needs to copy slot-keyed state (score blocks, counters). The
-        row counters are left to :meth:`carry_rows_from`.
+        row counters are left to :meth:`carry_rows_from`. Nothing is read back: a key
+        the table refused is asserted on the device.
         """
         assert self.use_rows_
+        self._require_rehash_kernels()
         table_ids = torch.full(
             (keys.numel(),), table_id, dtype=torch.int64, device=keys.device
         )
         score_value, policy = self._parse_score(score)
-        if os.environ.get("DEMB_DETERMINISM_MODE") is not None:
-            # The deterministic helper reads and writes one score word per key.
-            assert (
-                self.num_scores_ == 1
-            ), "DEMB_DETERMINISM_MODE does not support auxiliary score columns yet."
-            slots = self._deterministic_insert(keys, table_ids, score_value, policy)
-        else:
-            slots = table_insert(
-                self.table_storage_,
-                self.table_bucket_offsets_,
-                self.bucket_capacity_,
-                self.bucket_sizes,
-                keys,
-                table_ids,
-                score_value,
-                policy,
-                self._ref_counter,
-                num_scores=self.num_scores_,
-                score_fn_key=self.score_fn_key_,
-            )
-        assert bool((slots >= 0).all()), "rehash insert must not reject keys"
-        self.set_rows(slots, table_id, rows)
+        slots = self._insert_for_rehash(keys, table_ids, score_value, policy)
+        dynamicemb_extensions.table_carry_slot_state(
+            sf.as_i64(keys),
+            slots,
+            self._flat_base(table_id),
+            src_rows=rows.to(torch.int64).contiguous(),
+            dst_rows=self.rows_,
+        )
         return slots
+
+    def rehash_table_from(
+        self,
+        other: "LinearBucketTable",
+        table_id: int,
+        on_chunk: Optional[Callable[[torch.Tensor, torch.Tensor], None]] = None,
+        chunk_slots: int = REHASH_CHUNK_SLOTS,
+    ) -> None:
+        """Move the live keys of ``table_id`` of ``other`` (a smaller table of the same
+        bucket capacity) into this table, with what is keyed by their slot: the score
+        words, the value rows and the reference counters.
+
+        The old key column is the input as it is. A chunk of it -- ``chunk_slots`` slots,
+        a whole number of buckets -- is copied (one strided copy), inserted, and the state
+        that follows the keys is carried by the slots the insert reports. The empty,
+        reclaimed and locked slots of the old table hold reserved keys, which insert
+        nothing and carry nothing, so no key is picked out and no count is needed: the
+        host reads nothing and launches the same kernels whatever the table holds.
+        What goes wrong -- a live key the new table refused, or lost to an eviction -- is
+        a device assert.
+
+        The rows of the reclaimed slots, which have no key to hash by, are
+        :meth:`carry_rows_from`'s, called after this for a table that stores rows.
+
+        ``on_chunk(src_slots, dst_slots)`` is called after each chunk was launched (int64
+        ``[n]`` each: the table-relative slot of a live key in ``other`` and in this table,
+        ``-1`` on every lane that carries no key), for a table whose values follow their
+        slots.
+        """
+        assert (
+            self.use_rows_ == other.use_rows_
+        ), "a rehash keeps whether a key owns a row"
+        assert self.num_scores_ == other.num_scores_, "num_scores mismatch"
+        assert self.bucket_capacity_ == other.bucket_capacity_
+        assert not self.enable_overflow_ and not other.enable_overflow_, (
+            "a table with an overflow area (a cache) does not grow: the "
+            "rehash moves the main table only"
+        )
+        assert (self._ref_counter is None) == (other._ref_counter is None)
+        self._require_rehash_kernels()
+        cap = self.bucket_capacity_
+        o_b0 = other.bucket_offsets_host_[table_id]
+        o_nb = other.per_table_num_buckets_[table_id]
+        n_b0 = self.bucket_offsets_host_[table_id]
+        src_base = o_b0 * cap
+        dst_base = n_b0 * cap
+        chunk_buckets = rehash_chunk_buckets(o_nb, cap, chunk_slots)
+        table_ids = torch.full(
+            (chunk_buckets * cap,), table_id, dtype=torch.int64, device=self.device
+        )
+        key_column = other.keys_.view(torch.int64)
+        for c0 in range(0, o_nb, chunk_buckets):
+            nb = min(chunk_buckets, o_nb - c0)
+            n = nb * cap
+            keys = key_column[o_b0 + c0 : o_b0 + c0 + nb].reshape(-1)
+            src_slots = torch.arange(
+                c0 * cap, c0 * cap + n, dtype=torch.int64, device=self.device
+            )
+            # The score word every key is inserted with: the leading word of each slot,
+            # read through the accessor that knows the layout (AoS for several words).
+            scores = table_gather_score_blocks(
+                other.table_storage_,
+                cap,
+                other.num_scores_,
+                o_b0,
+                src_slots,
+                other.key_type_,
+            )[:, 0].contiguous()
+            slots = self._insert_for_rehash(
+                keys, table_ids[:n], scores, ScorePolicy.ASSIGN
+            )
+            lo = src_base + c0 * cap
+            dynamicemb_extensions.table_carry_slot_state(
+                keys,
+                slots,
+                dst_base,
+                src_rows=other.rows_[lo : lo + n] if self.use_rows_ else None,
+                dst_rows=self.rows_ if self.use_rows_ else None,
+                src_ref=other._ref_counter[lo : lo + n]
+                if other._ref_counter is not None
+                else None,
+                dst_ref=self._ref_counter,
+            )
+            if self.num_scores_ > 1:
+                # The insert restored the leading word only: copy every word, so that the
+                # frequency (and the exact timestamp) of an LruLfu key survive.
+                table_copy_score_blocks(
+                    other.table_storage_,
+                    cap,
+                    self.table_storage_,
+                    cap,
+                    self.num_scores_,
+                    o_b0,
+                    n_b0,
+                    src_slots,
+                    slots,
+                    self.key_type_,
+                )
+            if on_chunk is not None:
+                live = (keys >= 0) | (keys < -4)
+                on_chunk(torch.where(live, src_slots, -1), slots)
+        # Every live key of the old table is in the new one. An insert into a full bucket
+        # that evicts a resident reports a slot, so the per-key assertion cannot see the
+        # key it lost; the counts of the two tables can.
+        torch._assert_async(
+            self.bucket_sizes[n_b0 : n_b0 + self.per_table_num_buckets_[table_id]].sum()
+            == other.bucket_sizes[o_b0 : o_b0 + o_nb].sum()
+        )
 
     def set_rows(self, slots: torch.Tensor, table_id: int, rows: torch.Tensor) -> None:
         """Make the given table-relative ``slots`` own ``rows``."""
@@ -1022,7 +1186,7 @@ class LinearBucketTable(ScoredHashTable):
 
     def carry_rows_from(self, other: "LinearBucketTable", table_id: int) -> None:
         """Finish a rehash of ``table_id`` from ``other``, after its live keys
-        were re-inserted with :meth:`insert_carrying_rows`.
+        were re-inserted (:meth:`rehash_table_from`, :meth:`insert_carrying_rows`).
 
         An erased key leaves its slot reclaimed rather than empty, still owning
         its row for the next key that takes the slot. Those slots have no key to
@@ -1030,35 +1194,60 @@ class LinearBucketTable(ScoredHashTable):
         their rows. That keeps every row below the counter in use: rehashing
         leaves no holes, and no value has to move. The counter carries over.
 
-        Both steps are single kernels over the table's slots, and what they
-        allocate scales with the number of reclaimed slots, not the capacity.
+        One kernel over the old table's slots. How many rows the reclaimed slots hold
+        is the table's counter minus its live keys, computed on the device and never
+        read; the kernel asserts that it found exactly that many.
         """
         assert self.use_rows_ and other.use_rows_
         assert self.bucket_capacity_ == other.bucket_capacity_
-        cap = self.bucket_capacity_
-        o_b0 = int(other.table_bucket_offsets_cpu_[table_id].item())
-        o_b1 = int(other.table_bucket_offsets_cpu_[table_id + 1].item())
+        self._require_rehash_kernels()
+        o_b0 = other.bucket_offsets_host_[table_id]
+        o_b1 = other.bucket_offsets_host_[table_id + 1]
+        b0 = self.bucket_offsets_host_[table_id]
+        b1 = self.bucket_offsets_host_[table_id + 1]
         # Every row below the counter sits on a live or a reclaimed slot, so the
         # reclaimed ones are what is left once the live keys are subtracted.
-        n = int(
-            (other.row_counters_[table_id] - other.bucket_sizes[o_b0:o_b1].sum()).item()
+        count = (
+            other.row_counters_[table_id] - other.bucket_sizes[o_b0:o_b1].sum()
+        ).reshape(1)
+        dynamicemb_extensions.table_carry_reclaimed_rows(
+            other.keys_.view(torch.int64),
+            other.rows_,
+            o_b0,
+            o_b1,
+            self.bucket_capacity_,
+            self.keys_.view(torch.int64),
+            self.digests_,
+            self.rows_,
+            b0,
+            b1,
+            count,
         )
-        if n > 0:
-            carried = table_collect_reclaimed_rows(
-                other.keys_.view(torch.int64), other.rows_, o_b0, o_b1, cap, n
-            )
-            b0 = int(self.table_bucket_offsets_cpu_[table_id].item())
-            b1 = int(self.table_bucket_offsets_cpu_[table_id + 1].item())
-            table_place_reclaimed_rows(
-                self.keys_.view(torch.int64),
-                self.digests_,
-                self.rows_,
-                carried,
-                b0,
-                b1,
-                cap,
-            )
         self.row_counters_[table_id] = other.row_counters_[table_id]
+
+    def record_stream(self, stream: torch.cuda.Stream) -> None:
+        """Mark every tensor this table owns as used by ``stream``.
+
+        For a table that is replaced (a rehash) while kernels queued on ``stream`` may
+        still read it: the caching allocator then keeps each block until the work
+        queued on ``stream`` when the table is freed has finished, instead of handing
+        it to the next allocation of the stream the table was allocated on at once.
+        The key, digest and score columns are views of ``table_storage_``.
+        """
+        for tensor in (
+            self.table_storage_,
+            self.bucket_sizes,
+            self.table_bucket_offsets_,
+            self._ref_counter,
+            self.rows_,
+            self.row_counters_,
+            self.row_limits_,
+            self.overflow_table_storage_,
+            self.overflow_bucket_sizes,
+            self.overflow_output_offsets_,
+        ):
+            if tensor is not None:
+                tensor.record_stream(stream)
 
     def _check_has_ref_counter(self) -> None:
         if self._ref_counter is None:
@@ -1885,10 +2074,10 @@ class LinearBucketTable(ScoredHashTable):
         assert (
             self.per_table_capacity_[table_id] == other.per_table_capacity_[table_id]
         ), "copy_table_from requires same per-table capacity"
-        b_start = int(self.table_bucket_offsets_cpu_[table_id].item())
-        b_end = int(self.table_bucket_offsets_cpu_[table_id + 1].item())
-        o_b_start = int(other.table_bucket_offsets_cpu_[table_id].item())
-        o_b_end = int(other.table_bucket_offsets_cpu_[table_id + 1].item())
+        b_start = self.bucket_offsets_host_[table_id]
+        b_end = self.bucket_offsets_host_[table_id + 1]
+        o_b_start = other.bucket_offsets_host_[table_id]
+        o_b_end = other.bucket_offsets_host_[table_id + 1]
         assert (b_end - b_start) == (o_b_end - o_b_start)
         # Main table: keys, digests, scores, bucket_sizes, ref_counter
         self.keys_[b_start:b_end, :].copy_(other.keys_[o_b_start:o_b_end, :])
@@ -1948,8 +2137,8 @@ class LinearBucketTable(ScoredHashTable):
         assert self.num_scores_ == other.num_scores_, "num_scores mismatch"
         if src_slots.numel() == 0:
             return
-        src_bkt_begin = int(other.table_bucket_offsets_cpu_[table_id].item())
-        dst_bkt_begin = int(self.table_bucket_offsets_cpu_[table_id].item())
+        src_bkt_begin = other.bucket_offsets_host_[table_id]
+        dst_bkt_begin = self.bucket_offsets_host_[table_id]
         table_copy_score_blocks(
             other.table_storage_,
             other.bucket_capacity_,

@@ -86,9 +86,18 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 #       request-sized host tensors, so DynamicEmb reads the dedup count and the
 #       miss counts in front of every PS call (every step, hits included), and
 #       the PS stand-in's own host code adds more.
-#   I4  table growth events (*_growth, *_noevict in the miss scenario, and the
-#       growth scenario): new buffers are sized on the host and
-#       ExtendableBuffer.extend / HostVMMTensor.extend synchronize the device.
+#   (I4, table growth, is gone: a growth is queued on the stream that decided to grow,
+#       ordered against the streams that use the table by GrowthOrder, and reads
+#       nothing back -- the decision is made from an estimate, the rehash is padded and
+#       ExtendableBuffer.extend does not wait for the device -- so the growth
+#       scenarios must read zero like the others. They cross the 2 MiB granule of
+#       the VMM mapping (the *_wide configs) and take a host buffer through its
+#       registration, and test_no_host_syncs.py holds a growing step to returning
+#       before a kernel that is already running has finished, whatever the profiler
+#       calls the driver calls.)
+#   (I3, DEMB_DETERMINISM_MODE, is gone too: a deterministic insert sorts its keys by
+#       bucket on the device and inserts one run per thread, so it reads nothing back
+#       and the miss path needs no read gate in that mode.)
 # Section 5 also lists what no probe step contains, so it needs no entry here:
 # public APIs that return host data (the cache_metrics getter, pops, dumps,
 # checkpoint IO), construction and teardown, user-defined admitters and
@@ -101,20 +110,12 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 # is declared inherent.
 # --------------------------------------------------------------------------
 PS_STANDIN = "*test_batched_dynamic_embedding_tables_v2.py"
-_GROWTH_WHY = (
-    "table growth is an event: the new tables are sized on the host and the "
-    "device is synchronized while values move (ExtendableBuffer.extend, "
-    "HostVMMTensor.extend)"
-)
 _PS_WHY = (
     "external parameter server: its Storage interface takes request-sized host "
     "tensors (DynamicEmb reads the dedup and miss counts before each PS call) and "
     "the stand-in itself reads CUDA tensors on the host (PyDictStorage.find/insert)"
 )
 INHERENT: Dict[Tuple[str, ...], str] = {
-    ("*", "growth"): _GROWTH_WHY,
-    ("*_growth", "miss"): _GROWTH_WHY,
-    ("*_noevict", "miss"): _GROWTH_WHY,
     ("cache_ps*", "*"): _PS_WHY,
 }
 
@@ -125,7 +126,8 @@ KIND_DOC = {
     "es": "cudaEventSynchronize",
     "ms": "synchronous cudaMemcpy*",
     "pd": "D2H memcpy into pageable memory with no stream sync after it",
-    "al": "cudaMalloc/cudaFree/cudaHostAlloc/cudaMallocHost/cudaFreeHost",
+    "al": "cudaMalloc/cudaFree/cudaHostAlloc/cudaMallocHost/cudaFreeHost, pages mapped "
+    "(cuMemCreate/cuMemMap/cuMemSetAccess) or registered (cudaHostRegister)",
 }
 
 # CUDA runtime / driver API names -> kind.  Verified against the profiler of
@@ -165,6 +167,18 @@ SYNC_KIND = {
     "cuMemUnmap": "al",
     "cuMemAddressReserve": "al",
     "cuMemAddressFree": "al",
+    # A growth maps pages after the ones in use (a device buffer: cuMemCreate, cuMemMap,
+    # cuMemSetAccess) or registers the new pages of a reserved range (a host buffer:
+    # cudaHostRegister). They are counted with the allocator events and bounded per growth
+    # by the ratchet; whether one of them waits for the kernels in flight is not something
+    # a name can tell (cuda.h says of cuMemSetAccess that it "exhibits synchronous behavior
+    # for most use cases"), so test_no_host_syncs.py checks it directly, by the time the
+    # host returns, and the hardware gates of growth/gates do under load.
+    "cuMemSetAccess": "al",
+    "cudaHostRegister": "al",
+    "cudaHostUnregister": "al",
+    "cuMemHostRegister_v2": "al",
+    "cuMemHostUnregister": "al",
 }
 BLOCKING_KINDS = ("ss", "ds", "es", "ms")  # what PyTorch's sync debug mode can flag
 # runtime calls that may sit between a pageable D2H memcpy and its stream sync
@@ -211,6 +225,7 @@ class Cfg:
     noevict: bool = (
         False  # score_strategy=NO_EVICTION (tables expand instead of evicting)
     )
+    dim: int = 0  # embedding dim of every table; 0 is the module-level DIM
     doc: str = ""
 
 
@@ -279,6 +294,43 @@ def _build_configs() -> "collections.OrderedDict[str, Cfg]":
         "HBM-only NO_EVICTION, init_capacity < max_capacity",
         growth=True,
         noevict=True,
+    )
+    add(
+        "hybrid_growth",
+        "hybrid",
+        "HybridStorage, the host tier init_capacity < its max_capacity",
+        growth=True,
+    )
+    add(
+        "host_only_noevict",
+        "host",
+        "host-only NO_EVICTION, init_capacity < max_capacity",
+        growth=True,
+        noevict=True,
+    )
+    # 256-wide rows (1 KiB): the value buffers of the growth window cross the 2 MiB
+    # granule of the VMM mapping, which the rows of DIM=32 do not (they stay in the first)
+    add(
+        "hbm_only_growth_wide",
+        "hbm",
+        "HBM-only, init_capacity < max_capacity, wide rows (the value buffer maps new pages)",
+        growth=True,
+        dim=256,
+    )
+    add(
+        "host_only_growth_wide",
+        "host",
+        "host-only, init_capacity < max_capacity, wide rows",
+        growth=True,
+        dim=256,
+    )
+    add(
+        "hbm_only_noevict_wide",
+        "hbm",
+        "HBM-only NO_EVICTION, init_capacity < max_capacity, wide rows",
+        growth=True,
+        noevict=True,
+        dim=256,
     )
     add(
         "cache_storage_determ",
@@ -367,6 +419,10 @@ def plan_of(cfg: Cfg, scenario: str) -> Dict[str, Any]:
         p["init_capacity"] = 1024
         if cfg.layout == "cache":
             p["hbm_rows"] = 8192  # the cache must not fill while the storage grows
+        elif cfg.layout == "hybrid":
+            # the HBM tier does not fill either; the host tier (at most 12,288 rows,
+            # from 1,024) grows because the estimate of a batch counts all of its keys
+            p["hbm_rows"] = 4096
         return p
     if cfg.layout == "cache":
         p["max_capacity"], p["hbm_rows"] = (16384, 2048) if evict else (65536, 8192)
@@ -1094,7 +1150,8 @@ def build_module(cfg: Cfg, plan: Dict[str, Any], device_index: int):
     opt_params: Dict[str, Any] = {"learning_rate": 0.3}
     if cfg.optimizer == "adam":
         opt_params.update(weight_decay=0.06, eps=3e-5, beta1=0.8, beta2=0.888)
-    row_bytes = 4 * (DIM + get_optimizer_state_dim(opt_type, DIM, torch.float32))
+    dim = cfg.dim or DIM
+    row_bytes = 4 * (dim + get_optimizer_state_dim(opt_type, dim, torch.float32))
     max_cap = plan["max_capacity"]
     if cfg.layout in ("cache", "cache_ps", "hybrid"):
         local_hbm = (
@@ -1120,7 +1177,7 @@ def build_module(cfg: Cfg, plan: Dict[str, Any], device_index: int):
         kw["bucket_capacity"] = 128
     options = [
         DynamicEmbTableOptions(
-            dim=DIM,
+            dim=dim,
             max_capacity=max_cap,
             index_type=torch.int64,
             embedding_dtype=torch.float32,
