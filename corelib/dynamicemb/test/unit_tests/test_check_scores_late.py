@@ -159,6 +159,9 @@ def build_lagging_model(current_device: int, mode: DynamicEmbCheckMode):
     model = build_model(current_device, mode)
     indices, _, scores = batch(0, device)
     model._check_scores(scores, indices)  # the first launch of the kernels
+    # ... and of the negation that the tests apply under the sleep: with CUDA's lazy module
+    # loading the first launch of a kernel waits for the device, and every answer would land
+    _ = -scores
     torch.cuda.synchronize()
     model.flush()
     torch.cuda._sleep(100_000_000)
@@ -293,6 +296,7 @@ def test_flush_on_another_stream_sees_a_check_that_found_no_slot(current_device)
     side.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(side):
         model._check_scores(scores, indices)  # the first launch of the kernels
+        _ = -scores  # and of the negation (lazy module loading: a first launch waits)
     side.synchronize()
     model.flush()
 
@@ -347,6 +351,7 @@ def test_a_snapshot_taken_on_another_stream_counts_the_checks_before_it(
         stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(a):
         model._check_scores(scores, indices)  # the first launch of the kernels
+        _ = -scores  # and of the negation (lazy module loading: a first launch waits)
     a.synchronize()
     model.flush()
 

@@ -519,6 +519,9 @@ def test_enqueue_does_not_wait_for_a_kernel_in_flight():
     seconds = 0.5
     cycles = spin_cycles_for(seconds)
     dev = torch.tensor([21], device="cuda")
+    # the first launch of a kernel waits for the device (CUDA lazy module loading): make the
+    # multiplication that the observed call makes once before the stream is busy
+    _ = dev * 2
     torch.cuda.synchronize()
     torch.cuda._sleep(cycles)  # the stream is busy for about half a second
     t0 = time.perf_counter()
@@ -550,6 +553,9 @@ def test_the_event_is_recorded_on_the_stream_that_issued_the_copy():
         assert ring.ready(t) and ring.value(t).tolist() == [0]
         ring.release(t)
     source = torch.tensor([21], device="cuda")
+    # the first launch of a kernel waits for the device (lazy module loading): make the
+    # multiplication that the observed call makes once before `side` is busy
+    _ = source * 2
     side = torch.cuda.Stream()
     cycles = spin_cycles_for(0.4)
     torch.cuda.synchronize()
@@ -758,6 +764,11 @@ def test_the_poll_gate_runs_the_path_when_the_count_has_not_landed(
     monkeypatch.setattr(sf, "MISS_GATE", "poll")
     gate = sf.MissGate()
     none, _ = masks()
+    # the first launch of a kernel waits for the device (lazy module loading): begin() once
+    # before the stream is busy
+    warm = gate.begin(none)
+    torch.cuda.synchronize()
+    gate.needed(warm)
     torch.cuda._sleep(spin_cycles_for(0.3))
     pending = gate.begin(none)
     assert (
