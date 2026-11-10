@@ -190,6 +190,59 @@ def test_the_pass_of_nothing(where):
 
 
 @pytest.mark.parametrize("dtype", [torch.int64, torch.uint64])
+@pytest.mark.parametrize("wanted", [[0], [1], [0, 1], [], [5], [1, 2], [0, 7]])
+def test_a_table_id_past_the_tables_of_the_state_is_a_table_not_an_index_error(
+    where, dtype, wanted
+):
+    """The pass indexes per-table arrays with the table ids of the rows, and an index past
+    the end of a CUDA tensor is a device-side assert, which takes the process down with
+    it (the first run on the H100 of ``test_pop_dedup_and_table_id_filter``, a one-table
+    storage that retains a row of "table 1"). The pass is specified for any table id,
+    as the reference below is: a row of a table that is not asked for stays, whether or
+    not the state has such a table, and a table asked for is popped whether or not it
+    has one."""
+    kvt = _need("dynamicemb.key_value_table")
+    rng = random.Random(11)
+    num_tables = 2
+    pool = [rng.randrange(-(1 << 63), 1 << 63) for _ in range(6)] + [5, 6, -2]
+    chunks_k, chunks_t = [], []
+    rows, tids = [], []
+    for _ in range(3):
+        n = rng.randrange(8, 30)
+        t = [rng.choice([-1, 0, 1, 2, 5, 7]) for _ in range(n)]  # 2, 5, 7: no table
+        k = [EMPTY if tt == -1 else rng.choice(pool) for tt in t]
+        chunks_k.append(_keys_of(k, dtype, where))
+        chunks_t.append(torch.tensor(t, dtype=torch.int64, device=where))
+        rows += k
+        tids += t
+
+    taken, counts, rest_keys, rest_tids = kvt._drain_chunks(
+        chunks_k, chunks_t, wanted, num_tables
+    )
+
+    expected, expected_rest = _reference(rows, tids, set(wanted), dtype)
+    assert len(counts) == max([num_tables] + [t + 1 for t in wanted])
+    assert counts == [len(expected.get(t, [])) for t in range(len(counts))]
+    values = _as_numbers(taken, dtype)
+    start = 0
+    for t in range(len(counts)):
+        assert values[start : start + counts[t]] == expected.get(t, []), t
+        start += counts[t]
+    assert start == taken.numel()
+    got_rest = list(zip(_int64_view(rest_keys).tolist(), rest_tids.cpu().tolist()))
+    assert got_rest == expected_rest, "the rows of the tables not asked for stay"
+
+
+def test_a_negative_table_id_is_not_a_table_to_pop(where):
+    """``wanted[-1]`` would be the last table: a pop of ``-1`` is refused instead."""
+    kvt = _need("dynamicemb.key_value_table")
+    keys = _keys_of([5, 6], torch.int64, where)
+    tids = torch.tensor([0, 1], dtype=torch.int64, device=where)
+    with pytest.raises(ValueError, match="not negative"):
+        kvt._drain_chunks([keys], [tids], [-1], 2)
+
+
+@pytest.mark.parametrize("dtype", [torch.int64, torch.uint64])
 def test_a_host_union_is_sorted_and_distinct_in_the_key_type_order(dtype):
     kvt = _need("dynamicemb.key_value_table")
     values = [9, -4, 3, 9, 1 << 62, -(1 << 63), 3, -4, 0]
@@ -310,6 +363,29 @@ def test_pop_many_of_some_tables_leaves_the_others(gpu):
     assert all(bool((t >= 0).all()) for t in storage._state.evicted_tid_chunks)
     assert storage.pop_many("pop_evicted_keys", [1])[1].tolist() == [6, 8]
     assert storage.pop_many("pop_evicted_keys", []) == {}
+
+
+def test_a_pop_of_a_table_id_the_storage_has_no_table_for_works_as_it_always_did(gpu):
+    """The retained rows of a table id past the storage's tables (a test that appends
+    ``(key, table id)`` rows decoupled from any eviction does) stay for their own pop and
+    do not index past the per-table arrays of the first one; a pop of such a table that
+    holds nothing is empty."""
+    kvt = _need("dynamicemb.key_value_table")
+    device = _device()
+    rng = random.Random(9)
+    storage = _storage(2)
+    members = [(0, 5), (1, 6), (3, 8), (3, 9), (3, 8), (0, 5)]
+    kvt._append_evicted_masked(storage._state, *_masked(members[:3], 8, device, rng))
+    kvt._append_evicted_masked(storage._state, *_masked(members[3:], 8, device, rng))
+
+    first = storage.pop_many("pop_evicted_keys", [0, 3, 4])
+
+    assert sorted(first) == [0, 3, 4]
+    assert first[0].tolist() == [5] and first[3].tolist() == [8, 9]
+    assert first[4].numel() == 0 and first[4].dtype == torch.int64
+    assert storage.pop_evicted_keys(1).tolist() == [6], "table 1's key stayed"
+    assert storage.pop_evicted_keys(3).numel() == 0, "and the popped keys are gone"
+    assert storage._state.evicted_key_chunks == []
 
 
 def test_pop_many_with_nothing_retained_is_empty_and_does_not_wait(

@@ -67,14 +67,14 @@ from dynamicemb.rehash_plan import (
     lands_in_the_bucket_of_origin_or_a_new_one,
 )
 from dynamicemb.scored_hashtable import (
-    REHASH_CHUNK_SLOTS,
     LIVE_PREFIX_BATCHES_IN_FLIGHT,
+    REHASH_CHUNK_SLOTS,
     ScoreArg,
     ScorePolicy,
     ScoreSpec,
     get_scored_table,
-    rehash_chunk_buckets,
     pull_live_prefixes,
+    rehash_chunk_buckets,
 )
 from dynamicemb.types import (
     EMBEDDING_TYPE,
@@ -2791,22 +2791,35 @@ def _drain_chunks(
     as they are. Keys are 1-D, or ``[n, 2]`` (the (slot, row) pairs of a slot
     index: distinct rows).
 
+    Any table id is a table: a row whose id is not below ``num_tables`` is the row of
+    a table that is not asked for, and stays, and a table asked for may be one past
+    ``num_tables``. The per-table arrays below are indexed by the ids, and an index
+    past the end of a CUDA tensor is a device-side assert, which takes the process
+    down; so they cover the tables asked for as well as ``num_tables``, and an id is
+    clamped into them wherever it indexes.
+
     Returns ``(taken, counts, rest_keys, rest_tids)``: ``taken`` has the distinct
     keys of the wanted tables, table after table in table order, ``counts[t]`` of
-    table ``t``; ``rest_*`` are the rows of the other tables. All are exact: the
-    sizes are what the single read returns, and nothing else waits.
+    table ``t`` (a list of ``max(num_tables, the largest table asked for + 1)``
+    entries); ``rest_*`` are the rows of the other tables. All are exact: the sizes
+    are what the single read returns, and nothing else waits.
     """
+    if any(t < 0 for t in table_ids):
+        raise ValueError(f"table ids are not negative, got {list(table_ids)}")
     keys = torch.cat(key_chunks)
     tids = torch.cat(tid_chunks)
     device = keys.device
     size = keys.size(0)
+    num_tables = max([num_tables, *(t + 1 for t in table_ids)])
     wanted = torch.zeros(num_tables, dtype=torch.bool, device=device)
     for table_id in table_ids:
         # a kernel with the scalar as its argument; a list of ids would be an upload
         wanted[table_id].fill_(True)
-    in_table = tids >= 0
-    row_wanted = wanted[tids.clamp(min=0)]
-    keep = in_table & ~row_wanted
+    # ``slot`` is the id of a row in the per-table arrays; ``tids == slot`` says that the
+    # row's id is one of them (not -1, not past the end).
+    slot = tids.clamp(min=0, max=num_tables - 1)
+    row_wanted = wanted[slot] & (tids == slot)
+    keep = (tids >= 0) & ~row_wanted
 
     # Order the rows by (table, key): stable sorts by one column after another,
     # the least significant first.
@@ -2829,9 +2842,10 @@ def _drain_chunks(
     differs = differs | (sorted_tids[1:] != sorted_tids[:-1])
     first = torch.ones(size, dtype=torch.bool, device=device)
     first[1:] = differs
-    take = (sorted_tids >= 0) & wanted[sorted_tids.clamp(min=0)] & first
+    sorted_slot = sorted_tids.clamp(min=0, max=num_tables - 1)
+    take = wanted[sorted_slot] & (sorted_tids == sorted_slot) & first
     counts = torch.zeros(num_tables, dtype=torch.int64, device=device)
-    counts.scatter_add_(0, sorted_tids.clamp(min=0), take.to(torch.int64))
+    counts.scatter_add_(0, sorted_slot, take.to(torch.int64))
 
     # Moving the members of a mask to the front: a stable sort of the mask, so their
     # order is kept and there is no boolean-mask index.
@@ -2918,7 +2932,8 @@ def _pop_chunked_keys_to_host(
     wanted = set(table_ids)
     out: Dict[int, torch.Tensor] = {}
     start = 0
-    for t in range(state.num_tables):
+    # the tables of the state, and any one that was asked for past them
+    for t in range(len(counts)):
         if t in wanted:
             # a copy: the pulled buffer is pinned memory, which a caller keeps no claim on
             out[t] = host[start : start + counts[t]].clone()
