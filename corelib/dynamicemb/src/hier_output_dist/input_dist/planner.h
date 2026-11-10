@@ -296,6 +296,8 @@ ProxyBuffers proxy_buffers(at::Tensor remote_map, at::Tensor key_stage, const Pr
 // take index dedup's and the bucketize's names with a node_ prefix
 // (docs/hier_output_dist.md, section 10.4). The tables per occurrence and per
 // key hold garbage past the valid ones (occurrence_count, node_num_uniques).
+// The hash table and the scan take the valid occurrences alone: the kernels
+// read their count, and the host sizes the tables by remote_keys.
 struct ProxyKeys {
   at::Tensor occurrence_count;  // int64 0-dim: the valid occurrences (0 when the node skips)
   at::Tensor node_num_uniques;  // int64 0-dim: the node-unique keys
@@ -323,6 +325,10 @@ struct ProxyKeys {
 // node, the smallest of them. Weights must be whole numbers (frequency
 // counts): they are summed as int64.
 ProxyKeys proxy_keys(const ProxyInput &input, const Sizes &sizes, bool node_dedup);
+// A test hook (testing.cu): each later proxy_keys of this process runs its scan of the
+// representatives (slice_sums_kernel and slice_scan_kernel, planner.cuh) on `ctas` CTAs, or as
+// its sizes choose (0: a thread per entry of remote_keys, at most two CTAs per SM).
+void force_scan_ctas(int64_t ctas);
 
 // Step 2: the rows of the keys, the chunks of the stream and where they
 // lie, each occurrence's slot. A key's rows are its key row and its

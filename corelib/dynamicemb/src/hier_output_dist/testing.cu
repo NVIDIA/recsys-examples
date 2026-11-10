@@ -19,8 +19,9 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 // requester's push into stand-ins for its targets' node_keys, and one rank's
 // proxy, rail and requester steps across nodes. Last, a hook that makes the
 // next construction fail, a hook that delays the reads of node_offsets and
-// node_keys of later input dists, and the GPU clock the benchmark aligns
-// timelines by (a build with DYNAMICEMB_HIER_TRACE=1).
+// node_keys of later input dists, hooks that choose the paths of later ones
+// (node_exchange's, and the CTAs of the proxy's scan), and the GPU clock the
+// benchmark aligns timelines by (a build with DYNAMICEMB_HIER_TRACE=1).
 
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
@@ -313,7 +314,8 @@ std::pair<at::Tensor, at::Tensor> group_tables(const std::vector<int64_t> &looku
 // node n), by name. It writes remote_map, key_stage and proxy_header (a proxy
 // header, ProxyHeader) as the steps write those buffers of its window. Also
 // the node-unique key of each occurrence (node_reverse_indices, garbage past
-// the valid ones), for the test's reference.
+// the valid ones) and the node-unique keys (node_num_uniques), for the test's
+// reference.
 std::map<std::string, at::Tensor> proxy_plan_test(
     at::Tensor node_keys, c10::optional<at::Tensor> node_key_weights,
     at::Tensor node_bucket_feature_of_row, at::Tensor remote_offsets, at::Tensor skip,
@@ -351,6 +353,7 @@ std::map<std::string, at::Tensor> proxy_plan_test(
                                              key_stage, header, proxy_header.options());
   ProxyKeys proxy = proxy_keys(input, sizes, node_dedup);
   const at::Tensor node_reverse_indices = proxy.node_reverse_indices;  // the push order drops it
+  const at::Tensor node_num_uniques = proxy.node_num_uniques;          // the plan does not keep it
   ProxyChunks chunks = proxy_chunks_and_slots(proxy, remote_offsets, buffers, sizes);
   const ProxyPlan plan =
       proxy_push_order(std::move(proxy), std::move(chunks), remote_offsets, buffers, sizes);
@@ -371,7 +374,8 @@ std::map<std::string, at::Tensor> proxy_plan_test(
            count_message(need_remote.reshape({}), own_lengths, plan.need_key_rows,
                          plan.chunk_length_per_bucket, plan.node_length_per_bucket_feature,
                          group_tables(lookup_groups, num_features, node_keys.options()).second)},
-          {"node_reverse_indices", node_reverse_indices}};
+          {"node_reverse_indices", node_reverse_indices},
+          {"node_num_uniques", node_num_uniques}};
 }
 
 // One rank's rail steps of a call on its rail's count messages to it (int64
@@ -565,6 +569,10 @@ void bind_testing(py::module &py_module) {
                 "lays out the node's items (items) on node_exchange's CTA (1) or on a grid (0), or "
                 "as their sizes choose (-1)",
                 py::arg("push"), py::arg("items"));
+  py_module.def("hier_output_dist_scan_ctas", &force_scan_ctas,
+                "Each later proxy step of this process runs its scan of the representatives on "
+                "ctas CTAs, or as its sizes choose (0)",
+                py::arg("ctas"));
   py_module.def(
       "hier_output_dist_proxy_plan", &proxy_plan_test,
       "One proxy's steps of a call across nodes on plain tensors, which it writes as "

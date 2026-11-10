@@ -68,9 +68,33 @@ key past local_size occurrences: the need key_rows), check the needs alone
 (and that no access was out of range). Every planner call runs under
 ``torch.cuda.set_sync_debug_mode("error")``.
 
+Most cases size remote_keys at the largest remote part plus 5. Others size
+it 20 times as large (remote_factor) or exactly at it, or give node 0 no
+keys across nodes (its proxies get no occurrence in a call that fits): the
+proxy's hash table and its scan of the representatives take the valid
+occurrences alone, a count only the device knows. A few run that scan on a
+given number of CTAs (``hier_output_dist_scan_ctas``): 2, 3, 264 and 600 on
+calls of a few hundred occurrences a proxy (on 264 and 600, CTAs of one
+occurrence or none; on 264 also a count at remote_keys and a count of 0),
+and 1, 2 and 600 on calls of 11,000 to 21,000 (on 1 and 2, slices of
+several tiles; on 600, slices of about 20 to 35 occurrences, also in the
+CTAs past a CTA's threads).
+
 Run it on one GPU, from ``corelib/dynamicemb``::
 
     python test/unit_tests/test_hier_dedup.py
+
+Under compute-sanitizer, turn off the caching allocator. Then each tensor is
+an allocation of its own: memcheck sees an access past a tensor's end, and
+initcheck a read of a word that nothing wrote, whatever the memory held (the
+proxy's hash table keeps garbage past the buckets the call takes, and its
+tables per occurrence and per key past the valid ones; no kernel may read
+it)::
+
+    export PYTORCH_NO_CUDA_MEMORY_CACHING=1
+    compute-sanitizer --tool initcheck python test/unit_tests/test_hier_dedup.py
+
+and so with ``--tool memcheck``, ``--tool racecheck`` and ``--tool synccheck``.
 """
 
 import sys
@@ -86,6 +110,7 @@ from dynamicemb_extensions import (
     hier_output_dist_proxy_plan,
     hier_output_dist_rail_tables,
     hier_output_dist_requester_tables,
+    hier_output_dist_scan_ctas,
 )
 
 TASK_ROWS = 32  # kTaskRows: rows of a push task
@@ -170,10 +195,16 @@ class Case:
     # does not fit)
     lookup_slack: int = 5
     remote_slack: int = 5
+    # remote_keys: this many times the most a rank needs, plus remote_slack
+    # (far above the call: the proxy's counts far below its capacity)
+    remote_factor: int = 1
     job: Optional[Callable] = None  # the ranks' rows, when not random
     seeds: int = 2
     # the features of each lookup group (Config::lookup_groups); empty: one group
     groups: Tuple[int, ...] = ()
+    # the CTAs of the proxy's scan of the representatives
+    # (hier_output_dist_scan_ctas); 0: as its sizes choose
+    scan_ctas: int = 0
 
     @property
     def num_features(self) -> int:
@@ -265,6 +296,22 @@ def past_bound_job(case: Case, generator) -> List[Tuple]:
     return one_owner_job(
         case, [[7, 8, 8] if rank == 0 else [7, 8] for rank in range(case.local_size)]
     )
+
+
+def local_node_job(case: Case, generator) -> List[Tuple]:
+    """As random_job, but node 0's requesters ask only the owners of their
+    node: node 0's proxies get no occurrence (a count of 0) in a call that
+    fits, so they write their tables of no keys and no chunks."""
+    job = random_job(case, generator)
+    node_bucket_features = case.local_size * case.num_features  # node 0's owners
+    for rank in range(case.local_size):
+        counts, keys, weights = job[rank]
+        bucket_feature = torch.repeat_interleave(torch.arange(counts.numel()), counts)
+        keep = bucket_feature < node_bucket_features
+        counts = counts.clone()
+        counts[node_bucket_features:] = 0
+        job[rank] = (counts, keys[keep], weights[keep])
+    return job
 
 
 CASES = [
@@ -547,6 +594,164 @@ CASES = [
         remote_slack=0,
         job=wide_node_job,
         seeds=1,
+    ),
+    # remote_keys 20 times the need: the proxy's hash table and its scan of the
+    # representatives take the valid occurrences alone, far fewer than the
+    # capacity, and max_chunks is far above the chunks
+    Case("remote_keys 20 x the need", remote_factor=20),
+    Case(
+        "remote_keys 20 x the need, node dedup off, weights",
+        max_block=10,
+        key_range=60,
+        hot=0.3,
+        weighted=True,
+        node_dedup=False,
+        remote_factor=20,
+    ),
+    Case(
+        "remote_keys 20 x the need, 2 rows per payload",
+        max_block=40,
+        key_range=30,
+        hot=0.5,
+        max_chunk_rows_arg=40,
+        payload_rows=20,
+        remote_factor=20,
+    ),
+    Case(
+        "remote_keys 20 x the need, weights, 3 nodes of 2, 6 rows per payload",
+        num_nodes=3,
+        local_size=2,
+        tables=(0, 0, 1),
+        max_block=40,
+        key_range=30,
+        hot=0.5,
+        weighted=True,
+        max_chunk_rows_arg=60,
+        payload_rows=10,
+        remote_factor=20,
+    ),
+    Case(
+        "remote_keys 20 x the need, 2 nodes, a wrapping ring",
+        num_nodes=2,
+        max_block=200,
+        key_range=600,
+        hot=0.15,
+        num_proxy_rows=1280,
+        remote_factor=20,
+        seeds=1,
+    ),
+    # remote_keys at the need: the largest remote part fills it
+    Case("remote_keys at the need", max_block=20, hot=0.3, remote_slack=0),
+    Case(
+        "remote_keys at the need, node dedup off",
+        max_block=20,
+        hot=0.3,
+        node_dedup=False,
+        remote_slack=0,
+    ),
+    # node 0's proxies get no occurrence in a call that fits
+    Case("no keys across nodes from node 0", job=local_node_job),
+    Case(
+        "no keys across nodes from node 0, node dedup off, 20 x the need",
+        node_dedup=False,
+        remote_factor=20,
+        job=local_node_job,
+    ),
+    # many sparse features: 2,400 and 4,400 bucket features at a proxy, most of
+    # their blocks empty
+    Case(
+        "600 features on 4 nodes of 2",
+        local_size=2,
+        tables=tuple(feature // 5 for feature in range(600)),
+        max_block=1,
+        key_range=100,
+        hot=0.05,
+        seeds=1,
+    ),
+    Case(
+        "1,100 features on 4 nodes of 2, weights, 20 x the need",
+        local_size=2,
+        tables=tuple(feature // 11 for feature in range(1100)),
+        max_block=1,
+        key_range=100,
+        weighted=True,
+        remote_factor=20,
+        seeds=1,
+    ),
+    # the proxy's scan of the representatives on 1, 2, 3, 264 and 600 CTAs: on
+    # one CTA a slice of several tiles (4,096 occurrences each); on many, CTAs
+    # of one occurrence or none (600: more CTAs than a CTA's threads)
+    Case(
+        "the proxy's scan on 1 CTA, 2 nodes of 2",
+        num_nodes=2,
+        local_size=2,
+        tables=(0, 1),
+        max_block=9000,
+        key_range=30000,
+        hot=0.05,
+        scan_ctas=1,
+        seeds=1,
+    ),
+    Case(
+        "the proxy's scan on 2 CTAs",
+        max_block=40,
+        key_range=30,
+        hot=0.5,
+        scan_ctas=2,
+    ),
+    Case(
+        "the proxy's scan on 3 CTAs, weights",
+        max_block=40,
+        key_range=30,
+        hot=0.5,
+        weighted=True,
+        scan_ctas=3,
+    ),
+    Case("the proxy's scan on 264 CTAs", scan_ctas=264),
+    Case(
+        "the proxy's scan on 600 CTAs, 20 x the need",
+        remote_factor=20,
+        scan_ctas=600,
+        seeds=1,
+    ),
+    # the 1-CTA case's job on 2 CTAs, slices of several tiles after the sum of
+    # the slice before, and on 600 CTAs, slices of about 20 to 35 occurrences:
+    # the CTAs past a CTA's threads hold some, so a later CTA adds up the sums
+    # before its slice in more than one pass of its threads; on 264 CTAs, a
+    # count at remote_keys and a count of 0 (every slice empty)
+    Case(
+        "the proxy's scan on 2 CTAs, 2 nodes of 2",
+        num_nodes=2,
+        local_size=2,
+        tables=(0, 1),
+        max_block=9000,
+        key_range=30000,
+        hot=0.05,
+        scan_ctas=2,
+        seeds=1,
+    ),
+    Case(
+        "the proxy's scan on 600 CTAs, 2 nodes of 2",
+        num_nodes=2,
+        local_size=2,
+        tables=(0, 1),
+        max_block=9000,
+        key_range=30000,
+        hot=0.05,
+        scan_ctas=600,
+        seeds=1,
+    ),
+    Case(
+        "remote_keys at the need, the proxy's scan on 264 CTAs",
+        max_block=20,
+        hot=0.3,
+        remote_slack=0,
+        scan_ctas=264,
+    ),
+    Case(
+        "no keys across nodes from node 0, the proxy's scan on 264 CTAs",
+        job=local_node_job,
+        scan_ctas=264,
     ),
     # keys not index-deduplicated: the need key_rows
     Case("keys not deduplicated", max_block=40, key_range=30, hot=0.5, dedup=False),
@@ -1266,6 +1471,7 @@ def check_proxy(
     num_occurrences, node_num_uniques = len(ref["occurrences"]), ref["node_num_uniques"]
     num_chunks = ref["num_chunks"]
     expect("occurrences", int(out["occurrence_count"]), num_occurrences)
+    expect("node_num_uniques", int(out["node_num_uniques"]), node_num_uniques)
     expect("need_key_rows", int(out["need_key_rows"]), ref["need_key_rows"])
     expect(
         "keys", out["node_reverse_indices"][:num_occurrences].tolist(), ref["key_of"]
@@ -1279,6 +1485,15 @@ def check_proxy(
         "node_offset_per_bucket",
         out["node_offset_per_bucket"].tolist(),
         ref["node_offset_per_bucket"],
+    )
+    node_offset_per_bucket = ref["node_offset_per_bucket"]
+    expect(
+        "node_length_per_bucket",
+        out["node_length_per_bucket"].tolist(),
+        [
+            node_offset_per_bucket[owner_node + 1] - node_offset_per_bucket[owner_node]
+            for owner_node in range(num_nodes)
+        ],
     )
     expect("chunks", int(out["num_chunks"]), num_chunks)
     # the chunks' bounds: none empty, its rows at most its counted rows, which
@@ -1818,7 +2033,7 @@ def run_case(case: Case, seed: int) -> Tuple[Dict[str, List[str]], str]:
         for proxy in range(local_size)
     }
     need_remote = max(len(occs) for occs in occurrences.values())
-    remote_keys = max(need_remote + case.remote_slack, 1)
+    remote_keys = max(case.remote_factor * need_remote + case.remote_slack, 1)
     refs = {
         where: proxy_reference(case, occs, where[0], remote_keys)
         for where, occs in occurrences.items()
@@ -1849,13 +2064,18 @@ def run_case(case: Case, seed: int) -> Tuple[Dict[str, List[str]], str]:
     lookup_keys = max(need_lookup + case.lookup_slack, 1)
     need_key_rows = max(ref["need_key_rows"] for ref in refs.values())
     laps = max(-(-ref["stream_end"] // case.num_proxy_rows) for ref in refs.values())
-    call = run_call(case, ranks, lookup_keys, remote_keys, generator)
+    hier_output_dist_scan_ctas(case.scan_ctas)
+    try:
+        call = run_call(case, ranks, lookup_keys, remote_keys, generator)
+    finally:
+        hier_output_dist_scan_ctas(0)
     # each node's agreed needs: the most of what its ranks publish
     agreed = call["needs"].amax(1).tolist()
     checks = {"puts": call["problems"]}
     stats = (
         f"chunks {max(ref['num_chunks'] for ref in refs.values())}, laps {laps}, "
-        f"most occurrences of a key {need_key_rows}"
+        f"most occurrences of a key {need_key_rows}, "
+        f"largest remote part {need_remote} of {remote_keys}"
     )
     if lookup_keys < need_lookup or remote_keys < need_remote:
         # The call does not fit: every rank sees it in the same needs (an

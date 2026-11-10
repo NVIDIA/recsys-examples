@@ -1140,8 +1140,13 @@ nodes, ranks, features and chunks) runs on one CTA, which loops over them.
 A long scan on one CTA takes its values a tile at a time: each thread reads
 8 consecutive values of the tile before the tile's one block scan, so it
 waits once per tile for its loads (`cta_scan_blocked`, `planner.cuh`). The
-proxy's keys per bucket feature, the owner's KJT offsets on the rail, and
-the owner's record offsets of each other node (a CTA per node) take it.
+owner's KJT offsets on the rail and the owner's record offsets of each
+other node (a CTA per node) take it. A scan over a count that only the
+device knows (the proxy's scan of its representatives, section 10.4) runs
+on a grid that the host sizes, in two kernels (`slice_sums_kernel`,
+`slice_scan_kernel`): each CTA takes a slice of the valid items and sums it,
+then each CTA adds the sums of the slices before its own to the offsets in
+its slice, a tile at a time. Neither reads past the count.
 No kernel waits for another CTA: a step that needs every item done goes on
 in its next kernel, or in the kernel's last CTA out. That is the fan-out
 table's counts (section 10.1): each CTA takes a ticket once its items are
@@ -1510,28 +1515,37 @@ read:
   of each chunk start (the last: where they end), relative to that
   requester's push order.
 
-**Its node dedup** takes eight launches and no sort (`proxy_keys`,
-`input_dist/proxy.cu`); with `node_dedup=False` it takes three, without the
-hash table, the pass and the scan:
+**Its node dedup** takes five launches and no sort (`proxy_keys`,
+`input_dist/proxy.cu`); with `node_dedup=False` it takes two, without the
+hash table and the scan. Only the device knows how many occurrences are
+valid (the count). The host sizes every table and grid by what it knows:
+`remote_keys`, `local_size`, the bucket features (`num_nodes ×
+num_features`) and the SMs. The kernels read the count to bound their
+loops, so none of them reads or clears past the valid occurrences:
 
-* one kernel clears a hash table of the call, from the caching allocator:
-  a power of two of at least `2 × remote_keys` buckets, each the int32
-  head of a chain, and an int32 chain link per occurrence. Its threads also
-  find each (requester, bucket feature) block of the remote part, by a
-  binary search: a requester's occurrences go by owner node, then feature;
+* one kernel clears the part of a hash table of the call that the call
+  takes. The caching allocator gives a power of two of at least `2 ×
+  remote_keys` buckets, each the int32 head of a chain, and an int32 chain
+  link per occurrence. The call takes the first buckets, a power of two of
+  at least twice the count, and the links and the identities' state of the
+  valid occurrences. Its threads also find each (requester, bucket feature)
+  block of the remote part, by a binary search: a requester's occurrences
+  go by owner node, then feature;
 * a thread per occurrence finds its identity (table, key) with index
   dedup's chained insert (`chain_insert`, `src/dedup_chain.cuh`, which
-  `segmented_unique` runs too). A chain links the occurrences that claimed
-  an identity, one per identity. The occurrence walks its bucket's chain
-  and ends on its identity's occurrence, or appends itself at the end with
-  an `atomicCAS` and claims a new identity. On the identity it then lowers
-  the representative with an `atomicMin` of (bucket feature, occurrence),
-  counts the occurrence, puts it in a list of the identity's occurrences,
-  and adds its weight as an `int64`;
-* a pass marks the representatives, and a CUB scan (three launches) counts
-  them before each occurrence;
-* one CTA counts the representatives of each block: the keys of each
-  bucket feature, and where they start (a blocked scan, section 10);
+  `segmented_unique` runs too), in the buckets the first kernel cleared. A
+  chain links the occurrences that claimed an identity, one per identity.
+  The occurrence walks its bucket's chain and ends on its identity's
+  occurrence, or appends itself at the end with an `atomicCAS` and claims a
+  new identity. On the identity it then lowers the representative with an
+  `atomicMin` of (bucket feature, occurrence), counts the occurrence, puts
+  it in a list of the identity's occurrences, and adds its weight as an
+  `int64`;
+* two kernels count the representatives before each valid occurrence, a
+  scan over slices of the valid occurrences, one slice per CTA (section 10):
+  the first marks each occurrence of its slice that is its identity's
+  representative and sums them, and the second adds the sums of the slices
+  before its own to the offsets in its slice;
 * a thread per occurrence takes its key `uniq` from its representative,
   and its rank among its key's occurrences from the list. The
   representative writes its key's tables. The representative is the `k`-th
@@ -1542,11 +1556,19 @@ hash table, the pass and the scan:
   `reps(r', b) > k`: before it come every representative of `b` of place
   below `k`, of every requester, and those of place `k` of the requesters
   before `r`. So the keys of `b` go by (`k`, `r`), the requesters in turn
-  (section 9), one key per representative. That takes about four loads per
-  requester and occurrence, the same words for every occurrence of `b`.
-  Without node dedup the keys of `b` go requester after requester: the key
-  is where they start, plus the occurrences of `b` at the requesters
-  before `r`, plus `k`.
+  (section 9), one key per representative. Where the keys of `b` start is
+  the sum over the requesters of the representatives before their blocks of
+  `b`, less those before their ranges: a requester's representatives of the
+  blocks before `b` are those before its block of `b` less those before its
+  range. So nothing scans the bucket features, and the loads of the loop
+  over `r'` give it. That takes about four loads per requester and
+  occurrence, the same words for every occurrence of `b`. Without node
+  dedup the keys of `b` go requester after requester: the key is where they
+  start, plus the occurrences of `b` at the requesters before `r`, plus `k`;
+* then the same kernel takes the bucket features, a thread each, with the
+  same sums (`O(local_size)` loads each): the keys of each bucket feature,
+  and of each owner node where its keys start and how many. Where the last
+  owner node's keys end is the count of node-unique keys.
 
 The bucket is the high bits of `murmur3_fmix64(key ^ seed)`, mixed with
 the table. An owner rule fixes the low bits of the key (`roundrobin`) or of
@@ -1554,6 +1576,9 @@ the table. An owner rule fixes the low bits of the key (`roundrobin`) or of
 neither gives the bucket. On a proxy's keys under either rule, a CPU study
 of up to 4 million occurrences finds what random buckets give: chains of a
 few occurrences, and fewer than one comparison per occurrence on average.
+The buckets the call takes are at least twice its valid occurrences, so it
+clears and walks no more of the table than its keys need, whatever
+`remote_keys` is.
 
 **Names.** A table that holds data from another step is named after that
 data where it came from, with a prefix for where it is now. The requesters
@@ -2350,7 +2375,7 @@ The capacities are the ones in place (section 5), and `row_bytes` and
 | index dedup's fan-out table | about 13 bytes per original key (on this path the deduplicated KJT keeps the original length) | per call |
 | the bucketize, in the caller's pool | at its peak about 36 bytes per key, during the fan-out's sort: its outputs (`inv` and `bucket_feature_of_row`, 8), where it put each row (4), the sort's keys and values in and out (16) and CUB's extra key and value buffers (8); before that the counting sort by owner holds its outputs alone (8) and a count per CTA and owner (at most about 1 MiB), and above 2,047 owners, or where the counting sort's shared memory does not fit the GPU, the radix sort by bucket feature at most 24, its outputs included; for either owner rule, with or without weights | transient |
 | the planner, in the caller's pool | its largest step: across nodes the proxy's, about 64 bytes per entry of `remote_keys` with weights, 60 without (52 when `rows_per_payload` is 1); the requester's holds about 24 bytes per key besides its maps (the gathered `remote_map` words, 12, and the peer and word each comes from, 12), and the owner's adds only its KJT values and row map (per call); on one node nothing per key beyond the per-call tensors | transient |
-| the input dist's tables per (rank, feature), in the caller's pool | the bucketize's `offset_per_bucket_feature` and the node layout's `row_shift`, about `8 × world_size × num_features` each (the bucketize writes only each owner's first entry and its node's owners' entries, section 10.1); across nodes, while the proxy's node dedup runs, its block tables, about `8 × (world_size + num_nodes) × num_features` (section 15.4) | transient |
+| the input dist's tables per (rank, feature), in the caller's pool | the bucketize's `offset_per_bucket_feature` and the node layout's `row_shift`, about `8 × world_size × num_features` each (the bucketize writes only each owner's first entry and its node's owners' entries, section 10.1); across nodes, while the proxy's node dedup runs, its block table, about `8 × world_size × num_features` (section 15.4) | transient |
 
 The transient figures come from the code: bytes in live tensors. The
 caching allocator's rounding and the cached blocks it hands out add up to
@@ -2449,8 +2474,9 @@ by `world_size`. `node_offsets` holds a row of about `local_size ×
 (num_features + 1)` int64 words per GPU of the node (section 15.2). Per
 call, the bucketize's `offset_per_bucket_feature` and the node layout's row
 shifts are sized by `world_size` (`8 × world_size × num_features` bytes
-each), and so are the proxy's block tables while its node dedup runs (about
-`8 × (world_size + num_nodes) × num_features` bytes). Apart from these,
+each), and so is the proxy's block table while its node dedup runs (about
+`8 × world_size × num_features` bytes: where each requester's block of each
+bucket feature starts). Apart from these,
 `num_nodes` enters only through:
 
 * the share `(num_nodes − 1) / num_nodes`;
@@ -2648,8 +2674,9 @@ slots and their sub-tasks, below), and adds weights as whole numbers. The
 proxy's node dedup takes each key's representative with an atomic minimum,
 counts its occurrences and adds its weights with atomic adds, and keeps a
 list of its occurrences that it reads only as a set. No step reads which
-bucket of its hash table a key took, and no result depends on which of its
-occurrences claimed it: that occurrence only holds the key's state. None of
+bucket of its hash table a key took, or how many buckets the call takes, and
+no result depends on which of its occurrences claimed it: that occurrence
+only holds the key's state. None of
 the planner's steps adds up
 floating-point values with atomics. One step hands out heavy slots with an
 atomic whose order shows: index dedup's heavy rows take their heavy slots and
@@ -2728,6 +2755,11 @@ its `node_keys`, its owner tables: its KJT, the chunks its forward puts, and
 its row map. Both take the lookup groups, and both run the device code of
 `rail_exchange` (`input_dist/rail.cuh`).
 
+One more hook chooses a path of the proxy's step:
+`hier_output_dist_scan_ctas(ctas)` makes each later proxy step of the
+process run its scan of the representatives (section 10.4) on `ctas` CTAs,
+or as its sizes choose (0).
+
 `test_hier_bucketize.py` plays every rank of one node with the first two
 hooks. Each rank's offsets are those its in channel writes (section 10.1),
 with garbage at the other entries, so a read of another entry shows. Among
@@ -2740,6 +2772,15 @@ each source node's records, against a plain reference of the order in which
 the rows cross the rail; each proxy's group runs of its keys at each owner
 equal to that owner's runs of its records (so the backward's puts land
 where the owner's lookup wrote); and with a group per feature, no row map.
+Its proxies meet counts of valid occurrences far below `remote_keys` (20
+times the largest remote part), equal to it, and of 0 in a call that fits
+(a node whose requesters ask only its own owners); 600 and 1,100 features on
+4 nodes (2,400 and 4,400 bucket features at a proxy, most of their blocks
+empty); and the scan of the representatives on 2, 3, 264 and 600 CTAs in
+calls of a few hundred occurrences a proxy (on 264 also at counts of
+`remote_keys` and of 0), and on 1, 2 and 600 CTAs in calls of 11,000 to
+21,000 (on 1 and 2 slices of several tiles; on 600 slices of about 20 to
+35 occurrences, also in the CTAs past a CTA's 512 threads).
 
 ## 19. Limitations
 
@@ -2789,11 +2830,12 @@ where the owner's lookup wrote); and with a group per feature, no row map.
   lengths. So its work grows with the features times `local_size +
   num_nodes`, with the square of the nodes times the lookup groups plus
   one, and with the nodes times the square of the lookup groups. The
-  proxy's node dedup also counts the keys of its `local_size × num_nodes ×
-  num_features` blocks on one CTA, in a blocked scan: as many as the node
-  layout's `row_shift` has entries, 16K at 32 nodes of 8 GPUs and 64
-  features, and 2M at 256 nodes and 1,000 features. The node layout
-  computes its row shifts on a grid when they are many (section 10.2).
+  proxy's node dedup reads its `local_size × num_nodes × num_features`
+  blocks, as many as the node layout's `row_shift` has entries: 16K at 32
+  nodes of 8 GPUs and 64 features, and 2M at 256 nodes and 1,000 features.
+  It does so on a grid, `O(local_size)` loads per bucket feature
+  (section 10.4), and the node layout computes its row shifts on a grid when
+  they are many (section 10.2).
 * **Views**: a lookup output is a view of `lookup_rows`, valid until the
   next out kernel, and `lookup_grad` is one, valid until the next lookup
   (sections 11.2 and 11.4).
@@ -2911,15 +2953,18 @@ Paths from `corelib/dynamicemb`.
       CUB calls in `cub.cu` (radix sorts and scans); `planner.cuh`: what the
       planner's kernels share (how they are launched, searches in sorted
       tables, the offsets of sorted runs, a CTA's scans, among them the
-      blocked one, `cta_scan_blocked`). The bucketize is in
-      `bucketize.cu` and the proxy in `proxy.cu` (with its node dedup's
-      hash table, `Identities`, which takes index dedup's chained insert
-      from `src/dedup_chain.cuh`, and the rounds of its chunks, cut by
-      counted rows, `Rounds`); the node layout, the push, the count
-      message and the rail layout as the hooks run them (`node_layout`,
-      `push_to_node_keys`, `count_message`, `rail_layout`), the owner's KJT
-      on one node (`one_node_owner`), the owner's tables (with its row map)
-      and the requester are in `planner.cu`;
+      blocked one, `cta_scan_blocked`, and the scans over a count only the
+      device knows, `slice_sums_kernel` and `slice_scan_kernel`). The
+      bucketize is in `bucketize.cu` and the proxy in `proxy.cu` (with its
+      node dedup's hash table, `Identities`, which takes index dedup's
+      chained insert from `src/dedup_chain.cuh`, the hook that sets the
+      CTAs of its scan of the representatives, `force_scan_ctas`, and the
+      rounds of its chunks, cut by counted rows, `Rounds`); the node
+      layout, the push, the count message and the rail layout as the hooks
+      run them (`node_layout`, `push_to_node_keys`, `count_message`,
+      `rail_layout`), the owner's KJT on one node (`one_node_owner`), the
+      owner's tables (with its row map) and the requester are in
+      `planner.cu`;
   * `output_dist/`, the output dist:
     * `output_dist.h`, `output_dist.cu`: the out channel (`OutChannel`),
       which launches the out kernels, and their trace (`Trace`).
