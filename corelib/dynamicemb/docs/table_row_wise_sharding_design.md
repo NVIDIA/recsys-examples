@@ -1177,10 +1177,13 @@ under, and would still miss §8.5's planner defect, which no forward test finds.
 
 ### 7.2 Memory is costed per group, not per table
 
-The runtime decides the HBM-or-host split for a **grouped module**:
+The runtime chooses the layout for a **grouped module**:
 `BatchedDynamicEmbeddingTablesV2._create_cache_storage` sums both the tables'
-bytes and their `local_hbm_for_values` and takes one decision for the sum. So a
-table whose budget exceeds its size lends the remainder to its groupmates.
+bytes and their `local_hbm_for_values`, and a group whose rows fit the summed
+budget is HBM_ONLY. There a table whose budget exceeds its size covers its
+groupmates. A group that does not fit splits each table on its own budget --
+table *i* keeps `min(total_i, budget_i)` in HBM, and a spare budget is not lent
+-- so in that case the grouped cost is the per-table sum.
 
 Costing each table alone and adding up gives `sum(min(total, budget))`, which is
 at most `min(sum total, sum budget)` -- never more. The error therefore has a
@@ -1192,14 +1195,15 @@ inequality never goes the other way.
 
 `get_group_value_bytes_by_tier` costs a set of tables, and `per_rank_storage`
 buckets a rank's tables before calling it. **A worked case**, two tables sharing
-a rank, one with twice the budget it needs and one with none:
+a rank: 4 GB of rows with a 20 GB budget, and 16 GB of rows with a 2 GB budget.
+Together they fit the pooled 22 GB:
 
 | | HBM | host |
 |---|---|---|
-| per table | 6.0 GB | 19.0 GB |
-| grouped (what the runtime does) | 11.0 GB | 14.0 GB |
+| per table | 6.0 GB | 14.0 GB |
+| grouped (what the runtime does) | 20.0 GB | 0 GB |
 
-Five gigabytes of HBM the old arithmetic did not reserve.
+Fourteen gigabytes of HBM the old arithmetic did not reserve.
 
 **The grouping used is ours, and is coarser than the real one.** One function,
 `fusion_key`, answers what two tables must agree on, and both the placer and

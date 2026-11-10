@@ -161,7 +161,7 @@ At plan time, `DynamicEmbeddingShardingPlanner` reads the table configs off the 
 |------|-----------|----------------|
 | 1 | `initializer_args` | **`complete_initializer_args`** returns a new `DynamicEmbInitializerArgs` when needed. For **`UNIFORM`** initialization only: if `lower` or `upper` is `None`, they are filled. With a TorchREC `embedding_config`, bounds are `±sqrt(1 / num_embeddings)`; without it, `0.0` and `1.0`. Other modes are returned unchanged. |
 | 2 | `bucket_capacity`, `max_capacity` | **`_sharded_table_bucket_layout(embedding_config, world_size, bucket_capacity)`** (internal) returns **`(num_buckets, effective_bucket_width)`** per rank. The planner overwrites **`bucket_capacity`** with the **effective** width (after `MAX_BUCKET_CAPACITY` / alignment rules). **`max_capacity`** is set to **`num_buckets * effective_bucket_width`**, i.e. the same value as **`get_sharded_table_capacity(embedding_config, world_size, bucket_capacity)`**. **`init_capacity`**: if unset, set to **`max_capacity`**; if set, align to **`bucket_capacity`**, then clamp to **`max_capacity`** if larger. **User input:** `bucket_capacity` on `DynamicEmbTableOptions` (multiple of **`BUCKET_ALIGNMENT` (16)** unless **`MAX_BUCKET_CAPACITY`** = `2**63 - 1`). **Sentinel:** layout is `(1, aligned_per_rank_rows)` — one bucket spanning the shard. **Otherwise:** `num_buckets = align_to_table_size(ceil(N/world), bucket_capacity) // bucket_capacity`. |
-| 3 | `local_hbm_for_values` | Overwritten to **`ceil(global_hbm_for_values / fanout)`** so each rank holding the table gets an equal byte budget from the user-provided **`global_hbm_for_values`** (set on `DynamicEmbTableOptions` before planning). **It is a budget for the group, not the table:** tables the runtime fuses pool both their sizes and their budgets and take one HBM-or-host decision for the sum, so a table whose budget exceeds its size lends the remainder to its groupmates rather than wasting it. The planner reserves memory the same way. |
+| 3 | `local_hbm_for_values` | Overwritten to **`ceil(global_hbm_for_values / fanout)`** so each rank holding the table gets an equal byte budget from the user-provided **`global_hbm_for_values`** (set on `DynamicEmbTableOptions` before planning). **It is the table's own budget, even when the runtime fuses it with others:** the fused group takes one layout decision on the sums of its sizes and budgets -- if every row fits the summed budget the whole group is HBM-only -- but when it does not fit, each table keeps `min(its size, its own budget)` in HBM and the rest of its rows go to the host tier; a spare budget is not lent to groupmates. The planner reserves memory the same way. A budget that resolves to zero also turns `caching` off for the table, with a warning, before grouping and cost see it. |
 
 **The divisor (`fanout`) is per table.** It is how many pieces the table's rows are split into: `world_size` for a `ROW_WISE` table, which sits on every rank, and `local_world_size` for a `TABLE_ROW_WISE` one, which sits on a single node. The same number decides the shard metadata, so capacity and placement cannot disagree. Steps 2 and 3 both use it.
 
@@ -220,6 +220,8 @@ Inherits from TorchREC's `EmbeddingCollectionSharder` and is used in exactly the
     #How to import
     from dynamicemb.shard import DynamicEmbeddingCollectionSharder
     ```
+
+With `use_index_dedup=True` and an LFU score strategy or an admission strategy, each rank sends its deduplicated keys together with how often each one occurs (as the KJT weights), so that a table counts every occurrence.
 
 ## DynamicEmbCheckMode
 
@@ -878,6 +880,7 @@ Fields declared first (through `device_id`) are **planner/runtime-heavy**: `Dyna
                 set **`caching=True`** will create a GPU table and a host table, and make GPU table serves as a cache;
                 set **`caching=False`** will create a hybrid table which use GPU and host memory in a concatenated way to store value.
                 All keys and other meta data are always stored on GPU for both cases.
+            A table whose resolved `local_hbm_for_values` is zero has caching turned off, with a warning, at plan/construction time: a cache is an HBM tier, and without a budget it would be a single bucket whose overflow cannot absorb a batch's admitted keys.
         init_capacity : Optional[int], optional
             The initial capacity of the table. If not set, it defaults to max_capacity after sharding.
             ``BatchedDynamicEmbeddingTablesV2`` also sets ``init_capacity`` to ``max_capacity`` when it is still ``None``.

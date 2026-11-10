@@ -25,6 +25,7 @@ from dynamicemb.key_value_table import (
     Cache,
     DynamicEmbCache,
     DynamicEmbStorage,
+    DynamicEmbTableState,
     Storage,
     _append_evicted,
     _find_keys,
@@ -211,6 +212,34 @@ class PrefetchState:
     unique_scores: Optional[torch.Tensor] = None
     num_prefetched_keys: int = 0
     outstanding_keys_ref: Optional[torch.Tensor] = None
+    # The key_map_generation (rehash count) of the table state the slots were found in: a later
+    # prefetch may expand it before this batch's backward runs.
+    key_map_generation: int = 0
+
+
+def _slots_after_rehash(
+    state: DynamicEmbTableState,
+    unique_keys: torch.Tensor,
+    unique_table_ids: torch.Tensor,
+    slot_indices: torch.Tensor,
+) -> torch.Tensor:
+    """The slots of a batch's keys in ``state`` as it is now, for a batch
+    whose prefetch found them before a rehash moved them: the keys are looked
+    up again, read only (their ref counts kept them in the table). A key the
+    prefetch did not admit stays without a slot. Value rows do not move: a
+    storage keeps each key's row through a rehash, and a cache does not
+    rehash."""
+    # Only a table that stores a row per key keeps its value rows through a
+    # rehash (``use_rows_``). Without it the row is the slot and the value moves
+    # with the key, so ``value_row_indices`` would go stale too: not handled here.
+    assert state.key_index_map.use_rows_, (
+        "a rehash since the prefetch is only handled for a table that stores a "
+        "value row per key (DynamicEmbStorage); a cache does not rehash"
+    )
+    slots = _find_keys(
+        state, unique_keys, unique_table_ids, const_lookup=True, return_slots=True
+    )[-1]
+    return torch.where(slot_indices >= 0, slots, slot_indices)
 
 
 def _is_hbm_storage(storage: Storage) -> bool:
@@ -871,6 +900,7 @@ def dynamicemb_prefetch(
         slot_indices = None
         non_admitted_positions = None
         value_row_indices = None
+        key_map_generation = 0
         if caching:
             storage_mode = StorageMode.CACHE
         elif _is_hbm_storage(storage):
@@ -934,6 +964,7 @@ def dynamicemb_prefetch(
                     admitter,
                     key_scores=unique_scores,
                 )
+                key_map_generation = storage._state.key_map_generation
 
         return PrefetchState(
             unique_keys=unique_keys,
@@ -949,6 +980,7 @@ def dynamicemb_prefetch(
             num_prefetched_keys=num_prefetched_keys,
             outstanding_keys_ref=outstanding_keys_ref,
             value_row_indices=value_row_indices,
+            key_map_generation=key_map_generation,
         )
 
 
@@ -1309,6 +1341,7 @@ class DynamicEmbeddingFunction(torch.autograd.Function):
             # Same split as the forward: the fused optimizer writes into the
             # value buffer (rows), the ref counter is indexed by hash slot.
             ctx.update_value_rows = prefetch_state.value_row_indices
+            ctx.key_map_generation = prefetch_state.key_map_generation
             ctx.storage_mode = prefetch_state.storage_mode
             ctx.optimizer = optimizer
             ctx.layout = layout
@@ -1380,6 +1413,14 @@ class DynamicEmbeddingFunction(torch.autograd.Function):
                         if ctx.storage_mode == StorageMode.CACHE
                         else storage._state
                     )
+                    # A later batch's prefetch may have rehashed the table
+                    # since this one's prefetch (prefetch pipelines, several
+                    # forwards before their backwards).
+                    if ctx.key_map_generation != state.key_map_generation:
+                        ctx.slot_indices = _slots_after_rehash(
+                            state, ctx.unique_keys, unique_table_ids, ctx.slot_indices
+                        )
+                        ctx.key_map_generation = state.key_map_generation
                     with torch.cuda.nvtx.range("op:optimizer_update_fused"):
                         optimizer.fused_update_for_flat_table(
                             unique_grads.to(ctx.emb_dtype),
