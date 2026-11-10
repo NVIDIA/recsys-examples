@@ -18,6 +18,7 @@ import os
 import random
 from typing import List
 
+import hier_switch
 import pytest
 import torch
 import torch.distributed as dist
@@ -163,6 +164,14 @@ def backend_session():
     dist.destroy_process_group()
 
 
+@pytest.fixture(autouse=True)
+def release_hier_ops():
+    """At the end of each test, on every rank, passed or not: quiesces the ops
+    of the models the test gave the hierarchical dist (hier_switch.py)."""
+    yield
+    hier_switch.release()
+
+
 @pytest.mark.parametrize(
     "table_num, num_embeddings",
     [
@@ -227,6 +236,17 @@ def test_twin_module(
     # still occur; this only sets the upper end.
     multi_hot_sizes = [max_bag_size] * table_num
 
+    # Pooled collections ignore output_dist (hier_switch.py). The output is
+    # fp32, ConstructTwinModule's default.
+    output_dist_options = (
+        {}
+        if is_pooled
+        else hier_switch.options(
+            world_size=world_size,
+            index_dedup=use_index_dedup,
+            row_bytes=4 * dim,
+        )
+    )
     construct = ConstructTwinModule(
         table_num,
         dims,
@@ -239,10 +259,13 @@ def test_twin_module(
         is_weighted=is_weighted,
         rank=local_rank,
         world_size=world_size,
+        dynamicemb_options_kwargs=output_dist_options,
+        global_rank=dist.get_rank(),
     )
     construct.init_twin_embedding_model()
     dynamicemb_model = construct.dynamicemb_model
     torchrec_model = construct.torchrec_model
+    hier_switch.track(dynamicemb_model, output_dist_options)
 
     for i in range(num_iteration):
         if i % 2 == 0:
@@ -254,6 +277,10 @@ def test_twin_module(
                 weighted=is_weighted,
             )
         ret = dynamicemb_model(sparse_feature)
+        if i == 0:
+            hier_switch.check_path(dynamicemb_model, output_dist_options)
+        # The reference reads the same KJT next, and splits it by its totals.
+        hier_switch.check_totals(sparse_feature, output_dist_options)
         ret_compare = torchrec_model(sparse_feature)
 
         embedding_lookup_backward(ret, is_pooled)

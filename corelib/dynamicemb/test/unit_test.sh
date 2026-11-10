@@ -46,21 +46,43 @@ LOAD_DUMP_TEST_FILES=(
     "test/unit_tests/test_table_row_wise.sh"
 )
 
+# Files of the groups above that build sharded EmbeddingCollections, run
+# again on the hierarchical output dist with their configurations unchanged
+# (test/unit_tests/hier_switch.py; docs/hier_output_dist.md, section 18).
+FWD_BWD_HIER_FILES=(
+    "test/unit_tests/test_sequence_embedding.sh"
+    "test/unit_tests/test_twin_module.sh"
+    "test/unit_tests/erase_async/test_erase_async.sh"
+    "test/unit_tests/per_key_score/test_per_key_score.sh"
+    "test/unit_tests/test_lfu_scores.sh"
+)
+
+LOAD_DUMP_HIER_FILES=(
+    "test/unit_tests/admission/test_embedding_admission.sh"
+    "test/unit_tests/incremental_dump/test_incremental_dump.sh"
+    # Not test_embedding_dump_load.sh: each of its launches shards without
+    # index dedup, which the dist does not take, so none would run on it.
+)
+
 case "$1" in
     fwd_bwd)
         TEST_FILES=("${FWD_BWD_TEST_FILES[@]}")
+        HIER_FILES=("${FWD_BWD_HIER_FILES[@]}")
         ;;
     load_dump)
         TEST_FILES=("${LOAD_DUMP_TEST_FILES[@]}")
+        HIER_FILES=("${LOAD_DUMP_HIER_FILES[@]}")
         ;;
     *)
         TEST_FILES=("${FWD_BWD_TEST_FILES[@]}" "${LOAD_DUMP_TEST_FILES[@]}")
+        HIER_FILES=("${FWD_BWD_HIER_FILES[@]}" "${LOAD_DUMP_HIER_FILES[@]}")
         ;;
 esac
 
-# Run each test file using the appropriate command
-for TEST_FILE in "${TEST_FILES[@]}"; do
-    echo "Running tests in $TEST_FILE"
+# Run one test file of a group using the appropriate command
+run_file() {
+    local group=$1
+    local TEST_FILE=$2
     if [[ "$TEST_FILE" == *.py ]]; then
         # Run Python test files with pytest
         pytest -svv "$TEST_FILE"
@@ -76,7 +98,7 @@ for TEST_FILE in "${TEST_FILES[@]}"; do
         # argument they did not expect -- test_hybrid_storage_export.sh
         # forwards "$@" to pytest, which would read "fwd_bwd" as a path to
         # collect and fail.
-        DYNAMICEMB_TEST_GROUP="$1" bash "$TEST_FILE"
+        DYNAMICEMB_TEST_GROUP="$group" bash "$TEST_FILE"
         # Check if the test failed
         if [ $? -ne 0 ]; then
             echo "ERROR: Test failed in $TEST_FILE"
@@ -85,4 +107,26 @@ for TEST_FILE in "${TEST_FILES[@]}"; do
     else
         echo "Unknown test file type: $TEST_FILE"
     fi
+}
+
+# Run each test file
+for TEST_FILE in "${TEST_FILES[@]}"; do
+    echo "Running tests in $TEST_FILE"
+    run_file "$1" "$TEST_FILE"
 done
+
+# Then the hierarchical runs, unless the build has no dist: there, each model
+# given output_dist="hierarchical" raises ImportError. The probe loads torch
+# first, for libc10 (dynamicemb/__init__.py). A probe that fails does not skip
+# the runs.
+if [ "$(python -c 'import torch, dynamicemb_extensions as ext; print(hasattr(ext, "HierOutputDist"))')" = False ]; then
+    echo "this build has no hierarchical dist: the runs on it are skipped"
+else
+    for TEST_FILE in "${HIER_FILES[@]}"; do
+        echo "Running tests in $TEST_FILE on the hierarchical output dist"
+        (
+            export DYNAMICEMB_TEST_OUTPUT_DIST=hierarchical PYHKV_DEBUG_STRICT=1
+            run_file "$1" "$TEST_FILE"
+        ) || exit 1
+    done
+fi

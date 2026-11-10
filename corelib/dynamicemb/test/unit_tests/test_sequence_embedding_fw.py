@@ -19,6 +19,7 @@ import random
 import sys
 from typing import List
 
+import hier_switch
 import torch
 import torch.distributed as dist
 import torchrec
@@ -85,7 +86,7 @@ def get_comm_precission(precision_str):
         raise ValueError("unknown comm precision type")
 
 
-def get_planner(args, device, eb_configs):
+def get_planner(args, device, eb_configs, output_dist_options):
     dict_const = {}
     for i in range(args.num_embedding_table):
         if (
@@ -116,6 +117,7 @@ def get_planner(args, device, eb_configs):
                         mode=DynamicEmbInitializerMode.DEBUG
                     ),
                     safe_check_mode=DynamicEmbCheckMode.WARNING,
+                    **output_dist_options,
                 ),
             )
 
@@ -230,7 +232,20 @@ def run(args):
         else:
             raise ValueError("unknown optimizer type")
 
-    planner = get_planner(args, device, eb_configs)
+    # The row-wise tables share one sharding (hier_switch.py), and the output
+    # is fp32 (fused_params below).
+    row_wise_tables = [
+        i
+        for i in range(args.num_embedding_table)
+        if i not in (args.data_parallel_embeddings or [])
+    ]
+    output_dist_options = hier_switch.options(
+        world_size=world_size,
+        index_dedup=args.use_index_dedup,
+        row_bytes=4 * args.embedding_dim,
+        all_dynamicemb=all(i < args.dynamicemb_num for i in row_wise_tables),
+    )
+    planner = get_planner(args, device, eb_configs, output_dist_options)
 
     qcomm_forward_precision = get_comm_precission(args.fwd_a2a_precision)
     qcomm_backward_precision = get_comm_precission(args.fwd_a2a_precision)
@@ -276,6 +291,7 @@ def run(args):
         plan=plan,
         data_parallel_wrapper=data_parallel_wrapper,
     )
+    hier_switch.track(model, output_dist_options)
 
     if local_rank == 0 and args.print_sharding_plan:
         for collectionkey, plans in model._plan.plan.items():
@@ -318,6 +334,8 @@ def run(args):
                     local_batch_size=local_batch_size,
                 )
         ret = model(sparse_feature)  # => this is awaitable
+        if i == 0:
+            hier_switch.check_path(model, output_dist_options)
 
         feature_names = []
         jagged_tensors = []
@@ -339,6 +357,7 @@ def run(args):
 
     # dict_ = model.state_dict()
     # model.load_state_dict(dict_)
+    hier_switch.release()
     dist.barrier()
     dist.destroy_process_group()
 

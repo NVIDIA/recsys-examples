@@ -20,6 +20,7 @@ from itertools import product
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import click
+import hier_switch
 import torch
 import torch.distributed as dist
 import torch.nn as nn
@@ -284,11 +285,19 @@ class TestModel(nn.Module):
     ):
         super().__init__()
         self.embedding_modules = nn.ModuleList(embedding_modules)
+        # The row-wise tables of each collection and the output_dist fields
+        # apply_dmp gave them (hier_switch.py), until the first training
+        # forward checks the path they ask for.
+        self.output_dist_to_check: List[Tuple[List[str], Dict[str, Any]]] = []
 
     def forward(self, kjt: KeyedJaggedTensor) -> torch.Tensor:
         embeddings_dict = [
             embedding_module(kjt).wait() for embedding_module in self.embedding_modules
         ]
+        if self.training and self.output_dist_to_check:
+            for tables, options in self.output_dist_to_check:
+                hier_switch.check_path(self, options, tables=tables)
+            self.output_dist_to_check = []
         embeddings = []
         for embedding_dict in embeddings_dict:
             for embedding in embedding_dict.values():
@@ -314,11 +323,40 @@ def apply_dmp(
     fields that replace the ones every table otherwise shares, for a collection
     whose tables are not configured alike."""
     eb_configs: List[EmbeddingConfig] = []
+    collection_configs: List[List[EmbeddingConfig]] = []
     for _, m in model.named_modules():
         if type(m) in TORCHREC_TYPES:
             eb_configs.extend(m.embedding_configs())
+            collection_configs.append(m.embedding_configs())
 
     world_size = dist.get_world_size()
+    # The row-wise tables of a collection are one sharding, so they get the
+    # same output_dist fields (hier_switch.py), from the options below and
+    # each table's overrides. The output is fp32 (fused_params below).
+    overrides = table_option_overrides or {}
+    collection_output_dist: List[Tuple[List[str], Dict[str, Any]]] = []
+    for configs in collection_configs:
+        row_wise = [c for c in configs if c.name not in data_parallel_table_names]
+        if not row_wise:
+            continue
+        table_overrides = [overrides.get(c.name, {}) for c in row_wise]
+        fields = hier_switch.options(
+            world_size=world_size,
+            index_dedup=use_index_dedup,
+            row_bytes=4 * row_wise[0].embedding_dim,
+            dist_types=[
+                table_override.get("dist_type", dist_type)
+                for table_override in table_overrides
+            ],
+            score_strategies=[
+                table_override.get("score_strategy", score_strategy)
+                for table_override in table_overrides
+            ],
+        )
+        collection_output_dist.append(([c.name for c in row_wise], fields))
+    table_output_dist = {
+        name: fields for names, fields in collection_output_dist for name in names
+    }
     dynamicemb_options_dict: Dict[str, DynamicEmbTableOptions] = {}
     for eb_config in eb_configs:
         emb_opt_type = (
@@ -347,6 +385,7 @@ def apply_dmp(
             bucket_capacity=MAX_BUCKET_CAPACITY,  # keep same to the bucket capacity from get_table_value_bytes
             caching=caching,
             admit_strategy=admit_strategy,
+            **table_output_dist.get(eb_config.name, {}),
         )
         option_kwargs.update((table_option_overrides or {}).get(eb_config.name, {}))
         dynamicemb_options_dict[eb_config.name] = DynamicEmbTableOptions(
@@ -377,6 +416,10 @@ def apply_dmp(
         sharders=[sharder],
         plan=plan,
     )
+    model.output_dist_to_check = [
+        (names, fields) for names, fields in collection_output_dist if fields
+    ]
+    hier_switch.track(dmp, *(fields for _, fields in collection_output_dist))
     return dmp
 
 
@@ -586,7 +629,7 @@ def test_model_load_dump(
 ):
     global TABLE_SCOPE
     TABLE_SCOPE = table_scope
-    rank = int(os.environ["LOCAL_RANK"])
+    rank = dist.get_rank()  # the owner rank of owns_key, across nodes too
     world_size = int(os.environ["WORLD_SIZE"])
 
     num_embeddings = [int(v) for v in num_embeddings.split(",")]
@@ -771,6 +814,8 @@ def test_model_load_dump(
                     asserted_loaded_dist_type = True
                 ref_ret = ref_model(kjt)
                 assert torch.allclose(ret, ref_ret)
+
+    hier_switch.release()
 
 
 if __name__ == "__main__":

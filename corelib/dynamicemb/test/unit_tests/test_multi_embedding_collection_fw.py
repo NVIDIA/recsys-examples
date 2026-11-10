@@ -19,6 +19,7 @@ import random
 import sys
 from typing import List
 
+import hier_switch
 import torch
 import torch.distributed as dist
 import torchrec
@@ -85,7 +86,7 @@ def get_comm_precission(precision_str):
         raise ValueError("unknown comm precision type")
 
 
-def get_planner(args, device, eb_configs):
+def get_planner(args, device, eb_configs, table_output_dist_options):
     dict_const = {}
     for i in range(args.num_embedding_table):
         if (
@@ -116,6 +117,7 @@ def get_planner(args, device, eb_configs):
                         mode=DynamicEmbInitializerMode.DEBUG
                     ),
                     safe_check_mode=DynamicEmbCheckMode.WARNING,
+                    **table_output_dist_options[i],
                 ),
             )
         dict_const[table_idx_to_name(i)] = const
@@ -255,7 +257,30 @@ def run(args):
         else:
             raise ValueError("unknown optimizer type")
 
-    planner = get_planner(args, device, eb_configs)
+    # Each collection is a sharding of its own (hier_switch.py), of half the
+    # tables (MyModel), and the output is fp32 (fused_params below).
+    mid = args.num_embedding_table // 2
+    collection_tables = [range(mid), range(mid, args.num_embedding_table)]
+    collection_output_dist_options = [
+        hier_switch.options(
+            world_size=world_size,
+            index_dedup=args.use_index_dedup,
+            row_bytes=4 * args.embedding_dim,
+            all_dynamicemb=all(
+                i < args.num_dynamicemb
+                for i in tables
+                if i not in (args.data_parallel_embeddings or [])
+            ),
+        )
+        for tables in collection_tables
+    ]
+    # Each table takes the options of its collection.
+    table_output_dist_options = [
+        options
+        for tables, options in zip(collection_tables, collection_output_dist_options)
+        for _ in tables
+    ]
+    planner = get_planner(args, device, eb_configs, table_output_dist_options)
 
     qcomm_forward_precision = get_comm_precission(args.fwd_a2a_precision)
     qcomm_backward_precision = get_comm_precission(args.fwd_a2a_precision)
@@ -306,6 +331,7 @@ def run(args):
         plan=plan,
         data_parallel_wrapper=data_parallel_wrapper,
     )
+    hier_switch.track(model, *collection_output_dist_options)
 
     if local_rank == 0 and args.print_sharding_plan:
         for collectionkey, plans in model._plan.plan.items():
@@ -333,6 +359,13 @@ def run(args):
             offset=mid,
         )
         rets = model(feature1, feature2)  # => this is awaitable
+        if i == 0:
+            for tables, options in zip(
+                collection_tables, collection_output_dist_options
+            ):
+                hier_switch.check_path(
+                    model, options, tables=[table_idx_to_name(t) for t in tables]
+                )
         ret1, ret2 = rets[0], rets[1]
         feature1_names, feature2_names = [], []
         jagged_tensors1, jagged_tensors2 = [], []
@@ -361,6 +394,7 @@ def run(args):
             jagged_tensors2, feature2_names, dyn_emb_features, dims2[0]
         )
         print(f"DynamicEmb iteration {i+1} Passed")
+    hier_switch.release()
     dist.barrier()
     dist.destroy_process_group()
 

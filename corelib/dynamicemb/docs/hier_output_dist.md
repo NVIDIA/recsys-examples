@@ -2949,6 +2949,57 @@ under each pipeline. Run it from `examples/hstu`:
 PYTHONPATH=${PYTHONPATH}:$(realpath ../) torchrun --nproc_per_node 8 -m pytest -svv test/test_hierarchical_dist.py
 ```
 
+**The existing tests on the dist.** After its usual runs, `test/unit_test.sh`
+runs seven files of DynamicEmb's existing tests again on the hierarchical
+dist, with their configurations unchanged: `test_sequence_embedding.sh`,
+`test_twin_module.sh`, `erase_async/test_erase_async.sh`,
+`per_key_score/test_per_key_score.sh` and `test_lfu_scores.sh` in the
+`fwd_bwd` group, and `admission/test_embedding_admission.sh` and
+`incremental_dump/test_incremental_dump.sh` in the `load_dump` group. A build
+without the op skips them. To run one of them on the dist, from
+`corelib/dynamicemb`:
+
+```
+DYNAMICEMB_TEST_OUTPUT_DIST=hierarchical PYHKV_DEBUG_STRICT=1 bash test/unit_tests/test_lfu_scores.sh
+```
+
+The tests read the switch through `test/unit_tests/hier_switch.py`, where
+they make the options of the tables of a sharded `EmbeddingCollection`.
+Unset, empty or `torchrec`, it changes nothing. Set to `hierarchical`, it
+gives the tables of each collection `output_dist_capacity`
+(`DYNAMICEMB_TEST_OUTPUT_DIST_CAPACITY`, else `1 << 17`, twice the most keys
+a call of these tests has). It also gives them `output_dist="hierarchical"`
+when the dist serves the collection's row-wise sharding (more than one rank,
+DynamicEmb tables alone, index dedup, rows of a multiple of 16 bytes, no
+`"continuous"` table and no score per key), and `"auto"` otherwise, which
+must take TorchRec's dists (section 6). For a pass to mean something:
+
+* after the model's first training forward, `check_path` asserts that each
+  row-wise sharding of DynamicEmb tables took the dist exactly when it was
+  given `"hierarchical"`. So a fallback, which only warns, fails the test;
+* `PYHKV_DEBUG_STRICT=1` makes the forward tests' `Debugger` (`debug.py`)
+  raise on a mismatch, which it otherwise prints, and check the input's
+  totals per feature. The dist writes these totals into the caller's KJT
+  (section 7.4), and both the outputs and the reference are split by them.
+  `test_twin_module.py` checks them too, because its reference model reads
+  the same KJT;
+* at the end of each test, `release()` quiesces the ops of the models given
+  `"hierarchical"`, in the same order on every rank (section 4.6).
+
+On one node, 64 runs or cases take the dist: in `test_sequence_embedding.sh`,
+the run of two collections and the run with `--dynamicemb_num=4`; at 8 GPUs,
+the 12 sequence cases with index dedup of `test_twin_module.py`, the 15
+launches with index dedup of `test_lfu_scores.sh` and the 34 cases of
+`test_embedding_admission.py`; and the model of `test_erase_distributed.py`
+with scores per table and index dedup. The others take TorchRec's dists by
+design: one rank; plain TorchRec tables in the sharding (the default
+`--dynamicemb_num=2` of `test_sequence_embedding_fw.py`); rows of 516 bytes
+(`--embedding_dim 129`); a score per key (`per_key_score/`, and six models of
+`test_erase_distributed.py`); and sharders without index dedup (the other
+cases of the twin, LFU and erase tests, the incremental-dump tests, and all of
+`test_embedding_dump_load.sh`, which `test/unit_test.sh` does not run again
+for that reason). Pooled collections ignore `output_dist`.
+
 The node's part of a call has hooks of its own in `testing.cu`:
 
 * `hier_output_dist_node_layout(node_offsets, num_nodes, local_size, node,
