@@ -76,6 +76,7 @@ tree before the removal must be on ALLOWED_NEW_HITS, with the reason, and a line
 claims to remove (EXPECTED_GONE, appended to by that change) must be gone.
 """
 import ast
+import collections
 import functools
 import io
 import json
@@ -1232,12 +1233,14 @@ TARGETS: List[Target] = (
         "HybridStorage.request_size_snapshot",
         "SizeSnapshots.*",
     )
-    + _legacy(
-        KVT,
-        "DynamicEmbCache.lookup",
-        "DynamicEmbCache.insert_and_evict",
-        "expand_if_need_impl",
-    )
+    # The lookup of the cache and the expansion decision read nothing any more (the first
+    # hardware run of the merged tree showed both below their baseline, at zero): they exist on
+    # main and are enforced like the functions that are new, with no baseline to excuse.
+    + [
+        Target(KVT, "DynamicEmbCache.lookup", True, True),
+        Target(KVT, "expand_if_need_impl", True, True),
+    ]
+    + _legacy(KVT, "DynamicEmbCache.insert_and_evict")
     # the hash table: the async_count branch of the two evicting inserts
     + _legacy(
         SHT,
@@ -1393,13 +1396,6 @@ FINAL = os.environ.get("SYNC_LINT_FINAL") == "1"
 # its baseline, so that the baseline goes down with the change that removed the violation; the
 # entry of a target that is flipped to `enforce` goes away.
 LEGACY_BASELINE: Dict[str, Dict[str, int]] = {
-    "dynamicemb/key_value_table.py::DynamicEmbCache.lookup": {
-        "sync-call": 1,
-    },
-    "dynamicemb/key_value_table.py::expand_if_need_impl": {
-        "blocking-copy": 1,
-        "pin-memory": 1,
-    },
     "dynamicemb/scored_hashtable.py::LinearBucketTable.insert_and_evict": {
         "sync-call": 2,
     },
@@ -2642,6 +2638,173 @@ EXPECTED_GONE: List[Tuple[str, str, str, str]] = [
         "int(self.overflow_output_offsets_[table_id].item())",
         "E1",
     ),
+    # The first phase of the series (the commits of the pull request) removed these lines, and
+    # SYNC_LINT_FINAL=1 found them unclaimed: each is claimed by the commit that made the line
+    # go (git log -S, in the order of the series).
+    # the unique arrays keep the length of the input: no unique count is copied to the host
+    # (the pinned-copy helpers, the stream wait behind them, the table offsets read back)
+    (
+        "dynamicemb/batched_dynamicemb_function.py",
+        "cpu",
+        "return tensor.detach().cpu()",
+        "685bbfd5",
+    ),
+    (
+        "dynamicemb/batched_dynamicemb_function.py",
+        "item",
+        "return _copy_cuda_tensor_to_pinned_cpu(tensor.reshape(1))[0].item()",
+        "685bbfd5",
+    ),
+    (
+        "dynamicemb/batched_dynamicemb_function.py",
+        "pinned_copy_helper",
+        "return _copy_cuda_tensor_to_pinned_cpu(tensor.reshape(1))[0].item()",
+        "685bbfd5",
+    ),
+    (
+        "dynamicemb/batched_dynamicemb_function.py",
+        "item",
+        "total_unique = table_offsets_cpu[num_tables].item()",
+        "685bbfd5",
+    ),
+    (
+        "dynamicemb/batched_dynamicemb_function.py",
+        "pin_memory",
+        "pin_memory=True,",
+        "685bbfd5",
+    ),
+    (
+        "dynamicemb/batched_dynamicemb_function.py",
+        "pinned_copy_helper",
+        "def _bool_item(tensor: torch.Tensor) -> bool:",
+        "685bbfd5",
+    ),
+    (
+        "dynamicemb/batched_dynamicemb_function.py",
+        "pinned_copy_helper",
+        "def _copy_cuda_tensor_to_pinned_cpu(tensor: torch.Tensor) -> torch.Tensor:",
+        "685bbfd5",
+    ),
+    (
+        "dynamicemb/batched_dynamicemb_function.py",
+        "pinned_copy_helper",
+        "def _scalar_item(tensor: torch.Tensor):",
+        "685bbfd5",
+    ),
+    (
+        "dynamicemb/batched_dynamicemb_function.py",
+        "pinned_copy_helper",
+        "return bool(_scalar_item(tensor))",
+        "685bbfd5",
+    ),
+    (
+        "dynamicemb/batched_dynamicemb_function.py",
+        "pinned_copy_helper",
+        "table_offsets_cpu = _copy_cuda_tensor_to_pinned_cpu(table_offsets)",
+        "685bbfd5",
+    ),
+    (
+        "dynamicemb/batched_dynamicemb_function.py",
+        "sync_call",
+        "torch.cuda.current_stream(tensor.device).synchronize()",
+        "685bbfd5",
+    ),
+    # the cache, HBM-direct and generic lookups are the masked bodies: no admitted count, no
+    # compaction of the hits
+    (
+        "dynamicemb/batched_dynamicemb_function.py",
+        "any_all_in_cond",
+        "if inserted_mask.any():",
+        "ba6f90df",
+    ),
+    (
+        "dynamicemb/batched_dynamicemb_function.py",
+        "flagged_compact",
+        "num_hit, _, (hit_slots, hit_tids) = flagged_compact(",
+        "ba6f90df",
+    ),
+    # growth, the outstanding keys and the score check are decided from late reads
+    (
+        "dynamicemb/batched_dynamicemb_function.py",
+        "pinned_copy_helper",
+        "outstanding_keys = _scalar_item(outstanding_keys_ref)",
+        "e76b7063",
+    ),
+    (
+        "dynamicemb/batched_dynamicemb_tables.py",
+        "any_all_in_cond",
+        "if modes == {DynamicEmbCheckMode.IGNORE} or not bool((scores < 0).any()):",
+        "e76b7063",
+    ),
+    # (the docstring that named the blocking confirmation was reworded with the decision)
+    (
+        "dynamicemb/key_value_table.py",
+        "blocking_copy",
+        ":func:`collect_table_sizes_for_state` with ``non_blocking=False``.",
+        "e76b7063",
+    ),
+    # the masked storage lookups of both tiers: no `if found.any()`, no torch.equal assert
+    (
+        "dynamicemb/key_value_table.py",
+        "any_all_in_cond",
+        "if founds_hbm.any():",
+        "1088d815",
+    ),
+    (
+        "dynamicemb/key_value_table.py",
+        "any_all_in_cond",
+        "if founds_host.any():",
+        "1088d815",
+    ),
+    (
+        "dynamicemb/key_value_table.py",
+        "any_all_in_cond",
+        "if host_found_mask.any():",
+        "1088d815",
+    ),
+    (
+        "dynamicemb/key_value_table.py",
+        "equal_allclose",
+        "assert torch.equal(",
+        "1088d815",
+    ),
+    # count-free find and load, device cache metrics
+    (
+        "dynamicemb/key_value_table.py",
+        "item",
+        "n = int(num_evicted.item())",
+        "119d8e55",
+    ),
+    (
+        "dynamicemb/key_value_table.py",
+        "item",
+        "self._cache_metrics[1] = founds.sum().item()",
+        "119d8e55",
+    ),
+    # a pop of retained keys reads the sizes of its chunks once (the baseline had the line
+    # twice, the tree has it once: see claims_still_present)
+    (
+        "dynamicemb/incremental_dump.py",
+        "item",
+        "sizes = [int(s.item()) for s in size_list]",
+        "99b014eb",
+    ),
+    # black joined the lines of the second estimate (the baseline had `num_tables, dtype=...`
+    # twice; the joined line is on ALLOWED_NEW_HITS)
+    (
+        "dynamicemb/key_value_table.py",
+        "pin_memory",
+        "num_tables, dtype=torch.int64, pin_memory=True",
+        "e88872be",
+    ),
+    # the DYNAMICEMB_DEBUG check of segmented_range in the unique op is a device assert, no
+    # longer a copy of the ranges to the host
+    (
+        "src/unique_op.cu",
+        "cpu_item",
+        "at::Tensor sr_cpu = segmented_range.to(at::kCPU);",
+        "a02eee5b",
+    ),
 ]
 
 
@@ -2659,10 +2822,33 @@ def stale_claims(baseline_hits, claims) -> list:
     return [c for c in claims if not any(_claim_matches(c, k) for k in keys)]
 
 
-def claims_still_present(current_hits, claims) -> list:
-    """The claims whose line is still in the tree."""
-    keys = {sync_lint.norm(h) for h in current_hits}
-    return [c for c in claims if any(_claim_matches(c, k) for k in keys)]
+def claims_still_present(current_hits, claims, baseline_hits=None) -> list:
+    """The claims whose line is still in the tree.
+
+    One exception, given ``baseline_hits``: a claim that names a single line (a text that
+    is the same for every copy), which the baseline had more times than the tree has it now,
+    was a claim of the removal of some of its copies; the ones that are left are the tree's own
+    and do not make the claim false. A claim that matches several different lines of the
+    baseline stays strict: a prefix that names lines the change keeps is a claim that does
+    not say what it removes.
+    """
+    current = collections.Counter(sync_lint.norm(h) for h in current_hits)
+    baseline = collections.Counter(sync_lint.norm(h) for h in baseline_hits or ())
+    present = []
+    for claim in claims:
+        here = [k for k in current if _claim_matches(claim, k)]
+        if not here:
+            continue
+        was = [k for k in baseline if _claim_matches(claim, k)]
+        if (
+            len(here) == 1
+            and len(was) == 1
+            and here[0] == was[0]
+            and current[here[0]] < baseline[was[0]]
+        ):
+            continue
+        present.append(claim)
+    return present
 
 
 def unclaimed_removals(gone, claims) -> list:
@@ -2691,7 +2877,7 @@ def test_the_lines_that_a_change_claims_to_remove_are_gone():
         "EXPECTED_GONE names no line of lint_baseline.json (a typo, or a line that is not in "
         "the baseline): %s" % stale
     )
-    present = claims_still_present(_current_hits(), EXPECTED_GONE)
+    present = claims_still_present(_current_hits(), EXPECTED_GONE, _baseline_hits())
     assert not present, (
         "these lines are claimed to be removed (EXPECTED_GONE) and are still in the tree:\n%s"
         % "\n".join(
@@ -2764,6 +2950,40 @@ def test_the_removal_checks_tell_a_removed_line_from_one_that_is_still_there():
     ):
         assert stale_claims(baseline, [wrong]) == [wrong]
         assert claims_still_present(now, [wrong]) == []
+
+
+def test_a_claim_of_one_of_two_identical_lines_is_not_made_false_by_the_other():
+    """The baseline had `n = x.item()` twice and a change removed one: the line is still in the
+    tree, once, and the claim of the change is true. The rule is for a claim that names a single
+    line; one that is a prefix of several lines of the baseline keeps the strict rule.
+    """
+    twice = [
+        _hit("dynamicemb/a.py", "item", "n = x.item()"),
+        _hit("dynamicemb/a.py", "item", "n = x.item()"),
+        _hit("dynamicemb/a.py", "cpu", "y = x.cpu()"),
+        _hit("dynamicemb/a.py", "cpu", "y = x.cpu(); z = 1"),
+    ]
+    claim = ("dynamicemb/a.py", "item", "n = x.item()", "C09")
+    once = twice[1:]
+    gone, _ = sync_lint.diff_hits(twice, once)
+    # the second copy is gone, and the claim covers it
+    assert [k for k, _ in gone] == [("dynamicemb/a.py", "item", "n = x.item()")]
+    assert unclaimed_removals(gone, [claim]) == []
+    assert stale_claims(twice, [claim]) == []
+    # still there once, fewer than the baseline had: not a false claim; without the baseline
+    # to compare with it is the strict rule
+    assert claims_still_present(once, [claim], twice) == []
+    assert claims_still_present(once, [claim]) == [claim]
+    # nothing removed: both copies are there
+    assert claims_still_present(twice, [claim], twice) == [claim]
+    # a line that is not twice in the baseline is strict
+    single = ("dynamicemb/a.py", "cpu", "y = x.cpu()", "C09")
+    assert claims_still_present(twice, [single], twice) == [single]
+    # a claim that is a prefix of two different lines of the baseline is strict, though one
+    # of them is gone: it names a line that the change keeps
+    loose = ("dynamicemb/a.py", "cpu", "y = x.cpu", "C09")
+    fewer = [h for h in twice if h["text"] != "y = x.cpu(); z = 1"]
+    assert claims_still_present(fewer, [loose], twice) == [loose]
 
 
 def test_no_line_with_a_sync_pattern_is_new_unless_it_is_allowed():
