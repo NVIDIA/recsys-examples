@@ -106,10 +106,18 @@ def test_the_counts_are_what_the_kernels_made_not_what_the_launch_left(gpu, eras
     device = _device()
     stream = torch.cuda.Stream()
     add = torch.tensor([7, 5], dtype=torch.int64, device=device)
+    # The first launch of a kernel waits for the device (CUDA lazy module loading): the
+    # update is launched once before, or the worker's launch behind the long kernel would
+    # wait for it and the copy of the counts would be ordered behind work that is done.
+    torch.zeros(2, dtype=torch.int64, device=device).add_(add)
+    torch.cuda.synchronize()
 
     def slow_work(counts):
         torch.cuda._sleep(SLEEP_CYCLES)
+        behind = torch.cuda.Event()
+        behind.record()
         counts.add_(add)
+        assert not behind.query(), "the long kernel was over before the update"
 
     handle = eraser.submit(slow_work, stream)
     assert handle.result() == (7, 5)

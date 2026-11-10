@@ -296,6 +296,36 @@ def _device():
     return torch.device("cuda", torch.cuda.current_device())
 
 
+@pytest.fixture(scope="module", autouse=True)
+def _kernels_are_loaded():
+    """Launch once what an append and a pop of retained keys launch, before a test queues
+    a long kernel (``torch.cuda._sleep``) and counts on what it queues behind it staying
+    in flight. The first launch of a kernel in a process waits for the device while CUDA
+    loads its module (``CUDA_MODULE_LOADING=LAZY``, the default): launched for the first
+    time behind the long kernel, the append would wait for it, and a test of the order of
+    a pop after entries that are still in flight would pass without testing it, whenever
+    it runs before the tests that load these kernels (alone, for one)."""
+    if not torch.cuda.is_available():
+        return
+    kvt = _need("dynamicemb.key_value_table")
+    device = _device()
+    rng = random.Random(0)
+    members = [(0, 5), (1, 6), (2, 7), (0, 8)]
+    for key_type in (torch.int64, torch.uint64):
+        storage = _storage(3, key_type=key_type)
+        for _ in range(2):
+            kvt._append_evicted_masked(
+                storage._state, *_masked(members, 8, device, rng, key_type)
+            )
+        torch.cuda.synchronize()
+        storage.pop_many("pop_evicted_keys", [0, 1])  # a pass over folded chunks
+        kvt._append_evicted_masked(
+            storage._state, *_masked(members, 8, device, rng, key_type)
+        )
+        storage.pop_evicted_keys(2)  # and a pop that takes a pending entry whole
+    torch.cuda.synchronize()
+
+
 def _masked(members, n, device, rng, key_type=torch.int64):
     """N long arrays with the ``members`` ((table, key) pairs) scattered over them and the
     sentinels (reserved key, table id -1) everywhere else, on the device."""
@@ -417,6 +447,12 @@ def test_pending_entries_of_another_stream_are_popped_in_order(gpu):
         torch.cuda._sleep(SLEEP_CYCLES)
         for keys, tids in arrays:
             kvt._append_evicted_masked(storage._state, keys, tids)
+        behind = torch.cuda.Event()
+        behind.record()
+    assert not behind.query(), (
+        "the side stream was idle by the time of the pop, which then orders itself "
+        "after nothing: a launch of the append waited for the long kernel"
+    )
     got = storage.pop_many("pop_evicted_keys", [0, 1])
     torch.cuda.synchronize()
     assert {t: set(v.tolist()) for t, v in got.items()} == expected

@@ -58,6 +58,48 @@ def device():
     return torch.device("cuda", torch.cuda.current_device())
 
 
+@pytest.fixture(scope="module", autouse=True)
+def _kernels_are_loaded():
+    """Launch once what an append and a pop of retained keys launch, before any test of
+    the module queues a long kernel (``torch.cuda._sleep``) and counts on what it queues
+    behind it staying in flight.
+
+    The first launch of a kernel in a process waits for the device while CUDA loads its
+    module (``CUDA_MODULE_LOADING=LAZY``, the default). Launched for the first time
+    behind a long kernel, the append would wait for it, the counts would land before the
+    next entries are made, and the tests below that need the entries pending fail, or
+    pass without testing the order they are about, according to the tests that happened
+    to run before them (they fail when run alone)."""
+    if not torch.cuda.is_available():
+        return
+    device = torch.device("cuda", torch.cuda.current_device())
+    members = [(0, 7), (1, 9), (0, 11), (1, 12)]
+    for key_type in (torch.int64, torch.uint64):
+        state = _storage(key_type=key_type)._state
+        for _ in range(2):
+            _append_evicted_masked(
+                state, *_masked_arrays(members, 8, device, key_type=key_type)
+            )
+        torch.cuda.synchronize()
+        _resolve_pending_evicted(state)  # the fold of an entry whose count has landed
+        _append_evicted_masked(
+            state, *_masked_arrays(members, 8, device, key_type=key_type)
+        )
+        _pop_state_evicted_keys(
+            state, 0
+        )  # a pop over folded chunks and a pending entry
+        _pop_state_evicted_keys(state, 1)
+    torch.cuda.synchronize()
+
+
+def _event_behind():
+    """An event behind everything queued so far on the current stream: while it is
+    pending, the long kernel that was queued before it has not finished."""
+    event = torch.cuda.Event()
+    event.record()
+    return event
+
+
 def _storage(num_tables=2, retain=True, key_type=torch.int64):
     """A last-tier storage of ``num_tables`` tables of one bucket each."""
     device_id = torch.cuda.current_device()
@@ -240,7 +282,10 @@ def test_a_full_ring_loses_no_entry(device):
     torch.cuda._sleep(5 * 10**8)  # no count can land while the entries are appended
     for keys, tids in batches:
         _append_evicted_masked(state, keys, tids)
-    assert len(state.evicted_pending) == 4
+    assert len(state.evicted_pending) == 4, (
+        "a count landed while the entries were appended: the long kernel was over "
+        "before they were, so a launch of the append waited for it"
+    )
     assert [e[3] is None for e in state.evicted_pending] == [False, True, True, True]
 
     popped = set(_pop_state_evicted_keys(state, 0).tolist()) | set(
@@ -260,7 +305,10 @@ def test_entries_without_a_ticket_are_retried_when_a_slot_frees(device):
     torch.cuda._sleep(5 * 10**8)
     _append_evicted_masked(state, *first)
     _append_evicted_masked(state, *second)
-    assert [e[3] is None for e in state.evicted_pending] == [False, True]
+    assert [e[3] is None for e in state.evicted_pending] == [False, True], (
+        "the first count landed while the entries were appended: the long kernel was "
+        "over before they were, so a launch of the append waited for it"
+    )
     torch.cuda.synchronize()
     # the first count has landed: folding it frees the slot, and the entry without
     # a ticket is given it by the same call (on the stream that made the entry)
@@ -293,6 +341,11 @@ def test_a_pop_on_another_stream_than_the_appends(device, slots):
         torch.cuda._sleep(5 * 10**8)
         for keys, tids in batches:
             _append_evicted_masked(state, keys, tids)
+        behind = _event_behind()
+    assert not behind.query(), (
+        "the side stream was idle by the time of the pop, which then orders itself "
+        "after nothing: a launch of the append waited for the long kernel"
+    )
     # the default stream does not wait for `side`: the pop has to order itself
     popped = _pop_state_evicted_keys(state, 0)
     assert set(popped.tolist()) == expected
@@ -318,6 +371,8 @@ def test_waiting_for_a_stream_orders_the_current_stream_after_it(
     with torch.cuda.stream(producer):
         torch.cuda._sleep(5 * 10**8)
         flag.fill_(7)  # behind the sleep
+        behind = _event_behind()
+    assert not behind.query(), "the producer was idle: the wait below orders nothing"
     with torch.cuda.stream(consumer):
         _wait_for_stream(producer.cuda_stream)
         seen = flag.clone()
@@ -342,6 +397,8 @@ def test_a_pop_on_a_side_stream_takes_the_arrays_the_default_stream_made(device)
     torch.cuda._sleep(5 * 10**8)  # the counts of the others are made behind this
     for keys, tids in entries[1:]:
         _append_evicted_masked(state, keys, tids)
+    behind = _event_behind()
+    assert not behind.query(), "the long kernel was over before the pop"
     assert [e[3] is None for e in state.evicted_pending] == [False, True, True]
 
     with torch.cuda.stream(torch.cuda.Stream()):
