@@ -63,8 +63,8 @@ and inspect `model.dense_module.state_dict()`. Nonpersistent capture buffers are
 excluded. An external trainer/converter must provide weights for this exact
 architecture and the shared processor/head, plus the matching sparse weights.
 Missing/unexpected keys fail loading, including when the outer workflow uses
-`strict=False` to filter embedding keys. HSTU UVQK transposition and cached weight
-refresh are applied only to HSTU checkpoints.
+`strict=False` to filter embedding keys. The HSTU UVQK transposition and the
+refresh of the transposed HSTU weight copies apply only to HSTU checkpoints.
 
 ## Cache, graph and export paths
 
@@ -80,8 +80,10 @@ transfers or the cache manager.
 The layer implements `forward_naive`, `forward_input`, `forward_output` and
 `output_buffer_` for the existing per-layer CUDA graph capture/replay orchestration.
 Capture passes a nonzero token-count upper bound to the append operator so it
-does not read a GPU scalar back to the host. Native cache onload synchronization
-and offload are owned by the existing inference orchestration.
+does not read a GPU scalar back to the host. Like `PagedHSTUInferLayer`, each
+layer waits for its own layer of a layerwise KV onload before it reads the
+cache; starting the onload and offloading stay with the existing inference
+orchestration.
 Before each replay, `copy_kvcache_metadata` refreshes the static graph buffers,
 including `total_history_lengths`, so attention uses the current request's
 cached prefix lengths.
@@ -143,32 +145,43 @@ Tests: `test/test_transformer_infer_layer_fa4.py`.
 ## Validation and limitations
 
 ```bash
-python -m pytest test/test_transformer_inference.py \
-  test/test_hstu_block_inference.py test/test_nve_aoti_compat.py -q -ra
+python -m pytest test/test_transformer_inference.py test/test_hstu_block_inference.py \
+  test/test_transformer_infer_layer_fp8.py test/test_transformer_infer_layer_fa4.py \
+  test/test_triton_fp8_quant.py test/test_nve_aoti_compat.py -q -ra
 ```
 
-CPU tests compare the actual layer against independent, unpadded softmax
+CPU tests compare the reference layer against independent, unpadded softmax
 arithmetic; cover multi-layer paged-prefix reuse, variable-length users,
 noncontiguous physical pages, candidate independence, page-tail preservation,
 empty histories, half/bfloat16, HSTU/Transformer checkpoint handling, and
-torch.export save/reload with dynamic shapes and cache mutation. CUDA-only tests
+torch.export save/reload with dynamic shapes and cache mutation. CUDA tests
 exercise the native append operator, graph capture/replay and the shared
-recommendation pre/postprocessor. A skip is not GPU validation.
-The graph regression changes history lengths and page mappings between requests
-and compares each replay against fresh eager inference.
+recommendation pre/postprocessor; the graph regression changes history lengths
+and page mappings between requests and compares each replay against fresh eager
+inference. The FP8 and FA4 tests compare each variant with the reference layer,
+with and without the KV cache and CUDA graphs. A skip is not GPU validation.
 
-The CPU suite passes on PyTorch 2.5.1 and 2.12.0. Dynamic export is tested with
-both `strict=True` and `strict=False`, including replay with batch size one.
-These results do not validate the NVIDIA 26.05 Docker build (2.12.0a0), native
-CUDA operators or GPU graph replay; those checks remain pending.
+These tests pass on H100 (SM90) and on an SM120 GPU, in the PyTorch 26.07
+container (PyTorch 2.13) with the DeepGEMM and FA4 versions that the Docker
+image installs. The CPU suite also passes on PyTorch 2.5.1 and 2.12.0. Dynamic
+export is tested with both `strict=True` and `strict=False`, including replay
+with batch size one.
 
-This backend prioritizes functional integration. Eager attention bounds query
-padding by the smaller of the packed token count and `max_seq_len`; export uses
-the fixed `max_seq_len` bound to avoid specializing dynamic token dimensions.
-Cached K/V always pad to `max_seq_len`. Attention creates a dense boolean mask
-per user, so large configured limits can consume substantial memory. This is not an
-optimized paged Transformer attention kernel and makes no latency/throughput
-claim. Profile realistic workloads before production use. This implementation
-was locally tested on CPU; full NVE + GPU cache manager + AOTI/C++ + Triton
-integration and recommendation-quality benchmarks still require a compatible
-CUDA environment and a trained Transformer checkpoint.
+| Variant | Runs on | torch.export |
+|---|---|---|
+| Reference (`sdpa` attention, `nn.Linear` projections) | CPU and CUDA | yes |
+| FP8 projections (`transformer_fp8_linear`) | SM90+, bf16 | no |
+| FA4 attention (`transformer_attention="fa4"`) | SM90+, bf16 or fp16 | no |
+
+The reference attention prioritizes functional integration. Eager attention
+bounds query padding by the smaller of the packed token count and `max_seq_len`;
+export uses the fixed `max_seq_len` bound to avoid specializing dynamic token
+dimensions. Cached K/V always pad to `max_seq_len`, and attention creates a
+dense boolean mask per user, so large configured limits can consume substantial
+memory. FA4 replaces the padding and the mask with one varlen kernel, but with a
+paged KV cache it still gathers the history into packed K/V of
+`users * max_seq_len` rows. `inference/benchmark/transformer_fp8_layer_benchmark.py`
+and `inference/benchmark/transformer_e2e_benchmark.py` measure the variants;
+profile realistic workloads before production use. AOTI compilation, C++ replay
+and Triton serving of a Transformer model, and recommendation quality with a
+trained Transformer checkpoint, are not validated here.

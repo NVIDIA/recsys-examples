@@ -187,6 +187,11 @@ def get_inference_hstu_config(
         target_group_size (int, optional): The size of the sub-candidate group where causal attention is applied only within a sub-group (usually in the case of ranking). Defaults to 1.
         position_encoding_config (Optional[PositionEncodingConfig], optional): Position embedding config. Defaults to None.
         contextual_max_seqlen (int, optional): The (maximum) length of contextual features.
+        backbone (str, optional): Dense inference backbone, hstu or transformer. Defaults to hstu.
+        transformer_ffn_dim (Optional[int], optional): Transformer feed-forward width. Defaults to four times hidden_size.
+        hstu_preprocessing_config (Optional[HSTUPreprocessingConfig], optional): HSTU preprocessing config. Defaults to None.
+        transformer_fp8_linear (bool, optional): Run the Transformer projections as FP8 DeepGEMM GEMMs; needs bf16 and cannot be exported. Defaults to False.
+        transformer_attention (str, optional): Transformer attention, sdpa (padded reference) or fa4 (FlashAttention 4; needs bf16 or fp16 and cannot be exported). Defaults to sdpa.
     Returns:
         HSTUConfig: The HSTU configuration object.
     """
