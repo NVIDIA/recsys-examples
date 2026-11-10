@@ -34,10 +34,16 @@ NOT_ORDERED = {
     "stream that has used the table (GrowthOrder.section)",
     "note_forwarded": "called by the forward, which has registered its stream and ordered it "
     "after the last growth (_note_table_users) before it gets here",
+    "note_replayed": "adds a host int to the size estimate the next growth is decided from "
+    "(host bookkeeping and the pinned ring of the snapshots): it reads neither the key map "
+    "nor a value buffer, and the request_size_snapshot that follows it is ordered",
     "pop_evicted_keys": "hands back the keys earlier inserts retained, tensors those calls "
     "made: neither the key map nor a value buffer, which a growth replaces",
     "pop_erased_keys": "the same, for the keys an erase retained",
     "pop_erased_slot_index": "the same, for the slots an erase retained",
+    "pop_many": "the same as pop_evicted_keys / pop_erased_keys, for several tables in one "
+    "pass over the retained arrays (it orders the current stream after the streams that "
+    "made them, which is all it owes them)",
     "erase_untracked": "reads a set of table ids kept on the host",
     "embedding_dtype": "reads the options of the tables, not their state",
     "embedding_dim": "a host list of the dims",

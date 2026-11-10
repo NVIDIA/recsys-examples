@@ -282,11 +282,14 @@ def test_flush_orders_the_storage_below_the_cache_after_its_growth(device, monke
     )
 
     class NoCache:
-        """What flush_cache needs of a cache that holds nothing."""
+        """What flush_cache needs of a cache that holds nothing: no tables to scan, and the
+        row width and wave it sizes the batches of a scan from."""
 
         class _State:
             num_tables = 0
             threads_in_wave = 1
+            value_dim = DIM
+            emb_dtype = torch.float32
 
         _state = _State()
 

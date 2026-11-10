@@ -123,7 +123,8 @@ def lookup(table, table_id, keys):
         empty = torch.empty(0, dtype=torch.int64, device=DEVICE)
         return torch.empty(0, dtype=torch.bool, device=DEVICE), empty, empty
     tids = torch.full((keys.numel(),), table_id, dtype=torch.int64, device=DEVICE)
-    arg = ScoreArg(name=SCORE, value=None, policy=ScorePolicy.CONST)
+    # the table's own score name: a table of ``create_table_state`` names it by its strategy
+    arg = ScoreArg(name=table.score_names_[0], value=None, policy=ScorePolicy.CONST)
     _, founds, rows, slots = table.lookup(keys, tids, arg, return_slots=True)
     return founds, rows, slots
 
@@ -535,8 +536,8 @@ def table(capacity):
 
 def fill(t, n):
     keys = torch.arange(1000, 1000 + n, dtype=torch.int64, device="cuda")
-    arg = ScoreArg(name="s", value=torch.arange(n, device="cuda").to(torch.uint64) + 1,
-                   policy=ScorePolicy.ASSIGN)
+    scores = torch.arange(1, n + 1, dtype=torch.int64, device="cuda").to(torch.uint64)
+    arg = ScoreArg(name="s", value=scores, policy=ScorePolicy.ASSIGN)
     t.insert(keys, torch.zeros_like(keys), arg)
     return keys
 """
