@@ -1594,6 +1594,12 @@ frequency owns one; the framework only carries it, reporting its memory and
 writing it into checkpoints, which is what `AdmissionStrategy.state()` hands
 over. Custom counters inherit `Counter`.
 
+`add` and `erase` are called with the arrays of a step: per-key arrays of a
+capacity `N` and `num_valid`, the number of live leading entries (`None`: all
+of them). Only those entries may be read, what the methods return has the
+capacity `N`, and neither may wait for the device; see
+[Writing a Storage, Cache, Counter or MultiTableAdmitter](#writing-a-storage-cache-counter-or-multitableadmitter).
+
 ```python
 class Counter(abc.ABC):
     """Interface of a counter table which maps a key to a counter."""
@@ -1604,19 +1610,39 @@ class Counter(abc.ABC):
         keys: torch.Tensor,
         table_ids: torch.Tensor,
         frequencies: torch.Tensor,
+        *,
+        num_valid: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Add frequencies to these keys and return their accumulated counts."""
+        """Add frequencies to these keys and return their accumulated counts.
+
+        The result has the length of ``keys``; its entries past ``num_valid``
+        are undefined.
+        """
 
     @abc.abstractmethod
-    def erase(self, keys: torch.Tensor, table_ids: torch.Tensor) -> None:
-        """Erase these keys."""
+    def erase(
+        self,
+        keys: torch.Tensor,
+        table_ids: torch.Tensor,
+        *,
+        num_valid: Optional[torch.Tensor] = None,
+    ) -> None:
+        """Erase these keys (the first ``num_valid`` of them)."""
 
     @abc.abstractmethod
     def memory_usage(self, mem_type=MemoryType.DEVICE) -> int:
         """Consumption of one kind of memory."""
 
     @abc.abstractmethod
-    def load(self, key_file, counter_file, table_id: int) -> None:
+    def load(
+        self,
+        key_file,
+        counter_file,
+        table_id: int,
+        dist_type: str,
+        shard_index: Optional[int] = None,
+        num_shards: Optional[int] = None,
+    ) -> None:
         """Load one table's keys and counts from these files."""
 
     @abc.abstractmethod
@@ -1688,6 +1714,17 @@ class AdmissionStrategy(abc.ABC):
 takes. Only `admit` has to be implemented; the other two have defaults, so an
 admitter that merely decides is one method.
 
+`admit` is called with the arrays of a step: `keys`, `table_ids` and
+`frequencies` have a capacity `N`, and `num_valid` is the number of live
+leading entries (`None`: all of them). The mask it returns has the length of
+`keys`; only its first `num_valid` entries are read. The `MultiTableInitializer`
+that `non_admitted_initializer` returns is called the same way,
+`initializer(buffer, keys, table_ids, indices, num_valid=count)`: `indices`
+selects the rows to write, at the capacity of the batch, and only its first
+`count` entries are live, so an initializer of your own has to take `num_valid`.
+See
+[Writing a Storage, Cache, Counter or MultiTableAdmitter](#writing-a-storage-cache-counter-or-multitableadmitter).
+
 ```python
 class MultiTableAdmitter(abc.ABC):
     @abc.abstractmethod
@@ -1696,6 +1733,8 @@ class MultiTableAdmitter(abc.ABC):
         keys: torch.Tensor,
         table_ids: torch.Tensor,
         frequencies: Optional[torch.Tensor] = None,
+        *,
+        num_valid: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Which of these missing keys may enter the table.
 
@@ -1703,6 +1742,10 @@ class MultiTableAdmitter(abc.ABC):
         the module counts occurrences at all; None means treat each key as one.
         It is an increment, not a running total -- any total is the admitter's
         own to keep.
+
+        Only the first ``num_valid`` entries of the arrays are live (all of
+        them if None); the rest is undefined and is never to be read. The
+        result is a boolean mask over ``keys``.
         """
 
     def state(self) -> Optional[Counter]:
@@ -1719,7 +1762,8 @@ class MultiTableAdmitter(abc.ABC):
 
         A rejected key still takes part in the forward, so its row has to be
         written by something. Return a ``MultiTableInitializer`` to take that
-        on; the module does the calling.
+        on; the module does the calling, with ``num_valid`` (only the first
+        ``num_valid`` entries of ``indices`` are live).
         """
 ```
 
@@ -1869,7 +1913,7 @@ dynamicemb supports caching hot embeddings on GPU memory, and you can prefetch k
 
 ## External storage
 
-dynamicemb supports external storage once `external_storage` in `DynamicEmbTableOptions` inherits the `Storage` interface under [types.py](./dynamicemb/types.py). 
+dynamicemb supports external storage once `external_storage` in `DynamicEmbTableOptions` inherits the `Storage` interface under [types.py](./dynamicemb/types.py). Its `find` and `insert` are called with the capacity-sized arrays and the `num_valid` of the lookup step: see [Writing a Storage, Cache, Counter or MultiTableAdmitter](#writing-a-storage-cache-counter-or-multitableadmitter).
 Refer to demo `PyDictStorage` in [unit test](./test/test_batched_dynamic_embedding_tables_v2.py) for detailed usage.
 
 
@@ -1891,6 +1935,95 @@ Users can specify the initial capacity of a table on a single GPU. When the tabl
   The growth is not capped by `max_capacity`.
 - **Loading a checkpoint** (`DynamicEmbStorage.load`): the table is sized for the keys **this rank keeps** from the file (counted from the key file with the rank's ownership filter), not for every key in it, since a checkpoint may hold other ranks' keys as well.
 
+
+## Host syncs in a step
+
+The number of unique keys of a batch is only known to the device, and the lookup step (the prefetch, the forward and the backward of a batch) does not read it back. The arrays of the step -- the unique keys, their table ids, the misses, the rows to write back, ... -- keep the length of the input, `N`, the *capacity*, and carry the number of live leading entries beside them as `num_valid`, a one-element int64 tensor on the device. Every op of the step is launched over `N`, reads `num_valid`, and does its work for the live entries only; what lies past them is undefined and never read. Compaction (the misses, the admitted keys, the evicted keys) writes its result at the same length with a count of its own, so a step whose keys all hit runs its miss path for zero keys instead of deciding on the host to skip it. The price is memory: the arrays of the step are allocated for the `N` input keys, not for the number of unique or missing keys.
+
+This is the one path of every storage layout (HBM only, cache over storage, hybrid, host only), in training and in eval, and the classes you write follow the same contract: see [Writing a Storage, Cache, Counter or MultiTableAdmitter](#writing-a-storage-cache-counter-or-multitableadmitter).
+
+A step makes no blocking host sync. It waits for the device only when:
+
+- a table can grow (`init_capacity` below `max_capacity`, or `NO_EVICTION`): in training, deciding whether to expand needs the number of unique keys per table on the host; see [Table expansion](#table-expansion). A table that cannot grow never reads it.
+- `evicted_item_mode` retains evicted keys: the eviction count is read to keep the keys.
+- `DEMB_DETERMINISM_MODE` is set (see [Deterministic mode](#deterministic-mode)), or `DYNAMICEMB_DEBUG` (see [Environment Variables](#environment-variables)).
+- a class you wrote reads the count itself, because it cannot work from the device (a store that keeps its rows in host memory, say): the wait is that class's own.
+- the dump, load, replay, flush, pop and erase functions, and the per-key score check when `safe_check_mode` asks for it, which return host data or ask a question of the data.
+
+A probabilistic admitter (`ProbabilisticAdmissionStrategy`) draws one random number per entry of the arrays of the step, that is one per input key of the batch, whatever the number of keys that are missing, and it does so on every step, also on one whose keys all hit, since the miss path runs for zero keys instead of being skipped. The draws follow `torch.manual_seed`; the generator advances by that many per step, so which key gets which draw depends on the size of the batch.
+
+The over-subscription check of the prefetched keys (`Outstanding prefetched keys ... exceed cache capacity`) reads the number of unique keys only when the number of input keys of the batches in flight is larger than the cache.
+
+The blocking syncs of a step can be counted with `--sync-count` of the many-collections benchmark, see the [benchmark README](./benchmark/README.md#3-benchmark-many-embedding-collections-with-a-small-dense-part).
+
+## Writing a Storage, Cache, Counter or MultiTableAdmitter
+
+A `Storage` (the `external_storage` of a table), a `MultiTableAdmitter` (what the `create_admitter` of your own `AdmissionStrategy` returns) and a `Counter` (what an admitter counts in, which its `state()` hands out) are the classes of [types.py](./dynamicemb/types.py) that you can implement yourself, and so is the `MultiTableInitializer` (of [initializer.py](./dynamicemb/initializer.py)) that such an admitter hands out as its `non_admitted_initializer`. A `Cache` cannot be plugged in: the module builds a `DynamicEmbCache` itself, and the step uses more of it than its interface, namely its `increment_counter` and `decrement_counter`, which pin and release a slot, and its table state. The `lookup` and `insert_and_evict` of the interface are listed here with the others because they follow the same contract. The lookup step calls all of them with the arrays of [Host syncs in a step](#host-syncs-in-a-step): per-key arrays of a capacity `N`, and `num_valid`, the number of live leading entries.
+
+**This is a breaking change of these interfaces.** Their methods take a keyword-only `num_valid` (the `__call__` of a `MultiTableInitializer` takes a trailing `num_valid=None`), and what they return has the capacity of the input, with counts on the device, instead of being cut to the number of keys. A class written against the earlier signatures (exact-length tensors, no `num_valid`, `num_missing` and `num_evicted` as Python ints) fails at the first step with a `TypeError` for the unexpected `num_valid`. A method that accepts `num_valid` and ignores it does not fail, it works on entries that are undefined. There is no fallback that cuts the arrays to size for such a class, so migrate it as described below. Code that calls `find`, `insert`, `lookup` or `insert_and_evict` of the built-in `DynamicEmbStorage`, `HybridStorage` or `DynamicEmbCache` directly sees the same change in what it gets back: `num_missing` and `num_evicted` are tensors on the device, and the `missing_*` and `evicted_*` arrays have the length of the input, with only their first `num_missing` or `num_evicted` entries live (`int(count.item())` reads the count on the host; `num_valid` can be left out for exact-length arrays).
+
+| Class | Method | Returns |
+| --- | --- | --- |
+| `Storage` | `find(unique_keys, table_ids, copy_mode, lfu_accumulated_frequency=None, key_scores=None, *, num_valid=None)` | `(num_missing, missing_keys, missing_indices, missing_table_ids, missing_scores, founds, output_scores, values)` |
+| `Storage` | `insert(keys, table_ids, values, scores=None, preserve_existing=False, *, num_valid=None)` | `None` |
+| `Cache` | `lookup(unique_keys, table_ids, lfu_accumulated_frequency=None, *, num_valid=None)` | `(score_out, founds, indices)` |
+| `Cache` | `insert_and_evict(keys, table_ids, scores=None, *, num_valid=None)` | `(indices, num_evicted, evicted_keys, evicted_indices, evicted_scores, evicted_table_ids)` |
+| `Counter` | `add(keys, table_ids, frequencies, *, num_valid=None)` | `accumulated_frequencies` |
+| `Counter` | `erase(keys, table_ids, *, num_valid=None)` | `None` |
+| `MultiTableAdmitter` | `admit(keys, table_ids, frequencies=None, *, num_valid=None)` | a boolean mask over `keys` |
+| `MultiTableInitializer` | `__call__(buffer, keys, table_ids, indices, num_valid=None)` | `None` |
+
+The other methods of the classes (dump, load, the dimensions, ...) are unchanged. What each argument and result means is in the docstrings of [types.py](./dynamicemb/types.py); the rules they all follow are these:
+
+- **Live entries.** `num_valid` is a one-element int64 CUDA tensor: the number of live *leading* entries of every per-key array of the call. `None` means that all of them are live, an exact-length call such as the explicit APIs and tests make. Read, write and return only those entries. What lies past them is undefined -- memory that can hold anything, not necessarily a valid key or table id -- so never read it and never use it as an index.
+- **Capacity-sized results.** Return per-key results with the capacity of the inputs. A method that selects some of the keys returns arrays of the capacity whose first `count` entries are the selection, with the count (`num_missing`, `num_evicted`) as a one-element int64 CUDA tensor: never a Python int, and also when `num_valid` is `None`. The missing keys of `find` are in the order of the input, and `missing_indices` are their positions in the input arrays; `founds` and `output_scores` have an entry per input key, and `values` has a row per input key (the row of a key that was not found is not written). The evicted keys of `insert_and_evict` are the keys that left the cache and any key that could not be placed, in no defined order: entry `j` of the four `evicted_*` arrays describes one key.
+- **Keys.** The keys of `insert`, `insert_and_evict` and `Counter.add` are unique within each table, and so are those of `find` and `lookup` in a training step and in the evaluation of a pooled table. The evaluation of a table that is not pooled (`DynamicEmbPoolingMode.NONE`) looks up its raw ids, repeats included, and inserts nothing: answer every entry, a repeat as any other.
+- **Arrays.** The step hands what you return on to the counted ops of `dynamicemb_extensions`, which check what they get. Every array is a CUDA tensor on the device of the inputs, 1-D and contiguous (`values`: 2-D with contiguous rows); keys and scores have 8-byte elements (`int64` or `uint64`), table ids and indices are `int64`, `founds` is `bool`.
+- **Values.** The `values` of `find` is a tensor of `embedding_dtype()` with `max_embedding_dim()` columns for `CopyMode.EMBEDDING` and `max_value_dim()` for `CopyMode.VALUE`, laid out as `CopyMode` says (see [types.py](./dynamicemb/types.py)): the embedding of every table padded to `max_embedding_dim()` columns and, for `VALUE`, the optimizer states from that column on, whatever the table's own `embedding_dim`, because the step finds them there. The step writes into it (it initializes the rows of the new keys, resets their optimizer states and, in the backward, applies the gradients to the rows), so return a tensor of your own, never a view of your memory. The `values` of `insert` are the caller's, and their rows past `num_valid` are undefined: copy the rows you keep.
+- **An initializer** (the `__call__` of a `MultiTableInitializer`) gets the `buffer` to write, with `keys` and `table_ids` alongside it, one entry per row of the buffer, and `indices`, the rows to write, at the capacity of the batch. Only the first `num_valid` entries of `indices` are live; never use the others as a row.
+- **No wait.** Do not read a device tensor on the host: no `.item()`, `.cpu()` or `.tolist()`, and no torch op whose output size depends on device data (`nonzero`, `masked_select`, boolean-mask indexing, `unique`). `dynamicemb_extensions` has the building blocks: `flagged_compact(flags, inputs, num_valid)` (the entries where a flag is set, with their count: it returns `(count, positions, outs)`, where `positions[j]` is the input position of the `j`-th selected entry and `outs[k][j] == inputs[k][positions[j]]`, a `None` input staying `None`), `counted_gather(src, idx, num_valid)`, `counted_scatter(dst, idx, src, num_valid)`, `counted_scatter_fill(dst, idx, value, num_valid)` and `counted_count_true(flags, num_valid)`. Each does its work for the live entries only and reads nothing back; the index ops skip a negative index, so `torch.where(mask, idx, -1)` makes an index array select the entries where `mask` holds, with no compaction.
+- **A class that cannot work from the device** -- a store that keeps its rows in a Python dict or in host memory -- reads the count once, `n = capacity if num_valid is None else int(num_valid.item())`, and works on the first `n` entries. That wait is the only one the step makes for the class, and it is the class's own cost.
+
+An admitter that decides key by key needs nothing from `num_valid`: a mask over all `N` entries is correct, because only its live entries are read.
+
+```python
+class OddKeyAdmitter(MultiTableAdmitter):
+    def admit(self, keys, table_ids, frequencies=None, *, num_valid=None):
+        return keys % 2 == 1
+```
+
+To migrate a class that was written for exact-length tensors, add `*, num_valid=None` to its methods, and `key_scores=None` to a `find` that lacks it (it is in the signature above, and a table that takes a score per key passes it), take `n = keys.numel() if num_valid is None else int(num_valid.item())`, run the old code on `keys[:n]`, `table_ids[:n]` and the other per-key inputs cut the same way, and return what it produced padded to the capacity, with each count as a one-element int64 tensor on the device. For a `find` that is:
+
+```python
+import torch
+from dynamicemb.types import Storage
+
+
+class MyStore(Storage):
+    def find(self, unique_keys, table_ids, copy_mode,
+             lfu_accumulated_frequency=None, key_scores=None, *, num_valid=None):
+        capacity = unique_keys.numel()
+        n = capacity if num_valid is None else int(num_valid.item())  # waits for the device
+
+        def pad(x):  # the first entries of an array of the capacity, on the device
+            out = torch.empty((capacity, *x.shape[1:]), dtype=x.dtype,
+                              device=unique_keys.device)
+            out[: x.size(0)] = x
+            return out
+
+        # The old code, run on unique_keys[:n] and table_ids[:n], gives founds [n],
+        # values [n, dim] and, for the m keys it did not find, their keys,
+        # positions, table ids and scores: in the dtypes and the layout of the
+        # rules above, and values a tensor of its own.
+        ...
+        num_missing = torch.tensor([m], dtype=torch.int64, device=unique_keys.device)
+        return (num_missing, pad(missing_keys), pad(missing_indices),
+                pad(missing_table_ids),
+                None if missing_scores is None else pad(missing_scores),
+                pad(founds), pad(output_scores), pad(values))
+```
+
+`PyDictStorage` in the [unit test](./test/test_batched_dynamic_embedding_tables_v2.py) is a complete store written against this contract: a Python dict in host memory.
 
 ## Erasing keys by score
 

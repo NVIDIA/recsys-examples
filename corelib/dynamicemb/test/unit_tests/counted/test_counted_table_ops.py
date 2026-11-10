@@ -11,6 +11,10 @@ must match the same call on the exact slice [:n] (made on a twin table where the
 changes the table), leave the caller's output buffers untouched past n, and leave the
 table as if the tail did not exist: the tail names keys that are in the table or would
 be inserted, and tables, slots and keys that are out of range or reserved.
+
+The exact-slice call takes no count (``None``: every entry is live). It answers in the
+same form as the counted one -- arrays of the capacity of its input, counts as device
+tensors -- so what it is compared to is the live prefix of the counted result.
 """
 
 import pytest
@@ -48,6 +52,16 @@ def _unset(m, dtype=torch.uint8, value=UNSET):
 
 def _all(x, value):
     return bool((x == value).all())
+
+
+def _is_count(x):
+    """A count as the ops return it: a one-element int64 CUDA tensor."""
+    return (
+        isinstance(x, torch.Tensor)
+        and x.is_cuda
+        and x.dtype == torch.int64
+        and x.shape == (1,)
+    )
 
 
 def _table(policy=ASSIGN, caps=(1024,), bucket=128, **kw):
@@ -239,9 +253,13 @@ def test_insert_and_evict(n, use_rows, policy):
     assert int((head == EVICT).sum()) == m and int((head == INSERT).sum()) == n - m
     # A newcomer takes the slot (the row, with use_rows) of the resident it evicted.
     assert sorted(indices[:n][head == EVICT].tolist()) == sorted(ev_idx[:m].tolist())
-    # The exact-slice run on the twin agrees, table included.
-    _, m_b, ev_keys_b, *_ = b.insert_and_evict(new[:n], _ids(n), _arg(high[:n], policy))
-    assert m_b == m and sorted(ev_keys_b.tolist()) == sorted(ev_keys[:m].tolist())
+    # The exact-slice run on the twin agrees, table included. It has no count, so
+    # all n entries are live, and it answers in the same form: arrays of its own
+    # capacity n and a device count, of which the first m_b entries are live.
+    idx_b, m_b, *ev_b = b.insert_and_evict(new[:n], _ids(n), _arg(high[:n], policy))
+    assert _is_count(m_b) and all(x.numel() == n for x in (idx_b, *ev_b))
+    assert int(m_b) == m
+    assert sorted(ev_b[0][:m].tolist()) == sorted(ev_keys[:m].tolist())
     keys = torch.cat([torch.arange(1, 101, device="cuda"), new])
     ids = _ids(keys.numel())
     assert torch.equal(_found(a, keys, ids), _found(b, keys, ids))
@@ -282,7 +300,13 @@ def test_overflow(n):
     )
     assert int(num_evicted) == 0 and all(x.numel() == N for x in (indices, *evicted))
     assert _all(results[:n], INSERT) and _all(results[n:], UNSET)
-    b.insert_and_evict_with_counter_and_overflow(new[:n], _ids(n), _arg(high[:n]))
+    # The exact-slice run has no count: all n entries are live, and it answers in the
+    # same form, at its own capacity n.
+    idx_b, m_b, *ev_b = b.insert_and_evict_with_counter_and_overflow(
+        new[:n], _ids(n), _arg(high[:n])
+    )
+    assert _is_count(m_b) and int(m_b) == 0
+    assert all(x.numel() == n for x in (idx_b, *ev_b))
     assert torch.equal(a.overflow_bucket_sizes, b.overflow_bucket_sizes)
     assert int(a.overflow_bucket_sizes.sum()) == n
     look = _arg(None, CONST)
@@ -339,11 +363,13 @@ def test_erase(n, use_rows):
 
 
 @COUNT
-def test_determinism_mode(n, monkeypatch):
-    """The host reads the count once, runs the old code on exact slices, and hands back
-    the counted shapes: capacity-length arrays, ``num_evicted`` a device tensor."""
+@ROWS
+def test_determinism_mode(n, use_rows, monkeypatch):
+    """The host reads the count once (not at all without one), runs the old code on
+    exact slices, and hands back the counted shapes: capacity-length arrays,
+    ``num_evicted`` a device tensor."""
     monkeypatch.setenv("DEMB_DETERMINISM_MODE", "1")
-    a, _ = _resident(ASSIGN)
+    a, b = _resident(ASSIGN, use_rows)
     new, high = _newcomers()
     m = _evictions(n)
     indices, num_evicted, *evicted = a.insert_and_evict(
@@ -352,6 +378,18 @@ def test_determinism_mode(n, monkeypatch):
     assert num_evicted.shape == (1,) and num_evicted.dtype == torch.int64
     assert int(num_evicted) == m and all(x.numel() == N for x in (indices, *evicted))
     assert sorted(evicted[0][:m].tolist()) == list(range(1, m + 1))
+    # Without a count all n entries are live, and the form is the same, at capacity n.
+    idx_b, m_b, *ev_b = b.insert_and_evict(new[:n], _ids(n), _arg(high[:n]))
+    assert _is_count(m_b) and all(x.numel() == n for x in (idx_b, *ev_b))
+    assert int(m_b) == m and sorted(ev_b[0][:m].tolist()) == list(range(1, m + 1))
+    if use_rows:  # dense rows, none taken for an eviction, a victim's is a newcomer's
+        for t, rows, victims in [
+            (a, indices[:n], evicted[1][:m]),
+            (b, idx_b, ev_b[1][:m]),
+        ]:
+            assert t.num_rows(0) == min(100 + n, 128)
+            assert len(set(rows.tolist())) == n
+            assert set(victims.tolist()) <= set(rows.tolist())
     c = _table()
     keys = torch.arange(1, N + 1, device="cuda")
     batch = _dirty_batch(keys, keys.to(torch.uint64), n)

@@ -164,12 +164,18 @@ class MultiTableAdmitter(abc.ABC):
     """What a fused module runs, holding everything deciding takes."""
 
     @abc.abstractmethod
-    def admit(self, keys, table_ids, frequencies=None) -> torch.Tensor:
+    def admit(
+        self, keys, table_ids, frequencies=None, *, num_valid=None
+    ) -> torch.Tensor:
         """Which of these missing keys may enter the table.
 
         ``frequencies`` is how often each key occurred in *this batch*, where
         the module counts occurrences at all; None means treat each key as one.
         An increment, not a running total -- any total is the admitter's own.
+
+        The arrays have a capacity and ``num_valid`` is the number of live
+        leading entries (None: all of them); the mask has the length of
+        ``keys``, and only its live entries are read.
         """
 
     def state(self) -> Optional[Counter]:
@@ -190,6 +196,14 @@ at all: `state()` stays None and `admit` is one line.
 memory the framework sizes, reports through `memory_usage`, and checkpoints.
 `Counter` already is that protocol; it simply gains a second audience —
 `add`/`erase` for the admitter, `memory_usage`/`dump`/`load` for the module.
+
+`num_valid` belongs to the lookup step, not to the admission design: the step
+keeps its per-key arrays at the length of the input and carries the number of
+live entries on the device instead of reading it back. The contract of that
+count, for an admitter, for a `Counter` and for the initializer an admitter
+hands out as its `non_admitted_initializer`, is in "Host syncs in a step" and
+"Writing a Storage, Cache, Counter or MultiTableAdmitter" of
+[DynamicEmb_APIs.md](../DynamicEmb_APIs.md).
 
 ### 3.2 Configuration after the change
 
@@ -349,14 +363,15 @@ class UniformInitializer(MultiTableInitializer):
     def table_param_rows(args_list):
         return [[args.lower, args.upper] for args in args_list]
 
-    def __call__(self, buffer, keys, table_ids, indices):
+    def __call__(self, buffer, keys, table_ids, indices, num_valid=None):
         if self._table_params is None:
             uniform_init(buffer, indices, self._curand_state,
-                         self._args.lower, self._args.upper)
+                         self._args.lower, self._args.upper, num_valid)
         else:
             uniform_init_table_params(buffer, indices, self._curand_state,
                                       self._table_params,
-                                      self._table_ids_for_kernel(table_ids))
+                                      self._table_ids_for_kernel(table_ids),
+                                      num_valid)
 ```
 
 `table_param_rows` is where the column order is written down, four

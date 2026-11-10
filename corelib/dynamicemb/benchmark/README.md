@@ -582,10 +582,12 @@ its windows). After a barrier, the warmup (`--warmup`, 20 iterations) and
 the timed iterations (`--num_iterations`, 20) run back to back: nothing of
 the benchmark's between them syncs the host with the GPU, so the timed
 iterations follow the warmup without a pause and the ranks reach them in
-step. The dists and the lookup keep their own host syncs in every call (one
-in the hierarchical dist's input dist, several in TorchRec's, two in
-DynamicEmb's lookup), so the host runs at most part of an iteration ahead
-of the GPU, and where the GPU waits for the host, the wait is in the step.
+step. The dists keep their own host syncs in every call (one in the
+hierarchical dist's input dist, several in TorchRec's), and the lookup of
+these tables, which cannot grow, makes none ([DynamicEmb_APIs.md](../DynamicEmb_APIs.md),
+"Host syncs in a step"), so the host runs at most part of an iteration
+ahead of the GPU, and where the GPU waits for the host, the wait is in the
+step.
 A CUDA event before the first timed iteration and one after the last time
 them: the step is the time between them on the GPU, its idle gaps
 included, over the timed iterations. Python's garbage collector is off in
@@ -1096,13 +1098,12 @@ Every number is the median over the timed windows, followed by `[min, max]`.
   compare it with the timed numbers.
 - **syncs/step** (with `--sync-count`): blocking sync API calls per step, and per
   collection in parentheses. It counts `cudaStreamSynchronize`, `cudaDeviceSynchronize`,
-  `cudaEventSynchronize` and synchronous `cudaMemcpy`; every `.item()`, `.cpu()`,
-  boolean-mask indexing or `flagged_compact` count read-back is one
-  `cudaStreamSynchronize`. The single-point run also prints the breakdown and the
-  number of D2H copies into pageable memory (`d2h_pageable`: they block the host too,
-  but are normally followed by a counted stream sync, so they are not added). A
-  tree without syncs reads 0. If the profiler returns no CUDA runtime events the
-  run prints a note instead of numbers.
+  `cudaEventSynchronize` and synchronous `cudaMemcpy`; every `.item()`, `.cpu()` or
+  boolean-mask indexing is one `cudaStreamSynchronize`. The single-point run also
+  prints the breakdown and the number of D2H copies into pageable memory
+  (`d2h_pageable`: they block the host too, but are normally followed by a counted
+  stream sync, so they are not added). A tree without syncs reads 0. If the profiler
+  returns no CUDA runtime events the run prints a note instead of numbers.
 
 A single-point run also prints the layout, the planned memory, the unique-key ratio
 per step and the working set of the pool (see the notes below). The loss is checked

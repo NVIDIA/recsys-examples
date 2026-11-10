@@ -177,10 +177,9 @@ def test_resident_keys_reread_correctly(current_device):
     """A second forward over the same keys must return the same embeddings.
 
     Regression: the HBM-direct prefetch returned the *hash slot* for keys that hit
-    in the table (``h_num_missing == 0`` early return), and the forward fed that
-    straight into ``load_from_flat``. For NO_EVICTION the key map is twice the
-    value buffer, so roughly half those slots addressed rows past the end of the
-    buffer -- an illegal memory access.
+    in the table, and the forward fed that straight into ``load_from_flat``. For
+    NO_EVICTION the key map is twice the value buffer, so roughly half those slots
+    addressed rows past the end of the buffer -- an illegal memory access.
     """
     device = torch.device(f"cuda:{current_device}")
     model = build_model(current_device, max_capacity=65536 * 2)

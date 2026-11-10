@@ -100,6 +100,6 @@ Notes:
 
 - For detailed explanations of specific APIs and parameters, please refer to [API Doc](../DynamicEmb_APIs.md).
 
-- For usage of external storage, refer to the `PyDictStorage` demo in the [unit test](../test/test_batched_dynamic_embedding_tables_v2.py).
+- For usage of external storage, refer to the `PyDictStorage` demo in the [unit test](../test/test_batched_dynamic_embedding_tables_v2.py). Its `find` and `insert` are called with the capacity-sized arrays and the `num_valid` of the lookup step; see [Writing a Storage, Cache, Counter or MultiTableAdmitter](../DynamicEmb_APIs.md#writing-a-storage-cache-counter-or-multitableadmitter) for the contract.
 
 ***dynamicemb** supports not only `EmbeddingCollection` but also `EmbeddingBagCollection`. However, due to the requirements of generative recommendations, dynamicemb focuses on performance optimization of `EmbeddingCollection` while providing full functional support for `EmbeddingBagCollection`. And we use `EmbeddingCollection` as an example.*

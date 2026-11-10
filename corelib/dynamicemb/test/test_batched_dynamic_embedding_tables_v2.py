@@ -528,7 +528,7 @@ def _assert_storage_export_matches_find_embeddings(
                     (keys.numel(),), tid, dtype=torch.int64, device=keys.device
                 )
                 (
-                    h_miss,
+                    num_miss,
                     _,
                     _,
                     _,
@@ -537,9 +537,9 @@ def _assert_storage_export_matches_find_embeddings(
                     _,
                     emb_find,
                 ) = storage.find(keys, tids, CopyMode.EMBEDDING)
-                assert h_miss == 0, (
-                    f"storage table_id={tid}: find reports {h_miss} missing keys "
-                    "that export still lists"
+                assert int(num_miss) == 0, (
+                    f"storage table_id={tid}: find reports {int(num_miss)} missing "
+                    "keys that export still lists"
                 )
                 assert bool(
                     founds.all()
@@ -645,7 +645,7 @@ def _kim_scan_keys_embeddings_dict(
         ):
             if keys.numel() == 0:
                 continue
-            scores = named_scores[score_name]
+            named_scores[score_name]
             flat_rows = indices
             values = load_from_flat_single_table(state, flat_rows, tid)
             embeddings = values[:, :emb_dim_t].contiguous().to(device)
@@ -727,7 +727,7 @@ def _assert_bdebt_storage_cache_merged_export_matches_lookup(
                 miss = ~founds_c
                 if bool(miss.any()):
                     (
-                        h_miss,
+                        num_miss,
                         _,
                         _,
                         _,
@@ -740,9 +740,9 @@ def _assert_bdebt_storage_cache_merged_export_matches_lookup(
                         tid_t[miss],
                         copy_mode=CopyMode.EMBEDDING,
                     )
-                    assert h_miss == 0, (
-                        f"table_id={tid}: storage.find reports {h_miss} missing "
-                        f"among keys not in cache"
+                    assert int(num_miss) == 0, (
+                        f"table_id={tid}: storage.find reports {int(num_miss)} "
+                        f"missing among keys not in cache"
                     )
                     assert bool(
                         sf.all()
@@ -857,6 +857,16 @@ def _split_table_batched_optimizer_for_compare(opt_type: EmbOptimType) -> EmbOpt
 
 
 class PyDictStorage(Storage[DynamicEmbTableOptions, BaseDynamicEmbeddingOptimizer]):
+    """A storage in a Python dict: the demo of a class written against the contract of
+    ``Storage`` (see ``dynamicemb/types.py``).
+
+    The step calls ``find`` and ``insert`` with arrays of the capacity of the batch and
+    the number of live leading entries as ``num_valid``, a one-element device tensor
+    (``None`` when every entry is live). The rows of a dict are in host memory, so this
+    class reads the count once per call (``int(num_valid.item())``) and works on the live
+    entries only; what it returns has the capacity of its input as well.
+    """
+
     def __init__(
         self,
         options: List[DynamicEmbTableOptions],
@@ -889,29 +899,42 @@ class PyDictStorage(Storage[DynamicEmbTableOptions, BaseDynamicEmbeddingOptimize
     def size(self) -> int:
         return len(self.dict)
 
+    def _padded(self, values: List, capacity: int, dtype: torch.dtype) -> torch.Tensor:
+        """``values`` as the leading entries of an array of ``capacity``; the rest
+        of it is never read."""
+        out = torch.zeros(capacity, dtype=dtype, device=self.device)
+        if values:
+            out[: len(values)] = torch.tensor(values, dtype=dtype, device=self.device)
+        return out
+
     def find_impl(
         self,
         unique_keys: torch.Tensor,
         table_ids: torch.Tensor,
         unique_embs: torch.Tensor,
         input_scores: Optional[torch.Tensor] = None,
+        num_valid: Optional[torch.Tensor] = None,
     ) -> Tuple[
         torch.Tensor,
         torch.Tensor,
         torch.Tensor,
         torch.Tensor,
+        Optional[torch.Tensor],
         torch.Tensor,
         torch.Tensor,
     ]:
-        h_unique_keys = unique_keys.cpu()
-        h_table_ids = table_ids.cpu()
+        capacity = unique_keys.size(0)
+        n = capacity if num_valid is None else int(num_valid.item())
+        h_unique_keys = unique_keys[:n].cpu()
+        h_table_ids = table_ids[:n].cpu()
         lookup_dim = unique_embs.size(1)
         results = []
         missing_keys = []
         missing_indices = []
+        missing_table_ids = []
         missing_scores_list = []
         founds_ = []
-        for i in range(h_unique_keys.size(0)):
+        for i in range(n):
             key = h_unique_keys[i].item()
             tid = h_table_ids[i].item()
             composite_key = (tid, key)
@@ -921,58 +944,37 @@ class PyDictStorage(Storage[DynamicEmbTableOptions, BaseDynamicEmbeddingOptimize
             else:
                 missing_keys.append(key)
                 missing_indices.append(i)
+                missing_table_ids.append(tid)
                 if input_scores is not None:
                     missing_scores_list.append(input_scores[i].item())
                 founds_.append(False)
-        founds_ = torch.tensor(founds_, dtype=torch.bool, device=self.device)
+        founds = self._padded(founds_, capacity, torch.bool)
         if len(results) > 0:
-            unique_embs[founds_, :] = torch.cat(
-                [t.unsqueeze(0) for t in results], dim=0
-            )
+            unique_embs[founds, :] = torch.cat([t.unsqueeze(0) for t in results], dim=0)
 
         num_missing = torch.tensor(
             [len(missing_keys)], dtype=torch.long, device=self.device
         )
-        missing_keys = torch.tensor(
-            missing_keys, dtype=unique_keys.dtype, device=self.device
+        missing_scores = (
+            None
+            if input_scores is None
+            else self._padded(missing_scores_list, capacity, input_scores.dtype)
         )
-        missing_indices = torch.tensor(
-            missing_indices, dtype=torch.long, device=self.device
-        )
-
-        if input_scores is not None and len(missing_scores_list) > 0:
-            missing_scores = torch.tensor(
-                missing_scores_list, dtype=input_scores.dtype, device=self.device
-            )
-        else:
-            missing_scores = torch.empty(0, dtype=torch.uint64, device=self.device)
 
         # output_scores: scores for all keys (0 for missing, input_scores for found)
-        output_scores = torch.zeros(
-            unique_keys.size(0), dtype=torch.int64, device=self.device
-        )
+        output_scores = torch.zeros(capacity, dtype=torch.int64, device=self.device)
         if input_scores is not None:
-            output_scores[founds_] = input_scores[founds_].to(torch.int64)
+            output_scores[founds] = input_scores[founds].to(torch.int64)
 
         return (
             num_missing,
-            missing_keys,
-            missing_indices,
+            self._padded(missing_keys, capacity, unique_keys.dtype),
+            self._padded(missing_indices, capacity, torch.long),
+            self._padded(missing_table_ids, capacity, torch.int64),
             missing_scores,
-            founds_,
+            founds,
             output_scores,
         )
-
-    def find_embeddings(
-        self,
-        unique_keys: torch.Tensor,
-        table_ids: torch.Tensor,
-        unique_embs: torch.Tensor,
-        input_scores: Optional[torch.Tensor] = None,
-    ) -> Tuple[
-        int, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
-    ]:
-        return self.find_impl(unique_keys, table_ids, unique_embs, input_scores)
 
     def find(
         self,
@@ -980,10 +982,11 @@ class PyDictStorage(Storage[DynamicEmbTableOptions, BaseDynamicEmbeddingOptimize
         table_ids: torch.Tensor,
         copy_mode: CopyMode,
         lfu_accumulated_frequency: Optional[torch.Tensor] = None,
+        key_scores: Optional[torch.Tensor] = None,
         *,
-        find_debug_context: Optional[str] = None,
+        num_valid: Optional[torch.Tensor] = None,
     ) -> Tuple[
-        int,
+        torch.Tensor,
         torch.Tensor,
         torch.Tensor,
         torch.Tensor,
@@ -992,6 +995,18 @@ class PyDictStorage(Storage[DynamicEmbTableOptions, BaseDynamicEmbeddingOptimize
         torch.Tensor,
         torch.Tensor,
     ]:
+        """The first ``num_valid`` keys (all of them if ``None``) looked up in the dict.
+
+        Returns ``(num_missing, missing_keys, missing_indices, missing_table_ids,
+        missing_scores, founds, output_scores, values)``: ``num_missing`` is a device
+        tensor, the ``missing_*`` arrays have the capacity of the input with
+        ``num_missing`` live leading entries, and ``founds``, ``output_scores`` and
+        ``values`` have one entry per input key.
+        """
+        if key_scores is not None:
+            raise NotImplementedError(
+                "A score per key is not supported by PyDictStorage."
+            )
         if copy_mode == CopyMode.EMBEDDING:
             out_dim = self._max_emb_dim
         else:
@@ -1003,29 +1018,19 @@ class PyDictStorage(Storage[DynamicEmbTableOptions, BaseDynamicEmbeddingOptimize
             num_missing,
             missing_keys,
             missing_indices,
+            missing_table_ids,
             missing_scores,
             founds,
             output_scores,
         ) = self.find_impl(
-            unique_keys, table_ids, unique_vals, lfu_accumulated_frequency
+            unique_keys, table_ids, unique_vals, lfu_accumulated_frequency, num_valid
         )
-
-        h_table_ids = table_ids.cpu()
-        missing_table_ids_list = []
-        for idx in missing_indices.cpu().tolist():
-            missing_table_ids_list.append(h_table_ids[idx].item())
-        missing_table_ids = torch.tensor(
-            missing_table_ids_list, dtype=torch.int64, device=self.device
-        )
-
         return (
-            num_missing.item()
-            if isinstance(num_missing, torch.Tensor)
-            else num_missing,
+            num_missing,
             missing_keys,
             missing_indices,
             missing_table_ids,
-            missing_scores if missing_scores.numel() > 0 else None,
+            missing_scores,
             founds,
             output_scores,
             unique_vals,
@@ -1038,11 +1043,16 @@ class PyDictStorage(Storage[DynamicEmbTableOptions, BaseDynamicEmbeddingOptimize
         values: torch.Tensor,
         scores: Optional[torch.Tensor] = None,
         preserve_existing: bool = False,
+        *,
+        num_valid: Optional[torch.Tensor] = None,
     ) -> None:
-        h_keys = keys.cpu()
-        h_table_ids = table_ids.cpu()
-        h_scores = scores.cpu() if scores is not None and scores.numel() > 0 else None
-        for i in range(h_keys.size(0)):
+        n = keys.size(0) if num_valid is None else int(num_valid.item())
+        h_keys = keys[:n].cpu()
+        h_table_ids = table_ids[:n].cpu()
+        h_scores = (
+            scores[:n].cpu() if scores is not None and scores.numel() > 0 else None
+        )
+        for i in range(n):
             key = h_keys[i].item()
             tid = h_table_ids[i].item()
             composite_key = (tid, key)
@@ -1359,7 +1369,7 @@ def init_embedding_tables(stbe, bdet):
         num_emb = split.size(0)
         emb_dim = split.size(1)
         opt_state_dim = optimizer.get_state_dim(emb_dim)
-        val_dim = emb_dim + opt_state_dim
+        emb_dim + opt_state_dim
         indices = torch.arange(num_emb, device=split.device, dtype=torch.long)
         table_ids = torch.full(
             (num_emb,), table_idx, dtype=torch.int64, device=split.device
