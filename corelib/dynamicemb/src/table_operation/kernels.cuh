@@ -79,6 +79,19 @@ struct EvalAndCount {
   }
 };
 
+// How many leading entries of a per-key array of capacity `batch` are live: the
+// device count `*num_valid` clamped to [0, batch], or all `batch` when there is
+// no device count (null). Entries from that index on are undefined memory: a
+// kernel reads this once, loops to it, and neither reads nor writes an entry
+// past it.
+__device__ __forceinline__ int64_t
+table_live_count(int64_t const *__restrict__ num_valid, int64_t batch) {
+  if (num_valid == nullptr)
+    return batch;
+  int64_t n = *num_valid;
+  return n < 0 ? 0 : (n > batch ? batch : n);
+}
+
 template <typename Table, int ProbingGroupSize, ScorePolicyType PolicyType,
           bool EnableOverflow = false>
 __global__ void table_lookup_kernel(
@@ -87,15 +100,17 @@ __global__ void table_lookup_kernel(
     int64_t const *__restrict__ table_ids, bool *__restrict__ founds,
     IndexType *__restrict__ indices, ScoreType *__restrict__ score_input,
     int64_t *__restrict__ score_output, Table ovf_table,
-    int64_t const *__restrict__ ovf_output_offsets) {
+    int64_t const *__restrict__ ovf_output_offsets,
+    int64_t const *__restrict__ num_valid) {
 
   using KeyType = typename Table::KeyType;
   using Bucket = typename Table::BucketType;
   using Iter = typename Bucket::Iterator;
 
   auto tid = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  const int64_t n = table_live_count(num_valid, batch);
 
-  for (int64_t i = tid; i < batch; i += gridDim.x * blockDim.x) {
+  for (int64_t i = tid; i < n; i += gridDim.x * blockDim.x) {
 
     KeyType key = input_keys[i];
     ScoreType score = ScorePolicy<PolicyType>::get(score_input, i);
@@ -349,6 +364,8 @@ insert(Bucket &bucket, KeyType key, ScoreType score,
 // the "retain evicted keys" hook for a last-tier table. Only InsertResult::Evict
 // (an existing key pushed out) is collected, never Busy. Default false keeps the
 // plain-insert path (drops the victim) byte-for-byte unchanged (if constexpr).
+// `num_valid` (null: all `batch`) is the device count of live leading entries;
+// see table_live_count.
 template <typename Table, typename KernelTraits,
           typename Evictor = DefaultEvictor, bool CollectEvicted = false>
 __device__ __forceinline__ void
@@ -363,7 +380,8 @@ insert_body(Table table, int64_t const *__restrict__ table_bucket_offsets,
             int32_t *__restrict__ counter, uint64_t cur_ts = 0,
             typename Table::KeyType *__restrict__ evicted_keys = nullptr,
             int64_t *__restrict__ evicted_table_ids = nullptr,
-            CounterType *evicted_counter = nullptr) {
+            CounterType *evicted_counter = nullptr,
+            int64_t const *__restrict__ num_valid = nullptr) {
 
   using KeyType = typename Table::KeyType;
   using Bucket = typename Table::BucketType;
@@ -380,10 +398,11 @@ insert_body(Table table, int64_t const *__restrict__ table_bucket_offsets,
   using Policy = ScorePolicy<PolicyType>;
 
   auto tid = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  const int64_t n = table_live_count(num_valid, batch);
 
   __shared__ ScoreType sm_scores[BlockSize * BufferDim];
 
-  for (int64_t i = tid; i < batch; i += gridDim.x * blockDim.x) {
+  for (int64_t i = tid; i < n; i += gridDim.x * blockDim.x) {
 
     KeyType key = input_keys[i];
     ScoreType score = Policy::get(score_input, i);
@@ -490,11 +509,12 @@ __global__ void table_insert_kernel(
     InsertResult *__restrict__ insert_results, IndexType *__restrict__ indices,
     ScoreType *__restrict__ score_input, int64_t *__restrict__ score_output,
     typename Table::KeyType **__restrict__ table_key_slots,
-    int32_t *__restrict__ counter) {
+    int32_t *__restrict__ counter, int64_t const *__restrict__ num_valid) {
   insert_body<Table, KernelTraits, DefaultEvictor>(
       table, table_bucket_offsets, bucket_sizes, batch, input_keys, table_ids,
       insert_results, indices, score_input, score_output, table_key_slots,
-      counter, /*cur_ts=*/0);
+      counter, /*cur_ts=*/0, /*evicted_keys=*/nullptr,
+      /*evicted_table_ids=*/nullptr, /*evicted_counter=*/nullptr, num_valid);
 }
 
 // AoT entry: plain insert that also retains each evicted victim's (key,
@@ -512,11 +532,13 @@ __global__ void table_insert_collect_kernel(
     typename Table::KeyType **__restrict__ table_key_slots,
     int32_t *__restrict__ counter, CounterType *evicted_counter,
     typename Table::KeyType *__restrict__ evicted_keys,
-    int64_t *__restrict__ evicted_table_ids) {
+    int64_t *__restrict__ evicted_table_ids,
+    int64_t const *__restrict__ num_valid) {
   insert_body<Table, KernelTraits, DefaultEvictor, /*CollectEvicted=*/true>(
       table, table_bucket_offsets, bucket_sizes, batch, input_keys, table_ids,
       insert_results, indices, score_input, score_output, table_key_slots,
-      counter, /*cur_ts=*/0, evicted_keys, evicted_table_ids, evicted_counter);
+      counter, /*cur_ts=*/0, evicted_keys, evicted_table_ids, evicted_counter,
+      num_valid);
 }
 
 template <typename Table, typename KernelTraits, typename Evictor>
@@ -535,7 +557,8 @@ __device__ __forceinline__ void insert_and_evict_body(
     int64_t *__restrict__ evicted_table_ids, int32_t *__restrict__ counter,
     Table ovf_table, int *__restrict__ ovf_bucket_sizes,
     int32_t *__restrict__ ovf_counter,
-    int64_t const *__restrict__ ovf_output_offsets, uint64_t cur_ts) {
+    int64_t const *__restrict__ ovf_output_offsets, uint64_t cur_ts,
+    int64_t const *__restrict__ num_valid) {
 
   using KeyType = typename Table::KeyType;
   using Bucket = typename Table::BucketType;
@@ -553,10 +576,15 @@ __device__ __forceinline__ void insert_and_evict_body(
   using Policy = ScorePolicy<PolicyType>;
 
   auto tid = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  // With a device count the live length is not a multiple of CompactTileSize in
+  // general, so a launch that has one must use CompactTileSize == 1 (see the
+  // dispatch in insert_and_evict.cu): the ballot below then spans one lane, and
+  // the bound needs no rounding.
+  const int64_t n = table_live_count(num_valid, batch);
 
   __shared__ ScoreType sm_scores[BlockSize * BufferDim];
 
-  for (int64_t i = tid; i < batch; i += gridDim.x * blockDim.x) {
+  for (int64_t i = tid; i < n; i += gridDim.x * blockDim.x) {
 
     KeyType key = input_keys[i];
     ScoreType score = Policy::get(score_input, i);
@@ -672,7 +700,9 @@ __device__ __forceinline__ void insert_and_evict_body(
       uint32_t vote = g.ballot(evicted);
       int group_cnt = __popc(vote);
       CounterType group_offset = 0;
-      if (g.thread_rank() == 0) {
+      // A group that evicts nothing takes no slot, so it needs no atomic: with a
+      // tile of 1 (every launch that has a device count) that is most threads.
+      if (g.thread_rank() == 0 && group_cnt > 0) {
         group_offset =
             atomicAdd(evicted_counter, static_cast<CounterType>(group_cnt));
       }
@@ -732,25 +762,28 @@ __global__ void table_insert_and_evict_kernel(
     int64_t *__restrict__ evicted_table_ids, int32_t *__restrict__ counter,
     Table ovf_table, int *__restrict__ ovf_bucket_sizes,
     int32_t *__restrict__ ovf_counter,
-    int64_t const *__restrict__ ovf_output_offsets) {
+    int64_t const *__restrict__ ovf_output_offsets,
+    int64_t const *__restrict__ num_valid) {
   insert_and_evict_body<Table, KernelTraits, DefaultEvictor>(
       table, table_bucket_offsets, bucket_sizes, batch, input_keys, table_ids,
       insert_results, indices, score_input, score_output, table_key_slots,
       evicted_counter, evicted_keys, evicted_scores, evicted_indices,
       evicted_table_ids, counter, ovf_table, ovf_bucket_sizes, ovf_counter,
-      ovf_output_offsets, /*cur_ts=*/0);
+      ovf_output_offsets, /*cur_ts=*/0, num_valid);
 }
 
 template <typename Table>
 __global__ void
 table_unlock_kernel(Table table, int64_t batch,
                     typename Table::KeyType const *__restrict__ input_keys,
-                    typename Table::KeyType **__restrict__ table_key_slots) {
+                    typename Table::KeyType **__restrict__ table_key_slots,
+                    int64_t const *__restrict__ num_valid) {
   using KeyType = typename Table::KeyType;
 
   auto tid = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  const int64_t n = table_live_count(num_valid, batch);
 
-  for (int64_t i = tid; i < batch; i += gridDim.x * blockDim.x) {
+  for (int64_t i = tid; i < n; i += gridDim.x * blockDim.x) {
     KeyType key = input_keys[i];
     KeyType *key_slot = table_key_slots[i];
     if (key_slot) {
@@ -764,15 +797,17 @@ __global__ void table_erase_kernel(
     Table table, int64_t const *__restrict__ table_bucket_offsets,
     int *__restrict__ bucket_sizes, int64_t batch,
     typename Table::KeyType const *__restrict__ input_keys,
-    int64_t const *__restrict__ table_ids, IndexType *__restrict__ indices) {
+    int64_t const *__restrict__ table_ids, IndexType *__restrict__ indices,
+    int64_t const *__restrict__ num_valid) {
 
   using KeyType = typename Table::KeyType;
   using Bucket = typename Table::BucketType;
   using Iter = typename Bucket::Iterator;
 
   auto tid = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  const int64_t n = table_live_count(num_valid, batch);
 
-  for (int64_t i = tid; i < batch; i += gridDim.x * blockDim.x) {
+  for (int64_t i = tid; i < n; i += gridDim.x * blockDim.x) {
 
     KeyType key = input_keys[i];
 

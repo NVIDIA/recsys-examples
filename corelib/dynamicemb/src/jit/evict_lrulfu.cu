@@ -73,7 +73,7 @@ __device__ __forceinline__ void run_evict(const EvictParams &p,
       p.indices, p.score_input, p.score_output, p.table_key_slots,
       p.evicted_counter, p.evicted_keys, p.evicted_scores, p.evicted_indices,
       p.evicted_table_ids, p.counter, ovf_table, p.ovf_bucket_sizes,
-      p.ovf_counter, p.ovf_output_offsets, cur_ts);
+      p.ovf_counter, p.ovf_output_offsets, cur_ts, p.num_valid);
 }
 
 extern "C" __global__ void dyn_emb_evict_entry_ovf(EvictParams p) {
@@ -102,7 +102,8 @@ __device__ __forceinline__ void run_insert(const EvictParams &p,
       table, p.table_bucket_offsets, p.bucket_sizes, p.batch, p.input_keys,
       p.table_ids, reinterpret_cast<InsertResult *>(p.insert_results),
       p.indices, p.score_input, p.score_output, p.table_key_slots, p.counter,
-      cur_ts);
+      cur_ts, /*evicted_keys=*/nullptr, /*evicted_table_ids=*/nullptr,
+      /*evicted_counter=*/nullptr, p.num_valid);
 }
 
 extern "C" __global__ void dyn_emb_insert_entry(EvictParams p) {
@@ -128,7 +129,8 @@ __device__ __forceinline__ void run_insert_collect(const EvictParams &p,
       table, p.table_bucket_offsets, p.bucket_sizes, p.batch, p.input_keys,
       p.table_ids, reinterpret_cast<InsertResult *>(p.insert_results),
       p.indices, p.score_input, p.score_output, p.table_key_slots, p.counter,
-      cur_ts, p.evicted_keys, p.evicted_table_ids, p.evicted_counter);
+      cur_ts, p.evicted_keys, p.evicted_table_ids, p.evicted_counter,
+      p.num_valid);
 }
 
 extern "C" __global__ void dyn_emb_insert_collect_entry(EvictParams p) {
