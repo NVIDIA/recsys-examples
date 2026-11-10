@@ -7,28 +7,12 @@
   "seed": 1234,
   "alloc_events_max": 1,
   "measured": {
-   "time": "2026-11-09 11:29:03",
+   "label": "nhs2-int ab827883 + nhs2-fx-probe, H100 eos0449 GPU 4",
+   "time": "2026-11-09 18:24:02",
    "device": "NVIDIA H100 80GB HBM3",
    "torch": "2.13.0a0+9186a08b2c.nv26.07",
    "cuda": "13.3",
    "python": "3.12.3"
-  },
-  "unmeasured": {
-   "what": "the cells below are claims, not measurements: the commit that deleted the device synchronize of ExtendableBuffer.extend set them to 0 before a census could run on a GPU. Take the census (host_sync_probe.py --json census.json; sync_budgets.py --from-report census.json --write) once the hardware gates of growth/gates have passed; a cell that measures above its claim names the call that still waits.",
-   "lowered_to_zero": [
-    "cache_storage_growth",
-    "hbm_only_growth",
-    "host_only_growth",
-    "cache_storage_noevict",
-    "hbm_only_noevict"
-   ],
-   "new_configs": [
-    "hybrid_growth",
-    "host_only_noevict",
-    "hbm_only_growth_wide",
-    "host_only_growth_wide",
-    "hbm_only_noevict_wide"
-   ]
   }
  },
  "cache_storage": {
@@ -49,15 +33,15 @@
  },
  "cache_ps": {
   "all_hit": {"plain": 1, "prefetch": 1},
-  "miss": {"plain": 18, "prefetch": 18},
-  "miss_evict": {"plain": 21, "prefetch": 21},
-  "tier2_hit": {"plain": 18, "prefetch": 18}
+  "miss": {"plain": 13, "prefetch": 13},
+  "miss_evict": {"plain": 15, "prefetch": 15},
+  "tier2_hit": {"plain": 12, "prefetch": 12}
  },
  "cache_ps_sum": {
   "all_hit": {"plain": 1, "prefetch": 1},
-  "miss": {"plain": 18, "prefetch": 18},
-  "miss_evict": {"plain": 21, "prefetch": 21},
-  "tier2_hit": {"plain": 18, "prefetch": 18}
+  "miss": {"plain": 13, "prefetch": 13},
+  "miss_evict": {"plain": 15, "prefetch": 15},
+  "tier2_hit": {"plain": 12, "prefetch": 12}
  },
  "hbm_only": {
   "all_hit": {"plain": 0, "prefetch": 0},
