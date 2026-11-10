@@ -1,0 +1,22 @@
+AGG i32 * 3 + i32
+AGG i64 % 1000 - i64 / 7
+AGG f64 * f64 + f64
+AGG case when f64 > 0 then f64 else -f64 end
+AGG coalesce(i32, 0) + 1
+AGG cast(f64 as bigint) % 10
+AGG abs(i16) + abs(i8)
+AGG year(d) * 100 + month(d)
+AGG b and (i32 > 0)
+AGG sqrt(abs(f64)) + exp(f64 / 1000)
+AGG greatest(f64, 0.0) - least(f64, 1.0)
+AGG round(f64, 2)
+AGG i16 * i16 + i8 * i8
+GRP i32 % 100 + i64 % 7
+GRP f64 * 2.0 + 1.0
+GRP case when i32 > 0 then 1 else 2 end
+GRP abs(i16) + 3
+GRPKEY i32 % 5 + i8 % 3
+GRPKEY (i16 + 1) > 3
+GRPKEY year(d) % 7
+GRPKEY cast(f64 as int) % 4
+GRPKEY if(b, i32 % 3, i64 % 3)

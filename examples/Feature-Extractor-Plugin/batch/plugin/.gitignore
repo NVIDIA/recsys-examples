@@ -1,0 +1,20 @@
+# local dependencies / generated data / build output (spark-fusion-plugin only)
+.toolchain/
+work/
+target/
+tests/out/
+tests/data/
+tests/udf/classes/
+tests/udf/udfs.jar
+bench/data/
+bench/out/
+experiments/vec/classes/
+metastore_db/
+spark-warehouse/
+derby.log
+*.jar
+*.class
+*.log
+!docs/perf-logs/**/*.log
+__pycache__/
+*.pyc

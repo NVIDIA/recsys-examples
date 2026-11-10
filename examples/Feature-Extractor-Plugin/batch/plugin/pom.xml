@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+  <groupId>com.nvidia.fusion</groupId>
+  <artifactId>gpu-fusion-plugin</artifactId>
+  <version>0.1.0</version>
+  <packaging>jar</packaging>
+  <properties>
+    <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+    <scala.version>2.12.18</scala.version>
+    <!-- override with -Dtoolchain.dir=... or -Drapids.jar=... -Drapids.shim.jar=... (plugin/scripts/build.sh passes them from env) -->
+    <toolchain.dir>${project.basedir}/../.toolchain</toolchain.dir>
+    <rapids.jar>${toolchain.dir}/rapids-4-spark_2.12-26.08.1-cuda12.jar</rapids.jar>
+    <rapids.shim.jar>${toolchain.dir}/rapids-shim359.jar</rapids.shim.jar>
+  </properties>
+  <dependencies>
+    <dependency><groupId>org.scala-lang</groupId><artifactId>scala-library</artifactId><version>${scala.version}</version><scope>provided</scope></dependency>
+    <dependency><groupId>org.apache.spark</groupId><artifactId>spark-sql_2.12</artifactId><version>3.5.9</version><scope>provided</scope></dependency>
+    <dependency><groupId>org.apache.spark</groupId><artifactId>spark-catalyst_2.12</artifactId><version>3.5.9</version><scope>provided</scope></dependency>
+    <dependency><groupId>org.apache.spark</groupId><artifactId>spark-core_2.12</artifactId><version>3.5.9</version><scope>provided</scope></dependency>
+    <!-- spark-rapids: root classes + cuDF java come from the dist jar; shim classes (spark-shared + spark359) from the jar made by scripts/make-shim-jar.sh -->
+    <dependency><groupId>com.nvidia</groupId><artifactId>rapids-4-spark-local</artifactId><version>26.08.1</version><scope>system</scope><systemPath>${rapids.jar}</systemPath></dependency>
+    <dependency><groupId>com.nvidia</groupId><artifactId>rapids-4-spark-shim359</artifactId><version>26.08.1</version><scope>system</scope><systemPath>${rapids.shim.jar}</systemPath></dependency>
+    <dependency><groupId>org.jcuda</groupId><artifactId>jcuda</artifactId><version>12.0.0</version>
+      <exclusions><exclusion><groupId>org.jcuda</groupId><artifactId>jcuda-natives</artifactId></exclusion></exclusions></dependency>
+    <dependency><groupId>org.jcuda</groupId><artifactId>jcuda-natives</artifactId><version>12.0.0</version><classifier>linux-x86_64</classifier></dependency>
+  </dependencies>
+  <build>
+    <sourceDirectory>src/main/scala</sourceDirectory>
+    <plugins>
+      <plugin>
+        <groupId>net.alchim31.maven</groupId><artifactId>scala-maven-plugin</artifactId><version>4.9.2</version>
+        <executions><execution><goals><goal>compile</goal><goal>testCompile</goal></goals></execution></executions>
+        <configuration><scalaVersion>${scala.version}</scalaVersion><args><arg>-deprecation</arg><arg>-target:jvm-1.8</arg></args></configuration>
+      </plugin>
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId><artifactId>maven-shade-plugin</artifactId><version>3.5.1</version>
+        <executions><execution><phase>package</phase><goals><goal>shade</goal></goals>
+          <configuration><createDependencyReducedPom>false</createDependencyReducedPom>
+            <artifactSet><includes><include>org.jcuda:*</include></includes></artifactSet>
+            <filters><filter><artifact>*:*</artifact><excludes><exclude>META-INF/*.SF</exclude><exclude>META-INF/*.DSA</exclude><exclude>META-INF/*.RSA</exclude></excludes></filter></filters>
+          </configuration></execution></executions>
+      </plugin>
+    </plugins>
+  </build>
+</project>
