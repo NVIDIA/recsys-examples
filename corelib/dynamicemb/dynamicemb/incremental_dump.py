@@ -108,7 +108,9 @@ class DeltaDumpResult:
                 erases were retained (``erase_keys(..., mode=RETAIN_KEY)``); see
                 ``erase_untracked``.
             meta[i]["erase_untracked"]:  bool -- the table erased keys without
-                retaining them (on any rank of the dumping group), so
+                retaining them (``erase_keys`` without ``RETAIN_KEY``, or
+                ``erase_by_score_async``, which retains nothing; on any rank of
+                the dumping group), so
                 ``erased_slot_index`` misses the slots they
                 left and the delta cannot be replayed exactly. Sticky.
                 ``replay_increment`` refuses such a delta.

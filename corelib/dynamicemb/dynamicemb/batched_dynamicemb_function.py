@@ -15,15 +15,17 @@
 
 from dataclasses import dataclass
 from enum import Enum, auto
-from typing import Optional, Tuple
+from typing import Callable, ContextManager, Optional, Tuple
 
 import torch
+from dynamicemb.async_erase import table_section
 from dynamicemb.dynamicemb_config import EvictedItemMode
 from dynamicemb.initializer import MultiTableInitializer
 from dynamicemb.key_value_table import (
     Cache,
     DynamicEmbCache,
     DynamicEmbStorage,
+    DynamicEmbTableState,
     Storage,
     _append_evicted,
     _find_keys,
@@ -210,6 +212,34 @@ class PrefetchState:
     unique_scores: Optional[torch.Tensor] = None
     num_prefetched_keys: int = 0
     outstanding_keys_ref: Optional[torch.Tensor] = None
+    # The key_map_generation (rehash count) of the table state the slots were found in: a later
+    # prefetch may expand it before this batch's backward runs.
+    key_map_generation: int = 0
+
+
+def _slots_after_rehash(
+    state: DynamicEmbTableState,
+    unique_keys: torch.Tensor,
+    unique_table_ids: torch.Tensor,
+    slot_indices: torch.Tensor,
+) -> torch.Tensor:
+    """The slots of a batch's keys in ``state`` as it is now, for a batch
+    whose prefetch found them before a rehash moved them: the keys are looked
+    up again, read only (their ref counts kept them in the table). A key the
+    prefetch did not admit stays without a slot. Value rows do not move: a
+    storage keeps each key's row through a rehash, and a cache does not
+    rehash."""
+    # Only a table that stores a row per key keeps its value rows through a
+    # rehash (``use_rows_``). Without it the row is the slot and the value moves
+    # with the key, so ``value_row_indices`` would go stale too: not handled here.
+    assert state.key_index_map.use_rows_, (
+        "a rehash since the prefetch is only handled for a table that stores a "
+        "value row per key (DynamicEmbStorage); a cache does not rehash"
+    )
+    slots = _find_keys(
+        state, unique_keys, unique_table_ids, const_lookup=True, return_slots=True
+    )[-1]
+    return torch.where(slot_indices >= 0, slots, slot_indices)
 
 
 def _is_hbm_storage(storage: Storage) -> bool:
@@ -805,6 +835,7 @@ def dynamicemb_prefetch(
     outstanding_keys_ref: Optional[torch.Tensor] = None,
     external_storage: Optional[Storage] = None,
     scores: Optional[torch.Tensor] = None,
+    table_gate: Optional[Callable[[], ContextManager]] = None,
 ) -> PrefetchState:
     """Unified prefetch for all storage types (cache, HBM-direct, generic).
 
@@ -815,6 +846,11 @@ def dynamicemb_prefetch(
     follow the keys through the dedup on a channel of their own, beside the
     frequency counters: where a key repeats in the batch, the largest of its
     scores is the one the table gets.
+
+    ``table_gate`` is what an erase running beside the training takes too (see
+    ``async_erase.TableAccessGate``). Prefetch holds it while it reads or changes the
+    tables -- from the expansion through the find and the counter increment -- so
+    that a key it found is pinned before an erase can look at it.
     """
     with torch.cuda.nvtx.range("dynamicemb_prefetch"):
         table_num = feature_offsets.numel() - 1
@@ -856,9 +892,6 @@ def dynamicemb_prefetch(
 
         num_prefetched_keys = unique_keys.numel()
 
-        if hasattr(storage, "expand_if_need"):
-            storage.expand_if_need(unique_size_per_table)
-
         unique_table_ids = expand_table_ids_cuda(
             unique_indices_table_range,
             unique_keys.numel(),
@@ -867,6 +900,7 @@ def dynamicemb_prefetch(
         slot_indices = None
         non_admitted_positions = None
         value_row_indices = None
+        key_map_generation = 0
         if caching:
             storage_mode = StorageMode.CACHE
         elif _is_hbm_storage(storage):
@@ -874,58 +908,63 @@ def dynamicemb_prefetch(
         else:
             storage_mode = StorageMode.DEFAULT
 
-        if storage_mode == StorageMode.CACHE:
-            if outstanding_keys_ref is not None:
-                outstanding_keys_ref += num_prefetched_keys
-                cache_capacity = cache._state.capacity
-                outstanding_keys = _scalar_item(outstanding_keys_ref)
-                if outstanding_keys > cache_capacity:
-                    raise RuntimeError(
-                        f"Outstanding prefetched keys "
-                        f"({outstanding_keys}) "
-                        f"exceed cache capacity ({cache_capacity}). "
-                        "Reduce prefetch pipeline depth or increase "
-                        "cache size."
-                    )
-            (
-                slot_indices,
-                non_admitted_positions,
-            ) = _prefetch_cache_path(
-                cache,
-                storage,
-                unique_keys,
-                unique_table_ids,
-                max_emb_dim,
-                max_val_dim,
-                emb_dtype,
-                initializer,
-                evict_strat,
-                lfu_accumulated_frequency,
-                admitter,
-                external_storage,
-                key_scores=unique_scores,
-            )
-            # The cache addresses its own value buffer by cache slot: a cache is
-            # never NO_EVICTION (it enables overflow, which NO_EVICTION rejects
-            # at construction), so the two index spaces coincide here.
-            value_row_indices = slot_indices
-        elif storage_mode == StorageMode.HBM_DIRECT:
-            (
-                slot_indices,
-                non_admitted_positions,
-                value_row_indices,
-            ) = _prefetch_hbm_direct_path(
-                storage,
-                unique_keys,
-                unique_table_ids,
-                max_emb_dim,
-                max_val_dim,
-                initializer,
-                evict_strat,
-                lfu_accumulated_frequency,
-                admitter,
-                key_scores=unique_scores,
-            )
+        with table_section(table_gate):
+            if hasattr(storage, "expand_if_need"):
+                storage.expand_if_need(unique_size_per_table)
+
+            if storage_mode == StorageMode.CACHE:
+                if outstanding_keys_ref is not None:
+                    outstanding_keys_ref += num_prefetched_keys
+                    cache_capacity = cache._state.capacity
+                    outstanding_keys = _scalar_item(outstanding_keys_ref)
+                    if outstanding_keys > cache_capacity:
+                        raise RuntimeError(
+                            f"Outstanding prefetched keys "
+                            f"({outstanding_keys}) "
+                            f"exceed cache capacity ({cache_capacity}). "
+                            "Reduce prefetch pipeline depth or increase "
+                            "cache size."
+                        )
+                (
+                    slot_indices,
+                    non_admitted_positions,
+                ) = _prefetch_cache_path(
+                    cache,
+                    storage,
+                    unique_keys,
+                    unique_table_ids,
+                    max_emb_dim,
+                    max_val_dim,
+                    emb_dtype,
+                    initializer,
+                    evict_strat,
+                    lfu_accumulated_frequency,
+                    admitter,
+                    external_storage,
+                    key_scores=unique_scores,
+                )
+                # The cache addresses its own value buffer by cache slot: a cache is
+                # never NO_EVICTION (it enables overflow, which NO_EVICTION rejects
+                # at construction), so the two index spaces coincide here.
+                value_row_indices = slot_indices
+            elif storage_mode == StorageMode.HBM_DIRECT:
+                (
+                    slot_indices,
+                    non_admitted_positions,
+                    value_row_indices,
+                ) = _prefetch_hbm_direct_path(
+                    storage,
+                    unique_keys,
+                    unique_table_ids,
+                    max_emb_dim,
+                    max_val_dim,
+                    initializer,
+                    evict_strat,
+                    lfu_accumulated_frequency,
+                    admitter,
+                    key_scores=unique_scores,
+                )
+                key_map_generation = storage._state.key_map_generation
 
         return PrefetchState(
             unique_keys=unique_keys,
@@ -941,6 +980,7 @@ def dynamicemb_prefetch(
             num_prefetched_keys=num_prefetched_keys,
             outstanding_keys_ref=outstanding_keys_ref,
             value_row_indices=value_row_indices,
+            key_map_generation=key_map_generation,
         )
 
 
@@ -1284,6 +1324,7 @@ class DynamicEmbeddingFunction(torch.autograd.Function):
             # Same split as the forward: the fused optimizer writes into the
             # value buffer (rows), the ref counter is indexed by hash slot.
             ctx.update_value_rows = prefetch_state.value_row_indices
+            ctx.key_map_generation = prefetch_state.key_map_generation
             ctx.storage_mode = prefetch_state.storage_mode
             ctx.optimizer = optimizer
             ctx.layout = layout
@@ -1355,6 +1396,14 @@ class DynamicEmbeddingFunction(torch.autograd.Function):
                         if ctx.storage_mode == StorageMode.CACHE
                         else storage._state
                     )
+                    # A later batch's prefetch may have rehashed the table
+                    # since this one's prefetch (prefetch pipelines, several
+                    # forwards before their backwards).
+                    if ctx.key_map_generation != state.key_map_generation:
+                        ctx.slot_indices = _slots_after_rehash(
+                            state, ctx.unique_keys, unique_table_ids, ctx.slot_indices
+                        )
+                        ctx.key_map_generation = state.key_map_generation
                     with torch.cuda.nvtx.range("op:optimizer_update_fused"):
                         optimizer.fused_update_for_flat_table(
                             unique_grads.to(ctx.emb_dtype),

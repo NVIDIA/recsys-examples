@@ -347,9 +347,10 @@ def per_rank_storage(
     than read off it: a ParameterSharding records decisions, and the options a
     table was planned with live with the constraints, in one place.
 
-    **Tables are costed in groups, because the runtime fuses them.** A group's
-    HBM budget is the sum of its members', spent on the sum of their sizes, so a
-    table whose budget exceeds its size lends the remainder to its groupmates.
+    **Tables are costed in groups, because the runtime fuses them.** A group
+    whose summed size fits its summed HBM budget is held entirely in HBM, so
+    there a table whose budget exceeds its size covers its groupmates (a group
+    that does not fit splits each table on its own budget, and lends nothing).
     Costing each table alone gives ``sum(min(total, budget))``, which is at most
     ``min(sum total, sum budget)`` -- it under-states HBM, and that is the
     direction that lets a plan through which the machine will not hold.

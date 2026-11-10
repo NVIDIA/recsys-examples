@@ -13,6 +13,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import torch  # noqa: F401  # load libc10 before dynamicemb_extensions
+from dynamicemb_extensions import device_timestamp
+
+from .async_erase import EraseHandle, erase_by_score_async
 from .dump_load import DynamicEmbDump, DynamicEmbLoad
 from .dynamicemb_config import (
     BATCH_SIZE_PER_DUMP,
@@ -94,6 +98,9 @@ __all__ = [
     "string_to_evict_strategy",
     "DynamicEmbDump",
     "DynamicEmbLoad",
+    "EraseHandle",
+    "device_timestamp",
+    "erase_by_score_async",
     "DeltaDumpResult",
     "ReplayStats",
     "pop_erased_keys",

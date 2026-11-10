@@ -41,6 +41,7 @@ def generate_deterministic_sparse_features_with_frequency_tracking(
     world_size: int,
     batch_size: int,
     num_iterations: int,
+    empty_rank_iteration: Optional[int] = None,
     seed: int = 42,
     caching: bool = False,
 ) -> Tuple[List[KeyedJaggedTensor], Dict[str, Dict[int, int]]]:
@@ -48,6 +49,7 @@ def generate_deterministic_sparse_features_with_frequency_tracking(
     Generate deterministic sparse features and track frequency for each embedding table.
 
     Args:
+        empty_rank_iteration: At this iteration rank 0 has no keys
         caching: If True, generate more unique keys to trigger cache eviction
 
     Returns:
@@ -91,13 +93,16 @@ def generate_deterministic_sparse_features_with_frequency_tracking(
                         # In storage-only mode, limit to 100 keys for more duplicates
                         max_key = min(num_embedding - 1, 100)
                     indices = [random.randint(0, max_key) for _ in range(hotness)]
+                    sample_rank = sample_id // batch_size_per_rank
+                    if iteration == empty_rank_iteration and sample_rank == 0:
+                        indices = []
                     # Track frequency for all generated indices
                     for idx in indices:
                         table_frequency_counters[embedding_name][idx] += 1
 
-                    if sample_id // batch_size_per_rank == rank:
+                    if sample_rank == rank:
                         cur_indices.extend(indices)
-                        cur_lengths.append(hotness)
+                        cur_lengths.append(len(indices))
 
                 keys.append(feature_name)
 
@@ -281,6 +286,12 @@ def validate_non_admitted_embedding_values(
     help="Cache capacity as ratio of storage capacity (only used when --caching is enabled)",
 )
 @click.option(
+    "--empty-rank-iteration",
+    type=int,
+    default=None,
+    help="At this iteration rank 0 has no keys.",
+)
+@click.option(
     "--score-strategy",
     type=click.Choice(["timestamp", "lfu", "step"]),
     default="timestamp",
@@ -339,6 +350,7 @@ def test_admission_strategy_validation(
     threshold: int,
     caching: bool,
     cache_capacity_ratio: float,
+    empty_rank_iteration: Optional[int],
     score_strategy: str,
     global_hbm_budget_scale: float,
     non_admitted_init_value: float,
@@ -375,6 +387,7 @@ def test_admission_strategy_validation(
     print(f"  - Optimizer: {optimizer_type}")
     print(f"  - Batch size: {batch_size}")
     print(f"  - Iterations: {num_iterations}")
+    print(f"  - Empty rank iteration: {empty_rank_iteration}")
     print(f"  - Admission threshold: {threshold}")
     print(f"  - Use index dedup: {use_index_dedup}")
     print(f"  - Score strategy: {score_strategy}")
@@ -445,6 +458,7 @@ def test_admission_strategy_validation(
         world_size=dist.get_world_size(),
         batch_size=batch_size,
         num_iterations=num_iterations,
+        empty_rank_iteration=empty_rank_iteration,
         caching=caching,
     )
 
@@ -591,6 +605,18 @@ def _build_cases():
                     "expect_all_rejected": True,
                 },
             }
+
+    # Rank 0 has no keys at iteration 1. With the timestamp score, only
+    # admission makes index dedup send how often each key occurs.
+    cases["empty-rank"] = {
+        "gpus": (8,),
+        "options": {
+            **_FOUR_TABLES,
+            "optimizer_type": "sgd",
+            "score_strategy": "timestamp",
+            "empty_rank_iteration": 1,
+        },
+    }
 
     return cases
 
