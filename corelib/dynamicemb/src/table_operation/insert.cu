@@ -28,7 +28,8 @@ void launch_table_insert_kernel(
     int64_t *table_ids_ptr, InsertResult *insert_results_ptr,
     IndexType *indices_ptr, ScoreType *score_input_ptr,
     int64_t *score_output_ptr, typename Table::KeyType **table_key_slots_ptr,
-    int32_t *counter_ptr, int64_t score_fn_key, cudaStream_t stream) {
+    int32_t *counter_ptr, int64_t score_fn_key, int64_t const *num_valid_ptr,
+    cudaStream_t stream) {
   constexpr int BLOCK_SIZE = 256;
   using KernelTraits =
       InsertKernelTraits<BLOCK_SIZE, 1, 1, 1, 8, PolicyTypeV, OutputScoreV>;
@@ -47,6 +48,7 @@ void launch_table_insert_kernel(
     p.table_bucket_offsets = table_bucket_offsets_ptr;
     p.bucket_sizes = bucket_sizes_ptr;
     p.batch = num_total;
+    p.num_valid = num_valid_ptr;
     p.input_keys = reinterpret_cast<const int64_t *>(keys_ptr);
     p.table_ids = table_ids_ptr;
     p.insert_results = reinterpret_cast<uint8_t *>(insert_results_ptr);
@@ -59,16 +61,18 @@ void launch_table_insert_kernel(
     demb_launch_evict(fn, p, num_total, stream);
   } else {
     table_insert_kernel<Table, KernelTraits>
-        <<<(num_total + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE, 0, stream>>>(
+        <<<table_grid_size(num_total, BLOCK_SIZE, num_valid_ptr != nullptr),
+           BLOCK_SIZE, 0, stream>>>(
             table, table_bucket_offsets_ptr, bucket_sizes_ptr, num_total,
             keys_ptr, table_ids_ptr, insert_results_ptr, indices_ptr,
             score_input_ptr, score_output_ptr, table_key_slots_ptr,
-            counter_ptr);
+            counter_ptr, num_valid_ptr);
   }
 
   table_unlock_kernel<Table>
-      <<<(num_total + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE, 0, stream>>>(
-          table, num_total, keys_ptr, table_key_slots_ptr);
+      <<<table_grid_size(num_total, BLOCK_SIZE, num_valid_ptr != nullptr),
+         BLOCK_SIZE, 0, stream>>>(table, num_total, keys_ptr,
+                                  table_key_slots_ptr, num_valid_ptr);
 }
 
 // Plain insert that ALSO retains each evicted victim's (key, table_id). Mirrors
@@ -83,7 +87,7 @@ void launch_table_insert_collect_kernel(
     int64_t *score_output_ptr, typename Table::KeyType **table_key_slots_ptr,
     int32_t *counter_ptr, CounterType *evicted_counter_ptr,
     typename Table::KeyType *evicted_keys_ptr, int64_t *evicted_table_ids_ptr,
-    int64_t score_fn_key, cudaStream_t stream) {
+    int64_t score_fn_key, int64_t const *num_valid_ptr, cudaStream_t stream) {
   constexpr int BLOCK_SIZE = 256;
   using KernelTraits =
       InsertKernelTraits<BLOCK_SIZE, 1, 1, 1, 8, PolicyTypeV, OutputScoreV>;
@@ -97,6 +101,7 @@ void launch_table_insert_collect_kernel(
     p.table_bucket_offsets = table_bucket_offsets_ptr;
     p.bucket_sizes = bucket_sizes_ptr;
     p.batch = num_total;
+    p.num_valid = num_valid_ptr;
     p.input_keys = reinterpret_cast<const int64_t *>(keys_ptr);
     p.table_ids = table_ids_ptr;
     p.insert_results = reinterpret_cast<uint8_t *>(insert_results_ptr);
@@ -112,16 +117,19 @@ void launch_table_insert_collect_kernel(
     demb_launch_evict(fn, p, num_total, stream);
   } else {
     table_insert_collect_kernel<Table, KernelTraits>
-        <<<(num_total + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE, 0, stream>>>(
+        <<<table_grid_size(num_total, BLOCK_SIZE, num_valid_ptr != nullptr),
+           BLOCK_SIZE, 0, stream>>>(
             table, table_bucket_offsets_ptr, bucket_sizes_ptr, num_total,
             keys_ptr, table_ids_ptr, insert_results_ptr, indices_ptr,
             score_input_ptr, score_output_ptr, table_key_slots_ptr, counter_ptr,
-            evicted_counter_ptr, evicted_keys_ptr, evicted_table_ids_ptr);
+            evicted_counter_ptr, evicted_keys_ptr, evicted_table_ids_ptr,
+            num_valid_ptr);
   }
 
   table_unlock_kernel<Table>
-      <<<(num_total + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE, 0, stream>>>(
-          table, num_total, keys_ptr, table_key_slots_ptr);
+      <<<table_grid_size(num_total, BLOCK_SIZE, num_valid_ptr != nullptr),
+         BLOCK_SIZE, 0, stream>>>(table, num_total, keys_ptr,
+                                  table_key_slots_ptr, num_valid_ptr);
 }
 
 void table_insert_single_score(at::Tensor table_storage,
@@ -133,7 +141,8 @@ void table_insert_single_score(at::Tensor table_storage,
                                std::optional<at::Tensor> insert_results,
                                std::optional<at::Tensor> score_output,
                                std::optional<at::Tensor> counter,
-                               int64_t num_scores, int64_t score_fn_key) {
+                               int64_t num_scores, int64_t score_fn_key,
+                               int64_t const *num_valid_ptr) {
 
   auto key_type = get_data_type(keys);
 
@@ -192,13 +201,13 @@ void table_insert_single_score(at::Tensor table_storage,
             table, table_bucket_offsets_ptr, bucket_sizes_ptr, num_total,
             keys_ptr, table_ids_ptr, insert_results_ptr, indices_ptr,
             score_input_ptr, score_output_ptr, table_key_slots_ptr, counter_ptr,
-            score_fn_key, stream);
+            score_fn_key, num_valid_ptr, stream);
       } else {
         launch_table_insert_kernel<Table, PolicyTypeV, false>(
             table, table_bucket_offsets_ptr, bucket_sizes_ptr, num_total,
             keys_ptr, table_ids_ptr, insert_results_ptr, indices_ptr,
             score_input_ptr, nullptr, table_key_slots_ptr, counter_ptr,
-            score_fn_key, stream);
+            score_fn_key, num_valid_ptr, stream);
       }
     });
   });
@@ -214,7 +223,8 @@ at::Tensor table_insert(at::Tensor table_storage,
                         std::optional<at::Tensor> counter,
                         std::optional<at::Tensor> insert_results,
                         std::optional<at::Tensor> score_output,
-                        int64_t num_scores, int64_t score_fn_key) {
+                        int64_t num_scores, int64_t score_fn_key,
+                        std::optional<at::Tensor> num_valid) {
 
   int64_t num_total = keys.size(0);
   if (num_total == 0) {
@@ -227,7 +237,8 @@ at::Tensor table_insert(at::Tensor table_storage,
   table_insert_single_score(table_storage, table_bucket_offsets,
                             bucket_capacity, bucket_sizes, keys, table_ids,
                             score_input, policy_type, indices, insert_results,
-                            score_output, counter, num_scores, score_fn_key);
+                            score_output, counter, num_scores, score_fn_key,
+                            table_num_valid_pointer(num_valid));
 
   return indices;
 }
@@ -242,7 +253,8 @@ void table_insert_collect_single_score(
     std::optional<at::Tensor> insert_results,
     std::optional<at::Tensor> score_output, std::optional<at::Tensor> counter,
     int64_t num_scores, int64_t score_fn_key, at::Tensor evicted_counter,
-    at::Tensor evicted_keys, at::Tensor evicted_table_ids) {
+    at::Tensor evicted_keys, at::Tensor evicted_table_ids,
+    int64_t const *num_valid_ptr) {
 
   auto key_type = get_data_type(keys);
 
@@ -306,14 +318,14 @@ void table_insert_collect_single_score(
             keys_ptr, table_ids_ptr, insert_results_ptr, indices_ptr,
             score_input_ptr, score_output_ptr, table_key_slots_ptr, counter_ptr,
             evicted_counter_ptr, evicted_keys_ptr, evicted_table_ids_ptr,
-            score_fn_key, stream);
+            score_fn_key, num_valid_ptr, stream);
       } else {
         launch_table_insert_collect_kernel<Table, PolicyTypeV, false>(
             table, table_bucket_offsets_ptr, bucket_sizes_ptr, num_total,
             keys_ptr, table_ids_ptr, insert_results_ptr, indices_ptr,
             score_input_ptr, nullptr, table_key_slots_ptr, counter_ptr,
             evicted_counter_ptr, evicted_keys_ptr, evicted_table_ids_ptr,
-            score_fn_key, stream);
+            score_fn_key, num_valid_ptr, stream);
       }
     });
   });
@@ -333,7 +345,7 @@ table_insert_collect_evicted(
     ScorePolicyType policy_type, std::optional<at::Tensor> counter,
     std::optional<at::Tensor> insert_results,
     std::optional<at::Tensor> score_output, int64_t num_scores,
-    int64_t score_fn_key) {
+    int64_t score_fn_key, std::optional<at::Tensor> num_valid) {
 
   auto i64 = keys.options().dtype(torch::kInt64);
   int64_t num_total = keys.size(0);
@@ -353,7 +365,7 @@ table_insert_collect_evicted(
       table_storage, table_bucket_offsets, bucket_capacity, bucket_sizes, keys,
       table_ids, score_input, policy_type, indices, insert_results,
       score_output, counter, num_scores, score_fn_key, evicted_counter,
-      evicted_keys, evicted_table_ids);
+      evicted_keys, evicted_table_ids, table_num_valid_pointer(num_valid));
 
   return std::make_tuple(indices, evicted_counter, evicted_keys,
                          evicted_table_ids);
