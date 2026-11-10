@@ -20,7 +20,8 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 // over a count only the device knows.
 //
 // A step's kernels are of two kinds. A kernel over items (keys, rows,
-// occurrences) runs a thread per item in a grid-stride loop (item_grid).
+// occurrences) runs a thread per item in a grid-stride loop (item_grid); the
+// proxy's chunk layout runs a warp per chunk (proxy.cu).
 // A kernel over a step's small tables (sizes of the nodes, ranks, features
 // and chunks) runs on one CTA of kThreads threads (kOneCta), which loops over
 // them and syncs with __syncthreads; its scans are cub::BlockScan, a tile at
@@ -143,6 +144,31 @@ __device__ __forceinline__ int64_t warp_upper_bound(int64_t n, Entry entry, V va
     if (at_most == 0) return lo;
     hi = min(hi, lo + step * at_most);
     lo += step * (at_most - 1) + 1;
+  }
+  return lo;
+}
+// lower_bound by each half of the warp, in a table of its own, entry(0), ..., entry(n - 1), with
+// n, entry and value the same on the 16 lanes of a half: each round the half's lanes probe 16
+// entries `step` apart, and the range of the answer narrows 16 times, so a table of n entries
+// takes ceil(log16(n + 1)) rounds (5 for a million). The halves take their rounds together, on
+// the warp's ballots, until both are done. Every lane of the warp; each lane gets its half's
+// answer. The probes stay below n, whatever the table holds.
+template <typename Entry, typename V>
+__device__ __forceinline__ int64_t half_warp_lower_bound(int64_t n, Entry entry, V value,
+                                                         int lane) {
+  const int sub = lane & 15, half = lane & 16;  // the lane in its half, the half's first lane
+  int64_t lo = 0, hi = n;                       // the half's answer is in [lo, hi]
+  while (__any_sync(0xffffffffu, lo < hi)) {
+    const int64_t step = (hi - lo + 15) / 16, probe = lo + step * sub;
+    // the half's lanes from its first on whose probe is below value (none once the half is done)
+    const unsigned votes = __ballot_sync(0xffffffffu, probe < hi && entry(probe) < value);
+    const int64_t below = __popc((votes >> half) & 0xffffu);
+    if (below == 0) {
+      hi = lo;
+    } else {
+      hi = min(hi, lo + step * below);
+      lo += step * (below - 1) + 1;
+    }
   }
   return lo;
 }

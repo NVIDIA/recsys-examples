@@ -15,10 +15,11 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 # limitations under the License.
 ******************************************************************************/
 // The planner: the steps of a call between and around the comm kernels, on
-// the current stream: kernels of their own (what they share: planner.cuh)
-// and CUB's radix sorts (cub.cu), none of which waits for the
-// device. The bucketize, the owner's KJT on one node, the proxy, the rail and
-// the owner, and the requester. node_exchange makes the node
+// the current stream: kernels of their own (what they share: planner.cuh),
+// CUB's radix sorts (cub.cu) and CUB's scan of the proxy's chunks
+// (proxy.cu), none of which waits for the device. The bucketize, the owner's
+// KJT on one node, the proxy, the rail and the owner, and the requester.
+// node_exchange makes the node
 // layout (node_layout_small and node_layout_items, node.cuh); node_layout()
 // and push_to_node_keys() here are the hooks'. Every table of a step is sized by the op's sizes
 // (Sizes, from its configuration: config.h), never by a device value.
@@ -334,11 +335,15 @@ ProxyKeys proxy_keys(const ProxyInput &input, const Sizes &sizes, bool node_dedu
 // occurrence_rank, key_occurrences, key_node, node_unique_keys, node_unique_key_weights), which
 // no later step reads, each once its last kernel is queued. The scan of the keys' rows and the
 // chunks' loops take the node-unique keys and the stream's chunks alone (the kernels read their
-// counts, and the host sizes the tables by remote_keys and max_chunks); a grid writes the places
-// of the tables of max_chunks entries past the chunks as empty places: an empty Chunk, an end of
-// 0 in the proxy header, and the reducer tasks of all the chunks. The slots' kernel takes every
-// entry of remote_keys: past the valid occurrences it writes the push key that sorts last, so the
-// push order's sort reads no word that nothing wrote.
+// counts, and the host sizes the tables by remote_keys and max_chunks). The chunks' layout runs
+// on a grid that the host sizes by max_chunks (a warp per chunk). CUB's scan over the places
+// (max_chunks + 1 of them) then gives the rows and the reducer tasks before each chunk, and reads
+// and writes no place past the chunks but the totals. Last, a thread per place of a grid places
+// each chunk in the ring, and writes the places of the tables of max_chunks entries past the
+// chunks as empty places: an empty Chunk, an end of 0 in the proxy header, and the reducer tasks
+// of all the chunks. The slots' kernel takes every entry of remote_keys: past the valid
+// occurrences it writes the push key that sorts last, so the push order's sort reads no word
+// that nothing wrote.
 struct ProxyChunks {
   at::Tensor num_chunks;  // int64 0-dim: the chunks of the stream
   at::Tensor chunks;      // int32 [max_chunks][8]: Chunk, in stream order (zeros past them)
@@ -366,6 +371,9 @@ ProxyChunks proxy_chunks_and_slots(ProxyKeys &keys, const at::Tensor &remote_off
 // representatives, proxy_chunks_and_slots' of the keys' rows) on `ctas` CTAs, or as their sizes
 // choose (0: a thread per entry of remote_keys, at most two CTAs per SM).
 void force_scan_ctas(int64_t ctas);
+// Each later proxy_chunks_and_slots of this process lays out its chunks (chunk_layout_kernel) on
+// `ctas` CTAs, or as max_chunks chooses (0: a warp per place, at most two CTAs per SM).
+void force_chunk_ctas(int64_t ctas);
 // With `fill`, each later proxy_chunks_and_slots of this process sets every bit of its rows'
 // offsets (node_exp_off and the counted rows'), its chunk tables, reduce_task_offsets and its push
 // keys' indices, and makes each push key part 0, before its kernels write them, so a test sees a

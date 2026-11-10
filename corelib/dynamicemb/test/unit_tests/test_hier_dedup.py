@@ -91,6 +91,29 @@ none; on 264 also a count at remote_keys and a count of 0), and 1, 2 and
 threads); each with rows_per_payload 1 (a scan of the rows alone) and
 above 1 (of the rows and the counted rows together).
 
+The proxy lays its chunks out on a grid, a warp per chunk; CUB's scan over
+its max_chunks + 1 places (tiles of 384) then gives the rows and the reducer
+tasks before each chunk, and a thread per place places each chunk in its
+ring. As max_chunks chooses, a warp per place of max_chunks, so the calls of
+16 places or fewer (as in "weights, 3 nodes" and "2 nodes of 72") take one
+CTA. A few cases take a given number of CTAs
+(``hier_output_dist_chunk_ctas``): 1 for up to 4,800 chunks (about 300 a
+warp; the scan in 13 tiles), 3 in rings of 2 laps and of 3 to 6 laps (the
+latter with 3,500 to 7,000 chunks), 2 for 36 owner nodes (more turns in a
+round than a warp's lanes), 600 for a few dozen chunks (most CTAs lay out
+none), and 7 where node 0's proxies have no chunk. Two give the proxies a
+max_chunks below their chunks (``max_chunks_arg``, which no call that fits
+remote_keys needs): each proxy lays out the first max_chunks chunks of its
+stream, in a ring of many laps, one case at a max_chunks of 12 (one CTA, the
+scan in one tile); the checks take the proxies alone, and of a proxy whose
+chunks pass max_chunks its chunk layout alone. A proxy still writes the
+records of all its keys in key_stage, after the chunks of all its owner
+nodes, and the hooks size key_stage by max_chunks: remote_keys 600 past the
+need keeps them in it (a case whose records would pass it fails on its shape
+before it runs). One case sizes the ring by proxy (0, 0)'s stream
+(``ring_from_stream``), which then exactly fills it: a stream of the ring's
+rows fits it, so its chunks lie as they are, the last one past lap_span.
+
 The count messages' keys of each lookup group come with one group, 2 and 3
 groups and a group per feature, also at 1,100 features (groups of 1, 1,098
 and 1 features, and a group per feature): a group's features can hold no
@@ -169,20 +192,28 @@ plain and weighted ones, a group per feature (the count messages read every
 offset of the own part's features and of the proxy's bucket features), a
 wrapping ring, node dedup off, an overflow, and those of the proxy's live
 counts (20 times the need, at the need, a count of 0, the scans on 2 and 600
-CTAs, several rows per payload), its int64 push keys and a requester with
+CTAs, several rows per payload), its chunk layout on 3 CTAs in a wrapping
+ring and on 7 CTAs with no chunks, its int64 push keys and a requester with
 nothing to send; and the requester cases of ``SANITIZE_REQUESTER_CASES``.
+``sanitize past`` runs the cases of ``SANITIZE_PAST_CASES``, whose proxies'
+chunks pass max_chunks, under memcheck, racecheck and synccheck alone: the
+keys of the chunks past max_chunks read words of chunk_inv that no chunk
+wrote, which initcheck reports::
+
+    compute-sanitizer --tool memcheck python test/unit_tests/test_hier_dedup.py sanitize past
 """
 
 import os
 import random
 import sys
 from bisect import bisect_left, bisect_right
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from itertools import accumulate
 from typing import Callable, Dict, List, Optional, Tuple
 
 import torch
 from dynamicemb_extensions import (
+    hier_output_dist_chunk_ctas,
     hier_output_dist_node_layout,
     hier_output_dist_node_push,
     hier_output_dist_proxy_garbage,
@@ -241,8 +272,10 @@ def chunk_span(case: "Case") -> int:
 
 
 def max_chunks(case: "Case", remote_keys: int) -> int:
-    """The most chunks of a stream (Sizes::max_chunks)."""
-    return rows_per_payload(case) * remote_keys // chunk_span(case) + case.num_nodes
+    """The most chunks of a stream (Sizes::max_chunks), or the case's smaller
+    max_chunks_arg."""
+    most = rows_per_payload(case) * remote_keys // chunk_span(case) + case.num_nodes
+    return min(case.max_chunks_arg, most) if case.max_chunks_arg else most
 
 
 def max_owner_chunks(case: "Case", lookup_keys: int, remote_keys: int) -> int:
@@ -290,6 +323,17 @@ class Case:
     # the CTAs of the proxy's scans, of the representatives and of the keys'
     # rows (hier_output_dist_scan_ctas); 0: as their sizes choose
     scan_ctas: int = 0
+    # the CTAs of the proxy's chunk layout (hier_output_dist_chunk_ctas); 0: as
+    # max_chunks chooses (a warp per place, so one CTA up to 16 places)
+    chunk_ctas: int = 0
+    # max_chunks (the hooks' sizes); 0: as remote_keys sets it. A smaller one
+    # lets a proxy's chunks pass it, which no call that fits remote_keys does:
+    # the proxy lays out the first max_chunks of them, and the test checks the
+    # proxies alone
+    max_chunks_arg: int = 0
+    # the ring: the rows of proxy (0, 0)'s stream (they do not depend on the
+    # ring), which its stream then exactly fills; False: num_proxy_rows
+    ring_from_stream: bool = False
     # the push order's sort by int64 push keys (hier_output_dist_push_keys64);
     # False: by int32 ones, as the sizes choose
     push_keys64: bool = False
@@ -996,6 +1040,109 @@ CASES = [
         payload_rows=10,
         remote_factor=20,
     ),
+    # the chunk layout on a given number of CTAs (hier_output_dist_chunk_ctas),
+    # a warp per chunk, then CUB's scan of the chunks and a thread per place:
+    # on 1 CTA, about 300 chunks a warp and the scan in 13 tiles; on 3 CTAs in
+    # a ring of several laps (a lap's first chunk in one tile of the scan, its
+    # others in later ones); on 2 CTAs, 36 owner nodes (two ballots of the turn
+    # of a round); on 600 CTAs, far more warps than chunks; on 7 CTAs, no
+    # chunks at node 0's proxies (the scan writes the totals of none)
+    Case(
+        "the chunk layout on 1 CTA, 2 nodes of 2",
+        num_nodes=2,
+        local_size=2,
+        tables=(0, 1),
+        max_block=9000,
+        key_range=30000,
+        hot=0.05,
+        chunk_ctas=1,
+        seeds=1,
+    ),
+    Case(
+        "the chunk layout on 3 CTAs, 2 nodes of 2, a wrapping ring",
+        num_nodes=2,
+        local_size=2,
+        tables=(0, 1),
+        max_block=9000,
+        key_range=30000,
+        hot=0.05,
+        num_proxy_rows=3840,
+        chunk_ctas=3,
+        seeds=1,
+    ),
+    Case(
+        "2 nodes, a wrapping ring, the chunk layout on 3 CTAs",
+        num_nodes=2,
+        max_block=200,
+        key_range=600,
+        hot=0.15,
+        num_proxy_rows=1280,
+        chunk_ctas=3,
+    ),
+    Case(
+        "36 nodes of 1, the chunk layout on 2 CTAs",
+        num_nodes=36,
+        local_size=1,
+        tables=(0, 1),
+        max_block=6,
+        key_range=100,
+        hot=0.2,
+        num_proxy_rows=1280,
+        chunk_ctas=2,
+        seeds=1,
+    ),
+    Case(
+        "the chunk layout on 600 CTAs, 20 x the need",
+        remote_factor=20,
+        chunk_ctas=600,
+        seeds=1,
+    ),
+    Case(
+        "no keys across nodes from node 0, the chunk layout on 7 CTAs",
+        job=local_node_job,
+        chunk_ctas=7,
+        seeds=1,
+    ),
+    # max_chunks below the proxies' chunks (max_chunks_arg), which no call that
+    # fits remote_keys needs: a proxy lays out the first max_chunks chunks of its
+    # stream, in a ring of many laps, on the grid max_chunks chooses (7 CTAs at
+    # 100, one at 12). It still writes the records of all its keys in key_stage,
+    # after the chunks of all its owner nodes, those past max_chunks too, and the
+    # hooks size key_stage by max_chunks: remote_keys 600 past the need keeps the
+    # records in it (run_case refuses a case whose proxy would write past it)
+    Case(
+        "chunks past max_chunks of 100, a wrapping ring",
+        num_nodes=2,
+        max_block=200,
+        key_range=600,
+        hot=0.15,
+        num_proxy_rows=320,
+        remote_slack=600,
+        max_chunks_arg=100,
+        seeds=1,
+    ),
+    Case(
+        "chunks past max_chunks of 12, one CTA, a wrapping ring",
+        num_nodes=2,
+        max_block=200,
+        key_range=600,
+        hot=0.15,
+        num_proxy_rows=40,
+        remote_slack=600,
+        max_chunks_arg=12,
+        seeds=1,
+    ),
+    # a ring that proxy (0, 0)'s stream exactly fills (ring_from_stream): a
+    # stream of the ring's rows fits it, so its chunks lie as they are, the last
+    # one from past lap_span to the ring's end; the other proxies' streams fit
+    # or wrap
+    Case(
+        "a ring that proxy (0, 0)'s stream exactly fills",
+        max_block=40,
+        key_range=200,
+        hot=0.1,
+        ring_from_stream=True,
+    ),
     # the push order's sort by int64 push keys (hier_output_dist_push_keys64),
     # which the sizes choose only when local_size * (max_chunks + 1) + 1
     # reaches 2^31: the same push order, push tables and positions as by
@@ -1376,9 +1523,11 @@ def proxy_reference(case: Case, occurrences: List, node: int, remote_keys: int) 
         for owner_node in ((node + turn) % num_nodes for turn in range(1, num_nodes))
         if chunk_length_per_bucket[owner_node] > j
     ]
-    num_chunks = len(stream)
+    # the chunks the proxy lays out: the stream's first max_chunks (no call that
+    # fits remote_keys has more; a case's max_chunks_arg may be fewer)
+    num_chunks = min(len(stream), capacity)
     chunk_rows, chunk_keys, chunk_counted = [], [], []
-    for owner_node, j in stream:
+    for owner_node, j in stream[:num_chunks]:
         lo, hi = first_key(owner_node, j), first_key(owner_node, j + 1)
         first = node_offset_per_bucket[owner_node]
         chunk_keys.append((first + lo, hi - lo))
@@ -1399,7 +1548,7 @@ def proxy_reference(case: Case, occurrences: List, node: int, remote_keys: int) 
     chunk_offset_per_bucket = list(accumulate([0] + chunk_length_per_bucket))
     chunk_inv = [0] * chunk_offset_per_bucket[-1]
     chunk_of, key_row, first_duplicate_slot = ([0] * node_num_uniques for _ in range(3))
-    for chunk, (owner_node, j) in enumerate(stream):
+    for chunk, (owner_node, j) in enumerate(stream[:num_chunks]):
         key_lo, num = chunk_keys[chunk]
         start, end = offsets[chunk], offsets[chunk] + chunk_rows[chunk]
         pulls = occurrence_scan[key_lo + num] - occurrence_scan[key_lo]
@@ -1470,6 +1619,8 @@ def proxy_reference(case: Case, occurrences: List, node: int, remote_keys: int) 
         node_length_per_bucket_feature=node_length_per_bucket_feature,
         node_offset_per_bucket=node_offset_per_bucket,
         num_chunks=num_chunks,
+        stream_chunks=len(stream),
+        stream_rows=total,
         chunks=table,
         chunk_counted_rows=chunk_counted,
         chunk_length_per_bucket=chunk_length_per_bucket,
@@ -1580,10 +1731,15 @@ def lookup_rows_reference(
 
 
 def run_call(
-    case: Case, ranks: List[Dict], lookup_keys: int, remote_keys: int, generator
+    case: Case,
+    ranks: List[Dict],
+    lookup_keys: int,
+    remote_keys: int,
+    generator,
+    proxies_only: bool = False,
 ):
     """Every rank's planner steps of one call, with what the comm kernels do
-    between them."""
+    between them; with proxies_only, up to the proxies' steps."""
     num_nodes, local_size, num_features = (
         case.num_nodes,
         case.local_size,
@@ -1593,7 +1749,7 @@ def run_call(
     tables = torch.tensor(case.tables, dtype=torch.int32, device="cuda")
 
     def sizes(rank: int) -> Dict[str, int]:
-        return dict(
+        named = dict(
             num_nodes=num_nodes,
             local_size=local_size,
             node=rank // local_size,
@@ -1606,6 +1762,9 @@ def run_call(
             payload_rows=case.chunk_payload_rows,
             record_bytes=case.record_bytes,
         )
+        if case.max_chunks_arg:
+            named["max_chunks"] = max_chunks(case, remote_keys)
+        return named
 
     layouts, windows, node_buffers = [], [], []
     for node in range(num_nodes):
@@ -1682,6 +1841,9 @@ def run_call(
                 list(case.groups),
             )
         )
+    if proxies_only:
+        torch.cuda.synchronize()  # an access out of range would raise here
+        return dict(windows=windows, proxies=proxies)
 
     # rail_exchange: each rank sends each rail peer its count message (row n
     # of its messages to the peer on node n), so every rank of a rail gets
@@ -1953,6 +2115,64 @@ def check_proxy(
         out["node_exp_off"][: node_num_uniques + 1].tolist(),
         ref["node_exp_off"],
     )
+    return problems
+
+
+def check_chunk_layout(
+    case: Case, ref: Dict, out: Dict, window: Dict, remote_keys: int
+) -> List[str]:
+    """The chunk layout of a proxy whose chunks pass max_chunks (a case's
+    max_chunks_arg) against its reference: it lays out the first max_chunks
+    chunks of its stream, as a stream of no more, and keeps each owner node's
+    chunks whole (their counts, offsets and slices of key_stage). Its keys of
+    the chunks past max_chunks take a chunk from words of chunk_inv that no
+    chunk wrote (a call that does not fit may read them), so their rows,
+    slots, push order and pulls are not compared."""
+    capacity = max_chunks(case, remote_keys)
+    problems = []
+
+    def expect(label: str, got, want) -> None:
+        if got != want:
+            problems.append(label)
+
+    num_chunks = ref["num_chunks"]
+    expect("chunks", int(out["num_chunks"]), num_chunks)
+    for name in (
+        "chunk_length_per_bucket",
+        "chunk_offset_per_bucket",
+        "stage_offset_per_bucket",
+        "reduce_task_offsets",
+    ):
+        expect(name, out[name].tolist(), ref[name])
+    # the chunk table, but each chunk's pulls
+    expect(
+        "chunk table",
+        [
+            row[:3] + u32(row[4:6]) + row[6:]
+            for row in out["chunks"].view(-1, 8).tolist()
+        ],
+        [row[:3] + row[4:] for row in ref["chunks"]],
+    )
+    header = window["proxy_header"].cpu()
+    expect("header chunks", int(header[0]), num_chunks)
+    expect("header end", int(header[1]) & 0xFFFFFFFF, ref["stream_end"])
+    expect(
+        "header ends",
+        u32(header[2 : 2 + capacity].tolist()),
+        [row[5] for row in ref["chunks"]],
+    )
+    # each chunk laid out at its round in its owner node's slice of key_stage
+    words32 = window["key_stage"].cpu().view(torch.int32)
+    got, want = [], []
+    for owner_node, key_lo, keys, _, start, end, j, _ in ref["chunks"][:num_chunks]:
+        word = (ref["stage_offset_per_bucket"][owner_node] + 16 * j) // 4
+        got.append(
+            words32[word : word + 2].tolist()
+            + u32(words32[word + 2 : word + 4].tolist())
+        )
+        record_lo = key_lo - ref["node_offset_per_bucket"][owner_node]
+        want.append([record_lo, record_lo + keys, start, end])
+    expect("stage chunks", got, want)
     return problems
 
 
@@ -2454,6 +2674,38 @@ def run_case(case: Case, seed: int) -> Tuple[Dict[str, List[str]], str]:
         where: proxy_reference(case, occs, where[0], remote_keys)
         for where, occs in occurrences.items()
     }
+    # The shapes that a case needs, refused before anything runs. Under a
+    # max_chunks below a proxy's chunks, the records of all its keys still
+    # land in key_stage, which the hooks size by max_chunks, after the chunks
+    # of all its owner nodes.
+    if case.max_chunks_arg:
+        stage_bytes = (
+            max_chunks(case, remote_keys) * 16 + remote_keys * case.record_bytes
+        )
+        if any(
+            ref["stream_chunks"] * 16 + ref["node_num_uniques"] * case.record_bytes
+            > stage_bytes
+            for ref in refs.values()
+        ):
+            return {"shape": ["records past key_stage"]}, "not run"
+    if case.ring_from_stream:
+        # A ring of proxy (0, 0)'s stream rows (they do not depend on the
+        # ring), which the stream then exactly fills. The ring holds two
+        # chunks of the most rows (plan_sizes), and the stream's last chunk
+        # has fewer rows, so it starts past lap_span: were the stream not to
+        # fit, that chunk would start its next lap.
+        ref = refs[(0, 0)]
+        last = ref["chunks"][max(ref["num_chunks"] - 1, 0)]
+        if (
+            ref["stream_rows"] < 2 * case.max_chunk_rows
+            or last[5] - last[4] >= case.max_chunk_rows
+        ):
+            return {"shape": ["a ring the stream exactly fills"]}, "not run"
+        case = replace(case, num_proxy_rows=ref["stream_rows"])
+        refs = {
+            where: proxy_reference(case, occs, where[0], remote_keys)
+            for where, occs in occurrences.items()
+        }
     # what each owner looks up: its node's keys for it, and the node-unique
     # keys of the other nodes' proxies on its rail
     recv = []
@@ -2481,14 +2733,47 @@ def run_case(case: Case, seed: int) -> Tuple[Dict[str, List[str]], str]:
     need_key_rows = max(ref["need_key_rows"] for ref in refs.values())
     laps = max(-(-ref["stream_end"] // case.num_proxy_rows) for ref in refs.values())
     hier_output_dist_scan_ctas(case.scan_ctas)
+    hier_output_dist_chunk_ctas(case.chunk_ctas)
     hier_output_dist_proxy_garbage(PROXY_GARBAGE)
     hier_output_dist_push_keys64(case.push_keys64)
     try:
-        call = run_call(case, ranks, lookup_keys, remote_keys, generator)
+        call = run_call(
+            case,
+            ranks,
+            lookup_keys,
+            remote_keys,
+            generator,
+            proxies_only=bool(case.max_chunks_arg),
+        )
     finally:
         hier_output_dist_scan_ctas(0)
+        hier_output_dist_chunk_ctas(0)
         hier_output_dist_proxy_garbage(False)
         hier_output_dist_push_keys64(False)
+    if case.max_chunks_arg:
+        # max_chunks below the chunks of some proxies: the proxies alone, and of
+        # a proxy whose chunks pass max_chunks its chunk layout alone
+        capacity = max_chunks(case, remote_keys)
+        checks = {"proxies": [], "shape": []}
+        for rank in range(world_size):
+            ref = refs[divmod(rank, local_size)]
+            proxy, window = call["proxies"][rank], call["windows"][rank]
+            if ref["stream_chunks"] > capacity:
+                checks["proxies"] += check_chunk_layout(
+                    case, ref, proxy, window, remote_keys
+                )
+            else:
+                checks["proxies"] += check_proxy(
+                    case, rank // local_size, ref, proxy, window, remote_keys
+                )
+        past = max(ref["stream_chunks"] for ref in refs.values())
+        if past <= capacity or laps < 2:
+            checks["shape"].append("the case's shape")
+        stats = (
+            f"chunks {past} past max_chunks {capacity}, laps {laps}, "
+            f"largest remote part {need_remote} of {remote_keys}"
+        )
+        return checks, stats
     # each node's agreed needs: the most of what its ranks publish
     agreed = call["needs"].amax(1).tolist()
     checks = {"puts": call["problems"]}
@@ -3115,10 +3400,20 @@ SANITIZE_CASES = {
     "the proxy's scan on 2 CTAs",
     "the proxy's scan on 600 CTAs, 20 x the need",
     "the proxy's scans on 2 CTAs, 2 nodes of 2, 4 rows per payload",
+    "2 nodes, a wrapping ring, the chunk layout on 3 CTAs",
+    "no keys across nodes from node 0, the chunk layout on 7 CTAs",
     "the push order by int64 push keys",
     "requester 1 asks nothing across nodes, 20 x the need",
 }
-# and these requester cases
+# python test_hier_dedup.py sanitize past: these cases, on their first seed,
+# for memcheck, racecheck and synccheck alone (their proxies' chunks pass
+# max_chunks, and the keys of the chunks past it read words of chunk_inv that
+# no chunk wrote, which initcheck reports)
+SANITIZE_PAST_CASES = {
+    "chunks past max_chunks of 100, a wrapping ring",
+    "chunks past max_chunks of 12, one CTA, a wrapping ring",
+}
+# and these requester cases, with the cases of SANITIZE_CASES
 SANITIZE_REQUESTER_CASES = {
     "uniform",
     "no rows",
@@ -3134,10 +3429,14 @@ SANITIZE_REQUESTER_CASES = {
 
 def main() -> None:
     torch.cuda.set_device(0)
-    sanitize = sys.argv[1:] == ["sanitize"]
+    # "sanitize" or "sanitize past": the cases of one set, for compute-sanitizer
+    past = sys.argv[1:] == ["sanitize", "past"]
+    sanitize = past or sys.argv[1:] == ["sanitize"]
+    sanitize_cases = SANITIZE_PAST_CASES if past else SANITIZE_CASES
+    sanitize_requester_cases = set() if past else SANITIZE_REQUESTER_CASES
     failures = 0
     for case_idx, case in enumerate(CASES):
-        if sanitize and case.name not in SANITIZE_CASES:
+        if sanitize and case.name not in sanitize_cases:
             continue
         for seed in range(1 if sanitize else case.seeds):
             checks, stats = run_case(case, 1000 + 17 * case_idx + seed)
@@ -3155,7 +3454,7 @@ def main() -> None:
                 if problems:
                     print(f"    {area}: {sorted(set(problems))[:8]}", flush=True)
     for case_idx, case in enumerate(REQUESTER_CASES):
-        if sanitize and case.name not in SANITIZE_REQUESTER_CASES:
+        if sanitize and case.name not in sanitize_requester_cases:
             continue
         checks, stats = run_requester_case(case, 2000 + 31 * case_idx)
         good = not any(checks.values())

@@ -20,10 +20,11 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 // proxy, rail and requester steps across nodes. Last, a hook that makes the
 // next construction fail, a hook that delays the reads of node_offsets and
 // node_keys of later input dists, hooks that choose the paths of later ones
-// (node_exchange's, the CTAs of the proxy's scans, the type of its push keys
-// and the requester kernel's row CTAs), a hook that fills tables of the
-// proxy's with garbage before its kernels write them, and the GPU clock the
-// benchmark aligns timelines by (a build with DYNAMICEMB_HIER_TRACE=1).
+// (node_exchange's, the CTAs of the proxy's scans and of its chunk layout, the
+// type of its push keys and the requester kernel's row CTAs), a hook that
+// fills tables of the proxy's with garbage before its kernels write them, and
+// the GPU clock the benchmark aligns timelines by (a build with
+// DYNAMICEMB_HIER_TRACE=1).
 
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
@@ -246,9 +247,11 @@ void node_push_test(at::Tensor values, at::Tensor inv, c10::optional<at::Tensor>
 // number of features of each, Config::lookup_groups: empty, one group). rows_per_payload is
 // rows_per_payload_for(max_chunk_rows, payload_rows): here max_chunk_rows
 // stands for sizes_of's chunk_ring_rows. The two differ only when sizes_of's
-// least of 2 * max_key_rows sets max_chunk_rows. Then max_chunks follows, and
-// weighted with record_bytes. No step of the planner reads the others
-// (row_bytes), which stay 0.
+// least of 2 * max_key_rows sets max_chunk_rows. Then max_chunks follows
+// (max_chunks_for), or a smaller max_chunks when given, which a call's
+// chunks may pass: no call that fits remote_keys has more chunks than
+// max_chunks_for. weighted follows with record_bytes. No step of the planner
+// reads the others (row_bytes), which stay 0.
 Sizes plan_sizes(const std::map<std::string, int64_t> &named,
                  const std::vector<int64_t> &lookup_groups) {
   const int num_nodes = (int)named.at("num_nodes"), local_size = (int)named.at("local_size"),
@@ -278,6 +281,12 @@ Sizes plan_sizes(const std::map<std::string, int64_t> &named,
                   (sizes.record_bytes == 8 || sizes.record_bytes == 16),
               "hier_output_dist: the sizes of a call across nodes");
   sizes.max_chunks = max_chunks_for(sizes);
+  const auto max_chunks = named.find("max_chunks");
+  if (max_chunks != named.end()) {
+    TORCH_CHECK(max_chunks->second >= 1 && max_chunks->second <= sizes.max_chunks,
+                "hier_output_dist: max_chunks from 1 to max_chunks_for's ", sizes.max_chunks);
+    sizes.max_chunks = max_chunks->second;
+  }
   int64_t grouped = 0;
   for (const int64_t group : lookup_groups) {
     TORCH_CHECK(group >= 1, "hier_output_dist: a lookup group of at least one feature");
@@ -579,6 +588,10 @@ void bind_testing(py::module &py_module) {
   py_module.def("hier_output_dist_scan_ctas", &force_scan_ctas,
                 "Each later proxy step of this process runs its scans over a device count (of the "
                 "representatives and of the keys' rows) on ctas CTAs, or as their sizes choose (0)",
+                py::arg("ctas"));
+  py_module.def("hier_output_dist_chunk_ctas", &force_chunk_ctas,
+                "Each later proxy step of this process lays out the chunks of its stream on ctas "
+                "CTAs, or as max_chunks chooses (0)",
                 py::arg("ctas"));
   py_module.def("hier_output_dist_proxy_garbage", &fill_proxy_garbage,
                 "With fill, each later proxy step of this process sets every bit of the rows "
