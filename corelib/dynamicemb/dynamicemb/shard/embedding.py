@@ -49,6 +49,7 @@ from torchrec.distributed.types import (
 from torchrec.modules.embedding_modules import EmbeddingCollection
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 
+from .. import sync_free as sf
 from ..batched_dynamicemb_function import largest_score_per_unique_key
 from ..dynamicemb_config import (
     DynamicEmbKernel,
@@ -334,9 +335,18 @@ class ShardedDynamicEmbeddingCollection(ShardedEmbeddingCollection):
                     total_B,
                 )
 
-                # Get unique values for the KJT
-                # .item() implicitly syncs GPU to CPU
-                total_unique = num_uniques.item()
+                # The unique arrays are as long as the input, the real keys first and an
+                # inert tail (key EMPTY_KEY, count 0) after them: the host does not know
+                # how many there are, and need not. A DynamicEmb distributor cuts them to
+                # the lengths in its forward, with the read of the split sizes that the
+                # all2all makes anyway. A distributor of TorchRec's (the table of another
+                # sharding type, not DynamicEmb's) takes exact arrays and gets them here.
+                if getattr(self._input_dists[i], "accepts_padded_dedup", False):
+                    total_unique = num_elements
+                else:
+                    # The one read of a step that is left here: the count that such a
+                    # distributor needs, through the audited read like any other.
+                    total_unique = int(sf.read_now(num_uniques)[0])
                 unique_keys = unique_keys[:total_unique]
 
                 dedup_features = KeyedJaggedTensor(

@@ -96,6 +96,16 @@ AUDITED_READS: Dict[Tuple[str, str, str], Tuple[int, str]] = {
         1,
         "public API: the getter returns the hit counts, which are kept on the device",
     ),
+    (
+        "dynamicemb/shard/embedding.py",
+        "ShardedDynamicEmbeddingCollection._dedup_indices",
+        "read_now",
+    ): (
+        1,
+        "TorchRec: only for a sharding whose input distributor is TorchRec's (table-wise, "
+        "column-wise, data-parallel): its all-to-all needs the arrays at their exact length, which "
+        "the row-wise distributor of DynamicEmb cuts itself once the splits are known",
+    ),
     ("dynamicemb/key_value_table.py", "read_table_sizes_now", "read_now"): (
         1,
         "public API: a checkpoint load reads the exact table sizes once, to size the tables for "
@@ -118,20 +128,12 @@ AUDITED_READS: Dict[Tuple[str, str, str], Tuple[int, str]] = {
     ),
     (
         "dynamicemb/batched_dynamicemb_tables.py",
-        "BatchedDynamicEmbeddingTablesV2._wait_for_oldest_score_check",
+        "BatchedDynamicEmbeddingTablesV2._settle_oldest",
         "wait",
     ): (
         1,
-        "late check: the one wait of the negative-score check, taken only when every slot of its "
-        "ring still holds an answer, so that no check is dropped",
-    ),
-    (
-        "dynamicemb/batched_dynamicemb_tables.py",
-        "BatchedDynamicEmbeddingTablesV2._drain_score_checks",
-        "wait",
-    ): (
-        1,
-        "late check: flush waits for every answer in flight (block=True); a step only polls",
+        "late check: flush() waits for every answer of the negative-score check in flight "
+        "(wait=True); a step only polls and never waits",
     ),
     # ---- the count of a compaction, read back ----------------------------------------------
     ("dynamicemb/key_value_table.py", "_compact_missing", "flagged_compact"): (

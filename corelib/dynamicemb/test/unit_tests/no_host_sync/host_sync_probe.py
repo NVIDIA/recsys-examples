@@ -13,10 +13,12 @@ without output_size, H2D copies from pageable memory with non_blocking=False,
 and cudaMalloc / cudaFree / cudaHostAlloc on the hot path.
 
 The tool builds BatchedDynamicEmbeddingTablesV2 modules in several storage
-layouts, drives them through scenarios (all-hit, miss, miss+evict, eval,
-growth), and counts the host syncs of every measured step.  It uses only
-public APIs of the module that existed before the sync removal, so the same
-file measures a tree before and after it.  test_sync_ratchet.py holds the
+layouts, optimizers, dtypes, key types, poolings, admission and score
+strategies, drives them through scenarios (all-hit, miss, miss+evict, eval,
+growth; queue_ahead for per-key scores: the host a whole ring of score checks
+ahead of a busy device), and counts the host syncs of every measured step.  It
+uses only public APIs of the module that existed before the sync removal, so
+the same file measures a tree before and after it.  test_sync_ratchet.py holds the
 census of that "before" tree as budgets.json and lets it only go down;
 test_no_host_syncs.py is the acceptance test that every in-tree configuration
 reads zero.
@@ -232,8 +234,8 @@ WARN_TEXT = "called a synchronizing CUDA operation"
 class Cfg:
     name: str
     layout: str  # cache | cache_ps | hbm | hybrid | host | host_ps
-    pooling: str = "none"  # none | sum
-    optimizer: str = "sgd"  # sgd | adam
+    pooling: str = "none"  # none | sum | mean
+    optimizer: str = "sgd"  # sgd | adam | adagrad | rowwise_adagrad | ftrl
     admit: bool = False  # FrequencyAdmissionStrategy(threshold=2)
     retain: bool = False  # evicted_item_mode=RETAIN_KEY
     lfu: bool = False  # score_strategy=LFU, frequency counters passed in
@@ -251,6 +253,13 @@ class Cfg:
     # of the cache_ps layout), "device" the in-tree DynamicEmbStorage as a device-resident
     # PS (the padded contract: DynamicEmb and the PS itself read nothing).
     ps: str = ""
+    dtype: str = "fp32"  # fp32 | fp16 | bf16: the embedding dtype
+    keys: str = "int64"  # int64 | uint64: the key type of the tables
+    dims: Tuple[int, ...] = ()  # one dim per table; () is DIM twice (several: pooled)
+    weighted: bool = False  # per-key pooling weights are passed to forward
+    admit_kind: str = "frequency"  # with admit: frequency | probabilistic
+    admit_init: bool = False  # with admit: an initializer for the rows it refuses
+    score: str = "default"  # default | step | customized | lrulfu | precise
     doc: str = ""
 
 
@@ -415,6 +424,95 @@ def _build_configs() -> "collections.OrderedDict[str, Cfg]":
             chunk_rows=64,
             **extra,
         )
+    # What the census did not reach: other optimizers, dtypes, key types, poolings,
+    # admission and score strategies, each expected at zero.
+    add(
+        "cache_storage_adagrad",
+        "cache",
+        "cache layout with Adagrad",
+        optimizer="adagrad",
+    )
+    add("hbm_only_adagrad", "hbm", "HBM-only layout with Adagrad", optimizer="adagrad")
+    add(
+        "hbm_only_rowwise_adagrad_fp16",
+        "hbm",
+        "HBM-only, fp16 values, row-wise Adagrad (the accumulator is packed in words)",
+        optimizer="rowwise_adagrad",
+        dtype="fp16",
+    )
+    add(
+        "cache_storage_rowwise_adagrad_bf16",
+        "cache",
+        "cache layout, bf16 values, row-wise Adagrad",
+        optimizer="rowwise_adagrad",
+        dtype="bf16",
+    )
+    add("cache_storage_ftrl", "cache", "cache layout with FTRL", optimizer="ftrl")
+    add("hbm_only_uint64", "hbm", "HBM-only layout with uint64 keys", keys="uint64")
+    add("cache_storage_uint64", "cache", "cache layout with uint64 keys", keys="uint64")
+    add(
+        "hbm_only_mixed_dim_sum",
+        "hbm",
+        "HBM-only, tables of dim 16 and 32 in one module, SUM pooling",
+        pooling="sum",
+        dims=(16, 32),
+    )
+    add(
+        "cache_storage_mixed_dim_sum",
+        "cache",
+        "cache layout, tables of dim 16 and 32 in one module, SUM pooling",
+        pooling="sum",
+        dims=(16, 32),
+    )
+    add("hbm_only_mean", "hbm", "HBM-only layout, MEAN pooling", pooling="mean")
+    add("cache_storage_mean", "cache", "cache layout, MEAN pooling", pooling="mean")
+    add(
+        "cache_storage_weighted",
+        "cache",
+        "cache layout, SUM pooling with per-key pooling weights",
+        pooling="sum",
+        weighted=True,
+    )
+    add(
+        "cache_storage_prob_admit",
+        "cache",
+        "cache layout + ProbabilisticAdmissionStrategy (draws random numbers)",
+        admit=True,
+        admit_kind="probabilistic",
+    )
+    add(
+        "hbm_only_admit_init",
+        "hbm",
+        "HBM-only + frequency admission with an initializer for the rows it refuses",
+        admit=True,
+        admit_init=True,
+    )
+    add("hbm_only_step", "hbm", "HBM-only layout, score STEP", score="step")
+    add(
+        "cache_storage_customized",
+        "cache",
+        "cache layout, score CUSTOMIZED (set_score before every step)",
+        score="customized",
+    )
+    add(
+        "cache_storage_lrulfu",
+        "cache",
+        "cache layout, compound (TIMESTAMP, LFU) score: the LruLfu evictor",
+        score="lrulfu",
+        lfu=True,
+    )
+    add(
+        "hbm_only_precise",
+        "hbm",
+        "HBM-only, PRECISE_CUSTOMIZED: a score per key, checked for negative ones",
+        score="precise",
+    )
+    add(
+        "cache_storage_precise",
+        "cache",
+        "cache layout, PRECISE_CUSTOMIZED: a score per key, checked for negative ones",
+        score="precise",
+    )
     return out
 
 
@@ -439,10 +537,22 @@ SCENARIO_DOC = collections.OrderedDict(
             "growth",
             "fresh keys push a table past its load factor: expand_if_need fires",
         ),
+        (
+            "queue_ahead",
+            "per-key scores: a sleep on the stream, then more training steps than the score "
+            "check has ring slots, so the host runs a whole ring ahead of the device",
+        ),
     ]
 )
 EVAL_SCENARIOS = ("eval", "eval_miss")
 MODES = ("plain", "prefetch")
+# Scenarios that run in one mode only: prefetch is a no-op in eval, and queue_ahead issues
+# whole steps behind a sleep.
+PLAIN_ONLY_SCENARIOS = EVAL_SCENARIOS + ("queue_ahead",)
+# What queue_ahead sleeps for (device cycles) and how many steps it then issues: more than
+# the four slots of the ring of the score check, issued far sooner than the sleep ends.
+QUEUE_AHEAD_CYCLES = 300_000_000
+QUEUE_AHEAD_STEPS = 6
 
 # batch geometry: 2 tables, 3 features [0, 0, 1], B samples, KPB keys per bag
 FEATURE_TABLE_MAP = [0, 0, 1]
@@ -453,6 +563,12 @@ ROW_N = {0: 2 * BATCH * KPB, 1: 1 * BATCH * KPB}  # key slots per table per step
 UNIQ_FRAC = 0.9
 UNIQ = {t: int(UNIQ_FRAC * n) for t, n in ROW_N.items()}  # 345, 172
 ADMIT_THRESHOLD = 2
+# Steps of one batch after which every key of it is admitted, for the scenarios that want
+# an all-hit batch. Frequency admission takes a key at its ADMIT_THRESHOLD-th sight; a coin
+# toss admits it at each sight with probability p, so a key is still refused after n steps
+# with probability (1 - p) ** n: 0.5 ** 24 is 6e-8 a key.
+ADMIT_FREQUENCY_WARMUP = 4
+ADMIT_PROBABILISTIC_WARMUP = 24
 
 
 def scenarios_of(cfg: Cfg) -> List[str]:
@@ -469,6 +585,8 @@ def scenarios_of(cfg: Cfg) -> List[str]:
     if cfg.layout == "host_ps":
         # the PS is the only tier and has no capacity to evict from; eval reads it
         out = ["all_hit", "miss", "eval", "eval_miss"]
+    if cfg.score == "precise":
+        out.append("queue_ahead")
     return out
 
 
@@ -1112,6 +1230,8 @@ class Batch:
     indices: Any
     offsets: Any
     freq: Any = None
+    weights: Any = None  # per-key pooling weights (cfg.weighted)
+    scores: Any = None  # a score per key (cfg.score == "precise")
 
 
 class BatchMaker:
@@ -1157,12 +1277,24 @@ class BatchMaker:
         off = np.arange(0, len(idx) + 1, KPB, dtype=np.int64)
         indices = torch.from_numpy(idx).to(self.device)
         offsets = torch.from_numpy(off).to(self.device)
+        if self.cfg.keys == "uint64":
+            indices = indices.to(torch.uint64)
         freq = (
             torch.ones(len(idx), dtype=torch.int64, device=self.device)
             if self.cfg.lfu
             else None
         )
-        return Batch(indices, offsets, freq)
+        weights = (
+            torch.rand(len(idx), device=self.device) if self.cfg.weighted else None
+        )
+        scores = (
+            torch.randint(
+                1, 1 << 40, (len(idx),), dtype=torch.int64, device=self.device
+            )
+            if self.cfg.score == "precise"
+            else None
+        )
+        return Batch(indices, offsets, freq, weights, scores)
 
     def fresh_batch(self, scale: float = 1.0) -> Batch:
         return self.build(
@@ -1209,6 +1341,7 @@ def _load_ps_class(kind: str = "dict"):
 def build_module(cfg: Cfg, plan: Dict[str, Any], device_index: int):
     import torch
     from dynamicemb import (
+        DynamicEmbCheckMode,
         DynamicEmbPoolingMode,
         DynamicEmbScoreStrategy,
         DynamicEmbTableOptions,
@@ -1216,67 +1349,113 @@ def build_module(cfg: Cfg, plan: Dict[str, Any], device_index: int):
         EvictedItemMode,
     )
     from dynamicemb.batched_dynamicemb_tables import BatchedDynamicEmbeddingTablesV2
-    from dynamicemb.optimizer import get_optimizer_state_dim
+    from dynamicemb.optimizer import DynamicEmbOptimType, get_optimizer_state_dim
 
-    opt_type = EmbOptimType.ADAM if cfg.optimizer == "adam" else EmbOptimType.SGD
+    opt_type = {
+        "sgd": EmbOptimType.SGD,
+        "adam": EmbOptimType.ADAM,
+        "adagrad": EmbOptimType.EXACT_ADAGRAD,
+        "rowwise_adagrad": EmbOptimType.EXACT_ROWWISE_ADAGRAD,
+        "ftrl": DynamicEmbOptimType.FTRL,
+    }[cfg.optimizer]
     opt_params: Dict[str, Any] = {"learning_rate": 0.3}
     if cfg.optimizer == "adam":
         opt_params.update(weight_decay=0.06, eps=3e-5, beta1=0.8, beta2=0.888)
-    dim = cfg.dim or DIM
-    row_bytes = 4 * (dim + get_optimizer_state_dim(opt_type, dim, torch.float32))
+    elif cfg.optimizer in ("adagrad", "rowwise_adagrad", "ftrl"):
+        opt_params.update(initial_accumulator_value=0.1)
+    emb_dtype = {"fp32": torch.float32, "fp16": torch.float16, "bf16": torch.bfloat16}[
+        cfg.dtype
+    ]
+    itemsize = torch.empty(0, dtype=emb_dtype).element_size()
+
+    def row_bytes(dim: int) -> int:
+        return itemsize * (dim + get_optimizer_state_dim(opt_type, dim, emb_dtype))
+
     max_cap = plan["max_capacity"]
-    if cfg.layout in ("cache", "cache_ps", "hybrid"):
-        local_hbm = (
-            plan["hbm_rows"] * row_bytes
-        )  # exact power-of-two fraction of the table
-    elif cfg.layout == "hbm":
-        local_hbm = 1024**3
-    else:
-        local_hbm = 0
+
+    def local_hbm(dim: int) -> int:
+        if cfg.layout in ("cache", "cache_ps", "hybrid"):
+            # exact power-of-two fraction of the table
+            return plan["hbm_rows"] * row_bytes(dim)
+        return 1024**3 if cfg.layout == "hbm" else 0
+
     ps_kind = cfg.ps or ("dict" if cfg.layout == "cache_ps" else "")
     ps = _load_ps_class(ps_kind) if ps_kind else None
     admit = None
     if cfg.admit:
-        from dynamicemb.embedding_admission import FrequencyAdmissionStrategy, KVCounter
-
-        admit = FrequencyAdmissionStrategy(
-            threshold=ADMIT_THRESHOLD, counter=KVCounter(capacity=min(max_cap, 16384))
+        from dynamicemb import DynamicEmbInitializerArgs, DynamicEmbInitializerMode
+        from dynamicemb.embedding_admission import (
+            FrequencyAdmissionStrategy,
+            KVCounter,
+            ProbabilisticAdmissionStrategy,
         )
+
+        # The rows that the admitter refuses: the table's own initializer, or this one.
+        refused = (
+            DynamicEmbInitializerArgs(
+                mode=DynamicEmbInitializerMode.CONSTANT, value=1.0
+            )
+            if cfg.admit_init
+            else None
+        )
+        if cfg.admit_kind == "probabilistic":
+            admit = ProbabilisticAdmissionStrategy(0.5, initializer_args=refused)
+        else:
+            admit = FrequencyAdmissionStrategy(
+                threshold=ADMIT_THRESHOLD,
+                counter=KVCounter(capacity=min(max_cap, 16384)),
+                initializer_args=refused,
+            )
     kw: Dict[str, Any] = {}
     if cfg.retain:
         kw["evicted_item_mode"] = EvictedItemMode.RETAIN_KEY
     if plan["init_capacity"] is not None:
         kw["init_capacity"] = plan["init_capacity"]
         kw["bucket_capacity"] = 128
+    if cfg.score == "precise":
+        kw["safe_check_mode"] = DynamicEmbCheckMode.ERROR
+    if cfg.score == "lrulfu":
+        score_strategy = (
+            DynamicEmbScoreStrategy.TIMESTAMP,
+            DynamicEmbScoreStrategy.LFU,
+        )
+    elif cfg.score == "step":
+        score_strategy = DynamicEmbScoreStrategy.STEP
+    elif cfg.score == "customized":
+        score_strategy = DynamicEmbScoreStrategy.CUSTOMIZED
+    elif cfg.score == "precise":
+        score_strategy = DynamicEmbScoreStrategy.PRECISE_CUSTOMIZED
+    elif cfg.lfu:
+        score_strategy = DynamicEmbScoreStrategy.LFU
+    elif cfg.noevict:
+        score_strategy = DynamicEmbScoreStrategy.NO_EVICTION
+    else:
+        score_strategy = DynamicEmbScoreStrategy.TIMESTAMP
     options = [
         DynamicEmbTableOptions(
             dim=dim,
             max_capacity=max_cap,
-            index_type=torch.int64,
-            embedding_dtype=torch.float32,
+            index_type=torch.uint64 if cfg.keys == "uint64" else torch.int64,
+            embedding_dtype=emb_dtype,
             device_id=device_index,
-            score_strategy=(
-                DynamicEmbScoreStrategy.LFU
-                if cfg.lfu
-                else DynamicEmbScoreStrategy.NO_EVICTION
-                if cfg.noevict
-                else DynamicEmbScoreStrategy.TIMESTAMP
-            ),
+            score_strategy=score_strategy,
             caching=cfg.layout in ("cache", "cache_ps"),
-            local_hbm_for_values=local_hbm,
+            local_hbm_for_values=local_hbm(dim),
             external_storage=ps,
             admit_strategy=admit,
             **kw,
         )
-        for _ in range(2)
+        for dim in (cfg.dims or ((cfg.dim or DIM),) * 2)
     ]
     mod = BatchedDynamicEmbeddingTablesV2(
         table_names=["t0", "t1"],
         table_options=options,
         feature_table_map=list(FEATURE_TABLE_MAP),
-        pooling_mode=DynamicEmbPoolingMode.SUM
-        if cfg.pooling == "sum"
-        else DynamicEmbPoolingMode.NONE,
+        pooling_mode={
+            "none": DynamicEmbPoolingMode.NONE,
+            "sum": DynamicEmbPoolingMode.SUM,
+            "mean": DynamicEmbPoolingMode.MEAN,
+        }[cfg.pooling],
         optimizer=opt_type,
         use_index_dedup=True,
         **opt_params,
@@ -1325,9 +1504,38 @@ def top_tier(cfg: Cfg) -> str:
     )
 
 
-def regime_check(cfg: Cfg, scenario: str, before, after, k: int) -> Tuple[bool, str]:
+def regime_check(
+    cfg: Cfg,
+    scenario: str,
+    before,
+    after,
+    k: int,
+    ring: Optional[Sequence[Dict[str, Any]]] = None,
+) -> Tuple[bool, str]:
     """Did the scenario really happen?  Judged from tier occupancy before/after
-    the measured window."""
+    the measured window; for queue_ahead, from the state of the score check's ring at
+    the end of every measured iteration (``ring``: one dict of pending, slots and
+    uncovered each)."""
+    if scenario == "queue_ahead":
+        if not ring:
+            return False, "no ring state was recorded after the steps issued ahead"
+        # The zero of this scenario says something only if the host really ran a whole
+        # ring of checks ahead of the device: every slot holds a snapshot that has not
+        # been taken, and the last check found none free (the host was faster than the
+        # sleep; a slow host or a loaded node makes this false and the zero vacuous).
+        full = [
+            r["pending"] >= r["slots"] and r["uncovered"] is not False for r in ring
+        ]
+        return (
+            all(full),
+            "ring full after the issue loop in %d of %d iterations (pending %s of %d slots)"
+            % (
+                sum(full),
+                len(ring),
+                [r["pending"] for r in ring],
+                ring[0]["slots"],
+            ),
+        )
     if scenario == "tier2_hit":
         tiers = (
             ["storage"]
@@ -1392,12 +1600,30 @@ def regime_check(cfg: Cfg, scenario: str, before, after, k: int) -> Tuple[bool, 
 def _make_step(mod, cfg: Cfg, mode: str, train: bool):
     import torch
 
+    def prefetch_kw(b: Batch) -> Dict[str, Any]:
+        kw: Dict[str, Any] = {"frequency_counters": b.freq} if cfg.lfu else {}
+        if b.scores is not None:
+            kw["scores"] = b.scores
+        return kw
+
     def kw(b: Batch) -> Dict[str, Any]:
-        return {"frequency_counters": b.freq} if cfg.lfu else {}
+        out = prefetch_kw(b)
+        if b.weights is not None:
+            out["pooling_weights"] = b.weights
+        return out
+
+    # CUSTOMIZED: the score of a table is the caller's, a host int set before every step.
+    ticks = [0]
+
+    def set_scores() -> None:
+        if cfg.score == "customized":
+            ticks[0] += 1
+            mod.set_score({"t0": ticks[0], "t1": ticks[0]})
 
     if not train:
 
         def step(b: Batch):
+            set_scores()
             with torch.no_grad():
                 mod(b.indices, b.offsets, **kw(b))
 
@@ -1405,6 +1631,7 @@ def _make_step(mod, cfg: Cfg, mode: str, train: bool):
     if mode == "plain":
 
         def step(b: Batch):
+            set_scores()
             out = mod(b.indices, b.offsets, **kw(b))
             out.backward(torch.ones_like(out))
 
@@ -1413,15 +1640,27 @@ def _make_step(mod, cfg: Cfg, mode: str, train: bool):
     fs = torch.cuda.Stream()
 
     def step(b: Batch):
+        set_scores()
         ps.wait_stream(fs)
         with torch.cuda.stream(ps):
-            mod.prefetch(b.indices, b.offsets, fs, **kw(b))
+            mod.prefetch(b.indices, b.offsets, fs, **prefetch_kw(b))
         fs.wait_stream(ps)
         with torch.cuda.stream(fs):
             out = mod(b.indices, b.offsets, **kw(b))
             out.backward(torch.ones_like(out))
 
     return step
+
+
+def admit_warmup_steps(cfg: Cfg) -> int:
+    """Steps of one batch that an all-hit scenario runs before it measures (see
+    ADMIT_PROBABILISTIC_WARMUP): the keys of the batch have all been admitted by then.
+    """
+    if not cfg.admit:
+        return 3
+    if cfg.admit_kind == "probabilistic":
+        return ADMIT_PROBABILISTIC_WARMUP
+    return ADMIT_FREQUENCY_WARMUP
 
 
 def _fill_steps(cfg: Cfg, scenario: str, plan: Dict[str, Any]) -> int:
@@ -1478,10 +1717,10 @@ def run_case(
         stream_overlap = cfg.admit and scenario in ("miss", "miss_evict", "growth")
         n_fill = _fill_steps(cfg, scenario, plan)
         warm = max(warmup, 4) if cfg.admit else warmup
-        if scenario in ("all_hit", "eval", "eval_miss"):
+        if scenario in ("all_hit", "queue_ahead", "eval", "eval_miss"):
             fixed = bm.fresh_batch()
-            warm_train = [fixed] * max(warm, 4 if cfg.admit else 3)
-            if scenario == "all_hit":
+            warm_train = [fixed] * max(warm, admit_warmup_steps(cfg))
+            if scenario in ("all_hit", "queue_ahead"):
                 pre = warm_train
                 measured = [fixed] * iters
                 warm_eval: List[Batch] = []
@@ -1529,6 +1768,26 @@ def run_case(
         res["n_fill"] = len(fill)
         step_train = _make_step(mod, cfg, mode, True)
         step_eval = _make_step(mod, cfg, mode, False)
+        ring: List[Dict[str, Any]] = []
+        if scenario == "queue_ahead":
+            single_step = step_train
+
+            def step_train(b: Batch):  # noqa: F811
+                # The device is busy for a while: the steps below are issued far sooner
+                # than the sleep ends, so none of their checks has landed.
+                torch.cuda._sleep(QUEUE_AHEAD_CYCLES)
+                for _ in range(QUEUE_AHEAD_STEPS):
+                    single_step(b)
+                # What the sleep is for: the ring of the score check is full and its
+                # last check found no free slot. Recorded for regime_check.
+                ring.append(
+                    {
+                        "pending": len(mod._score_pending),
+                        "slots": mod._score_ring.slots,
+                        "uncovered": getattr(mod, "_score_uncovered", None),
+                    }
+                )
+
         # ---- unmeasured phases
         mod.train()
         for b in fill + pre:
@@ -1538,6 +1797,7 @@ def run_case(
             for b in warm_eval:
                 step_eval(b)
         torch.cuda.synchronize()
+        ring.clear()  # only the measured iterations count
         step = step_train if train else step_eval
         before = tier_sizes(mod)
         # ---- measured loop
@@ -1551,7 +1811,7 @@ def run_case(
                     step(b)
                 torch.cuda.synchronize()
         after = tier_sizes(mod)
-        ok, note = regime_check(cfg, scenario, before, after, iters)
+        ok, note = regime_check(cfg, scenario, before, after, iters, ring)
         res["regime"] = {"ok": ok, "note": note}
         res["tiers_before"] = before
         res["tiers_after"] = after
@@ -1998,8 +2258,8 @@ def measure(
                     "unknown scenario %r; have %s" % (sc, list(SCENARIO_DOC))
                 )
             for mode in modes:
-                if sc in EVAL_SCENARIOS and mode != "plain":
-                    continue  # prefetch is a no-op in eval
+                if sc in PLAIN_ONLY_SCENARIOS and mode != "plain":
+                    continue  # prefetch is a no-op in eval; queue_ahead is plain only
                 if sc not in avail:
                     results.append(
                         {
@@ -2062,6 +2322,16 @@ def check_zero(report: Dict[str, Any], allow_inherent: bool = True) -> List[str]
             continue
         if r["status"] != "ok":
             bad.append("%s: ERROR %s" % (tag, r.get("error")))
+            continue
+        regime = r.get("regime") or {"ok": True}
+        if r["scenario"] == "queue_ahead" and not regime["ok"]:
+            # The zero of this scenario is about a host that is a whole ring of checks
+            # ahead of the device; without it nothing was measured.
+            bad.append(
+                "%s: the regime did not happen (%s): the zero says nothing; rerun, or "
+                "raise QUEUE_AHEAD_CYCLES if the host is slower than the sleep"
+                % (tag, regime.get("note", ""))
+            )
             continue
         if allow_inherent and r.get("inherent"):
             continue

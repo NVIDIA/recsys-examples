@@ -81,6 +81,7 @@ from dynamicemb.key_value_table import (
     DynamicEmbStorage,
     HybridStorage,
     Storage,
+    _wait_for_stream,
     flush_cache,
 )
 from dynamicemb.lookup_layout import EmbeddingLayout
@@ -838,6 +839,9 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
         self._create_cache_storage()
         self._create_initializers()
         self._create_admitter()
+        # A blocking read of a step (read_now) must not allocate pinned memory on its
+        # first call: its buffer is made here, on the thread that builds the module.
+        sf.reserve_read_scratch(torch.device(self.device_id))
         # The counters ride the KJT weights channel of a whole sharding, so a
         # group with no use for them -- CUSTOMIZED tables next to LFU ones --
         # is handed some all the same and must drop them, or they would be
@@ -854,19 +858,28 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
         self.per_key_score: bool = any(
             option.takes_score_per_key for option in self._dynamicemb_options
         )
-        # The check for a negative score is read back late (see _check_scores), through
-        # a pinned ring made here, and only for tables that ask to be checked.
-        self._score_ring: Optional[sf.DeferredRead] = (
-            sf.DeferredRead((1,), torch.int64, 4)
-            if self.per_key_score
-            and any(
-                option.safe_check_mode != DynamicEmbCheckMode.IGNORE
-                for option in self._dynamicemb_options
-            )
-            else None
-        )
+        # The check for a negative score is read back late (see _check_scores): the
+        # device counts the checks that found one, and a snapshot of the count is copied
+        # to a pinned ring. Both are made here for tables that ask to be checked, and
+        # on the first check of a module whose check mode is switched on later.
+        self._score_ring: Optional[sf.DeferredRead] = None
+        self._score_neg_total: Optional[Tensor] = None
+        # The largest count the host has reported on; ``_score_error`` is what the last
+        # check asked for (raise or warn), ``_score_last_stream`` the ``cuda_stream`` of
+        # the stream that last wrote the count (the one that made it, until a check has
+        # run), and ``_score_uncovered`` says that the last check found no free slot in
+        # the ring, so no snapshot has the count it made.
+        self._score_neg_seen = 0
+        self._score_error = False
+        self._score_last_stream: Optional[int] = None
+        self._score_uncovered = False
         # (ring ticket, whether an ERROR table asked for it), oldest first
         self._score_pending: Deque[Tuple[int, bool]] = _TicketQueue()
+        if self.per_key_score and any(
+            option.safe_check_mode != DynamicEmbCheckMode.IGNORE
+            for option in self._dynamicemb_options
+        ):
+            self._make_score_ring(torch.device(self.device_id))
         self._prefetch_states: Deque[PrefetchState] = deque()
 
         # TODO:1->10
@@ -1485,13 +1498,17 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
         Evaluation reads no score, so it may go without them.
 
         A negative score is looked for on the device, and what it found is reported
-        late: the answer is copied back without waiting, and the next call that finds
-        it landed raises (``ERROR``) or warns (``WARNING``), as does ``flush``. The
-        batch that carried the score has been processed by then, and a device assert
-        would poison the context. A call that finds every slot of the ring still in
-        flight -- the host is that far ahead of the device -- waits for the oldest
-        answer to make room, so that no check goes unmade. ``late=False`` leaves the
-        device out: the caller knows another call checks the same scores.
+        late. The device keeps one count of the calls that carried a negative score
+        and a snapshot of it is copied back without waiting; the next call that finds
+        a snapshot landed with a larger count than the last one reported raises
+        (``ERROR``) or warns (``WARNING``), as does ``flush``. The batch that carried
+        the score has been processed by then, and a device assert would poison the
+        context. A call that finds every slot of the ring still in flight -- the host
+        is that far ahead of the device -- does not wait: its check is in the count,
+        and the next snapshot (or ``flush``) carries it. The negative batches of those
+        calls are therefore reported together, by that snapshot, where a batch that got
+        a snapshot of its own is reported by it. ``late=False`` leaves the device out:
+        the caller knows another call checks the same scores.
         """
         if scores is None:
             if self.per_key_score and self.training:
@@ -1515,28 +1532,66 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
         if not late or modes == {DynamicEmbCheckMode.IGNORE}:
             return
         error = DynamicEmbCheckMode.ERROR in modes
-        if self._score_ring is None or not scores.is_cuda:
+        if not scores.is_cuda:
             self._check_scores_now(scores, error)
             return
-        self._drain_score_checks(block=False)
+        if self._score_ring is None:
+            # A check mode that was switched on after construction.
+            self._make_score_ring(scores.device)
         # The check runs after this call returns: the scores' memory must not be
         # handed to another stream before it has.
         scores.record_stream(torch.cuda.current_stream())
-        found = (scores < 0).any().reshape(1).to(torch.int64)
-        ticket = self._score_ring.enqueue(found)
-        while ticket is None:
-            # Every slot holds an answer that has not landed. A check dropped for want
-            # of a slot would be a negative score nobody hears of, so wait for the
-            # oldest answer and take its slot: the only wait a check makes, and it
-            # holds the host back only while the device is a whole ring behind.
-            self._wait_for_oldest_score_check()
-            ticket = self._score_ring.enqueue(found)
-        self._score_pending.append((ticket, error))
+        # Counted first, so that a report that raises below leaves this check in the
+        # count: no snapshot has it yet.
+        self._count_negative_scores(scores)
+        self._score_uncovered = True
+        self._score_error = error
+        self._drain_score_checks(block=False)
+        ticket = self._score_ring.enqueue(self._score_neg_total)
+        # No free slot: nothing waits for one, and the next snapshot has the count (flush
+        # takes one if there is no next).
+        if ticket is not None:
+            self._score_pending.append((ticket, error))
+            self._score_uncovered = False
+
+    def _make_score_ring(self, device: torch.device) -> None:
+        """The pinned ring of snapshots and the device count that ``_check_scores``
+        reports from. Pinned memory is allocated here, once: when the module is built if
+        a table asks to be checked then, else on the first check of a module whose check
+        mode was switched on later.
+
+        Two things hold whichever call makes them. They are made outside inference mode:
+        a count or a slot made inside it is an inference tensor, which a training step
+        may not update in place, and the first check can be an evaluation forward. And the
+        count is zero-filled on the current stream, which nothing but ``_score_last_stream``
+        orders before the first check on another stream: a check that added to the count
+        before the fill ran would have its increment overwritten by the fill, or its
+        snapshot copy would read memory the fill has not reached.
+        """
+        with torch.inference_mode(False):
+            self._score_ring = sf.DeferredRead((1,), torch.int64, 4)
+            self._score_neg_total = torch.zeros(1, dtype=torch.int64, device=device)
+        self._score_last_stream = torch.cuda.current_stream(device).cuda_stream
+
+    def _count_negative_scores(self, scores: Tensor) -> None:
+        """Add one to the device count if ``scores`` has a negative entry: a few small
+        kernels, nothing read.
+
+        The add is a read-modify-write, which two streams must not run at once, so a
+        check on another stream than the last one is ordered after it, on the device
+        (the host does not wait). Every add is then ordered after the one before,
+        whichever stream made it, and a snapshot taken after one has all of them.
+        """
+        found = (scores < 0).any()
+        stream = torch.cuda.current_stream().cuda_stream
+        if self._score_last_stream not in (None, stream):
+            _wait_for_stream(self._score_last_stream)
+        self._score_neg_total.add_(found)
+        self._score_last_stream = stream
 
     def _check_scores_now(self, scores: Tensor, error: bool) -> None:
-        """The check that does not wait for a later call, for scores it cannot copy
-        back late: ones the host holds, or a module whose check mode was changed after
-        construction and has no ring."""
+        """The check of scores the host holds: nothing to copy back late, and reading
+        them waits for nothing."""
         if bool((scores < 0).any()):
             self._report_negative_scores(error)
 
@@ -1549,31 +1604,51 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
             "score by the table."
         )
 
-    def _wait_for_oldest_score_check(self) -> None:
-        """Report what the oldest check in flight found, waiting for its answer, and
-        give its slot back."""
+    def _settle_oldest(self, wait: bool) -> bool:
+        """Take the oldest snapshot -- if it has landed, or with ``wait``, blocking for
+        it -- and report what it says. True when one was taken.
+
+        A count above the last one reported means that a check since then found a
+        negative score. The count only grows, so the answer is exact, and a snapshot
+        that is behind one already seen (another stream's) says nothing new.
+        """
+        if not self._score_pending:
+            return False
         ticket, error = self._score_pending[0]
-        negative = bool(self._score_ring.wait(ticket)[0])
+        if not wait and not self._score_ring.ready(ticket):
+            return False
+        landed = (
+            self._score_ring.wait(ticket) if wait else self._score_ring.value(ticket)
+        )
+        negative_calls = int(landed[0])
         self._score_ring.release(ticket)
         self._score_pending.popleft()
-        if negative:
+        if negative_calls > self._score_neg_seen:
+            self._score_neg_seen = negative_calls
             self._report_negative_scores(error)
+        return True
 
     def _drain_score_checks(self, block: bool) -> None:
-        """Report what the checks started by ``_check_scores`` found: those that have
-        landed, or all of them, waiting for each, with ``block``."""
-        while self._score_pending:
-            ticket, error = self._score_pending[0]
-            if block:
-                negative = bool(self._score_ring.wait(ticket)[0])
-            elif self._score_ring.ready(ticket):
-                negative = bool(self._score_ring.value(ticket)[0])
-            else:
-                return
-            self._score_ring.release(ticket)
-            self._score_pending.popleft()
-            if negative:
-                self._report_negative_scores(error)
+        """Report what the checks started by ``_check_scores`` found: the snapshots that
+        have landed, or with ``block`` all of them, waiting for each.
+
+        ``block`` (``flush``, whose caller asked for the report) also takes the snapshot
+        that the last check could not, after the streams that made the checks, and so
+        sees every one of them."""
+        if self._score_ring is None:
+            return
+        if block and self._score_uncovered:
+            _wait_for_stream(self._score_last_stream)
+            ticket = self._score_ring.enqueue(self._score_neg_total)
+            # sync-ok: _settle_oldest answers a host bool, from the pinned ring
+            while ticket is None and self._settle_oldest(wait=True):
+                ticket = self._score_ring.enqueue(self._score_neg_total)
+            if ticket is not None:
+                self._score_pending.append((ticket, self._score_error))
+                self._score_uncovered = False
+        # sync-ok: _settle_oldest answers a host bool, from the pinned ring
+        while self._settle_oldest(wait=block):
+            pass
 
     @property
     def needs_key_bounds(self) -> bool:
@@ -2600,7 +2675,16 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
             plan = self._plan_replay(delta, content, storage)
 
         ts = device_timestamp()
-        return {job.name: self._apply_replay(job, content, storage, ts) for job in plan}
+        stats = {
+            job.name: self._apply_replay(job, content, storage, ts) for job in plan
+        }
+        if any(table_stats.upserted for table_stats in stats.values()):
+            # One snapshot of the sizes, after the writes of every table (not one per
+            # table: the ring of snapshots has four slots). The keys that _apply_replay
+            # counted in the growth estimate are a bound, which includes the keys a table
+            # held already; once this snapshot lands the estimate is the real sizes again.
+            storage.request_size_snapshot()
+        return stats
 
     @staticmethod
     def _refuse_no_eviction(
@@ -2878,6 +2962,9 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                 timestamp=ts,
             )
         )
+        # The keys are in the table, and no batch announced them to the estimate that its
+        # next growth is decided from.
+        storage.note_replayed(job.table_id, slot_index)
         if job.num_rows is not None:
             # Rows are restored verbatim, so the counter has to cover every row
             # the source had handed out, not just the ones this delta names.

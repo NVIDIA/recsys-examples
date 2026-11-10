@@ -264,36 +264,6 @@ template <> struct TypeConvertFunc<int, unsigned int> {
   }
 };
 
-class DeviceCounter {
-public:
-  DeviceCounter() {
-    CUDACHECK(cudaMalloc((void **)&d_counter, sizeof(uint64_t)));
-  }
-
-  ~DeviceCounter() { CUDACHECK(cudaFree(d_counter)); }
-
-  DeviceCounter &reset(const cudaStream_t &stream) {
-    CUDACHECK(cudaMemsetAsync(d_counter, 0, sizeof(uint64_t), stream));
-    return *this;
-  }
-
-  uint64_t *get() { return d_counter; }
-
-  DeviceCounter &sync(const cudaStream_t &stream) {
-    CUDACHECK(cudaMemcpyAsync(&h_counter, d_counter, sizeof(uint64_t),
-                              cudaMemcpyDeviceToHost, stream));
-    CUDACHECK(cudaStreamSynchronize(stream));
-    CUDACHECK(cudaGetLastError());
-    return *this;
-  }
-
-  uint64_t result() { return h_counter; }
-
-private:
-  uint64_t *d_counter{nullptr};
-  uint64_t h_counter{0};
-};
-
 } // namespace dyn_emb
 
 #endif // UTILS_H

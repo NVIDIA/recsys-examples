@@ -93,6 +93,9 @@ FWD_BWD_TEST_FILES=(
     "test/unit_tests/no_host_sync/test_sync_free_helpers.py"
     "test/unit_tests/no_host_sync/test_tail_invariants.py"
     "test/unit_tests/no_host_sync/test_sorted_insert_syncs.py"
+    "test/unit_tests/no_host_sync/test_score_check_ring.py"
+    "test/unit_tests/no_host_sync/test_dedup_padded_dist.py"
+    "test/unit_tests/no_host_sync/test_first_step_state.py"
     "test/unit_tests/no_host_sync/test_sync_ratchet.py"
     "test/unit_tests/no_host_sync/test_no_host_syncs.py"
 )

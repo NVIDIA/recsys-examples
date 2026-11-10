@@ -64,7 +64,10 @@ Worked example: ``F=2``, ``B=3``, both tables dim 2, so ``total_D = 4``::
 Shapes
 ------
 pooled (``SUM`` / ``MEAN``)   output ``[B, total_D]``; feature ``f`` occupies
-                              columns ``[col_begin(f), col_begin(f) + col_width(f))``
+                              columns ``[D_offsets[f], D_offsets[f+1])`` under mixed
+                              dims and ``[f*max_D, (f+1)*max_D)`` otherwise (the
+                              kernels' ``col_begin`` / ``col_width``, in
+                              ``src/pooled_layout.cuh``)
 sequence (``NONE``)           output ``[num_keys, D]``, one row per key, so
                               there is no pooling and no bag arithmetic at all
 
@@ -198,20 +201,3 @@ class EmbeddingLayout:
         """
         f, b = self.feature_sample_of_input(s)
         return self.output_index(f, b)
-
-    # -- placing a feature in the output ------------------------------------
-
-    def col_begin(self, f: int) -> int:
-        """First output column of feature ``f``.
-
-        Mirrors what the kernels do: look ``D_offsets`` up under mixed dims,
-        stride by the uniform dim otherwise.
-        """
-        if self.D_offsets is not None:
-            return int(self.D_offsets[f])
-        return f * self.max_D
-
-    def col_width(self, f: int) -> int:
-        if self.D_offsets is not None:
-            return int(self.D_offsets[f + 1]) - int(self.D_offsets[f])
-        return self.max_D

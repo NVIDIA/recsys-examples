@@ -347,5 +347,150 @@
   "miss": {"plain": 0, "prefetch": 0},
   "miss_evict": {"plain": 0, "prefetch": 0},
   "tier2_hit": {"plain": 0, "prefetch": 0}
+ },
+ "cache_storage_adagrad": {
+  "all_hit": {"plain": 0, "prefetch": 0},
+  "miss": {"plain": 0, "prefetch": 0},
+  "miss_evict": {"plain": 0, "prefetch": 0},
+  "tier2_hit": {"plain": 0, "prefetch": 0},
+  "eval": {"plain": 0},
+  "eval_miss": {"plain": 0}
+ },
+ "hbm_only_adagrad": {
+  "all_hit": {"plain": 0, "prefetch": 0},
+  "miss": {"plain": 0, "prefetch": 0},
+  "miss_evict": {"plain": 0, "prefetch": 0},
+  "eval": {"plain": 0},
+  "eval_miss": {"plain": 0}
+ },
+ "hbm_only_rowwise_adagrad_fp16": {
+  "all_hit": {"plain": 0, "prefetch": 0},
+  "miss": {"plain": 0, "prefetch": 0},
+  "miss_evict": {"plain": 0, "prefetch": 0},
+  "eval": {"plain": 0},
+  "eval_miss": {"plain": 0}
+ },
+ "cache_storage_rowwise_adagrad_bf16": {
+  "all_hit": {"plain": 0, "prefetch": 0},
+  "miss": {"plain": 0, "prefetch": 0},
+  "miss_evict": {"plain": 0, "prefetch": 0},
+  "tier2_hit": {"plain": 0, "prefetch": 0},
+  "eval": {"plain": 0},
+  "eval_miss": {"plain": 0}
+ },
+ "cache_storage_ftrl": {
+  "all_hit": {"plain": 0, "prefetch": 0},
+  "miss": {"plain": 0, "prefetch": 0},
+  "miss_evict": {"plain": 0, "prefetch": 0},
+  "tier2_hit": {"plain": 0, "prefetch": 0},
+  "eval": {"plain": 0},
+  "eval_miss": {"plain": 0}
+ },
+ "hbm_only_uint64": {
+  "all_hit": {"plain": 0, "prefetch": 0},
+  "miss": {"plain": 0, "prefetch": 0},
+  "miss_evict": {"plain": 0, "prefetch": 0},
+  "eval": {"plain": 0},
+  "eval_miss": {"plain": 0}
+ },
+ "cache_storage_uint64": {
+  "all_hit": {"plain": 0, "prefetch": 0},
+  "miss": {"plain": 0, "prefetch": 0},
+  "miss_evict": {"plain": 0, "prefetch": 0},
+  "tier2_hit": {"plain": 0, "prefetch": 0},
+  "eval": {"plain": 0},
+  "eval_miss": {"plain": 0}
+ },
+ "hbm_only_mixed_dim_sum": {
+  "all_hit": {"plain": 0, "prefetch": 0},
+  "miss": {"plain": 0, "prefetch": 0},
+  "miss_evict": {"plain": 0, "prefetch": 0},
+  "eval": {"plain": 0},
+  "eval_miss": {"plain": 0}
+ },
+ "cache_storage_mixed_dim_sum": {
+  "all_hit": {"plain": 0, "prefetch": 0},
+  "miss": {"plain": 0, "prefetch": 0},
+  "miss_evict": {"plain": 0, "prefetch": 0},
+  "tier2_hit": {"plain": 0, "prefetch": 0},
+  "eval": {"plain": 0},
+  "eval_miss": {"plain": 0}
+ },
+ "hbm_only_mean": {
+  "all_hit": {"plain": 0, "prefetch": 0},
+  "miss": {"plain": 0, "prefetch": 0},
+  "miss_evict": {"plain": 0, "prefetch": 0},
+  "eval": {"plain": 0},
+  "eval_miss": {"plain": 0}
+ },
+ "cache_storage_mean": {
+  "all_hit": {"plain": 0, "prefetch": 0},
+  "miss": {"plain": 0, "prefetch": 0},
+  "miss_evict": {"plain": 0, "prefetch": 0},
+  "tier2_hit": {"plain": 0, "prefetch": 0},
+  "eval": {"plain": 0},
+  "eval_miss": {"plain": 0}
+ },
+ "cache_storage_weighted": {
+  "all_hit": {"plain": 0, "prefetch": 0},
+  "miss": {"plain": 0, "prefetch": 0},
+  "miss_evict": {"plain": 0, "prefetch": 0},
+  "tier2_hit": {"plain": 0, "prefetch": 0},
+  "eval": {"plain": 0},
+  "eval_miss": {"plain": 0}
+ },
+ "cache_storage_prob_admit": {
+  "all_hit": {"plain": 0, "prefetch": 0},
+  "miss": {"plain": 0, "prefetch": 0},
+  "miss_evict": {"plain": 0, "prefetch": 0},
+  "eval": {"plain": 0},
+  "eval_miss": {"plain": 0}
+ },
+ "hbm_only_admit_init": {
+  "all_hit": {"plain": 0, "prefetch": 0},
+  "miss": {"plain": 0, "prefetch": 0},
+  "miss_evict": {"plain": 0, "prefetch": 0},
+  "eval": {"plain": 0},
+  "eval_miss": {"plain": 0}
+ },
+ "hbm_only_step": {
+  "all_hit": {"plain": 0, "prefetch": 0},
+  "miss": {"plain": 0, "prefetch": 0},
+  "miss_evict": {"plain": 0, "prefetch": 0},
+  "eval": {"plain": 0},
+  "eval_miss": {"plain": 0}
+ },
+ "cache_storage_customized": {
+  "all_hit": {"plain": 0, "prefetch": 0},
+  "miss": {"plain": 0, "prefetch": 0},
+  "miss_evict": {"plain": 0, "prefetch": 0},
+  "tier2_hit": {"plain": 0, "prefetch": 0},
+  "eval": {"plain": 0},
+  "eval_miss": {"plain": 0}
+ },
+ "cache_storage_lrulfu": {
+  "all_hit": {"plain": 0, "prefetch": 0},
+  "miss": {"plain": 0, "prefetch": 0},
+  "miss_evict": {"plain": 0, "prefetch": 0},
+  "tier2_hit": {"plain": 0, "prefetch": 0},
+  "eval": {"plain": 0},
+  "eval_miss": {"plain": 0}
+ },
+ "hbm_only_precise": {
+  "all_hit": {"plain": 0, "prefetch": 0},
+  "miss": {"plain": 0, "prefetch": 0},
+  "miss_evict": {"plain": 0, "prefetch": 0},
+  "eval": {"plain": 0},
+  "eval_miss": {"plain": 0},
+  "queue_ahead": {"plain": 0}
+ },
+ "cache_storage_precise": {
+  "all_hit": {"plain": 0, "prefetch": 0},
+  "miss": {"plain": 0, "prefetch": 0},
+  "miss_evict": {"plain": 0, "prefetch": 0},
+  "tier2_hit": {"plain": 0, "prefetch": 0},
+  "eval": {"plain": 0},
+  "eval_miss": {"plain": 0},
+  "queue_ahead": {"plain": 0}
  }
 }

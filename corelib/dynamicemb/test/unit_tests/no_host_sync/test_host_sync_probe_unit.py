@@ -517,6 +517,91 @@ def test_config_table_is_consistent():
         assert ("growth" in hsp.scenarios_of(c)) == c.growth
 
 
+def test_config_fields_are_known_values_and_consistent():
+    """The fields that the module builder switches on (optimizer, dtype, key type,
+    pooling, admission, score) take values it knows, several dims need pooling, and
+    queue_ahead -- which sleeps on the stream and issues whole steps -- exists for the
+    per-key-score configs only and runs in one mode."""
+    known = {
+        "optimizer": {"sgd", "adam", "adagrad", "rowwise_adagrad", "ftrl"},
+        "dtype": {"fp32", "fp16", "bf16"},
+        "keys": {"int64", "uint64"},
+        "pooling": {"none", "sum", "mean"},
+        "admit_kind": {"frequency", "probabilistic"},
+        "score": {"default", "step", "customized", "lrulfu", "precise"},
+    }
+    for c in hsp.CONFIGS.values():
+        for field, values in known.items():
+            assert getattr(c, field) in values, (c.name, field)
+        if len(set(c.dims)) > 1:
+            assert c.pooling != "none", c.name  # a sequence lookup needs one dim
+        if c.admit_kind != "frequency" or c.admit_init:
+            assert c.admit, c.name
+        assert ("queue_ahead" in hsp.scenarios_of(c)) == (c.score == "precise"), c.name
+        # a per-key score needs a layout that supports it
+        assert c.score != "precise" or c.layout in ("cache", "hbm"), c.name
+    assert set(hsp.PLAIN_ONLY_SCENARIOS) <= set(hsp.SCENARIO_DOC)
+    assert set(hsp.EVAL_SCENARIOS) <= set(hsp.PLAIN_ONLY_SCENARIOS)
+    assert hsp.QUEUE_AHEAD_STEPS > 4  # more than the slots of the score check's ring
+
+
+def ring_state(pending, slots=4, uncovered=True):
+    return {"pending": pending, "slots": slots, "uncovered": uncovered}
+
+
+def test_queue_ahead_regime_is_a_ring_that_was_full_after_every_iteration():
+    """The zero of queue_ahead means something only if the host really ran a whole ring of
+    checks ahead of the device: judged from the ring after the issue loop, not assumed.
+    """
+    cfg = hsp.CONFIGS["hbm_only_precise"]
+
+    def regime(ring):
+        return hsp.regime_check(cfg, "queue_ahead", {}, {}, 8, ring)
+
+    ok, note = regime([ring_state(4)] * 8)
+    assert ok, note
+    # nothing recorded: not the regime
+    assert not regime(None)[0] and not regime([])[0]
+    # one iteration in which the ring was not full (a host slower than the sleep)
+    assert not regime([ring_state(4)] * 7 + [ring_state(2)])[0]
+    # full, but the last check found a free slot: the checks were not ahead of the device
+    assert not regime([ring_state(4, uncovered=False)] * 8)[0]
+    # a tree that has no such flag (before the late check never waited) is judged on the ring
+    assert regime([ring_state(4, uncovered=None)] * 8)[0]
+    # the note says how many iterations had it
+    assert "2 of 3" in regime([ring_state(4), ring_state(1), ring_state(4)])[1]
+
+
+def test_a_queue_ahead_case_whose_regime_did_not_happen_is_not_a_zero():
+    """check_zero reports it though no sync was seen: the host was too slow, so no ring
+    was ahead of the device and nothing was measured."""
+    clean = result_of("hbm_only_precise", "queue_ahead")
+    clean.update(per_iter_total=[0, 0], inherent_site_per_iter=None)
+    assert hsp.check_zero(report_of(clean)) == []
+    vacuous = dict(
+        clean, regime={"ok": False, "note": "ring full in 0 of 2 iterations"}
+    )
+    bad = hsp.check_zero(report_of(vacuous))
+    assert len(bad) == 1 and "regime did not happen" in bad[0], bad
+    assert "hbm_only_precise/queue_ahead/plain" in bad[0]
+    # other scenarios keep their regime as a flag in the report, not a failure
+    other = dict(clean, scenario="all_hit", regime={"ok": False, "note": "x"})
+    assert hsp.check_zero(report_of(other)) == []
+
+
+def test_all_hit_scenarios_warm_up_long_enough_for_the_admitter():
+    """A coin toss admits a key at each sight with probability p, so a batch that is to be
+    all hit needs many steps; frequency admission needs its threshold, others a few."""
+    plain = hsp.CONFIGS["cache_storage"]
+    frequency = hsp.CONFIGS["cache_storage_admit"]
+    probabilistic = hsp.CONFIGS["cache_storage_prob_admit"]
+    assert not plain.admit and frequency.admit_kind == "frequency"
+    assert hsp.admit_warmup_steps(plain) == 3
+    assert hsp.admit_warmup_steps(frequency) >= hsp.ADMIT_THRESHOLD
+    # the p of the probabilistic config is 0.5: a key is refused after n steps with 0.5**n
+    assert 0.5 ** hsp.admit_warmup_steps(probabilistic) < 1e-6
+
+
 if __name__ == "__main__":
     fns = [
         (n, f)

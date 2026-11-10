@@ -68,6 +68,20 @@ def ensure_lex_fatbin_loaded() -> None:
         _lex_loaded = True
 
 
+def load_lex_module() -> None:
+    """Load the default (Lex) evictor module into the current CUDA context now.
+
+    ``ensure_lex_fatbin_loaded`` only hands the bytes over; the module is loaded into a
+    context when the first eviction asks for it, which would be the first insert of a
+    step. Calling this when the table is built (with its device current) moves that
+    one-time cost there. Idempotent; a no-op before a context exists, and with an
+    extension built before the function existed, where the first insert still loads it.
+    """
+    load = getattr(_ext, "demb_load_lex_module", None)
+    if load is not None:
+        load()
+
+
 def _remap_score_function(fn, perm):
     """Return a function equivalent to *fn* but with every ``scores[c]`` (c a
     logical index) rewritten to ``scores[perm[c]]`` (physical word), so a

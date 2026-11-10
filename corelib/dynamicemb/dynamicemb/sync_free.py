@@ -585,6 +585,17 @@ def _read_scratch(
     return entry
 
 
+def reserve_read_scratch(device: Union[torch.device, str, int]) -> None:
+    """Make the calling thread's pinned buffer and event for ``device`` now.
+
+    ``read_now`` allocates them on its first call on a thread and device, which is a
+    pinned allocation (``cudaHostAlloc``) in the middle of whatever step asked for the
+    read. A module that can read in a step makes them when it is built, on the thread
+    that builds it, which is the one that runs its steps. Idempotent.
+    """
+    _read_scratch(torch.device(device), 1)
+
+
 def read_now(*dev_tensors: torch.Tensor) -> List[torch.Tensor]:
     """THE blocking read: the host needs these values now.
 

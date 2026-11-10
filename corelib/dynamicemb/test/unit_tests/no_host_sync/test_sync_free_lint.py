@@ -1166,6 +1166,10 @@ ADM = "dynamicemb/embedding_admission.py"
 BDT = "dynamicemb/batched_dynamicemb_tables.py"
 GRO = "dynamicemb/growth_order.py"
 EXT = "dynamicemb/extendable_tensor.py"
+SHARD_EMB = "dynamicemb/shard/embedding.py"
+SHARD_IN = "dynamicemb/shard/input_dist.py"
+SHARD_RW = "dynamicemb/shard/rw_sharding.py"
+INIT = "dynamicemb/initializer.py"
 
 
 def _new(file: str, *qualnames: str) -> List[Target]:
@@ -1282,8 +1286,14 @@ TARGETS: List[Target] = (
         "MultiTableFrequencyAdmitter.admit",
         "MultiTableProbabilisticAdmitter.admit",
     )
-    + _legacy(BDT, "BatchedDynamicEmbeddingTablesV2._check_scores")
-    + _new(BDT, "BatchedDynamicEmbeddingTablesV2._table_key_bounds")
+    + _new(
+        BDT,
+        "BatchedDynamicEmbeddingTablesV2._check_scores",
+        "BatchedDynamicEmbeddingTablesV2._count_negative_scores",
+        "BatchedDynamicEmbeddingTablesV2._settle_oldest",
+        "BatchedDynamicEmbeddingTablesV2._drain_score_checks",
+        "BatchedDynamicEmbeddingTablesV2._table_key_bounds",
+    )
     # the order of a growth against the streams that use the table: queued waits and
     # recorded events, never a wait of the host
     + _new(GRO, "GrowthOrder.*")
@@ -1330,6 +1340,44 @@ TARGETS: List[Target] = (
     # growing a value buffer waits for nothing: the pages are mapped (a device buffer) or
     # committed (a host buffer) after the ones that are in use
     + _legacy(EXT, "DeviceExtendableBuffer.extend", "HostExtendableBuffer.extend")
+    # the index dedup of the embedding collection and the distributor that cuts its arrays
+    + _new(SHARD_EMB, "ShardedDynamicEmbeddingCollection._dedup_indices")
+    # the entry points of a step that are clean today, so that they stay clean: the module's
+    # prefetch / forward, the table calls every path makes, the initializer and the lookup's
+    # prefetch (the functions that still hold a legacy branch are targets of their own lane)
+    + _new(
+        BDT,
+        "BatchedDynamicEmbeddingTablesV2.forward",
+        "BatchedDynamicEmbeddingTablesV2.prefetch",
+        "BatchedDynamicEmbeddingTablesV2._counters_for_group",
+        "BatchedDynamicEmbeddingTablesV2._reduce_table_scores",
+    )
+    + _new(
+        KVT,
+        "DynamicEmbStorage.insert",
+        "_insert_key_values",
+        "load_from_flat",
+        "store_to_flat",
+        "get_find_score_arg",
+        "get_insert_score_arg",
+        "DynamicEmbCache.increment_counter",
+        "DynamicEmbCache.decrement_counter",
+    )
+    + _new(
+        SHT,
+        "LinearBucketTable.lookup",
+        "LinearBucketTable.lookup_with_overflow",
+        "LinearBucketTable.increment_counter",
+        "LinearBucketTable.decrement_counter",
+    )
+    + _new(INIT, "MultiTableInitializer.__call__")
+    + _new(SHARD_RW, "GroupedEmbeddingsLookup.prefetch")
+    + _new(
+        SHARD_IN,
+        "cut_to_length_per_key",
+        "RwSparseFeaturesDist.forward",
+        "_ScoredSplitsAwaitable._wait_impl",
+    )
 )
 
 ENFORCE_ALL = os.environ.get("SYNC_LINT_ENFORCE_ALL") == "1"
@@ -1360,10 +1408,6 @@ LEGACY_BASELINE: Dict[str, Dict[str, int]] = {
     },
     "dynamicemb/embedding_admission.py::MultiTableFrequencyAdmitter.admit": {
         "host-read-helper": 1,
-    },
-    "dynamicemb/batched_dynamicemb_tables.py::BatchedDynamicEmbeddingTablesV2._check_scores": {
-        "reduction-in-branch": 1,
-        "scalar-of-tensor": 1,
     },
 }
 
@@ -1985,8 +2029,8 @@ ALLOWED_NEW_HITS: List[Tuple[str, Optional[str], str]] = [
     (
         "dynamicemb/batched_dynamicemb_tables.py",
         "any_all_in_cond",
-        "_check_scores_now: the check for scores the host holds, or a module without a ring; "
-        "the late check of a CUDA score goes through the ring",
+        "_check_scores_now: the check for scores the host holds (a CPU tensor: nothing to "
+        "wait for); the late check of a CUDA score goes through the ring",
     ),
     (
         "dynamicemb/key_value_table.py",
@@ -2347,6 +2391,88 @@ EXPECTED_GONE: List[Tuple[str, str, str, str]] = [
         "flagged_compact",
         "h_num_miss, miss_compact_idx, (missing_keys, missing_table_ids) = flagged_compact(",
         "contract-C4",
+    ),
+    # The export read the overflow offset of a table from the device, a value the host holds.
+    (
+        "dynamicemb/scored_hashtable.py",
+        "item",
+        "int(self.overflow_output_offsets_[table_id].item())",
+        "step: delete dead code, read the overflow offset on the host",
+    ),
+    # The index dedup of the embedding collection no longer reads its unique count for a
+    # DynamicEmb row-wise distributor, which cuts the padded arrays itself.
+    (
+        "dynamicemb/shard/embedding.py",
+        "item",
+        "total_unique = num_uniques.item()",
+        "step: the dedup of the embedding collection reads no count",
+    ),
+    # Code that nothing called (offsets_to_table_features_offsets, DeviceCounter).
+    (
+        "src/dynamic_emb_op.cu",
+        "cudaStreamSynchronize",
+        "AT_CUDA_CHECK(cudaStreamSynchronize(stream));",
+        "step: delete dead code, read the overflow offset on the host",
+    ),
+    (
+        "src/dynamic_emb_op.cu",
+        "cpu_item",
+        "h_features_offsets[table_offsets_in_feature[i]].item<int64_t>();",
+        "step: delete dead code, read the overflow offset on the host",
+    ),
+    (
+        "src/utils.h",
+        "device_counter",
+        "class DeviceCounter {",
+        "step: delete dead code, read the overflow offset on the host",
+    ),
+    (
+        "src/utils.h",
+        "device_counter",
+        "DeviceCounter() {",
+        "step: delete dead code, read the overflow offset on the host",
+    ),
+    (
+        "src/utils.h",
+        "alloc_free",
+        "CUDACHECK(cudaMalloc((void **)&d_counter, sizeof(uint64_t)));",
+        "step: delete dead code, read the overflow offset on the host",
+    ),
+    (
+        "src/utils.h",
+        "alloc_free",
+        "~DeviceCounter() { CUDACHECK(cudaFree(d_counter)); }",
+        "step: delete dead code, read the overflow offset on the host",
+    ),
+    (
+        "src/utils.h",
+        "device_counter",
+        "~DeviceCounter() { CUDACHECK(cudaFree(d_counter)); }",
+        "step: delete dead code, read the overflow offset on the host",
+    ),
+    (
+        "src/utils.h",
+        "device_counter",
+        "DeviceCounter &reset(const cudaStream_t &stream) {",
+        "step: delete dead code, read the overflow offset on the host",
+    ),
+    (
+        "src/utils.h",
+        "device_counter",
+        "DeviceCounter &sync(const cudaStream_t &stream) {",
+        "step: delete dead code, read the overflow offset on the host",
+    ),
+    (
+        "src/utils.h",
+        "cudaMemcpyAsync_D2H",
+        "cudaMemcpyDeviceToHost, stream));",
+        "step: delete dead code, read the overflow offset on the host",
+    ),
+    (
+        "src/utils.h",
+        "cudaStreamSynchronize",
+        "CUDACHECK(cudaStreamSynchronize(stream));",
+        "step: delete dead code, read the overflow offset on the host",
     ),
 ]
 

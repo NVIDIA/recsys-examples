@@ -1049,6 +1049,31 @@ def request_size_snapshot(state: DynamicEmbTableState) -> None:
     )
 
 
+def _note_replayed(state: DynamicEmbTableState, table_id: int, count: int) -> None:
+    """A replay wrote up to ``count`` keys into table ``table_id`` of ``state``, which no
+    batch announced to ``expand_if_need``: add them to what the size estimate has to
+    cover, until a snapshot that saw them has landed.
+
+    The estimate is the newest snapshot that has landed plus the bounds issued after the
+    inserts it saw, and it must never be below what the table holds -- a growth decided
+    from a low one comes late. The bound counts every key the replay writes, also the
+    ones the table holds already (the same delta again, or keys that repeat from one
+    delta to the next), so it is only good until the table's real sizes are known: the
+    caller takes a snapshot when its replay is over (``request_size_snapshot``), which
+    has these keys and carries this bound in its mark, so that once it lands the estimate
+    is the real size again and nothing is counted twice. Without that snapshot the bounds
+    of the replays would add up, with nothing to take them back, to a table that holds
+    their union. The snapshots that landed are adopted first, which frees the slots the
+    next one needs however many replays came before. A host int; nothing is read from the
+    device.
+    """
+    snapshots = state.size_snapshots
+    if snapshots is None or count <= 0:
+        return
+    snapshots.poll()
+    snapshots.issued[table_id] += count
+
+
 def _note_forwarded(state: DynamicEmbTableState, bound: torch.Tensor) -> None:
     """The forward of a batch whose keys ``bound`` bounded has inserted them, on the
     current stream: it is no longer in flight, and a snapshot taken now counts it."""
@@ -4205,6 +4230,14 @@ class DynamicEmbStorage(Storage):
         """Collect per-table sizes from key_index_map into estimated_table_sizes (async copy)."""
         collect_table_sizes_for_state(self._state, non_blocking=non_blocking)
 
+    def note_replayed(self, table_id: int, slot_index: Tensor) -> None:
+        """The keys of a :meth:`replay_increment` of ``table_id`` (``slot_index`` is its
+        column, one row per key) are in the table: they count in the estimate that the
+        next expansion is decided from, until a snapshot that saw them has landed. The
+        caller follows the replay of all its tables with :meth:`request_size_snapshot`
+        (see :func:`_note_replayed`)."""
+        _note_replayed(self._state, table_id, slot_index.shape[0])
+
     def pop_evicted_keys(self, table_id: int) -> torch.Tensor:
         """Return + clear this rank's unique evicted keys retained for ``table_id``.
 
@@ -4935,6 +4968,18 @@ class HybridStorage(Storage):
     def collect_table_sizes(self, non_blocking: bool = True) -> None:
         """Collect per-table sizes from key_index_map into estimated_table_sizes (host tier only, async copy)."""
         collect_table_sizes_for_state(self._host, non_blocking=non_blocking)
+
+    def note_replayed(self, table_id: int, slot_index: Tensor) -> None:
+        """The keys of a :meth:`replay_increment` of ``table_id`` are in the tiers: the
+        ones the delta routes to the host tier -- ``slot_index`` has bit 63 set -- count in
+        the estimate that the next expansion of that tier is decided from, until a
+        snapshot that saw them has landed (the HBM tier does not grow). ``slot_index`` is
+        the delta's column, on the host. The caller follows the replay of all its tables
+        with :meth:`request_size_snapshot` (see :func:`_note_replayed`)."""
+        if self._host.size_snapshots is None:
+            return
+        host_keys = int(torch.count_nonzero(slot_index.to(torch.int64) < 0))
+        _note_replayed(self._host, table_id, host_keys)
 
     def pop_evicted_keys(self, table_id: int) -> torch.Tensor:
         """Return + clear this rank's unique evicted keys retained for ``table_id``.
