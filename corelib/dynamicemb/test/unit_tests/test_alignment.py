@@ -280,8 +280,9 @@ def test_alignment_cache_storage_shapes(
     embedding_dim: int,
     num_embeddings_per_table: Tuple[int, ...],
 ) -> None:
-    if caching and hbm_ratio == 0.0:
-        pytest.skip("caching with zero global HBM is invalid")
+    # caching=True with hbm_ratio 0.0 used to be skipped as invalid; it is now
+    # normalized off at plan time (with a warning), so the module below is the
+    # host-only one the runtime can actually build.
     world_size = _alignment_world_size()
     _require_cuda_dist()
     assert (
@@ -324,7 +325,7 @@ def test_alignment_cache_storage_shapes(
     assert emb_modules, "no BatchedDynamicEmbeddingTablesV2 under DMP"
     batched = emb_modules[0]
     assert isinstance(batched, BatchedDynamicEmbeddingTablesV2)
-    assert batched._caching == caching
+    assert batched._caching == (caching and hbm_ratio > 0.0)
 
     assert_cache_and_storage_shapes(batched, by_name, bucket_capacity)
 

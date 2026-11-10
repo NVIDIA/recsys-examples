@@ -45,6 +45,7 @@ from dynamicemb.async_erase import (
     EraseHandle,
     TableAccessGate,
     check_erase_arguments,
+    check_table_names,
 )
 from dynamicemb.batched_dynamicemb_function import (
     DynamicEmbeddingFunction,
@@ -61,8 +62,10 @@ from dynamicemb.dynamicemb_config import (
     EvictedItemMode,
     ReplayContent,
     get_eviction_score_strategy,
+    get_physical_score_order,
     get_score_part,
     has_no_eviction,
+    normalize_caching_against_hbm_budget,
     score_strategy_has_timestamp_column,
     warning_for_cstm_score,
 )
@@ -453,8 +456,8 @@ def _print_memory_consume(
     The caller passes the ``StorageLayout`` set by ``_create_cache_storage`` so
     the report matches the code path that ran (no inference from buffer state).
     Per-tier bytes come from the constructed ``ExtendableBuffer`` (init) and
-    ``options.max_capacity`` (peak), capturing bucket alignment, hybrid
-    ``cap_scale`` rebalancing, and caching's HBM/backing duplication. Does
+    ``options.max_capacity`` (peak), capturing bucket alignment, each table's
+    HBM-budget share of its rows, and caching's HBM/backing duplication. Does
     *not* include hash-table metadata (keys/digests/scores/ref_counter), which
     always live on HBM regardless of value tier.
     """
@@ -636,6 +639,32 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
     ) -> None:
         super().__init__()
         assert len(table_options) >= 1
+        # A cache is an HBM tier, so a table whose resolved HBM value budget
+        # is zero cannot have one: the runtime would build it a single-bucket
+        # cache whose overflow cannot absorb a batch. Caching comes off such
+        # a table before the grouped-key check below -- the planner makes the
+        # same change before it groups and costs tables
+        # (``_prepare_dynemb_table_options``), so both see one answer.
+        table_labels = (
+            table_names
+            if table_names is not None
+            else [f"table {i}" for i in range(len(table_options))]
+        )
+        lost_caching = [
+            label
+            for label, option in zip(table_labels, table_options)
+            if normalize_caching_against_hbm_budget(option, label=label)
+        ]
+        if lost_caching and len({option.caching for option in table_options}) > 1:
+            # Only the normalization above can leave a group mixed in caching:
+            # options that arrived mixed are refused by the check just below.
+            raise ValueError(
+                f"caching was disabled for {', '.join(lost_caching)} "
+                "(local_hbm_for_values of zero) but kept for the other tables: "
+                "the tables of one fused module must share one storage layout. "
+                "Give every table a positive local_hbm_for_values, or pass "
+                "caching=False for all of them."
+            )
         table_option = table_options[0]
         for other_option in table_options:
             assert (
@@ -845,13 +874,22 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
             option.dim + self._optimizer.get_state_dim(option.dim)
             for option in self._dynamicemb_options
         ]
-        total_memory = sum(
+        table_bytes = [
             option.max_capacity * DTYPE_NUM_BYTES[option.embedding_dtype] * value_dim
             for option, value_dim in zip(self._dynamicemb_options, value_dims)
-        )
+        ]
+        total_memory = sum(table_bytes)
         local_hbm = sum(
             option.local_hbm_for_values for option in self._dynamicemb_options
         )
+        # The layout is chosen for the group (above, from the sums), but when it
+        # splits rows between HBM and the next tier each table keeps the share
+        # its own budget buys: a budget the planner gave one table is not
+        # spread over its groupmates, nor is a spare one lent to them.
+        hbm_fractions = [
+            min(1.0, option.local_hbm_for_values / nbytes) if nbytes > 0 else 1.0
+            for option, nbytes in zip(self._dynamicemb_options, table_bytes)
+        ]
 
         if total_memory > local_hbm:
             # Data does not fit entirely in HBM.
@@ -863,10 +901,9 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                     )
 
                 cache_options = deepcopy(self._dynamicemb_options)
-                cap_scale = local_hbm / total_memory if total_memory > 0 else 1.0
-                for cache_option in cache_options:
+                for cache_option, frac in zip(cache_options, hbm_fractions):
                     cache_option.bucket_capacity = 1024
-                    cap = max(1, int(cache_option.max_capacity * cap_scale))
+                    cap = max(1, int(cache_option.max_capacity * frac))
                     cache_option.max_capacity = min(cache_option.max_capacity, cap)
                     cache_option.init_capacity = min(cache_option.max_capacity, cap)
 
@@ -942,20 +979,17 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                             "Set caching=True to use external storage.",
                             UserWarning,
                         )
-                    cap_scale = local_hbm / total_memory if total_memory > 0 else 1.0
-
                     hbm_options = deepcopy(self._dynamicemb_options)
-                    for hbm_option in hbm_options:
+                    for hbm_option, frac in zip(hbm_options, hbm_fractions):
                         hbm_option.bucket_capacity = 1024
-                        cap = max(1, int(hbm_option.max_capacity * cap_scale))
+                        cap = max(1, int(hbm_option.max_capacity * frac))
                         hbm_option.max_capacity = min(hbm_option.max_capacity, cap)
                         hbm_option.init_capacity = hbm_option.max_capacity
 
-                    storage_cap_scale = 1.0 - cap_scale
                     host_options = deepcopy(self._dynamicemb_options)
-                    for host_option in host_options:
+                    for host_option, frac in zip(host_options, hbm_fractions):
                         host_option.local_hbm_for_values = 0
-                        cap = max(1, int(host_option.max_capacity * storage_cap_scale))
+                        cap = max(1, int(host_option.max_capacity * (1.0 - frac)))
                         host_option.max_capacity = min(host_option.max_capacity, cap)
                         host_option.init_capacity = min(host_option.init_capacity, cap)
 
@@ -1566,26 +1600,19 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
         """The tables an erase by ``score_strategy`` would scan, after checking that it can.
 
         A table is scanned when its score strategy has ``score_strategy`` as a member
-        (``(NO_EVICTION, CUSTOMIZED)`` has ``CUSTOMIZED``); one with no score, which
-        is ``NO_EVICTION`` alone, is not. Raises if a table that would be scanned
-        cannot be: it keeps more than one score word, or its storage cannot be
-        scanned. Nothing to scan is an empty list, not an error.
+        (``(NO_EVICTION, CUSTOMIZED)`` has ``CUSTOMIZED``, and ``(TIMESTAMP, LFU)`` has
+        both ``TIMESTAMP`` and ``LFU``); one with no score, which is ``NO_EVICTION``
+        alone, is not. Raises if a table that would be scanned cannot be: its storage
+        cannot be scanned. Nothing to scan is an empty list, not an error.
         """
         table_ids = []
-        for table_id, (name, option) in enumerate(
-            zip(self._table_names, self._dynamicemb_options)
-        ):
+        for table_id, option in enumerate(self._dynamicemb_options):
             part = get_score_part(option.score_strategy)
             if part is None:
                 continue
-            if isinstance(part, tuple):
-                if score_strategy in part:
-                    raise NotImplementedError(
-                        f"Table '{name}' keeps one score word per strategy in "
-                        f"{option.score_strategy}; erase by score reads one."
-                    )
-                continue
-            if part == score_strategy:
+            if part == score_strategy or (
+                isinstance(part, tuple) and score_strategy in part
+            ):
                 table_ids.append(table_id)
         if table_ids and self._storage_layout not in self._ERASABLE_LAYOUTS:
             raise NotImplementedError(
@@ -1595,6 +1622,50 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
             )
         return table_ids
 
+    def get_erase_table_ids(
+        self,
+        score_strategy: DynamicEmbScoreStrategy,
+        table_names: Optional[Sequence[str]] = None,
+    ) -> List[int]:
+        """The tables an erase by ``score_strategy`` scans: :meth:`erasable_table_ids`,
+        narrowed to ``table_names`` when they are given, in table order. Raises if a name
+        is not a table of this module, or names a table that ``score_strategy`` does not
+        erase."""
+        check_table_names(table_names)
+        table_ids = self.erasable_table_ids(score_strategy)
+        if table_names is None:
+            return table_ids
+        unknown = [name for name in table_names if name not in self._table_names]
+        if unknown:
+            raise ValueError(
+                f"table_names {unknown} are not tables of this module, whose tables "
+                f"are {self._table_names}."
+            )
+        erasable = {self._table_names[table_id] for table_id in table_ids}
+        refused = [name for name in table_names if name not in erasable]
+        if refused:
+            raise ValueError(
+                f"Tables {refused} are not erased by {score_strategy}: their score "
+                f"strategy does not have it as a member."
+            )
+        wanted = set(table_names)
+        return [
+            table_id for table_id in table_ids if self._table_names[table_id] in wanted
+        ]
+
+    def erase_score_word(
+        self, score_strategy: DynamicEmbScoreStrategy, table_ids: Sequence[int]
+    ) -> Optional[int]:
+        """The score word an erase by ``score_strategy`` compares in ``table_ids``:
+        ``None`` for tables that keep one, else the place of ``score_strategy`` in their
+        physical layout, whatever the tuple order (``TIMESTAMP`` is word 0 and ``LFU``
+        word 1 of a ``(TIMESTAMP, LFU)`` table)."""
+        # The tables of a module share one key map, so one score layout.
+        part = get_score_part(self._dynamicemb_options[table_ids[0]].score_strategy)
+        if not isinstance(part, tuple):
+            return None
+        return get_physical_score_order(part).index(score_strategy)
+
     def erase_by_score_async(
         self,
         score_strategy: DynamicEmbScoreStrategy,
@@ -1602,12 +1673,18 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
         stream: Optional[torch.cuda.Stream] = None,
         chunk_slots: int = ERASE_CHUNK_SLOTS,
         max_in_flight: int = ERASE_MAX_CHUNKS_IN_FLIGHT,
+        table_names: Optional[Sequence[str]] = None,
     ) -> EraseHandle:
         """Erase, in the background, the keys whose score is below ``threshold``.
 
         Only tables whose score strategy has ``score_strategy`` as a member are
         scanned (see :meth:`erasable_table_ids`); with none, the handle is done at
-        once and says ``(0, 0)``. The scan runs on a thread of its own and launches on
+        once and says ``(0, 0)``. ``table_names`` narrows them to the tables named, each
+        of which must be one of them (see :meth:`get_erase_table_ids`); ``None`` is all
+        of them. Tables that need different thresholds take one call each: the calls on a
+        module run one after another, in the order they were made. In a ``(TIMESTAMP,
+        LFU)`` table the word compared is the one ``score_strategy`` names
+        (:meth:`erase_score_word`). The scan runs on a thread of its own and launches on
         ``stream``, a stream of the tables' device; the call returns at once. Without a
         ``stream`` this one uses a stream of its own, made on first use and kept, and the
         scan overlaps the training. On the stream the training runs on, or the prefetch
@@ -1631,9 +1708,9 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
         Returns an :class:`EraseHandle`; ``result()`` is ``(erased, spared)``.
         """
         check_erase_arguments(
-            score_strategy, threshold, stream, chunk_slots, max_in_flight
+            score_strategy, threshold, stream, chunk_slots, max_in_flight, table_names
         )
-        table_ids = self.erasable_table_ids(score_strategy)
+        table_ids = self.get_erase_table_ids(score_strategy, table_names)
         if not table_ids:
             return EraseHandle.completed()
         if stream is None:
@@ -1656,12 +1733,14 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                     UserWarning,
                     stacklevel=2,
                 )
+        score_word = self.erase_score_word(score_strategy, table_ids)
         storage, gate = self._storage, self._table_gate
         return self._eraser.submit(
             lambda counts: storage.erase_by_score(
                 threshold,
                 table_ids,
                 counts,
+                score_word=score_word,
                 chunk_slots=chunk_slots,
                 chunk_guard=gate,
                 max_in_flight=max_in_flight,

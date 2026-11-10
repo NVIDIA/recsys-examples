@@ -8,6 +8,8 @@ set -e
 DIR=./test/unit_tests/erase_async
 
 pytest -svv $DIR/test_erase_by_score.py \
+             $DIR/test_erase_by_score_lru_lfu.py \
+             $DIR/test_erase_table_filter.py \
              $DIR/test_storage_erase_by_score.py \
              $DIR/test_async_erase.py \
              $DIR/test_erase_api.py \

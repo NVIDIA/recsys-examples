@@ -61,7 +61,13 @@ from .rw_sharding import RwSequenceDynamicEmbeddingSharding
 
 
 class DynamicEmbeddingCollectionContext(EmbeddingCollectionContext):
-    """Extended EmbeddingCollectionContext that includes frequency_counters for LFU strategy."""
+    """EmbeddingCollectionContext with the frequency counters of index dedup.
+
+    With index dedup, ``frequency_counters`` holds one entry per sharding, in
+    sharding order. For a sharding that needs counters (LFU or admission) it is
+    how often each deduplicated key occurs, or an empty tensor when the
+    sharding's input on this rank is empty; for any other, None.
+    """
 
     def __init__(
         self,
@@ -79,7 +85,7 @@ class DynamicEmbeddingCollectionContext(EmbeddingCollectionContext):
             seq_vbe_ctx=[] if seq_vbe_ctx is None else seq_vbe_ctx,
         )
         # One entry per sharding, in sharding order; None for a sharding that
-        # needs no counters (or whose input is empty).
+        # needs no counters.
         self.frequency_counters: List[Optional[torch.Tensor]] = (
             [] if frequency_counters is None else frequency_counters
         )
@@ -282,7 +288,14 @@ class ShardedDynamicEmbeddingCollection(ShardedEmbeddingCollection):
                     ctx.reverse_indices.append(
                         torch.empty(0, dtype=torch.int64, device=self._device)
                     )
-                    ctx.frequency_counters.append(None)
+                    # No keys, so no counts. A sharding that needs counters still
+                    # gets an entry, empty, so input_dist sends empty weights as
+                    # the ranks with keys send theirs.
+                    ctx.frequency_counters.append(
+                        torch.empty(0, dtype=torch.uint64, device=self._device)
+                        if self._sharding_is_lfu[i] or self._sharding_has_admit[i]
+                        else None
+                    )
                     features_by_shards.append(dedup_features)
                     continue
 
@@ -414,9 +427,6 @@ class ShardedDynamicEmbeddingCollection(ShardedEmbeddingCollection):
             if unpadded_features is not None:
                 self._compute_sequence_vbe_context(ctx, unpadded_features)
         return KJTListSplitsAwaitable(awaitables, ctx)
-
-    # def create_context(self) -> DynamicEmbeddingCollectionContext:
-    #     return DynamicEmbeddingCollectionContext(sharding_contexts=[])
 
     def create_context(self) -> DynamicEmbeddingCollectionContext:
         return DynamicEmbeddingCollectionContext(sharding_contexts=[])

@@ -1971,6 +1971,80 @@ def test_prefetch_flush_in_cache(opt_type, opt_params, deterministic, PS):
         del os.environ["DEMB_DETERMINISM_MODE"]
 
 
+def test_prefetch_pipeline_keeps_ref_counts_through_expansion():
+    """A prefetch pipeline: the second batch is prefetched before the first
+    batch's backward, and its prefetch expands the tables, which moves the
+    first batch's keys to other slots. A prefetch adds 1 to the ref counter of
+    each key of its batch, and the batch's backward takes it off again. So no
+    counter goes below 0, and every counter is 0 after both backwards."""
+    assert torch.cuda.is_available()
+    device_id = 0
+    device = torch.device(f"cuda:{device_id}")
+
+    table_names = ["table0", "table1"]
+    table_options = [
+        DynamicEmbTableOptions(
+            dim=8,
+            init_capacity=1024,
+            max_capacity=16384,
+            index_type=torch.int64,
+            embedding_dtype=torch.float32,
+            device_id=device_id,
+            score_strategy=DynamicEmbScoreStrategy.TIMESTAMP,
+            caching=False,
+            # The tables fit in HBM: the prefetch counts keys at their slots.
+            local_hbm_for_values=1024**3,
+        )
+        for _ in table_names
+    ]
+    model = BatchedDynamicEmbeddingTablesV2(
+        table_names=table_names,
+        table_options=table_options,
+        feature_table_map=[0, 1],
+        pooling_mode=DynamicEmbPoolingMode.SUM,
+        optimizer=EmbOptimType.SGD,
+        learning_rate=0.3,
+    )
+    storage = model.tables
+    assert isinstance(storage, DynamicEmbStorage)
+
+    def make_batch(keys):
+        # One key per sample, the same keys for both features.
+        indices = torch.tensor(keys * 2, dtype=torch.int64, device=device)
+        offsets = torch.arange(len(indices) + 1, dtype=torch.int64, device=device)
+        return indices, offsets
+
+    def capacities():
+        key_map = storage.key_index_map
+        return [key_map.capacity(table_id) for table_id in range(len(table_names))]
+
+    def ref_counters():
+        return storage.key_index_map._ref_counter
+
+    # A table of 1024 slots holds 512 keys at the load factor of 0.5. The first
+    # batch's 256 keys fit. The second batch shares 128 keys with the first, and
+    # with its keys each table holds 640: its prefetch expands both tables.
+    first_keys = list(range(256))
+    second_keys = list(range(128, 640))
+    first_batch = make_batch(first_keys)
+    second_batch = make_batch(second_keys)
+
+    model.prefetch(*first_batch)
+    capacities_before = capacities()
+    model.prefetch(*second_batch)
+    assert all(
+        after > before for after, before in zip(capacities(), capacities_before)
+    ), "the second prefetch did not expand every table"
+    # A key counts once for each prefetched batch that has it, in each table.
+    total_counts = len(table_names) * (len(first_keys) + len(second_keys))
+    assert int(ref_counters().sum()) == total_counts
+
+    for indices, offsets in (first_batch, second_batch):
+        model(indices, offsets).sum().backward()
+        assert (ref_counters() >= 0).all(), "a ref counter went below 0"
+    assert (ref_counters() == 0).all(), "a ref counter is not 0 after the backwards"
+
+
 def random_indices(batch, min_index, max_index):
     result = set({})
     while len(result) < batch:

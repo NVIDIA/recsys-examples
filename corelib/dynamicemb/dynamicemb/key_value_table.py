@@ -624,13 +624,17 @@ def create_table_state(
         ovf_cap = key_index_map.overflow_bucket_capacity_
         overflow_caps_list = [ovf_cap] * num_tables
 
+    # Which memory the values live in is the group's tier, not options[0]'s
+    # budget: a host tier zeroes every table's budget, while an HBM tier may
+    # hold a table with no budget of its own beside one that has some.
+    on_host = all(opt.local_hbm_for_values == 0 for opt in options)
     tables: List[ExtendableBuffer] = []
     for i, (cap, vd) in enumerate(zip(table_caps, value_dims)):
         total_cap = cap
         if enable_overflow:
             total_cap += overflow_caps_list[i]
         shape = (total_cap, vd)
-        if base_opt.local_hbm_for_values == 0:
+        if on_host:
             tables.append(HostExtendableBuffer(shape, emb_dtype, device))
         else:
             tables.append(DeviceExtendableBuffer(shape, emb_dtype, device))
@@ -753,7 +757,12 @@ def _expand_tables_impl(
 
     A table that never evicts keeps its value buffer out of this: it is sized by the
     rows the table has handed out, not by the key map (see
-    :func:`_grow_values_only`)."""
+    :func:`_grow_values_only`).
+
+    Batches prefetched before the rehash whose backward has not run yet keep
+    their keys' ref counts, which move with the keys, but their slots go
+    stale: they look them up again (``state.key_map_generation`` counts the
+    rehashes)."""
     base_opt = state.options_list[0]
     device = state.device
     enable_overflow = getattr(state.key_index_map, "enable_overflow_", False)
@@ -811,6 +820,13 @@ def _expand_tables_impl(
         if not tables_to_expand[table_id]:
             new_key_index_map.copy_table_from(old_key_index_map, table_id)
             continue
+        # The ref counters are flat over the tables: the counter of a table's
+        # slot is at its first bucket times the bucket capacity, plus the slot.
+        src_base, dst_base = [
+            int(key_map.table_bucket_offsets_cpu_[table_id].item())
+            * key_map.bucket_capacity_
+            for key_map in (old_key_index_map, new_key_index_map)
+        ]
         dst_values_list: List[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
         for (
             keys,
@@ -855,9 +871,9 @@ def _expand_tables_impl(
                     old_key_index_map, table_id, src_slots, dst_slots
                 )
             if new_key_index_map._ref_counter is not None:
-                new_key_index_map._ref_counter[dst_slots].copy_(
-                    old_key_index_map._ref_counter[src_slots]
-                )
+                new_key_index_map._ref_counter[
+                    dst_base + dst_slots
+                ] = old_key_index_map._ref_counter[src_base + src_slots]
 
             if not new_key_index_map.use_rows_:
                 # Value row == hash slot: the value has to follow its key.
@@ -946,9 +962,11 @@ def _erase_state_by_score(
     chunk_slots: int = ERASE_CHUNK_SLOTS,
     chunk_guard: Optional[Callable[[], ContextManager]] = None,
     max_in_flight: int = ERASE_MAX_CHUNKS_IN_FLIGHT,
+    score_word: Optional[int] = None,
 ) -> None:
     """Erase the keys of ``table_ids`` whose score is below ``threshold``, a chunk
-    of slots at a time (:func:`next_erase_chunk_end`).
+    of slots at a time (:func:`next_erase_chunk_end`). ``score_word`` is the word
+    compared, as in :meth:`LinearBucketTable.erase_by_score`.
 
     No more than ``max_in_flight`` chunks are launched and unfinished at once: before
     launching one, the thread waits -- outside the guard, so holding nothing and not
@@ -1012,7 +1030,12 @@ def _erase_state_by_score(
                         position, table_slots, key_map.bucket_capacity_, chunk_slots
                     )
                     key_map.erase_by_score(
-                        table_id, threshold, table_counts, begin=position, end=end
+                        table_id,
+                        threshold,
+                        table_counts,
+                        score_word=score_word,
+                        begin=position,
+                        end=end,
                     )
                     position = end
                     finished = position >= table_slots
@@ -2897,6 +2920,7 @@ class DynamicEmbStorage(Storage):
         table_ids: Sequence[int],
         counts: Tensor,
         *,
+        score_word: Optional[int] = None,
         chunk_slots: int = ERASE_CHUNK_SLOTS,
         chunk_guard: Optional[Callable[[], ContextManager]] = None,
         max_in_flight: int = ERASE_MAX_CHUNKS_IN_FLIGHT,
@@ -2911,9 +2935,11 @@ class DynamicEmbStorage(Storage):
         the current stream and nothing waits for them, except that at the end of each table
         the count of its removals is read back, to know whether to mark it (below).
 
-        Single-score tables only, as :meth:`LinearBucketTable.erase_by_score`. A table the
-        scan removed a key from is marked (:meth:`erase_untracked`): the removals are not
-        recorded, so a delta dumped from it cannot be replayed exactly.
+        One score word is compared, as in :meth:`LinearBucketTable.erase_by_score`:
+        ``score_word`` names it for an ``LRU_LFU`` table (``0`` the last-access
+        timestamp, ``1`` the frequency) and is left out for a single-score one. A table
+        the scan removed a key from is marked (:meth:`erase_untracked`): the removals are
+        not recorded, so a delta dumped from it cannot be replayed exactly.
         """
         _erase_state_by_score(
             self._state,
@@ -2923,6 +2949,7 @@ class DynamicEmbStorage(Storage):
             chunk_slots,
             chunk_guard,
             max_in_flight,
+            score_word,
         )
 
     @property

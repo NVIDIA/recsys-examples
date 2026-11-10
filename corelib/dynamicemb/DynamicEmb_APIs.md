@@ -161,7 +161,7 @@ At plan time, `DynamicEmbeddingShardingPlanner` reads the table configs off the 
 |------|-----------|----------------|
 | 1 | `initializer_args` | **`complete_initializer_args`** returns a new `DynamicEmbInitializerArgs` when needed. For **`UNIFORM`** initialization only: if `lower` or `upper` is `None`, they are filled. With a TorchREC `embedding_config`, bounds are `±sqrt(1 / num_embeddings)`; without it, `0.0` and `1.0`. Other modes are returned unchanged. |
 | 2 | `bucket_capacity`, `max_capacity` | **`_sharded_table_bucket_layout(embedding_config, world_size, bucket_capacity)`** (internal) returns **`(num_buckets, effective_bucket_width)`** per rank. The planner overwrites **`bucket_capacity`** with the **effective** width (after `MAX_BUCKET_CAPACITY` / alignment rules). **`max_capacity`** is set to **`num_buckets * effective_bucket_width`**, i.e. the same value as **`get_sharded_table_capacity(embedding_config, world_size, bucket_capacity)`**. **`init_capacity`**: if unset, set to **`max_capacity`**; if set, align to **`bucket_capacity`**, then clamp to **`max_capacity`** if larger. **User input:** `bucket_capacity` on `DynamicEmbTableOptions` (multiple of **`BUCKET_ALIGNMENT` (16)** unless **`MAX_BUCKET_CAPACITY`** = `2**63 - 1`). **Sentinel:** layout is `(1, aligned_per_rank_rows)` — one bucket spanning the shard. **Otherwise:** `num_buckets = align_to_table_size(ceil(N/world), bucket_capacity) // bucket_capacity`. |
-| 3 | `local_hbm_for_values` | Overwritten to **`ceil(global_hbm_for_values / fanout)`** so each rank holding the table gets an equal byte budget from the user-provided **`global_hbm_for_values`** (set on `DynamicEmbTableOptions` before planning). **It is a budget for the group, not the table:** tables the runtime fuses pool both their sizes and their budgets and take one HBM-or-host decision for the sum, so a table whose budget exceeds its size lends the remainder to its groupmates rather than wasting it. The planner reserves memory the same way. |
+| 3 | `local_hbm_for_values` | Overwritten to **`ceil(global_hbm_for_values / fanout)`** so each rank holding the table gets an equal byte budget from the user-provided **`global_hbm_for_values`** (set on `DynamicEmbTableOptions` before planning). **It is the table's own budget, even when the runtime fuses it with others:** the fused group takes one layout decision on the sums of its sizes and budgets -- if every row fits the summed budget the whole group is HBM-only -- but when it does not fit, each table keeps `min(its size, its own budget)` in HBM and the rest of its rows go to the host tier; a spare budget is not lent to groupmates. The planner reserves memory the same way. A budget that resolves to zero also turns `caching` off for the table, with a warning, before grouping and cost see it. |
 
 **The divisor (`fanout`) is per table.** It is how many pieces the table's rows are split into: `world_size` for a `ROW_WISE` table, which sits on every rank, and `local_world_size` for a `TABLE_ROW_WISE` one, which sits on a single node. The same number decides the shard metadata, so capacity and placement cannot disagree. Steps 2 and 3 both use it.
 
@@ -220,6 +220,8 @@ Inherits from TorchREC's `EmbeddingCollectionSharder` and is used in exactly the
     #How to import
     from dynamicemb.shard import DynamicEmbeddingCollectionSharder
     ```
+
+With `use_index_dedup=True` and an LFU score strategy or an admission strategy, each rank sends its deduplicated keys together with how often each one occurs (as the KJT weights), so that a table counts every occurrence.
 
 ## DynamicEmbCheckMode
 
@@ -878,6 +880,7 @@ Fields declared first (through `device_id`) are **planner/runtime-heavy**: `Dyna
                 set **`caching=True`** will create a GPU table and a host table, and make GPU table serves as a cache;
                 set **`caching=False`** will create a hybrid table which use GPU and host memory in a concatenated way to store value.
                 All keys and other meta data are always stored on GPU for both cases.
+            A table whose resolved `local_hbm_for_values` is zero has caching turned off, with a warning, at plan/construction time: a cache is an HBM tier, and without a budget it would be a single bucket whose overflow cannot absorb a batch's admitted keys.
         init_capacity : Optional[int], optional
             The initial capacity of the table. If not set, it defaults to max_capacity after sharding.
             ``BatchedDynamicEmbeddingTablesV2`` also sets ``init_capacity`` to ``max_capacity`` when it is still ``None``.
@@ -1373,8 +1376,8 @@ Remove, in the background of training, every key whose score is below a threshol
 The call returns at once with a handle; the scan runs on a thread of its own, on a CUDA stream of its own, beside the forward, the backward and the prefetch of the training.
 
 **Behavior**
-- *Which tables.* Those whose score strategy has the one you name as a member, so `CUSTOMIZED` takes `CUSTOMIZED` and `(NO_EVICTION, CUSTOMIZED)` tables, and `PRECISE_CUSTOMIZED` takes `PRECISE_CUSTOMIZED` and `(NO_EVICTION, PRECISE_CUSTOMIZED)` tables. A table that is `NO_EVICTION` alone keeps no score and is never picked; naming `NO_EVICTION` is an error. With no table that qualifies the call is not an error: the handle is done at once and says `(0, 0)`. A table that keeps two score words (`(TIMESTAMP, LFU)`) cannot be erased by either: it is an error if you name one of its members.
-- *The threshold.* A key is erased when its score is **strictly below** `threshold`, an int in `[0, 2**64)`, in the unit the score has: the number you set or gave per key, a step, a frequency, or for `TIMESTAMP` the device clock, which you read with `dynamicemb_extensions.device_timestamp()`. For `(NO_EVICTION, CUSTOMIZED)` and `(NO_EVICTION, PRECISE_CUSTOMIZED)` tables the scores of the keys you keep must be at least 1: an erased slot is cleared to 0, so a key scored 0 ties with one.
+- *Which tables.* Those whose score strategy has the one you name as a member, so `CUSTOMIZED` takes `CUSTOMIZED` and `(NO_EVICTION, CUSTOMIZED)` tables, and `PRECISE_CUSTOMIZED` takes `PRECISE_CUSTOMIZED` and `(NO_EVICTION, PRECISE_CUSTOMIZED)` tables. A table that is `NO_EVICTION` alone keeps no score and is never picked; naming `NO_EVICTION` is an error. With no table that qualifies the call is not an error: the handle is done at once and says `(0, 0)`. A table that keeps two score words (`(TIMESTAMP, LFU)`, in either order) is taken by both `TIMESTAMP` and `LFU`, and the one you name is the word compared: `TIMESTAMP` its last-access timestamp (an expiry, whatever the key's frequency), `LFU` its frequency (whatever its age). The other word is not looked at, and an erased key loses both. `table_names` narrows the call to the tables you name, each of which must qualify; a name that is in no module, a table that does not qualify, or an empty list is an error, raised before anything starts. With `strict=False` a name that no module of this rank holds is skipped instead, so the same call works on every rank when a table is not on every rank (`TABLE_ROW_WISE`); a held name that does not qualify is still an error. Tables that need different thresholds take one call each (example below).
+- *The threshold.* A key is erased when its score is **strictly below** `threshold`, an int in `[0, 2**64)`, in the unit the score has: the number you set or gave per key, a step, a frequency, or for `TIMESTAMP` the device clock, in ns, which you read with `dynamicemb.device_timestamp()` on the tables' device. An `LFU` frequency is the raw access count: it never decays (a `score_function` only changes how evictions rank), and a key just admitted starts at its first count, so an erase by `LFU` alone also removes the keys that came in recently. A frequency floor usually wants an age condition with it, which this call does not combine. For `(NO_EVICTION, CUSTOMIZED)` and `(NO_EVICTION, PRECISE_CUSTOMIZED)` tables the scores of the keys you keep must be at least 1: an erased slot is cleared to 0, so a key scored 0 ties with one.
 - *Layouts.* Supported: GPU-only tables, and a cache over host storage (only the storage behind the cache is erased; the cache is neither read nor changed, so a key it still holds can be written back when the cache lets it go). Refused when a table of the module would be scanned: host-only tables, `HybridStorage`, and any layout with an `external_storage`.
 - *What is spared.* Best effort. A key a prefetched batch is using -- from its prefetch to its backward -- is not erased even if its score is below the threshold; it is counted as spared instead. A key whose score is raised or lowered while the scan runs is erased or not by the score it has when the scan reaches it. If the table is expanded while it is scanned (the training inserted more keys than it has room for), that table is scanned again from its first bucket.
 - *What it overlaps.* Forward, backward and prefetch. **Not** dump, load, `incremental_dump`, `replay_increment`, `pop_evicted_keys`, `pop_erased_keys` or evaluation: call `wait()` on the handle first; this is not checked. The prefetch of a batch waits for the chunk the scan is in and the few it has in flight, not for the whole scan.
@@ -1406,9 +1409,12 @@ Anything the background thread raised is raised by whichever of these you call. 
         stream: Optional[torch.cuda.Stream] = None,
         chunk_slots: int = 1 << 22,
         max_in_flight: int = 2,
+        table_names: Optional[Sequence[str]] = None,
+        strict: bool = True,
     ) -> EraseHandle:
         """Erase, in the background of training, the keys whose score is below ``threshold``
-        from every dynamic embedding table of ``model`` that scores its keys by ``score_strategy``.
+        from every dynamic embedding table of ``model`` that scores its keys by ``score_strategy``,
+        or only from the tables named in ``table_names``.
 
         Parameters
         ----------
@@ -1416,7 +1422,8 @@ Anything the background thread raised is raised by whichever of these you call. 
             The model containing dynamic embedding tables.
         score_strategy : DynamicEmbScoreStrategy
             Which tables to erase from, and how their scores read. A table qualifies when its
-            score strategy has this as a member. ``NO_EVICTION`` alone is an error.
+            score strategy has this as a member; in a ``(TIMESTAMP, LFU)`` table it is also
+            the score word compared. ``NO_EVICTION`` alone is an error.
         threshold : int
             A key is erased when its score is strictly below it. In [0, 2**64).
         stream : Optional[torch.cuda.Stream]
@@ -1426,6 +1433,14 @@ Anything the background thread raised is raised by whichever of these you call. 
             The most slots one chunk of the scan covers, in whole buckets. Default 2**22.
         max_in_flight : int
             At most this many chunks launched and not yet finished on the device. Default 2.
+        table_names : Optional[Sequence[str]]
+            Erase only from these tables, by name; each must qualify for ``score_strategy``.
+            Default ``None``: every table that qualifies. A name in no module, a table that does
+            not qualify, and an empty list are errors.
+        strict : bool
+            ``False``: a name no module of this rank holds is skipped, not an error, for tables
+            that are not on every rank (``TABLE_ROW_WISE``). A held name that does not qualify
+            is still an error. Default ``True``.
 
         Returns
         -------
@@ -1434,7 +1449,7 @@ Anything the background thread raised is raised by whichever of these you call. 
         """
     ```
 
-The same call is a method of `BatchedDynamicEmbeddingTablesV2`, `module.erase_by_score_async(score_strategy, threshold, stream=None, chunk_slots=..., max_in_flight=...)`, for the tables of that one module.
+The same call is a method of `BatchedDynamicEmbeddingTablesV2`, `module.erase_by_score_async(score_strategy, threshold, stream=None, chunk_slots=..., max_in_flight=..., table_names=None)`, for the tables of that one module. It has no `strict`: every name must be a table of the module.
 
     ```python
     # Keep the last 1000 steps. Every key is given the step it was seen in, as its score
@@ -1454,6 +1469,25 @@ The same call is a method of `BatchedDynamicEmbeddingTablesV2`, `module.erase_by
     # Before a dump: the erase must be finished.
     if handle is not None:
         erased, spared = handle.result()   # this rank's
+    DynamicEmbDump(path, model)
+    ```
+
+Tables that need different thresholds take one call each, with `table_names`. Here two `(TIMESTAMP, LFU)` tables expire keys at different ages: `item_id` after a day without being seen, `creator_id` after 90 days. The calls on one module run one after another, in the order they were made, and each handle has its own counts. For counts per table, make one call per table: each table is scanned once either way.
+
+    ```python
+    from dynamicemb import DynamicEmbScoreStrategy, device_timestamp, erase_by_score_async
+
+    DAY_NS = 24 * 3600 * 10**9
+    now = device_timestamp()   # this rank's device clock, in ns
+    short = erase_by_score_async(
+        model, DynamicEmbScoreStrategy.TIMESTAMP, now - DAY_NS, table_names=["item_id"]
+    )
+    long = erase_by_score_async(
+        model, DynamicEmbScoreStrategy.TIMESTAMP, now - 90 * DAY_NS, table_names=["creator_id"]
+    )
+    # Before a dump: both must be finished.
+    erased_items, _ = short.result()
+    erased_creators, _ = long.result()
     DynamicEmbDump(path, model)
     ```
 

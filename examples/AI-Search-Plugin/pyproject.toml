@@ -1,0 +1,33 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ai-search-plugin"
+version = "0.1.0"
+description = "Opt-in speed and correctness components for agentic-RL post-training on slime and verl"
+requires-python = ">=3.10"
+# No hard runtime dependencies: torch / slime / verl / SGLang / Megatron / Ray are imported lazily inside the
+# components, in the framework processes that already have them.
+dependencies = []
+
+[project.optional-dependencies]
+test = ["pytest>=7", "numpy>=1.24"]
+
+[project.scripts]
+ai-search-plugin = "ai_search_plugin.__main__:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+# the SGLang-engine sitecustomize directory is not a package; ship it as data
+ai_search_plugin = ["adapters/sgl_boot/*.py"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src", "tests"]
+testpaths = ["tests"]
+addopts = "-q -p no:cacheprovider"

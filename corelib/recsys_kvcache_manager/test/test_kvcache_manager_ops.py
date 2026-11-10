@@ -9,6 +9,7 @@ from flexkv.common.config import (
     GLOBAL_CONFIG_FROM_ENV,
     CacheConfig,
     ModelConfig,
+    RankInfo,
     UserConfig,
     parse_path_list,
     update_default_config_from_user_config,
@@ -85,7 +86,10 @@ def get_config(config_path: str):
     model_config.num_kv_heads = config["num_kv_heads"]
     model_config.head_size = config["head_size"]
     model_config.dtype = eval(f"torch.{config['dtype']}")
-    model_config.use_mla = config["use_mla"]
+    if "kv_dim" in config:
+        model_config.kv_dim = int(config["kv_dim"])
+    elif "use_mla" in config:
+        model_config.kv_dim = 1 if config["use_mla"] else 2
     model_config.tp_size = config["tp_size"]
     model_config.dp_size = config["dp_size"]
     cache_config.tokens_per_block = config["tokens_per_block"]
@@ -153,7 +157,9 @@ def get_config(config_path: str):
         # Store mooncake_config_path in cache_config so it survives spawn subprocesses via pickle
         cache_config.mooncake_config_path = mooncake_config_path
 
-    update_default_config_from_user_config(model_config, cache_config, user_config)
+    update_default_config_from_user_config(
+        RankInfo(model_config=model_config), cache_config, user_config
+    )
 
     # Handle server_client_mode from config
     if config.get("server_client_mode", False):
@@ -335,7 +341,6 @@ if __name__ == "__main__":
         cache_config=cache_config,
         gpu_register_port=gpu_register_port,
         server_recv_port=server_recv_port,
-        total_clients=1,
         inherit_env=True,
     )
     print("[CHECK] Started KVServer")
