@@ -3034,6 +3034,7 @@ class RequesterSizes:
     local_size: int
     max_chunk_rows: int
     chunk_payload_rows: int
+    max_chunks_arg: int = 0  # max_chunks as the sizes give it
 
 
 def requester_call(case: RequesterCase, rng: random.Random) -> Dict:
