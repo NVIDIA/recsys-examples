@@ -293,6 +293,10 @@ class TransformerInferLayer(nn.Module):
         return table
 
     def _compute(self, hidden, q, k, v, jd, metadata, batch_size, append):
+        if self._export_mode and jd.num_candidates is not None:
+            # An exported program serves every batch size it declares, but the exporters
+            # pass the example request's batch_size; count the users of this request.
+            batch_size = jd.num_candidates.shape[0]
         offsets = jd.seqlen_offsets[: batch_size + 1]
         candidates = (
             jd.num_candidates[:batch_size]

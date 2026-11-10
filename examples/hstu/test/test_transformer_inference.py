@@ -626,3 +626,75 @@ def test_cuda_append_and_graph_matches_eager():
             torch.testing.assert_close(output, expected)
             if histories == [3, 2]:
                 assert not torch.allclose(output, initial, atol=1e-3, rtol=1e-3)
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available(),
+    reason="requires the CUDA recommendation preprocessing operators",
+)
+def test_exported_dense_module_serves_more_users_than_the_example():
+    # The no-cache exporter rebuilds the HSTUBatch with the example request's
+    # batch_size, a constant of the exported program, while it declares 1-8 users
+    # (_PlainInputWrapper in inference_aoti/export_inference_gr_ranking.py).
+    from commons.datasets.hstu_batch import HSTUBatch
+    from torch.export import Dim
+    from torchrec.sparse.jagged_tensor import JaggedTensor, KeyedJaggedTensor
+    from transformer_test_utils import dense_config, dense_module
+
+    model = dense_module(0, dense_config(export_mode=True, max_batch_size=8))
+    keys, seq, num_candidates = ["context", "item", "action"], 8, 3
+
+    def run(ids, candidates, lengths, values, batch_size):
+        # One lengths and one values tensor per feature: slicing or viewing a single
+        # lengths tensor would let export guard the user count away from 1.
+        all_lengths = torch.cat(lengths)
+        features = KeyedJaggedTensor(
+            keys=keys,
+            values=ids,
+            lengths=all_lengths,
+            offsets=torch.ops.fbgemm.asynchronous_complete_cumsum(all_lengths.long()),
+        )
+        batch = HSTUBatch(
+            features=features,
+            batch_size=batch_size,
+            feature_to_max_seqlen={"context": 1, "item": seq, "action": seq},
+            contextual_feature_names=["context"],
+            item_feature_name="item",
+            action_feature_name="action",
+            max_num_candidates=num_candidates,
+            num_candidates=candidates,
+        )
+        embeddings = {
+            key: JaggedTensor(values=v, lengths=n)
+            for key, v, n in zip(keys, values, lengths)
+        }
+        return model(batch, embeddings).float()
+
+    class Wrapper(nn.Module):
+        def forward(self, ids, candidates, lengths, values):
+            return run(ids, candidates, lengths, values, batch_size=2)
+
+    def inputs(users):
+        sizes = (1, seq, seq)
+        return (
+            torch.arange(users * sum(sizes), device="cuda"),
+            torch.full((users,), num_candidates, device="cuda"),
+            tuple(torch.full((users,), n, device="cuda") for n in sizes),
+            tuple(
+                torch.randn(users * n, 512, device="cuda", dtype=torch.bfloat16)
+                for n in sizes
+            ),
+        )
+
+    users = Dim("users", min=1, max=8)
+    rows = [Dim(f"rows{i}", min=1, max=40000) for i in range(4)]
+    shapes = ({0: rows[0]}, {0: users}, ({0: users},) * 3)
+    shapes += (tuple({0: r} for r in rows[1:]),)
+    program = torch.export.export(
+        Wrapper(), inputs(2), dynamic_shapes=shapes, strict=False
+    ).module()
+    with torch.inference_mode():
+        for count in (1, 5):  # fewer and more users than the example
+            x = inputs(count)
+            expected = run(*x, batch_size=count)
+            torch.testing.assert_close(program(*x), expected, rtol=0, atol=1e-3)
