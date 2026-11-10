@@ -25,12 +25,13 @@ The two runs are two processes, one per tree, joined by a file::
 With ``GATE_E4_BASELINE`` the verdict is one printed line, ``E4 PASS ...`` or ``E4 FAIL ...``:
 every case must take at most 1.2 times the baseline up to 2**22 slots and at most 1.0 times it
 above (faster, where the old rehash read a count per batch of the export), unless it is slower by
-no more than MAX_ADDED_MS (a fixed launch overhead, see there). Measured on an H100 against the
-tree before the lanes: 2**16 slots 3.1 ms against 0.9 (+2.2), 2**18 1.8 against 1.4, and from
-2**20 on faster by 1.7 to 5 times (2**20: 2.0 against 3.4 ms, 2**22: 3.7 against 10.7, 2**24: 19 against 40). Without it the run
-only prints and records. Every case also reads back a sample of the keys and their values
-from the grown table. ``GATE_E4_LOG2_SLOTS`` (default ``16,18,20,22,24``; 2**26 needs about
-35 GB) and ``GATE_E4_REPS`` (the best of this many, default 3) change the grid.
+no more than MAX_ADDED_MS (node noise on the small cases, see there). Measured on an H100 node
+with nothing else running, against the tree before the lanes (three runs, within 3% of each
+other): 2**16 slots 0.85 ms against 0.9, 2**18 0.68 against 1.3, 2**20 0.74 against 3.3,
+2**22 1.4 against 10.7, 2**24 4.4 against 40.5. Without it the run only prints and records.
+Every case also reads back a sample of the keys and their values from the grown table.
+``GATE_E4_LOG2_SLOTS`` (default ``16,18,20,22,24``; 2**26 needs about 35 GB) and
+``GATE_E4_REPS`` (the best of this many, default 3) change the grid.
 """
 
 import gc
@@ -65,10 +66,11 @@ SAMPLE = 1 << 16
 SMALL_LOG2 = 22
 MAX_RATIO_SMALL = 1.2
 MAX_RATIO_LARGE = 1.0
-# The count-free rehash launches about a dozen more kernels than the one it replaced (the
-# carries, the device asserts, the pinned uploads): a fixed cost of a few milliseconds that
-# only a table small enough to rehash in about a millisecond can notice. A growth that is
-# slower by a ratio but by no more than this is not a regression anyone can measure.
+# The count-free rehash is a few dozen small launches and pinned uploads, so for a table small
+# enough to rehash in about a millisecond its time is the host's. On a node with nothing else
+# running it is not slower than the old one at any size (see the docstring); measured while
+# other suites ran on the same node it took 2 to 5 ms more at 2**16 and 2**18 slots (3.1 ms
+# against 0.9 at 2**16). A ratio exceeded by no more than this is node noise, not a regression.
 MAX_ADDED_MS = 6.0
 
 
