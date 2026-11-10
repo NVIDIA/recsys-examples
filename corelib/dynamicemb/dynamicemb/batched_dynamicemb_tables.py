@@ -636,6 +636,12 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
         group_lasso_reg: float = 0.0,
         # TO align with FBGEMM TBE
         *args,
+        # Keyword only. Whether an admission strategy counts the frequency
+        # counters the keys come with (every occurrence); False: a table that
+        # does not evict by LFU counts each key once per call, as without
+        # them. A sharded EmbeddingCollection sets it to the sharder's
+        # use_index_dedup.
+        admission_counts_occurrences: bool = True,
         **kwargs,
     ) -> None:
         super().__init__()
@@ -830,11 +836,16 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
         # is handed some all the same and must drop them, or they would be
         # misread as scores. Tables are grouped on score and admit strategy, so
         # one answer holds for the whole group and for the module's lifetime.
-        self._consumes_frequency_counters = self._admitter is not None or any(
+        # An admitting group that does not evict by LFU drops them too without
+        # admission_counts_occurrences.
+        evicts_by_lfu = any(
             option.score_strategy is not None
             and get_eviction_score_strategy(option.score_strategy)
             == DynamicEmbScoreStrategy.LFU
             for option in self._dynamicemb_options
+        )
+        self._consumes_frequency_counters = evicts_by_lfu or (
+            self._admitter is not None and admission_counts_occurrences
         )
         # Tables are grouped on it too (see DynamicEmbTableOptions), so it holds
         # for the whole group: every table takes a score per key, or none does.

@@ -100,7 +100,6 @@ def hier_needs(
     tables: Mapping[str, int],
     owner_of: Callable[[torch.Tensor, str], torch.Tensor],
     local_world_size: int,
-    index_dedup: bool = True,
     node_dedup: bool = True,
     group: Optional[dist.ProcessGroup] = None,
 ) -> Dict[str, int]:
@@ -110,7 +109,9 @@ def hier_needs(
     ``remote_keys`` comes from the keys each GPU gets from its node for the
     owners of other nodes; ``lookup_keys`` from the keys of its own node
     each owner receives and the node-unique (table, key) it receives from
-    each other node.
+    each other node. A rank sends each (table, key) of a call once: a call
+    on the dist deduplicates the sharding's keys (index dedup), whatever the
+    sharder's ``use_index_dedup``.
 
     Args:
         batches: this rank's KeyedJaggedTensor of each call. Only the keys of
@@ -120,8 +121,6 @@ def hier_needs(
             given the keys in the KJT's own dtype (TorchRec's path places an
             ``int32`` key by the bucketize's 32-bit rule).
         local_world_size: GPUs per node.
-        index_dedup: a rank sends each (table, key) of a call once (index
-            dedup, which the hierarchical dist takes; False: every key).
         node_dedup: across nodes an owner receives each (table, key) once
             per node; False: every occurrence.
         group: the sharding's process group (the default one if None).
@@ -146,9 +145,9 @@ def hier_needs(
             owners = owner_of(keys, feature).to(torch.int64)
             keys = keys.to(torch.int64)
             parts.append(torch.stack([torch.full_like(keys, table), keys, owners], 1))
-        sent = torch.cat(parts)  # (table, key, owner) of each key this rank sends
-        if index_dedup:
-            sent = torch.unique(sent, dim=0)
+        # (table, key, owner) of each key this rank sends, each (table, key)
+        # once (index dedup)
+        sent = torch.unique(torch.cat(parts), dim=0)
         counts = torch.bincount(sent[:, 2], minlength=world_size)
         every = [torch.empty_like(counts) for _ in range(world_size)]
         dist.all_gather(every, counts, group=group)

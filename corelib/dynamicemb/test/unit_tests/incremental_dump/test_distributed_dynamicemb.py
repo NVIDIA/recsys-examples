@@ -341,14 +341,13 @@ def test_incremental_dump_api(
         )
 
     print("EmbeddingCollection:", ebc)
-    # Pooled collections ignore output_dist (hier_switch.py). The sharder below
-    # has no index dedup, and its output is fp32 (the default).
+    # Pooled collections ignore output_dist (hier_switch.py). The output is
+    # fp32 (the default).
     output_dist_options = (
         {}
         if is_pooled
         else hier_switch.options(
             world_size=dist.get_world_size(),
-            index_dedup=False,
             row_bytes=4 * dim,
             all_dynamicemb=all(use_dynamicembs),
             score_strategies=score_strategies,
@@ -461,11 +460,9 @@ def test_incremental_dump_api(
 
 def _output_dist_options(score_strategies, dim) -> Dict[str, Any]:
     """The output_dist fields (hier_switch.py) of the tables of
-    _build_sharded_model, whose sharder has no index dedup and an fp32
-    output (the default)."""
+    _build_sharded_model, whose output is fp32 (the default)."""
     return hier_switch.options(
         world_size=dist.get_world_size(),
-        index_dedup=False,
         row_bytes=4 * dim,
         score_strategies=score_strategies,
     )

@@ -71,7 +71,6 @@ _models: List[nn.Module] = []
 def serves(
     *,
     world_size: int,
-    index_dedup: bool,
     row_bytes: int,
     all_dynamicemb: bool = True,
     dist_types: Collection[str] = (),
@@ -79,13 +78,14 @@ def serves(
 ) -> bool:
     """Whether the hierarchical dist serves the row-wise sharding of a
     collection (docs/hier_output_dist.md, section 6): more than one rank,
-    DynamicEmb tables alone, index-deduplicated keys, rows (``row_bytes``, in
-    the lookup's output dtype) of a multiple of 16 bytes, no ``"continuous"``
-    table and no table that takes a score per key."""
+    DynamicEmb tables alone, rows (``row_bytes``, in the lookup's output
+    dtype) of a multiple of 16 bytes, no ``"continuous"`` table and no table
+    that takes a score per key. The sharder's index dedup matters only with
+    gradient clipping, which none of these tests uses: a call on the dist
+    deduplicates the sharding's keys itself."""
     return (
         world_size > 1
         and all_dynamicemb
-        and index_dedup
         and row_bytes % 16 == 0
         and "continuous" not in dist_types
         and not any(takes_score_per_key(s) for s in score_strategies)

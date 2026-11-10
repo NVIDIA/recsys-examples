@@ -64,14 +64,23 @@ from .rw_sharding import RwSequenceDynamicEmbeddingSharding
 class DynamicEmbeddingCollectionContext(EmbeddingCollectionContext):
     """EmbeddingCollectionContext with the frequency counters of index dedup.
 
-    With index dedup, ``frequency_counters`` holds one entry per sharding, in
-    sharding order. For a sharding that needs counters (LFU or admission) it is
-    how often each deduplicated key occurs, or an empty tensor when the
-    sharding's input on this rank is empty; for any other, None.
+    A call deduplicates the keys of every sharding under the sharder's
+    ``use_index_dedup``, and those of a sharding on the hierarchical dist
+    whatever that flag is (``ShardedDynamicEmbeddingCollection.input_dist``).
+    When it deduplicates some sharding, ``input_features``, ``reverse_indices``
+    and ``frequency_counters`` hold one entry per sharding, in sharding order.
+    A sharding whose keys it does not deduplicate gets its input in
+    ``input_features`` and None in the other two, as if there were no index
+    dedup.
 
-    ``reverse_indices[i]`` is None when the output dist expands the index dedup
-    of sharding ``i`` itself, as the hierarchical dist's does for a call that
-    took it (see ``ShardedDynamicEmbeddingCollection.input_dist``).
+    In ``frequency_counters``, a deduplicated sharding that needs counters
+    (``ShardedDynamicEmbeddingCollection._needs_counters``) has how often each
+    deduplicated key occurs, or an empty tensor when the sharding's input on
+    this rank is empty; any other has None.
+
+    ``reverse_indices[i]`` is also None when the output dist expands the index
+    dedup of sharding ``i`` itself, as the hierarchical dist's does for a call
+    that took it.
     """
 
     def __init__(
@@ -227,7 +236,36 @@ class ShardedDynamicEmbeddingCollection(ShardedEmbeddingCollection):
                         and config.pooling is not None
                     ):
                         config.fused_params["use_index_dedup"] = self._use_index_dedup
+                        # Without index dedup an admitting table counts each
+                        # key once per call (TorchRec's dists give it no
+                        # counters), also on the hierarchical dist, whose
+                        # calls deduplicate the keys whatever the flag.
+                        config.fused_params[
+                            "admission_counts_occurrences"
+                        ] = self._use_index_dedup
             self._lookups.append(sharding.create_lookup())
+
+    def _create_input_dist(
+        self,
+        input_feature_names: List[str],
+        ctx: Optional[EmbeddingCollectionContext] = None,
+    ) -> None:
+        super()._create_input_dist(input_feature_names=input_feature_names, ctx=ctx)
+        # A sharding on the hierarchical dist deduplicates its keys whatever
+        # the sharder's use_index_dedup (input_dist). TorchRec makes the
+        # tables' offsets that index dedup reads under that flag alone.
+        if not self._use_index_dedup and any(
+            getattr(input_dist, "hier", None) is not None
+            for input_dist in self._input_dists
+        ):
+            self._create_hash_size_info(
+                [
+                    feature_name
+                    for sharding in self._sharding_type_to_sharding.values()
+                    for feature_name in sharding.feature_names()
+                ],
+                ctx,
+            )
 
     def _create_hash_size_info(
         self,
@@ -266,26 +304,33 @@ class ShardedDynamicEmbeddingCollection(ShardedEmbeddingCollection):
                 persistent=False,
             )
 
+    def _needs_counters(self, i: int) -> bool:
+        """Whether index dedup counts how often each key of sharding ``i``
+        occurs (its frequency counters, the keys' weights): a table of the
+        sharding evicts by LFU, or admits under the sharder's
+        ``use_index_dedup`` (:func:`collect_frequency_requirements`). Without
+        that flag an admitting table counts each key once per call, as on
+        TorchRec's dists (``_create_lookups``)."""
+        return self._sharding_is_lfu[i] or (
+            self._sharding_has_admit[i] and self._use_index_dedup
+        )
+
     def _on_hier_path(self) -> List[bool]:
         """Per sharding, whether this call takes the hierarchical dist
         (``shard/hier_output_dist.py``): a training call of a sharding that
         takes it. The sharding decides at its first call (in any mode),
         collectively, so the answer is the same on every rank. Eval calls run
-        on TorchRec's dists. The hierarchical dist takes index-deduplicated
-        keys only. A sharding's keys carry weights (frequency counters) under
-        index dedup when one of its tables evicts by LFU or admits
-        (:func:`collect_frequency_requirements`), as ``_dedup_indices`` and
+        on TorchRec's dists. A call on the hierarchical dist deduplicates its
+        sharding's keys (index dedup), whatever the sharder's
+        ``use_index_dedup``; tables that clip gradients need that flag
+        (``HierDist.setup``). Its keys carry weights (frequency counters) when
+        :meth:`_needs_counters` says so, as ``_dedup_indices`` and
         ``input_dist`` attach them."""
         return [
             getattr(input_dist, "hier", None) is not None
-            and input_dist.hier_setup(
-                self._use_index_dedup and (is_lfu or has_admit),
-                self._use_index_dedup,
-            )
+            and input_dist.hier_setup(self._needs_counters(i), self._use_index_dedup)
             and self.training
-            for input_dist, is_lfu, has_admit in zip(
-                self._input_dists, self._sharding_is_lfu, self._sharding_has_admit
-            )
+            for i, input_dist in enumerate(self._input_dists)
         ]
 
     def _dedup_indices(
@@ -293,8 +338,13 @@ class ShardedDynamicEmbeddingCollection(ShardedEmbeddingCollection):
         ctx: DynamicEmbeddingCollectionContext,
         input_feature_splits: List[KeyedJaggedTensor],
         on_hier: List[bool],
+        dedup: List[bool],
     ) -> List[KeyedJaggedTensor]:
-        """Deduplicate indices using segmented_unique_cuda.
+        """Deduplicate indices using segmented_unique_cuda, those of each
+        sharding ``i`` with ``dedup[i]``. Any other sharding keeps its keys. It
+        gets its input in ``ctx.input_features`` and None in
+        ``ctx.reverse_indices`` and ``ctx.frequency_counters``, so
+        construct_jagged_tensors reads it as it does without index dedup.
 
         A sharding on the hierarchical dist (``on_hier[i]``) keeps its
         deduplicated keys sized on the device. Its ``values`` keep their full
@@ -311,6 +361,12 @@ class ShardedDynamicEmbeddingCollection(ShardedEmbeddingCollection):
         with record_function("## dedup_ec_indices ##"):
             features_by_shards = []
             for i, input_feature in enumerate(input_feature_splits):
+                if not dedup[i]:
+                    ctx.input_features.append(input_feature)
+                    ctx.reverse_indices.append(None)
+                    ctx.frequency_counters.append(None)
+                    features_by_shards.append(input_feature)
+                    continue
                 hash_size_offset = self.get_buffer(f"_hash_size_offset_tensor_{i}")
                 d_table_offset = self.get_buffer(
                     f"_nonfuse_table_feature_offsets_device_{i}"
@@ -326,7 +382,7 @@ class ShardedDynamicEmbeddingCollection(ShardedEmbeddingCollection):
                 indices = values.long() if values.dtype == torch.int32 else values
                 offsets = input_feature.offsets().to(torch.int64)
                 num_elements = indices.numel()
-                needs_counters = self._sharding_is_lfu[i] or self._sharding_has_admit[i]
+                needs_counters = self._needs_counters(i)
 
                 # Handle empty input
                 if num_elements == 0:
@@ -441,8 +497,12 @@ class ShardedDynamicEmbeddingCollection(ShardedEmbeddingCollection):
         if self._has_uninitialized_input_dist:
             self._create_input_dist(input_feature_names=features.keys(), ctx=ctx)
             self._has_uninitialized_input_dist = False
-        # Before index dedup: it slices the keys of TorchRec's dists only.
+        # Before index dedup, which deduplicates a sharding on the hierarchical
+        # dist whatever the sharder's use_index_dedup (that dist takes
+        # index-deduplicated keys), and slices the keys of TorchRec's dists
+        # only. Eval calls keep the sharder's flag.
         on_hier = self._on_hier_path()
+        dedup = [self._use_index_dedup or hier for hier in on_hier]
         with torch.no_grad():
             unpadded_features = None
             if features.variable_stride_per_key():
@@ -468,9 +528,9 @@ class ShardedDynamicEmbeddingCollection(ShardedEmbeddingCollection):
                 features_by_shards = [features]
             else:
                 features_by_shards = features.split(self._feature_splits)
-            if self._use_index_dedup:
+            if any(dedup):
                 features_by_shards = self._dedup_indices(
-                    ctx, features_by_shards, on_hier
+                    ctx, features_by_shards, on_hier, dedup
                 )
 
             awaitables = []
@@ -478,9 +538,7 @@ class ShardedDynamicEmbeddingCollection(ShardedEmbeddingCollection):
                 zip(self._input_dists, features_by_shards)
             ):
                 # Attach frequency counters as weights if LFU strategy is enabled
-                frequency_counters = (
-                    ctx.frequency_counters[i] if self._use_index_dedup else None
-                )
+                frequency_counters = ctx.frequency_counters[i] if dedup[i] else None
                 if frequency_counters is not None:
                     features._weights = frequency_counters.float()
                 else:
@@ -490,10 +548,9 @@ class ShardedDynamicEmbeddingCollection(ShardedEmbeddingCollection):
                     features_before_input_dist=features
                 )
                 if on_hier[i]:
-                    # The hierarchical dist takes index-deduplicated keys (its
-                    # setup refuses others) and expands the index dedup
-                    # itself, from the plan's fan-out table: TorchRec must not
-                    # do it again.
+                    # The hierarchical dist takes the keys index dedup left
+                    # (dedup[i]) and expands the index dedup itself, from the
+                    # plan's fan-out table: TorchRec must not do it again.
                     input_features = ctx.input_features[i]
                     reverse_indices = ctx.reverse_indices[i]
                     ctx.reverse_indices[i] = None

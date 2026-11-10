@@ -773,17 +773,20 @@ class DynamicEmbTableOptions:
     dist: keys and rows move over NVLink inside a node and over the rails
     (NCCL GIN) between nodes, with one host sync per call. It needs DynamicEmb
     built against NCCL >= 2.30.7 (else ``ImportError`` when the model is
-    sharded), ``output_dist_capacity``, index dedup (the sharder's
-    ``use_index_dedup=True``; else ``ValueError`` at the first
-    ``input_dist()``) and tables of ``dist_type`` ``"roundrobin"`` or
-    ``"hash_roundrobin"`` (likewise). It carries no score per key: tables
-    of ``score_strategy`` ``PRECISE_CUSTOMIZED`` make it raise ``ValueError``
-    when the model is sharded. Every GPU of a node gives it keys of
-    one dtype (``int32`` or ``int64``) in a call, which it does not check
+    sharded), ``output_dist_capacity``, and tables of ``dist_type``
+    ``"roundrobin"`` or ``"hash_roundrobin"``: a ``"continuous"`` table makes
+    the first ``input_dist()`` raise ``ValueError``. A call on it
+    deduplicates the sharding's keys (index dedup), whatever the sharder's
+    ``use_index_dedup``; tables that clip gradients need that flag (else
+    ``ValueError`` there too). It carries no score per key: tables of
+    ``score_strategy`` ``PRECISE_CUSTOMIZED`` make it raise ``ValueError``
+    when the model is sharded. Every GPU of a node gives it keys of one dtype
+    (``int32`` or ``int64``) in a call, which it does not check
     (docs/hier_output_dist.md, section 9). ``"auto"`` is ``"hierarchical"``
-    where the build has it, ``output_dist_capacity`` is set, the keys are
-    index-deduplicated and no table of the sharding is ``"continuous"`` or
-    takes a score per key, and TorchRec's dists (with a warning) elsewhere.
+    where the build has it, ``output_dist_capacity`` is set and no table of
+    the sharding is ``"continuous"``, takes a score per key or clips
+    gradients without the sharder's index dedup, and TorchRec's dists (with
+    a warning) elsewhere.
     Pooled shardings ignore it.
     Every DynamicEmb table of a sharding sets ``output_dist``,
     ``output_dist_capacity`` and ``node_dedup`` alike. See
@@ -793,10 +796,10 @@ class DynamicEmbTableOptions:
     """With ``output_dist="hierarchical"`` (or ``"auto"``) across nodes, a
     node sends each key once and sums its gradient rows before they cross
     back. With bf16 or fp16 rows that sum adds one rounding to TorchRec's.
-    ``False`` sends every occurrence instead, as TorchRec does (more
-    InfiniBand traffic). Gradient clipping turns it off. Other output dists
-    ignore it, but every DynamicEmb table of a sharding sets it alike. See
-    docs/hier_output_dist.md, section 9."""
+    ``False`` sends every occurrence instead, as TorchRec does under the
+    sharder's index dedup (more InfiniBand traffic). Gradient clipping turns
+    it off. Other output dists ignore it, but every DynamicEmb table of a
+    sharding sets it alike. See docs/hier_output_dist.md, section 9."""
 
     output_dist_capacity: Optional[Union[int, Dict[str, int]]] = None
     """The capacities of ``output_dist="hierarchical"`` (and ``"auto"``), in

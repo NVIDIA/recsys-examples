@@ -59,9 +59,8 @@ FWD_BWD_HIER_FILES=(
 
 LOAD_DUMP_HIER_FILES=(
     "test/unit_tests/admission/test_embedding_admission.sh"
+    "test/unit_tests/test_embedding_dump_load.sh"
     "test/unit_tests/incremental_dump/test_incremental_dump.sh"
-    # Not test_embedding_dump_load.sh: each of its launches shards without
-    # index dedup, which the dist does not take, so none would run on it.
 )
 
 case "$1" in

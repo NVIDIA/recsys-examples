@@ -16,10 +16,10 @@
 (``output_dist="hierarchical"``) raises at its second wait, on every rank
 alike, and the op takes the calls after it.
 
-Each case trains three models, under index dedup (which the hierarchical
-dist takes): on the hierarchical dist with ample capacities (whose calls
-give the needs), on the hierarchical dist with one capacity that the case's
-large calls do not fit, and on TorchRec's dists with the case's small calls
+Each case trains three models, with the sharder's index dedup: on the
+hierarchical dist with ample capacities (whose calls give the needs), on the
+hierarchical dist with one capacity that the case's large calls do not fit,
+and on TorchRec's dists with the case's small calls
 alone. On the second model every large call
 raises RuntimeError on every rank, naming the capacity to raise, and every
 small call must give TorchRec's outputs, bit for bit at a power-of-two world

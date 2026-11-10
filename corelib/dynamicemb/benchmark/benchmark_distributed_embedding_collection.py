@@ -338,7 +338,6 @@ def resolve_capacity(
         tables,
         lambda keys, feature: owning_shard(keys, world_size, cfg.dist_type),
         local_world_size,
-        index_dedup=cfg.use_index_dedup,
         group=group,
     )
     dist.destroy_process_group(group)
@@ -2373,14 +2372,14 @@ def parse_args(argv: List[str]) -> BenchConfig:
     parser.add_argument(
         "--use_index_dedup",
         action="store_true",
-        help="TorchRec's index dedup (the hierarchical dist takes no other keys)",
+        help="TorchRec's index dedup (a call on the hierarchical dist deduplicates"
+        " its keys without it too)",
     )
     parser.add_argument(
         "--output_dist",
         choices=["torchrec", "hierarchical", "auto"],
         default=defaults.output_dist,
-        help="TorchRec's dists, or the hierarchical dist (hierarchical, or auto;"
-        " with --use_index_dedup)",
+        help="TorchRec's dists, or the hierarchical dist (hierarchical, or auto)",
     )
     parser.add_argument(
         "--pipeline",
@@ -2446,11 +2445,6 @@ def parse_args(argv: List[str]) -> BenchConfig:
         parser.error("--warmup must be at least 1")
     if cfg.capacity != "measure" and not cfg.capacity.isdigit():
         parser.error("--capacity is an int or measure")
-    if (cfg.output_dist != "torchrec" or cfg.check) and not cfg.use_index_dedup:
-        parser.error(
-            "the hierarchical dist (--output_dist hierarchical or auto, --check)"
-            " takes index-deduplicated keys: add --use_index_dedup"
-        )
     return cfg
 
 

@@ -366,9 +366,10 @@ class RwSparseFeaturesDist(_RwSparseFeaturesDist):
     def hier_setup(self, weighted: bool, index_dedup: bool) -> bool:
         """Whether the sharding takes its hierarchical dist; the first call
         builds it, collectively (``HierDist.setup``), with this input
-        dist's rule of each feature. ``weighted``: the keys carry weights;
-        ``index_dedup``: they are index-deduplicated, which the hierarchical
-        dist needs."""
+        dist's rule of each feature. ``weighted``: the keys carry weights
+        (index dedup's frequency counters); ``index_dedup``: the sharder's
+        ``use_index_dedup``. A call on that dist deduplicates the sharding's
+        keys either way; tables that clip gradients need the flag."""
         return self.hier.setup(self._dist_type_codes, weighted, index_dedup)
 
     def hier_forward(

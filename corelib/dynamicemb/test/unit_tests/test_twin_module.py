@@ -243,7 +243,6 @@ def test_twin_module(
         if is_pooled
         else hier_switch.options(
             world_size=world_size,
-            index_dedup=use_index_dedup,
             row_bytes=4 * dim,
         )
     )

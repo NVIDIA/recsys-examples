@@ -264,7 +264,6 @@ def run(args):
     collection_output_dist_options = [
         hier_switch.options(
             world_size=world_size,
-            index_dedup=args.use_index_dedup,
             row_bytes=4 * args.embedding_dim,
             all_dynamicemb=all(
                 i < args.num_dynamicemb

@@ -16,7 +16,7 @@
 pipelines.
 
 Each loop and pipeline trains on the same batches as the plain loop, or as
-TorchRec's dists, under index dedup (which the hierarchical dist takes), and
+TorchRec's dists, with the sharder's index dedup, and
 must give the same outputs and tables, bit for bit
 (with a power-of-two world size of at most 128, every sum is exact). Its
 last steps also count the host syncs and the kernels of each call. Then

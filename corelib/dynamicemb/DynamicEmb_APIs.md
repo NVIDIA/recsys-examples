@@ -226,6 +226,8 @@ Inherits from TorchREC's `EmbeddingCollectionSharder` and is used in exactly the
 
 With `use_index_dedup=True` and an LFU score strategy or an admission strategy, each rank sends its deduplicated keys together with how often each one occurs (as the KJT weights), so that a table counts every occurrence.
 
+A training call on the hierarchical dist (`output_dist="hierarchical"` or `"auto"`) deduplicates the sharding's keys in the same way whatever `use_index_dedup` is, and its tables count the keys as on TorchRec's dists under the same flag: without it the keys carry the counts for LFU tables alone, and an admission strategy of a table that does not evict by LFU counts each key once per call. Tables that clip gradients need `use_index_dedup=True` there ([docs/hier_output_dist.md](./docs/hier_output_dist.md), sections 6 and 7.4).
+
 ## DynamicEmbCheckMode
 
 When the dynamic embedding table capacity is small, a single feature with a large number of indices may lead to issues where the hashtable cannot insert the indices. Enabling safe check allows you to observe this behavior (the number of times indices cannot be inserted and the number of indices each time) to determine if the dynamic embedding table capacity is set too low.
@@ -980,13 +982,15 @@ Fields declared first (through `device_id`) are **planner/runtime-heavy**: `Dyna
             How a row-wise sequence (``EmbeddingCollection``) sharding moves keys to their
             owners and the looked-up rows back. ``"torchrec"`` (default): TorchRec's input and
             output dists. ``"hierarchical"``: DynamicEmb's hierarchical dist, which needs
-            ``output_dist_capacity``, DynamicEmb built against NCCL >= 2.30.7, index dedup and
-            tables of ``dist_type`` ``roundrobin`` or ``hash_roundrobin``; it carries no score
-            per key (``PRECISE_CUSTOMIZED`` tables raise ``ValueError``). Every GPU of a node
-            gives it keys of one dtype in a call, which it does not check. ``"auto"``:
-            ``"hierarchical"`` where the build has it, ``output_dist_capacity`` is set, the
-            keys are index-deduplicated and no table is ``continuous`` or takes a score per
-            key, else TorchRec's dists. See ``docs/hier_output_dist.md``, section 4.
+            ``output_dist_capacity``, DynamicEmb built against NCCL >= 2.30.7 and tables of
+            ``dist_type`` ``roundrobin`` or ``hash_roundrobin``; a call on it deduplicates
+            the sharding's keys, whatever the sharder's ``use_index_dedup`` (tables that clip
+            gradients need that flag). It carries no score per key (``PRECISE_CUSTOMIZED``
+            tables raise ``ValueError``). Every GPU of a node gives it keys of one dtype in a
+            call, which it does not check. ``"auto"``: ``"hierarchical"`` where the build has
+            it, ``output_dist_capacity`` is set and no table is ``continuous``, takes a score
+            per key or clips gradients without index dedup, else TorchRec's dists. See
+            ``docs/hier_output_dist.md``, section 4.
         node_dedup : bool, optional
             With ``"hierarchical"`` (or ``"auto"``) across nodes, a node sends each key once
             and adds up its gradient rows before they cross back. ``False`` sends every
@@ -1792,7 +1796,8 @@ Due to limited resources, the dynamic embedding table does not pre allocate memo
 `output_dist="hierarchical"` in `DynamicEmbTableOptions` replaces TorchRec's input and output dists of row-wise `EmbeddingCollection` shardings with DynamicEmb's hierarchical dist.
 
 - Set `output_dist_capacity` from what the model's batches need: `hier_needs` and `hier_capacities` in `benchmark/benchmark_utils.py` count it.
-- Use tables of `dist_type` `roundrobin` (the default) or `hash_roundrobin`, and a sharder with `use_index_dedup=True`. With a `continuous` table, or without index dedup, `"hierarchical"` raises `ValueError` at the first `input_dist()`, and `"auto"` takes TorchRec's dists ([docs/hier_output_dist.md](./docs/hier_output_dist.md), section 6).
+- Use tables of `dist_type` `roundrobin` (the default) or `hash_roundrobin`. With a `continuous` table, `"hierarchical"` raises `ValueError` at the first `input_dist()`, and `"auto"` takes TorchRec's dists ([docs/hier_output_dist.md](./docs/hier_output_dist.md), section 6).
+- A call on the dist deduplicates the sharding's keys (index dedup), whatever the sharder's `use_index_dedup` ([docs/hier_output_dist.md](./docs/hier_output_dist.md), section 7.4). Tables that clip gradients need `use_index_dedup=True`: without it, `"hierarchical"` raises `ValueError` at the first `input_dist()`, and `"auto"` takes TorchRec's dists ([docs/hier_output_dist.md](./docs/hier_output_dist.md), section 6).
 - The dist carries no score per key. With tables that take one (`PRECISE_CUSTOMIZED`), `"hierarchical"` raises `ValueError` when the model is sharded, and `"auto"` takes TorchRec's dists ([docs/hier_output_dist.md](./docs/hier_output_dist.md), section 6).
 - Give the dist keys of one dtype (`int32` or `int64`) on every GPU of a node in a call, as TorchRec's dists need on every rank. Mixed dtypes are not detected: a GPU can then get a key's row from the key's owner in the other dtype, and send its gradient there ([docs/hier_output_dist.md](./docs/hier_output_dist.md), section 9).
 - Give every DynamicEmb table of a sharding the same `output_dist`, `output_dist_capacity` and `node_dedup`, and every rank the same options and environment variables ([docs/hier_output_dist.md](./docs/hier_output_dist.md), section 4.1).

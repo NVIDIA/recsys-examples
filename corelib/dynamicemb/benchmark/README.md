@@ -568,7 +568,8 @@ to move keys and rows between GPUs (`--output_dist`):
   only moves rows: one kernel per direction, and before the backward's, when
   a call has heavy rows, two short kernels that add up their gradients. Its
   capacities come from the benchmark's own batches (`--capacity`). It takes
-  index-deduplicated keys: it needs `--use_index_dedup`.
+  index-deduplicated keys: its calls deduplicate them, with or without
+  `--use_index_dedup`.
 * `auto`: `hierarchical` where the build has it, else `torchrec`.
 
 ### How to run
@@ -626,8 +627,9 @@ for DIST in torchrec hierarchical; do
 done      # $LAUNCH: the torchrun or srun prefix above
 ```
 
-TorchRec's dists also run without `--use_index_dedup`; the hierarchical
-dist does not.
+Both dists also run without `--use_index_dedup`. TorchRec's dists then send
+every key, and the hierarchical dist's calls deduplicate their keys
+themselves.
 
 More runs on the same configuration:
 
@@ -774,7 +776,7 @@ and 4.01-4.04 ms on 4.
 
 | option | default | meaning |
 |---|---|---|
-| `--output_dist` | `torchrec` | `torchrec`, `hierarchical` or `auto` (see above); `hierarchical` and `auto` need `--use_index_dedup` |
+| `--output_dist` | `torchrec` | `torchrec`, `hierarchical` or `auto` (see above) |
 | `--capacity` | `measure` | The hierarchical dist's `output_dist_capacity`. An int sets `lookup_keys` and `remote_keys` to that many keys. `measure` counts what the benchmark's own batches need of each, as the dist counts it, before the model is built (`hier_needs` in `benchmark_utils.py`, on a process group made for it and destroyed after). It takes `--capacity_factor` times that, and at least 4096 entries more (`hier_capacities`). A call that does not fit raises at its second wait. |
 | `--capacity_factor` | 1.25 | with `--capacity measure`: the capacities over the measured needs |
 | `--pipeline` | `none` | `none`: plain loop (forward, then backward, one batch at a time); `sparse_dist`: `TrainPipelineSparseDist`; `prefetch`: `PrefetchTrainPipelineSparseDist`. Under a pipeline the report gives whole iterations, and `--check` runs the checked model under it |
@@ -788,12 +790,12 @@ and 4.01-4.04 ms on 4.
 | `--key_range` | `--num_embeddings` | uniform keys are drawn from [0, key_range), pow-law ones from [1, key_range) |
 | `--dist_type` | `roundrobin` | which rank owns a key: `roundrobin` (key mod ranks) or `hash_roundrobin` (hashed key mod ranks) |
 | `--emb_dtype`, `--output_dtype` | `fp32` | `fp32`, `bf16` or `fp16` |
-| `--use_index_dedup` | off | TorchRec's index dedup: each rank removes its own repeated keys before the input dist. The hierarchical dist (`hierarchical`, `auto`, `--check`) needs it |
+| `--use_index_dedup` | off | TorchRec's index dedup: each rank removes its own repeated keys before the input dist. A call on the hierarchical dist (`hierarchical`, `auto`, `--check`) does so without it too |
 | `--optimizer`, `--learning_rate` | `sgd`, 0.01 | `sgd`, `adam`, `exact_adagrad` or `rowwise_adagrad` |
 | `--num_iterations`, `--warmup` | 30, 10 | timed and untimed iterations, at least 1 each |
 | `--seed` | 1234 | seed of the batches (different for each rank) |
 | `--profile_iterations` | 5 | that many more iterations under `torch.profiler`, for the per-stage kernel times and counts; 0 skips them |
-| `--check` | off | Before timing, train 4 steps of two models side by side: one on TorchRec's dists, and one on the hierarchical dist (`--output_dist`'s, or `hierarchical` when that is `torchrec`), both with `--use_index_dedup`, which it needs. Both start from the DEBUG initializer, where a key's row is a function of the key. They use SGD at learning rate 1, and keys from an eighth of the table, so nothing is evicted. The capacities are `--capacity`, or measured on the check's own batches. Then print PASSED or FAILED. Outputs must match bit for bit when `--emb_dtype` and `--output_dtype` are both `fp32` and the world size is a power of two. Otherwise they must match bit for bit at the first step, and within 1e-2 after it. The checked model must also have launched its own output dist's kernels at every step, both ways. A sharding that took TorchRec's dists (one rank, for example) prints `FAILED (the <dist> model fell back to TorchRec's dists)`, where `<dist>` is `hierarchical` or `auto`. A failure exits with status 1. |
+| `--check` | off | Before timing, train 4 steps of two models side by side: one on TorchRec's dists, and one on the hierarchical dist (`--output_dist`'s, or `hierarchical` when that is `torchrec`), both with `--use_index_dedup` or both without it. Both start from the DEBUG initializer, where a key's row is a function of the key. They use SGD at learning rate 1, and keys from an eighth of the table, so nothing is evicted. The capacities are `--capacity`, or measured on the check's own batches. Then print PASSED or FAILED. Outputs must match bit for bit when `--emb_dtype` and `--output_dtype` are both `fp32` and the world size is a power of two. Otherwise they must match bit for bit at the first step, and within 1e-2 after it. The checked model must also have launched its own output dist's kernels at every step, both ways. A sharding that took TorchRec's dists (one rank, for example) prints `FAILED (the <dist> model fell back to TorchRec's dists)`, where `<dist>` is `hierarchical` or `auto`. A failure exits with status 1. |
 | `--trace` | off | The hierarchical dist's kernel timelines. It needs DynamicEmb built with `DYNAMICEMB_HIER_TRACE=1` (`docs/hier_output_dist.md`, section 4.4), and else stops with `--trace: rebuild with DYNAMICEMB_HIER_TRACE=1`. It keeps the timelines of the last 64 calls of each direction (every timed call at 64 iterations or fewer), and puts every rank's time stamps on rank 0's clock. It reports the traced metrics below (IB, NVLink and their overlap). A traced build traces every output-dist kernel: two memsets per kernel and counters in shared memory; `--trace` adds two clock stamps per input dist. So its times and kernel counts do not compare with an untraced build's. |
 | `--trace_out` | none | with `--trace`: save every rank's traced kernels of the timed iterations to this `.npz` file, for offline analysis |
 | `--kernel_times` | off | After the timed iterations, as many again under a CUDA-only profiler. It reports every call's output-dist kernel times, with their wait at the start for the other ranks (the hierarchical dist only). |

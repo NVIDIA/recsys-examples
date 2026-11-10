@@ -19,13 +19,14 @@ over the rails (NCCL GIN) between nodes, with one host sync per call. Design:
 docs/hier_output_dist.md (section 7.4 for this file).
 
 :class:`HierDist` builds the operator at the first ``input_dist()`` and
-holds what the calls share. The operator takes index-deduplicated keys
-(the sharder's ``use_index_dedup=True``). The input dist is in input_dist.py
-(``RwSparseFeaturesDist.hier_forward``). The lookup writes its rows into the
-operator's window (:meth:`HierDist.lookup`), and
-:class:`RwSequenceHierEmbeddingDist` moves them. A call that does not fit the
-capacities raises at its second wait; every eval forward runs on TorchRec's
-dists. :func:`quiesce` lets every rank free the operators at once.
+holds what the calls share. The operator takes index-deduplicated keys: a
+call on it deduplicates its sharding's keys, whatever the sharder's
+``use_index_dedup`` (``ShardedDynamicEmbeddingCollection.input_dist``). The
+input dist is in input_dist.py (``RwSparseFeaturesDist.hier_forward``). The
+lookup writes its rows into the operator's window (:meth:`HierDist.lookup`),
+and :class:`RwSequenceHierEmbeddingDist` moves them. A call that does not fit
+the capacities raises at its second wait; every eval forward runs on
+TorchRec's dists. :func:`quiesce` lets every rank free the operators at once.
 """
 
 import os
@@ -193,6 +194,8 @@ class HierDist:
         groups: the number of features of each lookup group, in feature order (the
             sharding's grouped configs); each group's rows take a slice of
             the call's rows of their own (None: one group).
+        clipping: the tables clip gradients, which needs the sharder's index
+            dedup (:meth:`setup`).
     """
 
     def __init__(
@@ -206,6 +209,7 @@ class HierDist:
         tables: Optional[List[int]] = None,
         node_dedup: bool = True,
         groups: Optional[List[int]] = None,
+        clipping: bool = False,
     ) -> None:
         self._pg = pg
         self._rank = dist.get_rank(pg)
@@ -214,6 +218,7 @@ class HierDist:
         local_size = min(get_local_size(), world_size)
         self._num_nodes = world_size // local_size
         self._asked = asked
+        self._clipping = clipping
         self.dtype = output_dtype  # of the lookup output's rows
         if isinstance(capacity, int):
             capacity = dict.fromkeys(OUTPUT_DIST_CAPACITY_NAMES, capacity)
@@ -264,11 +269,13 @@ class HierDist:
         """Whether this sharding takes the hierarchical dist, the same on
         every rank. The first call builds the operator, collectively, with
         the bucketize's rule of each feature (DistType codes) and whether the
-        keys carry weights. Ranks whose arguments differ raise the same
-        ValueError. A sharding the operator does not apply to takes
-        TorchRec's dists with a warning. A configuration it refuses (a
-        ``continuous`` table among them), or keys that are not
-        index-deduplicated (``index_dedup`` False), raises ValueError under
+        keys carry weights. ``index_dedup`` is the sharder's
+        ``use_index_dedup``: a call on the operator deduplicates the
+        sharding's keys either way, but tables that clip gradients need it.
+        Ranks whose arguments differ raise the same ValueError. A sharding
+        the operator does not apply to takes TorchRec's dists with a warning.
+        A configuration it refuses (a ``continuous`` table among them, or
+        clipping without ``index_dedup``) raises ValueError under
         ``"hierarchical"`` and takes TorchRec's dists with a warning under
         ``"auto"``. If a rank cannot build it, every rank warns and takes
         TorchRec's dists. See docs/hier_output_dist.md, sections 6 and 7.2."""
@@ -287,11 +294,15 @@ class HierDist:
             dist_types=list(dist_types),
             weighted=weighted,
         )
+        # The tables clip each row their lookup gets. TorchRec's dists without
+        # index dedup send a row per occurrence; a call on the operator would
+        # send a GPU's sum of a key's rows.
         refusal = (
-            hier_output_dist_invalid(rank=self._rank, **arguments)
-            if index_dedup
-            else "it takes index-deduplicated keys only: give the sharder "
-            "use_index_dedup=True"
+            "the sharding's tables clip gradients, and it would add up a GPU's "
+            "gradients of a key before the clip, where TorchRec's dists clip "
+            "each occurrence's: give the sharder use_index_dedup=True"
+            if self._clipping and not index_dedup
+            else hier_output_dist_invalid(rank=self._rank, **arguments)
         )
         # Making an id starts NCCL's listener for the other ranks: none for a
         # configuration the operator refuses.

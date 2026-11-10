@@ -178,8 +178,9 @@ this dist with TorchRec's dists.
   TorchRec's `use_index_dedup`. Each rank removes its own repeated keys
   before the input dist, and the rows are copied back to every original
   position after the output dist. The op takes index-deduplicated keys
-  only (section 6). **Node dedup**: the proxy removes the repeated keys of
-  its whole node (section 9).
+  only: a call on it deduplicates its sharding's keys, whatever the
+  sharder's `use_index_dedup` (section 7.4). **Node dedup**: the proxy
+  removes the repeated keys of its whole node (section 9).
 * **Skewed keys**: keys drawn so that a few of them are very common (a *hot*
   key appears in many samples).
 * **Fall back**: take TorchRec's dists instead, for a whole sharding
@@ -214,17 +215,20 @@ DynamicEmbTableOptions(
     output_dist_capacity=capacities,  # an int, or a dict by name (section 5)
     node_dedup=True,                  # across nodes: one key per (table, key)
 )
-DynamicEmbeddingCollectionSharder(..., use_index_dedup=True)  # the op takes no other keys
+DynamicEmbeddingCollectionSharder(...)  # use_index_dedup=True with gradient clipping
 ```
 
 It serves `ROW_WISE` sequence shardings (`EmbeddingCollection`) of
-`"roundrobin"` and `"hash_roundrobin"` tables (`dist_type`), under index
-dedup. Without `use_index_dedup=True` on the sharder, or with a
+`"roundrobin"` and `"hash_roundrobin"` tables (`dist_type`). With a
 `"continuous"` table, `"hierarchical"` raises `ValueError` at the first
-`input_dist()` and `"auto"` takes TorchRec's dists (section 6). The op
-carries no score per key: with tables that take one (`score_strategy`
-`PRECISE_CUSTOMIZED`), `"hierarchical"` raises `ValueError` when the model is
-sharded and `"auto"` takes TorchRec's dists. Pooled
+`input_dist()` and `"auto"` takes TorchRec's dists (section 6). A call on
+the op deduplicates the sharding's keys (index dedup), whatever the
+sharder's `use_index_dedup` (section 7.4). Tables that clip gradients need
+`use_index_dedup=True`: without it, the op refuses them as it refuses a
+`"continuous"` table (section 6). The op carries no score per key:
+with tables that take one (`score_strategy` `PRECISE_CUSTOMIZED`),
+`"hierarchical"` raises `ValueError` when the model is sharded and `"auto"`
+takes TorchRec's dists. Pooled
 shardings (`EmbeddingBagCollection`) ignore `output_dist`. All DynamicEmb
 tables of one sharding must agree on `output_dist`, `output_dist_capacity`
 and `node_dedup`, whatever their `output_dist`; otherwise building the
@@ -257,9 +261,12 @@ every rank before you drop a model (section 4.6).
   (the planner numbers them with int32).
 * Rows (embedding dim × bytes of the output dtype) a multiple of 16 bytes,
   in fp32, bf16 or fp16.
-* Index dedup: the sharder's `use_index_dedup=True`. Each rank then sends
-  each (table, key) of a call once, so a key has at most `local_size`
-  occurrences at its proxy (section 9).
+* Index dedup, which the sharding does itself: a call on the op
+  deduplicates the sharding's keys, whatever the sharder's
+  `use_index_dedup` (section 7.4). Each rank then sends each (table, key) of
+  a call once, so a key has at most `local_size` occurrences at its proxy
+  (section 9). Tables that clip gradients need the sharder's
+  `use_index_dedup=True` (section 6).
 * Tables of `dist_type` `"roundrobin"` (the default) or `"hash_roundrobin"`.
   The tables of a sharding can have different rules. The op refuses
   `"continuous"` (sections 6 and 10.1).
@@ -285,9 +292,9 @@ every rank before you drop a model (section 4.6).
 
 | option | default | meaning |
 |---|---|---|
-| `output_dist` | `"torchrec"` | `"torchrec"`: TorchRec's dists. `"hierarchical"`: the hierarchical dist. It needs `output_dist_capacity` (without it, making the options raises `ValueError`), index dedup and tables of `dist_type` `"roundrobin"` or `"hash_roundrobin"` (without them, the first `input_dist()` raises `ValueError`), and a build without NCCL ≥ 2.30.7 raises `ImportError` when the model is sharded. It carries no score per key: with tables that take one (`PRECISE_CUSTOMIZED`), it raises `ValueError` when the model is sharded. `"auto"`: `"hierarchical"` where the build has it, `output_dist_capacity` is set, the keys are index-deduplicated and no table is `"continuous"` or takes a score per key, else TorchRec's dists, with a warning. Any other value raises `ValueError`. |
+| `output_dist` | `"torchrec"` | `"torchrec"`: TorchRec's dists. `"hierarchical"`: the hierarchical dist. It needs `output_dist_capacity` (without it, making the options raises `ValueError`) and tables of `dist_type` `"roundrobin"` or `"hash_roundrobin"` (without them, the first `input_dist()` raises `ValueError`), and a build without NCCL ≥ 2.30.7 raises `ImportError` when the model is sharded. A call on it deduplicates the sharding's keys, whatever the sharder's `use_index_dedup`; tables that clip gradients need `use_index_dedup=True` (without it, the first `input_dist()` raises `ValueError`). It carries no score per key: with tables that take one (`PRECISE_CUSTOMIZED`), it raises `ValueError` when the model is sharded. `"auto"`: `"hierarchical"` where the build has it, `output_dist_capacity` is set and no table is `"continuous"`, takes a score per key or clips gradients without the sharder's index dedup, else TorchRec's dists, with a warning. Any other value raises `ValueError`. |
 | `output_dist_capacity` | `None` | The capacities of the op's buffers, in keys (section 5). An int sets `lookup_keys` and `remote_keys` to that many. A dict sets them by name: `lookup_keys`, and across nodes also `remote_keys` (one node uses `lookup_keys` alone). Each capacity is a positive int below 2^31 − 1024; other values or names raise `ValueError` when the options are made. A call that needs more of one raises `RuntimeError` at its second wait, on every rank (section 5.4). TorchRec's dists ignore it. |
-| `node_dedup` | `True` | Across nodes, the proxy sends one key per (table, key), and the node adds up its gradient rows before they cross back. `False` sends each GPU's occurrence on its own (more IB traffic) and keeps TorchRec's gradient rows (section 18). Gradient clipping turns it off by itself. |
+| `node_dedup` | `True` | Across nodes, the proxy sends one key per (table, key), and the node adds up its gradient rows before they cross back. `False` sends each GPU's occurrence on its own (more IB traffic) and keeps the gradient rows of TorchRec's dists under the sharder's index dedup (section 18). Gradient clipping turns it off by itself. |
 
 ### 4.4 Environment variables
 
@@ -418,9 +425,9 @@ headroom. Two helpers in `benchmark/benchmark_utils.py` do this (it is not
 part of the installed package: put `benchmark/` on `sys.path`, as the tests
 do):
 
-* `hier_needs(batches, tables, owner_of, local_world_size, index_dedup=True,
-  node_dedup=True, group=None)` counts what the op needs of each capacity
-  for some calls, as the op counts it: the most any rank needs in any call.
+* `hier_needs(batches, tables, owner_of, local_world_size, node_dedup=True,
+  group=None)` counts what the op needs of each capacity for some calls, as
+  the op counts it: the most any rank needs in any call.
   It is collective: every rank of the sharding's process group calls it with
   its own batches. `tables` maps each feature of the sharding to its table,
   and `owner_of(keys, feature)` gives the rank that owns each key.
@@ -501,14 +508,16 @@ some capacity than the op has:
   `lookup_keys` need leaves out the keys that node sends to other nodes. A
   later call may then name `lookup_keys` too.
 
-A call whose keys are not index-deduplicated, so that a proxy gets one key
-more than `local_size` times, also raises at its second wait, on every rank
-alike: `output_dist="hierarchical": a proxy got one key 9 times from the 8
-GPUs of its node; the keys must be index-deduplicated, each table's at most
-once per GPU`. Its status carries that need too (`key_rows`, against
-`local_size`). The proxy gives such a key `local_size` rows (section 9), so
-the input dist stays in bounds, and the call makes no lookup and no output
-dist.
+The sharding deduplicates the keys of every call on the op (section 7.4),
+so a rank never gives it one (table, key) twice in a call. The op still
+checks it: a call whose keys are not index-deduplicated, so that a proxy
+gets one key more than `local_size` times, also raises at its second wait,
+on every rank alike: `output_dist="hierarchical": a proxy got one key 9
+times from the 8 GPUs of its node; the keys must be index-deduplicated, each
+table's at most once per GPU`. Its status carries that need too
+(`key_rows`, against `local_size`). The proxy gives such a key `local_size`
+rows (section 9), so the input dist stays in bounds, and the call makes no
+lookup and no output dist.
 
 ## 6. When a sharding takes TorchRec's dists
 
@@ -529,12 +538,16 @@ state that every rank shares.
 | tables that take a score per key (`score_strategy` `PRECISE_CUSTOMIZED`): a key crosses with one float32 weight, which a proxy adds up, and no score | when sharding | `"hierarchical"`: `ValueError`; `"auto"`: a warning, TorchRec's dists |
 | ranks that would build the op from different options, capacities or environment values | first `input_dist()`, before the op is built | `ValueError` on every rank, naming the first rank and value that differ |
 | ranks that are not whole nodes; `world_size × num_features` of 2^31 − 1024 or more; rows not a multiple of 16 bytes | first `input_dist()` | a warning, TorchRec's dists |
-| keys that are not index-deduplicated (a sharder without `use_index_dedup=True`) | first `input_dist()`, before the op is built | `"hierarchical"`: `ValueError` on every rank; `"auto"`: a warning, TorchRec's dists |
 | a DynamicEmb table of the sharding with `dist_type` `"continuous"` (below) | first `input_dist()`, before the op is built | `"hierarchical"`: `ValueError` on every rank; `"auto"`: a warning, TorchRec's dists |
+| tables that clip gradients (`gradient_clipping`) under a sharder without `use_index_dedup=True`: the tables clip each row their lookup gets, and TorchRec's dists then send a row per occurrence, where a call on the op sends a GPU's sum of a key's rows | first `input_dist()`, before the op is built | `"hierarchical"`: `ValueError` on every rank; `"auto"`: a warning, TorchRec's dists |
 | a configuration the op cannot take: across nodes, capacities without `remote_keys`; a proxy cap below the least rows of its ring (section 15.3); a `remote_keys` whose stream could pass position 2^32 (section 15.3); rows that are not fp32, bf16 or fp16; an environment value it refuses (section 4.4) | first `input_dist()`, before the op is built | `"hierarchical"`: `ValueError` on every rank; `"auto"`: a warning, TorchRec's dists |
 | On some rank: the NCCL LSA team is not the whole node. Or, across nodes, GIN does not connect the rails, has fewer than 4 contexts, or its signals do not start at 0. Or the window cannot be allocated. | first `input_dist()`, collectively | a warning that names each rank and why, TorchRec's dists on every rank |
 | an eval forward | per call | TorchRec's dists for that call |
 | a call that does not fit the capacities, or a proxy that gets one key more than `local_size` times | per call, at its second wait | `RuntimeError` on every rank, naming the capacity to raise or the key's occurrences (section 5.4) |
+
+Without gradient clipping, the sharder's `use_index_dedup` is not one of
+these conditions: a call on the op deduplicates the sharding's keys itself
+(section 7.4).
 
 The op places keys by `roundrobin` and `hash_roundrobin` only
 (section 10.1). One op serves all tables of a sharding, so one
@@ -711,9 +724,9 @@ same point on every rank:
    the same configuration, so every rank decides alike. If the op does not
    apply (`hier_output_dist_unsupported()`, section 6), every rank warns and
    takes TorchRec's dists. If the op refuses the configuration (a
-   `continuous` table, say), or the keys are not index-deduplicated,
-   `"hierarchical"` raises `ValueError` on every rank and `"auto"` warns and
-   takes TorchRec's dists.
+   `continuous` table, say, or tables that clip gradients without the
+   sharder's index dedup), `"hierarchical"` raises `ValueError` on every
+   rank and `"auto"` warns and takes TorchRec's dists.
 2. Else every rank builds the op with that id. The constructor checks the
    configuration again (it throws before any collective if it refuses it),
    then makes the communicator and its device communicator: LSA inside the
@@ -845,14 +858,33 @@ goes once its kernel is queued, and autograd keeps the backward's
   carries what the output dist takes (`hier_result`, a `HierCall`: the
   plans and the backward's counts). Its `record_stream`, which TorchRec's
   pipelines call, also records the plans' tensors.
-* **Index dedup.** The op takes index-deduplicated keys only: a sharding
-  whose sharder has no `use_index_dedup=True` takes TorchRec's dists under
-  `"auto"`, and raises `ValueError` under `"hierarchical"`, at its first input
-  dist. For a call that takes the op, the output dist itself writes each
-  deduplicated row to all its original positions, and sums their
-  gradients. So the sharding skips TorchRec's own expansion for that call
-  (it clears the context's reverse indices when the call starts). A call on
-  TorchRec's dists (an eval forward) keeps it.
+* **Index dedup.** The op takes index-deduplicated keys only, so a call
+  that takes the op deduplicates its sharding's keys, whatever the
+  sharder's `use_index_dedup`. It does what index dedup does, the frequency
+  counters included (the keys' weights, where a table of the sharding
+  evicts by LFU, or admits under the sharder's index dedup), without the
+  host sync of the count (section 10.1). A call on TorchRec's dists (an
+  eval forward) deduplicates as the sharder says. When a call deduplicates
+  the keys of one sharding and not of another, the other gets its own
+  input as the context's input features and no reverse indices, which
+  `construct_jagged_tensors` reads as without index dedup. For a call that
+  takes the op, the output dist itself writes each deduplicated row to all
+  its original positions, and sums their gradients. So the sharding skips
+  TorchRec's own expansion for that call (it clears the context's reverse
+  indices when the call starts). A call on TorchRec's dists keeps it.
+* **Without the sharder's index dedup.** The tables count the keys of a
+  call on the op as on TorchRec's dists without index dedup. LFU scores
+  count every occurrence of a key, with index dedup or without it. An
+  admission strategy of a table that does not evict by LFU counts every
+  occurrence under index dedup (its frequency counters) and each key once
+  per call without it. So without the flag the keys carry counters only
+  where a table of the sharding evicts by LFU, and a lookup group of
+  admitting tables beside it drops them (the tables'
+  `admission_counts_occurrences`, which the sharding sets to
+  `use_index_dedup`). Tables that clip gradients need the flag (section
+  6). Index dedup changes no output row, and each key's gradient adds up
+  the same terms; with 16-bit rows a GPU's sum of them is rounded once
+  more (section 18).
 * **Owner rules.** The op takes `roundrobin` and `hash_roundrobin` tables
   only (`Config::validate`): a sharding with a `continuous` table takes
   TorchRec's dists under `"auto"`, and raises `ValueError` under
@@ -1090,8 +1122,9 @@ finds their identities with a hash table and numbers them with a scan
   key's row, and the call raises at its second wait (section 5.4).
 * **Weights** ride along when the keys carry them: index dedup's frequency
   counters, where a table of the sharding has LFU scores (which count how
-  often each key is seen) or an admission strategy. The proxy adds them up
-  per node-unique key, as whole numbers.
+  often each key is seen) or, under the sharder's index dedup, an admission
+  strategy (section 7.4). The proxy adds them up per node-unique key, as
+  whole numbers.
 * **`node_dedup=False`** (or gradient clipping): every occurrence is a
   node-unique key of its own. Inside each (owner node, feature) the keys
   go requester after requester, each requester's in its bucketized order.
@@ -2867,7 +2900,9 @@ occurrence, and one entry per (other node, table, key). It sees the same
 frequency counts, so inserts, admission and LFU scores match. As with any
 change of key order, random initializers and eviction under capacity
 pressure may differ. TorchRec's own `unique` order is not fixed either. So
-the bit-exact tests use the DEBUG initializer and no eviction.
+the bit-exact tests use the DEBUG initializer and no eviction. Against
+TorchRec's dists without index dedup the same holds: the owner looks up the
+same keys, and its tables count them as TorchRec's do (section 7.4).
 
 **Backward: per (table, key), the same terms.** Every row of `lookup_grad`
 is written once, and every occurrence adds to exactly one row, so the
@@ -2882,8 +2917,14 @@ lookup's backward adds up the same terms as TorchRec's:
   are made in fp32, where TorchRec's `index_add` adds in the row dtype.
   `node_dedup=False` sends each GPU's row across IB on its own, at the cost
   of more IB traffic.
+* bf16 or fp16 rows without the sharder's index dedup: TorchRec's dists
+  send each occurrence's row, where the op's own index dedup adds a GPU's
+  occurrences of a key in fp32 and rounds the sum to the row dtype once,
+  before it crosses. The error is at most `2^-8` of that sum for bf16, and
+  `2^-11` for fp16.
 * Gradient clipping clamps each row before the per-key sum, so it turns node
-  dedup off and keeps TorchRec's meaning.
+  dedup off and needs the sharder's index dedup (section 6): it keeps the
+  meaning of TorchRec's dists under index dedup.
 
 The order of the rows in `lookup_rows` (section 11.2) changes no bit of a
 result: the lookup writes each key's row at its place in the row map, and
@@ -2950,14 +2991,14 @@ PYTHONPATH=${PYTHONPATH}:$(realpath ../) torchrun --nproc_per_node 8 -m pytest -
 ```
 
 **The existing tests on the dist.** After its usual runs, `test/unit_test.sh`
-runs seven files of DynamicEmb's existing tests again on the hierarchical
+runs eight files of DynamicEmb's existing tests again on the hierarchical
 dist, with their configurations unchanged: `test_sequence_embedding.sh`,
 `test_twin_module.sh`, `erase_async/test_erase_async.sh`,
 `per_key_score/test_per_key_score.sh` and `test_lfu_scores.sh` in the
-`fwd_bwd` group, and `admission/test_embedding_admission.sh` and
-`incremental_dump/test_incremental_dump.sh` in the `load_dump` group. A build
-without the op skips them. To run one of them on the dist, from
-`corelib/dynamicemb`:
+`fwd_bwd` group, and `admission/test_embedding_admission.sh`,
+`test_embedding_dump_load.sh` and `incremental_dump/test_incremental_dump.sh`
+in the `load_dump` group. A build without the op skips them. To run one of
+them on the dist, from `corelib/dynamicemb`:
 
 ```
 DYNAMICEMB_TEST_OUTPUT_DIST=hierarchical PYHKV_DEBUG_STRICT=1 bash test/unit_tests/test_lfu_scores.sh
@@ -2970,9 +3011,9 @@ gives the tables of each collection `output_dist_capacity`
 (`DYNAMICEMB_TEST_OUTPUT_DIST_CAPACITY`, else `1 << 17`, twice the most keys
 a call of these tests has). It also gives them `output_dist="hierarchical"`
 when the dist serves the collection's row-wise sharding (more than one rank,
-DynamicEmb tables alone, index dedup, rows of a multiple of 16 bytes, no
-`"continuous"` table and no score per key), and `"auto"` otherwise, which
-must take TorchRec's dists (section 6). For a pass to mean something:
+DynamicEmb tables alone, rows of a multiple of 16 bytes, no `"continuous"`
+table and no score per key), and `"auto"` otherwise, which must take
+TorchRec's dists (section 6). For a pass to mean something:
 
 * after the model's first training forward, `check_path` asserts that each
   row-wise sharding of DynamicEmb tables took the dist exactly when it was
@@ -2986,19 +3027,21 @@ must take TorchRec's dists (section 6). For a pass to mean something:
 * at the end of each test, `release()` quiesces the ops of the models given
   `"hierarchical"`, in the same order on every rank (section 4.6).
 
-On one node, 64 runs or cases take the dist: in `test_sequence_embedding.sh`,
+On one node, 210 runs or cases take the dist: in `test_sequence_embedding.sh`,
 the run of two collections and the run with `--dynamicemb_num=4`; at 8 GPUs,
-the 12 sequence cases with index dedup of `test_twin_module.py`, the 15
-launches with index dedup of `test_lfu_scores.sh` and the 34 cases of
-`test_embedding_admission.py`; and the model of `test_erase_distributed.py`
-with scores per table and index dedup. The others take TorchRec's dists by
-design: one rank; plain TorchRec tables in the sharding (the default
-`--dynamicemb_num=2` of `test_sequence_embedding_fw.py`); rows of 516 bytes
-(`--embedding_dim 129`); a score per key (`per_key_score/`, and six models of
-`test_erase_distributed.py`); and sharders without index dedup (the other
-cases of the twin, LFU and erase tests, the incremental-dump tests, and all of
-`test_embedding_dump_load.sh`, which `test/unit_test.sh` does not run again
-for that reason). Pooled collections ignore `output_dist`.
+the 24 sequence cases of `test_twin_module.py`, the 28 launches of
+`test_lfu_scores.sh`, the 34 cases of `test_embedding_admission.py`, the 108
+launches of `test_embedding_dump_load.sh` and 8 sequence tests of
+`incremental_dump/test_distributed_dynamicemb.py`; and at 2 GPUs, the 2
+`hash_roundrobin` launches of `test_embedding_dump_load.sh` and the 4 models
+of `test_erase_distributed.py` with scores per table. Most of them shard
+without index dedup: there a call on the dist deduplicates the keys itself
+(section 7.4). The others take TorchRec's dists by design: one rank; plain
+TorchRec tables in the sharding (the default `--dynamicemb_num=2` of
+`test_sequence_embedding_fw.py`, and the incremental-dump cases that mix them
+with DynamicEmb tables); rows of 516 bytes (`--embedding_dim 129`); and a
+score per key (`per_key_score/`, and six models of
+`test_erase_distributed.py`). Pooled collections ignore `output_dist`.
 
 The node's part of a call has hooks of its own in `testing.cu`:
 
@@ -3217,8 +3260,10 @@ on 1 and 3 CTAs, and the calls of the design's reference ports.
   the row map (`HierDist.key_rows`). TorchRec's model delta tracker gets
   each group's rows in key order, a copy per lookup group
   (`HierDist.in_key_order`, section 7.4).
-* **16-bit rows with node dedup** get one more rounding per node sum
-  (section 18).
+* **16-bit rows** get one more rounding per node sum with node dedup, and
+  per GPU sum without the sharder's index dedup (section 18).
+* **Gradient clipping** needs the sharder's `use_index_dedup=True`
+  (section 6).
 * **Skewed keys**: lower IB use in the backward, and a slow rank's lookup
   delays the other ranks' output-dist kernels. A chunk of hot keys, which
   have many rows in the ring, moves less than `DYNAMICEMB_HIER_PAYLOAD_KB`
@@ -3250,8 +3295,8 @@ Paths from `corelib/dynamicemb`.
   output dist and `quiesce`; `input_dist.py` the hierarchical input dist
   (`hier_forward` and its two awaitables); `rw_sharding.py` the choice of
   dist, the lookup groups and the lookup; `embedding.py` the choice per call
-  (eval forwards take TorchRec's dists). The
-  table options are in `dynamicemb/dynamicemb_config.py`.
+  (eval forwards take TorchRec's dists) and the index dedup of a call on the
+  op. The table options are in `dynamicemb/dynamicemb_config.py`.
 * **DynamicEmb's lookup**, where it takes a row map (section 11.2):
   `dynamicemb/batched_dynamicemb_function.py` (`OutputAlloc`, the forward
   and its backward's `grad_rows`), `dynamicemb/key_value_table.py`

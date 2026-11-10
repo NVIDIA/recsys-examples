@@ -425,8 +425,8 @@ class RwSequenceDynamicEmbeddingSharding(RwSequenceEmbeddingSharding):
             for _ in table.feature_names
         ]
         # A clipping table clamps each looked-up row's gradient before the
-        # per-key sum, so every occurrence must cross on its own: node dedup
-        # off.
+        # per-key sum, so every row TorchRec's dists send must cross on its
+        # own: node dedup off, and the sharder's index dedup on (HierDist.setup).
         clipping = any(
             (sharding_info.fused_params or {}).get("gradient_clipping", False)
             for sharding_info in sharding_infos
@@ -445,6 +445,7 @@ class RwSequenceDynamicEmbeddingSharding(RwSequenceEmbeddingSharding):
             groups=[
                 config.num_features() for config in self._grouped_embedding_configs
             ],
+            clipping=clipping,
         )
 
     def create_input_dist(

@@ -241,7 +241,6 @@ def run(args):
     ]
     output_dist_options = hier_switch.options(
         world_size=world_size,
-        index_dedup=args.use_index_dedup,
         row_bytes=4 * args.embedding_dim,
         all_dynamicemb=all(i < args.dynamicemb_num for i in row_wise_tables),
     )

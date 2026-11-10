@@ -342,7 +342,6 @@ def apply_dmp(
         table_overrides = [overrides.get(c.name, {}) for c in row_wise]
         fields = hier_switch.options(
             world_size=world_size,
-            index_dedup=use_index_dedup,
             row_bytes=4 * row_wise[0].embedding_dim,
             dist_types=[
                 table_override.get("dist_type", dist_type)

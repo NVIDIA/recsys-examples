@@ -17,8 +17,9 @@ dists.
 
 Each case builds the same EmbeddingCollection of DynamicEmb tables twice, on
 TorchRec's dists and on the hierarchical dist, and trains both on the same
-batches, under index dedup, which the hierarchical dist takes. Every step
-checks:
+batches, with the sharder's index dedup (the last four cases without it:
+there a call on the hierarchical dist deduplicates the sharding's keys
+itself, and counts them as TorchRec's dists do). Every step checks:
 
 * the forward outputs: bit for bit in the first iteration, and in every
   iteration when every sum is exact (else within :func:`close`'s tolerances);
@@ -28,16 +29,18 @@ checks:
   which takes TorchRec's dists.
 
 Before the cases: the sharding shapes, the ranks' agreement, a sharding with
-a ``continuous`` feature outside a model, and the options (a model without
-index dedup, and a sharding with a ``continuous`` table: ``"hierarchical"``
-raises ``ValueError`` at its first input dist, ``"auto"`` takes TorchRec's
-dists). After the cases, two of them again with node_exchange's grids (the
-row's push before it and the layout's items after it, which only many
-features and nodes take: ``hier_output_dist_node_paths``). Then: an input
-dist that waits for the device nowhere but in its second wait, the output
-dist's call orders, the backward run to run, the window and the trace APIs,
-failed constructions, across nodes a proxy rows cap below the least rows of
-the proxy's ring, and the teardown.
+a ``continuous`` feature outside a model, and the options (a sharding with a
+``continuous`` table, and a model without index dedup whose tables clip
+gradients: ``"hierarchical"`` raises ``ValueError`` at its first input dist,
+``"auto"`` takes TorchRec's dists; a model without index dedup otherwise
+takes the hierarchical dist under both). After the cases, two of them again
+with node_exchange's grids (the row's push before it and the layout's items
+after it, which only many features and nodes take:
+``hier_output_dist_node_paths``). Then: an input dist that waits for the
+device nowhere but in its second wait, the output dist's call orders, the
+backward run to run, the window and the trace APIs, failed constructions,
+across nodes a proxy rows cap below the least rows of the proxy's ring, and
+the teardown.
 
 Run it from ``corelib/dynamicemb``, one process per GPU (on one node, or
 across nodes under Slurm)::
@@ -366,6 +369,33 @@ CASES = [
         lfu=True,
         empty_last=("f0", "f1", "f2", "f3"),
     ),
+    # Sharders without index dedup: a call on the hierarchical dist
+    # deduplicates the sharding's keys itself. Its frequency counters give the
+    # LFU scores that TorchRec's owners count from every occurrence.
+    Case("fp32 pow-law lfu, no index dedup", keys="pow-law", lfu=True, dedup=False),
+    # An admitting table that does not evict by LFU counts each key once per
+    # call, as on TorchRec's dists: the keys carry no counters, ...
+    Case("fp32 admission, no index dedup", admit=True, dedup=False),
+    # ... and beside an LFU table, whose counters the keys carry, its lookup
+    # group drops them
+    Case(
+        "fp32 pow-law, LFU and admission tables, no index dedup",
+        keys="pow-law",
+        mixed=True,
+        dedup=False,
+    ),
+    # A table-wise sharding beside the row-wise one: the call deduplicates
+    # the row-wise sharding's keys alone, and the table-wise sharding keeps
+    # its own input.
+    Case(
+        "fp32 pow-law lfu + table-wise table, no index dedup",
+        keys="pow-law",
+        lfu=True,
+        table_wise=("g0",),
+        empty_last=("g0",),
+        syncs=None,
+        dedup=False,
+    ),
 ]
 
 
@@ -560,7 +590,6 @@ def capacities_for(
         tables,
         owner_rule(case),
         local_size,
-        index_dedup=case.dedup,
         node_dedup=case.node_dedup and not case.clip,
     )
     return hier_capacities(needs)
@@ -682,9 +711,12 @@ def output_grads(
 
 
 def jagged_input(ec, ctx) -> KeyedJaggedTensor:
-    """The KJT construct_jagged_tensors reads for the row-wise sharding."""
+    """The KJT construct_jagged_tensors reads for the row-wise sharding: the
+    input of a call that deduplicated some sharding's keys (the sharder's
+    index dedup, or a call on the hierarchical dist), else the input of the
+    sharding's input dist."""
     rw = rw_index(ec)
-    if ec._use_index_dedup:
+    if ctx.input_features:
         return ctx.input_features[rw]
     return ctx.sharding_contexts[rw].features_before_input_dist
 
@@ -944,9 +976,10 @@ def frequencies_of(ec) -> Dict[Tuple[str, str], Tuple[torch.Tensor, torch.Tensor
 
 def same_frequencies(pair: Pair) -> bool:
     """The LFU scores and the admission counts of both models' tables: the
-    hierarchical owner counts every occurrence TorchRec's does (the keys'
-    weights carry index dedup's frequency counters, across nodes a
-    node-unique key's those of its node)."""
+    hierarchical owner counts what TorchRec's does, every occurrence where
+    the keys' weights carry index dedup's frequency counters (across nodes a
+    node-unique key's those of its node), and each key once per call where
+    an admitting table goes without them."""
     ref_freq, hier_freq = frequencies_of(pair.ref), frequencies_of(pair.hier)
     return ref_freq.keys() == hier_freq.keys() and all(
         torch.equal(ref_freq[key][0], hier_freq[key][0])
@@ -1242,10 +1275,13 @@ def run_options(rank: int, world_size: int, local_size: int, log: Callable) -> i
     warning, and trains as they do. Tables that take a score per key
     (``PRECISE_CUSTOMIZED``) raise ValueError under ``"hierarchical"`` when
     the model is sharded, on every rank alike; under ``"auto"`` the sharding
-    warns and takes TorchRec's dists. A model without index dedup, and a
-    sharding with a ``continuous`` table: under ``"hierarchical"`` its first
-    input dist raises ValueError on every rank alike, under ``"auto"`` it
-    warns and trains as TorchRec's dists do."""
+    warns and takes TorchRec's dists. A sharding with a ``continuous`` table:
+    under ``"hierarchical"`` its first input dist raises ValueError on every
+    rank alike, under ``"auto"`` it warns and trains as TorchRec's dists do.
+    A model without index dedup takes the hierarchical dist under both,
+    whose calls deduplicate the sharding's keys themselves, and gives the
+    outputs of TorchRec's dists without index dedup. With gradient clipping
+    such a model raises or warns as one with a ``continuous`` table does."""
     every_capacity = dict.fromkeys(OUTPUT_DIST_CAPACITY_NAMES, 1 << 16)
     unknown = option_error(output_dist="fused", output_dist_capacity=4)
     checks = {
@@ -1302,29 +1338,66 @@ def run_options(rank: int, world_size: int, local_size: int, log: Callable) -> i
     checks["auto trains as TorchRec"] = same_outputs(
         case, ref_run.out, auto_run.out, True
     )
+    # Without index dedup on the sharder, each model's call on the op
+    # deduplicates the sharding's keys itself. One op at a time, dropped on
+    # every rank at the same point (gc_models).
     plain = replace(case, dedup=False)
-    kjt = batch_of(plain, 141, 0, rank, world_size)
-    hierarchical = sharded_ec(
-        build_model(plain, "hierarchical", world_size, local_size, every_capacity)
+    ref_plain = sharded_ec(build_model(plain, "torchrec", world_size, local_size))
+    ref_plain_run = run_model(
+        ref_plain, batch_of(plain, 141, 0, rank, world_size), False
     )
-    refused = expect_error(
-        ValueError, hierarchical.input_dist, hierarchical.create_context(), kjt
+    teardown_failures = 0
+    for asked in ("hierarchical", "auto"):
+        plain_ec = sharded_ec(
+            build_model(plain, asked, world_size, local_size, every_capacity)
+        )
+        plain_run = run_model(
+            plain_ec, batch_of(plain, 141, 0, rank, world_size), False
+        )
+        checks[f"{asked} without index dedup"] = (
+            hier_of(plain_ec).takes_hier_dist is True
+            and plain_run.result is not None
+            and totals_right(jagged_input(plain_ec, plain_run.ctx))
+            and same_outputs(plain, ref_plain_run.out, plain_run.out, True)
+        )
+        del plain_ec, plain_run
+        teardown_failures += gc_models(log)
+    # Tables that clip each row their lookup gets, without index dedup: a
+    # call on the op would send a GPU's sum of a key's rows, where TorchRec's
+    # dists send a row per occurrence.
+    clipped = replace(plain, clip=True)
+    kjt = batch_of(clipped, 143, 0, rank, world_size)
+    hierarchical_clip = sharded_ec(
+        build_model(clipped, "hierarchical", world_size, local_size, every_capacity)
     )
-    checks["hierarchical without index dedup"] = same_everywhere(refused) and (
-        "index-deduplicated" in refused
+    refused_clip = expect_error(
+        ValueError,
+        hierarchical_clip.input_dist,
+        hierarchical_clip.create_context(),
+        kjt,
+    )
+    checks["hierarchical with clipping, no index dedup"] = (
+        same_everywhere(refused_clip)
+        and "use_index_dedup=True" in refused_clip
+        and hier_of(hierarchical_clip).op is None
     )
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
-        auto_plain = sharded_ec(
-            build_model(plain, "auto", world_size, local_size, every_capacity)
+        auto_clip = sharded_ec(
+            build_model(clipped, "auto", world_size, local_size, every_capacity)
         )
-        auto_plain_run = run_model(auto_plain, kjt, False)
-    ref_plain = sharded_ec(build_model(plain, "torchrec", world_size, local_size))
-    ref_plain_run = run_model(ref_plain, kjt, False)
-    checks["auto without index dedup"] = (
-        hier_of(auto_plain).takes_hier_dist is False
-        and any("index-deduplicated" in str(warning.message) for warning in caught)
-        and same_outputs(plain, ref_plain_run.out, auto_plain_run.out, True)
+        auto_clip_run = run_model(auto_clip, kjt, False)
+    ref_clip = sharded_ec(build_model(clipped, "torchrec", world_size, local_size))
+    ref_clip_run = run_model(ref_clip, kjt, False)
+    checks["auto with clipping, no index dedup"] = (
+        hier_of(auto_clip).takes_hier_dist is False
+        and auto_clip_run.result is None
+        and any(
+            "use_index_dedup=True" in str(warning.message)
+            and "using TorchRec" in str(warning.message)
+            for warning in caught
+        )
+        and same_outputs(clipped, ref_clip_run.out, auto_clip_run.out, True)
     )
     # one continuous table among cyclic ones refuses the whole sharding
     mixed = replace(case, rules=("roundrobin", "hash_roundrobin", "continuous"))
@@ -1362,13 +1435,13 @@ def run_options(rank: int, world_size: int, local_size: int, log: Callable) -> i
         and same_outputs(mixed, ref_cont_run.out, auto_cont_run.out, True)
     )
     failures = report(
-        "options", checks, log, f": {msg}; {unknown}; {refused}; {refused_cont}"
+        "options", checks, log, f": {msg}; {unknown}; {refused_clip}; {refused_cont}"
     )
     torch.cuda.synchronize()  # before the tables' memory goes with the models
-    del auto, ref, auto_run, ref_run, hierarchical, auto_plain, ref_plain
-    del auto_plain_run, ref_plain_run, auto_scored
+    del auto, ref, auto_run, ref_run, ref_plain, ref_plain_run, auto_scored
+    del hierarchical_clip, auto_clip, ref_clip, auto_clip_run, ref_clip_run
     del hierarchical_cont, auto_cont, ref_cont, auto_cont_run, ref_cont_run
-    return failures + gc_models(log)
+    return failures + teardown_failures + gc_models(log)
 
 
 def run_agreement(rank: int, world_size: int, local_size: int, log: Callable) -> int:
