@@ -17,8 +17,8 @@ instead: the two LayerNorms and the bias + GELU quantize their own output, and o
 attention output is quantized by a standalone kernel.
 
 ``HSTUBlockInference`` builds ``Fp8FusedTransformerInferLayer`` layers when the inference
-config sets ``transformer_fp8_linear`` (gin: ``NetworkArgs.transformer_fp8_linear``). The
-dense checkpoint loader requantizes their FP8 weights in place, which also reaches CUDA
+config sets ``transformer_fp8_linear`` (gin: ``NetworkArgs.transformer_fp8_linear``).
+Loading a state dict requantizes their FP8 weights in place, which also reaches CUDA
 graphs captured before the checkpoint was loaded.
 
 DeepGEMM is an optional dependency and is JIT compiled at the first call of each shape,
@@ -61,16 +61,19 @@ def _supports_fp8(linear):
     )
 
 
+def _requantize_after_load(module, incompatible_keys):
+    module.refresh_fp8_weights()
+
+
 class Fp8Linear(nn.Linear):
     """``nn.Linear`` that multiplies through DeepGEMM FP8 (bf16 in, bf16 out).
 
     ``weight`` and ``bias`` stay the bf16 checkpoint parameters, so state-dict keys and
     loading are unchanged. The FP8 weight is derived from ``weight`` by
     ``refresh_fp8_weights`` and rewritten in place, which keeps its address valid for
-    captured CUDA graphs. The first forward builds it, and a forward after the weight
-    changed rebuilds it. A replayed CUDA graph never runs Python, so a checkpoint loaded
-    into a captured model needs an explicit ``refresh_fp8_weights``; the dense checkpoint
-    loader calls it.
+    captured CUDA graphs. The first forward builds it, and a ``load_state_dict`` post-hook
+    rebuilds it, so a checkpoint loaded into a captured model reaches the graphs. After
+    changing ``weight`` any other way, call ``refresh_fp8_weights``.
     """
 
     def __init__(self, in_features, out_features, bias=True, device=None, dtype=None):
@@ -79,7 +82,8 @@ class Fp8Linear(nn.Linear):
         # buffers, and they do not belong in the state dict.
         self._fp8_weight = None
         self._fp8_scale = None
-        self._weight_version = None
+        # Every load_state_dict reaches it, also through a parent module's load.
+        self.register_load_state_dict_post_hook(_requantize_after_load)
 
     @classmethod
     def from_linear(cls, linear):
@@ -118,25 +122,10 @@ class Fp8Linear(nn.Linear):
         else:
             self._fp8_weight.copy_(qweight)
             self._fp8_scale.copy_(scale)
-        self._weight_version = self._version_of(self.weight)
-
-    @staticmethod
-    def _version_of(tensor):
-        try:
-            return tensor._version
-        except RuntimeError:
-            # Inference tensors do not track a version; refresh only on first use.
-            return None
-
-    def _weight_is_stale(self):
-        if self._fp8_weight is None:
-            return True
-        version = self._version_of(self.weight)
-        return version is not None and version != self._weight_version
 
     def gemm(self, qx, scale_x):
         """FP8 GEMM of an already quantized [M, in_features] input: bf16 out, no bias."""
-        if self._weight_is_stale():
+        if self._fp8_weight is None or self._fp8_weight.device != self.weight.device:
             self.refresh_fp8_weights()
         out = torch.empty(
             (qx.shape[0], self.out_features), dtype=torch.bfloat16, device=qx.device

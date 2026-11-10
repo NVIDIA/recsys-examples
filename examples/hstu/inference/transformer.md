@@ -117,9 +117,9 @@ convert HSTU dense weights into Transformer weights.
 projections as FP8 GEMMs of DeepGEMM, which the Docker image builds from
 `third_party/DeepGEMM`. The two LayerNorms and the GELU write FP8 from fused
 Triton kernels, the attention output is quantized before `proj`, and attention
-itself stays bf16. The checkpoint is unchanged: the dense checkpoint loader
-quantizes the loaded bf16 weights in place, so CUDA graphs captured before
-loading use them. FP8 requires bf16 and an SM90 or newer GPU, keeps a projection
+itself stays bf16. The checkpoint is unchanged: loading a state dict quantizes
+the loaded bf16 weights in place, so CUDA graphs captured before loading use
+them. FP8 requires bf16 and an SM90 or newer GPU, keeps a projection
 whose widths are not multiples of 128 in bf16 with a warning, and cannot be
 exported. Tests: `test/test_transformer_infer_layer_fp8.py` and
 `test/test_triton_fp8_quant.py`.

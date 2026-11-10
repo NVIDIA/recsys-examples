@@ -120,7 +120,7 @@ def test_updated_weights_are_picked_up(layer_cls):
     fresh.load_state_dict(base.state_dict())
     with torch.inference_mode():
         stale = fp8(x, offsets, candidates)  # builds FP8 weights from the old values
-        fp8.load_state_dict(base.state_dict())  # in-place copy bumps the weight version
+        fp8.load_state_dict(base.state_dict())  # requantizes in place
         updated = fp8(x, offsets, candidates)
         expected = fresh(x, offsets, candidates)
     assert not torch.equal(stale, updated)
@@ -337,9 +337,11 @@ def test_config_selects_fp8_layers():
         )
 
 
-def test_checkpoint_loaded_after_graph_capture_reaches_the_graphs(monkeypatch):
+@pytest.mark.parametrize("load", ["dense_module", "plain_module"])
+def test_checkpoint_loaded_after_graph_capture_reaches_the_graphs(monkeypatch, load):
     # The Triton model's order: the dense module captures its per-layer graphs while
-    # it is built, then it is cast to bf16 and the checkpoint is loaded.
+    # it is built, then it is cast to bf16 and the checkpoint is loaded. The FP8
+    # weights follow any load_state_dict, not only the dense module's override.
     source = dense_module(0, dense_config())
     fp8 = dense_config(transformer_fp8_linear=True)
     graphs = {"batch_size": [2], "length_per_sequence": [64]}
@@ -349,7 +351,10 @@ def test_checkpoint_loaded_after_graph_capture_reaches_the_graphs(monkeypatch):
     batch, embeddings = dense_batch()
     before = served(batch, embeddings)
     for model in (served, eager):
-        model.load_state_dict(source.state_dict(), strict=False)
+        if load == "dense_module":
+            model.load_state_dict(source.state_dict(), strict=False)
+        else:
+            nn.Module.load_state_dict(model, source.state_dict())
     after = served(batch, embeddings)
     expected = eager(batch, embeddings)
     assert len(replays) == 2
