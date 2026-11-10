@@ -18,6 +18,7 @@ GROUP_SIZE = 128
 @triton.jit
 def _quantize_group(values, ue8m0: tl.constexpr):
     """Scale each row of a [block_m, 128] fp32 tile into float8_e4m3fn: (q, scale)."""
+    # The floor of DeepGEMM's own casts: an all-zero group still gets a finite scale.
     amax = tl.maximum(tl.max(tl.abs(values), axis=1), 1e-4)
     scale = amax / 448.0  # largest float8_e4m3fn value
     if ue8m0:

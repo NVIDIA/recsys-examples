@@ -91,7 +91,7 @@ class Fa4AttentionMixin:
                 history_lengths,
             )
             key_width = self._max_seq_len
-        output = flash_attn_varlen_func(
+        output, _ = flash_attn_varlen_func(
             query,
             key,
             value,
@@ -103,7 +103,6 @@ class Fa4AttentionMixin:
             score_mod=_candidate_score_mod,
             aux_tensors=[candidates],
         )
-        output = output[0] if isinstance(output, tuple) else output
         # CUDA graph buckets pack more rows than the request; zero them as the reference.
         live = torch.arange(tokens, device=query.device) < offsets[-1]
         return torch.where(live[:, None], output.flatten(1), 0)

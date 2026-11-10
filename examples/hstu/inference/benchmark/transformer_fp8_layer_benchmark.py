@@ -34,7 +34,7 @@ from modules.transformer_infer_layer import TransformerInferLayer
 from modules.transformer_infer_layer_fp8 import Fp8FusedTransformerInferLayer
 
 DIMS = {
-    "pr": dict(label="H=512", hidden=512, heads=4, head_dim=128, ffn=2048),
+    "small": dict(label="H=512", hidden=512, heads=4, head_dim=128, ffn=2048),
     "large": dict(label="H=2048", hidden=2048, heads=16, head_dim=128, ffn=8192),
 }
 # (users, tokens per user); the packed token count M is their product.
