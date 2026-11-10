@@ -698,3 +698,48 @@ def test_exported_dense_module_serves_more_users_than_the_example():
             x = inputs(count)
             expected = run(*x, batch_size=count)
             torch.testing.assert_close(program(*x), expected, rtol=0, atol=1e-3)
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available(),
+    reason="requires the CUDA preprocessing and paged KV cache operators",
+)
+def test_cached_module_runs_a_forward_without_cache_eagerly():
+    # The CUDA graphs of a module with a KV cache append to it and attend over it,
+    # through the metadata of the last cached request. A forward without the cache
+    # must not replay them, and then matches a module without a cache.
+    from configs import InferenceEmbeddingConfig, RankingConfig
+    from modules.inference_dense_module import InferenceDenseModule
+    from recsys_kvcache_manager.kvcache_config import get_kvcache_config
+    from transformer_test_utils import dense_batch, dense_config
+
+    cfg = dense_config()
+    kvcache = get_kvcache_config(
+        num_layers=cfg.num_layers,
+        num_heads=cfg.num_heads,
+        head_dim=cfg.head_dim,
+        page_size=32,
+        offload_chunksize=1024,
+        num_primary_cache_pages=64,
+        num_buffer_pages=0,
+        host_capacity_per_layer=0,
+        max_batch_size=cfg.max_batch_size,
+        max_seq_len=cfg.max_seq_len,
+        dtype=torch.bfloat16,
+        device=torch.cuda.current_device(),
+        host_kvstorage_backend="native",
+    )
+    task = RankingConfig(
+        embedding_configs=[InferenceEmbeddingConfig(["item"], "item", 16, 512, False)],
+        prediction_head_arch=[512, 2],
+        num_tasks=2,
+    )
+    graphs = {"batch_size": [2], "length_per_sequence": [64]}
+    cached = InferenceDenseModule(
+        cfg, kvcache, task, use_cudagraph=True, cudagraph_configs=graphs
+    )
+    cached = cached.bfloat16().eval()
+    plain = InferenceDenseModule(cfg, None, task).bfloat16().eval()
+    plain.load_state_dict(cached.state_dict(), strict=False)
+    batch, embeddings = dense_batch()
+    torch.testing.assert_close(cached(batch, embeddings), plain(batch, embeddings))

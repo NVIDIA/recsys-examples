@@ -419,7 +419,9 @@ class InferenceDenseModule(torch.nn.Module):
 
             # num_tokens = batch.features.values().shape[0]
             num_tokens = jagged_data.values.shape[0]
-            if self.use_cudagraph:
+            # The CUDA graphs of a module with a KV cache append to it and attend over
+            # it, through the metadata of the last cached request: run eagerly instead.
+            if self.use_cudagraph and not self._use_kvcache:
                 self._hidden_states[:num_tokens, ...].copy_(
                     jagged_data.values, non_blocking=True
                 )
@@ -438,6 +440,7 @@ class InferenceDenseModule(torch.nn.Module):
                     jagged_data.values,
                     jagged_data,
                     None,
+                    use_cudagraph=False,
                 )
             jagged_data.values = hstu_output
             jagged_data = self._hstu_block._postprocessor(jagged_data)
