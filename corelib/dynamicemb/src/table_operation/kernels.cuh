@@ -913,11 +913,6 @@ __global__ void table_erase_by_score_kernel(
           bucket.unlock(iter, Bucket::reclaimed_key());
           atomicSub(bucket_sizes + bucket_id, 1);
           erased = true;
-          if (out_keys != nullptr) {
-            auto pos = atomicAdd(out_count, static_cast<CounterType>(1));
-            out_keys[pos] = key;
-            out_slots[pos] = i;
-          }
         }
       }
     }
@@ -929,6 +924,20 @@ __global__ void table_erase_by_score_kernel(
         atomicAdd(num_erased, static_cast<CounterType>(__popc(erased_vote)));
       if (spared_vote)
         atomicAdd(num_spared, static_cast<CounterType>(__popc(spared_vote)));
+    }
+    if (out_keys != nullptr && erased_vote) {
+      // One reservation per tile; each erased lane writes at its rank among them.
+      CounterType tile_base = 0;
+      if (g.thread_rank() == 0)
+        tile_base =
+            atomicAdd(out_count, static_cast<CounterType>(__popc(erased_vote)));
+      tile_base = g.shfl(tile_base, 0);
+      if (erased) {
+        auto pos = tile_base +
+                   __popc(erased_vote & ((1u << g.thread_rank()) - 1u));
+        out_keys[pos] = key;
+        out_slots[pos] = i;
+      }
     }
   }
 }

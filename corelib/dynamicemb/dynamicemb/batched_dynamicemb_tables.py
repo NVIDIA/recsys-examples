@@ -1714,7 +1714,13 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
         Returns an :class:`EraseHandle`; ``result()`` is ``(erased, spared)``.
         """
         check_erase_arguments(
-            score_strategy, threshold, stream, chunk_slots, max_in_flight, table_names
+            score_strategy,
+            threshold,
+            stream,
+            chunk_slots,
+            max_in_flight,
+            table_names,
+            mode,
         )
         table_ids = self.get_erase_table_ids(score_strategy, table_names)
         if not table_ids:

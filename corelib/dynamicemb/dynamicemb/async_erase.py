@@ -357,6 +357,7 @@ def check_erase_arguments(
     chunk_slots: int,
     max_in_flight: int,
     table_names: Optional[Sequence[str]] = None,
+    mode: EvictedItemMode = EvictedItemMode.DISCARD,
 ) -> None:
     """Raise if what an erase by score is asked for cannot mean anything, whatever the
     tables are. Both calls make it first, so a wrong argument is an error even where
@@ -387,6 +388,8 @@ def check_erase_arguments(
             raise TypeError(f"{name} must be an int, got {type(value).__name__}.")
         if value < 1:
             raise ValueError(f"{name} must be at least 1, got {value}.")
+    if not isinstance(mode, EvictedItemMode):
+        raise TypeError(f"mode must be an EvictedItemMode, got {type(mode).__name__}.")
 
 
 def erase_by_score_async(
@@ -465,7 +468,8 @@ def erase_by_score_async(
         marked ``erase_untracked``: an incremental dump of it cannot be replayed.
         ``RETAIN_KEY`` records the erased keys (``pop_erased_keys``), and an incremental
         dump carries them as removals, so a TTL can run with delta updates. Recording
-        costs one buffer per chunk in flight and one device read of its count.
+        costs about 24 bytes per slot of each chunk in flight (~100 MB per default
+        chunk) and one device read of its count.
 
     Returns
     -------
@@ -490,7 +494,7 @@ def erase_by_score_async(
     from dynamicemb.dump_load import get_dynamic_emb_module
 
     check_erase_arguments(
-        score_strategy, threshold, stream, chunk_slots, max_in_flight, table_names
+        score_strategy, threshold, stream, chunk_slots, max_in_flight, table_names, mode
     )
     modules: List[Tuple[nn.Module, Optional[List[str]]]] = []
     found = set()

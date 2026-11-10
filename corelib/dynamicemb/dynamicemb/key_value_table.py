@@ -1004,9 +1004,11 @@ def _erase_state_by_score(
 
     With ``RETAIN_KEY`` each chunk records the keys it erased, and the slot and row of
     each for a table that stores rows, into the buffer :func:`_append_erased` fills, as
-    ``erase_keys`` does; the table is not marked. A chunk's record is read -- one count
-    -- only after the wait for that chunk above (or at the end of its table), so
-    reading it adds no wait, and no more than ``max_in_flight`` chunks' records are held.
+    ``erase_keys`` does. A chunk's record is read -- one count -- only after the wait for
+    that chunk above (or at the end of its table), so reading it adds no wait, and no
+    more than ``max_in_flight`` chunks' records are held. The table is marked only if
+    it lost more keys than were recorded: a scan that fails after a chunk's kernel was
+    launched but before its record was kept.
     """
     for table_id in table_ids:
         if not 0 <= table_id < state.num_tables:
@@ -1021,21 +1023,24 @@ def _erase_state_by_score(
         collections.deque()
     )
 
-    def finish_chunk(finished_chunk: Tuple[torch.cuda.Event, Optional[Tuple]]) -> None:
+    def finish_chunk(finished_chunk: Tuple[torch.cuda.Event, Optional[Tuple]]) -> int:
         launched, recorded = finished_chunk
         launched.synchronize()
-        if recorded is not None:
-            chunk_table_id, keys, slot_index, written = recorded
-            n = int(written.item())
-            _append_erased(
-                state,
-                keys[:n],
-                chunk_table_id,
-                None if slot_index is None else slot_index[:n],
-            )
+        if recorded is None:
+            return 0
+        chunk_table_id, keys, slot_index, written = recorded
+        n = int(written.item())
+        _append_erased(
+            state,
+            keys[:n],
+            chunk_table_id,
+            None if slot_index is None else slot_index[:n],
+        )
+        return n
 
     for table_id in table_ids:
         table_counts = torch.zeros(2, dtype=counts.dtype, device=counts.device)
+        recorded_keys = 0
         # Marked also when the scan fails half way: whatever it removed before is gone.
         try:
             position = 0
@@ -1043,7 +1048,7 @@ def _erase_state_by_score(
             finished = False
             while not finished:
                 if len(in_flight) >= max_in_flight:
-                    finish_chunk(in_flight.popleft())
+                    recorded_keys += finish_chunk(in_flight.popleft())
                 recorded = None
                 with guard():
                     key_map = state.key_index_map
@@ -1098,14 +1103,13 @@ def _erase_state_by_score(
                 in_flight.append((chunk_launched, recorded))
         finally:
             counts.add_(table_counts)
-            if (
-                not record
-                and state.key_index_map.use_rows_
-                and int(table_counts[0]) > 0
-            ):
-                state.erase_untracked_tables.add(table_id)
-            while record and in_flight:
-                finish_chunk(in_flight.popleft())
+            try:
+                while record and in_flight:
+                    recorded_keys += finish_chunk(in_flight.popleft())
+            finally:
+                lost = int(table_counts[0]) - recorded_keys
+                if state.key_index_map.use_rows_ and lost > 0:
+                    state.erase_untracked_tables.add(table_id)
 
 
 def _value_rows_target(current_rows: int, need_rows: int, key_capacity: int) -> int:

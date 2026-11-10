@@ -342,6 +342,39 @@ def test_a_key_map_replaced_during_a_retained_scan_reports_no_key_twice(device):
     assert not storage.erase_untracked(0)
 
 
+class FailingAfterChunk(RecordingGuard):
+    """Raises on leaving chunk ``fail_at``: its kernel is launched, its record not kept."""
+
+    def __init__(self, fail_at):
+        super().__init__()
+        self.fail_at = fail_at
+
+    def __exit__(self, *exc):
+        if self.entered == self.fail_at:
+            raise RuntimeError("the scan failed")
+        return False
+
+
+def test_a_retained_scan_that_fails_after_a_chunk_ran_marks_the_table(device):
+    storage = make_storage([BUCKET * 16])
+    fill(storage, KEYS, SCORES, 0, device)
+
+    with pytest.raises(RuntimeError, match="the scan failed"):
+        storage.erase_by_score(
+            THRESHOLD,
+            [0],
+            new_counts(device),
+            chunk_slots=4 * BUCKET,
+            chunk_guard=FailingAfterChunk(2),
+            mode=EvictedItemMode.RETAIN_KEY,
+        )
+
+    torch.cuda.synchronize()
+    lost = len(KEYS) - int(storage.key_index_map.size(0))
+    assert lost > storage.pop_erased_keys(0).numel(), "the failed chunk erased keys"
+    assert storage.erase_untracked(0)
+
+
 class SlowChunks:
     """The guard of a scan whose chunks take a while on the device, counting how many
     of the chunks before the one being entered are still running there."""
