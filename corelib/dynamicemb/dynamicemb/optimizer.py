@@ -27,8 +27,10 @@ from dynamicemb_extensions import (
     adagrad_update_for_padded_buffer,
     adam_update_for_flat_table,
     adam_update_for_padded_buffer,
+    fill_rows,
     ftrl_update_for_flat_table,
     ftrl_update_for_padded_buffer,
+    reset_ftrl_states,
     rowwise_adagrad_for_flat_table,
     rowwise_adagrad_for_padded_buffer,
     sgd_update_for_flat_table,
@@ -182,6 +184,7 @@ class BaseDynamicEmbeddingOptimizer(abc.ABC):
         max_emb_dim: int,
         all_dims_vec4: bool,
         table_dtype: torch.dtype,
+        num_valid: Optional[torch.Tensor] = None,
     ) -> None:
         ...
 
@@ -195,6 +198,7 @@ class BaseDynamicEmbeddingOptimizer(abc.ABC):
         emb_dim: int,
         value_dim: int,
         all_dims_vec4: bool,
+        num_valid: Optional[torch.Tensor] = None,
     ) -> None:
         ...
 
@@ -250,6 +254,9 @@ class BaseDynamicEmbeddingOptimizer(abc.ABC):
         optim_states: torch.Tensor,
         indices: Optional[torch.Tensor] = None,
         emb_dims: Optional[Union[int, torch.Tensor]] = None,
+        num_valid: Optional[torch.Tensor] = None,
+        table_ids: Optional[torch.Tensor] = None,
+        table_emb_dims: Optional[torch.Tensor] = None,
     ) -> None:
         """Reset a batch of rows' optimizer state to its initial value, in place.
 
@@ -272,9 +279,24 @@ class BaseDynamicEmbeddingOptimizer(abc.ABC):
         wider than a given row's own state and the width alone cannot be
         divided up.
 
+        ``num_valid`` (a one-element int64 CUDA tensor) is the counted form: only
+        the first ``n = num_valid`` entries of the batch are live, and nothing
+        past them is read. ``indices``, if given, is then a capacity-sized int64
+        vector whose first ``n`` entries select the rows of ``optim_states`` to
+        reset (a negative one is skipped); without it the rows ``0..n-1`` are
+        reset. It runs entirely on the device -- no torch indexing, no host read
+        -- and does not use ``emb_dims``. ``table_ids`` (the table each row of
+        ``optim_states`` belongs to, aligned with its rows rather than with
+        ``indices``) and ``table_emb_dims`` (the per-table embedding widths, an
+        int64 CUDA tensor) stand in for it where the optimizer needs row widths:
+        FTRL with a non-zero ``initial_accumulator_value``.
+
         The default fills every element with the same scalar.
         """
         fill = self.get_initial_optimizer_state()
+        if num_valid is not None:
+            fill_rows(optim_states, fill, num_valid, indices)
+            return
         if indices is None:
             optim_states.fill_(fill)
         else:
@@ -363,6 +385,7 @@ class SGDDynamicEmbeddingOptimizer(BaseDynamicEmbeddingOptimizer):
         emb_dim: int,
         value_dim: int,
         all_dims_vec4: bool,
+        num_valid: Optional[torch.Tensor] = None,
     ) -> None:
         sgd_update_for_padded_buffer(
             grads,
@@ -373,6 +396,7 @@ class SGDDynamicEmbeddingOptimizer(BaseDynamicEmbeddingOptimizer):
             value_dim,
             all_dims_vec4,
             self._opt_args.learning_rate,
+            num_valid=num_valid,
         )
 
     def fused_update_for_flat_table(
@@ -386,6 +410,7 @@ class SGDDynamicEmbeddingOptimizer(BaseDynamicEmbeddingOptimizer):
         max_emb_dim: int,
         all_dims_vec4: bool,
         table_dtype: torch.dtype,
+        num_valid: Optional[torch.Tensor] = None,
     ) -> None:
         sgd_update_for_flat_table(
             grads,
@@ -398,6 +423,7 @@ class SGDDynamicEmbeddingOptimizer(BaseDynamicEmbeddingOptimizer):
             all_dims_vec4,
             self._opt_args.learning_rate,
             torch_to_dyn_emb(table_dtype).value,
+            num_valid=num_valid,
         )
 
     def get_opt_args(self):
@@ -450,6 +476,7 @@ class AdamDynamicEmbeddingOptimizer(BaseDynamicEmbeddingOptimizer):
         emb_dim: int,
         value_dim: int,
         all_dims_vec4: bool,
+        num_valid: Optional[torch.Tensor] = None,
     ) -> None:
         adam_update_for_padded_buffer(
             grads,
@@ -465,6 +492,7 @@ class AdamDynamicEmbeddingOptimizer(BaseDynamicEmbeddingOptimizer):
             self._opt_args.eps,
             self._opt_args.weight_decay,
             self._iterations,
+            num_valid=num_valid,
         )
 
     def fused_update_for_flat_table(
@@ -478,6 +506,7 @@ class AdamDynamicEmbeddingOptimizer(BaseDynamicEmbeddingOptimizer):
         max_emb_dim: int,
         all_dims_vec4: bool,
         table_dtype: torch.dtype,
+        num_valid: Optional[torch.Tensor] = None,
     ) -> None:
         adam_update_for_flat_table(
             grads,
@@ -495,6 +524,7 @@ class AdamDynamicEmbeddingOptimizer(BaseDynamicEmbeddingOptimizer):
             max_emb_dim,
             all_dims_vec4,
             torch_to_dyn_emb(table_dtype).value,
+            num_valid=num_valid,
         )
 
     def get_opt_args(self):
@@ -538,6 +568,7 @@ class AdaGradDynamicEmbeddingOptimizer(BaseDynamicEmbeddingOptimizer):
         emb_dim: int,
         value_dim: int,
         all_dims_vec4: bool,
+        num_valid: Optional[torch.Tensor] = None,
     ) -> None:
         adagrad_update_for_padded_buffer(
             grads,
@@ -549,6 +580,7 @@ class AdaGradDynamicEmbeddingOptimizer(BaseDynamicEmbeddingOptimizer):
             all_dims_vec4,
             self._opt_args.learning_rate,
             self._opt_args.eps,
+            num_valid=num_valid,
         )
 
     def fused_update_for_flat_table(
@@ -562,6 +594,7 @@ class AdaGradDynamicEmbeddingOptimizer(BaseDynamicEmbeddingOptimizer):
         max_emb_dim: int,
         all_dims_vec4: bool,
         table_dtype: torch.dtype,
+        num_valid: Optional[torch.Tensor] = None,
     ) -> None:
         adagrad_update_for_flat_table(
             grads,
@@ -575,6 +608,7 @@ class AdaGradDynamicEmbeddingOptimizer(BaseDynamicEmbeddingOptimizer):
             max_emb_dim,
             all_dims_vec4,
             torch_to_dyn_emb(table_dtype).value,
+            num_valid=num_valid,
         )
 
     def get_opt_args(self):
@@ -615,6 +649,7 @@ class RowWiseAdaGradDynamicEmbeddingOptimizer(BaseDynamicEmbeddingOptimizer):
         emb_dim: int,
         value_dim: int,
         all_dims_vec4: bool,
+        num_valid: Optional[torch.Tensor] = None,
     ) -> None:
         rowwise_adagrad_for_padded_buffer(
             grads,
@@ -627,6 +662,7 @@ class RowWiseAdaGradDynamicEmbeddingOptimizer(BaseDynamicEmbeddingOptimizer):
             self._opt_args.learning_rate,
             self._opt_args.eps,
             torch_to_dyn_emb(self.get_state_dtype(values.dtype)).value,
+            num_valid=num_valid,
         )
 
     def fused_update_for_flat_table(
@@ -640,6 +676,7 @@ class RowWiseAdaGradDynamicEmbeddingOptimizer(BaseDynamicEmbeddingOptimizer):
         max_emb_dim: int,
         all_dims_vec4: bool,
         table_dtype: torch.dtype,
+        num_valid: Optional[torch.Tensor] = None,
     ) -> None:
         rowwise_adagrad_for_flat_table(
             grads,
@@ -654,6 +691,7 @@ class RowWiseAdaGradDynamicEmbeddingOptimizer(BaseDynamicEmbeddingOptimizer):
             all_dims_vec4,
             torch_to_dyn_emb(table_dtype).value,
             torch_to_dyn_emb(self.get_state_dtype(table_dtype)).value,
+            num_valid=num_valid,
         )
 
     def get_opt_args(self):
@@ -713,10 +751,31 @@ class RowWiseAdaGradDynamicEmbeddingOptimizer(BaseDynamicEmbeddingOptimizer):
         optim_states: torch.Tensor,
         indices: Optional[torch.Tensor] = None,
         emb_dims: Optional[Union[int, torch.Tensor]] = None,
+        num_valid: Optional[torch.Tensor] = None,
+        table_ids: Optional[torch.Tensor] = None,
+        table_emb_dims: Optional[torch.Tensor] = None,
     ) -> None:
         """Seed the slot with the initial accumulator value, at the state's precision."""
         if not self._packs_fp32_in_words(optim_states.dtype):
-            super().reset_optimizer_states(optim_states, indices, emb_dims)
+            super().reset_optimizer_states(
+                optim_states,
+                indices,
+                emb_dims,
+                num_valid,
+                table_ids,
+                table_emb_dims,
+            )
+            return
+        if num_valid is not None:
+            # The accumulator is an fp32 spread over pairs of 16-bit words, which
+            # is what the fp32_words fill writes; no torch indexing here.
+            fill_rows(
+                optim_states,
+                self.get_initial_optimizer_state(),
+                num_valid,
+                indices,
+                fp32_words=True,
+            )
             return
         pattern = _fp32_as_words(
             torch.full(
@@ -871,6 +930,7 @@ class FTRLDynamicEmbeddingOptimizer(BaseDynamicEmbeddingOptimizer):
         emb_dim: int,
         value_dim: int,
         all_dims_vec4: bool,
+        num_valid: Optional[torch.Tensor] = None,
     ) -> None:
         ftrl_update_for_padded_buffer(
             grads,
@@ -886,6 +946,7 @@ class FTRLDynamicEmbeddingOptimizer(BaseDynamicEmbeddingOptimizer):
             self._opt_args.l1_reg,
             self._opt_args.l2_reg,
             self._opt_args.group_lasso_reg,
+            num_valid=num_valid,
         )
 
     def fused_update_for_flat_table(
@@ -899,6 +960,7 @@ class FTRLDynamicEmbeddingOptimizer(BaseDynamicEmbeddingOptimizer):
         max_emb_dim: int,
         all_dims_vec4: bool,
         table_dtype: torch.dtype,
+        num_valid: Optional[torch.Tensor] = None,
     ) -> None:
         ftrl_update_for_flat_table(
             grads,
@@ -916,6 +978,7 @@ class FTRLDynamicEmbeddingOptimizer(BaseDynamicEmbeddingOptimizer):
             all_dims_vec4,
             torch_to_dyn_emb(table_dtype).value,
             self._opt_args.group_lasso_reg,
+            num_valid=num_valid,
         )
 
     def get_opt_args(self):
@@ -962,12 +1025,30 @@ class FTRLDynamicEmbeddingOptimizer(BaseDynamicEmbeddingOptimizer):
         optim_states: torch.Tensor,
         indices: Optional[torch.Tensor] = None,
         emb_dims: Optional[Union[int, torch.Tensor]] = None,
+        num_valid: Optional[torch.Tensor] = None,
+        table_ids: Optional[torch.Tensor] = None,
+        table_emb_dims: Optional[torch.Tensor] = None,
     ) -> None:
         accum = self._opt_args.initial_accumulator_value
         if accum == 0.0:
             # Both halves start at zero, so the uniform fill is exact and the
             # row widths do not matter.
-            super().reset_optimizer_states(optim_states, indices)
+            super().reset_optimizer_states(optim_states, indices, num_valid=num_valid)
+            return
+
+        if num_valid is not None:
+            # Counted form: the boundary between `linear` and `accum` comes from
+            # each row's table, not from emb_dims.
+            if table_ids is None or table_emb_dims is None:
+                raise ValueError(
+                    "FTRL keeps `linear` and `accum` side by side in one state "
+                    "region, so resetting it with a non-zero "
+                    "initial_accumulator_value and num_valid needs table_ids and "
+                    "table_emb_dims to locate the boundary between them."
+                )
+            reset_ftrl_states(
+                optim_states, table_ids, table_emb_dims, accum, num_valid, indices
+            )
             return
 
         if emb_dims is None:
