@@ -17,9 +17,12 @@
 
 host_sync_probe builds BatchedDynamicEmbeddingTablesV2 modules in every storage layout,
 drives them through scenarios (all hit, miss, miss and evict, eval, growth) and counts the
-host syncs of each measured step; a case listed in host_sync_probe.INHERENT (an external
-PS, a table growth event) is excused. Everything else must read zero, the configs with
-DEMB_DETERMINISM_MODE (``*_determ``) included.
+blocking host syncs of each measured step (cudaStreamSynchronize, cudaDeviceSynchronize,
+cudaEventSynchronize, synchronous cudaMemcpy and a pageable D2H copy: not the allocator events
+of a growth, which test_sync_ratchet.py bounds); the syncs at a call site listed in
+host_sync_probe.INHERENT (the external PS of the host-sized contract) are excused. Everything
+else must read zero, the configs with DEMB_DETERMINISM_MODE (``*_determ``) and the ones that
+grow a table included.
 
 The removal lands in steps, so the test applies to a config once budgets.json (see
 test_sync_ratchet.py) has brought every case of it that is not inherent to zero. Until

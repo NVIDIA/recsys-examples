@@ -9,8 +9,14 @@ Event.synchronize, cudaStreamSynchronize / cudaDeviceSynchronize /
 cudaEventSynchronize / synchronous cudaMemcpy, cudaMemcpyAsync D2H into
 pageable memory, .item(), .cpu(), .tolist(), int()/bool() of a CUDA tensor,
 nonzero, boolean-mask indexing, masked_select, unique, repeat_interleave
-without output_size, H2D copies from pageable memory with non_blocking=False,
-and cudaMalloc / cudaFree / cudaHostAlloc on the hot path.
+without output_size, and H2D copies from pageable memory with non_blocking=False.
+Those are the BLOCKING kinds (ss ds es ms pd, HOST_BLOCKING_KINDS): what the
+acceptance (check_zero, test_no_host_syncs.py) holds to zero and what the budgets
+bound.  The allocator events -- cudaMalloc / cudaFree / cudaHostAlloc, pages mapped
+(cuMemCreate / cuMemMap / cuMemSetAccess) or host memory registered (cudaHostRegister)
+-- are counted as well, as the kind 'al', but apart: they are not blocking by
+themselves (a growth maps pages by design), and test_sync_ratchet.py bounds them
+separately, per window and per growth.
 
 The tool builds BatchedDynamicEmbeddingTablesV2 modules in several storage
 layouts, optimizers, dtypes, key types, poolings, admission and score
@@ -201,6 +207,12 @@ SYNC_KIND = {
     "cuMemHostUnregister": "al",
 }
 BLOCKING_KINDS = ("ss", "ds", "es", "ms")  # what PyTorch's sync debug mode can flag
+# What the acceptance holds to zero (check_zero) and what the budgets bound
+# (sync_budgets.METRIC, ``mean["blocking"]``): every kind that makes the host wait for the
+# device or read a value of it, i.e. all of KINDS but the allocator's ``al``. Allocator
+# events are counted apart -- test_sync_ratchet.py bounds them per window and per growth --
+# so the pages a growth maps or the host memory it registers are not blocking syncs here.
+HOST_BLOCKING_KINDS = BLOCKING_KINDS + ("pd",)
 # runtime calls that may sit between a pageable D2H memcpy and its stream sync
 NOISE_RT = {
     "cudaStreamIsCapturing",
@@ -1852,9 +1864,10 @@ def _summarize(
 ) -> Dict[str, Any]:
     cap = probe.cap
     out: Dict[str, Any] = {}
-    site_excused = [
-        0
-    ] * iters  # syncs per iteration whose call site is in an INHERENT file
+    # BLOCKING syncs per iteration whose call site is in an INHERENT file. Only those: the
+    # allocator events of an excused site are not excused by it (they are bounded apart), and
+    # an excuse that is larger than what it is subtracted from would hide a sync elsewhere.
+    site_excused = [0] * iters
 
     def excused(file_short: str) -> bool:
         return any(fnmatch.fnmatch(file_short, g) for g in site_globs)
@@ -1914,6 +1927,7 @@ def _summarize(
                 s["iters"].add(i)
                 if (
                     owner_kind == "ext"
+                    and k in HOST_BLOCKING_KINDS
                     and ev["site"]
                     and excused(ev["site"].split(":")[0])
                 ):
@@ -2070,11 +2084,18 @@ def _summarize(
     if probe.trace_events is not None:
         py_a = py_direct  # warnings that name the line of a direct python-level sync
     py_vis = [py_a[i] + py_c[i] for i in range(iters)]
+    # what the profiler saw of the blocking kinds; a python-visible sync is blocking by
+    # nature, so it bounds the blocking count from below exactly as it does the total
+    prof_blocking = [
+        sum(per_kind[k][i] for k in HOST_BLOCKING_KINDS) for i in range(iters)
+    ]
     if probe.trace_events is not None:
         totals = [max(prof_total[i], py_vis[i]) for i in range(iters)]
+        blocking = [max(prof_blocking[i], py_vis[i]) for i in range(iters)]
         src = "profiler+python"
     else:
         totals = py_vis
+        blocking = list(py_vis)
         src = "python-only (no profiler: syncs inside C++ extension calls are NOT seen)"
     if (
         probe.trace_events is not None
@@ -2089,15 +2110,17 @@ def _summarize(
                 "C++-internal ATen syncs: profiler=%d, sync-debug stderr lines=%d + late python "
                 "warnings=%d" % (ca, se, dp)
             )
+    # per_iter_total: every kind, the allocator's included; per_iter_blocking: the kinds of
+    # HOST_BLOCKING_KINDS only, which is what check_zero reads; inherent_site_per_iter: how many
+    # of the blocking ones sit at an excused call site (see above)
     out["per_iter_total"] = totals
+    out["per_iter_blocking"] = blocking
     out["inherent_site_per_iter"] = site_excused
     out["inherent_site_mean"] = sum(site_excused) / float(iters)
     out["per_iter_kind"] = per_kind
     out["mean"] = {k: sum(v) / float(iters) for k, v in per_kind.items()}
     out["mean"]["total"] = sum(totals) / float(iters)
-    out["mean"]["blocking"] = sum(
-        sum(per_kind[k][i] for k in BLOCKING_KINDS + ("pd",)) for i in range(iters)
-    ) / float(iters)
+    out["mean"]["blocking"] = sum(blocking) / float(iters)  # the budgets' metric
     out["total_source"] = src
     out["python_visible"] = {
         "warn": sum(py_a) / float(iters),
@@ -2234,9 +2257,10 @@ def measure(
     """Run the census in this process and return a structured report.
 
     report["results"] has one dict per (config, scenario, mode) with
-    mean syncs per iteration by kind (res["mean"]), per-iteration totals,
-    ranked call sites (res["sites"]) and diagnostics.  Use check_zero(report)
-    to list non-inherent cases that still sync.
+    mean syncs per iteration by kind (res["mean"]), per-iteration totals and blocking
+    counts (res["per_iter_total"], res["per_iter_blocking"]), ranked call sites
+    (res["sites"]) and diagnostics.  Use check_zero(report) to list non-inherent cases
+    that still make a blocking sync.
     """
     import torch
 
@@ -2294,10 +2318,11 @@ def measure(
                 if verbose:
                     m = r.get("mean", {})
                     print(
-                        "[probe]   -> %s total/iter=%s (%.1fs) %s"
+                        "[probe]   -> %s blocking/iter=%s al/iter=%s (%.1fs) %s"
                         % (
                             r["status"],
-                            "%.2f" % m["total"] if "total" in m else "-",
+                            "%.2f" % m["blocking"] if "blocking" in m else "-",
+                            "%.2f" % m["al"] if "al" in m else "-",
                             r.get("seconds", 0),
                             r.get("error", ""),
                         ),
@@ -2312,9 +2337,57 @@ def measure(
     }
 
 
+def blocking_per_iter(r: Dict[str, Any]) -> List[int]:
+    """The blocking syncs (HOST_BLOCKING_KINDS) of every measured iteration of a case.
+
+    Not ``per_iter_total``, which holds the allocator events (kind ``al``) too: a growth maps
+    pages and registers host memory by design, and test_sync_ratchet.py bounds those apart.
+    A report from before the series existed (``per_iter_blocking`` absent) is read from its
+    per-kind series, and one that has neither only has the total to offer.
+    """
+    series = r.get("per_iter_blocking")
+    if series is not None:
+        return list(series)
+    kinds = r.get("per_iter_kind")
+    if kinds:
+        return [
+            sum(kinds[k][i] for k in HOST_BLOCKING_KINDS if k in kinds)
+            for i in range(len(r["per_iter_total"]))
+        ]
+    return list(r["per_iter_total"])
+
+
+def effective_blocking_per_iter(
+    r: Dict[str, Any], allow_inherent: bool = True
+) -> List[int]:
+    """Per iteration, the blocking syncs of a case outside its INHERENT call sites.
+
+    The excused count of an iteration (``inherent_site_per_iter``: blocking syncs at an
+    excused site) is taken off that iteration's blocking count and no further: an iteration
+    never goes below zero, so the excuse of one cannot pay for a sync of another, and an
+    allocator event at an excused site (it is not a blocking sync, see _summarize) is not
+    taken off a sync elsewhere.
+    """
+    blocking = blocking_per_iter(r)
+    excused = (r.get("inherent_site_per_iter") if allow_inherent else None) or [
+        0
+    ] * len(blocking)
+    return [max(0, b - h) for b, h in zip(blocking, excused)]
+
+
+def _blocking_site(site: Dict[str, Any]) -> bool:
+    """Whether a ranked call site of a result has a blocking sync at it (a python warning
+    that no profiler event matched has no kind recorded, and is one by nature); a site that
+    only allocates is not."""
+    kinds = site.get("kinds") or {}
+    return not kinds or any(k in HOST_BLOCKING_KINDS for k in kinds)
+
+
 def check_zero(report: Dict[str, Any], allow_inherent: bool = True) -> List[str]:
-    """Violations: measured (config, scenario, mode) that sync, are not marked
-    INHERENT, or errored.  Empty list == zero host syncs."""
+    """Violations: measured (config, scenario, mode) that make a blocking sync (the kinds
+    of HOST_BLOCKING_KINDS; allocator events are not counted, the ratchet bounds them),
+    that are not marked INHERENT, or that errored.  Empty list == zero blocking host
+    syncs."""
     bad: List[str] = []
     for r in report["results"]:
         tag = "%s/%s/%s" % (r["config"], r["scenario"], r["mode"])
@@ -2335,11 +2408,7 @@ def check_zero(report: Dict[str, Any], allow_inherent: bool = True) -> List[str]
             continue
         if allow_inherent and r.get("inherent"):
             continue
-        site_excused = r.get("inherent_site_per_iter") or [0] * len(r["per_iter_total"])
-        eff = [
-            t - (h if allow_inherent else 0)
-            for t, h in zip(r["per_iter_total"], site_excused)
-        ]
+        eff = effective_blocking_per_iter(r, allow_inherent)
         if sum(eff) > 0:
             globs = (
                 [g for g, _ in inherent_site_globs(r["config"], r["scenario"])]
@@ -2350,12 +2419,13 @@ def check_zero(report: Dict[str, Any], allow_inherent: bool = True) -> List[str]
                 (
                     x["site"]
                     for x in r.get("sites", [])
-                    if not any(fnmatch.fnmatch(x.get("file", ""), g) for g in globs)
+                    if _blocking_site(x)
+                    and not any(fnmatch.fnmatch(x.get("file", ""), g) for g in globs)
                 ),
                 "?",
             )
             bad.append(
-                "%s: %.2f syncs/iter (max %d) outside inherent sites, top site %s"
+                "%s: %.2f blocking syncs/iter (max %d) outside inherent sites, top site %s"
                 % (tag, sum(eff) / float(len(eff)), max(eff), top)
             )
     return bad
@@ -2370,7 +2440,8 @@ def measure_callable(
 
     Returns the per-case summary that measure() keeps in report["results"]:
     "mean" (syncs per iteration by kind plus "total" and "blocking"),
-    "per_iter_total", ranked "sites", "origin", "python_visible" and "notes".
+    "per_iter_total", "per_iter_blocking", ranked "sites", "origin", "python_visible"
+    and "notes".
     """
     import torch
 
@@ -2618,19 +2689,28 @@ def selftest(
 # --------------------------------------------------------------------------
 # Before / after comparison of two reports (CPU only)
 # --------------------------------------------------------------------------
-def _effective_total(r: Dict[str, Any]) -> float:
-    """Mean syncs per iteration outside INHERENT call sites (0 for a whole-case INHERENT)."""
-    site_excused = r.get("inherent_site_per_iter") or [0] * len(r["per_iter_total"])
-    eff = [t - h for t, h in zip(r["per_iter_total"], site_excused)]
+def _effective_blocking(r: Dict[str, Any]) -> float:
+    """Mean blocking syncs per iteration outside INHERENT call sites (see
+    effective_blocking_per_iter; the allocator events are not among them)."""
+    eff = effective_blocking_per_iter(r)
     return sum(eff) / float(len(eff))
+
+
+def _mean_blocking(r: Dict[str, Any]) -> float:
+    """The mean blocking syncs per iteration of a result: the budgets' metric. A report
+    from before that metric existed only has the total."""
+    mean = r["mean"]
+    return mean["blocking"] if "blocking" in mean else mean["total"]
 
 
 def compare_reports(
     before: Dict[str, Any], after: Dict[str, Any], tol: float = 1e-9
 ) -> Dict[str, Any]:
-    """Per (config, scenario, mode): mean syncs/iter before and after.  "regressed"
-    = more syncs after than before; "remaining" = after-cases that still sync
-    outside INHERENT; "missing" = cases of `before` that `after` did not measure."""
+    """Per (config, scenario, mode): mean blocking syncs/iter before and after (the kinds of
+    HOST_BLOCKING_KINDS: allocator events are not syncs, see test_sync_ratchet.py).
+    "regressed" = more blocking syncs after than before; "remaining" = after-cases that
+    still make a blocking sync outside INHERENT; "missing" = cases of `before` that `after`
+    did not measure."""
     key = lambda r: (r["config"], r["scenario"], r["mode"])  # noqa: E731
     b = collections.OrderedDict(
         (key(r), r) for r in before["results"] if r["status"] == "ok"
@@ -2643,13 +2723,13 @@ def compare_reports(
         if ra is None:
             missing.append(k)
             continue
-        tb, ta = rb["mean"]["total"], ra["mean"]["total"]
+        tb, ta = _mean_blocking(rb), _mean_blocking(ra)
         rows.append(
             {
                 "case": k,
                 "before": tb,
                 "after": ta,
-                "after_effective": _effective_total(ra),
+                "after_effective": _effective_blocking(ra),
                 "inherent": bool(ra.get("inherent")),
                 "delta": ta - tb,
             }
@@ -2693,8 +2773,8 @@ def format_compare(cmp: Dict[str, Any], only_changed: bool = False) -> str:
         )
     L.append("")
     L.append(
-        "%d cases: %d improved, %d unchanged, %d regressed, %d still sync outside INHERENT, %d missing "
-        "from the second report"
+        "%d cases: %d improved, %d unchanged, %d regressed, %d still make a blocking sync outside "
+        "INHERENT, %d missing from the second report"
         % (
             len(cmp["rows"]),
             len(cmp["improved"]),
@@ -2754,7 +2834,7 @@ def _f(x: float) -> str:
 
 
 def format_pivot(report: Dict[str, Any]) -> str:
-    """config x scenario matrix of mean syncs per iteration, one block per mode."""
+    """config x scenario matrix of mean blocking syncs per iteration, one block per mode."""
     L: List[str] = []
     scs = [k for k in SCENARIO_DOC]
     for mode in MODES:
@@ -2768,9 +2848,9 @@ def format_pivot(report: Dict[str, Any]) -> str:
         if not rows:
             continue
         L.append(
-            "PIVOT mode=%s (syncs per iteration; '*' = case marked INHERENT, '(-n)' = n of them are in "
-            "INHERENT call sites, '[a-b]' = per-iteration range, 'E' = error, '-' = n/a)"
-            % mode
+            "PIVOT mode=%s (blocking syncs per iteration, allocator events not counted; '*' = case "
+            "marked INHERENT, '(-n)' = n of them are in INHERENT call sites, '[a-b]' = per-iteration "
+            "range, 'E' = error, '-' = n/a)" % mode
         )
         table: List[List[str]] = []
         for cfg, d in rows.items():
@@ -2782,8 +2862,8 @@ def format_pivot(report: Dict[str, Any]) -> str:
                 elif r["status"] != "ok":
                     cells.append("E")
                 else:
-                    pt = r["per_iter_total"]
-                    c = "%.3g" % r["mean"]["total"]
+                    pt = blocking_per_iter(r)
+                    c = "%.3g" % _mean_blocking(r)
                     if min(pt) != max(pt):
                         c += "[%d-%d]" % (min(pt), max(pt))
                     if r.get("inherent_site_mean"):
@@ -2810,7 +2890,9 @@ def format_pivot(report: Dict[str, Any]) -> str:
 
 
 def format_top_sites(report: Dict[str, Any], mode: str = "plain", n: int = 30) -> str:
-    """Call sites ranked by the number of cases they sync in (one mode)."""
+    """Call sites ranked by the number of cases they sync in (one mode): the ones that block
+    the host first, then the ones that only allocate (kind ``al``, not syncs: the ratchet
+    bounds those)."""
     agg: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
     ncases = 0
     for r in report["results"]:
@@ -2821,22 +2903,46 @@ def format_top_sites(report: Dict[str, Any], mode: str = "plain", n: int = 30) -
             key = (s["source"], s["site"], s.get("api", ""))
             a = agg.setdefault(
                 key,
-                {"cases": 0, "max": 0.0, "ops": set(), "snippet": s.get("snippet", "")},
+                {
+                    "cases": 0,
+                    "max": 0.0,
+                    "ops": set(),
+                    "blocking": False,
+                    "snippet": s.get("snippet", ""),
+                },
             )
             a["cases"] += 1
             a["max"] = max(a["max"], s["per_iter"])
             a["ops"].update(s.get("ops", {}) or [s.get("api", "")])
+            a["blocking"] = a["blocking"] or _blocking_site(s)
     rows = sorted(
-        agg.items(), key=lambda kv: (-kv[1]["cases"], -kv[1]["max"], kv[0][1])
+        agg.items(),
+        key=lambda kv: (
+            not kv[1]["blocking"],
+            -kv[1]["cases"],
+            -kv[1]["max"],
+            kv[0][1],
+        ),
     )
     L = [
         "TOP CALL SITES across the %d measured cases of mode=%s (cases = in how many it syncs, "
-        "max/it = the largest count per iteration in any case)" % (ncases, mode)
+        "max/it = the largest count per iteration in any case; '(alloc)' = the site only "
+        "allocates or maps pages: not a sync)" % (ncases, mode)
     ]
     L.append("%6s %7s  %-9s %s" % ("cases", "max/it", "source", "site (api / op)"))
     for (src, site, api), a in rows[:n]:
         what = api or ",".join(sorted(x for x in a["ops"] if x))
-        L.append("%6d %7s  %-9s %s  [%s]" % (a["cases"], _f(a["max"]), src, site, what))
+        L.append(
+            "%6d %7s  %-9s %s  [%s]%s"
+            % (
+                a["cases"],
+                _f(a["max"]),
+                src,
+                site,
+                what,
+                "" if a["blocking"] else " (alloc)",
+            )
+        )
         if a["snippet"]:
             L.append("%17s| %s" % ("", a["snippet"]))
     return "\n".join(L)
@@ -2871,21 +2977,26 @@ def format_report(report: Dict[str, Any], sites: int = 6, detail: str = "all") -
     )
     L.append("kinds: " + "; ".join("%s=%s" % (k, KIND_DOC[k]) for k in KINDS))
     L.append(
-        "columns: tot=syncs/iter (profiler authority, merged with python-visible); "
+        "columns: tot=every event per iteration (profiler authority, merged with python-visible), "
+        "blk=the blocking ones (ss+ds+es+ms+pd: what the budgets bound and the acceptance holds "
+        "to zero; al, the allocator events, are the ratchet's); "
         "py=python-delivered sync warnings+explicit sync calls; "
         "cppA=sync inside a C++ ext call under an ATen op (.cpu()/.item() issued from C++); "
         "cppR=raw CUDA runtime sync/alloc inside a C++ ext call or outside any ATen op; "
-        "[min-max]=per-iteration range of tot"
+        "[min-max]=per-iteration range of blk"
     )
     L.append("")
     L.append(format_pivot(report))
     L.append(format_top_sites(report))
     L.append("")
-    hdr = "%-24s %-10s %-8s %6s | %5s %5s %5s %5s %5s %5s | %5s %5s %5s %5s | %s" % (
+    hdr = (
+        "%-24s %-10s %-8s %6s %6s | %5s %5s %5s %5s %5s %5s | %5s %5s %5s %5s | %s"
+    ) % (
         "config",
         "scenario",
         "mode",
         "tot",
+        "blk",
         "ss",
         "ds",
         "es",
@@ -2903,18 +3014,19 @@ def format_report(report: Dict[str, Any], sites: int = 6, detail: str = "all") -
     for r in report["results"]:
         if r["status"] != "ok":
             L.append(
-                "%-24s %-10s %-8s %6s | %s"
+                "%-24s %-10s %-8s %6s %6s | %s"
                 % (
                     r["config"],
                     r["scenario"],
                     r["mode"],
                     r["status"].upper(),
+                    "",
                     (r.get("error") or "")[:110],
                 )
             )
             continue
         mk = r["mean"]
-        pt = r["per_iter_total"]
+        pt = blocking_per_iter(r)
         flags = []
         if r.get("inherent"):
             flags.append("INHERENT")
@@ -2929,12 +3041,13 @@ def format_report(report: Dict[str, Any], sites: int = 6, detail: str = "all") -
         py = r["python_visible"]["warn"] + r["python_visible"]["explicit"]
         cppr = org["cpp_raw"] + org["direct_raw"]
         L.append(
-            "%-24s %-10s %-8s %6s | %5s %5s %5s %5s %5s %5s | %5s %5s %5s %5s | %s%s"
+            "%-24s %-10s %-8s %6s %6s | %5s %5s %5s %5s %5s %5s | %5s %5s %5s %5s | %s%s"
             % (
                 r["config"],
                 r["scenario"],
                 r["mode"],
                 _f(mk["total"]),
+                _f(_mean_blocking(r)),
                 _f(mk["ss"]),
                 _f(mk["ds"]),
                 _f(mk["es"]),
@@ -2976,11 +3089,12 @@ def format_report(report: Dict[str, Any], sites: int = 6, detail: str = "all") -
             continue
         L.append("")
         L.append(
-            "### %s / %s / %s  tot=%s/iter  regime=%s (%s)%s"
+            "### %s / %s / %s  blk=%s/iter tot=%s/iter  regime=%s (%s)%s"
             % (
                 r["config"],
                 r["scenario"],
                 r["mode"],
+                _f(_mean_blocking(r)),
                 _f(r["mean"]["total"]),
                 "ok" if r["regime"]["ok"] else "SUSPECT",
                 r["regime"]["note"],
@@ -3185,7 +3299,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ap.add_argument(
         "--assert-zero",
         action="store_true",
-        help="exit 1 if a case not in INHERENT syncs (2 if a case errored)",
+        help="exit 1 if a case not in INHERENT makes a blocking sync (2 if a case "
+        "errored); allocator events are not counted",
     )
     ap.add_argument(
         "--list", action="store_true", help="list configs and scenarios, then exit"
@@ -3218,8 +3333,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         "--diff",
         nargs=2,
         metavar=("BEFORE.json", "AFTER.json"),
-        help="CPU only: compare two saved reports case by case, then exit "
-        "(exit 1 if AFTER regressed anywhere or still syncs outside INHERENT)",
+        help="CPU only: compare two saved reports case by case (blocking syncs), then exit "
+        "(exit 1 if AFTER regressed anywhere or still makes a blocking sync outside INHERENT)",
     )
     ap.add_argument(
         "--render",
@@ -3345,7 +3460,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             for b in bad:
                 print("  " + b)
             return 2 if errs and len(errs) == len(bad) else 1
-        print("ASSERT-ZERO: ok (every non-inherent case has zero host syncs)")
+        print("ASSERT-ZERO: ok (every non-inherent case has zero blocking host syncs)")
     return 0
 
 

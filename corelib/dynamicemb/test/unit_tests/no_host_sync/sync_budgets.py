@@ -56,7 +56,8 @@ import host_sync_probe as hsp  # noqa: E402
 
 BUDGETS_PATH = os.path.join(HERE, "budgets.json")
 
-# What a budget bounds: the mean of host_sync_probe's "blocking" total per iteration.
+# What a budget bounds: the mean of host_sync_probe's "blocking" total per iteration -- the
+# series (per_iter_blocking) that check_zero holds to zero, without the allocator events.
 METRIC = "blocking"
 # The census the budgets were taken with (the probe's own defaults).
 CENSUS_ITERS = 8

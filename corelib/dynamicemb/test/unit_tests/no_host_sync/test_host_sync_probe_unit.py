@@ -234,6 +234,19 @@ def result_of(config, scenario, probe=None, globs=()):
     return r
 
 
+def zeroed(r):
+    """``r`` with no sync of any kind in either iteration."""
+    r.update(
+        per_iter_total=[0, 0],
+        per_iter_blocking=[0, 0],
+        per_iter_kind={k: [0, 0] for k in hsp.KINDS},
+        inherent_site_per_iter=[0, 0],
+        sites=[],
+    )
+    r["mean"] = {k: 0.0 for k in list(hsp.KINDS) + ["total", "blocking"]}
+    return r
+
+
 def report_of(*results):
     return {
         "meta": {
@@ -284,8 +297,7 @@ def test_check_zero_site_level_and_case_level_inherent():
     # allow_inherent=False reports everything
     assert len(hsp.check_zero(report_of(g), allow_inherent=False)) == 1
     # a clean case passes
-    clean = result_of("hbm_only", "all_hit")
-    clean.update(per_iter_total=[0, 0], inherent_site_per_iter=[0, 0], sites=[])
+    clean = zeroed(result_of("hbm_only", "all_hit"))
     assert hsp.check_zero(report_of(clean)) == []
     # errors are violations, skipped cases are not
     err = {
@@ -387,6 +399,254 @@ def test_the_old_contract_ps_is_excused_by_call_site_only():
     bad = hsp.check_zero(report_of(ps))
     assert len(bad) == 1 and "cache_ps/miss/plain" in bad[0], bad
     assert "outside inherent sites" in bad[0]
+
+
+# --------------------------------------------------------------------------
+# the acceptance counts the blocking kinds only
+# --------------------------------------------------------------------------
+PS_SITE = PS_FILE + ":900:find"
+OWN_SITE = "dynamicemb/types.py:50:f"
+GROWTH_SITE = "dynamicemb/extendable_tensor.py:227:extend"
+
+
+def trace_of(*iterations):
+    """A chrome trace with one window per iteration. An iteration is a list of
+    (runtime or driver call, call site of the extension range it sits in, or None)."""
+    ev = []
+    corr = 100
+    for i, calls in enumerate(iterations):
+        t0 = 1000.0 + 2000.0 * i
+        ev.append(X("user_annotation", "PROBE_ITER|%d" % i, t0, 1000))
+        for j, (api, site) in enumerate(calls):
+            ts = t0 + 100 + 150 * j
+            corr += 1
+            if site is not None:
+                ev.append(X("user_annotation", "PROBE_EXT|f|%s" % site, ts - 10, 100))
+            driver = api.startswith("cu") and not api.startswith("cuda")
+            cat = "cuda_driver" if driver else "cuda_runtime"
+            ev.append(X(cat, api, ts, 2.0, 1, correlation=corr, cbid=0))
+    return ev
+
+
+def probe_of(*iterations):
+    p = hsp.Probe(use_profiler=True)
+    p.trace_events = trace_of(*iterations)
+    return p
+
+
+def test_an_iteration_that_only_allocates_is_not_a_violation():
+    """The first census of the merged tree: a growth maps pages (cuMemCreate, cuMemMap,
+    cuMemSetAccess), registers a host buffer and allocates a key map, by design, and the
+    ratchet bounds those events apart. check_zero summed them with the syncs and failed
+    nine configs (growth and PS) that read zero blocking syncs."""
+    p = probe_of(
+        [
+            ("cuMemCreate", GROWTH_SITE),
+            ("cuMemMap", GROWTH_SITE),
+            ("cuMemSetAccess", GROWTH_SITE),
+            ("cudaHostRegister", GROWTH_SITE),
+        ],
+        [("cudaMalloc", None)],
+    )
+    r = result_of("hbm_only_growth_wide", "growth", probe=p)
+    assert r["per_iter_total"] == [4, 1] and r["per_iter_kind"]["al"] == [4, 1]
+    assert r["per_iter_blocking"] == [0, 0] and r["inherent_site_per_iter"] == [0, 0]
+    assert r["mean"]["al"] == 2.5 and r["mean"]["total"] == 2.5
+    assert (
+        r["mean"]["blocking"] == 0
+        and r["mean"]["blocking"] == sum(r["per_iter_blocking"]) / 2.0
+    )
+    assert hsp.check_zero(report_of(r)) == []
+    assert hsp.check_zero(report_of(r), allow_inherent=False) == []
+    assert hsp.effective_blocking_per_iter(r) == [0, 0]
+
+
+def test_every_blocking_kind_is_a_violation_and_none_of_them_is_masked_by_allocations():
+    for api, kind in (
+        ("cudaStreamSynchronize", "ss"),
+        ("cudaDeviceSynchronize", "ds"),
+        ("cudaEventSynchronize", "es"),
+        ("cudaMemcpy", "ms"),
+    ):
+        p = probe_of(
+            [("cudaMalloc", None), ("cuMemSetAccess", GROWTH_SITE), (api, OWN_SITE)],
+            [("cudaMalloc", None)],
+        )
+        r = result_of("hbm_only_growth_wide", "growth", probe=p)
+        assert r["per_iter_kind"][kind] == [1, 0], kind
+        assert r["per_iter_total"] == [3, 1] and r["per_iter_blocking"] == [1, 0], kind
+        bad = hsp.check_zero(report_of(r))
+        assert len(bad) == 1 and "0.50 blocking syncs/iter (max 1)" in bad[0], bad
+        assert OWN_SITE in bad[0], bad  # the site of the sync, not the allocating one
+    # the pageable D2H copy that no sync follows (pd) is a blocking kind as well
+    r = result_of(
+        "hbm_only", "miss"
+    )  # fake_probe: the synthetic trace of the first tests
+    assert r["per_iter_kind"]["pd"] == [1, 0] and r["per_iter_kind"]["al"] == [1, 0]
+    assert r["per_iter_total"] == [5, 1] and r["per_iter_blocking"] == [4, 1]
+    assert r["mean"]["blocking"] == 2.5 and r["mean"]["total"] == 3.0
+
+
+def test_the_top_site_of_a_violation_is_one_that_blocks():
+    """The allocator site of a growth outranks the site of the sync (it has more events)
+    and must not be named as the place that syncs."""
+    p = probe_of(
+        [
+            ("cudaMalloc", GROWTH_SITE),
+            ("cudaMalloc", GROWTH_SITE),
+            ("cudaMalloc", GROWTH_SITE),
+            ("cudaStreamSynchronize", OWN_SITE),
+        ],
+        [],
+    )
+    r = result_of("hbm_only_growth_wide", "growth", probe=p)
+    assert r["sites"][0]["site"] == GROWTH_SITE  # ranked first, by its count
+    bad = hsp.check_zero(report_of(r))
+    assert len(bad) == 1 and OWN_SITE in bad[0] and GROWTH_SITE not in bad[0], bad
+
+
+def test_an_excused_site_that_allocates_does_not_excuse_a_sync_elsewhere():
+    """The excuse of a call site is for the blocking syncs made there. The stand-in of a
+    PS also grows the allocator (a dict of device tensors): those events must not be
+    taken off the syncs of the module's own code in the same iteration."""
+    globs = [hsp.PS_STANDIN]
+    # iteration 0: the stand-in allocates twice, DynamicEmb's own code syncs once;
+    # iteration 1: the stand-in syncs once (excused)
+    p = probe_of(
+        [
+            ("cudaMalloc", PS_SITE),
+            ("cudaMalloc", PS_SITE),
+            ("cudaStreamSynchronize", OWN_SITE),
+        ],
+        [("cudaStreamSynchronize", PS_SITE)],
+    )
+    r = result_of("cache_ps", "miss", probe=p, globs=globs)
+    assert r["per_iter_total"] == [3, 1] and r["per_iter_blocking"] == [1, 1]
+    # the allocations at the excused site are not excused syncs
+    assert r["inherent_site_per_iter"] == [0, 1]
+    assert hsp.effective_blocking_per_iter(r) == [1, 0]
+    bad = hsp.check_zero(report_of(r))
+    assert len(bad) == 1 and "0.50 blocking syncs/iter (max 1)" in bad[0], bad
+    assert OWN_SITE in bad[0], bad
+    # without the sync of the module's own code the same case is clean, and so is one in
+    # which every sync is at the excused site whatever else allocates
+    p = probe_of(
+        [
+            ("cudaStreamSynchronize", PS_SITE),
+            ("cudaMalloc", None),
+            ("cudaMalloc", PS_SITE),
+        ],
+        [("cudaEventSynchronize", PS_SITE)],
+    )
+    r = result_of("cache_ps", "miss", probe=p, globs=globs)
+    assert r["per_iter_blocking"] == [1, 1] and r["inherent_site_per_iter"] == [1, 1]
+    assert hsp.check_zero(report_of(r)) == []
+    # no excuse at all (allow_inherent=False): the syncs of the stand-in count
+    assert len(hsp.check_zero(report_of(r), allow_inherent=False)) == 1
+
+
+def test_the_excuse_of_one_iteration_does_not_pay_for_a_sync_of_another():
+    """check_zero subtracts per iteration and never goes below zero: an excuse that is
+    larger than the syncs of its iteration (a hand-made or an older report) must not
+    cancel a violation of the next one."""
+    r = dict(
+        zeroed(result_of("cache_ps", "miss")),
+        per_iter_blocking=[1, 1],
+        inherent_site_per_iter=[2, 0],
+    )
+    assert hsp.effective_blocking_per_iter(r) == [0, 1]
+    bad = hsp.check_zero(report_of(r))
+    assert len(bad) == 1 and "0.50 blocking syncs/iter (max 1)" in bad[0], bad
+
+
+def test_blocking_syncs_of_a_report_from_before_the_series_existed():
+    """A saved report (--diff, --render) without per_iter_blocking is read from its per-kind
+    series, and one that has neither from its totals."""
+    kinds = {k: [0, 0] for k in hsp.KINDS}
+    kinds.update(ss=[2, 1], ds=[1, 0], pd=[1, 0], al=[1, 0])
+    old = {"per_iter_total": [5, 1], "per_iter_kind": kinds}
+    assert hsp.blocking_per_iter(old) == [4, 1]
+    assert hsp.blocking_per_iter({"per_iter_total": [3, 0]}) == [3, 0]
+    assert hsp.blocking_per_iter(dict(old, per_iter_blocking=[7, 7])) == [7, 7]
+
+
+def test_the_comparison_counts_blocking_syncs_and_says_so():
+    """'still sync outside INHERENT' was a count of cases with allocator events."""
+    before = result_of(
+        "hbm_only_growth_wide",
+        "growth",
+        probe=probe_of(
+            [("cudaStreamSynchronize", OWN_SITE)] * 3,
+            [("cudaStreamSynchronize", OWN_SITE)] * 3,
+        ),
+    )
+    only_allocates = result_of(
+        "hbm_only_growth_wide",
+        "growth",
+        probe=probe_of([("cuMemSetAccess", GROWTH_SITE)], [("cudaMalloc", None)]),
+    )
+    cmp = hsp.compare_reports(report_of(before), report_of(only_allocates))
+    (row,) = cmp["rows"]
+    assert row["before"] == 3 and row["after"] == 0 and row["after_effective"] == 0
+    assert len(cmp["improved"]) == 1 and cmp["remaining"] == []
+    text = hsp.format_compare(cmp)
+    assert "0 still make a blocking sync outside INHERENT" in text, text
+    # a case that still blocks (and allocates) is counted
+    still = result_of(
+        "hbm_only_growth_wide",
+        "growth",
+        probe=probe_of(
+            [("cudaStreamSynchronize", OWN_SITE), ("cudaMalloc", None)],
+            [("cudaMalloc", None)],
+        ),
+    )
+    cmp = hsp.compare_reports(report_of(before), report_of(still))
+    assert len(cmp["remaining"]) == 1 and cmp["remaining"][0]["after_effective"] == 0.5
+    assert "1 still make a blocking sync outside INHERENT" in hsp.format_compare(cmp)
+    # a report from before the blocking metric existed compares on its totals
+    older = dict(before, mean={"total": 6.0})
+    cmp = hsp.compare_reports(report_of(older), report_of(only_allocates))
+    assert cmp["rows"][0]["before"] == 6.0
+
+
+def test_the_text_report_separates_the_blocking_syncs_from_the_allocator_events():
+    r = result_of(
+        "hbm_only_growth_wide",
+        "growth",
+        probe=probe_of(
+            [("cuMemCreate", GROWTH_SITE), ("cuMemMap", GROWTH_SITE)] * 2,
+            [("cudaMalloc", None)],
+        ),
+    )
+    text = hsp.format_report(report_of(r), detail="none")
+    assert "blk" in text and "allocator events" in text
+    # the table row: tot is every event (2.5 a step), blk the blocking ones (none)
+    row = next(
+        ln.split()
+        for ln in text.splitlines()
+        if ln.startswith("hbm_only_growth_wide ") and "growth" in ln and "|" in ln
+    )
+    assert row[3:5] == ["2.50", "0"], row
+    # the ranking of call sites names the ones that block first; a site that only allocates
+    # (it may have more events and be in more cases) comes after them, marked as such
+    blocks = result_of(
+        "hbm_only",
+        "miss",
+        probe=probe_of(
+            [("cudaStreamSynchronize", OWN_SITE)], [("cudaStreamSynchronize", OWN_SITE)]
+        ),
+    )
+    ranked = hsp.format_top_sites(report_of(r, r, blocks)).splitlines()
+    sites = [ln for ln in ranked if "cpp " in ln]
+    assert OWN_SITE in sites[0] and "(alloc)" not in sites[0], sites
+    assert GROWTH_SITE in sites[1] and sites[1].endswith("(alloc)"), sites
+    # the pivot reads the blocking syncs: the growth column is 0, not 2.5
+    pivot = next(
+        ln.split()
+        for ln in text.splitlines()
+        if ln.startswith("hbm_only_growth_wide ") and "|" not in ln
+    )
+    assert pivot == ["hbm_only_growth_wide"] + ["-"] * 6 + ["0", "-"], pivot
 
 
 def test_the_allocations_of_a_stand_in_are_excused_as_they_were_with_the_whole_case():
@@ -575,8 +835,8 @@ def test_queue_ahead_regime_is_a_ring_that_was_full_after_every_iteration():
 def test_a_queue_ahead_case_whose_regime_did_not_happen_is_not_a_zero():
     """check_zero reports it though no sync was seen: the host was too slow, so no ring
     was ahead of the device and nothing was measured."""
-    clean = result_of("hbm_only_precise", "queue_ahead")
-    clean.update(per_iter_total=[0, 0], inherent_site_per_iter=None)
+    clean = zeroed(result_of("hbm_only_precise", "queue_ahead"))
+    clean.update(inherent_site_per_iter=None)
     assert hsp.check_zero(report_of(clean)) == []
     vacuous = dict(
         clean, regime={"ok": False, "note": "ring full in 0 of 2 iterations"}
@@ -584,6 +844,7 @@ def test_a_queue_ahead_case_whose_regime_did_not_happen_is_not_a_zero():
     bad = hsp.check_zero(report_of(vacuous))
     assert len(bad) == 1 and "regime did not happen" in bad[0], bad
     assert "hbm_only_precise/queue_ahead/plain" in bad[0]
+    assert "QUEUE_AHEAD_CYCLES" in bad[0]
     # other scenarios keep their regime as a flag in the report, not a failure
     other = dict(clean, scenario="all_hit", regime={"ok": False, "note": "x"})
     assert hsp.check_zero(report_of(other)) == []
