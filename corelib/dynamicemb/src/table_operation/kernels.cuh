@@ -523,6 +523,64 @@ __global__ void table_insert_collect_kernel(
       counter, /*cur_ts=*/0, evicted_keys, evicted_table_ids, evicted_counter);
 }
 
+// The overflow tier of an insert whose bucket answered Busy: find or insert the
+// key in the overflow bucket of its table (``ovf_bucket``, bucket ``t_id`` of
+// the overflow table), the way insert_and_evict_body always did. On a success
+// ``index`` is the unified overflow index, ``final_result`` the overflow's
+// result, ``score`` the score the policy stored and ``table_key_slot`` the slot
+// a newly taken overflow slot is locked in (null for an Assign): the caller
+// puts the key back there to unlock it. An overflow Evict also sets
+// ``final_evict_key`` / ``final_evict_index`` to the victim. Nothing is touched
+// when the overflow is Busy too.
+template <typename Policy, typename Bucket, typename KeyType>
+__device__ __forceinline__ void
+insert_overflow_tier(Bucket &ovf_bucket, KeyType key, int64_t hashcode,
+                     int *__restrict__ ovf_bucket_sizes, int64_t t_id,
+                     int32_t *__restrict__ ovf_counter,
+                     int64_t ovf_output_offset, ScoreType &score,
+                     IndexType &index, InsertResult &final_result,
+                     KeyType *&table_key_slot, KeyType &final_evict_key,
+                     IndexType &final_evict_index) {
+  using Iter = typename Bucket::Iterator;
+  int64_t ovf_bucket_capacity = ovf_bucket.capacity();
+  Iter ovf_iter = Iter(hashcode % ovf_bucket_capacity);
+  InsertResult ovf_result = InsertResult::Init;
+  KeyType ovf_evict_key = KeyType();
+  int32_t *ovf_counter_table = ovf_counter + t_id * ovf_bucket_capacity;
+  overflow_insert_and_evict(ovf_bucket, key, ovf_bucket_sizes, t_id,
+                            ovf_counter_table, ovf_output_offset, ovf_iter,
+                            &ovf_iter, &ovf_result, &ovf_evict_key);
+
+  if (isInsertSuccess(ovf_result)) {
+    index = ovf_iter;
+    final_result = ovf_result;
+    table_key_slot = nullptr;
+    Iter local = ovf_iter - ovf_output_offset;
+    if (ovf_result == InsertResult::Insert ||
+        ovf_result == InsertResult::Evict) {
+      // Newly occupied overflow slot (locked until table_unlock_kernel):
+      // clear the whole score block so LruLfu frequency restarts at 0,
+      // then write the score words via the policy.
+      for (int64_t s = 0; s < ovf_bucket.num_scores(); ++s)
+        *ovf_bucket.scores(local, s) = ScoreType();
+      score = Policy::update(ovf_bucket.scores(local), score);
+      table_key_slot = ovf_bucket.keys(local);
+      if (ovf_result == InsertResult::Evict) {
+        final_evict_key = ovf_evict_key;
+        final_evict_index = ovf_iter;
+      }
+    } else if (ovf_result == InsertResult::Assign) {
+      // Existing overflow key re-inserted: update its score under lock
+      // (accumulate for LruLfu). It is not locked by the find, so guard.
+      KeyType expected_key = key;
+      if (ovf_bucket.try_lock(local, expected_key)) {
+        score = Policy::update(ovf_bucket.scores(local), score);
+        ovf_bucket.unlock(local, key);
+      }
+    }
+  }
+}
+
 template <typename Table, typename KernelTraits, typename Evictor>
 __device__ __forceinline__ void insert_and_evict_body(
     Table table, int64_t const *__restrict__ table_bucket_offsets,
@@ -620,44 +678,10 @@ __device__ __forceinline__ void insert_and_evict_body(
     if constexpr (UseOverflow) {
       if (result == InsertResult::Busy && Bucket::is_valid(key)) {
         Bucket ovf_bucket = ovf_table[t_id];
-        int64_t ovf_bucket_capacity = ovf_bucket.capacity();
-        Iter ovf_iter = Iter(hashcode % ovf_bucket_capacity);
-        InsertResult ovf_result = InsertResult::Init;
-        KeyType ovf_evict_key = KeyType();
-        int32_t *ovf_counter_table = ovf_counter + t_id * ovf_bucket_capacity;
-        overflow_insert_and_evict(ovf_bucket, key, ovf_bucket_sizes, t_id,
-                                  ovf_counter_table, ovf_output_offsets[t_id],
-                                  ovf_iter, &ovf_iter, &ovf_result,
-                                  &ovf_evict_key);
-
-        if (isInsertSuccess(ovf_result)) {
-          index = ovf_iter;
-          final_result = ovf_result;
-          table_key_slot = nullptr;
-          Iter local = ovf_iter - ovf_output_offsets[t_id];
-          if (ovf_result == InsertResult::Insert ||
-              ovf_result == InsertResult::Evict) {
-            // Newly occupied overflow slot (locked until table_unlock_kernel):
-            // clear the whole score block so LruLfu frequency restarts at 0,
-            // then write the score words via the policy.
-            for (int64_t s = 0; s < ovf_bucket.num_scores(); ++s)
-              *ovf_bucket.scores(local, s) = ScoreType();
-            score = Policy::update(ovf_bucket.scores(local), score);
-            table_key_slot = ovf_bucket.keys(local);
-            if (ovf_result == InsertResult::Evict) {
-              final_evict_key = ovf_evict_key;
-              final_evict_index = ovf_iter;
-            }
-          } else if (ovf_result == InsertResult::Assign) {
-            // Existing overflow key re-inserted: update its score under lock
-            // (accumulate for LruLfu). It is not locked by the find, so guard.
-            KeyType expected_key = key;
-            if (ovf_bucket.try_lock(local, expected_key)) {
-              score = Policy::update(ovf_bucket.scores(local), score);
-              ovf_bucket.unlock(local, key);
-            }
-          }
-        }
+        insert_overflow_tier<Policy>(
+            ovf_bucket, key, hashcode, ovf_bucket_sizes, t_id, ovf_counter,
+            ovf_output_offsets[t_id], score, index, final_result,
+            table_key_slot, final_evict_key, final_evict_index);
       }
 
       if (result == InsertResult::Evict) {

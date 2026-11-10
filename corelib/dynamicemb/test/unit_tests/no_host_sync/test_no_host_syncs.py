@@ -18,8 +18,8 @@
 host_sync_probe builds BatchedDynamicEmbeddingTablesV2 modules in every storage layout,
 drives them through scenarios (all hit, miss, miss and evict, eval, growth) and counts the
 host syncs of each measured step; a case listed in host_sync_probe.INHERENT (an external
-PS, the determinism mode, a table growth event) is excused. Everything else must read
-zero.
+PS, a table growth event) is excused. Everything else must read zero, the configs with
+DEMB_DETERMINISM_MODE (``*_determ``) included.
 
 The removal lands in steps, so the test applies to a config once budgets.json (see
 test_sync_ratchet.py) has brought every case of it that is not inherent to zero. Until

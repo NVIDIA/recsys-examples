@@ -14,9 +14,21 @@ from dynamicemb_extensions import InsertResult, ScorePolicy
 @pytest.mark.parametrize("policy", [ScorePolicy.ASSIGN, ScorePolicy.LRU_LFU])
 @pytest.mark.parametrize("operation", ["insert", "collect", "evict", "overflow"])
 @pytest.mark.parametrize("protected_table", [0, 1])
+@pytest.mark.parametrize("deterministic", [False, True], ids=["default", "determinism"])
 def test_multitable_reference_protection(
-    bucket_capacity, key_type, policy, operation, protected_table
+    bucket_capacity,
+    key_type,
+    policy,
+    operation,
+    protected_table,
+    deterministic,
+    monkeypatch,
 ):
+    if deterministic:
+        # The sorted insert takes one score word and cannot collect evicted keys.
+        if policy == ScorePolicy.LRU_LFU or operation == "collect":
+            pytest.skip("not supported in DEMB_DETERMINISM_MODE")
+        monkeypatch.setenv("DEMB_DETERMINISM_MODE", "1")
     assert torch.cuda.is_available()
     device = torch.cuda.current_device()
     table = get_scored_table(

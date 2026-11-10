@@ -64,7 +64,7 @@ the violations it has on the tree before the removal (LEGACY_BASELINE, per rule:
 expected failure with the count per rule) and may not gain one: a clean legacy function stays
 clean, so the rewrite of `forward` or `backward` cannot add a sync unnoticed. Its flag `enforce`
 is switched on when its package lands, with a `# sync-ok` on each branch that stays by design
-(the external PS, the determinism mode, the host-count mode of async_count).
+(the external PS, the host-count mode of async_count).
 SYNC_LINT_ENFORCE_ALL=1 enforces every target now, SYNC_LINT_REQUIRE_NEW=1 fails a new target
 that is missing and SYNC_LINT_STRICT=1 fails a legacy target that is below its baseline, so that
 the baseline is lowered with the change that removed the violation. `python
@@ -1222,6 +1222,23 @@ TARGETS: List[Target] = (
         "LinearBucketTable.insert_and_evict",
         "LinearBucketTable.insert_and_evict_with_counter_and_overflow",
     )
+    # the deterministic insert of DEMB_DETERMINISM_MODE: sorted kernels, no read but the
+    # audited host count of async_count=False. The helpers existed with the waves.
+    + [
+        Target(SHT, "LinearBucketTable._deterministic_insert", True, True),
+        Target(SHT, "LinearBucketTable._deterministic_insert_and_evict", True, True),
+        Target(
+            SHT,
+            "LinearBucketTable._deterministic_insert_and_evict_with_overflow",
+            True,
+            True,
+        ),
+    ]
+    + _new(
+        SHT,
+        "LinearBucketTable._sorted_insert_and_evict",
+        "LinearBucketTable._require_sorted_insert",
+    )
     # the helpers every path calls
     + _new(
         SF,
@@ -1932,24 +1949,6 @@ ALLOWED_NEW_HITS: List[Tuple[str, Optional[str], str]] = [
         "no device read",
     ),
     (
-        "dynamicemb/scored_hashtable.py",
-        "item",
-        "DEMB_DETERMINISM_MODE reads the count of the evictions it accumulated over its waves: "
-        "inherent to that opt-in mode",
-    ),
-    (
-        "dynamicemb/scored_hashtable.py",
-        "nonzero",
-        "DEMB_DETERMINISM_MODE drops the reserved keys of a batch before it buckets them: "
-        "one read in that opt-in mode",
-    ),
-    (
-        "dynamicemb/scored_hashtable.py",
-        "repeat_interleave",
-        "the call passes output_size on its next line (the lint sees the first line of a "
-        "multi-line call)",
-    ),
-    (
         "dynamicemb/key_value_table.py",
         "pin_memory",
         "construction-time pinned buffers (create_table_state, the size snapshot rings): "
@@ -1972,7 +1971,56 @@ def _allowed(hit_key: Tuple[str, str, str]) -> bool:
 # the tree. The text has to be unique enough that it does not name a line the change keeps.
 # SYNC_LINT_FINAL=1 (the last commit of the series) also wants every line that left the baseline
 # to be claimed here, so that no removal goes unreviewed.
-EXPECTED_GONE: List[Tuple[str, str, str, str]] = []
+EXPECTED_GONE: List[Tuple[str, str, str, str]] = [
+    # the waves of DEMB_DETERMINISM_MODE: the sorted kernels have no wave count and no buckets
+    # of padded rows
+    (
+        "dynamicemb/scored_hashtable.py",
+        "item",
+        "max_len = int(lengths.max().item())",
+        "379be6f9",
+    ),
+    (
+        "dynamicemb/scored_hashtable.py",
+        "int_bool_of_tensor",
+        "max_len = int(lengths.max().item())",
+        "379be6f9",
+    ),
+    (
+        "dynamicemb/scored_hashtable.py",
+        "repeat_interleave",
+        "bucket_idx = torch.repeat_interleave(",
+        "379be6f9",
+    ),
+    # (already given an output_size by stage 1 of the mode, 90db6dac, which the sorted kernels
+    # then removed with the rest of the waves)
+    (
+        "dynamicemb/scored_hashtable.py",
+        "repeat_interleave",
+        "starts = torch.repeat_interleave(offsets[:-1], lengths)",
+        "90db6dac",
+    ),
+    # what stage 1 of the mode (90db6dac) had already replaced: the drop of the reserved keys
+    # by a host-visible test, and the host count of the evictions the waves accumulated
+    (
+        "dynamicemb/scored_hashtable.py",
+        "any_all_in_cond",
+        "if not valid.any():",
+        "90db6dac",
+    ),
+    (
+        "dynamicemb/scored_hashtable.py",
+        "cpu",
+        "h_num_ev = num_ev.cpu().item()",
+        "90db6dac",
+    ),
+    (
+        "dynamicemb/scored_hashtable.py",
+        "item",
+        "h_num_ev = num_ev.cpu().item()",
+        "90db6dac",
+    ),
+]
 
 
 def _claim_matches(claim: Tuple[str, str, str, str], key: Tuple[str, str, str]) -> bool:

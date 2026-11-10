@@ -1814,7 +1814,6 @@ What can still wait for the GPU. Each of these reads goes through `sync_free.rea
 
 - an external `Storage` (a parameter server) and user-defined `MultiTableAdmitter`, `Counter`, `Cache` or `Storage` classes: their contract takes keys sized to the request and returns host counts. They run the previous, exact-length path after one read of the unique counts per step;
 - table growth: the decision to grow is made without waiting (see [Table expansion](#table-expansion)), but growing a table remaps memory and synchronizes the device; it never happens when `init_capacity` equals `max_capacity`;
-- `DEMB_DETERMINISM_MODE`, which reads two counts per insert;
 - dump, load, export, `pop_*` and the incremental dump, which move data to the host by design, and `cache_metrics()`, which reads the hit counts when it is called;
 - the one-time setup of a table, and its teardown, which waits for queued work before freeing memory;
 - the input distribution of TorchRec (the split sizes of the all-to-all of keys live on the host).
@@ -1823,8 +1822,22 @@ What can still wait for the GPU. Each of these reads goes through `sync_free.rea
 
 ## Deterministic mode
 
-When handling cache eviction and final table eviction, dynamicemb encounters randomness in the eviction of keys with the same score. To eliminate this uncertainty, dynamicemb provides a deterministic mode. Enabling this mode ensures that, under the same training script, the evicted keys will be determined.
-This mode is enabled by setting the environment variable `DEMB_DETERMINISM_MODE`.
+When handling cache eviction and final table eviction, dynamicemb encounters randomness in the eviction of keys with the same score. To eliminate this uncertainty, dynamicemb provides a deterministic mode, enabled by setting the environment variable `DEMB_DETERMINISM_MODE`.
+
+In this mode every insert into a hash table (the cache, the storage, the rehash of a growing table, `load`) sorts its keys by bucket and key, and one thread inserts the keys of a bucket one after the other, smallest key first, in a single kernel. The result is what the ordinary insert produces when its threads take the keys of a bucket one after the other in that order. A slot a key takes stays locked until the whole run of its bucket is inserted, so no key of a batch is evicted by a later key of the same batch (the cache and `HybridStorage` write the evicted rows back after the insert and rely on it), and a bucket that gets more new keys than it has free or evictable slots admits the smallest keys and refuses the rest: the refused keys spill into the overflow bucket of a cache or come back as refused inserts, as in the default mode, where which keys are refused depends on timing. A bucket sees the same sequence of operations whatever the order of the batch and the scheduling of the GPU: given the same sequence of batches and scores that do not depend on the scheduler (see below), the evicted keys, which come in (bucket, key) order, and the key table are the same on every run. The overflow bucket of a cache is deterministic too: the spills of a call are applied in order, and a key a call put there is not evicted by a later spill of the same call.
+
+The inserts of the mode read nothing from the device, so they cost no host sync, and the mode no longer makes a step read the miss count first. The code around the inserts of a rehash or of `load` keeps its own reads (see [Host syncs](#host-syncs)). A step whose keys all hit still runs the insert, on inert rows: a sort of the batch and the kernels after it, which take GPU time but no wait; `DYNAMICEMB_MISS_PATH_GATE=poll` skips them when a non-blocking poll shows that nothing missed. The mode needs a `dynamicemb_extensions` built with the sorted inserts: after pulling, rebuild with `python setup.py build_ext --inplace`; an older build raises an error that says so.
+
+What is the same on every run depends on the score strategy:
+
+- `LFU`, `STEP`, `CUSTOMIZED` and `PRECISE_CUSTOMIZED`: the scores written are counts, steps or values the user set, so the key table (its keys, its digests and its scores) and the evictions are bit-for-bit the same.
+- `TIMESTAMP`: the scores are values of the device timer and differ between runs. The insert keeps the timestamps of the keys of one bucket strictly increasing in key order (a stored timestamp can run ahead of the timer by at most the number of keys of that bucket in the batch, in nanoseconds), so a sequence of batches of new keys gives the same keys and the same victims every time. A lookup of a timestamp table stamps the keys it hits in thread order, which the mode does not control, and in a training step the lookup comes before the insert: when keys come back, which of the keys last used in the same step is the next victim can differ between runs, and so can the keys a table holds.
+
+Limits:
+
+- One score word per key: `LRU_LFU`, custom score functions and `RETAIN_KEY` (`evicted_item_mode`) are not supported in this mode.
+- Equal keys of one batch are a contract violation in every mode (the inserts take unique keys): the second copy takes a slot of its own, as in the default mode. The row numbers of a table that stores rows are taken with an atomic counter and are not part of the guarantee.
+- One thread works on a bucket, so a batch whose keys fall into few buckets takes as long as its longest bucket.
 
 ## Environment Variables
 
@@ -1833,9 +1846,9 @@ The following environment variables control runtime behavior of dynamicemb:
 | Variable | Default | Effect |
 |----------|---------|--------|
 | `DYNAMICEMB_CSTM_SCORE_CHECK` | `1` | When set to `0`, suppresses warnings in `set_score` when a new score is less than the previous one (CUSTOMIZED eviction mode). |
-| `DEMB_DETERMINISM_MODE` | unset | When set, enables deterministic eviction of keys with equal scores during cache eviction and final table eviction. |
+| `DEMB_DETERMINISM_MODE` | unset | When set, enables deterministic eviction of keys with equal scores during cache eviction and final table eviction, with no host sync. See [Deterministic mode](#deterministic-mode). |
 | `DYNAMICEMB_DEBUG` | unset | When set to any non-empty value, enables extra runtime validation in `segmented_unique_cuda`. A one-block kernel verifies on the device: (1) `segmented_range[0] == 0`, (2) `segmented_range[num_tables] == num_keys`, (3) monotonically non-decreasing. A violation is a device-side assert that prints the failed condition (the CUDA context is unusable afterwards), not an exception. Intended for development and testing only; costs one small kernel launch per call and no host synchronization. |
 | `DYNAMICEMB_SYNC_FREE` | `1` | When set to `0`, the lookup takes the previous paths that compact the missing keys and read their counts, for comparison and as a kill switch. See [Host syncs](#host-syncs). |
-| `DYNAMICEMB_MISS_PATH_GATE` | `always` | How a step decides whether to run the miss path: `always` launches it every step (no host read), `poll` skips it when a non-blocking poll shows that nothing missed (the control flow depends on timing; the results do not), `read` reads the miss count with one blocking copy. `read` is used for `DEMB_DETERMINISM_MODE` and an external storage. |
+| `DYNAMICEMB_MISS_PATH_GATE` | `always` | How a step decides whether to run the miss path: `always` launches it every step (no host read), `poll` skips it when a non-blocking poll shows that nothing missed (the control flow depends on timing; the results do not), `read` reads the miss count with one blocking copy. |
 | `DYNAMICEMB_SYNC_FREE_MAX_BYTES` | `4294967296` | A group whose miss-path buffers (`2 x N x value_dim x element size`) would exceed this takes the previous, count-reading path. |
 | `DYNAMICEMB_EXACT_GROWTH` | `0` | When set to `1`, `expand_if_need` confirms a table's size with a blocking copy before growing it, as `load()` always does, instead of deciding from the last landed size snapshot and the bounds of the batches since. |

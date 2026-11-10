@@ -114,6 +114,48 @@ table_insert_and_evict(
     std::optional<at::Tensor> ovf_output_offsets = std::nullopt,
     int64_t num_scores = 1, int64_t score_fn_key = 0);
 
+// The deterministic insert of DEMB_DETERMINISM_MODE (see sorted_insert.cuh):
+// the keys are sorted by (home bucket, key) and the keys of each bucket are
+// inserted one after another by one thread, smallest key first, so that a
+// bucket sees the same operations whatever the order of the batch and the
+// scheduling of the GPU. Nothing is read back and no shape depends on the data.
+// A key that takes part in no insert (a reserved key, a key of a table without
+// buckets or that does not exist) is Illegal. ``insert_results`` and
+// ``score_output`` (input order) are filled for every input position when
+// given; the indices are not returned (a lookup after the insert gives them).
+// One score word only: LRU_LFU is refused.
+void table_insert_sorted(
+    at::Tensor table_storage, at::Tensor table_bucket_offsets,
+    int64_t bucket_capacity, at::Tensor bucket_sizes, at::Tensor keys,
+    at::Tensor table_ids, std::optional<at::Tensor> score_input,
+    ScorePolicyType policy_type, std::optional<at::Tensor> counter,
+    std::optional<at::Tensor> insert_results = std::nullopt,
+    std::optional<at::Tensor> score_output = std::nullopt,
+    int64_t num_scores = 1);
+
+// The same insert that reports its evictions and refusals, in sorted (bucket,
+// key) order, with the count left on the device. Returns (num_evicted [1],
+// evicted_keys [N], evicted_indices [N], evicted_scores [N], evicted_table_ids
+// [N]): only the first num_evicted entries are real, the rest is inert (key -1,
+// index -1, score 0, table id -1). A refused key (Busy) is reported with the
+// index -(its input position + 1). With ``ovf_storage`` (a cache) the keys
+// whose bucket is Busy go to the overflow bucket of their table in sorted
+// order.
+std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor>
+table_insert_and_evict_sorted(
+    at::Tensor table_storage, at::Tensor table_bucket_offsets,
+    int64_t bucket_capacity, at::Tensor bucket_sizes, at::Tensor keys,
+    at::Tensor table_ids, std::optional<at::Tensor> score_input,
+    ScorePolicyType policy_type, std::optional<at::Tensor> counter,
+    std::optional<at::Tensor> insert_results = std::nullopt,
+    std::optional<at::Tensor> score_output = std::nullopt,
+    std::optional<at::Tensor> ovf_storage = std::nullopt,
+    int64_t ovf_bucket_capacity = 0,
+    std::optional<at::Tensor> ovf_bucket_sizes = std::nullopt,
+    std::optional<at::Tensor> ovf_counter = std::nullopt,
+    std::optional<at::Tensor> ovf_output_offsets = std::nullopt,
+    int64_t num_scores = 1);
+
 void table_erase_by_score(at::Tensor table_storage, torch::Dtype key_dtype,
                           int64_t bucket_capacity, at::Tensor bucket_sizes,
                           std::optional<at::Tensor> counter,
@@ -177,6 +219,15 @@ std::vector<at::Tensor> bucketize_keys(at::Tensor keys, at::Tensor table_ids,
                                        at::Tensor table_bucket_offsets,
                                        int64_t num_buckets,
                                        int64_t bucket_capacity);
+
+// The sort of bucketize_keys without its read back: returns (sorted keys,
+// inverse, segment of every sorted position), where the segment is the key's
+// home bucket, or num_buckets for a key that takes no part in an insert.
+// Nothing is compacted, so no shape depends on the data (see bucketize.cu).
+std::vector<at::Tensor>
+bucketize_keys_segmented(at::Tensor keys, at::Tensor table_ids,
+                         at::Tensor table_bucket_offsets, int64_t num_buckets,
+                         int64_t bucket_capacity);
 
 void table_update_counter_with_layout(
     at::Tensor counter, at::Tensor slot_indices, int32_t delta,

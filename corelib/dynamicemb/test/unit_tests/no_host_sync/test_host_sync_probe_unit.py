@@ -303,12 +303,7 @@ def test_inherent_matching():
     # I1, the external PS, in every scenario: the dedup and miss counts are read before each PS call
     assert hsp.inherent_reason("cache_ps", "all_hit")
     assert hsp.inherent_reason("cache_ps_sum", "miss_evict")
-    # I3, the determinism mode, in the training scenarios only
-    assert hsp.inherent_reason("cache_storage_determ", "all_hit")
-    assert hsp.inherent_reason("hbm_only_determ", "miss_evict")
-    assert hsp.inherent_reason("cache_storage_determ", "eval") is None
-    assert hsp.inherent_reason("cache_storage_determ", "eval_miss") is None
-    # nothing else is excused
+    # nothing else is excused, the determinism mode included: its inserts read nothing
     for config in (
         "cache_storage",
         "hbm_only",
@@ -316,6 +311,10 @@ def test_inherent_matching():
         "host_only",
         "cache_storage_metrics",
         "hybrid_retain",
+        "cache_storage_determ",
+        "hbm_only_determ",
+        "hybrid_determ",
+        "cache_storage_admit_determ",
     ):
         for scenario in hsp.SCENARIO_DOC:
             if scenario != "growth":

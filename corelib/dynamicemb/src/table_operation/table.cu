@@ -133,6 +133,29 @@ void bind_table_operation(py::module &m) {
         py::arg("ovf_output_offsets") = py::none(), py::arg("num_scores") = 1,
         py::arg("score_fn_key") = 0);
 
+  m.def("table_insert_sorted", &dyn_emb::table_insert_sorted,
+        "deterministic insert: the keys are sorted by (home bucket, key) and "
+        "inserted one bucket at a time, in order; reads nothing back",
+        py::arg("table_storage"), py::arg("table_bucket_offsets"),
+        py::arg("bucket_capacity"), py::arg("bucket_sizes"), py::arg("keys"),
+        py::arg("table_ids"), py::arg("score_input"), py::arg("policy_type"),
+        py::arg("counter"), py::arg("insert_results") = py::none(),
+        py::arg("score_output") = py::none(), py::arg("num_scores") = 1);
+
+  m.def("table_insert_and_evict_sorted",
+        &dyn_emb::table_insert_and_evict_sorted,
+        "deterministic insert that reports its evictions in sorted order, with "
+        "their count left on the device; a cache passes its overflow bucket",
+        py::arg("table_storage"), py::arg("table_bucket_offsets"),
+        py::arg("bucket_capacity"), py::arg("bucket_sizes"), py::arg("keys"),
+        py::arg("table_ids"), py::arg("score_input"), py::arg("policy_type"),
+        py::arg("counter"), py::arg("insert_results") = py::none(),
+        py::arg("score_output") = py::none(),
+        py::arg("ovf_storage") = py::none(), py::arg("ovf_bucket_capacity") = 0,
+        py::arg("ovf_bucket_sizes") = py::none(),
+        py::arg("ovf_counter") = py::none(),
+        py::arg("ovf_output_offsets") = py::none(), py::arg("num_scores") = 1);
+
   m.def("table_erase", &dyn_emb::table_erase, "erase keys from the table",
         py::arg("table_storage"), py::arg("table_bucket_offsets"),
         py::arg("bucket_capacity"), py::arg("bucket_sizes"), py::arg("keys"),
@@ -196,6 +219,14 @@ void bind_table_operation(py::module &m) {
         "bucketize input keys into a dense tensor, and return the output keys, "
         "buckets offset, inverse indices. num_buckets must equal "
         "table_bucket_offsets[-1] (total bucket count across tables).",
+        py::arg("keys"), py::arg("table_ids"), py::arg("table_bucket_offsets"),
+        py::arg("num_buckets"), py::arg("bucket_capacity"));
+
+  m.def("bucketize_keys_segmented", &dyn_emb::bucketize_keys_segmented,
+        "sort keys by (home bucket, key) and return (sorted keys, inverse "
+        "indices, the segment of every sorted position: its home bucket, or "
+        "num_buckets for a key that takes no part in an insert). Reads nothing "
+        "back, so no shape depends on the data.",
         py::arg("keys"), py::arg("table_ids"), py::arg("table_bucket_offsets"),
         py::arg("num_buckets"), py::arg("bucket_capacity"));
 
@@ -287,4 +318,9 @@ void bind_table_operation(py::module &m) {
   // arrays of table_insert_and_evict and table_insert_collect_evicted are
   // pre-filled (keys all ones, indices / scores / table ids -1) past the count.
   m.attr("evicted_tail_inert") = py::bool_(true);
+
+  // Capability flag, read by callers with getattr(..., False):
+  // table_insert_sorted and table_insert_and_evict_sorted exist, and
+  // DEMB_DETERMINISM_MODE inserts with them.
+  m.attr("sorted_insert") = py::bool_(true);
 }

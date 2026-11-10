@@ -524,6 +524,52 @@ def test_table_basic(
         print("Table operation(insert, erase, lookup) passed when table is full.")
 
 
+@pytest.mark.parametrize("key_type", [torch.int64, torch.uint64])
+@pytest.mark.parametrize("bucket_capacity", [128])
+@pytest.mark.parametrize("num_buckets", [13])
+@pytest.mark.parametrize("batch_size", [32, 128])
+@pytest.mark.parametrize(
+    "score_policy",
+    [ScorePolicy.ASSIGN, ScorePolicy.ACCUMULATE, ScorePolicy.GLOBAL_TIMER],
+)
+@pytest.mark.parametrize(
+    "capacity_multipliers",
+    [
+        pytest.param([1], id="1table"),
+        pytest.param([1, 2], id="2tables"),
+        pytest.param([1, 2, 3, 4], id="4tables"),
+        pytest.param([2, 0], id="2tables-zero-last"),
+        pytest.param([0, 3], id="2tables-zero-first"),
+        pytest.param([2, 0, 3, 0], id="4tables-mixed"),
+    ],
+)
+def test_table_basic_deterministic(
+    monkeypatch,
+    key_type,
+    num_buckets,
+    bucket_capacity,
+    batch_size,
+    score_policy,
+    capacity_multipliers,
+):
+    """test_table_basic in DEMB_DETERMINISM_MODE: the insert results (INSERT, ASSIGN,
+    ILLEGAL for a table without buckets, then the fill loop's INSERT, RECLAIM, EVICT
+    accounting), the output scores against lookups, and the zero-capacity tables.
+    ACCUMULATE ties every score of a bucket (each key counts 1): with the slots of a call
+    locked until its bucket's run is done a newcomer evicts the lowest slot that is not a
+    newcomer's, so the closing check of test_table_basic (every re-inserted key reclaims a
+    slot) holds as it does for the concurrent kernel."""
+    monkeypatch.setenv("DEMB_DETERMINISM_MODE", "1")
+    test_table_basic(
+        key_type,
+        num_buckets,
+        bucket_capacity,
+        batch_size,
+        score_policy,
+        capacity_multipliers,
+    )
+
+
 @pytest.mark.parametrize("key_type", [torch.int64])
 @pytest.mark.parametrize("bucket_capacity", [128, 1024])
 @pytest.mark.parametrize("num_buckets", [8192])

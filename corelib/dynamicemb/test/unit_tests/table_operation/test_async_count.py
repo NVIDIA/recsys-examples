@@ -42,6 +42,15 @@ KEY_TYPES = [torch.int64, torch.uint64]
 KINDS = ["storage", "storage_rows", "cache"]
 
 
+@pytest.fixture(params=[False, True], ids=["default", "determinism"])
+def deterministic(request, monkeypatch):
+    """The same expectations hold in DEMB_DETERMINISM_MODE: one bucket, ties by slot, the
+    outcome of a batch is known."""
+    if request.param:
+        monkeypatch.setenv("DEMB_DETERMINISM_MODE", "1")
+    return request.param
+
+
 def _table(kind, key_type):
     return get_scored_table(
         capacity=[BUCKET],
@@ -106,7 +115,9 @@ def _check_tail(batch_size, count, ev_keys, ev_indices, ev_tids):
 @pytest.mark.parametrize("kind", KINDS)
 @pytest.mark.parametrize("python_tails", [False, True], ids=["as_built", "py_tails"])
 @pytest.mark.parametrize("async_count", [False, True], ids=["host", "async"])
-def test_evictions(key_type, kind, python_tails, async_count, monkeypatch):
+def test_evictions(
+    key_type, kind, python_tails, async_count, deterministic, monkeypatch
+):
     if python_tails:
         # Make the tails inert in Python even when the extension already does.
         monkeypatch.setattr(sf, "EVICT_TAIL_INERT", False)
@@ -156,7 +167,7 @@ def test_evictions(key_type, kind, python_tails, async_count, monkeypatch):
 @pytest.mark.parametrize("python_tails", [False, True], ids=["as_built", "py_tails"])
 @pytest.mark.parametrize("async_count", [False, True], ids=["host", "async"])
 def test_refused_inserts_keep_their_negative_index(
-    key_type, kind, python_tails, async_count, monkeypatch
+    key_type, kind, python_tails, async_count, deterministic, monkeypatch
 ):
     """A key the table refuses comes back as an "evicted" entry whose index is
     -(position + 1), also with the count on the device and for a table of rows."""

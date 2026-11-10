@@ -20,6 +20,7 @@ import warnings
 from dataclasses import dataclass
 from typing import Any, Dict, Iterator, List, Optional, Tuple, Union
 
+import dynamicemb_extensions
 import numpy as np
 import torch
 import torch.distributed as dist
@@ -755,7 +756,9 @@ class LinearBucketTable(ScoredHashTable):
             assert (
                 num_scores == 1
             ), "DEMB_DETERMINISM_MODE does not support auxiliary score columns yet."
-            slots = self._deterministic_insert(keys, table_ids, score_value, policy)
+            slots = self._deterministic_insert(
+                keys, table_ids, score_value, policy, insert_results, score_out
+            )
             rows = self._rows_of(slots, table_ids, True)
             return (rows, slots) if return_slots else rows
 
@@ -837,6 +840,9 @@ class LinearBucketTable(ScoredHashTable):
             ``num_evicted`` is a host int and the evicted_* tensors are sliced to
             it, unless ``async_count``.
         If score_out is provided (caller-allocated int64 tensor), it is filled with output scores.
+        In DEMB_DETERMINISM_MODE the evicted entries come in (bucket, key) order of the key
+        that evicted them, a key refused for want of a slot is the entry of index
+        ``-(input position + 1)``, and no key of the call is evicted by the call.
         """
 
         score_value, policy = self._parse_score(score)
@@ -848,7 +854,13 @@ class LinearBucketTable(ScoredHashTable):
             ), "DEMB_DETERMINISM_MODE does not support auxiliary score columns yet."
             return self._evicted_rows_of(
                 self._deterministic_insert_and_evict(
-                    keys, table_ids, score_value, policy, async_count=async_count
+                    keys,
+                    table_ids,
+                    score_value,
+                    policy,
+                    async_count=async_count,
+                    insert_results=insert_results,
+                    score_out=score_out,
                 ),
                 table_ids,
             )
@@ -1174,7 +1186,10 @@ class LinearBucketTable(ScoredHashTable):
         """Insert with counter-aware eviction and overflow fallback.
         Returns same tuple as insert_and_evict, ``async_count`` included: the
         evicted_* tensors keep the length of ``keys`` and ``num_evicted`` stays
-        the unread int64[1] device counter."""
+        the unread int64[1] device counter. In DEMB_DETERMINISM_MODE the evicted
+        entries are in (bucket, key) order, a key refused by its bucket and by the
+        overflow bucket is the entry of index ``-(input position + 1)``, and no key
+        of the call (spills included) is evicted by the call."""
         assert (
             self.enable_overflow_
         ), "insert_and_evict_with_counter_and_overflow requires enable_overflow=True"
@@ -1186,7 +1201,13 @@ class LinearBucketTable(ScoredHashTable):
                 num_scores == 1
             ), "DEMB_DETERMINISM_MODE does not support auxiliary score columns yet."
             return self._deterministic_insert_and_evict_with_overflow(
-                keys, table_ids, score_value, policy, async_count=async_count
+                keys,
+                table_ids,
+                score_value,
+                policy,
+                async_count=async_count,
+                insert_results=insert_results,
+                score_out=score_out,
             )
 
         if num_scores > 1 and score_out is None:
@@ -2088,99 +2109,16 @@ class LinearBucketTable(ScoredHashTable):
         return bkt_keys, offsets, inverse
 
     # ------------------------------------------------------------------
-    # Deterministic insert helpers
+    # Deterministic insert (DEMB_DETERMINISM_MODE): the sorted kernels
     # ------------------------------------------------------------------
 
-    def _bucketize_and_pad(
-        self,
-        keys: torch.Tensor,
-        table_ids: torch.Tensor,
-        score_value: Optional[torch.Tensor],
-    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
-        """Bucketize keys and pad into waves of non-conflicting inserts.
-
-        Returns ``(keys_t, tids_t, scores_t)`` each shaped
-        ``[max_bucket_len, num_buckets]``.  Each row ("wave") contains at most
-        one key per bucket so that sequential per-wave inserts are
-        deterministic.  Padding uses -1 for keys and 0 for tids/scores.
-
-        Reserved all-ones keys (the padding of an N-aligned batch) are dropped
-        first and take no part in any wave; callers look the keys up over their
-        full arrays afterwards to get N-aligned indices.
-        """
-        # bucketize_keys reads table_ids[i] of every key, reserved or not (the
-        # padding's table id is -1), and all reserved keys hash to one bucket, so
-        # each of them would take a wave of its own. Drop them first. The read
-        # this costs is made once, by indexing with the positions found, not by
-        # a boolean mask per tensor; uint64 has no index_cuda, hence the views.
-        keys_i64 = sf.as_i64(keys)
-        live = torch.nonzero(keys_i64 != sf.EMPTY_KEY, as_tuple=True)[0]
-        keys = keys_i64[live].view(keys.dtype)
-        table_ids = table_ids[live]
-        if score_value is not None:
-            score_value = score_value.view(torch.int64)[live].view(torch.uint64)
-        if keys.numel() == 0:
-            return (
-                torch.empty((0, 0), dtype=keys.dtype, device=keys.device),
-                torch.empty((0, 0), dtype=torch.int64, device=keys.device),
-                None,
+    def _require_sorted_insert(self) -> None:
+        if not sf.SORTED_INSERT:
+            raise RuntimeError(
+                "DEMB_DETERMINISM_MODE needs a dynamicemb_extensions built with the "
+                "sorted inserts (table_insert_sorted); rebuild it: "
+                "python setup.py build_ext --inplace"
             )
-
-        bkt_keys, offsets, inverse = self.bucketize_keys(keys, table_ids)
-        bkt_tids = table_ids[inverse]
-        # uint64 doesn't support index_cuda; reinterpret as int64 for gather/scatter
-        if score_value is not None:
-            bkt_scores = score_value.view(torch.int64)[inverse].view(torch.uint64)
-        else:
-            bkt_scores = None
-
-        num_buckets = offsets.numel() - 1
-        lengths = offsets[1:] - offsets[:-1]
-        max_len = int(lengths.max().item()) if num_buckets > 0 else 0
-
-        if max_len == 0:
-            empty_k = torch.empty(
-                (0, num_buckets), dtype=keys.dtype, device=keys.device
-            )
-            empty_t = torch.empty(
-                (0, num_buckets), dtype=torch.int64, device=keys.device
-            )
-            return empty_k, empty_t, None
-
-        device = keys.device
-        # offsets[-1] is the number of keys (the last segment ends at the batch
-        # size), so the output size is known and neither call has to read it back.
-        bucket_idx = torch.repeat_interleave(
-            torch.arange(num_buckets, device=device),
-            lengths,
-            output_size=bkt_keys.numel(),
-        )
-        starts = torch.repeat_interleave(
-            offsets[:-1], lengths, output_size=bkt_keys.numel()
-        )
-        positions = torch.arange(bkt_keys.numel(), device=device) - starts
-
-        # The pad is built as int64 and viewed back: the scatter has no uint64 kernel.
-        pad_keys = torch.full(
-            (num_buckets, max_len), -1, dtype=torch.int64, device=device
-        )
-        pad_tids = torch.zeros((num_buckets, max_len), dtype=torch.int64, device=device)
-        pad_keys[bucket_idx, positions] = bkt_keys.view(torch.int64)
-        pad_tids[bucket_idx, positions] = bkt_tids
-
-        pad_scores = None
-        if bkt_scores is not None:
-            pad_scores = torch.zeros(
-                (num_buckets, max_len), dtype=torch.int64, device=device
-            )
-            pad_scores[bucket_idx, positions] = bkt_scores.view(torch.int64)
-
-        keys_t = pad_keys.transpose(0, 1).contiguous().view(keys.dtype)
-        tids_t = pad_tids.transpose(0, 1).contiguous()
-        scores_t = (
-            pad_scores.transpose(0, 1).contiguous() if pad_scores is not None else None
-        )
-        return keys_t, tids_t, scores_t
 
     def _deterministic_insert(
         self,
@@ -2188,29 +2126,34 @@ class LinearBucketTable(ScoredHashTable):
         table_ids: torch.Tensor,
         score_value: Optional[torch.Tensor],
         policy: ScorePolicy,
+        insert_results: Optional[torch.Tensor] = None,
+        score_out: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Deterministic insert: bucketize, insert one wave at a time, then
-        lookup to get final indices."""
+        """Deterministic insert. One extension call sorts the keys by (home bucket, key)
+        and inserts the keys of each bucket one after the other, smallest first, so that a
+        bucket sees the same sequence of operations whatever the order of the batch and
+        the scheduling of the GPU; the indices come from a lookup after all inserts (a key
+        evicted later in the call reads -1). Reserved keys (the padding of an N-aligned
+        batch) and keys of a table without buckets take no part and read -1; their input
+        positions get the result ILLEGAL and the input score as their output score.
+        Nothing is read back."""
         if keys.numel() == 0:
             return torch.empty(0, dtype=torch.int64, device=keys.device)
-
-        keys_t, tids_t, scores_t = self._bucketize_and_pad(keys, table_ids, score_value)
-        for i in range(keys_t.size(0)):
-            # The rows are passed as padded: the pad key is reserved, so its lanes
-            # take no part in the insert (Illegal), and there is nothing to read
-            # back to find out which lanes are real.
-            table_insert(
-                self.table_storage_,
-                self.table_bucket_offsets_,
-                self.bucket_capacity_,
-                self.bucket_sizes,
-                keys_t[i],
-                tids_t[i],
-                scores_t[i].to(torch.uint64) if scores_t is not None else None,
-                policy,
-                self._ref_counter,
-            )
-
+        self._require_sorted_insert()
+        dynamicemb_extensions.table_insert_sorted(
+            self.table_storage_,
+            self.table_bucket_offsets_,
+            self.bucket_capacity_,
+            self.bucket_sizes,
+            keys,
+            table_ids,
+            score_value,
+            policy,
+            self._ref_counter,
+            insert_results,
+            score_out,
+            num_scores=self.num_scores_,
+        )
         _, _, indices = table_lookup(
             self.table_storage_,
             self.table_bucket_offsets_,
@@ -2219,8 +2162,124 @@ class LinearBucketTable(ScoredHashTable):
             table_ids,
             None,
             ScorePolicy.CONST,
+            num_scores=self.num_scores_,
         )
         return indices
+
+    def _sorted_insert_and_evict(
+        self,
+        keys: torch.Tensor,
+        table_ids: torch.Tensor,
+        score_value: Optional[torch.Tensor],
+        policy: ScorePolicy,
+        *,
+        overflow: bool,
+        async_count: bool,
+        insert_results: Optional[torch.Tensor],
+        score_out: Optional[torch.Tensor],
+    ) -> Tuple[
+        torch.Tensor,
+        Union[int, torch.Tensor],
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ]:
+        """The sorted insert that reports its evictions, with the overflow bucket of a
+        cache when ``overflow``. Returns ``(indices, num_evicted, evicted_keys,
+        evicted_indices, evicted_scores, evicted_table_ids)`` in (bucket, key) order: with
+        ``async_count`` the count stays on the device and the evicted arrays keep the
+        length of ``keys`` (inert past the count: key -1, index -1, score 0, table id -1),
+        otherwise it is a host int, the one audited read of this path, and the arrays are
+        cut to it. A refused key comes back as an evicted entry of index
+        ``-(input position + 1)``."""
+        n = keys.numel()
+        device = keys.device
+        if n == 0:
+            empty = torch.empty(0, dtype=torch.int64, device=device)
+            num_evicted = (
+                torch.zeros(1, dtype=torch.int64, device=device) if async_count else 0
+            )
+            return (
+                empty,
+                num_evicted,
+                torch.empty_like(keys[:0]),
+                empty.clone(),
+                empty.clone(),
+                empty.clone(),
+            )
+        self._require_sorted_insert()
+        ovf = (
+            dict(
+                ovf_storage=self.overflow_table_storage_,
+                ovf_bucket_capacity=self.overflow_bucket_capacity_,
+                ovf_bucket_sizes=self.overflow_bucket_sizes,
+                ovf_counter=self._ovf_counter,
+                ovf_output_offsets=self.overflow_output_offsets_,
+            )
+            if overflow
+            else {}
+        )
+        (
+            num_evicted,
+            evicted_keys,
+            evicted_indices,
+            evicted_scores,
+            evicted_table_ids,
+        ) = dynamicemb_extensions.table_insert_and_evict_sorted(
+            self.table_storage_,
+            self.table_bucket_offsets_,
+            self.bucket_capacity_,
+            self.bucket_sizes,
+            keys,
+            table_ids,
+            score_value,
+            policy,
+            self._ref_counter,
+            insert_results,
+            score_out,
+            num_scores=self.num_scores_,
+            **ovf,
+        )
+        _, _, indices = table_lookup(
+            self.table_storage_,
+            self.table_bucket_offsets_,
+            self.bucket_capacity_,
+            keys,
+            table_ids,
+            None,
+            ScorePolicy.CONST,
+            num_scores=self.num_scores_,
+            **(
+                dict(
+                    ovf_storage=self.overflow_table_storage_,
+                    ovf_bucket_capacity=self.overflow_bucket_capacity_,
+                    ovf_output_offsets=self.overflow_output_offsets_,
+                )
+                if overflow
+                else {}
+            ),
+        )
+        evicted_scores = evicted_scores.view(torch.uint64)
+        if async_count:
+            return (
+                indices,
+                num_evicted,
+                evicted_keys,
+                evicted_indices,
+                evicted_scores,
+                evicted_table_ids,
+            )
+        # The host count is what this form returns: read it through the audited read.
+        count = int(sf.read_now(num_evicted)[0])
+        return (
+            indices,
+            count,
+            evicted_keys[:count],
+            evicted_indices[:count],
+            evicted_scores[:count],
+            evicted_table_ids[:count],
+        )
 
     def _deterministic_insert_and_evict(
         self,
@@ -2230,6 +2289,8 @@ class LinearBucketTable(ScoredHashTable):
         policy: ScorePolicy,
         *,
         async_count: bool = False,
+        insert_results: Optional[torch.Tensor] = None,
+        score_out: Optional[torch.Tensor] = None,
     ) -> Tuple[
         torch.Tensor,
         Union[int, torch.Tensor],
@@ -2238,101 +2299,16 @@ class LinearBucketTable(ScoredHashTable):
         torch.Tensor,
         torch.Tensor,
     ]:
-        """Deterministic insert_and_evict: bucketize, insert-and-evict one wave
-        at a time, accumulate evicted data on the device, then lookup for final
-        indices.
-        Returns ``(indices, num_evicted, evicted_keys, evicted_indices,
-        evicted_scores, evicted_table_ids)``: ``num_evicted`` is a host int and
-        the evicted_* tensors are sliced to it, unless ``async_count``, which
-        returns the unread int64[1] device count and evicted_* tensors of the
-        length of ``keys`` whose tails past it are inert (key ``-1``, index and
-        table id ``-1``, score 0)."""
-        n = keys.numel()
-        device = keys.device
-        if n == 0:
-            e = torch.empty(0, dtype=torch.int64, device=device)
-            num_evicted = (
-                torch.zeros(1, dtype=torch.int64, device=device) if async_count else 0
-            )
-            return (
-                e,
-                num_evicted,
-                torch.empty_like(keys[:0]),
-                e.clone(),
-                e.clone(),
-                e.clone(),
-            )
-
-        keys_t, tids_t, scores_t = self._bucketize_and_pad(keys, table_ids, score_value)
-
-        # A wave has one lane per bucket and each lane evicts at most one key, so
-        # a wave reports at most `width` evictions, in its first lanes. They are
-        # appended on the device: the lanes past the count hold garbage and are
-        # parked in [n, n + width), past anything returned, so that no wave has to
-        # read its count back. The buffers are int64 (uint64 has no index_cuda);
-        # keys and scores are viewed back when returned.
-        width = keys_t.size(1)
-        size = n + width
-        evicted_keys_buf = torch.full((size,), -1, dtype=torch.int64, device=device)
-        evicted_indices_buf = torch.full((size,), -1, dtype=torch.int64, device=device)
-        evicted_scores_buf = torch.zeros(size, dtype=torch.int64, device=device)
-        evicted_tids_buf = torch.full((size,), -1, dtype=torch.int64, device=device)
-        num_evicted_accum = torch.zeros(1, dtype=torch.int64, device=device)
-        lane = torch.arange(width, device=device)
-        for i in range(keys_t.size(0)):
-            (
-                _wave_idx,
-                num_ev,
-                ev_keys,
-                ev_indices,
-                ev_scores,
-                ev_tids,
-            ) = table_insert_and_evict(
-                self.table_storage_,
-                self.table_bucket_offsets_,
-                self.bucket_capacity_,
-                self.bucket_sizes,
-                keys_t[i],
-                tids_t[i],
-                scores_t[i].to(torch.uint64) if scores_t is not None else None,
-                policy,
-                self._ref_counter,
-            )
-            dst = torch.where(lane < num_ev, num_evicted_accum + lane, n + lane)
-            evicted_keys_buf[dst] = ev_keys.view(torch.int64)
-            evicted_indices_buf[dst] = ev_indices
-            evicted_scores_buf[dst] = ev_scores
-            evicted_tids_buf[dst] = ev_tids
-            num_evicted_accum += num_ev
-
-        _, _, indices = table_lookup(
-            self.table_storage_,
-            self.table_bucket_offsets_,
-            self.bucket_capacity_,
+        """Deterministic ``insert_and_evict`` (see :meth:`_sorted_insert_and_evict`)."""
+        return self._sorted_insert_and_evict(
             keys,
             table_ids,
-            None,
-            ScorePolicy.CONST,
-        )
-        evicted_keys_buf = evicted_keys_buf.view(keys.dtype)
-        evicted_scores_buf = evicted_scores_buf.view(torch.uint64)
-        if async_count:
-            return (
-                indices,
-                num_evicted_accum,
-                evicted_keys_buf[:n],
-                evicted_indices_buf[:n],
-                evicted_scores_buf[:n],
-                evicted_tids_buf[:n],
-            )
-        h_num_evicted = num_evicted_accum.item()
-        return (
-            indices,
-            h_num_evicted,
-            evicted_keys_buf[:h_num_evicted],
-            evicted_indices_buf[:h_num_evicted],
-            evicted_scores_buf[:h_num_evicted],
-            evicted_tids_buf[:h_num_evicted],
+            score_value,
+            policy,
+            overflow=False,
+            async_count=async_count,
+            insert_results=insert_results,
+            score_out=score_out,
         )
 
     def _deterministic_insert_and_evict_with_overflow(
@@ -2343,6 +2319,8 @@ class LinearBucketTable(ScoredHashTable):
         policy: ScorePolicy,
         *,
         async_count: bool = False,
+        insert_results: Optional[torch.Tensor] = None,
+        score_out: Optional[torch.Tensor] = None,
     ) -> Tuple[
         torch.Tensor,
         Union[int, torch.Tensor],
@@ -2351,100 +2329,19 @@ class LinearBucketTable(ScoredHashTable):
         torch.Tensor,
         torch.Tensor,
     ]:
-        """Like ``_deterministic_insert_and_evict`` but passes overflow
-        parameters to ``table_insert_and_evict`` and uses
-        ``lookup_with_overflow``-style lookup for final indices; ``async_count``
-        means the same."""
-        n = keys.numel()
-        device = keys.device
-        if n == 0:
-            e = torch.empty(0, dtype=torch.int64, device=device)
-            num_evicted = (
-                torch.zeros(1, dtype=torch.int64, device=device) if async_count else 0
-            )
-            return (
-                e,
-                num_evicted,
-                torch.empty_like(keys[:0]),
-                e.clone(),
-                e.clone(),
-                e.clone(),
-            )
-
-        keys_t, tids_t, scores_t = self._bucketize_and_pad(keys, table_ids, score_value)
-
-        # See _deterministic_insert_and_evict: evictions are appended on the
-        # device, the lanes without one are parked in [n, n + width).
-        width = keys_t.size(1)
-        size = n + width
-        evicted_keys_buf = torch.full((size,), -1, dtype=torch.int64, device=device)
-        evicted_indices_buf = torch.full((size,), -1, dtype=torch.int64, device=device)
-        evicted_scores_buf = torch.zeros(size, dtype=torch.int64, device=device)
-        evicted_tids_buf = torch.full((size,), -1, dtype=torch.int64, device=device)
-        num_evicted_accum = torch.zeros(1, dtype=torch.int64, device=device)
-        lane = torch.arange(width, device=device)
-        for i in range(keys_t.size(0)):
-            (
-                _wave_idx,
-                num_ev,
-                ev_keys,
-                ev_indices,
-                ev_scores,
-                ev_tids,
-            ) = table_insert_and_evict(
-                self.table_storage_,
-                self.table_bucket_offsets_,
-                self.bucket_capacity_,
-                self.bucket_sizes,
-                keys_t[i],
-                tids_t[i],
-                scores_t[i].to(torch.uint64) if scores_t is not None else None,
-                policy,
-                self._ref_counter,
-                ovf_storage=self.overflow_table_storage_,
-                ovf_bucket_capacity=self.overflow_bucket_capacity_,
-                ovf_bucket_sizes=self.overflow_bucket_sizes,
-                ovf_counter=self._ovf_counter,
-                ovf_output_offsets=self.overflow_output_offsets_,
-            )
-            dst = torch.where(lane < num_ev, num_evicted_accum + lane, n + lane)
-            evicted_keys_buf[dst] = ev_keys.view(torch.int64)
-            evicted_indices_buf[dst] = ev_indices
-            evicted_scores_buf[dst] = ev_scores
-            evicted_tids_buf[dst] = ev_tids
-            num_evicted_accum += num_ev
-
-        _, _, indices = table_lookup(
-            self.table_storage_,
-            self.table_bucket_offsets_,
-            self.bucket_capacity_,
+        """Deterministic ``insert_and_evict_with_counter_and_overflow``: the keys whose
+        bucket is full of pinned slots go to the overflow bucket of their table in sorted
+        order, and a key this call put there is not evicted by a later spill of the call.
+        """
+        return self._sorted_insert_and_evict(
             keys,
             table_ids,
-            None,
-            ScorePolicy.CONST,
-            ovf_storage=self.overflow_table_storage_,
-            ovf_bucket_capacity=self.overflow_bucket_capacity_,
-            ovf_output_offsets=self.overflow_output_offsets_,
-        )
-        evicted_keys_buf = evicted_keys_buf.view(keys.dtype)
-        evicted_scores_buf = evicted_scores_buf.view(torch.uint64)
-        if async_count:
-            return (
-                indices,
-                num_evicted_accum,
-                evicted_keys_buf[:n],
-                evicted_indices_buf[:n],
-                evicted_scores_buf[:n],
-                evicted_tids_buf[:n],
-            )
-        h_num_evicted = num_evicted_accum.item()
-        return (
-            indices,
-            h_num_evicted,
-            evicted_keys_buf[:h_num_evicted],
-            evicted_indices_buf[:h_num_evicted],
-            evicted_scores_buf[:h_num_evicted],
-            evicted_tids_buf[:h_num_evicted],
+            score_value,
+            policy,
+            overflow=True,
+            async_count=async_count,
+            insert_results=insert_results,
+            score_out=score_out,
         )
 
 

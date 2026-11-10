@@ -405,10 +405,14 @@ def test_miss_gate_mode(monkeypatch, gate, rng, ps):
 
 
 @pytest.mark.parametrize("gate", ["always", "poll", "read"])
-def test_the_determinism_mode_always_reads(monkeypatch, gate):
-    monkeypatch.setenv("DEMB_DETERMINISM_MODE", "ON")
+def test_the_determinism_mode_does_not_change_the_gate(monkeypatch, gate):
+    """The sorted inserts of the mode read nothing, so the mode has no reason to read the
+    miss count first: the gate is what DYNAMICEMB_MISS_PATH_GATE says."""
     monkeypatch.setattr(sf, "MISS_GATE", gate)
-    assert sf.miss_gate_mode(False) == "read" and sf.miss_gate_mode(True) == "read"
+    monkeypatch.delenv("DEMB_DETERMINISM_MODE", raising=False)
+    plain = {rng: sf.miss_gate_mode(rng) for rng in (False, True)}
+    monkeypatch.setenv("DEMB_DETERMINISM_MODE", "ON")
+    assert {rng: sf.miss_gate_mode(rng) for rng in (False, True)} == plain
 
 
 # --------------------------------------------------------------------------
