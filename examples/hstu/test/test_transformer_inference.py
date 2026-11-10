@@ -70,6 +70,26 @@ def test_backbone_configuration_defaults_and_validation():
         get_inference_hstu_config(**args, backbone="typo")
     with pytest.raises(ValueError, match="positive"):
         get_inference_hstu_config(**args, backbone="transformer", transformer_ffn_dim=0)
+    # FP8 and FA4 reject a dtype they cannot run when the config is built, not later
+    # inside DeepGEMM or FA4.
+    with pytest.raises(ValueError, match="requires bf16"):
+        get_inference_hstu_config(
+            **args,
+            backbone="transformer",
+            transformer_fp8_linear=True,
+            dtype=torch.float16,
+        )
+    with pytest.raises(ValueError, match="bf16 or fp16"):
+        get_inference_hstu_config(
+            **args,
+            backbone="transformer",
+            transformer_attention="fa4",
+            dtype=torch.float32,
+        )
+    fp16_fa4 = get_inference_hstu_config(
+        **args, backbone="transformer", transformer_attention="fa4", dtype=torch.float16
+    )
+    assert fp16_fa4.transformer_attention == "fa4"
 
 
 def offsets(lengths):

@@ -84,7 +84,7 @@ class InferenceHSTUConfig:
         backbone (str): Dense inference backbone, either hstu or transformer.
         transformer_ffn_dim (int, optional): Transformer feed-forward width; defaults to four times hidden_size.
         transformer_fp8_linear (bool): Run the Transformer projections as FP8 DeepGEMM GEMMs; needs bf16 and cannot be exported.
-        transformer_attention (str): Transformer attention, sdpa (padded reference) or fa4 (FlashAttention 4, cannot be exported).
+        transformer_attention (str): Transformer attention, sdpa (padded reference) or fa4 (FlashAttention 4; needs bf16 or fp16 and cannot be exported).
     """
 
     hidden_size: int
@@ -120,12 +120,16 @@ class InferenceHSTUConfig:
             raise ValueError(f"Unknown inference backbone: {self.backbone}")
         if self.transformer_fp8_linear and self.backbone != "transformer":
             raise ValueError("transformer_fp8_linear requires the transformer backbone")
+        if self.transformer_fp8_linear and not self.bf16:
+            raise ValueError("transformer_fp8_linear requires bf16")
         if self.transformer_attention not in ("sdpa", "fa4"):
             raise ValueError(
                 f"Unknown transformer attention: {self.transformer_attention}"
             )
         if self.transformer_attention != "sdpa" and self.backbone != "transformer":
             raise ValueError("transformer_attention requires the transformer backbone")
+        if self.transformer_attention == "fa4" and not (self.bf16 or self.fp16):
+            raise ValueError("FA4 attention requires bf16 or fp16")
         if self.transformer_ffn_dim is not None and self.transformer_ffn_dim <= 0:
             raise ValueError("transformer_ffn_dim must be positive")
         if self.backbone == "transformer":
