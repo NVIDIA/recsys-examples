@@ -707,19 +707,35 @@ struct FTRLVecOptimizer {
   }
 };
 
+// How many leading rows of a capacity-sized batch are live: the device counter
+// `*num_valid` clamped to [0, capacity], or all of them when there is none
+// (nullptr).  Rows from that one on are undefined, so a kernel reads this once,
+// loops to it, and neither reads nor writes a row past it.
+static DEVICE_INLINE uint32_t row_live_count(const int64_t *num_valid,
+                                             uint32_t capacity) {
+  if (num_valid == nullptr)
+    return capacity;
+  const int64_t n = *num_valid;
+  return n <= 0 ? 0u
+                : (n < static_cast<int64_t>(capacity) ? static_cast<uint32_t>(n)
+                                                      : capacity);
+}
+
 template <typename wgrad_t, typename weight_t, typename index_t,
           typename OptimizerFunc>
 __global__ void update4_with_index_flat_table_kernel(
     const uint32_t num_keys, const uint32_t grad_stride,
     const wgrad_t *grad_evs, const int64_t *table_ptrs, const index_t *indices,
     const int64_t *table_ids, const int64_t *table_value_dims,
-    const int64_t *table_emb_dims, OptimizerFunc optimizer) {
+    const int64_t *table_emb_dims, OptimizerFunc optimizer,
+    const int64_t *num_valid) {
   constexpr int kWarpSize = 32;
   const int warp_num_per_block = blockDim.x / kWarpSize;
   const int warp_id_in_block = threadIdx.x / kWarpSize;
 
+  const uint32_t n = row_live_count(num_valid, num_keys);
   for (uint32_t ev_id = warp_num_per_block * blockIdx.x + warp_id_in_block;
-       ev_id < num_keys; ev_id += gridDim.x * warp_num_per_block) {
+       ev_id < n; ev_id += gridDim.x * warp_num_per_block) {
     index_t const index = indices[ev_id];
     if (index == -1)
       continue;
@@ -744,9 +760,11 @@ __global__ void update_with_index_flat_table_kernel(
     const uint32_t num_keys, const uint32_t grad_stride,
     const wgrad_t *grad_evs, const int64_t *table_ptrs, const index_t *indices,
     const int64_t *table_ids, const int64_t *table_value_dims,
-    const int64_t *table_emb_dims, OptimizerFunc optimizer) {
+    const int64_t *table_emb_dims, OptimizerFunc optimizer,
+    const int64_t *num_valid) {
 
-  for (uint32_t ev_id = blockIdx.x; ev_id < num_keys; ev_id += gridDim.x) {
+  const uint32_t n = row_live_count(num_valid, num_keys);
+  for (uint32_t ev_id = blockIdx.x; ev_id < n; ev_id += gridDim.x) {
     index_t const index = indices[ev_id];
     if (index == -1)
       continue;
@@ -762,6 +780,13 @@ __global__ void update_with_index_flat_table_kernel(
     OptimizierInput<wgrad_t, weight_t> input{grad_ptr, weight_ptr,
                                              (uint32_t)edim, (uint32_t)edim};
     optimizer.update(input);
+    // A capped grid (see the launcher) gives a block several rows in turn, and
+    // the optimizers that reduce across the block (row-wise Adagrad, group
+    // FTRL) keep the partial sums in one shared buffer.  Every thread has to be
+    // done reading this row's sum before the next row's partials overwrite it.
+    // The condition is the same for the whole block, so the barrier is safe.
+    if (static_cast<uint64_t>(ev_id) + gridDim.x < n)
+      __syncthreads();
   }
 }
 
@@ -777,13 +802,15 @@ __global__ void update4_padded_buffer_kernel(
     const uint32_t num_rows, const uint32_t grad_stride,
     const uint32_t value_stride, const uint32_t max_emb_dim,
     const wgrad_t *grads, weight_t *values, const int64_t *table_ids,
-    const int64_t *table_emb_dims, OptimizerFunc optimizer) {
+    const int64_t *table_emb_dims, OptimizerFunc optimizer,
+    const int64_t *num_valid) {
   constexpr int kWarpSize = 32;
   const int warp_num_per_block = blockDim.x / kWarpSize;
   const int warp_id_in_block = threadIdx.x / kWarpSize;
 
+  const uint32_t n = row_live_count(num_valid, num_rows);
   for (uint32_t row = warp_num_per_block * blockIdx.x + warp_id_in_block;
-       row < num_rows; row += gridDim.x * warp_num_per_block) {
+       row < n; row += gridDim.x * warp_num_per_block) {
     uint32_t edim = table_emb_dims == nullptr
                         ? max_emb_dim
                         : (uint32_t)table_emb_dims[table_ids[row]];
@@ -800,8 +827,10 @@ __global__ void update_padded_buffer_kernel(
     const uint32_t num_rows, const uint32_t grad_stride,
     const uint32_t value_stride, const uint32_t max_emb_dim,
     const wgrad_t *grads, weight_t *values, const int64_t *table_ids,
-    const int64_t *table_emb_dims, OptimizerFunc optimizer) {
-  for (uint32_t row = blockIdx.x; row < num_rows; row += gridDim.x) {
+    const int64_t *table_emb_dims, OptimizerFunc optimizer,
+    const int64_t *num_valid) {
+  const uint32_t n = row_live_count(num_valid, num_rows);
+  for (uint32_t row = blockIdx.x; row < n; row += gridDim.x) {
     uint32_t edim = table_emb_dims == nullptr
                         ? max_emb_dim
                         : (uint32_t)table_emb_dims[table_ids[row]];
@@ -810,6 +839,10 @@ __global__ void update_padded_buffer_kernel(
     OptimizierInput<wgrad_t, weight_t> input{grad_ptr, weight_ptr, edim,
                                              max_emb_dim};
     optimizer.update(input);
+    // See update_with_index_flat_table_kernel: a block may go on to another row
+    // and reuse the shared buffer of the block-wide reductions.
+    if (static_cast<uint64_t>(row) + gridDim.x < n)
+      __syncthreads();
   }
 }
 
