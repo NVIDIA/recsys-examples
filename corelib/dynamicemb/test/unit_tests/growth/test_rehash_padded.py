@@ -39,6 +39,7 @@ from dynamicemb.scored_hashtable import (
     ScoreArg,
     ScoreSpec,
     get_scored_table,
+    sum_bucket_sizes,
 )
 from dynamicemb_extensions import ScorePolicy
 
@@ -620,8 +621,9 @@ def test_the_temporaries_of_a_rehash_are_those_of_one_chunk_not_of_the_table(
     chunk_slots,
 ):
     """A table of 2**22 slots is rehashed in chunks of 2**14 or 2**18: what the rehash
-    holds above the tables it works on is the temporaries of ONE chunk (about 40 bytes a
-    slot of it), whatever the number of chunks. Whatever a chunk allocates and a later
+    holds above the tables it works on is the temporaries of ONE chunk (56 bytes a slot
+    of it, measured: seven int64 vectors), whatever the number of chunks. Whatever a chunk
+    allocates and a later
     chunk does not free would show here as 16 or 256 times that; a table this small never
     shows it in the number of segments (every temporary of a 1024-slot table fits one
     2 MiB segment), which is why the peak of allocated bytes is what is bounded."""
@@ -639,7 +641,33 @@ def test_the_temporaries_of_a_rehash_are_those_of_one_chunk_not_of_the_table(
     torch.cuda.synchronize()
 
     peak = torch.cuda.max_memory_allocated() - base
-    # sixteen int64 vectors of a chunk (128 bytes a slot, three times what it takes) and
-    # a megabyte for the little that does not scale
+    # sixteen int64 vectors of a chunk (128 bytes a slot, more than twice the 56 it takes)
+    # and a megabyte for the little that does not scale: the counts the two tables are
+    # compared by (``Tensor.sum`` of their int32 bucket sizes would copy each as int64, 4
+    # MiB for the 2**19 buckets of ``new``, more than a chunk of 2**14 slots weighs, which
+    # is why ``sum_bucket_sizes`` does not)
     assert peak <= 16 * 8 * chunk_slots + (1 << 20), (peak, chunk_slots)
     assert int(new.bucket_sizes.sum()) == int(old.bucket_sizes.sum())
+
+
+@pytest.mark.parametrize(
+    "n", [0, 1, 4095, 4096, 4097, 3 * 4096 + 5, 1 << 19], ids=lambda n: "n%d" % n
+)
+def test_the_sum_of_bucket_sizes_is_exact_and_copies_nothing_the_size_of_the_table(n):
+    sizes = torch.randint(0, 129, (n,), dtype=torch.int32, device=DEVICE)
+    if n:
+        sizes[::7] = 128  # full buckets, the most a run of them can add up to
+    torch.cuda.synchronize()
+    expected = int(sizes.to(torch.int64).sum())
+    torch.cuda.reset_peak_memory_stats()
+    base = torch.cuda.memory_allocated()
+
+    total = sum_bucket_sizes(sizes)
+    torch.cuda.synchronize()
+
+    peak = torch.cuda.max_memory_allocated() - base
+    assert total.dtype == torch.int64 and total.dim() == 0
+    assert int(total) == expected
+    # the sums of the runs (one in 4096) and the cast of what is left over of them; not
+    # 8 bytes a bucket, which is what ``sizes.sum()`` takes
+    assert peak <= 12 * (n // 4096) + 8 * 4096 + (1 << 12), (peak, n)

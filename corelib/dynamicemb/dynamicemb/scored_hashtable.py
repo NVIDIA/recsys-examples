@@ -63,9 +63,10 @@ from dynamicemb_extensions import (
 )
 
 # The slots of the old key column one chunk of a rehash covers, at most (a chunk is a whole
-# number of buckets, and at least one). The transient memory of a chunk is about 40 bytes
-# a slot: the copy of the keys, the scores and the slots the insert reports, and the
-# insert's own bookkeeping.
+# number of buckets, and at least one). The transient memory of a chunk is 56 bytes a slot
+# (seven int64 vectors, measured on an H100 by test_the_temporaries_of_a_rehash_...): the
+# table ids, the old slots, the scores, the slots the insert reports and the insert's own
+# bookkeeping.
 REHASH_CHUNK_SLOTS = 1 << 20
 
 
@@ -76,6 +77,30 @@ def rehash_chunk_buckets(
     covers: ``chunk_slots`` slots as whole buckets, at least one and at most the table.
     """
     return max(1, min(num_buckets, chunk_slots // bucket_capacity))
+
+
+# Bucket sizes are added up in runs of this many buckets as int32: a bucket holds at most
+# its capacity, which is far below 2**31 / _SIZE_RUN, so a run cannot overflow.
+_SIZE_RUN = 1 << 12
+
+
+def sum_bucket_sizes(sizes: torch.Tensor) -> torch.Tensor:
+    """The sum of ``sizes`` (the int32 bucket sizes of a table or a range of its buckets) as
+    an int64 scalar on the device, with temporaries that do not grow with the table.
+
+    ``Tensor.sum`` of an int32 vector first copies it as int64, 8 bytes a bucket (4 MiB for
+    the new key map of a rehash of 2**22 slots in buckets of 16), which a rehash that is
+    chunked to bound its temporaries must not allocate: the runs of ``_SIZE_RUN`` buckets
+    are added as int32, and only their sums (one in ``_SIZE_RUN``) as int64. A few launches,
+    nothing is read back.
+    """
+    assert sizes.dtype == torch.int32 and sizes.dim() == 1
+    whole = sizes.numel() - sizes.numel() % _SIZE_RUN
+    total = sizes[whole:].sum(dtype=torch.int64)
+    if whole:
+        runs = sizes[:whole].view(-1, _SIZE_RUN).sum(dim=1, dtype=torch.int32)
+        total = total + runs.sum(dtype=torch.int64)
+    return total
 
 
 @dataclass(frozen=True)
@@ -1225,8 +1250,10 @@ class LinearBucketTable(ScoredHashTable):
         # that evicts a resident reports a slot, so the per-key assertion cannot see the
         # key it lost; the counts of the two tables can.
         torch._assert_async(
-            self.bucket_sizes[n_b0 : n_b0 + self.per_table_num_buckets_[table_id]].sum()
-            == other.bucket_sizes[o_b0 : o_b0 + o_nb].sum()
+            sum_bucket_sizes(
+                self.bucket_sizes[n_b0 : n_b0 + self.per_table_num_buckets_[table_id]]
+            )
+            == sum_bucket_sizes(other.bucket_sizes[o_b0 : o_b0 + o_nb])
         )
 
     def set_rows(self, slots: torch.Tensor, table_id: int, rows: torch.Tensor) -> None:
@@ -1293,7 +1320,8 @@ class LinearBucketTable(ScoredHashTable):
         # Every row below the counter sits on a live or a reclaimed slot, so the
         # reclaimed ones are what is left once the live keys are subtracted.
         count = (
-            other.row_counters_[table_id] - other.bucket_sizes[o_b0:o_b1].sum()
+            other.row_counters_[table_id]
+            - sum_bucket_sizes(other.bucket_sizes[o_b0:o_b1])
         ).reshape(1)
         dynamicemb_extensions.table_carry_reclaimed_rows(
             other.keys_.view(torch.int64),
