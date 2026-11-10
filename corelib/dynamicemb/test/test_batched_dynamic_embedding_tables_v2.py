@@ -2056,11 +2056,26 @@ def random_indices(batch, min_index, max_index):
         (EmbOptimType.SGD, {"learning_rate": 0.3}),
     ],
 )
+@pytest.mark.parametrize(
+    "score_strategy",
+    [
+        DynamicEmbScoreStrategy.TIMESTAMP,
+        DynamicEmbScoreStrategy.LFU,
+        DynamicEmbScoreStrategy.STEP,
+    ],
+)
 @pytest.mark.parametrize("caching", [False, True])
 @pytest.mark.parametrize("PS", [None])
 @pytest.mark.parametrize("iteration", [16])
 @pytest.mark.parametrize("batch_size", [2048, 65536])  # ,[])
-def test_deterministic_insert(opt_type, opt_params, caching, PS, iteration, batch_size):
+def test_deterministic_insert(
+    opt_type, opt_params, score_strategy, caching, PS, iteration, batch_size
+):
+    """Two modules fed the same batches in DEMB_DETERMINISM_MODE hold the same keys after every
+    step, in the cache and in the storage. The scores of TIMESTAMP come from the device timer
+    and differ between the modules; the scores of LFU (every key seen once, so every score of a
+    bucket ties) and STEP (one score per step, so the newcomers of a step tie) are compared
+    too: the victims of a tie are the sorted insert's business, not the scheduler's."""
     print(
         f"step in test_deterministic_insert , opt_type = {opt_type} opt_params = {opt_params}"
     )
@@ -2086,7 +2101,7 @@ def test_deterministic_insert(opt_type, opt_params, caching, PS, iteration, batc
             index_type=key_type,
             embedding_dtype=value_type,
             device_id=device_id,
-            score_strategy=DynamicEmbScoreStrategy.TIMESTAMP,
+            score_strategy=score_strategy,
             caching=caching,
             local_hbm_for_values=init_capacity * dim * 4,
             external_storage=PS,
@@ -2137,6 +2152,11 @@ def test_deterministic_insert(opt_type, opt_params, caching, PS, iteration, batc
         map_y = storage_y.key_index_map
 
         assert torch.equal(map_x.keys_, map_y.keys_)
+        if score_strategy != DynamicEmbScoreStrategy.TIMESTAMP:
+            assert all(
+                torch.equal(sx, sy)
+                for sx, sy in zip(map_x.scores_list, map_y.scores_list)
+            )
 
         print(
             f"Iteration {i} passed for deterministic insertion with table_x's size({map_x.size()}), table_y's size({map_y.size()}), totoal({map_x.capacity()})"
@@ -2148,6 +2168,11 @@ def test_deterministic_insert(opt_type, opt_params, caching, PS, iteration, batc
             map_y = cache_y.key_index_map
 
             assert torch.equal(map_x.keys_, map_y.keys_)
+            if score_strategy != DynamicEmbScoreStrategy.TIMESTAMP:
+                assert all(
+                    torch.equal(sx, sy)
+                    for sx, sy in zip(map_x.scores_list, map_y.scores_list)
+                )
 
             print(
                 f"Iteration {i} passed for deterministic insertion with cache_x's size({map_x.size()}), cache_y's size({map_y.size()}), totoal({map_x.capacity()})"
