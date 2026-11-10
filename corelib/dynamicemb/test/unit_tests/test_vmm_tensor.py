@@ -433,13 +433,69 @@ def test_host_buffer_grows_in_place():
         allocated = buf.allocated_bytes()
     first = torch.arange(1024, device=device, dtype=torch.float32)
     torch.testing.assert_close(buf.tensor()[:1024], first)
-    # one kernel over the whole buffer, which crosses every boundary
+    # Kernels over the whole buffer, which cross every boundary: the pieces are registered
+    # one by one, and only a kernel is indifferent to that (a copy engine operation across
+    # two pieces is refused by the driver, see
+    # test_a_copy_across_two_pieces_is_refused_cleanly_and_kernels_are_not_affected).
     everything = buf.tensor().reshape(-1)
-    everything.copy_(torch.arange(total, device=device, dtype=torch.float32))
+    indices = torch.arange(total, device=device, dtype=torch.float32)
+    everything.mul_(0.0).add_(indices)
     everything.add_(1.0)
     torch.cuda.synchronize()
-    expected = torch.arange(total, device=device, dtype=torch.float32) + 1.0
-    torch.testing.assert_close(buf.tensor().reshape(-1).clone(), expected)
+    assert torch.equal(buf.tensor().reshape(-1), indices + 1.0)
+    # the whole buffer read through a kernel that makes its own tensor
+    assert torch.equal(buf.tensor().reshape(-1) * 1.0, indices + 1.0)
+
+
+@requires_cuda
+@requires_in_place_host
+def test_a_copy_across_two_pieces_is_refused_cleanly_and_kernels_are_not_affected():
+    """A host buffer is registered with CUDA one piece per growth. A kernel addresses the
+    range as the one range it is, but ``cudaMemcpyAsync`` (what ``copy_``, ``clone`` and
+    ``cpu`` of a contiguous range come to) does not follow a copy from one registration
+    into the next: the driver answers ``cudaErrorInvalidValue`` at the call
+    (``CUDA_LOG_FILE=stderr`` says why: "Copy is larger than memobj size", the size of the
+    registration the pointer is in). That is a limit of growing in place, measured on an
+    H100. Nothing in the library copies a value buffer that way (rows are read and written
+    by kernels through the pointer table); this says what happens if a caller does: an
+    error that names the argument, and a context and a buffer that are as usable as before.
+    A copy inside one piece, a memset and every kernel work across any number of boundaries.
+    """
+    device = _cuda_device()
+    page = os.sysconf("SC_PAGE_SIZE")
+    per_page = page // 4
+    buf = HostExtendableBuffer(
+        (per_page,), torch.float32, device, max_shape=(8 * per_page,)
+    )
+    buf.extend((per_page,))  # the second piece
+    buf.extend((per_page,))  # the third
+    view = buf.tensor().reshape(-1)
+    source = torch.arange(3 * per_page, device=device, dtype=torch.float32)
+
+    view.mul_(0.0).add_(source)  # kernels across both boundaries
+    torch.cuda.synchronize()
+    assert torch.equal(view, source)
+    view[per_page : 2 * per_page].copy_(source[:per_page] + 1.0)  # inside one piece
+    view.zero_()  # a memset
+    torch.cuda.synchronize()
+    assert not bool(view.any())
+
+    try:
+        view.copy_(source)
+        torch.cuda.synchronize()
+        refused = False
+    except RuntimeError as exc:  # torch.AcceleratorError is one
+        refused = True
+        assert "invalid argument" in str(exc).lower(), exc
+    if not refused:
+        pytest.skip("this driver follows a copy from one registration into the next")
+
+    # the refusal is clean: nothing was written, and kernels and one-piece copies go on
+    assert not bool(view.any())
+    view.add_(source)  # a kernel across both boundaries
+    view[:per_page].copy_(source[:per_page])  # inside one piece
+    torch.cuda.synchronize()
+    assert torch.equal(view, source)
 
 
 @requires_cuda

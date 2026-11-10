@@ -360,6 +360,14 @@ private:
 // the device pointer of its host pointer, which is every Linux system with
 // unified addressing); a piece for which it does not is rolled back and the
 // growth fails with an error, the buffer is unchanged and can still be used.
+//
+// Kernels address the pieces as the one range they are. A copy engine operation
+// does not: the driver checks cudaMemcpy*'s range against the size of the
+// registration the pointer is in, and refuses one that crosses into the next
+// piece ("Copy is larger than memobj size", CUDA_ERROR_INVALID_VALUE from
+// cuMemcpyDtoDAsync / cuMemcpy; measured on an H100, CUDA 13). A memset, a
+// kernel and a copy inside one piece are fine. Nothing in the library copies a
+// value buffer: it reads and writes rows with kernels through the pointer table.
 class HostVMMTensor {
 
 public:

@@ -161,6 +161,15 @@ class HostExtendableBuffer(ExtendableBuffer):
     is reserved when the buffer is created (address space only, nothing is committed or
     counted against the memory limits) and growing commits the next pages of it. It
     defaults to eight times the initial size, at least 1 GiB.
+
+    The range is registered with CUDA one piece per growth that needs new pages. A kernel
+    addresses it as the one range it is, and that is how the library reads and writes the
+    rows (through the pointer table of the state). The driver does not follow a
+    ``cudaMemcpyAsync`` from one piece into the next, though: a ``copy_``, ``clone`` or
+    ``cpu`` of a contiguous range of ``tensor()`` that crosses the boundary of two pieces
+    fails with ``invalid argument`` (the buffer and the context stay usable). Copy such a
+    range piece by piece, or through a kernel (``torch.add(x, 0)``, an index op, an
+    arithmetic ``out=``); a memset (``zero_``) and a copy inside one piece are fine.
     """
 
     def __init__(
