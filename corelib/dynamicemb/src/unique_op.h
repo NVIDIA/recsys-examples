@@ -78,10 +78,15 @@ segmented_unique_cuda(at::Tensor keys, at::Tensor segmented_range,
  * @param offsets Jagged tensor offsets (int64, size = num_tables + 1)
  *                offsets[t] is the start index for table t's keys.
  * @param num_elements Total number of elements (keys)
+ * @param num_valid Optional one-element int64 device tensor: only the first
+ *                  clamp(*num_valid, 0, num_elements) table ids are written
+ *                  (the rest of the output is undefined); nothing is read back.
  *
  * @return table_ids tensor (int64) with same length as num_elements
  */
-at::Tensor expand_table_ids_cuda(at::Tensor offsets, int64_t num_elements);
+at::Tensor
+expand_table_ids_cuda(at::Tensor offsets, int64_t num_elements,
+                      c10::optional<at::Tensor> num_valid = c10::nullopt);
 
 /**
  * @brief Compute new lengths and offsets by evenly distributing unique keys.

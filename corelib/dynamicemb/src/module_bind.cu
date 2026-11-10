@@ -31,6 +31,7 @@ void bind_vmm_op(py::module &m);
 #ifndef DEMB_NO_HIER_OUTPUT_DIST // defined by setup.py without NCCL >= 2.30.7
 void bind_hier_output_dist(py::module &m);
 #endif
+void bind_counted_ops(py::module &m);
 
 PYBIND11_MODULE(dynamicemb_extensions, m) {
   m.doc() = "DYNAMICEMB"; // Optional
@@ -47,4 +48,5 @@ PYBIND11_MODULE(dynamicemb_extensions, m) {
 #ifndef DEMB_NO_HIER_OUTPUT_DIST
   bind_hier_output_dist(m);
 #endif
+  bind_counted_ops(m);
 }

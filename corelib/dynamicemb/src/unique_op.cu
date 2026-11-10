@@ -16,6 +16,7 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 ******************************************************************************/
 
 #include "check.h"
+#include "counted_ops.h"
 #include "dedup_chain.cuh"
 #include "lookup_forward.h"
 #include "torch_utils.h"
@@ -481,13 +482,17 @@ __global__ void segmented_unique_finalize(
 
 // Expand jagged offsets to per-element table_ids (identity mapping,
 // local_batch_size=1). For each idx, find largest t such that offsets[t] <= idx
-// via binary_search_upper_bound (defined above).
+// via binary_search_upper_bound (defined above). With num_valid (null: all
+// num_elements) only the first n = clamp(*num_valid, 0, num_elements) elements
+// are written; the rest of table_ids is left untouched.
 __global__ void expand_table_ids_kernel(const int64_t *offsets,
                                         int64_t *table_ids, int num_tables,
-                                        int64_t num_elements) {
+                                        int64_t num_elements,
+                                        const int64_t *num_valid) {
   const int64_t stride = blockDim.x * gridDim.x;
+  const int64_t limit = counted_limit(num_valid, num_elements);
 
-  for (int64_t idx = blockIdx.x * blockDim.x + threadIdx.x; idx < num_elements;
+  for (int64_t idx = blockIdx.x * blockDim.x + threadIdx.x; idx < limit;
        idx += stride) {
     table_ids[idx] = binary_search_upper_bound(offsets, num_tables + 1, idx);
   }
@@ -747,13 +752,18 @@ segmented_unique_cuda(at::Tensor keys, at::Tensor segmented_range,
 // Expand table IDs from offsets (identity mapping, local_batch_size=1).
 // offsets: size = num_tables + 1; offsets[t] is the start index for table t.
 // num_tables is derived from offsets.size(0)-1.
-at::Tensor expand_table_ids_cuda(at::Tensor offsets, int64_t num_elements) {
+// With num_valid (a one-element int64 device tensor) only the first
+// n = clamp(*num_valid, 0, num_elements) table_ids are written; the rest of the
+// output is undefined.
+at::Tensor expand_table_ids_cuda(at::Tensor offsets, int64_t num_elements,
+                                 c10::optional<at::Tensor> num_valid) {
   cudaStream_t stream = at::cuda::getCurrentCUDAStream().stream();
 
   const auto device = offsets.device();
   const int device_sm_count = DeviceProp::getDeviceProp(device.index()).num_sms;
 
   TORCH_CHECK(offsets.is_cuda(), "offsets must be on CUDA device");
+  const int64_t *d_num_valid = counted_num_valid_ptr(num_valid, device);
 
   // Handle empty input
   if (num_elements == 0) {
@@ -773,8 +783,8 @@ at::Tensor expand_table_ids_cuda(at::Tensor offsets, int64_t num_elements) {
       {num_elements}, at::TensorOptions().dtype(at::kLong).device(device));
 
   expand_table_ids_kernel<<<grid_size, BLOCK_SIZE, 0, stream>>>(
-      get_pointer<const int64_t>(offsets),
-      get_pointer<int64_t>(table_ids), num_tables, num_elements);
+      get_pointer<const int64_t>(offsets), get_pointer<int64_t>(table_ids),
+      num_tables, num_elements, d_num_valid);
   DEMB_CUDA_KERNEL_LAUNCH_CHECK();
 
   return table_ids;
@@ -892,8 +902,9 @@ Returns:
 
   m.def(
       "expand_table_ids_cuda",
-      [](at::Tensor offsets, int64_t num_elements) {
-        return dyn_emb::expand_table_ids_cuda(offsets, num_elements);
+      [](at::Tensor offsets, int64_t num_elements,
+         const c10::optional<at::Tensor> &num_valid) {
+        return dyn_emb::expand_table_ids_cuda(offsets, num_elements, num_valid);
       },
       R"doc(
 Expand table IDs from offsets (identity mapping, local_batch_size=1).
@@ -905,11 +916,15 @@ Args:
     offsets: Table boundary offsets (int64, size = num_tables + 1)
              offsets[t] is the start index for table t's keys.
     num_elements: Total number of elements (keys)
+    num_valid: Optional one-element int64 device tensor. When given, only the
+               first n = clamp(num_valid, 0, num_elements) table ids are
+               written (no host read); the rest of the output is undefined.
 
 Returns:
     table_ids tensor (int64) with same length as num_elements
 )doc",
-      py::arg("offsets"), py::arg("num_elements") = 0);
+      py::arg("offsets"), py::arg("num_elements") = 0,
+      py::arg("num_valid") = py::none());
 
   m.def(
       "compute_dedup_lengths_cuda",
