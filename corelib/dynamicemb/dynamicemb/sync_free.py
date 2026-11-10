@@ -50,7 +50,7 @@ import contextlib
 import os
 import threading
 import warnings
-from typing import Callable, List, Optional, Tuple, Union
+from typing import Callable, Dict, List, Optional, Sequence, Tuple, Union
 
 import dynamicemb_extensions
 import torch
