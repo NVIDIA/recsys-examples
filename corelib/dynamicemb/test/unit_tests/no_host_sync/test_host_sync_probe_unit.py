@@ -875,9 +875,47 @@ def test_a_queue_ahead_case_whose_regime_did_not_happen_is_not_a_zero():
     assert len(bad) == 1 and "regime did not happen" in bad[0], bad
     assert "hbm_only_precise/queue_ahead/plain" in bad[0]
     assert "QUEUE_AHEAD_CYCLES" in bad[0]
-    # other scenarios keep their regime as a flag in the report, not a failure
-    other = dict(clean, scenario="all_hit", regime={"ok": False, "note": "x"})
-    assert hsp.check_zero(report_of(other)) == []
+
+
+def test_a_case_whose_scenario_did_not_happen_is_not_a_zero_in_any_scenario():
+    """The first census of the merged tree had a growth case in which no table grew (the
+    host tier of a hybrid) and a miss case whose tier was full: both read zero, and the
+    acceptance said nothing, because only queue_ahead was held to its regime. A zero is a
+    statement about a scenario; if it did not happen there is no statement."""
+    clean = zeroed(result_of("hybrid_growth", "growth"))
+    assert hsp.check_zero(report_of(clean)) == []
+    for scenario in hsp.SCENARIO_DOC:
+        case = dict(
+            clean, scenario=scenario, regime={"ok": False, "note": "nothing grew"}
+        )
+        bad = hsp.check_zero(report_of(case))
+        assert len(bad) == 1 and "regime did not happen" in bad[0], (scenario, bad)
+        assert (
+            "hybrid_growth/%s/plain" % scenario in bad[0] and "nothing grew" in bad[0]
+        )
+    # a case that is whole-case INHERENT is held to it as well (it is excused from the
+    # syncs, not from being what its name says)
+    whole = ("synthetic_whole*", "growth")
+    hsp.INHERENT[whole] = "a whole-case excuse"
+    try:
+        case = dict(
+            clean,
+            config="synthetic_whole",
+            inherent="a whole-case excuse",
+            regime={"ok": False, "note": "nothing grew"},
+        )
+        bad = hsp.check_zero(report_of(case))
+    finally:
+        del hsp.INHERENT[whole]
+    assert len(bad) == 1 and "regime did not happen" in bad[0], bad
+    # the regime failing does not hide a sync of the same case: both are reported
+    syncing = dict(
+        result_of("hybrid_growth", "growth"),
+        regime={"ok": False, "note": "nothing grew"},
+    )
+    bad = hsp.check_zero(report_of(syncing))
+    assert len(bad) == 2 and "regime did not happen" in bad[0], bad
+    assert "outside inherent sites" in bad[1], bad
 
 
 def test_all_hit_scenarios_warm_up_long_enough_for_the_admitter():

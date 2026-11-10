@@ -22,7 +22,8 @@ cudaEventSynchronize, synchronous cudaMemcpy and a pageable D2H copy: not the al
 of a growth, which test_sync_ratchet.py bounds); the syncs at a call site listed in
 host_sync_probe.INHERENT (the external PS of the host-sized contract) are excused. Everything
 else must read zero, the configs with DEMB_DETERMINISM_MODE (``*_determ``) and the ones that
-grow a table included.
+grow a table included. A case counts only if its scenario happened (a growth case in which a
+table grew, a miss_evict case that evicted): the regime of every case is held as well.
 
 The removal lands in steps, so the test applies to a config once budgets.json (see
 test_sync_ratchet.py) has brought every case of it that is not inherent to zero. Until

@@ -2280,7 +2280,7 @@ def measure(
     mean syncs per iteration by kind (res["mean"]), per-iteration totals and blocking
     counts (res["per_iter_total"], res["per_iter_blocking"]), ranked call sites
     (res["sites"]) and diagnostics.  Use check_zero(report) to list non-inherent cases
-    that still make a blocking sync.
+    that still make a blocking sync (or did not happen as named).
     """
     import torch
 
@@ -2406,8 +2406,8 @@ def _blocking_site(site: Dict[str, Any]) -> bool:
 def check_zero(report: Dict[str, Any], allow_inherent: bool = True) -> List[str]:
     """Violations: measured (config, scenario, mode) that make a blocking sync (the kinds
     of HOST_BLOCKING_KINDS; allocator events are not counted, the ratchet bounds them),
-    that are not marked INHERENT, or that errored.  Empty list == zero blocking host
-    syncs."""
+    that are not marked INHERENT, whose scenario did not happen, or that errored.  Empty
+    list == zero blocking host syncs, in cases that measured what their name says."""
     bad: List[str] = []
     for r in report["results"]:
         tag = "%s/%s/%s" % (r["config"], r["scenario"], r["mode"])
@@ -2417,15 +2417,20 @@ def check_zero(report: Dict[str, Any], allow_inherent: bool = True) -> List[str]
             bad.append("%s: ERROR %s" % (tag, r.get("error")))
             continue
         regime = r.get("regime") or {"ok": True}
-        if r["scenario"] == "queue_ahead" and not regime["ok"]:
-            # The zero of this scenario is about a host that is a whole ring of checks
-            # ahead of the device; without it nothing was measured.
-            bad.append(
-                "%s: the regime did not happen (%s): the zero says nothing; rerun, or "
-                "raise QUEUE_AHEAD_CYCLES if the host is slower than the sleep"
-                % (tag, regime.get("note", ""))
+        if not regime["ok"]:
+            # A zero is a statement about a scenario: queue_ahead is about a host that is a
+            # whole ring of checks ahead of the device, growth about a table that grows,
+            # miss_evict about evictions, and so on. If it did not happen, nothing was
+            # measured, whatever the count.
+            hint = (
+                "rerun, or raise QUEUE_AHEAD_CYCLES if the host is slower than the sleep"
+                if r["scenario"] == "queue_ahead"
+                else "fix plan_of (or regime_check) so that the case is what its name says"
             )
-            continue
+            bad.append(
+                "%s: the regime did not happen (%s): the zero says nothing; %s"
+                % (tag, regime.get("note", ""), hint)
+            )
         if allow_inherent and r.get("inherent"):
             continue
         eff = effective_blocking_per_iter(r, allow_inherent)
@@ -3319,8 +3324,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ap.add_argument(
         "--assert-zero",
         action="store_true",
-        help="exit 1 if a case not in INHERENT makes a blocking sync (2 if a case "
-        "errored); allocator events are not counted",
+        help="exit 1 if a case not in INHERENT makes a blocking sync or did not happen as "
+        "named (2 if a case errored); allocator events are not counted",
     )
     ap.add_argument(
         "--list", action="store_true", help="list configs and scenarios, then exit"
@@ -3480,7 +3485,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             for b in bad:
                 print("  " + b)
             return 2 if errs and len(errs) == len(bad) else 1
-        print("ASSERT-ZERO: ok (every non-inherent case has zero blocking host syncs)")
+        print(
+            "ASSERT-ZERO: ok (every non-inherent case has zero blocking host syncs, and "
+            "happened as named)"
+        )
     return 0
 
 
