@@ -26,7 +26,31 @@ and the push of its node's keys, on one GPU, on plain tensors:
   feature)'s keys start, and the input's per-feature totals, for many world
   sizes (most not powers of two). The keys by owner, those past the valid
   ones too, are the KJT's keys at ``inv``, widened to int64 with their sign,
-  as the push gathers them. A second run gives the same bits;
+  as the push gathers them. A second run gives the same bits, and so does
+  the radix sort by bucket feature (``sorted_path``), which the counting sort
+  by owner replaces up to 2047 owners. The in channel's bucketize on each
+  node of a sharding (``num_nodes``, ``local_size``, ``node``) gives the same
+  tables, its offsets per bucket feature at each owner's first one and at
+  every one of its node's owners (``node_entries``), the entries
+  ``node_exchange`` reads. The hook says which sort ran (``counted``): the
+  counting sort wherever its shared memory fits a CTA of the GPU
+  (``counting_runs``). The test scrubs each call's tables once it compared
+  them (``scrub``): the next call of the same sizes gets the same blocks
+  back from the caching allocator, and an entry it does not write then
+  holds -1, not the right value of the call before;
+* the counting sort against the radix sort on a grid of features (1 to
+  4,096), owners (1 to 2,048) and keys (0 to about a million), bit for bit,
+  whole and on every node. Forced (``sorted_path`` False), the counting sort
+  runs exactly where the bucketize chooses it, and elsewhere raises with the
+  reason: more than 2,047 owners (2,048 take the radix sort), or more shared
+  memory than a CTA of the GPU takes. Then the shapes it is for
+  (``PRODUCTION``: 4,096 features on 2, 4 and 64 nodes of 8, at up to 12.6M
+  keys, so its CTAs take many sub-tiles each), on the first, a middle and
+  the last node; KJTs whose features start on the bounds of the counting
+  sort's chunks and beside them, with 1 to 4,096 features: its CTAs find
+  those features with a warp's 32 probes a round; and with a second GPU, a
+  grid point there after the first GPU's (the shared memory attribute is
+  per GPU);
 * index dedup's fan-out (``hier_output_dist_fanout``) against a torch
   reference: the original rows of each row, its heavy rows of more than 64,
   their heavy slots and consecutive sub-tasks, and where the bucketize put
@@ -40,7 +64,9 @@ and the push of its node's keys, on one GPU, on plain tensors:
 * the node layout and the push (``hier_output_dist_node_layout``,
   ``hier_output_dist_node_push``): the test plays every rank of one node (the
   bucketize of a batch of its own; the node's offsets, their
-  ``offset_per_bucket_feature`` stacked). It checks each rank's layout
+  ``offset_per_bucket_feature`` stacked, each as its in channel writes it,
+  at ``node_entries``, and garbage elsewhere: a read of another entry
+  shows). It checks each rank's layout
   against counts of the requesters' rows: the needs and the skip, and where
   it puts each key in its target's parts. Then every requester pushes its
   KJT's keys (int64, or int32 widened with their sign) into one set of
@@ -65,8 +91,25 @@ allocation of its own, and memcheck sees an access past a tensor's end::
 
     export PYTORCH_NO_CUDA_MEMORY_CACHING=1
     compute-sanitizer --tool memcheck python test/unit_tests/test_hier_bucketize.py
+
+The counting sort shares shared memory between its threads and warps; check
+it with racecheck and synccheck too. With the caching allocator off,
+initcheck reports an entry of a node's offsets per bucket feature that the
+test compares and no kernel wrote, whatever the memory held. Under these
+tools the whole file can take hours: ``sanitize`` runs the bucketize's cases
+on fewer and smaller calls (each case at its first and last world size, the
+grid's points of at most 70,000 keys, the chunk-bound cases, one KJT whose
+CTAs take two sub-tiles each, and the first, a middle and the last node of
+each sharding)::
+
+    export PYTORCH_NO_CUDA_MEMORY_CACHING=1
+    compute-sanitizer --tool racecheck python test/unit_tests/test_hier_bucketize.py sanitize
+
+and so with ``--tool synccheck`` and ``--tool initcheck``; memcheck takes
+it too, for a quicker run than the whole file's.
 """
 
+import itertools
 import sys
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
@@ -202,6 +245,9 @@ CASES = [
         rules=tuple((ROUNDROBIN, HASH_ROUNDROBIN)[table % 2] for table in range(150)),
         world_sizes=(8, 129, 1024),
     ),
+    Case("all keys in one feature", empty=(0, 1, 3), max_len=40, bound=50),
+    # key 0 has owner 0 under both rules: one owner takes every key
+    Case("one owner takes every key", key_range=(0, 1), bound=3, weighted=True),
 ]
 
 
@@ -359,9 +405,21 @@ def bucketize(
     world_size: int,
     dist_types,
     lengths: bool = False,
+    node: Optional[Tuple[int, int, int]] = None,
+    sorted_path: Optional[bool] = None,
 ) -> Dict[str, torch.Tensor]:
     """The bucketize of the batch, from its offsets, or (``lengths``) from its
-    lengths alone; the input's totals from the input KJT's offsets."""
+    lengths alone; the input's totals from the input KJT's offsets. node:
+    (num_nodes, local_size, node), the bucketize of the in channel of a rank
+    of that node (its offsets per bucket feature only at node_entries); none,
+    the whole table. sorted_path: the radix sort by bucket feature (True),
+    the counting sort (False), or as the sizes choose (None). The hook gets
+    only the arguments given (a stand-in of the hook may take no others)."""
+    given = {}
+    if node is not None:
+        given.update(zip(("num_nodes", "local_size", "node"), node))
+    if sorted_path is not None:
+        given["sorted_path"] = sorted_path
     return planner(
         hier_output_dist_bucketize,
         batch.values,
@@ -372,7 +430,159 @@ def bucketize(
         dist_types,
         world_size,
         batch.in_offsets,
+        **given,
     )
+
+
+def node_entries(
+    world_size: int, num_features: int, local_size: int, node: int
+) -> torch.Tensor:
+    """The entries of offset_per_bucket_feature that the in channel of a rank
+    of ``node`` writes, those node_exchange reads: each owner's first one, and
+    every one of its node's owners (on the GPU)."""
+    first = node * local_size * num_features
+    return (
+        torch.cat(
+            [
+                torch.arange(world_size + 1) * num_features,
+                torch.arange(first, first + local_size * num_features + 1),
+            ]
+        )
+        .unique()
+        .cuda()
+    )
+
+
+def nodes_of(world_size: int) -> Tuple[int, int]:
+    """(num_nodes, local_size) of a test's sharding of world_size ranks: the
+    GPUs per node nearest 8, of at most 128 nodes."""
+    local_size = min(
+        (
+            gpus
+            for gpus in range(1, world_size + 1)
+            if world_size % gpus == 0 and world_size // gpus <= 128
+        ),
+        key=lambda gpus: (abs(gpus - 8), gpus),
+    )
+    return world_size // local_size, local_size
+
+
+def same_tables(
+    got: Dict[str, torch.Tensor],
+    want: Dict[str, torch.Tensor],
+    valid: int,
+    entries: Optional[torch.Tensor] = None,
+) -> bool:
+    """Whether two bucketizes of one batch give the same tables, bit for bit
+    (whichever sort made them, ``counted``): the keys and weights up to the
+    valid ones, the others whole. entries: a node's bucketize (no
+    feature_offsets), its offset_per_bucket_feature compared there only."""
+    names = set(want) - {"counted"}
+    if entries is not None:
+        names -= {"feature_offsets"}
+    if set(got) - {"counted"} != names:
+        return False
+    for name in names:
+        mine, theirs = got[name], want[name]
+        if name in ("keys", "weights"):
+            mine, theirs = mine[:valid], theirs[:valid]
+        elif name == "offset_per_bucket_feature" and entries is not None:
+            mine, theirs = mine[entries], theirs[entries]
+        if not torch.equal(mine, theirs):
+            return False
+    return True
+
+
+def scrub(tables: Dict[str, torch.Tensor]) -> None:
+    """-1 into every table of a bucketize the test is done with (all but the
+    host's counted), before the caching allocator takes its blocks back. The
+    next call of the same sizes gets those blocks, so an entry it does not
+    write holds -1, which no offset, row or bucket feature is, and not the
+    right value this call wrote. Never a table the test still compares
+    against."""
+    for name, tensor in tables.items():
+        if name != "counted":
+            tensor.fill_(-1)
+
+
+# The most owners of the counting sort (bucketize.cu, kMaxCountingBuckets - 1).
+MAX_COUNTING_OWNERS = 2047
+# The keys of a sub-tile of the counting sort (kThreads * kSortItems).
+SUB_TILE = 4096
+# The most static shared memory of a CTA of the counting sort's second kernel
+# (owner_scatter_kernel: 4,448 bytes on sm_90), which takes its dynamic
+# shared memory besides.
+SCATTER_STATIC_SMEM = 8 << 10
+
+
+def scatter_smem(world_size: int, owners: int) -> int:
+    """The dynamic shared memory of a CTA of the counting sort's second kernel
+    (bucketize.cu, scatter_smem), which writes the offsets per bucket feature
+    of ``owners`` owners."""
+    buckets = (world_size + 1 + 3) // 4 * 4
+    return 4 * (2 * SUB_TILE + 3 * buckets + 1 + owners) + 2 * (SUB_TILE + 16 * buckets)
+
+
+def counting_runs(world_size: int, owners: int) -> Optional[bool]:
+    """Whether the bucketize takes the counting sort, as the sizes choose:
+    up to MAX_COUNTING_OWNERS, where its shared memory fits a CTA of this GPU
+    (``shared_memory_per_block_optin``). None where the test cannot tell:
+    within SCATTER_STATIC_SMEM of the GPU's most, or a PyTorch that does not
+    give it."""
+    if world_size > MAX_COUNTING_OWNERS:
+        return False
+    most = getattr(
+        torch.cuda.get_device_properties(torch.cuda.current_device()),
+        "shared_memory_per_block_optin",
+        None,
+    )
+    if most is None:
+        return None
+    need = scatter_smem(world_size, owners)
+    if need + SCATTER_STATIC_SMEM <= most:
+        return True
+    return False if need > most else None
+
+
+def took(tables: Dict[str, torch.Tensor], counting: Optional[bool]) -> bool:
+    """Whether a bucketize took the sort ``counting`` names: the counting
+    sort (True), the radix sort (False), or either (None)."""
+    return counting is None or bool(tables["counted"]) == counting
+
+
+def run_nodes(
+    case: Case,
+    batch: Batch,
+    world_size: int,
+    dist_types,
+    whole: Dict[str, torch.Tensor],
+    every_node: bool = True,
+) -> bool:
+    """The in channel's bucketize on each node of a sharding of world_size
+    ranks (nodes_of) against the whole one: the same tables, and at the
+    node's entries the same offsets per bucket feature; the counting sort
+    where it runs for the node's owners. Past MAX_COUNTING_OWNERS, where the
+    radix sort writes every entry, and not every_node: the first, a middle
+    and the last node. Each node's tables are scrubbed once compared."""
+    num_nodes, local_size = nodes_of(world_size)
+    num_features = len(dist_types)
+    counting = counting_runs(world_size, local_size)
+    nodes = range(num_nodes)
+    if world_size > MAX_COUNTING_OWNERS or not every_node:
+        nodes = sorted({0, num_nodes // 2, num_nodes - 1})
+    good = True
+    for node in nodes:
+        got = bucketize(
+            case, batch, world_size, dist_types, node=(num_nodes, local_size, node)
+        )
+        entries = node_entries(world_size, num_features, local_size, node)
+        good = (
+            good
+            and took(got, counting)
+            and same_tables(got, whole, batch.valid, entries)
+        )
+        scrub(got)
+    return good
 
 
 def run_rule_refusals() -> Dict[str, bool]:
@@ -425,7 +635,9 @@ def run_rule_refusals() -> Dict[str, bool]:
     }
 
 
-def run_case(case: Case, seed: int, world_size: int) -> Dict[str, bool]:
+def run_case(
+    case: Case, seed: int, world_size: int, every_node: bool = True
+) -> Dict[str, bool]:
     batch = make_batch(case, seed, world_size)
     dist_types = rules_of(case)
     ref = reference(case, batch, world_size, dist_types)
@@ -460,21 +672,232 @@ def run_case(case: Case, seed: int, world_size: int) -> Dict[str, bool]:
             out["bucket_feature_of_row"].cpu().long(), ref["bucket_feature_of_row"]
         ),
         "totals": out["input_length_per_key"].tolist() == batch.in_totals,
+        "counted": took(out, counting_runs(world_size, world_size)),
     }
-
-    def same(other: Dict[str, torch.Tensor]) -> bool:
-        return other.keys() == out.keys() and all(
-            torch.equal(other[name][:valid], tensor[:valid])
-            if name in ("keys", "weights")
-            else torch.equal(other[name], tensor)
-            for name, tensor in out.items()
-        )
-
-    checks["again"] = same(bucketize(case, batch, world_size, dist_types))
-    checks["lengths"] = same(
-        bucketize(case, batch, world_size, dist_types, lengths=True)
-    )
+    # Again, from the lengths, and by the radix sort: the same tables, the
+    # first two by the same sort; each scrubbed once compared.
+    for check, given, counting in (
+        ("again", {}, bool(out["counted"])),
+        ("lengths", {"lengths": True}, bool(out["counted"])),
+        ("sorted", {"sorted_path": True}, False),
+    ):
+        got = bucketize(case, batch, world_size, dist_types, **given)
+        checks[check] = took(got, counting) and same_tables(got, out, valid)
+        scrub(got)
+    checks["nodes"] = run_nodes(case, batch, world_size, dist_types, out, every_node)
     return checks
+
+
+# ── the counting sort against the radix sort ─────────────────────────────────
+
+# Features, owners and keys: each pair of features and owners, with the keys
+# in turn. 2,048 owners take the radix sort.
+GRID_FEATURES = (1, 8, 300, 1024, 4096)
+GRID_WORLD_SIZES = (1, 8, 16, 129, 512, 1024, 2047, 2048)
+GRID_KEYS = (0, 31, 4095, 4096, 4097, 70_000, 1_000_000)
+GRID = [
+    (num_features, world_size, GRID_KEYS[index % len(GRID_KEYS)])
+    for index, (num_features, world_size) in enumerate(
+        itertools.product(GRID_FEATURES, GRID_WORLD_SIZES)
+    )
+]
+# The shapes the counting sort is for, past the grid's: 4,096 features on 2,
+# 4 and 64 nodes of 8, at about the keys of a GPU (4.2M, and 12.6M), so its
+# CTAs take many sub-tiles each (4, 4 and 24 at 132 SMs). Each with the seed
+# of its KJT (run_grid_case): the first, uniform features with int32 keys,
+# weights and keys past the valid ones; the others, no keys in the first and
+# the last feature, with int64 keys, and the last with keys past the valid
+# ones.
+PRODUCTION = (
+    (4096, 16, 4_200_000, 603),
+    (4096, 32, 3_300_000, 602),
+    (4096, 512, 12_600_000, 605),
+)
+
+
+def feature_batch(
+    starts: List[int],
+    num_keys: int,
+    batch_size: int,
+    seed: int,
+    values: torch.dtype = torch.int64,
+    weighted: bool = False,
+) -> Tuple[Case, Batch]:
+    """A KJT of len(starts) - 1 features whose keys start at ``starts`` (the
+    last entry: the valid keys), num_keys keys in all (index dedup's keys
+    past the valid ones after them), each feature's keys over random samples;
+    a rule per feature, roundrobin or hash_roundrobin at random, some keys at
+    the edges of the rules."""
+    generator = torch.Generator().manual_seed(seed)
+    num_features, valid = len(starts) - 1, starts[-1]
+    feature = torch.repeat_interleave(
+        torch.arange(num_features), torch.tensor(starts).diff()
+    )
+    sample = torch.randint(0, batch_size, (valid,), generator=generator)
+    lengths = torch.bincount(
+        feature * batch_size + sample, minlength=num_features * batch_size
+    )
+    keys = torch.randint(
+        -(1 << 40), 1 << 40, (num_keys,), generator=generator, dtype=torch.int64
+    )
+    keys[torch.rand(num_keys, generator=generator) < 0.2] = 7
+    edges = torch.tensor(edge_keys(values, 2048))
+    places = torch.nonzero(torch.rand(num_keys, generator=generator) < 0.1).flatten()
+    keys[places] = edges[
+        torch.randint(0, edges.numel(), (places.numel(),), generator=generator)
+    ]
+    rules = tuple(
+        (ROUNDROBIN, HASH_ROUNDROBIN)[rule]
+        for rule in torch.randint(0, 2, (num_features,), generator=generator).tolist()
+    )
+    in_lengths = lengths + torch.randint(0, 3, lengths.shape, generator=generator)
+    weights = torch.rand(num_keys, generator=generator).cuda() if weighted else None
+    case = Case(
+        f"{num_features} features",
+        batch_size=batch_size,
+        tables=tuple(range(num_features)),
+        rules=rules,
+        values=values,
+        weighted=weighted,
+    )
+    batch = Batch(
+        lengths=lengths.cuda(),
+        offsets=offsets_of(lengths.cuda()),
+        values=keys.to(values).cuda(),
+        weights=weights,
+        in_offsets=offsets_of(in_lengths.cuda()),
+        in_totals=in_lengths.view(num_features, batch_size).sum(1).tolist(),
+        valid=valid,
+    )
+    return case, batch
+
+
+def run_sorts(
+    case: Case, batch: Batch, world_size: int, every_node: bool = True
+) -> Dict[str, bool]:
+    """The counting sort against the radix sort, bit for bit: whole, from the
+    offsets and from the lengths, and on every node (run_nodes); as the sizes
+    choose, the counting sort where counting_runs says it runs. Forced, the
+    counting sort runs exactly where the sizes choose it, and elsewhere
+    raises with the reason: more than MAX_COUNTING_OWNERS owners, or more
+    shared memory than a CTA of this GPU takes."""
+    dist_types = rules_of(case)
+    valid = batch.valid
+    radix = bucketize(case, batch, world_size, dist_types, sorted_path=True)
+    chosen = bucketize(case, batch, world_size, dist_types)
+    counted = bool(chosen["counted"])
+    checks = {
+        "chosen": took(radix, False)
+        and took(chosen, counting_runs(world_size, world_size))
+        and same_tables(chosen, radix, valid),
+        "totals": chosen["input_length_per_key"].tolist() == batch.in_totals,
+    }
+    scrub(chosen)
+    lengths = bucketize(case, batch, world_size, dist_types, lengths=True)
+    checks["lengths"] = took(lengths, counted) and same_tables(lengths, radix, valid)
+    scrub(lengths)
+    checks["nodes"] = run_nodes(case, batch, world_size, dist_types, radix, every_node)
+    try:
+        forced = bucketize(case, batch, world_size, dist_types, sorted_path=False)
+        checks["counting"] = (
+            counted and took(forced, True) and same_tables(forced, radix, valid)
+        )
+        scrub(forced)
+    except RuntimeError as error:
+        reason = (
+            f"at most {MAX_COUNTING_OWNERS} owners"
+            if world_size > MAX_COUNTING_OWNERS
+            else "shared memory"
+        )
+        checks["counting"] = not counted and reason in str(error)
+    scrub(radix)
+    return checks
+
+
+def run_grid_case(
+    num_features: int,
+    world_size: int,
+    num_keys: int,
+    seed: int,
+    every_node: bool = True,
+) -> Dict[str, bool]:
+    """A KJT of the grid: uniform features, all keys in one feature, or empty
+    features at both ends, in turn; index dedup's keys past the valid ones in
+    every other case; int32 keys and weights in every third."""
+    generator = torch.Generator().manual_seed(seed)
+    valid = num_keys - (num_keys // 7 if seed % 2 else 0)
+    pattern = seed % 3
+    if pattern == 0 or num_features < 3:  # uniform
+        feature = torch.randint(0, num_features, (valid,), generator=generator)
+    elif pattern == 1:  # one feature
+        feature = torch.full((valid,), num_features // 2)
+    else:  # none in the first and last feature
+        feature = torch.randint(1, num_features - 1, (valid,), generator=generator)
+    starts = [0] + torch.bincount(feature, minlength=num_features).cumsum(0).tolist()
+    case, batch = feature_batch(
+        starts,
+        num_keys,
+        batch_size=4 if num_features > 512 else 64,
+        seed=seed,
+        values=torch.int32 if seed % 3 == 0 else torch.int64,
+        weighted=seed % 3 == 0,
+    )
+    return run_sorts(case, batch, world_size, every_node)
+
+
+# Features of the KJTs whose features start on the bounds of the counting
+# sort's chunks: its CTAs find the features of their bounds by a warp's 32
+# probes a round.
+SEARCH_FEATURES = (1, 31, 32, 33, 1023, 1024, 4096)
+SEARCH_KEYS = 70_000
+
+
+def counting_chunk(num_keys: int, world_size: int) -> int:
+    """The keys of a CTA of the counting sort (bucketize.cu, counting_grid)."""
+    sms = torch.cuda.get_device_properties(
+        torch.cuda.current_device()
+    ).multi_processor_count
+    buckets = (world_size + 1 + 3) // 4 * 4
+    ctas = min(max(-(-num_keys // SUB_TILE), 1), (2 if buckets <= 128 else 1) * sms)
+    chunk = -(-max(num_keys, 1) // ctas)
+    return -(-chunk // 32) * 32
+
+
+def run_search_case(
+    num_features: int, world_size: int, seed: int, every_node: bool = True
+) -> Dict[str, bool]:
+    """A KJT of SEARCH_KEYS keys whose features start at the bounds of the
+    counting sort's chunks, one key before and one after; the others at
+    random places, some features empty. Without keys past the valid ones (the
+    last feature ends at the last key), or (odd seeds) with them from a
+    chunk's bound on."""
+    generator = torch.Generator().manual_seed(seed)
+    chunk = counting_chunk(SEARCH_KEYS, world_size)
+    bounds = list(range(chunk, SEARCH_KEYS, chunk))
+    valid = bounds[len(bounds) // 2] if seed % 2 else SEARCH_KEYS
+    near = sorted(
+        {
+            bound + step
+            for bound in bounds
+            for step in (-1, 0, 1)
+            if 0 < bound + step < valid
+        }
+    )
+    inner = num_features - 1
+    if inner <= len(near):
+        picks = torch.linspace(0, len(near) - 1, inner).round().long().tolist()
+        starts = [near[pick] for pick in picks]
+    else:
+        starts = (
+            near
+            + torch.randint(
+                0, valid + 1, (inner - len(near),), generator=generator
+            ).tolist()
+        )
+    case, batch = feature_batch(
+        [0] + sorted(starts) + [valid], SEARCH_KEYS, batch_size=2, seed=seed
+    )
+    return run_sorts(case, batch, world_size, every_node)
 
 
 # ── index dedup's fan-out ────────────────────────────────────────────────────
@@ -786,16 +1209,31 @@ def run_node_case(case: NodeCase, seed: int) -> Dict[str, bool]:
     batches = [
         make_batch(kjt, seed * 100 + local_rank) for local_rank in range(local_size)
     ]
+    # Each requester's whole bucketize, which the reference reads (its
+    # offsets per bucket feature at every entry) and which it pushes.
     ranks = [bucketize(kjt, batch, world_size, dist_types) for batch in batches]
     valid = [batch.valid for batch in batches]
     offset_per_bucket_feature = [
         bucketized["offset_per_bucket_feature"].tolist() for bucketized in ranks
     ]
+    generator = torch.Generator().manual_seed(seed)
     # The node's offsets, as node_exchange gathers them: row r is requester
-    # r's offset_per_bucket_feature.
-    node_offsets = torch.stack(
-        [bucketized["offset_per_bucket_feature"] for bucketized in ranks]
+    # r's offset_per_bucket_feature as its in channel writes it, at the
+    # entries the node layout reads (node_entries), and garbage at the
+    # others, so a read of another entry shows. Only those entries are
+    # copied: the bucketize does not write the others.
+    contract = node_entries(world_size, num_features, local_size, node)
+    node_offsets = garbage(
+        (local_size, world_size * num_features + 1), torch.int64, generator
     )
+    for local_rank, batch in enumerate(batches):
+        in_channel = bucketize(
+            kjt, batch, world_size, dist_types, node=(num_nodes, local_size, node)
+        )
+        node_offsets[local_rank, contract] = in_channel["offset_per_bucket_feature"][
+            contract
+        ]
+        scrub(in_channel)
     # The reference: each requester's keys of each owner and feature, counted
     # from its rows. [requester][owner node][target][feature].
     counts = torch.stack(
@@ -817,7 +1255,6 @@ def run_node_case(case: NodeCase, seed: int) -> Dict[str, bool]:
     lookup_keys = need_lookup + case.lookup_slack
     remote_keys = need_remote + case.remote_slack if num_nodes > 1 else 0
     skip = need_lookup > lookup_keys or need_remote > remote_keys
-    generator = torch.Generator().manual_seed(seed)
 
     def layout_of(local_rank: int, **owner) -> Dict[str, torch.Tensor]:
         """A rank's layout from the node's offsets, on the GPU. On one node,
@@ -1138,13 +1575,59 @@ def report(label: str, checks: Dict[str, bool]) -> bool:
 
 
 def main() -> None:
+    # sanitize: the bucketize's cases on fewer and smaller calls, for
+    # compute-sanitizer (the module's docstring)
+    sanitize = sys.argv[1:] == ["sanitize"]
+    every_node = not sanitize
     torch.cuda.set_device(0)
-    failures = int(not report("rule refusals", run_rule_refusals()))
+    failures = 0
+    if not sanitize:
+        failures += not report("rule refusals", run_rule_refusals())
     for case_idx, case in enumerate(CASES):
-        for world_size in case.world_sizes:
-            checks = run_case(case, 100 + case_idx, world_size)
+        world_sizes = case.world_sizes
+        if sanitize:
+            world_sizes = sorted({world_sizes[0], world_sizes[-1]})
+        for world_size in world_sizes:
+            checks = run_case(case, 100 + case_idx, world_size, every_node)
             label = f"bucketize '{case.name}' world_size={world_size}"
             failures += not report(label, checks)
+    grid = [
+        (num_features, world_size, num_keys, 400 + case_idx)
+        for case_idx, (num_features, world_size, num_keys) in enumerate(GRID)
+        if not sanitize or num_keys <= SEARCH_KEYS
+    ]
+    if sanitize:
+        # CTAs of two sub-tiles each, the second of 32 keys (counting_grid):
+        # the fewest keys whose CTAs carry a sub-tile's state to the next
+        sms = torch.cuda.get_device_properties(0).multi_processor_count
+        grid.append((300, 129, sms * (SUB_TILE + 32), 453))
+    else:
+        grid += PRODUCTION
+    for num_features, world_size, num_keys, seed in grid:
+        checks = run_grid_case(num_features, world_size, num_keys, seed, every_node)
+        label = (
+            f"sorts {num_features} features, world_size={world_size}, {num_keys} keys"
+        )
+        failures += not report(label, checks)
+    for case_idx, num_features in enumerate(SEARCH_FEATURES):
+        # with keys past the valid ones (an odd seed) at 129 owners only
+        for tail, world_size in enumerate((16, 129)):
+            checks = run_search_case(
+                num_features, world_size, 500 + 2 * case_idx + tail, every_node
+            )
+            label = f"chunk bounds {num_features} features, world_size={world_size}"
+            failures += not report(label, checks)
+    if sanitize:
+        print("ALL PASSED" if failures == 0 else f"{failures} FAILED")
+        sys.exit(1 if failures else 0)
+    if torch.cuda.device_count() > 1:
+        # The shared memory attribute is per GPU (bucketize.cu, takes_smem): a
+        # grid point past 48 KiB on GPU 1, after GPU 0's.
+        with torch.cuda.device(1):
+            checks = run_grid_case(300, 129, SEARCH_KEYS, 701)
+        failures += not report(
+            f"sorts on GPU 1, 300 features, world_size=129, {SEARCH_KEYS} keys", checks
+        )
     for case_idx, case in enumerate(FANOUT_CASES):
         checks = run_fanout_case(case, 200 + case_idx)
         failures += not report(f"fanout '{case.name}'", checks)

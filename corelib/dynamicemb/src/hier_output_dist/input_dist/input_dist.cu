@@ -131,12 +131,15 @@ InDist InChannel::input_dist(const PlanInput &input) {
               "hier_output_dist: the keys carry weights exactly when the op was made with "
               "weights (",
               weighted_ ? "with" : "without", ")");
-  check_bucketize_input(input, dist_types_, sizes_.topo.world_size);
-  check_fanout_input(input.reverse_indices);
-  // The bucketize up to its gather (the push gathers), and the fan-out of its rows.
-  const BucketizedKeys bucketized = bucketize_rows(input, dist_types_, sizes_.topo.world_size);
-  const FanoutTables fanout = fanout_tables(input.reverse_indices, bucketized.inv, fanout_words_);
   const Topo &topo = sizes_.topo;
+  check_bucketize_input(input, dist_types_, topo.world_size);
+  check_fanout_input(input.reverse_indices);
+  // The bucketize up to its gather (the push gathers), and the fan-out of its rows. Its offsets
+  // per bucket feature are those node_exchange reads: each owner's first one, and every one of
+  // this node's owners.
+  const BucketizedKeys bucketized = bucketize_rows(
+      input, dist_types_, topo.world_size, (int64_t)topo.node * topo.local_size, topo.local_size);
+  const FanoutTables fanout = fanout_tables(input.reverse_indices, bucketized.inv, fanout_words_);
   const int64_t local_size = topo.local_size, num_nodes = topo.num_nodes,
                 num_features = sizes_.num_features;
   const auto long_options = bucketized.offset_per_bucket.options();

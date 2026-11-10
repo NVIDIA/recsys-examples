@@ -24,9 +24,11 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 // and chunks) runs on one CTA of kThreads threads (kOneCta), which loops over
 // them and syncs with __syncthreads; its scans are cub::BlockScan, a tile at
 // a time. No kernel waits for another CTA: a step that needs every item done
-// goes on in its next kernel, or in the kernel's last CTA out (the fan-out's
-// count, bucketize.cu: each CTA takes a ticket once its items are done, and
-// the one that takes the last goes on; none waits for it).
+// goes on in its next kernel (the bucketize's counting sort, bucketize.cu:
+// each CTA of its second kernel reads the counts every CTA of the first one
+// wrote), or in the kernel's last CTA out (the fan-out's count, bucketize.cu:
+// each CTA takes a ticket once its items are done, and the one that takes the
+// last goes on; none waits for it).
 #pragma once
 
 #include <ATen/ATen.h>
@@ -119,6 +121,23 @@ __device__ __forceinline__ int64_t upper_bound(const T *table, int64_t n, V valu
   }
   return lo;
 }
+// upper_bound by the whole warp, in the table entry(0), ..., entry(n - 1): each round its lanes
+// probe 32 entries `step` apart, and the range of the answer narrows 32 times, so a table of n
+// entries takes ceil(log32(n + 1)) rounds (3 for 4097). Every lane of the warp, with the same
+// arguments; every lane gets the answer. The probes stay below n, whatever the table holds.
+template <typename Entry, typename V>
+__device__ __forceinline__ int64_t warp_upper_bound(int64_t n, Entry entry, V value, int lane) {
+  int64_t lo = 0, hi = n;  // the answer is in [lo, hi]
+  while (lo < hi) {
+    const int64_t step = (hi - lo + 31) / 32, probe = lo + step * lane;
+    // the lanes from lane 0 on whose probe is at most value
+    const int64_t at_most = __popc(__ballot_sync(0xffffffffu, probe < hi && entry(probe) <= value));
+    if (at_most == 0) return lo;
+    hi = min(hi, lo + step * at_most);
+    lo += step * (at_most - 1) + 1;
+  }
+  return lo;
+}
 
 // ── the offsets of sorted runs ──
 
@@ -126,7 +145,7 @@ __device__ __forceinline__ int64_t upper_bound(const T *table, int64_t n, V valu
 // a thread per bucket in [0, buckets]: offsets[bucket] is the first position
 // whose value is at least `bucket` (n when none is), by a search. Every
 // stride-th offset also goes to coarse[bucket / stride] (coarse nullptr:
-// none).
+// none). The bucketize's radix sort by bucket feature takes it (bucketize.cu).
 template <typename Value, typename Offset>
 __global__ void __launch_bounds__(kThreads)
     run_offsets_kernel(const Value *sorted, int64_t n, int64_t buckets, Offset *offsets,

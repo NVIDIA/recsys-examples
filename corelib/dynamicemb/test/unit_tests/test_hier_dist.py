@@ -347,6 +347,18 @@ CASES = [
         batch=64,
         max_len=4,
     ),
+    # 1,024 features, 128 per table, of short sequences: the bucketize's
+    # chunks start and end inside runs of many short features
+    Case(
+        "fp32, 1024 features",
+        tables=tuple(
+            tuple(f"f{128 * table + feature}" for feature in range(128))
+            for table in range(8)
+        ),
+        num_embeddings=1 << 16,
+        batch=64,
+        max_len=2,
+    ),
     # LFU with no keys on the last rank: that rank still sends weights (the
     # frequency counters, empty), as the other ranks do
     Case(

@@ -56,16 +56,31 @@ namespace {
 // rules' codes on the host, kCyclic or kHashedCyclic, the op's (it raises for
 // any other, as Config::validate refuses them); their copy to the GPU does
 // not wait for the device (the tests run the planner under the sync debug
-// mode "error").
+// mode "error"). num_nodes, local_size and node (all or none): the bucketize
+// of the in channel of a rank of that node, whose offset_per_bucket_feature
+// holds each owner's first entry and every entry of its node's owners, and
+// garbage elsewhere (then no feature_offsets); none, every entry.
+// sorted_path: bucketize_rows' (the radix sort by bucket feature, the
+// counting sort, or none: as the sizes choose); counted (bool, on the host):
+// whether the counting sort ran.
 std::map<std::string, at::Tensor> bucketize_test(
     at::Tensor values, c10::optional<at::Tensor> offsets, c10::optional<at::Tensor> lengths,
     int64_t batch_size, c10::optional<at::Tensor> weights, std::vector<int> dist_types,
-    int64_t world_size, at::Tensor input_offsets) {
+    int64_t world_size, at::Tensor input_offsets, c10::optional<int64_t> num_nodes,
+    c10::optional<int64_t> local_size, c10::optional<int64_t> node,
+    c10::optional<bool> sorted_path) {
   for (const int code : dist_types)
     TORCH_CHECK(code == (int)DistType::kCyclic || code == (int)DistType::kHashedCyclic,
                 "hier_output_dist: the bucketize takes dist_type codes ", (int)DistType::kCyclic,
                 " (roundrobin) and ", (int)DistType::kHashedCyclic, " (hash_roundrobin), got ",
                 code);
+  const bool of_node = node.has_value();
+  TORCH_CHECK(num_nodes.has_value() == of_node && local_size.has_value() == of_node &&
+                  (!of_node ||
+                   (*num_nodes >= 1 && *local_size >= 1 && *num_nodes * *local_size == world_size &&
+                    *node >= 0 && *node < *num_nodes)),
+              "hier_output_dist: the bucketize's node: num_nodes, local_size and node of "
+              "world_size ranks, or none of them");
   c10::cuda::CUDAGuard guard(values.device());
   PlanInput input;
   input.values = values;
@@ -77,7 +92,11 @@ std::map<std::string, at::Tensor> bucketize_test(
   const at::Tensor rules = at::tensor(dist_types, at::kInt)
                                .pin_memory()
                                .to(values.options().dtype(at::kInt), /*non_blocking=*/true);
-  const BucketizedKeys bucketized = bucketize_keys(input, rules, world_size);
+  check_bucketize_input(input, rules, world_size);
+  const int64_t first_owner = of_node ? *node * *local_size : 0,
+                owners = of_node ? *local_size : world_size;
+  const BucketizedKeys bucketized =
+      bucketize_keys(input, rules, world_size, first_owner, owners, sorted_path);
   const int64_t num_features = (int64_t)dist_types.size();
   std::map<std::string, at::Tensor> named{
       {"keys", bucketized.keys},
@@ -85,11 +104,13 @@ std::map<std::string, at::Tensor> bucketize_test(
       {"bucket_feature_of_row", bucketized.bucket_feature_of_row},
       {"offset_per_bucket_feature", bucketized.offset_per_bucket_feature},
       {"offset_per_bucket", bucketized.offset_per_bucket},
-      {"feature_offsets",
-       (bucketized.offset_per_bucket_feature.unfold(0, num_features + 1, num_features) -
-        bucketized.offset_per_bucket.narrow(0, 0, world_size).unsqueeze(1))
-           .reshape({-1})},
-      {"input_length_per_key", bucketized.input_length_per_key}};
+      {"input_length_per_key", bucketized.input_length_per_key},
+      {"counted", at::scalar_tensor(bucketized.counted, at::kBool)}};
+  if (!of_node)
+    named["feature_offsets"] =
+        (bucketized.offset_per_bucket_feature.unfold(0, num_features + 1, num_features) -
+         bucketized.offset_per_bucket.narrow(0, 0, world_size).unsqueeze(1))
+            .reshape({-1});
   if (bucketized.key_weights.defined()) named["weights"] = bucketized.key_weights;
   return named;
 }
@@ -99,6 +120,7 @@ std::map<std::string, at::Tensor> bucketize_test(
 // zeroed tensor of this call's.
 std::map<std::string, at::Tensor> fanout_test(at::Tensor reverse_indices, at::Tensor inv,
                                               c10::optional<at::Tensor> words) {
+  check_fanout_input(reverse_indices);
   c10::cuda::CUDAGuard guard(inv.device());
   const FanoutTables fanout = fanout_tables(reverse_indices, inv, words.value_or(at::Tensor()));
   return {
@@ -502,10 +524,14 @@ void bind_testing(py::module &py_module) {
   py_module.def("hier_output_dist_bucketize", &bucketize_test,
                 "The keys bucketized by owner (widened to int64 with their sign), their rows in "
                 "the KJT, their bucket features and offsets, and the input's per-feature totals, "
-                "by name",
+                "by name; given num_nodes, local_size and node, as the in channel of that node "
+                "writes the offsets; sorted_path: the radix sort (True), the counting sort "
+                "(False), or as the sizes choose (None); counted: whether the counting sort ran",
                 py::arg("values"), py::arg("offsets"), py::arg("lengths"), py::arg("batch_size"),
                 py::arg("weights"), py::arg("dist_types"), py::arg("world_size"),
-                py::arg("input_offsets"));
+                py::arg("input_offsets"), py::arg("num_nodes") = py::none(),
+                py::arg("local_size") = py::none(), py::arg("node") = py::none(),
+                py::arg("sorted_path") = py::none());
   py_module.def("hier_output_dist_fanout", &fanout_test,
                 "Index dedup's fan-out of the bucketized rows, by name; words: the kernel's "
                 "counter and CTA ticket (int64 [2], zero), which it leaves at zero, or None",

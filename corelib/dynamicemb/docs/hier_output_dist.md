@@ -1157,7 +1157,7 @@ an index taken from device data is clamped first: a call that does not fit
 runs every step on what arrived and stays in bounds.
 
 With the benchmark's configuration (8 features, one owner rule), the
-bucketize queues 29 kernels and copies per call (DynamicEmb's index dedup
+bucketize queues 22 kernels and copies per call (DynamicEmb's index dedup
 and the fan-out table included), and the steps after it 5 on one node and
 about 40 across nodes (an estimate from the code), CUB's included. The
 node's part of a call is three comm kernels (`node_exchange`,
@@ -1182,22 +1182,62 @@ bucketize (`bucketize_rows`, `bucketize.cu`), named after TorchRec's
 2. **The keys by owner.** Each key's feature comes from the KJT's offsets, and
    its owner from its feature's rule (`dist_type`: `roundrobin` or
    `hash_roundrobin`), in the arithmetic of the keys' own width (see
-   below). The kernel reads the rule of each key's feature at run time, so
-   the tables of a sharding can have different rules. A warp's keys are
-   consecutive, so all but a few warps have the keys of one feature and
-   take one branch. Then one stable radix sort by bucket feature (an
-   int32, owner × `num_features` + feature) puts the keys' rows in
-   `[owner][feature][sample][position]` order: `inv` holds each one's row
-   in the KJT; the keys past the valid ones (index dedup) go last. Both
-   rules keep the key, so the keys stay in the KJT: bucketized row `row` is
-   the KJT's key at `inv[row]`, widened to `int64` with its sign, and its
-   weight is the KJT's at `inv[row]`. The
-   bucketize does not gather the keys into that order. The push does, as it
-   stores them (`node_key_push`, section 10.2). Searches of the sorted
-   bucket features give where each bucket feature's and each owner's keys start
-   (`offset_per_bucket_feature`, `offset_per_bucket`). It also gives the
-   input KJT's per-feature totals. Its outputs take 8 bytes per key, with
-   or without weights, and nothing of size `world_size × samples`.
+   below). The kernels read the rule of each key's feature at run time, so
+   the tables of a sharding can have different rules. The keys' rows go in
+   `[owner][feature][sample][position]` order: `inv` holds each one's row in
+   the KJT, and the keys past the valid ones (index dedup) go last. A KJT's
+   offsets never fall, so neither do its keys' features: two keys of one
+   owner are in that order in their KJT order. So a stable counting sort by
+   owner gives the order, over `world_size + 1` buckets (the owners, then
+   the keys past the valid ones), in two kernels, each a CTA per chunk of
+   consecutive keys (a chunk per 4,096 keys, at most two per SM, or one per
+   SM above 127 owners):
+   * `owner_count_kernel` counts each chunk's keys of each bucket. Two of
+     its warps first find the features of the chunk's first and last key,
+     with 32 probes of the offsets a round (`warp_upper_bound`). Each thread
+     loads its 8 keys before it finds their features and owners. For a KJT
+     of offsets the kernel also writes the input KJT's per-feature totals;
+     for a KJT of lengths, the kernel that first finds where its features
+     start writes them.
+   * `owner_scatter_kernel` adds up the counts of every chunk: where each
+     owner's keys start (`offset_per_bucket`), and where each chunk's keys of
+     each owner go. Then it ranks its chunk's keys in sub-tiles of 4,096 (a
+     warp's lanes match their buckets, `__match_any_sync`), stages them in
+     shared memory by bucket, and writes `inv` and each row's bucket feature
+     (`bucket_feature_of_row`, an int32: owner × `num_features` + feature,
+     `world_size × num_features` past the valid keys), a bucket's rows from
+     consecutive threads.
+
+   No CTA waits for another, no atomic decides a row, and no device-wide
+   sort runs. Both rules keep the key, so the keys stay in the KJT:
+   bucketized row `row` is the KJT's key at `inv[row]`, widened to `int64`
+   with its sign, and its weight is the KJT's at `inv[row]`. The bucketize
+   does not gather the keys into that order. The push does, as it stores
+   them (`node_key_push`, section 10.2).
+
+   `offset_per_bucket_feature` says where each bucket feature's keys start.
+   It is written only where the node layout reads it (`NodeRow`, section
+   10.3): at each owner's first bucket feature, and at every bucket feature
+   of the owners of this rank's node; on one node, every entry. The other
+   entries hold garbage. A key of owner `o` and feature `f` writes its row
+   into `o`'s entries of the features after that of `o`'s key before it, up
+   to `f`. After its last key of `o`, a CTA writes the row past it into
+   `o`'s entries up to the feature of the next chunk's first key. So each
+   entry is written once.
+
+   The counting sort's shared memory grows with the owners (about 41 KiB at
+   16, 62 KiB at 512). Above 2,047 owners, or where it does not fit the
+   GPU, the bucketize takes the radix sort that the counting sort replaced:
+   one stable CUB sort by bucket feature, then a search of the sorted bucket
+   features per bucket feature, which writes every entry. The test hook
+   `hier_output_dist_bucketize` runs either sort (`sorted_path`) and, given
+   a node (`num_nodes`, `local_size`, `node`), the in channel's entries, and
+   says which sort ran (`counted`); the tests compare the two sorts bit for
+   bit. At the benchmark the counting sort is 2 kernels and 6 allocations;
+   the radix sort was 9 GPU submissions (13 at 4,096 features on 2 nodes,
+   where it sorts in 3 passes) and 9 allocations. The outputs take 8 bytes
+   per key, with or without weights, and nothing of size
+   `world_size × samples`.
 3. **The fan-out table**: for each deduplicated row, its
    original rows in increasing order, from a stable radix sort of the
    reverse indices. A row with more than 64 original rows is a *heavy row*:
@@ -2308,9 +2348,9 @@ The capacities are the ones in place (section 5), and `row_bytes` and
 | the proxy's rows before each key (`node_exp_off`) | `8 × remote_keys` | per call |
 | the group runs and the backward's ready counters | `16 × num_nodes × (2 × num_groups + 1) + 8 × max_chunks` | per call |
 | index dedup's fan-out table | about 13 bytes per original key (on this path the deduplicated KJT keeps the original length) | per call |
-| the bucketize, in the caller's pool | at its peak about 36 bytes per key, during the fan-out's sort: its outputs (`inv` and `bucket_feature_of_row`, 8), where it put each row (4), the sort's keys and values in and out (16) and CUB's extra key and value buffers (8); before that the keys by owner hold at most 24, their outputs included, or 16 when their sort takes one pass (`world_size × num_features` below 256); for either owner rule, with or without weights | transient |
+| the bucketize, in the caller's pool | at its peak about 36 bytes per key, during the fan-out's sort: its outputs (`inv` and `bucket_feature_of_row`, 8), where it put each row (4), the sort's keys and values in and out (16) and CUB's extra key and value buffers (8); before that the counting sort by owner holds its outputs alone (8) and a count per CTA and owner (at most about 1 MiB), and above 2,047 owners, or where the counting sort's shared memory does not fit the GPU, the radix sort by bucket feature at most 24, its outputs included; for either owner rule, with or without weights | transient |
 | the planner, in the caller's pool | its largest step: across nodes the proxy's, about 64 bytes per entry of `remote_keys` with weights, 60 without (52 when `rows_per_payload` is 1); the requester's holds about 24 bytes per key besides its maps (the gathered `remote_map` words, 12, and the peer and word each comes from, 12), and the owner's adds only its KJT values and row map (per call); on one node nothing per key beyond the per-call tensors | transient |
-| the input dist's tables per (rank, feature), in the caller's pool | the bucketize's `offset_per_bucket_feature` and the node layout's `row_shift`, about `8 × world_size × num_features` each; across nodes, while the proxy's node dedup runs, its block tables, about `8 × (world_size + num_nodes) × num_features` (section 15.4) | transient |
+| the input dist's tables per (rank, feature), in the caller's pool | the bucketize's `offset_per_bucket_feature` and the node layout's `row_shift`, about `8 × world_size × num_features` each (the bucketize writes only each owner's first entry and its node's owners' entries, section 10.1); across nodes, while the proxy's node dedup runs, its block tables, about `8 × (world_size + num_nodes) × num_features` (section 15.4) | transient |
 
 The transient figures come from the code: bytes in live tensors. The
 caching allocator's rounding and the cached blocks it hands out add up to
@@ -2689,8 +2729,10 @@ its row map. Both take the lookup groups, and both run the device code of
 `rail_exchange` (`input_dist/rail.cuh`).
 
 `test_hier_bucketize.py` plays every rank of one node with the first two
-hooks. Among its checks: each rank's node layout is the same with the items
-on one CTA and on a grid (`items_in_cta`), also with 127 to 300 features.
+hooks. Each rank's offsets are those its in channel writes (section 10.1),
+with garbage at the other entries, so a read of another entry shows. Among
+its checks: each rank's node layout is the same with the items on one CTA
+and on a grid (`items_in_cta`), also with 127 to 300 features.
 `test_hier_dedup.py` plays every rank of an N-node job, also with 2 and 3
 lookup groups and a group per feature. Among its checks: each owner's row
 map, where its groups' slices start, its group shifts and the group runs of

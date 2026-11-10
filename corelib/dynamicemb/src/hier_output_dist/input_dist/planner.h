@@ -52,8 +52,9 @@ at::Tensor sort_keys(const at::Tensor &keys, int end_bit);
 at::Tensor offsets_of(const at::Tensor &counts, at::ScalarType dtype = at::kLong);
 
 // The bucketize of a call (the requester's, local, on the caller's stream):
-// its keys by owner, as TorchRec's bucketize orders them, and the fan-out of
-// its deduplicated rows: kernels and a CUB sort each (bucketize.cu).
+// its keys by owner, as TorchRec's bucketize orders them (a counting sort by
+// owner), and the fan-out of its deduplicated rows (kernels and a CUB sort):
+// bucketize.cu.
 
 // The keys of a call as the bucketize takes them: the KJT the input dist was
 // given, index-deduplicated (each table's keys once: only its first keys are
@@ -84,9 +85,14 @@ struct BucketizedKeys {
   at::Tensor bucket_feature_of_row;  // int32 [B]: the bucket feature owner * num_features + feature
                                      // of each, world_size * num_features past the valid
   at::Tensor offset_per_bucket_feature;  // int64 [world_size * num_features + 1]: where each bucket
-                                         // feature starts
+                                         // feature starts, written at each owner's first one
+                                         // (owner * num_features, owner in [0, world_size]) and
+                                         // at those of the owners bucketize_rows is given; the
+                                         // other entries hold garbage (bucketize_rows)
   at::Tensor offset_per_bucket;          // int64 [world_size + 1]: where each bucket (owner) starts
   at::Tensor input_length_per_key;       // int64 [num_features]: keys per feature of the input KJT
+  bool counted = false;  // whether the counting sort by owner made these, not the radix sort by
+                         // bucket feature (bucketize_rows); the hook reports it
 };
 
 // The bucketize places the keys of each feature on their owners by the feature's rule, its
@@ -95,19 +101,30 @@ struct BucketizedKeys {
 
 // The checks of the bucketize's inputs (the keys, offsets or lengths, the input KJT's offsets,
 // weights, the rules) and of the fan-out's (reverse_indices). Each throws (TORCH_CHECK) with the
-// message of its check. InChannel::input_dist calls both before it takes a sequence number.
-// bucketize_rows and fanout_tables call them too (the hooks).
+// message of its check. InChannel::input_dist calls both before it takes a sequence number, and
+// the hooks call them; bucketize_rows and fanout_tables do not.
 void check_bucketize_input(const PlanInput &input, const at::Tensor &dist_types,
                            int64_t world_size);
 void check_fanout_input(const at::Tensor &reverse_indices);
 // The bucketize up to its gather: the in channel's (its push gathers the keys as it pushes them).
-// keys and key_weights stay undefined.
+// keys and key_weights stay undefined. Two kernels sort the keys by owner, a stable counting
+// sort. Its offset_per_bucket_feature holds each owner's first entry (owner * num_features), and
+// every entry of the owners [first_owner, first_owner + owners); the other entries hold garbage.
+// Those are the entries the node layout reads (NodeRow, node_layout_small, node_layout_items):
+// the in channel gives its node's owners, node * local_size and local_size of them; first_owner
+// 0 and owners world_size write every entry (the hooks'). Above 2047 owners, or where its shared
+// memory does not fit the GPU, a radix sort by bucket feature (place_keys_kernel, a CUB sort and
+// run_offsets) writes every entry. sorted_path: true, that radix sort; false, the counting sort,
+// which raises where it does not fit, with the reason; none, as the sizes choose (the in
+// channel's). counted says which sort ran.
 BucketizedKeys bucketize_rows(const PlanInput &input, const at::Tensor &dist_types,
-                              int64_t world_size);
+                              int64_t world_size, int64_t first_owner, int64_t owners,
+                              c10::optional<bool> sorted_path = c10::nullopt);
 // The whole bucketize: bucketize_rows, then the keys (and weights) gathered into bucketized order
 // (gather_rows): the tests'.
 BucketizedKeys bucketize_keys(const PlanInput &input, const at::Tensor &dist_types,
-                              int64_t world_size);
+                              int64_t world_size, int64_t first_owner, int64_t owners,
+                              c10::optional<bool> sorted_path = c10::nullopt);
 
 // Index dedup's fan-out of the deduplicated rows to the original rows, in the
 // format of Fanout (common.h): a row's original rows are
