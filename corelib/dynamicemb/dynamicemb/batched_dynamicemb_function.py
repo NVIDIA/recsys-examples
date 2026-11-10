@@ -1199,6 +1199,23 @@ def _generic_forward_path(
         return unique_values, persisted_unique_indices
 
 
+def release_slot_pins(
+    cache: Optional[Cache],
+    storage: Storage,
+    storage_mode: StorageMode,
+    slot_indices: torch.Tensor,
+    unique_table_ids: torch.Tensor,
+) -> None:
+    """Undo the ref-counter pins that prefetch took on ``slot_indices``.
+
+    The counter sits beside the hash table of whichever of ``cache`` / ``storage``
+    served the batch, and is indexed by hash slot (not by value row). Called by
+    backward, or by a forward that has no backward (no autograd graph).
+    """
+    counter_owner = cache if storage_mode == StorageMode.CACHE else storage
+    counter_owner.decrement_counter(slot_indices, unique_table_ids)
+
+
 class DynamicEmbeddingFunction(torch.autograd.Function):
     @staticmethod
     def forward(
@@ -1418,13 +1435,12 @@ class DynamicEmbeddingFunction(torch.autograd.Function):
                             state.emb_dtype,
                         )
 
-                    counter_owner = (
-                        cache if ctx.storage_mode == StorageMode.CACHE else storage
-                    )
-
-                    # Ref counter sits beside the hash table -> slots.
-                    counter_owner.decrement_counter(
-                        ctx.slot_indices, ctx.unique_table_ids
+                    release_slot_pins(
+                        cache,
+                        storage,
+                        ctx.storage_mode,
+                        ctx.slot_indices,
+                        ctx.unique_table_ids,
                     )
 
                 if not ctx.use_counter and ctx.unique_values is not None:

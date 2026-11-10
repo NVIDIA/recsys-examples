@@ -52,6 +52,7 @@ from dynamicemb.batched_dynamicemb_function import (
     PrefetchState,
     dynamicemb_eval_forward,
     dynamicemb_prefetch,
+    release_slot_pins,
 )
 from dynamicemb.dynamicemb_config import (
     DynamicEmbCheckMode,
@@ -1434,9 +1435,12 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
         # Grad-mode forwards keep their slot pins until backward. Without an
         # autograd graph, release on this stream after the gather consumed them.
         if not res.requires_grad and prefetch_state.slot_indices is not None:
-            counter_owner = self._cache if self._cache is not None else self._storage
-            counter_owner.decrement_counter(
-                prefetch_state.slot_indices, prefetch_state.unique_table_ids
+            release_slot_pins(
+                self._cache,
+                self._storage,
+                prefetch_state.storage_mode,
+                prefetch_state.slot_indices,
+                prefetch_state.unique_table_ids,
             )
         if isinstance(self._cache, DynamicEmbCache):
             self._cache.training = False
