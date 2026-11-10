@@ -55,6 +55,11 @@ garbage before the call. The checks:
   push tasks (each counting its rows in its chunk's pushed_rows, which must
   reach the chunk's rows once every row is in) and the proxies' reducers,
   each key's rows its key row and then its duplicates' slots;
+* each rank's count messages, word for word, against sums over the
+  features: its own part's keys of each lookup group and its proxy's
+  node-unique keys of each (owner node, group), which the op takes as
+  differences of two offsets (its node layout's own_offsets and own_total,
+  its proxy's node_offset_per_bucket_feature), and each row's part;
 * the rail: each proxy's slices start where its owners' offsets say; each
   owner's KJT, the chunks it got, and its lookup_rows' rows against a plain
   reference (each lookup group's keys in a slice of their own, its own part
@@ -82,6 +87,12 @@ none; on 264 also a count at remote_keys and a count of 0), and 1, 2 and
 600, slices of about 20 to 35 occurrences, also in the CTAs past a CTA's
 threads); each with rows_per_payload 1 (a scan of the rows alone) and
 above 1 (of the rows and the counted rows together).
+
+The count messages' keys of each lookup group come with one group, 2 and 3
+groups and a group per feature, also at 1,100 features (groups of 1, 1,098
+and 1 features, and a group per feature): a group's features can hold no
+keys (of an own part, or of an owner node at a proxy), and a proxy holds no
+keys of its own node.
 
 The proxy's push tables come from a binary search of each requester's
 sorted push keys for each chunk below its stream's chunks, and its
@@ -131,10 +142,12 @@ it)::
 and so with ``--tool memcheck``, ``--tool racecheck`` and ``--tool synccheck``.
 Under initcheck the whole file takes hours (about 2 minutes a case):
 ``sanitize`` runs the cases of ``SANITIZE_CASES`` on their first seed, the
-plain and weighted ones, a wrapping ring, node dedup off, an overflow, and
-those of the proxy's live counts (20 times the need, at the need, a count
-of 0, the scans on 2 and 600 CTAs, several rows per payload), its int64 push
-keys and a requester with nothing to send.
+plain and weighted ones, a group per feature (the count messages read every
+offset of the own part's features and of the proxy's bucket features), a
+wrapping ring, node dedup off, an overflow, and those of the proxy's live
+counts (20 times the need, at the need, a count of 0, the scans on 2 and 600
+CTAs, several rows per payload), its int64 push keys and a requester with
+nothing to send.
 """
 
 import os
@@ -748,6 +761,28 @@ CASES = [
         key_range=100,
         weighted=True,
         remote_factor=20,
+        seeds=1,
+    ),
+    # 1,100 features in lookup groups of 1, 1,098 and 1 features, and in a group
+    # per feature: a count message's keys of a group, a difference of two
+    # offsets, span one feature (often of no keys) or most of them
+    Case(
+        "1,100 features on 4 nodes of 2, 3 lookup groups",
+        local_size=2,
+        tables=tuple(feature // 11 for feature in range(1100)),
+        max_block=1,
+        key_range=100,
+        groups=(1, 1098, 1),
+        seeds=1,
+    ),
+    Case(
+        "1,100 features on 2 nodes of 2, a lookup group per feature",
+        num_nodes=2,
+        local_size=2,
+        tables=tuple(feature // 11 for feature in range(1100)),
+        max_block=1,
+        key_range=100,
+        groups=(1,) * 1100,
         seeds=1,
     ),
     # the proxy's scan of the representatives on 1, 2, 3, 264 and 600 CTAs: on
@@ -1612,7 +1647,8 @@ def run_call(
                 layout["skip"],
                 tables,
                 layout["need_remote"],
-                layout["own_lengths"],
+                layout["own_offsets"],
+                layout["own_total"],
                 window["remote_map"],
                 window["key_stage"],
                 window["proxy_header"],
@@ -1752,6 +1788,12 @@ def check_proxy(
         out["node_length_per_bucket_feature"].tolist(),
         ref["node_length_per_bucket_feature"],
     )
+    # where the keys of each bucket feature start, then all of them
+    expect(
+        "node_offset_per_bucket_feature",
+        out["node_offset_per_bucket_feature"].tolist(),
+        list(accumulate([0] + ref["node_length_per_bucket_feature"])),
+    )
     expect(
         "node_offset_per_bucket",
         out["node_offset_per_bucket"].tolist(),
@@ -1886,6 +1928,76 @@ def check_proxy(
         out["node_exp_off"][: node_num_uniques + 1].tolist(),
         ref["node_exp_off"],
     )
+    return problems
+
+
+def check_message(case: Case, rank: int, ranks: List[Dict], refs: Dict, out: Dict):
+    """The count messages a rank sends its rail (out["message"], row n to the
+    peer on node n), word for word, against sums over the features. Each row:
+    the header (its node's largest remote part; as proxy the most occurrences
+    of one of its keys; the keys of each lookup group of its own part, over
+    its node's requesters; as proxy its chunks per owner node and its
+    node-unique keys of each (owner node, group)), then row n's part: its
+    node-unique keys of each feature of node n. The op takes each key count
+    of the header as a difference of two offsets."""
+    num_nodes, local_size, num_features = (
+        case.num_nodes,
+        case.local_size,
+        case.num_features,
+    )
+    node, rail = divmod(rank, local_size)
+    ref = refs[(node, rail)]
+    groups = case.group_ranges
+    num_groups = len(groups)
+    header = 2 + num_groups + num_nodes * (num_groups + 1)
+    lengths = ref["node_length_per_bucket_feature"]
+    problems = []
+
+    def expect(label: str, got, want) -> None:
+        if got != want:
+            problems.append(label)
+
+    # its own part's keys of each feature: those of its node's requesters for it
+    own = [0] * num_features
+    for requester in range(local_size):
+        counts = ranks[node * local_size + requester]["counts"]
+        for feature, keys in enumerate(
+            counts[rank * num_features : (rank + 1) * num_features].tolist()
+        ):
+            own[feature] += keys
+    # the largest remote part of its node: the most occurrences of a proxy
+    need_remote = max(
+        len(refs[(node, proxy)]["occurrences"]) for proxy in range(local_size)
+    )
+    rows = out["message"].tolist()
+    expect("message rows", len(rows), num_nodes)
+    for owner_node, row in enumerate(rows):
+        expect("message length", len(row), header + num_features)
+        expect("message needs", row[:2], [need_remote, ref["need_key_rows"]])
+        expect(
+            "message own keys of each group",
+            row[2 : 2 + num_groups],
+            [sum(own[lo:hi]) for lo, hi in groups],
+        )
+        expect(
+            "message chunks",
+            row[2 + num_groups : 2 + num_groups + num_nodes],
+            ref["chunk_length_per_bucket"],
+        )
+        expect(
+            "message keys of each (owner node, group)",
+            row[2 + num_groups + num_nodes : header],
+            [
+                sum(lengths[other * num_features + lo : other * num_features + hi])
+                for other in range(num_nodes)
+                for lo, hi in groups
+            ],
+        )
+        expect(
+            "message part",
+            row[header:],
+            lengths[owner_node * num_features : (owner_node + 1) * num_features],
+        )
     return problems
 
 
@@ -2404,6 +2516,13 @@ def run_case(case: Case, seed: int) -> Tuple[Dict[str, List[str]], str]:
         ),
         [],
     )
+    checks["messages"] = sum(
+        (
+            check_message(case, rank, ranks, refs, proxies[rank])
+            for rank in range(world_size)
+        ),
+        [],
+    )
     checks["requesters"] = sum(
         (
             check_requester(
@@ -2470,6 +2589,7 @@ def run_case(case: Case, seed: int) -> Tuple[Dict[str, List[str]], str]:
 # compute-sanitizer (the module's docstring)
 SANITIZE_CASES = {
     "uniform",
+    "a lookup group per feature",
     "weights, 3 nodes of 2, 6 rows per payload, above a key's rows",
     "2 nodes, a wrapping ring",
     "node dedup off",

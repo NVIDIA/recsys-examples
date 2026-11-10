@@ -310,21 +310,22 @@ std::pair<at::Tensor, at::Tensor> group_tables(const std::vector<int64_t> &looku
 // proxy_chunks_and_slots, proxy_push_order) on its remote part (node_keys,
 // node_key_weights, node_bucket_feature_of_row: what those buffers hold
 // past lookup_keys; weights exactly with 16-byte records) and what the node
-// layout says of it (remote_offsets, skip, need_remote, own_lengths: its own
-// part's lengths [feature][requester]), and the count messages it sends its
-// rail (count_message: [num_nodes][CountMessage::length], row n to the peer on
-// node n), by name. It writes remote_map, key_stage and proxy_header (a proxy
-// header, ProxyHeader) as the steps write those buffers of its window. Also
-// the node-unique key of each occurrence (node_reverse_indices, garbage past
-// the valid ones) and the node-unique keys (node_num_uniques), for the test's
-// reference; push_key_bytes (int64, on the host): the bytes of each push key
-// the push order sorts by, 4 or 8, as the sizes or the test hook
-// (force_push_keys64) choose.
+// layout says of it (remote_offsets, skip, need_remote; own_offsets
+// [feature][requester], where the keys of each start in its own part, and
+// own_total [local_size], each owner's own part), and the count messages it
+// sends its rail (count_message: [num_nodes][CountMessage::length], row n to
+// the peer on node n), by name. It writes remote_map, key_stage and
+// proxy_header (a proxy header, ProxyHeader) as the steps write those
+// buffers of its window. Also the node-unique key of each occurrence
+// (node_reverse_indices, garbage past the valid ones) and the node-unique
+// keys (node_num_uniques), for the test's reference; push_key_bytes (int64,
+// on the host): the bytes of each push key the push order sorts by, 4 or 8,
+// as the sizes or the test hook (force_push_keys64) choose.
 std::map<std::string, at::Tensor> proxy_plan_test(
     at::Tensor node_keys, c10::optional<at::Tensor> node_key_weights,
     at::Tensor node_bucket_feature_of_row, at::Tensor remote_offsets, at::Tensor skip,
-    at::Tensor tables, at::Tensor need_remote, at::Tensor own_lengths, at::Tensor remote_map,
-    at::Tensor key_stage, at::Tensor proxy_header, bool node_dedup,
+    at::Tensor tables, at::Tensor need_remote, at::Tensor own_offsets, at::Tensor own_total,
+    at::Tensor remote_map, at::Tensor key_stage, at::Tensor proxy_header, bool node_dedup,
     std::map<std::string, int64_t> named_sizes, std::vector<int64_t> lookup_groups) {
   c10::cuda::CUDAGuard guard(node_keys.device());
   const Sizes sizes = plan_sizes(named_sizes, lookup_groups);
@@ -340,7 +341,8 @@ std::map<std::string, at::Tensor> proxy_plan_test(
                   is_cuda_array(skip, at::kBool, 1) &&
                   is_cuda_array(tables, at::kInt, num_features) &&
                   is_cuda_array(need_remote, at::kLong, 1) &&
-                  is_cuda_array(own_lengths, at::kLong, num_features * local_size) &&
+                  is_cuda_array(own_offsets, at::kLong, num_features * local_size) &&
+                  is_cuda_array(own_total, at::kLong, local_size) &&
                   is_cuda_array(remote_map, at::kInt, RemoteMap::kArrays * entries) &&
                   is_cuda_array(key_stage, at::kLong,
                                 (int64_t)KeysLayout(sizes, nullptr).key_stage_bytes() / 8) &&
@@ -365,6 +367,7 @@ std::map<std::string, at::Tensor> proxy_plan_test(
   return {{"num_chunks", plan.num_chunks},
           {"occurrence_count", plan.occurrence_count},
           {"need_key_rows", plan.need_key_rows},
+          {"node_offset_per_bucket_feature", plan.node_offset_per_bucket_feature},
           {"node_length_per_bucket_feature", plan.node_length_per_bucket_feature},
           {"node_offset_per_bucket", plan.node_offset_per_bucket},
           {"node_length_per_bucket", plan.node_length_per_bucket},
@@ -376,8 +379,10 @@ std::map<std::string, at::Tensor> proxy_plan_test(
           {"reduce_task_offsets", plan.reduce_task_offsets},
           {"node_exp_off", plan.node_exp_off},
           {"message",
-           count_message(need_remote.reshape({}), own_lengths, plan.need_key_rows,
+           count_message(need_remote.reshape({}), own_offsets,
+                         own_total.select(0, sizes.topo.local_rank), plan.need_key_rows,
                          plan.chunk_length_per_bucket, plan.node_length_per_bucket_feature,
+                         plan.node_offset_per_bucket_feature,
                          group_tables(lookup_groups, num_features, node_keys.options()).second)},
           {"node_reverse_indices", node_reverse_indices},
           {"node_num_uniques", node_num_uniques},
@@ -589,14 +594,15 @@ void bind_testing(py::module &py_module) {
                 "With on, each later proxy step of this process sorts its push order by int64 "
                 "push keys (False: by int32 ones where they fit, as its sizes choose)",
                 py::arg("on"));
-  py_module.def(
-      "hier_output_dist_proxy_plan", &proxy_plan_test,
-      "One proxy's steps of a call across nodes on plain tensors, which it writes as "
-      "its buffers of the window, and the count message its rank sends its rail, by name",
-      py::arg("node_keys"), py::arg("node_key_weights"), py::arg("node_bucket_feature_of_row"),
-      py::arg("remote_offsets"), py::arg("skip"), py::arg("tables"), py::arg("need_remote"),
-      py::arg("own_lengths"), py::arg("remote_map"), py::arg("key_stage"), py::arg("proxy_header"),
-      py::arg("node_dedup"), py::arg("sizes"), py::arg("lookup_groups") = std::vector<int64_t>{});
+  py_module.def("hier_output_dist_proxy_plan", &proxy_plan_test,
+                "One proxy's steps of a call across nodes on plain tensors, which it writes as "
+                "its buffers of the window, and the count message its rank sends its rail, by name",
+                py::arg("node_keys"), py::arg("node_key_weights"),
+                py::arg("node_bucket_feature_of_row"), py::arg("remote_offsets"), py::arg("skip"),
+                py::arg("tables"), py::arg("need_remote"), py::arg("own_offsets"),
+                py::arg("own_total"), py::arg("remote_map"), py::arg("key_stage"),
+                py::arg("proxy_header"), py::arg("node_dedup"), py::arg("sizes"),
+                py::arg("lookup_groups") = std::vector<int64_t>{});
   py_module.def("hier_output_dist_rail_tables", &rail_tables_test,
                 "One rank's rail layout on its rail's count messages to it, and given its "
                 "rail_keys and node_keys its owner tables, by name",

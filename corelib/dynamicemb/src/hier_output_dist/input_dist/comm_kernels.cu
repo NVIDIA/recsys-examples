@@ -221,13 +221,15 @@ __global__ void node_done_kernel(ncclWindow_t window, Sizes sizes, int64_t seq) 
 // call's count_msg slot of its own node. Then warp 1's lanes, each taking rail peers in turn, put
 // each peer its row into the same slot in the peer's copy, one put that signals count[node]. Warp
 // 0's lanes wait for the rail peers' messages. From the rail's num_nodes messages, read in their
-// slots of the call, the CTA lays out the rail (rail_layout_of) into the call's tensors: every rank
-// of the rail computes the rail's runs and shifts from the same headers. The count messages go by
-// in_seq parity: a peer's message of call seq + 2 needs this rank's of seq + 1, which it sends
-// once call seq ended here.
+// slots of the call, and its own part's lengths (own_lengths [feature][requester], the node
+// layout's), the CTA lays out the rail (rail_layout_of) into the call's tensors: every rank of the
+// rail computes the rail's runs and shifts from the same headers. The count messages go by in_seq
+// parity: a peer's message of call seq + 2 needs this rank's of seq + 1, which it sends once call
+// seq ended here.
 __global__ void __launch_bounds__(kThreads)
     rail_exchange_kernel(ncclWindow_t window, ncclDevComm dev, Sizes sizes, int64_t seq,
-                         CountParts parts, int64_t *scratch, RailLayoutView layout) {
+                         CountParts parts, const int64_t *own_lengths, int64_t *scratch,
+                         RailLayoutView layout) {
   const int num_nodes = sizes.topo.num_nodes, node = sizes.topo.node, tid = threadIdx.x,
             warp = tid >> 5, lane = tid & 31;
   const CountMessage format{num_nodes, sizes.num_features, sizes.num_groups};
@@ -252,7 +254,7 @@ __global__ void __launch_bounds__(kThreads)
         spin.pause("count message", peer_node, seq, sizes.topo.rank);
   }
   __syncthreads();
-  rail_layout_of(RailCounts{ctrl.count_msg(seq, 0), format.slot_words(), format}, parts.own_lengths,
+  rail_layout_of(RailCounts{ctrl.count_msg(seq, 0), format.slot_words(), format}, own_lengths,
                  sizes, scratch, layout);
   // count_msg_out may be written again once the NIC has read it.
   if (warp == 1) gin.flush(ncclCoopThread{});
@@ -430,14 +432,19 @@ RailLayout InChannel::rail_exchange(const NodeLayout &node, const ProxyPlan &pro
   RailLayout rail = empty_rail_layout(sizes_, options);
   const at::Tensor scratch =
       at::empty({rail_layout_scratch(sizes_.topo, sizes_.num_groups)}, options);
+  // the keys of this rank's own part: its entry of the node's own_total
+  const int64_t *own_total = node.own_total.data_ptr<int64_t>() + sizes_.topo.local_rank;
   const CountParts parts{node.need_remote.data_ptr<int64_t>(),
-                         node.own_lengths.data_ptr<int64_t>(),
+                         node.own_offsets.data_ptr<int64_t>(),
+                         own_total,
                          proxy.need_key_rows.data_ptr<int64_t>(),
                          proxy.chunk_length_per_bucket.data_ptr<int64_t>(),
                          proxy.node_length_per_bucket_feature.data_ptr<int64_t>(),
+                         proxy.node_offset_per_bucket_feature.data_ptr<int64_t>(),
                          group_starts_.data_ptr<int64_t>()};
   rail_exchange_kernel<<<kOneCta, kThreads, 0, current_stream()>>>(
-      window_, dev_, sizes_, seq_, parts, scratch.data_ptr<int64_t>(), view_of(rail));
+      window_, dev_, sizes_, seq_, parts, node.own_lengths.data_ptr<int64_t>(),
+      scratch.data_ptr<int64_t>(), view_of(rail));
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   return rail;
 }

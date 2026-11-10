@@ -1368,15 +1368,16 @@ and why no wait hangs.
   messages (section 10.4) into its `count_msg_out` words, a row per rail
   peer (the header, the same in every row, then that peer's own part), and
   its message to its own node into its `count_msg` slot of its own node:
-  the slots go by `in_seq` parity and source node. Then the lanes of one
-  warp, which take the rail peers in turn, put each peer its row into the
-  same slot in the peer's copy: one put, which carries a GIN signal
-  (context 2). The lanes of another warp wait until the message of every
-  rail peer has landed. From the `num_nodes` messages of the call to this
-  rank, read in their slots, the CTA lays out the rail (section 10.4) into
-  the call's tensors: every rank of the rail computes the rail's group runs
-  and shifts from the same headers. Before it ends, the putting warp
-  flushes its puts.
+  the slots go by `in_seq` parity and source node. A thread takes each key
+  count of the header, a difference of two offsets that the node layout
+  and the proxy wrote. Then the lanes of one warp, which take the rail
+  peers in turn, put each peer its row into the same slot in the peer's
+  copy: one put, which carries a GIN signal (context 2). The lanes of
+  another warp wait until the message of every rail peer has landed. From
+  the `num_nodes` messages of the call to this rank, read in their slots,
+  the CTA lays out the rail (section 10.4) into the call's tensors: every
+  rank of the rail computes the rail's group runs and shifts from the same
+  headers. Before it ends, the putting warp flushes its puts.
 * **`rail_key_push`** (1 warp, across nodes): its lanes, which take the
   rail owners in turn, put this proxy's `key_stage` slice for each owner
   into the owner's `rail_keys`, where the rail layout says, with a GIN
@@ -1574,9 +1575,11 @@ loops, so none of them reads or clears past the valid occurrences:
   dedup the keys of `b` go requester after requester: the key is where they
   start, plus the occurrences of `b` at the requesters before `r`, plus `k`;
 * then the same kernel takes the bucket features, a thread each, with the
-  same sums (`O(local_size)` loads each): the keys of each bucket feature,
-  and of each owner node where its keys start and how many. Where the last
-  owner node's keys end is the count of node-unique keys.
+  same sums (`O(local_size)` loads each): where the keys of each bucket
+  feature start (`node_offset_per_bucket_feature`, which the rail's count
+  messages read) and how many, and of each owner node where its keys start
+  and how many. Where the last owner node's keys end is the count of
+  node-unique keys.
 
 The bucket is the high bits of `murmur3_fmix64(key ^ seed)`, mixed with
 the table. An owner rule fixes the low bits of the key (`roundrobin`) or of
@@ -1684,6 +1687,15 @@ int64 words, `count_messages_of`) in two parts:
 * a part for that peer alone: as proxy, its node-unique keys of each
   feature of the peer's node, `num_features` words.
 
+A lookup group's features are consecutive, so each key count of the header
+is a difference of two offsets: where the group's first feature starts and
+where the next group's starts. For its own part they are entries of the
+node layout's `own_offsets` (entry `f × local_size`, where feature `f`
+starts), and at the last group's end its own part's keys in all
+(`own_total` of this rank). For an owner node they are entries of the
+proxy's `node_offset_per_bucket_feature`. A thread takes each word, so no
+word of the header sums over features.
+
 From the `num_nodes` messages of the call to it, its own too, every rank of
 the rail computes the layout of the rail (`rail_layout_of`,
 `input_dist/rail.cuh`). Its tables of every node and lookup group come from
@@ -1718,19 +1730,22 @@ rail.
 `num_nodes × (num_features + num_nodes × (num_groups + 1))` words each way
 per call. The ctrl section keeps this rank's messages (`count_msg_out`, a
 row per rail peer) and the rail's in a slot per `in_seq` parity and node:
-`3 × num_nodes` messages (section 15.2). `rail_exchange` lays out the rail
-on one CTA. From the headers it reads the chunk count of each (source
-node, owner node) and the key count of each (source node, owner node,
-lookup group), `num_nodes² × (num_groups + 1)` words, a few times. The start of each group
-run is a sum over the groups before it (`group_first`), so for the runs it
-also reads the keys between its own node and each other node, in both
-directions: about `2 × num_nodes × num_groups²` loads in all. From the
-parts to it, it reads the other nodes' keys of each feature, `(num_nodes −
-1) × num_features` words. So the messages grow with the features times the
-nodes, and with the square of the nodes times the lookup groups plus one:
-each header holds a chunk count per owner node and a key count per (owner
-node, lookup group). The layout's loads also grow with the nodes times the
-square of the lookup groups (section 19).
+`3 × num_nodes` messages (section 15.2). `rail_exchange` writes this
+rank's messages on one CTA: the header's `(num_nodes + 1) × num_groups` key
+counts, two loads each, then the header and each row's part into the rows.
+It lays out the rail on the same CTA. From the headers it reads the chunk
+count of each (source node, owner node) and the key count of each (source
+node, owner node, lookup group), `num_nodes² × (num_groups + 1)` words, a
+few times. The start of each group run is a sum over the groups before it
+(`group_first`), so for the runs it also reads the keys between its own
+node and each other node, in both directions: about `2 × num_nodes ×
+num_groups²` loads in all. From the parts to it, it reads the other nodes'
+keys of each feature, `(num_nodes − 1) × num_features` words. So the
+messages grow with the features times the nodes, and with the square of the
+nodes times the lookup groups plus one: each header holds a chunk count per
+owner node and a key count per (owner node, lookup group). The layout's
+loads also grow with the nodes times the square of the lookup groups
+(section 19).
 
 **The requester.** Two `peer_gather`s read what the node's proxies wrote. One
 reads the words of their headers it needs: the chunks, the stream's end, each
@@ -2442,7 +2457,7 @@ The capacities are the ones in place (section 5), and `row_bytes` and
 | index dedup's fan-out table | about 13 bytes per original key (on this path the deduplicated KJT keeps the original length) | per call |
 | the bucketize, in the caller's pool | at its peak about 36 bytes per key, during the fan-out's sort: its outputs (`inv` and `bucket_feature_of_row`, 8), where it put each row (4), the sort's keys and values in and out (16) and CUB's extra key and value buffers (8); before that the counting sort by owner holds its outputs alone (8) and a count per CTA and owner (at most about 1 MiB), and above 2,047 owners, or where the counting sort's shared memory does not fit the GPU, the radix sort by bucket feature at most 24, its outputs included; for either owner rule, with or without weights | transient |
 | the planner, in the caller's pool | its largest step: across nodes the proxy's, about 64 bytes per entry of `remote_keys` with weights, 52 without; the requester's holds about 24 bytes per key besides its maps (the gathered `remote_map` words, 12, and the peer and word each comes from, 12), and the owner's adds only its KJT values and row map (per call); on one node nothing per key beyond the per-call tensors | transient |
-| the input dist's tables per (rank, feature), in the caller's pool | the bucketize's `offset_per_bucket_feature` and the node layout's `row_shift`, about `8 × world_size × num_features` each (the bucketize writes only each owner's first entry and its node's owners' entries, section 10.1); across nodes, while the proxy's node dedup runs, its block table, about `8 × world_size × num_features` (section 15.4) | transient |
+| the input dist's tables per (rank, feature), in the caller's pool | the bucketize's `offset_per_bucket_feature` and the node layout's `row_shift`, about `8 × world_size × num_features` each (the bucketize writes only each owner's first entry and its node's owners' entries, section 10.1); across nodes, while the proxy's node dedup runs, its block table, about `8 × world_size × num_features` (section 15.4), and from its node dedup to the end of the input dist its keys of each bucket feature and where they start (`node_length_per_bucket_feature`, `node_offset_per_bucket_feature`: the rail's count messages read them), about `16 × num_nodes × num_features` | transient |
 
 The transient figures come from the code: bytes in live tensors. The
 caching allocator's rounding and the cached blocks it hands out add up to
@@ -2559,7 +2574,9 @@ bucket feature starts). Apart from these,
   tables are linear in the nodes: the owner's KJT lengths and offsets and
   its keys of each source node and feature (linear in `(local_size +
   num_nodes) × num_features`), and the group runs (`num_nodes × (2 ×
-  num_groups + 1)` words each);
+  num_groups + 1)` words each); so are the proxy's keys of each bucket
+  feature and where they start (`num_nodes × num_features` words each),
+  which the count messages read;
 * GIN's queues to `num_nodes − 1` rail peers per context (with
   `NCCL_CROSS_NIC=0`);
 * the chunk tables, which grow with `max_chunks` (linear in
@@ -2817,12 +2834,14 @@ The node's part of a call has hooks of its own in `testing.cu`:
 
 The rail's part has two: `hier_output_dist_proxy_plan` gives a proxy's plan
 and its count messages (`"message"`, row `n` the one to the rail peer on
-node `n`), and `hier_output_dist_rail_tables` one rank's rail layout from
-the messages to it (row `n` the message of the rail peer on node `n`, as
-`rail_exchange` reads them) and, given its `rail_keys` and the own part of
-its `node_keys`, its owner tables: its KJT, the chunks its forward puts, and
-its row map. Both take the lookup groups, and both run the device code of
-`rail_exchange` (`input_dist/rail.cuh`).
+node `n`; it takes the node layout's `own_offsets` and `own_total`, whose
+differences give the header's keys of the own part), and
+`hier_output_dist_rail_tables` one rank's rail layout from the messages to
+it (row `n` the message of the rail peer on node `n`, as `rail_exchange`
+reads them) and, given its `rail_keys` and the own part of its `node_keys`,
+its owner tables: its KJT, the chunks its forward puts, and its row map.
+Both take the lookup groups, and both run the device code of `rail_exchange`
+(`input_dist/rail.cuh`).
 
 Three more hooks reach into the proxy's steps.
 `hier_output_dist_scan_ctas(ctas)` makes each later proxy step of the
@@ -2850,20 +2869,23 @@ map, where its groups' slices start, its group shifts and the group runs of
 each source node's records, against a plain reference of the order in which
 the rows cross the rail; each proxy's group runs of its keys at each owner
 equal to that owner's runs of its records (so the backward's puts land
-where the owner's lookup wrote); and with a group per feature, no row map.
-Its proxies meet counts of valid occurrences far below `remote_keys` (20
-times the largest remote part, so `max_chunks` far above the chunks),
-equal to it, and of 0 in a call that fits (a node whose requesters ask only
-its own owners); 600 and 1,100 features on 4 nodes (2,400 and 4,400 bucket
-features at a proxy, most of their blocks empty); and the scans on 2, 3,
-264 and 600 CTAs in calls of a few hundred occurrences a proxy (on 264 also
-at counts of `remote_keys` and of 0), and on 1, 2 and 600 CTAs in calls of
-4,000 to 21,000 (on 1 and 2 slices of several tiles; on 600 slices of about
-20 to 35 occurrences, also in the CTAs past a CTA's 512 threads), each with
-`rows_per_payload` 1 and above 1 (the rows' scan of a pair of sums). It
-compares every entry of each proxy's push tables and each requester's,
-most of them past the chunks when `max_chunks` is far above them; also
-with the push order sorted by int64 push keys
+where the owner's lookup wrote); with a group per feature, no row map; and
+each rank's count messages, word for word, against sums over the features
+of its own part's keys and its proxy's keys of each lookup group, also at
+1,100 features in 3 lookup groups (of 1, 1,098 and 1 features) and in a
+group per feature. Its proxies meet counts of valid occurrences far below
+`remote_keys` (20 times the largest remote part, so `max_chunks` far above
+the chunks), equal to it, and of 0 in a call that fits (a node whose
+requesters ask only its own owners); 600 and 1,100 features on 4 nodes
+(2,400 and 4,400 bucket features at a proxy, most of their blocks empty);
+and the scans on 2, 3, 264 and 600 CTAs in calls of a few hundred
+occurrences a proxy (on 264 also at counts of `remote_keys` and of 0), and
+on 1, 2 and 600 CTAs in calls of 4,000 to 21,000 (on 1 and 2 slices of
+several tiles; on 600 slices of about 20 to 35 occurrences, also in the CTAs
+past a CTA's 512 threads), each with `rows_per_payload` 1 and above 1 (the
+rows' scan of a pair of sums). It compares every entry of each proxy's push
+tables and each requester's, most of them past the chunks when `max_chunks`
+is far above them; also with the push order sorted by int64 push keys
 (`hier_output_dist_push_keys64`; each proxy gives the bytes of its push
 keys, so the checks see the hook's int64 keys and the sizes' int32 ones),
 in three passes of 8 bits by int32 and by int64 keys (`local_size ×
@@ -2915,14 +2937,16 @@ tables and positions a push key it leaves out.
   messages: they grow with the nodes times the features, and with the
   square of the nodes times the lookup groups plus one (sections 10.4 and
   15.4). One CTA (`rail_exchange`) writes this rank's `num_nodes` messages
-  and lays the rail out from the messages to it. It reads the headers'
-  `num_nodes² × (num_groups + 1)` counts a few times, and for the starts of
-  the group runs the keys between its own node and each other node: about
-  `2 × num_nodes × num_groups²` loads in all. It copies the other nodes'
-  keys of each feature (`num_nodes × num_features` counts) and scans its
-  KJT's `num_features × kjt_stride` lengths: at 256 nodes of 8 GPUs and
-  1,000 features, about 0.4M words of messages, 0.26M counts and 0.26M
-  lengths. So its work grows with the features times `local_size +
+  and lays the rail out from the messages to it. It takes each key count of
+  the header from two offsets (section 10.4), with no loop over the
+  features, then copies the header and the parts into the rows. It reads
+  the headers' `num_nodes² × (num_groups + 1)` counts a few times, and for
+  the starts of the group runs the keys between its own node and each other
+  node: about `2 × num_nodes × num_groups²` loads in all. It copies the
+  other nodes' keys of each feature (`num_nodes × num_features` counts) and
+  scans its KJT's `num_features × kjt_stride` lengths: at 256 nodes of 8
+  GPUs and 1,000 features, about 0.4M words of messages, 0.26M counts and
+  0.26M lengths. So its work grows with the features times `local_size +
   num_nodes`, with the square of the nodes times the lookup groups plus
   one, and with the nodes times the square of the lookup groups. The
   proxy's node dedup reads its `local_size × num_nodes × num_features`

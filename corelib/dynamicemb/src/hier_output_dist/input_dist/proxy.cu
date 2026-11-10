@@ -338,8 +338,10 @@ __device__ __forceinline__ int64_t key_of_representative(
 // there.
 // Then a thread per bucket feature b, and one for their end (b =
 // num_nodes * num_features), each O(local_size) loads (reps_before_blocks):
-// the keys of b (node_length_per_bucket_feature), and at the first bucket
-// feature of an owner node where the node's keys start and how many
+// where the keys of b start (node_offset_per_bucket_feature: key_offsets[b]
+// above, at the end the node-unique keys), the keys of b
+// (node_length_per_bucket_feature), and at the first bucket feature of an
+// owner node where the node's keys start and how many
 // (node_offset_per_bucket, node_length_per_bucket); at the end, where the
 // keys end, the node-unique keys (node_num_uniques).
 template <bool kNodeDedup>
@@ -352,6 +354,7 @@ __global__ void __launch_bounds__(kThreads)
                       int32_t *node_reverse_indices, int32_t *occurrence_rank,
                       int32_t *key_occurrences, int32_t *key_node, int64_t *node_unique_keys,
                       float *node_unique_key_weights, int64_t *need_key_rows,
+                      int64_t *node_offset_per_bucket_feature,
                       int64_t *node_length_per_bucket_feature, int64_t *node_offset_per_bucket,
                       int64_t *node_length_per_bucket, int64_t *node_num_uniques) {
   const int64_t count = *occurrence_count, bucket_features = num_nodes * num_features,
@@ -402,6 +405,7 @@ __global__ void __launch_bounds__(kThreads)
        bucket_feature += item_stride()) {
     const int64_t before =
         reps_before_blocks(block_offsets, columns, reps_before, local_size, bucket_feature);
+    node_offset_per_bucket_feature[bucket_feature] = before - reps_before_ranges;
     if (bucket_feature < bucket_features)
       node_length_per_bucket_feature[bucket_feature] =
           reps_before_blocks(block_offsets, columns, reps_before, local_size, bucket_feature + 1) -
@@ -968,9 +972,9 @@ ProxyKeys proxy_keys(const ProxyInput &input, const Sizes &sizes, bool node_dedu
     C10_CUDA_KERNEL_LAUNCH_CHECK();
   }
   // Per occurrence its key (with node dedup the requesters in turn inside
-  // each bucket feature) and its rank there, and per key its tables; the
-  // node-unique keys of each bucket feature, where those of each owner node
-  // start and how many, and all of them.
+  // each bucket feature) and its rank there, and per key its tables; where
+  // the node-unique keys of each bucket feature start and how many, where
+  // those of each owner node start and how many, and all of them.
   keys.node_reverse_indices = at::empty({entries}, int_options);
   keys.occurrence_rank = at::empty({entries}, int_options);
   keys.key_occurrences = at::empty({entries}, int_options);
@@ -979,6 +983,7 @@ ProxyKeys proxy_keys(const ProxyInput &input, const Sizes &sizes, bool node_dedu
   if (sum_weights)
     keys.node_unique_key_weights =
         at::empty({entries}, input.node_keys.options().dtype(at::kFloat));
+  keys.node_offset_per_bucket_feature = at::empty({bucket_features + 1}, long_options);
   keys.node_length_per_bucket_feature = at::empty({bucket_features}, long_options);
   keys.node_offset_per_bucket = at::empty({num_nodes + 1}, long_options);
   keys.node_length_per_bucket = at::empty({num_nodes}, long_options);
@@ -993,6 +998,7 @@ ProxyKeys proxy_keys(const ProxyInput &input, const Sizes &sizes, bool node_dedu
         keys.occurrence_rank.data_ptr<int32_t>(), keys.key_occurrences.data_ptr<int32_t>(),
         keys.key_node.data_ptr<int32_t>(), keys.node_unique_keys.data_ptr<int64_t>(),
         data_or_null<float>(keys.node_unique_key_weights), keys.need_key_rows.data_ptr<int64_t>(),
+        keys.node_offset_per_bucket_feature.data_ptr<int64_t>(),
         keys.node_length_per_bucket_feature.data_ptr<int64_t>(),
         keys.node_offset_per_bucket.data_ptr<int64_t>(),
         keys.node_length_per_bucket.data_ptr<int64_t>(), keys.node_num_uniques.data_ptr<int64_t>());
@@ -1169,6 +1175,7 @@ ProxyPlan proxy_push_order(ProxyKeys keys, ProxyChunks chunks, const at::Tensor 
   plan.num_chunks = chunks.num_chunks;
   plan.occurrence_count = keys.occurrence_count;
   plan.need_key_rows = keys.need_key_rows;
+  plan.node_offset_per_bucket_feature = keys.node_offset_per_bucket_feature;
   plan.node_length_per_bucket_feature = keys.node_length_per_bucket_feature;
   plan.node_offset_per_bucket = keys.node_offset_per_bucket;
   plan.node_length_per_bucket = keys.node_length_per_bucket;

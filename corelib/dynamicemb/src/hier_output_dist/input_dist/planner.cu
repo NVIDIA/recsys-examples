@@ -350,9 +350,11 @@ at::Tensor other_nodes_of(const Topo &topo, const at::TensorOptions &options) {
   return nodes + nodes.ge(topo.node);
 }
 
-at::Tensor count_message(const at::Tensor &need_remote, const at::Tensor &own_lengths,
-                         const at::Tensor &need_key_rows, const at::Tensor &chunk_length_per_bucket,
+at::Tensor count_message(const at::Tensor &need_remote, const at::Tensor &own_offsets,
+                         const at::Tensor &own_total, const at::Tensor &need_key_rows,
+                         const at::Tensor &chunk_length_per_bucket,
                          const at::Tensor &node_length_per_bucket_feature,
+                         const at::Tensor &node_offset_per_bucket_feature,
                          const at::Tensor &group_starts) {
   const int64_t num_nodes = chunk_length_per_bucket.numel(),
                 num_features = node_length_per_bucket_feature.numel() / num_nodes;
@@ -361,13 +363,15 @@ at::Tensor count_message(const at::Tensor &need_remote, const at::Tensor &own_le
       at::empty({num_nodes, format.slot_words()}, chunk_length_per_bucket.options());
   const at::Tensor own = at::empty({format.length()}, chunk_length_per_bucket.options());
   const CountParts parts{need_remote.data_ptr<int64_t>(),
-                         own_lengths.data_ptr<int64_t>(),
+                         own_offsets.data_ptr<int64_t>(),
+                         own_total.data_ptr<int64_t>(),
                          need_key_rows.data_ptr<int64_t>(),
                          chunk_length_per_bucket.data_ptr<int64_t>(),
                          node_length_per_bucket_feature.data_ptr<int64_t>(),
+                         node_offset_per_bucket_feature.data_ptr<int64_t>(),
                          group_starts.data_ptr<int64_t>()};
   count_message_kernel<<<kOneCta, kThreads, 0, current_stream()>>>(
-      parts, format, own_lengths.numel() / num_features, 0, messages.data_ptr<int64_t>(),
+      parts, format, own_offsets.numel() / num_features, 0, messages.data_ptr<int64_t>(),
       own.data_ptr<int64_t>());
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   return messages.narrow(1, 0, format.length()).contiguous();

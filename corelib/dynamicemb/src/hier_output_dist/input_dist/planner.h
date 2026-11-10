@@ -307,6 +307,9 @@ struct ProxyKeys {
   at::Tensor node_unique_keys;                // int64 [remote_keys]: the key
   at::Tensor node_unique_key_weights;         // fp32 [remote_keys]: the weight of its record, its
                                               // occurrences' weights, or undefined (8-byte records)
+  at::Tensor node_offset_per_bucket_feature;  // int64 [num_nodes * num_features + 1]: the first
+                                              // key of each (owner node, feature), then the keys
+                                              // in all
   at::Tensor node_length_per_bucket_feature;  // int64 [num_nodes * num_features]: the keys of each
                                               // (owner node, feature)
   at::Tensor node_offset_per_bucket;  // int64 [num_nodes + 1]: the first key of each owner node
@@ -380,6 +383,7 @@ struct ProxyPlan {
   at::Tensor num_chunks;                      // int64 0-dim
   at::Tensor occurrence_count;                // int64 0-dim
   at::Tensor need_key_rows;                   // int64 0-dim
+  at::Tensor node_offset_per_bucket_feature;  // int64 [num_nodes * num_features + 1]
   at::Tensor node_length_per_bucket_feature;  // int64 [num_nodes * num_features]
   at::Tensor node_offset_per_bucket;          // int64 [num_nodes + 1]
   at::Tensor node_length_per_bucket;          // int64 [num_nodes]
@@ -432,14 +436,20 @@ at::Tensor other_nodes_of(const Topo &topo, const at::TensorOptions &options);
 // n to the peer on node n, window.h), as rail_exchange makes them (count_messages_of, rail.cuh): a
 // header, the same in every row: its node's largest remote part (need_remote), as proxy the most
 // occurrences of one of its keys (need_key_rows), the keys of each lookup group (group_starts:
-// int64 [num_groups + 1], each group's first feature, then num_features) of its own part
-// (own_lengths [feature][requester], summed over its node's requesters), as proxy its chunks per
-// owner node (chunk_length_per_bucket) and its node-unique keys of each (owner node, group); then
-// row n's own part: its node-unique keys of each feature of node n
-// (node_length_per_bucket_feature). The hooks'.
-at::Tensor count_message(const at::Tensor &need_remote, const at::Tensor &own_lengths,
-                         const at::Tensor &need_key_rows, const at::Tensor &chunk_length_per_bucket,
+// int64 [num_groups + 1], each group's first feature, then num_features) of its own part, as proxy
+// its chunks per owner node (chunk_length_per_bucket) and its node-unique keys of each (owner
+// node, group); then row n's own part: its node-unique keys of each feature of node n
+// (node_length_per_bucket_feature). A group's keys are a difference of two offsets: where its
+// first feature starts and where the next group's starts. In its own part: own_offsets
+// [feature][requester] (the node layout's; entry feature * local_size is where the feature
+// starts), and at num_features own_total (0-dim: this rank's entry of the node layout's
+// own_total, its own part's keys). Among its keys of an owner node: node_offset_per_bucket_feature
+// (the proxy plan's). The hooks'.
+at::Tensor count_message(const at::Tensor &need_remote, const at::Tensor &own_offsets,
+                         const at::Tensor &own_total, const at::Tensor &need_key_rows,
+                         const at::Tensor &chunk_length_per_bucket,
                          const at::Tensor &node_length_per_bucket_feature,
+                         const at::Tensor &node_offset_per_bucket_feature,
                          const at::Tensor &group_starts);
 
 // The rail's layout, from the rail's count messages to this rank (int64 [num_nodes]

@@ -35,15 +35,18 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 namespace dyn_emb {
 namespace hier_output_dist {
 
-// The tables a rank's count messages (CountMessage) are made of: of its node layout need_remote and
-// own_lengths, of its proxy plan need_key_rows, chunk_length_per_bucket and
-// node_length_per_bucket_feature, and the op's lookup groups.
+// The tables a rank's count messages (CountMessage) are made of: of its node layout need_remote,
+// own_offsets and its own part's keys (own_total[local_rank]), of its proxy plan need_key_rows,
+// chunk_length_per_bucket, node_length_per_bucket_feature and node_offset_per_bucket_feature, and
+// the op's lookup groups.
 struct CountParts {
   const int64_t *need_remote;                     // 0-dim
-  const int64_t *own_lengths;                     // [num_features][local_size]
+  const int64_t *own_offsets;                     // [num_features][local_size]
+  const int64_t *own_total;                       // 0-dim: the keys of its own part
   const int64_t *need_key_rows;                   // 0-dim
   const int64_t *chunk_length_per_bucket;         // [num_nodes]
   const int64_t *node_length_per_bucket_feature;  // [num_nodes][num_features]
+  const int64_t *node_offset_per_bucket_feature;  // [num_nodes * num_features + 1]
   const int64_t *group_starts;  // [num_groups + 1]: each lookup group's first feature, then
                                 // num_features
 };
@@ -51,15 +54,22 @@ struct CountParts {
 // Every thread of a CTA of kThreads: this rank's count message (`format`) to the rail peer on each
 // node into row n of `rows` (slot_words apart), and its message to its own node into `own` too,
 // word by word. The header goes into row 0 first, from which the other rows copy it. Its own
-// part's keys of a group are those of its node's local_size requesters of the group's features
-// (own_lengths), its node-unique keys of an (owner node, group) those of the group's features.
+// part's keys of a group are those of its node's local_size requesters of the group's features,
+// its node-unique keys of an (owner node, group) those of the group's features. Each is a
+// difference of two offsets, a thread per word: where the group's first feature starts and where
+// the next group's starts, in its own part (own_offsets at feature * local_size, own_total at
+// num_features) or among its keys of the owner node (node_offset_per_bucket_feature). So no word
+// sums over the features.
 __device__ inline void count_messages_of(const CountParts &in, const CountMessage &format,
                                          int64_t local_size, int64_t node, int64_t *rows,
                                          int64_t *own) {
   const int64_t num_nodes = format.num_nodes, num_features = format.num_features,
                 num_groups = format.num_groups, stride = format.slot_words(),
                 header = format.header_length(), length = format.length();
-  const int lane = threadIdx.x & 31;
+  // where its own part's keys of `feature` start (its end at num_features)
+  auto own_offset = [&](int64_t feature) {
+    return feature == num_features ? *in.own_total : in.own_offsets[feature * local_size];
+  };
   // the scalar words and the chunks
   if (threadIdx.x == 0) {
     rows[CountMessage::kNeedRemoteWord] = *in.need_remote;
@@ -67,24 +77,16 @@ __device__ inline void count_messages_of(const CountParts &in, const CountMessag
   }
   for (int64_t owner_node = threadIdx.x; owner_node < num_nodes; owner_node += kThreads)
     rows[format.chunk_length_word(owner_node)] = in.chunk_length_per_bucket[owner_node];
-  // A warp per group of its own part, its lanes taking the (feature, requester) entries; then a
-  // warp per (owner node, group), its lanes taking the group's features.
-  for (int64_t index = threadIdx.x >> 5; index < num_groups * (num_nodes + 1); index += kWarps) {
+  // A thread per group of its own part, then per (owner node, group).
+  for (int64_t index = threadIdx.x; index < num_groups * (num_nodes + 1); index += kThreads) {
     const int64_t group = index % num_groups, owner_node = index / num_groups - 1;
     const int64_t lo = in.group_starts[group], hi = in.group_starts[group + 1];
-    int64_t keys = 0;
     if (owner_node < 0) {
-      for (int64_t entry = lo * local_size + lane; entry < hi * local_size; entry += 32)
-        keys += in.own_lengths[entry];
+      rows[format.own_total_word(group)] = own_offset(hi) - own_offset(lo);
     } else {
-      const int64_t *lengths = in.node_length_per_bucket_feature + owner_node * num_features;
-      for (int64_t feature = lo + lane; feature < hi; feature += 32) keys += lengths[feature];
+      const int64_t *offsets = in.node_offset_per_bucket_feature + owner_node * num_features;
+      rows[format.key_total_word(owner_node, group)] = offsets[hi] - offsets[lo];
     }
-    for (int offset = 16; offset > 0; offset >>= 1)
-      keys += __shfl_xor_sync(0xffffffffu, keys, offset);
-    if (lane == 0)
-      rows[owner_node < 0 ? format.own_total_word(group)
-                          : format.key_total_word(owner_node, group)] = keys;
   }
   __syncthreads();
   // Each row: the header, then its node's part.
