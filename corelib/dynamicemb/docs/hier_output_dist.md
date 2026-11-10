@@ -3209,7 +3209,7 @@ on 1 and 3 CTAs, and the calls of the design's reference ports.
   and the hottest owner's need sizes `lookup_keys` on every rank (section
   15).
 * **Host time of the input dist**: across nodes an input dist launches
-  about 58 kernels, CUB's included (section 10; an estimate from the code),
+  about 53 kernels, CUB's included (section 10; an estimate from the code),
   and the training thread spends their host time, also under the train
   pipelines.
 * **Size of one call**: a GPU may receive, deduplicate or look up fewer than

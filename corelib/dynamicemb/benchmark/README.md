@@ -772,6 +772,40 @@ round of 1,024 × 512 on 4 nodes. At 8 features neither is: in every run
 of both, the forward kernel's fastest call takes 2.72-2.74 ms on 2 nodes
 and 4.01-4.04 ms on 4.
 
+After that, the input dist's fusions (the bucketize as a counting sort by
+owner, the proxy's steps bounded by the counts the device holds and its
+scans by CUB, the requester's tables in one kernel;
+[docs/hier_output_dist.md](../docs/hier_output_dist.md), section 10)
+shorten the input dist and leave the output dist's kernels as they were.
+Three rounds on four nodes, before and after in alternating order
+(medians over the rounds, in ms):
+
+| features × batch (keys per sample) | nodes | hier step before → after | fwd kernel before → after | bwd kernel before → after | input dist before → after |
+|---|---|---|---|---|---|
+| 8 × 4096 (1-32) | 1 | 4.0 → 3.9 | 0.75 → 0.75 | 0.72 → 0.72 | 0.33 → 0.30 |
+| 8 × 4096 (1-32) | 2 | 8.5 → 8.3 | 2.75 → 2.75 | 2.84 → 2.84 | 0.68 → 0.65 |
+| 8 × 4096 (1-32) | 4 | 11.1 → 10.9 | 4.06 → 4.07 | 4.13 → 4.13 | 0.79 → 0.67 |
+| 1024 × 512 (1) | 2 | 27.8 → 27.6 | 2.67 → 2.67 | 2.78 → 2.77 | 0.84 → 0.74 |
+| 1024 × 512 (1) | 4 | 30.4 → 30.3 | 3.96 → 3.95 | 4.02 → 4.02 | 1.00 → 0.83 |
+| 4096 × 128 (1) | 2 | 108.2 → 107.4 | 2.67 → 2.66 | 2.97 → 2.96 | 1.15 → 0.97 |
+| 4096 × 128 (1) | 4 | 119.7 → 118.4 | 3.95 → 3.95 | 4.05 → 4.02 | 1.42 → 1.10 |
+| 4096 × 1024 (1) | 2 | 145.2 → 141.5 | 13.83 → 13.82 | 16.18 → 16.39 | 3.39 → 2.97 |
+| 4096 × 1024 (1) | 4 | 153.3 → 159.5 | 20.68 → 20.68 | 20.92 → 20.80 | 3.97 → 3.38 |
+
+* At every point every round after has a shorter input dist than every
+  round before: 5% shorter (8 features on 2 nodes) to 23% (4,096 × 128 on
+  4 nodes). `input_dist()` and its two waits run 25 kernels and memory
+  operations per call on one node (32 before) and 51 on 2 nodes (72
+  before) at 8 features, and 53 on 2 nodes at 4,096 features (78 before),
+  as `--profile_iterations` counts them on rank 0.
+* At 4,096 × 1,024 on 4 nodes the step after is 6 ms longer while its
+  input dist is shorter and its kernels take the same time. The step there
+  is the benchmark's host work, which differs between ranks: in both trees
+  the ranks of one or two nodes reach the backward kernel last, and the
+  others wait for them in it (averaged over the ranks, the backward kernel
+  takes 26-31 ms in the rounds before and 27-37 ms after; on the last rank,
+  20.8 ms).
+
 #### Options
 
 | option | default | meaning |
