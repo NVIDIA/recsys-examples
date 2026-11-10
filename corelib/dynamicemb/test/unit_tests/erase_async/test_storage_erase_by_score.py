@@ -22,7 +22,7 @@ background worker will put there.
 
 import pytest
 import torch
-from dynamicemb import DynamicEmbCheckMode, DynamicEmbScoreStrategy
+from dynamicemb import DynamicEmbCheckMode, DynamicEmbScoreStrategy, EvictedItemMode
 from dynamicemb.dynamicemb_config import DynamicEmbEvictStrategy, DynamicEmbTableOptions
 from dynamicemb.key_value_table import (
     ERASE_CHUNK_SLOTS,
@@ -286,6 +286,60 @@ def test_a_table_the_scan_removed_keys_from_is_marked_untracked_and_no_other(dev
 
     storage.erase_by_score(THRESHOLD, [0], new_counts(device))  # nothing left to remove
     assert storage.erase_untracked(0)
+
+
+@pytest.mark.parametrize("chunk_slots", [BUCKET, 3 * BUCKET, ERASE_CHUNK_SLOTS])
+def test_a_retained_scan_reports_the_keys_it_erased_and_does_not_mark_the_table(
+    device, chunk_slots
+):
+    storage = make_storage([BUCKET * 16, BUCKET * 8])
+    fill(storage, KEYS, SCORES, 0, device)
+    fill(storage, KEYS, SCORES, 1, device)  # not scanned
+
+    counts = new_counts(device)
+    storage.erase_by_score(
+        THRESHOLD,
+        [0],
+        counts,
+        chunk_slots=chunk_slots,
+        mode=EvictedItemMode.RETAIN_KEY,
+    )
+
+    assert erased_and_spared(counts) == (len(BELOW), 0)
+    erased = storage.pop_erased_keys(0).tolist()
+    assert sorted(erased) == BELOW
+    slot_index = storage.pop_erased_slot_index(0)
+    assert slot_index.shape == (len(BELOW), 2)
+    assert bool((slot_index >= 0).all())
+    assert storage.pop_erased_keys(1).numel() == 0
+    assert [storage.erase_untracked(t) for t in (0, 1)] == [False, False]
+    assert not bool(found(storage, BELOW, 0, device).any())
+    assert bool(found(storage, KEPT, 0, device).all())
+
+
+def test_a_key_map_replaced_during_a_retained_scan_reports_no_key_twice(device):
+    storage = make_storage([BUCKET * 16, BUCKET * 8])
+    state = storage._state
+    fill(storage, KEYS, SCORES, 0, device)
+
+    def expand_before_the_third_chunk(entry):
+        if entry == 3:
+            _expand_tables_impl(state, [True, False], [BUCKET * 32, -1])
+
+    storage.erase_by_score(
+        THRESHOLD,
+        [0],
+        new_counts(device),
+        chunk_slots=2 * BUCKET,
+        chunk_guard=RecordingGuard(expand_before_the_third_chunk),
+        mode=EvictedItemMode.RETAIN_KEY,
+    )
+
+    assert state.key_map_generation == 1
+    # What was recorded, before the pop de-duplicates it.
+    recorded = torch.cat(state.erased_key_chunks).tolist()
+    assert sorted(recorded) == BELOW
+    assert not storage.erase_untracked(0)
 
 
 class SlowChunks:

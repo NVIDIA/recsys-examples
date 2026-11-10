@@ -989,6 +989,54 @@ def test_an_erase_by_score_makes_the_delta_unreplayable(current_device):
     assert dump_all(dst).keys[0].numel() == before, "a refused delta writes nothing"
 
 
+def test_a_retained_erase_by_score_rides_the_delta_and_replays_exactly(current_device):
+    """A TTL with deltas: the keys the scan erased are in the delta's ``erased_keys``
+    with the slot and row each left, the table is not marked, and the replica ends with
+    the keys, slots and rows of the source."""
+    device = torch.device(f"cuda:{current_device}")
+    src, dst = _one_bucket_models(current_device)
+    old, new = list(range(2001, 2009)), list(range(2009, 2016))
+    touch(src, old, device, backward=True)
+    cutoff = device_timestamp()
+    touch(src, new, device, backward=True)
+    dst.replay_increment(dump_all(src))
+
+    handle = src.erase_by_score_async(
+        DynamicEmbScoreStrategy.TIMESTAMP, cutoff, mode=EvictedItemMode.RETAIN_KEY
+    )
+    assert handle.result() == (len(old), 0)
+
+    delta = dump_all(src)
+    assert delta.meta[0]["erase_untracked"] is False
+    assert sorted(delta.erased_keys[0].tolist()) == old
+    (erased_slots,) = delta.meta[0]["erased_slot_index"]
+    assert erased_slots.shape == (len(old), 2)
+    assert sorted(delta.keys[0].tolist()) == new
+
+    dst.replay_increment(delta)
+    replayed = dump_all(dst)
+    src_keys, src_slots = sorted_view(delta.keys[0], delta.meta[0]["slot_index"])
+    dst_keys, dst_slots = sorted_view(replayed.keys[0], replayed.meta[0]["slot_index"])
+    assert torch.equal(src_keys, dst_keys) and torch.equal(src_slots, dst_slots)
+    assert_rows_accounted_for(dst)
+
+
+def test_a_retained_erase_by_score_does_not_report_a_key_it_spared(current_device):
+    device = torch.device(f"cuda:{current_device}")
+    src, _ = _one_bucket_models(current_device)
+    erasable, pinned = list(range(2001, 2009)), list(range(2009, 2016))
+    touch(src, erasable, device, backward=True)
+    touch(src, pinned, device)  # no backward: a batch is still using these
+
+    handle = src.erase_by_score_async(
+        DynamicEmbScoreStrategy.TIMESTAMP,
+        device_timestamp(),
+        mode=EvictedItemMode.RETAIN_KEY,
+    )
+    assert handle.result() == (len(erasable), len(pinned))
+    assert sorted(src._storage.pop_erased_keys(0).tolist()) == erasable
+
+
 def test_an_erase_by_score_that_removes_nothing_leaves_the_delta_replayable(
     current_device,
 ):

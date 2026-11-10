@@ -1230,7 +1230,7 @@ The same rule is enforced per key inside the kernel — a slot that does not lan
 
 > **Precondition:** writing a key at its source slot **overwrites whatever occupies that slot** in the target. That is what makes a replica converge — if the source evicted key `B` to make room for `A`, a same-capacity replica must do the same. It also means a replayed table must be built *only* by loading/replaying from its source: a table that also takes independent writes can lose a key whose slot a delta key claims.
 
-*Rows and erases.* A storage keeps a value row per key, apart from the key's slot, and an erased key leaves its slot reclaimed, still owning its row. For a replica to keep the same rows, an erase that should be replayed has to be **retained**: `erase_keys(..., mode=EvictedItemMode.RETAIN_KEY)`. A table that erased keys **without** `RETAIN_KEY` (on any rank of the dumping group) -- by `erase_keys`, or by [`erase_by_score_async`](#erase_by_score_async), which retains nothing -- is marked, `meta["erase_untracked"]` is set, and `replay_increment` raises `ValueError` for its deltas; the mark is sticky, so rebuild the replica from a full checkpoint after such an erase. Within a delta the order is: erase by key, recreate the reclaimed slots (`meta["erased_slot_index"]`), then upsert.
+*Rows and erases.* A storage keeps a value row per key, apart from the key's slot, and an erased key leaves its slot reclaimed, still owning its row. For a replica to keep the same rows, an erase that should be replayed has to be **retained**: `erase_keys(..., mode=EvictedItemMode.RETAIN_KEY)`. A table that erased keys **without** `RETAIN_KEY` (on any rank of the dumping group) -- by `erase_keys`, or by [`erase_by_score_async`](#erase_by_score_async) without `mode=EvictedItemMode.RETAIN_KEY` -- is marked, `meta["erase_untracked"]` is set, and `replay_increment` raises `ValueError` for its deltas; the mark is sticky, so rebuild the replica from a full checkpoint after such an erase. Within a delta the order is: erase by key, recreate the reclaimed slots (`meta["erased_slot_index"]`), then upsert.
 
 *The source growing ends the delta chain.* A target's capacity does not change on its own. Once the source table expands (rehash), its capacity no longer matches the target's, and every delta dumped from then on is rejected (`capacity` mismatch). Rebuild the target from a full checkpoint of the grown source and replay what comes after it.
 
@@ -1384,7 +1384,7 @@ The call returns at once with a handle; the scan runs on a thread of its own, on
 - *Which stream.* By default each module makes one stream of its own and keeps it, and the scan overlaps the training. You can pass a stream of the tables' device. The one the training runs on, the default stream or the prefetch stream also work, but the scan is then queued among the training's kernels, does not overlap them, and a `UserWarning` says so.
 - *Chunks.* The scan goes a chunk of at most `chunk_slots` slots at a time, with at most `max_in_flight` chunks launched and not yet finished on the device. They set how much the scan disturbs the training and how long it takes: smaller and fewer disturb it less and take longer. The defaults (`2**22` slots, `2`) were measured on an H100 with a table of `2**29` slots at half load and training steps of 0.7 ms, scans running back to back: a step was slowed by about 10%; with `2**24` slots it was slowed by 110%, with `2**26` it took about eight times as long, and with no limit on chunks in flight (`max_in_flight` large) a step took about six times as long as without a scan. A smaller chunk makes the scan take longer (in the same 300 steps, 13 to 15 scans finished with `2**22` slots and 115 with `2**24`). Those scans only read; erasing is slower (134 million keys removed in 21 ms, with chunks of `2**24` slots, against 3.4 ms to look at the table), and the disturbance while it erases was not measured. A real training step is longer than the 0.7 ms used, so the same disturbance should cost it proportionally less; that was not measured either. Both parameters are worth tuning for your tables.
 - *Ranks.* The call is local: each rank erases what it holds, there is no collective in it, and `result()` is what this rank erased. Add it up across the ranks with a collective if you need the total.
-- *What it does not do.* The keys it erases are not recorded for `pop_erased_keys` or `replay_increment`. So a table it removed any key from is marked (`meta["erase_untracked"]` of an [incremental_dump](#incremental_dump) delta, sticky), and `replay_increment` refuses that table's deltas: a replica would otherwise keep the keys the source erased, and their rows. A call that removes nothing does not mark. `NO_EVICTION` tables are not replayed at all. After such an erase, rebuild the replica from a full checkpoint.
+- *Recording the erase (`mode`).* `mode` is the call's, as for `erase_keys`. With the default `EvictedItemMode.DISCARD` the keys it erases are not recorded for `pop_erased_keys` or `replay_increment`. So a table it removed any key from is marked (`meta["erase_untracked"]` of an [incremental_dump](#incremental_dump) delta, sticky), and `replay_increment` refuses that table's deltas: a replica would otherwise keep the keys the source erased, and their rows. A call that removes nothing does not mark. `NO_EVICTION` tables are not replayed at all. After such an erase, rebuild the replica from a full checkpoint. With `mode=EvictedItemMode.RETAIN_KEY` the erased keys are recorded -- `pop_erased_keys` returns them, and for a table that stores a row per key `pop_erased_slot_index` the `(slot, row)` each left -- the table is not marked, and an `incremental_dump` carries them in `erased_keys` and `erased_slot_index`, so a TTL can run together with delta updates. Spared keys are not recorded. Recording costs a buffer of `chunk_slots` entries for each chunk in flight and one read of the chunk's count, taken after the chunk has finished. As for `erase_keys`, a recorded slot is where the key sat when it was erased: dump before the table is expanded again for the delta to name the slots the replica expects.
 
 The handle (`EraseHandle`, also importable from `dynamicemb`):
 
@@ -1411,6 +1411,7 @@ Anything the background thread raised is raised by whichever of these you call. 
         max_in_flight: int = 2,
         table_names: Optional[Sequence[str]] = None,
         strict: bool = True,
+        mode: EvictedItemMode = EvictedItemMode.DISCARD,
     ) -> EraseHandle:
         """Erase, in the background of training, the keys whose score is below ``threshold``
         from every dynamic embedding table of ``model`` that scores its keys by ``score_strategy``,
@@ -1441,6 +1442,10 @@ Anything the background thread raised is raised by whichever of these you call. 
             ``False``: a name no module of this rank holds is skipped, not an error, for tables
             that are not on every rank (``TABLE_ROW_WISE``). A held name that does not qualify
             is still an error. Default ``True``.
+        mode : EvictedItemMode
+            ``DISCARD`` (default): the erase is not recorded, and a table with a row per key that
+            lost a key is marked ``erase_untracked``. ``RETAIN_KEY``: the erased keys are recorded
+            (``pop_erased_keys``) and carried by an incremental dump as removals.
 
         Returns
         -------
@@ -1449,7 +1454,7 @@ Anything the background thread raised is raised by whichever of these you call. 
         """
     ```
 
-The same call is a method of `BatchedDynamicEmbeddingTablesV2`, `module.erase_by_score_async(score_strategy, threshold, stream=None, chunk_slots=..., max_in_flight=..., table_names=None)`, for the tables of that one module. It has no `strict`: every name must be a table of the module.
+The same call is a method of `BatchedDynamicEmbeddingTablesV2`, `module.erase_by_score_async(score_strategy, threshold, stream=None, chunk_slots=..., max_in_flight=..., table_names=None, mode=EvictedItemMode.DISCARD)`, for the tables of that one module. It has no `strict`: every name must be a table of the module.
 
     ```python
     # Keep the last 1000 steps. Every key is given the step it was seen in, as its score

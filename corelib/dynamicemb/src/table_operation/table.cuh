@@ -119,7 +119,10 @@ void table_erase_by_score(at::Tensor table_storage, torch::Dtype key_dtype,
                           std::optional<at::Tensor> counter,
                           ScoreType threshold, int64_t begin, int64_t end,
                           int64_t num_scores, int64_t score_index,
-                          at::Tensor counts);
+                          at::Tensor counts,
+                          std::optional<at::Tensor> out_keys = std::nullopt,
+                          std::optional<at::Tensor> out_slots = std::nullopt,
+                          std::optional<at::Tensor> out_count = std::nullopt);
 
 void table_erase(at::Tensor table_storage, at::Tensor table_bucket_offsets,
                  int64_t bucket_capacity, at::Tensor bucket_sizes,

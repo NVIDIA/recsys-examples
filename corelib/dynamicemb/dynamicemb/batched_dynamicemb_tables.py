@@ -1674,6 +1674,7 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
         chunk_slots: int = ERASE_CHUNK_SLOTS,
         max_in_flight: int = ERASE_MAX_CHUNKS_IN_FLIGHT,
         table_names: Optional[Sequence[str]] = None,
+        mode: EvictedItemMode = EvictedItemMode.DISCARD,
     ) -> EraseHandle:
         """Erase, in the background, the keys whose score is below ``threshold``.
 
@@ -1698,7 +1699,12 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
         longer (see ``ERASE_CHUNK_SLOTS``).
 
         Best effort: a key a prefetched batch is still using is spared, not erased.
-        With a cache only the storage behind it is erased, and the cache is neither
+        ``mode`` is this call's, as for ``erase_keys``: with ``EvictedItemMode.RETAIN_KEY``
+        the keys it erases are recorded, to be read by ``pop_erased_keys`` or carried by
+        ``incremental_dump`` (``erased_keys``, and ``erased_slot_index`` for a table that
+        stores rows), and the table stays replayable; the default ``DISCARD`` records
+        nothing, and an incremental dump of a table it erased from is marked
+        ``erase_untracked``. With a cache only the storage behind it is erased, and the cache is neither
         read nor changed.
 
         The scan can overlap training -- forward, backward and prefetch -- and nothing
@@ -1744,6 +1750,7 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                 chunk_slots=chunk_slots,
                 chunk_guard=gate,
                 max_in_flight=max_in_flight,
+                mode=mode,
             ),
             stream,
         )
@@ -2521,8 +2528,8 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                 raise ValueError(
                     f"replay_increment: the source of table '{table_name}' erased "
                     "keys without retaining them (erase_keys without "
-                    "EvictedItemMode.RETAIN_KEY, or erase_by_score_async, which "
-                    "retains nothing). Each erase left a reclaimed slot "
+                    "EvictedItemMode.RETAIN_KEY, or erase_by_score_async without "
+                    "it). Each erase left a reclaimed slot "
                     "that keeps its row, and nothing reports it, so this delta "
                     "cannot reproduce the source's rows. Retain the erases from "
                     "the start and rebuild the replica from deltas."
