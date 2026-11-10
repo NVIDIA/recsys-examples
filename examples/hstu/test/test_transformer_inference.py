@@ -96,6 +96,19 @@ def test_backbone_configuration_defaults_and_validation():
         **args, backbone="transformer", transformer_attention="fa4", dtype=torch.float16
     )
     assert fp16_fa4.transformer_attention == "fa4"
+    # Neither runs under torch.export, so an export config rejects both up front.
+    for option in (
+        dict(transformer_fp8_linear=True),
+        dict(transformer_attention="fa4"),
+    ):
+        with pytest.raises(ValueError, match="cannot be exported"):
+            get_inference_hstu_config(
+                **args,
+                **option,
+                backbone="transformer",
+                dtype=torch.bfloat16,
+                export_mode=True,
+            )
 
 
 def reference(layer, x, candidates):

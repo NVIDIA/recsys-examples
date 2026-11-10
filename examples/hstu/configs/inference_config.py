@@ -130,6 +130,10 @@ class InferenceHSTUConfig:
             raise ValueError("transformer_attention requires the transformer backbone")
         if self.transformer_attention == "fa4" and not (self.bf16 or self.fp16):
             raise ValueError("FA4 attention requires bf16 or fp16")
+        if self.export_mode and (
+            self.transformer_fp8_linear or self.transformer_attention == "fa4"
+        ):
+            raise ValueError("FP8 projections and FA4 attention cannot be exported")
         if self.transformer_ffn_dim is not None and self.transformer_ffn_dim <= 0:
             raise ValueError("transformer_ffn_dim must be positive")
         if self.backbone == "transformer":
