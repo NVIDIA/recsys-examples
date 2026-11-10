@@ -28,6 +28,7 @@ import torch
 from dynamicemb import DynamicEmbInitializerArgs, DynamicEmbInitializerMode
 from dynamicemb.initializer import MultiTableInitializer
 from dynamicemb.optimizer import (
+    AdaGradDynamicEmbeddingOptimizer,
     AdamDynamicEmbeddingOptimizer,
     FTRLDynamicEmbeddingOptimizer,
     OptimizerArgs,
@@ -80,10 +81,11 @@ def nan_tail(x, n):
     return x
 
 
-def flat_tables(emb_dims, extra, dtype=torch.float32):
-    """One value table per embedding dim, each row ``emb | extra * emb`` wide."""
-    vdims = [e * (1 + extra) for e in emb_dims]
-    tables = [torch.rand(ROWS, v, device=DEV).to(dtype) for v in vdims]
+def flat_tables(emb_dims, extra, dtype=torch.float32, rows=ROWS, state=None):
+    """One value table per embedding dim, each row ``emb | extra * emb`` wide (or ``emb``
+    and ``state(emb)`` elements of optimizer state)."""
+    vdims = [e + (extra * e if state is None else state(e)) for e in emb_dims]
+    tables = [torch.rand(rows, v, device=DEV).to(dtype) for v in vdims]
     return {
         "tables": tables,
         "table_ptrs": torch.tensor(
@@ -252,24 +254,37 @@ def test_initializer_without_indices_needs_num_valid():
 # -- optimizers ---------------------------------------------------------------
 
 
+def _args(**kw):
+    return OptimizerArgs(learning_rate=0.1, **kw)
+
+
 OPTIMIZERS = {
-    "sgd": SGDDynamicEmbeddingOptimizer,
-    "adam": AdamDynamicEmbeddingOptimizer,
+    "sgd": lambda: SGDDynamicEmbeddingOptimizer(_args()),
+    "adam": lambda: AdamDynamicEmbeddingOptimizer(_args()),
+    "adagrad": lambda: AdaGradDynamicEmbeddingOptimizer(_args()),
+    "rowwise_adagrad": lambda: RowWiseAdaGradDynamicEmbeddingOptimizer(
+        _args(), torch.float32
+    ),
+    "ftrl": lambda: FTRLDynamicEmbeddingOptimizer(_args(l1_reg=0.01, l2_reg=0.01)),
+    # a row is a group: a block reduces its norm in shared memory
+    "ftrl_group": lambda: FTRLDynamicEmbeddingOptimizer(
+        _args(l1_reg=0.01, l2_reg=0.01, group_lasso_reg=0.05)
+    ),
 }
 
 
 def make_optimizer(name):
-    opt = OPTIMIZERS[name](OptimizerArgs(learning_rate=0.1))
+    opt = OPTIMIZERS[name]()
     opt.step()  # Adam's bias correction needs a first iteration
     return opt
 
 
-@pytest.mark.parametrize("name", ["sgd", "adam"])
+@pytest.mark.parametrize("name", list(OPTIMIZERS))
 @pytest.mark.parametrize("dims,vec4", DIMS)
 @pytest.mark.parametrize("n", COUNTS)
 def test_flat_table_update(name, dims, vec4, n):
     opt = make_optimizer(name)
-    a = flat_tables(dims, extra=2 if name == "adam" else 0)
+    a = flat_tables(dims, 0, state=opt.get_state_dim)
     b = clone_tables(a)
     me = a["max_emb_dim"]
     rows = torch.randperm(ROWS, device=DEV)[:N]  # distinct: no two entries race
@@ -287,13 +302,13 @@ def test_flat_table_update(name, dims, vec4, n):
     assert same_tables(a, b)
 
 
-@pytest.mark.parametrize("name", ["sgd", "adam"])
+@pytest.mark.parametrize("name", list(OPTIMIZERS))
 @pytest.mark.parametrize("dims,vec4", DIMS)
 @pytest.mark.parametrize("n", COUNTS)
 def test_padded_buffer_update(name, dims, vec4, n):
     opt = make_optimizer(name)
     me = max(dims)
-    vd = me * (3 if name == "adam" else 1)
+    vd = me + opt.get_state_dim(me)
     a = torch.rand(N, vd, device=DEV)
     b, before = a.clone(), a.clone()
     tids = junk_tail(randint(len(dims)), n, randint(len(dims)))
@@ -307,20 +322,31 @@ def test_padded_buffer_update(name, dims, vec4, n):
     assert torch.equal(a[n:], before[n:])
 
 
-def test_rowwise_adagrad_blocks_with_several_rows():
+@pytest.mark.parametrize("name", ["rowwise_adagrad", "ftrl_group"])
+@pytest.mark.parametrize("flat", [False, True], ids=["padded", "flat"])
+def test_blocks_with_several_rows(name, flat):
     """With a counter the grid is capped, so a block works through several rows in
     turn and reuses its shared reduction buffer: same result as one block per row."""
     sms = torch.cuda.get_device_properties(0).multi_processor_count
     rows, dim = 4 * sms * 32 * 4, 96  # more rows than the cap of any block size
-    opt = RowWiseAdaGradDynamicEmbeddingOptimizer(
-        OptimizerArgs(learning_rate=0.1), torch.float32
-    )
-    a = torch.rand(rows, dim + 4, device=DEV)
-    b = a.clone()
+    opt = make_optimizer(name)
     grads = torch.randn(rows, dim, device=DEV)
     tids = torch.zeros(rows, dtype=torch.int64, device=DEV)
+    if flat:
+        a = flat_tables([dim], 0, rows=rows, state=opt.get_state_dim)
+        b = clone_tables(a)
+        idx = torch.randperm(rows, device=DEV)  # distinct: no two entries race
+        for t, kw in ((a, {"num_valid": nv(rows)}), (b, {})):
+            opt.fused_update_for_flat_table(
+                grads, idx, t["table_ptrs"], tids, *tail(t, False), torch.float32, **kw
+            )
+        assert same_tables(a, b)
+        return
+    vd = dim + opt.get_state_dim(dim)
+    a = torch.rand(rows, vd, device=DEV)
+    b = a.clone()
     emb_dims = torch.tensor([dim], dtype=torch.int64, device=DEV)
-    args = (tids, emb_dims, dim, dim + 4, False)  # the scalar kernel
+    args = (tids, emb_dims, dim, vd, False)  # the scalar kernel
     opt.update_for_padded_buffer(grads, a, *args, num_valid=nv(rows))
     opt.update_for_padded_buffer(grads, b, *args)
     assert torch.equal(a, b)
@@ -436,8 +462,8 @@ def test_reset_ftrl_states(n, with_indices, dtype):
 @pytest.mark.parametrize("kind", ["ftrl", "rowwise_fp16", "adam"])
 @pytest.mark.parametrize("with_indices", [True, False])
 @pytest.mark.parametrize("n", COUNTS)
-def test_reset_optimizer_states_counted(kind, with_indices, n):
-    """The counted form against the host-sized one on exactly the live rows."""
+def test_reset_optimizer_states_with_a_count(kind, with_indices, n):
+    """A device count against the same call on exactly the live rows."""
     if kind == "ftrl":
         args = OptimizerArgs(learning_rate=0.1, initial_accumulator_value=0.5)
         opt, dtype = FTRLDynamicEmbeddingOptimizer(args), torch.float32
