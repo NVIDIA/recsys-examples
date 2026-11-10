@@ -521,6 +521,11 @@ class Storage(abc.ABC, Generic[OptionsT, OptimizerT]):
       the values row of an inert row except through a mask. ``find_masked`` reports
       ``founds[i] = False`` for it and leaves ``values[i]`` unspecified;
       ``insert_masked`` stores nothing for it.
+    * ``keys`` have the table's ``index_type``, int64 or uint64, in both contracts (the
+      host-sized ``find`` / ``insert`` get them as they are, not as int64). torch cannot
+      index a uint64 tensor on the GPU (``keys[rows]`` raises ``"index_cuda" not
+      implemented for 'UInt64'``): select, gather and compare through
+      ``keys.view(torch.int64)``, as the package does (``sync_free.as_i64``).
     * There is no count: nothing takes, returns or branches on a number of live rows.
     * All tensors are CUDA tensors on the storage's device, produced on the current
       stream. Enqueue your work on the current stream, do not synchronize it and do not

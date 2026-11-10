@@ -84,6 +84,13 @@ def key_list(keys):
     return t.tolist()
 
 
+def take_keys(keys, index):
+    """``keys[index]`` for a key tensor of either dtype: torch cannot index a uint64 tensor
+    on the GPU ("index_cuda" is not implemented for UInt64), so the selection goes through
+    the int64 view of the same bits, as the package's own code does (``sf.as_i64``)."""
+    return sf.as_i64(keys)[index].view(keys.dtype)
+
+
 class RecordingOld(StandInBase):
     """A store written against the host-sized contract: exact-length ``find`` / ``insert``
     over a Python dict. It records every call: the keys and table ids it got and the names
@@ -111,7 +118,7 @@ class RecordingOld(StandInBase):
         freq = kwargs.get("lfu_accumulated_frequency")
         return (
             len(missing),
-            keys[where],
+            take_keys(keys, where),
             where,
             table_ids[where],
             None if freq is None or not missing else freq[where],
@@ -568,7 +575,10 @@ def _random_padded_batch(generator, n, device, key_space=60000):
 
 
 @cuda_only
-def test_a_device_resident_store_costs_the_host_nothing_and_its_adapter_one_read():
+@pytest.mark.parametrize("dtype", KEY_DTYPES)
+def test_a_device_resident_store_costs_the_host_nothing_and_its_adapter_one_read(
+    dtype,
+):
     options, optimizer = _device_options(), _sgd()
     native = ps_standins.DeviceDictStorage(options, optimizer)
     old = ps_standins.OldContractDeviceDict(options, optimizer)
@@ -581,6 +591,8 @@ def test_a_device_resident_store_costs_the_host_nothing_and_its_adapter_one_read
         # the probe batch shares keys with the stored one half of the time
         half = min(keys.numel(), probe_keys.numel()) // 2
         probe_keys[:half], probe_ids[:half] = keys[:half], ids[:half]
+        if dtype == torch.uint64:  # the same bits: the reserved key is all ones in both
+            keys, probe_keys = keys.view(dtype), probe_keys.view(dtype)
         torch.cuda.synchronize()
 
         with ps_standins.no_sync():  # the padded contract: nothing is read

@@ -229,7 +229,8 @@ class OldContractDeviceDict(DeviceDictStorage):
         )
         return (
             int(missing.numel()),
-            keys[miss],
+            # torch cannot index a uint64 tensor on the GPU: select through the int64 view
+            sf.as_i64(keys)[miss].view(keys.dtype),
             missing,
             table_ids[miss],
             scores,
