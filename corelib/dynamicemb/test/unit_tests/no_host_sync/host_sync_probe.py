@@ -616,9 +616,15 @@ def plan_of(cfg: Cfg, scenario: str) -> Dict[str, Any]:
         if cfg.layout == "cache":
             p["hbm_rows"] = 8192  # the cache must not fill while the storage grows
         elif cfg.layout == "hybrid":
-            # the HBM tier does not fill either; the host tier (at most 12,288 rows,
-            # from 1,024) grows because the estimate of a batch counts all of its keys
-            p["hbm_rows"] = 4096
+            # Only the host tier grows (from 1,024 rows, to at most 15,360), and a growth is
+            # decided from what it holds -- the snapshot of its size at the last forward --
+            # plus the bound of the batches in flight (key_value_table.SizeSnapshots), which
+            # a step that ends in a barrier leaves empty. The host tier holds what the HBM
+            # tier has spilled and nothing else, so it grows only if the keys of the window
+            # overflow the HBM tier. The growth scenario gives that tier one bucket per table
+            # (1,024 rows: full after the warm-up, then every new key moves one out); the
+            # others keep it roomy, so that a miss is a miss into a tier that is not full.
+            p["hbm_rows"] = 1024 if scenario == "growth" else 8192
         return p
     if cfg.layout == "cache":
         p["max_capacity"], p["hbm_rows"] = (16384, 2048) if evict else (65536, 8192)
@@ -629,6 +635,19 @@ def plan_of(cfg: Cfg, scenario: str) -> Dict[str, Any]:
     elif cfg.layout == "hybrid":
         p["max_capacity"], p["hbm_rows"] = (16384, 2048) if evict else (65536, 8192)
     return p
+
+
+def growth_warmup_scale(cfg: Cfg) -> float:
+    """The size of the warm-up batches of the growth scenario relative to a full one
+    (``BatchMaker.fresh_batch(scale=...)``).
+
+    Small, so that no table has grown when the window starts, and the window has all of the
+    growth. A hybrid is the exception: its host tier grows from what the HBM tier spills,
+    which is nothing until that tier is full (see plan_of), so its warm-up is whole batches:
+    they fill the HBM tier (one bucket per table in this scenario) and the keys of the window
+    all move to the host tier, whatever the growth of the warm-up has made of its capacity.
+    """
+    return 1.0 if cfg.layout == "hybrid" else 0.1
 
 
 # --------------------------------------------------------------------------
@@ -1747,10 +1766,11 @@ def run_case(
             fill: List[Batch] = []
         elif scenario == "growth":
             fill = []
-            pre = [bm.fresh_batch(scale=0.1)] * 1
+            warm_scale = growth_warmup_scale(cfg)
+            pre = [bm.fresh_batch(scale=warm_scale)] * 1
             warm_eval = []
             n = warm - 1 if warm > 1 else 0
-            pre += [bm.fresh_batch(scale=0.1) for _ in range(n)]
+            pre += [bm.fresh_batch(scale=warm_scale) for _ in range(n)]
             measured = (
                 bm.overlap_stream(iters)
                 if stream_overlap

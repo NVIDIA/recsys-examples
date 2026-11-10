@@ -156,7 +156,8 @@ def test_a_growing_step_returns_while_a_running_kernel_has_not_finished(
         maker = hsp.BatchMaker(cfg, device, sb.CENSUS_SEED)
         # all the batches before anything is queued: a copy from pageable memory waits for
         # the stream it is issued on
-        warm = [maker.fresh_batch(scale=0.1) for _ in range(3)]
+        scale = hsp.growth_warmup_scale(cfg)
+        warm = [maker.fresh_batch(scale=scale) for _ in range(3)]
         measured = [maker.fresh_batch() for _ in range(sb.CENSUS_ITERS)]
         return module, warm, measured
 

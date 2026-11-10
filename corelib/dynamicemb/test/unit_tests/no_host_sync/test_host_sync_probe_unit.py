@@ -698,6 +698,36 @@ def test_the_growth_configs_cover_every_layout_that_grows():
     assert noevict == {"cache", "hbm", "host"}  # HybridStorage cannot hold NO_EVICTION
 
 
+def test_the_hybrid_growth_scenario_overflows_the_hbm_tier_into_the_host_tier():
+    """Only the host tier of a hybrid grows, and from what it holds: the keys the HBM tier
+    spills (the first hardware run of the merged tree saw no growth with an HBM tier that took
+    every key). The growth scenario gives the HBM tier one bucket, fills it with the warm-up
+    and moves the keys of the window to the host tier -- enough of them to double a key map
+    that the warm-up has grown to the most it can reach -- while the other scenarios keep the
+    HBM tier roomy: a miss there is a miss into a tier that is not full."""
+    cfg = hsp.CONFIGS["hybrid_growth"]
+    iters = sync_budgets.CENSUS_ITERS
+    grow = hsp.plan_of(cfg, "growth")
+    assert grow["hbm_rows"] == 1024  # one bucket of the HBM tier (bucket_capacity 1024)
+    warm_keys = 3 * int(hsp.growth_warmup_scale(cfg) * hsp.UNIQ[0])
+    assert warm_keys > grow["hbm_rows"], "the HBM tier is full when the window starts"
+    # The host key map starts at init_capacity (1,024 rows) and the batches in flight of the
+    # warm-up can double it twice (the bound of a step is its key slots); a growth in the window
+    # needs the keys spilled before its last step, and the bound of that step, to pass the load
+    # factor of that capacity.
+    start = 4 * grow["init_capacity"]
+    spilled = warm_keys + (iters - 1) * hsp.UNIQ[0] - grow["hbm_rows"]
+    assert spilled + hsp.ROW_N[0] > 0.5 * start, (spilled, start)
+    # the other scenarios hold every key of the warm-up and the window in the HBM tier
+    for scenario in ("all_hit", "miss"):
+        roomy = hsp.plan_of(cfg, scenario)
+        assert roomy["hbm_rows"] > (3 + iters) * hsp.UNIQ[0], scenario
+    # a small warm-up is for the others: nothing has grown when their window starts
+    for name, other in hsp.CONFIGS.items():
+        if other.growth and other.layout != "hybrid":
+            assert hsp.growth_warmup_scale(other) == 0.1, name
+
+
 def test_every_inherent_entry_excuses_a_case_the_probe_measures():
     cases = sync_budgets.case_keys()
     for key in hsp.INHERENT:
