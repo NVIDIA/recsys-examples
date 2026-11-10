@@ -987,3 +987,195 @@ once). So NVLink moves about 7 times as much per GPU as one NIC (50 GB/s).
 
 The hierarchical dist's output dist needs the plans its own input dist makes,
 so this benchmark times it in place (`--kernel_times`, `--trace`).
+
+## 4. Benchmark many embedding collections with a small dense part
+
+This benchmark measures what **blocking host syncs inside DynamicEmb** cost when a
+model has many separate embedding collections and very little GPU work per step.
+Each collection is its own `BatchedDynamicEmbeddingTablesV2`, so every step it does
+its own unique / lookup / update, and every host sync (reading the unique count,
+compaction counts, eviction counts, ...) stalls the CPU until the GPU has drained.
+With a tiny dense part the GPU work per step is small, so launch latency and sync
+stalls dominate the step time: that is where removing a sync shows.
+
+The script `benchmark_many_collections.py` (launcher `benchmark_many_collections.sh`)
+uses only public DynamicEmb APIs, so the same file runs unchanged on any tree.
+It needs one GPU, no `torchrun` and no process group.
+
+### What one step does
+
+- K collections (default 32), each with T tables (default 2) of dim D (default 64),
+  sum-pooled, fp32, fused optimizer in the backward (`--optimizer sgd|adam`).
+- Every collection gets B samples (default 1024) x H keys per sample (default 4)
+  per table, drawn from a pow-law distribution over `--num-embeddings` rows
+  (default 1M) with exponent `--alpha` (default 1.05; larger means more repeated
+  keys, which makes the unique/dedup stage matter more).
+- The pooled outputs `[B, K*T*D]` go through `Linear(K*T*D, 32) -> ReLU ->
+  Linear(32, 1)` and a BCE-with-logits loss; the dense part uses plain SGD.
+- `--pool` (default 16) distinct batches are generated on the GPU up front and
+  cycled, so there is no data generation and no host-to-device copy per step.
+
+### How to run
+
+```bash
+cd corelib/dynamicemb
+
+# One point with the defaults (32 collections x 2 tables, 1024 samples, HBM, SGD)
+bash ./benchmark/benchmark_many_collections.sh
+
+# Other storage layouts: caching, hybrid, host (default: hbm)
+bash ./benchmark/benchmark_many_collections.sh --storage caching
+
+# Also count blocking syncs per step and the GPU-busy fraction, and save JSON
+bash ./benchmark/benchmark_many_collections.sh --sync-count --json hbm.json
+
+# K in {1,4,16,64} x B in {256,1024,4096} in one process, one row per point
+bash ./benchmark/benchmark_many_collections.sh --sweep --storage hbm --sync-count --json hbm_sweep.json
+
+# Before/after table of two result files (needs no GPU and no torch)
+bash ./benchmark/benchmark_many_collections.sh --compare main.json nosync.json
+```
+
+`python benchmark/benchmark_many_collections.py <flags>` is equivalent. Main flags
+(`--help` lists all of them with their defaults):
+
+| Flag | Default | Meaning |
+| ---- | ------- | ------- |
+| `--collections` / `--tables` / `--dim` | 32 / 2 / 64 | K, T and D |
+| `--batch-size` / `--hotness` | 1024 / 4 | B samples and H keys per sample and table |
+| `--num-embeddings` / `--alpha` | 1000000 / 1.05 | rows per table, pow-law exponent |
+| `--optimizer` | `sgd` | `sgd` or `adam` (Adam keeps 2*D state per row: 3x the memory) |
+| `--storage` | `hbm` | `hbm`, `caching`, `hybrid` or `host`, see below |
+| `--hbm-ratio` | 0.1 | share of each table's value bytes in HBM for `caching` and `hybrid` |
+| `--warmup` / `--steps` / `--windows` | 30 / 200 / 5 | untimed steps, timed steps, timed windows (`--sweep`: 20 / 100) |
+| `--pool` / `--seed` | 16 / 0 | distinct batches cycled, RNG seed |
+| `--sync-count` / `--sync-steps` | off / 3 | profile extra steps with `torch.profiler`, see below |
+| `--profile-steps` | 0 | bracket this many extra steps for nsys, see below |
+| `--sweep` | off | the grid K in {1,4,16,64} x B in {256,1024,4096} (`SWEEP_*` constants in the script) |
+| `--json PATH` / `--compare A B` | | write results / compare two result files |
+| `--device` | current | CUDA device index (0-9) |
+
+Storage layouts (the script checks that the library really built the requested one):
+
+| `--storage` | Layout | Values live in |
+| ----------- | ------ | -------------- |
+| `hbm` | `HBM_ONLY` | HBM |
+| `caching` | `CACHING` | HBM cache of `--hbm-ratio` of the rows over a full host copy |
+| `hybrid` | `HYBRID` | `--hbm-ratio` of the rows in HBM, the rest in host memory (no cache) |
+| `host` | `HOST_ONLY` | host memory |
+
+The planned memory is printed, and the run refuses a point whose planned HBM exceeds
+90% of the free device memory (in a sweep it is reported as `FAILED` and the sweep
+continues). With 1M rows per table the planned HBM is 17.2 GiB for the defaults
+(SGD), 47.7 GiB for Adam, 34.4 GiB for SGD with 64 collections, and 95.4 GiB for
+Adam with 64 collections (too much for one 80 GB GPU: use
+`--storage caching|hybrid|host` or a smaller `--num-embeddings`).
+`caching`/`hybrid`/`host` keep (part of) the values in host memory, 15.3 GiB for the
+defaults with SGD; the hash tables always stay in HBM (about 1.9 GiB).
+
+### How to read the output
+
+```
+storage    K      B |        wall ms/step        |        host ms/step        | host/wall | gpu busy |  syncs/step (per coll)
+```
+
+Every number is the median over the timed windows, followed by `[min, max]`.
+
+- **wall ms/step**: all steps of a window are launched back to back and the device
+  is synchronized once at the end. This is the throughput of a real training loop
+  that does not sync by itself, and the number to compare between trees.
+- **host ms/step**: CPU time spent inside the step function, measured without any
+  synchronization. Blocking syncs show up here: with them the CPU waits for the GPU
+  in the middle of the step and the two serialize (`host/wall` near 100%, and the
+  step takes about CPU time plus GPU time). On a sync-free tree `host` is the pure
+  launch cost; if `wall` is still close to `host` the step is bound by CPU launch
+  overhead, if `wall` is larger the GPU is the bottleneck and the CPU runs ahead.
+- **gpu busy** (with `--sync-count`): summed duration of GPU activities divided by the
+  span from the first step to the last GPU activity of the profiled steps. The
+  profiler's own CPU overhead lowers it, so compare it between trees and do not
+  compare it with the timed numbers.
+- **syncs/step** (with `--sync-count`): blocking sync API calls per step, and per
+  collection in parentheses. It counts `cudaStreamSynchronize`, `cudaDeviceSynchronize`,
+  `cudaEventSynchronize` and synchronous `cudaMemcpy`; every `.item()`, `.cpu()`,
+  boolean-mask indexing or `flagged_compact` count read-back is one
+  `cudaStreamSynchronize`. The single-point run also prints the breakdown and the
+  number of D2H copies into pageable memory (`d2h_pageable`: they block the host too,
+  but are normally followed by a counted stream sync, so they are not added). A
+  tree without syncs reads 0. If the profiler returns no CUDA runtime events the
+  run prints a note instead of numbers.
+
+A single-point run also prints the layout, the planned memory, the unique-key ratio
+per step and the working set of the pool (see the notes below). The loss is checked
+for being finite after every window, outside the timed region.
+
+### Comparing two trees
+
+Run the same command on each tree and compare the JSON files. The script imports
+whatever `dynamicemb` is installed (or first on `PYTHONPATH`), so install or select
+the intended tree first; the first lines of the output, and `meta` in the JSON, give
+the imported path and the git commit (and a dirty flag) of that tree.
+
+```bash
+# tree A (for example origin/main), with its dynamicemb installed
+bash ./benchmark/benchmark_many_collections.sh --sweep --storage hbm --sync-count --json main_hbm.json
+# tree B (the change under test), with its dynamicemb installed
+bash ./benchmark/benchmark_many_collections.sh --sweep --storage hbm --sync-count --json nosync_hbm.json
+
+bash ./benchmark/benchmark_many_collections.sh --compare main_hbm.json nosync_hbm.json
+```
+
+`--compare` matches points by configuration (everything but the seed) and prints
+wall ms/step, host ms/step and syncs/step of A and B, the speedup A/B (above 1 means
+B is faster) and the geometric mean over the points. Use the same flags on both
+sides; repeat and alternate the runs (A, B, A, B) to see the run-to-run spread, since
+this benchmark is CPU-bound by design and sensitive to other work on the node.
+
+### Profiling with nsys
+
+Every step is wrapped in NVTX ranges: `step_<i>`, one `collection_<k>` per collection
+(its forward: prefetch with unique, find and insert, then the pooled gather),
+`dense_forward`, and `backward`. `backward` covers `loss.backward()`, which runs the
+dense backward and then each collection's `DynamicEmbeddingFunction.backward` (reduce
+gradients and fused update, in the library's own ranges on the autograd thread).
+`--profile-steps N` runs N extra steps between `cudaProfilerStart` and
+`cudaProfilerStop`, so nsys records only those:
+
+```bash
+nsys profile \
+    --output=many_collections --force-overwrite=true \
+    --sample=none --cpuctxsw=none --trace=cuda,nvtx,osrt \
+    --capture-range=cudaProfilerApi --capture-range-end=stop \
+    python benchmark/benchmark_many_collections.py \
+        --storage hbm --collections 32 --warmup 30 --steps 10 --windows 1 --profile-steps 3
+
+# call counts and time per CUDA API; divide by --profile-steps for per step
+nsys stats --report cuda_api_sum many_collections.nsys-rep | head -20
+```
+
+In the timeline, blocking syncs are long `cudaStreamSynchronize` blocks on the CPU
+thread inside the `collection_<k>` ranges, with the GPU idle around them; on a tree
+without them the launches run back to back and the GPU rows lag behind the CPU.
+With `--sweep`, `--profile-steps` opens one capture window per point: use
+`--capture-range-end=repeat-shutdown:N` with N at least the number of points.
+
+### Notes
+
+- TorchRec `EmbeddingCollection` / `DistributedModelParallel` mode is not covered on
+  purpose: the point is to isolate DynamicEmb's own syncs from the ones TorchRec's
+  input distribution adds. There is no collective in this benchmark.
+- With the default pool of 16 batches and tables much larger than the keys they see,
+  every key is resident after the warmup, so the timed steady state is the all-hit
+  path (every lookup finds its key: no new key is admitted, nothing is evicted) for
+  `hbm`, `hybrid` and `host`, and for `caching` while the working set of the pool
+  fits in the cache. At the defaults the pool's
+  working set is about 23K keys per table against a 100K-row cache, and the script
+  prints both. To keep the miss, insert and eviction paths in every step, shrink the
+  cache (`--storage caching --hbm-ratio 0.01`, 10K rows) or enlarge the pool
+  (`--pool 256`, about 190K keys per table).
+- Keep `--warmup` at least `--pool`: the first pass over the pool inserts the keys.
+- The profiler pass (`--sync-count`) runs after the timed windows and does not affect
+  them. The sync counts are exact API call counts; the GPU-busy fraction is not
+  comparable with the timed numbers (see above).
+- Every collection prints a memory table when it is built; only the one of
+  collection 0 is shown (single-point runs). After each point the modules are freed,
+  and a warning is printed if more than 1 GiB of GPU memory is still held.
