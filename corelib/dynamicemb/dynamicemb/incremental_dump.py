@@ -19,8 +19,10 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.distributed as dist
+from dynamicemb import sync_free as sf
 from dynamicemb.dump_load import find_sharded_modules, get_dynamic_emb_module
 from dynamicemb.dynamicemb_config import ReplayContent
+from dynamicemb.key_value_table import _host_sorted_unique, _upload_async
 from dynamicemb.types import ReplayStats
 from torch import nn
 
@@ -679,30 +681,63 @@ def _all_gather_evicted_keys(
     gather itself runs on the CUDA device). Each rank holds a disjoint set
     (row-wise sharding), so the group-wide union is just the concatenation;
     ``unique`` is applied defensively. Implemented as a size all_gather followed by
-    a padded all_gather (NCCL has no native variable-length gather).
+    a padded all_gather (NCCL has no native variable-length gather); see
+    :func:`_all_gather_evicted_many` for what it costs.
     """
+    return _all_gather_evicted_many([keys], pg)[0]
+
+
+def _all_gather_evicted_many(
+    keys_list: List[torch.Tensor], pg: Optional[dist.ProcessGroup]
+) -> List[torch.Tensor]:
+    """:func:`_all_gather_evicted_keys` for several tables at once, one result each.
+
+    The sizes of every table go through one all_gather as a ``[T]`` tensor and are
+    read once; the keys of every table go through one padded all_gather as one
+    int64 buffer (uint64 keys by their bits) and are copied to the host once. That
+    is two waits for the device however many tables and ranks there are; one gather
+    per table waited for each rank's size and for the keys of each table. Every rank
+    has to call it with the same number of tables, as it had to call the gather once
+    per table.
+    """
+    if not keys_list:
+        return []
     world_size = dist.get_world_size(pg)
     if world_size <= 1:
-        return keys.cpu()
+        # what a pop returns is on the host already, and comes back as it is; keys that are
+        # not (a storage without pop_many) are copied together, with one wait
+        return list(sf.pull_to_host(*keys_list))
     device = torch.device("cuda", torch.cuda.current_device())
-    keys = keys.to(device)
-    local_size = torch.tensor([keys.numel()], device=device, dtype=torch.int64)
-    size_list = [torch.zeros_like(local_size) for _ in range(world_size)]
-    dist.all_gather(size_list, local_size, group=pg)
-    sizes = [int(s.item()) for s in size_list]
-    max_size = max(max(sizes), 1)  # avoid a 0-length NCCL all_gather
-    padded = torch.zeros(max_size, dtype=keys.dtype, device=device)
-    if keys.numel() > 0:
-        padded[: keys.numel()] = keys
-    gathered = [
-        torch.zeros(max_size, dtype=keys.dtype, device=device)
-        for _ in range(world_size)
-    ]
+    num = len(keys_list)
+    dtypes = [keys.dtype for keys in keys_list]
+    local_sizes = torch.tensor([keys.numel() for keys in keys_list], dtype=torch.int64)
+    size_dev = _upload_async(local_sizes, device)
+    size_list = [torch.zeros_like(size_dev) for _ in range(world_size)]
+    dist.all_gather(size_list, size_dev, group=pg)
+    sizes = sf.read_now(torch.stack(size_list))[0]  # [W, T] on the host: the one read
+    by_rank = [[int(sizes[r][t]) for t in range(num)] for r in range(world_size)]
+    max_total = max(max(sum(row) for row in by_rank), 1)  # avoid a 0-length gather
+    local = torch.cat([_upload_async(sf.as_i64(keys), device) for keys in keys_list])
+    padded = torch.zeros(max_total, dtype=torch.int64, device=device)
+    if local.numel() > 0:
+        padded[: local.numel()] = local
+    gathered = [torch.zeros_like(padded) for _ in range(world_size)]
     dist.all_gather(gathered, padded, group=pg)
-    parts = [g[:sz] for g, sz in zip(gathered, sizes) if sz > 0]
-    if not parts:
-        return keys[:0].cpu()
-    return torch.unique(torch.cat(parts)).cpu()
+    host = sf.pull_to_host(*gathered)  # every rank's buffer, pinned: the one copy
+    out: List[torch.Tensor] = []
+    for t in range(num):
+        parts = []
+        for r in range(world_size):
+            if by_rank[r][t] > 0:
+                start = sum(by_rank[r][:t])
+                parts.append(host[r][start : start + by_rank[r][t]])
+        merged = (
+            torch.cat(parts).view(dtypes[t])
+            if parts
+            else torch.empty(0, dtype=dtypes[t])
+        )
+        out.append(_host_sorted_unique(merged))
+    return out
 
 
 def _all_gather_by_rank(
@@ -730,8 +765,7 @@ def _all_gather_by_rank(
     if tensor.size(0) > 0:
         padded[: tensor.size(0)] = tensor
     gathered = [
-        torch.zeros(shape, dtype=tensor.dtype, device=device)
-        for _ in range(world_size)
+        torch.zeros(shape, dtype=tensor.dtype, device=device) for _ in range(world_size)
     ]
     dist.all_gather(gathered, padded, group=pg)
     return [g[:sz].cpu() for g, sz in zip(gathered, sizes)]
@@ -769,10 +803,13 @@ def _pop_retained_keys(
             if not hasattr(dynamic_emb_module, method):
                 continue
             local = getattr(dynamic_emb_module, method)(wanted)
-            for tname, keys in local.items():
-                if pg is not None:
-                    keys = _all_gather_evicted_keys(keys, pg)
-                collection_result[tname] = keys
+            if pg is not None and local:
+                # every table of the module in one gather, in the order they came
+                names = list(local)
+                local = dict(
+                    zip(names, _all_gather_evicted_many([local[n] for n in names], pg))
+                )
+            collection_result.update(local)
 
         if collection_result:
             ret[collection_path] = collection_result

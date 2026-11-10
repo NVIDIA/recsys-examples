@@ -82,6 +82,7 @@ from dynamicemb.key_value_table import (
     HybridStorage,
     Storage,
     _wait_for_stream,
+    _upload_async,
     flush_cache,
 )
 from dynamicemb.lookup_layout import EmbeddingLayout
@@ -2104,6 +2105,25 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
         with open(meta_file_path, "w") as meta_file:
             json.dump(meta_data, meta_file, indent=4)
 
+    def _checkpoint_timestamp(self) -> int:
+        """The device clock a checkpoint takes the ages of its scores against.
+
+        A wait for the device, so it is not read at all when no score is a timestamp: the
+        in-tree storages only look at it for a table that evicts by recency, and ignore the
+        0 they are given otherwise. A dump reads it once for the call, so that the ages of
+        every table are against the same instant. A load reads it for each table, after the
+        barrier of that table, as it always did: the keys of a table are scored against the
+        clock of the time they are loaded, and a load of many tables takes long enough for
+        a clock read at its start to score the keys of the last ones older than they are
+        (by the time the earlier tables took), for whatever reads the clock afterwards.
+        """
+        if isinstance(self._storage, (DynamicEmbStorage, HybridStorage)) and not any(
+            option.evict_strategy == DynamicEmbEvictStrategy.LRU
+            for option in self._dynamicemb_options
+        ):
+            return 0
+        return device_timestamp()
+
     def dump(
         self,
         save_dir: str,
@@ -2123,6 +2143,7 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
         self.flush()
 
         counter_table = self._admission_counter
+        ts: Optional[int] = None
         for table_id, table_name in enumerate(self._table_names):
             if table_name not in set(table_names):
                 continue
@@ -2149,7 +2170,8 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
 
             storage = self._storage
             self._shard_barrier(pg)
-            ts = device_timestamp()
+            if ts is None:
+                ts = self._checkpoint_timestamp()
             storage.dump(
                 table_id,
                 meta_file_path,
@@ -2231,7 +2253,7 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
 
             num_key_files = len(emb_key_files)
             self._shard_barrier(pg)
-            ts = device_timestamp()
+            ts = self._checkpoint_timestamp()
             for i in range(num_key_files):
                 loaded_score = storage.load(
                     table_id,
@@ -2352,13 +2374,24 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
         if not hasattr(storage, method):
             return {}
         pop = getattr(storage, method)
+        tables = [
+            (i, name)
+            for i, name in enumerate(self._table_names)
+            if wanted(self._dynamicemb_options[i].evicted_item_mode)
+            and (table_names is None or name in table_names)
+        ]
+        table_ids = [i for i, _ in tables]
+        # One pass over the retained keys of every table, when the storage has one:
+        # the keys come back on the host after two waits for the device, however many
+        # tables there are.
+        pop_many = getattr(storage, "pop_many", None)
+        popped = pop_many(method, table_ids) if pop_many is not None else None
         result: Dict[str, Tensor] = {}
-        for i, name in enumerate(self._table_names):
-            if not wanted(self._dynamicemb_options[i].evicted_item_mode):
-                continue
-            if table_names is not None and name not in table_names:
-                continue
-            result[name] = pop(i).cpu()  # host tensor
+        for i, name in tables:
+            if popped is not None:
+                result[name] = popped[i]
+            else:
+                result[name] = pop(i).cpu()  # host tensor
         return result
 
     def incremental_dump(
@@ -2650,7 +2683,13 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                 ``dist_type="continuous"`` across more than one rank.
             RuntimeError: a key could not be written at its source slot even
                 though the metadata matched. Unlike the checks above this fires
-                mid-write, so the table may hold a partial replay.
+                mid-write, so the model holds a partial replay: the tables before
+                the failing one were written whole, and every key of the failing
+                table that could be placed is in its key map, where it took the
+                slot of whatever was there, with no row and no value written for
+                it. The replica no longer matches its source (the layouts have
+                diverged, or something else wrote to it) and has to be rebuilt from
+                a full checkpoint.
         """
         storage = self._storage
         if not isinstance(storage, (DynamicEmbStorage, HybridStorage)):
@@ -3008,7 +3047,7 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
             return
         device = torch.device(f"cuda:{torch.cuda.current_device()}")
         self._cache.key_index_map.erase(
-            stale.to(device=device),
+            _upload_async(stale, device),
             torch.full((stale.numel(),), table_id, dtype=torch.int64, device=device),
         )
 
@@ -3032,7 +3071,11 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
 
         if not wanted or not hasattr(storage, method):
             return None
-        out = getattr(storage, method)(table_id)
+        pop_many = getattr(storage, "pop_many", None)
+        if pop_many is not None:
+            out = pop_many(method, [table_id])[table_id]  # on the host already
+        else:
+            out = getattr(storage, method)(table_id)
         if pg is not None:
             out = _all_gather_evicted_keys(out, pg)
         return out.cpu()

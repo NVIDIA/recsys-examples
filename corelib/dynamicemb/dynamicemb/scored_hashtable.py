@@ -14,11 +14,23 @@
 # limitations under the License.
 
 import abc
+import contextlib
 import enum
 import os
 import warnings
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple, Union
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    Iterable,
+    Iterator,
+    List,
+    Optional,
+    Sequence,
+    Tuple,
+    Union,
+)
 
 import dynamicemb_extensions
 import numpy as np
@@ -306,6 +318,69 @@ class ScoredHashTable(abc.ABC):
 
 def uint64_to_int64(x):
     return x if x < (1 << 63) else x - (1 << 64)
+
+
+# How many batches of ``pull_live_prefixes`` are alive on the device at once: the one whose
+# rows are being copied (and then yielded), the next, and the one launched before the yield.
+LIVE_PREFIX_BATCHES_IN_FLIGHT = 3
+
+
+def pull_live_prefixes(
+    batches: Iterable[Tuple[torch.Tensor, Sequence[torch.Tensor]]],
+) -> Iterator[Tuple[int, List[torch.Tensor]]]:
+    """Bring the live rows of batches that only the device knows the size of to the
+    host, one wait for the device per batch.
+
+    ``batches`` yields ``(count, columns)``: ``count`` is an ``int64[1]`` on the device
+    and every column is a device tensor whose first ``count`` rows are the batch's; the
+    rest is not looked at. Iterating it is what launches the work of a batch, so the order
+    below is the order of the launches. Yields ``(n, host_columns)``: one tensor per
+    column, holding its first ``n`` rows in pinned host memory. A batch that holds no row
+    (``n`` is 0) copies nothing: its columns are empty host tensors of the column's dtype
+    and trailing shape, so that a caller can unpack the columns of every batch without
+    asking for ``n`` first.
+
+    Only the live rows cross to the host, so the bytes moved follow the keys the table
+    holds and not the slots it scans. The count of a batch has to be known before its rows
+    can be cut, and a wait for it would stall the device once more per batch; so the count
+    of the next batch rides the copy of this one's rows, which is queued behind the next
+    batch's launch, and a batch after that is launched before the rows in hand are yielded,
+    so the device works while the caller writes them. That is one wait per batch (the
+    first batch's count is one more), however many columns there are, and
+    :data:`LIVE_PREFIX_BATCHES_IN_FLIGHT` batches on the device at once, which a caller
+    that makes a batch large has to budget for.
+    """
+    iterator = iter(batches)
+    current = next(iterator, None)
+    if current is None:
+        return
+    rows = int(sf.pull_to_host(current[0])[0][0])
+    upcoming = next(iterator, None)
+    while True:
+        columns = current[1]
+        wanted: List[torch.Tensor] = []
+        if upcoming is not None:
+            wanted.append(upcoming[0])
+        if rows > 0:
+            wanted.extend(column[:rows] for column in columns)
+        pulled = sf.pull_to_host(*wanted) if wanted else []
+        position = 0
+        next_rows = 0
+        if upcoming is not None:
+            next_rows = int(pulled[0][0])
+            position = 1
+        if rows > 0:
+            host_columns = list(pulled[position : position + len(columns)])
+        else:
+            host_columns = [
+                torch.empty((0,) + tuple(column.shape[1:]), dtype=column.dtype)
+                for column in columns
+            ]
+        after = next(iterator, None)  # the device is busy while the caller writes this
+        yield rows, host_columns
+        if upcoming is None:
+            return
+        current, rows, upcoming = upcoming, next_rows, after
 
 
 class LinearBucketTable(ScoredHashTable):
@@ -1660,8 +1735,20 @@ class LinearBucketTable(ScoredHashTable):
             num_shards = dist.get_world_size() if dist.is_initialized() else 1
             shard_index = dist.get_rank() if dist.is_initialized() else 0
 
-        dump_timestamp = device_timestamp()
+        # a timestamp is only looked at for a score that is one
+        dump_timestamp = (
+            device_timestamp()
+            if any(
+                spec.policy == ScorePolicy.GLOBAL_TIMER for spec in self.score_specs_
+            )
+            else 0
+        )
 
+        # The batches are read and filtered on the host and cross to the device through
+        # pinned staging buffers, without a wait for the copy (see
+        # ``sync_free.StagedUpload``).
+        keys_ring = sf.StagedUpload(device)
+        scores_ring = sf.StagedUpload(device)
         batch_size = 65536
         for start in range(0, num_keys, batch_size):
             num_keys_to_read = min(num_keys - start, batch_size)
@@ -1676,7 +1763,6 @@ class LinearBucketTable(ScoredHashTable):
             keys = torch.tensor(
                 np.frombuffer(keys_bytes, dtype=torch_dtype_to_np_dtype[KEY_TYPE]),
                 dtype=KEY_TYPE,
-                device=device,
             )
             scores_dict: Dict[str, torch.Tensor] = {}
             for score_name, score_bytes in score_bytes_dict.items():
@@ -1685,7 +1771,6 @@ class LinearBucketTable(ScoredHashTable):
                         score_bytes, dtype=torch_dtype_to_np_dtype[SCORE_TYPE]
                     ),
                     dtype=SCORE_TYPE,
-                    device=device,
                 )
                 index = self.score_names_.index(score_name)
                 if self.score_specs_[index].policy == ScorePolicy.GLOBAL_TIMER:
@@ -1704,8 +1789,11 @@ class LinearBucketTable(ScoredHashTable):
 
             assert len(scores_dict) == 1, "Only single score is supported."
             score_name, scores = next(iter(scores_dict.items()))
+            keys = keys_ring.upload(keys)
             score_arg = ScoreArg(
-                name=score_name, value=scores, policy=ScorePolicy.ASSIGN
+                name=score_name,
+                value=scores_ring.upload(scores),
+                policy=ScorePolicy.ASSIGN,
             )
             tid = torch.full(
                 (keys.numel(),), load_table_id, dtype=torch.int64, device=device
@@ -1872,6 +1960,87 @@ class LinearBucketTable(ScoredHashTable):
                     )
                 ovf_offset += batch_size
 
+    def _export_batches_masked(
+        self,
+        table_id: int,
+        batch_size: int = 65536,
+    ) -> Iterator[Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]]:
+        """:meth:`_batched_export_keys_scores` without reading a count: the same scan of
+        the table's main region and then its overflow region, a batch of ``batch_size``
+        slots at a time, but every batch comes at full length and the host never learns
+        how many keys it has.
+
+        Yields ``(count, keys, scores, slots)``: ``count`` is the ``int64[1]`` on the
+        device that the export kernel filled, and the first ``count`` entries of the other
+        three are the batch's keys (in the table's key type), their first score word
+        (int64) and the table-relative slots they sit in (an overflow slot is past
+        ``per_table_capacity_[table_id]``, as in the other export). The rest of the three
+        is inert, as in every padded array of the step path: the reserved key, score 0 and
+        slot ``-1`` (the export kernel's buffers are uninitialised past the count, and a
+        kernel that is handed a key with a table id would take it for a real one). So a
+        caller can use the arrays as they are, or copy the first ``count`` entries once the
+        count has reached the host.
+
+        Nothing here waits for the device; ``count`` is the one thing a caller has to
+        read, and a pipelined one can read it for the next batch while it copies this one
+        (see :func:`pull_live_prefixes`).
+        """
+        begin_slot = (
+            int(self.table_bucket_offsets_cpu_[table_id]) * self.bucket_capacity_
+        )
+        end_slot = (
+            int(self.table_bucket_offsets_cpu_[table_id + 1]) * self.bucket_capacity_
+        )
+        # (storage, bucket capacity, first slot of the table in it, slots, offset of the
+        # slots a batch reports)
+        regions = [
+            (
+                self.table_storage_,
+                self.bucket_capacity_,
+                begin_slot,
+                end_slot - begin_slot,
+                0,
+            )
+        ]
+        if self.enable_overflow_:
+            ovf_cap = self.overflow_bucket_capacity_
+            regions.append(
+                (
+                    self.overflow_table_storage_,
+                    ovf_cap,
+                    table_id * ovf_cap,
+                    ovf_cap,
+                    self.per_table_capacity_[table_id],
+                )
+            )
+        for storage, bucket_capacity, first, length, slot_offset in regions:
+            offset = 0
+            while offset < length:
+                batch_ = min(batch_size, length - offset)
+                counter, keys, score, indices = table_export_batch(
+                    storage,
+                    bucket_capacity,
+                    batch_,
+                    first + offset,
+                    self.key_type_,
+                    None,
+                    first,
+                    num_scores=self.num_scores_,
+                    score_index=0,
+                )
+                live = (
+                    torch.arange(batch_, dtype=torch.int64, device=counter.device)
+                    < counter
+                )
+                slots = indices if slot_offset == 0 else indices + slot_offset
+                yield (
+                    counter,
+                    sf.mask_keys(keys, live),
+                    torch.where(live, score, 0),
+                    torch.where(live, slots, -1),
+                )
+                offset += batch_size
+
     def dump(
         self,
         key_file: str,
@@ -1887,35 +2056,43 @@ class LinearBucketTable(ScoredHashTable):
             table_id (Optional[int]): if provided, only dump the specified logical table.
         """
 
-        fkey = open(key_file, "wb")
-        fscores: Dict[str, Any] = {}
-        for score_name, score_path in score_files.items():
-            if score_name not in self.score_names_:
-                print(
-                    f"Score name {score_name} not existed, will not dump to {score_path}."
+        with contextlib.ExitStack() as files:
+            fkey = files.enter_context(open(key_file, "wb"))
+            fscores: Dict[str, Any] = {}
+            for score_name, score_path in score_files.items():
+                if score_name not in self.score_names_:
+                    print(
+                        f"Score name {score_name} not existed, will not dump to {score_path}."
+                    )
+                else:
+                    fscores[score_name] = files.enter_context(open(score_path, "wb"))
+
+            # a timestamp is only looked at for a score that is one
+            dump_timestamp = (
+                device_timestamp()
+                if any(
+                    spec.policy == ScorePolicy.GLOBAL_TIMER
+                    for spec in self.score_specs_
                 )
-            else:
-                fscores[score_name] = open(score_path, "wb")
+                else 0
+            )
 
-        dump_timestamp = device_timestamp()
-
-        table_ids = [table_id] if table_id is not None else range(self.num_tables_)
-        for tid in table_ids:
-            for keys, named_scores, _ in self._batched_export_keys_scores(
-                fscores.keys(), self.device, tid
-            ):
-                fkey.write(keys.cpu().numpy().tobytes())
-                for name, scores in named_scores.items():
-                    index = self.score_names_.index(name)
-                    if self.score_specs_[index].policy == ScorePolicy.GLOBAL_TIMER:
-                        scores = dump_timestamp - scores
-                    fscores[name].write(scores.cpu().numpy().tobytes())
-
-        fkey.close()
-        for fscore in fscores.values():
-            fscore.close()
-
-        return
+            table_ids = [table_id] if table_id is not None else range(self.num_tables_)
+            for tid in table_ids:
+                batches = (
+                    (count, [sf.as_i64(keys), score])
+                    for count, keys, score, _ in self._export_batches_masked(tid)
+                )
+                for n, (keys, scores) in pull_live_prefixes(batches):
+                    if n == 0:
+                        continue
+                    fkey.write(keys.numpy().tobytes())
+                    for name in fscores:
+                        index = self.score_names_.index(name)
+                        column = scores
+                        if self.score_specs_[index].policy == ScorePolicy.GLOBAL_TIMER:
+                            column = dump_timestamp - scores
+                        fscores[name].write(column.numpy().tobytes())
 
     def incremental_dump(
         self,

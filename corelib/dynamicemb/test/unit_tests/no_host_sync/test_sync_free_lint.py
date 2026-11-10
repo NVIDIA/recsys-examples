@@ -2056,6 +2056,31 @@ ALLOWED_NEW_HITS: List[Tuple[str, Optional[str], str]] = [
         "allocated once, never in a step; the estimated_row_counts line existed before and "
         "black joined its lines",
     ),
+    (
+        "dynamicemb/async_erase.py",
+        "pin_memory",
+        "AsyncEraser.submit: the pinned landing buffer of an erase's counts, allocated on the "
+        "worker thread (the host allocator caches it), which makes EraseHandle.result() one "
+        "wait for the device",
+    ),
+    (
+        "dynamicemb/key_value_table.py",
+        "pin_memory",
+        "_upload_async: the explicit APIs (pop, replay, erase_keys) hand host data to the device "
+        "through a pinned copy and a non-blocking transfer, not a pageable copy that waits",
+    ),
+    (
+        "dynamicemb/key_value_table.py",
+        "numpy",
+        "_dump_table writes the pinned host batches that pull_live_prefixes brought over, one "
+        "wait per batch: a checkpoint file is host data by contract",
+    ),
+    (
+        "dynamicemb/scored_hashtable.py",
+        "numpy",
+        "LinearBucketTable.dump (the admission counter's checkpoint) writes the pinned host "
+        "batches that pull_live_prefixes brought over, one wait per batch",
+    ),
 ]
 
 # The same for a new line that has to be named: (file, label, the start of the line with its
@@ -2473,6 +2498,149 @@ EXPECTED_GONE: List[Tuple[str, str, str, str]] = [
         "cudaStreamSynchronize",
         "CUDACHECK(cudaStreamSynchronize(stream));",
         "step: delete dead code, read the overflow offset on the host",
+    ),
+    # E10: the counts of an erase come back in pinned memory behind the event result() waits
+    # for, instead of a second, pageable copy after it
+    ("dynamicemb/async_erase.py", "cpu", "erased, spared = counts.cpu()", "E10"),
+    ("dynamicemb/async_erase.py", "tolist", "erased, spared = counts.cpu()", "E10"),
+    # E5: a pop is one pass over the retained chunks, and the gather of the group is one
+    # stacked size read and one padded copy, not a read per rank and table
+    ("dynamicemb/incremental_dump.py", "cpu", "return keys.cpu()", "E5"),
+    ("dynamicemb/incremental_dump.py", "cpu", "return keys[:0].cpu()", "E5"),
+    (
+        "dynamicemb/incremental_dump.py",
+        "cpu",
+        "return torch.unique(torch.cat(parts)).cpu()",
+        "E5",
+    ),
+    (
+        "dynamicemb/incremental_dump.py",
+        "unique",
+        "return torch.unique(torch.cat(parts)).cpu()",
+        "E5",
+    ),
+    (
+        "dynamicemb/incremental_dump.py",
+        "tensor_to_device",
+        "local_size = torch.tensor([keys.numel()], device=device, dtype=torch.int64)",
+        "E5",
+    ),
+    (
+        "dynamicemb/key_value_table.py",
+        "unique",
+        "out = torch.unique(keys[mask], dim=0 if keys.dim() > 1 else None)",
+        "E5",
+    ),
+    # E2: a dump copies the live rows of a batch to pinned memory (one wait per batch) instead
+    # of a pageable copy per column
+    (
+        "dynamicemb/key_value_table.py",
+        "cpu",
+        "fkey.write(keys.cpu().numpy().tobytes())",
+        "E2",
+    ),
+    (
+        "dynamicemb/key_value_table.py",
+        "numpy",
+        "fkey.write(keys.cpu().numpy().tobytes())",
+        "E2",
+    ),
+    (
+        "dynamicemb/key_value_table.py",
+        "cpu",
+        "fscore.write(scores.cpu().numpy().tobytes())",
+        "E2",
+    ),
+    (
+        "dynamicemb/key_value_table.py",
+        "numpy",
+        "fscore.write(scores.cpu().numpy().tobytes())",
+        "E2",
+    ),
+    (
+        "dynamicemb/scored_hashtable.py",
+        "cpu",
+        "fkey.write(keys.cpu().numpy().tobytes())",
+        "E2",
+    ),
+    (
+        "dynamicemb/scored_hashtable.py",
+        "numpy",
+        "fkey.write(keys.cpu().numpy().tobytes())",
+        "E2",
+    ),
+    (
+        "dynamicemb/scored_hashtable.py",
+        "cpu",
+        "fscores[name].write(scores.cpu().numpy().tobytes())",
+        "E2",
+    ),
+    (
+        "dynamicemb/scored_hashtable.py",
+        "numpy",
+        "fscores[name].write(scores.cpu().numpy().tobytes())",
+        "E2",
+    ),
+    # E3: the owned keys of a checkpoint file are counted on the host, not copied to the
+    # device batch by batch and read back
+    (
+        "dynamicemb/key_value_table.py",
+        "item",
+        "owned += int(mask.sum().item()) if mask is not None else n",
+        "E3",
+    ),
+    (
+        "dynamicemb/key_value_table.py",
+        "int_bool_of_tensor",
+        "owned += int(mask.sum().item()) if mask is not None else n",
+        "E3",
+    ),
+    # E7: a replay places every key, reads once that they all landed, and writes with masked
+    # stores; erase_keys reads the count it returns and cuts the retained keys with a sort
+    ("dynamicemb/key_value_table.py", "any_all_in_cond", "if bool(keep.any()):", "E7"),
+    (
+        "dynamicemb/key_value_table.py",
+        "int_bool_of_tensor",
+        "if bool(keep.any()):",
+        "E7",
+    ),
+    ("dynamicemb/key_value_table.py", "any_all_in_cond", "if bool(fresh.any()):", "E7"),
+    (
+        "dynamicemb/key_value_table.py",
+        "int_bool_of_tensor",
+        "if bool(fresh.any()):",
+        "E7",
+    ),
+    (
+        "dynamicemb/key_value_table.py",
+        "item",
+        "num_removed = int(removed.sum().item())",
+        "E7",
+    ),
+    (
+        "dynamicemb/key_value_table.py",
+        "int_bool_of_tensor",
+        "num_removed = int(removed.sum().item())",
+        "E7",
+    ),
+    (
+        "dynamicemb/key_value_table.py",
+        "item",
+        "example = int(keys[torch.logical_not(placed)][0].item())",
+        "E7",
+    ),
+    (
+        "dynamicemb/key_value_table.py",
+        "item",
+        "num_unplaced = int(n - placed.sum().item())",
+        "E7",
+    ),
+    # E1: the overflow offset of an export is the host list the device tensor was built from
+    (
+        "dynamicemb/scored_hashtable.py",
+        "item",
+        "int(self.overflow_output_offsets_[table_id].item())",
+        "E1",
     ),
 ]
 

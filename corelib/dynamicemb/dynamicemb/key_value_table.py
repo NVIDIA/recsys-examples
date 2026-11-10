@@ -67,11 +67,13 @@ from dynamicemb.rehash_plan import (
 )
 from dynamicemb.scored_hashtable import (
     REHASH_CHUNK_SLOTS,
+    LIVE_PREFIX_BATCHES_IN_FLIGHT,
     ScoreArg,
     ScorePolicy,
     ScoreSpec,
     get_scored_table,
     rehash_chunk_buckets,
+    pull_live_prefixes,
 )
 from dynamicemb.types import (
     EMBEDDING_TYPE,
@@ -343,6 +345,22 @@ def _tensor_from_bytes(
     return torch.frombuffer(bytearray(buf), dtype=dtype).to(device)
 
 
+def _upload_async(t: torch.Tensor, device: torch.device) -> torch.Tensor:
+    """``t`` on ``device``, without making the host wait for the copy.
+
+    A pageable host tensor is copied to pinned memory first (a host-to-device copy
+    from pageable memory is a wait for the stream); the pinned block is not reused
+    before the copy has landed. A tensor that is on the device already comes back as
+    it is. For the explicit APIs that hand host data to the device: the result is valid
+    on the current stream.
+    """
+    if t.is_cuda:
+        return t.to(device, non_blocking=True)
+    if t.numel() == 0:
+        return torch.empty(tuple(t.shape), dtype=t.dtype, device=device)
+    return t.pin_memory().to(device, non_blocking=True)
+
+
 def get_score_policy(score_strategy):
     """Build the physical :class:`ScoreSpec` for a (validated) score strategy.
 
@@ -515,7 +533,8 @@ class DynamicEmbTableState:
     # ticket, stream] per entry (``stream`` is the ``cuda_stream`` handle of the
     # stream that made it), appended by ``_append_evicted_masked`` and folded into
     # the chunks above by ``_resolve_pending_evicted`` once ``count`` has landed on
-    # the host (or, on a pop, by waiting for it). ``retain_ring`` is the pinned ring
+    # the host (a pop does not wait for it: it takes the arrays whole, see
+    # ``_pending_evicted_arrays``). ``retain_ring`` is the pinned ring
     # those counts land in, allocated here so that no step allocates; only a table
     # that retains evicted keys has one. A copy of the state (``copy.deepcopy``,
     # pickle) gets a ring of its own, which does not know the tickets of the entries
@@ -2125,10 +2144,12 @@ def _replay_score_block(
     e.g. writing a frequency into the timestamp column. The width is validated
     here rather than trusted.
     """
-    device = state.device
     score_strategy = state.options_list[table_id].score_strategy
     num_scores = state.key_index_map.num_scores_
-    block = scores.to(device=device, dtype=SCORE_TYPE)
+    # Where the block is stays where it is: a replay does this on the host block of the
+    # delta, so that the permutation by a list of columns is not an index on the device
+    # (a list of ints as an index is an upload), and uploads the result.
+    block = scores.to(dtype=SCORE_TYPE)
     if block.dim() == 1:
         block = block.view(-1, 1)
     if block.dim() != 2 or block.size(1) != num_scores:
@@ -2630,10 +2651,10 @@ def _append_evicted_masked(
     assert state.retain_ring is not None, "the table does not retain evicted keys"
     if keys.numel() == 0:
         return
-    _resolve_pending_evicted(state, block=False)  # fold what has already landed
+    _resolve_pending_evicted(state)  # fold what has already landed
     count = (table_ids >= 0).sum().reshape(1)  # int64[1], stays on the device
     # A full ring gives no ticket: the entry is retried by a later call, on this
-    # stream (the one the count was produced on), or read by a blocking pop.
+    # stream (the one the count was produced on), or taken whole by a pop.
     state.evicted_pending.append(
         [
             keys,
@@ -2645,12 +2666,12 @@ def _append_evicted_masked(
     )
 
 
-def _resolve_pending_evicted(state: DynamicEmbTableState, block: bool) -> None:
+def _resolve_pending_evicted(state: DynamicEmbTableState) -> None:
     """Fold the pending evicted keys of ``state`` into its chunk lists.
 
-    Without ``block`` only the entries whose count has already landed on the host
-    are folded; nothing waits. With ``block`` every entry is folded, waiting for
-    its count: for a pop, whose result has a data-dependent size anyway.
+    Only the entries whose count has already landed on the host are folded; nothing
+    waits. (A pop does not come here: it takes the pending arrays whole, the members of
+    each marked by their table id, see :func:`_pending_evicted_arrays`.)
 
     An entry is folded by moving its members to the front with a stable sort of
     the membership flag (the order of the keys is kept) and cutting ``[:n]``.
@@ -2666,20 +2687,11 @@ def _resolve_pending_evicted(state: DynamicEmbTableState, block: bool) -> None:
             # on the stream that produced ``count``: the copy and its event are
             # ordered by that stream.
             ticket = ring.enqueue(count)
-        if ticket is not None and not (block or ring.ready(ticket)):
+        if ticket is None or not ring.ready(ticket):
             keep.append([keys, tids, count, ticket, stream])
             continue
-        if ticket is not None:
-            n = int((ring.wait(ticket) if block else ring.value(ticket))[0])
-            ring.release(ticket)
-        elif block:
-            # No ticket and a pop that must have the number: one read. It runs on
-            # this stream, so order it after the one that produced the count.
-            _wait_for_stream(stream)
-            n = int(sf.read_now(count)[0])
-        else:
-            keep.append([keys, tids, count, None, stream])
-            continue
+        n = int(ring.value(ticket)[0])
+        ring.release(ticket)
         if n > 0:
             # The arrays belong to the stream that made them; the sort and the
             # gathers below run on this one, and the arrays are dropped here.
@@ -2721,6 +2733,125 @@ def _append_erased(
         )
 
 
+_INT64_MIN = -(1 << 63)
+
+
+def _key_order_view(keys: torch.Tensor) -> torch.Tensor:
+    """``keys`` as int64 numbers whose signed order is the order of the keys.
+
+    An int64 key is its own number. A uint64 key goes through the int64 view of its
+    bits with the top bit flipped, which maps ``0 .. 2**64 - 1`` onto
+    ``-2**63 .. 2**63 - 1`` in order: sorting these sorts the keys as unsigned, and
+    the same flip undoes it.
+    """
+    signed = sf.as_i64(keys)
+    return signed ^ _INT64_MIN if keys.dtype == torch.uint64 else signed
+
+
+def _host_sorted_unique(keys: torch.Tensor) -> torch.Tensor:
+    """The distinct keys of a 1-D host tensor, ascending in the key type's order."""
+    if keys.numel() <= 1:
+        return keys
+    ordered = torch.sort(_key_order_view(keys)).values
+    first = torch.ones(ordered.numel(), dtype=torch.bool)
+    first[1:] = ordered[1:] != ordered[:-1]
+    ordered = ordered[first]
+    if keys.dtype == torch.uint64:
+        ordered = ordered ^ _INT64_MIN
+    return ordered.view(keys.dtype)
+
+
+def _gather_rows(a: torch.Tensor, order: torch.Tensor) -> torch.Tensor:
+    """``a[order]`` along the first dimension; a uint64 array goes through its int64
+    view (uint64 has no advanced indexing)."""
+    return torch.index_select(sf.as_i64(a), 0, order).view(a.dtype)
+
+
+def _exact(t: torch.Tensor, n: int) -> torch.Tensor:
+    """The first ``n`` rows of ``t`` as a tensor of their own: a slice would keep the
+    whole sorted buffer alive for as long as the few rows that are left in it."""
+    return t if n == t.size(0) else t[:n].clone()
+
+
+def _drain_chunks(
+    key_chunks: List[torch.Tensor],
+    tid_chunks: List[torch.Tensor],
+    table_ids: Sequence[int],
+    num_tables: int,
+) -> Tuple[torch.Tensor, List[int], torch.Tensor, torch.Tensor]:
+    """The one pass every pop of retained keys is made of, over a (key, table_id)
+    chunk buffer, with one read of the device for everything it needs to know.
+
+    The rows of the tables in ``table_ids`` are sorted by (table, key), reduced to
+    the distinct keys and put first; the rows of the other tables are put first in a
+    second array, in the order they came; a row with table id ``-1`` is a sentinel
+    (an inert entry of a masked append), which is neither and is dropped. A chunk
+    may hold any number of sentinels, so the arrays of a lazy append can be given
+    as they are. Keys are 1-D, or ``[n, 2]`` (the (slot, row) pairs of a slot
+    index: distinct rows).
+
+    Returns ``(taken, counts, rest_keys, rest_tids)``: ``taken`` has the distinct
+    keys of the wanted tables, table after table in table order, ``counts[t]`` of
+    table ``t``; ``rest_*`` are the rows of the other tables. All are exact: the
+    sizes are what the single read returns, and nothing else waits.
+    """
+    keys = torch.cat(key_chunks)
+    tids = torch.cat(tid_chunks)
+    device = keys.device
+    size = keys.size(0)
+    wanted = torch.zeros(num_tables, dtype=torch.bool, device=device)
+    for table_id in table_ids:
+        # a kernel with the scalar as its argument; a list of ids would be an upload
+        wanted[table_id].fill_(True)
+    in_table = tids >= 0
+    row_wanted = wanted[tids.clamp(min=0)]
+    keep = in_table & ~row_wanted
+
+    # Order the rows by (table, key): stable sorts by one column after another,
+    # the least significant first.
+    if keys.dim() == 1:
+        columns = [_key_order_view(keys)]
+    else:
+        columns = [keys[:, j] for j in range(keys.size(1) - 1, -1, -1)]
+    order = torch.arange(size, device=device)
+    for column in columns + [tids]:
+        order = order[torch.sort(column[order], stable=True).indices]
+    sorted_keys = _gather_rows(keys, order)
+    sorted_tids = tids[order]
+
+    # A row starts a run of equal (table, key) rows, or it is a repeat.
+    if keys.dim() == 1:
+        sorted_view = sf.as_i64(sorted_keys)
+        differs = sorted_view[1:] != sorted_view[:-1]
+    else:
+        differs = (sorted_keys[1:] != sorted_keys[:-1]).any(dim=1)
+    differs = differs | (sorted_tids[1:] != sorted_tids[:-1])
+    first = torch.ones(size, dtype=torch.bool, device=device)
+    first[1:] = differs
+    take = (sorted_tids >= 0) & wanted[sorted_tids.clamp(min=0)] & first
+    counts = torch.zeros(num_tables, dtype=torch.int64, device=device)
+    counts.scatter_add_(0, sorted_tids.clamp(min=0), take.to(torch.int64))
+
+    # Moving the members of a mask to the front: a stable sort of the mask, so their
+    # order is kept and there is no boolean-mask index.
+    front = torch.sort(take.to(torch.int8), descending=True, stable=True).indices
+    taken = _gather_rows(keys, order[front])
+    rest_order = torch.sort(keep.to(torch.int8), descending=True, stable=True).indices
+    rest_keys = _gather_rows(keys, rest_order)
+    rest_tids = tids[rest_order]
+
+    # The one read: how many rows each wanted table gets, and how many are left.
+    host = sf.read_now(torch.cat([counts, keep.sum().reshape(1)]))[0]
+    per_table = [int(host[t]) for t in range(num_tables)]
+    num_rest = int(host[num_tables])
+    return (
+        _exact(taken, sum(per_table)),
+        per_table,
+        _exact(rest_keys, num_rest),
+        _exact(rest_tids, num_rest),
+    )
+
+
 def _pop_chunked_keys(
     key_chunks: List[torch.Tensor],
     tid_chunks: List[torch.Tensor],
@@ -2732,7 +2863,9 @@ def _pop_chunked_keys(
 
     Concatenates the chunks, selects this table's rows, de-duplicates, and
     returns the rebuilt chunk lists holding only the OTHER tables' rows -- so
-    this table's keys are cleared while the rest stay for their own pop.
+    this table's keys are cleared while the rest stay for their own pop. The
+    result is on the device; the call waits for it once, to know how many rows
+    there are (see :func:`_drain_chunks`).
     """
     if not key_chunks:
         # Match the non-empty path's dtype: chunks carry key_index_map.key_type
@@ -2745,26 +2878,98 @@ def _pop_chunked_keys(
             device=state.device,
         )
         return empty, [], []
-    keys = torch.cat(key_chunks)
-    tids = torch.cat(tid_chunks)
-    mask = tids == table_id
-    out = torch.unique(keys[mask], dim=0 if keys.dim() > 1 else None)
+    out, _, rest_keys, rest_tids = _drain_chunks(
+        key_chunks, tid_chunks, [table_id], state.num_tables
+    )
     # A row with table id -1 is a sentinel (an inert entry of a masked append), not
-    # another table's key: leaving it in the remainder would keep it there for ever.
-    keep = (tids != table_id) & (tids >= 0)
-    if bool(keep.any()):
-        return out, [keys[keep]], [tids[keep]]
+    # another table's key: it is dropped, not left in the remainder for ever.
+    if rest_keys.size(0) > 0:
+        return out, [rest_keys], [rest_tids]
     return out, [], []
+
+
+def _pop_chunked_keys_to_host(
+    key_chunks: List[torch.Tensor],
+    tid_chunks: List[torch.Tensor],
+    table_ids: Sequence[int],
+    state: DynamicEmbTableState,
+) -> Tuple[Dict[int, torch.Tensor], List[torch.Tensor], List[torch.Tensor]]:
+    """:func:`_pop_chunked_keys` for several tables at once, with the keys on the host.
+
+    Two waits for the whole call, however many tables and chunks: one read of how many
+    rows each table gets, then one copy of exactly those rows (the rows of the tables
+    that stay are not copied). Each table's tensor is its own, in the chunks' key type.
+    """
+    if not key_chunks:
+        return (
+            {t: torch.empty(0, dtype=state.key_index_map.key_type) for t in table_ids},
+            [],
+            [],
+        )
+    taken, counts, rest_keys, rest_tids = _drain_chunks(
+        key_chunks, tid_chunks, table_ids, state.num_tables
+    )
+    host = (
+        sf.pull_to_host(taken)[0]
+        if taken.size(0) > 0
+        else torch.empty(0, dtype=taken.dtype)
+    )
+    wanted = set(table_ids)
+    out: Dict[int, torch.Tensor] = {}
+    start = 0
+    for t in range(state.num_tables):
+        if t in wanted:
+            # a copy: the pulled buffer is pinned memory, which a caller keeps no claim on
+            out[t] = host[start : start + counts[t]].clone()
+        start += counts[t]
+    if rest_keys.size(0) > 0:
+        return out, [rest_keys], [rest_tids]
+    return out, [], []
+
+
+def _pending_evicted_arrays(
+    state: DynamicEmbTableState,
+) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
+    """The evictions still pending, as the arrays they were made of.
+
+    A pop that sorts by (table, key) does not need the number each entry holds: the
+    arrays are N long with the table id ``-1`` for the lanes that are not evictions,
+    and the pass drops those. So nothing waits for a count (and the entries that never
+    got a ring slot need no read of their own). What a pop owes the entries is the
+    order: each was made on some stream, and the current stream has to come after it.
+    """
+    keys: List[torch.Tensor] = []
+    tids: List[torch.Tensor] = []
+    current = torch.cuda.current_stream()
+    for entry_keys, entry_tids, _count, _ticket, stream in state.evicted_pending:
+        _wait_for_stream(stream)
+        entry_keys.record_stream(current)
+        entry_tids.record_stream(current)
+        keys.append(entry_keys)
+        tids.append(entry_tids)
+    return keys, tids
+
+
+def _release_pending_evicted(state: DynamicEmbTableState) -> None:
+    """Forget the pending evictions a pop has taken, giving their ring slots back.
+    A count that was never read is not waited for: a slot that is given back is not
+    reused before the copy of its count has landed."""
+    if state.retain_ring is not None:
+        for _keys, _tids, _count, ticket, _stream in state.evicted_pending:
+            state.retain_ring.release(ticket)
+    state.evicted_pending = []
 
 
 def _pop_state_evicted_keys(state: DynamicEmbTableState, table_id: int) -> torch.Tensor:
     """Pop (return + clear) the unique keys ``table_id`` had evicted."""
-    # A pop returns data of a data-dependent size, so waiting for the counts of
-    # the evictions that are still pending is part of its cost.
-    _resolve_pending_evicted(state, block=True)
+    pending_keys, pending_tids = _pending_evicted_arrays(state)
     out, state.evicted_key_chunks, state.evicted_tid_chunks = _pop_chunked_keys(
-        state.evicted_key_chunks, state.evicted_tid_chunks, table_id, state
+        state.evicted_key_chunks + pending_keys,
+        state.evicted_tid_chunks + pending_tids,
+        table_id,
+        state,
     )
+    _release_pending_evicted(state)
     return out
 
 
@@ -2790,6 +2995,54 @@ def _pop_state_erased_slot_index(
         dtype=torch.int64,
     )
     return out.reshape(-1, 2)
+
+
+def _pop_state_many(
+    state: DynamicEmbTableState, evicted: bool, table_ids: Sequence[int]
+) -> Dict[int, torch.Tensor]:
+    """Pop (return + clear) the keys of every table in ``table_ids`` at once, as host
+    tensors: what :func:`_pop_state_evicted_keys` (``evicted``) or
+    :func:`_pop_state_erased_keys` returns for each, from one pass over the chunks."""
+    if evicted:
+        pending_keys, pending_tids = _pending_evicted_arrays(state)
+        (
+            out,
+            state.evicted_key_chunks,
+            state.evicted_tid_chunks,
+        ) = _pop_chunked_keys_to_host(
+            state.evicted_key_chunks + pending_keys,
+            state.evicted_tid_chunks + pending_tids,
+            table_ids,
+            state,
+        )
+        _release_pending_evicted(state)
+    else:
+        (
+            out,
+            state.erased_key_chunks,
+            state.erased_tid_chunks,
+        ) = _pop_chunked_keys_to_host(
+            state.erased_key_chunks, state.erased_tid_chunks, table_ids, state
+        )
+    return out
+
+
+_POP_METHODS = ("pop_evicted_keys", "pop_erased_keys")
+
+
+def _check_pop_method(method: str) -> None:
+    if method not in _POP_METHODS:
+        raise ValueError(f"method must be one of {_POP_METHODS}, got {method!r}")
+
+
+def _union_of_tiers(parts: List[torch.Tensor], key_type: torch.dtype) -> torch.Tensor:
+    """The distinct keys of the host results of several tiers, in key order."""
+    parts = [p for p in parts if p.numel() > 0]
+    if not parts:
+        return torch.empty(0, dtype=key_type)
+    if len(parts) == 1:
+        return parts[0]  # a tier's result is distinct and sorted already
+    return _host_sorted_unique(torch.cat(parts))
 
 
 def _insert_key_values(
@@ -2948,6 +3201,102 @@ def export_keys_values_iter(
         )
 
 
+# What a dump holds on the device for the values of its batches, in bytes, all the batches in
+# flight together. The batches of a dump are full length (the host does not learn how many
+# keys a batch holds before the rows are cut), so each one gathers ``[batch, value_dim]``
+# whatever it holds, and :func:`pull_live_prefixes` keeps several alive: a wide row makes the
+# batch shorter instead of the dump of a table at 1% fill a few GB of transients, at the time
+# a checkpoint is taken and the device is full of the tables.
+DUMP_BATCH_BYTES = 256 << 20
+
+
+def _dump_batch_rows(
+    state: DynamicEmbTableState, table_id: int, batch_size: int = 65536
+) -> int:
+    """How many slots a dump of this table scans per batch: ``batch_size``, or fewer when
+    the value rows are wide enough for the batches in flight, and the contiguous copy of the
+    embedding columns that is made while one of them is pulled, not to fit in
+    :data:`DUMP_BATCH_BYTES`. What the files hold does not depend on it."""
+    row_bytes = max(1, state.table_value_dims_cpu[table_id] * state.emb_dtype.itemsize)
+    in_flight = LIVE_PREFIX_BATCHES_IN_FLIGHT + 1
+    rows = min(batch_size, max(32, DUMP_BATCH_BYTES // (in_flight * row_bytes)))
+    # a multiple of the export kernel's tile, when there is room for one
+    return rows - rows % 32 if rows >= 32 else rows
+
+
+def _dump_batches(
+    state: DynamicEmbTableState,
+    table_id: int,
+    include_optim: bool,
+    batch_size: int = 65536,
+) -> Iterator[Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor], torch.Tensor]]:
+    """What :func:`export_keys_values_iter` yields for a table, as HOST tensors and with
+    one wait for the device per batch (see :func:`pull_live_prefixes`).
+
+    The batches are exported at full length, with their count on the device; the
+    embeddings (and the optimizer state, when ``include_optim`` wants it) are gathered
+    for every lane, a lane past the count at row ``-1``, which the gather skips. Only the
+    first ``count`` rows of the keys, the values and the scores are copied to the host,
+    where the optimizer state is split off the values and the score columns are put in the
+    user's order. Yields ``(keys, embeddings, opt_states, scores)`` for each batch that
+    holds a key: ``keys`` are int64, ``opt_states`` is ``None`` unless ``include_optim``
+    and the table keeps one, ``scores`` are int64 ``[n]`` or ``[n, num_scores]``.
+
+    A batch is ``batch_size`` slots at most; a table of wide rows has shorter ones, so that
+    the values of the batches in flight stay inside :data:`DUMP_BATCH_BYTES`.
+    """
+    batch_size = _dump_batch_rows(state, table_id, batch_size)
+    emb_dim_t = state.table_emb_dims_cpu[table_id]
+    optim_state_dim = state.table_value_dims_cpu[table_id] - emb_dim_t
+    with_opt = include_optim and optim_state_dim != 0
+    key_index_map = state.key_index_map
+    num_scores = key_index_map.num_scores_
+    dump_perm = None
+    if num_scores > 1:
+        # Multi-word score layouts (e.g. LruLfu: timestamp + frequency) must persist ALL
+        # words, not just the exported column, so the checkpoint can restore them exactly,
+        # in the user's configured (logical) order. Identity when it is the physical one.
+        score_strategy = state.options_list[table_id].score_strategy
+        assert (
+            score_strategy is not None
+        ), "a table with several score words has a strategy"
+        dump_perm = score_dump_permutation(score_strategy)
+        if dump_perm == list(range(num_scores)):
+            dump_perm = None
+
+    def launches():
+        for count, keys, scores, slots in key_index_map._export_batches_masked(
+            table_id, batch_size
+        ):
+            rows = key_index_map._rows_of(
+                slots, torch.full_like(slots, table_id), False
+            )
+            values = load_from_flat_single_table(state, rows, table_id)
+            if num_scores > 1:
+                # score blocks are keyed by slot, the values by row (the same thing unless
+                # the table stores rows); a slot of -1 gives zeros
+                scores = key_index_map.gather_score_blocks(table_id, slots)
+            # the embedding columns of the value rows are a strided view: only the rows
+            # that are copied are made contiguous
+            yield count, [
+                sf.as_i64(keys),
+                values if with_opt else values[:, :emb_dim_t],
+                scores,
+            ]
+
+    for n, (keys, values, scores) in pull_live_prefixes(launches()):
+        if n == 0:
+            continue
+        if dump_perm is not None:
+            scores = scores[:, dump_perm].contiguous()
+        yield (
+            keys,
+            values[:, :emb_dim_t] if with_opt else values,
+            values[:, -optim_state_dim:] if with_opt else None,
+            scores,
+        )
+
+
 def _dump_table(
     state: DynamicEmbTableState,
     table_id: int,
@@ -2962,7 +3311,6 @@ def _dump_table(
     current_score: Optional[int] = None,
     append: bool = False,
 ) -> None:
-    device = torch.device(f"cuda:{torch.cuda.current_device()}")
     if not append and include_meta:
         meta_data = {}
         meta_data.update(state.optimizer.get_opt_args())
@@ -2988,32 +3336,29 @@ def _dump_table(
         save_to_json(meta_data, meta_json_file_path)
 
     mode = "ab" if append else "wb"
-    fkey = open(emb_key_path, mode)
-    fembedding = open(embedding_file_path, mode)
-    fscore = open(score_file_path, mode)
-    fopt_states = open(opt_file_path, mode) if include_optim else None
+    with contextlib.ExitStack() as files:
+        fkey = files.enter_context(open(emb_key_path, mode))
+        fembedding = files.enter_context(open(embedding_file_path, mode))
+        fscore = files.enter_context(open(score_file_path, mode))
+        fopt_states = (
+            files.enter_context(open(opt_file_path, mode)) if include_optim else None
+        )
 
-    for keys, embeddings, opt_states_batch, scores in export_keys_values_iter(
-        state, device=device, table_id=table_id
-    ):
-        fkey.write(keys.cpu().numpy().tobytes())
-        fembedding.write(_raw_bytes(embeddings))
-        if state.evict_strategy == EvictStrategy.KLru:
-            scores = timestamp - scores
-        fscore.write(scores.cpu().numpy().tobytes())
-        if fopt_states and opt_states_batch is not None:
-            to_write = state.optimizer.states_for_checkpoint(
-                opt_states_batch,
-                state.table_emb_dims_cpu[table_id],
-            )
-            fopt_states.write(_raw_bytes(to_write))
-
-    fkey.close()
-    fembedding.close()
-    if fscore:
-        fscore.close()
-    if fopt_states:
-        fopt_states.close()
+        # One wait for the device per batch, and only the keys the table holds are copied.
+        for keys, embeddings, opt_states_batch, scores in _dump_batches(
+            state, table_id, include_optim
+        ):
+            fkey.write(keys.numpy().tobytes())
+            fembedding.write(_raw_bytes(embeddings))
+            if state.evict_strategy == EvictStrategy.KLru:
+                scores = timestamp - scores
+            fscore.write(scores.numpy().tobytes())
+            if fopt_states and opt_states_batch is not None:
+                to_write = state.optimizer.states_for_checkpoint(
+                    opt_states_batch,
+                    state.table_emb_dims_cpu[table_id],
+                )
+                fopt_states.write(_raw_bytes(to_write))
 
 
 def _resolve_shard(
@@ -3040,6 +3385,10 @@ def _count_owned_keys(
     Reads only the key file, with the filter :func:`_iter_batches_from_files`
     applies. A checkpoint can hold many ranks' keys while a rank keeps only its
     own share, so the file's size is not what a rank has to make room for.
+
+    The count is made on the host, on the keys as they come out of the file: nothing
+    is copied to the device and nothing waits for it (``device`` is kept for callers
+    that pass it).
     """
     num_keys = os.path.getsize(emb_key_path) // KEY_TYPE.itemsize
     shard_index, num_shards = _resolve_shard(shard_index, num_shards)
@@ -3049,16 +3398,11 @@ def _count_owned_keys(
     with open(emb_key_path, "rb") as fkey:
         for start in range(0, num_keys, batch_size):
             n = min(num_keys - start, batch_size)
-            keys = torch.tensor(
-                np.frombuffer(
-                    fkey.read(KEY_TYPE.itemsize * n),
-                    dtype=torch_dtype_to_np_dtype[KEY_TYPE],
-                ),
-                dtype=KEY_TYPE,
-                device=device,
+            keys = torch.frombuffer(
+                bytearray(fkey.read(KEY_TYPE.itemsize * n)), dtype=KEY_TYPE
             )
             mask = owned_key_mask(keys, shard_index, num_shards, dist_type)
-            owned += int(mask.sum().item()) if mask is not None else n
+            owned += n if mask is None else keys[mask].numel()
     return owned
 
 
@@ -3099,6 +3443,14 @@ def _iter_batches_from_files(
 
     Handles file I/O, deserialization, and keeping only the keys this rank owns.
 
+    The keys this rank does not own are dropped on the host, before anything goes to
+    the device (the ownership rule is plain tensor arithmetic, which runs on a CPU tensor
+    as it does on a CUDA one), and each column crosses through a ring of pinned staging
+    buffers (:class:`sync_free.StagedUpload`) with a non-blocking copy: the host reads
+    and filters the next batch while the device takes this one, and does not wait for it
+    but for a buffer, when the device is still busy with the transfer two batches back.
+    The tensors yielded are valid on the current stream.
+
     *dist_type* selects the ownership rule, which is the table's own -- the load
     path checks it against the checkpoint's before getting here
     (``_validate_load_meta``). It matters in two ways. When the checkpoint's
@@ -3120,6 +3472,12 @@ def _iter_batches_from_files(
 
     shard_index, num_shards = _resolve_shard(shard_index, num_shards)
 
+    host = torch.device("cpu")
+    keys_ring = sf.StagedUpload(device)
+    embeddings_ring = sf.StagedUpload(device)
+    scores_ring = sf.StagedUpload(device)
+    opt_ring = sf.StagedUpload(device)
+
     try:
         for start in range(0, num_keys, batch_size):
             n = min(num_keys - start, batch_size)
@@ -3128,11 +3486,10 @@ def _iter_batches_from_files(
             keys = torch.tensor(
                 np.frombuffer(keys_bytes, dtype=torch_dtype_to_np_dtype[KEY_TYPE]),
                 dtype=KEY_TYPE,
-                device=device,
             )
 
             emb_bytes = fembedding.read(emb_dtype.itemsize * dim * n)
-            embeddings = _tensor_from_bytes(emb_bytes, emb_dtype, device).view(-1, dim)
+            embeddings = _tensor_from_bytes(emb_bytes, emb_dtype, host).view(-1, dim)
 
             scores = None
             if fscore:
@@ -3142,7 +3499,6 @@ def _iter_batches_from_files(
                         score_bytes, dtype=torch_dtype_to_np_dtype[SCORE_TYPE]
                     ),
                     dtype=SCORE_TYPE,
-                    device=device,
                 )
                 if num_scores > 1:
                     scores = scores.view(-1, num_scores)
@@ -3150,9 +3506,9 @@ def _iter_batches_from_files(
             opt_states = None
             if fopt:
                 opt_bytes = fopt.read(opt_state_dtype.itemsize * optstate_dim * n)
-                opt_states = _tensor_from_bytes(
-                    opt_bytes, opt_state_dtype, device
-                ).view(-1, optstate_dim)
+                opt_states = _tensor_from_bytes(opt_bytes, opt_state_dtype, host).view(
+                    -1, optstate_dim
+                )
 
             masks = owned_key_mask(keys, shard_index, num_shards, dist_type)
             if masks is not None:
@@ -3163,7 +3519,12 @@ def _iter_batches_from_files(
                 if opt_states is not None:
                     opt_states = opt_states[masks]
 
-            yield keys, embeddings, scores, opt_states
+            yield (
+                keys_ring.upload(keys),
+                embeddings_ring.upload(embeddings),
+                None if scores is None else scores_ring.upload(scores),
+                None if opt_states is None else opt_ring.upload(opt_states),
+            )
     finally:
         fkey.close()
         fembedding.close()
@@ -3447,9 +3808,41 @@ def _load_key_values(
 # ---------------------------------------------------------------------------
 
 
-def _slice(t: Optional[torch.Tensor], start: int, end: int) -> Optional[torch.Tensor]:
-    """Slice an optional column, keeping ``None`` as ``None``."""
-    return None if t is None else t[start:end]
+def _replay_wants_state(
+    state: DynamicEmbTableState, table_id: int, content: ReplayContent
+) -> bool:
+    """Whether a replay writes the optimizer state the delta carries for this table: the
+    content asks for it and the table keeps some."""
+    return (
+        ReplayContent.OPTIMIZER_STATE in content
+        and state.optimizer.get_state_dim(state.table_emb_dims_cpu[table_id]) > 0
+    )
+
+
+def _check_replay_optimizer_states(
+    state: DynamicEmbTableState,
+    table_id: int,
+    optimizer_states: Optional[torch.Tensor],
+) -> torch.Tensor:
+    """Raise ``ValueError`` for a delta whose optimizer state this table cannot take: it
+    carries none, or a block that is not as wide as the table's checkpoint rows. Looks
+    at the shape of the host block only, so a replay can run it before it writes.
+    Returns the block."""
+    if optimizer_states is None:
+        raise ValueError(
+            f"replay_increment: table {table_id} keeps optimizer state per "
+            "row, but the delta carries none. Drop "
+            "ReplayContent.OPTIMIZER_STATE, or replay a delta dumped from a "
+            "table with the same optimizer."
+        )
+    ckpt_dim = state.optimizer.get_ckpt_state_dim(state.table_emb_dims_cpu[table_id])
+    if optimizer_states.dim() != 2 or optimizer_states.size(1) != ckpt_dim:
+        raise ValueError(
+            f"replay_increment: table {table_id} dumps {ckpt_dim} "
+            f"optimizer-state column(s) per row, but the delta carries a "
+            f"block of shape {tuple(optimizer_states.shape)}."
+        )
+    return optimizer_states
 
 
 def _replay_write_values(
@@ -3458,7 +3851,7 @@ def _replay_write_values(
     rows: torch.Tensor,
     embeddings: torch.Tensor,
     optimizer_states: Optional[torch.Tensor],
-    keep_optimizer: torch.Tensor,
+    keep_optimizer: Optional[torch.Tensor],
     content: ReplayContent,
 ) -> None:
     """Write a replayed row's value columns, per :class:`ReplayContent`.
@@ -3475,36 +3868,25 @@ def _replay_write_values(
       state, because writing just the embedding columns leaves the tail
       untouched. Every other row is new to this key, so its tail still holds the
       previous occupant's moments and has to be reset by the optimizer.
+      ``keep_optimizer`` says which rows are which (bool, one per row); it is not
+      read by the other two cases, which may leave it ``None``.
     """
     if rows.numel() == 0:
         return
     emb_dim_cfg = state.table_emb_dims_cpu[table_id]
     optstate_dim = state.optimizer.get_state_dim(emb_dim_cfg)
     embeddings = embeddings.to(dtype=state.emb_dtype)
-    want_opt = ReplayContent.OPTIMIZER_STATE in content and optstate_dim > 0
+    want_opt = _replay_wants_state(state, table_id, content)
 
     if optstate_dim == 0:
         store_to_flat_single_table(state, rows, table_id, embeddings)
         return
 
     if want_opt:
-        if optimizer_states is None:
-            raise ValueError(
-                f"replay_increment: table {table_id} keeps optimizer state per "
-                "row, but the delta carries none. Drop "
-                "ReplayContent.OPTIMIZER_STATE, or replay a delta dumped from a "
-                "table with the same optimizer."
-            )
-        ckpt_dim = state.optimizer.get_ckpt_state_dim(emb_dim_cfg)
-        if optimizer_states.dim() != 2 or optimizer_states.size(1) != ckpt_dim:
-            raise ValueError(
-                f"replay_increment: table {table_id} dumps {ckpt_dim} "
-                f"optimizer-state column(s) per row, but the delta carries a "
-                f"block of shape {tuple(optimizer_states.shape)}."
-            )
+        checked = _check_replay_optimizer_states(state, table_id, optimizer_states)
         # Back to the runtime width the fused value row expects.
         opt = state.optimizer.states_from_checkpoint(
-            optimizer_states.to(device=embeddings.device),
+            checked.to(device=embeddings.device),
             emb_dim_cfg,
             state.emb_dtype,
             embeddings.device,
@@ -3514,131 +3896,277 @@ def _replay_write_values(
         )
         return
 
+    # Two masked stores over every row: a row of -1 is skipped by the store kernel, so each
+    # write takes the rows of its own kind without a count and without compacting them (a
+    # boolean-mask index waits for the device). The rows that keep their state get the
+    # embedding columns only; the others get the whole row, with the state the optimizer
+    # starts from.
     keep = keep_optimizer
-    if bool(keep.any()):
-        store_to_flat_single_table(state, rows[keep], table_id, embeddings[keep])
-    fresh = torch.logical_not(keep)
-    if bool(fresh.any()):
-        fresh_emb = embeddings[fresh]
-        opt_states = torch.empty(
-            (fresh_emb.size(0), optstate_dim),
-            dtype=state.emb_dtype,
-            device=fresh_emb.device,
-        )
-        state.optimizer.reset_optimizer_states(opt_states, emb_dims=emb_dim_cfg)
-        store_to_flat_single_table(
-            state,
-            rows[fresh],
-            table_id,
-            torch.cat([fresh_emb, opt_states], dim=-1),
-        )
+    store_to_flat_single_table(state, torch.where(keep, rows, -1), table_id, embeddings)
+    opt_states = torch.empty(
+        (embeddings.size(0), optstate_dim),
+        dtype=state.emb_dtype,
+        device=embeddings.device,
+    )
+    state.optimizer.reset_optimizer_states(opt_states, emb_dims=emb_dim_cfg)
+    store_to_flat_single_table(
+        state,
+        torch.where(torch.logical_not(keep), rows, -1),
+        table_id,
+        torch.cat([embeddings, opt_states], dim=-1),
+    )
 
 
-def _replay_at_slots(
-    state: DynamicEmbTableState,
+class _ReplayPlaced(NamedTuple):
+    """What the placement of one batch of a replay leaves for the rest of the call."""
+
+    state: DynamicEmbTableState
+    table_id: int
+    start: int  # the batch is rows [start, start + n) of its tier's arrays
+    n: int
+    tier: int  # which of the call's tiers
+    same_key: Optional[torch.Tensor]  # bool[n] on the device, when the writes need it
+    unplaced: torch.Tensor  # int64[2] on the device: how many keys were not placed, one of them
+
+
+class _ReplayTier(NamedTuple):
+    """One tier's share of a replayed delta: host tensors, row aligned."""
+
+    state: DynamicEmbTableState
+    keys: torch.Tensor
+    embeddings: torch.Tensor
+    optimizer_states: Optional[torch.Tensor]
+    scores: Optional[torch.Tensor]
+    slot_index: torch.Tensor
+
+
+class _ReplayUploads:
+    """The staging rings of one replay call: a column of the delta crosses to the device
+    through pinned buffers, with a non-blocking copy, one ring per column."""
+
+    def __init__(self, device: torch.device) -> None:
+        self.keys = sf.StagedUpload(device)
+        self.slots = sf.StagedUpload(device)
+        self.scores = sf.StagedUpload(device)
+        self.write_slots = sf.StagedUpload(device)
+        self.embeddings = sf.StagedUpload(device)
+        self.optimizer_states = sf.StagedUpload(device)
+
+
+def _replay_slots(
+    state: DynamicEmbTableState, slot_index: torch.Tensor, ring: sf.StagedUpload
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """The key slots and the value rows of a batch of the delta, on the device."""
+    slots = ring.upload(slot_index).to(dtype=torch.int64)
+    if _row_differs_from_slot(state):
+        # ``use_rows`` tables carry (key slot, value row) as ``[n, 2]``; every other
+        # table uses one index for both.
+        return slots[:, 0].contiguous(), slots[:, 1].contiguous()
+    return slots, slots
+
+
+def _replay_place(
+    tier_index: int,
+    tier: _ReplayTier,
     table_id: int,
-    keys: torch.Tensor,
-    embeddings: torch.Tensor,
-    optimizer_states: Optional[torch.Tensor],
-    scores: Optional[torch.Tensor],
-    slot_index: torch.Tensor,
+    start: int,
+    end: int,
     timestamp: int,
     insert_score: int,
     content: ReplayContent,
-) -> int:
-    """Write keys at the exact slots they held in the source table.
-
-    Every key must land: the caller has already established that this table's
-    layout matches the source's, so a slot that does not fall inside its key's
-    home bucket means the two have diverged anyway and the replay would silently
-    lose that key. Raises rather than writing a partial result.
-
-    Returns the number of keys written (always all of them, or it raised).
-    """
-    n = keys.numel()
+    uploads: _ReplayUploads,
+) -> _ReplayPlaced:
+    """The first phase of a replay, for rows ``[start, end)`` of one tier: write the keys
+    (and their score words) at the slots they held in the source, and leave on the
+    device how many could not be placed. Launches only; nothing is read, and nothing
+    but the key map is written -- no row of the table and no value."""
+    state = tier.state
+    n = end - start
     device = state.device
-    if n == 0:
-        return 0
+    keys = uploads.keys.upload(tier.keys[start:end]).to(
+        dtype=state.key_index_map.key_type
+    )
     tids = torch.full((n,), table_id, dtype=torch.int64, device=device)
-
-    if _row_differs_from_slot(state):
-        # ``use_rows`` tables carry (key slot, value row) as ``[n, 2]``; every
-        # other table uses one index for both.
-        key_slots = slot_index[:, 0].contiguous()
-        value_rows = slot_index[:, 1].contiguous()
-    else:
-        key_slots = slot_index
-        value_rows = slot_index
-
+    key_slots, _ = _replay_slots(state, tier.slot_index[start:end], uploads.slots)
     # The score words are written with the key, so they are chosen here: either
     # restored from the delta or minted as if the key had just been inserted.
-    if ReplayContent.SCORE in content and scores is not None:
-        score_block = _replay_score_block(state, table_id, scores, timestamp)
+    if ReplayContent.SCORE in content and tier.scores is not None:
+        score_block = uploads.scores.upload(
+            _replay_score_block(state, table_id, tier.scores[start:end], timestamp)
+        )
     else:
         score_block = _fresh_score_block(state, table_id, n, timestamp, insert_score)
     status, same_key = state.key_index_map.scatter_keys_at_slots(
         keys, tids, key_slots, score_block
     )
-    placed = status >= 0
-    num_unplaced = int(n - placed.sum().item())
-    if num_unplaced:
-        example = int(keys[torch.logical_not(placed)][0].item())
-        raise RuntimeError(
-            f"replay_increment: {num_unplaced} of {n} keys could not be written "
-            f"at their source slot on table {table_id} (e.g. key {example}). "
-            "Either the slot falls outside its key's home bucket -- where no "
-            "lookup would ever probe it, meaning the target's hash layout "
-            "differs from the source's despite matching metadata -- or the slot "
-            "was held by another writer, meaning something ran against this "
-            "table concurrently with the replay. Replaying past either would "
-            "silently drop those keys."
-        )
+    bad = status < 0
+    first_bad = torch.argmax(bad.to(torch.int8))
+    unplaced = torch.cat(
+        [
+            bad.sum().reshape(1),
+            torch.index_select(sf.as_i64(keys), 0, first_bad.reshape(1)),
+        ]
+    )
+    # Only the writes of a table that keeps optimizer state, and a delta that does not
+    # carry it, ask which keys were already in their slot.
+    emb_dim = state.table_emb_dims_cpu[table_id]
+    needs_same_key = (
+        state.optimizer.get_state_dim(emb_dim) > 0
+        and ReplayContent.OPTIMIZER_STATE not in content
+    )
+    return _ReplayPlaced(
+        state,
+        table_id,
+        start,
+        n,
+        tier_index,
+        same_key if needs_same_key else None,
+        unplaced,
+    )
 
+
+def _replay_check(
+    placed: Sequence[_ReplayPlaced], tiers: Sequence[_ReplayTier], table_id: int
+) -> None:
+    """The one read of a replay: raise if any key of any batch was not placed.
+
+    This is where the call waits for the device, once, and it is before the first row
+    of the table or the first value is written. A key that does not fall in the home
+    bucket of its slot means that the target's layout is not the source's, whatever its
+    metadata said, and writing the values of the keys that did land would leave a table
+    that is neither.
+    """
+    if not placed:
+        return
+    host = sf.read_now(torch.cat([p.unplaced for p in placed]))[0]
+    unplaced = [int(host[2 * i]) for i in range(len(placed))]
+    if not any(unplaced):
+        return
+    total = sum(p.n for p in placed)
+    first = next(i for i, count in enumerate(unplaced) if count)
+    example = int(host[2 * first + 1])
+    if placed[first].state.key_index_map.key_type == torch.uint64:
+        example &= (1 << 64) - 1  # the key, not its int64 bit pattern
+    raise RuntimeError(
+        f"replay_increment: {sum(unplaced)} of {total} keys could not be written "
+        f"at their source slot on table {table_id} (e.g. key {example}). "
+        "Either the slot falls outside its key's home bucket -- where no "
+        "lookup would ever probe it, meaning the target's hash layout "
+        "differs from the source's despite matching metadata -- or the slot "
+        "was held by another writer, meaning something ran against this "
+        "table concurrently with the replay. Replaying past either would "
+        "silently drop those keys. No row and no value of the call was written."
+    )
+
+
+def _replay_write(
+    placed: _ReplayPlaced,
+    tiers: Sequence[_ReplayTier],
+    content: ReplayContent,
+    uploads: _ReplayUploads,
+) -> None:
+    """The second phase of a replay, for one batch that was placed: make each key own
+    its source row, and write its value, per :class:`ReplayContent`."""
+    tier = tiers[placed.tier]
+    state, table_id = placed.state, placed.table_id
+    end = placed.start + placed.n
+    key_slots, value_rows = _replay_slots(
+        state, tier.slot_index[placed.start : end], uploads.write_slots
+    )
     if state.key_index_map.use_rows_:
         # The key now sits at the source's slot; make it own the source's row.
         # The row counter is set by the caller from the delta's metadata -- the
         # rows named here are only the ones that changed.
         state.key_index_map.set_rows(key_slots, table_id, value_rows)
-
-    _replay_write_values(
-        state, table_id, value_rows, embeddings, optimizer_states, same_key, content
+    embeddings = uploads.embeddings.upload(tier.embeddings[placed.start : end]).to(
+        dtype=state.emb_dtype
     )
-    return n
+    # the state of the delta is only written when the content asks for it
+    optimizer_states = (
+        uploads.optimizer_states.upload(tier.optimizer_states[placed.start : end])
+        if _replay_wants_state(state, table_id, content)
+        and tier.optimizer_states is not None
+        else None
+    )
+    _replay_write_values(
+        state,
+        table_id,
+        value_rows,
+        embeddings,
+        optimizer_states,
+        placed.same_key,
+        content,
+    )
 
 
-def _replay_state_increment(
-    state: DynamicEmbTableState,
+def _replay_tiers(
     table_id: int,
-    keys: torch.Tensor,
-    values: torch.Tensor,
-    optimizer_states: Optional[torch.Tensor],
-    scores: Optional[torch.Tensor],
-    slot_index: torch.Tensor,
+    tiers: Sequence[_ReplayTier],
     timestamp: int,
     insert_score: int,
     content: ReplayContent,
 ) -> ReplayStats:
-    """Replay one delta batch into a single table state (one storage tier)."""
+    """Replay a delta into the tiers of one table, in two phases with one read between.
+
+    Writing is batched at ``threads_in_wave`` keys -- one full pass over the device,
+    since the scatter kernel runs one thread per key -- which keeps the machine busy and
+    bounds the temporary buffers independently of how large the delta is.
+
+    *Placement*: every batch of every tier puts its keys at their source slots; the call
+    launches all of them, keeping on the device only whether each key landed. One read
+    of the device then says whether every key of the call did, and raises if one did
+    not, before a row or a value has been written. *Writing*: every batch makes its keys
+    own their rows and writes their values, with masked stores (no compaction, so no
+    count). A delta is all-or-nothing in what it writes after a failed placement, and the
+    call waits for the device once however many batches and tiers it has; where it
+    used to wait for the number of unplaced keys of every batch, and for the two masks
+    of the write of each.
+
+    What the host can tell is wrong with the delta (a score block or an optimizer state
+    that is not as wide as the table's, or none where the table needs it) is raised before
+    the first key is placed, so that it cannot leave a table placed and not written. A key
+    that the device could not place is not that: the keys of every batch that did land
+    are in the key map, where each took the slot of whatever was in it, and no row and no
+    value was written for them (``replay_increment`` of the module says what to do).
+
+    The delta is on the host, so the second phase takes its columns from it again: only
+    one byte a key (which keys were in their slot already) is kept on the device between
+    the phases.
+    """
     stats = ReplayStats()
-    n = keys.numel()
-    if n == 0:
+    live = [(index, tier) for index, tier in enumerate(tiers) if tier.keys.numel() > 0]
+    if not live:
         return stats
-    device = state.device
-    keys = keys.to(device=device, dtype=state.key_index_map.key_type)
-    embeddings = values.to(device=device, dtype=state.emb_dtype)
-    slots = slot_index.to(device=device, dtype=torch.int64)
-    stats.upserted = _replay_at_slots(
-        state,
-        table_id,
-        keys,
-        embeddings,
-        optimizer_states,
-        scores,
-        slots,
-        timestamp,
-        insert_score,
-        content,
-    )
+    for _, tier in live:
+        if ReplayContent.SCORE in content and tier.scores is not None:
+            # no rows, so only the shape of the block is looked at
+            _replay_score_block(tier.state, table_id, tier.scores[:0], timestamp)
+        if _replay_wants_state(tier.state, table_id, content):
+            _check_replay_optimizer_states(tier.state, table_id, tier.optimizer_states)
+    uploads = _ReplayUploads(live[0][1].state.device)
+    placed: List[_ReplayPlaced] = []
+    for index, tier in live:
+        n = tier.keys.numel()
+        batch = tier.state.threads_in_wave
+        for start in range(0, n, batch):
+            end = min(start + batch, n)
+            placed.append(
+                _replay_place(
+                    index,
+                    tier,
+                    table_id,
+                    start,
+                    end,
+                    timestamp,
+                    insert_score,
+                    content,
+                    uploads,
+                )
+            )
+    _replay_check(placed, tiers, table_id)
+    for batch_placed in placed:
+        _replay_write(batch_placed, tiers, content, uploads)
+        stats.upserted += batch_placed.n
     return stats
 
 
@@ -3654,6 +4182,10 @@ def _erase_state_keys(
     The erase kernel reports the slot it cleared, or ``-1`` for a key that was
     not there, so the count is the real number removed rather than the number
     asked for -- a delta can legitimately name keys this replica never held.
+    The count is the return value, so it is the one wait of the call: the keys go
+    to the device without waiting (pinned copy, non-blocking), the retained keys
+    are cut at the count with a stable sort of the mask and not a boolean-mask index,
+    and nothing else reads the device.
 
     *mode* is this call's, not the table's: retaining an erase costs only a copy
     of keys already in hand, so there is nothing to configure up front and each
@@ -3667,23 +4199,26 @@ def _erase_state_keys(
     if n == 0:
         return 0
     device = state.device
-    keys = keys.to(device=device, dtype=state.key_index_map.key_type)
+    keys = _upload_async(keys, device).to(dtype=state.key_index_map.key_type)
     tids = torch.full((n,), table_id, dtype=torch.int64, device=device)
     indices = state.key_index_map.erase(keys, tids, return_indices=True)
     removed = indices >= 0
-    if EvictedItemMode.RETAIN_KEY in mode:
+    num_removed = int(sf.read_now(removed.sum())[0])
+    if EvictedItemMode.RETAIN_KEY in mode and num_removed > 0:
         # Only the keys that were really there: a caller may name keys this
         # table never held, and reporting those as removed would make a replica
         # replay removals that never happened.
+        order = torch.sort(
+            removed.to(torch.int8), descending=True, stable=True
+        ).indices[:num_removed]
         slot_index = None
         if state.key_index_map.use_rows_:
             # The slot stays reclaimed with its row; record both so a replica can
             # recreate it, laid out the way a dumped slot_index is.
-            slots = indices[removed]
-            rows = state.key_index_map._rows_of(slots, tids[removed], False)
+            slots = indices[order]
+            rows = state.key_index_map._rows_of(slots, tids[:num_removed], False)
             slot_index = torch.stack([slots, rows], dim=1)
-        _append_erased(state, keys[removed], table_id, slot_index)
-    num_removed = int(removed.sum().item())
+        _append_erased(state, _gather_rows(keys, order), table_id, slot_index)
     if (
         track_untracked
         and num_removed > 0
@@ -3831,6 +4366,11 @@ class DynamicEmbCache(Cache):
         reading them is where the host waits for the device, not the lookups: one
         batched copy per read. It is a snapshot, a later lookup does not change
         a tensor returned earlier.
+
+        A read is one wait for the device whatever it returns, the least an API
+        that hands out host numbers can do. Read it when the numbers are needed,
+        not on every step: the ``CACHE_DEBUG=1`` hook of the examples does, which is
+        a debugging aid and not for a run that is being timed.
         """
         if not self._record_cache_metrics:
             return None
@@ -4259,6 +4799,16 @@ class DynamicEmbStorage(Storage):
         erase left reclaimed in ``table_id`` (empty unless the table stores
         rows)."""
         return _pop_state_erased_slot_index(self._state, table_id)
+
+    def pop_many(self, method: str, table_ids: Sequence[int]) -> Dict[int, Tensor]:
+        """What ``method`` (``"pop_evicted_keys"`` or ``"pop_erased_keys"``) returns for
+        each of ``table_ids``, as host tensors from one pass over the retained keys: the
+        call waits for the device twice, however many tables there are, where one
+        :meth:`pop_evicted_keys` per table waits for each."""
+        _check_pop_method(method)
+        if not table_ids:
+            return {}
+        return _pop_state_many(self._state, method == "pop_evicted_keys", table_ids)
 
     # -- Storage interface --
 
@@ -4692,6 +5242,12 @@ class DynamicEmbStorage(Storage):
         the delta is. Not a knob: it is a property of the GPU, not of the call,
         and ``flush_cache`` sizes its own batches the same way.
 
+        The call has two phases with one wait for the device between them (see
+        :func:`_replay_tiers`): every batch places its keys, then one read says that
+        all of them landed, then every batch writes its rows and values. A key that did
+        not land raises before a row or a value is written; the keys that did land stay
+        in the key map, without values.
+
         Returns:
             :class:`ReplayStats` with ``upserted`` set; ``erased`` / ``skipped``
             are the caller's to fill.
@@ -4704,23 +5260,24 @@ class DynamicEmbStorage(Storage):
         if n == 0:
             return stats
         timestamp = device_timestamp() if timestamp is None else timestamp
-        batch_size = self._state.threads_in_wave
-        for start in range(0, n, batch_size):
-            end = min(start + batch_size, n)
-            stats.merge(
-                _replay_state_increment(
-                    self._state,
-                    table_id,
-                    keys[start:end],
-                    values[start:end],
-                    _slice(optimizer_states, start, end),
-                    _slice(scores, start, end),
-                    slot_index[start:end],
-                    timestamp,
-                    insert_score,
-                    content,
-                )
+        stats.merge(
+            _replay_tiers(
+                table_id,
+                [
+                    _ReplayTier(
+                        self._state,
+                        keys,
+                        values,
+                        optimizer_states,
+                        scores,
+                        slot_index,
+                    )
+                ],
+                timestamp,
+                insert_score,
+                content,
             )
+        )
         return stats
 
     @_after_growth
@@ -4764,7 +5321,8 @@ class DynamicEmbStorage(Storage):
         stays reclaimed with its row.
         """
         self._state.key_index_map.restore_reclaimed_slots(
-            slot_index.to(device=self._state.device, dtype=torch.int64), table_id
+            _upload_async(slot_index, self._state.device).to(dtype=torch.int64),
+            table_id,
         )
 
     # -- Export --
@@ -5004,6 +5562,21 @@ class HybridStorage(Storage):
                 0, dtype=self._host.key_index_map.key_type, device=self._host.device
             )
         return torch.unique(torch.cat(parts))
+
+    def pop_many(self, method: str, table_ids: Sequence[int]) -> Dict[int, Tensor]:
+        """:meth:`DynamicEmbStorage.pop_many` for the two tiers: the evicted keys of the
+        host tier, the erased keys of both, merged per table on the host. A pass per
+        tier, so four waits at most for the call, whatever the number of tables."""
+        _check_pop_method(method)
+        if not table_ids:
+            return {}
+        if method == "pop_evicted_keys":
+            return _pop_state_many(self._host, True, table_ids)
+        drained = [_pop_state_many(s, False, table_ids) for s in self.tables]
+        key_type = self._host.key_index_map.key_type
+        return {
+            t: _union_of_tiers([d[t] for d in drained], key_type) for t in table_ids
+        }
 
     # -- Two-tier find (with values) --
 
@@ -5420,35 +5993,26 @@ class HybridStorage(Storage):
             return stats
         timestamp = device_timestamp() if timestamp is None else timestamp
 
-        # Both tiers sit on the same device, so one size covers them.
-        batch_size = self.tables[0].threads_in_wave
         tier_bit = slot_index.to(torch.int64) < 0  # bit 63 set -> host tier
         key_slots = slot_index.to(torch.int64) & 0x7FFFFFFFFFFFFFFF
+        tiers = []
         for tier, state in enumerate(self.tables):
             sel = tier_bit if tier else torch.logical_not(tier_bit)
             if not bool(sel.any()):
                 continue
-            sel_keys, sel_values = keys[sel], values[sel]
-            sel_opts = optimizer_states[sel] if optimizer_states is not None else None
-            sel_scores = scores[sel] if scores is not None else None
-            sel_slots = key_slots[sel]
-            sel_n = sel_keys.numel()
-            for start in range(0, sel_n, batch_size):
-                end = min(start + batch_size, sel_n)
-                stats.merge(
-                    _replay_state_increment(
-                        state,
-                        table_id,
-                        sel_keys[start:end],
-                        sel_values[start:end],
-                        _slice(sel_opts, start, end),
-                        _slice(sel_scores, start, end),
-                        sel_slots[start:end],
-                        timestamp,
-                        insert_score,
-                        content,
-                    )
+            tiers.append(
+                _ReplayTier(
+                    state,
+                    keys[sel],
+                    values[sel],
+                    optimizer_states[sel] if optimizer_states is not None else None,
+                    scores[sel] if scores is not None else None,
+                    key_slots[sel],
                 )
+            )
+        # One call for both tiers: every key of both is placed before one read of the
+        # device says that they all landed, and only then is a value written.
+        stats.merge(_replay_tiers(table_id, tiers, timestamp, insert_score, content))
         return stats
 
     @_after_growth
@@ -5814,6 +6378,41 @@ def _write_back_evicted_masked(
             )
 
 
+# What a flush loads from the cache per batch at most, in bytes of values. The batches
+# of the flush are full length (the host does not learn how many entries a batch holds),
+# so each one loads ``[batch, value_dim]`` whatever it holds: a wide row makes the batch
+# shorter instead of the buffer 800 MB.
+FLUSH_BATCH_BYTES = 256 << 20
+
+
+def _flush_batch_rows(state: DynamicEmbTableState) -> int:
+    """How many slots a flush of this cache scans per batch: a wave of threads, as
+    many as the values it loads for them fit in :data:`FLUSH_BATCH_BYTES`."""
+    row_bytes = max(1, state.value_dim * state.emb_dtype.itemsize)
+    rows = min(state.threads_in_wave, max(32, FLUSH_BATCH_BYTES // row_bytes))
+    # a multiple of the export kernel's tile, when there is room for one
+    return rows - rows % 32 if rows >= 32 else rows
+
+
+def _wait_for_pending_evicted(state: DynamicEmbTableState) -> None:
+    """Wait for the newest count that is on its way to the host and fold what landed.
+
+    For an explicit call that appends many entries and may wait: the host runs ahead of
+    the device, and every entry keeps its arrays (``16 * N`` bytes) until its count lands.
+    The events of one stream are ordered, so waiting for the newest ticket is waiting for
+    the ones before it (an entry made on another stream is folded when its own count lands,
+    as it is anyway).
+    """
+    ring = state.retain_ring
+    newest = None
+    for entry in state.evicted_pending:
+        if entry[3] is not None:
+            newest = entry[3]
+    if ring is not None and newest is not None:
+        ring.wait(newest)
+    _resolve_pending_evicted(state)
+
+
 def flush_cache(
     cache: DynamicEmbCache,
     storage: DynamicEmbStorage,
@@ -5824,25 +6423,55 @@ def flush_cache(
     Storage keeps the scores, so a key it still has only has its value
     updated. One it has evicted goes to ``external_storage``, or is dropped
     when there is none: it is not re-inserted, which would evict another row.
+
+    Without an ``external_storage`` the flush waits for nothing: each batch of the cache
+    is exported at full length with its entries past the count made inert (the reserved
+    key, table id and slot ``-1``) and written back with :func:`_write_back_evicted_masked`,
+    which skips them, so no count is read. A storage that retains evicted keys has the
+    arrays of each batch pending until their counts land; every ``retain_ring`` of
+    batches the flush waits for the newest count (it is an explicit call), so that they do
+    not pile up behind a host that is far ahead of the device. An ``external_storage``
+    takes exact-length tensors on the host side of its contract, so each batch is read
+    and compacted for it as before.
     """
     # The storage below the cache may have grown on another stream (the prefetch).
     wait_for_growth = getattr(storage, "wait_for_growth", None)
     if wait_for_growth is not None:
         wait_for_growth()
     state = cache._state
-    batch_size = state.threads_in_wave
+    if external_storage is not None:
+        batch_size = state.threads_in_wave
+        for t in range(state.num_tables):
+            for keys, _, indices in state.key_index_map._batched_export_keys_scores(
+                [state.score_policy.name],
+                state.device,
+                batch_size=batch_size,
+                return_index=True,
+                table_id=t,
+            ):
+                tid = torch.full(
+                    (keys.numel(),), t, dtype=torch.int64, device=keys.device
+                )
+                values = load_from_flat(state, indices, tid, copy_mode=CopyMode.VALUE)
+                _write_back_evicted(storage, external_storage, keys, tid, values)
+        return
 
+    batch_size = _flush_batch_rows(state)
+    retaining = EvictedItemMode.RETAIN_KEY in storage._state.evicted_item_mode
+    ring = storage._state.retain_ring
     for t in range(state.num_tables):
-        for keys, _, indices in state.key_index_map._batched_export_keys_scores(
-            [state.score_policy.name],
-            state.device,
-            batch_size=batch_size,
-            return_index=True,
-            table_id=t,
+        batches = 0
+        for _, keys, _, slots in state.key_index_map._export_batches_masked(
+            t, batch_size
         ):
-            tid = torch.full((keys.numel(),), t, dtype=torch.int64, device=keys.device)
-            values = load_from_flat(state, indices, tid, copy_mode=CopyMode.VALUE)
-            _write_back_evicted(storage, external_storage, keys, tid, values)
+            live = slots >= 0
+            tid = torch.where(live, torch.full_like(slots, t), -1)
+            rows = state.key_index_map._rows_of(slots, tid, False)
+            values = load_from_flat(state, rows, tid, copy_mode=CopyMode.VALUE)
+            _write_back_evicted(storage, None, keys, tid, values)
+            batches += 1
+            if retaining and ring is not None and batches % ring.slots == 0:
+                _wait_for_pending_evicted(storage._state)
 
 
 # ---------------------------------------------------------------------------

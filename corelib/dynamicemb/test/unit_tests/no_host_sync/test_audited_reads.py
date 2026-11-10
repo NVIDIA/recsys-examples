@@ -87,11 +87,6 @@ AUDITED_READS: Dict[Tuple[str, str, str], Tuple[int, str]] = {
         "padded contract, so that a step that missed nothing does not call it (and the "
         "number of keys it will be asked for, which saves its adapter a read)",
     ),
-    ("dynamicemb/key_value_table.py", "_resolve_pending_evicted", "read_now"): (
-        1,
-        "public API: pop_evicted_keys with no ticket for its count: the result has a "
-        "data-dependent size",
-    ),
     ("dynamicemb/key_value_table.py", "DynamicEmbCache.cache_metrics", "read_now"): (
         1,
         "public API: the getter returns the hit counts, which are kept on the device",
@@ -111,6 +106,45 @@ AUDITED_READS: Dict[Tuple[str, str, str], Tuple[int, str]] = {
         "public API: a checkpoint load reads the exact table sizes once, to size the tables for "
         "the keys it keeps; a step decides to grow from the late snapshots and never comes here",
     ),
+    ("dynamicemb/key_value_table.py", "_drain_chunks", "read_now"): (
+        1,
+        "public API: pop_evicted_keys and pop_erased_keys read how many keys each table gets and "
+        "how many remain, once for all the tables of a call",
+    ),
+    ("dynamicemb/key_value_table.py", "_pop_chunked_keys_to_host", "pull_to_host"): (
+        1,
+        "public API: the popped keys, a data-dependent number of them, come to the host in one "
+        "pinned copy",
+    ),
+    ("dynamicemb/key_value_table.py", "_wait_for_pending_evicted", "wait"): (
+        1,
+        "public API: pop_evicted_keys waits once on the newest count of the pending entries (the "
+        "events of one stream are ordered)",
+    ),
+    ("dynamicemb/key_value_table.py", "_erase_state_keys", "read_now"): (
+        1,
+        "public API: erase_keys returns the number of keys that were really removed, a host int",
+    ),
+    ("dynamicemb/key_value_table.py", "_replay_check", "read_now"): (
+        1,
+        "public API: replay_increment raises, before it writes a row or a value, if a key of any "
+        "batch was not placed; this is its one wait",
+    ),
+    ("dynamicemb/scored_hashtable.py", "pull_live_prefixes", "pull_to_host"): (
+        2,
+        "public API: a dump copies the live prefix of each batch, and the count of the next batch "
+        "rides the same copy: one wait per batch",
+    ),
+    ("dynamicemb/incremental_dump.py", "_all_gather_evicted_many", "pull_to_host"): (
+        2,
+        "public API: the keys a pop returns are copied to the host in one wait (one rank), or the "
+        "buffers of every rank are, after the all_gather",
+    ),
+    ("dynamicemb/incremental_dump.py", "_all_gather_evicted_many", "read_now"): (
+        1,
+        "public API: the sizes the ranks exchange for the keys of all tables, one read, because the "
+        "all_gather of the keys needs them on the host",
+    ),
     (
         "dynamicemb/scored_hashtable.py",
         "LinearBucketTable._sorted_insert_and_evict",
@@ -121,11 +155,6 @@ AUDITED_READS: Dict[Tuple[str, str, str], Tuple[int, str]] = {
         "host int; every path of a step passes async_count=True and leaves the count on the device",
     ),
     # ---- the wait of a ring of late reads ---------------------------------------------------
-    ("dynamicemb/key_value_table.py", "_resolve_pending_evicted", "wait"): (
-        1,
-        "public API: pop_evicted_keys waits for the count of each pending entry (a step "
-        "only folds what has landed)",
-    ),
     (
         "dynamicemb/batched_dynamicemb_tables.py",
         "BatchedDynamicEmbeddingTablesV2._settle_oldest",
