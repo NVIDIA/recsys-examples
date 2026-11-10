@@ -918,6 +918,80 @@ def test_a_case_whose_scenario_did_not_happen_is_not_a_zero_in_any_scenario():
     assert "outside inherent sites" in bad[1], bad
 
 
+def _tiers(**sizes):
+    """tier_sizes of a module: name -> {"size": [t0, t1], "cap": [t0, t1]}."""
+    return {name: {"size": list(v), "cap": [4096, 4096]} for name, v in sizes.items()}
+
+
+def test_tier2_hit_is_held_to_where_the_keys_are():
+    """The size of the backing tiers not changing says that no key was added to them, not that
+    the keys of the window miss the top tier: a hybrid with LFU eviction held a fifth to three
+    quarters of them in its HBM tier (tier_residency, the first hardware run of the series)
+    and the case read zero as a tier-2 hit. The layouts with a PS had no check at all.
+    """
+    hybrid = hsp.CONFIGS["hybrid_lfu"]
+    sizes = _tiers(hbm=(2048, 2048), host=(8992, 3456))
+    ok, note = hsp.regime_check(hybrid, "tier2_hit", sizes, sizes, 8)
+    assert ok, note  # the sizes alone are as they were
+    leaky = {"hbm": [0.22, 0.74], "host": [0.78, 0.26]}
+    ok, note = hsp.regime_check(hybrid, "tier2_hit", sizes, sizes, 8, residency=leaky)
+    assert not ok and "holds [0.22, 0.74]" in note, note
+    held = {"hbm": [0.0, 0.0], "host": [1.0, 1.0]}
+    ok, note = hsp.regime_check(hybrid, "tier2_hit", sizes, sizes, 8, residency=held)
+    assert ok, note
+    # the size check still fails the case when a key was added below
+    grown = _tiers(hbm=(2048, 2048), host=(9100, 3456))
+    ok, _ = hsp.regime_check(hybrid, "tier2_hit", sizes, grown, 8, residency=held)
+    assert not ok
+    # a PS: no size check, but the keys come from the lower tier that has them -- the PS for
+    # one table, the storage for the other (the storage holds what its capacity lets it)
+    ps = hsp.CONFIGS["cache_ps"]
+    tiers = _tiers(cache=(1024, 1024), storage=(4096, 3766), ps=(4590, 0))
+    served = {"cache": [0.0, 0.0], "storage": [0.0, 0.987], "ps": [1.0, 0.013]}
+    ok, note = hsp.regime_check(ps, "tier2_hit", tiers, tiers, 8, residency=served)
+    assert ok, note
+    nowhere = {"cache": [0.0, 0.0], "storage": [0.0, 0.0], "ps": [0.0, 0.0]}
+    ok, note = hsp.regime_check(ps, "tier2_hit", tiers, tiers, 8, residency=nowhere)
+    assert not ok and "a lower tier holds [0.0, 0.0]" in note, note
+    # nothing to ask (an older tree): the check says so and passes on the sizes
+    ok, note = hsp.regime_check(ps, "tier2_hit", tiers, tiers, 8, residency={})
+    assert ok and "no backing-tier occupancy check" in note, note
+
+
+def test_all_hit_and_eval_are_held_to_the_keys_being_in_the_top_tier():
+    cfg = hsp.CONFIGS["hbm_only"]
+    sizes = _tiers(storage=(345, 172))
+    for scenario in ("all_hit", "eval"):
+        ok, note = hsp.regime_check(
+            cfg, scenario, sizes, sizes, 8, residency={"storage": [1.0, 0.99]}
+        )
+        assert ok, note
+        # nothing is added, and nothing is held: a batch of keys the table refused
+        ok, note = hsp.regime_check(
+            cfg, scenario, sizes, sizes, 8, residency={"storage": [0.5, 1.0]}
+        )
+        assert not ok and "holds [0.5, 1.0]" in note, note
+        # no residency (an older tree): the size check as before
+        ok, note = hsp.regime_check(cfg, scenario, sizes, sizes, 8)
+        assert ok, note
+
+
+def test_miss_evict_is_held_for_both_tables():
+    """Only the first table was checked, so a table whose tier never filled passed."""
+    cfg = hsp.CONFIGS["hbm_only"]
+    k = 8
+    new = [k * hsp.UNIQ[0], k * hsp.UNIQ[1]]
+    full = {"storage": {"size": [4090, 4090], "cap": [4096, 4096]}}
+    before = {"storage": {"size": [4090, 4090], "cap": [4096, 4096]}}
+    ok, note = hsp.regime_check(cfg, "miss_evict", before, full, k)
+    assert ok, note
+    # the second table is at a quarter, growing by what it is given: nothing is evicted there
+    idle = {"storage": {"size": [4090, 1024 + new[1]], "cap": [4096, 4096]}}
+    before = {"storage": {"size": [4090, 1024], "cap": [4096, 4096]}}
+    ok, note = hsp.regime_check(cfg, "miss_evict", before, idle, k)
+    assert not ok, note
+
+
 def test_all_hit_scenarios_warm_up_long_enough_for_the_admitter():
     """A coin toss admits a key at each sight with probability p, so a batch that is to be
     all hit needs many steps; frequency admission needs its threshold, others a few."""

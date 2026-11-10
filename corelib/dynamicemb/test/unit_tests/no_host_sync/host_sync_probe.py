@@ -1535,6 +1535,111 @@ def top_tier(cfg: Cfg) -> str:
     )
 
 
+# A tier "holds" the keys of a window when it has at least RESIDENT of them before it, and
+# "lacks" them when it has at most ABSENT (see tier_residency).
+RESIDENT = 0.95
+ABSENT = 0.05
+# The scenarios whose name is a statement about where the keys of the window are when it starts.
+RESIDENCY_SCENARIOS = ("all_hit", "eval", "tier2_hit")
+
+
+def _window_keys(batches: Sequence["Batch"]):
+    """The unique keys of ``batches``, per table (the layout of BatchMaker.build: the
+    features in order, BATCH * KPB keys each)."""
+    import torch
+
+    per: List[List[Any]] = [[] for _ in (0, 1)]
+    for b in batches:
+        pos = 0
+        for table in FEATURE_TABLE_MAP:
+            per[table].append(b.indices[pos : pos + BATCH * KPB])
+            pos += BATCH * KPB
+    out = []
+    for parts in per:
+        keys = torch.cat(parts)
+        wide = keys.dtype == torch.uint64  # unique wants a signed type
+        unique = torch.unique(keys.view(torch.int64) if wide else keys)
+        out.append(unique.view(torch.uint64) if wide else unique)
+    return out
+
+
+def tier_residency(mod, batches: Sequence["Batch"]) -> Dict[str, List[float]]:
+    """Per tier (the names of tier_sizes) and table: the fraction of the unique keys of
+    ``batches`` that the tier holds now.
+
+    The tiers are asked with a lookup that scores nothing (the CONST policy of an eval), so
+    the state of the module is the one the window starts from. Host reads: call outside
+    windows. Empty when the module has no key maps to ask (an older tree), or on any error:
+    a diagnostic never breaks a run.
+    """
+    out: Dict[str, List[float]] = {}
+    try:
+        import torch
+        from dynamicemb.key_value_table import get_find_score_arg
+
+        keys = _window_keys(batches)
+        device = keys[0].device
+
+        def held(state) -> List[float]:
+            fractions = []
+            for table, ks in enumerate(keys):
+                ids = torch.full((ks.numel(),), table, dtype=torch.int64, device=device)
+                arg = get_find_score_arg(state, ks.numel(), device, const_lookup=True)
+                _, founds, _ = state.key_index_map.lookup(ks, ids, arg)
+                fractions.append(float(founds.float().mean()))
+            return fractions
+
+        cache = getattr(mod, "_cache", None)
+        if cache is not None:
+            out["cache"] = held(cache._state)
+        st = getattr(mod, "_storage", None)
+        if st is not None:
+            if hasattr(st, "_state"):
+                out["storage"] = held(st._state)
+            elif hasattr(st, "_hbm") and hasattr(st, "_host"):
+                out["hbm"], out["host"] = held(st._hbm), held(st._host)
+        ps = getattr(mod, "_external_storage", None)
+        if ps is not None:
+            if hasattr(ps, "dict"):  # PyDictStorage: (table id, key) -> row
+                present = set(ps.dict.keys())
+                out["ps"] = [
+                    sum((t, k) in present for k in ks.tolist())
+                    / float(max(1, ks.numel()))
+                    for t, ks in enumerate(keys)
+                ]
+            elif hasattr(ps, "_state"):
+                out["ps"] = held(ps._state)
+    except Exception:  # noqa: BLE001
+        return {}
+    return out
+
+
+def _residency_note(cfg: Cfg, scenario: str, residency) -> Tuple[bool, str]:
+    """Where the keys of the window are when it starts, against what its name says: the top
+    tier holds them (all_hit, eval) or lacks them while a lower tier holds them (tier2_hit:
+    every step misses the top tier and hits the next)."""
+    top = top_tier(cfg)
+    in_top = residency.get(top)
+    lower = {name: v for name, v in residency.items() if name != top}
+    if in_top is None or (scenario == "tier2_hit" and not lower):
+        return True, "no residency of the tiers"
+    shown = lambda v: [round(x, 2) for x in v]  # noqa: E731
+    if scenario in ("all_hit", "eval"):
+        ok = min(in_top) >= RESIDENT
+        return ok, "tier %s holds %s of the keys of the window (expected all)" % (
+            top,
+            shown(in_top),
+        )
+    # a table's keys come from the lower tier that has most of them: the storage of a cache
+    # here, the PS there
+    served = [max(v[t] for v in lower.values()) for t in range(len(in_top))]
+    ok = max(in_top) <= ABSENT and min(served) >= RESIDENT
+    return ok, (
+        "tier %s holds %s of the keys of the window (expected none), a lower tier holds %s"
+        % (top, shown(in_top), shown(served))
+    )
+
+
 def regime_check(
     cfg: Cfg,
     scenario: str,
@@ -1542,11 +1647,13 @@ def regime_check(
     after,
     k: int,
     ring: Optional[Sequence[Dict[str, Any]]] = None,
+    residency: Optional[Dict[str, List[float]]] = None,
 ) -> Tuple[bool, str]:
     """Did the scenario really happen?  Judged from tier occupancy before/after
-    the measured window; for queue_ahead, from the state of the score check's ring at
-    the end of every measured iteration (``ring``: one dict of pending, slots and
-    uncovered each)."""
+    the measured window, and for the scenarios of RESIDENCY_SCENARIOS from where the keys
+    of the window were when it started (``residency``, see tier_residency); for queue_ahead,
+    from the state of the score check's ring at the end of every measured iteration
+    (``ring``: one dict of pending, slots and uncovered each)."""
     if scenario == "queue_ahead":
         if not ring:
             return False, "no ring state was recorded after the steps issued ahead"
@@ -1573,16 +1680,22 @@ def regime_check(
             if cfg.layout == "cache"
             else (["hbm", "host"] if cfg.layout == "hybrid" else [])
         )
-        if not tiers or any(t not in after or t not in before for t in tiers):
-            return True, "no backing-tier occupancy check for layout %s" % cfg.layout
-        d = sum(
-            after[t]["size"][i] - before[t]["size"][i] for t in tiers for i in range(2)
-        )
-        return (
-            d == 0,
-            "backing tiers %s size delta=%d (expected 0: every key is already stored)"
-            % (tiers, d),
-        )
+        ok, note = True, "no backing-tier occupancy check for layout %s" % cfg.layout
+        if tiers and all(t in after and t in before for t in tiers):
+            d = sum(
+                after[t]["size"][i] - before[t]["size"][i]
+                for t in tiers
+                for i in range(2)
+            )
+            ok = d == 0
+            note = (
+                "backing tiers %s size delta=%d (expected 0: every key is already stored)"
+                % (tiers, d)
+            )
+        if residency:
+            r_ok, r_note = _residency_note(cfg, scenario, residency)
+            ok, note = ok and r_ok, "%s; %s" % (note, r_note)
+        return ok, note
     tier = top_tier(cfg)
     b, a = before.get(tier), after.get(tier)
     if b is None or a is None:
@@ -1592,7 +1705,11 @@ def regime_check(
     load = [a["size"][t] / max(1, a["cap"][t]) for t in range(2)]
     if scenario in ("all_hit", "eval"):
         ok = all(d == 0 for d in dsz)
-        return ok, "tier %s size delta=%s (expected 0)" % (tier, dsz)
+        note = "tier %s size delta=%s (expected 0)" % (tier, dsz)
+        if residency:
+            r_ok, r_note = _residency_note(cfg, scenario, residency)
+            ok, note = ok and r_ok, "%s; %s" % (note, r_note)
+        return ok, note
     if scenario == "eval_miss":
         ok = all(d == 0 for d in dsz)
         return ok, "tier %s size delta=%s (eval inserts nothing)" % (tier, dsz)
@@ -1605,7 +1722,8 @@ def regime_check(
             ["%.2f" % x for x in load],
         )
     if scenario == "miss_evict":
-        ok = load[0] >= 0.8 and dsz[0] < 0.7 * new[0]
+        # both tables: a table whose tier never fills measures no eviction
+        ok = all(load[t] >= 0.8 and dsz[t] < 0.7 * new[t] for t in range(2))
         return (
             ok,
             "tier %s load=%s size delta=%s of ~%s new keys (net growth << new keys = evicting)"
@@ -1780,7 +1898,14 @@ def run_case(
             # a pool of batches is inserted, fresh keys then push it out of the top tier
             # (into the storage / the host tier / the PS), and the pool is read again
             pool = [bm.fresh_batch() for _ in range(warm + iters)]
-            fill = pool + [bm.fresh_batch() for _ in range(n_fill)]
+            push = [bm.fresh_batch() for _ in range(n_fill)]
+            if cfg.lfu:
+                # An LFU tier keeps what was counted most, and every key was counted once:
+                # the pool would keep its place in the top tier (a hybrid's HBM tier held
+                # a fifth to three quarters of it). The keys that push it out count more.
+                for b in push:
+                    b.freq = b.freq * 4
+            fill = pool + push
             pre = pool[:warm]
             measured = pool[warm:]
             warm_eval = []
@@ -1832,6 +1957,9 @@ def run_case(
         ring.clear()  # only the measured iterations count
         step = step_train if train else step_eval
         before = tier_sizes(mod)
+        residency = (
+            tier_residency(mod, measured) if scenario in RESIDENCY_SCENARIOS else None
+        )
         # ---- measured loop
         probe = Probe(
             use_profiler=use_profiler, stacks=stacks, keep_trace_dir=keep_trace_dir
@@ -1843,8 +1971,9 @@ def run_case(
                     step(b)
                 torch.cuda.synchronize()
         after = tier_sizes(mod)
-        ok, note = regime_check(cfg, scenario, before, after, iters, ring)
+        ok, note = regime_check(cfg, scenario, before, after, iters, ring, residency)
         res["regime"] = {"ok": ok, "note": note}
+        res["residency"] = residency
         res["tiers_before"] = before
         res["tiers_after"] = after
         res.update(
