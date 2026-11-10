@@ -16,7 +16,7 @@ repos:
     -   id: codespell
         args:
         - --skip=".git,corelib/hstu/*,third_party/*"
-        - --ignore-words-list=TE,TBE,tbe,dout,retrival,IndexT,ANS,ans
+        - --ignore-words-list=TE,TBE,tbe,dout,retrival,IndexT,ANS,ans,te,retriev
 -   repo: https://github.com/psf/black
     rev: 23.9.1
     hooks:
@@ -30,6 +30,7 @@ repos:
                 "--explicit-package-bases", 
                 "--exclude=examples/hstu/inference/triton/hstu_.*/[0-9]*/model.py$",
                 "--exclude=examples/hstu/triton_libs/",
-                "--exclude=^examples/sid-gr-inference/"
+                "--exclude=^examples/sid-gr-inference/",
+                "--exclude=^examples/AI-Search-Plugin/"
             ]
         pass_filenames: false
