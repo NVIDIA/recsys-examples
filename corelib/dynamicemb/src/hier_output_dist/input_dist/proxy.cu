@@ -740,94 +740,79 @@ __global__ void __launch_bounds__(kThreads)
   }
 }
 
-// A thread per valid occurrence: its requester (from remote_offsets) and its
-// slot: the key's row for its key's first occurrence, a duplicate slot for the
-// others (every occurrence of a key of more than max_key_rows, in a call that
-// raises, has rank max_key_rows and takes the key's row). remote_map gets the
-// occurrence's key row and its slot.
+// A thread per entry of the remote part (remote_keys of them). A valid
+// occurrence gets its slot: the key's row for its key's first occurrence, a
+// duplicate slot for the others (every occurrence of a key of more than
+// max_key_rows, in a call that raises, has rank max_key_rows and takes the
+// key's row). remote_map gets the occurrence's key row and its slot. It also
+// gets its push key, its part of the push order: its requester (from
+// remote_offsets) * (max_chunks + 1) + its key's chunk. An entry past the
+// valid occurrences gets local_size * (max_chunks + 1), which sorts after
+// every part. Every entry gets its own index too, which the sort carries. So
+// the push order holds a part's occurrences in occurrence order, and the sort
+// reads no word that nothing wrote.
+template <typename PushKey>
 __global__ void __launch_bounds__(kThreads)
     occurrence_slots_kernel(const int32_t *node_reverse_indices, const int32_t *occurrence_rank,
                             const int32_t *key_row, const int32_t *first_duplicate_slot,
-                            const int64_t *node_exp_off, const int64_t *remote_offsets,
-                            const int64_t *occurrence_count, int64_t local_size,
-                            int32_t *requester_of, int32_t *map_key_row, int32_t *map_slot) {
+                            const int32_t *key_chunk, const int64_t *node_exp_off,
+                            const int64_t *remote_offsets, const int64_t *occurrence_count,
+                            int64_t entries, int64_t local_size, int64_t max_chunks,
+                            int32_t *map_key_row, int32_t *map_slot, PushKey *push_key,
+                            int32_t *occurrence_index) {
   const int64_t count = *occurrence_count;
-  for (int64_t occurrence = first_item(); occurrence < count; occurrence += item_stride()) {
-    const int32_t key = node_reverse_indices[occurrence];
-    const int64_t place = occurrence_rank[occurrence];  // among the key's occurrences
-    const int64_t rows = node_exp_off[key + 1] - node_exp_off[key];
-    const int64_t slot =
-        place == 0 || place >= rows ? key_row[key] : first_duplicate_slot[key] + place - 1;
-    requester_of[occurrence] =
-        (int32_t)requester_of_occurrence(remote_offsets, local_size, occurrence);
-    map_key_row[occurrence] = key_row[key];
-    map_slot[occurrence] = (int32_t)slot;
+  for (int64_t occurrence = first_item(); occurrence < entries; occurrence += item_stride()) {
+    int64_t push = local_size * (max_chunks + 1);  // past the valid occurrences: after every part
+    if (occurrence < count) {
+      const int32_t key = node_reverse_indices[occurrence];
+      const int64_t place = occurrence_rank[occurrence];  // among the key's occurrences
+      const int64_t rows = node_exp_off[key + 1] - node_exp_off[key];
+      const int64_t slot =
+          place == 0 || place >= rows ? key_row[key] : first_duplicate_slot[key] + place - 1;
+      map_key_row[occurrence] = key_row[key];
+      map_slot[occurrence] = (int32_t)slot;
+      push = requester_of_occurrence(remote_offsets, local_size, occurrence) * (max_chunks + 1) +
+             key_chunk[key];
+    }
+    push_key[occurrence] = (PushKey)push;
+    occurrence_index[occurrence] = (int32_t)occurrence;
   }
 }
 
 // ── step 3: the push order ──
 
-// A thread per occurrence: its push key, its part of the push order,
-// requester * (max_chunks + 1) + its key's chunk (past the valid occurrences
-// local_size * (max_chunks + 1), which sorts them last); and its own index,
-// which the sort carries. So the push order holds a part's occurrences in
-// occurrence order.
-__global__ void __launch_bounds__(kThreads)
-    push_keys_kernel(const int32_t *node_reverse_indices, const int64_t *occurrence_count,
-                     const int32_t *requester_of, const int32_t *key_chunk, int64_t entries,
-                     int64_t local_size, int64_t max_chunks, int64_t *push_key, int32_t *index) {
-  const int64_t count = *occurrence_count;
-  for (int64_t occurrence = first_item(); occurrence < entries; occurrence += item_stride()) {
-    int64_t push = local_size * (max_chunks + 1);
-    if (occurrence < count)
-      push =
-          requester_of[occurrence] * (max_chunks + 1) + key_chunk[node_reverse_indices[occurrence]];
-    push_key[occurrence] = push;
-    index[occurrence] = (int32_t)occurrence;
-  }
-}
-
-// A thread per push position (the occurrences sorted by push key): where the
-// parts of the push order start (part_offsets; a part per requester and chunk
-// up to max_chunks, in push key order). A valid position whose part is not
-// the one before's starts its part and the parts in between, which have
-// none; the last valid one ends the parts after its own, and the first
-// thread every part when there is no valid one.
-__global__ void __launch_bounds__(kThreads)
-    part_offsets_kernel(const int64_t *push_key_sorted, const int64_t *occurrence_count,
-                        int64_t parts, int32_t *part_offsets) {
-  const int64_t count = *occurrence_count;
-  if (first_item() == 0 && count == 0)
-    for (int64_t part = 0; part < parts; ++part) part_offsets[part] = 0;
-  for (int64_t position = first_item(); position < count; position += item_stride()) {
-    const int64_t part = push_key_sorted[position];
-    const int64_t before = position == 0 ? -1 : push_key_sorted[position - 1];
-    for (int64_t next = before + 1; next <= part; ++next) part_offsets[next] = (int32_t)position;
-    if (position == count - 1)
-      for (int64_t next = part + 1; next < parts; ++next) part_offsets[next] = (int32_t)count;
-  }
-}
-
 // A thread per entry of the push tables, a requester's and a chunk's up to
-// max_chunks: where its positions start (part_offsets), relative to the
-// requester's push order (remote_offsets), into the proxy header.
-__global__ void __launch_bounds__(kThreads)
-    push_tables_kernel(const int32_t *part_offsets, const int64_t *remote_offsets,
-                       int64_t local_size, int64_t max_chunks, int32_t *header_tables) {
-  const int64_t columns = max_chunks + 1;  // the entries of a requester
-  for (int64_t index = first_item(); index < local_size * columns; index += item_stride())
-    header_tables[index] = part_offsets[index] - (int32_t)remote_offsets[index / columns];
-}
-
-// A thread per valid push position: its occurrence's place in its
+// max_chunks, which is its part r * (max_chunks + 1) + chunk: where the
+// requester's positions of the chunk start in the push order (push_key_sorted:
+// occurrence_slots_kernel's push keys, sorted), relative to the requester's
+// push order (remote_offsets), into the proxy header. The push key sorts by
+// requester first, so requester r's positions are those of its valid
+// occurrences, [lo, hi): its range of the remote part cut at the count. There
+// its push keys go in chunk order, and a chunk below num_chunks starts at the
+// first of them not below its part (a binary search of [lo, hi)). A valid
+// key's chunk is below num_chunks, so a chunk from num_chunks on, and r's end
+// (chunk max_chunks), start at hi. When the node skips the call no position is
+// valid, and each entry is -remote_offsets[r].
+// Then a thread per valid push position: its occurrence's place in its
 // requester's push order (remote_map's positions).
+template <typename PushKey>
 __global__ void __launch_bounds__(kThreads)
-    push_positions_kernel(const int64_t *push_key_sorted, const int32_t *push_order,
-                          const int64_t *remote_offsets, const int64_t *occurrence_count,
-                          int64_t max_chunks, int32_t *map_position) {
-  const int64_t count = *occurrence_count;
+    push_tables_kernel(const PushKey *push_key_sorted, const int32_t *push_order,
+                       const int64_t *remote_offsets, const int64_t *occurrence_count,
+                       const int64_t *num_chunks, int64_t local_size, int64_t max_chunks,
+                       int32_t *header_tables, int32_t *map_position) {
+  const int64_t count = *occurrence_count, chunks = *num_chunks;
+  const int64_t columns = max_chunks + 1;  // the entries of a requester
+  for (int64_t part = first_item(); part < local_size * columns; part += item_stride()) {
+    const int64_t requester = part / columns, chunk = part % columns;
+    const int64_t lo = min(remote_offsets[requester], count),
+                  hi = max(min(remote_offsets[requester + 1], count), lo);
+    const int64_t start =
+        chunk < chunks ? lo + lower_bound(push_key_sorted + lo, hi - lo, part) : hi;
+    header_tables[part] = (int32_t)start - (int32_t)remote_offsets[requester];
+  }
   for (int64_t position = first_item(); position < count; position += item_stride()) {
-    const int64_t requester = push_key_sorted[position] / (max_chunks + 1);
+    const int64_t requester = push_key_sorted[position] / columns;
     map_position[push_order[position]] = (int32_t)(position - remote_offsets[requester]);
   }
 }
@@ -836,8 +821,12 @@ __global__ void __launch_bounds__(kThreads)
 // as their sizes choose.
 int64_t g_scan_ctas = 0;
 // The test hook's garbage (fill_proxy_garbage): whether a new table of
-// step 2 holds ones in every bit.
+// step 2 holds garbage (empty_table's: ones in every bit, part 0 in each
+// push key).
 bool g_proxy_garbage = false;
+// The test hook's push keys (force_push_keys64): whether they are int64
+// whatever their values.
+bool g_push_keys64 = false;
 
 // The CTAs of a scan over a device count of at most `capacity` items
 // (slice_sums_kernel, slice_scan_kernel): a thread per item, at most two CTAs
@@ -845,12 +834,32 @@ bool g_proxy_garbage = false;
 int scan_grid(int64_t capacity) { return g_scan_ctas > 0 ? (int)g_scan_ctas : item_grid(capacity); }
 
 // A new table of step 2 for its kernels to write (at::empty); under the test
-// hook (fill_proxy_garbage) every bit of it set, so a word they leave out
-// shows, whatever the caching allocator gave.
-at::Tensor empty_table(at::IntArrayRef sizes, const at::TensorOptions &options) {
+// hook (fill_proxy_garbage) `garbage` in each entry (every bit set, unless
+// the caller gives another), so a word they leave out shows, whatever the
+// caching allocator gave.
+at::Tensor empty_table(at::IntArrayRef sizes, const at::TensorOptions &options,
+                       int64_t garbage = -1) {
   at::Tensor table = at::empty(sizes, options);
-  if (g_proxy_garbage) table.fill_(-1);
+  if (g_proxy_garbage) table.fill_(garbage);
   return table;
+}
+
+// The type of the push keys of `parts` parts (local_size * (max_chunks + 1)),
+// whose values are [0, parts]: int32 when parts + 1 is below 2^31, else int64
+// (or under the test hook, force_push_keys64). A pass of the sort moves 16
+// bytes per entry of int32 keys and their values, 24 of int64 ones.
+at::ScalarType push_key_type(int64_t parts) {
+  return g_push_keys64 || parts + 1 >= (int64_t{1} << 31) ? at::kLong : at::kInt;
+}
+
+// Calls `launch` with a zero of the push keys' type (`push_key`'s: int32 or
+// int64). The kernels that write or read the push keys take that type.
+template <typename Launch>
+void with_push_key(const at::Tensor &push_key, Launch &&launch) {
+  if (push_key.scalar_type() == at::kLong)
+    launch(int64_t{0});
+  else
+    launch(int32_t{0});
 }
 
 }  // namespace
@@ -863,6 +872,8 @@ void force_scan_ctas(int64_t ctas) {
 }
 
 void fill_proxy_garbage(bool fill) { g_proxy_garbage = fill; }
+
+void force_push_keys64(bool on) { g_push_keys64 = on; }
 
 ProxyBuffers proxy_buffers(at::Tensor remote_map, at::Tensor key_stage, const ProxyHeader &header,
                            const at::TensorOptions &options) {
@@ -1076,10 +1087,10 @@ ProxyChunks proxy_chunks_and_slots(ProxyKeys &keys, const at::Tensor &remote_off
   chunk_layout_kernel<<<kOneCta, kThreads, 0, stream>>>(layout_args);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   // Per key: its chunk, its row and its duplicates' first slot there, and
-  // its record; each chunk's pulls. The records' keys and weights go once
-  // written. Then the places past the chunks: empty, no end, all the tasks
-  // before them.
-  chunks.key_chunk = at::empty({entries}, int_options);
+  // its record; each chunk's pulls. The records' keys and weights, and the
+  // keys' occurrences and owner nodes, go once read. Then the places past
+  // the chunks: empty, no end, all the tasks before them.
+  const at::Tensor key_chunk = at::empty({entries}, int_options);
   const at::Tensor key_row = at::empty({entries}, int_options);
   const at::Tensor first_duplicate_slot = at::empty({entries}, int_options);
   with_record(sizes, [&](auto record) {
@@ -1092,24 +1103,38 @@ ProxyChunks proxy_chunks_and_slots(ProxyKeys &keys, const at::Tensor &remote_off
             chunks.stage_offset_per_bucket.data_ptr<int64_t>(), node_num_uniques,
             chunks.num_chunks.data_ptr<int64_t>(), max_chunks, sizes.num_proxy_rows, chunk_records,
             layout_args.header_ends, chunks.reduce_task_offsets.data_ptr<int64_t>(),
-            chunks.key_chunk.data_ptr<int32_t>(), key_row.data_ptr<int32_t>(),
+            key_chunk.data_ptr<int32_t>(), key_row.data_ptr<int32_t>(),
             first_duplicate_slot.data_ptr<int32_t>(),
             (char *)buffers.key_stage.data_ptr<int64_t>());
   });
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   keys.node_unique_keys.reset();
   keys.node_unique_key_weights.reset();
+  keys.key_occurrences.reset();
+  keys.key_node.reset();
   // Each occurrence's slot: the key's row for its key's first occurrence, a
-  // duplicate slot for the others.
-  chunks.requester_of = at::empty({entries}, int_options);
+  // duplicate slot for the others. And for the push order's sort each
+  // entry's push key (past the valid occurrences, one that sorts after every
+  // part: push_key_type's int32 or int64) and its own index. The tables per
+  // occurrence go once read. Under the test hook each push key starts as
+  // part 0, so a key left out sorts into part 0 and moves the later parts'
+  // positions; with every bit set it would sort last, as the key past the
+  // valid occurrences does, and not show.
+  chunks.push_key =
+      empty_table({entries}, int_options.dtype(push_key_type(local_size * (max_chunks + 1))), 0);
+  chunks.occurrence_index = empty_table({entries}, int_options);
   const RemoteMap remote_map{buffers.remote_map.data_ptr<int32_t>(), entries};
-  occurrence_slots_kernel<<<item_grid(entries), kThreads, 0, stream>>>(
-      keys.node_reverse_indices.data_ptr<int32_t>(), keys.occurrence_rank.data_ptr<int32_t>(),
-      key_row.data_ptr<int32_t>(), first_duplicate_slot.data_ptr<int32_t>(),
-      chunks.node_exp_off.data_ptr<int64_t>(), remote_offsets.data_ptr<int64_t>(),
-      keys.occurrence_count.data_ptr<int64_t>(), local_size,
-      chunks.requester_of.data_ptr<int32_t>(), remote_map.key_row(), remote_map.slot());
+  with_push_key(chunks.push_key, [&](auto key) {
+    occurrence_slots_kernel<decltype(key)><<<item_grid(entries), kThreads, 0, stream>>>(
+        keys.node_reverse_indices.data_ptr<int32_t>(), keys.occurrence_rank.data_ptr<int32_t>(),
+        key_row.data_ptr<int32_t>(), first_duplicate_slot.data_ptr<int32_t>(),
+        key_chunk.data_ptr<int32_t>(), chunks.node_exp_off.data_ptr<int64_t>(),
+        remote_offsets.data_ptr<int64_t>(), keys.occurrence_count.data_ptr<int64_t>(), entries,
+        local_size, max_chunks, remote_map.key_row(), remote_map.slot(),
+        chunks.push_key.data_ptr<decltype(key)>(), chunks.occurrence_index.data_ptr<int32_t>());
+  });
   C10_CUDA_KERNEL_LAUNCH_CHECK();
+  keys.node_reverse_indices.reset();
   keys.occurrence_rank.reset();
   return chunks;
 }
@@ -1118,46 +1143,26 @@ ProxyPlan proxy_push_order(ProxyKeys keys, ProxyChunks chunks, const at::Tensor 
                            const ProxyBuffers &buffers, const Sizes &sizes) {
   const int64_t entries = sizes.remote_keys, local_size = sizes.topo.local_size,
                 max_chunks = sizes.max_chunks, parts = local_size * (max_chunks + 1);
-  const auto long_options = keys.node_reverse_indices.options().dtype(at::kLong);
-  const auto int_options = keys.node_reverse_indices.options().dtype(at::kInt);
   const cudaStream_t stream = current_stream();
-  // The push order: one stable sort of the occurrences by their part; the
-  // invalid ones after the last part. What only the push key needs goes
-  // before the sort.
+  // The push order: one stable sort of the occurrences by their part (the
+  // push keys of step 2), the invalid ones after the last part; the keys
+  // and values in go once sorted.
   at::Tensor push_key_sorted, push_order;
-  {
-    const at::Tensor push_key = at::empty({entries}, long_options);
-    const at::Tensor index = at::empty({entries}, int_options);
-    push_keys_kernel<<<item_grid(entries), kThreads, 0, stream>>>(
-        keys.node_reverse_indices.data_ptr<int32_t>(), keys.occurrence_count.data_ptr<int64_t>(),
-        chunks.requester_of.data_ptr<int32_t>(), chunks.key_chunk.data_ptr<int32_t>(), entries,
-        local_size, max_chunks, push_key.data_ptr<int64_t>(), index.data_ptr<int32_t>());
-    C10_CUDA_KERNEL_LAUNCH_CHECK();
-    keys.node_reverse_indices.reset();
-    keys.key_occurrences.reset();
-    keys.key_node.reset();
-    chunks.requester_of.reset();
-    chunks.key_chunk.reset();
-    std::tie(push_key_sorted, push_order) = sort_pairs(push_key, index, bits_for(parts + 1));
-  }
-  // Where the parts of the push order start, then the push tables, per
-  // requester and chunk: its first position.
-  const at::Tensor part_offsets = at::empty({parts}, int_options);
-  part_offsets_kernel<<<item_grid(entries), kThreads, 0, stream>>>(
-      push_key_sorted.data_ptr<int64_t>(), keys.occurrence_count.data_ptr<int64_t>(), parts,
-      part_offsets.data_ptr<int32_t>());
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
-  push_tables_kernel<<<item_grid(parts), kThreads, 0, stream>>>(
-      part_offsets.data_ptr<int32_t>(), remote_offsets.data_ptr<int64_t>(), local_size, max_chunks,
-      buffers.push_tables.data_ptr<int32_t>());
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
-  // Each occurrence's place in its requester's push order (remote_map's
-  // positions).
+  std::tie(push_key_sorted, push_order) =
+      sort_pairs(chunks.push_key, chunks.occurrence_index, bits_for(parts + 1));
+  chunks.push_key.reset();
+  chunks.occurrence_index.reset();
+  // The push tables, per requester and chunk its first position (a search of
+  // its sorted push keys), then each occurrence's place in its requester's
+  // push order (remote_map's positions).
   const RemoteMap remote_map{buffers.remote_map.data_ptr<int32_t>(), entries};
-  push_positions_kernel<<<item_grid(entries), kThreads, 0, stream>>>(
-      push_key_sorted.data_ptr<int64_t>(), push_order.data_ptr<int32_t>(),
-      remote_offsets.data_ptr<int64_t>(), keys.occurrence_count.data_ptr<int64_t>(), max_chunks,
-      remote_map.position());
+  with_push_key(push_key_sorted, [&](auto key) {
+    push_tables_kernel<decltype(key)><<<item_grid(std::max(parts, entries)), kThreads, 0, stream>>>(
+        push_key_sorted.data_ptr<decltype(key)>(), push_order.data_ptr<int32_t>(),
+        remote_offsets.data_ptr<int64_t>(), keys.occurrence_count.data_ptr<int64_t>(),
+        chunks.num_chunks.data_ptr<int64_t>(), local_size, max_chunks,
+        buffers.push_tables.data_ptr<int32_t>(), remote_map.position());
+  });
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   ProxyPlan plan;
   plan.node_exp_off = chunks.node_exp_off;

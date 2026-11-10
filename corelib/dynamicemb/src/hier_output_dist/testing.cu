@@ -20,10 +20,10 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 // proxy, rail and requester steps across nodes. Last, a hook that makes the
 // next construction fail, a hook that delays the reads of node_offsets and
 // node_keys of later input dists, hooks that choose the paths of later ones
-// (node_exchange's, and the CTAs of the proxy's scans), a hook that fills
-// tables of the proxy's with garbage before its kernels write them, and the
-// GPU clock the benchmark aligns timelines by (a build with
-// DYNAMICEMB_HIER_TRACE=1).
+// (node_exchange's, the CTAs of the proxy's scans and the type of its push
+// keys), a hook that fills tables of the proxy's with garbage before its
+// kernels write them, and the GPU clock the benchmark aligns timelines by (a
+// build with DYNAMICEMB_HIER_TRACE=1).
 
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
@@ -317,7 +317,9 @@ std::pair<at::Tensor, at::Tensor> group_tables(const std::vector<int64_t> &looku
 // header, ProxyHeader) as the steps write those buffers of its window. Also
 // the node-unique key of each occurrence (node_reverse_indices, garbage past
 // the valid ones) and the node-unique keys (node_num_uniques), for the test's
-// reference.
+// reference; push_key_bytes (int64, on the host): the bytes of each push key
+// the push order sorts by, 4 or 8, as the sizes or the test hook
+// (force_push_keys64) choose.
 std::map<std::string, at::Tensor> proxy_plan_test(
     at::Tensor node_keys, c10::optional<at::Tensor> node_key_weights,
     at::Tensor node_bucket_feature_of_row, at::Tensor remote_offsets, at::Tensor skip,
@@ -354,9 +356,10 @@ std::map<std::string, at::Tensor> proxy_plan_test(
   const ProxyBuffers buffers = proxy_buffers(remote_map.view({RemoteMap::kArrays, entries}),
                                              key_stage, header, proxy_header.options());
   ProxyKeys proxy = proxy_keys(input, sizes, node_dedup);
-  const at::Tensor node_reverse_indices = proxy.node_reverse_indices;  // the push order drops it
+  const at::Tensor node_reverse_indices = proxy.node_reverse_indices;  // step 2 drops it
   const at::Tensor node_num_uniques = proxy.node_num_uniques;          // the plan does not keep it
   ProxyChunks chunks = proxy_chunks_and_slots(proxy, remote_offsets, buffers, sizes);
+  const int64_t push_key_bytes = chunks.push_key.element_size();  // the push order drops the keys
   const ProxyPlan plan =
       proxy_push_order(std::move(proxy), std::move(chunks), remote_offsets, buffers, sizes);
   return {{"num_chunks", plan.num_chunks},
@@ -377,7 +380,8 @@ std::map<std::string, at::Tensor> proxy_plan_test(
                          plan.chunk_length_per_bucket, plan.node_length_per_bucket_feature,
                          group_tables(lookup_groups, num_features, node_keys.options()).second)},
           {"node_reverse_indices", node_reverse_indices},
-          {"node_num_uniques", node_num_uniques}};
+          {"node_num_uniques", node_num_uniques},
+          {"push_key_bytes", at::scalar_tensor(push_key_bytes, at::kLong)}};
 }
 
 // One rank's rail steps of a call on its rail's count messages to it (int64
@@ -577,10 +581,14 @@ void bind_testing(py::module &py_module) {
                 py::arg("ctas"));
   py_module.def("hier_output_dist_proxy_garbage", &fill_proxy_garbage,
                 "With fill, each later proxy step of this process sets every bit of the rows "
-                "before each key, its chunk tables and reduce_task_offsets before its kernels "
-                "write them, so a word they leave out shows (False: as the caching allocator "
-                "gives them)",
+                "before each key, its chunk tables, reduce_task_offsets and its push keys' "
+                "indices, and makes each push key part 0, before its kernels write them, so a "
+                "word they leave out shows (False: as the caching allocator gives them)",
                 py::arg("fill"));
+  py_module.def("hier_output_dist_push_keys64", &force_push_keys64,
+                "With on, each later proxy step of this process sorts its push order by int64 "
+                "push keys (False: by int32 ones where they fit, as its sizes choose)",
+                py::arg("on"));
   py_module.def(
       "hier_output_dist_proxy_plan", &proxy_plan_test,
       "One proxy's steps of a call across nodes on plain tensors, which it writes as "

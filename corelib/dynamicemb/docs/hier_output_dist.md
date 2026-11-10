@@ -780,7 +780,7 @@ the planner's kernels, with CUB's radix sorts.
 | `node_done` | comm | tells its targets; waits until every requester of the node told it | 10.2 |
 | owner's KJT (one node) | kernel | a copy of the own part of `node_keys` | 10.3 |
 | node dedup | kernels | the proxy's node-unique keys, rows, the chunks of its stream and their slots | 9, 10.4 |
-| push order | kernels, CUB | its requesters' push orders and push tables | 10.4 |
+| push order | CUB, a kernel | its requesters' push orders and push tables | 10.4 |
 | `rail_exchange` | comm | its count message to each rail peer (a header the same to all, then the peer's own part), and theirs; then the rail layout from the rail's messages: where each proxy's key records land, this owner's KJT layout, where each lookup group's rows lie in its `lookup_rows` (`group_offsets`, `group_shift`), and the group runs of each source node's records here (`fwd_groups`) and of its node's keys at each rail owner (`bwd_groups`); the rail's needs | 10.2, 10.4 |
 | `rail_key_push` | comm | its key records to its rail owners; it does not wait | 10.2 |
 | `node_status_exchange` | comm | the needs and the group shifts of the node's owners; the call's needs | 10.2 |
@@ -1172,7 +1172,7 @@ in bounds.
 With the benchmark's configuration (8 features, one owner rule), the
 bucketize queues 22 kernels and copies per call (DynamicEmb's index dedup
 and the fan-out table included), and the steps after it 5 on one node and
-about 37 across nodes (an estimate from the code), CUB's included. The
+about 34 across nodes (an estimate from the code), CUB's included. The
 node's part of a call is three comm kernels (`node_exchange`,
 `node_key_push`, `node_done`); on one node a fourth kernel copies the own
 part. With many features, `node_exchange`'s grids add one or two more.
@@ -1588,12 +1588,13 @@ The buckets the call takes are at least twice its valid occurrences, so it
 clears and walks no more of the table than its keys need, whatever
 `remote_keys` is.
 
-**Its rows and chunks** take five launches and 15 allocations (14 with
-`rows_per_payload` 1), and no CUB call (`proxy_chunks_and_slots`; with CUB's
-scans over `remote_keys` they took ten and 18). Only the device knows how
-many node-unique keys there are and how many chunks they make. The host
-sizes the tables by `remote_keys` and `max_chunks`, and the kernels read the
-two counts to bound their loops:
+**Its rows and chunks** take five launches and 16 allocations (15 with
+`rows_per_payload` 1, two of them the push order's keys and values), and no
+CUB call (`proxy_chunks_and_slots`; with CUB's scans over `remote_keys` they
+took ten launches). Only the device knows how many node-unique keys there
+are and how many chunks they make. The host sizes the tables by
+`remote_keys` and `max_chunks`, and the kernels read the two counts to bound
+their loops:
 
 * two kernels count the rows before each key, a row per occurrence and at
   most `max_key_rows`, and its counted rows before it (section 12.1): a scan
@@ -1616,7 +1617,35 @@ two counts to bound their loops:
   `proxy_header`, and in `reduce_task_offsets` the reducer tasks of all the
   chunks. The requesters gather all `max_chunks` ends, and the reducers
   search `reduce_task_offsets` over all `max_chunks` places;
-* a thread per occurrence gives it its slot.
+* a thread per entry of the remote part gives each valid occurrence its
+  slot and its push key (below), and each entry past them the push key that
+  sorts after every part, so the push order's sort reads no word that
+  nothing wrote.
+
+**Its push order** takes one CUB sort and one kernel (`proxy_push_order`):
+nine launches when the sort takes two passes of 8 bits, as it does for
+`local_size × (max_chunks + 1)` from 256 to 65,535 (eleven with three
+passes), and three allocations, the sort's. With a kernel of its own for
+the push keys, and two more for where the parts start and for the
+positions, it took 12 launches and 6 allocations. The host sizes the sort
+by `remote_keys` and the push tables by `local_size × (max_chunks + 1)`,
+and the kernel reads the count and the stream's chunks to bound its loops:
+
+* the sort orders every entry of the remote part by its push key, stably
+  (CUB's radix sort, by the bits that hold `local_size × (max_chunks +
+  1)`), and carries each entry's index: the push order. The push keys are
+  int32 while `local_size × (max_chunks + 1) + 1` stays below 2^31 (a proxy
+  header below 8 GiB), else int64; a pass moves 16 bytes per entry of int32
+  keys and their indices, 24 of int64 ones;
+* one kernel, a thread per entry of the push tables, finds where its part
+  starts. A requester's positions are those of its valid occurrences: its
+  range of the remote part, cut at the count, which its push keys fill in
+  chunk order. So a chunk below the stream's chunks starts at the first of
+  them not below its part (a binary search of the range), and a chunk from
+  the stream's chunks on, like the requester's end, at the range's end:
+  every valid key's chunk is below the stream's chunks. Then a thread per
+  valid position gives its occurrence its place in its requester's push
+  order (`remote_map`'s positions).
 
 **Names.** A table that holds data from another step is named after that
 data where it came from, with a prefix for where it is now. The requesters
@@ -1636,11 +1665,11 @@ the proxies' tables as `proxy_num_chunks`, `proxy_ends` and
 A requester's push order at the proxy comes from one stable radix sort of
 the push key, the occurrence's part: requester × (`max_chunks` + 1) + its
 key's chunk. So a requester pushes its rows chunk after chunk, in each chunk
-in its own order. Its push tables give, per chunk, its first position; a
-pass over the sorted push keys writes where each part starts, so the tables
-take no search. A key's rows are its key row, then its duplicates' slots
-in occurrence order; `node_exp_off` holds the rows before each key, and
-where the rows lie follows from the chunk (section 12.1).
+in its own order. Its push tables give, per chunk, its first position, and
+for a chunk past the stream's chunks the end of its positions. A key's rows
+are its key row, then its duplicates' slots in occurrence order;
+`node_exp_off` holds the rows before each key, and where the rows lie
+follows from the chunk (section 12.1).
 
 **The rail.** The rail all-gathers its counts, as the node gathers its
 offsets. Each rank sends each rail peer a count message (`CountMessage`,
@@ -2431,7 +2460,10 @@ representatives before each occurrence and its tables per occurrence and
 per key. Its next step holds the rows before each key (int64), and with
 `rows_per_payload` above 1, as by default, the counted rows before each key
 (int64), while it cuts its chunks and gives the slots: about 52 bytes per
-entry, 56 with weights, no more than its node dedup.
+entry, 56 with weights, no more than its node dedup. Its push order holds
+the rows before each key, and the sort's push keys and indices in and out
+with CUB's extra key and index buffers: about 32 bytes per entry (44 with
+int64 push keys).
 
 The constructors of the layouts size the window's buffers as above
 (`CtrlLayout`, `KeysLayout` and `RowsLayout`, in `window.h`). The buffers
@@ -2541,14 +2573,13 @@ bucket feature starts). Apart from these,
 `local_size` enters through `node_offsets` (a row of about `local_size ×
 (num_features + 1)` words per GPU of the node), and through the tables kept
 per GPU of the node: the proxy header's push tables, and per call the
-requester's tables of each proxy and the proxy's `part_offsets` of each
-requester. Two tables hold a count per (sender, receiver, feature), of a
-rail or of a node. A count message's part to a rail peer holds one per
-feature of the peer's node: the sender's node-unique keys of each; its
-header holds one per (owner node, lookup group). `node_offsets` holds one
-per (GPU of the node, GPU of the node, feature): each GPU's offsets at its
-own node's bucket features, and one per (GPU of the node, GPU of the node)
-for the owners on the other nodes.
+requester's tables of each proxy. Two tables hold a count per (sender,
+receiver, feature), of a rail or of a node. A count message's part to a
+rail peer holds one per feature of the peer's node: the sender's
+node-unique keys of each; its header holds one per (owner node, lookup
+group). `node_offsets` holds one per (GPU of the node, GPU of the node,
+feature): each GPU's offsets at its own node's bucket features, and one
+per (GPU of the node, GPU of the node) for the owners on the other nodes.
 
 Everything else is linear in the capacities, except `proxy_rows` (capped: a
 larger call's stream takes more laps of the ring).
@@ -2793,14 +2824,20 @@ its `node_keys`, its owner tables: its KJT, the chunks its forward puts, and
 its row map. Both take the lookup groups, and both run the device code of
 `rail_exchange` (`input_dist/rail.cuh`).
 
-Two more hooks reach into the proxy's steps.
+Three more hooks reach into the proxy's steps.
 `hier_output_dist_scan_ctas(ctas)` makes each later proxy step of the
 process run its scans over a count only the device knows (of the
 representatives and of the keys' rows, section 10.4) on `ctas` CTAs, or as
 their sizes choose (0). `hier_output_dist_proxy_garbage(fill)` makes each
-later proxy step set every bit of the rows before each key, its chunk table
-and its `reduce_task_offsets` before its kernels write them, so a test sees
-a word they leave out, whatever the caching allocator gave.
+later proxy step set every bit of the rows before each key, its chunk
+table, its `reduce_task_offsets` and its push keys' indices, and make each
+push key part 0, before its kernels write them, so a test sees a word they
+leave out, whatever the caching allocator gave. A push key left out sorts
+into part 0 and moves the later parts' positions; with every bit set it
+would sort last, as the key past the valid occurrences does, and not show.
+`hier_output_dist_push_keys64(on)` makes each later proxy step sort its
+push order by int64 push keys, which the sizes choose only for a proxy
+header of 8 GiB or more (section 10.4).
 
 `test_hier_bucketize.py` plays every rank of one node with the first two
 hooks. Each rank's offsets are those its in channel writes (section 10.1),
@@ -2823,12 +2860,22 @@ features at a proxy, most of their blocks empty); and the scans on 2, 3,
 at counts of `remote_keys` and of 0), and on 1, 2 and 600 CTAs in calls of
 4,000 to 21,000 (on 1 and 2 slices of several tiles; on 600 slices of about
 20 to 35 occurrences, also in the CTAs past a CTA's 512 threads), each with
-`rows_per_payload` 1 and above 1 (the rows' scan of a pair of sums). Its
-proxies fill their rows' offsets, chunk tables and `reduce_task_offsets`
-with garbage first (`hier_output_dist_proxy_garbage`), and its windows hold
+`rows_per_payload` 1 and above 1 (the rows' scan of a pair of sums). It
+compares every entry of each proxy's push tables and each requester's,
+most of them past the chunks when `max_chunks` is far above them; also
+with the push order sorted by int64 push keys
+(`hier_output_dist_push_keys64`; each proxy gives the bytes of its push
+keys, so the checks see the hook's int64 keys and the sizes' int32 ones),
+in three passes of 8 bits by int32 and by int64 keys (`local_size ×
+(max_chunks + 1)` of 2^16 or more, with `remote_keys` far past CUB's single
+tile), and with a requester of each node that asks nothing across nodes,
+between requesters that do. Its proxies fill their rows' offsets, chunk
+tables and `reduce_task_offsets` with garbage first, and their push keys
+with part 0 (`hier_output_dist_proxy_garbage`), and its windows hold
 garbage before the call, so the checks of the chunk table,
 `reduce_task_offsets` and the header's chunk ends over all `max_chunks`
-places see a word that the proxy leaves out.
+places see a word that the proxy leaves out, and the checks of the push
+tables and positions a push key it leaves out.
 
 ## 19. Limitations
 
@@ -2856,7 +2903,7 @@ places see a word that the proxy leaves out.
   and the hottest owner's need sizes `lookup_keys` on every rank (section
   15).
 * **Host time of the input dist**: across nodes an input dist launches
-  about 60 kernels, CUB's included (section 10; an estimate from the code),
+  about 56 kernels, CUB's included (section 10; an estimate from the code),
   and the training thread spends their host time, also under the train
   pipelines.
 * **Size of one call**: a GPU may receive, deduplicate or look up fewer than
@@ -3006,9 +3053,10 @@ Paths from `corelib/dynamicemb`.
       bucketize is in `bucketize.cu` and the proxy in `proxy.cu` (with its
       node dedup's hash table, `Identities`, which takes index dedup's
       chained insert from `src/dedup_chain.cuh`, the hooks that set the
-      CTAs of its scans, `force_scan_ctas`, and fill tables of its second
-      step with garbage first, `fill_proxy_garbage`, and the rounds of its
-      chunks, cut by counted rows, `Rounds`); the node
+      CTAs of its scans, `force_scan_ctas`, fill tables of its second step
+      with garbage first, `fill_proxy_garbage`, and sort its push order by
+      int64 keys, `force_push_keys64`, and the rounds of its chunks, cut by
+      counted rows, `Rounds`); the node
       layout, the push, the count message and the rail layout as the hooks
       run them (`node_layout`, `push_to_node_keys`, `count_message`,
       `rail_layout`), the owner's KJT on one node (`one_node_owner`), the

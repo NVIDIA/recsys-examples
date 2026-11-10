@@ -83,14 +83,35 @@ none; on 264 also a count at remote_keys and a count of 0), and 1, 2 and
 threads); each with rows_per_payload 1 (a scan of the rows alone) and
 above 1 (of the rows and the counted rows together).
 
-The proxy's second step fills the rows before each key, its chunk table and
-reduce_task_offsets with garbage before its kernels write them
+The proxy's push tables come from a binary search of each requester's
+sorted push keys for each chunk below its stream's chunks, and its
+positions' end for the chunks past them; the checks compare all
+local_size x (max_chunks + 1) entries of each proxy's push tables and of
+each requester's, and most are past the chunks where max_chunks is far
+above them. A few cases sort the push order by int64 push keys
+(``hier_output_dist_push_keys64``), which the sizes choose only when
+local_size x (max_chunks + 1) + 1 reaches 2^31: with remote_keys 20 times
+the need, without node dedup in a ring that wraps, and at a count of 0.
+Each proxy gives the bytes of its push keys, which the checks compare, so
+the hook's int64 keys and the sizes' int32 ones show. Two cases sort in
+three passes of 8 bits (local_size x (max_chunks + 1) of 2^16 or more), by
+int32 and by int64 keys, with remote_keys 85,000 past the need: far past
+CUB's single tile, so its onesweep passes run, as at the sizes that choose
+int64 keys. In a few, requester 1 of each node asks nothing across nodes,
+so at each proxy it has no push position, between requesters 0 and 2's.
+
+The proxy's second step fills the rows before each key, its chunk table,
+reduce_task_offsets and its push keys' indices with garbage before its
+kernels write them, and makes each push key part 0
 (``hier_output_dist_proxy_garbage``), as the windows hold garbage before
 the call. So the checks of the chunk table, reduce_task_offsets and the
 header's chunk ends, over all max_chunks entries, see a word the proxy
-leaves out past its chunks, whatever the caching allocator gave. With the
-caching allocator off (under compute-sanitizer, below) the proxy leaves
-them as they come, so initcheck sees a read of a word that nothing wrote.
+leaves out past its chunks, and the checks of the push tables and
+positions a push key it leaves out, also past the valid occurrences (with
+every bit set that key would sort last, as the key there does), whatever
+the caching allocator gave. With the caching allocator off (under
+compute-sanitizer, below) the proxy leaves them as they come, so initcheck
+sees a read of a word that nothing wrote.
 
 Run it on one GPU, from ``corelib/dynamicemb``::
 
@@ -123,6 +144,7 @@ from dynamicemb_extensions import (
     hier_output_dist_node_push,
     hier_output_dist_proxy_garbage,
     hier_output_dist_proxy_plan,
+    hier_output_dist_push_keys64,
     hier_output_dist_rail_tables,
     hier_output_dist_requester_tables,
     hier_output_dist_scan_ctas,
@@ -224,6 +246,9 @@ class Case:
     # the CTAs of the proxy's scans, of the representatives and of the keys'
     # rows (hier_output_dist_scan_ctas); 0: as their sizes choose
     scan_ctas: int = 0
+    # the push order's sort by int64 push keys (hier_output_dist_push_keys64);
+    # False: by int32 ones, as the sizes choose
+    push_keys64: bool = False
 
     @property
     def num_features(self) -> int:
@@ -329,6 +354,28 @@ def local_node_job(case: Case, generator) -> List[Tuple]:
         keep = bucket_feature < node_bucket_features
         counts = counts.clone()
         counts[node_bucket_features:] = 0
+        job[rank] = (counts, keys[keep], weights[keep])
+    return job
+
+
+def quiet_requester_job(case: Case, generator) -> List[Tuple]:
+    """As random_job, but local rank 1 of each node asks only the owners of
+    its node: at each proxy requester 1 has no occurrence, between
+    requesters that have some (local_size above 2), so its push order there
+    is empty and each entry of its push tables is 0."""
+    job = random_job(case, generator)
+    node_bucket_features = case.local_size * case.num_features
+    for node in range(case.num_nodes):
+        rank = node * case.local_size + 1
+        counts, keys, weights = job[rank]
+        bucket_feature = torch.repeat_interleave(torch.arange(counts.numel()), counts)
+        first = node * node_bucket_features  # its node's owners' bucket features
+        keep = (bucket_feature >= first) & (
+            bucket_feature < first + node_bucket_features
+        )
+        counts = counts.clone()
+        counts[:first] = 0
+        counts[first + node_bucket_features :] = 0
         job[rank] = (counts, keys[keep], weights[keep])
     return job
 
@@ -882,6 +929,87 @@ CASES = [
         max_chunk_rows_arg=30,
         payload_rows=10,
         remote_factor=20,
+    ),
+    # the push order's sort by int64 push keys (hier_output_dist_push_keys64),
+    # which the sizes choose only when local_size * (max_chunks + 1) + 1
+    # reaches 2^31: the same push order, push tables and positions as by
+    # int32 keys, with max_chunks far above the chunks, without node dedup
+    # in a ring that wraps, and at a count of 0
+    Case("the push order by int64 push keys", push_keys64=True),
+    Case(
+        "the push order by int64 push keys, 20 x the need, weights, 3 nodes of 2, "
+        "6 rows per payload",
+        num_nodes=3,
+        local_size=2,
+        tables=(0, 0, 1),
+        max_block=40,
+        key_range=30,
+        hot=0.5,
+        weighted=True,
+        max_chunk_rows_arg=60,
+        payload_rows=10,
+        remote_factor=20,
+        push_keys64=True,
+    ),
+    Case(
+        "the push order by int64 push keys, node dedup off, 2 nodes, a wrapping ring",
+        num_nodes=2,
+        max_block=200,
+        key_range=600,
+        hot=0.15,
+        node_dedup=False,
+        num_proxy_rows=1280,
+        push_keys64=True,
+        seeds=1,
+    ),
+    Case(
+        "no keys across nodes from node 0, the push order by int64 push keys",
+        job=local_node_job,
+        push_keys64=True,
+        seeds=1,
+    ),
+    # the push order's sort in three passes of 8 bits (local_size *
+    # (max_chunks + 1) of 2^16 or more) by int32 and by int64 push keys, with
+    # remote_keys 85,000 past the need, whatever the job: far past CUB's
+    # single tile, so its onesweep passes run, as at the sizes that choose
+    # int64 keys
+    Case(
+        "the push order in three passes, remote_keys 85,000 past the need, 2 nodes, "
+        "a wrapping ring",
+        num_nodes=2,
+        max_block=200,
+        key_range=600,
+        hot=0.15,
+        num_proxy_rows=1280,
+        remote_slack=85000,
+        seeds=1,
+    ),
+    Case(
+        "the push order in three passes by int64 push keys, remote_keys 85,000 past "
+        "the need, 2 nodes, a wrapping ring",
+        num_nodes=2,
+        max_block=200,
+        key_range=600,
+        hot=0.15,
+        num_proxy_rows=1280,
+        remote_slack=85000,
+        push_keys64=True,
+        seeds=1,
+    ),
+    # requester 1 of each node asks nothing across nodes: at each proxy no
+    # push position of it, between requesters 0 and 2's, and with max_chunks
+    # far above the chunks
+    Case(
+        "requester 1 asks nothing across nodes, 20 x the need",
+        remote_factor=20,
+        job=quiet_requester_job,
+    ),
+    Case(
+        "requester 1 asks nothing across nodes, node dedup off, int64 push keys",
+        node_dedup=False,
+        job=quiet_requester_job,
+        push_keys64=True,
+        seeds=1,
     ),
     # keys not index-deduplicated: the need key_rows
     Case("keys not deduplicated", max_block=40, key_range=30, hot=0.5, dedup=False),
@@ -1603,6 +1731,13 @@ def check_proxy(
     expect("occurrences", int(out["occurrence_count"]), num_occurrences)
     expect("node_num_uniques", int(out["node_num_uniques"]), node_num_uniques)
     expect("need_key_rows", int(out["need_key_rows"]), ref["need_key_rows"])
+    # the push keys' width: int64 under the hook, or when local_size *
+    # (max_chunks + 1) + 1 reaches 2^31; else int32
+    expect(
+        "push key bytes",
+        int(out["push_key_bytes"]),
+        8 if case.push_keys64 or local_size * (capacity + 1) + 1 >= 1 << 31 else 4,
+    )
     expect(
         "keys", out["node_reverse_indices"][:num_occurrences].tolist(), ref["key_of"]
     )
@@ -2204,11 +2339,13 @@ def run_case(case: Case, seed: int) -> Tuple[Dict[str, List[str]], str]:
     laps = max(-(-ref["stream_end"] // case.num_proxy_rows) for ref in refs.values())
     hier_output_dist_scan_ctas(case.scan_ctas)
     hier_output_dist_proxy_garbage(PROXY_GARBAGE)
+    hier_output_dist_push_keys64(case.push_keys64)
     try:
         call = run_call(case, ranks, lookup_keys, remote_keys, generator)
     finally:
         hier_output_dist_scan_ctas(0)
         hier_output_dist_proxy_garbage(False)
+        hier_output_dist_push_keys64(False)
     # each node's agreed needs: the most of what its ranks publish
     agreed = call["needs"].amax(1).tolist()
     checks = {"puts": call["problems"]}

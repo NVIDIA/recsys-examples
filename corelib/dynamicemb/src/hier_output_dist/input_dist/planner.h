@@ -322,17 +322,20 @@ struct ProxyKeys {
 ProxyKeys proxy_keys(const ProxyInput &input, const Sizes &sizes, bool node_dedup);
 
 // Step 2: the rows of the keys, the chunks of the stream and where they
-// lie, each occurrence's slot. A key's rows are its key row and its
+// lie, each occurrence's slot and push key. A key's rows are its key row and its
 // duplicates' slots, a row per occurrence (max_key_rows at most: a key of
 // more occurrences, which the call raises for, takes max_key_rows, and all
 // its occurrences take its key row). Writes remote_map's key rows and
 // slots, the chunks and records of key_stage, and the proxy header's chunks,
-// end and ends; drops keys.node_unique_keys and keys.node_unique_key_weights, which only the
-// records need, and keys.occurrence_rank, which only the slots need. The scan of the keys' rows
-// and the chunks' loops take the node-unique keys and the stream's chunks alone (the kernels read
-// their counts, and the host sizes the tables by remote_keys and max_chunks); a grid writes the
-// places of the tables of max_chunks entries past the chunks as empty places: an empty Chunk, an
-// end of 0 in the proxy header, and the reducer tasks of all the chunks.
+// end and ends; drops the tables of `keys` per occurrence and per key (node_reverse_indices,
+// occurrence_rank, key_occurrences, key_node, node_unique_keys, node_unique_key_weights), which
+// no later step reads, each once its last kernel is queued. The scan of the keys' rows and the
+// chunks' loops take the node-unique keys and the stream's chunks alone (the kernels read their
+// counts, and the host sizes the tables by remote_keys and max_chunks); a grid writes the places
+// of the tables of max_chunks entries past the chunks as empty places: an empty Chunk, an end of
+// 0 in the proxy header, and the reducer tasks of all the chunks. The slots' kernel takes every
+// entry of remote_keys: past the valid occurrences it writes the push key that sorts last, so the
+// push order's sort reads no word that nothing wrote.
 struct ProxyChunks {
   at::Tensor num_chunks;  // int64 0-dim: the chunks of the stream
   at::Tensor chunks;      // int32 [max_chunks][8]: Chunk, in stream order (zeros past them)
@@ -346,8 +349,12 @@ struct ProxyChunks {
   at::Tensor reduce_task_offsets;  // int64 [max_chunks + 1]: the reducers' tasks before each chunk
   at::Tensor node_exp_off;         // int64 [remote_keys + 1]: the rows before each key, up to
                                    // node_num_uniques (garbage past it)
-  at::Tensor key_chunk;            // int32 [remote_keys]: the chunk of each key
-  at::Tensor requester_of;         // int32 [remote_keys]: the requester of each occurrence
+  at::Tensor push_key;  // int32 [remote_keys], int64 when local_size * (max_chunks + 1) + 1
+                        // reaches 2^31: each occurrence's part of the push order, requester *
+                        // (max_chunks + 1) + its key's chunk; past the valid occurrences
+                        // local_size * (max_chunks + 1), which sorts after every part
+  at::Tensor occurrence_index;  // int32 [remote_keys]: each entry's own index, which the push
+                                // order's sort carries
 };
 ProxyChunks proxy_chunks_and_slots(ProxyKeys &keys, const at::Tensor &remote_offsets,
                                    const ProxyBuffers &buffers, const Sizes &sizes);
@@ -357,10 +364,16 @@ ProxyChunks proxy_chunks_and_slots(ProxyKeys &keys, const at::Tensor &remote_off
 // choose (0: a thread per entry of remote_keys, at most two CTAs per SM).
 void force_scan_ctas(int64_t ctas);
 // With `fill`, each later proxy_chunks_and_slots of this process sets every bit of its rows'
-// offsets (node_exp_off and the counted rows'), its chunk tables and reduce_task_offsets before
-// its kernels write them, so a test sees a word they leave out (false: as the caching allocator
-// gives them).
+// offsets (node_exp_off and the counted rows'), its chunk tables, reduce_task_offsets and its push
+// keys' indices, and makes each push key part 0, before its kernels write them, so a test sees a
+// word they leave out (false: as the caching allocator gives them). A push key left out sorts into
+// part 0 and moves the later parts' positions; with every bit set it would sort last, as the key
+// past the valid occurrences does, and not show.
 void fill_proxy_garbage(bool fill);
+// With `on`, each later proxy_chunks_and_slots of this process writes int64 push keys, which its
+// proxy_push_order sorts (false: int32 ones when local_size * (max_chunks + 1) + 1 is below 2^31,
+// as the sizes choose).
+void force_push_keys64(bool on);
 
 // What the call keeps of the proxy.
 struct ProxyPlan {
@@ -382,8 +395,11 @@ struct ProxyPlan {
                                    // are its key row, then its duplicates' slots in order
 };
 // Step 3: each requester's push order (one stable sort by its part, a
-// requester and a chunk) and its push tables. Writes remote_map's positions
-// and the proxy header's push tables.
+// requester and a chunk: chunks.push_key) and its push tables. Writes remote_map's positions
+// and the proxy header's push tables, all local_size * (max_chunks + 1) of them: one kernel finds
+// where each part starts by a binary search of its requester's sorted push keys when its chunk is
+// below the stream's chunks, and else takes the end of the requester's positions (every valid
+// key's chunk is below the stream's chunks).
 ProxyPlan proxy_push_order(ProxyKeys keys, ProxyChunks chunks, const at::Tensor &remote_offsets,
                            const ProxyBuffers &buffers, const Sizes &sizes);
 
