@@ -232,40 +232,15 @@ class Fp8FusedTransformerInferLayer(Fp8TransformerInferLayer):
         projections = (self.qkv, self.proj, self.ffn[0], self.ffn[2])
         return all(isinstance(p, Fp8Linear) for p in projections)
 
-    def _qkv(self, hidden):
+    def _mixed_qkv(self, hidden):
+        if not self._fused:
+            return super()._mixed_qkv(hidden)
         norm = self.input_norm
         ue8m0 = _uses_ue8m0(hidden.device)
         qx, scale_x = triton_layernorm_quant_1x128(
             hidden, norm.weight, norm.bias, norm.eps, ue8m0
         )
         return self.qkv.gemm(qx, scale_x).add_(self.qkv.bias)
-
-    def project_qkv(self, hidden):
-        if not self._fused:
-            return super().project_qkv(hidden)
-        mixed = self._qkv(hidden)
-        return tuple(
-            x.reshape(-1, self.num_heads, self.head_dim) for x in mixed.chunk(3, dim=-1)
-        )
-
-    def forward_input(self, batch_size, num_tokens, hidden, jd, metadata):
-        if not self._fused:
-            return super().forward_input(batch_size, num_tokens, hidden, jd, metadata)
-        # The parent's forward_input with the fused qkv projection.
-        mixed = self._qkv(hidden[:num_tokens])
-        self._qkv_buffer[:num_tokens].copy_(mixed)
-        if metadata is not None:
-            _, k, v = (
-                x.reshape(-1, self.num_heads, self.head_dim) for x in mixed.chunk(3, -1)
-            )
-            offsets = jd.seqlen_offsets[: batch_size + 1]
-            candidates = (
-                jd.num_candidates[:batch_size]
-                if jd.num_candidates is not None
-                else torch.zeros_like(offsets[:-1])
-            )
-            self._append(k, v, offsets, candidates, metadata, batch_size)
-        return self._qkv_buffer[:num_tokens]
 
     def finish(self, hidden, attention):
         if not self._fused:

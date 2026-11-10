@@ -126,9 +126,13 @@ class TransformerInferLayer(nn.Module):
         )
         self.requires_grad_(False)
 
+    def _mixed_qkv(self, hidden):
+        """The qkv projection of the normalized hidden states, tokens x 3 * inner."""
+        return self.qkv(self.input_norm(hidden))
+
     def project_qkv(self, hidden):
         """Project packed hidden states to Q/K/V shaped as tokens, heads, dim."""
-        mixed = self.qkv(self.input_norm(hidden))
+        mixed = self._mixed_qkv(hidden)
         return tuple(
             x.reshape(-1, self.num_heads, self.head_dim) for x in mixed.chunk(3, dim=-1)
         )
@@ -292,7 +296,8 @@ class TransformerInferLayer(nn.Module):
         table[pages, 1, positions % table.shape[2]] = value[valid]
         return table
 
-    def _compute(self, hidden, q, k, v, jd, metadata, batch_size, append):
+    def _request_bounds(self, jd, batch_size):
+        """The request's user count, offsets and candidate counts in jd."""
         if self._export_mode and jd.num_candidates is not None:
             # An exported program serves every batch size it declares, but the exporters
             # pass the example request's batch_size; count the users of this request.
@@ -303,6 +308,10 @@ class TransformerInferLayer(nn.Module):
             if jd.num_candidates is not None
             else torch.zeros_like(offsets[:-1])
         )
+        return batch_size, offsets, candidates
+
+    def _compute(self, hidden, q, k, v, jd, metadata, batch_size, append):
+        batch_size, offsets, candidates = self._request_bounds(jd, batch_size)
         cache = {}
         if metadata is not None:
             table = (
@@ -339,18 +348,13 @@ class TransformerInferLayer(nn.Module):
 
     def forward_input(self, batch_size, num_tokens, hidden, jd, metadata):
         """Store projected Q/K/V and append history for split graph execution."""
-        mixed = self.qkv(self.input_norm(hidden[:num_tokens]))
+        mixed = self._mixed_qkv(hidden[:num_tokens])
         self._qkv_buffer[:num_tokens].copy_(mixed)
         if metadata is not None:
             _, k, v = (
                 x.reshape(-1, self.num_heads, self.head_dim) for x in mixed.chunk(3, -1)
             )
-            offsets = jd.seqlen_offsets[: batch_size + 1]
-            candidates = (
-                jd.num_candidates[:batch_size]
-                if jd.num_candidates is not None
-                else torch.zeros_like(offsets[:-1])
-            )
+            batch_size, offsets, candidates = self._request_bounds(jd, batch_size)
             self._append(k, v, offsets, candidates, metadata, batch_size)
         return self._qkv_buffer[:num_tokens]
 
