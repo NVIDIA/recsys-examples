@@ -297,10 +297,59 @@ class InferenceDenseModule(torch.nn.Module):
         self.load_state_dict(model_state_dict, strict=False)
 
     def load_state_dict(self, model_state_dict, *args, **kwargs):
-        """Load dense weights and refresh backbone-specific inference state."""
-        from modules.inference_checkpoint import load_dense_state_dict
+        """Load the dense weights of a model checkpoint, skipping its sparse tables.
 
-        return load_dense_state_dict(self, model_state_dict, *args, **kwargs)
+        HSTU checkpoints use the training layout, with transposed UVQK and projection
+        weights; Transformer checkpoints use the module's own parameter names. Missing
+        or unexpected dense keys raise RuntimeError even when the caller passes
+        strict=False to skip the sparse weights.
+        """
+        hstu_layout = not self._use_exportable and self._backbone == "hstu"
+        new_state_dict = {}
+        for k in model_state_dict:
+            if (
+                k.startswith(
+                    "_embedding_collection._data_parallel_embedding_collection.embeddings."
+                )
+                or "_model_parallel_embedding_collection" in k
+            ):
+                continue
+
+            is_transposed = False
+
+            newk = k
+            if hstu_layout:
+                if k.endswith("_linear_uvqk_weight"):
+                    newk = k.removesuffix("_linear_uvqk_weight") + "_linear_uvqk.weight"
+                    is_transposed = True
+                elif k.endswith("_linear_uvqk_bias"):
+                    newk = k.removesuffix("_linear_uvqk_bias") + "_linear_uvqk.bias"
+                elif k.endswith("_linear_proj_weight"):
+                    newk = k.removesuffix("_linear_proj_weight") + "_linear_proj.weight"
+                    is_transposed = True
+
+            new_state_dict[newk] = (
+                model_state_dict[k] if not is_transposed else model_state_dict[k].T
+            )
+
+        unloaded_modules = super().load_state_dict(new_state_dict, *args, **kwargs)
+        if hstu_layout:
+            with torch.no_grad():
+                for hstu_layer in self._hstu_block._attention_layers:
+                    hstu_layer._linear_uvqk_weight.copy_(
+                        hstu_layer._linear_uvqk.weight.T
+                    )
+                    hstu_layer._linear_proj_weight.copy_(
+                        hstu_layer._linear_proj.weight.T
+                    )
+
+        if unloaded_modules.missing_keys or unloaded_modules.unexpected_keys:
+            raise RuntimeError(
+                f"Checkpoint does not match {self._backbone} backbone: "
+                f"missing={unloaded_modules.missing_keys}, "
+                f"unexpected={unloaded_modules.unexpected_keys}"
+            )
+        return unloaded_modules
 
     def forward_with_kvcache(
         self,

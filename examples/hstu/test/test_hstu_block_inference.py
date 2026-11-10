@@ -124,9 +124,41 @@ def test_hstu_process_inference(backbone):
     dense = InferenceDenseModule(cfg, None, task, hstu_block=block).bfloat16().eval()
     logits = dense(batch, embeddings)
     torch.testing.assert_close(logits, dense._mlp(output.values))
-    if backbone == "transformer":
-        # Transformer checkpoints keep the module's parameter names (HSTU ones use the
-        # training layout, see inference_checkpoint.py).
-        state = {k: v.clone() for k, v in dense.state_dict().items()}
-        dense.load_state_dict(state, strict=True)
-        torch.testing.assert_close(dense(batch, embeddings), logits)
+    # Load the checkpoint of another dense module. Transformer checkpoints keep the
+    # module's parameter names; HSTU ones use the training layout, with transposed
+    # UVQK and projection weights. The sparse tables of a model checkpoint are skipped.
+    other = InferenceDenseModule(
+        cfg, None, task, hstu_block=HSTUBlockInference(cfg).to(device)
+    )
+    other = other.bfloat16().eval()
+    expected = other(batch, embeddings)
+    assert not torch.allclose(expected, logits)
+    state = {k: v.clone() for k, v in other.state_dict().items()}
+    if backbone == "hstu":
+        for key in list(state):
+            for name, transpose in (
+                ("_linear_uvqk.weight", True),
+                ("_linear_uvqk.bias", False),
+                ("_linear_proj.weight", True),
+            ):
+                if key.endswith(name):
+                    value = state.pop(key)
+                    training_key = key.removesuffix(name) + name.replace(".", "_")
+                    state[training_key] = value.T if transpose else value
+    sparse = "_embedding_collection._data_parallel_embedding_collection.embeddings."
+    state[sparse + "item.weight"] = torch.zeros(1)
+    dense.load_state_dict(state, strict=False)
+    torch.testing.assert_close(dense(batch, embeddings), expected)
+    if backbone == "hstu":
+        # Large requests (1024+ tokens with CUDA graphs, 2048+ eagerly) multiply by
+        # these transposed copies instead of the nn.Linear weights.
+        for layer in dense._hstu_block._attention_layers:
+            torch.testing.assert_close(
+                layer._linear_uvqk_weight, layer._linear_uvqk.weight.T
+            )
+            torch.testing.assert_close(
+                layer._linear_proj_weight, layer._linear_proj.weight.T
+            )
+    # Missing or unexpected dense keys fail even with strict=False.
+    with pytest.raises(RuntimeError, match=f"Checkpoint does not match {backbone}"):
+        dense.load_state_dict({"_hstu_block.unknown": torch.zeros(1)}, strict=False)

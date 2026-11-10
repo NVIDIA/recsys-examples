@@ -7,7 +7,6 @@ reference computes each user's unpadded attention independently with softmax.
 GPU-only integration is covered separately at the end of this file.
 """
 
-import copy
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -22,7 +21,6 @@ HSTU_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(HSTU_ROOT))
 sys.path.insert(0, str(HSTU_ROOT.parents[1] / "corelib/recsys_kvcache_manager"))
 
-from modules.inference_checkpoint import load_dense_state_dict
 from modules.transformer_infer_layer import TransformerInferLayer
 from recsys_kvcache_manager.kvcache_metadata import copy_kvcache_metadata
 from transformer_test_utils import (
@@ -55,6 +53,8 @@ def config(**overrides):
 
 
 def test_backbone_configuration_defaults_and_validation():
+    # configs also loads the task schemas, which need the training embedding stack.
+    pytest.importorskip("configs", reason="needs the training embedding stack")
     from configs import get_inference_hstu_config
 
     args = dict(
@@ -370,57 +370,6 @@ def test_non_affine_input_norm_and_empty_batch_tokens():
     )
     empty = layer(torch.empty(0, 12), offsets([0, 0]), torch.tensor([0, 0]))
     assert empty.shape == (0, 12)
-
-
-def test_matching_transformer_checkpoint_and_wrong_backbone_rejection():
-    class Dense(nn.Module):
-        def __init__(self):
-            super().__init__()
-            self._backbone, self._use_exportable = "transformer", False
-            self._hstu_block = nn.Module()
-            self._hstu_block._attention_layers = nn.ModuleList(
-                [TransformerInferLayer(config(), 0, "cpu")]
-            )
-
-    original, loaded = Dense(), Dense()
-    state = copy.deepcopy(original.state_dict())
-    state[
-        "_embedding_collection._data_parallel_embedding_collection.embeddings.item.weight"
-    ] = torch.randn(2, 3)
-    load_dense_state_dict(loaded, state, strict=False)
-    for a, b in zip(original.parameters(), loaded.parameters()):
-        torch.testing.assert_close(a, b, rtol=0, atol=0)
-    with pytest.raises(RuntimeError, match="Checkpoint does not match transformer"):
-        load_dense_state_dict(
-            loaded,
-            {"_hstu_block._attention_layers.0._linear_uvqk_weight": torch.randn(1)},
-            strict=False,
-        )
-
-
-def test_hstu_checkpoint_transposition_is_preserved():
-    dense = nn.Module()
-    dense._backbone, dense._use_exportable = "hstu", False
-    dense._hstu_block = nn.Module()
-    layer = nn.Module()
-    layer._linear_uvqk = nn.Linear(3, 8)
-    layer._linear_proj = nn.Linear(2, 3, bias=False)
-    layer._linear_uvqk_weight = torch.empty(3, 8)
-    layer._linear_proj_weight = torch.empty(2, 3)
-    dense._hstu_block._attention_layers = nn.ModuleList([layer])
-    prefix = "_hstu_block._attention_layers.0."
-    uvqk, proj, bias = torch.randn(3, 8), torch.randn(2, 3), torch.randn(8)
-    load_dense_state_dict(
-        dense,
-        {
-            prefix + "_linear_uvqk_weight": uvqk,
-            prefix + "_linear_uvqk_bias": bias,
-            prefix + "_linear_proj_weight": proj,
-        },
-    )
-    torch.testing.assert_close(layer._linear_uvqk.weight, uvqk.T)
-    torch.testing.assert_close(layer._linear_uvqk_weight, uvqk)
-    torch.testing.assert_close(layer._linear_proj_weight, proj)
 
 
 @pytest.mark.parametrize("strict", [False, True])

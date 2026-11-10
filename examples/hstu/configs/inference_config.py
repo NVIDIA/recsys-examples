@@ -107,7 +107,7 @@ class InferenceHSTUConfig:
     scaling_seqlen: int = -1
     embedding_backend: Optional[EmbeddingBackend] = None
     export_mode: bool = False
-    # Keep the existing config/API name for compatibility with HSTU callers.
+    # The dense backbone. The class keeps its HSTU name for existing callers.
     backbone: str = "hstu"
     transformer_ffn_dim: Optional[int] = None
     transformer_fp8_linear: bool = False

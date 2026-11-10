@@ -153,10 +153,10 @@ python -m pytest test/test_transformer_inference.py test/test_hstu_block_inferen
 CPU tests compare the reference layer against independent, unpadded softmax
 arithmetic; cover multi-layer paged-prefix reuse, variable-length users,
 noncontiguous physical pages, candidate independence, page-tail preservation,
-empty histories, half/bfloat16, HSTU/Transformer checkpoint handling, and
-torch.export save/reload with dynamic shapes and cache mutation. CUDA tests
-exercise the native append operator, graph capture/replay and the shared
-recommendation pre/postprocessor; the graph regression changes history lengths
+empty histories, half/bfloat16, and torch.export save/reload with dynamic
+shapes and cache mutation. CUDA tests exercise the native append operator,
+graph capture/replay, the shared recommendation pre/postprocessor and the HSTU
+and Transformer checkpoint layouts; the graph regression changes history lengths
 and page mappings between requests and compares each replay against fresh eager
 inference. The FP8 and FA4 tests compare each variant with the reference layer,
 with and without the KV cache and CUDA graphs. A skip is not GPU validation.
