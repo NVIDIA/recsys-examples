@@ -658,13 +658,12 @@ Every number is the median over the timed windows, followed by `[min, max]`.
   compare it with the timed numbers.
 - **syncs/step** (with `--sync-count`): blocking sync API calls per step, and per
   collection in parentheses. It counts `cudaStreamSynchronize`, `cudaDeviceSynchronize`,
-  `cudaEventSynchronize` and synchronous `cudaMemcpy`; every `.item()`, `.cpu()`,
-  boolean-mask indexing or `flagged_compact` count read-back is one
-  `cudaStreamSynchronize`. The single-point run also prints the breakdown and the
-  number of D2H copies into pageable memory (`d2h_pageable`: they block the host too,
-  but are normally followed by a counted stream sync, so they are not added). A
-  tree without syncs reads 0. If the profiler returns no CUDA runtime events the
-  run prints a note instead of numbers.
+  `cudaEventSynchronize` and synchronous `cudaMemcpy`; every `.item()`, `.cpu()` or
+  boolean-mask indexing is one `cudaStreamSynchronize`. The single-point run also
+  prints the breakdown and the number of D2H copies into pageable memory
+  (`d2h_pageable`: they block the host too, but are normally followed by a counted
+  stream sync, so they are not added). A tree without syncs reads 0. If the profiler
+  returns no CUDA runtime events the run prints a note instead of numbers.
 
 A single-point run also prints the layout, the planned memory, the unique-key ratio
 per step and the working set of the pool (see the notes below). The loss is checked

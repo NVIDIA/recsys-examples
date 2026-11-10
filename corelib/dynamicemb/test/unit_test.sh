@@ -1,6 +1,10 @@
 set -e
 FWD_BWD_TEST_FILES=(
     "test/unit_tests/table_operation/test_table_operation.sh"
+    "test/unit_tests/counted/test_counted_glue_ops.py"
+    "test/unit_tests/counted/test_counted_table_ops.py"
+    "test/unit_tests/counted/test_counted_value_ops.py"
+    "test/unit_tests/counted/test_counted_lookup.py"
     "test/unit_tests/erase_async/test_erase_async.sh"
     "test/unit_tests/retain_evicted_keys/test_retain_evicted_keys.sh"
     "test/unit_tests/test_hybrid_storage_export.sh"

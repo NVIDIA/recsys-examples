@@ -528,17 +528,21 @@ def test_flagged_compact(setup_device, N, flag_mode, input_spec):
                 torch.randint(0, 2**60, (N,), dtype=torch.int64, device=device)
             )
 
-    h_count, indices, outputs = flagged_compact(flags, inputs)
+    # The arrays keep the length of the input; the first ``count`` entries are the result.
+    count, indices, outputs = flagged_compact(flags, inputs, None)
+    h_count = count.item()
     ref_count, ref_idx, ref_outputs = _flagged_compact_reference(flags, inputs)
 
     assert h_count == ref_count, f"count mismatch: {h_count} vs {ref_count}"
-    assert torch.equal(indices, ref_idx), "indices mismatch"
+    assert indices.shape == (N,), "indices keep the length of the input"
+    assert torch.equal(indices[:h_count], ref_idx), "indices mismatch"
     assert len(outputs) == len(ref_outputs)
     for i, (out, ref) in enumerate(zip(outputs, ref_outputs)):
         if ref is None:
             assert out is None, f"output {i} should be None"
         else:
-            assert torch.equal(out, ref), f"output {i} mismatch"
+            assert out.shape == (N,), f"output {i} keeps the length of the input"
+            assert torch.equal(out[:h_count], ref), f"output {i} mismatch"
             assert out.dtype == torch.int64, f"output {i} dtype mismatch"
 
 
@@ -609,7 +613,11 @@ def test_segmented_unique_reduce_rejects_unknown(setup_device):
     segmented_range = torch.tensor([0, 2], dtype=torch.int64, device=device)
     with pytest.raises(Exception, match="reduce must be"):
         segmented_unique_cuda(
-            keys, segmented_range, 1, torch.empty(0, dtype=torch.int64, device=device), "avg"
+            keys,
+            segmented_range,
+            1,
+            torch.empty(0, dtype=torch.int64, device=device),
+            "avg",
         )
 
 

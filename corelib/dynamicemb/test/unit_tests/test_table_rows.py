@@ -88,10 +88,11 @@ def test_eviction_reuses_the_victims_row():
     newcomers = _keys(100, 100 + BUCKET // 2)
     tids, score = _args(table, newcomers, score=10)
     rows, num_evicted, _, ev_rows, _, _ = table.insert_and_evict(newcomers, tids, score)
-    assert num_evicted == newcomers.numel()
+    assert int(num_evicted) == newcomers.numel()
     assert table.num_rows(0) == BUCKET, "eviction must not allocate"
-    # The victims held exactly the rows the newcomers now hold.
-    assert sorted(rows.tolist()) == sorted(ev_rows.tolist())
+    # The victims held exactly the rows the newcomers now hold (the evicted arrays
+    # have the capacity of the input: the victims are the first num_evicted entries).
+    assert sorted(rows.tolist()) == sorted(ev_rows[: int(num_evicted)].tolist())
 
 
 def test_erased_slot_keeps_its_row_for_the_next_key():

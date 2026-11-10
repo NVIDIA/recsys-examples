@@ -33,7 +33,6 @@ from dynamicemb_extensions import (
     counted_scatter_fill,
     expand_table_ids_cuda,
     flagged_compact,
-    flagged_compact_counted,
 )
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs a GPU")
@@ -131,12 +130,12 @@ def _selected(idx, n):
     return (idx[:n] >= 0).nonzero().flatten()
 
 
-# -- flagged_compact_counted ----------------------------------------------------------
+# -- flagged_compact ------------------------------------------------------------------
 
 
 @pytest.mark.parametrize("n", NS)
 @pytest.mark.parametrize("k", [0, 1, 3, 7])
-def test_flagged_compact_counted(n, k):
+def test_flagged_compact(n, k):
     flags = torch.rand(N, device="cuda") < 0.4
     flags[n:] = True  # a tail that a compaction without the bound would select
     arrays = [torch.randint(-HUGE, HUGE, (N,), device="cuda") for _ in range(k)]
@@ -144,40 +143,39 @@ def test_flagged_compact_counted(n, k):
         arrays[0] = arrays[0].view(torch.uint64)
     if k > 2:
         arrays[1] = None  # stays None: 0, 1, 2 and 6 real inputs
-    count, positions, outs = flagged_compact_counted(flags, arrays, _nv(n, n % 2 == 1))
-    ref_count, ref_positions, ref_outs = flagged_compact(
-        flags[:n], [None if a is None else a[:n] for a in arrays]
-    )
+    count, positions, outs = flagged_compact(flags, arrays, _nv(n, n % 2 == 1))
+    ref_positions = flags[:n].nonzero().flatten()
 
     c = count.item()
     assert count.dtype == torch.int64 and count.shape == (1,) and count.is_cuda
-    assert c == ref_count and positions.shape == (N,)
+    assert c == ref_positions.numel() and positions.shape == (N,)
     assert torch.equal(positions[:c], ref_positions)
     assert len(outs) == k
-    for a, out, ref in zip(arrays, outs, ref_outs):
+    for a, out in zip(arrays, outs):
         assert (out is None) == (a is None)
         if a is not None:
+            ref = a[:n].view(torch.int64)[ref_positions].view(a.dtype)
             assert out.dtype == a.dtype and out.shape == (N,)
             assert _same(out[:c], ref)
 
 
-def test_flagged_compact_counted_count_forms():
+def test_flagged_compact_count_forms():
     flags = torch.rand(N, device="cuda") < 0.4
     keys = torch.randint(0, HUGE, (N,), device="cuda")
-    ref_count, ref_positions, (ref_keys,) = flagged_compact(flags, [keys])
+    ref_positions = flags.nonzero().flatten()
     for nv in (None, _nv(N + 50)):  # no count, a count past the capacity: all live
-        count, positions, (out,) = flagged_compact_counted(flags, [keys], nv)
+        count, positions, (out,) = flagged_compact(flags, [keys], nv)
         c = count.item()
-        assert c == ref_count and torch.equal(positions[:c], ref_positions)
-        assert torch.equal(out[:c], ref_keys)
-    assert flagged_compact_counted(flags, [keys], _nv(-3))[0].item() == 0
+        assert c == ref_positions.numel() and torch.equal(positions[:c], ref_positions)
+        assert torch.equal(out[:c], keys[ref_positions])
+    assert flagged_compact(flags, [keys], _nv(-3))[0].item() == 0
 
     empty = flags[:0]
-    count, positions, outs = flagged_compact_counted(empty, [keys[:0], None], _nv(0))
+    count, positions, outs = flagged_compact(empty, [keys[:0], None], _nv(0))
     assert count.item() == 0 and positions.numel() == 0
     assert outs[0].numel() == 0 and outs[1] is None
     with pytest.raises(RuntimeError):  # at most 6 real inputs
-        flagged_compact_counted(flags, [keys] * 7, None)
+        flagged_compact(flags, [keys] * 7, None)
 
 
 # -- counted_count_true ---------------------------------------------------------------
@@ -304,7 +302,7 @@ def test_rows_of_strided_views():
 
 
 @pytest.mark.parametrize("n", NS)
-def test_expand_table_ids_counted(n):
+def test_expand_table_ids_with_a_count(n):
     counts = torch.tensor([0, 130, 0, 400, 1, 469, 0], dtype=torch.int64, device="cuda")
     offsets = torch.zeros(counts.numel() + 1, dtype=torch.int64, device="cuda")
     offsets[1:] = counts.cumsum(0)  # N = 1000 elements in total
@@ -331,8 +329,8 @@ def test_ops_do_not_read_the_count():
     torch.cuda.synchronize()
     torch.cuda.set_sync_debug_mode("error")  # a .item() / .cpu() of the count raises
     try:
-        flagged_compact_counted(flags, [keys, None], nv)
-        flagged_compact_counted(flags, [], nv)
+        flagged_compact(flags, [keys, None], nv)
+        flagged_compact(flags, [], nv)
         counted_count_true(flags, nv)
         counted_gather(rows, keys, nv, None)
         counted_scatter(rows, keys, src, nv)

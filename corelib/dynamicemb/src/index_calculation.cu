@@ -140,121 +140,15 @@ at::Tensor get_table_range(at::Tensor offsets, at::Tensor feature_offsets) {
   return table_range;
 }
 
-std::tuple<int64_t, at::Tensor, std::vector<c10::optional<at::Tensor>>>
-flagged_compact(at::Tensor flags,
-                std::vector<c10::optional<at::Tensor>> inputs) {
-
-  auto device = flags.device();
-  auto stream = at::cuda::getCurrentCUDAStream().stream();
-  int64_t num_total = flags.size(0);
-  TORCH_CHECK(flags.dtype() == at::kBool, "flags must be bool");
-
-  std::vector<at::Tensor> real_inputs;
-  std::vector<size_t> real_positions;
-  for (size_t i = 0; i < inputs.size(); i++) {
-    if (inputs[i].has_value()) {
-      auto &t = inputs[i].value();
-      TORCH_CHECK(t.dim() == 1, "all inputs must be 1D");
-      TORCH_CHECK(t.element_size() == 8,
-                  "all inputs must be 8-byte elements (int64/uint64)");
-      TORCH_CHECK(t.size(0) == num_total, "all inputs must match flags length");
-      real_inputs.push_back(t);
-      real_positions.push_back(i);
-    }
-  }
-  size_t num_real = real_inputs.size();
-
-  if (num_total == 0) {
-    auto empty_idx =
-        at::empty({0}, at::TensorOptions().dtype(at::kLong).device(device));
-    std::vector<c10::optional<at::Tensor>> full_out(inputs.size(),
-                                                    c10::nullopt);
-    for (size_t j = 0; j < num_real; j++) {
-      auto s = real_inputs[j].sizes().vec();
-      s[0] = 0;
-      full_out[real_positions[j]] = at::empty(s, real_inputs[j].options());
-    }
-    return {0, empty_idx, full_out};
-  }
-
-  auto num_selected =
-      at::empty({1}, at::TensorOptions().dtype(at::kLong).device(device));
-  auto out_indices = at::empty(
-      {num_total}, at::TensorOptions().dtype(at::kLong).device(device));
-  std::vector<at::Tensor> real_outputs;
-  real_outputs.reserve(num_real);
-  for (const auto &inp : real_inputs) {
-    real_outputs.push_back(at::empty_like(inp));
-  }
-
-  std::vector<int64_t const *> in_ptrs(num_real);
-  std::vector<int64_t *> out_ptrs(num_real);
-  for (size_t i = 0; i < num_real; i++) {
-    in_ptrs[i] = reinterpret_cast<int64_t const *>(real_inputs[i].data_ptr());
-    out_ptrs[i] = reinterpret_cast<int64_t *>(real_outputs[i].data_ptr());
-  }
-
-  auto *d_flags = flags.data_ptr<bool>();
-  auto *d_out_idx = out_indices.data_ptr<int64_t>();
-  auto *d_num_sel = num_selected.data_ptr<int64_t>();
-
-  switch (num_real) {
-  case 0:
-    select_index_async<int64_t, int64_t>(num_total, d_flags, d_out_idx,
-                                         d_num_sel, device, stream);
-    break;
-  case 1:
-    flagged_compact_cub<1>(num_total, d_flags, in_ptrs.data(), out_ptrs.data(),
-                           d_out_idx, d_num_sel, device, stream);
-    break;
-  case 2:
-    flagged_compact_cub<2>(num_total, d_flags, in_ptrs.data(), out_ptrs.data(),
-                           d_out_idx, d_num_sel, device, stream);
-    break;
-  case 3:
-    flagged_compact_cub<3>(num_total, d_flags, in_ptrs.data(), out_ptrs.data(),
-                           d_out_idx, d_num_sel, device, stream);
-    break;
-  case 4:
-    flagged_compact_cub<4>(num_total, d_flags, in_ptrs.data(), out_ptrs.data(),
-                           d_out_idx, d_num_sel, device, stream);
-    break;
-  case 5:
-    flagged_compact_cub<5>(num_total, d_flags, in_ptrs.data(), out_ptrs.data(),
-                           d_out_idx, d_num_sel, device, stream);
-    break;
-  case 6:
-    flagged_compact_cub<6>(num_total, d_flags, in_ptrs.data(), out_ptrs.data(),
-                           d_out_idx, d_num_sel, device, stream);
-    break;
-  default:
-    TORCH_CHECK(false,
-                "flagged_compact supports at most 6 non-None input tensors");
-  }
-
-  int64_t h_count = num_selected.cpu().item<int64_t>();
-  auto sliced_indices = out_indices.slice(0, 0, h_count);
-
-  std::vector<c10::optional<at::Tensor>> full_outputs(inputs.size(),
-                                                      c10::nullopt);
-  for (size_t j = 0; j < num_real; j++) {
-    full_outputs[real_positions[j]] = real_outputs[j].slice(0, 0, h_count);
-  }
-
-  return {h_count, sliced_indices, full_outputs};
-}
-
-// flagged_compact over capacity-N arrays whose live length is a device count:
-// only the entries i < n, n = clamp(*num_valid, 0, N) (None: N), are
-// candidates, and nothing is read back (flagged_compact ends in a blocking
-// .cpu().item() of the count; the temporary storage here is an at::empty, which
-// does not wait). Returns (count[1] int64 on the device, positions[N], outs[N]
-// aligned with `inputs`, None staying None); entries from count on are
-// undefined.
+// Compaction of capacity-N arrays whose live length is a device count: the
+// entries of `inputs` where `flags` is set, over the entries i < n only,
+// n = clamp(*num_valid, 0, N) (None: N). Nothing is read back (the temporary
+// storage is an at::empty, which does not wait). Returns (count[1] int64 on
+// the device, positions[N], outs[N] aligned with `inputs`, None staying None);
+// entries from count on are undefined.
 std::tuple<at::Tensor, at::Tensor, std::vector<c10::optional<at::Tensor>>>
-flagged_compact_counted(at::Tensor flags,
-                        std::vector<c10::optional<at::Tensor>> inputs,
-                        c10::optional<at::Tensor> num_valid) {
+flagged_compact(at::Tensor flags, std::vector<c10::optional<at::Tensor>> inputs,
+                c10::optional<at::Tensor> num_valid) {
 
   TORCH_CHECK(flags.is_cuda(), "flags must be on CUDA");
   TORCH_CHECK(flags.dtype() == at::kBool, "flags must be bool");
@@ -283,8 +177,8 @@ flagged_compact_counted(at::Tensor flags,
     }
   }
   size_t num_real = real_inputs.size();
-  TORCH_CHECK(num_real <= 6, "flagged_compact_counted supports at most 6 "
-                             "non-None input tensors");
+  TORCH_CHECK(num_real <= 6,
+              "flagged_compact supports at most 6 non-None input tensors");
 
   const auto i64 = at::TensorOptions().dtype(at::kLong).device(device);
   std::vector<c10::optional<at::Tensor>> full_outputs(inputs.size(),
@@ -351,8 +245,8 @@ flagged_compact_counted(at::Tensor flags,
                            d_out_idx, d_num_sel, device, stream);
     break;
   default:
-    TORCH_CHECK(false, "flagged_compact_counted supports at most 6 non-None "
-                       "input tensors");
+    TORCH_CHECK(false,
+                "flagged_compact supports at most 6 non-None input tensors");
   }
   DEMB_CUDA_KERNEL_LAUNCH_CHECK();
 
@@ -372,17 +266,12 @@ void bind_index_calculation_op(py::module &m) {
         py::arg("offsets"), py::arg("feature_offsets"));
 
   m.def("flagged_compact", &dyn_emb::flagged_compact,
-        "CUB stream compaction with zipped iterators. "
-        "Accepts Optional[Tensor] in inputs; None passes through. "
-        "Returns (count, indices[count], [opt_tensors[count]...]).",
-        py::arg("flags"), py::arg("inputs"));
-
-  m.def("flagged_compact_counted", &dyn_emb::flagged_compact_counted,
-        "flagged_compact with a device count and no host read. Only entries "
-        "i < n (n = clamp(*num_valid, 0, len(flags)); None: len(flags)) are "
-        "candidates. Accepts Optional[Tensor] in inputs; None passes through. "
-        "Returns (count[1] int64 on device, positions[len(flags)], "
-        "[opt_tensors[len(flags)]...]); entries from count on are undefined.",
+        "CUB stream compaction with zipped iterators, with a device count and "
+        "no host read. Only entries i < n (n = clamp(*num_valid, 0, "
+        "len(flags)); None: len(flags)) are candidates. Accepts "
+        "Optional[Tensor] in inputs; None passes through. Returns (count[1] "
+        "int64 on device, positions[len(flags)], [opt_tensors[len(flags)]...]); "
+        "entries from count on are undefined.",
         py::arg("flags"), py::arg("inputs"), py::arg("num_valid"));
 
   m.def("segmented_sum_cuda", &dyn_emb::segmented_sum_cuda,

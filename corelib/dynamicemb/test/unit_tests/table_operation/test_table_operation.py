@@ -629,7 +629,7 @@ def test_table_evict(
             == num_inserted + num_inserted_by_eviction + num_insert_failed + num_illegal
         )
         assert num_existed == num_inserted + num_inserted_by_eviction
-        assert num_evicted == num_inserted_by_eviction + num_insert_failed
+        assert int(num_evicted) == num_inserted_by_eviction + num_insert_failed
 
         assert torch.equal(indices[founds], indices_lookup[founds])
 
@@ -1002,9 +1002,9 @@ def test_overflow_with_counter(key_type, table_config):
     )
 
     has_evict = (evict_results == InsertResult.EVICT.value).any().item()
-    print(f"Phase 6: evictions={num_evicted}, " f"has_evict_result={has_evict}")
+    print(f"Phase 6: evictions={int(num_evicted)}, " f"has_evict_result={has_evict}")
     assert (
-        num_evicted > 0 or has_evict
+        int(num_evicted) > 0 or has_evict
     ), "With counters at 0 and higher scores, some eviction should occur"
 
     print("Phase 6 passed: counter release and eviction verified")

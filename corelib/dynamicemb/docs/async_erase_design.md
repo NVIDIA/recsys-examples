@@ -209,18 +209,18 @@ mechanism predicts.
 
 None of the older `dynamicemb_extensions` bindings releases the GIL. A binding that only
 **launches** holds it for microseconds. A binding that **waits for the GPU inside C++**
-(`flagged_compact`, `index_calculation.cu`: `num_selected.cpu().item<int64_t>()`) would
-hold it for as long as the stream's queued work takes, and the training thread could not
-launch a kernel meanwhile. PyTorch's own ops (`.item()`, `.cpu()`, `Event.synchronize()`)
-release it themselves.
+(a count read back with `.cpu().item<int64_t>()`, as `flagged_compact` did before it kept
+its count on the device) would hold it for as long as the stream's queued work takes, and
+the training thread could not launch a kernel meanwhile. PyTorch's own ops (`.item()`,
+`.cpu()`, `Event.synchronize()`) release it themselves.
 
 Rules, kept by this work: every **new** binding the erase uses (`table_erase_by_score`)
 releases the GIL (`py::call_guard<py::gil_scoped_release>()`; they take only tensors and
 integers), and the worker calls only launch-only bindings and PyTorch ops. Existing
 bindings are not changed; the scan needs none of the blocking ones (counts come from
 device-side atomics, the worker waits with `Event.synchronize()`). A later change that
-makes the worker call a blocking binding (e.g. `flagged_compact` for `RETAIN_KEY`) must
-give it the same guard first.
+makes the worker call a blocking binding (e.g. one that reads a count back, for
+`RETAIN_KEY`) must give it the same guard first.
 
 The worker's Python between two chunks still needs the GIL. Measured per chunk with
 nothing else running: 14.6 µs of worker CPU (two `.item()` of a CPU tensor, 1.0 µs each;
@@ -328,16 +328,16 @@ the way a cached copy of any key storage has evicted does.
 
 Why that is safe (checked, not assumed):
 
-- **Scores live only in storage.** The cache ranks by timestamp, and prefetch
-  `_find_keys` every key in storage, hits included (step 2 of `_prefetch_cache_path`).
-  "Score below the threshold" is decided on storage.
+- **Scores live only in storage.** The cache ranks by timestamp, and prefetch looks
+  every key up in storage (`_lookup_keys`), hits included (step 2 of
+  `_prefetch_cache_path`). "Score below the threshold" is decided on storage.
 - **"In storage but not in cache" and "in cache but not in storage" are both already
-  legal states.** `_write_back_evicted` looks each key the cache evicts up in storage: one
-  still there only has its value updated (`preserve_existing=True`); one storage has since
-  evicted goes to `external_storage` if there is one, otherwise it is dropped, and
-  recorded as an evicted key when the storage retains evictions. A storage eviction
-  already produces that state without asking the cache; an erase is one more way to reach
-  it.
+  legal states.** `_write_back_evicted` looks each key the cache evicts up in storage
+  (a const lookup): one still there only has its value stored into the row the lookup
+  found, nothing is inserted; one storage has since evicted goes to `external_storage` if
+  there is one, otherwise it is dropped, and recorded as an evicted key when the storage
+  retains evictions. A storage eviction already produces that state without asking the
+  cache; an erase is one more way to reach it.
 - **The storage under a cache has no ref counter.** A cache-mode prefetch pins *cache*
   slots; the storage's counter was never touched, so it is no longer allocated. The erase
   kernel therefore takes the counter as an optional pointer: null (cache mode) skips the
@@ -379,8 +379,10 @@ What still needs exclusion with prefetch:
     later erase retries it.
   Residual, both benign: (a) `Const` finds (`const_lookup`, eval) read the score without a
   lock, so they can report a key that is being erased as found; `_write_back_evicted` uses
-  one, then `storage.insert(preserve_existing=True)`, so a key erased in that window can
-  come back with a default score. (b) The `HBM_DIRECT` find → `increment_counter` window
+  one and then stores the value into the row the lookup found, with no insert, so a key
+  erased in that window gets its value written into the row that stays with its
+  reclaimed slot and is not brought back (a later key that takes the slot writes the
+  whole row). (b) The `HBM_DIRECT` find → `increment_counter` window
   of §4.3 is still real, because the lock is released when the find returns, before the
   slot is pinned; the gate closes it. Not examined: the insert / insert-and-evict kernels'
   handling of a key that is erased under them.
