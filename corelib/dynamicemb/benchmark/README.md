@@ -808,6 +808,85 @@ Three rounds on four nodes, before and after in alternating order
   takes 26-31 ms in the rounds before and 27-37 ms after; on the rank that
   arrives last, 20.8-21.0 ms in every round of both).
 
+Multi-hot at many features. The same tables and loop as the many-features
+runs, with several keys per sample: 1 to 4 (uniform) at four of the large
+points and 1 to 32 at two, so that a GPU has 1.3 to 10.5 million keys per
+iteration (add `--output_dist torchrec` for TorchRec's):
+
+```bash
+$LAUNCH $BENCH $MANY --features_per_table 128 --local_batch_size 512  --max_seq_len 4  --output_dist hierarchical
+$LAUNCH $BENCH $MANY --features_per_table 512 --local_batch_size 128  --max_seq_len 4  --output_dist hierarchical
+$LAUNCH $BENCH $MANY --features_per_table 128 --local_batch_size 4096 --max_seq_len 4  --output_dist hierarchical
+$LAUNCH $BENCH $MANY --features_per_table 512 --local_batch_size 1024 --max_seq_len 4  --output_dist hierarchical
+$LAUNCH $BENCH $MANY --features_per_table 128 --local_batch_size 512  --max_seq_len 32 --output_dist hierarchical
+$LAUNCH $BENCH $MANY --features_per_table 512 --local_batch_size 128  --max_seq_len 32 --output_dist hierarchical
+```
+
+On Eos, after the input dist's fusions, medians of 2 rounds of
+alternating order on the same 4 nodes, in ms:
+
+| features × batch (keys per sample) | nodes | keys per GPU | TorchRec step | hier step | TorchRec input dist | hier input dist |
+|---|---|---|---|---|---|---|
+| 1024 × 512 (1-4) | 1 | 1.3M | 35.8 | 29.6 | 3.11 | 0.55 |
+| 1024 × 512 (1-4) | 2 | 1.3M | 48.2 | 34.7 | 6.02 | 1.11 |
+| 1024 × 512 (1-4) | 4 | 1.3M | 62.9 | 39.1 | 11.00 | 1.25 |
+| 4096 × 128 (1-4) | 1 | 1.3M | 128.1 | 104.5 | 6.32 | 0.82 |
+| 4096 × 128 (1-4) | 2 | 1.3M | 139.0 | 110.3 | 11.80 | 1.41 |
+| 4096 × 128 (1-4) | 4 | 1.3M | 167.1 | 118.1 | 23.18 | 1.55 |
+| 1024 × 4096 (1-4) | 1 | 10.5M | 111.9 | 56.6 | 11.45 | 2.61 |
+| 1024 × 4096 (1-4) | 2 | 10.5M | 205.3 | 78.9 | 24.46 | 5.56 |
+| 1024 × 4096 (1-4) | 4 | 10.5M | 306.3 | 91.6 | 51.65 | 6.53 |
+| 4096 × 1024 (1-4) | 1 | 10.5M | 204.4 | 137.5 | 15.29 | 2.86 |
+| 4096 × 1024 (1-4) | 2 | 10.5M | 295.9 | 159.7 | 30.41 | 5.97 |
+| 4096 × 1024 (1-4) | 4 | 10.5M | 397.0 | 175.5 | 62.86 | 6.87 |
+| 1024 × 512 (1-32) | 1 | 8.7M | 84.4 | 51.0 | 5.00 | 2.17 |
+| 1024 × 512 (1-32) | 2 | 8.7M | 146.8 | 73.7 | 8.54 | 4.59 |
+| 1024 × 512 (1-32) | 4 | 8.7M | 197.7 | 86.2 | 14.34 | 5.35 |
+| 4096 × 128 (1-32) | 1 | 8.7M | 176.5 | 134.1 | 7.91 | 2.40 |
+| 4096 × 128 (1-32) | 2 | 8.7M | 237.8 | 157.2 | 13.97 | 5.09 |
+| 4096 × 128 (1-32) | 4 | 8.7M | 298.3 | 172.7 | 27.36 | 5.84 |
+
+The hierarchical dist's step, part by part: the input dist
+(`in_seg_ms_mean`), the output dist's kernels as the rank that arrives
+last runs them (as above), and from its first round's profiled iterations
+the lookup's forward and backward kernels and the model's own kernels
+(GPU time per iteration, mean over the ranks); the rest is the step's
+other time, mostly the benchmark model's host work. In ms:
+
+| features × batch (keys per sample) | nodes | step | input dist | lookup fwd | output dist fwd | output dist bwd | lookup bwd | model kernels | rest |
+|---|---|---|---|---|---|---|---|---|---|
+| 1024 × 512 (1-4) | 1 | 29.6 | 0.55 | 1.24 | 1.74 | 1.67 | 1.23 | 8.81 | 14.3 |
+| 1024 × 512 (1-4) | 2 | 34.7 | 1.11 | 1.19 | 5.98 | 6.11 | 1.10 | 8.93 | 10.3 |
+| 1024 × 512 (1-4) | 4 | 39.1 | 1.25 | 1.14 | 8.93 | 9.01 | 0.92 | 9.00 | 8.9 |
+| 4096 × 128 (1-4) | 1 | 104.5 | 0.82 | 1.24 | 1.74 | 1.88 | 1.23 | 48.80 | 48.8 |
+| 4096 × 128 (1-4) | 2 | 110.3 | 1.41 | 1.19 | 5.98 | 6.27 | 1.10 | 48.91 | 45.5 |
+| 4096 × 128 (1-4) | 4 | 118.1 | 1.55 | 1.14 | 8.93 | 9.20 | 0.92 | 48.85 | 47.5 |
+| 1024 × 4096 (1-4) | 1 | 56.6 | 2.61 | 6.02 | 11.92 | 11.41 | 5.22 | 11.60 | 7.8 |
+| 1024 × 4096 (1-4) | 2 | 78.9 | 5.56 | 3.87 | 19.76 | 26.36 | 3.24 | 11.47 | 8.7 |
+| 1024 × 4096 (1-4) | 4 | 91.6 | 6.53 | 2.83 | 29.47 | 30.65 | 2.17 | 11.49 | 8.5 |
+| 4096 × 1024 (1-4) | 1 | 137.5 | 2.86 | 6.01 | 11.92 | 11.56 | 5.22 | 36.57 | 63.3 |
+| 4096 × 1024 (1-4) | 2 | 159.7 | 5.97 | 3.88 | 19.76 | 25.92 | 3.24 | 36.82 | 64.1 |
+| 4096 × 1024 (1-4) | 4 | 175.5 | 6.87 | 2.83 | 29.47 | 30.78 | 2.17 | 37.02 | 66.4 |
+| 1024 × 512 (1-32) | 1 | 51.0 | 2.17 | 5.31 | 10.11 | 9.68 | 4.75 | 10.89 | 8.1 |
+| 1024 × 512 (1-32) | 2 | 73.7 | 4.59 | 3.60 | 18.85 | 24.27 | 3.02 | 10.92 | 8.5 |
+| 1024 × 512 (1-32) | 4 | 86.2 | 5.35 | 2.65 | 28.15 | 28.35 | 2.04 | 10.94 | 8.7 |
+| 4096 × 128 (1-32) | 1 | 134.1 | 2.40 | 5.31 | 10.13 | 9.79 | 4.75 | 36.54 | 65.2 |
+| 4096 × 128 (1-32) | 2 | 157.2 | 5.09 | 3.60 | 18.85 | 24.58 | 3.02 | 36.48 | 65.6 |
+| 4096 × 128 (1-32) | 4 | 172.7 | 5.84 | 2.65 | 28.15 | 28.43 | 2.04 | 36.42 | 69.2 |
+
+* The hierarchical dist's step is 17% to 70% shorter than TorchRec's, and
+  the gain grows with the nodes and with the keys per GPU: at 10.5 million
+  keys on 4 nodes, 91.6 against 306.3 ms at 1,024 features and 175.5
+  against 397.0 ms at 4,096. Its input dist is 2.3 to 15 times shorter.
+* The output dist's forward kernel takes the same time at the same keys
+  per GPU whatever the features (1,024 × 512 and 4,096 × 128; 1,024 ×
+  4,096 and 4,096 × 1,024), and its backward kernel within 3%, but on one
+  node at 1.3 million keys (1.67 and 1.88 ms).
+* On 2 nodes, at 8.7 and 10.5 million keys, the backward kernel takes
+  about 30% longer than the forward (on 4 nodes, 1% to 5%).
+* At 4,096 features the rest, the benchmark model's host work, is 45 to
+  69 ms of the step.
+
 #### Options
 
 | option | default | meaning |
