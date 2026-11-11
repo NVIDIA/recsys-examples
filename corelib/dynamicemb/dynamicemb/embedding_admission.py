@@ -107,8 +107,6 @@ class MultiTableKVCounter(Counter):
         *,
         num_valid: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """The accumulated count of each of the first ``num_valid`` keys (all of them
-        if None); the other entries of the result are not written."""
         self.score_arg_.value = frequencies
         scores_out = torch.empty(keys.numel(), dtype=torch.int64, device=keys.device)
         self.table_.insert(
@@ -290,10 +288,6 @@ class MultiTableFrequencyAdmitter(MultiTableAdmitter):
         *,
         num_valid: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """The mask of the keys that get in. It has the length of ``keys``; only the
-        first ``num_valid`` keys (all of them if None) are looked at, the other
-        entries of the mask are undefined, and nothing is read back from the device
-        (see :class:`dynamicemb.types.Storage`)."""
         if frequencies is None:
             frequencies = torch.ones(
                 keys.shape[0], dtype=torch.int64, device=keys.device
@@ -404,10 +398,8 @@ class MultiTableProbabilisticAdmitter(MultiTableAdmitter):
         *,
         num_valid: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        # The mask is computed for every entry of the arrays, whatever ``num_valid``
-        # says, and the caller reads the live ones: one draw per entry, that is per key
-        # of the batch's capacity and not per missing key, so the generator advances by
-        # that many on every call. The other entries of the mask are undefined.
+        # One draw per entry of the arrays, not per live key (see the Notes of
+        # ProbabilisticAdmissionStrategy).
         num_keys = keys.shape[0]
         if self._probability <= 0.0:
             return torch.zeros(num_keys, dtype=torch.bool, device=keys.device)

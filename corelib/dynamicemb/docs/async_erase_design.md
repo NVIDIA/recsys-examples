@@ -209,10 +209,9 @@ mechanism predicts.
 
 None of the older `dynamicemb_extensions` bindings releases the GIL. A binding that only
 **launches** holds it for microseconds. A binding that **waits for the GPU inside C++**
-(a count read back with `.cpu().item<int64_t>()`, as `flagged_compact` did before it kept
-its count on the device) would hold it for as long as the stream's queued work takes, and
-the training thread could not launch a kernel meanwhile. PyTorch's own ops (`.item()`,
-`.cpu()`, `Event.synchronize()`) release it themselves.
+(a count read back with `.cpu().item<int64_t>()`, say) would hold it for as long as the
+stream's queued work takes, and the training thread could not launch a kernel meanwhile.
+PyTorch's own ops (`.item()`, `.cpu()`, `Event.synchronize()`) release it themselves.
 
 Rules, kept by this work: every **new** binding the erase uses (`table_erase_by_score`)
 releases the GIL (`py::call_guard<py::gil_scoped_release>()`; they take only tensors and

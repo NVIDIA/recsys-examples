@@ -17,6 +17,7 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 
 #pragma once
 
+#include "counted_limit.cuh"
 #include "jit/evict_comparators.cuh"
 #include "types.cuh"
 #include <cub/cub.cuh>
@@ -79,19 +80,6 @@ struct EvalAndCount {
   }
 };
 
-// How many leading entries of a per-key array of capacity `batch` are live: the
-// device count `*num_valid` clamped to [0, batch], or all `batch` when there is
-// no device count (null). Entries from that index on are undefined memory: a
-// kernel reads this once, loops to it, and neither reads nor writes an entry
-// past it.
-__device__ __forceinline__ int64_t
-table_live_count(int64_t const *__restrict__ num_valid, int64_t batch) {
-  if (num_valid == nullptr)
-    return batch;
-  int64_t n = *num_valid;
-  return n < 0 ? 0 : (n > batch ? batch : n);
-}
-
 template <typename Table, int ProbingGroupSize, ScorePolicyType PolicyType,
           bool EnableOverflow = false>
 __global__ void table_lookup_kernel(
@@ -108,7 +96,7 @@ __global__ void table_lookup_kernel(
   using Iter = typename Bucket::Iterator;
 
   auto tid = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-  const int64_t n = table_live_count(num_valid, batch);
+  const int64_t n = counted_limit(num_valid, batch);
 
   for (int64_t i = tid; i < n; i += gridDim.x * blockDim.x) {
 
@@ -365,7 +353,7 @@ insert(Bucket &bucket, KeyType key, ScoreType score,
 // (an existing key pushed out) is collected, never Busy. Default false keeps the
 // plain-insert path (drops the victim) byte-for-byte unchanged (if constexpr).
 // `num_valid` (null: all `batch`) is the device count of live leading entries;
-// see table_live_count.
+// see counted_ops.h.
 template <typename Table, typename KernelTraits,
           typename Evictor = DefaultEvictor, bool CollectEvicted = false>
 __device__ __forceinline__ void
@@ -398,7 +386,7 @@ insert_body(Table table, int64_t const *__restrict__ table_bucket_offsets,
   using Policy = ScorePolicy<PolicyType>;
 
   auto tid = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-  const int64_t n = table_live_count(num_valid, batch);
+  const int64_t n = counted_limit(num_valid, batch);
 
   __shared__ ScoreType sm_scores[BlockSize * BufferDim];
 
@@ -580,7 +568,7 @@ __device__ __forceinline__ void insert_and_evict_body(
   // general, so a launch that has one must use CompactTileSize == 1 (see the
   // dispatch in insert_and_evict.cu): the ballot below then spans one lane, and
   // the bound needs no rounding.
-  const int64_t n = table_live_count(num_valid, batch);
+  const int64_t n = counted_limit(num_valid, batch);
 
   __shared__ ScoreType sm_scores[BlockSize * BufferDim];
 
@@ -781,7 +769,7 @@ table_unlock_kernel(Table table, int64_t batch,
   using KeyType = typename Table::KeyType;
 
   auto tid = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-  const int64_t n = table_live_count(num_valid, batch);
+  const int64_t n = counted_limit(num_valid, batch);
 
   for (int64_t i = tid; i < n; i += gridDim.x * blockDim.x) {
     KeyType key = input_keys[i];
@@ -805,7 +793,7 @@ __global__ void table_erase_kernel(
   using Iter = typename Bucket::Iterator;
 
   auto tid = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-  const int64_t n = table_live_count(num_valid, batch);
+  const int64_t n = counted_limit(num_valid, batch);
 
   for (int64_t i = tid; i < n; i += gridDim.x * blockDim.x) {
 

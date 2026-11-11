@@ -35,7 +35,6 @@ import io
 import json
 import math
 import os
-import random
 import statistics
 import subprocess
 import sys
@@ -46,8 +45,6 @@ from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Sequence,
 
 if TYPE_CHECKING:
     import torch
-
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # dataset_generator
 
 Batch = List["torch.Tensor"]  # the keys of each collection
 # The StorageLayout the library must pick for each --storage choice.
@@ -181,14 +178,10 @@ def git_info(path: str) -> Dict[str, Any]:
 def run_meta(device: torch.device) -> Dict[str, Any]:
     """Where the numbers come from: tree commit, library and extension paths, versions, GPU."""
     import dynamicemb
+    import dynamicemb_extensions
     import torch
 
-    try:  # the compiled part of a tree: a mismatched pair would be a different library
-        import dynamicemb_extensions
-
-        extension = os.path.abspath(dynamicemb_extensions.__file__)
-    except ImportError:
-        extension = None
+    extension = os.path.abspath(dynamicemb_extensions.__file__)
     package = os.path.dirname(os.path.abspath(dynamicemb.__file__))
     here = os.path.dirname(os.path.abspath(__file__))
     return {
@@ -233,10 +226,9 @@ def build_inputs(cfg: Config, device: torch.device) -> Tuple[torch.Tensor, List[
     Every input draws its keys from the pow-law helper of dataset_generator.py over
     ``R = num_embeddings // inputs`` rows and shifts them by ``s * R``: the same
     distribution in its own slice ``[s * R + 1, (s + 1) * R]`` of the rows, so no two
-    inputs share a key.  Taken in turn, a step does not find in a cache the keys of the
-    previous step, and finds those of its own earlier use as far as the cache holds them.
-    Bags are feature-major as in a KeyedJaggedTensor: bag ``table * B + sample`` owns
-    keys ``[bag * H, (bag + 1) * H)`` of every collection's index tensor.
+    inputs share a key.  Bags are feature-major as in a KeyedJaggedTensor: bag
+    ``table * B + sample`` owns keys ``[bag * H, (bag + 1) * H)`` of every
+    collection's index tensor.
     """
     import torch
     from dataset_generator import PowerLaw
@@ -289,10 +281,9 @@ def cache_ratio(cfg: Config, inputs: List[Batch]) -> float:
     """The ``--hbm-ratio`` that gives a caching layout its default cache: the smallest
     one that holds the unique keys of any input in any table of collection 0.
 
-    A cache holds a multiple of ``CACHE_BUCKET`` rows, and at the defaults (about 2.1K
-    unique keys per table and input) that is 3072: one input and about 45% of the
-    other, so a step misses on the rest.  The library raises when the unique keys of a
-    step do not fit its cache, so a size taken from the inputs works at any batch size.
+    A cache holds a multiple of ``CACHE_BUCKET`` rows.  The library raises when the
+    unique keys of a step do not fit its cache, so a size taken from the inputs works
+    at any batch size.
     """
     import torch
 
@@ -377,14 +368,7 @@ class Workload:
         self._nvtx, self._backward = torch.cuda.nvtx, torch.autograd.backward
 
     def step(self) -> List[torch.Tensor]:
-        """K lookups, then their K backwards with the fused sparse update; no sync.
-
-        The backward is part of the lookup. In the caching and HBM-only layouts a
-        training forward pins every key it reads with a reference count that only the
-        backward releases (a pinned key is never evicted); in every layout the backward
-        makes the fused update of the rows, and in a hybrid or host layout writes them
-        back.
-        """
+        """K lookups, then their K backwards with the fused sparse update; no sync."""
         nvtx = self._nvtx
         i = self.count
         self.count += 1
@@ -517,10 +501,9 @@ def cache_round(wl: Workload) -> Optional[List[Dict[str, int]]]:
     One step per input with the cache metrics of the library on: the unique keys looked
     up, how many were found, how many were inserted (the misses) and how many evictions
     that made (or keys that could not be placed), all over the tables of the
-    collection.  The metrics are zeroed before each step: a tree that skips the insert
-    of a step without a miss leaves the numbers of the step before in their slots.
-    Recording costs a wait for the device (main reads the counts back, the other tree
-    waits on an event when the metrics are read), so this runs after the timed windows.
+    collection.  The metrics are zeroed before each step, so a step that inserts
+    nothing reports 0, not the numbers of the step before.  Recording waits for the
+    device, so this runs after the timed windows.
     """
     import torch
 
@@ -716,7 +699,6 @@ def run_point(
             f"{free:.1f} GiB free: lower --collections, --num-embeddings or "
             "--hbm-ratio, or use --storage host"
         )
-    random.seed(cfg.seed)
     torch.manual_seed(cfg.seed)  # also seeds the CUDA generators
     wl = Workload(cfg, device, verbose)
     warmup = getattr(args, "warmup", 20 if args.sweep else 30)

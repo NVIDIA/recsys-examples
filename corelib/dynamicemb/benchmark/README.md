@@ -1215,11 +1215,11 @@ With `--sweep`, `--profile-steps` opens one capture window per point: use
   so its hit rate changes with the batch size.
 - A caching layout checks that the keys a step pins fit its cache. The check compares
   the number of keys of the step (B x H per table, a bound) with the capacity of the
-  cache, its rows plus an overflow area of 3072 per table. A tree that does not know
-  the number of unique keys on the host (the one of #545) reads it from the device in
-  that step only when the bound exceeds the capacity: at the defaults it never does
-  (`--sync-count` reads 0), but with a larger batch (B = 4096, say) every forward of a
-  collection makes one blocking read, and `--sync-count` shows it.
+  cache, its rows plus an overflow area of 3072 per table. The lookup reads the number
+  of unique keys from the device in that step only when the bound exceeds the
+  capacity: at the defaults it never does (`--sync-count` reads 0), but with a larger
+  batch (B = 4096, say) every forward of a collection makes one blocking read, and
+  `--sync-count` shows it.
 - Keep `--warmup` at least `--inputs`: the first pass over the inputs inserts the keys.
 - The profiler pass (`--sync-count`) runs after the timed windows and does not affect
   them. The sync counts are exact API call counts; the GPU-busy fraction is not

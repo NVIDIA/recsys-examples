@@ -239,10 +239,10 @@ class Storage(abc.ABC, Generic[OptionsT, OptimizerT]):
       as a Python int, also when ``num_valid`` is ``None``;
     * returns arrays that the counted ops of ``dynamicemb_extensions`` take
       (``flagged_compact``, ``counted_gather``, ``counted_scatter``,
-      ``counted_scatter_fill``, ``counted_count_true``), and they check what they get:
-      CUDA tensors on the device of its inputs, 1-D and contiguous (a 2-D one has
-      contiguous rows), with 8-byte elements for keys and scores, int64 for table ids
-      and indices, bool for flags;
+      ``counted_scatter_fill``), and they check what they get: CUDA tensors on the
+      device of its inputs, 1-D and contiguous (a 2-D one has contiguous rows), with
+      8-byte elements for keys and scores, int64 for table ids and indices, bool for
+      flags;
     * does not wait for the device: no ``.item()``, ``.cpu()`` or ``.tolist()`` of a
       device tensor, and no torch op whose output size depends on device data
       (``nonzero``, ``masked_select``, boolean-mask indexing, ``unique``). The counted
@@ -477,7 +477,7 @@ class Cache(abc.ABC):
     :class:`Storage` for them: per-key arrays of a capacity ``N`` and ``num_valid``,
     the number of live leading entries (``None``: all of them); results at the
     capacity of the input, counts as one-element int64 CUDA tensors; no wait for the
-    device.
+    device (recording the cache metrics is the exception, see ``cache_metrics``).
     """
 
     @abc.abstractmethod
@@ -568,7 +568,8 @@ class Cache(abc.ABC):
         """The numbers of the last lookup and the last insert, in a host tensor: the
         keys of the lookup, how many of them were found, the keys of the insert and
         how many it evicted. ``None`` while they are not recorded (see
-        :meth:`set_record_cache_metrics`). Reading it may wait for the device."""
+        :meth:`set_record_cache_metrics`). Recording them is what makes ``lookup``
+        and ``insert_and_evict`` read the device; this property does not."""
 
     @abc.abstractmethod
     def set_record_cache_metrics(self, record: bool) -> None:

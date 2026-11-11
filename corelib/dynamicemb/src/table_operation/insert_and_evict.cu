@@ -35,7 +35,7 @@ __global__ void update_counter_with_layout_kernel(
     int64_t overflow_bucket_capacity, int64_t num_tables,
     int64_t const *__restrict__ num_valid) {
   int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-  if (i >= table_live_count(num_valid, n))
+  if (i >= counted_limit(num_valid, n))
     return;
   int64_t slot = slot_indices[i];
   if (slot < 0)
@@ -206,9 +206,7 @@ void table_insert_and_evict_single_score(
                        num_buckets, bucket_capacity, num_scores);
 
     DISPATCH_SCORE_POLICY(policy_type, PolicyTypeV, [&] {
-      // A tile of 32 lanes ballots together, which needs them all to run the
-      // same iterations: a capacity that is a whole number of warps, and no
-      // device count (the live length it gives is not known here).
+      // A device count needs tile 1 (see insert_and_evict_body).
       if (num_total % 32 == 0 && num_valid_ptr == nullptr) {
         if (output_score) {
           launch_table_insert_and_evict_kernel<Table, PolicyTypeV, true, 32>(
@@ -333,9 +331,7 @@ static void table_insert_and_evict_with_counter_and_overflow_single_score(
                            ovf_num_buckets, ovf_bucket_capacity, num_scores);
 
     DISPATCH_SCORE_POLICY(policy_type, PolicyTypeV, [&] {
-      // A tile of 32 lanes ballots together, which needs them all to run the
-      // same iterations: a capacity that is a whole number of warps, and no
-      // device count (the live length it gives is not known here).
+      // A device count needs tile 1 (see insert_and_evict_body).
       if (num_total % 32 == 0 && num_valid_ptr == nullptr) {
         if (output_score) {
           launch_table_insert_and_evict_kernel<Table, PolicyTypeV, true, 32,
@@ -436,7 +432,7 @@ table_insert_and_evict(at::Tensor table_storage,
       torch::empty({num_total}, keys.options().dtype(torch::kLong));
 
   bool use_overflow = ovf_storage.has_value() && ovf_storage.value().defined();
-  auto num_valid_ptr = table_num_valid_pointer(num_valid);
+  auto num_valid_ptr = counted_num_valid_ptr(num_valid, keys.device());
 
   if (use_overflow) {
     TORCH_CHECK(counter.has_value(),
@@ -495,7 +491,7 @@ void table_update_counter_with_layout(
       counter_ptr, total_capacity, slot_indices_ptr, n, delta, table_ids_ptr,
       table_bucket_offsets_ptr, bucket_capacity, main_capacity,
       overflow_output_offsets_ptr, overflow_bucket_capacity, num_tables,
-      table_num_valid_pointer(num_valid));
+      counted_num_valid_ptr(num_valid, slot_indices.device()));
 
   DEMB_CUDA_KERNEL_LAUNCH_CHECK();
 }

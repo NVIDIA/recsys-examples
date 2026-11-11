@@ -16,11 +16,11 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 ******************************************************************************/
 
 #include "check.h"
+#include "counted_ops.h"
 #include "optimizer.h"
 #include "optimizer_kernel.cuh"
 #include "torch_utils.h"
 #include "utils.h"
-#include <algorithm>
 #include <cmath>
 #include <functional>
 #include <optional>
@@ -31,43 +31,6 @@ constexpr int MULTIPLIER = 4;
 constexpr int WARPSIZE = 32;
 constexpr int OPTIMIZER_BLOCKSIZE_VEC = 64;
 constexpr int OPTIMIZER_BLOCKSIZE = 1024;
-
-// The updates take an optional `num_valid`: a one-element int64 CUDA tensor with
-// the number of leading rows of the batch that are live.  Rows past it are
-// undefined -- indices and table ids there may be out of range -- and are never
-// read or written.  Without it every row is live, as before.  Returns the
-// counter's device pointer, or nullptr without one; `like` is the batch it
-// counts, which it has to share a device with.
-static const int64_t *row_counter_ptr(const std::optional<at::Tensor> &num_valid,
-                                      const at::Tensor &like) {
-  if (!num_valid.has_value()) {
-    return nullptr;
-  }
-  const at::Tensor &counter = num_valid.value();
-  TORCH_CHECK(counter.defined() && counter.is_cuda(),
-              "num_valid must be a CUDA tensor");
-  TORCH_CHECK(counter.scalar_type() == at::kLong,
-              "num_valid must be int64, got ", counter.scalar_type());
-  TORCH_CHECK(counter.numel() == 1,
-              "num_valid must hold exactly one element, got ", counter.numel());
-  TORCH_CHECK(counter.device() == like.device(),
-              "num_valid must be on the same device as the batch it counts");
-  return static_cast<const int64_t *>(counter.data_ptr());
-}
-
-// The grid of a block-per-row kernel when it runs counted.  The kernels are
-// grid-stride, so the grid can be capped without changing what they compute, and
-// an empty batch then costs a bounded number of idle blocks instead of one per
-// row of capacity.  Uncounted launches keep one block per row.
-static int counted_grid_size(int64_t rows, int block_size,
-                             const DeviceProp &device_prop) {
-  // The hardware keeps at most 32 blocks of a kernel resident on one SM.
-  const int blocks_per_sm = std::min(
-      32, std::max(1, device_prop.max_thread_per_sm / std::max(1, block_size)));
-  const int64_t max_grid = static_cast<int64_t>(device_prop.num_sms) *
-                           blocks_per_sm * MULTIPLIER;
-  return static_cast<int>(std::min<int64_t>(rows, max_grid));
-}
 
 template <typename GradType, typename WeightType, typename IndexType,
           typename OptimizerType>
@@ -106,7 +69,7 @@ void launch_update_kernel_for_flat_table(
         max_emb_dim > OPTIMIZER_BLOCKSIZE ? OPTIMIZER_BLOCKSIZE : max_emb_dim;
     int grid_size = ev_nums;
     if (num_valid != nullptr) {
-      grid_size = counted_grid_size(ev_nums, block_size, device_prop);
+      grid_size = counted_grid(ev_nums, block_size);
     }
 
     auto kernel = update_with_index_flat_table_kernel<GradType, WeightType,
@@ -131,7 +94,7 @@ void sgd_update_for_flat_table(at::Tensor grads, at::Tensor indices,
     return;
   TORCH_CHECK(grads.is_cuda(), "grads must be a CUDA tensor");
   TORCH_CHECK(indices.is_cuda(), "indices must be a CUDA tensor");
-  const int64_t *d_num_valid = row_counter_ptr(num_valid, grads);
+  const int64_t *d_num_valid = counted_num_valid_ptr(num_valid, grads.device());
 
   uint32_t max_emb_dim_u32 = static_cast<uint32_t>(max_emb_dim);
 
@@ -176,7 +139,7 @@ void adam_update_for_flat_table(at::Tensor grads, at::Tensor indices,
     return;
   TORCH_CHECK(grads.is_cuda(), "grads must be a CUDA tensor");
   TORCH_CHECK(indices.is_cuda(), "indices must be a CUDA tensor");
-  const int64_t *d_num_valid = row_counter_ptr(num_valid, grads);
+  const int64_t *d_num_valid = counted_num_valid_ptr(num_valid, grads.device());
 
   uint32_t max_emb_dim_u32 = static_cast<uint32_t>(max_emb_dim);
 
@@ -220,7 +183,7 @@ void adagrad_update_for_flat_table(at::Tensor grads, at::Tensor indices,
     return;
   TORCH_CHECK(grads.is_cuda(), "grads must be a CUDA tensor");
   TORCH_CHECK(indices.is_cuda(), "indices must be a CUDA tensor");
-  const int64_t *d_num_valid = row_counter_ptr(num_valid, grads);
+  const int64_t *d_num_valid = counted_num_valid_ptr(num_valid, grads.device());
 
   uint32_t max_emb_dim_u32 = static_cast<uint32_t>(max_emb_dim);
 
@@ -277,7 +240,7 @@ void rowwise_adagrad_for_flat_table(
     return;
   TORCH_CHECK(grads.is_cuda(), "grads must be a CUDA tensor");
   TORCH_CHECK(indices.is_cuda(), "indices must be a CUDA tensor");
-  const int64_t *d_num_valid = row_counter_ptr(num_valid, grads);
+  const int64_t *d_num_valid = counted_num_valid_ptr(num_valid, grads.device());
 
   uint32_t max_emb_dim_u32 = static_cast<uint32_t>(max_emb_dim);
 
@@ -344,7 +307,7 @@ void ftrl_update_for_flat_table(at::Tensor grads, at::Tensor indices,
   TORCH_CHECK(lr > 0.0f, "FTRL learning rate must be positive, got ", lr);
   TORCH_CHECK(group_lasso_reg >= 0.0f, "FTRL group_lasso_reg must be non-negative, got ",
               group_lasso_reg);
-  const int64_t *d_num_valid = row_counter_ptr(num_valid, grads);
+  const int64_t *d_num_valid = counted_num_valid_ptr(num_valid, grads.device());
 
   uint32_t max_emb_dim_u32 = static_cast<uint32_t>(max_emb_dim);
   const bool use_sqrt = ftrl_uses_sqrt(learning_rate_power);
@@ -416,7 +379,7 @@ void launch_update_kernel_for_padded_buffer(
         emb_dim > OPTIMIZER_BLOCKSIZE ? OPTIMIZER_BLOCKSIZE : emb_dim;
     int grid_size = num_rows;
     if (num_valid != nullptr) {
-      grid_size = counted_grid_size(num_rows, block_size, device_prop);
+      grid_size = counted_grid(num_rows, block_size);
     }
     update_padded_buffer_kernel<GradType, WeightType, OptimizerType>
         <<<grid_size, block_size, smem_size_f(block_size), stream>>>(
@@ -441,7 +404,7 @@ void sgd_update_for_padded_buffer(at::Tensor grads, at::Tensor values,
   TORCH_CHECK(table_ids.is_cuda(), "table_ids must be a CUDA tensor");
   TORCH_CHECK(table_emb_dims.is_cuda(),
               "table_emb_dims must be a CUDA tensor");
-  const int64_t *d_num_valid = row_counter_ptr(num_valid, grads);
+  const int64_t *d_num_valid = counted_num_valid_ptr(num_valid, grads.device());
   uint32_t emb_dim_u32 = static_cast<uint32_t>(emb_dim);
   uint32_t value_stride = static_cast<uint32_t>(value_dim);
   auto grad_type = get_data_type(grads);
@@ -477,7 +440,7 @@ void adam_update_for_padded_buffer(at::Tensor grads, at::Tensor values,
   TORCH_CHECK(table_ids.is_cuda(), "table_ids must be a CUDA tensor");
   TORCH_CHECK(table_emb_dims.is_cuda(),
               "table_emb_dims must be a CUDA tensor");
-  const int64_t *d_num_valid = row_counter_ptr(num_valid, grads);
+  const int64_t *d_num_valid = counted_num_valid_ptr(num_valid, grads.device());
   uint32_t emb_dim_u32 = static_cast<uint32_t>(emb_dim);
   uint32_t value_stride = static_cast<uint32_t>(value_dim);
   auto grad_type = get_data_type(grads);
@@ -511,7 +474,7 @@ void adagrad_update_for_padded_buffer(
   TORCH_CHECK(table_ids.is_cuda(), "table_ids must be a CUDA tensor");
   TORCH_CHECK(table_emb_dims.is_cuda(),
               "table_emb_dims must be a CUDA tensor");
-  const int64_t *d_num_valid = row_counter_ptr(num_valid, grads);
+  const int64_t *d_num_valid = counted_num_valid_ptr(num_valid, grads.device());
   uint32_t emb_dim_u32 = static_cast<uint32_t>(emb_dim);
   uint32_t value_stride = static_cast<uint32_t>(value_dim);
   auto grad_type = get_data_type(grads);
@@ -544,7 +507,7 @@ void rowwise_adagrad_for_padded_buffer(
   TORCH_CHECK(table_ids.is_cuda(), "table_ids must be a CUDA tensor");
   TORCH_CHECK(table_emb_dims.is_cuda(),
               "table_emb_dims must be a CUDA tensor");
-  const int64_t *d_num_valid = row_counter_ptr(num_valid, grads);
+  const int64_t *d_num_valid = counted_num_valid_ptr(num_valid, grads.device());
   uint32_t emb_dim_u32 = static_cast<uint32_t>(emb_dim);
   uint32_t value_stride = static_cast<uint32_t>(value_dim);
   auto grad_type = get_data_type(grads);
@@ -589,7 +552,7 @@ void ftrl_update_for_padded_buffer(at::Tensor grads, at::Tensor values,
   TORCH_CHECK(lr > 0.0f, "FTRL learning rate must be positive, got ", lr);
   TORCH_CHECK(group_lasso_reg >= 0.0f, "FTRL group_lasso_reg must be non-negative, got ",
               group_lasso_reg);
-  const int64_t *d_num_valid = row_counter_ptr(num_valid, grads);
+  const int64_t *d_num_valid = counted_num_valid_ptr(num_valid, grads.device());
   uint32_t emb_dim_u32 = static_cast<uint32_t>(emb_dim);
   uint32_t value_stride = static_cast<uint32_t>(value_dim);
   const bool use_sqrt = ftrl_uses_sqrt(learning_rate_power);
@@ -619,7 +582,7 @@ void ftrl_update_for_padded_buffer(at::Tensor grads, at::Tensor values,
 
 // PYTHON WRAP
 // Every update takes a trailing `num_valid` (default None: all rows are live);
-// see row_counter_ptr.
+// see counted_ops.h.
 void bind_optimizer_kernel_op(py::module &m) {
   m.def("sgd_update_for_flat_table", &dyn_emb::sgd_update_for_flat_table,
         "SGD optimizer for multi-table buffer via table_ptrs", py::arg("grads"),

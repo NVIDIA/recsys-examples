@@ -18,10 +18,10 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 #pragma once
 
 #include "../check.h"
+#include "counted_ops.h"
 #include "torch_utils.h"
 #include "types.cuh"
 
-#include <algorithm>
 #include <iostream>
 #include <optional>
 #include <tuple>
@@ -70,44 +70,17 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 
 namespace dyn_emb {
 
-// Optional device count of the live leading entries of the per-key arrays
-// (`num_valid` of the ops below): a one-element int64 CUDA tensor (any view
-// with numel() == 1). Without it every entry is live. Entries from the count on
-// are undefined memory that no kernel reads or writes. Returns the device
-// pointer the kernels read, or nullptr when there is none.
-inline int64_t const *
-table_num_valid_pointer(const std::optional<at::Tensor> &num_valid) {
-  if (!num_valid.has_value() || !num_valid.value().defined())
-    return nullptr;
-  const at::Tensor &t = num_valid.value();
-  TORCH_CHECK(t.is_cuda() && t.scalar_type() == at::kLong && t.numel() == 1,
-              "num_valid must be a one-element int64 CUDA tensor");
-  TORCH_CHECK(t.get_device() == at::cuda::getCurrentCUDAStream().device_index(),
-              "num_valid must be on the current CUDA device");
-  return t.data_ptr<int64_t>();
-}
-
 // Number of blocks for a grid-stride launch over the `num_total` entries of a
-// per-key array. Without a device count the grid covers every entry, as ever.
-// With one (`counted`) the live length is not known on the host: cap the grid
-// the way the vec4 kernels do (num_sms * max_threads_per_sm / block_size * 4),
-// so that a short or empty batch costs one cheap launch, not a block per
-// capacity entry.
+// per-key array: one thread per entry, capped by counted_grid when `counted`
+// (the live length is a device count the host does not know).
 inline int64_t table_grid_size(int64_t num_total, int block_size,
                                bool counted) {
-  int64_t grid = (num_total + block_size - 1) / block_size;
-  if (counted) {
-    const cudaDeviceProp *prop = at::cuda::getCurrentDeviceProperties();
-    const int64_t max_grid =
-        static_cast<int64_t>(prop->multiProcessorCount) *
-        (prop->maxThreadsPerMultiProcessor / block_size) * 4;
-    grid = std::min<int64_t>(grid, max_grid);
-  }
-  return grid;
+  const int64_t grid = (num_total + block_size - 1) / block_size;
+  return counted ? counted_grid(grid, block_size) : grid;
 }
 
 // `num_valid` (last, optional, on every op below that has it): see
-// table_num_valid_pointer. Per-key outputs at or past it are left untouched.
+// counted_ops.h. Per-key outputs at or past it are undefined.
 
 std::tuple<at::Tensor, at::Tensor, at::Tensor>
 table_lookup(at::Tensor table_storage, at::Tensor table_bucket_offsets,

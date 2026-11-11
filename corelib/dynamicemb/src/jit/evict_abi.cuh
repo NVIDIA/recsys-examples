@@ -53,9 +53,8 @@ struct EvictParams {
   const int64_t *table_bucket_offsets;
   int *bucket_sizes;
   int64_t batch;
-  // Device count of the live leading entries of the per-key arrays (nullable):
-  // the kernels clamp *num_valid to [0, batch] and neither read nor write an
-  // entry past it. Null means all `batch` entries are live.
+  // Device count of the live leading entries of the per-key arrays (nullable;
+  // null: all `batch`); see counted_ops.h.
   const int64_t *num_valid;
   const int64_t *input_keys;
   const int64_t *table_ids;
