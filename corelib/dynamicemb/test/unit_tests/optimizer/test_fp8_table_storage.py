@@ -25,7 +25,12 @@ move the weights instead of being rounded away.
 import pytest
 import torch
 from dynamicemb.optimizer import OptimizerArgs, RowWiseAdaGradDynamicEmbeddingOptimizer
-from dynamicemb.utils import FP8_STORAGE_DTYPE, decode_table_values, encode_table_values
+from dynamicemb.utils import (
+    FP8_STORAGE_DTYPE,
+    decode_table_values,
+    encode_table_values,
+    gradient_dtype,
+)
 
 cuda = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA device")
 
@@ -160,6 +165,17 @@ def test_fp8_steps_below_half_an_fp8_step_still_accumulate():
     drift = (weights - init.cuda()).mean().item()
     assert ref_drift < -0.02
     assert abs(drift - ref_drift) < 0.05 * abs(ref_drift)
+
+
+def test_fp8_table_takes_fp32_gradients():
+    # fp8 cannot hold a gradient and fp16 flushes the small ones, so an fp8 table
+    # takes fp32 whatever the gradient is; every other table takes the gradient
+    # as it is, because converting it can only lose precision or gain none.
+    grad_dtypes = (torch.float32, torch.float16, torch.bfloat16)
+    for grad_dtype in grad_dtypes:
+        assert gradient_dtype(FP8_STORAGE_DTYPE, grad_dtype) == torch.float32
+        for table_dtype in (torch.float32, torch.float16, torch.bfloat16):
+            assert gradient_dtype(table_dtype, grad_dtype) == grad_dtype
 
 
 @cuda
