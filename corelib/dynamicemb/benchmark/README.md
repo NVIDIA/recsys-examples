@@ -575,7 +575,8 @@ dedup, an `index_select` by the reverse indices, stays). That split is host
 work that grows with the features, the same for every dist (about 4 ms at
 1,024 features on GB300), and its backward is a cat of the features'
 gradients. So the step holds no work per feature outside the dists, and the
-gradient goes to the rows in one autograd edge. It runs a plain training
+gradient goes to the rows in one autograd edge. Python's garbage collector is off in the
+timed iterations (`--timed_gc`). It runs a plain training
 loop (the forward, then `backward()` on that zero, each timed on its own) or
 one of TorchRec's train pipelines, with one of these ways to move keys and
 rows between GPUs (`--output_dist`):
@@ -857,6 +858,7 @@ kernels within about 1%.
 | `--nic_counters` | off | read every InfiniBand port's counters on each host before and after the timed iterations, and report what each sent and received |
 | `--nvtx` | off | for Nsight Systems: NVTX ranges of each timed iteration (`iteration i`, with its `forward` and `backward`) and of the stages (`bench::input_dist` and the like), in every iteration; and the timed iterations between `cudaProfilerStart` and `cudaProfilerStop`, so that `nsys profile -c cudaProfilerApi --capture-range-end=stop` captures them alone; the ranks meet in a barrier after `cudaProfilerStart`, so a rank whose capture takes seconds to start does not hold up the others' first timed iteration. To read a run's numbers in a capture, capture that run: the same options (`--num_iterations` and `--warmup` above all, since a shorter window can miss what a longer one holds) plus `--nvtx`, and compare the capture's step with the run's |
 | `--nvtx_ops` | off | with `--nvtx`, also an NVTX range per PyTorch op of the timed iterations (`torch.autograd.profiler.emit_nvtx`), the backward's autograd nodes included; their host time, on every rank, is then in the timings, so a capture with it is for reading ops, not for timing |
+| `--timed_gc` | `off` | Python's cyclic garbage collector in the timed iterations: `off` (one collection after the warmup, before the ranks meet in a barrier, then off until the timed iterations end; `timeit` only turns it off) or `on`. A full collection takes about 100 ms on the benchmark's heap and falls at the same call on every rank with the same history; with TorchRec's per-feature output at 1,024 features it fell inside the timed iterations on GB300, and the ranks' collective kernels waited for the rank that paused |
 | `--json_out` | none | append the results as one JSON line to this file |
 
 #### Metrics

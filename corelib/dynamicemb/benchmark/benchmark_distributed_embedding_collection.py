@@ -155,6 +155,7 @@ class BenchConfig:
     nic_counters: bool = False
     nvtx: bool = False
     nvtx_ops: bool = False
+    timed_gc: str = "off"  # Python's garbage collector in the timed iterations
     seed: int = 1234
     json_out: Optional[str] = None
 
@@ -1951,6 +1952,14 @@ def run(cfg: BenchConfig) -> Dict:
     train(batches[1 : cfg.warmup])
     torch.cuda.synchronize()
     used["warmup"] = device_used()
+    # Python's cyclic garbage collector, off in the timed iterations unless
+    # --timed_gc on: a full collection takes about 100 ms on this process's
+    # heap and falls at the same call on every rank with the same history, and
+    # the ranks' collective kernels wait for a rank that pauses. One collection
+    # first, before the barrier, so the ranks start the timed iterations
+    # together however long theirs took.
+    if cfg.timed_gc == "off":
+        gc.collect()
     dist.barrier()
 
     # Tracing: the clocks of all ranks against rank 0's, before and after the
@@ -1967,13 +1976,22 @@ def run(cfg: BenchConfig) -> Dict:
     if host is not None:
         host.install()
     iter_ms = None
-    with _timed_capture(cfg):
-        t0 = time.perf_counter()
-        if pipeline is None:
-            fwd_ms, bwd_ms = time_iterations(model, timed)
-        else:
-            iter_ms = time_pipeline(pipeline, fed, len(timed))
-        wall_ms = (time.perf_counter() - t0) * 1000.0 / len(timed)
+    # the collector off until the timed iterations end (collected above), then
+    # as it was
+    gc_was_enabled = gc.isenabled()
+    if cfg.timed_gc == "off":
+        gc.disable()
+    try:
+        with _timed_capture(cfg):
+            t0 = time.perf_counter()
+            if pipeline is None:
+                fwd_ms, bwd_ms = time_iterations(model, timed)
+            else:
+                iter_ms = time_pipeline(pipeline, fed, len(timed))
+            wall_ms = (time.perf_counter() - t0) * 1000.0 / len(timed)
+    finally:
+        if gc_was_enabled:
+            gc.enable()
     if host is not None:
         host.uninstall()
     nics = None
@@ -2703,6 +2721,13 @@ def parse_args(argv: List[str]) -> BenchConfig:
         action="store_true",
         help="with --nvtx, also an NVTX range per PyTorch op in the timed "
         "iterations (emit_nvtx), whose host time the timings then include",
+    )
+    parser.add_argument(
+        "--timed_gc",
+        choices=["off", "on"],
+        default=defaults.timed_gc,
+        help="Python's garbage collector in the timed iterations: off (collected "
+        "before them) or on",
     )
     parser.add_argument(
         "--check",
