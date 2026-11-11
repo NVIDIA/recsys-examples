@@ -1,6 +1,7 @@
 #!/bin/bash
-# Run the many-collections benchmark: K separate DynamicEmb collections next to a
-# tiny dense part, to measure what blocking host syncs inside DynamicEmb cost.
+# Run the many-collections benchmark: the lookup (forward and backward, nothing else) of
+# K separate DynamicEmb collections on a few inputs in turn, to measure what blocking
+# host syncs inside DynamicEmb cost.
 # Single GPU; no torchrun or process group needed.  Every flag is forwarded to
 # benchmark_many_collections.py (see benchmark/README.md, section 3).
 #
