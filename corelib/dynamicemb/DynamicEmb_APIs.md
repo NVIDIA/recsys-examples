@@ -25,6 +25,7 @@ This document consists of two parts, one is the introduction to the API, which c
 - [Counter](#counter)
 - [AdmissionStrategy and MultiTableAdmitter](#admissionstrategy-and-multitableadmitter)
 - [quiesce](#quiesce)
+- [node_size](#node_size)
 
 ## DynamicEmbParameterConstraints
 
@@ -1781,6 +1782,35 @@ Lets a model on the hierarchical dist (`output_dist="hierarchical"`, or `"auto"`
         """
     ```
 
+## node_size
+
+The GPUs of a node of the hierarchical dist (`output_dist="hierarchical"`, or `"auto"`) on the ranks of a process group: NCCL's LSA team there, which the dist reads when it builds a sharding's operator. Use it where you count with the dist's nodes, as `hier_needs` in `benchmark/benchmark_utils.py` does.
+
+    ```python
+    #How to import
+    from dynamicemb.shard import node_size
+
+    #API arguments
+    def node_size(pg: Optional[torch.distributed.ProcessGroup] = None) -> int:
+        """
+        The ranks of NCCL's LSA team on the ranks of ``pg`` (the default group if None):
+        those that reach each other's memory over NVLink. A host of 8 GPUs on H100
+        machines, with the ranks numbered host by host; on GB200 and GB300 NVL72, with
+        multi-node NVLink on, the job's GPUs of a rack when the job runs inside one rack.
+        Not ``LOCAL_WORLD_SIZE``, the GPUs of a host.
+
+        Collective: every rank of ``pg`` calls it, at the same point. It makes a short-lived
+        NCCL communicator of the group's ranks, as the dist makes its own, reads its LSA
+        team, ends it, and checks that the ranks read the same size and that it divides
+        them. The answer is kept per group of ranks. Raises RuntimeError, the same on every
+        rank, where a rank cannot read it (a build without the hierarchical dist, an NCCL
+        error) or the ranks disagree; but an NCCL error inside the communicator's
+        initialization on some ranks only leaves the other ranks waiting there, as with any
+        NCCL communicator. Warns, on every rank, when the team splits the GPUs of a host
+        between nodes (ranks not numbered host by host).
+        """
+    ```
+
 # Functionality and User interface
 
 ## Distributed embedding training and evaluation
@@ -1799,6 +1829,7 @@ Due to limited resources, the dynamic embedding table does not pre allocate memo
 - Use tables of `dist_type` `roundrobin` (the default) or `hash_roundrobin`. With a `continuous` table, `"hierarchical"` raises `ValueError` at the first `input_dist()`, and `"auto"` takes TorchRec's dists ([docs/hier_output_dist.md](./docs/hier_output_dist.md), section 6).
 - A call on the dist deduplicates the sharding's keys (index dedup), whatever the sharder's `use_index_dedup`; without that flag the sharding warns so once, at its first `input_dist()` ([docs/hier_output_dist.md](./docs/hier_output_dist.md), section 7.4). Tables that clip gradients need `use_index_dedup=True`: without it, `"hierarchical"` raises `ValueError` at the first `input_dist()`, and `"auto"` takes TorchRec's dists ([docs/hier_output_dist.md](./docs/hier_output_dist.md), section 6).
 - The dist carries no score per key. With tables that take one (`PRECISE_CUSTOMIZED`), `"hierarchical"` raises `ValueError` when the model is sharded, and `"auto"` takes TorchRec's dists ([docs/hier_output_dist.md](./docs/hier_output_dist.md), section 6).
+- A node of the dist is NCCL's LSA team, the GPUs that reach each other's memory over NVLink: a host of 8 GPUs on H100 machines, and on GB200 and GB300 NVL72 with multi-node NVLink the job's GPUs of a rack when the job runs inside one rack. The dist reads it at its first `input_dist()` ([node_size](#node_size) gives it too); `LOCAL_WORLD_SIZE`, the GPUs of a host, does not set it. Across racks it is what the NCCL you run gives: check it there ([docs/hier_output_dist.md](./docs/hier_output_dist.md), section 4.2).
 - Give the dist keys of one dtype (`int32` or `int64`) on every GPU of a node in a call, as TorchRec's dists need on every rank. Mixed dtypes are not detected: a GPU can then get a key's row from the key's owner in the other dtype, and send its gradient there ([docs/hier_output_dist.md](./docs/hier_output_dist.md), section 9).
 - Give every DynamicEmb table of a sharding the same `output_dist`, `output_dist_capacity` and `node_dedup`, and every rank the same options and environment variables ([docs/hier_output_dist.md](./docs/hier_output_dist.md), section 4.1).
 - Set `NCCL_CROSS_NIC=0` for multi-node jobs, before the first NCCL communicator is created, so that NCCL connects GIN on the rails alone.
@@ -1888,4 +1919,4 @@ The following environment variables control runtime behavior of dynamicemb:
 | `DYNAMICEMB_DEBUG` | unset | When set to any non-empty value, enables extra runtime validation in `segmented_unique_cuda`. Copies `segmented_range` to CPU and verifies: (1) `segmented_range[0] == 0`, (2) `segmented_range[num_tables] == num_keys`, (3) monotonically non-decreasing. Raises an error with a descriptive message on violation. Intended for development and testing only; incurs one device-to-host copy per call. |
 | `DYNAMICEMB_HIER_PROXY_MB` | `512` | Hierarchical dist (`output_dist="hierarchical"`): cap, in MiB, of the rows a GPU passes between its node and the other nodes (in both directions); a call whose rows do not fit moves them in laps of its ring. |
 | `DYNAMICEMB_HIER_TIMEOUT_S` | the process group's timeout | Hierarchical dist: how long a kernel waits for a peer before it prints what it waited for and traps. |
-| `DYNAMICEMB_HIER_OUT_CTAS`, `DYNAMICEMB_HIER_REDUCE_CTAS`, `DYNAMICEMB_HIER_PAYLOAD_KB`, `LOCAL_WORLD_SIZE` | – | Hierarchical dist: its CTA counts, the payload of a chunk across nodes, and the GPUs per node: [docs/hier_output_dist.md](./docs/hier_output_dist.md), section 4.4, which also gives the build option of its trace. |
+| `DYNAMICEMB_HIER_OUT_CTAS`, `DYNAMICEMB_HIER_REDUCE_CTAS`, `DYNAMICEMB_HIER_PAYLOAD_KB` | – | Hierarchical dist: its CTA counts and the payload of a chunk across nodes: [docs/hier_output_dist.md](./docs/hier_output_dist.md), section 4.4, which also gives the build option of its trace. Its node is NCCL's LSA team, which no variable of DynamicEmb's sets ([node_size](#node_size)). |

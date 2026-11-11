@@ -49,11 +49,13 @@ bool g_fail_alloc = false;
 // What a rank tells the others when they agree whether the op can run.
 enum Readiness : int { kReady = 0, kNoLsaTeam, kNoGin, kNoMemory };
 
-std::string why_not(int readiness, int local_size) {
+// Why a rank of readiness `readiness` cannot run, whose NCCL LSA team has
+// `lsa_size` ranks, in an op of nodes of `local_size` GPUs.
+std::string why_not(int readiness, int lsa_size, int local_size) {
   switch (readiness) {
     case kNoLsaTeam:
-      return c10::str("the NCCL LSA team (NVLink domain) does not hold all ", local_size,
-                      " ranks of its node");
+      return c10::str("its NCCL LSA team (NVLink domain) has ", lsa_size, " ranks, not the ",
+                      local_size, " of its node");
     case kNoGin:
       return "NCCL GIN does not connect the nodes' rails, gives fewer than 4 contexts, its "
              "connections are of different backends or of none the kernels are built for, or "
@@ -162,15 +164,30 @@ bool gin_signals_zero(const ncclDevComm &dev, int num_nodes, int counters) {
   return bad.item<int>() == 0;
 }
 
-// Every rank's readiness (`every`, in rank order) in words: those of the
-// ranks that cannot run, or "" when every rank can.
+// Every rank's readiness and LSA team size (`every`, in rank order, a pair
+// per rank) in words: those of the ranks that cannot run, or "" when every
+// rank can.
 std::string why_some_cannot_run(const std::vector<int> &every, int local_size) {
   std::string why;
-  for (int peer = 0; peer < (int)every.size(); ++peer)
-    if (every[peer] != kReady)
-      why +=
-          c10::str(why.empty() ? "" : "; ", "rank ", peer, ": ", why_not(every[peer], local_size));
+  for (int peer = 0; 2 * peer < (int)every.size(); ++peer)
+    if (every[2 * peer] != kReady)
+      why += c10::str(why.empty() ? "" : "; ", "rank ", peer, ": ",
+                      why_not(every[2 * peer], every[2 * peer + 1], local_size));
   return why;
+}
+
+// A new communicator of `world_size` ranks with the unique id `unique_id`
+// (Communicator::unique_id), this one `rank`, on the current device
+// (collective, as ncclCommInitRank).
+ncclComm_t init_comm(const std::string &unique_id, int world_size, int rank) {
+  TORCH_CHECK(unique_id.size() == sizeof(ncclUniqueId::internal),
+              "hier_output_dist: a unique id is ", sizeof(ncclUniqueId::internal), " bytes, got ",
+              unique_id.size());
+  ncclUniqueId id;
+  memcpy(id.internal, unique_id.data(), sizeof(id.internal));
+  ncclComm_t comm = nullptr;
+  HIER_NCCL_CHECK(ncclCommInitRank(&comm, world_size, id, rank));
+  return comm;
 }
 
 // `config` once it passed its checks (Config::validate throws).
@@ -228,10 +245,13 @@ HierOutputDist::HierOutputDist(const std::string &unique_id, int64_t rank, int64
     }
   }
   // Before the collective registration: a rank that cannot run must not
-  // leave the others waiting for it there.
+  // leave the others waiting for it there. Each rank's LSA team comes along,
+  // which the message of a rank whose team is not its node gives.
   std::string why;
   try {
-    why = why_some_cannot_run(communicator_->all_gather(readiness), sizes_.topo.local_size);
+    why = why_some_cannot_run(
+        communicator_->all_gather(std::vector<int>{readiness, communicator_->dev().lsaSize}),
+        sizes_.topo.local_size);
   } catch (...) {
     give_up(false);
     throw;
@@ -397,11 +417,29 @@ std::string Communicator::unique_id() {
   return std::string(id.internal, sizeof(id.internal));
 }
 
+// NCCL computes the LSA team once per communicator (computeLsaSize in
+// nccl/src/dev_runtime.cc, NCCL 2.30): the greatest common divisor of the
+// runs of consecutive ranks on one NCCL node (a host, or under multi-node
+// NVLink an NVLink clique) and of NCCL_LSA_TEAM_SIZE, if set; or every rank,
+// when all are in one NVLink domain of several cliques that
+// NCCL_MNNVL_CROSS_CLIQUE=1 lets share memory. ncclTeamLsa gives no team (0
+// ranks) when NCCL fails there.
+int64_t Communicator::lsa_team_size(const std::string &unique_id, int64_t rank,
+                                    int64_t world_size) {
+  ncclComm_t comm = init_comm(unique_id, (int)world_size, (int)rank);
+  const ncclTeam_t team = ncclTeamLsa(comm);
+  // Nothing ran on it: each rank ends it on its own, once it read the team.
+  ncclResult_t result = ncclCommFinalize(comm);
+  if (result == ncclSuccess) result = ncclCommDestroy(comm);
+  if (result != ncclSuccess) ncclCommAbort(comm);
+  TORCH_CHECK(team.nRanks >= 1 && team.nRanks <= world_size,
+              "hier_output_dist: NCCL gave no LSA team (", team.nRanks, " ranks) to rank ", rank,
+              " of ", world_size);
+  return team.nRanks;
+}
+
 Communicator::Communicator(const std::string &unique_id, const Topo &topo, int counters)
     : topo_(topo) {
-  TORCH_CHECK(unique_id.size() == sizeof(ncclUniqueId::internal),
-              "hier_output_dist: a unique id is ", sizeof(ncclUniqueId::internal), " bytes, got ",
-              unique_id.size());
   HIER_CUDA_CHECK(cudaGetDevice(&device_));
   CUdevice cu_device;
   HIER_CU_CHECK(cuDeviceGet(&cu_device, device_));
@@ -411,9 +449,7 @@ Communicator::Communicator(const std::string &unique_id, const Topo &topo, int c
   prop.location.id = cu_device;
   HIER_CU_CHECK(
       cuMemGetAllocationGranularity(&granularity_, &prop, CU_MEM_ALLOC_GRANULARITY_RECOMMENDED));
-  ncclUniqueId id;
-  memcpy(id.internal, unique_id.data(), sizeof(id.internal));
-  HIER_NCCL_CHECK(ncclCommInitRank(&comm_, topo.world_size, id, topo.rank));
+  comm_ = init_comm(unique_id, topo.world_size, topo.rank);
   try {
     ncclCommProperties_t props = NCCL_COMM_PROPERTIES_INITIALIZER;
     HIER_NCCL_CHECK(ncclCommQueryProperties(comm_, &props));
@@ -442,17 +478,20 @@ Communicator::Communicator(const std::string &unique_id, const Topo &topo, int c
 // On the current stream: the caching allocator may hand `gathered` a block
 // that kernels queued there still use, and only that stream's order puts the
 // gather after them.
-std::vector<int> Communicator::all_gather(int value) {
+std::vector<int> Communicator::all_gather(const std::vector<int> &values) {
   c10::cuda::CUDAGuard guard(device_);
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream(device_);
-  auto gathered = at::empty({topo_.world_size + 1},
-                            at::TensorOptions().device(at::kCUDA, device_).dtype(at::kInt));
-  int *mine = gathered.data_ptr<int>() + topo_.world_size;
-  HIER_CUDA_CHECK(cudaMemcpyAsync(mine, &value, sizeof(int), cudaMemcpyHostToDevice, stream));
-  HIER_NCCL_CHECK(ncclAllGather(mine, gathered.data_ptr<int>(), 1, ncclInt32, comm_, stream));
+  const int64_t count = (int64_t)values.size(), total = topo_.world_size * count;
+  auto gathered =
+      at::empty({total + count}, at::TensorOptions().device(at::kCUDA, device_).dtype(at::kInt));
+  int *mine = gathered.data_ptr<int>() + total;
+  HIER_CUDA_CHECK(
+      cudaMemcpyAsync(mine, values.data(), count * sizeof(int), cudaMemcpyHostToDevice, stream));
+  HIER_NCCL_CHECK(
+      ncclAllGather(mine, gathered.data_ptr<int>(), (size_t)count, ncclInt32, comm_, stream));
   HIER_CUDA_CHECK(cudaStreamSynchronize(stream));
-  auto host = gathered.narrow(0, 0, topo_.world_size).cpu();
-  return std::vector<int>(host.data_ptr<int>(), host.data_ptr<int>() + topo_.world_size);
+  auto host = gathered.narrow(0, 0, total).cpu();
+  return std::vector<int>(host.data_ptr<int>(), host.data_ptr<int>() + total);
 }
 
 void Communicator::finish() noexcept {

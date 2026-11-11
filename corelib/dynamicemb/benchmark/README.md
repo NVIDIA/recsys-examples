@@ -619,6 +619,18 @@ srun -N 4 --ntasks-per-node 8 python $BENCH $ARGS --output_dist hierarchical
   `SLURM_LOCALID`, and `LOCAL_WORLD_SIZE` from the tasks per node. Under a
   bare `srun`, `MASTER_ADDR` defaults to the step's first node and
   `MASTER_PORT` to 29500.
+* A node is the hierarchical dist's: NCCL's LSA team, which the script reads
+  once before it builds a model (`hier_node_size` in `benchmark_utils.py`,
+  through `dynamicemb.shard.node_size`). On Eos that is a machine's 8 GPUs;
+  with multi-node NVLink (GB200 and GB300 NVL72) it is the job's GPUs of
+  the rack when the job runs inside one rack, and across racks what NCCL
+  gives ([docs/hier_output_dist.md](../docs/hier_output_dist.md), section
+  4.2). Both dists' rows over NVLink and IB, the capacities and the trace's
+  node peers count by it. `LOCAL_WORLD_SIZE` stays the GPUs of a host:
+  TorchRec's planner and the NIC counters (`--nic_counters`) take it. The
+  JSON result gives both counts (`nodes`, `hosts`), and the printed header
+  gives `hosts` when they differ. A build without the hierarchical dist
+  takes a host for a node, and says so.
 * Export NCCL variables before `srun`: `--export=ALL,VAR=x` does not override
   a variable that is already exported. Give every side of a comparison the
   same NCCL settings.
@@ -834,7 +846,7 @@ kernels within about 1%.
 | `--trace_out` | none | with `--trace`: save every rank's traced kernels of the timed iterations to this `.npz` file, for offline analysis |
 | `--kernel_times` | off | After the timed iterations, as many again under a CUDA-only profiler. It reports every call's output-dist kernel times, with their wait at the start for the other ranks (the hierarchical dist only). |
 | `--host_stages` | off | Plain loop, to find problems. Per call: the CPU time spent waiting for the GPU, by place in the code. |
-| `--nic_counters` | off | read every InfiniBand port's counters on each node before and after the timed iterations, and report what each sent and received |
+| `--nic_counters` | off | read every InfiniBand port's counters on each host before and after the timed iterations, and report what each sent and received |
 | `--json_out` | none | append the results as one JSON line to this file |
 
 #### Metrics
@@ -863,7 +875,7 @@ and what it receives (rows × row bytes, from the dist's plan).
 | IB windows | `trace[dir]["ib_win_out"]`, `trace[dir]["ib_win_in"]` | `--trace`: the bytes sent, from the first put until all puts are done; and the bytes received, from the earlier of the first landing and the senders' first put until all rows have landed. |
 | first IB put | `trace[dir]["first_put"]` | `--trace`: µs from the kernel's start to its first IB put. |
 | TorchRec's IB basis | `ib_kernel_basis` (`pxn`) | Profiled iterations, `torchrec`: each NIC's bytes over the node's longest NCCL kernel (`net_ms`). They are counted as NCCL's PXN routing sends them: the NIC of a node on a rail sends that node's rows for the GPUs of that rail on the other nodes. |
-| NIC counters | `nic_bytes_per_iter` | `--nic_counters`: the bytes each InfiniBand port of each node sent and received per iteration, from the port counters. |
+| NIC counters | `nic_bytes_per_iter` | `--nic_counters`: the bytes each InfiniBand port of each host sent and received per iteration, from the port counters. |
 | node dedup ratio | `traffic_mean` | `hierarchical`: `rows_ib_out / rows_remote`, the rows owners put over IB over the rows asked of owners on other nodes, per iteration. |
 
 **NVLink.** On one node, NVLink use is that of the busiest port, which the

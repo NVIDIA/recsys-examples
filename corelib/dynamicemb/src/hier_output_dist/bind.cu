@@ -16,10 +16,11 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 ******************************************************************************/
 // The Python bindings of the op, which take and give tensors and plain
 // values only: dynamicemb_extensions.HierOutputDist (the op), and
-// hier_output_dist_unique_id, hier_output_dist_unsupported,
-// hier_output_dist_invalid and hier_output_dist_traced; the test-only ones
-// are in testing.cu. hier_output_dist_max_capacity, which every build needs,
-// is bound in src/dynamic_emb_op.cu.
+// hier_output_dist_unique_id, hier_output_dist_lsa_size,
+// hier_output_dist_unsupported, hier_output_dist_invalid and
+// hier_output_dist_traced; the test-only ones are in testing.cu.
+// hier_output_dist_max_capacity, which every build needs, is bound in
+// src/dynamic_emb_op.cu.
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 #include <torch/extension.h>
@@ -46,6 +47,12 @@ void bind_hier_output_dist(py::module &py_module) {
   py_module.def(
       "hier_output_dist_unique_id", []() { return py::bytes(Communicator::unique_id()); },
       "A new NCCL unique id for a hierarchical dist's communicator");
+  py_module.def("hier_output_dist_lsa_size", &Communicator::lsa_team_size, py::arg("unique_id"),
+                py::arg("rank"), py::arg("world_size"),
+                py::call_guard<py::gil_scoped_release>(),  // a collective NCCL init
+                "Collective: the ranks of the NCCL LSA team (NVLink domain) that a communicator "
+                "of world_size ranks gives this one rank, made as a hierarchical dist's "
+                "communicator is: a short-lived one, which each rank then ends on its own");
   py_module.def(
       "hier_output_dist_traced", []() { return kTrace; },
       "Whether the build keeps the hierarchical dist's trace (DYNAMICEMB_HIER_TRACE=1)");

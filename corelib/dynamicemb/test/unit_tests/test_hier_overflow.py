@@ -57,7 +57,7 @@ from dynamicemb.planner import (
     DynamicEmbeddingShardingPlanner,
     DynamicEmbParameterConstraints,
 )
-from dynamicemb.shard import DynamicEmbeddingCollectionSharder, quiesce
+from dynamicemb.shard import DynamicEmbeddingCollectionSharder, node_size, quiesce
 from dynamicemb.shard.embedding import ShardedDynamicEmbeddingCollection
 from fbgemm_gpu.split_embedding_configs import SparseType
 from torchrec.distributed.embedding_types import EmbeddingComputeKernel
@@ -99,7 +99,7 @@ class Case:
     # "plain": each call's forward, then its backward; "interleaved": two
     # calls' forwards, then their backwards in order
     order: str = "plain"
-    multi_node: bool = False  # across nodes only
+    multi_node: bool = False  # across nodes (NCCL's LSA teams: node_size) only
     expected: Tuple[int, ...] = field(init=False)  # the calls that raise
 
     def __post_init__(self) -> None:
@@ -561,9 +561,11 @@ def run_case(case: Case, checks: Checks, rank: int, world_size: int, local_size:
 
 
 def main() -> None:
+    # local_size: the GPUs of a host, which the planner takes; the dist's
+    # node is NCCL's LSA team (node_size, collective)
     rank, world_size, _, local_size = init_distributed()
     os.environ.setdefault("DYNAMICEMB_HIER_TIMEOUT_S", "120")
-    multi_node = world_size // local_size > 1
+    multi_node = world_size // node_size(dist.group.WORLD) > 1
     checks = Checks(rank)
     for case in CASES:
         if case.multi_node and not multi_node:

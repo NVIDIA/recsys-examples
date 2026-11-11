@@ -15,8 +15,10 @@
 """The hierarchical dist of a row-wise sequence sharding
 (``output_dist="hierarchical"``) on the C++ operator ``HierOutputDist``
 (``src/hier_output_dist``). Keys and rows move over NVLink inside a node and
-over the rails (NCCL GIN) between nodes, with one host sync per call. Design:
-docs/hier_output_dist.md (section 7.4 for this file).
+over the rails (NCCL GIN) between nodes, with one host sync per call. A node
+is NCCL's LSA team, the ranks that reach each other's memory over NVLink
+(:func:`node_size`). Design: docs/hier_output_dist.md (section 7.4 for this
+file).
 
 :class:`HierDist` builds the operator at the first ``input_dist()`` and
 holds what the calls share. The operator takes index-deduplicated keys: a
@@ -30,16 +32,16 @@ TorchRec's dists. :func:`quiesce` lets every rank free the operators at once.
 """
 
 import os
+import socket
 import warnings
 import weakref
 from itertools import accumulate
-from typing import Callable, Dict, List, Optional, Sequence, Tuple, Union
+from typing import Callable, Dict, List, Optional, Sequence, Set, Tuple, Union
 
 import torch
 import torch.distributed as dist
 from torch.distributed.constants import default_pg_nccl_timeout
 from torchrec.distributed import comm_ops
-from torchrec.distributed.comm import get_local_size
 from torchrec.distributed.embedding_sharding import BaseEmbeddingDist
 from torchrec.distributed.sharding.rw_sequence_sharding import RwSequenceEmbeddingDist
 from torchrec.distributed.sharding.sequence_sharding import SequenceShardingContext
@@ -73,6 +75,140 @@ def _first_difference(every: List[Dict]) -> Optional[str]:
                     f"rank {rank} has {name}={value!r} where rank 0 has "
                     f"{name}={every[0][name]!r}"
                 )
+    return None
+
+
+# What node_size read for the ranks of each process group, by their global
+# ranks, the same on every rank of the group: (size, None), or (None, why it
+# could not).
+_NODE_SIZES: Dict[Tuple[int, ...], Tuple[Optional[int], Optional[str]]] = {}
+
+
+def node_size(pg: Optional[dist.ProcessGroup] = None) -> int:
+    """The GPUs of a node of the hierarchical dist on the ranks of ``pg``
+    (the default group if None): the ranks of NCCL's LSA team, which reach
+    each other's memory over NVLink. With machines of 8 GPUs (Eos's H100
+    nodes) it is a machine's GPUs, when the ranks are numbered host by host.
+    With multi-node NVLink (GB200 and GB300 NVL72, MNNVL on) it is the job's
+    GPUs of the rack (its NVLink clique) when the job runs inside one rack;
+    across racks it is what NCCL gives (docs/hier_output_dist.md, section
+    4.2). ``LOCAL_WORLD_SIZE`` stays the GPUs of a host, which TorchRec's
+    planner and the devices take. See docs/hier_output_dist.md, section 2.
+
+    Collective: every rank of ``pg`` calls it, at the same point. Rank 0 makes
+    the id of a short-lived NCCL communicator of the group's ranks, made as
+    the dist makes its own, and every rank reads its LSA team there
+    (``hier_output_dist_lsa_size``). The ranks then agree that they read the
+    same size and that it divides the group (NCCL's team is consecutive
+    ranks). The answer is kept for the group's ranks: a later call, on every
+    rank, returns it at once. Raises RuntimeError, the same on every rank,
+    when a rank cannot read it (a build without the hierarchical dist, an
+    NCCL error) or the ranks disagree; a sharding then takes TorchRec's
+    dists (:meth:`HierDist.setup`). But an NCCL error inside the
+    communicator's initialization on some ranks only leaves the other ranks
+    waiting there, as with any NCCL communicator (docs/hier_output_dist.md,
+    section 19). Warns, on every rank, when the team splits the GPUs of a
+    host between nodes (ranks not numbered host by host): the dist moves
+    keys and rows between those over IB, not NVLink."""
+    group = dist.group.WORLD if pg is None else pg
+    ranks = tuple(dist.get_process_group_ranks(group))
+    if ranks not in _NODE_SIZES:
+        _NODE_SIZES[ranks] = _read_node_size(group)
+    size, why = _NODE_SIZES[ranks]
+    if why is not None:
+        raise RuntimeError(why)
+    return size
+
+
+def _read_node_size(
+    group: dist.ProcessGroup,
+) -> Tuple[Optional[int], Optional[str]]:
+    """:func:`node_size`'s read on ``group``, collective: (size, None), or
+    (None, why not), the same on every rank. Warns, on every rank, when the
+    nodes split a host (:func:`_split_host`)."""
+    import dynamicemb_extensions
+
+    rank, world_size = dist.get_rank(group), dist.get_world_size(group)
+    probe = getattr(dynamicemb_extensions, "hier_output_dist_lsa_size", None)
+    # Each rank tells the others whether it can take part before any of
+    # them makes the communicator, which would wait for every rank.
+    unique_id, why = None, None
+    if probe is None:
+        why = (
+            "DynamicEmb was built without its hierarchical dist, which needs "
+            "NCCL >= 2.30.7"
+        )
+    elif rank == 0:
+        try:
+            unique_id = dynamicemb_extensions.hier_output_dist_unique_id()
+        except RuntimeError as err:
+            why = str(err)
+    every = [None] * world_size
+    dist.all_gather_object(every, (unique_id, why), group=group)
+    why = _first_failure([theirs for _, theirs in every])
+    if why is not None:
+        return None, why
+    try:
+        size, why = probe(every[0][0], rank, world_size), None
+    except RuntimeError as err:
+        size, why = None, str(err)
+    dist.all_gather_object(every, (size, why, socket.gethostname()), group=group)
+    why = _first_failure([theirs for _, theirs, _ in every])
+    if why is not None:
+        return None, why
+    size, why = _agreed_node_size([size for size, _, _ in every], world_size)
+    split = None if size is None else _split_host([host for _, _, host in every], size)
+    if split is not None:
+        warnings.warn(split)
+    return size, why
+
+
+def _first_failure(whys: Sequence[Optional[str]]) -> Optional[str]:
+    """Why the first rank that could not read NCCL's LSA team could not
+    (``whys``, every rank's reason or None, in rank order), in words, or None
+    when every rank could."""
+    for rank, why in enumerate(whys):
+        if why is not None:
+            return f"rank {rank} could not read NCCL's LSA team: {why}"
+    return None
+
+
+def _agreed_node_size(
+    sizes: Sequence[int], world_size: int
+) -> Tuple[Optional[int], Optional[str]]:
+    """The node size of ``world_size`` ranks whose LSA teams have ``sizes``
+    ranks, in rank order: (size, None), or (None, why not) when two ranks
+    read different sizes or the size does not divide the ranks."""
+    for rank, size in enumerate(sizes):
+        if size != sizes[0]:
+            return None, (
+                f"the ranks read different LSA teams from NCCL: rank {rank} one "
+                f"of {size} ranks, rank 0 one of {sizes[0]}"
+            )
+    if sizes[0] < 1 or world_size % sizes[0]:
+        return None, (
+            f"NCCL's LSA team of {sizes[0]} ranks does not divide the "
+            f"{world_size} ranks"
+        )
+    return sizes[0], None
+
+
+def _split_host(hosts: Sequence[str], size: int) -> Optional[str]:
+    """Whether nodes of ``size`` consecutive ranks split the GPUs of a host
+    (``hosts``: each rank's host name, in rank order): the first such host,
+    in words, or None."""
+    nodes: Dict[str, Set[int]] = {}
+    for rank, host in enumerate(hosts):
+        nodes.setdefault(host, set()).add(rank // size)
+    for host, of_host in nodes.items():
+        if len(of_host) > 1:
+            return (
+                f"the hierarchical dist's node, NCCL's LSA team of {size} ranks, "
+                f"splits the GPUs of host {host} between {len(of_host)} nodes, "
+                "which exchange keys and rows over IB, not NVLink; ranks "
+                "numbered host by host, as many on every host, keep a host in "
+                "one node (docs/hier_output_dist.md, section 4.2)"
+            )
     return None
 
 
@@ -178,7 +314,8 @@ class HierDist:
     """The hierarchical dist of one row-wise sequence sharding: its operator,
     built at the first ``input_dist()`` (:meth:`setup`), and what its calls
     share. The knobs are read here, from the environment
-    (docs/hier_output_dist.md, section 4.4).
+    (docs/hier_output_dist.md, section 4.4), and the node in :meth:`setup`,
+    from NCCL (:func:`node_size`).
 
     Args:
         pg: the sharding's process group (ranks node-contiguous).
@@ -214,9 +351,8 @@ class HierDist:
         self._pg = pg
         self._rank = dist.get_rank(pg)
         world_size = dist.get_world_size(pg)
-        # GPUs per node, or the whole group when it is smaller than a node.
-        local_size = min(get_local_size(), world_size)
-        self._num_nodes = world_size // local_size
+        # The nodes, once setup() read the node from NCCL.
+        self._num_nodes: Optional[int] = None
         self._asked = asked
         self._clipping = clipping
         self.dtype = output_dtype  # of the lookup output's rows
@@ -224,10 +360,11 @@ class HierDist:
             capacity = dict.fromkeys(OUTPUT_DIST_CAPACITY_NAMES, capacity)
         proxy_mb = float(os.environ.get("DYNAMICEMB_HIER_PROXY_MB", 512))
         # What the operator is built from, but the bucketize's rules and the
-        # weighted flag (setup()). One node needs lookup_keys alone.
+        # weighted flag (setup()), and the GPUs per node until setup() reads
+        # them from NCCL (node_size). One node needs lookup_keys alone.
         self._arguments = dict(
             world_size=world_size,
-            local_size=local_size,
+            local_size=None,
             feature_tables=list(range(num_features) if tables is None else tables),
             lookup_groups=list(groups or []),
             dim=embedding_dim,
@@ -258,6 +395,10 @@ class HierDist:
 
     @property
     def multi_node(self) -> bool:
+        """Whether the sharding's ranks span more than one node: known once
+        :meth:`setup` read the node from NCCL."""
+        if self._num_nodes is None:
+            raise RuntimeError("HierDist.multi_node: the node is read by setup()")
         return self._num_nodes > 1
 
     def setup(
@@ -267,10 +408,11 @@ class HierDist:
         index_dedup: bool,
     ) -> bool:
         """Whether this sharding takes the hierarchical dist, the same on
-        every rank. The first call builds the operator, collectively, with
-        the bucketize's rule of each feature (DistType codes) and whether the
-        keys carry weights. ``index_dedup`` is the sharder's
-        ``use_index_dedup``: a call on the operator deduplicates the
+        every rank. The first call reads the node from NCCL (its LSA team on
+        the sharding's ranks: :func:`node_size`), then builds the operator,
+        collectively, with the bucketize's rule of each feature (DistType
+        codes) and whether the keys carry weights. ``index_dedup`` is the
+        sharder's ``use_index_dedup``: a call on the operator deduplicates the
         sharding's keys either way (without it, a sharding that takes the
         operator warns so here, once), but tables that clip gradients need it.
         Ranks whose arguments differ raise the same ValueError. A sharding
@@ -278,8 +420,11 @@ class HierDist:
         A configuration it refuses (a ``continuous`` table among them, or
         clipping without ``index_dedup``) raises ValueError under
         ``"hierarchical"`` and takes TorchRec's dists with a warning under
-        ``"auto"``. If a rank cannot build it, every rank warns and takes
-        TorchRec's dists. See docs/hier_output_dist.md, sections 6 and 7.2."""
+        ``"auto"``. If a rank cannot read the node or build the operator,
+        every rank warns and takes TorchRec's dists, but for an NCCL error
+        inside a communicator's initialization on some ranks only, which
+        leaves the others waiting there. See docs/hier_output_dist.md,
+        sections 6, 7.2 and 19."""
         if self.takes_hier_dist is not None:
             return self.takes_hier_dist
         from dynamicemb_extensions import (
@@ -290,6 +435,20 @@ class HierDist:
         )
 
         self.takes_hier_dist = False
+        # The node: NCCL's LSA team on the sharding's ranks, which the
+        # operator's own communicator gets too (its LSA check). Every rank
+        # reads the same, or every rank raises alike, but for an NCCL error
+        # inside the initialization of node_size's communicator on some
+        # ranks only, which leaves the others waiting there.
+        try:
+            local_size = node_size(self._pg)
+        except RuntimeError as err:
+            warnings.warn(
+                f'output_dist="{self._asked}": {err}; using TorchRec\'s dists'
+            )
+            return False
+        self._arguments["local_size"] = local_size
+        self._num_nodes = self._arguments["world_size"] // local_size
         arguments = dict(
             self._arguments,
             dist_types=list(dist_types),

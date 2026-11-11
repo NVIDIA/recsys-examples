@@ -73,7 +73,7 @@ from dynamicemb.planner import (
     DynamicEmbeddingShardingPlanner,
     DynamicEmbParameterConstraints,
 )
-from dynamicemb.shard import DynamicEmbeddingCollectionSharder, quiesce
+from dynamicemb.shard import DynamicEmbeddingCollectionSharder, node_size, quiesce
 from dynamicemb.shard.embedding import ShardedDynamicEmbeddingCollection
 from dynamicemb.shard.hier_output_dist import HierDist
 from dynamicemb.shard.rw_sharding import RwSequenceDynamicEmbeddingSharding
@@ -142,8 +142,11 @@ LATE = 10.0
 # case (one node), in ns: long enough that its node peers' next call would
 # overwrite them first if it did not wait.
 SKEW_NS = 20_000_000
-# The ranks of a node, and whether every table sum is exact (main sets them).
+# The ranks of a host (LOCAL_WORLD_SIZE, the planner's), those of a node of
+# the hierarchical dist (NCCL's LSA team: node_size; a host's without the
+# dist), and whether every table sum is exact (main sets them).
 LOCAL = 1
+NODE = 1
 EXACT = True
 
 
@@ -615,7 +618,7 @@ def needs_of(batches: List[Batch]) -> Dict[str, int]:
         [batch.features for batch in batches],
         tables,
         lambda keys, feature: owning_shard(keys, world_size, DIST_TYPE),
-        min(LOCAL, world_size),
+        NODE,
     )
 
 
@@ -1331,7 +1334,7 @@ def run_skew(rank: int, log: Callable) -> int:
     its in_started only at its next node_exchange, once this call ended
     there. Across nodes in_status holds the peers too, so only one node opens
     the race. 20 steps."""
-    if dist.get_world_size() != LOCAL:
+    if dist.get_world_size() != NODE:
         return 0
     spec = replace(UNIFORM, name="uniform, 20 steps", sizes=(SIZES * 4)[:20])
     plain = run(spec, "hierarchical", "plain", rank)
@@ -1490,7 +1493,7 @@ def run_teardown(rank: int, world_size: int, log: Callable) -> int:
     failures = 0
     last = rank == world_size - 1
     peer = not last and (
-        rank // LOCAL == (world_size - 1) // LOCAL or rank % LOCAL == LOCAL - 1
+        rank // NODE == (world_size - 1) // NODE or rank % NODE == NODE - 1
     )
     spec = replace(UNIFORM, sizes=SIZES[:2] + SIZES[3:4] * 4)
     capacities = capacities_of(spec, rank)
@@ -1538,7 +1541,7 @@ def run_teardown(rank: int, world_size: int, log: Callable) -> int:
 
 
 def main() -> None:
-    global LOCAL, EXACT
+    global LOCAL, NODE, EXACT
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--core", action="store_true", help="the TorchRec version matrix's cases"
@@ -1547,6 +1550,7 @@ def main() -> None:
     # Spins that trap after two minutes instead of the process group's timeout.
     os.environ.setdefault("DYNAMICEMB_HIER_TIMEOUT_S", "120")
     rank, world_size, _, LOCAL = init_distributed()
+    NODE = node_size(dist.group.WORLD) if HAS_HIER_DIST else min(LOCAL, world_size)
     EXACT = (world_size & (world_size - 1)) == 0 and world_size <= 128
 
     def log(msg: str) -> None:
@@ -1555,8 +1559,9 @@ def main() -> None:
 
     log(
         f"torchrec {torchrec.__version__}, {world_size} ranks on"
-        f" {world_size // LOCAL} node(s), a build"
-        f" {'with' if HAS_HIER_DIST else 'without'} the hierarchical dist"
+        f" {world_size // NODE} node(s) of the dist ({world_size // LOCAL}"
+        f" host(s)), a build {'with' if HAS_HIER_DIST else 'without'} the"
+        " hierarchical dist"
     )
     instrument()
     if not HAS_HIER_DIST:

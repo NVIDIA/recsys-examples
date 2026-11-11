@@ -52,10 +52,11 @@ class GPUTimer:
 def init_distributed() -> Tuple[int, int, int, int]:
     """Init NCCL from torchrun's variables, or derive them from srun's.
 
-    Returns (rank, world_size, local_rank, local_world_size). Exports
-    LOCAL_WORLD_SIZE, which the hierarchical dist reads, and under a bare
-    srun MASTER_ADDR (the step's first node) and MASTER_PORT (29500) unless
-    they are set.
+    Returns (rank, world_size, local_rank, local_world_size): the GPUs of a
+    host, which TorchRec's planner reads (the hierarchical dist's node is
+    NCCL's LSA team instead: :func:`hier_node_size`). Exports
+    LOCAL_WORLD_SIZE, and under a bare srun MASTER_ADDR (the step's first
+    node) and MASTER_PORT (29500) unless they are set.
     """
     if "RANK" not in os.environ and "SLURM_PROCID" in os.environ:
         os.environ["RANK"] = os.environ["SLURM_PROCID"]
@@ -91,6 +92,28 @@ def init_distributed() -> Tuple[int, int, int, int]:
     return rank, world_size, local_rank, local_world_size
 
 
+def hier_node_size(
+    local_world_size: int, group: Optional[dist.ProcessGroup] = None
+) -> int:
+    """The GPUs of a node as the hierarchical dist takes them: NCCL's LSA
+    team on the ranks of ``group`` (the default one if None;
+    ``dynamicemb.shard.node_size``, collective). A host's GPUs on Eos; with
+    multi-node NVLink (GB200 and GB300 NVL72), the job's GPUs of the rack
+    when the job runs inside one rack, and across racks what NCCL gives
+    (docs/hier_output_dist.md, section 4.2). Where node_size raises, on
+    every rank alike (a build without the hierarchical dist, an NCCL error:
+    see its docstring), the GPUs of a host, ``local_world_size``, with a
+    note on rank 0."""
+    from dynamicemb.shard import node_size
+
+    try:
+        return node_size(group)
+    except RuntimeError as err:
+        if dist.get_rank(group) == 0:
+            print(f"the node is a host of {local_world_size} GPUs ({err})", flush=True)
+        return min(local_world_size, dist.get_world_size(group))
+
+
 # The capacities of output_dist_capacity, by name.
 HIER_CAPACITY_NAMES = ("lookup_keys", "remote_keys")
 
@@ -99,7 +122,7 @@ def hier_needs(
     batches: Sequence,
     tables: Mapping[str, int],
     owner_of: Callable[[torch.Tensor, str], torch.Tensor],
-    local_world_size: int,
+    local_size: Optional[int] = None,
     node_dedup: bool = True,
     group: Optional[dist.ProcessGroup] = None,
 ) -> Dict[str, int]:
@@ -120,7 +143,9 @@ def hier_needs(
         owner_of: ``owner_of(keys, feature)``, the rank that owns each key,
             given the keys in the KJT's own dtype (TorchRec's path places an
             ``int32`` key by the bucketize's 32-bit rule).
-        local_world_size: GPUs per node.
+        local_size: GPUs per node, as the dist takes them: NCCL's LSA team
+            on the ranks of ``group`` (``dynamicemb.shard.node_size``), not
+            LOCAL_WORLD_SIZE. None reads it so.
         node_dedup: across nodes an owner receives each (table, key) once
             per node; False: every occurrence.
         group: the sharding's process group (the default one if None).
@@ -128,8 +153,12 @@ def hier_needs(
     Collective: every rank of ``group`` calls it with its own batches, the
     same number of them on every rank.
     """
+    if local_size is None:
+        from dynamicemb.shard import node_size
+
+        local_size = node_size(group)
     world_size, rank = dist.get_world_size(group), dist.get_rank(group)
-    num_nodes, node = world_size // local_world_size, rank // local_world_size
+    num_nodes, node = world_size // local_size, rank // local_size
     names = HIER_CAPACITY_NAMES
     device = torch.device("cuda", torch.cuda.current_device())
     needs = torch.zeros(len(names), dtype=torch.int64, device=device)
@@ -153,9 +182,7 @@ def hier_needs(
         dist.all_gather(every, counts, group=group)
         matrix = torch.stack(every)  # [requester, owner]
         # [requester node, owner node, rail]: what a node's GPUs send each owner
-        by_node = matrix.view(
-            num_nodes, local_world_size, num_nodes, local_world_size
-        ).sum(dim=1)
+        by_node = matrix.view(num_nodes, local_size, num_nodes, local_size).sum(dim=1)
         node_keys = by_node.sum(dim=1)  # [node, rail]: what a GPU gets from its node
         own_node = by_node[ranks[:num_nodes], ranks[:num_nodes]]  # [node, rail]
         # the owner's keys, by source rank
@@ -169,7 +196,7 @@ def hier_needs(
             counts.tolist(),
             group=group,
         )
-        source_node = torch.repeat_interleave(ranks // local_world_size, received)
+        source_node = torch.repeat_interleave(ranks // local_size, received)
         from_own_node = source_node == node
         if node_dedup:
             others = torch.cat(

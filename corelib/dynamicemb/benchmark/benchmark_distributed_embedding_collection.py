@@ -53,6 +53,7 @@ from benchmark_utils import (
     NVLINK_PEAK_GBPS,
     hier_capacities,
     hier_needs,
+    hier_node_size,
     init_distributed,
 )
 from dataset_generator import PowerLaw
@@ -397,13 +398,14 @@ def build_model(
 def resolve_capacity(
     cfg: BenchConfig,
     batches: List[torchrec.KeyedJaggedTensor],
-    local_world_size: int,
+    node_size: int,
 ) -> BenchConfig:
     """``cfg`` with the output_dist_capacity its models are built with.
 
     An int ``--capacity`` is used as it is. Otherwise each capacity is what
     the hierarchical dist needs for ``batches`` on its busiest rank
-    (``hier_needs``, collective, outside the timed iterations), times
+    (``hier_needs``, collective, outside the timed iterations) on nodes of
+    ``node_size`` GPUs (:func:`hier_node_size`), times
     ``cfg.capacity_factor``, and at least 4096 entries over the need."""
     if cfg.output_dist == "torchrec":
         return cfg
@@ -424,7 +426,7 @@ def resolve_capacity(
         batches,
         tables,
         lambda keys, feature: owning_shard(keys, world_size, cfg.dist_type),
-        local_world_size,
+        node_size,
         group=group,
     )
     dist.destroy_process_group(group)
@@ -881,14 +883,17 @@ class TorchRecTraffic:
     In the forward each rank sends back one row per key it received, i.e.
     ``output_splits`` of the input dist (already on the host), and receives
     one per key it sent (``input_splits``): ``rows_ib`` and ``rows_ib_in``
-    are those of other nodes. A call costs the host one append: the splits
-    are added up afterwards.
+    are those of other nodes. A node is the hierarchical dist's, of
+    ``node_size`` GPUs (:func:`hier_node_size`): NCCL's LSA team, whose GPUs
+    NCCL's all-to-all reaches over NVLink too (with multi-node NVLink, those
+    of other trays of the rack). A call costs the host one append: the
+    splits are added up afterwards.
     """
 
-    def __init__(self, rank: int, local_world_size: int):
-        self.node = rank // local_world_size
+    def __init__(self, rank: int, node_size: int):
+        self.node = rank // node_size
         self.rank = rank
-        self.local_size = local_world_size
+        self.local_size = node_size
         self.reset()
         orig = RwSequenceEmbeddingDist.forward
         traffic = self
@@ -953,14 +958,15 @@ class HierTraffic:
     rows its node asked of other nodes' owners on its rail (rows_remote: the
     IB rows over these are the node dedup's ratio), in the chunks of its
     stream through its ring (chunks, per call); the backward moves the same
-    rows the other way. A call costs the host one append: its tables are
-    read afterwards.
+    rows the other way. A node is the dist's, of ``node_size`` GPUs (NCCL's
+    LSA team: :func:`hier_node_size`), and a rank's local rank its place
+    there. A call costs the host one append: its tables are read afterwards.
     """
 
-    def __init__(self, rank: int, local_world_size: int):
-        self.local_rank = rank % local_world_size
-        self.node = rank // local_world_size
-        self.local_size = local_world_size
+    def __init__(self, rank: int, node_size: int):
+        self.local_rank = rank % node_size
+        self.node = rank // node_size
+        self.local_size = node_size
         self.hier = None
         self.reset()
         orig = RwSequenceHierEmbeddingDist.forward
@@ -1577,7 +1583,7 @@ def output_dist_kernel_times(prof) -> List[List[float]]:
 
 
 def nic_counters() -> Dict[str, Tuple[int, int]]:
-    """Bytes each InfiniBand port of this node has sent and received so far
+    """Bytes each InfiniBand port of this host has sent and received so far
     (its port counters, which count 4-byte words), by device."""
     out = {}
     for port in sorted(glob.glob("/sys/class/infiniband/*/ports/1")):
@@ -1648,7 +1654,7 @@ def gather_floats(values: Union[List[float], torch.Tensor]) -> torch.Tensor:
 
 
 def check_against_torchrec(
-    cfg: BenchConfig, device, world_size, local_size, rank, steps: int = 4
+    cfg: BenchConfig, device, world_size, local_size, node_size, rank, steps: int = 4
 ) -> Optional[str]:
     """Same inputs through a model on TorchRec's dists and one on the
     hierarchical dist (``--output_dist``'s, or ``hierarchical`` when that is
@@ -1673,6 +1679,9 @@ def check_against_torchrec(
     Under ``--pipeline`` the checked model trains under that pipeline, whose
     outputs must match the plain loop's of TorchRec's model step by step.
 
+    ``local_size`` is the GPUs of a host (the planner's), ``node_size`` those
+    of a node of the hierarchical dist (:func:`hier_node_size`).
+
     The checked model must also have launched its own output dist's kernels
     at every step, in both directions, and no call may have run on TorchRec's
     dists (a sharding that fell back, or a call over its capacities): that
@@ -1687,7 +1696,7 @@ def check_against_torchrec(
     output_dist = cfg.output_dist if cfg.output_dist != "torchrec" else "hierarchical"
     batches = generate_batches(cfg, rank, device, steps)
     inputs = with_output_grads(cfg, rank, device, batches)
-    cfg = resolve_capacity(replace(cfg, output_dist=output_dist), batches, local_size)
+    cfg = resolve_capacity(replace(cfg, output_dist=output_dist), batches, node_size)
     torchrec_model = build_model(cfg, device, world_size, local_size, "torchrec", debug)
     hier_model = build_model(cfg, device, world_size, local_size, output_dist, debug)
     pipeline = train_pipeline(cfg, hier_model) if cfg.pipeline != "none" else None
@@ -1757,13 +1766,20 @@ def run(cfg: BenchConfig) -> Dict:
     rank, world_size, local_rank, local_size = init_distributed()
     device = torch.device(f"cuda:{local_rank}")
     used["process_group"] = device_used()
+    # local_size is the GPUs of a host (the planner, the NIC counters);
+    # node_size those of the hierarchical dist's node, NCCL's LSA team (the
+    # rows over NVLink and IB, the capacities, the trace), read collectively
+    # before the timed iterations
+    node_size = hier_node_size(local_size)
     install_stage_markers()
-    torchrec_traffic = TorchRecTraffic(rank, local_size)
-    hier_traffic = HierTraffic(rank, local_size)
+    torchrec_traffic = TorchRecTraffic(rank, node_size)
+    hier_traffic = HierTraffic(rank, node_size)
     row_bytes = cfg.embedding_dim * _OUTPUT_DTYPES[cfg.output_dtype].as_dtype().itemsize
 
     if cfg.check:
-        why = check_against_torchrec(cfg, device, world_size, local_size, rank)
+        why = check_against_torchrec(
+            cfg, device, world_size, local_size, node_size, rank
+        )
         if rank == 0:
             print(
                 "check against torchrec output dist: "
@@ -1783,7 +1799,7 @@ def run(cfg: BenchConfig) -> Dict:
     n_calls = cfg.warmup + cfg.num_iterations + kernel_iters + cfg.profile_iterations
     kjts = generate_batches(cfg, rank, device, _NUM_BATCHES)
     # the capacities of every batch the model will see (untimed collectives)
-    cfg = resolve_capacity(cfg, kjts, local_size)
+    cfg = resolve_capacity(cfg, kjts, node_size)
     if rank == 0 and cfg.output_dist_capacity is not None:
         print(f"output_dist_capacity: {cfg.output_dist_capacity}", flush=True)
     inputs = with_output_grads(cfg, rank, device, kjts)
@@ -1868,8 +1884,8 @@ def run(cfg: BenchConfig) -> Dict:
         }
         nics = [None] * world_size
         dist.all_gather_object(nics, mine)
-        # per node, its local rank 0's: per device, bytes sent and received
-        nics = [nics[node * local_size] for node in range(world_size // local_size)]
+        # per host, its local rank 0's: per device, bytes sent and received
+        nics = [nics[host * local_size] for host in range(world_size // local_size)]
     used["timed"] = device_used()
     calls, _CALLS = _CALLS, None
     # The input dist's segment per call (plain loop; the calls that took the
@@ -2046,6 +2062,7 @@ def run(cfg: BenchConfig) -> Dict:
             cfg,
             world_size,
             local_size,
+            node_size,
             times_all,
             wall_ms,
             stage_keys,
@@ -2102,6 +2119,7 @@ def report(
     cfg,
     world_size,
     local_size,
+    node_size,
     times_all,
     wall_ms,
     stage_keys,
@@ -2113,11 +2131,15 @@ def report(
     more,
 ) -> Dict:
     row_bytes = cfg.embedding_dim * _OUTPUT_DTYPES[cfg.output_dtype].as_dtype().itemsize
+    # nodes: the hierarchical dist's (NCCL's LSA teams, of node_size GPUs);
+    # hosts: of local_size GPUs, fewer GPUs than a node under multi-node
+    # NVLink
     res = {
         "config": asdict(cfg),
         "label": cfg.label(),
         "world_size": world_size,
-        "nodes": world_size // local_size,
+        "nodes": world_size // node_size,
+        "hosts": world_size // local_size,
         "iter_ms_host": wall_ms,
         "capacities": cfg.output_dist_capacity,
     }
@@ -2131,9 +2153,10 @@ def report(
                 f"{part}_ms_max": times.max().item(),
             }
         )
+    hosts = "" if node_size == local_size else f" hosts={world_size // local_size}"
     print(
         f"\n=== {cfg.label()}  world_size={world_size}"
-        f" nodes={world_size // local_size} ==="
+        f" nodes={world_size // node_size}{hosts} ==="
     )
     if cfg.pipeline == "none":
         print(
@@ -2296,23 +2319,23 @@ def report(
         )
     nics = more.get("nics")
     if nics is not None:
-        # per node and InfiniBand device: bytes sent and received per iteration
+        # per host and InfiniBand device: bytes sent and received per iteration
         iters = cfg.num_iterations
         res["nic_bytes_per_iter"] = [
-            {dev: [count / iters for count in counts] for dev, counts in node.items()}
-            for node in nics
+            {dev: [count / iters for count in counts] for dev, counts in host.items()}
+            for host in nics
         ]
-        for node_idx, node in enumerate(res["nic_bytes_per_iter"]):
+        for host_idx, host in enumerate(res["nic_bytes_per_iter"]):
             busy = sorted(
                 (
                     (counts[0], counts[1], dev)
-                    for dev, counts in node.items()
+                    for dev, counts in host.items()
                     if max(counts) > 1e6
                 ),
                 reverse=True,
             )
             print(
-                f"  node {node_idx}: {len(busy)} InfiniBand ports moved over 1 MB per iteration;"
+                f"  host {host_idx}: {len(busy)} InfiniBand ports moved over 1 MB per iteration;"
                 " sent / received MB: "
                 + ", ".join(
                     f"{dev} {sent / 1e6:.1f} / {received / 1e6:.1f}"
@@ -2377,19 +2400,19 @@ def report(
                 profiled_traffic["rows_ib_in"],
             )
             num_ranks = fwd_out.numel()
-            nodes = num_ranks // local_size
+            nodes = num_ranks // node_size
             rail_out = torch.stack(
-                [profiled_traffic[f"rail_out_{rail}"] for rail in range(local_size)], 1
+                [profiled_traffic[f"rail_out_{rail}"] for rail in range(node_size)], 1
             )
             rail_in = torch.stack(
-                [profiled_traffic[f"rail_in_{rail}"] for rail in range(local_size)], 1
+                [profiled_traffic[f"rail_in_{rail}"] for rail in range(node_size)], 1
             )
             # NIC (node, rail): its node's rows to that rail of other nodes
             pxn_fwd_out = (
-                rail_out.view(nodes, local_size, local_size).sum(1).reshape(num_ranks)
+                rail_out.view(nodes, node_size, node_size).sum(1).reshape(num_ranks)
             )
             pxn_bwd_out = (
-                rail_in.view(nodes, local_size, local_size).sum(1).reshape(num_ranks)
+                rail_in.view(nodes, node_size, node_size).sum(1).reshape(num_ranks)
             )
             pxn = {"fwd": (pxn_fwd_out, fwd_in), "bwd": (pxn_bwd_out, fwd_out)}
             res["ib_kernel_basis"] = {}
@@ -2404,9 +2427,9 @@ def report(
                 ]
                 # a NIC carries its node's GPUs' rows: their kernels' span
                 output_dist_ms = (
-                    output_dist_ms.view(nodes, local_size)
+                    output_dist_ms.view(nodes, node_size)
                     .max(1, keepdim=True)
-                    .values.expand(nodes, local_size)
+                    .values.expand(nodes, node_size)
                     .reshape(num_ranks)
                 )
                 ok = (output_dist_ms > 0) & (nic_bytes > 0)
@@ -2440,7 +2463,7 @@ def report(
         }
     records = more.get("records")
     if records is not None:
-        summ = trace_summary(records, local_size)
+        summ = trace_summary(records, node_size)
         res["trace"] = summ
         cal = more.get("cal_stats")
         if cal:

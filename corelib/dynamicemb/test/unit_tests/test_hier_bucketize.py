@@ -77,7 +77,9 @@ and the push of its node's keys, on one GPU, on plain tensors:
   checks each requester's map into its owners' KJTs (``src``) and each
   owner's KJT. The layout's items, laid out on one CTA and on a grid
   (node_exchange's two paths), give the same tables; cases of 127 to 300
-  features take the grid by default.
+  features take the grid by default. Nodes go from 1 to 72 GPUs: 72 is a
+  GB300 NVL72 rack as one node (NCCL's LSA team under multi-node NVLink,
+  which the dist takes for its node), alone and as one of two racks.
 
 Every call of the planner runs under ``torch.cuda.set_sync_debug_mode
 ("error")``, so an op that waits for the device fails the test.
@@ -1168,6 +1170,28 @@ NODE_CASES = [
     ),
     NodeCase("one node of 40, 70 features", 1, 40, num_features=70, max_len=3),
     NodeCase("2 nodes of 36, 70 features", 2, 36, num_features=70, node=1, max_len=3),
+    # nodes of 72 GPUs, an NVL72 rack's (multi-node NVLink: NCCL's LSA team
+    # holds its 18 trays of 4), alone and as one of two racks; with 70
+    # features the layout's items take the grid by default
+    NodeCase("one node of 72", 1, 72),
+    NodeCase(
+        "one node of 72, hot key, bound, weights",
+        1,
+        72,
+        hot=0.5,
+        bound=20,
+        weighted=True,
+    ),
+    NodeCase("one node of 72, lookup_keys overflow", 1, 72, lookup_slack=-1),
+    NodeCase("one node of 72, 70 features", 1, 72, num_features=70, max_len=2),
+    NodeCase("2 nodes of 72, node 1, weights", 2, 72, node=1, weighted=True),
+    NodeCase(
+        "2 nodes of 72, hot key: one remote part overflows by one",
+        2,
+        72,
+        hot=0.5,
+        remote_slack=-1,
+    ),
     NodeCase("40 nodes of 2", 40, 2, num_features=3, node=33),
     # the key range wraps to int32 keys, negative ones among them: the push
     # widens each with its sign, as the bucketize's gather does

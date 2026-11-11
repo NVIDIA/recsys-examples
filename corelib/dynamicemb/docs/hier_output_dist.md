@@ -105,9 +105,18 @@ this dist with TorchRec's dists.
 ## 2. Words used here
 
 * **Rank**: one GPU and the process that drives it; `world_size` ranks in
-  all. **Node**: one machine; its `local_size` GPUs are joined by
-  **NVLink**. There are `num_nodes` nodes, and ranks are numbered node by
-  node: `rank = node × local_size + local_rank`.
+  all. **Node**: the GPUs that reach each other's memory over **NVLink**:
+  NCCL's LSA team (below), of `local_size` GPUs. On machines of 8 GPUs
+  joined by NVLink, as on Eos (H100), a node is one machine, when the ranks
+  are numbered host by host (section 4.2). With multi-node NVLink (MNNVL:
+  GB200 and GB300 NVL72, a rack of 18 trays of 4 GPUs), it is the job's
+  GPUs of one NVLink domain when the job runs inside one rack: then one
+  node spans several **hosts** (a host: one machine, one operating
+  system). There are `num_nodes` nodes, and ranks are numbered
+  node by node: `rank = node × local_size + local_rank`. The dist reads the
+  node from NCCL when it builds a sharding's op (`node_size`, sections 4.2
+  and 7.2). `LOCAL_WORLD_SIZE` stays the GPUs of a host, which TorchRec's
+  planner and the choice of devices take.
 * **InfiniBand (IB)**: the network between nodes. Each GPU has its own
   network card (**NIC**). A **rail** is the set of GPUs with the same
   `local_rank` on every node. On a rail-optimized network the NICs of one
@@ -116,7 +125,9 @@ this dist with TorchRec's dists.
   its **rail peers** the other GPUs of its rail.
 * **NCCL**: NVIDIA's communication library. This dist uses its device API,
   which kernels call. With **LSA** (load/store access) a kernel reads and
-  writes the memory of the other GPUs of its node over NVLink. With **GIN**
+  writes the memory of the other GPUs of its node over NVLink. NCCL's **LSA
+  team** is the ranks a rank has that access to: consecutive ranks, as
+  many on every rank (section 4.2 says which). With **GIN**
   (GPU-initiated networking) a kernel sends data over IB itself, without the
   CPU. GIN sends *puts* (copy bytes into a peer's memory) and *signals* (add
   a number to a counter at the peer).
@@ -255,8 +266,48 @@ every rank before you drop a model (section 4.6).
 * NCCL's device API on the GPUs. Across nodes: GIN on the rail connection,
   with at least 4 contexts, all of one backend (proxy, GDAKI or GPI;
   section 11.1).
-* Ranks numbered node by node (the code assumes it; torchrun and Slurm's
-  default task layout do this), and forming whole nodes.
+* Ranks numbered node by node, forming whole nodes, where a node is
+  NCCL's LSA team (section 2). The first `input_dist()` of a sharding reads
+  it (`dynamicemb.shard.node_size`, once per group of ranks, collectively):
+  rank 0 makes the id of a short-lived NCCL communicator of the sharding's
+  ranks, made as the op makes its own, every rank reads its LSA team there
+  (`ncclTeamLsa`) and ends it, and the ranks check that they read the same
+  size and that it divides their number. If a rank cannot read it (an NCCL
+  error), or the ranks disagree, every rank warns and takes TorchRec's
+  dists (section 6); but an NCCL error inside that communicator's
+  initialization on some ranks only leaves the other ranks waiting there
+  (section 19). The op's own communicator must then get the same team: it
+  checks so when it is built (section 7.2).
+* **The team NCCL gives.** NCCL 2.30 computes it (`computeLsaSize` in
+  NCCL's `src/dev_runtime.cc`, lines 113-138 in NCCL 2.30.4) as the
+  greatest common divisor of the runs of consecutive ranks on one NCCL
+  node, and of `NCCL_LSA_TEAM_SIZE` if that is set. An NCCL node is a host,
+  or with MNNVL the ranks of one NVLink clique (a rack, or an NVLink
+  partition of one), whose topologies NCCL fuses into one node. So on Eos a
+  node is a host of 8 GPUs (with torchrun's and Slurm's default task
+  layouts, which number the ranks host by host). A layout that does not
+  (Slurm's `--distribution=cyclic`, say, which alternates hosts) gives
+  shorter runs, so nodes smaller than a host: the dist then moves keys and
+  rows between GPUs of one host over IB, and `node_size` warns so on every
+  rank. On GB200 or GB300 NVL72 inside one rack, with MNNVL on, it is the
+  job's GPUs of the rack. That is read from NCCL 2.30.4's source: confirm
+  it on the first GB300 run, where `node_size` gives the team and NCCL's
+  INFO log (`NCCL_DEBUG=INFO`) shows `MNNVL 1` with the clique's size
+  (`cliqueSize`) and the NVLink domain's (`nvlDomainSize`), and `nNodes 1`.
+  MNNVL needs the IMEX channel (`/dev/nvidia-caps-imex-channels`) in the
+  container. `NCCL_MNNVL_ENABLE=0` turns it off, and a node is then a host
+  (a tray of 4 GPUs); so does `NCCL_P2P_DISABLE=1`, which also turns off
+  NCCL's P2P transport (NVLink) for NCCL's own collectives.
+  `NCCL_CUMEM_ENABLE=0` turns MNNVL off too, but also NCCL's device API
+  (NCCL's symmetric memory needs cuMem): the op then cannot be built, and
+  every sharding takes TorchRec's dists. **Across racks** that source
+  extends the team past a clique only when every rank is in one NVLink
+  domain of several cliques and `NCCL_MNNVL_CROSS_CLIQUE=1`. Otherwise it
+  is the greatest common divisor of the runs of each clique: a rack's GPUs
+  when the ranks run rack by rack, each rack with as many GPUs in the job;
+  fewer when racks give runs of different lengths (72 and 56 GPUs give 8),
+  or when ranks alternate between racks. Check it on the NCCL you deploy:
+  `node_size` gives the team the dist takes.
 * Fewer than 2^31 − 1024 (rank, feature) pairs: `world_size × num_features`
   (the planner numbers them with int32).
 * Rows (embedding dim × bytes of the output dtype) a multiple of 16 bytes,
@@ -311,7 +362,13 @@ rank alike (section 6).
 | `DYNAMICEMB_HIER_OUT_CTAS` | `0` | CTAs of the output-dist kernels. `0`: 32 for the forward and 64 for the backward on one node, 32 for both across nodes (section 14). |
 | `DYNAMICEMB_HIER_REDUCE_CTAS` | `8` | Across nodes: the backward's CTAs that add up the proxy's rows (1 or more; the kernel uses at most its CTAs minus one). |
 | `DYNAMICEMB_HIER_PAYLOAD_KB` | `512` | Across nodes: the payload of a chunk of keys of few occurrences, the rows it moves over IB, in KiB: about this value or more (below). At least 64, and a multiple of 16. |
-| `LOCAL_WORLD_SIZE` | TorchRec's `get_local_size` | GPUs per node (`local_size`); torchrun sets it. |
+
+No variable sets the node, `local_size`: the dist reads it from NCCL, its
+LSA team on the sharding's ranks (section 4.2). `LOCAL_WORLD_SIZE`, the GPUs
+of a host, does not change it. NCCL's own settings do, as they change the
+team: `NCCL_LSA_TEAM_SIZE` (the team divides it) and those that turn MNNVL
+off (section 4.2). Every rank must have the same: the ranks check that they
+read the same team.
 
 Across nodes the dist moves rows over IB in chunks (section 12.1). A chunk
 takes a row of the ring per occurrence of its keys: at most 2 MiB of rows
@@ -418,6 +475,12 @@ its own node, and at most `local_size` occurrences to `remote_keys` at its
 proxy on every other node, which after node dedup add one key each to its
 owner's `lookup_keys`. That holds whatever the number of nodes.
 
+The node is NCCL's LSA team (section 2), so the needs follow it. On a GB300
+NVL72 rack taken as one node, every key of the rack's GPUs for an owner
+counts in its `lookup_keys`, and `remote_keys` only counts keys for other
+racks: on one rack the dist needs `lookup_keys` alone. Count the needs with
+the node the dist takes (section 5.2), not with `LOCAL_WORLD_SIZE`.
+
 ### 5.2 How to choose them
 
 Count the needs on batches like the ones the model will see, then add
@@ -425,12 +488,14 @@ headroom. Two helpers in `benchmark/benchmark_utils.py` do this (it is not
 part of the installed package: put `benchmark/` on `sys.path`, as the tests
 do):
 
-* `hier_needs(batches, tables, owner_of, local_world_size, node_dedup=True,
+* `hier_needs(batches, tables, owner_of, local_size=None, node_dedup=True,
   group=None)` counts what the op needs of each capacity for some calls, as
   the op counts it: the most any rank needs in any call.
   It is collective: every rank of the sharding's process group calls it with
   its own batches. `tables` maps each feature of the sharding to its table,
   and `owner_of(keys, feature)` gives the rank that owns each key.
+  `local_size` is the GPUs of a node as the dist takes them; `None` reads
+  them from NCCL (`dynamicemb.shard.node_size(group)`, collective).
 * `hier_capacities(needs, factor=1.25, min_extra=4096)` makes the dict for
   `output_dist_capacity`: each capacity `factor` times its need, and at
   least `min_extra` entries more (small calls).
@@ -448,8 +513,7 @@ needs = hier_needs(
     # each key's owner, for int64 keys; for int32 keys give the bucketize's
     # 32-bit rule (section 10.1)
     lambda keys, feature: owning_shard(keys, world_size, "roundrobin"),
-    local_world_size,
-)
+)  # on nodes of NCCL's LSA team (node_size), as the dist takes them
 capacities = hier_capacities(needs, factor=1.25)
 ```
 
@@ -536,12 +600,13 @@ state that every rank shares.
 | `"auto"` without `output_dist_capacity` | when sharding | a warning, TorchRec's dists |
 | one rank in the sharding; a table of the sharding that is not a DynamicEmb table; feature processors | when sharding | a warning, TorchRec's dists |
 | tables that take a score per key (`score_strategy` `PRECISE_CUSTOMIZED`): a key crosses with one float32 weight, which a proxy adds up, and no score | when sharding | `"hierarchical"`: `ValueError`; `"auto"`: a warning, TorchRec's dists |
+| a rank that cannot read the node, NCCL's LSA team (`node_size`: an NCCL error, but for one inside the initialization of its communicator on some ranks only, which leaves the others waiting there: section 19), or ranks that read teams of different sizes | first `input_dist()`, collectively, before the op is built | a warning on every rank that names the first such rank and why, TorchRec's dists |
 | ranks that would build the op from different options, capacities or environment values | first `input_dist()`, before the op is built | `ValueError` on every rank, naming the first rank and value that differ |
 | ranks that are not whole nodes; `world_size × num_features` of 2^31 − 1024 or more; rows not a multiple of 16 bytes | first `input_dist()` | a warning, TorchRec's dists |
 | a DynamicEmb table of the sharding with `dist_type` `"continuous"` (below) | first `input_dist()`, before the op is built | `"hierarchical"`: `ValueError` on every rank; `"auto"`: a warning, TorchRec's dists |
 | tables that clip gradients (`gradient_clipping`) under a sharder without `use_index_dedup=True`: the tables clip each row their lookup gets, and TorchRec's dists then send a row per occurrence, where a call on the op sends a GPU's sum of a key's rows | first `input_dist()`, before the op is built | `"hierarchical"`: `ValueError` on every rank; `"auto"`: a warning, TorchRec's dists |
 | a configuration the op cannot take: across nodes, capacities without `remote_keys`; a proxy cap below the least rows of its ring (section 15.3); a `remote_keys` whose stream could pass position 2^32 (section 15.3); rows that are not fp32, bf16 or fp16; an environment value it refuses (section 4.4) | first `input_dist()`, before the op is built | `"hierarchical"`: `ValueError` on every rank; `"auto"`: a warning, TorchRec's dists |
-| On some rank: the NCCL LSA team is not the whole node. Or, across nodes, GIN does not connect the rails, has fewer than 4 contexts, or its signals do not start at 0. Or the window cannot be allocated. | first `input_dist()`, collectively | a warning that names each rank and why, TorchRec's dists on every rank |
+| On some rank: the LSA team of the op's own communicator is not the node `node_size` read (the warning gives the team's size). Or, across nodes, GIN does not connect the rails, has fewer than 4 contexts, or its signals do not start at 0. Or the window cannot be allocated. | first `input_dist()`, collectively | a warning that names each rank and why, TorchRec's dists on every rank |
 | an eval forward | per call | TorchRec's dists for that call |
 | a call that does not fit the capacities, or a proxy that gets one key more than `local_size` times | per call, at its second wait | `RuntimeError` on every rank, naming the capacity to raise or the key's occurrences (section 5.4) |
 
@@ -567,9 +632,14 @@ words, and ends with `; using TorchRec's dists`.
 
 The op is a C++ class with a small interface, which takes and gives tensors
 and plain values only. Python reaches it through pybind11, as
-`dynamicemb_extensions.HierOutputDist`, beside five functions of the
+`dynamicemb_extensions.HierOutputDist`, beside six functions of the
 module: `hier_output_dist_unique_id()` (the id of the op's communicator,
-made on one rank), `hier_output_dist_unsupported()` and
+made on one rank), `hier_output_dist_lsa_size(unique_id, rank, world_size)`
+(collective: the size of the LSA team NCCL gives a short-lived
+communicator of that id, made as the op's, which each rank then ends on
+its own, as nothing ran on it; `node_size` reads it;
+`Communicator::lsa_team_size`),
+`hier_output_dist_unsupported()` and
 `hier_output_dist_invalid()` (why the op does not apply to a sharding, or
 refuses a configuration, or ""; they build nothing, section 7.2),
 `hier_output_dist_traced()`, and `hier_output_dist_max_capacity()` (the
@@ -715,7 +785,20 @@ and the GPU clock by which the benchmark aligns its timelines.
 The op is built at the sharding's first `input_dist()`, in any mode, at the
 same point on every rank:
 
-1. **The ranks agree on what they build it from.** Each rank asks
+1. **The node.** `node_size` reads it from NCCL, once per group of ranks
+   (section 4.2): an all-gather hands out a unique id made on rank 0,
+   every rank makes a short-lived communicator with it
+   (`hier_output_dist_lsa_size`, made as step 3 makes the op's), reads its
+   LSA team (`ncclTeamLsa`) and ends it, and a second all-gather checks
+   that every rank read the same size, which divides the ranks. If a rank
+   cannot (an NCCL error) or the ranks disagree, every rank warns and takes
+   TorchRec's dists, but for an NCCL error inside the communicator's
+   initialization on some ranks only, which leaves the others waiting there
+   (section 19). Else the size is `local_size`, and `world_size /
+   local_size` the nodes. The second all-gather also gives each rank's host
+   name: when the nodes split the GPUs of a host, every rank warns (section
+   4.2).
+2. **The ranks agree on what they build it from.** Each rank asks
    `hier_output_dist_invalid()` whether the op takes its configuration. Then one
    all-gather over the sharding's process group gives every rank what every
    rank would build the op from (all but its rank), and a unique id for the
@@ -728,26 +811,31 @@ same point on every rank:
    `continuous` table, say, or tables that clip gradients without the
    sharder's index dedup), `"hierarchical"` raises `ValueError` on every
    rank and `"auto"` warns and takes TorchRec's dists.
-2. Else every rank builds the op with that id. The constructor checks the
+3. Else every rank builds the op with that id. The constructor checks the
    configuration again (it throws before any collective if it refuses it),
    then makes the communicator and its device communicator: LSA inside the
    node and, across nodes, GIN on the rails with 4 contexts.
-3. Each rank checks that it can run: its LSA team is the whole node, and
+4. Each rank checks that it can run: its LSA team is the whole node (the
+   team `node_size` read: the same NCCL computes the same team), and
    across nodes GIN connects the rails with at least 4 contexts whose
    signals start at 0. Then it allocates its copy of the window (section
    7.5), once.
-4. The ranks agree: an all-gather of one readiness code per rank, on the
-   op's own communicator, before anything collective uses the window. If
-   some rank cannot run, every rank ends the communicator together, frees
-   what it allocated, and raises the same `RuntimeError`, which names each
-   rank and why. Python warns and takes TorchRec's dists for the sharding.
-5. Else every rank registers its window (one collective registration) and
+5. The ranks agree: an all-gather of each rank's readiness code and LSA
+   team size, on the op's own communicator, before anything collective
+   uses the window. If some rank cannot run, every rank ends the
+   communicator together, frees what it allocated, and raises the same
+   `RuntimeError`, which names each rank and why (for a team that is not
+   the node, its size). Python warns and takes TorchRec's dists for the
+   sharding.
+6. Else every rank registers its window (one collective registration) and
    makes its two channels (section 7.5). An error inside the collective
    registration cannot be agreed: that rank raises alone, and the others
    wait in the registration, as they would in NCCL's own initialization.
 
-Building the op costs a few host syncs: the all-gather, the communicator,
-the window's zeroing and the agreement. After it, a call costs one.
+Building the op costs a few host syncs: the node's read (two all-gathers
+and a communicator, once per group of ranks), the all-gather, the
+communicator, the window's zeroing and the agreement. After it, a call
+costs one.
 
 ### 7.3 One call
 
@@ -841,7 +929,10 @@ goes once its kernel is queued, and autograd keeps the backward's
 * **When the sharding is built** (no collective): Python reads the options,
   the capacities and the environment, and the lookup groups: the number of
   features of each of the sharding's grouped configs, in feature order
-  (`HierDist(groups=...)`, the op's `lookup_groups`). It sets each
+  (`HierDist(groups=...)`, the op's `lookup_groups`). It reads the node at
+  the first `input_dist()`, from NCCL (`node_size`, section 7.2): until
+  then `HierDist` knows neither `local_size` nor the nodes, and nothing
+  reads them before (`multi_node` raises). It sets each
   DynamicEmb table's `output_alloc` to the sharding (`lookup_buffer`). In
   each call on the op, the sharding then hands each lookup group the next
   rows of the call's rows of `lookup_rows`, and the row of each of the
@@ -2984,13 +3075,22 @@ each module's docstring says what it checks and how to run it. On one node
 run them, and `test/unit_test.sh` runs those. `test_hier_dist.py` compares
 the lookup's gradient per (table, key) with TorchRec's: its probe reads the
 gradient of the lookup output in the KJT's key order, through
-`HierDist.key_rows` (section 7.4). End to end,
+`HierDist.key_rows` (section 7.4). First it checks the node (`node_size`):
+NCCL's LSA team, read once per group of ranks and then kept, which the dist
+takes whatever `LOCAL_WORLD_SIZE` says (with it halved, a sharding still
+builds its op, on the team's nodes); with the read made to go wrong, a size
+that differs on one rank, a size that does not divide the ranks and an
+error on one rank each raise the same `RuntimeError` on every rank, and a
+sharding then takes TorchRec's dists; with a size every rank reads that is
+not the team, the op's own communicator refuses the node, and every rank
+warns, giving the team's size, and takes TorchRec's dists. End to end,
 `examples/hstu/test/test_hierarchical_dist.py` trains the HSTU ranking model
 on the hierarchical dist and on TorchRec's dists, under the example's
 JaggedMegatron pipelines, and compares them: the first step's loss and logits
-and the tables' keys bit for bit, and with fp32 on one node every step and row
-within `torch.allclose`'s defaults. It also checks the over-capacity error
-under each pipeline. Run it from `examples/hstu`:
+and the tables' keys bit for bit, and with fp32 on one node (of the dist:
+NCCL's LSA team) every step and row within `torch.allclose`'s defaults. It
+also checks the over-capacity error under each pipeline. Run it from
+`examples/hstu`:
 
 ```
 PYTHONPATH=${PYTHONPATH}:$(realpath ../) torchrun --nproc_per_node 8 -m pytest -svv test/test_hierarchical_dist.py
@@ -3125,7 +3225,9 @@ remote_keys` reaches 2^32 (section 10.4).
 hooks. Each rank's offsets are those its in channel writes (section 10.1),
 with garbage at the other entries, so a read of another entry shows. Among
 its checks: each rank's node layout is the same with the items on one CTA
-and on a grid (`items_in_cta`), also with 127 to 300 features.
+and on a grid (`items_in_cta`), also with 127 to 300 features. Its nodes
+take 1 to 72 GPUs: 72 is a GB300 NVL72 rack as one node, alone and as one
+of two racks.
 `test_hier_dedup.py` plays every rank of an N-node job, also with 2 and 3
 lookup groups and a group per feature. Among its checks: each owner's row
 map, where its groups' slices start, its group shifts and the group runs of
@@ -3193,6 +3295,24 @@ on 1 and 3 CTAs, and the calls of the design's reference ports.
 
 * **Scope**: row-wise sequence shardings of DynamicEmb tables, within the
   limits of section 4.2.
+* **The node is NCCL's LSA team** (sections 2 and 4.2), read once per group
+  of ranks at the first `input_dist()`, with a short-lived NCCL
+  communicator: a host of 8 GPUs on Eos, and on GB200 and GB300 NVL72 with
+  MNNVL the job's GPUs of a rack when the job runs inside one rack (read
+  from NCCL 2.30.4's source, to confirm on the first GB300 run: section
+  4.2). Across racks it is what the deployed NCCL gives: in NCCL 2.30.4 a
+  rack's GPUs only when the ranks run rack by rack with as many GPUs in
+  each rack, else fewer (to check there). Ranks not numbered host by host
+  give nodes smaller than a host: the dist then moves keys and rows between
+  GPUs of one host over IB, and `node_size` warns. `LOCAL_WORLD_SIZE` does
+  not set it.
+* **Nodes of many GPUs**: `node_offsets` grows with `local_size² ×
+  num_features` (section 15.2): at 72 GPUs per node about 1 MiB per GPU
+  with 26 features and 40 MiB with 1,024, which every call also sends over
+  NVLink. The node's steps that run on one CTA, and the out kernels'
+  barriers, have work that grows with `local_size`. The planner's hook
+  tests take nodes of 72 GPUs (section 18); nothing has run on an NVL72
+  rack yet.
 * **Owner rules**: `roundrobin` and `hash_roundrobin` only. A sharding with
   a `continuous` table takes TorchRec's dists under `"auto"`, and raises
   `ValueError` under `"hierarchical"` (section 6).
@@ -3204,8 +3324,9 @@ on 1 and 3 CTAs, and the calls of the design's reference ports.
 * **Fixed capacities**: a call that needs more raises, on every rank
   (section 5.4); the capacities must hold the largest call.
 * **Errors no agreement covers**: an NCCL error while the op makes its
-  communicator, or inside the collective window registration, on some ranks
-  only leaves the other ranks waiting (section 7.2). An error inside an
+  communicator (or while `node_size` makes its short-lived one), or inside
+  the collective window registration, on some ranks only leaves the other
+  ranks waiting (section 7.2). An error inside an
   input dist, such as an allocation that fails, reaches Python on its rank. The
   other ranks then trap at the timeout in the call's next comm kernel that
   waits, as when a rank dies.
@@ -3298,7 +3419,8 @@ Paths from `corelib/dynamicemb`.
   `HierDist` (the op, what a sharding's calls share, a call's second wait,
   `finish`, and the lookup's rows and row map: `lookup_buffer`, `key_rows`,
   `in_key_order`), what a call leaves its output dist (`HierCall`), the
-  output dist and `quiesce`; `input_dist.py` the hierarchical input dist
+  output dist, `quiesce` and the node (`node_size`: NCCL's LSA team);
+  `input_dist.py` the hierarchical input dist
   (`hier_forward` and its two awaitables); `rw_sharding.py` the choice of
   dist, the lookup groups and the lookup; `embedding.py` the choice per call
   (eval forwards take TorchRec's dists) and the index dedup of a call on the
@@ -3313,9 +3435,11 @@ Paths from `corelib/dynamicemb`.
   the op's own files, and a folder for what both dists share and one for
   each dist.
   * `hier_output_dist.h`, `hier_output_dist.cu`: the op, `HierOutputDist`,
-    and what it owns: its communicator (`Communicator`), its window
-    (`SymmetricWindow`) and its two channels; its construction, teardown and
-    calls, and the kernels of its setup and teardown;
+    and what it owns: its communicator (`Communicator`, whose
+    `lsa_team_size` gives the LSA team of a short-lived one, which
+    `node_size` reads), its window (`SymmetricWindow`) and its two
+    channels; its construction, teardown and calls, and the kernels of its
+    setup and teardown;
   * `bind.cu`: the Python bindings (but `hier_output_dist_max_capacity()`,
     which `src/dynamic_emb_op.cu` binds in every build); `testing.cu`:
     bindings for the tests and the benchmark only.
@@ -3413,4 +3537,5 @@ Paths from `corelib/dynamicemb`.
 * **Tests**: section 18. **Benchmark**:
   `benchmark/benchmark_distributed_embedding_collection.py`
   (`benchmark/README.md`, section 3), `benchmark/benchmark_utils.py`
-  (`hier_needs`, `hier_capacities`) and `benchmark/nvlink_ceiling.cu`.
+  (`hier_node_size`, `hier_needs`, `hier_capacities`) and
+  `benchmark/nvlink_ceiling.cu`.

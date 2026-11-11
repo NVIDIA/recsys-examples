@@ -28,7 +28,10 @@ itself, and counts them as TorchRec's dists do). Every step checks:
 * the input dist's host syncs, and in the second step an eval forward,
   which takes TorchRec's dists.
 
-Before the cases: the sharding shapes, the ranks' agreement, a sharding with
+Before the cases: the node, which the dist reads from NCCL (``node_size``:
+its LSA team, read once per group; ranks whose reads disagree raise alike,
+and the op's own LSA check refuses a node that is not the team), the
+sharding shapes, the ranks' agreement, a sharding with
 a ``continuous`` feature outside a model, and the options (a sharding with a
 ``continuous`` table, and a model without index dedup whose tables clip
 gradients: ``"hierarchical"`` raises ``ValueError`` at its first input dist,
@@ -64,6 +67,7 @@ import weakref
 from dataclasses import dataclass, replace
 from typing import Callable, Dict, List, NamedTuple, Optional, Sequence, Tuple
 
+import dynamicemb_extensions
 import torch
 import torch.distributed as dist
 import torchrec
@@ -90,7 +94,14 @@ from dynamicemb.planner import (
 )
 from dynamicemb.shard import DynamicEmbeddingCollectionSharder
 from dynamicemb.shard.embedding import ShardedDynamicEmbeddingCollection
-from dynamicemb.shard.hier_output_dist import HierDist
+from dynamicemb.shard.hier_output_dist import (
+    _NODE_SIZES,
+    HierDist,
+    _agreed_node_size,
+    _first_failure,
+    _split_host,
+    node_size,
+)
 from dynamicemb_extensions import (
     block_bucketize_sparse_features,
     hier_output_dist_fail_next_construction,
@@ -113,8 +124,11 @@ sys.path.insert(
 from benchmark_utils import hier_capacities, hier_needs, init_distributed  # noqa: E402
 
 NUM_EMBEDDINGS = 1 << 20
-# Nodes of the run (main sets it).
+# Nodes of the run and their GPUs, as the hierarchical dist takes them: NCCL's
+# LSA team (node_size), not LOCAL_WORLD_SIZE, a host's GPUs, which the planner
+# takes (main sets them).
 NODES = 1
+NODE_SIZE = 1
 DTYPES = {
     "fp32": (DataType.FP32, SparseType.FP32),
     "bf16": (DataType.BF16, SparseType.BF16),
@@ -159,21 +173,23 @@ def standalone(group) -> HierDist:
 
 
 def check_group_shapes(rank: int, world_size: int) -> bool:
-    """A sharding whose LOCAL_WORLD_SIZE splits each node in two (as if each
-    half were a node) takes TorchRec's dists with a warning, the same on
-    every rank: NCCL's LSA team holds every GPU of the node, not the half the
-    sharding takes for a node. One on fewer ranks than a node, here a 2-rank
-    group of the first node, runs with those 2 ranks as its node."""
+    """The dist's node follows NCCL's LSA team, not LOCAL_WORLD_SIZE: with
+    LOCAL_WORLD_SIZE halved (as if each half of a host were a host) and the
+    node read again, a sharding on every rank still builds its op, on nodes
+    of the team's NODE_SIZE GPUs, the same on every rank (the op's own
+    communicator checks its LSA team against them: check_node_size). One on
+    fewer ranks than a node, here a 2-rank group of the first node, runs
+    with those 2 ranks as its node."""
     ok = True
     local_world_size = os.environ["LOCAL_WORLD_SIZE"]
     os.environ["LOCAL_WORLD_SIZE"] = str(max(int(local_world_size) // 2, 1))
     try:
-        with warnings.catch_warnings(record=True) as caught:
-            warnings.simplefilter("always")
-            hier = standalone(dist.group.WORLD)
-            ok = hier.setup(*bucketize_rules(3), False, True) is False and any(
-                "using TorchRec" in str(warning.message) for warning in caught
-            )
+        _NODE_SIZES.pop(tuple(range(world_size)), None)
+        hier = standalone(dist.group.WORLD)
+        ok = (
+            hier.setup(*bucketize_rules(3), False, True) is True
+            and hier._arguments["local_size"] == NODE_SIZE
+        )
         del hier
     finally:
         os.environ["LOCAL_WORLD_SIZE"] = local_world_size
@@ -181,11 +197,137 @@ def check_group_shapes(rank: int, world_size: int) -> bool:
         pair = dist.new_group([0, 1])
         if rank < 2:
             hier = standalone(pair)
-            ok &= hier._arguments["local_size"] == 2 and hier.setup(
-                *bucketize_rules(3), False, True
-            )
+            built = hier.setup(*bucketize_rules(3), False, True)
+            ok &= built is True and hier._arguments["local_size"] == min(NODE_SIZE, 2)
             del hier
     return ok
+
+
+def check_node_size(rank: int, world_size: int, log: Callable) -> int:
+    """node_size, the dist's node: NCCL's LSA team on a group's ranks. It is
+    read once, then kept: a second call reads nothing. Its read made to go
+    wrong (the extension's hier_output_dist_lsa_size wrapped, every rank
+    still taking part in NCCL's): a size that differs on the last rank, a
+    size that does not divide the ranks, and an error on the last rank each
+    raise the same RuntimeError on every rank, and none hangs. With the
+    error, a sharding takes TorchRec's dists, with a warning on every rank.
+    With a size every rank reads that is not NCCL's team, the op's own
+    communicator refuses the node: every rank warns, giving the team's size,
+    and takes TorchRec's dists. The checks of the sizes, and of the hosts
+    that nodes split, also run on lists of their own."""
+    checks: Dict[str, bool] = {}
+    last = world_size - 1
+    ranks = tuple(range(world_size))
+    saved = dict(_NODE_SIZES)
+    real = dynamicemb_extensions.hier_output_dist_lsa_size
+    reads: List[int] = []
+
+    def wrapped(change: Callable[[int], int]) -> Callable:
+        def read(unique_id, of_rank, size):
+            reads.append(of_rank)
+            return change(real(unique_id, of_rank, size))
+
+        return read
+
+    def raising(size: int) -> int:
+        if rank == last:
+            raise RuntimeError("a read that failed on purpose")
+        return size
+
+    messages = []
+    try:
+        _NODE_SIZES.pop(ranks, None)
+        dynamicemb_extensions.hier_output_dist_lsa_size = wrapped(lambda size: size)
+        first, second = node_size(dist.group.WORLD), node_size(dist.group.WORLD)
+        checks["read once, then kept"] = (
+            first == second == NODE_SIZE and reads == [rank] and world_size % first == 0
+        )
+        wrong = [
+            ("a size that does not divide", lambda size: world_size + 1, "divide"),
+            ("an error on the last rank", raising, f"rank {last} could not read"),
+        ]
+        if world_size > 1:
+            wrong.insert(
+                0,
+                (
+                    "a size on the last rank",
+                    lambda size: size + (rank == last),
+                    "different LSA teams",
+                ),
+            )
+        for name, change, says in wrong:
+            _NODE_SIZES.pop(ranks, None)
+            dynamicemb_extensions.hier_output_dist_lsa_size = wrapped(change)
+            msg = expect_error(RuntimeError, node_size, dist.group.WORLD)
+            checks[name] = same_everywhere(msg) and says in msg
+            messages.append(msg)
+        # the read that failed is kept: a sharding takes TorchRec's dists
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            hier = standalone(dist.group.WORLD)
+            took = hier.setup(*bucketize_rules(3), False, True)
+        checks["a sharding falls back"] = (
+            took is False
+            and hier.op is None
+            and any(
+                "could not read NCCL's LSA team" in str(warning.message)
+                and "using TorchRec" in str(warning.message)
+                for warning in caught
+            )
+        )
+        del hier
+        # A node the ranks agree on that is not NCCL's team: the op's own
+        # communicator refuses it (its LSA check). Across nodes the node is
+        # every rank, one node, which takes no GIN; on one node it is half
+        # of it, whose two nodes ask for GIN, which NCCL may refuse there
+        # before that check (the warning then says why, not the team).
+        node = world_size if NODES > 1 else max(NODE_SIZE // 2, 1)
+        if node != NODE_SIZE and world_size % node == 0:
+            _NODE_SIZES.pop(ranks, None)
+            dynamicemb_extensions.hier_output_dist_lsa_size = wrapped(lambda size: node)
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always")
+                hier = standalone(dist.group.WORLD)
+                took = hier.setup(*bucketize_rules(3), False, True)
+            said = [
+                str(warning.message)
+                for warning in caught
+                if "using TorchRec" in str(warning.message)
+            ]
+            msg = said[0] if len(said) == 1 else ""
+            team = f"has {NODE_SIZE} ranks, not the {node} of its node"
+            checks["the op refuses a node that is not the team"] = (
+                same_everywhere(msg)
+                and took is False
+                and hier.op is None
+                and msg != ""
+                and (team in msg or (NODES == 1 and "LSA team" not in msg))
+            )
+            messages.append(msg)
+            del hier
+    finally:
+        dynamicemb_extensions.hier_output_dist_lsa_size = real
+        _NODE_SIZES.clear()
+        _NODE_SIZES.update(saved)
+    checks["the sizes' checks"] = (
+        _agreed_node_size([4] * 8, 8) == (4, None)
+        and _agreed_node_size([72] * 144, 144) == (72, None)
+        and "rank 2 one of 8" in _agreed_node_size([4, 4, 8, 4], 4)[1]
+        and "does not divide" in _agreed_node_size([3] * 8, 8)[1]
+        and _first_failure([None, None]) is None
+        and "rank 1 could not read" in _first_failure([None, "why", "and why"])
+    )
+    trays = [f"tray{tray}" for tray in range(18) for _ in range(4)]
+    checks["the hosts' checks"] = (
+        _split_host(["a"] * 8 + ["b"] * 8, 8) is None
+        and _split_host(trays, 72) is None
+        and _split_host(trays, 4) is None
+        and "host a between 8 nodes" in _split_host(["a", "b"] * 8, 1)
+        and "host a between 2 nodes" in _split_host(["a"] * 8 + ["b"] * 4, 4)
+    )
+    torch.cuda.synchronize()
+    dist.barrier()
+    return report("node size from NCCL", checks, log, f": {messages}")
 
 
 # ── models ───────────────────────────────────────────────────────────────────
@@ -574,14 +716,10 @@ def owner_rule(case: Case) -> Callable:
     return lambda keys, feature: bucketized_owners(keys, world_size, rule_of[feature])
 
 
-def capacities_for(
-    case: Case,
-    calls: Sequence[KeyedJaggedTensor],
-    local_size: int,
-) -> Dict:
+def capacities_for(case: Case, calls: Sequence[KeyedJaggedTensor]) -> Dict:
     """The case's ``output_dist_capacity`` for its ``calls`` (this rank's KJT
-    of each): the most any rank needs (``hier_needs``, collective), times
-    1.25 and at least 4096 more."""
+    of each): the most any rank needs (``hier_needs``, collective) on nodes
+    of NODE_SIZE GPUs, times 1.25 and at least 4096 more."""
     tables = {
         feature: table for table, feats in enumerate(case.tables) for feature in feats
     }
@@ -589,7 +727,7 @@ def capacities_for(
         calls,
         tables,
         owner_rule(case),
-        local_size,
+        NODE_SIZE,
         node_dedup=case.node_dedup and not case.clip,
     )
     return hier_capacities(needs)
@@ -616,7 +754,7 @@ def hierarchical_model(
 ) -> DistributedModelParallel:
     """The case's EC on the hierarchical dist alone, with the capacities its
     ``calls`` need."""
-    capacity = capacities_for(case, calls, local_size)
+    capacity = capacities_for(case, calls)
     return build_model(case, "hierarchical", world_size, local_size, capacity)
 
 
@@ -677,11 +815,10 @@ def batch_of(
         keys = torch.randint(0, case.key_range, (num_keys,), generator=gen)
         if case.keys == "hot":
             keys[torch.rand(num_keys, generator=gen) < 1 / 16] = 7
-    local_size = world_size // NODES
-    if case.avoid and NODES > 1 and rank < local_size:
+    if case.avoid and NODES > 1 and rank < NODE_SIZE:
         # roundrobin: a key's owner is key % world_size; the last node's go to
         # the node before
-        keys -= local_size * (keys % world_size >= world_size - local_size).long()
+        keys -= NODE_SIZE * (keys % world_size >= world_size - NODE_SIZE).long()
     index_dtype = torch.int32 if case.int32 else torch.int64
     return KeyedJaggedTensor(
         keys=inputs,
@@ -864,7 +1001,7 @@ class Pair:
         torch.manual_seed(case_idx)
         self.ref_model = build_model(case, "torchrec", world_size, local_size)
         self.ref = sharded_ec(self.ref_model)
-        capacity = capacities_for(case, calls, local_size)
+        capacity = capacities_for(case, calls)
         torch.manual_seed(case_idx)
         with warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter("always")
@@ -1245,7 +1382,7 @@ def run_proxy_rows(rank: int, world_size: int, local_size: int, log: Callable) -
     cap's knob, and "auto" warns and takes TorchRec's dists."""
     # min_proxy_rows_for in common.h: two chunks of keys of the most rows (a
     # row per GPU of the node)
-    least_rows = 4 * local_size
+    least_rows = 4 * NODE_SIZE
     cap_mb = least_rows * 4 * 32 / 2 / (1 << 20)  # half their fp32 rows of 32 columns
     capacity = dict.fromkeys(OUTPUT_DIST_CAPACITY_NAMES, 1 << 16)
     checks: Dict[str, bool] = {}
@@ -1877,9 +2014,9 @@ def run_teardown(rank: int, world_size: int, local_size: int, log: Callable) -> 
     failures = 0
     last = rank == world_size - 1
     # a node peer of the late one
-    node_peer = rank // local_size == (world_size - 1) // local_size and not last
+    node_peer = rank // NODE_SIZE == (world_size - 1) // NODE_SIZE and not last
     # a rail peer of it
-    rail_peer = rank % local_size == (world_size - 1) % local_size and not last
+    rail_peer = rank % NODE_SIZE == (world_size - 1) % NODE_SIZE and not last
     peer = node_peer or rail_peer
     for name, timeout_s, late in (
         ("a peer drops it 3 s late", 20.0, 3.0),
@@ -1952,16 +2089,25 @@ def gc_models(log: Callable) -> int:
 
 
 def main() -> None:
-    global NODES
+    global NODES, NODE_SIZE
+    # local_size: the GPUs of a host (LOCAL_WORLD_SIZE), which the planner
+    # takes; the dist's node is NCCL's LSA team (collective)
     rank, world_size, _, local_size = init_distributed()
-    NODES = world_size // local_size
+    NODE_SIZE = node_size(dist.group.WORLD)
+    NODES = world_size // NODE_SIZE
 
     def log(msg: str) -> None:
         if rank == 0:
             print(msg, flush=True)
 
+    log(
+        f"{world_size} ranks: {NODES} node(s) of {NODE_SIZE} GPUs (NCCL's LSA"
+        f" team), hosts of {local_size} (LOCAL_WORLD_SIZE)"
+    )
+    failures = check_node_size(rank, world_size, log)
+    failures += gc_models(log)
     good = all_true(check_group_shapes(rank, world_size))
-    failures = int(not good)
+    failures += int(not good)
     log(f"op sharding groups: [{'ok' if good else 'FAIL'}]")
     failures += gc_models(log)
     failures += run_agreement(rank, world_size, local_size, log)

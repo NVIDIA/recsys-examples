@@ -62,6 +62,14 @@ class Communicator {
 
   // A new unique id (on one rank; the caller hands it to the others).
   static std::string unique_id();
+  // Collective, before any op: the size of the LSA team NCCL gives `world_size`
+  // ranks, this one `rank`, on the current device. A short-lived communicator
+  // with the unique id `unique_id`, made as the constructor makes the op's (so
+  // with the same multi-node NVLink), tells it; then each rank ends it on its
+  // own (nothing ran on it). The op's node is that team (Python's node_size
+  // reads it here): its ranks reach each other's memory over NVLink. A rank
+  // that fails here raises, as in the constructor.
+  static int64_t lsa_team_size(const std::string &unique_id, int64_t rank, int64_t world_size);
 
   ncclComm_t comm() const { return comm_; }
   const ncclDevComm &dev() const { return dev_; }
@@ -79,8 +87,11 @@ class Communicator {
   bool gin_railed() const { return dev_.ginConnectionsRailed; }
   // What ncclMemAlloc rounds an allocation up to.
   size_t granularity() const { return granularity_; }
+  // Every rank's `values`, as many on every rank, in rank order: rank r's
+  // from r * values.size() (collective, synchronous).
+  std::vector<int> all_gather(const std::vector<int> &values);
   // Every rank's `value`, in rank order (collective, synchronous).
-  std::vector<int> all_gather(int value);
+  std::vector<int> all_gather(int value) { return all_gather(std::vector<int>{value}); }
   // Returns once every rank has called it (collective, synchronous).
   void barrier() { all_gather(0); }
   // Ends the communicator on this rank alone (no collective).

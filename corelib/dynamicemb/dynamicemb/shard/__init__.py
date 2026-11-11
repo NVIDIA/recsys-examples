@@ -43,12 +43,13 @@ from .embeddingbag import (
     DynamicEmbeddingBagCollectionSharder,
     ShardedDynamicEmbeddingBagCollection,
 )
-from .hier_output_dist import quiesce
+from .hier_output_dist import node_size, quiesce
 
 __all__ = [
     "ShardedDynamicEmbeddingCollection",
     "DynamicEmbeddingCollectionSharder",
     "ShardedDynamicEmbeddingBagCollection",
     "DynamicEmbeddingBagCollectionSharder",
+    "node_size",
     "quiesce",
 ]

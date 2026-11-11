@@ -29,7 +29,9 @@ evicted (which keys a full cache evicts depends on their order too). Then:
   forward is a byte copy of the owner's rows (DynamicEmb's
   docs/hier_output_dist.md, section 18);
 * each rank's tables hold the same keys;
-* with fp32 (the PyTorch backend) on one node, every step's loss and logits,
+* with fp32 (the PyTorch backend) on one node (the hierarchical dist's:
+  NCCL's LSA team, the GPUs that reach each other over NVLink, which with
+  multi-node NVLink spans hosts), every step's loss and logits,
   and the tables' rows, are within torch.allclose's defaults: the two dists
   add the same gradient terms per key, in another order. These runs have one
   table, ``item``. Where training is not the same bits from run to run on
@@ -79,7 +81,7 @@ from commons.pipeline.train_pipeline import (
 )
 from commons.utils.distributed_utils import collective_assert
 from configs import KernelBackend
-from dynamicemb.shard import ShardedDynamicEmbeddingCollection, quiesce
+from dynamicemb.shard import ShardedDynamicEmbeddingCollection, node_size, quiesce
 from dynamicemb.shard.rw_sharding import RwSequenceDynamicEmbeddingSharding
 from test_utils import create_model
 from utils.hstu_batch_balancer import HASTUBalancedBatchShuffler
@@ -105,9 +107,10 @@ CHECKPOINT = "./hier_dist_checkpoint"
 
 
 def one_node() -> bool:
-    """Whether every rank of the run is on this node."""
-    world_size = dist.get_world_size()
-    return int(os.environ.get("LOCAL_WORLD_SIZE", world_size)) == world_size
+    """Whether every rank of the run is on one node of the hierarchical
+    dist: NCCL's LSA team (node_size, collective), not LOCAL_WORLD_SIZE, the
+    GPUs of a host."""
+    return node_size(dist.group.WORLD) == dist.get_world_size()
 
 
 def start() -> None:
