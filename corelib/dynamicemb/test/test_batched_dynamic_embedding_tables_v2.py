@@ -56,6 +56,7 @@ from dynamicemb.key_value_table import (
 from dynamicemb.optimizer import (
     BaseDynamicEmbeddingOptimizer,
     DynamicEmbOptimType,
+    RowWiseAdaGradDynamicEmbeddingOptimizer,
     get_optimizer_ckpt_state_dim,
 )
 from dynamicemb.types import KEY_TYPE, CopyMode
@@ -3080,6 +3081,7 @@ def _rowwise_adagrad_bdeb(
     caching: bool,
     local_hbm_for_values: int,
     pooling_mode: DynamicEmbPoolingMode,
+    eps: float = 1e-8,
 ) -> BatchedDynamicEmbeddingTablesV2:
     options = [
         DynamicEmbTableOptions(
@@ -3106,31 +3108,44 @@ def _rowwise_adagrad_bdeb(
         optimizer=EmbOptimType.EXACT_ROWWISE_ADAGRAD,
         use_index_dedup=True,
         learning_rate=0.01,
-        eps=1e-8,
+        eps=eps,
     )
 
 
-@pytest.mark.parametrize(
-    "caching, local_hbm_for_values",
-    [(False, 1024**3), (True, 64 * 1024), (False, 0)],
-    ids=["hbm", "cache", "host"],
-)
-@pytest.mark.parametrize(
-    "pooling_mode", [DynamicEmbPoolingMode.SUM, DynamicEmbPoolingMode.NONE]
-)
-def test_fp8_table_trains_like_fp32_table(caching, local_hbm_for_values, pooling_mode):
+FP8_TABLE_STORAGE = [
+    pytest.param(False, 1024**3, id="hbm"),
+    pytest.param(True, 64 * 1024, id="cache"),
+    pytest.param(False, 0, id="host"),
+]
+
+
+def _train_fp32_and_fp8_tables(
+    caching,
+    local_hbm_for_values,
+    pooling_mode,
+    num_steps,
+    grad_scale=1.0,
+    eps=1e-8,
+    on_step=None,
+):
+    """Train an fp32 and an fp8 row-wise Adagrad table on the same batches.
+
+    ``grad_scale`` scales the loss and so every gradient; ``on_step(step,
+    fp32_output, fp8_output)`` sees each step's lookups. Returns the tables by
+    dtype and the number of features.
+    """
     device = torch.device("cuda:0")
     dims = [16, 16] if pooling_mode == DynamicEmbPoolingMode.NONE else [8, 16, 32]
     tables = {
         value_type: _rowwise_adagrad_bdeb(
-            value_type, dims, caching, local_hbm_for_values, pooling_mode
+            value_type, dims, caching, local_hbm_for_values, pooling_mode, eps
         )
         for value_type in (torch.float32, torch.float8_e4m3fn)
     }
     generator = torch.Generator(device="cpu").manual_seed(0)
     batch_size, pooling = 128, 4
     num_features = len(dims)
-    for step in range(30):
+    for step in range(num_steps):
         indices = torch.randint(
             0, 1500, (batch_size * pooling * num_features,), generator=generator
         ).to(device)
@@ -3141,25 +3156,98 @@ def test_fp8_table_trains_like_fp32_table(caching, local_hbm_for_values, pooling
         for value_type, bdeb in tables.items():
             embs = bdeb(indices, offsets)
             target = torch.linspace(-1, 1, embs.numel(), device=device).view_as(embs)
-            (embs.float() * target).sum().backward()
+            (embs.float() * target * grad_scale).sum().backward()
             outputs[value_type] = embs.detach().float()
-        reference, fp8 = outputs[torch.float32], outputs[torch.float8_e4m3fn]
-        assert torch.isfinite(fp8).all()
-        if step == 0:
-            torch.testing.assert_close(fp8, reference, rtol=0, atol=0)
-        else:
-            error = (fp8 - reference).pow(2).mean().sqrt()
-            assert error < 0.25 * reference.pow(2).mean().sqrt(), step
+        if on_step is not None:
+            on_step(step, outputs[torch.float32], outputs[torch.float8_e4m3fn])
+    return tables, num_features
+
+
+def _fp8_and_fp32_drifts(tables, num_features):
+    """Per table, how far the fp32 and the fp8 table's rows moved from their
+    shared initial value, row by row in the same key order."""
+    device = torch.device("cuda:0")
     for name in [f"table{i}" for i in range(num_features)]:
         keys32, vals32 = tables[torch.float32].export_keys_values(name, device)
         keys8, vals8 = tables[torch.float8_e4m3fn].export_keys_values(name, device)
         assert vals8.dtype == torch.float16
         order32, order8 = keys32.argsort(), keys8.argsort()
         torch.testing.assert_close(keys32[order32], keys8[order8])
-        drift32 = vals32[order32].float() - 12 / 256
-        drift8 = vals8[order8].float() - 12 / 256
+        yield (
+            vals32[order32].float() - 12 / 256,
+            vals8[order8].float() - 12 / 256,
+        )
+
+
+@pytest.mark.parametrize("caching, local_hbm_for_values", FP8_TABLE_STORAGE)
+@pytest.mark.parametrize(
+    "pooling_mode", [DynamicEmbPoolingMode.SUM, DynamicEmbPoolingMode.NONE]
+)
+def test_fp8_table_trains_like_fp32_table(caching, local_hbm_for_values, pooling_mode):
+    def check_step(step, reference, fp8):
+        assert torch.isfinite(fp8).all()
+        if step == 0:
+            torch.testing.assert_close(fp8, reference, rtol=0, atol=0)
+        else:
+            error = (fp8 - reference).pow(2).mean().sqrt()
+            assert error < 0.25 * reference.pow(2).mean().sqrt(), step
+
+    tables, num_features = _train_fp32_and_fp8_tables(
+        caching, local_hbm_for_values, pooling_mode, 30, on_step=check_step
+    )
+    for drift32, drift8 in _fp8_and_fp32_drifts(tables, num_features):
         assert drift32.abs().mean() > 1e-3
         assert (drift8 - drift32).mean().abs() < 0.05 * drift32.abs().mean()
+
+
+@pytest.mark.parametrize("caching, local_hbm_for_values", FP8_TABLE_STORAGE)
+def test_fp8_table_learns_from_gradients_fp16_would_flush(
+    caching, local_hbm_for_values, monkeypatch
+):
+    """An fp8 table takes tiny gradients at fp32, and so still learns from them.
+
+    Row-wise Adagrad's step is lr * g / sqrt(accumulated g^2), which does not
+    depend on how large the gradients are: an fp32 table takes full steps on
+    gradients of 1e-8. fp16 flushes anything below 3e-8 to zero, so an fp8 table
+    whose gradients were lowered to fp16 would not move at all. Every gradient
+    here is at most a few 1e-8, and eps is far below them so it does not skew
+    the step.
+    """
+    seen = []  # (table dtype, gradient dtype) of every update the tables took
+    fused = RowWiseAdaGradDynamicEmbeddingOptimizer.fused_update_for_flat_table
+    padded = RowWiseAdaGradDynamicEmbeddingOptimizer.update_for_padded_buffer
+
+    def spy_fused(self, grads, *args):
+        seen.append((args[-1], grads.dtype))
+        return fused(self, grads, *args)
+
+    def spy_padded(self, grads, values, *args):
+        seen.append((values.dtype, grads.dtype))
+        return padded(self, grads, values, *args)
+
+    monkeypatch.setattr(
+        RowWiseAdaGradDynamicEmbeddingOptimizer,
+        "fused_update_for_flat_table",
+        spy_fused,
+    )
+    monkeypatch.setattr(
+        RowWiseAdaGradDynamicEmbeddingOptimizer, "update_for_padded_buffer", spy_padded
+    )
+
+    tables, num_features = _train_fp32_and_fp8_tables(
+        caching,
+        local_hbm_for_values,
+        DynamicEmbPoolingMode.SUM,
+        20,
+        grad_scale=1e-8,
+        eps=1e-12,
+    )
+
+    fp8_gradients = {grad for table, grad in seen if table == torch.float8_e4m3fn}
+    assert fp8_gradients == {torch.float32}
+    for drift32, drift8 in _fp8_and_fp32_drifts(tables, num_features):
+        assert drift32.abs().mean() > 1e-3, "the fp32 table did not learn"
+        assert drift8.abs().mean() > 0.5 * drift32.abs().mean()
 
 
 def test_optimizer_state_dtype_is_a_grouping_key():
