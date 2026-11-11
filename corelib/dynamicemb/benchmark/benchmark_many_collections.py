@@ -71,6 +71,7 @@ class Config:
     dim: int = 64
     num_embeddings: int = 1_000_000
     alpha: float = 1.05
+    init_capacity_ratio: float = 1.0
     optimizer: str = "sgd"
     hbm_ratio: Optional[float] = None  # caching: None sizes the cache from the inputs
     lr: float = 0.01
@@ -98,6 +99,15 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     add("--hotness", type=int, default=4, help="H: keys per sample and table")
     add("--num-embeddings", type=int, default=1_000_000, help="rows per table")
     add("--alpha", type=float, default=1.05, help="pow-law exponent (more dups if big)")
+    add(
+        "--init-capacity-ratio",
+        type=float,
+        default=1.0,
+        help="init_capacity as a share of --num-embeddings; below 1 the tables can "
+        "still grow (--storage hybrid: below 1 - --hbm-ratio, the share of the rows "
+        "that the host tier holds), so the host keeps track of their size to decide "
+        "whether to expand",
+    )
     add("--optimizer", choices=["sgd", "adam"], default="sgd", help="sparse optimizer")
     add("--lr", type=float, default=0.01, help="learning rate of the sparse optimizer")
     add(
@@ -157,6 +167,8 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     if args.storage in ("caching", "hybrid") and ratio is not None:
         if not 0 < ratio < 1:
             parser.error("--hbm-ratio must be in (0, 1) for --storage caching/hybrid")
+    if not 0 < args.init_capacity_ratio <= 1:
+        parser.error("--init-capacity-ratio must be in (0, 1]")
     return args
 
 
@@ -314,6 +326,9 @@ def make_collection(
             embedding_dtype=torch.float32,
             dim=cfg.dim,
             max_capacity=cfg.num_embeddings,
+            init_capacity=max(1, int(cfg.init_capacity_ratio * cfg.num_embeddings))
+            if cfg.init_capacity_ratio < 1
+            else None,
             local_hbm_for_values=int(ratio * cfg.num_embeddings * cfg.row_bytes),
             bucket_capacity=128,
             initializer_args=de.DynamicEmbInitializerArgs(
@@ -628,8 +643,12 @@ def load_results(path: str) -> Tuple[Dict[str, Any], Dict[Tuple, Dict[str, Any]]
     """Meta and the good points of a --json file, keyed by their configuration."""
     with open(path) as f:
         data = json.load(f)
+    # A file written before a setting existed ran with its default.
+    defaults = {"init_capacity_ratio": 1.0}
     rows = {
-        tuple(v for k, v in sorted(r["config"].items()) if k != "seed"): r
+        tuple(
+            v for k, v in sorted({**defaults, **r["config"]}.items()) if k != "seed"
+        ): r
         for r in data["results"]
         if "error" not in r
     }
