@@ -567,10 +567,15 @@ of the key range on one node at the configuration below, 66% on four). This
 is the same for every dist. No loss is computed. The forward returns a zero
 in its place, and the backward gives each looked-up row a gradient drawn
 once before the run: +1 or -1 per element, from `--seed` and the rank, so
-every dist gets the same. At many features the step still holds the host's
-work of handing each feature's rows their gradient (a loop over the
-features and an autograd edge per feature, about 1 µs per feature), as any
-consumer of the EC's per-feature output would. It runs a plain training
+every dist gets the same. The EC returns its rows as one `JaggedTensor`
+over all features, in the input's order: the benchmark replaces TorchRec's
+`construct_jagged_tensors`, which splits them into a `JaggedTensor` per
+feature, with one that keeps them whole (TorchRec's expansion of index
+dedup, an `index_select` by the reverse indices, stays). That split is host
+work that grows with the features, the same for every dist (about 4 ms at
+1,024 features on GB300), and its backward is a cat of the features'
+gradients. So the step holds no work per feature outside the dists, and the
+gradient goes to the rows in one autograd edge. It runs a plain training
 loop (the forward, then `backward()` on that zero, each timed on its own) or
 one of TorchRec's train pipelines, with one of these ways to move keys and
 rows between GPUs (`--output_dist`):
@@ -801,10 +806,13 @@ time that no kernel above covers.
   whatever the features: at 4.2 million keys the forward takes 5.2, 14.7 to
   14.8 and 20.7 ms on 1, 2 and 4 nodes at both 1,024 × 4,096 and 4,096 ×
   1,024.
-* The rest is host time that grows with the features: TorchRec's
-  EmbeddingCollection gives a JaggedTensor per feature, and autograd has an
-  edge per feature. It is 18 to 36 ms of the step at 4,096 features and at
-  most 3.6 ms at 1,024; TorchRec's dists pay it too.
+* The rest is host time that grows with the features: in these runs
+  TorchRec's EmbeddingCollection gave a JaggedTensor per feature, and
+  autograd had an edge per feature. It is 18 to 36 ms of the step at 4,096
+  features and at most 3.6 ms at 1,024; TorchRec's dists pay it too. The
+  benchmark no longer builds a JaggedTensor per feature (see above), so
+  these tables, measured before that change, hold this work in the step of
+  both dists and in the other kernels (the cat of the features' gradients).
 
 Before these runs, the benchmark drew a new batch every iteration and summed
 each feature's rows into a loss (two or three kernels per feature), so its
@@ -847,8 +855,8 @@ kernels within about 1%.
 | `--kernel_times` | off | After the timed iterations, as many again under a CUDA-only profiler. It reports every call's output-dist kernel times, with their wait at the start for the other ranks (the hierarchical dist only). |
 | `--host_stages` | off | Plain loop, to find problems. Per call: the CPU time spent waiting for the GPU, by place in the code. |
 | `--nic_counters` | off | read every InfiniBand port's counters on each host before and after the timed iterations, and report what each sent and received |
-| `--nvtx` | off | for Nsight Systems: NVTX ranges of each timed iteration (`iteration i`, with its `forward` and `backward`) and of the stages (`bench::input_dist` and the like), in every iteration; and the timed iterations between `cudaProfilerStart` and `cudaProfilerStop`, so that `nsys profile -c cudaProfilerApi --capture-range-end=stop` captures them alone; the ranks meet in a barrier after `cudaProfilerStart`, so a rank whose capture takes seconds to start does not hold up the others' first timed iteration |
-| `--nvtx_ops` | off | with `--nvtx`, also an NVTX range per PyTorch op of the timed iterations (`torch.autograd.profiler.emit_nvtx`), the backward's autograd nodes included; their host time is then in the timings |
+| `--nvtx` | off | for Nsight Systems: NVTX ranges of each timed iteration (`iteration i`, with its `forward` and `backward`) and of the stages (`bench::input_dist` and the like), in every iteration; and the timed iterations between `cudaProfilerStart` and `cudaProfilerStop`, so that `nsys profile -c cudaProfilerApi --capture-range-end=stop` captures them alone; the ranks meet in a barrier after `cudaProfilerStart`, so a rank whose capture takes seconds to start does not hold up the others' first timed iteration. To read a run's numbers in a capture, capture that run: the same options (`--num_iterations` and `--warmup` above all, since a shorter window can miss what a longer one holds) plus `--nvtx`, and compare the capture's step with the run's |
+| `--nvtx_ops` | off | with `--nvtx`, also an NVTX range per PyTorch op of the timed iterations (`torch.autograd.profiler.emit_nvtx`), the backward's autograd nodes included; their host time, on every rank, is then in the timings, so a capture with it is for reading ops, not for timing |
 | `--json_out` | none | append the results as one JSON line to this file |
 
 #### Metrics

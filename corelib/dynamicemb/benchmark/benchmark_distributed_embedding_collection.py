@@ -20,9 +20,10 @@ and keys are random, and the iterations take them in turn, so the amount of
 data every rank sends and receives changes from one iteration to the next,
 and no iteration repeats the one before it. From the third call on, the
 lookups find their keys in the tables (the first two calls inserted them),
-which hold only the two batches' keys. No loss is computed: the backward
-gives the looked-up rows gradients drawn once, before the run
-(``inject_grads``).
+which hold only the two batches' keys. The EC returns its rows as one
+JaggedTensor over all features, not one per feature
+(``install_flat_output``). No loss is computed: the backward gives the
+looked-up rows gradients drawn once, before the run (``inject_grads``).
 
 Launch with torchrun or srun, one process per GPU::
 
@@ -48,6 +49,7 @@ from typing import Dict, List, Optional, Tuple, Union
 import torch
 import torch.distributed as dist
 import torchrec
+import torchrec.distributed.embedding as torchrec_embedding
 from benchmark_utils import (
     IB_PEAK_GBPS,
     NVLINK_PEAK_GBPS,
@@ -90,6 +92,7 @@ from torchrec.distributed.train_pipeline import (
 )
 from torchrec.distributed.types import BoundsCheckMode, ShardingType
 from torchrec.modules.embedding_configs import DataType
+from torchrec.sparse.jagged_tensor import JaggedTensor
 from torchrec.streamable import Pipelineable
 
 _OPTIMIZERS = {
@@ -228,33 +231,25 @@ def with_output_grads(
     or -1 (exact in every dtype, which ``--check`` needs). Its generator is
     its own, seeded by ``cfg.seed`` and ``rank``, so every run of a
     configuration gets the same, whatever its dists. A batch's gradients are
-    the buffer's first rows, one per key, split by feature as the sequence
-    EC's output is (each feature's keys, in the KJT's order).
+    the buffer's first rows, one per key, in the KJT's order: the order of the
+    EC's output (:func:`install_flat_output`).
     """
-    # keys per feature and batch, from the lengths (every feature has the
-    # same samples): a KJT keeps the totals it is asked for, and a call on
-    # it must find its own
-    counts = [
-        kjt.lengths().view(len(kjt.keys()), -1).sum(dim=1).tolist() for kjt in batches
-    ]
+    # keys per batch, from the lengths: a KJT keeps the totals it is asked
+    # for, and a call on it must find its own
+    counts = [int(kjt.lengths().sum()) for kjt in batches]
     # seeded apart from the batches (generate_batches)
     generator = torch.Generator(device=device)
     generator.manual_seed(cfg.seed * 7919 + rank + (1 << 32))
     grad = torch.randint(
         0,
         2,
-        (max(sum(per_feature) for per_feature in counts), cfg.embedding_dim),
+        (max(counts), cfg.embedding_dim),
         generator=generator,
         device=device,
         dtype=_OUTPUT_DTYPES[cfg.output_dtype].as_dtype(),
     )
     grad.mul_(2).sub_(1)
-    out = []
-    for kjt, per_feature in zip(batches, counts):
-        rows = grad[: sum(per_feature)]
-        grads = dict(zip(kjt.keys(), rows.split(per_feature)))
-        out.append(Batch(kjt, rows, grads))
-    return out
+    return [Batch(kjt, grad[:count]) for kjt, count in zip(batches, counts)]
 
 
 # ── model ───────────────────────────────────────────────────────────────────
@@ -262,19 +257,14 @@ def with_output_grads(
 
 class Batch(Pipelineable):
     """One call's input, as TorchRec's train pipelines move it: the
-    features, and the gradients their embeddings get in the backward
-    (:func:`inject_grads`): ``grad``, a row per key, and ``grads``, each
-    feature's rows of it (views), by feature name."""
+    features, and ``grad``, the gradients their embeddings get in the
+    backward (:func:`inject_grads`), a row per key in the KJT's order."""
 
     def __init__(
-        self,
-        features: torchrec.KeyedJaggedTensor,
-        grad: torch.Tensor,
-        grads: Dict[str, torch.Tensor],
+        self, features: torchrec.KeyedJaggedTensor, grad: torch.Tensor
     ) -> None:
         self.features = features
         self.grad = grad
-        self.grads = grads
 
     def fresh(self) -> "Batch":
         """The same batch on a KJT of its own (the same tensors): a call
@@ -290,31 +280,25 @@ class Batch(Pipelineable):
                 offsets=kjt.offsets(),
             ),
             self.grad,
-            self.grads,
         )
 
     def to(self, device: torch.device, non_blocking: bool = False) -> "Batch":
-        # One call for the gradients, not one per feature (a pipeline moves
-        # every batch): the views are made again only if their rows moved.
-        grad = self.grad.to(device=device, non_blocking=non_blocking)
-        grads = self.grads
-        if grad is not self.grad:
-            sizes = [view.size(0) for view in grads.values()]
-            grads = dict(zip(grads, grad.split(sizes)))
         return Batch(
-            self.features.to(device=device, non_blocking=non_blocking), grad, grads
+            self.features.to(device=device, non_blocking=non_blocking),
+            self.grad.to(device=device, non_blocking=non_blocking),
         )
 
     def record_stream(self, stream: torch.Stream) -> None:
         self.features.record_stream(stream)
-        self.grad.record_stream(stream)  # the views' storage
+        self.grad.record_stream(stream)
 
 
 class EmbeddingModel(torch.nn.Module):
     """The EC, with no loss: ``forward(batch)`` returns a zero in its place,
     whose backward gives the embeddings the batch's gradients
-    (:func:`inject_grads`), and the embeddings, as TorchRec's train
-    pipelines expect."""
+    (:func:`inject_grads`), and the embeddings (one JaggedTensor over all
+    features: :func:`install_flat_output`), as TorchRec's train pipelines
+    expect."""
 
     def __init__(self, ec: torchrec.EmbeddingCollection) -> None:
         super().__init__()
@@ -322,7 +306,7 @@ class EmbeddingModel(torch.nn.Module):
 
     def forward(self, batch: Batch):
         out = self.ec(batch.features)
-        return inject_grads(out, batch.grads), out
+        return inject_grads(out, batch.grad), out
 
 
 def build_model(
@@ -453,43 +437,89 @@ def _hier_op(model):
 
 
 class _GradInjection(torch.autograd.Function):
-    """``forward(grads, *values)``: a zero (one small kernel) for a loss.
-    The backward gives each of ``values`` the gradient at its position in
-    ``grads`` (drawn before the run: :func:`with_output_grads`), whatever
-    gradient the zero gets, and launches nothing."""
+    """``forward(grad, values)``: a zero (one small kernel) for a loss. The
+    backward gives ``values`` the gradient ``grad`` (drawn before the run:
+    :func:`with_output_grads`), whatever gradient the zero gets, and
+    launches nothing."""
 
     @staticmethod
-    def forward(
-        ctx, grads: Tuple[torch.Tensor, ...], *values: torch.Tensor
-    ) -> torch.Tensor:
-        ctx.out_grads = grads
-        return values[0].new_zeros(())
+    def forward(ctx, grad: torch.Tensor, values: torch.Tensor) -> torch.Tensor:
+        ctx.out_grad = grad
+        return values.new_zeros(())
 
     @staticmethod
-    def backward(ctx, _) -> Tuple[Optional[torch.Tensor], ...]:
-        return (None, *ctx.out_grads)
+    def backward(ctx, _) -> Tuple[None, torch.Tensor]:
+        return None, ctx.out_grad
 
 
-def inject_grads(out, grads: Dict[str, torch.Tensor]) -> torch.Tensor:
-    """In place of a loss over the looked-up embeddings ``out``: a zero
-    whose backward gives each feature's rows in ``out`` their gradient in
-    ``grads`` (by feature name). It launches no kernel but that zero,
-    however many the features; its host work (this loop, and one autograd
-    node with an edge per feature) still grows with them, about 1 us per
-    feature. Opaque to the train pipelines' fx tracing."""
-    values, ordered = [], []
-    for name, jagged in out.items():
-        values.append(jagged.values())
-        ordered.append(grads[name])
-    # autograd would cast gradients of another dtype, a kernel per feature
-    assert ordered[0].dtype == values[0].dtype, (
-        f"the output gradients are {ordered[0].dtype}, the embeddings"
-        f" {values[0].dtype}"
+def inject_grads(out: Dict[str, JaggedTensor], grad: torch.Tensor) -> torch.Tensor:
+    """In place of a loss over the looked-up embeddings ``out``, the EC's one
+    JaggedTensor over all features (:func:`install_flat_output`): a zero
+    whose backward gives its rows ``grad``, a row per key in the KJT's order.
+    It launches no kernel but that zero, and its host work does not grow
+    with the features. Opaque to the train pipelines' fx tracing."""
+    (values,) = [jagged.values() for jagged in out.values()]
+    # autograd would cast a gradient of another dtype (a kernel)
+    assert values.shape == grad.shape and values.dtype == grad.dtype, (
+        f"the output gradients are {tuple(grad.shape)} {grad.dtype}, the"
+        f" embeddings {tuple(values.shape)} {values.dtype}"
     )
-    return _GradInjection.apply(tuple(ordered), *values)
+    return _GradInjection.apply(grad, values)
 
 
 torch.fx.wrap("inject_grads")
+
+
+# The name of the EC's one JaggedTensor (install_flat_output).
+_ALL_FEATURES = "all_features"
+
+
+def _flat_jagged_tensors(
+    embeddings: torch.Tensor,
+    features: torchrec.KeyedJaggedTensor,
+    embedding_names: List[str],
+    need_indices: bool = False,
+    features_to_permute_indices: Optional[Dict[str, List[int]]] = None,
+    original_features: Optional[torchrec.KeyedJaggedTensor] = None,
+    reverse_indices: Optional[torch.Tensor] = None,
+    seq_vbe_ctx=None,
+    use_gather_select: bool = False,
+) -> Dict[str, JaggedTensor]:
+    """TorchRec's ``construct_jagged_tensors`` without its split by feature:
+    a sharding's rows, with index dedup expanded as TorchRec expands it (when
+    the output dist leaves it to TorchRec: TorchRec's dists; the hierarchical
+    dist writes every original row itself), in the input KJT's order, as one
+    JaggedTensor over all features. The split (a view, a JaggedTensor and a
+    row of lengths per feature) is host work that grows with the features,
+    the same for every dist, and its backward is a cat of the features'
+    gradients: neither is the embedding's."""
+    assert (
+        not need_indices and not features_to_permute_indices and seq_vbe_ctx is None
+    ), (
+        "the benchmark's EC returns no indices, and has no column-wise sharding"
+        " and no variable batch"
+    )
+    if original_features is not None:
+        features = original_features
+    if reverse_indices is not None:
+        if use_gather_select:
+            expanded = reverse_indices.unsqueeze(1).expand(-1, embeddings.size(-1))
+            embeddings = torch.gather(embeddings, 0, expanded)
+        else:
+            embeddings = torch.index_select(
+                embeddings, 0, reverse_indices.to(torch.int32)
+            )
+    return {_ALL_FEATURES: JaggedTensor(values=embeddings, lengths=features.lengths())}
+
+
+def install_flat_output() -> None:
+    """The EC's output as one JaggedTensor over all features
+    (:func:`_flat_jagged_tensors`), in place of one per feature: TorchRec's
+    ``EmbeddingCollectionAwaitable`` builds it with its module's
+    ``construct_jagged_tensors``. One sharding takes all features (every
+    table is row-wise), so the output has one entry, which
+    :func:`inject_grads` checks."""
+    torchrec_embedding.construct_jagged_tensors = _flat_jagged_tensors
 
 
 def train_pipeline(cfg: BenchConfig, model: DistributedModelParallel):
@@ -826,12 +856,10 @@ def _wrap_once(module: torch.nn.Module, stage: str) -> None:
 
 
 # Autograd node -> stage, for kernels launched during backward; any other
-# node's land in bwd/other, the backward of the EC's per-feature split among
-# them (SplitWithSizesBackward: a cat of the features' gradients, which the
-# backward of inject_grads hands it, launching nothing itself). Forward
-# kernels outside the stage ranges land in fwd/other: the zero inject_grads
-# returns (one kernel), and the scalar gradient loss.backward() starts from
-# (under a pipeline, with its sum of the losses).
+# node's land in bwd/other. Forward kernels outside the stage ranges land in
+# fwd/other: the zero inject_grads returns (one kernel), and the scalar
+# gradient loss.backward() starts from (under a pipeline, with its sum of the
+# losses).
 _BACKWARD_STAGES = [
     (re.compile(r"DynamicEmbeddingFunction"), "lookup"),
     (re.compile(r"All2All_Seq"), "output_dist"),
@@ -1786,7 +1814,7 @@ def check_against_torchrec(
                 row = int(bad[0]) if bad.numel() else 0
                 diff = (expected.float() - got.float()).abs().max().item()
                 print(
-                    f"[rank {rank}] step {step} feature {name}: {bad.numel()} of"
+                    f"[rank {rank}] step {step} {name}: {bad.numel()} of"
                     f" {expected.shape[0]} rows differ, max abs diff {diff:.3e}; row {row}:"
                     f" torchrec {expected[row, :4].tolist()}"
                     f" hierarchical {got[row, :4].tolist()}",
@@ -1829,6 +1857,7 @@ def run(cfg: BenchConfig) -> Dict:
     # rows over NVLink and IB, the capacities, the trace), read collectively
     # before the timed iterations
     node_size = hier_node_size(local_size)
+    install_flat_output()
     install_stage_markers()
     torchrec_traffic = TorchRecTraffic(rank, node_size)
     hier_traffic = HierTraffic(rank, node_size)
