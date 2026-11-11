@@ -776,7 +776,9 @@ After that, the input dist's fusions (the bucketize as a counting sort by
 owner, the proxy's steps bounded by the counts the device holds and its
 scans by CUB, the requester's tables in one kernel;
 [docs/hier_output_dist.md](../docs/hier_output_dist.md), section 10)
-shorten the input dist and leave the output dist's kernels as they were.
+shorten the input dist and leave the output dist's kernels within about 1%
+(the backward kernel at 4,096 × 1,024 on 2 nodes is 1.3% slower in every
+round).
 Three rounds on four nodes, before and after in alternating order
 (medians over the rounds, in ms):
 
@@ -803,8 +805,8 @@ Three rounds on four nodes, before and after in alternating order
   is the benchmark's host work, which differs between ranks: in both trees
   the ranks of one or two nodes reach the backward kernel last, and the
   others wait for them in it (averaged over the ranks, the backward kernel
-  takes 26-31 ms in the rounds before and 27-37 ms after; on the last rank,
-  20.8 ms).
+  takes 26-31 ms in the rounds before and 27-37 ms after; on the rank that
+  arrives last, 20.8-21.0 ms in every round of both).
 
 #### Options
 
