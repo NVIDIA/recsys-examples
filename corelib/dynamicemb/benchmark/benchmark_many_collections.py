@@ -13,15 +13,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Benchmark many separate DynamicEmb collections next to a tiny dense part.
+"""Benchmark the lookup of many separate DynamicEmb collections.
 
 Every step runs K independent BatchedDynamicEmbeddingTablesV2 modules (each is its
-own lookup group), feeds their pooled outputs to a tiny MLP and back-propagates, so
-GPU work per step is small and CPU launch latency and blocking host syncs dominate.
-Only public DynamicEmb APIs are used (plus a guarded read of ``_storage_layout`` to
-check the layout): run the same script on each tree with --json and print the
-before/after table with --compare.  One GPU; no torchrun, process group or TorchRec.
-See benchmark/README.md, section 3.
+own lookup group) on the next of a few pre-built inputs, taken in turn, and nothing
+else: the modules' forward and their backward with the fused sparse update, driven by
+gradients built beforehand.  There is no dense part, no loss and no data creation in
+the timed region, so GPU work per step is small and CPU launch latency and blocking
+host syncs dominate.  The inputs share no key: a cache that cannot hold all of them
+is refreshed at every step.  Only public DynamicEmb APIs are used (plus a guarded read
+of ``_storage_layout`` to check the layout): run the same script on each tree with
+--json and print the before/after table with --compare.  One GPU; no torchrun,
+process group or TorchRec.  See benchmark/README.md, section 3.
 """
 
 from __future__ import annotations
@@ -46,13 +49,17 @@ if TYPE_CHECKING:
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # dataset_generator
 
-Batch = Tuple[List["torch.Tensor"], "torch.Tensor"]  # keys of each collection, labels
+Batch = List["torch.Tensor"]  # the keys of each collection
 # The StorageLayout the library must pick for each --storage choice.
 LAYOUTS = dict(hbm="HBM_ONLY", caching="CACHING", hybrid="HYBRID", host="HOST_ONLY")
 GIB = 2**30
 META_BYTES_PER_ROW = 32  # hash-table key, digest, score, value row, ref count (approx.)
 SYNC_KINDS = ("stream_sync", "device_sync", "event_sync", "memcpy_sync")
 SWEEP_COLLECTIONS, SWEEP_BATCH_SIZES = (1, 4, 16, 64), (256, 1024, 4096)  # --sweep grid
+# Default --hbm-ratio of the layouts that take one: the HBM tier of a hybrid layout. The
+# cache of a caching layout is sized from the inputs unless --hbm-ratio is given.
+HBM_RATIO = dict(hybrid=0.1)
+CACHE_BUCKET = 1024  # rows per bucket of a cache: its capacity is a multiple of this
 
 
 @dataclass(frozen=True)
@@ -68,9 +75,9 @@ class Config:
     num_embeddings: int = 1_000_000
     alpha: float = 1.05
     optimizer: str = "sgd"
-    hbm_ratio: float = 0.1
+    hbm_ratio: Optional[float] = None  # caching: None sizes the cache from the inputs
     lr: float = 0.01
-    pool: int = 16
+    inputs: int = 2
     seed: int = 0
 
     @property
@@ -81,8 +88,9 @@ class Config:
 
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Step time of K separate DynamicEmb collections plus a tiny dense "
-        "part: shows what blocking host syncs inside DynamicEmb cost.",
+        description="Step time of the lookup of K separate DynamicEmb collections "
+        "(forward and backward, nothing else): shows what blocking host syncs inside "
+        "DynamicEmb cost.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     add = parser.add_argument
@@ -94,9 +102,15 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     add("--num-embeddings", type=int, default=1_000_000, help="rows per table")
     add("--alpha", type=float, default=1.05, help="pow-law exponent (more dups if big)")
     add("--optimizer", choices=["sgd", "adam"], default="sgd", help="sparse optimizer")
-    add("--lr", type=float, default=0.01, help="learning rate, sparse and dense")
-    add("--pool", type=int, default=16, help="distinct pre-built batches, cycled")
-    add("--seed", type=int, default=0, help="seed of the key and label generators")
+    add("--lr", type=float, default=0.01, help="learning rate of the sparse optimizer")
+    add(
+        "--inputs",
+        type=int,
+        default=2,
+        help="pre-built inputs, used in turn; each draws its keys from its own slice of "
+        "the rows, so no two share a key (1: the same input at every step)",
+    )
+    add("--seed", type=int, default=0, help="seed of the key and gradient generators")
     add(
         "--storage",
         choices=list(LAYOUTS),
@@ -104,7 +118,15 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         help="hbm: all in HBM; caching: HBM cache over host storage; hybrid: partial "
         "HBM without cache; host: host memory only",
     )
-    add("--hbm-ratio", type=float, default=0.1, help="HBM share of caching/hybrid")
+    add(
+        "--hbm-ratio",
+        type=float,
+        default=argparse.SUPPRESS,
+        help="HBM share of the rows for caching (the cache) and hybrid (the HBM tier). "
+        f"Default: hybrid {HBM_RATIO['hybrid']}; caching, the smallest cache that holds "
+        "the unique keys of an input, which misses on the other inputs' keys at every "
+        "step (see the README)",
+    )
     skip = argparse.SUPPRESS
     add("--warmup", type=int, default=skip, help="untimed steps (30; 20 with --sweep)")
     add("--steps", type=int, default=skip, help="timed steps (200; 100 with --sweep)")
@@ -127,10 +149,17 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         help="print the speedup of run B over run A and exit (no GPU needed)",
     )
     args = parser.parse_args(argv)
-    if min(args.collections, args.tables, args.pool, args.windows) < 1:
-        parser.error("--collections, --tables, --pool and --windows must be >= 1")
-    if args.storage in ("caching", "hybrid") and not 0 < args.hbm_ratio < 1:
-        parser.error("--hbm-ratio must be in (0, 1) for --storage caching/hybrid")
+    args.hbm_ratio = getattr(args, "hbm_ratio", HBM_RATIO.get(args.storage))
+    if min(args.collections, args.tables, args.inputs, args.windows) < 1:
+        parser.error("--collections, --tables, --inputs and --windows must be >= 1")
+    if args.num_embeddings // args.inputs < 2:
+        parser.error("--num-embeddings must be at least 2 per input")
+    if args.alpha == 1:
+        parser.error("--alpha must not be 1: the pow-law helper divides by 1 - alpha")
+    ratio = args.hbm_ratio
+    if args.storage in ("caching", "hybrid") and ratio is not None:
+        if not 0 < ratio < 1:
+            parser.error("--hbm-ratio must be in (0, 1) for --storage caching/hybrid")
     return args
 
 
@@ -150,15 +179,22 @@ def git_info(path: str) -> Dict[str, Any]:
 
 
 def run_meta(device: torch.device) -> Dict[str, Any]:
-    """Where the numbers come from: tree commit, library path, versions, GPU."""
+    """Where the numbers come from: tree commit, library and extension paths, versions, GPU."""
     import dynamicemb
     import torch
 
+    try:  # the compiled part of a tree: a mismatched pair would be a different library
+        import dynamicemb_extensions
+
+        extension = os.path.abspath(dynamicemb_extensions.__file__)
+    except ImportError:
+        extension = None
     package = os.path.dirname(os.path.abspath(dynamicemb.__file__))
     here = os.path.dirname(os.path.abspath(__file__))
     return {
         **(git_info(package) or git_info(here)),
         "dynamicemb_path": package,
+        "dynamicemb_extension": extension,
         "torch": torch.__version__,
         "cuda": torch.version.cuda,
         "gpu": torch.cuda.get_device_name(device),
@@ -168,10 +204,10 @@ def run_meta(device: torch.device) -> Dict[str, Any]:
 
 
 def plan_memory(cfg: Config) -> Dict[str, float]:
-    """Planned memory in GiB: table values per tier, hash-table metadata, data pool."""
+    """Planned memory in GiB: table values per tier, hash-table metadata, inputs."""
     n_tables = cfg.collections * cfg.tables
     values = n_tables * cfg.num_embeddings * cfg.row_bytes
-    ratio = cfg.hbm_ratio
+    ratio = cfg.hbm_ratio or 0.0  # a cache sized from the inputs is a few K rows: ~0
     hbm, host = {
         "hbm": (values, 0.0),
         "caching": (ratio * values, values),  # HBM is a cache; host holds every row
@@ -182,48 +218,96 @@ def plan_memory(cfg: Config) -> Dict[str, float]:
         "hbm_values": hbm,
         "host_values": host,
         "metadata": n_tables * cfg.num_embeddings * META_BYTES_PER_ROW,
-        "pool": cfg.pool * cfg.batch_size * (n_tables * cfg.hotness * 8 + 4),
+        # int64 keys of every input, fp32 gradient of every pooled output
+        "data": cfg.batch_size
+        * (cfg.inputs * n_tables * cfg.hotness * 8 + n_tables * cfg.dim * 4),
     }
     plan = {name: nbytes / GIB for name, nbytes in plan.items()}
-    plan["hbm_total"] = plan["hbm_values"] + plan["metadata"] + plan["pool"]
+    plan["hbm_total"] = plan["hbm_values"] + plan["metadata"] + plan["data"]
     return plan
 
 
-def build_pool(cfg: Config, device: torch.device) -> Tuple[torch.Tensor, List[Batch]]:
-    """Pre-build ``cfg.pool`` distinct batches on the GPU, plus the shared offsets.
+def build_inputs(cfg: Config, device: torch.device) -> Tuple[torch.Tensor, List[Batch]]:
+    """Pre-build ``cfg.inputs`` inputs on the GPU, plus the shared offsets.
 
-    Keys come from the pow-law helper of dataset_generator.py.  Bags are
-    feature-major as in a KeyedJaggedTensor: bag ``table * B + sample`` owns keys
-    ``[bag * H, (bag + 1) * H)`` of every collection's index tensor.
+    Every input draws its keys from the pow-law helper of dataset_generator.py over
+    ``R = num_embeddings // inputs`` rows and shifts them by ``s * R``: the same
+    distribution in its own slice ``[s * R + 1, (s + 1) * R]`` of the rows, so no two
+    inputs share a key.  Taken in turn, a step does not find in a cache the keys of the
+    previous step, and finds those of its own earlier use as far as the cache holds them.
+    Bags are feature-major as in a KeyedJaggedTensor: bag ``table * B + sample`` owns
+    keys ``[bag * H, (bag + 1) * H)`` of every collection's index tensor.
     """
     import torch
     from dataset_generator import PowerLaw
 
     k, t, b, h = cfg.collections, cfg.tables, cfg.batch_size, cfg.hotness
+    span = cfg.num_embeddings // cfg.inputs
     offsets = torch.arange(t * b + 1, device=device, dtype=torch.int64) * h
-    batches: List[Batch] = []
-    for _ in range(cfg.pool):
-        keys = PowerLaw(1, cfg.num_embeddings, cfg.alpha, k * t * b * h, device)
-        labels = torch.randint(0, 2, (b,), device=device, dtype=torch.float32)
-        batches.append((list(keys.view(k, t * b * h).unbind(0)), labels))
-    return offsets, batches
+    inputs: List[Batch] = []
+    for s in range(cfg.inputs):
+        keys = PowerLaw(1, span + 1, cfg.alpha, k * t * b * h, device) + s * span
+        inputs.append(list(keys.view(k, t * b * h).unbind(0)))
+    return offsets, inputs
 
 
-def key_stats(cfg: Config, batches: List[Batch]) -> Dict[str, float]:
-    """Unique-key statistics of collection 0, table 0 over the data pool."""
+def key_stats(cfg: Config, inputs: List[Batch]) -> Dict[str, float]:
+    """Unique-key statistics of collection 0, table 0 over the inputs."""
     import torch
 
     n = cfg.batch_size * cfg.hotness
-    per_batch = [indices[0][:n] for indices, _ in batches]
-    unique = sum(torch.unique(keys).numel() for keys in per_batch)
+    per_input = [keys[0][:n] for keys in inputs]
+    unique = [torch.unique(keys).numel() for keys in per_input]
     return {
         "keys_per_table": n,
-        "unique_ratio": unique / (n * len(per_batch)),
-        "working_set": torch.unique(torch.cat(per_batch)).numel(),
+        "unique_per_input": sum(unique) / len(unique),
+        "unique_ratio": sum(unique) / (n * len(per_input)),
+        "working_set": torch.unique(torch.cat(per_input)).numel(),
     }
 
 
-def make_collection(cfg: Config, k: int, device: torch.device) -> Any:
+def cache_rows(unique: int, num_embeddings: int) -> int:
+    """The rows of the default cache of a caching layout: the smallest multiple of
+    ``CACHE_BUCKET`` that holds ``unique`` keys.
+
+    A cache as large as the table is the table: the library builds an HBM-only layout
+    then, so a table that small is refused here, before any module is built.
+    """
+    rows = -(-unique // CACHE_BUCKET) * CACHE_BUCKET
+    if rows >= num_embeddings:
+        raise ValueError(
+            f"--storage caching needs a cache smaller than the table: an input has "
+            f"{unique} unique keys per table, which take a cache of {rows} rows (a "
+            f"multiple of {CACHE_BUCKET}), and --num-embeddings is {num_embeddings}. "
+            "Raise --num-embeddings, lower --batch-size or --hotness, or use another "
+            "--storage."
+        )
+    return rows
+
+
+def cache_ratio(cfg: Config, inputs: List[Batch]) -> float:
+    """The ``--hbm-ratio`` that gives a caching layout its default cache: the smallest
+    one that holds the unique keys of any input in any table of collection 0.
+
+    A cache holds a multiple of ``CACHE_BUCKET`` rows, and at the defaults (about 2.1K
+    unique keys per table and input) that is 3072: one input and about 45% of the
+    other, so a step misses on the rest.  The library raises when the unique keys of a
+    step do not fit its cache, so a size taken from the inputs works at any batch size.
+    """
+    import torch
+
+    n = cfg.batch_size * cfg.hotness
+    unique = max(
+        torch.unique(keys[0][t * n : (t + 1) * n]).numel()
+        for keys in inputs
+        for t in range(cfg.tables)
+    )
+    return cache_rows(unique, cfg.num_embeddings) / cfg.num_embeddings
+
+
+def make_collection(
+    cfg: Config, k: int, device: torch.device, hbm_ratio: Optional[float]
+) -> Any:
     """Collection ``k``: one BatchedDynamicEmbeddingTablesV2 of T pooled tables."""
     import dynamicemb as de
     import torch
@@ -232,7 +316,7 @@ def make_collection(cfg: Config, k: int, device: torch.device) -> Any:
     # The layout follows from the HBM budget (see _create_cache_storage): a budget
     # covering the table is HBM-only, none is host-only, in between is a cache
     # (caching=True) or a hybrid split (caching=False).
-    ratio = {"hbm": 2.0, "host": 0.0}.get(cfg.storage, cfg.hbm_ratio)
+    ratio = {"hbm": 2.0, "host": 0.0}.get(cfg.storage, hbm_ratio)
     options = [
         de.DynamicEmbTableOptions(
             index_type=torch.int64,
@@ -263,51 +347,60 @@ def make_collection(cfg: Config, k: int, device: torch.device) -> Any:
 
 
 class Workload:
-    """K DynamicEmb collections and a tiny dense net; ``step`` is one training step."""
+    """K DynamicEmb collections; ``step`` is the lookup of the next input."""
 
     def __init__(self, cfg: Config, device: torch.device, verbose: bool) -> None:
         import torch
 
-        self.offsets, self.batches = build_pool(cfg, device)
+        self.offsets, self.inputs = build_inputs(cfg, device)
+        # The gradient of every pooled output, built once: the backward then has no
+        # work but the library's own.
+        self.grads = [
+            torch.randn(cfg.batch_size, cfg.tables * cfg.dim, device=device) * 0.01
+            for _ in range(cfg.collections)
+        ]
         torch.cuda.empty_cache()  # the tables allocate outside the caching allocator
+        self.hbm_ratio = cfg.hbm_ratio
+        if self.hbm_ratio is None and cfg.storage == "caching":
+            self.hbm_ratio = cache_ratio(cfg, self.inputs)
         self.modules = []
         for k in range(cfg.collections):
             show = verbose and k == 0  # every module prints a memory table when built
             with nullcontext() if show else redirect_stdout(io.StringIO()):
-                self.modules.append(make_collection(cfg, k, device))
+                self.modules.append(make_collection(cfg, k, device, self.hbm_ratio))
         layout = getattr(self.modules[0], "_storage_layout", None)
         self.layout = getattr(layout, "name", None)  # None if a tree lacks the field
         if self.layout not in (None, LAYOUTS[cfg.storage]):
             raise RuntimeError(f"--storage {cfg.storage} built layout {self.layout}")
-        width = cfg.collections * cfg.tables * cfg.dim
-        self.dense = torch.nn.Sequential(
-            torch.nn.Linear(width, 32), torch.nn.ReLU(), torch.nn.Linear(32, 1)
-        ).to(device)
-        self.dense_opt = torch.optim.SGD(self.dense.parameters(), lr=cfg.lr)
         self.names = [f"collection_{k}" for k in range(cfg.collections)]
-        self._cat, self._nvtx = torch.cat, torch.cuda.nvtx
-        self._bce = torch.nn.functional.binary_cross_entropy_with_logits
+        self.count = 0  # steps so far: the inputs are taken in turn across all calls
+        self._nvtx, self._backward = torch.cuda.nvtx, torch.autograd.backward
 
-    def step(self, i: int) -> torch.Tensor:
-        """K lookups, tiny MLP, loss, backward with fused sparse update; no sync."""
+    def step(self) -> List[torch.Tensor]:
+        """K lookups, then their K backwards with the fused sparse update; no sync.
+
+        The backward is part of the lookup. In the caching and HBM-only layouts a
+        training forward pins every key it reads with a reference count that only the
+        backward releases (a pinned key is never evicted); in every layout the backward
+        makes the fused update of the rows, and in a hybrid or host layout writes them
+        back.
+        """
         nvtx = self._nvtx
-        indices, labels = self.batches[i % len(self.batches)]
+        i = self.count
+        self.count += 1
         nvtx.range_push(f"step_{i}")
         pooled = []
-        for module, name, keys in zip(self.modules, self.names, indices):
+        for module, name, keys in zip(
+            self.modules, self.names, self.inputs[i % len(self.inputs)]
+        ):
             nvtx.range_push(name)
             pooled.append(module(keys, self.offsets))  # prefetch + lookup, pooled sum
             nvtx.range_pop()
-        nvtx.range_push("dense_forward")
-        loss = self._bce(self.dense(self._cat(pooled, dim=1)).squeeze(1), labels)
+        nvtx.range_push("backward")  # every collection's backward + fused update
+        self._backward(pooled, self.grads)
         nvtx.range_pop()
-        nvtx.range_push("backward")  # runs every collection's backward + update
-        loss.backward()
         nvtx.range_pop()
-        self.dense_opt.step()
-        self.dense_opt.zero_grad(set_to_none=True)
-        nvtx.range_pop()
-        return loss.detach()
+        return pooled
 
 
 def summarize(v: List[float]) -> Dict[str, Any]:
@@ -322,13 +415,12 @@ def measure(wl: Workload, warmup: int, steps: int, windows: int) -> Dict[str, An
     """
     import torch
 
-    for i in range(warmup):
-        wl.step(i)
+    for _ in range(warmup):
+        wl.step()
     torch.cuda.synchronize()
     per = max(1, steps // windows)
     wall: List[float] = []
     host: List[float] = []
-    i = warmup
     for _ in range(windows):
         gc.collect()
         gc.disable()  # keep collector pauses out of the timed region
@@ -338,22 +430,20 @@ def measure(wl: Workload, warmup: int, steps: int, windows: int) -> Dict[str, An
             begin = time.perf_counter()
             for _ in range(per):
                 enter = time.perf_counter()
-                loss = wl.step(i)
+                pooled = wl.step()
                 inside += time.perf_counter() - enter
-                i += 1
             torch.cuda.synchronize()
             elapsed = time.perf_counter() - begin
         finally:
             gc.enable()
-        if not bool(torch.isfinite(loss)):  # outside the timed region
-            raise RuntimeError(f"non-finite loss {float(loss)} after step {i}")
+        if not all(bool(torch.isfinite(p).all()) for p in pooled):  # outside the window
+            raise RuntimeError(f"non-finite output after step {wl.count}")
         wall.append(elapsed / per * 1e3)
         host.append(inside / per * 1e3)
     return {
         "wall_ms": summarize(wall),
         "host_ms": summarize(host),
         "steps_per_window": per,
-        "loss": float(loss),
     }
 
 
@@ -375,7 +465,7 @@ def classify(name: str) -> Optional[str]:
     return None
 
 
-def profile_steps(step: Callable[[int], Any], n: int) -> Dict[str, Any]:
+def profile_steps(step: Callable[[], Any], n: int) -> Dict[str, Any]:
     """Profile ``n`` steps: blocking host syncs per step and the GPU-busy fraction.
 
     Only events inside the steps count (the profiler ends its own window with a
@@ -388,9 +478,9 @@ def profile_steps(step: Callable[[int], Any], n: int) -> Dict[str, Any]:
 
     torch.cuda.synchronize()
     with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof:
-        for i in range(n):
+        for _ in range(n):
             with record_function("bench_step"):
-                step(i)
+                step()
     events = list(prof.events())
     gpu = {id(e) for e in events if "cuda" in str(e.device_type).lower()}
     steps = [e for e in events if e.name == "bench_step" and id(e) not in gpu]
@@ -420,25 +510,96 @@ def profile_steps(step: Callable[[int], Any], n: int) -> Dict[str, Any]:
     }
 
 
+def cache_round(wl: Workload) -> Optional[List[Dict[str, int]]]:
+    """What the cache of collection 0 did at each step of one round over the inputs
+    (None: no cache, or no metrics on this tree).
+
+    One step per input with the cache metrics of the library on: the unique keys looked
+    up, how many were found, how many were inserted (the misses) and how many evictions
+    that made (or keys that could not be placed), all over the tables of the
+    collection.  The metrics are zeroed before each step: a tree that skips the insert
+    of a step without a miss leaves the numbers of the step before in their slots.
+    Recording costs a wait for the device (main reads the counts back, the other tree
+    waits on an event when the metrics are read), so this runs after the timed windows.
+    """
+    import torch
+
+    module = wl.modules[0]
+    cache = getattr(module, "cache", None)
+    if cache is None or not hasattr(module, "set_record_cache_metrics"):
+        return None
+    module.set_record_cache_metrics(True)
+    try:
+        rounds = []
+        for _ in range(len(wl.inputs)):
+            torch.cuda.synchronize()
+            metrics = cache.cache_metrics  # a live host tensor on both trees
+            if metrics is None:
+                return None
+            metrics.zero_()
+            index = wl.count % len(wl.inputs)
+            wl.step()
+            torch.cuda.synchronize()
+            keys, found, inserted, evicted = (int(v) for v in cache.cache_metrics[:4])
+            rounds.append(
+                dict(
+                    input=index,
+                    keys=keys,
+                    found=found,
+                    inserted=inserted,
+                    evicted=evicted,
+                )
+            )
+    finally:
+        module.set_record_cache_metrics(False)
+    return rounds
+
+
+def hit_rate(res: Dict[str, Any]) -> Optional[float]:
+    """The share of the unique keys that a cache found, over the steps of its round."""
+    rounds = res.get("cache")
+    if not rounds:
+        return None
+    return sum(r["found"] for r in rounds) / max(1, sum(r["keys"] for r in rounds))
+
+
 def describe(cfg: Config, res: Dict[str, Any]) -> None:
     """Print what was built: layout, planned memory, key statistics, sync breakdown."""
     plan, keys, syncs = res["plan_gib"], res["keys"], res.get("syncs_per_step")
     print(f"layout {res['layout']} (--storage {cfg.storage}); memory in GiB:")
     print(
         f"  planned HBM {plan['hbm_total']:.1f} = values {plan['hbm_values']:.1f} + "
-        f"metadata {plan['metadata']:.1f} + data pool {plan['pool']:.1f}; "
+        f"metadata {plan['metadata']:.1f} + inputs and gradients {plan['data']:.1f}; "
         f"planned host {plan['host_values']:.1f}; GPU in use {res['gpu_used_gib']:.1f}"
     )
-    cache_rows = int(cfg.hbm_ratio * cfg.num_embeddings)
-    if cfg.storage == "caching" and keys["working_set"] > cache_rows:
-        regime = f"exceeds the {cache_rows}-row cache, so steady state keeps missing"
-    else:
-        regime = "stays resident after the first pass, so steady state is all hits"
     print(
         f"keys per table per step: {keys['keys_per_table']}, "
-        f"{100 * keys['unique_ratio']:.0f}% unique; working set over the pool: "
-        f"{keys['working_set']} keys/table, which {regime}"
+        f"{keys['unique_per_input']:.0f} unique ({100 * keys['unique_ratio']:.0f}%); "
+        f"the {cfg.inputs} inputs hold {keys['working_set']} distinct keys per table"
     )
+    ratio = res["hbm_ratio"]
+    if cfg.storage == "caching":
+        wanted = int(ratio * cfg.num_embeddings)
+        rows = -(-wanted // CACHE_BUCKET) * CACHE_BUCKET
+        cells = "; ".join(
+            f"input {r['input']}: {100 * r['found'] / max(1, r['keys']):.0f}% of "
+            f"{r['keys']} found, {r['inserted']} inserted, {r['evicted']} evicted"
+            for r in res.get("cache") or []
+        )
+        print(
+            f"cache of {rows} rows per table (--hbm-ratio {ratio:.6f}: a multiple of "
+            f"{CACHE_BUCKET} rows); collection 0, unique keys over its {cfg.tables} "
+            f"tables, one step per input: {cells or 'metrics not available'}"
+        )
+    elif cfg.storage == "hybrid":
+        rows = int(ratio * cfg.num_embeddings)
+        where = (
+            "all in HBM" if rows >= keys["working_set"] else "the rest in host memory"
+        )
+        print(
+            f"HBM tier of about {rows} rows per table for {keys['working_set']} "
+            f"distinct keys: {where}"
+        )
     if syncs:
         kinds = " ".join(f"{kind}={syncs[kind]:.1f}" for kind in SYNC_KINDS)
         print(
@@ -450,7 +611,8 @@ def describe(cfg: Config, res: Dict[str, Any]) -> None:
 
 HEADER = (
     f"{'storage':<8}{'K':>4}{'B':>7} | {'wall ms/step':^26} | {'host ms/step':^26} | "
-    f"{'host/wall':>9} | {'gpu busy':>8} | {'syncs/step (per coll)':>22}"
+    f"{'host/wall':>9} | {'gpu busy':>8} | {'syncs/step (per coll)':>22} | "
+    f"{'cache hit':>9}"
 )
 
 
@@ -470,10 +632,12 @@ def row_text(res: Dict[str, Any]) -> str:
     sync_cell = "-"
     if syncs:
         sync_cell = f"{syncs['total']:.1f} ({syncs['total'] / cfg['collections']:.2f})"
+    hit = hit_rate(res)
+    hit_cell = "-" if hit is None else f"{100 * hit:.0f}%"
     return (
         f"{head} | {cell(wall)} | {cell(host)} | "
         f"{100 * host['median'] / wall['median']:8.0f}% | "
-        f"{busy_cell:>8} | {sync_cell:>22}"
+        f"{busy_cell:>8} | {sync_cell:>22} | {hit_cell:>9}"
     )
 
 
@@ -510,7 +674,7 @@ def compare(path_a: str, path_b: str) -> int:
         return 1
     lead, abr = f"{'storage':<8}{'K':>4}{'B':>7}", f"{'A':>8} {'B':>8} {'A/B':>7}"
     print(f"{lead} | {'wall ms/step':^25} | {'host ms/step':^25} |")
-    print(f"{'':19} | {abr} | {abr} | syncs/step A -> B")
+    print(f"{'':19} | {abr} | {abr} | syncs/step A -> B | cache hit A -> B")
     speedups: Dict[str, List[float]] = {"wall_ms": [], "host_ms": []}
     for key in shared:
         a, b = rows_a[key], rows_b[key]
@@ -521,9 +685,15 @@ def compare(path_a: str, path_b: str) -> int:
             cells.append(f"{ma:8.2f} {mb:8.2f} {ma / mb:6.2f}x")
         sa, sb = a.get("syncs_per_step"), b.get("syncs_per_step")
         syncs = f"{sa['total']:.1f} -> {sb['total']:.1f}" if sa and sb else "-"
+        ha, hb = hit_rate(a), hit_rate(b)
+        hits = (
+            f"{100 * ha:.0f}% -> {100 * hb:.0f}%"
+            if ha is not None and hb is not None
+            else "-"
+        )
         cfg = a["config"]
         head = f"{cfg['storage']:<8}{cfg['collections']:>4}{cfg['batch_size']:>7}"
-        print(f"{head} | {cells[0]} | {cells[1]} | {syncs}")
+        print(f"{head} | {cells[0]} | {cells[1]} | {syncs:<17} | {hits}")
     for metric, ratios in speedups.items():
         mean = math.exp(statistics.fmean(math.log(r) for r in ratios))
         print(f"geometric-mean speedup of B over A, {metric}: {mean:.2f}x")
@@ -551,16 +721,22 @@ def run_point(
     wl = Workload(cfg, device, verbose)
     warmup = getattr(args, "warmup", 20 if args.sweep else 30)
     steps = getattr(args, "steps", 100 if args.sweep else 200)
-    res = {"config": asdict(cfg), "layout": wl.layout, "plan_gib": plan}
+    res = {
+        "config": asdict(cfg),
+        "hbm_ratio": wl.hbm_ratio,  # as used: a caching layout sizes its own default
+        "layout": wl.layout,
+        "plan_gib": plan,
+    }
     res.update(measure(wl, warmup, steps, args.windows))
-    res.update(keys=key_stats(cfg, wl.batches), warmup_steps=warmup)
+    res.update(keys=key_stats(cfg, wl.inputs), warmup_steps=warmup)
+    res["cache"] = cache_round(wl)
     if args.sync_count:
         res.update(profile_steps(wl.step, args.sync_steps))
     if args.profile_steps:  # for nsys --capture-range=cudaProfilerApi
         torch.cuda.synchronize()
         torch.cuda.profiler.start()
-        for i in range(args.profile_steps):
-            wl.step(i)
+        for _ in range(args.profile_steps):
+            wl.step()
         torch.cuda.synchronize()
         torch.cuda.profiler.stop()
     free_now, total = torch.cuda.mem_get_info(device)
@@ -592,9 +768,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     dirty = " (dirty)" if meta.get("dirty") else ""
     print(f"{meta['gpu']}  torch {meta['torch']}  cuda {meta['cuda']}")
     print(f"dynamicemb {meta['dynamicemb_path']}  commit {meta.get('commit')}{dirty}")
+    print(f"extension {meta['dynamicemb_extension']}")
     print(
         f"T={base.tables} H={base.hotness} D={base.dim} alpha={base.alpha} "
-        f"rows/table={base.num_embeddings} optimizer={base.optimizer} pool={base.pool}"
+        f"rows/table={base.num_embeddings} optimizer={base.optimizer} inputs={base.inputs}"
     )
     if args.sweep:
         print(HEADER)

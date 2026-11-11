@@ -550,15 +550,16 @@ only ~5%:
 
 ![adam caching cfr=1.0 per-op breakdown](./plots/breakdown_adam_caching_cfr1.0.png)
 
-## 3. Benchmark many embedding collections with a small dense part
+## 3. Benchmark the lookup of many embedding collections
 
 This benchmark measures what **blocking host syncs inside DynamicEmb** cost when a
 model has many separate embedding collections and very little GPU work per step.
 Each collection is its own `BatchedDynamicEmbeddingTablesV2`, so every step it does
 its own unique / lookup / update, and every host sync (reading the unique count,
 compaction counts, eviction counts, ...) stalls the CPU until the GPU has drained.
-With a tiny dense part the GPU work per step is small, so launch latency and sync
-stalls dominate the step time: that is where removing a sync shows.
+The timed region holds nothing but the lookups (no dense part, no loss, no data
+creation), so the GPU work per step is small and launch latency and sync stalls
+dominate the step time: that is where removing a sync shows.
 
 The script `benchmark_many_collections.py` (launcher `benchmark_many_collections.sh`)
 uses only public DynamicEmb APIs, so the same file runs unchanged on any tree.
@@ -568,14 +569,25 @@ It needs one GPU, no `torchrun` and no process group.
 
 - K collections (default 32), each with T tables (default 2) of dim D (default 64),
   sum-pooled, fp32, fused optimizer in the backward (`--optimizer sgd|adam`).
-- Every collection gets B samples (default 1024) x H keys per sample (default 4)
-  per table, drawn from a pow-law distribution over `--num-embeddings` rows
-  (default 1M) with exponent `--alpha` (default 1.05; larger means more repeated
-  keys, which makes the unique/dedup stage matter more).
-- The pooled outputs `[B, K*T*D]` go through `Linear(K*T*D, 32) -> ReLU ->
-  Linear(32, 1)` and a BCE-with-logits loss; the dense part uses plain SGD.
-- `--pool` (default 16) distinct batches are generated on the GPU up front and
-  cycled, so there is no data generation and no host-to-device copy per step.
+- A step is the lookup of one input: the K collections' forward, then their K
+  backwards (`torch.autograd.backward` with gradients built beforehand). The backward
+  is part of the lookup. In the `caching` and `hbm` layouts a training forward pins
+  every key it reads with a reference count that only the backward releases (a pinned
+  key is never evicted); in every layout the backward makes the fused update of the
+  rows, and in `hybrid` and `host` writes them back. Nothing else is timed: no dense
+  part, no loss, no data creation and no host-to-device copy.
+- `--inputs` (default 2) inputs are generated on the GPU up front and used in turn:
+  input 0, input 1, input 0, and so on. Every collection gets B samples (default 1024)
+  x H keys per sample (default 4) per table, drawn from a pow-law distribution
+  with exponent `--alpha` (default 1.05; larger means more repeated keys, which makes
+  the unique/dedup stage matter more) over its own slice of the `--num-embeddings`
+  rows (default 1M), so the inputs share no key. A step never finds in a cache the
+  keys of the step before it; it finds those of its own earlier use, `--inputs` steps
+  back, as far as the cache still holds them: all of them if it holds all the inputs,
+  `(rows - U) / U` of them if it holds one input of U unique keys and part of another,
+  hardly any below that. A cache that holds less than all the inputs is therefore
+  refreshed at every step (`--inputs 1` uses one input at every step: after the first,
+  all hits).
 
 ### How to run
 
@@ -608,9 +620,9 @@ bash ./benchmark/benchmark_many_collections.sh --compare main.json nosync.json
 | `--num-embeddings` / `--alpha` | 1000000 / 1.05 | rows per table, pow-law exponent |
 | `--optimizer` | `sgd` | `sgd` or `adam` (Adam keeps 2*D state per row: 3x the memory) |
 | `--storage` | `hbm` | `hbm`, `caching`, `hybrid` or `host`, see below |
-| `--hbm-ratio` | 0.1 | share of each table's value bytes in HBM for `caching` and `hybrid` |
+| `--hbm-ratio` | `caching`: from the inputs, `hybrid`: 0.1 | share of each table's rows in HBM for `caching` (the cache) and `hybrid` (the HBM tier); a caching layout is given the smallest cache that holds the unique keys of an input, see the notes |
 | `--warmup` / `--steps` / `--windows` | 30 / 200 / 5 | untimed steps, timed steps, timed windows (`--sweep`: 20 / 100) |
-| `--pool` / `--seed` | 16 / 0 | distinct batches cycled, RNG seed |
+| `--inputs` / `--seed` | 2 / 0 | inputs used in turn, each on its own slice of the rows; RNG seed |
 | `--sync-count` / `--sync-steps` | off / 3 | profile extra steps with `torch.profiler`, see below |
 | `--profile-steps` | 0 | bracket this many extra steps for nsys, see below |
 | `--sweep` | off | the grid K in {1,4,16,64} x B in {256,1024,4096} (`SWEEP_*` constants in the script) |
@@ -632,13 +644,14 @@ continues). With 1M rows per table the planned HBM is 17.2 GiB for the defaults
 (SGD), 47.7 GiB for Adam, 34.4 GiB for SGD with 64 collections, and 95.4 GiB for
 Adam with 64 collections (too much for one 80 GB GPU: use
 `--storage caching|hybrid|host` or a smaller `--num-embeddings`).
-`caching`/`hybrid`/`host` keep (part of) the values in host memory, 15.3 GiB for the
-defaults with SGD; the hash tables always stay in HBM (about 1.9 GiB).
+`caching` and `host` keep every value in host memory, 15.3 GiB for the defaults with
+SGD, and `hybrid` keeps the share that is not in HBM (13.7 GiB at the default 0.1);
+the hash tables always stay in HBM (about 1.9 GiB).
 
 ### How to read the output
 
 ```
-storage    K      B |        wall ms/step        |        host ms/step        | host/wall | gpu busy |  syncs/step (per coll)
+storage    K      B |        wall ms/step        |        host ms/step        | host/wall | gpu busy |  syncs/step (per coll) | cache hit
 ```
 
 Every number is the median over the timed windows, followed by `[min, max]`.
@@ -664,17 +677,25 @@ Every number is the median over the timed windows, followed by `[min, max]`.
   (`d2h_pageable`: they block the host too, but are normally followed by a counted
   stream sync, so they are not added). A tree without syncs reads 0. If the profiler
   returns no CUDA runtime events the run prints a note instead of numbers.
+- **cache hit** (`caching` only): the share of the unique keys that the cache of
+  collection 0 found, over one round of the inputs in steady state (the cache metrics
+  of the library, read after the timed windows). `--compare` prints it for both sides:
+  two trees are only comparable in the same regime.
 
-A single-point run also prints the layout, the planned memory, the unique-key ratio
-per step and the working set of the pool (see the notes below). The loss is checked
-for being finite after every window, outside the timed region.
+A single-point run also prints the layout, the planned memory, the unique keys of an
+input and the distinct keys of all inputs and, for `caching`, what the cache of
+collection 0 did at the step of each input of one round: how many of the unique keys
+(over its tables) it found, inserted and evicted (or could not place). The pooled
+outputs are checked for being finite after every window.
 
 ### Comparing two trees
 
 Run the same command on each tree and compare the JSON files. The script imports
 whatever `dynamicemb` is installed (or first on `PYTHONPATH`), so install or select
-the intended tree first; the first lines of the output, and `meta` in the JSON, give
-the imported path and the git commit (and a dirty flag) of that tree.
+the whole intended tree first, the Python package and its compiled extension together
+(the two trees of a comparison differ in both); the first lines of the output, and
+`meta` in the JSON, give the imported path, the path of the extension and the git
+commit (and a dirty flag) of that tree.
 
 ```bash
 # tree A (for example origin/main), with its dynamicemb installed
@@ -694,9 +715,8 @@ this benchmark is CPU-bound by design and sensitive to other work on the node.
 ### Profiling with nsys
 
 Every step is wrapped in NVTX ranges: `step_<i>`, one `collection_<k>` per collection
-(its forward: prefetch with unique, find and insert, then the pooled gather),
-`dense_forward`, and `backward`. `backward` covers `loss.backward()`, which runs the
-dense backward and then each collection's `DynamicEmbeddingFunction.backward` (reduce
+(its forward: prefetch with unique, find and insert, then the pooled gather), and
+`backward`, which runs each collection's `DynamicEmbeddingFunction.backward` (reduce
 gradients and fused update, in the library's own ranges on the autograd thread).
 `--profile-steps N` runs N extra steps between `cudaProfilerStart` and
 `cudaProfilerStop`, so nsys records only those:
@@ -724,16 +744,43 @@ With `--sweep`, `--profile-steps` opens one capture window per point: use
 - TorchRec `EmbeddingCollection` / `DistributedModelParallel` mode is not covered on
   purpose: the point is to isolate DynamicEmb's own syncs from the ones TorchRec's
   input distribution adds. There is no collective in this benchmark.
-- With the default pool of 16 batches and tables much larger than the keys they see,
-  every key is resident after the warmup, so the timed steady state is the all-hit
-  path (every lookup finds its key: no new key is admitted, nothing is evicted) for
-  `hbm`, `hybrid` and `host`, and for `caching` while the working set of the pool
-  fits in the cache. At the defaults the pool's
-  working set is about 23K keys per table against a 100K-row cache, and the script
-  prints both. To keep the miss, insert and eviction paths in every step, shrink the
-  cache (`--storage caching --hbm-ratio 0.01`, 10K rows) or enlarge the pool
-  (`--pool 256`, about 190K keys per table).
-- Keep `--warmup` at least `--pool`: the first pass over the pool inserts the keys.
+- Tables much larger than the keys they see hold every key of the inputs after the
+  first pass over them, so for `hbm` and `host` the timed steady state is the all-hit
+  path (every lookup finds its key: no new key is admitted, nothing is evicted), and so
+  it is for a `hybrid` whose HBM tier (`--hbm-ratio 0.1`, 100K rows) holds the keys of
+  all inputs. What `caching` does depends on the size of its cache, which holds a
+  multiple of 1024 rows (its buckets hold 1024). The library raises (`Outstanding
+  prefetched keys ... exceed cache capacity`) when the unique keys of one step do not
+  fit, so the script sizes the cache from the inputs unless `--hbm-ratio` is given: the
+  smallest cache that holds the unique keys of an input in any table, that is the
+  smallest one for which a step is valid. At the defaults an input has about 2.1K
+  unique keys per table (the script prints the number), so the cache gets 3072 rows
+  and the two inputs together, about 4.2K keys, do not fit. Measured on an H100 with
+  the defaults, for collection 0 (two tables) and one step:
+
+  | cache rows per table | `--hbm-ratio` | keys found | inserted and evicted |
+  | -------------------- | ------------- | ---------- | -------------------- |
+  | 2048 | 0.002 | 3% | 4096 |
+  | 3072 (the default, from the inputs) | 0.0025 | 45% | 2295 |
+  | 4096 | 0.004 | 93% | 299 |
+  | 5120 and more | 0.005 and more | 100% | 0 |
+
+  With 3072 rows the cache holds one input and 45% of the other, so every step misses
+  on about half of its keys and replaces about a third of the cache: the miss, insert
+  and eviction paths run in every step. A cache of 2048 rows is smaller than the keys
+  of one input: all of it is replaced at every step and the step takes about 2.5 times
+  longer than at 3072 rows, which is not a regime to compare trees in. For each
+  `caching` run the script prints these numbers (and `cache hit` in the table), so the
+  regime can be read off the output. The cache is sized for each point of a `--sweep`,
+  so its hit rate changes with the batch size.
+- A caching layout checks that the keys a step pins fit its cache. The check compares
+  the number of keys of the step (B x H per table, a bound) with the capacity of the
+  cache, its rows plus an overflow area of 3072 per table. A tree that does not know
+  the number of unique keys on the host (the one of #545) reads it from the device in
+  that step only when the bound exceeds the capacity: at the defaults it never does
+  (`--sync-count` reads 0), but with a larger batch (B = 4096, say) every forward of a
+  collection makes one blocking read, and `--sync-count` shows it.
+- Keep `--warmup` at least `--inputs`: the first pass over the inputs inserts the keys.
 - The profiler pass (`--sync-count`) runs after the timed windows and does not affect
   them. The sync counts are exact API call counts; the GPU-busy fraction is not
   comparable with the timed numbers (see above).
