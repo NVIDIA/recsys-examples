@@ -623,7 +623,7 @@ BENCH=benchmark/benchmark_distributed_embedding_collection.py
 ARGS="--num_tables 8 --num_embeddings 4000000 --local_batch_size 4096 \
       --max_seq_len 32 --use_index_dedup"
 export NCCL_CROSS_NIC=0                            # GIN on the rails only (recommended)
-export NCCL_NET_PLUGIN=none NCCL_GIN_PLUGIN=none   # only where NCCL's plugin cannot run GIN (Eos)
+export NCCL_NET_PLUGIN=none NCCL_GIN_PLUGIN=none   # only where NCCL's plugin cannot run GIN (Eos, GB300)
 
 # 1 node, 8 GPUs
 torchrun --nproc_per_node 8 $BENCH $ARGS --output_dist hierarchical
@@ -694,6 +694,132 @@ More runs on the same configuration:
 * `--capacity <entries>`: the capacities by hand, for example to see calls
   that do not fit.
 
+#### Results
+
+The final runs compare TorchRec's dists (`--output_dist torchrec`) with the
+hierarchical dist (`--output_dist hierarchical`) in the plain loop, with
+power-law keys (`--key_dist pow-law --alpha 1.05`), 8 tables of 4,000,000
+rows, dim 128, fp32, SGD and index dedup. The step is `iter_ms_mean`. After
+the first call and a barrier, 20 warmup iterations and 20 timed ones run
+back to back, with no sync of the benchmark's between them (the dists and
+the lookup keep their own). A CUDA event before the first timed iteration
+and one after the last give the time of the 20 on the GPU, its idle gaps
+included; the step is that over 20, the mean over ranks. Each point ran in
+rounds, the two dists in turn at each point, TorchRec's first in some
+rounds and the hierarchical dist first in others: three rounds on Eos, in
+one allocation, and five on GB300, rounds 1 to 3 in one allocation and
+rounds 4 and 5 in a second on the same four trays, added after rounds 1 to
+3 showed stalls at 16 GPUs (see the GB300 note below). The tables give the
+median of the rounds. The points are F features (8 tables of F/8 features
+each, `--features_per_table`) by a number of samples per GPU
+(`--local_batch_size`), with 1 to N keys per sample and feature, drawn
+uniformly (`--max_seq_len N --seq_len_dist uniform`):
+
+| case | F | samples per GPU | keys per sample and feature | keys per GPU and iteration |
+|---|---|---|---|---|
+| 1 | 8 | 8,192 / 16,384 / 32,768 | 1-4 | 164K / 328K / 655K |
+| 2 | 1,024 / 2,048 / 4,096 | 128 | 1-4 | 328K / 655K / 1.31M |
+| 3 | 8 | 128 | 1-1,024 / 1-2,048 / 1-4,096 / 1-8,192 | 525K / 1.05M / 2.10M / 4.19M |
+
+```bash
+COMMON="--num_tables 8 --num_embeddings 4000000 --use_index_dedup --num_iterations 20 --warmup 20 \
+        --pipeline none --profile_iterations 0 --key_dist pow-law --alpha 1.05 --json_out results.jsonl"
+for DIST in torchrec hierarchical; do   # here one dist after the other; the runs took both in turn at each point
+  for B in 8192 16384 32768; do      # case 1
+    $LAUNCH $BENCH $COMMON --output_dist $DIST --features_per_table 1 --local_batch_size $B \
+      --max_seq_len 4 --seq_len_dist uniform
+  done
+  for P in 128 256 512; do           # case 2
+    $LAUNCH $BENCH $COMMON --output_dist $DIST --features_per_table $P --local_batch_size 128 \
+      --max_seq_len 4 --seq_len_dist uniform
+  done
+  for N in 1024 2048 4096 8192; do   # case 3
+    $LAUNCH $BENCH $COMMON --output_dist $DIST --features_per_table 1 --local_batch_size 128 \
+      --max_seq_len $N --seq_len_dist uniform
+  done
+done
+```
+
+On Eos (H100 nodes of 8 GPUs: NVLink inside a node, a 400 Gb/s IB NIC per
+GPU between nodes; the hierarchical dist's node is a machine), on 1, 2 and 4
+nodes. TorchRec's step / the hierarchical dist's step, in ms, and the
+hierarchical dist against TorchRec's:
+
+| F × samples per GPU (keys per sample and feature) | keys per GPU | 8 GPUs | 16 GPUs | 32 GPUs |
+|---|---|---|---|---|
+| 8 × 8k (1-4) | 164K | 3.04 / 1.36 (-55%) | 4.07 / 1.99 (-51%) | 5.38 / 2.31 (-57%) |
+| 8 × 16k (1-4) | 328K | 3.68 / 1.53 (-58%) | 5.71 / 2.54 (-56%) | 8.05 / 3.04 (-62%) |
+| 8 × 32k (1-4) | 655K | 5.26 / 1.95 (-63%) | 8.94 / 3.40 (-62%) | 13.38 / 4.31 (-68%) |
+| 1k × 128 (1-4) | 328K | 4.75 / 1.62 (-66%) | 7.59 / 2.68 (-65%) | 11.75 / 3.30 (-72%) |
+| 2k × 128 (1-4) | 655K | 7.40 / 2.17 (-71%) | 12.71 / 3.64 (-71%) | 20.64 / 4.58 (-78%) |
+| 4k × 128 (1-4) | 1.31M | 12.55 / 3.33 (-73%) | 22.55 / 5.62 (-75%) | 37.81 / 7.20 (-81%) |
+| 8 × 128 (1-1k) | 525K | 3.96 / 1.77 (-55%) | 5.87 / 3.07 (-48%) | 7.37 / 3.79 (-49%) |
+| 8 × 128 (1-2k) | 1.05M | 5.74 / 2.53 (-56%) | 8.83 / 4.47 (-49%) | 11.36 / 5.75 (-49%) |
+| 8 × 128 (1-4k) | 2.10M | 9.09 / 4.00 (-56%) | 14.54 / 6.99 (-52%) | 18.40 / 9.23 (-50%) |
+| 8 × 128 (1-8k) | 4.19M | 15.40 / 6.76 (-56%) | 24.60 / 11.29 (-54%) | 31.25 / 14.94 (-52%) |
+
+On GB300 (NVL72 trays of 4 GPUs), on 1, 2 and 4 trays of one rack: one
+NVLink domain, so one node of 4, 8 and 16 GPUs for the hierarchical dist.
+Each rank runs pinned to cores of its GPU's CPU (below):
+
+| F × samples per GPU (keys per sample and feature) | keys per GPU | 4 GPUs | 8 GPUs | 16 GPUs |
+|---|---|---|---|---|
+| 8 × 8k (1-4) | 164K | 3.80 / 1.78 (-53%) | 3.89 / 1.78 (-54%) | 4.08 / 1.77 (-56%) |
+| 8 × 16k (1-4) | 328K | 3.80 / 1.70 (-55%) | 3.84 / 1.75 (-55%) | 4.31 / 1.73 (-60%) |
+| 8 × 32k (1-4) | 655K | 4.23 / 1.84 (-56%) | 4.69 / 1.88 (-60%) | 5.82 / 1.92 (-67%) |
+| 1k × 128 (1-4) | 328K | 4.41 / 1.82 (-59%) | 4.95 / 1.81 (-63%) | 6.20 / 1.82 (-71%) |
+| 2k × 128 (1-4) | 655K | 5.38 / 1.99 (-63%) | 6.79 / 2.03 (-70%) | 9.65 / 2.09 (-78%) |
+| 4k × 128 (1-4) | 1.31M | 8.21 / 2.63 (-68%) | 11.04 / 2.72 (-75%) | 16.88 / 3.06† (-82%†) |
+| 8 × 128 (1-1k) | 525K | 3.82 / 1.72 (-55%) | 3.84 / 1.77 (-54%) | 4.89† / 1.82 (-63%†) |
+| 8 × 128 (1-2k) | 1.05M | 4.76 / 2.18 (-54%) | 4.85 / 2.24 (-54%) | 4.94 / 2.30 (-54%) |
+| 8 × 128 (1-4k) | 2.10M | 6.70 / 3.04 (-55%) | 6.70 / 3.16 (-53%) | 6.85 / 3.24 (-53%) |
+| 8 × 128 (1-8k) | 4.19M | 10.24 / 4.88 (-52%) | 10.30 / 5.02 (-51%) | 11.23 / 5.13 (-54%) |
+
+* `--check` passed at every scale (8 × 128, 1 to 1,024 keys per sample and
+  feature): over 4 steps of SGD, the hierarchical dist's outputs equal
+  TorchRec's bit for bit (fp32, power-of-two GPU counts).
+* Eos: over the 60 combinations of point, scale and dist, the slowest of
+  the three rounds was 0.6% above the fastest at the median, and more than
+  5% above it at 4 of them (at most 16%: the first round of the
+  hierarchical dist at 8 × 128 (1-1k) on 8 GPUs).
+* GB300 runs pinned. `nvidia-smi topo -m` puts GPUs 0 and 1 on cores 0-71
+  and GPUs 2 and 3 on cores 72-143; local ranks 0 to 3 ran on cores 8-39,
+  40-71, 80-111 and 112-143 (`taskset -c <cores>` in front of `python` in
+  each task), the first 8 cores of each CPU left to the system. Unpinned, a
+  rank's main Python thread sometimes waited 1 to 4 ms for a CPU after it
+  was woken (in the longest cases behind another rank's thread on its
+  core), and every rank waited for it in the call's collective kernels:
+  with the benchmark's earlier timing, on four trays of another rack, the
+  hierarchical dist's 16-GPU steps unpinned were 1.3 to 3.1 times its
+  pinned ones, and at 8 × 16k and 1k × 128 about as long as TorchRec's.
+  There, pinning also shortened TorchRec's 16-GPU steps (unpinned 1.03 to
+  1.34 times pinned) but lengthened its 4-GPU steps by 2% to 13% (cause
+  unknown). Pinned, a rank still stalls at times, for tens of ms, at random
+  (cause unknown), and every rank waits for it. At 4 and 8 GPUs the five
+  rounds of a point spread by at most 3% and 5%; at 16 GPUs 10 of the 20
+  points and dists had a round more than 10% above their fastest, and at
+  two of them the median of the five is itself a slow round, marked † in
+  the table: the hierarchical dist at 4k × 128 (3.06 ms; its two fastest
+  rounds 2.78 and 2.80 ms, about 83% shorter than TorchRec's 16.88 ms) and
+  TorchRec's dists at 8 × 128 (1-1k) (4.89 ms; their two fastest rounds
+  4.05 and 4.10 ms, against which the hierarchical dist's 1.82 ms is about
+  55% shorter).
+* Rank 0 of one more run per point and dist was captured with nsys (the
+  run's options plus `--nvtx`), at 8 × 32k, 4k × 128 and 8 × 128 (1-8k), on
+  32 Eos GPUs and 16 GB300 GPUs. Each capture holds the 20 warmup and the
+  20 timed iterations, with no sync of the benchmark's between them, and
+  the timed iterations' span on the GPU (from their first kernel's start to
+  their last one's end, idle time included) over 20 is that run's step.
+  Against the tables' medians, the captured runs' steps were 0% to 4%
+  longer on Eos. On GB300 the hierarchical dist's were 1% to 5% longer (at
+  4k × 128, whose median is a slow round, 4% shorter than it and 5% longer
+  than its two fastest rounds), and TorchRec's dists' 4% to 14% longer: at
+  8 × 32k every iteration about 10% longer (about 0.6 ms, as at that point
+  on Eos; likely nsys tracing the input dist's many CUDA calls), at 8 × 128
+  (1-8k) some iterations up to 16.5 ms against a median step of 11.2 ms.
+
+#### Output dist kernels at large batch
+
 A large-batch workload: one table of 268 million rows, bf16, and 16,384
 samples per GPU, each with 1 to 1,536 keys drawn uniformly (jagged
 lengths: about 12.6 million keys per GPU and iteration):
@@ -736,111 +862,8 @@ On 2 nodes the backward reaches 84% because of the ring's laps: a ring that
 holds the stream in one lap (`DYNAMICEMB_HIER_PROXY_MB=12288`) gives
 28.55 ms there (47.1 GB/s, 94%, in 2 runs); on 4 nodes the laps cost little.
 
-Many features. These runs keep the keys per GPU about the same while the
-features grow: 8 tables of 4,000,000 rows (dim 128, fp32, SGD), each with
-`--features_per_table` P features (F = 8P in all), index dedup, plain loop,
-about 540,000 keys per GPU and iteration (4.2 million in the two runs
-marked `b`: 1,024 × 4,096 and 4,096 × 1,024):
-
-```bash
-MANY="--num_tables 8 --num_embeddings 4000000 --use_index_dedup --num_iterations 20 --warmup 5"
-$LAUNCH $BENCH $MANY --features_per_table 1   --local_batch_size 4096 --max_seq_len 32       --output_dist hierarchical
-$LAUNCH $BENCH $MANY --features_per_table 8   --local_batch_size 4096 --max_seq_len 3        --output_dist hierarchical
-$LAUNCH $BENCH $MANY --features_per_table 32  --local_batch_size 2048 --max_seq_len 1 --seq_len_dist fixed --output_dist hierarchical
-$LAUNCH $BENCH $MANY --features_per_table 128 --local_batch_size 512  --max_seq_len 1 --seq_len_dist fixed --output_dist hierarchical
-$LAUNCH $BENCH $MANY --features_per_table 512 --local_batch_size 128  --max_seq_len 1 --seq_len_dist fixed --output_dist hierarchical
-$LAUNCH $BENCH $MANY --features_per_table 128 --local_batch_size 4096 --max_seq_len 1 --seq_len_dist fixed --output_dist hierarchical  # b
-$LAUNCH $BENCH $MANY --features_per_table 512 --local_batch_size 1024 --max_seq_len 1 --seq_len_dist fixed --output_dist hierarchical  # b
-```
-
-Multi-hot at many features: the same, with several keys per sample, 1 to 4
-(uniform) at four of the large points and 1 to 32 at two, so that a GPU has
-1.3 to 10.5 million keys per iteration:
-
-```bash
-$LAUNCH $BENCH $MANY --features_per_table 128 --local_batch_size 512  --max_seq_len 4  --output_dist hierarchical
-$LAUNCH $BENCH $MANY --features_per_table 512 --local_batch_size 128  --max_seq_len 4  --output_dist hierarchical
-$LAUNCH $BENCH $MANY --features_per_table 128 --local_batch_size 4096 --max_seq_len 4  --output_dist hierarchical
-$LAUNCH $BENCH $MANY --features_per_table 512 --local_batch_size 1024 --max_seq_len 4  --output_dist hierarchical
-$LAUNCH $BENCH $MANY --features_per_table 128 --local_batch_size 512  --max_seq_len 32 --output_dist hierarchical
-$LAUNCH $BENCH $MANY --features_per_table 512 --local_batch_size 128  --max_seq_len 32 --output_dist hierarchical
-```
-
-On Eos, with the loop above (two alternating batches and pre-drawn output
-gradients, no loss), TorchRec's dists (`--output_dist torchrec`) against the
-hierarchical dist: medians of 2 rounds of alternating order on the same 4
-nodes, on 1 / 2 / 4 nodes, in ms: the step (`iter_ms_host`) and the input
-dist (`in_seg_ms_mean`).
-
-| features × batch (keys per sample) | keys per GPU | TorchRec step | hier step | hier vs TorchRec | TorchRec input dist | hier input dist |
-|---|---|---|---|---|---|---|
-| 8 × 4096 (1-32) | 0.5M | 6.8 / 11.3 / 14.9 | 3.3 / 8.5 / 10.7 | -52% / -25% / -29% | 1.38 / 1.66 / 2.16 | 0.30 / 0.70 / 0.71 |
-| 64 × 4096 (1-3) | 0.5M | 7.4 / 13.5 / 19.8 | 3.2 / 8.4 / 10.4 | -56% / -38% / -47% | 1.63 / 2.92 / 4.73 | 0.31 / 0.69 / 0.73 |
-| 256 × 2048 (1) | 0.5M | 8.8 / 16.6 / 25.8 | 3.7 / 8.7 / 10.4 | -58% / -48% / -60% | 2.30 / 4.39 / 7.90 | 0.36 / 0.75 / 0.75 |
-| 1024 × 512 (1) | 0.5M | 13.7 / 18.8 / 29.0 | 6.5 / 9.9 / 10.9 | -53% / -48% / -62% | 3.51 / 5.81 / 10.82 | 0.39 / 0.87 / 0.84 |
-| 4096 × 128 (1) | 0.5M | 54.8 / 73.7 / 76.3 | 38.9 / 41.1 / 45.4 | -29% / -44% / -41% | 6.42 / 11.61 / 23.44 | 0.56 / 1.09 / 1.11 |
-| 1024 × 4096 (1) | 4.2M | 55.1 / 110.1 / 177.3 | 19.1 / 42.3 / 50.1 | -65% / -62% / -72% | 10.34 / 22.93 / 47.19 | 1.20 / 2.56 / 3.01 |
-| 4096 × 1024 (1) | 4.2M | 83.3 / 148.7 / 208.6 | 47.5 / 61.2 / 69.1 | -43% / -59% / -67% | 13.34 / 28.56 / 59.59 | 1.43 / 2.88 / 3.32 |
-| 1024 × 512 (1-4) | 1.3M | 16.2 / 30.8 / 45.9 | 9.5 / 17.6 / 22.2 | -41% / -43% / -52% | 3.27 / 6.10 / 11.12 | 0.56 / 1.25 / 1.16 |
-| 4096 × 128 (1-4) | 1.3M | 56.5 / 81.1 / 86.2 | 39.3 / 48.0 / 50.4 | -30% / -41% / -41% | 6.39 / 11.84 / 24.56 | 0.81 / 1.54 / 1.56 |
-| 1024 × 4096 (1-4) | 10.5M | 96.7 / 190.6 / 287.5 | 40.8 / 65.1 / 75.7 | -58% / -66% / -74% | 11.46 / 24.53 / 51.01 | 2.61 / 5.63 / 6.48 |
-| 4096 × 1024 (1-4) | 10.5M | 124.8 / 219.5 / 308.8 | 61.2 / 84.3 / 94.1 | -51% / -62% / -70% | 15.65 / 30.48 / 62.83 | 2.85 / 6.11 / 6.92 |
-| 1024 × 512 (1-32) | 8.7M | 68.9 / 131.5 / 179.8 | 35.0 / 61.8 / 70.1 | -49% / -53% / -61% | 4.98 / 8.56 / 14.20 | 2.16 / 4.66 / 5.37 |
-| 4096 × 128 (1-32) | 8.7M | 95.8 / 165.7 / 205.3 | 55.8 / 79.3 / 88.9 | -42% / -52% / -57% | 7.89 / 14.02 / 26.52 | 2.39 / 5.13 / 5.78 |
-
-The hierarchical dist's step part by part, on 1 / 2 / 4 nodes, in ms: the
-input dist; the lookup's forward and backward kernels and the other kernels
-(`fwd/other` and `bwd/other`: the backward of the EC's per-feature split, a
-cat of the output gradients, and two small fills), from its first round's
-profiled iterations (GPU time per iteration, mean over the ranks); the
-output dist's kernels as the rank that arrives last runs them (per call the
-least time over the ranks, then the median over the calls: what the dist
-takes, without the wait for a slower rank); and the rest of the step, host
-time that no kernel above covers.
-
-| features × batch (keys per sample) | step | input dist | lookup fwd + bwd | output dist fwd | output dist bwd | other kernels | rest |
-|---|---|---|---|---|---|---|---|
-| 8 × 4096 (1-32) | 3.3 / 8.5 / 10.7 | 0.30 / 0.70 / 0.71 | 0.93 / 0.90 / 0.84 | 0.74 / 2.89 / 4.07 | 0.72 / 2.85 / 4.14 | 0.19 / 0.19 / 0.19 | 0.4 / 1.0 / 0.7 |
-| 64 × 4096 (1-3) | 3.2 / 8.4 / 10.4 | 0.31 / 0.69 / 0.73 | 0.91 / 0.88 / 0.82 | 0.72 / 2.78 / 3.96 | 0.70 / 2.87 / 4.03 | 0.18 / 0.18 / 0.18 | 0.4 / 1.0 / 0.7 |
-| 256 × 2048 (1) | 3.7 / 8.7 / 10.4 | 0.36 / 0.75 / 0.75 | 0.80 / 0.88 / 0.82 | 0.72 / 3.05 / 3.96 | 0.70 / 2.81 / 4.03 | 0.29 / 0.18 / 0.18 | 0.8 / 1.0 / 0.7 |
-| 1024 × 512 (1) | 6.5 / 9.9 / 10.9 | 0.39 / 0.87 / 0.84 | 0.80 / 0.88 / 0.82 | 0.72 / 2.73 / 3.95 | 0.70 / 2.82 / 4.05 | 0.30 / 0.19 / 0.19 | 3.6 / 2.4 / 1.0 |
-| 4096 × 128 (1) | 38.9 / 41.1 / 45.4 | 0.56 / 1.09 / 1.11 | 0.91 / 0.88 / 0.82 | 0.72 / 2.96 / 3.96 | 0.72 / 2.97 / 4.01 | 0.24 / 0.24 / 0.24 | 35.7 / 32.9 / 35.2 |
-| 1024 × 4096 (1) | 19.1 / 42.3 / 50.1 | 1.20 / 2.56 / 3.01 | 5.77 / 4.79 / 3.55 | 5.24 / 14.70 / 20.69 | 5.03 / 16.83 / 20.79 | 1.42 / 1.42 / 1.43 | 0.4 / 2.0 / 0.6 |
-| 4096 × 1024 (1) | 47.5 / 61.2 / 69.1 | 1.43 / 2.88 / 3.32 | 5.77 / 4.78 / 3.55 | 5.25 / 14.78 / 20.68 | 5.04 / 16.66 / 20.80 | 1.47 / 1.48 / 1.48 | 28.6 / 20.7 / 19.2 |
-| 1024 × 512 (1-4) | 9.5 / 17.6 / 22.2 | 0.56 / 1.25 / 1.16 | 1.79 / 1.95 / 2.00 | 1.74 / 6.52 / 8.93 | 1.67 / 6.19 / 9.01 | 0.70 / 0.46 / 0.46 | 3.1 / 1.2 / 0.6 |
-| 4096 × 128 (1-4) | 39.3 / 48.0 / 50.4 | 0.81 / 1.54 / 1.56 | 2.03 / 1.94 / 2.00 | 1.74 / 6.74 / 8.93 | 1.70 / 6.48 / 8.98 | 0.51 / 0.51 / 0.51 | 32.5 / 30.7 / 28.4 |
-| 1024 × 4096 (1-4) | 40.8 / 65.1 / 75.7 | 2.61 / 5.63 / 6.48 | 10.89 / 7.08 / 5.00 | 11.92 / 21.96 / 29.48 | 11.41 / 25.05 / 30.51 | 3.53 / 3.53 / 3.54 | 0.4 / 1.9 / 0.7 |
-| 4096 × 1024 (1-4) | 61.2 / 84.3 / 94.1 | 2.85 / 6.11 / 6.92 | 10.88 / 7.08 / 5.00 | 11.92 / 21.56 / 29.48 | 11.41 / 26.43 / 30.60 | 3.57 / 3.58 / 3.58 | 20.6 / 19.5 / 18.5 |
-| 1024 × 512 (1-32) | 35.0 / 61.8 / 70.1 | 2.16 / 4.66 / 5.37 | 9.74 / 6.51 / 4.69 | 10.10 / 21.32 / 28.13 | 9.68 / 24.42 / 28.35 | 2.91 / 2.92 / 2.92 | 0.4 / 1.9 / 0.6 |
-| 4096 × 128 (1-32) | 55.8 / 79.3 / 88.9 | 2.39 / 5.13 / 5.78 | 9.75 / 6.51 / 4.69 | 10.12 / 20.43 / 28.14 | 9.69 / 24.54 / 28.35 | 2.96 / 2.97 / 2.97 | 20.9 / 19.7 / 19.0 |
-
-* The hierarchical dist's step is 25% to 74% shorter than TorchRec's, more
-  so with more nodes and more keys per GPU: at 10.5 million keys on 4
-  nodes, 75.7 against 287.5 ms at 1,024 features and 94.1 against 308.8 ms
-  at 4,096. Its input dist is 2.3 to 21 times shorter.
-* The output dist's kernels take the same time at the same keys per GPU
-  whatever the features: at 4.2 million keys the forward takes 5.2, 14.7 to
-  14.8 and 20.7 ms on 1, 2 and 4 nodes at both 1,024 × 4,096 and 4,096 ×
-  1,024.
-* The rest is host time that grows with the features: in these runs
-  TorchRec's EmbeddingCollection gave a JaggedTensor per feature, and
-  autograd had an edge per feature. It is 18 to 36 ms of the step at 4,096
-  features and at most 3.6 ms at 1,024; TorchRec's dists pay it too. The
-  benchmark no longer builds a JaggedTensor per feature (see above), so
-  these tables, measured before that change, hold this work in the step of
-  both dists and in the other kernels (the cat of the features' gradients).
-
-Before these runs, the benchmark drew a new batch every iteration and summed
-each feature's rows into a loss (two or three kernels per feature), so its
-steps at many features were mostly that loss's host work. With that loop,
-the changes for many features (one put per chunk and lookup group; count
-messages, node rows and planner tables that grow with the features once, not
-with the features times the nodes; [docs/hier_output_dist.md](../docs/hier_output_dist.md),
-sections 10 and 11) took the output dist's kernels at 4,096 × 128 on 2 and 4
-nodes from 13 to 17 ms to 2.7 to 4.2 ms, and its input dist from 2.6 to 3.6
-ms to 1.3 to 1.5 ms. The input dist's fusions (section 10) then shortened
-the input dist by 5% to 23% at every point, and left the output dist's
-kernels within about 1%.
+These runs are of commit `45101458`; this batch was not timed again on the
+commits after it.
 
 #### Options
 
@@ -888,7 +911,7 @@ names are in backticks. The JSON line holds more than these measures.
 |---|---|---|
 | step | `iter_ms_mean` | The time on the GPU of the timed iterations over their number, its idle gaps included (where the GPU waits for the host's launches, the step holds that wait): on each rank, from a CUDA event before the first timed iteration to one after the last, on the caller's stream (under a pipeline, the default stream), with the warmup right before and no sync of the benchmark's between them; the mean over ranks (`iter_ms_max`: the most; `iter_ms_per_rank`: each rank's). `iter_ms_host` is rank 0's wall time per timed iteration: from the host's first launch of them (the GPU may then still run the end of the warmup) to a device sync after the last, over their number. With `--call_events`, `fwd_ms_mean` and `bwd_ms_mean` split the plain loop's step into its forward and backward. |
 | input-dist segment | `in_seg_ms_mean`, `in_seg_ms_per_call`, `in_seg_steps_ms` | Plain loop, `--call_events`. Four CUDA events on the caller's stream: before `input_dist()`, after it, after the first wait, and after the second wait, when the lookup may start. The segment runs from the first event to the last, idle time from host syncs included. `in_seg_ms_mean` is its mean over calls and ranks, `in_seg_ms_per_call` holds every call, and `in_seg_steps_ms` the three steps. TorchRec's input dist is measured the same way. |
-| stages | `stages` | Profiled iterations: per stage of the forward or the backward (`fwd/input_dist`, `fwd/lookup`, `bwd/output_dist`, ...), the GPU ms per iteration of its kernels (`ms`) and their count (`kernels`), the mean over ranks. `fwd/other` holds the kernels outside every stage and every autograd node: the zero the model returns for a loss, and the scalar gradient `backward()` starts from (under a pipeline, also its sum of the losses). `bwd/other` holds those of the backward's other nodes: none in the benchmark's model, whose EC returns one JaggedTensor over all features (runs before that change had the backward of the EC's per-feature split there, a cat of the gradients). `net_ms` is the time of the output dist's kernels that move rows between GPUs: NCCL's, or `fwd_kernel` and `bwd_kernel`. |
+| stages | `stages` | Profiled iterations: per stage of the forward or the backward (`fwd/input_dist`, `fwd/lookup`, `bwd/output_dist`, ...), the GPU ms per iteration of its kernels (`ms`) and their count (`kernels`), the mean over ranks. `fwd/other` holds the kernels outside every stage and every autograd node: the zero the model returns for a loss, and the scalar gradient `backward()` starts from (under a pipeline, also its sum of the losses). `bwd/other` holds those of the backward's other nodes: none in the benchmark's model, whose EC returns one JaggedTensor over all features. `net_ms` is the time of the output dist's kernels that move rows between GPUs: NCCL's, or `fwd_kernel` and `bwd_kernel`. |
 | output dist, events | `output_dist_event_ms_median` | Plain loop, `hierarchical`, `--call_events`: CUDA events right before and after the output dist's forward and backward launches, in the timed iterations, with no profiler running; the median over calls of the mean over ranks. They hold the kernel's wait at its start for the other ranks and, when the GPU is idle at the launch, the launch's own CPU time. |
 | output-dist kernels | `output_dist_kernel_ms_median` | `--kernel_times`: the GPU ms of every call's forward kernel and backward kernels (the heavy rows' two included) under a CUDA-only profiler, the median over calls. |
 | rows per iteration | `traffic_mean`, `traffic_max` | The output dist's rows of the timed iterations, per rank and iteration: the mean or the most over the ranks (`traffic_per_rank` holds each rank's). `hierarchical`: `rows_self`, the rows it asks of itself as owner; `rows_nvlink`, the rows it pulls from its node peers; `rows_served`, the rows other GPUs ask of it as owner; across nodes `rows_ib_out` and `rows_ib_in`, the rows its NIC puts and receives in the forward (the backward moves them the other way), `rows_ib`, the larger of the two, `rows_remote`, the rows of its proxy's stream, and `chunks`, that stream's chunks per call. `torchrec`: the forward's rows to itself, to its node peers and to other nodes (`rows_self`, `rows_nvlink`, `rows_ib`), and from other nodes (`rows_ib_in`). |

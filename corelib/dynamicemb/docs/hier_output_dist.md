@@ -100,7 +100,12 @@ operator per sharding, `HierOutputDist`, does the work (section 7):
   of the ring and moves about 512 KiB of rows over IB (section 12.1).
 
 [benchmark/README.md](../benchmark/README.md), section 3, says how to compare
-this dist with TorchRec's dists.
+this dist with TorchRec's dists, and gives the results. With power-law keys,
+at its ten points (8 to 4,096 features, 164K to 4.19M keys per GPU and
+iteration), an `EmbeddingCollection`'s step alone (forward and backward) is
+48% to 81% shorter than on TorchRec's dists on Eos (1 to 4 nodes of 8 H100
+GPUs), and 51% to 82% shorter on GB300 (4 to 16 GPUs of one NVL72 rack,
+each rank pinned to cores of its GPU's CPU).
 
 ## 2. Words used here
 
@@ -290,12 +295,12 @@ every rank before you drop a model (section 4.6).
   shorter runs, so nodes smaller than a host: the dist then moves keys and
   rows between GPUs of one host over IB, and `node_size` warns so on every
   rank. On GB200 or GB300 NVL72 inside one rack, with MNNVL on, it is the
-  job's GPUs of the rack. That is read from NCCL 2.30.4's source: confirm
-  it on the first GB300 run, where `node_size` gives the team and NCCL's
-  INFO log (`NCCL_DEBUG=INFO`) shows `MNNVL 1` with the clique's size
-  (`cliqueSize`) and the NVLink domain's (`nvlDomainSize`), and `nNodes 1`.
-  MNNVL needs the IMEX channel (`/dev/nvidia-caps-imex-channels`) in the
-  container. `NCCL_MNNVL_ENABLE=0` turns it off, and a node is then a host
+  job's GPUs of the rack. On GB300 (NCCL 2.30.7), 2 and 4 trays of one rack
+  gave `node_size` 8 and 16, and NCCL's INFO log (`NCCL_DEBUG=INFO`) showed
+  `MNNVL 1`, `cliqueSize` and `nvlDomainSize` both 8 on 2 trays and both 16
+  on 4, and `nNodes 1`. MNNVL needs the IMEX channel
+  (`/dev/nvidia-caps-imex-channels`) in the container.
+  `NCCL_MNNVL_ENABLE=0` turns it off, and a node is then a host
   (a tray of 4 GPUs); so does `NCCL_P2P_DISABLE=1`, which also turns off
   NCCL's P2P transport (NVLink) for NCCL's own collectives.
   `NCCL_CUMEM_ENABLE=0` turns MNNVL off too, but also NCCL's device API
@@ -414,10 +419,10 @@ traced build's times do not compare with an untraced build's.
   one NIC index, which suits a rail-optimized network. IB use looked
   steadier with it, but it has not been compared with the default on the
   same nodes, for this dist or for the other communicators.
-* Where the NCCL network plugin cannot run GIN (on Eos with its default
-  container), set `NCCL_NET_PLUGIN=none NCCL_GIN_PLUGIN=none`. Under Slurm,
-  export them before `srun`: `--export=ALL,VAR=x` does not override a
-  variable that is already exported.
+* Where the NCCL network plugin cannot run GIN (on Eos and GB300 with
+  their default containers), set `NCCL_NET_PLUGIN=none NCCL_GIN_PLUGIN=none`.
+  Under Slurm, export them before `srun`: `--export=ALL,VAR=x` does not
+  override a variable that is already exported.
 
 ### 4.6 Teardown and `quiesce()`
 
@@ -3298,21 +3303,20 @@ on 1 and 3 CTAs, and the calls of the design's reference ports.
 * **The node is NCCL's LSA team** (sections 2 and 4.2), read once per group
   of ranks at the first `input_dist()`, with a short-lived NCCL
   communicator: a host of 8 GPUs on Eos, and on GB200 and GB300 NVL72 with
-  MNNVL the job's GPUs of a rack when the job runs inside one rack (read
-  from NCCL 2.30.4's source, to confirm on the first GB300 run: section
-  4.2). Across racks it is what the deployed NCCL gives: in NCCL 2.30.4 a
-  rack's GPUs only when the ranks run rack by rack with as many GPUs in
-  each rack, else fewer (to check there). Ranks not numbered host by host
-  give nodes smaller than a host: the dist then moves keys and rows between
-  GPUs of one host over IB, and `node_size` warns. `LOCAL_WORLD_SIZE` does
-  not set it.
+  MNNVL the job's GPUs of a rack when the job runs inside one rack (on
+  GB300, 8 and 16 GPUs of 2 and 4 trays: section 4.2). Across racks it is
+  what the deployed NCCL gives: in NCCL 2.30.4 a rack's GPUs only when the
+  ranks run rack by rack with as many GPUs in each rack, else fewer (to
+  check there). Ranks not numbered host by host give nodes smaller than a
+  host: the dist then moves keys and rows between GPUs of one host over IB,
+  and `node_size` warns. `LOCAL_WORLD_SIZE` does not set it.
 * **Nodes of many GPUs**: `node_offsets` grows with `local_size² ×
   num_features` (section 15.2): at 72 GPUs per node about 1 MiB per GPU
   with 26 features and 40 MiB with 1,024, which every call also sends over
   NVLink. The node's steps that run on one CTA, and the out kernels'
   barriers, have work that grows with `local_size`. The planner's hook
-  tests take nodes of 72 GPUs (section 18); nothing has run on an NVL72
-  rack yet.
+  tests take nodes of 72 GPUs (section 18); nothing has run on a node of
+  more than 16 GPUs yet (4 trays of a GB300 NVL72 rack, section 4.2).
 * **Owner rules**: `roundrobin` and `hash_roundrobin` only. A sharding with
   a `continuous` table takes TorchRec's dists under `"auto"`, and raises
   `ValueError` under `"hierarchical"` (section 6).
