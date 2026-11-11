@@ -149,6 +149,8 @@ class BenchConfig:
     kernel_times: bool = False
     host_stages: bool = False
     nic_counters: bool = False
+    nvtx: bool = False
+    nvtx_ops: bool = False
     seed: int = 1234
     json_out: Optional[str] = None
 
@@ -504,12 +506,58 @@ _STAGE_PREFIX = "bench::"
 # Set while the profiled iterations run: the stage ranges are recorded then
 # only, so the timed iterations pay nothing for them.
 _PROFILING = False
+# --nvtx: the stage ranges also go to NVTX, in every iteration (for nsys).
+_NVTX = False
 _NO_RANGE = contextlib.nullcontext()
 
 
+@contextlib.contextmanager
+def _nvtx_range(name: str, profiling: bool):
+    """An NVTX range ``name``, and the profiler's range too while profiling."""
+    torch.cuda.nvtx.range_push(name)
+    try:
+        if profiling:
+            with record_function(name):
+                yield
+        else:
+            yield
+    finally:
+        torch.cuda.nvtx.range_pop()
+
+
 def _range(name: str):
-    """The profiler range ``name`` while profiling, else nothing."""
+    """The profiler range ``name`` while profiling, and an NVTX range under
+    --nvtx; else nothing."""
+    if _NVTX:
+        return _nvtx_range(name, _PROFILING)
     return record_function(name) if _PROFILING else _NO_RANGE
+
+
+def _nvtx(name: str):
+    """An NVTX range ``name`` under --nvtx, else nothing."""
+    return _nvtx_range(name, False) if _NVTX else _NO_RANGE
+
+
+@contextlib.contextmanager
+def _timed_capture(cfg: "BenchConfig"):
+    """Under --nvtx, the timed iterations between cudaProfilerStart and
+    cudaProfilerStop, so that ``nsys profile -c cudaProfilerApi`` captures
+    them alone; under --nvtx_ops also with an NVTX range per PyTorch op
+    (``emit_nvtx``), whose host time the timings then include."""
+    if not cfg.nvtx:
+        yield
+        return
+    torch.cuda.synchronize()
+    torch.cuda.profiler.start()
+    try:
+        if cfg.nvtx_ops:
+            with torch.autograd.profiler.emit_nvtx():
+                yield
+        else:
+            yield
+    finally:
+        torch.cuda.synchronize()
+        torch.cuda.profiler.stop()
 
 
 # Device syncs a call's host may wait in (--host_stages): (owner, method,
@@ -1617,12 +1665,15 @@ def time_iterations(model, batches: List[Batch]) -> Tuple[List[float], List[floa
         )
         for _ in batches
     ]
-    for batch, (start, middle, end) in zip(batches, events):
-        start.record()
-        loss = model(batch)[0]
-        middle.record()
-        loss.backward()
-        end.record()
+    for i, (batch, (start, middle, end)) in enumerate(zip(batches, events)):
+        with _nvtx(f"iteration {i}"):
+            start.record()
+            with _nvtx("forward"):
+                loss = model(batch)[0]
+            middle.record()
+            with _nvtx("backward"):
+                loss.backward()
+            end.record()
     torch.cuda.synchronize()
     for start, middle, end in events:
         fwd_ms.append(start.elapsed_time(middle))
@@ -1638,10 +1689,11 @@ def time_pipeline(pipeline, batches, iterations: int) -> List[float]:
         (torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True))
         for _ in range(iterations)
     ]
-    for start, end in events:
-        start.record()
-        pipeline.progress(batches)
-        end.record()
+    for i, (start, end) in enumerate(events):
+        with _nvtx(f"iteration {i}"):
+            start.record()
+            pipeline.progress(batches)
+            end.record()
     torch.cuda.synchronize()
     return [start.elapsed_time(end) for start, end in events]
 
@@ -1751,7 +1803,8 @@ def check_against_torchrec(
 
 
 def run(cfg: BenchConfig) -> Dict:
-    global _CALLS, _PROFILING
+    global _CALLS, _PROFILING, _NVTX
+    _NVTX = cfg.nvtx
     if cfg.trace:
         from dynamicemb_extensions import hier_output_dist_traced
 
@@ -1866,13 +1919,14 @@ def run(cfg: BenchConfig) -> Dict:
     nics0 = nic_counters() if cfg.nic_counters and local_rank == 0 else {}
     if host is not None:
         host.install()
-    t0 = time.perf_counter()
     iter_ms = None
-    if pipeline is None:
-        fwd_ms, bwd_ms = time_iterations(model, timed)
-    else:
-        iter_ms = time_pipeline(pipeline, fed, len(timed))
-    wall_ms = (time.perf_counter() - t0) * 1000.0 / len(timed)
+    with _timed_capture(cfg):
+        t0 = time.perf_counter()
+        if pipeline is None:
+            fwd_ms, bwd_ms = time_iterations(model, timed)
+        else:
+            iter_ms = time_pipeline(pipeline, fed, len(timed))
+        wall_ms = (time.perf_counter() - t0) * 1000.0 / len(timed)
     if host is not None:
         host.uninstall()
     nics = None
@@ -2589,6 +2643,19 @@ def parse_args(argv: List[str]) -> BenchConfig:
         "--nic_counters",
         action="store_true",
         help="the bytes every InfiniBand port sent and received",
+    )
+    parser.add_argument(
+        "--nvtx",
+        action="store_true",
+        help="NVTX ranges for nsys (each timed iteration with its forward and "
+        "backward, and the stages), and the timed iterations between "
+        "cudaProfilerStart and cudaProfilerStop (nsys -c cudaProfilerApi)",
+    )
+    parser.add_argument(
+        "--nvtx_ops",
+        action="store_true",
+        help="with --nvtx, also an NVTX range per PyTorch op in the timed "
+        "iterations (emit_nvtx), whose host time the timings then include",
     )
     parser.add_argument(
         "--check",
