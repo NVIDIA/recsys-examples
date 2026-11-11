@@ -76,9 +76,18 @@ def checkpoint_dtype(table_dtype: torch.dtype) -> torch.dtype:
     return torch.float16 if table_dtype == FP8_STORAGE_DTYPE else table_dtype
 
 
-def gradient_dtype(table_dtype: torch.dtype) -> torch.dtype:
-    """Precision the fused optimizer takes gradients in for a table of ``table_dtype``."""
-    return torch.float16 if table_dtype == FP8_STORAGE_DTYPE else table_dtype
+def gradient_dtype(table_dtype: torch.dtype, grad_dtype: torch.dtype) -> torch.dtype:
+    """Precision the optimizer takes a table's gradients in, never below ``grad_dtype``.
+
+    A gradient already has the precision it will ever have, so converting it
+    only matters when it would otherwise lose some. The optimizer kernels take
+    the gradient and the weight at independent dtypes and convert every gradient
+    to fp32 to compute, so an fp32, fp16 or bf16 table takes the gradient as it
+    is. An fp8 table takes fp32 whatever the gradient is: e4m3 cannot hold a
+    gradient (its smallest subnormal is 2^-9, above most embedding gradients),
+    and fp16 would flush those below 6e-8 to zero and keep few bits below 6e-5.
+    """
+    return torch.float32 if table_dtype == FP8_STORAGE_DTYPE else grad_dtype
 
 
 def torch_to_dyn_emb(torch_dtype: torch.dtype) -> DynamicEmbDataType:

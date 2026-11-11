@@ -1428,7 +1428,9 @@ class DynamicEmbeddingFunction(torch.autograd.Function):
                     refresh_slots_after_rehash(state, ctx)
                     with torch.cuda.nvtx.range("op:optimizer_update_fused"):
                         optimizer.fused_update_for_flat_table(
-                            unique_grads.to(gradient_dtype(ctx.emb_dtype)),
+                            unique_grads.to(
+                                gradient_dtype(ctx.emb_dtype, unique_grads.dtype)
+                            ),
                             # Writes into the value buffer -> rows.
                             ctx.update_value_rows,
                             state.table_ptrs_dev,
@@ -1461,7 +1463,9 @@ class DynamicEmbeddingFunction(torch.autograd.Function):
                     all_dims_vec4 = storage.all_dims_vec4()
                     with torch.cuda.nvtx.range("op:optimizer_update_padded"):
                         optimizer.update_for_padded_buffer(
-                            unique_grads,
+                            unique_grads.to(
+                                gradient_dtype(ctx.emb_dtype, unique_grads.dtype)
+                            ),
                             ctx.unique_values,
                             unique_table_ids,
                             table_emb_dims,
