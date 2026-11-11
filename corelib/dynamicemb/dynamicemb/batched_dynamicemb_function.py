@@ -840,8 +840,10 @@ def dynamicemb_prefetch(
     Returns a PrefetchState containing unique embeddings + optimizer states
     and the metadata needed by forward/backward.
 
-    The host reads the number of unique keys only for a table that can still grow,
-    which needs it to decide whether to expand.
+    The host reads the number of unique keys only when a table that can still grow
+    might have to expand: it decides from the number of input keys, an upper bound, and
+    asks the device only when that leaves the question open (see
+    ``DynamicEmbStorage.may_expand``).
 
     ``scores`` are one int64 per key, for tables that take a score per key. They
     follow the keys through the dedup on a channel of their own, beside the
@@ -880,8 +882,9 @@ def dynamicemb_prefetch(
         if hasattr(storage, "collect_table_sizes"):
             storage.collect_table_sizes(non_blocking=True)
 
-        # The number of unique keys stays on the device. The host reads it (a read that
-        # waits for the device) only to decide whether a table has to grow.
+        # The number of unique keys stays on the device. The host needs it (a read that
+        # waits for the device) only to decide whether a table has to grow, and then
+        # only if the number of input keys, a bound of it, leaves that open (below).
         may_grow = (
             hasattr(storage, "expand_if_need")
             and getattr(storage, "can_expand", lambda: True)()
@@ -899,10 +902,23 @@ def dynamicemb_prefetch(
             evict_strat,
             frequency_counts_int64,
         )
+        # No table gets more new keys than the batch has keys: that is what the host
+        # knows. While the tables' estimated sizes plus that fit under their load limit
+        # nothing can grow and nothing is read; otherwise the real counts are, here
+        # and not in the gate, as they always were. A storage that grows but does not say
+        # when it may (a class of the user's with only ``expand_if_need``) is given the
+        # real counts at every step, as it always was.
+        unique_per_table = None
+        key_bound = None
         if may_grow:
-            # The one read of the step: it waits for the device.
-            range_cpu = _copy_cuda_tensor_to_pinned_cpu(unique_indices_table_range)
-            unique_per_table = range_cpu[1:] - range_cpu[:-1]
+            key_bound = torch.full(
+                (table_num,), indices.numel(), dtype=torch.int64, device="cpu"
+            )
+            may_expand = getattr(storage, "may_expand", None)
+            if may_expand is None or may_expand(key_bound):
+                # The read of the step: it waits for the device.
+                range_cpu = _copy_cuda_tensor_to_pinned_cpu(unique_indices_table_range)
+                unique_per_table = range_cpu[1:] - range_cpu[:-1]
         unique_scores = (
             None
             if scores is None
@@ -939,7 +955,10 @@ def dynamicemb_prefetch(
 
         with table_section(table_gate):
             if may_grow:
-                storage.expand_if_need(unique_per_table)
+                if unique_per_table is None:
+                    storage.accumulate_bound(key_bound)
+                else:
+                    storage.expand_if_need(unique_per_table)
 
             if storage_mode == StorageMode.CACHE:
                 if outstanding_keys_ref is not None:

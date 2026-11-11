@@ -1820,6 +1820,8 @@ Users can specify the initial capacity of a table on a single GPU. When the tabl
   The growth is not capped by `max_capacity`.
 - **Loading a checkpoint** (`DynamicEmbStorage.load`): the table is sized for the keys **this rank keeps** from the file (counted from the key file with the rank's ownership filter), not for every key in it, since a checkpoint may hold other ranks' keys as well.
 
+**When the host looks at the device.** The step does not read the number of keys of a table to decide whether it has to expand. The host keeps an estimate of the keys of each table that can still grow (and of the rows handed out of a table that never evicts): the numbers it last read from the device, plus, for every batch since, the number `N` of its input keys, an upper bound of the unique keys `U` the table got (the host does not know `U`, and `N` counts the keys of all the tables of the module). The estimate can only overcount. While the estimate plus `N` stays under the limit of the table (the number of keys it may hold before the rules above grow it), nothing can grow and the step reads nothing and waits for nothing. Near the limit the step reads `U` per table from the device, one wait, and counts `U` in place of `N`; if the estimate then passes the limit, it confirms the sizes with the device, another wait, expands the tables that need it as above, and the estimate is the real size again. The estimate grows by `N` where a table grows by `U`, so it reaches the limit long before the table does: a table with room to spare waits in a burst of up to about `N / U + 2` reads, once in about `(limit - size) / N` steps, and a table within `N` keys of its limit waits at every step. A table that cannot grow (its capacity is `max_capacity`) never reads.
+
 
 ## Host syncs in a step
 
@@ -1829,7 +1831,7 @@ This is the one path of every storage layout (HBM only, cache over storage, hybr
 
 A step makes no blocking host sync. It waits for the device only when:
 
-- a table can grow (`init_capacity` below `max_capacity`, or `NO_EVICTION`): in training, deciding whether to expand needs the number of unique keys per table on the host; see [Table expansion](#table-expansion). A table that cannot grow never reads it.
+- a table that can grow (`init_capacity` below `max_capacity`, or `NO_EVICTION`) is near its limit, by the host's estimate of its size: in training the step then reads the number of unique keys from the device, and the sizes when the table may have to expand, see [Table expansion](#table-expansion) for how often. A table that cannot grow never does.
 - `evicted_item_mode` retains evicted keys: the eviction count is read to keep the keys.
 - `DEMB_DETERMINISM_MODE` is set (see [Deterministic mode](#deterministic-mode)), or `DYNAMICEMB_DEBUG` (see [Environment Variables](#environment-variables)).
 - the cache metrics are recorded (`set_record_cache_metrics(True)`, off by default): the cache's `lookup` and `insert_and_evict` then read the device.

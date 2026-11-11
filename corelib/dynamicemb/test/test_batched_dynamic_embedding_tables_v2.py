@@ -27,6 +27,7 @@ import numpy as np
 import pytest
 import torch
 from dynamicemb import (
+    DynamicEmbCheckMode,
     DynamicEmbInitializerArgs,
     DynamicEmbInitializerMode,
     DynamicEmbPoolingMode,
@@ -55,6 +56,8 @@ from dynamicemb.key_value_table import (
     DynamicEmbTableState,
     HybridStorage,
     Storage,
+    collect_row_counts_to_device,
+    collect_table_sizes_to_device,
     export_keys_values_iter,
     load_from_flat,
     load_from_flat_single_table,
@@ -4312,3 +4315,279 @@ def test_large_batch_matches_the_oracle(layout):
     sample = torch.randint(0, key_space, (100_000,), generator=gen).cuda()
     sample_offsets = torch.arange(0, 100_001, 25_000, device="cuda")
     eval_and_compare(module, oracle, sample, sample_offsets)
+
+
+# --- tables that can still grow -------------------------------------------------------
+#
+# A table that can still grow (``init_capacity`` below ``max_capacity``, or
+# ``NO_EVICTION``) does not read the number of unique keys to decide whether it has to
+# expand. The host decides from a bound it knows (the number of input keys, added to an
+# estimate of the table's size that can only overcount) and reads the real counts, and
+# then the sizes, from the device only when that bound leaves growth open:
+#
+# * a table far from its limit makes no blocking host sync, whatever the storage layout;
+# * a table that has to grow still does, and the keys it holds never pass its load limit;
+# * a batch of repeats, whose bound is far above its real count, does not make a table grow;
+# * ``may_expand`` / ``accumulate_bound`` / ``expand_if_need``: what the host reads, and
+#   when; a storage of the user's that has only ``expand_if_need`` is given the counts at
+#   every step;
+# * the estimates never fall below the real sizes, also while a copy of the sizes from
+#   the device is on its way into them;
+# * a module that grows gives the outputs of one that starts at full size, and loses no
+#   key.
+
+GROW_MAX_ROWS = 1 << 16
+GROW_DIM = 8
+GROW_TABLE_BYTES = GROW_MAX_ROWS * GROW_DIM * 4  # fp32, SGD keeps no optimizer state
+# The share of the value bytes that HBM holds: all, a sixteenth (the cache: 4096 rows),
+# a sixty-fourth (the HBM tier of a hybrid storage: 1024 rows, so that it spills), none
+# (host values).
+GROW_HBM_SHARE = {
+    "hbm": None,
+    "cache": 1 / 16,
+    "hybrid": 1 / 64,
+    "host": 0,
+    "noevict": None,
+}
+GROW_LAYOUTS = list(GROW_HBM_SHARE)
+# The layouts whose table state holds every key of the module.
+GROW_HOLDS_ALL_KEYS = ["hbm", "host", "noevict"]
+
+
+def make_growing_module(layout, init_capacity, feature_table_map=(0,)):
+    """A module that trains for real but never changes a value (learning rate 0): the
+    DEBUG initializer makes the row of a key a function of the key."""
+    share = GROW_HBM_SHARE[layout]
+    options = [
+        DynamicEmbTableOptions(
+            index_type=torch.int64,
+            embedding_dtype=torch.float32,
+            device_id=torch.cuda.current_device(),
+            dim=GROW_DIM,
+            max_capacity=GROW_MAX_ROWS,
+            init_capacity=init_capacity,
+            bucket_capacity=128,
+            safe_check_mode=DynamicEmbCheckMode.IGNORE,
+            local_hbm_for_values=1024**3
+            if share is None
+            else int(share * GROW_TABLE_BYTES),
+            score_strategy=DynamicEmbScoreStrategy.NO_EVICTION
+            if layout == "noevict"
+            else DynamicEmbScoreStrategy.TIMESTAMP,
+            caching=layout == "cache",
+            initializer_args=DynamicEmbInitializerArgs(
+                mode=DynamicEmbInitializerMode.DEBUG
+            ),
+        )
+        for _ in range(max(feature_table_map) + 1)
+    ]
+    return BatchedDynamicEmbeddingTablesV2(
+        table_options=options,
+        table_names=[f"t_{i}" for i in range(len(options))],
+        feature_table_map=list(feature_table_map),
+        pooling_mode=DynamicEmbPoolingMode.SUM,
+        optimizer=EmbOptimType.SGD,
+        learning_rate=0.0,
+        stochastic_rounding=False,
+    )
+
+
+def growing_state(model):
+    """The table state that expands: the host tier of a hybrid storage, else the
+    storage's (the backing storage of a cache)."""
+    storage = model._storage
+    return storage._host if isinstance(storage, HybridStorage) else storage._state
+
+
+def grown_capacity(model, table=0):
+    return growing_state(model).key_index_map.capacity(table)
+
+
+def keys_held(model, table=0):
+    return int(collect_table_sizes_to_device(growing_state(model)).cpu()[table])
+
+
+def one_key_per_bag(keys):
+    """The inputs of a batch. A pageable host-to-device copy waits for the device: make
+    them before a step that is to be probed for waits."""
+    indices = torch.as_tensor(list(keys), dtype=torch.int64, device="cuda")
+    return indices, torch.arange(indices.numel() + 1, dtype=torch.int64, device="cuda")
+
+
+def train_batch(model, indices, offsets):
+    out = model(indices, offsets)
+    out.sum().backward()
+    return out.detach()
+
+
+def train_keys(model, keys):
+    return train_batch(model, *one_key_per_bag(keys))
+
+
+# --- a table that grows: when the host waits, and when the table grows ----------------
+
+
+@pytest.mark.parametrize("layout", GROW_LAYOUTS)
+def test_a_table_far_from_its_limit_does_not_wait(layout):
+    model = make_growing_module(layout, init_capacity=1 << 14)
+    assert model._storage.can_expand(), "the table cannot grow: nothing is tested"
+    before = grown_capacity(model)
+    # The first step is larger than the HBM tier of a hybrid storage: the kernels that
+    # spill to the host have run before the steps under the profiler.
+    train_keys(model, range(10_000, 11_500))
+    batches = [one_key_per_bag(range(i * 200, (i + 1) * 200)) for i in range(5)]
+    for batch in batches[:2]:
+        train_batch(model, *batch)
+    torch.cuda.synchronize()
+    rest = iter(batches[2:])
+    assert blocking_syncs(lambda: train_batch(model, *next(rest)), 3) == {}
+    assert grown_capacity(model) == before
+
+
+@pytest.mark.parametrize("layout", GROW_LAYOUTS)
+def test_a_batch_that_may_fill_the_table_asks_the_device_and_the_table_grows(layout):
+    model = make_growing_module(layout, init_capacity=1024)
+    train_keys(model, range(10))  # nothing to grow yet
+    before = grown_capacity(model)
+    batch = one_key_per_bag(range(1000, 3000))
+    # The same probe that sees nothing above sees the reads and the growth here.
+    syncs = blocking_syncs(lambda: train_batch(model, *batch), 1)
+    assert syncs, "a step that grows a table makes no blocking sync: the probe is blind"
+    assert grown_capacity(model) > before
+
+
+@pytest.mark.parametrize("layout", GROW_LAYOUTS)
+def test_the_keys_of_a_table_never_pass_its_load_limit(layout):
+    model = make_growing_module(layout, init_capacity=1024)
+    for step in range(30):  # 9000 new keys in all: the table grows several times
+        train_keys(model, range(step * 300, (step + 1) * 300))
+        assert (
+            keys_held(model) <= grown_capacity(model) // 2
+        ), f"too late at step {step}"
+    if layout in GROW_HOLDS_ALL_KEYS:
+        assert keys_held(model) == 9000
+
+
+@pytest.mark.parametrize("layout", ["hbm", "noevict"])
+def test_batches_of_repeats_do_not_make_a_table_grow(layout):
+    """4000 keys of 50 distinct ones: the bound the host knows is 80 times the real count,
+    and the table, which holds 50 keys, must not grow on it."""
+    model = make_growing_module(layout, init_capacity=1024)
+    before = grown_capacity(model)
+    for _ in range(20):
+        train_keys(model, [key % 50 for key in range(4000)])
+    assert grown_capacity(model) == before
+    assert keys_held(model) == 50
+
+
+def test_may_expand_is_decided_from_the_estimate_and_the_bound():
+    model = make_growing_module("hbm", init_capacity=1024)  # the load limit is 512 keys
+    storage, state = model._storage, growing_state(model)
+    before = grown_capacity(model)
+    assert state.estimated_table_sizes.tolist() == [0]
+
+    def bound(count):
+        return torch.tensor([count])
+
+    for _ in range(4):  # 400 keys by the bounds: under the limit, whatever they are
+        assert not storage.may_expand(bound(100))
+        storage.accumulate_bound(bound(100))
+    assert state.estimated_table_sizes.tolist() == [400]
+    assert storage.may_expand(bound(200))  # 600 might not fit
+
+    # The batch had 200 unique keys, and the table holds none: the sizes on the device
+    # settle it. They refresh the estimate, and until a step has waited for that copy
+    # the estimate is not read: the next batch is asked for.
+    storage.expand_if_need(bound(200))
+    assert grown_capacity(model) == before
+    assert state.collect_table_sizes_flag
+    assert storage.may_expand(bound(1))
+    storage.expand_if_need(bound(1))
+    assert not state.collect_table_sizes_flag
+    assert not storage.may_expand(bound(1))
+
+    # 1000 new keys do not fit, and the table is empty: the sizes on the device cannot
+    # have made the estimate too large.
+    assert storage.may_expand(bound(1000))
+    storage.expand_if_need(bound(1000))
+    assert grown_capacity(model) > before
+
+
+def test_a_storage_that_does_not_say_when_it_may_grow_is_asked_at_every_step():
+    """A storage of the user's with only ``expand_if_need`` is given the real counts at
+    every step, as it always was: it has no ``may_expand`` and no ``accumulate_bound``.
+    """
+    model = make_growing_module("hbm", init_capacity=1 << 14)
+    model._storage.may_expand = (
+        None  # shadows the method: this storage does not offer it
+    )
+    batches = [one_key_per_bag(range(i * 200, (i + 1) * 200)) for i in range(5)]
+    for batch in batches[:2]:
+        train_batch(model, *batch)
+    torch.cuda.synchronize()
+    rest = iter(batches[2:])
+    assert blocking_syncs(
+        lambda: train_batch(model, *next(rest)), 3
+    ), "the counts were not read"
+
+    model = make_growing_module("hbm", init_capacity=1024)
+    model._storage.may_expand = None
+    before = grown_capacity(model)
+    for step in range(10):
+        train_keys(model, range(step * 300, (step + 1) * 300))
+        assert (
+            keys_held(model) <= grown_capacity(model) // 2
+        ), f"too late at step {step}"
+    assert grown_capacity(model) > before
+
+
+@pytest.mark.parametrize("layout", ["hbm", "noevict"])
+def test_the_estimates_never_fall_below_the_real_sizes(layout):
+    """A flag left by a checkpoint load, or by a confirmation that found nothing to
+    expand, makes the next prefetch queue a copy of the sizes into the host's estimates.
+    If the step used or added to them before that copy has landed, the copy would
+    overwrite the sum and lose the keys of the batch: the table would grow late. The
+    sleep keeps the copy waiting on the device while the host goes on."""
+    model = make_growing_module(layout, init_capacity=1 << 14)
+    state = growing_state(model)
+    for step in range(4):
+        state.collect_table_sizes_flag = True
+        batch = one_key_per_bag(range(step * 500, (step + 1) * 500))
+        torch.cuda._sleep(100_000_000)
+        train_batch(model, *batch)
+        torch.cuda.synchronize()
+        assert int(state.estimated_table_sizes[0]) >= keys_held(model), step
+        if state.no_eviction:
+            rows = int(collect_row_counts_to_device(state).cpu()[0])
+            assert int(state.estimated_row_counts[0]) >= rows, step
+        assert not state.collect_table_sizes_flag
+
+
+@pytest.mark.parametrize("layout", GROW_LAYOUTS)
+def test_a_growing_module_gives_the_outputs_of_one_that_starts_at_full_size(layout):
+    """Two tables, both fed by the same keys: some new at every step (5600 in all, more
+    than the cache, the HBM tier, hold), some seen before. A key that a rehash lost would
+    come back with the same row (the DEBUG initializer), so what is checked is that the
+    tables that never evict still hold every key."""
+    feature_table_map = (0, 1)
+    grown = make_growing_module(layout, 1024, feature_table_map)
+    full = make_growing_module(layout, GROW_MAX_ROWS, feature_table_map)
+    before = grown_capacity(grown)
+    gen = torch.Generator().manual_seed(3)
+    for step in range(14):
+        new = torch.arange(step * 400, (step + 1) * 400)
+        old = torch.randint(0, max(step * 400, 1), (100,), generator=gen)
+        keys = torch.cat([new, old]).tolist()
+        indices, offsets = one_key_per_bag(keys * 2)  # the same keys for both features
+        out_grown = grown(indices, offsets)
+        out_full = full(indices, offsets)
+        assert torch.equal(out_grown, out_full), f"step {step}"
+        (out_grown.sum() + out_full.sum()).backward()
+    assert grown_capacity(grown) > before, "the module never grew"
+    if layout in GROW_HOLDS_ALL_KEYS:
+        assert [keys_held(grown, t) for t in (0, 1)] == [5600, 5600]
+    grown.eval()
+    full.eval()
+    with torch.no_grad():
+        indices, offsets = one_key_per_bag(list(range(5600)) * 2)
+        assert torch.equal(grown(indices, offsets), full(indices, offsets))

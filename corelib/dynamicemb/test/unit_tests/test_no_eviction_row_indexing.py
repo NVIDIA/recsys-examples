@@ -618,6 +618,36 @@ def test_rows_handed_out_grow_the_value_buffer_not_the_key_map(current_device):
     assert km.num_rows(0) == 3000
 
 
+def test_the_host_estimate_of_a_table_that_never_evicts_counts_rows(current_device):
+    """The step decides from the host's estimates whether to look at the device
+    (``may_expand``) and counts a batch it does not look at by its bound
+    (``accumulate_bound``), in the estimate of the keys and in that of the rows handed
+    out. Rows can outnumber keys: a batch that the key map has room for can still need
+    more rows than the buffer has, and only the estimate of the rows says so."""
+    model = build_model(current_device, max_capacity=65536 * 2, init_capacity=4096)
+    storage, state = model._storage, model._storage._state
+    km = state.key_index_map
+    assert (km.capacity(0), state.tables[0].shape[0]) == (8192, 4096)
+
+    km.reserve_rows(0, 3000)  # three thousand rows out, no live key at all
+    # Refresh the estimates from the device, as a checkpoint load does. A step that has
+    # waited for that copy has lowered the flag, which on its own makes may_expand say yes.
+    state.collect_table_sizes_flag = True
+    collect_table_sizes_for_state(state, non_blocking=False)
+    state.collect_table_sizes_flag = False
+    assert state.estimated_table_sizes.tolist() == [0]
+    assert state.estimated_row_counts.tolist() == [3000]
+
+    flags, _ = get_expand_info(state, state.estimated_table_sizes, torch.tensor([1500]))
+    assert flags == [False]  # 1500 keys in 8192 slots: the key map has room ...
+    assert storage.may_expand(torch.tensor([1500]))  # ... 4500 rows in 4096 do not
+    assert not storage.may_expand(torch.tensor([1000]))  # 4000 do
+
+    storage.accumulate_bound(torch.tensor([100]))
+    assert state.estimated_table_sizes.tolist() == [100]
+    assert state.estimated_row_counts.tolist() == [3100]
+
+
 def test_new_keys_carry_a_flag_and_erased_slots_do_not(current_device):
     """``NO_EVICTION`` alone has no score a user sets, but every key it stores
     sets its flag to 1 and an erased slot is cleared to 0. That is what lets a full bucket

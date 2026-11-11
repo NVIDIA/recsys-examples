@@ -502,8 +502,8 @@ class DynamicEmbTableState:
         """Whether a batch could make any of the tables grow.
 
         Host-only and conservative: the rule of :func:`get_expand_info`, without
-        the sizes. A state that cannot expand never needs the number of unique
-        keys of a batch on the host.
+        the sizes. A state that cannot expand never consults its estimate of the
+        table sizes (see :func:`growth_may_be_due`).
         """
         if self.no_eviction:
             return True
@@ -1204,6 +1204,28 @@ def get_expand_info(
     return results, target_capacities
 
 
+def _rows_short(
+    state: DynamicEmbTableState,
+    rows: torch.Tensor,
+    unique_size_per_table: torch.Tensor,
+) -> bool:
+    """Whether the rows a table that never evicts has handed out (``rows``), plus a
+    batch that adds ``unique_size_per_table``, pass what its value buffer holds.
+
+    A buffer that already has a row for every slot of the key map has nothing more to
+    grow to (see _value_rows_target), so the rows it is asked for are no pressure:
+    counting them would make every batch of a table that has settled at one row per slot
+    ask the device for numbers that change nothing. The key map's own growth is checked
+    apart, by get_expand_info, and when it grows the buffer is short of slots again.
+    """
+    need = rows + unique_size_per_table
+    return any(
+        int(need[i]) > state.tables[i].shape[0]
+        and state.tables[i].shape[0] < state.key_index_map.per_table_capacity_[i]
+        for i in range(state.num_tables)
+    )
+
+
 def _expand_if_need_no_eviction(
     state: DynamicEmbTableState, unique_size_per_table: torch.Tensor
 ) -> None:
@@ -1218,32 +1240,13 @@ def _expand_if_need_no_eviction(
     So erasing keys lets new ones come in without growing the key map, and a table
     that churns its keys settles at one row per slot instead of growing forever.
     Like the other strategies this works from estimates (the last confirmed
-    numbers plus every batch's unique keys, which can only overcount) and confirms
-    them against the device, one sync, only when an estimate says something has to
-    grow.
+    numbers plus every batch's unique keys, or their bound, which can only
+    overcount) and confirms them against the device, one sync, only when an estimate
+    says something has to grow.
     """
-    if state.estimated_row_counts is None:
-        state.estimated_row_counts = torch.zeros(
-            state.num_tables, dtype=torch.int64, pin_memory=True
-        )
     keys_est, rows_est = state.estimated_table_sizes, state.estimated_row_counts
-
-    def rows_short(rows: torch.Tensor) -> bool:
-        # A buffer that already has a row for every slot of the key map has nothing
-        # more to grow to (see _value_rows_target), so the rows it is asked for are no
-        # pressure: counting them would make every batch of a table that has settled
-        # at one row per slot ask the device for numbers that change nothing. The key
-        # map's own growth is checked apart, by get_expand_info, and when it grows the
-        # buffer is short of slots again.
-        need = rows + unique_size_per_table
-        return any(
-            int(need[i]) > state.tables[i].shape[0]
-            and state.tables[i].shape[0] < state.key_index_map.per_table_capacity_[i]
-            for i in range(state.num_tables)
-        )
-
     est_results, _ = get_expand_info(state, keys_est, unique_size_per_table)
-    if any(est_results) or rows_short(rows_est):
+    if any(est_results) or _rows_short(state, rows_est, unique_size_per_table):
         keys = collect_table_sizes_to_device(state).cpu()
         rows = collect_row_counts_to_device(state).cpu()
         keys_est.copy_(keys)
@@ -1256,6 +1259,60 @@ def _expand_if_need_no_eviction(
         _grow_values_only(state, need_rows)
     keys_est.add_(unique_size_per_table)
     rows_est.add_(unique_size_per_table)
+    # This path confirms from the device itself, not through the flag: a flag left by a
+    # checkpoint load has had its use (the step waited for the copy it made).
+    state.collect_table_sizes_flag = False
+
+
+def _ensure_estimates(state: DynamicEmbTableState) -> None:
+    if state.estimated_table_sizes is None:
+        state.estimated_table_sizes = torch.zeros(
+            state.num_tables, dtype=torch.int64, pin_memory=True
+        )
+    if state.no_eviction and state.estimated_row_counts is None:
+        state.estimated_row_counts = torch.zeros(
+            state.num_tables, dtype=torch.int64, pin_memory=True
+        )
+
+
+def growth_may_be_due(
+    state: DynamicEmbTableState, bound_per_table: torch.Tensor
+) -> bool:
+    """Whether a batch that adds at most ``bound_per_table`` keys to each table might
+    make one grow, by the host's estimates alone: nothing is read from the device.
+
+    The estimates only overcount, so a batch that cannot make a table grow by them
+    cannot by the real sizes either: it needs only :func:`accumulate_bound`. When the
+    answer is True the decision needs the number of unique keys of the batch, which is
+    on the device, and goes to :func:`expand_if_need_impl`.
+
+    It is also True while ``collect_table_sizes_flag`` is set: a copy of the sizes from
+    the device may be on its way into the estimates (see ``dynamicemb_prefetch``), and
+    they are not to be read or added to before the host has waited for it, which
+    reading the number of unique keys does.
+    """
+    _ensure_estimates(state)
+    if state.collect_table_sizes_flag:
+        return True
+    results, _ = get_expand_info(state, state.estimated_table_sizes, bound_per_table)
+    if any(results):
+        return True
+    return state.no_eviction and _rows_short(
+        state, state.estimated_row_counts, bound_per_table
+    )
+
+
+def accumulate_bound(
+    state: DynamicEmbTableState, bound_per_table: torch.Tensor
+) -> None:
+    """Count a batch that cannot make a table grow (see :func:`growth_may_be_due`) by
+    the bound of its unique keys, which can only be too large, in place of their number,
+    which the host does not know."""
+    assert bound_per_table.device.type == "cpu", "bound_per_table must be a CPU tensor"
+    _ensure_estimates(state)
+    state.estimated_table_sizes.add_(bound_per_table)
+    if state.no_eviction:
+        state.estimated_row_counts.add_(bound_per_table)
 
 
 def expand_if_need_impl(
@@ -1265,17 +1322,15 @@ def expand_if_need_impl(
     """Accumulate per-table unique counts, optionally collect size and expand.
 
     unique_size_per_table is the CPU tensor of per-table unique counts (shape
-    (num_tables,)) that ``dynamicemb_prefetch`` reads from the device.
+    (num_tables,)) that ``dynamicemb_prefetch`` reads from the device, and only when
+    :func:`growth_may_be_due` says that it has to.
     When a second opinion on table sizes is needed, calls
     :func:`collect_table_sizes_for_state` with ``non_blocking=False``.
     """
     assert (
         unique_size_per_table.device.type == "cpu"
     ), "unique_size_per_table must be a CPU tensor"
-    if state.estimated_table_sizes is None:
-        state.estimated_table_sizes = torch.zeros(
-            state.num_tables, dtype=torch.int64, pin_memory=True
-        )
+    _ensure_estimates(state)
     if state.no_eviction:
         _expand_if_need_no_eviction(state, unique_size_per_table)
         return
@@ -3195,9 +3250,21 @@ class DynamicEmbStorage(Storage):
                     break
 
     def can_expand(self) -> bool:
-        """Whether a batch could grow a table: only then does the number of unique keys
-        per table have to be known on the host (see ``expand_if_need``)."""
+        """Whether a batch could grow a table: only then does the host keep an estimate
+        of the table sizes (see ``may_expand``)."""
         return self._state.can_expand()
+
+    def may_expand(self, bound_per_table: torch.Tensor) -> bool:
+        """Whether a batch that adds at most ``bound_per_table`` keys to each table might
+        make one grow, by the host's estimates alone (see :func:`growth_may_be_due`).
+        If not, ``accumulate_bound`` is all the batch needs; if so, ``expand_if_need``
+        wants the number of unique keys per table, which the host reads from the
+        device."""
+        return growth_may_be_due(self._state, bound_per_table)
+
+    def accumulate_bound(self, bound_per_table: torch.Tensor) -> None:
+        """Count a batch for which ``may_expand`` was False by its bound."""
+        accumulate_bound(self._state, bound_per_table)
 
     def expand_if_need(self, unique_size_per_table: torch.Tensor) -> None:
         """Accumulate per-table unique counts, optionally collect size and expand."""
@@ -3821,6 +3888,15 @@ class HybridStorage(Storage):
     def can_expand(self) -> bool:
         """Whether a batch could grow the host tier (the one that expands)."""
         return self._host.can_expand()
+
+    def may_expand(self, bound_per_table: torch.Tensor) -> bool:
+        """Whether a batch that adds at most ``bound_per_table`` keys might make the host
+        tier grow (see ``DynamicEmbStorage.may_expand``)."""
+        return growth_may_be_due(self._host, bound_per_table)
+
+    def accumulate_bound(self, bound_per_table: torch.Tensor) -> None:
+        """Count a batch for which ``may_expand`` was False by its bound."""
+        accumulate_bound(self._host, bound_per_table)
 
     def expand_if_need(self, unique_size_per_table: torch.Tensor) -> None:
         """Accumulate per-table unique counts (on host), optionally collect size and expand."""
