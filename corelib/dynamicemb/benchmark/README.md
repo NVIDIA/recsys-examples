@@ -847,7 +847,7 @@ kernels within about 1%.
 | `--kernel_times` | off | After the timed iterations, as many again under a CUDA-only profiler. It reports every call's output-dist kernel times, with their wait at the start for the other ranks (the hierarchical dist only). |
 | `--host_stages` | off | Plain loop, to find problems. Per call: the CPU time spent waiting for the GPU, by place in the code. |
 | `--nic_counters` | off | read every InfiniBand port's counters on each host before and after the timed iterations, and report what each sent and received |
-| `--nvtx` | off | for Nsight Systems: NVTX ranges of each timed iteration (`iteration i`, with its `forward` and `backward`) and of the stages (`bench::input_dist` and the like), in every iteration; and the timed iterations between `cudaProfilerStart` and `cudaProfilerStop`, so that `nsys profile -c cudaProfilerApi --capture-range-end=stop` captures them alone |
+| `--nvtx` | off | for Nsight Systems: NVTX ranges of each timed iteration (`iteration i`, with its `forward` and `backward`) and of the stages (`bench::input_dist` and the like), in every iteration; and the timed iterations between `cudaProfilerStart` and `cudaProfilerStop`, so that `nsys profile -c cudaProfilerApi --capture-range-end=stop` captures them alone; the ranks meet in a barrier after `cudaProfilerStart`, so a rank whose capture takes seconds to start does not hold up the others' first timed iteration |
 | `--nvtx_ops` | off | with `--nvtx`, also an NVTX range per PyTorch op of the timed iterations (`torch.autograd.profiler.emit_nvtx`), the backward's autograd nodes included; their host time is then in the timings |
 | `--json_out` | none | append the results as one JSON line to this file |
 

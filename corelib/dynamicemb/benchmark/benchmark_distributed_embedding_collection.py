@@ -543,12 +543,17 @@ def _timed_capture(cfg: "BenchConfig"):
     """Under --nvtx, the timed iterations between cudaProfilerStart and
     cudaProfilerStop, so that ``nsys profile -c cudaProfilerApi`` captures
     them alone; under --nvtx_ops also with an NVTX range per PyTorch op
-    (``emit_nvtx``), whose host time the timings then include."""
+    (``emit_nvtx``), whose host time the timings then include. A barrier
+    after cudaProfilerStart: the profiled rank's capture starts in it, which
+    can take seconds, and the other ranks' first timed forward would wait
+    that out in the dists."""
     if not cfg.nvtx:
         yield
         return
     torch.cuda.synchronize()
     torch.cuda.profiler.start()
+    dist.barrier()
+    torch.cuda.synchronize()
     try:
         if cfg.nvtx_ops:
             with torch.autograd.profiler.emit_nvtx():
