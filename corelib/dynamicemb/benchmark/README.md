@@ -559,11 +559,11 @@ alone. Before the run, each GPU draws two batches with random sequence
 lengths and keys, and the iterations take them in turn. So the amount each
 GPU sends and receives changes from one iteration to the next, and no
 iteration repeats the one before it, whose keys and rows the GPU's caches
-may still hold. From the third call on (every timed one, with `--warmup` 2
-or more), the keys a lookup asks for are already in its table, where the
-first two calls put them: the timed lookups find their keys instead of
-inserting them, in tables that hold only the two batches' keys (about 24%
-of the key range on one node at the configuration below, 66% on four). This
+may still hold. From the third call on (every timed one), the keys a lookup
+asks for are already in its table, where the first two calls put them: the
+timed lookups find their keys instead of inserting them, in tables that
+hold only the two batches' keys (about 24% of the key range on one node at
+the configuration below, 66% on four). This
 is the same for every dist. No loss is computed. The forward returns a zero
 in its place, and the backward gives each looked-up row a gradient drawn
 once before the run: +1 or -1 per element, from `--seed` and the rank, so
@@ -575,11 +575,24 @@ dedup, an `index_select` by the reverse indices, stays). That split is host
 work that grows with the features, the same for every dist (about 4 ms at
 1,024 features on GB300), and its backward is a cat of the features'
 gradients. So the step holds no work per feature outside the dists, and the
-gradient goes to the rows in one autograd edge. Python's garbage collector is off in the
-timed iterations (`--timed_gc`). It runs a plain training
-loop (the forward, then `backward()` on that zero, each timed on its own) or
-one of TorchRec's train pipelines, with one of these ways to move keys and
-rows between GPUs (`--output_dist`):
+gradient goes to the rows in one autograd edge.
+
+The first call makes what the dists keep (the hierarchical dist's op and
+its windows). After a barrier, the warmup (`--warmup`, 20 iterations) and
+the timed iterations (`--num_iterations`, 20) run back to back: nothing of
+the benchmark's between them syncs the host with the GPU, so the timed
+iterations follow the warmup without a pause and the ranks reach them in
+step. The dists and the lookup keep their own host syncs in every call (one
+in the hierarchical dist's input dist, several in TorchRec's, two in
+DynamicEmb's lookup), so the host runs at most part of an iteration ahead
+of the GPU, and where the GPU waits for the host, the wait is in the step.
+A CUDA event before the first timed iteration and one after the last time
+them: the step is the time between them on the GPU, its idle gaps
+included, over the timed iterations. Python's garbage collector is off in
+the warmup and the timed iterations (`--timed_gc`). The loop is a plain
+training loop (the forward, then `backward()` on that zero) or one of
+TorchRec's train pipelines, with one of these ways to move keys and rows
+between GPUs (`--output_dist`):
 
 * `torchrec`: TorchRec's input and output dists (bucketize and NCCL
   all-to-alls; reorder, all-to-all, `index_select`).
@@ -608,7 +621,7 @@ default task layout do this). The words used here (GIN, rail, proxy,
 ```bash
 BENCH=benchmark/benchmark_distributed_embedding_collection.py
 ARGS="--num_tables 8 --num_embeddings 4000000 --local_batch_size 4096 \
-      --max_seq_len 32 --num_iterations 20 --warmup 5 --use_index_dedup"
+      --max_seq_len 32 --use_index_dedup"
 export NCCL_CROSS_NIC=0                            # GIN on the rails only (recommended)
 export NCCL_NET_PLUGIN=none NCCL_GIN_PLUGIN=none   # only where NCCL's plugin cannot run GIN (Eos)
 
@@ -676,6 +689,8 @@ More runs on the same configuration:
   NVLink use and their overlap. A traced build is slower, so take times from
   a build without the trace.
 * `--host_stages` (plain loop): where the CPU waits for the GPU.
+* `--call_events` (plain loop): CUDA events in every timed call, for the
+  per-call metrics (*Metrics*).
 * `--capacity <entries>`: the capacities by hand, for example to see calls
   that do not fit.
 
@@ -847,18 +862,19 @@ kernels within about 1%.
 | `--emb_dtype`, `--output_dtype` | `fp32` | `fp32`, `bf16` or `fp16` |
 | `--use_index_dedup` | off | TorchRec's index dedup: each rank removes its own repeated keys before the input dist. A call on the hierarchical dist (`hierarchical`, `auto`, `--check`) does so without it too |
 | `--optimizer`, `--learning_rate` | `sgd`, 0.01 | `sgd`, `adam`, `exact_adagrad` or `rowwise_adagrad` |
-| `--num_iterations`, `--warmup` | 30, 10 | timed and untimed iterations, at least 1 each |
+| `--num_iterations`, `--warmup` | 20, 20 | the timed iterations, and the untimed ones right before them (after the first call): the two run back to back, with no sync of the benchmark's between them, and a CUDA event before the first timed iteration and one after the last time them. At least 1 each |
 | `--seed` | 1234 | seed of the batches and of the output gradients (different for each rank) |
 | `--profile_iterations` | 5 | that many more iterations under `torch.profiler`, for the per-stage kernel times and counts; 0 skips them |
 | `--check` | off | Before timing, train 4 steps of two models side by side: one on TorchRec's dists, and one on the hierarchical dist (`--output_dist`'s, or `hierarchical` when that is `torchrec`), both with `--use_index_dedup` or both without it. Both start from the DEBUG initializer, where a key's row is a function of the key. They use SGD at learning rate 1, the same output gradients (+1 or -1 per element, as in the timed run), and keys from an eighth of the table, so nothing is evicted. The capacities are `--capacity`, or measured on the check's own batches. Then print PASSED or FAILED. Outputs must match bit for bit when `--emb_dtype` and `--output_dtype` are both `fp32` and the world size is a power of two. Otherwise they must match bit for bit at the first step, and within 1e-2 after it. The checked model must also have launched its own output dist's kernels at every step, both ways. A sharding that took TorchRec's dists (one rank, for example) prints `FAILED (the <dist> model fell back to TorchRec's dists)`, where `<dist>` is `hierarchical` or `auto`. A failure exits with status 1. |
 | `--trace` | off | The hierarchical dist's kernel timelines. It needs DynamicEmb built with `DYNAMICEMB_HIER_TRACE=1` (`docs/hier_output_dist.md`, section 4.4), and else stops with `--trace: rebuild with DYNAMICEMB_HIER_TRACE=1`. It keeps the timelines of the last 64 calls of each direction (every timed call at 64 iterations or fewer), and puts every rank's time stamps on rank 0's clock. It reports the traced metrics below (IB, NVLink and their overlap). A traced build traces every output-dist kernel: two memsets per kernel and counters in shared memory; `--trace` adds two clock stamps per input dist. So its times and kernel counts do not compare with an untraced build's. |
 | `--trace_out` | none | with `--trace`: save every rank's traced kernels of the timed iterations to this `.npz` file, for offline analysis |
 | `--kernel_times` | off | After the timed iterations, as many again under a CUDA-only profiler. It reports every call's output-dist kernel times, with their wait at the start for the other ranks (the hierarchical dist only). |
-| `--host_stages` | off | Plain loop, to find problems. Per call: the CPU time spent waiting for the GPU, by place in the code. |
-| `--nic_counters` | off | read every InfiniBand port's counters on each host before and after the timed iterations, and report what each sent and received |
-| `--nvtx` | off | for Nsight Systems: NVTX ranges of each timed iteration (`iteration i`, with its `forward` and `backward`) and of the stages (`bench::input_dist` and the like), in every iteration; and the timed iterations between `cudaProfilerStart` and `cudaProfilerStop`, so that `nsys profile -c cudaProfilerApi --capture-range-end=stop` captures them alone; the ranks meet in a barrier after `cudaProfilerStart`, so a rank whose capture takes seconds to start does not hold up the others' first timed iteration. To read a run's numbers in a capture, capture that run: the same options (`--num_iterations` and `--warmup` above all, since a shorter window can miss what a longer one holds) plus `--nvtx`, and compare the capture's step with the run's |
-| `--nvtx_ops` | off | with `--nvtx`, also an NVTX range per PyTorch op of the timed iterations (`torch.autograd.profiler.emit_nvtx`), the backward's autograd nodes included; their host time, on every rank, is then in the timings, so a capture with it is for reading ops, not for timing |
-| `--timed_gc` | `off` | Python's cyclic garbage collector in the timed iterations: `off` (one collection after the warmup, before the ranks meet in a barrier, then off until the timed iterations end; `timeit` only turns it off) or `on`. A full collection takes about 100 ms on the benchmark's heap and falls at the same call on every rank with the same history; with TorchRec's per-feature output at 1,024 features it fell inside the timed iterations on GB300, and the ranks' collective kernels waited for the rank that paused |
+| `--call_events` | off | Plain loop: CUDA events in every timed call, before and after its input dist's steps and its hierarchical output dist's launches, and between its forward and backward, for the per-call metrics (*Metrics*). Each adds host work to the call, so take the step from runs without it. `--trace` and `--host_stages` turn it on. |
+| `--host_stages` | off | Plain loop, to find problems. Per call: the CPU time spent waiting for the GPU, by place in the code (with `--call_events`'s events). |
+| `--nic_counters` | off | read every InfiniBand port's counters on each host right before the timed iterations (host work between the warmup and them, while the GPU may still run the warmup's last iteration, whose bytes may then count) and after them (after a device sync), and report what each sent and received |
+| `--nvtx` | off | for Nsight Systems: NVTX ranges of each warmup iteration (`warmup i`) and each timed iteration (`iteration i`, with its `forward` and `backward`), and of the stages (`bench::input_dist` and the like); and the warmup and the timed iterations between `cudaProfilerStart` and `cudaProfilerStop`, so that `nsys profile -c cudaProfilerApi --capture-range-end=stop` captures them alone. `cudaProfilerStart` comes before the barrier ahead of the warmup, so a rank whose capture takes seconds to start holds up no iteration. To read a run's numbers in a capture, capture that run: the same options plus `--nvtx`, and compare the capture's step with the run's |
+| `--nvtx_ops` | off | with `--nvtx`, also an NVTX range per PyTorch op of the warmup and the timed iterations (`torch.autograd.profiler.emit_nvtx`), the backward's autograd nodes included; their host time, on every rank, is then in the timings, so a capture with it is for reading ops, not for timing |
+| `--timed_gc` | `off` | Python's cyclic garbage collector in the warmup and the timed iterations: `off` (one collection before the ranks meet in the barrier ahead of the warmup, then off until the timed iterations end; `timeit` only turns it off) or `on`. A full collection takes about 100 ms on the benchmark's heap and falls at the same call on every rank with the same history; with TorchRec's per-feature output at 1,024 features it fell inside the timed iterations on GB300, and the ranks' collective kernels waited for the rank that paused |
 | `--json_out` | none | append the results as one JSON line to this file |
 
 #### Metrics
@@ -870,10 +886,10 @@ names are in backticks. The JSON line holds more than these measures.
 
 | metric | JSON field | definition |
 |---|---|---|
-| step | `iter_ms_host` | Wall time of the timed iterations divided by their number, on rank 0 (`time.perf_counter` around the loop, which ends with a device sync), for the plain loop or a pipeline. |
-| input-dist segment | `in_seg_ms_mean`, `in_seg_ms_per_call`, `in_seg_steps_ms` | Plain loop. Four CUDA events on the caller's stream: before `input_dist()`, after it, after the first wait, and after the second wait, when the lookup may start. The segment runs from the first event to the last, idle time from host syncs included. `in_seg_ms_mean` is its mean over calls and ranks, `in_seg_ms_per_call` holds every call, and `in_seg_steps_ms` the three steps. TorchRec's input dist is measured the same way. The first timed call is slow on every dist, because the GPU waits for the CPU when the loop starts. |
+| step | `iter_ms_mean` | The time on the GPU of the timed iterations over their number, its idle gaps included (where the GPU waits for the host's launches, the step holds that wait): on each rank, from a CUDA event before the first timed iteration to one after the last, on the caller's stream (under a pipeline, the default stream), with the warmup right before and no sync of the benchmark's between them; the mean over ranks (`iter_ms_max`: the most; `iter_ms_per_rank`: each rank's). `iter_ms_host` is rank 0's wall time per timed iteration: from the host's first launch of them (the GPU may then still run the end of the warmup) to a device sync after the last, over their number. With `--call_events`, `fwd_ms_mean` and `bwd_ms_mean` split the plain loop's step into its forward and backward. |
+| input-dist segment | `in_seg_ms_mean`, `in_seg_ms_per_call`, `in_seg_steps_ms` | Plain loop, `--call_events`. Four CUDA events on the caller's stream: before `input_dist()`, after it, after the first wait, and after the second wait, when the lookup may start. The segment runs from the first event to the last, idle time from host syncs included. `in_seg_ms_mean` is its mean over calls and ranks, `in_seg_ms_per_call` holds every call, and `in_seg_steps_ms` the three steps. TorchRec's input dist is measured the same way. |
 | stages | `stages` | Profiled iterations: per stage of the forward or the backward (`fwd/input_dist`, `fwd/lookup`, `bwd/output_dist`, ...), the GPU ms per iteration of its kernels (`ms`) and their count (`kernels`), the mean over ranks. `fwd/other` holds the kernels outside every stage and every autograd node: the zero the model returns for a loss, and the scalar gradient `backward()` starts from (under a pipeline, also its sum of the losses). `bwd/other` holds those of the backward's other nodes: none in the benchmark's model, whose EC returns one JaggedTensor over all features (runs before that change had the backward of the EC's per-feature split there, a cat of the gradients). `net_ms` is the time of the output dist's kernels that move rows between GPUs: NCCL's, or `fwd_kernel` and `bwd_kernel`. |
-| output dist, events | `output_dist_event_ms_median` | Plain loop, `hierarchical`: CUDA events right before and after the output dist's forward and backward launches, in the timed iterations, with no profiler running; the median over calls of the mean over ranks. They hold the kernel's wait at its start for the other ranks and, when the GPU is idle at the launch, the launch's own CPU time. |
+| output dist, events | `output_dist_event_ms_median` | Plain loop, `hierarchical`, `--call_events`: CUDA events right before and after the output dist's forward and backward launches, in the timed iterations, with no profiler running; the median over calls of the mean over ranks. They hold the kernel's wait at its start for the other ranks and, when the GPU is idle at the launch, the launch's own CPU time. |
 | output-dist kernels | `output_dist_kernel_ms_median` | `--kernel_times`: the GPU ms of every call's forward kernel and backward kernels (the heavy rows' two included) under a CUDA-only profiler, the median over calls. |
 | rows per iteration | `traffic_mean`, `traffic_max` | The output dist's rows of the timed iterations, per rank and iteration: the mean or the most over the ranks (`traffic_per_rank` holds each rank's). `hierarchical`: `rows_self`, the rows it asks of itself as owner; `rows_nvlink`, the rows it pulls from its node peers; `rows_served`, the rows other GPUs ask of it as owner; across nodes `rows_ib_out` and `rows_ib_in`, the rows its NIC puts and receives in the forward (the backward moves them the other way), `rows_ib`, the larger of the two, `rows_remote`, the rows of its proxy's stream, and `chunks`, that stream's chunks per call. `torchrec`: the forward's rows to itself, to its node peers and to other nodes (`rows_self`, `rows_nvlink`, `rows_ib`), and from other nodes (`rows_ib_in`). |
 
@@ -882,7 +898,7 @@ and what it receives (rows × row bytes, from the dist's plan).
 
 | metric | JSON field | definition |
 |---|---|---|
-| IB event basis | `ib_event_basis_calls` | Plain loop, `hierarchical`: each NIC's bytes over its GPU's output-dist time from the events above; the median over calls of the mean over NICs (`mean`), and of the busiest NIC's bytes over the slowest GPU's time (`bottleneck`). |
+| IB event basis | `ib_event_basis_calls` | Plain loop, `hierarchical`, `--call_events`: each NIC's bytes over its GPU's output-dist time from the events above; the median over calls of the mean over NICs (`mean`), and of the busiest NIC's bytes over the slowest GPU's time (`bottleneck`). |
 | IB in-kernel | `trace[dir]["ib_inkern"]` | `--trace`: the bytes over the kernel's time once every rank has started, `end_us − skew_all`: its time to its exit, less its wait for the latest rank to start. |
 | IB windows | `trace[dir]["ib_win_out"]`, `trace[dir]["ib_win_in"]` | `--trace`: the bytes sent, from the first put until all puts are done; and the bytes received, from the earlier of the first landing and the senders' first put until all rows have landed. |
 | first IB put | `trace[dir]["first_put"]` | `--trace`: µs from the kernel's start to its first IB put. |

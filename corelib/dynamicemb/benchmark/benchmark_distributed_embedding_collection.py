@@ -24,6 +24,10 @@ which hold only the two batches' keys. The EC returns its rows as one
 JaggedTensor over all features, not one per feature
 (``install_flat_output``). No loss is computed: the backward gives the
 looked-up rows gradients drawn once, before the run (``inject_grads``).
+After the first call, the warmup's iterations and the timed ones run back to
+back, with nothing of the benchmark's between them that syncs the host with
+the GPU (the dists and the lookup keep their own syncs), and two CUDA events
+time the timed ones: one before the first, one after the last.
 
 Launch with torchrun or srun, one process per GPU::
 
@@ -143,14 +147,15 @@ class BenchConfig:
     capacity_factor: float = 1.25
     # the output_dist_capacity the models are built with (from capacity)
     output_dist_capacity: Optional[Union[int, Dict[str, int]]] = None
-    num_iterations: int = 30
-    warmup: int = 10
+    num_iterations: int = 20
+    warmup: int = 20
     profile_iterations: int = 5
     pipeline: str = "none"
     check: bool = False
     trace: bool = False
     trace_out: Optional[str] = None
     kernel_times: bool = False
+    call_events: bool = False
     host_stages: bool = False
     nic_counters: bool = False
     nvtx: bool = False
@@ -583,21 +588,19 @@ def _nvtx(name: str):
 
 
 @contextlib.contextmanager
-def _timed_capture(cfg: "BenchConfig"):
-    """Under --nvtx, the timed iterations between cudaProfilerStart and
-    cudaProfilerStop, so that ``nsys profile -c cudaProfilerApi`` captures
-    them alone; under --nvtx_ops also with an NVTX range per PyTorch op
-    (``emit_nvtx``), whose host time the timings then include. A barrier
-    after cudaProfilerStart: the profiled rank's capture starts in it, which
-    can take seconds, and the other ranks' first timed forward would wait
-    that out in the dists."""
+def _capture(cfg: "BenchConfig"):
+    """Under --nvtx, the warmup and the timed iterations between
+    cudaProfilerStart and cudaProfilerStop, so that ``nsys profile -c
+    cudaProfilerApi`` captures them alone, in NVTX ranges of their own
+    (``warmup i``, ``iteration i``); under --nvtx_ops also with an NVTX range
+    per PyTorch op (``emit_nvtx``), whose host time the timings then
+    include. The caller's barrier before the warmup comes after
+    cudaProfilerStart: the profiled rank's capture starts in it, which can
+    take seconds."""
     if not cfg.nvtx:
         yield
         return
-    torch.cuda.synchronize()
     torch.cuda.profiler.start()
-    dist.barrier()
-    torch.cuda.synchronize()
     try:
         if cfg.nvtx_ops:
             with torch.autograd.profiler.emit_nvtx():
@@ -683,8 +686,9 @@ class _HostSyncs:
 
 
 class _Calls:
-    """What the plain loop keeps of each call of its timed iterations: CUDA
-    events on the caller's stream before the input dist, after input_dist(),
+    """What the plain loop keeps of each call of its timed iterations under
+    --call_events (and --trace or --host_stages): CUDA events on the
+    caller's stream before the input dist, after input_dist(),
     after the first wait and after the second wait (when the lookup may
     start: the stream then waits for everything the KJT needs), and right
     before and after the hierarchical output dist's forward and backward
@@ -757,7 +761,8 @@ class _Calls:
         ]
 
 
-# The plain loop's timed iterations' calls (None otherwise).
+# The plain loop's timed iterations' calls under --call_events, --trace or
+# --host_stages (None otherwise).
 _CALLS: Optional[_Calls] = None
 # Launches of the hierarchical output dist's kernels outside the timed
 # iterations, by direction (0: forward, 1: backward): --check reads them to
@@ -1699,50 +1704,60 @@ def nic_counters() -> Dict[str, Tuple[int, int]]:
 # ── benchmark ───────────────────────────────────────────────────────────────
 
 
-def time_iterations(model, batches: List[Batch]) -> Tuple[List[float], List[float]]:
-    """Per batch, the GPU ms of the forward (the model's call) and of the
-    backward (``loss.backward()``, the injected gradients'), on the caller's
-    stream."""
-    fwd_ms, bwd_ms = [], []
-    events = [
-        (
-            torch.cuda.Event(enable_timing=True),
-            torch.cuda.Event(enable_timing=True),
-            torch.cuda.Event(enable_timing=True),
-        )
+def time_iterations(
+    model, batches: List[Batch], per_iteration: bool
+) -> Tuple[float, List[Tuple[float, float]]]:
+    """The GPU ms per iteration over ``batches``, each an iteration (the
+    forward, the model's call, then ``loss.backward()``, the injected
+    gradients'): a CUDA event on the caller's stream before the first and
+    one after the last, and nothing of the benchmark's between them that
+    syncs the host with the GPU (the model's calls keep their own). With
+    ``per_iteration`` (--call_events), also each iteration's
+    forward and backward GPU ms, from two more events per iteration."""
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    marks = [
+        (torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True))
         for _ in batches
+        if per_iteration
     ]
-    for i, (batch, (start, middle, end)) in enumerate(zip(batches, events)):
+    start.record()
+    for i, batch in enumerate(batches):
         with _nvtx(f"iteration {i}"):
-            start.record()
             with _nvtx("forward"):
                 loss = model(batch)[0]
-            middle.record()
+            if marks:
+                marks[i][0].record()
             with _nvtx("backward"):
                 loss.backward()
-            end.record()
+            if marks:
+                marks[i][1].record()
+    end.record()
     torch.cuda.synchronize()
-    for start, middle, end in events:
-        fwd_ms.append(start.elapsed_time(middle))
-        bwd_ms.append(middle.elapsed_time(end))
-    return fwd_ms, bwd_ms
-
-
-def time_pipeline(pipeline, batches, iterations: int) -> List[float]:
-    """``iterations`` calls of the pipeline's progress(), each one batch's
-    forward and backward (with the next batch's input dist in between), on
-    the device's timeline (the default stream)."""
-    events = [
-        (torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True))
-        for _ in range(iterations)
+    # an iteration's forward runs from the end of the one before it
+    before = [start] + [backward for _, backward in marks[:-1]]
+    split = [
+        (prev.elapsed_time(forward), forward.elapsed_time(backward))
+        for prev, (forward, backward) in zip(before, marks)
     ]
-    for i, (start, end) in enumerate(events):
+    return start.elapsed_time(end) / len(batches), split
+
+
+def time_pipeline(pipeline, batches, iterations: int) -> float:
+    """The GPU ms per iteration over ``iterations`` calls of the pipeline's
+    progress(), each one batch's forward and backward (with the next batch's
+    input dist in between): a CUDA event on the default stream before the
+    first and one after the last, and nothing of the benchmark's between them
+    that syncs the host with the GPU (the pipeline's calls keep their own)."""
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    start.record()
+    for i in range(iterations):
         with _nvtx(f"iteration {i}"):
-            start.record()
             pipeline.progress(batches)
-            end.record()
+    end.record()
     torch.cuda.synchronize()
-    return [start.elapsed_time(end) for start, end in events]
+    return start.elapsed_time(end) / iterations
 
 
 def gather_floats(values: Union[List[float], torch.Tensor]) -> torch.Tensor:
@@ -1897,7 +1912,10 @@ def run(cfg: BenchConfig) -> Dict:
         dist.barrier()
     # --kernel_times: as many iterations again after the timed ones
     kernel_iters = cfg.num_iterations if cfg.kernel_times else 0
-    n_calls = cfg.warmup + cfg.num_iterations + kernel_iters + cfg.profile_iterations
+    # the first call, the warmup, the timed iterations, then the rest
+    n_calls = (
+        1 + cfg.warmup + cfg.num_iterations + kernel_iters + cfg.profile_iterations
+    )
     kjts = generate_batches(cfg, rank, device, _NUM_BATCHES)
     # the capacities of every batch the model will see (untimed collectives)
     cfg = resolve_capacity(cfg, kjts, node_size)
@@ -1922,12 +1940,15 @@ def run(cfg: BenchConfig) -> Dict:
     pipeline = train_pipeline(cfg, model) if cfg.pipeline != "none" else None
     fed = iter(batches)  # what the pipeline takes from
 
-    def train(part: List[Batch]) -> None:
-        for batch in part:
-            if pipeline is None:
-                model(batch)[0].backward()
-            else:
-                pipeline.progress(fed)
+    def train(part: List[Batch], label: Optional[str] = None) -> None:
+        """An iteration per batch of ``part``, under --nvtx in an NVTX range
+        ``label i`` when there is a label."""
+        for i, batch in enumerate(part):
+            with _nvtx(f"{label} {i}") if label else _NO_RANGE:
+                if pipeline is None:
+                    model(batch)[0].backward()
+                else:
+                    pipeline.progress(fed)
 
     def reset_traffic() -> None:
         torchrec_traffic.reset()
@@ -1946,48 +1967,59 @@ def run(cfg: BenchConfig) -> Dict:
 
     torch.cuda.synchronize()
     mem0, reserved0 = torch.cuda.memory_allocated(), torch.cuda.memory_reserved()
+    # The first call makes what the dists keep (the hierarchical dist's op and
+    # its windows): the device memory that took.
     train(batches[:1])
     torch.cuda.synchronize()
     used["first_call"] = device_used()
-    train(batches[1 : cfg.warmup])
-    torch.cuda.synchronize()
-    used["warmup"] = device_used()
-    # Python's cyclic garbage collector, off in the timed iterations unless
-    # --timed_gc on: a full collection takes about 100 ms on this process's
-    # heap and falls at the same call on every rank with the same history, and
-    # the ranks' collective kernels wait for a rank that pauses. One collection
-    # first, before the barrier, so the ranks start the timed iterations
-    # together however long theirs took.
+
+    # Tracing: the clocks of all ranks against rank 0's, before the warmup and
+    # after the timed iterations (their stamps then compare across ranks).
+    cal_before = clock_offsets(device) if cfg.trace else None
+    warmup = batches[1 : 1 + cfg.warmup]
+    timed = batches[1 + cfg.warmup : 1 + cfg.warmup + cfg.num_iterations]
+    host = _HostSyncs(len(timed)) if cfg.host_stages and pipeline is None else None
+    # per-call events in the timed iterations, which add host work to every
+    # call: --call_events, and --trace and --host_stages, which need them
+    calls = (
+        _Calls(len(timed), cfg.trace, host)
+        if pipeline is None and (cfg.call_events or cfg.trace or host is not None)
+        else None
+    )
+    # Python's cyclic garbage collector, off in the warmup and the timed
+    # iterations unless --timed_gc on: a full collection takes about 100 ms on
+    # this process's heap and falls at the same call on every rank with the
+    # same history, and the ranks' collective kernels wait for a rank that
+    # pauses. One collection first, before the barrier; then off until the
+    # timed iterations end, and then as it was.
     if cfg.timed_gc == "off":
         gc.collect()
-    dist.barrier()
-
-    # Tracing: the clocks of all ranks against rank 0's, before and after the
-    # timed iterations (their stamps then compare across ranks).
-    cal_before = clock_offsets(device) if cfg.trace else None
-    timed = batches[cfg.warmup : cfg.warmup + cfg.num_iterations]
-    reset_traffic()
-    held = torch.cuda.memory_allocated()
-    torch.cuda.reset_peak_memory_stats()
-    host = _HostSyncs(len(timed)) if cfg.host_stages and pipeline is None else None
-    if pipeline is None:
-        _CALLS = _Calls(len(timed), cfg.trace, host)
-    nics0 = nic_counters() if cfg.nic_counters and local_rank == 0 else {}
-    if host is not None:
-        host.install()
-    iter_ms = None
-    # the collector off until the timed iterations end (collected above), then
-    # as it was
     gc_was_enabled = gc.isenabled()
-    if cfg.timed_gc == "off":
-        gc.disable()
+    split = []
     try:
-        with _timed_capture(cfg):
+        with _capture(cfg):
+            dist.barrier()
+            if cfg.timed_gc == "off":
+                gc.disable()
+            # The warmup and the timed iterations run back to back: nothing
+            # of the benchmark's between them syncs the host with the GPU
+            # (what is below until the timed iterations is host work), so the
+            # timed iterations follow the warmup without a pause and the ranks
+            # reach them in step. The dists and the lookup keep their own
+            # syncs.
+            train(warmup, "warmup")
+            reset_traffic()
+            held = torch.cuda.memory_allocated()
+            torch.cuda.reset_peak_memory_stats()
+            _CALLS = calls
+            nics0 = nic_counters() if cfg.nic_counters and local_rank == 0 else {}
+            if host is not None:
+                host.install()
             t0 = time.perf_counter()
             if pipeline is None:
-                fwd_ms, bwd_ms = time_iterations(model, timed)
+                step_ms, split = time_iterations(model, timed, calls is not None)
             else:
-                iter_ms = time_pipeline(pipeline, fed, len(timed))
+                step_ms = time_pipeline(pipeline, fed, len(timed))
             wall_ms = (time.perf_counter() - t0) * 1000.0 / len(timed)
     finally:
         if gc_was_enabled:
@@ -2006,7 +2038,7 @@ def run(cfg: BenchConfig) -> Dict:
         # per host, its local rank 0's: per device, bytes sent and received
         nics = [nics[host * local_size] for host in range(world_size // local_size)]
     used["timed"] = device_used()
-    calls, _CALLS = _CALLS, None
+    _CALLS = None
     # The input dist's segment per call (plain loop; the calls that took the
     # hierarchical dist, unless none did): from before it to after its
     # second wait, and its three steps, in ms on the caller's stream.
@@ -2084,14 +2116,14 @@ def run(cfg: BenchConfig) -> Dict:
     # it): per call, the output dist's kernels' GPU ms (forward, backward).
     kernel_ms = None
     if cfg.kernel_times:
-        start = cfg.warmup + cfg.num_iterations
+        start = 1 + cfg.warmup + cfg.num_iterations
         torch.cuda.synchronize()
         dist.barrier()
         with torch.profiler.profile(
             activities=[torch.profiler.ProfilerActivity.CUDA]
         ) as kprof:
             if pipeline is None:
-                time_iterations(model, batches[start : start + kernel_iters])
+                time_iterations(model, batches[start : start + kernel_iters], False)
             else:
                 time_pipeline(pipeline, fed, kernel_iters)
         # per call that took the hierarchical dist (the same calls on every
@@ -2102,7 +2134,7 @@ def run(cfg: BenchConfig) -> Dict:
     names = {}
     prof_traffic = None
     if cfg.profile_iterations > 0:
-        prof_batches = batches[cfg.warmup + cfg.num_iterations + kernel_iters :]
+        prof_batches = batches[1 + cfg.warmup + cfg.num_iterations + kernel_iters :]
         torch.cuda.synchronize()
         dist.barrier()
         reset_traffic()
@@ -2129,13 +2161,12 @@ def run(cfg: BenchConfig) -> Dict:
         }
     hier_traffic.reset()
 
-    # Aggregate over ranks.
-    if iter_ms is None:
-        times_all = [
-            gather_floats([sum(times) / len(times)]) for times in (fwd_ms, bwd_ms)
-        ]
-    else:
-        times_all = [gather_floats([sum(iter_ms) / len(iter_ms)])]
+    # Aggregate over ranks: the step, and under --call_events its forward and
+    # backward.
+    times_all = {"iter": gather_floats([step_ms])}
+    if split:
+        for i, part in enumerate(("fwd", "bwd")):
+            times_all[part] = gather_floats([sum(t[i] for t in split) / len(split)])
     memory_all = gather_floats(memory)
     # Every rank sees the same stage keys only if they ran the same code; use
     # rank 0's keys and fill missing ones with zero.
@@ -2262,32 +2293,38 @@ def report(
         "iter_ms_host": wall_ms,
         "capacities": cfg.output_dist_capacity,
     }
-    # The forward and the backward of the plain loop, or a pipeline's whole
-    # iterations (which overlap the next batch's input dist with both).
-    parts = ("fwd", "bwd") if cfg.pipeline == "none" else ("iter",)
-    for part, times in zip(parts, times_all):
+    # The step: the GPU ms per timed iteration between the CUDA events before
+    # the first and after the last (a pipeline's iterations overlap the next
+    # batch's input dist with the forward and the backward), each rank's, its
+    # mean and most over the ranks; under --call_events (plain loop) also its
+    # forward and backward.
+    for part, times in times_all.items():
         res.update(
             {
                 f"{part}_ms_mean": times.mean().item(),
                 f"{part}_ms_max": times.max().item(),
             }
         )
+    res["iter_ms_per_rank"] = times_all["iter"][:, 0].tolist()
     hosts = "" if node_size == local_size else f" hosts={world_size // local_size}"
     print(
         f"\n=== {cfg.label()}  world_size={world_size}"
         f" nodes={world_size // node_size}{hosts} ==="
     )
-    if cfg.pipeline == "none":
-        print(
-            f"fwd {res['fwd_ms_mean']:.3f} ms (max rank {res['fwd_ms_max']:.3f})   "
-            f"bwd {res['bwd_ms_mean']:.3f} ms (max rank {res['bwd_ms_max']:.3f})   "
-            f"host iter {wall_ms:.3f} ms"
-        )
-    else:
-        print(
-            f"{cfg.pipeline} pipeline iteration {res['iter_ms_mean']:.3f} ms (max rank"
-            f" {res['iter_ms_max']:.3f})   host iter {wall_ms:.3f} ms"
-        )
+    what = (
+        "iteration" if cfg.pipeline == "none" else f"{cfg.pipeline} pipeline iteration"
+    )
+    split = (
+        f"   fwd {res['fwd_ms_mean']:.3f} ms (max rank {res['fwd_ms_max']:.3f}),"
+        f" bwd {res['bwd_ms_mean']:.3f} ms (max rank {res['bwd_ms_max']:.3f})"
+        if "fwd" in times_all
+        else ""
+    )
+    print(
+        f"{what} {res['iter_ms_mean']:.3f} ms (CUDA events over {cfg.num_iterations}"
+        f" iterations after {cfg.warmup} of warmup, mean over ranks; max rank"
+        f" {res['iter_ms_max']:.3f}){split}   host iter {wall_ms:.3f} ms"
+    )
     # [world_size, 8]: held, peak and reserved past the start, the most
     # allocated and reserved, windows, batches, their output gradients
     mem = memory_all.max(dim=0).values.tolist()
@@ -2676,8 +2713,20 @@ def parse_args(argv: List[str]) -> BenchConfig:
         default=defaults.capacity_factor,
         help="with --capacity measure: the capacities over the needs",
     )
-    parser.add_argument("--num_iterations", type=int, default=defaults.num_iterations)
-    parser.add_argument("--warmup", type=int, default=defaults.warmup)
+    parser.add_argument(
+        "--num_iterations",
+        type=int,
+        default=defaults.num_iterations,
+        help="timed iterations, between a CUDA event before the first and one"
+        " after the last",
+    )
+    parser.add_argument(
+        "--warmup",
+        type=int,
+        default=defaults.warmup,
+        help="untimed iterations after the first call and right before the timed"
+        " ones, with no sync between them",
+    )
     parser.add_argument(
         "--profile_iterations", type=int, default=defaults.profile_iterations
     )
@@ -2700,6 +2749,12 @@ def parse_args(argv: List[str]) -> BenchConfig:
         help="the output dist's kernel times, under a CUDA-only profiler",
     )
     parser.add_argument(
+        "--call_events",
+        action="store_true",
+        help="plain loop: CUDA events in every timed call (its forward and"
+        " backward, its input dist and output dist), which add host work to it",
+    )
+    parser.add_argument(
         "--host_stages",
         action="store_true",
         help="plain loop: where the host waits for the GPU",
@@ -2712,22 +2767,24 @@ def parse_args(argv: List[str]) -> BenchConfig:
     parser.add_argument(
         "--nvtx",
         action="store_true",
-        help="NVTX ranges for nsys (each timed iteration with its forward and "
-        "backward, and the stages), and the timed iterations between "
-        "cudaProfilerStart and cudaProfilerStop (nsys -c cudaProfilerApi)",
+        help="NVTX ranges for nsys (each warmup and timed iteration, a timed one "
+        "with its forward and backward, and the stages), and the warmup and the "
+        "timed iterations between cudaProfilerStart and cudaProfilerStop (nsys "
+        "-c cudaProfilerApi)",
     )
     parser.add_argument(
         "--nvtx_ops",
         action="store_true",
-        help="with --nvtx, also an NVTX range per PyTorch op in the timed "
-        "iterations (emit_nvtx), whose host time the timings then include",
+        help="with --nvtx, also an NVTX range per PyTorch op in the warmup and "
+        "the timed iterations (emit_nvtx), whose host time the timings then "
+        "include",
     )
     parser.add_argument(
         "--timed_gc",
         choices=["off", "on"],
         default=defaults.timed_gc,
-        help="Python's garbage collector in the timed iterations: off (collected "
-        "before them) or on",
+        help="Python's garbage collector in the warmup and the timed iterations: "
+        "off (collected before them) or on",
     )
     parser.add_argument(
         "--check",
