@@ -757,7 +757,8 @@ __global__ void update4_with_index_flat_table_kernel(
 
     weight_t *weight_ptr = reinterpret_cast<weight_t *>(table_ptrs[table_id]) +
                            static_cast<int64_t>(index) * vdim;
-    const wgrad_t *grad_ptr = grad_evs + ev_id * grad_stride;
+    const wgrad_t *grad_ptr =
+        grad_evs + static_cast<int64_t>(ev_id) * grad_stride;
 
     OptimizierInput<wgrad_t, weight_t> input{grad_ptr, weight_ptr,
                                              (uint32_t)edim, (uint32_t)edim};
@@ -784,7 +785,8 @@ __global__ void update_with_index_flat_table_kernel(
 
     weight_t *weight_ptr = reinterpret_cast<weight_t *>(table_ptrs[table_id]) +
                            static_cast<int64_t>(index) * vdim;
-    const wgrad_t *grad_ptr = grad_evs + ev_id * grad_stride;
+    const wgrad_t *grad_ptr =
+        grad_evs + static_cast<int64_t>(ev_id) * grad_stride;
 
     OptimizierInput<wgrad_t, weight_t> input{grad_ptr, weight_ptr,
                                              (uint32_t)edim, (uint32_t)edim};
@@ -814,8 +816,8 @@ __global__ void update4_padded_buffer_kernel(
     uint32_t edim = table_emb_dims == nullptr
                         ? max_emb_dim
                         : (uint32_t)table_emb_dims[table_ids[row]];
-    weight_t *weight_ptr = values + row * value_stride;
-    const wgrad_t *grad_ptr = grads + row * grad_stride;
+    weight_t *weight_ptr = values + static_cast<int64_t>(row) * value_stride;
+    const wgrad_t *grad_ptr = grads + static_cast<int64_t>(row) * grad_stride;
     OptimizierInput<wgrad_t, weight_t> input{grad_ptr, weight_ptr, edim,
                                              max_emb_dim};
     optimizer.update4(input);
@@ -832,8 +834,8 @@ __global__ void update_padded_buffer_kernel(
     uint32_t edim = table_emb_dims == nullptr
                         ? max_emb_dim
                         : (uint32_t)table_emb_dims[table_ids[row]];
-    weight_t *weight_ptr = values + row * value_stride;
-    const wgrad_t *grad_ptr = grads + row * grad_stride;
+    weight_t *weight_ptr = values + static_cast<int64_t>(row) * value_stride;
+    const wgrad_t *grad_ptr = grads + static_cast<int64_t>(row) * grad_stride;
     OptimizierInput<wgrad_t, weight_t> input{grad_ptr, weight_ptr, edim,
                                              max_emb_dim};
     optimizer.update(input);
