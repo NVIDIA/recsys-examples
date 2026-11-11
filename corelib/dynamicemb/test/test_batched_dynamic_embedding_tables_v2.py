@@ -3186,6 +3186,17 @@ def _fp8_and_fp32_drifts(tables, num_features):
         )
 
 
+# RMS of (fp8 output - fp32 output) over the RMS of the fp32 output, which the
+# fp8 test allows at every step. Measured on an H100 over 10 runs each, the
+# unseeded rounding moves the worst step's value by about 1%: SUM 0.0577 (at
+# most 0.0588), NONE 0.1053 (at most 0.1066). Each limit is about 1.5x the
+# largest of those, for other hardware.
+FP8_MAX_OUTPUT_ERROR = {
+    DynamicEmbPoolingMode.SUM: 0.09,
+    DynamicEmbPoolingMode.NONE: 0.16,
+}
+
+
 @pytest.mark.parametrize("caching, local_hbm_for_values", FP8_TABLE_STORAGE)
 @pytest.mark.parametrize(
     "pooling_mode", [DynamicEmbPoolingMode.SUM, DynamicEmbPoolingMode.NONE]
@@ -3197,7 +3208,8 @@ def test_fp8_table_trains_like_fp32_table(caching, local_hbm_for_values, pooling
             torch.testing.assert_close(fp8, reference, rtol=0, atol=0)
         else:
             error = (fp8 - reference).pow(2).mean().sqrt()
-            assert error < 0.25 * reference.pow(2).mean().sqrt(), step
+            limit = FP8_MAX_OUTPUT_ERROR[pooling_mode]
+            assert error < limit * reference.pow(2).mean().sqrt(), step
 
     tables, num_features = _train_fp32_and_fp8_tables(
         caching, local_hbm_for_values, pooling_mode, 30, on_step=check_step
