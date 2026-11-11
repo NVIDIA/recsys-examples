@@ -112,3 +112,37 @@ for num_load_gpus in ${NUM_GPUS[@]}; do
     done
   done
 done
+
+# int32 keys, negative ones included, dumped and reloaded at the same world
+# size. A table stores an int32 key widened to int64 with its sign, the
+# checkpoint holds that int64 key, and the loader keeps each key on the rank
+# the int64 key belongs to. The bucketize has to send the int32 key to that
+# same rank, or after the load a key sits on one rank and is looked up on
+# another. Read in 32 bits, many negative keys would get another rank: under
+# hash_roundrobin at every world size from 2, under roundrobin where 2**32
+# and 2**64 leave different remainders, as at 7 ranks and not at 8.
+INT32_KEY_CASES=("hash_roundrobin 8" "hash_roundrobin 7" "roundrobin 7")
+
+for int32_key_case in "${INT32_KEY_CASES[@]}"; do
+  read -r dist_type num_gpus <<< "${int32_key_case}"
+  for mode in "dump" "load"; do
+    echo "int32 keys: dist_type: $dist_type, num_gpus: $num_gpus, mode: $mode"
+    torchrun \
+      --nnodes 1 \
+      --nproc_per_node $num_gpus \
+      ./test/unit_tests/test_embedding_dump_load.py \
+      --optimizer-type sgd \
+      --score-strategy step \
+      --dist-type ${dist_type} \
+      --key-dtype int32 \
+      --batch-size $((128 / num_gpus * num_gpus)) \
+      --mode "${mode}" \
+      --optim False \
+      --counter False \
+      --save-path "debug_weight_int32_${dist_type}_${num_gpus}" \
+      --num-embedding-collections 1 \
+      --num-embeddings 1000000 \
+      --multi-hot-sizes 10 \
+      --embedding-dim 16 || exit 1
+  done
+done

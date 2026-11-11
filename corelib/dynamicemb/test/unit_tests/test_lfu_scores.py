@@ -46,6 +46,7 @@ def generate_deterministic_sparse_features_with_frequency_tracking(
     data_parallel_table: bool = False,
     seed: int = 42,
     caching: bool = False,
+    key_dtype: torch.dtype = torch.int64,
 ) -> Tuple[List[KeyedJaggedTensor], Dict[str, Dict[int, int]]]:
     """
     Generate deterministic sparse features and track frequency for each embedding table.
@@ -54,6 +55,7 @@ def generate_deterministic_sparse_features_with_frequency_tracking(
         empty_rank_iteration: At this iteration rank 0 has no keys
         data_parallel_table: Add keys for the data-parallel table, none on rank 0
         caching: If True, generate more unique keys to trigger cache eviction
+        key_dtype: dtype of the KJT keys
 
     Returns:
         kjts: List of KeyedJaggedTensor for each iteration
@@ -122,7 +124,7 @@ def generate_deterministic_sparse_features_with_frequency_tracking(
         kjts.append(
             KeyedJaggedTensor.from_lengths_sync(
                 keys=keys,
-                values=torch.tensor(cur_indices, dtype=torch.int64).cuda(),
+                values=torch.tensor(cur_indices, dtype=key_dtype).cuda(),
                 lengths=torch.tensor(cur_lengths, dtype=torch.int64).cuda(),
             )
         )
@@ -294,6 +296,12 @@ def validate_lfu_scores(
         "table's; only the LFU tables are validated."
     ),
 )
+@click.option(
+    "--key-dtype",
+    type=click.Choice(["int64", "int32"]),
+    default="int64",
+    help="dtype of the KJT keys.",
+)
 def test_lfu_score_validation(
     num_embedding_collections: int,
     num_embeddings: str,
@@ -311,6 +319,7 @@ def test_lfu_score_validation(
     global_hbm_budget_scale: float,
     lru_lfu: bool,
     mixed_score_strategies: bool,
+    key_dtype: str,
 ):
     """Test LFU score correctness by comparing with naive frequency counting.
 
@@ -352,6 +361,7 @@ def test_lfu_score_validation(
     print(f"  - Data-parallel table: {data_parallel_table}")
     print(f"  - Tolerance: {tolerance}")
     print(f"  - Use index dedup: {use_index_dedup}")
+    print(f"  - Key dtype: {key_dtype}")
     if caching:
         print(f"  - Caching: ENABLED ✓")
         print(f"  - Cache capacity ratio: {cache_capacity_ratio}")
@@ -422,6 +432,7 @@ def test_lfu_score_validation(
         empty_rank_iteration=empty_rank_iteration,
         data_parallel_table=data_parallel_table,
         caching=caching,
+        key_dtype=getattr(torch, key_dtype),
     )
 
     # Run forward passes to populate frequency information
