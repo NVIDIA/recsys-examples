@@ -703,18 +703,11 @@ On 2 nodes the backward reaches 84% because of the ring's laps: a ring that
 holds the stream in one lap (`DYNAMICEMB_HIER_PROXY_MB=12288`) gives
 28.55 ms there (47.1 GB/s, 94%, in 2 runs); on 4 nodes the laps cost little.
 
-The many-features and multi-hot tables below were measured with the
-previous loop, and will be re-measured with the loop above. That loop drew
-a new batch for every iteration, so its lookups kept inserting new keys
-into tables that filled toward their capacity, and its loss summed each
-feature's rows on its own (two or three kernels per feature: a sum, with a
-memset before it when the feature is large, and an add).
-
 Many features. These runs keep the keys per GPU about the same while the
 features grow: 8 tables of 4,000,000 rows (dim 128, fp32, SGD), each with
 `--features_per_table` P features (F = 8P in all), index dedup, plain loop,
-about 540,000 keys per GPU and iteration (4.2 million in the two runs marked
-`b`: 1,024 × 4,096 and 4,096 × 1,024 in the table):
+about 540,000 keys per GPU and iteration (4.2 million in the two runs
+marked `b`: 1,024 × 4,096 and 4,096 × 1,024):
 
 ```bash
 MANY="--num_tables 8 --num_embeddings 4000000 --use_index_dedup --num_iterations 20 --warmup 5"
@@ -727,114 +720,9 @@ $LAUNCH $BENCH $MANY --features_per_table 128 --local_batch_size 4096 --max_seq_
 $LAUNCH $BENCH $MANY --features_per_table 512 --local_batch_size 1024 --max_seq_len 1 --seq_len_dist fixed --output_dist hierarchical  # b
 ```
 
-On Eos, before and after the changes for many features (the hierarchical
-dist puts each chunk once per lookup group; its count messages, node rows
-and planner tables grow with the features once, not with the features
-times the nodes; [docs/hier_output_dist.md](../docs/hier_output_dist.md),
-sections 10 and 11), in ms: the step (`iter_ms_host`), the output dist's
-kernels as the rank that arrives last runs them (per call the least time
-over the ranks, then the median over the calls: what the dist takes, without
-the wait for a slower rank's host), and the input dist (`in_seg_ms_mean`).
-One run of each point. TorchRec's dists are the same before and after.
-
-| features × batch (keys per sample) | nodes | TorchRec step | hier step before → after | fwd kernel before → after | bwd kernel before → after | input dist before → after |
-|---|---|---|---|---|---|---|
-| 8 × 4096 (1-32) | 1 | 7.0 | 4.1 → 4.0 | 0.75 → 0.75 | 0.72 → 0.72 | 0.35 → 0.33 |
-| 8 × 4096 (1-32) | 2 | 11.9 | 8.7 → 8.6 | 2.74 → 2.75 | 2.84 → 2.85 | 0.79 → 0.77 |
-| 8 × 4096 (1-32) | 4 | 15.7 | 11.3 → 11.2 | 4.06 → 4.07 | 4.14 → 4.14 | 0.87 → 0.78 |
-| 64 × 4096 (1-3) | 1 | 8.5 | 4.5 → 4.8 | 0.72 → 0.72 | 0.70 → 0.70 | 0.36 → 0.36 |
-| 64 × 4096 (1-3) | 2 | 14.6 | 9.1 → 9.2 | 2.71 → 2.67 | 2.86 → 2.77 | 0.76 → 0.85 |
-| 64 × 4096 (1-3) | 4 | 20.9 | 11.5 → 11.5 | 3.95 → 3.97 | 4.03 → 4.03 | 0.85 → 0.78 |
-| 256 × 2048 (1) | 1 | 13.3 | 9.2 → 9.2 | 0.72 → 0.72 | 0.70 → 0.70 | 0.39 → 0.40 |
-| 256 × 2048 (1) | 2 | 19.8 | 12.6 → 13.6 | 2.94 → 2.66 | 3.23 → 2.76 | 0.83 → 0.81 |
-| 256 × 2048 (1) | 4 | 29.3 | 14.0 → 14.2 | 3.95 → 3.96 | 4.06 → 4.02 | 1.10 → 0.94 |
-| 1024 × 512 (1) | 1 | 29.7 | 24.9 → 24.9 | 0.72 → 0.72 | 0.70 → 0.70 | 0.50 → 0.44 |
-| 1024 × 512 (1) | 2 | 37.9 | 32.1 → 28.1 | 4.83 → 2.68 | 4.57 → 2.80 | 1.27 → 0.86 |
-| 1024 × 512 (1) | 4 | 49.3 | 32.5 → 30.5 | 4.68 → 3.96 | 4.96 → 4.02 | 1.49 → 0.97 |
-| 4096 × 128 (1) | 1 | 119.3 | 104.0 → 104.4 | 0.72 → 0.72 | 0.85 → 0.91 | 0.91 → 0.59 |
-| 4096 × 128 (1) | 2 | 138.3 | 126.3 → 120.0 | 15.78 → 2.69 | 13.15 → 2.85 | 2.62 → 1.28 |
-| 4096 × 128 (1) | 4 | 166.2 | 139.8 → 118.3 | 17.23 → 3.96 | 15.47 → 4.15 | 3.60 → 1.45 |
-| 1024 × 4096 (1) | 1 | 71.4 | 36.8 → 37.0 | 5.24 → 5.24 | 5.03 → 5.03 | 1.37 → 1.30 |
-| 1024 × 4096 (1) | 2 | 127.9 | 61.6 → 58.5 | 15.29 → 14.26 | 19.77 → 16.45 | 3.28 → 2.97 |
-| 1024 × 4096 (1) | 4 | 195.1 | 75.2 → 67.8 | 20.67 → 20.70 | 25.43 → 20.79 | 3.98 → 3.43 |
-| 4096 × 1024 (1) | 1 | 164.8 | 130.0 → 130.6 | 5.25 → 5.25 | 5.13 → 5.13 | 1.86 → 1.54 |
-| 4096 × 1024 (1) | 2 | 229.0 | 178.7 → 150.2 | 24.58 → 14.35 | 35.77 → 16.29 | 5.44 → 3.65 |
-| 4096 × 1024 (1) | 4 | 313.5 | 189.5 → 157.7 | 24.87 → 20.74 | 46.09 → 20.82 | 6.25 → 4.10 |
-
-* The output dist's kernels take the same time at 4,096 features as at 8,
-  for the same keys per GPU. Before, at 4,096 features on 2 and 4 nodes,
-  they took 13-17 ms where 8 features take 2.7-4.1 ms: a chunk's rows went
-  over InfiniBand in one put per feature.
-* The input dist at 4,096 features takes 1.3-1.5 ms on 2 and 4 nodes
-  (0.5-0.7 ms more than at 8 features), against 12.2 and 23.6 ms for
-  TorchRec's.
-* At many features the step was mostly the previous loop's host work: the
-  EC made a JaggedTensor per feature and the loss summed each one on its
-  own, so that work grew with the features, and at 4,096 features the ranks
-  reached the backward kernel 12-16 ms apart (the median rank's backward
-  kernel was that much longer). The step of one run varied by a few ms for
-  that reason.
-
-Three rounds on another set of four nodes, before and after in
-alternating order, give the same picture (medians over the rounds, in ms):
-
-| features × batch (keys per sample) | nodes | hier step before → after | fwd kernel before → after | bwd kernel before → after | input dist before → after |
-|---|---|---|---|---|---|
-| 8 × 4096 (1-32) | 2 | 8.8 → 9.1 | 2.96 → 3.10 | 2.91 → 2.96 | 0.76 → 0.77 |
-| 8 × 4096 (1-32) | 4 | 11.3 → 11.2 | 4.07 → 4.07 | 4.14 → 4.14 | 0.85 → 0.84 |
-| 1024 × 512 (1) | 2 | 32.1 → 28.6 | 4.87 → 2.79 | 4.50 → 2.88 | 1.26 → 0.92 |
-| 1024 × 512 (1) | 4 | 32.5 → 30.6 | 4.71 → 3.96 | 4.97 → 4.02 | 1.48 → 1.01 |
-| 4096 × 128 (1) | 2 | 119.9 → 107.8 | 15.87 → 2.86 | 13.20 → 3.01 | 2.60 → 1.30 |
-| 4096 × 128 (1) | 4 | 129.6 → 109.2 | 17.29 → 3.96 | 15.52 → 4.17 | 3.53 → 1.42 |
-| 4096 × 1024 (1) | 2 | 171.3 → 142.7 | 24.29 → 14.75 | 35.50 → 16.24 | 5.04 → 3.50 |
-| 4096 × 1024 (1) | 4 | 189.1 → 151.7 | 25.10 → 20.70 | 45.88 → 20.99 | 6.16 → 3.97 |
-
-At 1,024 and 4,096 features every round after is faster than every round
-before, in both kernels and the input dist, and in the step but for one
-round of 1,024 × 512 on 4 nodes. At 8 features neither is: in every run
-of both, the forward kernel's fastest call takes 2.72-2.74 ms on 2 nodes
-and 4.01-4.04 ms on 4.
-
-After that, the input dist's fusions (the bucketize as a counting sort by
-owner, the proxy's steps bounded by the counts the device holds and its
-scans by CUB, the requester's tables in one kernel;
-[docs/hier_output_dist.md](../docs/hier_output_dist.md), section 10)
-shorten the input dist and leave the output dist's kernels within about 1%
-(the backward kernel at 4,096 × 1,024 on 2 nodes is 1.3% slower in every
-round).
-Three rounds on four nodes, before and after in alternating order
-(medians over the rounds, in ms):
-
-| features × batch (keys per sample) | nodes | hier step before → after | fwd kernel before → after | bwd kernel before → after | input dist before → after |
-|---|---|---|---|---|---|
-| 8 × 4096 (1-32) | 1 | 4.0 → 3.9 | 0.75 → 0.75 | 0.72 → 0.72 | 0.33 → 0.30 |
-| 8 × 4096 (1-32) | 2 | 8.5 → 8.3 | 2.75 → 2.75 | 2.84 → 2.84 | 0.68 → 0.65 |
-| 8 × 4096 (1-32) | 4 | 11.1 → 10.9 | 4.06 → 4.07 | 4.13 → 4.13 | 0.79 → 0.67 |
-| 1024 × 512 (1) | 2 | 27.8 → 27.6 | 2.67 → 2.67 | 2.78 → 2.77 | 0.84 → 0.74 |
-| 1024 × 512 (1) | 4 | 30.4 → 30.3 | 3.96 → 3.95 | 4.02 → 4.02 | 1.00 → 0.83 |
-| 4096 × 128 (1) | 2 | 108.2 → 107.4 | 2.67 → 2.66 | 2.97 → 2.96 | 1.15 → 0.97 |
-| 4096 × 128 (1) | 4 | 119.7 → 118.4 | 3.95 → 3.95 | 4.05 → 4.02 | 1.42 → 1.10 |
-| 4096 × 1024 (1) | 2 | 145.2 → 141.5 | 13.83 → 13.82 | 16.18 → 16.39 | 3.39 → 2.97 |
-| 4096 × 1024 (1) | 4 | 153.3 → 159.5 | 20.68 → 20.68 | 20.92 → 20.80 | 3.97 → 3.38 |
-
-* At every point every round after has a shorter input dist than every
-  round before: 5% shorter (8 features on 2 nodes) to 23% (4,096 × 128 on
-  4 nodes). `input_dist()` and its two waits run 25 kernels and memory
-  operations per call on one node (32 before) and 51 on 2 nodes (72
-  before) at 8 features, and 53 on 2 nodes at 4,096 features (78 before),
-  as `--profile_iterations` counts them on rank 0.
-* At 4,096 × 1,024 on 4 nodes the step after is 6 ms longer while its
-  input dist is shorter and its kernels take the same time. The step there
-  is the previous loop's host work, which differs between ranks: in both
-  trees the ranks of one or two nodes reach the backward kernel last, and
-  the others wait for them in it (averaged over the ranks, the backward
-  kernel takes 26-31 ms in the rounds before and 27-37 ms after; on the
-  rank that arrives last, 20.8-21.0 ms in every round of both).
-
-Multi-hot at many features. The same tables and loop as the many-features
-runs, with several keys per sample: 1 to 4 (uniform) at four of the large
-points and 1 to 32 at two, so that a GPU has 1.3 to 10.5 million keys per
-iteration (add `--output_dist torchrec` for TorchRec's):
+Multi-hot at many features: the same, with several keys per sample, 1 to 4
+(uniform) at four of the large points and 1 to 32 at two, so that a GPU has
+1.3 to 10.5 million keys per iteration:
 
 ```bash
 $LAUNCH $BENCH $MANY --features_per_table 128 --local_batch_size 512  --max_seq_len 4  --output_dist hierarchical
@@ -845,71 +733,78 @@ $LAUNCH $BENCH $MANY --features_per_table 128 --local_batch_size 512  --max_seq_
 $LAUNCH $BENCH $MANY --features_per_table 512 --local_batch_size 128  --max_seq_len 32 --output_dist hierarchical
 ```
 
-On Eos, after the input dist's fusions, medians of 2 rounds of
-alternating order on the same 4 nodes, in ms:
+On Eos, with the loop above (two alternating batches and pre-drawn output
+gradients, no loss), TorchRec's dists (`--output_dist torchrec`) against the
+hierarchical dist: medians of 2 rounds of alternating order on the same 4
+nodes, on 1 / 2 / 4 nodes, in ms: the step (`iter_ms_host`) and the input
+dist (`in_seg_ms_mean`).
 
-| features × batch (keys per sample) | nodes | keys per GPU | TorchRec step | hier step | TorchRec input dist | hier input dist |
+| features × batch (keys per sample) | keys per GPU | TorchRec step | hier step | hier vs TorchRec | TorchRec input dist | hier input dist |
 |---|---|---|---|---|---|---|
-| 1024 × 512 (1-4) | 1 | 1.3M | 35.8 | 29.6 | 3.11 | 0.55 |
-| 1024 × 512 (1-4) | 2 | 1.3M | 48.2 | 34.7 | 6.02 | 1.11 |
-| 1024 × 512 (1-4) | 4 | 1.3M | 62.9 | 39.1 | 11.00 | 1.25 |
-| 4096 × 128 (1-4) | 1 | 1.3M | 128.1 | 104.5 | 6.32 | 0.82 |
-| 4096 × 128 (1-4) | 2 | 1.3M | 139.0 | 110.3 | 11.80 | 1.41 |
-| 4096 × 128 (1-4) | 4 | 1.3M | 167.1 | 118.1 | 23.18 | 1.55 |
-| 1024 × 4096 (1-4) | 1 | 10.5M | 111.9 | 56.6 | 11.45 | 2.61 |
-| 1024 × 4096 (1-4) | 2 | 10.5M | 205.3 | 78.9 | 24.46 | 5.56 |
-| 1024 × 4096 (1-4) | 4 | 10.5M | 306.3 | 91.6 | 51.65 | 6.53 |
-| 4096 × 1024 (1-4) | 1 | 10.5M | 204.4 | 137.5 | 15.29 | 2.86 |
-| 4096 × 1024 (1-4) | 2 | 10.5M | 295.9 | 159.7 | 30.41 | 5.97 |
-| 4096 × 1024 (1-4) | 4 | 10.5M | 397.0 | 175.5 | 62.86 | 6.87 |
-| 1024 × 512 (1-32) | 1 | 8.7M | 84.4 | 51.0 | 5.00 | 2.17 |
-| 1024 × 512 (1-32) | 2 | 8.7M | 146.8 | 73.7 | 8.54 | 4.59 |
-| 1024 × 512 (1-32) | 4 | 8.7M | 197.7 | 86.2 | 14.34 | 5.35 |
-| 4096 × 128 (1-32) | 1 | 8.7M | 176.5 | 134.1 | 7.91 | 2.40 |
-| 4096 × 128 (1-32) | 2 | 8.7M | 237.8 | 157.2 | 13.97 | 5.09 |
-| 4096 × 128 (1-32) | 4 | 8.7M | 298.3 | 172.7 | 27.36 | 5.84 |
+| 8 × 4096 (1-32) | 0.5M | 6.8 / 11.3 / 14.9 | 3.3 / 8.5 / 10.7 | -52% / -25% / -29% | 1.38 / 1.66 / 2.16 | 0.30 / 0.70 / 0.71 |
+| 64 × 4096 (1-3) | 0.5M | 7.4 / 13.5 / 19.8 | 3.2 / 8.4 / 10.4 | -56% / -38% / -47% | 1.63 / 2.92 / 4.73 | 0.31 / 0.69 / 0.73 |
+| 256 × 2048 (1) | 0.5M | 8.8 / 16.6 / 25.8 | 3.7 / 8.7 / 10.4 | -58% / -48% / -60% | 2.30 / 4.39 / 7.90 | 0.36 / 0.75 / 0.75 |
+| 1024 × 512 (1) | 0.5M | 13.7 / 18.8 / 29.0 | 6.5 / 9.9 / 10.9 | -53% / -48% / -62% | 3.51 / 5.81 / 10.82 | 0.39 / 0.87 / 0.84 |
+| 4096 × 128 (1) | 0.5M | 54.8 / 73.7 / 76.3 | 38.9 / 41.1 / 45.4 | -29% / -44% / -41% | 6.42 / 11.61 / 23.44 | 0.56 / 1.09 / 1.11 |
+| 1024 × 4096 (1) | 4.2M | 55.1 / 110.1 / 177.3 | 19.1 / 42.3 / 50.1 | -65% / -62% / -72% | 10.34 / 22.93 / 47.19 | 1.20 / 2.56 / 3.01 |
+| 4096 × 1024 (1) | 4.2M | 83.3 / 148.7 / 208.6 | 47.5 / 61.2 / 69.1 | -43% / -59% / -67% | 13.34 / 28.56 / 59.59 | 1.43 / 2.88 / 3.32 |
+| 1024 × 512 (1-4) | 1.3M | 16.2 / 30.8 / 45.9 | 9.5 / 17.6 / 22.2 | -41% / -43% / -52% | 3.27 / 6.10 / 11.12 | 0.56 / 1.25 / 1.16 |
+| 4096 × 128 (1-4) | 1.3M | 56.5 / 81.1 / 86.2 | 39.3 / 48.0 / 50.4 | -30% / -41% / -41% | 6.39 / 11.84 / 24.56 | 0.81 / 1.54 / 1.56 |
+| 1024 × 4096 (1-4) | 10.5M | 96.7 / 190.6 / 287.5 | 40.8 / 65.1 / 75.7 | -58% / -66% / -74% | 11.46 / 24.53 / 51.01 | 2.61 / 5.63 / 6.48 |
+| 4096 × 1024 (1-4) | 10.5M | 124.8 / 219.5 / 308.8 | 61.2 / 84.3 / 94.1 | -51% / -62% / -70% | 15.65 / 30.48 / 62.83 | 2.85 / 6.11 / 6.92 |
+| 1024 × 512 (1-32) | 8.7M | 68.9 / 131.5 / 179.8 | 35.0 / 61.8 / 70.1 | -49% / -53% / -61% | 4.98 / 8.56 / 14.20 | 2.16 / 4.66 / 5.37 |
+| 4096 × 128 (1-32) | 8.7M | 95.8 / 165.7 / 205.3 | 55.8 / 79.3 / 88.9 | -42% / -52% / -57% | 7.89 / 14.02 / 26.52 | 2.39 / 5.13 / 5.78 |
 
-The hierarchical dist's step, part by part: the input dist
-(`in_seg_ms_mean`), the output dist's kernels as the rank that arrives
-last runs them (as above), and from its first round's profiled iterations
-the lookup's forward and backward kernels and the model's own kernels
-(`fwd/other` and `bwd/other`, mostly the previous loop's loss; GPU time per
-iteration, mean over the ranks); the rest is the step's other time, mostly
-that loop's host work. In ms:
+The hierarchical dist's step part by part, on 1 / 2 / 4 nodes, in ms: the
+input dist; the lookup's forward and backward kernels and the other kernels
+(`fwd/other` and `bwd/other`: the backward of the EC's per-feature split, a
+cat of the output gradients, and two small fills), from its first round's
+profiled iterations (GPU time per iteration, mean over the ranks); the
+output dist's kernels as the rank that arrives last runs them (per call the
+least time over the ranks, then the median over the calls: what the dist
+takes, without the wait for a slower rank); and the rest of the step, host
+time that no kernel above covers.
 
-| features × batch (keys per sample) | nodes | step | input dist | lookup fwd | output dist fwd | output dist bwd | lookup bwd | model kernels | rest |
-|---|---|---|---|---|---|---|---|---|---|
-| 1024 × 512 (1-4) | 1 | 29.6 | 0.55 | 1.24 | 1.74 | 1.67 | 1.23 | 8.81 | 14.3 |
-| 1024 × 512 (1-4) | 2 | 34.7 | 1.11 | 1.19 | 5.98 | 6.11 | 1.10 | 8.93 | 10.3 |
-| 1024 × 512 (1-4) | 4 | 39.1 | 1.25 | 1.14 | 8.93 | 9.01 | 0.92 | 9.00 | 8.9 |
-| 4096 × 128 (1-4) | 1 | 104.5 | 0.82 | 1.24 | 1.74 | 1.88 | 1.23 | 48.80 | 48.8 |
-| 4096 × 128 (1-4) | 2 | 110.3 | 1.41 | 1.19 | 5.98 | 6.27 | 1.10 | 48.91 | 45.5 |
-| 4096 × 128 (1-4) | 4 | 118.1 | 1.55 | 1.14 | 8.93 | 9.20 | 0.92 | 48.85 | 47.5 |
-| 1024 × 4096 (1-4) | 1 | 56.6 | 2.61 | 6.02 | 11.92 | 11.41 | 5.22 | 11.60 | 7.8 |
-| 1024 × 4096 (1-4) | 2 | 78.9 | 5.56 | 3.87 | 19.76 | 26.36 | 3.24 | 11.47 | 8.7 |
-| 1024 × 4096 (1-4) | 4 | 91.6 | 6.53 | 2.83 | 29.47 | 30.65 | 2.17 | 11.49 | 8.5 |
-| 4096 × 1024 (1-4) | 1 | 137.5 | 2.86 | 6.01 | 11.92 | 11.56 | 5.22 | 36.57 | 63.3 |
-| 4096 × 1024 (1-4) | 2 | 159.7 | 5.97 | 3.88 | 19.76 | 25.92 | 3.24 | 36.82 | 64.1 |
-| 4096 × 1024 (1-4) | 4 | 175.5 | 6.87 | 2.83 | 29.47 | 30.78 | 2.17 | 37.02 | 66.4 |
-| 1024 × 512 (1-32) | 1 | 51.0 | 2.17 | 5.31 | 10.11 | 9.68 | 4.75 | 10.89 | 8.1 |
-| 1024 × 512 (1-32) | 2 | 73.7 | 4.59 | 3.60 | 18.85 | 24.27 | 3.02 | 10.92 | 8.5 |
-| 1024 × 512 (1-32) | 4 | 86.2 | 5.35 | 2.65 | 28.15 | 28.35 | 2.04 | 10.94 | 8.7 |
-| 4096 × 128 (1-32) | 1 | 134.1 | 2.40 | 5.31 | 10.13 | 9.79 | 4.75 | 36.54 | 65.2 |
-| 4096 × 128 (1-32) | 2 | 157.2 | 5.09 | 3.60 | 18.85 | 24.58 | 3.02 | 36.48 | 65.6 |
-| 4096 × 128 (1-32) | 4 | 172.7 | 5.84 | 2.65 | 28.15 | 28.43 | 2.04 | 36.42 | 69.2 |
+| features × batch (keys per sample) | step | input dist | lookup fwd + bwd | output dist fwd | output dist bwd | other kernels | rest |
+|---|---|---|---|---|---|---|---|
+| 8 × 4096 (1-32) | 3.3 / 8.5 / 10.7 | 0.30 / 0.70 / 0.71 | 0.93 / 0.90 / 0.84 | 0.74 / 2.89 / 4.07 | 0.72 / 2.85 / 4.14 | 0.19 / 0.19 / 0.19 | 0.4 / 1.0 / 0.7 |
+| 64 × 4096 (1-3) | 3.2 / 8.4 / 10.4 | 0.31 / 0.69 / 0.73 | 0.91 / 0.88 / 0.82 | 0.72 / 2.78 / 3.96 | 0.70 / 2.87 / 4.03 | 0.18 / 0.18 / 0.18 | 0.4 / 1.0 / 0.7 |
+| 256 × 2048 (1) | 3.7 / 8.7 / 10.4 | 0.36 / 0.75 / 0.75 | 0.80 / 0.88 / 0.82 | 0.72 / 3.05 / 3.96 | 0.70 / 2.81 / 4.03 | 0.29 / 0.18 / 0.18 | 0.8 / 1.0 / 0.7 |
+| 1024 × 512 (1) | 6.5 / 9.9 / 10.9 | 0.39 / 0.87 / 0.84 | 0.80 / 0.88 / 0.82 | 0.72 / 2.73 / 3.95 | 0.70 / 2.82 / 4.05 | 0.30 / 0.19 / 0.19 | 3.6 / 2.4 / 1.0 |
+| 4096 × 128 (1) | 38.9 / 41.1 / 45.4 | 0.56 / 1.09 / 1.11 | 0.91 / 0.88 / 0.82 | 0.72 / 2.96 / 3.96 | 0.72 / 2.97 / 4.01 | 0.24 / 0.24 / 0.24 | 35.7 / 32.9 / 35.2 |
+| 1024 × 4096 (1) | 19.1 / 42.3 / 50.1 | 1.20 / 2.56 / 3.01 | 5.77 / 4.79 / 3.55 | 5.24 / 14.70 / 20.69 | 5.03 / 16.83 / 20.79 | 1.42 / 1.42 / 1.43 | 0.4 / 2.0 / 0.6 |
+| 4096 × 1024 (1) | 47.5 / 61.2 / 69.1 | 1.43 / 2.88 / 3.32 | 5.77 / 4.78 / 3.55 | 5.25 / 14.78 / 20.68 | 5.04 / 16.66 / 20.80 | 1.47 / 1.48 / 1.48 | 28.6 / 20.7 / 19.2 |
+| 1024 × 512 (1-4) | 9.5 / 17.6 / 22.2 | 0.56 / 1.25 / 1.16 | 1.79 / 1.95 / 2.00 | 1.74 / 6.52 / 8.93 | 1.67 / 6.19 / 9.01 | 0.70 / 0.46 / 0.46 | 3.1 / 1.2 / 0.6 |
+| 4096 × 128 (1-4) | 39.3 / 48.0 / 50.4 | 0.81 / 1.54 / 1.56 | 2.03 / 1.94 / 2.00 | 1.74 / 6.74 / 8.93 | 1.70 / 6.48 / 8.98 | 0.51 / 0.51 / 0.51 | 32.5 / 30.7 / 28.4 |
+| 1024 × 4096 (1-4) | 40.8 / 65.1 / 75.7 | 2.61 / 5.63 / 6.48 | 10.89 / 7.08 / 5.00 | 11.92 / 21.96 / 29.48 | 11.41 / 25.05 / 30.51 | 3.53 / 3.53 / 3.54 | 0.4 / 1.9 / 0.7 |
+| 4096 × 1024 (1-4) | 61.2 / 84.3 / 94.1 | 2.85 / 6.11 / 6.92 | 10.88 / 7.08 / 5.00 | 11.92 / 21.56 / 29.48 | 11.41 / 26.43 / 30.60 | 3.57 / 3.58 / 3.58 | 20.6 / 19.5 / 18.5 |
+| 1024 × 512 (1-32) | 35.0 / 61.8 / 70.1 | 2.16 / 4.66 / 5.37 | 9.74 / 6.51 / 4.69 | 10.10 / 21.32 / 28.13 | 9.68 / 24.42 / 28.35 | 2.91 / 2.92 / 2.92 | 0.4 / 1.9 / 0.6 |
+| 4096 × 128 (1-32) | 55.8 / 79.3 / 88.9 | 2.39 / 5.13 / 5.78 | 9.75 / 6.51 / 4.69 | 10.12 / 20.43 / 28.14 | 9.69 / 24.54 / 28.35 | 2.96 / 2.97 / 2.97 | 20.9 / 19.7 / 19.0 |
 
-* The hierarchical dist's step is 17% to 70% shorter than TorchRec's, and
-  the gain grows with the nodes and with the keys per GPU: at 10.5 million
-  keys on 4 nodes, 91.6 against 306.3 ms at 1,024 features and 175.5
-  against 397.0 ms at 4,096. Its input dist is 2.3 to 15 times shorter.
-* The output dist's forward kernel takes the same time at the same keys
-  per GPU whatever the features (1,024 × 512 and 4,096 × 128; 1,024 ×
-  4,096 and 4,096 × 1,024), and its backward kernel within 3%, but on one
-  node at 1.3 million keys (1.67 and 1.88 ms).
-* On 2 nodes, at 8.7 and 10.5 million keys, the backward kernel takes
-  about 30% longer than the forward (on 4 nodes, 1% to 5%).
-* At 4,096 features the rest, mostly the previous loop's host work, is 45
-  to 69 ms of the step.
+* The hierarchical dist's step is 25% to 74% shorter than TorchRec's, more
+  so with more nodes and more keys per GPU: at 10.5 million keys on 4
+  nodes, 75.7 against 287.5 ms at 1,024 features and 94.1 against 308.8 ms
+  at 4,096. Its input dist is 2.3 to 21 times shorter.
+* The output dist's kernels take the same time at the same keys per GPU
+  whatever the features: at 4.2 million keys the forward takes 5.2, 14.7 to
+  14.8 and 20.7 ms on 1, 2 and 4 nodes at both 1,024 × 4,096 and 4,096 ×
+  1,024.
+* The rest is host time that grows with the features: TorchRec's
+  EmbeddingCollection gives a JaggedTensor per feature, and autograd has an
+  edge per feature. It is 18 to 36 ms of the step at 4,096 features and at
+  most 3.6 ms at 1,024; TorchRec's dists pay it too.
+
+Before these runs, the benchmark drew a new batch every iteration and summed
+each feature's rows into a loss (two or three kernels per feature), so its
+steps at many features were mostly that loss's host work. With that loop,
+the changes for many features (one put per chunk and lookup group; count
+messages, node rows and planner tables that grow with the features once, not
+with the features times the nodes; [docs/hier_output_dist.md](../docs/hier_output_dist.md),
+sections 10 and 11) took the output dist's kernels at 4,096 × 128 on 2 and 4
+nodes from 13 to 17 ms to 2.7 to 4.2 ms, and its input dist from 2.6 to 3.6
+ms to 1.3 to 1.5 ms. The input dist's fusions (section 10) then shortened
+the input dist by 5% to 23% at every point, and left the output dist's
+kernels within about 1%.
 
 #### Options
 
