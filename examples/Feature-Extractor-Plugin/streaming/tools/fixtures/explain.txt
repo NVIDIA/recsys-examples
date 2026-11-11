@@ -1,0 +1,5 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+== Optimized Execution Plan ==
+LookupJoin(table=[secret_catalog.secret_customers], customer=Acme)
++- WindowAggregate(window=[TUMBLE(time_col=[secret_ts], size=[1 min])], password=very-secret-password)

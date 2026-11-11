@@ -35,6 +35,7 @@ from configs import HSTUConfig, InferenceHSTUConfig, get_inference_hstu_config
 from flexkv.common.config import (
     CacheConfig,
     ModelConfig,
+    RankInfo,
     UserConfig,
     update_default_config_from_user_config,
 )
@@ -89,7 +90,7 @@ def start_flexkv_server(
     model_config.num_kv_heads = kvcache_config.num_heads
     model_config.head_size = kvcache_config.head_dim
     model_config.dtype = kvcache_config.dtype
-    model_config.use_mla = False
+    model_config.kv_dim = 2
     model_config.tp_size = 1
     model_config.dp_size = 1
     cache_config.tokens_per_block = kvcache_config.page_size
@@ -118,7 +119,9 @@ def start_flexkv_server(
         if name in extra_configs:
             setattr(user_config, name, extra_configs[name])
 
-    update_default_config_from_user_config(model_config, cache_config, user_config)
+    update_default_config_from_user_config(
+        RankInfo(model_config=model_config), cache_config, user_config
+    )
 
     server_recv_port = str(required_config(runtime_config, "server_recv_port"))
     gpu_register_port = str(required_config(runtime_config, "gpu_register_port"))
@@ -130,7 +133,6 @@ def start_flexkv_server(
         cache_config=cache_config,
         gpu_register_port=gpu_register_port,
         server_recv_port=server_recv_port,
-        total_clients=1,
         inherit_env=True,
     )
     print(

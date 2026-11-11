@@ -1,0 +1,272 @@
+# arithmetic
+i32 + i32 * 3
+i64 + i64 - i64 * 2
+i8 + i8
+i16 * i16
+i8 * i8 - i8
+-i32
+-i64
+-i8
+abs(i32)
+abs(i64)
+abs(i16)
+f64 * f64 + f64
+f64 + 1.5 - f64 / 3.0
+f32 * f32 + f32
+-f64
+-f32
+abs(f64)
+abs(f32)
+f64 / f64
+f32 / f32
+i64 % i64
+i32 % i32
+i32 % 7 + i32 % -1
+pmod(i32, 7)
+pmod(i64, i64)
+pmod(f64, f64)
+i64 div i64
+i32 div i32
+i8 div i8
+f64 % f64
+f32 % f32
+# comparisons
+f64 < f64
+f64 <= f64
+f64 > f64
+f64 >= f64
+f64 = f64
+f64 <=> f64
+f32 < f32
+f32 = f32
+i64 < i64
+i32 >= i32
+i8 = i8
+i16 <=> i16
+d < d
+ts >= ts
+b = b
+# logic
+b and (i32 > 0)
+b or (i32 > 0)
+not b
+(i32 > 0) and (f64 < 1.0) or b
+(i32 > 0) or (f64 < 1.0) and not b
+b <=> (i32 > 0)
+# null tests
+i32 is null
+i32 is not null
+isnan(f64)
+isnan(f32)
+f64 is null or f64 is not null
+# conditional
+if(i32 > 0, i64, -i64)
+if(b, f64, f64 + 1)
+case when i32 > 0 then 1 when i32 < 0 then -1 else 0 end
+case when i32 > 0 then f64 when i32 < 0 then f64 * 2 end
+coalesce(i32, i32 + 1, 0)
+coalesce(f64, f64 + 1.0)
+coalesce(i64, cast(i32 as bigint), 5L)
+greatest(f64, f64 + 1, 0.0)
+least(f64, f64 * 2, 1.0)
+greatest(i32, i32 * 2)
+least(i64, i64 / 2L)
+# casts
+cast(i32 as bigint)
+cast(i64 as int)
+cast(i64 as smallint)
+cast(i32 as tinyint)
+cast(i32 as double)
+cast(i64 as float)
+cast(i64 as double)
+cast(f64 as float)
+cast(f32 as double)
+cast(f64 as bigint)
+cast(f64 as int)
+cast(f64 as smallint)
+cast(f64 as tinyint)
+cast(f32 as bigint)
+cast(f32 as int)
+cast(i32 as boolean)
+cast(f64 as boolean)
+cast(b as int)
+cast(b as double)
+cast(d as timestamp)
+cast(ts as date)
+cast(ts as bigint)
+cast(ts as int)
+cast(ts as double)
+cast(i32 as timestamp)
+cast(i8 as timestamp)
+# bitwise
+i32 & i32
+i64 | i64
+i16 ^ i16
+~i32
+~i8
+shiftleft(i32, 3)
+shiftleft(i64, 65)
+shiftright(i32, 33)
+shiftright(i64, 3)
+shiftrightunsigned(i32, 5)
+shiftrightunsigned(i64, 5)
+shiftleft(i32, i32)
+# math
+sqrt(f64)
+sqrt(abs(f64))
+exp(f64 / 1000)
+exp(f64)
+log(f64)
+log(abs(f64) + 1)
+pow(f64, 2.0)
+pow(abs(f64), f64)
+sin(f64) * cos(f64)
+tan(f64)
+atan(f64)
+asin(f64)
+acos(f64)
+sinh(f64 / 1000)
+cosh(f64 / 1000)
+tanh(f64)
+cbrt(f64)
+signum(f64)
+rint(f64)
+expm1(f64 / 1000)
+hypot(f64, f64)
+# mixed
+f64 * i32 + i64
+(i32 + 1) * (i32 - 1) / 7
+cast(i32 as double) / cast(i32 as double)
+case when f64 > 0 then sqrt(f64) else -f64 end
+if(isnan(f64), 0.0, f64)
+nanvl(f64, 0.0)
+f64 + f32
+f32 * i32
+# filters
+FILTER i32 > 0 and f64 < 100.0
+FILTER (i32 % 3 = 0) or (f64 > 0.0 and i64 < 0)
+FILTER i32 is not null and not b
+FILTER f64 > 1e6 or f64 < -1e6 or isnan(f64)
+FILTER s is not null and i32 > 5 and f64 < 3
+# with string (opaque cuDF sub-expression)
+length(s) + i32
+cast(s as int) * 2 + i32
+i32 + 1 + length(s) * 2
+# batch 2
+ln(f64)
+log(2.0, f64)
+log(f64, f64)
+nanvl(f64, 0.5)
+nanvl(f32, cast(1.5 as float))
+degrees(f64)
+radians(f64)
+floor(f64)
+ceil(f64)
+floor(i64)
+ceil(i64)
+floor(f64 * 1000)
+bit_count(i32)
+bit_count(i64)
+bit_count(i8)
+bit_count(b)
+year(d)
+month(d)
+day(d)
+dayofmonth(d)
+quarter(d)
+dayofyear(d)
+dayofweek(d)
+weekday(d)
+last_day(d)
+year(ts)
+month(ts)
+hour(ts)
+minute(ts)
+second(ts)
+date_add(d, i8)
+date_add(d, i32 % 1000)
+date_sub(d, i16)
+datediff(d, d + 30)
+datediff(cast(ts as date), d)
+year(d) * 10000 + month(d) * 100 + day(d)
+FILTER year(d) = 2000 and quarter(d) > 1
+nvl(i32, 0) + 1
+ifnull(f64, 1.0) * 2
+nullif(i32, 0) + 1
+nvl2(i32, 1, 2) + i64
+i32 in (1, 5, 7, -1, 0)
+i64 in (1, 2, 3)
+i8 in (0, -1, 100)
+i16 in (1, null, 300)
+i32 in (3, 4) or i32 is null
+not (i32 in (1, 2, 3))
+d in (cast('2000-01-01' as date), cast('1999-12-31' as date))
+FILTER i32 in (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12) and f64 > 0
+asinh(f64)
+acosh(abs(f64)+1)
+atanh(f64 / 1000)
+cot(f64)
+cot(f64 + 0.5) * 2
+round(f64, 2)
+round(f64, 0)
+round(f64, -1)
+round(f64, 5)
+round(f32, 1)
+bround(f64, 1)
+bround(f64, 2)
+round(f64 * 3.14159, 3) + 1
+round(f64, 400)
+round(f64, -400)
+round(f32, 50)
+round(f32, -50)
+round(f64 * 0.37, 2)
+round(f32 * 0.37, 3)
+round(f64 / 7, 4)
+bround(f64 * 0.37, 2)
+hypot(f64, f64)
+hypot(f64, 3.0)
+# narrow integer wrap-around feeding comparisons (ptxas 16-bit miscompile regression)
+(-i16) >= 1
+(-i8) > 0
+(i16 + i16) > 0
+(i8 * i8) < 0
+(i16 * i16) >= 0
+abs(i16) >= 0
+abs(i8) < 0
+(i16 - i16) = 0
+(i8 + 100) > 0
+(i16 - 30000) < 0
+if((-i16) > 0, i16, cast(0 as smallint))
+case when (-i8) >= 1 then i8 when (i8 * 3) < 0 then -i8 else cast(0 as tinyint) end
+cast(i32 as smallint) > 0
+cast(i64 as tinyint) >= 1
+pmod(i16, i16) >= 0
+(i16 % 7) + (i8 % 5) > 0
+greatest(i16, -i16) > 0
+~i16 > 0
+(i8 & 15) | (i8 ^ 3)
+# literal zeros of both signs (CSE must keep them apart)
+coalesce(f64, cast('-0.0' as double))
+if(b, cast('0.0' as double), cast('-0.0' as double))
+least(f64, cast('-0.0' as double))
+greatest(f64, cast('0.0' as double))
+least(f64, 3.0, cast('0.0' as double))
+f64 * cast('-0.0' as double)
+cast('-0.0' as double) / i32
+case when b then cast('-0.0' as double) when i32 > 0 then cast('0.0' as double) else f64 end
+cast('NaN' as double) + f64
+if(b, cast('NaN' as double), cast('Infinity' as double))
+hour(cast(i32 as timestamp))
+minute(cast(i32 as timestamp))
+second(cast(i32 as timestamp))
+cast(cast(i32 as timestamp) as date)
+cast(i32 as timestamp) < ts
+cast(ts as bigint) % 86400
+cast(ts as double) * 2
+cast(d as timestamp) = ts
+year(cast(ts as date))
+dayofweek(cast(i32 as timestamp))
+cast(i8 as timestamp) > cast(i16 as timestamp)
+hour(ts) * 3600 + minute(ts) * 60 + second(ts)
+datediff(cast(ts as date), cast(i32 as timestamp))
+cast(cast(i16 as timestamp) as date) = d

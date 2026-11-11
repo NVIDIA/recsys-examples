@@ -1,0 +1,52 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="980" height="430" viewBox="0 0 980 430">
+<defs><marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#52514e"/></marker><marker id="ahb" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#2a78d6"/></marker><marker id="aho" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="#eb6834"/></marker></defs>
+<rect x="0" y="0" width="980" height="430" rx="12" fill="#ffffff"/>
+<text x="24" y="34" font-size="17" text-anchor="start" font-weight="600" fill="#1f1f1d" font-family="Inter, 'Helvetica Neue', Helvetica, Arial, 'PingFang SC', 'Microsoft YaHei', 'Noto Sans CJK SC', sans-serif">Bottleneck 3 - shuffle: most of the cost is local work on each machine, not the network</text>
+<text x="24" y="56" font-size="13" text-anchor="start" font-weight="normal" fill="#52514e" font-family="Inter, 'Helvetica Neue', Helvetica, Arial, 'PingFang SC', 'Microsoft YaHei', 'Noto Sans CJK SC', sans-serif">Every row is regrouped by key so that the next stage finds all rows of one key on one task</text>
+<rect x="16" y="74" width="948" height="120" rx="10" fill="#fbfbf9" stroke="#c9c8c2" stroke-width="1" stroke-dasharray="5 4"/>
+<text x="28" y="94" font-size="13" text-anchor="start" font-weight="600" fill="#52514e" font-family="Inter, 'Helvetica Neue', Helvetica, Arial, 'PingFang SC', 'Microsoft YaHei', 'Noto Sans CJK SC', sans-serif">Map side (machine 1)</text>
+<rect x="28" y="106" width="160" height="72" rx="8" fill="#fdebe3" stroke="#eb6834" stroke-width="1.5"/>
+<text x="108.0" y="137.68" font-size="13" text-anchor="middle" font-weight="600" fill="#1f1f1d" font-family="Inter, 'Helvetica Neue', Helvetica, Arial, 'PingFang SC', 'Microsoft YaHei', 'Noto Sans CJK SC', sans-serif">Partition</text>
+<text x="108.0" y="155.68" font-size="12" text-anchor="middle" font-weight="normal" fill="#52514e" font-family="Inter, 'Helvetica Neue', Helvetica, Arial, 'PingFang SC', 'Microsoft YaHei', 'Noto Sans CJK SC', sans-serif">hash(key) -&gt; target</text>
+<line x1="191" y1="142" x2="213" y2="142" stroke="#52514e" stroke-width="1.6" marker-end="url(#ah)"/>
+<rect x="216" y="106" width="160" height="72" rx="8" fill="#fdebe3" stroke="#eb6834" stroke-width="1.5"/>
+<text x="296.0" y="137.68" font-size="13" text-anchor="middle" font-weight="600" fill="#1f1f1d" font-family="Inter, 'Helvetica Neue', Helvetica, Arial, 'PingFang SC', 'Microsoft YaHei', 'Noto Sans CJK SC', sans-serif">Copy to host</text>
+<text x="296.0" y="155.68" font-size="12" text-anchor="middle" font-weight="normal" fill="#52514e" font-family="Inter, 'Helvetica Neue', Helvetica, Arial, 'PingFang SC', 'Microsoft YaHei', 'Noto Sans CJK SC', sans-serif">GPU -&gt; CPU memory</text>
+<line x1="379" y1="142" x2="401" y2="142" stroke="#52514e" stroke-width="1.6" marker-end="url(#ah)"/>
+<rect x="404" y="106" width="160" height="72" rx="8" fill="#fdebe3" stroke="#eb6834" stroke-width="1.5"/>
+<text x="484.0" y="137.68" font-size="13" text-anchor="middle" font-weight="600" fill="#1f1f1d" font-family="Inter, 'Helvetica Neue', Helvetica, Arial, 'PingFang SC', 'Microsoft YaHei', 'Noto Sans CJK SC', sans-serif">Serialize</text>
+<text x="484.0" y="155.68" font-size="12" text-anchor="middle" font-weight="normal" fill="#52514e" font-family="Inter, 'Helvetica Neue', Helvetica, Arial, 'PingFang SC', 'Microsoft YaHei', 'Noto Sans CJK SC', sans-serif">+ group by target</text>
+<line x1="567" y1="142" x2="589" y2="142" stroke="#52514e" stroke-width="1.6" marker-end="url(#ah)"/>
+<rect x="592" y="106" width="160" height="72" rx="8" fill="#fdebe3" stroke="#eb6834" stroke-width="1.5"/>
+<text x="672.0" y="137.68" font-size="13" text-anchor="middle" font-weight="600" fill="#1f1f1d" font-family="Inter, 'Helvetica Neue', Helvetica, Arial, 'PingFang SC', 'Microsoft YaHei', 'Noto Sans CJK SC', sans-serif">Compress</text>
+<text x="672.0" y="155.68" font-size="12" text-anchor="middle" font-weight="normal" fill="#52514e" font-family="Inter, 'Helvetica Neue', Helvetica, Arial, 'PingFang SC', 'Microsoft YaHei', 'Noto Sans CJK SC', sans-serif">LZ4 / ZSTD</text>
+<line x1="755" y1="142" x2="777" y2="142" stroke="#52514e" stroke-width="1.6" marker-end="url(#ah)"/>
+<rect x="780" y="106" width="160" height="72" rx="8" fill="#fdebe3" stroke="#eb6834" stroke-width="1.5"/>
+<text x="860.0" y="137.68" font-size="13" text-anchor="middle" font-weight="600" fill="#1f1f1d" font-family="Inter, 'Helvetica Neue', Helvetica, Arial, 'PingFang SC', 'Microsoft YaHei', 'Noto Sans CJK SC', sans-serif">Write</text>
+<text x="860.0" y="155.68" font-size="12" text-anchor="middle" font-weight="normal" fill="#52514e" font-family="Inter, 'Helvetica Neue', Helvetica, Arial, 'PingFang SC', 'Microsoft YaHei', 'Noto Sans CJK SC', sans-serif">local shuffle file</text>
+<rect x="16" y="250" width="948" height="120" rx="10" fill="#fbfbf9" stroke="#c9c8c2" stroke-width="1" stroke-dasharray="5 4"/>
+<text x="28" y="362" font-size="13" text-anchor="start" font-weight="600" fill="#52514e" font-family="Inter, 'Helvetica Neue', Helvetica, Arial, 'PingFang SC', 'Microsoft YaHei', 'Noto Sans CJK SC', sans-serif">Reduce side (machine 2)</text>
+<rect x="28" y="262" width="160" height="72" rx="8" fill="#f2f1ed" stroke="#c9c8c2" stroke-width="1.5"/>
+<text x="108.0" y="293.68" font-size="13" text-anchor="middle" font-weight="600" fill="#1f1f1d" font-family="Inter, 'Helvetica Neue', Helvetica, Arial, 'PingFang SC', 'Microsoft YaHei', 'Noto Sans CJK SC', sans-serif">Fetch</text>
+<text x="108.0" y="311.68" font-size="12" text-anchor="middle" font-weight="normal" fill="#52514e" font-family="Inter, 'Helvetica Neue', Helvetica, Arial, 'PingFang SC', 'Microsoft YaHei', 'Noto Sans CJK SC', sans-serif">over the network</text>
+<line x1="191" y1="298" x2="213" y2="298" stroke="#52514e" stroke-width="1.6" marker-end="url(#ah)"/>
+<rect x="216" y="262" width="160" height="72" rx="8" fill="#fdebe3" stroke="#eb6834" stroke-width="1.5"/>
+<text x="296.0" y="302.68" font-size="13" text-anchor="middle" font-weight="600" fill="#1f1f1d" font-family="Inter, 'Helvetica Neue', Helvetica, Arial, 'PingFang SC', 'Microsoft YaHei', 'Noto Sans CJK SC', sans-serif">Decompress</text>
+<line x1="379" y1="298" x2="401" y2="298" stroke="#52514e" stroke-width="1.6" marker-end="url(#ah)"/>
+<rect x="404" y="262" width="160" height="72" rx="8" fill="#fdebe3" stroke="#eb6834" stroke-width="1.5"/>
+<text x="484.0" y="302.68" font-size="13" text-anchor="middle" font-weight="600" fill="#1f1f1d" font-family="Inter, 'Helvetica Neue', Helvetica, Arial, 'PingFang SC', 'Microsoft YaHei', 'Noto Sans CJK SC', sans-serif">Deserialize</text>
+<line x1="567" y1="298" x2="589" y2="298" stroke="#52514e" stroke-width="1.6" marker-end="url(#ah)"/>
+<rect x="592" y="262" width="160" height="72" rx="8" fill="#fdebe3" stroke="#eb6834" stroke-width="1.5"/>
+<text x="672.0" y="293.68" font-size="13" text-anchor="middle" font-weight="600" fill="#1f1f1d" font-family="Inter, 'Helvetica Neue', Helvetica, Arial, 'PingFang SC', 'Microsoft YaHei', 'Noto Sans CJK SC', sans-serif">Copy to GPU</text>
+<text x="672.0" y="311.68" font-size="12" text-anchor="middle" font-weight="normal" fill="#52514e" font-family="Inter, 'Helvetica Neue', Helvetica, Arial, 'PingFang SC', 'Microsoft YaHei', 'Noto Sans CJK SC', sans-serif">CPU -&gt; GPU memory</text>
+<line x1="755" y1="298" x2="777" y2="298" stroke="#52514e" stroke-width="1.6" marker-end="url(#ah)"/>
+<rect x="780" y="262" width="160" height="72" rx="8" fill="#fdebe3" stroke="#eb6834" stroke-width="1.5"/>
+<text x="860.0" y="293.68" font-size="13" text-anchor="middle" font-weight="600" fill="#1f1f1d" font-family="Inter, 'Helvetica Neue', Helvetica, Arial, 'PingFang SC', 'Microsoft YaHei', 'Noto Sans CJK SC', sans-serif">Concatenate</text>
+<text x="860.0" y="311.68" font-size="12" text-anchor="middle" font-weight="normal" fill="#52514e" font-family="Inter, 'Helvetica Neue', Helvetica, Arial, 'PingFang SC', 'Microsoft YaHei', 'Noto Sans CJK SC', sans-serif">into one GPU batch</text>
+<path d="M 860 182 V 224 H 108 V 258" fill="none" stroke="#52514e" stroke-width="1.6" marker-end="url(#ah)"/>
+<text x="484" y="214" font-size="12.5" text-anchor="middle" font-weight="600" fill="#52514e" font-family="Inter, 'Helvetica Neue', Helvetica, Arial, 'PingFang SC', 'Microsoft YaHei', 'Noto Sans CJK SC', sans-serif">network transfer (only this arrow crosses machines)</text>
+<text x="24" y="400" font-size="12.5" text-anchor="start" font-weight="normal" fill="#52514e" font-family="Inter, 'Helvetica Neue', Helvetica, Arial, 'PingFang SC', 'Microsoft YaHei', 'Noto Sans CJK SC', sans-serif">In production profiles the hot spots are on the map side: grouping/sorting rows by target, serializing and compressing them on the CPU,</text>
+<text x="24" y="418" font-size="12.5" text-anchor="start" font-weight="normal" fill="#52514e" font-family="Inter, 'Helvetica Neue', Helvetica, Arial, 'PingFang SC', 'Microsoft YaHei', 'Noto Sans CJK SC', sans-serif">and spilling to local files. Shuffling less data and making this per-machine work cheaper matter more than a faster network.</text>
+<rect x="640" y="84" width="12" height="12" rx="3" fill="#fdebe3" stroke="#eb6834"/>
+<text x="658" y="95" font-size="12" text-anchor="start" font-weight="normal" fill="#52514e" font-family="Inter, 'Helvetica Neue', Helvetica, Arial, 'PingFang SC', 'Microsoft YaHei', 'Noto Sans CJK SC', sans-serif">CPU / memory-copy work inside one machine</text>
+</svg>

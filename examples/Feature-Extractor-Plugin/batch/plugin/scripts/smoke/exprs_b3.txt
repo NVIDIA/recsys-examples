@@ -1,0 +1,20 @@
+i32 in (1, 5, 7, -1, 0)
+i64 in (1, 2, 3)
+i8 in (0, -1, 100)
+i16 in (1, null, 300)
+i32 in (3, 4) or i32 is null
+not (i32 in (1, 2, 3))
+d in (cast('2000-01-01' as date), cast('1999-12-31' as date))
+FILTER i32 in (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12) and f64 > 0
+round(f64, 2)
+round(f64, 0)
+round(f64, -1)
+round(f64, 5)
+round(f32, 1)
+bround(f64, 1)
+bround(f64, 2)
+round(f64 * 3.14159, 3) + 1
+round(f64, 400)
+round(f64, -400)
+round(f32, 50)
+round(f32, -50)

@@ -1,0 +1,1042 @@
+[
+ {
+  "spark_class": "Literal",
+  "gpu_class": "GpuLiteral",
+  "category": "leaf",
+  "sql": "1, 2.5D, NULL",
+  "deterministic": true,
+  "rowwise": true,
+  "types": {
+   "in": [],
+   "out": "bool,byte,short,int,long,float,double,date,timestamp (string/decimal excluded in v1)"
+  },
+  "null_semantics": "typed NULL literal -> all-null column; GPU evaluates literals as GpuScalar (not a column)",
+  "non_ansi_behavior": "none",
+  "ansi_behavior": "none",
+  "rapids_notes": "spark-rapids keeps scalars unexpanded and uses scalar-specialised paths (e.g. GpuGreaterThanOrEqual lhs NaN scalar); results equal the column path.",
+  "whitelist": "v1",
+  "whitelist_reason": "needed by every expression tree",
+  "device_function_hint": "Emit as a compile-time constant. Floats must be emitted with exact bit pattern (use hex float or __longlong_as_double(0x...)) incl. NaN/Inf/-0.0; never print with %f. Typed NULL -> constant valid=false.",
+  "source": "literals.scala"
+ },
+ {
+  "spark_class": "AttributeReference/BoundReference",
+  "gpu_class": "GpuBoundReference",
+  "category": "leaf",
+  "sql": "col_a",
+  "deterministic": true,
+  "rowwise": true,
+  "types": {
+   "in": [],
+   "out": "any fixed-width column type"
+  },
+  "null_semantics": "validity bit from input cudf bitmask (bit i of word i/32; null_count may be 0 and mask pointer may be NULL => all valid)",
+  "non_ansi_behavior": "none",
+  "ansi_behavior": "none",
+  "rapids_notes": "cudf columns: data buffer + optional validity bitmask; offset/slices (column view offset) must be honoured; mask words are bitmask_type=uint32.",
+  "whitelist": "v1",
+  "whitelist_reason": "needed",
+  "device_function_hint": "Read data[i+offset]; valid = mask==nullptr ? true : (mask[(i+offset)/32] >> ((i+offset)%32)) & 1. BOOL8 is 1 byte per value (cudf), not bit-packed.",
+  "source": "GpuBoundAttribute.scala"
+ },
+ {
+  "spark_class": "Alias",
+  "gpu_class": "GpuAlias",
+  "category": "leaf-wrapper",
+  "sql": "a AS b",
+  "deterministic": true,
+  "rowwise": true,
+  "types": {
+   "in": [
+    "any"
+   ],
+   "out": "same"
+  },
+  "null_semantics": "transparent",
+  "non_ansi_behavior": "none",
+  "ansi_behavior": "none",
+  "rapids_notes": "Pure rename; stripped when binding.",
+  "whitelist": "v1",
+  "whitelist_reason": "transparent",
+  "device_function_hint": "identity",
+  "source": ""
+ },
+ {
+  "spark_class": "UnaryMinus",
+  "gpu_class": "GpuUnaryMinus",
+  "category": "arithmetic",
+  "sql": "-a",
+  "deterministic": true,
+  "rowwise": true,
+  "types": {
+   "in": [
+    "byte",
+    "short",
+    "int",
+    "long",
+    "float",
+    "double"
+   ],
+   "out": "same"
+  },
+  "null_semantics": "NULL propagates",
+  "non_ansi_behavior": "int wraps: -MIN_VALUE = MIN_VALUE; float: flips sign bit (-0.0 <-> 0.0, -NaN stays NaN)",
+  "ansi_behavior": "int types: throws ArithmeticException on MIN_VALUE (hasSideEffects=true when failOnError)",
+  "rapids_notes": "GPU computes 0 - x via Scalar.sub for all types (incl. float!): 0 - 0.0 = +0.0 but Spark/Java -(0.0) = -0.0. Check: GPU result for float -x on x=+0.0 is +0.0 (0.0-0.0) vs CPU -0.0 => known diff candidate; fused kernel should replicate whichever the unfused GPU path does only if tests show it, else exclude float UnaryMinus or define as 0-x (v1 decision: bit-match the CPU: -x via sign flip; document as diff vs unfused GPU if confirmed).",
+  "whitelist": "v1",
+  "whitelist_reason": "simple; ANSI form (failOnError) excluded",
+  "device_function_hint": "int: (T)(0 - (U)a) (use unsigned arithmetic to avoid UB); float: -a (sign flip).",
+  "source": "sql-plugin/.../org/apache/spark/sql/rapids/arithmetic.scala"
+ },
+ {
+  "spark_class": "UnaryPositive",
+  "gpu_class": "GpuUnaryPositive",
+  "category": "arithmetic",
+  "sql": "+a",
+  "deterministic": true,
+  "rowwise": true,
+  "types": {
+   "in": [
+    "byte",
+    "short",
+    "int",
+    "long",
+    "float",
+    "double"
+   ],
+   "out": "same"
+  },
+  "null_semantics": "propagates",
+  "non_ansi_behavior": "none",
+  "ansi_behavior": "none",
+  "rapids_notes": "identity (incRefCount)",
+  "whitelist": "v1",
+  "whitelist_reason": "trivial",
+  "device_function_hint": "identity",
+  "source": ""
+ },
+ {
+  "spark_class": "Abs",
+  "gpu_class": "GpuAbs",
+  "category": "arithmetic",
+  "sql": "abs(a)",
+  "deterministic": true,
+  "rowwise": true,
+  "types": {
+   "in": [
+    "byte",
+    "short",
+    "int",
+    "long",
+    "float",
+    "double"
+   ],
+   "out": "same"
+  },
+  "null_semantics": "propagates",
+  "non_ansi_behavior": "int: abs(MIN_VALUE)=MIN_VALUE (wraps); float: clears sign bit (abs(-0.0)=0.0, abs(NaN)=NaN)",
+  "ansi_behavior": "int: throws on MIN_VALUE",
+  "rapids_notes": "cuDF UnaryOp.ABS. Non-ANSI wraps.",
+  "whitelist": "v1",
+  "whitelist_reason": "simple",
+  "device_function_hint": "int: a<0 ? (T)(0-(U)a) : a ; float: fabs (bit clear sign).",
+  "source": "sql-plugin/.../org/apache/spark/sql/rapids/arithmetic.scala"
+ },
+ {
+  "spark_class": "Add",
+  "gpu_class": "GpuAdd",
+  "category": "arithmetic",
+  "sql": "a + b",
+  "deterministic": true,
+  "rowwise": true,
+  "types": {
+   "in": [
+    "byte",
+    "short",
+    "int",
+    "long",
+    "float",
+    "double"
+   ],
+   "out": "same (after Spark type coercion both sides same type)"
+  },
+  "null_semantics": "NULL if either NULL",
+  "non_ansi_behavior": "int/long/short/byte: two's-complement wraparound (byte/short: result truncated to type). float/double: IEEE (Inf, NaN, -0.0: (-0.0)+(-0.0)=-0.0, (-0.0)+0.0=0.0 in round-to-nearest). No FMA contraction allowed (--fmad=false).",
+  "ansi_behavior": "int types: throws ArithmeticException on overflow (hasSideEffects). float: same as non-ANSI. Interval/decimal variants separate.",
+  "rapids_notes": "cuDF BinaryOp ADD; GPU only checks overflow if failOnError. Decimal has separate overflow->NULL logic (excluded v1).",
+  "whitelist": "v1",
+  "whitelist_reason": "simple; ANSI(failOnError=true) integral instances are NOT fusible (side effects)",
+  "device_function_hint": "int: (T)((U)a + (U)b) using unsigned arithmetic for defined wrap; float: a + b.",
+  "source": "sql-plugin/.../org/apache/spark/sql/rapids/arithmetic.scala"
+ },
+ {
+  "spark_class": "Subtract",
+  "gpu_class": "GpuSubtract",
+  "category": "arithmetic",
+  "sql": "a - b",
+  "deterministic": true,
+  "rowwise": true,
+  "types": {
+   "in": [
+    "byte",
+    "short",
+    "int",
+    "long",
+    "float",
+    "double"
+   ],
+   "out": "same (after Spark type coercion both sides same type)"
+  },
+  "null_semantics": "NULL if either NULL",
+  "non_ansi_behavior": "int/long/short/byte: two's-complement wraparound (byte/short: result truncated to type). float/double: IEEE (Inf, NaN, -0.0: (-0.0)+(-0.0)=-0.0, (-0.0)+0.0=0.0 in round-to-nearest). No FMA contraction allowed (--fmad=false).",
+  "ansi_behavior": "int types: throws ArithmeticException on overflow (hasSideEffects). float: same as non-ANSI. Interval/decimal variants separate.",
+  "rapids_notes": "cuDF BinaryOp SUB; GPU only checks overflow if failOnError. Decimal has separate overflow->NULL logic (excluded v1).",
+  "whitelist": "v1",
+  "whitelist_reason": "simple; ANSI(failOnError=true) integral instances are NOT fusible (side effects)",
+  "device_function_hint": "int: (T)((U)a - (U)b) using unsigned arithmetic for defined wrap; float: a - b.",
+  "source": "sql-plugin/.../org/apache/spark/sql/rapids/arithmetic.scala"
+ },
+ {
+  "spark_class": "Multiply",
+  "gpu_class": "GpuMultiply",
+  "category": "arithmetic",
+  "sql": "a * b",
+  "deterministic": true,
+  "rowwise": true,
+  "types": {
+   "in": [
+    "byte",
+    "short",
+    "int",
+    "long",
+    "float",
+    "double"
+   ],
+   "out": "same"
+  },
+  "null_semantics": "NULL if either NULL",
+  "non_ansi_behavior": "int wraps (low bits), byte/short truncated; float IEEE; no FMA with following add (--fmad=false and no __fmaf contraction)",
+  "ansi_behavior": "int: throws on overflow",
+  "rapids_notes": "Uses spark-rapids-jni Arithmetic.multiply(lhs,rhs,ansi,tryMode); non-ANSI wraps like CPU. Decimal: separate GpuDecimalMultiply (excluded).",
+  "whitelist": "v1",
+  "whitelist_reason": "simple",
+  "device_function_hint": "int: (T)((U)a * (U)b) in unsigned 32/64-bit; for byte/short compute in int then truncate; float: a*b",
+  "source": "sql-plugin/.../org/apache/spark/sql/rapids/arithmetic.scala"
+ },
+ {
+  "spark_class": "Divide",
+  "gpu_class": "GpuDivide",
+  "category": "arithmetic",
+  "sql": "a / b",
+  "deterministic": true,
+  "rowwise": true,
+  "types": {
+   "in": [
+    "double (Spark coerces int/long/float operands to double; float/float is NOT coerced? Divide requires DoubleType|DecimalType: float inputs are cast to double)"
+   ],
+   "out": "double"
+  },
+  "null_semantics": "NULL if either NULL; ALSO NULL if divisor == 0 (including 0.0 and -0.0) when ANSI off",
+  "non_ansi_behavior": "x/0 => NULL (not Inf/NaN) for double as well. NaN/y = NaN; y/NaN = NaN; Inf/Inf=NaN. If b != 0: IEEE division.",
+  "ansi_behavior": "b==0 throws DIVIDE_BY_ZERO (hasSideEffects). Excluded from v1.",
+  "rapids_notes": "GpuDivModLike: non-ANSI replaces zeros in rhs with NULL via findAndReplaceAll (0.0 == -0.0 both replaced) then TRUE_DIV. scalar zero rhs => all-NULL column. nullable=true.",
+  "whitelist": "v1",
+  "whitelist_reason": "non-ANSI semantic is branch-free: valid = valid_a & valid_b & (b != 0)",
+  "device_function_hint": "if (b == 0) {valid=false} else r = a / b. Output validity must AND (b!=0) even when result is garbage. Inputs already cast to double by planner.",
+  "source": "sql-plugin/.../org/apache/spark/sql/rapids/arithmetic.scala"
+ },
+ {
+  "spark_class": "IntegralDivide",
+  "gpu_class": "GpuIntegralDivide",
+  "category": "arithmetic",
+  "sql": "a div b",
+  "deterministic": true,
+  "rowwise": true,
+  "types": {
+   "in": [
+    "byte",
+    "short",
+    "int",
+    "long"
+   ],
+   "out": "long"
+  },
+  "null_semantics": "NULL if either NULL, NULL if b==0 (ANSI off)",
+  "non_ansi_behavior": "truncation toward zero (C semantics). Long.MIN div -1: CPU Java gives Long.MIN (wraps) in non-ANSI. NOTE GPU passes it to cuDF DIV (C++ UB) -> unfused GPU may differ (known-diff candidate; verify)",
+  "ansi_behavior": "b==0 throws; Long.MIN div -1 throws ArithmeticException(overflow) (shouldFailDivOverflow = ansiEnabled)",
+  "rapids_notes": "GpuDivModLike.checkDivideOverflow only when LongType && ansi. Result type always Long (int operands are widened first in cuDF with outputTypeOverride=INT64).",
+  "whitelist": "v1",
+  "whitelist_reason": "need explicit INT_MIN/-1 special case in device fn",
+  "device_function_hint": "if (b==0) null; else if (b==-1) r = (long)(0-(ulong)a); else r = (long)a / (long)b (operands widened to long first).",
+  "source": "sql-plugin/.../org/apache/spark/sql/rapids/arithmetic.scala"
+ },
+ {
+  "spark_class": "Remainder",
+  "gpu_class": "GpuRemainder",
+  "category": "arithmetic",
+  "sql": "a % b",
+  "deterministic": true,
+  "rowwise": true,
+  "types": {
+   "in": [
+    "byte",
+    "short",
+    "int",
+    "long",
+    "float",
+    "double"
+   ],
+   "out": "same"
+  },
+  "null_semantics": "NULL if either NULL; NULL if b==0 (ints AND floats) when ANSI off",
+  "non_ansi_behavior": "int: result has sign of dividend (C/Java %); MIN % -1 = 0 (Java) - cuDF MOD for b==-1 is C++ UB territory => special-case. float: Java % == C fmod: x%Inf=x, Inf%x=NaN, x%NaN=NaN, result keeps sign of dividend incl. -0.0 ((-4.0) % 2.0 = -0.0).",
+  "ansi_behavior": "b==0 throws (int) ; for float ANSI also throws on 0.",
+  "rapids_notes": "Shares GpuDivModLike zero->NULL logic. cuDF BinaryOp.MOD: for floats uses fmod/fmodf (matches Java) but verify -0.0 outputs in differential test.",
+  "whitelist": "v1",
+  "whitelist_reason": "need b==-1 special case for ints; floats via fmod (note: CUDA fmod is exact so equal to Java)",
+  "device_function_hint": "if (b==0) null; ints: b==-1 ? 0 : a % b ; float: fmod(a,b).",
+  "source": "sql-plugin/.../org/apache/spark/sql/rapids/arithmetic.scala"
+ },
+ {
+  "spark_class": "Pmod",
+  "gpu_class": "GpuPmod",
+  "category": "arithmetic",
+  "sql": "pmod(a, b)",
+  "deterministic": true,
+  "rowwise": true,
+  "types": {
+   "in": [
+    "byte",
+    "short",
+    "int",
+    "long",
+    "float",
+    "double"
+   ],
+   "out": "same as left"
+  },
+  "null_semantics": "NULL if either NULL, NULL if b==0",
+  "non_ansi_behavior": "Spark: r = a % b; if (r < 0) (r + b) % b else r. Note for negative b the result can still be negative ((-7) pmod (-3) -> r=-1 -> (-1+-3)%-3=-1). Float NaN: r<0 false -> NaN stays NaN. int overflow in r+b wraps.",
+  "ansi_behavior": "b==0 throws",
+  "rapids_notes": "cuDF BinaryOp.PMOD; semantic equivalence with Spark formula for negative divisor and float edge cases is a differential-test target.",
+  "whitelist": "v1",
+  "whitelist_reason": "same machinery as Remainder; implement literal Spark formula (not cuDF's)",
+  "device_function_hint": "r = rem(a,b) [as Remainder]; if (r < 0) r = rem(r + b, b); return r;  (r+b computed wrapping)",
+  "source": "sql-plugin/.../org/apache/spark/sql/rapids/arithmetic.scala"
+ },
+ {
+  "spark_class": "Greatest",
+  "gpu_class": "GpuGreatest",
+  "category": "arithmetic",
+  "sql": "greatest(a,b,...)",
+  "deterministic": true,
+  "rowwise": true,
+  "types": {
+   "in": [
+    "byte",
+    "short",
+    "int",
+    "long",
+    "float",
+    "double",
+    "date",
+    "timestamp",
+    "boolean"
+   ],
+   "out": "same; >=2 args"
+  },
+  "null_semantics": "NULLs are SKIPPED; result NULL only if all args NULL",
+  "non_ansi_behavior": "NaN is greater than any other value (Greatest returns NaN if any non-null arg is NaN). -0.0 vs 0.0 tie: Spark keeps the earlier (first) arg because comparison is a>b strictly with -0.0 == 0.0 => result sign depends on arg order. cuDF binaryOp NULL_MAX on ties unspecified => differential-test target.",
+  "ansi_behavior": "same",
+  "rapids_notes": "GpuGreatestLeastBase folds pairwise cuDF binaryOp (NULL_MAX/NULL_MIN) then fixes NaN with isNan masks (shouldNanWin=true for Greatest, false for Least).",
+  "whitelist": "v1",
+  "whitelist_reason": "needs tie/-0.0 verification; keep behind test",
+  "device_function_hint": "acc=first non-null; for next valid x: if (!acc_valid || gt(x,acc)) acc=x, where gt(x,y) = isnan(x) ? !isnan(y) : (!isnan(y) && x>y). Least: lt(x,y) = isnan(y) ? !isnan(x) : (!isnan(x) && x<y).",
+  "source": "sql-plugin/.../org/apache/spark/sql/rapids/arithmetic.scala"
+ },
+ {
+  "spark_class": "Least",
+  "gpu_class": "GpuLeast",
+  "category": "arithmetic",
+  "sql": "least(a,b,...)",
+  "deterministic": true,
+  "rowwise": true,
+  "types": {
+   "in": [
+    "byte",
+    "short",
+    "int",
+    "long",
+    "float",
+    "double",
+    "date",
+    "timestamp",
+    "boolean"
+   ],
+   "out": "same"
+  },
+  "null_semantics": "NULLs skipped; NULL only if all NULL",
+  "non_ansi_behavior": "NaN is the LARGEST value so Least ignores NaN unless all non-null args are NaN; ties keep earlier arg.",
+  "ansi_behavior": "same",
+  "rapids_notes": "see Greatest",
+  "whitelist": "v1",
+  "whitelist_reason": "see Greatest",
+  "device_function_hint": "see Greatest",
+  "source": "sql-plugin/.../org/apache/spark/sql/rapids/arithmetic.scala"
+ },
+ {
+  "spark_class": "EqualTo",
+  "gpu_class": "GpuEqualTo",
+  "category": "comparison",
+  "sql": "a = b",
+  "deterministic": true,
+  "rowwise": true,
+  "types": {
+   "in": [
+    "boolean",
+    "byte",
+    "short",
+    "int",
+    "long",
+    "float",
+    "double",
+    "date",
+    "timestamp"
+   ],
+   "out": "boolean"
+  },
+  "null_semantics": "NULL if either NULL (except <=>)",
+  "non_ansi_behavior": "Spark total order for floating point: NaN == NaN is TRUE, NaN > every non-NaN (incl. +Inf), -0.0 == 0.0 is TRUE. (SQLOrderingUtil.compareDoubles). IEEE would give NaN==NaN false.",
+  "ansi_behavior": "same",
+  "rapids_notes": "cuDF EQUAL then ORs (isNan(l) AND isNan(r)). Null rows: result NULL.",
+  "whitelist": "v1",
+  "whitelist_reason": "simple; Spark NaN ordering must be replicated",
+  "device_function_hint": "float: (a==b) || (isnan(a)&&isnan(b)); else a==b",
+  "source": "sql-plugin/.../org/apache/spark/sql/rapids/predicates.scala"
+ },
+ {
+  "spark_class": "GreaterThan",
+  "gpu_class": "GpuGreaterThan",
+  "category": "comparison",
+  "sql": "a > b",
+  "deterministic": true,
+  "rowwise": true,
+  "types": {
+   "in": [
+    "boolean",
+    "byte",
+    "short",
+    "int",
+    "long",
+    "float",
+    "double",
+    "date",
+    "timestamp"
+   ],
+   "out": "boolean"
+  },
+  "null_semantics": "NULL if either NULL (except <=>)",
+  "non_ansi_behavior": "Spark total order for floating point: NaN == NaN is TRUE, NaN > every non-NaN (incl. +Inf), -0.0 == 0.0 is TRUE. (SQLOrderingUtil.compareDoubles). IEEE would give NaN==NaN false.",
+  "ansi_behavior": "same",
+  "rapids_notes": "cuDF GREATER OR (isNan(l) AND isNotNan(r)).",
+  "whitelist": "v1",
+  "whitelist_reason": "simple; Spark NaN ordering must be replicated",
+  "device_function_hint": "float: isnan(a) ? !isnan(b) : (a > b)   [a>b false if b NaN]",
+  "source": "sql-plugin/.../org/apache/spark/sql/rapids/predicates.scala"
+ },
+ {
+  "spark_class": "GreaterThanOrEqual",
+  "gpu_class": "GpuGreaterThanOrEqual",
+  "category": "comparison",
+  "sql": "a >= b",
+  "deterministic": true,
+  "rowwise": true,
+  "types": {
+   "in": [
+    "boolean",
+    "byte",
+    "short",
+    "int",
+    "long",
+    "float",
+    "double",
+    "date",
+    "timestamp"
+   ],
+   "out": "boolean"
+  },
+  "null_semantics": "NULL if either NULL (except <=>)",
+  "non_ansi_behavior": "Spark total order for floating point: NaN == NaN is TRUE, NaN > every non-NaN (incl. +Inf), -0.0 == 0.0 is TRUE. (SQLOrderingUtil.compareDoubles). IEEE would give NaN==NaN false.",
+  "ansi_behavior": "same",
+  "rapids_notes": "cuDF GREATER_EQUAL OR isNan(l).",
+  "whitelist": "v1",
+  "whitelist_reason": "simple; Spark NaN ordering must be replicated",
+  "device_function_hint": "float: isnan(a) || (a >= b)",
+  "source": "sql-plugin/.../org/apache/spark/sql/rapids/predicates.scala"
+ },
+ {
+  "spark_class": "LessThan",
+  "gpu_class": "GpuLessThan",
+  "category": "comparison",
+  "sql": "a < b",
+  "deterministic": true,
+  "rowwise": true,
+  "types": {
+   "in": [
+    "boolean",
+    "byte",
+    "short",
+    "int",
+    "long",
+    "float",
+    "double",
+    "date",
+    "timestamp"
+   ],
+   "out": "boolean"
+  },
+  "null_semantics": "NULL if either NULL (except <=>)",
+  "non_ansi_behavior": "Spark total order for floating point: NaN == NaN is TRUE, NaN > every non-NaN (incl. +Inf), -0.0 == 0.0 is TRUE. (SQLOrderingUtil.compareDoubles). IEEE would give NaN==NaN false.",
+  "ansi_behavior": "same",
+  "rapids_notes": "cuDF LESS OR (isNotNan(l) AND isNan(r)).",
+  "whitelist": "v1",
+  "whitelist_reason": "simple; Spark NaN ordering must be replicated",
+  "device_function_hint": "float: isnan(b) ? !isnan(a) : (a < b)",
+  "source": "sql-plugin/.../org/apache/spark/sql/rapids/predicates.scala"
+ },
+ {
+  "spark_class": "LessThanOrEqual",
+  "gpu_class": "GpuLessThanOrEqual",
+  "category": "comparison",
+  "sql": "a <= b",
+  "deterministic": true,
+  "rowwise": true,
+  "types": {
+   "in": [
+    "boolean",
+    "byte",
+    "short",
+    "int",
+    "long",
+    "float",
+    "double",
+    "date",
+    "timestamp"
+   ],
+   "out": "boolean"
+  },
+  "null_semantics": "NULL if either NULL (except <=>)",
+  "non_ansi_behavior": "Spark total order for floating point: NaN == NaN is TRUE, NaN > every non-NaN (incl. +Inf), -0.0 == 0.0 is TRUE. (SQLOrderingUtil.compareDoubles). IEEE would give NaN==NaN false.",
+  "ansi_behavior": "same",
+  "rapids_notes": "cuDF LESS_EQUAL OR isNan(r).",
+  "whitelist": "v1",
+  "whitelist_reason": "simple; Spark NaN ordering must be replicated",
+  "device_function_hint": "float: isnan(b) || (a <= b)",
+  "source": "sql-plugin/.../org/apache/spark/sql/rapids/predicates.scala"
+ },
+ {
+  "spark_class": "EqualNullSafe",
+  "gpu_class": "GpuEqualNullSafe",
+  "category": "comparison",
+  "sql": "a <=> b",
+  "deterministic": true,
+  "rowwise": true,
+  "types": {
+   "in": [
+    "boolean",
+    "byte",
+    "short",
+    "int",
+    "long",
+    "float",
+    "double",
+    "date",
+    "timestamp"
+   ],
+   "out": "boolean (never NULL)"
+  },
+  "null_semantics": "both NULL -> true; exactly one NULL -> false; else as EqualTo (NaN==NaN true)",
+  "non_ansi_behavior": "as EqualTo",
+  "ansi_behavior": "same",
+  "rapids_notes": "cuDF NULL_EQUALS + NaN fix. nullable=false.",
+  "whitelist": "v1",
+  "whitelist_reason": "simple",
+  "device_function_hint": "valid=true; r = (va&&vb) ? eq(a,b) : (!va && !vb)",
+  "source": "sql-plugin/.../org/apache/spark/sql/rapids/predicates.scala"
+ },
+ {
+  "spark_class": "And",
+  "gpu_class": "GpuAnd",
+  "category": "logical",
+  "sql": "a AND b",
+  "deterministic": true,
+  "rowwise": true,
+  "types": {
+   "in": [
+    "boolean"
+   ],
+   "out": "boolean"
+  },
+  "null_semantics": "3-valued: F AND NULL = F; NULL AND F = F; T AND NULL = NULL; NULL AND NULL = NULL",
+  "non_ansi_behavior": "Spark CPU short-circuits (right not evaluated if left is false) - only matters for errors/side effects",
+  "ansi_behavior": "same",
+  "rapids_notes": "cuDF NULL_LOGICAL_AND. If right child hasSideEffects (ANSI errors) GPU evaluates right only on rows where left is not false (filter/gather). v1 forbids side-effecting children so plain both-sides evaluation is equivalent.",
+  "whitelist": "v1",
+  "whitelist_reason": "simple (children must be side-effect free)",
+  "device_function_hint": "if ((va && !a) || (vb && !b)) {r=false; valid=true} else if (va && vb) {r=true; valid=true} else valid=false",
+  "source": "sql-plugin/.../org/apache/spark/sql/rapids/predicates.scala"
+ },
+ {
+  "spark_class": "Or",
+  "gpu_class": "GpuOr",
+  "category": "logical",
+  "sql": "a OR b",
+  "deterministic": true,
+  "rowwise": true,
+  "types": {
+   "in": [
+    "boolean"
+   ],
+   "out": "boolean"
+  },
+  "null_semantics": "T OR NULL = T; NULL OR T = T; F OR NULL = NULL",
+  "non_ansi_behavior": "short-circuit on CPU",
+  "ansi_behavior": "same",
+  "rapids_notes": "cuDF NULL_LOGICAL_OR; side-effect branch handling as And",
+  "whitelist": "v1",
+  "whitelist_reason": "simple",
+  "device_function_hint": "if ((va && a) || (vb && b)) {r=true; valid=true} else if (va && vb) {r=false; valid=true} else valid=false",
+  "source": "sql-plugin/.../org/apache/spark/sql/rapids/predicates.scala"
+ },
+ {
+  "spark_class": "Not",
+  "gpu_class": "GpuNot",
+  "category": "logical",
+  "sql": "NOT a",
+  "deterministic": true,
+  "rowwise": true,
+  "types": {
+   "in": [
+    "boolean"
+   ],
+   "out": "boolean"
+  },
+  "null_semantics": "NULL -> NULL",
+  "non_ansi_behavior": "",
+  "ansi_behavior": "",
+  "rapids_notes": "cuDF UnaryOp.NOT",
+  "whitelist": "v1",
+  "whitelist_reason": "simple",
+  "device_function_hint": "valid=va; r=!a",
+  "source": "sql-plugin/.../org/apache/spark/sql/rapids/predicates.scala"
+ },
+ {
+  "spark_class": "In",
+  "gpu_class": "GpuIn / GpuInSet",
+  "category": "predicate",
+  "sql": "a IN (1,2,3)",
+  "deterministic": true,
+  "rowwise": true,
+  "types": {
+   "in": [
+    "bool,int types,float,double,date,timestamp (literal lists; strings excluded v1)"
+   ],
+   "out": "boolean"
+  },
+  "null_semantics": "a NULL -> NULL; a found -> TRUE; not found and list contains NULL -> NULL; not found -> FALSE",
+  "non_ansi_behavior": "float: NaN IN (NaN) is TRUE (NaN equality); -0.0 matches 0.0",
+  "ansi_behavior": "same",
+  "rapids_notes": "GpuInSet uses cudf contains with NaN handling; In with non-literal list (<=256) uses AST-fused equality+OR. Large literal lists (OptimizeIn -> InSet) use hash set semantic - cap list length in v1 (e.g. <=16 unrolled compares).",
+  "whitelist": "v1",
+  "whitelist_reason": "expand to OR chain of EqualTo; cap list size",
+  "device_function_hint": "r=false; any_null=!va... : if(!va) null; else {found = OR(eq(a, lit_i)); if (found) true else if (list_has_null) null else false}",
+  "source": "GpuIn.scala"
+ },
+ {
+  "spark_class": "If",
+  "gpu_class": "GpuIf",
+  "category": "conditional",
+  "sql": "IF(p, t, f)",
+  "deterministic": true,
+  "rowwise": true,
+  "types": {
+   "in": [
+    "boolean",
+    "any fixed-width t/f of same type"
+   ],
+   "out": "type of t/f"
+  },
+  "null_semantics": "predicate NULL -> take FALSE branch; result is validity of the chosen branch",
+  "non_ansi_behavior": "Only the chosen branch is observable. If either branch hasSideEffects (ANSI errors) GPU filters rows per branch to avoid spurious errors.",
+  "ansi_behavior": "same",
+  "rapids_notes": "GpuIf: no side effects => evaluates BOTH branches on all rows then cuDF ifElse (pred null treated as false). With side effects: isAllTrue/isAllFalse shortcuts + filter/gather (conditionalExpressions.scala:177+).",
+  "whitelist": "v1",
+  "whitelist_reason": "branch-per-row in kernel is strictly safer than GPU unfused evaluation; v1 requires both branches side-effect-free so result identical",
+  "device_function_hint": "valid_p && p ? eval(t) : eval(f)  (evaluate ONLY chosen branch in kernel, branch divergence acceptable).",
+  "source": "sql-plugin/.../com/nvidia/spark/rapids/conditionalExpressions.scala"
+ },
+ {
+  "spark_class": "CaseWhen",
+  "gpu_class": "GpuCaseWhen",
+  "category": "conditional",
+  "sql": "CASE WHEN c1 THEN v1 ... ELSE e END",
+  "deterministic": true,
+  "rowwise": true,
+  "types": {
+   "in": [
+    "boolean conds",
+    "same-typed values"
+   ],
+   "out": "value type"
+  },
+  "null_semantics": "first branch whose condition is TRUE (NULL cond = not taken) wins; no ELSE -> NULL",
+  "non_ansi_behavior": "short-circuit by order; side-effect branches filtered on GPU",
+  "ansi_behavior": "same",
+  "rapids_notes": "GpuCaseWhen has an optional 'fuse' path (caseWhenFuseEnabled, >2 branches, all-literal values) and a side-effect-aware path. Output nullable if any branch nullable or no else.",
+  "whitelist": "v1",
+  "whitelist_reason": "lowered to chain of Ifs",
+  "device_function_hint": "for each i: if (valid_ci && c_i) return v_i; return else or NULL.",
+  "source": "sql-plugin/.../com/nvidia/spark/rapids/conditionalExpressions.scala"
+ },
+ {
+  "spark_class": "Coalesce",
+  "gpu_class": "GpuCoalesce",
+  "category": "null-handling",
+  "sql": "coalesce(a,b,...)",
+  "deterministic": true,
+  "rowwise": true,
+  "types": {
+   "in": [
+    "any same-typed"
+   ],
+   "out": "same"
+  },
+  "null_semantics": "first non-NULL argument; NULL if all NULL",
+  "non_ansi_behavior": "CPU stops at first non-null; GPU evaluates all children (GpuNvl folded right-to-left) - difference only visible with side effects (excluded)",
+  "ansi_behavior": "same",
+  "rapids_notes": "GpuNvl: replaceNulls fold.",
+  "whitelist": "v1",
+  "whitelist_reason": "simple",
+  "device_function_hint": "for each child in order: if valid -> return; return NULL",
+  "source": "sql-plugin/.../com/nvidia/spark/rapids/nullExpressions.scala"
+ },
+ {
+  "spark_class": "IsNull",
+  "gpu_class": "GpuIsNull",
+  "category": "null-handling",
+  "sql": "a IS NULL",
+  "deterministic": true,
+  "rowwise": true,
+  "types": {
+   "in": [
+    "any"
+   ],
+   "out": "boolean (non-null)"
+  },
+  "null_semantics": "never NULL",
+  "non_ansi_behavior": "",
+  "ansi_behavior": "",
+  "rapids_notes": "",
+  "whitelist": "v1",
+  "whitelist_reason": "simple",
+  "device_function_hint": "valid=true; r=!va",
+  "source": "sql-plugin/.../com/nvidia/spark/rapids/nullExpressions.scala"
+ },
+ {
+  "spark_class": "IsNotNull",
+  "gpu_class": "GpuIsNotNull",
+  "category": "null-handling",
+  "sql": "a IS NOT NULL",
+  "deterministic": true,
+  "rowwise": true,
+  "types": {
+   "in": [
+    "any"
+   ],
+   "out": "boolean (non-null)"
+  },
+  "null_semantics": "never NULL",
+  "non_ansi_behavior": "",
+  "ansi_behavior": "",
+  "rapids_notes": "",
+  "whitelist": "v1",
+  "whitelist_reason": "simple",
+  "device_function_hint": "valid=true; r=va",
+  "source": "sql-plugin/.../com/nvidia/spark/rapids/nullExpressions.scala"
+ },
+ {
+  "spark_class": "IsNaN",
+  "gpu_class": "GpuIsNan",
+  "category": "null-handling",
+  "sql": "isnan(a)",
+  "deterministic": true,
+  "rowwise": true,
+  "types": {
+   "in": [
+    "float",
+    "double"
+   ],
+   "out": "boolean (non-null)"
+  },
+  "null_semantics": "NULL input -> FALSE (never NULL)",
+  "non_ansi_behavior": "",
+  "ansi_behavior": "",
+  "rapids_notes": "cuDF isNan; nulls produce false in Spark (IsNaN null-> false).",
+  "whitelist": "v1",
+  "whitelist_reason": "simple",
+  "device_function_hint": "valid=true; r=va && isnan(a)",
+  "source": "sql-plugin/.../com/nvidia/spark/rapids/nullExpressions.scala"
+ },
+ {
+  "spark_class": "NaNvl",
+  "gpu_class": "GpuNaNvl",
+  "category": "null-handling",
+  "sql": "nanvl(a,b)",
+  "deterministic": true,
+  "rowwise": true,
+  "types": {
+   "in": [
+    "float",
+    "double"
+   ],
+   "out": "same"
+  },
+  "null_semantics": "a NULL -> NULL(!) (Spark: if a null -> null; if a NaN -> b else a); b only used when a is NaN",
+  "non_ansi_behavior": "",
+  "ansi_behavior": "",
+  "rapids_notes": "cuDF: isNotNan(a).ifElse(a,b). NOTE cuDF isNotNan(null) semantic: verify (null a must give NULL result).",
+  "whitelist": "v1",
+  "whitelist_reason": "simple (verify null)",
+  "device_function_hint": "if(!va) null; else if (isnan(a)) b(with validity) else a",
+  "source": "sql-plugin/.../com/nvidia/spark/rapids/nullExpressions.scala"
+ },
+ {
+  "spark_class": "AtLeastNNonNulls",
+  "gpu_class": "GpuAtLeastNNonNulls",
+  "category": "null-handling",
+  "sql": "DataFrame.na.drop(minNonNulls)",
+  "deterministic": true,
+  "rowwise": true,
+  "types": {
+   "in": [
+    "any"
+   ],
+   "out": "boolean"
+  },
+  "null_semantics": "non-null & non-NaN counted",
+  "non_ansi_behavior": "NaN counted as null for float/double",
+  "ansi_behavior": "",
+  "rapids_notes": "sum of casts",
+  "whitelist": "v2",
+  "whitelist_reason": "used by na.drop only; low priority",
+  "device_function_hint": "count(valid && !isnan) >= n",
+  "source": "sql-plugin/.../com/nvidia/spark/rapids/nullExpressions.scala"
+ },
+ {
+  "spark_class": "NormalizeNaNAndZero",
+  "gpu_class": "GpuNormalizeNaNAndZero",
+  "category": "float",
+  "sql": "(internal) normalize NaN/-0.0",
+  "deterministic": true,
+  "rowwise": true,
+  "types": {
+   "in": [
+    "float",
+    "double"
+   ],
+   "out": "same"
+  },
+  "null_semantics": "propagates",
+  "non_ansi_behavior": "-0.0 -> 0.0; any NaN -> canonical NaN",
+  "ansi_behavior": "",
+  "rapids_notes": "Inserted by Spark for join/group keys.",
+  "whitelist": "v1",
+  "whitelist_reason": "cheap",
+  "device_function_hint": "r = isnan(a) ? CANONICAL_NAN : (a == 0 ? 0.0 : a)",
+  "source": "GpuMathAndDateExpressionRuleMetas.scala:667"
+ },
+ {
+  "spark_class": "KnownFloatingPointNormalized/KnownNotNull",
+  "gpu_class": "GpuKnown*",
+  "category": "tag",
+  "sql": "(internal tag)",
+  "deterministic": true,
+  "rowwise": true,
+  "types": {
+   "in": [
+    "any"
+   ],
+   "out": "same"
+  },
+  "null_semantics": "identity (tag)",
+  "non_ansi_behavior": "",
+  "ansi_behavior": "",
+  "rapids_notes": "ShimTaggingExpression: pure pass-through",
+  "whitelist": "v1",
+  "whitelist_reason": "identity",
+  "device_function_hint": "identity",
+  "source": "constraintExpressions.scala"
+ },
+ {
+  "spark_class": "Nvl/IfNull/Nvl2/NullIf (RuntimeReplaceable)",
+  "gpu_class": "(rewritten to Coalesce/If/CaseWhen by Spark optimizer)",
+  "category": "null-handling",
+  "sql": "nvl(a,b), nullif(a,b)",
+  "deterministic": true,
+  "rowwise": true,
+  "types": {
+   "in": [
+    "any"
+   ],
+   "out": "same"
+  },
+  "null_semantics": "see Coalesce/If/EqualTo",
+  "non_ansi_behavior": "",
+  "ansi_behavior": "",
+  "rapids_notes": "Never appear in physical plan; covered by rewrite targets.",
+  "whitelist": "v1",
+  "whitelist_reason": "covered",
+  "device_function_hint": "n/a",
+  "source": ""
+ },
+ {
+  "spark_class": "Rand/Randn/Uuid/Shuffle",
+  "gpu_class": "-",
+  "category": "excluded",
+  "sql": "",
+  "deterministic": true,
+  "rowwise": true,
+  "types": {
+   "in": [],
+   "out": ""
+  },
+  "null_semantics": "",
+  "non_ansi_behavior": "",
+  "ansi_behavior": "",
+  "rapids_notes": "",
+  "whitelist": "no",
+  "whitelist_reason": "non-deterministic, stateful per partition (GpuNondeterministic.initializeAll)",
+  "device_function_hint": "",
+  "source": ""
+ },
+ {
+  "spark_class": "MonotonicallyIncreasingID/SparkPartitionID/InputFileName/InputFileBlockStart/Length",
+  "gpu_class": "-",
+  "category": "excluded",
+  "sql": "",
+  "deterministic": true,
+  "rowwise": true,
+  "types": {
+   "in": [],
+   "out": ""
+  },
+  "null_semantics": "",
+  "non_ansi_behavior": "",
+  "ansi_behavior": "",
+  "rapids_notes": "",
+  "whitelist": "no",
+  "whitelist_reason": "depend on task/partition state; spark-rapids has special rules (InputFileBlockRule)",
+  "device_function_hint": "",
+  "source": ""
+ },
+ {
+  "spark_class": "ScalaUDF / PythonUDF / RapidsUDF (opaque)",
+  "gpu_class": "-",
+  "category": "excluded",
+  "sql": "",
+  "deterministic": true,
+  "rowwise": true,
+  "types": {
+   "in": [],
+   "out": ""
+  },
+  "null_semantics": "",
+  "non_ansi_behavior": "",
+  "ansi_behavior": "",
+  "rapids_notes": "",
+  "whitelist": "no",
+  "whitelist_reason": "black box; Scala UDFs only fusible after udf-compiler translated them to Catalyst expressions (done at logical plan level)",
+  "device_function_hint": "",
+  "source": ""
+ },
+ {
+  "spark_class": "Decimal arithmetic (CheckOverflow, MakeDecimal, UnscaledValue, DecimalDivide/Multiply, PromotePrecision)",
+  "gpu_class": "-",
+  "category": "excluded",
+  "sql": "",
+  "deterministic": true,
+  "rowwise": true,
+  "types": {
+   "in": [],
+   "out": ""
+  },
+  "null_semantics": "",
+  "non_ansi_behavior": "",
+  "ansi_behavior": "",
+  "rapids_notes": "",
+  "whitelist": "no",
+  "whitelist_reason": "128-bit math, overflow->NULL rules, precision/scale intermediate casts (see arithmetic.scala DecimalMultiplyChecks); v2",
+  "device_function_hint": "",
+  "source": ""
+ },
+ {
+  "spark_class": "String / array / map / struct expressions",
+  "gpu_class": "-",
+  "category": "excluded",
+  "sql": "",
+  "deterministic": true,
+  "rowwise": true,
+  "types": {
+   "in": [],
+   "out": ""
+  },
+  "null_semantics": "",
+  "non_ansi_behavior": "",
+  "ansi_behavior": "",
+  "rapids_notes": "",
+  "whitelist": "no",
+  "whitelist_reason": "variable length / nested layouts; out of scope v1",
+  "device_function_hint": "",
+  "source": ""
+ },
+ {
+  "spark_class": "ANSI-mode arithmetic & casts (failOnError=true)",
+  "gpu_class": "-",
+  "category": "excluded",
+  "sql": "",
+  "deterministic": true,
+  "rowwise": true,
+  "types": {
+   "in": [],
+   "out": ""
+  },
+  "null_semantics": "",
+  "non_ansi_behavior": "",
+  "ansi_behavior": "",
+  "rapids_notes": "",
+  "whitelist": "no",
+  "whitelist_reason": "hasSideEffects=true (throws). GPU reports error only after whole column checked; row index semantics differ. v2 via error flag",
+  "device_function_hint": "",
+  "source": ""
+ },
+ {
+  "spark_class": "Hash functions (Murmur3Hash, XxHash64, Md5, Sha*)",
+  "gpu_class": "-",
+  "category": "excluded",
+  "sql": "",
+  "deterministic": true,
+  "rowwise": true,
+  "types": {
+   "in": [],
+   "out": ""
+  },
+  "null_semantics": "",
+  "non_ansi_behavior": "",
+  "ansi_behavior": "",
+  "rapids_notes": "",
+  "whitelist": "no",
+  "whitelist_reason": "not-in-scope for v1; murmur3 on numeric would be a v2 candidate (needs identical seed/null handling)",
+  "device_function_hint": "",
+  "source": ""
+ }
+]
