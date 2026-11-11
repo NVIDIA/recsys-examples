@@ -554,11 +554,26 @@ only ~5%:
 
 `benchmark_distributed_embedding_collection.py` times a row-wise sharded
 `EmbeddingCollection` of DynamicEmb tables (all in HBM: no caching, no host
-memory) across GPUs and nodes, one process per GPU. Every iteration feeds a
-fresh batch with random sequence lengths and keys, so the amount each GPU
-sends and receives changes from one iteration to the next. It runs a plain
-training loop or one of TorchRec's train pipelines, with one of these ways
-to move keys and rows between GPUs (`--output_dist`):
+memory) across GPUs and nodes, one process per GPU. It times the embedding
+alone. Before the run, each GPU draws two batches with random sequence
+lengths and keys, and the iterations take them in turn. So the amount each
+GPU sends and receives changes from one iteration to the next, and no
+iteration repeats the one before it, whose keys and rows the GPU's caches
+may still hold. From the third call on (every timed one, with `--warmup` 2
+or more), the keys a lookup asks for are already in its table, where the
+first two calls put them: the timed lookups find their keys instead of
+inserting them, in tables that hold only the two batches' keys (about 24%
+of the key range on one node at the configuration below, 66% on four). This
+is the same for every dist. No loss is computed. The forward returns a zero
+in its place, and the backward gives each looked-up row a gradient drawn
+once before the run: +1 or -1 per element, from `--seed` and the rank, so
+every dist gets the same. At many features the step still holds the host's
+work of handing each feature's rows their gradient (a loop over the
+features and an autograd edge per feature, about 1 µs per feature), as any
+consumer of the EC's per-feature output would. It runs a plain training
+loop (the forward, then `backward()` on that zero, each timed on its own) or
+one of TorchRec's train pipelines, with one of these ways to move keys and
+rows between GPUs (`--output_dist`):
 
 * `torchrec`: TorchRec's input and output dists (bucketize and NCCL
   all-to-alls; reorder, all-to-all, `index_select`).
@@ -688,6 +703,13 @@ On 2 nodes the backward reaches 84% because of the ring's laps: a ring that
 holds the stream in one lap (`DYNAMICEMB_HIER_PROXY_MB=12288`) gives
 28.55 ms there (47.1 GB/s, 94%, in 2 runs); on 4 nodes the laps cost little.
 
+The many-features and multi-hot tables below were measured with the
+previous loop, and will be re-measured with the loop above. That loop drew
+a new batch for every iteration, so its lookups kept inserting new keys
+into tables that filled toward their capacity, and its loss summed each
+feature's rows on its own (two or three kernels per feature: a sum, with a
+memset before it when the feature is large, and an add).
+
 Many features. These runs keep the keys per GPU about the same while the
 features grow: 8 tables of 4,000,000 rows (dim 128, fp32, SGD), each with
 `--features_per_table` P features (F = 8P in all), index dedup, plain loop,
@@ -746,11 +768,12 @@ One run of each point. TorchRec's dists are the same before and after.
 * The input dist at 4,096 features takes 1.3-1.5 ms on 2 and 4 nodes
   (0.5-0.7 ms more than at 8 features), against 12.2 and 23.6 ms for
   TorchRec's.
-* At many features the step is the benchmark's own model: it makes and
-  sums a JaggedTensor per feature, so its host work grows with the features,
-  and at 4,096 features the ranks reach the backward kernel 12-16 ms apart
-  (the median rank's backward kernel is that much longer). The step of one
-  run varies by a few ms for that reason.
+* At many features the step was mostly the previous loop's host work: the
+  EC made a JaggedTensor per feature and the loss summed each one on its
+  own, so that work grew with the features, and at 4,096 features the ranks
+  reached the backward kernel 12-16 ms apart (the median rank's backward
+  kernel was that much longer). The step of one run varied by a few ms for
+  that reason.
 
 Three rounds on another set of four nodes, before and after in
 alternating order, give the same picture (medians over the rounds, in ms):
@@ -802,11 +825,11 @@ Three rounds on four nodes, before and after in alternating order
   as `--profile_iterations` counts them on rank 0.
 * At 4,096 × 1,024 on 4 nodes the step after is 6 ms longer while its
   input dist is shorter and its kernels take the same time. The step there
-  is the benchmark's host work, which differs between ranks: in both trees
-  the ranks of one or two nodes reach the backward kernel last, and the
-  others wait for them in it (averaged over the ranks, the backward kernel
-  takes 26-31 ms in the rounds before and 27-37 ms after; on the rank that
-  arrives last, 20.8-21.0 ms in every round of both).
+  is the previous loop's host work, which differs between ranks: in both
+  trees the ranks of one or two nodes reach the backward kernel last, and
+  the others wait for them in it (averaged over the ranks, the backward
+  kernel takes 26-31 ms in the rounds before and 27-37 ms after; on the
+  rank that arrives last, 20.8-21.0 ms in every round of both).
 
 Multi-hot at many features. The same tables and loop as the many-features
 runs, with several keys per sample: 1 to 4 (uniform) at four of the large
@@ -850,8 +873,9 @@ The hierarchical dist's step, part by part: the input dist
 (`in_seg_ms_mean`), the output dist's kernels as the rank that arrives
 last runs them (as above), and from its first round's profiled iterations
 the lookup's forward and backward kernels and the model's own kernels
-(GPU time per iteration, mean over the ranks); the rest is the step's
-other time, mostly the benchmark model's host work. In ms:
+(`fwd/other` and `bwd/other`, mostly the previous loop's loss; GPU time per
+iteration, mean over the ranks); the rest is the step's other time, mostly
+that loop's host work. In ms:
 
 | features × batch (keys per sample) | nodes | step | input dist | lookup fwd | output dist fwd | output dist bwd | lookup bwd | model kernels | rest |
 |---|---|---|---|---|---|---|---|---|---|
@@ -884,8 +908,8 @@ other time, mostly the benchmark model's host work. In ms:
   node at 1.3 million keys (1.67 and 1.88 ms).
 * On 2 nodes, at 8.7 and 10.5 million keys, the backward kernel takes
   about 30% longer than the forward (on 4 nodes, 1% to 5%).
-* At 4,096 features the rest, the benchmark model's host work, is 45 to
-  69 ms of the step.
+* At 4,096 features the rest, mostly the previous loop's host work, is 45
+  to 69 ms of the step.
 
 #### Options
 
@@ -908,9 +932,9 @@ other time, mostly the benchmark model's host work. In ms:
 | `--use_index_dedup` | off | TorchRec's index dedup: each rank removes its own repeated keys before the input dist. A call on the hierarchical dist (`hierarchical`, `auto`, `--check`) does so without it too |
 | `--optimizer`, `--learning_rate` | `sgd`, 0.01 | `sgd`, `adam`, `exact_adagrad` or `rowwise_adagrad` |
 | `--num_iterations`, `--warmup` | 30, 10 | timed and untimed iterations, at least 1 each |
-| `--seed` | 1234 | seed of the batches (different for each rank) |
+| `--seed` | 1234 | seed of the batches and of the output gradients (different for each rank) |
 | `--profile_iterations` | 5 | that many more iterations under `torch.profiler`, for the per-stage kernel times and counts; 0 skips them |
-| `--check` | off | Before timing, train 4 steps of two models side by side: one on TorchRec's dists, and one on the hierarchical dist (`--output_dist`'s, or `hierarchical` when that is `torchrec`), both with `--use_index_dedup` or both without it. Both start from the DEBUG initializer, where a key's row is a function of the key. They use SGD at learning rate 1, and keys from an eighth of the table, so nothing is evicted. The capacities are `--capacity`, or measured on the check's own batches. Then print PASSED or FAILED. Outputs must match bit for bit when `--emb_dtype` and `--output_dtype` are both `fp32` and the world size is a power of two. Otherwise they must match bit for bit at the first step, and within 1e-2 after it. The checked model must also have launched its own output dist's kernels at every step, both ways. A sharding that took TorchRec's dists (one rank, for example) prints `FAILED (the <dist> model fell back to TorchRec's dists)`, where `<dist>` is `hierarchical` or `auto`. A failure exits with status 1. |
+| `--check` | off | Before timing, train 4 steps of two models side by side: one on TorchRec's dists, and one on the hierarchical dist (`--output_dist`'s, or `hierarchical` when that is `torchrec`), both with `--use_index_dedup` or both without it. Both start from the DEBUG initializer, where a key's row is a function of the key. They use SGD at learning rate 1, the same output gradients (+1 or -1 per element, as in the timed run), and keys from an eighth of the table, so nothing is evicted. The capacities are `--capacity`, or measured on the check's own batches. Then print PASSED or FAILED. Outputs must match bit for bit when `--emb_dtype` and `--output_dtype` are both `fp32` and the world size is a power of two. Otherwise they must match bit for bit at the first step, and within 1e-2 after it. The checked model must also have launched its own output dist's kernels at every step, both ways. A sharding that took TorchRec's dists (one rank, for example) prints `FAILED (the <dist> model fell back to TorchRec's dists)`, where `<dist>` is `hierarchical` or `auto`. A failure exits with status 1. |
 | `--trace` | off | The hierarchical dist's kernel timelines. It needs DynamicEmb built with `DYNAMICEMB_HIER_TRACE=1` (`docs/hier_output_dist.md`, section 4.4), and else stops with `--trace: rebuild with DYNAMICEMB_HIER_TRACE=1`. It keeps the timelines of the last 64 calls of each direction (every timed call at 64 iterations or fewer), and puts every rank's time stamps on rank 0's clock. It reports the traced metrics below (IB, NVLink and their overlap). A traced build traces every output-dist kernel: two memsets per kernel and counters in shared memory; `--trace` adds two clock stamps per input dist. So its times and kernel counts do not compare with an untraced build's. |
 | `--trace_out` | none | with `--trace`: save every rank's traced kernels of the timed iterations to this `.npz` file, for offline analysis |
 | `--kernel_times` | off | After the timed iterations, as many again under a CUDA-only profiler. It reports every call's output-dist kernel times, with their wait at the start for the other ranks (the hierarchical dist only). |
@@ -929,7 +953,7 @@ names are in backticks. The JSON line holds more than these measures.
 |---|---|---|
 | step | `iter_ms_host` | Wall time of the timed iterations divided by their number, on rank 0 (`time.perf_counter` around the loop, which ends with a device sync), for the plain loop or a pipeline. |
 | input-dist segment | `in_seg_ms_mean`, `in_seg_ms_per_call`, `in_seg_steps_ms` | Plain loop. Four CUDA events on the caller's stream: before `input_dist()`, after it, after the first wait, and after the second wait, when the lookup may start. The segment runs from the first event to the last, idle time from host syncs included. `in_seg_ms_mean` is its mean over calls and ranks, `in_seg_ms_per_call` holds every call, and `in_seg_steps_ms` the three steps. TorchRec's input dist is measured the same way. The first timed call is slow on every dist, because the GPU waits for the CPU when the loop starts. |
-| stages | `stages` | Profiled iterations: per stage of the forward or the backward (`fwd/input_dist`, `fwd/lookup`, `bwd/output_dist`, ...), the GPU ms per iteration of its kernels (`ms`) and their count (`kernels`), the mean over ranks. `net_ms` is the time of the output dist's kernels that move rows between GPUs: NCCL's, or `fwd_kernel` and `bwd_kernel`. |
+| stages | `stages` | Profiled iterations: per stage of the forward or the backward (`fwd/input_dist`, `fwd/lookup`, `bwd/output_dist`, ...), the GPU ms per iteration of its kernels (`ms`) and their count (`kernels`), the mean over ranks. `fwd/other` holds the kernels outside every stage and every autograd node: the zero the model returns for a loss, and the scalar gradient `backward()` starts from (under a pipeline, also its sum of the losses). `bwd/other` holds those of the backward's other nodes: the backward of the EC's per-feature split (a cat of the gradients). `net_ms` is the time of the output dist's kernels that move rows between GPUs: NCCL's, or `fwd_kernel` and `bwd_kernel`. |
 | output dist, events | `output_dist_event_ms_median` | Plain loop, `hierarchical`: CUDA events right before and after the output dist's forward and backward launches, in the timed iterations, with no profiler running; the median over calls of the mean over ranks. They hold the kernel's wait at its start for the other ranks and, when the GPU is idle at the launch, the launch's own CPU time. |
 | output-dist kernels | `output_dist_kernel_ms_median` | `--kernel_times`: the GPU ms of every call's forward kernel and backward kernels (the heavy rows' two included) under a CUDA-only profiler, the median over calls. |
 | rows per iteration | `traffic_mean`, `traffic_max` | The output dist's rows of the timed iterations, per rank and iteration: the mean or the most over the ranks (`traffic_per_rank` holds each rank's). `hierarchical`: `rows_self`, the rows it asks of itself as owner; `rows_nvlink`, the rows it pulls from its node peers; `rows_served`, the rows other GPUs ask of it as owner; across nodes `rows_ib_out` and `rows_ib_in`, the rows its NIC puts and receives in the forward (the backward moves them the other way), `rows_ib`, the larger of the two, `rows_remote`, the rows of its proxy's stream, and `chunks`, that stream's chunks per call. `torchrec`: the forward's rows to itself, to its node peers and to other nodes (`rows_self`, `rows_nvlink`, `rows_ib`), and from other nodes (`rows_ib_in`). |
@@ -979,7 +1003,7 @@ calls.
 
 | metric | JSON field | definition |
 |---|---|---|
-| reserved_max | `mem_reserved_max_bytes` | The most that PyTorch's caching allocator reserved during the timed iterations, all told (the batches included). |
+| reserved_max | `mem_reserved_max_bytes` | The most that PyTorch's caching allocator reserved during the timed iterations, all told (the batches and their output gradients included: `mem_input_bytes`, `mem_grad_bytes`). |
 | windows | `mem_window_bytes` | The window of each hierarchical sharding, summed (its op's `memory()["windows"]`: `docs/hier_output_dist.md`, section 7.1), from `ncclMemAlloc`, outside the allocator. |
 | reserved + windows | `mem_total_reserved_bytes` | The two together. |
 | device memory in use | `mem_device_used_bytes` | From `cudaMemGetInfo`, after the timed iterations (and at earlier checkpoints): the CUDA context, NCCL's communicators and buffers, the windows, the tables and PyTorch's memory. |

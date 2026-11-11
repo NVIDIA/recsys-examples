@@ -14,10 +14,15 @@
 # limitations under the License.
 """Multi-GPU benchmark for a row-wise sharded DynamicEmb EmbeddingCollection.
 
-Every table lives entirely in HBM (no caching, no host memory). Each
-iteration feeds a fresh batch whose sequence lengths and keys are drawn at
-random, so the amount of data every rank sends and receives changes from one
-iteration to the next.
+Every table lives entirely in HBM (no caching, no host memory), and only
+the embedding is timed. Each rank draws two batches whose sequence lengths
+and keys are random, and the iterations take them in turn, so the amount of
+data every rank sends and receives changes from one iteration to the next,
+and no iteration repeats the one before it. From the third call on, the
+lookups find their keys in the tables (the first two calls inserted them),
+which hold only the two batches' keys. No loss is computed: the backward
+gives the looked-up rows gradients drawn once, before the run
+(``inject_grads``).
 
 Launch with torchrun or srun, one process per GPU::
 
@@ -102,6 +107,12 @@ _PIPELINES = {
     "sparse_dist": TrainPipelineSparseDist,
     "prefetch": PrefetchTrainPipelineSparseDist,
 }
+# The batches each rank draws, which the calls take in turn (call i takes
+# batch i % _NUM_BATCHES): two, so that no call repeats the one before it,
+# whose keys and rows the GPU's caches may still hold. From the third call
+# on, the lookups find their keys in the tables (the first two inserted
+# them).
+_NUM_BATCHES = 2
 
 
 @dataclass
@@ -164,7 +175,7 @@ def feature_name(i: int) -> str:
 def generate_batches(
     cfg: BenchConfig, rank: int, device: torch.device, num_batches: int
 ) -> List[torchrec.KeyedJaggedTensor]:
-    """One KJT per iteration: ``num_tables * features_per_table`` features x
+    """``num_batches`` KJTs: ``num_tables * features_per_table`` features x
     ``local_batch_size`` samples, each sample holding a sequence of keys.
 
     ``seq_len_dist`` decides the sequence lengths: ``fixed`` (all equal to
@@ -201,36 +212,114 @@ def generate_batches(
     return batches
 
 
+def with_output_grads(
+    cfg: BenchConfig,
+    rank: int,
+    device: torch.device,
+    batches: List[torchrec.KeyedJaggedTensor],
+) -> List["Batch"]:
+    """``batches`` with the gradients their embeddings get in the backward
+    (:func:`inject_grads`), drawn here, once. They come from one buffer of
+    this rank's: as many rows as the largest batch has keys,
+    ``embedding_dim`` columns, in the lookup's output dtype, each element +1
+    or -1 (exact in every dtype, which ``--check`` needs). Its generator is
+    its own, seeded by ``cfg.seed`` and ``rank``, so every run of a
+    configuration gets the same, whatever its dists. A batch's gradients are
+    the buffer's first rows, one per key, split by feature as the sequence
+    EC's output is (each feature's keys, in the KJT's order).
+    """
+    # keys per feature and batch, from the lengths (every feature has the
+    # same samples): a KJT keeps the totals it is asked for, and a call on
+    # it must find its own
+    counts = [
+        kjt.lengths().view(len(kjt.keys()), -1).sum(dim=1).tolist() for kjt in batches
+    ]
+    # seeded apart from the batches (generate_batches)
+    generator = torch.Generator(device=device)
+    generator.manual_seed(cfg.seed * 7919 + rank + (1 << 32))
+    grad = torch.randint(
+        0,
+        2,
+        (max(sum(per_feature) for per_feature in counts), cfg.embedding_dim),
+        generator=generator,
+        device=device,
+        dtype=_OUTPUT_DTYPES[cfg.output_dtype].as_dtype(),
+    )
+    grad.mul_(2).sub_(1)
+    out = []
+    for kjt, per_feature in zip(batches, counts):
+        rows = grad[: sum(per_feature)]
+        grads = dict(zip(kjt.keys(), rows.split(per_feature)))
+        out.append(Batch(kjt, rows, grads))
+    return out
+
+
 # ── model ───────────────────────────────────────────────────────────────────
 
 
 class Batch(Pipelineable):
-    """One iteration's input, as TorchRec's train pipelines move it."""
+    """One call's input, as TorchRec's train pipelines move it: the
+    features, and the gradients their embeddings get in the backward
+    (:func:`inject_grads`): ``grad``, a row per key, and ``grads``, each
+    feature's rows of it (views), by feature name."""
 
-    def __init__(self, features: torchrec.KeyedJaggedTensor) -> None:
+    def __init__(
+        self,
+        features: torchrec.KeyedJaggedTensor,
+        grad: torch.Tensor,
+        grads: Dict[str, torch.Tensor],
+    ) -> None:
         self.features = features
+        self.grad = grad
+        self.grads = grads
+
+    def fresh(self) -> "Batch":
+        """The same batch on a KJT of its own (the same tensors): a call
+        leaves totals on the KJT it takes (``length_per_key`` and the like),
+        which a later call on that KJT would find, and no call on a new
+        batch does."""
+        kjt = self.features
+        return Batch(
+            torchrec.KeyedJaggedTensor(
+                keys=kjt.keys(),
+                values=kjt.values(),
+                lengths=kjt.lengths(),
+                offsets=kjt.offsets(),
+            ),
+            self.grad,
+            self.grads,
+        )
 
     def to(self, device: torch.device, non_blocking: bool = False) -> "Batch":
-        return Batch(self.features.to(device=device, non_blocking=non_blocking))
+        # One call for the gradients, not one per feature (a pipeline moves
+        # every batch): the views are made again only if their rows moved.
+        grad = self.grad.to(device=device, non_blocking=non_blocking)
+        grads = self.grads
+        if grad is not self.grad:
+            sizes = [view.size(0) for view in grads.values()]
+            grads = dict(zip(grads, grad.split(sizes)))
+        return Batch(
+            self.features.to(device=device, non_blocking=non_blocking), grad, grads
+        )
 
     def record_stream(self, stream: torch.Stream) -> None:
         self.features.record_stream(stream)
+        self.grad.record_stream(stream)  # the views' storage
 
 
 class EmbeddingModel(torch.nn.Module):
-    """The EC and the loss it trains on: ``forward(batch)`` returns both the
-    loss and the embeddings, as TorchRec's train pipelines expect."""
+    """The EC, with no loss: ``forward(batch)`` returns a zero in its place,
+    whose backward gives the embeddings the batch's gradients
+    (:func:`inject_grads`), and the embeddings, as TorchRec's train
+    pipelines expect."""
 
-    def __init__(
-        self, ec: torchrec.EmbeddingCollection, weight: Optional[torch.Tensor]
-    ) -> None:
+    def __init__(self, ec: torchrec.EmbeddingCollection) -> None:
         super().__init__()
         self.ec = ec
-        self.weight = weight
 
     def forward(self, batch: Batch):
         out = self.ec(batch.features)
-        return embedding_loss(out, self.weight), out
+        return inject_grads(out, batch.grads), out
 
 
 def build_model(
@@ -240,10 +329,8 @@ def build_model(
     local_world_size: int,
     output_dist: str,
     init_mode: DynamicEmbInitializerMode = DynamicEmbInitializerMode.NORMAL,
-    weight: Optional[torch.Tensor] = None,
 ) -> DistributedModelParallel:
-    """The EC of ``cfg`` on ``output_dist``, in an :class:`EmbeddingModel`
-    whose loss weighs the embeddings' columns by ``weight`` (None: 1)."""
+    """The EC of ``cfg`` on ``output_dist``, in an :class:`EmbeddingModel`."""
     tables = [
         torchrec.EmbeddingConfig(
             name=table_name(i),
@@ -300,7 +387,7 @@ def build_model(
         fused_params=fused_params,
         use_index_dedup=cfg.use_index_dedup,
     )
-    model = EmbeddingModel(ec, weight)
+    model = EmbeddingModel(ec)
     plan = planner.collective_plan(model, [sharder], dist.GroupMember.WORLD)
     return DistributedModelParallel(
         module=model, device=device, sharders=[sharder], plan=plan
@@ -361,16 +448,44 @@ def _hier_op(model):
     return next((hier.op for hier in _hier_dists(model)), None)
 
 
-def embedding_loss(out, weight: Optional[torch.Tensor] = None) -> torch.Tensor:
-    """Sum of the looked-up embeddings in ``out`` (optionally weighted per
-    column). Opaque to the train pipelines' fx tracing."""
-    values = [jagged.values() for jagged in out.values()]
-    if weight is None:
-        return sum(rows.sum() for rows in values)
-    return sum((rows.float() * weight).sum() for rows in values)
+class _GradInjection(torch.autograd.Function):
+    """``forward(grads, *values)``: a zero (one small kernel) for a loss.
+    The backward gives each of ``values`` the gradient at its position in
+    ``grads`` (drawn before the run: :func:`with_output_grads`), whatever
+    gradient the zero gets, and launches nothing."""
+
+    @staticmethod
+    def forward(
+        ctx, grads: Tuple[torch.Tensor, ...], *values: torch.Tensor
+    ) -> torch.Tensor:
+        ctx.out_grads = grads
+        return values[0].new_zeros(())
+
+    @staticmethod
+    def backward(ctx, _) -> Tuple[Optional[torch.Tensor], ...]:
+        return (None, *ctx.out_grads)
 
 
-torch.fx.wrap("embedding_loss")
+def inject_grads(out, grads: Dict[str, torch.Tensor]) -> torch.Tensor:
+    """In place of a loss over the looked-up embeddings ``out``: a zero
+    whose backward gives each feature's rows in ``out`` their gradient in
+    ``grads`` (by feature name). It launches no kernel but that zero,
+    however many the features; its host work (this loop, and one autograd
+    node with an edge per feature) still grows with them, about 1 us per
+    feature. Opaque to the train pipelines' fx tracing."""
+    values, ordered = [], []
+    for name, jagged in out.items():
+        values.append(jagged.values())
+        ordered.append(grads[name])
+    # autograd would cast gradients of another dtype, a kernel per feature
+    assert ordered[0].dtype == values[0].dtype, (
+        f"the output gradients are {ordered[0].dtype}, the embeddings"
+        f" {values[0].dtype}"
+    )
+    return _GradInjection.apply(tuple(ordered), *values)
+
+
+torch.fx.wrap("inject_grads")
 
 
 def train_pipeline(cfg: BenchConfig, model: DistributedModelParallel):
@@ -655,7 +770,13 @@ def _wrap_once(module: torch.nn.Module, stage: str) -> None:
     module.forward = forward
 
 
-# Autograd node -> stage, for kernels launched during backward.
+# Autograd node -> stage, for kernels launched during backward; any other
+# node's land in bwd/other, the backward of the EC's per-feature split among
+# them (SplitWithSizesBackward: a cat of the features' gradients, which the
+# backward of inject_grads hands it, launching nothing itself). Forward
+# kernels outside the stage ranges land in fwd/other: the zero inject_grads
+# returns (one kernel), and the scalar gradient loss.backward() starts from
+# (under a pipeline, with its sum of the losses).
 _BACKWARD_STAGES = [
     (re.compile(r"DynamicEmbeddingFunction"), "lookup"),
     (re.compile(r"All2All_Seq"), "output_dist"),
@@ -1477,7 +1598,10 @@ def nic_counters() -> Dict[str, Tuple[int, int]]:
 # ── benchmark ───────────────────────────────────────────────────────────────
 
 
-def time_iterations(model, batches) -> Tuple[List[float], List[float]]:
+def time_iterations(model, batches: List[Batch]) -> Tuple[List[float], List[float]]:
+    """Per batch, the GPU ms of the forward (the model's call) and of the
+    backward (``loss.backward()``, the injected gradients'), on the caller's
+    stream."""
     fwd_ms, bwd_ms = [], []
     events = [
         (
@@ -1487,9 +1611,9 @@ def time_iterations(model, batches) -> Tuple[List[float], List[float]]:
         )
         for _ in batches
     ]
-    for kjt, (start, middle, end) in zip(batches, events):
+    for batch, (start, middle, end) in zip(batches, events):
         start.record()
-        loss = model(Batch(kjt))[0]
+        loss = model(batch)[0]
         middle.record()
         loss.backward()
         end.record()
@@ -1531,13 +1655,16 @@ def check_against_torchrec(
     ``torchrec``): None when they match, else why not, the same on every rank.
 
     Both models start from the DEBUG initializer (a key's row is a function of
-    the key) and train with SGD at learning rate 1 against output weights of
-    +-1, so every gradient is a sum of +-1/world_size. For a power-of-two
-    world_size that sum is exact in fp32 in any order (the hierarchical
-    backward sums a node's duplicates before the owner does), so with fp32
-    rows the forward outputs must match bit for bit after every step. bf16
-    rows round the node sums of hot keys, and with any other world_size the
-    sums of 1/world_size depend on their order, so both get a tolerance.
+    the key) and train with SGD at learning rate 1 on the same output
+    gradients, +-1 drawn per element (:func:`with_output_grads`), so every
+    gradient is a sum of +-1/world_size. Each key's occurrence gets a row of
+    its own, so a gradient row that reaches the wrong key shows. For a
+    power-of-two world_size that sum is exact in fp32 in any order (the
+    hierarchical backward sums a node's duplicates before the owner does), so
+    with fp32 rows the forward outputs must match bit for bit after every
+    step. bf16 rows round the node sums of hot keys, and with any other
+    world_size the sums of 1/world_size depend on their order, so both get a
+    tolerance.
 
     Keys come from at most an eighth of the table, so nothing is evicted: which
     rows a full table evicts is not deterministic, and two models evicting
@@ -1556,20 +1683,16 @@ def check_against_torchrec(
         cfg.key_range or cfg.num_embeddings, max(cfg.num_embeddings // 8, 1)
     )
     cfg = replace(cfg, optimizer="sgd", learning_rate=1.0, key_range=key_range)
-    torch.manual_seed(7)
-    weight = torch.randn(cfg.embedding_dim, device=device).sign()
     debug = DynamicEmbInitializerMode.DEBUG
     output_dist = cfg.output_dist if cfg.output_dist != "torchrec" else "hierarchical"
     batches = generate_batches(cfg, rank, device, steps)
+    inputs = with_output_grads(cfg, rank, device, batches)
     cfg = resolve_capacity(replace(cfg, output_dist=output_dist), batches, local_size)
-    torchrec_model = build_model(
-        cfg, device, world_size, local_size, "torchrec", debug, weight
-    )
-    hier_model = build_model(
-        cfg, device, world_size, local_size, output_dist, debug, weight
-    )
+    torchrec_model = build_model(cfg, device, world_size, local_size, "torchrec", debug)
+    hier_model = build_model(cfg, device, world_size, local_size, output_dist, debug)
     pipeline = train_pipeline(cfg, hier_model) if cfg.pipeline != "none" else None
-    fed = iter([Batch(kjt) for kjt in batches])
+    # every call on a KJT of its own (Batch.fresh), the same gradients
+    fed = iter([batch.fresh() for batch in inputs])
     exact = (
         cfg.emb_dtype == "fp32"
         and cfg.output_dtype == "fp32"
@@ -1577,11 +1700,11 @@ def check_against_torchrec(
     )
     ok = True
     _OUTPUT_DIST_COUNTS.clear()
-    for step, kjt in enumerate(batches):
-        loss_torchrec, out_torchrec = torchrec_model(Batch(kjt))
+    for step, batch in enumerate(inputs):
+        loss_torchrec, out_torchrec = torchrec_model(batch.fresh())
         loss_hier = None
         if pipeline is None:
-            loss_hier, out_hier = hier_model(Batch(kjt))
+            loss_hier, out_hier = hier_model(batch.fresh())
         else:
             out_hier = pipeline.progress(fed)  # this batch's forward and backward
         for name in out_torchrec.keys():
@@ -1657,28 +1780,35 @@ def run(cfg: BenchConfig) -> Dict:
         dist.barrier()
     # --kernel_times: as many iterations again after the timed ones
     kernel_iters = cfg.num_iterations if cfg.kernel_times else 0
-    n_batches = cfg.warmup + cfg.num_iterations + kernel_iters + cfg.profile_iterations
-    batches = generate_batches(cfg, rank, device, n_batches)
+    n_calls = cfg.warmup + cfg.num_iterations + kernel_iters + cfg.profile_iterations
+    kjts = generate_batches(cfg, rank, device, _NUM_BATCHES)
     # the capacities of every batch the model will see (untimed collectives)
-    cfg = resolve_capacity(cfg, batches, local_size)
+    cfg = resolve_capacity(cfg, kjts, local_size)
     if rank == 0 and cfg.output_dist_capacity is not None:
         print(f"output_dist_capacity: {cfg.output_dist_capacity}", flush=True)
+    inputs = with_output_grads(cfg, rank, device, kjts)
     model = build_model(cfg, device, world_size, local_size, cfg.output_dist)
     torch.cuda.synchronize()
     used["model"] = device_used()
-    # what the batches take of the memory allocated before the timed loop
+    # what the batches and their output gradients (one buffer, the largest
+    # batch's rows) take of the memory allocated before the timed loop
     input_bytes = sum(
         tensor.numel() * tensor.element_size()
-        for kjt in batches
+        for kjt in kjts
         for tensor in (kjt.values(), kjt.lengths(), kjt.offsets())
     )
+    grad_bytes = max(batch.grad.numel() * batch.grad.element_size() for batch in inputs)
+    # Call i takes batch i % _NUM_BATCHES, on a KJT of its own (Batch.fresh),
+    # in every phase: the first call, the warmup, the timed iterations,
+    # --kernel_times' and the profiled ones, plain loop or pipeline.
+    batches = [inputs[i % len(inputs)].fresh() for i in range(n_calls)]
     pipeline = train_pipeline(cfg, model) if cfg.pipeline != "none" else None
-    fed = iter([Batch(kjt) for kjt in batches])  # what the pipeline takes from
+    fed = iter(batches)  # what the pipeline takes from
 
-    def train(kjts) -> None:
-        for kjt in kjts:
+    def train(part: List[Batch]) -> None:
+        for batch in part:
             if pipeline is None:
-                model(Batch(kjt))[0].backward()
+                model(batch)[0].backward()
             else:
                 pipeline.progress(fed)
 
@@ -1759,11 +1889,12 @@ def run(cfg: BenchConfig) -> Dict:
     # The hierarchical output dist's forward and backward launches per call
     # that took it, GPU ms.
     output_dist_ms = calls.output_dist_ms() if calls is not None else []
-    # Bytes per rank: allocated before the timed iterations (the batches and
-    # the dists' persistent tensors); past what was allocated before the
-    # first batch, the most allocated and reserved during them; the most
-    # allocated and reserved, all told; the windows of the hierarchical dist
-    # (ncclMemAlloc, outside PyTorch's allocator); the batches.
+    # Bytes per rank: allocated before the timed iterations (the batches,
+    # their output gradients and the dists' persistent tensors); past what
+    # was allocated before the first batch, the most allocated and reserved
+    # during them; the most allocated and reserved, all told; the windows of
+    # the hierarchical dist (ncclMemAlloc, outside PyTorch's allocator); the
+    # batches; their output gradients.
     memory = [
         held,
         torch.cuda.max_memory_allocated() - mem0,
@@ -1776,6 +1907,7 @@ def run(cfg: BenchConfig) -> Dict:
             if hier.takes_hier_dist
         ),
         input_bytes,
+        grad_bytes,
     ]
     ib_calls = hier_traffic.per_call_ib()
     traffic = traffic_of(len(timed))
@@ -2014,10 +2146,10 @@ def report(
             f"{cfg.pipeline} pipeline iteration {res['iter_ms_mean']:.3f} ms (max rank"
             f" {res['iter_ms_max']:.3f})   host iter {wall_ms:.3f} ms"
         )
-    # [world_size, 7]: held, peak and reserved past the start, the most
-    # allocated and reserved, windows, batches
+    # [world_size, 8]: held, peak and reserved past the start, the most
+    # allocated and reserved, windows, batches, their output gradients
     mem = memory_all.max(dim=0).values.tolist()
-    held, peak, reserved, alloc_max, reserved_max, windows, inputs = mem
+    held, peak, reserved, alloc_max, reserved_max, windows, inputs, grads = mem
     total_alloc = (memory_all[:, 3] + memory_all[:, 5]).max().item()
     total_reserved = (memory_all[:, 4] + memory_all[:, 5]).max().item()
     res.update(
@@ -2028,13 +2160,15 @@ def report(
         mem_reserved_max_bytes=reserved_max,
         mem_window_bytes=windows,
         mem_input_bytes=inputs,
+        mem_grad_bytes=grads,
         mem_total_alloc_bytes=total_alloc,
         mem_total_reserved_bytes=total_reserved,
     )
     print(
         f"memory per rank (GB, max over ranks): {held / 1e9:.3f} allocated before the"
-        f" timed iterations ({inputs / 1e9:.3f} of it the batches; the tables are not"
-        f" in PyTorch's allocator); during them, the most allocated {alloc_max / 1e9:.3f}"
+        f" timed iterations ({inputs / 1e9:.3f} of it the batches and {grads / 1e9:.3f}"
+        " their output gradients; the tables are not in PyTorch's allocator); during"
+        f" them, the most allocated {alloc_max / 1e9:.3f}"
         f" ({peak / 1e9:.3f} past the start) and reserved {reserved_max / 1e9:.3f}"
         f" ({reserved / 1e9:.3f} past the start); the hierarchical dist's windows"
         f" {windows / 1e9:.3f}; totals with the windows: allocated {total_alloc / 1e9:.3f},"
@@ -2051,6 +2185,7 @@ def report(
                 "reserved_max",
                 "windows",
                 "inputs",
+                "grads",
             )
         )
     }
