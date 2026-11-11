@@ -15,6 +15,7 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 # limitations under the License.
 ******************************************************************************/
 
+#include "counted_ops.h"
 #include "initializer.cuh"
 
 namespace py = pybind11;
@@ -72,12 +73,7 @@ __global__ void initialize_with_index_addressor_kernel(
     int64_t const *__restrict__ num_valid) {
 
   GeneratorT gen(generator_args);
-  int64_t n = num;
-  if (num_valid != nullptr) {
-    n = *num_valid;
-    n = n < 0 ? 0 : (n < num ? n : num);
-  }
-  int64_t num_task = n * dim;
+  int64_t num_task = counted_limit(num_valid, num) * dim;
   int64_t task_id = blockIdx.x * blockDim.x + threadIdx.x;
 
   for (; task_id < num_task; task_id += gridDim.x * blockDim.x) {
@@ -109,26 +105,6 @@ static void check_beside_buffer(const at::Tensor &buffer,
   }
 }
 
-// The counter behind an initializer's optional `num_valid`: how many leading
-// entries of the batch are live, as a one-element int64 CUDA tensor beside the
-// buffer.  nullptr when there is none, which means all of them.
-static const int64_t *check_num_valid(const at::Tensor &buffer,
-                                      const std::optional<at::Tensor> &num_valid) {
-  if (!num_valid.has_value()) {
-    return nullptr;
-  }
-  const at::Tensor &counter = num_valid.value();
-  if (!counter.defined()) {
-    throw std::invalid_argument("Initializer's num_valid is undefined.");
-  }
-  check_beside_buffer(buffer, counter, "num_valid");
-  if (counter.scalar_type() != at::kLong || counter.numel() != 1) {
-    throw std::invalid_argument(
-        "Initializer's num_valid has to be a one-element int64 tensor.");
-  }
-  return static_cast<const int64_t *>(counter.data_ptr());
-}
-
 // `indices` selects the rows of `buffer` to write, in order; left out (None, or
 // an undefined tensor) it means the rows 0..n-1, n = num_valid, which is then
 // required.  With num_valid, only the first n entries of `indices` are used --
@@ -152,7 +128,8 @@ void initialize_with_generator(at::Tensor buffer,
         "Initializer's value buffer have to be a CUDA tensor.");
   }
   const bool has_indices = indices.has_value() && indices.value().defined();
-  const int64_t *d_num_valid = check_num_valid(buffer, num_valid);
+  const int64_t *d_num_valid =
+      counted_num_valid_ptr(num_valid, buffer.device());
   if (has_indices) {
     check_beside_buffer(buffer, indices.value(), "indices");
   } else if (d_num_valid == nullptr) {

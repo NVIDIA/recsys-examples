@@ -1430,7 +1430,6 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
             self._optimizer,
             layout,
             self._admitter,
-            self._evict_strategy,
             pooling_weights,
             self._empty_tensor,
         )
@@ -1556,9 +1555,7 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                 external_storage=self._external_storage,
                 scores=scores,
                 table_gate=self._table_gate,
-                outstanding_settle=self._settle_outstanding_keys
-                if self._cache is not None
-                else None,
+                outstanding_settle=self._settle_outstanding_keys,
             )
         )
         self._update_score()
@@ -1579,7 +1576,7 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
         capacity = self._cache._state.capacity
         pending = self._prefetch_states
         counts = torch.cat(
-            [state.num_unique.reshape(1) for state in pending] + [num_unique.reshape(1)]
+            [state.num_unique for state in pending] + [num_unique]
         ).tolist()
         for state, count in zip(pending, counts):
             self._prefetch_outstanding_keys += count - state.num_prefetched_keys

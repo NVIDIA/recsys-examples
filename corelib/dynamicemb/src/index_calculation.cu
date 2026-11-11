@@ -244,9 +244,6 @@ flagged_compact(at::Tensor flags, std::vector<c10::optional<at::Tensor>> inputs,
     flagged_compact_cub<6>(num_total, d_flags, in_ptrs.data(), out_ptrs.data(),
                            d_out_idx, d_num_sel, device, stream);
     break;
-  default:
-    TORCH_CHECK(false,
-                "flagged_compact supports at most 6 non-None input tensors");
   }
   DEMB_CUDA_KERNEL_LAUNCH_CHECK();
 

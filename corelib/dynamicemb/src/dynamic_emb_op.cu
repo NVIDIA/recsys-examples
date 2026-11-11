@@ -21,13 +21,13 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 #include "ATen/ATen.h"
 #include "ATen/cuda/CUDAContext.h"
 #include "check.h"
+#include "counted_ops.h"
 #include "lookup_backward.h"
 #include "lookup_forward.h"
 #include "lookup_kernel.cuh"
 #include "pooled_layout.cuh"
 #include "torch_utils.h"
 #include "utils.h"
-#include <algorithm>
 #include <c10/cuda/CUDAGuard.h>
 #include <cstdint>
 #include <limits>
@@ -39,64 +39,6 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 
 namespace py = pybind11;
 using namespace dyn_emb;
-
-// ---------------------------------------------------------------------------
-// Counted batches: a capacity-sized batch plus a device counter
-// ---------------------------------------------------------------------------
-//
-// The ops below that take an optional `num_valid` read how many leading entries
-// of their batch are live from a one-element int64 CUDA tensor.  Entries past it
-// are undefined -- possibly out of range -- so a kernel reads the counter once
-// and never reads or writes them.  Without `num_valid` every entry is live and
-// the op behaves exactly as it did before the counter existed.
-
-// The counter's device pointer, or nullptr when the caller passed none.  `like`
-// is the batch it counts, which it has to share a device with.
-static const int64_t *row_counter_ptr(const std::optional<at::Tensor> &num_valid,
-                                      const at::Tensor &like) {
-  if (!num_valid.has_value()) {
-    return nullptr;
-  }
-  const at::Tensor &counter = num_valid.value();
-  TORCH_CHECK(counter.defined() && counter.is_cuda(),
-              "num_valid must be a CUDA tensor");
-  TORCH_CHECK(counter.scalar_type() == at::kLong,
-              "num_valid must be int64, got ", counter.scalar_type());
-  TORCH_CHECK(counter.numel() == 1,
-              "num_valid must hold exactly one element, got ", counter.numel());
-  TORCH_CHECK(counter.device() == like.device(),
-              "num_valid must be on the same device as the batch it counts");
-  return static_cast<const int64_t *>(counter.data_ptr());
-}
-
-// n = clamp(*num_valid, 0, capacity); the whole batch when there is no counter.
-static DEVICE_INLINE int64_t row_live_count(const int64_t *num_valid,
-                                            int64_t capacity) {
-  if (num_valid == nullptr) {
-    return capacity;
-  }
-  const int64_t n = *num_valid;
-  return n < 0 ? 0 : (n < capacity ? n : capacity);
-}
-
-constexpr int kCountedGridMultiplier = 4;
-
-// The grid of a kernel that is grid-stride but is launched with one block per
-// row.  With a counter it is capped, so that an empty batch costs a bounded
-// number of idle blocks instead of one per row of capacity; without one it is
-// the row count, as it always was.
-static int one_block_per_row_grid(int64_t rows, int block_size, bool counted) {
-  if (!counted) {
-    return static_cast<int>(rows);
-  }
-  auto &device_prop = DeviceProp::getDeviceProp();
-  // The hardware keeps at most 32 blocks of a kernel resident on one SM.
-  const int blocks_per_sm = std::min(
-      32, std::max(1, device_prop.max_thread_per_sm / std::max(1, block_size)));
-  const int64_t max_grid = static_cast<int64_t>(device_prop.num_sms) *
-                           blocks_per_sm * kCountedGridMultiplier;
-  return static_cast<int>(std::min<int64_t>(rows, max_grid));
-}
 
 template <typename scalar_t>
 __global__ void
@@ -303,7 +245,7 @@ fill_rows_kernel(int64_t batch, int64_t width, int64_t row_stride,
                  ValueT *__restrict__ dst, float value,
                  int64_t const *__restrict__ indices,
                  int64_t const *__restrict__ num_valid, bool fp32_words) {
-  const int64_t num_task = row_live_count(num_valid, batch) * width;
+  const int64_t num_task = counted_limit(num_valid, batch) * width;
   for (int64_t task =
            static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
        task < num_task; task += static_cast<int64_t>(gridDim.x) * blockDim.x) {
@@ -333,7 +275,7 @@ __global__ void reset_ftrl_states_kernel(
     int64_t const *__restrict__ table_ids,
     int64_t const *__restrict__ emb_dims, float accum,
     int64_t const *__restrict__ indices, int64_t const *__restrict__ num_valid) {
-  const int64_t num_task = row_live_count(num_valid, batch) * width;
+  const int64_t num_task = counted_limit(num_valid, batch) * width;
   for (int64_t task =
            static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
        task < num_task; task += static_cast<int64_t>(gridDim.x) * blockDim.x) {
@@ -381,16 +323,6 @@ static RowFillBatch check_row_fill(const at::Tensor &dst,
   return RowFillBatch{dst.size(0), nullptr};
 }
 
-static int row_fill_grid(int64_t num_task, int block_size) {
-  auto &device_prop = DeviceProp::getDeviceProp();
-  const int64_t max_grid =
-      static_cast<int64_t>(device_prop.num_sms) *
-      std::max(1, device_prop.max_thread_per_sm / block_size) *
-      kCountedGridMultiplier;
-  return static_cast<int>(
-      std::min<int64_t>((num_task + block_size - 1) / block_size, max_grid));
-}
-
 static void launch_fill_rows(const at::Tensor &dst, float value,
                              const RowFillBatch &batch,
                              const int64_t *num_valid, bool fp32_words) {
@@ -398,7 +330,8 @@ static void launch_fill_rows(const at::Tensor &dst, float value,
   if (batch.size <= 0 || width <= 0)
     return;
   constexpr int kBlockSize = 256;
-  const int grid_size = row_fill_grid(batch.size * width, kBlockSize);
+  const int grid_size = counted_grid(
+      (batch.size * width + kBlockSize - 1) / kBlockSize, kBlockSize);
   auto stream = at::cuda::getCurrentCUDAStream().stream();
   DISPATCH_FLOAT_DATATYPE_FUNCTION(get_data_type(dst), ValueType, [&] {
     fill_rows_kernel<ValueType><<<grid_size, kBlockSize, 0, stream>>>(
@@ -417,8 +350,8 @@ void fill_rows(at::Tensor dst, float value,
   TORCH_CHECK(!fp32_words || dst.element_size() == 2,
               "fill_rows: fp32_words needs a 16-bit dst, got ",
               dst.scalar_type());
-  launch_fill_rows(dst, value, batch, row_counter_ptr(num_valid, dst),
-                   fp32_words);
+  launch_fill_rows(dst, value, batch,
+                   counted_num_valid_ptr(num_valid, dst.device()), fp32_words);
 }
 
 // Resets the FTRL state region dst[M, W] of the selected rows; see
@@ -439,12 +372,13 @@ void reset_ftrl_states(at::Tensor dst, at::Tensor table_ids,
                   emb_dims.is_contiguous(),
               "reset_ftrl_states: emb_dims must be a contiguous int64 CUDA "
               "vector with one entry per table");
-  const int64_t *d_num_valid = row_counter_ptr(num_valid, dst);
+  const int64_t *d_num_valid = counted_num_valid_ptr(num_valid, dst.device());
   const int64_t width = dst.size(1);
   if (batch.size <= 0 || width <= 0)
     return;
   constexpr int kBlockSize = 256;
-  const int grid_size = row_fill_grid(batch.size * width, kBlockSize);
+  const int grid_size = counted_grid(
+      (batch.size * width + kBlockSize - 1) / kBlockSize, kBlockSize);
   auto stream = at::cuda::getCurrentCUDAStream().stream();
   DISPATCH_FLOAT_DATATYPE_FUNCTION(get_data_type(dst), ValueType, [&] {
     reset_ftrl_states_kernel<ValueType><<<grid_size, kBlockSize, 0, stream>>>(
@@ -462,8 +396,7 @@ reduce_grads(at::Tensor inverse_index, at::Tensor grads, int64_t num_unique,
              const std::optional<at::Tensor> &D_offsets = std::nullopt,
              PoolingMode pooling_mode = PoolingMode::kNone, int total_D = 0,
 	     const std::optional<at::Tensor> &weights = std::nullopt,
-             bool feature_dims_vec4 = false,
-             const std::optional<at::Tensor> &num_valid = std::nullopt) {
+             bool feature_dims_vec4 = false) {
   // Pooled (offsets present): grads is [B, total_D], numbered in the output's
   // order, while offsets numbers bags in the input's.  grad_infos bridges the
   // two -- one entry per key, holding the grads row that key's gradient comes
@@ -489,33 +422,18 @@ reduce_grads(at::Tensor inverse_index, at::Tensor grads, int64_t num_unique,
   auto stream = at::cuda::getCurrentCUDAStream().stream();
   const auto index_dtype = get_data_type(inverse_index);
 
-  // With num_valid, num_unique is the capacity of the output and n =
-  // clamp(*num_valid, 0, num_unique) is the number of unique rows that are live:
-  // rows >= n are undefined and never written.  That needs no kernel change
-  // below.  The sort and the reduce run over the num_keys input keys, all of
-  // them live, and write only the rows their inverse indices name, which are all
-  // < n; the sort's key width follows num_unique, a bound of n that costs a
-  // few extra radix bits and nothing else.  Only the zero fill needs the count.
-  const int64_t *d_num_valid = row_counter_ptr(num_valid, grads);
-
   // Nothing to reduce.  No keys means no gradient reaches any row, and with no
   // unique rows there is nowhere to put one; num_unique is 0 whenever num_keys
   // is, so the answer really is an empty tensor rather than a shortcut.
   // Zeros rather than empty(): should a caller ever pass num_unique > 0 with no
   // keys, every row's gradient is genuinely zero, and handing back
-  // uninitialized memory would feed garbage straight into the optimizer.  With
-  // a counter only the n live rows are that: zero those and leave the rest.
+  // uninitialized memory would feed garbage straight into the optimizer.
   // Mirrors the early return in gather_embedding_pooled.
   if (num_keys <= 0 || num_unique <= 0) {
-    if (d_num_valid != nullptr && num_unique > 0) {
-      at::Tensor zeroed = at::empty({num_unique, out_dim}, grads.options());
-      launch_fill_rows(zeroed, 0.0f, RowFillBatch{num_unique, nullptr},
-                       d_num_valid, /*fp32_words=*/false);
-      return zeroed;
-    }
     return at::zeros({num_unique, out_dim}, grads.options());
   }
 
+  // num_unique may be a capacity: the rows that no key maps to stay undefined.
   at::Tensor unique_grads = at::empty({num_unique, out_dim}, grads.options());
 
   // Validated before anything reads it, since the grad_infos kernel below is
@@ -693,7 +611,7 @@ __global__ void load_from_flat_table_kernel_vec4(
     }
   };
 
-  const int64_t n = row_live_count(num_valid, batch);
+  const int64_t n = counted_limit(num_valid, batch);
   for (int64_t emb_id = warp_num_per_block * blockIdx.x + warp_id_in_block;
        emb_id < n; emb_id += gridDim.x * warp_num_per_block) {
     IndexT index = indices[emb_id];
@@ -737,7 +655,7 @@ load_from_flat_table_kernel(int64_t batch, int64_t output_dim,
                             int64_t max_emb_dim, int64_t scalar_table_id,
                             int64_t const *__restrict__ num_valid) {
 
-  const int64_t n = row_live_count(num_valid, batch);
+  const int64_t n = counted_limit(num_valid, batch);
   for (int64_t emb_id = blockIdx.x; emb_id < n; emb_id += gridDim.x) {
     IndexT index = indices[emb_id];
     if (index < 0)
@@ -801,7 +719,7 @@ __global__ void store_to_flat_table_kernel_vec4(
     }
   };
 
-  const int64_t n = row_live_count(num_valid, batch);
+  const int64_t n = counted_limit(num_valid, batch);
   for (int64_t emb_id = warp_num_per_block * blockIdx.x + warp_id_in_block;
        emb_id < n; emb_id += gridDim.x * warp_num_per_block) {
     IndexT index = indices[emb_id];
@@ -838,7 +756,7 @@ __global__ void store_to_flat_table_kernel(
     int64_t const *__restrict__ table_emb_dims, int64_t max_emb_dim,
     int64_t scalar_table_id, int64_t const *__restrict__ num_valid) {
 
-  const int64_t n = row_live_count(num_valid, batch);
+  const int64_t n = counted_limit(num_valid, batch);
   for (int64_t emb_id = blockIdx.x; emb_id < n; emb_id += gridDim.x) {
     IndexT index = indices[emb_id];
     if (index < 0)
@@ -889,7 +807,8 @@ void load_from_flat_table_impl(at::Tensor table_ptrs, at::Tensor indices,
 
   auto val_type = get_data_type(output);
   auto index_type = get_data_type(indices);
-  const int64_t *d_num_valid = row_counter_ptr(num_valid, indices);
+  const int64_t *d_num_valid =
+      counted_num_valid_ptr(num_valid, indices.device());
 
   auto &device_prop = DeviceProp::getDeviceProp();
 
@@ -927,10 +846,11 @@ void load_from_flat_table_impl(at::Tensor table_ptrs, at::Tensor indices,
                              : device_prop.max_thread_per_block;
         if (block_size < 1)
           block_size = 1;
+        const int grid_size = d_num_valid != nullptr
+                                  ? counted_grid(num_total, block_size)
+                                  : static_cast<int>(num_total);
         load_from_flat_table_kernel<NumRegions, IndexType, ValueType>
-            <<<one_block_per_row_grid(num_total, block_size,
-                                      d_num_valid != nullptr),
-               block_size, 0, stream>>>(
+            <<<grid_size, block_size, 0, stream>>>(
                 num_total, output_dim, output_stride,
                 get_pointer<ValueType>(output), get_pointer<IndexType>(indices),
                 table_ids_ptr, get_pointer<int64_t>(table_ptrs),
@@ -943,14 +863,14 @@ void load_from_flat_table_impl(at::Tensor table_ptrs, at::Tensor indices,
   DEMB_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
-void load_from_flat_table_contiguous(
-    at::Tensor table_ptrs, at::Tensor indices, int64_t table_id,
-    at::Tensor output, at::Tensor table_value_dims, at::Tensor table_emb_dims,
-    int64_t max_emb_dim, bool all_dims_vec4,
-    const std::optional<at::Tensor> &num_valid = std::nullopt) {
+void load_from_flat_table_contiguous(at::Tensor table_ptrs, at::Tensor indices,
+                                     int64_t table_id, at::Tensor output,
+                                     at::Tensor table_value_dims,
+                                     at::Tensor table_emb_dims,
+                                     int64_t max_emb_dim, bool all_dims_vec4) {
   load_from_flat_table_impl<0>(table_ptrs, indices, nullptr, table_id, output,
                                table_value_dims, table_emb_dims, max_emb_dim,
-                               all_dims_vec4, num_valid);
+                               all_dims_vec4, std::nullopt);
 }
 
 void load_from_flat_table_emb(
@@ -995,7 +915,8 @@ void store_to_flat_table_impl(at::Tensor table_ptrs, at::Tensor indices,
 
   auto val_type = get_data_type(input);
   auto index_type = get_data_type(indices);
-  const int64_t *d_num_valid = row_counter_ptr(num_valid, indices);
+  const int64_t *d_num_valid =
+      counted_num_valid_ptr(num_valid, indices.device());
 
   auto &device_prop = DeviceProp::getDeviceProp();
 
@@ -1033,10 +954,11 @@ void store_to_flat_table_impl(at::Tensor table_ptrs, at::Tensor indices,
                              : device_prop.max_thread_per_block;
         if (block_size < 1)
           block_size = 1;
+        const int grid_size = d_num_valid != nullptr
+                                  ? counted_grid(num_total, block_size)
+                                  : static_cast<int>(num_total);
         store_to_flat_table_kernel<NumRegions, IndexType, ValueType>
-            <<<one_block_per_row_grid(num_total, block_size,
-                                      d_num_valid != nullptr),
-               block_size, 0, stream>>>(
+            <<<grid_size, block_size, 0, stream>>>(
                 num_total, input_dim, input_stride,
                 get_pointer<ValueType>(input), get_pointer<IndexType>(indices),
                 table_ids_ptr, get_pointer<int64_t>(table_ptrs),
@@ -1049,14 +971,14 @@ void store_to_flat_table_impl(at::Tensor table_ptrs, at::Tensor indices,
   DEMB_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
-void store_to_flat_table_contiguous(
-    at::Tensor table_ptrs, at::Tensor indices, int64_t table_id,
-    at::Tensor input, at::Tensor table_value_dims, at::Tensor table_emb_dims,
-    int64_t max_emb_dim, bool all_dims_vec4,
-    const std::optional<at::Tensor> &num_valid = std::nullopt) {
+void store_to_flat_table_contiguous(at::Tensor table_ptrs, at::Tensor indices,
+                                    int64_t table_id, at::Tensor input,
+                                    at::Tensor table_value_dims,
+                                    at::Tensor table_emb_dims,
+                                    int64_t max_emb_dim, bool all_dims_vec4) {
   store_to_flat_table_impl<0>(table_ptrs, indices, nullptr, table_id, input,
                               table_value_dims, table_emb_dims, max_emb_dim,
-                              all_dims_vec4, num_valid);
+                              all_dims_vec4, std::nullopt);
 }
 
 void store_to_flat_table_value(
@@ -1082,7 +1004,7 @@ __global__ void select_insert_failed_values_kernel_vec4(
   const int lane_id = threadIdx.x % kWarpSize;
 
   Vec4T<ValueT> emb;
-  const int64_t n = row_live_count(num_valid, batch);
+  const int64_t n = counted_limit(num_valid, batch);
   for (int64_t dst_idx = warp_num_per_block * blockIdx.x + warp_id_in_block;
        dst_idx < n; dst_idx += gridDim.x * warp_num_per_block) {
     IndexT in_idx = indices[dst_idx];
@@ -1111,7 +1033,7 @@ __global__ void select_insert_failed_values_kernel(
     ValueT *__restrict__ out_v_ptr, IndexT *__restrict__ indices,
     int64_t const *__restrict__ num_valid) {
 
-  const int64_t n = row_live_count(num_valid, batch);
+  const int64_t n = counted_limit(num_valid, batch);
   for (int64_t dst_idx = blockIdx.x; dst_idx < n; dst_idx += gridDim.x) {
 
     IndexT in_idx = indices[dst_idx];
@@ -1144,7 +1066,8 @@ void select_insert_failed_values(
 
   auto val_type = get_data_type(input_values);
   auto index_type = get_data_type(indices);
-  const int64_t *d_num_valid = row_counter_ptr(num_valid, indices);
+  const int64_t *d_num_valid =
+      counted_num_valid_ptr(num_valid, indices.device());
 
   constexpr int kWarpSize = 32;
   constexpr int MULTIPLIER = 4;
@@ -1179,8 +1102,9 @@ void select_insert_failed_values(
         int block_size = dim < device_prop.max_thread_per_block
                              ? dim
                              : device_prop.max_thread_per_block;
-        int grid_size = one_block_per_row_grid(num_total, block_size,
-                                               d_num_valid != nullptr);
+        int grid_size = d_num_valid != nullptr
+                            ? counted_grid(num_total, block_size)
+                            : static_cast<int>(num_total);
         select_insert_failed_values_kernel<IndexType, ValueType>
             <<<grid_size, block_size, 0, stream>>>(
                 num_total, dim, in_v_ptr, out_v_ptr, index_ptr, d_num_valid);
@@ -1234,16 +1158,13 @@ void bind_dyn_emb_op(py::module &m) {
   // DynamicEmbPoolingMode, which is an IntEnum -- can be passed straight through.
   py::implicitly_convertible<py::int_, dyn_emb::PoolingMode>();
 
-  // With num_valid, num_unique is the capacity of the result and num_valid the
-  // number of unique rows that are live; rows past it are undefined.
   m.def("reduce_grads", &reduce_grads, "reduce grads",
         py::arg("inverse_index"), py::arg("grads"), py::arg("num_unique"),
         py::arg("batch_size"), py::arg("out_dim"),
         py::arg("offsets") = py::none(), py::arg("D_offsets") = py::none(),
         py::arg("pooling_mode") = dyn_emb::PoolingMode::kNone,
         py::arg("total_D") = 0, py::arg("weights") = py::none(),
-        py::arg("feature_dims_vec4") = false,
-        py::arg("num_valid") = py::none());
+        py::arg("feature_dims_vec4") = false);
 
   m.def("gather_embedding", &gather_embedding,
         "Gather embedding based on index.", py::arg("input"), py::arg("output"),
@@ -1264,7 +1185,7 @@ void bind_dyn_emb_op(py::module &m) {
         py::arg("table_ptrs"), py::arg("indices"), py::arg("table_id"),
         py::arg("output"), py::arg("table_value_dims"),
         py::arg("table_emb_dims"), py::arg("max_emb_dim"),
-        py::arg("all_dims_vec4"), py::arg("num_valid") = py::none());
+        py::arg("all_dims_vec4"));
 
   m.def("load_from_flat_table_emb", &load_from_flat_table_emb,
         "Load from flat table: emb-only copy (NumRegions=1, EMBEDDING mode).",
@@ -1286,7 +1207,7 @@ void bind_dyn_emb_op(py::module &m) {
         py::arg("table_ptrs"), py::arg("indices"), py::arg("table_id"),
         py::arg("input"), py::arg("table_value_dims"),
         py::arg("table_emb_dims"), py::arg("max_emb_dim"),
-        py::arg("all_dims_vec4"), py::arg("num_valid") = py::none());
+        py::arg("all_dims_vec4"));
 
   m.def("store_to_flat_table_value", &store_to_flat_table_value,
         "Store to flat table: 2-region copy (NumRegions=2, VALUE mode).",

@@ -127,7 +127,7 @@ class MultiTableInitializer(abc.ABC):
         leading entries of ``indices`` are live; the rest are undefined and are
         never read. ``indices=None`` means the identity over the first ``n``
         rows of ``buffer`` (``n = num_valid``, which is then required). Without
-        ``num_valid`` every entry of ``indices`` is live, as before.
+        ``num_valid`` every entry of ``indices`` is live.
         """
         ...
 

@@ -28,7 +28,7 @@ namespace dyn_emb {
 //
 // With `num_valid` (null: all n) only the first *num_valid entries of slots and
 // table_ids are live: the others are neither read nor allocated for, and the
-// matching entries of `out` are left as they were.
+// matching entries of `out` are undefined.
 __global__ void table_resolve_rows_kernel(
     int64_t *__restrict__ rows, int64_t *__restrict__ row_counters,
     int64_t const *__restrict__ row_limits,
@@ -36,7 +36,7 @@ __global__ void table_resolve_rows_kernel(
     int64_t const *__restrict__ slots, int64_t const *__restrict__ table_ids,
     int64_t *__restrict__ out, int64_t n, bool allocate,
     int64_t const *__restrict__ num_valid) {
-  const int64_t live = table_live_count(num_valid, n);
+  const int64_t live = counted_limit(num_valid, n);
   for (int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
        i < live; i += static_cast<int64_t>(gridDim.x) * blockDim.x) {
     int64_t slot = slots[i];
@@ -93,7 +93,7 @@ at::Tensor table_resolve_rows(at::Tensor rows, at::Tensor row_counters,
     return out;
   constexpr int BLOCK = 256;
   cudaStream_t stream = at::cuda::getCurrentCUDAStream();
-  auto num_valid_ptr = table_num_valid_pointer(num_valid);
+  auto num_valid_ptr = counted_num_valid_ptr(num_valid, slots.device());
   table_resolve_rows_kernel<<<
       table_grid_size(n, BLOCK, num_valid_ptr != nullptr), BLOCK, 0, stream>>>(
       rows.data_ptr<int64_t>(), row_counters.data_ptr<int64_t>(),

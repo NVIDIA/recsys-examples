@@ -75,7 +75,6 @@ from dynamicemb.types import (
 )
 from dynamicemb_extensions import (
     EvictStrategy,
-    counted_count_true,
     counted_gather,
     counted_scatter,
     counted_scatter_fill,
@@ -1234,8 +1233,7 @@ def expand_if_need_impl(
     """Accumulate per-table unique counts, optionally collect size and expand.
 
     unique_size_per_table is the CPU tensor of per-table unique counts (shape
-    (num_tables,)) that ``unique_size_per_table`` of ``batched_dynamicemb_function``
-    reads from the device.
+    (num_tables,)) that ``dynamicemb_prefetch`` reads from the device.
     When a second opinion on table sizes is needed, calls
     :func:`collect_table_sizes_for_state` with ``non_blocking=False``.
     """
@@ -1503,7 +1501,7 @@ def store_to_flat(
     table_ids: torch.Tensor,
     values: torch.Tensor,
     *,
-    num_valid: Optional[torch.Tensor] = None,
+    num_valid: Optional[torch.Tensor],
 ) -> None:
     """Write ``values`` into the rows ``indices``; a negative index is skipped. With
     ``num_valid`` only the first ``num_valid`` rows are written."""
@@ -1713,8 +1711,8 @@ def _lookup_keys(
     const_lookup: bool = False,
     return_slots: bool = False,
 ) -> Tuple[ScoreArg, torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
-    """Look up the first ``num_valid`` keys (``None``: all of them); no compaction of
-    the misses, and nothing is read back (see :class:`dynamicemb.types.Storage`).
+    """Look up the first ``num_valid`` keys (see :class:`dynamicemb.types.Storage`);
+    no compaction of the misses.
 
     Returns ``(score_arg, score_out, founds, indices, slots)``. The indices are value
     rows for a table that stores them, hash slots otherwise. A key that is not found
@@ -1758,8 +1756,8 @@ def _find_keys(
     const_lookup: bool = False,
     return_slots: bool = False,
 ) -> Tuple:
-    """Key-only find: look up the first ``num_valid`` keys (``None``: all of them) in
-    the hash table and pick out the missing ones; nothing is read back.
+    """Key-only find: look up the first ``num_valid`` keys in the hash table and pick
+    out the missing ones.
 
     Returns ``(num_missing, missing_keys, missing_indices, missing_table_ids,
     missing_scores, founds, score_out, indices)``; with ``return_slots`` the hash
@@ -1770,8 +1768,7 @@ def _find_keys(
     ``founds``, ``score_out`` and ``indices`` have one entry per key (see
     :func:`_lookup_keys` for ``indices``).
 
-    ``score_input`` is the one tensor a table's score is made from, as
-    :func:`score_source` chose it (see :func:`get_find_score_arg`).
+    ``score_input``: see :func:`_lookup_keys`.
     """
     if keys.dtype != state.key_index_map.key_type:
         keys = keys.to(state.key_index_map.key_type)
@@ -1958,24 +1955,17 @@ def _insert_and_evict_keys(
     keys: torch.Tensor,
     table_ids: torch.Tensor,
     scores: Optional[torch.Tensor],
-    preserve_existing: bool,
     num_valid: Optional[torch.Tensor],
 ) -> Tuple[
     torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
 ]:
-    """Key-only insert_and_evict of the first ``num_valid`` keys (``None``: all of
-    them). Returns (indices, num_evicted, evicted_keys, evicted_table_ids,
-    evicted_indices, evicted_scores): ``num_evicted`` is a one-element device tensor
-    and the evicted arrays have the capacity of ``keys``, with ``num_evicted`` live
-    leading entries.
+    """Key-only insert_and_evict of the first ``num_valid`` keys. Returns (indices,
+    num_evicted, evicted_keys, evicted_table_ids, evicted_indices, evicted_scores):
+    ``num_evicted`` is a one-element device tensor and the evicted arrays have the
+    capacity of ``keys``, with ``num_evicted`` live leading entries.
     Caller is responsible for loading evicted values and storing new values.
-
-    *preserve_existing* is forwarded to :func:`get_insert_score_arg` (e.g. backward
-    re-insert should use True so existing slot scores are not overwritten).
     """
-    score_arg = get_insert_score_arg(
-        state, keys.numel(), keys.device, scores, preserve_existing
-    )
+    score_arg = get_insert_score_arg(state, keys.numel(), keys.device, scores)
     (
         indices,
         num_evicted,
@@ -2819,14 +2809,7 @@ class DynamicEmbCache(Cache):
         optimizer: BaseDynamicEmbeddingOptimizer,
     ):
         self._state = create_table_state(options, optimizer, enable_overflow=True)
-        # The host tensor ``cache_metrics`` hands out: pinned, because the numbers are
-        # copied into it without waiting for the device (see ``_publish_metrics``).
-        self._cache_metrics = torch.zeros(10, dtype=torch.long, pin_memory=True)
-        self._cache_metrics_dev = torch.zeros(
-            10, dtype=torch.long, device=self._state.device
-        )
-        # Recorded after the last copy of the metrics to the host.
-        self._metrics_event: Optional[torch.cuda.Event] = None
+        self._cache_metrics = torch.zeros(10, dtype=torch.long, device="cpu")
         self._record_cache_metrics = False
 
     # -- Cache interface --
@@ -2863,9 +2846,9 @@ class DynamicEmbCache(Cache):
         *,
         num_valid: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Lookup with overflow fallback of the first ``num_valid`` keys (``None``: all
-        of them); nothing is read back. Returns (score_out, founds, indices), one entry
-        per key, undefined past ``num_valid``."""
+        """Lookup with overflow fallback of the first ``num_valid`` keys. Returns
+        (score_out, founds, indices), one entry per key, undefined past ``num_valid``.
+        While the metrics are recorded this reads the device."""
         state = self._state
         score_arg = get_find_score_arg(
             state,
@@ -2877,12 +2860,9 @@ class DynamicEmbCache(Cache):
             unique_keys, table_ids, score_arg, num_valid=num_valid
         )
         if self._record_cache_metrics:
-            if num_valid is None:
-                self._cache_metrics_dev[0:1].fill_(unique_keys.size(0))
-            else:
-                self._cache_metrics_dev[0:1].copy_(num_valid)
-            self._cache_metrics_dev[1:2].copy_(counted_count_true(result[1], num_valid))
-            self._publish_metrics(0, 2)
+            n = unique_keys.size(0) if num_valid is None else int(num_valid.item())
+            self._cache_metrics[0] = n
+            self._cache_metrics[1] = int(result[1][:n].sum())
         return result
 
     def insert_and_evict(
@@ -2900,8 +2880,8 @@ class DynamicEmbCache(Cache):
         torch.Tensor,
         torch.Tensor,
     ]:
-        """Insert the first ``num_valid`` keys (``None``: all of them), with
-        counter-aware eviction and overflow fallback; nothing is read back.
+        """Insert the first ``num_valid`` keys, with counter-aware eviction and
+        overflow fallback. While the metrics are recorded this reads the device.
 
         Returns ``(indices, num_evicted, evicted_keys, evicted_indices,
         evicted_scores, evicted_table_ids)``. ``num_evicted`` is a one-element device
@@ -2914,38 +2894,18 @@ class DynamicEmbCache(Cache):
             keys, table_ids, score_arg, num_valid=num_valid
         )
         if self._record_cache_metrics:
-            if num_valid is None:
-                self._cache_metrics_dev[2:3].fill_(keys.size(0))
-            else:
-                self._cache_metrics_dev[2:3].copy_(num_valid)
-            self._cache_metrics_dev[3:4].copy_(result[1])
-            self._publish_metrics(2, 4)
+            self._cache_metrics[2] = (
+                keys.size(0) if num_valid is None else int(num_valid.item())
+            )
+            self._cache_metrics[3] = int(result[1])
         return result
 
     def reset(self) -> None:
         self._state.key_index_map.reset()
 
-    def _publish_metrics(self, begin: int, end: int) -> None:
-        """Copy ``_cache_metrics_dev[begin:end]`` to the host tensor, in the order of the
-        stream and without waiting for it."""
-        self._cache_metrics[begin:end].copy_(
-            self._cache_metrics_dev[begin:end], non_blocking=True
-        )
-        if self._metrics_event is None:
-            self._metrics_event = torch.cuda.Event()
-        self._metrics_event.record()
-
     @property
     def cache_metrics(self) -> Optional[torch.Tensor]:
-        """The metrics of the last lookup and insert, a host tensor that stays valid: the
-        later calls write into it. Reading it is where a step's numbers are waited
-        for; a caller that keeps the tensor has to wait for the device itself
-        (``torch.cuda.synchronize()``) before it reads a later step's."""
-        if not self._record_cache_metrics:
-            return None
-        if self._metrics_event is not None:
-            self._metrics_event.synchronize()
-        return self._cache_metrics
+        return self._cache_metrics if self._record_cache_metrics else None
 
     def set_record_cache_metrics(self, record: bool) -> None:
         self._record_cache_metrics = record
@@ -3258,8 +3218,7 @@ class DynamicEmbStorage(Storage):
         torch.Tensor,
         torch.Tensor,
     ]:
-        """Find the first ``num_valid`` keys (``None``: all of them); nothing is read
-        back.
+        """Find the first ``num_valid`` keys.
 
         Returns ``(num_missing, missing_keys, missing_indices, missing_table_ids,
         missing_scores, founds, output_scores, values)``. ``num_missing`` is a
@@ -3268,16 +3227,7 @@ class DynamicEmbStorage(Storage):
         ``missing_indices`` are positions among ``unique_keys``. ``founds``,
         ``output_scores`` and ``values`` have one entry per input key.
         """
-        (
-            num_missing,
-            missing_keys,
-            missing_indices,
-            missing_table_ids,
-            missing_scores,
-            founds,
-            score_out,
-            indices,
-        ) = _find_keys(
+        *found, indices = _find_keys(
             self._state,
             unique_keys,
             table_ids,
@@ -3287,16 +3237,7 @@ class DynamicEmbStorage(Storage):
         values = load_from_flat(
             self._state, indices, table_ids, copy_mode=copy_mode, num_valid=num_valid
         )
-        return (
-            num_missing,
-            missing_keys,
-            missing_indices,
-            missing_table_ids,
-            missing_scores,
-            founds,
-            score_out,
-            values,
-        )
+        return (*found, values)
 
     def increment_counter(
         self,
@@ -3332,9 +3273,8 @@ class DynamicEmbStorage(Storage):
         *,
         num_valid: Optional[torch.Tensor] = None,
     ) -> None:
-        """Insert the first ``num_valid`` keys (``None``: all of them) with their
-        values. Nothing is read back, but the count of the keys evicted for room when
-        the table retains them (``EvictedItemMode.RETAIN_KEY``)."""
+        """Insert the first ``num_valid`` keys with their values (see
+        :func:`_insert_key_values`)."""
         _insert_key_values(
             self._state,
             unique_keys,
@@ -3903,14 +3843,13 @@ class HybridStorage(Storage):
         torch.Tensor,
         torch.Tensor,
     ]:
-        """Find the first ``num_valid`` keys (``None``: all of them), in the HBM tier
-        and then, for the keys it lacks, in the host tier; nothing is read back.
+        """Find the first ``num_valid`` keys in the HBM tier and then, for the keys it
+        lacks, in the host tier.
 
         Returns the elements of :meth:`DynamicEmbStorage.find`, where ``num_missing``
         counts the keys missing from both tiers. The host tier is always asked about
         the keys the HBM tier lacks: there is no count on the host to decide that
-        nothing is missing. The LFU frequencies carried through both tiers are not
-        compared (that would read them).
+        nothing is missing.
         """
         if key_scores is not None:
             raise NotImplementedError(
@@ -3992,9 +3931,8 @@ class HybridStorage(Storage):
         *,
         num_valid: Optional[torch.Tensor] = None,
     ) -> None:
-        """Insert or update the first ``num_valid`` rows (``None``: all of them).
-        Nothing is read back, but the count of the keys the host tier evicts when it
-        retains them (``EvictedItemMode.RETAIN_KEY``).
+        """Insert or update the first ``num_valid`` rows; the host tier takes the
+        evicted keys with :func:`_insert_key_values`.
 
         * ``preserve_existing=False`` (default): insert into the HBM tier; evicted
           keys are written to the host tier (existing behavior).
@@ -4046,9 +3984,7 @@ class HybridStorage(Storage):
             evicted_table_ids,
             evicted_indices,
             evicted_scores,
-        ) = _insert_and_evict_keys(
-            self._hbm, unique_keys, table_ids, scores, False, num_valid
-        )
+        ) = _insert_and_evict_keys(self._hbm, unique_keys, table_ids, scores, num_valid)
         evicted_values = load_from_flat(
             self._hbm,
             evicted_indices,
@@ -4471,7 +4407,7 @@ class HybridStorage(Storage):
                 evicted_table_ids,
                 evicted_indices,
                 evicted_scores,
-            ) = _insert_and_evict_keys(self._hbm, keys, tids, file_scores, False, None)
+            ) = _insert_and_evict_keys(self._hbm, keys, tids, file_scores, None)
 
             evicted_values = load_from_flat(
                 self._hbm,
@@ -4555,11 +4491,10 @@ def _write_back_evicted(
     values: torch.Tensor,
     num_valid: Optional[torch.Tensor],
     *,
-    next_tier: Optional[Storage] = None,
+    next_tier: Optional[Storage],
 ) -> None:
-    """Return what the cache evicted -- the first ``num_valid`` entries (``None``: all
-    of them) -- to the tier below it; nothing is read back, except the count of the
-    keys dropped when storage retains them.
+    """Return what the cache evicted -- the first ``num_valid`` entries -- to the
+    tier below it (see :func:`_insert_key_values` for what is read from the device).
 
     A key still in storage keeps its score, so only its value is written, into the
     row the lookup found. One storage has evicted since goes to ``next_tier``; with
@@ -4690,7 +4625,7 @@ def eval_lookup(
     num_valid: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Eval-only lookup (no insertion, no admission, no backward) of the first
-    ``num_valid`` keys (``None``: all of them); waits for nothing.
+    ``num_valid`` keys.
 
     When *cache* is ``None``, looks up directly from *storage*.
     When *cache* is provided, looks up from cache first, then falls back to

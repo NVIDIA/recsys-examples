@@ -176,7 +176,7 @@ table_lookup(at::Tensor table_storage, at::Tensor table_bucket_offsets,
       torch::empty({num_total}, keys.options().dtype(torch::kInt64));
 
   bool use_overflow = ovf_storage.has_value() && ovf_storage.value().defined();
-  auto num_valid_ptr = table_num_valid_pointer(num_valid);
+  auto num_valid_ptr = counted_num_valid_ptr(num_valid, keys.device());
 
   if (use_overflow) {
     table_lookup_with_overflow_single_score(

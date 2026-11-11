@@ -190,11 +190,11 @@ class ScoredHashTable(abc.ABC):
             num_valid: as in :meth:`lookup`.
         Returns:
             (indices, num_evicted, evicted_keys, evicted_indices, evicted_scores, evicted_table_ids)
-            ``num_evicted`` is a one-element int64 device tensor (never an int) and
-            nothing is read back to the host: ``indices`` and the evicted_* arrays
-            are at the capacity of ``keys``, not cut to size. Only the first
-            ``num_valid`` entries of ``indices`` (all of them for ``None``) and the
-            first ``num_evicted`` entries of the evicted_* arrays are defined.
+            ``num_evicted`` is a one-element int64 device tensor and nothing is read
+            back to the host: ``indices`` and the evicted_* arrays are at the
+            capacity of ``keys``. Only the first ``num_valid`` entries of ``indices``
+            (all of them for ``None``) and the first ``num_evicted`` entries of the
+            evicted_* arrays are defined.
         If score_out is provided (caller-allocated int64 tensor), it is filled with output scores.
         """
 
@@ -608,11 +608,9 @@ class LinearBucketTable(ScoredHashTable):
         where the slot must already own a row (a lookup hit, an evicted
         victim). Negative entries pass through, as do overflow slots.
 
-        ``num_valid`` (a one-element int64 device tensor) says that only the
-        first ``num_valid`` entries of ``slots`` / ``table_ids`` are live; the
-        rest are never read and the same entries of the result are undefined.
-        Without ``use_rows`` there is nothing to resolve: ``slots`` come back as
-        they are.
+        ``num_valid``: as in :meth:`ScoredHashTable.lookup`, for ``slots`` and
+        ``table_ids``; the same entries of the result are undefined. Without
+        ``use_rows`` there is nothing to resolve: ``slots`` come back as they are.
         """
         if not self.use_rows_:
             return slots
@@ -632,7 +630,7 @@ class LinearBucketTable(ScoredHashTable):
         self,
         result: Tuple,
         table_ids: torch.Tensor,
-        num_valid: Optional[torch.Tensor] = None,
+        num_valid: Optional[torch.Tensor],
     ) -> Tuple:
         """``_rows_of`` over an ``insert_and_evict`` result: the inserted keys'
         indices take (and allocate) their rows, the evicted victims' indices
@@ -682,7 +680,10 @@ class LinearBucketTable(ScoredHashTable):
     @staticmethod
     def _to_capacity(a: torch.Tensor, capacity: int) -> torch.Tensor:
         """``a`` as the first ``a.numel()`` entries of a ``capacity``-sized array,
-        the rest undefined: the shape a counted caller expects."""
+        the rest undefined: the shape a counted caller expects. ``a`` itself when
+        it has ``capacity`` entries."""
+        if a.numel() == capacity:
+            return a
         out = torch.empty(capacity, dtype=a.dtype, device=a.device)
         out[: a.numel()].copy_(a)
         return out
@@ -700,21 +701,13 @@ class LinearBucketTable(ScoredHashTable):
             *(LinearBucketTable._to_capacity(a, capacity) for a in evicted),
         )
 
-    def slots_of(
-        self,
-        keys: torch.Tensor,
-        table_ids: torch.Tensor,
-        num_valid: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
+    def slots_of(self, keys: torch.Tensor, table_ids: torch.Tensor) -> torch.Tensor:
         """The hash slots ``keys`` sit in (``-1`` where absent), whatever
         ``use_rows`` is.
 
         :meth:`lookup` and :meth:`insert` report rows for a table that stores
         them. State that is keyed by slot -- the score blocks, the reference
         counters -- needs the slot instead, and this is how to get it.
-
-        With ``num_valid`` only the first ``num_valid`` keys are looked up; the
-        other entries of the result are undefined.
         """
         _, _, slots = table_lookup(
             self.table_storage_,
@@ -725,7 +718,6 @@ class LinearBucketTable(ScoredHashTable):
             None,
             ScorePolicy.CONST,
             num_scores=self.num_scores_,
-            num_valid=num_valid,
         )
         return slots
 
@@ -785,10 +777,8 @@ class LinearBucketTable(ScoredHashTable):
             return_slots: also return the hash slots as a fourth element. For a
                 table that stores rows ``indices`` are rows, but the reference
                 counters sit beside the hash table and are keyed by slot.
-            num_valid: optional one-element int64 device tensor: only the first
-                ``num_valid`` entries of ``keys`` / ``table_ids`` (/ the score
-                input) are looked up, and the other entries of every output are
-                undefined. Nothing is read back to the host.
+            num_valid: as in :meth:`ScoredHashTable.lookup`; the other entries of
+                every output are undefined.
         Returns:
             (score_out, founds, indices): score tensor (int64), found mask, indices;
             plus ``slots`` when asked.
@@ -831,11 +821,9 @@ class LinearBucketTable(ScoredHashTable):
         Keys have to be unique.
         Args:
             table_ids: int32 tensor of same length as keys, identifying which logical table each key belongs to.
-            num_valid: optional one-element int64 device tensor: only the first
-                ``num_valid`` entries of ``keys`` / ``table_ids`` (/ the score
-                input) are inserted; the other entries of every output (and of
-                ``insert_results`` / ``score_out``, which are left as they were)
-                are not written. Nothing is read back to the host.
+            num_valid: as in :meth:`ScoredHashTable.lookup`; the other entries of
+                every output (and of ``insert_results`` / ``score_out``, which are
+                left as they were) are not written.
         Returns:
             indices; or, when ``collect_evicted`` is True, the 4-tuple
             ``(indices, num_evicted, evicted_keys, evicted_table_ids)`` where the
@@ -858,22 +846,16 @@ class LinearBucketTable(ScoredHashTable):
             assert (
                 num_scores == 1
             ), "DEMB_DETERMINISM_MODE does not support auxiliary score columns yet."
-            if num_valid is None:
-                slots = self._deterministic_insert(keys, table_ids, score_value, policy)
-            else:
-                # Blocking: the deterministic insert works from the host, so the
-                # live count is read back once (see _host_count) and the exact
-                # slices go through the old code; the slots come back at capacity.
-                n = self._host_count(num_valid, keys.numel())
-                slots = self._to_capacity(
-                    self._deterministic_insert(
-                        keys[:n],
-                        table_ids[:n],
-                        None if score_value is None else score_value[:n],
-                        policy,
-                    ),
-                    keys.numel(),
-                )
+            n = self._host_count(num_valid, keys.numel())
+            slots = self._to_capacity(
+                self._deterministic_insert(
+                    keys[:n],
+                    table_ids[:n],
+                    None if score_value is None else score_value[:n],
+                    policy,
+                ),
+                keys.numel(),
+            )
             rows = self._rows_of(slots, table_ids, True, num_valid)
             return (rows, slots) if return_slots else rows
 
@@ -936,18 +918,15 @@ class LinearBucketTable(ScoredHashTable):
         Keys have to be unique.
         Args:
             table_ids: int32 tensor of same length as keys, identifying which logical table each key belongs to.
-            num_valid: optional one-element int64 device tensor: only the first
-                ``num_valid`` entries of ``keys`` / ``table_ids`` (/ the score
-                input) are inserted; ``None``: all of them. ``insert_results`` /
+            num_valid: as in :meth:`ScoredHashTable.lookup`; ``insert_results`` /
                 ``score_out`` are not written past ``num_valid``.
         Returns:
             (indices, num_evicted, evicted_keys, evicted_indices, evicted_scores, evicted_table_ids)
             in the same form for every call, with nothing read back to the host:
-            ``num_evicted`` is a one-element int64 device tensor (not an int), and
-            ``indices`` and the evicted_* arrays are not sliced -- they have the
-            capacity of ``keys``. Only the first ``num_valid`` entries of
-            ``indices`` (all of them for ``None``) and the first ``num_evicted``
-            entries of the evicted_* arrays are defined.
+            ``num_evicted`` is a one-element int64 device tensor, and ``indices``
+            and the evicted_* arrays have the capacity of ``keys``. Only the first
+            ``num_valid`` entries of ``indices`` (all of them for ``None``) and the
+            first ``num_evicted`` entries of the evicted_* arrays are defined.
         If score_out is provided (caller-allocated int64 tensor), it is filled with output scores.
         Under DEMB_DETERMINISM_MODE the buckets are walked in waves from the host,
         which waits for the device; the result comes back in the same form.
@@ -960,11 +939,6 @@ class LinearBucketTable(ScoredHashTable):
             assert (
                 num_scores == 1
             ), "DEMB_DETERMINISM_MODE does not support auxiliary score columns yet."
-            # Blocking: the deterministic insert works from the host, so a live
-            # count is read back once (see _host_count; for None every key is live
-            # and nothing is read) and the exact slices go through the old code.
-            # The result is put in the counted form, and its rows are resolved
-            # like those of the kernel below.
             n = self._host_count(num_valid, keys.numel())
             return self._evicted_rows_of(
                 self._counted_result(
@@ -980,9 +954,6 @@ class LinearBucketTable(ScoredHashTable):
                 num_valid,
             )
 
-        # The counted form, for every call: no read-back, no slicing. The live
-        # entries of the evicted_* arrays are the first num_evicted, which the row
-        # resolution takes as its count too.
         return self._evicted_rows_of(
             table_insert_and_evict(
                 self.table_storage_,
@@ -1154,9 +1125,8 @@ class LinearBucketTable(ScoredHashTable):
         index (e.g. slot_indices from unique_keys lookup), so no two threads
         write the same counter element.
 
-        num_valid: optional one-element int64 device tensor: only the first
-        ``num_valid`` entries of slot_indices / table_ids are counted; the others
-        are never read.
+        num_valid: as in :meth:`ScoredHashTable.lookup`: only those entries of
+        slot_indices / table_ids are counted.
         """
         self._check_has_ref_counter()
         table_update_counter_with_layout(
@@ -1195,9 +1165,8 @@ class LinearBucketTable(ScoredHashTable):
         index (e.g. slot_indices from unique_keys lookup), so no two threads
         write the same counter element.
 
-        num_valid: optional one-element int64 device tensor: only the first
-        ``num_valid`` entries of slot_indices / table_ids are counted; the others
-        are never read.
+        num_valid: as in :meth:`ScoredHashTable.lookup`: only those entries of
+        slot_indices / table_ids are counted.
         """
         self._check_has_ref_counter()
         table_update_counter_with_layout(
@@ -1267,10 +1236,8 @@ class LinearBucketTable(ScoredHashTable):
         torch.Tensor,
     ]:
         """Insert with counter-aware eviction and overflow fallback.
-        Returns same tuple as insert_and_evict, in the same form for every call;
-        ``num_valid`` is as there too (``None``: all of ``keys`` are live;
-        ``num_evicted`` a one-element int64 device tensor, arrays at the capacity of
-        ``keys``, nothing read back)."""
+        Returns same tuple as insert_and_evict, in the same form; ``num_valid`` is
+        as there too."""
         assert (
             self.enable_overflow_
         ), "insert_and_evict_with_counter_and_overflow requires enable_overflow=True"
@@ -1281,9 +1248,6 @@ class LinearBucketTable(ScoredHashTable):
             assert (
                 num_scores == 1
             ), "DEMB_DETERMINISM_MODE does not support auxiliary score columns yet."
-            # Blocking: as in insert_and_evict, a live count is read back once for
-            # the host-driven deterministic code (see _host_count; for None every
-            # key is live and nothing is read).
             n = self._host_count(num_valid, keys.numel())
             return self._counted_result(
                 self._deterministic_insert_and_evict_with_overflow(
@@ -1295,8 +1259,6 @@ class LinearBucketTable(ScoredHashTable):
                 keys.numel(),
             )
 
-        # The counted form, for every call: no read-back, no slicing (an overflow
-        # table has no rows to resolve).
         return table_insert_and_evict(
             self.table_storage_,
             self.table_bucket_offsets_,
@@ -1333,10 +1295,8 @@ class LinearBucketTable(ScoredHashTable):
             return_indices: also report which keys were actually present. Costs
                 one int64 tensor of ``keys.numel()``; callers that only need the
                 erase itself should leave it False.
-            num_valid: optional one-element int64 device tensor: only the first
-                ``num_valid`` entries of ``keys`` / ``table_ids`` are erased (the
-                other entries are never read), and only those of the
-                ``return_indices`` tensor are defined.
+            num_valid: as in :meth:`ScoredHashTable.lookup`; only the first
+                ``num_valid`` entries of the ``return_indices`` tensor are defined.
 
         Returns:
             ``None`` unless *return_indices*, else a tensor that is ``-1`` where

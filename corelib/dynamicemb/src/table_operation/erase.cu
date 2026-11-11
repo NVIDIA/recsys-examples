@@ -37,7 +37,7 @@ void table_erase(at::Tensor table_storage, at::Tensor table_bucket_offsets,
   auto indices_ = get_pointer<IndexType>(indices);
   auto table_ids_ptr = table_ids.data_ptr<int64_t>();
   auto table_bucket_offsets_ptr = table_bucket_offsets.data_ptr<int64_t>();
-  auto num_valid_ptr = table_num_valid_pointer(num_valid);
+  auto num_valid_ptr = counted_num_valid_ptr(num_valid, keys.device());
 
   auto stream = at::cuda::getCurrentCUDAStream().stream();
 

@@ -238,7 +238,7 @@ at::Tensor table_insert(at::Tensor table_storage,
                             bucket_capacity, bucket_sizes, keys, table_ids,
                             score_input, policy_type, indices, insert_results,
                             score_output, counter, num_scores, score_fn_key,
-                            table_num_valid_pointer(num_valid));
+                            counted_num_valid_ptr(num_valid, keys.device()));
 
   return indices;
 }
@@ -365,7 +365,8 @@ table_insert_collect_evicted(
       table_storage, table_bucket_offsets, bucket_capacity, bucket_sizes, keys,
       table_ids, score_input, policy_type, indices, insert_results,
       score_output, counter, num_scores, score_fn_key, evicted_counter,
-      evicted_keys, evicted_table_ids, table_num_valid_pointer(num_valid));
+      evicted_keys, evicted_table_ids,
+      counted_num_valid_ptr(num_valid, keys.device()));
 
   return std::make_tuple(indices, evicted_counter, evicted_keys,
                          evicted_table_ids);

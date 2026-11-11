@@ -197,14 +197,6 @@ memory the framework sizes, reports through `memory_usage`, and checkpoints.
 `Counter` already is that protocol; it simply gains a second audience —
 `add`/`erase` for the admitter, `memory_usage`/`dump`/`load` for the module.
 
-`num_valid` belongs to the lookup step, not to the admission design: the step
-keeps its per-key arrays at the length of the input and carries the number of
-live entries on the device instead of reading it back. The contract of that
-count, for an admitter, for a `Counter` and for the initializer an admitter
-hands out as its `non_admitted_initializer`, is in "Host syncs in a step" and
-"Writing a Storage, Cache, Counter or MultiTableAdmitter" of
-[DynamicEmb_APIs.md](../DynamicEmb_APIs.md).
-
 ### 3.2 Configuration after the change
 
 ```python
