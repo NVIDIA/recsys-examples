@@ -50,8 +50,11 @@ from dynamicemb.async_erase import (
 from dynamicemb.batched_dynamicemb_function import (
     DynamicEmbeddingFunction,
     PrefetchState,
+    StorageMode,
     dynamicemb_eval_forward,
     dynamicemb_prefetch,
+    refresh_slots_after_rehash,
+    release_slot_pins,
 )
 from dynamicemb.dynamicemb_config import (
     DynamicEmbCheckMode,
@@ -72,11 +75,11 @@ from dynamicemb.dynamicemb_config import (
 from dynamicemb.initializer import MultiTableInitializer
 from dynamicemb.key_ownership import owned_key_mask, owned_keys
 from dynamicemb.key_value_table import (
+    ERASE_CHUNK_SLOTS,
+    ERASE_MAX_CHUNKS_IN_FLIGHT,
     Cache,
     DynamicEmbCache,
     DynamicEmbStorage,
-    ERASE_CHUNK_SLOTS,
-    ERASE_MAX_CHUNKS_IN_FLIGHT,
     HybridStorage,
     Storage,
     flush_cache,
@@ -1431,6 +1434,23 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
             pooling_weights,
             self._empty_tensor,
         )
+        # Grad-mode forwards keep their slot pins until backward. Without an
+        # autograd graph, release on this stream after the gather consumed them.
+        if not res.requires_grad and prefetch_state.slot_indices is not None:
+            owner = (
+                self._cache
+                if prefetch_state.storage_mode == StorageMode.CACHE
+                else self._storage
+            )
+            # A later batch's prefetch may have rehashed the table since this one's.
+            refresh_slots_after_rehash(owner._state, prefetch_state)
+            release_slot_pins(
+                self._cache,
+                self._storage,
+                prefetch_state.storage_mode,
+                prefetch_state.slot_indices,
+                prefetch_state.unique_table_ids,
+            )
         if isinstance(self._cache, DynamicEmbCache):
             self._cache.training = False
         if isinstance(self._storage, (DynamicEmbStorage, HybridStorage)):
