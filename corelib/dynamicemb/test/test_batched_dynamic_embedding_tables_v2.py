@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import copy
+import dataclasses
 import itertools
 import json
 import os
@@ -4334,7 +4335,9 @@ def test_large_batch_matches_the_oracle(layout):
 # * the estimates never fall below the real sizes, also while a copy of the sizes from
 #   the device is on its way into them;
 # * a module that grows gives the outputs of one that starts at full size, and loses no
-#   key.
+#   key;
+# * the tensors of a prefetch are not reused by the allocator while the forward may
+#   still read them.
 
 GROW_MAX_ROWS = 1 << 16
 GROW_DIM = 8
@@ -4591,3 +4594,68 @@ def test_a_growing_module_gives_the_outputs_of_one_that_starts_at_full_size(layo
     with torch.no_grad():
         indices, offsets = one_key_per_bag(list(range(5600)) * 2)
         assert torch.equal(grown(indices, offsets), full(indices, offsets))
+
+
+# --- the hand-off of a prefetch to the forward stream ---------------------------------
+
+
+def blocks_reused_after_the_host_lets_go(layout):
+    """Prefetch a batch, queue a long wait on the forward stream (the forward and the
+    backward, late), let go of what the prefetch made (the host does, once the backward is
+    queued) and allocate on the prefetch stream what the next prefetch would. Returns the
+    blocks of the prefetch that the allocator handed out again (any byte of them)."""
+    model = make_growing_module(layout, init_capacity=1024)
+    forward, prefetch = torch.cuda.Stream(), torch.cuda.Stream()
+    with torch.cuda.stream(prefetch):
+        keys, offsets = one_key_per_bag(range(300, 500))
+    keys.record_stream(forward)
+    offsets.record_stream(forward)
+    with torch.cuda.stream(prefetch):
+        model.prefetch(keys, offsets, forward)
+    (state,) = model._prefetch_states
+    # the memory of each device tensor of the prefetch: address -> bytes
+    blocks = {
+        t.untyped_storage().data_ptr(): t.untyped_storage().nbytes()
+        for t in (getattr(state, f.name) for f in dataclasses.fields(state))
+        if isinstance(t, torch.Tensor) and t.is_cuda
+    }
+    forward.wait_stream(prefetch)
+    with torch.cuda.stream(forward):
+        torch.cuda._sleep(200_000_000)  # a tenth of a second or so
+    model._prefetch_states.clear()
+    del state
+    with torch.cuda.stream(prefetch):
+        fresh = [
+            torch.empty(nbytes, dtype=torch.uint8, device="cuda")
+            for nbytes in set(blocks.values())
+            for _ in range(32)
+        ]
+    spans = [(t.data_ptr(), t.data_ptr() + t.numel()) for t in fresh]
+    reused = {
+        start
+        for start, nbytes in blocks.items()
+        if any(lo < start + nbytes and start < hi for lo, hi in spans)
+    }
+    del fresh
+    torch.cuda.synchronize()
+    assert blocks, "the prefetch made no device tensor"
+    return reused
+
+
+@pytest.mark.parametrize(
+    "layout, recorded", [("hbm", True), ("cache", True), ("hbm", False)]
+)
+def test_the_tensors_of_a_prefetch_are_not_reused_while_the_forward_may_read_them(
+    layout, recorded, monkeypatch
+):
+    """The tensors a prefetch makes (the unique keys, their count, the slots) are read by
+    the forward and the backward on another stream. The host lets go of them when the
+    backward has been queued, and the allocator would give their blocks to the next
+    prefetch at once. The control, with the recording taken out, does get a block back.
+    """
+    if not recorded:
+        monkeypatch.setattr(
+            "dynamicemb.batched_dynamicemb_function.record_prefetch_state_on",
+            lambda state, stream: None,
+        )
+    assert bool(blocks_reused_after_the_host_lets_go(layout)) is not recorded

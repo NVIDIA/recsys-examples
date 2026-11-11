@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from enum import Enum, auto
 from typing import Callable, ContextManager, Optional, Tuple
 
@@ -818,6 +818,34 @@ def _prefetch_hbm_direct_path(
         return slot_indices, non_admitted_positions, num_refused, rows
 
 
+def record_prefetch_state_on(
+    state: PrefetchState, forward_stream: Optional[torch.cuda.Stream]
+) -> None:
+    """Mark every device tensor of ``state`` as used by ``forward_stream``.
+
+    A prefetch makes these tensors on its own stream, and the forward and the backward
+    of the batch read them on ``forward_stream``. The host lets go of them once the
+    backward has been *queued*, and that is the moment the caching allocator gives their
+    blocks back to the prefetch stream, whose next prefetch may then write into them
+    while the backward is still waiting behind other work of ``forward_stream``: a lookup
+    or a load that reads a key, a slot or a row of some other batch, and faults. Recorded,
+    a block is not reused before the work queued on ``forward_stream`` when it was freed
+    has run. Nothing to do without a forward stream (an evaluation, a module that is not
+    pipelined).
+    """
+    if forward_stream is None:
+        return
+    seen = set()
+    for field in fields(state):
+        value = getattr(state, field.name)
+        if not (isinstance(value, torch.Tensor) and value.is_cuda):
+            continue
+        block = value.untyped_storage().data_ptr()
+        if block not in seen:  # views share their storage's block
+            seen.add(block)
+            value.record_stream(forward_stream)
+
+
 def dynamicemb_prefetch(
     indices: torch.Tensor,
     offsets: torch.Tensor,
@@ -1017,7 +1045,7 @@ def dynamicemb_prefetch(
                 )
                 key_map_generation = storage._state.key_map_generation
 
-        return PrefetchState(
+        state = PrefetchState(
             unique_keys=unique_keys,
             reverse_indices=reverse_indices,
             unique_table_ids=unique_table_ids,
@@ -1034,6 +1062,8 @@ def dynamicemb_prefetch(
             num_unique=num_unique,
             non_admitted_count=non_admitted_count,
         )
+        record_prefetch_state_on(state, forward_stream)
+        return state
 
 
 def dynamicemb_eval_forward(
