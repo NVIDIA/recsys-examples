@@ -37,6 +37,7 @@ import argparse
 import contextlib
 import gc
 import glob
+import inspect
 import json
 import os
 import re
@@ -472,6 +473,10 @@ torch.fx.wrap("inject_grads")
 
 # The name of the EC's one JaggedTensor (install_flat_output).
 _ALL_FEATURES = "all_features"
+# Whether the installed TorchRec casts index dedup's reverse indices to int32
+# before its index_select (1.6 and earlier; from 1.7 on it takes them as
+# they are): install_flat_output reads it from TorchRec's own code.
+_REVERSE_INDICES_INT32 = True
 
 
 def _flat_jagged_tensors(
@@ -506,9 +511,9 @@ def _flat_jagged_tensors(
             expanded = reverse_indices.unsqueeze(1).expand(-1, embeddings.size(-1))
             embeddings = torch.gather(embeddings, 0, expanded)
         else:
-            embeddings = torch.index_select(
-                embeddings, 0, reverse_indices.to(torch.int32)
-            )
+            if _REVERSE_INDICES_INT32:
+                reverse_indices = reverse_indices.to(torch.int32)
+            embeddings = torch.index_select(embeddings, 0, reverse_indices)
     return {_ALL_FEATURES: JaggedTensor(values=embeddings, lengths=features.lengths())}
 
 
@@ -518,7 +523,15 @@ def install_flat_output() -> None:
     ``EmbeddingCollectionAwaitable`` builds it with its module's
     ``construct_jagged_tensors``. One sharding takes all features (every
     table is row-wise), so the output has one entry, which
-    :func:`inject_grads` checks."""
+    :func:`inject_grads` checks. The expansion of index dedup copies the
+    installed TorchRec's."""
+    global _REVERSE_INDICES_INT32
+    original = torchrec_embedding.construct_jagged_tensors
+    if original is _flat_jagged_tensors:
+        return
+    _REVERSE_INDICES_INT32 = "reverse_indices.to(torch.int32)" in inspect.getsource(
+        original
+    )
     torchrec_embedding.construct_jagged_tensors = _flat_jagged_tensors
 
 
