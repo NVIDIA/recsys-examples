@@ -546,8 +546,9 @@ state that every rank shares.
 | a call that does not fit the capacities, or a proxy that gets one key more than `local_size` times | per call, at its second wait | `RuntimeError` on every rank, naming the capacity to raise or the key's occurrences (section 5.4) |
 
 Without gradient clipping, the sharder's `use_index_dedup` is not one of
-these conditions: a call on the op deduplicates the sharding's keys itself
-(section 7.4).
+these conditions: a call on the op deduplicates the sharding's keys itself,
+and without the flag the sharding warns so once, when its first
+`input_dist()` builds the op (section 7.4).
 
 The op places keys by `roundrobin` and `hash_roundrobin` only
 (section 10.1). One op serves all tables of a sharding, so one
@@ -884,7 +885,12 @@ goes once its kernel is queued, and autograd keeps the backward's
   `use_index_dedup`). Tables that clip gradients need the flag (section
   6). Index dedup changes no output row, and each key's gradient adds up
   the same terms; with 16-bit rows a GPU's sum of them is rounded once
-  more (section 18).
+  more (section 18). A sharding that takes the op without the flag says
+  so once, on every rank, when its first `input_dist()` builds the op
+  (`HierDist.setup`): a warning that starts with `output_dist="hierarchical":
+  the sharder has use_index_dedup=False, so the training calls of this
+  sharding deduplicate its keys themselves` (`output_dist="auto":` under
+  `"auto"`).
 * **Owner rules.** The op takes `roundrobin` and `hash_roundrobin` tables
   only (`Config::validate`): a sharding with a `continuous` table takes
   TorchRec's dists under `"auto"`, and raises `ValueError` under

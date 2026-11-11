@@ -836,6 +836,16 @@ def same_outputs(case: Case, ref_out: Dict, hier_out: Dict, exact: bool) -> bool
     return True
 
 
+def show_others(caught: Sequence[warnings.WarningMessage], counted: str) -> None:
+    """Shows again the warnings a check recorded, but those it counted (with
+    ``counted`` in their text): a fallback's warning says why it fell back."""
+    for warning in caught:
+        if counted not in str(warning.message):
+            warnings.showwarning(
+                warning.message, warning.category, warning.filename, warning.lineno
+            )
+
+
 class Pair:
     """A case built twice: on TorchRec's dists (``ref``) and on the
     hierarchical dist (``hier``, its sharding's ``state``), with a probe on
@@ -867,8 +877,16 @@ class Pair:
         self.hier = sharded_ec(self.hier_model)
         self.state = hier_of(self.hier)
         # The first input_dist() makes the EC's input dists and builds the op
-        # (collective): a bucketize nobody waits for, before the calls.
-        self.hier.input_dist(self.hier.create_context(), calls[0])
+        # (collective): a bucketize nobody waits for, before the calls. A
+        # sharding on the op without the sharder's index dedup warns there,
+        # once, that its calls deduplicate its keys themselves.
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            self.hier.input_dist(self.hier.create_context(), calls[0])
+        self.dedup_warnings = sum(
+            "use_index_dedup=False" in str(warning.message) for warning in caught
+        )
+        show_others(caught, "use_index_dedup=False")
         self.ref_probe = Probe(self.ref, case.dim)
         self.hier_probe = Probe(self.hier, case.dim)
 
@@ -1094,7 +1112,10 @@ def run_case(
             and totals_right(jagged_input(hier, hier_run.ctx))
         )
         groups = len(hier._lookups[rw_index(hier)]._emb_modules)
-        ok_path = pair.fell_back == bool(case.plain) and (
+        ok_path = (
+            pair.fell_back == bool(case.plain)
+            and pair.dedup_warnings == int(not case.plain and not case.dedup)
+        ) and (
             state is None
             if case.plain
             else state is not None
@@ -1351,14 +1372,23 @@ def run_options(rank: int, world_size: int, local_size: int, log: Callable) -> i
         plain_ec = sharded_ec(
             build_model(plain, asked, world_size, local_size, every_capacity)
         )
-        plain_run = run_model(
-            plain_ec, batch_of(plain, 141, 0, rank, world_size), False
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            plain_run = run_model(
+                plain_ec, batch_of(plain, 141, 0, rank, world_size), False
+            )
+        warned = sum(
+            f'output_dist="{asked}": the sharder has use_index_dedup=False'
+            in str(warning.message)
+            for warning in caught
         )
+        show_others(caught, "use_index_dedup=False")
         checks[f"{asked} without index dedup"] = (
             hier_of(plain_ec).takes_hier_dist is True
             and plain_run.result is not None
             and totals_right(jagged_input(plain_ec, plain_run.ctx))
             and same_outputs(plain, ref_plain_run.out, plain_run.out, True)
+            and warned == 1
         )
         del plain_ec, plain_run
         teardown_failures += gc_models(log)

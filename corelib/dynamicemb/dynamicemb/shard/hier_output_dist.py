@@ -271,7 +271,8 @@ class HierDist:
         the bucketize's rule of each feature (DistType codes) and whether the
         keys carry weights. ``index_dedup`` is the sharder's
         ``use_index_dedup``: a call on the operator deduplicates the
-        sharding's keys either way, but tables that clip gradients need it.
+        sharding's keys either way (without it, a sharding that takes the
+        operator warns so here, once), but tables that clip gradients need it.
         Ranks whose arguments differ raise the same ValueError. A sharding
         the operator does not apply to takes TorchRec's dists with a warning.
         A configuration it refuses (a ``continuous`` table among them, or
@@ -345,6 +346,17 @@ class HierDist:
             )
             return False
         self.takes_hier_dist = True
+        if not index_dedup:
+            # The training calls deduplicate the keys the sharder did not
+            # (ShardedDynamicEmbeddingCollection.input_dist): say so once.
+            warnings.warn(
+                f'output_dist="{self._asked}": the sharder has '
+                "use_index_dedup=False, so the training calls of this sharding "
+                "deduplicate its keys themselves, as the hierarchical dist needs; "
+                "index dedup changes no output row, and each key's gradient adds "
+                "up the same terms, but with 16-bit rows a GPU's sum of them is "
+                "rounded once more (docs/hier_output_dist.md, sections 7.4 and 18)"
+            )
         return True
 
     def owns(self, kjt: KeyedJaggedTensor) -> bool:

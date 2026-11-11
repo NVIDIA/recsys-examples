@@ -777,8 +777,9 @@ class DynamicEmbTableOptions:
     ``"roundrobin"`` or ``"hash_roundrobin"``: a ``"continuous"`` table makes
     the first ``input_dist()`` raise ``ValueError``. A call on it
     deduplicates the sharding's keys (index dedup), whatever the sharder's
-    ``use_index_dedup``; tables that clip gradients need that flag (else
-    ``ValueError`` there too). It carries no score per key: tables of
+    ``use_index_dedup`` (without that flag, the sharding warns so once, at
+    its first ``input_dist()``); tables that clip gradients need the flag
+    (else ``ValueError`` there too). It carries no score per key: tables of
     ``score_strategy`` ``PRECISE_CUSTOMIZED`` make it raise ``ValueError``
     when the model is sharded. Every GPU of a node gives it keys of one dtype
     (``int32`` or ``int64``) in a call, which it does not check

@@ -21,8 +21,11 @@ warnings.filterwarnings("ignore", category=SyntaxWarning)
 # Where output_dist="hierarchical" cannot run, DynamicEmb warns and takes
 # TorchRec's dists. Raise instead, whatever PYTHONWARNINGS says, so that a run
 # never reports TorchRec's dists as the hierarchical dist. "auto" still falls
-# back.
-warnings.filterwarnings("error", message='output_dist="hierarchical"')
+# back. Such a warning ends with "using TorchRec's dists"; the dist's note that
+# it deduplicates a sharding's keys itself does not, and only warns.
+warnings.filterwarnings(
+    "error", message='(?s)output_dist="hierarchical".*using TorchRec\'s dists'
+)
 import argparse
 from typing import List, Union
 
