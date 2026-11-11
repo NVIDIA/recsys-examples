@@ -33,20 +33,51 @@ __forceinline__ __device__ uint64_t hash_key(uint64_t key) {
   return murmur3_fmix64(key);
 }
 
-// The bucket of a key under kCyclic or kHashedCyclic. Both rules read the key
-// as a table stores it: widened to 64 bits with its sign, then unsigned. So an
-// int32 key goes where the int64 key with the same value goes, which is where a
-// checkpoint load or a delta replay puts it (dynamicemb/key_ownership.py).
-// Kernel1 and kernel2 both call this, so the lengths one counts and the keys
-// the other writes agree.
+// A key as a table stores it: widened to 64 bits with its sign, then read as
+// unsigned. Every dist_type reads the key this way, so an int32 key goes where
+// the int64 key with the same value goes, which is where a checkpoint load or a
+// delta replay puts it (dynamicemb/key_ownership.py).
+template <typename index_t>
+__forceinline__ __device__ uint64_t stored_key(const index_t key) {
+  return static_cast<uint64_t>(static_cast<int64_t>(key));
+}
+
+// The bucket of a key under kCyclic or kHashedCyclic. Kernel1 and kernel2 both
+// call this, so the lengths one counts and the keys the other writes agree.
 template <typename index_t>
 __forceinline__ __device__ std::make_unsigned_t<index_t>
 cyclic_bucket(const index_t key, const DistType dist_type, const int my_size) {
-  const uint64_t wide_key = static_cast<uint64_t>(static_cast<int64_t>(key));
+  const uint64_t wide_key = stored_key(key);
   const uint64_t spread =
       dist_type == DistType::kHashedCyclic ? hash_key(wide_key) : wide_key;
   return static_cast<std::make_unsigned_t<index_t>>(
       spread % static_cast<uint64_t>(my_size));
+}
+
+// The bucket of a key under kBlock, and the key the bucket receives. A key in
+// [0, blk_size * my_size) goes to block key / blk_size as key % blk_size; any
+// other key, a negative one included, goes to key % my_size as key / my_size.
+// The arithmetic is 64-bit, so a negative int32 key is the large number its
+// int64 twin is, not a 32-bit one.
+template <typename index_t> struct BlockBucket {
+  std::make_unsigned_t<index_t> bucket;
+  std::make_unsigned_t<index_t> new_key;
+};
+
+template <typename index_t>
+__forceinline__ __device__ BlockBucket<index_t>
+block_bucket(const index_t key, const index_t blk_size, const int my_size) {
+  using uindex_t = std::make_unsigned_t<index_t>;
+  const uint64_t wide_key = stored_key(key);
+  const uint64_t span = static_cast<uint64_t>(blk_size) * my_size;
+  const uint64_t divisor = static_cast<uint64_t>(blk_size);
+  const uint64_t ranks = static_cast<uint64_t>(my_size);
+  if (wide_key < span) {
+    return {static_cast<uindex_t>(wide_key / divisor),
+            static_cast<uindex_t>(wide_key % divisor)};
+  }
+  return {static_cast<uindex_t>(wide_key % ranks),
+          static_cast<uindex_t>(wide_key / ranks)};
 }
 
 __forceinline__ __device__ int atomicAdd(int *address, int val) {
@@ -262,7 +293,6 @@ __launch_bounds__(kMaxThreads) void _block_bucketize_sparse_features_cuda_kernel
     // of hashing indices calculation.
     if (!use_block_bucketize_pos) {
       for (auto i = rowstart + threadIdx.x; i < rowend; i += blockDim.x) {
-        uindex_t idx = static_cast<uindex_t>(indices_data[i]);
         uindex_t p = 0;
         switch (dist_type) {
         case DistType::kCyclic:
@@ -270,7 +300,7 @@ __launch_bounds__(kMaxThreads) void _block_bucketize_sparse_features_cuda_kernel
           p = cyclic_bucket(indices_data[i], dist_type, my_size);
           break;
         default: // DistType::kBlock
-          p = idx < blk_size * my_size ? idx / blk_size : idx % my_size;
+          p = block_bucket(indices_data[i], blk_size, my_size).bucket;
           break;
         }
         atomicAdd(&new_lengths_data[p * lengths_size + b_t], 1);
@@ -352,10 +382,12 @@ __launch_bounds__(kMaxThreads) void _block_bucketize_sparse_features_cuda_kernel
           p = cyclic_bucket(indices_data[i], dist_type, my_size);
           new_idx = idx;
           break;
-        default: // DistType::kBlock
-          p = idx < blk_size * my_size ? idx / blk_size : idx % my_size;
-          new_idx = idx < blk_size * my_size ? idx % blk_size : idx / my_size;
+        default: { // DistType::kBlock
+          const auto block = block_bucket(indices_data[i], blk_size, my_size);
+          p = block.bucket;
+          new_idx = block.new_key;
           break;
+        }
         }
       } else {
         uindex_t lb = indices_to_lb[i];

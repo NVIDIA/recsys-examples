@@ -35,10 +35,10 @@ Three things the rule is easy to get wrong, and why they live here:
 * **The key is 64 bits, whatever the input's dtype.** A table stores an int32
   key widened to int64 with its sign, and a checkpoint or a delta holds that
   int64 key, which is all a loader has. So the kernel widens an int32 key the
-  same way before either rule: an int32 key gets the rank of the int64 key with
-  the same value. Read in 32 bits instead, a negative key is another number,
-  and a hash cut to 32 bits leaves another remainder at any world size that is
-  not a power of two.
+  same way before any of its rules, ``continuous`` included: an int32 key gets
+  the rank of the int64 key with the same value. Read in 32 bits instead, a
+  negative key is another number, and a hash cut to 32 bits leaves another
+  remainder at any world size that is not a power of two.
 * **``dist_type`` selects the rule**, and ``roundrobin`` and ``hash_roundrobin``
   disagree for almost every key. Code that hardcodes one of them keeps roughly
   ``1/num_shards`` of the keys when handed the other, and reports no error.

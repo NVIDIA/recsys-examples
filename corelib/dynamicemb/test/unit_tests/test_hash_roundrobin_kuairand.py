@@ -48,11 +48,12 @@ def assign_owner_cpu(
     blk_size: int,
 ) -> np.ndarray:
     if dist_type == "continuous":
-        return np.where(
-            indices < blk_size * my_size,
-            indices // blk_size,
-            indices % my_size,
-        ).astype(np.int64)
+        keys = stored_keys_cpu(indices)
+        block = np.uint64(blk_size)
+        size = np.uint64(my_size)
+        return np.where(keys < block * size, keys // block, keys % size).astype(
+            np.int64
+        )
     if dist_type == "roundrobin":
         return (stored_keys_cpu(indices) % np.uint64(my_size)).astype(np.int64)
     if dist_type == "hash_roundrobin":
@@ -69,19 +70,24 @@ def continuous_owner_cpu(
 ) -> Tuple[np.ndarray, np.ndarray]:
     """Rank and rewritten key of each key under ``continuous``.
 
-    This rule reads a key in its own width, unsigned, and writes the rewritten
-    key back in that width: an int32 key stays an int32. So a negative key
-    counts as a large number past the last block, and goes by the modulo.
+    Like the other rules, this one reads the key as a table stores it: widened
+    to 64 bits with its sign, then unsigned. So a negative key counts as a large
+    number past the last block and goes by the modulo, whatever its width. The
+    rewritten key is written back in the input's dtype, which keeps the low bits
+    of the 64-bit result: an int32 key stays an int32.
     """
-    unsigned_dtype = np.uint32 if key_dtype == torch.int32 else np.uint64
     signed_dtype = np.int32 if key_dtype == torch.int32 else np.int64
-    keys = np.asarray(indices).astype(signed_dtype).astype(unsigned_dtype)
-    block = unsigned_dtype(blk_size)
-    size = unsigned_dtype(my_size)
+    unsigned_dtype = np.uint32 if key_dtype == torch.int32 else np.uint64
+    keys = stored_keys_cpu(indices)
+    block = np.uint64(blk_size)
+    size = np.uint64(my_size)
     in_blocks = keys < block * size
     ranks = np.where(in_blocks, keys // block, keys % size)
     rewritten = np.where(in_blocks, keys % block, keys // size)
-    return ranks.astype(np.int64), rewritten.astype(signed_dtype)
+    return (
+        ranks.astype(np.int64),
+        rewritten.astype(unsigned_dtype).astype(signed_dtype),
+    )
 
 
 def owner_histogram_cpu(
@@ -550,12 +556,13 @@ def test_bucketize_kernel_matches_key_ownership(key_dtype, my_size, dist_type):
 
 @pytest.mark.parametrize("my_size", EDGE_KEY_WORLD_SIZES)
 @pytest.mark.parametrize("key_dtype", [torch.int64, torch.int32], ids=str)
-def test_bucketize_kernel_continuous_keeps_key_width(key_dtype, my_size):
-    """``continuous`` reads a key in its own width and rewrites it in that width.
+def test_bucketize_kernel_continuous_reads_stored_key(key_dtype, my_size):
+    """``continuous`` reads the key a table stores, and rewrites it in its dtype.
 
-    key_ownership has no rule for it: it rewrites a key to its offset inside a
-    block, so what a table stores is not the input key. The rewrite of an int32
-    key is an int32.
+    A negative int32 key is the same large number as the int64 key with the same
+    value, so the two go to one rank. key_ownership has no rule for it: it
+    rewrites a key to its offset inside a block, so what a table stores is not
+    the input key. The rewrite of an int32 key is an int32.
     """
     pytest.importorskip("dynamicemb_extensions")
 
@@ -573,3 +580,17 @@ def test_bucketize_kernel_continuous_keeps_key_width(key_dtype, my_size):
     assert new_indices.cpu().numpy().tolist() == rewritten[order].tolist()
     permute = unbucketize_permute.long().cpu().numpy()
     assert new_indices.cpu().numpy()[permute].tolist() == rewritten.tolist()
+
+
+@pytest.mark.parametrize("dist_type", ["continuous", "roundrobin", "hash_roundrobin"])
+@pytest.mark.parametrize("my_size", EDGE_KEY_WORLD_SIZES)
+def test_bucketize_kernel_int32_goes_where_int64_goes(my_size, dist_type):
+    """Under every rule an int32 key goes to the rank of the int64 key it equals."""
+    pytest.importorskip("dynamicemb_extensions")
+
+    keys32 = edge_keys(torch.int32)
+    ranks32, _, _ = bucketize_one_key_per_sample(keys32, my_size, dist_type)
+    ranks64, _, _ = bucketize_one_key_per_sample(
+        keys32.to(torch.int64), my_size, dist_type
+    )
+    assert torch.equal(ranks32, ranks64)
