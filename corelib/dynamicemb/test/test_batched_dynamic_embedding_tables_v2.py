@@ -3075,6 +3075,13 @@ def _rows(raw: bytes, num_keys: int) -> List[bytes]:
     return [raw[i * width : (i + 1) * width] for i in range(num_keys)]
 
 
+# Every row of the fp8 tests starts here. An fp8 table stores e4m3 codes of
+# value * 256, and 12 is exactly an e4m3 value (1.5 * 2**3), so this starting
+# value is stored without any rounding: the fp8 and the fp32 table begin equal
+# bit for bit, and any difference after that comes from training.
+FP8_INITIAL_VALUE = 12 / 256
+
+
 def _rowwise_adagrad_bdeb(
     value_type: torch.dtype,
     dims: List[int],
@@ -3095,7 +3102,7 @@ def _rowwise_adagrad_bdeb(
             caching=caching,
             local_hbm_for_values=local_hbm_for_values,
             initializer_args=DynamicEmbInitializerArgs(
-                mode=DynamicEmbInitializerMode.CONSTANT, value=12 / 256
+                mode=DynamicEmbInitializerMode.CONSTANT, value=FP8_INITIAL_VALUE
             ),
         )
         for dim in dims
@@ -3174,8 +3181,8 @@ def _fp8_and_fp32_drifts(tables, num_features):
         order32, order8 = keys32.argsort(), keys8.argsort()
         torch.testing.assert_close(keys32[order32], keys8[order8])
         yield (
-            vals32[order32].float() - 12 / 256,
-            vals8[order8].float() - 12 / 256,
+            vals32[order32].float() - FP8_INITIAL_VALUE,
+            vals8[order8].float() - FP8_INITIAL_VALUE,
         )
 
 
