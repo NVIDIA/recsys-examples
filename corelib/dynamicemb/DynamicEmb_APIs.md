@@ -1943,7 +1943,7 @@ A step makes no blocking host sync. It waits for the device only when:
 
 A probabilistic admitter (`ProbabilisticAdmissionStrategy`) draws one random number per entry of the arrays of the step, that is one per input key of the batch, whatever the number of keys that are missing, and it does so on every step, also on one whose keys all hit, since the miss path runs for zero keys instead of being skipped. The draws follow `torch.manual_seed`; the generator advances by that many per step, so which key gets which draw depends on the size of the batch.
 
-The over-subscription check of the prefetched keys (`Outstanding prefetched keys ... exceed cache capacity`) reads the number of unique keys only when the number of input keys of the batches in flight is larger than the cache.
+The over-subscription check of the prefetched keys (`Outstanding prefetched keys ... exceed cache capacity`) counts the keys that the batches in flight pin by the number of input keys of each, an upper bound, and replaces the bound of a batch by its number of unique keys when that has reached the host: a batch that is counted by its bound while the sum is past half of the cache has its number of unique keys copied to the host without waiting, and a later check uses it if it has landed. Only when the bounds, so replaced, still add up to more than the cache does the check read the numbers of unique keys from the device.
 
 The blocking syncs of a step can be counted with `--sync-count` of the many-collections benchmark, see the [benchmark README](./benchmark/README.md#3-benchmark-the-lookup-of-many-embedding-collections).
 

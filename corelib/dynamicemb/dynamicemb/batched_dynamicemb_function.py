@@ -23,6 +23,7 @@ from dynamicemb.dynamicemb_config import EvictedItemMode
 from dynamicemb.initializer import MultiTableInitializer
 from dynamicemb.key_value_table import (
     Cache,
+    DelayedCopy,
     DynamicEmbCache,
     DynamicEmbStorage,
     DynamicEmbTableState,
@@ -207,6 +208,10 @@ class PrefetchState:
     # ``BatchedDynamicEmbeddingTablesV2._settle_outstanding_keys``).
     num_prefetched_keys: int = 0
     outstanding_keys_ref: Optional[torch.Tensor] = None
+    # The real number of unique keys on its way to the host, asked for by a batch that is
+    # counted by its bound when the sum is past half of the cache: the bound is replaced
+    # by it once it has landed.
+    unique_count: Optional[DelayedCopy] = None
     # The keys the admitter refused: their positions among the unique keys and how many.
     non_admitted_count: Optional[torch.Tensor] = None
     # The key_map_generation (rehash count) of the table state the slots were found in: a later
@@ -880,10 +885,14 @@ def dynamicemb_prefetch(
 
     ``outstanding_settle(num_unique, bound)`` is asked when the keys that prefetched
     batches pin in the cache add up, by the host's bounds, to more than the cache holds
-    (see ``BatchedDynamicEmbeddingTablesV2._settle_outstanding_keys``): it reads the real
-    count of this batch, ``num_unique``, and returns it, or raises if the cache really is
-    over-subscribed. It runs before the cache is touched, and is required whenever
-    ``outstanding_keys_ref`` is given.
+    (see ``BatchedDynamicEmbeddingTablesV2._settle_outstanding_keys``): it replaces the
+    bounds of the batches in flight by their real counts where these have landed on the
+    host already, and if that does not settle it reads the real count of this batch,
+    ``num_unique``, from the device and returns it (else it returns the bound), or
+    raises if the cache really is over-subscribed. It runs before the cache is touched,
+    and is required whenever ``outstanding_keys_ref`` is given. A batch that is counted
+    by its bound when the sum is past half of the cache has its real count copied to the
+    host without waiting (``PrefetchState.unique_count``), for a later check.
     """
     with torch.cuda.nvtx.range("dynamicemb_prefetch"):
         table_num = feature_offsets.numel() - 1
@@ -949,6 +958,7 @@ def dynamicemb_prefetch(
         non_admitted_positions = None
         non_admitted_count = None
         value_row_indices = None
+        unique_count = None
         key_map_generation = 0
         if caching:
             storage_mode = StorageMode.CACHE
@@ -964,10 +974,18 @@ def dynamicemb_prefetch(
             if storage_mode == StorageMode.CACHE:
                 if outstanding_keys_ref is not None:
                     outstanding_keys_ref += num_prefetched_keys
-                    if _scalar_item(outstanding_keys_ref) > cache._state.capacity:
-                        num_prefetched_keys = outstanding_settle(
-                            num_unique, num_prefetched_keys
-                        )
+                    outstanding = _scalar_item(outstanding_keys_ref)
+                    bound = num_prefetched_keys
+                    if outstanding > cache._state.capacity:
+                        num_prefetched_keys = outstanding_settle(num_unique, bound)
+                    if (
+                        num_prefetched_keys == bound
+                        and outstanding > cache._state.capacity // 2
+                    ):
+                        # The bound stands and the sum is past half of the cache: the
+                        # real count goes to the host without waiting, for a later check
+                        # to use if it has landed by then.
+                        unique_count = DelayedCopy(num_unique)
                 (
                     slot_indices,
                     non_admitted_positions,
@@ -1021,6 +1039,7 @@ def dynamicemb_prefetch(
             unique_scores=unique_scores,
             num_prefetched_keys=num_prefetched_keys,
             outstanding_keys_ref=outstanding_keys_ref,
+            unique_count=unique_count,
             value_row_indices=value_row_indices,
             key_map_generation=key_map_generation,
             num_unique=num_unique,
