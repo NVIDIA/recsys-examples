@@ -495,6 +495,7 @@ def _flat_jagged_tensors(
     reverse_indices: Optional[torch.Tensor] = None,
     seq_vbe_ctx=None,
     use_gather_select: bool = False,
+    use_sorted_select: bool = False,
 ) -> Dict[str, JaggedTensor]:
     """TorchRec's ``construct_jagged_tensors`` without its split by feature:
     a sharding's rows, with index dedup expanded as TorchRec expands it (when
@@ -504,11 +505,15 @@ def _flat_jagged_tensors(
     row of lengths per feature) is host work that grows with the features,
     the same for every dist, and its backward is a cat of the features'
     gradients: neither is the embedding's."""
+    # TorchRec 1.9 passes use_sorted_select, False unless the EC asks for it
     assert (
-        not need_indices and not features_to_permute_indices and seq_vbe_ctx is None
+        not need_indices
+        and not features_to_permute_indices
+        and seq_vbe_ctx is None
+        and not use_sorted_select
     ), (
-        "the benchmark's EC returns no indices, and has no column-wise sharding"
-        " and no variable batch"
+        "the benchmark's EC returns no indices, has no column-wise sharding"
+        " and no variable batch, and does not ask for sorted select"
     )
     if original_features is not None:
         features = original_features

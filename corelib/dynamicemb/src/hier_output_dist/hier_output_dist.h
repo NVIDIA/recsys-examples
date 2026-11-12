@@ -83,8 +83,16 @@ class Communicator {
   ncclGinType_t gin_type() const { return gin_type_; }
   // Across nodes, whether NCCL connected GIN on the rails only, as asked (it
   // does so only when NCCL_CROSS_NIC is 0; else GIN's memory grows with the
-  // ranks).
-  bool gin_railed() const { return dev_.ginConnectionsRailed; }
+  // ranks). NCCL 2.31 replaced the flag with the stride between the ranks GIN
+  // connects, 1 when it connects every rank (its own compat shim maps the two
+  // alike).
+  bool gin_railed() const {
+#if NCCL_VERSION_CODE >= NCCL_VERSION(2, 31, 0)
+    return dev_.ginConnectionStride > 1;
+#else
+    return dev_.ginConnectionsRailed;
+#endif
+  }
   // What ncclMemAlloc rounds an allocation up to.
   size_t granularity() const { return granularity_; }
   // Every rank's `values`, as many on every rank, in rank order: rank r's
