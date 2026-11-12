@@ -459,6 +459,16 @@ class DynamicEmbTableState:
     # key map grows with the keys it holds and its value buffer with the rows.
     estimated_row_counts: Optional[torch.Tensor] = None
     collect_table_sizes_flag: bool = False
+    # The sizes of the tables on their way to the host, to correct the estimates (see
+    # :func:`close_batch`), and how many times the estimates were set from the device:
+    # a correction asked for before that is void.
+    size_refresh: Optional["SizeRefresh"] = None
+    estimate_generation: int = 0
+    # The last check of the estimates found them within four batches of a limit.
+    estimates_close: bool = False
+    # What the batches that are not done yet were counted by, per table (see
+    # :func:`open_batch`).
+    open_bound: Optional[torch.Tensor] = None
     # How many times ``key_index_map`` has been replaced (an expansion builds a
     # new one and drops the old). A slot number means something only in the map it
     # was read from, so whoever walks the slots across calls -- an erase by score,
@@ -774,6 +784,7 @@ def collect_table_sizes_for_state(
     """Copy device table sizes into ``state.estimated_table_sizes`` when flag is set."""
     if not state.collect_table_sizes_flag:
         return
+    state.estimate_generation += 1
     table_sizes = collect_table_sizes_to_device(state)
     state.estimated_table_sizes.copy_(table_sizes, non_blocking=non_blocking)
     if state.estimated_row_counts is not None:
@@ -1251,6 +1262,7 @@ def _expand_if_need_no_eviction(
         rows = collect_row_counts_to_device(state).cpu()
         keys_est.copy_(keys)
         rows_est.copy_(rows)
+        state.estimate_generation += 1
         results, targets = get_expand_info(state, keys, unique_size_per_table)
         need_rows = (rows + unique_size_per_table).tolist()
         if any(results):
@@ -1290,15 +1302,31 @@ def growth_may_be_due(
     the device may be on its way into the estimates (see ``dynamicemb_prefetch``), and
     they are not to be read or added to before the host has waited for it, which
     reading the number of unique keys does.
+
+    It also corrects the estimates by the sizes of the tables that a batch that is done
+    asked for and that have landed (:func:`close_batch`), and notes whether the estimates
+    are within four batches of a limit, which that request depends on.
     """
     _ensure_estimates(state)
+    state.estimates_close = False
     if state.collect_table_sizes_flag:
         return True
-    results, _ = get_expand_info(state, state.estimated_table_sizes, bound_per_table)
-    if any(results):
-        return True
-    return state.no_eviction and _rows_short(
-        state, state.estimated_row_counts, bound_per_table
+    _land_size_refresh(state)
+    # Four batches of room: while there is, nothing can grow and the estimates are no
+    # trouble. Closer than that, the batch asks the device for the sizes once it is done
+    # (see :func:`close_batch`), to bring the estimates back to them.
+    state.estimates_close = _may_pass_limit(state, 4 * bound_per_table)
+    return state.estimates_close and _may_pass_limit(state, bound_per_table)
+
+
+def _may_pass_limit(state: DynamicEmbTableState, add_per_table: torch.Tensor) -> bool:
+    """Whether the estimates plus ``add_per_table`` pass the limit of a table: the load
+    factor of its key map, and for a table that never evicts the rows of its value
+    buffer."""
+    results, _ = get_expand_info(state, state.estimated_table_sizes, add_per_table)
+    return any(results) or (
+        state.no_eviction
+        and _rows_short(state, state.estimated_row_counts, add_per_table)
     )
 
 
@@ -1313,6 +1341,110 @@ def accumulate_bound(
     state.estimated_table_sizes.add_(bound_per_table)
     if state.no_eviction:
         state.estimated_row_counts.add_(bound_per_table)
+
+
+@dataclass
+class SizeRefresh:
+    """The sizes of the tables on their way to the host, and the estimates as they were
+    when they were asked for, less the batches that were still open (``held``): one row
+    for the keys of each table, and for a table that never evicts a second one for the
+    rows handed out."""
+
+    generation: int
+    held: torch.Tensor
+    sizes: DelayedCopy
+
+    def __reduce__(self):
+        # As for the copy of a count on its way: a copy of a module starts without it.
+        return (_nothing, ())
+
+
+def _estimates_of(state: DynamicEmbTableState) -> torch.Tensor:
+    rows = [state.estimated_table_sizes]
+    if state.no_eviction:
+        rows.append(state.estimated_row_counts)
+    return torch.stack(rows)
+
+
+def _sizes_on_device(state: DynamicEmbTableState) -> torch.Tensor:
+    km = state.key_index_map
+    # The copy is ordered after the work of this stream only. A later prefetch may expand
+    # the table on its own stream and let go of this key map before the copy has run: the
+    # allocator is told that the blocks are in use here.
+    stream = torch.cuda.current_stream()
+    for tensor in (km.bucket_sizes, km.table_bucket_offsets_, km.row_counters_):
+        if tensor is not None:
+            tensor.record_stream(stream)
+    rows = [collect_table_sizes_to_device(state)]
+    if state.no_eviction:
+        rows.append(collect_row_counts_to_device(state))
+    return torch.stack(rows)
+
+
+def open_batch(state: DynamicEmbTableState, counted_per_table: torch.Tensor):
+    """A batch has been counted in the estimates by ``counted_per_table`` (its bound, or
+    the number of its unique keys). It is open until :func:`close_batch`: the keys that
+    it adds to the tables may not all be there yet. Returns what the batch hands back
+    then, what it was counted by and the key map it was counted in.
+
+    The estimates and what is kept here are the business of the thread that trains: the
+    prefetch, the forward and the backward of a step do not run at the same time.
+    """
+    if state.open_bound is None:
+        state.open_bound = torch.zeros(state.num_tables, dtype=torch.int64)
+    state.open_bound.add_(counted_per_table)
+    return counted_per_table, state.key_map_generation
+
+
+def close_batch(state: DynamicEmbTableState, batch) -> None:
+    """The batch (what :func:`open_batch` returned) is done, its inserts queued: ask for
+    the sizes of the tables, if the last check of :func:`growth_may_be_due` found the
+    estimates within four batches of a limit (farther away, even a drifting estimate asks
+    the device for nothing), no copy is on its way already, and the table has not been
+    expanded since the batch was counted: the key map that a later prefetch has made on
+    its own stream is not ordered after this one.
+
+    The estimates, less the batches still open, are an upper bound of what the tables hold
+    once the batches that are closed are done, whatever the order the batches are done
+    in: the inserts of every batch that is closed are queued ahead of the copy, those of
+    the batches still open may or may not be. The copy goes to the host without waiting,
+    and :func:`growth_may_be_due` uses it once it has landed.
+    """
+    counted_per_table, key_map_generation = batch
+    state.open_bound.sub_(counted_per_table)
+    if (
+        not state.estimates_close
+        or state.size_refresh is not None
+        or key_map_generation != state.key_map_generation
+    ):
+        return
+    state.size_refresh = SizeRefresh(
+        state.estimate_generation,
+        _estimates_of(state) - state.open_bound,
+        DelayedCopy(_sizes_on_device(state)),
+    )
+
+
+def _land_size_refresh(state: DynamicEmbTableState) -> None:
+    """Correct the estimates by the sizes that have landed, if any, without waiting.
+
+    The device held ``sizes`` once the batches that were closed were done, and the host
+    had counted ``held`` for them: what it counted beyond the sizes is dropped. The
+    bounds of the batches that were open stay, and so do those of the batches counted
+    since, which are added to the estimates as they come: the estimates remain an upper
+    bound of what the tables will hold. Whatever else has set the estimates since (see
+    ``estimate_generation``) makes the correction void.
+    """
+    refresh = state.size_refresh
+    if refresh is None or not refresh.sizes.landed():
+        return
+    state.size_refresh = None
+    if refresh.generation != state.estimate_generation:
+        return
+    over = (refresh.held - refresh.sizes.value).clamp_(min=0)
+    state.estimated_table_sizes.sub_(over[0])
+    if state.no_eviction:
+        state.estimated_row_counts.sub_(over[1])
 
 
 def expand_if_need_impl(
@@ -3266,6 +3398,16 @@ class DynamicEmbStorage(Storage):
         """Count a batch for which ``may_expand`` was False by its bound."""
         accumulate_bound(self._state, bound_per_table)
 
+    def open_batch(self, counted_per_table: torch.Tensor):
+        """Note a batch counted by ``counted_per_table``, until ``close_batch``; returns
+        what the batch gives back then (see :func:`open_batch`)."""
+        return open_batch(self._state, counted_per_table)
+
+    def close_batch(self, batch) -> None:
+        """The batch is done: ask for the sizes of the tables, to correct the host's
+        estimates by them without waiting (see :func:`close_batch`)."""
+        close_batch(self._state, batch)
+
     def expand_if_need(self, unique_size_per_table: torch.Tensor) -> None:
         """Accumulate per-table unique counts, optionally collect size and expand."""
         expand_if_need_impl(self._state, unique_size_per_table)
@@ -3897,6 +4039,14 @@ class HybridStorage(Storage):
     def accumulate_bound(self, bound_per_table: torch.Tensor) -> None:
         """Count a batch for which ``may_expand`` was False by its bound."""
         accumulate_bound(self._host, bound_per_table)
+
+    def open_batch(self, counted_per_table: torch.Tensor):
+        """See ``DynamicEmbStorage.open_batch`` (the host tier)."""
+        return open_batch(self._host, counted_per_table)
+
+    def close_batch(self, batch) -> None:
+        """See ``DynamicEmbStorage.close_batch`` (the host tier)."""
+        close_batch(self._host, batch)
 
     def expand_if_need(self, unique_size_per_table: torch.Tensor) -> None:
         """Accumulate per-table unique counts (on host), optionally collect size and expand."""

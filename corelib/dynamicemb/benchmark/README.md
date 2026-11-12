@@ -618,7 +618,7 @@ bash ./benchmark/benchmark_many_collections.sh --compare main.json nosync.json
 | `--collections` / `--tables` / `--dim` | 32 / 2 / 64 | K, T and D |
 | `--batch-size` / `--hotness` | 1024 / 4 | B samples and H keys per sample and table |
 | `--num-embeddings` / `--alpha` | 1000000 / 1.05 | rows per table, pow-law exponent |
-| `--init-capacity-ratio` | 1.0 | `init_capacity` as a share of `--num-embeddings`; below 1 the tables can still grow (`hybrid`: below `1 - --hbm-ratio`, the share of the rows that the host tier holds), and the host keeps track of their size to decide whether to expand. A tree that reads the device only when a table may have to expand does so in a short burst every few dozen steps: count its syncs over more steps than that, `--sync-count --sync-steps 90` |
+| `--init-capacity-ratio` | 1.0 | `init_capacity` as a share of `--num-embeddings`; below 1 the tables can still grow (`hybrid`: below `1 - --hbm-ratio`, the share of the rows that the host tier holds), and the host keeps track of their size to decide whether to expand. A tree that reads the device only when a table comes close to its limit does so rarely: count its syncs over many steps, `--sync-count --sync-steps 90` |
 | `--optimizer` | `sgd` | `sgd` or `adam` (Adam keeps 2*D state per row: 3x the memory) |
 | `--storage` | `hbm` | `hbm`, `caching`, `hybrid` or `host`, see below |
 | `--hbm-ratio` | `caching`: from the inputs, `hybrid`: 0.1 | share of each table's rows in HBM for `caching` (the cache) and `hybrid` (the HBM tier); a caching layout is given the smallest cache that holds the unique keys of an input, see the notes |

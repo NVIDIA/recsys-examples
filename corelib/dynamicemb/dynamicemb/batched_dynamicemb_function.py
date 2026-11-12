@@ -202,6 +202,11 @@ class PrefetchState:
     # counted by its bound when the sum is past half of the cache: the bound is replaced
     # by it once it has landed.
     unique_count: Optional[DelayedCopy] = None
+    # What the storage noted of the batch when the host's estimates of the table sizes
+    # counted it (``open_batch``), given back when the batch is done so that the
+    # estimates can be corrected by the sizes of the tables (``close_batch``). None for a
+    # storage that keeps no such estimates.
+    counted: Optional[tuple] = None
     # The keys the admitter refused: their positions among the unique keys and how many.
     non_admitted_count: Optional[torch.Tensor] = None
     # The key_map_generation (rehash count) of the table state the slots were found in: a later
@@ -973,6 +978,7 @@ def dynamicemb_prefetch(
         non_admitted_count = None
         value_row_indices = None
         unique_count = None
+        counted_by = None
         key_map_generation = 0
         if caching:
             storage_mode = StorageMode.CACHE
@@ -985,8 +991,10 @@ def dynamicemb_prefetch(
             if may_grow:
                 if unique_per_table is None:
                     storage.accumulate_bound(key_bound)
+                    counted_by = key_bound
                 else:
                     storage.expand_if_need(unique_per_table)
+                    counted_by = unique_per_table
 
             if storage_mode == StorageMode.CACHE:
                 if outstanding_keys_ref is not None:
@@ -1045,6 +1053,12 @@ def dynamicemb_prefetch(
                 )
                 key_map_generation = storage._state.key_map_generation
 
+        # Nothing that can fail is left: the batch is open from here to its release.
+        counted = (
+            storage.open_batch(counted_by)
+            if counted_by is not None and hasattr(storage, "open_batch")
+            else None
+        )
         state = PrefetchState(
             unique_keys=unique_keys,
             reverse_indices=reverse_indices,
@@ -1057,6 +1071,7 @@ def dynamicemb_prefetch(
             num_prefetched_keys=num_prefetched_keys,
             outstanding_keys_ref=outstanding_keys_ref,
             unique_count=unique_count,
+            counted=counted,
             value_row_indices=value_row_indices,
             key_map_generation=key_map_generation,
             num_unique=num_unique,
@@ -1439,6 +1454,7 @@ class DynamicEmbeddingFunction(torch.autograd.Function):
             ctx.num_persisted = num_persisted
             ctx.outstanding_keys_ref = prefetch_state.outstanding_keys_ref
             ctx.num_prefetched_keys = prefetch_state.num_prefetched_keys
+            ctx.counted = prefetch_state.counted
 
             # Recover outstanding count at end of forward so it is decremented
             # even when backward is not run, avoiding overflow.
@@ -1566,5 +1582,11 @@ class DynamicEmbeddingFunction(torch.autograd.Function):
                             preserve_existing=True,
                             num_valid=num_p,
                         )
+
+            # The batch is done, its inserts queued: ask for the sizes of the tables.
+            if ctx.counted is not None:
+                storage.close_batch(ctx.counted)
+                # A second backward (retain_graph) must not close the batch again.
+                ctx.counted = None
 
             return (None,) * 11

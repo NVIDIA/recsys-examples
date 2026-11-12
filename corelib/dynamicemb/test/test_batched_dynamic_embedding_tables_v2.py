@@ -56,8 +56,10 @@ from dynamicemb.key_value_table import (
     DynamicEmbStorage,
     DynamicEmbTableState,
     HybridStorage,
+    SizeRefresh,
     Storage,
     collect_row_counts_to_device,
+    collect_table_sizes_for_state,
     collect_table_sizes_to_device,
     export_keys_values_iter,
     load_from_flat,
@@ -4334,6 +4336,11 @@ def test_large_batch_matches_the_oracle(layout):
 #   every step;
 # * the estimates never fall below the real sizes, also while a copy of the sizes from
 #   the device is on its way into them;
+# * a batch that is done has the sizes of the tables sent to the host without waiting,
+#   and the estimates are corrected by them once they have landed: they follow the size
+#   of a table that holds few keys, and never fall below it while batches overlap, nor
+#   below what the batches still open may bring; a correction made against estimates
+#   that were set again since is void;
 # * a module that grows gives the outputs of one that starts at full size, and loses no
 #   key;
 # * the tensors of a prefetch are not reused by the allocator while the forward may
@@ -4594,6 +4601,121 @@ def test_a_growing_module_gives_the_outputs_of_one_that_starts_at_full_size(layo
     with torch.no_grad():
         indices, offsets = one_key_per_bag(list(range(5600)) * 2)
         assert torch.equal(grown(indices, offsets), full(indices, offsets))
+
+
+@pytest.mark.parametrize("layout", GROW_LAYOUTS)
+def test_the_estimates_follow_the_sizes_of_a_table_whose_batches_repeat_their_keys(
+    layout,
+):
+    """Batches of 1500 keys of which 20 are distinct: counted by their bound, the estimate
+    of the keys would pass the limit of the table within a few steps, and the step would
+    ask the device at every step after that. A batch that is done has the sizes of the
+    tables sent to the host, and the estimates are corrected by them once they have
+    landed, never below them."""
+    model = make_growing_module(layout, init_capacity=1 << 14)
+    state = growing_state(model)
+    limit = grown_capacity(model) // 2
+    batch = one_key_per_bag(key % 20 for key in range(1500))
+    estimates = []
+    for step in range(14):
+        train_batch(model, *batch)
+        torch.cuda.synchronize()  # what was asked of the device has landed
+        held, estimate = keys_held(model), int(state.estimated_table_sizes[0])
+        assert held <= estimate <= max(limit - 2 * 1500, held + 4 * 1500), step
+        estimates.append(estimate)
+    assert any(b < a for a, b in zip(estimates, estimates[1:])), "never corrected"
+
+
+@pytest.mark.parametrize("layout", GROW_LAYOUTS)
+def test_the_estimates_stay_above_the_sizes_while_batches_overlap(layout, monkeypatch):
+    """Each batch is prefetched before the one before it is done, and brings new keys to a
+    table that is near its limit nearly all the time: the sizes sent to the host are taken
+    while later batches are counted and not yet inserted. After every step the estimates
+    (of the keys, and of the rows of a table that never evicts) are not below what the
+    device holds."""
+    requests = []
+    monkeypatch.setattr(
+        "dynamicemb.key_value_table.SizeRefresh",
+        lambda *args: requests.append(1) or SizeRefresh(*args),
+    )
+    model = make_growing_module(layout, init_capacity=1024)
+    state = growing_state(model)
+    batches = [one_key_per_bag(range(i * 150, i * 150 + 300)) for i in range(14)]
+    model.prefetch(*batches[0])
+    for i, batch in enumerate(batches):
+        if i + 1 < len(batches):
+            model.prefetch(*batches[i + 1])
+        train_batch(model, *batch)
+        torch.cuda.synchronize()
+        assert int(state.estimated_table_sizes[0]) >= keys_held(model), i
+        if state.no_eviction:
+            rows = int(collect_row_counts_to_device(state).cpu()[0])
+            assert int(state.estimated_row_counts[0]) >= rows, i
+    assert len(requests) >= 3, "the sizes were hardly asked for"
+
+
+def test_a_correction_asked_for_before_the_estimates_were_set_again_is_void():
+    """The sizes sent to the host after a batch are of no use to the estimates once
+    something else has set them from the device (a confirmation, a checkpoint load): the
+    correction was worked out against estimates that are gone."""
+    model = make_growing_module("hbm", init_capacity=1024)  # the limit is 512 keys
+    storage, state = model._storage, growing_state(model)
+    bound = torch.tensor([200])
+    assert not storage.may_expand(bound)  # 200 keys fit ...
+    assert state.estimates_close  # ... but four batches of them do not
+    storage.accumulate_bound(bound)
+    batch = storage.open_batch(bound)
+    storage.close_batch(batch)  # the batch is done: the table holds no key, it will say
+    torch.cuda.synchronize()
+
+    state.collect_table_sizes_flag = True  # set again from the device, now
+    collect_table_sizes_for_state(state, non_blocking=False)
+    state.collect_table_sizes_flag = False
+    state.estimated_table_sizes.add_(torch.tensor([50]))  # a batch counted since
+    storage.may_expand(bound)  # looks at the correction that has landed
+    assert state.estimated_table_sizes.tolist() == [50]
+
+
+@pytest.mark.parametrize("layout", ["hbm", "noevict"])
+def test_the_batches_still_open_are_not_corrected_away(layout):
+    """The sizes sent to the host after a batch are what the tables hold of the batches
+    that are done: a batch that is not done may still bring its keys, so what the host
+    counted for it stays in the estimates, of the keys and of the rows handed out."""
+    model = make_growing_module(layout, init_capacity=1024)
+    storage, state = model._storage, growing_state(model)
+    bound = torch.tensor([300])
+    batches = []
+    for _ in range(2):  # two batches are counted, and open
+        storage.may_expand(bound)
+        storage.accumulate_bound(bound)
+        batches.append(storage.open_batch(bound))
+    # The first is done: the table holds none of its keys. A copy of a module has no copy
+    # of the sizes on its way.
+    storage.close_batch(batches[0])
+    assert copy.deepcopy(state.size_refresh) is None
+    torch.cuda.synchronize()
+    storage.may_expand(bound)  # looks at the correction that has landed
+    assert state.estimated_table_sizes.tolist() == [300]  # the second batch's bound
+    if state.no_eviction:
+        assert state.estimated_row_counts.tolist() == [300]
+
+
+def test_a_table_expanded_since_the_batch_was_counted_asks_for_no_sizes():
+    """The key map that a later prefetch makes on its own stream is not ordered after the
+    stream of a batch that is done: the sizes of the new tables are not asked for then.
+    """
+    model = make_growing_module("hbm", init_capacity=1024)
+    storage, state = model._storage, growing_state(model)
+    bound = torch.tensor([300])
+    storage.may_expand(bound)
+    storage.accumulate_bound(bound)
+    batch = storage.open_batch(bound)
+    state.key_map_generation += 1  # an expansion: the key map was replaced
+    storage.close_batch(batch)
+    assert state.size_refresh is None
+    state.key_map_generation -= 1  # the same key map: the sizes are asked for
+    storage.close_batch(storage.open_batch(bound))
+    assert state.size_refresh is not None
 
 
 # --- the hand-off of a prefetch to the forward stream ---------------------------------

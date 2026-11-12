@@ -1451,6 +1451,10 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                 prefetch_state.unique_table_ids,
                 num_valid=prefetch_state.num_unique,
             )
+        if not res.requires_grad and prefetch_state.counted is not None:
+            # No backward will come: this forward is the end of the batch.
+            self._storage.close_batch(prefetch_state.counted)
+            prefetch_state.counted = None
         if isinstance(self._cache, DynamicEmbCache):
             self._cache.training = False
         if isinstance(self._storage, (DynamicEmbStorage, HybridStorage)):
