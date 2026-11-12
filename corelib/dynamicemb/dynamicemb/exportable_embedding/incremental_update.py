@@ -277,7 +277,7 @@ class EmbeddingCollectionUpdateCoordinator:
                 device=self.device,
             )
             snapshot_path = dump_embedding_collection_indexer_snapshot(
-                collection_id=collection_id.replace(".", "_"),
+                collection_id=collection_id,
                 snapshot_id=snapshot_id,
                 snapshot=snapshot,
                 output_dir=self.shared_update_dir,
@@ -301,7 +301,6 @@ class EmbeddingCollectionUpdateCoordinator:
     ) -> tuple[list[int], list[torch.Tensor]]:
         binding = self.bindings[collection_id]
         table_ids = {name: index for index, name in enumerate(binding.table_names)}
-        snapshot = self.snapshots.get(collection_id)
         cache_update_keys: list[int] = []
         cache_update_values: list[torch.Tensor] = []
         for column, table_name in enumerate(delta.table_names):
@@ -315,13 +314,9 @@ class EmbeddingCollectionUpdateCoordinator:
                 binding.indexer_type
                 == EmbeddingCollectionIndexerType.FUSED_IDENTITY.value
             ):
-                assert snapshot is not None
-                base = int(snapshot.valid_bases[table_id].item())
-                reserved = int(snapshot.reserved_sizes[table_id].item())
-                if feature_ids.numel() and int(feature_ids.max().item()) >= reserved:
-                    raise ValueError(
-                        f"feature ID exceeds the reserved range for {table_name}"
-                    )
+                # Fixed ranges are exported even when indexer state is embedded.
+                # Each preceding table also reserves one zero miss row.
+                base = table_id + 1 + sum(binding.table_capacities[:table_id])
                 storage_keys = base + feature_ids
             else:
                 storage_keys = feature_ids
@@ -344,8 +339,6 @@ class EmbeddingCollectionUpdateCoordinator:
                 binding.indexer_type
                 == EmbeddingCollectionIndexerType.FUSED_IDENTITY.value
             ):
-                assert snapshot is not None
-                base = int(snapshot.valid_bases[table_id].item())
                 removed_storage = base + removed
             else:
                 removed_storage = removed
@@ -502,7 +495,7 @@ class EmbeddingCollectionUpdateCoordinator:
         snapshot_path = None
         if next_snapshot is not None:
             snapshot_path = dump_embedding_collection_indexer_snapshot(
-                collection_id=collection_id.replace(".", "_"),
+                collection_id=collection_id,
                 snapshot_id=snapshot_id,
                 snapshot=next_snapshot,
                 output_dir=self.shared_update_dir,

@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from enum import IntEnum
 from pathlib import Path
 from typing import Any, Sequence
+from urllib.parse import quote
 
 import torch
 
@@ -96,7 +97,9 @@ def dump_embedding_collection_indexer_snapshot(
     snapshot: IndexerSnapshot,
     output_dir: str | Path,
 ) -> str:
-    path = Path(output_dir).resolve() / f"{collection_id}.{snapshot_id}.bin"
+    # Preserve collection identity while keeping the name in one path component.
+    filename = f"{quote(collection_id, safe='')}.{snapshot_id}.bin"
+    path = Path(output_dir).resolve() / filename
     dump_indexer_snapshot(snapshot, path)
     return str(path)
 

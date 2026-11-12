@@ -38,7 +38,16 @@ def delta(names, keys, values, evicted=None, erased=None):
     )
 
 
-def runtime(path, kind, dtype=torch.float32, sidecar=True, pooling=-1, rows=4, dim=8):
+def runtime(
+    path,
+    kind,
+    dtype=torch.float32,
+    sidecar=True,
+    pooling=-1,
+    rows=4,
+    dim=8,
+    collection_id=None,
+):
     names = ["a"] if kind == Indexer.IDENTITY else ["a", "b"]
     model = collection(
         indexer=kind,
@@ -47,6 +56,8 @@ def runtime(path, kind, dtype=torch.float32, sidecar=True, pooling=-1, rows=4, d
         pooling=pooling,
         tables=[table(name, rows, dim) for name in names],
     ).eval()
+    if collection_id is not None:
+        model.collection_id_ = collection_id
     model.load_from_embedding_table(torch.zeros((rows * len(names), dim), dtype=dtype))
     path.mkdir(parents=True, exist_ok=True)
     save_nve(model, str(path))
@@ -75,6 +86,23 @@ def lookup(rt, local_keys, pooling=-1):
     if pooling != -1:
         args += (torch.arange(0, keys.numel() + 1, 2),)
     return rt.model(*args)
+
+
+def test_hash_update_snapshot_names_are_distinct(tmp_path):
+    pending = []
+    for name, key in (("a.b", 10), ("a_b", 20)):
+        rt = runtime(tmp_path / name, Indexer.LINEAR_HASH_MAP, collection_id=name)
+        rt.coordinator.shared_update_dir = tmp_path / "updates"
+        update = rt.coordinator.apply_delta(
+            rt.id,
+            delta(rt.names, [[key], [key]], [[[7.0] * 8]] * 2, evicted=[[1], [1]]),
+        )
+        pending.append((rt, update, key))
+    assert len({u.indexer_snapshot_path for _, u, _ in pending}) == 2
+    # Delay both subscribers until both snapshots have been written.
+    for rt, update, key in pending:
+        rt.subscriber.apply_incremental_load(update.to_json(), inference_paused=True)
+        torch.testing.assert_close(lookup(rt, [key]), torch.full((2, 8), 7.0))
 
 
 @pytest.mark.parametrize("kind", [Indexer.IDENTITY, Indexer.FUSED_IDENTITY])

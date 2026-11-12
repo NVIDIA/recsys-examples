@@ -97,7 +97,7 @@ def redis_address(tmp_path_factory):
                 process.wait()
 
 
-def runtime(path, address, kind, dtype, host_cache):
+def runtime(path, address, kind, dtype, host_cache, *, sidecar=True):
     torch.cuda.set_device(0)
     device = torch.device("cuda:0")
     names = ["a"] if kind == Indexer.IDENTITY else ["a", "b"]
@@ -120,6 +120,7 @@ def runtime(path, address, kind, dtype, host_cache):
         ],
         config=InferenceEmbeddingCollectionConfig(
             indexer_type=kind,
+            indexer_state_sidecar=sidecar,
             nve_layer_type="hierarchical",
             parameter_server=ps,
             gpu_cache_size=CACHE_BYTES,
@@ -253,13 +254,17 @@ def test_removal_only(tmp_path, redis_address, kind, dtype, host_cache, field):
     check_removal(rt, delta, expected, expected)
 
 
-@pytest.mark.parametrize("kind", INDEXERS, ids=lambda kind: kind.value)
+@pytest.mark.parametrize(
+    "kind,sidecar",
+    [pytest.param(kind, True, id=kind.value) for kind in INDEXERS]
+    + [pytest.param(Indexer.FUSED_IDENTITY, False, id="fused_identity_embedded")],
+)
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16], ids=["fp32", "fp16"])
 @pytest.mark.parametrize("host_cache", [0, CACHE_BYTES], ids=["gpu_only", "host_gpu"])
 def test_final_upserts_win_over_removals(
-    tmp_path, redis_address, kind, dtype, host_cache
+    tmp_path, redis_address, kind, dtype, host_cache, sidecar
 ):
-    rt = runtime(tmp_path, redis_address, kind, dtype, host_cache)
+    rt = runtime(tmp_path, redis_address, kind, dtype, host_cache, sidecar=sidecar)
     values = [
         torch.tensor([9 + 10 * i, 8 + 10 * i], dtype=dtype).view(-1, 1).repeat(1, DIM)
         for i in range(len(rt.names))
