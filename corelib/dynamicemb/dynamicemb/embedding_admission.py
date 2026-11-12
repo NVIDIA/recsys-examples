@@ -104,14 +104,28 @@ class MultiTableKVCounter(Counter):
         keys: torch.Tensor,
         table_ids: torch.Tensor,
         frequencies: torch.Tensor,
+        *,
+        num_valid: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         self.score_arg_.value = frequencies
         scores_out = torch.empty(keys.numel(), dtype=torch.int64, device=keys.device)
-        self.table_.insert(keys, table_ids, self.score_arg_, score_out=scores_out)
+        self.table_.insert(
+            keys,
+            table_ids,
+            self.score_arg_,
+            score_out=scores_out,
+            num_valid=num_valid,
+        )
         return scores_out
 
-    def erase(self, keys: torch.Tensor, table_ids: torch.Tensor) -> None:
-        self.table_.erase(keys, table_ids)
+    def erase(
+        self,
+        keys: torch.Tensor,
+        table_ids: torch.Tensor,
+        *,
+        num_valid: Optional[torch.Tensor] = None,
+    ) -> None:
+        self.table_.erase(keys, table_ids, num_valid=num_valid)
 
     def memory_usage(self, mem_type=MemoryType.DEVICE) -> int:
         return self.table_.memory_usage(mem_type)
@@ -271,6 +285,8 @@ class MultiTableFrequencyAdmitter(MultiTableAdmitter):
         keys: torch.Tensor,
         table_ids: torch.Tensor,
         frequencies: Optional[torch.Tensor] = None,
+        *,
+        num_valid: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if frequencies is None:
             frequencies = torch.ones(
@@ -282,18 +298,19 @@ class MultiTableFrequencyAdmitter(MultiTableAdmitter):
                 f"{keys.shape[0]} and {frequencies.shape[0]}"
             )
 
-        accumulated = self._counter.add(keys, table_ids, frequencies)
+        accumulated = self._counter.add(
+            keys, table_ids, frequencies, num_valid=num_valid
+        )
         admit_mask = accumulated >= self._threshold
 
         # A key that got in is no longer waiting, so it stops taking up room.
         # This repeats a compaction the caller also makes over the same mask;
         # one pass over the missing keys is worth keeping the counter's whole
         # lifecycle in the one place that knows the counter exists.
-        _, _, (admitted_keys, admitted_table_ids) = flagged_compact(
-            admit_mask, [keys, table_ids]
+        num_admitted, _, (admitted_keys, admitted_table_ids) = flagged_compact(
+            admit_mask, [keys, table_ids], num_valid
         )
-        if admitted_keys.numel() > 0:
-            self._counter.erase(admitted_keys, admitted_table_ids)
+        self._counter.erase(admitted_keys, admitted_table_ids, num_valid=num_admitted)
         return admit_mask
 
     def state(self) -> Optional[Counter]:
@@ -325,9 +342,11 @@ class ProbabilisticAdmissionStrategy(AdmissionStrategy):
     Notes
     -----
     The draws come from ``torch.rand``, so they follow ``torch.manual_seed``
-    and survive CUDA graph capture. A seeded run repeats, but the draws are
-    consumed in the order keys go missing, so changing the batch size or the
-    data order changes which keys get in.
+    and survive CUDA graph capture. A seeded run repeats, but every step draws
+    one number per entry of the arrays it is given (one per key of the batch's
+    capacity, whatever the number of keys that are missing), and the keys that
+    go missing take the first of them in the order they go missing, so changing
+    the batch size or the data order changes which keys get in.
     """
 
     def __init__(
@@ -376,7 +395,11 @@ class MultiTableProbabilisticAdmitter(MultiTableAdmitter):
         keys: torch.Tensor,
         table_ids: torch.Tensor,
         frequencies: Optional[torch.Tensor] = None,
+        *,
+        num_valid: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        # One draw per entry of the arrays, not per live key (see the Notes of
+        # ProbabilisticAdmissionStrategy).
         num_keys = keys.shape[0]
         if self._probability <= 0.0:
             return torch.zeros(num_keys, dtype=torch.bool, device=keys.device)

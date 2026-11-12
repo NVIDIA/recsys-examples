@@ -385,7 +385,7 @@ def test_table_incremental_dump(
             assert num_reclaim == 0
 
             assert new_size - old_size == num_inserted
-            assert num_inserted_by_eviction + num_insert_failed == num_evict
+            assert num_inserted_by_eviction + num_insert_failed == int(num_evict)
             assert (
                 num_inserted
                 + num_inserted_by_eviction
@@ -395,6 +395,8 @@ def test_table_incremental_dump(
             )
 
             # evicted keys are not in the table anymore, including insert failed keys.
+            # They are the first num_evict entries of an array at the capacity of keys.
+            evict_keys = evict_keys[: int(num_evict)]
             evict_keys_interval_mask = (evict_keys - interval_offset) >= 0
             evict_keys_interval_mask = (
                 evict_keys[evict_keys_interval_mask] - interval_offset

@@ -13,9 +13,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import copy
+import itertools
 import json
 import os
 import random
+import tempfile
 import time
 import warnings
 from typing import Any, Dict, Iterator, List, Optional, Tuple
@@ -35,6 +38,7 @@ from dynamicemb import (
 )
 from dynamicemb.batched_dynamicemb_tables import (
     BatchedDynamicEmbeddingTablesV2,
+    StorageLayout,
     encode_checkpoint_file_path,
     encode_meta_json_file_path,
 )
@@ -43,7 +47,9 @@ from dynamicemb.dynamicemb_config import (
     ScoreStrategy,
     _sharded_table_bucket_layout,
 )
+from dynamicemb.embedding_admission import FrequencyAdmissionStrategy, KVCounter
 from dynamicemb.key_value_table import (
+    DelayedCopy,
     DynamicEmbCache,
     DynamicEmbStorage,
     DynamicEmbTableState,
@@ -528,7 +534,7 @@ def _assert_storage_export_matches_find_embeddings(
                     (keys.numel(),), tid, dtype=torch.int64, device=keys.device
                 )
                 (
-                    h_miss,
+                    num_miss,
                     _,
                     _,
                     _,
@@ -537,9 +543,9 @@ def _assert_storage_export_matches_find_embeddings(
                     _,
                     emb_find,
                 ) = storage.find(keys, tids, CopyMode.EMBEDDING)
-                assert h_miss == 0, (
-                    f"storage table_id={tid}: find reports {h_miss} missing keys "
-                    "that export still lists"
+                assert int(num_miss) == 0, (
+                    f"storage table_id={tid}: find reports {int(num_miss)} missing "
+                    "keys that export still lists"
                 )
                 assert bool(
                     founds.all()
@@ -645,7 +651,6 @@ def _kim_scan_keys_embeddings_dict(
         ):
             if keys.numel() == 0:
                 continue
-            scores = named_scores[score_name]
             flat_rows = indices
             values = load_from_flat_single_table(state, flat_rows, tid)
             embeddings = values[:, :emb_dim_t].contiguous().to(device)
@@ -727,7 +732,7 @@ def _assert_bdebt_storage_cache_merged_export_matches_lookup(
                 miss = ~founds_c
                 if bool(miss.any()):
                     (
-                        h_miss,
+                        num_miss,
                         _,
                         _,
                         _,
@@ -740,9 +745,9 @@ def _assert_bdebt_storage_cache_merged_export_matches_lookup(
                         tid_t[miss],
                         copy_mode=CopyMode.EMBEDDING,
                     )
-                    assert h_miss == 0, (
-                        f"table_id={tid}: storage.find reports {h_miss} missing "
-                        f"among keys not in cache"
+                    assert int(num_miss) == 0, (
+                        f"table_id={tid}: storage.find reports {int(num_miss)} "
+                        f"missing among keys not in cache"
                     )
                     assert bool(
                         sf.all()
@@ -857,6 +862,16 @@ def _split_table_batched_optimizer_for_compare(opt_type: EmbOptimType) -> EmbOpt
 
 
 class PyDictStorage(Storage[DynamicEmbTableOptions, BaseDynamicEmbeddingOptimizer]):
+    """A storage in a Python dict: the demo of a class written against the contract of
+    ``Storage`` (see ``dynamicemb/types.py``).
+
+    The step calls ``find`` and ``insert`` with arrays of the capacity of the batch and
+    the number of live leading entries as ``num_valid``, a one-element device tensor
+    (``None`` when every entry is live). The rows of a dict are in host memory, so this
+    class reads the count once per call (``int(num_valid.item())``) and works on the live
+    entries only; what it returns has the capacity of its input as well.
+    """
+
     def __init__(
         self,
         options: List[DynamicEmbTableOptions],
@@ -889,29 +904,42 @@ class PyDictStorage(Storage[DynamicEmbTableOptions, BaseDynamicEmbeddingOptimize
     def size(self) -> int:
         return len(self.dict)
 
+    def _padded(self, values: List, capacity: int, dtype: torch.dtype) -> torch.Tensor:
+        """``values`` as the leading entries of an array of ``capacity``; the rest
+        of it is never read."""
+        out = torch.zeros(capacity, dtype=dtype, device=self.device)
+        if values:
+            out[: len(values)] = torch.tensor(values, dtype=dtype, device=self.device)
+        return out
+
     def find_impl(
         self,
         unique_keys: torch.Tensor,
         table_ids: torch.Tensor,
         unique_embs: torch.Tensor,
         input_scores: Optional[torch.Tensor] = None,
+        num_valid: Optional[torch.Tensor] = None,
     ) -> Tuple[
         torch.Tensor,
         torch.Tensor,
         torch.Tensor,
         torch.Tensor,
+        Optional[torch.Tensor],
         torch.Tensor,
         torch.Tensor,
     ]:
-        h_unique_keys = unique_keys.cpu()
-        h_table_ids = table_ids.cpu()
+        capacity = unique_keys.size(0)
+        n = capacity if num_valid is None else int(num_valid.item())
+        h_unique_keys = unique_keys[:n].cpu()
+        h_table_ids = table_ids[:n].cpu()
         lookup_dim = unique_embs.size(1)
         results = []
         missing_keys = []
         missing_indices = []
+        missing_table_ids = []
         missing_scores_list = []
         founds_ = []
-        for i in range(h_unique_keys.size(0)):
+        for i in range(n):
             key = h_unique_keys[i].item()
             tid = h_table_ids[i].item()
             composite_key = (tid, key)
@@ -921,58 +949,37 @@ class PyDictStorage(Storage[DynamicEmbTableOptions, BaseDynamicEmbeddingOptimize
             else:
                 missing_keys.append(key)
                 missing_indices.append(i)
+                missing_table_ids.append(tid)
                 if input_scores is not None:
                     missing_scores_list.append(input_scores[i].item())
                 founds_.append(False)
-        founds_ = torch.tensor(founds_, dtype=torch.bool, device=self.device)
+        founds = self._padded(founds_, capacity, torch.bool)
         if len(results) > 0:
-            unique_embs[founds_, :] = torch.cat(
-                [t.unsqueeze(0) for t in results], dim=0
-            )
+            unique_embs[founds, :] = torch.cat([t.unsqueeze(0) for t in results], dim=0)
 
         num_missing = torch.tensor(
             [len(missing_keys)], dtype=torch.long, device=self.device
         )
-        missing_keys = torch.tensor(
-            missing_keys, dtype=unique_keys.dtype, device=self.device
+        missing_scores = (
+            None
+            if input_scores is None
+            else self._padded(missing_scores_list, capacity, input_scores.dtype)
         )
-        missing_indices = torch.tensor(
-            missing_indices, dtype=torch.long, device=self.device
-        )
-
-        if input_scores is not None and len(missing_scores_list) > 0:
-            missing_scores = torch.tensor(
-                missing_scores_list, dtype=input_scores.dtype, device=self.device
-            )
-        else:
-            missing_scores = torch.empty(0, dtype=torch.uint64, device=self.device)
 
         # output_scores: scores for all keys (0 for missing, input_scores for found)
-        output_scores = torch.zeros(
-            unique_keys.size(0), dtype=torch.int64, device=self.device
-        )
+        output_scores = torch.zeros(capacity, dtype=torch.int64, device=self.device)
         if input_scores is not None:
-            output_scores[founds_] = input_scores[founds_].to(torch.int64)
+            output_scores[founds] = input_scores[founds].to(torch.int64)
 
         return (
             num_missing,
-            missing_keys,
-            missing_indices,
+            self._padded(missing_keys, capacity, unique_keys.dtype),
+            self._padded(missing_indices, capacity, torch.long),
+            self._padded(missing_table_ids, capacity, torch.int64),
             missing_scores,
-            founds_,
+            founds,
             output_scores,
         )
-
-    def find_embeddings(
-        self,
-        unique_keys: torch.Tensor,
-        table_ids: torch.Tensor,
-        unique_embs: torch.Tensor,
-        input_scores: Optional[torch.Tensor] = None,
-    ) -> Tuple[
-        int, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
-    ]:
-        return self.find_impl(unique_keys, table_ids, unique_embs, input_scores)
 
     def find(
         self,
@@ -980,10 +987,11 @@ class PyDictStorage(Storage[DynamicEmbTableOptions, BaseDynamicEmbeddingOptimize
         table_ids: torch.Tensor,
         copy_mode: CopyMode,
         lfu_accumulated_frequency: Optional[torch.Tensor] = None,
+        key_scores: Optional[torch.Tensor] = None,
         *,
-        find_debug_context: Optional[str] = None,
+        num_valid: Optional[torch.Tensor] = None,
     ) -> Tuple[
-        int,
+        torch.Tensor,
         torch.Tensor,
         torch.Tensor,
         torch.Tensor,
@@ -992,6 +1000,18 @@ class PyDictStorage(Storage[DynamicEmbTableOptions, BaseDynamicEmbeddingOptimize
         torch.Tensor,
         torch.Tensor,
     ]:
+        """The first ``num_valid`` keys (all of them if ``None``) looked up in the dict.
+
+        Returns ``(num_missing, missing_keys, missing_indices, missing_table_ids,
+        missing_scores, founds, output_scores, values)``: ``num_missing`` is a device
+        tensor, the ``missing_*`` arrays have the capacity of the input with
+        ``num_missing`` live leading entries, and ``founds``, ``output_scores`` and
+        ``values`` have one entry per input key.
+        """
+        if key_scores is not None:
+            raise NotImplementedError(
+                "A score per key is not supported by PyDictStorage."
+            )
         if copy_mode == CopyMode.EMBEDDING:
             out_dim = self._max_emb_dim
         else:
@@ -1003,29 +1023,19 @@ class PyDictStorage(Storage[DynamicEmbTableOptions, BaseDynamicEmbeddingOptimize
             num_missing,
             missing_keys,
             missing_indices,
+            missing_table_ids,
             missing_scores,
             founds,
             output_scores,
         ) = self.find_impl(
-            unique_keys, table_ids, unique_vals, lfu_accumulated_frequency
+            unique_keys, table_ids, unique_vals, lfu_accumulated_frequency, num_valid
         )
-
-        h_table_ids = table_ids.cpu()
-        missing_table_ids_list = []
-        for idx in missing_indices.cpu().tolist():
-            missing_table_ids_list.append(h_table_ids[idx].item())
-        missing_table_ids = torch.tensor(
-            missing_table_ids_list, dtype=torch.int64, device=self.device
-        )
-
         return (
-            num_missing.item()
-            if isinstance(num_missing, torch.Tensor)
-            else num_missing,
+            num_missing,
             missing_keys,
             missing_indices,
             missing_table_ids,
-            missing_scores if missing_scores.numel() > 0 else None,
+            missing_scores,
             founds,
             output_scores,
             unique_vals,
@@ -1038,11 +1048,16 @@ class PyDictStorage(Storage[DynamicEmbTableOptions, BaseDynamicEmbeddingOptimize
         values: torch.Tensor,
         scores: Optional[torch.Tensor] = None,
         preserve_existing: bool = False,
+        *,
+        num_valid: Optional[torch.Tensor] = None,
     ) -> None:
-        h_keys = keys.cpu()
-        h_table_ids = table_ids.cpu()
-        h_scores = scores.cpu() if scores is not None and scores.numel() > 0 else None
-        for i in range(h_keys.size(0)):
+        n = keys.size(0) if num_valid is None else int(num_valid.item())
+        h_keys = keys[:n].cpu()
+        h_table_ids = table_ids[:n].cpu()
+        h_scores = (
+            scores[:n].cpu() if scores is not None and scores.numel() > 0 else None
+        )
+        for i in range(n):
             key = h_keys[i].item()
             tid = h_table_ids[i].item()
             composite_key = (tid, key)
@@ -1359,7 +1374,6 @@ def init_embedding_tables(stbe, bdet):
         num_emb = split.size(0)
         emb_dim = split.size(1)
         opt_state_dim = optimizer.get_state_dim(emb_dim)
-        val_dim = emb_dim + opt_state_dim
         indices = torch.arange(num_emb, device=split.device, dtype=torch.long)
         table_ids = torch.full(
             (num_emb,), table_idx, dtype=torch.int64, device=split.device
@@ -2399,8 +2413,6 @@ def test_multi_table_mixed_dims_forward_backward(
 @pytest.mark.parametrize("caching", [True, False])
 def test_multi_table_with_admission(opt_type, opt_params, caching):
     """Multi-table with frequency-based admission counter."""
-    from dynamicemb.embedding_admission import FrequencyAdmissionStrategy, KVCounter
-
     assert torch.cuda.is_available()
     device_id = 0
     device = torch.device(f"cuda:{device_id}")
@@ -3815,3 +3827,488 @@ def test_caching_ps_rejects_no_eviction():
             use_index_dedup=True,
             learning_rate=0.1,
         )
+
+
+# ---------------------------------------------------------------------------
+# The lookup step: its results against an oracle, and its host syncs
+# ---------------------------------------------------------------------------
+# With the DEBUG initializer the row of a new key is a function of the key, so what a
+# forward returns, and where a step of the optimizer moves the rows, follows from the
+# batches alone: ``Oracle`` works it out in plain torch.
+
+NONE = DynamicEmbPoolingMode.NONE
+SUM = DynamicEmbPoolingMode.SUM
+MEAN = DynamicEmbPoolingMode.MEAN
+# (caching, local_hbm_for_values) of each layout, as in the tests above. The budget is
+# per table, and 1024 bytes buy the HBM tier of a cache or a hybrid layout the least it
+# can have: one bucket of 1024 slots for each table.
+LAYOUTS = {
+    "hbm": (False, 1024**3),
+    "cache": (True, 1024),
+    "hybrid": (False, 1024),
+    "host": (False, 0),
+}
+OPTIMIZERS = {
+    "sgd": (EmbOptimType.SGD, {"learning_rate": 0.3}),
+    "adam": (
+        EmbOptimType.ADAM,
+        {
+            "learning_rate": 0.3,
+            "weight_decay": 0.06,
+            "eps": 3e-5,
+            "beta1": 0.8,
+            "beta2": 0.888,
+        },
+    ),
+}
+# Sequence output needs one width; pooled output may mix them.
+DIMS = {NONE: [8, 8, 8], SUM: [8, 16, 8], MEAN: [8, 16, 8]}
+FEATURE_TABLE_MAP = [0, 0, 1, 2]
+# A batch asks for at most 4 * 128 * 4 = 2048 keys, fewer than the 3072 slots of a cache
+# (1024 for each of its 3 tables): the prefetch of a cache never has to count the keys
+# it pins, which would wait for the device.
+BATCH = 128  # samples
+# Keys 0..HOT-1 turn up again and again. The COLD ones, more than the 1024 slots of an
+# HBM tier, turn up now and then: they are evicted (cache) or spilled to the host
+# (hybrid), and read back.
+HOT = 64
+COLD = 2048
+KEYS = HOT + COLD
+COLD_SHARE = 0.75  # of the keys of a bag
+THRESHOLD = 2  # the admission strategy's
+# Room for about four times the keys: no bucket of a table, or of the admission counter,
+# fills up and evicts a key that the oracle still holds.
+MAX_CAPACITY = 8192
+NUM_BATCHES = 12  # enough for a table to hold more keys than its HBM tier has slots
+
+
+def make_module(
+    layout: str,
+    optimizer: str,
+    pooling: DynamicEmbPoolingMode,
+    admission: bool,
+    max_capacity: int = MAX_CAPACITY,
+    local_hbm: Optional[int] = None,
+) -> BatchedDynamicEmbeddingTablesV2:
+    caching, layout_hbm = LAYOUTS[layout]
+    local_hbm = layout_hbm if local_hbm is None else local_hbm
+    opt_type, opt_params = OPTIMIZERS[optimizer]
+    options = [
+        DynamicEmbTableOptions(
+            dim=dim,
+            init_capacity=max_capacity,
+            max_capacity=max_capacity,
+            index_type=torch.int64,
+            embedding_dtype=torch.float32,
+            device_id=0,
+            score_strategy=DynamicEmbScoreStrategy.TIMESTAMP,
+            caching=caching,
+            local_hbm_for_values=local_hbm,
+            # The row of a new key is a function of the key: the oracle knows it.
+            initializer_args=DynamicEmbInitializerArgs(
+                mode=DynamicEmbInitializerMode.DEBUG
+            ),
+            admit_strategy=FrequencyAdmissionStrategy(
+                threshold=THRESHOLD, counter=KVCounter(capacity=max_capacity)
+            )
+            if admission
+            else None,
+        )
+        for dim in DIMS[pooling]
+    ]
+    return BatchedDynamicEmbeddingTablesV2(
+        table_names=["t0", "t1", "t2"],
+        table_options=options,
+        feature_table_map=FEATURE_TABLE_MAP,
+        pooling_mode=pooling,
+        optimizer=opt_type,
+        use_index_dedup=True,
+        **opt_params,
+    )
+
+
+def jagged(bags: List[List[int]]) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Keys and offsets of ``bags``: one list of keys per (feature, sample), feature by
+    feature."""
+    lengths = torch.tensor([len(bag) for bag in bags], dtype=torch.int64)
+    offsets = torch.cat([torch.zeros(1, dtype=torch.int64), lengths.cumsum(0)])
+    keys = torch.tensor([key for bag in bags for key in bag], dtype=torch.int64)
+    return keys.cuda(), offsets.cuda()
+
+
+def random_batch(gen: torch.Generator) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Random keys with repeats: ``BATCH`` bags of 0 to 4 keys for every feature, a key
+    being a ``COLD`` one ``COLD_SHARE`` of the time, else one of the ``HOT`` ones."""
+    lengths = torch.randint(0, 5, (len(FEATURE_TABLE_MAP) * BATCH,), generator=gen)
+    offsets = torch.cat([torch.zeros(1, dtype=torch.int64), lengths.cumsum(0)])
+    num_keys = int(offsets[-1])
+    hot = torch.randint(0, HOT, (num_keys,), generator=gen)
+    cold = torch.randint(HOT, KEYS, (num_keys,), generator=gen)
+    is_cold = torch.rand(num_keys, generator=gen) < COLD_SHARE
+    return torch.where(is_cold, cold, hot).cuda(), offsets.cuda()
+
+
+class Oracle:
+    """What the tables should hold, worked out in plain torch from the batches alone.
+
+    The DEBUG initializer fills the row of a new key with the key modulo
+    ``DEBUG_EMB_INITIALIZER_MOD`` in every column. A step of the optimizer moves the row
+    of each key of the batch that a table holds, on the sum of the gradients of the key:
+    one per occurrence, divided by the length of its bag for MEAN. The other rows stay,
+    and so does a key that admission has not let in: it has no row to move.
+    """
+
+    def __init__(
+        self,
+        pooling: DynamicEmbPoolingMode,
+        key_space: int = KEYS,
+        threshold: int = 0,
+        optimizer: str = "sgd",
+    ):
+        self.pooling, self.threshold, self.optimizer = pooling, threshold, optimizer
+        keys = torch.arange(key_space, device="cuda")
+        initial = (keys % DEBUG_EMB_INITIALIZER_MOD).float()[:, None]
+        # Per table: the row of every key, whether the table holds the key, and how
+        # often a batch has asked for it while the table did not.
+        self.rows = [initial.repeat(1, dim) for dim in DIMS[pooling]]
+        self.stored = [torch.zeros_like(keys, dtype=torch.bool) for _ in self.rows]
+        self.asked = [torch.zeros_like(keys) for _ in self.rows]
+        # Adam: the first and second moment of every row, and the steps taken so far.
+        if optimizer == "adam":
+            self.m = [torch.zeros_like(rows) for rows in self.rows]
+            self.v = [torch.zeros_like(rows) for rows in self.rows]
+        self.steps = 0
+
+    @staticmethod
+    def features(keys, offsets):
+        """Per feature: its table, its keys, the bag of each key and the bag lengths."""
+        bounds = offsets.tolist()
+        batch = (len(bounds) - 1) // len(FEATURE_TABLE_MAP)
+        for feature, table in enumerate(FEATURE_TABLE_MAP):
+            first, last = feature * batch, (feature + 1) * batch
+            lengths = offsets[first + 1 : last + 1] - offsets[first:last]
+            bags = torch.repeat_interleave(torch.arange(batch, device="cuda"), lengths)
+            yield table, keys[bounds[first] : bounds[last]], bags, lengths
+
+    def admit(self, keys, offsets):
+        """A key a table lacks gets in the ``threshold``-th time a batch asks for it."""
+        wanted: List[List[torch.Tensor]] = [[] for _ in self.rows]
+        for table, table_keys, _, _ in self.features(keys, offsets):
+            wanted[table].append(table_keys)
+        for stored, asked, chunks in zip(self.stored, self.asked, wanted):
+            missing = torch.cat(chunks).unique()
+            missing = missing[~stored[missing]]
+            asked[missing] += 1
+            stored[missing[asked[missing] >= self.threshold]] = True
+
+    def forward(self, keys, offsets, training=True):
+        """What the module returns. A training forward admits keys; an evaluation gives
+        a key the tables lack zeros."""
+        if training:
+            self.admit(keys, offsets)
+        outputs = []
+        for table, table_keys, bags, lengths in self.features(keys, offsets):
+            rows = self.rows[table][table_keys]
+            if not training:
+                rows = rows * self.stored[table][table_keys][:, None]
+            if self.pooling != NONE:
+                pooled = torch.zeros(lengths.numel(), rows.size(1), device="cuda")
+                rows = pooled.index_add_(0, bags, rows)
+                if self.pooling == MEAN:
+                    rows = rows / lengths.clamp(min=1)[:, None]
+            outputs.append(rows)
+        return torch.cat(outputs, dim=0 if self.pooling == NONE else 1)
+
+    def backward(self, keys, offsets, grad):
+        """A step of the optimizer on the gradient of the output."""
+        summed = [torch.zeros_like(rows) for rows in self.rows]
+        in_batch = [torch.zeros_like(stored) for stored in self.stored]
+        row = column = 0  # where the gradients of the next feature begin
+        for table, table_keys, bags, lengths in self.features(keys, offsets):
+            if self.pooling == NONE:
+                key_grads = grad[row : row + table_keys.numel()]
+                row += table_keys.numel()
+            else:
+                dim = DIMS[self.pooling][table]
+                key_grads = grad[:, column : column + dim][bags]
+                column += dim
+                if self.pooling == MEAN:
+                    key_grads = key_grads / lengths[bags][:, None]
+            summed[table].index_add_(0, table_keys, key_grads)
+            in_batch[table][table_keys] = True
+        self.steps += 1
+        for table, grads in enumerate(summed):
+            live = (self.stored[table] & in_batch[table])[:, None]
+            self.update(table, grads, live)
+
+    def update(self, table, grads, live):
+        """The optimizer's rule on the rows of ``table`` that ``live`` flags, one flag a
+        row; the other rows, and their moments, stay."""
+        rows, args = self.rows[table], OPTIMIZERS[self.optimizer][1]
+        if self.optimizer == "sgd":
+            new_rows = rows - args["learning_rate"] * grads
+        else:
+            beta1, beta2 = args["beta1"], args["beta2"]
+            m = beta1 * self.m[table] + (1 - beta1) * grads
+            v = beta2 * self.v[table] + (1 - beta2) * grads * grads
+            # The bias is corrected by the steps of the module, not of the key.
+            m_hat = m / (1 - beta1**self.steps)
+            v_hat = v / (1 - beta2**self.steps)
+            step = m_hat / (v_hat.sqrt() + args["eps"]) + args["weight_decay"] * rows
+            new_rows = rows - args["learning_rate"] * step
+            self.m[table] = torch.where(live, m, self.m[table])
+            self.v[table] = torch.where(live, v, self.v[table])
+        rows.copy_(torch.where(live, new_rows, rows))
+
+
+def train_and_compare(module, oracle, keys, offsets, gen):
+    """A training step: the output is the oracle's, and both take the same step of the
+    optimizer."""
+    out = module(keys, offsets)
+    torch.testing.assert_close(out, oracle.forward(keys, offsets), rtol=1e-4, atol=1e-4)
+    weight = torch.randn(out.shape, generator=gen).cuda()  # a random upstream gradient
+    (out * weight).sum().backward()
+    oracle.backward(keys, offsets, weight)
+
+
+def eval_and_compare(module, oracle, keys, offsets):
+    """An eval reads back what the steps wrote: the oracle's rows, zeros for a key the
+    tables lack."""
+    module.eval()
+    with torch.no_grad():
+        out = module(keys, offsets)
+    expected = oracle.forward(keys, offsets, training=False)
+    torch.testing.assert_close(out, expected, rtol=1e-4, atol=1e-4)
+
+
+def assert_tier_overflows(module, oracle):
+    """Some table holds more keys than its HBM tier (of a cache or a hybrid layout) has
+    slots: the steps so far evicted keys from the cache, or spilled them to the host
+    tier, and found them again. The other layouts have one tier, which holds it all."""
+    if module._storage_layout == StorageLayout.CACHING:
+        tier = module._cache._state
+    elif module._storage_layout == StorageLayout.HYBRID:
+        tier = module._storage._hbm
+    else:
+        return
+    slots = tier.key_index_map.per_table_capacity_
+    held = [int(stored.sum()) for stored in oracle.stored]
+    overflowed = any(n > cap for n, cap in zip(held, slots))
+    assert overflowed, f"{held} keys held in tables of {slots} HBM slots"
+
+
+_SYNC_RUNTIME_CALLS = (
+    "cudaStreamSynchronize",
+    "cudaDeviceSynchronize",
+    "cudaEventSynchronize",
+)
+
+
+def blocking_syncs(step, num_steps: int = 3) -> Dict[str, int]:
+    """Run ``step`` ``num_steps`` times under the profiler and count the host syncs
+    inside the steps: the runtime's synchronize calls, synchronous memcpys, and copies
+    to pageable host memory."""
+    from torch.profiler import ProfilerActivity, profile, record_function
+
+    with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof:
+        with record_function("profiled_steps"):
+            for _ in range(num_steps):
+                step()
+        # Outside the window: it is this wait, not one of the steps', that ends them.
+        torch.cuda.synchronize()
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "trace.json")
+        prof.export_chrome_trace(path)
+        with open(path) as f:
+            events: List[dict] = json.load(f)["traceEvents"]
+
+    windows = [e for e in events if e.get("name") == "profiled_steps"]
+    assert windows, "the profiler did not record the step window"
+    begin, end = windows[0]["ts"], windows[0]["ts"] + windows[0]["dur"]
+    counts: Dict[str, int] = {}
+    runtime_calls = 0
+    for event in events:
+        if not (begin <= event.get("ts", -1) <= end):
+            continue
+        name = event.get("name", "")
+        category = event.get("cat", "")
+        runtime_calls += category == "cuda_runtime"
+        blocking = category == "cuda_runtime" and (
+            name in _SYNC_RUNTIME_CALLS
+            or (name.startswith("cudaMemcpy") and not name.endswith("Async"))
+        )
+        blocking = blocking or (
+            category == "gpu_memcpy" and "DtoH" in name and "Pageable" in name
+        )
+        if blocking:
+            counts[name] = counts.get(name, 0) + 1
+    # A profiler that saw no launch would let every step pass.
+    assert runtime_calls > 0, "the profiler recorded no CUDA runtime calls"
+    return counts
+
+
+# Adam keeps its state in the row, so a row is wider than the embedding and the state
+# moves between the tiers with it: it runs on every layout, with and without admission.
+# SGD keeps no state and a pooling mode acts on the rows after they are looked up: the
+# tests add a few cases for those.
+ADAM_CASES = [
+    (layout, "adam", SUM, admission)
+    for layout in LAYOUTS
+    for admission in (False, True)
+]
+
+
+@pytest.mark.parametrize(
+    "layout, optimizer, pooling, admission",
+    ADAM_CASES
+    + [(layout, "sgd", SUM, False) for layout in LAYOUTS]
+    + [("hbm", "sgd", NONE, False), ("hbm", "sgd", MEAN, False)],
+    ids=lambda value: getattr(value, "name", None),
+)
+def test_step_matches_the_oracle(layout, optimizer, pooling, admission):
+    """Training steps, then an eval, give what the oracle says, on batches that repeat
+    keys, hold one key or none, and overflow the HBM tier of a cache or a hybrid."""
+    module = make_module(layout, optimizer, pooling, admission)
+    oracle = Oracle(
+        pooling, threshold=THRESHOLD if admission else 0, optimizer=optimizer
+    )
+    gen = torch.Generator().manual_seed(7)
+    bags = len(FEATURE_TABLE_MAP) * BATCH
+    batches = [
+        random_batch(gen),
+        random_batch(gen),
+        jagged([[7, 7]] * bags),  # one key, in every bag, twice
+        jagged([[42]] + [[]] * (bags - 1)),  # one key
+        jagged([[]] * bags),  # no key
+        *[random_batch(gen) for _ in range(NUM_BATCHES)],
+    ]
+    for keys, offsets in batches:
+        train_and_compare(module, oracle, keys, offsets, gen)
+    assert_tier_overflows(module, oracle)
+
+    # Every key, one to a bag.
+    keys = torch.arange(KEYS, device="cuda").repeat(len(FEATURE_TABLE_MAP))
+    offsets = torch.arange(keys.numel() + 1, device="cuda")
+    eval_and_compare(module, oracle, keys, offsets)
+
+
+@pytest.mark.parametrize(
+    "layout, optimizer, pooling, admission",
+    ADAM_CASES + [("cache", "sgd", NONE, False)],
+    ids=lambda value: getattr(value, "name", None),
+)
+def test_step_does_not_block(layout, optimizer, pooling, admission):
+    """A training step, a no-grad forward and an eval step make no blocking host sync
+    (cudaStreamSynchronize, cudaDeviceSynchronize, cudaEventSynchronize, a synchronous
+    or pageable copy to the host), with the HBM tier full."""
+    module = make_module(layout, optimizer, pooling, admission)
+    gen = torch.Generator().manual_seed(11)
+    # The warm-up fills the HBM tier. The steps under the profiler follow it with
+    # batches that still hold keys new to the tables: inserting them evicts rows (cache)
+    # or spills them to the host (hybrid).
+    warm, profiled = NUM_BATCHES, 3
+    batches = [random_batch(gen) for _ in range(warm + profiled)]
+    feed = itertools.cycle(batches)
+
+    def train_step() -> None:
+        keys, offsets = next(feed)
+        module(keys, offsets).sum().backward()
+
+    for _ in range(warm):  # misses, evictions or spills, and the first launches
+        train_step()
+    oracle = Oracle(pooling, threshold=THRESHOLD if admission else 0)
+    for keys, offsets in batches[:warm]:
+        oracle.admit(keys, offsets)
+    assert_tier_overflows(module, oracle)
+    torch.cuda.synchronize()
+    assert blocking_syncs(train_step, profiled) == {}, "a training step blocks"
+
+    def no_grad_step() -> None:
+        keys, offsets = next(feed)
+        with torch.no_grad():
+            module(keys, offsets)
+
+    # A forward of a module that trains, without an autograd graph: it has no backward
+    # to release the pins of its keys, so it releases them itself.
+    no_grad_step()
+    torch.cuda.synchronize()
+    assert blocking_syncs(no_grad_step, profiled) == {}, "a no-grad forward blocks"
+
+    module.eval()  # the same forward, in evaluation
+    no_grad_step()
+    torch.cuda.synchronize()
+    assert blocking_syncs(no_grad_step, profiled) == {}, "an eval step blocks"
+
+
+def test_outstanding_keys_settle_from_the_counts_that_have_landed():
+    """Batches prefetched ahead of their forwards pin, by their bounds (the keys they
+    look up), more than the cache holds, and in fact a few keys. A batch counted by its
+    bound with the sum past half of the cache has its real count sent to the host without
+    waiting: once that has landed, the next prefetch settles on it and does not wait for
+    the device, and asks for its own count in turn. If it has not landed, the prefetch
+    asks the device, as it did."""
+    module = make_module("cache", "sgd", NONE, False)
+    capacity = module._cache._state.capacity
+    n = capacity // 2 + 200  # one batch is within the cache, two are not
+    bags = len(FEATURE_TABLE_MAP) * BATCH
+    offsets = torch.round(torch.linspace(0, n, bags + 1)).to(torch.int64).cuda()
+    keys = (torch.arange(n) % 8).cuda()  # eight distinct keys in each table
+
+    def prefetch():
+        module.prefetch(keys, offsets)
+
+    def drain():
+        for _ in range(2):  # the forwards pop the prefetched batches in order
+            module(keys, offsets).sum().backward()
+        assert int(module._prefetch_outstanding_keys) == 0, "the keys were miscounted"
+
+    prefetch()
+    torch.cuda.synchronize()  # the count of the first batch has landed
+    assert blocking_syncs(prefetch, 1) == {}  # the second settles on it ...
+    assert int(module._prefetch_outstanding_keys) < capacity
+    module(keys, offsets).sum().backward()  # the first batch is done
+    torch.cuda.synchronize()  # ... and the count of the second has landed
+    assert blocking_syncs(prefetch, 1) == {}  # the third settles on that
+    drain()
+
+    # The control: the count of the first prefetch is queued behind a long wait, so it has
+    # not landed when the second looks, which then has to ask the device.
+    def asks_the_device():
+        torch.cuda._sleep(100_000_000)
+        prefetch()
+        prefetch()
+
+    assert blocking_syncs(asks_the_device, 1), "no wait seen"
+    drain()
+
+
+def test_a_copy_of_a_count_on_its_way_is_nothing():
+    """An event belongs to one process and one device: a copy of a module (copy.deepcopy,
+    pickle) that has a count on its way starts without it."""
+    assert copy.deepcopy(DelayedCopy(torch.arange(3, device="cuda"))) is None
+
+
+@pytest.mark.parametrize("layout", ["hbm", "cache", "host"])
+def test_large_batch_matches_the_oracle(layout):
+    """The whole step at a size where every launch is capped: more than a million keys
+    per batch, new keys in every batch, and (cache) evictions in the second.
+    """
+    rows, key_space = 1 << 22, 2_000_000
+    # The budget is per table: 24 MiB of the 128 MiB that a table takes keep 786 432
+    # rows in the cache. That is room for the 625 000 or so keys that one batch asks
+    # table 0 for, not for the 1 055 000 or so of two batches: the second one evicts.
+    local_hbm = 24 << 20 if layout == "cache" else None
+    module = make_module(layout, "sgd", NONE, False, rows, local_hbm)
+    oracle = Oracle(NONE, key_space)
+    per_feature = 375_000
+    offsets = torch.arange(0, 4 * per_feature + 1, per_feature, device="cuda")
+    gen = torch.Generator().manual_seed(3)
+
+    for _ in range(2):
+        keys = torch.randint(0, key_space, (4 * per_feature,), generator=gen).cuda()
+        train_and_compare(module, oracle, keys, offsets, gen)
+    assert_tier_overflows(module, oracle)
+
+    sample = torch.randint(0, key_space, (100_000,), generator=gen).cuda()
+    sample_offsets = torch.arange(0, 100_001, 25_000, device="cuda")
+    eval_and_compare(module, oracle, sample, sample_offsets)

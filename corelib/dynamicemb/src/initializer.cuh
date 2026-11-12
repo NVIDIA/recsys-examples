@@ -27,6 +27,7 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 #include <cstdint>
 #include <cuda_runtime.h>
 #include <curand_kernel.h>
+#include <optional>
 #include <pybind11/pybind11.h>
 #include <random>
 #include <string>

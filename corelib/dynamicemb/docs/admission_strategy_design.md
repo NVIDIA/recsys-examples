@@ -164,12 +164,18 @@ class MultiTableAdmitter(abc.ABC):
     """What a fused module runs, holding everything deciding takes."""
 
     @abc.abstractmethod
-    def admit(self, keys, table_ids, frequencies=None) -> torch.Tensor:
+    def admit(
+        self, keys, table_ids, frequencies=None, *, num_valid=None
+    ) -> torch.Tensor:
         """Which of these missing keys may enter the table.
 
         ``frequencies`` is how often each key occurred in *this batch*, where
         the module counts occurrences at all; None means treat each key as one.
         An increment, not a running total -- any total is the admitter's own.
+
+        The arrays have a capacity and ``num_valid`` is the number of live
+        leading entries (None: all of them); the mask has the length of
+        ``keys``, and only its live entries are read.
         """
 
     def state(self) -> Optional[Counter]:
@@ -349,14 +355,15 @@ class UniformInitializer(MultiTableInitializer):
     def table_param_rows(args_list):
         return [[args.lower, args.upper] for args in args_list]
 
-    def __call__(self, buffer, keys, table_ids, indices):
+    def __call__(self, buffer, keys, table_ids, indices, num_valid=None):
         if self._table_params is None:
             uniform_init(buffer, indices, self._curand_state,
-                         self._args.lower, self._args.upper)
+                         self._args.lower, self._args.upper, num_valid)
         else:
             uniform_init_table_params(buffer, indices, self._curand_state,
                                       self._table_params,
-                                      self._table_ids_for_kernel(table_ids))
+                                      self._table_ids_for_kernel(table_ids),
+                                      num_valid)
 ```
 
 `table_param_rows` is where the column order is written down, four
