@@ -857,12 +857,18 @@ __device__ __forceinline__ bool slot_is_pinned(int32_t const *counter,
 //
 // ``num_erased`` / ``num_spared`` are added to. Counted a tile at a time, so the
 // atomics are few even when every key matches.
+//
+// When ``out_keys`` is not null the erase is recorded: each erased slot's key and
+// global slot are written at the position ``out_count`` hands out (the caller zeroes
+// it and sizes both outputs for the range). Null, nothing extra is done.
 template <typename Table, int TileSize>
 __global__ void table_erase_by_score_kernel(
     Table table, IndexType begin, IndexType end, ScoreType threshold,
     int64_t score_index, int *__restrict__ bucket_sizes,
     int32_t const *__restrict__ counter, CounterType *__restrict__ num_erased,
-    CounterType *__restrict__ num_spared) {
+    CounterType *__restrict__ num_spared,
+    typename Table::KeyType *__restrict__ out_keys,
+    int64_t *__restrict__ out_slots, CounterType *__restrict__ out_count) {
   using KeyType = typename Table::KeyType;
   using Bucket = typename Table::BucketType;
   using Iter = typename Bucket::Iterator;
@@ -918,6 +924,20 @@ __global__ void table_erase_by_score_kernel(
         atomicAdd(num_erased, static_cast<CounterType>(__popc(erased_vote)));
       if (spared_vote)
         atomicAdd(num_spared, static_cast<CounterType>(__popc(spared_vote)));
+    }
+    if (out_keys != nullptr && erased_vote) {
+      // One reservation per tile; each erased lane writes at its rank among them.
+      CounterType tile_base = 0;
+      if (g.thread_rank() == 0)
+        tile_base =
+            atomicAdd(out_count, static_cast<CounterType>(__popc(erased_vote)));
+      tile_base = g.shfl(tile_base, 0);
+      if (erased) {
+        auto pos = tile_base +
+                   __popc(erased_vote & ((1u << g.thread_rank()) - 1u));
+        out_keys[pos] = key;
+        out_slots[pos] = i;
+      }
     }
   }
 }

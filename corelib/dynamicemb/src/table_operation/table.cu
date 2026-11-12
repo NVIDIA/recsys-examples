@@ -149,11 +149,15 @@ void bind_table_operation(py::module &m) {
   m.def("table_erase_by_score", &dyn_emb::table_erase_by_score,
         "erase the keys of the slots [begin, end) whose score is below the "
         "threshold, sparing slots a ref counter pins; adds [erased, spared] to "
-        "counts",
+        "counts; "
+        "with out_keys/out_slots/out_count, also records each erased key and "
+        "global slot",
         py::arg("table_storage"), py::arg("key_dtype"),
         py::arg("bucket_capacity"), py::arg("bucket_sizes"), py::arg("counter"),
         py::arg("threshold"), py::arg("begin"), py::arg("end"),
         py::arg("num_scores"), py::arg("score_index"), py::arg("counts"),
+        py::arg("out_keys") = py::none(), py::arg("out_slots") = py::none(),
+        py::arg("out_count") = py::none(),
         py::call_guard<py::gil_scoped_release>());
 
   m.def("table_count_matched", &dyn_emb::table_count_matched,

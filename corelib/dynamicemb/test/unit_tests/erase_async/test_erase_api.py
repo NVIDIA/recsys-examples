@@ -25,7 +25,7 @@ import warnings
 
 import pytest
 import torch
-from dynamicemb import DynamicEmbScoreStrategy, erase_by_score_async
+from dynamicemb import DynamicEmbScoreStrategy, EvictedItemMode, erase_by_score_async
 from dynamicemb.batched_dynamicemb_tables import StorageLayout
 from dynamicemb.key_value_table import ERASE_CHUNK_SLOTS, ERASE_MAX_CHUNKS_IN_FLIGHT
 from dynamicemb.async_erase import EraseHandle, EraseHandleGroup
@@ -66,6 +66,17 @@ def test_a_table_is_picked_when_its_strategy_has_the_one_asked_for_as_a_member(
 ):
     module = build_de_table(device.index, table_strategy)
     assert module.erasable_table_ids(asked) == expected
+
+
+def test_a_mode_that_is_not_an_evicted_item_mode_is_refused_by_both_calls(device):
+    module = build_de_table(device.index, S.CUSTOMIZED)
+    with pytest.raises(TypeError, match="EvictedItemMode"):
+        module.erase_by_score_async(S.CUSTOMIZED, 10, mode="RETAIN_KEY")
+    with pytest.raises(TypeError, match="EvictedItemMode"):
+        erase_by_score_async(nn.ModuleList(), S.CUSTOMIZED, 10, mode="RETAIN_KEY")
+    assert module.erase_by_score_async(
+        S.CUSTOMIZED, 10, mode=EvictedItemMode.RETAIN_KEY
+    ).result() == (0, 0)
 
 
 @pytest.mark.parametrize(

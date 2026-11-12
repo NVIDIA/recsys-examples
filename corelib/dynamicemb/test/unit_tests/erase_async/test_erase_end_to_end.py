@@ -22,11 +22,12 @@ a row that an erase took from a key that was using it fails there, not later."""
 import time
 
 import torch
-from dynamicemb import DynamicEmbScoreStrategy
+from dynamicemb import DynamicEmbScoreStrategy, EvictedItemMode, erase_by_score_async
 from dynamicemb.async_erase import EraseHandle
 from dynamicemb.batched_dynamicemb_tables import StorageLayout
 from dynamicemb_extensions import device_timestamp
 from helpers import DIM, build_de_table, found, size, train_step
+from torch import nn
 
 S = DynamicEmbScoreStrategy
 NO_EVICTION_PRECISE = (S.NO_EVICTION, S.PRECISE_CUSTOMIZED)
@@ -197,3 +198,46 @@ def test_with_a_cache_only_the_storage_behind_it_is_erased(device):
     assert bool(found(module, new, device).all())
     assert bool((found(module, everything, device, cache=True) == in_cache).all())
     train_step(module, everything[:500], device, score=300)  # and it still reads right
+
+
+def test_a_retained_erase_on_a_model_records_the_keys_of_each_module(device):
+    first, second = (build_de_table(device.index, S.CUSTOMIZED) for _ in range(2))
+    old, new = key_range(1, 300), key_range(301, 300)
+    for module in (first, second):
+        train_step(module, old, device, score=10)
+        train_step(module, new, device, score=200)
+
+    handle = erase_by_score_async(
+        nn.ModuleList([first, second]),
+        S.CUSTOMIZED,
+        100,
+        mode=EvictedItemMode.RETAIN_KEY,
+    )
+    assert handle.result() == (2 * len(old), 0)
+    for module in (first, second):
+        assert sorted(module.pop_erased_keys()["t_0"].tolist()) == old
+        assert not module._storage.erase_untracked(0)
+
+
+def test_with_a_cache_a_retained_erase_records_what_it_erased_from_the_storage(device):
+    max_capacity = 1 << 16
+    module = build_de_table(
+        device.index,
+        S.CUSTOMIZED,
+        caching=True,
+        max_capacity=max_capacity,
+        init_capacity=max_capacity,
+        local_hbm_for_values=int(max_capacity * DIM * 4 * 0.02),
+    )
+    assert module._storage_layout is StorageLayout.CACHING
+    old, new = key_range(1, 2000), key_range(2001, 2000)
+    for keys, score in ((old, 10), (new, 200)):
+        for start in range(0, len(keys), 500):
+            train_step(module, keys[start : start + 500], device, score=score)
+
+    handle = module.erase_by_score_async(
+        S.CUSTOMIZED, 100, mode=EvictedItemMode.RETAIN_KEY
+    )
+    assert handle.result() == (len(old), 0)
+    assert sorted(module.pop_erased_keys()["t_0"].tolist()) == old
+    assert not module._storage.erase_untracked(0)

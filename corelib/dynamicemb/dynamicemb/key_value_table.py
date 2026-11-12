@@ -961,6 +961,7 @@ def _erase_state_by_score(
     chunk_guard: Optional[Callable[[], ContextManager]] = None,
     max_in_flight: int = ERASE_MAX_CHUNKS_IN_FLIGHT,
     score_word: Optional[int] = None,
+    mode: EvictedItemMode = EvictedItemMode.DISCARD,
 ) -> None:
     """Erase the keys of ``table_ids`` whose score is below ``threshold``, a chunk
     of slots at a time (:func:`next_erase_chunk_end`). ``score_word`` is the word
@@ -989,14 +990,23 @@ def _erase_state_by_score(
     ``counts`` is the device tensor of :meth:`LinearBucketTable.erase_by_score`,
     added to by every chunk.
 
-    The keys it removes are not recorded (no ``RETAIN_KEY``), and a table that stores a
-    row per key leaves each erased slot reclaimed with its row, which only a recorded
-    erase lets an incremental dump report. So a table it removed any key from is marked,
-    as :func:`_erase_state_keys` marks one (``erase_untracked_tables``): a delta dumped
-    from it cannot be replayed exactly, and ``replay_increment`` refuses it. A table
-    from which it removed nothing is not marked -- the mark is sticky. To know, each
-    table is scanned into a count of its own, which the worker reads when the table is
-    done (a wait for its own stream only) before adding it to ``counts``.
+    Without ``RETAIN_KEY`` in ``mode`` the keys it removes are not recorded, and a table
+    that stores a row per key leaves each erased slot reclaimed with its row, which
+    only a recorded erase lets an incremental dump report. So a table it removed any
+    key from is marked, as :func:`_erase_state_keys` marks one
+    (``erase_untracked_tables``): a delta dumped from it cannot be replayed exactly,
+    and ``replay_increment`` refuses it. A table from which it removed nothing is not
+    marked -- the mark is sticky. To know, each table is scanned into a count of its
+    own, which the worker reads when the table is done (a wait for its own stream
+    only) before adding it to ``counts``.
+
+    With ``RETAIN_KEY`` each chunk records the keys it erased, and the slot and row of
+    each for a table that stores rows, into the buffer :func:`_append_erased` fills, as
+    ``erase_keys`` does. A chunk's record is read -- one count -- only after the wait for
+    that chunk above (or at the end of its table), so reading it adds no wait, and no
+    more than ``max_in_flight`` chunks' records are held. The table is marked only if
+    it lost more keys than were recorded: a scan that fails after a chunk's kernel was
+    launched but before its record was kept.
     """
     for table_id in table_ids:
         if not 0 <= table_id < state.num_tables:
@@ -1006,9 +1016,29 @@ def _erase_state_by_score(
     if max_in_flight < 1:
         raise ValueError(f"max_in_flight must be at least 1, got {max_in_flight}")
     guard = contextlib.nullcontext if chunk_guard is None else chunk_guard
-    in_flight: "collections.deque[torch.cuda.Event]" = collections.deque()
+    record = EvictedItemMode.RETAIN_KEY in mode
+    in_flight: "collections.deque[Tuple[torch.cuda.Event, Optional[Tuple]]]" = (
+        collections.deque()
+    )
+
+    def finish_chunk(finished_chunk: Tuple[torch.cuda.Event, Optional[Tuple]]) -> int:
+        launched, recorded = finished_chunk
+        launched.synchronize()
+        if recorded is None:
+            return 0
+        chunk_table_id, keys, slot_index, written = recorded
+        n = int(written.item())
+        _append_erased(
+            state,
+            keys[:n],
+            chunk_table_id,
+            None if slot_index is None else slot_index[:n],
+        )
+        return n
+
     for table_id in table_ids:
         table_counts = torch.zeros(2, dtype=counts.dtype, device=counts.device)
+        recorded_keys = 0
         # Marked also when the scan fails half way: whatever it removed before is gone.
         try:
             position = 0
@@ -1016,7 +1046,8 @@ def _erase_state_by_score(
             finished = False
             while not finished:
                 if len(in_flight) >= max_in_flight:
-                    in_flight.popleft().synchronize()
+                    recorded_keys += finish_chunk(in_flight.popleft())
+                recorded = None
                 with guard():
                     key_map = state.key_index_map
                     if generation != state.key_map_generation:
@@ -1027,6 +1058,23 @@ def _erase_state_by_score(
                     end = next_erase_chunk_end(
                         position, table_slots, key_map.bucket_capacity_, chunk_slots
                     )
+                    buffers = None
+                    if record:
+                        device = state.device
+                        base = (
+                            int(key_map.table_bucket_offsets_cpu_[table_id].item())
+                            * key_map.bucket_capacity_
+                        )
+                        size = end - position
+                        # Unwritten entries become -1 below, which the row lookup skips.
+                        slots = torch.full(
+                            (size,), base - 1, dtype=torch.int64, device=device
+                        )
+                        buffers = (
+                            torch.empty(size, dtype=key_map.key_type, device=device),
+                            slots,
+                            torch.zeros(1, dtype=torch.int64, device=device),
+                        )
                     key_map.erase_by_score(
                         table_id,
                         threshold,
@@ -1034,16 +1082,32 @@ def _erase_state_by_score(
                         score_word=score_word,
                         begin=position,
                         end=end,
+                        record=buffers,
                     )
+                    if buffers is not None:
+                        keys, slots, written = buffers
+                        slots.sub_(base)
+                        slot_index = None
+                        if key_map.use_rows_:
+                            # In the guard: an expansion replaces the slot -> row map.
+                            tids = torch.full_like(slots, table_id)
+                            rows = key_map._rows_of(slots, tids, False)
+                            slot_index = torch.stack([slots, rows], dim=1)
+                        recorded = (table_id, keys, slot_index, written)
                     position = end
                     finished = position >= table_slots
                 chunk_launched = torch.cuda.Event()
                 chunk_launched.record()
-                in_flight.append(chunk_launched)
+                in_flight.append((chunk_launched, recorded))
         finally:
             counts.add_(table_counts)
-            if state.key_index_map.use_rows_ and int(table_counts[0]) > 0:
-                state.erase_untracked_tables.add(table_id)
+            try:
+                while record and in_flight:
+                    recorded_keys += finish_chunk(in_flight.popleft())
+            finally:
+                lost = int(table_counts[0]) - recorded_keys
+                if state.key_index_map.use_rows_ and lost > 0:
+                    state.erase_untracked_tables.add(table_id)
 
 
 def _value_rows_target(current_rows: int, need_rows: int, key_capacity: int) -> int:
@@ -2946,6 +3010,7 @@ class DynamicEmbStorage(Storage):
         chunk_slots: int = ERASE_CHUNK_SLOTS,
         chunk_guard: Optional[Callable[[], ContextManager]] = None,
         max_in_flight: int = ERASE_MAX_CHUNKS_IN_FLIGHT,
+        mode: EvictedItemMode = EvictedItemMode.DISCARD,
     ) -> None:
         """Erase the keys of logical tables ``table_ids`` whose score is below
         ``threshold``, sparing those a prefetched batch has pinned.
@@ -2959,9 +3024,11 @@ class DynamicEmbStorage(Storage):
 
         One score word is compared, as in :meth:`LinearBucketTable.erase_by_score`:
         ``score_word`` names it for an ``LRU_LFU`` table (``0`` the last-access
-        timestamp, ``1`` the frequency) and is left out for a single-score one. A table
-        the scan removed a key from is marked (:meth:`erase_untracked`): the removals are
-        not recorded, so a delta dumped from it cannot be replayed exactly.
+        timestamp, ``1`` the frequency) and is left out for a single-score one. Without
+        ``RETAIN_KEY`` in ``mode`` a table the scan removed a key from is marked
+        (:meth:`erase_untracked`): the removals are not recorded, so a delta dumped from
+        it cannot be replayed exactly. With it they are recorded, as by :meth:`erase_keys`
+        (:meth:`pop_erased_keys`, :meth:`pop_erased_slot_index`), and no table is marked.
         """
         _erase_state_by_score(
             self._state,
@@ -2972,6 +3039,7 @@ class DynamicEmbStorage(Storage):
             chunk_guard,
             max_in_flight,
             score_word,
+            mode,
         )
 
     @property

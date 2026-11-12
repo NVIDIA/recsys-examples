@@ -116,6 +116,40 @@ def test_the_word_named_is_compared_and_the_other_is_not(
     ]
 
 
+@pytest.mark.parametrize(
+    "score_word, threshold, scores",
+    [
+        (TIMESTAMP_WORD, TS_THRESHOLD, TIMESTAMPS),
+        (FREQUENCY_WORD, FREQ_THRESHOLD, FREQUENCIES),
+    ],
+    ids=["timestamp", "frequency"],
+)
+def test_a_recorded_erase_reports_the_keys_of_the_word_named_and_their_slots(
+    device, score_word, threshold, scores
+):
+    table = make_table([BUCKET * 64])
+    slots = fill(table, KEYS, TIMESTAMPS, FREQUENCIES, device)
+    below = [i for i, s in enumerate(scores) if s < threshold]
+
+    out_keys = torch.empty(BUCKET * 64, dtype=torch.int64, device=device)
+    out_slots = torch.full((BUCKET * 64,), -1, dtype=torch.int64, device=device)
+    written = torch.zeros(1, dtype=torch.int64, device=device)
+    counts = new_counts(device)
+    table.erase_by_score(
+        0,
+        threshold,
+        counts,
+        score_word=score_word,
+        record=(out_keys, out_slots, written),
+    )
+    assert erased_and_spared(counts) == (len(below), 0)
+    n = int(written)
+    assert n == len(below)
+    reported = dict(zip(out_keys[:n].tolist(), out_slots[:n].tolist()))
+    assert reported == {KEYS[i]: int(slots[i]) for i in below}
+    assert bool((out_slots[n:] == -1).all()), "nothing is written past the count"
+
+
 def test_by_timestamp_a_stale_key_goes_however_frequent_and_a_fresh_one_stays(device):
     """The expiry: what decides is the age alone."""
     table = make_table([BUCKET * 8])

@@ -1206,6 +1206,7 @@ class LinearBucketTable(ScoredHashTable):
         score_word: Optional[int] = None,
         begin: Optional[int] = None,
         end: Optional[int] = None,
+        record: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None,
     ) -> None:
         """Erase the keys of logical table ``table_id`` whose score is **below**
         ``threshold``, over the table's slots ``[begin, end)``.
@@ -1226,6 +1227,13 @@ class LinearBucketTable(ScoredHashTable):
         timestamp, ``1`` the frequency. Whichever is compared, an erased slot has
         all its score words cleared. Any other multi-word layout is refused, and so
         is a table with an overflow area (a cache).
+
+        ``record`` is ``(keys, slots, count)`` to record the erase: ``keys`` of the key
+        type and ``slots`` int64, each with room for ``end - begin`` entries, and
+        ``count`` an int64 of one, zeroed. The kernel writes the key and the slot
+        (counted from the start of the shared array, not of the table) of every key it
+        erases, and ``count`` the number written (read it once the kernel is done);
+        entries past it are not touched.
         """
         if self.num_scores_ != 1:
             if self.score_specs_[0].policy != ScorePolicy.LRU_LFU:
@@ -1280,6 +1288,7 @@ class LinearBucketTable(ScoredHashTable):
             self.num_scores_,
             score_index,
             counts,
+            *(record or (None, None, None)),
         )
 
     def load(

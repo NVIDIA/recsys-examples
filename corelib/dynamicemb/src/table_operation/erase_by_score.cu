@@ -27,6 +27,10 @@ namespace dyn_emb {
 // two on the device, ``[erased, spared]``, that this adds to: the caller zeroes it
 // once and passes it for every chunk, and nothing here waits for the GPU.
 //
+// ``out_keys`` / ``out_slots`` / ``out_count``, all or none, record the erase: the
+// key and the global slot of each erased slot, ``out_count`` (int64 of one, zeroed by
+// the caller) the number written. They must hold ``end - begin`` entries.
+//
 // The binding releases the GIL (see docs/async_erase_design.md, 4.5): it takes only
 // tensors and integers and never touches a Python object.
 void table_erase_by_score(at::Tensor table_storage, torch::Dtype key_dtype,
@@ -34,7 +38,9 @@ void table_erase_by_score(at::Tensor table_storage, torch::Dtype key_dtype,
                           std::optional<at::Tensor> counter,
                           ScoreType threshold, int64_t begin, int64_t end,
                           int64_t num_scores, int64_t score_index,
-                          at::Tensor counts) {
+                          at::Tensor counts, std::optional<at::Tensor> out_keys,
+                          std::optional<at::Tensor> out_slots,
+                          std::optional<at::Tensor> out_count) {
   TORCH_CHECK(table_storage.is_cuda(),
               "table_erase_by_score: table_storage must be a CUDA tensor");
   // [erased, spared] are written as two neighbours from one pointer.
@@ -43,6 +49,10 @@ void table_erase_by_score(at::Tensor table_storage, torch::Dtype key_dtype,
                   counts.is_contiguous(),
               "table_erase_by_score: counts must be a contiguous int64 tensor "
               "of 2 on the table's device");
+  TORCH_CHECK(out_keys.has_value() == out_slots.has_value() &&
+                  out_keys.has_value() == out_count.has_value(),
+              "table_erase_by_score: out_keys, out_slots and out_count are "
+              "given together or not at all");
   TORCH_CHECK(bucket_capacity > 0,
               "table_erase_by_score: bucket_capacity must be positive");
   TORCH_CHECK(score_index >= 0 && score_index < num_scores,
@@ -90,8 +100,34 @@ void table_erase_by_score(at::Tensor table_storage, torch::Dtype key_dtype,
     }
 
     int64_t num_total = end - begin;
+    if (out_keys.has_value()) {
+      auto const &keys = out_keys.value();
+      auto const &slots = out_slots.value();
+      auto const &written = out_count.value();
+      TORCH_CHECK(keys.is_cuda() && keys.device() == table_storage.device() &&
+                      keys.scalar_type() == key_dtype && keys.is_contiguous() &&
+                      keys.numel() >= num_total,
+                  "table_erase_by_score: out_keys must be a contiguous tensor "
+                  "of the key dtype with room for ",
+                  num_total, " keys on the table's device");
+      TORCH_CHECK(slots.is_cuda() && slots.device() == table_storage.device() &&
+                      slots.scalar_type() == torch::kInt64 &&
+                      slots.is_contiguous() && slots.numel() >= num_total,
+                  "table_erase_by_score: out_slots must be a contiguous int64 "
+                  "tensor with room for ",
+                  num_total, " slots on the table's device");
+      TORCH_CHECK(written.is_cuda() &&
+                      written.device() == table_storage.device() &&
+                      written.scalar_type() == torch::kInt64 &&
+                      written.numel() == 1 && written.is_contiguous(),
+                  "table_erase_by_score: out_count must be a contiguous int64 "
+                  "tensor of 1 on the table's device");
+    }
     if (num_total == 0)
       return;
+    auto out_keys_ = get_pointer<KeyType>(out_keys);
+    auto out_slots_ = get_pointer<int64_t>(out_slots);
+    auto out_count_ = get_pointer<CounterType>(out_count);
 
     using Bucket = LinearBucket<KeyType>;
     using Table = LinearBucketTable<Bucket>;
@@ -110,11 +146,13 @@ void table_erase_by_score(at::Tensor table_storage, torch::Dtype key_dtype,
     if (num_total % 32 == 0) {
       table_erase_by_score_kernel<Table, 32><<<grid, BLOCK_SIZE, 0, stream>>>(
           table, begin, end, threshold, score_index, bucket_sizes_, counter_,
-          num_erased, num_spared);
+          num_erased, num_spared, out_keys_, out_slots_,
+          out_count_);
     } else {
       table_erase_by_score_kernel<Table, 1><<<grid, BLOCK_SIZE, 0, stream>>>(
           table, begin, end, threshold, score_index, bucket_sizes_, counter_,
-          num_erased, num_spared);
+          num_erased, num_spared, out_keys_, out_slots_,
+          out_count_);
     }
   });
   DEMB_CUDA_KERNEL_LAUNCH_CHECK();

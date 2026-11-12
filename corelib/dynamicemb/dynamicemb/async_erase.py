@@ -45,7 +45,7 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from typing import Callable, ContextManager, List, Optional, Sequence, Tuple
 
 import torch
-from dynamicemb.dynamicemb_config import DynamicEmbScoreStrategy
+from dynamicemb.dynamicemb_config import DynamicEmbScoreStrategy, EvictedItemMode
 from dynamicemb.key_value_table import ERASE_CHUNK_SLOTS, ERASE_MAX_CHUNKS_IN_FLIGHT
 from torch import nn
 
@@ -357,6 +357,7 @@ def check_erase_arguments(
     chunk_slots: int,
     max_in_flight: int,
     table_names: Optional[Sequence[str]] = None,
+    mode: EvictedItemMode = EvictedItemMode.DISCARD,
 ) -> None:
     """Raise if what an erase by score is asked for cannot mean anything, whatever the
     tables are. Both calls make it first, so a wrong argument is an error even where
@@ -387,6 +388,8 @@ def check_erase_arguments(
             raise TypeError(f"{name} must be an int, got {type(value).__name__}.")
         if value < 1:
             raise ValueError(f"{name} must be at least 1, got {value}.")
+    if not isinstance(mode, EvictedItemMode):
+        raise TypeError(f"mode must be an EvictedItemMode, got {type(mode).__name__}.")
 
 
 def erase_by_score_async(
@@ -398,6 +401,7 @@ def erase_by_score_async(
     max_in_flight: int = ERASE_MAX_CHUNKS_IN_FLIGHT,
     table_names: Optional[Sequence[str]] = None,
     strict: bool = True,
+    mode: EvictedItemMode = EvictedItemMode.DISCARD,
 ) -> EraseHandle:
     """Erase, in the background of training, the keys whose score is below ``threshold``
     from every dynamic embedding table of ``model`` that scores its keys by ``score_strategy``,
@@ -458,6 +462,14 @@ def erase_by_score_async(
         A rank that holds none of the names erases nothing and its result is
         ``(0, 0)``. A name that is held but does not qualify is an error either
         way. Default ``True``.
+    mode : EvictedItemMode
+        What is kept about the keys erased, as for ``erase_keys``. ``DISCARD`` (the
+        default) keeps nothing, and a table with a row per key that lost a key is then
+        marked ``erase_untracked``: an incremental dump of it cannot be replayed.
+        ``RETAIN_KEY`` records the erased keys (``pop_erased_keys``), and an incremental
+        dump carries them as removals, so a TTL can run with delta updates. Recording
+        costs about 24 bytes per slot of each chunk in flight (~100 MB per default
+        chunk) and one device read of its count.
 
     Returns
     -------
@@ -482,7 +494,7 @@ def erase_by_score_async(
     from dynamicemb.dump_load import get_dynamic_emb_module
 
     check_erase_arguments(
-        score_strategy, threshold, stream, chunk_slots, max_in_flight, table_names
+        score_strategy, threshold, stream, chunk_slots, max_in_flight, table_names, mode
     )
     modules: List[Tuple[nn.Module, Optional[List[str]]]] = []
     found = set()
@@ -518,6 +530,7 @@ def erase_by_score_async(
                 chunk_slots,
                 max_in_flight,
                 table_names=names,
+                mode=mode,
             )
             for module, names in modules
         ]
