@@ -1567,20 +1567,33 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
         A prefetch adds the number of keys it looked up to
         ``_prefetch_outstanding_keys``, which can only be too large. While the sum is
         within the cache nothing is wrong whatever the real counts are, and nothing is
-        read. When it is not, the real counts are read (this waits for the device),
-        once for all the prefetches in flight and the one being made, the sum is
-        corrected, and only then is it an error. It is called before the prefetch
-        changes anything, so a cache that is over-subscribed is raised on untouched.
-        Returns the real count of the batch being made.
+        read. When it is not, the real counts that have already landed on the host (a
+        prefetch counted by its bound, with the sum past half of the cache, asked for
+        its count: see ``PrefetchState.unique_count``) replace their bounds, without
+        waiting. If that is not enough, the real counts are read
+        (this waits for the device), once for all the prefetches in flight and the one
+        being made, the sum is corrected, and only then is it an error. It is called
+        before the prefetch changes anything, so a cache that is over-subscribed is
+        raised on untouched. Returns the count of the batch being made: its bound, or its
+        real count if it had to be read.
         """
         capacity = self._cache._state.capacity
         pending = self._prefetch_states
+        for state in pending:
+            if state.unique_count is not None and state.unique_count.landed():
+                count = int(state.unique_count.value)
+                self._prefetch_outstanding_keys += count - state.num_prefetched_keys
+                state.num_prefetched_keys = count
+                state.unique_count = None
+        if int(self._prefetch_outstanding_keys) <= capacity:
+            return bound
         counts = torch.cat(
             [state.num_unique for state in pending] + [num_unique]
         ).tolist()
         for state, count in zip(pending, counts):
             self._prefetch_outstanding_keys += count - state.num_prefetched_keys
             state.num_prefetched_keys = count
+            state.unique_count = None
         current = counts[-1]
         self._prefetch_outstanding_keys += current - bound
         outstanding = int(self._prefetch_outstanding_keys)

@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import copy
 import itertools
 import json
 import os
@@ -48,6 +49,7 @@ from dynamicemb.dynamicemb_config import (
 )
 from dynamicemb.embedding_admission import FrequencyAdmissionStrategy, KVCounter
 from dynamicemb.key_value_table import (
+    DelayedCopy,
     DynamicEmbCache,
     DynamicEmbStorage,
     DynamicEmbTableState,
@@ -4236,6 +4238,54 @@ def test_step_does_not_block(layout, optimizer, pooling, admission):
     no_grad_step()
     torch.cuda.synchronize()
     assert blocking_syncs(no_grad_step, profiled) == {}, "an eval step blocks"
+
+
+def test_outstanding_keys_settle_from_the_counts_that_have_landed():
+    """Batches prefetched ahead of their forwards pin, by their bounds (the keys they
+    look up), more than the cache holds, and in fact a few keys. A batch counted by its
+    bound with the sum past half of the cache has its real count sent to the host without
+    waiting: once that has landed, the next prefetch settles on it and does not wait for
+    the device, and asks for its own count in turn. If it has not landed, the prefetch
+    asks the device, as it did."""
+    module = make_module("cache", "sgd", NONE, False)
+    capacity = module._cache._state.capacity
+    n = capacity // 2 + 200  # one batch is within the cache, two are not
+    bags = len(FEATURE_TABLE_MAP) * BATCH
+    offsets = torch.round(torch.linspace(0, n, bags + 1)).to(torch.int64).cuda()
+    keys = (torch.arange(n) % 8).cuda()  # eight distinct keys in each table
+
+    def prefetch():
+        module.prefetch(keys, offsets)
+
+    def drain():
+        for _ in range(2):  # the forwards pop the prefetched batches in order
+            module(keys, offsets).sum().backward()
+        assert int(module._prefetch_outstanding_keys) == 0, "the keys were miscounted"
+
+    prefetch()
+    torch.cuda.synchronize()  # the count of the first batch has landed
+    assert blocking_syncs(prefetch, 1) == {}  # the second settles on it ...
+    assert int(module._prefetch_outstanding_keys) < capacity
+    module(keys, offsets).sum().backward()  # the first batch is done
+    torch.cuda.synchronize()  # ... and the count of the second has landed
+    assert blocking_syncs(prefetch, 1) == {}  # the third settles on that
+    drain()
+
+    # The control: the count of the first prefetch is queued behind a long wait, so it has
+    # not landed when the second looks, which then has to ask the device.
+    def asks_the_device():
+        torch.cuda._sleep(100_000_000)
+        prefetch()
+        prefetch()
+
+    assert blocking_syncs(asks_the_device, 1), "no wait seen"
+    drain()
+
+
+def test_a_copy_of_a_count_on_its_way_is_nothing():
+    """An event belongs to one process and one device: a copy of a module (copy.deepcopy,
+    pickle) that has a count on its way starts without it."""
+    assert copy.deepcopy(DelayedCopy(torch.arange(3, device="cuda"))) is None
 
 
 @pytest.mark.parametrize("layout", ["hbm", "cache", "host"])

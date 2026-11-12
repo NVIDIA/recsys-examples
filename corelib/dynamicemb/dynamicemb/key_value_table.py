@@ -708,6 +708,38 @@ def create_table_state(
     )
 
 
+def _nothing() -> None:
+    return None
+
+
+class DelayedCopy:
+    """A device tensor on its way to the host: started now, read once it has landed.
+
+    The host works from an upper bound of what the device knows (the input keys of a
+    batch for its unique keys), and replaces the bound by the real value when it can have
+    it without waiting. The copy is queued on the current stream, into pinned memory,
+    behind the work that made the tensor; ``landed()`` asks the event that ends it,
+    without waiting, and ``value`` is the host tensor, to be read only after ``landed()``
+    has said yes.
+    """
+
+    def __init__(self, source: torch.Tensor):
+        self.value = torch.empty(
+            tuple(source.shape), dtype=source.dtype, device="cpu", pin_memory=True
+        )
+        self.value.copy_(source.detach(), non_blocking=True)
+        self._event = torch.cuda.Event()
+        self._event.record(torch.cuda.current_stream(source.device))
+
+    def landed(self) -> bool:
+        return self._event.query()
+
+    def __reduce__(self):
+        # An event belongs to one process and one device: a copy of a module
+        # (copy.deepcopy, pickle) with a copy on its way starts without it.
+        return (_nothing, ())
+
+
 def collect_table_sizes_to_device(state: DynamicEmbTableState) -> torch.Tensor:
     """Collect per-table sizes (main table only, no overflow) into a tensor on state.device.
 
