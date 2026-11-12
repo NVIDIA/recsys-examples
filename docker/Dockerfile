@@ -35,12 +35,15 @@ COPY --from=fbgemm_arm64_wheel_build /dist/ /
 FROM ${BASE_IMAGE} AS base_fbgemm
 
 ARG TARGETPLATFORM
-# The linux/arm64 FBGEMM GPU wheel to install (fbgemm_arm64_wheel's, published),
-# its sha256, and the torch it is built against (its torch_version.txt), which
-# must be the image's. An empty URL builds FBGEMM from source instead.
-ARG FBGEMM_ARM64_WHEEL_URL=
-ARG FBGEMM_ARM64_WHEEL_SHA256=
-ARG FBGEMM_ARM64_WHEEL_TORCH_VERSION=
+# The linux/arm64 FBGEMM GPU wheel to install, its sha256, and the torch it is
+# built against (its torch_version.txt), which must be the image's: by default
+# fbgemm_arm64_wheel's for this BASE_IMAGE and FBGEMM tag, published with the
+# recsys-examples release fbgemm-gpu-1.9.0-ngc26.09-aarch64. Another BASE_IMAGE
+# needs a wheel built on it, or an empty FBGEMM_ARM64_WHEEL_URL, which builds
+# FBGEMM from source.
+ARG FBGEMM_ARM64_WHEEL_URL=https://github.com/NVIDIA/recsys-examples/releases/download/fbgemm-gpu-1.9.0-ngc26.09-aarch64/fbgemm_gpu-1.9.0-cp312-cp312-linux_aarch64.whl
+ARG FBGEMM_ARM64_WHEEL_SHA256=acf9f3efba35aa9be36c90bb840656d1fb91dedda3cff6258431858f635acea0
+ARG FBGEMM_ARM64_WHEEL_TORCH_VERSION=2.14.0a0+b2c75dd062.nv26.09
 
 WORKDIR /workspace/deps
 
