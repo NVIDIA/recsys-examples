@@ -171,8 +171,8 @@ def test_lru_lfu_eviction_by_frequency(current_device):
         ir,
     )
 
-    assert num_evicted > 0, "eviction should have occurred (bucket overflowed)"
-    evicted_set = set(int(k) for k in evicted_keys.tolist())
+    assert int(num_evicted) > 0, "eviction should have occurred (bucket overflowed)"
+    evicted_set = set(int(k) for k in evicted_keys[: int(num_evicted)].tolist())
     assert evicted_set.isdisjoint(
         set(int(k) for k in hot.tolist())
     ), "high-frequency (hot) keys must not be evicted by LFU"
@@ -480,7 +480,7 @@ def test_lru_lfu_custom_score_function_ranks_by_its_dimension(
         ScoreArg(name="frequency", value=new_freq, policy=ScorePolicy.LRU_LFU),
         ir,
     )
-    assert num_evicted > 0, "eviction should have occurred"
+    assert int(num_evicted) > 0, "eviction should have occurred"
 
     ev_keys, ev_tids = probes[evicted]
     sv_keys, sv_tids = probes[survivor]
@@ -555,7 +555,7 @@ def test_lru_lfu_decay_matches_python_oracle(current_device):
 
     keys_cpu = keys.cpu().numpy()
     predicted = set(int(keys_cpu[i]) for i in order[:m])
-    actual = set(int(k) for k in evicted_keys.tolist())
+    actual = set(int(k) for k in evicted_keys[:m].tolist())
     assert actual == predicted, "kernel must evict exactly the oracle-predicted set"
 
 
@@ -589,10 +589,10 @@ def test_lru_lfu_score_function_logical_order_remap(current_device):
         ir = torch.empty(n_new, dtype=table.result_type, device=device).fill_(
             InsertResult.INIT.value
         )
-        _, _, evk, _, _, _ = table.insert_and_evict(
+        _, num_ev, evk, _, _, _ = table.insert_and_evict(
             nk, nt, ScoreArg(name="frequency", value=nf, policy=ScorePolicy.LRU_LFU), ir
         )
-        return set(int(k) for k in evk.tolist())
+        return set(int(k) for k in evk[: int(num_ev)].tolist())
 
     evicted_ts = _run(_evict_high_freq_first, LRU_LFU_TS_FIRST)
     evicted_lfu = _run(_evict_high_freq_first_lfu_first, LRU_LFU_LFU_FIRST)
@@ -748,7 +748,7 @@ def test_lru_lfu_custom_score_function_batched_v2(current_device):
     assert rank[order[m]] - rank[order[m - 1]] > 1e-6, "eviction boundary must not tie"
     keys_cpu = keys.cpu().numpy()
     predicted = set(int(keys_cpu[i]) for i in order[:m])
-    actual = set(int(k) for k in evicted_keys.tolist())
+    actual = set(int(k) for k in evicted_keys[:m].tolist())
     assert actual == predicted, (
         "batched (LFU,TIMESTAMP) custom eviction must match the physical decayed-LFU "
         "oracle (proves both logical->physical index remaps are correct)"
@@ -813,7 +813,7 @@ def test_lru_lfu_default_evictor_timestamp_tiebreak(current_device):
     assert ts[order[m]] > ts[order[m - 1]], "eviction boundary must fall on a ts gap"
     keys_cpu = keys.cpu().numpy()
     predicted = set(int(keys_cpu[i]) for i in order[:m])
-    actual = set(int(k) for k in evicted_keys.tolist())
+    actual = set(int(k) for k in evicted_keys[:m].tolist())
     assert (
         actual == predicted
     ), "default Lex evictor must break equal-frequency ties by evicting oldest timestamps"
@@ -1337,7 +1337,7 @@ def test_lru_lfu_erase_reclaimed_slot_is_reused_before_evicting_live_keys(
 
     assert int(num_evicted) == 0, (
         f"insert into a bucket with a reclaimed slot evicted live key(s) "
-        f"{evicted_keys[:num_evicted].tolist()}"
+        f"{evicted_keys[: int(num_evicted)].tolist()}"
     )
     assert table.size() == bc
 

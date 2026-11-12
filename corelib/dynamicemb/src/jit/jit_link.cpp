@@ -219,7 +219,28 @@ void demb_launch_evict(CUfunction fn, EvictParams params, int64_t batch,
   constexpr int BLOCK = 256;
   if (batch <= 0)
     return;
-  unsigned grid = static_cast<unsigned>((batch + BLOCK - 1) / BLOCK);
+  int64_t blocks = (batch + BLOCK - 1) / BLOCK;
+  if (params.num_valid != nullptr) {
+    // The live count sits on the device, so the grid is sized by the capacity
+    // `batch`; cap it as the AoT launches do (counted_grid in counted_ops.h,
+    // num_sms * (max_threads_per_sm / block) * 4; this file has no torch, so it
+    // asks the driver) so that a short or empty batch is one cheap launch. The
+    // kernels stride over the entries.
+    CUdevice dev = current_device();
+    int num_sms = 0, max_threads_per_sm = 0;
+    cu_check(cuDeviceGetAttribute(
+                 &num_sms, CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT, dev),
+             "cuDeviceGetAttribute(multiprocessor count)");
+    cu_check(cuDeviceGetAttribute(
+                 &max_threads_per_sm,
+                 CU_DEVICE_ATTRIBUTE_MAX_THREADS_PER_MULTIPROCESSOR, dev),
+             "cuDeviceGetAttribute(max threads per multiprocessor)");
+    int64_t max_blocks =
+        static_cast<int64_t>(num_sms) * (max_threads_per_sm / BLOCK) * 4;
+    if (blocks > max_blocks)
+      blocks = max_blocks;
+  }
+  unsigned grid = static_cast<unsigned>(blocks);
   void *args[] = {&params};
   cu_check(cuLaunchKernel(fn, grid, 1, 1, BLOCK, 1, 1, 0, stream, args,
                           nullptr),

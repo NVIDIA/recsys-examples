@@ -28,6 +28,7 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 #include <cstdint>
 #include <cuda_runtime.h>
 #include <memory>
+#include <optional>
 #include <pybind11/pybind11.h>
 #include <stdexcept>
 #include <torch/extension.h>
@@ -40,7 +41,9 @@ void sgd_update_for_flat_table(at::Tensor grads, at::Tensor indices,
                                at::Tensor table_value_dims,
                                at::Tensor table_emb_dims, int64_t max_emb_dim,
                                bool all_dims_vec4, float const lr,
-                               int64_t table_dtype);
+                               int64_t table_dtype,
+                               const std::optional<at::Tensor> &num_valid =
+                                   std::nullopt);
 
 void adam_update_for_flat_table(at::Tensor grads, at::Tensor indices,
                                 at::Tensor table_ptrs, at::Tensor table_ids,
@@ -49,14 +52,18 @@ void adam_update_for_flat_table(at::Tensor grads, at::Tensor indices,
                                 const float beta1, const float beta2,
                                 const float eps, const float weight_decay,
                                 const uint32_t iter_num, int64_t max_emb_dim,
-                                bool all_dims_vec4, int64_t table_dtype);
+                                bool all_dims_vec4, int64_t table_dtype,
+                                const std::optional<at::Tensor> &num_valid =
+                                    std::nullopt);
 
 void adagrad_update_for_flat_table(at::Tensor grads, at::Tensor indices,
                                    at::Tensor table_ptrs, at::Tensor table_ids,
                                    at::Tensor table_value_dims,
                                    at::Tensor table_emb_dims, const float lr,
                                    const float eps, int64_t max_emb_dim,
-                                   bool all_dims_vec4, int64_t table_dtype);
+                                   bool all_dims_vec4, int64_t table_dtype,
+                                   const std::optional<at::Tensor> &num_valid =
+                                       std::nullopt);
 
 void rowwise_adagrad_for_flat_table(at::Tensor grads, at::Tensor indices,
                                     at::Tensor table_ptrs, at::Tensor table_ids,
@@ -64,7 +71,9 @@ void rowwise_adagrad_for_flat_table(at::Tensor grads, at::Tensor indices,
                                     at::Tensor table_emb_dims, const float lr,
                                     const float eps, int64_t max_emb_dim,
                                     bool all_dims_vec4, int64_t table_dtype,
-                                    int64_t state_dtype);
+                                    int64_t state_dtype,
+                                    const std::optional<at::Tensor> &num_valid =
+                                        std::nullopt);
 
 void ftrl_update_for_flat_table(at::Tensor grads, at::Tensor indices,
                                 at::Tensor table_ptrs, at::Tensor table_ids,
@@ -74,13 +83,17 @@ void ftrl_update_for_flat_table(at::Tensor grads, at::Tensor indices,
                                 const float beta, const float l1_reg,
                                 const float l2_reg, int64_t max_emb_dim,
                                 bool all_dims_vec4, int64_t table_dtype,
-                                const float group_lasso_reg = 0.0f);
+                                const float group_lasso_reg = 0.0f,
+                                const std::optional<at::Tensor> &num_valid =
+                                    std::nullopt);
 
 void sgd_update_for_padded_buffer(at::Tensor grads, at::Tensor values,
                                   at::Tensor table_ids,
                                   at::Tensor table_emb_dims, int64_t emb_dim,
                                   int64_t value_dim, bool all_dims_vec4,
-                                  float lr);
+                                  float lr,
+                                  const std::optional<at::Tensor> &num_valid =
+                                      std::nullopt);
 
 void adam_update_for_padded_buffer(at::Tensor grads, at::Tensor values,
                                    at::Tensor table_ids,
@@ -88,20 +101,26 @@ void adam_update_for_padded_buffer(at::Tensor grads, at::Tensor values,
                                    int64_t value_dim, bool all_dims_vec4,
                                    float lr, float beta1, float beta2,
                                    float eps, float weight_decay,
-                                   uint32_t iter_num);
+                                   uint32_t iter_num,
+                                   const std::optional<at::Tensor> &num_valid =
+                                       std::nullopt);
 
 void adagrad_update_for_padded_buffer(at::Tensor grads, at::Tensor values,
                                       at::Tensor table_ids,
                                       at::Tensor table_emb_dims,
                                       int64_t emb_dim, int64_t value_dim,
-                                      bool all_dims_vec4, float lr, float eps);
+                                      bool all_dims_vec4, float lr, float eps,
+                                      const std::optional<at::Tensor> &num_valid =
+                                          std::nullopt);
 
 void rowwise_adagrad_for_padded_buffer(at::Tensor grads, at::Tensor values,
                                        at::Tensor table_ids,
                                        at::Tensor table_emb_dims,
                                        int64_t emb_dim, int64_t value_dim,
                                        bool all_dims_vec4, float lr, float eps,
-                                       int64_t state_dtype);
+                                       int64_t state_dtype,
+                                       const std::optional<at::Tensor> &num_valid =
+                                           std::nullopt);
 
 void ftrl_update_for_padded_buffer(at::Tensor grads, at::Tensor values,
                                    at::Tensor table_ids,
@@ -109,7 +128,9 @@ void ftrl_update_for_padded_buffer(at::Tensor grads, at::Tensor values,
                                    int64_t value_dim, bool all_dims_vec4,
                                    float lr, float learning_rate_power,
                                    float beta, float l1_reg, float l2_reg,
-                                   float group_lasso_reg);
+                                   float group_lasso_reg,
+                                   const std::optional<at::Tensor> &num_valid =
+                                       std::nullopt);
 
 } // namespace dyn_emb
 #endif // OPTIMIZER_H

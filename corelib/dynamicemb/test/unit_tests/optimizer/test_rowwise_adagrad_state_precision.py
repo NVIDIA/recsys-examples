@@ -303,8 +303,11 @@ def test_reset_writes_fp32_initial_value(value_type):
     rows = torch.zeros(
         4, emb_dim + optimizer.get_state_dim(emb_dim), dtype=value_type, device="cuda"
     )
+    # The counted form: only the first two of the three indices are live.
     optimizer.reset_optimizer_states(
-        rows[:, emb_dim:], indices=torch.tensor([1, 3], device="cuda")
+        rows[:, emb_dim:],
+        indices=torch.tensor([1, 3, 0], device="cuda"),
+        num_valid=torch.tensor([2], device="cuda"),
     )
 
     accumulator = optimizer.states_for_checkpoint(rows[:, emb_dim:], emb_dim)

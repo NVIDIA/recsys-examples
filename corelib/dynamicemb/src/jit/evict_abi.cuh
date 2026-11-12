@@ -23,6 +23,11 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 // (cuLaunchKernel kernelParams = { &params }), so there is no hand-packed
 // per-argument void* list to get wrong.
 //
+// The host launcher and the cubin both include this header and both are
+// rebuilt from it by setup.py (compile_evict_fatbins), so the layout cannot
+// drift between them: a field added here needs a rebuild of the extension,
+// never a hand-sync.
+//
 // KeyType/IndexType/CounterType are all int64, ScoreType is uint64, InsertResult
 // is a uint8 enum -- fixed for LruLfu (§11.2), so this ABI is monomorphic. The
 // cubin exposes three entry points (all take EvictParams by value):
@@ -48,6 +53,9 @@ struct EvictParams {
   const int64_t *table_bucket_offsets;
   int *bucket_sizes;
   int64_t batch;
+  // Device count of the live leading entries of the per-key arrays (nullable;
+  // null: all `batch`); see counted_ops.h.
+  const int64_t *num_valid;
   const int64_t *input_keys;
   const int64_t *table_ids;
   uint8_t *insert_results; // InsertResult*

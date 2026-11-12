@@ -24,16 +24,18 @@ namespace dyn_emb {
 // Converts per-table slot_indices (and optional table_ids) to flat counter
 // index inside the kernel and adds delta. No atomic: caller guarantees no
 // two threads write the same counter element (e.g. slot_indices from unique
-// keys).
+// keys). With `num_valid` (null: all n) only the first *num_valid entries are
+// live; the others are never read.
 __global__ void update_counter_with_layout_kernel(
     int32_t *__restrict__ counter, int64_t total_capacity,
     int64_t const *__restrict__ slot_indices, int64_t n, int32_t delta,
     int64_t const *__restrict__ table_ids,
     int64_t const *__restrict__ table_bucket_offsets, int64_t bucket_capacity,
     int64_t main_capacity, int64_t const *__restrict__ overflow_output_offsets,
-    int64_t overflow_bucket_capacity, int64_t num_tables) {
+    int64_t overflow_bucket_capacity, int64_t num_tables,
+    int64_t const *__restrict__ num_valid) {
   int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-  if (i >= n)
+  if (i >= counted_limit(num_valid, n))
     return;
   int64_t slot = slot_indices[i];
   if (slot < 0)
@@ -70,7 +72,8 @@ void launch_table_insert_and_evict_kernel(
     int64_t *score_output_ptr, typename Table::KeyType **table_key_slots_ptr,
     CounterType *evict_counter_ptr, typename Table::KeyType *evicted_keys_ptr,
     int64_t *evicted_scores_ptr, IndexType *evicted_indices_ptr,
-    int64_t *evicted_table_ids_ptr, int32_t *counter_ptr, cudaStream_t stream,
+    int64_t *evicted_table_ids_ptr, int32_t *counter_ptr,
+    int64_t const *num_valid_ptr, cudaStream_t stream,
     Table ovf_table = Table(), int *ovf_bucket_sizes_ptr = nullptr,
     int32_t *ovf_counter_ptr = nullptr,
     int64_t *ovf_output_offsets_ptr = nullptr, int64_t score_fn_key = 0) {
@@ -90,6 +93,7 @@ void launch_table_insert_and_evict_kernel(
     p.table_bucket_offsets = table_bucket_offsets_ptr;
     p.bucket_sizes = bucket_sizes_ptr;
     p.batch = num_total;
+    p.num_valid = num_valid_ptr;
     p.input_keys = reinterpret_cast<const int64_t *>(keys_ptr);
     p.table_ids = table_ids_ptr;
     p.insert_results = reinterpret_cast<uint8_t *>(insert_results_ptr);
@@ -116,18 +120,21 @@ void launch_table_insert_and_evict_kernel(
         InsertKernelTraits<BLOCK_SIZE, 1, 1, CompactTileSize, 8, PolicyTypeV,
                            OutputScoreV, EnableOverflowV>;
     table_insert_and_evict_kernel<Table, KernelTraits>
-        <<<(num_total + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE, 0, stream>>>(
+        <<<table_grid_size(num_total, BLOCK_SIZE, num_valid_ptr != nullptr),
+           BLOCK_SIZE, 0, stream>>>(
             table, table_bucket_offsets_ptr, bucket_sizes_ptr, num_total,
             keys_ptr, table_ids_ptr, insert_results_ptr, indices_ptr,
             score_input_ptr, score_output_ptr, table_key_slots_ptr,
             evict_counter_ptr, evicted_keys_ptr, evicted_scores_ptr,
             evicted_indices_ptr, evicted_table_ids_ptr, counter_ptr, ovf_table,
-            ovf_bucket_sizes_ptr, ovf_counter_ptr, ovf_output_offsets_ptr);
+            ovf_bucket_sizes_ptr, ovf_counter_ptr, ovf_output_offsets_ptr,
+            num_valid_ptr);
   }
 
   table_unlock_kernel<Table>
-      <<<(num_total + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE, 0, stream>>>(
-          table, num_total, keys_ptr, table_key_slots_ptr);
+      <<<table_grid_size(num_total, BLOCK_SIZE, num_valid_ptr != nullptr),
+         BLOCK_SIZE, 0, stream>>>(table, num_total, keys_ptr,
+                                  table_key_slots_ptr, num_valid_ptr);
 }
 
 void table_insert_and_evict_single_score(
@@ -140,7 +147,7 @@ void table_insert_and_evict_single_score(
     at::Tensor evicted_keys, at::Tensor evicted_indices,
     at::Tensor evicted_scores, at::Tensor evicted_table_ids,
     std::optional<at::Tensor> counter, int64_t num_scores,
-    int64_t score_fn_key) {
+    int64_t score_fn_key, int64_t const *num_valid_ptr) {
 
   auto key_type = get_data_type(keys);
 
@@ -199,23 +206,24 @@ void table_insert_and_evict_single_score(
                        num_buckets, bucket_capacity, num_scores);
 
     DISPATCH_SCORE_POLICY(policy_type, PolicyTypeV, [&] {
-      if (num_total % 32 == 0) {
+      // A device count needs tile 1 (see insert_and_evict_body).
+      if (num_total % 32 == 0 && num_valid_ptr == nullptr) {
         if (output_score) {
           launch_table_insert_and_evict_kernel<Table, PolicyTypeV, true, 32>(
               table, table_bucket_offsets_ptr, bucket_sizes_, num_total, keys_,
               table_ids_ptr, insert_results_ptr, indices_ptr, score_input_ptr,
               score_output_ptr, table_key_slots_, evict_counter_, evicted_keys_,
               evicted_scores_ptr, evicted_indices_, evicted_table_ids_ptr,
-              counter_ptr, stream, Table(), nullptr, nullptr, nullptr,
-              score_fn_key);
+              counter_ptr, num_valid_ptr, stream, Table(), nullptr, nullptr,
+              nullptr, score_fn_key);
         } else {
           launch_table_insert_and_evict_kernel<Table, PolicyTypeV, false, 32>(
               table, table_bucket_offsets_ptr, bucket_sizes_, num_total, keys_,
               table_ids_ptr, insert_results_ptr, indices_ptr, score_input_ptr,
               nullptr, table_key_slots_, evict_counter_, evicted_keys_,
               evicted_scores_ptr, evicted_indices_, evicted_table_ids_ptr,
-              counter_ptr, stream, Table(), nullptr, nullptr, nullptr,
-              score_fn_key);
+              counter_ptr, num_valid_ptr, stream, Table(), nullptr, nullptr,
+              nullptr, score_fn_key);
         }
       } else {
         if (output_score) {
@@ -224,16 +232,16 @@ void table_insert_and_evict_single_score(
               table_ids_ptr, insert_results_ptr, indices_ptr, score_input_ptr,
               score_output_ptr, table_key_slots_, evict_counter_, evicted_keys_,
               evicted_scores_ptr, evicted_indices_, evicted_table_ids_ptr,
-              counter_ptr, stream, Table(), nullptr, nullptr, nullptr,
-              score_fn_key);
+              counter_ptr, num_valid_ptr, stream, Table(), nullptr, nullptr,
+              nullptr, score_fn_key);
         } else {
           launch_table_insert_and_evict_kernel<Table, PolicyTypeV, false, 1>(
               table, table_bucket_offsets_ptr, bucket_sizes_, num_total, keys_,
               table_ids_ptr, insert_results_ptr, indices_ptr, score_input_ptr,
               nullptr, table_key_slots_, evict_counter_, evicted_keys_,
               evicted_scores_ptr, evicted_indices_, evicted_table_ids_ptr,
-              counter_ptr, stream, Table(), nullptr, nullptr, nullptr,
-              score_fn_key);
+              counter_ptr, num_valid_ptr, stream, Table(), nullptr, nullptr,
+              nullptr, score_fn_key);
         }
       }
     });
@@ -253,7 +261,8 @@ static void table_insert_and_evict_with_counter_and_overflow_single_score(
     at::Tensor evicted_scores, at::Tensor evicted_table_ids, at::Tensor counter,
     at::Tensor ovf_storage, int64_t ovf_bucket_capacity,
     at::Tensor ovf_bucket_sizes, at::Tensor ovf_counter,
-    at::Tensor ovf_output_offsets, int64_t num_scores, int64_t score_fn_key) {
+    at::Tensor ovf_output_offsets, int64_t num_scores, int64_t score_fn_key,
+    int64_t const *num_valid_ptr) {
 
   auto key_type = get_data_type(keys);
 
@@ -322,7 +331,8 @@ static void table_insert_and_evict_with_counter_and_overflow_single_score(
                            ovf_num_buckets, ovf_bucket_capacity, num_scores);
 
     DISPATCH_SCORE_POLICY(policy_type, PolicyTypeV, [&] {
-      if (num_total % 32 == 0) {
+      // A device count needs tile 1 (see insert_and_evict_body).
+      if (num_total % 32 == 0 && num_valid_ptr == nullptr) {
         if (output_score) {
           launch_table_insert_and_evict_kernel<Table, PolicyTypeV, true, 32,
                                                true>(
@@ -330,8 +340,9 @@ static void table_insert_and_evict_with_counter_and_overflow_single_score(
               table_ids_ptr, insert_results_ptr, indices_ptr, score_input_ptr,
               score_output_ptr, table_key_slots_, evict_counter_, evicted_keys_,
               evicted_scores_ptr, evicted_indices_, evicted_table_ids_ptr,
-              counter_ptr, stream, ovf_table, ovf_bucket_sizes_,
-              ovf_counter_ptr, ovf_output_offsets_ptr, score_fn_key);
+              counter_ptr, num_valid_ptr, stream, ovf_table,
+              ovf_bucket_sizes_, ovf_counter_ptr, ovf_output_offsets_ptr,
+              score_fn_key);
         } else {
           launch_table_insert_and_evict_kernel<Table, PolicyTypeV, false, 32,
                                                true>(
@@ -339,8 +350,9 @@ static void table_insert_and_evict_with_counter_and_overflow_single_score(
               table_ids_ptr, insert_results_ptr, indices_ptr, score_input_ptr,
               nullptr, table_key_slots_, evict_counter_, evicted_keys_,
               evicted_scores_ptr, evicted_indices_, evicted_table_ids_ptr,
-              counter_ptr, stream, ovf_table, ovf_bucket_sizes_,
-              ovf_counter_ptr, ovf_output_offsets_ptr, score_fn_key);
+              counter_ptr, num_valid_ptr, stream, ovf_table,
+              ovf_bucket_sizes_, ovf_counter_ptr, ovf_output_offsets_ptr,
+              score_fn_key);
         }
       } else {
         if (output_score) {
@@ -350,8 +362,9 @@ static void table_insert_and_evict_with_counter_and_overflow_single_score(
               table_ids_ptr, insert_results_ptr, indices_ptr, score_input_ptr,
               score_output_ptr, table_key_slots_, evict_counter_, evicted_keys_,
               evicted_scores_ptr, evicted_indices_, evicted_table_ids_ptr,
-              counter_ptr, stream, ovf_table, ovf_bucket_sizes_,
-              ovf_counter_ptr, ovf_output_offsets_ptr, score_fn_key);
+              counter_ptr, num_valid_ptr, stream, ovf_table,
+              ovf_bucket_sizes_, ovf_counter_ptr, ovf_output_offsets_ptr,
+              score_fn_key);
         } else {
           launch_table_insert_and_evict_kernel<Table, PolicyTypeV, false, 1,
                                                true>(
@@ -359,8 +372,9 @@ static void table_insert_and_evict_with_counter_and_overflow_single_score(
               table_ids_ptr, insert_results_ptr, indices_ptr, score_input_ptr,
               nullptr, table_key_slots_, evict_counter_, evicted_keys_,
               evicted_scores_ptr, evicted_indices_, evicted_table_ids_ptr,
-              counter_ptr, stream, ovf_table, ovf_bucket_sizes_,
-              ovf_counter_ptr, ovf_output_offsets_ptr, score_fn_key);
+              counter_ptr, num_valid_ptr, stream, ovf_table,
+              ovf_bucket_sizes_, ovf_counter_ptr, ovf_output_offsets_ptr,
+              score_fn_key);
         }
       }
     });
@@ -384,7 +398,8 @@ table_insert_and_evict(at::Tensor table_storage,
                        std::optional<at::Tensor> ovf_bucket_sizes,
                        std::optional<at::Tensor> ovf_counter,
                        std::optional<at::Tensor> ovf_output_offsets,
-                       int64_t num_scores, int64_t score_fn_key) {
+                       int64_t num_scores, int64_t score_fn_key,
+                       std::optional<at::Tensor> num_valid) {
 
   int64_t num_total = keys.size(0);
   if (num_total == 0) {
@@ -417,6 +432,7 @@ table_insert_and_evict(at::Tensor table_storage,
       torch::empty({num_total}, keys.options().dtype(torch::kLong));
 
   bool use_overflow = ovf_storage.has_value() && ovf_storage.value().defined();
+  auto num_valid_ptr = counted_num_valid_ptr(num_valid, keys.device());
 
   if (use_overflow) {
     TORCH_CHECK(counter.has_value(),
@@ -427,13 +443,14 @@ table_insert_and_evict(at::Tensor table_storage,
         score_output, num_evicted, evicted_keys, evicted_indices,
         evicted_scores, evicted_table_ids, counter.value(), ovf_storage.value(),
         ovf_bucket_capacity, ovf_bucket_sizes.value(), ovf_counter.value(),
-        ovf_output_offsets.value(), num_scores, score_fn_key);
+        ovf_output_offsets.value(), num_scores, score_fn_key, num_valid_ptr);
   } else {
     table_insert_and_evict_single_score(
         table_storage, table_bucket_offsets, bucket_capacity, bucket_sizes,
         keys, table_ids, score_input, policy_type, indices, insert_results,
         score_output, num_evicted, evicted_keys, evicted_indices,
-        evicted_scores, evicted_table_ids, counter, num_scores, score_fn_key);
+        evicted_scores, evicted_table_ids, counter, num_scores, score_fn_key,
+        num_valid_ptr);
   }
 
   return std::make_tuple(indices, num_evicted, evicted_keys, evicted_indices,
@@ -446,7 +463,7 @@ void table_update_counter_with_layout(
     int64_t main_capacity, int64_t num_tables,
     c10::optional<at::Tensor> table_ids,
     c10::optional<at::Tensor> overflow_output_offsets,
-    int64_t overflow_bucket_capacity) {
+    int64_t overflow_bucket_capacity, std::optional<at::Tensor> num_valid) {
 
   int64_t n = slot_indices.size(0);
   if (n == 0)
@@ -467,11 +484,14 @@ void table_update_counter_with_layout(
   auto stream = at::cuda::getCurrentCUDAStream().stream();
 
   constexpr int BLOCK_SIZE = 256;
+  // One thread per entry, not a grid-stride loop: the grid stays derived from
+  // the capacity n, and the blocks past the live count return at once.
   update_counter_with_layout_kernel<<<(n + BLOCK_SIZE - 1) / BLOCK_SIZE,
                                       BLOCK_SIZE, 0, stream>>>(
       counter_ptr, total_capacity, slot_indices_ptr, n, delta, table_ids_ptr,
       table_bucket_offsets_ptr, bucket_capacity, main_capacity,
-      overflow_output_offsets_ptr, overflow_bucket_capacity, num_tables);
+      overflow_output_offsets_ptr, overflow_bucket_capacity, num_tables,
+      counted_num_valid_ptr(num_valid, slot_indices.device()));
 
   DEMB_CUDA_KERNEL_LAUNCH_CHECK();
 }

@@ -62,7 +62,10 @@ CUfunction demb_get_insert_fn(int64_t key);
 CUfunction demb_get_insert_collect_fn(int64_t key);
 
 // Launch the evict kernel over `batch` keys (block 256), passing `params` as the
-// single by-value argument, on `stream`. Throws on launch error.
+// single by-value argument, on `stream`. Throws on launch error. `batch` is the
+// capacity of the per-key arrays; when params.num_valid (a device count of the
+// live leading entries) is set the kernel stops at it and the grid is capped
+// instead of covering `batch`.
 void demb_launch_evict(CUfunction fn, EvictParams params, int64_t batch,
                        CUstream stream);
 

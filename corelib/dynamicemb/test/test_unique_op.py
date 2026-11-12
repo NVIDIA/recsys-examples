@@ -16,6 +16,9 @@
 import pytest
 import torch
 from dynamicemb_extensions import (
+    counted_gather,
+    counted_scatter,
+    counted_scatter_fill,
     expand_table_ids_cuda,
     flagged_compact,
     segmented_unique_cuda,
@@ -465,9 +468,10 @@ def test_expand_table_ids(setup_device):
         table_ids_cpu, expected
     ), f"table_ids mismatch: {table_ids_cpu} vs {expected}"
 
-    # Edge: empty input
-    empty_ids = expand_table_ids_cuda(segmented_range, 0)
-    assert empty_ids.numel() == 0
+    # A prefix of the expansion, down to the empty input
+    for n in (0, 1, 7, 16):
+        prefix = expand_table_ids_cuda(segmented_range, n)
+        assert torch.equal(prefix.cpu(), expected[:n])
 
     print(f"expand_table_ids test passed: {num_elements} elements, 3 tables")
 
@@ -528,18 +532,244 @@ def test_flagged_compact(setup_device, N, flag_mode, input_spec):
                 torch.randint(0, 2**60, (N,), dtype=torch.int64, device=device)
             )
 
-    h_count, indices, outputs = flagged_compact(flags, inputs)
+    # The arrays keep the length of the input; the first ``count`` entries are the result.
+    count, indices, outputs = flagged_compact(flags, inputs, None)
+    h_count = count.item()
     ref_count, ref_idx, ref_outputs = _flagged_compact_reference(flags, inputs)
 
     assert h_count == ref_count, f"count mismatch: {h_count} vs {ref_count}"
-    assert torch.equal(indices, ref_idx), "indices mismatch"
+    assert indices.shape == (N,), "indices keep the length of the input"
+    assert torch.equal(indices[:h_count], ref_idx), "indices mismatch"
     assert len(outputs) == len(ref_outputs)
     for i, (out, ref) in enumerate(zip(outputs, ref_outputs)):
         if ref is None:
             assert out is None, f"output {i} should be None"
         else:
-            assert torch.equal(out, ref), f"output {i} mismatch"
+            assert out.shape == (N,), f"output {i} keeps the length of the input"
+            assert torch.equal(out[:h_count], ref), f"output {i} mismatch"
             assert out.dtype == torch.int64, f"output {i} dtype mismatch"
+
+
+# ============================================================================
+# Tests with a device count
+# ============================================================================
+# ``num_valid``, a one-element int64 device tensor, says how many leading entries of the
+# capacity-CAP arrays are live; the rest is garbage that no op may read or write. The
+# reference for n is a torch computation on the exact slice [:n].
+
+CAP = 1000
+NS = [0, 1, CAP // 2, CAP - 1, CAP]
+BIG = 1 << 22  # more entries than a capped grid has threads: the ops must stride
+HUGE = 1 << 40
+INT_OF_SIZE = {1: torch.int8, 2: torch.int16, 4: torch.int32, 8: torch.int64}
+# The n sweep on one layout, then every word width (1, 2, 4, 8, 16 bytes) and a row
+# wider than a block (1100 columns) at one n. ``inner``: the dims of a row, () for 1-D.
+ROW_CASES = [(n, torch.float32, (8,)) for n in NS] + [
+    (CAP // 2, torch.bool, ()),
+    (CAP // 2, torch.float16, (3,)),
+    (CAP // 2, torch.float32, (3,)),
+    (CAP // 2, torch.int64, ()),
+    (CAP // 2, torch.uint64, (40,)),
+    (CAP // 2, torch.bfloat16, (1100,)),
+]
+
+
+def _nv(n):
+    """``num_valid`` as the step passes it: a view into a longer int64 tensor."""
+    return torch.tensor([-7, n, 99], device="cuda")[1:2]
+
+
+def _bits(t):
+    """``t`` as a signed integer tensor of its element size: exact to compare, and
+    indexable for the dtypes torch has few ops for (uint64)."""
+    return t.contiguous().view(INT_OF_SIZE[t.element_size()])
+
+
+def _same(a, b):
+    return torch.equal(_bits(a), _bits(b))
+
+
+def _rand(shape, dtype):
+    x = torch.randint(0, 100, shape, dtype=torch.int64, device="cuda")
+    if dtype == torch.uint64:
+        return x.view(torch.uint64)
+    return x % 2 == 1 if dtype == torch.bool else x.to(dtype)
+
+
+def _sentinel(shape, dtype):
+    """An output pre-filled with an all-ones bit pattern, which no test value has."""
+    out = torch.empty(shape, dtype=dtype, device="cuda")
+    out.view(INT_OF_SIZE[out.element_size()]).fill_(-1)
+    return out
+
+
+def _garbage_idx(n, rows, unique=False):
+    """(idx, sel): idx[:n] holds row ids in [0, rows) (distinct if ``unique``) or -1,
+    idx[n:] is garbage, out-of-range ids of both signs; sel are the positions below n
+    that hold a row id."""
+    if unique:
+        idx = torch.randperm(rows, device="cuda")[:CAP]
+    else:
+        idx = torch.randint(0, rows, (CAP,), device="cuda")
+    idx[torch.rand(CAP, device="cuda") < 0.2] = -1
+    sel = (idx[:n] >= 0).nonzero().flatten()
+    junk = torch.randint(rows, HUGE, (CAP - n,), device="cuda")
+    junk[1::2] *= -1
+    idx[n:] = junk
+    return idx, sel
+
+
+@pytest.mark.parametrize("n", NS + [-3, CAP + 50])  # the last two: clamped to [0, CAP]
+def test_flagged_compact_ignores_the_tail(n):
+    live = min(max(n, 0), CAP)
+    flags = torch.rand(CAP, device="cuda") < 0.4
+    flags[live:] = True  # a tail that a compaction without the count would select
+    keys = torch.randint(-HUGE, HUGE, (CAP,), device="cuda")
+    count, positions, outs = flagged_compact(
+        flags, [keys.view(torch.uint64), None, keys], _nv(n)
+    )
+    ref = flags[:live].nonzero().flatten()
+    c = count.item()
+    assert c == ref.numel() and torch.equal(positions[:c], ref)
+    assert outs[1] is None and outs[0].dtype == torch.uint64
+    assert _same(outs[0][:c], keys[ref]) and torch.equal(outs[2][:c], keys[ref])
+
+
+def test_flagged_compact_rejects_a_seventh_input():
+    flags = torch.ones(8, dtype=torch.bool, device="cuda")
+    with pytest.raises(RuntimeError):
+        flagged_compact(flags, [torch.arange(8, device="cuda")] * 7, None)
+
+
+@pytest.mark.parametrize("n, dtype, inner", ROW_CASES, ids=str)
+def test_counted_gather(n, dtype, inner):
+    rows = 600
+    src = _rand((rows, *inner), dtype)
+    idx, sel = _garbage_idx(n, rows)
+    out = counted_gather(src, idx, _nv(n))
+    assert out.dtype == dtype and out.shape == (CAP, *inner)
+    assert torch.equal(_bits(out)[sel], _bits(src)[idx[sel]])
+
+
+@pytest.mark.parametrize("n, dtype, inner", ROW_CASES, ids=str)
+def test_counted_scatter(n, dtype, inner):
+    shape = (CAP + 20, *inner)
+    src = _rand((CAP, *inner), dtype)
+    idx, sel = _garbage_idx(n, shape[0], unique=True)
+    ref = _sentinel(shape, dtype)
+    _bits(ref)[idx[sel]] = _bits(src)[sel]
+
+    dst = _sentinel(shape, dtype)
+    counted_scatter(dst, idx, src, _nv(n))
+    assert _same(dst, ref)  # the garbage tail wrote nothing
+    dst = _sentinel(shape, dtype)
+    counted_scatter(dst, idx[:n], src[:n], None)
+    assert _same(dst, ref)
+
+
+@pytest.mark.parametrize(
+    "n, dtype, value",
+    [(n, torch.int64, -1) for n in NS] + [(CAP // 2, torch.int64, 7)]
+    # a bool destination takes True for any value but 0
+    + [(CAP // 2, torch.bool, v) for v in (True, 2, 0)],
+    ids=str,
+)
+def test_counted_scatter_fill(n, dtype, value):
+    idx, sel = _garbage_idx(n, CAP)
+    ref = torch.zeros(CAP, dtype=dtype, device="cuda")
+    ref[idx[sel]] = bool(value) if dtype == torch.bool else value
+
+    dst = torch.zeros_like(ref)
+    counted_scatter_fill(dst, idx, value, _nv(n))
+    assert _same(dst, ref)  # the garbage tail wrote nothing
+    dst = torch.zeros_like(ref)
+    counted_scatter_fill(dst, idx[:n], value, None)
+    assert _same(dst, ref)
+
+
+@pytest.mark.parametrize("count", [-3, CAP + 9])
+def test_count_is_clamped_to_the_capacity(count):
+    # idx is the first CAP entries of a longer array: a loop to the raw count would
+    # read live entries past the capacity, and write dst[5] for them.
+    idx = torch.full((CAP + 16,), 5, device="cuda")
+    idx[:CAP] = -1  # skipped
+    dst = torch.zeros(CAP, dtype=torch.int64, device="cuda")
+    counted_scatter_fill(dst, idx[:CAP], 1, _nv(count))
+    assert not dst.any()
+
+
+def test_counted_scatter_fill_rejects_other_destinations():
+    with pytest.raises(RuntimeError):  # a destination is a 1-D bool or int64 tensor
+        counted_scatter_fill(
+            torch.zeros(8, 4, device="cuda"), torch.arange(8, device="cuda"), 1, None
+        )
+
+
+def test_rows_of_strided_views():
+    # Views of the middle columns of a wider tensor: a row pitch that is no multiple
+    # of 16 bytes and a base 4 bytes in, so rows move in 4-byte words; the other
+    # columns must stay as they were.
+    n, c = CAP // 2, 6
+    wide = torch.randn(700, c + 4, device="cuda")
+    idx, sel = _garbage_idx(n, 700)
+    out = counted_gather(wide[:, 1 : 1 + c], idx, _nv(n))
+    assert torch.equal(out[sel], wide[idx[sel], 1 : 1 + c])
+
+    idx, sel = _garbage_idx(n, CAP, unique=True)
+    rows = torch.randn(CAP, c, device="cuda")
+    dst = torch.full((CAP, c + 4), -1.0, device="cuda")
+    ref = dst.clone()
+    ref[idx[sel], 1 : 1 + c] = rows[sel]
+    counted_scatter(dst[:, 1 : 1 + c], idx, rows, _nv(n))
+    assert torch.equal(dst, ref)
+
+
+@pytest.mark.parametrize("n", [1, BIG // 2 + 1, BIG])
+def test_glue_ops_over_a_capped_grid(n):
+    num_valid = torch.tensor([n], device="cuda")
+    flags = torch.rand(BIG, device="cuda") < 0.3
+    keys = torch.randint(0, 1 << 40, (BIG,), device="cuda")
+    idx = torch.randperm(BIG, device="cuda")  # n live entries, all distinct, all valid
+
+    count, positions, (selected,) = flagged_compact(flags, [keys], num_valid)
+    ref = torch.nonzero(flags[:n]).flatten()
+    assert int(count) == ref.numel()
+    assert torch.equal(positions[: ref.numel()], ref)
+    assert torch.equal(selected[: ref.numel()], keys[ref])
+
+    gathered = counted_gather(keys, idx, num_valid)
+    assert torch.equal(gathered[:n], keys[idx[:n]])
+
+    scattered = torch.zeros_like(keys)
+    counted_scatter(scattered, idx, keys, num_valid)
+    ref = torch.zeros_like(keys)
+    ref[idx[:n]] = keys[:n]
+    assert torch.equal(scattered, ref)
+
+    filled = torch.zeros_like(keys)
+    counted_scatter_fill(filled, idx, 7, num_valid)
+    ref = torch.zeros_like(keys)
+    ref[idx[:n]] = 7
+    assert torch.equal(filled, ref)
+
+
+def test_ops_do_not_read_the_count():
+    flags = torch.rand(CAP, device="cuda") < 0.5
+    keys = torch.arange(CAP, device="cuda")
+    rows = torch.zeros(CAP, 4, device="cuda")
+    src = torch.ones(CAP, 4, device="cuda")
+    count = _nv(CAP // 2)
+    torch.cuda.synchronize()
+    torch.cuda.set_sync_debug_mode("error")  # a .item() / .cpu() of the count raises
+    try:
+        flagged_compact(flags, [keys, None], count)
+        flagged_compact(flags, [], count)
+        counted_gather(rows, keys, count)
+        counted_scatter(rows, keys, src, count)
+        counted_scatter_fill(flags, keys, True, count)
+    finally:
+        torch.cuda.set_sync_debug_mode("default")
+    torch.cuda.synchronize()
 
 
 if __name__ == "__main__":
@@ -609,7 +839,11 @@ def test_segmented_unique_reduce_rejects_unknown(setup_device):
     segmented_range = torch.tensor([0, 2], dtype=torch.int64, device=device)
     with pytest.raises(Exception, match="reduce must be"):
         segmented_unique_cuda(
-            keys, segmented_range, 1, torch.empty(0, dtype=torch.int64, device=device), "avg"
+            keys,
+            segmented_range,
+            1,
+            torch.empty(0, dtype=torch.int64, device=device),
+            "avg",
         )
 
 

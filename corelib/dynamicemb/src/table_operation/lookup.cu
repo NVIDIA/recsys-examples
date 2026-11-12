@@ -25,7 +25,7 @@ void table_lookup_single_score(
     int64_t bucket_capacity, at::Tensor keys, at::Tensor table_ids,
     std::optional<at::Tensor> score_input, ScorePolicyType policy_type,
     at::Tensor score_output, at::Tensor founds, at::Tensor indices,
-    int64_t num_scores) {
+    int64_t num_scores, int64_t const *num_valid_ptr) {
 
   auto key_type = get_data_type(keys);
 
@@ -70,10 +70,11 @@ void table_lookup_single_score(
 
     DISPATCH_SCORE_POLICY(policy_type, PolicyTypeV, [&] {
       table_lookup_kernel<Table, 1, PolicyTypeV, false>
-          <<<(num_total + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE, 0,
-             stream>>>(table, table_bucket_offsets_ptr, num_total, keys_ptr,
-                       table_ids_ptr, founds_ptr, indices_ptr, score_input_ptr,
-                       score_output_ptr, Table(), nullptr);
+          <<<table_grid_size(num_total, BLOCK_SIZE, num_valid_ptr != nullptr),
+             BLOCK_SIZE, 0, stream>>>(
+              table, table_bucket_offsets_ptr, num_total, keys_ptr,
+              table_ids_ptr, founds_ptr, indices_ptr, score_input_ptr,
+              score_output_ptr, Table(), nullptr, num_valid_ptr);
     });
   });
   DEMB_CUDA_KERNEL_LAUNCH_CHECK();
@@ -85,7 +86,8 @@ static void table_lookup_with_overflow_single_score(
     std::optional<at::Tensor> score_input, ScorePolicyType policy_type,
     at::Tensor score_output, at::Tensor founds, at::Tensor indices,
     at::Tensor ovf_storage, int64_t ovf_bucket_capacity,
-    at::Tensor ovf_output_offsets, int64_t num_scores) {
+    at::Tensor ovf_output_offsets, int64_t num_scores,
+    int64_t const *num_valid_ptr) {
 
   auto key_type = get_data_type(keys);
 
@@ -138,10 +140,12 @@ static void table_lookup_with_overflow_single_score(
 
     DISPATCH_SCORE_POLICY(policy_type, PolicyTypeV, [&] {
       table_lookup_kernel<Table, 1, PolicyTypeV, true>
-          <<<(num_total + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE, 0,
-             stream>>>(table, table_bucket_offsets_ptr, num_total, keys_ptr,
-                       table_ids_ptr, founds_ptr, indices_ptr, score_input_ptr,
-                       score_output_ptr, ovf_table, ovf_output_offsets_ptr);
+          <<<table_grid_size(num_total, BLOCK_SIZE, num_valid_ptr != nullptr),
+             BLOCK_SIZE, 0, stream>>>(
+              table, table_bucket_offsets_ptr, num_total, keys_ptr,
+              table_ids_ptr, founds_ptr, indices_ptr, score_input_ptr,
+              score_output_ptr, ovf_table, ovf_output_offsets_ptr,
+              num_valid_ptr);
     });
   });
   DEMB_CUDA_KERNEL_LAUNCH_CHECK();
@@ -152,7 +156,8 @@ table_lookup(at::Tensor table_storage, at::Tensor table_bucket_offsets,
              int64_t bucket_capacity, at::Tensor keys, at::Tensor table_ids,
              std::optional<at::Tensor> score_input, ScorePolicyType policy_type,
              std::optional<at::Tensor> ovf_storage, int64_t ovf_bucket_capacity,
-             std::optional<at::Tensor> ovf_output_offsets, int64_t num_scores) {
+             std::optional<at::Tensor> ovf_output_offsets, int64_t num_scores,
+             std::optional<at::Tensor> num_valid) {
 
   int64_t num_total = keys.size(0);
   if (num_total == 0) {
@@ -171,18 +176,19 @@ table_lookup(at::Tensor table_storage, at::Tensor table_bucket_offsets,
       torch::empty({num_total}, keys.options().dtype(torch::kInt64));
 
   bool use_overflow = ovf_storage.has_value() && ovf_storage.value().defined();
+  auto num_valid_ptr = counted_num_valid_ptr(num_valid, keys.device());
 
   if (use_overflow) {
     table_lookup_with_overflow_single_score(
         table_storage, table_bucket_offsets, bucket_capacity, keys, table_ids,
         score_input, policy_type, score_output, founds, indices,
         ovf_storage.value(), ovf_bucket_capacity, ovf_output_offsets.value(),
-        num_scores);
+        num_scores, num_valid_ptr);
   } else {
     table_lookup_single_score(table_storage, table_bucket_offsets,
                               bucket_capacity, keys, table_ids, score_input,
                               policy_type, score_output, founds, indices,
-                              num_scores);
+                              num_scores, num_valid_ptr);
   }
 
   return std::make_tuple(score_output, founds, indices);

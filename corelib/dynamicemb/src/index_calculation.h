@@ -53,8 +53,11 @@ void select_async(int64_t num_items, bool const *d_flags, T const *d_input,
                              stream);
 }
 
-template <typename T, typename NumSelectedIteratorT>
-void select_index_async(int64_t num_items, bool const *d_flags, T *d_output,
+// d_flags of select_index_async / flagged_compact_impl / flagged_compact_cub is
+// a bool pointer or any random-access iterator over bool-convertible flags (the
+// counted compaction passes one that bounds the candidates by a device count).
+template <typename T, typename NumSelectedIteratorT, typename FlagsIteratorT>
+void select_index_async(int64_t num_items, FlagsIteratorT d_flags, T *d_output,
                         NumSelectedIteratorT *d_num_select,
                         at::Device const &device, cudaStream_t const &stream) {
   void *d_temp_storage = nullptr;
@@ -78,8 +81,8 @@ void select_index_async(int64_t num_items, bool const *d_flags, T *d_output,
                              stream);
 }
 
-template <size_t... Is>
-void flagged_compact_impl(int64_t num_items, bool const *d_flags,
+template <typename FlagsIteratorT, size_t... Is>
+void flagged_compact_impl(int64_t num_items, FlagsIteratorT d_flags,
                           int64_t const *const *d_inputs,
                           int64_t *const *d_outputs, int64_t *d_out_indices,
                           int64_t *d_num_selected, at::Device const &device,
@@ -103,8 +106,8 @@ void flagged_compact_impl(int64_t num_items, bool const *d_flags,
                              d_num_selected, num_items, stream);
 }
 
-template <size_t N>
-void flagged_compact_cub(int64_t num_items, bool const *d_flags,
+template <size_t N, typename FlagsIteratorT>
+void flagged_compact_cub(int64_t num_items, FlagsIteratorT d_flags,
                          int64_t const *const *d_inputs,
                          int64_t *const *d_outputs, int64_t *d_out_indices,
                          int64_t *d_num_selected, at::Device const &device,
