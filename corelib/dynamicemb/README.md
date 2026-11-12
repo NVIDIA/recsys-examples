@@ -42,8 +42,8 @@ The lookup kernel algorithms implemented in DynamicEmb primarily leverage portio
 
 DynamicEmb builds on PyTorch, FBGEMM_GPU, and TorchRec. The project Docker image installs the validated dependency set from `docker/Dockerfile`:
 
-- FBGEMM_GPU `v1.5.0`
-- TorchRec `release/V1.5.0`
+- FBGEMM_GPU `v1.9.0`
+- TorchRec `v1.9.2-rc3`
 
 For source installs outside the Docker image, make sure a CUDA-enabled PyTorch environment is already installed (refer to [PyTorch documentation](https://pytorch.org/get-started/locally/)), then install compatible FBGEMM_GPU and TorchRec packages.
 
@@ -54,7 +54,7 @@ Please follow the instructions below to build FBGEMM_GPU from source. It may tak
 ```bash
 # install setup tools
 pip install --no-cache setuptools-git-versioning scikit-build
-git clone --recursive -b v1.5.0 https://github.com/pytorch/FBGEMM.git fbgemm
+git clone --recursive -b v1.9.0 https://github.com/pytorch/FBGEMM.git fbgemm
 cd fbgemm/fbgemm_gpu
 # please specify the proper TORCH_CUDA_ARCH_LIST for your ENV
 python setup.py install --build-target=default --build-variant=cuda -DTORCH_CUDA_ARCH_LIST="7.5 8.0 9.0"
@@ -64,7 +64,7 @@ Once the build is done, run `python -c 'import fbgemm_gpu'` to make sure it is i
 
 2. **TorchRec**
 
-> torchrec >= v1.2.0; the Docker image currently validates against TorchRec `release/V1.5.0`.
+> torchrec >= v1.2.0; the Docker image currently validates against TorchRec `v1.9.2-rc3`.
 
 Thanks to the torchrec team for their [support](https://github.com/meta-pytorch/torchrec/commit/6aaf1fa72e884642f39c49ef232162fa3772055e), torchrec v1.2.0 added support for custom embedding lookup module.
 
@@ -73,7 +73,7 @@ After FBGEMM_GPU is installed, install TorchRec with:
 ```bash
 # torchrec depends on below 2 libs
 pip install --no-deps tensordict orjson
-git clone --recursive -b release/V1.5.0 https://github.com/pytorch/torchrec.git torchrec
+git clone --recursive -b v1.9.2-rc3 https://github.com/meta-pytorch/torchrec.git torchrec
 cd torchrec
 # with --no-deps to prevent from installing dependencies
 pip install --no-deps .
@@ -87,6 +87,12 @@ To install DynamicEmb, please use the following command:
 
 ```bash
 python setup.py install
+```
+
+It builds DynamicEmb's kernels for the GPU architectures in `DEMB_ARCHS`: by default `75;80;90;100;103;120` (`103` is GB300), less those the CUDA compiler cannot build (sm_103 needs CUDA 12.9 or newer). `TORCH_CUDA_ARCH_LIST` does not apply to them. To build for fewer, for example only GB300:
+
+```bash
+DEMB_ARCHS=103 python setup.py install
 ```
 
 ## DynamicEmb APIs
