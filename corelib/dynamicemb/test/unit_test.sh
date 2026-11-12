@@ -32,6 +32,9 @@ FWD_BWD_TEST_FILES=(
     "test/unit_tests/test_planner_plan_cost.py"
     "test/unit_tests/test_planner_placement.py"
     "test/unit_tests/test_table_row_wise.sh"
+    "test/unit_tests/test_hier_dist.sh"
+    "test/unit_tests/test_hier_overflow.sh"
+    "test/unit_tests/test_hier_pipeline.sh"
 )
 
 LOAD_DUMP_TEST_FILES=(
@@ -44,18 +47,9 @@ LOAD_DUMP_TEST_FILES=(
     "test/unit_tests/test_table_row_wise.sh"
 )
 
-# The hierarchical output dist's groups, fwd_bwd_hier and load_dump_hier,
-# each a CI job of its own beside fwd_bwd and load_dump, which would not fit
-# them in their time (docs/hier_output_dist.md, section 18). fwd_bwd_hier
-# runs the dist's own tests, then both run the files of their group above
-# that build sharded EmbeddingCollections again on the dist, with their
-# configurations unchanged (test/unit_tests/hier_switch.py).
-HIER_TEST_FILES=(
-    "test/unit_tests/test_hier_dist.sh"
-    "test/unit_tests/test_hier_overflow.sh"
-    "test/unit_tests/test_hier_pipeline.sh"
-)
-
+# Files of the groups above that build sharded EmbeddingCollections, run
+# again on the hierarchical output dist with their configurations unchanged
+# (test/unit_tests/hier_switch.py; docs/hier_output_dist.md, section 18).
 FWD_BWD_HIER_FILES=(
     "test/unit_tests/test_sequence_embedding.sh"
     "test/unit_tests/test_twin_module.sh"
@@ -70,28 +64,18 @@ LOAD_DUMP_HIER_FILES=(
     "test/unit_tests/incremental_dump/test_incremental_dump.sh"
 )
 
-# TEST_FILES run with the group given; the groups of RERUN_GROUPS then run
-# their HIER_FILES on the dist, each file with its own group.
 case "$1" in
     fwd_bwd)
         TEST_FILES=("${FWD_BWD_TEST_FILES[@]}")
-        RERUN_GROUPS=()
+        HIER_FILES=("${FWD_BWD_HIER_FILES[@]}")
         ;;
     load_dump)
         TEST_FILES=("${LOAD_DUMP_TEST_FILES[@]}")
-        RERUN_GROUPS=()
-        ;;
-    fwd_bwd_hier)
-        TEST_FILES=("${HIER_TEST_FILES[@]}")
-        RERUN_GROUPS=(fwd_bwd)
-        ;;
-    load_dump_hier)
-        TEST_FILES=()
-        RERUN_GROUPS=(load_dump)
+        HIER_FILES=("${LOAD_DUMP_HIER_FILES[@]}")
         ;;
     *)
-        TEST_FILES=("${FWD_BWD_TEST_FILES[@]}" "${LOAD_DUMP_TEST_FILES[@]}" "${HIER_TEST_FILES[@]}")
-        RERUN_GROUPS=(fwd_bwd load_dump)
+        TEST_FILES=("${FWD_BWD_TEST_FILES[@]}" "${LOAD_DUMP_TEST_FILES[@]}")
+        HIER_FILES=("${FWD_BWD_HIER_FILES[@]}" "${LOAD_DUMP_HIER_FILES[@]}")
         ;;
 esac
 
@@ -135,23 +119,14 @@ done
 # given output_dist="hierarchical" raises ImportError. The probe loads torch
 # first, for libc10 (dynamicemb/__init__.py). A probe that fails does not skip
 # the runs.
-if [ "${#RERUN_GROUPS[@]}" -eq 0 ]; then
-    :
-elif [ "$(python -c 'import torch, dynamicemb_extensions as ext; print(hasattr(ext, "HierOutputDist"))')" = False ]; then
+if [ "$(python -c 'import torch, dynamicemb_extensions as ext; print(hasattr(ext, "HierOutputDist"))')" = False ]; then
     echo "this build has no hierarchical dist: the runs on it are skipped"
 else
-    for group in "${RERUN_GROUPS[@]}"; do
-        if [ "$group" = fwd_bwd ]; then
-            HIER_FILES=("${FWD_BWD_HIER_FILES[@]}")
-        else
-            HIER_FILES=("${LOAD_DUMP_HIER_FILES[@]}")
-        fi
-        for TEST_FILE in "${HIER_FILES[@]}"; do
-            echo "Running tests in $TEST_FILE on the hierarchical output dist"
-            (
-                export DYNAMICEMB_TEST_OUTPUT_DIST=hierarchical PYHKV_DEBUG_STRICT=1
-                run_file "$group" "$TEST_FILE"
-            ) || exit 1
-        done
+    for TEST_FILE in "${HIER_FILES[@]}"; do
+        echo "Running tests in $TEST_FILE on the hierarchical output dist"
+        (
+            export DYNAMICEMB_TEST_OUTPUT_DIST=hierarchical PYHKV_DEBUG_STRICT=1
+            run_file "$1" "$TEST_FILE"
+        ) || exit 1
     done
 fi

@@ -122,7 +122,6 @@ sys.path.insert(
     0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "benchmark")
 )
 from benchmark_utils import hier_capacities, hier_needs, init_distributed  # noqa: E402
-from hier_switch import splits_host  # noqa: E402
 
 NUM_EMBEDDINGS = 1 << 20
 # Nodes of the run and their GPUs, as the hierarchical dist takes them: NCCL's
@@ -2128,11 +2127,6 @@ def main() -> None:
         f"{world_size} ranks: {NODES} node(s) of {NODE_SIZE} GPUs (NCCL's LSA"
         f" team), hosts of {local_size} (LOCAL_WORLD_SIZE)"
     )
-    skip = splits_host(NODE_SIZE, local_size)
-    if skip is not None:
-        log(f"skipped: {skip}")
-        dist.destroy_process_group()
-        sys.exit(0)
     failures = check_node_size(rank, world_size, log)
     failures += gc_models(log)
     good = all_true(check_group_shapes(rank, world_size))

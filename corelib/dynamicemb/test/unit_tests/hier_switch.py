@@ -36,9 +36,8 @@ from ``corelib/dynamicemb``::
 
 import gc
 import os
-from typing import Any, Collection, Dict, List, Optional, Set
+from typing import Any, Collection, Dict, List, Optional
 
-import torch.distributed as dist
 import torch.nn as nn
 from dynamicemb.dynamicemb_config import (
     AUTO_OUTPUT_DIST,
@@ -46,7 +45,7 @@ from dynamicemb.dynamicemb_config import (
     TORCHREC_OUTPUT_DIST,
     takes_score_per_key,
 )
-from dynamicemb.shard import node_size, quiesce
+from dynamicemb.shard import quiesce
 from dynamicemb.shard.rw_sharding import RwSequenceDynamicEmbeddingSharding
 from torchrec.distributed.embedding_types import EmbeddingComputeKernel
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
@@ -67,28 +66,6 @@ OUTPUT_DIST_CAPACITY = int(
 # The models given the hierarchical dist, in the order they were built (the
 # same on every rank), until release() quiesces their ops.
 _models: List[nn.Module] = []
-# What check_path() said on this rank about runs where NCCL splits a host.
-_said: Set[str] = set()
-
-
-def splits_host(node: int, local: int) -> Optional[str]:
-    """Why a test of the hierarchical dist does not test it on a run, or
-    None: the dist's node, NCCL's LSA team of ``node`` ranks, splits the
-    ``local`` GPUs of a host (``LOCAL_WORLD_SIZE``) between nodes. NCCL makes its team smaller
-    than a host when it does not connect the host's GPUs directly, as under
-    ``NCCL_P2P_DISABLE=1``, which the CI sets: there, 6 ranks on an H100 host
-    got nodes of 2. The nodes of one host would exchange keys and rows over
-    GIN, where ``ncclDevCommCreate`` failed and every sharding took TorchRec's
-    dists (docs/hier_output_dist.md, section 18). test_hier_dist.py,
-    test_hier_overflow.py and test_hier_pipeline.py skip such a run, and
-    :func:`check_path` passes a sharding that falls back there."""
-    if local < 1 or node % local == 0:
-        return None
-    return (
-        f"NCCL's LSA team of {node} ranks splits the {local} GPUs of a host "
-        "between nodes (NCCL_P2P_DISABLE=1?), and the hierarchical dist would "
-        "exchange keys and rows over GIN inside the host"
-    )
 
 
 def serves(
@@ -138,9 +115,7 @@ def check_path(
     DynamicEmb tables (of ``tables`` alone, if given) took the hierarchical
     dist exactly when ``options`` give it ``"hierarchical"``. A sharding
     that falls back under ``"hierarchical"`` only warns, so the test would
-    pass without the dist; but where NCCL splits a host between the dist's
-    nodes (:func:`splits_host`), a fallback passes, with a line on rank 0. A
-    sharding given ``"auto"`` must fall back."""
+    pass without the dist. A sharding given ``"auto"`` must fall back."""
     if not options:
         return
     asked = options["output_dist"] == HIERARCHICAL_OUTPUT_DIST
@@ -161,28 +136,11 @@ def check_path(
             hier = sharding._hier
             took = hier is not None and hier.takes_hier_dist
             assert took is not None, f"{names}: the sharding has had no call yet"
-            num_checked += 1
-            if asked and not took and hier is not None:
-                # The sharding read its node (node_size, kept): no collective.
-                try:
-                    why = splits_host(
-                        node_size(hier._pg), int(os.environ.get("LOCAL_WORLD_SIZE", 0))
-                    )
-                except RuntimeError:
-                    why = None
-                if why is not None:
-                    if why not in _said and dist.get_rank() == 0:
-                        print(
-                            f"hier_switch: {names} took TorchRec's dists, which "
-                            f"passes: {why}",
-                            flush=True,
-                        )
-                    _said.add(why)
-                    continue
             assert took == asked, (
                 f"{names}: given output_dist={options['output_dist']!r}, the "
                 f"sharding {'took' if took else 'did not take'} the hierarchical dist"
             )
+            num_checked += 1
     assert num_checked or not asked, "no row-wise sharding of DynamicEmb tables"
 
 
