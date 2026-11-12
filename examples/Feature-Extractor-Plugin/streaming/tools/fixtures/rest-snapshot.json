@@ -1,0 +1,393 @@
+{
+  "spdx_copyright": "Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.",
+  "spdx_license_identifier": "Apache-2.0",
+  "schema": "flink-rest-snapshot/v1",
+  "overview": {
+    "flink-version": "2.2.1-secret-Acme",
+    "taskmanagers": 2,
+    "slots-total": 8,
+    "slots-available": 2,
+    "jobs-running": 1
+  },
+  "job": {
+    "jid": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "name": "secret-acme-orders-job",
+    "state": "RUNNING",
+    "start-time": 1760000000000,
+    "end-time": 1760000123456,
+    "duration": 123456,
+    "vertices": [
+      {
+        "id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "name": "Source: secret-acme-kafka-orders",
+        "parallelism": 4,
+        "status": "RUNNING",
+        "duration": 123000,
+        "metrics": {
+          "read-records": 0,
+          "write-records": 12000000,
+          "read-bytes": 0,
+          "write-bytes": 96000000
+        }
+      },
+      {
+        "id": "cccccccccccccccccccccccccccccccc",
+        "name": "StreamExecLookupJoin secret_customer_email@example.com",
+        "parallelism": 4,
+        "status": "RUNNING",
+        "duration": 122500,
+        "metrics": {
+          "read-records": 12000000,
+          "write-records": 8000000,
+          "read-bytes": 96000000,
+          "write-bytes": 128000000
+        }
+      },
+      {
+        "id": "dddddddddddddddddddddddddddddddd",
+        "name": "WindowAggregate secret_revenue_by_customer",
+        "parallelism": 4,
+        "status": "RUNNING",
+        "duration": 122000,
+        "metrics": {
+          "read-records": 8000000,
+          "write-records": 200000,
+          "read-bytes": 128000000,
+          "write-bytes": 6400000
+        }
+      },
+      {
+        "id": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        "name": "secret_customer_output[4]: Writer",
+        "parallelism": 2,
+        "status": "RUNNING",
+        "duration": 121000,
+        "metrics": {
+          "read-records": 200000,
+          "write-records": 200000,
+          "read-bytes": 6400000,
+          "write-bytes": 6400000
+        }
+      }
+    ]
+  },
+  "plan": {
+    "plan": {
+      "jid": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "name": "secret-acme-orders-job",
+      "nodes": [
+        {
+          "id": 1,
+          "type": "Source: private-kafka-topic-orders",
+          "pact": "Data Source",
+          "contents": "TableSourceScan(table=[secret_catalog.secret_orders])",
+          "parallelism": 4
+        },
+        {
+          "id": 2,
+          "type": "LookupJoin",
+          "pact": "Operator",
+          "contents": "StreamExecLookupJoin INNER secret_orders.customer_id = secret_customers.id",
+          "parallelism": 4,
+          "predecessors": [
+            {
+              "id": 1,
+              "ship_strategy": "HASH"
+            }
+          ]
+        },
+        {
+          "id": 3,
+          "type": "WindowAggregate",
+          "pact": "Operator",
+          "contents": "StreamExecWindowAggregate window=[TUMBLE(time_col=[secret_ts], size=[1 min])] SUM(secret_salary) GROUP BY secret_customer_id",
+          "parallelism": 4,
+          "predecessors": [
+            {
+              "id": 2,
+              "ship_strategy": "HASH secret-route-Acme"
+            }
+          ]
+        },
+        {
+          "id": 4,
+          "type": "Sink: private-jdbc-output",
+          "pact": "Data Sink",
+          "contents": "jdbc:postgresql://private-db.acme.example/orders password=very-secret",
+          "parallelism": 2,
+          "predecessors": [
+            {
+              "id": 3,
+              "ship_strategy": "FORWARD"
+            }
+          ]
+        }
+      ]
+    }
+  },
+  "config": {
+    "jid": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "name": "secret-acme-orders-job",
+    "execution-config": {
+      "execution-mode": "PIPELINED",
+      "restart-strategy": "ExponentialDelayRestartBackoffTimeStrategy",
+      "job-parallelism": 4,
+      "object-reuse-mode": false,
+      "user-config": {
+        "db.password": "very-secret-password",
+        "api.token": "private-token",
+        "customer.name": "Acme"
+      }
+    }
+  },
+  "checkpoint_config": {
+    "interval": 10000,
+    "timeout": 60000,
+    "min_pause": 1000,
+    "max_concurrent": 1,
+    "mode": "exactly_once",
+    "tolerable_failed_checkpoints": 0,
+    "unaligned_checkpoints": false,
+    "checkpoints_after_tasks_finish": true,
+    "state_backend": "secret.backend.CustomerStateBackend",
+    "checkpoint_storage": "s3://secret-customer-bucket/checkpoints",
+    "externalization": {
+      "enabled": true,
+      "delete_on_cancellation": false
+    }
+  },
+  "checkpoints": {
+    "counts": {
+      "total": 3,
+      "in_progress": 0,
+      "completed": 2,
+      "failed": 1,
+      "restored": 0
+    },
+    "history": [
+      {
+        "id": 1,
+        "status": "COMPLETED",
+        "end_to_end_duration": 950,
+        "checkpointed_size": 1048576,
+        "external_path": "s3://secret-customer-bucket/checkpoints/chk-1"
+      },
+      {
+        "id": 2,
+        "status": "COMPLETED",
+        "end_to_end_duration": 1250,
+        "checkpointed_size": 2097152,
+        "external_path": "s3://secret-customer-bucket/checkpoints/chk-2"
+      }
+    ]
+  },
+  "exceptions": {
+    "root-exception": "java.lang.RuntimeException: customer secret password very-secret-password",
+    "truncated": false,
+    "all-exceptions": [
+      {
+        "exception": "private-token at secret_customer_email@example.com",
+        "timestamp": 1760000060000
+      }
+    ]
+  },
+  "vertex_details": {
+    "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb": {
+      "name": "Source: secret-acme-kafka-orders",
+      "parallelism": 4,
+      "status": "RUNNING",
+      "tasks": {
+        "RUNNING": 4
+      }
+    },
+    "cccccccccccccccccccccccccccccccc": {
+      "name": "StreamExecLookupJoin private-customer-orders",
+      "parallelism": 4,
+      "status": "RUNNING",
+      "tasks": {
+        "RUNNING": 4
+      }
+    },
+    "dddddddddddddddddddddddddddddddd": {
+      "name": "WindowAggregate secret-revenue",
+      "parallelism": 4,
+      "status": "RUNNING",
+      "tasks": {
+        "RUNNING": 4
+      }
+    },
+    "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee": {
+      "name": "secret_customer_output[4]: Writer",
+      "parallelism": 2,
+      "status": "RUNNING",
+      "tasks": {
+        "RUNNING": 2
+      }
+    }
+  },
+  "runtime_samples": [
+    {
+      "offset_ms": 0,
+      "vertices": {
+        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb": {
+          "metrics": [
+            {
+              "id": "busyTimeMsPerSecond",
+              "min": "180",
+              "max": "240",
+              "avg": "210",
+              "sum": "840"
+            },
+            {
+              "id": "numRecordsOutPerSecond",
+              "avg": "100000"
+            }
+          ],
+          "backpressure": {
+            "status": "ok",
+            "backpressure-level": "ok",
+            "subtasks": [
+              {
+                "subtask": 0,
+                "backpressureRatio": 0.05,
+                "busyRatio": 0.21,
+                "idleRatio": 0.74
+              }
+            ]
+          }
+        },
+        "cccccccccccccccccccccccccccccccc": {
+          "metrics": [
+            {
+              "id": "busyTimeMsPerSecond",
+              "min": "810",
+              "max": "900",
+              "avg": "860",
+              "sum": "3440"
+            },
+            {
+              "id": "numRecordsInPerSecond",
+              "avg": "100000"
+            },
+            {
+              "id": "numRecordsOutPerSecond",
+              "avg": "65000"
+            }
+          ],
+          "backpressure": {
+            "status": "ok",
+            "backpressure-level": "low",
+            "subtasks": [
+              {
+                "subtask": 0,
+                "backpressureRatio": 0.12,
+                "busyRatio": 0.86,
+                "idleRatio": 0.02
+              }
+            ]
+          }
+        },
+        "dddddddddddddddddddddddddddddddd": {
+          "metrics": [
+            {
+              "id": "busyTimeMsPerSecond",
+              "min": "700",
+              "max": "830",
+              "avg": "770",
+              "sum": "3080"
+            },
+            {
+              "id": "numRecordsInPerSecond",
+              "avg": "65000"
+            },
+            {
+              "id": "numRecordsOutPerSecond",
+              "avg": "1800"
+            }
+          ],
+          "backpressure": {
+            "status": "ok",
+            "backpressure-level": "low",
+            "subtasks": [
+              {
+                "subtask": 0,
+                "backpressureRatio": 0.2,
+                "busyRatio": 0.77,
+                "idleRatio": 0.03
+              }
+            ]
+          }
+        },
+        "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee": {
+          "metrics": [
+            {
+              "id": "busyTimeMsPerSecond",
+              "avg": "300"
+            },
+            {
+              "id": "numRecordsInPerSecond",
+              "avg": "1800"
+            }
+          ],
+          "backpressure": {
+            "status": "ok",
+            "backpressure-level": "ok"
+          }
+        }
+      }
+    },
+    {
+      "offset_ms": 10000,
+      "vertices": {
+        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb": {
+          "metrics": [
+            {
+              "id": "busyTimeMsPerSecond",
+              "avg": "220"
+            }
+          ],
+          "backpressure": {
+            "status": "ok",
+            "backpressure-level": "ok"
+          }
+        },
+        "cccccccccccccccccccccccccccccccc": {
+          "metrics": [
+            {
+              "id": "busyTimeMsPerSecond",
+              "avg": "880"
+            }
+          ],
+          "backpressure": {
+            "status": "ok",
+            "backpressure-level": "low"
+          }
+        },
+        "dddddddddddddddddddddddddddddddd": {
+          "metrics": [
+            {
+              "id": "busyTimeMsPerSecond",
+              "avg": "790"
+            }
+          ],
+          "backpressure": {
+            "status": "ok",
+            "backpressure-level": "high"
+          }
+        },
+        "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee": {
+          "metrics": [
+            {
+              "id": "busyTimeMsPerSecond",
+              "avg": "320"
+            }
+          ],
+          "backpressure": {
+            "status": "ok",
+            "backpressure-level": "ok"
+          }
+        }
+      }
+    }
+  ]
+}

@@ -67,6 +67,16 @@ def generate_sparse_feature(
     )
 
 
+def with_key_dtype(features: torchrec.KeyedJaggedTensor, key_dtype: torch.dtype):
+    """The same features, with their keys in ``key_dtype``."""
+    return torchrec.KeyedJaggedTensor(
+        keys=features.keys(),
+        values=features.values().to(key_dtype),
+        lengths=features.lengths(),
+        weights=features.weights_or_none(),
+    )
+
+
 def embedding_lookup_backward(ret, is_pooled):
     """
     Perform backward pass on embeddings for both pooled and non-pooled cases
@@ -182,9 +192,18 @@ def release_hier_ops():
 # The bag size belongs with the pooling mode: a sequence lookup has one
 # embedding per key by definition, while SUM has to actually accumulate several
 # of them -- with a bag of at most one key the reduction being tested never runs.
+# The key dtype is that of the keys the DynamicEmb model reads. The TorchRec
+# model always reads them as int64, so an int32 run is checked against the int64
+# one. Index dedup belongs to EmbeddingCollection, so int32 keys run on the
+# sequence collection.
 @pytest.mark.parametrize(
-    "is_pooled, pooling_mode, max_bag_size",
-    [(True, PoolingType.SUM, 8), (False, None, 1)],
+    "is_pooled, pooling_mode, max_bag_size, key_dtype",
+    [
+        (True, PoolingType.SUM, 8, torch.int64),
+        (False, None, 1, torch.int64),
+        (False, None, 1, torch.int32),
+    ],
+    ids=["pooled-int64", "sequence-int64", "sequence-int32"],
 )
 @pytest.mark.parametrize("batch_size", [32, 2048])
 @pytest.mark.parametrize("num_iteration", [10])
@@ -210,6 +229,7 @@ def test_twin_module(
     backend_session,
     use_index_dedup,
     is_weighted,
+    key_dtype,
 ):
     if is_weighted:
         if not (is_pooled and pooling_mode == PoolingType.SUM):
@@ -275,7 +295,7 @@ def test_twin_module(
                 batch_size,
                 weighted=is_weighted,
             )
-        ret = dynamicemb_model(sparse_feature)
+        ret = dynamicemb_model(with_key_dtype(sparse_feature, key_dtype))
         if i == 0:
             hier_switch.check_path(dynamicemb_model, output_dist_options)
         # The reference reads the same KJT next, and splits it by its totals.

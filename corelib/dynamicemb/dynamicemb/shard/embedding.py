@@ -353,10 +353,9 @@ class ShardedDynamicEmbeddingCollection(ShardedEmbeddingCollection):
         ``values``, so theirs are sliced to the count.
 
         ``segmented_unique_cuda`` takes ``int64`` (or ``uint64``) keys:
-        ``int32`` keys are deduplicated as ``int64``, and the deduplicated
-        keys go back to the caller's dtype. So both dists' bucketizes place
-        each key by the rule of the key's own width, as DynamicEmb's
-        bucketize does.
+        ``int32`` keys are deduplicated as ``int64``, the keys the tables
+        store, and the deduplicated keys go back to the caller's dtype. So the
+        input dist sees the dtype it sees without index dedup.
         """
         with record_function("## dedup_ec_indices ##"):
             features_by_shards = []
@@ -378,8 +377,7 @@ class ShardedDynamicEmbeddingCollection(ShardedEmbeddingCollection):
                 features = hash_size_offset.numel() - 1
                 local_batchsize = total_B // features
 
-                values = input_feature.values()
-                indices = values.long() if values.dtype == torch.int32 else values
+                indices = input_feature.values()
                 offsets = input_feature.offsets().to(torch.int64)
                 num_elements = indices.numel()
                 needs_counters = self._needs_counters(i)
@@ -390,7 +388,7 @@ class ShardedDynamicEmbeddingCollection(ShardedEmbeddingCollection):
                         keys=input_feature.keys(),
                         lengths=input_feature.lengths().to(torch.int64),
                         offsets=offsets,
-                        values=values,
+                        values=indices,
                     )
                     if isinstance(input_feature, ScoredKeyedJaggedTensor):
                         dedup_features = ScoredKeyedJaggedTensor.from_kjt(
@@ -421,6 +419,12 @@ class ShardedDynamicEmbeddingCollection(ShardedEmbeddingCollection):
                         0, dtype=torch.int64, device=self._device
                     )
 
+                # segmented_unique_cuda takes 64-bit keys. The lookup widens
+                # int32 indices to int64, so the dedup does the same.
+                indices_64bit = (
+                    indices.to(torch.int64) if indices.dtype == torch.int32 else indices
+                )
+
                 # Call segmented_unique_cuda
                 (
                     num_uniques,
@@ -429,7 +433,7 @@ class ShardedDynamicEmbeddingCollection(ShardedEmbeddingCollection):
                     table_offsets,
                     freq_counters,
                 ) = segmented_unique_cuda(
-                    indices,
+                    indices_64bit,
                     segmented_range,
                     table_num,
                     input_frequencies,
@@ -445,7 +449,7 @@ class ShardedDynamicEmbeddingCollection(ShardedEmbeddingCollection):
                     total_B,
                 )
 
-                unique_keys = unique_keys.to(values.dtype)
+                unique_keys = unique_keys.to(indices.dtype)
                 if not on_hier[i]:
                     # Get unique values for the KJT
                     # .item() implicitly syncs GPU to CPU
