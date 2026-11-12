@@ -251,15 +251,16 @@ RUN cd FlexKV && mkdir -p build && cd build && \
 
 # -- Layer 4: NVE 26.05/default source trees and shared NVTX headers. The
 # default build follows the repository submodule; 26.05 uses its release tag.
-# NVE 26.05's bit_ops.hpp gives std::has_single_bit a signed size, which C++20
-# (PyTorch 2.14's headers need it) rejects; later NVE casts it to unsigned.
+# Under C++20, which PyTorch 2.14's headers need, NVE 26.05's bit_ops.hpp takes
+# std::has_single_bit and its siblings, but calls has_single_bit with signed
+# values, which only its own C++17 reimplementations accept (later NVE casts
+# them). Keep NVE 26.05 on those: its only C++20 switch, made false.
 COPY third_party/nv-embedding-cache /workspace/deps/nve
 RUN git clone --recursive -b v26.05 \
       https://github.com/NVIDIA/nv-embedding-cache.git nve-26.05 && \
-    test "$(grep -c '^  static_assert(has_single_bit(size));$' nve-26.05/include/bit_ops.hpp)" -eq 1 && \
-    sed -i 's/^  static_assert(has_single_bit(size));$/  static_assert(has_single_bit(static_cast<uint64_t>(size)));/' \
-      nve-26.05/include/bit_ops.hpp && \
-    test "$(grep -c 'has_single_bit(static_cast<uint64_t>(size))' nve-26.05/include/bit_ops.hpp)" -eq 1 && \
+    test "$(grep -c '^#if __cplusplus >= 202002L$' nve-26.05/include/bit_ops.hpp)" -eq 1 && \
+    sed -i 's/^#if __cplusplus >= 202002L$/#if 0/' nve-26.05/include/bit_ops.hpp && \
+    test "$(grep -c '^#if __cplusplus >= 202002L$' nve-26.05/include/bit_ops.hpp)" -eq 0 && \
     git clone -b v3.5.0 https://github.com/NVIDIA/NVTX.git NVTX
 
 COPY docker/nve_cuda_architectures.cmake /usr/local/share/recsys/nve_cuda_architectures.cmake
