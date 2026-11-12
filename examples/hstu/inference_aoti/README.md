@@ -91,14 +91,14 @@ contract family.
 ## Environment
 
 1. PyTorch export, C++ replay, and development use the image built from
-   `docker/Dockerfile`. It extends NVIDIA PyTorch 26.05
-   (`nvcr.io/nvidia/pytorch:26.05-py3`) with the repository's FBGEMM, FlexKV,
+   `docker/Dockerfile`. It extends NVIDIA PyTorch 26.09
+   (`nvcr.io/nvidia/pytorch:26.09-py3`) with the repository's FBGEMM, FlexKV,
    HSTU, DynamicEmb, commons, KV-cache manager, and isolated NVE 26.05 and
    submodule-backed default versions. The image selects the default. See
    the HSTU example [README](../README.md) for broader context.
 
 2. Triton Server testing uses `docker/Dockerfile.tritonserver`, based on NVIDIA
-   Triton Server 26.06 (`nvcr.io/nvidia/tritonserver:26.06-py3`). It copies the
+   Triton Server 26.09 (`nvcr.io/nvidia/tritonserver:26.09-py3`). It copies the
    custom PyTorch backend, PyTorch installation, FlexKV, NVE 26.05, HSTU,
    FBGEMM, custom-operator libraries, and Triton client dependencies from the
    AOTI development image.

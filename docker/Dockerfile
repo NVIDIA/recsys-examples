@@ -1,4 +1,4 @@
-ARG BASE_IMAGE=nvcr.io/nvidia/pytorch:26.07-py3
+ARG BASE_IMAGE=nvcr.io/nvidia/pytorch:26.09-py3
 ARG BASE_FBGEMM_IMAGE=base_fbgemm
 ARG BASE_TRITON_IMAGE=base_triton
 ARG DEVEL_IMAGE=devel
@@ -8,10 +8,10 @@ ARG DEVEL_IMAGE=devel
 #   1. UPSTREAM_PYTORCH_CONTAINER_VERSION when explicitly supplied
 #   2. Version parsed from nvcr.io/nvidia/pytorch:xx.xx-py3 BASE_IMAGE
 #   3. DEFAULT_UPSTREAM_PYTORCH_CONTAINER_VERSION
-ARG TRITON_SERVER_VERSION=26.07
-ARG TRITON_CLIENT_VERSION=2.71.0
+ARG TRITON_SERVER_VERSION=26.09
+ARG TRITON_CLIENT_VERSION=2.73.0
 ARG UPSTREAM_PYTORCH_CONTAINER_VERSION=
-ARG DEFAULT_UPSTREAM_PYTORCH_CONTAINER_VERSION=26.07
+ARG DEFAULT_UPSTREAM_PYTORCH_CONTAINER_VERSION=26.09
 ARG TRITON_BUILD_JOBS=8
 
 # ============================================================================
@@ -25,18 +25,19 @@ ARG TARGETPLATFORM
 WORKDIR /workspace/deps
 
 # Keep this tag marker for the distributed-recommender CI image-tag parser:
-# git clone --recursive -b v1.8.0 https://github.com/pytorch/FBGEMM.git
+# git clone --recursive -b v1.9.0 https://github.com/pytorch/FBGEMM.git
 COPY docker/install_fbgemm_gpu_arm64.sh /usr/local/bin/install_fbgemm_gpu_arm64.sh
 
 # Layer 0a: FBGEMM GPU. The official CUDA 13.0 wheel is version-matched to
-# PyTorch 2.13 and includes the SM80, SM90a, and SM100a targets needed here.
-# Using the wheel also avoids CUDA 13.3 source-compiler issues in this image.
+# PyTorch 2.14 and includes the SM80, SM90a, SM100a and SM120a targets.
+# Using the wheel also avoids compiling FBGEMM with this image's CUDA 13.4,
+# which FBGEMM 1.9.0 does not support yet (the arm64 source build still does).
 # The CUDA wheel is not published for aarch64, so retain the source build there.
 RUN set -eux; \
     case "${TARGETPLATFORM}" in \
       linux/amd64) \
         pip install --no-cache-dir --no-deps \
-          'https://download.pytorch.org/whl/cu130/fbgemm_gpu-1.8.0%2Bcu130-cp312-cp312-manylinux_2_28_x86_64.whl#sha256=b5a98aad7c662c84e04a005d0656a7da99da15bd70c7aa1cb04bfc1e868a0b48'; \
+          'https://download.pytorch.org/whl/cu130/fbgemm_gpu-1.9.0%2Bcu130-cp312-cp312-manylinux_2_28_x86_64.whl#sha256=fdf56c45f0ad507cf7d85460b8384165d9ed50ee86905c762062c4e7ae813a66'; \
         ;; \
       linux/arm64) \
         bash /usr/local/bin/install_fbgemm_gpu_arm64.sh; \
@@ -46,14 +47,14 @@ RUN set -eux; \
         exit 1; \
         ;; \
     esac; \
-    python3 -c 'import importlib.metadata as m; assert m.version("fbgemm-gpu").startswith("1.8.0")'
+    python3 -c 'import importlib.metadata as m; assert m.version("fbgemm-gpu").startswith("1.9.0")'
 
 # Layer 0b: TorchRec (tightly coupled with FBGEMM C++ ops version).
 RUN pip install --no-deps tensordict orjson && \
-    git clone --recursive --depth 1 --branch v1.8.0-rc1 \
+    git clone --recursive --depth 1 --branch v1.9.2-rc3 \
       https://github.com/meta-pytorch/torchrec.git torchrec && \
     cd torchrec && \
-    test "$(git rev-parse HEAD)" = "$(git rev-list -n 1 v1.8.0-rc1)" && \
+    test "$(git rev-parse HEAD)" = "$(git rev-list -n 1 v1.9.2-rc3)" && \
     pip install --no-deps .
 
 # ============================================================================
@@ -94,7 +95,7 @@ RUN python3 -m pip install --no-cache-dir distro && \
     cmake --version && \
     /usr/bin/python3 -c "import build, wheel, setuptools"
 
-# Triton r26.07 requires Boost >= 1.78. Use the same Boost 1.80 headers and
+# Triton r26.09 requires Boost >= 1.78. Use the same Boost 1.80 headers and
 # checksum encoded by Triton's build.py instead of relying on distro version.
 RUN wget -O /tmp/boost.tar.gz \
       https://archives.boost.io/release/1.80.0/source/boost_1_80_0.tar.gz && \
@@ -154,7 +155,7 @@ ENV NVIDIA_TRITON_SERVER_VERSION=${TRITON_SERVER_VERSION}
 ENV PATH=/opt/tritonserver/bin:${PATH}
 ENV LD_LIBRARY_PATH=/opt/tritonserver/lib:/opt/tritonserver/backends/pytorch:${LD_LIBRARY_PATH}
 
-# Triton release 26.07 corresponds to server/client version 2.71.0. Install
+# Triton release 26.09 corresponds to server/client version 2.73.0. Install
 # only the HTTP client required by the same-container HSTU test workflow.
 RUN env -u PIP_CONSTRAINT /usr/bin/python3 -m pip install \
       --break-system-packages --no-cache-dir "tritonclient[http]==${TRITON_CLIENT_VERSION}" && \
@@ -221,23 +222,22 @@ RUN apt-get update -y --fix-missing && \
 # -- Layer 2: pip dependencies + Megatron-LM ---
 # core_v0.13.1 picks up an optional skip for count_zeros_in_grad in
 # ChainedOptimizer.step (~4 ms / step under HSTU bf16 when the stat is unused).
-# TorchX 0.7 requires urllib3<1.27, while Triton client 2.71 requires
+# TorchX 0.7 requires urllib3<1.27, while Triton client 2.73 requires
 # urllib3>=2.0.7, so keep the TorchX launcher in an isolated virtualenv.
-# The 26.07 base provides the complete CUTLASS DSL 4.5.2 payload. Keep it
-# intact and install only the matching Quack wheel without dependency
-# resolution, so pip cannot replace the base image's CUTLASS packages.
+# The 26.09 base provides the complete CUTLASS DSL 4.8.0.dev0 payload and
+# Quack 0.6.2, which it installs without dependency resolution. Keep both
+# intact: nothing below installs either, so pip cannot replace them.
 RUN git clone -b core_v0.13.1 https://github.com/NVIDIA/Megatron-LM.git megatron-lm && \
     pip install --no-deps -e ./megatron-lm && \
     pip install --no-cache-dir gin-config torchmetrics==1.0.3 typing-extensions iopath pyvers expiring_dict \
         cloudpickle pyre-extensions \
         'apache-tvm-ffi>=0.1.6' torch-c-dlpack-ext pre-commit \
         pytest pytest-shard pytest-rerunfailures pytest-xdist pytest-flakefinder && \
-    pip install --no-cache-dir --no-deps 'quack-kernels==0.4.1' && \
-    python3 -c 'import importlib.metadata as m; assert m.version("nvidia-cutlass-dsl") == m.version("nvidia-cutlass-dsl-libs-base") == m.version("nvidia-cutlass-dsl-libs-cu13") == "4.5.2"; assert m.version("quack-kernels") == "0.4.1"' && \
+    python3 -c 'import importlib.metadata as m; assert m.version("nvidia-cutlass-dsl") == m.version("nvidia-cutlass-dsl-libs-base") == m.version("nvidia-cutlass-dsl-libs-core") == m.version("nvidia-cutlass-dsl-libs-cu12") == m.version("nvidia-cutlass-dsl-libs-cu13") == "4.8.0.dev0"; assert m.version("quack-kernels") == "0.6.2"' && \
     python3 -m venv /opt/torchx && \
     /opt/torchx/bin/python -m pip install --no-cache-dir 'torchx==0.7.0' && \
     ln -sf /opt/torchx/bin/torchx /usr/local/bin/torchx && \
-    python3 -c 'import importlib.metadata as m, urllib3; assert m.version("tritonclient") == "2.71.0"; assert tuple(map(int, urllib3.__version__.split(".")[:2])) >= (2, 0)' && \
+    python3 -c 'import importlib.metadata as m, urllib3; assert m.version("tritonclient") == "2.73.0"; assert tuple(map(int, urllib3.__version__.split(".")[:2])) >= (2, 0)' && \
     /opt/torchx/bin/python -c 'import importlib.metadata as m, urllib3; assert m.version("torchx") == "0.7.0"; assert tuple(map(int, urllib3.__version__.split(".")[:2])) < (1, 27)' && \
     torchx --help >/dev/null
 
@@ -288,8 +288,13 @@ ENV PYTHONPATH=/opt/nve/default/python:.:/workspace/recsys-examples/examples:/wo
 # Install fbgemm_gpu_hstu (package: fbgemm_gpu_hstu, import: hstu) from submodule.
 # Each HSTU CUDA compile job can peak at 8-9 GiB of host memory, so use a
 # conservative default that also fits the 128 GiB A100 CI builders.
+# PyTorch 2.14's headers need C++20, and the submodule's setup.py asks for
+# C++17: build it as C++20.
 COPY third_party/FBGEMM /workspace/deps/fbgemm_hstu
 RUN cd /workspace/deps/fbgemm_hstu/fbgemm_gpu/experimental/hstu && \
+    grep -q -- '-std=c++17' setup.py && \
+    sed -i 's/-std=c++17/-std=c++20/g' setup.py && \
+    ! grep -q -- '-std=c++17' setup.py && \
     export HSTU_ARCH_LIST="8.0 9.0 10.0" && \
     if [ "${TARGETPLATFORM}" = "linux/amd64" ]; then \
       export HSTU_DISABLE_120=TRUE; \
