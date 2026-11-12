@@ -21,7 +21,7 @@ from copy import deepcopy
 from dataclasses import dataclass
 from enum import Enum
 from itertools import accumulate
-from typing import Any, Callable, Deque, Dict, List, Optional, Tuple, Union
+from typing import Any, Callable, Deque, Dict, List, Optional, Sequence, Tuple, Union
 
 import torch  # usort:skip
 import torch.distributed as dist
