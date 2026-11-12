@@ -30,6 +30,7 @@ def deserialize_delta(payload: bytes) -> DeltaDumpResult:
         keys=value["keys"],
         values=value["values"],
         evicted_keys=value["evicted_keys"],
+        erased_keys=value.get("erased_keys", []),
     )
 
 

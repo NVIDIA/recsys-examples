@@ -8,6 +8,7 @@ import shutil
 import socket
 import subprocess
 import time
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -252,6 +253,63 @@ def test_removal_only(tmp_path, redis_address, kind, dtype, host_cache, field):
     check_removal(rt, delta, expected, before_ack)
     # An already removed key is harmless, including an erase-only empty upsert.
     check_removal(rt, delta, expected, expected)
+
+
+@pytest.mark.parametrize("kind", [Indexer.BIT_CONCAT, Indexer.LINEAR_HASH_MAP])
+def test_example_transport_preserves_explicit_erases(
+    tmp_path, redis_address, monkeypatch, kind
+):
+    monkeypatch.syspath_prepend(
+        str(Path(__file__).resolve().parents[1] / "example" / "exportable_embedding")
+    )
+    from dynamicemb import DeltaDumpResult
+    from workflow_utils import (
+        coordinator_acknowledge,
+        coordinator_delta,
+        start_update_coordinator,
+    )
+
+    rt = runtime(tmp_path, redis_address, kind, torch.float32, CACHE_BYTES)
+    delta = DeltaDumpResult(
+        table_names=rt.names,
+        keys=[torch.empty(0, dtype=torch.int64) for _ in rt.names],
+        values=[torch.empty((0, DIM)) for _ in rt.names],
+        evicted_keys=[None, None],
+        erased_keys=[torch.tensor([1, 1], device="cuda"), None],
+    )
+    expected = rt.weights.clone()
+    expected[1] = 0
+    process, connection = start_update_coordinator(
+        tmp_path, tmp_path / "ipc", {"reader"}
+    )
+    try:
+        update = coordinator_delta(connection, rt.id, delta)
+        rt.subscriber.apply_incremental_load(
+            update.to_json(), torch.cuda.current_stream().cuda_stream
+        )
+        torch.testing.assert_close(lookup(rt), expected)
+        ack = EmbeddingCollectionUpdateAck.from_json(
+            rt.subscriber.wait_for_retirement(rt.id, update.snapshot_id)
+        )
+        coordinator_acknowledge(connection, "reader", ack)
+    finally:
+        connection.send({"op": "stop"})
+        connection.close()
+        try:
+            process.wait(timeout=30)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait()
+    assert process.returncode == 0
+    # The coordinator processes ACK before stop; Redis retirement is now done.
+    torch.testing.assert_close(cold_ps_rows(rt), expected)
+    rt.binding.erase(
+        rt.storage_keys.numel(),
+        rt.storage_keys.data_ptr(),
+        0,
+        torch.cuda.current_stream().cuda_stream,
+    )
+    torch.testing.assert_close(lookup(rt), expected)
 
 
 @pytest.mark.parametrize(

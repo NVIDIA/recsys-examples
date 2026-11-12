@@ -585,6 +585,10 @@ def coordinator_delta(
                 None if tensor is None else tensor.detach().cpu()
                 for tensor in delta.evicted_keys
             ],
+            "erased_keys": [
+                None if tensor is None else tensor.detach().cpu()
+                for tensor in delta.erased_keys
+            ],
         },
         buffer,
     )
