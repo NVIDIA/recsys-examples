@@ -20,7 +20,7 @@ import sys
 from pathlib import Path
 
 from setuptools import find_packages, setup
-from torch.utils.cpp_extension import BuildExtension, CUDAExtension
+from torch.utils.cpp_extension import CUDA_HOME, BuildExtension, CUDAExtension
 
 subprocess.run(
     [
@@ -103,12 +103,28 @@ def get_version():
     return version, sha
 
 
+def _default_archs():
+    """75;80;90;100;103;120, less those the CUDA compiler cannot build: sm_103
+    (GB300) needs CUDA 12.9 or newer. Without an answer from nvcc, the list
+    without 103."""
+    archs = ["75", "80", "90", "100", "103", "120"]
+    nvcc = os.path.join(CUDA_HOME or "/usr/local/cuda", "bin", "nvcc")
+    try:
+        supported = subprocess.check_output(
+            [nvcc, "--list-gpu-code"], text=True
+        ).split()
+    except (OSError, subprocess.CalledProcessError):
+        return [a for a in archs if a != "103"]
+    return [a for a in archs if f"sm_{a}" in supported]
+
+
 # Target GPU compute capabilities (no dot). Parsed in two places: the main
 # extension's -gencode flags and the LruLfu evict fatbins. Override with
-# DEMB_ARCHS="80;90;100".
+# DEMB_ARCHS="80;90;100". TORCH_CUDA_ARCH_LIST does not apply: these
+# -gencode flags take its place.
 DEMB_ARCHS = [
     a.strip()
-    for a in os.environ.get("DEMB_ARCHS", "75;80;90;100;120")
+    for a in (os.environ.get("DEMB_ARCHS") or ";".join(_default_archs()))
     .replace(",", ";")
     .split(";")
     if a.strip()
