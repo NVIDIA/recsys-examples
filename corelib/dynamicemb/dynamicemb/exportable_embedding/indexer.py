@@ -216,6 +216,12 @@ class LinearHashMapIndexer(EmbeddingCollectionIndexerBase):
         missing_ids = feature_ids[~found]
         missing_tables = table_ids[~found]
         if missing_ids.numel() > 0:
+            # Allocate once per logical key, including duplicates in this batch.
+            missing_pairs = torch.unique(
+                torch.stack((missing_tables, missing_ids), dim=1), dim=0
+            )
+            missing_tables = missing_pairs[:, 0].contiguous()
+            missing_ids = missing_pairs[:, 1].contiguous()
             start = self._snapshot.next_fused_key
             if start + missing_ids.numel() > self._nve_num_embeddings:
                 raise ValueError(
