@@ -34,8 +34,10 @@ struct ForwardSequenceFusedCopyDesc {
     IndexType idx = reverse_idx_ptr[i];
     return src_ptr + idx * src_stride;
   }
+  // Output row i is row out_row[i] of dst, or row i without out_row.
   HOST_DEVICE_INLINE DstType *get_dst_ptr(int i) {
-    return dst_ptr + i * ev_size;
+    const int64_t row = out_row_ptr != nullptr ? out_row_ptr[i] : i;
+    return dst_ptr + row * ev_size;
   }
 
   int num_vec_;
@@ -44,12 +46,13 @@ struct ForwardSequenceFusedCopyDesc {
   const IndexType *__restrict__ reverse_idx_ptr;
   const SrcType *__restrict__ src_ptr;
   DstType *dst_ptr;
+  const int32_t *__restrict__ out_row_ptr;
 };
 
 void scatter_fused(void *src_ptr, void *dst_ptr, void *inverse_idx_ptr,
                    int num_emb, int ev_size, int src_stride, DataType src_type,
                    DataType dst_type, DataType offset_type, int device_num_sms,
-                   cudaStream_t stream) {
+                   cudaStream_t stream, const int32_t *out_row) {
   DISPATCH_INTEGER_DATATYPE_FUNCTION(offset_type, offset_t, [&] {
     DISPATCH_FLOAT_DATATYPE_FUNCTION(src_type, src_t, [&] {
       DISPATCH_FLOAT_DATATYPE_FUNCTION(dst_type, dst_t, [&] {
@@ -57,7 +60,8 @@ void scatter_fused(void *src_ptr, void *dst_ptr, void *inverse_idx_ptr,
         CopyDesc sequence_copy_desc{
             num_emb,          ev_size,
             src_stride,       (offset_t *)inverse_idx_ptr,
-            (src_t *)src_ptr, (dst_t *)dst_ptr};
+            (src_t *)src_ptr, (dst_t *)dst_ptr,
+            out_row};
         copy_one_to_one<CopyDesc>(sequence_copy_desc, ev_size, device_num_sms,
                                   stream);
       });

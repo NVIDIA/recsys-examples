@@ -14,7 +14,7 @@
 # limitations under the License.
 
 
-from typing import List, Optional, Union
+from typing import Dict, List, Optional, Union
 
 import commons.datasets as datasets
 import commons.utils as init
@@ -403,7 +403,24 @@ def create_model(
     num_batches: int = 10,
     replicate_batches: bool = True,
     sequence_parallel: bool = False,
+    output_dist: Optional[str] = None,
+    output_dist_capacity: Optional[int] = None,
+    global_hbm_for_values: int = 8 << 20,
 ):
+    """The tests' sharded HSTU model, its dense optimizer and its batches.
+
+    With ``output_dist`` None, the item table is the model's one DynamicEmb
+    table when ``use_dynamic_emb`` is True (else every table is TorchRec's),
+    as the other tests use it. Else every model-parallel table (item,
+    and context with contextual features) is a DynamicEmb table on that
+    ``output_dist``: the hierarchical dist takes a sharding of DynamicEmb
+    tables alone. ``output_dist_capacity`` is their capacity (None: the most
+    a call of the batches can need). ``"torchrec"`` gives the same model on
+    TorchRec's dists. ``global_hbm_for_values`` is each DynamicEmb table's
+    HBM, its cache under the prefetch pipeline.
+    """
+    if output_dist is not None and not use_dynamic_emb:
+        raise ValueError("output_dist is an option of DynamicEmb tables")
     init.set_random_seed(seed)
     device = torch.device("cuda", torch.cuda.current_device())
     embdim = 128
@@ -430,8 +447,13 @@ def create_model(
     item_feature_name = "item_feat"
     action_feature_name = "action_feat"
     contextual_emb_size = 1000
+    # A DynamicEmb context table gets twice the rows of its ids, as the item
+    # table does, so that no bucket of it overflows and nothing is evicted.
+    context_vocab_size = contextual_emb_size * (1 if output_dist is None else 2)
     item_emb_size = 1024 * 1024
     action_vocab_size = 16
+    item_max_seqlen = 100
+    contextual_max_seqlen = 10
     emb_configs = [
         ShardedEmbeddingConfig(
             feature_names=[action_feature_name],
@@ -455,7 +477,7 @@ def create_model(
                 max(item_emb_size // 2, 1),
                 action_vocab_size,
             ],  # halve the max ids to `minimize` eviction
-            max_sequence_length=100,
+            max_sequence_length=item_max_seqlen,
             is_jagged=True,
         )
     ]
@@ -466,7 +488,7 @@ def create_model(
                 max_item_ids=[
                     contextual_emb_size for _ in range(len(contextual_feature_names))
                 ],
-                max_sequence_length=10,
+                max_sequence_length=contextual_max_seqlen,
                 is_jagged=True,
             )
         )
@@ -474,7 +496,7 @@ def create_model(
             ShardedEmbeddingConfig(
                 feature_names=contextual_feature_names,
                 table_name="context",
-                vocab_size=contextual_emb_size,
+                vocab_size=context_vocab_size,
                 dim=embdim,
                 sharding_type="model_parallel",
             )
@@ -520,19 +542,44 @@ def create_model(
     )
     from dynamicemb import DynamicEmbScoreStrategy
 
+    def dynamicemb_options(**kwargs) -> DynamicEmbTableOptions:
+        # A new object for each table: the planner refuses one shared by two.
+        return DynamicEmbTableOptions(
+            global_hbm_for_values=global_hbm_for_values,  # (maybe cached)
+            score_strategy=DynamicEmbScoreStrategy.STEP,
+            caching=pipeline_type
+            == "prefetch",  # when prefetch is enabled, we must enable caching
+            **kwargs,
+        )
+
+    dynamicemb_options_dict: Dict[str, DynamicEmbTableOptions] = {}
+    if output_dist is not None:
+        if output_dist_capacity is None:
+            # An owner looks up at most every rank's keys of the sharding's
+            # features, and a sample has fewer than max_sequence_length keys
+            # of each feature.
+            output_dist_capacity = (
+                torch.distributed.get_world_size()
+                * batch_size
+                * (
+                    item_max_seqlen
+                    + contextual_max_seqlen * len(contextual_feature_names)
+                )
+            )
+        table_names = ["item"] + (["context"] if contextual_feature_names else [])
+        dynamicemb_options_dict = {
+            name: dynamicemb_options(
+                output_dist=output_dist, output_dist_capacity=output_dist_capacity
+            )
+            for name in table_names
+        }
+    elif use_dynamic_emb:
+        dynamicemb_options_dict = {"item": dynamicemb_options()}
+
     model_train, dense_optimizer = make_optimizer_and_shard(
         model_train,
         config=hstu_config,
-        dynamicemb_options_dict={
-            "item": DynamicEmbTableOptions(
-                global_hbm_for_values=1024 * 1024 * 8,  # 4M HBM (maybe cached)
-                score_strategy=DynamicEmbScoreStrategy.STEP,
-                caching=pipeline_type
-                == "prefetch",  # when prefetch is enabled, we must enable caching
-            ),
-        }
-        if use_dynamic_emb
-        else {},
+        dynamicemb_options_dict=dynamicemb_options_dict,
         sparse_optimizer_param=optimizer_param,
         dense_optimizer_param=optimizer_param,
         pipeline_type=pipeline_type,

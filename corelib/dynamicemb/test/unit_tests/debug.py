@@ -58,6 +58,10 @@ def monitor_debug_folder(folder_path, printer=None):
 class Debugger:
     def __init__(self, is_sequence: bool = False) -> None:
         self._debug_iter = int(os.getenv("PYHKV_DEBUG_ITER", 0))
+        # PYHKV_DEBUG_STRICT=1: a mismatch raises AssertionError, where it is
+        # otherwise only printed, and the input's totals per feature are
+        # checked too.
+        self._strict = os.getenv("PYHKV_DEBUG_STRICT") == "1"
 
         self._rank = dist.get_rank()
         self.p = Printer(self._rank)
@@ -170,6 +174,13 @@ class Debugger:
                 h_outputs[batch, first_idx2emb] != res
                 or h_outputs[batch, last_idx2emb] != res
             ):
+                if self._strict:
+                    raise AssertionError(
+                        f"feature {feature_id}, sample {batch}: pooled embedding "
+                        f"[{h_outputs[batch, first_idx2emb].item()}, ..., "
+                        f"{h_outputs[batch, last_idx2emb].item()}] after the dist, "
+                        f"expected {res}"
+                    )
                 print(
                     "DynamicEmb: lookup result after dist mismatched=",
                     h_outputs[batch, first_idx2emb].item(),
@@ -196,6 +207,20 @@ class Debugger:
         feature_batch // feature_num
         assert feature_batch % feature_num == 0
 
+        if self._strict:
+            # The hierarchical dist writes these totals into the caller's KJT,
+            # and both the outputs and the keys below are split by them.
+            totals = (
+                self_feature_kt.lengths()
+                .view(len(self_feature_kt.keys()), -1)
+                .sum(1)
+                .tolist()
+            )
+            assert self_feature_kt.length_per_key() == totals, (
+                f"length_per_key {self_feature_kt.length_per_key()}, "
+                f"but the lengths add up to {totals}"
+            )
+
         counter = 0
         for i, (feature_name, values) in enumerate(
             zip(self_feature_kt.keys(), jagged_tensors)
@@ -205,6 +230,11 @@ class Debugger:
                 continue
             indices = self_feature_kt[feature_name].values().to("cpu")
             if indices.size()[0] != embds.size()[0]:
+                if self._strict:
+                    raise AssertionError(
+                        f"{feature_name}: {indices.size()[0]} keys, "
+                        f"{embds.size()[0]} embeddings after the dist"
+                    )
                 print("DynamicEmb:mismatched")
             else:
                 print("DynamicEmb:matched", indices.size()[0])
@@ -214,6 +244,13 @@ class Debugger:
                 index = indices[i].item()
                 expected = float(index % 100000)
                 if expected != embds[counter, 0] or expected != embds[counter, dim - 1]:
+                    if self._strict:
+                        raise AssertionError(
+                            f"{feature_name}: key {index} has embedding "
+                            f"[{embds[counter, 0].item()}, ..., "
+                            f"{embds[counter, dim - 1].item()}] after the dist, "
+                            f"expected {expected}"
+                        )
                     print(
                         "DynamicEmb: lookup result after dist mismatched=",
                         embds[counter, 0].item(),

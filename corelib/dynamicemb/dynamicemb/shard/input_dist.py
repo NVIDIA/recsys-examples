@@ -37,6 +37,7 @@ from torchrec.fx.utils import assert_fx_safe
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 
 from ..scored_kjt import ScoredKeyedJaggedTensor
+from .hier_output_dist import DynamicEmbSequenceShardingContext, HierDist
 
 torch.fx.wrap("len")
 
@@ -235,12 +236,13 @@ def _determine_output_weights(kjt, pos, bucketize_pos, bucketized_weights):
 class RwSparseFeaturesDist(_RwSparseFeaturesDist):
     """TorchRec's row-wise distributor, bucketizing by DynamicEmb's rule.
 
-    The distribution itself is entirely TorchRec's: the per-feature block
-    sizes, the KJTAllToAll and its splits, the sequence permute, all come from
-    ``super().__init__``. One call differs. TorchRec places a key by the block
-    of rows it falls in and rewrites it to its offset inside that block;
-    DynamicEmb has three rules (``dyn_emb::DistType``), two of which leave the
-    key global, because a hash table has no row index to rewrite it into.
+    Apart from :meth:`hier_forward`, the distribution is TorchRec's: the
+    per-feature block sizes, the KJTAllToAll and its splits, the sequence
+    permute, all come from ``super().__init__``. One call differs. TorchRec
+    places a key by the block of rows it falls in and rewrites it to its
+    offset inside that block; DynamicEmb has three rules
+    (``dyn_emb::DistType``), two of which leave the key global, because a hash
+    table has no row index to rewrite it into.
 
     Args:
         dist_types: the rule per feature, in the same order as
@@ -250,6 +252,11 @@ class RwSparseFeaturesDist(_RwSparseFeaturesDist):
             (:class:`~dynamicemb.scored_kjt.ScoredKeyedJaggedTensor`), sent by
             an all2all of their own beside the keys', and handed on with the
             received keys.
+        hier: the sharding's hierarchical dist (``shard/hier_output_dist.py``),
+            whose input dist :meth:`hier_forward` runs, or None. ``forward``
+            stays TorchRec's distribution, for the calls that do not take it.
+            None where ``per_key_score``: :meth:`hier_forward` carries no
+            scores.
     """
 
     def __init__(
@@ -263,6 +270,7 @@ class RwSparseFeaturesDist(_RwSparseFeaturesDist):
         need_pos: bool = False,
         dist_types: Optional[List[str]] = None,
         per_key_score: bool = False,
+        hier: Optional[HierDist] = None,
     ) -> None:
         super().__init__(
             pg=pg,
@@ -283,6 +291,10 @@ class RwSparseFeaturesDist(_RwSparseFeaturesDist):
             if per_key_score
             else None
         )
+        # the same codes on the host, which the hierarchical dist takes
+        # (dist_type_codes checked them)
+        self._dist_type_codes: List[int] = [DIST_TYPE_CODES[t] for t in dist_types]
+        self.hier = hier
 
     def forward(
         self,
@@ -297,19 +309,8 @@ class RwSparseFeaturesDist(_RwSparseFeaturesDist):
         takes_scores = self._score_dist is not None and isinstance(
             sparse_features, ScoredKeyedJaggedTensor
         )
-        bucketized_features, unbucketize_permute = bucketize_kjt_before_all2all(
-            sparse_features,
-            num_buckets=self._world_size,
-            block_sizes=self._feature_block_sizes_tensor,
-            # The scores are moved by it too, though only a sequence embedding
-            # needs it afterwards.
-            output_permute=self._is_sequence or takes_scores,
-            bucketize_pos=(
-                self._has_feature_processor
-                if sparse_features.weights_or_none() is None
-                else self._need_pos
-            ),
-            dist_type_per_feature=self._dist_type_tensor,
+        bucketized_features, unbucketize_permute = self._bucketize(
+            sparse_features, takes_scores
         )
         self.unbucketize_permute_tensor = (
             unbucketize_permute if self._is_sequence else None
@@ -343,3 +344,140 @@ class RwSparseFeaturesDist(_RwSparseFeaturesDist):
             stride=bucketized_features.stride(),
         )
         return _ScoredSplitsAwaitable(keys_dist, self._score_dist(scores_kjt))
+
+    def _bucketize(
+        self, sparse_features: KeyedJaggedTensor, takes_scores: bool = False
+    ) -> Tuple[KeyedJaggedTensor, Optional[torch.Tensor]]:
+        return bucketize_kjt_before_all2all(
+            sparse_features,
+            num_buckets=self._world_size,
+            block_sizes=self._feature_block_sizes_tensor,
+            # The scores are moved by it too, though only a sequence embedding
+            # needs it afterwards.
+            output_permute=self._is_sequence or takes_scores,
+            bucketize_pos=(
+                self._has_feature_processor
+                if sparse_features.weights_or_none() is None
+                else self._need_pos
+            ),
+            dist_type_per_feature=self._dist_type_tensor,
+        )
+
+    def hier_setup(self, weighted: bool, index_dedup: bool) -> bool:
+        """Whether the sharding takes its hierarchical dist; the first call
+        builds it, collectively (``HierDist.setup``), with this input
+        dist's rule of each feature. ``weighted``: the keys carry weights
+        (index dedup's frequency counters); ``index_dedup``: the sharder's
+        ``use_index_dedup``. A call on that dist deduplicates the sharding's
+        keys either way; tables that clip gradients need the flag."""
+        return self.hier.setup(self._dist_type_codes, weighted, index_dedup)
+
+    def hier_forward(
+        self,
+        features: KeyedJaggedTensor,
+        input_features: KeyedJaggedTensor,
+        reverse_indices: torch.Tensor,
+        sharding_ctx: DynamicEmbSequenceShardingContext,
+    ) -> "HierStartAwaitable":
+        """The hierarchical input dist of a call: the sharding's operator
+        queues all of it on the current stream at once (``op.input_dist``),
+        and reads nothing on the host. The second wait copies the call's
+        status to the host and raises if the call does not fit the
+        capacities. See docs/hier_output_dist.md, sections 7.3 and 10.
+
+        Args:
+            features: the keys to send, ``int32`` or ``int64``,
+                index-deduplicated: only the first keys are valid, and only
+                the device knows how many. The op gets ``int32`` keys as
+                ``int64`` (docs/hier_output_dist.md, section 10.1).
+            input_features: the KJT ``construct_jagged_tensors`` reads (the
+                input before index dedup).
+            reverse_indices: index dedup's map from the input's rows to the
+                rows of ``features``.
+            sharding_ctx: the call's sharding context, which gets what the
+                output dist takes (``hier_result``).
+        """
+        if features.stride() == 0:
+            raise ValueError(
+                "RwSparseFeaturesDist: an empty local batch (stride 0) is not "
+                "supported: DynamicEmb's bucketize and TorchRec's "
+                "construct_jagged_tensors take no such batch"
+            )
+        offsets = features.offsets_or_none()
+        weights = features.weights_or_none()
+        # The op reads a key in its own width. DynamicEmb's bucketize and
+        # key_ownership read an int32 key as the int64 key of its value, the
+        # key a table stores and a checkpoint holds: so the op gets int32 keys
+        # as int64, and gives each key the owner they give it.
+        keys = features.values()
+        if keys.dtype == torch.int32:
+            keys = keys.long()
+        in_dist = self.hier.op.input_dist(
+            keys.contiguous(),
+            offsets,
+            features.lengths() if offsets is None else None,
+            features.stride(),
+            None if weights is None else weights.contiguous(),
+            input_features.offsets(),
+            reverse_indices,
+        )
+        return HierStartAwaitable(
+            HierKJTAwaitable(
+                self.hier,
+                in_dist,
+                (features, keys, input_features, reverse_indices),
+                features.keys(),
+                input_features,
+                sharding_ctx,
+            )
+        )
+
+
+class HierStartAwaitable(Awaitable[Awaitable[KeyedJaggedTensor]]):
+    """The first wait of a call on the hierarchical dist: its input dist is
+    queued already, so the wait returns the second at once."""
+
+    def __init__(self, second: "HierKJTAwaitable") -> None:
+        super().__init__()
+        self._second = second
+
+    def _wait_impl(self) -> "HierKJTAwaitable":
+        return self._second
+
+
+class HierKJTAwaitable(Awaitable[KeyedJaggedTensor]):
+    """The second wait of a call on the hierarchical dist: the call's status
+    on the host, its one host sync; then the owner's KJT (the same KJT on a
+    later wait), and the sharding context gets what the output dist takes. A
+    call that does not fit the capacities raises RuntimeError, on every rank
+    alike. Until then it holds the call's inputs, which the input dist reads
+    on its stream."""
+
+    def __init__(
+        self,
+        hier: HierDist,
+        in_dist: Tuple,
+        inputs: Tuple,
+        keys: List[str],
+        input_features: KeyedJaggedTensor,
+        sharding_ctx: DynamicEmbSequenceShardingContext,
+    ) -> None:
+        super().__init__()
+        self._hier = hier
+        self._in_dist = in_dist
+        self._inputs = inputs
+        self._keys = keys
+        self._input_features = input_features
+        self._sharding_ctx = sharding_ctx
+        self._kjt: Optional[KeyedJaggedTensor] = None
+
+    def _wait_impl(self) -> KeyedJaggedTensor:
+        if self._kjt is None:
+            self._kjt = self._hier.finish(
+                self._in_dist, self._keys, self._input_features, self._sharding_ctx
+            )
+            # What only this wait needed goes: a pipeline keeps this awaitable
+            # until after the backward.
+            self._in_dist = self._inputs = self._input_features = None
+            self._sharding_ctx = None
+        return self._kjt

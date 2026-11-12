@@ -49,6 +49,7 @@ from dynamicemb.async_erase import (
 )
 from dynamicemb.batched_dynamicemb_function import (
     DynamicEmbeddingFunction,
+    OutputAlloc,
     PrefetchState,
     StorageMode,
     dynamicemb_eval_forward,
@@ -638,6 +639,12 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
         group_lasso_reg: float = 0.0,
         # TO align with FBGEMM TBE
         *args,
+        # Keyword only. Whether an admission strategy counts the frequency
+        # counters the keys come with (every occurrence); False: a table that
+        # does not evict by LFU counts each key once per call, as without
+        # them. A sharded EmbeddingCollection sets it to the sharder's
+        # use_index_dedup.
+        admission_counts_occurrences: bool = True,
         **kwargs,
     ) -> None:
         super().__init__()
@@ -832,11 +839,16 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
         # is handed some all the same and must drop them, or they would be
         # misread as scores. Tables are grouped on score and admit strategy, so
         # one answer holds for the whole group and for the module's lifetime.
-        self._consumes_frequency_counters = self._admitter is not None or any(
+        # An admitting group that does not evict by LFU drops them too without
+        # admission_counts_occurrences.
+        evicts_by_lfu = any(
             option.score_strategy is not None
             and get_eviction_score_strategy(option.score_strategy)
             == DynamicEmbScoreStrategy.LFU
             for option in self._dynamicemb_options
+        )
+        self._consumes_frequency_counters = evicts_by_lfu or (
+            self._admitter is not None and admission_counts_occurrences
         )
         # Tables are grouped on it too (see DynamicEmbTableOptions), so it holds
         # for the whole group: every table takes a score per key, or none does.
@@ -844,6 +856,10 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
             option.takes_score_per_key for option in self._dynamicemb_options
         )
         self._prefetch_states: Deque[PrefetchState] = deque()
+        # Hook of the hierarchical dist (shard/hier_output_dist.py, set by
+        # HierGroupedEmbeddingsLookup): where to put the sequence lookup
+        # output, in training and in eval (OutputAlloc).
+        self.output_alloc: Optional[OutputAlloc] = None
 
         # TODO:1->10
         self._empty_tensor = nn.Parameter(
@@ -1407,6 +1423,7 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                 self._evict_strategy,
                 frequency_counters,
                 pooling_weights,
+                self.output_alloc,
             )
 
         if any([not o.training for o in self._dynamicemb_options]):
@@ -1419,6 +1436,7 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                 indices, offsets, frequency_counters=frequency_counters, scores=scores
             )
         prefetch_state = self._prefetch_states.popleft()
+        prefetch_state.record_stream(torch.cuda.current_stream())
 
         res = DynamicEmbeddingFunction.apply(
             prefetch_state,
@@ -1433,6 +1451,7 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
             self._evict_strategy,
             pooling_weights,
             self._empty_tensor,
+            self.output_alloc,
         )
         # Grad-mode forwards keep their slot pins until backward. Without an
         # autograd graph, release on this stream after the gather consumed them.

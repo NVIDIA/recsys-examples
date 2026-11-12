@@ -677,9 +677,7 @@ def create_table_state(
         estimated_table_sizes=torch.zeros(
             num_tables, dtype=torch.int64, pin_memory=True
         ),
-        estimated_row_counts=torch.zeros(
-            num_tables, dtype=torch.int64, pin_memory=True
-        )
+        estimated_row_counts=torch.zeros(num_tables, dtype=torch.int64, pin_memory=True)
         if no_eviction
         else None,
         evicted_item_mode=evicted_item_mode,
@@ -1107,8 +1105,6 @@ def get_expand_info(
         unique_per_table.device.type == "cpu"
     ), "unique_per_table must be a CPU tensor"
 
-    from dynamicemb.dynamicemb_config import DynamicEmbScoreStrategy
-
     is_no_eviction = state.no_eviction
     results = [False] * state.num_tables
     target_capacities = [-1] * state.num_tables
@@ -1464,6 +1460,32 @@ def load_from_flat(
             state.all_dims_vec4,
         )
     return output
+
+
+def load_from_flat_by(
+    state: DynamicEmbTableState,
+    indices: torch.Tensor,
+    table_ids: torch.Tensor,
+    entry_of_row: torch.Tensor,
+    out: torch.Tensor,
+    out_rows: Optional[torch.Tensor] = None,
+) -> None:
+    """Into row i of ``out`` (``[entry_of_row.numel(), columns]``, of the
+    tables' dtype; row ``out_rows[i]`` with ``out_rows``, int32) the embedding
+    of row ``indices[entry_of_row[i]]`` of table ``table_ids[entry_of_row[i]]``;
+    rows whose index is negative are left as they are."""
+    _load_emb(
+        state.table_ptrs_dev,
+        indices,
+        table_ids,
+        out,
+        state.table_value_dims,
+        state.table_emb_dims,
+        state.emb_dim,
+        state.all_dims_vec4,
+        entry_of_row,
+        out_rows,
+    )
 
 
 def store_to_flat(

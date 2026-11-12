@@ -553,17 +553,6 @@ class BatchedDynamicEmbedding(BaseBatchedEmbedding[torch.Tensor]):
         """
         return get_scores(features) if self._emb_module.per_key_score else None
 
-    def prefetch(
-        self, features, forward_stream: Optional[torch.cuda.Stream] = None
-    ) -> None:
-        """Prefetch the keys of ``features``, with their scores if the tables take them."""
-        self._emb_module.prefetch(
-            indices=features.values(),
-            offsets=features.offsets(),
-            forward_stream=forward_stream,
-            scores=self._scores_of(features),
-        )
-
     def forward(self, features) -> torch.Tensor:
         return self._emb_module(
             indices=features.values().long(),
