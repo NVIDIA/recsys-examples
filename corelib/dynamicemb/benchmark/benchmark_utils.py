@@ -101,9 +101,9 @@ def hier_node_size(
     multi-node NVLink (GB200 and GB300 NVL72), the job's GPUs of the rack
     when the job runs inside one rack, and across racks what NCCL gives
     (docs/hier_output_dist.md, section 4.2). Where node_size raises, on
-    every rank alike (a build without the hierarchical dist, an NCCL error:
-    see its docstring), the GPUs of a host, ``local_world_size``, with a
-    note on rank 0."""
+    every rank alike (a build without the hierarchical dist, a GPU before
+    compute capability 8.0, an NCCL error: see its docstring), the GPUs of
+    a host, ``local_world_size``, with a note on rank 0."""
     from dynamicemb.shard import node_size
 
     try:

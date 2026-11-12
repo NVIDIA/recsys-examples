@@ -211,6 +211,9 @@ def check_node_size(rank: int, world_size: int, log: Callable) -> int:
     size that does not divide the ranks, and an error on the last rank each
     raise the same RuntimeError on every rank, and none hangs. With the
     error, a sharding takes TorchRec's dists, with a warning on every rank.
+    A GPU before compute capability 8.0 (a stand-in capability) on rank 0,
+    and on the last rank, raises the same RuntimeError on every rank before
+    any rank reads NCCL's team.
     With a size every rank reads that is not NCCL's team, the op's own
     communicator refuses the node: every rank warns, giving the team's size,
     and takes TorchRec's dists. The checks of the sizes, and of the hosts
@@ -276,6 +279,26 @@ def check_node_size(rank: int, world_size: int, log: Callable) -> int:
             )
         )
         del hier
+        # A GPU before 8.0 on one rank: every rank refuses in the first
+        # all-gather, before any rank makes the probe's communicator.
+        capability = torch.cuda.get_device_capability
+        for old in sorted({0, last}):
+            _NODE_SIZES.pop(ranks, None)
+            reads.clear()
+            dynamicemb_extensions.hier_output_dist_lsa_size = wrapped(lambda size: size)
+            if rank == old:
+                torch.cuda.get_device_capability = lambda device=None: (7, 5)
+            try:
+                msg = expect_error(RuntimeError, node_size, dist.group.WORLD)
+            finally:
+                torch.cuda.get_device_capability = capability
+            checks[f"a GPU before 8.0 on rank {old}"] = (
+                same_everywhere(msg)
+                and f"rank {old} " in msg
+                and "compute capability 7.5" in msg
+                and reads == []
+            )
+            messages.append(msg)
         # A node the ranks agree on that is not NCCL's team: the op's own
         # communicator refuses it (its LSA check). Across nodes the node is
         # every rank, one node, which takes no GIN; on one node it is half

@@ -37,6 +37,35 @@ namespace hier_output_dist {
 
 namespace {
 
+// ── warp reductions ──
+//
+// __reduce_max_sync and __reduce_add_sync are sm_80 instructions, and the
+// dist runs on sm_80 and newer: a sharding with an older GPU takes TorchRec's
+// dists (node_size). A build that also targets older GPUs (DEMB_ARCHS, whose
+// default 75;80;90;100;120 has 75) compiles these kernels for them with a
+// trap in place of the instructions.
+
+// The most of `value` over the warp.
+__device__ __forceinline__ int32_t warp_max(int32_t value) {
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800
+  return __reduce_max_sync(0xffffffffu, value);
+#else
+  __trap();
+  return value;
+#endif
+}
+
+// The sum of `value` over the lanes of `group`, a __match_any_sync mask that
+// holds this lane.
+__device__ __forceinline__ int32_t group_sum(unsigned group, int32_t value) {
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800
+  return __reduce_add_sync(group, value);
+#else
+  __trap();
+  return value;
+#endif
+}
+
 // ── step 1: the node-unique keys ──
 //
 // A hash table finds each occurrence's identity, by index dedup's chained
@@ -397,7 +426,7 @@ __global__ void __launch_bounds__(kThreads)
           (float)(kNodeDedup ? ids.weight[identity] : (int64_t)weights[occurrence]);
     most = max(most, occurrences);
   }
-  most = __reduce_max_sync(0xffffffffu, most);
+  most = warp_max(most);
   if ((threadIdx.x & 31) == 0 && most > 0)
     atomicMax((unsigned long long *)need_key_rows, (unsigned long long)most);
   for (int64_t bucket_feature = first_item(); bucket_feature <= bucket_features;
@@ -844,7 +873,7 @@ __global__ void __launch_bounds__(kThreads)
     }
     // the lanes of each chunk: their sum, added once
     const unsigned same = __match_any_sync(0xffffffffu, place);
-    const int32_t pulls = __reduce_add_sync(same, occurrences);
+    const int32_t pulls = group_sum(same, occurrences);
     if (place >= 0 && lane == __ffs(same) - 1) atomicAdd(&chunks[place].pulls, pulls);
   }
   const int64_t count = *num_chunks, total = places.stream_offsets[count],

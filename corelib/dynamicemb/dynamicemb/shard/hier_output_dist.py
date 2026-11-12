@@ -102,9 +102,10 @@ def node_size(pg: Optional[dist.ProcessGroup] = None) -> int:
     same size and that it divides the group (NCCL's team is consecutive
     ranks). The answer is kept for the group's ranks: a later call, on every
     rank, returns it at once. Raises RuntimeError, the same on every rank,
-    when a rank cannot read it (a build without the hierarchical dist, an
-    NCCL error) or the ranks disagree; a sharding then takes TorchRec's
-    dists (:meth:`HierDist.setup`). But an NCCL error inside the
+    when a rank cannot read it (a build without the hierarchical dist, a GPU
+    before compute capability 8.0, an NCCL error) or the ranks disagree; a
+    sharding then takes TorchRec's dists (:meth:`HierDist.setup`). But an
+    NCCL error inside the
     communicator's initialization on some ranks only leaves the other ranks
     waiting there, as with any NCCL communicator (docs/hier_output_dist.md,
     section 19). Warns, on every rank, when the team splits the GPUs of a
@@ -137,6 +138,13 @@ def _read_node_size(
         why = (
             "DynamicEmb was built without its hierarchical dist, which needs "
             "NCCL >= 2.30.7"
+        )
+    elif torch.cuda.get_device_capability() < (8, 0):
+        # Its kernels take sm_80 instructions (input_dist/proxy.cu).
+        major, minor = torch.cuda.get_device_capability()
+        why = (
+            f"its GPU is of compute capability {major}.{minor}, and the "
+            "hierarchical dist needs 8.0 or newer"
         )
     elif rank == 0:
         try:

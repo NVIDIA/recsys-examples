@@ -268,6 +268,12 @@ every rank before you drop a model (section 4.6).
   the process must load an NCCL at least that new (`libnccl.so.2` is one
   file name for every version: with `NCCL_HOME`, put its `lib` directory on
   `LD_LIBRARY_PATH`).
+* GPUs of compute capability 8.0 or newer: the op's kernels take sm_80
+  instructions. DynamicEmb builds for the architectures of `DEMB_ARCHS`
+  (`75;80;90;100;120` by default; `TORCH_CUDA_ARCH_LIST` does not reach its
+  nvcc flags), so a default build compiles the op for sm_75 too, with a
+  trap in place of those instructions. A sharding with a GPU before 8.0 on
+  some rank takes TorchRec's dists (section 6).
 * NCCL's device API on the GPUs. Across nodes: GIN on the rail connection,
   with at least 4 contexts, all of one backend (proxy, GDAKI or GPI;
   section 11.1).
@@ -605,6 +611,7 @@ state that every rank shares.
 | `"auto"` without `output_dist_capacity` | when sharding | a warning, TorchRec's dists |
 | one rank in the sharding; a table of the sharding that is not a DynamicEmb table; feature processors | when sharding | a warning, TorchRec's dists |
 | tables that take a score per key (`score_strategy` `PRECISE_CUSTOMIZED`): a key crosses with one float32 weight, which a proxy adds up, and no score | when sharding | `"hierarchical"`: `ValueError`; `"auto"`: a warning, TorchRec's dists |
+| a GPU before compute capability 8.0 on some rank: the op's kernels take sm_80 instructions | first `input_dist()`, collectively (`node_size`), before the op is built | a warning on every rank that names the first such rank, TorchRec's dists |
 | a rank that cannot read the node, NCCL's LSA team (`node_size`: an NCCL error, but for one inside the initialization of its communicator on some ranks only, which leaves the others waiting there: section 19), or ranks that read teams of different sizes | first `input_dist()`, collectively, before the op is built | a warning on every rank that names the first such rank and why, TorchRec's dists |
 | ranks that would build the op from different options, capacities or environment values | first `input_dist()`, before the op is built | `ValueError` on every rank, naming the first rank and value that differ |
 | ranks that are not whole nodes; `world_size × num_features` of 2^31 − 1024 or more; rows not a multiple of 16 bytes | first `input_dist()` | a warning, TorchRec's dists |
@@ -791,7 +798,10 @@ The op is built at the sharding's first `input_dist()`, in any mode, at the
 same point on every rank:
 
 1. **The node.** `node_size` reads it from NCCL, once per group of ranks
-   (section 4.2): an all-gather hands out a unique id made on rank 0,
+   (section 4.2): an all-gather hands out a unique id made on rank 0, and
+   each rank's refusal, if it has one (a build without the dist, a GPU
+   before compute capability 8.0: then every rank warns and takes
+   TorchRec's dists before any communicator is made). Else
    every rank makes a short-lived communicator with it
    (`hier_output_dist_lsa_size`, made as step 3 makes the op's), reads its
    LSA team (`ncclTeamLsa`) and ends it, and a second all-gather checks
