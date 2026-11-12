@@ -15,12 +15,32 @@ ARG DEFAULT_UPSTREAM_PYTORCH_CONTAINER_VERSION=26.09
 ARG TRITON_BUILD_JOBS=8
 
 # ============================================================================
+# fbgemm_arm64_wheel — FBGEMM GPU's linux/arm64 wheel alone, which no FBGEMM
+# release publishes, built from source as base_fbgemm builds it. The CI's
+# build_fbgemm_arm64_wheel job exports it (--output type=local) for publishing;
+# base_fbgemm then installs it from FBGEMM_ARM64_WHEEL_URL.
+# ============================================================================
+FROM ${BASE_IMAGE} AS fbgemm_arm64_wheel_build
+WORKDIR /workspace/deps
+COPY docker/install_fbgemm_gpu_arm64.sh /usr/local/bin/install_fbgemm_gpu_arm64.sh
+RUN FBGEMM_WHEEL_DIR=/dist bash /usr/local/bin/install_fbgemm_gpu_arm64.sh
+
+FROM scratch AS fbgemm_arm64_wheel
+COPY --from=fbgemm_arm64_wheel_build /dist/ /
+
+# ============================================================================
 # Stage 1: base_fbgemm — FBGEMM GPU + TorchRec (version-coupled with FBGEMM).
 # Override BASE_FBGEMM_IMAGE to consume a pre-built image and skip the build.
 # ============================================================================
 FROM ${BASE_IMAGE} AS base_fbgemm
 
 ARG TARGETPLATFORM
+# The linux/arm64 FBGEMM GPU wheel to install (fbgemm_arm64_wheel's, published),
+# its sha256, and the torch it is built against (its torch_version.txt), which
+# must be the image's. An empty URL builds FBGEMM from source instead.
+ARG FBGEMM_ARM64_WHEEL_URL=
+ARG FBGEMM_ARM64_WHEEL_SHA256=
+ARG FBGEMM_ARM64_WHEEL_TORCH_VERSION=
 
 WORKDIR /workspace/deps
 
@@ -32,7 +52,9 @@ COPY docker/install_fbgemm_gpu_arm64.sh /usr/local/bin/install_fbgemm_gpu_arm64.
 # PyTorch 2.14 and includes the SM80, SM90a, SM100a and SM120a targets.
 # Using the wheel also avoids compiling FBGEMM with this image's CUDA 13.4,
 # which FBGEMM 1.9.0 does not support yet (the arm64 source build still does).
-# The CUDA wheel is not published for aarch64, so retain the source build there.
+# FBGEMM publishes no aarch64 CUDA wheel: arm64 installs the one
+# FBGEMM_ARM64_WHEEL_URL names, checked against FBGEMM_ARM64_WHEEL_SHA256, or
+# builds it from source.
 RUN set -eux; \
     case "${TARGETPLATFORM}" in \
       linux/amd64) \
@@ -40,7 +62,16 @@ RUN set -eux; \
           'https://download.pytorch.org/whl/cu130/fbgemm_gpu-1.9.0%2Bcu130-cp312-cp312-manylinux_2_28_x86_64.whl#sha256=fdf56c45f0ad507cf7d85460b8384165d9ed50ee86905c762062c4e7ae813a66'; \
         ;; \
       linux/arm64) \
-        bash /usr/local/bin/install_fbgemm_gpu_arm64.sh; \
+        if [ -n "${FBGEMM_ARM64_WHEEL_URL}" ]; then \
+          python3 -c 'import sys, torch; w = sys.argv[1]; sys.exit(0 if torch.__version__ == w else f"the FBGEMM wheel is built for torch {w!r}, and the image has {torch.__version__!r}")' "${FBGEMM_ARM64_WHEEL_TORCH_VERSION}"; \
+          wheel="/tmp/$(basename "${FBGEMM_ARM64_WHEEL_URL}")"; \
+          wget -q -O "${wheel}" "${FBGEMM_ARM64_WHEEL_URL}"; \
+          echo "${FBGEMM_ARM64_WHEEL_SHA256}  ${wheel}" | sha256sum --check; \
+          pip install --no-cache-dir --no-deps "${wheel}"; \
+          rm -f "${wheel}"; \
+        else \
+          bash /usr/local/bin/install_fbgemm_gpu_arm64.sh; \
+        fi; \
         ;; \
       *) \
         echo "Unsupported TARGETPLATFORM=${TARGETPLATFORM}" >&2; \

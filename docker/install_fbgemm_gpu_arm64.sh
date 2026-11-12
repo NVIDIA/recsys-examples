@@ -25,7 +25,7 @@ restore_tensor_body() {
 }
 trap 'restore_tensor_body "$?"' EXIT
 
-python3 -m pip install --no-cache-dir setuptools-git-versioning scikit-build
+python3 -m pip install --no-cache-dir setuptools-git-versioning scikit-build wheel
 git clone --recursive --branch "${fbgemm_tag}" \
   https://github.com/pytorch/FBGEMM.git "${fbgemm_source}"
 test "$(git -C "${fbgemm_source}" rev-parse HEAD)" = \
@@ -52,6 +52,18 @@ sed -i \
 test "$(grep -Fc 'return at::Tensor(std::forward<Args>(args)...);' "${torch_tensor_body}")" -eq 0
 test "$(grep -Fc 'return repr_type(std::forward<Args>(args)...);' "${torch_tensor_body}")" -eq 1
 
-python3 setup.py install --build-target=default --build-variant=cuda \
+# Build a wheel and install it. With FBGEMM_WHEEL_DIR set, the wheel is also kept
+# there (the Dockerfile's fbgemm_arm64_wheel target exports it for publishing).
+python3 setup.py bdist_wheel --build-target=default --build-variant=cuda \
   --package_channel=release \
   -DTORCH_CUDA_ARCH_LIST='8.0 9.0a 10.0'
+wheels=(dist/fbgemm_gpu-*.whl)
+[[ ${#wheels[@]} -eq 1 && -f ${wheels[0]} ]]
+python3 -m pip install --no-cache-dir --no-deps "${wheels[0]}"
+if [[ -n "${FBGEMM_WHEEL_DIR:-}" ]]; then
+  mkdir -p "${FBGEMM_WHEEL_DIR}"
+  cp -- "${wheels[0]}" "${FBGEMM_WHEEL_DIR}/"
+  # The wheel's .so files link this torch's libraries, whose C++ ABI is not
+  # stable across builds: base_fbgemm checks the image's torch against it.
+  python3 -c 'import torch; print(torch.__version__)' > "${FBGEMM_WHEEL_DIR}/torch_version.txt"
+fi
