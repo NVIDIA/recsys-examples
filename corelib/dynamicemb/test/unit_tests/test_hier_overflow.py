@@ -70,6 +70,7 @@ sys.path.insert(
     0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "benchmark")
 )
 from benchmark_utils import init_distributed  # noqa: E402
+from hier_switch import splits_host  # noqa: E402
 
 AMPLE = 1 << 20  # entries: far above every batch here
 DIM = 32
@@ -565,7 +566,14 @@ def main() -> None:
     # node is NCCL's LSA team (node_size, collective)
     rank, world_size, _, local_size = init_distributed()
     os.environ.setdefault("DYNAMICEMB_HIER_TIMEOUT_S", "120")
-    multi_node = world_size // node_size(dist.group.WORLD) > 1
+    node = node_size(dist.group.WORLD)
+    skip = splits_host(node, local_size)
+    if skip is not None:
+        if rank == 0:
+            print(f"{world_size} ranks: skipped: {skip}", flush=True)
+        dist.destroy_process_group()
+        sys.exit(0)
+    multi_node = world_size // node > 1
     checks = Checks(rank)
     for case in CASES:
         if case.multi_node and not multi_node:

@@ -102,6 +102,7 @@ sys.path.insert(
     0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "benchmark")
 )
 from benchmark_utils import hier_capacities, hier_needs, init_distributed  # noqa: E402
+from hier_switch import splits_host  # noqa: E402
 
 DEV = torch.device("cuda")
 NUM_EMBEDDINGS = 1 << 20
@@ -1563,6 +1564,11 @@ def main() -> None:
         f" host(s)), a build {'with' if HAS_HIER_DIST else 'without'} the"
         " hierarchical dist"
     )
+    skip = splits_host(NODE, LOCAL) if HAS_HIER_DIST else None
+    if skip is not None:
+        log(f"skipped: {skip}")
+        dist.destroy_process_group()
+        sys.exit(0)
     instrument()
     if not HAS_HIER_DIST:
         failures = run_without_hier_dist(rank, log)

@@ -3081,7 +3081,13 @@ every dist, so tables of 16-bit rows may still differ from run to run.
 `test_hier_dist.py`, `test_hier_overflow.py` and `test_hier_pipeline.py`;
 each module's docstring says what it checks and how to run it. On one node
 `test_hier_dist.sh`, `test_hier_overflow.sh` and `test_hier_pipeline.sh`
-run them, and `test/unit_test.sh` runs those. `test_hier_dist.py` compares
+run them, and `test/unit_test.sh`'s `fwd_bwd_hier` group runs those. A run
+where NCCL's LSA team splits the GPUs of a host between nodes skips them
+(`hier_switch.splits_host`): NCCL makes the team smaller than a host when it
+does not connect the host's GPUs directly, as under `NCCL_P2P_DISABLE=1`,
+which the CI sets (6 ranks on an H100 host got nodes of 2). The nodes of one
+host would exchange keys and rows over GIN, where `ncclDevCommCreate`
+failed, and every sharding took TorchRec's dists. `test_hier_dist.py` compares
 the lookup's gradient per (table, key) with TorchRec's: its probe reads the
 gradient of the lookup output in the KJT's key order, through
 `HierDist.key_rows` (section 7.4). First it checks the node (`node_size`):
@@ -3105,15 +3111,18 @@ also checks the over-capacity error under each pipeline. Run it from
 PYTHONPATH=${PYTHONPATH}:$(realpath ../) torchrun --nproc_per_node 8 -m pytest -svv test/test_hierarchical_dist.py
 ```
 
-**The existing tests on the dist.** After its usual runs, `test/unit_test.sh`
-runs eight files of DynamicEmb's existing tests again on the hierarchical
-dist, with their configurations unchanged: `test_sequence_embedding.sh`,
-`test_twin_module.sh`, `erase_async/test_erase_async.sh`,
-`per_key_score/test_per_key_score.sh` and `test_lfu_scores.sh` in the
-`fwd_bwd` group, and `admission/test_embedding_admission.sh`,
+**The existing tests on the dist.** `test/unit_test.sh` runs eight files of
+DynamicEmb's existing tests again on the hierarchical dist, with their
+configurations unchanged: `test_sequence_embedding.sh`, `test_twin_module.sh`,
+`erase_async/test_erase_async.sh`, `per_key_score/test_per_key_score.sh` and
+`test_lfu_scores.sh` of the `fwd_bwd` group in the `fwd_bwd_hier` group,
+after the dist's own tests, and `admission/test_embedding_admission.sh`,
 `test_embedding_dump_load.sh` and `incremental_dump/test_incremental_dump.sh`
-in the `load_dump` group. A build without the op skips them. To run one of
-them on the dist, from `corelib/dynamicemb`:
+of the `load_dump` group in the `load_dump_hier` group. Each file runs with
+the group it comes from. The two groups are CI jobs of their own: the CI
+gives a job two hours, which `fwd_bwd` and `load_dump` already take most of.
+A build without the op skips the runs. To run one of them on the dist, from
+`corelib/dynamicemb`:
 
 ```
 DYNAMICEMB_TEST_OUTPUT_DIST=hierarchical PYHKV_DEBUG_STRICT=1 bash test/unit_tests/test_lfu_scores.sh
@@ -3133,6 +3142,8 @@ TorchRec's dists (section 6). For a pass to mean something:
 * after the model's first training forward, `check_path` asserts that each
   row-wise sharding of DynamicEmb tables took the dist exactly when it was
   given `"hierarchical"`. So a fallback, which only warns, fails the test;
+  where NCCL splits a host between the dist's nodes (above), it passes, with
+  a line on rank 0;
 * `PYHKV_DEBUG_STRICT=1` makes the forward tests' `Debugger` (`debug.py`)
   raise on a mismatch, which it otherwise prints, and check the input's
   totals per feature. The dist writes these totals into the caller's KJT
