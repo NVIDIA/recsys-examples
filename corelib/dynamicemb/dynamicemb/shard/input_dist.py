@@ -386,10 +386,10 @@ class RwSparseFeaturesDist(_RwSparseFeaturesDist):
         capacities. See docs/hier_output_dist.md, sections 7.3 and 10.
 
         Args:
-            features: the keys to send, ``int32`` or ``int64`` (one dtype on
-                every GPU of the node: docs/hier_output_dist.md, section 9),
+            features: the keys to send, ``int32`` or ``int64``,
                 index-deduplicated: only the first keys are valid, and only
-                the device knows how many.
+                the device knows how many. The op gets ``int32`` keys as
+                ``int64`` (docs/hier_output_dist.md, section 10.1).
             input_features: the KJT ``construct_jagged_tensors`` reads (the
                 input before index dedup).
             reverse_indices: index dedup's map from the input's rows to the
@@ -405,8 +405,15 @@ class RwSparseFeaturesDist(_RwSparseFeaturesDist):
             )
         offsets = features.offsets_or_none()
         weights = features.weights_or_none()
+        # The op reads a key in its own width. DynamicEmb's bucketize and
+        # key_ownership read an int32 key as the int64 key of its value, the
+        # key a table stores and a checkpoint holds: so the op gets int32 keys
+        # as int64, and gives each key the owner they give it.
+        keys = features.values()
+        if keys.dtype == torch.int32:
+            keys = keys.long()
         in_dist = self.hier.op.input_dist(
-            features.values().contiguous(),
+            keys.contiguous(),
             offsets,
             features.lengths() if offsets is None else None,
             features.stride(),
@@ -418,7 +425,7 @@ class RwSparseFeaturesDist(_RwSparseFeaturesDist):
             HierKJTAwaitable(
                 self.hier,
                 in_dist,
-                (features, input_features, reverse_indices),
+                (features, keys, input_features, reverse_indices),
                 features.keys(),
                 input_features,
                 sharding_ctx,

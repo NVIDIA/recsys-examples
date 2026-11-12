@@ -127,8 +127,8 @@ from dynamicemb_extensions import (
     hier_output_dist_node_push,
 )
 
-# Owners of a case: the bucketize's 32-bit rules give other owners than the
-# 64-bit ones where world_size is not a power of two.
+# Owners of a case, most not powers of two: there an int32 key read in 32 bits
+# would get another owner than the int64 key of its value.
 WORLD_SIZES = (1, 2, 3, 5, 6, 7, 8, 12, 24, 32, 100, 255, 256)
 ROUNDROBIN, HASH_ROUNDROBIN = (
     DIST_TYPE_CODES[name] for name in ("roundrobin", "hash_roundrobin")
@@ -424,7 +424,9 @@ def bucketize(
         given["sorted_path"] = sorted_path
     return planner(
         hier_output_dist_bucketize,
-        batch.values,
+        # The sharding gives the op int32 keys as int64 (hier_forward). The
+        # reference bucketizes the int32 keys: the owners must agree.
+        batch.values.long() if batch.values.dtype == torch.int32 else batch.values,
         None if lengths else batch.offsets,
         batch.lengths if lengths else None,
         case.batch_size,

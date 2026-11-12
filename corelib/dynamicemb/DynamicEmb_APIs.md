@@ -991,8 +991,7 @@ Fields declared first (through `device_id`) are **planner/runtime-heavy**: `Dyna
             ``dist_type`` ``roundrobin`` or ``hash_roundrobin``; a call on it deduplicates
             the sharding's keys, whatever the sharder's ``use_index_dedup`` (tables that clip
             gradients need that flag). It carries no score per key (``PRECISE_CUSTOMIZED``
-            tables raise ``ValueError``). Every GPU of a node gives it keys of one dtype in a
-            call, which it does not check. ``"auto"``: ``"hierarchical"`` where the build has
+            tables raise ``ValueError``). ``"auto"``: ``"hierarchical"`` where the build has
             it, ``output_dist_capacity`` is set and no table is ``continuous``, takes a score
             per key or clips gradients without index dedup, else TorchRec's dists. See
             ``docs/hier_output_dist.md``, section 4.
@@ -1834,7 +1833,7 @@ Due to limited resources, the dynamic embedding table does not pre allocate memo
 - A call on the dist deduplicates the sharding's keys (index dedup), whatever the sharder's `use_index_dedup`; without that flag the sharding warns so once, at its first `input_dist()` ([docs/hier_output_dist.md](./docs/hier_output_dist.md), section 7.4). Tables that clip gradients need `use_index_dedup=True`: without it, `"hierarchical"` raises `ValueError` at the first `input_dist()`, and `"auto"` takes TorchRec's dists ([docs/hier_output_dist.md](./docs/hier_output_dist.md), section 6).
 - The dist carries no score per key. With tables that take one (`PRECISE_CUSTOMIZED`), `"hierarchical"` raises `ValueError` when the model is sharded, and `"auto"` takes TorchRec's dists ([docs/hier_output_dist.md](./docs/hier_output_dist.md), section 6).
 - A node of the dist is NCCL's LSA team, the GPUs that reach each other's memory over NVLink: a host of 8 GPUs on H100 machines, and on GB200 and GB300 NVL72 with multi-node NVLink the job's GPUs of a rack when the job runs inside one rack. The dist reads it at its first `input_dist()` ([node_size](#node_size) gives it too); `LOCAL_WORLD_SIZE`, the GPUs of a host, does not set it. Across racks it is what the NCCL you run gives: check it there ([docs/hier_output_dist.md](./docs/hier_output_dist.md), section 4.2).
-- Give the dist keys of one dtype (`int32` or `int64`) on every GPU of a node in a call, as TorchRec's dists need on every rank. Mixed dtypes are not detected: a GPU can then get a key's row from the key's owner in the other dtype, and send its gradient there ([docs/hier_output_dist.md](./docs/hier_output_dist.md), section 9).
+- Keys may be `int32` or `int64`. The dist gives an `int32` key the owner of the `int64` key of its value, as DynamicEmb's bucketize, checkpoint loading and `replay_increment` do ([docs/hier_output_dist.md](./docs/hier_output_dist.md), section 10.1).
 - Give every DynamicEmb table of a sharding the same `output_dist`, `output_dist_capacity` and `node_dedup`, and every rank the same options and environment variables ([docs/hier_output_dist.md](./docs/hier_output_dist.md), section 4.1).
 - Set `NCCL_CROSS_NIC=0` for multi-node jobs, before the first NCCL communicator is created, so that NCCL connects GIN on the rails alone.
 - Call [quiesce](#quiesce) on every rank before dropping the model.

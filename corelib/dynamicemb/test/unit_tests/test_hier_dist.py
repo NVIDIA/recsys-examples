@@ -680,9 +680,9 @@ def bucketized_owners(
     keys: torch.Tensor, world_size: int, dist_type: str
 ) -> torch.Tensor:
     """The rank TorchRec's path in DynamicEmb sends each key to: DynamicEmb's
-    bucketize run on the keys as given (one sample of one feature), so by the
-    rule of their own width. A key's owner is the bucket its place in the
-    bucketized keys falls in."""
+    bucketize run on the keys as given (one sample of one feature), which
+    places an int32 key as the int64 key of its value. A key's owner is the
+    bucket its place in the bucketized keys falls in."""
     if keys.numel() == 0:
         return torch.empty(0, dtype=torch.int64, device=keys.device)
     lengths, _, _, _, places = block_bucketize_sparse_features(

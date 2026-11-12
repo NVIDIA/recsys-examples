@@ -781,9 +781,7 @@ class DynamicEmbTableOptions:
     its first ``input_dist()``); tables that clip gradients need the flag
     (else ``ValueError`` there too). It carries no score per key: tables of
     ``score_strategy`` ``PRECISE_CUSTOMIZED`` make it raise ``ValueError``
-    when the model is sharded. Every GPU of a node gives it keys of one dtype
-    (``int32`` or ``int64``) in a call, which it does not check
-    (docs/hier_output_dist.md, section 9). ``"auto"`` is ``"hierarchical"``
+    when the model is sharded. ``"auto"`` is ``"hierarchical"``
     where the build has it, ``output_dist_capacity`` is set and no table of
     the sharding is ``"continuous"``, takes a score per key or clips
     gradients without the sharder's index dedup, and TorchRec's dists (with

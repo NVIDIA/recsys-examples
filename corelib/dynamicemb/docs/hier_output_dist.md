@@ -326,8 +326,8 @@ every rank before you drop a model (section 4.6).
 * Tables of `dist_type` `"roundrobin"` (the default) or `"hash_roundrobin"`.
   The tables of a sharding can have different rules. The op refuses
   `"continuous"` (sections 6 and 10.1).
-* Keys of one dtype, `int32` or `int64`, on all GPUs of a node in a call
-  (section 9). TorchRec's dists need one key dtype on every rank too.
+* Keys `int32` or `int64`. The sharding gives the op `int32` keys as
+  `int64` (section 10.1). TorchRec's dists need one key dtype on every rank.
 * Capacities (`output_dist_capacity`) that fit the calls (section 5).
 * Every rank makes the same calls in the same order, as with NCCL
   collectives (operations that all ranks run together).
@@ -515,8 +515,8 @@ from dynamicemb.key_ownership import owning_shard
 needs = hier_needs(
     sample_batches,                  # this rank's KJTs of a few calls
     {"item": 0, "user": 1},          # the table of each of the sharding's features
-    # each key's owner, for int64 keys; for int32 keys give the bucketize's
-    # 32-bit rule (section 10.1)
+    # each key's owner (owning_shard reads an int32 key as int64, as the dist
+    # does: section 10.1)
     lambda keys, feature: owning_shard(keys, world_size, "roundrobin"),
 )  # on nodes of NCCL's LSA team (node_size), as the dist takes them
 capacities = hier_capacities(needs, factor=1.25)
@@ -1183,19 +1183,15 @@ finds their identities with a hash table and numbers them with a scan
   `roundrobin` or `hash_roundrobin` (section 10.1). Python gives each
   table's rule to all its features, and the op refuses a table whose
   features have different rules (section 7.1). Both rules keep the key and
-  compute the owner from the key alone. So equal keys of a table, of one
-  dtype, have one owner, and so one owner node: the owner node adds nothing
-  to the identity. (`continuous` rewrites a key to its offset in its
+  compute the owner from the key alone. So equal keys of a table have one
+  owner, and so one owner node: the owner node adds nothing to the
+  identity. (`continuous` rewrites a key to its offset in its
   owner's block, so equal stored keys of two owners would be different
   keys. The op refuses it, section 6.)
-* **One key dtype.** Both rules work in the width of the key: `roundrobin`
-  takes a negative `int32` key as `2^32 + key`, and `hash_roundrobin` takes
-  the low 32 bits of the hash of an `int32` key. So a key can have one
-  owner as `int32` and another as `int64`. The GPUs of a node must give the
-  op keys of one dtype in a call (TorchRec's dists need one dtype on every
-  rank). Else a proxy can merge an `int32` key and the same `int64` key of
-  two owner nodes, and serve both from the smaller owner node, its
-  representative's (below).
+* **`int64` keys.** The sharding gives the op every key as `int64`, an
+  `int32` key widened with its sign (section 10.1). So an `int32` key and
+  the `int64` key of its value are one key, with one owner, whatever dtype
+  each GPU's KJT has.
 * **Representative.** A node-unique key's representative is its occurrence
   of the least (owner node, feature), and of those the first in the remote
   part. So the key's feature is the table's smallest feature under which the
@@ -1343,12 +1339,12 @@ bucketize (`bucketize_rows`, `bucketize.cu`), named after TorchRec's
    GPU. The deduplicated KJT keeps its full length, and its lengths say how
    many keys are valid. So `num_uniques.item()` (a host sync) is not needed.
    `segmented_unique` takes `int64` keys, so `int32` keys are deduplicated
-   as `int64`, and the deduplicated keys go back to `int32`: the bucketize
-   places each key by the rules of its own width (see below). TorchRec's
-   path in DynamicEmb (an eval forward) does the same.
+   as `int64`, and the deduplicated keys go back to `int32`, as on
+   TorchRec's path in DynamicEmb (an eval forward). The op gets them as
+   `int64` (see below).
 2. **The keys by owner.** Each key's feature comes from the KJT's offsets, and
    its owner from its feature's rule (`dist_type`: `roundrobin` or
-   `hash_roundrobin`), in the arithmetic of the keys' own width (see
+   `hash_roundrobin`), in the arithmetic of the keys' width: 64 bits (see
    below). The kernels read the rule of each key's feature at run time, so
    the tables of a sharding can have different rules. The keys' rows go in
    `[owner][feature][sample][position]` order: `inv` holds each one's row in
@@ -1435,23 +1431,21 @@ bucketize (`bucketize_rows`, `bucketize.cu`), named after TorchRec's
    sub-tasks stay consecutive and in original-row order, so the heavy
    rows' sums and the gradient keep their bits (section 18).
 
-**The owner rules by key width.** On TorchRec's path DynamicEmb bucketizes
-the KJT as the caller gave it, and the bucketize reads each key as an
-unsigned number of the keys' width (a negative `int32` key as
-`2^32 + key`). `bucketize_rows` computes the same way, in the keys' own
-type. So on both paths a key goes to the same owner:
+**The owner rules and `int32` keys.** On TorchRec's path DynamicEmb
+bucketizes the KJT as the caller gave it, and the bucketize reads an
+`int32` key as the `int64` key of its value, the key a table stores:
+`roundrobin` sends a key to `key mod world_size` and `hash_roundrobin` to
+`murmur3_fmix64(key) mod world_size`, the key read as an unsigned 64-bit
+number. Checkpoint loading and delta replay (`dynamicemb/key_ownership.py`)
+place each key by the same rule. `bucketize_rows` computes in the keys' own
+type, an `int32` key in 32 bits, so the sharding gives the op `int32` keys
+as `int64` (`hier_forward`). So on both paths a key goes to the same owner,
+which is where a checkpoint load or a delta replay puts it.
 
-| `dist_type` | `int64` keys | `int32` keys |
-|---|---|---|
-| `roundrobin` | key mod `world_size` | the same, in 32 bits |
-| `hash_roundrobin` | the key's 64-bit hash mod `world_size` | the low 32 bits of the hash of the key (zero-extended), mod `world_size` |
-
-Both rules keep the key. The owner gets an `int32` key widened with its
-sign to `int64`: the 64-bit key DynamicEmb's lookup makes of an `int32` key
-on TorchRec's path. So a model may take either path call by call (eval
-forwards, calls that do not fit) and finds its rows. Checkpoint loading and
-delta replay (`dynamicemb/key_ownership.py`) follow another rule for some
-`int32` keys (section 19).
+Both rules keep the key, and the owner gets the 64-bit key DynamicEmb's
+lookup makes of an `int32` key on TorchRec's path. So a model may take
+either path call by call (eval forwards, calls that do not fit) and finds
+its rows.
 
 The op does not take `continuous`, TorchRec's block rule. That rule
 rewrites a key to its offset in its owner's block, so equal stored keys of
@@ -3323,8 +3317,6 @@ on 1 and 3 CTAs, and the calls of the design's reference ports.
 * **No score per key**: tables of `score_strategy` `PRECISE_CUSTOMIZED` take
   TorchRec's dists under `"auto"`, and raise `ValueError` under
   `"hierarchical"` (section 6).
-* **One key dtype**: the GPUs of a node give the op keys of one dtype
-  (`int32` or `int64`) in a call. The op does not check it (section 9).
 * **Fixed capacities**: a call that needs more raises, on every rank
   (section 5.4); the capacities must hold the largest call.
 * **Errors no agreement covers**: an NCCL error while the op makes its
@@ -3399,13 +3391,6 @@ on 1 and 3 CTAs, and the calls of the design's reference ports.
   delays the other ranks' output-dist kernels. A chunk of hot keys, which
   have many rows in the ring, moves less than `DYNAMICEMB_HIER_PAYLOAD_KB`
   over IB: down to `max_chunk_rows / max_counted_rows` rows (section 12.1).
-* **`int32` keys**: checkpoint loading and delta replay
-  (`dynamicemb/key_ownership.py`) place every `roundrobin` and
-  `hash_roundrobin` key by the 64-bit rule (`continuous` keys raise there).
-  For negative keys, and under `hash_roundrobin` on a world size that is not
-  a power of two, that rule gives other ranks than the bucketize's (section
-  10.1). Such keys load on other ranks than the ones that look them up: a gap
-  of DynamicEmb's, not of this dist.
 * **Freeing tables**: a model dropped right after its last step, without a
   device sync, can crash later with an illegal memory access. DynamicEmb
   frees its table memory without waiting for the kernels that still read it

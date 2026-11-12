@@ -141,8 +141,8 @@ def hier_needs(
             the sharding's features count.
         tables: the table of each of the sharding's features.
         owner_of: ``owner_of(keys, feature)``, the rank that owns each key,
-            given the keys in the KJT's own dtype (TorchRec's path places an
-            ``int32`` key by the bucketize's 32-bit rule).
+            given the keys in the KJT's own dtype. An ``int32`` key is owned
+            as the ``int64`` key of its value (``key_ownership.owning_shard``).
         local_size: GPUs per node, as the dist takes them: NCCL's LSA team
             on the ranks of ``group`` (``dynamicemb.shard.node_size``), not
             LOCAL_WORLD_SIZE. None reads it so.
