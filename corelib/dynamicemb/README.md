@@ -100,9 +100,80 @@ Regarding how to use the DynamicEmb APIs and their parameters, please refer to t
 3. The allocated memory for dynamic embedding tables may differ slightly from the requested `num_embeddings`. Capacity is aligned through `bucket_capacity` rules in `DynamicEmbTableOptions` (`BUCKET_ALIGNMENT` = 16), and the planner writes the effective per-rank `max_capacity`.
 4. The lookup process for each dynamic embedding table incurs additional overhead from unique or radix sort operations. Therefore, if you request a large number of small dynamic embedding tables for lookup, the performance will be poor. Since the lookup range of dynamic embedding tables is particularly large (using the entire range of `int64_t`), it is recommended to create one large embedding table and perform a fused lookup for multiple features.
 5. Although dynamic embedding tables can be trained together with TorchREC tables, they cannot be fused together for embedding lookup. Therefore, it is recommended to select dynamic embedding tables for all model-parallel tables during training.
-6. DynamicEmb supports training with TorchREC's `EmbeddingBagCollection` (pooling mode: SUM/MEAN) and `EmbeddingCollection` (sequence mode). Both modes use fused CUDA kernels for embedding lookup and gradient reduction. Tables with different embedding dimensions are supported in pooling mode.
+6. DynamicEmb supports training with TorchREC's `EmbeddingBagCollection` (pooling mode: SUM/MEAN) and `EmbeddingCollection` (sequence mode). Both modes use TorchRec lookup with DynamicEmb's fused CUDA gradient reduction and optimizer updates. Tables with different embedding dimensions are supported in pooling mode.
 7. DynamicEmb supports Torch-exportable embedding tables through `InferenceEmbeddingTable`. It uses DynamicEmb `ScoredHashTable` metadata frozen at export/inference time and `LinearUVMEmbedding` from [NVEmbedding](https://github.com/NVIDIA/nv-embedding-cache), supporting sequence mode and pooling mode (`SUM`, `MEAN`). It is initialized from `DynamicEmbTableOptions` and loads from DynamicEmb dumped embedding files.
 8. A table can take a score per key from the input (`DynamicEmbScoreStrategy.PRECISE_CUSTOMIZED`, with a `ScoredKeyedJaggedTensor` as input), for row-wise `EmbeddingCollection` and `EmbeddingBagCollection`. See "Per-key score" in [DynamicEmb_APIs.md](./DynamicEmb_APIs.md).
+
+### Resolved input distribution and TorchRec lookup
+
+See the [design RFC](docs/input_dist_indices_design.md) for the row-state
+contract, measured results and remaining integration/validation work.
+
+DynamicEmb resolves keys **after the input all-to-all**, when the tensors
+awaitable is waited on. This applies to row-wise sequence collections and
+row-wise / table-row-wise pooled collections, all storage layouts (HBM, cache,
+host, hybrid and external PS), and evaluation. Lookup consumes resolved rows and batch metadata;
+it does not query the hash table or fetch keys from a Storage backend.
+
+TorchRec's native `EmbeddingCollection` / `EmbeddingBagCollection` perform gather
+and pooling over compact unique-row weights. Uniform-dimension groups use one
+synthetic feature over the entire workspace, avoiding per-feature lookups and
+index reconstruction. Pooled output is reshaped back to its batch/feature layout;
+mixed-dimension pooling keeps per-table weight views. FP16/BF16 pooling uses a
+temporary FP32 embedding workspace so accumulation and FP32 sample weights keep
+their existing precision, with the requested output cast applied after pooling.
+Placeholder modules are constructed on meta without advancing CPU/CUDA RNG,
+including on the first lookup after restoring a checkpoint.
+DynamicEmb retains its fused
+optimizer and gradient reduction, including mixed dimensions and optimizer-state
+precision. Temporary weight views are kept out of checkpoints and external
+optimizers. The raw `BatchedDynamicEmbeddingTablesV2.forward` and FIFO `prefetch`
+APIs remain available; sharded collections pass batch state explicitly.
+
+HBM and cache resolution reuse the existing admission, initialization and pinning
+code. Hash slots and value rows stay separate: slots index reference counters,
+while value rows survive storage rehashes. Eviction initializes the replacement
+embedding **and optimizer state** before exposing the new row. Backward releases
+pins; a forward without an autograd graph releases them after lookup.
+
+Host, hybrid and opaque PS interfaces resolve into batch-local rows. Distributed
+inputs and autograd contexts own these rows; the working-set registry holds weak
+references so a discarded input or graph does not retain its buffers. The legacy
+prefetch FIFO also owns its pending rows. An optimizer
+update is written to the backend and copied to overlapping outstanding batches,
+so an already-prefetched batch observes current embedding and optimizer state,
+even after backing-store eviction. `TableAccessGate` orders these operations
+across CUDA streams. Live rows record streams used by find/publish copies so
+cancelling a graph cannot recycle memory before a queued copy finishes.
+The existing Storage `find` / `insert` interface is sufficient;
+PS implementations need no GPU-pointer or remote slot-index API.
+
+Evaluation resolves read-only rows and can read through cache, storage and PS.
+Missing keys use the evaluation initializer, without insertion or optimizer
+updates. Scores and deduplication frequencies are consumed during resolution;
+`need_indices=True` still returns original keys from the output context. A
+feature processor runs on raw keys before resolution and is not applied twice.
+
+Sparse and prefetch train pipelines keep DynamicEmb's input all-to-all outside
+TorchRec's fused splits optimization, which otherwise drops the postprocessing
+callback. This choice is uniform across ranks, including ranks holding no
+local table in a table-row-wise sharding. Native all-to-all and stream overlap
+are retained. These changes implement
+[#459](https://github.com/NVIDIA/recsys-examples/issues/459).
+
+Run focused GPU validation in an installed, compatible environment:
+
+```bash
+python -m pytest test/unit_tests/test_input_dist_indices.py -q
+torchrun --standalone --nproc_per_node=2 -m pytest test/unit_tests/test_input_dist_indices.py -q
+```
+
+The suite includes low-precision pooling/update checks, cancelled inputs and
+graphs, cross-stream buffer lifetime, and RNG/dropout consistency after restore.
+For component and real SparseDist pipeline A/B commands, see the
+[resolved lookup benchmark](benchmark/README.md#3-resolved-lookup-and-sparsedist-pipeline-ab).
+The native adapter still has fixed overhead relative to the prior CUDA gather;
+component timings do not establish full-model throughput.
 
 ### DynamicEmb Insertion Behavior Checking Modes
 

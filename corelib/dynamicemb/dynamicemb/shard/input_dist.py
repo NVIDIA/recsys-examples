@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import List, Optional, Tuple
+from typing import Callable, List, Optional, Tuple
 
 import torch
 from dynamicemb.dynamicemb_config import DIST_TYPE_CODES
@@ -207,6 +207,25 @@ class _ScoredSplitsAwaitable(Awaitable[KJTAllToAllTensorsAwaitable]):
         return _ScoredTensorsAwaitable(keys, self._scores_awaitable.wait())
 
 
+class _PostprocessedSplitsAwaitable(Awaitable[KJTAllToAllTensorsAwaitable]):
+    """Run local resolution after the tensors all2all, keeping TorchRec's metadata.
+
+    Return the original tensors awaitable so TorchRec still reads its input and
+    output splits and recat. A callback also runs after the scored wrapper has
+    reattached the per-key scores, when present.
+    """
+
+    def __init__(self, awaitable, postprocessor) -> None:
+        super().__init__()
+        self._awaitable = awaitable
+        self._postprocessor = postprocessor
+
+    def _wait_impl(self) -> KJTAllToAllTensorsAwaitable:
+        tensors = self._awaitable.wait()
+        tensors.callbacks.append(self._postprocessor)
+        return tensors
+
+
 def _determine_output_weights(kjt, pos, bucketize_pos, bucketized_weights):
     """
     Determine which weights to return: pos or bucketized_weights.
@@ -250,6 +269,9 @@ class RwSparseFeaturesDist(_RwSparseFeaturesDist):
             (:class:`~dynamicemb.scored_kjt.ScoredKeyedJaggedTensor`), sent by
             an all2all of their own beside the keys', and handed on with the
             received keys.
+        input_postprocessor: optional receiver-side transformation, run after
+            the tensors all2all completes. Its callback is kept outside the
+            train pipeline's splits fusion.
     """
 
     def __init__(
@@ -263,6 +285,9 @@ class RwSparseFeaturesDist(_RwSparseFeaturesDist):
         need_pos: bool = False,
         dist_types: Optional[List[str]] = None,
         per_key_score: bool = False,
+        input_postprocessor: Optional[
+            Callable[[KeyedJaggedTensor], KeyedJaggedTensor]
+        ] = None,
     ) -> None:
         super().__init__(
             pg=pg,
@@ -283,6 +308,15 @@ class RwSparseFeaturesDist(_RwSparseFeaturesDist):
             if per_key_score
             else None
         )
+        self._input_postprocessor = input_postprocessor
+        if input_postprocessor is not None:
+            # TrainPipelineSparseDist replaces `_dist.forward` to fuse splits
+            # across modules, rebuilding tensors awaitables itself and dropping
+            # their callbacks. Keep this all2all private until TorchRec can
+            # carry a postprocessor through that fusion. Both normal and prefetch
+            # pipelines still overlap this native TorchRec all2all with compute.
+            self._key_dist = self._dist
+            del self._dist
 
     def forward(
         self,
@@ -315,8 +349,15 @@ class RwSparseFeaturesDist(_RwSparseFeaturesDist):
             unbucketize_permute if self._is_sequence else None
         )
 
-        keys_dist = self._dist(bucketized_features)
+        key_dist = (
+            self._key_dist if self._input_postprocessor is not None else self._dist
+        )
+        keys_dist = key_dist(bucketized_features)
         if not takes_scores:
+            if self._input_postprocessor is not None:
+                return _PostprocessedSplitsAwaitable(
+                    keys_dist, self._input_postprocessor
+                )
             return keys_dist
 
         # TrainPipelineSparseDist swaps ``_dist.forward`` for one that returns
@@ -342,4 +383,7 @@ class RwSparseFeaturesDist(_RwSparseFeaturesDist):
             lengths=bucketized_features.lengths().clone(),
             stride=bucketized_features.stride(),
         )
-        return _ScoredSplitsAwaitable(keys_dist, self._score_dist(scores_kjt))
+        scored_dist = _ScoredSplitsAwaitable(keys_dist, self._score_dist(scores_kjt))
+        if self._input_postprocessor is not None:
+            return _PostprocessedSplitsAwaitable(scored_dist, self._input_postprocessor)
+        return scored_dist

@@ -15,6 +15,7 @@
 
 # pyre-strict
 
+from dataclasses import replace
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
@@ -50,6 +51,7 @@ from ..batched_dynamicemb_compute_kernel import (
     BatchedDynamicEmbeddingBag,
 )
 from .input_dist import RwSparseFeaturesDist
+from .resolved_input import ResolvedEmbeddingInput
 
 
 def dist_type_per_feature(
@@ -115,15 +117,90 @@ def sharding_takes_scores(sharding_infos: List[EmbeddingShardingInfo]) -> bool:
     return False
 
 
-class GroupedEmbeddingsLookup(_GroupedEmbeddingsLookup):
-    def __init__(self, *args, **kwargs) -> None:
-        super().__init__(*args, **kwargs)
+def sharding_has_dynamic_tables(sharding_infos: List[EmbeddingShardingInfo]) -> bool:
+    # This decision must agree on all ranks, including a table-row-wise rank
+    # that holds no table. Otherwise only some ranks opt out of splits fusion.
+    return any(
+        info.param_sharding.compute_kernel
+        == EmbeddingComputeKernel.CUSTOMIZED_KERNEL.value
+        for info in sharding_infos
+    )
+
+
+class _DynamicLookupMixin(torch.nn.Module):
+    _emb_modules: torch.nn.ModuleList
+    _feature_splits: List[int]
+    _feature_processor: Optional[BaseGroupedFeatureProcessor]
+
+    def _prefetch_raw(self, features, forward_stream):
+        raise NotImplementedError
+
+    def __init__(self, grouped_configs, *args, **kwargs) -> None:
+        processor = kwargs.get("feature_processor")
+        self._input_processor_flags = [
+            config.compute_kernel == EmbeddingComputeKernel.CUSTOMIZED_KERNEL
+            and config.has_feature_processor
+            and isinstance(processor, BaseGroupedFeatureProcessor)
+            for config in grouped_configs
+        ]
+        # Resolve the keys the processor produces, then let native grouped
+        # lookup skip a second application. Static kernels keep native behavior.
+        lookup_configs = [
+            replace(config, has_feature_processor=False) if flag else config
+            for config, flag in zip(grouped_configs, self._input_processor_flags)
+        ]
+        super().__init__(lookup_configs, *args, **kwargs)
         # A collection that takes a score per key holds DynamicEmb tables only
         # (see collect_per_key_score), and all of them take it, or none does.
         self._per_key_score: bool = any(
-            isinstance(emb_op, BatchedDynamicEmbedding)
+            isinstance(emb_op, (BatchedDynamicEmbedding, BatchedDynamicEmbeddingBag))
             and emb_op.emb_module.per_key_score
             for emb_op in self._emb_modules
+        )
+
+    @property
+    def resolves_input_dist(self) -> bool:
+        return any(
+            isinstance(emb, (BatchedDynamicEmbedding, BatchedDynamicEmbeddingBag))
+            and emb.resolves_input_dist
+            for emb in self._emb_modules
+        )
+
+    def resolve_input(self, features: KeyedJaggedTensor) -> KeyedJaggedTensor:
+        groups = features.split(self._feature_splits)
+        resolved = []
+        for emb, group, processed in zip(
+            self._emb_modules, groups, self._input_processor_flags
+        ):
+            if processed:
+                assert self._feature_processor is not None
+                group = self._feature_processor(group)
+                weights = group.weights_or_none()
+                if (
+                    torch.is_grad_enabled()
+                    and self.training
+                    and emb._config.is_weighted
+                    and weights is not None
+                    and weights.requires_grad
+                ):
+                    raise ValueError(
+                        "pooling_weights with requires_grad=True is not supported"
+                    )
+            with torch.no_grad():
+                resolved.append(
+                    emb.resolve_input(group)
+                    if isinstance(
+                        emb, (BatchedDynamicEmbedding, BatchedDynamicEmbeddingBag)
+                    )
+                    else group
+                )
+        if not any(isinstance(group, ResolvedEmbeddingInput) for group in resolved):
+            return features
+        return ResolvedEmbeddingInput.from_groups(
+            features,
+            resolved,
+            self._feature_splits,
+            recompute_lengths=any(self._input_processor_flags),
         )
 
     def prefetch(
@@ -134,11 +211,27 @@ class GroupedEmbeddingsLookup(_GroupedEmbeddingsLookup):
         """TorchRec's prefetch, which hands the tables only the values and offsets
         of each group, so that the scores split off with them would be left behind.
         """
-        if not self._per_key_score:
-            return super().prefetch(sparse_features, forward_stream)
+        if not self._per_key_score and not isinstance(
+            sparse_features, ResolvedEmbeddingInput
+        ):
+            return self._prefetch_raw(sparse_features, forward_stream)
         features_by_group = sparse_features.split(self._feature_splits)
         for emb_op, features in zip(self._emb_modules, features_by_group):
-            emb_op.prefetch(features, forward_stream)
+            if isinstance(
+                emb_op, (BatchedDynamicEmbedding, BatchedDynamicEmbeddingBag)
+            ):
+                emb_op.prefetch(features, forward_stream)
+            elif hasattr(emb_op.emb_module, "prefetch"):
+                emb_op.emb_module.prefetch(
+                    indices=features.values(),
+                    offsets=features.offsets(),
+                    forward_stream=forward_stream,
+                )
+
+
+class GroupedEmbeddingsLookup(_DynamicLookupMixin, _GroupedEmbeddingsLookup):
+    def _prefetch_raw(self, features, forward_stream):
+        return _GroupedEmbeddingsLookup.prefetch(self, features, forward_stream)
 
     def _create_embedding_kernel(
         self,
@@ -200,6 +293,7 @@ class RwSequenceDynamicEmbeddingSharding(RwSequenceEmbeddingSharding):
             sharding_infos
         )
         self._per_key_score: bool = sharding_takes_scores(sharding_infos)
+        self._has_dynamic_tables = sharding_has_dynamic_tables(sharding_infos)
 
     def create_input_dist(
         self,
@@ -219,6 +313,7 @@ class RwSequenceDynamicEmbeddingSharding(RwSequenceEmbeddingSharding):
                 self._dist_type_per_feature[name] for name in self.feature_names()
             ],
             per_key_score=self._per_key_score,
+            input_postprocessor=self._input_postprocessor,
         )
 
     def create_lookup(
@@ -227,14 +322,23 @@ class RwSequenceDynamicEmbeddingSharding(RwSequenceEmbeddingSharding):
         fused_params: Optional[Dict[str, Any]] = None,
         feature_processor: Optional[BaseGroupedFeatureProcessor] = None,
     ) -> BaseEmbeddingLookup:
-        return GroupedEmbeddingsLookup(
+        lookup = GroupedEmbeddingsLookup(
             grouped_configs=self._grouped_embedding_configs,
             pg=self._pg,
             device=device if device is not None else self._device,
         )
+        self._input_postprocessor = (
+            lookup.resolve_input if self._has_dynamic_tables else None
+        )
+        return lookup
 
 
-class GroupedPooledEmbeddingsLookup(_GroupedPooledEmbeddingsLookup):
+class GroupedPooledEmbeddingsLookup(
+    _DynamicLookupMixin, _GroupedPooledEmbeddingsLookup
+):
+    def _prefetch_raw(self, features, forward_stream):
+        return _GroupedPooledEmbeddingsLookup.prefetch(self, features, forward_stream)
+
     def _create_embedding_kernel(
         self,
         config: GroupedEmbeddingConfig,
@@ -291,6 +395,7 @@ class RwPooledDynamicEmbeddingSharding(RwPooledEmbeddingSharding):
             sharding_infos
         )
         self._per_key_score: bool = sharding_takes_scores(sharding_infos)
+        self._has_dynamic_tables = sharding_has_dynamic_tables(sharding_infos)
 
     def create_input_dist(
         self,
@@ -310,6 +415,7 @@ class RwPooledDynamicEmbeddingSharding(RwPooledEmbeddingSharding):
                 self._dist_type_per_feature[name] for name in self.feature_names()
             ],
             per_key_score=self._per_key_score,
+            input_postprocessor=self._input_postprocessor,
         )
 
     def create_lookup(
@@ -318,10 +424,15 @@ class RwPooledDynamicEmbeddingSharding(RwPooledEmbeddingSharding):
         fused_params: Optional[Dict[str, Any]] = None,
         feature_processor: Optional[BaseGroupedFeatureProcessor] = None,
     ) -> BaseEmbeddingLookup:
-        return GroupedPooledEmbeddingsLookup(
+        lookup = GroupedPooledEmbeddingsLookup(
             grouped_configs=self._grouped_embedding_configs,
             pg=self._pg,
             device=device if device is not None else self._device,
             feature_processor=feature_processor,
             sharding_type=ShardingType.ROW_WISE,
         )
+
+        self._input_postprocessor = (
+            lookup.resolve_input if self._has_dynamic_tables else None
+        )
+        return lookup

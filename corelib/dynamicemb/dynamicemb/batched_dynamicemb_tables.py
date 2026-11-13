@@ -51,8 +51,8 @@ from dynamicemb.batched_dynamicemb_function import (
     DynamicEmbeddingFunction,
     PrefetchState,
     StorageMode,
-    dynamicemb_eval_forward,
     dynamicemb_prefetch,
+    dynamicemb_resolve_eval,
     refresh_slots_after_rehash,
     release_slot_pins,
 )
@@ -98,6 +98,8 @@ from dynamicemb.optimizer import (
     SGDDynamicEmbeddingOptimizer,
     get_optimizer_state_dim,
 )
+from dynamicemb.resolved_storage import ActiveStorageRows
+from dynamicemb.torchrec_lookup import TorchRecLookup
 from dynamicemb.types import ReplayStats
 from dynamicemb.utils import DTYPE_NUM_BYTES
 from dynamicemb_extensions import device_timestamp
@@ -844,6 +846,13 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
             option.takes_score_per_key for option in self._dynamicemb_options
         )
         self._prefetch_states: Deque[PrefetchState] = deque()
+        self._active_rows = ActiveStorageRows()
+        self._native_lookup = TorchRecLookup(
+            self.dims,
+            self.feature_table_map,
+            self.pooling_mode,
+            torch.device("cuda", self.device_id),
+        )
 
         # TODO:1->10
         self._empty_tensor = nn.Parameter(
@@ -1307,8 +1316,10 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
         batch_size_per_feature_per_rank: Optional[List[List[int]]] = None,
         total_unique_indices: Optional[int] = None,
         scores: Optional[Tensor] = None,
+        prefetch_state: Optional[PrefetchState] = None,
     ) -> List[Tensor]:
-        self._check_scores(scores, indices)
+        if prefetch_state is None:
+            self._check_scores(scores, indices)
         if indices.dtype != self.index_type:
             indices = indices.to(self.index_type)
 
@@ -1380,45 +1391,35 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                 )
 
         if not self.training:
-            if self._external_storage is not None:
+            state = prefetch_state or self.resolve_input(indices, offsets)
+            if not state.is_eval:
                 raise RuntimeError(
-                    "Evaluation does not read external_storage: a key spilled to "
-                    "it would be treated as missing. Train with external_storage "
-                    "unset, or do not call eval() on this module."
+                    "Module mode changed after input_dist resolved the batch"
                 )
-            frequency_counters = self._counters_for_group(frequency_counters)
-            table_scores = [self._scores[name] for name in self._table_names]
-            fused_score = self._reduce_table_scores(table_scores)
-            if isinstance(self._cache, DynamicEmbCache):
-                self._cache.training = False
-                self._cache.set_score(fused_score)
-            if isinstance(self._storage, (DynamicEmbStorage, HybridStorage)):
-                self._storage.training = False
-                self._storage.set_score(fused_score)
-            return dynamicemb_eval_forward(
-                indices,
-                offsets,
-                self._cache,
-                self._storage,
-                self.feature_offsets,
-                self.output_dtype,
-                self._eval_initializer,
-                layout,
-                self._evict_strategy,
-                frequency_counters,
-                pooling_weights,
-            )
+            with torch.no_grad():
+                return self._native_lookup(
+                    state.unique_values,
+                    state,
+                    offsets,
+                    self.output_dtype,
+                    pooling_weights,
+                )
 
-        if any([not o.training for o in self._dynamicemb_options]):
+        self._check_training_mode()
+        if prefetch_state is not None and prefetch_state.is_eval:
             raise RuntimeError(
-                "BatchedDynamicEmbeddingTables does not support training when some tables are in eval mode."
+                "Module mode changed after input_dist resolved the batch"
             )
 
-        if not self._prefetch_states:
-            self.prefetch(
-                indices, offsets, frequency_counters=frequency_counters, scores=scores
-            )
-        prefetch_state = self._prefetch_states.popleft()
+        if prefetch_state is None:
+            if not self._prefetch_states:
+                self.prefetch(
+                    indices,
+                    offsets,
+                    frequency_counters=frequency_counters,
+                    scores=scores,
+                )
+            prefetch_state = self._prefetch_states.popleft()
 
         res = DynamicEmbeddingFunction.apply(
             prefetch_state,
@@ -1432,6 +1433,7 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
             self._admitter,
             self._evict_strategy,
             pooling_weights,
+            self._native_lookup,
             self._empty_tensor,
         )
         # Grad-mode forwards keep their slot pins until backward. Without an
@@ -1451,6 +1453,8 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                 prefetch_state.slot_indices,
                 prefetch_state.unique_table_ids,
             )
+        if not res.requires_grad and prefetch_state.active_rows is not None:
+            prefetch_state.active_rows.release(prefetch_state)
         if isinstance(self._cache, DynamicEmbCache):
             self._cache.training = False
         if isinstance(self._storage, (DynamicEmbStorage, HybridStorage)):
@@ -1498,6 +1502,12 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
         """Return ``frequency_counters`` only if this group consumes them."""
         return frequency_counters if self._consumes_frequency_counters else None
 
+    def _check_training_mode(self) -> None:
+        if any(not option.training for option in self._dynamicemb_options):
+            raise RuntimeError(
+                "BatchedDynamicEmbeddingTables does not support training when some tables are in eval mode."
+            )
+
     def prefetch(
         self,
         indices: Tensor,
@@ -1507,9 +1517,60 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
         frequency_counters: Optional[Tensor] = None,
         scores: Optional[Tensor] = None,
     ) -> None:
-        self._check_scores(scores, indices)
         if not self.training:
             return
+        state = self.resolve_input(
+            indices,
+            offsets,
+            forward_stream=forward_stream,
+            batch_size_per_feature_per_rank=batch_size_per_feature_per_rank,
+            frequency_counters=frequency_counters,
+            scores=scores,
+        )
+        self._prefetch_states.append(state)
+
+    def resolve_input(
+        self,
+        indices: Tensor,
+        offsets: Tensor,
+        forward_stream: Optional[torch.cuda.Stream] = None,
+        batch_size_per_feature_per_rank: Optional[List[List[int]]] = None,
+        frequency_counters: Optional[Tensor] = None,
+        scores: Optional[Tensor] = None,
+    ) -> PrefetchState:
+        """Prepare a batch without putting it in the legacy prefetch FIFO.
+
+        The caller owns the returned state and passes it explicitly to forward.
+        HBM/cache states pin stable value rows. Other stores resolve into live
+        batch-local rows shared with overlapping in-flight batches. Evaluation
+        resolves read-only rows. Every layout is consumed by TorchRec lookup.
+        """
+        self._check_scores(scores, indices)
+        if indices.dtype != self.index_type:
+            indices = indices.to(self.index_type)
+        if not self.training:
+            fused_score = self._reduce_table_scores(
+                [self._scores[name] for name in self._table_names]
+            )
+            if isinstance(self._cache, DynamicEmbCache):
+                self._cache.training = False
+                self._cache.set_score(fused_score)
+            if isinstance(self._storage, (DynamicEmbStorage, HybridStorage)):
+                self._storage.training = False
+                self._storage.set_score(fused_score)
+            return dynamicemb_resolve_eval(
+                indices,
+                offsets,
+                self._cache,
+                self._storage,
+                self.feature_offsets,
+                self._eval_initializer,
+                self._external_storage,
+                self._table_gate,
+            )
+        # These checks used to precede prefetch in forward. Keep them before
+        # input_dist can initialize rows or take pins as well.
+        self._check_training_mode()
         if self.prefetch_stream is None and forward_stream is not None:
             self.prefetch_stream = torch.cuda.current_stream()
             assert (
@@ -1537,27 +1598,28 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
             self._storage.training = True
             self._storage.set_score(fused_score)
 
-        self._prefetch_states.append(
-            dynamicemb_prefetch(
-                indices,
-                offsets,
-                self._cache,
-                self._storage,
-                self.feature_offsets,
-                self._initializer,
-                forward_stream,
-                self._evict_strategy,
-                frequency_counters,
-                self._admitter,
-                outstanding_keys_ref=self._prefetch_outstanding_keys
-                if self._cache is not None
-                else None,
-                external_storage=self._external_storage,
-                scores=scores,
-                table_gate=self._table_gate,
-            )
+        state = dynamicemb_prefetch(
+            indices,
+            offsets,
+            self._cache,
+            self._storage,
+            self.feature_offsets,
+            self._initializer,
+            forward_stream,
+            self._evict_strategy,
+            frequency_counters,
+            self._admitter,
+            outstanding_keys_ref=self._prefetch_outstanding_keys
+            if self._cache is not None
+            else None,
+            external_storage=self._external_storage,
+            scores=scores,
+            table_gate=self._table_gate,
+            active_rows=self._active_rows,
+            optimizer=self._optimizer,
         )
         self._update_score()
+        return state
 
     def set_score(
         self,

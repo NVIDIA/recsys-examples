@@ -444,6 +444,16 @@ class ShardedDynamicEmbeddingCollection(ShardedEmbeddingCollection):
     def create_context(self) -> DynamicEmbeddingCollectionContext:
         return DynamicEmbeddingCollectionContext(sharding_contexts=[])
 
+    def prefetch(
+        self,
+        dist_input: KJTList,
+        forward_stream: Optional[torch.cuda.Stream] = None,
+        ctx: Optional[EmbeddingCollectionContext] = None,
+    ) -> None:
+        """Keep pipeline prefetch idempotent for input_dist-resolved groups."""
+        for lookup, features in zip(self._lookups, dist_input):
+            lookup.prefetch(features, forward_stream)
+
 
 class DynamicEmbeddingCollectionSharder(EmbeddingCollectionSharder):
     """

@@ -293,7 +293,56 @@ def _get_dynamicemb_options_per_table(
     return o
 
 
+class _ResolvedInputMixin:
+    _emb_module: BatchedDynamicEmbeddingTablesV2
+
+    def _scores_of(self, features) -> Optional[torch.Tensor]:
+        return get_scores(features) if self._emb_module.per_key_score else None
+
+    def prefetch(
+        self, features, forward_stream: Optional[torch.cuda.Stream] = None
+    ) -> None:
+        """Prefetch the keys of ``features``, with their scores if the tables take them."""
+        from .shard.resolved_input import ResolvedEmbeddingInput
+
+        if isinstance(features, ResolvedEmbeddingInput):
+            # input_dist already inserted, initialized and pinned this batch.
+            return
+        self._emb_module.prefetch(
+            indices=features.values(),
+            offsets=features.offsets(),
+            forward_stream=forward_stream,
+            frequency_counters=(
+                features.weights_or_none()
+                if self._emb_module.pooling_mode == DynamicEmbPoolingMode.NONE
+                else None
+            ),
+            scores=self._scores_of(features),
+        )
+
+    @property
+    def resolves_input_dist(self) -> bool:
+        return True
+
+    def resolve_input(self, features):
+        """Resolve keys for every storage layout before embedding lookup."""
+        from .shard.resolved_input import ResolvedEmbeddingInput
+
+        state = self._emb_module.resolve_input(
+            indices=features.values(),
+            offsets=features.offsets(),
+            frequency_counters=(
+                features.weights_or_none()
+                if self._emb_module.pooling_mode == DynamicEmbPoolingMode.NONE
+                else None
+            ),
+            scores=self._scores_of(features),
+        )
+        return ResolvedEmbeddingInput.from_rows(features, state)
+
+
 class BatchedDynamicEmbeddingBag(
+    _ResolvedInputMixin,
     BaseBatchedEmbeddingBag[torch.Tensor],  # FusedOptimizerModule
     # BaseBatchedEmbeddingBag[BatchedDynamicEmbeddingTables, torch.Tensor], # FusedOptimizerModule
 ):
@@ -410,13 +459,6 @@ class BatchedDynamicEmbeddingBag(
     def purge(self) -> None:
         self._emb_module.reset_cache_states()
 
-    def _scores_of(self, features) -> Optional[torch.Tensor]:
-        """The scores of ``features``, if the tables take a score per key.
-
-        A collection that does not take them ignores the ones its input carries.
-        """
-        return get_scores(features) if self._emb_module.per_key_score else None
-
     def forward(self, features) -> torch.Tensor:
         # Only take the KJT weights as pooling weights when the collection was
         # actually declared weighted. The weights channel is shared: TorchRec
@@ -427,15 +469,19 @@ class BatchedDynamicEmbeddingBag(
         pooling_weights = (
             features.weights_or_none() if self._config.is_weighted else None
         )
+        from .shard.resolved_input import ResolvedEmbeddingInput
+
+        resolved = isinstance(features, ResolvedEmbeddingInput)
         return self._emb_module(
             indices=features.values().long(),
             offsets=features.offsets().long(),
             pooling_weights=pooling_weights,
-            scores=self._scores_of(features),
+            scores=None if resolved else self._scores_of(features),
+            prefetch_state=features.prefetch_state if resolved else None,
         )
 
 
-class BatchedDynamicEmbedding(BaseBatchedEmbedding[torch.Tensor]):
+class BatchedDynamicEmbedding(_ResolvedInputMixin, BaseBatchedEmbedding[torch.Tensor]):
     # FusedOptimizerModule):
     def __init__(
         self,
@@ -546,25 +592,15 @@ class BatchedDynamicEmbedding(BaseBatchedEmbedding[torch.Tensor]):
     def purge(self) -> None:
         self._emb_module.reset_cache_states()
 
-    def _scores_of(self, features) -> Optional[torch.Tensor]:
-        """The scores of ``features``, if the tables take a score per key.
-
-        A collection that does not take them ignores the ones its input carries.
-        """
-        return get_scores(features) if self._emb_module.per_key_score else None
-
-    def prefetch(
-        self, features, forward_stream: Optional[torch.cuda.Stream] = None
-    ) -> None:
-        """Prefetch the keys of ``features``, with their scores if the tables take them."""
-        self._emb_module.prefetch(
-            indices=features.values(),
-            offsets=features.offsets(),
-            forward_stream=forward_stream,
-            scores=self._scores_of(features),
-        )
-
     def forward(self, features) -> torch.Tensor:
+        from .shard.resolved_input import ResolvedEmbeddingInput
+
+        if isinstance(features, ResolvedEmbeddingInput):
+            return self._emb_module(
+                indices=features.values(),
+                offsets=features.offsets().long(),
+                prefetch_state=features.prefetch_state,
+            )
         return self._emb_module(
             indices=features.values().long(),
             offsets=features.offsets().long(),
