@@ -85,11 +85,8 @@ from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 # test_embedding_dump_load is the fixture module the tests in unit_tests share,
 # so it stays a directory up and has to be put on the path from here.
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from test_embedding_dump_load import (
-    create_model,  # noqa: E402
-    get_optimizer_kwargs,
-    idx_to_name,
-)
+from test_embedding_dump_load import create_model  # noqa: E402
+from test_embedding_dump_load import get_optimizer_kwargs, idx_to_name
 
 NUM_TABLES = 3
 NUM_EMBEDDINGS = 1000

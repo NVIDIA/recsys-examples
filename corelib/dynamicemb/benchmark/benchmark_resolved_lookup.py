@@ -85,6 +85,8 @@ def options(args, **kwargs):
             mode=DynamicEmbInitializerMode.DEBUG
         ),
         caching=args.layout == "cache",
+        output_dist=args.output_dist,
+        output_dist_capacity=args.output_capacity,
         **kwargs,
     )
 
@@ -291,6 +293,8 @@ def run(args, feature_num, device):
                 ],
                 peak_increment_bytes=torch.cuda.max_memory_allocated(device)
                 - memory_before,
+                resident_allocated_bytes=memory_before,
+                peak_allocated_bytes=torch.cuda.max_memory_allocated(device),
             )
     for name, pipeline in pipelines.items():
         try:
@@ -362,6 +366,12 @@ def main():
     )
     parser.add_argument("--profile-steps", type=int, default=0)
     parser.add_argument("--profile-dir", default="/tmp/dynamicemb-resolved-profile")
+    parser.add_argument(
+        "--output-dist",
+        choices=["torchrec", "auto", "hierarchical"],
+        default="torchrec",
+    )
+    parser.add_argument("--output-capacity", type=int, default=65536)
     args = parser.parse_args()
     if args.prefetch_depth < 0 or args.profile_steps < 0:
         parser.error("prefetch depth and profile steps must be nonnegative")

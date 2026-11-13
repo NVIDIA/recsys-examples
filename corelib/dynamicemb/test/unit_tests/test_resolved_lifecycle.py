@@ -284,3 +284,26 @@ def test_retained_backward_cancelled_on_another_stream_waits_for_update(layout):
     assert torch.count_nonzero(counter).item() == 0
     expected = (keys % 100000).float()[:, None].expand_as(observed) - 0.25
     torch.testing.assert_close(observed, expected, rtol=0, atol=0)
+
+
+def test_rejected_cache_reservation_can_recover():
+    model, counter = make_model(DynamicEmbPoolingMode.NONE, "cache")
+    capacity = model._cache._state.capacity
+    per_table = capacity // 4
+    keys = torch.cat([torch.arange(per_table), torch.arange(per_table) + 10000]).cuda()
+    offsets = torch.tensor(
+        [0, per_table, 2 * per_table], dtype=torch.int64, device="cuda"
+    )
+    states = [model.resolve_input(keys, offsets) for _ in range(2)]
+    before = model._prefetch_outstanding_keys.item()
+    with pytest.raises(RuntimeError, match="exceed cache capacity"):
+        model.resolve_input(keys, offsets)
+    assert model._prefetch_outstanding_keys.item() == before
+    for state in states:
+        state.release()
+    torch.cuda.synchronize()
+    assert torch.count_nonzero(counter).item() == 0
+    assert model._prefetch_outstanding_keys.item() == 0
+    state = model.resolve_input(keys, offsets)
+    state.release()
+    assert model._prefetch_outstanding_keys.item() == 0

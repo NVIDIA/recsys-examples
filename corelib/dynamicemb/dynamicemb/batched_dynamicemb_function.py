@@ -41,7 +41,6 @@ from dynamicemb.key_value_table import (
     eval_lookup,
     get_insert_score_arg,
     load_from_flat,
-    load_from_flat_by,
     score_source,
     store_to_flat,
 )
@@ -1048,9 +1047,10 @@ def dynamicemb_prefetch(
 
             if storage_mode == StorageMode.CACHE:
                 if outstanding_keys_ref is not None:
-                    outstanding_keys_ref += num_prefetched_keys
                     cache_capacity = cache._state.capacity
-                    outstanding_keys = _scalar_item(outstanding_keys_ref)
+                    outstanding_keys = (
+                        _scalar_item(outstanding_keys_ref) + num_prefetched_keys
+                    )
                     if outstanding_keys > cache_capacity:
                         raise RuntimeError(
                             f"Outstanding prefetched keys "
@@ -1059,6 +1059,7 @@ def dynamicemb_prefetch(
                             "Reduce prefetch pipeline depth or increase "
                             "cache size."
                         )
+                    outstanding_keys_ref += num_prefetched_keys
                 (
                     slot_indices,
                     non_admitted_positions,
@@ -1119,8 +1120,10 @@ def dynamicemb_prefetch(
                     admitter,
                     key_scores=unique_scores,
                 )
-                value_row_indices = torch.arange(
-                    unique_keys.numel(), device=indices.device
+                value_row_indices = (
+                    persisted_unique_indices
+                    if persisted_unique_indices.numel() == unique_keys.numel()
+                    else torch.arange(unique_keys.numel(), device=indices.device)
                 )
 
             result = PrefetchState(
@@ -1235,8 +1238,6 @@ def _resolve_storage_rows(
                 **({} if key_scores is None else {"key_scores": key_scores}),
             )
 
-        key_persisted = founds.clone()
-
         if h_num_missing == 0:
             n = unique_keys.numel()
             if n == 0:
@@ -1248,6 +1249,8 @@ def _resolve_storage_rows(
                     n, device=device, dtype=torch.int64
                 )
             return unique_values, persisted_unique_indices
+
+        key_persisted = founds.clone()
 
         freq_for_admission = (
             accumulated_frequency[missing_indices]
@@ -1583,9 +1586,18 @@ class DynamicEmbeddingFunction(torch.autograd.Function):
                     pui = ctx.persisted_unique_indices
                     assert pui is not None
                     if pui.numel() > 0:
-                        keys_c = ctx.unique_keys[pui]
-                        tids_c = unique_table_ids[pui]
-                        vals_c = ctx.unique_values[pui]
+                        if pui.numel() == ctx.unique_keys.numel():
+                            # Compaction preserves ascending unique positions;
+                            # all persisted means an identity selection.
+                            keys_c, tids_c, vals_c = (
+                                ctx.unique_keys,
+                                unique_table_ids,
+                                ctx.unique_values,
+                            )
+                        else:
+                            keys_c = ctx.unique_keys[pui]
+                            tids_c = unique_table_ids[pui]
+                            vals_c = ctx.unique_values[pui]
                         # preserve_existing=True → CONST score policy on insert:
                         # refresh embedding/optimizer buffers only; do not overwrite
                         # table scores (LFU / timestamp / etc.). For HybridStorage,

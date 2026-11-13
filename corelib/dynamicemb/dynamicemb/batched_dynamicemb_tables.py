@@ -51,12 +51,9 @@ from dynamicemb.batched_dynamicemb_function import (
     DynamicEmbeddingFunction,
     OutputAlloc,
     PrefetchState,
-    StorageMode,
     dynamicemb_prefetch,
     dynamicemb_resolve_eval,
     place_lookup_output,
-    refresh_slots_after_rehash,
-    release_slot_pins,
 )
 from dynamicemb.dynamicemb_config import (
     DynamicEmbCheckMode,
@@ -2890,9 +2887,9 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
         this kind of key at all, so a consumer can tell "nothing was removed"
         from "this table does not record removals".
         """
-        from dynamicemb.incremental_dump import (
+        from dynamicemb.incremental_dump import (  # lazy: avoid import cycle
             _all_gather_evicted_keys,
-        )  # lazy: avoid import cycle
+        )
 
         if not wanted or not hasattr(storage, method):
             return None
