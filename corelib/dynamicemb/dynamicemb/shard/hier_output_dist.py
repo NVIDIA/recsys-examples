@@ -17,8 +17,8 @@
 (``src/hier_output_dist``). Keys and rows move over NVLink inside a node and
 over the rails (NCCL GIN) between nodes, with one host sync per call. A node
 is NCCL's LSA team, the ranks that reach each other's memory over NVLink
-(:func:`node_size`). Design: docs/hier_output_dist.md (section 7.4 for this
-file).
+(:func:`node_size`, which refuses a team whose GPUs NVLink does not
+connect). Design: docs/hier_output_dist.md (section 7.4 for this file).
 
 :class:`HierDist` builds the operator at the first ``input_dist()`` and
 holds what the calls share. The operator takes index-deduplicated keys: a
@@ -31,12 +31,25 @@ the capacities raises at its second wait; every eval forward runs on
 TorchRec's dists. :func:`quiesce` lets every rank free the operators at once.
 """
 
+import contextlib
+import ctypes
 import os
 import socket
 import warnings
 import weakref
 from itertools import accumulate
-from typing import Callable, Dict, List, Optional, Sequence, Set, Tuple, Union
+from typing import (
+    Callable,
+    Dict,
+    FrozenSet,
+    List,
+    NamedTuple,
+    Optional,
+    Sequence,
+    Set,
+    Tuple,
+    Union,
+)
 
 import torch
 import torch.distributed as dist
@@ -78,10 +91,19 @@ def _first_difference(every: List[Dict]) -> Optional[str]:
     return None
 
 
+class NVLinkCheckError(RuntimeError):
+    """:func:`node_size`'s error when it cannot confirm that NVLink connects
+    the GPUs of a node: NVLink does not connect two of them (a host of PCIe
+    GPUs, or GPUs that NVLink bridges in pairs), or a rank of a node of more
+    than one GPU cannot read its GPU's NVLinks from NVML. A sharding on
+    ``output_dist="hierarchical"`` raises it, and one on ``"auto"`` takes
+    TorchRec's dists (:meth:`HierDist.setup`)."""
+
+
 # What node_size read for the ranks of each process group, by their global
-# ranks, the same on every rank of the group: (size, None), or (None, why it
-# could not).
-_NODE_SIZES: Dict[Tuple[int, ...], Tuple[Optional[int], Optional[str]]] = {}
+# ranks, the same on every rank of the group: (size, None, False), or (None,
+# why it could not, whether the NVLink check refused the node).
+_NODE_SIZES: Dict[Tuple[int, ...], Tuple[Optional[int], Optional[str], bool]] = {}
 
 
 def node_size(pg: Optional[dist.ProcessGroup] = None) -> int:
@@ -104,29 +126,38 @@ def node_size(pg: Optional[dist.ProcessGroup] = None) -> int:
     rank, returns it at once. Raises RuntimeError, the same on every rank,
     when a rank cannot read it (a build without the hierarchical dist, a GPU
     before compute capability 8.0, an NCCL error) or the ranks disagree; a
-    sharding then takes TorchRec's dists (:meth:`HierDist.setup`). But an
-    NCCL error inside the
+    sharding then takes TorchRec's dists. Raises :class:`NVLinkCheckError`
+    (a RuntimeError), the same on every rank, when NVLink does not connect
+    two GPUs of a node: NCCL's team takes the GPUs of a host whatever joins
+    them, PCIe alone too, and the dist moves a node's keys and rows over
+    NVLink alone. Each rank reads its GPU's NVLinks from NVML (nvidia-ml-py's
+    ``pynvml``) with its team; in a node of more than one GPU, a rank that
+    cannot read them refuses the node too (:func:`_first_unlinked`). A
+    sharding on ``"hierarchical"`` then raises, and one on ``"auto"`` takes
+    TorchRec's dists (:meth:`HierDist.setup`). But an NCCL error inside the
     communicator's initialization on some ranks only leaves the other ranks
     waiting there, as with any NCCL communicator (docs/hier_output_dist.md,
-    section 19). Warns, on every rank, when the team splits the GPUs of a
-    host between nodes (ranks not numbered host by host): the dist moves
-    keys and rows between those over IB, not NVLink."""
+    section 19).
+    Warns, on every rank, when the team splits the GPUs of a host between
+    nodes (ranks not numbered host by host): the dist moves keys and rows
+    between those over IB, not NVLink."""
     group = dist.group.WORLD if pg is None else pg
     ranks = tuple(dist.get_process_group_ranks(group))
     if ranks not in _NODE_SIZES:
         _NODE_SIZES[ranks] = _read_node_size(group)
-    size, why = _NODE_SIZES[ranks]
+    size, why, unlinked = _NODE_SIZES[ranks]
     if why is not None:
-        raise RuntimeError(why)
+        raise (NVLinkCheckError if unlinked else RuntimeError)(why)
     return size
 
 
 def _read_node_size(
     group: dist.ProcessGroup,
-) -> Tuple[Optional[int], Optional[str]]:
-    """:func:`node_size`'s read on ``group``, collective: (size, None), or
-    (None, why not), the same on every rank. Warns, on every rank, when the
-    nodes split a host (:func:`_split_host`)."""
+) -> Tuple[Optional[int], Optional[str], bool]:
+    """:func:`node_size`'s read on ``group``, collective: (size, None, False),
+    or (None, why not, whether the NVLink check refused the node:
+    :func:`_first_unlinked`), the same on every rank. Warns, on every rank,
+    when the nodes split a host (:func:`_split_host`)."""
     import dynamicemb_extensions
 
     rank, world_size = dist.get_rank(group), dist.get_world_size(group)
@@ -155,20 +186,30 @@ def _read_node_size(
     dist.all_gather_object(every, (unique_id, why), group=group)
     why = _first_failure([theirs for _, theirs in every])
     if why is not None:
-        return None, why
+        return None, why, False
     try:
         size, why = probe(every[0][0], rank, world_size), None
     except RuntimeError as err:
         size, why = None, str(err)
-    dist.all_gather_object(every, (size, why, socket.gethostname()), group=group)
-    why = _first_failure([theirs for _, theirs, _ in every])
+    # With its team, each rank's host and its GPU's NVLinks, which decide
+    # whether NVLink connects the GPUs of each node.
+    dist.all_gather_object(
+        every, (size, why, socket.gethostname(), _gpu_links()), group=group
+    )
+    why = _first_failure([theirs for _, theirs, _, _ in every])
     if why is not None:
-        return None, why
-    size, why = _agreed_node_size([size for size, _, _ in every], world_size)
-    split = None if size is None else _split_host([host for _, _, host in every], size)
+        return None, why, False
+    size, why = _agreed_node_size([size for size, _, _, _ in every], world_size)
+    if why is not None:
+        return None, why, False
+    hosts = [host for _, _, host, _ in every]
+    why = _first_unlinked([links for _, _, _, links in every], hosts, size)
+    if why is not None:
+        return None, why, True
+    split = _split_host(hosts, size)
     if split is not None:
         warnings.warn(split)
-    return size, why
+    return size, None, False
 
 
 def _first_failure(whys: Sequence[Optional[str]]) -> Optional[str]:
@@ -217,6 +258,146 @@ def _split_host(hosts: Sequence[str], size: int) -> Optional[str]:
                 "numbered host by host, as many on every host, keep a host in "
                 "one node (docs/hier_output_dist.md, section 4.2)"
             )
+    return None
+
+
+class _GpuLinks(NamedTuple):
+    """What NVML says of a rank's GPU (:func:`_gpu_links`): its PCI address
+    (domain, bus, device); those of the GPUs its active NVLinks reach
+    directly (an NVLink bridge, or a mesh); whether an active NVLink reaches
+    an NVSwitch; and, once the GPU joined an NVLink fabric (MNNVL), the
+    fabric's cluster UUID and the GPU's clique in it, which NCCL reads to
+    make one node of several hosts."""
+
+    pci: Tuple[int, int, int]
+    gpus: FrozenSet[Tuple[int, int, int]]
+    switch: bool
+    clique: Optional[Tuple[bytes, int]]
+
+
+def _gpu_links() -> Tuple[Optional[_GpuLinks], Optional[str]]:
+    """This rank's GPU as NVML (nvidia-ml-py's ``pynvml``) gives it:
+    (links, None), or (None, why not). It never raises: :func:`_read_node_size`
+    calls it between two all-gathers, and a rank that raised would leave the
+    others waiting in the second."""
+    try:
+        import pynvml
+    except ImportError:
+        return None, "nvidia-ml-py (pynvml) is not installed"
+    try:
+        uuid = torch.cuda.get_device_properties(torch.cuda.current_device()).uuid
+        pynvml.nvmlInit()
+    except Exception as err:  # never raises: see the docstring
+        return None, str(err)
+    try:
+        handle = pynvml.nvmlDeviceGetHandleByUUID(f"GPU-{uuid}")
+        pci = pynvml.nvmlDeviceGetPciInfo(handle)
+        gpus, switch = set(), False
+        for link in range(pynvml.NVML_NVLINK_MAX_LINKS):
+            try:
+                if (
+                    pynvml.nvmlDeviceGetNvLinkState(handle, link)
+                    != pynvml.NVML_FEATURE_ENABLED
+                ):
+                    continue
+                kind = pynvml.nvmlDeviceGetNvLinkRemoteDeviceType(handle, link)
+                if kind == pynvml.NVML_NVLINK_DEVICE_TYPE_GPU:
+                    peer = pynvml.nvmlDeviceGetNvLinkRemotePciInfo(handle, link)
+                    gpus.add((peer.domain, peer.bus, peer.device))
+                elif kind != pynvml.NVML_NVLINK_DEVICE_TYPE_IBMNPU:
+                    switch = True  # an NVSwitch, or an end NVML does not name
+            except pynvml.NVMLError:  # past the GPU's links, or no NVLink at all
+                continue
+        links = _GpuLinks(
+            (pci.domain, pci.bus, pci.device),
+            frozenset(gpus),
+            switch,
+            _fabric_clique(pynvml, handle),
+        )
+        return links, None
+    except Exception as err:  # never raises: see the docstring
+        return None, str(err)
+    finally:
+        with contextlib.suppress(Exception):
+            pynvml.nvmlShutdown()
+
+
+def _fabric_clique(pynvml, handle) -> Optional[Tuple[bytes, int]]:
+    """The NVLink fabric's cluster UUID and the GPU's clique in it, once the
+    GPU's registration with the fabric completed, as NCCL reads them for
+    MNNVL; None without a fabric, or where nvidia-ml-py or the driver
+    cannot tell."""
+    info_type = getattr(pynvml, "c_nvmlGpuFabricInfoV_t", None)
+    read = getattr(pynvml, "nvmlDeviceGetGpuFabricInfoV", None)
+    if info_type is None or read is None:  # an nvidia-ml-py without it
+        return None
+    info = info_type()
+    try:
+        read(handle, ctypes.byref(info))
+    except pynvml.NVMLError:
+        return None
+    cluster = bytes(info.clusterUuid)
+    if (
+        info.state != pynvml.NVML_GPU_FABRIC_STATE_COMPLETED
+        or info.status != pynvml.NVML_SUCCESS
+        or not any(cluster)
+    ):
+        return None
+    return cluster, int(info.cliqueId)
+
+
+def _nvlinked(first: _GpuLinks, second: _GpuLinks, one_host: bool) -> bool:
+    """Whether NVLink connects two GPUs: one clique of an NVLink fabric
+    (MNNVL, across hosts too), or on one host an NVLink between them, or
+    from each to an NVSwitch."""
+    if first.clique is not None and first.clique == second.clique:
+        return True
+    return one_host and (
+        second.pci in first.gpus
+        or first.pci in second.gpus
+        or (first.switch and second.switch)
+    )
+
+
+def _pci_name(pci: Tuple[int, int, int]) -> str:
+    domain, bus, device = pci
+    return f"{domain:04x}:{bus:02x}:{device:02x}.0"
+
+
+def _first_unlinked(
+    every: Sequence[Tuple[Optional[_GpuLinks], Optional[str]]],
+    hosts: Sequence[str],
+    size: int,
+) -> Optional[str]:
+    """The first two ranks of a node (``size`` consecutive ranks) whose GPUs
+    NVLink does not connect, or the first rank that could not read its GPU's
+    NVLinks when nodes have more than one GPU, in words; or None.
+    ``every``: each rank's :func:`_gpu_links`, in rank order; ``hosts``:
+    each rank's host name."""
+    if size == 1:
+        return None  # nothing moves inside a node of one GPU
+    for rank, (links, why) in enumerate(every):
+        if links is None:
+            return f"rank {rank} could not read its GPU's NVLinks from NVML: {why}"
+    for start in range(0, len(every), size):
+        for first in range(start, start + size):
+            for second in range(first + 1, start + size):
+                one_host = hosts[first] == hosts[second]
+                if _nvlinked(every[first][0], every[second][0], one_host):
+                    continue
+                where = (
+                    f"PCI {_pci_name(every[first][0].pci)} and "
+                    f"{_pci_name(every[second][0].pci)} of host {hosts[first]}"
+                    if one_host
+                    else f"of hosts {hosts[first]} and {hosts[second]}, in no "
+                    "NVLink clique together"
+                )
+                return (
+                    f"NVLink does not connect the GPUs of ranks {first} and "
+                    f"{second} ({where}), which NCCL's LSA team puts in one "
+                    "node: the dist moves a node's keys and rows over NVLink "
+                    "alone (docs/hier_output_dist.md, section 4.2)"
+                )
     return None
 
 
@@ -428,7 +609,9 @@ class HierDist:
         A configuration it refuses (a ``continuous`` table among them, or
         clipping without ``index_dedup``) raises ValueError under
         ``"hierarchical"`` and takes TorchRec's dists with a warning under
-        ``"auto"``. If a rank cannot read the node or build the operator,
+        ``"auto"``. So do GPUs of a node that NVLink does not connect
+        (:func:`node_size`), but with :class:`NVLinkCheckError`, a
+        RuntimeError. If a rank cannot read the node or build the operator,
         every rank warns and takes TorchRec's dists, but for an NCCL error
         inside a communicator's initialization on some ranks only, which
         leaves the others waiting there. See docs/hier_output_dist.md,
@@ -444,13 +627,21 @@ class HierDist:
 
         self.takes_hier_dist = False
         # The node: NCCL's LSA team on the sharding's ranks, which the
-        # operator's own communicator gets too (its LSA check). Every rank
-        # reads the same, or every rank raises alike, but for an NCCL error
-        # inside the initialization of node_size's communicator on some
-        # ranks only, which leaves the others waiting there.
+        # operator's own communicator gets too (its LSA check), and whose GPUs
+        # NVLink connects. Every rank reads the same, or every rank raises
+        # alike, but for an NCCL error inside the initialization of
+        # node_size's communicator on some ranks only, which leaves the
+        # others waiting there.
         try:
             local_size = node_size(self._pg)
         except RuntimeError as err:
+            # GPUs of a node that NVLink does not connect: "hierarchical"
+            # raises, on every rank alike, as for a configuration it refuses.
+            if isinstance(err, NVLinkCheckError) and self._asked == "hierarchical":
+                raise NVLinkCheckError(
+                    f'output_dist="hierarchical": {err}; set output_dist to '
+                    '"auto", which takes TorchRec\'s dists there, or to "torchrec"'
+                ) from None
             warnings.warn(
                 f'output_dist="{self._asked}": {err}; using TorchRec\'s dists'
             )

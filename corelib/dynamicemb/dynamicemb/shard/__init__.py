@@ -43,13 +43,14 @@ from .embeddingbag import (
     DynamicEmbeddingBagCollectionSharder,
     ShardedDynamicEmbeddingBagCollection,
 )
-from .hier_output_dist import node_size, quiesce
+from .hier_output_dist import NVLinkCheckError, node_size, quiesce
 
 __all__ = [
     "ShardedDynamicEmbeddingCollection",
     "DynamicEmbeddingCollectionSharder",
     "ShardedDynamicEmbeddingBagCollection",
     "DynamicEmbeddingBagCollectionSharder",
+    "NVLinkCheckError",
     "node_size",
     "quiesce",
 ]
