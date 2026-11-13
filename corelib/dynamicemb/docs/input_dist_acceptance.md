@@ -1,0 +1,150 @@
+# Issue #459 acceptance and code review evidence
+
+Review date: 2026-11-13. Decision: **Needs Fixes / validation before merge; #459 is not accepted as complete.** See the [full RFC](input_dist_indices_design.md) for contracts and alternatives, and [machine-readable evidence](../benchmark/input_dist_review_results.json) for samples, source digests, log hashes and profiler summaries. This report distinguishes fixed reproducible defects, unverified deployment risks and design tradeoffs.
+
+## Baselines and environment
+
+The original PR was `7ef51667b75d9e498776ee9c4a29426828282d7c` on main `476cdc01`. Review incorporated #528 (`d53b9c8`), then #550/#553 through current main `8accb875333f82a9446877ec929f53ed42a283b7`. In particular, the #553 NVLink checks are preserved. The transport C++ sources did not change between d53 and 8acc; both compiled extensions were rebuilt from those current sources, rather than reusing the original PR's incompatible extension. Runtime snapshots pair production Python, the correct extension ABI and matching JIT fatbins; their SHA-256 manifests identify what tests imported.
+
+Hardware: four RTX PRO 6000 Blackwell Server Edition GPUs (SM120), driver 580.126.09, one shared Linux host. `nvidia-smi topo -m` reports PCIe NODE/SYS connections, no NVLink. Runs use GPU subsets and may contend with other jobs; they are not physical multi-node tests.
+
+| Environment | Exact stack / configuration | Limits |
+| --- | --- | --- |
+| P: compatible older stack | Python 3.12, PyTorch 2.7.0+cu128, TorchRec 1.2.0, FBGEMM 1.2.0+cu128, CUDA 12.8, NCCL 2.28.9 preload; extension without hierarchical ops | Two-rank tests disable P2P/IB and cuMem host allocation and use loopback; tracker API is absent |
+| T: target dependency validation | Python 3.12, PyTorch 2.13.0+cu130, TorchRec `v1.8.0-rc1` commit `0ea0ec0` (package 1.8.0+0ea0ec0), official FBGEMM 1.8.0+cu130 wheel pinned by docker/Dockerfile; CUDA 13.0.88 compiler, newer CCCL headers, NCCL 2.30.7 headers/extension/preload | Private clean venv, not the complete NGC 26.07 container; no Docker executable. PyTorch's dependency/compiled NCCL version remains 2.29.7, and both library paths can be mapped. `ncclGetVersion` on the preloaded symbols reports 23007. This must not be described as a certified single-NCCL container |
+
+The target venv includes nvidia-ml-py 13.615.71, so final topology refusal is based on actual NVML links, not a missing dependency. An initial score-script attempt lacked `click`; installing it allowed the actual distributed score checks to run. The first hierarchical-script attempt lacked torch/lib in `LD_LIBRARY_PATH` and failed importing libc10; later scripts include that path. These setup failures are not functional test passes or code defects.
+
+## Confirmed findings, ordered by impact
+
+All source paths below are relative to `corelib/dynamicemb`. The original-code negative controls and final regression results are retained separately. A fixed finding is not an outstanding blocker.
+
+| Severity / disposition | Trigger and code evidence | Actual effect / minimal repair | Required regression |
+| --- | --- | --- | --- |
+| Blocking correctness, fixed | Original [`PrefetchState`](https://github.com/WEIXILIN0307/recsys-examples/blob/7ef51667b75d9e498776ee9c4a29426828282d7c/corelib/dynamicemb/dynamicemb/batched_dynamicemb_function.py#L193) and [`DynamicEmbeddingFunction`](../dynamicemb/batched_dynamicemb_function.py#L205) had no abandoned pin owner. Resolve an HBM/cache input and drop it, or drop its output graph without backward | Both original layouts retained 32 pins. Cache capacity/erase/eviction cannot reclaim those identities. Add an independently owned idempotent lease with stream-ordered finalization; defer GC releases outside a held table gate | `test_abandoned_pinned_batch_releases_rows`, `test_discard_retained_graph_releases_rows`, `test_cancellation_inside_table_gate_defers_cleanup` |
+| Blocking correctness, fixed; inherited from main too | [Original backward](https://github.com/WEIXILIN0307/recsys-examples/blob/7ef51667b75d9e498776ee9c4a29426828282d7c/corelib/dynamicemb/dynamicemb/batched_dynamicemb_function.py#L1394) unconditionally called `release_slot_pins`. Backward the same custom Function twice with `retain_graph=True` on the first call | Original #551 and unmodified d53 main reached 0 pins after the first backward and -32 after the second. Hold the reservation for retained graphs and release once after final use; record retained backward's last GPU use for cancellation | `test_retained_backward_observes_intervening_update`, `test_retained_backward_cancelled_on_another_stream_waits_for_update` |
+| Blocking integration, fixed | #528 [`HierDist.finish` / ownership transfer](../dynamicemb/shard/hier_output_dist.py#L814) registers output ownership by KJT identity; resolving creates another object. Its `output_alloc` may supply a mapped shared window | A naive merge loses window ownership or sends wrong row order/gradients. Preserve completion status ordering, rebind ownership, honor allocator and pass row map to gradient reduction. An ordinary in-place window copy also produced a real autograd shared-view RuntimeError across two groups; use the existing externally owned raw-window write contract | `test_hier_receiver_completion_contract`, `test_output_allocator_preserves_values_and_gradient_rows`, `test_shared_output_window_accepts_multiple_lookup_groups`; supported-hardware communication CI still pending |
+| Should-fix correctness, fixed | [Original native wrapper](https://github.com/WEIXILIN0307/recsys-examples/blob/7ef51667b75d9e498776ee9c4a29426828282d7c/corelib/dynamicemb/dynamicemb/shard/input_dist.py#L225) appended receiver callbacks without caching; TorchRec `Awaitable.wait()` reruns callbacks | Waiting the same request again re-prepared/pinned rows. Cache the successful resolved result and attach the callback once while preserving native tensors-awaitable metadata | `test_native_receiver_resolution_runs_once`, which fails on original #551 |
+| Should-fix compatibility, fixed | [Original table forward](https://github.com/WEIXILIN0307/recsys-examples/blob/7ef51667b75d9e498776ee9c4a29426828282d7c/corelib/dynamicemb/dynamicemb/batched_dynamicemb_tables.py#L1397) rejected a train/eval mode difference between input_dist and compute | Valid pipeline mode transitions raised `Module mode changed after input_dist resolved the batch`. Consume/release training-prepared rows in eval, and prepare fresh state for eval-to-training or recomputation | `test_resolved_batch_train_eval_transition`, `test_recomputed_resolved_batch_owns_separate_state` |
+| Should-fix observability/optimizer integration, fixed | [Native grouped lookup observer](../dynamicemb/shard/rw_sharding.py#L154) passed the resolved KJT to registered optimizer/model tracker | Tracker received physical row IDs as keys; original PR fails the new test on TorchRec 1.5. Reconstruct original local key identities only for observers | `test_optimizer_tracker_observes_original_keys`; final positive on target TorchRec 1.8, explicit skip on 1.2 |
+| Should-fix failure cleanup, fixed | [Later kernel-group resolution](../dynamicemb/shard/rw_sharding.py#L241) raises after an earlier group took pins | Release states already prepared by that receiver operation. Completed backend mutation is not rolled back | `test_later_group_resolution_failure_releases_earlier_pins` |
+| Should-fix recovery, fixed; inherited cache logic | [Cache capacity rejection](../dynamicemb/batched_dynamicemb_function.py#L1051) incremented `_prefetch_outstanding_keys` before checking the limit | A real rejected third reservation left 12288 outstanding instead of 8192; releasing the two successful batches could not return the rejected reservation. Check before incrementing; no rollback API is introduced | L `test_rejected_cache_reservation_can_recover`, failed before the fix |
+| Outstanding performance / acceptance issue | Current-main imported-checkout A/B with identical resident inputs and target stack | SparseDist training is 17.871 ms versus main 15.537 ms (+15.0%); opaque-storage overlap is substantially more expensive. The PR does not yet meet the user's requirement to preserve performance | Improve the measured bottlenecks or obtain an explicit maintainer decision on acceptable workload/overhead, then rerun the complete benchmark |
+
+The lease/gate cancellation and output-copy defects were found while implementing the integration, and repaired before publication. They are not misrepresented as behaviors of original #551, which did not contain #528. The generic Storage snapshot path already had weak ownership and full-key matching; this review did not invent a new backend API or replace it with an unproven concurrency mechanism.
+
+## Executable acceptance matrix
+
+Run commands from `corelib/dynamicemb` in an installed compatible build. `U` below is `test/unit_tests/test_input_dist_indices.py`, `L` is `test/unit_tests/test_resolved_lifecycle.py`; a named test is executable as `python -m pytest U::test_name -q` with the actual file path substituted. A two-GPU invocation is `torchrun --standalone --nproc_per_node=2 -m pytest U -q -rs`. Results are suite evidence, not an assertion that every Cartesian product of options was run.
+
+| #459 condition and observable acceptance criterion | Main code location | Executable test | Environment / result / remaining scope |
+| --- | --- | --- | --- |
+| 1. Resolution has finished before lookup; first compute performs no hash/backend key lookup | `shard/input_dist.py`, `shard/rw_sharding.py`, `batched_dynamicemb_compute_kernel.py` | U `test_input_dist_resolves_before_lookup` | P/T one/two GPUs; all six layouts, dedup flags, int32/int64, stream transition and fused-awaitable wrapper; passed |
+| 2. Lookup reuses native TorchRec operations with correct indices | `torchrec_lookup.py`, `shard/resolved_input.py` | U `test_pooled_lookup_and_update_match_unsharded_torchrec`; L `test_single_persistent_matrix_uses_physical_rows` | Compact and single persistent matrix paths; SGD/Adam and FP32/FP16/BF16 direct path passed |
+| 3. Evicted physical rows initialize embedding and moments for the new key | `_prefetch_hbm_direct_path`, `_prefetch_cache_path` in `batched_dynamicemb_function.py` | U `test_eviction_reinitializes_reused_value_rows_and_adam_state` | Real GPU eviction with an assertion that row reuse actually occurred; passed; not an artificial slot-number-only test |
+| 4. Rehash does not invalidate value-row identity or ref-counter release | `refresh_slots_after_rehash`, `_PinnedRowLease` | U `test_expansion_and_out_of_order_batches`; existing `test_no_grad_release_after_rehash_by_a_later_prefetch` | Passed; full table suite also exercises expansion and non-evicting row capacity |
+| 5. All backends preserve current values and optimizer state across overlapping input resolution and arbitrary backward order | `resolved_storage.py`, DEFAULT update/write-through in `batched_dynamicemb_function.py` | U `test_prefetched_batch_reads_updates_from_previous_batch`, `test_in_flight_batches_share_current_optimizer_state` | HBM/cache/host/hybrid/PyDict PS/cache+PS, SGD/Adam, both backward orders and dropped input owners; passed |
+| 6. Finite backing-store eviction cannot discard an in-flight update | `_StorageWithActiveRows.find`, `ActiveStorageRows.publish` | U `test_pending_rows_survive_backing_store_eviction` | Host/hybrid/PyDict PS interfaces; passed; remote PS durability/consistency is not certified |
+| 7. Full key identity and table identity survive matching | `matching_rows` | U `test_live_row_matching_keeps_table_and_full_key_identity` | Signed/unsigned 64-bit identities and same key in different tables; passed |
+| 8. Non-admitted temporary rows produce output but no persistent optimizer write | `_apply_admission`, persisted-row selection | U `test_non_admitted_rows_survive_input_dist`; existing weighted/no-grad suites | Passed; direct matrix adapter intentionally falls back to scratch workspace for rejected rows |
+| 9. Dedup frequency and score semantics stay intact | segmented uniqueness, `shard/input_dist.py`, unchanged hier transport | U `test_optimizer_and_score_parity_with_legacy`; `per_key_score/test_per_key_score_dist.py` | Target two-rank score checks passed, including eval, dump/load and pipeline reconstruction; precise scores remain unsupported on the existing Host/Hybrid/PS-only combinations |
+| 10. Successful receiver completion is idempotent | `_ResolveOnce`, `_PostprocessedSplitsAwaitable`, `HierKJTAwaitable` | U `test_native_receiver_resolution_runs_once`, `test_hier_receiver_completion_contract` | Native real communication and hierarchical supplied-result receiver test passed; the latter is not a transport test |
+| 11. Hierarchical overflow is checked before backend mutation and preserves later valid calls | `HierDist.finish`, `HierKJTAwaitable` | U `test_hier_receiver_completion_contract[True]`; `test_hier_overflow.py` | Receiver status-before-resolution passed with supplied GPU tensors; full supported-hardware overflow/next-call matrix not run on current main |
+| 12. Output windows and row maps route forward and gradients, including multiple groups and eval | `place_lookup_output`, `reduce_grads(grad_rows=...)`, `HierDist.rebind_input` | L allocator/shared-window tests; U hierarchical completion test | Real GPU window views/permutation, varied row gradients, all four local layouts and two groups passed; NVLink/GIN transport placement still needs CI |
+| 13. Native fallback, score fallback and topology refusal keep row preparation | `shard/rw_sharding.py`, #553 `HierDist.setup` | U `test_output_dist_selection_keeps_receiver_resolution`, `test_hierarchical_refuses_unlinked_topology_before_resolution`; `test_hier_pipeline.py --core` | Actual two-rank PCIe auto fallback and explicit hierarchical refusal passed; one-rank fallback passed; no forced topology override |
+| 14. Pipelined split fusion cannot drop callback/state or change collective ordering | `_key_dist` in RW/TW-RW input dists | U `test_native_sparse_dist_pipeline`, `test_native_pooled_pipeline`, fused-awaitable cases | Native SparseDist and prefetch pipelines passed on P/T; per-key scores preserved; fusion opt-out cost remains |
+| 15. Original output indices and observer keys remain keys | sequence output context, `original_features`, tracker wrapper | U `test_input_dist_resolves_before_lookup`, `test_optimizer_tracker_observes_original_keys` | `need_indices=True` and target tracker passed; old TorchRec tracker is unavailable, not silently tested |
+| 16. Multiple kernel groups, mixed static/dynamic groups and feature processing retain their contracts | `_DynamicLookupMixin`, `ResolvedEmbeddingInput.split` | U mixed-group and `test_feature_processing_precedes_resolution_and_runs_once`, `test_feature_processor_preserves_no_grad_contract` | Passed; invalid learned pooling-weight gradient remains an explicit error |
+| 17. Cancellation/exception releases resources once without recycling metadata used on another stream | `_PinnedRowLease`, `TableAccessGate`, `PrefetchState.record_stream` | L cancellation/retained/gate tests; U storage cancellation and later-group failure | Actual CUDA delayed-copy/cancellation stress and GC passed; arbitrary concurrent host-thread forwards are not a supported claim |
+| 18. Retained backward, recomputation and mode changes do not share a consumed lease | table forward + final-backward release | L retained/mode/recompute tests | HBM/cache/host/hybrid, both backward orders and SUM/NONE modes passed |
+| 19. Eval resolves through all tiers without mutation; cold restore preserves RNG | `dynamicemb_resolve_eval`, `eval_lookup`, meta construction | U `test_host_and_evaluation_resolve_rows`, `test_cold_lookup_after_restore_preserves_rng`; full table train/eval | Passed on interface backends; live network PS not exercised |
+| 20. Low precision, weighted pooling and mixed dimensions preserve accumulation/update | `torchrec_lookup.py`, unchanged DynamicEmb optimizer kernels | U low-precision pooling tests, `test_half_pooling_keeps_finite_fp32_output`; `test_weighted_pooled_embedding_v2.py` | FP32 accumulation and requested output casts passed; SGD/Adam direct matrix with all three float dtypes passed |
+| 21. Raw table and FIFO prefetch APIs remain usable | table `prefetch`, `forward`, grouped `_prefetch_raw` | U `test_raw_grouped_prefetch_keeps_legacy_contract`, `test_legacy_prefetch_owns_rows_until_forward`; full table suite | Passed on compatible/target suites; FIFO intentionally owns unconsumed batches until consumed or destroyed |
+| 22. TW-RW pooled sharding keeps gradient scaling and empty-group behavior | `shard/twrw_sharding.py` | `test_table_row_wise.py --node-size 1 --mode grad --dist-type hash_roundrobin` | Target two GPUs/two emulated nodes and four GPUs/two emulated nodes: passed (-0.05 and -0.025 updates respectively); physical multi-node execution remains untested |
+| 23. Async erase still orders table access and spares pinned rows | original gate/erase plus deferred cleanup scope | `erase_async/test_async_erase.py`, `erase_async/test_erase_end_to_end.py` | Combined target table/lifecycle/erase run: 465 passed, 4 skipped before final DEFAULT fast-path/import-only edits; targeted final lifetime/native suites passed afterward |
+| 24. Complete current-main and implementation regression results are separate | Full table suite and source manifests | `python -m pytest test/test_batched_dynamic_embedding_tables_v2.py -q` | See final run ledger below; do not substitute historical 476 results |
+| 25. No unacceptable regression in complete training or backend overlap cost | `benchmark_resolved_lookup.py` | Commands below and profiler traces | Not satisfied: measured regression and missing production/NVLink workloads; optimization acceptance remains open |
+
+## Commands and run ledger
+
+Use the installed ABI that matches the imported Python package. The local review used isolated runtime copies because the ignored extension in the source checkout belonged to the old pre-#528 ABI. Reproduction in a correctly rebuilt installation does not require that staging helper.
+
+```bash
+# Focused one-GPU correctness/lifecycle matrix
+python -m pytest test/unit_tests/test_input_dist_indices.py test/unit_tests/test_resolved_lifecycle.py test/unit_tests/test_weighted_pooled_embedding_v2.py test/unit_tests/test_no_grad_slot_lifetime.py -q -rs
+# Real two-rank native receiver, storage, score, pipeline and fallback matrix
+torchrun --standalone --nproc_per_node=2 -m pytest test/unit_tests/test_input_dist_indices.py -q -rs
+torchrun --standalone --nproc_per_node=2 test/unit_tests/per_key_score/test_per_key_score_dist.py
+# Full existing tables and async erase, run as separate jobs to avoid fixed test ports
+python -m pytest test/test_batched_dynamic_embedding_tables_v2.py -q
+python -m pytest test/unit_tests/erase_async/test_async_erase.py test/unit_tests/erase_async/test_erase_end_to_end.py -q
+# TW-RW: the test sets node size internally; torchrun otherwise overwrites LOCAL_WORLD_SIZE
+torchrun --standalone --nproc_per_node=2 test/unit_tests/test_table_row_wise.py --node-size 1 --mode grad --dist-type hash_roundrobin
+# Supported NVLink hardware, and separately physical multi-node infrastructure, still required
+bash test/unit_tests/test_hier_dist.sh
+bash test/unit_tests/test_hier_overflow.sh
+bash test/unit_tests/test_hier_pipeline.sh --core
+bash test/unit_test.sh hier_fwd_bwd
+bash test/unit_test.sh hier_load_dump
+```
+
+| Final / bounded run | Source snapshot | Actual result |
+| --- | --- | --- |
+| Unmodified main 8acc, target full table suite | `main-target-8acc` | 391 passed, 4 skipped |
+| PR, isolated target full table suite | `feature-target-r5` | 391 passed, 4 skipped; before final capacity-rejection-only change |
+| Final target focused + lifecycle + weighted/no-grad | `feature-target-r6` | 397 passed, 5 skipped |
+| Final older-stack focused + lifecycle + weighted/no-grad | `feature-primary-r6` | 396 passed, 6 skipped |
+| Target two-rank focused | `feature-target-r4` | 292 passed, 4 skipped per rank |
+| Older-stack two-rank focused | `feature-primary-r4` | 290 passed, 6 skipped per rank |
+| Earlier target tables + lifecycle + async erase | `feature-target-final` | 465 passed, 4 skipped; bounded by its source manifest |
+| Target per-key score script | `feature-target-r4` | Passed, exit 0 |
+| Target TW-RW gradient, two then four GPUs | `r4`, `r5` | Both passed, exit 0; emulated nodes |
+| Target one-rank fallback; older-stack two-rank no-hierarchical fallback/pipeline | `r4`, `r5` | Both ALL PASSED, exit 0 |
+
+The initial parallel PR full-table attempt had 43 checkpoint failures (`EADDRINUSE` on fixed port 29500), 348 passes and four skips. A separate diagnostic reproduced that port error. After the main job exited, an isolated full rerun passed 391/4 without changing the tests' port. These are separate recorded runs, not a synthesized green result. Final r6 differs from r5 by the three-line cache reservation precheck/recovery fix, exercised by the new negative/positive regression and both final focused matrices; the complete table suite was not rerun after that final conditional fix. R4 performance samples precede only unused-import cleanup and this rejection fix and are labeled by their actual source.
+
+Final run ledger is generated from the retained logs in the machine-readable evidence. Current results include target focused 397 passed/5 skipped; target two-rank 292 passed/4 skipped per rank; older-stack focused 396 passed/6 skipped; older-stack two-rank 290 passed/6 skipped per rank. The four common skips are existing precise-score/storage restrictions. The extra older-stack skips are tracker unavailability and no hierarchical-enabled multi-rank topology test. Single-rank target skips the multi-rank refusal test. A target one-rank hierarchical pipeline fallback, older-stack two-rank no-hierarchical-build fallback/pipeline, and the target two-rank score script passed. Final one-GPU suite counts include the cache-reservation recovery regression.
+
+The pre-#553 d53 hierarchical experiment ran the real extension on two PCIe GPUs and, after correcting the observer to reconstruct keys, matched forward, per-key gradients, table values, LFU/admission and eval in its cases. The old transport-only synchronization assertions were split from newly moved row-resolution work, with resolution syncs reported separately. A run excluding the isolated standalone timeout-teardown printed ALL PASSED, explicitly with that one stage skipped. The timeout-teardown hung on unmodified d53 main too. Latest main now refuses this PCIe topology. These observations are diagnostic evidence, not a supported-hardware hierarchical pass; current-main NVLink/GIN overflow, pipeline overlap, window reuse and teardown remain validation gates.
+
+## Profiling and performance
+
+Run the same command in complete main and PR installations, with identical GPU/dependency settings. `--lookup default` measures each installation's actual data flow; `--lookup both` is only an adapter A/B and must not be labeled a complete-main baseline.
+
+```bash
+# Raw training, one table / 128 features, resident working set
+python benchmark/benchmark_resolved_lookup.py --lookup default --train --layout hbm --features 128 --warmup 20 --iterations 100 --trials 8 --profile-steps 5 --profile-dir /tmp/dynamicemb-profile
+# ActiveStorageRows: compare zero and two outstanding batches, host then hybrid
+python benchmark/benchmark_resolved_lookup.py --lookup default --train --layout host --prefetch-depth 2 --features 128 --warmup 20 --iterations 100 --trials 8 --profile-steps 5 --profile-dir /tmp/dynamicemb-host-profile
+# Complete SparseDist training, dense MLP + sparse optimizer included
+torchrun --standalone --nproc_per_node=2 benchmark/benchmark_resolved_lookup.py --lookup default --pipeline sparse --features 128 --warmup 20 --iterations 100 --trials 8 --profile-steps 5 --profile-dir /tmp/dynamicemb-pipeline-profile
+```
+
+All rows below use T, D=64, per-rank batch=32, hotness=4, capacity=4096, a 1024-key resident working set, twenty warmup steps and eight trials of one hundred timed steps. Profile counts cover five extra calls outside timing, with one terminal profiler synchronization. These shared-host synthetic numbers are evidence of overhead, not production estimates.
+
+| Complete workload | Main 8acc median ms | PR median ms | Main -> PR kernels in five calls | Main -> PR host-sync calls |
+| --- | ---: | ---: | ---: | ---: |
+| HBM raw training | 1.696 | 2.878 | 145 -> 155 | 11 -> 11 |
+| Cache raw training | 2.156 | 3.143 | 165 -> 175 | 16 -> 16 |
+| Host raw training, depth 0 | 2.002 | 2.745 | 185 -> 175 | 11 -> 11 |
+| Hybrid raw training, depth 0 | 2.697 | 3.447 | 245 -> 235 | 36 -> 36 |
+| Host raw training, depth 2 | 2.058 | 8.782 | 185 -> 925 | 11 -> 121 |
+| Hybrid raw training, depth 2 | 2.573 | 10.217 | 245 -> 985 | 36 -> 146 |
+| Two-rank SparseDist + dense MLP/SGD | 15.537 | 17.871 | 590 -> 600 | 71 -> 56 |
+
+The before/after local optimization profile is separately retained: pre-optimization Host depth-0 had 245 kernels/31 sync calls in five steps; the empty-live-registry fast path reduced this to 195/11, and removing identity persisted-row gathers/duplicate ranges reduced it further to 175/11. Because adjacent trials/hardware load differ, the corresponding wall-time change is not presented as an isolated causal speedup. The persistent single-matrix adapter removes the compact HBM embedding load; raw callers still compute occurrence rows, so its raw kernel count need not decrease. A multi-table/rejected-row workspace and hierarchical output copy still exist.
+
+For overlap, the added dynamic nonzero/matching/sorting/searchsorted and publishing copies are visible in the CPU/CUDA trace. Their increased kernels/synchronizations explain why fewer synchronization calls in the complete SparseDist row do not imply higher throughput. A separate warmed Host memory profile records resident allocated bytes 4,498,944 at depth 0 versus 5,580,288 at depth 2; peak allocated bytes are 14,689,280 versus 15,770,624. The depth-2 resident increase is 1,081,344 bytes. These are real PyTorch allocator readings, not total device memory. Peak allocator increments in these warmed profiles exclude pre-existing live snapshots, VMM reservations and some NCCL memory; resident/peak readings are recorded separately where collected. No network PS performance, physical multi-node GIN performance or production HSTU throughput was measured.
+
+## Remaining gates and non-blocking design choices
+
+1. **Merge/complete-issue validation gate:** run current-main native/hierarchical receiver, overflow recovery, output-window and pipeline suites on supported NVLink GPUs and physical multi-node GIN. Do not bypass #553 to obtain a green local test.
+2. **Performance gate:** reduce native adapter/split-fusion overhead and bound active-snapshot matching cost under representative overlap, or have the maintainer explicitly accept the cost. The measured regressions violate the requested performance-preservation criterion.
+3. **Deployment risk, not a proved defect:** PyDict tests validate the Storage/PS interface and finite-store eviction behavior, not remote service errors, durability, latency or third-party asynchronous buffer ownership. Run the deployment's PS integration suite before making that deployment claim.
+4. **Design choices requiring review, not speculative bugs:** compact adaptation for general backends; an extra mapped output-window copy; the split-fusion opt-out; serialized backend event chain; private PyTorch retained-graph query; no new host-thread-reentrant model API. Their invariants, costs and alternatives are explicit in the RFC.
+
+No outstanding functional defect was inferred merely from a missing experiment, and no full-repository CI pass is claimed. Historical or failed setup runs are kept distinguishable from successful final checks. This work updates existing RFC/PR bodies and commits only; it does not close any issue, change Draft state or publish GitHub comments.
+
+## Static checks
+
+Changed Python files pass Black and isort with the repository profile. Root-config autoflake retains two unused assignments in the existing full-table test, also present on main; the changed production files have no new autoflake findings. Root-command mypy reports 199 errors in 53 files on both main 8acc and this branch, with no added normalized diagnostic messages. The root mypy configuration excludes corelib, so this is not a claim of type-checking DynamicEmb. Whitespace and new-document spelling checks pass. Full repository CI is not claimed.

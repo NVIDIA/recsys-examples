@@ -990,96 +990,23 @@ so this benchmark times it in place (`--kernel_times`, `--trace`).
 
 ## 4. Resolved lookup and SparseDist pipeline A/B
 
-`benchmark_resolved_lookup.py` compares the native TorchRec adapter with the
-previous CUDA gather on HBM-backed sequence embeddings. Both arms use the new
-resolved input distribution and DynamicEmb optimizer; this isolates the lookup
-adapter rather than reproducing main's previous input distribution.
-Use `--lookup default` to time a checkout's unmodified lookup, including main,
-with the same benchmark harness. The JSON `dynamicemb_source` records which
-Python package was imported. Build the extension for the same PyTorch/CUDA ABI
-in each environment; do not mix different dependency versions in the comparison.
+`benchmark_resolved_lookup.py` measures raw-table sequence forward/training or an actual TorchRec SparseDist/prefetch pipeline with a dense MLP and SGD. Use `--lookup default` in both complete imported checkouts for a main/PR comparison. The default `--lookup both` changes only the lookup adapter to the prior CUDA gather; it is an adapter control, not a reproduction of main's input distribution.
+
+The [current review report](../docs/input_dist_acceptance.md#profiling-and-performance) contains the methodology, complete-main latency table, limitations and remaining acceptance gates. [input_dist_review_results.json](input_dist_review_results.json) records all current-main samples, source identities, environment details and CPU/CUDA profiler summaries. [resolved_lookup_results.json](resolved_lookup_results.json) is historical evidence against `476cdc01`, before #528/#550/#553; its earlier improvement percentages do not validate current main.
+
+Run in an installed compatible environment and check the emitted `dynamicemb_source` against the intended checkout. Rebuild the native extension and JIT fatbins for that checkout/ABI. Use identical hardware, CUDA/NCCL settings and dependency versions for both arms.
 
 ```bash
-# Raw table forward, then forward + fused backward/update
-python benchmark/benchmark_resolved_lookup.py --features 1 32 128
-python benchmark/benchmark_resolved_lookup.py --features 1 32 128 --train
-
-# Real sparse and prefetch pipelines, including a dense MLP and SGD
-torchrun --standalone --nproc_per_node=2 benchmark/benchmark_resolved_lookup.py \
-    --pipeline sparse --features 32 128 --iterations 30
-torchrun --standalone --nproc_per_node=2 benchmark/benchmark_resolved_lookup.py \
-    --pipeline prefetch --features 32 128 --iterations 30
-
-# Run this same command against each checkout for a complete SparseDist baseline
-torchrun --standalone --nproc_per_node=2 benchmark/benchmark_resolved_lookup.py \
-    --lookup default --pipeline sparse --features 128 \
-    --warmup 20 --iterations 120 --trials 8
+# HBM component comparison, including backward
+python benchmark/benchmark_resolved_lookup.py --lookup default --train --layout hbm --features 128 --warmup 20 --iterations 100 --trials 8 --profile-steps 5 --profile-dir /tmp/hbm-profile
+# Cache, Host and Hybrid; overlap depth is for raw training only
+python benchmark/benchmark_resolved_lookup.py --lookup default --train --layout host --prefetch-depth 2 --features 128 --warmup 20 --iterations 100 --trials 8 --profile-steps 5 --profile-dir /tmp/host-profile
+# Complete two-rank SparseDist training
+torchrun --standalone --nproc_per_node=2 benchmark/benchmark_resolved_lookup.py --lookup default --pipeline sparse --features 128 --warmup 20 --iterations 100 --trials 8 --profile-steps 5 --profile-dir /tmp/pipeline-profile
 ```
 
-Defaults are one table, D=64, per-rank batch=32, hotness=4, capacity=4096,
-and a resident working set of at most 1024 keys. Inputs are already on GPU;
-data loading and CPU transfers are excluded. Pipeline mode trains a two-layer
-dense MLP on the sequence rows and includes backward and optimizer updates.
-`--warmup`, `--iterations`, `--trials`, `--batch-size`, `--hotness`, and `--dim`
-control the workload. Run both arms on the same devices.
+`--layout` accepts `hbm`, `cache`, `host`, `hybrid`. `--pipeline` accepts `none`, `sparse`, `prefetch`; `--train` enables raw-table backward. `--prefetch-depth` retains that many extra raw training batches, exercising active Storage snapshots; compare 0 and 2 before increasing depth. `--output-dist` accepts `torchrec`, `auto`, `hierarchical`, with `--output-capacity` for hierarchical planning. Explicit hierarchical measurements require the topology/build supported by current main; do not bypass its NVLink checks.
 
-Trials alternate execution order, synchronize all GPU work around each sample,
-and report wall time per step. Multi-rank samples report the maximum across
-ranks. Output includes JSON samples and medians; final outputs/losses are checked
-for agreement in A/B mode and all pipeline batches are drained outside the timed
-interval.
-Uniform-dimension lookup batches all features into one native lookup, but fixed
-adapter overhead remains. The adapter supplies the existing JT/offsets through
-KJT's public constructor cache and rebinds frozen scratch parameters without
-registering new parameters each batch. A single resolved kernel group is returned
-directly instead of copying it into a wrapper. Report component and pipeline
-results separately; neither this synthetic MLP nor a lookup-only speedup
-establishes production model throughput. The earlier H100 figures are historical
-benchmarks, not measurements of this adapter.
+Profile steps run outside the timed trials and export Chrome traces, CPU/CUDA operator aggregates, memcpy/synchronization/kernel counts, and allocator peak increments. Resident/peak allocator totals are emitted where collected; VMM and some NCCL allocations are outside that accounting. Five-call profiles include a terminal profiler synchronization. Timings exclude data loading and cold setup, include complete step/backward in training, and use the maximum rank time. This is a shared-host synthetic workload, not a production HSTU benchmark.
 
-Example local measurements on **RTX PRO 6000 Blackwell Server Edition**
-GPUs, PyTorch 2.7.0+cu128 / TorchRec 1.2.0, NCCL 2.28.9, with P2P and IB
-disabled (`NCCL_CUMEM_HOST_ENABLE=0`, `NCCL_SOCKET_IFNAME=lo`): D=64,
-per-rank batch=32, hotness=4, eight trials after 20 warmup steps. These are
-shared-machine synthetic measurements. "Before" means the resolved implementation
-before the JT cache, scratch parameter rebinding, and single-group optimizations.
-The [recorded samples](resolved_lookup_results.json) include source tree/blob
-identities, dependency versions, timing options and all trial values.
-
-Raw-table forward on one GPU, 400 steps per trial (ms/step):
-
-| Features | Before | Optimized TorchRec | Prior gather control |
-| ---: | ---: | ---: | ---: |
-| 32 | 0.829 | 0.677 | 0.523 |
-| 128 | 0.819 | 0.669 | 0.516 |
-
-The observed median decreases by about 18% from the earlier adapter; the gather
-control remains faster. A profiler capture of five warmed full forwards with
-128 features shows 28 -> 24 GPU kernels per call, eliminating the repeated
-`cumsum` and `cat`. These component results do not measure training throughput.
-
-Complete two-GPU SparseDist training, 128 features, 120 steps per trial, using
-`--lookup default` and the same harness against each complete Python checkout:
-
-| Checkout | Median (ms/step) | Sample range (ms/step) |
-| --- | ---: | ---: |
-| main (`476cdc01d1625337070d71659c9bb304c1593d8f`) | 16.33 | 15.66-17.95 |
-| Resolved implementation before optimization | 17.93 | 17.09-19.59 |
-| Optimized resolved implementation | 17.63 | 16.61-18.70 |
-
-The observed median decreases by 1.7% from before optimization, but the sample
-ranges overlap; this does not establish a stable pipeline speedup. The optimized
-implementation remains about 8% slower than main in this workload. No end-to-end
-throughput improvement over main is claimed.
-
-Two-GPU Prefetch SparseDist A/B, 120 steps per trial (ms/step):
-
-| Features | Prior gather control | Optimized TorchRec |
-| ---: | ---: | ---: |
-| 32 | 14.72 | 15.80 |
-| 128 | 16.80 | 17.34 |
-
-This last A/B shares resolved input distribution in both arms; it is not a main
-baseline. Use the emitted samples and medians to assess variance and remaining
-overhead on the target hardware and model. Cache/Storage/PS performance has not
-been measured by this HBM benchmark.
+The current PR is slower than current main in the recorded complete-training case, and Host/Hybrid overlap has substantial matching/publication overhead. No end-to-end speedup, network PS speedup or supported-hardware GIN performance claim is made. The single persistent-matrix path, empty live-registry fast path and identity persisted-row optimization reduce particular costs; judge their practical benefit from complete workload samples, not kernel counts alone.
