@@ -1,0 +1,309 @@
+{
+  "date": "2026-11-13",
+  "issue": 459,
+  "validated_base": "476cdc01d1625337070d71659c9bb304c1593d8f",
+  "optimized_source_blobs": {
+    "corelib/dynamicemb/dynamicemb/torchrec_lookup.py": "950cca7bf3783cef18e2f2af6b0f91a434096da0",
+    "corelib/dynamicemb/dynamicemb/shard/rw_sharding.py": "58b642b19e8df15693eba05d2b70075306eb7edc"
+  },
+  "environment": {
+    "nccl": "2.28.9",
+    "NCCL_P2P_DISABLE": "1",
+    "NCCL_IB_DISABLE": "1",
+    "NCCL_CUMEM_HOST_ENABLE": "0",
+    "NCCL_SOCKET_IFNAME": "lo"
+  },
+  "method": "Wall milliseconds per step, synchronized around each trial, maximum elapsed across ranks. Adapter A/B order alternates. Complete-checkout comparisons run separately on the same shared host.",
+  "limitations": [
+    "HBM sequence synthetic resident workload only; no data loading or host transfer.",
+    "Complete-checkout main baseline predates #528.",
+    "Shared-host sample ranges overlap; no stable pipeline speedup is claimed.",
+    "No Cache/Storage/PS performance or production throughput measurements."
+  ],
+  "runs": [
+    {
+      "pipeline": "none",
+      "train": false,
+      "gpu_name": "NVIDIA RTX PRO 6000 Blackwell Server Edition",
+      "torch_version": "2.7.0+cu128",
+      "torchrec_version": "1.2.0",
+      "world_size": 1,
+      "features": 32,
+      "batch_size": 32,
+      "hotness": 4,
+      "dim": 64,
+      "samples_ms": {
+        "optimized": [
+          1.012340614979621,
+          0.6959050524164923,
+          0.6772090500453487,
+          0.6708082926343195,
+          0.6776450751931407,
+          0.6767748499987647,
+          0.6746475651743822,
+          0.6782572198426351
+        ],
+        "before": [
+          0.9595016075763851,
+          0.8274149350472726,
+          0.8223761949921027,
+          0.8193237602245063,
+          1.0907770026824437,
+          0.8356377849122509,
+          0.8297539525665343,
+          0.8274310250999406
+        ],
+        "prior_gather": [
+          0.519984437560197,
+          0.5198134627426043,
+          0.5235022224951535,
+          0.5203923498629592,
+          0.526657652517315,
+          0.5216475523775443,
+          0.5239944873028435,
+          0.524203417589888
+        ]
+      },
+      "median_ms": {
+        "optimized": 0.6774270626192447,
+        "before": 0.8285924888332374,
+        "prior_gather": 0.522574887436349
+      },
+      "source": "adapter A/B on the same resolved table",
+      "warmup": 20,
+      "trials": 8,
+      "iterations": 400
+    },
+    {
+      "pipeline": "none",
+      "train": false,
+      "gpu_name": "NVIDIA RTX PRO 6000 Blackwell Server Edition",
+      "torch_version": "2.7.0+cu128",
+      "torchrec_version": "1.2.0",
+      "world_size": 1,
+      "features": 128,
+      "batch_size": 32,
+      "hotness": 4,
+      "dim": 64,
+      "samples_ms": {
+        "optimized": [
+          0.6843154024682008,
+          0.6730719323968515,
+          0.6722874651313759,
+          0.6684580777073279,
+          0.666116000211332,
+          0.6672983299358748,
+          0.6642724975245073,
+          0.6688612076686695
+        ],
+        "before": [
+          0.8331280076527037,
+          1.058722444868181,
+          0.8234575900132768,
+          0.8157964801648632,
+          0.8203845974639989,
+          0.8121061450219713,
+          0.8140852974611335,
+          0.8173325975076295
+        ],
+        "prior_gather": [
+          0.5256764774094336,
+          0.5220737776835449,
+          0.5275246349629015,
+          0.5143648202647455,
+          0.5177734099561349,
+          0.5142764252377674,
+          0.511364747362677,
+          0.513666290207766
+        ]
+      },
+      "median_ms": {
+        "optimized": 0.6686596426879987,
+        "before": 0.8188585974858142,
+        "prior_gather": 0.5160691151104402
+      },
+      "source": "adapter A/B on the same resolved table",
+      "warmup": 20,
+      "trials": 8,
+      "iterations": 400
+    },
+    {
+      "pipeline": "sparse",
+      "train": true,
+      "gpu_name": "NVIDIA RTX PRO 6000 Blackwell Server Edition",
+      "torch_version": "2.7.0+cu128",
+      "torchrec_version": "1.2.0",
+      "world_size": 2,
+      "features": 128,
+      "batch_size": 32,
+      "hotness": 4,
+      "dim": 64,
+      "samples_ms": {
+        "default": [
+          17.36503028869629,
+          17.355257034301758,
+          17.417245864868164,
+          17.090044021606445,
+          19.040328979492188,
+          18.446138381958008,
+          19.59292984008789,
+          18.548812866210938
+        ]
+      },
+      "median_ms": {
+        "default": 17.931692123413086
+      },
+      "source": "before-optimization tree 05defa5bf8a2ec03e19910bb60c318f7856a9d55",
+      "warmup": 20,
+      "trials": 8,
+      "iterations": 120
+    },
+    {
+      "pipeline": "sparse",
+      "train": true,
+      "gpu_name": "NVIDIA RTX PRO 6000 Blackwell Server Edition",
+      "torch_version": "2.7.0+cu128",
+      "torchrec_version": "1.2.0",
+      "world_size": 2,
+      "features": 128,
+      "batch_size": 32,
+      "hotness": 4,
+      "dim": 64,
+      "samples_ms": {
+        "default": [
+          16.60519790649414,
+          17.10924530029297,
+          17.60329818725586,
+          16.810657501220703,
+          17.648426055908203,
+          18.698728561401367,
+          18.527143478393555,
+          18.076549530029297
+        ]
+      },
+      "median_ms": {
+        "default": 17.62586212158203
+      },
+      "source": "optimized implementation identified by blobs below",
+      "warmup": 20,
+      "trials": 8,
+      "iterations": 120
+    },
+    {
+      "pipeline": "sparse",
+      "train": true,
+      "gpu_name": "NVIDIA RTX PRO 6000 Blackwell Server Edition",
+      "torch_version": "2.7.0+cu128",
+      "torchrec_version": "1.2.0",
+      "world_size": 2,
+      "features": 128,
+      "batch_size": 32,
+      "hotness": 4,
+      "dim": 64,
+      "samples_ms": {
+        "default": [
+          15.659806251525879,
+          16.248146057128906,
+          16.406160354614258,
+          16.141040802001953,
+          15.986052513122559,
+          17.389928817749023,
+          17.254528045654297,
+          17.952638626098633
+        ]
+      },
+      "median_ms": {
+        "default": 16.327153205871582
+      },
+      "source": "476cdc01d1625337070d71659c9bb304c1593d8f",
+      "warmup": 20,
+      "trials": 8,
+      "iterations": 120
+    },
+    {
+      "pipeline": "prefetch",
+      "train": true,
+      "gpu_name": "NVIDIA RTX PRO 6000 Blackwell Server Edition",
+      "torch_version": "2.7.0+cu128",
+      "torchrec_version": "1.2.0",
+      "world_size": 2,
+      "features": 32,
+      "batch_size": 32,
+      "hotness": 4,
+      "dim": 64,
+      "samples_ms": {
+        "torchrec": [
+          14.09266471862793,
+          15.922734260559082,
+          15.673696517944336,
+          16.858522415161133,
+          16.5196590423584,
+          15.959339141845703,
+          14.160365104675293,
+          13.986210823059082
+        ],
+        "prior_gather": [
+          14.165755271911621,
+          14.57445240020752,
+          14.861824035644531,
+          15.022584915161133,
+          16.135759353637695,
+          16.316242218017578,
+          13.75075626373291,
+          13.571471214294434
+        ]
+      },
+      "median_ms": {
+        "torchrec": 15.798215389251709,
+        "prior_gather": 14.718138217926025
+      },
+      "source": "adapter A/B on the optimized resolved pipeline",
+      "warmup": 20,
+      "trials": 8,
+      "iterations": 120
+    },
+    {
+      "pipeline": "prefetch",
+      "train": true,
+      "gpu_name": "NVIDIA RTX PRO 6000 Blackwell Server Edition",
+      "torch_version": "2.7.0+cu128",
+      "torchrec_version": "1.2.0",
+      "world_size": 2,
+      "features": 128,
+      "batch_size": 32,
+      "hotness": 4,
+      "dim": 64,
+      "samples_ms": {
+        "torchrec": [
+          16.352108001708984,
+          17.449777603149414,
+          17.576805114746094,
+          18.50718879699707,
+          19.108308792114258,
+          16.521137237548828,
+          16.329429626464844,
+          17.22265625
+        ],
+        "prior_gather": [
+          16.9877872467041,
+          17.399005889892578,
+          18.336814880371094,
+          18.329971313476562,
+          16.607845306396484,
+          15.807143211364746,
+          15.882927894592285,
+          16.132007598876953
+        ]
+      },
+      "median_ms": {
+        "torchrec": 17.336216926574707,
+        "prior_gather": 16.797816276550293
+      },
+      "source": "adapter A/B on the optimized resolved pipeline",
+      "warmup": 20,
+      "trials": 8,
+      "iterations": 120
+    }
+  ],
+  "before_optimization_tree": "05defa5bf8a2ec03e19910bb60c318f7856a9d55"
+}

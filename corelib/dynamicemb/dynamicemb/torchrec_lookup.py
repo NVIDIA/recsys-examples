@@ -22,6 +22,7 @@ from torchrec import (
     KeyedJaggedTensor,
     PoolingType,
 )
+from torchrec.sparse.jagged_tensor import JaggedTensor
 
 from .dynamicemb_config import DynamicEmbPoolingMode
 
@@ -84,6 +85,7 @@ class TorchRecLookup:
             with torch.no_grad():
                 for weight in module.parameters():
                     weight.zero_()
+                    weight.requires_grad_(False)
             self._modules[weighted] = module
         return self._modules[weighted]
 
@@ -103,32 +105,48 @@ class TorchRecLookup:
             else [0] + list(accumulate(batch.unique_sizes))
         )
         placeholders = [
-            (embedding.weight, embedding.num_embeddings)
+            (embedding.weight.data, embedding.num_embeddings)
             for embedding in embeddings.values()
         ]
         for t, (embedding, dim) in enumerate(zip(embeddings.values(), self._dims)):
             # Native embedding/embedding_bag accept strided weights. In mixed-D
             # groups each row occupies max_D elements, with padding after dim.
             weight = unique_embs[table_offsets[t] : table_offsets[t + 1], :dim]
-            embedding.weight = torch.nn.Parameter(weight, requires_grad=False)
+            # The cached parameters are frozen and outside the model tree.
+            # Rebind their data rather than allocating/registering a Parameter
+            # for every batch; DynamicEmb's custom backward owns all updates.
+            embedding.weight.data = weight
             embedding.num_embeddings = weight.size(0)
         if self._uniform:
             count = batch.reverse_indices.numel()
+            lengths = (
+                offsets[1:] - offsets[:-1]
+                if pooled
+                else torch.full(
+                    (1,), count, dtype=torch.int64, device=unique_embs.device
+                )
+            )
+            # This synthetic feature already has its JT representation. Pass
+            # the public cache so native lookup does not split it or reconstruct
+            # offsets with another GPU scan/cat (pooling uses our input offsets).
+            jt = JaggedTensor(
+                values=batch.reverse_indices,
+                lengths=lengths,
+                offsets=offsets if pooled else None,
+                weights=pooling_weights,
+            )
             # These lengths are known on the host; supplying KJT metadata
             # avoids a device-to-host length reduction in native to_dict().
             features = KeyedJaggedTensor(
                 keys=self._feature_names,
                 values=batch.reverse_indices,
                 offsets=offsets if pooled else None,
-                lengths=None
-                if pooled
-                else torch.full(
-                    (1,), count, dtype=torch.int64, device=unique_embs.device
-                ),
+                lengths=lengths,
                 weights=pooling_weights,
                 stride=offsets.numel() - 1 if pooled else 1,
                 length_per_key=[count],
                 offset_per_key=[0, count],
+                jt_dict={self._feature_names[0]: jt},
             )
         else:
             starts = torch.tensor(table_offsets[:-1], device=unique_embs.device)
@@ -159,5 +177,5 @@ class TorchRecLookup:
             # The table owns persistent weights. Do not retain a whole batch
             # workspace in the cached TorchRec module after lookup.
             for embedding, (weight, size) in zip(embeddings.values(), placeholders):
-                embedding.weight = weight
+                embedding.weight.data = weight
                 embedding.num_embeddings = size

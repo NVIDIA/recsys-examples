@@ -196,6 +196,11 @@ class _DynamicLookupMixin(torch.nn.Module):
                 )
         if not any(isinstance(group, ResolvedEmbeddingInput) for group in resolved):
             return features
+        if len(resolved) == 1:
+            # The group's KJT already has the resolved rows and processed
+            # metadata. Avoid concatenating it into a wrapper whose only split
+            # would immediately hand the same group back to lookup.
+            return resolved[0]
         return ResolvedEmbeddingInput.from_groups(
             features,
             resolved,

@@ -179,13 +179,18 @@ NCCL 2.28.9 with P2P/IB disabled, `NCCL_CUMEM_HOST_ENABLE=0` and
 | Per-key score distributed suite, two GPUs | Passed |
 | Additional table-row-wise gradient/pooling checks, four GPUs | Passed with two emulated nodes; not a physical multi-node test |
 | Focused suite with TorchRec 1.5.0, one and two GPUs | 284 passed, 4 skipped per invocation/rank |
-| Changed-file formatting/import/unused-code/spelling and whitespace checks | Passed |
+| Changed-file formatting/import/spelling and whitespace checks | Passed |
+| autoflake with root-repository flags | Three findings unchanged from the original main baseline; no new findings |
 | mypy against the original main baseline | 362 existing errors versus 364; no new normalized diagnostic messages |
 
 The supplemental environment used PyTorch 2.11.0+cu128, TorchRec 1.5.0+cu128
 and FBGEMM 1.5.0+cu129. It emits version warnings and is not an officially
 certified dependency combination. These runs do not validate the repository's
 target Docker stack (PyTorch 2.13 / TorchRec 1.8.0-rc1 / FBGEMM 1.8.0).
+
+The baseline autoflake findings are one unused local import in
+`key_value_table.py` and two unused assignments in the existing full-table test.
+The complete repository lint suite is not claimed to pass.
 
 The focused suite exercises resolved-before-lookup behavior, deduplication,
 empty ranks/batches, multiple kernel groups, original output indices, per-key
