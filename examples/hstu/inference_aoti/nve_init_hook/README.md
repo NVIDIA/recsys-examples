@@ -4,7 +4,8 @@
 process-global `NVELayerRegistry` at model load, so `nve_ops::embedding_lookup`
 resolves at inference time. Those weights live **outside** `model.pt2`
 (`<model_dir>/metadata.json` + `<model_dir>/weights/*.nve`), so loading the
-package alone does not load them.
+package alone does not load them. The HSTU indexer state is embedded in
+`model.pt2` for this NVE 26.05 Triton workflow.
 
 This is the **plug-in** for the generic `MODEL_INIT_LIBRARY` hook in the Triton
 PyTorch backend: the backend `dlopen()`s this `.so` and calls its

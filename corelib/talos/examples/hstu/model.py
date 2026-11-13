@@ -63,7 +63,9 @@ class HSTUBlock(nn.Module):
         self.input_norm = RMSNorm(embedding_dim)
         self.uvqk = nn.Linear(embedding_dim, projected_dim)
         self.output_norm = RMSNorm(num_heads * hidden_dim)
-        self.output = nn.Linear(num_heads * hidden_dim * 2 + embedding_dim, embedding_dim)
+        self.output = nn.Linear(
+            num_heads * hidden_dim * 2 + embedding_dim, embedding_dim
+        )
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -81,12 +83,18 @@ class HSTUBlock(nn.Module):
             dim=-1,
         )
 
-        q = q.view(batch_size, seq_len, self.num_heads, self.attention_dim).transpose(1, 2)
-        k = k.view(batch_size, seq_len, self.num_heads, self.attention_dim).transpose(1, 2)
+        q = q.view(batch_size, seq_len, self.num_heads, self.attention_dim).transpose(
+            1, 2
+        )
+        k = k.view(batch_size, seq_len, self.num_heads, self.attention_dim).transpose(
+            1, 2
+        )
         v = v.view(batch_size, seq_len, self.num_heads, self.hidden_dim).transpose(1, 2)
 
         scores = torch.matmul(q, k.transpose(-2, -1)) * self.attn_alpha
-        causal = torch.tril(torch.ones(seq_len, seq_len, dtype=torch.bool, device=x.device))
+        causal = torch.tril(
+            torch.ones(seq_len, seq_len, dtype=torch.bool, device=x.device)
+        )
 
         # @torch_optimize:begin
         scores = F.silu(scores).masked_fill(~causal, 0.0)
@@ -136,9 +144,15 @@ class HSTUSequentialRecommender(nn.Module):
         self.output = nn.Linear(embedding_dim, vocab_size, bias=False)
         self.output.weight = self.item_embedding.weight
 
-    def forward(self, input_ids: torch.Tensor, user_group: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, input_ids: torch.Tensor, user_group: torch.Tensor
+    ) -> torch.Tensor:
         batch_size, seq_len = input_ids.shape
-        positions = torch.arange(seq_len, device=input_ids.device).unsqueeze(0).expand(batch_size, -1)
+        positions = (
+            torch.arange(seq_len, device=input_ids.device)
+            .unsqueeze(0)
+            .expand(batch_size, -1)
+        )
         x = self.item_embedding(input_ids) + self.position_embedding(positions)
         x = x + self.user_embedding(user_group).unsqueeze(1)
 

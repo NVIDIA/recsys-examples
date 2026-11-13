@@ -54,7 +54,7 @@ This can be extended to integrate other KV-cache systems. Currently, we provide 
 
 - **[NEW] Compatible with Torch Export and AOTI**: 
 Recsys KVCache Manager now includes an export-compatible backend for KV-cache lookup, allocation, onboarding, offloading, and eviction when using the paged GPU KV cache together with the FlexKV host cache backend.
-The export path keeps the Python API unchanged, but routes KV-cache operations through tensor-only torch custom ops while keeping stateful cache policy and runtime management in C++, which makes the flow compatible with `torch.export` and AOTInductor/AOTI packaging. The current implementation is dependent on a [customized FlexKV version](https://github.com/geoffreyQiu/FlexKV/tree/cpp_client).
+The export path keeps the Python API unchanged, but routes KV-cache operations through tensor-only torch custom ops while keeping stateful cache policy and runtime management in C++, which makes the flow compatible with `torch.export` and AOTInductor/AOTI packaging. The C++ runtime requires the binary-protocol adapter in the [pinned FlexKV submodule](../../third_party/FlexKV). Preserve this adapter when upgrading FlexKV; the upstream Python pickle protocol alone cannot serve the C++ client. The adapter is based on the current layerwise-capable FlexKV revision and retains the Python protocol.
 
 
 
