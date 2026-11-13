@@ -3081,7 +3081,11 @@ every dist, so tables of 16-bit rows may still differ from run to run.
 `test_hier_dist.py`, `test_hier_overflow.py` and `test_hier_pipeline.py`;
 each module's docstring says what it checks and how to run it. On one node
 `test_hier_dist.sh`, `test_hier_overflow.sh` and `test_hier_pipeline.sh`
-run them, and `test/unit_test.sh` runs those. `test_hier_dist.py` compares
+run them, and `test/unit_test.sh`'s `hier` group runs those. The CI runs
+them in JET jobs of the CI repo, with NCCL's P2P on: on Eos, on one node of 8
+H100s and across two nodes, and on GB300, on one tray and across trays. It
+does not run them in its `fwd_bwd` and `load_dump` jobs, whose two hours they
+would not fit in. `test_hier_dist.py` compares
 the lookup's gradient per (table, key) with TorchRec's: its probe reads the
 gradient of the lookup output in the KJT's key order, through
 `HierDist.key_rows` (section 7.4). First it checks the node (`node_size`):
@@ -3105,15 +3109,18 @@ also checks the over-capacity error under each pipeline. Run it from
 PYTHONPATH=${PYTHONPATH}:$(realpath ../) torchrun --nproc_per_node 8 -m pytest -svv test/test_hierarchical_dist.py
 ```
 
-**The existing tests on the dist.** After its usual runs, `test/unit_test.sh`
-runs eight files of DynamicEmb's existing tests again on the hierarchical
-dist, with their configurations unchanged: `test_sequence_embedding.sh`,
-`test_twin_module.sh`, `erase_async/test_erase_async.sh`,
-`per_key_score/test_per_key_score.sh` and `test_lfu_scores.sh` in the
-`fwd_bwd` group, and `admission/test_embedding_admission.sh`,
-`test_embedding_dump_load.sh` and `incremental_dump/test_incremental_dump.sh`
-in the `load_dump` group. A build without the op skips them. To run one of
-them on the dist, from `corelib/dynamicemb`:
+**The existing tests on the dist.** `test/unit_test.sh`'s `hier_fwd_bwd`
+and `hier_load_dump` groups run eight files of DynamicEmb's existing tests
+again on the hierarchical dist, with their configurations unchanged:
+`test_sequence_embedding.sh`, `test_twin_module.sh`,
+`erase_async/test_erase_async.sh`, `per_key_score/test_per_key_score.sh` and
+`test_lfu_scores.sh` of the `fwd_bwd` group in `hier_fwd_bwd`, and
+`admission/test_embedding_admission.sh`, `test_embedding_dump_load.sh` and
+`incremental_dump/test_incremental_dump.sh` of the `load_dump` group in
+`hier_load_dump`, each with the group it comes from. Most of their runs take
+8 GPUs on one host: the CI runs these two groups on Eos (JET jobs, NCCL's P2P
+on). A build without the op skips them. To run one of them on the dist, from
+`corelib/dynamicemb`:
 
 ```
 DYNAMICEMB_TEST_OUTPUT_DIST=hierarchical PYHKV_DEBUG_STRICT=1 bash test/unit_tests/test_lfu_scores.sh
