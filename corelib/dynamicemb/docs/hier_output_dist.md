@@ -3082,8 +3082,9 @@ every dist, so tables of 16-bit rows may still differ from run to run.
 each module's docstring says what it checks and how to run it. On one node
 `test_hier_dist.sh`, `test_hier_overflow.sh` and `test_hier_pipeline.sh`
 run them, and `test/unit_test.sh`'s `hier` group runs those. The CI runs
-them on GB300 (a JET job of the CI repo, NCCL's P2P on), on one tray and
-across trays, not in its `fwd_bwd` and `load_dump` jobs, whose two hours they
+them in JET jobs of the CI repo, with NCCL's P2P on: on Eos, on one node of 8
+H100s and across two nodes, and on GB300, on one tray and across trays. It
+does not run them in its `fwd_bwd` and `load_dump` jobs, whose two hours they
 would not fit in. `test_hier_dist.py` compares
 the lookup's gradient per (table, key) with TorchRec's: its probe reads the
 gradient of the lookup output in the KJT's key order, through

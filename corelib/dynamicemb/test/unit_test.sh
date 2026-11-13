@@ -45,7 +45,8 @@ LOAD_DUMP_TEST_FILES=(
 )
 
 # The hierarchical output dist's own tests: the hier group, which the CI runs
-# on GB300, on one tray and across trays (docs/hier_output_dist.md, section 18).
+# on Eos and GB300, on one node and across nodes (docs/hier_output_dist.md,
+# section 18).
 HIER_TEST_FILES=(
     "test/unit_tests/test_hier_dist.sh"
     "test/unit_tests/test_hier_overflow.sh"
