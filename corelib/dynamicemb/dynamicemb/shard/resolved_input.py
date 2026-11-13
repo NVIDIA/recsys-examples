@@ -32,6 +32,7 @@ class ResolvedEmbeddingInput(KeyedJaggedTensor):
     ) -> "ResolvedEmbeddingInput":
         assert state.value_row_indices is not None
         rows = state.value_row_indices[state.reverse_indices]
+        state.occurrence_rows = rows
         return _shallow_copy_as(
             cls,
             features,
@@ -39,6 +40,7 @@ class ResolvedEmbeddingInput(KeyedJaggedTensor):
             # A cached JaggedTensor dictionary still refers to the old keys.
             _jt_dict=None,
             prefetch_state=state,
+            _original_dtype=features.values().dtype,
             _feature_splits=[len(features.keys())],
             _groups=None,
         )
@@ -65,6 +67,7 @@ class ResolvedEmbeddingInput(KeyedJaggedTensor):
             _values=torch.cat([group.values() for group in groups]),
             _jt_dict=None,
             prefetch_state=None,
+            _original_dtype=features.values().dtype,
             _feature_splits=feature_splits,
             _groups=groups,
             **fields,
@@ -73,6 +76,35 @@ class ResolvedEmbeddingInput(KeyedJaggedTensor):
     prefetch_state: Optional[PrefetchState]
     _feature_splits: List[int]
     _groups: Optional[List[KeyedJaggedTensor]]
+
+    def original_features(self) -> KeyedJaggedTensor:
+        """Key-ordered input for observers such as TorchRec's model tracker."""
+        state = self.prefetch_state
+        values = (
+            state.unique_keys[state.reverse_indices].to(self._original_dtype)
+            if state is not None
+            else torch.cat(
+                [
+                    group.original_features().values()
+                    if isinstance(group, ResolvedEmbeddingInput)
+                    else group.values()
+                    for group in self._groups
+                ]
+            )
+        )
+        features = _shallow_copy_as(
+            KeyedJaggedTensor,
+            self,
+            _values=values,
+            _jt_dict=None,
+        )
+        if state is not None and state.unique_scores is not None:
+            from ..scored_kjt import ScoredKeyedJaggedTensor
+
+            features = ScoredKeyedJaggedTensor.from_kjt(
+                features, state.unique_scores[state.reverse_indices]
+            )
+        return features
 
     def split(self, segments: List[int]) -> List[KeyedJaggedTensor]:
         if segments != self._feature_splits:

@@ -174,6 +174,7 @@ FLAG_DISPLAY = {
     "recompute_layernorm": "Recompute LN",
     "balanced_shuffler": "Balanced Shuffler",
     "pipeline_type=prefetch": "Prefetch Pipeline",
+    "output_dist=hierarchical": "Hierarchical Dist",
     "tp_size": "TP",
 }
 

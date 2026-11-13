@@ -523,6 +523,28 @@ def test_mixed_hbm_and_host_groups():
     assert all(not table._prefetch_states for table in tables(model))
 
 
+def test_later_group_resolution_failure_releases_earlier_pins():
+    model = make_model(
+        table_options={"t1": {"score_strategy": DynamicEmbScoreStrategy.LFU}}
+    )
+    features = batch()
+    grouped = model._lookups[0]
+    assert len(grouped._emb_modules) == 2
+    table = grouped._emb_modules[0].emb_module
+    with patch.object(
+        grouped._emb_modules[1],
+        "resolve_input",
+        side_effect=RuntimeError("receiver failure"),
+    ):
+        with pytest.raises(RuntimeError, match="receiver failure"):
+            distribute(model, features)
+    gc.collect()
+    torch.cuda.synchronize()
+    owner = table._cache if table._cache is not None else table._storage
+    assert torch.count_nonzero(owner._state.key_index_map._ref_counter).item() == 0
+    assert table._prefetch_outstanding_keys.item() == 0
+
+
 def test_mixed_dynamic_and_torchrec_groups():
     model = make_model(static_table=True)
     for lookup in model._lookups:
@@ -1171,3 +1193,50 @@ def test_feature_processor_preserves_no_grad_contract(grad_enabled):
     assert all(not table._active_rows.states for table in tables(model))
     for table in tables(model):
         assert (table.tables.key_index_map._ref_counter == 0).all()
+
+
+def test_native_receiver_resolution_runs_once():
+    model = make_model()
+    ctx = model.create_context()
+    request = model.input_dist(ctx, batch()).wait()
+    first = request.wait()
+    counts = [
+        (table.cache or table.tables).key_index_map._ref_counter.clone()
+        for table in tables(model)
+    ]
+    second = request.wait()
+    assert first[0] is second[0]
+    for table, expected in zip(tables(model), counts):
+        torch.testing.assert_close(
+            (table.cache or table.tables).key_index_map._ref_counter, expected
+        )
+    result = output(model, ctx, first)
+    sum(jt.values().sum() for jt in result.values()).backward()
+
+
+def test_optimizer_tracker_observes_original_keys():
+    from torchrec.distributed.embedding_lookup import (
+        GroupedEmbeddingsLookup as NativeLookup,
+    )
+
+    if not hasattr(NativeLookup, "register_optim_state_tracker_fn"):
+        pytest.skip("Optimizer trackers are not available in this TorchRec version")
+    model = make_model()
+    ctx, arrived = distribute(model, batch())
+    seen, expected = [], {}
+    for lookup, features in zip(model._lookups, arrived):
+        for emb, group in zip(
+            lookup._emb_modules, features.split(lookup._feature_splits)
+        ):
+            state = group.prefetch_state
+            expected[id(emb)] = state.unique_keys[state.reverse_indices]
+        lookup.register_optim_state_tracker_fn(
+            lambda features, values, emb: seen.append(
+                (id(emb), features.values().clone())
+            )
+        )
+    result = output(model, ctx, arrived)
+    assert len(seen) == len(expected)
+    for emb, keys in seen:
+        torch.testing.assert_close(keys, expected[emb])
+    sum(jt.values().sum() for jt in result.values()).backward()

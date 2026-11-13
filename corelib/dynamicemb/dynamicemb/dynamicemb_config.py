@@ -42,6 +42,7 @@ from dynamicemb.utils import DTYPE_NUM_BYTES
 # keep the two apart wherever both are in scope.
 from dynamicemb_extensions import DistType, DynamicEmbDataType, EvictStrategy
 from dynamicemb_extensions import PoolingMode as BagPoolingMode
+from dynamicemb_extensions import hier_output_dist_max_capacity
 from torchrec.modules.embedding_configs import BaseEmbeddingConfig
 from torchrec.types import DataType
 
@@ -65,6 +66,28 @@ DIST_TYPE_CODES: Dict[str, int] = {
     "hash_roundrobin": int(DistType.KHashedCyclic),
 }
 SUPPORTED_DIST_TYPES: Tuple[str, ...] = tuple(DIST_TYPE_CODES)
+# DynamicEmbTableOptions.output_dist: TorchRec's dists, the hierarchical dist
+# of shard/hier_output_dist.py, or that one where the build has it and
+# TorchRec's elsewhere.
+TORCHREC_OUTPUT_DIST = "torchrec"
+HIERARCHICAL_OUTPUT_DIST = "hierarchical"
+AUTO_OUTPUT_DIST = "auto"
+SUPPORTED_OUTPUT_DISTS: Tuple[str, ...] = (
+    TORCHREC_OUTPUT_DIST,
+    HIERARCHICAL_OUTPUT_DIST,
+    AUTO_OUTPUT_DIST,
+)
+# The capacities of output_dist_capacity, by name (see
+# DynamicEmbTableOptions.output_dist_capacity). A dict sets "lookup_keys",
+# and across nodes "remote_keys" too.
+OUTPUT_DIST_CAPACITY_NAMES: Tuple[str, ...] = ("lookup_keys", "remote_keys")
+# Every capacity stays below this many entries: the planner numbers the keys
+# with int32 indices. The value is C++'s (kMaxEntries), which every build
+# binds, with the op or without. The rest of this block has no C++ value to
+# take: the op never sees output_dist (rw_sharding.py picks the dist), and
+# the capacity names are the keys of a user option, which the op takes as
+# keyword arguments of the same names (pybind11 matches them by name).
+MAX_OUTPUT_DIST_CAPACITY: int = hier_output_dist_max_capacity()
 # Must match ``MappingEmbeddingGenerator`` mod in ``debug_init`` (initializer.cu).
 DEBUG_EMB_INITIALIZER_MOD = 100_000
 # Default hashtable bucket width in rows; keep in sync with
@@ -235,7 +258,8 @@ class DynamicEmbScoreStrategy(enum.IntEnum):
         A key that repeats in a batch takes the largest of its scores; a later batch assigns, so the latest
         score of a key wins. While training the input must be a `ScoredKeyedJaggedTensor`; evaluation reads
         no score and takes either kind. Row-wise sharding only; no `admit_strategy`; no variable batch size
-        per key; no HybridStorage. May be combined with NO_EVICTION as `(NO_EVICTION, PRECISE_CUSTOMIZED)`.
+        per key; no HybridStorage; not on the hierarchical dist (`output_dist`). May be combined with
+        NO_EVICTION as `(NO_EVICTION, PRECISE_CUSTOMIZED)`.
         Within one collection either every table uses it or none does, and a collection that does holds
         DynamicEmb tables only.
     NO_EVICTION:
@@ -631,7 +655,11 @@ class DynamicEmbTableOptions:
     dist_type : str
         Input distribution policy for row-wise sharding. Supported values are
         ``continuous``, ``roundrobin``, and ``hash_roundrobin``. Defaults to
-        ``roundrobin``.
+        ``roundrobin``. ``output_dist="hierarchical"`` takes ``roundrobin`` and
+        ``hash_roundrobin`` only: a row-wise sequence sharding with a
+        ``continuous`` table raises ``ValueError`` at its first
+        ``input_dist()`` (``"auto"`` takes TorchRec's dists there, with a
+        warning).
     node_index : Optional[int], optional
         Pins this table to a node, under ``TABLE_ROW_WISE`` sharding. Leave it
         unset -- the default -- and the planner's
@@ -738,6 +766,56 @@ class DynamicEmbTableOptions:
     (key, table_id) only, no value/score. Tables differing in this mode are not
     grouped onto shared storage."""
 
+    output_dist: str = "torchrec"
+    """How a row-wise sequence (EmbeddingCollection) sharding moves keys to
+    the ranks that own them and looked-up rows back. ``"torchrec"`` is
+    TorchRec's input and output dists. ``"hierarchical"`` is the hierarchical
+    dist: keys and rows move over NVLink inside a node and over the rails
+    (NCCL GIN) between nodes, with one host sync per call. It needs DynamicEmb
+    built against NCCL >= 2.30.7 (else ``ImportError`` when the model is
+    sharded), ``output_dist_capacity``, and tables of ``dist_type``
+    ``"roundrobin"`` or ``"hash_roundrobin"``: a ``"continuous"`` table makes
+    the first ``input_dist()`` raise ``ValueError``. A call on it
+    deduplicates the sharding's keys (index dedup), whatever the sharder's
+    ``use_index_dedup`` (without that flag, the sharding warns so once, at
+    its first ``input_dist()``); tables that clip gradients need the flag
+    (else ``ValueError`` there too). It carries no score per key: tables of
+    ``score_strategy`` ``PRECISE_CUSTOMIZED`` make it raise ``ValueError``
+    when the model is sharded. ``"auto"`` is ``"hierarchical"``
+    where the build has it, ``output_dist_capacity`` is set and no table of
+    the sharding is ``"continuous"``, takes a score per key or clips
+    gradients without the sharder's index dedup, and TorchRec's dists (with
+    a warning) elsewhere.
+    Pooled shardings ignore it.
+    Every DynamicEmb table of a sharding sets ``output_dist``,
+    ``output_dist_capacity`` and ``node_dedup`` alike. See
+    docs/hier_output_dist.md, section 4."""
+
+    node_dedup: bool = True
+    """With ``output_dist="hierarchical"`` (or ``"auto"``) across nodes, a
+    node sends each key once and sums its gradient rows before they cross
+    back. With bf16 or fp16 rows that sum adds one rounding to TorchRec's.
+    ``False`` sends every occurrence instead, as TorchRec does under the
+    sharder's index dedup (more InfiniBand traffic). Gradient clipping turns
+    it off. Other output dists ignore it, but every DynamicEmb table of a
+    sharding sets it alike. See docs/hier_output_dist.md, section 9."""
+
+    output_dist_capacity: Optional[Union[int, Dict[str, int]]] = None
+    """The capacities of ``output_dist="hierarchical"`` (and ``"auto"``), in
+    entries, fixed for the model's life: its buffers are made once, at the
+    first ``input_dist()``. A dict sets each by name:
+
+    * ``"lookup_keys"``: the keys an owner looks up;
+    * ``"remote_keys"`` (across nodes): the keys of other nodes' owners a GPU
+      deduplicates for its node.
+
+    An int sets both. Each is a positive int below 2^31 - 1024. A call that
+    needs more raises RuntimeError at its second wait, on every rank, naming
+    the capacity to raise. ``"hierarchical"`` needs it, and ``"auto"``
+    without it takes TorchRec's dists. Other output dists ignore it, but
+    every DynamicEmb table of a sharding sets it alike. See
+    docs/hier_output_dist.md, section 5."""
+
     optimizer_state_dtype: Optional[torch.dtype] = None
     """Precision the optimizer state is kept at, and the ``optim_state_dtype`` a
     dump records. ``None`` keeps each optimizer's default. Only
@@ -786,6 +864,12 @@ class DynamicEmbTableOptions:
                 f"Unsupported dist_type {self.dist_type!r}. "
                 f"Supported values: {SUPPORTED_DIST_TYPES}."
             )
+        if self.output_dist not in SUPPORTED_OUTPUT_DISTS:
+            raise ValueError(
+                f"Unsupported output_dist {self.output_dist!r}. "
+                f"Supported values: {SUPPORTED_OUTPUT_DISTS}."
+            )
+        self._validate_output_dist_capacity()
         # Validate and canonicalize score_strategy (unwrap one-element tuples,
         # reject unsupported compound tuples) so all downstream code sees either a
         # single strategy or a supported compound tuple.
@@ -812,6 +896,40 @@ class DynamicEmbTableOptions:
     def takes_score_per_key(self) -> bool:
         """Whether the table takes a score for every key from its input."""
         return takes_score_per_key(self.score_strategy)
+
+    def _validate_output_dist_capacity(self) -> None:
+        cap = self.output_dist_capacity
+
+        def is_capacity(value) -> bool:
+            return (
+                isinstance(value, int)
+                and not isinstance(value, bool)
+                and 0 < value < MAX_OUTPUT_DIST_CAPACITY
+            )
+
+        if cap is None:
+            if self.output_dist == HIERARCHICAL_OUTPUT_DIST:
+                raise ValueError(
+                    'output_dist="hierarchical" needs output_dist_capacity: an int, '
+                    f"or a dict of {OUTPUT_DIST_CAPACITY_NAMES}."
+                )
+            return
+        if isinstance(cap, dict):
+            if not (
+                "lookup_keys" in cap
+                and set(cap) <= set(OUTPUT_DIST_CAPACITY_NAMES)
+                and all(is_capacity(value) for value in cap.values())
+            ):
+                raise ValueError(
+                    f"output_dist_capacity as a dict sets {OUTPUT_DIST_CAPACITY_NAMES} "
+                    '("remote_keys" across nodes) to positive ints below '
+                    f"{MAX_OUTPUT_DIST_CAPACITY}; got {cap}."
+                )
+        elif not is_capacity(cap):
+            raise ValueError(
+                "output_dist_capacity must be a positive int below "
+                f"{MAX_OUTPUT_DIST_CAPACITY}, or a dict of capacities; got {cap!r}."
+            )
 
     def __eq__(self, other):
         if not isinstance(other, DynamicEmbTableOptions):

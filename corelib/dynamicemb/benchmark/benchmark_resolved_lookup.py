@@ -16,6 +16,7 @@ import os
 import statistics
 import tempfile
 import time
+from pathlib import Path
 
 import dynamicemb
 import torch
@@ -83,11 +84,18 @@ def options(args, **kwargs):
         initializer_args=DynamicEmbInitializerArgs(
             mode=DynamicEmbInitializerMode.DEBUG
         ),
+        caching=args.layout == "cache",
         **kwargs,
     )
 
 
 def build(args, names, device, control):
+    hbm_bytes = {
+        "hbm": 1024**3,
+        "cache": args.capacity * args.dim,
+        "host": 0,
+        "hybrid": args.capacity * args.dim * 2,
+    }[args.layout]
     if args.pipeline == "none":
         table = BatchedDynamicEmbeddingTablesV2(
             table_options=[
@@ -96,7 +104,7 @@ def build(args, names, device, control):
                     device_id=device.index,
                     index_type=torch.int64,
                     embedding_dtype=torch.float32,
-                    local_hbm_for_values=1024**3,
+                    local_hbm_for_values=hbm_bytes,
                 )
             ],
             table_names=["table"],
@@ -125,7 +133,7 @@ def build(args, names, device, control):
                 "table": DynamicEmbParameterConstraints(
                     sharding_types=[ShardingType.ROW_WISE.value],
                     use_dynamicemb=True,
-                    dynamicemb_options=options(args, global_hbm_for_values=1024**3),
+                    dynamicemb_options=options(args, global_hbm_for_values=hbm_bytes),
                 )
             },
         )
@@ -174,9 +182,13 @@ def run(args, feature_num, device):
         torch.manual_seed(1234)
         model = build(args, names, device, control)
         if args.pipeline == "none":
+            for _ in range(args.prefetch_depth):
+                model.prefetch(features.values(), features.offsets())
 
             def step(model=model):
                 with torch.set_grad_enabled(args.train):
+                    if args.prefetch_depth:
+                        model.prefetch(features.values(), features.offsets())
                     result = model(features.values(), features.offsets())
                     if args.train:
                         result.mean().backward()
@@ -196,7 +208,8 @@ def run(args, feature_num, device):
                 execute_all_batches=True,
             )
             iterator = iter(
-                [features] * (args.warmup + args.trials * args.iterations + 8)
+                [features]
+                * (args.warmup + args.trials * args.iterations + args.profile_steps + 8)
             )
             pipelines[name], iterators[name] = pipeline, iterator
             steps[name] = lambda p=pipeline, it=iterator: p.progress(it)
@@ -219,6 +232,66 @@ def run(args, feature_num, device):
                 dist.all_reduce(value, op=dist.ReduceOp.MAX)
                 elapsed = value.item()
             samples[name].append(elapsed)
+    profiles = {}
+    if args.profile_steps:
+        from torch.profiler import ProfilerActivity, profile
+
+        for name, step in steps.items():
+            torch.cuda.synchronize(device)
+            torch.cuda.reset_peak_memory_stats(device)
+            memory_before = torch.cuda.memory_allocated(device)
+            with profile(
+                activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+                profile_memory=True,
+            ) as prof:
+                for _ in range(args.profile_steps):
+                    step()
+            trace = (
+                Path(args.profile_dir)
+                / f"{args.layout}-{args.pipeline}-{feature_num}-{name}-rank{dist.get_rank() if dist.is_initialized() else 0}.json"
+            )
+            trace.parent.mkdir(parents=True, exist_ok=True)
+            prof.export_chrome_trace(str(trace))
+            events = prof.events()
+            sync_names = {
+                "cudaStreamSynchronize",
+                "cudaEventSynchronize",
+                "cudaDeviceSynchronize",
+                "cudaMemcpy",
+            }
+            profiles[name] = dict(
+                steps=args.profile_steps,
+                trace=str(trace),
+                host_syncs=sum(e.name in sync_names for e in events),
+                kernels=sum(
+                    e.device_type == torch.autograd.DeviceType.CUDA
+                    and not e.name.startswith("Memcpy")
+                    for e in events
+                ),
+                copies=[
+                    dict(
+                        name=e.key,
+                        count=e.count,
+                        cpu_us=e.self_cpu_time_total,
+                        device_us=e.self_device_time_total,
+                    )
+                    for e in prof.key_averages()
+                    if "memcpy" in e.key.lower()
+                ],
+                operators=[
+                    dict(
+                        name=e.key,
+                        count=e.count,
+                        cpu_us=e.self_cpu_time_total,
+                        device_us=e.self_device_time_total,
+                        memory_bytes=e.self_device_memory_usage,
+                    )
+                    for e in prof.key_averages()
+                    if e.key.startswith("aten::")
+                ],
+                peak_increment_bytes=torch.cuda.max_memory_allocated(device)
+                - memory_before,
+            )
     for name, pipeline in pipelines.items():
         try:
             while True:
@@ -232,6 +305,8 @@ def run(args, feature_num, device):
             json.dumps(
                 dict(
                     pipeline=args.pipeline,
+                    layout=args.layout,
+                    prefetch_depth=args.prefetch_depth,
                     train=args.train or args.pipeline != "none",
                     gpu_name=torch.cuda.get_device_name(device),
                     torch_version=torch.__version__,
@@ -247,6 +322,7 @@ def run(args, feature_num, device):
                         name: statistics.median(values)
                         for name, values in samples.items()
                     },
+                    profiles=profiles,
                 )
             ),
             flush=True,
@@ -275,7 +351,22 @@ def main():
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--iterations", type=int, default=20)
     parser.add_argument("--trials", type=int, default=4)
+    parser.add_argument(
+        "--layout", choices=["hbm", "cache", "host", "hybrid"], default="hbm"
+    )
+    parser.add_argument(
+        "--prefetch-depth",
+        type=int,
+        default=0,
+        help="Outstanding raw-table training batches before the next forward",
+    )
+    parser.add_argument("--profile-steps", type=int, default=0)
+    parser.add_argument("--profile-dir", default="/tmp/dynamicemb-resolved-profile")
     args = parser.parse_args()
+    if args.prefetch_depth < 0 or args.profile_steps < 0:
+        parser.error("prefetch depth and profile steps must be nonnegative")
+    if args.prefetch_depth and (args.pipeline != "none" or not args.train):
+        parser.error("--prefetch-depth requires --pipeline none --train")
     if (
         min(
             args.features

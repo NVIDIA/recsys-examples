@@ -50,6 +50,7 @@ from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 # test_embedding_dump_load is the fixture module the tests in unit_tests share, so it
 # stays a directory up and has to be put on the path from here.
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import hier_switch  # noqa: E402
 from test_embedding_dump_load import (  # noqa: E402
     create_model,
     get_optimizer_kwargs,
@@ -187,6 +188,7 @@ def check_erase(case: str, use_index_dedup: bool) -> None:
     # The model goes on: the old keys are new keys again.
     _train(model, feature_names, OLD_KEYS, per_key, NEW_SCORE + 100)
     _expect(model, table_names, OLD_KEYS + NEW_KEYS, f"{label}, after training them again")
+    hier_switch.release()
 
 
 def check_erase_beside_training(case: str) -> None:
@@ -205,6 +207,7 @@ def check_erase_beside_training(case: str) -> None:
         0,
     ), f"{label}: counts {(erased, spared)} on rank {dist.get_rank()}"
     _expect(model, table_names, NEW_KEYS + LATER_KEYS, label)
+    hier_switch.release()
 
 
 def check_host_only_is_refused() -> None:
@@ -219,6 +222,7 @@ def check_host_only_is_refused() -> None:
     else:
         raise AssertionError("an erase of a host-only table was not refused")
     _expect(model, table_names, OLD_KEYS, "host only")
+    hier_switch.release()
 
 
 if __name__ == "__main__":

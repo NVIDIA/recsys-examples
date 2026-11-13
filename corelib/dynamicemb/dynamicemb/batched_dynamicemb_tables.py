@@ -49,10 +49,12 @@ from dynamicemb.async_erase import (
 )
 from dynamicemb.batched_dynamicemb_function import (
     DynamicEmbeddingFunction,
+    OutputAlloc,
     PrefetchState,
     StorageMode,
     dynamicemb_prefetch,
     dynamicemb_resolve_eval,
+    place_lookup_output,
     refresh_slots_after_rehash,
     release_slot_pins,
 )
@@ -640,6 +642,12 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
         group_lasso_reg: float = 0.0,
         # TO align with FBGEMM TBE
         *args,
+        # Keyword only. Whether an admission strategy counts the frequency
+        # counters the keys come with (every occurrence); False: a table that
+        # does not evict by LFU counts each key once per call, as without
+        # them. A sharded EmbeddingCollection sets it to the sharder's
+        # use_index_dedup.
+        admission_counts_occurrences: bool = True,
         **kwargs,
     ) -> None:
         super().__init__()
@@ -834,11 +842,16 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
         # is handed some all the same and must drop them, or they would be
         # misread as scores. Tables are grouped on score and admit strategy, so
         # one answer holds for the whole group and for the module's lifetime.
-        self._consumes_frequency_counters = self._admitter is not None or any(
+        # An admitting group that does not evict by LFU drops them too without
+        # admission_counts_occurrences.
+        evicts_by_lfu = any(
             option.score_strategy is not None
             and get_eviction_score_strategy(option.score_strategy)
             == DynamicEmbScoreStrategy.LFU
             for option in self._dynamicemb_options
+        )
+        self._consumes_frequency_counters = evicts_by_lfu or (
+            self._admitter is not None and admission_counts_occurrences
         )
         # Tables are grouped on it too (see DynamicEmbTableOptions), so it holds
         # for the whole group: every table takes a score per key, or none does.
@@ -846,6 +859,7 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
             option.takes_score_per_key for option in self._dynamicemb_options
         )
         self._prefetch_states: Deque[PrefetchState] = deque()
+        self.output_alloc: Optional[OutputAlloc] = None
         self._active_rows = ActiveStorageRows()
         self._native_lookup = TorchRecLookup(
             self.dims,
@@ -1318,6 +1332,20 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
         scores: Optional[Tensor] = None,
         prefetch_state: Optional[PrefetchState] = None,
     ) -> List[Tensor]:
+        if prefetch_state is not None and (
+            prefetch_state.used or (prefetch_state.is_eval and self.training)
+        ):
+            # Reusing a distributed batch is a new lookup, as in TorchRec.
+            # Its prior reservation/snapshot belongs to the earlier graph.
+            previous = prefetch_state
+            prefetch_state = self.resolve_input(
+                previous.unique_keys[previous.reverse_indices],
+                offsets,
+                frequency_counters=previous.input_frequencies,
+                scores=previous.unique_scores[previous.reverse_indices]
+                if self.training and previous.unique_scores is not None
+                else None,
+            )
         if prefetch_state is None:
             self._check_scores(scores, indices)
         if indices.dtype != self.index_type:
@@ -1390,26 +1418,23 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                     "the weight gradient outside this module."
                 )
 
-        if not self.training:
+        if not self.training and (prefetch_state is None or prefetch_state.is_eval):
             state = prefetch_state or self.resolve_input(indices, offsets)
-            if not state.is_eval:
-                raise RuntimeError(
-                    "Module mode changed after input_dist resolved the batch"
-                )
             with torch.no_grad():
-                return self._native_lookup(
+                output = self._native_lookup(
                     state.unique_values,
                     state,
                     offsets,
                     self.output_dtype,
                     pooling_weights,
                 )
+                if not layout.is_pooling:
+                    output, _ = place_lookup_output(output, self.output_alloc)
+                state.used = True
+                return output
 
-        self._check_training_mode()
-        if prefetch_state is not None and prefetch_state.is_eval:
-            raise RuntimeError(
-                "Module mode changed after input_dist resolved the batch"
-            )
+        if self.training:
+            self._check_training_mode()
 
         if prefetch_state is None:
             if not self._prefetch_states:
@@ -1421,40 +1446,32 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                 )
             prefetch_state = self._prefetch_states.popleft()
 
-        res = DynamicEmbeddingFunction.apply(
-            prefetch_state,
-            offsets,
-            self._cache,
-            self._storage,
-            self.output_dtype,
-            self._initializer,
-            self._optimizer,
-            layout,
-            self._admitter,
-            self._evict_strategy,
-            pooling_weights,
-            self._native_lookup,
-            self._empty_tensor,
-        )
-        # Grad-mode forwards keep their slot pins until backward. Without an
-        # autograd graph, release on this stream after the gather consumed them.
-        if not res.requires_grad and prefetch_state.slot_indices is not None:
-            owner = (
-                self._cache
-                if prefetch_state.storage_mode == StorageMode.CACHE
-                else self._storage
-            )
-            # A later batch's prefetch may have rehashed the table since this one's.
-            refresh_slots_after_rehash(owner._state, prefetch_state)
-            release_slot_pins(
-                self._cache,
-                self._storage,
-                prefetch_state.storage_mode,
-                prefetch_state.slot_indices,
-                prefetch_state.unique_table_ids,
-            )
-        if not res.requires_grad and prefetch_state.active_rows is not None:
-            prefetch_state.active_rows.release(prefetch_state)
+        prefetch_state.record_stream(torch.cuda.current_stream())
+
+        prefetch_state.used = True
+        try:
+            with torch.set_grad_enabled(self.training and torch.is_grad_enabled()):
+                res = DynamicEmbeddingFunction.apply(
+                    prefetch_state,
+                    offsets,
+                    self._cache,
+                    self._storage,
+                    self.output_dtype,
+                    self._initializer,
+                    self._optimizer,
+                    layout,
+                    self._admitter,
+                    self._evict_strategy,
+                    pooling_weights,
+                    self._native_lookup,
+                    self._empty_tensor,
+                    self.output_alloc,
+                )
+        except BaseException:
+            prefetch_state.release()
+            raise
+        if not res.requires_grad:
+            prefetch_state.release()
         if isinstance(self._cache, DynamicEmbCache):
             self._cache.training = False
         if isinstance(self._storage, (DynamicEmbStorage, HybridStorage)):
@@ -1558,7 +1575,7 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
             if isinstance(self._storage, (DynamicEmbStorage, HybridStorage)):
                 self._storage.training = False
                 self._storage.set_score(fused_score)
-            return dynamicemb_resolve_eval(
+            state = dynamicemb_resolve_eval(
                 indices,
                 offsets,
                 self._cache,
@@ -1568,6 +1585,8 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                 self._external_storage,
                 self._table_gate,
             )
+            state.input_frequencies = frequency_counters
+            return state
         # These checks used to precede prefetch in forward. Keep them before
         # input_dist can initialize rows or take pins as well.
         self._check_training_mode()
@@ -1619,6 +1638,7 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
             optimizer=self._optimizer,
         )
         self._update_score()
+        state.input_frequencies = frequency_counters
         return state
 
     def set_score(
@@ -2870,9 +2890,9 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
         this kind of key at all, so a consumer can tell "nothing was removed"
         from "this table does not record removals".
         """
-        from dynamicemb.incremental_dump import (  # lazy: avoid import cycle
+        from dynamicemb.incremental_dump import (
             _all_gather_evicted_keys,
-        )
+        )  # lazy: avoid import cycle
 
         if not wanted or not hasattr(storage, method):
             return None

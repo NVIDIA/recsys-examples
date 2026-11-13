@@ -92,6 +92,9 @@ class _StorageWithActiveRows:
 
     def find(self, keys, table_ids, **kwargs):
         result = self._storage.find(keys, table_ids, **kwargs)
+        states = self._active.states
+        if not states:
+            return result
         (
             n,
             missing_keys,
@@ -104,7 +107,7 @@ class _StorageWithActiveRows:
         ) = result
         live = torch.zeros_like(found)
         stream = torch.cuda.current_stream()
-        for batch in self._active.states:
+        for batch in states:
             batch.record_stream(stream)
             persisted = batch.persisted_unique_indices
             si, ti = matching_rows(

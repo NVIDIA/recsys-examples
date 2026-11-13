@@ -19,6 +19,7 @@ from collections import defaultdict
 from typing import Dict, List, Optional, Tuple
 
 import click
+import hier_switch
 import torch
 import torch.distributed as dist
 import torch.nn as nn
@@ -462,6 +463,7 @@ def test_lfu_score_validation(
         actual_scores,
         tolerance,
     )
+    hier_switch.release()
 
 
 if __name__ == "__main__":

@@ -89,7 +89,19 @@ class TorchRecLookup:
             self._modules[weighted] = module
         return self._modules[weighted]
 
-    def __call__(self, unique_embs, batch, offsets, output_dtype, pooling_weights=None):
+    def __call__(
+        self,
+        unique_embs,
+        batch,
+        offsets,
+        output_dtype,
+        pooling_weights=None,
+        *,
+        indices=None,
+    ):
+        # Normally indices address the compact unique workspace. A single HBM
+        # table/cache can instead bind its persistent buffer and physical rows.
+        indices = batch.reverse_indices if indices is None else indices
         module = self._module(pooling_weights is not None)
         pooled = self._pooling_mode != DynamicEmbPoolingMode.NONE
         # DynamicEmb accumulates pooling in fp32, independently of the stored
@@ -118,7 +130,7 @@ class TorchRecLookup:
             embedding.weight.data = weight
             embedding.num_embeddings = weight.size(0)
         if self._uniform:
-            count = batch.reverse_indices.numel()
+            count = indices.numel()
             lengths = (
                 offsets[1:] - offsets[:-1]
                 if pooled
@@ -130,7 +142,7 @@ class TorchRecLookup:
             # the public cache so native lookup does not split it or reconstruct
             # offsets with another GPU scan/cat (pooling uses our input offsets).
             jt = JaggedTensor(
-                values=batch.reverse_indices,
+                values=indices,
                 lengths=lengths,
                 offsets=offsets if pooled else None,
                 weights=pooling_weights,
@@ -139,7 +151,7 @@ class TorchRecLookup:
             # avoids a device-to-host length reduction in native to_dict().
             features = KeyedJaggedTensor(
                 keys=self._feature_names,
-                values=batch.reverse_indices,
+                values=indices,
                 offsets=offsets if pooled else None,
                 lengths=lengths,
                 weights=pooling_weights,

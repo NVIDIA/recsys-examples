@@ -89,6 +89,12 @@ To install DynamicEmb, please use the following command:
 python setup.py install
 ```
 
+It builds DynamicEmb's kernels for the GPU architectures in `DEMB_ARCHS`: by default `75;80;90;100;103;120` (`103` is GB300), less those the CUDA compiler cannot build (sm_103 needs CUDA 12.9 or newer). `TORCH_CUDA_ARCH_LIST` does not apply to them. To build for fewer, for example only GB300:
+
+```bash
+DEMB_ARCHS=103 python setup.py install
+```
+
 ## DynamicEmb APIs
 
 Regarding how to use the DynamicEmb APIs and their parameters, please refer to the [DynamicEmb_APIs.md](./DynamicEmb_APIs.md) file in the same folder as this document.

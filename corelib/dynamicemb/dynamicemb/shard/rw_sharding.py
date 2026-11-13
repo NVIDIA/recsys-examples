@@ -15,11 +15,18 @@
 
 # pyre-strict
 
+import logging
+import warnings
 from dataclasses import replace
+from functools import partial
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
 import torchrec
+from fbgemm_gpu.split_table_batched_embeddings_ops_training import (
+    SplitTableBatchedEmbeddingBagsCodegen,
+)
+from fbgemm_gpu.tbe.ssd.training import SSDTableBatchedEmbeddingBags
 from packaging.version import Version
 from torch import distributed as dist
 from torchrec.distributed.embedding_kernel import BaseEmbedding
@@ -50,6 +57,15 @@ from ..batched_dynamicemb_compute_kernel import (
     BatchedDynamicEmbedding,
     BatchedDynamicEmbeddingBag,
 )
+from ..batched_dynamicemb_tables import BatchedDynamicEmbeddingTablesV2
+from ..dynamicemb_config import (
+    AUTO_OUTPUT_DIST,
+    HIERARCHICAL_OUTPUT_DIST,
+    TORCHREC_OUTPUT_DIST,
+    DynamicEmbTableOptions,
+)
+from ..scored_kjt import get_scores
+from .hier_output_dist import HierDist, RwSequenceHierEmbeddingDist
 from .input_dist import RwSparseFeaturesDist
 from .resolved_input import ResolvedEmbeddingInput
 
@@ -135,6 +151,20 @@ class _DynamicLookupMixin(torch.nn.Module):
     def _prefetch_raw(self, features, forward_stream):
         raise NotImplementedError
 
+    def register_optim_state_tracker_fn(self, record_fn):
+        # TorchRec observers still identify rows by keys. Only the kernel
+        # boundary consumes physical row indices; preserve the observer API.
+        if record_fn is None:
+            self.optim_state_tracker_fn = None
+            return
+
+        def track(features, values, emb_op):
+            if isinstance(features, ResolvedEmbeddingInput):
+                features = features.original_features()
+            return record_fn(features, values, emb_op)
+
+        self.optim_state_tracker_fn = track
+
     def __init__(self, grouped_configs, *args, **kwargs) -> None:
         processor = kwargs.get("feature_processor")
         self._input_processor_flags = [
@@ -169,44 +199,53 @@ class _DynamicLookupMixin(torch.nn.Module):
     def resolve_input(self, features: KeyedJaggedTensor) -> KeyedJaggedTensor:
         groups = features.split(self._feature_splits)
         resolved = []
-        for emb, group, processed in zip(
-            self._emb_modules, groups, self._input_processor_flags
-        ):
-            if processed:
-                assert self._feature_processor is not None
-                group = self._feature_processor(group)
-                weights = group.weights_or_none()
-                if (
-                    torch.is_grad_enabled()
-                    and self.training
-                    and emb._config.is_weighted
-                    and weights is not None
-                    and weights.requires_grad
-                ):
-                    raise ValueError(
-                        "pooling_weights with requires_grad=True is not supported"
+        try:
+            for emb, group, processed in zip(
+                self._emb_modules, groups, self._input_processor_flags
+            ):
+                if processed:
+                    assert self._feature_processor is not None
+                    group = self._feature_processor(group)
+                    weights = group.weights_or_none()
+                    if (
+                        torch.is_grad_enabled()
+                        and self.training
+                        and emb._config.is_weighted
+                        and weights is not None
+                        and weights.requires_grad
+                    ):
+                        raise ValueError(
+                            "pooling_weights with requires_grad=True is not supported"
+                        )
+                with torch.no_grad():
+                    resolved.append(
+                        emb.resolve_input(group)
+                        if isinstance(
+                            emb, (BatchedDynamicEmbedding, BatchedDynamicEmbeddingBag)
+                        )
+                        else group
                     )
-            with torch.no_grad():
-                resolved.append(
-                    emb.resolve_input(group)
-                    if isinstance(
-                        emb, (BatchedDynamicEmbedding, BatchedDynamicEmbeddingBag)
-                    )
-                    else group
-                )
-        if not any(isinstance(group, ResolvedEmbeddingInput) for group in resolved):
-            return features
-        if len(resolved) == 1:
-            # The group's KJT already has the resolved rows and processed
-            # metadata. Avoid concatenating it into a wrapper whose only split
-            # would immediately hand the same group back to lookup.
-            return resolved[0]
-        return ResolvedEmbeddingInput.from_groups(
-            features,
-            resolved,
-            self._feature_splits,
-            recompute_lengths=any(self._input_processor_flags),
-        )
+            if not any(isinstance(group, ResolvedEmbeddingInput) for group in resolved):
+                return features
+            if len(resolved) == 1:
+                # The group's KJT already has the resolved rows and processed
+                # metadata. Avoid concatenating it into a wrapper whose only split
+                # would immediately hand the same group back to lookup.
+                return resolved[0]
+            return ResolvedEmbeddingInput.from_groups(
+                features,
+                resolved,
+                self._feature_splits,
+                recompute_lengths=any(self._input_processor_flags),
+            )
+        except BaseException:
+            # A later group's validation/backend failure must not strand the
+            # reservations of groups that already resolved successfully.
+            for group in resolved:
+                state = getattr(group, "prefetch_state", None)
+                if state is not None:
+                    state.release()
+            raise
 
     def prefetch(
         self,
@@ -234,10 +273,58 @@ class _DynamicLookupMixin(torch.nn.Module):
                 )
 
 
-class GroupedEmbeddingsLookup(_DynamicLookupMixin, _GroupedEmbeddingsLookup):
-    def _prefetch_raw(self, features, forward_stream):
-        return _GroupedEmbeddingsLookup.prefetch(self, features, forward_stream)
+def built_output_dist(kind: str) -> str:
+    """Output dist ``kind`` as this build of DynamicEmb runs it: ``"auto"`` is
+    ``"hierarchical"`` when the build has it (``HierOutputDist``, which needs
+    NCCL >= 2.30.7), else TorchRec's dists (with a warning);
+    ``"hierarchical"`` raises ``ImportError`` when it does not."""
+    import dynamicemb_extensions
 
+    built = hasattr(dynamicemb_extensions, "HierOutputDist")
+    if kind == AUTO_OUTPUT_DIST:
+        if built:
+            return HIERARCHICAL_OUTPUT_DIST
+        warnings.warn(
+            'output_dist="auto": DynamicEmb was built without NCCL >= 2.30.7, so '
+            "without its hierarchical dist; using TorchRec's dists"
+        )
+        return TORCHREC_OUTPUT_DIST
+    if kind == HIERARCHICAL_OUTPUT_DIST and not built:
+        raise ImportError(
+            'output_dist="hierarchical" needs dynamicemb built against NCCL >= 2.30.7 '
+            "(this build has no hierarchical dist; set NCCL_HOME to a newer NCCL "
+            'and rebuild, or use "auto")'
+        )
+    return kind
+
+
+def output_dist_options(
+    sharding_infos: List[EmbeddingShardingInfo],
+) -> Optional[DynamicEmbTableOptions]:
+    """The options of the sharding's DynamicEmb tables, which must agree on
+    ``output_dist``, ``output_dist_capacity`` and ``node_dedup``: one output
+    dist serves the whole sharding. None when the sharding has no DynamicEmb
+    table (plain TorchRec tables do not vote)."""
+    voters = [
+        info.fused_params["dynamicemb_options"]
+        for info in sharding_infos
+        if (info.fused_params or {}).get("dynamicemb_options") is not None
+    ]
+    choices = [
+        (options.output_dist, options.output_dist_capacity, options.node_dedup)
+        for options in voters
+    ]
+    for choice in choices[1:]:
+        if choice != choices[0]:
+            raise ValueError(
+                "The DynamicEmb tables of one row-wise sharding must agree on "
+                "output_dist, output_dist_capacity and node_dedup; one table has "
+                f"{choices[0]}, another {choice}."
+            )
+    return voters[0] if voters else None
+
+
+class GroupedEmbeddingsLookup(_DynamicLookupMixin, _GroupedEmbeddingsLookup):
     def _create_embedding_kernel(
         self,
         config: GroupedEmbeddingConfig,
@@ -263,6 +350,112 @@ class GroupedEmbeddingsLookup(_DynamicLookupMixin, _GroupedEmbeddingsLookup):
                 pg=pg,
                 device=device,
             )
+
+    def _prefetch_raw(
+        self,
+        sparse_features: KeyedJaggedTensor,
+        forward_stream: Optional[torch.cuda.Stream] = None,
+    ) -> None:
+        """TorchRec's, but a DynamicEmb group's tables also get its keys'
+        weights, their frequency counters, and the keys' scores where the
+        tables take a score per key, as its forward gives them. TorchRec
+        passes keys and offsets alone. Under the prefetch pipelines the LFU
+        scores and admission counters would then differ from the plain loop's
+        wherever weights count occurrences: index dedup's (whatever the
+        output dist); and tables that take a score per key refuse a prefetch
+        without the scores."""
+        if not self._need_prefetch:
+            return
+        for emb_op, features in zip(
+            self._emb_modules, self._group_features(sparse_features)
+        ):
+            emb = emb_op.emb_module
+            if isinstance(emb, BatchedDynamicEmbeddingTablesV2):
+                emb.prefetch(
+                    features.values().to(emb.index_type),
+                    features.offsets().long(),
+                    forward_stream=forward_stream,
+                    frequency_counters=features.weights_or_none(),
+                    scores=get_scores(features) if emb.per_key_score else None,
+                )
+                continue
+            if (
+                isinstance(
+                    emb,
+                    (
+                        SplitTableBatchedEmbeddingBagsCodegen,
+                        SSDTableBatchedEmbeddingBags,
+                    ),
+                )
+                and not emb.prefetch_pipeline
+            ):
+                logging.error(
+                    f"Invalid setting on {type(emb)} modules. prefetch_pipeline must "
+                    "be set to True.\nIf you don't turn on prefetch_pipeline, cache "
+                    "locations might be wrong in backward and can cause wrong results.\n"
+                )
+            if hasattr(emb, "prefetch"):
+                emb.prefetch(
+                    indices=features.values(),
+                    offsets=features.offsets(),
+                    forward_stream=forward_stream,
+                )
+
+    def _group_features(
+        self, sparse_features: KeyedJaggedTensor
+    ) -> List[KeyedJaggedTensor]:
+        """The features of each lookup group."""
+        return sparse_features.split(self._feature_splits)
+
+
+class HierGroupedEmbeddingsLookup(GroupedEmbeddingsLookup):
+    """The lookup of a sharding on the hierarchical dist. A call takes that
+    path when its KJT is the one its input dist returned, whatever the
+    module's mode. For such a call each group writes its rows straight into
+    the call's rows of ``op.lookup_rows``, through the tables'
+    ``output_alloc``. The groups' outputs come back as those rows, without a
+    copy (``HierDist.lookup``). See docs/hier_output_dist.md, section
+    7.4.
+    """
+
+    def __init__(
+        self,
+        grouped_configs: List[GroupedEmbeddingConfig],
+        hier: HierDist,
+        pg: Optional[dist.ProcessGroup] = None,
+        device: Optional[torch.device] = None,
+    ) -> None:
+        super().__init__(grouped_configs=grouped_configs, pg=pg, device=device)
+        self._hier = hier
+        for module in self._emb_modules:
+            emb = module.emb_module
+            if emb.output_dtype != hier.dtype:
+                raise ValueError(
+                    f"A lookup group outputs {emb.output_dtype} and the "
+                    f"hierarchical dist's rows are {hier.dtype}: give the tables "
+                    "of the sharding one output_dtype."
+                )
+            emb.output_alloc = hier.lookup_buffer
+
+    def forward(self, sparse_features: KeyedJaggedTensor) -> torch.Tensor:
+        if not self._hier.owns(sparse_features):
+            return super().forward(sparse_features)
+        look_ups = [
+            partial(self._look_up, emb_op, features)
+            for emb_op, features in zip(
+                self._emb_modules, self._group_features(sparse_features)
+            )
+        ]
+        return self._hier.lookup(sparse_features, look_ups)
+
+    def _look_up(self, emb_op, features: KeyedJaggedTensor) -> torch.Tensor:
+        lookup = emb_op(features)
+        # TorchRec's model delta tracker, from TorchRec 1.5 on. It reads the
+        # rows in the keys' order.
+        tracker = getattr(self, "optim_state_tracker_fn", None)
+        if tracker is not None:
+            tracker(features, self._hier.in_key_order(lookup).view(-1), emb_op)
+        return lookup
 
 
 class RwSequenceDynamicEmbeddingSharding(RwSequenceEmbeddingSharding):
@@ -299,6 +492,104 @@ class RwSequenceDynamicEmbeddingSharding(RwSequenceEmbeddingSharding):
         )
         self._per_key_score: bool = sharding_takes_scores(sharding_infos)
         self._has_dynamic_tables = sharding_has_dynamic_tables(sharding_infos)
+        self._hier: Optional[HierDist] = None
+        options = output_dist_options(sharding_infos)
+        if (
+            options is None
+            or built_output_dist(options.output_dist) != HIERARCHICAL_OUTPUT_DIST
+        ):
+            return
+        if options.output_dist_capacity is None:
+            # "auto" alone gets here without one: "hierarchical" needs it
+            # (DynamicEmbTableOptions).
+            warnings.warn(
+                f'output_dist="{options.output_dist}" without output_dist_capacity; '
+                "using TorchRec's dists"
+            )
+            return
+        self._hier = self._hier_dist(sharding_infos, options)
+
+    def _hier_dist(
+        self,
+        sharding_infos: List[EmbeddingShardingInfo],
+        options: DynamicEmbTableOptions,
+    ) -> Optional[HierDist]:
+        """The hierarchical dist of ``output_dist="hierarchical"`` (or
+        ``"auto"``), or None (with a warning) where it does not apply and the
+        sharding stays on TorchRec's dists. Tables that take a score per key
+        (``PRECISE_CUSTOMIZED``) raise ValueError under ``"hierarchical"`` and
+        stay on TorchRec's dists under ``"auto"``. Decided from the sharding
+        alone, so the same on every rank."""
+        asked = options.output_dist
+        why = None
+        if self._pg.size() == 1:
+            why = "the sharding has one rank"
+        elif self._has_feature_processor:
+            why = "the sharding has feature processors"
+        elif any(
+            info.param_sharding.compute_kernel
+            != EmbeddingComputeKernel.CUSTOMIZED_KERNEL.value
+            for info in sharding_infos
+        ):
+            why = "the sharding has tables that are not DynamicEmb tables"
+        if why is not None:
+            warnings.warn(
+                f'output_dist="{asked}" does not apply here ({why}); '
+                "using TorchRec's dists"
+            )
+            return None
+        if self._per_key_score:
+            # A key crosses it with one float32 weight, which a proxy adds up
+            # over the key's occurrences, and nothing beside it: an int64
+            # score, the largest of the key's occurrences', has no way through.
+            refusal = (
+                "it does not carry a score per key (the tables' score_strategy "
+                "PRECISE_CUSTOMIZED)"
+            )
+            if asked == HIERARCHICAL_OUTPUT_DIST:
+                raise ValueError(
+                    f'output_dist="{asked}": {refusal}; use '
+                    f'output_dist="{TORCHREC_OUTPUT_DIST}"'
+                )
+            warnings.warn(f'output_dist="{asked}": {refusal}; using TorchRec\'s dists')
+            return None
+        # The rows of the lookup output: an EmbeddingCollection's tables share
+        # one dim, and the lookup casts to the sharder's output_dtype (fp32 by
+        # default).
+        info = sharding_infos[0]
+        output_dtype = (info.fused_params or {}).get("output_dtype", torch.float32)
+        if hasattr(output_dtype, "as_dtype"):  # an fbgemm SparseType
+            output_dtype = output_dtype.as_dtype()
+        # The table of each feature, in the sharding's feature order: across
+        # nodes a key is its table and value.
+        tables = [
+            table_idx
+            for table_idx, table in enumerate(self.embedding_tables())
+            for _ in table.feature_names
+        ]
+        # A clipping table clamps each looked-up row's gradient before the
+        # per-key sum, so every row TorchRec's dists send must cross on its
+        # own: node dedup off, and the sharder's index dedup on (HierDist.setup).
+        clipping = any(
+            (sharding_info.fused_params or {}).get("gradient_clipping", False)
+            for sharding_info in sharding_infos
+        )
+        return HierDist(
+            self._pg,
+            self._get_num_features(),
+            info.embedding_config.embedding_dim,
+            output_dtype,
+            options.output_dist_capacity,
+            asked=asked,
+            tables=tables,
+            node_dedup=options.node_dedup and not clipping,
+            # the lookup groups (HierGroupedEmbeddingsLookup's), in the
+            # sharding's feature order
+            groups=[
+                config.num_features() for config in self._grouped_embedding_configs
+            ],
+            clipping=clipping,
+        )
 
     def create_input_dist(
         self,
@@ -319,6 +610,7 @@ class RwSequenceDynamicEmbeddingSharding(RwSequenceEmbeddingSharding):
             ],
             per_key_score=self._per_key_score,
             input_postprocessor=self._input_postprocessor,
+            hier=self._hier,
         )
 
     def create_lookup(
@@ -327,15 +619,35 @@ class RwSequenceDynamicEmbeddingSharding(RwSequenceEmbeddingSharding):
         fused_params: Optional[Dict[str, Any]] = None,
         feature_processor: Optional[BaseGroupedFeatureProcessor] = None,
     ) -> BaseEmbeddingLookup:
-        lookup = GroupedEmbeddingsLookup(
-            grouped_configs=self._grouped_embedding_configs,
-            pg=self._pg,
-            device=device if device is not None else self._device,
-        )
+        device = device if device is not None else self._device
+        if self._hier is not None:
+            lookup = HierGroupedEmbeddingsLookup(
+                self._grouped_embedding_configs, self._hier, self._pg, device
+            )
+        else:
+            lookup = GroupedEmbeddingsLookup(
+                grouped_configs=self._grouped_embedding_configs,
+                pg=self._pg,
+                device=device,
+            )
         self._input_postprocessor = (
             lookup.resolve_input if self._has_dynamic_tables else None
         )
         return lookup
+
+    def create_output_dist(
+        self,
+        device: Optional[torch.device] = None,
+    ):
+        if self._hier is not None:
+            return RwSequenceHierEmbeddingDist(
+                self._hier,
+                self._pg,
+                self._get_num_features(),
+                device if device is not None else self._device,
+                qcomm_codecs_registry=self.qcomm_codecs_registry,
+            )
+        return super().create_output_dist(device)
 
 
 class GroupedPooledEmbeddingsLookup(
@@ -436,7 +748,6 @@ class RwPooledDynamicEmbeddingSharding(RwPooledEmbeddingSharding):
             feature_processor=feature_processor,
             sharding_type=ShardingType.ROW_WISE,
         )
-
         self._input_postprocessor = (
             lookup.resolve_input if self._has_dynamic_tables else None
         )
