@@ -97,7 +97,6 @@ from dynamicemb.shard.embedding import ShardedDynamicEmbeddingCollection
 from dynamicemb.shard.hier_output_dist import (
     _NODE_SIZES,
     HierDist,
-    NVLinkCheckError,
     _agreed_node_size,
     _first_failure,
     _split_host,
@@ -217,10 +216,8 @@ def check_node_size(rank: int, world_size: int, log: Callable) -> int:
     any rank reads NCCL's team.
     With a size every rank reads that is not NCCL's team, the op's own
     communicator refuses the node: every rank warns, giving the team's size,
-    and takes TorchRec's dists; across hosts that NVLink does not join,
-    node_size refuses that node first, and the sharding raises
-    NVLinkCheckError. The checks of the sizes, and of the hosts that nodes
-    split, also run on lists of their own."""
+    and takes TorchRec's dists. The checks of the sizes, and of the hosts
+    that nodes split, also run on lists of their own."""
     checks: Dict[str, bool] = {}
     last = world_size - 1
     ranks = tuple(range(world_size))
@@ -303,41 +300,32 @@ def check_node_size(rank: int, world_size: int, log: Callable) -> int:
             )
             messages.append(msg)
         # A node the ranks agree on that is not NCCL's team: the op's own
-        # communicator refuses it (its LSA check). Across nodes the node is
-        # every rank, one node, which takes no GIN; on one node it is half
-        # of it, whose two nodes ask for GIN, which NCCL may refuse there
-        # before that check (the warning then says why, not the team). A
-        # node across hosts that NVLink does not join (Eos) node_size
-        # refuses first, and "hierarchical" raises NVLinkCheckError.
-        node = world_size if NODES > 1 else max(NODE_SIZE // 2, 1)
+        # communicator refuses it (its LSA check). The node is half of the
+        # team's, inside the team's NVLink domain, also across nodes (a node
+        # of every rank would span hosts that only IB joins, which node_size
+        # refuses first). Its nodes ask for GIN, which NCCL may refuse before
+        # that check (the warning then says why, not the team).
+        node = max(NODE_SIZE // 2, 1)
         if node != NODE_SIZE and world_size % node == 0:
             _NODE_SIZES.pop(ranks, None)
             dynamicemb_extensions.hier_output_dist_lsa_size = wrapped(lambda size: node)
-            unlinked = ""
             with warnings.catch_warnings(record=True) as caught:
                 warnings.simplefilter("always")
                 hier = standalone(dist.group.WORLD)
-                try:
-                    took = hier.setup(*bucketize_rules(3), False, True)
-                except NVLinkCheckError as err:
-                    took, unlinked = False, str(err)
+                took = hier.setup(*bucketize_rules(3), False, True)
             said = [
                 str(warning.message)
                 for warning in caught
                 if "using TorchRec" in str(warning.message)
             ]
-            msg = unlinked or (said[0] if len(said) == 1 else "")
+            msg = said[0] if len(said) == 1 else ""
             team = f"has {NODE_SIZE} ranks, not the {node} of its node"
             checks["the op refuses a node that is not the team"] = (
                 same_everywhere(msg)
                 and took is False
                 and hier.op is None
                 and msg != ""
-                and (
-                    team in msg
-                    or (NODES == 1 and "LSA team" not in msg)
-                    or (NODES > 1 and "NVLink does not connect" in msg)
-                )
+                and (team in msg or "LSA team" not in msg)
             )
             messages.append(msg)
             del hier
