@@ -26,8 +26,6 @@ late), shardings that take TorchRec's dists, and the teardown with a
 pipeline in flight. On one
 GPU the sharding takes TorchRec's dists. On a build without the op (NCCL
 older than 2.30.7), "hierarchical" raises and "auto" takes TorchRec's dists.
-On GPUs of a node that NVLink does not connect (a host of PCIe GPUs), both
-take TorchRec's dists, with a warning.
 
 Run it from ``corelib/dynamicemb``, one process per GPU (on one node, or
 across nodes under Slurm)::
@@ -103,12 +101,7 @@ if HAS_HIER_DIST:
 sys.path.insert(
     0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "benchmark")
 )
-from benchmark_utils import (  # noqa: E402
-    hier_capacities,
-    hier_needs,
-    hier_unlinked,
-    init_distributed,
-)
+from benchmark_utils import hier_capacities, hier_needs, init_distributed  # noqa: E402
 
 DEV = torch.device("cuda")
 NUM_EMBEDDINGS = 1 << 20
@@ -1469,26 +1462,6 @@ def run_without_hier_dist(rank: int, log: Callable) -> int:
     return report("a build without the hierarchical dist", checks, log) + gc_models(log)
 
 
-def run_unlinked(rank: int, why: str, log: Callable) -> int:
-    """GPUs of a node that NVLink does not connect (a host of PCIe GPUs):
-    with capacities, "hierarchical" and "auto" each warn once per model,
-    giving node_size's error ``why``, and train on TorchRec's dists (plain
-    loop and TrainPipelineSparseDist) exactly as "torchrec" does."""
-    runs = {}
-    with warnings.catch_warnings(record=True) as caught:
-        warnings.simplefilter("always")
-        for asked in ("hierarchical", "auto"):
-            for kind in ("plain", "sparse_dist"):
-                runs[f"{asked}, {kind}"] = run(UNIFORM, asked, kind, rank)
-    warns = sum(why in str(warning.message) for warning in caught)
-    checks = {"warned once per model": warns == len(runs)}
-    torchrec_run = run(UNIFORM, "torchrec", "plain", rank)
-    for name, got in runs.items():
-        checks[f"{name}: fwd"] = same_outs(got.outs, torchrec_run.outs)
-        checks[f"{name}: tables"] = same_tables(got.tables, torchrec_run.tables)[0]
-    return report("a node NVLink does not connect", checks, log) + gc_models(log)
-
-
 # ── teardown ─────────────────────────────────────────────────────────────────
 
 
@@ -1577,14 +1550,7 @@ def main() -> None:
     # Spins that trap after two minutes instead of the process group's timeout.
     os.environ.setdefault("DYNAMICEMB_HIER_TIMEOUT_S", "120")
     rank, world_size, _, LOCAL = init_distributed()
-    # GPUs of a node that NVLink does not connect: every sharding takes
-    # TorchRec's dists, as without the op
-    unlinked = hier_unlinked(dist.group.WORLD) if HAS_HIER_DIST else None
-    NODE = (
-        node_size(dist.group.WORLD)
-        if HAS_HIER_DIST and unlinked is None
-        else min(LOCAL, world_size)
-    )
+    NODE = node_size(dist.group.WORLD) if HAS_HIER_DIST else min(LOCAL, world_size)
     EXACT = (world_size & (world_size - 1)) == 0 and world_size <= 128
 
     def log(msg: str) -> None:
@@ -1600,8 +1566,6 @@ def main() -> None:
     instrument()
     if not HAS_HIER_DIST:
         failures = run_without_hier_dist(rank, log)
-    elif unlinked is not None:
-        failures = run_unlinked(rank, unlinked, log)
     elif world_size == 1:
         failures = run_one_rank(rank, log)
     else:

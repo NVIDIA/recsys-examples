@@ -337,9 +337,11 @@ every rank before you drop a model (section 4.6).
   when an NVLink joins them or each reaches an NVSwitch (an NVLink whose
   other end NVML does not name counts as one to an NVSwitch). If two GPUs
   of a node are not, or a rank of a node of more than one GPU cannot read
-  its GPU (without nvidia-ml-py, say), every rank warns, naming the first
-  such pair of ranks, or the rank and why, and takes TorchRec's dists
-  (section 6).
+  its GPU (without nvidia-ml-py, say), `node_size` raises
+  `NVLinkCheckError` (a `RuntimeError`, from `dynamicemb.shard`) on every
+  rank, naming the first such pair of ranks, or the rank and why. A
+  sharding on `"hierarchical"` then raises it at its first `input_dist()`,
+  and one on `"auto"` warns and takes TorchRec's dists (section 6).
 * Fewer than 2^31 − 1024 (rank, feature) pairs: `world_size × num_features`
   (the planner numbers them with int32).
 * Rows (embedding dim × bytes of the output dtype) a multiple of 16 bytes,
@@ -633,7 +635,7 @@ state that every rank shares.
 | one rank in the sharding; a table of the sharding that is not a DynamicEmb table; feature processors | when sharding | a warning, TorchRec's dists |
 | tables that take a score per key (`score_strategy` `PRECISE_CUSTOMIZED`): a key crosses with one float32 weight, which a proxy adds up, and no score | when sharding | `"hierarchical"`: `ValueError`; `"auto"`: a warning, TorchRec's dists |
 | a GPU before compute capability 8.0 on some rank: the op's kernels take sm_80 instructions | first `input_dist()`, collectively (`node_size`), before the op is built | a warning on every rank that names the first such rank, TorchRec's dists |
-| GPUs of a node that NVLink does not connect (a host whose GPUs reach each other over PCIe alone, or NVLink bridges between pairs of them), or, in a node of more than one GPU, a rank that cannot read its GPU's NVLinks from NVML (nvidia-ml-py): section 4.2 | first `input_dist()`, collectively (`node_size`), before the op is built | a warning on every rank that names the first such pair of ranks, or the rank and why, TorchRec's dists |
+| GPUs of a node that NVLink does not connect (a host whose GPUs reach each other over PCIe alone, or NVLink bridges between pairs of them), or, in a node of more than one GPU, a rank that cannot read its GPU's NVLinks from NVML (nvidia-ml-py): section 4.2 | first `input_dist()`, collectively (`node_size`), before the op is built | `"hierarchical"`: `NVLinkCheckError` (a `RuntimeError`) on every rank, naming the first such pair of ranks, or the rank and why; `"auto"`: a warning, TorchRec's dists |
 | a rank that cannot read the node, NCCL's LSA team (`node_size`: an NCCL error, but for one inside the initialization of its communicator on some ranks only, which leaves the others waiting there: section 19), or ranks that read teams of different sizes | first `input_dist()`, collectively, before the op is built | a warning on every rank that names the first such rank and why, TorchRec's dists |
 | ranks that would build the op from different options, capacities or environment values | first `input_dist()`, before the op is built | `ValueError` on every rank, naming the first rank and value that differ |
 | ranks that are not whole nodes; `world_size × num_features` of 2^31 − 1024 or more; rows not a multiple of 16 bytes | first `input_dist()` | a warning, TorchRec's dists |
@@ -829,11 +831,13 @@ same point on every rank:
    LSA team (`ncclTeamLsa`) and ends it, and a second all-gather checks
    that every rank read the same size, which divides the ranks, and, from
    each rank's GPU as NVML gives it, that NVLink connects every two GPUs
-   of a node (section 4.2). If a rank cannot (an NCCL error), the ranks
-   disagree, or NVLink does not connect a node, every rank warns and takes
-   TorchRec's dists, but for an NCCL error inside the communicator's
-   initialization on some ranks only, which leaves the others waiting there
-   (section 19). Else the size is `local_size`, and `world_size /
+   of a node (section 4.2). If it does not, `"hierarchical"` raises
+   `NVLinkCheckError` on every rank, and `"auto"` warns and takes
+   TorchRec's dists. If a rank cannot (an NCCL error) or the ranks
+   disagree, every rank warns and takes TorchRec's dists, but for an NCCL
+   error inside the communicator's initialization on some ranks only, which
+   leaves the others waiting there (section 19). Else the size is
+   `local_size`, and `world_size /
    local_size` the nodes. The second all-gather also gives each rank's host
    name: when the nodes split the GPUs of a host, every rank warns (section
    4.2).
@@ -3116,16 +3120,7 @@ that differs on one rank, a size that does not divide the ranks and an
 error on one rank each raise the same `RuntimeError` on every rank, and a
 sharding then takes TorchRec's dists; with a size every rank reads that is
 not the team, the op's own communicator refuses the node, and every rank
-warns, giving the team's size, and takes TorchRec's dists. The NVLink check
-runs on lists of its own (a host of NVSwitches, of PCIe alone and of
-NVLink pairs, and two trays of one clique and of two), and with the last
-rank's GPU read as linked to nothing: every rank raises the same
-`RuntimeError`, naming the pair, and a sharding takes TorchRec's dists. On
-GPUs of a node that NVLink does not connect, `test_hier_dist.py` checks
-only that a sharding takes TorchRec's dists, `test_hier_pipeline.py` that
-models on `"hierarchical"` and `"auto"` train as on TorchRec's dists, and
-`test_hier_overflow.py` skips; the existing tests run again on the dist
-(below) then expect TorchRec's dists. End to end,
+warns, giving the team's size, and takes TorchRec's dists. End to end,
 `examples/hstu/test/test_hierarchical_dist.py` trains the HSTU ranking model
 on the hierarchical dist and on TorchRec's dists, under the example's
 JaggedMegatron pipelines, and compares them: the first step's loss and logits
@@ -3347,8 +3342,8 @@ on 1 and 3 CTAs, and the calls of the design's reference ports.
   check there). Ranks not numbered host by host give nodes smaller than a
   host: the dist then moves keys and rows between GPUs of one host over IB,
   and `node_size` warns. `LOCAL_WORLD_SIZE` does not set it. NVLink must
-  connect the GPUs of a node: on a host of PCIe GPUs every sharding takes
-  TorchRec's dists (section 4.2).
+  connect the GPUs of a node: on a host of PCIe GPUs `"hierarchical"`
+  raises and `"auto"` takes TorchRec's dists (section 4.2).
 * **Nodes of many GPUs**: `node_offsets` grows with `local_size² ×
   num_features` (section 15.2): at 72 GPUs per node about 1 MiB per GPU
   with 26 features and 40 MiB with 1,024, which every call also sends over
@@ -3455,7 +3450,7 @@ Paths from `corelib/dynamicemb`.
   `in_key_order`), what a call leaves its output dist (`HierCall`), the
   output dist, `quiesce` and the node (`node_size`: NCCL's LSA team, whose
   GPUs NVLink must connect, `_first_unlinked`, from what NVML gives of each
-  GPU, `_gpu_links`);
+  GPU, `_gpu_links`; else `NVLinkCheckError`);
   `input_dist.py` the hierarchical input dist
   (`hier_forward` and its two awaitables); `rw_sharding.py` the choice of
   dist, the lookup groups and the lookup; `embedding.py` the choice per call

@@ -50,9 +50,7 @@ A call that needs more than ``output_dist_capacity`` raises RuntimeError on
 every rank, under each pipeline.
 
 It needs DynamicEmb built against NCCL >= 2.30.7 (else it skips) and 2 or more
-GPUs (on one GPU the sharding takes TorchRec's dists: it skips), which NVLink
-connects (on a host of PCIe GPUs every sharding takes TorchRec's dists: it
-skips). Run it from
+GPUs (on one GPU the sharding takes TorchRec's dists: it skips). Run it from
 ``examples/hstu``, one process per GPU::
 
     PYTHONPATH=${PYTHONPATH}:$(realpath ../) torchrun --nproc_per_node 8 \\
@@ -124,14 +122,6 @@ def start() -> None:
     if dist.get_world_size() < 2:
         init.destroy_global_state()
         pytest.skip("on one GPU the sharding takes TorchRec's dists")
-    # GPUs of a node that NVLink does not connect (node_size, collective)
-    try:
-        node_size(dist.group.WORLD)
-    except RuntimeError as err:
-        if "NVLink does not connect" not in str(err):
-            raise
-        init.destroy_global_state()
-        pytest.skip(f"every sharding takes TorchRec's dists: {err}")
 
 
 def contextual(dtype: torch.dtype) -> List[str]:

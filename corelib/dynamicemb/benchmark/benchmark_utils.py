@@ -102,9 +102,8 @@ def hier_node_size(
     when the job runs inside one rack, and across racks what NCCL gives
     (docs/hier_output_dist.md, section 4.2). Where node_size raises, on
     every rank alike (a build without the hierarchical dist, a GPU before
-    compute capability 8.0, an NCCL error, GPUs of a node that NVLink does
-    not connect: see its docstring), the GPUs of a host,
-    ``local_world_size``, with a note on rank 0."""
+    compute capability 8.0, an NCCL error: see its docstring), the GPUs of
+    a host, ``local_world_size``, with a note on rank 0."""
     from dynamicemb.shard import node_size
 
     try:
@@ -113,24 +112,6 @@ def hier_node_size(
         if dist.get_rank(group) == 0:
             print(f"the node is a host of {local_world_size} GPUs ({err})", flush=True)
         return min(local_world_size, dist.get_world_size(group))
-
-
-def hier_unlinked(group: Optional[dist.ProcessGroup] = None) -> Optional[str]:
-    """Why the hierarchical dist refuses the nodes of ``group``'s ranks (the
-    default group if None) when NVLink does not connect the GPUs of one, as
-    on a host of PCIe GPUs: ``dynamicemb.shard.node_size``'s error, the same
-    on every rank. Every sharding there takes TorchRec's dists. None when
-    NVLink connects them; node_size's other errors raise. Collective the
-    first time, as node_size."""
-    from dynamicemb.shard import node_size
-
-    try:
-        node_size(group)
-    except RuntimeError as err:
-        if "NVLink does not connect" in str(err):
-            return str(err)
-        raise
-    return None
 
 
 # The capacities of output_dist_capacity, by name.

@@ -91,10 +91,19 @@ def _first_difference(every: List[Dict]) -> Optional[str]:
     return None
 
 
+class NVLinkCheckError(RuntimeError):
+    """:func:`node_size`'s error when it cannot confirm that NVLink connects
+    the GPUs of a node: NVLink does not connect two of them (a host of PCIe
+    GPUs, or GPUs that NVLink bridges in pairs), or a rank of a node of more
+    than one GPU cannot read its GPU's NVLinks from NVML. A sharding on
+    ``output_dist="hierarchical"`` raises it, and one on ``"auto"`` takes
+    TorchRec's dists (:meth:`HierDist.setup`)."""
+
+
 # What node_size read for the ranks of each process group, by their global
-# ranks, the same on every rank of the group: (size, None), or (None, why it
-# could not).
-_NODE_SIZES: Dict[Tuple[int, ...], Tuple[Optional[int], Optional[str]]] = {}
+# ranks, the same on every rank of the group: (size, None, False), or (None,
+# why it could not, whether the NVLink check refused the node).
+_NODE_SIZES: Dict[Tuple[int, ...], Tuple[Optional[int], Optional[str], bool]] = {}
 
 
 def node_size(pg: Optional[dist.ProcessGroup] = None) -> int:
@@ -116,16 +125,19 @@ def node_size(pg: Optional[dist.ProcessGroup] = None) -> int:
     ranks). The answer is kept for the group's ranks: a later call, on every
     rank, returns it at once. Raises RuntimeError, the same on every rank,
     when a rank cannot read it (a build without the hierarchical dist, a GPU
-    before compute capability 8.0, an NCCL error), when the ranks disagree,
-    and when NVLink does not connect two GPUs of a node: NCCL's team takes
-    the GPUs of a host whatever joins them, PCIe alone too, and the dist
-    moves a node's keys and rows over NVLink alone. Each rank reads its
-    GPU's NVLinks from NVML (nvidia-ml-py's ``pynvml``) with its team; in a
-    node of more than one GPU, a rank that cannot read them refuses the node
-    too (:func:`_first_unlinked`). A sharding then takes TorchRec's dists
-    (:meth:`HierDist.setup`). But an NCCL error inside the communicator's
-    initialization on some ranks only leaves the other ranks waiting there,
-    as with any NCCL communicator (docs/hier_output_dist.md, section 19).
+    before compute capability 8.0, an NCCL error) or the ranks disagree; a
+    sharding then takes TorchRec's dists. Raises :class:`NVLinkCheckError`
+    (a RuntimeError), the same on every rank, when NVLink does not connect
+    two GPUs of a node: NCCL's team takes the GPUs of a host whatever joins
+    them, PCIe alone too, and the dist moves a node's keys and rows over
+    NVLink alone. Each rank reads its GPU's NVLinks from NVML (nvidia-ml-py's
+    ``pynvml``) with its team; in a node of more than one GPU, a rank that
+    cannot read them refuses the node too (:func:`_first_unlinked`). A
+    sharding on ``"hierarchical"`` then raises, and one on ``"auto"`` takes
+    TorchRec's dists (:meth:`HierDist.setup`). But an NCCL error inside the
+    communicator's initialization on some ranks only leaves the other ranks
+    waiting there, as with any NCCL communicator (docs/hier_output_dist.md,
+    section 19).
     Warns, on every rank, when the team splits the GPUs of a host between
     nodes (ranks not numbered host by host): the dist moves keys and rows
     between those over IB, not NVLink."""
@@ -133,19 +145,19 @@ def node_size(pg: Optional[dist.ProcessGroup] = None) -> int:
     ranks = tuple(dist.get_process_group_ranks(group))
     if ranks not in _NODE_SIZES:
         _NODE_SIZES[ranks] = _read_node_size(group)
-    size, why = _NODE_SIZES[ranks]
+    size, why, unlinked = _NODE_SIZES[ranks]
     if why is not None:
-        raise RuntimeError(why)
+        raise (NVLinkCheckError if unlinked else RuntimeError)(why)
     return size
 
 
 def _read_node_size(
     group: dist.ProcessGroup,
-) -> Tuple[Optional[int], Optional[str]]:
-    """:func:`node_size`'s read on ``group``, collective: (size, None), or
-    (None, why not), the same on every rank: why not also when NVLink does
-    not connect the GPUs of a node (:func:`_first_unlinked`). Warns, on
-    every rank, when the nodes split a host (:func:`_split_host`)."""
+) -> Tuple[Optional[int], Optional[str], bool]:
+    """:func:`node_size`'s read on ``group``, collective: (size, None, False),
+    or (None, why not, whether the NVLink check refused the node:
+    :func:`_first_unlinked`), the same on every rank. Warns, on every rank,
+    when the nodes split a host (:func:`_split_host`)."""
     import dynamicemb_extensions
 
     rank, world_size = dist.get_rank(group), dist.get_world_size(group)
@@ -174,7 +186,7 @@ def _read_node_size(
     dist.all_gather_object(every, (unique_id, why), group=group)
     why = _first_failure([theirs for _, theirs in every])
     if why is not None:
-        return None, why
+        return None, why, False
     try:
         size, why = probe(every[0][0], rank, world_size), None
     except RuntimeError as err:
@@ -186,18 +198,18 @@ def _read_node_size(
     )
     why = _first_failure([theirs for _, theirs, _, _ in every])
     if why is not None:
-        return None, why
+        return None, why, False
     size, why = _agreed_node_size([size for size, _, _, _ in every], world_size)
     if why is not None:
-        return None, why
+        return None, why, False
     hosts = [host for _, _, host, _ in every]
     why = _first_unlinked([links for _, _, _, links in every], hosts, size)
     if why is not None:
-        return None, why
+        return None, why, True
     split = _split_host(hosts, size)
     if split is not None:
         warnings.warn(split)
-    return size, None
+    return size, None, False
 
 
 def _first_failure(whys: Sequence[Optional[str]]) -> Optional[str]:
@@ -597,9 +609,10 @@ class HierDist:
         A configuration it refuses (a ``continuous`` table among them, or
         clipping without ``index_dedup``) raises ValueError under
         ``"hierarchical"`` and takes TorchRec's dists with a warning under
-        ``"auto"``. If a rank cannot read the node or build the operator, or
-        NVLink does not connect the GPUs of a node (:func:`node_size`), every
-        rank warns and takes TorchRec's dists, but for an NCCL error
+        ``"auto"``. So do GPUs of a node that NVLink does not connect
+        (:func:`node_size`), but with :class:`NVLinkCheckError`, a
+        RuntimeError. If a rank cannot read the node or build the operator,
+        every rank warns and takes TorchRec's dists, but for an NCCL error
         inside a communicator's initialization on some ranks only, which
         leaves the others waiting there. See docs/hier_output_dist.md,
         sections 6, 7.2 and 19."""
@@ -622,6 +635,13 @@ class HierDist:
         try:
             local_size = node_size(self._pg)
         except RuntimeError as err:
+            # GPUs of a node that NVLink does not connect: "hierarchical"
+            # raises, on every rank alike, as for a configuration it refuses.
+            if isinstance(err, NVLinkCheckError) and self._asked == "hierarchical":
+                raise NVLinkCheckError(
+                    f'output_dist="hierarchical": {err}; set output_dist to '
+                    '"auto", which takes TorchRec\'s dists there, or to "torchrec"'
+                ) from None
             warnings.warn(
                 f'output_dist="{self._asked}": {err}; using TorchRec\'s dists'
             )
