@@ -64,22 +64,24 @@ Once the build is done, run `python -c 'import fbgemm_gpu'` to make sure it is i
 
 2. **TorchRec**
 
-> torchrec >= v1.2.0; the Docker image currently validates against TorchRec `release/V1.5.0`.
+> torchrec >= v1.2.0; the Docker image currently uses TorchRec `v1.8.0-rc1` with FBGEMM_GPU `v1.8.0`.
 
 Thanks to the torchrec team for their [support](https://github.com/meta-pytorch/torchrec/commit/6aaf1fa72e884642f39c49ef232162fa3772055e), torchrec v1.2.0 added support for custom embedding lookup module.
 
 After FBGEMM_GPU is installed, install TorchRec with:
 
 ```bash
-# torchrec depends on below 2 libs
-pip install --no-deps tensordict orjson
-git clone --recursive -b release/V1.5.0 https://github.com/pytorch/torchrec.git torchrec
+# Resolve Python dependencies without replacing the selected native packages.
+python3 -c 'import importlib.metadata as m; from pathlib import Path; Path("/tmp/torchrec-constraints.txt").write_text("".join(f"{name}=={m.version(name)}\n" for name in ("torch", "fbgemm-gpu")))'
+pip install --constraint /tmp/torchrec-constraints.txt tensordict==0.15.4 orjson==3.13.0 pyvers==0.2.3 cloudpickle==3.1.2
+git clone --recursive -b v1.8.0-rc1 https://github.com/meta-pytorch/torchrec.git torchrec
 cd torchrec
-# with --no-deps to prevent from installing dependencies
-pip install --no-deps .
+pip install --constraint /tmp/torchrec-constraints.txt .
 ```
 
-Once the install is done, run `python -c 'import torchrec'` to make sure it is installed.
+The constraints preserve the installed PyTorch and FBGEMM builds while pip resolves
+TorchRec's Python dependencies. Once the install is done, run
+`python -c 'import torchrec'` on the GPU build host to check library loading.
 
 ## Installation
 
