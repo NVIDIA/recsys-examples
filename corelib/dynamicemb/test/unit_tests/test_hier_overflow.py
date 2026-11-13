@@ -25,7 +25,8 @@ raises RuntimeError on every rank, naming the capacity to raise, and every
 small call must give TorchRec's outputs, bit for bit at a power-of-two world
 size: the large calls changed nothing. The ``placement`` cases also check
 that each table holds exactly the keys DynamicEmb's bucketize gives its
-rank.
+rank. On GPUs of a node that NVLink does not connect (a host of PCIe GPUs),
+every sharding takes TorchRec's dists: it skips.
 
 Run it from ``corelib/dynamicemb``, one process per GPU (on one node, or
 across nodes under Slurm)::
@@ -69,7 +70,7 @@ from torchrec.modules.embedding_configs import DataType
 sys.path.insert(
     0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "benchmark")
 )
-from benchmark_utils import init_distributed  # noqa: E402
+from benchmark_utils import hier_unlinked, init_distributed  # noqa: E402
 
 AMPLE = 1 << 20  # entries: far above every batch here
 DIM = 32
@@ -565,6 +566,15 @@ def main() -> None:
     # node is NCCL's LSA team (node_size, collective)
     rank, world_size, _, local_size = init_distributed()
     os.environ.setdefault("DYNAMICEMB_HIER_TIMEOUT_S", "120")
+    unlinked = hier_unlinked(dist.group.WORLD)
+    if unlinked is not None:
+        if rank == 0:
+            print(
+                f"every sharding takes TorchRec's dists: skipped ({unlinked})",
+                flush=True,
+            )
+        dist.destroy_process_group()
+        sys.exit(0)
     multi_node = world_size // node_size(dist.group.WORLD) > 1
     checks = Checks(rank)
     for case in CASES:

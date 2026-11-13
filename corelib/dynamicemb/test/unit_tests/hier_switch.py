@@ -45,7 +45,7 @@ from dynamicemb.dynamicemb_config import (
     TORCHREC_OUTPUT_DIST,
     takes_score_per_key,
 )
-from dynamicemb.shard import quiesce
+from dynamicemb.shard import node_size, quiesce
 from dynamicemb.shard.rw_sharding import RwSequenceDynamicEmbeddingSharding
 from torchrec.distributed.embedding_types import EmbeddingComputeKernel
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
@@ -115,7 +115,9 @@ def check_path(
     DynamicEmb tables (of ``tables`` alone, if given) took the hierarchical
     dist exactly when ``options`` give it ``"hierarchical"``. A sharding
     that falls back under ``"hierarchical"`` only warns, so the test would
-    pass without the dist. A sharding given ``"auto"`` must fall back."""
+    pass without the dist. A sharding given ``"auto"`` must fall back, and
+    so must every sharding on GPUs of a node that NVLink does not connect
+    (a host of PCIe GPUs: :func:`unlinked`)."""
     if not options:
         return
     asked = options["output_dist"] == HIERARCHICAL_OUTPUT_DIST
@@ -136,12 +138,25 @@ def check_path(
             hier = sharding._hier
             took = hier is not None and hier.takes_hier_dist
             assert took is not None, f"{names}: the sharding has had no call yet"
-            assert took == asked, (
+            expected = asked and not (hier is not None and unlinked(hier))
+            assert took == expected, (
                 f"{names}: given output_dist={options['output_dist']!r}, the "
                 f"sharding {'took' if took else 'did not take'} the hierarchical dist"
             )
             num_checked += 1
     assert num_checked or not asked, "no row-wise sharding of DynamicEmb tables"
+
+
+def unlinked(hier) -> bool:
+    """Whether the hierarchical dist refused the nodes of a sharding's ranks
+    because NVLink does not connect the GPUs of one (node_size's error,
+    which the sharding's first input dist read and kept: no collective
+    here)."""
+    try:
+        node_size(hier._pg)
+    except RuntimeError as err:
+        return "NVLink does not connect" in str(err)
+    return False
 
 
 def check_totals(kjt: KeyedJaggedTensor, options: Dict[str, Any]) -> None:

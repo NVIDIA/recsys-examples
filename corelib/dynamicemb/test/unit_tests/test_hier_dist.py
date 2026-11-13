@@ -30,7 +30,8 @@ itself, and counts them as TorchRec's dists do). Every step checks:
 
 Before the cases: the node, which the dist reads from NCCL (``node_size``:
 its LSA team, read once per group; ranks whose reads disagree raise alike,
-and the op's own LSA check refuses a node that is not the team), the
+as do GPUs of a node that NVLink does not connect, and the op's own LSA
+check refuses a node that is not the team), the
 sharding shapes, the ranks' agreement, a sharding with
 a ``continuous`` feature outside a model, and the options (a sharding with a
 ``continuous`` table, and a model without index dedup whose tables clip
@@ -43,7 +44,9 @@ after it, which only many features and nodes take:
 device nowhere but in its second wait, the output dist's call orders, the
 backward run to run, the window and the trace APIs, failed constructions,
 across nodes a proxy rows cap below the least rows of the proxy's ring, and
-the teardown.
+the teardown. On GPUs of a node that NVLink does not connect (a host of
+PCIe GPUs), where every sharding takes TorchRec's dists, it checks only
+that.
 
 Run it from ``corelib/dynamicemb``, one process per GPU (on one node, or
 across nodes under Slurm)::
@@ -67,6 +70,7 @@ import weakref
 from dataclasses import dataclass, replace
 from typing import Callable, Dict, List, NamedTuple, Optional, Sequence, Tuple
 
+import dynamicemb.shard.hier_output_dist as hier_module
 import dynamicemb_extensions
 import torch
 import torch.distributed as dist
@@ -99,6 +103,8 @@ from dynamicemb.shard.hier_output_dist import (
     HierDist,
     _agreed_node_size,
     _first_failure,
+    _first_unlinked,
+    _GpuLinks,
     _split_host,
     node_size,
 )
@@ -121,7 +127,12 @@ from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 sys.path.insert(
     0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "benchmark")
 )
-from benchmark_utils import hier_capacities, hier_needs, init_distributed  # noqa: E402
+from benchmark_utils import (  # noqa: E402
+    hier_capacities,
+    hier_needs,
+    hier_unlinked,
+    init_distributed,
+)
 
 NUM_EMBEDDINGS = 1 << 20
 # Nodes of the run and their GPUs, as the hierarchical dist takes them: NCCL's
@@ -216,14 +227,26 @@ def check_node_size(rank: int, world_size: int, log: Callable) -> int:
     any rank reads NCCL's team.
     With a size every rank reads that is not NCCL's team, the op's own
     communicator refuses the node: every rank warns, giving the team's size,
-    and takes TorchRec's dists. The checks of the sizes, and of the hosts
-    that nodes split, also run on lists of their own."""
+    and takes TorchRec's dists. With the last rank's GPU read from NVML as
+    linked to nothing (nodes of more than one GPU), node_size raises the
+    same RuntimeError on every rank, naming that rank and the first of its
+    node, and a sharding takes TorchRec's dists. The checks of the sizes, of
+    the hosts that nodes split, and of NVLink between the GPUs of a node,
+    also run on lists of their own."""
     checks: Dict[str, bool] = {}
     last = world_size - 1
     ranks = tuple(range(world_size))
     saved = dict(_NODE_SIZES)
     real = dynamicemb_extensions.hier_output_dist_lsa_size
     reads: List[int] = []
+    gpu_links = hier_module._gpu_links
+    links, why = gpu_links()  # this rank's GPU, as node_size read it
+    nvml = (
+        why
+        if links is None
+        else f"{len(links.gpus)} NVLink(s) to GPUs, to an NVSwitch: {links.switch},"
+        f" in a fabric clique: {links.clique is not None}"
+    )
 
     def wrapped(change: Callable[[int], int]) -> Callable:
         def read(unique_id, of_rank, size):
@@ -237,7 +260,7 @@ def check_node_size(rank: int, world_size: int, log: Callable) -> int:
             raise RuntimeError("a read that failed on purpose")
         return size
 
-    messages = []
+    messages = [f"rank 0's GPU from NVML: {nvml}"]
     try:
         _NODE_SIZES.pop(ranks, None)
         dynamicemb_extensions.hier_output_dist_lsa_size = wrapped(lambda size: size)
@@ -245,6 +268,7 @@ def check_node_size(rank: int, world_size: int, log: Callable) -> int:
         checks["read once, then kept"] = (
             first == second == NODE_SIZE and reads == [rank] and world_size % first == 0
         )
+        checks["NVML read every GPU"] = links is not None or NODE_SIZE == 1
         wrong = [
             ("a size that does not divide", lambda size: world_size + 1, "divide"),
             ("an error on the last rank", raising, f"rank {last} could not read"),
@@ -328,8 +352,41 @@ def check_node_size(rank: int, world_size: int, log: Callable) -> int:
             )
             messages.append(msg)
             del hier
+        # GPUs NVLink does not connect: the last rank's GPU read as linked to
+        # nothing, at a PCI address no NVLink reaches (as on a host of PCIe
+        # GPUs). A node of one GPU has no two GPUs to check.
+        if NODE_SIZE > 1:
+            _NODE_SIZES.pop(ranks, None)
+            dynamicemb_extensions.hier_output_dist_lsa_size = wrapped(lambda size: size)
+            if rank == last:
+                hier_module._gpu_links = lambda: (
+                    _GpuLinks((0xFFFF, 0xFF, 0x1F), frozenset(), False, None),
+                    None,
+                )
+            msg = expect_error(RuntimeError, node_size, dist.group.WORLD)
+            checks["GPUs NVLink does not connect"] = (
+                same_everywhere(msg)
+                and "NVLink does not connect" in msg
+                and f"ranks {last - NODE_SIZE + 1} and {last}" in msg
+            )
+            messages.append(msg)
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always")
+                hier = standalone(dist.group.WORLD)
+                took = hier.setup(*bucketize_rules(3), False, True)
+            checks["a sharding on them falls back"] = (
+                took is False
+                and hier.op is None
+                and any(
+                    "NVLink does not connect" in str(warning.message)
+                    and "using TorchRec" in str(warning.message)
+                    for warning in caught
+                )
+            )
+            del hier
     finally:
         dynamicemb_extensions.hier_output_dist_lsa_size = real
+        hier_module._gpu_links = gpu_links
         _NODE_SIZES.clear()
         _NODE_SIZES.update(saved)
     checks["the sizes' checks"] = (
@@ -347,6 +404,36 @@ def check_node_size(rank: int, world_size: int, log: Callable) -> int:
         and _split_host(trays, 4) is None
         and "host a between 8 nodes" in _split_host(["a", "b"] * 8, 1)
         and "host a between 2 nodes" in _split_host(["a"] * 8 + ["b"] * 4, 4)
+    )
+
+    # GPUs of one host on NVSwitches, on PCIe alone, and NVLink-bridged in
+    # pairs; two trays of one NVLink clique, and of two.
+    def gpu(bus: int, gpus=(), switch=False, clique=None):
+        pcis = frozenset((0, other, 0) for other in gpus)
+        return _GpuLinks((0, bus, 0), pcis, switch, clique), None
+
+    one_host, two_trays = ["a"] * 8, ["tray0"] * 4 + ["tray1"] * 4
+    switched = [gpu(bus, switch=True) for bus in range(8)]
+    pcie = [gpu(bus) for bus in range(8)]
+    pairs = [gpu(bus, gpus=[bus ^ 1]) for bus in range(8)]
+    rack = [gpu(bus % 4, switch=True, clique=(b"r" * 16, 1)) for bus in range(8)]
+    cliques = rack[:4] + [
+        gpu(bus, switch=True, clique=(b"r" * 16, 2)) for bus in range(4)
+    ]
+    unread = [gpu(0, switch=True), (None, "a read that failed")]
+    checks["the NVLink checks"] = (
+        _first_unlinked(switched, one_host, 8) is None
+        and "ranks 0 and 1 (PCI 0000:00:00.0 and 0000:01:00.0 of host a)"
+        in (_first_unlinked(pcie, one_host, 8) or "")
+        and _first_unlinked(pcie, one_host, 1) is None
+        and _first_unlinked(pairs, one_host, 2) is None
+        and "ranks 0 and 2" in (_first_unlinked(pairs, one_host, 4) or "")
+        and _first_unlinked(rack, two_trays, 8) is None
+        and "ranks 0 and 4 (of hosts tray0 and tray1"
+        in (_first_unlinked(cliques, two_trays, 8) or "")
+        and "rank 1 could not read its GPU's NVLinks"
+        in (_first_unlinked(unread, ["a", "a"], 2) or "")
+        and _first_unlinked(unread, ["a", "a"], 1) is None
     )
     torch.cuda.synchronize()
     dist.barrier()
@@ -2111,18 +2198,56 @@ def gc_models(log: Callable) -> int:
     return int(not good)
 
 
+def run_unlinked(why: str, log: Callable) -> int:
+    """GPUs of a node that NVLink does not connect, as on a host of PCIe
+    GPUs: node_size raised ``why`` on every rank alike, and a sharding takes
+    TorchRec's dists, warning so on every rank. The other checks need the
+    dist."""
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        hier = standalone(dist.group.WORLD)
+        took = hier.setup(*bucketize_rules(3), False, True)
+    checks = {
+        "the same on every rank": same_everywhere(why),
+        "a sharding falls back": took is False
+        and hier.op is None
+        and any(
+            why in str(warning.message) and "using TorchRec" in str(warning.message)
+            for warning in caught
+        ),
+    }
+    del hier
+    return report(
+        "a node NVLink does not connect",
+        checks,
+        log,
+        f": {why}; the other checks need the dist, and do not run",
+    )
+
+
+def finish(failures: int, log: Callable) -> None:
+    """Every rank's end: the verdict, on rank 0, and the exit status."""
+    dist.barrier()
+    log("ALL PASSED" if failures == 0 else f"{failures} FAILED")
+    dist.destroy_process_group()
+    sys.exit(1 if failures else 0)
+
+
 def main() -> None:
     global NODES, NODE_SIZE
     # local_size: the GPUs of a host (LOCAL_WORLD_SIZE), which the planner
     # takes; the dist's node is NCCL's LSA team (collective)
     rank, world_size, _, local_size = init_distributed()
-    NODE_SIZE = node_size(dist.group.WORLD)
-    NODES = world_size // NODE_SIZE
 
     def log(msg: str) -> None:
         if rank == 0:
             print(msg, flush=True)
 
+    unlinked = hier_unlinked(dist.group.WORLD)
+    if unlinked is not None:
+        finish(run_unlinked(unlinked, log), log)
+    NODE_SIZE = node_size(dist.group.WORLD)
+    NODES = world_size // NODE_SIZE
     log(
         f"{world_size} ranks: {NODES} node(s) of {NODE_SIZE} GPUs (NCCL's LSA"
         f" team), hosts of {local_size} (LOCAL_WORLD_SIZE)"
@@ -2171,10 +2296,7 @@ def main() -> None:
         failures += run_proxy_rows(rank, world_size, local_size, log)
     failures += run_teardown_credits(rank, world_size, local_size, log)
     failures += run_teardown(rank, world_size, local_size, log)
-    dist.barrier()
-    log("ALL PASSED" if failures == 0 else f"{failures} FAILED")
-    dist.destroy_process_group()
-    sys.exit(1 if failures else 0)
+    finish(failures, log)
 
 
 if __name__ == "__main__":
