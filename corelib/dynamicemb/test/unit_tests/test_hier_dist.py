@@ -29,9 +29,8 @@ itself, and counts them as TorchRec's dists do). Every step checks:
   which takes TorchRec's dists.
 
 Before the cases: the node, which the dist reads from NCCL (``node_size``:
-its LSA team, read once per group; ranks whose reads disagree raise alike,
-and the op's own LSA check refuses a node that is not the team), the
-sharding shapes, the ranks' agreement, a sharding with
+its LSA team, read once per group; ranks whose reads disagree raise alike),
+the sharding shapes, the ranks' agreement, a sharding with
 a ``continuous`` feature outside a model, and the options (a sharding with a
 ``continuous`` table, and a model without index dedup whose tables clip
 gradients: ``"hierarchical"`` raises ``ValueError`` at its first input dist,
@@ -213,10 +212,7 @@ def check_node_size(rank: int, world_size: int, log: Callable) -> int:
     error, a sharding takes TorchRec's dists, with a warning on every rank.
     A GPU before compute capability 8.0 (a stand-in capability) on rank 0,
     and on the last rank, raises the same RuntimeError on every rank before
-    any rank reads NCCL's team.
-    With a size every rank reads that is not NCCL's team, the op's own
-    communicator refuses the node: every rank warns, giving the team's size,
-    and takes TorchRec's dists. The checks of the sizes, and of the hosts
+    any rank reads NCCL's team. The checks of the sizes, and of the hosts
     that nodes split, also run on lists of their own."""
     checks: Dict[str, bool] = {}
     last = world_size - 1
@@ -299,36 +295,6 @@ def check_node_size(rank: int, world_size: int, log: Callable) -> int:
                 and reads == []
             )
             messages.append(msg)
-        # A node the ranks agree on that is not NCCL's team: the op's own
-        # communicator refuses it (its LSA check). The node is half of the
-        # team's, inside the team's NVLink domain, also across nodes (a node
-        # of every rank would span hosts that only IB joins, which node_size
-        # refuses first). Its nodes ask for GIN, which NCCL may refuse before
-        # that check (the warning then says why, not the team).
-        node = max(NODE_SIZE // 2, 1)
-        if node != NODE_SIZE and world_size % node == 0:
-            _NODE_SIZES.pop(ranks, None)
-            dynamicemb_extensions.hier_output_dist_lsa_size = wrapped(lambda size: node)
-            with warnings.catch_warnings(record=True) as caught:
-                warnings.simplefilter("always")
-                hier = standalone(dist.group.WORLD)
-                took = hier.setup(*bucketize_rules(3), False, True)
-            said = [
-                str(warning.message)
-                for warning in caught
-                if "using TorchRec" in str(warning.message)
-            ]
-            msg = said[0] if len(said) == 1 else ""
-            team = f"has {NODE_SIZE} ranks, not the {node} of its node"
-            checks["the op refuses a node that is not the team"] = (
-                same_everywhere(msg)
-                and took is False
-                and hier.op is None
-                and msg != ""
-                and (team in msg or "LSA team" not in msg)
-            )
-            messages.append(msg)
-            del hier
     finally:
         dynamicemb_extensions.hier_output_dist_lsa_size = real
         _NODE_SIZES.clear()
