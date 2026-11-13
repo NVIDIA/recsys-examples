@@ -138,7 +138,7 @@ void initialize_with_generator(at::Tensor buffer, at::Tensor indices,
       scalartype_to_datatype(convertTypeMetaToScalarType(buffer.dtype()));
   auto index_type =
       scalartype_to_datatype(convertTypeMetaToScalarType(indices.dtype()));
-  DISPATCH_FLOAT_DATATYPE_FUNCTION(value_type, ValueType, [&] {
+  DISPATCH_VALUE_DATATYPE_FUNCTION(value_type, ValueType, [&] {
     DISPATCH_INTEGER_DATATYPE_FUNCTION(index_type, IndexType, [&] {
       initialize_with_index_addressor_kernel<ValueType, IndexType, GeneratorT>
           <<<grid_size, block_size, 0, stream>>>(

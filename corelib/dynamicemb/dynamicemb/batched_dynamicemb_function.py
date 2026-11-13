@@ -42,6 +42,7 @@ from dynamicemb.key_value_table import (
 from dynamicemb.lookup_layout import EmbeddingLayout
 from dynamicemb.optimizer import BaseDynamicEmbeddingOptimizer
 from dynamicemb.types import CopyMode, MultiTableAdmitter
+from dynamicemb.utils import decode_table_values, gradient_dtype
 from dynamicemb_extensions import (
     EvictStrategy,
     expand_table_ids_cuda,
@@ -1069,7 +1070,7 @@ def dynamicemb_eval_forward(
                     return out.copy_(output_embs)
                 return out.index_copy_(0, out_rows.long(), output_embs.to(out.dtype))
             if output_dtype != emb_dtype:
-                output_embs = output_embs.to(output_dtype)
+                output_embs = decode_table_values(output_embs, output_dtype)
             return output_embs
 
         frequency_counts_int64 = (
@@ -1507,7 +1508,9 @@ class DynamicEmbeddingFunction(torch.autograd.Function):
                     refresh_slots_after_rehash(state, ctx)
                     with torch.cuda.nvtx.range("op:optimizer_update_fused"):
                         optimizer.fused_update_for_flat_table(
-                            unique_grads.to(ctx.emb_dtype),
+                            unique_grads.to(
+                                gradient_dtype(ctx.emb_dtype, unique_grads.dtype)
+                            ),
                             # Writes into the value buffer -> rows.
                             ctx.update_value_rows,
                             state.table_ptrs_dev,
@@ -1540,7 +1543,9 @@ class DynamicEmbeddingFunction(torch.autograd.Function):
                     all_dims_vec4 = storage.all_dims_vec4()
                     with torch.cuda.nvtx.range("op:optimizer_update_padded"):
                         optimizer.update_for_padded_buffer(
-                            unique_grads,
+                            unique_grads.to(
+                                gradient_dtype(ctx.emb_dtype, unique_grads.dtype)
+                            ),
                             ctx.unique_values,
                             unique_table_ids,
                             table_emb_dims,

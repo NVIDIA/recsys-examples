@@ -271,6 +271,17 @@ template <> struct Vec4T<__half> {
     tmp.h[1].y = TypeConvertFunc<__nv_bfloat16, __half>::convert(value.h[1].y);
     *(reinterpret_cast<float2 *>(dst)) = tmp.f;
   }
+
+  DEVICE_INLINE void store(dyn_fp8_t *dst, int n) {
+    const float lanes[4] = {__half2float(value.h[0].x), __half2float(value.h[0].y),
+                             __half2float(value.h[1].x), __half2float(value.h[1].y)};
+    dyn_fp8_t codes[4];
+    for (int i = 0; i < 4; ++i)
+      codes[i] = dyn_fp8_t(lanes[i]);
+    store_fp8_codes(dst, n, codes);
+  }
+
+  DEVICE_INLINE void store(dyn_fp8_t *dst) { store(dst, 4); }
 };
 
 template <> struct Vec4T<__nv_bfloat16> {
@@ -492,6 +503,17 @@ template <> struct Vec4T<__nv_bfloat16> {
   DEVICE_INLINE void store(__nv_bfloat16 *dst) {
     *(reinterpret_cast<float2 *>(dst)) = value.f;
   }
+
+  DEVICE_INLINE void store(dyn_fp8_t *dst, int n) {
+    const float lanes[4] = {__bfloat162float(value.h[0].x), __bfloat162float(value.h[0].y),
+                             __bfloat162float(value.h[1].x), __bfloat162float(value.h[1].y)};
+    dyn_fp8_t codes[4];
+    for (int i = 0; i < 4; ++i)
+      codes[i] = dyn_fp8_t(lanes[i]);
+    store_fp8_codes(dst, n, codes);
+  }
+
+  DEVICE_INLINE void store(dyn_fp8_t *dst) { store(dst, 4); }
 };
 
 template <> struct Vec4T<float> {
@@ -789,7 +811,95 @@ template <> struct Vec4T<float> {
     val.z += (__bfloat162float(other.value.h[1].x) * __bfloat162float(weight));
     val.w += (__bfloat162float(other.value.h[1].y) * __bfloat162float(weight));
   }
+
+  DEVICE_INLINE void load(const dyn_fp8_t *p, int n) {
+    dyn_fp8_t codes[4];
+    load_fp8_codes(p, n, codes);
+    if (n > 0)
+      val.x = static_cast<float>(codes[0]);
+    if (n > 1)
+      val.y = static_cast<float>(codes[1]);
+    if (n > 2)
+      val.z = static_cast<float>(codes[2]);
+    if (n > 3)
+      val.w = static_cast<float>(codes[3]);
+  }
+
+  DEVICE_INLINE void load(const dyn_fp8_t *p) { load(p, 4); }
+
+  DEVICE_INLINE void store(dyn_fp8_t *dst, int n) {
+    const dyn_fp8_t codes[4] = {dyn_fp8_t(val.x), dyn_fp8_t(val.y),
+                                dyn_fp8_t(val.z), dyn_fp8_t(val.w)};
+    store_fp8_codes(dst, n, codes);
+  }
+
+  DEVICE_INLINE void store(dyn_fp8_t *dst) { store(dst, 4); }
+
+  DEVICE_INLINE void accumulate(const Vec4T<dyn_fp8_t> &other);
+  DEVICE_INLINE void accumulate_multiply(const Vec4T<dyn_fp8_t> &other,
+                                         float weight);
 };
+
+// Four fp8 codes kept raw, so a same-type copy moves the bytes unchanged --
+// a value row's optimizer slot holds raw fp32 bytes that are not valid fp8
+// values and must not round-trip through float.
+template <> struct Vec4T<dyn_fp8_t> {
+  dyn_fp8_t code[4];
+
+  DEVICE_INLINE Vec4T() { reset(); }
+
+  DEVICE_INLINE void reset() {
+    for (int i = 0; i < 4; ++i)
+      code[i].bits = 0;
+  }
+
+  DEVICE_INLINE float lane(int i) const { return static_cast<float>(code[i]); }
+
+  DEVICE_INLINE void load(const dyn_fp8_t *p, int n) {
+    load_fp8_codes(p, n, code);
+  }
+
+  DEVICE_INLINE void load(const dyn_fp8_t *p) { load(p, 4); }
+
+  template <typename T> DEVICE_INLINE void load(const T *p, int n) {
+    Vec4T<float> lanes;
+    lanes.load(p, n);
+    lanes.store(code, n);
+  }
+
+  template <typename T> DEVICE_INLINE void load(const T *p) { load(p, 4); }
+
+  DEVICE_INLINE void store(dyn_fp8_t *dst, int n) const {
+    store_fp8_codes(dst, n, code);
+  }
+
+  DEVICE_INLINE void store(dyn_fp8_t *dst) const { store(dst, 4); }
+
+  template <typename T> DEVICE_INLINE void store(T *dst, int n) const {
+    Vec4T<float> lanes;
+    lanes.val = make_float4(lane(0), lane(1), lane(2), lane(3));
+    lanes.store(dst, n);
+  }
+
+  template <typename T> DEVICE_INLINE void store(T *dst) const {
+    store(dst, 4);
+  }
+};
+
+DEVICE_INLINE void Vec4T<float>::accumulate(const Vec4T<dyn_fp8_t> &other) {
+  val.x += other.lane(0);
+  val.y += other.lane(1);
+  val.z += other.lane(2);
+  val.w += other.lane(3);
+}
+
+DEVICE_INLINE void
+Vec4T<float>::accumulate_multiply(const Vec4T<dyn_fp8_t> &other, float weight) {
+  val.x += other.lane(0) * weight;
+  val.y += other.lane(1) * weight;
+  val.z += other.lane(2) * weight;
+  val.w += other.lane(3) * weight;
+}
 
 template <typename T>
 HOST_DEVICE_INLINE int64_t bs_upper_bound_sub_one(const T *const arr,
