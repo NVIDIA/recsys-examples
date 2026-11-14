@@ -2060,5 +2060,910 @@
       "older_stack_positive_retained_types": 0,
       "older_stack_positive_traced_bytes_delta": 91280
     }
+  },
+  "receiver_type_pool_followup": {
+    "main": "85e628db7a6ac4d5f5f070d1e2d15d51eead0534",
+    "previous_code_commit": "e778622a0cc5dc1f445cbdf210d98c7c8b2385b3",
+    "code_commit": "8efd9517a9e2c6f07b24b635bf462ce37a148f40",
+    "decision": "CPU receiver preparation is cheaper; end-to-end parity with main and supported-hardware validation are still not established",
+    "notes": [
+      "Current implementation is pool2: bounded per-distributor idle entries with static dist_init and a weak resolver cell. Pool1/classmethod variants and the global-pool prototype are unpublished experiments, retained as historical diagnostics.",
+      "At most eight idle entries are cached per distributor, not an in-flight request limit. Native/fused awaitables own source KJTs. Returning an entry clears its weak cell; cache copies/unpickling start empty.",
+      "Production Python changes only shard/input_dist.py relative to e778622. No C++/optimizer/raw-table/dense-kernel changes. Runtime deltas below reconstruct exact manifests from the already recorded parent manifests.",
+      "Target/older receiver+lifecycle matrices use final production source but precede added weak-result and distinct-active-type assertions. Final contract matrices rerun the result checks; final one-case burst tests rerun all strengthened checks on both stacks. Production Python stays identical.",
+      "The previous e778622 full table suite and 297-case dense suite remain bounded evidence for unchanged raw-table/dense code; they were not rerun in this controller-only follow-up.",
+      "CPU attribution uses perf_counter_ns wrappers around selected methods, 100 warmed steps. It is instrumented and not throughput acceptance; stages are inclusive, so do not sum nested totals. The raw diagnostic covers forward only, not backward.",
+      "The first global-pool attribution prototype patches runtime callbacks; it is not production code or a complete-checkout benchmark.",
+      "Formal timings use complete imported main85, gate2/e778622 and immutable candidate snapshots, --lookup default; no runtime monkeypatch. 128 features, batch32, hotness4, D64/FP32/SGD; 20 warmups, six 100-step trials, five separately profiled calls.",
+      "Original affinity series: GPU1,2, both workers inherit CPUs4-11. GPU1 is NUMA0, GPU2 NUMA2, so rank1 is remote in that series. NUMA control uses rank0 CPUs4-7, rank1 CPUs36-39, before importing Torch; its process order differs and every sample is retained.",
+      "No other local GPU validation overlaps timing. External jobs share the machine and processes/trials vary. Changing affinity is an experimental control, not a code improvement or a reason to erase prior slower measurements.",
+      "TWRW tests use two/four local ranks with node-size2; four ranks emulate two nodes, not physical multi-node or NVLink/GIN validation.",
+      "Removing cache-copy reduction in independent negative snapshots produces wrong owner values on deepcopy and pickle failure. Those failures are intentional controls, not failures of the final production code."
+    ],
+    "runtime_deltas": {
+      "pool1": {
+        "parent": "critical_path_followup.runtime_manifests.gate2",
+        "code_sha256": "179c26130953a00567c773a0237a6ce59867456d8b1b2d6080729f3a244b4915",
+        "changed_files": {
+          "dynamicemb/shard/input_dist.py": "d6784b3ab1f406a9f303cdc5db7d52b88f2a1fb684d7c698e8eada9248c7b2e3"
+        },
+        "removed_files": [],
+        "extension_sha256": "89227a502e9c59aa345e744ead8f5fc6ef163a7e946c1469ece26259ba153f68"
+      },
+      "pool1-primary": {
+        "parent": "critical_path_followup.runtime_manifests.gate2-primary",
+        "code_sha256": "179c26130953a00567c773a0237a6ce59867456d8b1b2d6080729f3a244b4915",
+        "changed_files": {
+          "dynamicemb/shard/input_dist.py": "d6784b3ab1f406a9f303cdc5db7d52b88f2a1fb684d7c698e8eada9248c7b2e3"
+        },
+        "removed_files": [],
+        "extension_sha256": "b25b80eb0190dac854dfaf11118a1317dc7bdd014798d60ca6bedafaa179c335"
+      },
+      "pool1-copy-negative": {
+        "parent": "critical_path_followup.runtime_manifests.gate2",
+        "code_sha256": "0425348dd6837b618cbda968d80a7cd0438a2b159fa59dc2ae85e5277b7ba005",
+        "changed_files": {
+          "dynamicemb/shard/input_dist.py": "12e078880f597a9c0769295d8c2e7877446a3081de179f15016e3301175d0bb8"
+        },
+        "removed_files": [],
+        "extension_sha256": "89227a502e9c59aa345e744ead8f5fc6ef163a7e946c1469ece26259ba153f68"
+      },
+      "pool2": {
+        "parent": "critical_path_followup.runtime_manifests.gate2",
+        "code_sha256": "d6ef7ec8f598fcf5f53bcab948715cc8aa970c6d00367b06763ea1d2a09c9a6c",
+        "changed_files": {
+          "dynamicemb/shard/input_dist.py": "d45dd2f1377f3a41536c9cb27ac0595e967e23b21c4caf399de59059ddfa10b1"
+        },
+        "removed_files": [],
+        "extension_sha256": "89227a502e9c59aa345e744ead8f5fc6ef163a7e946c1469ece26259ba153f68"
+      },
+      "pool2-primary": {
+        "parent": "critical_path_followup.runtime_manifests.gate2-primary",
+        "code_sha256": "d6ef7ec8f598fcf5f53bcab948715cc8aa970c6d00367b06763ea1d2a09c9a6c",
+        "changed_files": {
+          "dynamicemb/shard/input_dist.py": "d45dd2f1377f3a41536c9cb27ac0595e967e23b21c4caf399de59059ddfa10b1"
+        },
+        "removed_files": [],
+        "extension_sha256": "b25b80eb0190dac854dfaf11118a1317dc7bdd014798d60ca6bedafaa179c335"
+      },
+      "pool2-copy-negative": {
+        "parent": "critical_path_followup.runtime_manifests.gate2",
+        "code_sha256": "fe10b97ae59ad37a75fc75d29c17b286ee5edc6e6b503c9f43c7d4ae9394a0ed",
+        "changed_files": {
+          "dynamicemb/shard/input_dist.py": "229118cf8fb3bcb84e22946134fc7c5d2c66d1b343b0cb9344b179885addc5fd"
+        },
+        "removed_files": [],
+        "extension_sha256": "89227a502e9c59aa345e744ead8f5fc6ef163a7e946c1469ece26259ba153f68"
+      }
+    },
+    "test_source_sha256": {
+      "final": "d4b4237c4bd3e9ab39d996efed5dfa41806a572681ec1bff130d0e1721d61ae0",
+      "before_extra_result_weakref_assertions": "9bfa1307c66a914588f4f8f76654932a7cc83254182a8df92c64d55dccd145f8",
+      "before_distinct_active_type_assertion": "a97d60a5d4fda9390cb849251aad2e7ef28b8da361bd4802401232bb9486c101"
+    },
+    "scripts": {
+      "attribute.py": {
+        "path": "/home/lwx/.cache/recsys-459-attribution-20261114/attribute.py",
+        "sha256": "7b4154321f0538306360d51dc0192c95c6057e8866712140c8b9d7be165bfd26"
+      },
+      "attribute-pool.py": {
+        "path": "/home/lwx/.cache/recsys-459-attribution-20261114/attribute-pool.py",
+        "sha256": "112128cf22834271dd07cc603b5c59ae5494e7da2bda09a5b7db9128ba7056d8"
+      },
+      "type_pool.py": {
+        "path": "/home/lwx/.cache/recsys-459-attribution-20261114/type_pool.py",
+        "sha256": "c683fc877ab2173c7fde2ab72c82248fc06cf55ae53387bfd69e5c2fc36c1bef"
+      },
+      "attribute-production.py": {
+        "path": "/home/lwx/.cache/recsys-459-attribution-20261114/attribute-production.py",
+        "sha256": "d5d32e3c936d632a983bc0e51fe45d44681840eb03f377f48d692ceb9ba75275"
+      },
+      "numa_bench.py": {
+        "path": "/home/lwx/.cache/recsys-459-attribution-20261114/numa_bench.py",
+        "sha256": "eba3ccbce7b836b70188eb8492f9a14810a186376f592e2971d0529477f677b0",
+        "source": "import json\nimport os\nimport sys\n\nrank=int(os.environ.get('LOCAL_RANK','0'))\nos.sched_setaffinity(0,set(range(4,8)) if rank==0 else set(range(36,40)))\nprint('WORKER_AFFINITY '+json.dumps(dict(rank=rank,cpus=sorted(os.sched_getaffinity(0)))),flush=True)\nsys.path.insert(0,'/home/lwx/recsys-examples/corelib/dynamicemb/benchmark')\nimport benchmark_resolved_lookup\nbenchmark_resolved_lookup.main()\n"
+      },
+      "perf.py": {
+        "path": "/home/lwx/.cache/recsys-459-attribution-20261114/perf.py",
+        "sha256": "cfc46e7d5d3746185a0bd70119be5b9c0d472dbc010b0008bc18b017d7035f2b"
+      },
+      "perf-reverse.py": {
+        "path": "/home/lwx/.cache/recsys-459-attribution-20261114/perf-reverse.py",
+        "sha256": "bd9bcf019d3e7687e1e8ad4e0349e79477f7b30b079336ae7297e498752358d7"
+      },
+      "perf-pool2.py": {
+        "path": "/home/lwx/.cache/recsys-459-attribution-20261114/perf-pool2.py",
+        "sha256": "9c866027345d21d3c5305c2a1f9ceb1d21a1cccc99dd92c994e9529a11980edf"
+      },
+      "perf-numa.py": {
+        "path": "/home/lwx/.cache/recsys-459-attribution-20261114/perf-numa.py",
+        "sha256": "48e1b3c553897681fd71e960d00a2b8d745f3ecd436d6a95dee3a29ea8ed9326"
+      }
+    },
+    "runs": [
+      {"name": "test-pool1-contract","log": "/home/lwx/.cache/recsys-459-opt-20261114/test-pool1-contract.log","sha256": "8d0962cc6332158f26640112847a5d34ce576450a54372133b6088472334a842","expected_exit_code": 0,"results": ["-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html7 passed, 336 deselected, 4 warnings in 5.88s","7 passed, 336 deselected, 4 warnings in 5.88s"]},
+      {"name": "test-pool1-primary-contract","log": "/home/lwx/.cache/recsys-459-opt-20261114/test-pool1-primary-contract.log","sha256": "e098ff34244580f95e0455c56e79f6b293989fcf650ae5f7b9ae366834908f2c","expected_exit_code": 0,"results": ["6 passed, 1 skipped, 336 deselected in 5.51s","6 passed, 1 skipped, 336 deselected in 5.51s"]},
+      {"name": "test-pool1-two","log": "/home/lwx/.cache/recsys-459-opt-20261114/test-pool1-two.log","sha256": "ed8f09b09098015e833f850bc9debaa50f2922f45b4c8ca539d7f558e474955c","expected_exit_code": 0,"results": ["395 passed, 4 skipped, 1120 warnings in 35.80s","395 passed, 4 skipped, 1121 warnings in 36.34s"]},
+      {"name": "test-pool1-primary-two","log": "/home/lwx/.cache/recsys-459-opt-20261114/test-pool1-primary-two.log","sha256": "72678d438ee05b02da10b7a80318837187765987185fa5db82e75eebd79518e9","expected_exit_code": 0,"results": ["392 passed, 7 skipped, 794 warnings in 29.15s","392 passed, 7 skipped, 794 warnings in 29.16s"]},
+      {"name": "test-pool1-single","log": "/home/lwx/.cache/recsys-459-opt-20261114/test-pool1-single.log","sha256": "c7034ffa7194d2bf5331fb7d9b3176e2ed51215dd21713a68b7ea055dfd294db","expected_exit_code": 0,"results": ["389 passed, 10 skipped, 422 warnings in 23.64s"]},
+      {"name": "test-pool1-copy-negative","log": "/home/lwx/.cache/recsys-459-opt-20261114/test-pool1-copy-negative.log","sha256": "6c94f05351963880d6c08c831243c53566e79dc97dbd6d67f3ac0556018a464d","expected_exit_code": 1,"results": ["2 failed, 341 deselected, 3 warnings in 4.57s"]},
+      {"name": "test-pool1-twrw","log": "/home/lwx/.cache/recsys-459-opt-20261114/test-pool1-twrw.log","sha256": "da1e740474fe76836871cac01596b54fb8fe9e75cac2a81952b6cf7779bedfcf","expected_exit_code": 0,"results": ["grad ok: both tables moved by -0.050000"]},
+      {"name": "test-pool1-primary-twrw","log": "/home/lwx/.cache/recsys-459-opt-20261114/test-pool1-primary-twrw.log","sha256": "81ffbc0199cf86be73814d254d859a6ba1e16670c39eadd894a600abe9d71ee0","expected_exit_code": 0,"results": ["grad ok: both tables moved by -0.050000"]},
+      {"name": "test-pool2-two","log": "/home/lwx/.cache/recsys-459-opt-20261114/test-pool2-two.log","sha256": "3c8989d3ec00da325afb14605dbd84abcb42c0f89e8f5aa6be089e6ca00f682e","expected_exit_code": 0,"results": ["                                  [100%]395 passed, 4 skipped, 1121 warnings in 34.54s","395 passed, 4 skipped, 1120 warnings in 34.54s"]},
+      {"name": "test-pool2-primary-two","log": "/home/lwx/.cache/recsys-459-opt-20261114/test-pool2-primary-two.log","sha256": "0b98e04717b2b0ee2fd810bcc2012c38df3d5fd2dc1d538de50debdfb1088b66","expected_exit_code": 0,"results": ["392 passed, 7 skipped, 794 warnings in 29.38s","392 passed, 7 skipped, 794 warnings in 29.39s"]},
+      {"name": "test-pool2-single","log": "/home/lwx/.cache/recsys-459-opt-20261114/test-pool2-single.log","sha256": "80a43104477461d89098f2070916993d22c75fb82fc0fd8cc034002d0307563d","expected_exit_code": 0,"results": ["389 passed, 10 skipped, 422 warnings in 24.44s"]},
+      {"name": "test-pool2-final-contract","log": "/home/lwx/.cache/recsys-459-opt-20261114/test-pool2-final-contract.log","sha256": "f1a550da46c3b14571a3ea17d2c91cab6afeddad783935c40e9c9afca901aa3b","expected_exit_code": 0,"results": ["7 passed, 336 deselected, 4 warnings in 5.83s","7 passed, 336 deselected, 4 warnings in 5.85s"]},
+      {"name": "test-pool2-primary-final-contract","log": "/home/lwx/.cache/recsys-459-opt-20261114/test-pool2-primary-final-contract.log","sha256": "5148ebc5427564c411a330c72b145ea967db97df47e024f1ca889b89929f46a4","expected_exit_code": 0,"results": ["                                                                  [100%]6 passed, 1 skipped, 336 deselected in 5.40s","6 passed, 1 skipped, 336 deselected in 5.40s"]},
+      {"name": "test-pool2-copy-negative","log": "/home/lwx/.cache/recsys-459-opt-20261114/test-pool2-copy-negative.log","sha256": "13da944b3692b1c7f33d27a30c29260dbaee49bb0af71029c282bd5286e7fd7f","expected_exit_code": 1,"results": ["2 failed, 341 deselected, 3 warnings in 4.20s"]},
+      {"name": "test-pool2-twrw","log": "/home/lwx/.cache/recsys-459-opt-20261114/test-pool2-twrw.log","sha256": "3b0581d71569b7b01f7b141a794446daf7d5df6be1063073549f5cdce4411cf4","expected_exit_code": 0,"results": ["grad ok: both tables moved by -0.050000"]},
+      {"name": "test-pool2-primary-twrw","log": "/home/lwx/.cache/recsys-459-opt-20261114/test-pool2-primary-twrw.log","sha256": "ccc15816702a0ead1884366183b60af4bfdcbee5c85eb498dfe31a97b2cc8274","expected_exit_code": 0,"results": ["grad ok: both tables moved by -0.050000"]},
+      {"name": "test-pool2-twrw4","log": "/home/lwx/.cache/recsys-459-opt-20261114/test-pool2-twrw4.log","sha256": "870a254dd55b3107ad19c8f8294d9b7ef1d3b3d484b395bd098633b52203715a","expected_exit_code": 0,"results": ["grad ok: both tables moved by -0.025000"]},
+      {"name": "test-pool2-primary-twrw4","log": "/home/lwx/.cache/recsys-459-opt-20261114/test-pool2-primary-twrw4.log","sha256": "fcef5499a264a21d495008a42a760485ba5b1f089e24d79f4d7c98653416f03d","expected_exit_code": 0,"results": ["grad ok: both tables moved by -0.025000"]},
+      {"name": "test-pool2-final-burst","log": "/home/lwx/.cache/recsys-459-opt-20261114/test-pool2-final-burst.log","sha256": "7d8be37a7fca1b4fe766c91787ac5afdff3cf088f6766122b45ef52e6eba0f4f","expected_exit_code": 0,"results": ["1 passed, 3 warnings in 5.62s"]},
+      {"name": "test-pool2-primary-final-burst","log": "/home/lwx/.cache/recsys-459-opt-20261114/test-pool2-primary-final-burst.log","sha256": "b03fe92ac2458a01c657751f05a52ae23cf76e716286b8c00fcc503782302e21","expected_exit_code": 0,"results": ["1 passed in 4.80s"]}
+    ],
+    "attribution": [
+      {
+        "name": "attribution-main-raw",
+        "log": "/home/lwx/.cache/recsys-459-opt-20261114/attribution-main-raw.log",
+        "sha256": "e0f5653b472f7cf9adb4ac857ab3efc7fcc682d9019eb3e58315b48fa193b48e",
+        "instrumented": true,
+        "stages": [
+          {
+            "rank": "0",
+            "pipeline": "none",
+            "stages": {
+              "tables.prefetch": {
+                "calls": 100,
+                "total_ms": 120.760653,
+                "mean_us": 1207.60653
+              },
+              "state.record_stream": {
+                "calls": 100,
+                "total_ms": 2.059673,
+                "mean_us": 20.596729999999997
+              },
+              "function.forward": {
+                "calls": 100,
+                "total_ms": 8.467245,
+                "mean_us": 84.67245000000001
+              },
+              "tables.forward": {
+                "calls": 100,
+                "total_ms": 148.289629,
+                "mean_us": 1482.89629
+              }
+            }
+          }
+        ],
+        "factory_counts": []
+      },
+      {
+        "name": "attribution-feature-raw",
+        "log": "/home/lwx/.cache/recsys-459-opt-20261114/attribution-feature-raw.log",
+        "sha256": "7f8cb32148727dbc9f739a696f994f0afb14b22019c2fd40832f76123c6afc70",
+        "instrumented": true,
+        "stages": [
+          {
+            "rank": "0",
+            "pipeline": "none",
+            "stages": {
+              "tables.resolve_input": {
+                "calls": 100,
+                "total_ms": 119.325791,
+                "mean_us": 1193.25791
+              },
+              "tables.prefetch": {
+                "calls": 100,
+                "total_ms": 120.019733,
+                "mean_us": 1200.19733
+              },
+              "state.record_stream": {
+                "calls": 100,
+                "total_ms": 3.287608,
+                "mean_us": 32.87608
+              },
+              "lookup": {
+                "calls": 100,
+                "total_ms": 12.508354,
+                "mean_us": 125.08354
+              },
+              "lease.record_use": {
+                "calls": 100,
+                "total_ms": 3.310684,
+                "mean_us": 33.106840000000005
+              },
+              "lease.finish_forward": {
+                "calls": 100,
+                "total_ms": 3.925751,
+                "mean_us": 39.25751
+              },
+              "function.forward": {
+                "calls": 100,
+                "total_ms": 31.549758,
+                "mean_us": 315.49758
+              },
+              "tables.forward": {
+                "calls": 100,
+                "total_ms": 170.172643,
+                "mean_us": 1701.7264300000002
+              }
+            }
+          }
+        ],
+        "factory_counts": []
+      },
+      {
+        "name": "attribution-main-sparse",
+        "log": "/home/lwx/.cache/recsys-459-opt-20261114/attribution-main-sparse.log",
+        "sha256": "8bdd2ca229171275162116130f515547459867b397b8fcce1992e8c1cdb3a5a8",
+        "instrumented": true,
+        "stages": [
+          {
+            "rank": "1",
+            "pipeline": "sparse",
+            "stages": {
+              "tables.prefetch": {
+                "calls": 100,
+                "total_ms": 153.907963,
+                "mean_us": 1539.07963
+              },
+              "state.record_stream": {
+                "calls": 100,
+                "total_ms": 2.229279,
+                "mean_us": 22.29279
+              },
+              "function.forward": {
+                "calls": 100,
+                "total_ms": 10.461239,
+                "mean_us": 104.61238999999999
+              },
+              "tables.forward": {
+                "calls": 100,
+                "total_ms": 189.631051,
+                "mean_us": 1896.31051
+              },
+              "function.backward": {
+                "calls": 100,
+                "total_ms": 41.603272,
+                "mean_us": 416.03272
+              }
+            }
+          },
+          {
+            "rank": "0",
+            "pipeline": "sparse",
+            "stages": {
+              "tables.prefetch": {
+                "calls": 100,
+                "total_ms": 155.723292,
+                "mean_us": 1557.23292
+              },
+              "state.record_stream": {
+                "calls": 100,
+                "total_ms": 2.287978,
+                "mean_us": 22.87978
+              },
+              "function.forward": {
+                "calls": 100,
+                "total_ms": 10.60316,
+                "mean_us": 106.0316
+              },
+              "tables.forward": {
+                "calls": 100,
+                "total_ms": 191.837086,
+                "mean_us": 1918.37086
+              },
+              "function.backward": {
+                "calls": 100,
+                "total_ms": 42.062392,
+                "mean_us": 420.62392
+              }
+            }
+          }
+        ],
+        "factory_counts": []
+      },
+      {
+        "name": "attribution-feature-sparse",
+        "log": "/home/lwx/.cache/recsys-459-opt-20261114/attribution-feature-sparse.log",
+        "sha256": "7ccfb9c7ad3c3022059d7cf7b3e71186f81f239d21ea197c1a8e408c6c81ad40",
+        "instrumented": true,
+        "stages": [
+          {
+            "rank": "0",
+            "pipeline": "sparse",
+            "stages": {
+              "resolve_at_receive": {
+                "calls": 100,
+                "total_ms": 15.144787,
+                "mean_us": 151.44787
+              },
+              "tables.resolve_input": {
+                "calls": 100,
+                "total_ms": 162.21907,
+                "mean_us": 1622.1907
+              },
+              "from_rows": {
+                "calls": 100,
+                "total_ms": 10.609128,
+                "mean_us": 106.09128000000001
+              },
+              "state.record_stream": {
+                "calls": 200,
+                "total_ms": 6.925189,
+                "mean_us": 34.625945
+              },
+              "lookup": {
+                "calls": 100,
+                "total_ms": 16.465119,
+                "mean_us": 164.65118999999999
+              },
+              "lease.record_use": {
+                "calls": 100,
+                "total_ms": 3.656496,
+                "mean_us": 36.56496
+              },
+              "lease.finish_forward": {
+                "calls": 100,
+                "total_ms": 4.468027,
+                "mean_us": 44.68027
+              },
+              "function.forward": {
+                "calls": 100,
+                "total_ms": 32.321044,
+                "mean_us": 323.21044
+              },
+              "tables.forward": {
+                "calls": 100,
+                "total_ms": 55.468937,
+                "mean_us": 554.6893699999999
+              },
+              "lease.release": {
+                "calls": 100,
+                "total_ms": 18.345853,
+                "mean_us": 183.45853
+              },
+              "function.backward": {
+                "calls": 100,
+                "total_ms": 59.220677,
+                "mean_us": 592.20677
+              }
+            }
+          },
+          {
+            "rank": "1",
+            "pipeline": "sparse",
+            "stages": {
+              "resolve_at_receive": {
+                "calls": 100,
+                "total_ms": 15.811747,
+                "mean_us": 158.11747
+              },
+              "tables.resolve_input": {
+                "calls": 100,
+                "total_ms": 155.51165,
+                "mean_us": 1555.1164999999999
+              },
+              "from_rows": {
+                "calls": 100,
+                "total_ms": 10.603479,
+                "mean_us": 106.03478999999999
+              },
+              "state.record_stream": {
+                "calls": 200,
+                "total_ms": 6.985075,
+                "mean_us": 34.925375
+              },
+              "lookup": {
+                "calls": 100,
+                "total_ms": 17.052179,
+                "mean_us": 170.52179
+              },
+              "lease.record_use": {
+                "calls": 100,
+                "total_ms": 3.637033,
+                "mean_us": 36.370329999999996
+              },
+              "lease.finish_forward": {
+                "calls": 100,
+                "total_ms": 4.432563,
+                "mean_us": 44.325630000000004
+              },
+              "function.forward": {
+                "calls": 100,
+                "total_ms": 32.49301,
+                "mean_us": 324.9301
+              },
+              "tables.forward": {
+                "calls": 100,
+                "total_ms": 56.123168,
+                "mean_us": 561.23168
+              },
+              "lease.release": {
+                "calls": 100,
+                "total_ms": 17.939243,
+                "mean_us": 179.39243
+              },
+              "function.backward": {
+                "calls": 100,
+                "total_ms": 57.674387,
+                "mean_us": 576.74387
+              }
+            }
+          }
+        ],
+        "factory_counts": []
+      },
+      {
+        "name": "attribution-pool-sparse",
+        "log": "/home/lwx/.cache/recsys-459-opt-20261114/attribution-pool-sparse.log",
+        "sha256": "119fe8bd6eba493ef8974024cb1eafd0c7169868472da2ab153c9e26543c18f9",
+        "instrumented": true,
+        "stages": [
+          {
+            "rank": "0",
+            "pipeline": "sparse",
+            "stages": {
+              "resolve_at_receive": {
+                "calls": 100,
+                "total_ms": 2.850605,
+                "mean_us": 28.506050000000002
+              },
+              "tables.resolve_input": {
+                "calls": 100,
+                "total_ms": 120.197546,
+                "mean_us": 1201.97546
+              },
+              "from_rows": {
+                "calls": 100,
+                "total_ms": 9.278691,
+                "mean_us": 92.78691
+              },
+              "state.record_stream": {
+                "calls": 200,
+                "total_ms": 6.753812,
+                "mean_us": 33.769059999999996
+              },
+              "lookup": {
+                "calls": 100,
+                "total_ms": 14.991834,
+                "mean_us": 149.91834
+              },
+              "lease.record_use": {
+                "calls": 100,
+                "total_ms": 3.71767,
+                "mean_us": 37.176700000000004
+              },
+              "lease.finish_forward": {
+                "calls": 100,
+                "total_ms": 4.508968,
+                "mean_us": 45.08968
+              },
+              "function.forward": {
+                "calls": 100,
+                "total_ms": 30.13572,
+                "mean_us": 301.35720000000003
+              },
+              "tables.forward": {
+                "calls": 100,
+                "total_ms": 51.745574,
+                "mean_us": 517.45574
+              },
+              "lease.release": {
+                "calls": 100,
+                "total_ms": 16.219329,
+                "mean_us": 162.19329
+              },
+              "function.backward": {
+                "calls": 100,
+                "total_ms": 50.243856,
+                "mean_us": 502.43856
+              }
+            }
+          },
+          {
+            "rank": "1",
+            "pipeline": "sparse",
+            "stages": {
+              "resolve_at_receive": {
+                "calls": 100,
+                "total_ms": 2.790165,
+                "mean_us": 27.90165
+              },
+              "tables.resolve_input": {
+                "calls": 100,
+                "total_ms": 116.627394,
+                "mean_us": 1166.27394
+              },
+              "from_rows": {
+                "calls": 100,
+                "total_ms": 9.174662,
+                "mean_us": 91.74662000000001
+              },
+              "state.record_stream": {
+                "calls": 200,
+                "total_ms": 6.959775,
+                "mean_us": 34.798874999999995
+              },
+              "lookup": {
+                "calls": 100,
+                "total_ms": 14.916017,
+                "mean_us": 149.16017
+              },
+              "lease.record_use": {
+                "calls": 100,
+                "total_ms": 3.729229,
+                "mean_us": 37.29229
+              },
+              "lease.finish_forward": {
+                "calls": 100,
+                "total_ms": 4.501113,
+                "mean_us": 45.01113
+              },
+              "function.forward": {
+                "calls": 100,
+                "total_ms": 29.990363,
+                "mean_us": 299.90363
+              },
+              "tables.forward": {
+                "calls": 100,
+                "total_ms": 52.133745,
+                "mean_us": 521.33745
+              },
+              "lease.release": {
+                "calls": 100,
+                "total_ms": 16.592009,
+                "mean_us": 165.92009
+              },
+              "function.backward": {
+                "calls": 100,
+                "total_ms": 51.403307,
+                "mean_us": 514.03307
+              }
+            }
+          }
+        ],
+        "factory_counts": [],
+        "prototype_factory_lines": [
+          "TYPE_POOL_CREATED 2 CACHED 2",
+          "TYPE_POOL_CREATED 2 CACHED 2"
+        ]
+      },
+      {
+        "name": "attribution-pool-production-sparse",
+        "log": "/home/lwx/.cache/recsys-459-opt-20261114/attribution-pool-production-sparse.log",
+        "sha256": "bf40b63a36e2f54ae64cfb7c48b8c60fd45f4b42d5373f51fceed956275bfb71",
+        "instrumented": true,
+        "stages": [
+          {
+            "rank": "0",
+            "pipeline": "sparse",
+            "stages": {
+              "resolve_at_receive": {
+                "calls": 100,
+                "total_ms": 2.725801,
+                "mean_us": 27.25801
+              },
+              "tables.resolve_input": {
+                "calls": 100,
+                "total_ms": 127.080998,
+                "mean_us": 1270.80998
+              },
+              "from_rows": {
+                "calls": 100,
+                "total_ms": 9.311632,
+                "mean_us": 93.11632
+              },
+              "state.record_stream": {
+                "calls": 200,
+                "total_ms": 6.75666,
+                "mean_us": 33.7833
+              },
+              "lookup": {
+                "calls": 100,
+                "total_ms": 14.492985,
+                "mean_us": 144.92985000000002
+              },
+              "lease.record_use": {
+                "calls": 100,
+                "total_ms": 3.675051,
+                "mean_us": 36.75051
+              },
+              "lease.finish_forward": {
+                "calls": 100,
+                "total_ms": 4.370092,
+                "mean_us": 43.700919999999996
+              },
+              "function.forward": {
+                "calls": 100,
+                "total_ms": 29.073662,
+                "mean_us": 290.73662
+              },
+              "tables.forward": {
+                "calls": 100,
+                "total_ms": 50.197296,
+                "mean_us": 501.97296
+              },
+              "lease.release": {
+                "calls": 100,
+                "total_ms": 15.858025,
+                "mean_us": 158.58025
+              },
+              "function.backward": {
+                "calls": 100,
+                "total_ms": 50.089658,
+                "mean_us": 500.89658000000003
+              }
+            }
+          },
+          {
+            "rank": "1",
+            "pipeline": "sparse",
+            "stages": {
+              "resolve_at_receive": {
+                "calls": 100,
+                "total_ms": 2.770075,
+                "mean_us": 27.70075
+              },
+              "tables.resolve_input": {
+                "calls": 100,
+                "total_ms": 119.315283,
+                "mean_us": 1193.15283
+              },
+              "from_rows": {
+                "calls": 100,
+                "total_ms": 9.27956,
+                "mean_us": 92.7956
+              },
+              "state.record_stream": {
+                "calls": 200,
+                "total_ms": 6.928662,
+                "mean_us": 34.64331
+              },
+              "lookup": {
+                "calls": 100,
+                "total_ms": 14.967255,
+                "mean_us": 149.67255
+              },
+              "lease.record_use": {
+                "calls": 100,
+                "total_ms": 3.449042,
+                "mean_us": 34.49042
+              },
+              "lease.finish_forward": {
+                "calls": 100,
+                "total_ms": 4.176302,
+                "mean_us": 41.76302
+              },
+              "function.forward": {
+                "calls": 100,
+                "total_ms": 29.618906,
+                "mean_us": 296.18906
+              },
+              "tables.forward": {
+                "calls": 100,
+                "total_ms": 51.661692,
+                "mean_us": 516.61692
+              },
+              "lease.release": {
+                "calls": 100,
+                "total_ms": 16.037778,
+                "mean_us": 160.37778
+              },
+              "function.backward": {
+                "calls": 100,
+                "total_ms": 50.25998,
+                "mean_us": 502.5998
+              }
+            }
+          }
+        ],
+        "factory_counts": [
+          {
+            "total": 2,
+            "warm": 0
+          },
+          {
+            "total": 2,
+            "warm": 0
+          }
+        ]
+      },
+      {
+        "name": "attribution-pool2-production-sparse",
+        "log": "/home/lwx/.cache/recsys-459-opt-20261114/attribution-pool2-production-sparse.log",
+        "sha256": "8739fb8bdc6fb5c1180fd7eeb62b15c0c45f5c8aa14101e0a853ab2e909cc0ac",
+        "instrumented": true,
+        "stages": [
+          {
+            "rank": "0",
+            "pipeline": "sparse",
+            "stages": {
+              "resolve_at_receive": {
+                "calls": 100,
+                "total_ms": 2.381981,
+                "mean_us": 23.819810000000004
+              },
+              "tables.resolve_input": {
+                "calls": 100,
+                "total_ms": 115.692982,
+                "mean_us": 1156.92982
+              },
+              "from_rows": {
+                "calls": 100,
+                "total_ms": 9.012338,
+                "mean_us": 90.12338
+              },
+              "state.record_stream": {
+                "calls": 200,
+                "total_ms": 6.924016,
+                "mean_us": 34.62008
+              },
+              "lookup": {
+                "calls": 100,
+                "total_ms": 14.513943,
+                "mean_us": 145.13943
+              },
+              "lease.record_use": {
+                "calls": 100,
+                "total_ms": 3.54275,
+                "mean_us": 35.4275
+              },
+              "lease.finish_forward": {
+                "calls": 100,
+                "total_ms": 4.280475,
+                "mean_us": 42.804750000000006
+              },
+              "function.forward": {
+                "calls": 100,
+                "total_ms": 29.370413,
+                "mean_us": 293.70413
+              },
+              "tables.forward": {
+                "calls": 100,
+                "total_ms": 50.347317,
+                "mean_us": 503.47317000000004
+              },
+              "lease.release": {
+                "calls": 100,
+                "total_ms": 15.868351,
+                "mean_us": 158.68351
+              },
+              "function.backward": {
+                "calls": 100,
+                "total_ms": 49.20735,
+                "mean_us": 492.07349999999997
+              }
+            }
+          },
+          {
+            "rank": "1",
+            "pipeline": "sparse",
+            "stages": {
+              "resolve_at_receive": {
+                "calls": 100,
+                "total_ms": 2.426557,
+                "mean_us": 24.265569999999997
+              },
+              "tables.resolve_input": {
+                "calls": 100,
+                "total_ms": 114.036686,
+                "mean_us": 1140.36686
+              },
+              "from_rows": {
+                "calls": 100,
+                "total_ms": 8.975462,
+                "mean_us": 89.75461999999999
+              },
+              "state.record_stream": {
+                "calls": 200,
+                "total_ms": 6.719687,
+                "mean_us": 33.598435
+              },
+              "lookup": {
+                "calls": 100,
+                "total_ms": 15.223394,
+                "mean_us": 152.23394
+              },
+              "lease.record_use": {
+                "calls": 100,
+                "total_ms": 3.548252,
+                "mean_us": 35.48252
+              },
+              "lease.finish_forward": {
+                "calls": 100,
+                "total_ms": 4.235324,
+                "mean_us": 42.35324
+              },
+              "function.forward": {
+                "calls": 100,
+                "total_ms": 29.983047,
+                "mean_us": 299.83047
+              },
+              "tables.forward": {
+                "calls": 100,
+                "total_ms": 54.869385,
+                "mean_us": 548.69385
+              },
+              "lease.release": {
+                "calls": 100,
+                "total_ms": 15.554142,
+                "mean_us": 155.54142
+              },
+              "function.backward": {
+                "calls": 100,
+                "total_ms": 48.672822,
+                "mean_us": 486.72822
+              }
+            }
+          }
+        ],
+        "factory_counts": [
+          {
+            "total": 2,
+            "warm": 0
+          },
+          {
+            "total": 2,
+            "warm": 0
+          }
+        ]
+      }
+    ],
+    "pilot_performance": [
+      {"case": "main85-pool-a-sparse-hbm-depth0-cap4096","argv": ["taskset","-c","4-11","/home/lwx/.cache/recsys-459-target-venv/bin/python","-m","torch.distributed.run","--standalone","--nproc_per_node=2","/home/lwx/recsys-examples/corelib/dynamicemb/benchmark/benchmark_resolved_lookup.py","--lookup","default","--pipeline","sparse","--layout","hbm","--features","128","--capacity","4096","--warmup","20","--iterations","100","--trials","6","--profile-steps","5","--profile-dir","/home/lwx/.cache/recsys-459-attribution-20261114/profiles/final/main85-pool-a-sparse-hbm-depth0-cap4096"],"devices": "1,2","exit_code": 0,"log": "/home/lwx/.cache/recsys-459-attribution-20261114/final-perf-main85-pool-a-sparse-hbm-depth0-cap4096.log","log_sha256": "e6479c193fca3d46aa7884a95d15a34783993b12ae4b79a26f08b9013556169a","results": [{"pipeline": "sparse","layout": "hbm","prefetch_depth": 0,"train": true,"gpu_name": "NVIDIA RTX PRO 6000 Blackwell Server Edition","torch_version": "2.13.0+cu130","torchrec_version": "1.8.0+0ea0ec0","dynamicemb_source": "/home/lwx/.cache/recsys-459-attribution-20261114/runtime/main85-pool-a/dynamicemb/__init__.py","world_size": 2,"features": 128,"batch_size": 32,"hotness": 4,"dim": 64,"capacity": 4096,"warmup": 20,"iterations": 100,"trials": 6,"samples_ms": {"default": [15.85719108581543,15.564910888671875,15.497990608215332,15.69705867767334,15.931246757507324,15.550625801086426]},"median_ms": {"default": 15.630984783172607},"profiles": {"default": {"steps": 5,"trace": "/home/lwx/.cache/recsys-459-attribution-20261114/profiles/final/main85-pool-a-sparse-hbm-depth0-cap4096/hbm-sparse-128-default-rank0.json","host_syncs": 71,"kernels": 590,"copies": [{"name": "cudaMemcpyAsync","count": 75,"cpu_us": 1924.0259999999716,"device_us": 0},{"name": "Memcpy DtoH (Device -> Pageable)","count": 45,"cpu_us": 0,"device_us": 19.233999999990374},{"name": "Memcpy HtoD (Pageable -> Device)","count": 20,"cpu_us": 0,"device_us": 6.531000000029053},{"name": "Memcpy DtoH (Device -> Pinned)","count": 5,"cpu_us": 0,"device_us": 2.143999999991138},{"name": "Memcpy DtoD (Device -> Device)","count": 5,"cpu_us": 0,"device_us": 4.798999999984517}],"peak_increment_bytes": 17367040,"resident_allocated_bytes": 67902464,"peak_allocated_bytes": 85269504,"selected_operators": [{"name": "aten::record_stream","count": 80,"cpu_us": 385.4409999999716,"device_us": 0,"memory_bytes": 0},{"name": "aten::as_strided","count": 2135,"cpu_us": 1862.532999999873,"device_us": 0,"memory_bytes": 0},{"name": "aten::cat","count": 15,"cpu_us": 1566.8409999999803,"device_us": 27.77600000000075,"memory_bytes": 41945600}],"trace_sha256": "700ba91325bc790bf53988d7d64f39bfdda44bc326959baa61d50f20840cac33","selected_cuda_api": {"cudaEventRecordWithFlags": {"count": 75,"cpu_us": 247.961},"cudaStreamWaitEvent": {"count": 120,"cpu_us": 366.2559999999999},"cudaMemcpyAsync": {"count": 75,"cpu_us": 1924.0259999999998},"cudaStreamSynchronize": {"count": 70,"cpu_us": 451.7239999999998},"cudaEventRecord": {"count": 95,"cpu_us": 269.585},"cudaEventQuery": {"count": 64,"cpu_us": 284.852},"cudaDeviceSynchronize": {"count": 1,"cpu_us": 37.389}}}}}],"python_source_sha256": "1cf6952c1b31555581eb862a68e0d3b39e558c2d96209beaf99889892d8740d7"},
+      {"case": "gate2-pool-a-sparse-hbm-depth0-cap4096","argv": ["taskset","-c","4-11","/home/lwx/.cache/recsys-459-target-venv/bin/python","-m","torch.distributed.run","--standalone","--nproc_per_node=2","/home/lwx/recsys-examples/corelib/dynamicemb/benchmark/benchmark_resolved_lookup.py","--lookup","default","--pipeline","sparse","--layout","hbm","--features","128","--capacity","4096","--warmup","20","--iterations","100","--trials","6","--profile-steps","5","--profile-dir","/home/lwx/.cache/recsys-459-attribution-20261114/profiles/final/gate2-pool-a-sparse-hbm-depth0-cap4096"],"devices": "1,2","exit_code": 0,"log": "/home/lwx/.cache/recsys-459-attribution-20261114/final-perf-gate2-pool-a-sparse-hbm-depth0-cap4096.log","log_sha256": "89cfd95317766b3377ad32eb4de1d9aadba7c8cf35563d827e97c5d1695a8fe9","results": [{"pipeline": "sparse","layout": "hbm","prefetch_depth": 0,"train": true,"gpu_name": "NVIDIA RTX PRO 6000 Blackwell Server Edition","torch_version": "2.13.0+cu130","torchrec_version": "1.8.0+0ea0ec0","dynamicemb_source": "/home/lwx/.cache/recsys-459-attribution-20261114/runtime/gate2-pool-a/dynamicemb/__init__.py","world_size": 2,"features": 128,"batch_size": 32,"hotness": 4,"dim": 64,"capacity": 4096,"warmup": 20,"iterations": 100,"trials": 6,"samples_ms": {"default": [17.252843856811523,17.262020111083984,17.238407135009766,17.00777816772461,17.571847915649414,17.04048728942871]},"median_ms": {"default": 17.245625495910645},"profiles": {"default": {"steps": 5,"trace": "/home/lwx/.cache/recsys-459-attribution-20261114/profiles/final/gate2-pool-a-sparse-hbm-depth0-cap4096/hbm-sparse-128-default-rank0.json","host_syncs": 71,"kernels": 595,"copies": [{"name": "cudaMemcpyAsync","count": 75,"cpu_us": 2078.1869999999954,"device_us": 0},{"name": "Memcpy DtoH (Device -> Pageable)","count": 45,"cpu_us": 0,"device_us": 19.32400000004054},{"name": "Memcpy HtoD (Pageable -> Device)","count": 20,"cpu_us": 0,"device_us": 6.55899999999383},{"name": "Memcpy DtoH (Device -> Pinned)","count": 5,"cpu_us": 0,"device_us": 2.2080000000041764},{"name": "Memcpy DtoD (Device -> Device)","count": 5,"cpu_us": 0,"device_us": 4.896000000004278}],"peak_increment_bytes": 17498112,"resident_allocated_bytes": 67902976,"peak_allocated_bytes": 85401088,"selected_operators": [{"name": "aten::record_stream","count": 120,"cpu_us": 554.7000000000635,"device_us": 0,"memory_bytes": 0},{"name": "aten::as_strided","count": 2145,"cpu_us": 1879.4000000002306,"device_us": 0,"memory_bytes": 0},{"name": "aten::cat","count": 15,"cpu_us": 1605.9889999999614,"device_us": 27.74400000001151,"memory_bytes": 41945600},{"name": "aten::index","count": 5,"cpu_us": 268.13199999999597,"device_us": 20.767000000003463,"memory_bytes": 655360}],"trace_sha256": "c131d52c7325960d669e51bde077ae824cc93053a430210bb60f0fd64621e55c","selected_cuda_api": {"cudaEventRecordWithFlags": {"count": 85,"cpu_us": 289.2660000000001},"cudaStreamWaitEvent": {"count": 125,"cpu_us": 413.54399999999976},"cudaMemcpyAsync": {"count": 75,"cpu_us": 2078.1870000000004},"cudaStreamSynchronize": {"count": 70,"cpu_us": 464.66700000000003},"cudaEventRecord": {"count": 125,"cpu_us": 318.8689999999999},"cudaEventQuery": {"count": 120,"cpu_us": 398.17900000000014},"cudaDeviceSynchronize": {"count": 1,"cpu_us": 39.917}}}}}],"python_source_sha256": "02d58e7c1643ea3bb1e160afe4e93a36428b566412776287c6f767c41e9fe5d9"},
+      {"case": "pool1-a-sparse-hbm-depth0-cap4096","argv": ["taskset","-c","4-11","/home/lwx/.cache/recsys-459-target-venv/bin/python","-m","torch.distributed.run","--standalone","--nproc_per_node=2","/home/lwx/recsys-examples/corelib/dynamicemb/benchmark/benchmark_resolved_lookup.py","--lookup","default","--pipeline","sparse","--layout","hbm","--features","128","--capacity","4096","--warmup","20","--iterations","100","--trials","6","--profile-steps","5","--profile-dir","/home/lwx/.cache/recsys-459-attribution-20261114/profiles/final/pool1-a-sparse-hbm-depth0-cap4096"],"devices": "1,2","exit_code": 0,"log": "/home/lwx/.cache/recsys-459-attribution-20261114/final-perf-pool1-a-sparse-hbm-depth0-cap4096.log","log_sha256": "95cd8f83e5948a10e10c24ad44e7c2ab9fe33c8a2691fd33ae39cffcfc3bc4ea","results": [{"pipeline": "sparse","layout": "hbm","prefetch_depth": 0,"train": true,"gpu_name": "NVIDIA RTX PRO 6000 Blackwell Server Edition","torch_version": "2.13.0+cu130","torchrec_version": "1.8.0+0ea0ec0","dynamicemb_source": "/home/lwx/.cache/recsys-459-attribution-20261114/runtime/pool1-a/dynamicemb/__init__.py","world_size": 2,"features": 128,"batch_size": 32,"hotness": 4,"dim": 64,"capacity": 4096,"warmup": 20,"iterations": 100,"trials": 6,"samples_ms": {"default": [18.637725830078125,18.51653480529785,18.628068923950195,18.645654678344727,18.87131118774414,18.77092933654785]},"median_ms": {"default": 18.641690254211426},"profiles": {"default": {"steps": 5,"trace": "/home/lwx/.cache/recsys-459-attribution-20261114/profiles/final/pool1-a-sparse-hbm-depth0-cap4096/hbm-sparse-128-default-rank0.json","host_syncs": 71,"kernels": 595,"copies": [{"name": "cudaMemcpyAsync","count": 75,"cpu_us": 2239.0149999999967,"device_us": 0},{"name": "Memcpy DtoH (Device -> Pageable)","count": 45,"cpu_us": 0,"device_us": 19.390999999960513},{"name": "Memcpy HtoD (Pageable -> Device)","count": 20,"cpu_us": 0,"device_us": 6.5270000000236905},{"name": "Memcpy DtoH (Device -> Pinned)","count": 5,"cpu_us": 0,"device_us": 2.1120000000064465},{"name": "Memcpy DtoD (Device -> Device)","count": 5,"cpu_us": 0,"device_us": 4.862999999990279}],"peak_increment_bytes": 17498112,"resident_allocated_bytes": 67902976,"peak_allocated_bytes": 85401088,"selected_operators": [{"name": "aten::record_stream","count": 120,"cpu_us": 571.0820000000103,"device_us": 0,"memory_bytes": 0},{"name": "aten::as_strided","count": 2145,"cpu_us": 1978.2799999996541,"device_us": 0,"memory_bytes": 0},{"name": "aten::cat","count": 15,"cpu_us": 1655.8160000000498,"device_us": 27.83599999998114,"memory_bytes": 41945600},{"name": "aten::index","count": 5,"cpu_us": 290.8779999999915,"device_us": 20.800000000013824,"memory_bytes": 655360}],"trace_sha256": "880cb4582424039a2ebbef44deef8ed59b80781c7190e2eea803e12d14b06091","selected_cuda_api": {"cudaEventRecordWithFlags": {"count": 85,"cpu_us": 313.376},"cudaStreamWaitEvent": {"count": 125,"cpu_us": 420.6769999999999},"cudaMemcpyAsync": {"count": 75,"cpu_us": 2239.0149999999994},"cudaStreamSynchronize": {"count": 70,"cpu_us": 489.7979999999999},"cudaEventRecord": {"count": 125,"cpu_us": 347.60099999999983},"cudaEventQuery": {"count": 81,"cpu_us": 397.923},"cudaDeviceSynchronize": {"count": 1,"cpu_us": 53.207}}}}}],"python_source_sha256": "179c26130953a00567c773a0237a6ce59867456d8b1b2d6080729f3a244b4915"},
+      {"case": "pool1-b-sparse-hbm-depth0-cap4096","argv": ["taskset","-c","4-11","/home/lwx/.cache/recsys-459-target-venv/bin/python","-m","torch.distributed.run","--standalone","--nproc_per_node=2","/home/lwx/recsys-examples/corelib/dynamicemb/benchmark/benchmark_resolved_lookup.py","--lookup","default","--pipeline","sparse","--layout","hbm","--features","128","--capacity","4096","--warmup","20","--iterations","100","--trials","6","--profile-steps","5","--profile-dir","/home/lwx/.cache/recsys-459-attribution-20261114/profiles/final/pool1-b-sparse-hbm-depth0-cap4096"],"devices": "1,2","exit_code": 0,"log": "/home/lwx/.cache/recsys-459-attribution-20261114/final-perf-pool1-b-sparse-hbm-depth0-cap4096.log","log_sha256": "6c1260513cc9481197c351fd79737b4c7c913209b328b451f5699e59fb2ba091","results": [{"pipeline": "sparse","layout": "hbm","prefetch_depth": 0,"train": true,"gpu_name": "NVIDIA RTX PRO 6000 Blackwell Server Edition","torch_version": "2.13.0+cu130","torchrec_version": "1.8.0+0ea0ec0","dynamicemb_source": "/home/lwx/.cache/recsys-459-attribution-20261114/runtime/pool1-b/dynamicemb/__init__.py","world_size": 2,"features": 128,"batch_size": 32,"hotness": 4,"dim": 64,"capacity": 4096,"warmup": 20,"iterations": 100,"trials": 6,"samples_ms": {"default": [18.10556983947754,18.25453758239746,18.209829330444336,18.247379302978516,18.305360794067383,18.19411277770996]},"median_ms": {"default": 18.228604316711426},"profiles": {"default": {"steps": 5,"trace": "/home/lwx/.cache/recsys-459-attribution-20261114/profiles/final/pool1-b-sparse-hbm-depth0-cap4096/hbm-sparse-128-default-rank0.json","host_syncs": 71,"kernels": 595,"copies": [{"name": "cudaMemcpyAsync","count": 75,"cpu_us": 2266.716000000056,"device_us": 0},{"name": "Memcpy DtoH (Device -> Pageable)","count": 45,"cpu_us": 0,"device_us": 19.072999999986678},{"name": "Memcpy HtoD (Pageable -> Device)","count": 20,"cpu_us": 0,"device_us": 6.593000000009852},{"name": "Memcpy DtoH (Device -> Pinned)","count": 5,"cpu_us": 0,"device_us": 2.2080000000150903},{"name": "Memcpy DtoD (Device -> Device)","count": 5,"cpu_us": 0,"device_us": 4.896000000007916}],"peak_increment_bytes": 17498112,"resident_allocated_bytes": 67902976,"peak_allocated_bytes": 85401088,"selected_operators": [{"name": "aten::record_stream","count": 120,"cpu_us": 562.4329999999836,"device_us": 0,"memory_bytes": 0},{"name": "aten::as_strided","count": 2145,"cpu_us": 1925.5469999998168,"device_us": 0,"memory_bytes": 0},{"name": "aten::cat","count": 15,"cpu_us": 1668.5580000000464,"device_us": 27.744000000024243,"memory_bytes": 41945600},{"name": "aten::index","count": 5,"cpu_us": 302.9400000000169,"device_us": 20.767999999985477,"memory_bytes": 655360}],"trace_sha256": "914b0ab09aeb5d8d39353f6a49d11714260f74067bf14a14d3b7d071f2631b0e","selected_cuda_api": {"cudaEventRecordWithFlags": {"count": 85,"cpu_us": 317.93400000000014},"cudaStreamWaitEvent": {"count": 125,"cpu_us": 423.67199999999997},"cudaMemcpyAsync": {"count": 75,"cpu_us": 2266.7160000000003},"cudaStreamSynchronize": {"count": 70,"cpu_us": 483.0830000000002},"cudaEventRecord": {"count": 125,"cpu_us": 334.7499999999999},"cudaEventQuery": {"count": 117,"cpu_us": 511.461},"cudaDeviceSynchronize": {"count": 1,"cpu_us": 47.606}}}}}],"python_source_sha256": "179c26130953a00567c773a0237a6ce59867456d8b1b2d6080729f3a244b4915"},
+      {"case": "gate2-pool-b-sparse-hbm-depth0-cap4096","argv": ["taskset","-c","4-11","/home/lwx/.cache/recsys-459-target-venv/bin/python","-m","torch.distributed.run","--standalone","--nproc_per_node=2","/home/lwx/recsys-examples/corelib/dynamicemb/benchmark/benchmark_resolved_lookup.py","--lookup","default","--pipeline","sparse","--layout","hbm","--features","128","--capacity","4096","--warmup","20","--iterations","100","--trials","6","--profile-steps","5","--profile-dir","/home/lwx/.cache/recsys-459-attribution-20261114/profiles/final/gate2-pool-b-sparse-hbm-depth0-cap4096"],"devices": "1,2","exit_code": 0,"log": "/home/lwx/.cache/recsys-459-attribution-20261114/final-perf-gate2-pool-b-sparse-hbm-depth0-cap4096.log","log_sha256": "9a5c1cc748277a13a14c7fa9742640c14f83898dedaf3a1d3021cd107e495020","results": [{"pipeline": "sparse","layout": "hbm","prefetch_depth": 0,"train": true,"gpu_name": "NVIDIA RTX PRO 6000 Blackwell Server Edition","torch_version": "2.13.0+cu130","torchrec_version": "1.8.0+0ea0ec0","dynamicemb_source": "/home/lwx/.cache/recsys-459-attribution-20261114/runtime/gate2-pool-b/dynamicemb/__init__.py","world_size": 2,"features": 128,"batch_size": 32,"hotness": 4,"dim": 64,"capacity": 4096,"warmup": 20,"iterations": 100,"trials": 6,"samples_ms": {"default": [18.55571174621582,18.808273315429688,17.038801193237305,16.932998657226562,16.608158111572266,16.730140686035156]},"median_ms": {"default": 16.985899925231934},"profiles": {"default": {"steps": 5,"trace": "/home/lwx/.cache/recsys-459-attribution-20261114/profiles/final/gate2-pool-b-sparse-hbm-depth0-cap4096/hbm-sparse-128-default-rank0.json","host_syncs": 71,"kernels": 595,"copies": [{"name": "cudaMemcpyAsync","count": 75,"cpu_us": 1920.4240000000163,"device_us": 0},{"name": "Memcpy DtoH (Device -> Pageable)","count": 45,"cpu_us": 0,"device_us": 30.940999999983433},{"name": "Memcpy HtoD (Pageable -> Device)","count": 20,"cpu_us": 0,"device_us": 13.118000000008578},{"name": "Memcpy DtoH (Device -> Pinned)","count": 5,"cpu_us": 0,"device_us": 3.583999999995285},{"name": "Memcpy DtoD (Device -> Device)","count": 5,"cpu_us": 0,"device_us": 4.863999999979569}],"peak_increment_bytes": 17498112,"resident_allocated_bytes": 67902976,"peak_allocated_bytes": 85401088,"selected_operators": [{"name": "aten::record_stream","count": 120,"cpu_us": 518.3160000000462,"device_us": 0,"memory_bytes": 0},{"name": "aten::as_strided","count": 2145,"cpu_us": 1816.7500000001728,"device_us": 0,"memory_bytes": 0},{"name": "aten::cat","count": 15,"cpu_us": 1552.2000000000116,"device_us": 27.775999999991654,"memory_bytes": 41945600},{"name": "aten::index","count": 5,"cpu_us": 252.7270000000044,"device_us": 20.79899999999543,"memory_bytes": 655360}],"trace_sha256": "0e2871170149d2f32b48f03e25c4ddd1713ff318e5a3080e763cb1fb7fa6ceac","selected_cuda_api": {"cudaEventRecordWithFlags": {"count": 85,"cpu_us": 271.4920000000001},"cudaStreamWaitEvent": {"count": 125,"cpu_us": 377.7970000000002},"cudaMemcpyAsync": {"count": 75,"cpu_us": 1948.7149999999995},"cudaStreamSynchronize": {"count": 70,"cpu_us": 437.05},"cudaEventRecord": {"count": 125,"cpu_us": 304.67900000000014},"cudaEventQuery": {"count": 255,"cpu_us": 725.7460000000002},"cudaDeviceSynchronize": {"count": 1,"cpu_us": 5430.975}}}}}],"python_source_sha256": "02d58e7c1643ea3bb1e160afe4e93a36428b566412776287c6f767c41e9fe5d9"},
+      {"case": "main85-pool-b-sparse-hbm-depth0-cap4096","argv": ["taskset","-c","4-11","/home/lwx/.cache/recsys-459-target-venv/bin/python","-m","torch.distributed.run","--standalone","--nproc_per_node=2","/home/lwx/recsys-examples/corelib/dynamicemb/benchmark/benchmark_resolved_lookup.py","--lookup","default","--pipeline","sparse","--layout","hbm","--features","128","--capacity","4096","--warmup","20","--iterations","100","--trials","6","--profile-steps","5","--profile-dir","/home/lwx/.cache/recsys-459-attribution-20261114/profiles/final/main85-pool-b-sparse-hbm-depth0-cap4096"],"devices": "1,2","exit_code": 0,"log": "/home/lwx/.cache/recsys-459-attribution-20261114/final-perf-main85-pool-b-sparse-hbm-depth0-cap4096.log","log_sha256": "3f115dc033c69070483276e83ad635dd4ec7d08cb401d321091eb2bb90fdd80f","results": [{"pipeline": "sparse","layout": "hbm","prefetch_depth": 0,"train": true,"gpu_name": "NVIDIA RTX PRO 6000 Blackwell Server Edition","torch_version": "2.13.0+cu130","torchrec_version": "1.8.0+0ea0ec0","dynamicemb_source": "/home/lwx/.cache/recsys-459-attribution-20261114/runtime/main85-pool-b/dynamicemb/__init__.py","world_size": 2,"features": 128,"batch_size": 32,"hotness": 4,"dim": 64,"capacity": 4096,"warmup": 20,"iterations": 100,"trials": 6,"samples_ms": {"default": [15.68844985961914,15.584196090698242,15.91533374786377,16.837392807006836,16.524133682250977,15.98298168182373]},"median_ms": {"default": 15.94915771484375},"profiles": {"default": {"steps": 5,"trace": "/home/lwx/.cache/recsys-459-attribution-20261114/profiles/final/main85-pool-b-sparse-hbm-depth0-cap4096/hbm-sparse-128-default-rank0.json","host_syncs": 71,"kernels": 590,"copies": [{"name": "cudaMemcpyAsync","count": 75,"cpu_us": 2018.2039999999424,"device_us": 0},{"name": "Memcpy DtoH (Device -> Pageable)","count": 45,"cpu_us": 0,"device_us": 19.424999999997453},{"name": "Memcpy HtoD (Pageable -> Device)","count": 20,"cpu_us": 0,"device_us": 6.526999999987311},{"name": "Memcpy DtoH (Device -> Pinned)","count": 5,"cpu_us": 0,"device_us": 2.2070000000076107},{"name": "Memcpy DtoD (Device -> Device)","count": 5,"cpu_us": 0,"device_us": 4.736000000000786}],"peak_increment_bytes": 17367040,"resident_allocated_bytes": 67902464,"peak_allocated_bytes": 85269504,"selected_operators": [{"name": "aten::record_stream","count": 80,"cpu_us": 380.9789999999948,"device_us": 0,"memory_bytes": 0},{"name": "aten::as_strided","count": 2135,"cpu_us": 1824.8409999999512,"device_us": 0,"memory_bytes": 0},{"name": "aten::cat","count": 15,"cpu_us": 1647.4609999999839,"device_us": 27.903000000007523,"memory_bytes": 41945600}],"trace_sha256": "11d55a327db7626ff9698c667bcc9eb2a9c62373c813cbaf891ada70ccd5f354","selected_cuda_api": {"cudaEventRecordWithFlags": {"count": 75,"cpu_us": 253.14199999999997},"cudaStreamWaitEvent": {"count": 120,"cpu_us": 361.458},"cudaMemcpyAsync": {"count": 75,"cpu_us": 2018.204},"cudaStreamSynchronize": {"count": 70,"cpu_us": 463.418},"cudaEventRecord": {"count": 95,"cpu_us": 277.74400000000014},"cudaEventQuery": {"count": 118,"cpu_us": 523.759},"cudaDeviceSynchronize": {"count": 1,"cpu_us": 52.965}}}}}],"python_source_sha256": "1cf6952c1b31555581eb862a68e0d3b39e558c2d96209beaf99889892d8740d7"},
+      {"case": "main85-pool-a-prefetch-hbm-depth0-cap4096","argv": ["taskset","-c","4-11","/home/lwx/.cache/recsys-459-target-venv/bin/python","-m","torch.distributed.run","--standalone","--nproc_per_node=2","/home/lwx/recsys-examples/corelib/dynamicemb/benchmark/benchmark_resolved_lookup.py","--lookup","default","--pipeline","prefetch","--layout","hbm","--features","128","--capacity","4096","--warmup","20","--iterations","100","--trials","6","--profile-steps","5","--profile-dir","/home/lwx/.cache/recsys-459-attribution-20261114/profiles/final/main85-pool-a-prefetch-hbm-depth0-cap4096"],"devices": "1,2","exit_code": 0,"log": "/home/lwx/.cache/recsys-459-attribution-20261114/final-perf-main85-pool-a-prefetch-hbm-depth0-cap4096.log","log_sha256": "eb131fe1b87a7134dbbfc1a46eea21dd85f1a2d005b3b6232190859dabb7eea5","results": [{"pipeline": "prefetch","layout": "hbm","prefetch_depth": 0,"train": true,"gpu_name": "NVIDIA RTX PRO 6000 Blackwell Server Edition","torch_version": "2.13.0+cu130","torchrec_version": "1.8.0+0ea0ec0","dynamicemb_source": "/home/lwx/.cache/recsys-459-attribution-20261114/runtime/main85-pool-a/dynamicemb/__init__.py","world_size": 2,"features": 128,"batch_size": 32,"hotness": 4,"dim": 64,"capacity": 4096,"warmup": 20,"iterations": 100,"trials": 6,"samples_ms": {"default": [17.541215896606445,18.222782135009766,18.450397491455078,18.80849838256836,18.403766632080078,18.197622299194336]},"median_ms": {"default": 18.313274383544922},"profiles": {"default": {"steps": 5,"trace": "/home/lwx/.cache/recsys-459-attribution-20261114/profiles/final/main85-pool-a-prefetch-hbm-depth0-cap4096/hbm-prefetch-128-default-rank0.json","host_syncs": 71,"kernels": 595,"copies": [{"name": "cudaMemcpyAsync","count": 75,"cpu_us": 2373.6939999999613,"device_us": 0},{"name": "Memcpy DtoH (Device -> Pageable)","count": 45,"cpu_us": 0,"device_us": 18.939999999995962},{"name": "Memcpy HtoD (Pageable -> Device)","count": 20,"cpu_us": 0,"device_us": 6.400999999978012},{"name": "Memcpy DtoH (Device -> Pinned)","count": 5,"cpu_us": 0,"device_us": 2.2079999999914435},{"name": "Memcpy DtoD (Device -> Device)","count": 5,"cpu_us": 0,"device_us": 4.864000000001397}],"peak_increment_bytes": 17036800,"resident_allocated_bytes": 68376576,"peak_allocated_bytes": 85413376,"selected_operators": [{"name": "aten::record_stream","count": 145,"cpu_us": 750.3009999999313,"device_us": 0,"memory_bytes": 0},{"name": "aten::as_strided","count": 2135,"cpu_us": 1932.3589999997776,"device_us": 0,"memory_bytes": 0},{"name": "aten::cat","count": 15,"cpu_us": 1696.510000000013,"device_us": 27.676000000039494,"memory_bytes": 41945600}],"trace_sha256": "3a4d956baf766f45f85c316f2a23ed52364a0948ad30d315224958197dfc3e3f","selected_cuda_api": {"cudaEventRecordWithFlags": {"count": 80,"cpu_us": 285.4989999999999},"cudaStreamWaitEvent": {"count": 125,"cpu_us": 396.59999999999997},"cudaMemcpyAsync": {"count": 75,"cpu_us": 2373.694},"cudaStreamSynchronize": {"count": 70,"cpu_us": 509.35999999999984},"cudaEventRecord": {"count": 165,"cpu_us": 413.67000000000013},"cudaEventQuery": {"count": 163,"cpu_us": 724.8440000000003},"cudaDeviceSynchronize": {"count": 1,"cpu_us": 868.249}}}}}],"python_source_sha256": "1cf6952c1b31555581eb862a68e0d3b39e558c2d96209beaf99889892d8740d7"},
+      {"case": "gate2-pool-a-prefetch-hbm-depth0-cap4096","argv": ["taskset","-c","4-11","/home/lwx/.cache/recsys-459-target-venv/bin/python","-m","torch.distributed.run","--standalone","--nproc_per_node=2","/home/lwx/recsys-examples/corelib/dynamicemb/benchmark/benchmark_resolved_lookup.py","--lookup","default","--pipeline","prefetch","--layout","hbm","--features","128","--capacity","4096","--warmup","20","--iterations","100","--trials","6","--profile-steps","5","--profile-dir","/home/lwx/.cache/recsys-459-attribution-20261114/profiles/final/gate2-pool-a-prefetch-hbm-depth0-cap4096"],"devices": "1,2","exit_code": 0,"log": "/home/lwx/.cache/recsys-459-attribution-20261114/final-perf-gate2-pool-a-prefetch-hbm-depth0-cap4096.log","log_sha256": "8d6a83cb0aaa0a57f7c6eb115f1d1695b2fef31d1a0736219e9e4521aa3e3d1c","results": [{"pipeline": "prefetch","layout": "hbm","prefetch_depth": 0,"train": true,"gpu_name": "NVIDIA RTX PRO 6000 Blackwell Server Edition","torch_version": "2.13.0+cu130","torchrec_version": "1.8.0+0ea0ec0","dynamicemb_source": "/home/lwx/.cache/recsys-459-attribution-20261114/runtime/gate2-pool-a/dynamicemb/__init__.py","world_size": 2,"features": 128,"batch_size": 32,"hotness": 4,"dim": 64,"capacity": 4096,"warmup": 20,"iterations": 100,"trials": 6,"samples_ms": {"default": [17.54847526550293,17.30019187927246,17.487398147583008,17.44106101989746,17.42275619506836,17.63593292236328]},"median_ms": {"default": 17.464229583740234},"profiles": {"default": {"steps": 5,"trace": "/home/lwx/.cache/recsys-459-attribution-20261114/profiles/final/gate2-pool-a-prefetch-hbm-depth0-cap4096/hbm-prefetch-128-default-rank0.json","host_syncs": 71,"kernels": 595,"copies": [{"name": "cudaMemcpyAsync","count": 75,"cpu_us": 2007.7640000000065,"device_us": 0},{"name": "Memcpy DtoH (Device -> Pageable)","count": 45,"cpu_us": 0,"device_us": 19.103000000014617},{"name": "Memcpy HtoD (Pageable -> Device)","count": 20,"cpu_us": 0,"device_us": 6.495999999956439},{"name": "Memcpy DtoH (Device -> Pinned)","count": 5,"cpu_us": 0,"device_us": 2.1120000000028085},{"name": "Memcpy DtoD (Device -> Device)","count": 5,"cpu_us": 0,"device_us": 4.864000000012311}],"peak_increment_bytes": 17167872,"resident_allocated_bytes": 68377088,"peak_allocated_bytes": 85544960,"selected_operators": [{"name": "aten::record_stream","count": 250,"cpu_us": 1103.5980000000545,"device_us": 0,"memory_bytes": 0},{"name": "aten::as_strided","count": 2145,"cpu_us": 1970.7479999997859,"device_us": 0,"memory_bytes": 0},{"name": "aten::cat","count": 15,"cpu_us": 1660.0580000000318,"device_us": 27.680999999995038,"memory_bytes": 41945600},{"name": "aten::index","count": 5,"cpu_us": 276.68900000005306,"device_us": 20.767999999992753,"memory_bytes": 655360}],"trace_sha256": "3093bc355c6d3d7eabdc2b05b51613ea595110c7ef2e446a4d447800118c54e6","selected_cuda_api": {"cudaEventRecordWithFlags": {"count": 90,"cpu_us": 307.7920000000001},"cudaStreamWaitEvent": {"count": 130,"cpu_us": 408.70499999999987},"cudaMemcpyAsync": {"count": 75,"cpu_us": 2022.1570000000004},"cudaStreamSynchronize": {"count": 70,"cpu_us": 479.041},"cudaEventRecord": {"count": 225,"cpu_us": 458.09200000000027},"cudaEventQuery": {"count": 214,"cpu_us": 688.5199999999996},"cudaDeviceSynchronize": {"count": 1,"cpu_us": 35.665}}}}}],"python_source_sha256": "02d58e7c1643ea3bb1e160afe4e93a36428b566412776287c6f767c41e9fe5d9"},
+      {"case": "pool1-a-prefetch-hbm-depth0-cap4096","argv": ["taskset","-c","4-11","/home/lwx/.cache/recsys-459-target-venv/bin/python","-m","torch.distributed.run","--standalone","--nproc_per_node=2","/home/lwx/recsys-examples/corelib/dynamicemb/benchmark/benchmark_resolved_lookup.py","--lookup","default","--pipeline","prefetch","--layout","hbm","--features","128","--capacity","4096","--warmup","20","--iterations","100","--trials","6","--profile-steps","5","--profile-dir","/home/lwx/.cache/recsys-459-attribution-20261114/profiles/final/pool1-a-prefetch-hbm-depth0-cap4096"],"devices": "1,2","exit_code": 0,"log": "/home/lwx/.cache/recsys-459-attribution-20261114/final-perf-pool1-a-prefetch-hbm-depth0-cap4096.log","log_sha256": "c213c55570c2d9ede077f82e4529cac791bed7880aac434bb7861e67b089b135","results": [{"pipeline": "prefetch","layout": "hbm","prefetch_depth": 0,"train": true,"gpu_name": "NVIDIA RTX PRO 6000 Blackwell Server Edition","torch_version": "2.13.0+cu130","torchrec_version": "1.8.0+0ea0ec0","dynamicemb_source": "/home/lwx/.cache/recsys-459-attribution-20261114/runtime/pool1-a/dynamicemb/__init__.py","world_size": 2,"features": 128,"batch_size": 32,"hotness": 4,"dim": 64,"capacity": 4096,"warmup": 20,"iterations": 100,"trials": 6,"samples_ms": {"default": [17.347652435302734,17.859479904174805,17.387441635131836,17.61077117919922,17.27008056640625,17.520374298095703]},"median_ms": {"default": 17.45390796661377},"profiles": {"default": {"steps": 5,"trace": "/home/lwx/.cache/recsys-459-attribution-20261114/profiles/final/pool1-a-prefetch-hbm-depth0-cap4096/hbm-prefetch-128-default-rank0.json","host_syncs": 71,"kernels": 595,"copies": [{"name": "cudaMemcpyAsync","count": 75,"cpu_us": 1917.261999999966,"device_us": 0},{"name": "Memcpy DtoH (Device -> Pageable)","count": 45,"cpu_us": 0,"device_us": 19.166999999972177},{"name": "Memcpy HtoD (Pageable -> Device)","count": 20,"cpu_us": 0,"device_us": 6.463999999997213},{"name": "Memcpy DtoH (Device -> Pinned)","count": 5,"cpu_us": 0,"device_us": 2.1450000000095315},{"name": "Memcpy DtoD (Device -> Device)","count": 5,"cpu_us": 0,"device_us": 4.864999999997963}],"peak_increment_bytes": 17167872,"resident_allocated_bytes": 68377088,"peak_allocated_bytes": 85544960,"selected_operators": [{"name": "aten::record_stream","count": 250,"cpu_us": 1083.1189999999779,"device_us": 0,"memory_bytes": 0},{"name": "aten::as_strided","count": 2145,"cpu_us": 1901.9330000000264,"device_us": 0,"memory_bytes": 0},{"name": "aten::cat","count": 15,"cpu_us": 1652.966000000053,"device_us": 27.774999999995998,"memory_bytes": 41945600},{"name": "aten::index","count": 5,"cpu_us": 265.40499999998065,"device_us": 20.67199999998047,"memory_bytes": 655360}],"trace_sha256": "9f1a66b146cc9d8b91d8b8a20e9d40f6a90c356c706e160ae093c65166dcd390","selected_cuda_api": {"cudaEventRecordWithFlags": {"count": 90,"cpu_us": 296.4630000000002},"cudaStreamWaitEvent": {"count": 130,"cpu_us": 387.0879999999998},"cudaMemcpyAsync": {"count": 75,"cpu_us": 1917.2620000000006},"cudaStreamSynchronize": {"count": 70,"cpu_us": 450.678},"cudaEventRecord": {"count": 225,"cpu_us": 445.39600000000024},"cudaEventQuery": {"count": 217,"cpu_us": 760.208},"cudaDeviceSynchronize": {"count": 1,"cpu_us": 34.924}}}}}],"python_source_sha256": "179c26130953a00567c773a0237a6ce59867456d8b1b2d6080729f3a244b4915"},
+      {"case": "pool1-b-prefetch-hbm-depth0-cap4096","argv": ["taskset","-c","4-11","/home/lwx/.cache/recsys-459-target-venv/bin/python","-m","torch.distributed.run","--standalone","--nproc_per_node=2","/home/lwx/recsys-examples/corelib/dynamicemb/benchmark/benchmark_resolved_lookup.py","--lookup","default","--pipeline","prefetch","--layout","hbm","--features","128","--capacity","4096","--warmup","20","--iterations","100","--trials","6","--profile-steps","5","--profile-dir","/home/lwx/.cache/recsys-459-attribution-20261114/profiles/final/pool1-b-prefetch-hbm-depth0-cap4096"],"devices": "1,2","exit_code": 0,"log": "/home/lwx/.cache/recsys-459-attribution-20261114/final-perf-pool1-b-prefetch-hbm-depth0-cap4096.log","log_sha256": "cbe965e59c2e3a9620579d4fe988209af00e31b0069bd8ab36c9c9bb9df8ba6e","results": [{"pipeline": "prefetch","layout": "hbm","prefetch_depth": 0,"train": true,"gpu_name": "NVIDIA RTX PRO 6000 Blackwell Server Edition","torch_version": "2.13.0+cu130","torchrec_version": "1.8.0+0ea0ec0","dynamicemb_source": "/home/lwx/.cache/recsys-459-attribution-20261114/runtime/pool1-b/dynamicemb/__init__.py","world_size": 2,"features": 128,"batch_size": 32,"hotness": 4,"dim": 64,"capacity": 4096,"warmup": 20,"iterations": 100,"trials": 6,"samples_ms": {"default": [18.85546875,19.398969650268555,18.93852996826172,18.9008731842041,18.77094841003418,18.798643112182617]},"median_ms": {"default": 18.87817096710205},"profiles": {"default": {"steps": 5,"trace": "/home/lwx/.cache/recsys-459-attribution-20261114/profiles/final/pool1-b-prefetch-hbm-depth0-cap4096/hbm-prefetch-128-default-rank0.json","host_syncs": 71,"kernels": 595,"copies": [{"name": "cudaMemcpyAsync","count": 75,"cpu_us": 3972.577999999975,"device_us": 0},{"name": "Memcpy DtoH (Device -> Pageable)","count": 45,"cpu_us": 0,"device_us": 19.10000000000582},{"name": "Memcpy HtoD (Pageable -> Device)","count": 20,"cpu_us": 0,"device_us": 6.494999999997162},{"name": "Memcpy DtoH (Device -> Pinned)","count": 5,"cpu_us": 0,"device_us": 2.11099999997532},{"name": "Memcpy DtoD (Device -> Device)","count": 5,"cpu_us": 0,"device_us": 4.862999999983003}],"peak_increment_bytes": 17167872,"resident_allocated_bytes": 68377088,"peak_allocated_bytes": 85544960,"selected_operators": [{"name": "aten::record_stream","count": 250,"cpu_us": 1143.7529999999351,"device_us": 0,"memory_bytes": 0},{"name": "aten::as_strided","count": 2145,"cpu_us": 2324.2909999998237,"device_us": 0,"memory_bytes": 0},{"name": "aten::cat","count": 15,"cpu_us": 1682.9129999999604,"device_us": 27.71200000002682,"memory_bytes": 41945600},{"name": "aten::index","count": 5,"cpu_us": 287.8559999999743,"device_us": 20.73599999999351,"memory_bytes": 655360}],"trace_sha256": "cb3424fe40d402f62f970826b1713507c645d3618a7aee50b6249f54bb227ff2","selected_cuda_api": {"cudaEventRecordWithFlags": {"count": 90,"cpu_us": 325.539},"cudaStreamWaitEvent": {"count": 130,"cpu_us": 424.63200000000006},"cudaMemcpyAsync": {"count": 75,"cpu_us": 3972.577999999999},"cudaStreamSynchronize": {"count": 70,"cpu_us": 492.87000000000006},"cudaEventRecord": {"count": 225,"cpu_us": 493.41700000000003},"cudaEventQuery": {"count": 175,"cpu_us": 642.5269999999998},"cudaDeviceSynchronize": {"count": 1,"cpu_us": 46.752}}}}}],"python_source_sha256": "179c26130953a00567c773a0237a6ce59867456d8b1b2d6080729f3a244b4915"},
+      {"case": "gate2-pool-b-prefetch-hbm-depth0-cap4096","argv": ["taskset","-c","4-11","/home/lwx/.cache/recsys-459-target-venv/bin/python","-m","torch.distributed.run","--standalone","--nproc_per_node=2","/home/lwx/recsys-examples/corelib/dynamicemb/benchmark/benchmark_resolved_lookup.py","--lookup","default","--pipeline","prefetch","--layout","hbm","--features","128","--capacity","4096","--warmup","20","--iterations","100","--trials","6","--profile-steps","5","--profile-dir","/home/lwx/.cache/recsys-459-attribution-20261114/profiles/final/gate2-pool-b-prefetch-hbm-depth0-cap4096"],"devices": "1,2","exit_code": 0,"log": "/home/lwx/.cache/recsys-459-attribution-20261114/final-perf-gate2-pool-b-prefetch-hbm-depth0-cap4096.log","log_sha256": "d0a3ceb900967c2bca56ff39e4f3458144d64357e4c7113c15dc8036f09a9fb6","results": [{"pipeline": "prefetch","layout": "hbm","prefetch_depth": 0,"train": true,"gpu_name": "NVIDIA RTX PRO 6000 Blackwell Server Edition","torch_version": "2.13.0+cu130","torchrec_version": "1.8.0+0ea0ec0","dynamicemb_source": "/home/lwx/.cache/recsys-459-attribution-20261114/runtime/gate2-pool-b/dynamicemb/__init__.py","world_size": 2,"features": 128,"batch_size": 32,"hotness": 4,"dim": 64,"capacity": 4096,"warmup": 20,"iterations": 100,"trials": 6,"samples_ms": {"default": [19.222671508789062,18.87981605529785,19.02117347717285,19.167404174804688,19.0856876373291,18.964744567871094]},"median_ms": {"default": 19.053430557250977},"profiles": {"default": {"steps": 5,"trace": "/home/lwx/.cache/recsys-459-attribution-20261114/profiles/final/gate2-pool-b-prefetch-hbm-depth0-cap4096/hbm-prefetch-128-default-rank0.json","host_syncs": 71,"kernels": 595,"copies": [{"name": "cudaMemcpyAsync","count": 75,"cpu_us": 2307.534000000027,"device_us": 0},{"name": "Memcpy DtoH (Device -> Pageable)","count": 45,"cpu_us": 0,"device_us": 19.171999999992295},{"name": "Memcpy HtoD (Pageable -> Device)","count": 20,"cpu_us": 0,"device_us": 6.49500000001899},{"name": "Memcpy DtoH (Device -> Pinned)","count": 5,"cpu_us": 0,"device_us": 2.1410000000178115},{"name": "Memcpy DtoD (Device -> Device)","count": 5,"cpu_us": 0,"device_us": 4.798999999999069}],"peak_increment_bytes": 17167872,"resident_allocated_bytes": 68377088,"peak_allocated_bytes": 85544960,"selected_operators": [{"name": "aten::record_stream","count": 250,"cpu_us": 1135.7799999998388,"device_us": 0,"memory_bytes": 0},{"name": "aten::as_strided","count": 2145,"cpu_us": 1892.8759999999493,"device_us": 0,"memory_bytes": 0},{"name": "aten::cat","count": 15,"cpu_us": 1712.3409999999985,"device_us": 27.805000000009386,"memory_bytes": 41945600},{"name": "aten::index","count": 5,"cpu_us": 283.08399999999165,"device_us": 20.76799999998184,"memory_bytes": 655360}],"trace_sha256": "3f4b1f24b1c45e7ab347b97471fe04b4992a5dec804fa042afc66c1ecb5846e8","selected_cuda_api": {"cudaEventRecordWithFlags": {"count": 90,"cpu_us": 332.58899999999994},"cudaStreamWaitEvent": {"count": 130,"cpu_us": 452.761},"cudaMemcpyAsync": {"count": 75,"cpu_us": 2307.533999999999},"cudaStreamSynchronize": {"count": 70,"cpu_us": 496.14900000000017},"cudaEventRecord": {"count": 225,"cpu_us": 486.65000000000026},"cudaEventQuery": {"count": 205,"cpu_us": 773.7099999999996},"cudaDeviceSynchronize": {"count": 1,"cpu_us": 45.403}}}}}],"python_source_sha256": "02d58e7c1643ea3bb1e160afe4e93a36428b566412776287c6f767c41e9fe5d9"},
+      {"case": "main85-pool-b-prefetch-hbm-depth0-cap4096","argv": ["taskset","-c","4-11","/home/lwx/.cache/recsys-459-target-venv/bin/python","-m","torch.distributed.run","--standalone","--nproc_per_node=2","/home/lwx/recsys-examples/corelib/dynamicemb/benchmark/benchmark_resolved_lookup.py","--lookup","default","--pipeline","prefetch","--layout","hbm","--features","128","--capacity","4096","--warmup","20","--iterations","100","--trials","6","--profile-steps","5","--profile-dir","/home/lwx/.cache/recsys-459-attribution-20261114/profiles/final/main85-pool-b-prefetch-hbm-depth0-cap4096"],"devices": "1,2","exit_code": 0,"log": "/home/lwx/.cache/recsys-459-attribution-20261114/final-perf-main85-pool-b-prefetch-hbm-depth0-cap4096.log","log_sha256": "2a6e80ef011309fec2b2ee46927cbf63ac7705078eb885c80445c5c109f883e1","results": [{"pipeline": "prefetch","layout": "hbm","prefetch_depth": 0,"train": true,"gpu_name": "NVIDIA RTX PRO 6000 Blackwell Server Edition","torch_version": "2.13.0+cu130","torchrec_version": "1.8.0+0ea0ec0","dynamicemb_source": "/home/lwx/.cache/recsys-459-attribution-20261114/runtime/main85-pool-b/dynamicemb/__init__.py","world_size": 2,"features": 128,"batch_size": 32,"hotness": 4,"dim": 64,"capacity": 4096,"warmup": 20,"iterations": 100,"trials": 6,"samples_ms": {"default": [18.451374053955078,18.309476852416992,18.603261947631836,18.514667510986328,18.597488403320312,18.370773315429688]},"median_ms": {"default": 18.483020782470703},"profiles": {"default": {"steps": 5,"trace": "/home/lwx/.cache/recsys-459-attribution-20261114/profiles/final/main85-pool-b-prefetch-hbm-depth0-cap4096/hbm-prefetch-128-default-rank0.json","host_syncs": 71,"kernels": 595,"copies": [{"name": "cudaMemcpyAsync","count": 75,"cpu_us": 2462.648000000064,"device_us": 0},{"name": "Memcpy DtoH (Device -> Pageable)","count": 45,"cpu_us": 0,"device_us": 18.90700000000743},{"name": "Memcpy HtoD (Pageable -> Device)","count": 20,"cpu_us": 0,"device_us": 6.430999999996857},{"name": "Memcpy DtoH (Device -> Pinned)","count": 5,"cpu_us": 0,"device_us": 2.209999999988213},{"name": "Memcpy DtoD (Device -> Device)","count": 5,"cpu_us": 0,"device_us": 4.831999999994878}],"peak_increment_bytes": 17036800,"resident_allocated_bytes": 68376576,"peak_allocated_bytes": 85413376,"selected_operators": [{"name": "aten::record_stream","count": 145,"cpu_us": 748.8699999998826,"device_us": 0,"memory_bytes": 0},{"name": "aten::as_strided","count": 2135,"cpu_us": 2022.506999999945,"device_us": 0,"memory_bytes": 0},{"name": "aten::cat","count": 15,"cpu_us": 1686.3959999999752,"device_us": 27.711999999946784,"memory_bytes": 41945600}],"trace_sha256": "9f609bd0e300c2c120a25c38d11741f234adf928198f6225ad0c4fe26895d8cb","selected_cuda_api": {"cudaEventRecordWithFlags": {"count": 80,"cpu_us": 286.048},"cudaStreamWaitEvent": {"count": 125,"cpu_us": 405.5009999999999},"cudaMemcpyAsync": {"count": 75,"cpu_us": 2462.648},"cudaStreamSynchronize": {"count": 70,"cpu_us": 500.39300000000014},"cudaEventRecord": {"count": 165,"cpu_us": 419.771},"cudaEventQuery": {"count": 118,"cpu_us": 561.0040000000001},"cudaDeviceSynchronize": {"count": 1,"cpu_us": 1172.326}}}}}],"python_source_sha256": "1cf6952c1b31555581eb862a68e0d3b39e558c2d96209beaf99889892d8740d7"},
+      {"case": "pool1-reverse-a-sparse-hbm-depth0-cap4096","argv": ["taskset","-c","4-11","/home/lwx/.cache/recsys-459-target-venv/bin/python","-m","torch.distributed.run","--standalone","--nproc_per_node=2","/home/lwx/recsys-examples/corelib/dynamicemb/benchmark/benchmark_resolved_lookup.py","--lookup","default","--pipeline","sparse","--layout","hbm","--features","128","--capacity","4096","--warmup","20","--iterations","100","--trials","6","--profile-steps","5","--profile-dir","/home/lwx/.cache/recsys-459-attribution-20261114/profiles/final/pool1-reverse-a-sparse-hbm-depth0-cap4096"],"devices": "1,2","exit_code": 0,"log": "/home/lwx/.cache/recsys-459-attribution-20261114/final-perf-pool1-reverse-a-sparse-hbm-depth0-cap4096.log","log_sha256": "3b8bbfc7cf40d670c6ba9bc7c66a8eeaed63e828d6be9c1765da574607035d95","results": [{"pipeline": "sparse","layout": "hbm","prefetch_depth": 0,"train": true,"gpu_name": "NVIDIA RTX PRO 6000 Blackwell Server Edition","torch_version": "2.13.0+cu130","torchrec_version": "1.8.0+0ea0ec0","dynamicemb_source": "/home/lwx/.cache/recsys-459-attribution-20261114/runtime/pool1-reverse-a/dynamicemb/__init__.py","world_size": 2,"features": 128,"batch_size": 32,"hotness": 4,"dim": 64,"capacity": 4096,"warmup": 20,"iterations": 100,"trials": 6,"samples_ms": {"default": [16.408910751342773,17.3013916015625,18.2327938079834,18.380741119384766,18.33586883544922,18.283544540405273]},"median_ms": {"default": 18.258169174194336},"profiles": {"default": {"steps": 5,"trace": "/home/lwx/.cache/recsys-459-attribution-20261114/profiles/final/pool1-reverse-a-sparse-hbm-depth0-cap4096/hbm-sparse-128-default-rank0.json","host_syncs": 71,"kernels": 595,"copies": [{"name": "cudaMemcpyAsync","count": 75,"cpu_us": 2191.860999999929,"device_us": 0},{"name": "Memcpy DtoH (Device -> Pageable)","count": 45,"cpu_us": 0,"device_us": 20.25699999999142},{"name": "Memcpy HtoD (Pageable -> Device)","count": 20,"cpu_us": 0,"device_us": 6.496000000021013},{"name": "Memcpy DtoH (Device -> Pinned)","count": 5,"cpu_us": 0,"device_us": 3.326999999995678},{"name": "Memcpy DtoD (Device -> Device)","count": 5,"cpu_us": 0,"device_us": 4.800000000024738}],"peak_increment_bytes": 17498112,"resident_allocated_bytes": 67902976,"peak_allocated_bytes": 85401088,"selected_operators": [{"name": "aten::record_stream","count": 120,"cpu_us": 553.3120000000654,"device_us": 0,"memory_bytes": 0},{"name": "aten::as_strided","count": 2145,"cpu_us": 1890.120000000482,"device_us": 0,"memory_bytes": 0},{"name": "aten::cat","count": 15,"cpu_us": 1656.6129999999866,"device_us": 27.775000000054206,"memory_bytes": 41945600},{"name": "aten::index","count": 5,"cpu_us": 293.7210000000341,"device_us": 20.79799999999159,"memory_bytes": 655360}],"trace_sha256": "c851305eaca13aeb4cc0a8ab39f41e4d0defc7f24b7ed1d93d9e1cede71eebc3","selected_cuda_api": {"cudaEventRecordWithFlags": {"count": 85,"cpu_us": 320.3359999999999},"cudaStreamWaitEvent": {"count": 125,"cpu_us": 407.4869999999999},"cudaMemcpyAsync": {"count": 75,"cpu_us": 2191.8609999999985},"cudaStreamSynchronize": {"count": 70,"cpu_us": 461.78100000000006},"cudaEventRecord": {"count": 125,"cpu_us": 334.13600000000025},"cudaEventQuery": {"count": 82,"cpu_us": 375.95799999999997},"cudaDeviceSynchronize": {"count": 1,"cpu_us": 893.932}}}}}],"python_source_sha256": "179c26130953a00567c773a0237a6ce59867456d8b1b2d6080729f3a244b4915"},
+      {"case": "gate2-reverse-a-sparse-hbm-depth0-cap4096","argv": ["taskset","-c","4-11","/home/lwx/.cache/recsys-459-target-venv/bin/python","-m","torch.distributed.run","--standalone","--nproc_per_node=2","/home/lwx/recsys-examples/corelib/dynamicemb/benchmark/benchmark_resolved_lookup.py","--lookup","default","--pipeline","sparse","--layout","hbm","--features","128","--capacity","4096","--warmup","20","--iterations","100","--trials","6","--profile-steps","5","--profile-dir","/home/lwx/.cache/recsys-459-attribution-20261114/profiles/final/gate2-reverse-a-sparse-hbm-depth0-cap4096"],"devices": "1,2","exit_code": 0,"log": "/home/lwx/.cache/recsys-459-attribution-20261114/final-perf-gate2-reverse-a-sparse-hbm-depth0-cap4096.log","log_sha256": "fc7702d27c538e6988e075d4c3e24e80e8b226fc61bc983a0883e946f8684874","results": [{"pipeline": "sparse","layout": "hbm","prefetch_depth": 0,"train": true,"gpu_name": "NVIDIA RTX PRO 6000 Blackwell Server Edition","torch_version": "2.13.0+cu130","torchrec_version": "1.8.0+0ea0ec0","dynamicemb_source": "/home/lwx/.cache/recsys-459-attribution-20261114/runtime/gate2-reverse-a/dynamicemb/__init__.py","world_size": 2,"features": 128,"batch_size": 32,"hotness": 4,"dim": 64,"capacity": 4096,"warmup": 20,"iterations": 100,"trials": 6,"samples_ms": {"default": [17.615415573120117,17.342241287231445,17.212810516357422,17.532066345214844,17.288280487060547,17.28178596496582]},"median_ms": {"default": 17.315260887145996},"profiles": {"default": {"steps": 5,"trace": "/home/lwx/.cache/recsys-459-attribution-20261114/profiles/final/gate2-reverse-a-sparse-hbm-depth0-cap4096/hbm-sparse-128-default-rank0.json","host_syncs": 71,"kernels": 595,"copies": [{"name": "cudaMemcpyAsync","count": 75,"cpu_us": 1979.5579999999954,"device_us": 0},{"name": "Memcpy DtoH (Device -> Pageable)","count": 45,"cpu_us": 0,"device_us": 19.516999999998916},{"name": "Memcpy HtoD (Pageable -> Device)","count": 20,"cpu_us": 0,"device_us": 6.558000000012726},{"name": "Memcpy DtoH (Device -> Pinned)","count": 5,"cpu_us": 0,"device_us": 2.2079999999969004},{"name": "Memcpy DtoD (Device -> Device)","count": 5,"cpu_us": 0,"device_us": 4.863999999994121}],"peak_increment_bytes": 17498112,"resident_allocated_bytes": 67902976,"peak_allocated_bytes": 85401088,"selected_operators": [{"name": "aten::record_stream","count": 120,"cpu_us": 537.6260000001057,"device_us": 0,"memory_bytes": 0},{"name": "aten::as_strided","count": 2145,"cpu_us": 1880.0999999998385,"device_us": 0,"memory_bytes": 0},{"name": "aten::cat","count": 15,"cpu_us": 1601.791999999985,"device_us": 27.808000000008178,"memory_bytes": 41945600},{"name": "aten::index","count": 5,"cpu_us": 261.2219999999761,"device_us": 20.768000000025495,"memory_bytes": 655360}],"trace_sha256": "16798aadad20fd41dd85cdb8ab335587b896fc37a83df99487f7d079b5ed875e","selected_cuda_api": {"cudaEventRecordWithFlags": {"count": 85,"cpu_us": 275.08400000000006},"cudaStreamWaitEvent": {"count": 125,"cpu_us": 379.708},"cudaMemcpyAsync": {"count": 75,"cpu_us": 1979.5579999999998},"cudaStreamSynchronize": {"count": 70,"cpu_us": 462.102},"cudaEventRecord": {"count": 125,"cpu_us": 319.4969999999998},"cudaEventQuery": {"count": 138,"cpu_us": 512.6160000000001},"cudaDeviceSynchronize": {"count": 1,"cpu_us": 36.589}}}}}],"python_source_sha256": "02d58e7c1643ea3bb1e160afe4e93a36428b566412776287c6f767c41e9fe5d9"},
+      {"case": "gate2-reverse-b-sparse-hbm-depth0-cap4096","argv": ["taskset","-c","4-11","/home/lwx/.cache/recsys-459-target-venv/bin/python","-m","torch.distributed.run","--standalone","--nproc_per_node=2","/home/lwx/recsys-examples/corelib/dynamicemb/benchmark/benchmark_resolved_lookup.py","--lookup","default","--pipeline","sparse","--layout","hbm","--features","128","--capacity","4096","--warmup","20","--iterations","100","--trials","6","--profile-steps","5","--profile-dir","/home/lwx/.cache/recsys-459-attribution-20261114/profiles/final/gate2-reverse-b-sparse-hbm-depth0-cap4096"],"devices": "1,2","exit_code": 0,"log": "/home/lwx/.cache/recsys-459-attribution-20261114/final-perf-gate2-reverse-b-sparse-hbm-depth0-cap4096.log","log_sha256": "d45b62af124ecdc1cad640c1729c7fd526d52eaaa5878103ed5f78b225d6058e","results": [{"pipeline": "sparse","layout": "hbm","prefetch_depth": 0,"train": true,"gpu_name": "NVIDIA RTX PRO 6000 Blackwell Server Edition","torch_version": "2.13.0+cu130","torchrec_version": "1.8.0+0ea0ec0","dynamicemb_source": "/home/lwx/.cache/recsys-459-attribution-20261114/runtime/gate2-reverse-b/dynamicemb/__init__.py","world_size": 2,"features": 128,"batch_size": 32,"hotness": 4,"dim": 64,"capacity": 4096,"warmup": 20,"iterations": 100,"trials": 6,"samples_ms": {"default": [18.15224838256836,18.506723403930664,18.609821319580078,18.5352725982666,18.59564208984375,18.44550895690918]},"median_ms": {"default": 18.520998001098633},"profiles": {"default": {"steps": 5,"trace": "/home/lwx/.cache/recsys-459-attribution-20261114/profiles/final/gate2-reverse-b-sparse-hbm-depth0-cap4096/hbm-sparse-128-default-rank0.json","host_syncs": 71,"kernels": 595,"copies": [{"name": "cudaMemcpyAsync","count": 75,"cpu_us": 3898.90600000002,"device_us": 0},{"name": "Memcpy DtoH (Device -> Pageable)","count": 45,"cpu_us": 0,"device_us": 45.1500000000251},{"name": "Memcpy HtoD (Pageable -> Device)","count": 20,"cpu_us": 0,"device_us": 18.42999999996482},{"name": "Memcpy DtoH (Device -> Pinned)","count": 5,"cpu_us": 0,"device_us": 5.31200000001445},{"name": "Memcpy DtoD (Device -> Device)","count": 5,"cpu_us": 0,"device_us": 4.800000000006548}],"peak_increment_bytes": 17498112,"resident_allocated_bytes": 67902976,"peak_allocated_bytes": 85401088,"selected_operators": [{"name": "aten::record_stream","count": 120,"cpu_us": 559.7860000000019,"device_us": 0,"memory_bytes": 0},{"name": "aten::as_strided","count": 2145,"cpu_us": 1939.8620000000647,"device_us": 0,"memory_bytes": 0},{"name": "aten::cat","count": 15,"cpu_us": 1659.8469999999888,"device_us": 27.90400000002228,"memory_bytes": 41945600},{"name": "aten::index","count": 5,"cpu_us": 348.88399999997273,"device_us": 20.733999999989464,"memory_bytes": 655360}],"trace_sha256": "b1c6228261f2b9d8bb22bf7b32cb952e84b23ff366062b9e791b8541122631a1","selected_cuda_api": {"cudaEventRecordWithFlags": {"count": 85,"cpu_us": 314.22700000000003},"cudaStreamWaitEvent": {"count": 125,"cpu_us": 419.93499999999983},"cudaMemcpyAsync": {"count": 75,"cpu_us": 3898.905999999999},"cudaStreamSynchronize": {"count": 70,"cpu_us": 488.7650000000001},"cudaEventRecord": {"count": 125,"cpu_us": 325.05900000000025},"cudaEventQuery": {"count": 230,"cpu_us": 626.4590000000001},"cudaDeviceSynchronize": {"count": 1,"cpu_us": 8001.638}}}}}],"python_source_sha256": "02d58e7c1643ea3bb1e160afe4e93a36428b566412776287c6f767c41e9fe5d9"},
+      {"case": "pool1-reverse-b-sparse-hbm-depth0-cap4096","argv": ["taskset","-c","4-11","/home/lwx/.cache/recsys-459-target-venv/bin/python","-m","torch.distributed.run","--standalone","--nproc_per_node=2","/home/lwx/recsys-examples/corelib/dynamicemb/benchmark/benchmark_resolved_lookup.py","--lookup","default","--pipeline","sparse","--layout","hbm","--features","128","--capacity","4096","--warmup","20","--iterations","100","--trials","6","--profile-steps","5","--profile-dir","/home/lwx/.cache/recsys-459-attribution-20261114/profiles/final/pool1-reverse-b-sparse-hbm-depth0-cap4096"],"devices": "1,2","exit_code": 0,"log": "/home/lwx/.cache/recsys-459-attribution-20261114/final-perf-pool1-reverse-b-sparse-hbm-depth0-cap4096.log","log_sha256": "1f46edda8ef4aefcffced8737ba6034d11a57087032bf8cf09047ed05b38c5fc","results": [{"pipeline": "sparse","layout": "hbm","prefetch_depth": 0,"train": true,"gpu_name": "NVIDIA RTX PRO 6000 Blackwell Server Edition","torch_version": "2.13.0+cu130","torchrec_version": "1.8.0+0ea0ec0","dynamicemb_source": "/home/lwx/.cache/recsys-459-attribution-20261114/runtime/pool1-reverse-b/dynamicemb/__init__.py","world_size": 2,"features": 128,"batch_size": 32,"hotness": 4,"dim": 64,"capacity": 4096,"warmup": 20,"iterations": 100,"trials": 6,"samples_ms": {"default": [17.71440315246582,17.533388137817383,17.653512954711914,17.473682403564453,17.5706787109375,17.533926010131836]},"median_ms": {"default": 17.552302360534668},"profiles": {"default": {"steps": 5,"trace": "/home/lwx/.cache/recsys-459-attribution-20261114/profiles/final/pool1-reverse-b-sparse-hbm-depth0-cap4096/hbm-sparse-128-default-rank0.json","host_syncs": 71,"kernels": 595,"copies": [{"name": "cudaMemcpyAsync","count": 75,"cpu_us": 2084.1799999999257,"device_us": 0},{"name": "Memcpy DtoH (Device -> Pageable)","count": 45,"cpu_us": 0,"device_us": 21.088999999940825},{"name": "Memcpy HtoD (Pageable -> Device)","count": 20,"cpu_us": 0,"device_us": 6.40100000003622},{"name": "Memcpy DtoH (Device -> Pinned)","count": 5,"cpu_us": 0,"device_us": 3.2639999999864813},{"name": "Memcpy DtoD (Device -> Device)","count": 5,"cpu_us": 0,"device_us": 4.832000000002154}],"peak_increment_bytes": 17498112,"resident_allocated_bytes": 67902976,"peak_allocated_bytes": 85401088,"selected_operators": [{"name": "aten::record_stream","count": 120,"cpu_us": 542.9380000000519,"device_us": 0,"memory_bytes": 0},{"name": "aten::as_strided","count": 2145,"cpu_us": 1978.5189999993418,"device_us": 0,"memory_bytes": 0},{"name": "aten::cat","count": 15,"cpu_us": 1647.4990000000444,"device_us": 27.775999999988926,"memory_bytes": 41945600},{"name": "aten::index","count": 5,"cpu_us": 271.8279999999959,"device_us": 20.80000000000109,"memory_bytes": 655360}],"trace_sha256": "5c36091c28c91a18b5553603a04683d5c33c1ba6c89468003ba143165fff4a34","selected_cuda_api": {"cudaEventRecordWithFlags": {"count": 85,"cpu_us": 293.52900000000017},"cudaStreamWaitEvent": {"count": 125,"cpu_us": 403.3130000000002},"cudaMemcpyAsync": {"count": 75,"cpu_us": 2109.9089999999997},"cudaStreamSynchronize": {"count": 70,"cpu_us": 477.365},"cudaEventRecord": {"count": 125,"cpu_us": 319.88699999999994},"cudaEventQuery": {"count": 144,"cpu_us": 490.481},"cudaDeviceSynchronize": {"count": 1,"cpu_us": 2484.942}}}}}],"python_source_sha256": "179c26130953a00567c773a0237a6ce59867456d8b1b2d6080729f3a244b4915"}
+    ],
+    "performance": [
+      {"case": "main85-pool2-a-sparse-hbm-depth0-cap4096","argv": ["taskset","-c","4-11","/home/lwx/.cache/recsys-459-target-venv/bin/python","-m","torch.distributed.run","--standalone","--nproc_per_node=2","/home/lwx/recsys-examples/corelib/dynamicemb/benchmark/benchmark_resolved_lookup.py","--lookup","default","--pipeline","sparse","--layout","hbm","--features","128","--capacity","4096","--warmup","20","--iterations","100","--trials","6","--profile-steps","5","--profile-dir","/home/lwx/.cache/recsys-459-attribution-20261114/profiles/final/main85-pool2-a-sparse-hbm-depth0-cap4096"],"devices": "1,2","exit_code": 0,"log": "/home/lwx/.cache/recsys-459-attribution-20261114/final-perf-main85-pool2-a-sparse-hbm-depth0-cap4096.log","log_sha256": "d84ca2c39524539db4b438d762fe326ca8b269d74fd3dd992efaced41a2af9ff","results": [{"pipeline": "sparse","layout": "hbm","prefetch_depth": 0,"train": true,"gpu_name": "NVIDIA RTX PRO 6000 Blackwell Server Edition","torch_version": "2.13.0+cu130","torchrec_version": "1.8.0+0ea0ec0","dynamicemb_source": "/home/lwx/.cache/recsys-459-attribution-20261114/runtime/main85-pool2-a/dynamicemb/__init__.py","world_size": 2,"features": 128,"batch_size": 32,"hotness": 4,"dim": 64,"capacity": 4096,"warmup": 20,"iterations": 100,"trials": 6,"samples_ms": {"default": [15.797090530395508,15.784564971923828,15.681628227233887,15.749411582946777,15.761902809143066,15.79305648803711]},"median_ms": {"default": 15.773233890533447},"profiles": {"default": {"steps": 5,"trace": "/home/lwx/.cache/recsys-459-attribution-20261114/profiles/final/main85-pool2-a-sparse-hbm-depth0-cap4096/hbm-sparse-128-default-rank0.json","host_syncs": 71,"kernels": 590,"copies": [{"name": "cudaMemcpyAsync","count": 75,"cpu_us": 2036.6269999999358,"device_us": 0},{"name": "Memcpy DtoH (Device -> Pageable)","count": 45,"cpu_us": 0,"device_us": 19.54900000005091},{"name": "Memcpy HtoD (Pageable -> Device)","count": 20,"cpu_us": 0,"device_us": 6.46400000000358},{"name": "Memcpy DtoH (Device -> Pinned)","count": 5,"cpu_us": 0,"device_us": 2.2070000000003347},{"name": "Memcpy DtoD (Device -> Device)","count": 5,"cpu_us": 0,"device_us": 4.735999999986234}],"peak_increment_bytes": 17367040,"resident_allocated_bytes": 67902464,"peak_allocated_bytes": 85269504,"selected_operators": [{"name": "aten::record_stream","count": 80,"cpu_us": 395.6070000000427,"device_us": 0,"memory_bytes": 0},{"name": "aten::as_strided","count": 2135,"cpu_us": 1814.2950000002857,"device_us": 0,"memory_bytes": 0},{"name": "aten::cat","count": 15,"cpu_us": 1609.479000000044,"device_us": 27.967000000029657,"memory_bytes": 41945600}],"trace_sha256": "8f2a9e5da6e4e26e02b30fc0fdc796c93fd74d187bf6089e61ab70bdf9272f0b","selected_cuda_api": {"cudaEventRecordWithFlags": {"count": 75,"cpu_us": 248.431},"cudaStreamWaitEvent": {"count": 120,"cpu_us": 397.7710000000001},"cudaMemcpyAsync": {"count": 75,"cpu_us": 2036.6270000000004},"cudaStreamSynchronize": {"count": 70,"cpu_us": 448.1689999999998},"cudaEventRecord": {"count": 95,"cpu_us": 274.282},"cudaEventQuery": {"count": 112,"cpu_us": 385.2809999999999},"cudaDeviceSynchronize": {"count": 1,"cpu_us": 37.498}}}}}],"python_source_sha256": "1cf6952c1b31555581eb862a68e0d3b39e558c2d96209beaf99889892d8740d7"},
+      {"case": "gate2-pool2-a-sparse-hbm-depth0-cap4096","argv": ["taskset","-c","4-11","/home/lwx/.cache/recsys-459-target-venv/bin/python","-m","torch.distributed.run","--standalone","--nproc_per_node=2","/home/lwx/recsys-examples/corelib/dynamicemb/benchmark/benchmark_resolved_lookup.py","--lookup","default","--pipeline","sparse","--layout","hbm","--features","128","--capacity","4096","--warmup","20","--iterations","100","--trials","6","--profile-steps","5","--profile-dir","/home/lwx/.cache/recsys-459-attribution-20261114/profiles/final/gate2-pool2-a-sparse-hbm-depth0-cap4096"],"devices": "1,2","exit_code": 0,"log": "/home/lwx/.cache/recsys-459-attribution-20261114/final-perf-gate2-pool2-a-sparse-hbm-depth0-cap4096.log","log_sha256": "12a2d4f7f470e81f7678044246819abcba97d332fe2506e0480e8016b2a6cb0f","results": [{"pipeline": "sparse","layout": "hbm","prefetch_depth": 0,"train": true,"gpu_name": "NVIDIA RTX PRO 6000 Blackwell Server Edition","torch_version": "2.13.0+cu130","torchrec_version": "1.8.0+0ea0ec0","dynamicemb_source": "/home/lwx/.cache/recsys-459-attribution-20261114/runtime/gate2-pool2-a/dynamicemb/__init__.py","world_size": 2,"features": 128,"batch_size": 32,"hotness": 4,"dim": 64,"capacity": 4096,"warmup": 20,"iterations": 100,"trials": 6,"samples_ms": {"default": [17.332115173339844,18.658960342407227,18.437204360961914,18.498132705688477,18.574010848999023,18.48971176147461]},"median_ms": {"default": 18.493922233581543},"profiles": {"default": {"steps": 5,"trace": "/home/lwx/.cache/recsys-459-attribution-20261114/profiles/final/gate2-pool2-a-sparse-hbm-depth0-cap4096/hbm-sparse-128-default-rank0.json","host_syncs": 71,"kernels": 595,"copies": [{"name": "cudaMemcpyAsync","count": 75,"cpu_us": 2288.9909999999873,"device_us": 0},{"name": "Memcpy DtoH (Device -> Pageable)","count": 45,"cpu_us": 0,"device_us": 19.5489999999636},{"name": "Memcpy HtoD (Pageable -> Device)","count": 20,"cpu_us": 0,"device_us": 6.688999999987573},{"name": "Memcpy DtoH (Device -> Pinned)","count": 5,"cpu_us": 0,"device_us": 2.2080000000041764},{"name": "Memcpy DtoD (Device -> Device)","count": 5,"cpu_us": 0,"device_us": 4.864000000008673}],"peak_increment_bytes": 17498112,"resident_allocated_bytes": 67902976,"peak_allocated_bytes": 85401088,"selected_operators": [{"name": "aten::record_stream","count": 120,"cpu_us": 559.3429999999344,"device_us": 0,"memory_bytes": 0},{"name": "aten::as_strided","count": 2145,"cpu_us": 2034.6899999997959,"device_us": 0,"memory_bytes": 0},{"name": "aten::cat","count": 15,"cpu_us": 1666.3290000000452,"device_us": 27.837999999954263,"memory_bytes": 41945600},{"name": "aten::index","count": 5,"cpu_us": 304.00499999999556,"device_us": 20.800000000012005,"memory_bytes": 655360}],"trace_sha256": "04499fe8adb449f565832b0bf4faaadef498157be7b35e6c9245694c3871ab5a","selected_cuda_api": {"cudaEventRecordWithFlags": {"count": 85,"cpu_us": 312.842},"cudaStreamWaitEvent": {"count": 125,"cpu_us": 414.92499999999995},"cudaMemcpyAsync": {"count": 75,"cpu_us": 2288.991000000001},"cudaStreamSynchronize": {"count": 70,"cpu_us": 479.505},"cudaEventRecord": {"count": 125,"cpu_us": 335.84099999999995},"cudaEventQuery": {"count": 78,"cpu_us": 377.46100000000007},"cudaDeviceSynchronize": {"count": 1,"cpu_us": 47.15}}}}}],"python_source_sha256": "02d58e7c1643ea3bb1e160afe4e93a36428b566412776287c6f767c41e9fe5d9"},
+      {"case": "pool2-a-sparse-hbm-depth0-cap4096","argv": ["taskset","-c","4-11","/home/lwx/.cache/recsys-459-target-venv/bin/python","-m","torch.distributed.run","--standalone","--nproc_per_node=2","/home/lwx/recsys-examples/corelib/dynamicemb/benchmark/benchmark_resolved_lookup.py","--lookup","default","--pipeline","sparse","--layout","hbm","--features","128","--capacity","4096","--warmup","20","--iterations","100","--trials","6","--profile-steps","5","--profile-dir","/home/lwx/.cache/recsys-459-attribution-20261114/profiles/final/pool2-a-sparse-hbm-depth0-cap4096"],"devices": "1,2","exit_code": 0,"log": "/home/lwx/.cache/recsys-459-attribution-20261114/final-perf-pool2-a-sparse-hbm-depth0-cap4096.log","log_sha256": "372c76e8cec5f0cd4930ca5cde77db6602d39c0e9e230b4e401bbe5e521c73e7","results": [{"pipeline": "sparse","layout": "hbm","prefetch_depth": 0,"train": true,"gpu_name": "NVIDIA RTX PRO 6000 Blackwell Server Edition","torch_version": "2.13.0+cu130","torchrec_version": "1.8.0+0ea0ec0","dynamicemb_source": "/home/lwx/.cache/recsys-459-attribution-20261114/runtime/pool2-a/dynamicemb/__init__.py","world_size": 2,"features": 128,"batch_size": 32,"hotness": 4,"dim": 64,"capacity": 4096,"warmup": 20,"iterations": 100,"trials": 6,"samples_ms": {"default": [18.306175231933594,18.33226203918457,18.111709594726562,18.261245727539062,18.281850814819336,18.08528709411621]},"median_ms": {"default": 18.2715482711792},"profiles": {"default": {"steps": 5,"trace": "/home/lwx/.cache/recsys-459-attribution-20261114/profiles/final/pool2-a-sparse-hbm-depth0-cap4096/hbm-sparse-128-default-rank0.json","host_syncs": 71,"kernels": 595,"copies": [{"name": "cudaMemcpyAsync","count": 75,"cpu_us": 2303.262000000067,"device_us": 0},{"name": "Memcpy DtoH (Device -> Pageable)","count": 45,"cpu_us": 0,"device_us": 19.23099999997885},{"name": "Memcpy HtoD (Pageable -> Device)","count": 20,"cpu_us": 0,"device_us": 6.466999999991458},{"name": "Memcpy DtoH (Device -> Pinned)","count": 5,"cpu_us": 0,"device_us": 2.210000000004584},{"name": "Memcpy DtoD (Device -> Device)","count": 5,"cpu_us": 0,"device_us": 4.894999999982247}],"peak_increment_bytes": 17498112,"resident_allocated_bytes": 67902976,"peak_allocated_bytes": 85401088,"selected_operators": [{"name": "aten::record_stream","count": 120,"cpu_us": 564.8040000000119,"device_us": 0,"memory_bytes": 0},{"name": "aten::as_strided","count": 2145,"cpu_us": 1985.9090000000933,"device_us": 0,"memory_bytes": 0},{"name": "aten::cat","count": 15,"cpu_us": 1675.5390000000243,"device_us": 27.840999999985797,"memory_bytes": 41945600},{"name": "aten::index","count": 5,"cpu_us": 294.2809999999736,"device_us": 20.73500000000422,"memory_bytes": 655360}],"trace_sha256": "429b5e3c634061cad7fff71e64a4eeeadcde38718285a1667bfe3a11933a6603","selected_cuda_api": {"cudaEventRecordWithFlags": {"count": 85,"cpu_us": 306.785},"cudaStreamWaitEvent": {"count": 125,"cpu_us": 410.2580000000002},"cudaMemcpyAsync": {"count": 75,"cpu_us": 2303.2619999999997},"cudaStreamSynchronize": {"count": 70,"cpu_us": 479.60200000000003},"cudaEventRecord": {"count": 125,"cpu_us": 323.938},"cudaEventQuery": {"count": 120,"cpu_us": 410.792},"cudaDeviceSynchronize": {"count": 1,"cpu_us": 51.247}}}}}],"python_source_sha256": "d6ef7ec8f598fcf5f53bcab948715cc8aa970c6d00367b06763ea1d2a09c9a6c"},
+      {"case": "pool2-b-sparse-hbm-depth0-cap4096","argv": ["taskset","-c","4-11","/home/lwx/.cache/recsys-459-target-venv/bin/python","-m","torch.distributed.run","--standalone","--nproc_per_node=2","/home/lwx/recsys-examples/corelib/dynamicemb/benchmark/benchmark_resolved_lookup.py","--lookup","default","--pipeline","sparse","--layout","hbm","--features","128","--capacity","4096","--warmup","20","--iterations","100","--trials","6","--profile-steps","5","--profile-dir","/home/lwx/.cache/recsys-459-attribution-20261114/profiles/final/pool2-b-sparse-hbm-depth0-cap4096"],"devices": "1,2","exit_code": 0,"log": "/home/lwx/.cache/recsys-459-attribution-20261114/final-perf-pool2-b-sparse-hbm-depth0-cap4096.log","log_sha256": "e202370790b60645325fb347acde45e251f32dbd50a7459d072a972d7197250c","results": [{"pipeline": "sparse","layout": "hbm","prefetch_depth": 0,"train": true,"gpu_name": "NVIDIA RTX PRO 6000 Blackwell Server Edition","torch_version": "2.13.0+cu130","torchrec_version": "1.8.0+0ea0ec0","dynamicemb_source": "/home/lwx/.cache/recsys-459-attribution-20261114/runtime/pool2-b/dynamicemb/__init__.py","world_size": 2,"features": 128,"batch_size": 32,"hotness": 4,"dim": 64,"capacity": 4096,"warmup": 20,"iterations": 100,"trials": 6,"samples_ms": {"default": [18.434480667114258,18.449377059936523,16.77353286743164,16.442293167114258,16.42134666442871,16.37919044494629]},"median_ms": {"default": 16.60791301727295},"profiles": {"default": {"steps": 5,"trace": "/home/lwx/.cache/recsys-459-attribution-20261114/profiles/final/pool2-b-sparse-hbm-depth0-cap4096/hbm-sparse-128-default-rank0.json","host_syncs": 71,"kernels": 595,"copies": [{"name": "cudaMemcpyAsync","count": 75,"cpu_us": 1997.2209999999895,"device_us": 0},{"name": "Memcpy DtoH (Device -> Pageable)","count": 45,"cpu_us": 0,"device_us": 19.322999999959393},{"name": "Memcpy HtoD (Pageable -> Device)","count": 20,"cpu_us": 0,"device_us": 6.5930000000353175},{"name": "Memcpy DtoH (Device -> Pinned)","count": 5,"cpu_us": 0,"device_us": 2.1759999999922},{"name": "Memcpy DtoD (Device -> Device)","count": 5,"cpu_us": 0,"device_us": 4.929000000000087}],"peak_increment_bytes": 17498112,"resident_allocated_bytes": 67902976,"peak_allocated_bytes": 85401088,"selected_operators": [{"name": "aten::record_stream","count": 120,"cpu_us": 549.8319999999057,"device_us": 0,"memory_bytes": 0},{"name": "aten::as_strided","count": 2145,"cpu_us": 2038.9029999995191,"device_us": 0,"memory_bytes": 0},{"name": "aten::cat","count": 15,"cpu_us": 1606.5309999999954,"device_us": 27.808999999997468,"memory_bytes": 41945600},{"name": "aten::index","count": 5,"cpu_us": 261.5189999999984,"device_us": 20.76800000000003,"memory_bytes": 655360}],"trace_sha256": "226f86da29be5db0d56391c416ee424251cdbf7902cedec3eb13fbe2231a56af","selected_cuda_api": {"cudaEventRecordWithFlags": {"count": 85,"cpu_us": 278.53399999999993},"cudaStreamWaitEvent": {"count": 125,"cpu_us": 392.31899999999996},"cudaMemcpyAsync": {"count": 75,"cpu_us": 1997.2210000000005},"cudaStreamSynchronize": {"count": 70,"cpu_us": 464.55199999999996},"cudaEventRecord": {"count": 125,"cpu_us": 314.0440000000002},"cudaEventQuery": {"count": 138,"cpu_us": 527.1969999999999},"cudaDeviceSynchronize": {"count": 1,"cpu_us": 37.987}}}}}],"python_source_sha256": "d6ef7ec8f598fcf5f53bcab948715cc8aa970c6d00367b06763ea1d2a09c9a6c"},
+      {"case": "gate2-pool2-b-sparse-hbm-depth0-cap4096","argv": ["taskset","-c","4-11","/home/lwx/.cache/recsys-459-target-venv/bin/python","-m","torch.distributed.run","--standalone","--nproc_per_node=2","/home/lwx/recsys-examples/corelib/dynamicemb/benchmark/benchmark_resolved_lookup.py","--lookup","default","--pipeline","sparse","--layout","hbm","--features","128","--capacity","4096","--warmup","20","--iterations","100","--trials","6","--profile-steps","5","--profile-dir","/home/lwx/.cache/recsys-459-attribution-20261114/profiles/final/gate2-pool2-b-sparse-hbm-depth0-cap4096"],"devices": "1,2","exit_code": 0,"log": "/home/lwx/.cache/recsys-459-attribution-20261114/final-perf-gate2-pool2-b-sparse-hbm-depth0-cap4096.log","log_sha256": "5662cd6d56347041a342c2178bbfb8a00090c713264e782463e8f2d6eeb6cc11","results": [{"pipeline": "sparse","layout": "hbm","prefetch_depth": 0,"train": true,"gpu_name": "NVIDIA RTX PRO 6000 Blackwell Server Edition","torch_version": "2.13.0+cu130","torchrec_version": "1.8.0+0ea0ec0","dynamicemb_source": "/home/lwx/.cache/recsys-459-attribution-20261114/runtime/gate2-pool2-b/dynamicemb/__init__.py","world_size": 2,"features": 128,"batch_size": 32,"hotness": 4,"dim": 64,"capacity": 4096,"warmup": 20,"iterations": 100,"trials": 6,"samples_ms": {"default": [16.56060218811035,16.677461624145508,16.391788482666016,16.658702850341797,16.663209915161133,16.50754165649414]},"median_ms": {"default": 16.609652519226074},"profiles": {"default": {"steps": 5,"trace": "/home/lwx/.cache/recsys-459-attribution-20261114/profiles/final/gate2-pool2-b-sparse-hbm-depth0-cap4096/hbm-sparse-128-default-rank0.json","host_syncs": 71,"kernels": 595,"copies": [{"name": "cudaMemcpyAsync","count": 75,"cpu_us": 1963.6529999999757,"device_us": 0},{"name": "Memcpy DtoH (Device -> Pageable)","count": 45,"cpu_us": 0,"device_us": 29.91899999995894},{"name": "Memcpy HtoD (Pageable -> Device)","count": 20,"cpu_us": 0,"device_us": 12.062999999982821},{"name": "Memcpy DtoH (Device -> Pinned)","count": 5,"cpu_us": 0,"device_us": 3.455999999994674},{"name": "Memcpy DtoD (Device -> Device)","count": 5,"cpu_us": 0,"device_us": 4.798999999988155}],"peak_increment_bytes": 17498112,"resident_allocated_bytes": 67902976,"peak_allocated_bytes": 85401088,"selected_operators": [{"name": "aten::record_stream","count": 120,"cpu_us": 532.8259999999864,"device_us": 0,"memory_bytes": 0},{"name": "aten::as_strided","count": 2145,"cpu_us": 1907.795000000222,"device_us": 0,"memory_bytes": 0},{"name": "aten::cat","count": 15,"cpu_us": 1573.7700000000314,"device_us": 28.00000000002001,"memory_bytes": 41945088},{"name": "aten::index","count": 5,"cpu_us": 261.55899999999747,"device_us": 20.8000000000211,"memory_bytes": 655360}],"trace_sha256": "06a5772899b5a3b1369aa45f03703a7bb0d0046c72177f2e9d4ef42e66c21a03","selected_cuda_api": {"cudaEventRecordWithFlags": {"count": 85,"cpu_us": 276.33899999999994},"cudaStreamWaitEvent": {"count": 125,"cpu_us": 388.39199999999977},"cudaMemcpyAsync": {"count": 75,"cpu_us": 1963.6530000000005},"cudaStreamSynchronize": {"count": 70,"cpu_us": 445.158},"cudaEventRecord": {"count": 125,"cpu_us": 324.296},"cudaEventQuery": {"count": 212,"cpu_us": 550.3819999999997},"cudaDeviceSynchronize": {"count": 1,"cpu_us": 4679.99}}}}}],"python_source_sha256": "02d58e7c1643ea3bb1e160afe4e93a36428b566412776287c6f767c41e9fe5d9"},
+      {"case": "main85-pool2-b-sparse-hbm-depth0-cap4096","argv": ["taskset","-c","4-11","/home/lwx/.cache/recsys-459-target-venv/bin/python","-m","torch.distributed.run","--standalone","--nproc_per_node=2","/home/lwx/recsys-examples/corelib/dynamicemb/benchmark/benchmark_resolved_lookup.py","--lookup","default","--pipeline","sparse","--layout","hbm","--features","128","--capacity","4096","--warmup","20","--iterations","100","--trials","6","--profile-steps","5","--profile-dir","/home/lwx/.cache/recsys-459-attribution-20261114/profiles/final/main85-pool2-b-sparse-hbm-depth0-cap4096"],"devices": "1,2","exit_code": 0,"log": "/home/lwx/.cache/recsys-459-attribution-20261114/final-perf-main85-pool2-b-sparse-hbm-depth0-cap4096.log","log_sha256": "ff2072b70d93b0c4994210390f0f54923f50a662e6fee29ecb2bc3b7f27f0410","results": [{"pipeline": "sparse","layout": "hbm","prefetch_depth": 0,"train": true,"gpu_name": "NVIDIA RTX PRO 6000 Blackwell Server Edition","torch_version": "2.13.0+cu130","torchrec_version": "1.8.0+0ea0ec0","dynamicemb_source": "/home/lwx/.cache/recsys-459-attribution-20261114/runtime/main85-pool2-b/dynamicemb/__init__.py","world_size": 2,"features": 128,"batch_size": 32,"hotness": 4,"dim": 64,"capacity": 4096,"warmup": 20,"iterations": 100,"trials": 6,"samples_ms": {"default": [15.714370727539062,15.580755233764648,15.496780395507812,15.764424324035645,15.629725456237793,15.470183372497559]},"median_ms": {"default": 15.60524034500122},"profiles": {"default": {"steps": 5,"trace": "/home/lwx/.cache/recsys-459-attribution-20261114/profiles/final/main85-pool2-b-sparse-hbm-depth0-cap4096/hbm-sparse-128-default-rank0.json","host_syncs": 71,"kernels": 590,"copies": [{"name": "cudaMemcpyAsync","count": 75,"cpu_us": 1972.536999999963,"device_us": 0},{"name": "Memcpy DtoH (Device -> Pageable)","count": 45,"cpu_us": 0,"device_us": 19.775999999969827},{"name": "Memcpy HtoD (Pageable -> Device)","count": 20,"cpu_us": 0,"device_us": 6.433000000020002},{"name": "Memcpy DtoH (Device -> Pinned)","count": 5,"cpu_us": 0,"device_us": 2.209000000000742},{"name": "Memcpy DtoD (Device -> Device)","count": 5,"cpu_us": 0,"device_us": 4.768999999978405}],"peak_increment_bytes": 17367040,"resident_allocated_bytes": 67902464,"peak_allocated_bytes": 85269504,"selected_operators": [{"name": "aten::record_stream","count": 80,"cpu_us": 376.27400000004036,"device_us": 0,"memory_bytes": 0},{"name": "aten::as_strided","count": 2135,"cpu_us": 1822.1919999997826,"device_us": 0,"memory_bytes": 0},{"name": "aten::cat","count": 15,"cpu_us": 1586.631999999965,"device_us": 27.80800000000181,"memory_bytes": 41945600}],"trace_sha256": "1b2d00fcbe28a7b5d111bdbc20d6e1fbe27846342a8dae6c4f5207162e9684f6","selected_cuda_api": {"cudaEventRecordWithFlags": {"count": 75,"cpu_us": 246.62700000000007},"cudaStreamWaitEvent": {"count": 120,"cpu_us": 370.80499999999984},"cudaMemcpyAsync": {"count": 75,"cpu_us": 1972.537},"cudaStreamSynchronize": {"count": 70,"cpu_us": 459.972},"cudaEventRecord": {"count": 95,"cpu_us": 272.71600000000007},"cudaEventQuery": {"count": 49,"cpu_us": 254.876},"cudaDeviceSynchronize": {"count": 1,"cpu_us": 39.36}}}}}],"python_source_sha256": "1cf6952c1b31555581eb862a68e0d3b39e558c2d96209beaf99889892d8740d7"},
+      {"case": "main85-pool2-a-prefetch-hbm-depth0-cap4096","argv": ["taskset","-c","4-11","/home/lwx/.cache/recsys-459-target-venv/bin/python","-m","torch.distributed.run","--standalone","--nproc_per_node=2","/home/lwx/recsys-examples/corelib/dynamicemb/benchmark/benchmark_resolved_lookup.py","--lookup","default","--pipeline","prefetch","--layout","hbm","--features","128","--capacity","4096","--warmup","20","--iterations","100","--trials","6","--profile-steps","5","--profile-dir","/home/lwx/.cache/recsys-459-attribution-20261114/profiles/final/main85-pool2-a-prefetch-hbm-depth0-cap4096"],"devices": "1,2","exit_code": 0,"log": "/home/lwx/.cache/recsys-459-attribution-20261114/final-perf-main85-pool2-a-prefetch-hbm-depth0-cap4096.log","log_sha256": "9f2cd4c9776446c2acff267b9ed6e47bbf7e7bfedef4d5b4882dc95e0e87b3da","results": [{"pipeline": "prefetch","layout": "hbm","prefetch_depth": 0,"train": true,"gpu_name": "NVIDIA RTX PRO 6000 Blackwell Server Edition","torch_version": "2.13.0+cu130","torchrec_version": "1.8.0+0ea0ec0","dynamicemb_source": "/home/lwx/.cache/recsys-459-attribution-20261114/runtime/main85-pool2-a/dynamicemb/__init__.py","world_size": 2,"features": 128,"batch_size": 32,"hotness": 4,"dim": 64,"capacity": 4096,"warmup": 20,"iterations": 100,"trials": 6,"samples_ms": {"default": [16.07339096069336,15.914016723632812,15.931300163269043,16.19830322265625,16.09311294555664,15.954466819763184]},"median_ms": {"default": 16.01392889022827},"profiles": {"default": {"steps": 5,"trace": "/home/lwx/.cache/recsys-459-attribution-20261114/profiles/final/main85-pool2-a-prefetch-hbm-depth0-cap4096/hbm-prefetch-128-default-rank0.json","host_syncs": 71,"kernels": 595,"copies": [{"name": "cudaMemcpyAsync","count": 75,"cpu_us": 7223.42199999996,"device_us": 0},{"name": "Memcpy DtoH (Device -> Pageable)","count": 45,"cpu_us": 0,"device_us": 20.963000000054308},{"name": "Memcpy HtoD (Pageable -> Device)","count": 20,"cpu_us": 0,"device_us": 7.968999999959124},{"name": "Memcpy DtoH (Device -> Pinned)","count": 5,"cpu_us": 0,"device_us": 2.2080000000187283},{"name": "Memcpy DtoD (Device -> Device)","count": 5,"cpu_us": 0,"device_us": 4.895999999993364}],"peak_increment_bytes": 17036800,"resident_allocated_bytes": 68376576,"peak_allocated_bytes": 85413376,"selected_operators": [{"name": "aten::record_stream","count": 145,"cpu_us": 676.9619999999259,"device_us": 0,"memory_bytes": 0},{"name": "aten::as_strided","count": 2135,"cpu_us": 1905.6590000000651,"device_us": 0,"memory_bytes": 0},{"name": "aten::cat","count": 15,"cpu_us": 1630.687000000038,"device_us": 27.77599999999984,"memory_bytes": 41945600}],"trace_sha256": "d3a6925ad2aa90a90dbe1feb83afdaef0ff90936ea66dcc69405697f51f51913","selected_cuda_api": {"cudaEventRecordWithFlags": {"count": 80,"cpu_us": 257.90299999999996},"cudaStreamWaitEvent": {"count": 125,"cpu_us": 379.81300000000005},"cudaMemcpyAsync": {"count": 75,"cpu_us": 7223.422000000003},"cudaStreamSynchronize": {"count": 70,"cpu_us": 470.234},"cudaEventRecord": {"count": 165,"cpu_us": 382.53800000000007},"cudaEventQuery": {"count": 125,"cpu_us": 513.908},"cudaDeviceSynchronize": {"count": 1,"cpu_us": 37.027}}}}}],"python_source_sha256": "1cf6952c1b31555581eb862a68e0d3b39e558c2d96209beaf99889892d8740d7"},
+      {"case": "gate2-pool2-a-prefetch-hbm-depth0-cap4096","argv": ["taskset","-c","4-11","/home/lwx/.cache/recsys-459-target-venv/bin/python","-m","torch.distributed.run","--standalone","--nproc_per_node=2","/home/lwx/recsys-examples/corelib/dynamicemb/benchmark/benchmark_resolved_lookup.py","--lookup","default","--pipeline","prefetch","--layout","hbm","--features","128","--capacity","4096","--warmup","20","--iterations","100","--trials","6","--profile-steps","5","--profile-dir","/home/lwx/.cache/recsys-459-attribution-20261114/profiles/final/gate2-pool2-a-prefetch-hbm-depth0-cap4096"],"devices": "1,2","exit_code": 0,"log": "/home/lwx/.cache/recsys-459-attribution-20261114/final-perf-gate2-pool2-a-prefetch-hbm-depth0-cap4096.log","log_sha256": "b159412c0a3367cba4718778ef6e7d594044aa134daacf73e958a129f711df07","results": [{"pipeline": "prefetch","layout": "hbm","prefetch_depth": 0,"train": true,"gpu_name": "NVIDIA RTX PRO 6000 Blackwell Server Edition","torch_version": "2.13.0+cu130","torchrec_version": "1.8.0+0ea0ec0","dynamicemb_source": "/home/lwx/.cache/recsys-459-attribution-20261114/runtime/gate2-pool2-a/dynamicemb/__init__.py","world_size": 2,"features": 128,"batch_size": 32,"hotness": 4,"dim": 64,"capacity": 4096,"warmup": 20,"iterations": 100,"trials": 6,"samples_ms": {"default": [16.97308349609375,16.96967315673828,16.87580680847168,17.02788543701172,17.02134132385254,16.811092376708984]},"median_ms": {"default": 16.971378326416016},"profiles": {"default": {"steps": 5,"trace": "/home/lwx/.cache/recsys-459-attribution-20261114/profiles/final/gate2-pool2-a-prefetch-hbm-depth0-cap4096/hbm-prefetch-128-default-rank0.json","host_syncs": 71,"kernels": 595,"copies": [{"name": "cudaMemcpyAsync","count": 75,"cpu_us": 4000.384000000073,"device_us": 0},{"name": "Memcpy DtoH (Device -> Pageable)","count": 45,"cpu_us": 0,"device_us": 19.297999999928834},{"name": "Memcpy HtoD (Pageable -> Device)","count": 20,"cpu_us": 0,"device_us": 6.495000000007167},{"name": "Memcpy DtoH (Device -> Pinned)","count": 5,"cpu_us": 0,"device_us": 2.1750000000010914},{"name": "Memcpy DtoD (Device -> Device)","count": 5,"cpu_us": 0,"device_us": 4.864000000019587}],"peak_increment_bytes": 17167872,"resident_allocated_bytes": 68377088,"peak_allocated_bytes": 85544960,"selected_operators": [{"name": "aten::record_stream","count": 250,"cpu_us": 1135.24500000002,"device_us": 0,"memory_bytes": 0},{"name": "aten::as_strided","count": 2145,"cpu_us": 1869.670999999983,"device_us": 0,"memory_bytes": 0},{"name": "aten::cat","count": 15,"cpu_us": 1618.79500000004,"device_us": 27.744000000007873,"memory_bytes": 41945600},{"name": "aten::index","count": 5,"cpu_us": 260.23400000001493,"device_us": 20.767999999992753,"memory_bytes": 655360}],"trace_sha256": "7de83265d379c28a4a26fced252f0a568d09dbe93944fe915af6774db136654f","selected_cuda_api": {"cudaEventRecordWithFlags": {"count": 90,"cpu_us": 310.7309999999999},"cudaStreamWaitEvent": {"count": 130,"cpu_us": 410.7830000000001},"cudaMemcpyAsync": {"count": 75,"cpu_us": 4000.384},"cudaStreamSynchronize": {"count": 70,"cpu_us": 481.76400000000007},"cudaEventRecord": {"count": 225,"cpu_us": 500.80000000000007},"cudaEventQuery": {"count": 208,"cpu_us": 732.2759999999997},"cudaDeviceSynchronize": {"count": 1,"cpu_us": 36.954}}}}}],"python_source_sha256": "02d58e7c1643ea3bb1e160afe4e93a36428b566412776287c6f767c41e9fe5d9"},
+      {"case": "pool2-a-prefetch-hbm-depth0-cap4096","argv": ["taskset","-c","4-11","/home/lwx/.cache/recsys-459-target-venv/bin/python","-m","torch.distributed.run","--standalone","--nproc_per_node=2","/home/lwx/recsys-examples/corelib/dynamicemb/benchmark/benchmark_resolved_lookup.py","--lookup","default","--pipeline","prefetch","--layout","hbm","--features","128","--capacity","4096","--warmup","20","--iterations","100","--trials","6","--profile-steps","5","--profile-dir","/home/lwx/.cache/recsys-459-attribution-20261114/profiles/final/pool2-a-prefetch-hbm-depth0-cap4096"],"devices": "1,2","exit_code": 0,"log": "/home/lwx/.cache/recsys-459-attribution-20261114/final-perf-pool2-a-prefetch-hbm-depth0-cap4096.log","log_sha256": "71ae5d0cb3650ec97f21add3eed21ce73b739f07e4b5afe47b1bee0c9f607972","results": [{"pipeline": "prefetch","layout": "hbm","prefetch_depth": 0,"train": true,"gpu_name": "NVIDIA RTX PRO 6000 Blackwell Server Edition","torch_version": "2.13.0+cu130","torchrec_version": "1.8.0+0ea0ec0","dynamicemb_source": "/home/lwx/.cache/recsys-459-attribution-20261114/runtime/pool2-a/dynamicemb/__init__.py","world_size": 2,"features": 128,"batch_size": 32,"hotness": 4,"dim": 64,"capacity": 4096,"warmup": 20,"iterations": 100,"trials": 6,"samples_ms": {"default": [16.670846939086914,16.603172302246094,16.96943473815918,16.794517517089844,16.860506057739258,16.662965774536133]},"median_ms": {"default": 16.73268222808838},"profiles": {"default": {"steps": 5,"trace": "/home/lwx/.cache/recsys-459-attribution-20261114/profiles/final/pool2-a-prefetch-hbm-depth0-cap4096/hbm-prefetch-128-default-rank0.json","host_syncs": 71,"kernels": 595,"copies": [{"name": "cudaMemcpyAsync","count": 75,"cpu_us": 8308.052999999953,"device_us": 0},{"name": "Memcpy DtoH (Device -> Pageable)","count": 45,"cpu_us": 0,"device_us": 21.731000000027052},{"name": "Memcpy HtoD (Pageable -> Device)","count": 20,"cpu_us": 0,"device_us": 7.90400000000318},{"name": "Memcpy DtoH (Device -> Pinned)","count": 5,"cpu_us": 0,"device_us": 2.2079999999914435},{"name": "Memcpy DtoD (Device -> Device)","count": 5,"cpu_us": 0,"device_us": 4.830999999991036}],"peak_increment_bytes": 17167872,"resident_allocated_bytes": 68377088,"peak_allocated_bytes": 85544960,"selected_operators": [{"name": "aten::record_stream","count": 250,"cpu_us": 1060.6610000000182,"device_us": 0,"memory_bytes": 0},{"name": "aten::as_strided","count": 2145,"cpu_us": 1813.2370000002466,"device_us": 0,"memory_bytes": 0},{"name": "aten::cat","count": 15,"cpu_us": 1912.5060000000085,"device_us": 27.742000000002008,"memory_bytes": 41945600},{"name": "aten::index","count": 5,"cpu_us": 235.10199999999895,"device_us": 20.704000000001543,"memory_bytes": 655360}],"trace_sha256": "6c969b6fc8e282be862a8212e45ab3523d9990bb62c9746e9edc6b92fdff1242","selected_cuda_api": {"cudaEventRecordWithFlags": {"count": 90,"cpu_us": 291.033},"cudaStreamWaitEvent": {"count": 130,"cpu_us": 403.96000000000004},"cudaMemcpyAsync": {"count": 75,"cpu_us": 8308.053000000004},"cudaStreamSynchronize": {"count": 70,"cpu_us": 463.256},"cudaEventRecord": {"count": 225,"cpu_us": 467.3470000000002},"cudaEventQuery": {"count": 218,"cpu_us": 753.2109999999999},"cudaDeviceSynchronize": {"count": 1,"cpu_us": 2575.867}}}}}],"python_source_sha256": "d6ef7ec8f598fcf5f53bcab948715cc8aa970c6d00367b06763ea1d2a09c9a6c"},
+      {"case": "pool2-b-prefetch-hbm-depth0-cap4096","argv": ["taskset","-c","4-11","/home/lwx/.cache/recsys-459-target-venv/bin/python","-m","torch.distributed.run","--standalone","--nproc_per_node=2","/home/lwx/recsys-examples/corelib/dynamicemb/benchmark/benchmark_resolved_lookup.py","--lookup","default","--pipeline","prefetch","--layout","hbm","--features","128","--capacity","4096","--warmup","20","--iterations","100","--trials","6","--profile-steps","5","--profile-dir","/home/lwx/.cache/recsys-459-attribution-20261114/profiles/final/pool2-b-prefetch-hbm-depth0-cap4096"],"devices": "1,2","exit_code": 0,"log": "/home/lwx/.cache/recsys-459-attribution-20261114/final-perf-pool2-b-prefetch-hbm-depth0-cap4096.log","log_sha256": "15fa533798f5d339263d015645297da87f2d1e87dd2dd347ba02a47a53cf0813","results": [{"pipeline": "prefetch","layout": "hbm","prefetch_depth": 0,"train": true,"gpu_name": "NVIDIA RTX PRO 6000 Blackwell Server Edition","torch_version": "2.13.0+cu130","torchrec_version": "1.8.0+0ea0ec0","dynamicemb_source": "/home/lwx/.cache/recsys-459-attribution-20261114/runtime/pool2-b/dynamicemb/__init__.py","world_size": 2,"features": 128,"batch_size": 32,"hotness": 4,"dim": 64,"capacity": 4096,"warmup": 20,"iterations": 100,"trials": 6,"samples_ms": {"default": [16.9749698638916,16.853370666503906,16.8197078704834,17.054250717163086,16.94879722595215,16.702402114868164]},"median_ms": {"default": 16.901083946228027},"profiles": {"default": {"steps": 5,"trace": "/home/lwx/.cache/recsys-459-attribution-20261114/profiles/final/pool2-b-prefetch-hbm-depth0-cap4096/hbm-prefetch-128-default-rank0.json","host_syncs": 71,"kernels": 595,"copies": [{"name": "cudaMemcpyAsync","count": 75,"cpu_us": 2012.4600000000728,"device_us": 0},{"name": "Memcpy DtoH (Device -> Pageable)","count": 45,"cpu_us": 0,"device_us": 19.39600000001792},{"name": "Memcpy HtoD (Pageable -> Device)","count": 20,"cpu_us": 0,"device_us": 6.497000000012122},{"name": "Memcpy DtoH (Device -> Pinned)","count": 5,"cpu_us": 0,"device_us": 2.144000000000233},{"name": "Memcpy DtoD (Device -> Device)","count": 5,"cpu_us": 0,"device_us": 4.89799999999741}],"peak_increment_bytes": 17167872,"resident_allocated_bytes": 68377088,"peak_allocated_bytes": 85544960,"selected_operators": [{"name": "aten::record_stream","count": 250,"cpu_us": 1089.8529999999519,"device_us": 0,"memory_bytes": 0},{"name": "aten::as_strided","count": 2145,"cpu_us": 2013.432000000049,"device_us": 0,"memory_bytes": 0},{"name": "aten::cat","count": 15,"cpu_us": 1617.0549999999785,"device_us": 27.774999999981446,"memory_bytes": 41945600},{"name": "aten::index","count": 5,"cpu_us": 260.3809999999721,"device_us": 20.736000000022614,"memory_bytes": 655360}],"trace_sha256": "0717377fc56fcedfb519df96d02128ccf1fda1346028d72d82e372ccba8d84cc","selected_cuda_api": {"cudaEventRecordWithFlags": {"count": 90,"cpu_us": 295.40000000000003},"cudaStreamWaitEvent": {"count": 130,"cpu_us": 392.57},"cudaMemcpyAsync": {"count": 75,"cpu_us": 2012.4599999999998},"cudaStreamSynchronize": {"count": 70,"cpu_us": 452.0880000000001},"cudaEventRecord": {"count": 225,"cpu_us": 496.10300000000007},"cudaEventQuery": {"count": 202,"cpu_us": 653.5370000000001},"cudaDeviceSynchronize": {"count": 1,"cpu_us": 38.704}}}}}],"python_source_sha256": "d6ef7ec8f598fcf5f53bcab948715cc8aa970c6d00367b06763ea1d2a09c9a6c"},
+      {"case": "gate2-pool2-b-prefetch-hbm-depth0-cap4096","argv": ["taskset","-c","4-11","/home/lwx/.cache/recsys-459-target-venv/bin/python","-m","torch.distributed.run","--standalone","--nproc_per_node=2","/home/lwx/recsys-examples/corelib/dynamicemb/benchmark/benchmark_resolved_lookup.py","--lookup","default","--pipeline","prefetch","--layout","hbm","--features","128","--capacity","4096","--warmup","20","--iterations","100","--trials","6","--profile-steps","5","--profile-dir","/home/lwx/.cache/recsys-459-attribution-20261114/profiles/final/gate2-pool2-b-prefetch-hbm-depth0-cap4096"],"devices": "1,2","exit_code": 0,"log": "/home/lwx/.cache/recsys-459-attribution-20261114/final-perf-gate2-pool2-b-prefetch-hbm-depth0-cap4096.log","log_sha256": "ef05b414b5218a5bb7982f737df8c7be3ad44e314e2c50a4f2facf6a17a4b1b7","results": [{"pipeline": "prefetch","layout": "hbm","prefetch_depth": 0,"train": true,"gpu_name": "NVIDIA RTX PRO 6000 Blackwell Server Edition","torch_version": "2.13.0+cu130","torchrec_version": "1.8.0+0ea0ec0","dynamicemb_source": "/home/lwx/.cache/recsys-459-attribution-20261114/runtime/gate2-pool2-b/dynamicemb/__init__.py","world_size": 2,"features": 128,"batch_size": 32,"hotness": 4,"dim": 64,"capacity": 4096,"warmup": 20,"iterations": 100,"trials": 6,"samples_ms": {"default": [17.017276763916016,17.137462615966797,16.812259674072266,17.022953033447266,17.114212036132812,16.971759796142578]},"median_ms": {"default": 17.02011489868164},"profiles": {"default": {"steps": 5,"trace": "/home/lwx/.cache/recsys-459-attribution-20261114/profiles/final/gate2-pool2-b-prefetch-hbm-depth0-cap4096/hbm-prefetch-128-default-rank0.json","host_syncs": 71,"kernels": 595,"copies": [{"name": "cudaMemcpyAsync","count": 75,"cpu_us": 14396.543000000065,"device_us": 0},{"name": "Memcpy DtoH (Device -> Pageable)","count": 45,"cpu_us": 0,"device_us": 21.571999999982836},{"name": "Memcpy HtoD (Pageable -> Device)","count": 20,"cpu_us": 0,"device_us": 8.575000000010732},{"name": "Memcpy DtoH (Device -> Pinned)","count": 5,"cpu_us": 0,"device_us": 2.176000000012209},{"name": "Memcpy DtoD (Device -> Device)","count": 5,"cpu_us": 0,"device_us": 4.864000000012311}],"peak_increment_bytes": 17167872,"resident_allocated_bytes": 68377088,"peak_allocated_bytes": 85544960,"selected_operators": [{"name": "aten::record_stream","count": 250,"cpu_us": 1030.0239999999858,"device_us": 0,"memory_bytes": 0},{"name": "aten::as_strided","count": 2145,"cpu_us": 1830.0459999998347,"device_us": 0,"memory_bytes": 0},{"name": "aten::cat","count": 15,"cpu_us": 1485.5080000000107,"device_us": 27.744000000006054,"memory_bytes": 41945600},{"name": "aten::index","count": 5,"cpu_us": 241.54699999999866,"device_us": 20.79899999999543,"memory_bytes": 655360}],"trace_sha256": "cb10b5597d80ceb62e84d26d5f1fe8948e700614cf40d0f44f9916ca71a56cee","selected_cuda_api": {"cudaEventRecordWithFlags": {"count": 90,"cpu_us": 281.0540000000001},"cudaStreamWaitEvent": {"count": 130,"cpu_us": 373.109},"cudaMemcpyAsync": {"count": 75,"cpu_us": 14396.542999999998},"cudaStreamSynchronize": {"count": 70,"cpu_us": 439.123},"cudaEventRecord": {"count": 225,"cpu_us": 440.96500000000003},"cudaEventQuery": {"count": 167,"cpu_us": 571.023},"cudaDeviceSynchronize": {"count": 1,"cpu_us": 39.675}}}}}],"python_source_sha256": "02d58e7c1643ea3bb1e160afe4e93a36428b566412776287c6f767c41e9fe5d9"},
+      {"case": "main85-pool2-b-prefetch-hbm-depth0-cap4096","argv": ["taskset","-c","4-11","/home/lwx/.cache/recsys-459-target-venv/bin/python","-m","torch.distributed.run","--standalone","--nproc_per_node=2","/home/lwx/recsys-examples/corelib/dynamicemb/benchmark/benchmark_resolved_lookup.py","--lookup","default","--pipeline","prefetch","--layout","hbm","--features","128","--capacity","4096","--warmup","20","--iterations","100","--trials","6","--profile-steps","5","--profile-dir","/home/lwx/.cache/recsys-459-attribution-20261114/profiles/final/main85-pool2-b-prefetch-hbm-depth0-cap4096"],"devices": "1,2","exit_code": 0,"log": "/home/lwx/.cache/recsys-459-attribution-20261114/final-perf-main85-pool2-b-prefetch-hbm-depth0-cap4096.log","log_sha256": "7b9a2935f9d26309809a9ee3d35c274d52cb1f9253de704e994c9184f74ff237","results": [{"pipeline": "prefetch","layout": "hbm","prefetch_depth": 0,"train": true,"gpu_name": "NVIDIA RTX PRO 6000 Blackwell Server Edition","torch_version": "2.13.0+cu130","torchrec_version": "1.8.0+0ea0ec0","dynamicemb_source": "/home/lwx/.cache/recsys-459-attribution-20261114/runtime/main85-pool2-b/dynamicemb/__init__.py","world_size": 2,"features": 128,"batch_size": 32,"hotness": 4,"dim": 64,"capacity": 4096,"warmup": 20,"iterations": 100,"trials": 6,"samples_ms": {"default": [16.393436431884766,16.737728118896484,16.724802017211914,16.85620880126953,16.579265594482422,16.47022247314453]},"median_ms": {"default": 16.652033805847168},"profiles": {"default": {"steps": 5,"trace": "/home/lwx/.cache/recsys-459-attribution-20261114/profiles/final/main85-pool2-b-prefetch-hbm-depth0-cap4096/hbm-prefetch-128-default-rank0.json","host_syncs": 71,"kernels": 595,"copies": [{"name": "cudaMemcpyAsync","count": 75,"cpu_us": 11218.53699999995,"device_us": 0},{"name": "Memcpy DtoH (Device -> Pageable)","count": 45,"cpu_us": 0,"device_us": 23.10499999998956},{"name": "Memcpy HtoD (Pageable -> Device)","count": 20,"cpu_us": 0,"device_us": 8.479000000036649},{"name": "Memcpy DtoH (Device -> Pinned)","count": 5,"cpu_us": 0,"device_us": 2.238000000037573},{"name": "Memcpy DtoD (Device -> Device)","count": 5,"cpu_us": 0,"device_us": 4.865000000012515}],"peak_increment_bytes": 17036800,"resident_allocated_bytes": 68376576,"peak_allocated_bytes": 85413376,"selected_operators": [{"name": "aten::record_stream","count": 145,"cpu_us": 716.0489999999236,"device_us": 0,"memory_bytes": 0},{"name": "aten::as_strided","count": 2135,"cpu_us": 1805.4959999996581,"device_us": 0,"memory_bytes": 0},{"name": "aten::cat","count": 15,"cpu_us": 1682.4430000000175,"device_us": 27.743000000016764,"memory_bytes": 41945600}],"trace_sha256": "cc4508000b8d894de70f0df32cd9d5807e56f754de58693abc4e2066dfb622b4","selected_cuda_api": {"cudaEventRecordWithFlags": {"count": 80,"cpu_us": 281.2},"cudaStreamWaitEvent": {"count": 125,"cpu_us": 388.48699999999997},"cudaMemcpyAsync": {"count": 75,"cpu_us": 11218.536999999998},"cudaStreamSynchronize": {"count": 70,"cpu_us": 494.195},"cudaEventRecord": {"count": 165,"cpu_us": 397.0759999999998},"cudaEventQuery": {"count": 158,"cpu_us": 580.1620000000006},"cudaDeviceSynchronize": {"count": 1,"cpu_us": 1406.146}}}}}],"python_source_sha256": "1cf6952c1b31555581eb862a68e0d3b39e558c2d96209beaf99889892d8740d7"}
+    ],
+    "numa_performance": [
+      {"case": "pool2-numa-a-sparse-hbm-depth0-cap4096","argv": ["taskset","-c","4-11","/home/lwx/.cache/recsys-459-target-venv/bin/python","-m","torch.distributed.run","--standalone","--nproc_per_node=2","/home/lwx/.cache/recsys-459-attribution-20261114/numa_bench.py","--lookup","default","--pipeline","sparse","--layout","hbm","--features","128","--capacity","4096","--warmup","20","--iterations","100","--trials","6","--profile-steps","5","--profile-dir","/home/lwx/.cache/recsys-459-attribution-20261114/profiles/final/pool2-numa-a-sparse-hbm-depth0-cap4096"],"devices": "1,2","exit_code": 0,"log": "/home/lwx/.cache/recsys-459-attribution-20261114/final-perf-pool2-numa-a-sparse-hbm-depth0-cap4096.log","log_sha256": "56e4151cbb119682408ffb599ce8902967f4bcde8d72b22d1305df174893e36d","results": [{"pipeline": "sparse","layout": "hbm","prefetch_depth": 0,"train": true,"gpu_name": "NVIDIA RTX PRO 6000 Blackwell Server Edition","torch_version": "2.13.0+cu130","torchrec_version": "1.8.0+0ea0ec0","dynamicemb_source": "/home/lwx/.cache/recsys-459-attribution-20261114/runtime/pool2-numa-a/dynamicemb/__init__.py","world_size": 2,"features": 128,"batch_size": 32,"hotness": 4,"dim": 64,"capacity": 4096,"warmup": 20,"iterations": 100,"trials": 6,"samples_ms": {"default": [16.60495376586914,16.383495330810547,17.146114349365234,18.6381893157959,18.387081146240234,18.188356399536133]},"median_ms": {"default": 17.667235374450684},"profiles": {"default": {"steps": 5,"trace": "/home/lwx/.cache/recsys-459-attribution-20261114/profiles/final/pool2-numa-a-sparse-hbm-depth0-cap4096/hbm-sparse-128-default-rank0.json","host_syncs": 71,"kernels": 595,"copies": [{"name": "cudaMemcpyAsync","count": 75,"cpu_us": 2144.1610000000037,"device_us": 0},{"name": "Memcpy DtoH (Device -> Pageable)","count": 45,"cpu_us": 0,"device_us": 19.32899999995425},{"name": "Memcpy HtoD (Pageable -> Device)","count": 20,"cpu_us": 0,"device_us": 6.527999999990243},{"name": "Memcpy DtoH (Device -> Pinned)","count": 5,"cpu_us": 0,"device_us": 2.175999999999476},{"name": "Memcpy DtoD (Device -> Device)","count": 5,"cpu_us": 0,"device_us": 4.894999999982247}],"peak_increment_bytes": 17498112,"resident_allocated_bytes": 67902976,"peak_allocated_bytes": 85401088,"selected_operators": [{"name": "aten::record_stream","count": 120,"cpu_us": 545.6830000000082,"device_us": 0,"memory_bytes": 0},{"name": "aten::as_strided","count": 2145,"cpu_us": 1801.2190000003502,"device_us": 0,"memory_bytes": 0},{"name": "aten::cat","count": 15,"cpu_us": 1556.7020000000339,"device_us": 27.777000000012777,"memory_bytes": 41945600},{"name": "aten::index","count": 5,"cpu_us": 283.05599999998594,"device_us": 20.863999999999578,"memory_bytes": 655360}],"trace_sha256": "af1dd25b3e5784cd1714f47b98c43ef2c5e9042d3791e7ab48ca00331054cfb5","selected_cuda_api": {"cudaEventRecordWithFlags": {"count": 85,"cpu_us": 292.875},"cudaStreamWaitEvent": {"count": 125,"cpu_us": 389.8029999999999},"cudaMemcpyAsync": {"count": 75,"cpu_us": 2144.1609999999996},"cudaStreamSynchronize": {"count": 70,"cpu_us": 485.7930000000002},"cudaEventRecord": {"count": 125,"cpu_us": 317.02000000000004},"cudaEventQuery": {"count": 120,"cpu_us": 403.745},"cudaDeviceSynchronize": {"count": 1,"cpu_us": 51.691}}}}}],"python_source_sha256": "d6ef7ec8f598fcf5f53bcab948715cc8aa970c6d00367b06763ea1d2a09c9a6c","worker_affinity": {"1": [36,37,38,39],"0": [4,5,6,7]}},
+      {"case": "gate2-numa-a-sparse-hbm-depth0-cap4096","argv": ["taskset","-c","4-11","/home/lwx/.cache/recsys-459-target-venv/bin/python","-m","torch.distributed.run","--standalone","--nproc_per_node=2","/home/lwx/.cache/recsys-459-attribution-20261114/numa_bench.py","--lookup","default","--pipeline","sparse","--layout","hbm","--features","128","--capacity","4096","--warmup","20","--iterations","100","--trials","6","--profile-steps","5","--profile-dir","/home/lwx/.cache/recsys-459-attribution-20261114/profiles/final/gate2-numa-a-sparse-hbm-depth0-cap4096"],"devices": "1,2","exit_code": 0,"log": "/home/lwx/.cache/recsys-459-attribution-20261114/final-perf-gate2-numa-a-sparse-hbm-depth0-cap4096.log","log_sha256": "f1f33dc6ebf49451e84bb2123ecdf19ad3b8909f3b9b953815d4c063d98455e3","results": [{"pipeline": "sparse","layout": "hbm","prefetch_depth": 0,"train": true,"gpu_name": "NVIDIA RTX PRO 6000 Blackwell Server Edition","torch_version": "2.13.0+cu130","torchrec_version": "1.8.0+0ea0ec0","dynamicemb_source": "/home/lwx/.cache/recsys-459-attribution-20261114/runtime/gate2-numa-a/dynamicemb/__init__.py","world_size": 2,"features": 128,"batch_size": 32,"hotness": 4,"dim": 64,"capacity": 4096,"warmup": 20,"iterations": 100,"trials": 6,"samples_ms": {"default": [18.483692169189453,18.876693725585938,18.77619171142578,18.85432243347168,18.854440689086914,18.580413818359375]},"median_ms": {"default": 18.81525707244873},"profiles": {"default": {"steps": 5,"trace": "/home/lwx/.cache/recsys-459-attribution-20261114/profiles/final/gate2-numa-a-sparse-hbm-depth0-cap4096/hbm-sparse-128-default-rank0.json","host_syncs": 71,"kernels": 595,"copies": [{"name": "cudaMemcpyAsync","count": 75,"cpu_us": 6592.326999999914,"device_us": 0},{"name": "Memcpy DtoH (Device -> Pageable)","count": 45,"cpu_us": 0,"device_us": 43.809000000057495},{"name": "Memcpy HtoD (Pageable -> Device)","count": 20,"cpu_us": 0,"device_us": 17.92199999996683},{"name": "Memcpy DtoH (Device -> Pinned)","count": 5,"cpu_us": 0,"device_us": 5.537999999991371},{"name": "Memcpy DtoD (Device -> Device)","count": 5,"cpu_us": 0,"device_us": 4.832000000002154}],"peak_increment_bytes": 17498112,"resident_allocated_bytes": 67902976,"peak_allocated_bytes": 85401088,"selected_operators": [{"name": "aten::record_stream","count": 120,"cpu_us": 516.914999999989,"device_us": 0,"memory_bytes": 0},{"name": "aten::as_strided","count": 2145,"cpu_us": 1898.0550000003968,"device_us": 0,"memory_bytes": 0},{"name": "aten::cat","count": 15,"cpu_us": 1635.395000000015,"device_us": 27.712000000055014,"memory_bytes": 41945600},{"name": "aten::index","count": 5,"cpu_us": 351.79500000002554,"device_us": 20.6720000000023,"memory_bytes": 655360}],"trace_sha256": "7f3b40426bee74d93408fbaafd8963779073d0c250b909fbeb82406b5c5f2a64","selected_cuda_api": {"cudaEventRecordWithFlags": {"count": 85,"cpu_us": 298.13599999999997},"cudaStreamWaitEvent": {"count": 125,"cpu_us": 394.367},"cudaMemcpyAsync": {"count": 75,"cpu_us": 6595.022000000003},"cudaStreamSynchronize": {"count": 70,"cpu_us": 478.65999999999985},"cudaEventRecord": {"count": 125,"cpu_us": 317.64800000000014},"cudaEventQuery": {"count": 266,"cpu_us": 653.044},"cudaDeviceSynchronize": {"count": 1,"cpu_us": 7061.408}}}}}],"python_source_sha256": "02d58e7c1643ea3bb1e160afe4e93a36428b566412776287c6f767c41e9fe5d9","worker_affinity": {"0": [4,5,6,7],"1": [36,37,38,39]}},
+      {"case": "main85-numa-a-sparse-hbm-depth0-cap4096","argv": ["taskset","-c","4-11","/home/lwx/.cache/recsys-459-target-venv/bin/python","-m","torch.distributed.run","--standalone","--nproc_per_node=2","/home/lwx/.cache/recsys-459-attribution-20261114/numa_bench.py","--lookup","default","--pipeline","sparse","--layout","hbm","--features","128","--capacity","4096","--warmup","20","--iterations","100","--trials","6","--profile-steps","5","--profile-dir","/home/lwx/.cache/recsys-459-attribution-20261114/profiles/final/main85-numa-a-sparse-hbm-depth0-cap4096"],"devices": "1,2","exit_code": 0,"log": "/home/lwx/.cache/recsys-459-attribution-20261114/final-perf-main85-numa-a-sparse-hbm-depth0-cap4096.log","log_sha256": "92a90ca4f713eeb35ea019a7c20b44ddf891a0c2b00a4ba5e2a4b2545679bfea","results": [{"pipeline": "sparse","layout": "hbm","prefetch_depth": 0,"train": true,"gpu_name": "NVIDIA RTX PRO 6000 Blackwell Server Edition","torch_version": "2.13.0+cu130","torchrec_version": "1.8.0+0ea0ec0","dynamicemb_source": "/home/lwx/.cache/recsys-459-attribution-20261114/runtime/main85-numa-a/dynamicemb/__init__.py","world_size": 2,"features": 128,"batch_size": 32,"hotness": 4,"dim": 64,"capacity": 4096,"warmup": 20,"iterations": 100,"trials": 6,"samples_ms": {"default": [15.864336013793945,15.783166885375977,15.585983276367188,15.850029945373535,16.35295295715332,15.963912010192871]},"median_ms": {"default": 15.85718297958374},"profiles": {"default": {"steps": 5,"trace": "/home/lwx/.cache/recsys-459-attribution-20261114/profiles/final/main85-numa-a-sparse-hbm-depth0-cap4096/hbm-sparse-128-default-rank0.json","host_syncs": 71,"kernels": 590,"copies": [{"name": "cudaMemcpyAsync","count": 75,"cpu_us": 1908.6880000000283,"device_us": 0},{"name": "Memcpy DtoH (Device -> Pageable)","count": 45,"cpu_us": 0,"device_us": 20.101999999975305},{"name": "Memcpy HtoD (Pageable -> Device)","count": 20,"cpu_us": 0,"device_us": 6.496000000002823},{"name": "Memcpy DtoH (Device -> Pinned)","count": 5,"cpu_us": 0,"device_us": 2.4319999999916035},{"name": "Memcpy DtoD (Device -> Device)","count": 5,"cpu_us": 0,"device_us": 4.766999999992549}],"peak_increment_bytes": 17367040,"resident_allocated_bytes": 67902464,"peak_allocated_bytes": 85269504,"selected_operators": [{"name": "aten::record_stream","count": 80,"cpu_us": 377.27600000001894,"device_us": 0,"memory_bytes": 0},{"name": "aten::as_strided","count": 2135,"cpu_us": 1816.7030000000868,"device_us": 0,"memory_bytes": 0},{"name": "aten::cat","count": 15,"cpu_us": 1578.7769999999773,"device_us": 27.83899999998539,"memory_bytes": 41945600}],"trace_sha256": "2cd6fe308346349dbfc58ab2af3a28851881019a797a54d4797be6c063e030b3","selected_cuda_api": {"cudaEventRecordWithFlags": {"count": 75,"cpu_us": 244.012},"cudaStreamWaitEvent": {"count": 120,"cpu_us": 356.5910000000001},"cudaMemcpyAsync": {"count": 75,"cpu_us": 1908.6879999999994},"cudaStreamSynchronize": {"count": 70,"cpu_us": 456.08000000000015},"cudaEventRecord": {"count": 95,"cpu_us": 285.28999999999996},"cudaEventQuery": {"count": 70,"cpu_us": 309.5060000000001},"cudaDeviceSynchronize": {"count": 1,"cpu_us": 1227.539}}}}}],"python_source_sha256": "1cf6952c1b31555581eb862a68e0d3b39e558c2d96209beaf99889892d8740d7","worker_affinity": {"0": [4,5,6,7],"1": [36,37,38,39]}},
+      {"case": "main85-numa-b-sparse-hbm-depth0-cap4096","argv": ["taskset","-c","4-11","/home/lwx/.cache/recsys-459-target-venv/bin/python","-m","torch.distributed.run","--standalone","--nproc_per_node=2","/home/lwx/.cache/recsys-459-attribution-20261114/numa_bench.py","--lookup","default","--pipeline","sparse","--layout","hbm","--features","128","--capacity","4096","--warmup","20","--iterations","100","--trials","6","--profile-steps","5","--profile-dir","/home/lwx/.cache/recsys-459-attribution-20261114/profiles/final/main85-numa-b-sparse-hbm-depth0-cap4096"],"devices": "1,2","exit_code": 0,"log": "/home/lwx/.cache/recsys-459-attribution-20261114/final-perf-main85-numa-b-sparse-hbm-depth0-cap4096.log","log_sha256": "de90068faf69d4b172de697e73eec84495f502006b73f00da4356f9bfd6a7e45","results": [{"pipeline": "sparse","layout": "hbm","prefetch_depth": 0,"train": true,"gpu_name": "NVIDIA RTX PRO 6000 Blackwell Server Edition","torch_version": "2.13.0+cu130","torchrec_version": "1.8.0+0ea0ec0","dynamicemb_source": "/home/lwx/.cache/recsys-459-attribution-20261114/runtime/main85-numa-b/dynamicemb/__init__.py","world_size": 2,"features": 128,"batch_size": 32,"hotness": 4,"dim": 64,"capacity": 4096,"warmup": 20,"iterations": 100,"trials": 6,"samples_ms": {"default": [16.08107566833496,16.25994110107422,15.860419273376465,16.34872817993164,16.199596405029297,15.778891563415527]},"median_ms": {"default": 16.14033603668213},"profiles": {"default": {"steps": 5,"trace": "/home/lwx/.cache/recsys-459-attribution-20261114/profiles/final/main85-numa-b-sparse-hbm-depth0-cap4096/hbm-sparse-128-default-rank0.json","host_syncs": 71,"kernels": 590,"copies": [{"name": "cudaMemcpyAsync","count": 75,"cpu_us": 2198.9339999999875,"device_us": 0},{"name": "Memcpy DtoH (Device -> Pageable)","count": 45,"cpu_us": 0,"device_us": 25.117999999973108},{"name": "Memcpy HtoD (Pageable -> Device)","count": 20,"cpu_us": 0,"device_us": 8.768999999962034},{"name": "Memcpy DtoH (Device -> Pinned)","count": 5,"cpu_us": 0,"device_us": 2.7189999999955035},{"name": "Memcpy DtoD (Device -> Device)","count": 5,"cpu_us": 0,"device_us": 4.736000000004424}],"peak_increment_bytes": 17367040,"resident_allocated_bytes": 67902464,"peak_allocated_bytes": 85269504,"selected_operators": [{"name": "aten::record_stream","count": 80,"cpu_us": 419.6220000000212,"device_us": 0,"memory_bytes": 0},{"name": "aten::as_strided","count": 2135,"cpu_us": 1841.3130000000683,"device_us": 0,"memory_bytes": 0},{"name": "aten::cat","count": 15,"cpu_us": 1639.7989999999863,"device_us": 27.840000000001965,"memory_bytes": 41945600}],"trace_sha256": "ca296e19801fa46f0521beed3ba70ca103ffae1f53bc5925c9022561fd644d1b","selected_cuda_api": {"cudaEventRecordWithFlags": {"count": 75,"cpu_us": 266.15799999999996},"cudaStreamWaitEvent": {"count": 120,"cpu_us": 382.966},"cudaMemcpyAsync": {"count": 75,"cpu_us": 2198.934},"cudaStreamSynchronize": {"count": 70,"cpu_us": 500.77299999999985},"cudaEventRecord": {"count": 95,"cpu_us": 288.984},"cudaEventQuery": {"count": 119,"cpu_us": 406.94700000000006},"cudaDeviceSynchronize": {"count": 1,"cpu_us": 40.635}}}}}],"python_source_sha256": "1cf6952c1b31555581eb862a68e0d3b39e558c2d96209beaf99889892d8740d7","worker_affinity": {"0": [4,5,6,7],"1": [36,37,38,39]}},
+      {"case": "gate2-numa-b-sparse-hbm-depth0-cap4096","argv": ["taskset","-c","4-11","/home/lwx/.cache/recsys-459-target-venv/bin/python","-m","torch.distributed.run","--standalone","--nproc_per_node=2","/home/lwx/.cache/recsys-459-attribution-20261114/numa_bench.py","--lookup","default","--pipeline","sparse","--layout","hbm","--features","128","--capacity","4096","--warmup","20","--iterations","100","--trials","6","--profile-steps","5","--profile-dir","/home/lwx/.cache/recsys-459-attribution-20261114/profiles/final/gate2-numa-b-sparse-hbm-depth0-cap4096"],"devices": "1,2","exit_code": 0,"log": "/home/lwx/.cache/recsys-459-attribution-20261114/final-perf-gate2-numa-b-sparse-hbm-depth0-cap4096.log","log_sha256": "6d9ba42734fa7b800c0ef87f30d9e3cc32e7c3aaf1614257d68e53c7ffccfb83","results": [{"pipeline": "sparse","layout": "hbm","prefetch_depth": 0,"train": true,"gpu_name": "NVIDIA RTX PRO 6000 Blackwell Server Edition","torch_version": "2.13.0+cu130","torchrec_version": "1.8.0+0ea0ec0","dynamicemb_source": "/home/lwx/.cache/recsys-459-attribution-20261114/runtime/gate2-numa-b/dynamicemb/__init__.py","world_size": 2,"features": 128,"batch_size": 32,"hotness": 4,"dim": 64,"capacity": 4096,"warmup": 20,"iterations": 100,"trials": 6,"samples_ms": {"default": [17.287883758544922,16.925527572631836,17.119428634643555,17.21227264404297,16.57881736755371,16.586339950561523]},"median_ms": {"default": 17.022478103637695},"profiles": {"default": {"steps": 5,"trace": "/home/lwx/.cache/recsys-459-attribution-20261114/profiles/final/gate2-numa-b-sparse-hbm-depth0-cap4096/hbm-sparse-128-default-rank0.json","host_syncs": 71,"kernels": 595,"copies": [{"name": "cudaMemcpyAsync","count": 75,"cpu_us": 1936.6779999999753,"device_us": 0},{"name": "Memcpy DtoH (Device -> Pageable)","count": 45,"cpu_us": 0,"device_us": 23.165999999963788},{"name": "Memcpy HtoD (Pageable -> Device)","count": 20,"cpu_us": 0,"device_us": 6.880999999962114},{"name": "Memcpy DtoH (Device -> Pinned)","count": 5,"cpu_us": 0,"device_us": 2.8149999999786814},{"name": "Memcpy DtoD (Device -> Device)","count": 5,"cpu_us": 0,"device_us": 4.798999999999069}],"peak_increment_bytes": 17498112,"resident_allocated_bytes": 67902976,"peak_allocated_bytes": 85401088,"selected_operators": [{"name": "aten::record_stream","count": 120,"cpu_us": 513.5709999999772,"device_us": 0,"memory_bytes": 0},{"name": "aten::as_strided","count": 2145,"cpu_us": 1762.2170000002352,"device_us": 0,"memory_bytes": 0},{"name": "aten::cat","count": 15,"cpu_us": 1582.525000000015,"device_us": 27.807999999977255,"memory_bytes": 41945600},{"name": "aten::index","count": 5,"cpu_us": 250.51400000002286,"device_us": 20.67100000001301,"memory_bytes": 655360}],"trace_sha256": "952cc1b637fe2b39f4be321869bae41b4de4d7a09d0b39194ef1eac95ae7cb13","selected_cuda_api": {"cudaEventRecordWithFlags": {"count": 85,"cpu_us": 265.9569999999999},"cudaStreamWaitEvent": {"count": 125,"cpu_us": 380.02599999999995},"cudaMemcpyAsync": {"count": 75,"cpu_us": 1936.6780000000003},"cudaStreamSynchronize": {"count": 70,"cpu_us": 447.8349999999999},"cudaEventRecord": {"count": 125,"cpu_us": 303.264},"cudaEventQuery": {"count": 180,"cpu_us": 596.9260000000002},"cudaDeviceSynchronize": {"count": 1,"cpu_us": 38.055}}}}}],"python_source_sha256": "02d58e7c1643ea3bb1e160afe4e93a36428b566412776287c6f767c41e9fe5d9","worker_affinity": {"0": [4,5,6,7],"1": [36,37,38,39]}},
+      {"case": "pool2-numa-b-sparse-hbm-depth0-cap4096","argv": ["taskset","-c","4-11","/home/lwx/.cache/recsys-459-target-venv/bin/python","-m","torch.distributed.run","--standalone","--nproc_per_node=2","/home/lwx/.cache/recsys-459-attribution-20261114/numa_bench.py","--lookup","default","--pipeline","sparse","--layout","hbm","--features","128","--capacity","4096","--warmup","20","--iterations","100","--trials","6","--profile-steps","5","--profile-dir","/home/lwx/.cache/recsys-459-attribution-20261114/profiles/final/pool2-numa-b-sparse-hbm-depth0-cap4096"],"devices": "1,2","exit_code": 0,"log": "/home/lwx/.cache/recsys-459-attribution-20261114/final-perf-pool2-numa-b-sparse-hbm-depth0-cap4096.log","log_sha256": "4c6c98a5583f965b1060e6c9ee016c0db5f0d1d8ee8726b4956be7e8d0b1ac1f","results": [{"pipeline": "sparse","layout": "hbm","prefetch_depth": 0,"train": true,"gpu_name": "NVIDIA RTX PRO 6000 Blackwell Server Edition","torch_version": "2.13.0+cu130","torchrec_version": "1.8.0+0ea0ec0","dynamicemb_source": "/home/lwx/.cache/recsys-459-attribution-20261114/runtime/pool2-numa-b/dynamicemb/__init__.py","world_size": 2,"features": 128,"batch_size": 32,"hotness": 4,"dim": 64,"capacity": 4096,"warmup": 20,"iterations": 100,"trials": 6,"samples_ms": {"default": [17.615859985351562,18.091806411743164,18.245874404907227,18.164865493774414,18.24089241027832,18.261674880981445]},"median_ms": {"default": 18.202878952026367},"profiles": {"default": {"steps": 5,"trace": "/home/lwx/.cache/recsys-459-attribution-20261114/profiles/final/pool2-numa-b-sparse-hbm-depth0-cap4096/hbm-sparse-128-default-rank0.json","host_syncs": 71,"kernels": 595,"copies": [{"name": "cudaMemcpyAsync","count": 75,"cpu_us": 2252.909999999937,"device_us": 0},{"name": "Memcpy DtoH (Device -> Pageable)","count": 45,"cpu_us": 0,"device_us": 19.394000000010237},{"name": "Memcpy HtoD (Pageable -> Device)","count": 20,"cpu_us": 0,"device_us": 6.562000000036278},{"name": "Memcpy DtoH (Device -> Pinned)","count": 5,"cpu_us": 0,"device_us": 2.2419999999819993},{"name": "Memcpy DtoD (Device -> Device)","count": 5,"cpu_us": 0,"device_us": 4.864000000001397}],"peak_increment_bytes": 17498112,"resident_allocated_bytes": 67902976,"peak_allocated_bytes": 85401088,"selected_operators": [{"name": "aten::record_stream","count": 120,"cpu_us": 561.746000000021,"device_us": 0,"memory_bytes": 0},{"name": "aten::as_strided","count": 2145,"cpu_us": 2133.2130000001207,"device_us": 0,"memory_bytes": 0},{"name": "aten::cat","count": 15,"cpu_us": 1680.5349999999798,"device_us": 27.646999999975378,"memory_bytes": 41945600},{"name": "aten::index","count": 5,"cpu_us": 294.4349999999922,"device_us": 20.863999999999578,"memory_bytes": 655360}],"trace_sha256": "d14adbeda8779c487e1e14c5d0c0c277544a3a37c078070913ea0695f146753b","selected_cuda_api": {"cudaEventRecordWithFlags": {"count": 85,"cpu_us": 313.20900000000006},"cudaStreamWaitEvent": {"count": 125,"cpu_us": 417.18599999999986},"cudaMemcpyAsync": {"count": 75,"cpu_us": 2283.1420000000003},"cudaStreamSynchronize": {"count": 70,"cpu_us": 480.892},"cudaEventRecord": {"count": 125,"cpu_us": 337.19699999999995},"cudaEventQuery": {"count": 126,"cpu_us": 534.463},"cudaDeviceSynchronize": {"count": 1,"cpu_us": 48.687}}}}}],"python_source_sha256": "d6ef7ec8f598fcf5f53bcab948715cc8aa970c6d00367b06763ea1d2a09c9a6c","worker_affinity": {"0": [4,5,6,7],"1": [36,37,38,39]}},
+      {"case": "pool2-numa-a-prefetch-hbm-depth0-cap4096","argv": ["taskset","-c","4-11","/home/lwx/.cache/recsys-459-target-venv/bin/python","-m","torch.distributed.run","--standalone","--nproc_per_node=2","/home/lwx/.cache/recsys-459-attribution-20261114/numa_bench.py","--lookup","default","--pipeline","prefetch","--layout","hbm","--features","128","--capacity","4096","--warmup","20","--iterations","100","--trials","6","--profile-steps","5","--profile-dir","/home/lwx/.cache/recsys-459-attribution-20261114/profiles/final/pool2-numa-a-prefetch-hbm-depth0-cap4096"],"devices": "1,2","exit_code": 0,"log": "/home/lwx/.cache/recsys-459-attribution-20261114/final-perf-pool2-numa-a-prefetch-hbm-depth0-cap4096.log","log_sha256": "6f99780545fed2d9a4af779df86357dab9e5899c21213572f15d3be6fb8dd3d1","results": [{"pipeline": "prefetch","layout": "hbm","prefetch_depth": 0,"train": true,"gpu_name": "NVIDIA RTX PRO 6000 Blackwell Server Edition","torch_version": "2.13.0+cu130","torchrec_version": "1.8.0+0ea0ec0","dynamicemb_source": "/home/lwx/.cache/recsys-459-attribution-20261114/runtime/pool2-numa-a/dynamicemb/__init__.py","world_size": 2,"features": 128,"batch_size": 32,"hotness": 4,"dim": 64,"capacity": 4096,"warmup": 20,"iterations": 100,"trials": 6,"samples_ms": {"default": [18.694692611694336,18.6451358795166,18.743824005126953,19.171342849731445,18.665306091308594,18.705625534057617]},"median_ms": {"default": 18.700159072875977},"profiles": {"default": {"steps": 5,"trace": "/home/lwx/.cache/recsys-459-attribution-20261114/profiles/final/pool2-numa-a-prefetch-hbm-depth0-cap4096/hbm-prefetch-128-default-rank0.json","host_syncs": 71,"kernels": 595,"copies": [{"name": "cudaMemcpyAsync","count": 75,"cpu_us": 4313.696999999921,"device_us": 0},{"name": "Memcpy DtoH (Device -> Pageable)","count": 45,"cpu_us": 0,"device_us": 19.84199999993143},{"name": "Memcpy HtoD (Pageable -> Device)","count": 20,"cpu_us": 0,"device_us": 6.463000000008833},{"name": "Memcpy DtoH (Device -> Pinned)","count": 5,"cpu_us": 0,"device_us": 2.175999999995838},{"name": "Memcpy DtoD (Device -> Device)","count": 5,"cpu_us": 0,"device_us": 4.831999999980326}],"peak_increment_bytes": 17167872,"resident_allocated_bytes": 68377088,"peak_allocated_bytes": 85544960,"selected_operators": [{"name": "aten::record_stream","count": 250,"cpu_us": 1111.9649999999338,"device_us": 0,"memory_bytes": 0},{"name": "aten::as_strided","count": 2145,"cpu_us": 1984.1220000000358,"device_us": 0,"memory_bytes": 0},{"name": "aten::cat","count": 15,"cpu_us": 1641.3300000000272,"device_us": 27.6470000000063,"memory_bytes": 41945600},{"name": "aten::index","count": 5,"cpu_us": 298.50800000002346,"device_us": 20.73499999998603,"memory_bytes": 655360}],"trace_sha256": "3662b44dbab957fa9b877d64367a0b763dc56dd1947b016b7f2ed0f40f864045","selected_cuda_api": {"cudaEventRecordWithFlags": {"count": 90,"cpu_us": 316.13599999999985},"cudaStreamWaitEvent": {"count": 130,"cpu_us": 426.2189999999997},"cudaMemcpyAsync": {"count": 75,"cpu_us": 4313.696999999999},"cudaStreamSynchronize": {"count": 70,"cpu_us": 489.5630000000003},"cudaEventRecord": {"count": 225,"cpu_us": 474.8299999999999},"cudaEventQuery": {"count": 205,"cpu_us": 767.5160000000003},"cudaDeviceSynchronize": {"count": 1,"cpu_us": 1710.936}}}}}],"python_source_sha256": "d6ef7ec8f598fcf5f53bcab948715cc8aa970c6d00367b06763ea1d2a09c9a6c","worker_affinity": {"0": [4,5,6,7],"1": [36,37,38,39]}},
+      {"case": "gate2-numa-a-prefetch-hbm-depth0-cap4096","argv": ["taskset","-c","4-11","/home/lwx/.cache/recsys-459-target-venv/bin/python","-m","torch.distributed.run","--standalone","--nproc_per_node=2","/home/lwx/.cache/recsys-459-attribution-20261114/numa_bench.py","--lookup","default","--pipeline","prefetch","--layout","hbm","--features","128","--capacity","4096","--warmup","20","--iterations","100","--trials","6","--profile-steps","5","--profile-dir","/home/lwx/.cache/recsys-459-attribution-20261114/profiles/final/gate2-numa-a-prefetch-hbm-depth0-cap4096"],"devices": "1,2","exit_code": 0,"log": "/home/lwx/.cache/recsys-459-attribution-20261114/final-perf-gate2-numa-a-prefetch-hbm-depth0-cap4096.log","log_sha256": "c26f62b764ec28e9dfcac5c33b28b72e06c59c23f66889dafd26a9e73d5d6830","results": [{"pipeline": "prefetch","layout": "hbm","prefetch_depth": 0,"train": true,"gpu_name": "NVIDIA RTX PRO 6000 Blackwell Server Edition","torch_version": "2.13.0+cu130","torchrec_version": "1.8.0+0ea0ec0","dynamicemb_source": "/home/lwx/.cache/recsys-459-attribution-20261114/runtime/gate2-numa-a/dynamicemb/__init__.py","world_size": 2,"features": 128,"batch_size": 32,"hotness": 4,"dim": 64,"capacity": 4096,"warmup": 20,"iterations": 100,"trials": 6,"samples_ms": {"default": [18.533349990844727,18.7311954498291,18.664125442504883,18.70387840270996,18.7823429107666,18.65689468383789]},"median_ms": {"default": 18.684001922607422},"profiles": {"default": {"steps": 5,"trace": "/home/lwx/.cache/recsys-459-attribution-20261114/profiles/final/gate2-numa-a-prefetch-hbm-depth0-cap4096/hbm-prefetch-128-default-rank0.json","host_syncs": 71,"kernels": 595,"copies": [{"name": "cudaMemcpyAsync","count": 75,"cpu_us": 2330.5399999998845,"device_us": 0},{"name": "Memcpy DtoH (Device -> Pageable)","count": 45,"cpu_us": 0,"device_us": 19.330000000023574},{"name": "Memcpy HtoD (Pageable -> Device)","count": 20,"cpu_us": 0,"device_us": 6.432000000023436},{"name": "Memcpy DtoH (Device -> Pinned)","count": 5,"cpu_us": 0,"device_us": 2.1449999999749707},{"name": "Memcpy DtoD (Device -> Device)","count": 5,"cpu_us": 0,"device_us": 4.831999999994878}],"peak_increment_bytes": 17167872,"resident_allocated_bytes": 68377088,"peak_allocated_bytes": 85544960,"selected_operators": [{"name": "aten::record_stream","count": 250,"cpu_us": 1126.5549999999466,"device_us": 0,"memory_bytes": 0},{"name": "aten::as_strided","count": 2145,"cpu_us": 1928.9369999996734,"device_us": 0,"memory_bytes": 0},{"name": "aten::cat","count": 15,"cpu_us": 1676.0899999999783,"device_us": 27.64800000001742,"memory_bytes": 41945600},{"name": "aten::index","count": 5,"cpu_us": 287.9729999999836,"device_us": 20.672000000031403,"memory_bytes": 655360}],"trace_sha256": "e6c97ab846ad52c9b068832cc8f06d6d3d890fee41720daa6f9792f9c4db6c9a","selected_cuda_api": {"cudaEventRecordWithFlags": {"count": 90,"cpu_us": 333.03899999999993},"cudaStreamWaitEvent": {"count": 130,"cpu_us": 445.2079999999999},"cudaMemcpyAsync": {"count": 75,"cpu_us": 2330.5400000000004},"cudaStreamSynchronize": {"count": 70,"cpu_us": 505.734},"cudaEventRecord": {"count": 225,"cpu_us": 490.46799999999973},"cudaEventQuery": {"count": 169,"cpu_us": 663.32},"cudaDeviceSynchronize": {"count": 1,"cpu_us": 50.186}}}}}],"python_source_sha256": "02d58e7c1643ea3bb1e160afe4e93a36428b566412776287c6f767c41e9fe5d9","worker_affinity": {"0": [4,5,6,7],"1": [36,37,38,39]}},
+      {"case": "main85-numa-a-prefetch-hbm-depth0-cap4096","argv": ["taskset","-c","4-11","/home/lwx/.cache/recsys-459-target-venv/bin/python","-m","torch.distributed.run","--standalone","--nproc_per_node=2","/home/lwx/.cache/recsys-459-attribution-20261114/numa_bench.py","--lookup","default","--pipeline","prefetch","--layout","hbm","--features","128","--capacity","4096","--warmup","20","--iterations","100","--trials","6","--profile-steps","5","--profile-dir","/home/lwx/.cache/recsys-459-attribution-20261114/profiles/final/main85-numa-a-prefetch-hbm-depth0-cap4096"],"devices": "1,2","exit_code": 0,"log": "/home/lwx/.cache/recsys-459-attribution-20261114/final-perf-main85-numa-a-prefetch-hbm-depth0-cap4096.log","log_sha256": "abe1f3b6ddae50475f383d95428b0f598289b949b085bf9b975ba8d43fa82976","results": [{"pipeline": "prefetch","layout": "hbm","prefetch_depth": 0,"train": true,"gpu_name": "NVIDIA RTX PRO 6000 Blackwell Server Edition","torch_version": "2.13.0+cu130","torchrec_version": "1.8.0+0ea0ec0","dynamicemb_source": "/home/lwx/.cache/recsys-459-attribution-20261114/runtime/main85-numa-a/dynamicemb/__init__.py","world_size": 2,"features": 128,"batch_size": 32,"hotness": 4,"dim": 64,"capacity": 4096,"warmup": 20,"iterations": 100,"trials": 6,"samples_ms": {"default": [17.998550415039062,17.847654342651367,18.16896629333496,18.041946411132812,17.997798919677734,18.14332389831543]},"median_ms": {"default": 18.020248413085938},"profiles": {"default": {"steps": 5,"trace": "/home/lwx/.cache/recsys-459-attribution-20261114/profiles/final/main85-numa-a-prefetch-hbm-depth0-cap4096/hbm-prefetch-128-default-rank0.json","host_syncs": 71,"kernels": 595,"copies": [{"name": "cudaMemcpyAsync","count": 75,"cpu_us": 2367.3249999999734,"device_us": 0},{"name": "Memcpy DtoH (Device -> Pageable)","count": 45,"cpu_us": 0,"device_us": 18.944000000019514},{"name": "Memcpy HtoD (Pageable -> Device)","count": 20,"cpu_us": 0,"device_us": 6.366999999954714},{"name": "Memcpy DtoH (Device -> Pinned)","count": 5,"cpu_us": 0,"device_us": 2.20600000000195},{"name": "Memcpy DtoD (Device -> Device)","count": 5,"cpu_us": 0,"device_us": 4.864000000026863}],"peak_increment_bytes": 17036800,"resident_allocated_bytes": 68376576,"peak_allocated_bytes": 85413376,"selected_operators": [{"name": "aten::record_stream","count": 145,"cpu_us": 738.3989999999276,"device_us": 0,"memory_bytes": 0},{"name": "aten::as_strided","count": 2135,"cpu_us": 2041.7040000001916,"device_us": 0,"memory_bytes": 0},{"name": "aten::cat","count": 15,"cpu_us": 1754.7780000000002,"device_us": 27.681000000031418,"memory_bytes": 41945600}],"trace_sha256": "e0d32c0773ea25df7ed59fbd00cfc1b24ba05fef4cfa4d67b6a91abf5997f54a","selected_cuda_api": {"cudaEventRecordWithFlags": {"count": 80,"cpu_us": 309.6939999999999},"cudaStreamWaitEvent": {"count": 125,"cpu_us": 402.98500000000007},"cudaMemcpyAsync": {"count": 75,"cpu_us": 2367.3250000000003},"cudaStreamSynchronize": {"count": 70,"cpu_us": 509.6679999999997},"cudaEventRecord": {"count": 165,"cpu_us": 411.1680000000001},"cudaEventQuery": {"count": 121,"cpu_us": 579.317},"cudaDeviceSynchronize": {"count": 1,"cpu_us": 48.854}}}}}],"python_source_sha256": "1cf6952c1b31555581eb862a68e0d3b39e558c2d96209beaf99889892d8740d7","worker_affinity": {"0": [4,5,6,7],"1": [36,37,38,39]}},
+      {"case": "main85-numa-b-prefetch-hbm-depth0-cap4096","argv": ["taskset","-c","4-11","/home/lwx/.cache/recsys-459-target-venv/bin/python","-m","torch.distributed.run","--standalone","--nproc_per_node=2","/home/lwx/.cache/recsys-459-attribution-20261114/numa_bench.py","--lookup","default","--pipeline","prefetch","--layout","hbm","--features","128","--capacity","4096","--warmup","20","--iterations","100","--trials","6","--profile-steps","5","--profile-dir","/home/lwx/.cache/recsys-459-attribution-20261114/profiles/final/main85-numa-b-prefetch-hbm-depth0-cap4096"],"devices": "1,2","exit_code": 0,"log": "/home/lwx/.cache/recsys-459-attribution-20261114/final-perf-main85-numa-b-prefetch-hbm-depth0-cap4096.log","log_sha256": "7c14ab1bd27eea380b60ea731d547ba3784acbf74b24f344cd5ba29cc6e6c306","results": [{"pipeline": "prefetch","layout": "hbm","prefetch_depth": 0,"train": true,"gpu_name": "NVIDIA RTX PRO 6000 Blackwell Server Edition","torch_version": "2.13.0+cu130","torchrec_version": "1.8.0+0ea0ec0","dynamicemb_source": "/home/lwx/.cache/recsys-459-attribution-20261114/runtime/main85-numa-b/dynamicemb/__init__.py","world_size": 2,"features": 128,"batch_size": 32,"hotness": 4,"dim": 64,"capacity": 4096,"warmup": 20,"iterations": 100,"trials": 6,"samples_ms": {"default": [17.97093391418457,18.377498626708984,17.81427574157715,17.883296966552734,17.759258270263672,17.796831130981445]},"median_ms": {"default": 17.84878635406494},"profiles": {"default": {"steps": 5,"trace": "/home/lwx/.cache/recsys-459-attribution-20261114/profiles/final/main85-numa-b-prefetch-hbm-depth0-cap4096/hbm-prefetch-128-default-rank0.json","host_syncs": 71,"kernels": 595,"copies": [{"name": "cudaMemcpyAsync","count": 75,"cpu_us": 2315.4149999999618,"device_us": 0},{"name": "Memcpy DtoH (Device -> Pageable)","count": 45,"cpu_us": 0,"device_us": 18.99899999993886},{"name": "Memcpy HtoD (Pageable -> Device)","count": 20,"cpu_us": 0,"device_us": 6.497000000004846},{"name": "Memcpy DtoH (Device -> Pinned)","count": 5,"cpu_us": 0,"device_us": 2.2079999999914435},{"name": "Memcpy DtoD (Device -> Device)","count": 5,"cpu_us": 0,"device_us": 4.864999999983411}],"peak_increment_bytes": 17036800,"resident_allocated_bytes": 68376576,"peak_allocated_bytes": 85413376,"selected_operators": [{"name": "aten::record_stream","count": 145,"cpu_us": 729.9580000001033,"device_us": 0,"memory_bytes": 0},{"name": "aten::as_strided","count": 2135,"cpu_us": 1918.0270000003002,"device_us": 0,"memory_bytes": 0},{"name": "aten::cat","count": 15,"cpu_us": 1687.8629999999557,"device_us": 27.68300000002455,"memory_bytes": 41945600}],"trace_sha256": "f1f3340c494dd43b8b78603cb658dd4ecbca517ad1d9ad621d227cb28e3be798","selected_cuda_api": {"cudaEventRecordWithFlags": {"count": 80,"cpu_us": 295.10700000000014},"cudaStreamWaitEvent": {"count": 125,"cpu_us": 406.2220000000002},"cudaMemcpyAsync": {"count": 75,"cpu_us": 2315.415},"cudaStreamSynchronize": {"count": 70,"cpu_us": 515.5150000000002},"cudaEventRecord": {"count": 165,"cpu_us": 416.16799999999995},"cudaEventQuery": {"count": 157,"cpu_us": 615.6859999999999},"cudaDeviceSynchronize": {"count": 1,"cpu_us": 491.665}}}}}],"python_source_sha256": "1cf6952c1b31555581eb862a68e0d3b39e558c2d96209beaf99889892d8740d7","worker_affinity": {"0": [4,5,6,7],"1": [36,37,38,39]}},
+      {"case": "gate2-numa-b-prefetch-hbm-depth0-cap4096","argv": ["taskset","-c","4-11","/home/lwx/.cache/recsys-459-target-venv/bin/python","-m","torch.distributed.run","--standalone","--nproc_per_node=2","/home/lwx/.cache/recsys-459-attribution-20261114/numa_bench.py","--lookup","default","--pipeline","prefetch","--layout","hbm","--features","128","--capacity","4096","--warmup","20","--iterations","100","--trials","6","--profile-steps","5","--profile-dir","/home/lwx/.cache/recsys-459-attribution-20261114/profiles/final/gate2-numa-b-prefetch-hbm-depth0-cap4096"],"devices": "1,2","exit_code": 0,"log": "/home/lwx/.cache/recsys-459-attribution-20261114/final-perf-gate2-numa-b-prefetch-hbm-depth0-cap4096.log","log_sha256": "e9d7209f6f19153ef6a6687c38128cad15c06b8d30f5a4a962de77ec969dfd0d","results": [{"pipeline": "prefetch","layout": "hbm","prefetch_depth": 0,"train": true,"gpu_name": "NVIDIA RTX PRO 6000 Blackwell Server Edition","torch_version": "2.13.0+cu130","torchrec_version": "1.8.0+0ea0ec0","dynamicemb_source": "/home/lwx/.cache/recsys-459-attribution-20261114/runtime/gate2-numa-b/dynamicemb/__init__.py","world_size": 2,"features": 128,"batch_size": 32,"hotness": 4,"dim": 64,"capacity": 4096,"warmup": 20,"iterations": 100,"trials": 6,"samples_ms": {"default": [19.50421142578125,19.14605712890625,19.186460494995117,19.3198299407959,19.208620071411133,19.101224899291992]},"median_ms": {"default": 19.197540283203125},"profiles": {"default": {"steps": 5,"trace": "/home/lwx/.cache/recsys-459-attribution-20261114/profiles/final/gate2-numa-b-prefetch-hbm-depth0-cap4096/hbm-prefetch-128-default-rank0.json","host_syncs": 71,"kernels": 595,"copies": [{"name": "cudaMemcpyAsync","count": 75,"cpu_us": 5286.438000000054,"device_us": 0},{"name": "Memcpy DtoH (Device -> Pageable)","count": 45,"cpu_us": 0,"device_us": 19.231000000054337},{"name": "Memcpy HtoD (Pageable -> Device)","count": 20,"cpu_us": 0,"device_us": 6.431000000010499},{"name": "Memcpy DtoH (Device -> Pinned)","count": 5,"cpu_us": 0,"device_us": 2.176999999986947},{"name": "Memcpy DtoD (Device -> Device)","count": 5,"cpu_us": 0,"device_us": 4.895999999986088}],"peak_increment_bytes": 17167872,"resident_allocated_bytes": 68377088,"peak_allocated_bytes": 85544960,"selected_operators": [{"name": "aten::record_stream","count": 250,"cpu_us": 1209.1990000002024,"device_us": 0,"memory_bytes": 0},{"name": "aten::as_strided","count": 2145,"cpu_us": 1887.3030000000663,"device_us": 0,"memory_bytes": 0},{"name": "aten::cat","count": 15,"cpu_us": 1671.3220000000383,"device_us": 27.70899999997164,"memory_bytes": 41945600},{"name": "aten::index","count": 5,"cpu_us": 290.36400000000503,"device_us": 20.800999999988562,"memory_bytes": 655360}],"trace_sha256": "a608d97acee8ffb3e3ea7f0acba63dac0e9a465a0682e7f6367a2a19fa8994d5","selected_cuda_api": {"cudaEventRecordWithFlags": {"count": 90,"cpu_us": 317.0560000000001},"cudaStreamWaitEvent": {"count": 130,"cpu_us": 421.2149999999999},"cudaMemcpyAsync": {"count": 75,"cpu_us": 5286.438},"cudaStreamSynchronize": {"count": 70,"cpu_us": 509.7449999999999},"cudaEventRecord": {"count": 225,"cpu_us": 490.8860000000001},"cudaEventQuery": {"count": 169,"cpu_us": 654.0410000000005},"cudaDeviceSynchronize": {"count": 1,"cpu_us": 49.244}}}}}],"python_source_sha256": "02d58e7c1643ea3bb1e160afe4e93a36428b566412776287c6f767c41e9fe5d9","worker_affinity": {"0": [4,5,6,7],"1": [36,37,38,39]}},
+      {"case": "pool2-numa-b-prefetch-hbm-depth0-cap4096","argv": ["taskset","-c","4-11","/home/lwx/.cache/recsys-459-target-venv/bin/python","-m","torch.distributed.run","--standalone","--nproc_per_node=2","/home/lwx/.cache/recsys-459-attribution-20261114/numa_bench.py","--lookup","default","--pipeline","prefetch","--layout","hbm","--features","128","--capacity","4096","--warmup","20","--iterations","100","--trials","6","--profile-steps","5","--profile-dir","/home/lwx/.cache/recsys-459-attribution-20261114/profiles/final/pool2-numa-b-prefetch-hbm-depth0-cap4096"],"devices": "1,2","exit_code": 0,"log": "/home/lwx/.cache/recsys-459-attribution-20261114/final-perf-pool2-numa-b-prefetch-hbm-depth0-cap4096.log","log_sha256": "e148a8882c97f4390b3500e50bb89771b8e2101994be5f424ce71ad625b7eed8","results": [{"pipeline": "prefetch","layout": "hbm","prefetch_depth": 0,"train": true,"gpu_name": "NVIDIA RTX PRO 6000 Blackwell Server Edition","torch_version": "2.13.0+cu130","torchrec_version": "1.8.0+0ea0ec0","dynamicemb_source": "/home/lwx/.cache/recsys-459-attribution-20261114/runtime/pool2-numa-b/dynamicemb/__init__.py","world_size": 2,"features": 128,"batch_size": 32,"hotness": 4,"dim": 64,"capacity": 4096,"warmup": 20,"iterations": 100,"trials": 6,"samples_ms": {"default": [19.25787925720215,18.42719268798828,17.605316162109375,18.042564392089844,17.607357025146484,17.232797622680664]},"median_ms": {"default": 17.824960708618164},"profiles": {"default": {"steps": 5,"trace": "/home/lwx/.cache/recsys-459-attribution-20261114/profiles/final/pool2-numa-b-prefetch-hbm-depth0-cap4096/hbm-prefetch-128-default-rank0.json","host_syncs": 71,"kernels": 595,"copies": [{"name": "cudaMemcpyAsync","count": 75,"cpu_us": 1925.190999999999,"device_us": 0},{"name": "Memcpy DtoH (Device -> Pageable)","count": 45,"cpu_us": 0,"device_us": 19.169000000079905},{"name": "Memcpy HtoD (Pageable -> Device)","count": 20,"cpu_us": 0,"device_us": 6.43199999999797},{"name": "Memcpy DtoH (Device -> Pinned)","count": 5,"cpu_us": 0,"device_us": 2.175999999997657},{"name": "Memcpy DtoD (Device -> Device)","count": 5,"cpu_us": 0,"device_us": 4.863999999986845}],"peak_increment_bytes": 17167872,"resident_allocated_bytes": 68377088,"peak_allocated_bytes": 85544960,"selected_operators": [{"name": "aten::record_stream","count": 250,"cpu_us": 1085.6469999998108,"device_us": 0,"memory_bytes": 0},{"name": "aten::as_strided","count": 2145,"cpu_us": 1946.096000000046,"device_us": 0,"memory_bytes": 0},{"name": "aten::cat","count": 15,"cpu_us": 1683.3369999999977,"device_us": 27.71199999997225,"memory_bytes": 41945600},{"name": "aten::index","count": 5,"cpu_us": 274.87299999997776,"device_us": 20.73599999999351,"memory_bytes": 655360}],"trace_sha256": "fd1e7a7fe359c360bbfc0a7e26967d394d0f662033b46c62b0c5127b50a51dc5","selected_cuda_api": {"cudaEventRecordWithFlags": {"count": 90,"cpu_us": 288.7830000000001},"cudaStreamWaitEvent": {"count": 130,"cpu_us": 385.348},"cudaMemcpyAsync": {"count": 75,"cpu_us": 1925.1910000000005},"cudaStreamSynchronize": {"count": 70,"cpu_us": 457.09000000000003},"cudaEventRecord": {"count": 225,"cpu_us": 446.3640000000002},"cudaEventQuery": {"count": 163,"cpu_us": 591.267},"cudaDeviceSynchronize": {"count": 1,"cpu_us": 36.837}}}}}],"python_source_sha256": "d6ef7ec8f598fcf5f53bcab948715cc8aa970c6d00367b06763ea1d2a09c9a6c","worker_affinity": {"0": [4,5,6,7],"1": [36,37,38,39]}}
+    ],
+    "cache_assertions": {
+      "idle_entry_bound": 8,
+      "live_requests_in_burst_test": 128,
+      "active_entries_distinct_asserted": true,
+      "cached_resolvers_after_drop": 0,
+      "cached_outputs_after_drop": 0,
+      "evidence_test": "test_receiver_type_pool_bounds_idle_types_without_retaining_requests"
+    }
   }
 }

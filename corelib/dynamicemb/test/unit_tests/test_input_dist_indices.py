@@ -572,6 +572,7 @@ def test_receiver_type_pool_bounds_idle_types_without_retaining_requests():
         resolve_at_receive(features, lambda received: received, pool)
         for _ in range(128)
     ]
+    assert len({type(request) for request in requests}) == len(requests)
     types = [weakref.ref(type(request)) for request in requests]
     resolvers = [weakref.ref(request._receiver_resolver) for request in requests]
     results = [

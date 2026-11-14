@@ -31,7 +31,7 @@ All source paths below are relative to `corelib/dynamicemb`. The original-code n
 | Should-fix recovery, fixed; inherited cache logic | [Cache capacity rejection](../dynamicemb/batched_dynamicemb_function.py#L1051) incremented `_prefetch_outstanding_keys` before checking the limit | A real rejected third reservation left 12288 outstanding instead of 8192; releasing the two successful batches could not return the rejected reservation. Check before incrementing; no rollback API is introduced | L `test_rejected_cache_reservation_can_recover`, failed before the fix |
 | Should-fix follow-up compatibility, fixed | New dense adapter initially selected pooled D>2048 in `torchrec_lookup.py` | FBGEMM 1.8 raises; FBGEMM 1.2 aborts the standalone width probe. Check the bound before dispatch and retain existing EBC behavior | `test_dense_lookup_and_fallback_match_reference`, D=2048/2052/4096, both dependency stacks |
 | Should-fix follow-up CPU lifetime, fixed | `resolve_at_receive` creates a KJT subclass per native request; inherited FX metaclass initialization strongly registers every class | Discarding 1000 requests and forcing GC still retained 1000 classes, about 3.25 MB traced Python memory. A local transport metaclass skips constructor registration while preserving inherited ABC creation; no FX global registry mutation | `test_request_local_receiver_types_are_collectible`; standalone 1000-request negative and positive controls on both dependency stacks |
-| Outstanding performance / acceptance issue | Current main85 imported-checkout comparisons below | Final SparseDist process medians are 20.390/20.293 ms versus main 19.030/18.734 ms. The PR does not meet the user's performance-preservation requirement | Publication/fusion, dense lookup and event changes reduce specific costs; stable end-to-end parity remains unproven |
+| Outstanding performance / acceptance issue | Current main85 imported-checkout comparisons below | Latest SparseDist medians are 18.272/16.608 ms versus main 15.773/15.605 ms; affinity-control results are recorded separately. The PR does not meet the user's performance-preservation requirement | Publication/fusion, dense lookup and event changes reduce specific costs; stable end-to-end parity remains unproven |
 
 The lease/gate cancellation and output-copy defects were found while implementing the integration, and repaired before publication. They are not misrepresented as behaviors of original #551, which did not contain #528. The generic Storage snapshot path already had weak ownership and full-key matching; this review did not invent a new backend API or replace it with an unproven concurrency mechanism.
 
@@ -67,7 +67,41 @@ Run commands from `corelib/dynamicemb` in an installed compatible build. `U` bel
 | 24. Complete current-main and implementation regression results are separate | Full table suite and source manifests | `python -m pytest test/test_batched_dynamic_embedding_tables_v2.py -q` | See final run ledger below; do not substitute historical 476 results |
 | 25. No unacceptable regression in complete training or backend overlap cost | `benchmark_resolved_lookup.py` | Commands below and profiler traces | Not satisfied: measured regression and missing production/NVLink workloads; optimization acceptance remains open |
 
-## Receiver lifetime and gate follow-up: latest code and evidence
+## Bounded receiver-type reuse: latest implementation and evidence
+
+Code `8efd951` (production Python SHA-256 `d6ef7ec8f598fcf5f53bcab948715cc8aa970c6d00367b06763ea1d2a09c9a6c`), based on `e778622`. Remote main remains `85e628d`. Only `shard/input_dist.py` changes in production; raw table, dense lookup, CUDA and optimizer code are unchanged. The `receiver_type_pool_followup` evidence retains exact Python manifest deltas, matching extension hashes, all 16 first-candidate processes, 12 final processes and 12 NUMA-control processes. The first classmethod/global-pool experiments are explicitly not the final implementation and are not silently dropped.
+
+The final distributor-local cache retains at most eight idle `(type, weak-reference cell)` entries. Every live request has an exclusive entry; native/fused awaitables keep their source KJT and resolver alive. A weakref callback clears the cell before returning it, so cached entries own no source, resolver, result or backend rows. The static `dist_init` protocol stays unchanged. There is no in-flight limit: a cache miss creates a fresh type. Deepcopy/pickling resets the cache instead of copying mutable bindings. The negative runtime without that reset returns the wrong owner's value on deepcopy and cannot pickle its local class; the final implementation passes both controls. Those are intentional negative experiments, not outstanding production defects.
+
+| Actual validation | Source / environment | Result and scope |
+| --- | --- | --- |
+| Full receiver + lifecycle matrix, two ranks | pool2 / T | 395 passed, 4 skipped per rank, 34.54 s |
+| Same matrix on older stack | pool2-primary / P | 392 passed, 7 skipped per rank, 29.39 s |
+| Same matrix, one rank | pool2 / T | 389 passed, 10 skipped, 24.44 s |
+| Final receiver ownership/copy/cache controls | T / P, two ranks | 7 passed per rank / 6 passed + 1 skipped per rank; includes added weak-result assertions |
+| TW-RW versus RW gradient, node-size 2 | T / P, two ranks | Both passed; -0.05 step |
+| Same gradient test, two emulated nodes | T / P, four ranks | Both passed; -0.025 step; not physical multi-node infrastructure |
+| Cache-copy negative without reduction | Independent pool2-copy-negative runtime | 2 expected failures: wrong value for deepcopy and pickle failure |
+
+The full matrices precede additional assertions for completed-result reclamation and distinct active types. The final seven-case contract run repeats the weak-result checks; a final single-case burst run repeats all strengthened assertions on both stacks (1 passed each). Production Python is identical throughout, and the exact test-source hashes before each addition are retained. It checks 128 simultaneously live requests, no retained resolvers/results after drop, at most eight idle types, independent out-of-order completion, repeated waits and copied-cache ownership. The real native-awaitable test drops the caller's source reference before completion and confirms that the awaitable still owns the binding. It also exercises `clear_inputs()` on TorchRec 1.8; TorchRec 1.2 lacks that API and explicitly skips that case. Earlier table-suite/dense-kernel evidence remains bounded to its source; those implementations did not change and were not rerun solely for this controller cache. Black/isort/autoflake/codespell/AST/whitespace checks pass; full repository CI is not inferred.
+
+Lightweight CPU attribution measures 100 warmed pipeline calls, with inclusive method timers. Receiver preparation falls from about 151/158 us per rank to 23.8/24.3 us. The production counter observes two total type constructions per rank, zero during the 100 warmed calls. This is a component result, not end-to-end throughput. Nested stages must not be summed; the raw attribution only covers forward. Remaining lookup, state registration and lease costs are still visible. In both tested TorchRec implementations, the ordinary SparseDist runtime finishes the current tensors awaitable inside `PipelinedForward`, immediately before compute: the input_dist boundary does not automatically move key resolution off the current forward's critical path.
+
+| Complete workload / two process medians (ms), original affinity | main85 | preceding e778622 | final pool2 |
+| --- | --- | --- | --- |
+| SparseDist + MLP/SGD | 15.773 / 15.605 | 18.494 / 16.610 | 18.272 / 16.608 |
+| Prefetch SparseDist + MLP/SGD | 16.014 / 16.652 | 16.971 / 17.020 | 16.733 / 16.901 |
+
+These six-process series use main/preceding/current/current/preceding/main order, resident inputs and the same 128-feature, B32, hotness4, D64/FP32/SGD parameters; profiling is separate. Both ranks originally shared CPUs4-11 on GPUs1,2. GPU1 is NUMA0 and GPU2 NUMA2, making rank1 remote in that configuration. An additional CPU-affinity control places rank0 on CPUs4-7 and rank1 on CPUs36-39 before importing Torch. It neither isolates those CPUs nor sets memory binding, and uses a different process order (current/preceding/main/main/preceding/current):
+
+| Complete workload / two process medians (ms), NUMA CPU-affinity control | main85 | preceding e778622 | final pool2 |
+| --- | --- | --- | --- |
+| SparseDist + MLP/SGD | 15.857 / 16.140 | 18.815 / 17.022 | 17.667 / 18.203 |
+| Prefetch SparseDist + MLP/SGD | 18.020 / 17.849 | 18.684 / 19.198 | 18.700 / 17.825 |
+
+Every result and placement log is retained, including slower samples and the first candidate's adverse timing series. No other local GPU validation overlaps timing; external jobs still share the host. Affinity and process order differ between series, so their cross-series differences cannot be attributed to code. Kernel/sync counts remain 595/71 in these PR pipeline profiles. The cache removes repeated Python type construction, but these samples do not establish stable end-to-end speedup or parity with main. **Performance preservation remains unmet; #459 is not accepted as complete.** Supported NVLink/physical multi-node GIN and deployment-specific remote PS validation still require a target environment; no Draft transition or comments are performed.
+
+## Receiver lifetime and gate follow-up: preceding implementation and evidence
 
 Code `e778622a0cc5dc1f445cbdf210d98c7c8b2385b3`, based on `2bf1a40`; production Python SHA-256 `02d58e7c1643ea3bb1e160afe4e93a36428b566412776287c6f767c41e9fe5d9`. Main remains `85e628d`, rechecked against the remote. The `critical_path_followup` section of the [machine-readable evidence](../benchmark/input_dist_dense_lookup_results.json) retains source/extension manifests, all 24 pilot and 12 final timing processes, per-rank CPU diagnostics, failed control and test log hashes. No C++ or optimizer-format changes are introduced in this follow-up.
 
