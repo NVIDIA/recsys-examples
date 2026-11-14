@@ -549,5 +549,186 @@
       ],
       "note": "Instrumented raw-call diagnostic, not an uninstrumented end-to-end timing; dense2 precedes release/device reductions"
     }
-  ]
+  ],
+  "pooled_width_followup": {
+    "production_python_sha256": "2c32b97868ca68ba631c5f5cf93d46360f2f75565513355a9b93b55a7feeda80",
+    "change": "Select EC/EBC before dispatch for pooled D > 2048; retain native sequence and pooled boundary support. This narrow guard follows the 40-process performance series; that series was not rerun after the guard.",
+    "runtime_manifests": {
+      "dense4": {
+        "source": "/home/lwx/recsys-examples/corelib/dynamicemb",
+        "code_sha256": "2c32b97868ca68ba631c5f5cf93d46360f2f75565513355a9b93b55a7feeda80",
+        "files": {
+          "dynamicemb/__init__.py": "e05226a10cc4bd357afaf95c2e02ee5524659bfad0a1eeeb9981e363cc52e536",
+          "dynamicemb/async_erase.py": "657800486b8ef5d4e2b323257a7266b325142b33cbded65a2bdc560534ccfbd7",
+          "dynamicemb/batched_dynamicemb_compute_kernel.py": "10f3234f35a96d5ec128837fad6f6a7571177361275b574393f4a013e9d7c65e",
+          "dynamicemb/batched_dynamicemb_function.py": "0391ed49b3b17075ecd4dac9fdb4f1f5d4ce5c1c7d06fa4852c0939b291c1824",
+          "dynamicemb/batched_dynamicemb_tables.py": "402823b6820d3fd27daae48a4c0ece06005dcfea6ef2fa771d16149a2d61cf66",
+          "dynamicemb/checkpoint_io.py": "e7a4ba17b6d79b8024044dad408b327b086d0678a9eab57e7444e213386fa2a1",
+          "dynamicemb/construct_twin_module.py": "a71c29eb21bac6ba3179e085f9024a4a2706842b977eb7dc65814f3b145a71d1",
+          "dynamicemb/dense_lookup.py": "e5ea1b886d6605eb46eb5181780785b88b9cd1d56abeeec6f60e6d7cb18d0047",
+          "dynamicemb/dump_load.py": "bd077049a4832f53e007024d01a9d047cccf1dd5a509f9a9bf16402acefacb34",
+          "dynamicemb/dynamicemb_config.py": "805123e8324625450e682d12a23fafdc90443de8e3b4ff2a90e968785fd860cd",
+          "dynamicemb/embedding_admission.py": "5ecbf4d9d1c9a9583865838baeae3543d15e1ac973c15fd6b83c3620fe30cc71",
+          "dynamicemb/exportable_embedding/__init__.py": "62c35603ee464b3c47fc5bac6e7b527ca7b3d268b3a6fb61237ff86bcf4b15c0",
+          "dynamicemb/exportable_embedding/config.py": "57038a9b2bffad8c222c76907cee4db4404c2539cbbad38cd29195e8faeecd6d",
+          "dynamicemb/exportable_embedding/incremental_update.py": "003eeae0b545667812e38e3382dba676a49f953424bc72726f64ec6eaf2921f7",
+          "dynamicemb/exportable_embedding/indexer.py": "73515b19718c9b09b360d89f79690419e46f8d4295f3c9194d303defcd957ec5",
+          "dynamicemb/exportable_embedding/indexer_directory.py": "74fb8f853e327417e7b0f7984e7e3531fa04d2b63fae4d2ae664b35d2e5a46d9",
+          "dynamicemb/exportable_embedding/indexer_snapshot.py": "6e872dd2f3079d46d3f318a37500ccfd86bdf3bde04b0dfda588232e3f09fd70",
+          "dynamicemb/exportable_embedding/nve_runtime.py": "3f38e4374bc619846ead036f2451d1c62a7a2fd323708c2a6c54c31132fc6262",
+          "dynamicemb/exportable_embedding/nve_tier.py": "1f8fbecd83bf7b143bddfd0134e171fea109c252575a7a558dc5b2801e73a6d5",
+          "dynamicemb/exportable_tables.py": "764c9608b946e1ee923df00902df2c342ad547b677498d09882d9c19ac7bb1ba",
+          "dynamicemb/extendable_tensor.py": "64f9bc99976799e8412528ff7fa6e765cd047f56e1f03a0bb0bb856307e3993e",
+          "dynamicemb/incremental_dump.py": "c634f9f1474c65d64e4d942d82cb68c0914febe3c2cc889a7388d449e2ddb27d",
+          "dynamicemb/index_range_meta.py": "dfef5b385cd56fded18327731c545761b0e9a88518a1ac115474ad526eba790a",
+          "dynamicemb/initializer.py": "d92b9a6ae7c8c7ee5335a3ece33fd24d64b947aab7cb39ebf78a9e1e0acfd307",
+          "dynamicemb/jit/__init__.py": "0e0d6c8bf8a3db90cd580a2565300c86cc41e14bc46ae0ff22752de3df7498b0",
+          "dynamicemb/jit/score_jit.py": "79028af386d7a2ad790b4801b29506a767f66c736a0a25aef1e5a3397dca484d",
+          "dynamicemb/key_ownership.py": "d3247ac28fd0fb23d601c9631ae1bf8834f728f4028f3a2f572cd11c1e76d24d",
+          "dynamicemb/key_value_table.py": "0edcd6dc99cc4530657d630ca1ca24b09703a19410a18f1565448a46dc922a00",
+          "dynamicemb/lookup_layout.py": "a8bacdbb30c6daa16ed1617694d95c3416fc9b2b3a384cc508ab4854ed277c7a",
+          "dynamicemb/lookup_meta.py": "023322af90bfccb8270d38d498610914b44b5a0f7e0ae5a940278527e75e54e9",
+          "dynamicemb/optimizer.py": "45140970f25bcf3f017e7aed3ad5de0b61c0d3a07296896d35d5db30c97d2671",
+          "dynamicemb/planner/__init__.py": "a40e00cd2906b5aae057c4631c5260cb1bb8862991c43033e120764166d5b728",
+          "dynamicemb/planner/get_planner.py": "1dbf4acfa9e373598897ca7774f4c07609a8bacc400ad104a0ccb22fd820cda3",
+          "dynamicemb/planner/placement.py": "8a92c6ef0829a17c2ee2edba84b511cd5ea97ae12ce5c624dd17cdabf16b8fe3",
+          "dynamicemb/planner/plan.py": "5f7a39aa0299debdd5afaa5d005343af49956f81d74b2b3a9be0eaca5d806f05",
+          "dynamicemb/planner/planners.py": "439ae69f58d38d7d9a1a3dfd524158ddbc0d2a16ce425ef909a95056788d92ed",
+          "dynamicemb/resolved_storage.py": "7efecf4b7fdb2fe06b0ceafe4c866b1e72f7d70570dc53a5f173fd0b9a01d462",
+          "dynamicemb/scored_hashtable.py": "a0c4b3b18f11973065ab53fe23110ffda57b298733546b6a527539e720aa4a08",
+          "dynamicemb/scored_kjt.py": "68c04f366d90570b7489d6e18c9c0f8d28bda6ec885b715e1c5d061ba9a569f2",
+          "dynamicemb/shard/__init__.py": "ba152ff578c11f19052c1890212257a8db1bafca7ba830180c903b4912c4488e",
+          "dynamicemb/shard/embedding.py": "adfb6283a6ebdcdc5ec2c889f565d223744f2de856c3616570b49b22509dcdc0",
+          "dynamicemb/shard/embeddingbag.py": "17e6db91d906f9e055346acc5b55e9304a7de16b297fface1cbe8a20783f9817",
+          "dynamicemb/shard/hier_output_dist.py": "f018cf95c65108560d5b7914fe2d35d8e2d78785ba7c1f47961aaa881d7c76fe",
+          "dynamicemb/shard/input_dist.py": "d98cd419efacfa73bb7ff2e7157ce98d10f181ec74b3c07a9ffa59aedcba0eba",
+          "dynamicemb/shard/per_key_score.py": "b36912bfa41a00c256c2c245e4d59e1c52b8f59548d7b0b4aca70e9b4ae0ec32",
+          "dynamicemb/shard/resolved_input.py": "16ef8d214d86cbac0e353b11b45025ce79fc73efa298f8362eec4b6ffc16535c",
+          "dynamicemb/shard/rw_sharding.py": "4c1c7db6de5b63132d7e9b27fb68314223fbbde0a535c319e29af28a5861f84f",
+          "dynamicemb/shard/twrw_sharding.py": "3b93d055bc5483e96a1a68b921c3f5bfcec3026c1736ede6815b418f580bc09b",
+          "dynamicemb/torchrec_lookup.py": "647fe529e5ba7ed8feea9baf237ad05b484553a5ab34a0364c7cd829a5eecd03",
+          "dynamicemb/types.py": "1c3d4c7bfe59c6f956ea609c1cf079250725ae97f1c6609534b123d274f8bbd5",
+          "dynamicemb/utils.py": "202a3d22a1fee3924a679f3d05a4516c9f2541109a0808ce3e6c2c13a31af5c4"
+        },
+        "fatbins_build_path": "/home/lwx/.cache/recsys-459-opt-20261114/target-build/lib",
+        "extension_path": "/home/lwx/.cache/recsys-459-opt-20261114/feature2-build/lib/dynamicemb_extensions.cpython-312-x86_64-linux-gnu.so",
+        "extension_sha256": "89227a502e9c59aa345e744ead8f5fc6ef163a7e946c1469ece26259ba153f68"
+      },
+      "dense4-primary": {
+        "source": "/home/lwx/recsys-examples/corelib/dynamicemb",
+        "code_sha256": "2c32b97868ca68ba631c5f5cf93d46360f2f75565513355a9b93b55a7feeda80",
+        "files": {
+          "dynamicemb/__init__.py": "e05226a10cc4bd357afaf95c2e02ee5524659bfad0a1eeeb9981e363cc52e536",
+          "dynamicemb/async_erase.py": "657800486b8ef5d4e2b323257a7266b325142b33cbded65a2bdc560534ccfbd7",
+          "dynamicemb/batched_dynamicemb_compute_kernel.py": "10f3234f35a96d5ec128837fad6f6a7571177361275b574393f4a013e9d7c65e",
+          "dynamicemb/batched_dynamicemb_function.py": "0391ed49b3b17075ecd4dac9fdb4f1f5d4ce5c1c7d06fa4852c0939b291c1824",
+          "dynamicemb/batched_dynamicemb_tables.py": "402823b6820d3fd27daae48a4c0ece06005dcfea6ef2fa771d16149a2d61cf66",
+          "dynamicemb/checkpoint_io.py": "e7a4ba17b6d79b8024044dad408b327b086d0678a9eab57e7444e213386fa2a1",
+          "dynamicemb/construct_twin_module.py": "a71c29eb21bac6ba3179e085f9024a4a2706842b977eb7dc65814f3b145a71d1",
+          "dynamicemb/dense_lookup.py": "e5ea1b886d6605eb46eb5181780785b88b9cd1d56abeeec6f60e6d7cb18d0047",
+          "dynamicemb/dump_load.py": "bd077049a4832f53e007024d01a9d047cccf1dd5a509f9a9bf16402acefacb34",
+          "dynamicemb/dynamicemb_config.py": "805123e8324625450e682d12a23fafdc90443de8e3b4ff2a90e968785fd860cd",
+          "dynamicemb/embedding_admission.py": "5ecbf4d9d1c9a9583865838baeae3543d15e1ac973c15fd6b83c3620fe30cc71",
+          "dynamicemb/exportable_embedding/__init__.py": "62c35603ee464b3c47fc5bac6e7b527ca7b3d268b3a6fb61237ff86bcf4b15c0",
+          "dynamicemb/exportable_embedding/config.py": "57038a9b2bffad8c222c76907cee4db4404c2539cbbad38cd29195e8faeecd6d",
+          "dynamicemb/exportable_embedding/incremental_update.py": "003eeae0b545667812e38e3382dba676a49f953424bc72726f64ec6eaf2921f7",
+          "dynamicemb/exportable_embedding/indexer.py": "73515b19718c9b09b360d89f79690419e46f8d4295f3c9194d303defcd957ec5",
+          "dynamicemb/exportable_embedding/indexer_directory.py": "74fb8f853e327417e7b0f7984e7e3531fa04d2b63fae4d2ae664b35d2e5a46d9",
+          "dynamicemb/exportable_embedding/indexer_snapshot.py": "6e872dd2f3079d46d3f318a37500ccfd86bdf3bde04b0dfda588232e3f09fd70",
+          "dynamicemb/exportable_embedding/nve_runtime.py": "3f38e4374bc619846ead036f2451d1c62a7a2fd323708c2a6c54c31132fc6262",
+          "dynamicemb/exportable_embedding/nve_tier.py": "1f8fbecd83bf7b143bddfd0134e171fea109c252575a7a558dc5b2801e73a6d5",
+          "dynamicemb/exportable_tables.py": "764c9608b946e1ee923df00902df2c342ad547b677498d09882d9c19ac7bb1ba",
+          "dynamicemb/extendable_tensor.py": "64f9bc99976799e8412528ff7fa6e765cd047f56e1f03a0bb0bb856307e3993e",
+          "dynamicemb/incremental_dump.py": "c634f9f1474c65d64e4d942d82cb68c0914febe3c2cc889a7388d449e2ddb27d",
+          "dynamicemb/index_range_meta.py": "dfef5b385cd56fded18327731c545761b0e9a88518a1ac115474ad526eba790a",
+          "dynamicemb/initializer.py": "d92b9a6ae7c8c7ee5335a3ece33fd24d64b947aab7cb39ebf78a9e1e0acfd307",
+          "dynamicemb/jit/__init__.py": "0e0d6c8bf8a3db90cd580a2565300c86cc41e14bc46ae0ff22752de3df7498b0",
+          "dynamicemb/jit/score_jit.py": "79028af386d7a2ad790b4801b29506a767f66c736a0a25aef1e5a3397dca484d",
+          "dynamicemb/key_ownership.py": "d3247ac28fd0fb23d601c9631ae1bf8834f728f4028f3a2f572cd11c1e76d24d",
+          "dynamicemb/key_value_table.py": "0edcd6dc99cc4530657d630ca1ca24b09703a19410a18f1565448a46dc922a00",
+          "dynamicemb/lookup_layout.py": "a8bacdbb30c6daa16ed1617694d95c3416fc9b2b3a384cc508ab4854ed277c7a",
+          "dynamicemb/lookup_meta.py": "023322af90bfccb8270d38d498610914b44b5a0f7e0ae5a940278527e75e54e9",
+          "dynamicemb/optimizer.py": "45140970f25bcf3f017e7aed3ad5de0b61c0d3a07296896d35d5db30c97d2671",
+          "dynamicemb/planner/__init__.py": "a40e00cd2906b5aae057c4631c5260cb1bb8862991c43033e120764166d5b728",
+          "dynamicemb/planner/get_planner.py": "1dbf4acfa9e373598897ca7774f4c07609a8bacc400ad104a0ccb22fd820cda3",
+          "dynamicemb/planner/placement.py": "8a92c6ef0829a17c2ee2edba84b511cd5ea97ae12ce5c624dd17cdabf16b8fe3",
+          "dynamicemb/planner/plan.py": "5f7a39aa0299debdd5afaa5d005343af49956f81d74b2b3a9be0eaca5d806f05",
+          "dynamicemb/planner/planners.py": "439ae69f58d38d7d9a1a3dfd524158ddbc0d2a16ce425ef909a95056788d92ed",
+          "dynamicemb/resolved_storage.py": "7efecf4b7fdb2fe06b0ceafe4c866b1e72f7d70570dc53a5f173fd0b9a01d462",
+          "dynamicemb/scored_hashtable.py": "a0c4b3b18f11973065ab53fe23110ffda57b298733546b6a527539e720aa4a08",
+          "dynamicemb/scored_kjt.py": "68c04f366d90570b7489d6e18c9c0f8d28bda6ec885b715e1c5d061ba9a569f2",
+          "dynamicemb/shard/__init__.py": "ba152ff578c11f19052c1890212257a8db1bafca7ba830180c903b4912c4488e",
+          "dynamicemb/shard/embedding.py": "adfb6283a6ebdcdc5ec2c889f565d223744f2de856c3616570b49b22509dcdc0",
+          "dynamicemb/shard/embeddingbag.py": "17e6db91d906f9e055346acc5b55e9304a7de16b297fface1cbe8a20783f9817",
+          "dynamicemb/shard/hier_output_dist.py": "f018cf95c65108560d5b7914fe2d35d8e2d78785ba7c1f47961aaa881d7c76fe",
+          "dynamicemb/shard/input_dist.py": "d98cd419efacfa73bb7ff2e7157ce98d10f181ec74b3c07a9ffa59aedcba0eba",
+          "dynamicemb/shard/per_key_score.py": "b36912bfa41a00c256c2c245e4d59e1c52b8f59548d7b0b4aca70e9b4ae0ec32",
+          "dynamicemb/shard/resolved_input.py": "16ef8d214d86cbac0e353b11b45025ce79fc73efa298f8362eec4b6ffc16535c",
+          "dynamicemb/shard/rw_sharding.py": "4c1c7db6de5b63132d7e9b27fb68314223fbbde0a535c319e29af28a5861f84f",
+          "dynamicemb/shard/twrw_sharding.py": "3b93d055bc5483e96a1a68b921c3f5bfcec3026c1736ede6815b418f580bc09b",
+          "dynamicemb/torchrec_lookup.py": "647fe529e5ba7ed8feea9baf237ad05b484553a5ab34a0364c7cd829a5eecd03",
+          "dynamicemb/types.py": "1c3d4c7bfe59c6f956ea609c1cf079250725ae97f1c6609534b123d274f8bbd5",
+          "dynamicemb/utils.py": "202a3d22a1fee3924a679f3d05a4516c9f2541109a0808ce3e6c2c13a31af5c4"
+        },
+        "fatbins_build_path": "/home/lwx/.cache/recsys-459-opt-20261114/target-build/lib",
+        "extension_path": "/home/lwx/.cache/recsys-459-opt-20261114/primary-feature2-build/lib/dynamicemb_extensions.cpython-312-x86_64-linux-gnu.so",
+        "extension_sha256": "b25b80eb0190dac854dfaf11118a1317dc7bdd014798d60ca6bedafaa179c335"
+      }
+    },
+    "test_source_sha256": {
+      "test_dense_lookup.py": "7ee1d678b1a352c2774b8450e571025e8b466182cd7adb23d0db9a20fa8eeda1",
+      "test_input_dist_indices.py": "31a30f40b5540a0b2f7a42908cf7be40d7e42ef853576dd5f757602c9fb05c33",
+      "test_resolved_lifecycle.py": "158febaa7550782da6c1ae613021803a1bc83f145cdca705c2ece0c1fed2013f"
+    },
+    "runs": [
+      {
+        "name": "native-wide-probe",
+        "exit_code": 1,
+        "log": "/home/lwx/.cache/recsys-459-opt-20261114/native-wide-probe.log",
+        "sha256": "eed1f533404e1eca5efb66450b61702b7575dcb13918215406c944d2a543d493",
+        "results": [
+          "PASS 2048 torch.float16 2",
+          "PASS 2048 torch.float16 0",
+          "PASS 2048 torch.float16 1",
+          "PASS 3072 torch.float32 2",
+          "[F1114 20:40:15.785062995 gen_embedding_forward_dense_unweighted_codegen_cuda.cu:849] Check failed: max_D <= 2048 (3072 vs. 2048). ",
+          "RuntimeError: [F1114 20:40:15.785062995 gen_embedding_forward_dense_unweighted_codegen_cuda.cu:849] Check failed: max_D <= 2048 (3072 vs. 2048). "
+        ]
+      },
+      {
+        "name": "native-wide-probe-primary",
+        "exit_code": -6,
+        "log": "/home/lwx/.cache/recsys-459-opt-20261114/native-wide-probe-primary.log",
+        "sha256": "73c55bbef60706d12e42d137148c517c84d60933db54ee64a1a47a0519f32a82",
+        "results": [
+          "PASS 2048 torch.float32 1",
+          "PASS 2048 torch.float16 2",
+          "PASS 2048 torch.float16 0",
+          "PASS 2048 torch.float16 1",
+          "PASS 3072 torch.float32 2",
+          "[F1114 20:41:12.590647949 gen_embedding_forward_dense_unweighted_codegen_cuda.cu:848] Check failed: max_D <= 2048 (3072 vs. 2048) "
+        ]
+      },
+      {
+        "name": "test-dense4-final-two",
+        "exit_code": 0,
+        "log": "/home/lwx/.cache/recsys-459-opt-20261114/test-dense4-final-two.log",
+        "sha256": "2f8aeb8942699ad0905bf1a674c990aa13d2311024f8424d48808ef3722a3fe0",
+        "results": [
+          "685 passed, 4 skipped, 1119 warnings in 46.72s",
+          "685 passed, 4 skipped, 1120 warnings in 46.73s"
+        ]
+      },
+      {
+        "name": "test-dense4-primary-final-two",
+        "exit_code": 0,
+        "log": "/home/lwx/.cache/recsys-459-opt-20261114/test-dense4-primary-final-two.log",
+        "sha256": "289c4e6e7326ce969efad97a7f4f59916531530176b79387d3d0e394e4d89ed3",
+        "results": [
+          "683 passed, 6 skipped, 794 warnings in 42.59s",
+          "683 passed, 6 skipped, 794 warnings in 43.43s"
+        ]
+      }
+    ]
+  }
 }

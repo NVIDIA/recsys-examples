@@ -117,6 +117,7 @@ class TorchRecLookup:
         if (
             self._uniform
             and self._dims[0] % 4 == 0
+            and (not pooled or self._dims[0] <= 2048)
             and unique_embs.is_cuda
             and unique_embs.dtype in (torch.float32, torch.float16)
             and output_dtype in OUTPUT_TYPES
@@ -124,8 +125,9 @@ class TorchRecLookup:
             and unique_embs.stride(0) % self._dims[0] == 0
         ):
             # TorchRec's dense forward kernels support aligned FP32/FP16
-            # weights. BF16 storage, mixed/odd widths and fractional row strides
-            # retain EC/EBC below; never pack an entire persistent matrix.
+            # weights (pooled kernels also require D <= 2048). Other widths,
+            # BF16 storage and fractional row strides retain EC/EBC below;
+            # never pack an entire persistent matrix.
             values = self._dense_module(pooling_weights is not None).forward(
                 unique_embs, indices, offsets, output_dtype, pooling_weights
             )

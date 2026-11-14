@@ -17,7 +17,10 @@ from dynamicemb.torchrec_lookup import TorchRecLookup
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("output_dtype", [torch.float32, torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("dim,padding", [(4, 0), (8, 16), (8, 1), (7, 0), (12, 0)])
+@pytest.mark.parametrize(
+    "dim,padding",
+    [(4, 0), (8, 16), (8, 1), (7, 0), (12, 0), (2048, 0), (2052, 0), (4096, 0)],
+)
 @pytest.mark.parametrize(
     "mode,weighted",
     [
@@ -44,7 +47,12 @@ def test_dense_lookup_and_fallback_match_reference(
     sample_weights = torch.arange(1, 8, device=device).float() / 4 if weighted else None
     batch = SimpleNamespace(reverse_indices=indices)
     adapter = TorchRecLookup([dim], [0, 0], mode, device)
-    dense = dim % 4 == 0 and padding % dim == 0 and dtype != torch.bfloat16
+    dense = (
+        dim % 4 == 0
+        and padding % dim == 0
+        and dtype != torch.bfloat16
+        and (mode == DynamicEmbPoolingMode.NONE or dim <= 2048)
+    )
     backend = adapter._dense_module(weighted) if dense else adapter._module(weighted)
     name = "_operation" if dense else "forward"
     with torch.no_grad(), patch.object(
