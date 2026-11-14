@@ -321,6 +321,10 @@ def run(args, feature_num, device):
                     batch_size=args.batch_size,
                     hotness=args.hotness,
                     dim=args.dim,
+                    capacity=args.capacity,
+                    warmup=args.warmup,
+                    iterations=args.iterations,
+                    trials=args.trials,
                     samples_ms=samples,
                     median_ms={
                         name: statistics.median(values)

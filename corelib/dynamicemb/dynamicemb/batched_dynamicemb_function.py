@@ -21,7 +21,7 @@ from threading import RLock
 from typing import TYPE_CHECKING, Callable, ContextManager, List, Optional, Tuple
 
 if TYPE_CHECKING:
-    from .resolved_storage import ActiveStorageRows
+    from .resolved_storage import ActiveStorageRows, StorageRowIndex
 
 import torch
 from dynamicemb.async_erase import defer_table_cleanup, table_section
@@ -78,7 +78,7 @@ def _copy_cuda_tensor_to_pinned_cpu(tensor: torch.Tensor) -> torch.Tensor:
         pin_memory=True,
     )
     cpu.copy_(tensor.detach(), non_blocking=True)
-    torch.cuda.current_stream(tensor.device).synchronize()
+    torch.cuda.current_stream(tensor.device.index).synchronize()
     return cpu
 
 
@@ -224,16 +224,24 @@ class _PinnedRowLease:
         self.released = False
         self._reservation_returned = False
         self._lock = RLock()
-        self._last_use = torch.cuda.Event()
-        self._last_use.record(torch.cuda.current_stream(self.unique_keys.device))
+        self._device_index = self.unique_keys.device.index
+        # The prefetch gate already orders creation. Only a caller without a
+        # gate needs an additional creation event for abandoned input cleanup.
+        self._last_use = None
+        if self.table_gate is None:
+            self.record_use()
 
     def record_use(self):
         with self._lock:
-            self._last_use.record(torch.cuda.current_stream(self.unique_keys.device))
+            if self._last_use is None:
+                self._last_use = torch.cuda.Event()
+            self._last_use.record(torch.cuda.current_stream(self._device_index))
 
     def finish_forward(self):
         with self._lock:
             self.record_use()
+            if self.outstanding_keys_ref is None:
+                return
             with table_section(
                 self.table_gate.host_section if self.table_gate is not None else None
             ):
@@ -245,26 +253,35 @@ class _PinnedRowLease:
                 self.outstanding_keys_ref -= self.num_prefetched_keys
             self._reservation_returned = True
 
-    def release(self):
+    def release(self, *, after_use=False):
         with self._lock:
             if self.released:
                 return
-            with torch.cuda.device(self.unique_keys.device), table_section(
-                self.table_gate
-            ):
-                stream = torch.cuda.current_stream()
-                stream.wait_event(self._last_use)
+            owner = (
+                self.cache if self.storage_mode == StorageMode.CACHE else self.storage
+            )
+            # Fixed hash slots cannot move while pinned. As in the existing
+            # backward contract, the atomic decrement follows this stream's
+            # final use; async erase sees the pin until that decrement. Rehash
+            # and cancellation still need the gate, as do CPU reservations.
+            fixed_slots = not owner._state.key_index_map.use_rows_
+            gate = (
+                None
+                if after_use and fixed_slots and self._reservation_returned
+                else self.table_gate
+            )
+            with torch.cuda.device(self._device_index), table_section(gate):
+                stream = torch.cuda.current_stream(self._device_index)
+                # A completed backward enqueues the release on its own use
+                # stream. Cancellation still has to join the last use event.
+                if not after_use and self._last_use is not None:
+                    stream.wait_event(self._last_use)
                 for tensor in (
                     self.unique_keys,
                     self.unique_table_ids,
                     self.slot_indices,
                 ):
                     tensor.record_stream(stream)
-                owner = (
-                    self.cache
-                    if self.storage_mode == StorageMode.CACHE
-                    else self.storage
-                )
                 refresh_slots_after_rehash(owner._state, self)
                 release_slot_pins(
                     self.cache,
@@ -320,9 +337,11 @@ class PrefetchState:
     # prefetch may expand it before this batch's backward runs.
     key_map_generation: int = 0
     unique_sizes: List[int] = field(default_factory=list)
+    unique_table_offsets: Optional[torch.Tensor] = None
     unique_values: Optional[torch.Tensor] = None
     persisted_unique_indices: Optional[torch.Tensor] = None
     active_rows: Optional["ActiveStorageRows"] = None
+    storage_row_index: Optional["StorageRowIndex"] = field(default=None, repr=False)
     table_gate: Optional[Callable[[], ContextManager]] = None
     is_eval: bool = False
     input_frequencies: Optional[torch.Tensor] = None
@@ -330,11 +349,11 @@ class PrefetchState:
     released: bool = False
     used: bool = False
 
-    def release(self):
+    def release(self, *, after_use=False):
         if self.released:
             return
         if self.pin_lease is not None:
-            self.pin_lease.release()
+            self.pin_lease.release(after_use=after_use)
         if self.active_rows is not None:
             self.active_rows.release(self)
         self.released = True
@@ -1105,9 +1124,11 @@ def dynamicemb_prefetch(
                 # not in lookup. Active rows preserve optimizer consistency when
                 # multiple prefetched batches overlap, even across eviction.
                 unique_values, persisted_unique_indices = _resolve_storage_rows(
-                    active_rows.overlay(storage)
-                    if active_rows is not None
-                    else storage,
+                    (
+                        active_rows.overlay(storage)
+                        if active_rows is not None
+                        else storage
+                    ),
                     optimizer,
                     unique_keys,
                     unique_table_ids,
@@ -1142,11 +1163,16 @@ def dynamicemb_prefetch(
                 value_row_indices=value_row_indices,
                 key_map_generation=key_map_generation,
                 unique_sizes=unique_size_per_table.tolist(),
+                unique_table_offsets=(
+                    unique_indices_table_range
+                    if storage_mode == StorageMode.DEFAULT
+                    else None
+                ),
                 unique_values=unique_values,
                 persisted_unique_indices=persisted_unique_indices,
-                active_rows=active_rows
-                if storage_mode == StorageMode.DEFAULT
-                else None,
+                active_rows=(
+                    active_rows if storage_mode == StorageMode.DEFAULT else None
+                ),
                 table_gate=table_gate,
             )
             if result.slot_indices is not None:
@@ -1615,9 +1641,10 @@ class DynamicEmbeddingFunction(torch.autograd.Function):
             # Preserve pins/live snapshots across retained backwards, including
             # intervening prefetched updates. Normal backwards release at once;
             # discarded retained graphs release through their lease/weak owner.
-            if ctx.prefetch_state.pin_lease is not None:
-                ctx.prefetch_state.pin_lease.record_use()
-            if not torch._C._autograd._get_current_graph_task_keep_graph():
-                ctx.prefetch_state.release()
+            if torch._C._autograd._get_current_graph_task_keep_graph():
+                if ctx.prefetch_state.pin_lease is not None:
+                    ctx.prefetch_state.pin_lease.record_use()
+            else:
+                ctx.prefetch_state.release(after_use=True)
 
             return (None,) * ctx.input_count

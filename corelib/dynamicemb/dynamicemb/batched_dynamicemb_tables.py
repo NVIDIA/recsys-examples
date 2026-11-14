@@ -1246,7 +1246,7 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                 )
             prefetch_state = self._prefetch_states.popleft()
 
-        prefetch_state.record_stream(torch.cuda.current_stream())
+        prefetch_state.record_stream(torch.cuda.current_stream(self.device_id))
 
         prefetch_state.used = True
         try:

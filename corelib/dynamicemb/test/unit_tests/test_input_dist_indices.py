@@ -54,12 +54,16 @@ from torchrec import (
     KeyedJaggedTensor,
     PoolingType,
 )
-from torchrec.distributed.embedding_sharding import FusedKJTListSplitsAwaitable
+from torchrec.distributed.embedding_sharding import (
+    FusedKJTListSplitsAwaitable,
+    KJTSplitsAllToAllMeta,
+)
 from torchrec.distributed.embedding_types import BaseGroupedFeatureProcessor
 from torchrec.distributed.planner import Topology
 from torchrec.distributed.train_pipeline import (
     PrefetchTrainPipelineSparseDist,
     TrainPipelineSparseDist,
+    _override_input_dist_forwards,
 )
 from torchrec.distributed.types import ShardingEnv, ShardingType
 from torchrec.types import DataType
@@ -160,14 +164,16 @@ def make_model(
                     global_hbm_for_values=(
                         1024**3
                         if layout == "hbm"
-                        else max_capacity * config.embedding_dim
-                        if layout in ["cache", "hybrid", "cache_ps"]
-                        else 0
+                        else (
+                            max_capacity * config.embedding_dim
+                            if layout in ["cache", "hybrid", "cache_ps"]
+                            else 0
+                        )
                     ),
                     caching=layout in ["cache", "cache_ps"],
-                    external_storage=PyDictStorage
-                    if layout in ["ps", "cache_ps"]
-                    else None,
+                    external_storage=(
+                        PyDictStorage if layout in ["ps", "cache_ps"] else None
+                    ),
                     bucket_capacity=128,
                     score_strategy=score,
                     initializer_args=DynamicEmbInitializerArgs(
@@ -233,7 +239,9 @@ def distribute(model, features, fused=False):
     request = model.input_dist(ctx, features)
     if fused:
         # This is how both SparseDist pipelines rebuild the second awaitable.
-        request = FusedKJTListSplitsAwaitable([request], [ctx], None).wait()[0]
+        request = FusedKJTListSplitsAwaitable(
+            [request], [ctx], dist.group.WORLD
+        ).wait()[0]
     else:
         request = request.wait()
     return ctx, request.wait()
@@ -258,6 +266,60 @@ def check_debug(result, features):
         torch.testing.assert_close(
             result[name].weights(), expected.values(), rtol=0, atol=0, check_dtype=False
         )
+
+
+def test_split_fusion_keeps_each_collections_receiver_state():
+    if dist.get_world_size() < 2:
+        pytest.skip("A real split collective requires multiple ranks")
+    models = [make_model(), make_model()]
+    # Initialize the lazy distributors, then apply the same native fusion
+    # override as TrainPipelineSparseDist (including to both collections).
+    for model in models:
+        ctx, received = distribute(model, batch(start=1000))
+        result = output(model, ctx, received)
+        sum(jt.values().sum() for jt in result.values()).backward()
+    _override_input_dist_forwards(models)
+    features = [batch(start=0), batch(start=100)]
+    contexts = [model.create_context() for model in models]
+    requests = [
+        model.input_dist(ctx, inputs)
+        for model, ctx, inputs in zip(models, contexts, features)
+    ]
+    assert all(
+        isinstance(awaitable, KJTSplitsAllToAllMeta)
+        for request in requests
+        for awaitable in request.awaitables
+    )
+    fused = FusedKJTListSplitsAwaitable(requests, contexts, dist.group.WORLD)
+    assert fused._splits_awaitable is not None
+    arrived = [request.wait() for request in fused.wait()]
+    for model, ctx, inputs, received in zip(models, contexts, features, arrived):
+        assert isinstance(received[0], ResolvedEmbeddingInput)
+        result = output(model, ctx, received)
+        check_debug(result, inputs)
+        sum(jt.values().sum() for jt in result.values()).backward()
+    assert all(
+        not table._active_rows.states for model in models for table in tables(model)
+    )
+
+
+@pytest.mark.parametrize("layout", ["host", "hybrid", "ps"])
+def test_storage_hits_skip_snapshot_matching_and_keep_optimizer_state(layout):
+    table = tables(make_model(layout=layout))[0]
+    features = batch()
+    state = table.resolve_input(features.values(), features.offsets())
+    result = table(features.values(), features.offsets(), prefetch_state=state)
+    result.sum().backward(retain_graph=True)
+    with patch(
+        "dynamicemb.resolved_storage.matching_rows",
+        side_effect=AssertionError("a current storage hit searched live snapshots"),
+    ):
+        following = table.resolve_input(features.values(), features.offsets())
+    # Includes Adam m/v, not just the visible embedding columns.
+    torch.testing.assert_close(following.unique_values, state.unique_values)
+    following.release()
+    result.sum().backward()
+    assert not table._active_rows.states
 
 
 @pytest.mark.parametrize("dedup", [False, True])
@@ -776,9 +838,11 @@ def test_pooled_lookup_and_update_match_unsharded_torchrec(
         keys=["f0", "f1", "f2"],
         values=torch.tensor([2, 2, 4, 3, 3, 7, 7], device="cuda"),
         lengths=torch.tensor([3, 0, 0, 2, 1, 1], device="cuda"),
-        weights=torch.arange(1, 8, device="cuda", dtype=torch.float32) / 3
-        if weighted
-        else None,
+        weights=(
+            torch.arange(1, 8, device="cuda", dtype=torch.float32) / 3
+            if weighted
+            else None
+        ),
     )
     ctx, arrived = distribute(model, features)
     assert isinstance(arrived[0], ResolvedEmbeddingInput)
@@ -855,9 +919,11 @@ def test_low_precision_pooling_and_update(layout, dtype, dims, pooling, weighted
         keys=["f0", "f1", "f2"],
         values=torch.tensor([1, 2048, 256, 1, 1, 256, 1], device="cuda"),
         lengths=torch.tensor([2, 0, 0, 2, 2, 1], device="cuda"),
-        weights=torch.arange(1, 8, device="cuda", dtype=torch.float32) / 2
-        if weighted
-        else None,
+        weights=(
+            torch.arange(1, 8, device="cuda", dtype=torch.float32) / 2
+            if weighted
+            else None
+        ),
     )
 
     def reference():
@@ -954,17 +1020,16 @@ def test_cancelled_storage_rows_survive_queued_cross_stream_copy():
     copy_stream = torch.cuda.Stream()
     copy_stream.wait_stream(allocation_stream)
 
-    def delayed_match(*args):
-        indices = matching_rows(*args)
-        # Delay the actual copy after matching has finished its host syncs.
+    from dynamicemb.resolved_storage import _copy_matching_rows
+
+    def delayed_copy(*args):
+        # Delay the actual copy on the consumer stream.
         # Dropping the source below must not recycle its allocation meanwhile.
         torch.cuda._sleep(100_000_000)
-        return indices
+        return _copy_matching_rows(*args)
 
     with torch.cuda.stream(copy_stream), table._table_gate():
-        with patch(
-            "dynamicemb.resolved_storage.matching_rows", side_effect=delayed_match
-        ):
+        with patch("dynamicemb.resolved_storage._copy_matching_rows", new=delayed_copy):
             table._active_rows.publish(source)
     del source
     assert source_ref() is None

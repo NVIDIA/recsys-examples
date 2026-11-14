@@ -64,7 +64,11 @@ class ResolvedEmbeddingInput(KeyedJaggedTensor):
         return _shallow_copy_as(
             cls,
             features,
-            _values=torch.cat([group.values() for group in groups]),
+            _values=(
+                groups[0].values()
+                if len(groups) == 1
+                else torch.cat([group.values() for group in groups])
+            ),
             _jt_dict=None,
             prefetch_state=None,
             _original_dtype=features.values().dtype,

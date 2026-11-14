@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import weakref
 from typing import Callable, List, Optional, Tuple
 
 import torch
@@ -36,7 +37,7 @@ from torchrec.distributed.types import Awaitable
 from torchrec.fx.utils import assert_fx_safe
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 
-from ..scored_kjt import ScoredKeyedJaggedTensor
+from ..scored_kjt import ScoredKeyedJaggedTensor, _shallow_copy_as
 from .hier_output_dist import DynamicEmbSequenceShardingContext, HierDist
 
 torch.fx.wrap("len")
@@ -219,6 +220,29 @@ class _ResolveOnce:
         return self._resolved
 
 
+def resolve_at_receive(features, postprocessor):
+    """Carry resolution through TorchRec's public KJT ``dist_init`` hook.
+
+    Native split fusion reconstructs its awaitables, but preserves their input
+    KJT type and calls that type's dist_init after receiving tensors. Each
+    request owns its resolver; the generated type holds only a weak reference
+    so cyclic type GC cannot retain the request's CUDA allocations or pins.
+    """
+    resolver = _ResolveOnce(postprocessor)
+    resolver_ref = weakref.ref(resolver)
+
+    class ReceiverInput(KeyedJaggedTensor):
+        @staticmethod
+        def dist_init(*args, **kwargs):
+            resolve = resolver_ref()
+            assert resolve is not None, "Receiver input must own its resolver"
+            if resolve._resolved is None:
+                return resolve(KeyedJaggedTensor.dist_init(*args, **kwargs))
+            return resolve._resolved
+
+    return _shallow_copy_as(ReceiverInput, features, _receiver_resolver=resolver)
+
+
 class _PostprocessedSplitsAwaitable(Awaitable[KJTAllToAllTensorsAwaitable]):
     """Run local resolution after the tensors all2all, keeping TorchRec's metadata.
 
@@ -331,8 +355,12 @@ class RwSparseFeaturesDist(_RwSparseFeaturesDist):
         self._dist_type_codes: List[int] = [DIST_TYPE_CODES[t] for t in dist_types]
         self.hier = hier
         self._input_postprocessor = input_postprocessor
-        if input_postprocessor is not None:
-            # Split fusion rebuilds native awaitables without our callback.
+        self._resolve_via_dist_init = (
+            input_postprocessor is not None and not per_key_score and pg.size() > 1
+        )
+        if input_postprocessor is not None and not self._resolve_via_dist_init:
+            # A one-rank transport bypasses dist_init. Scores also need their
+            # second channel to complete before resolving the key tensors.
             self._key_dist = self._dist
             del self._dist
 
@@ -356,8 +384,14 @@ class RwSparseFeaturesDist(_RwSparseFeaturesDist):
             unbucketize_permute if self._is_sequence else None
         )
 
+        if self._resolve_via_dist_init:
+            bucketized_features = resolve_at_receive(
+                bucketized_features, self._input_postprocessor
+            )
         key_dist = (
-            self._key_dist if self._input_postprocessor is not None else self._dist
+            self._dist
+            if self._resolve_via_dist_init or self._input_postprocessor is None
+            else self._key_dist
         )
         keys_dist = key_dist(bucketized_features)
         if not takes_scores:
@@ -391,7 +425,7 @@ class RwSparseFeaturesDist(_RwSparseFeaturesDist):
         )
 
     def _postprocess(self, awaitable):
-        if self._input_postprocessor is None:
+        if self._input_postprocessor is None or self._resolve_via_dist_init:
             return awaitable
         return _PostprocessedSplitsAwaitable(awaitable, self._input_postprocessor)
 

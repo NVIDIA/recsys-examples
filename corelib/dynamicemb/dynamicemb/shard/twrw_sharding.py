@@ -56,6 +56,7 @@ from .input_dist import (
     _PostprocessedSplitsAwaitable,
     bucketize_kjt_before_all2all,
     dist_type_codes,
+    resolve_at_receive,
 )
 from .rw_sharding import (
     GroupedPooledEmbeddingsLookup,
@@ -113,7 +114,8 @@ class TwRwSparseFeaturesDist(_TwRwSparseFeaturesDist):
             persistent=False,
         )
         self._input_postprocessor = input_postprocessor
-        if input_postprocessor is not None:
+        self._resolve_via_dist_init = input_postprocessor is not None and pg.size() > 1
+        if input_postprocessor is not None and not self._resolve_via_dist_init:
             self._key_dist = self._dist
             del self._dist
 
@@ -146,6 +148,10 @@ class TwRwSparseFeaturesDist(_TwRwSparseFeaturesDist):
             self._sf_staggered_shuffle,
             self._sf_staggered_shuffle_tensor,
         )
+        if self._resolve_via_dist_init:
+            return self._dist(
+                resolve_at_receive(bucketized_features, self._input_postprocessor)
+            )
         if self._input_postprocessor is not None:
             return _PostprocessedSplitsAwaitable(
                 self._key_dist(bucketized_features), self._input_postprocessor

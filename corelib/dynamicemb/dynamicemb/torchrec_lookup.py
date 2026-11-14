@@ -61,9 +61,11 @@ class TorchRecLookup:
                     init_fn=torch.nn.init.zeros_,
                     **(
                         {
-                            "pooling": PoolingType.MEAN
-                            if self._pooling_mode == DynamicEmbPoolingMode.MEAN
-                            else PoolingType.SUM
+                            "pooling": (
+                                PoolingType.MEAN
+                                if self._pooling_mode == DynamicEmbPoolingMode.MEAN
+                                else PoolingType.SUM
+                            )
                         }
                         if pooled
                         else {}
@@ -131,13 +133,7 @@ class TorchRecLookup:
             embedding.num_embeddings = weight.size(0)
         if self._uniform:
             count = indices.numel()
-            lengths = (
-                offsets[1:] - offsets[:-1]
-                if pooled
-                else torch.full(
-                    (1,), count, dtype=torch.int64, device=unique_embs.device
-                )
-            )
+            lengths = offsets[1:] - offsets[:-1] if pooled else offsets[-1:]
             # This synthetic feature already has its JT representation. Pass
             # the public cache so native lookup does not split it or reconstruct
             # offsets with another GPU scan/cat (pooling uses our input offsets).
