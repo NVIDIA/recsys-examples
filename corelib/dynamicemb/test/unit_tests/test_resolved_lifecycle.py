@@ -16,52 +16,6 @@ from test_no_grad_slot_lifetime import batch, check_values, make_model, pins
 
 
 @pytest.mark.parametrize("layout", ["hbm", "cache", "host", "hybrid"])
-def test_stream_registration_rechecks_changed_metadata(layout):
-    model, _ = make_model(DynamicEmbPoolingMode.NONE, layout)
-    keys, offsets = batch(0)
-    state = model.resolve_input(keys, offsets)
-    first, second = torch.cuda.current_stream(), torch.cuda.Stream()
-    calls = []
-    original = torch.Tensor.record_stream
-
-    def register(value, stream):
-        calls.append((weakref.ref(value), stream.cuda_stream))
-        return original(value, stream)
-
-    with patch.object(torch.Tensor, "record_stream", new=register):
-        state.record_stream(first)
-        count = len(calls)
-        assert count > 0
-        state.record_stream(first)
-        assert len(calls) == count
-        state.occurrence_rows = state.reverse_indices.clone()
-        state.record_stream(first)
-        assert len(calls) > count
-        occurrence = state.occurrence_rows
-        occurrence_ref = weakref.ref(occurrence)
-        assert any(value() is occurrence for value, _ in calls)
-        count = len(calls)
-        state.record_stream(first)
-        assert len(calls) == count
-        state.occurrence_rows = occurrence.clone()
-        del occurrence
-        assert occurrence_ref() is None
-        state.record_stream(first)
-        assert len(calls) > count
-        state.occurrence_rows = None
-        count = len(calls)
-        second.wait_stream(first)
-        state.record_stream(second)
-        assert len(calls) > count
-        count = len(calls)
-        state.record_stream(second)
-        assert len(calls) == count
-        state.record_stream(first)
-        assert len(calls) > count
-    state.release()
-
-
-@pytest.mark.parametrize("layout", ["hbm", "cache", "host", "hybrid"])
 @pytest.mark.parametrize("replace_values", [False, True])
 def test_eval_state_survives_drop_on_producer_stream(layout, replace_values):
     model, _ = make_model(DynamicEmbPoolingMode.NONE, layout)

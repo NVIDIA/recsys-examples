@@ -20,7 +20,6 @@ from dataclasses import dataclass, field
 from enum import Enum, auto
 from threading import RLock
 from typing import TYPE_CHECKING, Callable, ContextManager, List, Optional, Tuple
-from weakref import ref
 
 if TYPE_CHECKING:
     from .resolved_storage import ActiveStorageRows, StorageRowIndex
@@ -356,7 +355,6 @@ class PrefetchState:
     pin_lease: Optional[_PinnedRowLease] = field(default=None, repr=False)
     released: bool = False
     used: bool = False
-    _stream_registration: Optional[tuple] = field(default=None, init=False, repr=False)
 
     def release(self, *, after_use=False):
         if self.released:
@@ -369,26 +367,9 @@ class PrefetchState:
 
     def record_stream(self, stream: torch.cuda.Stream) -> None:
         """Keep the batch's metadata alive when input_dist and lookup use different streams."""
-        values = tuple(
-            value
-            for value in vars(self).values()
-            if isinstance(value, torch.Tensor) and value.is_cuda
-        )
-        stream_key = (stream.device.index, stream.cuda_stream)
-        previous = self._stream_registration
-        if (
-            previous is not None
-            and previous[0] == stream_key
-            and len(previous[1]) == len(values)
-            and all(old() is value for old, value in zip(previous[1], values))
-        ):
-            return
-        for value in values:
-            value.record_stream(stream)
-        # Registration persists for an allocation/stream. Recheck tensor
-        # identities because resolution/rehash may replace metadata. Weak refs
-        # must not keep a replaced snapshot or its allocator blocks alive.
-        self._stream_registration = (stream_key, tuple(ref(value) for value in values))
+        for value in vars(self).values():
+            if isinstance(value, torch.Tensor) and value.is_cuda:
+                value.record_stream(stream)
 
 
 def refresh_slots_after_rehash(state: DynamicEmbTableState, batch) -> None:
