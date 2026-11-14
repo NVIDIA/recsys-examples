@@ -65,6 +65,7 @@ import warnings
 import weakref
 from dataclasses import dataclass, replace
 from typing import Callable, Dict, List, NamedTuple, Optional, Sequence, Tuple
+from unittest.mock import patch
 
 import dynamicemb_extensions
 import torch
@@ -763,7 +764,13 @@ class Probe:
 
         def forward(features):
             out = orig(features)
-            self.kjt = features
+            # Lookup now consumes value-row indices. Gradient comparisons must
+            # continue to group by the original (table, key), not physical rows.
+            self.kjt = (
+                features.original_features()
+                if hasattr(features, "original_features")
+                else features
+            )
             rows = (
                 hier.key_rows(features)
                 if hier is not None and hier.owns(features)
@@ -851,9 +858,10 @@ def jagged_input(ec, ctx) -> KeyedJaggedTensor:
 class Run(NamedTuple):
     out: Dict
     ctx: object
-    syncs: int  # host syncs in the input dist (-1: not counted)
+    syncs: int  # transport host syncs, excluding receiver row preparation
     totals: bool  # the KJT construct_jagged_tensors reads had length_per_key
     result: object  # the call's input dist result on the op (None: TorchRec's dists)
+    resolution_syncs: int
 
 
 def counted(fn: Callable):
@@ -865,12 +873,25 @@ def counted(fn: Callable):
     window = next(
         event for event in events if event.name == "counted_window"
     ).time_range
+    resolution = [event for event in events if event.name == "receiver_row_resolution"]
+
+    def in_resolution(event):
+        return any(
+            span.thread == event.thread
+            and span.time_range.start <= event.time_range.start <= span.time_range.end
+            for span in resolution
+        )
+
     syncs = sum(
         event.name in SYNC_CALLS
         and window.start <= event.time_range.start <= window.end
+        and not in_resolution(event)
         for event in events
     )
-    return result, syncs
+    resolution_syncs = sum(
+        event.name in SYNC_CALLS and in_resolution(event) for event in events
+    )
+    return result, syncs, resolution_syncs
 
 
 def run_model(ec, kjt, sync_count: bool) -> Run:
@@ -878,18 +899,34 @@ def run_model(ec, kjt, sync_count: bool) -> Run:
     if asked), then lookup and output dist."""
     ctx = ec.create_context()
     syncs = -1
+    resolution_syncs = -1
 
     def input_dist():
         return ec.input_dist(ctx, kjt).wait().wait()
 
     if sync_count:
-        dist_input, syncs = counted(input_dist)
+        # Row preparation moved from compute to this receiver wait. Keep the
+        # existing transport sync budget and report preparation separately.
+        # No production profiling ranges or relaxed gradient checks are needed.
+        with contextlib.ExitStack() as stack:
+            for distributor in ec._input_dists:
+                callback = getattr(distributor, "_input_postprocessor", None)
+                if callback is not None:
+
+                    def resolved(features, callback=callback):
+                        with record_function("receiver_row_resolution"):
+                            return callback(features)
+
+                    stack.enter_context(
+                        patch.object(distributor, "_input_postprocessor", resolved)
+                    )
+            dist_input, syncs, resolution_syncs = counted(input_dist)
     else:
         dist_input = input_dist()
     totals = jagged_input(ec, ctx)._length_per_key is not None
     result = getattr(ctx.sharding_contexts[rw_index(ec)], "hier_result", None)
     out = ec.compute_and_output_dist(ctx, dist_input).wait()
-    return Run(out, ctx, syncs, totals, result)
+    return Run(out, ctx, syncs, totals, result, resolution_syncs)
 
 
 def totals_right(kjt: KeyedJaggedTensor) -> bool:
@@ -1284,6 +1321,7 @@ def run_case(
         log(
             f"case {case_idx} '{case.name}' iteration {iteration}: "
             + " ".join(f"{label}={flag}" for label, flag in zip(checks, flags))
+            + f" resolution_syncs={hier_run.resolution_syncs}"
             + f" tables_bitwise={flags[-1]} [{'ok' if good else 'FAIL'}]"
         )
     torch.cuda.synchronize()

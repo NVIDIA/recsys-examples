@@ -20,11 +20,10 @@ Run with ``torchrun --nproc_per_node 2``. Three parts:
 1. ``check_input_dist`` -- an ``EmbeddingCollection`` as far as its input
    distribution (and, with ``use_index_dedup``, its dedup):
    - a plain ``KeyedJaggedTensor`` is refused, not read as "no scores";
-   - a ``ScoredKeyedJaggedTensor`` reaches the row-wise distributor, and what the
-     distribution hands on, with every score still beside its key, nothing lost,
-     and the context the output distribution reads its splits from filled in;
-   - the lookup hands the scores of each group to the tables' ``forward`` and
-     ``prefetch``, still beside their keys.
+   - a ``ScoredKeyedJaggedTensor`` reaches the row-wise distributor; for HBM,
+     the distribution resolves rows and retains each unique key's score in the
+     batch state, with the output distribution's splits filled in;
+   - pipeline awaitable reconstruction preserves resolution and scores, also for a cache.
    Every score there is derived from its key (``score = key * 10 + 1``), so
    ``scores == values * 10 + 1`` says a score is still beside its key.
 
@@ -64,7 +63,6 @@ from dynamicemb import (
     DynamicEmbTableOptions,
     ScoredKeyedJaggedTensor,
 )
-from dynamicemb.batched_dynamicemb_tables import BatchedDynamicEmbeddingTablesV2
 from dynamicemb.dump_load import (
     DynamicEmbDump,
     DynamicEmbLoad,
@@ -77,6 +75,7 @@ from dynamicemb.planner import (
 )
 from dynamicemb.shard import DynamicEmbeddingBagCollectionSharder
 from dynamicemb.shard.input_dist import RwSparseFeaturesDist
+from dynamicemb.shard.resolved_input import ResolvedEmbeddingInput
 from fbgemm_gpu.split_embedding_configs import EmbOptimType, SparseType
 from torchrec.distributed.model_parallel import DistributedModelParallel
 from torchrec.distributed.planner import Topology
@@ -86,11 +85,8 @@ from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 # test_embedding_dump_load is the fixture module the tests in unit_tests share,
 # so it stays a directory up and has to be put on the path from here.
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from test_embedding_dump_load import (  # noqa: E402
-    create_model,
-    get_optimizer_kwargs,
-    idx_to_name,
-)
+from test_embedding_dump_load import create_model  # noqa: E402
+from test_embedding_dump_load import get_optimizer_kwargs, idx_to_name
 
 NUM_TABLES = 3
 NUM_EMBEDDINGS = 1000
@@ -99,11 +95,8 @@ INPUT_BATCH_PER_RANK = 4
 
 # --- 1. input distribution ---------------------------------------------------
 
-# The tables' entry points the lookup hands the scores to.
-seen_names = ("forward", "prefetch")
 
-
-def _input_model(use_index_dedup: bool):
+def _input_model(use_index_dedup: bool, caching: bool = False):
     names = [idx_to_name(0, i) for i in range(NUM_TABLES)]
     return create_model(
         num_embedding_collections=1,
@@ -112,6 +105,7 @@ def _input_model(use_index_dedup: bool):
         optimizer_kwargs=get_optimizer_kwargs("sgd"),
         score_strategy=DynamicEmbScoreStrategy.PRECISE_CUSTOMIZED,
         use_index_dedup=use_index_dedup,
+        caching=caching,
     ), [feature for feature, _ in names]
 
 
@@ -176,9 +170,11 @@ def check_input_dist(use_index_dedup: bool) -> None:
     # What comes out of the all2all: scores still beside their keys (the default
     # dist_type keeps a key global), and as many of them as were sent.
     (arrived,) = distributed
-    assert isinstance(arrived, ScoredKeyedJaggedTensor), type(arrived)
-    assert arrived.scores().numel() == arrived.values().numel()
-    assert torch.equal(arrived.scores(), arrived.values() * 10 + 1)
+    assert isinstance(arrived, ResolvedEmbeddingInput), type(arrived)
+    (lookup,) = sharded._lookups
+    for group in arrived.split(lookup._feature_splits):
+        state = group.prefetch_state
+        assert torch.equal(state.unique_scores, state.unique_keys * 10 + 1)
     # TorchRec read the splits the output distribution needs off the awaitable.
     (sharding_context,) = context.sharding_contexts
     assert sharding_context.input_splits and sharding_context.output_splits
@@ -190,91 +186,38 @@ def check_input_dist(use_index_dedup: bool) -> None:
     dist.all_reduce(counts)
     assert counts[0] == counts[1], counts
 
-    check_lookup_gets_scores(sharded, arrived)
+    # Scores have already reached the tables. Lookup consumes rows and metadata,
+    # and a pipeline prefetch must neither read them as keys nor rescore them.
+    lookup.prefetch(arrived)
+    result = sharded.compute_and_output_dist(context, distributed).wait()
+    sum(jt.values().sum() for jt in result.values()).backward()
 
 
-def check_train_pipeline_is_refused() -> None:
-    """What TrainPipelineSparseDist does to the distributor is refused clearly.
+def check_train_pipeline_keeps_scores() -> None:
+    """Pipeline awaitable reconstruction retains resolution and per-key scores."""
+    from torchrec.distributed.embedding_sharding import FusedKJTListSplitsAwaitable
 
-    The pipeline replaces each ``_dist.forward`` with ``KJTAllToAllForward``,
-    which returns the metadata of a fused splits all2all, not an awaitable.
-    """
-    from torchrec.distributed.train_pipeline.runtime_forwards import KJTAllToAllForward
-
-    model, feature_names = _input_model(use_index_dedup=False)
-    ((_, _, sharded),) = find_sharded_modules(model, "")
-    device = torch.device(f"cuda:{torch.cuda.current_device()}")
-    fields, scores = _input_features(feature_names, device)
-    scored = ScoredKeyedJaggedTensor(scores=scores, **fields)
-
-    # The tables are created by the first input_dist; do it before patching.
-    sharded.input_dist(sharded.create_context(), scored).wait().wait()
-
-    (row_wise_dist,) = sharded._input_dists
-    original = row_wise_dist._dist.forward
-    row_wise_dist._dist.forward = KJTAllToAllForward(
-        pg=row_wise_dist._dist._pg,
-        splits=row_wise_dist._dist._splits,
-        stagger=row_wise_dist._dist._stagger,
-    )
-    try:
-        sharded.input_dist(sharded.create_context(), scored)
-    except NotImplementedError as error:
-        assert "train pipeline" in str(error), error
-    else:
-        raise AssertionError("a train pipeline was accepted")
-    finally:
-        row_wise_dist._dist.forward = original
-
-    # Evaluation sends no scores, so the fused path has nothing to lose.
-    sharded.eval()
-    row_wise_dist._dist.forward = KJTAllToAllForward(
-        pg=row_wise_dist._dist._pg,
-        splits=row_wise_dist._dist._splits,
-        stagger=row_wise_dist._dist._stagger,
-    )
-    try:
-        sharded.input_dist(sharded.create_context(), scored)
-    finally:
-        row_wise_dist._dist.forward = original
-        sharded.train()
-
-
-class _Stop(Exception):
-    """Raised by a spy once it has seen what it was called with."""
-
-
-def check_lookup_gets_scores(sharded, arrived) -> None:
-    """What the lookup hands to the tables' ``forward`` and ``prefetch``."""
-    (lookup,) = sharded._lookups
-    seen = {}
-
-    def spy(name):
-        def record(self, indices, offsets, scores=None, **_):
-            seen[name] = (indices, scores)
-            raise _Stop
-
-        return record
-
-    real = {name: getattr(BatchedDynamicEmbeddingTablesV2, name) for name in seen_names}
-    try:
-        for name in seen_names:
-            setattr(BatchedDynamicEmbeddingTablesV2, name, spy(name))
-            try:
-                getattr(lookup, name)(arrived)
-            except _Stop:
-                pass
-    finally:
-        for name, function in real.items():
-            setattr(BatchedDynamicEmbeddingTablesV2, name, function)
-
-    for name in seen_names:
-        assert name in seen, f"the lookup never called the tables' {name}"
-        indices, scores = seen[name]
-        assert scores is not None, name
-        # Every score is still beside its key (the default dist_type keeps a key
-        # global).
-        assert torch.equal(scores, indices * 10 + 1), name
+    for caching in [False, True]:
+        model, feature_names = _input_model(use_index_dedup=False, caching=caching)
+        ((_, _, sharded),) = find_sharded_modules(model, "")
+        device = torch.device(f"cuda:{torch.cuda.current_device()}")
+        fields, scores = _input_features(feature_names, device)
+        scored = ScoredKeyedJaggedTensor(scores=scores, **fields)
+        ctx = sharded.create_context()
+        request = sharded.input_dist(ctx, scored)
+        assert all(
+            not hasattr(input_dist, "_dist") for input_dist in sharded._input_dists
+        )
+        distributed = (
+            FusedKJTListSplitsAwaitable([request], [ctx], None).wait()[0].wait()
+        )
+        for lookup, arrived in zip(sharded._lookups, distributed):
+            for group in arrived.split(lookup._feature_splits):
+                state = group.prefetch_state
+                assert torch.equal(state.unique_scores, state.unique_keys * 10 + 1)
+            lookup.prefetch(arrived)
+        result = sharded.compute_and_output_dist(ctx, distributed).wait()
+        sum(jt.values().sum() for jt in result.values()).backward()
 
 
 # --- 2. scores in an EmbeddingCollection's tables ------------------------------
@@ -682,7 +625,7 @@ if __name__ == "__main__":
     check_eval_needs_no_scores(use_index_dedup=True)
     check_negative_score()
     check_external_storage_alone_is_refused()
-    check_train_pipeline_is_refused()
+    check_train_pipeline_keeps_scores()
     # Last: it ends in an exception while the model is being built.
     check_hybrid_storage_is_refused()
     check_pooled_scores()

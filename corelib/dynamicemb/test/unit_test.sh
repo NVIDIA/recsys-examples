@@ -20,6 +20,8 @@ FWD_BWD_TEST_FILES=(
     # fp32 Adagrad accumulator -- odd dims, checkpoint conversion, state
     # precision -- have not run in CI since.
     "test/unit_tests/optimizer/test_rowwise_adagrad_state_precision.py"
+    "test/unit_tests/test_input_dist_indices.sh"
+    "test/unit_tests/test_resolved_lifecycle.py"
     "test/unit_tests/test_no_eviction_row_indexing.py"
     "test/unit_tests/test_per_table_hbm_budget.py"
     "test/unit_tests/test_expansion_value_capacity.py"

@@ -153,12 +153,29 @@ Regarding how to use the DynamicEmb APIs and their parameters, please refer to t
 3. The allocated memory for dynamic embedding tables may differ slightly from the requested `num_embeddings`. Capacity is aligned through `bucket_capacity` rules in `DynamicEmbTableOptions` (`BUCKET_ALIGNMENT` = 16), and the planner writes the effective per-rank `max_capacity`.
 4. The lookup process for each dynamic embedding table incurs additional overhead from unique or radix sort operations. Therefore, if you request a large number of small dynamic embedding tables for lookup, the performance will be poor. Since the lookup range of dynamic embedding tables is particularly large (using the entire range of `int64_t`), it is recommended to create one large embedding table and perform a fused lookup for multiple features.
 5. Although dynamic embedding tables can be trained together with TorchREC tables, they cannot be fused together for embedding lookup. Therefore, it is recommended to select dynamic embedding tables for all model-parallel tables during training.
-6. DynamicEmb supports training with TorchREC's `EmbeddingBagCollection` (pooling mode: SUM/MEAN) and `EmbeddingCollection` (sequence mode). Both modes use fused CUDA kernels for embedding lookup and gradient reduction. Tables with different embedding dimensions are supported in pooling mode.
+6. DynamicEmb supports training with TorchREC's `EmbeddingBagCollection` (pooling mode: SUM/MEAN) and `EmbeddingCollection` (sequence mode). Both modes use TorchRec lookup with DynamicEmb's fused CUDA gradient reduction and optimizer updates. Tables with different embedding dimensions are supported in pooling mode.
 7. DynamicEmb supports exportable inference embedding collections with configurable indexing and NVE GPU, LinearUVM, or hierarchical storage. Data-backed indexer state is exported as a sidecar, while Redis-backed hierarchical collections use an ephemeral NVHashMap host cache and support incremental load.
 
    See the [verified example](./example/exportable_embedding/README.md).
 
 8. A table can take a score per key from the input (`DynamicEmbScoreStrategy.PRECISE_CUSTOMIZED`, with a `ScoredKeyedJaggedTensor` as input), for row-wise `EmbeddingCollection` and `EmbeddingBagCollection`. See "Per-key score" in [DynamicEmb_APIs.md](./DynamicEmb_APIs.md).
+
+### Resolved input distribution and TorchRec lookup
+
+The proposed [RFC](docs/input_dist_indices_design.md) moves key-to-row resolution to the receiver's second input-distribution wait, then reuses TorchRec's dense FBGEMM forward operators for supported aligned uniform FP32/FP16 layouts, with public `EmbeddingCollection` / `EmbeddingBagCollection` fallback for other supported layouts. The [acceptance report](docs/input_dist_acceptance.md) records code evidence, executable tests and outstanding gates for [#459](https://github.com/NVIDIA/recsys-examples/issues/459). The implementation remains a Draft; complete-issue acceptance and a throughput improvement are not claimed.
+
+Previously supported row-wise sequence and row-wise/table-row-wise pooled paths resolve HBM/cache rows or Host/Hybrid/PS-interface snapshots before compute. DynamicEmb retains admission, replacement-row and optimizer-state initialization, gradient reduction and its fused optimizer. Hash slots, physical value rows and compact workspace positions remain distinct. Eligible single-table HBM/cache sequence lookups bind the persistent matrix directly; other paths use a compact embedding workspace. Low-precision pooling accumulates in FP32. Native module setup preserves caller RNG and temporary weights stay outside checkpoints/external optimizers.
+
+Resolved inputs own their batch state explicitly. HBM/cache pin leases survive retained backward and release once on final backward, no-grad consumption or cancellation; release waits on the last CUDA use. Host/Hybrid/opaque PS snapshots publish embedding and optimizer updates to overlapping live batches through the existing Storage interface. The registry uses weak ownership and records queued-copy streams. The raw table forward and FIFO prefetch APIs remain available. Original output indices and optimizer/model tracker identities remain keys.
+
+Native SparseDist/prefetch pipelines keep the receiver callback outside split fusion. Hierarchical completion preserves #528 plans, status checks and output-window ownership; mapped window placement also maps backward gradients. The current main's #553 NVLink refusal/fallback rules are preserved. This host has PCIe GPUs, so native/auto fallback and supplied-result receiver tests do not certify supported-hardware NVLink/GIN execution. Actual network PS integration also remains deployment-specific.
+
+```bash
+python -m pytest test/unit_tests/test_input_dist_indices.py test/unit_tests/test_resolved_lifecycle.py -q -rs
+torchrun --standalone --nproc_per_node=2 -m pytest test/unit_tests/test_input_dist_indices.py -q -rs
+```
+
+See the [complete-main benchmark and CPU/CUDA profiling commands](benchmark/README.md#4-resolved-lookup-and-sparsedist-pipeline-ab). Current measurements show remaining adapter/split-fusion and active-snapshot overhead; fewer synchronization calls do not establish higher end-to-end throughput.
 
 ### DynamicEmb Insertion Behavior Checking Modes
 

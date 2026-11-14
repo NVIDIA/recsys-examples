@@ -987,3 +987,26 @@ once). So NVLink moves about 7 times as much per GPU as one NIC (50 GB/s).
 
 The hierarchical dist's output dist needs the plans its own input dist makes,
 so this benchmark times it in place (`--kernel_times`, `--trace`).
+
+## 4. Resolved lookup and SparseDist pipeline A/B
+
+`benchmark_resolved_lookup.py` measures raw-table sequence forward/training or an actual TorchRec SparseDist/prefetch pipeline with a dense MLP and SGD. Use `--lookup default` in both complete imported checkouts for a main/PR comparison. The default `--lookup both` changes only the lookup adapter to the prior CUDA gather; it is an adapter control, not a reproduction of main's input distribution.
+
+The [current review report](../docs/input_dist_acceptance.md#profiling-and-performance) contains the methodology, complete-main latency table, limitations and remaining acceptance gates. [input_dist_review_results.json](input_dist_review_results.json) records all current-main samples, source identities, environment details and CPU/CUDA profiler summaries. [resolved_lookup_results.json](resolved_lookup_results.json) is historical evidence against `476cdc01`, before #528/#550/#553; its earlier improvement percentages do not validate current main.
+
+Run in an installed compatible environment and check the emitted `dynamicemb_source` against the intended checkout. Rebuild the native extension and JIT fatbins for that checkout/ABI. Use identical hardware, CUDA/NCCL settings and dependency versions for both arms.
+
+```bash
+# HBM component comparison, including backward
+python benchmark/benchmark_resolved_lookup.py --lookup default --train --layout hbm --features 128 --warmup 20 --iterations 100 --trials 8 --profile-steps 5 --profile-dir /tmp/hbm-profile
+# Cache, Host and Hybrid; overlap depth is for raw training only
+python benchmark/benchmark_resolved_lookup.py --lookup default --train --layout host --prefetch-depth 2 --features 128 --warmup 20 --iterations 100 --trials 8 --profile-steps 5 --profile-dir /tmp/host-profile
+# Complete two-rank SparseDist training
+torchrun --standalone --nproc_per_node=2 benchmark/benchmark_resolved_lookup.py --lookup default --pipeline sparse --features 128 --warmup 20 --iterations 100 --trials 8 --profile-steps 5 --profile-dir /tmp/pipeline-profile
+```
+
+`--layout` accepts `hbm`, `cache`, `host`, `hybrid`. `--pipeline` accepts `none`, `sparse`, `prefetch`; `--train` enables raw-table backward. `--prefetch-depth` retains that many extra raw training batches, exercising active Storage snapshots; compare 0 and 2 before increasing depth. `--output-dist` accepts `torchrec`, `auto`, `hierarchical`, with `--output-capacity` for hierarchical planning. Explicit hierarchical measurements require the topology/build supported by current main; do not bypass its NVLink checks.
+
+Profile steps run outside the timed trials and export Chrome traces, CPU/CUDA operator aggregates, memcpy/synchronization/kernel counts, and allocator peak increments. Resident/peak allocator totals are emitted where collected; VMM and some NCCL allocations are outside that accounting. Five-call profiles include a terminal profiler synchronization. Timings exclude data loading and cold setup, include complete step/backward in training, and use the maximum rank time. This is a shared-host synthetic workload, not a production HSTU benchmark.
+
+The current PR is slower than current main in the recorded complete-training case, and Host/Hybrid overlap has substantial matching/publication overhead. No end-to-end speedup, network PS speedup or supported-hardware GIN performance claim is made. The single persistent-matrix path, empty live-registry fast path and identity persisted-row optimization reduce particular costs; judge their practical benefit from complete workload samples, not kernel counts alone.

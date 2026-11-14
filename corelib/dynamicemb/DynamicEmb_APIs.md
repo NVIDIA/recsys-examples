@@ -539,10 +539,10 @@ Rules:
   (VBE). Tables with a host/hybrid storage tier (`HybridStorage`) are not
   supported yet. Neither is an `external_storage` that is the only
   tier (no cache and no HBM for values); with a cache above it, it is fine.
-- **Training pipeline.** Not with TorchRec's `TrainPipelineSparseDist` or its
-  variants while training: they fuse the splits all2all of the keys, which has
-  no channel for scores, and the input dist raises `NotImplementedError`.
-  Evaluation sends no scores, so it is not affected.
+- **Training pipeline.** Supported with TorchRec's `TrainPipelineSparseDist`
+  and prefetch variant. DynamicEmb keeps its input all2all outside splits fusion
+  so per-key scores and resolved-row metadata are retained. Existing score-strategy
+  and storage restrictions listed above still apply.
 - **Repeated keys.** Within one batch -- including across ranks, and with
   `use_index_dedup` -- a key takes the **largest** score the batch gave it.
 - **Across batches.** The score is assigned on every hit, so the latest batch

@@ -49,6 +49,40 @@ from dynamicemb.dynamicemb_config import DynamicEmbScoreStrategy
 from dynamicemb.key_value_table import ERASE_CHUNK_SLOTS, ERASE_MAX_CHUNKS_IN_FLIGHT
 from torch import nn
 
+_table_cleanup = threading.local()
+
+
+def defer_table_cleanup(cleanup: Callable[[], None]) -> bool:
+    """Defer a GC cleanup until this thread holds no table gate/host lock."""
+    if not getattr(_table_cleanup, "depth", 0):
+        return False
+    _table_cleanup.pending.append(cleanup)
+    return True
+
+
+@contextlib.contextmanager
+def _table_cleanup_scope():
+    # A Python finalizer may run even during FairLock.acquire/release. It must
+    # not recursively acquire that non-reentrant lock. Drain after unlocking,
+    # on the same host thread, without adding background workers or GPU syncs.
+    if not hasattr(_table_cleanup, "pending"):
+        _table_cleanup.pending = collections.deque()
+    depth = getattr(_table_cleanup, "depth", 0)
+    _table_cleanup.depth = depth + 1
+    try:
+        yield
+    finally:
+        _table_cleanup.depth = depth
+        if depth == 0 and not getattr(_table_cleanup, "draining", False):
+            _table_cleanup.draining = True
+            try:
+                while _table_cleanup.pending:
+                    cleanup = _table_cleanup.pending.popleft()
+                    cleanup()
+                    del cleanup
+            finally:
+                _table_cleanup.draining = False
+
 
 class FairLock:
     """A lock that goes to the threads that wait for it in the order they came.
@@ -145,8 +179,8 @@ class TableAccessGate:
 
     @contextlib.contextmanager
     def __call__(self):
-        with self._lock:
-            stream = torch.cuda.current_stream()
+        with _table_cleanup_scope(), self._lock:
+            stream = torch.cuda.current_stream(torch.cuda.current_device())
             if self._last_access is not None:
                 stream.wait_event(self._last_access)
             try:
@@ -157,6 +191,12 @@ class TableAccessGate:
                 event = torch.cuda.Event()
                 event.record(stream)
                 self._last_access = event
+
+    @contextlib.contextmanager
+    def host_section(self):
+        """Serialize CPU reservation counters without adding a device fence."""
+        with _table_cleanup_scope(), self._lock:
+            yield
 
     def __reduce__(self):
         # A lock and an event belong to one process and one device; a copy of the
