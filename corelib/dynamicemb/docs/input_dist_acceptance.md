@@ -1,6 +1,6 @@
 # Issue #459 acceptance and code review evidence
 
-Review updated: 2026-11-14. Decision: **Needs Fixes / validation before merge; #459 is not accepted as complete.** See the [full RFC](input_dist_indices_design.md) for contracts and alternatives, and [current machine-readable evidence](../benchmark/input_dist_optimization_results.json) and [historical evidence](../benchmark/input_dist_review_results.json) for samples, source digests, log hashes and profiler summaries. This report distinguishes fixed reproducible defects, unverified deployment risks and design tradeoffs.
+Review updated: 2026-11-14. Decision: **Needs Fixes / validation before merge; #459 is not accepted as complete.** See the [full RFC](input_dist_indices_design.md) for contracts and alternatives, and [dense-lookup evidence](../benchmark/input_dist_dense_lookup_results.json), [preceding optimization evidence](../benchmark/input_dist_optimization_results.json) and [historical evidence](../benchmark/input_dist_review_results.json) for samples, source digests, log hashes and profiler summaries. This report distinguishes fixed reproducible defects, unverified deployment risks and design tradeoffs.
 
 ## Baselines and environment
 
@@ -29,7 +29,7 @@ All source paths below are relative to `corelib/dynamicemb`. The original-code n
 | Should-fix observability/optimizer integration, fixed | [Native grouped lookup observer](../dynamicemb/shard/rw_sharding.py#L154) passed the resolved KJT to registered optimizer/model tracker | Tracker received physical row IDs as keys; original PR fails the new test on TorchRec 1.5. Reconstruct original local key identities only for observers | `test_optimizer_tracker_observes_original_keys`; final positive on target TorchRec 1.8, explicit skip on 1.2 |
 | Should-fix failure cleanup, fixed | [Later kernel-group resolution](../dynamicemb/shard/rw_sharding.py#L241) raises after an earlier group took pins | Release states already prepared by that receiver operation. Completed backend mutation is not rolled back | `test_later_group_resolution_failure_releases_earlier_pins` |
 | Should-fix recovery, fixed; inherited cache logic | [Cache capacity rejection](../dynamicemb/batched_dynamicemb_function.py#L1051) incremented `_prefetch_outstanding_keys` before checking the limit | A real rejected third reservation left 12288 outstanding instead of 8192; releasing the two successful batches could not return the rejected reservation. Check before incrementing; no rollback API is introduced | L `test_rejected_cache_reservation_can_recover`, failed before the fix |
-| Outstanding performance / acceptance issue | Historical main8acc imported-checkout A/B, followed by the main85 measurements below | SparseDist training is 17.871 ms versus main 15.537 ms (+15.0%); opaque-storage overlap is substantially more expensive. The PR does not yet meet the user's requirement to preserve performance | The new publication/fusion optimizations reduce specific costs, but the main85 end-to-end regression remains; continue measured adapter optimization and representative validation |
+| Outstanding performance / acceptance issue | Historical main8acc imported-checkout A/B, followed by the main85 measurements below | SparseDist training is 17.871 ms versus main 15.537 ms (+15.0%); opaque-storage overlap is substantially more expensive. The PR does not yet meet the user's requirement to preserve performance | Publication/fusion and the dense adapter reduce specific costs; current main85 comparisons below still do not establish performance preservation |
 
 The lease/gate cancellation and output-copy defects were found while implementing the integration, and repaired before publication. They are not misrepresented as behaviors of original #551, which did not contain #528. The generic Storage snapshot path already had weak ownership and full-key matching; this review did not invent a new backend API or replace it with an unproven concurrency mechanism.
 
@@ -40,7 +40,7 @@ Run commands from `corelib/dynamicemb` in an installed compatible build. `U` bel
 | #459 condition and observable acceptance criterion | Main code location | Executable test | Environment / result / remaining scope |
 | --- | --- | --- | --- |
 | 1. Resolution has finished before lookup; first compute performs no hash/backend key lookup | `shard/input_dist.py`, `shard/rw_sharding.py`, `batched_dynamicemb_compute_kernel.py` | U `test_input_dist_resolves_before_lookup` | P/T one/two GPUs; all six layouts, dedup flags, int32/int64, stream transition and fused-awaitable wrapper; passed |
-| 2. Lookup reuses native TorchRec operations with correct indices | `torchrec_lookup.py`, `shard/resolved_input.py` | U `test_pooled_lookup_and_update_match_unsharded_torchrec`; L `test_single_persistent_matrix_uses_physical_rows` | Compact and single persistent matrix paths; SGD/Adam and FP32/FP16/BF16 direct path passed |
+| 2. Lookup reuses native TorchRec operations with correct indices | `dense_lookup.py`, `torchrec_lookup.py`, `shard/resolved_input.py` | U `test_pooled_lookup_and_update_match_unsharded_torchrec`; L `test_single_persistent_matrix_uses_physical_rows`; `test_dense_lookup.py` | P/T compact and persistent matrices, SGD/Adam; aligned FP32/FP16 native and BF16/odd/mixed/fractional-stride EC/EBC fallback passed; direct TorchRec dense-kernel comparison passed |
 | 3. Evicted physical rows initialize embedding and moments for the new key | `_prefetch_hbm_direct_path`, `_prefetch_cache_path` in `batched_dynamicemb_function.py` | U `test_eviction_reinitializes_reused_value_rows_and_adam_state` | Real GPU eviction with an assertion that row reuse actually occurred; passed; not an artificial slot-number-only test |
 | 4. Rehash does not invalidate value-row identity or ref-counter release | `refresh_slots_after_rehash`, `_PinnedRowLease` | U `test_expansion_and_out_of_order_batches`; existing `test_no_grad_release_after_rehash_by_a_later_prefetch` | Passed; full table suite also exercises expansion and non-evicting row capacity |
 | 5. All backends preserve current values and optimizer state across overlapping input resolution and arbitrary backward order | `resolved_storage.py`, DEFAULT update/write-through in `batched_dynamicemb_function.py` | U `test_prefetched_batch_reads_updates_from_previous_batch`, `test_in_flight_batches_share_current_optimizer_state` | HBM/cache/host/hybrid/PyDict PS/cache+PS, SGD/Adam, both backward orders and dropped input owners; passed |
@@ -65,7 +65,45 @@ Run commands from `corelib/dynamicemb` in an installed compatible build. `U` bel
 | 24. Complete current-main and implementation regression results are separate | Full table suite and source manifests | `python -m pytest test/test_batched_dynamic_embedding_tables_v2.py -q` | See final run ledger below; do not substitute historical 476 results |
 | 25. No unacceptable regression in complete training or backend overlap cost | `benchmark_resolved_lookup.py` | Commands below and profiler traces | Not satisfied: measured regression and missing production/NVLink workloads; optimization acceptance remains open |
 
-## 2026-11-14 optimization validation
+## Dense forward follow-up: current implementation and evidence
+
+Code: `361fe13a2432d458135a9ff5aaa9a83b62eb98ca`; production Python SHA-256 `6cf177ccde3e6416c7eb7ab284a2bc606c9db6931bd86f20d5b65822f3f7d44b`. No C++/optimizer-format change. The [dedicated evidence](../benchmark/input_dist_dense_lookup_results.json) contains the matching runtime/extension manifests, current test hashes, failed/negative controls and all 40 timed processes. Existing evidence below remains bounded by its earlier source.
+
+`dynamicemb/dense_lookup.py` now calls the same FBGEMM CUDA forward primitives as TorchRec dense lookup for uniform aligned FP32/FP16 matrices. Physical rows and compact rows share one flat-view contract; integer row-stride scaling excludes optimizer columns and final padding. The selector in `torchrec_lookup.py` retains public EC/EBC for BF16 storage, odd/mixed widths and fractional strides. Both dependency stacks produced numerically matching NONE/SUM/MEAN outputs and identical kernel names to TorchRec's own dense module; both reject BF16 dense storage. Output dtype, FP32 pooling accumulation and DynamicEmb backward/state ownership are tested separately. Generated operator schemas remain a dependency-version contract to validate on upgrades.
+
+| Actual run / command family | Source / environment | Result and boundary |
+| --- | --- | --- |
+| Full `test/test_batched_dynamic_embedding_tables_v2.py` | dense3 / T | 391 passed, 4 skipped, 351.23 s; existing process-group shutdown warning |
+| Receiver/lifecycle/dense/weighted/no-grad/native-copy focused matrix | dense3 / T | 646 passed, 8 skipped, 30.00 s; before adding six cancellation-sum test cases |
+| Corresponding older-stack focused matrix | dense3-primary / P | 645 passed, 9 skipped, 28.41 s; before those six test-only additions |
+| Final `torchrun --standalone --nproc_per_node=2 -m pytest` on U, L and `test_dense_lookup.py` | dense3 / T | 577 passed, 4 skipped per rank, 39.27 s |
+| Same final two-rank command | dense3-primary / P | 575 passed, 6 skipped per rank, 28.42 s |
+| Final `python -m pytest test/unit_tests/test_dense_lookup.py -q` | dense3 / T | 189 passed, 4.74 s |
+| Async erase and end-to-end erase | dense3 / T | 29 passed, 5.69 s |
+| Direct comparison with TorchRec dense module, standalone diagnostic | dense3 / T and P | NONE/SUM/MEAN numerics and kernel names match; BF16 storage refusal observed |
+
+The 189 adapter cases cover storage/output dtypes, aligned/odd/padded row layouts, nonzero storage offset, empty bags, weighted pooling, exact end-of-storage bounds, unchanged optimizer/padding columns and cross-stream metadata lifetime. Six half-input cancellation tests ensure a large intermediate sum accumulates before output conversion. The receiver matrix now checks both aligned native and mixed-D EC/EBC pooling against an independent unsharded TorchRec reference, including SGD/Adam updates. The two-device lifecycle regression invokes final backward with another CUDA device current and checks updates, pin release and restoration of the caller's current device.
+
+Removing metadata `record_stream` in an isolated negative runtime fails the queued-use/deletion regression. Removing the ready-event wait initially passed because first CUDA kernel loading concealed the race; warming the exact operator before delayed initialization makes that negative fail, while the unchanged normal implementation passes. The initial test-only `torch.full` size argument failure was corrected; neither that failure nor the passing unwarmed negative is advertised as production correctness evidence. The source manifest distinguishes those runtime copies from production. Black 23.9.1, isort 5.12.0, autoflake, Python AST, shell syntax and whitespace checks passed for this follow-up; repository-wide CI is not inferred.
+
+### Current performance: components improve, acceptance remains open
+
+Parameters and affinity match the earlier main85 measurements below. Each row uses sequential main/old/dense/dense/old/main process order, six 100-step trials per process, with five separately profiled calls. `old` is complete production `6297e55`; `dense` is complete production `361fe13`. No other local GPU validation overlapped timings. The machine still has external jobs; preserve every sample and process, including the reverse-order SparseDist control.
+
+| Workload / two process medians (ms) | main85 | old public adapter | dense adapter |
+| --- | --- | --- | --- |
+| HBM raw training | 1.740 / 1.761 | 2.803 / 2.584 | 2.394 / 2.207 |
+| Cache raw, depth 2 | 2.193 / 2.231 | 3.001 / 2.667 | 2.601 / 2.613 |
+| Host raw, depth 2 | 2.343 / 2.326 | 3.375 / 3.361 | 2.908 / 2.899 |
+| Hybrid raw, depth 2 | 2.851 / 2.593 | 3.976 / 3.378 | 3.511 / 3.217 |
+| Two-rank SparseDist + MLP/SGD | 16.090 / 15.706 | 17.262 / 17.169 | 18.606 / 18.718 |
+| Two-rank Prefetch SparseDist + MLP/SGD | 16.009 / 16.391 | 18.116 / 17.477 | 17.516 / 16.970 |
+
+The additional SparseDist dense/old/old/dense sequence measured 16.895 / 17.205 / 19.482 / 18.017 ms. It neither erases the slower first pair nor establishes a stable end-to-end gain. The raw HBM and Host pairs show lower adapter overhead than the preceding implementation, while all current comparisons still leave overhead relative to main. In a separate 100-call raw cProfile diagnostic, the adapter cumulative CPU time fell from about 58 ms (old) to 18 ms (dense2, before the final release/device-query reductions). That diagnostic attributes wrapper costs; it does not measure uninstrumented end-to-end speed.
+
+Five-call dense profiles retain kernel/sync counts HBM 150/11, Cache 170/16, Host 190/11 and Hybrid 250/36; pipelines are 595/71. Thus the adapter change does not itself reduce those counts. Host/Hybrid still enqueue ten full-row publication kernels across five calls at depth 2. Raw HBM peak allocator increment is 9,936,384 bytes; Host/Hybrid are 10,190,848 bytes, excluding VMM and some NCCL allocations. Copy/API counts, allocation readings and trace hashes are in the JSON. Earlier publication changes removed substantial compact-matching overhead; the new adapter mainly removes CPU KJT/module/parameter work and eligible low-precision conversions. None of these component facts establishes production throughput, NVLink performance or complete #459 acceptance.
+
+## 2026-11-14 preceding optimization validation
 
 Code commit: `6297e5578ba8e6337ce203f306effd2e4ccb4d28`. Final production Python manifest: `d184aeb4e0d7c556136c0c1509a9e5577a46129f93ad03f88ab10979806301b7`; before the final single-group concatenation elision it was `3451b6edb3776226f7851e4b7907cab23f66a6b4a482ab96127151f88959b493`. The initial receiver-fusion integration and storage fast paths were tested before the final native skip-missing copy change; the final runs below identify the extension revision separately. Formatting preserves the Python AST. `opt6`, `opt7` and `opt8` share this Python digest; `opt8` uses the final CUDA operation with a compile-time skip-missing option. Existing row-copy callers keep its default false setting.
 
@@ -129,7 +167,7 @@ Final run ledger is generated from the retained logs in the machine-readable evi
 
 The pre-#553 d53 hierarchical experiment ran the real extension on two PCIe GPUs and, after correcting the observer to reconstruct keys, matched forward, per-key gradients, table values, LFU/admission and eval in its cases. The old transport-only synchronization assertions were split from newly moved row-resolution work, with resolution syncs reported separately. A run excluding the isolated standalone timeout-teardown printed ALL PASSED, explicitly with that one stage skipped. The timeout-teardown hung on unmodified d53 main too. Latest main now refuses this PCIe topology. These observations are diagnostic evidence, not a supported-hardware hierarchical pass; current-main NVLink/GIN overflow, pipeline overlap, window reuse and teardown remain validation gates.
 
-## Current-main profiling and performance
+## Preceding main85 profiling and performance
 
 All figures below come from complete imported main85, merged-but-unoptimized `d1151e6` (before85), and optimized `6297e55` (opt9). The repeated-key inputs fit the warmed working set: 128 features, per-rank batch 32, hotness 4, D=64, FP32/SGD, 20 warmups and six trials of 100 steps per process. Five extra steps are profiled separately. Raw cases use GPU 1 / CPU affinity 4-7; two-rank pipelines use GPUs 1,2 / affinity 4-11. Cache depth 2 uses capacity 16384 (4096 cache rows), allowing three outstanding 1024-key batches under the existing reservation contract; other cases use capacity 4096. This is a small resident-input benchmark, not a production training claim.
 
