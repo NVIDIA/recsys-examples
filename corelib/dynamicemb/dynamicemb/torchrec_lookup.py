@@ -12,6 +12,7 @@ external optimizers.
 """
 
 from itertools import accumulate
+from weakref import ref
 
 import torch
 from torchrec import (
@@ -45,6 +46,23 @@ class TorchRecLookup:
         ]
         self._modules = {}
         self._dense_modules = {}
+        self._persistent = None
+
+    def persistent_weights(self, buffer):
+        """Borrow one stable value matrix without rebuilding its Tensor wrapper.
+
+        VMM growth preserves addresses but changes the logical shape. The
+        lookup owns only view metadata; the storage/pin lease owns the buffer.
+        A replacement buffer, even of the same shape, must get its own view.
+        """
+        entry = self._persistent
+        if entry is None or entry[0]() is not buffer or entry[1] != buffer.shape:
+            weights = buffer.tensor()
+            if weights.size(1) != self._dims[0]:
+                weights = weights[:, : self._dims[0]]
+            entry = (ref(buffer), buffer.shape, weights)
+            self._persistent = entry
+        return entry[2]
 
     def _dense_module(self, weighted):
         if weighted not in self._dense_modules:

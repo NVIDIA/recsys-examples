@@ -1427,10 +1427,7 @@ class DynamicEmbeddingFunction(torch.autograd.Function):
                 ):
                     # One persistent matrix already has TorchRec's row layout.
                     # Pins keep these rows alive; VMM growth preserves addresses.
-                    # Reacquire its current shape on every call after any growth.
-                    unique_embs = state.tables[0].tensor()
-                    if unique_embs.size(1) != max_emb_dim:
-                        unique_embs = unique_embs[:, :max_emb_dim]
+                    unique_embs = native_lookup.persistent_weights(state.tables[0])
                     lookup_indices = prefetch_state.occurrence_rows
                     if lookup_indices is None:
                         lookup_indices = prefetch_state.value_row_indices[

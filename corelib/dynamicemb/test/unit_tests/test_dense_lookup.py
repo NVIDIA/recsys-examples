@@ -3,6 +3,7 @@
 
 """TorchRec dense kernels and EC/EBC fallback share the same row contract."""
 
+import gc
 import weakref
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -12,7 +13,61 @@ import torch
 import torch.nn.functional as F
 from dynamicemb import DynamicEmbPoolingMode
 from dynamicemb.dense_lookup import DenseLookup
+from dynamicemb.extendable_tensor import DeviceExtendableBuffer
 from dynamicemb.torchrec_lookup import TorchRecLookup
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("padding", [0, 16, 1])
+def test_persistent_weight_view_tracks_growth_replacement_and_owner(dtype, padding):
+    dim, rows = 8, 4
+    device = torch.device("cuda", torch.cuda.current_device())
+    buffer = DeviceExtendableBuffer((rows, dim + padding), dtype, device)
+    lookup = TorchRecLookup([dim], [0], DynamicEmbPoolingMode.NONE, device)
+    indices = torch.tensor([1, 3, 1], device=device)
+    offsets = torch.tensor([0, 3], device=device)
+    batch = SimpleNamespace(reverse_indices=indices)
+    with torch.no_grad(), patch.object(buffer, "tensor", wraps=buffer.tensor) as read:
+        first = lookup.persistent_weights(buffer)
+        first.fill_(3)
+        first[:, 0] = 9
+        torch.testing.assert_close(
+            lookup(first, batch, offsets, torch.float32), first[indices].float()
+        )
+        assert lookup.persistent_weights(buffer) is first
+        assert read.call_count == 1
+        # CUDA optimizer writes must be visible through the cached view.
+        first.add_(2)
+        torch.testing.assert_close(
+            lookup(lookup.persistent_weights(buffer), batch, offsets, torch.float32),
+            first[indices].float(),
+        )
+        assert read.call_count == 1
+        buffer.extend((rows, dim + padding))
+        grown = lookup.persistent_weights(buffer)
+        assert read.call_count == 2 and grown.shape == (2 * rows, dim)
+        assert grown.data_ptr() == first.data_ptr()
+        grown[rows:].fill_(17)
+        batch.reverse_indices = torch.tensor([6, 1, 7], device=device)
+        torch.testing.assert_close(
+            lookup(grown, batch, offsets, torch.float32),
+            grown[batch.reverse_indices].float(),
+        )
+    del read
+    owner_ref = weakref.ref(buffer)
+    del buffer
+    gc.collect()
+    assert owner_ref() is None
+    # A same-shape replacement cannot reuse the former owner's borrowed view.
+    replacement = DeviceExtendableBuffer((2 * rows, dim + padding), dtype, device)
+    with torch.no_grad():
+        current = lookup.persistent_weights(replacement)
+        assert current is not grown
+        current.fill_(23)
+        torch.testing.assert_close(
+            lookup(current, batch, offsets, torch.float32),
+            torch.full((3, dim), 23.0, device=device),
+        )
 
 
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
