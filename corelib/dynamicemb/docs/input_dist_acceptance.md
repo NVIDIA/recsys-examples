@@ -1,10 +1,10 @@
 # Issue #459 acceptance and code review evidence
 
-Review date: 2026-11-13. Decision: **Needs Fixes / validation before merge; #459 is not accepted as complete.** See the [full RFC](input_dist_indices_design.md) for contracts and alternatives, and [machine-readable evidence](../benchmark/input_dist_review_results.json) for samples, source digests, log hashes and profiler summaries. This report distinguishes fixed reproducible defects, unverified deployment risks and design tradeoffs.
+Review updated: 2026-11-14. Decision: **Needs Fixes / validation before merge; #459 is not accepted as complete.** See the [full RFC](input_dist_indices_design.md) for contracts and alternatives, and [current machine-readable evidence](../benchmark/input_dist_optimization_results.json) and [historical evidence](../benchmark/input_dist_review_results.json) for samples, source digests, log hashes and profiler summaries. This report distinguishes fixed reproducible defects, unverified deployment risks and design tradeoffs.
 
 ## Baselines and environment
 
-The original PR was `7ef51667b75d9e498776ee9c4a29426828282d7c` on main `476cdc01`. Review incorporated #528 (`d53b9c8`), then #550/#553 through current main `8accb875333f82a9446877ec929f53ed42a283b7`. In particular, the #553 NVLink checks are preserved. The transport C++ sources did not change between d53 and 8acc; both compiled extensions were rebuilt from those current sources, rather than reusing the original PR's incompatible extension. Runtime snapshots pair production Python, the correct extension ABI and matching JIT fatbins; their SHA-256 manifests identify what tests imported.
+The original PR was `7ef51667b75d9e498776ee9c4a29426828282d7c` on main `476cdc01`. Review incorporated #528 (`d53b9c8`), then #550/#553 through `8accb875333f82a9446877ec929f53ed42a283b7`. The current integrated baseline is `85e628db7a6ac4d5f5f070d1e2d15d51eead0534` (merge `d1151e6`), including #555, #478 and #554. The README conflict retains both the TorchRec training description and upstream export documentation. Checkpoint-helper extraction/reexports and the corrected topology test are retained. In particular, the #553 NVLink checks are preserved. The transport C++ sources did not change between d53 and 8acc. New 85e628d training extensions were rebuilt for both ABIs; modified storage-publication code was compiled with those flags and linked with the matching baseline objects/fatbins. The optional NVE inference extension was disabled and is not validated. Incremental-build commands and modified-source hashes are recorded separately from Python manifests. Runtime snapshots pair production Python, the correct extension ABI and matching JIT fatbins; their SHA-256 manifests identify what tests imported.
 
 Hardware: four RTX PRO 6000 Blackwell Server Edition GPUs (SM120), driver 580.126.09, one shared Linux host. `nvidia-smi topo -m` reports PCIe NODE/SYS connections, no NVLink. Runs use GPU subsets and may contend with other jobs; they are not physical multi-node tests.
 
@@ -29,7 +29,7 @@ All source paths below are relative to `corelib/dynamicemb`. The original-code n
 | Should-fix observability/optimizer integration, fixed | [Native grouped lookup observer](../dynamicemb/shard/rw_sharding.py#L154) passed the resolved KJT to registered optimizer/model tracker | Tracker received physical row IDs as keys; original PR fails the new test on TorchRec 1.5. Reconstruct original local key identities only for observers | `test_optimizer_tracker_observes_original_keys`; final positive on target TorchRec 1.8, explicit skip on 1.2 |
 | Should-fix failure cleanup, fixed | [Later kernel-group resolution](../dynamicemb/shard/rw_sharding.py#L241) raises after an earlier group took pins | Release states already prepared by that receiver operation. Completed backend mutation is not rolled back | `test_later_group_resolution_failure_releases_earlier_pins` |
 | Should-fix recovery, fixed; inherited cache logic | [Cache capacity rejection](../dynamicemb/batched_dynamicemb_function.py#L1051) incremented `_prefetch_outstanding_keys` before checking the limit | A real rejected third reservation left 12288 outstanding instead of 8192; releasing the two successful batches could not return the rejected reservation. Check before incrementing; no rollback API is introduced | L `test_rejected_cache_reservation_can_recover`, failed before the fix |
-| Outstanding performance / acceptance issue | Current-main imported-checkout A/B with identical resident inputs and target stack | SparseDist training is 17.871 ms versus main 15.537 ms (+15.0%); opaque-storage overlap is substantially more expensive. The PR does not yet meet the user's requirement to preserve performance | Improve the measured bottlenecks or obtain an explicit maintainer decision on acceptable workload/overhead, then rerun the complete benchmark |
+| Outstanding performance / acceptance issue | Historical main8acc imported-checkout A/B, followed by the main85 measurements below | SparseDist training is 17.871 ms versus main 15.537 ms (+15.0%); opaque-storage overlap is substantially more expensive. The PR does not yet meet the user's requirement to preserve performance | The new publication/fusion optimizations reduce specific costs, but the main85 end-to-end regression remains; continue measured adapter optimization and representative validation |
 
 The lease/gate cancellation and output-copy defects were found while implementing the integration, and repaired before publication. They are not misrepresented as behaviors of original #551, which did not contain #528. The generic Storage snapshot path already had weak ownership and full-key matching; this review did not invent a new backend API or replace it with an unproven concurrency mechanism.
 
@@ -52,7 +52,7 @@ Run commands from `corelib/dynamicemb` in an installed compatible build. `U` bel
 | 11. Hierarchical overflow is checked before backend mutation and preserves later valid calls | `HierDist.finish`, `HierKJTAwaitable` | U `test_hier_receiver_completion_contract[True]`; `test_hier_overflow.py` | Receiver status-before-resolution passed with supplied GPU tensors; full supported-hardware overflow/next-call matrix not run on current main |
 | 12. Output windows and row maps route forward and gradients, including multiple groups and eval | `place_lookup_output`, `reduce_grads(grad_rows=...)`, `HierDist.rebind_input` | L allocator/shared-window tests; U hierarchical completion test | Real GPU window views/permutation, varied row gradients, all four local layouts and two groups passed; NVLink/GIN transport placement still needs CI |
 | 13. Native fallback, score fallback and topology refusal keep row preparation | `shard/rw_sharding.py`, #553 `HierDist.setup` | U `test_output_dist_selection_keeps_receiver_resolution`, `test_hierarchical_refuses_unlinked_topology_before_resolution`; `test_hier_pipeline.py --core` | Actual two-rank PCIe auto fallback and explicit hierarchical refusal passed; one-rank fallback passed; no forced topology override |
-| 14. Pipelined split fusion cannot drop callback/state or change collective ordering | `_key_dist` in RW/TW-RW input dists | U `test_native_sparse_dist_pipeline`, `test_native_pooled_pipeline`, fused-awaitable cases | Native SparseDist and prefetch pipelines passed on P/T; per-key scores preserved; fusion opt-out cost remains |
+| 14. Pipelined split fusion preserves per-request completion and collective ordering | `resolve_at_receive`, RW/TW-RW `_dist`; score/single-rank `_key_dist` | U `test_split_fusion_keeps_each_collections_receiver_state`, `test_native_sparse_dist_pipeline`, `test_native_pooled_pipeline` | T/P real two-collection split collective and native pipelines passed. Unscored multi-rank fusion enabled; separate score-channel completion retained |
 | 15. Original output indices and observer keys remain keys | sequence output context, `original_features`, tracker wrapper | U `test_input_dist_resolves_before_lookup`, `test_optimizer_tracker_observes_original_keys` | `need_indices=True` and target tracker passed; old TorchRec tracker is unavailable, not silently tested |
 | 16. Multiple kernel groups, mixed static/dynamic groups and feature processing retain their contracts | `_DynamicLookupMixin`, `ResolvedEmbeddingInput.split` | U mixed-group and `test_feature_processing_precedes_resolution_and_runs_once`, `test_feature_processor_preserves_no_grad_contract` | Passed; invalid learned pooling-weight gradient remains an explicit error |
 | 17. Cancellation/exception releases resources once without recycling metadata used on another stream | `_PinnedRowLease`, `TableAccessGate`, `PrefetchState.record_stream` | L cancellation/retained/gate tests; U storage cancellation and later-group failure | Actual CUDA delayed-copy/cancellation stress and GC passed; arbitrary concurrent host-thread forwards are not a supported claim |
@@ -65,7 +65,29 @@ Run commands from `corelib/dynamicemb` in an installed compatible build. `U` bel
 | 24. Complete current-main and implementation regression results are separate | Full table suite and source manifests | `python -m pytest test/test_batched_dynamic_embedding_tables_v2.py -q` | See final run ledger below; do not substitute historical 476 results |
 | 25. No unacceptable regression in complete training or backend overlap cost | `benchmark_resolved_lookup.py` | Commands below and profiler traces | Not satisfied: measured regression and missing production/NVLink workloads; optimization acceptance remains open |
 
-## Commands and run ledger
+## 2026-11-14 optimization validation
+
+Code commit: `6297e5578ba8e6337ce203f306effd2e4ccb4d28`. Final production Python manifest: `d184aeb4e0d7c556136c0c1509a9e5577a46129f93ad03f88ab10979806301b7`; before the final single-group concatenation elision it was `3451b6edb3776226f7851e4b7907cab23f66a6b4a482ab96127151f88959b493`. The initial receiver-fusion integration and storage fast paths were tested before the final native skip-missing copy change; the final runs below identify the extension revision separately. Formatting preserves the Python AST. `opt6`, `opt7` and `opt8` share this Python digest; `opt8` uses the final CUDA operation with a compile-time skip-missing option. Existing row-copy callers keep its default false setting.
+
+| Run / command | Environment / revision | Actual result |
+| --- | --- | --- |
+| Full unmodified main table suite | T / main85 | 391 passed, 4 skipped, 373.87 s |
+| Full PR table suite with final CUDA refinement, before single-group KJT alias change | T / opt8 | 391 passed, 4 skipped, 348.78 s |
+| Focused receiver/lifetime/weighted/no-grad plus native storage-row copy | T / opt8 | 427 passed, 6 skipped, 23.68 s |
+| Two-rank focused receiver plus native storage-row copy | T / opt8 | 323 passed, 4 skipped per rank, 32.33 s |
+| Same focused matrix with final CUDA refinement, before KJT alias change | P / opt8-primary | 426 passed, 7 skipped, 24.28 s |
+| Same two-rank matrix before final CUDA refinement | P / opt7-primary | 321 passed, 6 skipped per rank, 26.68 s |
+| Async erase and end-to-end erase | T / opt6 | 29 passed, 5.81 s |
+| TW-RW gradient / two emulated nodes | T / opt7 two ranks; opt8 four ranks | Passed: both tables moved by -0.05 and -0.025 respectively |
+| Checkpoint-file discovery / upstream helper extraction | T / opt8 | 8 passed, 3.97 s |
+| Final receiver/lifetime matrix after single-group KJT alias change | T / opt9 | 348 passed, 6 skipped, 24.35 s |
+| Final two-rank receiver matrix after KJT alias change | T / opt9; P / opt9-primary | 296/4 and 294/6 per rank, 29.10 s / 26.13 s |
+
+`test_storage_hits_skip_snapshot_matching_and_keep_optimizer_state` reads a real backing store after a retained Adam update, asserts that an all-hit read performs no live matching, and compares complete embedding/moment rows. `test_storage_row_copy_preserves_table_key_admission_and_moments` covers FP32/FP16/BF16, full uint64 identities, table isolation, source/target admission masks, and widths 7/64/1024/3072; the companion test covers empty tables and batches. The cross-stream cancellation test uses a delayed real GPU copy and a callable replacement that does not retain the source through mock call history.
+
+One standalone kernel-test attempt failed allocating its first six-key CUDA tensor (`out of memory`) before calling the new operation on shared GPU 0. A subsequent GPU 1 run passed all 27 cases. An intermediate cancellation-test failure was caused by `MagicMock` retaining the new helper's state arguments; replacing it with a plain delayed callable restored the test's intended ownership condition. These failed runs are retained as distinct evidence; neither was counted as a pass. Both main and PR full suites emit the existing process-group shutdown warning, recorded in their logs.
+
+## Commands and historical run ledger
 
 Use the installed ABI that matches the imported Python package. The local review used isolated runtime copies because the ignored extension in the source checkout belonged to the old pre-#528 ABI. Reproduction in a correctly rebuilt installation does not require that staging helper.
 
@@ -107,7 +129,32 @@ Final run ledger is generated from the retained logs in the machine-readable evi
 
 The pre-#553 d53 hierarchical experiment ran the real extension on two PCIe GPUs and, after correcting the observer to reconstruct keys, matched forward, per-key gradients, table values, LFU/admission and eval in its cases. The old transport-only synchronization assertions were split from newly moved row-resolution work, with resolution syncs reported separately. A run excluding the isolated standalone timeout-teardown printed ALL PASSED, explicitly with that one stage skipped. The timeout-teardown hung on unmodified d53 main too. Latest main now refuses this PCIe topology. These observations are diagnostic evidence, not a supported-hardware hierarchical pass; current-main NVLink/GIN overflow, pipeline overlap, window reuse and teardown remain validation gates.
 
-## Profiling and performance
+## Current-main profiling and performance
+
+All figures below come from complete imported main85, merged-but-unoptimized `d1151e6` (before85), and optimized `6297e55` (opt9). The repeated-key inputs fit the warmed working set: 128 features, per-rank batch 32, hotness 4, D=64, FP32/SGD, 20 warmups and six trials of 100 steps per process. Five extra steps are profiled separately. Raw cases use GPU 1 / CPU affinity 4-7; two-rank pipelines use GPUs 1,2 / affinity 4-11. Cache depth 2 uses capacity 16384 (4096 cache rows), allowing three outstanding 1024-key batches under the existing reservation contract; other cases use capacity 4096. This is a small resident-input benchmark, not a production training claim.
+
+| Workload / repeated process medians (ms) | main85 | before85 | optimized | Five-step kernels / host syncs, before -> optimized |
+| --- | --- | --- | --- | --- |
+| HBM raw, ABBA repeat | 1.775 / 1.774 | 2.729 initial series | 2.552 / 2.551 | 155/11 -> 150/11 |
+| Cache raw, depth 2, ABBA repeat | 2.195 / 2.204 | 7.086 initial, unstable series | 2.943 / 3.011 | 175/16 -> 170/16 |
+| Host raw, depth 2, main/before/after/after/before/main | 4.737 / 2.310 | 8.770 / 9.507 | 3.352 / 3.487 | 925/121 -> 190/11 |
+| Hybrid raw, depth 2, same order | 2.855 / 3.582 | 10.056 / 9.281 | 3.982 / 4.146 | 985/146 -> 250/36 |
+| Two-rank SparseDist + dense MLP/SGD | 15.640 | 17.459 | 17.626 | 600/56 -> 595/71 |
+| Two-rank Prefetch SparseDist + dense MLP/SGD | 15.993 | 17.370 | 17.582 | 600/56 -> 595/71 |
+
+Storage publication substantially reduces the previous overlap cost and removes its additional count synchronizations. It does not establish parity with main. The stable HBM repeats remain about 44% slower in this small raw case; SparseDist and Prefetch medians remain about 12.7% and 9.9% slower respectively. The public EC/EBC adapter and state/lifetime work remain costs to optimize. Restoring fusion recovers the native protocol, but this single-collection pipeline benchmark does not demonstrate a throughput gain from it. Multi-collection correctness was tested; multi-collection throughput was not measured.
+
+Keep the outliers: the initial HBM optimized process measured 4.766 ms, with five-step CUDA API CPU time 7723.8 us in memcpy and 5398.5 us in stream synchronization, versus 245.6/66.7 us in the initial main process. Later ABBA medians were 2.552/2.551 ms for the same optimized source. Host main process medians also vary materially. These observations justify separating scheduling/wait variability from fixed adapter overhead; they do not identify the external cause or warrant dropping samples. The first r1/r2 repeat series overlapped a local GPU regression and is excluded from performance conclusions. R3/r4 and storage R5/R6 ran without another local validation job; external jobs still share the machine. All samples, commands, trace hashes, API counts, selected operators, allocator readings and native publication-kernel counts are in `input_dist_optimization_results.json`.
+
+```bash
+python benchmark/benchmark_resolved_lookup.py --lookup default --layout host --train --prefetch-depth 2 --features 128 --capacity 4096 --warmup 20 --iterations 100 --trials 6 --profile-steps 5 --profile-dir /tmp/resolved-host
+# Execute this separately in each complete main/before/optimized installation.
+torchrun --standalone --nproc_per_node=2 benchmark/benchmark_resolved_lookup.py --lookup default --pipeline sparse --layout hbm --features 128 --capacity 4096 --warmup 20 --iterations 100 --trials 6 --profile-steps 5 --profile-dir /tmp/resolved-sparse
+```
+
+## Historical profiling and performance
+
+The table below is historical main-8acc evidence. It predates the latest-main merge, restored split fusion and fused storage publication, and must not be interpreted as a measurement of the optimized revision. Current-baseline measurements are recorded separately in the JSON; no throughput improvement over main has been established.
 
 Run the same command in complete main and PR installations, with identical GPU/dependency settings. `--lookup default` measures each installation's actual data flow; `--lookup both` is only an adapter A/B and must not be labeled a complete-main baseline.
 
@@ -140,11 +187,13 @@ For overlap, the added dynamic nonzero/matching/sorting/searchsorted and publish
 
 1. **Merge/complete-issue validation gate:** run current-main native/hierarchical receiver, overflow recovery, output-window and pipeline suites on supported NVLink GPUs and physical multi-node GIN. Do not bypass #553 to obtain a green local test.
 2. **Performance gate:** reduce native adapter/split-fusion overhead and bound active-snapshot matching cost under representative overlap, or have the maintainer explicitly accept the cost. The measured regressions violate the requested performance-preservation criterion.
-3. **Deployment risk, not a proved defect:** PyDict tests validate the Storage/PS interface and finite-store eviction behavior, not remote service errors, durability, latency or third-party asynchronous buffer ownership. Run the deployment's PS integration suite before making that deployment claim.
-4. **Design choices requiring review, not speculative bugs:** compact adaptation for general backends; an extra mapped output-window copy; the split-fusion opt-out; serialized backend event chain; private PyTorch retained-graph query; no new host-thread-reentrant model API. Their invariants, costs and alternatives are explicit in the RFC.
+3. **Deployment risk, not a proved defect:** PyDict tests validate the Storage/PS interface and finite-store eviction behavior, not remote service errors, durability, latency or third-party asynchronous buffer ownership. Run the deployment's PS integration suite before making that deployment claim. The registry is local and supplies no invalidation/coherence mechanism for independent external writers; no such multi-writer PS deployment was tested.
+4. **Design choices requiring review, not speculative bugs:** compact adaptation for general backends; an extra mapped output-window copy; the remaining score-channel score-channel fusion opt-out; serialized backend event chain; private PyTorch retained-graph query; no new host-thread-reentrant model API. Their invariants, costs and alternatives are explicit in the RFC.
 
 No outstanding functional defect was inferred merely from a missing experiment, and no full-repository CI pass is claimed. Historical or failed setup runs are kept distinguishable from successful final checks. This work updates existing RFC/PR bodies and commits only; it does not close any issue, change Draft state or publish GitHub comments.
 
 ## Static checks
 
-Changed Python files pass Black and isort with the repository profile. Root-config autoflake retains two unused assignments in the existing full-table test, also present on main; the changed production files have no new autoflake findings. Root-command mypy reports 199 errors in 53 files on both main 8acc and this branch, with no added normalized diagnostic messages. The root mypy configuration excludes corelib, so this is not a claim of type-checking DynamicEmb. Whitespace and new-document spelling checks pass. Full repository CI is not claimed.
+Changed Python files pass Black and isort with the repository profile. Root-config autoflake retains two unused assignments in the existing full-table test, also present on main; the changed production files have no new autoflake findings. Historical root-command mypy against 8acc reported 199 errors in 53 files on both main 8acc and this branch, with no added normalized diagnostic messages. The root mypy configuration excludes corelib, so this is not a claim of type-checking DynamicEmb. Whitespace and new-document spelling checks pass. Full repository CI is not claimed.
+
+Current-change checks: Black 23.9.1, isort 5.12.0 with the repository profile, autoflake, Python AST parsing, shell syntax and whitespace checks pass. The historical mypy comparison was not rerun against main85; corelib remains excluded by root configuration.
