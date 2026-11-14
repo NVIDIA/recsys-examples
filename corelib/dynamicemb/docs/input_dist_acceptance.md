@@ -1,6 +1,6 @@
 # Issue #459 acceptance and code review evidence
 
-Review updated: 2026-11-14. Decision: **Needs Fixes / validation before merge; #459 is not accepted as complete.** See the [full RFC](input_dist_indices_design.md) for contracts and alternatives, and [dense-lookup evidence](../benchmark/input_dist_dense_lookup_results.json), [preceding optimization evidence](../benchmark/input_dist_optimization_results.json) and [historical evidence](../benchmark/input_dist_review_results.json) for samples, source digests, log hashes and profiler summaries. This report distinguishes fixed reproducible defects, unverified deployment risks and design tradeoffs.
+Review updated: 2026-11-15. Decision: **Needs Fixes / validation before merge; #459 is not accepted as complete.** See the [full RFC](input_dist_indices_design.md) for contracts and alternatives, and [dense-lookup evidence](../benchmark/input_dist_dense_lookup_results.json), [preceding optimization evidence](../benchmark/input_dist_optimization_results.json) and [historical evidence](../benchmark/input_dist_review_results.json) for samples, source digests, log hashes and profiler summaries. This report distinguishes fixed reproducible defects, unverified deployment risks and design tradeoffs.
 
 ## Baselines and environment
 
@@ -30,8 +30,9 @@ All source paths below are relative to `corelib/dynamicemb`. The original-code n
 | Should-fix failure cleanup, fixed | [Later kernel-group resolution](../dynamicemb/shard/rw_sharding.py#L241) raises after an earlier group took pins | Release states already prepared by that receiver operation. Completed backend mutation is not rolled back | `test_later_group_resolution_failure_releases_earlier_pins` |
 | Should-fix recovery, fixed; inherited cache logic | [Cache capacity rejection](../dynamicemb/batched_dynamicemb_function.py#L1051) incremented `_prefetch_outstanding_keys` before checking the limit | A real rejected third reservation left 12288 outstanding instead of 8192; releasing the two successful batches could not return the rejected reservation. Check before incrementing; no rollback API is introduced | L `test_rejected_cache_reservation_can_recover`, failed before the fix |
 | Should-fix follow-up compatibility, fixed | New dense adapter initially selected pooled D>2048 in `torchrec_lookup.py` | FBGEMM 1.8 raises; FBGEMM 1.2 aborts the standalone width probe. Check the bound before dispatch and retain existing EBC behavior | `test_dense_lookup_and_fallback_match_reference`, D=2048/2052/4096, both dependency stacks |
+| Should-fix follow-up correctness, fixed | Eval's early return in [`BatchedDynamicEmbeddingTablesV2.forward`](../dynamicemb/batched_dynamicemb_tables.py#L1221) omitted the training path's consumer-stream registration. Prepare an explicit eval state on stream A, correctly finish its production, queue lookup on B, then drop state and reuse allocations on A | Real warmed allocator reuse overwrote all 256 output elements on HBM/cache/host/hybrid in both stacks. Register eval metadata before lookup. Native pipeline KJT registration already protected that call path; the defect concerns explicit raw-table state handoffs | L `test_eval_state_survives_drop_on_producer_stream`, including same-stream metadata replacement; no-fix and incomplete-cache negative controls fail |
 | Should-fix follow-up CPU lifetime, fixed | `resolve_at_receive` creates a KJT subclass per native request; inherited FX metaclass initialization strongly registers every class | Discarding 1000 requests and forcing GC still retained 1000 classes, about 3.25 MB traced Python memory. A local transport metaclass skips constructor registration while preserving inherited ABC creation; no FX global registry mutation | `test_request_local_receiver_types_are_collectible`; standalone 1000-request negative and positive controls on both dependency stacks |
-| Outstanding performance / acceptance issue | Current main85 imported-checkout comparisons below | Latest SparseDist medians are 18.272/16.608 ms versus main 15.773/15.605 ms; affinity-control results are recorded separately. The PR does not meet the user's performance-preservation requirement | Publication/fusion, dense lookup and event changes reduce specific costs; stable end-to-end parity remains unproven |
+| Outstanding performance / acceptance issue | Current main85 imported-checkout comparisons below | Latest retained matrix-view SparseDist medians are 20.413/21.143 ms versus main 20.360/19.920 ms; complete earlier/withdrawn series are recorded separately. The PR does not meet the user's performance-preservation requirement | Publication/fusion, dense lookup, event and borrowed-view changes reduce specific costs; stable end-to-end parity remains unproven |
 
 The lease/gate cancellation and output-copy defects were found while implementing the integration, and repaired before publication. They are not misrepresented as behaviors of original #551, which did not contain #528. The generic Storage snapshot path already had weak ownership and full-key matching; this review did not invent a new backend API or replace it with an unproven concurrency mechanism.
 
@@ -67,7 +68,48 @@ Run commands from `corelib/dynamicemb` in an installed compatible build. `U` bel
 | 24. Complete current-main and implementation regression results are separate | Full table suite and source manifests | `python -m pytest test/test_batched_dynamic_embedding_tables_v2.py -q` | See final run ledger below; do not substitute historical 476 results |
 | 25. No unacceptable regression in complete training or backend overlap cost | `benchmark_resolved_lookup.py` | Commands below and profiler traces | Not satisfied: measured regression and missing production/NVLink workloads; optimization acceptance remains open |
 
-## Bounded receiver-type reuse: latest implementation and evidence
+## Eval lifetime and borrowed matrix views: latest implementation and evidence
+
+The eval fix is `b779019`; persistent matrix-wrapper reuse is `b7a950d`. Final code `9f33797` withdraws the unhelpful registration-cache experiment and has production Python SHA-256 `d6ed2ad30f274b5c1569429331928c1f641903308ce57a86b9b7d7e2d028cea1`, byte-identical to the `matrix1` snapshot. All retain integrated main `85e628d` and the matching previously built extensions. The `metadata_reuse_followup` evidence separates production snapshots, test-source boundaries and all timing series. No C++ kernel, backend mutation protocol or optimizer changes in this follow-up.
+
+Evaluation now protects hidden state allocations when an explicit raw-table state crosses streams. A first short-delay diagnostic passed without exercising the race; after warming the exact lookup/allocator and checking that the consumer was still pending, value-buffer reuse corrupted all 256 output elements. Removing only the registration gives four failures on each stack. This is a confirmed defect in the preceding PR implementation; native pipeline KJT registration already protected its call path. The final test also replaces the value Tensor after an earlier stream registration: all eight layout/replacement cases pass with the simple registration loop.
+
+Persistent matrix views are borrowed under weak buffer identity and current logical shape. Real-buffer tests cover in-place updates, actual extension, a same-shape replacement and owner GC, for FP32/FP16/BF16 and row strides 8/24/9. Existing direct HBM/cache SGD/Adam tests also pass. Public buffer wrappers/version semantics remain unchanged. Removing the shape check causes nine failures; owning the buffer strongly causes nine lifecycle failures. Instrumented raw forward calls reduce per-call buffer-wrapper work from 38.98 us to 3.79 us for the cached-view access, and observe zero warmed `buffer.tensor()` calls in that path. This is component evidence, not an end-to-end speedup claim.
+
+A second candidate (`af28238`, `streams1`) used weak Tensor identities and the most recent stream to avoid repeated allocator registrations. It passed functional matrices and reduced five-step SparseDist `record_stream` calls from 120 to 90, Prefetch from 250 to 220. However, inclusive method CPU timing increased from 36.05/36.19 us to 44.24/44.37 us per call; complete-workload timing did not improve reliably. **That cache was removed in `9f33797`.** Its source, tests and all 18 timing processes remain labeled as a withdrawn experiment. Removing its identity checks caused eight control failures, including four actual corrupted eval outputs after same-shape Tensor replacement. These controls do not imply that this cache is in the final code.
+
+| Actual command / scope | T: target stack | P: older stack |
+| --- | --- | --- |
+| Final `matrix1` production, two-rank `pytest U L test_dense_lookup.py -q`, final test source | 709 passed / 4 skipped per rank, 46.73 s | Preceding same-production full matrix: 702 passed / 7 skipped per rank, 41.87 s; final eight-case eval extension separately passes below |
+| Final production full table suite | 391 passed / 4 skipped, 353.30 s; existing process-group shutdown warning | Not rerun; earlier full-suite evidence remains source-bounded |
+| Final eight-case eval lifetime/replacement test | Included in final full matrix | 8 passed / 56 deselected, 8.02 s |
+| Earlier same-production full matrix before added eval replacement parameter | 705 passed / 4 skipped per rank, 51.67 s | 702 passed / 7 skipped per rank, 41.87 s |
+| Eval-only four-layout positive / no-fix negative, preceding test revision | 4 passed / 4 expected failures | 4 passed / 4 expected failures |
+| Matrix growth / owner negative controls | 9 / 9 expected failures | Not repeated; positive matrix above |
+| Withdrawn registration-cache candidate full matrix | 713 passed / 4 skipped per rank; single-rank 707 / 10 | 710 passed / 7 skipped per rank |
+| Withdrawn identity-check negative, candidate test source | 8 expected failures | Not repeated |
+
+Two initial eval commands used relative test paths from the staged working directory and ran no tests (exit 4). Initial matrix-view test drafts had test-scaffolding failures: an instance patch introduced a bound-method cycle requiring GC, then a replacement reference had int64 instead of float32 dtype. Those failed runs are retained; production did not change during the test corrections. The withdrawn candidate's full table run was deliberately interrupted at 336 passed after rejecting its CPU cost; this partial run is not full-table acceptance. Skips, deselections and interruption are not passes.
+
+Complete unchanged installations use GPU1 for raw training and GPUs1,2 for pipelines; all workers bind CPUs before Torch import (rank0 CPUs4-7, rank1 CPUs36-39). CPUs/memory are not isolated. Resident inputs: 128 features, batch32, hotness4, D64/FP32/SGD, capacity4096, 20 warmups, six 100-step trials and five separate profiled calls. Each series uses main/before/current/current/before/main order. No other local GPU validation overlaps timing; external jobs share the host.
+
+| Final production series / two process medians (ms) | main85 | preceding `8efd951` | retained matrix-view implementation |
+| --- | --- | --- | --- |
+| Raw HBM SGD | 2.422 / 2.197 | 2.784 / 2.758 | 2.801 / 2.764 |
+| SparseDist + MLP/SGD | 20.360 / 19.920 | 21.538 / 21.421 | 20.413 / 21.143 |
+| Prefetch SparseDist + MLP/SGD | 18.567 / 18.571 | 18.358 / 17.878 | 16.955 / 19.067 |
+
+These samples do not establish stable parity or improvement over main. Five-call raw profiles remove five `aten::view` operations (10 -> 5); GPU kernel/sync counts remain 150/11. SparseDist stays 595/71 (main 590/71); Prefetch stays 595/71. Kernel count, host synchronization and full value-copy traffic are not reduced by a CPU wrapper cache. Profiler allocator/API readings, complete samples and trace hashes remain in the JSON.
+
+| Withdrawn registration-cache series / two process medians (ms) | main85 | retained matrix-view implementation | withdrawn cache |
+| --- | --- | --- | --- |
+| Raw HBM SGD | 1.880 / 1.760 | 2.320 / 2.335 | 2.328 / 2.326 |
+| SparseDist + MLP/SGD | 17.000 / 17.167 | 18.100 / 18.168 | 18.590 / 18.057 |
+| Prefetch SparseDist + MLP/SGD | 17.739 / 17.790 | 19.116 / 18.743 | 19.000 / 19.202 |
+
+Retain both series and every unfavorable sample. Their different host conditions preclude attributing cross-series differences to code. No stable end-to-end gain is claimed. **Performance preservation remains unmet; complete #459 acceptance, supported NVLink/physical multi-node GIN and deployment-specific remote PS validation remain open.** The PR remains Draft and no comments or issue closure are performed.
+
+## Preceding bounded receiver-type reuse and evidence
 
 Code `8efd951` (production Python SHA-256 `d6ef7ec8f598fcf5f53bcab948715cc8aa970c6d00367b06763ea1d2a09c9a6c`), based on `e778622`. Remote main remains `85e628d`. Only `shard/input_dist.py` changes in production; raw table, dense lookup, CUDA and optimizer code are unchanged. The `receiver_type_pool_followup` evidence retains exact Python manifest deltas, matching extension hashes, all 16 first-candidate processes, 12 final processes and 12 NUMA-control processes. The first classmethod/global-pool experiments are explicitly not the final implementation and are not silently dropped.
 
