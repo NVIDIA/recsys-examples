@@ -712,7 +712,7 @@ def test_lru_lfu_custom_score_function_batched_v2(current_device):
     ir = torch.empty(n, dtype=table.result_type, device=device).fill_(
         InsertResult.INIT.value
     )
-    idx = table.insert(keys, tids, _sa(ones), ir)
+    idx = table.insert(keys, tids, _sa(ones), ir)  # noqa: F841
 
     for i in range(n):
         reps = 1 + (i * 7) % 5

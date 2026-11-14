@@ -13,27 +13,41 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import importlib.util
 import os
 import re
+import shutil
 import subprocess
 import sys
 from pathlib import Path
 
-from setuptools import find_packages, setup
+import torch
+from setuptools import Extension, find_packages, setup
 from torch.utils.cpp_extension import CUDA_HOME, BuildExtension, CUDAExtension
 
-subprocess.run(
-    [
-        sys.executable,
-        "-m",
-        "pip",
-        "uninstall",
-        "-y",
-        "dynamicemb",
-        "--break-system-packages",
-    ]
-)
-subprocess.run(["pip", "install", "ordered-set", "--break-system-packages"])
+cpu_option = os.environ.get("DYNAMICEMB_CPU_ONLY", "0")
+if cpu_option not in {"0", "1"}:
+    raise ValueError("DYNAMICEMB_CPU_ONLY must be 0 or 1")
+CPU_ONLY = cpu_option == "1"
+BUILD_TRAINING = not CPU_ONLY
+if CPU_ONLY and torch.version.cuda is not None:
+    raise ValueError("DYNAMICEMB_CPU_ONLY requires CPU-only PyTorch")
+if not BUILD_TRAINING and os.environ.get("DYNAMICEMB_BUILD_INFERENCE") == "0":
+    raise ValueError("Inference-only builds require DYNAMICEMB_BUILD_INFERENCE=1")
+
+if BUILD_TRAINING:
+    subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "pip",
+            "uninstall",
+            "-y",
+            "dynamicemb",
+            "--break-system-packages",
+        ]
+    )
+    subprocess.run(["pip", "install", "ordered-set", "--break-system-packages"])
 
 # TODO: update when torchrec release compatible commit.
 compatible_versions = "1.2.0"
@@ -76,7 +90,8 @@ def find_source_files(
     return source_files
 
 
-check_torchrec_version()
+if BUILD_TRAINING:
+    check_torchrec_version()
 
 library_name = "dynamicemb"
 
@@ -207,6 +222,19 @@ def get_extensions():
         "lookup_torch_binding.cu",
         "get_table_range_torch_binding.cu",
         "expand_table_ids_torch_binding.cu",
+        "indexer_directory.cpp",
+        "indexer_snapshot.cpp",
+        "indexer_ops.cu",
+        "indexer_cpu.cpp",
+        "inference_emb_schemas.cpp",
+        "incremental_update.cpp",
+        "nve_runtime.cu",
+        "nve_tier_pybind.cu",
+        "exportable_embedding_pybind.cpp",
+        "indexer_directory_pybind.cpp",
+        "indexer_snapshot_pybind.cpp",
+        "update_subscriber_pybind.cu",
+        "update_subscriber_unavailable_pybind.cpp",
         # Built separately into standalone fatbins (Lex + custom LTO-IR),
         # shipped as package_data; NOT linked into the .so.
         "evict_lrulfu.cu",
@@ -325,6 +353,88 @@ def compile_evict_fatbins():
         print(f"[dynamicemb] {out_name}: {os.path.getsize(out)} bytes")
 
 
+def build_inference_extensions(build_lib, inplace):
+    """Reuse the CMake build and package its bindings with their local libraries."""
+    package_dir = root_path / library_name / "exportable_embedding"
+    destination = (
+        package_dir
+        if inplace
+        else Path(build_lib) / library_name / "exportable_embedding"
+    )
+    libraries = (
+        "_C.so",
+        "_C_legacy.so",
+        "inference_emb_ops.so",
+        "inference_emb_update.so",
+    )
+    destination.mkdir(parents=True, exist_ok=True)
+    if not inplace:
+        # build_py can have copied artifacts from an earlier, different build.
+        for name in libraries:
+            (destination / name).unlink(missing_ok=True)
+    nve_spec = importlib.util.find_spec("pynve")
+    enabled = os.environ.get(
+        "DYNAMICEMB_BUILD_INFERENCE", "1" if nve_spec or not BUILD_TRAINING else "0"
+    )
+    if enabled not in {"0", "1"}:
+        raise ValueError("DYNAMICEMB_BUILD_INFERENCE must be 0 or 1")
+    if enabled == "0":
+        print(
+            "[dynamicemb] inference bindings disabled; set DYNAMICEMB_BUILD_INFERENCE=1 to enable"
+        )
+        return
+    if nve_spec is None:
+        raise RuntimeError(
+            "Inference bindings require pynve; install NVE before building DynamicEmb"
+        )
+    import pynve
+
+    # Keep CPU builds separate from cached CUDA inference/training builds.
+    build_dir = root_path / (
+        "torch_binding_build_cpu" if CPU_ONLY else "torch_binding_build"
+    )
+    command = [
+        "cmake",
+        "-S",
+        str(root_path),
+        "-B",
+        str(build_dir),
+        f"-DPython3_EXECUTABLE={sys.executable}",
+        f"-DNVE_VERSION={pynve.__version__}",
+        f"-DNVE_LIB_DIR={os.environ.get('NVE_LIB_DIR', str(Path(pynve.__file__).parent))}",
+        "-DDYNAMICEMB_ENABLE_NVE_UPDATE=ON",
+        f"-DDYNAMICEMB_CPU_ONLY={'ON' if CPU_ONLY else 'OFF'}",
+        "-DDYNAMICEMB_BUILD_PYTHON=ON",
+    ]
+    module_dir = package_dir if BUILD_TRAINING else build_dir
+    if not BUILD_TRAINING:
+        command.append(f"-DDYNAMICEMB_PYTHON_MODULE_DIR={module_dir}")
+    for name in ("NVE_ROOT", "NVTX_INCLUDE_DIR", "CMAKE_CUDA_ARCHITECTURES"):
+        if name in os.environ:
+            command.append(f"-D{name}={os.environ[name]}")
+    # Preserve an explicit CMake configuration (including Docker's GPU targets).
+    if not BUILD_TRAINING or not (build_dir / "CMakeCache.txt").exists():
+        subprocess.run(command, check=True)
+    subprocess.run(
+        ["cmake", "--build", str(build_dir), "--parallel", os.environ["MAX_JOBS"]],
+        check=True,
+    )
+    sources = [
+        module_dir / "_C.so",
+        build_dir / "inference_emb_ops.so",
+    ]
+    if not CPU_ONLY:
+        sources.append(module_dir / "_C_legacy.so")
+    update_library = build_dir / "inference_emb_update.so"
+    if update_library.exists():
+        sources.append(update_library)
+    for source in sources:
+        target = destination / source.name
+        if source.resolve() != target.resolve():
+            shutil.copy2(source, target)
+        print(f"[dynamicemb] staged {source.name} -> {target}")
+
+
 class NinjaBuildExtension(BuildExtension):
     def __init__(self, *args, **kwargs) -> None:
         # do not override env MAX_JOBS if already exists
@@ -345,9 +455,15 @@ class NinjaBuildExtension(BuildExtension):
             max_jobs = max(1, min(max_num_jobs_cores, max_num_jobs_memory))
             os.environ["MAX_JOBS"] = str(max_jobs)
 
+        if not BUILD_TRAINING:
+            # CMake writes _C.so, without Python's ABI filename suffix.
+            kwargs["no_python_abi_suffix"] = True
         super().__init__(*args, **kwargs)
 
     def run(self):
+        if not BUILD_TRAINING:
+            build_inference_extensions(self.build_lib, self.inplace)
+            return
         start_time = time.time()
         compile_evict_fatbins()
         super().run()
@@ -356,14 +472,13 @@ class NinjaBuildExtension(BuildExtension):
         # wheel/install -- copy them in now. Inplace builds import straight from
         # the source tree and don't need this.
         if not self.inplace:
-            import shutil
-
             src_dir = root_path / library_name / "jit"
             dst_dir = os.path.join(self.build_lib, library_name, "jit")
             os.makedirs(dst_dir, exist_ok=True)
             for fb in sorted(src_dir.glob("*.fatbin")):
                 shutil.copy2(str(fb), dst_dir)
                 print(f"[dynamicemb] staged {fb.name} -> {dst_dir}")
+        build_inference_extensions(self.build_lib, self.inplace)
         end_time = time.time()
         compilation_time = end_time - start_time
         print(f"compilation_time: {compilation_time}")
@@ -379,8 +494,22 @@ setup(
     maintainer_email="zehuanw@nvidia.com",
     description="Plugin for Dynamic Embedding in TorchREC",
     packages=package,
-    ext_modules=get_extensions(),
-    package_data={f"{library_name}.jit": ["*.fatbin"]},
+    # Declare the CMake-built extension so inference-only wheels are platform
+    # specific and setuptools still invokes build_ext.
+    ext_modules=(
+        get_extensions()
+        if BUILD_TRAINING
+        else [Extension(f"{library_name}.exportable_embedding._C", sources=[])]
+    ),
+    options={} if BUILD_TRAINING else {"build": {"build_base": "build_cpu"}},
+    package_data={
+        f"{library_name}.jit": ["*.fatbin"] if BUILD_TRAINING else [],
+        f"{library_name}.exportable_embedding": [
+            "_C.so",
+            "_C_legacy.so",
+            "inference_emb*.so",
+        ],
+    },
     license="BSD-3",
     keywords=[
         "pytorch",

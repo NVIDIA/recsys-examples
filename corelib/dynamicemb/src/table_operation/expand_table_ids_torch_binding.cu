@@ -4,10 +4,6 @@
 
 #include "unique_op.h"
 
-TORCH_LIBRARY_FRAGMENT(INFERENCE_EMB, m) {
-    m.def("expand_table_ids(Tensor offsets, Tensor indices, Tensor? table_offsets_in_feature=None, int num_tables=0, int local_batch_size=1) -> Tensor");
-}
-
 namespace dyn_emb {
 
 // expand_table_ids_cuda (unique_op.cu) now only supports identity mapping
@@ -84,37 +80,9 @@ at::Tensor expand_table_ids_cuda_impl(
     return table_ids;
 }
 
-// at::Tensor expand_table_ids_cpu_impl(
-//     at::Tensor offsets, at::Tensor indices, c10::optional<at::Tensor> table_offsets_in_feature,
-//     int64_t num_tables, int64_t local_batch_size, int64_t num_elements) {
-//     TORCH_WARN_ONCE(
-//         "INFERENCE_EMB::expand_table_ids has no CPU kernel. "
-//         "Please move inputs to CUDA and load inference_emb_ops.so before calling this operator."
-//     );
-//     TORCH_CHECK(
-//         false,
-//         "INFERENCE_EMB::expand_table_ids is CUDA-only. Got CPU dispatch."
-//     );
-//     return at::Tensor();
-// }
-
-at::Tensor expand_table_ids_meta_impl(
-    at::Tensor offsets, at::Tensor indices, c10::optional<at::Tensor> table_offsets_in_feature,
-    int64_t num_tables, int64_t local_batch_size) {
-    return at::empty_like(indices, at::TensorOptions().dtype(at::kLong));
-}
-
 } // namespace dyn_emb
 
 TORCH_LIBRARY_IMPL(INFERENCE_EMB, CUDA, m) {
     m.impl("expand_table_ids", &dyn_emb::expand_table_ids_cuda_impl);
-}
-
-// TORCH_LIBRARY_IMPL(INFERENCE_EMB, CPU, m) {
-//     m.impl("expand_table_ids", &dyn_emb::expand_table_ids_cpu_impl);
-// }
-
-TORCH_LIBRARY_IMPL(INFERENCE_EMB, Meta, m) {
-    m.impl("expand_table_ids", &dyn_emb::expand_table_ids_meta_impl);
 }
 

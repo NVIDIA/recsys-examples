@@ -51,7 +51,7 @@ struct ForwardMultiToOneFMLayoutDesc {
   HOST_DEVICE_INLINE DstType *get_dst_ptr(int i) {
     const int f = layout.feature_of_input(i);
     const int b = layout.sample_of_input(i);
-    return dst_ptr + b * layout.total_D + layout.col_begin(f);
+    return dst_ptr + (int64_t)b * layout.total_D + layout.col_begin(f);
   }
 
   PoolingMode pooling_mode;

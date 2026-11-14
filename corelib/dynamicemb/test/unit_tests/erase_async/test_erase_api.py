@@ -26,9 +26,9 @@ import warnings
 import pytest
 import torch
 from dynamicemb import DynamicEmbScoreStrategy, erase_by_score_async
+from dynamicemb.async_erase import EraseHandle, EraseHandleGroup
 from dynamicemb.batched_dynamicemb_tables import StorageLayout
 from dynamicemb.key_value_table import ERASE_CHUNK_SLOTS, ERASE_MAX_CHUNKS_IN_FLIGHT
-from dynamicemb.async_erase import EraseHandle, EraseHandleGroup
 from helpers import DIM, build_de_table, size, train_step
 from torch import nn
 
@@ -256,7 +256,10 @@ def test_nothing_is_started_when_any_module_is_refused(device):
     train_step(scannable, list(range(1, 501)), device, score=5)
     with pytest.raises(NotImplementedError, match="GPU hash table"):
         erase_by_score_async(
-            nn.ModuleList([scannable, host_only]), S.CUSTOMIZED, 100, torch.cuda.Stream()
+            nn.ModuleList([scannable, host_only]),
+            S.CUSTOMIZED,
+            100,
+            torch.cuda.Stream(),
         )
     assert scannable._eraser._executor is None
     assert size(scannable) == 500
@@ -282,7 +285,10 @@ def test_the_model_call_erases_from_every_module_that_has_the_strategy(device):
     # One type for the caller; the group is what a model with several modules returns.
     assert isinstance(handle, EraseHandle) and isinstance(handle, EraseHandleGroup)
     handle.wait_stream()
-    assert handle.result() == (1000, 0)  # the first module's thousand; the second scored 20
+    assert handle.result() == (
+        1000,
+        0,
+    )  # the first module's thousand; the second scored 20
     assert handle.done()
     assert [size(module) for module in scored] == [0, 1000]
     assert size(unscored) == 1000
