@@ -78,6 +78,52 @@ def test_the_kernels_of_a_section_run_after_those_of_the_section_before(device):
     assert run(gate)
 
 
+@pytest.mark.parametrize("fail_section", [False, True])
+def test_queued_handoffs_preserve_order_after_repeated_records(device, fail_section):
+    gate = TableAccessGate()
+    streams = [torch.cuda.Stream() for _ in range(3)]
+    value = torch.zeros(4096, device=device)
+    torch.cuda.synchronize()
+    expected = 0
+    for i, which in enumerate((0, 0, 1, 2, 2, 0, 1, 0)):
+        expected = expected * 2 + i
+        try:
+            with torch.cuda.stream(streams[which]), gate():
+                torch.cuda._sleep(SLEEP_CYCLES // 10)
+                value.mul_(2).add_(i)
+                if fail_section and i == 3:
+                    raise RuntimeError("section failed after launch")
+        except RuntimeError as error:
+            assert fail_section and i == 3
+            assert str(error) == "section failed after launch"
+    torch.cuda.synchronize()
+    torch.testing.assert_close(value, torch.full_like(value, expected), rtol=0, atol=0)
+
+
+def test_gate_handoffs_can_change_cuda_device(device):
+    if torch.cuda.device_count() < 2:
+        pytest.skip("Requires two visible CUDA devices")
+    first = torch.cuda.current_device()
+    other = (first + 1) % torch.cuda.device_count()
+    gate = TableAccessGate()
+    source = torch.cuda.Stream(device=first)
+    target = torch.cuda.Stream(device=other)
+    x = torch.zeros(4096, device=device)
+    y = torch.zeros(4096, device=torch.device("cuda", other))
+    torch.cuda.synchronize(first)
+    torch.cuda.synchronize(other)
+    with torch.cuda.stream(source), gate():
+        torch.cuda._sleep(SLEEP_CYCLES)
+        x.fill_(1)
+    with torch.cuda.stream(target), gate():
+        y.fill_(2)
+    with torch.cuda.stream(source), gate():
+        x.add_(1)
+    source.synchronize()
+    torch.testing.assert_close(x, torch.full_like(x, 2), rtol=0, atol=0)
+    torch.testing.assert_close(y, torch.full_like(y, 2), rtol=0, atol=0)
+
+
 def test_the_lock_is_held_for_the_whole_section():
     gate = TableAccessGate()
     inside, release, order = threading.Event(), threading.Event(), []

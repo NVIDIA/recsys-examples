@@ -176,21 +176,28 @@ class TableAccessGate:
     def __init__(self) -> None:
         self._lock = FairLock()
         self._last_access: Optional[torch.cuda.Event] = None
+        self._last_stream: Optional[torch.cuda.Stream] = None
 
     @contextlib.contextmanager
     def __call__(self):
         with _table_cleanup_scope(), self._lock:
             stream = torch.cuda.current_stream(torch.cuda.current_device())
-            if self._last_access is not None:
-                stream.wait_event(self._last_access)
+            event = self._last_access
+            if event is not None and stream != self._last_stream:
+                stream.wait_event(event)
             try:
                 yield
             finally:
                 # Also after a failure: whatever was launched is still on the
                 # stream, and the next holder has to come after it.
-                event = torch.cuda.Event()
+                # A queued wait captures the event's current record. Reusing
+                # it cannot change earlier waits, and same-stream work is
+                # already ordered. Events can only be recorded on one device.
+                if event is None or self._last_stream.device != stream.device:
+                    event = torch.cuda.Event()
                 event.record(stream)
                 self._last_access = event
+                self._last_stream = stream
 
     @contextlib.contextmanager
     def host_section(self):

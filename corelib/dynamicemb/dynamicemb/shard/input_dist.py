@@ -220,6 +220,14 @@ class _ResolveOnce:
         return self._resolved
 
 
+class _ReceiverInputMeta(type(KeyedJaggedTensor)):
+    def __init__(cls, name, bases, attrs):
+        # ABC initialization still runs in the inherited __new__. These
+        # request-local transport types are never FX constructor targets:
+        # registering each one globally would retain one class per batch.
+        type.__init__(cls, name, bases, attrs)
+
+
 def resolve_at_receive(features, postprocessor):
     """Carry resolution through TorchRec's public KJT ``dist_init`` hook.
 
@@ -231,7 +239,7 @@ def resolve_at_receive(features, postprocessor):
     resolver = _ResolveOnce(postprocessor)
     resolver_ref = weakref.ref(resolver)
 
-    class ReceiverInput(KeyedJaggedTensor):
+    class ReceiverInput(KeyedJaggedTensor, metaclass=_ReceiverInputMeta):
         @staticmethod
         def dist_init(*args, **kwargs):
             resolve = resolver_ref()

@@ -504,6 +504,22 @@ def test_live_row_matching_keeps_table_and_full_key_identity(dtype):
     assert source.numel() == 4
 
 
+def test_request_local_receiver_types_are_collectible():
+    from dynamicemb.shard.input_dist import resolve_at_receive
+
+    features = KeyedJaggedTensor(
+        keys=["f"], values=torch.tensor([7]), lengths=torch.tensor([1])
+    )
+    types = []
+    for _ in range(32):
+        source = resolve_at_receive(features, lambda received: received)
+        assert isinstance(source, KeyedJaggedTensor)
+        types.append(weakref.ref(type(source)))
+    del source
+    gc.collect()
+    assert all(ref() is None for ref in types)
+
+
 def test_globally_empty_input():
     model = make_model(dedup=True)
     features = batch(count=0)
