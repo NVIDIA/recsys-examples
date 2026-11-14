@@ -8,8 +8,10 @@
         test/unit_tests/test_input_dist_indices.py -q
 """
 
+import copy
 import gc
 import os
+import pickle
 import sys
 import tempfile
 import weakref
@@ -518,6 +520,132 @@ def test_request_local_receiver_types_are_collectible():
     del source
     gc.collect()
     assert all(ref() is None for ref in types)
+
+
+def _finish_receiver(source, value):
+    return type(source).dist_init(
+        keys=["f"],
+        tensors=[torch.tensor([1]), torch.tensor([value])],
+        variable_stride_per_key=False,
+        num_workers=1,
+        recat=None,
+        stride_per_rank=[1],
+    )
+
+
+def test_receiver_type_pool_keeps_live_requests_independent():
+    from dynamicemb.shard.input_dist import _ReceiverTypePool, resolve_at_receive
+
+    features = KeyedJaggedTensor(
+        keys=["f"], values=torch.tensor([7]), lengths=torch.tensor([1])
+    )
+    pool = _ReceiverTypePool()
+    first = resolve_at_receive(features, lambda received: received, pool)
+    second = resolve_at_receive(features, lambda received: received, pool)
+    first_type = type(first)
+    assert first_type is not type(second)
+    second_result = _finish_receiver(second, 20)
+    first_result = _finish_receiver(first, 10)
+    assert _finish_receiver(first, 999) is first_result
+    del first
+    gc.collect()
+    third = resolve_at_receive(features, lambda received: received, pool)
+    assert type(third) is first_type
+    third_result = _finish_receiver(third, 30)
+    assert _finish_receiver(second, 999) is second_result
+    for result, expected in [
+        (first_result, 10),
+        (second_result, 20),
+        (third_result, 30),
+    ]:
+        torch.testing.assert_close(result.values(), torch.tensor([expected]))
+
+
+def test_receiver_type_pool_bounds_idle_types_without_retaining_requests():
+    from dynamicemb.shard.input_dist import _ReceiverTypePool, resolve_at_receive
+
+    features = KeyedJaggedTensor(
+        keys=["f"], values=torch.tensor([7]), lengths=torch.tensor([1])
+    )
+    pool = _ReceiverTypePool()
+    requests = [
+        resolve_at_receive(features, lambda received: received, pool)
+        for _ in range(128)
+    ]
+    types = [weakref.ref(type(request)) for request in requests]
+    resolvers = [weakref.ref(request._receiver_resolver) for request in requests]
+    results = [
+        weakref.ref(_finish_receiver(request, i)) for i, request in enumerate(requests)
+    ]
+    del requests
+    gc.collect()
+    assert all(ref() is None for ref in resolvers)
+    assert all(ref() is None for ref in results)
+    retained = {ref() for ref in types if ref() is not None}
+    assert 0 < len(retained) <= 8
+
+
+@pytest.mark.parametrize("copy_kind", ["deepcopy", "pickle"])
+def test_receiver_type_pool_copy_has_independent_request_owners(copy_kind):
+    from dynamicemb.shard.input_dist import _ReceiverTypePool, resolve_at_receive
+
+    features = KeyedJaggedTensor(
+        keys=["f"], values=torch.tensor([7]), lengths=torch.tensor([1])
+    )
+    pool = _ReceiverTypePool()
+    warm = resolve_at_receive(features, lambda received: received, pool)
+    del warm
+    gc.collect()
+    other = (
+        copy.deepcopy(pool)
+        if copy_kind == "deepcopy"
+        else pickle.loads(pickle.dumps(pool))
+    )
+    first = resolve_at_receive(features, lambda received: received, pool)
+    second = resolve_at_receive(features, lambda received: received, other)
+    second_result = _finish_receiver(second, 20)
+    first_result = _finish_receiver(first, 10)
+    torch.testing.assert_close(first_result.values(), torch.tensor([10]))
+    torch.testing.assert_close(second_result.values(), torch.tensor([20]))
+
+
+@pytest.mark.parametrize("clear_inputs", [False, True])
+def test_native_receiver_type_stays_owned_until_awaitable_is_dropped(clear_inputs):
+    from dynamicemb.shard.input_dist import _ReceiverTypePool, resolve_at_receive
+    from torchrec.distributed.dist_data import KJTAllToAll, KJTAllToAllTensorsAwaitable
+
+    world = dist.get_world_size()
+    if world < 2:
+        pytest.skip("Requires native multi-rank tensors awaitables")
+    if clear_inputs and not hasattr(KJTAllToAllTensorsAwaitable, "clear_inputs"):
+        pytest.skip("TorchRec does not expose clear_inputs")
+    pool = _ReceiverTypePool()
+
+    def source(offset):
+        features = KeyedJaggedTensor(
+            keys=[f"f{i}" for i in range(world)],
+            values=torch.arange(world, device="cuda") + 100 * dist.get_rank() + offset,
+            lengths=torch.ones(world, device="cuda", dtype=torch.int64),
+        )
+        return resolve_at_receive(features, lambda received: received, pool)
+
+    distribution = KJTAllToAll(dist.group.WORLD, [1] * world)
+    first, second = source(0), source(10000)
+    first_type = type(first)
+    first_request = distribution(first).wait()
+    second_request = distribution(second).wait()
+    if clear_inputs:
+        first_request.clear_inputs()
+    del first
+    gc.collect()
+    third = source(20000)
+    assert type(third) is not first_type
+    second_result = second_request.wait()
+    first_result = first_request.wait()
+    assert first_request.wait() is first_result
+    expected = torch.arange(world, device="cuda") * 100 + dist.get_rank()
+    torch.testing.assert_close(first_result.values(), expected)
+    torch.testing.assert_close(second_result.values(), expected + 10000)
 
 
 def test_globally_empty_input():

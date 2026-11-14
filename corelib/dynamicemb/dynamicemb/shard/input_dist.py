@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import weakref
+from collections import deque
 from typing import Callable, List, Optional, Tuple
 
 import torch
@@ -228,27 +229,67 @@ class _ReceiverInputMeta(type(KeyedJaggedTensor)):
         type.__init__(cls, name, bases, attrs)
 
 
-def resolve_at_receive(features, postprocessor):
-    """Carry resolution through TorchRec's public KJT ``dist_init`` hook.
-
-    Native split fusion reconstructs its awaitables, but preserves their input
-    KJT type and calls that type's dist_init after receiving tensors. Each
-    request owns its resolver; the generated type holds only a weak reference
-    so cyclic type GC cannot retain the request's CUDA allocations or pins.
-    """
-    resolver = _ResolveOnce(postprocessor)
-    resolver_ref = weakref.ref(resolver)
+def _new_receiver_type():
+    resolver_slot = [None]
 
     class ReceiverInput(KeyedJaggedTensor, metaclass=_ReceiverInputMeta):
         @staticmethod
         def dist_init(*args, **kwargs):
-            resolve = resolver_ref()
+            ref = resolver_slot[0]
+            resolve = None if ref is None else ref()
             assert resolve is not None, "Receiver input must own its resolver"
             if resolve._resolved is None:
                 return resolve(KeyedJaggedTensor.dist_init(*args, **kwargs))
             return resolve._resolved
 
-    return _shallow_copy_as(ReceiverInput, features, _receiver_resolver=resolver)
+    return ReceiverInput, resolver_slot
+
+
+class _ReceiverTypePool:
+    """Bounded, distributor-local cache of types with no live request owner."""
+
+    def __init__(self):
+        self._free = deque(maxlen=8)
+
+    def take(self):
+        try:
+            return self._free.pop()
+        except IndexError:
+            return _new_receiver_type()
+
+    def put(self, entry):
+        self._free.append(entry)
+
+    def __reduce__(self):
+        # A copied distributor cannot share mutable receiver types with the
+        # original, including while its original requests remain in flight.
+        return (_ReceiverTypePool, ())
+
+
+def resolve_at_receive(features, postprocessor, type_pool=None):
+    """Carry resolution through TorchRec's public KJT ``dist_init`` hook.
+
+    Native split fusion reconstructs its awaitables, but preserves their input
+    KJT type and calls that type's dist_init after receiving tensors. Each
+    request owns its resolver; its type holds only a weak reference. A type can
+    be rebound only after that resolver dies: native/fused awaitables retain
+    their source KJT until they can no longer call its dist_init.
+    """
+    resolver = _ResolveOnce(postprocessor)
+    receiver_type, resolver_slot = (
+        type_pool.take() if type_pool is not None else _new_receiver_type()
+    )
+    if type_pool is None:
+        resolver_slot[0] = weakref.ref(resolver)
+    else:
+
+        def recycle(ref):
+            if resolver_slot[0] is ref:
+                resolver_slot[0] = None
+                type_pool.put((receiver_type, resolver_slot))
+
+        resolver_slot[0] = weakref.ref(resolver, recycle)
+    return _shallow_copy_as(receiver_type, features, _receiver_resolver=resolver)
 
 
 class _PostprocessedSplitsAwaitable(Awaitable[KJTAllToAllTensorsAwaitable]):
@@ -363,6 +404,7 @@ class RwSparseFeaturesDist(_RwSparseFeaturesDist):
         self._dist_type_codes: List[int] = [DIST_TYPE_CODES[t] for t in dist_types]
         self.hier = hier
         self._input_postprocessor = input_postprocessor
+        self._receiver_types = _ReceiverTypePool()
         self._resolve_via_dist_init = (
             input_postprocessor is not None and not per_key_score and pg.size() > 1
         )
@@ -394,7 +436,7 @@ class RwSparseFeaturesDist(_RwSparseFeaturesDist):
 
         if self._resolve_via_dist_init:
             bucketized_features = resolve_at_receive(
-                bucketized_features, self._input_postprocessor
+                bucketized_features, self._input_postprocessor, self._receiver_types
             )
         key_dist = (
             self._dist
