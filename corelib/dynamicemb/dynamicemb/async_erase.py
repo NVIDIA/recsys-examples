@@ -180,7 +180,7 @@ class TableAccessGate:
     @contextlib.contextmanager
     def __call__(self):
         with _table_cleanup_scope(), self._lock:
-            stream = torch.cuda.current_stream()
+            stream = torch.cuda.current_stream(torch.cuda.current_device())
             if self._last_access is not None:
                 stream.wait_event(self._last_access)
             try:

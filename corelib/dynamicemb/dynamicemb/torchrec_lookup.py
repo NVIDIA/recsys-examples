@@ -3,10 +3,10 @@
 
 """TorchRec lookup over the rows resolved by DynamicEmb.
 
-TorchRec owns gather/pooling; DynamicEmb keeps admission, storage and its fused
-optimizer. The weights address the current compact unique rows, with an fp32
-workspace for pooling, including initialized rejected rows. No hash table is
-accessed here. Keeping this adapter outside the
+TorchRec's dense kernels own aligned uniform gather/pooling, with EC/EBC for
+other layouts; DynamicEmb keeps admission, storage and its fused optimizer.
+Weights address resolved persistent or compact rows, including initialized
+rejected rows. No hash table is accessed here. Keeping this adapter outside the
 nn.Module tree also keeps these temporary weight views out of checkpoints and
 external optimizers.
 """
@@ -24,6 +24,7 @@ from torchrec import (
 )
 from torchrec.sparse.jagged_tensor import JaggedTensor
 
+from .dense_lookup import OUTPUT_TYPES, DenseLookup
 from .dynamicemb_config import DynamicEmbPoolingMode
 
 
@@ -43,6 +44,14 @@ class TorchRecLookup:
             f"feature_{i}" for i in range(len(self._feature_table_map))
         ]
         self._modules = {}
+        self._dense_modules = {}
+
+    def _dense_module(self, weighted):
+        if weighted not in self._dense_modules:
+            self._dense_modules[weighted] = DenseLookup(
+                self._dims[0], self._pooling_mode, weighted, self._device
+            )
+        return self._dense_modules[weighted]
 
     def _module(self, weighted):
         if weighted not in self._modules:
@@ -104,8 +113,31 @@ class TorchRecLookup:
         # Normally indices address the compact unique workspace. A single HBM
         # table/cache can instead bind its persistent buffer and physical rows.
         indices = batch.reverse_indices if indices is None else indices
-        module = self._module(pooling_weights is not None)
         pooled = self._pooling_mode != DynamicEmbPoolingMode.NONE
+        if (
+            self._uniform
+            and self._dims[0] % 4 == 0
+            and unique_embs.is_cuda
+            and unique_embs.dtype in (torch.float32, torch.float16)
+            and output_dtype in OUTPUT_TYPES
+            and unique_embs.stride(1) == 1
+            and unique_embs.stride(0) % self._dims[0] == 0
+        ):
+            # TorchRec's dense forward kernels support aligned FP32/FP16
+            # weights. BF16 storage, mixed/odd widths and fractional row strides
+            # retain EC/EBC below; never pack an entire persistent matrix.
+            values = self._dense_module(pooling_weights is not None).forward(
+                unique_embs, indices, offsets, output_dtype, pooling_weights
+            )
+            if pooled:
+                batch_size = (offsets.numel() - 1) // self._feature_num
+                values = (
+                    values.view(self._feature_num, batch_size, self._dims[0])
+                    .transpose(0, 1)
+                    .reshape(batch_size, self._feature_num * self._dims[0])
+                )
+            return values
+        module = self._module(pooling_weights is not None)
         # DynamicEmb accumulates pooling in fp32, independently of the stored
         # embedding and output dtypes. Native EmbeddingBag returns its weight
         # dtype and requires sample weights to have that same dtype. Promote

@@ -286,6 +286,25 @@ def test_retained_backward_cancelled_on_another_stream_waits_for_update(layout):
     torch.testing.assert_close(observed, expected, rtol=0, atol=0)
 
 
+@pytest.mark.parametrize("layout", ["hbm", "cache"])
+def test_final_backward_uses_forward_device_when_another_device_is_current(layout):
+    if torch.cuda.device_count() < 2:
+        pytest.skip("Requires two visible CUDA devices")
+    device = torch.cuda.current_device()
+    model, counter = make_model(DynamicEmbPoolingMode.NONE, layout)
+    keys, offsets = batch(0)
+    output = model(keys, offsets)
+    other = (device + 1) % torch.cuda.device_count()
+    with torch.cuda.device(other):
+        output.sum().backward()
+        assert torch.cuda.current_device() == other
+    torch.cuda.synchronize(device)
+    assert pins(counter) == 0
+    model.eval()
+    expected = (keys % 100000).float()[:, None].expand_as(output) - 0.25
+    torch.testing.assert_close(model(keys, offsets), expected, rtol=0, atol=0)
+
+
 def test_rejected_cache_reservation_can_recover():
     model, counter = make_model(DynamicEmbPoolingMode.NONE, "cache")
     capacity = model._cache._state.capacity

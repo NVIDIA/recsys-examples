@@ -15,6 +15,7 @@
 
 import sys
 import warnings
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from enum import Enum, auto
 from threading import RLock
@@ -270,18 +271,24 @@ class _PinnedRowLease:
                 if after_use and fixed_slots and self._reservation_returned
                 else self.table_gate
             )
-            with torch.cuda.device(self._device_index), table_section(gate):
+            # Autograd runs final backward on the forward's device/use stream.
+            # Abandoned ownership can be released from any device or thread.
+            device_guard = (
+                nullcontext() if after_use else torch.cuda.device(self._device_index)
+            )
+            with device_guard, table_section(gate):
                 stream = torch.cuda.current_stream(self._device_index)
                 # A completed backward enqueues the release on its own use
                 # stream. Cancellation still has to join the last use event.
                 if not after_use and self._last_use is not None:
                     stream.wait_event(self._last_use)
-                for tensor in (
-                    self.unique_keys,
-                    self.unique_table_ids,
-                    self.slot_indices,
-                ):
-                    tensor.record_stream(stream)
+                if not after_use:
+                    for tensor in (
+                        self.unique_keys,
+                        self.unique_table_ids,
+                        self.slot_indices,
+                    ):
+                        tensor.record_stream(stream)
                 refresh_slots_after_rehash(owner._state, self)
                 release_slot_pins(
                     self.cache,
@@ -294,7 +301,7 @@ class _PinnedRowLease:
                 self.released = True
 
     def __del__(self):
-        if sys.is_finalizing():
+        if self.released or sys.is_finalizing():
             return
         if not defer_table_cleanup(self._release_safely):
             self._release_safely()
@@ -1421,7 +1428,9 @@ class DynamicEmbeddingFunction(torch.autograd.Function):
                     # One persistent matrix already has TorchRec's row layout.
                     # Pins keep these rows alive; VMM growth preserves addresses.
                     # Reacquire its current shape on every call after any growth.
-                    unique_embs = state.tables[0].tensor()[:, :max_emb_dim]
+                    unique_embs = state.tables[0].tensor()
+                    if unique_embs.size(1) != max_emb_dim:
+                        unique_embs = unique_embs[:, :max_emb_dim]
                     lookup_indices = prefetch_state.occurrence_rows
                     if lookup_indices is None:
                         lookup_indices = prefetch_state.value_row_indices[
@@ -1461,7 +1470,9 @@ class DynamicEmbeddingFunction(torch.autograd.Function):
                 assert persisted_unique_indices is not None
                 # find() was asked for CopyMode.VALUE, so a row here is
                 # embedding ++ optimizer state; keep only the embedding.
-                unique_embs = unique_values[:, :max_emb_dim]
+                unique_embs = unique_values
+                if unique_embs.size(1) != max_emb_dim:
+                    unique_embs = unique_embs[:, :max_emb_dim]
 
             with table_section(prefetch_state.table_gate if not use_counter else None):
                 assert native_lookup is not None

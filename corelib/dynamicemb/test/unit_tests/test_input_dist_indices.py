@@ -361,10 +361,10 @@ def test_input_dist_resolves_before_lookup(dedup, dtype, fused, layout):
         )
         native_calls = []
         for table in tables(model):
-            native = table._native_lookup._module(False)
+            native = table._native_lookup._dense_module(False)
             native_calls.append(
                 checks.enter_context(
-                    patch.object(native, "forward", wraps=native.forward)
+                    patch.object(native, "_operation", wraps=native._operation)
                 )
             )
             checks.enter_context(
@@ -795,27 +795,28 @@ def test_pending_rows_survive_backing_store_eviction(layout):
     [(PoolingType.SUM, False), (PoolingType.MEAN, False), (PoolingType.SUM, True)],
 )
 @pytest.mark.parametrize("optimizer", [EmbOptimType.SGD, EmbOptimType.ADAM])
+@pytest.mark.parametrize("dims,native_dense", [((8, 8), True), ((7, 11), False)])
 def test_pooled_lookup_and_update_match_unsharded_torchrec(
-    layout, pooling, weighted, optimizer
+    layout, pooling, weighted, optimizer, dims, native_dense
 ):
     model = make_model(
         layout=layout,
         pooling=pooling,
         weighted=weighted,
-        dims=(7, 11),
+        dims=dims,
         optimizer=optimizer,
     )
     configs = [
         EmbeddingBagConfig(
             name="t0",
-            embedding_dim=7,
+            embedding_dim=dims[0],
             num_embeddings=128,
             feature_names=["f0", "f1"],
             pooling=pooling,
         ),
         EmbeddingBagConfig(
             name="t1",
-            embedding_dim=11,
+            embedding_dim=dims[1],
             num_embeddings=128,
             feature_names=["f2"],
             pooling=pooling,
@@ -855,10 +856,15 @@ def test_pooled_lookup_and_update_match_unsharded_torchrec(
         )
         native_calls = []
         for table in tables(model):
-            native = table._native_lookup._module(weighted)
+            native = (
+                table._native_lookup._dense_module(weighted)
+                if native_dense
+                else table._native_lookup._module(weighted)
+            )
+            method = "_operation" if native_dense else "forward"
             native_calls.append(
                 checks.enter_context(
-                    patch.object(native, "forward", wraps=native.forward)
+                    patch.object(native, method, wraps=getattr(native, method))
                 )
             )
             checks.enter_context(
