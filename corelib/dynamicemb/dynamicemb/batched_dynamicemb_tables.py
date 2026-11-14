@@ -1220,6 +1220,7 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
 
         if not self.training and (prefetch_state is None or prefetch_state.is_eval):
             state = prefetch_state or self.resolve_input(indices, offsets)
+            state.record_stream(torch.cuda.current_stream(self.device_id))
             with torch.no_grad():
                 output = self._native_lookup(
                     state.unique_values,

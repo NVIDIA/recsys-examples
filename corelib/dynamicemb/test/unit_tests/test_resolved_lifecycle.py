@@ -4,6 +4,7 @@
 """Receiver-state lifetime and output-window contracts, using real GPU tables."""
 
 import gc
+import weakref
 from dataclasses import replace
 from unittest.mock import patch
 
@@ -12,6 +13,64 @@ import torch
 from dynamicemb import DynamicEmbPoolingMode, EmbOptimType
 from dynamicemb.batched_dynamicemb_tables import BatchedDynamicEmbeddingTablesV2
 from test_no_grad_slot_lifetime import batch, check_values, make_model, pins
+
+
+@pytest.mark.parametrize("layout", ["hbm", "cache", "host", "hybrid"])
+def test_eval_state_survives_drop_on_producer_stream(layout):
+    model, _ = make_model(DynamicEmbPoolingMode.NONE, layout)
+    keys, offsets = batch(0)
+    model(keys, offsets).sum().backward()
+    model.eval()
+    source, consumer = torch.cuda.Stream(), torch.cuda.Stream()
+    torch.cuda.synchronize()
+    with torch.cuda.stream(source):
+        warm_state = model.resolve_input(keys, offsets)
+    source.synchronize()
+    with torch.cuda.stream(consumer):
+        warm_output = model(keys, offsets, prefetch_state=warm_state)
+    consumer.synchronize()
+    expected = warm_output.cpu()
+    shape, dtype = warm_state.unique_values.shape, warm_state.unique_values.dtype
+    del warm_state, warm_output
+
+    # Warm both the exact lookup and allocator pool. Lazy CUDA loading or a new
+    # cudaMalloc can synchronize the device and conceal missing registration.
+    with torch.cuda.stream(source):
+        warm_allocs = [
+            torch.full(shape, 7777, device=keys.device, dtype=dtype) for _ in range(64)
+        ]
+    source.synchronize()
+    del warm_allocs
+    with torch.cuda.stream(source):
+        state = model.resolve_input(keys, offsets)
+    source.synchronize()
+    # Keep index metadata alive to isolate value-buffer reuse and avoid unsafe
+    # indices in a failing implementation. The state itself must be collectible.
+    other_metadata = [
+        value
+        for name, value in vars(state).items()
+        if isinstance(value, torch.Tensor) and name != "unique_values"
+    ]
+    state_ref, values_ref = weakref.ref(state), weakref.ref(state.unique_values)
+    with torch.cuda.stream(consumer):
+        torch.cuda._sleep(1_000_000_000)
+        actual = model(keys, offsets, prefetch_state=state)
+        done = torch.cuda.Event()
+        done.record()
+    del state
+    assert state_ref() is None and values_ref() is None
+    pending = not done.query()
+    with torch.cuda.stream(source):
+        reuse = [
+            torch.full(shape, 7777, device=keys.device, dtype=dtype) for _ in range(64)
+        ]
+    source.synchronize()
+    overwritten_while_pending = not done.query()
+    consumer.synchronize()
+    if not pending or not overwritten_while_pending:
+        pytest.skip("consumer finished before allocator reuse could be exercised")
+    torch.testing.assert_close(actual.cpu(), expected, rtol=0, atol=0)
+    assert len(other_metadata) > 0 and len(reuse) == 64
 
 
 @pytest.mark.parametrize("layout", ["hbm", "cache"])
