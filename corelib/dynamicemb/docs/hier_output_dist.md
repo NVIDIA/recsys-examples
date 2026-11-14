@@ -3122,9 +3122,7 @@ takes whatever `LOCAL_WORLD_SIZE` says (with it halved, a sharding still
 builds its op, on the team's nodes); with the read made to go wrong, a size
 that differs on one rank, a size that does not divide the ranks and an
 error on one rank each raise the same `RuntimeError` on every rank, and a
-sharding then takes TorchRec's dists; with a size every rank reads that is
-not the team, the op's own communicator refuses the node, and every rank
-warns, giving the team's size, and takes TorchRec's dists. End to end,
+sharding then takes TorchRec's dists. End to end,
 `examples/hstu/test/test_hierarchical_dist.py` trains the HSTU ranking model
 on the hierarchical dist and on TorchRec's dists, under the example's
 JaggedMegatron pipelines, and compares them: the first step's loss and logits
