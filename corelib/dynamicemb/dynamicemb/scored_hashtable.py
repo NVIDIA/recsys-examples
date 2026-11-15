@@ -1012,10 +1012,8 @@ class LinearBucketTable(ScoredHashTable):
         table slot_indices[i] belongs to, so the kernel can map (table_id, slot)
         to the flat _ref_counter index.
 
-        The kernel uses non-atomic addition: the caller must ensure no two
-        (slot_indices[i], table_ids[i]) pairs in this call map to the same flat
-        index (e.g. slot_indices from unique_keys lookup), so no two threads
-        write the same counter element.
+        Updates are atomic across streams. Provide one (slot, table) pair per
+        unique key so each batch takes one pin, independently of occurrences.
 
         If value_rows and reverse_indices are supplied together, also return
         value_rows[reverse_indices] from the same kernel. Counter updates still
@@ -1062,10 +1060,8 @@ class LinearBucketTable(ScoredHashTable):
         table slot_indices[i] belongs to, so the kernel can map (table_id, slot)
         to the flat _ref_counter index.
 
-        The kernel uses non-atomic addition: the caller must ensure no two
-        (slot_indices[i], table_ids[i]) pairs in this call map to the same flat
-        index (e.g. slot_indices from unique_keys lookup), so no two threads
-        write the same counter element.
+        Updates are atomic across streams. Return each batch's unique pin once;
+        another stream may concurrently prepare or release the same keys.
         """
         self._check_has_ref_counter()
         table_update_counter_with_layout(

@@ -110,3 +110,57 @@ def test_counter_projection_validates_metadata_before_pinning(invalid):
             counter, slots, 1, torch.tensor([0, 1], device=device), 128, 128, 1, **args
         )
     assert torch.count_nonzero(counter).item() == 0
+
+
+@pytest.mark.parametrize("project_rows", [False, True])
+def test_counter_updates_on_different_streams_preserve_each_reference(project_rows):
+    # Use a larger grid rather than thousands of queued launches: the host
+    # launch queue must not fill and block before both streams reach the gate.
+    size, steps = 65536, 128
+    counter = torch.full((size,), steps, device="cuda", dtype=torch.int32)
+    slots = torch.arange(size, device="cuda")
+    offsets = torch.tensor([0, size // 128], device="cuda")
+    rows = torch.arange(size, device="cuda") * 13 + 7
+    reverse = torch.arange(2 * size, device="cuda") % size
+    operation = (
+        table_update_counter_and_project_rows
+        if project_rows
+        else table_update_counter_with_layout
+    )
+    projection = dict(value_rows=rows, reverse_indices=reverse) if project_rows else {}
+
+    def update(delta):
+        return operation(counter, slots, delta, offsets, 128, size, 1, **projection)
+
+    source, consumer, control = [torch.cuda.Stream() for _ in range(3)]
+    torch.cuda.synchronize()
+    # Warm the exact kernels and each stream's output allocation before adding
+    # the common start gate. Lazy loading/cudaMalloc can otherwise serialize it.
+    for stream in [source, consumer]:
+        with torch.cuda.stream(stream):
+            update(1)
+    with torch.cuda.stream(control):
+        torch.cuda._sleep(1)
+    torch.cuda.synchronize()
+    counter.fill_(steps)
+    torch.cuda.synchronize()
+    start = torch.cuda.Event()
+    with torch.cuda.stream(control):
+        torch.cuda._sleep(1_000_000_000)
+        start.record()
+    source.wait_event(start)
+    consumer.wait_event(start)
+    with torch.cuda.stream(source):
+        for _ in range(steps):
+            update(1)
+    with torch.cuda.stream(consumer):
+        for _ in range(steps):
+            update(-1)
+    queued_before_start = not start.query()
+    source.synchronize()
+    consumer.synchronize()
+    if not queued_before_start:
+        pytest.skip("could not queue both streams before the common start gate")
+    # The result is independent of scheduling/interleaving. Each call itself
+    # has unique slots, so uniqueness within a batch cannot prevent this race.
+    torch.testing.assert_close(counter, torch.full_like(counter, steps), rtol=0, atol=0)

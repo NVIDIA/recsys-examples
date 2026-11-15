@@ -408,6 +408,85 @@ def test_all_hit_sequence_projects_rows_with_unique_pins(optimizer, dtype):
     torch.testing.assert_close(*values, rtol=0, atol=0)
 
 
+def test_cache_backward_and_prefetch_keep_live_pins_across_streams():
+    template, _ = make_model(DynamicEmbPoolingMode.NONE, "cache")
+    model = BatchedDynamicEmbeddingTablesV2(
+        table_options=[
+            replace(
+                template._dynamicemb_options[0],
+                init_capacity=16384,
+                max_capacity=16384,
+                local_hbm_for_values=8192 * 8 * 4,
+            )
+        ],
+        table_names=["table"],
+        feature_table_map=[0],
+        pooling_mode=DynamicEmbPoolingMode.NONE,
+        output_dtype=torch.float32,
+        optimizer=EmbOptimType.SGD,
+        learning_rate=0.25,
+    )
+    count = 4096
+    keys = torch.arange(count, device="cuda")
+    offsets = torch.tensor([0, count], device="cuda")
+    gradients = torch.zeros((count, 8), device="cuda")
+    consumer, producer, control = (
+        torch.cuda.current_stream(),
+        torch.cuda.Stream(),
+        torch.cuda.Stream(),
+    )
+    cache = model._cache
+    counter = cache._state.key_index_map._ref_counter
+    model(keys, offsets).backward(gradients)
+    with torch.cuda.stream(control):
+        torch.cuda._sleep(1)
+    torch.cuda.synchronize()
+    gate = [None]
+    increment, decrement = type(cache).increment_counter, type(cache).decrement_counter
+
+    def wait_then_increment(owner, *args, **kwargs):
+        if owner is cache and gate[0] is not None:
+            torch.cuda.current_stream().wait_event(gate[0])
+        return increment(owner, *args, **kwargs)
+
+    def wait_then_decrement(owner, *args, **kwargs):
+        if owner is cache and gate[0] is not None:
+            torch.cuda.current_stream().wait_event(gate[0])
+        return decrement(owner, *args, **kwargs)
+
+    # Only align the real cache kernels; no counter/value result is mocked.
+    with patch.object(
+        type(cache), "increment_counter", new=wait_then_increment
+    ), patch.object(type(cache), "decrement_counter", new=wait_then_decrement):
+        for _ in range(3):
+            output = model(keys, offsets)
+            torch.cuda.synchronize()
+            assert pins(counter) == count
+            with torch.cuda.stream(control):
+                torch.cuda._sleep(1_000_000_000)
+                gate[0] = torch.cuda.Event()
+                gate[0].record()
+            output.backward(gradients)
+            with torch.cuda.stream(producer):
+                model.prefetch(keys, offsets, forward_stream=consumer)
+            producer.synchronize()
+            consumer.synchronize()
+            state = model._prefetch_states[0]
+            # The previous backward returned its pins; the queued batch owns
+            # exactly one per key, despite CPU-ordered calls using two streams.
+            torch.testing.assert_close(
+                counter[state.slot_indices],
+                torch.ones(count, device=keys.device, dtype=counter.dtype),
+                rtol=0,
+                atol=0,
+            )
+            assert pins(counter) == count
+            gate[0] = None
+            model(keys, offsets).backward(gradients)
+            torch.cuda.synchronize()
+            assert pins(counter) == 0
+
+
 @pytest.mark.parametrize("layout", ["hbm", "cache"])
 def test_retained_backward_cancelled_on_another_stream_waits_for_update(layout):
     model, counter = make_model(DynamicEmbPoolingMode.NONE, layout)

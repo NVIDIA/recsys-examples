@@ -24,9 +24,8 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 namespace dyn_emb {
 
 // Converts per-table slot_indices (and optional table_ids) to flat counter
-// index inside the kernel and adds delta. No atomic: caller guarantees no
-// two threads write the same counter element (e.g. slot_indices from unique
-// keys).
+// index inside the kernel and adds delta. Batches contain unique keys, but a
+// different stream can concurrently acquire or release pins for the same key.
 __global__ void update_counter_with_layout_kernel(
     int32_t *__restrict__ counter, int64_t total_capacity,
     int64_t const *__restrict__ slot_indices, int64_t n, int32_t delta,
@@ -68,7 +67,7 @@ __global__ void update_counter_with_layout_kernel(
     }
   }
   if (flat >= 0 && flat < total_capacity) {
-    counter[flat] += delta;
+    atomicAdd(counter + flat, delta);
   }
 }
 
