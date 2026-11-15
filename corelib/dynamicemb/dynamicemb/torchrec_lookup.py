@@ -15,6 +15,7 @@ from itertools import accumulate
 from weakref import ref
 
 import torch
+import torch.nn.functional as F
 from torchrec import (
     EmbeddingBagCollection,
     EmbeddingBagConfig,
@@ -132,6 +133,12 @@ class TorchRecLookup:
         # table/cache can instead bind its persistent buffer and physical rows.
         indices = batch.reverse_indices if indices is None else indices
         pooled = self._pooling_mode != DynamicEmbPoolingMode.NONE
+        if self._uniform and not pooled and unique_embs.dtype == output_dtype:
+            # EmbeddingCollection uses nn.Embedding's ATen primitive. With no
+            # output conversion it can read the row stride directly, avoiding
+            # flat-view metadata and an optimizer-stride index multiply. No
+            # synthetic KJT or weight rebinding is needed for this single matrix.
+            return F.embedding(indices, unique_embs)
         if (
             self._uniform
             and self._dims[0] % 4 == 0

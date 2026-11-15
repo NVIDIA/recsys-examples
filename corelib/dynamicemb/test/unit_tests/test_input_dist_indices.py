@@ -363,14 +363,13 @@ def test_input_dist_resolves_before_lookup(dedup, dtype, fused, layout):
                 side_effect=AssertionError("lookup hashed a key"),
             )
         )
-        native_calls = []
-        for table in tables(model):
-            native = table._native_lookup._dense_module(False)
-            native_calls.append(
-                checks.enter_context(
-                    patch.object(native, "_operation", wraps=native._operation)
-                )
+        native_call = checks.enter_context(
+            patch(
+                "dynamicemb.torchrec_lookup.F.embedding",
+                wraps=torch.nn.functional.embedding,
             )
+        )
+        for table in tables(model):
             checks.enter_context(
                 patch.object(
                     table.tables,
@@ -379,7 +378,7 @@ def test_input_dist_resolves_before_lookup(dedup, dtype, fused, layout):
                 )
             )
         result = output(model, ctx, arrived)
-        assert all(call.call_count == 1 for call in native_calls)
+        assert native_call.call_count == len(tables(model))
     check_debug(result, features)
     sum(jt.values().sum() for jt in result.values()).backward()
     for table in tables(model):
