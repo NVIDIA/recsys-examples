@@ -31,7 +31,9 @@ class ResolvedEmbeddingInput(KeyedJaggedTensor):
         cls, features: KeyedJaggedTensor, state: PrefetchState
     ) -> "ResolvedEmbeddingInput":
         assert state.value_row_indices is not None
-        rows = state.value_row_indices[state.reverse_indices]
+        rows = state.occurrence_rows
+        if rows is None:
+            rows = state.value_row_indices[state.reverse_indices]
         state.occurrence_rows = rows
         return _shallow_copy_as(
             cls,

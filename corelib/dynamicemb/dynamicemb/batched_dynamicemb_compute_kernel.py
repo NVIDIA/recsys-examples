@@ -337,6 +337,7 @@ class _ResolvedInputMixin:
                 else None
             ),
             scores=self._scores_of(features),
+            resolve_occurrence_rows=True,
         )
         return ResolvedEmbeddingInput.from_rows(features, state)
 

@@ -820,13 +820,16 @@ def _prefetch_hbm_direct_path(
     accumulated_frequency: Optional[torch.Tensor],
     admitter: Optional[MultiTableAdmitter],
     key_scores: Optional[torch.Tensor] = None,
-) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
+    reverse_indices: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor, Optional[torch.Tensor]]:
     """HBM-direct prefetch with counter protection.
 
     Only admitted keys are inserted.  Non-admitted keys get slot_indices = -1
     and their positions are returned for lazy initialization at forward time.
 
-    Returns ``(slot_indices, non_admitted_positions, value_row_indices)``. The
+    Returns ``(slot_indices, non_admitted_positions, value_row_indices,
+    occurrence_rows)``. The last is prepared only for an all-hit batch that
+    requests row projection. The
     two index spaces are kept apart because they only coincide by accident:
     ``slot_indices`` addresses the hash table (and the ref counter beside it),
     ``value_row_indices`` addresses the flat value buffer. A storage stores a
@@ -843,7 +846,7 @@ def _prefetch_hbm_direct_path(
 
         if h_num_total == 0:
             empty = torch.empty(0, dtype=torch.int64, device=device)
-            return empty, None, empty
+            return empty, None, empty, reverse_indices
 
         with torch.cuda.nvtx.range("op:storage_find"):
             (
@@ -869,6 +872,14 @@ def _prefetch_hbm_direct_path(
         # row is the slot). The ref counter is keyed by slot. Its kernel skips
         # the missing keys' slots (-1), so the found ones need no compaction
         # (nor its sync).
+        if h_num_missing == 0 and reverse_indices is not None:
+            occurrence_rows = state.key_index_map.increment_counter(
+                slot_indices,
+                unique_table_ids,
+                value_rows=indices,
+                reverse_indices=reverse_indices,
+            )
+            return slot_indices, None, indices, occurrence_rows
         storage.increment_counter(slot_indices, unique_table_ids)
 
         # Values are addressed by row, the counter by slot: a storage stores a row
@@ -876,7 +887,7 @@ def _prefetch_hbm_direct_path(
         rows = indices
 
         if h_num_missing == 0:
-            return slot_indices, None, rows
+            return slot_indices, None, rows, None
 
         # Determine admission for missing keys
         non_admitted_positions: Optional[torch.Tensor] = None
@@ -973,7 +984,7 @@ def _prefetch_hbm_direct_path(
             slot_indices[non_admitted_positions] = -1
             rows[non_admitted_positions] = -1
 
-        return slot_indices, non_admitted_positions, rows
+        return slot_indices, non_admitted_positions, rows, None
 
 
 def dynamicemb_prefetch(
@@ -993,6 +1004,7 @@ def dynamicemb_prefetch(
     table_gate: Optional[Callable[[], ContextManager]] = None,
     active_rows=None,
     optimizer=None,
+    resolve_occurrence_rows=False,
 ) -> PrefetchState:
     """Unified prefetch for all storage types (cache, HBM-direct, generic).
 
@@ -1057,6 +1069,7 @@ def dynamicemb_prefetch(
         slot_indices = None
         non_admitted_positions = None
         value_row_indices = None
+        occurrence_rows = None
         key_map_generation = 0
         unique_values = None
         persisted_unique_indices = None
@@ -1113,6 +1126,7 @@ def dynamicemb_prefetch(
                     slot_indices,
                     non_admitted_positions,
                     value_row_indices,
+                    occurrence_rows,
                 ) = _prefetch_hbm_direct_path(
                     storage,
                     unique_keys,
@@ -1124,6 +1138,9 @@ def dynamicemb_prefetch(
                     lfu_accumulated_frequency,
                     admitter,
                     key_scores=unique_scores,
+                    reverse_indices=reverse_indices
+                    if resolve_occurrence_rows
+                    else None,
                 )
                 key_map_generation = storage._state.key_map_generation
             else:
@@ -1153,6 +1170,11 @@ def dynamicemb_prefetch(
                     if persisted_unique_indices.numel() == unique_keys.numel()
                     else torch.arange(unique_keys.numel(), device=indices.device)
                 )
+                # DEFAULT snapshots retain the full unique-key row order,
+                # including rejected scratch rows. Their value-row map is
+                # identity, so occurrences already address it via reverse.
+                if resolve_occurrence_rows:
+                    occurrence_rows = reverse_indices
 
             result = PrefetchState(
                 unique_keys=unique_keys,
@@ -1168,6 +1190,7 @@ def dynamicemb_prefetch(
                 num_prefetched_keys=num_prefetched_keys,
                 outstanding_keys_ref=outstanding_keys_ref,
                 value_row_indices=value_row_indices,
+                occurrence_rows=occurrence_rows,
                 key_map_generation=key_map_generation,
                 unique_sizes=unique_size_per_table.tolist(),
                 unique_table_offsets=(

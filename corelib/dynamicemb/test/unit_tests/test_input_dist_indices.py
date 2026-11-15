@@ -339,6 +339,8 @@ def test_input_dist_resolves_before_lookup(dedup, dtype, fused, layout):
         groups = arrived[0].split(model._lookups[0]._feature_splits)
         for group in groups:
             state = group.prefetch_state
+            if layout in ["host", "hybrid", "ps"]:
+                assert group.values() is state.reverse_indices
             torch.testing.assert_close(
                 group.values(), state.value_row_indices[state.reverse_indices]
             )
@@ -488,6 +490,8 @@ def test_host_and_evaluation_resolve_rows():
             model.eval()
         ctx, arrived = distribute(model, features)
         assert isinstance(arrived[0], ResolvedEmbeddingInput)
+        for group in arrived[0].split(model._lookups[0]._feature_splits):
+            assert group.values() is group.prefetch_state.reverse_indices
         with torch.no_grad():
             check_debug(output(model, ctx, arrived), features)
 

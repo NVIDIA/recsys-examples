@@ -1355,6 +1355,7 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
         batch_size_per_feature_per_rank: Optional[List[List[int]]] = None,
         frequency_counters: Optional[Tensor] = None,
         scores: Optional[Tensor] = None,
+        resolve_occurrence_rows: bool = False,
     ) -> PrefetchState:
         """Prepare a batch without putting it in the legacy prefetch FIFO.
 
@@ -1362,6 +1363,8 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
         HBM/cache states pin stable value rows. Other stores resolve into live
         batch-local rows shared with overlapping in-flight batches. Evaluation
         resolves read-only rows. Every layout is consumed by TorchRec lookup.
+        Input distribution requests occurrence rows when it will construct a
+        resolved KJT; raw/FIFO callers need not retain that extra array.
         """
         self._check_scores(scores, indices)
         if indices.dtype != self.index_type:
@@ -1387,6 +1390,8 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                 self._table_gate,
             )
             state.input_frequencies = frequency_counters
+            if resolve_occurrence_rows:
+                state.occurrence_rows = state.reverse_indices
             return state
         # These checks used to precede prefetch in forward. Keep them before
         # input_dist can initialize rows or take pins as well.
@@ -1437,6 +1442,7 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
             table_gate=self._table_gate,
             active_rows=self._active_rows,
             optimizer=self._optimizer,
+            resolve_occurrence_rows=resolve_occurrence_rows,
         )
         self._update_score()
         state.input_frequencies = frequency_counters

@@ -19,6 +19,8 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 #include "kernels.cuh"
 #include "table.cuh"
 
+#include <algorithm>
+
 namespace dyn_emb {
 
 // Converts per-table slot_indices (and optional table_ids) to flat counter
@@ -31,8 +33,18 @@ __global__ void update_counter_with_layout_kernel(
     int64_t const *__restrict__ table_ids,
     int64_t const *__restrict__ table_bucket_offsets, int64_t bucket_capacity,
     int64_t main_capacity, int64_t const *__restrict__ overflow_output_offsets,
-    int64_t overflow_bucket_capacity, int64_t num_tables) {
+    int64_t overflow_bucket_capacity, int64_t num_tables,
+    int64_t const *__restrict__ value_rows,
+    int64_t const *__restrict__ reverse_indices,
+    int64_t *__restrict__ occurrence_rows, int64_t num_occurrences) {
   int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  // Row projection reads only the already resolved rows, independently of
+  // counter updates. Pin each unique key once, not once per occurrence.
+  if (i < num_occurrences) {
+    int64_t unique = reverse_indices[i];
+    CUDA_KERNEL_ASSERT(unique >= 0 && unique < n);
+    occurrence_rows[i] = value_rows[unique];
+  }
   if (i >= n)
     return;
   int64_t slot = slot_indices[i];
@@ -446,10 +458,34 @@ void table_update_counter_with_layout(
     int64_t main_capacity, int64_t num_tables,
     c10::optional<at::Tensor> table_ids,
     c10::optional<at::Tensor> overflow_output_offsets,
-    int64_t overflow_bucket_capacity) {
+    int64_t overflow_bucket_capacity,
+    c10::optional<at::Tensor> value_rows,
+    c10::optional<at::Tensor> reverse_indices,
+    c10::optional<at::Tensor> occurrence_rows) {
 
   int64_t n = slot_indices.size(0);
-  if (n == 0)
+  bool project_rows = occurrence_rows.has_value();
+  TORCH_CHECK(value_rows.has_value() == project_rows &&
+                  reverse_indices.has_value() == project_rows,
+              "value_rows, reverse_indices and occurrence_rows must be supplied together");
+  int64_t num_occurrences = 0;
+  if (project_rows) {
+    for (const auto &tensor : {*value_rows, *reverse_indices, *occurrence_rows}) {
+      TORCH_CHECK(tensor.is_cuda() && tensor.device() == counter.device() &&
+                      tensor.scalar_type() == at::kLong && tensor.dim() == 1 &&
+                      tensor.is_contiguous(),
+                  "row projection tensors must be contiguous int64 vectors on the counter device");
+    }
+    TORCH_CHECK(value_rows->numel() == n,
+                "value_rows must have one entry per unique slot");
+    num_occurrences = reverse_indices->numel();
+    TORCH_CHECK(occurrence_rows->numel() == num_occurrences,
+                "occurrence_rows must match reverse_indices");
+    TORCH_CHECK(n > 0 || num_occurrences == 0,
+                "cannot project occurrences without unique rows");
+  }
+  int64_t work = std::max(n, num_occurrences);
+  if (work == 0)
     return;
 
   int64_t total_capacity = counter.numel();
@@ -467,11 +503,15 @@ void table_update_counter_with_layout(
   auto stream = at::cuda::getCurrentCUDAStream().stream();
 
   constexpr int BLOCK_SIZE = 256;
-  update_counter_with_layout_kernel<<<(n + BLOCK_SIZE - 1) / BLOCK_SIZE,
+  update_counter_with_layout_kernel<<<(work + BLOCK_SIZE - 1) / BLOCK_SIZE,
                                       BLOCK_SIZE, 0, stream>>>(
       counter_ptr, total_capacity, slot_indices_ptr, n, delta, table_ids_ptr,
       table_bucket_offsets_ptr, bucket_capacity, main_capacity,
-      overflow_output_offsets_ptr, overflow_bucket_capacity, num_tables);
+      overflow_output_offsets_ptr, overflow_bucket_capacity, num_tables,
+      project_rows ? value_rows->data_ptr<int64_t>() : nullptr,
+      project_rows ? reverse_indices->data_ptr<int64_t>() : nullptr,
+      project_rows ? occurrence_rows->data_ptr<int64_t>() : nullptr,
+      num_occurrences);
 
   DEMB_CUDA_KERNEL_LAUNCH_CHECK();
 }

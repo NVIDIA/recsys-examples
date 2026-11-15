@@ -1000,7 +1000,10 @@ class LinearBucketTable(ScoredHashTable):
         self,
         slot_indices: torch.Tensor,
         table_ids: torch.Tensor,
-    ) -> None:
+        *,
+        value_rows: Optional[torch.Tensor] = None,
+        reverse_indices: Optional[torch.Tensor] = None,
+    ) -> Optional[torch.Tensor]:
         """Increment ref-counter at given per-table slot indices.
 
         table_ids: Must be provided and aligned with slot_indices (same length).
@@ -1012,8 +1015,23 @@ class LinearBucketTable(ScoredHashTable):
         (slot_indices[i], table_ids[i]) pairs in this call map to the same flat
         index (e.g. slot_indices from unique_keys lookup), so no two threads
         write the same counter element.
+
+        If value_rows and reverse_indices are supplied together, also return
+        value_rows[reverse_indices] from the same kernel. Counter updates still
+        run once per unique slot, independently of repeated occurrences.
         """
         self._check_has_ref_counter()
+        if (value_rows is None) != (reverse_indices is None):
+            raise ValueError("value_rows and reverse_indices must be supplied together")
+        projection = {}
+        occurrence_rows = None
+        if reverse_indices is not None:
+            occurrence_rows = torch.empty_like(reverse_indices)
+            projection = dict(
+                value_rows=value_rows,
+                reverse_indices=reverse_indices,
+                occurrence_rows=occurrence_rows,
+            )
         table_update_counter_with_layout(
             self._ref_counter,
             slot_indices,
@@ -1029,7 +1047,9 @@ class LinearBucketTable(ScoredHashTable):
             overflow_bucket_capacity=(
                 self.overflow_bucket_capacity_ if self.enable_overflow_ else 0
             ),
+            **projection,
         )
+        return occurrence_rows
 
     def decrement_counter(
         self,

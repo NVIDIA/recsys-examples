@@ -207,7 +207,10 @@ void bind_table_operation(py::module &m) {
         py::arg("main_capacity"), py::arg("num_tables"),
         py::arg("table_ids") = py::none(),
         py::arg("overflow_output_offsets") = py::none(),
-        py::arg("overflow_bucket_capacity") = 0);
+        py::arg("overflow_bucket_capacity") = 0,
+        py::arg("value_rows") = py::none(),
+        py::arg("reverse_indices") = py::none(),
+        py::arg("occurrence_rows") = py::none());
 
   m.def("table_resolve_rows", &dyn_emb::table_resolve_rows,
         "map table-relative hash slots to the value rows they own, "
