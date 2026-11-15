@@ -184,10 +184,17 @@ void table_update_counter_with_layout(
     int64_t main_capacity, int64_t num_tables,
     c10::optional<at::Tensor> table_ids,
     c10::optional<at::Tensor> overflow_output_offsets,
+    int64_t overflow_bucket_capacity);
+
+at::Tensor table_update_counter_and_project_rows(
+    at::Tensor counter, at::Tensor slot_indices, int32_t delta,
+    at::Tensor table_bucket_offsets, int64_t bucket_capacity,
+    int64_t main_capacity, int64_t num_tables,
+    c10::optional<at::Tensor> table_ids,
+    c10::optional<at::Tensor> overflow_output_offsets,
     int64_t overflow_bucket_capacity,
     c10::optional<at::Tensor> value_rows,
-    c10::optional<at::Tensor> reverse_indices,
-    c10::optional<at::Tensor> occurrence_rows);
+    c10::optional<at::Tensor> reverse_indices);
 
 // Resolve table-relative hash slots to the value rows they own, taking the
 // next row of the slot's table for a slot that has none yet when `allocate`;

@@ -5,7 +5,10 @@
 
 import pytest
 import torch
-from dynamicemb_extensions import table_update_counter_with_layout
+from dynamicemb_extensions import (
+    table_update_counter_and_project_rows,
+    table_update_counter_with_layout,
+)
 
 
 @pytest.mark.parametrize("num_tables", [1, 3])
@@ -69,18 +72,8 @@ def test_counter_row_projection_matches_separate_operations(
     )
     # The original call form still returns None and updates exactly these pins.
     assert table_update_counter_with_layout(expected, slots, delta, **layout) is None
-    occurrence_rows = torch.empty_like(reverse)
-    assert (
-        table_update_counter_with_layout(
-            actual,
-            slots,
-            delta,
-            **layout,
-            value_rows=rows,
-            reverse_indices=reverse,
-            occurrence_rows=occurrence_rows
-        )
-        is None
+    occurrence_rows = table_update_counter_and_project_rows(
+        actual, slots, delta, **layout, value_rows=rows, reverse_indices=reverse
     )
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
     torch.testing.assert_close(occurrence_rows, rows[reverse], rtol=0, atol=0)
@@ -89,7 +82,7 @@ def test_counter_row_projection_matches_separate_operations(
 
 @pytest.mark.parametrize(
     "invalid",
-    ["partial", "rows_size", "reverse_dtype", "strided", "output_size", "cpu_rows"],
+    ["partial", "rows_size", "reverse_dtype", "strided", "empty_unique", "cpu_rows"],
 )
 def test_counter_projection_validates_metadata_before_pinning(invalid):
     device = torch.device("cuda", torch.cuda.current_device())
@@ -98,22 +91,22 @@ def test_counter_projection_validates_metadata_before_pinning(invalid):
     args = dict(
         value_rows=torch.arange(4, device=device),
         reverse_indices=torch.tensor([3, 0], device=device),
-        occurrence_rows=torch.empty(2, device=device, dtype=torch.int64),
     )
     if invalid == "partial":
-        del args["occurrence_rows"]
+        del args["reverse_indices"]
     elif invalid == "rows_size":
         args["value_rows"] = args["value_rows"][:3]
     elif invalid == "reverse_dtype":
         args["reverse_indices"] = args["reverse_indices"].int()
     elif invalid == "strided":
         args["reverse_indices"] = torch.arange(4, device=device)[::2]
-    elif invalid == "output_size":
-        args["occurrence_rows"] = args["occurrence_rows"][:1]
+    elif invalid == "empty_unique":
+        slots = slots[:0]
+        args["value_rows"] = args["value_rows"][:0]
     else:
         args["value_rows"] = args["value_rows"].cpu()
     with pytest.raises(RuntimeError):
-        table_update_counter_with_layout(
+        table_update_counter_and_project_rows(
             counter, slots, 1, torch.tensor([0, 1], device=device), 128, 128, 1, **args
         )
     assert torch.count_nonzero(counter).item() == 0

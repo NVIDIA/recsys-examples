@@ -452,38 +452,17 @@ table_insert_and_evict(at::Tensor table_storage,
                          evicted_scores, evicted_table_ids);
 }
 
-void table_update_counter_with_layout(
-    at::Tensor counter, at::Tensor slot_indices, int32_t delta,
-    at::Tensor table_bucket_offsets, int64_t bucket_capacity,
+static void launch_counter_update(
+    const at::Tensor &counter, const at::Tensor &slot_indices, int32_t delta,
+    const at::Tensor &table_bucket_offsets, int64_t bucket_capacity,
     int64_t main_capacity, int64_t num_tables,
-    c10::optional<at::Tensor> table_ids,
-    c10::optional<at::Tensor> overflow_output_offsets,
-    int64_t overflow_bucket_capacity,
-    c10::optional<at::Tensor> value_rows,
-    c10::optional<at::Tensor> reverse_indices,
-    c10::optional<at::Tensor> occurrence_rows) {
+    const c10::optional<at::Tensor> &table_ids,
+    const c10::optional<at::Tensor> &overflow_output_offsets,
+    int64_t overflow_bucket_capacity, const int64_t *value_rows,
+    const int64_t *reverse_indices, int64_t *occurrence_rows,
+    int64_t num_occurrences) {
 
   int64_t n = slot_indices.size(0);
-  bool project_rows = occurrence_rows.has_value();
-  TORCH_CHECK(value_rows.has_value() == project_rows &&
-                  reverse_indices.has_value() == project_rows,
-              "value_rows, reverse_indices and occurrence_rows must be supplied together");
-  int64_t num_occurrences = 0;
-  if (project_rows) {
-    for (const auto &tensor : {*value_rows, *reverse_indices, *occurrence_rows}) {
-      TORCH_CHECK(tensor.is_cuda() && tensor.device() == counter.device() &&
-                      tensor.scalar_type() == at::kLong && tensor.dim() == 1 &&
-                      tensor.is_contiguous(),
-                  "row projection tensors must be contiguous int64 vectors on the counter device");
-    }
-    TORCH_CHECK(value_rows->numel() == n,
-                "value_rows must have one entry per unique slot");
-    num_occurrences = reverse_indices->numel();
-    TORCH_CHECK(occurrence_rows->numel() == num_occurrences,
-                "occurrence_rows must match reverse_indices");
-    TORCH_CHECK(n > 0 || num_occurrences == 0,
-                "cannot project occurrences without unique rows");
-  }
   int64_t work = std::max(n, num_occurrences);
   if (work == 0)
     return;
@@ -508,12 +487,54 @@ void table_update_counter_with_layout(
       counter_ptr, total_capacity, slot_indices_ptr, n, delta, table_ids_ptr,
       table_bucket_offsets_ptr, bucket_capacity, main_capacity,
       overflow_output_offsets_ptr, overflow_bucket_capacity, num_tables,
-      project_rows ? value_rows->data_ptr<int64_t>() : nullptr,
-      project_rows ? reverse_indices->data_ptr<int64_t>() : nullptr,
-      project_rows ? occurrence_rows->data_ptr<int64_t>() : nullptr,
-      num_occurrences);
+      value_rows, reverse_indices, occurrence_rows, num_occurrences);
 
   DEMB_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+void table_update_counter_with_layout(
+    at::Tensor counter, at::Tensor slot_indices, int32_t delta,
+    at::Tensor table_bucket_offsets, int64_t bucket_capacity,
+    int64_t main_capacity, int64_t num_tables,
+    c10::optional<at::Tensor> table_ids,
+    c10::optional<at::Tensor> overflow_output_offsets,
+    int64_t overflow_bucket_capacity) {
+  launch_counter_update(counter, slot_indices, delta, table_bucket_offsets,
+                        bucket_capacity, main_capacity, num_tables, table_ids,
+                        overflow_output_offsets, overflow_bucket_capacity,
+                        nullptr, nullptr, nullptr, 0);
+}
+
+at::Tensor table_update_counter_and_project_rows(
+    at::Tensor counter, at::Tensor slot_indices, int32_t delta,
+    at::Tensor table_bucket_offsets, int64_t bucket_capacity,
+    int64_t main_capacity, int64_t num_tables,
+    c10::optional<at::Tensor> table_ids,
+    c10::optional<at::Tensor> overflow_output_offsets,
+    int64_t overflow_bucket_capacity, c10::optional<at::Tensor> value_rows,
+    c10::optional<at::Tensor> reverse_indices) {
+  TORCH_CHECK(value_rows.has_value() && reverse_indices.has_value(),
+              "value_rows and reverse_indices must be supplied together");
+  for (const auto &tensor : {*value_rows, *reverse_indices}) {
+    TORCH_CHECK(tensor.is_cuda() && tensor.device() == counter.device() &&
+                    tensor.scalar_type() == at::kLong && tensor.dim() == 1 &&
+                    tensor.is_contiguous(),
+                "row projection tensors must be contiguous int64 vectors on the counter device");
+  }
+  int64_t n = slot_indices.size(0);
+  int64_t num_occurrences = reverse_indices->numel();
+  TORCH_CHECK(value_rows->numel() == n,
+              "value_rows must have one entry per unique slot");
+  TORCH_CHECK(n > 0 || num_occurrences == 0,
+              "cannot project occurrences without unique rows");
+  auto occurrence_rows = at::empty({num_occurrences}, reverse_indices->options());
+  launch_counter_update(
+      counter, slot_indices, delta, table_bucket_offsets, bucket_capacity,
+      main_capacity, num_tables, table_ids, overflow_output_offsets,
+      overflow_bucket_capacity, value_rows->data_ptr<int64_t>(),
+      reverse_indices->data_ptr<int64_t>(), occurrence_rows.data_ptr<int64_t>(),
+      num_occurrences);
+  return occurrence_rows;
 }
 
 } // namespace dyn_emb

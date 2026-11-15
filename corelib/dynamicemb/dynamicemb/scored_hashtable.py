@@ -47,6 +47,7 @@ from dynamicemb_extensions import (
     table_restore_reclaimed_slots,
     table_scatter_keys_at_slots,
     table_scatter_score_blocks,
+    table_update_counter_and_project_rows,
     table_update_counter_with_layout,
 )
 
@@ -1024,15 +1025,14 @@ class LinearBucketTable(ScoredHashTable):
         if (value_rows is None) != (reverse_indices is None):
             raise ValueError("value_rows and reverse_indices must be supplied together")
         projection = {}
-        occurrence_rows = None
+        update = table_update_counter_with_layout
         if reverse_indices is not None:
-            occurrence_rows = torch.empty_like(reverse_indices)
+            update = table_update_counter_and_project_rows
             projection = dict(
                 value_rows=value_rows,
                 reverse_indices=reverse_indices,
-                occurrence_rows=occurrence_rows,
             )
-        table_update_counter_with_layout(
+        return update(
             self._ref_counter,
             slot_indices,
             1,
@@ -1049,7 +1049,6 @@ class LinearBucketTable(ScoredHashTable):
             ),
             **projection,
         )
-        return occurrence_rows
 
     def decrement_counter(
         self,
