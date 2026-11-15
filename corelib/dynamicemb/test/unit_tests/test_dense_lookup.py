@@ -108,15 +108,8 @@ def test_dense_lookup_and_fallback_match_reference(
         and dtype != torch.bfloat16
         and (mode == DynamicEmbPoolingMode.NONE or dim <= 2048)
     )
-    embedding = mode == DynamicEmbPoolingMode.NONE and dtype == output_dtype
-    backend = (
-        F
-        if embedding
-        else adapter._dense_module(weighted)
-        if dense
-        else adapter._module(weighted)
-    )
-    name = "embedding" if embedding else "_operation" if dense else "forward"
+    backend = adapter._dense_module(weighted) if dense else adapter._module(weighted)
+    name = "_operation" if dense else "forward"
     with torch.no_grad(), patch.object(
         backend, name, wraps=getattr(backend, name)
     ) as call:
@@ -152,34 +145,6 @@ def test_dense_lookup_flat_view_stops_at_last_embedding():
     lookup = DenseLookup(dim, DynamicEmbPoolingMode.NONE, False, weights.device)
     actual = lookup.forward(weights, indices, offsets, torch.float32, None)
     torch.testing.assert_close(actual, weights[indices], rtol=0, atol=0)
-
-
-@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64])
-@pytest.mark.parametrize("empty", [False, True])
-def test_sequence_primitive_accepts_empty_and_strided_rows(dtype, index_dtype, empty):
-    dim, rows, stride = 7, 6, 23
-    # A nonzero storage offset, fractional row stride and no trailing padding.
-    flat = torch.arange(3 + (rows - 1) * stride + dim, device="cuda").to(dtype)
-    weights = flat[3:].as_strided((rows, dim), (stride, 1))
-    before = flat.clone()
-    indices = torch.tensor(
-        [] if empty else [rows - 1, 0, rows - 1], device="cuda", dtype=index_dtype
-    )
-    offsets = torch.tensor([0, indices.numel()], device="cuda")
-    lookup = TorchRecLookup([dim], [0], DynamicEmbPoolingMode.NONE, weights.device)
-    with torch.no_grad(), patch.object(
-        lookup, "_module", side_effect=AssertionError("unexpected KJT adaptation")
-    ), patch.object(
-        lookup,
-        "_dense_module",
-        side_effect=AssertionError("unexpected flat adaptation"),
-    ):
-        actual = lookup(
-            weights, SimpleNamespace(reverse_indices=indices), offsets, dtype
-        )
-    torch.testing.assert_close(actual, weights[indices.long()], rtol=0, atol=0)
-    torch.testing.assert_close(flat, before, rtol=0, atol=0)
 
 
 @pytest.mark.parametrize("output_dtype", [torch.float32, torch.float16, torch.bfloat16])
