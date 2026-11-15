@@ -286,6 +286,11 @@ class FlexKVStorage(HostKVStorageBase):
             raise RuntimeError(f"FlexKV SDK import failed: {e}") from e
         if "FLEXKV_ENABLE_MPS" not in os.environ:
             os.environ["FLEXKV_ENABLE_MPS"] = "1" if self.enable_mps else "0"
+            # KVManager reads enable_mps from GLOBAL_CONFIG_FROM_ENV, which
+            # FlexKV fills when this module's imports load flexkv.common.config:
+            # the variable alone comes too late, and FlexKV's default starts
+            # an MPS daemon.
+            GLOBAL_CONFIG_FROM_ENV.enable_mps = self.enable_mps
         model_cfg = ModelConfig(
             num_layers=self.num_layers,
             num_kv_heads=self.num_heads,
