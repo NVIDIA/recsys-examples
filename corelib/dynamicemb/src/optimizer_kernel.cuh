@@ -331,6 +331,33 @@ template <typename weight_t> struct RowWiseAdaGradState<weight_t, float> {
   }
 };
 
+// An fp32 accumulator in an fp8 table, held as four raw bytes: the slot starts
+// right after the embedding, at any byte offset.
+template <> struct RowWiseAdaGradState<dyn_fp8_t, float> {
+  static DEVICE_INLINE float load(const dyn_fp8_t *slot) {
+    if ((reinterpret_cast<uintptr_t>(slot) & 3u) == 0)
+      return *reinterpret_cast<const float *>(slot);
+    const uint8_t *bytes = reinterpret_cast<const uint8_t *>(slot);
+    const uint32_t bits = static_cast<uint32_t>(bytes[0]) |
+                          (static_cast<uint32_t>(bytes[1]) << 8) |
+                          (static_cast<uint32_t>(bytes[2]) << 16) |
+                          (static_cast<uint32_t>(bytes[3]) << 24);
+    return __uint_as_float(bits);
+  }
+  static DEVICE_INLINE void store(dyn_fp8_t *slot, float value) {
+    if ((reinterpret_cast<uintptr_t>(slot) & 3u) == 0) {
+      *reinterpret_cast<float *>(slot) = value;
+      return;
+    }
+    const uint32_t bits = __float_as_uint(value);
+    uint8_t *bytes = reinterpret_cast<uint8_t *>(slot);
+    bytes[0] = static_cast<uint8_t>(bits & 0xFFu);
+    bytes[1] = static_cast<uint8_t>((bits >> 8) & 0xFFu);
+    bytes[2] = static_cast<uint8_t>((bits >> 16) & 0xFFu);
+    bytes[3] = static_cast<uint8_t>(bits >> 24);
+  }
+};
+
 template <> struct RowWiseAdaGradState<float, float> {
   static DEVICE_INLINE float load(const float *slot) { return *slot; }
   static DEVICE_INLINE void store(float *slot, float value) { *slot = value; }
@@ -730,7 +757,8 @@ __global__ void update4_with_index_flat_table_kernel(
 
     weight_t *weight_ptr = reinterpret_cast<weight_t *>(table_ptrs[table_id]) +
                            static_cast<int64_t>(index) * vdim;
-    const wgrad_t *grad_ptr = grad_evs + ev_id * grad_stride;
+    const wgrad_t *grad_ptr =
+        grad_evs + static_cast<int64_t>(ev_id) * grad_stride;
 
     OptimizierInput<wgrad_t, weight_t> input{grad_ptr, weight_ptr,
                                              (uint32_t)edim, (uint32_t)edim};
@@ -757,7 +785,8 @@ __global__ void update_with_index_flat_table_kernel(
 
     weight_t *weight_ptr = reinterpret_cast<weight_t *>(table_ptrs[table_id]) +
                            static_cast<int64_t>(index) * vdim;
-    const wgrad_t *grad_ptr = grad_evs + ev_id * grad_stride;
+    const wgrad_t *grad_ptr =
+        grad_evs + static_cast<int64_t>(ev_id) * grad_stride;
 
     OptimizierInput<wgrad_t, weight_t> input{grad_ptr, weight_ptr,
                                              (uint32_t)edim, (uint32_t)edim};
@@ -787,8 +816,8 @@ __global__ void update4_padded_buffer_kernel(
     uint32_t edim = table_emb_dims == nullptr
                         ? max_emb_dim
                         : (uint32_t)table_emb_dims[table_ids[row]];
-    weight_t *weight_ptr = values + row * value_stride;
-    const wgrad_t *grad_ptr = grads + row * grad_stride;
+    weight_t *weight_ptr = values + static_cast<int64_t>(row) * value_stride;
+    const wgrad_t *grad_ptr = grads + static_cast<int64_t>(row) * grad_stride;
     OptimizierInput<wgrad_t, weight_t> input{grad_ptr, weight_ptr, edim,
                                              max_emb_dim};
     optimizer.update4(input);
@@ -805,8 +834,8 @@ __global__ void update_padded_buffer_kernel(
     uint32_t edim = table_emb_dims == nullptr
                         ? max_emb_dim
                         : (uint32_t)table_emb_dims[table_ids[row]];
-    weight_t *weight_ptr = values + row * value_stride;
-    const wgrad_t *grad_ptr = grads + row * grad_stride;
+    weight_t *weight_ptr = values + static_cast<int64_t>(row) * value_stride;
+    const wgrad_t *grad_ptr = grads + static_cast<int64_t>(row) * grad_stride;
     OptimizierInput<wgrad_t, weight_t> input{grad_ptr, weight_ptr, edim,
                                              max_emb_dim};
     optimizer.update(input);

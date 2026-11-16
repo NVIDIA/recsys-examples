@@ -61,6 +61,8 @@ inline int get_size(torch::ScalarType scalar_type) {
     return 2;
   case torch::kFloat16:
     return 2;
+  case torch::kFloat8_e4m3fn:
+    return 1;
   case torch::kUInt16:
     return 2;
   case torch::kUInt32:

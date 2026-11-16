@@ -66,7 +66,7 @@ from dynamicemb.dynamicemb_config import (
     score_strategy_has_timestamp_column,
     warning_for_cstm_score,
 )
-from dynamicemb.initializer import MultiTableInitializer
+from dynamicemb.initializer import MultiTableInitializer, fp8_out_of_range_risk
 from dynamicemb.key_ownership import owned_key_mask, owned_keys
 from dynamicemb.key_value_table import (
     ERASE_CHUNK_SLOTS,
@@ -93,7 +93,12 @@ from dynamicemb.optimizer import (
     get_optimizer_state_dim,
 )
 from dynamicemb.types import ReplayStats
-from dynamicemb.utils import DTYPE_NUM_BYTES
+from dynamicemb.utils import (
+    DTYPE_NUM_BYTES,
+    FP8_MAX_VALUE,
+    FP8_STORAGE_DTYPE,
+    checkpoint_dtype,
+)
 from dynamicemb_extensions import device_timestamp
 from fbgemm_gpu.split_table_batched_embeddings_ops_training import (
     BoundsCheckMode,
@@ -510,6 +515,14 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
         self.initializer_args = table_option.initializer_args
         self.index_type = table_option.index_type
         self.embedding_dtype = table_option.embedding_dtype
+        if output_dtype == FP8_STORAGE_DTYPE:
+            # fp8 is a storage format here: the lookup kernels write that dtype
+            # as its stored codes, 256x the weights, which no consumer expects.
+            raise ValueError(
+                "output_dtype=torch.float8_e4m3fn is not supported: fp8 is only "
+                "a table storage dtype. Use torch.float32, torch.float16 or "
+                "torch.bfloat16 for the output."
+            )
         self.output_dtype = output_dtype
         self.pooling_mode = pooling_mode
         self.use_index_dedup = use_index_dedup
@@ -670,7 +683,7 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                 10,
                 requires_grad=True,
                 device=torch.device(self.device_id),
-                dtype=self.embedding_dtype,
+                dtype=checkpoint_dtype(self.embedding_dtype),
             )
         )
 
@@ -877,6 +890,16 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
         unbounded UNIFORM resolves against each table's num_embeddings.
         """
         device = torch.device(f"cuda:{self.device_id}")
+        if self.embedding_dtype == FP8_STORAGE_DTYPE:
+            for name, option in zip(self._table_names, self._dynamicemb_options):
+                risk = fp8_out_of_range_risk(option.initializer_args)
+                if risk is not None:
+                    warnings.warn(
+                        f"Table {name} stores fp8 weights, which hold values "
+                        f"up to +-{FP8_MAX_VALUE:g} and saturate larger ones "
+                        f"to it without notice, but it has a {risk}: some "
+                        f"initial weights may be clipped."
+                    )
         self._initializer = MultiTableInitializer.create(
             [option.initializer_args for option in self._dynamicemb_options], device
         )
@@ -1065,7 +1088,9 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
         for t, _ in enumerate(self._dynamicemb_options):
             splits.append(
                 torch.empty(
-                    (1, 1), device=torch.device("cuda"), dtype=self.embedding_dtype
+                    (1, 1),
+                    device=torch.device("cuda"),
+                    dtype=checkpoint_dtype(self.embedding_dtype),
                 )
             )
         return splits
@@ -1915,7 +1940,10 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
 
         if len(keys_list) == 0:
             return torch.empty(0, dtype=torch.int64, device=device), torch.empty(
-                0, 0, dtype=self._storage.embedding_dtype(), device=device
+                0,
+                0,
+                dtype=checkpoint_dtype(self._storage.embedding_dtype()),
+                device=device,
             )
         return torch.cat(keys_list), torch.cat(values_list, dim=0)
 
