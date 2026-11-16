@@ -221,8 +221,6 @@ class PrefetchState:
     non_admitted_positions: Optional[torch.Tensor] = None
     # One int64 per unique key, for tables that take a score per key.
     unique_scores: Optional[torch.Tensor] = None
-    num_prefetched_keys: int = 0
-    outstanding_keys_ref: Optional[torch.Tensor] = None
     # The key_map_generation (rehash count) of the table state the slots were found in: a later
     # prefetch may expand it before this batch's backward runs.
     key_map_generation: int = 0
@@ -649,7 +647,9 @@ def _prefetch_cache_path(
                     st_score_input,
                 )
 
-        # 7. Bring the keys into the cache, ranked by timestamp only
+        # 7. Bring the keys into the cache, ranked by timestamp only. The insert
+        # also flags the keys it could not place, in pinned host memory that the
+        # read of num_evicted waits for.
         with torch.cuda.nvtx.range("op:cache_insert_evict"):
             (
                 cache_slots,
@@ -658,7 +658,23 @@ def _prefetch_cache_path(
                 evicted_slots,
                 _,
                 evicted_tids,
-            ) = cache.insert_and_evict(cache_keys, cache_tids, None)
+                num_refused,
+            ) = cache.insert_and_evict(
+                cache_keys, cache_tids, None, report_refused=True
+            )
+        if num_refused > 0:
+            # Every key of a batch must be in the cache when its forward reads
+            # it. A refused key (its bucket and its table's overflow area held
+            # only keys the insert may not evict: pinned by batches in flight, or
+            # placed by this insert) has no slot; it comes back among the evicted
+            # ones with a negative one, and nothing is written back.
+            raise RuntimeError(
+                f"The cache could not place {num_refused} keys of this batch: their "
+                "buckets and their tables' overflow areas held only keys it may not "
+                "evict (pinned by batches in flight, or placed by this batch). "
+                "Increase the cache size, or reduce the prefetch pipeline depth or "
+                "the batch size."
+            )
 
         # 8. What it evicted: read before the slots are overwritten, then write back
         with torch.cuda.nvtx.range("op:load_from_flat"):
@@ -861,7 +877,6 @@ def dynamicemb_prefetch(
     evict_strategy=None,
     frequency_counters: Optional[torch.Tensor] = None,
     admitter: Optional[MultiTableAdmitter] = None,
-    outstanding_keys_ref: Optional[torch.Tensor] = None,
     external_storage: Optional[Storage] = None,
     scores: Optional[torch.Tensor] = None,
     table_gate: Optional[Callable[[], ContextManager]] = None,
@@ -919,8 +934,6 @@ def dynamicemb_prefetch(
             )
         )
 
-        num_prefetched_keys = unique_keys.numel()
-
         unique_table_ids = expand_table_ids_cuda(
             unique_indices_table_range,
             unique_keys.numel(),
@@ -942,18 +955,6 @@ def dynamicemb_prefetch(
                 storage.expand_if_need(unique_size_per_table)
 
             if storage_mode == StorageMode.CACHE:
-                if outstanding_keys_ref is not None:
-                    outstanding_keys_ref += num_prefetched_keys
-                    cache_capacity = cache._state.capacity
-                    outstanding_keys = _scalar_item(outstanding_keys_ref)
-                    if outstanding_keys > cache_capacity:
-                        raise RuntimeError(
-                            f"Outstanding prefetched keys "
-                            f"({outstanding_keys}) "
-                            f"exceed cache capacity ({cache_capacity}). "
-                            "Reduce prefetch pipeline depth or increase "
-                            "cache size."
-                        )
                 (
                     slot_indices,
                     non_admitted_positions,
@@ -1006,8 +1007,6 @@ def dynamicemb_prefetch(
             storage_mode=storage_mode,
             non_admitted_positions=non_admitted_positions,
             unique_scores=unique_scores,
-            num_prefetched_keys=num_prefetched_keys,
-            outstanding_keys_ref=outstanding_keys_ref,
             value_row_indices=value_row_indices,
             key_map_generation=key_map_generation,
         )
@@ -1443,15 +1442,6 @@ class DynamicEmbeddingFunction(torch.autograd.Function):
             ctx.use_counter = use_counter
             ctx.unique_values = unique_values
             ctx.persisted_unique_indices = persisted_unique_indices
-            ctx.outstanding_keys_ref = prefetch_state.outstanding_keys_ref
-            ctx.num_prefetched_keys = prefetch_state.num_prefetched_keys
-
-            # Recover outstanding count at end of forward so it is decremented
-            # even when backward is not run, avoiding overflow.
-            if prefetch_state.outstanding_keys_ref is not None:
-                prefetch_state.outstanding_keys_ref -= (
-                    prefetch_state.num_prefetched_keys
-                )
 
             return output_embs
 

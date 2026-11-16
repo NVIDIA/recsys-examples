@@ -2627,14 +2627,14 @@ class DynamicEmbCache(Cache):
         keys: torch.Tensor,
         table_ids: torch.Tensor,
         scores: Optional[torch.Tensor] = None,
-    ) -> Tuple[
-        torch.Tensor, int, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
-    ]:
-        """Insert with counter-aware eviction and overflow fallback."""
+        report_refused: bool = False,
+    ) -> Tuple:
+        """Insert with counter-aware eviction and overflow fallback; with
+        ``report_refused`` the number of keys it could not place follows."""
         state = self._state
         score_arg = get_insert_score_arg(state, keys.numel(), keys.device, scores)
         result = state.key_index_map.insert_and_evict_with_counter_and_overflow(
-            keys, table_ids, score_arg
+            keys, table_ids, score_arg, report_refused=report_refused
         )
         if self._record_cache_metrics:
             self._cache_metrics[2] = keys.numel()
