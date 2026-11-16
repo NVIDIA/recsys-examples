@@ -17,3 +17,7 @@ Host/Hybrid/Storage sequence receivers now resolve complete live snapshots. Writ
 ## Native pooled/processor extension
 
 Native RW pooled/weighted layouts now use prepared rows; dynamic feature processing precedes resolution and runs once. Gradient requirements and no-grad behavior retain the established interface. TW-RW and hierarchical receiver hookup remain subsequent changes.
+
+## Hierarchical extension
+
+After successful #528 receiver status, resolved input takes ownership of the lookup output window and row/gradient maps. Transport kernels remain unchanged. Local tests supply GPU receiver results and validate overflow before mutation; these are not NVLink or physical multi-node GIN deployment tests. The existing supported-fabric suite keeps its gradient checks and distinguishes transport synchronization from row preparation.

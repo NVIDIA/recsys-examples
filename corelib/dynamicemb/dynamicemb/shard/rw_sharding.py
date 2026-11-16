@@ -631,9 +631,7 @@ class RwSequenceDynamicEmbeddingSharding(RwSequenceEmbeddingSharding):
                 device=device,
             )
         self._input_postprocessor = (
-            lookup.resolve_input
-            if self._has_dynamic_tables and self._hier is None
-            else None
+            lookup.resolve_input if self._has_dynamic_tables else None
         )
         return lookup
 

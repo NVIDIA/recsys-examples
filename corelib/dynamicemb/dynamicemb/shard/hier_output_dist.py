@@ -811,6 +811,17 @@ class HierDist:
         )
         return kjt
 
+    def rebind_input(
+        self, original: KeyedJaggedTensor, resolved: KeyedJaggedTensor
+    ) -> None:
+        """Preserve this call's row-window ownership after receiver resolution.
+
+        Resolution changes the KJT's values/type, not its feature order or the
+        output-dist plans. The native fallback has no entry in this registry.
+        """
+        if original is not resolved:
+            self._rows[resolved] = self._rows.pop(original)
+
     def key_rows(self, kjt: KeyedJaggedTensor) -> Optional[torch.Tensor]:
         """The row of each key of ``kjt`` (an owner's KJT of a call on this
         path, :meth:`owns`) among the call's rows that its lookup writes, int64
