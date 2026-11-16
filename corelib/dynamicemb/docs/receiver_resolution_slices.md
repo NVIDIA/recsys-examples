@@ -13,3 +13,7 @@ Pinned Cache and cache-over-Storage sequence receivers now use prepared rows too
 ## Storage extension
 
 Host/Hybrid/Storage sequence receivers now resolve complete live snapshots. Writes publish embedding and optimizer bytes to overlapping batches by complete table/key identity and preserve existing scores. Local Storage-interface tests do not validate a network PS or concurrent remote writers. Evaluation is resolved read-only; raw/FIFO preparation also receives coherent snapshots.
+
+## Native pooled/processor extension
+
+Native RW pooled/weighted layouts now use prepared rows; dynamic feature processing precedes resolution and runs once. Gradient requirements and no-grad behavior retain the established interface. TW-RW and hierarchical receiver hookup remain subsequent changes.

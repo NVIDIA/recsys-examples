@@ -322,7 +322,7 @@ class _ResolvedInputMixin:
 
     @property
     def resolves_input_dist(self) -> bool:
-        return self._emb_module.pooling_mode == DynamicEmbPoolingMode.NONE
+        return True
 
     def resolve_input(self, features):
         """Resolve keys for every storage layout before embedding lookup."""
