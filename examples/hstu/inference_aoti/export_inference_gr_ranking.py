@@ -197,7 +197,9 @@ def get_exportable_model_for_inference(
         # The training shell supplies the existing sparse/MLP/processor schemas.
         # Its HSTU weights are never used; load a matching Transformer checkpoint.
         model = apply_inference_embedding_collection(
-            model, dynamic_table_configs, trained_emb_table_sizes
+            model,
+            embedding_collection_configs=embedding_collection_configs,
+            trained_emb_table_sizes=trained_emb_table_sizes,
         )
         cfg = model._hstu_config
         inference_config = get_inference_hstu_config(
