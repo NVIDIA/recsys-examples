@@ -3177,29 +3177,39 @@ def test_fp8_is_refused_as_an_output_dtype(table_dtype):
         )
 
 
+@pytest.mark.parametrize("training", [False, True], ids=["eval", "train"])
 @pytest.mark.parametrize("permuted", [False, True], ids=["in_order", "permuted_rows"])
-def test_fp8_sequence_eval_through_output_alloc_returns_real_weights(permuted):
-    # The allocator's copies only convert dtypes, so an fp8 table's stored codes
-    # (256x the weights) must be decoded before they are handed over.
+def test_fp8_sequence_lookup_through_output_alloc_returns_real_weights(
+    training, permuted
+):
+    # An evaluation copies the rows through torch, which only converts dtypes, so
+    # an fp8 table's stored codes (256x the weights) must be decoded before they
+    # are handed over; a training forward decodes inside its kernels. Either way
+    # the allocated output must hold the real weights.
     device = torch.device("cuda:0")
     bdeb = _rowwise_adagrad_bdeb(
         FP8_STORAGE_DTYPE, [16, 16], False, 1024**3, DynamicEmbPoolingMode.NONE
     )
     indices = torch.arange(64, dtype=torch.int64, device=device)
     offsets = torch.arange(0, 65, 32, dtype=torch.int64, device=device)
-    bdeb(indices, offsets)  # a training forward inserts the rows
-    bdeb.eval()
-    plain = bdeb(indices, offsets)
-    assert plain.dtype == torch.float32
-    assert torch.all(plain == FP8_INITIAL_VALUE)
+    with torch.no_grad():
+        bdeb(indices, offsets)  # a training forward inserts the rows
+        if not training:
+            bdeb.eval()
+        plain = bdeb(indices, offsets)
+        assert plain.dtype == torch.float32
+        assert torch.all(plain == FP8_INITIAL_VALUE)
 
-    out_rows = torch.randperm(64, device=device) if permuted else None
+        # The kernels take the row of each key as int32.
+        out_rows = (
+            torch.randperm(64, device=device).to(torch.int32) if permuted else None
+        )
 
-    def alloc(rows, cols, dtype):
-        return torch.zeros(rows, cols, dtype=dtype, device=device), out_rows
+        def alloc(rows, cols, dtype):
+            return torch.zeros(rows, cols, dtype=dtype, device=device), out_rows
 
-    bdeb.output_alloc = alloc
-    out = bdeb(indices, offsets)
+        bdeb.output_alloc = alloc
+        out = bdeb(indices, offsets)
     expected = torch.zeros_like(out)
     if permuted:
         expected[out_rows.long()] = plain
