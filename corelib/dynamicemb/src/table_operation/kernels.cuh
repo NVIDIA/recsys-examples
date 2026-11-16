@@ -42,7 +42,7 @@ struct InsertKernelTraits {
   static constexpr ScorePolicyType PolicyType = PolicyType_;
   static constexpr bool OutputScore = OutputScore_;
   static constexpr bool EnableOverflow = EnableOverflow_;
-  // insert_and_evict_body counts the keys it could not place.
+  // insert_and_evict_body flags that it could not place a key.
   static constexpr bool ReportRefused = ReportRefused_;
 };
 
@@ -539,7 +539,7 @@ __device__ __forceinline__ void insert_and_evict_body(
     Table ovf_table, int *__restrict__ ovf_bucket_sizes,
     int32_t *__restrict__ ovf_counter,
     int64_t const *__restrict__ ovf_output_offsets, uint64_t cur_ts,
-    CounterType *refused_counter = nullptr) {
+    int64_t *refused = nullptr) {
 
   using KeyType = typename Table::KeyType;
   using Bucket = typename Table::BucketType;
@@ -676,9 +676,11 @@ __device__ __forceinline__ void insert_and_evict_body(
       if constexpr (KernelTraits::ReportRefused) {
         // Busy: neither the key's bucket nor (with overflow) its table's
         // overflow area had a slot to give it. It goes out among the evicted
-        // ones with a negative index.
+        // ones with a negative index. A plain store: every refusing thread
+        // writes the same 1, and the flag may sit in pinned host memory, where
+        // an atomic would not be one on every platform.
         if (cmp_result == InsertResult::Busy) {
-          atomicAdd(refused_counter, static_cast<CounterType>(1));
+          *refused = 1;
         }
       }
       uint32_t vote = g.ballot(evicted);
@@ -744,14 +746,13 @@ __global__ void table_insert_and_evict_kernel(
     int64_t *__restrict__ evicted_table_ids, int32_t *__restrict__ counter,
     Table ovf_table, int *__restrict__ ovf_bucket_sizes,
     int32_t *__restrict__ ovf_counter,
-    int64_t const *__restrict__ ovf_output_offsets,
-    CounterType *refused_counter) {
+    int64_t const *__restrict__ ovf_output_offsets, int64_t *refused) {
   insert_and_evict_body<Table, KernelTraits, DefaultEvictor>(
       table, table_bucket_offsets, bucket_sizes, batch, input_keys, table_ids,
       insert_results, indices, score_input, score_output, table_key_slots,
       evicted_counter, evicted_keys, evicted_scores, evicted_indices,
       evicted_table_ids, counter, ovf_table, ovf_bucket_sizes, ovf_counter,
-      ovf_output_offsets, /*cur_ts=*/0, refused_counter);
+      ovf_output_offsets, /*cur_ts=*/0, refused);
 }
 
 template <typename Table>

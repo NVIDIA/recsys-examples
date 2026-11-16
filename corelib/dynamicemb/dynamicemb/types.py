@@ -406,7 +406,7 @@ class Cache(abc.ABC):
             indices, num_evicted, evicted_keys, evicted_indices,
             evicted_scores, evicted_table_ids; with ``report_refused``, then
             num_refused: the keys it could not place (among the evicted ones,
-            with a negative index), read with num_evicted.
+            with a negative index), known on the host once num_evicted is.
         """
         ...
 

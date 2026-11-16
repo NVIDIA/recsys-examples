@@ -79,7 +79,7 @@ void launch_table_insert_and_evict_kernel(
     Table ovf_table = Table(), int *ovf_bucket_sizes_ptr = nullptr,
     int32_t *ovf_counter_ptr = nullptr,
     int64_t *ovf_output_offsets_ptr = nullptr, int64_t score_fn_key = 0,
-    CounterType *refused_ptr = nullptr) {
+    int64_t *refused_ptr = nullptr) {
   constexpr int BLOCK_SIZE = 256;
 
   if constexpr (PolicyTypeV == ScorePolicyType::LruLfu) {
@@ -268,7 +268,16 @@ static void table_insert_and_evict_with_counter_and_overflow_single_score(
     std::optional<at::Tensor> refused) {
 
   auto key_type = get_data_type(keys);
-  CounterType *refused_ptr = get_pointer<CounterType>(refused);
+  // The flag sits in pinned host memory: the kernel writes it through its
+  // device mapping, and the host reads it once it has waited for the insert.
+  int64_t *refused_ptr = nullptr;
+  if (refused.has_value()) {
+    void *mapped = nullptr;
+    TORCH_CHECK(cudaHostGetDevicePointer(&mapped, refused->data_ptr(), 0) ==
+                    cudaSuccess,
+                "table_insert_and_evict: refused is not mapped for the device");
+    refused_ptr = static_cast<int64_t *>(mapped);
+  }
 
   ScoreType *score_input_ptr = nullptr;
   at::Tensor score_input_tensor;
@@ -334,8 +343,8 @@ static void table_insert_and_evict_with_counter_and_overflow_single_score(
     auto ovf_table = Table(reinterpret_cast<uint8_t *>(ovf_storage.data_ptr()),
                            ovf_num_buckets, ovf_bucket_capacity, num_scores);
 
-    // Counting the refused keys is a variant of the kernel of its own, so that
-    // an insert that is not asked for them pays nothing.
+    // Flagging a refused key is a variant of the kernel of its own, so that an
+    // insert that is not asked to pays nothing.
     auto launch = [&](auto report_refused) {
       constexpr bool ReportRefusedV = decltype(report_refused)::value;
       DISPATCH_SCORE_POLICY(policy_type, PolicyTypeV, [&] {
@@ -416,12 +425,14 @@ table_insert_and_evict(at::Tensor table_storage,
 
   bool use_overflow = ovf_storage.has_value() && ovf_storage.value().defined();
   TORCH_CHECK(!refused.has_value() || use_overflow,
-              "table_insert_and_evict: refused is counted by the insert with "
+              "table_insert_and_evict: refused is flagged by the insert with "
               "overflow only");
   TORCH_CHECK(!refused.has_value() ||
-                  (refused->is_cuda() && refused->scalar_type() == at::kLong &&
+                  (!refused->is_cuda() && refused->is_pinned() &&
+                   refused->scalar_type() == at::kLong &&
                    refused->numel() >= 1),
-              "table_insert_and_evict: refused must be an int64 CUDA tensor");
+              "table_insert_and_evict: refused must be an int64 tensor in "
+              "pinned host memory");
 
   int64_t num_total = keys.size(0);
   if (num_total == 0) {

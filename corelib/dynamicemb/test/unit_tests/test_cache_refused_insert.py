@@ -6,9 +6,9 @@
 The cache's insert refuses a key when its bucket and its table's overflow area
 hold only keys that cannot be evicted (pinned by batches in flight, or being
 inserted by the same call). Such a key comes back among the evicted ones with a
-negative slot, and has no row for the forward to read. The insert kernel counts the
-keys it refuses (a variant of the kernel asked for it), the count comes to the host
-with the number of evicted keys, in the read the prefetch makes anyway, and the
+negative slot, and has no row for the forward to read. The insert kernel flags a
+refused key (a variant of the kernel asked to) in pinned host memory, which the
+read of the number of evicted keys the prefetch makes anyway waits for, and the
 prefetch raises before it writes anything back: the refused key's evicted row was
 never loaded, and written back it would have overwritten the key's storage row.
 

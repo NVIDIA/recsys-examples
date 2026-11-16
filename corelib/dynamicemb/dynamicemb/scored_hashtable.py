@@ -1110,8 +1110,9 @@ class LinearBucketTable(ScoredHashTable):
         With ``report_refused``, the number of keys the insert could not place
         follows: keys whose bucket and table's overflow area held nothing it may
         evict (pinned, or placed by the same insert). They are among the evicted
-        ones, with a negative index. The kernel counts them, and the count comes to
-        the host with the number of evicted keys, in the same read."""
+        ones, with a negative index. The kernel flags them in pinned host memory,
+        which the read of the number of evicted keys waits for: no read is added,
+        and the keys are counted only when there are some."""
         assert (
             self.enable_overflow_
         ), "insert_and_evict_with_counter_and_overflow requires enable_overflow=True"
@@ -1127,7 +1128,7 @@ class LinearBucketTable(ScoredHashTable):
             )
 
         refused = (
-            torch.zeros(1, dtype=torch.int64, device=keys.device)
+            torch.zeros(1, dtype=torch.int64, pin_memory=True)
             if report_refused
             else None
         )
@@ -1160,10 +1161,7 @@ class LinearBucketTable(ScoredHashTable):
             refused=refused,
         )
 
-        if refused is not None:
-            h_num_evicted, h_refused = torch.cat([num_evicted, refused]).tolist()
-        else:
-            h_num_evicted = num_evicted.cpu().item()
+        h_num_evicted = num_evicted.cpu().item()
         result = (
             indices,
             h_num_evicted,
@@ -1172,7 +1170,12 @@ class LinearBucketTable(ScoredHashTable):
             evicted_scores[:h_num_evicted],
             evicted_table_ids[:h_num_evicted],
         )
-        return (*result, h_refused) if report_refused else result
+        if not report_refused:
+            return result
+        h_refused = (
+            int((evicted_indices[:h_num_evicted] < 0).sum()) if refused.item() else 0
+        )
+        return (*result, h_refused)
 
     def erase(
         self,
@@ -2221,7 +2224,9 @@ class LinearBucketTable(ScoredHashTable):
             result = (e, 0, torch.empty_like(keys[:0]), e.clone(), e.clone(), e.clone())
             return (*result, 0) if report_refused else result
         refused = (
-            torch.zeros(1, dtype=torch.int64, device=device) if report_refused else None
+            torch.zeros(1, dtype=torch.int64, pin_memory=True)
+            if report_refused
+            else None
         )
 
         evicted_keys_buf = torch.empty_like(keys)
@@ -2296,8 +2301,14 @@ class LinearBucketTable(ScoredHashTable):
             evicted_scores_buf[:num_evicted_accum],
             evicted_tids_buf[:num_evicted_accum],
         )
-        # This mode reads every wave's count already: one read more.
-        return (*result, int(refused.item())) if report_refused else result
+        if not report_refused:
+            return result
+        h_refused = (
+            int((evicted_indices_buf[:num_evicted_accum] < 0).sum())
+            if refused.item()
+            else 0
+        )
+        return (*result, h_refused)
 
 
 def get_scored_table(

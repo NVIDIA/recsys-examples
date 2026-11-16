@@ -648,7 +648,8 @@ def _prefetch_cache_path(
                 )
 
         # 7. Bring the keys into the cache, ranked by timestamp only. The insert
-        # also counts the keys it could not place, read with num_evicted.
+        # also flags the keys it could not place, in pinned host memory that the
+        # read of num_evicted waits for.
         with torch.cuda.nvtx.range("op:cache_insert_evict"):
             (
                 cache_slots,
