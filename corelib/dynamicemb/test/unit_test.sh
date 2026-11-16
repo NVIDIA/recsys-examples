@@ -1,5 +1,6 @@
 set -e
 FWD_BWD_TEST_FILES=(
+    "test/unit_tests/test_counter_concurrency.py"
     "test/unit_tests/table_operation/test_table_operation.sh"
     "test/unit_tests/erase_async/test_erase_async.sh"
     "test/unit_tests/retain_evicted_keys/test_retain_evicted_keys.sh"
