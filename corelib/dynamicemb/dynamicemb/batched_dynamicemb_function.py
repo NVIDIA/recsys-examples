@@ -649,7 +649,8 @@ def _prefetch_cache_path(
                     st_score_input,
                 )
 
-        # 7. Bring the keys into the cache, ranked by timestamp only
+        # 7. Bring the keys into the cache, ranked by timestamp only. The insert
+        # also counts the keys it could not place, read with num_evicted.
         with torch.cuda.nvtx.range("op:cache_insert_evict"):
             (
                 cache_slots,
@@ -658,7 +659,23 @@ def _prefetch_cache_path(
                 evicted_slots,
                 _,
                 evicted_tids,
-            ) = cache.insert_and_evict(cache_keys, cache_tids, None)
+                num_refused,
+            ) = cache.insert_and_evict(
+                cache_keys, cache_tids, None, report_refused=True
+            )
+        if num_refused > 0:
+            # Every key of a batch must be in the cache when its forward reads
+            # it. A refused key (its bucket and its table's overflow area held
+            # only keys the insert may not evict: pinned by batches in flight, or
+            # placed by this insert) has no slot; it comes back among the evicted
+            # ones with a negative one, and nothing is written back.
+            raise RuntimeError(
+                f"The cache could not place {num_refused} keys of this batch: their "
+                "buckets and their tables' overflow areas held only keys it may not "
+                "evict (pinned by batches in flight, or placed by this batch). "
+                "Increase the cache size, or reduce the prefetch pipeline depth or "
+                "the batch size."
+            )
 
         # 8. What it evicted: read before the slots are overwritten, then write back
         with torch.cuda.nvtx.range("op:load_from_flat"):

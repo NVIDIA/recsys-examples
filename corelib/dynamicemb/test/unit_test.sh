@@ -30,6 +30,7 @@ FWD_BWD_TEST_FILES=(
     "test/unit_tests/test_frequency_requirements.py"
     "test/unit_tests/test_frequency_counter_guard.py"
     "test/unit_tests/test_no_grad_slot_lifetime.py"
+    "test/unit_tests/test_cache_refused_insert.py"
     "test/unit_tests/test_pin_counter_concurrency.py"
     "test/unit_tests/per_key_score/test_per_key_score.sh"
     "test/unit_tests/test_planner_plan_cost.py"

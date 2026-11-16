@@ -31,7 +31,8 @@ namespace dyn_emb {
 template <int ThreadBlockDim_, int ProbingGroupSize_, int ReductionGroupSize_,
           int CompactTileSize_, int NumScorePerThread_,
           ScorePolicyType PolicyType_ = ScorePolicyType::Const,
-          bool OutputScore_ = false, bool EnableOverflow_ = false>
+          bool OutputScore_ = false, bool EnableOverflow_ = false,
+          bool ReportRefused_ = false>
 struct InsertKernelTraits {
   static constexpr int ThreadBlockDim = ThreadBlockDim_;
   static constexpr int ProbingGroupSize = ProbingGroupSize_;
@@ -41,6 +42,8 @@ struct InsertKernelTraits {
   static constexpr ScorePolicyType PolicyType = PolicyType_;
   static constexpr bool OutputScore = OutputScore_;
   static constexpr bool EnableOverflow = EnableOverflow_;
+  // insert_and_evict_body counts the keys it could not place.
+  static constexpr bool ReportRefused = ReportRefused_;
 };
 
 template <bool Pred> struct ExportPredFunctor {
@@ -535,7 +538,8 @@ __device__ __forceinline__ void insert_and_evict_body(
     int64_t *__restrict__ evicted_table_ids, int32_t *__restrict__ counter,
     Table ovf_table, int *__restrict__ ovf_bucket_sizes,
     int32_t *__restrict__ ovf_counter,
-    int64_t const *__restrict__ ovf_output_offsets, uint64_t cur_ts) {
+    int64_t const *__restrict__ ovf_output_offsets, uint64_t cur_ts,
+    CounterType *refused_counter = nullptr) {
 
   using KeyType = typename Table::KeyType;
   using Bucket = typename Table::BucketType;
@@ -669,6 +673,14 @@ __device__ __forceinline__ void insert_and_evict_body(
       InsertResult cmp_result = UseOverflow ? final_result : result;
       bool evicted = (cmp_result == InsertResult::Evict ||
                       cmp_result == InsertResult::Busy);
+      if constexpr (KernelTraits::ReportRefused) {
+        // Busy: neither the key's bucket nor (with overflow) its table's
+        // overflow area had a slot to give it. It goes out among the evicted
+        // ones with a negative index.
+        if (cmp_result == InsertResult::Busy) {
+          atomicAdd(refused_counter, static_cast<CounterType>(1));
+        }
+      }
       uint32_t vote = g.ballot(evicted);
       int group_cnt = __popc(vote);
       CounterType group_offset = 0;
@@ -732,13 +744,14 @@ __global__ void table_insert_and_evict_kernel(
     int64_t *__restrict__ evicted_table_ids, int32_t *__restrict__ counter,
     Table ovf_table, int *__restrict__ ovf_bucket_sizes,
     int32_t *__restrict__ ovf_counter,
-    int64_t const *__restrict__ ovf_output_offsets) {
+    int64_t const *__restrict__ ovf_output_offsets,
+    CounterType *refused_counter) {
   insert_and_evict_body<Table, KernelTraits, DefaultEvictor>(
       table, table_bucket_offsets, bucket_sizes, batch, input_keys, table_ids,
       insert_results, indices, score_input, score_output, table_key_slots,
       evicted_counter, evicted_keys, evicted_scores, evicted_indices,
       evicted_table_ids, counter, ovf_table, ovf_bucket_sizes, ovf_counter,
-      ovf_output_offsets, /*cur_ts=*/0);
+      ovf_output_offsets, /*cur_ts=*/0, refused_counter);
 }
 
 template <typename Table>
