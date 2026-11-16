@@ -10,6 +10,8 @@ The project is organized into three parts:
 - [HSTU inference](./examples/hstu/inference/README.md) with paged GPU KV cache, asynchronous host KV onload/offload, [Triton Inference Server](https://github.com/triton-inference-server/server), CUDA graph optimization, and C++ deployment with AOTInductor
 - [Semantic ID generative recommender examples](./examples/sid_gr/README.md) for SID-GR training and retrieval, including hierarchical semantic-ID prediction, Megatron-Core decoder support, TorchRec jagged tensors, baseline beam generation, and KV-cache `generate_beam_decode()`
 - [SID-GR inference](./examples/sid-gr-inference/README.md) for long-context, short-decode, large-beam serving with ContextKV/BeamKV/BeamPath runtime abstractions, continuous batching, CUDA graph replay, HTTP `/generate`, and SGLang comparison benchmarks
+- [AI-Search-Plugin](./examples/AI-Search-Plugin/README.md) with opt-in components that speed up RL post-training of search agents (AI search / deep research) on slime and verl
+- [Feature-Extractor-Plugin](./examples/Feature-Extractor-Plugin/) for GPU feature extraction: fused expression kernels for Spark on spark-rapids ([batch](./examples/Feature-Extractor-Plugin/batch/README.md)) and GPU window-aggregation and lookup-join operators for Flink ([streaming](./examples/Feature-Extractor-Plugin/streaming/README.md))
 
 ## Standalone GPU Libraries
 - [DynamicEmb](./corelib/dynamicemb/README.md) for model-parallel dynamic embedding tables with GPU/host hash-table storage, TorchRec `EmbeddingCollection` and `EmbeddingBagCollection` integration, admission and eviction controls, cache/prefetch support, fused pooling/sequence kernels, and Torch-exportable inference embedding tables
@@ -20,6 +22,13 @@ The project is organized into three parts:
 - [Talos](./corelib/talos/README.md) for end-to-end automated optimization of a PyTorch model: it profiles the real workload, rewrites the hotspots it finds, verifies every change for numerical correctness and measured speedup, and iterates until the gains run out — driven entirely by a coding agent (Claude Code, Codex and others), with no human in the loop
 
 # What's New
+- **[2026/11/16]** 🎉v26.10 released!
+  - Adds a hierarchical input and output dist to DynamicEmb for row-wise sharded `EmbeddingCollection`s (`output_dist="hierarchical"`): keys and rows move over NVLink inside a node and over GPU-initiated InfiniBand (NCCL GIN) between nodes, with each key deduplicated per node. It shortens the DynamicEmb `EmbeddingCollection` benchmark's training step by about 50%–80% against TorchRec's dists, on up to 32 H100 GPUs and on GB300 NVL72. See the [design doc](./corelib/dynamicemb/docs/hier_output_dist.md) and the [benchmark](./corelib/dynamicemb/benchmark/README.md).
+  - Extends [DynamicEmb](./corelib/dynamicemb/README.md) with table-row-wise sharding, the FTRL optimizer (with group lasso), FP8 (`float8_e4m3fn`) table storage for row-wise Adagrad, probabilistic admission, per-key scores (`PRECISE_CUSTOMIZED`), and a background erase by score (`erase_by_score_async`) for time-to-live policies. See the [DynamicEmb APIs](./corelib/dynamicemb/DynamicEmb_APIs.md).
+  - Adds layer-wise FlexKV KV-cache loading to [HSTU inference](./examples/hstu/inference/README.md), an opt-in [Transformer backbone](./examples/hstu/inference/transformer.md) with FP8 DeepGEMM projections and FlashAttention 4 attention (up to 2.84× faster than its bf16 SDPA reference), and configurable indexers and NV-Embedding-Cache layers for exportable embedding collections.
+  - Speeds up [SID-GR inference](./examples/sid-gr-inference/README.md) decode with new default kernels contributed by Netflix: beam attention fused with its merge and a fused QK-norm + RoPE on Blackwell (SM10x), plus a vectorized beam-KV write. On B200 they are up to 3.3×, 1.7× and 3.7× faster than the kernels they replace.
+  - Adds two examples: [AI-Search-Plugin](./examples/AI-Search-Plugin/README.md) for RL post-training of search agents on slime and verl, and [Feature-Extractor-Plugin](./examples/Feature-Extractor-Plugin/) for GPU feature extraction in Spark and Flink.
+  - Moves the container to NGC PyTorch 26.07, with FBGEMM GPU 1.8.0, TorchRec 1.8.0, Triton Inference Server 26.07 and NV-Embedding-Cache 26.10, and builds DynamicEmb for GB300 (`sm_103`) by default.
 - **[2026/9/13]** 🎉v26.08 released!
   - Adds [Talos](./corelib/talos/README.md), an agent-driven PyTorch optimization toolkit that profiles real workloads, optimizes one measured hotspot at a time, and independently verifies numerical correctness and end-to-end speedup. The included DIN, DIEN, HSTU, and OneRec workloads show 2.22×–3.29× speedups.
   - Adds DynamicEmb delta replay through `replay_increment()`, completing the `incremental_dump()` pipeline for synchronizing training updates to serving replicas without reloading a full checkpoint. See the [DynamicEmb API guide](./corelib/dynamicemb/DynamicEmb_APIs.md#replay_increment).
@@ -31,14 +40,14 @@ The project is organized into three parts:
   - Improves [SID-GR inference](./examples/sid-gr-inference/README.md) with shared decode CUDA-graph memory pools and logits buffers, and adds opt-in, SGLang-compatible weight hot updates from disk or colocated CUDA IPC for slime-style RL workflows. See the [weight hot-update guide](./examples/sid-gr-inference/docs/weight_hot_update.md).
   - Extends [DynamicEmb](./corelib/dynamicemb/README.md) with compound `(TIMESTAMP, LFU)` eviction and optional JIT-compiled custom score functions, enabling policies such as time-decayed LFU.
   - Adds opt-in retention and readback of keys evicted from DynamicEmb's last storage tier through `EvictedItemMode.RETAIN_KEY` and `pop_evicted_keys()`, and upgrades `incremental_dump()` to return structured `DeltaDumpResult` records with keys, values, evicted keys, slot indices, and metadata. See the [DynamicEmb APIs](./corelib/dynamicemb/DynamicEmb_APIs.md).
+<details>
+<summary>More</summary>
+
 - **[2026/7/14]** 🎉v26.06 released!
   - Optimizes the RecSys-FlexKV inference path (bulk `slot_mapping` device-to-host copy, vectorized slot expansion, batched onboarding, and SSD tier) and adds a FlexKV inference benchmark covering the three cache-tier hit paths (GPU-hit, host/CPU-hit, and SSD-hit). See [RecSys KVCache Manager](./corelib/recsys_kvcache_manager/README.md) and the [FlexKV CPU breakdown](./corelib/recsys_kvcache_manager/test/FLEXKV_CPU_BREAKDOWN.md).
   - Adds DynamicEmb incremental dump for LFU tables via a compound `LruLfu` score policy, and fixes the padded-buffer optimizer for mixed embedding dimensions and host VMM tensor sizing to avoid virtual-address-space exhaustion. See [DynamicEmb](./corelib/dynamicemb/README.md).
   - Updates FBGEMM for Blackwell HSTU attention and adds phase-selective CUDA-graph benchmark profiling with percentile (P10) reporting and attention heatmaps. See the [HSTU inference benchmark](./examples/hstu/inference/benchmark/README.md).
   - Extends [SID-GR inference](./examples/sid-gr-inference/README.md) with a shared-prefix-length argument and an environment-variable control for GR decode attention.
-<details>
-<summary>More</summary>
-
 - **[2026/6/15]** 🎉v26.05 released!
   - Adds a new [SID-GR inference example](./examples/sid-gr-inference/README.md) for large-beam generative retrieval serving and benchmarking.
   - Enables HSTU + DynamicEmb end-to-end training on Blackwell (`sm_100`) and refreshes HSTU benchmark fixes, docs, and training examples.
