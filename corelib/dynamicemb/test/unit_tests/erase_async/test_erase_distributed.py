@@ -50,6 +50,7 @@ from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 # test_embedding_dump_load is the fixture module the tests in unit_tests share, so it
 # stays a directory up and has to be put on the path from here.
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import hier_switch  # noqa: E402
 from test_embedding_dump_load import (  # noqa: E402
     create_model,
     get_optimizer_kwargs,
@@ -100,7 +101,9 @@ def _model(strategy, use_index_dedup=False, hbm_scale=1.0):
 def _features(feature_names: List[str], keys: List[int], per_key_score=None):
     """One key per bag, the same keys in every feature; ``per_key_score`` is the score
     every key carries, for tables that take one per key."""
-    values = torch.tensor(keys * len(feature_names), dtype=torch.int64, device=_device())
+    values = torch.tensor(
+        keys * len(feature_names), dtype=torch.int64, device=_device()
+    )
     fields = dict(
         keys=feature_names,
         values=values,
@@ -109,7 +112,9 @@ def _features(feature_names: List[str], keys: List[int], per_key_score=None):
     if per_key_score is None:
         return KeyedJaggedTensor(**fields)
     return ScoredKeyedJaggedTensor(
-        scores=torch.full((len(values),), per_key_score, dtype=torch.int64, device=_device()),
+        scores=torch.full(
+            (len(values),), per_key_score, dtype=torch.int64, device=_device()
+        ),
         **fields,
     )
 
@@ -186,7 +191,10 @@ def check_erase(case: str, use_index_dedup: bool) -> None:
 
     # The model goes on: the old keys are new keys again.
     _train(model, feature_names, OLD_KEYS, per_key, NEW_SCORE + 100)
-    _expect(model, table_names, OLD_KEYS + NEW_KEYS, f"{label}, after training them again")
+    _expect(
+        model, table_names, OLD_KEYS + NEW_KEYS, f"{label}, after training them again"
+    )
+    hier_switch.release()
 
 
 def check_erase_beside_training(case: str) -> None:
@@ -197,7 +205,9 @@ def check_erase_beside_training(case: str) -> None:
     _train(model, feature_names, OLD_KEYS, per_key, OLD_SCORE)
     _train(model, feature_names, NEW_KEYS, per_key, NEW_SCORE)
     handle = erase_by_score_async(model, asked, THRESHOLD)
-    _train(model, feature_names, LATER_KEYS, per_key, NEW_SCORE)  # the call has returned
+    _train(
+        model, feature_names, LATER_KEYS, per_key, NEW_SCORE
+    )  # the call has returned
 
     erased, spared = handle.result()
     assert (_everywhere(erased), _everywhere(spared)) == (
@@ -205,6 +215,7 @@ def check_erase_beside_training(case: str) -> None:
         0,
     ), f"{label}: counts {(erased, spared)} on rank {dist.get_rank()}"
     _expect(model, table_names, NEW_KEYS + LATER_KEYS, label)
+    hier_switch.release()
 
 
 def check_host_only_is_refused() -> None:
@@ -219,6 +230,7 @@ def check_host_only_is_refused() -> None:
     else:
         raise AssertionError("an erase of a host-only table was not refused")
     _expect(model, table_names, OLD_KEYS, "host only")
+    hier_switch.release()
 
 
 if __name__ == "__main__":

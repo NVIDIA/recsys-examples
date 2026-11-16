@@ -22,7 +22,6 @@ from pathlib import Path
 from urllib.request import urlretrieve
 from zipfile import BadZipFile, ZipFile
 
-
 MOVIELENS_1M_URL = "https://files.grouplens.org/datasets/movielens/ml-1m.zip"
 
 
@@ -50,7 +49,9 @@ def ensure_movielens_1m(data_dir: str | Path, url: str = MOVIELENS_1M_URL) -> Pa
         zf.extractall(root)
 
     if not ratings_path.exists():
-        raise FileNotFoundError(f"Extraction finished but {ratings_path} was not found.")
+        raise FileNotFoundError(
+            f"Extraction finished but {ratings_path} was not found."
+        )
     print(f"Ready: {ratings_path}")
     return ratings_path
 
@@ -65,7 +66,9 @@ def _valid_zip(path: Path) -> bool:
 
 def main() -> None:
     p = argparse.ArgumentParser()
-    p.add_argument("--data-dir", type=str, default=str(Path(__file__).resolve().parent / "data"))
+    p.add_argument(
+        "--data-dir", type=str, default=str(Path(__file__).resolve().parent / "data")
+    )
     args = p.parse_args()
     ensure_movielens_1m(args.data_dir)
 

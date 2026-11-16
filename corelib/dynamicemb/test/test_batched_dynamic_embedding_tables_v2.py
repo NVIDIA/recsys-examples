@@ -645,7 +645,7 @@ def _kim_scan_keys_embeddings_dict(
         ):
             if keys.numel() == 0:
                 continue
-            scores = named_scores[score_name]
+            scores = named_scores[score_name]  # noqa: F841
             flat_rows = indices
             values = load_from_flat_single_table(state, flat_rows, tid)
             embeddings = values[:, :emb_dim_t].contiguous().to(device)
@@ -1359,7 +1359,7 @@ def init_embedding_tables(stbe, bdet):
         num_emb = split.size(0)
         emb_dim = split.size(1)
         opt_state_dim = optimizer.get_state_dim(emb_dim)
-        val_dim = emb_dim + opt_state_dim
+        emb_dim + opt_state_dim
         indices = torch.arange(num_emb, device=split.device, dtype=torch.long)
         table_ids = torch.full(
             (num_emb,), table_idx, dtype=torch.int64, device=split.device

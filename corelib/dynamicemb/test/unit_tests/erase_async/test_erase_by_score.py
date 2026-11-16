@@ -22,6 +22,7 @@ from dynamicemb.key_ownership import murmur3_hash_64bits
 from dynamicemb.scored_hashtable import ScoreArg, ScoreSpec, get_scored_table
 from dynamicemb_extensions import ScorePolicy
 from helpers import BUCKET, erased_and_spared, new_counts
+
 SCORE = "s"
 EMPTY_KEY = (1 << 64) - 1
 RECLAIM_KEY = (1 << 64) - 2
@@ -67,7 +68,9 @@ def find(table, keys, table_id, device):
         (30, False),  # a table that keeps no ref counter spares nothing either
     ],
 )
-def test_erases_exactly_the_keys_below_the_threshold(device, threshold, use_ref_counter):
+def test_erases_exactly_the_keys_below_the_threshold(
+    device, threshold, use_ref_counter
+):
     table = make_table([BUCKET * 64], use_ref_counter=use_ref_counter)
     keys = list(range(1, 2001))
     scores = [k % 100 for k in keys]  # 0..99, twenty keys of each
@@ -88,7 +91,9 @@ def test_erases_exactly_the_keys_below_the_threshold(device, threshold, use_ref_
         score_out, founds = find(table, kept, 0, device)
         assert bool(founds.all())
         # What is kept is untouched, its score included.
-        expected = torch.tensor([k % 100 for k in kept], dtype=torch.int64, device=device)
+        expected = torch.tensor(
+            [k % 100 for k in kept], dtype=torch.int64, device=device
+        )
         assert torch.equal(score_out.to(torch.int64), expected)
     # Strictly below: a key scored exactly the threshold is among the kept.
     if equal:
@@ -112,11 +117,15 @@ def test_scanning_in_chunks_erases_the_same_keys(device, chunk):
     fill(chunked, keys, scores, 0, device)
     counts_chunked = new_counts(device)
     for start in range(0, n, chunk):
-        chunked.erase_by_score(0, 40, counts_chunked, begin=start, end=min(start + chunk, n))
+        chunked.erase_by_score(
+            0, 40, counts_chunked, begin=start, end=min(start + chunk, n)
+        )
 
     assert erased_and_spared(counts_chunked) == erased_and_spared(counts_whole)
     assert int(chunked.size()) == int(whole.size())
-    assert torch.equal(find(chunked, keys, 0, device)[1], find(whole, keys, 0, device)[1])
+    assert torch.equal(
+        find(chunked, keys, 0, device)[1], find(whole, keys, 0, device)[1]
+    )
 
 
 def test_only_the_named_table_is_scanned(device):
@@ -146,7 +155,9 @@ def test_a_pinned_slot_is_spared_whatever_its_score(device, table_id):
     other = 1 - table_id
     keys = list(range(1, 801))
     scores = [k % 100 for k in keys]
-    fill(table, keys, scores, other, device)  # the same keys in the other table, unpinned
+    fill(
+        table, keys, scores, other, device
+    )  # the same keys in the other table, unpinned
     slots = fill(table, keys, scores, table_id, device)
     assert bool((slots >= 0).all())
 
@@ -159,8 +170,12 @@ def test_a_pinned_slot_is_spared_whatever_its_score(device, table_id):
     table.erase_by_score(table_id, 50, counts)
     assert erased_and_spared(counts) == (len(below) - len(pinned), len(pinned))
     pinned_keys = [keys[i] for i in pinned]
-    assert bool(find(table, pinned_keys, table_id, device)[1].all()), "a pinned key was erased"
-    assert bool(find(table, keys, other, device)[1].all()), "the other table was touched"
+    assert bool(
+        find(table, pinned_keys, table_id, device)[1].all()
+    ), "a pinned key was erased"
+    assert bool(
+        find(table, keys, other, device)[1].all()
+    ), "the other table was touched"
 
     # Released, the same keys go the next time, and nothing is spared. A fresh
     # ``counts``: they add up across calls, so this one says what this scan did.

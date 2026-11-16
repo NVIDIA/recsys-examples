@@ -109,11 +109,18 @@ contract family.
 ### NVE support
 
 Python export/reload and native C++ replay support NVE 26.05 and the
-submodule-backed default (26.06 or later). Upgrading the submodule updates the
-default without changing these workflows. The Triton model-init hook supports
-only 26.05.
+submodule-backed default (26.06 or later). A compatible newer submodule uses the
+same modern path; rebuild NVE, the native adapters, and replay plugins with
+matching headers/libraries. DynamicEmb pooled collections require 26.07+ (or
+legacy 26.05), and Host collections require 26.09+; see the
+[collection compatibility table](../../../corelib/dynamicemb/docs/nve_tier_updates.md).
+The Triton model-init hook and its runtime image support only 26.05.
 
-The default needs no `NVE_VERSION`. To select 26.05 before starting Python:
+The default needs no `NVE_VERSION`. This variable selects the `26.05` or
+`default` installation family; it does not install or select an arbitrary
+release. Use two components (for example, `26.10`) when setting it for C++
+replay; that parser rejects patch-level strings such as `26.10.0`.
+To select 26.05 before starting Python:
 
 ```bash
 export NVE_INSTALL_ROOT=/opt/nve

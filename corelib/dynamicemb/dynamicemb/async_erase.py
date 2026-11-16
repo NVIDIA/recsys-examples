@@ -242,7 +242,9 @@ class EraseHandleGroup(EraseHandle):
     ``__init__`` and answers every question through the handles it holds.
     """
 
-    def __init__(self, handles: "list[EraseHandle]") -> None:  # noqa: super-init-not-called
+    def __init__(
+        self, handles: "list[EraseHandle]"
+    ) -> None:  # noqa: super-init-not-called
         self._handles = list(handles)
 
     def done(self) -> bool:
@@ -259,7 +261,10 @@ class EraseHandleGroup(EraseHandle):
 
     def result(self) -> Tuple[int, int]:
         results = [handle.result() for handle in self._handles]
-        return (sum(erased for erased, _ in results), sum(spared for _, spared in results))
+        return (
+            sum(erased for erased, _ in results),
+            sum(spared for _, spared in results),
+        )
 
 
 class AsyncEraser:

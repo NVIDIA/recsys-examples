@@ -21,6 +21,7 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 #include "ATen/ATen.h"
 #include "ATen/cuda/CUDAContext.h"
 #include "check.h"
+#include "hier_output_dist/common/common.h"
 #include "lookup_backward.h"
 #include "lookup_forward.h"
 #include "lookup_kernel.cuh"
@@ -78,7 +79,10 @@ std::vector<int64_t> offsets_to_table_features_offsets(
   return table_features_offsets;
 }
 
-void gather_embedding(at::Tensor input, at::Tensor output, at::Tensor index) {
+// Row i of output (row out_row[i] with out_row, int32 [index.numel()]) gets
+// row index[i] of input.
+void gather_embedding(at::Tensor input, at::Tensor output, at::Tensor index,
+                      const std::optional<at::Tensor> &out_row = std::nullopt) {
   auto stream = at::cuda::getCurrentCUDAStream().stream();
   auto &device_prop = DeviceProp::getDeviceProp(index.device().index());
   int num_sms = device_prop.num_sms;
@@ -99,10 +103,17 @@ void gather_embedding(at::Tensor input, at::Tensor output, at::Tensor index) {
     throw std::runtime_error(
         "Number cols of `output` must match with `input`.");
   }
+  TORCH_CHECK(!out_row.has_value() ||
+                  (out_row->is_cuda() && out_row->is_contiguous() &&
+                   out_row->scalar_type() == at::kInt &&
+                   out_row->numel() == num_total),
+              "out_row must be a contiguous CUDA int32 tensor of a row per "
+              "index");
   int64_t src_stride = input.stride(0);
-  dyn_emb::scatter_fused(input.data_ptr(), output.data_ptr(), index.data_ptr(),
-                         num_total, dim, src_stride, src_type, dst_type,
-                         index_type, num_sms, stream);
+  dyn_emb::scatter_fused(
+      input.data_ptr(), output.data_ptr(), index.data_ptr(), num_total, dim,
+      src_stride, src_type, dst_type, index_type, num_sms, stream,
+      out_row.has_value() ? out_row->data_ptr<int32_t>() : nullptr);
 }
 
 void gather_embedding_pooled(
@@ -211,14 +222,17 @@ generate_grad_infos_pooled_kernel(const index_t *__restrict__ offsets,
 }
 
 // Sequence lookups already have one grads row per key, so the row is the key's
-// own index and nothing is pooled, hence no weight.
+// own index (grad_rows[i] when the output rows were placed by a row map) and
+// nothing is pooled, hence no weight.
 template <typename index_t>
 __global__ void
 generate_grad_infos_sequence_kernel(int64_t num_keys,
+                                    const int32_t *__restrict__ grad_rows,
                                     GradInfo<index_t> *__restrict__ grad_infos) {
   for (int64_t i = blockIdx.x * (int64_t)blockDim.x + threadIdx.x; i < num_keys;
        i += (int64_t)gridDim.x * blockDim.x) {
-    grad_infos[i] = GradInfo<index_t>{static_cast<index_t>(i), 1.0f};
+    const int64_t row = grad_rows != nullptr ? grad_rows[i] : i;
+    grad_infos[i] = GradInfo<index_t>{static_cast<index_t>(row), 1.0f};
   }
 }
 
@@ -229,7 +243,8 @@ reduce_grads(at::Tensor inverse_index, at::Tensor grads, int64_t num_unique,
              const std::optional<at::Tensor> &D_offsets = std::nullopt,
              PoolingMode pooling_mode = PoolingMode::kNone, int total_D = 0,
 	     const std::optional<at::Tensor> &weights = std::nullopt,
-             bool feature_dims_vec4 = false) {
+             bool feature_dims_vec4 = false,
+             const std::optional<at::Tensor> &grad_rows = std::nullopt) {
   // Pooled (offsets present): grads is [B, total_D], numbered in the output's
   // order, while offsets numbers bags in the input's.  grad_infos bridges the
   // two -- one entry per key, holding the grads row that key's gradient comes
@@ -239,7 +254,9 @@ reduce_grads(at::Tensor inverse_index, at::Tensor grads, int64_t num_unique,
   // fused into the stage-1 kernel either way.  See pooled_layout.cuh.
   //
   // Sequence (offsets absent): one grads row per key already, so the row is
-  // just the key's index.
+  // just the key's index, or grad_rows[key] when the forward placed key i's
+  // output row at grad_rows[i] (an output dist's row map): the sort by the
+  // inverse index stays the same, so the sums are too.
   //
   // The pooling weight rides in the same GradInfo as the row, so the single
   // sort below carries it to the reduce; see GradInfo in lookup_backward.h for
@@ -267,6 +284,16 @@ reduce_grads(at::Tensor inverse_index, at::Tensor grads, int64_t num_unique,
   }
 
   at::Tensor unique_grads = at::empty({num_unique, out_dim}, grads.options());
+
+  TORCH_CHECK(!grad_rows.has_value() ||
+                  (!offsets.has_value() && grad_rows->is_cuda() &&
+                   grad_rows->is_contiguous() &&
+                   grad_rows->scalar_type() == at::kInt &&
+                   grad_rows->numel() == num_keys),
+              "grad_rows must be a contiguous CUDA int32 tensor of a row per "
+              "key, on the sequence path");
+  const int32_t *d_grad_rows =
+      grad_rows.has_value() ? grad_rows->data_ptr<int32_t>() : nullptr;
 
   // Validated before anything reads it, since the grad_infos kernel below is
   // the first consumer.
@@ -366,7 +393,8 @@ reduce_grads(at::Tensor inverse_index, at::Tensor grads, int64_t num_unique,
           std::min((num_keys + kBlockSize - 1) / kBlockSize,
                    (int64_t)max_grid_size));
       generate_grad_infos_sequence_kernel<index_t>
-          <<<key_grid, kBlockSize, 0, stream>>>(num_keys, d_grad_infos);
+          <<<key_grid, kBlockSize, 0, stream>>>(num_keys, d_grad_rows,
+                                                d_grad_infos);
     }
     DEMB_CUDA_KERNEL_LAUNCH_CHECK();
 
@@ -413,7 +441,9 @@ reduce_grads(at::Tensor inverse_index, at::Tensor grads, int64_t num_unique,
 
 // NumRegions: 0 = contiguous, 1 = emb-only, 2 = two-region (emb + opt)
 // When NumRegions==0, scalar_table_id is used directly (table_ids may be
-// nullptr).
+// nullptr). Output row i takes entry entry_of_row[i] of indices and table_ids
+// (entry i when entry_of_row is nullptr), and lies at row out_row[i] of output
+// (row i when out_row is nullptr).
 template <int NumRegions, typename IndexT, typename ValueT>
 __global__ void load_from_flat_table_kernel_vec4(
     int64_t batch, int64_t output_dim, int64_t output_stride,
@@ -422,7 +452,8 @@ __global__ void load_from_flat_table_kernel_vec4(
     int64_t const *__restrict__ table_ptrs,
     int64_t const *__restrict__ table_value_dims,
     int64_t const *__restrict__ table_emb_dims, int64_t max_emb_dim,
-    int64_t scalar_table_id) {
+    int64_t scalar_table_id, int64_t const *__restrict__ entry_of_row,
+    int32_t const *__restrict__ out_row) {
 
   constexpr int kWarpSize = 32;
   constexpr int VecSize = 4;
@@ -445,16 +476,18 @@ __global__ void load_from_flat_table_kernel_vec4(
 
   for (int64_t emb_id = warp_num_per_block * blockIdx.x + warp_id_in_block;
        emb_id < batch; emb_id += gridDim.x * warp_num_per_block) {
-    IndexT index = indices[emb_id];
+    int64_t entry = entry_of_row != nullptr ? entry_of_row[emb_id] : emb_id;
+    IndexT index = indices[entry];
     if (index < 0)
       continue;
 
-    int64_t table_id = NumRegions == 0 ? scalar_table_id : table_ids[emb_id];
+    int64_t table_id = NumRegions == 0 ? scalar_table_id : table_ids[entry];
     int64_t vdim = table_value_dims[table_id];
     ValueT const *src_base =
         reinterpret_cast<ValueT const *>(table_ptrs[table_id]) +
         static_cast<int64_t>(index) * vdim;
-    ValueT *dst_base = output + emb_id * output_stride;
+    const int64_t row = out_row != nullptr ? out_row[emb_id] : emb_id;
+    ValueT *dst_base = output + row * output_stride;
 
     if constexpr (NumRegions == 0) {
       int64_t copy_len = vdim < output_dim ? vdim : output_dim;
@@ -475,27 +508,29 @@ __global__ void load_from_flat_table_kernel_vec4(
 }
 
 template <int NumRegions, typename IndexT, typename ValueT>
-__global__ void
-load_from_flat_table_kernel(int64_t batch, int64_t output_dim,
-                            int64_t output_stride, ValueT *__restrict__ output,
-                            IndexT const *__restrict__ indices,
-                            int64_t const *__restrict__ table_ids,
-                            int64_t const *__restrict__ table_ptrs,
-                            int64_t const *__restrict__ table_value_dims,
-                            int64_t const *__restrict__ table_emb_dims,
-                            int64_t max_emb_dim, int64_t scalar_table_id) {
+__global__ void load_from_flat_table_kernel(
+    int64_t batch, int64_t output_dim, int64_t output_stride,
+    ValueT *__restrict__ output, IndexT const *__restrict__ indices,
+    int64_t const *__restrict__ table_ids,
+    int64_t const *__restrict__ table_ptrs,
+    int64_t const *__restrict__ table_value_dims,
+    int64_t const *__restrict__ table_emb_dims, int64_t max_emb_dim,
+    int64_t scalar_table_id, int64_t const *__restrict__ entry_of_row,
+    int32_t const *__restrict__ out_row) {
 
   for (int64_t emb_id = blockIdx.x; emb_id < batch; emb_id += gridDim.x) {
-    IndexT index = indices[emb_id];
+    int64_t entry = entry_of_row != nullptr ? entry_of_row[emb_id] : emb_id;
+    IndexT index = indices[entry];
     if (index < 0)
       continue;
 
-    int64_t table_id = NumRegions == 0 ? scalar_table_id : table_ids[emb_id];
+    int64_t table_id = NumRegions == 0 ? scalar_table_id : table_ids[entry];
     int64_t vdim = table_value_dims[table_id];
     ValueT const *src_base =
         reinterpret_cast<ValueT const *>(table_ptrs[table_id]) +
         static_cast<int64_t>(index) * vdim;
-    ValueT *dst_base = output + emb_id * output_stride;
+    const int64_t row = out_row != nullptr ? out_row[emb_id] : emb_id;
+    ValueT *dst_base = output + row * output_stride;
 
     if constexpr (NumRegions == 0) {
       int64_t copy_len = vdim < output_dim ? vdim : output_dim;
@@ -613,20 +648,36 @@ __global__ void store_to_flat_table_kernel(
 }
 
 template <int NumRegions>
-void load_from_flat_table_impl(at::Tensor table_ptrs, at::Tensor indices,
-                               int64_t const *table_ids_ptr,
-                               int64_t scalar_table_id, at::Tensor output,
-                               at::Tensor table_value_dims,
-                               at::Tensor table_emb_dims, int64_t max_emb_dim,
-                               bool all_dims_vec4) {
+void load_from_flat_table_impl(
+    at::Tensor table_ptrs, at::Tensor indices, int64_t const *table_ids_ptr,
+    int64_t scalar_table_id, at::Tensor output, at::Tensor table_value_dims,
+    at::Tensor table_emb_dims, int64_t max_emb_dim, bool all_dims_vec4,
+    c10::optional<at::Tensor> entry_of_row = c10::nullopt,
+    c10::optional<at::Tensor> out_row = c10::nullopt) {
 
-  int64_t num_total = indices.size(0);
+  int64_t num_total =
+      entry_of_row.has_value() ? entry_of_row->size(0) : indices.size(0);
   if (num_total == 0)
     return;
 
   TORCH_CHECK(output.dim() == 2, "output must be 2-D");
-  TORCH_CHECK(output.size(0) == num_total,
-              "output.size(0) must match indices.size(0)");
+  TORCH_CHECK(output.size(0) == num_total, "output.size(0) must match ",
+              entry_of_row.has_value() ? "entry_of_row" : "indices",
+              ".size(0)");
+  TORCH_CHECK(!entry_of_row.has_value() ||
+                  (entry_of_row->is_cuda() && entry_of_row->is_contiguous() &&
+                   entry_of_row->scalar_type() == at::kLong),
+              "entry_of_row must be a contiguous CUDA int64 tensor");
+  int64_t const *entry_of_row_ptr =
+      entry_of_row.has_value() ? entry_of_row->data_ptr<int64_t>() : nullptr;
+  TORCH_CHECK(!out_row.has_value() ||
+                  (out_row->is_cuda() && out_row->is_contiguous() &&
+                   out_row->scalar_type() == at::kInt &&
+                   out_row->numel() == num_total),
+              "out_row must be a contiguous CUDA int32 tensor of a row per "
+              "output row");
+  int32_t const *out_row_ptr =
+      out_row.has_value() ? out_row->data_ptr<int32_t>() : nullptr;
 
   int64_t output_dim = output.size(1);
   int64_t output_stride = output.stride(0);
@@ -663,7 +714,7 @@ void load_from_flat_table_impl(at::Tensor table_ptrs, at::Tensor indices,
                 table_ids_ptr, get_pointer<int64_t>(table_ptrs),
                 get_pointer<int64_t>(table_value_dims),
                 get_pointer<int64_t>(table_emb_dims), max_emb_dim,
-                scalar_table_id);
+                scalar_table_id, entry_of_row_ptr, out_row_ptr);
       } else {
         int block_size = output_dim < device_prop.max_thread_per_block
                              ? static_cast<int>(output_dim)
@@ -677,7 +728,7 @@ void load_from_flat_table_impl(at::Tensor table_ptrs, at::Tensor indices,
                 table_ids_ptr, get_pointer<int64_t>(table_ptrs),
                 get_pointer<int64_t>(table_value_dims),
                 get_pointer<int64_t>(table_emb_dims), max_emb_dim,
-                scalar_table_id);
+                scalar_table_id, entry_of_row_ptr, out_row_ptr);
       }
     });
   });
@@ -698,10 +749,13 @@ void load_from_flat_table_emb(at::Tensor table_ptrs, at::Tensor indices,
                               at::Tensor table_ids, at::Tensor output,
                               at::Tensor table_value_dims,
                               at::Tensor table_emb_dims, int64_t max_emb_dim,
-                              bool all_dims_vec4) {
-  load_from_flat_table_impl<1>(
-      table_ptrs, indices, get_pointer<int64_t>(table_ids), 0, output,
-      table_value_dims, table_emb_dims, max_emb_dim, all_dims_vec4);
+                              bool all_dims_vec4,
+                              c10::optional<at::Tensor> entry_of_row,
+                              c10::optional<at::Tensor> out_row) {
+  load_from_flat_table_impl<1>(table_ptrs, indices,
+                               get_pointer<int64_t>(table_ids), 0, output,
+                               table_value_dims, table_emb_dims, max_emb_dim,
+                               all_dims_vec4, entry_of_row, out_row);
 }
 
 void load_from_flat_table_value(at::Tensor table_ptrs, at::Tensor indices,
@@ -964,17 +1018,28 @@ void bind_dyn_emb_op(py::module &m) {
   // DynamicEmbPoolingMode, which is an IntEnum -- can be passed straight through.
   py::implicitly_convertible<py::int_, dyn_emb::PoolingMode>();
 
+  // Single source of truth for the bound of the hierarchical dist's
+  // capacities (kMaxEntries): dynamicemb_config.py checks
+  // output_dist_capacity against it. Bound here, in every build, since the
+  // dist's own bindings (bind.cu) are built only with NCCL >= 2.30.7.
+  m.def(
+      "hier_output_dist_max_capacity",
+      []() { return dyn_emb::hier_output_dist::kMaxEntries; },
+      "Every capacity of the hierarchical dist stays below this many entries");
+
   m.def("reduce_grads", &reduce_grads, "reduce grads",
         py::arg("inverse_index"), py::arg("grads"), py::arg("num_unique"),
         py::arg("batch_size"), py::arg("out_dim"),
         py::arg("offsets") = py::none(), py::arg("D_offsets") = py::none(),
         py::arg("pooling_mode") = dyn_emb::PoolingMode::kNone,
         py::arg("total_D") = 0, py::arg("weights") = py::none(),
-        py::arg("feature_dims_vec4") = false);
+        py::arg("feature_dims_vec4") = false, py::arg("grad_rows") = py::none());
 
   m.def("gather_embedding", &gather_embedding,
-        "Gather embedding based on index.", py::arg("input"), py::arg("output"),
-        py::arg("index"));
+        "Gather embedding based on index; output row out_row[i] (int32) takes "
+        "index[i] if out_row is given.",
+        py::arg("input"), py::arg("output"), py::arg("index"),
+        py::arg("out_row") = py::none());
 
   m.def("gather_embedding_pooled", &gather_embedding_pooled,
         "Gather embedding with pooling (SUM/MEAN) based on the dedup inverse "
@@ -994,11 +1059,15 @@ void bind_dyn_emb_op(py::module &m) {
         py::arg("all_dims_vec4"));
 
   m.def("load_from_flat_table_emb", &load_from_flat_table_emb,
-        "Load from flat table: emb-only copy (NumRegions=1, EMBEDDING mode).",
+        "Load from flat table: emb-only copy (NumRegions=1, EMBEDDING mode); "
+        "output row i takes entry entry_of_row[i] of indices and table_ids if "
+        "entry_of_row is given, and lies at row out_row[i] (int32) of output "
+        "if out_row is given.",
         py::arg("table_ptrs"), py::arg("indices"), py::arg("table_ids"),
         py::arg("output"), py::arg("table_value_dims"),
         py::arg("table_emb_dims"), py::arg("max_emb_dim"),
-        py::arg("all_dims_vec4"));
+        py::arg("all_dims_vec4"), py::arg("entry_of_row") = py::none(),
+        py::arg("out_row") = py::none());
 
   m.def("load_from_flat_table_value", &load_from_flat_table_value,
         "Load from flat table: 2-region copy (NumRegions=2, VALUE mode).",

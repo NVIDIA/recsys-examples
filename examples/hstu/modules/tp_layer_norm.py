@@ -128,7 +128,8 @@ class TPLayerNormMulDropout(torch.nn.Module):
 
         """
         if u.dim() == 3:
-            u = u.contiguous().view(u.size(0), -1)
+            # flatten, not view(T, -1): a rank with an empty batch has T = 0
+            u = u.contiguous().flatten(1)
         weight = self.weight
         bias = self.bias
         if self._sequence_parallel:

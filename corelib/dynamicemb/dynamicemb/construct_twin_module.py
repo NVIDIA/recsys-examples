@@ -142,6 +142,7 @@ def get_planner(
     device,
     use_dynamicemb,
     dist_type: str = "roundrobin",
+    dynamicemb_options_kwargs: Optional[Dict[str, Any]] = None,
 ):
     dict_const = {}
     for i, config in enumerate(eb_configs):
@@ -158,6 +159,7 @@ def get_planner(
                 dynamicemb_options=DynamicEmbTableOptions(
                     global_hbm_for_values=1024**3,
                     dist_type=dist_type,
+                    **(dynamicemb_options_kwargs or {}),
                 ),
             )
         else:
@@ -215,6 +217,8 @@ class ConstructTwinModule:
         world_size: int = 1,
         scale_factor: int = 2,
         dist_type: str = "roundrobin",
+        dynamicemb_options_kwargs: Optional[Dict[str, Any]] = None,
+        global_rank: Optional[int] = None,
     ) -> None:
         super().__init__()
 
@@ -235,6 +239,9 @@ class ConstructTwinModule:
         assert not is_weighted or is_pooled, "is_weighted requires a pooled collection"
         self._is_weighted = is_weighted
         self._rank = rank
+        # The owner rank of the keys this rank seeds (``owned_key_mask``).
+        # ``rank`` is the device; on one node the two are the same.
+        self._global_rank = rank if global_rank is None else global_rank
         self._world_size = world_size
         self._scale_factor = scale_factor
         self._init_fn = init_fn
@@ -242,6 +249,9 @@ class ConstructTwinModule:
         # keys this rank owns when seeding them (``init_twin_embedding_model``).
         # One value for both, so the seeding cannot disagree with the sharding.
         self._dist_type = dist_type
+        # More DynamicEmbTableOptions fields for the DynamicEmb model's tables;
+        # the reference model has no DynamicEmb tables.
+        self._dynamicemb_options_kwargs = dynamicemb_options_kwargs
 
         self._table_names = [f"t_{t}" for t in range(self._table_num)]
         self._feature_names = [f"f_{t}" for t in range(self._table_num)]
@@ -333,6 +343,7 @@ class ConstructTwinModule:
             device,
             use_dynamicemb=True,
             dist_type=self._dist_type,
+            dynamicemb_options_kwargs=self._dynamicemb_options_kwargs,
         )
         plan = planner.collective_plan(collection, [sharder], dist.GroupMember.WORLD)
         self._dynamicemb_model = DistributedModelParallel(
@@ -534,7 +545,7 @@ class ConstructTwinModule:
             values = result["values"]
 
             mask = owned_key_mask(
-                indices, self._rank, self._world_size, self._dist_type
+                indices, self._global_rank, self._world_size, self._dist_type
             )
             if mask is None:
                 mask = torch.ones_like(indices, dtype=torch.bool)

@@ -628,7 +628,10 @@ def test_new_keys_carry_a_flag_and_erased_slots_do_not(current_device):
 
     device = torch.device(f"cuda:{current_device}")
     model = build_model(
-        current_device, max_capacity=65536 * 2, init_capacity=4096, model_kwargs=NO_UPDATE
+        current_device,
+        max_capacity=65536 * 2,
+        init_capacity=4096,
+        model_kwargs=NO_UPDATE,
     )
     state = model._storage._state
     assert state.score_policy.policy == ScorePolicy.FLAG
@@ -638,7 +641,9 @@ def test_new_keys_carry_a_flag_and_erased_slots_do_not(current_device):
 
     def scores_of(ks):
         tensor = torch.tensor(ks, dtype=torch.int64, device=device)
-        arg = ScoreArg(name=state.score_policy.name, value=None, policy=ScorePolicy.CONST)
+        arg = ScoreArg(
+            name=state.score_policy.name, value=None, policy=ScorePolicy.CONST
+        )
         score_out, founds, _ = state.key_index_map.lookup(
             tensor, torch.zeros_like(tensor), arg
         )
@@ -662,7 +667,10 @@ def test_erase_and_reinsert_never_outgrows_the_value_buffer(current_device):
     them, and they never pass it."""
     device = torch.device(f"cuda:{current_device}")
     model = build_model(
-        current_device, max_capacity=65536 * 2, init_capacity=4096, model_kwargs=NO_UPDATE
+        current_device,
+        max_capacity=65536 * 2,
+        init_capacity=4096,
+        model_kwargs=NO_UPDATE,
     )
     state = model._storage._state
 
@@ -672,7 +680,9 @@ def test_erase_and_reinsert_never_outgrows_the_value_buffer(current_device):
     next_key = 10_001 + window
     for _ in range(10):
         gone, live = live[:step], live[step:]
-        model._storage.erase_keys(0, torch.tensor(gone, dtype=torch.int64, device=device))
+        model._storage.erase_keys(
+            0, torch.tensor(gone, dtype=torch.int64, device=device)
+        )
         new = list(range(next_key, next_key + step))
         next_key += step
         live += new
@@ -695,7 +705,10 @@ def test_replacing_the_whole_live_set_does_not_grow_the_key_map(current_device):
     """
     device = torch.device(f"cuda:{current_device}")
     model = build_model(
-        current_device, max_capacity=65536 * 8, init_capacity=4096, model_kwargs=NO_UPDATE
+        current_device,
+        max_capacity=65536 * 8,
+        init_capacity=4096,
+        model_kwargs=NO_UPDATE,
     )
     state = model._storage._state
 
@@ -728,7 +741,10 @@ def test_replacing_half_the_live_set_never_loses_a_live_key(current_device):
     an insert that evicts a live key leaves a key short."""
     device = torch.device(f"cuda:{current_device}")
     model = build_model(
-        current_device, max_capacity=65536 * 8, init_capacity=4096, model_kwargs=NO_UPDATE
+        current_device,
+        max_capacity=65536 * 8,
+        init_capacity=4096,
+        model_kwargs=NO_UPDATE,
     )
     state = model._storage._state
 
@@ -738,15 +754,17 @@ def test_replacing_half_the_live_set_never_loses_a_live_key(current_device):
     next_key = 10_001 + window
     for r in range(40):  # enough rounds for the buckets to fill with erased slots
         gone, live = live[:half], live[half:]
-        model._storage.erase_keys(0, torch.tensor(gone, dtype=torch.int64, device=device))
+        model._storage.erase_keys(
+            0, torch.tensor(gone, dtype=torch.int64, device=device)
+        )
         new = list(range(next_key, next_key + half))
         next_key += half
         assert_debug_values(train_step(model, new, device), new)
         live += new
         km = state.key_index_map
-        assert int(km.size(0)) == len(live), (
-            f"round {r}: {len(live) - int(km.size(0))} live keys were given up"
-        )
+        assert int(km.size(0)) == len(
+            live
+        ), f"round {r}: {len(live) - int(km.size(0))} live keys were given up"
         assert km.capacity(0) == 8192, f"round {r}: the key map grew"
 
 
@@ -779,7 +797,10 @@ def test_load_expands_for_every_key_in_the_checkpoint(
 
         target = build_model(current_device, max_capacity=65536 * 2, init_capacity=1024)
         state = target._storage._state
-        assert (state.key_index_map.capacity(0), state.tables[0].shape[0]) == (2048, 1024)
+        assert (state.key_index_map.capacity(0), state.tables[0].shape[0]) == (
+            2048,
+            1024,
+        )
         target.load(save_dir)
         torch.cuda.synchronize()
 
@@ -822,7 +843,10 @@ def test_load_reserves_room_only_for_the_keys_this_rank_keeps(current_device):
             dist_type="roundrobin",
         )
         state = target._storage._state
-        assert (state.key_index_map.capacity(0), state.tables[0].shape[0]) == (2048, 1024)
+        assert (state.key_index_map.capacity(0), state.tables[0].shape[0]) == (
+            2048,
+            1024,
+        )
         # This module is one rank of a larger group as far as the load is concerned.
         original = (target._shard_index, target._num_shards)
         target._shard_index, target._num_shards = shard_index, num_shards

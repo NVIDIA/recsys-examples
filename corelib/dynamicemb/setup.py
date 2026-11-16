@@ -13,27 +13,41 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import importlib.util
 import os
 import re
+import shutil
 import subprocess
 import sys
 from pathlib import Path
 
-from setuptools import find_packages, setup
-from torch.utils.cpp_extension import BuildExtension, CUDAExtension
+import torch
+from setuptools import Extension, find_packages, setup
+from torch.utils.cpp_extension import CUDA_HOME, BuildExtension, CUDAExtension
 
-subprocess.run(
-    [
-        sys.executable,
-        "-m",
-        "pip",
-        "uninstall",
-        "-y",
-        "dynamicemb",
-        "--break-system-packages",
-    ]
-)
-subprocess.run(["pip", "install", "ordered-set", "--break-system-packages"])
+cpu_option = os.environ.get("DYNAMICEMB_CPU_ONLY", "0")
+if cpu_option not in {"0", "1"}:
+    raise ValueError("DYNAMICEMB_CPU_ONLY must be 0 or 1")
+CPU_ONLY = cpu_option == "1"
+BUILD_TRAINING = not CPU_ONLY
+if CPU_ONLY and torch.version.cuda is not None:
+    raise ValueError("DYNAMICEMB_CPU_ONLY requires CPU-only PyTorch")
+if not BUILD_TRAINING and os.environ.get("DYNAMICEMB_BUILD_INFERENCE") == "0":
+    raise ValueError("Inference-only builds require DYNAMICEMB_BUILD_INFERENCE=1")
+
+if BUILD_TRAINING:
+    subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "pip",
+            "uninstall",
+            "-y",
+            "dynamicemb",
+            "--break-system-packages",
+        ]
+    )
+    subprocess.run(["pip", "install", "ordered-set", "--break-system-packages"])
 
 # TODO: update when torchrec release compatible commit.
 compatible_versions = "1.2.0"
@@ -76,7 +90,8 @@ def find_source_files(
     return source_files
 
 
-check_torchrec_version()
+if BUILD_TRAINING:
+    check_torchrec_version()
 
 library_name = "dynamicemb"
 
@@ -103,12 +118,28 @@ def get_version():
     return version, sha
 
 
+def _default_archs():
+    """75;80;90;100;103;120, less those the CUDA compiler cannot build: sm_103
+    (GB300) needs CUDA 12.9 or newer. Without an answer from nvcc, the list
+    without 103."""
+    archs = ["75", "80", "90", "100", "103", "120"]
+    nvcc = os.path.join(CUDA_HOME or "/usr/local/cuda", "bin", "nvcc")
+    try:
+        supported = subprocess.check_output(
+            [nvcc, "--list-gpu-code"], text=True
+        ).split()
+    except (OSError, subprocess.CalledProcessError):
+        return [a for a in archs if a != "103"]
+    return [a for a in archs if f"sm_{a}" in supported]
+
+
 # Target GPU compute capabilities (no dot). Parsed in two places: the main
 # extension's -gencode flags and the LruLfu evict fatbins. Override with
-# DEMB_ARCHS="80;90;100".
+# DEMB_ARCHS="80;90;100". TORCH_CUDA_ARCH_LIST does not apply: these
+# -gencode flags take its place.
 DEMB_ARCHS = [
     a.strip()
-    for a in os.environ.get("DEMB_ARCHS", "75;80;90;100;120")
+    for a in (os.environ.get("DEMB_ARCHS") or ";".join(_default_archs()))
     .replace(",", ";")
     .split(";")
     if a.strip()
@@ -122,6 +153,42 @@ def _gencode_flags(code_kind):
     for a in DEMB_ARCHS:
         flags += ["-gencode", f"arch=compute_{a},code={code_kind}_{a}"]
     return flags
+
+
+# The hierarchical dist (src/hier_output_dist) uses NCCL's device API with
+# railed GIN and ncclGin_StrongSignalAdd: NCCL 2.30.7 or newer. Without it the
+# extension is built without that op.
+NCCL_MIN_VERSION_CODE = 23007
+
+
+def _nccl_version_code(include_dir):
+    """NCCL_VERSION_CODE of include_dir/nccl.h, None if there is none."""
+    header = os.path.join(include_dir, "nccl.h")
+    if not os.path.isfile(header):
+        return None
+    with open(header) as header_file:
+        match = re.search(r"#define\s+NCCL_VERSION_CODE\s+(\d+)", header_file.read())
+    return int(match.group(1)) if match else None
+
+
+def find_nccl():
+    """(NCCL_HOME or None, version code or None) of the NCCL to build with:
+    $NCCL_HOME if set, else the first nccl.h in the order the compiler looks:
+    $CUDA_HOME/include, /usr/local/include, /usr/include."""
+    nccl_home = os.environ.get("NCCL_HOME")
+    if nccl_home:
+        return nccl_home, _nccl_version_code(os.path.join(nccl_home, "include"))
+    from torch.utils.cpp_extension import CUDA_HOME
+
+    for include_dir in (
+        os.path.join(CUDA_HOME or "/usr/local/cuda", "include"),
+        "/usr/local/include",
+        "/usr/include",
+    ):
+        code = _nccl_version_code(include_dir)
+        if code is not None:
+            return None, code
+    return None, None
 
 
 def get_extensions():
@@ -151,22 +218,65 @@ def get_extensions():
         ],
     }
 
-    cuda_sources = find_source_files(
-        os.path.join(root_path, "src"),
-        r".*\.cu$|.*\.cpp$|.*\.c$|.*\.cxx$",
-        exclude_files=[
-            "lookup_torch_binding.cu",
-            "get_table_range_torch_binding.cu",
-            "expand_table_ids_torch_binding.cu",
-            # Built separately into standalone fatbins (Lex + custom LTO-IR),
-            # shipped as package_data; NOT linked into the .so.
-            "evict_lrulfu.cu",
-        ],
-    )
-
+    exclude_files = [
+        "lookup_torch_binding.cu",
+        "get_table_range_torch_binding.cu",
+        "expand_table_ids_torch_binding.cu",
+        "indexer_directory.cpp",
+        "indexer_snapshot.cpp",
+        "indexer_ops.cu",
+        "indexer_cpu.cpp",
+        "inference_emb_schemas.cpp",
+        "incremental_update.cpp",
+        "nve_runtime.cu",
+        "nve_tier_pybind.cu",
+        "exportable_embedding_pybind.cpp",
+        "indexer_directory_pybind.cpp",
+        "indexer_snapshot_pybind.cpp",
+        "update_subscriber_pybind.cu",
+        "update_subscriber_unavailable_pybind.cpp",
+        # Built separately into standalone fatbins (Lex + custom LTO-IR),
+        # shipped as package_data; NOT linked into the .so.
+        "evict_lrulfu.cu",
+    ]
     include_dirs = [
         root_path / "src",
     ]
+    library_dirs = []
+
+    cuda_sources = find_source_files(
+        os.path.join(root_path, "src"),
+        r".*\.cu$|.*\.cpp$|.*\.c$|.*\.cxx$",
+        exclude_files=exclude_files,
+    )
+
+    nccl_home, nccl_code = find_nccl()
+    if nccl_code is not None and nccl_code >= NCCL_MIN_VERSION_CODE:
+        # device API (GIN + LSA) of the hierarchical dist (src/hier_output_dist)
+        extra_link_args.append("-lnccl")
+        if nccl_home:
+            include_dirs.append(Path(nccl_home) / "include")
+            library_dirs += [
+                os.path.join(nccl_home, subdir) for subdir in ("lib", "lib64")
+            ]
+        if os.environ.get("DYNAMICEMB_HIER_TRACE") == "1":
+            for flags in extra_compile_args.values():
+                flags.append("-DDEMB_HIER_TRACE=1")
+            print(
+                "[dynamicemb] building the hierarchical dist with its trace "
+                "(DYNAMICEMB_HIER_TRACE=1)"
+            )
+    else:
+        op_dir = os.path.join(root_path, "src", "hier_output_dist") + os.sep
+        cuda_sources = [path for path in cuda_sources if not path.startswith(op_dir)]
+        for flags in extra_compile_args.values():
+            flags.append("-DDEMB_NO_HIER_OUTPUT_DIST")
+        found = "no nccl.h" if nccl_code is None else f"NCCL_VERSION_CODE {nccl_code}"
+        print(
+            "[dynamicemb] building without the hierarchical dist: it needs "
+            f"NCCL >= 2.30.7, found {found} (set NCCL_HOME to use another NCCL)"
+        )
+
     cuda_sources = [str(path) for path in cuda_sources]
     include_dirs = [str(path) for path in include_dirs]
 
@@ -177,6 +287,7 @@ def get_extensions():
             extra_compile_args=extra_compile_args,
             extra_link_args=extra_link_args,
             include_dirs=include_dirs,
+            library_dirs=library_dirs,
             # libraries=['torch', 'c10'],
         )
     ]
@@ -242,6 +353,88 @@ def compile_evict_fatbins():
         print(f"[dynamicemb] {out_name}: {os.path.getsize(out)} bytes")
 
 
+def build_inference_extensions(build_lib, inplace):
+    """Reuse the CMake build and package its bindings with their local libraries."""
+    package_dir = root_path / library_name / "exportable_embedding"
+    destination = (
+        package_dir
+        if inplace
+        else Path(build_lib) / library_name / "exportable_embedding"
+    )
+    libraries = (
+        "_C.so",
+        "_C_legacy.so",
+        "inference_emb_ops.so",
+        "inference_emb_update.so",
+    )
+    destination.mkdir(parents=True, exist_ok=True)
+    if not inplace:
+        # build_py can have copied artifacts from an earlier, different build.
+        for name in libraries:
+            (destination / name).unlink(missing_ok=True)
+    nve_spec = importlib.util.find_spec("pynve")
+    enabled = os.environ.get(
+        "DYNAMICEMB_BUILD_INFERENCE", "1" if nve_spec or not BUILD_TRAINING else "0"
+    )
+    if enabled not in {"0", "1"}:
+        raise ValueError("DYNAMICEMB_BUILD_INFERENCE must be 0 or 1")
+    if enabled == "0":
+        print(
+            "[dynamicemb] inference bindings disabled; set DYNAMICEMB_BUILD_INFERENCE=1 to enable"
+        )
+        return
+    if nve_spec is None:
+        raise RuntimeError(
+            "Inference bindings require pynve; install NVE before building DynamicEmb"
+        )
+    import pynve
+
+    # Keep CPU builds separate from cached CUDA inference/training builds.
+    build_dir = root_path / (
+        "torch_binding_build_cpu" if CPU_ONLY else "torch_binding_build"
+    )
+    command = [
+        "cmake",
+        "-S",
+        str(root_path),
+        "-B",
+        str(build_dir),
+        f"-DPython3_EXECUTABLE={sys.executable}",
+        f"-DNVE_VERSION={pynve.__version__}",
+        f"-DNVE_LIB_DIR={os.environ.get('NVE_LIB_DIR', str(Path(pynve.__file__).parent))}",
+        "-DDYNAMICEMB_ENABLE_NVE_UPDATE=ON",
+        f"-DDYNAMICEMB_CPU_ONLY={'ON' if CPU_ONLY else 'OFF'}",
+        "-DDYNAMICEMB_BUILD_PYTHON=ON",
+    ]
+    module_dir = package_dir if BUILD_TRAINING else build_dir
+    if not BUILD_TRAINING:
+        command.append(f"-DDYNAMICEMB_PYTHON_MODULE_DIR={module_dir}")
+    for name in ("NVE_ROOT", "NVTX_INCLUDE_DIR", "CMAKE_CUDA_ARCHITECTURES"):
+        if name in os.environ:
+            command.append(f"-D{name}={os.environ[name]}")
+    # Preserve an explicit CMake configuration (including Docker's GPU targets).
+    if not BUILD_TRAINING or not (build_dir / "CMakeCache.txt").exists():
+        subprocess.run(command, check=True)
+    subprocess.run(
+        ["cmake", "--build", str(build_dir), "--parallel", os.environ["MAX_JOBS"]],
+        check=True,
+    )
+    sources = [
+        module_dir / "_C.so",
+        build_dir / "inference_emb_ops.so",
+    ]
+    if not CPU_ONLY:
+        sources.append(module_dir / "_C_legacy.so")
+    update_library = build_dir / "inference_emb_update.so"
+    if update_library.exists():
+        sources.append(update_library)
+    for source in sources:
+        target = destination / source.name
+        if source.resolve() != target.resolve():
+            shutil.copy2(source, target)
+        print(f"[dynamicemb] staged {source.name} -> {target}")
+
+
 class NinjaBuildExtension(BuildExtension):
     def __init__(self, *args, **kwargs) -> None:
         # do not override env MAX_JOBS if already exists
@@ -262,9 +455,15 @@ class NinjaBuildExtension(BuildExtension):
             max_jobs = max(1, min(max_num_jobs_cores, max_num_jobs_memory))
             os.environ["MAX_JOBS"] = str(max_jobs)
 
+        if not BUILD_TRAINING:
+            # CMake writes _C.so, without Python's ABI filename suffix.
+            kwargs["no_python_abi_suffix"] = True
         super().__init__(*args, **kwargs)
 
     def run(self):
+        if not BUILD_TRAINING:
+            build_inference_extensions(self.build_lib, self.inplace)
+            return
         start_time = time.time()
         compile_evict_fatbins()
         super().run()
@@ -273,14 +472,13 @@ class NinjaBuildExtension(BuildExtension):
         # wheel/install -- copy them in now. Inplace builds import straight from
         # the source tree and don't need this.
         if not self.inplace:
-            import shutil
-
             src_dir = root_path / library_name / "jit"
             dst_dir = os.path.join(self.build_lib, library_name, "jit")
             os.makedirs(dst_dir, exist_ok=True)
             for fb in sorted(src_dir.glob("*.fatbin")):
                 shutil.copy2(str(fb), dst_dir)
                 print(f"[dynamicemb] staged {fb.name} -> {dst_dir}")
+        build_inference_extensions(self.build_lib, self.inplace)
         end_time = time.time()
         compilation_time = end_time - start_time
         print(f"compilation_time: {compilation_time}")
@@ -296,8 +494,22 @@ setup(
     maintainer_email="zehuanw@nvidia.com",
     description="Plugin for Dynamic Embedding in TorchREC",
     packages=package,
-    ext_modules=get_extensions(),
-    package_data={f"{library_name}.jit": ["*.fatbin"]},
+    # Declare the CMake-built extension so inference-only wheels are platform
+    # specific and setuptools still invokes build_ext.
+    ext_modules=(
+        get_extensions()
+        if BUILD_TRAINING
+        else [Extension(f"{library_name}.exportable_embedding._C", sources=[])]
+    ),
+    options={} if BUILD_TRAINING else {"build": {"build_base": "build_cpu"}},
+    package_data={
+        f"{library_name}.jit": ["*.fatbin"] if BUILD_TRAINING else [],
+        f"{library_name}.exportable_embedding": [
+            "_C.so",
+            "_C_legacy.so",
+            "inference_emb*.so",
+        ],
+    },
     license="BSD-3",
     keywords=[
         "pytorch",

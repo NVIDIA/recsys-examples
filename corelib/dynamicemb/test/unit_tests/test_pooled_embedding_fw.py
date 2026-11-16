@@ -284,7 +284,8 @@ def run(args):
             multi_hot_sizes=args.multi_hot_sizes,
             local_batch_size=args.batch_size // world_size,
         )
-        ret = model(sparse_feature)  # => this is awaitable
+        with torch.no_grad():
+            ret = model(sparse_feature)  # => this is awaitable
         kt = ret.values()
         feature_num = len(ret.keys())
         dims = [args.embedding_dim for _ in range(feature_num)]

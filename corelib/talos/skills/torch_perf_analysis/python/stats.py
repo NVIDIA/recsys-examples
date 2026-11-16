@@ -78,9 +78,9 @@ import sys
 from pathlib import Path
 from typing import Any
 
-try:                       # package module (python -m …python.stats)
+try:  # package module (python -m …python.stats)
     from . import correlate
-except ImportError:        # flat script (tests / vendored copy)
+except ImportError:  # flat script (tests / vendored copy)
     import correlate
 
 
@@ -112,7 +112,9 @@ def run_veloq(args: list[str]) -> dict:
             code = ""
         if code.endswith("multi-device-ambiguous") and "--all-devices" not in args:
             return run_veloq([*args, "--all-devices"])
-        sys.stderr.write(f"[stats] veloq failed (exit {result.returncode}): veloq {' '.join(args)}\n")
+        sys.stderr.write(
+            f"[stats] veloq failed (exit {result.returncode}): veloq {' '.join(args)}\n"
+        )
         sys.stderr.write(result.stderr)
         sys.stderr.write(result.stdout[:500] + "\n")
         sys.exit(result.returncode)
@@ -155,6 +157,8 @@ def _bwd_seq(row: dict, text: str) -> int | None:
     if BWD_BARE_RE.match(text):
         return _payload_seq(row)
     return None
+
+
 # The autograd engine wraps each grad_fn's full evaluation (the XxxBackward
 # apply *and* the gradient-accumulate ops that sit outside it) in this range —
 # it is the true "backward of one forward op" boundary.
@@ -182,7 +186,9 @@ def _parse_ta_seg(seg: str) -> tuple[str, str | None, str | None, str | None] | 
     return (m.group(1), m.group(2), m.group(3), m.group(4))
 
 
-def _find_ta_seg(nvtx_path: str) -> tuple[str, str | None, str | None, str | None] | None:
+def _find_ta_seg(
+    nvtx_path: str,
+) -> tuple[str, str | None, str | None, str | None] | None:
     """Innermost (deepest) ``talos::`` segment in ``nvtx_path``."""
     parsed = None
     for seg in nvtx_path.split("/"):
@@ -247,9 +253,15 @@ def synthesize_bwd_nvtx(nvtx_parquet: Path) -> int:
     # each synth row will be stamped over.
     eval_by_tid: dict[int, list[tuple[int, int]]] = {}
     for r, t in zip(rows, texts):
-        if t.startswith(EVAL_FN_PREFIX) and r.get("globalTid") is not None \
-                and r.get("start") is not None and r.get("end") is not None:
-            eval_by_tid.setdefault(int(r["globalTid"]), []).append((int(r["start"]), int(r["end"])))
+        if (
+            t.startswith(EVAL_FN_PREFIX)
+            and r.get("globalTid") is not None
+            and r.get("start") is not None
+            and r.get("end") is not None
+        ):
+            eval_by_tid.setdefault(int(r["globalTid"]), []).append(
+                (int(r["start"]), int(r["end"]))
+            )
     for ivs in eval_by_tid.values():
         ivs.sort()
 
@@ -258,10 +270,10 @@ def synthesize_bwd_nvtx(nvtx_parquet: Path) -> int:
         if not ivs:
             return None
         starts = [iv[0] for iv in ivs]
-        i = bisect.bisect_right(starts, s) - 1   # latest eval starting ≤ s
+        i = bisect.bisect_right(starts, s) - 1  # latest eval starting ≤ s
         while i >= 0:
             es, ee = ivs[i]
-            if ee >= e:                          # …that also contains the end ⇒ encloses
+            if ee >= e:  # …that also contains the end ⇒ encloses
                 return (es, ee)
             i -= 1
         return None
@@ -270,13 +282,20 @@ def synthesize_bwd_nvtx(nvtx_parquet: Path) -> int:
     # fallback, XxxBackward.start-1). A live forward range — incl. checkpoint
     # recompute — never starts at exactly those offsets.
     synth_starts = {(tid, es + 1) for tid, ivs in eval_by_tid.items() for es, _ in ivs}
-    synth_starts |= {(int(r["globalTid"]), int(r["start"]) - 1)
-                     for r, t in zip(rows, texts)
-                     if _bwd_seq(r, t) is not None
-                     and r.get("globalTid") is not None and r.get("start") is not None}
-    if any(t.startswith("talos::") and r.get("globalTid") is not None and r.get("start") is not None
-           and (int(r["globalTid"]), int(r["start"])) in synth_starts
-           for r, t in zip(rows, texts)):
+    synth_starts |= {
+        (int(r["globalTid"]), int(r["start"]) - 1)
+        for r, t in zip(rows, texts)
+        if _bwd_seq(r, t) is not None
+        and r.get("globalTid") is not None
+        and r.get("start") is not None
+    }
+    if any(
+        t.startswith("talos::")
+        and r.get("globalTid") is not None
+        and r.get("start") is not None
+        and (int(r["globalTid"]), int(r["start"])) in synth_starts
+        for r, t in zip(rows, texts)
+    ):
         sys.stderr.write("[stats]      synthesis already present; skip\n")
         return 0
 
@@ -302,9 +321,12 @@ def synthesize_bwd_nvtx(nvtx_parquet: Path) -> int:
         tid, s, e = r.get("globalTid"), int(r["start"]), int(r["end"])
         ev = enclosing_eval(int(tid), s, e) if tid is not None else None
         if ev is not None and ev[1] - 1 > ev[0] + 1:
-            new_start, new_end = ev[0] + 1, ev[1] - 1     # full backward node, strictly inside it
+            new_start, new_end = (
+                ev[0] + 1,
+                ev[1] - 1,
+            )  # full backward node, strictly inside it
         else:
-            new_start, new_end = s - 1, e + 1             # fallback: XxxBackward extent (±1 ns)
+            new_start, new_end = s - 1, e + 1  # fallback: XxxBackward extent (±1 ns)
         new_row = dict(r)
         # Stamp the forward call's talos:: label (verbatim); clear the inherited
         # textId AND payload seq (a synth talos:: row must not feed the direct
@@ -334,6 +356,7 @@ def _load_string_ids(stringids_parquet: Path) -> dict[int, str]:
     if not stringids_parquet.exists():
         return {}
     import pyarrow.parquet as pq
+
     sids = pq.read_table(stringids_parquet).to_pylist()
     return {r["id"]: r.get("value") for r in sids if r.get("id") is not None}
 
@@ -521,7 +544,9 @@ def select_typical_step(summary: dict) -> dict | None:
 # ── Phase 1.3: per-step evidence ─────────────────────────────────────
 
 
-def collect_timeline_bucket(trace: Path, ws: Path, pick: dict, n_buckets: int = 100) -> dict:
+def collect_timeline_bucket(
+    trace: Path, ws: Path, pick: dict, n_buckets: int = 100
+) -> dict:
     """Per-stream GPU timeline for the typical step. Each CUDA stream gets its
     own folder ``step_<N>/stream_<id>/`` holding three files:
       * ``timeline_bucket.json`` — the stream sliced into ``n_buckets``
@@ -555,13 +580,13 @@ def collect_timeline_bucket(trace: Path, ws: Path, pick: dict, n_buckets: int = 
     window = tl["window"]
 
     step_dir = ws / f"step_{pick['step']}"
-    for old in step_dir.glob("stream_*"):          # clear prior streams / threads
+    for old in step_dir.glob("stream_*"):  # clear prior streams / threads
         if old.is_dir():
             shutil.rmtree(old)
     for old in step_dir.glob("cpu_thread_*"):
         if old.is_dir():
             shutil.rmtree(old)
-    if (step_dir / "cpu").exists():                # remove the old flat layout
+    if (step_dir / "cpu").exists():  # remove the old flat layout
         shutil.rmtree(step_dir / "cpu")
 
     index_streams = []
@@ -569,22 +594,40 @@ def collect_timeline_bucket(trace: Path, ws: Path, pick: dict, n_buckets: int = 
         sdir = step_dir / f"stream_{sid}"
         sdir.mkdir(parents=True, exist_ok=True)
         utils = [b["util"] for b in st["buckets"]]
-        _write_json(sdir / "timeline_bucket.json",
-                    {"stream": st["stream"], "window": window,
-                     "totals": st["totals"], "buckets": st["buckets"]})
-        _write_json(sdir / "util.json", {
-            "stream": st["stream"], "n_buckets": window["n_buckets"],
-            "bucket_ns": window["bucket_ns"], "start_ns": window["start_ns"],
-            "mean_util": round(sum(utils) / len(utils), 4) if utils else 0.0,
-            "min_util": round(min(utils), 4) if utils else 0.0,
-            "max_util": round(max(utils), 4) if utils else 0.0,
-            # keyed by bucket index (matches timeline_bucket.json's bucket `i`)
-            "util": {str(i): u for i, u in enumerate(utils)},
-        })
-        _write_json(sdir / "source_attribution.json",
-                    {"stream": st["stream"], "busy_ms": st["totals"]["busy_ms"],
-                     "by_source": st["by_source"]})
-        index_streams.append({"stream": st["stream"], "totals": st["totals"], "util": utils})
+        _write_json(
+            sdir / "timeline_bucket.json",
+            {
+                "stream": st["stream"],
+                "window": window,
+                "totals": st["totals"],
+                "buckets": st["buckets"],
+            },
+        )
+        _write_json(
+            sdir / "util.json",
+            {
+                "stream": st["stream"],
+                "n_buckets": window["n_buckets"],
+                "bucket_ns": window["bucket_ns"],
+                "start_ns": window["start_ns"],
+                "mean_util": round(sum(utils) / len(utils), 4) if utils else 0.0,
+                "min_util": round(min(utils), 4) if utils else 0.0,
+                "max_util": round(max(utils), 4) if utils else 0.0,
+                # keyed by bucket index (matches timeline_bucket.json's bucket `i`)
+                "util": {str(i): u for i, u in enumerate(utils)},
+            },
+        )
+        _write_json(
+            sdir / "source_attribution.json",
+            {
+                "stream": st["stream"],
+                "busy_ms": st["totals"]["busy_ms"],
+                "by_source": st["by_source"],
+            },
+        )
+        index_streams.append(
+            {"stream": st["stream"], "totals": st["totals"], "util": utils}
+        )
     index_streams.sort(key=lambda s: -s["totals"]["busy_ms"])
 
     # CPU side: one folder per thread (mirrors stream_<id>/), holding a single
@@ -596,21 +639,36 @@ def collect_timeline_bucket(trace: Path, ws: Path, pick: dict, n_buckets: int = 
         u = th["util"]
         tdir = step_dir / f"cpu_thread_{i}"
         tdir.mkdir(parents=True, exist_ok=True)
-        _write_json(tdir / "torch_function_util.json", {
-            "thread_index": i, "global_tid": th["global_tid"], "role": th["role"],
-            "cover_ms": th["cover_ms"],                    # torch-function (talos::) coverage
-            "cuda_api_cover_ms": th["cuda_api_cover_ms"],  # CUDA-API coverage (busyness; ~0 util threads)
-            "n_buckets": window["n_buckets"], "bucket_ns": window["bucket_ns"],
-            "start_ns": window["start_ns"],
-            "mean_util": round(sum(u) / len(u), 4) if u else 0.0,
-            "min_util": round(min(u), 4) if u else 0.0,
-            "max_util": round(max(u), 4) if u else 0.0,
-            # torch_function util keyed by bucket index
-            "util": {str(b): v for b, v in enumerate(u)},
-        })
-        index_threads.append({"thread_index": i, "global_tid": th["global_tid"],
-                              "role": th["role"], "cover_ms": th["cover_ms"],
-                              "cuda_api_cover_ms": th["cuda_api_cover_ms"], "util": u})
+        _write_json(
+            tdir / "torch_function_util.json",
+            {
+                "thread_index": i,
+                "global_tid": th["global_tid"],
+                "role": th["role"],
+                "cover_ms": th["cover_ms"],  # torch-function (talos::) coverage
+                "cuda_api_cover_ms": th[
+                    "cuda_api_cover_ms"
+                ],  # CUDA-API coverage (busyness; ~0 util threads)
+                "n_buckets": window["n_buckets"],
+                "bucket_ns": window["bucket_ns"],
+                "start_ns": window["start_ns"],
+                "mean_util": round(sum(u) / len(u), 4) if u else 0.0,
+                "min_util": round(min(u), 4) if u else 0.0,
+                "max_util": round(max(u), 4) if u else 0.0,
+                # torch_function util keyed by bucket index
+                "util": {str(b): v for b, v in enumerate(u)},
+            },
+        )
+        index_threads.append(
+            {
+                "thread_index": i,
+                "global_tid": th["global_tid"],
+                "role": th["role"],
+                "cover_ms": th["cover_ms"],
+                "cuda_api_cover_ms": th["cuda_api_cover_ms"],
+                "util": u,
+            }
+        )
 
     if not tl["streams"]:
         sys.stderr.write(
@@ -618,11 +676,16 @@ def collect_timeline_bucket(trace: Path, ws: Path, pick: dict, n_buckets: int = 
             "Either the parquetdir is missing CUPTI tables, or the capture host's "
             "talos is a different version than this stats.py.\n"
         )
-    return {"step": pick["step"], "window": window,
-            "streams": index_streams, "threads": index_threads}
+    return {
+        "step": pick["step"],
+        "window": window,
+        "streams": index_streams,
+        "threads": index_threads,
+    }
 
 
 # ── memcpy / sync / idle ────────────────────────────────────────────
+
 
 def _by_nvtx_path(env_rows: list[dict], span_ns: int) -> list[dict]:
     """Turn ``stats --group-by nvtx-path`` rows (for memcpy / sync) into
@@ -647,14 +710,16 @@ def _by_nvtx_path(env_rows: list[dict], span_ns: int) -> list[dict]:
             module = f"{p}@{c}" if p else None
             source = cs
         total = r.get("total_ns") or 0
-        out.append({
-            "nvtx_path": path,
-            "module": module,            # <path>@<Class> (null for a free call)
-            "source": source,            # file:line of the triggering torch.* call (or null)
-            "count": r.get("count"),
-            "total_ms": total / 1e6,
-            "pct_of_step": (total / span_ns * 100) if span_ns > 0 else 0,
-        })
+        out.append(
+            {
+                "nvtx_path": path,
+                "module": module,  # <path>@<Class> (null for a free call)
+                "source": source,  # file:line of the triggering torch.* call (or null)
+                "count": r.get("count"),
+                "total_ms": total / 1e6,
+                "pct_of_step": (total / span_ns * 100) if span_ns > 0 else 0,
+            }
+        )
     return out
 
 
@@ -664,10 +729,20 @@ def collect_memcpy(trace: Path, ws: Path, pick: dict) -> dict:
     span_ns = e_ns - s_ns
     bypath = run_veloq(
         [
-            "stats", str(trace),
-            "--from", f"@{s_ns}", "--to", f"@{e_ns}",
-            "--type", "memcpy", "--group-by", "nvtx-path",
-            "--sort", "total:desc", "--limit", "25",
+            "stats",
+            str(trace),
+            "--from",
+            f"@{s_ns}",
+            "--to",
+            f"@{e_ns}",
+            "--type",
+            "memcpy",
+            "--group-by",
+            "nvtx-path",
+            "--sort",
+            "total:desc",
+            "--limit",
+            "25",
         ]
     )
     data = {"by_path": _by_nvtx_path(_rows(bypath), span_ns)}
@@ -682,10 +757,20 @@ def collect_sync(trace: Path, ws: Path, pick: dict) -> dict:
     span_ns = e_ns - s_ns
     bypath = run_veloq(
         [
-            "stats", str(trace),
-            "--from", f"@{s_ns}", "--to", f"@{e_ns}",
-            "--type", "sync", "--group-by", "nvtx-path",
-            "--sort", "total:desc", "--limit", "25",
+            "stats",
+            str(trace),
+            "--from",
+            f"@{s_ns}",
+            "--to",
+            f"@{e_ns}",
+            "--type",
+            "sync",
+            "--group-by",
+            "nvtx-path",
+            "--sort",
+            "total:desc",
+            "--limit",
+            "25",
         ]
     )
     data = {"by_path": _by_nvtx_path(_rows(bypath), span_ns)}
@@ -697,10 +782,18 @@ def collect_idle(trace: Path, ws: Path, pick: dict) -> dict:
     s_ns, e_ns = pick["fwd_start_ns"], pick["full_end_ns"]
     env = run_veloq(
         [
-            "gaps", str(trace),
-            "--from", f"@{s_ns}", "--to", f"@{e_ns}",
-            "--min-duration", "100us",
-            "--sort", "duration:desc", "--limit", "30",
+            "gaps",
+            str(trace),
+            "--from",
+            f"@{s_ns}",
+            "--to",
+            f"@{e_ns}",
+            "--min-duration",
+            "100us",
+            "--sort",
+            "duration:desc",
+            "--limit",
+            "30",
         ]
     )
     rows = _rows(env)
@@ -769,11 +862,11 @@ def collect_fusion_candidates(trace: Path, ws: Path, pick: dict) -> dict:
     data = {
         "step": pick["step"],
         "metric": "gpu_ms is the memory-traffic proxy (no per-kernel bytes in CUPTI); "
-                  "rank by fusible_gpu_ms. by_kind shows the kernel mix per source line: "
-                  "'elementwise' fuses directly (pointwise islands); 'reduction' "
-                  "(sum/mean/norm/softmax) fuses with its surrounding pointwise, not in "
-                  "isolation. Compute-bound (gemm/conv/attention) and non-fusible "
-                  "(comm/sort) kinds are listed but excluded from fusible_gpu_ms.",
+        "rank by fusible_gpu_ms. by_kind shows the kernel mix per source line: "
+        "'elementwise' fuses directly (pointwise islands); 'reduction' "
+        "(sum/mean/norm/softmax) fuses with its surrounding pointwise, not in "
+        "isolation. Compute-bound (gemm/conv/attention) and non-fusible "
+        "(comm/sort) kinds are listed but excluded from fusible_gpu_ms.",
         "candidates": rows,
     }
     _write_json(ws / f"step_{pick['step']}" / "fusion_candidates.json", data)
@@ -798,7 +891,8 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("trace", help="path to .nsys-rep (or pre-exported _pqtdir/)")
     parser.add_argument(
-        "--workspace", default=None,
+        "--workspace",
+        default=None,
         help=f"workspace dir to write the JSON evidence into (default: {DEFAULT_WORKSPACE})",
     )
     args = parser.parse_args(argv)
@@ -853,7 +947,9 @@ def main(argv: list[str] | None = None) -> int:
         if n_new:
             removed = invalidate_veloq_caches(trace)
             if removed:
-                sys.stderr.write(f"[stats]      invalidated veloq caches: {', '.join(removed)}\n")
+                sys.stderr.write(
+                    f"[stats]      invalidated veloq caches: {', '.join(removed)}\n"
+                )
 
     sys.stderr.write("[stats] 3/4 step structure + typical step\n")
     steps_summary = collect_steps(trace)
@@ -861,12 +957,15 @@ def main(argv: list[str] | None = None) -> int:
 
     # One consolidated file for the run-level basics (trace span +
     # capabilities, hardware inventory, step uniformity, the picked step).
-    _write_json(ws / "basics.json", {
-        "trace_meta": trace_meta,
-        "hardware": hardware,
-        "steps": steps_summary,
-        "typical_step": pick,
-    })
+    _write_json(
+        ws / "basics.json",
+        {
+            "trace_meta": trace_meta,
+            "hardware": hardware,
+            "steps": steps_summary,
+            "typical_step": pick,
+        },
+    )
 
     if pick is not None:
         n = pick["step"]
@@ -879,7 +978,9 @@ def main(argv: list[str] | None = None) -> int:
         collect_exposed_idle(trace, ws, pick)
         collect_fusion_candidates(trace, ws, pick)
     else:
-        sys.stderr.write("[stats]      no step_* ranges found; skipping per-step phases\n")
+        sys.stderr.write(
+            "[stats]      no step_* ranges found; skipping per-step phases\n"
+        )
 
     sys.stderr.write(f"[stats] wrote JSON evidence to {ws}\n")
     return 0

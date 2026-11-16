@@ -23,7 +23,6 @@ import tarfile
 from pathlib import Path
 from urllib.request import urlretrieve
 
-
 KUAIRAND_PURE_URL = "https://zenodo.org/records/10439422/files/KuaiRand-Pure.tar.gz"
 KUAIRAND_PURE_MD5 = "0820331067a3784d9691136f772b35a7"
 
@@ -40,7 +39,9 @@ def ensure_kuairand_pure(data_dir: str | Path, url: str = KUAIRAND_PURE_URL) -> 
     if archive_path.exists():
         actual_md5 = _md5(archive_path)
         if actual_md5 != KUAIRAND_PURE_MD5:
-            print(f"Removing incomplete or invalid archive: {archive_path} ({actual_md5})")
+            print(
+                f"Removing incomplete or invalid archive: {archive_path} ({actual_md5})"
+            )
             archive_path.unlink()
     if not archive_path.exists():
         print(f"Downloading {url} -> {archive_path}")
@@ -72,7 +73,9 @@ def _md5(path: Path) -> str:
 
 def main() -> None:
     p = argparse.ArgumentParser()
-    p.add_argument("--data-dir", type=str, default=str(Path(__file__).resolve().parent / "data"))
+    p.add_argument(
+        "--data-dir", type=str, default=str(Path(__file__).resolve().parent / "data")
+    )
     args = p.parse_args()
     ensure_kuairand_pure(args.data_dir)
 

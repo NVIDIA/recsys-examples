@@ -18,6 +18,7 @@ import os
 import random
 from typing import List
 
+import hier_switch
 import pytest
 import torch
 import torch.distributed as dist
@@ -63,6 +64,16 @@ def generate_sparse_feature(
         values=torch.tensor(indices, dtype=torch.int64).cuda(),
         lengths=torch.tensor(lengths, dtype=torch.int64).cuda(),
         weights=weights,
+    )
+
+
+def with_key_dtype(features: torchrec.KeyedJaggedTensor, key_dtype: torch.dtype):
+    """The same features, with their keys in ``key_dtype``."""
+    return torchrec.KeyedJaggedTensor(
+        keys=features.keys(),
+        values=features.values().to(key_dtype),
+        lengths=features.lengths(),
+        weights=features.weights_or_none(),
     )
 
 
@@ -163,6 +174,14 @@ def backend_session():
     dist.destroy_process_group()
 
 
+@pytest.fixture(autouse=True)
+def release_hier_ops():
+    """At the end of each test, on every rank, passed or not: quiesces the ops
+    of the models the test gave the hierarchical dist (hier_switch.py)."""
+    yield
+    hier_switch.release()
+
+
 @pytest.mark.parametrize(
     "table_num, num_embeddings",
     [
@@ -173,9 +192,18 @@ def backend_session():
 # The bag size belongs with the pooling mode: a sequence lookup has one
 # embedding per key by definition, while SUM has to actually accumulate several
 # of them -- with a bag of at most one key the reduction being tested never runs.
+# The key dtype is that of the keys the DynamicEmb model reads. The TorchRec
+# model always reads them as int64, so an int32 run is checked against the int64
+# one. Index dedup belongs to EmbeddingCollection, so int32 keys run on the
+# sequence collection.
 @pytest.mark.parametrize(
-    "is_pooled, pooling_mode, max_bag_size",
-    [(True, PoolingType.SUM, 8), (False, None, 1)],
+    "is_pooled, pooling_mode, max_bag_size, key_dtype",
+    [
+        (True, PoolingType.SUM, 8, torch.int64),
+        (False, None, 1, torch.int64),
+        (False, None, 1, torch.int32),
+    ],
+    ids=["pooled-int64", "sequence-int64", "sequence-int32"],
 )
 @pytest.mark.parametrize("batch_size", [32, 2048])
 @pytest.mark.parametrize("num_iteration", [10])
@@ -201,6 +229,7 @@ def test_twin_module(
     backend_session,
     use_index_dedup,
     is_weighted,
+    key_dtype,
 ):
     if is_weighted:
         if not (is_pooled and pooling_mode == PoolingType.SUM):
@@ -227,6 +256,16 @@ def test_twin_module(
     # still occur; this only sets the upper end.
     multi_hot_sizes = [max_bag_size] * table_num
 
+    # Pooled collections ignore output_dist (hier_switch.py). The output is
+    # fp32, ConstructTwinModule's default.
+    output_dist_options = (
+        {}
+        if is_pooled
+        else hier_switch.options(
+            world_size=world_size,
+            row_bytes=4 * dim,
+        )
+    )
     construct = ConstructTwinModule(
         table_num,
         dims,
@@ -239,10 +278,13 @@ def test_twin_module(
         is_weighted=is_weighted,
         rank=local_rank,
         world_size=world_size,
+        dynamicemb_options_kwargs=output_dist_options,
+        global_rank=dist.get_rank(),
     )
     construct.init_twin_embedding_model()
     dynamicemb_model = construct.dynamicemb_model
     torchrec_model = construct.torchrec_model
+    hier_switch.track(dynamicemb_model, output_dist_options)
 
     for i in range(num_iteration):
         if i % 2 == 0:
@@ -253,7 +295,11 @@ def test_twin_module(
                 batch_size,
                 weighted=is_weighted,
             )
-        ret = dynamicemb_model(sparse_feature)
+        ret = dynamicemb_model(with_key_dtype(sparse_feature, key_dtype))
+        if i == 0:
+            hier_switch.check_path(dynamicemb_model, output_dist_options)
+        # The reference reads the same KJT next, and splits it by its totals.
+        hier_switch.check_totals(sparse_feature, output_dist_options)
         ret_compare = torchrec_model(sparse_feature)
 
         embedding_lookup_backward(ret, is_pooled)

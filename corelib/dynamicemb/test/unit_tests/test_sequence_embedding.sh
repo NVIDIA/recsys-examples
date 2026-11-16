@@ -1,4 +1,4 @@
-# Test sequence embedding's forward on 2 GPUs with different [use_index_dedup, dim, output_dtype, dynamicemb_num, multi_hot_sizes]
+# Test sequence embedding's forward on 2 GPUs with different [use_index_dedup, key_dtype, dim, output_dtype, dynamicemb_num, multi_hot_sizes]
 set -e
 export PYHKV_DEBUG=1
 export PYHKV_DEBUG_ITER=10
@@ -17,6 +17,16 @@ CUDA_VISIBLE_DEVICES=0,1 torchrun \
   --nnodes 1 \
   --nproc_per_node 2 \
   ./test/unit_tests/test_sequence_embedding_fw.py --print_sharding_plan --optimizer_type "adam" --use_index_dedup False
+
+CUDA_VISIBLE_DEVICES=0,1 torchrun \
+  --nnodes 1 \
+  --nproc_per_node 2 \
+  ./test/unit_tests/test_sequence_embedding_fw.py --print_sharding_plan --optimizer_type "adam" --use_index_dedup True --key_dtype int32
+
+CUDA_VISIBLE_DEVICES=0,1 torchrun \
+  --nnodes 1 \
+  --nproc_per_node 2 \
+  ./test/unit_tests/test_sequence_embedding_fw.py --print_sharding_plan --optimizer_type "adam" --use_index_dedup False --key_dtype int32
 
 CUDA_VISIBLE_DEVICES=0,1 torchrun \
   --nnodes 1 \
@@ -57,6 +67,11 @@ CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 torchrun \
   --nnodes 1 \
   --nproc_per_node 8 \
   ./test/unit_tests/test_sequence_embedding_fw.py --print_sharding_plan --optimizer_type "adam" --use_index_dedup True --batch_size 1024 --num_embeddings_per_feature=8388608,4194304,524288,1048576
+
+CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 torchrun \
+  --nnodes 1 \
+  --nproc_per_node 8 \
+  ./test/unit_tests/test_sequence_embedding_fw.py --print_sharding_plan --optimizer_type "adam" --use_index_dedup True --key_dtype int32 --batch_size 1024 --num_embeddings_per_feature=8388608,4194304,524288,1048576
 
 # Test sequence embedding's backward on a single GPU with different ["use_index_dedup", "dim", "batch_size", "multi_hot_sizes"]
 CUDA_VISIBLE_DEVICES=0 torchrun \

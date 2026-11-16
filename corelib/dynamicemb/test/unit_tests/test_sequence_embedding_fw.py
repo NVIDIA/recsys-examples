@@ -19,6 +19,7 @@ import random
 import sys
 from typing import List
 
+import hier_switch
 import torch
 import torch.distributed as dist
 import torchrec
@@ -29,6 +30,7 @@ from dynamicemb import (
     DynamicEmbInitializerMode,
     DynamicEmbTableOptions,
 )
+from dynamicemb.dynamicemb_config import DEBUG_EMB_INITIALIZER_MOD
 from dynamicemb.planner import (
     DynamicEmbeddingShardingPlanner,
     DynamicEmbParameterConstraints,
@@ -85,7 +87,7 @@ def get_comm_precission(precision_str):
         raise ValueError("unknown comm precision type")
 
 
-def get_planner(args, device, eb_configs):
+def get_planner(args, device, eb_configs, output_dist_options):
     dict_const = {}
     for i in range(args.num_embedding_table):
         if (
@@ -116,6 +118,7 @@ def get_planner(args, device, eb_configs):
                         mode=DynamicEmbInitializerMode.DEBUG
                     ),
                     safe_check_mode=DynamicEmbCheckMode.WARNING,
+                    **output_dist_options,
                 ),
             )
 
@@ -170,6 +173,15 @@ def generate_sparse_feature(
             indices, dtype=torch.int64
         ).cuda(),  # key [0,1] on rank0, [2] on rank 1
         lengths=torch.tensor(lengths, dtype=torch.int64).cuda(),
+    )
+
+
+def with_key_dtype(features: torchrec.KeyedJaggedTensor, key_dtype: torch.dtype):
+    """The same features, with their keys in ``key_dtype``."""
+    return torchrec.KeyedJaggedTensor(
+        keys=features.keys(),
+        values=features.values().to(key_dtype),
+        lengths=features.lengths(),
     )
 
 
@@ -230,7 +242,19 @@ def run(args):
         else:
             raise ValueError("unknown optimizer type")
 
-    planner = get_planner(args, device, eb_configs)
+    # The row-wise tables share one sharding (hier_switch.py), and the output
+    # is fp32 (fused_params below).
+    row_wise_tables = [
+        i
+        for i in range(args.num_embedding_table)
+        if i not in (args.data_parallel_embeddings or [])
+    ]
+    output_dist_options = hier_switch.options(
+        world_size=world_size,
+        row_bytes=4 * args.embedding_dim,
+        all_dynamicemb=all(i < args.dynamicemb_num for i in row_wise_tables),
+    )
+    planner = get_planner(args, device, eb_configs, output_dist_options)
 
     qcomm_forward_precision = get_comm_precission(args.fwd_a2a_precision)
     qcomm_backward_precision = get_comm_precission(args.fwd_a2a_precision)
@@ -276,6 +300,7 @@ def run(args):
         plan=plan,
         data_parallel_wrapper=data_parallel_wrapper,
     )
+    hier_switch.track(model, output_dist_options)
 
     if local_rank == 0 and args.print_sharding_plan:
         for collectionkey, plans in model._plan.plan.items():
@@ -284,6 +309,16 @@ def run(args):
                 print(table_name, "\n", plan, "\n")
 
     debugger = Debugger()
+
+    # The features get_planner puts on DynamicEmb tables. Their rows start at
+    # the DEBUG initializer's value.
+    data_parallel_embeddings = args.data_parallel_embeddings or []
+    dynamicemb_features = [
+        feature_idx_to_name(feature_idx)
+        for feature_idx in range(args.num_embedding_table)
+        if feature_idx < args.dynamicemb_num
+        and feature_idx not in data_parallel_embeddings
+    ]
 
     local_batch_size = args.batch_size // world_size
 
@@ -317,7 +352,34 @@ def run(args):
                     multi_hot_sizes=args.multi_hot_sizes,
                     local_batch_size=local_batch_size,
                 )
-        ret = model(sparse_feature)  # => this is awaitable
+        with torch.no_grad():
+            ret = model(sparse_feature)  # => this is awaitable
+            if i == 0:
+                hier_switch.check_path(model, output_dist_options)
+            if args.key_dtype == "int32":
+                # The same keys as int32 must look up the same embeddings. On the
+                # last iteration rank 0 has no keys while the other ranks have some.
+                ret_int32 = model(with_key_dtype(sparse_feature, torch.int32))
+                for feature_name, jagged_tensor in ret.items():
+                    torch.testing.assert_close(
+                        ret_int32[feature_name].values(),
+                        jagged_tensor.values(),
+                        rtol=0,
+                        atol=0,
+                    )
+                # Nothing trains here, so each DynamicEmb row still holds what the
+                # DEBUG initializer wrote: its key modulo DEBUG_EMB_INITIALIZER_MOD,
+                # in every element. The lookup without index dedup gives the same.
+                for feature_name in dynamicemb_features:
+                    embeddings = ret_int32[feature_name].values()
+                    keys = sparse_feature[feature_name].values()
+                    expected = (keys % DEBUG_EMB_INITIALIZER_MOD).to(embeddings.dtype)
+                    torch.testing.assert_close(
+                        embeddings,
+                        expected.unsqueeze(1).expand_as(embeddings),
+                        rtol=0,
+                        atol=0,
+                    )
 
         feature_names = []
         jagged_tensors = []
@@ -339,6 +401,7 @@ def run(args):
 
     # dict_ = model.state_dict()
     # model.load_state_dict(dict_)
+    hier_switch.release()
     dist.barrier()
     dist.destroy_process_group()
 
@@ -546,6 +609,15 @@ def main(argv: List[str]) -> None:
         type=str2bool,
         default=True,
         help="Use index deduplication (default: True).",
+    )
+    parser.add_argument(
+        "--key_dtype",
+        type=str,
+        default="int64",
+        choices=["int64", "int32"],
+        help="int32 also looks up every batch as int32 keys and checks that the "
+        "embeddings equal the int64 lookup's and, on DynamicEmb tables, the "
+        "DEBUG initializer's values.",
     )
     args = parser.parse_args()
 
