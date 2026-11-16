@@ -71,7 +71,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from test_batched_dynamic_embedding_tables_v2 import PyDictStorage
 
 LAYOUTS = ["hbm"]
-ENABLED_LAYOUTS = {"hbm"}
+ENABLED_LAYOUTS = {"hbm", "cache", "cache_ps"}
 
 
 @pytest.fixture(scope="module", autouse=True)

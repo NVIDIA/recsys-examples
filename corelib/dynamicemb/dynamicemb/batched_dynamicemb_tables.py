@@ -1372,8 +1372,10 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
         Other backends and layouts retain their existing raw lookup path.
         The caller owns this state until consumption or explicit release.
         """
-        if self._cache is not None or not _is_hbm_storage(self._storage):
-            raise ValueError("receiver resolution currently requires HBM storage")
+        if self._cache is None and not _is_hbm_storage(self._storage):
+            raise ValueError(
+                "receiver resolution currently requires HBM or Cache storage"
+            )
         if not self.training:
             raise RuntimeError("receiver resolution requires training tables")
         if any(not o.training for o in self._dynamicemb_options):

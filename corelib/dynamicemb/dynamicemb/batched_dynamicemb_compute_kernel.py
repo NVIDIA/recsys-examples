@@ -324,10 +324,9 @@ class _ResolvedInputMixin:
     def resolves_input_dist(self) -> bool:
         from .batched_dynamicemb_function import _is_hbm_storage
 
-        return (
-            self._emb_module.pooling_mode == DynamicEmbPoolingMode.NONE
-            and self._emb_module._cache is None
-            and _is_hbm_storage(self._emb_module._storage)
+        return self._emb_module.pooling_mode == DynamicEmbPoolingMode.NONE and (
+            self._emb_module._cache is not None
+            or _is_hbm_storage(self._emb_module._storage)
         )
 
     def resolve_input(self, features):

@@ -1,5 +1,6 @@
 set -e
 FWD_BWD_TEST_FILES=(
+    "test/unit_tests/test_cache_receiver.py"
     "test/unit_tests/test_hbm_row_state.py"
     "test/unit_tests/test_hbm_receiver.py"
     "test/unit_tests/test_dense_lookup.py"
