@@ -808,7 +808,7 @@ HOST_DEVICE_INLINE int64_t bs_upper_bound_sub_one(const T *const arr,
   return (start == num && arr[start - 1] != target) ? num : start - 1;
 }
 
-template <typename CopyDesc>
+template <typename CopyDesc, bool SkipMissing = false>
 __global__ void one_to_one_warp_per_ev_kernel(CopyDesc copy_desc) {
   using vec_length_type = int;
   using src_type = typename CopyDesc::SrcT;
@@ -818,13 +818,17 @@ __global__ void one_to_one_warp_per_ev_kernel(CopyDesc copy_desc) {
   for (int i_ev = blockIdx.x; i_ev < copy_desc.num_vec_; i_ev += gridDim.x) {
     auto *dst_ptr = copy_desc.get_dst_ptr(i_ev);
     auto *src_ptr = copy_desc.get_src_ptr(i_ev);
+    if constexpr (SkipMissing) {
+      if (src_ptr == nullptr)
+        continue;
+    }
     for (int i = threadIdx.x; i < ev_size; i += blockDim.x) {
       dst_ptr[i] = TypeConvertFunc<dst_type, src_type>::convert(src_ptr[i]);
     }
   }
 }
 
-template <typename CopyDesc, int kMaxElemPerThread>
+template <typename CopyDesc, int kMaxElemPerThread, bool SkipMissing = false>
 __global__ void one_to_one_warp_per_ev_vec4_kernel(CopyDesc copy_desc) {
   using src_type = typename CopyDesc::SrcT;
   using dst_type = typename CopyDesc::DstT;
@@ -843,6 +847,10 @@ __global__ void one_to_one_warp_per_ev_vec4_kernel(CopyDesc copy_desc) {
 
     const src_type *src_ptr = copy_desc.get_src_ptr(i_ev);
     dst_type *dst_ptr = copy_desc.get_dst_ptr(i_ev);
+    if constexpr (SkipMissing) {
+      if (src_ptr == nullptr)
+        continue;
+    }
 
 #pragma unroll kMaxElemPerThread
     for (int i = 0;
@@ -1012,7 +1020,7 @@ void copy_multi_to_one(CopyDesc &copy_desc, bool feature_dims_vec4,
   DEMB_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
-template <typename CopyDesc>
+template <typename CopyDesc, bool SkipMissing = false>
 void copy_one_to_one(CopyDesc &copy_desc, int ev_size, int num_sms,
                      cudaStream_t stream) {
   if (copy_desc.num_vec_ == 0)
@@ -1024,7 +1032,7 @@ void copy_one_to_one(CopyDesc &copy_desc, int ev_size, int num_sms,
     int block_dim =
         ev_size < MAX_THREADS_PER_BLOCK ? ev_size : MAX_THREADS_PER_BLOCK;
 
-    one_to_one_warp_per_ev_kernel<CopyDesc>
+    one_to_one_warp_per_ev_kernel<CopyDesc, SkipMissing>
         <<<grid_dim, block_dim, 0, stream>>>(copy_desc);
   } else {
     if (ev_size <= 128) {
@@ -1032,20 +1040,20 @@ void copy_one_to_one(CopyDesc &copy_desc, int ev_size, int num_sms,
       if (copy_desc.num_vec_ < grid_size)
         grid_size = copy_desc.num_vec_;
       dim3 block_size{32, 2};
-      one_to_one_warp_per_ev_vec4_kernel<CopyDesc, 1>
+      one_to_one_warp_per_ev_vec4_kernel<CopyDesc, 1, SkipMissing>
           <<<grid_size, block_size, 0, stream>>>(copy_desc);
     } else if (ev_size <= 256) {
       int grid_size = num_sms * 32; // 2048/64 =32
       if (copy_desc.num_vec_ < grid_size)
         grid_size = copy_desc.num_vec_;
       dim3 block_size{32, 2};
-      one_to_one_warp_per_ev_vec4_kernel<CopyDesc, 2>
+      one_to_one_warp_per_ev_vec4_kernel<CopyDesc, 2, SkipMissing>
           <<<grid_size, block_size, 0, stream>>>(copy_desc);
     } else if (ev_size <= 1024) {
       int grid_dim = copy_desc.num_vec_;
       int block_dim =
           ev_size < MAX_THREADS_PER_BLOCK ? ev_size : MAX_THREADS_PER_BLOCK;
-      one_to_one_warp_per_ev_kernel<CopyDesc>
+      one_to_one_warp_per_ev_kernel<CopyDesc, SkipMissing>
           <<<grid_dim, block_dim, 0, stream>>>(copy_desc);
     } else {
       throw std::runtime_error(

@@ -322,18 +322,13 @@ class _ResolvedInputMixin:
 
     @property
     def resolves_input_dist(self) -> bool:
-        from .batched_dynamicemb_function import _is_hbm_storage
-
-        return self._emb_module.pooling_mode == DynamicEmbPoolingMode.NONE and (
-            self._emb_module._cache is not None
-            or _is_hbm_storage(self._emb_module._storage)
-        )
+        return self._emb_module.pooling_mode == DynamicEmbPoolingMode.NONE
 
     def resolve_input(self, features):
         """Resolve keys for every storage layout before embedding lookup."""
         from .shard.resolved_input import ResolvedEmbeddingInput
 
-        if not self.resolves_input_dist or not self._emb_module.training:
+        if not self.resolves_input_dist:
             return features
         state = self._emb_module.resolve_input(
             indices=features.values(),

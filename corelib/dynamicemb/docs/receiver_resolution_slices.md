@@ -9,3 +9,7 @@ Subsequent dependent slices enable Cache, coherent Storage snapshots, other layo
 ## Cache extension
 
 Pinned Cache and cache-over-Storage sequence receivers now use prepared rows too. Snapshot-backed Host/Hybrid/PS and additional layouts still keep their existing receiver behavior. Cache replacement initialization, overlap and reverse backward are tested separately.
+
+## Storage extension
+
+Host/Hybrid/Storage sequence receivers now resolve complete live snapshots. Writes publish embedding and optimizer bytes to overlapping batches by complete table/key identity and preserve existing scores. Local Storage-interface tests do not validate a network PS or concurrent remote writers. Evaluation is resolved read-only; raw/FIFO preparation also receives coherent snapshots.

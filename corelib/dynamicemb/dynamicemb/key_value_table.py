@@ -4329,6 +4329,7 @@ def _eval_lookup_storage(
     keys: torch.Tensor,
     table_ids: torch.Tensor,
     initializer: Callable,
+    external_storage: Optional[Storage] = None,
 ) -> torch.Tensor:
     (
         h_num_missing,
@@ -4345,6 +4346,15 @@ def _eval_lookup_storage(
         copy_mode=CopyMode.EMBEDDING,
     )
 
+    if h_num_missing > 0 and external_storage is not None:
+        external = external_storage.find(
+            keys[missing_indices],
+            table_ids[missing_indices],
+            copy_mode=CopyMode.EMBEDDING,
+        )
+        embs[missing_indices] = external[-1]
+        missing_indices = missing_indices[external[2]]
+        h_num_missing = missing_indices.numel()
     if h_num_missing > 0:
         initializer(embs, keys, table_ids, missing_indices)
 
@@ -4357,6 +4367,7 @@ def _eval_lookup_cached(
     keys: torch.Tensor,
     table_ids: torch.Tensor,
     initializer: Callable,
+    external_storage: Optional[Storage] = None,
 ) -> torch.Tensor:
     _, founds, cache_indices = cache.lookup(keys, table_ids)
 
@@ -4372,25 +4383,9 @@ def _eval_lookup_cached(
     if h_num_miss == 0:
         return embs
 
-    (
-        h_num_missing_in_storage,
-        _,
-        missing_indices_in_storage,
-        _,
-        _,
-        _,
-        _,
-        storage_embs,
-    ) = storage.find(
-        missing_keys,
-        missing_table_ids,
-        copy_mode=CopyMode.EMBEDDING,
+    storage_embs = _eval_lookup_storage(
+        storage, missing_keys, missing_table_ids, initializer, external_storage
     )
-
-    if h_num_missing_in_storage > 0:
-        initializer(
-            storage_embs, missing_keys, missing_table_ids, missing_indices_in_storage
-        )
 
     embs[miss_compact_idx, :] = storage_embs
 
@@ -4403,6 +4398,7 @@ def eval_lookup(
     table_ids: torch.Tensor,
     initializer: Callable,
     cache: Optional[Cache] = None,
+    external_storage: Optional[Storage] = None,
 ) -> torch.Tensor:
     """Eval-only lookup (no insertion, no admission, no backward).
 
@@ -4423,7 +4419,9 @@ def eval_lookup(
         )
 
     if cache is None:
-        return _eval_lookup_storage(storage, keys, table_ids, initializer)
+        return _eval_lookup_storage(
+            storage, keys, table_ids, initializer, external_storage
+        )
 
     return _eval_lookup_cached(
         cache,
@@ -4431,4 +4429,5 @@ def eval_lookup(
         keys,
         table_ids,
         initializer,
+        external_storage,
     )

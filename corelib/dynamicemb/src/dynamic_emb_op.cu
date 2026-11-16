@@ -79,6 +79,122 @@ std::vector<int64_t> offsets_to_table_features_offsets(
   return table_features_offsets;
 }
 
+namespace {
+
+// Copy a complete live storage row (embedding plus optimizer state) by its
+// immutable (table, key) identity. Reuse the existing row copy kernels, skipping
+// misses/rejected rows without allocating compact output indices on the host.
+template <typename Value> struct StorageRowCopyDesc {
+  using SrcT = Value;
+  using DstT = Value;
+  int num_vec_;
+  int width;
+  const int64_t *sorted_keys, *sorted_rows, *source_offsets;
+  const Value *source;
+  const int64_t *target_keys, *target_tids;
+  Value *target;
+  const bool *source_persisted, *target_persisted;
+
+  DEVICE_INLINE int get_vec_length() { return width; }
+  DEVICE_INLINE Value *get_dst_ptr(int i) {
+    return target + static_cast<int64_t>(i) * width;
+  }
+  DEVICE_INLINE const Value *get_src_ptr(int i) {
+    if (target_persisted && !target_persisted[i])
+      return nullptr;
+    const int64_t tid = target_tids[i];
+    const int64_t end = source_offsets[tid + 1];
+    int64_t lo = source_offsets[tid], hi = end;
+    const int64_t key = target_keys[i];
+    while (lo < hi) {
+      const int64_t mid = lo + (hi - lo) / 2;
+      if (sorted_keys[mid] < key)
+        lo = mid + 1;
+      else
+        hi = mid;
+    }
+    if (lo == end || sorted_keys[lo] != key)
+      return nullptr;
+    const int64_t row = sorted_rows[lo];
+    if (source_persisted && !source_persisted[row])
+      return nullptr;
+    return source + row * width;
+  }
+};
+
+} // namespace
+
+void copy_matching_storage_rows(
+    const at::Tensor &sorted_keys, const at::Tensor &sorted_rows,
+    const at::Tensor &source_offsets, const at::Tensor &source_values,
+    const at::Tensor &target_keys, const at::Tensor &target_tids,
+    at::Tensor target_values,
+    const std::optional<at::Tensor> &source_persisted = std::nullopt,
+    const std::optional<at::Tensor> &target_persisted = std::nullopt) {
+  const auto device = source_values.device();
+  for (const auto &tensor : {sorted_keys, sorted_rows, source_offsets,
+                             target_keys, target_tids}) {
+    TORCH_CHECK(tensor.is_cuda() && tensor.device() == device &&
+                    tensor.is_contiguous() && tensor.dim() == 1 &&
+                    tensor.scalar_type() == at::kLong,
+                "storage row keys, positions and boundaries must be "
+                "contiguous CUDA int64 vectors on the values device");
+  }
+  TORCH_CHECK(source_values.is_cuda() && target_values.device() == device &&
+                  source_values.is_contiguous() && target_values.is_contiguous() &&
+                  source_values.dim() == 2 && target_values.dim() == 2 &&
+                  source_values.scalar_type() == target_values.scalar_type() &&
+                  source_values.size(1) == target_values.size(1) &&
+                  sorted_keys.numel() == source_values.size(0) &&
+                  sorted_rows.numel() == sorted_keys.numel() &&
+                  target_keys.numel() == target_values.size(0) &&
+                  target_tids.numel() == target_keys.numel() &&
+                  source_offsets.numel() >= 2,
+              "storage row values must be compatible contiguous matrices");
+  for (const auto &entry : {
+           std::make_pair(source_persisted, source_values.size(0)),
+           std::make_pair(target_persisted, target_values.size(0))}) {
+    if (entry.first.has_value()) {
+      const auto &mask = *entry.first;
+      TORCH_CHECK(mask.device() == device && mask.is_contiguous() &&
+                      mask.dim() == 1 && mask.scalar_type() == at::kBool &&
+                      mask.numel() == entry.second,
+                  "storage row persisted masks must be CUDA bool vectors");
+    }
+  }
+  TORCH_CHECK(target_keys.numel() <= std::numeric_limits<int>::max() &&
+                  source_values.size(1) <= std::numeric_limits<int>::max(),
+              "storage row copy exceeds the row copy kernel dimensions");
+  if (!target_keys.numel() || !source_values.size(1))
+    return;
+  const c10::cuda::CUDAGuard guard(device);
+  auto stream = at::cuda::getCurrentCUDAStream().stream();
+  auto type = scalartype_to_datatype(source_values.scalar_type());
+  DISPATCH_FLOAT_DATATYPE_FUNCTION(type, value_t, [&] {
+    StorageRowCopyDesc<value_t> desc{
+        static_cast<int>(target_keys.numel()),
+        static_cast<int>(source_values.size(1)),
+        sorted_keys.data_ptr<int64_t>(), sorted_rows.data_ptr<int64_t>(),
+        source_offsets.data_ptr<int64_t>(),
+        static_cast<const value_t *>(source_values.data_ptr()),
+        target_keys.data_ptr<int64_t>(), target_tids.data_ptr<int64_t>(),
+        static_cast<value_t *>(target_values.data_ptr()),
+        source_persisted ? source_persisted->data_ptr<bool>() : nullptr,
+        target_persisted ? target_persisted->data_ptr<bool>() : nullptr};
+    // Optimizer moments can make a complete row wider than an embedding's
+    // 1024-element limit. The scalar CTA copy loops over the full row width.
+    if (desc.width > 1024) {
+      one_to_one_warp_per_ev_kernel<StorageRowCopyDesc<value_t>, true>
+          <<<desc.num_vec_, 256, 0, stream>>>(desc);
+      DEMB_CUDA_KERNEL_LAUNCH_CHECK();
+    } else {
+      auto &prop = DeviceProp::getDeviceProp(device.index());
+      copy_one_to_one<StorageRowCopyDesc<value_t>, true>(
+          desc, desc.width, prop.num_sms, stream);
+    }
+  });
+}
+
 // Row i of output (row out_row[i] with out_row, int32 [index.numel()]) gets
 // row index[i] of input.
 void gather_embedding(at::Tensor input, at::Tensor output, at::Tensor index,
@@ -1040,6 +1156,14 @@ void bind_dyn_emb_op(py::module &m) {
         "index[i] if out_row is given.",
         py::arg("input"), py::arg("output"), py::arg("index"),
         py::arg("out_row") = py::none());
+
+  m.def("copy_matching_storage_rows", &copy_matching_storage_rows,
+        "Publish complete live storage rows by sorted (table, key) identity.",
+        py::arg("sorted_keys"), py::arg("sorted_rows"),
+        py::arg("source_offsets"), py::arg("source_values"),
+        py::arg("target_keys"), py::arg("target_tids"),
+        py::arg("target_values"), py::arg("source_persisted") = py::none(),
+        py::arg("target_persisted") = py::none());
 
   m.def("gather_embedding_pooled", &gather_embedding_pooled,
         "Gather embedding with pooling (SUM/MEAN) based on the dedup inverse "

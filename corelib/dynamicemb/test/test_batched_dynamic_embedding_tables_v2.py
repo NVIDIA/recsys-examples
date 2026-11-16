@@ -1524,15 +1524,6 @@ def test_forward_train_eval(
         total_D = sum(dims[feature_table_map[f]] for f in range(len(feature_table_map)))
         assert embs_train.shape == (batch_size, total_D)
 
-    if PS is not None:
-        # Evaluation does not read the PS, so it refuses to run with one.
-        bdebt.eval()
-        with pytest.raises(RuntimeError, match="external_storage"):
-            bdebt(indices, offsets)
-        if deterministic:
-            del os.environ["DEMB_DETERMINISM_MODE"]
-        return
-
     with torch.no_grad():
         bdebt.eval()
         embs_eval = bdebt(indices, offsets)
