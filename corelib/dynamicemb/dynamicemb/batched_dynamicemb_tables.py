@@ -528,7 +528,6 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
         self.use_index_dedup = use_index_dedup
         self._enable_prefetch = prefetch_pipeline
         self.prefetch_stream = None
-        self._prefetch_outstanding_keys = torch.tensor(0, dtype=torch.int64)
         # Who may touch the tables now: prefetch, and an erase running beside the
         # training. See async_erase.py.
         self._table_gate = TableAccessGate()
@@ -1102,7 +1101,6 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
     def reset_cache_states(self) -> None:
         if self._caching and self._cache is not None:
             self._cache.reset()
-            self._prefetch_outstanding_keys.zero_()
 
     @property
     def table_names(self) -> List[str]:
@@ -1396,9 +1394,6 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                 self._evict_strategy,
                 frequency_counters,
                 self._admitter,
-                outstanding_keys_ref=self._prefetch_outstanding_keys
-                if self._cache is not None
-                else None,
                 external_storage=self._external_storage,
                 scores=scores,
                 table_gate=self._table_gate,

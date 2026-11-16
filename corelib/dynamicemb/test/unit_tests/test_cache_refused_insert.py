@@ -14,11 +14,9 @@ never loaded, and written back it would have overwritten the key's storage row.
 
 The cache here is one bucket (1024 slots, its buckets always hold 1024) plus an
 overflow area of 3 buckets: one prefetch of more new keys than those 4096 slots
-makes the insert refuse the rest. The prefetch is called without the module's
-outstanding-keys check, which would stop such a batch earlier: the refusal can
-also happen within that check, when a bucket's keys and the overflow area are
-pinned while the cache as a whole has room. Unwritten memory is filled with NaN
-so that a row stored without being written shows.
+makes the insert refuse the rest; nothing checks the batch before the insert
+does. Unwritten memory is filled with NaN so that a row stored without being
+written shows.
 """
 
 import pytest
@@ -30,7 +28,6 @@ from dynamicemb import (
     DynamicEmbTableOptions,
     EmbOptimType,
 )
-from dynamicemb.batched_dynamicemb_function import dynamicemb_prefetch
 from dynamicemb.batched_dynamicemb_tables import BatchedDynamicEmbeddingTablesV2
 from dynamicemb.key_value_table import get_insert_score_arg
 from dynamicemb.types import CopyMode
@@ -93,23 +90,10 @@ def make_model():
 
 
 def prefetch(model, keys):
+    """The module's prefetch of one feature holding ``keys``; the state it queued."""
     offsets = torch.tensor([0, keys.numel()], dtype=torch.int64, device=keys.device)
-    return dynamicemb_prefetch(
-        keys,
-        offsets,
-        model._cache,
-        model._storage,
-        model.feature_offsets,
-        model._initializer,
-        None,
-        model._evict_strategy,
-        None,
-        model._admitter,
-        outstanding_keys_ref=None,
-        external_storage=model._external_storage,
-        scores=None,
-        table_gate=None,
-    )
+    model.prefetch(keys, offsets)
+    return model._prefetch_states[-1]
 
 
 def test_refused_keys_stop_the_prefetch_and_keep_the_storage():
