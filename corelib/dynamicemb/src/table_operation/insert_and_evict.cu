@@ -268,16 +268,10 @@ static void table_insert_and_evict_with_counter_and_overflow_single_score(
     std::optional<at::Tensor> refused) {
 
   auto key_type = get_data_type(keys);
-  // The flag sits in pinned host memory: the kernel writes it through its
-  // device mapping, and the host reads it once it has waited for the insert.
-  int64_t *refused_ptr = nullptr;
-  if (refused.has_value()) {
-    void *mapped = nullptr;
-    TORCH_CHECK(cudaHostGetDevicePointer(&mapped, refused->data_ptr(), 0) ==
-                    cudaSuccess,
-                "table_insert_and_evict: refused is not mapped for the device");
-    refused_ptr = static_cast<int64_t *>(mapped);
-  }
+  // The flag sits in pinned host memory, which unified addressing maps at its
+  // host address: the kernel writes it there, and the host reads it once it
+  // has waited for the insert.
+  int64_t *refused_ptr = get_pointer<int64_t>(refused);
 
   ScoreType *score_input_ptr = nullptr;
   at::Tensor score_input_tensor;
