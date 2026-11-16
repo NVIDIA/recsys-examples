@@ -66,7 +66,12 @@ def walk(table_slots, bucket_capacity, target):
         # The last chunk of a table is the short one; bigger buckets, same rule.
         (1024 * 5, 1024, 2048, [2048, 4096, 5120]),
         # Big enough to need several default chunks.
-        (1 << 25, BUCKET, ERASE_CHUNK_SLOTS, [ERASE_CHUNK_SLOTS * k for k in range(1, 9)]),
+        (
+            1 << 25,
+            BUCKET,
+            ERASE_CHUNK_SLOTS,
+            [ERASE_CHUNK_SLOTS * k for k in range(1, 9)],
+        ),
     ],
 )
 def test_the_chunks_of_a_table(table_slots, bucket_capacity, target, expected):
@@ -153,7 +158,9 @@ def found(storage, keys, table_id, device):
     """Which of ``keys`` the table holds -- in the key map it has *now*."""
     keys = torch.as_tensor(keys, dtype=torch.int64, device=device)
     arg = ScoreArg(name=score_name(storage), value=None, policy=ScorePolicy.CONST)
-    _, founds, _ = storage.key_index_map.lookup(keys, torch.full_like(keys, table_id), arg)
+    _, founds, _ = storage.key_index_map.lookup(
+        keys, torch.full_like(keys, table_id), arg
+    )
     return founds
 
 

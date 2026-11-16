@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import sys
-from typing import Dict, List, Tuple, Union
+from typing import Dict, List, Optional, Tuple, Union
 
 import commons.datasets as datasets
 import torch  # pylint: disable-unused-import
@@ -186,6 +186,32 @@ def get_data_loader(
     return datasets.get_data_loader(train_dataset), datasets.get_data_loader(test_dataset)  # type: ignore[attr-defined]
 
 
+def get_feature_to_max_seqlen(
+    dataset_args: Union[DatasetArgs, BenchmarkDatasetArgs],
+) -> Dict[str, int]:
+    """The most keys a sample of the dataset has of each feature, candidates
+    included: the ``feature_to_max_seqlen`` of the dataset's batches."""
+    if isinstance(dataset_args, BenchmarkDatasetArgs):
+        # HSTUBatch.random: at most max_sequence_length keys of each feature of a
+        # FeatureArgs. The candidates are the last keys of the item feature.
+        return {
+            name: feature_args.max_sequence_length
+            for feature_args in dataset_args.feature_args
+            for name in feature_args.feature_names
+        }
+    from commons.hstu_data_preprocessor import get_common_preprocessors
+
+    # HSTUSequenceDataset: one key of each contextual feature, and at most
+    # max_history_seqlen + max_num_candidates of the item and action features.
+    dp = get_common_preprocessors(dataset_args.dataset_path)[dataset_args.dataset_name]
+    max_seqlen = dataset_args.max_history_seqlen + dataset_args.max_num_candidates
+    return {
+        **{name: 1 for name in dp._contextual_feature_names},
+        dp._item_feature_name: max_seqlen,
+        dp._action_feature_name: max_seqlen,
+    }
+
+
 def create_optimizer_params(optimizer_args: OptimizerArgs):
     return OptimizerParam(
         optimizer_str=optimizer_args.optimizer_str,
@@ -265,31 +291,87 @@ def create_embedding_configs(
     return embedding_configs
 
 
+def get_output_dist_and_capacity(
+    dynamic_embedding_args: List[DynamicEmbeddingArgs],
+    world_size: int,
+    batch_size: int,
+    feature_to_max_seqlen: Dict[str, int],
+) -> Tuple[str, Optional[Union[int, Dict[str, int]]]]:
+    """The output dist of the DynamicEmb tables, and its capacity.
+
+    The DynamicEmb tables are one row-wise sharding, so they must all set the
+    same output_dist and output_dist_capacity. Without a capacity, an output
+    dist other than "torchrec" gets one that every call fits. An owner looks up
+    at most every rank's keys of the sharding's features, so the capacity is
+    world_size × batch_size × the most keys a sample has, summed over those
+    features.
+    """
+    output_dist = dynamic_embedding_args[0].output_dist
+    capacity = dynamic_embedding_args[0].output_dist_capacity
+    for args in dynamic_embedding_args[1:]:
+        if (args.output_dist, args.output_dist_capacity) != (output_dist, capacity):
+            raise ValueError(
+                "The DynamicEmb tables are one row-wise sharding, so they must all "
+                "set the same output_dist and output_dist_capacity. Table "
+                f"{dynamic_embedding_args[0].table_name!r} sets "
+                f"({output_dist!r}, {capacity!r}), table {args.table_name!r} sets "
+                f"({args.output_dist!r}, {args.output_dist_capacity!r})."
+            )
+    if output_dist == "torchrec" or capacity is not None:
+        return output_dist, capacity
+    keys_per_sample = sum(
+        feature_to_max_seqlen[name]
+        for args in dynamic_embedding_args
+        for name in args.feature_names
+    )
+    return output_dist, world_size * batch_size * keys_per_sample
+
+
 def create_dynamic_optitons_dict(
     embedding_args_list: List[Union[EmbeddingArgs, DynamicEmbeddingArgs]],
     hidden_size: int,
     training: bool = True,
     embedding_dim_multiplier: int = 1,  # for training, we store the optimizer states together with original embedding vectors.
+    *,
+    world_size: int,
+    batch_size: int,
+    feature_to_max_seqlen: Dict[str, int],
 ) -> Dict[str, DynamicEmbTableOptions]:
-    dynamic_options_dict: Dict[str, DynamicEmbTableOptions] = {}
-    for embedding_args in embedding_args_list:
-        if isinstance(embedding_args, DynamicEmbeddingArgs):
-            from dynamicemb import DynamicEmbCheckMode, DynamicEmbEvictStrategy
+    """The DynamicEmbTableOptions of each DynamicEmb table, by table name.
 
-            embedding_args.calculate_and_reset_global_hbm_for_values(
-                hidden_size, embedding_dim_multiplier
-            )
-            dynamic_options_dict[embedding_args.table_name] = DynamicEmbTableOptions(
-                global_hbm_for_values=embedding_args.global_hbm_for_values,
-                evict_strategy=DynamicEmbEvictStrategy.LRU
-                if embedding_args.evict_strategy == "lru"
-                else DynamicEmbEvictStrategy.LFU,
-                safe_check_mode=DynamicEmbCheckMode.IGNORE,
-                bucket_capacity=128,
-                training=training,
-                caching=embedding_args.caching,
-                dist_type=embedding_args.dist_type,
-            )
+    ``world_size``, ``batch_size`` (the local training batch size) and
+    ``feature_to_max_seqlen`` (see :func:`get_feature_to_max_seqlen`) size the
+    output dist's capacity when the tables set none
+    (:func:`get_output_dist_and_capacity`).
+    """
+    dynamic_embedding_args = [
+        args for args in embedding_args_list if isinstance(args, DynamicEmbeddingArgs)
+    ]
+    if not dynamic_embedding_args:
+        return {}
+    output_dist, output_dist_capacity = get_output_dist_and_capacity(
+        dynamic_embedding_args, world_size, batch_size, feature_to_max_seqlen
+    )
+    from dynamicemb import DynamicEmbCheckMode, DynamicEmbEvictStrategy
+
+    dynamic_options_dict: Dict[str, DynamicEmbTableOptions] = {}
+    for embedding_args in dynamic_embedding_args:
+        embedding_args.calculate_and_reset_global_hbm_for_values(
+            hidden_size, embedding_dim_multiplier
+        )
+        dynamic_options_dict[embedding_args.table_name] = DynamicEmbTableOptions(
+            global_hbm_for_values=embedding_args.global_hbm_for_values,
+            evict_strategy=DynamicEmbEvictStrategy.LRU
+            if embedding_args.evict_strategy == "lru"
+            else DynamicEmbEvictStrategy.LFU,
+            safe_check_mode=DynamicEmbCheckMode.IGNORE,
+            bucket_capacity=128,
+            training=training,
+            caching=embedding_args.caching,
+            dist_type=embedding_args.dist_type,
+            output_dist=output_dist,
+            output_dist_capacity=output_dist_capacity,
+        )
     return dynamic_options_dict
 
 

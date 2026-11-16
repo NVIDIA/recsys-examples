@@ -80,7 +80,9 @@ FRESH = 16384 * SCALE
 REVISITS = 36864 * SCALE
 STRAGGLERS = 2048 * SCALE
 # A step's batch is 8192 + 16384 + 36864 + 2048 = 63488 keys, at most, per table.
-CHUNK_SLOTS = 1 << 18  # a table of a few million slots is scanned in a dozen chunks or more
+CHUNK_SLOTS = (
+    1 << 18
+)  # a table of a few million slots is scanned in a dozen chunks or more
 
 
 def _workload(num_steps: int):
@@ -103,8 +105,11 @@ def _workload(num_steps: int):
         batches.append(batch)
     return batches, next_key
 
+
 NUM_EMBEDDINGS = 1 << 23  # per table: more than the keys of the whole run
-INIT_CAPACITY = 1 << 20  # less than what the window holds: the tables grow under the scans
+INIT_CAPACITY = (
+    1 << 20
+)  # less than what the window holds: the tables grow under the scans
 # Without it a table is one bucket the size of the whole table (MAX_BUCKET_CAPACITY, what
 # create_model uses): it could not grow, and a scan could not be cut into chunks, which
 # never split a bucket.
@@ -211,7 +216,9 @@ def check_stress(num_tables: int) -> None:
 
     assert asked, "the loop was too short for an erase"
     asked_at, threshold = asked[-1]
-    expect = last_step >= threshold  # present iff trained at or after the last threshold
+    expect = (
+        last_step >= threshold
+    )  # present iff trained at or after the last threshold
     expect[0] = False
     held, counts = _held(model, table_names, universe)
     for index, name in enumerate(table_names):
@@ -225,9 +232,9 @@ def check_stress(num_tables: int) -> None:
             f"{name}: {len(wrong_kept)} keys below the threshold {threshold} survived "
             f"the erase asked for at step {asked_at}, e.g. {wrong_kept[:5].tolist()}"
         )
-        assert counts[index] == int(expect.sum()), (
-            f"{name}: exports {counts[index]} keys, a key twice?"
-        )
+        assert counts[index] == int(
+            expect.sum()
+        ), f"{name}: exports {counts[index]} keys, a key twice?"
     assert erased_total > 0
     # The scans had tables that grew under them to restart on.
     assert expansions() > expansions_before, "the tables never grew: no restart tried"

@@ -1,0 +1,583 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""A call over the hierarchical dist's capacities
+(``output_dist="hierarchical"``) raises at its second wait, on every rank
+alike, and the op takes the calls after it.
+
+Each case trains three models, with the sharder's index dedup: on the
+hierarchical dist with ample capacities (whose calls give the needs), on the
+hierarchical dist with one capacity that the case's large calls do not fit,
+and on TorchRec's dists with the case's small calls
+alone. On the second model every large call
+raises RuntimeError on every rank, naming the capacity to raise, and every
+small call must give TorchRec's outputs, bit for bit at a power-of-two world
+size: the large calls changed nothing. The ``placement`` cases also check
+that each table holds exactly the keys DynamicEmb's bucketize gives its
+rank.
+
+Run it from ``corelib/dynamicemb``, one process per GPU (on one node, or
+across nodes under Slurm)::
+
+    torchrun --nproc_per_node 8 test/unit_tests/test_hier_overflow.py
+    srun --ntasks-per-node 8 python test/unit_tests/test_hier_overflow.py
+"""
+
+import os
+import sys
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional, Sequence, Tuple
+
+import torch
+import torch.distributed as dist
+import torchrec
+from dynamicemb import (
+    DynamicEmbInitializerArgs,
+    DynamicEmbInitializerMode,
+    DynamicEmbScoreStrategy,
+    DynamicEmbTableOptions,
+    EmbOptimType,
+    EvictedItemMode,
+    get_table_value_bytes,
+)
+from dynamicemb.batched_dynamicemb_tables import BatchedDynamicEmbeddingTablesV2
+from dynamicemb.dynamicemb_config import OUTPUT_DIST_CAPACITY_NAMES
+from dynamicemb.planner import (
+    DynamicEmbeddingShardingPlanner,
+    DynamicEmbParameterConstraints,
+)
+from dynamicemb.shard import DynamicEmbeddingCollectionSharder, node_size, quiesce
+from dynamicemb.shard.embedding import ShardedDynamicEmbeddingCollection
+from fbgemm_gpu.split_embedding_configs import SparseType
+from torchrec.distributed.embedding_types import EmbeddingComputeKernel
+from torchrec.distributed.model_parallel import DistributedModelParallel
+from torchrec.distributed.planner import Topology
+from torchrec.distributed.types import BoundsCheckMode, ShardingType
+from torchrec.modules.embedding_configs import DataType
+
+sys.path.insert(
+    0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "benchmark")
+)
+from benchmark_utils import init_distributed  # noqa: E402
+
+AMPLE = 1 << 20  # entries: far above every batch here
+DIM = 32
+NUM_EMBEDDINGS = 1 << 20
+TABLES = (("f0", "f1"), ("f2",))  # f0 and f1 share table t0
+FEATURES = [feature for table in TABLES for feature in table]
+BESIDE = "g0"  # the feature of the table-wise TorchRec table beside the sharding
+SMALL, LARGE = (64, 4), (512, 16)  # (samples, longest sequence) of a batch
+
+
+@dataclass
+class Case:
+    name: str
+    capacity: str  # the tight one: a name of OUTPUT_DIST_CAPACITY_NAMES, or "int"
+    # the calls, "s" small and "l" large (those do not fit the tight capacity)
+    schedule: str = "sls"
+    hot: float = 0.0  # share of the keys drawn from 4 hot keys (heavy rows)
+    lfu: bool = False  # LFU scores (frequency counters as weights)
+    int32: bool = False  # KJT values and lengths
+    # int32 keys of placement_keys(), and the checks of where they went
+    # (check_placement)
+    placement: bool = False
+    dist_type: str = "roundrobin"  # the tables' key -> rank rule
+    vbe: bool = False  # variable batch size per feature
+    groups: bool = False  # the last table in a lookup group of its own
+    beside: bool = False  # a table-wise TorchRec table beside the sharding
+    # "plain": each call's forward, then its backward; "interleaved": two
+    # calls' forwards, then their backwards in order
+    order: str = "plain"
+    multi_node: bool = False  # across nodes (NCCL's LSA teams: node_size) only
+    expected: Tuple[int, ...] = field(init=False)  # the calls that raise
+
+    def __post_init__(self) -> None:
+        self.expected = tuple(
+            step for step, kind in enumerate(self.schedule) if kind == "l"
+        )
+
+    @property
+    def features(self) -> List[str]:
+        return FEATURES + ([BESIDE] if self.beside else [])
+
+    def size(self, step: int) -> Tuple[int, int]:
+        return LARGE if self.schedule[step] == "l" else SMALL
+
+
+CASES = [
+    Case("lookup_keys", "lookup_keys"),
+    Case("int", "int"),
+    Case("first call", "lookup_keys", schedule="lss"),
+    Case("many calls", "lookup_keys", schedule="sllslls"),
+    Case("heavy rows", "lookup_keys", hot=0.5),
+    Case("lfu", "lookup_keys", lfu=True),
+    Case("lfu, int", "int", lfu=True),
+    Case("int32 keys", "lookup_keys", int32=True),
+    *(
+        Case(
+            f"int32 placement, {dist_type}",
+            "lookup_keys",
+            schedule="slss",
+            int32=True,
+            placement=True,
+            dist_type=dist_type,
+        )
+        for dist_type in ("roundrobin", "hash_roundrobin")
+    ),
+    Case("variable batch per feature", "lookup_keys", vbe=True),
+    Case("two lookup groups", "lookup_keys", groups=True),
+    Case("a table-wise table beside", "lookup_keys", beside=True),
+    Case(
+        "between a forward and its backward",
+        "lookup_keys",
+        schedule="slssls",
+        order="interleaved",
+        hot=0.5,
+    ),
+    Case("remote_keys", "remote_keys", multi_node=True),
+]
+
+
+def signed_sum(out, signs: torch.Tensor, features: List[str]) -> torch.Tensor:
+    return sum((out[name].values() * signs).sum() for name in features)
+
+
+def build_model(
+    case: Case, output_dist: str, capacity, world_size: int, local_size: int
+) -> DistributedModelParallel:
+    def config(name: str, features) -> torchrec.EmbeddingConfig:
+        return torchrec.EmbeddingConfig(
+            name=name,
+            embedding_dim=DIM,
+            num_embeddings=NUM_EMBEDDINGS,
+            feature_names=list(features),
+            data_type=DataType.FP32,
+        )
+
+    # the table-wise TorchRec table's rows: the same in every model
+    torch.manual_seed(13)
+    tables = [config(f"t{i}", features) for i, features in enumerate(TABLES)]
+    beside = [config(f"tw_{BESIDE}", (BESIDE,))] if case.beside else []
+    ec = torchrec.EmbeddingCollection(
+        tables=tables + beside, device=torch.device("meta")
+    )
+    opt = EmbOptimType.EXACT_SGD
+    extra = {"score_strategy": DynamicEmbScoreStrategy.LFU} if case.lfu else {}
+
+    def evicted(table_idx: int) -> EvictedItemMode:
+        last = case.groups and table_idx == len(tables) - 1
+        return EvictedItemMode.RETAIN_KEY if last else EvictedItemMode.DISCARD
+
+    constraints = {
+        table.name: DynamicEmbParameterConstraints(
+            sharding_types=[ShardingType.ROW_WISE.value],
+            enforce_hbm=True,
+            bounds_check_mode=BoundsCheckMode.NONE,
+            use_dynamicemb=True,
+            dynamicemb_options=DynamicEmbTableOptions(
+                global_hbm_for_values=get_table_value_bytes(table, opt, world_size),
+                caching=False,
+                initializer_args=DynamicEmbInitializerArgs(
+                    mode=DynamicEmbInitializerMode.DEBUG
+                ),
+                output_dist=output_dist,
+                output_dist_capacity=capacity,
+                dist_type=case.dist_type,
+                evicted_item_mode=evicted(table_idx),
+                **extra,
+            ),
+        )
+        for table_idx, table in enumerate(tables)
+    }
+    for table in beside:
+        constraints[table.name] = DynamicEmbParameterConstraints(
+            sharding_types=[ShardingType.TABLE_WISE.value],
+            compute_kernels=[EmbeddingComputeKernel.FUSED.value],
+            bounds_check_mode=BoundsCheckMode.NONE,
+            use_dynamicemb=False,
+        )
+    topology = Topology(
+        local_world_size=local_size,
+        world_size=world_size,
+        compute_device="cuda",
+        hbm_cap=80 * 1024**3,
+        ddr_cap=1024**4 // local_size,
+    )
+    planner = DynamicEmbeddingShardingPlanner(
+        topology=topology, constraints=constraints, batch_size=LARGE[0]
+    )
+    sharder = DynamicEmbeddingCollectionSharder(
+        fused_params={
+            "optimizer": opt,
+            "learning_rate": 1.0,
+            "output_dtype": SparseType.FP32,
+        },
+        use_index_dedup=True,
+    )
+    plan = planner.collective_plan(ec, [sharder], dist.GroupMember.WORLD)
+    return DistributedModelParallel(
+        module=ec,
+        device=torch.device("cuda", torch.cuda.current_device()),
+        sharders=[sharder],
+        plan=plan,
+    )
+
+
+def batches_of(case: Case, rank: int) -> List[torchrec.KeyedJaggedTensor]:
+    generator = torch.Generator(device="cuda")
+    generator.manual_seed(1009 * (rank + 1) + len(case.name))
+    features = case.features
+    out = []
+    for step in range(len(case.schedule)):
+        samples, longest = case.size(step)
+        strides = [samples] * len(features)
+        if case.vbe:  # each feature its own batch size, and its map to the batch
+            strides = [
+                max(1, samples - 13 * feature) for feature in range(len(features))
+            ]
+        lengths = torch.cat(
+            [
+                torch.randint(
+                    1, longest + 1, (stride,), device="cuda", generator=generator
+                )
+                for stride in strides
+            ]
+        )
+        total = int(lengths.sum())
+        keys = torch.randint(
+            0, NUM_EMBEDDINGS, (total,), device="cuda", generator=generator
+        )
+        if case.placement:
+            pool = placement_keys()
+            keys = pool[
+                torch.randint(
+                    0, pool.numel(), (total,), device="cuda", generator=generator
+                )
+            ]
+        if case.hot:
+            hot = torch.rand(total, device="cuda", generator=generator) < case.hot
+            keys = torch.where(hot, keys % 4, keys)
+        kwargs = {}
+        if case.vbe:
+            inverse = torch.stack(
+                [
+                    torch.randint(
+                        0, stride, (samples,), device="cuda", generator=generator
+                    )
+                    for stride in strides
+                ]
+            )
+            kwargs = dict(
+                stride_per_key_per_rank=[[stride] for stride in strides],
+                inverse_indices=(features, inverse),
+            )
+        index_dtype = torch.int32 if case.int32 else torch.int64
+        out.append(
+            torchrec.KeyedJaggedTensor(
+                keys=features,
+                values=keys.to(index_dtype),
+                lengths=lengths.to(index_dtype),
+                **kwargs,
+            )
+        )
+    return out
+
+
+def sharded_ec(model) -> ShardedDynamicEmbeddingCollection:
+    return next(
+        module
+        for module in model.modules()
+        if isinstance(module, ShardedDynamicEmbeddingCollection)
+    )
+
+
+def rw_index(ec: ShardedDynamicEmbeddingCollection) -> int:
+    """Position of the row-wise sharding (its dists and context)."""
+    return list(ec._sharding_type_to_sharding).index(ShardingType.ROW_WISE.value)
+
+
+def placement_keys() -> torch.Tensor:
+    """The keys of the ``placement`` cases, the same on every rank: 4096 from
+    the whole int32 range, 512 below NUM_EMBEDDINGS, and both ends of the
+    range, but the four keys the tables reserve (-4 to -1: their int64 keys
+    are the hash tables' empty, locked and reclaimed slots)."""
+    generator = torch.Generator().manual_seed(4093)
+    keys = torch.cat(
+        [
+            torch.randint(-(1 << 31), 1 << 31, (4096,), generator=generator),
+            torch.randint(0, NUM_EMBEDDINGS, (512,), generator=generator),
+            torch.tensor([-(1 << 31), -(1 << 31) + 1, (1 << 31) - 2, (1 << 31) - 1]),
+            torch.tensor([-6, -5, 0, 1]),
+        ]
+    )
+    reserved = (keys >= -4) & (keys <= -1)
+    return torch.unique(keys[~reserved]).cuda()
+
+
+def table_keys(model) -> Dict[str, torch.Tensor]:
+    """This rank's keys of each DynamicEmb table of the row-wise sharding,
+    sorted."""
+    ec = sharded_ec(model)
+    out = {}
+    for module in ec._lookups[rw_index(ec)]._emb_modules:
+        emb = module._emb_module
+        if not isinstance(emb, BatchedDynamicEmbeddingTablesV2):
+            continue
+        for name in emb._table_names:
+            keys, _ = emb.export_keys_values(name, torch.device("cuda"))
+            out[name] = torch.sort(keys).values
+    return out
+
+
+def bucketized_keys(
+    model, case: Case, rank: int, steps: Sequence[int]
+) -> Dict[str, torch.Tensor]:
+    """The keys each table of this rank holds after the case's calls
+    ``steps``: the keys of every rank's KJTs of those calls that DynamicEmb's
+    bucketize (the sharding's own, on the KJT as it is) gives this rank, as it
+    writes them, widened to int64 with their sign; per table, sorted."""
+    ec = sharded_ec(model)
+    input_dist = ec._input_dists[rw_index(ec)]
+    world_size = dist.get_world_size()
+    # the sharding's features, in its order (a placement case has no table
+    # beside it)
+    features = list(ec._sharding_type_to_sharding.values())[
+        rw_index(ec)
+    ].feature_names()
+    table_of = {
+        feature: f"t{table}" for table, feats in enumerate(TABLES) for feature in feats
+    }
+    parts: Dict[str, List[torch.Tensor]] = {name: [] for name in table_of.values()}
+    for source in range(world_size):
+        batches = batches_of(case, source)
+        for kjt in (batches[step] for step in steps):
+            kjt = kjt.permute([kjt.keys().index(feature) for feature in features])
+            bucketized, _ = input_dist._bucketize(kjt)
+            # keys by [owner][feature][sample]
+            length_per_bucket_feature = (
+                bucketized.lengths().view(world_size, len(features), -1).sum(2)
+            )
+            ends = (
+                torch.cumsum(length_per_bucket_feature.flatten(), 0)
+                .view_as(length_per_bucket_feature)
+                .tolist()
+            )
+            values = bucketized.values().long()
+            for index, feature in enumerate(features):
+                end = ends[rank][index]
+                begin = end - int(length_per_bucket_feature[rank][index])
+                parts[table_of[feature]].append(values[begin:end])
+    return {name: torch.unique(torch.cat(keys)) for name, keys in parts.items()}
+
+
+def check_placement(
+    case: Case, checks: "Checks", model, rank: int, which: str, steps: Sequence[int]
+):
+    """Each table of this rank holds exactly the keys the bucketize gives the
+    rank in the calls ``steps`` (:func:`bucketized_keys`)."""
+    want, got = bucketized_keys(model, case, rank, steps), table_keys(model)
+    placed = sorted(got) == sorted(want) and all(
+        torch.equal(got[name].cpu(), want[name].cpu()) for name in want
+    )
+    if not placed:
+        print(
+            f"[rank {rank}] {case.name}: {which} tables hold "
+            + ", ".join(
+                f"{name} {got[name].numel() if name in got else None}" for name in want
+            )
+            + " keys, the bucketize gives "
+            + ", ".join(f"{name} {keys.numel()}" for name, keys in want.items()),
+            flush=True,
+        )
+    checks.check(f"{case.name}: {which} placed", placed)
+
+
+@dataclass
+class Step:
+    out: Dict[str, torch.Tensor]  # the output rows of each feature
+    call: Optional[
+        object
+    ]  # what the input dist left the output dist, None on TorchRec's
+
+
+def rows_of(case: Case, out) -> Dict[str, torch.Tensor]:
+    return {name: out[name].values().detach().clone() for name in case.features}
+
+
+def input_dist(ec, kjt: torchrec.KeyedJaggedTensor):
+    """A call's input dist, both waits: its context, the lookup's input, and
+    what it left the output dist (None on TorchRec's dists)."""
+    ctx = ec.create_context()
+    dist_input = ec.input_dist(ctx, kjt).wait().wait()
+    return (
+        ctx,
+        dist_input,
+        getattr(ctx.sharding_contexts[rw_index(ec)], "hier_result", None),
+    )
+
+
+def run(
+    model, case: Case, batches, signs, skip: Sequence[int] = ()
+) -> Tuple[Dict[int, Step], Dict[int, str]]:
+    """The case's calls on ``model``, but those in ``skip``, in the case's
+    order: each call's forward, then its backward; or (``interleaved``) the
+    forwards of two calls, then their backwards in order. A call whose input
+    dist raises RuntimeError makes no forward. Returns the steps of the calls
+    that ran and the messages of those that raised, by call. Their kernels
+    have ended when it returns (the caller may drop the model, and its
+    tables' memory with it)."""
+    ec = sharded_ec(model)
+    steps: Dict[int, Step] = {}
+    raised: Dict[int, str] = {}
+    group = 2 if case.order == "interleaved" else 1
+    for first in range(0, len(batches), group):
+        pending = []
+        for index in range(first, min(first + group, len(batches))):
+            if index in skip:
+                continue
+            try:
+                ctx, dist_input, call = input_dist(ec, batches[index])
+            except RuntimeError as error:
+                raised[index] = str(error)
+                continue
+            out = ec.compute_and_output_dist(ctx, dist_input).wait()
+            pending.append((index, out, Step(rows_of(case, out), call)))
+        for index, out, step in pending:
+            signed_sum(out, signs, case.features).backward()
+            steps[index] = step
+    torch.cuda.synchronize()
+    return steps, raised
+
+
+def same_everywhere(values: List[int]) -> bool:
+    every = [None] * dist.get_world_size()
+    dist.all_gather_object(every, values)
+    return all(other == values for other in every)
+
+
+class Checks:
+    def __init__(self, rank: int) -> None:
+        self.rank = rank
+        self.failed = 0
+
+    def check(self, label: str, ok: bool) -> None:
+        flag = torch.tensor([int(ok)], device="cuda")
+        dist.all_reduce(flag, op=dist.ReduceOp.MIN)
+        ok = bool(flag.item())
+        self.failed += not ok
+        if self.rank == 0:
+            print(f"{label}={int(ok)} [{'ok' if ok else 'FAIL'}]", flush=True)
+
+
+def tight_capacity(case: Case, needs: List[Dict[str, int]]):
+    """The capacities of ``tight``: ample, but ``case.capacity`` at the most
+    the case's small calls need (their needs, as ``ample``'s calls counted
+    them)."""
+    small = [need for step, need in enumerate(needs) if step not in case.expected]
+    if case.capacity == "int":
+        return max(
+            max(need[name] for name in OUTPUT_DIST_CAPACITY_NAMES) for need in small
+        )
+    capacity = dict.fromkeys(OUTPUT_DIST_CAPACITY_NAMES, AMPLE)
+    capacity[case.capacity] = max(need[case.capacity] for need in small)
+    return capacity
+
+
+def run_case(case: Case, checks: Checks, rank: int, world_size: int, local_size: int):
+    exact = world_size & (world_size - 1) == 0
+    torch.manual_seed(7)
+    signs = torch.randn(DIM, device="cuda").sign()
+    batches = batches_of(case, rank)
+    small = [step for step in range(len(batches)) if step not in case.expected]
+    label = case.name
+    # The ample capacities, whose calls give the needs; then TorchRec's dists
+    # on the small calls alone.
+    ample_capacity = dict.fromkeys(OUTPUT_DIST_CAPACITY_NAMES, AMPLE)
+    ample_model = build_model(
+        case, "hierarchical", ample_capacity, world_size, local_size
+    )
+    ample, ample_raised = run(ample_model, case, batches, signs)
+    checks.check(f"{label}: ample runs every call", not ample_raised)
+    if case.placement:
+        check_placement(case, checks, ample_model, rank, "ample's", range(len(batches)))
+    needs = [ample[step].call.needs for step in range(len(batches))]
+    quiesce(ample_model)
+    del ample_model
+    reference_model = build_model(case, "torchrec", None, world_size, local_size)
+    reference, _ = run(reference_model, case, batches, signs, skip=case.expected)
+    del reference_model
+    capacity = tight_capacity(case, needs)
+    tight_model = build_model(case, "hierarchical", capacity, world_size, local_size)
+    tight, raised = run(tight_model, case, batches, signs)
+
+    def same_rows() -> bool:
+        if sorted(tight) != small:
+            return False
+        for step in small:
+            for name in case.features:
+                expected, got = reference[step].out[name], tight[step].out[name]
+                same = (
+                    torch.equal(expected, got)
+                    if exact
+                    else torch.allclose(expected, got, 1e-4, 1e-4)
+                )
+                if not same:
+                    print(
+                        f"[rank {rank}] {label}: feature {name} differs at step {step}",
+                        flush=True,
+                    )
+                    return False
+        return True
+
+    checks.check(f"{label}: fwd of the small calls", same_rows())
+    over = sorted(raised)
+    checks.check(f"{label}: raised {over}", over == list(case.expected))
+    checks.check(f"{label}: same calls everywhere", same_everywhere(over))
+    named = case.capacity if case.capacity != "int" else "_keys from"
+    checks.check(
+        f"{label}: names the capacity",
+        all(
+            "output_dist_capacity" in message and named in message
+            for message in raised.values()
+        ),
+    )
+    if case.placement:
+        check_placement(case, checks, tight_model, rank, "tight's", small)
+    quiesce(tight_model)
+    del tight_model
+    torch.cuda.synchronize()
+    dist.barrier()
+
+
+def main() -> None:
+    # local_size: the GPUs of a host, which the planner takes; the dist's
+    # node is NCCL's LSA team (node_size, collective)
+    rank, world_size, _, local_size = init_distributed()
+    os.environ.setdefault("DYNAMICEMB_HIER_TIMEOUT_S", "120")
+    multi_node = world_size // node_size(dist.group.WORLD) > 1
+    checks = Checks(rank)
+    for case in CASES:
+        if case.multi_node and not multi_node:
+            continue
+        run_case(case, checks, rank, world_size, local_size)
+    if rank == 0:
+        print(
+            "ALL PASSED" if not checks.failed else f"{checks.failed} FAILED", flush=True
+        )
+    dist.destroy_process_group()
+    sys.exit(1 if checks.failed else 0)
+
+
+if __name__ == "__main__":
+    main()

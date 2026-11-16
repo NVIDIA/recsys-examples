@@ -57,9 +57,13 @@ class ValueDecoderBlock(nn.Module):
     def __init__(self, dim: int, num_heads: int, dropout: float) -> None:
         super().__init__()
         self.self_norm = RMSNorm(dim)
-        self.self_attn = nn.MultiheadAttention(dim, num_heads, dropout=dropout, batch_first=True)
+        self.self_attn = nn.MultiheadAttention(
+            dim, num_heads, dropout=dropout, batch_first=True
+        )
         self.cross_norm = RMSNorm(dim)
-        self.cross_attn = nn.MultiheadAttention(dim, num_heads, dropout=dropout, batch_first=True)
+        self.cross_attn = nn.MultiheadAttention(
+            dim, num_heads, dropout=dropout, batch_first=True
+        )
         self.ffn_norm = RMSNorm(dim)
         self.ffn = SwiGLU(dim, dim * 4, dropout)
         self.cross_gate = nn.Parameter(torch.tensor(0.5))
@@ -71,7 +75,9 @@ class ValueDecoderBlock(nn.Module):
         memory_key_padding_mask: torch.Tensor | None,
     ) -> torch.Tensor:
         q_len = x.size(1)
-        causal = torch.triu(torch.ones(q_len, q_len, dtype=torch.bool, device=x.device), diagonal=1)
+        causal = torch.triu(
+            torch.ones(q_len, q_len, dtype=torch.bool, device=x.device), diagonal=1
+        )
         h = self.self_norm(x)
         self_out, _ = self.self_attn(
             h,
@@ -97,12 +103,16 @@ class ValueDecoderBlock(nn.Module):
 
 
 class ValueDecoder(nn.Module):
-    def __init__(self, dim: int, num_heads: int, num_layers: int, sid_depth: int, dropout: float) -> None:
+    def __init__(
+        self, dim: int, num_heads: int, num_layers: int, sid_depth: int, dropout: float
+    ) -> None:
         super().__init__()
         self.boc = nn.Parameter(torch.zeros(1, 1, dim))
         self.position = nn.Embedding(sid_depth + 2, dim)
         self.memory_norm = RMSNorm(dim)
-        self.blocks = nn.ModuleList([ValueDecoderBlock(dim, num_heads, dropout) for _ in range(num_layers)])
+        self.blocks = nn.ModuleList(
+            [ValueDecoderBlock(dim, num_heads, dropout) for _ in range(num_layers)]
+        )
         self.head_norm = RMSNorm(dim)
         self.head = SwiGLU(dim, dim * 2, dropout)
         self.reward_head = nn.Linear(dim, 1)
@@ -123,7 +133,14 @@ class ValueDecoder(nn.Module):
             valid = (~memory_key_padding_mask).float().unsqueeze(-1)
             pooled = (memory * valid).sum(dim=1) / valid.sum(dim=1).clamp(min=1.0)
 
-        x = torch.cat([self.boc.expand(batch_size, -1, -1), pooled.unsqueeze(1), decoder_features.detach()], dim=1)
+        x = torch.cat(
+            [
+                self.boc.expand(batch_size, -1, -1),
+                pooled.unsqueeze(1),
+                decoder_features.detach(),
+            ],
+            dim=1,
+        )
         pos = torch.arange(x.size(1), device=x.device).unsqueeze(0)
         x = x + self.position(pos)
 
@@ -174,7 +191,9 @@ class OneRecSIDWithValue(nn.Module):
             activation="gelu",
             norm_first=False,
         )
-        self.history_encoder = nn.TransformerEncoder(encoder_layer, num_layers=encoder_layers)
+        self.history_encoder = nn.TransformerEncoder(
+            encoder_layer, num_layers=encoder_layers
+        )
 
         decoder_layer = nn.TransformerDecoderLayer(
             d_model=dim,
@@ -187,7 +206,9 @@ class OneRecSIDWithValue(nn.Module):
         )
         self.decoder = nn.TransformerDecoder(decoder_layer, num_layers=decoder_layers)
         self.output = nn.Linear(dim, num_classes)
-        self.value_decoder = ValueDecoder(dim, num_heads, value_layers, sid_depth, dropout)
+        self.value_decoder = ValueDecoder(
+            dim, num_heads, value_layers, sid_depth, dropout
+        )
 
         nn.init.normal_(self.bos, mean=0.0, std=0.02)
 
@@ -198,9 +219,13 @@ class OneRecSIDWithValue(nn.Module):
         user_feat: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         batch_size, hist_size, sid_depth = hist_sid.shape
-        depth_pos = torch.arange(sid_depth, device=hist_sid.device).view(1, 1, sid_depth)
+        depth_pos = torch.arange(sid_depth, device=hist_sid.device).view(
+            1, 1, sid_depth
+        )
         sid_emb = self.sid_embedding(hist_sid) + self.sid_position(depth_pos)
-        item_vec = self.sid_merge(sid_emb.reshape(batch_size, hist_size, sid_depth * self.dim))
+        item_vec = self.sid_merge(
+            sid_emb.reshape(batch_size, hist_size, sid_depth * self.dim)
+        )
         hist_pos = torch.arange(hist_size, device=hist_sid.device).view(1, hist_size)
         user_vec = self.user_proj(user_feat).unsqueeze(1)
 
@@ -209,7 +234,9 @@ class OneRecSIDWithValue(nn.Module):
         # @torch_optimize:end
 
         mask = (hist_sid == 0).all(dim=-1)
-        len_mask = torch.arange(hist_size, device=hist_sid.device).view(1, hist_size) >= hist_len.view(batch_size, 1)
+        len_mask = torch.arange(hist_size, device=hist_sid.device).view(
+            1, hist_size
+        ) >= hist_len.view(batch_size, 1)
         mask = mask | len_mask
         all_pad = mask.all(dim=1)
         if all_pad.any():
@@ -227,7 +254,9 @@ class OneRecSIDWithValue(nn.Module):
         return x + self.decoder_position(pos)
 
     def causal_mask(self, length: int, device: torch.device) -> torch.Tensor:
-        return torch.triu(torch.ones(length, length, dtype=torch.bool, device=device), diagonal=1)
+        return torch.triu(
+            torch.ones(length, length, dtype=torch.bool, device=device), diagonal=1
+        )
 
     def forward(
         self,
@@ -259,12 +288,18 @@ class OneRecSIDWithValue(nn.Module):
         reward_weight: float = 0.2,
         ltv_weight: float = 0.2,
     ) -> tuple[torch.Tensor, dict[str, float]]:
-        logits, dec, memory, memory_mask = self(target_sid, user_feat, hist_sid, hist_len)
-        cls_loss = F.cross_entropy(logits.reshape(-1, logits.size(-1)), target_sid.reshape(-1))
+        logits, dec, memory, memory_mask = self(
+            target_sid, user_feat, hist_sid, hist_len
+        )
+        cls_loss = F.cross_entropy(
+            logits.reshape(-1, logits.size(-1)), target_sid.reshape(-1)
+        )
         reward_pred, ltv_pred = self.value_decoder(memory, dec, memory_mask)
         reward_loss = F.mse_loss(reward_pred, immediate_reward)
         ltv_loss = F.mse_loss(ltv_pred.mean(dim=1), ltv)
-        loss = cls_weight * cls_loss + reward_weight * reward_loss + ltv_weight * ltv_loss
+        loss = (
+            cls_weight * cls_loss + reward_weight * reward_loss + ltv_weight * ltv_loss
+        )
         logs = {
             "loss": float(loss.detach().cpu()),
             "cls": float(cls_loss.detach().cpu()),

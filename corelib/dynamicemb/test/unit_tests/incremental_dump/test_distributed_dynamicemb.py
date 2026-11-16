@@ -15,7 +15,8 @@
 
 import os
 import random
-from typing import Dict, List, Optional
+import sys
+from typing import Any, Dict, List, Optional
 
 import pytest
 import torch
@@ -50,6 +51,10 @@ from torchrec.distributed.model_parallel import DistributedModelParallel
 from torchrec.distributed.planner import Topology
 from torchrec.distributed.types import BoundsCheckMode, ShardingType
 from torchrec.modules.embedding_configs import BaseEmbeddingConfig, PoolingType
+
+# hier_switch is in unit_tests, a directory up, so it is put on the path from here.
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import hier_switch  # noqa: E402
 
 
 @pytest.fixture
@@ -109,6 +114,7 @@ def get_planner(
     multi_hot_sizes: List[int],
     device,
     training: bool = True,
+    dynamicemb_options_kwargs: Optional[Dict[str, Any]] = None,
 ):
     dict_const = {}
     for i in range(len(table_names)):
@@ -128,6 +134,7 @@ def get_planner(
                 initializer_args=DynamicEmbInitializerArgs(
                     mode=DynamicEmbInitializerMode.DEBUG,
                 ),
+                **(dynamicemb_options_kwargs or {}),
             ),
         )
         dict_const[table_names[i]] = const
@@ -209,6 +216,14 @@ def backend_session():
     yield
     # dist.barrier()
     dist.destroy_process_group()
+
+
+@pytest.fixture(autouse=True)
+def release_hier_ops():
+    """At the end of each test, on every rank, passed or not: quiesces the ops
+    of the models the test gave the hierarchical dist (hier_switch.py)."""
+    yield
+    hier_switch.release()
 
 
 @pytest.mark.parametrize(
@@ -326,6 +341,18 @@ def test_incremental_dump_api(
         )
 
     print("EmbeddingCollection:", ebc)
+    # Pooled collections ignore output_dist (hier_switch.py). The output is
+    # fp32 (the default).
+    output_dist_options = (
+        {}
+        if is_pooled
+        else hier_switch.options(
+            world_size=dist.get_world_size(),
+            row_bytes=4 * dim,
+            all_dynamicemb=all(use_dynamicembs),
+            score_strategies=score_strategies,
+        )
+    )
     planner = get_planner(
         table_names,
         eb_configs,
@@ -334,6 +361,7 @@ def test_incremental_dump_api(
         local_batch,
         multi_hot_sizes,
         device,
+        dynamicemb_options_kwargs=output_dist_options,
     )
 
     if is_pooled:
@@ -353,6 +381,7 @@ def test_incremental_dump_api(
         sharders=[sharder],
         plan=plan,
     )
+    hier_switch.track(model, output_dist_options)
 
     customized_scores = CustomizedScore(table_names)
     ret: Dict[str, Dict[str, int]] = get_score(model)
@@ -426,6 +455,18 @@ def test_incremental_dump_api(
                 dump_vals = dump_vals.to(dump_keys.dtype)
                 assert torch.all(dump_keys.unsqueeze(1).expand(-1, dim) == dump_vals)
 
+    hier_switch.check_path(model, output_dist_options)
+
+
+def _output_dist_options(score_strategies, dim) -> Dict[str, Any]:
+    """The output_dist fields (hier_switch.py) of the tables of
+    _build_sharded_model, whose output is fp32 (the default)."""
+    return hier_switch.options(
+        world_size=dist.get_world_size(),
+        row_bytes=4 * dim,
+        score_strategies=score_strategies,
+    )
+
 
 def _build_sharded_model(
     table_names, eb_configs, score_strategies, batch, dim, device, training=True
@@ -437,6 +478,7 @@ def _build_sharded_model(
     embedding alone and there is no per-row state for a replay to restore.
     """
     ebc = torchrec.EmbeddingCollection(device=torch.device("meta"), tables=eb_configs)
+    output_dist_options = _output_dist_options(score_strategies, dim)
     planner = get_planner(
         table_names,
         eb_configs,
@@ -446,15 +488,18 @@ def _build_sharded_model(
         [1] * len(table_names),
         device,
         training=training,
+        dynamicemb_options_kwargs=output_dist_options,
     )
     sharder = DynamicEmbeddingCollectionSharder(
         fused_params={"optimizer": EmbOptimType.SGD, "learning_rate": 0.1},
         use_index_dedup=False,
     )
     plan = planner.collective_plan(ebc, [sharder], dist.GroupMember.WORLD)
-    return DistributedModelParallel(
+    model = DistributedModelParallel(
         module=ebc, device=device, sharders=[sharder], plan=plan
     )
+    hier_switch.track(model, output_dist_options)
+    return model
 
 
 @pytest.mark.parametrize("table_num, dim, local_batch", [(2, 8, 64)])
@@ -500,6 +545,7 @@ def test_replay_increment_distributed(
         [BATCH_SIZE_PER_DUMP * 8] * table_num,
     )
     trained = {k: v.values().clone() for k, v in train_model(sparse_feature).items()}
+    hier_switch.check_path(train_model, _output_dist_options(strategies, dim))
 
     pg = intra_and_cross_node_pg()[0]
     deltas = incremental_dump(train_model, 0, pg)
@@ -565,6 +611,7 @@ def test_erase_untracked_is_the_groups_not_one_ranks(request, backend_session):
         [BATCH_SIZE_PER_DUMP * 8] * len(table_names),
     )
     train_model(sparse_feature)
+    hier_switch.check_path(train_model, _output_dist_options(strategies, dim))
 
     pg = intra_and_cross_node_pg()[0]
     prefix_path = "model"

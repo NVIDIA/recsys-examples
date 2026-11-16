@@ -609,7 +609,11 @@ def test_segmented_unique_reduce_rejects_unknown(setup_device):
     segmented_range = torch.tensor([0, 2], dtype=torch.int64, device=device)
     with pytest.raises(Exception, match="reduce must be"):
         segmented_unique_cuda(
-            keys, segmented_range, 1, torch.empty(0, dtype=torch.int64, device=device), "avg"
+            keys,
+            segmented_range,
+            1,
+            torch.empty(0, dtype=torch.int64, device=device),
+            "avg",
         )
 
 

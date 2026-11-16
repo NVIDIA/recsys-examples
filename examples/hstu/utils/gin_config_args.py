@@ -154,9 +154,25 @@ class DynamicEmbeddingArgs(EmbeddingArgs):
             global_hbm_for_values indicates the cache size. Default: False.
         dist_type (str): Input distribution policy for row-wise sharding.
             One of "continuous", "roundrobin", "hash_roundrobin". Default: "roundrobin".
+        output_dist (str): How the row-wise sharding of the DynamicEmb tables moves keys
+            to the ranks that own them and rows back. "torchrec": TorchRec's dists.
+            "hierarchical": DynamicEmb's hierarchical dist. Inside a node, keys and rows
+            move over NVLink. Between nodes, one copy of each (table, key) per node moves
+            over InfiniBand. It needs DynamicEmb built against NCCL >= 2.30.7, and a
+            dist_type other than "continuous". "auto": the hierarchical dist where the
+            build has it, else TorchRec's dists. Default: "torchrec".
+        output_dist_capacity (Optional[Union[int, Dict[str, int]]]): The capacities of
+            the hierarchical dist, in keys: an int sets "lookup_keys" and "remote_keys"
+            alike, a dict {"lookup_keys": ..., "remote_keys": ...} sets each. A call
+            that needs more raises RuntimeError, which names the capacity to raise.
+            None, with an output_dist other than "torchrec", takes a capacity that
+            every call fits: world_size × train_batch_size × the most keys a sample
+            has, summed over the DynamicEmb tables' features. Default: None.
 
     Note:
         - sharding_type is automatically set to "model_parallel".
+        - The DynamicEmb tables are one row-wise sharding, so they must all set the same
+          output_dist and output_dist_capacity.
         - Precedence: The first 3 params can be used for setting the HBM size for dynamic
           embedding, with precedence: `global_hbm_for_values` > `item_vocab_gpu_capacity` >
           item_vocab_gpu_capacity_ratio. When only item_vocab_gpu_capacity_ratio is given,
@@ -174,6 +190,8 @@ class DynamicEmbeddingArgs(EmbeddingArgs):
     evict_strategy: str = "lru"
     caching: bool = False
     dist_type: str = "roundrobin"
+    output_dist: str = "torchrec"
+    output_dist_capacity: Optional[Union[int, Dict[str, int]]] = None
 
     def __post_init__(self):
         self.sharding_type = "model_parallel"
@@ -182,6 +200,24 @@ class DynamicEmbeddingArgs(EmbeddingArgs):
             f"Invalid dist_type {self.dist_type!r}; "
             f"must be one of 'continuous', 'roundrobin', 'hash_roundrobin'"
         )
+        assert self.output_dist in ("torchrec", "hierarchical", "auto"), (
+            f"Invalid output_dist {self.output_dist!r}; "
+            "must be one of 'torchrec', 'hierarchical', 'auto'"
+        )
+        capacity = self.output_dist_capacity
+        if capacity is not None:
+            # An int sets every capacity alike; check it as lookup_keys.
+            by_name = (
+                capacity if isinstance(capacity, dict) else {"lookup_keys": capacity}
+            )
+            assert (
+                "lookup_keys" in by_name
+                and set(by_name) <= {"lookup_keys", "remote_keys"}
+                and all(type(value) is int and value > 0 for value in by_name.values())
+            ), (
+                f"Invalid output_dist_capacity {capacity!r}; must be a positive int, "
+                "or a dict of positive ints with 'lookup_keys' and maybe 'remote_keys'"
+            )
 
     def calculate_and_reset_global_hbm_for_values(self, hidden_size, multiplier=1):
         if self.global_hbm_for_values is not None:

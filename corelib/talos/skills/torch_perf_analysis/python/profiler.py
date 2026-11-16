@@ -94,7 +94,6 @@ from contextlib import contextmanager
 import torch
 import torch.nn as nn
 
-
 # ─── Env gating ─────────────────────────────────────────────────────
 
 _ENABLE_ENV = "TORCH_PERF_ANALYSIS_ENABLE"
@@ -107,15 +106,15 @@ def _enabled() -> bool:
 
 # ─── C++ observer backend ────────────────────────────────────────────
 
-_CPP_SITELINE_ENV = "TALOS_CPP_SITELINE"    # =0 → skip file:line (ablation)
+_CPP_SITELINE_ENV = "TALOS_CPP_SITELINE"  # =0 → skip file:line (ablation)
 _CPP_SEQ_MARKS_ENV = "TALOS_CPP_SEQ_MARKS"  # =0 → skip talos_seq: marks (ablation)
-_CPP_SKIPLIST_ENV = "TALOS_CPP_SKIPLIST"    # =0 → label no-kernel ops too
+_CPP_SKIPLIST_ENV = "TALOS_CPP_SKIPLIST"  # =0 → label no-kernel ops too
 _CPP_OWN_DOMAIN_ENV = "TALOS_CPP_OWN_DOMAIN"  # =1 → separate "talos" NVTX domain
 
 
-_cpp_ext = None       # loaded extension module
-_cpp_active = False   # capture window open
-_cpp_failed = False   # compile/load failed → profiling disabled (warned)
+_cpp_ext = None  # loaded extension module
+_cpp_active = False  # capture window open
+_cpp_failed = False  # compile/load failed → profiling disabled (warned)
 
 
 def _load_cpp_ext():
@@ -177,6 +176,7 @@ _CWD_PREFIX = os.getcwd() + _sep
 
 
 # ─── NVTX ───────────────────────────────────────────────────────────
+
 
 def _push(label: str) -> None:
     torch.cuda.nvtx.range_push(label)
@@ -245,6 +245,7 @@ def _ensure_indexed(module: nn.Module) -> tuple:
 
 # ─── Global module hooks (context only — no NVTX) ───────────────────
 
+
 def _module_pre(module, args):
     info = module.__dict__.get("_ta_info") or _ensure_indexed(module)
     _stack().append(info)
@@ -261,6 +262,7 @@ def _module_post(module, args, output):
 
 
 # ─── Manual region annotation (context only) ────────────────────────
+
 
 @contextmanager
 def nvtx_range(name: str, cls: str = "Region"):
@@ -290,6 +292,7 @@ def nvtx_range(name: str, cls: str = "Region"):
 
 
 # ─── Profiler ───────────────────────────────────────────────────────
+
 
 class TalosProfiler:
     """Process-global profiler. ``enable()`` (once, up front) extends

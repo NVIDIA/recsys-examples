@@ -20,6 +20,8 @@ from dynamicemb.types import DynamicEmbInitializerArgs, DynamicEmbInitializerMod
 # a directory up and has to be put on the path from here.
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+import hier_switch
+
 # from dynamicemb.admission_strategy import FrequencyAdmissionStrategy
 from test_embedding_dump_load import (
     ADMISSION_COUNTER_CAPACITY,
@@ -538,6 +540,7 @@ def test_admission_strategy_validation(
             f"{expected_non_admitted_value}"
         )
 
+    hier_switch.release()
     print(f"\n✓ Admission strategy test passed!")
 
 

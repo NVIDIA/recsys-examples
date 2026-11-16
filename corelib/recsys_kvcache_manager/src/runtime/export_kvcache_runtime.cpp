@@ -2,6 +2,7 @@
 #include "kvcache_runtime_config.h"
 
 #include <ATen/ATen.h>
+#include <algorithm>
 #include <iostream>
 #include <nvtx3/nvtx3.hpp>
 #include <string>
@@ -362,8 +363,12 @@ std::vector<at::Tensor> ExportKVCacheRuntime::onboard_kvcache_launch(
     }
 
     if (!task_ids_tolaunch.empty()) {
-        flexkv_client_->launch_tasks(task_ids_tolaunch, slot_mappings_tolaunch,
-                                     true);
+        const auto launched_ids = flexkv_client_->launch_tasks(
+            task_ids_tolaunch, slot_mappings_tolaunch, true);
+        // Merging retires the child IDs. Keep the actual completion handles,
+        // padded to the existing output shape, for the unchanged wait below.
+        std::fill(task_ids_ptr, task_ids_ptr + batch_size, -1);
+        std::copy(launched_ids.begin(), launched_ids.end(), task_ids_ptr);
     }
 
     return slot_mappings;

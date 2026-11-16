@@ -59,4 +59,4 @@ On `PASS`, you also decide the loop's **code disposition** — `keep` or `revert
 
 **`revert` is not automatic just because end-to-end showed no or negative gain.** Choose `keep` anyway when there's a real, evidenced reason the code is still worth having — e.g. a genuine unit-test-level win even though it doesn't move this workload's end-to-end time, or a sound analytical case that it helps on other input shapes this profiling run didn't happen to exercise. State that reason explicitly if you choose it. Choose `revert` when the change is genuinely without merit — e.g. clearly net-negative with no such justification behind it.
 
-Give the verdict the evidence supports — don't shade it toward `ITERATE` or `PASS` based on how many rounds this hotspot has already gone through; managing that is the Main Loop Agent's job, not yours to pre-empt.
+Give the verdict the evidence supports — don't shade it toward `ITERATE` or `PASS` based on how many rounds this hotspot has already gone through; managing that is the Main Loop Agent's job, not yours to preempt.

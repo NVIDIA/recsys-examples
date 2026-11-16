@@ -25,7 +25,6 @@ from typing import List
 
 import pytest
 import torch
-
 from dynamicemb import (
     DynamicEmbPoolingMode,
     DynamicEmbScoreStrategy,

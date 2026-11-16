@@ -41,22 +41,32 @@ class SyntheticOneRecDataset(Dataset):
         seed: int = 0,
     ) -> None:
         if num_classes < 8:
-            raise ValueError("num_classes must be at least 8; token 0 is reserved for padding")
+            raise ValueError(
+                "num_classes must be at least 8; token 0 is reserved for padding"
+            )
         if max_hist_len < min_hist_len:
             raise ValueError("max_hist_len must be >= min_hist_len")
 
         g = torch.Generator().manual_seed(seed)
         intent = torch.randint(0, num_intents, (num_samples,), generator=g)
-        hist_len = torch.randint(min_hist_len, max_hist_len + 1, (num_samples,), generator=g)
+        hist_len = torch.randint(
+            min_hist_len, max_hist_len + 1, (num_samples,), generator=g
+        )
 
         depth_offsets = torch.arange(sid_depth).view(1, 1, sid_depth)
         time_offsets = torch.arange(max_hist_len).view(1, max_hist_len, 1)
-        base = (intent.view(num_samples, 1, 1) * 5 + depth_offsets * 11) % (num_classes - 1)
-        jitter = torch.randint(0, 4, (num_samples, max_hist_len, sid_depth), generator=g)
+        base = (intent.view(num_samples, 1, 1) * 5 + depth_offsets * 11) % (
+            num_classes - 1
+        )
+        jitter = torch.randint(
+            0, 4, (num_samples, max_hist_len, sid_depth), generator=g
+        )
         hist_sid = (base + 2 * time_offsets + jitter) % (num_classes - 1)
         hist_sid = hist_sid + 1
 
-        valid = torch.arange(max_hist_len).view(1, max_hist_len) < hist_len.view(num_samples, 1)
+        valid = torch.arange(max_hist_len).view(1, max_hist_len) < hist_len.view(
+            num_samples, 1
+        )
         hist_sid = hist_sid.masked_fill(~valid.unsqueeze(-1), 0).long()
 
         target_jitter = torch.randint(0, 4, (num_samples, sid_depth), generator=g)
@@ -73,12 +83,18 @@ class SyntheticOneRecDataset(Dataset):
         user_feat[:, :hot_dims] = 0.0
         user_feat[torch.arange(num_samples), intent % hot_dims] = 1.0
         if user_feat_dim > hot_dims:
-            user_feat[:, hot_dims:] += (intent.float().unsqueeze(1) / max(num_intents - 1, 1)) * 0.5
+            user_feat[:, hot_dims:] += (
+                intent.float().unsqueeze(1) / max(num_intents - 1, 1)
+            ) * 0.5
 
         depth_scale = torch.linspace(0.5, 1.0, sid_depth).view(1, sid_depth)
         immediate_reward = ((target_sid.float() % 7.0) / 6.0) * depth_scale
-        immediate_reward = immediate_reward + (intent.float().view(num_samples, 1) % 3.0) * 0.05
-        discounts = torch.pow(torch.full((sid_depth,), 0.85), torch.arange(sid_depth).float())
+        immediate_reward = (
+            immediate_reward + (intent.float().view(num_samples, 1) % 3.0) * 0.05
+        )
+        discounts = torch.pow(
+            torch.full((sid_depth,), 0.85), torch.arange(sid_depth).float()
+        )
         ltv = (immediate_reward * discounts.view(1, sid_depth)).sum(dim=1)
 
         self.hist_sid = hist_sid
@@ -93,7 +109,14 @@ class SyntheticOneRecDataset(Dataset):
 
     def __getitem__(
         self, idx: int
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ]:
         return (
             self.target_sid[idx],
             self.user_feat[idx],
@@ -158,7 +181,9 @@ class KuaiRandSequenceDataset(Dataset):
         seed: int = 0,
     ) -> None:
         if num_classes < 2:
-            raise ValueError("num_classes must reserve 0 for padding and at least one SID token.")
+            raise ValueError(
+                "num_classes must reserve 0 for padding and at least one SID token."
+            )
         self.max_hist_len = max_hist_len
         self.sid_depth = sid_depth
         self.num_classes = num_classes
@@ -170,7 +195,9 @@ class KuaiRandSequenceDataset(Dataset):
             log_files.append(data_path / KUAI_RANDOM_LOG_FILE)
         log_files = [path for path in log_files if path.exists()]
         if not log_files:
-            raise FileNotFoundError(f"No KuaiRand-Pure log files were found under {data_path}")
+            raise FileNotFoundError(
+                f"No KuaiRand-Pure log files were found under {data_path}"
+            )
 
         user_rows = _load_kuairand_user_features(data_path, user_feat_dim)
         by_user: dict[int, list[tuple[int, int, float]]] = defaultdict(list)
@@ -197,8 +224,14 @@ class KuaiRandSequenceDataset(Dataset):
 
         if max_users is not None:
             keep = set(sorted(by_user)[:max_users])
-            by_user = {user_id: events for user_id, events in by_user.items() if user_id in keep}
-            item_ids = {video_id for events in by_user.values() for _, video_id, _ in events}
+            by_user = {
+                user_id: events
+                for user_id, events in by_user.items()
+                if user_id in keep
+            }
+            item_ids = {
+                video_id for events in by_user.values() for _, video_id, _ in events
+            }
 
         capacity = (num_classes - 1) ** sid_depth
         if len(item_ids) > capacity:
@@ -207,8 +240,12 @@ class KuaiRandSequenceDataset(Dataset):
                 f"but KuaiRand subset has {len(item_ids)} videos."
             )
 
-        self.item_to_dense = {item_id: idx + 1 for idx, item_id in enumerate(sorted(item_ids))}
-        self.sid_table = _build_sid_table(len(self.item_to_dense), sid_depth, num_classes)
+        self.item_to_dense = {
+            item_id: idx + 1 for idx, item_id in enumerate(sorted(item_ids))
+        }
+        self.sid_table = _build_sid_table(
+            len(self.item_to_dense), sid_depth, num_classes
+        )
         self.user_sequences: list[torch.Tensor] = []
         self.user_rewards: list[torch.Tensor] = []
         self.user_ltv: list[torch.Tensor] = []
@@ -226,7 +263,9 @@ class KuaiRandSequenceDataset(Dataset):
             reward_tensor = torch.tensor(rewards, dtype=torch.float32)
             self.user_rewards.append(reward_tensor)
             self.user_ltv.append(_discounted_returns(reward_tensor, gamma))
-            self.user_features.append(_encode_user_features(user_rows.get(user_id), user_id, user_feat_dim))
+            self.user_features.append(
+                _encode_user_features(user_rows.get(user_id), user_id, user_feat_dim)
+            )
             for pos in range(min_hist_len, len(seq)):
                 self.index.append((seq_idx, pos))
 
@@ -286,7 +325,9 @@ def _find_kuairand_data_dir(data_dir: str | Path) -> Path:
     )
 
 
-def _load_kuairand_user_features(data_path: Path, user_feat_dim: int) -> dict[int, torch.Tensor]:
+def _load_kuairand_user_features(
+    data_path: Path, user_feat_dim: int
+) -> dict[int, torch.Tensor]:
     path = data_path / "user_features_pure.csv"
     if not path.exists():
         return {}
@@ -331,7 +372,12 @@ def _row_reward(row: dict[str, str]) -> float:
     play_time = _float_field(row, "play_time_ms")
     duration = _float_field(row, "duration_ms")
     watch_ratio = min(play_time / duration, 1.0) if duration > 0 else 0.0
-    reward = click + 0.5 * long_view + 0.25 * (like + follow + comment + forward) + 0.1 * watch_ratio
+    reward = (
+        click
+        + 0.5 * long_view
+        + 0.25 * (like + follow + comment + forward)
+        + 0.1 * watch_ratio
+    )
     reward = reward - 0.25 * hate
     return max(reward, 0.0)
 
@@ -351,7 +397,9 @@ def _stable_bucket(value: str, buckets: int) -> int:
     return int.from_bytes(digest[:8], "big") % buckets
 
 
-def _encode_user_features(row: dict[str, str] | torch.Tensor | None, user_id: int, dim: int) -> torch.Tensor:
+def _encode_user_features(
+    row: dict[str, str] | torch.Tensor | None, user_id: int, dim: int
+) -> torch.Tensor:
     if torch.is_tensor(row):
         return row.float()
 
@@ -370,7 +418,9 @@ def _encode_user_features(row: dict[str, str] | torch.Tensor | None, user_id: in
         try:
             numeric = float(value)
             sign = -1.0 if numeric < 0 else 1.0
-            features[offset] = sign * min(torch.log1p(torch.tensor(abs(numeric))).item() / 10.0, 1.0)
+            features[offset] = sign * min(
+                torch.log1p(torch.tensor(abs(numeric))).item() / 10.0, 1.0
+            )
         except ValueError:
             bucket = _stable_bucket(f"{key}:{value}", 997)
             features[offset] = bucket / 996.0

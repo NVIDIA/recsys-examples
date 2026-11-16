@@ -56,6 +56,7 @@ _AUTOGRAD = "autograd::engine::evaluate_function"
 
 # ─── parquet loading ────────────────────────────────────────────────
 
+
 def _read(parquetdir: str, table: str, columns: list[str] | None = None) -> list[dict]:
     path = os.path.join(parquetdir, table + ".parquet")
     if not os.path.exists(path):
@@ -64,8 +65,11 @@ def _read(parquetdir: str, table: str, columns: list[str] | None = None) -> list
 
 
 def _string_ids(parquetdir: str) -> dict[int, str]:
-    return {r["id"]: r.get("value")
-            for r in _read(parquetdir, "StringIds") if r.get("id") is not None}
+    return {
+        r["id"]: r.get("value")
+        for r in _read(parquetdir, "StringIds")
+        if r.get("id") is not None
+    }
 
 
 def _copy_kind_map(parquetdir: str) -> dict[int, str]:
@@ -100,12 +104,17 @@ def _source_of(m: _FuncMeta) -> str:
 
 # ─── talos:: function ranges, per launching thread ────────────────────
 
+
 class _FuncIndex:
     def __init__(self):
-        self._by_tid: dict[int, list[tuple[int, int, int]]] = defaultdict(list)  # tid → [(start,end,fid)]
+        self._by_tid: dict[int, list[tuple[int, int, int]]] = defaultdict(
+            list
+        )  # tid → [(start,end,fid)]
         self.meta: list[_FuncMeta] = []
-        self._ag: list[tuple[int, int]] = []   # autograd intervals (any thread)
-        self._ag_tids: set[int] = set()        # threads that run the autograd engine (backward)
+        self._ag: list[tuple[int, int]] = []  # autograd intervals (any thread)
+        self._ag_tids: set[
+            int
+        ] = set()  # threads that run the autograd engine (backward)
 
     def add_range(self, tid, start, end, m: _FuncMeta):
         self._by_tid[tid].append((start, end, len(self.meta)))
@@ -145,15 +154,20 @@ class _FuncIndex:
         return i < len(self._ag_starts) and self._ag_starts[i] <= end
 
 
-def _build_func_index(parquetdir: str, sid: dict[int, str], s_ns: int, e_ns: int) -> _FuncIndex:
-    ta_ranges: list[tuple] = []          # (tid, start, end, _FuncMeta)
+def _build_func_index(
+    parquetdir: str, sid: dict[int, str], s_ns: int, e_ns: int
+) -> _FuncIndex:
+    ta_ranges: list[tuple] = []  # (tid, start, end, _FuncMeta)
     idx = _FuncIndex()
-    for r in _read(parquetdir, "NVTX_EVENTS",
-                   ["start", "end", "text", "textId", "globalTid"]):
+    for r in _read(
+        parquetdir, "NVTX_EVENTS", ["start", "end", "text", "textId", "globalTid"]
+    ):
         start, end, tid = r.get("start"), r.get("end"), r.get("globalTid")
         if start is None or end is None or tid is None or end < s_ns or start > e_ns:
             continue
-        text = r.get("text") or (sid.get(r["textId"]) if r.get("textId") is not None else None)
+        text = r.get("text") or (
+            sid.get(r["textId"]) if r.get("textId") is not None else None
+        )
         if not text:
             continue
         if text.startswith("talos::"):
@@ -178,36 +192,65 @@ def _build_func_index(parquetdir: str, sid: dict[int, str], s_ns: int, e_ns: int
 
 # ─── per-stream, per-bucket timeline ───────────────────────────────
 
+
 def _gpu_events(parquetdir: str, copy_kinds: dict, s_ns: int, e_ns: int):
     """Yield ``(start, end, stream, kind, correlationId)`` for every kernel /
     memcpy / memset that executes within ``[s_ns, e_ns)``. ``kind`` ∈
     {'kernel','h2d','d2h','d2d','other','memset'}."""
-    for r in _read(parquetdir, "CUPTI_ACTIVITY_KIND_KERNEL",
-                   ["start", "end", "streamId", "correlationId"]):
+    for r in _read(
+        parquetdir,
+        "CUPTI_ACTIVITY_KIND_KERNEL",
+        ["start", "end", "streamId", "correlationId"],
+    ):
         if r["end"] > s_ns and r["start"] < e_ns:
-            yield r["start"], r["end"], r.get("streamId"), "kernel", r.get("correlationId")
-    for r in _read(parquetdir, "CUPTI_ACTIVITY_KIND_MEMCPY",
-                   ["start", "end", "streamId", "correlationId", "copyKind"]):
+            yield r["start"], r["end"], r.get("streamId"), "kernel", r.get(
+                "correlationId"
+            )
+    for r in _read(
+        parquetdir,
+        "CUPTI_ACTIVITY_KIND_MEMCPY",
+        ["start", "end", "streamId", "correlationId", "copyKind"],
+    ):
         if r["end"] > s_ns and r["start"] < e_ns:
-            yield (r["start"], r["end"], r.get("streamId"),
-                   copy_kinds.get(r.get("copyKind"), "other"), r.get("correlationId"))
-    for r in _read(parquetdir, "CUPTI_ACTIVITY_KIND_MEMSET",
-                   ["start", "end", "streamId", "correlationId"]):
+            yield (
+                r["start"],
+                r["end"],
+                r.get("streamId"),
+                copy_kinds.get(r.get("copyKind"), "other"),
+                r.get("correlationId"),
+            )
+    for r in _read(
+        parquetdir,
+        "CUPTI_ACTIVITY_KIND_MEMSET",
+        ["start", "end", "streamId", "correlationId"],
+    ):
         if r["end"] > s_ns and r["start"] < e_ns:
-            yield r["start"], r["end"], r.get("streamId"), "memset", r.get("correlationId")
+            yield r["start"], r["end"], r.get("streamId"), "memset", r.get(
+                "correlationId"
+            )
 
 
 def _new_bucket() -> dict:
-    return {"kernel": 0, "h2d": 0, "d2h": 0, "d2d": 0, "memset": 0,
-            "kernel_ns": 0, "memcpy_ns": 0, "memset_ns": 0,
-            "src": defaultdict(lambda: [0, 0])}   # source → [gpu_ns, events]
+    return {
+        "kernel": 0,
+        "h2d": 0,
+        "d2h": 0,
+        "d2d": 0,
+        "memset": 0,
+        "kernel_ns": 0,
+        "memcpy_ns": 0,
+        "memset_ns": 0,
+        "src": defaultdict(lambda: [0, 0]),
+    }  # source → [gpu_ns, events]
 
 
 def _ms(ns) -> float:
     return round(ns / 1e6, 4)
 
 
-def build_timeline(parquetdir: str, start_ns: int, end_ns: int, n_buckets: int = 100) -> dict:
+def build_timeline(
+    parquetdir: str, start_ns: int, end_ns: int, n_buckets: int = 100
+) -> dict:
     """Per-stream, per-bucket GPU timeline with source-line attribution for
     ``[start_ns, end_ns)``. Returns ``{window, streams: {id: {...}}}``;
     ``streams`` is empty when the parquet tables are missing/empty."""
@@ -215,14 +258,32 @@ def build_timeline(parquetdir: str, start_ns: int, end_ns: int, n_buckets: int =
     copy_kinds = _copy_kind_map(parquetdir)
     funcs = _build_func_index(parquetdir, sid, start_ns, end_ns)
 
-    launch: dict[int, tuple[int, int]] = {}   # correlationId → (launch_tid, launch_start)
-    rt_cover: dict[int, int] = {}             # globalTid → CUDA-API coverage ns (clipped to window)
-    for r in _read(parquetdir, "CUPTI_ACTIVITY_KIND_RUNTIME",
-                   ["start", "end", "globalTid", "correlationId"]):
-        cid, tid, st, en = r.get("correlationId"), r.get("globalTid"), r.get("start"), r.get("end")
+    launch: dict[
+        int, tuple[int, int]
+    ] = {}  # correlationId → (launch_tid, launch_start)
+    rt_cover: dict[
+        int, int
+    ] = {}  # globalTid → CUDA-API coverage ns (clipped to window)
+    for r in _read(
+        parquetdir,
+        "CUPTI_ACTIVITY_KIND_RUNTIME",
+        ["start", "end", "globalTid", "correlationId"],
+    ):
+        cid, tid, st, en = (
+            r.get("correlationId"),
+            r.get("globalTid"),
+            r.get("start"),
+            r.get("end"),
+        )
         if cid is not None and tid is not None and st is not None:
             launch[cid] = (tid, st)
-        if tid is not None and st is not None and en is not None and en > start_ns and st < end_ns:
+        if (
+            tid is not None
+            and st is not None
+            and en is not None
+            and en > start_ns
+            and st < end_ns
+        ):
             rt_cover[tid] = rt_cover.get(tid, 0) + (min(en, end_ns) - max(st, start_ns))
 
     span_ns = end_ns - start_ns
@@ -243,11 +304,16 @@ def build_timeline(parquetdir: str, start_ns: int, end_ns: int, n_buckets: int =
 
     # stream id → {buckets: [...], src_total: source → [gpu_ns, events]}
     def _new_stream():
-        return {"buckets": [_new_bucket() for _ in range(n_buckets)],
-                "src_total": defaultdict(lambda: [0, 0])}
+        return {
+            "buckets": [_new_bucket() for _ in range(n_buckets)],
+            "src_total": defaultdict(lambda: [0, 0]),
+        }
+
     streams: dict[int, dict] = defaultdict(_new_stream)
 
-    for start, end, stream, kind, cid in _gpu_events(parquetdir, copy_kinds, start_ns, end_ns):
+    for start, end, stream, kind, cid in _gpu_events(
+        parquetdir, copy_kinds, start_ns, end_ns
+    ):
         es, ee = max(start, start_ns), min(end, end_ns)
         if ee <= es:
             continue
@@ -262,7 +328,11 @@ def build_timeline(parquetdir: str, start_ns: int, end_ns: int, n_buckets: int =
         st[0] += ee - es
         st[1] += 1
         # per-bucket: distribute execution time (clipped) across spanned buckets
-        time_key = "kernel_ns" if kind == "kernel" else ("memset_ns" if kind == "memset" else "memcpy_ns")
+        time_key = (
+            "kernel_ns"
+            if kind == "kernel"
+            else ("memset_ns" if kind == "memset" else "memcpy_ns")
+        )
         first, last = bucket_of(es), bucket_of(ee - 1)
         for bi in range(first, last + 1):
             bs, be = start_ns + bi * bucket_ns, bucket_end(bi)
@@ -276,11 +346,22 @@ def build_timeline(parquetdir: str, start_ns: int, end_ns: int, n_buckets: int =
             sd[1] += 1
 
     return {
-        "window": {"start_ns": start_ns, "end_ns": end_ns,
-                   "duration_ms": _ms(span_ns), "bucket_ns": bucket_ns, "n_buckets": n_buckets},
-        "streams": {str(stream): _emit_stream(stream, sdata, start_ns, bucket_ns, end_ns, n_buckets, span_ns)
-                    for stream, sdata in sorted(streams.items())},
-        "threads": _cpu_threads(funcs, rt_cover, start_ns, end_ns, n_buckets, bucket_ns),
+        "window": {
+            "start_ns": start_ns,
+            "end_ns": end_ns,
+            "duration_ms": _ms(span_ns),
+            "bucket_ns": bucket_ns,
+            "n_buckets": n_buckets,
+        },
+        "streams": {
+            str(stream): _emit_stream(
+                stream, sdata, start_ns, bucket_ns, end_ns, n_buckets, span_ns
+            )
+            for stream, sdata in sorted(streams.items())
+        },
+        "threads": _cpu_threads(
+            funcs, rt_cover, start_ns, end_ns, n_buckets, bucket_ns
+        ),
     }
 
 
@@ -314,7 +395,7 @@ def _cpu_threads(funcs, rt_cover, start_ns, end_ns, n_buckets, bucket_ns) -> lis
     for tid in set(funcs._by_tid) | set(rt_cover):
         ranges = funcs._by_tid.get(tid, [])
         rtc = rt_cover.get(tid, 0)
-        if not ranges and rtc < min_cover:        # no torch ops + near-idle ⇒ drop
+        if not ranges and rtc < min_cover:  # no torch ops + near-idle ⇒ drop
             continue
         cov = [0] * n_buckets
         for start, end, _fid in ranges:
@@ -328,51 +409,93 @@ def _cpu_threads(funcs, rt_cover, start_ns, end_ns, n_buckets, bucket_ns) -> lis
                 ov = min(ee, be) - max(es, bs)
                 if ov > 0:
                     cov[bi] += ov
-        util = [min(round(cov[bi] / (bend(bi) - (start_ns + bi * bucket_ns)), 4), 1.0)
-                if bend(bi) > start_ns + bi * bucket_ns else 0.0 for bi in range(n_buckets)]
-        role = "backward" if tid in funcs._ag_tids else ("forward" if ranges else "other")
-        out.append({
-            "global_tid": tid,
-            "role": role,
-            "cover_ms": _ms(sum(cov)),            # torch-function (talos::) coverage
-            "cuda_api_cover_ms": _ms(rtc),        # CUDA-API (kernel-launch) coverage — busyness
-            "util": util,
-        })
+        util = [
+            min(round(cov[bi] / (bend(bi) - (start_ns + bi * bucket_ns)), 4), 1.0)
+            if bend(bi) > start_ns + bi * bucket_ns
+            else 0.0
+            for bi in range(n_buckets)
+        ]
+        role = (
+            "backward" if tid in funcs._ag_tids else ("forward" if ranges else "other")
+        )
+        out.append(
+            {
+                "global_tid": tid,
+                "role": role,
+                "cover_ms": _ms(sum(cov)),  # torch-function (talos::) coverage
+                "cuda_api_cover_ms": _ms(
+                    rtc
+                ),  # CUDA-API (kernel-launch) coverage — busyness
+                "util": util,
+            }
+        )
     out.sort(key=lambda t: -(t["cover_ms"] + t["cuda_api_cover_ms"]))
     return out
 
 
-def _emit_stream(stream, sdata, start_ns, bucket_ns, end_ns, n_buckets, span_ns) -> dict:
+def _emit_stream(
+    stream, sdata, start_ns, bucket_ns, end_ns, n_buckets, span_ns
+) -> dict:
     out_buckets = []
     tot = {"kernel": 0, "h2d": 0, "d2h": 0, "d2d": 0, "memset": 0, "busy_ns": 0}
     for i, b in enumerate(sdata["buckets"]):
-        bs, be = start_ns + i * bucket_ns, (end_ns if i == n_buckets - 1 else start_ns + (i + 1) * bucket_ns)
+        bs, be = start_ns + i * bucket_ns, (
+            end_ns if i == n_buckets - 1 else start_ns + (i + 1) * bucket_ns
+        )
         win = be - bs
         busy = b["kernel_ns"] + b["memcpy_ns"] + b["memset_ns"]
-        by_source = sorted(({"source": s, "gpu_ms": _ms(ns), "count": c}
-                            for s, (ns, c) in b["src"].items()), key=lambda r: -r["gpu_ms"])
-        out_buckets.append({
-            "i": i, "start_ns": bs, "end_ns": be,
-            "kernel_count": b["kernel"], "h2d_count": b["h2d"], "d2h_count": b["d2h"],
-            "d2d_count": b["d2d"], "memset_count": b["memset"],
-            "busy_ms": _ms(busy), "kernel_ms": _ms(b["kernel_ns"]), "memcpy_ms": _ms(b["memcpy_ns"]),
-            "idle_ms": _ms(max(0, win - busy)),
-            "util": round(busy / win, 4) if win > 0 else 0.0,
-            "by_source": by_source,
-        })
+        by_source = sorted(
+            (
+                {"source": s, "gpu_ms": _ms(ns), "count": c}
+                for s, (ns, c) in b["src"].items()
+            ),
+            key=lambda r: -r["gpu_ms"],
+        )
+        out_buckets.append(
+            {
+                "i": i,
+                "start_ns": bs,
+                "end_ns": be,
+                "kernel_count": b["kernel"],
+                "h2d_count": b["h2d"],
+                "d2h_count": b["d2h"],
+                "d2d_count": b["d2d"],
+                "memset_count": b["memset"],
+                "busy_ms": _ms(busy),
+                "kernel_ms": _ms(b["kernel_ns"]),
+                "memcpy_ms": _ms(b["memcpy_ns"]),
+                "idle_ms": _ms(max(0, win - busy)),
+                "util": round(busy / win, 4) if win > 0 else 0.0,
+                "by_source": by_source,
+            }
+        )
         for k in ("kernel", "h2d", "d2h", "d2d", "memset"):
             tot[k] += b[k]
         tot["busy_ns"] += busy
     # whole-stream source attribution, largest first
-    by_source = sorted(({"source": s, "gpu_ms": _ms(ns), "count": c,
-                         "pct_of_step": round(ns / span_ns * 100, 2) if span_ns else 0.0}
-                        for s, (ns, c) in sdata["src_total"].items()), key=lambda r: -r["gpu_ms"])
+    by_source = sorted(
+        (
+            {
+                "source": s,
+                "gpu_ms": _ms(ns),
+                "count": c,
+                "pct_of_step": round(ns / span_ns * 100, 2) if span_ns else 0.0,
+            }
+            for s, (ns, c) in sdata["src_total"].items()
+        ),
+        key=lambda r: -r["gpu_ms"],
+    )
     return {
         "stream": stream,
-        "totals": {"kernel_count": tot["kernel"], "h2d_count": tot["h2d"], "d2h_count": tot["d2h"],
-                   "d2d_count": tot["d2d"], "memset_count": tot["memset"],
-                   "busy_ms": _ms(tot["busy_ns"]),
-                   "mean_util": round(tot["busy_ns"] / span_ns, 4) if span_ns > 0 else 0.0},
+        "totals": {
+            "kernel_count": tot["kernel"],
+            "h2d_count": tot["h2d"],
+            "d2h_count": tot["d2h"],
+            "d2d_count": tot["d2d"],
+            "memset_count": tot["memset"],
+            "busy_ms": _ms(tot["busy_ns"]),
+            "mean_util": round(tot["busy_ns"] / span_ns, 4) if span_ns > 0 else 0.0,
+        },
         "buckets": out_buckets,
         "by_source": by_source,
     }
@@ -385,13 +508,39 @@ def _emit_stream(stream, sdata, start_ns, bucket_ns, end_ns, n_buckets, span_ns)
 # memory-bound elementwise & reduction families. Matched against the kernel's
 # demangled / short name. Names are matched case-insensitively.
 _KIND_RULES = [
-    ("gemm",        re.compile(r"gemm|xmma|cutlass|cublas|sgemm|hgemm|dgemm|wgrad|dgrad", re.I)),
-    ("conv",        re.compile(r"conv|cudnn|winograd|implicit_gemm", re.I)),
-    ("attention",   re.compile(r"attention|flash|fmha|\bmha\b", re.I)),
-    ("comm",        re.compile(r"nccl|allreduce|all_reduce|allgather|all_gather|reduce_scatter|sendrecv", re.I)),
-    ("sort",        re.compile(r"sort|radix|\bscan\b|devicescan|deviceradix|devicereduce|cub::", re.I)),
-    ("reduction",   re.compile(r"reduce|layer_norm|layernorm|batch_norm|group_norm|rms_?norm|softmax|\bnorm_", re.I)),
-    ("elementwise", re.compile(r"elementwise|pointwise|vectorized|unrolled|activation|gather|scatter|index|\bcopy|\bfill|\bcat_|where|cast|gelu|relu|silu|sigmoid|tanh|dropout", re.I)),
+    (
+        "gemm",
+        re.compile(r"gemm|xmma|cutlass|cublas|sgemm|hgemm|dgemm|wgrad|dgrad", re.I),
+    ),
+    ("conv", re.compile(r"conv|cudnn|winograd|implicit_gemm", re.I)),
+    ("attention", re.compile(r"attention|flash|fmha|\bmha\b", re.I)),
+    (
+        "comm",
+        re.compile(
+            r"nccl|allreduce|all_reduce|allgather|all_gather|reduce_scatter|sendrecv",
+            re.I,
+        ),
+    ),
+    (
+        "sort",
+        re.compile(
+            r"sort|radix|\bscan\b|devicescan|deviceradix|devicereduce|cub::", re.I
+        ),
+    ),
+    (
+        "reduction",
+        re.compile(
+            r"reduce|layer_norm|layernorm|batch_norm|group_norm|rms_?norm|softmax|\bnorm_",
+            re.I,
+        ),
+    ),
+    (
+        "elementwise",
+        re.compile(
+            r"elementwise|pointwise|vectorized|unrolled|activation|gather|scatter|index|\bcopy|\bfill|\bcat_|where|cast|gelu|relu|silu|sigmoid|tanh|dropout",
+            re.I,
+        ),
+    ),
 ]
 
 # Kinds whose GPU time is memory-bound and therefore a CUDA-fusion (tech4)
@@ -412,8 +561,9 @@ def classify_kernel(name: str) -> str:
     return "other"
 
 
-def build_fusion_candidates(parquetdir: str, start_ns: int, end_ns: int,
-                            top: int = 40) -> list[dict]:
+def build_fusion_candidates(
+    parquetdir: str, start_ns: int, end_ns: int, top: int = 40
+) -> list[dict]:
     """Rank source-line regions by **fusible** (memory-bound elementwise /
     reduction) GPU time over ``[start_ns, end_ns)`` — the tech4 candidate list.
 
@@ -428,8 +578,11 @@ def build_fusion_candidates(parquetdir: str, start_ns: int, end_ns: int,
     funcs = _build_func_index(parquetdir, sid, start_ns, end_ns)
 
     launch: dict[int, tuple[int, int]] = {}
-    for r in _read(parquetdir, "CUPTI_ACTIVITY_KIND_RUNTIME",
-                   ["start", "globalTid", "correlationId"]):
+    for r in _read(
+        parquetdir,
+        "CUPTI_ACTIVITY_KIND_RUNTIME",
+        ["start", "globalTid", "correlationId"],
+    ):
         cid, tid, st = r.get("correlationId"), r.get("globalTid"), r.get("start")
         if cid is not None and tid is not None and st is not None:
             launch[cid] = (tid, st)
@@ -443,11 +596,20 @@ def build_fusion_candidates(parquetdir: str, start_ns: int, end_ns: int,
 
     span_ns = end_ns - start_ns
     regions: dict[str, dict] = defaultdict(
-        lambda: {"gpu_ns": 0, "count": 0, "fusible_ns": 0, "fusible_count": 0,
-                 "by_kind": defaultdict(lambda: [0, 0])})   # kind → [gpu_ns, count]
+        lambda: {
+            "gpu_ns": 0,
+            "count": 0,
+            "fusible_ns": 0,
+            "fusible_count": 0,
+            "by_kind": defaultdict(lambda: [0, 0]),
+        }
+    )  # kind → [gpu_ns, count]
 
-    for r in _read(parquetdir, "CUPTI_ACTIVITY_KIND_KERNEL",
-                   ["start", "end", "correlationId", "shortName", "demangledName"]):
+    for r in _read(
+        parquetdir,
+        "CUPTI_ACTIVITY_KIND_KERNEL",
+        ["start", "end", "correlationId", "shortName", "demangledName"],
+    ):
         s, e = r.get("start"), r.get("end")
         if s is None or e is None or e <= start_ns or s >= end_ns:
             continue
@@ -471,16 +633,22 @@ def build_fusion_candidates(parquetdir: str, start_ns: int, end_ns: int,
     for src, reg in regions.items():
         if reg["fusible_ns"] <= 0:
             continue
-        out.append({
-            "source": src,
-            "fusible_gpu_ms": _ms(reg["fusible_ns"]),
-            "fusible_kernel_count": reg["fusible_count"],
-            "total_gpu_ms": _ms(reg["gpu_ns"]),
-            "total_kernel_count": reg["count"],
-            "pct_of_step": round(reg["fusible_ns"] / span_ns * 100, 2) if span_ns else 0.0,
-            "by_kind": {k: {"gpu_ms": _ms(v[0]), "count": v[1]}
-                        for k, v in sorted(reg["by_kind"].items(), key=lambda x: -x[1][0])},
-        })
+        out.append(
+            {
+                "source": src,
+                "fusible_gpu_ms": _ms(reg["fusible_ns"]),
+                "fusible_kernel_count": reg["fusible_count"],
+                "total_gpu_ms": _ms(reg["gpu_ns"]),
+                "total_kernel_count": reg["count"],
+                "pct_of_step": round(reg["fusible_ns"] / span_ns * 100, 2)
+                if span_ns
+                else 0.0,
+                "by_kind": {
+                    k: {"gpu_ms": _ms(v[0]), "count": v[1]}
+                    for k, v in sorted(reg["by_kind"].items(), key=lambda x: -x[1][0])
+                },
+            }
+        )
     out.sort(key=lambda r: -r["fusible_gpu_ms"])
     return out[:top]
 
@@ -531,16 +699,26 @@ class _RegionIndex:
         return None
 
 
-def _build_region_index(parquetdir: str, sid: dict[int, str], s_ns: int, e_ns: int) -> _RegionIndex:
+def _build_region_index(
+    parquetdir: str, sid: dict[int, str], s_ns: int, e_ns: int
+) -> _RegionIndex:
     idx = _RegionIndex()
-    for r in _read(parquetdir, "NVTX_EVENTS", ["start", "end", "text", "textId", "globalTid"]):
+    for r in _read(
+        parquetdir, "NVTX_EVENTS", ["start", "end", "text", "textId", "globalTid"]
+    ):
         start, end, tid = r.get("start"), r.get("end"), r.get("globalTid")
         if start is None or end is None or tid is None or end < s_ns or start > e_ns:
             continue
-        text = r.get("text") or (sid.get(r["textId"]) if r.get("textId") is not None else None)
+        text = r.get("text") or (
+            sid.get(r["textId"]) if r.get("textId") is not None else None
+        )
         if not text:
             continue
-        if text.startswith("talos::") or text.startswith("aten::") or text.startswith(_AUTOGRAD):
+        if (
+            text.startswith("talos::")
+            or text.startswith("aten::")
+            or text.startswith(_AUTOGRAD)
+        ):
             continue
         # Bare backward-node ranges ("MulBackward0", seq in payload) and
         # "talos_seq:" seq marks are machinery, not regions.
@@ -573,7 +751,9 @@ def _idle_overlap(idle_sorted, idle_starts, a: int, b: int) -> int:
     return tot
 
 
-def build_exposed_idle(parquetdir: str, start_ns: int, end_ns: int, top: int = 25) -> dict:
+def build_exposed_idle(
+    parquetdir: str, start_ns: int, end_ns: int, top: int = 25
+) -> dict:
     """Attribute GPU idle over ``[start_ns, end_ns)`` to the line / region that
     starves the device. Returns the ``exposed_idle.json`` payload (minus the
     ``step`` key, which the caller adds)."""
@@ -582,21 +762,40 @@ def build_exposed_idle(parquetdir: str, start_ns: int, end_ns: int, top: int = 2
     funcs = _build_func_index(parquetdir, sid, start_ns, end_ns)
     regions = _build_region_index(parquetdir, sid, start_ns, end_ns)
 
-    launch: dict[int, tuple[int, int]] = {}         # correlationId → (tid, launch_start)
-    sync_calls: list[tuple[int, int, int]] = []     # (start, end, tid) for host *Synchronize*
-    for r in _read(parquetdir, "CUPTI_ACTIVITY_KIND_RUNTIME",
-                   ["start", "end", "globalTid", "correlationId", "nameId"]):
-        cid, tid, st, en = r.get("correlationId"), r.get("globalTid"), r.get("start"), r.get("end")
+    launch: dict[int, tuple[int, int]] = {}  # correlationId → (tid, launch_start)
+    sync_calls: list[
+        tuple[int, int, int]
+    ] = []  # (start, end, tid) for host *Synchronize*
+    for r in _read(
+        parquetdir,
+        "CUPTI_ACTIVITY_KIND_RUNTIME",
+        ["start", "end", "globalTid", "correlationId", "nameId"],
+    ):
+        cid, tid, st, en = (
+            r.get("correlationId"),
+            r.get("globalTid"),
+            r.get("start"),
+            r.get("end"),
+        )
         if cid is not None and tid is not None and st is not None:
             launch[cid] = (tid, st)
         nm = sid.get(r.get("nameId")) if r.get("nameId") is not None else None
-        if nm and "Synchronize" in nm and tid is not None and st is not None and en is not None \
-                and en > start_ns and st < end_ns:
+        if (
+            nm
+            and "Synchronize" in nm
+            and tid is not None
+            and st is not None
+            and en is not None
+            and en > start_ns
+            and st < end_ns
+        ):
             sync_calls.append((max(st, start_ns), min(en, end_ns), tid))
 
     # GPU events (kernel / memcpy / memset), clipped to the window
     events: list[tuple[int, int, object]] = []
-    for s, e, _stream, _kind, cid in _gpu_events(parquetdir, copy_kinds, start_ns, end_ns):
+    for s, e, _stream, _kind, cid in _gpu_events(
+        parquetdir, copy_kinds, start_ns, end_ns
+    ):
         es, ee = max(s, start_ns), min(e, end_ns)
         if ee > es:
             events.append((es, ee, cid))
@@ -633,7 +832,9 @@ def build_exposed_idle(parquetdir: str, start_ns: int, end_ns: int, top: int = 2
         else:
             m = funcs.meta[fid]
             source, op = _source_of(m), m.func
-        region = regions.lookup(tid, lst) or (_file_of(source) if source != "(unattributed)" else "(unattributed)")
+        region = regions.lookup(tid, lst) or (
+            _file_of(source) if source != "(unattributed)" else "(unattributed)"
+        )
         return source, op, region
 
     # launch counts + region per source (all events in the window)
@@ -655,8 +856,11 @@ def build_exposed_idle(parquetdir: str, start_ns: int, end_ns: int, top: int = 2
     src_fus: dict[str, int] = defaultdict(int)
     reg_busy: dict[str, int] = defaultdict(int)
     reg_fus: dict[str, int] = defaultdict(int)
-    for r in _read(parquetdir, "CUPTI_ACTIVITY_KIND_KERNEL",
-                   ["start", "end", "correlationId", "shortName", "demangledName"]):
+    for r in _read(
+        parquetdir,
+        "CUPTI_ACTIVITY_KIND_KERNEL",
+        ["start", "end", "correlationId", "shortName", "demangledName"],
+    ):
         ks, ke = r.get("start"), r.get("end")
         if ks is None or ke is None or ke <= start_ns or ks >= end_ns:
             continue
@@ -742,57 +946,87 @@ def build_exposed_idle(parquetdir: str, start_ns: int, end_ns: int, top: int = 2
     # by fusion). A region can be idle-bound while another is busy-bound.
     src_keys = set(src_idle) | set(src_fus)
     by_source = sorted(
-        ({"source": s, "op": src_op.get(s), "launch_count": src_launches.get(s, 0),
-          "region": src_region.get(s),
-          "exposed_idle_ms": _ms(src_idle.get(s, 0)), "gap_count": src_gap.get(s, 0),
-          "busy_ms": _ms(src_busy.get(s, 0)), "fusible_ms": _ms(src_fus.get(s, 0)),
-          "lever": lever(src_idle.get(s, 0), src_fus.get(s, 0)),
-          "pct_of_step": pct(max(src_idle.get(s, 0), src_fus.get(s, 0)))}
-         for s in src_keys),
-        key=lambda r: -max(r["exposed_idle_ms"], r["fusible_ms"]))[:top]
+        (
+            {
+                "source": s,
+                "op": src_op.get(s),
+                "launch_count": src_launches.get(s, 0),
+                "region": src_region.get(s),
+                "exposed_idle_ms": _ms(src_idle.get(s, 0)),
+                "gap_count": src_gap.get(s, 0),
+                "busy_ms": _ms(src_busy.get(s, 0)),
+                "fusible_ms": _ms(src_fus.get(s, 0)),
+                "lever": lever(src_idle.get(s, 0), src_fus.get(s, 0)),
+                "pct_of_step": pct(max(src_idle.get(s, 0), src_fus.get(s, 0))),
+            }
+            for s in src_keys
+        ),
+        key=lambda r: -max(r["exposed_idle_ms"], r["fusible_ms"]),
+    )[:top]
     reg_keys = set(reg_idle) | set(reg_fus)
     by_region = sorted(
-        ({"region": r, "exposed_idle_ms": _ms(reg_idle.get(r, 0)), "gap_count": reg_gap.get(r, 0),
-          "busy_ms": _ms(reg_busy.get(r, 0)), "fusible_ms": _ms(reg_fus.get(r, 0)),
-          "lever": lever(reg_idle.get(r, 0), reg_fus.get(r, 0)),
-          "pct_of_step": pct(max(reg_idle.get(r, 0), reg_fus.get(r, 0)))}
-         for r in reg_keys),
-        key=lambda r: -max(r["exposed_idle_ms"], r["fusible_ms"]))[:top]
+        (
+            {
+                "region": r,
+                "exposed_idle_ms": _ms(reg_idle.get(r, 0)),
+                "gap_count": reg_gap.get(r, 0),
+                "busy_ms": _ms(reg_busy.get(r, 0)),
+                "fusible_ms": _ms(reg_fus.get(r, 0)),
+                "lever": lever(reg_idle.get(r, 0), reg_fus.get(r, 0)),
+                "pct_of_step": pct(max(reg_idle.get(r, 0), reg_fus.get(r, 0))),
+            }
+            for r in reg_keys
+        ),
+        key=lambda r: -max(r["exposed_idle_ms"], r["fusible_ms"]),
+    )[:top]
     by_sync_source = sorted(
-        ({"source": s, "op": sync_op.get(s), "exposed_idle_ms": _ms(ms), "pct_of_step": pct(ms),
-          "gap_count": sync_src_gap[s]}
-         for s, ms in sync_src_idle.items()),
-        key=lambda r: -r["exposed_idle_ms"])[:top]
+        (
+            {
+                "source": s,
+                "op": sync_op.get(s),
+                "exposed_idle_ms": _ms(ms),
+                "pct_of_step": pct(ms),
+                "gap_count": sync_src_gap[s],
+            }
+            for s, ms in sync_src_idle.items()
+        ),
+        key=lambda r: -r["exposed_idle_ms"],
+    )[:top]
 
     return {
         "window": {"start_ns": start_ns, "end_ns": end_ns, "duration_ms": _ms(span_ns)},
-        "gpu": {"busy_ms": _ms(busy_ns), "idle_ms": _ms(idle_ns),
-                "idle_pct": round(idle_ns / span_ns * 100, 2) if span_ns else 0.0,
-                "gap_count": len(idle)},
+        "gpu": {
+            "busy_ms": _ms(busy_ns),
+            "idle_ms": _ms(idle_ns),
+            "idle_pct": round(idle_ns / span_ns * 100, 2) if span_ns else 0.0,
+            "gap_count": len(idle),
+        },
         "idle_split": {
             "host_sync_ms": _ms(host_sync_ns),
             "launch_bound_ms": _ms(max(0, idle_ns - host_sync_ns)),
             "note": "host_sync_ms = idle overlapped by a host *Synchronize* (.item()/.cpu() waits); "
-                    "launch_bound_ms = the rest — GPU starved between kernel launches (CPU/dispatch/Python).",
+            "launch_bound_ms = the rest — GPU starved between kernel launches (CPU/dispatch/Python).",
         },
         "by_region": by_region,
         "by_source": by_source,
         "by_sync_source": by_sync_source,
         "method": "device idle = window minus union(kernel,memcpy,memset); each gap charged to the "
-                  "launch that ends it (kernel→RUNTIME→enclosing talos:: source/region). Heuristic: "
-                  "'next launch' folds the Python glue before that launch into it. by_sync_source is "
-                  "the idle slice overlapped by host *Synchronize* calls (self_time of a sync ≠ its "
-                  "exposed idle). Each by_source/by_region row carries BOTH levers — exposed_idle_ms "
-                  "(starvation) and fusible_ms (bandwidth/compute reducible by fusion, runs at high "
-                  "util with no idle) — with a per-row 'lever' hint; the lever is chosen per hotspot, "
-                  "not globally, since a model mixes idle-bound and busy-bound regions.",
+        "launch that ends it (kernel→RUNTIME→enclosing talos:: source/region). Heuristic: "
+        "'next launch' folds the Python glue before that launch into it. by_sync_source is "
+        "the idle slice overlapped by host *Synchronize* calls (self_time of a sync ≠ its "
+        "exposed idle). Each by_source/by_region row carries BOTH levers — exposed_idle_ms "
+        "(starvation) and fusible_ms (bandwidth/compute reducible by fusion, runs at high "
+        "util with no idle) — with a per-row 'lever' hint; the lever is chosen per hotspot, "
+        "not globally, since a model mixes idle-bound and busy-bound regions.",
     }
 
 
 # ─── device-level GPU utilisation (union across all streams) ────────
 
-def build_gpu_util(parquetdir: str, start_ns: int, end_ns: int,
-                   n_buckets: int = 100) -> dict:
+
+def build_gpu_util(
+    parquetdir: str, start_ns: int, end_ns: int, n_buckets: int = 100
+) -> dict:
     """Whole-device GPU utilisation: the union of busy time across ALL
     streams (kernel / memcpy / memset), bucketed like a stream's
     ``util.json``. Individual streams can each look moderate while the
@@ -805,7 +1039,9 @@ def build_gpu_util(parquetdir: str, start_ns: int, end_ns: int,
 
     events: list[tuple[int, int]] = []
     per_stream: dict = defaultdict(list)
-    for s, e, stream, _kind, _cid in _gpu_events(parquetdir, copy_kinds, start_ns, end_ns):
+    for s, e, stream, _kind, _cid in _gpu_events(
+        parquetdir, copy_kinds, start_ns, end_ns
+    ):
         es, ee = max(s, start_ns), min(e, end_ns)
         if ee > es:
             events.append((es, ee))
@@ -837,8 +1073,9 @@ def build_gpu_util(parquetdir: str, start_ns: int, end_ns: int,
             s = min(e, b_end)
             i += 1
 
-    util = {str(i): round(min(bucket_busy[i] / bucket_ns, 1.0), 4)
-            for i in range(n_buckets)}
+    util = {
+        str(i): round(min(bucket_busy[i] / bucket_ns, 1.0), 4) for i in range(n_buckets)
+    }
     vals = [util[str(i)] for i in range(n_buckets)]
 
     per_stream_mean = {
@@ -850,14 +1087,17 @@ def build_gpu_util(parquetdir: str, start_ns: int, end_ns: int,
         "window": {"start_ns": start_ns, "end_ns": end_ns, "duration_ms": _ms(span)},
         "n_buckets": n_buckets,
         "bucket_ns": bucket_ns,
-        "gpu": {"busy_ms": _ms(busy_ns), "idle_ms": _ms(span - busy_ns),
-                "util": round(busy_ns / span, 4) if span else 0.0},
+        "gpu": {
+            "busy_ms": _ms(busy_ns),
+            "idle_ms": _ms(span - busy_ns),
+            "util": round(busy_ns / span, 4) if span else 0.0,
+        },
         "mean_util": round(sum(vals) / len(vals), 4) if vals else 0.0,
         "min_util": min(vals) if vals else 0.0,
         "max_util": max(vals) if vals else 0.0,
         "util": util,
         "per_stream_mean_util": per_stream_mean,
         "note": "device-level union of kernel/memcpy/memset across ALL streams; "
-                "compare per_stream_mean_util against gpu.util to see how much "
-                "of the device's busy time comes from stream overlap.",
+        "compare per_stream_mean_util against gpu.util to see how much "
+        "of the device's busy time comes from stream overlap.",
     }

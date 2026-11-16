@@ -78,7 +78,9 @@ def test_a_sliding_window_of_keys_does_not_grow_the_table(device):
     train_step(module, live, device, scores=[rounds] * len(live))
 
 
-def test_training_goes_on_while_the_call_erases_and_each_key_reads_its_own_value(device):
+def test_training_goes_on_while_the_call_erases_and_each_key_reads_its_own_value(
+    device,
+):
     """The call is made, and the training does not wait: new keys come in -- the table
     grows under the scan, which starts again -- and every output is right. When the erase
     is done, the old keys are gone, once each, and the new ones are all there."""
@@ -189,7 +191,9 @@ def test_with_a_cache_only_the_storage_behind_it_is_erased(device):
     everything = old + new
     in_cache = found(module, everything, device, cache=True).clone()
     assert size(module) == len(everything), "every key reaches the storage"
-    assert 0 < int(in_cache.sum()) < len(everything), "the cache is neither empty nor all"
+    assert (
+        0 < int(in_cache.sum()) < len(everything)
+    ), "the cache is neither empty nor all"
 
     assert module.erase_by_score_async(S.CUSTOMIZED, 100).result() == (len(old), 0)
 

@@ -23,12 +23,11 @@ Usage:
 from __future__ import annotations
 
 import argparse
-from pathlib import Path
 import time
+from pathlib import Path
 
 import torch
 import torch.nn.functional as F
-
 from data import get_dataloader, get_movielens_dataloader
 from model import HSTUSequentialRecommender
 
@@ -36,8 +35,14 @@ from model import HSTUSequentialRecommender
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser()
     p.add_argument("--dataset", choices=["synthetic", "ml-1m"], default="synthetic")
-    p.add_argument("--data-dir", type=str, default=str(Path(__file__).resolve().parent / "data"))
-    p.add_argument("--download", action="store_true", help="Download the selected real dataset if it is missing.")
+    p.add_argument(
+        "--data-dir", type=str, default=str(Path(__file__).resolve().parent / "data")
+    )
+    p.add_argument(
+        "--download",
+        action="store_true",
+        help="Download the selected real dataset if it is missing.",
+    )
     p.add_argument("--steps", type=int, default=50)
     p.add_argument("--batch-size", type=int, default=64)
     p.add_argument("--seq-len", type=int, default=128)
@@ -78,7 +83,9 @@ def main() -> None:
             seed=args.seed,
             num_workers=args.num_workers,
         )
-        print(f"Dataset: MovieLens 1M ({len(loader.dataset)} windows, vocab_size={vocab_size})")
+        print(
+            f"Dataset: MovieLens 1M ({len(loader.dataset)} windows, vocab_size={vocab_size})"
+        )
     else:
         vocab_size = args.vocab_size
         loader = get_dataloader(
@@ -89,7 +96,9 @@ def main() -> None:
             seed=args.seed,
             num_workers=args.num_workers,
         )
-        print(f"Dataset: synthetic ({len(loader.dataset)} windows, vocab_size={vocab_size})")
+        print(
+            f"Dataset: synthetic ({len(loader.dataset)} windows, vocab_size={vocab_size})"
+        )
 
     model = HSTUSequentialRecommender(
         vocab_size=vocab_size,

@@ -9,6 +9,7 @@
 #   --recompute_layernorm               (default: False)
 #   --balanced_shuffler                 (default: False)
 #   --tp_size INT                       (default: 1)
+#   --output_dist [torchrec|hierarchical|auto]  (default: torchrec)
 #
 # Debug twin: when submit_all_experiments_slurm.sh is invoked with
 # --cache-debug and/or --mem-debug, each experiment in this file is paired
@@ -29,3 +30,4 @@ exp2_cutlass,--balanced_shuffler --kernel_backend cutlass --value_dist zipf --va
 exp3_caching,--balanced_shuffler --kernel_backend cutlass --caching --value_dist zipf --value_dist_alpha 1.05
 exp4_caching_hr,--balanced_shuffler --kernel_backend cutlass --caching --dist_type hash_roundrobin --value_dist zipf --value_dist_alpha 1.05
 exp5_prefetch,--balanced_shuffler --kernel_backend cutlass --caching --dist_type hash_roundrobin --pipeline_type prefetch --value_dist zipf --value_dist_alpha 1.05
+exp6_hier,--balanced_shuffler --kernel_backend cutlass --caching --dist_type hash_roundrobin --pipeline_type prefetch --output_dist hierarchical --value_dist zipf --value_dist_alpha 1.05
