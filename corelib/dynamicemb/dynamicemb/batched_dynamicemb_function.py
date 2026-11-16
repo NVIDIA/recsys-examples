@@ -1036,7 +1036,6 @@ def dynamicemb_eval_forward(
     with torch.cuda.nvtx.range("dynamicemb_eval_forward"):
         table_num = feature_offsets.numel() - 1
         assert table_num != 0
-        emb_dtype = storage.embedding_dtype()
 
         is_pooling = layout.is_pooling
 
@@ -1059,6 +1058,11 @@ def dynamicemb_eval_forward(
                 initializer,
                 cache=cache,
             )
+            # Decode first: the allocator's copies below only convert dtypes, so
+            # an fp8 table's stored codes (256x the weights) would be copied out.
+            # Always: for any other table this is a ``.to`` that returns the
+            # tensor itself when the dtype already matches.
+            output_embs = decode_table_values(output_embs, output_dtype)
             alloc = (
                 output_alloc(*layout.sequence_shape(), output_dtype)
                 if output_alloc is not None
@@ -1069,8 +1073,6 @@ def dynamicemb_eval_forward(
                 if out_rows is None:
                     return out.copy_(output_embs)
                 return out.index_copy_(0, out_rows.long(), output_embs.to(out.dtype))
-            if output_dtype != emb_dtype:
-                output_embs = decode_table_values(output_embs, output_dtype)
             return output_embs
 
         frequency_counts_int64 = (

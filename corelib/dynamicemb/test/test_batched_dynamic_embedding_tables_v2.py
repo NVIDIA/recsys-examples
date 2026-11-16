@@ -60,6 +60,7 @@ from dynamicemb.optimizer import (
     get_optimizer_ckpt_state_dim,
 )
 from dynamicemb.types import KEY_TYPE, CopyMode
+from dynamicemb.utils import FP8_STORAGE_DTYPE
 from fbgemm_gpu.split_embedding_configs import SparseType
 from fbgemm_gpu.split_table_batched_embeddings_ops_common import (
     BoundsCheckMode,
@@ -3090,6 +3091,7 @@ def _rowwise_adagrad_bdeb(
     pooling_mode: DynamicEmbPoolingMode,
     eps: float = 1e-8,
     initializer_args: Optional[DynamicEmbInitializerArgs] = None,
+    output_dtype: torch.dtype = torch.float32,
 ) -> BatchedDynamicEmbeddingTablesV2:
     if initializer_args is None:
         initializer_args = DynamicEmbInitializerArgs(
@@ -3119,6 +3121,7 @@ def _rowwise_adagrad_bdeb(
         use_index_dedup=True,
         learning_rate=0.01,
         eps=eps,
+        output_dtype=output_dtype,
     )
 
 
@@ -3158,6 +3161,51 @@ def test_fp8_table_warns_of_an_initializer_that_can_saturate(initializer_args, w
     assert bool(messages) == warns, messages
     if warns:
         assert "table0" in messages[0] and "1.75" in messages[0]
+
+
+@pytest.mark.parametrize("table_dtype", [FP8_STORAGE_DTYPE, torch.float16])
+def test_fp8_is_refused_as_an_output_dtype(table_dtype):
+    # The lookup kernels write an fp8 output as stored codes, 256x the weights.
+    with pytest.raises(ValueError, match="output_dtype=torch.float8_e4m3fn"):
+        _rowwise_adagrad_bdeb(
+            table_dtype,
+            [8],
+            False,
+            1024**3,
+            DynamicEmbPoolingMode.SUM,
+            output_dtype=FP8_STORAGE_DTYPE,
+        )
+
+
+@pytest.mark.parametrize("permuted", [False, True], ids=["in_order", "permuted_rows"])
+def test_fp8_sequence_eval_through_output_alloc_returns_real_weights(permuted):
+    # The allocator's copies only convert dtypes, so an fp8 table's stored codes
+    # (256x the weights) must be decoded before they are handed over.
+    device = torch.device("cuda:0")
+    bdeb = _rowwise_adagrad_bdeb(
+        FP8_STORAGE_DTYPE, [16, 16], False, 1024**3, DynamicEmbPoolingMode.NONE
+    )
+    indices = torch.arange(64, dtype=torch.int64, device=device)
+    offsets = torch.arange(0, 65, 32, dtype=torch.int64, device=device)
+    bdeb(indices, offsets)  # a training forward inserts the rows
+    bdeb.eval()
+    plain = bdeb(indices, offsets)
+    assert plain.dtype == torch.float32
+    assert torch.all(plain == FP8_INITIAL_VALUE)
+
+    out_rows = torch.randperm(64, device=device) if permuted else None
+
+    def alloc(rows, cols, dtype):
+        return torch.zeros(rows, cols, dtype=dtype, device=device), out_rows
+
+    bdeb.output_alloc = alloc
+    out = bdeb(indices, offsets)
+    expected = torch.zeros_like(out)
+    if permuted:
+        expected[out_rows.long()] = plain
+    else:
+        expected = plain
+    torch.testing.assert_close(out, expected, rtol=0, atol=0)
 
 
 def _train_fp32_and_fp8_tables(

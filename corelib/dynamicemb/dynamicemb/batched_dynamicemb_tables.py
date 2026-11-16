@@ -515,6 +515,14 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
         self.initializer_args = table_option.initializer_args
         self.index_type = table_option.index_type
         self.embedding_dtype = table_option.embedding_dtype
+        if output_dtype == FP8_STORAGE_DTYPE:
+            # fp8 is a storage format here: the lookup kernels write that dtype
+            # as its stored codes, 256x the weights, which no consumer expects.
+            raise ValueError(
+                "output_dtype=torch.float8_e4m3fn is not supported: fp8 is only "
+                "a table storage dtype. Use torch.float32, torch.float16 or "
+                "torch.bfloat16 for the output."
+            )
         self.output_dtype = output_dtype
         self.pooling_mode = pooling_mode
         self.use_index_dedup = use_index_dedup
