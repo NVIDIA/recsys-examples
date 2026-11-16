@@ -332,11 +332,15 @@ ENV PYTHONPATH=/opt/nve/default/python:.:/workspace/recsys-examples/examples:/wo
 # conservative default that also fits the 128 GiB A100 CI builders.
 # PyTorch 2.14's headers need C++20, and the submodule's setup.py asks for
 # C++17: build it as C++20.
+# CUTLASS DSL 4.8 (the 26.09 base) drops CooperativeGroup's alignment argument,
+# which 4.5.2 deprecated and ignored. The Blackwell backward still passes it,
+# equal to the size, in 7 calls: drop it.
 COPY third_party/FBGEMM /workspace/deps/fbgemm_hstu
 RUN cd /workspace/deps/fbgemm_hstu/fbgemm_gpu/experimental/hstu && \
     grep -q -- '-std=c++17' setup.py && \
     sed -i 's/-std=c++17/-std=c++20/g' setup.py && \
     ! grep -q -- '-std=c++17' setup.py && \
+    python3 -c "import re; p='src/hstu_blackwell/hstu_bwd.py'; s=open(p).read(); s, n = re.subn(r'(CooperativeGroup\(\n\s+pipeline\.Agent\.Thread,\n(\s+)([^\n]+),\n)\2\3,\n', r'\1', s); assert n == 7, n; open(p, 'w').write(s)" && \
     export HSTU_ARCH_LIST="8.0 9.0 10.0" && \
     if [ "${TARGETPLATFORM}" = "linux/amd64" ]; then \
       export HSTU_DISABLE_120=TRUE; \
