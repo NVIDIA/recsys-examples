@@ -24,8 +24,11 @@ move the weights instead of being rounded away.
 
 import pytest
 import torch
+from dynamicemb.initializer import fp8_out_of_range_risk
 from dynamicemb.optimizer import OptimizerArgs, RowWiseAdaGradDynamicEmbeddingOptimizer
+from dynamicemb.types import DynamicEmbInitializerArgs, DynamicEmbInitializerMode
 from dynamicemb.utils import (
+    FP8_MAX_VALUE,
     FP8_STORAGE_DTYPE,
     decode_table_values,
     encode_table_values,
@@ -176,6 +179,44 @@ def test_fp8_table_takes_fp32_gradients():
         assert gradient_dtype(FP8_STORAGE_DTYPE, grad_dtype) == torch.float32
         for table_dtype in (torch.float32, torch.float16, torch.bfloat16):
             assert gradient_dtype(table_dtype, grad_dtype) == grad_dtype
+
+
+def test_fp8_max_value_is_what_the_storage_saturates_to():
+    big = torch.tensor([10.0, -10.0, 1.0])
+    stored = decode_table_values(
+        encode_table_values(big, FP8_STORAGE_DTYPE), torch.float32
+    )
+    assert stored.tolist() == [FP8_MAX_VALUE, -FP8_MAX_VALUE, 1.0]
+    assert FP8_MAX_VALUE == 1.75
+
+
+@pytest.mark.parametrize(
+    "args, risky",
+    [
+        # Bounded modes are judged on their bounds.
+        (dict(mode="uniform", lower=-1.75, upper=1.75), False),
+        (dict(mode="uniform", lower=-0.01, upper=0.01), False),
+        (dict(mode="uniform", lower=0.0, upper=2.0), True),
+        (dict(mode="uniform", lower=-2.0, upper=0.0), True),
+        (dict(mode="uniform"), False),  # unresolved: the 0..1 fallback
+        (dict(mode="truncated_normal", lower=-1.0, upper=3.0), True),
+        (dict(mode="truncated_normal", lower=-1.0, upper=1.0), False),
+        (dict(mode="constant", value=0.5), False),
+        (dict(mode="constant", value=-2.0), True),
+        # A normal has no bound: three standard deviations from the mean.
+        (dict(mode="normal"), True),  # the default std_dev of 1.0
+        (dict(mode="normal", std_dev=0.5), False),
+        (dict(mode="normal", mean=1.0, std_dev=0.5), True),
+        (dict(mode="normal", mean=0.0, std_dev=0.6), True),
+        (dict(mode="debug"), False),
+    ],
+)
+def test_fp8_out_of_range_risk(args, risky):
+    args = dict(args, mode=DynamicEmbInitializerMode(args["mode"]))
+    risk = fp8_out_of_range_risk(DynamicEmbInitializerArgs(**args))
+    assert (risk is not None) == risky
+    if risky:
+        assert args["mode"].value in risk
 
 
 @cuda

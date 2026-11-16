@@ -45,6 +45,8 @@ DTYPE_NUM_BYTES: Dict[torch.dtype, int] = {
 FP8_STORAGE_DTYPE = torch.float8_e4m3fn
 FP8_STORAGE_SCALE = 256.0
 _FP8_E4M3_MAX = 448.0
+# The largest weight an fp8 table holds; a larger one saturates to it, silently.
+FP8_MAX_VALUE = _FP8_E4M3_MAX / FP8_STORAGE_SCALE
 
 
 def decode_table_values(values: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:

@@ -66,7 +66,7 @@ from dynamicemb.dynamicemb_config import (
     score_strategy_has_timestamp_column,
     warning_for_cstm_score,
 )
-from dynamicemb.initializer import MultiTableInitializer
+from dynamicemb.initializer import MultiTableInitializer, fp8_out_of_range_risk
 from dynamicemb.key_ownership import owned_key_mask, owned_keys
 from dynamicemb.key_value_table import (
     ERASE_CHUNK_SLOTS,
@@ -93,7 +93,12 @@ from dynamicemb.optimizer import (
     get_optimizer_state_dim,
 )
 from dynamicemb.types import ReplayStats
-from dynamicemb.utils import DTYPE_NUM_BYTES, checkpoint_dtype
+from dynamicemb.utils import (
+    DTYPE_NUM_BYTES,
+    FP8_MAX_VALUE,
+    FP8_STORAGE_DTYPE,
+    checkpoint_dtype,
+)
 from dynamicemb_extensions import device_timestamp
 from fbgemm_gpu.split_table_batched_embeddings_ops_training import (
     BoundsCheckMode,
@@ -877,6 +882,16 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
         unbounded UNIFORM resolves against each table's num_embeddings.
         """
         device = torch.device(f"cuda:{self.device_id}")
+        if self.embedding_dtype == FP8_STORAGE_DTYPE:
+            for name, option in zip(self._table_names, self._dynamicemb_options):
+                risk = fp8_out_of_range_risk(option.initializer_args)
+                if risk is not None:
+                    warnings.warn(
+                        f"Table {name} stores fp8 weights, which hold values "
+                        f"up to +-{FP8_MAX_VALUE:g} and saturate larger ones "
+                        f"to it without notice, but it has a {risk}: some "
+                        f"initial weights may be clipped."
+                    )
         self._initializer = MultiTableInitializer.create(
             [option.initializer_args for option in self._dynamicemb_options], device
         )

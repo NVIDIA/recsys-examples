@@ -538,6 +538,16 @@ class DynamicEmbTableOptions:
         ``embedding_dtype`` (alongside ``embedding_dim`` / ``optim_state_dtype``), which is how
         ``DynamicEmbLoad`` reads them back. Loading a checkpoint whose precision differs converts the
         values and warns; a differing dim is an error.
+
+        ``torch.float8_e4m3fn`` stores each weight as an e4m3 code of ``weight * 256`` (1 byte per
+        element) and rounds stochastically on every write. Its limits: weights are held only in
+        ``[-1.75, 1.75]`` -- a larger one saturates to the bound, with no error, and a construction-time
+        warning is issued only for initializers that can generate such values; the optimizer must be
+        ``EXACT_ROWWISE_ADAGRAD``; a checkpoint is written as ``torch.float16`` (lossless for fp8 values,
+        so loading it back into an fp8 table does not warn), and loading a fp16 / fp32 / bf16 checkpoint
+        saturates its values beyond the bound the same way. A fp16 checkpoint trained as a fp16 table is
+        narrowed to fp8 without a warning too, since it cannot be told from an fp8 table's own dump.
+        The stochastic rounding is not seeded, so two runs of the same training are not bit-identical.
     dim : Optional[int], optional
         Value vector dimension. With ``DynamicEmbeddingShardingPlanner``, ``_prepare_dynemb_table_options``
         sets it from ``BaseEmbeddingConfig.embedding_dim``. The embedding kernel only warns if it

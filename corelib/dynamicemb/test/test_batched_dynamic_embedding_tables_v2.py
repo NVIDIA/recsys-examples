@@ -3089,7 +3089,12 @@ def _rowwise_adagrad_bdeb(
     local_hbm_for_values: int,
     pooling_mode: DynamicEmbPoolingMode,
     eps: float = 1e-8,
+    initializer_args: Optional[DynamicEmbInitializerArgs] = None,
 ) -> BatchedDynamicEmbeddingTablesV2:
+    if initializer_args is None:
+        initializer_args = DynamicEmbInitializerArgs(
+            mode=DynamicEmbInitializerMode.CONSTANT, value=FP8_INITIAL_VALUE
+        )
     options = [
         DynamicEmbTableOptions(
             dim=dim,
@@ -3101,9 +3106,7 @@ def _rowwise_adagrad_bdeb(
             score_strategy=DynamicEmbScoreStrategy.TIMESTAMP,
             caching=caching,
             local_hbm_for_values=local_hbm_for_values,
-            initializer_args=DynamicEmbInitializerArgs(
-                mode=DynamicEmbInitializerMode.CONSTANT, value=FP8_INITIAL_VALUE
-            ),
+            initializer_args=initializer_args,
         )
         for dim in dims
     ]
@@ -3124,6 +3127,37 @@ FP8_TABLE_STORAGE = [
     pytest.param(True, 64 * 1024, id="cache"),
     pytest.param(False, 0, id="host"),
 ]
+
+
+@pytest.mark.parametrize(
+    "initializer_args, warns",
+    [
+        # The default NORMAL has std_dev 1.0, which reaches past 1.75.
+        (DynamicEmbInitializerArgs(mode=DynamicEmbInitializerMode.NORMAL), True),
+        (
+            DynamicEmbInitializerArgs(
+                mode=DynamicEmbInitializerMode.UNIFORM, lower=-0.1, upper=0.1
+            ),
+            False,
+        ),
+    ],
+    ids=["normal-default-warns", "uniform-in-range-quiet"],
+)
+def test_fp8_table_warns_of_an_initializer_that_can_saturate(initializer_args, warns):
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        _rowwise_adagrad_bdeb(
+            FP8_STORAGE_DTYPE,
+            [8],
+            False,
+            1024**3,
+            DynamicEmbPoolingMode.SUM,
+            initializer_args=initializer_args,
+        )
+    messages = [str(w.message) for w in caught if "saturate" in str(w.message)]
+    assert bool(messages) == warns, messages
+    if warns:
+        assert "table0" in messages[0] and "1.75" in messages[0]
 
 
 def _train_fp32_and_fp8_tables(

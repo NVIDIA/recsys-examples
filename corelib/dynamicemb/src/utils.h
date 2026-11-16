@@ -106,7 +106,9 @@ enum class DistType : int32_t {
 // subnormal. Writes round stochastically: an optimizer step is often smaller
 // than half an e4m3 step (1/16 of |w|), and round-to-nearest would discard it,
 // freezing rows after a few dozen updates. Values already on the e4m3 grid
-// (e.g. loaded from an fp16 dump of this table) are stored exactly.
+// (e.g. loaded from an fp16 dump of this table) are stored unchanged in the
+// normal range; in the subnormal range one moves up a step with a probability
+// of about 1e-7 per write, because the dither is added in fp32.
 #ifdef __CUDACC__
 constexpr float kFp8StorageScale = 256.0f;
 constexpr float kFp8StorageInvScale = 1.0f / 256.0f;
