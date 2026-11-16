@@ -98,6 +98,13 @@ enum class DistType : int32_t {
   // exchange for not caring what structure the key space has.  Python calls it
   // "hash_roundrobin".
   kHashedCyclic = 2,
+  // rank = ((murmur3_fmix64(key) & INT64_MAX) % global_capacity) / shard_capacity:
+  // the key's *global* hash bucket decides the rank, so the keys that share a
+  // bucket do not depend on the world size and a checkpoint reloads at another
+  // world size without a bucket overflowing (see hashed_shard in
+  // sparse_block_bucketize_features.cu and LinearBucketTable::home_bucket).
+  // Python calls it "hash_bucket".
+  kHashedBucket = 3,
 };
 // 8-bit table storage: an e4m3 code holding value * 2^8. The shift moves e4m3's
 // range to [2^-17, 1.75] -- exponent bias 15, the format FBGEMM's FP8 comms use

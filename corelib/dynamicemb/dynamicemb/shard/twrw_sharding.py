@@ -25,7 +25,7 @@ keys are placed by DynamicEmb's rule rather than by row block, and the lookup
 has to reach a hash table rather than a TBE.
 """
 
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 import torchrec
@@ -52,8 +52,16 @@ from torchrec.distributed.types import (
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 
 from ..batched_dynamicemb_tables import BatchedDynamicEmbeddingTablesV2
-from .input_dist import bucketize_kjt_before_all2all, dist_type_codes
-from .rw_sharding import GroupedPooledEmbeddingsLookup, dist_type_per_feature
+from .input_dist import (
+    bucketize_kjt_before_all2all,
+    dist_type_codes,
+    routing_param_tensors,
+)
+from .rw_sharding import (
+    GroupedPooledEmbeddingsLookup,
+    dist_type_per_feature,
+    routing_params_per_feature,
+)
 
 
 class TwRwSparseFeaturesDist(_TwRwSparseFeaturesDist):
@@ -88,6 +96,7 @@ class TwRwSparseFeaturesDist(_TwRwSparseFeaturesDist):
         has_feature_processor: bool = False,
         need_pos: bool = False,
         dist_types: Optional[List[str]] = None,
+        routing_params: Optional[List[Tuple[int, int]]] = None,
     ) -> None:
         super().__init__(
             pg=pg,
@@ -102,6 +111,18 @@ class TwRwSparseFeaturesDist(_TwRwSparseFeaturesDist):
             "_dist_type_tensor",
             dist_type_codes(dist_types, device=device),
             persistent=False,
+        )
+        # The hash_bucket parameters per feature, validated against this
+        # distributor's fan-out: one node, which is also what the planner sized
+        # the shard capacity by (table_fanout).
+        global_capacity_tensor, shard_capacity_tensor = routing_param_tensors(
+            dist_types, routing_params, local_size, device=device
+        )
+        self.register_buffer(
+            "_global_capacity_tensor", global_capacity_tensor, persistent=False
+        )
+        self.register_buffer(
+            "_shard_capacity_tensor", shard_capacity_tensor, persistent=False
         )
 
     def forward(
@@ -128,6 +149,8 @@ class TwRwSparseFeaturesDist(_TwRwSparseFeaturesDist):
                 else self._need_pos
             ),
             dist_type_per_feature=self._dist_type_tensor,
+            global_capacity_per_feature=self._global_capacity_tensor,
+            shard_capacity_per_feature=self._shard_capacity_tensor,
         )
         bucketized_features = bucketized_features.permute(
             self._sf_staggered_shuffle,
@@ -164,6 +187,9 @@ class TwRwPooledDynamicEmbeddingSharding(TwRwPooledEmbeddingSharding):
         self._dist_type_per_feature: Dict[str, str] = dist_type_per_feature(
             sharding_infos
         )
+        self._routing_params_per_feature: Dict[
+            str, Tuple[int, int]
+        ] = routing_params_per_feature(sharding_infos)
 
     def create_input_dist(
         self,
@@ -185,6 +211,9 @@ class TwRwPooledDynamicEmbeddingSharding(TwRwPooledEmbeddingSharding):
             need_pos=self._need_pos,
             dist_types=[
                 self._dist_type_per_feature[name] for name in self.feature_names()
+            ],
+            routing_params=[
+                self._routing_params_per_feature[name] for name in self.feature_names()
             ],
         )
 

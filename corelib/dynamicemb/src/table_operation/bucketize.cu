@@ -38,23 +38,31 @@ struct BucketizeFunctor {
   __host__ __device__ __forceinline__ IndexType operator()(KeyType key,
                                                            IndexType tid) {
 
+    // Same arithmetic as LinearBucketTable::home_bucket (types.cuh); keep the
+    // two in step.
     int64_t hashcode = BucketType::hash(key);
     int64_t t_id = table_ids[tid];
     int64_t bkt_begin = table_bucket_offsets[t_id];
     int64_t bkt_end = table_bucket_offsets[t_id + 1];
-    int64_t table_cap = (bkt_end - bkt_begin) * bucket_capacity;
+    int64_t nb = bkt_end - bkt_begin;
+    int64_t table_cap = nb * bucket_capacity;
     if (table_cap == 0) {
       return static_cast<IndexType>(bkt_begin);
     }
+    int64_t global_cap =
+        table_global_capacities != nullptr ? table_global_capacities[t_id] : 0;
+    if (global_cap <= 0)
+      global_cap = table_cap;
     // Use unsigned modulo to avoid negative results from signed hash values
     int64_t local_idx = static_cast<int64_t>(static_cast<uint64_t>(hashcode) %
-                                             static_cast<uint64_t>(table_cap));
-    int64_t bucket_id = bkt_begin + local_idx / bucket_capacity;
+                                             static_cast<uint64_t>(global_cap));
+    int64_t bucket_id = bkt_begin + (local_idx / bucket_capacity) % nb;
     return static_cast<IndexType>(bucket_id);
   }
   int64_t const *__restrict__ table_ids;
   int64_t const *__restrict__ table_bucket_offsets;
   int64_t bucket_capacity;
+  int64_t const *__restrict__ table_global_capacities;
 };
 
 template <typename KeyType, typename IndexType, typename ComposeKey>
@@ -118,7 +126,8 @@ namespace dyn_emb {
 std::vector<at::Tensor> bucketize_keys(at::Tensor keys, at::Tensor table_ids,
                                        at::Tensor table_bucket_offsets,
                                        int64_t num_buckets,
-                                       int64_t bucket_capacity) {
+                                       int64_t bucket_capacity,
+                                       std::optional<at::Tensor> table_global_capacities) {
 
   int64_t num_total = keys.size(0);
   TORCH_CHECK(num_buckets >= 0, "num_buckets must be non-negative");
@@ -159,6 +168,8 @@ std::vector<at::Tensor> bucketize_keys(at::Tensor keys, at::Tensor table_ids,
 
   auto table_ids_ = get_pointer<IndexType>(table_ids);
   auto table_bucket_offsets_ = get_pointer<IndexType>(table_bucket_offsets);
+  auto global_caps_ptr =
+      global_capacities_ptr(table_global_capacities, table_bucket_offsets);
 
   auto natural_ = get_pointer<IndexType>(natural);
   auto inverse_ = get_pointer<IndexType>(inverse);
@@ -178,7 +189,8 @@ std::vector<at::Tensor> bucketize_keys(at::Tensor keys, at::Tensor table_ids,
 
     // 1.  compose keys
     using SegmentFunc = BucketizeFunctor<KeyType, IndexType, Bucket>;
-    SegmentFunc func{table_ids_, table_bucket_offsets_, bucket_capacity};
+    SegmentFunc func{table_ids_, table_bucket_offsets_, bucket_capacity,
+                     global_caps_ptr};
     auto compose_keys_in = at::empty(
         {num_total * static_cast<int64_t>(sizeof(ComposeKey))},
         at::TensorOptions().dtype(torch::kChar).device(keys.device()));

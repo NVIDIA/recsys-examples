@@ -77,7 +77,11 @@ void check_rules(const Config &config) {
       const std::string rule = code[f] == (int)DistType::kBlock
                                    ? "\"continuous\" (set its table's dist_type to one of those, "
                                      "or output_dist to \"torchrec\")"
-                                   : c10::str("dist_type code ", code[f]);
+                                   : code[f] == (int)DistType::kHashedBucket
+                                         ? "\"hash_bucket\" (its owner is a global bucket of the whole "
+                                           "table, which the op does not compute; set its table's "
+                                           "dist_type to one of those, or output_dist to \"torchrec\")"
+                                         : c10::str("dist_type code ", code[f]);
       refuse("it places keys by dist_type \"roundrobin\" or \"hash_roundrobin\" only, and ",
              "the sharding's feature ", f, " has ", rule);
     }

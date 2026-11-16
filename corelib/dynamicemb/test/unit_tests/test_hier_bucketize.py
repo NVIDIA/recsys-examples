@@ -349,6 +349,8 @@ def reference(
         bucketize_pos=False,
         sequence=True,
         dist_type_per_feature=torch.tensor(dist_types, dtype=torch.int32).cuda(),
+        global_capacity_per_feature=torch.zeros(num_features, dtype=torch.int64).cuda(),
+        shard_capacity_per_feature=torch.zeros(num_features, dtype=torch.int64).cuda(),
         block_sizes=torch.ones(num_features, dtype=batch.values.dtype).cuda(),
         my_size=world_size,
         weights=batch.weights,

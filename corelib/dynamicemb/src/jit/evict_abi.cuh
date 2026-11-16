@@ -69,6 +69,11 @@ struct EvictParams {
   int *ovf_bucket_sizes;
   int32_t *ovf_counter;
   const int64_t *ovf_output_offsets;
+
+  // --- appended (keep last: the struct layout is the cubin launch contract) ---
+  // Per logical table global capacity for LinearBucketTable::home_bucket;
+  // nullptr == every table hashes within its own capacity.
+  const int64_t *table_global_capacities;
 };
 
 } // namespace dyn_emb

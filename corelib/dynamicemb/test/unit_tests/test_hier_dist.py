@@ -683,6 +683,8 @@ def bucketized_owners(
         dist_type_per_feature=torch.tensor(
             [DIST_TYPE_CODES[dist_type]], dtype=torch.int32, device=keys.device
         ),
+        global_capacity_per_feature=torch.zeros(1, dtype=torch.int64, device=keys.device),
+        shard_capacity_per_feature=torch.zeros(1, dtype=torch.int64, device=keys.device),
         # the cyclic rules read no block size
         block_sizes=torch.ones(1, dtype=keys.dtype, device=keys.device),
         my_size=world_size,
