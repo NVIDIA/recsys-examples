@@ -19,7 +19,7 @@ from contextlib import nullcontext
 from dataclasses import dataclass, field
 from enum import Enum, auto
 from threading import RLock
-from typing import Callable, ContextManager, Optional, Tuple
+from typing import Callable, ContextManager, List, Optional, Tuple
 
 import torch
 from dynamicemb.async_erase import defer_table_cleanup, table_section
@@ -343,26 +343,19 @@ class PrefetchState:
     key_map_generation: int = 0
 
     def record_stream(self, stream: torch.cuda.Stream) -> None:
-        """Marks the per-batch tensors used on ``stream``: a prefetch pipeline
-        makes them on its own stream, and the forward that takes them and its
-        backward read them on another, past the point where the caching
-        allocator would otherwise hand their blocks to the next prefetch."""
-        for tensor in (
-            self.unique_keys,
-            self.reverse_indices,
-            self.unique_table_ids,
-            self.lfu_accumulated_frequency,
-            self.slot_indices,
-            self.value_row_indices,
-            self.non_admitted_positions,
-            self.unique_scores,
-        ):
-            if tensor is not None:
-                tensor.record_stream(stream)
+        """Keep the batch's metadata alive when input_dist and lookup use different streams."""
+        for value in vars(self).values():
+            if isinstance(value, torch.Tensor) and value.is_cuda:
+                value.record_stream(stream)
 
     table_gate: Optional[Callable[[], ContextManager]] = None
     pin_lease: Optional[_PinnedRowLease] = field(default=None, repr=False)
     released: bool = False
+    used: bool = False
+    prepared_for_lookup: bool = False
+    input_frequencies: Optional[torch.Tensor] = None
+    occurrence_rows: Optional[torch.Tensor] = None
+    unique_sizes: List[int] = field(default_factory=list)
 
     def release(self, *, after_use=False):
         if self.released:
@@ -1139,6 +1132,7 @@ def dynamicemb_prefetch(
             value_row_indices=value_row_indices,
             key_map_generation=key_map_generation,
             table_gate=table_gate,
+            unique_sizes=unique_size_per_table.tolist(),
         )
         if result.slot_indices is not None:
             result.pin_lease = _PinnedRowLease(cache, storage, result)
@@ -1376,6 +1370,30 @@ def _generic_forward_path(
         return unique_values, persisted_unique_indices
 
 
+def place_lookup_output(output: torch.Tensor, output_alloc: Optional[OutputAlloc]):
+    """Place key-ordered rows in an output distributor's buffer and row order.
+
+    The returned map must also be passed to gradient reduction. An inactive
+    allocator returns None for native/fallback calls.
+    """
+    alloc = (
+        output_alloc(*output.shape, output.dtype) if output_alloc is not None else None
+    )
+    if alloc is None:
+        return output, None
+    out, row_map = alloc
+    # Like the native output kernels, write the externally owned window without
+    # bumping its shared view version: other lookup groups have already returned
+    # views of this same window from their custom autograd Functions. Gradient
+    # routing is explicit below/through _LookupOutput, not through this copy.
+    destination = out.data
+    if row_map is None:
+        destination.copy_(output)
+    else:
+        destination.index_copy_(0, row_map.long(), output)
+    return out, row_map
+
+
 def release_slot_pins(
     cache: Optional[Cache],
     storage: Storage,
@@ -1415,6 +1433,7 @@ class DynamicEmbeddingFunction(torch.autograd.Function):
         # hierarchical dist puts it in a window its node peers read in place,
         # each key's row where its row map says).
         output_alloc: Optional[OutputAlloc] = None,
+        native_lookup=None,
     ):
         with torch.cuda.nvtx.range("DynamicEmbeddingFunction.forward"):
             max_emb_dim = storage.max_embedding_dim()
@@ -1432,6 +1451,7 @@ class DynamicEmbeddingFunction(torch.autograd.Function):
             # dtype, loads each key's row straight into the output: no unique
             # rows to write and read back in between.
             direct = False
+            borrowed = False
             if use_counter:
                 state = (
                     cache._state
@@ -1439,11 +1459,20 @@ class DynamicEmbeddingFunction(torch.autograd.Function):
                     else storage._state
                 )
                 direct = (
-                    not is_pooling
+                    native_lookup is None
+                    and not is_pooling
                     and prefetch_state.non_admitted_positions is None
                     and output_dtype == state.emb_dtype
                 )
-                if not direct:
+                borrowed = (
+                    native_lookup is not None
+                    and prefetch_state.table_num == 1
+                    and prefetch_state.non_admitted_positions is None
+                    and not is_pooling
+                )
+                if borrowed:
+                    unique_embs = native_lookup.persistent_weights(state.tables[0])
+                elif not direct:
                     with torch.cuda.nvtx.range("op:load_from_flat"):
                         unique_embs = load_from_flat(
                             state,
@@ -1494,61 +1523,81 @@ class DynamicEmbeddingFunction(torch.autograd.Function):
                 # embedding ++ optimizer state; keep only the embedding.
                 unique_embs = unique_values[:, :max_emb_dim]
 
-            device = prefetch_state.unique_keys.device
-            out_rows = None  # each key's output row, None: key i's is row i
-            if is_pooling:
-                output_embs = torch.empty(
-                    *layout.pooled_shape(),
-                    dtype=output_dtype,
-                    device=device,
+            if native_lookup is not None:
+                lookup_indices = prefetch_state.occurrence_rows
+                if borrowed and lookup_indices is None:
+                    lookup_indices = prefetch_state.value_row_indices[
+                        prefetch_state.reverse_indices
+                    ]
+                output_embs = native_lookup(
+                    unique_embs,
+                    prefetch_state,
+                    offsets,
+                    output_dtype,
+                    pooling_weights,
+                    **({"indices": lookup_indices} if borrowed else {}),
                 )
-                with torch.cuda.nvtx.range("op:gather_embedding"):
-                    gather_embedding_pooled(
-                        unique_embs,
-                        output_embs,
-                        prefetch_state.reverse_indices,
-                        offsets,
-                        layout.pooling_mode,
-                        layout.total_D,
-                        layout.batch_size,
-                        layout.D_offsets,
-                        layout.max_D,
-                        pooling_weights,
-                        layout.feature_dims_vec4,
+                out_rows = None
+                if not is_pooling:
+                    output_embs, out_rows = place_lookup_output(
+                        output_embs, output_alloc
                     )
             else:
-                alloc = (
-                    output_alloc(*layout.sequence_shape(), output_dtype)
-                    if output_alloc is not None
-                    else None
-                )
-                # None: no allocator, or it has no buffer for this batch.
-                if alloc is None:
+                device = prefetch_state.unique_keys.device
+                out_rows = None  # each key's output row, None: key i's is row i
+                if is_pooling:
                     output_embs = torch.empty(
-                        *layout.sequence_shape(),
+                        *layout.pooled_shape(),
                         dtype=output_dtype,
                         device=device,
                     )
-                else:
-                    output_embs, out_rows = alloc
-                if direct:
-                    with torch.cuda.nvtx.range("op:load_from_flat"):
-                        load_from_flat_by(
-                            state,
-                            prefetch_state.value_row_indices,
-                            prefetch_state.unique_table_ids,
-                            prefetch_state.reverse_indices,
-                            output_embs,
-                            out_rows,
-                        )
-                else:
                     with torch.cuda.nvtx.range("op:gather_embedding"):
-                        gather_embedding(
+                        gather_embedding_pooled(
                             unique_embs,
                             output_embs,
                             prefetch_state.reverse_indices,
-                            out_rows,
+                            offsets,
+                            layout.pooling_mode,
+                            layout.total_D,
+                            layout.batch_size,
+                            layout.D_offsets,
+                            layout.max_D,
+                            pooling_weights,
+                            layout.feature_dims_vec4,
                         )
+                else:
+                    alloc = (
+                        output_alloc(*layout.sequence_shape(), output_dtype)
+                        if output_alloc is not None
+                        else None
+                    )
+                    # None: no allocator, or it has no buffer for this batch.
+                    if alloc is None:
+                        output_embs = torch.empty(
+                            *layout.sequence_shape(),
+                            dtype=output_dtype,
+                            device=device,
+                        )
+                    else:
+                        output_embs, out_rows = alloc
+                    if direct:
+                        with torch.cuda.nvtx.range("op:load_from_flat"):
+                            load_from_flat_by(
+                                state,
+                                prefetch_state.value_row_indices,
+                                prefetch_state.unique_table_ids,
+                                prefetch_state.reverse_indices,
+                                output_embs,
+                                out_rows,
+                            )
+                    else:
+                        with torch.cuda.nvtx.range("op:gather_embedding"):
+                            gather_embedding(
+                                unique_embs,
+                                output_embs,
+                                prefetch_state.reverse_indices,
+                                out_rows,
+                            )
 
             ctx.unique_keys = prefetch_state.unique_keys
             ctx.reverse_indices = prefetch_state.reverse_indices
