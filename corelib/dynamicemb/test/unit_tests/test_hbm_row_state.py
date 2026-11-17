@@ -156,7 +156,6 @@ def test_cross_stream_cancellation_keeps_release_metadata(layout):
         ]
     torch.cuda.synchronize()
     assert torch.count_nonzero(counter).item() == 0
-    assert model._prefetch_outstanding_keys.item() == 0
     assert len(reused) == 200
 
 

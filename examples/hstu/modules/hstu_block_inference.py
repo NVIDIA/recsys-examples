@@ -9,6 +9,7 @@ from configs import InferenceHSTUConfig
 from modules.hstu_processor import HSTUBlockPostprocessor, HSTUBlockPreprocessor
 from modules.jagged_data import JaggedData
 from modules.paged_hstu_infer_layer import PagedHSTUInferLayer
+from modules.transformer_infer_layer import TransformerInferLayer
 from recsys_kvcache_manager.host_kvstorage_manager import HostKVBackend
 from torchrec.sparse.jagged_tensor import JaggedTensor
 
@@ -160,6 +161,26 @@ def _initialize_kvcache_metadata_for_cudagraph(
     kvcache_metadata.new_history_nnz = max_new_history_nnz
 
 
+def _layer_type(config: InferenceHSTUConfig):
+    if config.backbone != "transformer":
+        return PagedHSTUInferLayer
+    # FA4 and DeepGEMM are optional dependencies, imported only when requested.
+    if config.transformer_attention == "fa4":
+        from modules.transformer_infer_layer_fa4 import (
+            Fa4Fp8TransformerInferLayer,
+            Fa4TransformerInferLayer,
+        )
+
+        if config.transformer_fp8_linear:
+            return Fa4Fp8TransformerInferLayer
+        return Fa4TransformerInferLayer
+    if config.transformer_fp8_linear:
+        from modules.transformer_infer_layer_fp8 import Fp8FusedTransformerInferLayer
+
+        return Fp8FusedTransformerInferLayer
+    return TransformerInferLayer
+
+
 class HSTUBlockInference(torch.nn.Module):
     """
     HSTUBlock module. A stack of HSTULayers.
@@ -178,9 +199,10 @@ class HSTUBlockInference(torch.nn.Module):
         self._preprocessor = HSTUBlockPreprocessor(config, is_inference=True)
         self._postprocessor = HSTUBlockPostprocessor(is_inference=True)
 
+        layer_type = _layer_type(config)
         self._attention_layers = torch.nn.ModuleList(
             [
-                PagedHSTUInferLayer(config, layer_idx)
+                layer_type(config, layer_idx)
                 for layer_idx in range(self.config.num_layers)
             ]
         )
@@ -204,8 +226,14 @@ class HSTUBlockInference(torch.nn.Module):
         """
         with torch.inference_mode():
             jd = self._preprocessor(embeddings, batch)
-            for hstu_layer in self._attention_layers:
-                jd = hstu_layer(jd)
+            jd.values = self.predict(
+                batch.batch_size,
+                jd.values.shape[0],
+                jd.values,
+                jd,
+                None,
+                use_cudagraph=False,
+            )
             return self._postprocessor(jd)
 
     def predict(

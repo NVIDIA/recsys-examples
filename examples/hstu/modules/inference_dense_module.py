@@ -143,6 +143,7 @@ class InferenceDenseModule(torch.nn.Module):
         self._hstu_config = hstu_config
         self._task_config = task_config
         self._use_exportable = use_exportable
+        self._backbone = getattr(hstu_config, "backbone", "hstu")
         if self._use_exportable:
             assert isinstance(
                 hstu_config, HSTUConfig
@@ -296,6 +297,14 @@ class InferenceDenseModule(torch.nn.Module):
         self.load_state_dict(model_state_dict, strict=False)
 
     def load_state_dict(self, model_state_dict, *args, **kwargs):
+        """Load the dense weights of a model checkpoint, skipping its sparse tables.
+
+        HSTU checkpoints use the training layout, with transposed UVQK and projection
+        weights; Transformer checkpoints use the module's own parameter names. Missing
+        or unexpected dense keys raise RuntimeError even when the caller passes
+        strict=False to skip the sparse weights.
+        """
+        hstu_layout = not self._use_exportable and self._backbone == "hstu"
         new_state_dict = {}
         for k in model_state_dict:
             if (
@@ -309,7 +318,7 @@ class InferenceDenseModule(torch.nn.Module):
             is_transposed = False
 
             newk = k
-            if not self._use_exportable:
+            if hstu_layout:
                 if k.endswith("_linear_uvqk_weight"):
                     newk = k.removesuffix("_linear_uvqk_weight") + "_linear_uvqk.weight"
                     is_transposed = True
@@ -324,13 +333,23 @@ class InferenceDenseModule(torch.nn.Module):
             )
 
         unloaded_modules = super().load_state_dict(new_state_dict, *args, **kwargs)
-        if not self._use_exportable:
-            for hstu_layer in self._hstu_block._attention_layers:
-                hstu_layer._linear_uvqk_weight.copy_(hstu_layer._linear_uvqk.weight.T)
-                hstu_layer._linear_proj_weight.copy_(hstu_layer._linear_proj.weight.T)
+        if hstu_layout:
+            with torch.no_grad():
+                for hstu_layer in self._hstu_block._attention_layers:
+                    hstu_layer._linear_uvqk_weight.copy_(
+                        hstu_layer._linear_uvqk.weight.T
+                    )
+                    hstu_layer._linear_proj_weight.copy_(
+                        hstu_layer._linear_proj.weight.T
+                    )
 
-        assert unloaded_modules.missing_keys == []
-        assert unloaded_modules.unexpected_keys == []
+        if unloaded_modules.missing_keys or unloaded_modules.unexpected_keys:
+            raise RuntimeError(
+                f"Checkpoint does not match {self._backbone} backbone: "
+                f"missing={unloaded_modules.missing_keys}, "
+                f"unexpected={unloaded_modules.unexpected_keys}"
+            )
+        return unloaded_modules
 
     def forward_with_kvcache(
         self,
@@ -449,7 +468,9 @@ class InferenceDenseModule(torch.nn.Module):
 
             # num_tokens = batch.features.values().shape[0]
             num_tokens = jagged_data.values.shape[0]
-            if self.use_cudagraph:
+            # The CUDA graphs of a module with a KV cache append to it and attend over
+            # it, through the metadata of the last cached request: run eagerly instead.
+            if self.use_cudagraph and not self._use_kvcache:
                 self._hidden_states[:num_tokens, ...].copy_(
                     jagged_data.values, non_blocking=True
                 )
@@ -468,6 +489,7 @@ class InferenceDenseModule(torch.nn.Module):
                     jagged_data.values,
                     jagged_data,
                     None,
+                    use_cudagraph=False,
                 )
             jagged_data.values = hstu_output
             jagged_data = self._hstu_block._postprocessor(jagged_data)
@@ -481,6 +503,8 @@ class InferenceDenseModule(torch.nn.Module):
         embeddings: Dict[str, JaggedTensor],
     ):
         with torch.inference_mode():
+            if not self._use_exportable:
+                return self.forward_nokvcache(batch, embeddings)
             # Forward through HSTU block
             jd_output, _ = self._hstu_block(embeddings, batch)
             # Prediction head

@@ -4,6 +4,7 @@ from typing import Dict, List, Optional
 
 from dynamicemb.dynamicemb_config import *
 from dynamicemb.types import DEFAULT_UNIFORM_LOWER, DEFAULT_UNIFORM_UPPER, group_key_of
+from dynamicemb.utils import FP8_MAX_VALUE
 from dynamicemb_extensions import (
     CurandStateContext,
     const_init,
@@ -34,6 +35,36 @@ def _with_default_bounds(
         lower=DEFAULT_UNIFORM_LOWER if args.lower is None else args.lower,
         upper=DEFAULT_UNIFORM_UPPER if args.upper is None else args.upper,
     )
+
+
+def fp8_out_of_range_risk(args: DynamicEmbInitializerArgs) -> Optional[str]:
+    """Why ``args`` can generate a weight an fp8 table cannot hold, or ``None``.
+
+    An fp8 table holds weights up to ``FP8_MAX_VALUE`` in magnitude and
+    saturates a larger one to it without a word. The bounded modes are judged on
+    their bounds; a NORMAL has none, so it is judged on three standard
+    deviations from its mean, which leaves out only 0.3% of its draws.
+    """
+    mode = args.mode
+    if mode == DynamicEmbInitializerMode.NORMAL:
+        reach = abs(args.mean) + 3 * args.std_dev
+        what = f"mean={args.mean}, std_dev={args.std_dev}, which reaches {reach:g}"
+    elif mode in (
+        DynamicEmbInitializerMode.UNIFORM,
+        DynamicEmbInitializerMode.TRUNCATED_NORMAL,
+    ):
+        lower = DEFAULT_UNIFORM_LOWER if args.lower is None else args.lower
+        upper = DEFAULT_UNIFORM_UPPER if args.upper is None else args.upper
+        reach = max(abs(lower), abs(upper))
+        what = f"lower={lower}, upper={upper}"
+    elif mode == DynamicEmbInitializerMode.CONSTANT:
+        reach = abs(args.value)
+        what = f"value={args.value}"
+    else:
+        return None
+    if reach <= FP8_MAX_VALUE:
+        return None
+    return f"{mode.value} initializer with {what}"
 
 
 class MultiTableInitializer(abc.ABC):

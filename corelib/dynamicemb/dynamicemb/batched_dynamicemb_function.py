@@ -19,7 +19,7 @@ from contextlib import nullcontext
 from dataclasses import dataclass, field
 from enum import Enum, auto
 from threading import RLock
-from typing import Callable, ContextManager, List, Optional, Tuple
+from typing import Callable, ContextManager, List, Optional, Tuple, cast
 
 import torch
 from dynamicemb.async_erase import defer_table_cleanup, table_section
@@ -46,6 +46,7 @@ from dynamicemb.key_value_table import (
 from dynamicemb.lookup_layout import EmbeddingLayout
 from dynamicemb.optimizer import BaseDynamicEmbeddingOptimizer
 from dynamicemb.types import CopyMode, MultiTableAdmitter
+from dynamicemb.utils import FP8_STORAGE_DTYPE, decode_table_values, gradient_dtype
 from dynamicemb_extensions import (
     EvictStrategy,
     expand_table_ids_cuda,
@@ -218,11 +219,8 @@ class _PinnedRowLease:
         )
         self.slot_indices = batch.slot_indices
         self.key_map_generation = batch.key_map_generation
-        self.outstanding_keys_ref = batch.outstanding_keys_ref
-        self.num_prefetched_keys = batch.num_prefetched_keys
         self.table_gate = batch.table_gate
         self.released = False
-        self._reservation_returned = False
         self._lock = RLock()
         self._device_index = self.unique_keys.device.index
         # The prefetch gate already orders creation. Only a caller without a
@@ -238,20 +236,7 @@ class _PinnedRowLease:
             self._last_use.record(torch.cuda.current_stream(self._device_index))
 
     def finish_forward(self):
-        with self._lock:
-            self.record_use()
-            if self.outstanding_keys_ref is None:
-                return
-            with table_section(
-                self.table_gate.host_section if self.table_gate is not None else None
-            ):
-                self._return_reservation()
-
-    def _return_reservation(self):
-        if not self._reservation_returned:
-            if self.outstanding_keys_ref is not None:
-                self.outstanding_keys_ref -= self.num_prefetched_keys
-            self._reservation_returned = True
+        self.record_use()
 
     def release(self, *, after_use=False):
         with self._lock:
@@ -261,15 +246,11 @@ class _PinnedRowLease:
                 self.cache if self.storage_mode == StorageMode.CACHE else self.storage
             )
             # Fixed hash slots cannot move while pinned. As in the existing
-            # backward contract, the decrement follows this stream's
+            # backward contract, the atomic decrement follows this stream's
             # final use; async erase sees the pin until that decrement. Rehash
             # and cancellation still need the gate, as do CPU reservations.
             fixed_slots = not owner._state.key_index_map.use_rows_
-            gate = (
-                None
-                if after_use and fixed_slots and self._reservation_returned
-                else self.table_gate
-            )
+            gate = None if after_use and fixed_slots else self.table_gate
             # Autograd runs final backward on the forward's device/use stream.
             # Abandoned ownership can be released from any device or thread.
             device_guard = (
@@ -296,7 +277,6 @@ class _PinnedRowLease:
                     self.slot_indices,
                     self.unique_table_ids,
                 )
-                self._return_reservation()
                 self.released = True
 
     def __del__(self):
@@ -336,8 +316,6 @@ class PrefetchState:
     non_admitted_positions: Optional[torch.Tensor] = None
     # One int64 per unique key, for tables that take a score per key.
     unique_scores: Optional[torch.Tensor] = None
-    num_prefetched_keys: int = 0
-    outstanding_keys_ref: Optional[torch.Tensor] = None
     # The key_map_generation (rehash count) of the table state the slots were found in: a later
     # prefetch may expand it before this batch's backward runs.
     key_map_generation: int = 0
@@ -768,7 +746,9 @@ def _prefetch_cache_path(
                     st_score_input,
                 )
 
-        # 7. Bring the keys into the cache, ranked by timestamp only
+        # 7. Bring the keys into the cache, ranked by timestamp only. The insert
+        # also flags the keys it could not place, in pinned host memory that the
+        # read of num_evicted waits for.
         with torch.cuda.nvtx.range("op:cache_insert_evict"):
             (
                 cache_slots,
@@ -777,7 +757,23 @@ def _prefetch_cache_path(
                 evicted_slots,
                 _,
                 evicted_tids,
-            ) = cache.insert_and_evict(cache_keys, cache_tids, None)
+                num_refused,
+            ) = cache.insert_and_evict(
+                cache_keys, cache_tids, None, report_refused=True
+            )
+        if num_refused > 0:
+            # Every key of a batch must be in the cache when its forward reads
+            # it. A refused key (its bucket and its table's overflow area held
+            # only keys the insert may not evict: pinned by batches in flight, or
+            # placed by this insert) has no slot; it comes back among the evicted
+            # ones with a negative one, and nothing is written back.
+            raise RuntimeError(
+                f"The cache could not place {num_refused} keys of this batch: their "
+                "buckets and their tables' overflow areas held only keys it may not "
+                "evict (pinned by batches in flight, or placed by this batch). "
+                "Increase the cache size, or reduce the prefetch pipeline depth or "
+                "the batch size."
+            )
 
         # 8. What it evicted: read before the slots are overwritten, then write back
         with torch.cuda.nvtx.range("op:load_from_flat"):
@@ -980,7 +976,6 @@ def dynamicemb_prefetch(
     evict_strategy=None,
     frequency_counters: Optional[torch.Tensor] = None,
     admitter: Optional[MultiTableAdmitter] = None,
-    outstanding_keys_ref: Optional[torch.Tensor] = None,
     external_storage: Optional[Storage] = None,
     scores: Optional[torch.Tensor] = None,
     table_gate: Optional[Callable[[], ContextManager]] = None,
@@ -1038,8 +1033,6 @@ def dynamicemb_prefetch(
             )
         )
 
-        num_prefetched_keys = unique_keys.numel()
-
         unique_table_ids = expand_table_ids_cuda(
             unique_indices_table_range,
             unique_keys.numel(),
@@ -1061,20 +1054,6 @@ def dynamicemb_prefetch(
                 storage.expand_if_need(unique_size_per_table)
 
             if storage_mode == StorageMode.CACHE:
-                if outstanding_keys_ref is not None:
-                    cache_capacity = cache._state.capacity
-                    outstanding_keys = (
-                        _scalar_item(outstanding_keys_ref) + num_prefetched_keys
-                    )
-                    if outstanding_keys > cache_capacity:
-                        raise RuntimeError(
-                            f"Outstanding prefetched keys "
-                            f"({outstanding_keys}) "
-                            f"exceed cache capacity ({cache_capacity}). "
-                            "Reduce prefetch pipeline depth or increase "
-                            "cache size."
-                        )
-                    outstanding_keys_ref += num_prefetched_keys
                 (
                     slot_indices,
                     non_admitted_positions,
@@ -1127,8 +1106,6 @@ def dynamicemb_prefetch(
             storage_mode=storage_mode,
             non_admitted_positions=non_admitted_positions,
             unique_scores=unique_scores,
-            num_prefetched_keys=num_prefetched_keys,
-            outstanding_keys_ref=outstanding_keys_ref,
             value_row_indices=value_row_indices,
             key_map_generation=key_map_generation,
             table_gate=table_gate,
@@ -1162,7 +1139,6 @@ def dynamicemb_eval_forward(
     with torch.cuda.nvtx.range("dynamicemb_eval_forward"):
         table_num = feature_offsets.numel() - 1
         assert table_num != 0
-        emb_dtype = storage.embedding_dtype()
 
         is_pooling = layout.is_pooling
 
@@ -1185,6 +1161,11 @@ def dynamicemb_eval_forward(
                 initializer,
                 cache=cache,
             )
+            # Decode first: the allocator's copies below only convert dtypes, so
+            # an fp8 table's stored codes (256x the weights) would be copied out.
+            # Always: for any other table this is a ``.to`` that returns the
+            # tensor itself when the dtype already matches.
+            output_embs = decode_table_values(output_embs, output_dtype)
             alloc = (
                 output_alloc(*layout.sequence_shape(), output_dtype)
                 if output_alloc is not None
@@ -1195,8 +1176,6 @@ def dynamicemb_eval_forward(
                 if out_rows is None:
                     return out.copy_(output_embs)
                 return out.index_copy_(0, out_rows.long(), output_embs.to(out.dtype))
-            if output_dtype != emb_dtype:
-                output_embs = output_embs.to(output_dtype)
             return output_embs
 
         frequency_counts_int64 = (
@@ -1376,9 +1355,8 @@ def place_lookup_output(output: torch.Tensor, output_alloc: Optional[OutputAlloc
     The returned map must also be passed to gradient reduction. An inactive
     allocator returns None for native/fallback calls.
     """
-    alloc = (
-        output_alloc(*output.shape, output.dtype) if output_alloc is not None else None
-    )
+    rows, cols = output.shape
+    alloc = output_alloc(rows, cols, output.dtype) if output_alloc is not None else None
     if alloc is None:
         return output, None
     out, row_map = alloc
@@ -1466,6 +1444,7 @@ class DynamicEmbeddingFunction(torch.autograd.Function):
                 )
                 borrowed = (
                     native_lookup is not None
+                    and emb_dtype != FP8_STORAGE_DTYPE
                     and prefetch_state.table_num == 1
                     and prefetch_state.non_admitted_positions is None
                     and not is_pooling
@@ -1524,11 +1503,13 @@ class DynamicEmbeddingFunction(torch.autograd.Function):
                 unique_embs = unique_values[:, :max_emb_dim]
 
             if native_lookup is not None:
+                if emb_dtype == FP8_STORAGE_DTYPE:
+                    unique_embs = decode_table_values(unique_embs, output_dtype)
                 lookup_indices = prefetch_state.occurrence_rows
                 if borrowed and lookup_indices is None:
-                    lookup_indices = prefetch_state.value_row_indices[
-                        prefetch_state.reverse_indices
-                    ]
+                    lookup_indices = cast(
+                        torch.Tensor, prefetch_state.value_row_indices
+                    )[prefetch_state.reverse_indices]
                 output_embs = native_lookup(
                     unique_embs,
                     prefetch_state,
@@ -1622,8 +1603,6 @@ class DynamicEmbeddingFunction(torch.autograd.Function):
             ctx.use_counter = use_counter
             ctx.unique_values = unique_values
             ctx.persisted_unique_indices = persisted_unique_indices
-            ctx.outstanding_keys_ref = prefetch_state.outstanding_keys_ref
-            ctx.num_prefetched_keys = prefetch_state.num_prefetched_keys
 
             ctx.prefetch_state = prefetch_state
             ctx.input_count = len(ctx.needs_input_grad)
@@ -1691,7 +1670,9 @@ class DynamicEmbeddingFunction(torch.autograd.Function):
                     refresh_slots_after_rehash(state, ctx)
                     with torch.cuda.nvtx.range("op:optimizer_update_fused"):
                         optimizer.fused_update_for_flat_table(
-                            unique_grads.to(ctx.emb_dtype),
+                            unique_grads.to(
+                                gradient_dtype(ctx.emb_dtype, unique_grads.dtype)
+                            ),
                             # Writes into the value buffer -> rows.
                             ctx.update_value_rows,
                             state.table_ptrs_dev,
@@ -1716,7 +1697,9 @@ class DynamicEmbeddingFunction(torch.autograd.Function):
                     all_dims_vec4 = storage.all_dims_vec4()
                     with torch.cuda.nvtx.range("op:optimizer_update_padded"):
                         optimizer.update_for_padded_buffer(
-                            unique_grads,
+                            unique_grads.to(
+                                gradient_dtype(ctx.emb_dtype, unique_grads.dtype)
+                            ),
                             ctx.unique_values,
                             unique_table_ids,
                             table_emb_dims,
