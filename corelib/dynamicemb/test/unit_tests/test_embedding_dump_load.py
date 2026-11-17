@@ -558,7 +558,11 @@ def check_counter_table_checkpoint(x, y):
 
 
 def owns_key(
-    key: int, rank: int, world_size: int, dist_type: str, num_embeddings: int
+    key: int,
+    rank: int,
+    world_size: int,
+    dist_type: str,
+    num_embeddings: Optional[int] = None,
 ) -> bool:
     """Whether *rank* is the one holding *key*, under the rule the model uses.
 
@@ -583,6 +587,8 @@ def owns_key(
     if dist_type == "hash_roundrobin":
         return int(murmur3_fmix64(key)) % world_size == rank
     if dist_type == "hash_bucket":
+        if num_embeddings is None:
+            raise ValueError("owns_key: hash_bucket needs the table's num_embeddings")
         shard_capacity = get_sharded_table_capacity(
             EmbeddingConfig(
                 name="owns_key",

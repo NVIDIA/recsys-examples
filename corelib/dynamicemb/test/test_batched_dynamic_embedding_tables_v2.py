@@ -2679,7 +2679,11 @@ def test_multi_table_dump_load_preserves_dist_type(dist_type, tmp_path):
     torch.testing.assert_close(vals0_src[idx0_src], vals0_dst[idx0_dst])
 
 
-def test_multi_table_load_rejects_dist_type_mismatch(tmp_path):
+def test_multi_table_load_dist_type_mismatch_warns_and_repartitions(tmp_path):
+    """A checkpoint of another key -> rank rule still loads: ownership is
+    recomputed from the key by the table's rule, and shard 0 warns that rows may
+    be lost where a bucket overflows. Only ``continuous`` is refused
+    (test_global_bucket_layout.py::test_continuous_checkpoint_is_refused)."""
     import torch.distributed as dist
 
     assert torch.cuda.is_available()
@@ -2732,7 +2736,7 @@ def test_multi_table_load_rejects_dist_type_mismatch(tmp_path):
         device_id,
         dist_type="hash_roundrobin",
     )
-    with pytest.raises(ValueError, match="Input dist_type mismatch"):
+    with pytest.warns(UserWarning, match="differs from the table's"):
         bdeb_dst.load(save_dir)
 
 
