@@ -598,6 +598,25 @@ class MultiTableAdmitter(abc.ABC):
             torch.Tensor: Boolean mask over `keys`, True where admitted.
         """
 
+    def admit_with_counts(
+        self,
+        keys: torch.Tensor,
+        table_ids: torch.Tensor,
+        frequencies: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """:meth:`admit`, plus the count each key was admitted on.
+
+        An admitter that counts occurrences across steps may return, for every
+        key, its running total (this batch included); a frequency-scored table
+        then starts an admitted key from that total instead of from this
+        batch's increment alone. The default keeps no count and returns None.
+
+        Returns:
+            Tuple[torch.Tensor, Optional[torch.Tensor]]: The mask of
+            :meth:`admit`, and an int64 tensor over `keys` or None.
+        """
+        return self.admit(keys, table_ids, frequencies), None
+
     def state(self) -> Optional[Counter]:
         """Persistent state the framework has to carry, or None.
 

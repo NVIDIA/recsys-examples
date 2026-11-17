@@ -16,7 +16,7 @@
 
 import math
 import warnings
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import torch
 from dynamicemb.initializer import MultiTableInitializer
@@ -200,6 +200,14 @@ class FrequencyAdmissionStrategy(AdmissionStrategy):
         How to initialize the rows this rejects. None -- the default -- leaves
         them to the table's own initializer, which is also the only way to get
         bounds derived from a table's row count.
+    carry_count : bool
+        Start an admitted key's score from the occurrences counted while it
+        waited (this batch included) instead of from this batch's alone, so it
+        ranks as if it had been in the table since it was first seen. Only for
+        tables whose eviction is LFU, including the compound (TIMESTAMP, LFU);
+        any other table rejects it. Off by default. When on, the counting does
+        not go through :meth:`MultiTableFrequencyAdmitter.admit`, so a subclass
+        that overrides only that method is bypassed.
     """
 
     def __init__(
@@ -207,6 +215,7 @@ class FrequencyAdmissionStrategy(AdmissionStrategy):
         threshold: int,
         counter: Optional[KVCounter] = None,
         initializer_args: Optional[DynamicEmbInitializerArgs] = None,
+        carry_count: bool = False,
     ):
         if threshold < 0:
             raise ValueError(f"Threshold must be non-negative, got {threshold}")
@@ -220,6 +229,7 @@ class FrequencyAdmissionStrategy(AdmissionStrategy):
         self.threshold = threshold
         self.counter = counter
         self.initializer_args = initializer_args
+        self.carry_count = carry_count
 
     def get_grouped_key(self):
         # The threshold decides for a whole batch at once, so tables sharing a
@@ -231,6 +241,7 @@ class FrequencyAdmissionStrategy(AdmissionStrategy):
             self.threshold,
             group_key_of(self.initializer_args),
             group_key_of(self.counter),
+            self.carry_count,
         )
 
     @classmethod
@@ -250,6 +261,7 @@ class FrequencyAdmissionStrategy(AdmissionStrategy):
             non_admitted_initializer=_non_admitted_initializer(
                 table_strategies, device
             ),
+            carry_count=first.carry_count,
         )
 
 
@@ -261,10 +273,12 @@ class MultiTableFrequencyAdmitter(MultiTableAdmitter):
         threshold: int,
         counter: Counter,
         non_admitted_initializer=None,
+        carry_count: bool = False,
     ):
         self._threshold = threshold
         self._counter = counter
         self._non_admitted_initializer = non_admitted_initializer
+        self._carry_count = carry_count
 
     def admit(
         self,
@@ -272,6 +286,24 @@ class MultiTableFrequencyAdmitter(MultiTableAdmitter):
         table_ids: torch.Tensor,
         frequencies: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        return self._count_and_admit(keys, table_ids, frequencies)[0]
+
+    def admit_with_counts(
+        self,
+        keys: torch.Tensor,
+        table_ids: torch.Tensor,
+        frequencies: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        if not self._carry_count:
+            return self.admit(keys, table_ids, frequencies), None
+        return self._count_and_admit(keys, table_ids, frequencies)
+
+    def _count_and_admit(
+        self,
+        keys: torch.Tensor,
+        table_ids: torch.Tensor,
+        frequencies: Optional[torch.Tensor],
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         if frequencies is None:
             frequencies = torch.ones(
                 keys.shape[0], dtype=torch.int64, device=keys.device
@@ -294,7 +326,7 @@ class MultiTableFrequencyAdmitter(MultiTableAdmitter):
         )
         if admitted_keys.numel() > 0:
             self._counter.erase(admitted_keys, admitted_table_ids)
-        return admit_mask
+        return admit_mask, accumulated
 
     def state(self) -> Optional[Counter]:
         return self._counter

@@ -901,6 +901,16 @@ class DynamicEmbTableOptions:
                 "admit_strategy: both are decided per key from the input, and a "
                 "key's score is not its occurrence count."
             )
+        if (
+            getattr(self.admit_strategy, "carry_count", False)
+            and get_eviction_score_strategy(self.score_strategy)
+            != DynamicEmbScoreStrategy.LFU
+        ):
+            raise ValueError(
+                "FrequencyAdmissionStrategy(carry_count=True) needs a table that "
+                "evicts by LFU (score_strategy LFU or (TIMESTAMP, LFU)): only then "
+                f"is the score an occurrence count; got {self.score_strategy}."
+            )
 
     @property
     def takes_score_per_key(self) -> bool:

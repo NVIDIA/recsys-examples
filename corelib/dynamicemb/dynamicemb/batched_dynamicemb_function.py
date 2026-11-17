@@ -287,6 +287,31 @@ def _is_hbm_storage(storage: Storage) -> bool:
     )
 
 
+def _admit_and_carry_counts(
+    admitter: MultiTableAdmitter,
+    keys: torch.Tensor,
+    table_ids: torch.Tensor,
+    frequencies: Optional[torch.Tensor],
+    scores: Optional[torch.Tensor],
+    scores_are_frequencies: bool,
+    rows: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Admit ``keys`` and, on a frequency-scored table, write each admitted key's count into ``scores``.
+
+    ``rows`` says where ``keys`` sit in ``scores``; None means at the same positions.
+    Returns the admission mask over ``keys``.
+    """
+    admit_mask, counts = admitter.admit_with_counts(keys, table_ids, frequencies)
+    if counts is not None and scores is not None and scores_are_frequencies:
+        current = scores if rows is None else scores[rows]
+        carried = torch.where(admit_mask, counts.to(scores.dtype), current)
+        if rows is None:
+            scores.copy_(carried)
+        else:
+            scores[rows] = carried
+    return admit_mask
+
+
 def _apply_admission(
     missing_keys: torch.Tensor,
     missing_indices: torch.Tensor,
@@ -298,6 +323,7 @@ def _apply_admission(
     max_emb_dim: int,
     freq_for_admission: Optional[torch.Tensor],
     admitter: Optional[MultiTableAdmitter],
+    scores_are_frequencies: bool = False,
 ) -> Tuple[
     torch.Tensor, Optional[torch.Tensor], torch.Tensor, torch.Tensor, torch.Tensor
 ]:
@@ -324,7 +350,14 @@ def _apply_admission(
                 missing_indices,
             )
 
-        admit_mask = admitter.admit(missing_keys, missing_table_ids, freq_for_admission)
+        admit_mask = _admit_and_carry_counts(
+            admitter,
+            missing_keys,
+            missing_table_ids,
+            freq_for_admission,
+            missing_scores,
+            scores_are_frequencies,
+        )
         non_admitted_initializer = admitter.non_admitted_initializer
 
         non_admitted_mask = ~admit_mask
@@ -596,7 +629,15 @@ def _prefetch_cache_path(
                     (new_keys, new_tids, new_freq, new_pos),
                 ) = flagged_compact(is_new, [miss_keys, miss_tids, miss_freq, miss_pos])
             if num_new > 0:
-                admit_mask = admitter.admit(new_keys, new_tids, new_freq)
+                admit_mask = _admit_and_carry_counts(
+                    admitter,
+                    new_keys,
+                    new_tids,
+                    new_freq,
+                    miss_score_input,
+                    storage._state.evict_strategy == EvictStrategy.KLfu,
+                    rows=new_rows,
+                )
                 admitted[new_rows] = admit_mask
                 with torch.cuda.nvtx.range("op:flagged_compact"):
                     num_refused, _, (refused_pos,) = flagged_compact(
@@ -777,8 +818,13 @@ def _prefetch_hbm_direct_path(
                 if accumulated_frequency is not None
                 else None
             )
-            admit_mask = admitter.admit(
-                missing_keys, missing_table_ids, freq_for_admission
+            admit_mask = _admit_and_carry_counts(
+                admitter,
+                missing_keys,
+                missing_table_ids,
+                freq_for_admission,
+                missing_scores,
+                state.evict_strategy == EvictStrategy.KLfu,
             )
 
             admitted_keys = missing_keys[admit_mask]
@@ -1210,6 +1256,7 @@ def _generic_forward_path(
             max_emb_dim,
             freq_for_admission,
             admitter,
+            scores_are_frequencies=evict_strategy == EvictStrategy.KLfu,
         )
 
         if indices_to_init.numel() > 0:

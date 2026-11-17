@@ -99,13 +99,15 @@ def get_optimizer_kwargs(optimizer_type: str) -> Dict[str, Any]:
         raise ValueError("unknown optimizer type")
 
 
-def get_score_strategy(score_strategy_str: str) -> DynamicEmbScoreStrategy:
+def get_score_strategy(score_strategy_str: str) -> ScoreStrategy:
     if score_strategy_str == "timestamp":
         return DynamicEmbScoreStrategy.TIMESTAMP
     elif score_strategy_str == "step":
         return DynamicEmbScoreStrategy.STEP
     elif score_strategy_str == "lfu":
         return DynamicEmbScoreStrategy.LFU
+    elif score_strategy_str == "lru_lfu":
+        return (DynamicEmbScoreStrategy.TIMESTAMP, DynamicEmbScoreStrategy.LFU)
     else:
         raise ValueError(f"Invalid score strategy: {score_strategy_str}")
 
