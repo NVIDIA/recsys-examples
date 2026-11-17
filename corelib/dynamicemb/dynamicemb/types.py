@@ -398,14 +398,15 @@ class Cache(abc.ABC):
         keys: torch.Tensor,
         table_ids: torch.Tensor,
         scores: Optional[torch.Tensor] = None,
-    ) -> Tuple[
-        torch.Tensor, int, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
-    ]:
+        report_refused: bool = False,
+    ) -> Tuple:
         """Insert with counter-aware eviction and overflow fallback.
 
         Returns:
             indices, num_evicted, evicted_keys, evicted_indices,
-            evicted_scores, evicted_table_ids.
+            evicted_scores, evicted_table_ids; with ``report_refused``, then
+            num_refused: the keys it could not place (among the evicted ones,
+            with a negative index), known on the host once num_evicted is.
         """
         ...
 
