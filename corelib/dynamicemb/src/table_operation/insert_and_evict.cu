@@ -18,13 +18,17 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 #include "jit/jit_link.h"
 #include "kernels.cuh"
 #include "table.cuh"
+#include <type_traits>
 
 namespace dyn_emb {
 
 // Converts per-table slot_indices (and optional table_ids) to flat counter
-// index inside the kernel and adds delta. No atomic: caller guarantees no
-// two threads write the same counter element (e.g. slot_indices from unique
-// keys).
+// index inside the kernel and adds delta. Atomic: within one launch the slots
+// come from unique keys, but launches on different streams can overlap on the
+// same slot -- under TorchRec's prefetch pipeline the prefetch of batch i+1
+// pins (prefetch stream) while the backward of batch i unpins (default
+// stream), with nothing ordering the two, and a key in both batches would
+// otherwise lose one of the updates.
 __global__ void update_counter_with_layout_kernel(
     int32_t *__restrict__ counter, int64_t total_capacity,
     int64_t const *__restrict__ slot_indices, int64_t n, int32_t delta,
@@ -56,12 +60,13 @@ __global__ void update_counter_with_layout_kernel(
     }
   }
   if (flat >= 0 && flat < total_capacity) {
-    counter[flat] += delta;
+    atomicAdd(&counter[flat], delta);
   }
 }
 
 template <typename Table, ScorePolicyType PolicyTypeV, bool OutputScoreV,
-          int CompactTileSize, bool EnableOverflowV = false>
+          int CompactTileSize, bool EnableOverflowV = false,
+          bool ReportRefusedV = false>
 void launch_table_insert_and_evict_kernel(
     Table table, int64_t *table_bucket_offsets_ptr, int *bucket_sizes_ptr,
     int64_t num_total, typename Table::KeyType *keys_ptr,
@@ -73,10 +78,15 @@ void launch_table_insert_and_evict_kernel(
     int64_t *evicted_table_ids_ptr, int32_t *counter_ptr, cudaStream_t stream,
     Table ovf_table = Table(), int *ovf_bucket_sizes_ptr = nullptr,
     int32_t *ovf_counter_ptr = nullptr,
-    int64_t *ovf_output_offsets_ptr = nullptr, int64_t score_fn_key = 0) {
+    int64_t *ovf_output_offsets_ptr = nullptr, int64_t score_fn_key = 0,
+    int64_t *refused_ptr = nullptr) {
   constexpr int BLOCK_SIZE = 256;
 
   if constexpr (PolicyTypeV == ScorePolicyType::LruLfu) {
+    // The cache ranks by timestamp, so it never takes this path.
+    TORCH_CHECK(!ReportRefusedV,
+                "table_insert_and_evict: the LruLfu insert does not report "
+                "the keys it refuses");
     // LruLfu (num_scores == 2) routes eviction through the driver-launched cubin
     // (default Lex cubin when score_fn_key == 0, else the nvJitLink-linked custom
     // cubin). The scan/insert/overflow logic is the shared insert_and_evict_body;
@@ -114,7 +124,7 @@ void launch_table_insert_and_evict_kernel(
   } else {
     using KernelTraits =
         InsertKernelTraits<BLOCK_SIZE, 1, 1, CompactTileSize, 8, PolicyTypeV,
-                           OutputScoreV, EnableOverflowV>;
+                           OutputScoreV, EnableOverflowV, ReportRefusedV>;
     table_insert_and_evict_kernel<Table, KernelTraits>
         <<<(num_total + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE, 0, stream>>>(
             table, table_bucket_offsets_ptr, bucket_sizes_ptr, num_total,
@@ -122,7 +132,8 @@ void launch_table_insert_and_evict_kernel(
             score_input_ptr, score_output_ptr, table_key_slots_ptr,
             evict_counter_ptr, evicted_keys_ptr, evicted_scores_ptr,
             evicted_indices_ptr, evicted_table_ids_ptr, counter_ptr, ovf_table,
-            ovf_bucket_sizes_ptr, ovf_counter_ptr, ovf_output_offsets_ptr);
+            ovf_bucket_sizes_ptr, ovf_counter_ptr, ovf_output_offsets_ptr,
+            refused_ptr);
   }
 
   table_unlock_kernel<Table>
@@ -253,9 +264,14 @@ static void table_insert_and_evict_with_counter_and_overflow_single_score(
     at::Tensor evicted_scores, at::Tensor evicted_table_ids, at::Tensor counter,
     at::Tensor ovf_storage, int64_t ovf_bucket_capacity,
     at::Tensor ovf_bucket_sizes, at::Tensor ovf_counter,
-    at::Tensor ovf_output_offsets, int64_t num_scores, int64_t score_fn_key) {
+    at::Tensor ovf_output_offsets, int64_t num_scores, int64_t score_fn_key,
+    std::optional<at::Tensor> refused) {
 
   auto key_type = get_data_type(keys);
+  // The flag sits in pinned host memory, which unified addressing maps at its
+  // host address: the kernel writes it there, and the host reads it once it
+  // has waited for the insert.
+  int64_t *refused_ptr = get_pointer<int64_t>(refused);
 
   ScoreType *score_input_ptr = nullptr;
   at::Tensor score_input_tensor;
@@ -321,49 +337,63 @@ static void table_insert_and_evict_with_counter_and_overflow_single_score(
     auto ovf_table = Table(reinterpret_cast<uint8_t *>(ovf_storage.data_ptr()),
                            ovf_num_buckets, ovf_bucket_capacity, num_scores);
 
-    DISPATCH_SCORE_POLICY(policy_type, PolicyTypeV, [&] {
-      if (num_total % 32 == 0) {
-        if (output_score) {
-          launch_table_insert_and_evict_kernel<Table, PolicyTypeV, true, 32,
-                                               true>(
-              table, table_bucket_offsets_ptr, bucket_sizes_, num_total, keys_,
-              table_ids_ptr, insert_results_ptr, indices_ptr, score_input_ptr,
-              score_output_ptr, table_key_slots_, evict_counter_, evicted_keys_,
-              evicted_scores_ptr, evicted_indices_, evicted_table_ids_ptr,
-              counter_ptr, stream, ovf_table, ovf_bucket_sizes_,
-              ovf_counter_ptr, ovf_output_offsets_ptr, score_fn_key);
+    // Flagging a refused key is a variant of the kernel of its own, so that an
+    // insert that is not asked to pays nothing.
+    auto launch = [&](auto report_refused) {
+      constexpr bool ReportRefusedV = decltype(report_refused)::value;
+      DISPATCH_SCORE_POLICY(policy_type, PolicyTypeV, [&] {
+        if (num_total % 32 == 0) {
+          if (output_score) {
+            launch_table_insert_and_evict_kernel<Table, PolicyTypeV, true, 32,
+                                                 true, ReportRefusedV>(
+                table, table_bucket_offsets_ptr, bucket_sizes_, num_total,
+                keys_, table_ids_ptr, insert_results_ptr, indices_ptr,
+                score_input_ptr, score_output_ptr, table_key_slots_,
+                evict_counter_, evicted_keys_, evicted_scores_ptr,
+                evicted_indices_, evicted_table_ids_ptr, counter_ptr, stream,
+                ovf_table, ovf_bucket_sizes_, ovf_counter_ptr,
+                ovf_output_offsets_ptr, score_fn_key, refused_ptr);
+          } else {
+            launch_table_insert_and_evict_kernel<Table, PolicyTypeV, false, 32,
+                                                 true, ReportRefusedV>(
+                table, table_bucket_offsets_ptr, bucket_sizes_, num_total,
+                keys_, table_ids_ptr, insert_results_ptr, indices_ptr,
+                score_input_ptr, nullptr, table_key_slots_, evict_counter_,
+                evicted_keys_, evicted_scores_ptr, evicted_indices_,
+                evicted_table_ids_ptr, counter_ptr, stream, ovf_table,
+                ovf_bucket_sizes_, ovf_counter_ptr, ovf_output_offsets_ptr,
+                score_fn_key, refused_ptr);
+          }
         } else {
-          launch_table_insert_and_evict_kernel<Table, PolicyTypeV, false, 32,
-                                               true>(
-              table, table_bucket_offsets_ptr, bucket_sizes_, num_total, keys_,
-              table_ids_ptr, insert_results_ptr, indices_ptr, score_input_ptr,
-              nullptr, table_key_slots_, evict_counter_, evicted_keys_,
-              evicted_scores_ptr, evicted_indices_, evicted_table_ids_ptr,
-              counter_ptr, stream, ovf_table, ovf_bucket_sizes_,
-              ovf_counter_ptr, ovf_output_offsets_ptr, score_fn_key);
+          if (output_score) {
+            launch_table_insert_and_evict_kernel<Table, PolicyTypeV, true, 1,
+                                                 true, ReportRefusedV>(
+                table, table_bucket_offsets_ptr, bucket_sizes_, num_total,
+                keys_, table_ids_ptr, insert_results_ptr, indices_ptr,
+                score_input_ptr, score_output_ptr, table_key_slots_,
+                evict_counter_, evicted_keys_, evicted_scores_ptr,
+                evicted_indices_, evicted_table_ids_ptr, counter_ptr, stream,
+                ovf_table, ovf_bucket_sizes_, ovf_counter_ptr,
+                ovf_output_offsets_ptr, score_fn_key, refused_ptr);
+          } else {
+            launch_table_insert_and_evict_kernel<Table, PolicyTypeV, false, 1,
+                                                 true, ReportRefusedV>(
+                table, table_bucket_offsets_ptr, bucket_sizes_, num_total,
+                keys_, table_ids_ptr, insert_results_ptr, indices_ptr,
+                score_input_ptr, nullptr, table_key_slots_, evict_counter_,
+                evicted_keys_, evicted_scores_ptr, evicted_indices_,
+                evicted_table_ids_ptr, counter_ptr, stream, ovf_table,
+                ovf_bucket_sizes_, ovf_counter_ptr, ovf_output_offsets_ptr,
+                score_fn_key, refused_ptr);
+          }
         }
-      } else {
-        if (output_score) {
-          launch_table_insert_and_evict_kernel<Table, PolicyTypeV, true, 1,
-                                               true>(
-              table, table_bucket_offsets_ptr, bucket_sizes_, num_total, keys_,
-              table_ids_ptr, insert_results_ptr, indices_ptr, score_input_ptr,
-              score_output_ptr, table_key_slots_, evict_counter_, evicted_keys_,
-              evicted_scores_ptr, evicted_indices_, evicted_table_ids_ptr,
-              counter_ptr, stream, ovf_table, ovf_bucket_sizes_,
-              ovf_counter_ptr, ovf_output_offsets_ptr, score_fn_key);
-        } else {
-          launch_table_insert_and_evict_kernel<Table, PolicyTypeV, false, 1,
-                                               true>(
-              table, table_bucket_offsets_ptr, bucket_sizes_, num_total, keys_,
-              table_ids_ptr, insert_results_ptr, indices_ptr, score_input_ptr,
-              nullptr, table_key_slots_, evict_counter_, evicted_keys_,
-              evicted_scores_ptr, evicted_indices_, evicted_table_ids_ptr,
-              counter_ptr, stream, ovf_table, ovf_bucket_sizes_,
-              ovf_counter_ptr, ovf_output_offsets_ptr, score_fn_key);
-        }
-      }
-    });
+      });
+    };
+    if (refused_ptr != nullptr) {
+      launch(std::true_type{});
+    } else {
+      launch(std::false_type{});
+    }
   });
   DEMB_CUDA_KERNEL_LAUNCH_CHECK();
 }
@@ -384,7 +414,19 @@ table_insert_and_evict(at::Tensor table_storage,
                        std::optional<at::Tensor> ovf_bucket_sizes,
                        std::optional<at::Tensor> ovf_counter,
                        std::optional<at::Tensor> ovf_output_offsets,
-                       int64_t num_scores, int64_t score_fn_key) {
+                       int64_t num_scores, int64_t score_fn_key,
+                       std::optional<at::Tensor> refused) {
+
+  bool use_overflow = ovf_storage.has_value() && ovf_storage.value().defined();
+  TORCH_CHECK(!refused.has_value() || use_overflow,
+              "table_insert_and_evict: refused is flagged by the insert with "
+              "overflow only");
+  TORCH_CHECK(!refused.has_value() ||
+                  (!refused->is_cuda() && refused->is_pinned() &&
+                   refused->scalar_type() == at::kLong &&
+                   refused->numel() >= 1),
+              "table_insert_and_evict: refused must be an int64 tensor in "
+              "pinned host memory");
 
   int64_t num_total = keys.size(0);
   if (num_total == 0) {
@@ -416,8 +458,6 @@ table_insert_and_evict(at::Tensor table_storage,
   at::Tensor evicted_table_ids =
       torch::empty({num_total}, keys.options().dtype(torch::kLong));
 
-  bool use_overflow = ovf_storage.has_value() && ovf_storage.value().defined();
-
   if (use_overflow) {
     TORCH_CHECK(counter.has_value(),
                 "table_insert_and_evict with overflow needs a ref counter");
@@ -427,7 +467,7 @@ table_insert_and_evict(at::Tensor table_storage,
         score_output, num_evicted, evicted_keys, evicted_indices,
         evicted_scores, evicted_table_ids, counter.value(), ovf_storage.value(),
         ovf_bucket_capacity, ovf_bucket_sizes.value(), ovf_counter.value(),
-        ovf_output_offsets.value(), num_scores, score_fn_key);
+        ovf_output_offsets.value(), num_scores, score_fn_key, refused);
   } else {
     table_insert_and_evict_single_score(
         table_storage, table_bucket_offsets, bucket_capacity, bucket_sizes,
