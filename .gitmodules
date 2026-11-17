@@ -11,3 +11,7 @@
 [submodule "third_party/nv-embedding-cache"]
 	path = third_party/nv-embedding-cache
 	url = https://github.com/NVIDIA/nv-embedding-cache.git
+[submodule "third_party/DeepGEMM"]
+	path = third_party/DeepGEMM
+	url = https://github.com/deepseek-ai/DeepGEMM.git
+	branch = nv_dev
