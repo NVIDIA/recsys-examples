@@ -131,7 +131,7 @@ void bind_table_operation(py::module &m) {
         py::arg("ovf_bucket_sizes") = py::none(),
         py::arg("ovf_counter") = py::none(),
         py::arg("ovf_output_offsets") = py::none(), py::arg("num_scores") = 1,
-        py::arg("score_fn_key") = 0);
+        py::arg("score_fn_key") = 0, py::arg("refused") = py::none());
 
   m.def("table_erase", &dyn_emb::table_erase, "erase keys from the table",
         py::arg("table_storage"), py::arg("table_bucket_offsets"),
