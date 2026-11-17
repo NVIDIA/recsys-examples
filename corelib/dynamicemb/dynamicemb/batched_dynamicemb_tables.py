@@ -64,7 +64,7 @@ from dynamicemb.dynamicemb_config import (
     score_strategy_has_timestamp_column,
     warning_for_cstm_score,
 )
-from dynamicemb.initializer import MultiTableInitializer
+from dynamicemb.initializer import MultiTableInitializer, fp8_out_of_range_risk
 from dynamicemb.key_ownership import owned_key_mask, owned_keys
 from dynamicemb.key_value_table import (
     ERASE_CHUNK_SLOTS,
@@ -93,7 +93,13 @@ from dynamicemb.optimizer import (
 from dynamicemb.resolved_storage import ActiveStorageRows
 from dynamicemb.torchrec_lookup import TorchRecLookup
 from dynamicemb.types import ReplayStats
-from dynamicemb.utils import DTYPE_NUM_BYTES
+from dynamicemb.utils import (
+    DTYPE_NUM_BYTES,
+    FP8_MAX_VALUE,
+    FP8_STORAGE_DTYPE,
+    checkpoint_dtype,
+    decode_table_values,
+)
 from dynamicemb_extensions import device_timestamp
 from fbgemm_gpu.split_table_batched_embeddings_ops_training import (
     BoundsCheckMode,
@@ -510,12 +516,19 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
         self.initializer_args = table_option.initializer_args
         self.index_type = table_option.index_type
         self.embedding_dtype = table_option.embedding_dtype
+        if output_dtype == FP8_STORAGE_DTYPE:
+            # fp8 is a storage format here: the lookup kernels write that dtype
+            # as its stored codes, 256x the weights, which no consumer expects.
+            raise ValueError(
+                "output_dtype=torch.float8_e4m3fn is not supported: fp8 is only "
+                "a table storage dtype. Use torch.float32, torch.float16 or "
+                "torch.bfloat16 for the output."
+            )
         self.output_dtype = output_dtype
         self.pooling_mode = pooling_mode
         self.use_index_dedup = use_index_dedup
         self._enable_prefetch = prefetch_pipeline
         self.prefetch_stream = None
-        self._prefetch_outstanding_keys = torch.tensor(0, dtype=torch.int64)
         # Who may touch the tables now: prefetch, and an erase running beside the
         # training. See async_erase.py.
         self._table_gate = TableAccessGate()
@@ -674,7 +687,7 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                 10,
                 requires_grad=True,
                 device=torch.device(self.device_id),
-                dtype=self.embedding_dtype,
+                dtype=checkpoint_dtype(self.embedding_dtype),
             )
         )
 
@@ -881,6 +894,16 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
         unbounded UNIFORM resolves against each table's num_embeddings.
         """
         device = torch.device(f"cuda:{self.device_id}")
+        if self.embedding_dtype == FP8_STORAGE_DTYPE:
+            for name, option in zip(self._table_names, self._dynamicemb_options):
+                risk = fp8_out_of_range_risk(option.initializer_args)
+                if risk is not None:
+                    warnings.warn(
+                        f"Table {name} stores fp8 weights, which hold values "
+                        f"up to +-{FP8_MAX_VALUE:g} and saturate larger ones "
+                        f"to it without notice, but it has a {risk}: some "
+                        f"initial weights may be clipped."
+                    )
         self._initializer = MultiTableInitializer.create(
             [option.initializer_args for option in self._dynamicemb_options], device
         )
@@ -1069,7 +1092,9 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
         for t, _ in enumerate(self._dynamicemb_options):
             splits.append(
                 torch.empty(
-                    (1, 1), device=torch.device("cuda"), dtype=self.embedding_dtype
+                    (1, 1),
+                    device=torch.device("cuda"),
+                    dtype=checkpoint_dtype(self.embedding_dtype),
                 )
             )
         return splits
@@ -1081,7 +1106,6 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
     def reset_cache_states(self) -> None:
         if self._caching and self._cache is not None:
             self._cache.reset()
-            self._prefetch_outstanding_keys.zero_()
 
     @property
     def table_names(self) -> List[str]:
@@ -1223,7 +1247,9 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
             state.record_stream(torch.cuda.current_stream(self.device_id))
             with torch.no_grad():
                 output = self._native_lookup(
-                    state.unique_values,
+                    decode_table_values(state.unique_values, self.output_dtype)
+                    if self.embedding_dtype == FP8_STORAGE_DTYPE
+                    else state.unique_values,
                     state,
                     offsets,
                     self.output_dtype,
@@ -1264,7 +1290,7 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                     self._admitter,
                     self._evict_strategy,
                     pooling_weights,
-                    self._native_lookup,
+                    self._native_lookup if prefetch_state.prepared_for_lookup else None,
                     self._empty_tensor,
                     self.output_alloc,
                 )
@@ -1345,6 +1371,7 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
             frequency_counters=frequency_counters,
             scores=scores,
         )
+        state.prepared_for_lookup = False
         self._prefetch_states.append(state)
 
     def resolve_input(
@@ -1355,14 +1382,14 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
         batch_size_per_feature_per_rank: Optional[List[List[int]]] = None,
         frequency_counters: Optional[Tensor] = None,
         scores: Optional[Tensor] = None,
-        resolve_occurrence_rows: bool = False,
     ) -> PrefetchState:
         """Prepare a batch without putting it in the legacy prefetch FIFO.
 
         The caller owns the returned state and passes it explicitly to forward.
         HBM/cache states pin stable value rows. Other stores resolve into live
         batch-local rows shared with overlapping in-flight batches. Evaluation
-        resolves read-only rows. Every layout is consumed by TorchRec lookup.
+        resolves read-only rows. Explicit states use TorchRec lookup; raw/FIFO
+        calls retain the existing CUDA gather.
         Input distribution requests occurrence rows when it will construct a
         resolved KJT; raw/FIFO callers need not retain that extra array.
         """
@@ -1390,8 +1417,7 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                 self._table_gate,
             )
             state.input_frequencies = frequency_counters
-            if resolve_occurrence_rows:
-                state.occurrence_rows = state.reverse_indices
+            state.prepared_for_lookup = True
             return state
         # These checks used to precede prefetch in forward. Keep them before
         # input_dist can initialize rows or take pins as well.
@@ -1434,18 +1460,15 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
             self._evict_strategy,
             frequency_counters,
             self._admitter,
-            outstanding_keys_ref=self._prefetch_outstanding_keys
-            if self._cache is not None
-            else None,
             external_storage=self._external_storage,
             scores=scores,
             table_gate=self._table_gate,
             active_rows=self._active_rows,
             optimizer=self._optimizer,
-            resolve_occurrence_rows=resolve_occurrence_rows,
         )
         self._update_score()
         state.input_frequencies = frequency_counters
+        state.prepared_for_lookup = True
         return state
 
     def set_score(
@@ -1982,7 +2005,10 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
 
         if len(keys_list) == 0:
             return torch.empty(0, dtype=torch.int64, device=device), torch.empty(
-                0, 0, dtype=self._storage.embedding_dtype(), device=device
+                0,
+                0,
+                dtype=checkpoint_dtype(self._storage.embedding_dtype()),
+                device=device,
             )
         return torch.cat(keys_list), torch.cat(values_list, dim=0)
 

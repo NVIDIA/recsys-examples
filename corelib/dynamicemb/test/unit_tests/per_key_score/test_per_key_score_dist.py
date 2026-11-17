@@ -212,9 +212,14 @@ def check_train_pipeline_keeps_scores() -> None:
             FusedKJTListSplitsAwaitable([request], [ctx], None).wait()[0].wait()
         )
         for lookup, arrived in zip(sharded._lookups, distributed):
-            for group in arrived.split(lookup._feature_splits):
-                state = group.prefetch_state
-                assert torch.equal(state.unique_scores, state.unique_keys * 10 + 1)
+            if isinstance(arrived, ResolvedEmbeddingInput):
+                for group in arrived.split(lookup._feature_splits):
+                    state = group.prefetch_state
+                    assert torch.equal(state.unique_scores, state.unique_keys * 10 + 1)
+            else:
+                # Native transport is shared; this backend still resolves in lookup.
+                assert isinstance(arrived, ScoredKeyedJaggedTensor), type(arrived)
+                assert torch.equal(arrived.scores(), arrived.values() * 10 + 1)
             lookup.prefetch(arrived)
         result = sharded.compute_and_output_dist(ctx, distributed).wait()
         sum(jt.values().sum() for jt in result.values()).backward()

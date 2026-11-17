@@ -93,6 +93,8 @@ def _isolate_emulated_node_devices() -> None:
 if __name__ == "__main__":
     _isolate_emulated_node_devices()
 
+from unittest.mock import patch
+
 import torch
 import torch.distributed as dist
 import torchrec
@@ -109,6 +111,7 @@ from dynamicemb.planner import (
     DynamicEmbParameterConstraints,
 )
 from dynamicemb.shard import DynamicEmbeddingBagCollectionSharder
+from dynamicemb.shard.resolved_input import ResolvedEmbeddingInput
 from fbgemm_gpu.split_embedding_configs import EmbOptimType, SparseType
 from torch.distributed.elastic.multiprocessing.errors import record
 from torchrec.distributed.comm import get_local_size
@@ -324,7 +327,17 @@ def check_plan(args, device, rank, world_size) -> None:
 def _compare_forward(args, device, rank, world_size, bags=None) -> None:
     model, _ = _build(device, TRW, args.dist_type)
     keys = _rank_keys(rank, world_size)
-    out = model(_kjt(keys, device, bags)).to_dict()
+    sharded = model.module
+    context = sharded.create_context()
+    arrived = sharded.input_dist(context, _kjt(keys, device, bags)).wait().wait()
+    for lookup, features in zip(sharded._lookups, arrived):
+        if lookup._emb_modules:
+            assert isinstance(features, ResolvedEmbeddingInput)
+    with patch(
+        "dynamicemb.batched_dynamicemb_function._find_keys",
+        side_effect=AssertionError("TW-RW lookup hashed keys again"),
+    ):
+        out = sharded.compute_and_output_dist(context, arrived).wait().to_dict()
 
     trw_out = out[_feature(TRW_TABLE)]
     rw_out = out[_feature(RW_TABLE)]

@@ -131,7 +131,7 @@ void bind_table_operation(py::module &m) {
         py::arg("ovf_bucket_sizes") = py::none(),
         py::arg("ovf_counter") = py::none(),
         py::arg("ovf_output_offsets") = py::none(), py::arg("num_scores") = 1,
-        py::arg("score_fn_key") = 0);
+        py::arg("score_fn_key") = 0, py::arg("refused") = py::none());
 
   m.def("table_erase", &dyn_emb::table_erase, "erase keys from the table",
         py::arg("table_storage"), py::arg("table_bucket_offsets"),
@@ -208,18 +208,6 @@ void bind_table_operation(py::module &m) {
         py::arg("table_ids") = py::none(),
         py::arg("overflow_output_offsets") = py::none(),
         py::arg("overflow_bucket_capacity") = 0);
-
-  m.def("table_update_counter_and_project_rows",
-        &dyn_emb::table_update_counter_and_project_rows,
-        "update unique-slot counters and return occurrence value rows in one kernel",
-        py::arg("counter"), py::arg("slot_indices"), py::arg("delta"),
-        py::arg("table_bucket_offsets"), py::arg("bucket_capacity"),
-        py::arg("main_capacity"), py::arg("num_tables"),
-        py::arg("table_ids") = py::none(),
-        py::arg("overflow_output_offsets") = py::none(),
-        py::arg("overflow_bucket_capacity") = 0,
-        py::arg("value_rows") = py::none(),
-        py::arg("reverse_indices") = py::none());
 
   m.def("table_resolve_rows", &dyn_emb::table_resolve_rows,
         "map table-relative hash slots to the value rows they own, "

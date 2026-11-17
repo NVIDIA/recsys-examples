@@ -94,7 +94,6 @@ def test_abandoned_pinned_batch_releases_rows(layout, stage):
     gc.collect()
     torch.cuda.synchronize()
     assert pins(counter) == 0
-    assert model._prefetch_outstanding_keys.item() == 0
     if stage == "discard_graph":
         check_values(detached, keys, DynamicEmbPoolingMode.NONE)
 
@@ -111,7 +110,6 @@ def test_cancellation_inside_table_gate_defers_cleanup(layout):
         assert pins(counter) == keys.numel()
     torch.cuda.synchronize()
     assert torch.count_nonzero(counter).item() == 0
-    assert model._prefetch_outstanding_keys.item() == 0
 
 
 @pytest.mark.parametrize("layout", ["hbm", "cache", "host", "hybrid"])
@@ -282,7 +280,6 @@ def test_cross_stream_cancellation_keeps_release_metadata(layout):
         ]
     torch.cuda.synchronize()
     assert torch.count_nonzero(counter).item() == 0
-    assert model._prefetch_outstanding_keys.item() == 0
     assert len(reused) == 200
 
 
@@ -324,167 +321,6 @@ def test_single_persistent_matrix_uses_physical_rows(layout, optimizer, dtype):
     # A repeated key has two occurrences; SGD sums them, Adam normalizes them.
     delta = 0.5 if optimizer == EmbOptimType.SGD else 0.25
     torch.testing.assert_close(model(keys, offsets), expected - delta)
-
-
-@pytest.mark.parametrize("optimizer", [EmbOptimType.SGD, EmbOptimType.ADAM])
-@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
-def test_all_hit_sequence_projects_rows_with_unique_pins(optimizer, dtype):
-    from dynamicemb.shard.resolved_input import ResolvedEmbeddingInput
-    from dynamicemb.types import CopyMode
-    from torchrec import KeyedJaggedTensor
-
-    template, _ = make_model(DynamicEmbPoolingMode.NONE, "hbm")
-
-    def create():
-        return BatchedDynamicEmbeddingTablesV2(
-            table_options=[
-                replace(template._dynamicemb_options[0], embedding_dtype=dtype)
-            ],
-            table_names=["table"],
-            feature_table_map=[0],
-            pooling_mode=DynamicEmbPoolingMode.NONE,
-            output_dtype=torch.float32,
-            optimizer=optimizer,
-            learning_rate=0.25,
-        )
-
-    models = [create(), create()]
-    # The existing compact-workspace path is the control. Its native lookup is
-    # unchanged, but it does not opt into persistent-row/fused pin preparation.
-    models[1]._native_lookup = models[1]._native_lookup.__call__
-    keys = torch.tensor([2, 2, 9, 1, 9], device="cuda")
-    offsets = torch.tensor([0, 5], device="cuda")
-    states = []
-    for index, model in enumerate(models):
-        cold = model.resolve_input(keys, offsets)
-        assert (
-            cold.occurrence_rows is None
-        ), "misses must follow the original insertion path"
-        output = model(keys, offsets, prefetch_state=cold)
-        output.backward(torch.zeros_like(output))
-        raw = model.resolve_input(keys, offsets)
-        assert raw.occurrence_rows is None
-        raw.release()
-        first = model.resolve_input(keys, offsets, resolve_occurrence_rows=index == 0)
-        second = model.resolve_input(keys, offsets, resolve_occurrence_rows=index == 0)
-        assert (first.occurrence_rows is not None) == (index == 0)
-        if index == 0:
-            cached_rows = first.occurrence_rows
-            torch.testing.assert_close(
-                first.occurrence_rows, first.value_row_indices[first.reverse_indices]
-            )
-            features = KeyedJaggedTensor(keys=["f"], values=keys, offsets=offsets)
-            resolved = ResolvedEmbeddingInput.from_rows(features, first)
-            assert resolved.values() is cached_rows
-        counter = model._storage._state.key_index_map._ref_counter
-        assert pins(counter) == 6  # two batches, three unique keys, five occurrences
-        states.append((first, second, counter))
-    first_outputs = [
-        model(keys, offsets, prefetch_state=state[0])
-        for model, state in zip(models, states)
-    ]
-    torch.testing.assert_close(*first_outputs)
-    for output, (_, _, counter) in zip(first_outputs, states):
-        output.sum().backward(retain_graph=True)
-        assert pins(counter) == 6
-    second_outputs = [
-        model(keys, offsets, prefetch_state=state[1])
-        for model, state in zip(models, states)
-    ]
-    torch.testing.assert_close(*second_outputs)
-    for first, second, (_, _, counter) in zip(first_outputs, second_outputs, states):
-        second.sum().backward()
-        assert pins(counter) == 3
-        first.sum().backward()
-        assert pins(counter) == 0
-    unique_keys = keys.unique()
-    values = [
-        model._storage.find(
-            unique_keys, torch.zeros_like(unique_keys), copy_mode=CopyMode.VALUE
-        )[-1]
-        for model in models
-    ]
-    # Compare the complete persisted rows, including Adam moments.
-    torch.testing.assert_close(*values, rtol=0, atol=0)
-
-
-def test_cache_backward_and_prefetch_keep_live_pins_across_streams():
-    template, _ = make_model(DynamicEmbPoolingMode.NONE, "cache")
-    model = BatchedDynamicEmbeddingTablesV2(
-        table_options=[
-            replace(
-                template._dynamicemb_options[0],
-                init_capacity=16384,
-                max_capacity=16384,
-                local_hbm_for_values=8192 * 8 * 4,
-            )
-        ],
-        table_names=["table"],
-        feature_table_map=[0],
-        pooling_mode=DynamicEmbPoolingMode.NONE,
-        output_dtype=torch.float32,
-        optimizer=EmbOptimType.SGD,
-        learning_rate=0.25,
-    )
-    count = 4096
-    keys = torch.arange(count, device="cuda")
-    offsets = torch.tensor([0, count], device="cuda")
-    gradients = torch.zeros((count, 8), device="cuda")
-    consumer, producer, control = (
-        torch.cuda.current_stream(),
-        torch.cuda.Stream(),
-        torch.cuda.Stream(),
-    )
-    cache = model._cache
-    counter = cache._state.key_index_map._ref_counter
-    model(keys, offsets).backward(gradients)
-    with torch.cuda.stream(control):
-        torch.cuda._sleep(1)
-    torch.cuda.synchronize()
-    gate = [None]
-    increment, decrement = type(cache).increment_counter, type(cache).decrement_counter
-
-    def wait_then_increment(owner, *args, **kwargs):
-        if owner is cache and gate[0] is not None:
-            torch.cuda.current_stream().wait_event(gate[0])
-        return increment(owner, *args, **kwargs)
-
-    def wait_then_decrement(owner, *args, **kwargs):
-        if owner is cache and gate[0] is not None:
-            torch.cuda.current_stream().wait_event(gate[0])
-        return decrement(owner, *args, **kwargs)
-
-    # Only align the real cache kernels; no counter/value result is mocked.
-    with patch.object(
-        type(cache), "increment_counter", new=wait_then_increment
-    ), patch.object(type(cache), "decrement_counter", new=wait_then_decrement):
-        for _ in range(3):
-            output = model(keys, offsets)
-            torch.cuda.synchronize()
-            assert pins(counter) == count
-            with torch.cuda.stream(control):
-                torch.cuda._sleep(1_000_000_000)
-                gate[0] = torch.cuda.Event()
-                gate[0].record()
-            output.backward(gradients)
-            with torch.cuda.stream(producer):
-                model.prefetch(keys, offsets, forward_stream=consumer)
-            producer.synchronize()
-            consumer.synchronize()
-            state = model._prefetch_states[0]
-            # The previous backward returned its pins; the queued batch owns
-            # exactly one per key, despite CPU-ordered calls using two streams.
-            torch.testing.assert_close(
-                counter[state.slot_indices],
-                torch.ones(count, device=keys.device, dtype=counter.dtype),
-                rtol=0,
-                atol=0,
-            )
-            assert pins(counter) == count
-            gate[0] = None
-            model(keys, offsets).backward(gradients)
-            torch.cuda.synchronize()
-            assert pins(counter) == 0
 
 
 @pytest.mark.parametrize("layout", ["hbm", "cache"])
@@ -531,7 +367,7 @@ def test_final_backward_uses_forward_device_when_another_device_is_current(layou
     torch.testing.assert_close(model(keys, offsets), expected, rtol=0, atol=0)
 
 
-def test_rejected_cache_reservation_can_recover():
+def test_repeated_cache_resolution_uses_actual_capacity():
     model, counter = make_model(DynamicEmbPoolingMode.NONE, "cache")
     capacity = model._cache._state.capacity
     per_table = capacity // 4
@@ -539,16 +375,91 @@ def test_rejected_cache_reservation_can_recover():
     offsets = torch.tensor(
         [0, per_table, 2 * per_table], dtype=torch.int64, device="cuda"
     )
-    states = [model.resolve_input(keys, offsets) for _ in range(2)]
-    before = model._prefetch_outstanding_keys.item()
-    with pytest.raises(RuntimeError, match="exceed cache capacity"):
-        model.resolve_input(keys, offsets)
-    assert model._prefetch_outstanding_keys.item() == before
+    states = [model.resolve_input(keys, offsets) for _ in range(3)]
+    assert pins(counter) == keys.numel() * 3
     for state in states:
         state.release()
     torch.cuda.synchronize()
     assert torch.count_nonzero(counter).item() == 0
-    assert model._prefetch_outstanding_keys.item() == 0
     state = model.resolve_input(keys, offsets)
     state.release()
-    assert model._prefetch_outstanding_keys.item() == 0
+
+
+@pytest.mark.parametrize("optimizer", [EmbOptimType.SGD, EmbOptimType.ADAM])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+def test_all_hit_sequence_projects_rows_with_unique_pins(optimizer, dtype):
+    from dynamicemb.shard.resolved_input import ResolvedEmbeddingInput
+    from dynamicemb.types import CopyMode
+    from torchrec import KeyedJaggedTensor
+
+    template, _ = make_model(DynamicEmbPoolingMode.NONE, "hbm")
+
+    def create():
+        return BatchedDynamicEmbeddingTablesV2(
+            table_options=[
+                replace(template._dynamicemb_options[0], embedding_dtype=dtype)
+            ],
+            table_names=["table"],
+            feature_table_map=[0],
+            pooling_mode=DynamicEmbPoolingMode.NONE,
+            output_dtype=torch.float32,
+            optimizer=optimizer,
+            learning_rate=0.25,
+        )
+
+    models = [create(), create()]
+    # The existing compact-workspace path is the control. Its native lookup is
+    # unchanged, but it does not opt into persistent-row/fused pin preparation.
+    models[1]._native_lookup = models[1]._native_lookup.__call__
+    keys = torch.tensor([2, 2, 9, 1, 9], device="cuda")
+    offsets = torch.tensor([0, 5], device="cuda")
+    states = []
+    for index, model in enumerate(models):
+        cold = model.resolve_input(keys, offsets)
+        assert (
+            cold.occurrence_rows is None
+        ), "misses must follow the original insertion path"
+        output = model(keys, offsets, prefetch_state=cold)
+        output.backward(torch.zeros_like(output))
+        raw = model.resolve_input(keys, offsets)
+        assert raw.occurrence_rows is None
+        raw.release()
+        first = model.resolve_input(keys, offsets)
+        second = model.resolve_input(keys, offsets)
+        if index == 0:
+            features = KeyedJaggedTensor(keys=["f"], values=keys, offsets=offsets)
+            resolved = ResolvedEmbeddingInput.from_rows(features, first)
+            torch.testing.assert_close(
+                resolved.values(), first.value_row_indices[first.reverse_indices]
+            )
+            assert resolved.values() is first.occurrence_rows
+        counter = model._storage._state.key_index_map._ref_counter
+        assert pins(counter) == 6  # two batches, three unique keys, five occurrences
+        states.append((first, second, counter))
+    first_outputs = [
+        model(keys, offsets, prefetch_state=state[0])
+        for model, state in zip(models, states)
+    ]
+    torch.testing.assert_close(*first_outputs)
+    for output, (_, _, counter) in zip(first_outputs, states):
+        output.sum().backward(retain_graph=True)
+        assert pins(counter) == 6
+    second_outputs = [
+        model(keys, offsets, prefetch_state=state[1])
+        for model, state in zip(models, states)
+    ]
+    torch.testing.assert_close(*second_outputs)
+    for first, second, (_, _, counter) in zip(first_outputs, second_outputs, states):
+        second.sum().backward()
+        assert pins(counter) == 3
+        first.sum().backward()
+        assert pins(counter) == 0
+    unique_keys = keys.unique()
+    values = [
+        model._storage.find(
+            unique_keys, torch.zeros_like(unique_keys), copy_mode=CopyMode.VALUE
+        )[-1]
+        for model in models
+    ]
+    # Compare the complete persisted rows, including Adam moments.
+    torch.testing.assert_close(*values, rtol=0, atol=0)

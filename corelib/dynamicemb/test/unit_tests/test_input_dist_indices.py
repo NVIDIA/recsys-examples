@@ -339,8 +339,6 @@ def test_input_dist_resolves_before_lookup(dedup, dtype, fused, layout):
         groups = arrived[0].split(model._lookups[0]._feature_splits)
         for group in groups:
             state = group.prefetch_state
-            if layout in ["host", "hybrid", "ps"]:
-                assert group.values() is state.reverse_indices
             torch.testing.assert_close(
                 group.values(), state.value_row_indices[state.reverse_indices]
             )
@@ -491,7 +489,9 @@ def test_host_and_evaluation_resolve_rows():
         ctx, arrived = distribute(model, features)
         assert isinstance(arrived[0], ResolvedEmbeddingInput)
         for group in arrived[0].split(model._lookups[0]._feature_splits):
-            assert group.values() is group.prefetch_state.reverse_indices
+            torch.testing.assert_close(
+                group.values(), group.prefetch_state.reverse_indices, rtol=0, atol=0
+            )
         with torch.no_grad():
             check_debug(output(model, ctx, arrived), features)
 
@@ -753,7 +753,6 @@ def test_later_group_resolution_failure_releases_earlier_pins():
     torch.cuda.synchronize()
     owner = table._cache if table._cache is not None else table._storage
     assert torch.count_nonzero(owner._state.key_index_map._ref_counter).item() == 0
-    assert table._prefetch_outstanding_keys.item() == 0
 
 
 def test_mixed_dynamic_and_torchrec_groups():
@@ -1254,11 +1253,30 @@ class PipelineModel(torch.nn.Module):
 
 
 @pytest.mark.parametrize(
-    "pipeline_type", [TrainPipelineSparseDist, PrefetchTrainPipelineSparseDist]
+    "pipeline_type,clear_inputs",
+    [
+        (TrainPipelineSparseDist, False),
+        (PrefetchTrainPipelineSparseDist, False),
+        (TrainPipelineSparseDist, True),
+    ],
 )
 @pytest.mark.parametrize("scored", [False, True])
 @pytest.mark.parametrize("layout", LAYOUTS)
-def test_native_sparse_dist_pipeline(pipeline_type, scored, layout):
+def test_native_sparse_dist_pipeline(
+    pipeline_type, clear_inputs, scored, layout, monkeypatch
+):
+    if clear_inputs:
+        import inspect
+
+        if "clear_data_dist_inputs" not in inspect.signature(pipeline_type).parameters:
+            pytest.skip("TorchRec has no input-clearing option")
+        from torchrec.distributed.train_pipeline.runtime_forwards import (
+            PipelinedForward,
+        )
+
+        # The public constructor updates this class option. Restore it after
+        # the case so default-pipeline tests retain their original scheduling.
+        monkeypatch.setattr(PipelinedForward, "_use_main_stream_for_dist_init", False)
     if scored and layout in ["ps", "hybrid"]:
         pytest.skip("PRECISE_CUSTOMIZED is not supported by these storage layouts")
     score = (
@@ -1273,6 +1291,7 @@ def test_native_sparse_dist_pipeline(pipeline_type, scored, layout):
         torch.optim.SGD([model.dense], lr=0.1),
         torch.device("cuda", torch.cuda.current_device()),
         execute_all_batches=True,
+        **({"clear_data_dist_inputs": True} if clear_inputs else {}),
     )
     control = PipelineModel(
         make_model(optimizer=EmbOptimType.SGD, score=score, layout=layout)

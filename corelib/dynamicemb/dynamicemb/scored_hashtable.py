@@ -47,7 +47,6 @@ from dynamicemb_extensions import (
     table_restore_reclaimed_slots,
     table_scatter_keys_at_slots,
     table_scatter_score_blocks,
-    table_update_counter_and_project_rows,
     table_update_counter_with_layout,
 )
 
@@ -1001,10 +1000,7 @@ class LinearBucketTable(ScoredHashTable):
         self,
         slot_indices: torch.Tensor,
         table_ids: torch.Tensor,
-        *,
-        value_rows: Optional[torch.Tensor] = None,
-        reverse_indices: Optional[torch.Tensor] = None,
-    ) -> Optional[torch.Tensor]:
+    ) -> None:
         """Increment ref-counter at given per-table slot indices.
 
         table_ids: Must be provided and aligned with slot_indices (same length).
@@ -1012,25 +1008,13 @@ class LinearBucketTable(ScoredHashTable):
         table slot_indices[i] belongs to, so the kernel can map (table_id, slot)
         to the flat _ref_counter index.
 
-        Updates are atomic across streams. Provide one (slot, table) pair per
-        unique key so each batch takes one pin, independently of occurrences.
-
-        If value_rows and reverse_indices are supplied together, also return
-        value_rows[reverse_indices] from the same kernel. Counter updates still
-        run once per unique slot, independently of repeated occurrences.
+        The kernel uses non-atomic addition: the caller must ensure no two
+        (slot_indices[i], table_ids[i]) pairs in this call map to the same flat
+        index (e.g. slot_indices from unique_keys lookup), so no two threads
+        write the same counter element.
         """
         self._check_has_ref_counter()
-        if (value_rows is None) != (reverse_indices is None):
-            raise ValueError("value_rows and reverse_indices must be supplied together")
-        projection = {}
-        update = table_update_counter_with_layout
-        if reverse_indices is not None:
-            update = table_update_counter_and_project_rows
-            projection = dict(
-                value_rows=value_rows,
-                reverse_indices=reverse_indices,
-            )
-        return update(
+        table_update_counter_with_layout(
             self._ref_counter,
             slot_indices,
             1,
@@ -1045,7 +1029,6 @@ class LinearBucketTable(ScoredHashTable):
             overflow_bucket_capacity=(
                 self.overflow_bucket_capacity_ if self.enable_overflow_ else 0
             ),
-            **projection,
         )
 
     def decrement_counter(
@@ -1060,8 +1043,10 @@ class LinearBucketTable(ScoredHashTable):
         table slot_indices[i] belongs to, so the kernel can map (table_id, slot)
         to the flat _ref_counter index.
 
-        Updates are atomic across streams. Return each batch's unique pin once;
-        another stream may concurrently prepare or release the same keys.
+        The kernel uses non-atomic addition: the caller must ensure no two
+        (slot_indices[i], table_ids[i]) pairs in this call map to the same flat
+        index (e.g. slot_indices from unique_keys lookup), so no two threads
+        write the same counter element.
         """
         self._check_has_ref_counter()
         table_update_counter_with_layout(
@@ -1117,11 +1102,17 @@ class LinearBucketTable(ScoredHashTable):
         score: ScoreArg,
         insert_results: Optional[torch.Tensor] = None,
         score_out: Optional[torch.Tensor] = None,
-    ) -> Tuple[
-        torch.Tensor, int, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
-    ]:
+        report_refused: bool = False,
+    ) -> Tuple:
         """Insert with counter-aware eviction and overflow fallback.
-        Returns same tuple as insert_and_evict."""
+        Returns same tuple as insert_and_evict.
+
+        With ``report_refused``, the number of keys the insert could not place
+        follows: keys whose bucket and table's overflow area held nothing it may
+        evict (pinned, or placed by the same insert). They are among the evicted
+        ones, with a negative index. The kernel flags them in pinned host memory,
+        which the read of the number of evicted keys waits for: no read is added,
+        and the keys are counted only when there are some."""
         assert (
             self.enable_overflow_
         ), "insert_and_evict_with_counter_and_overflow requires enable_overflow=True"
@@ -1133,9 +1124,14 @@ class LinearBucketTable(ScoredHashTable):
                 num_scores == 1
             ), "DEMB_DETERMINISM_MODE does not support auxiliary score columns yet."
             return self._deterministic_insert_and_evict_with_overflow(
-                keys, table_ids, score_value, policy
+                keys, table_ids, score_value, policy, report_refused=report_refused
             )
 
+        refused = (
+            torch.zeros(1, dtype=torch.int64, pin_memory=True)
+            if report_refused
+            else None
+        )
         (
             indices,
             num_evicted,
@@ -1162,10 +1158,11 @@ class LinearBucketTable(ScoredHashTable):
             ovf_output_offsets=self.overflow_output_offsets_,
             num_scores=num_scores,
             score_fn_key=self.score_fn_key_,
+            refused=refused,
         )
 
         h_num_evicted = num_evicted.cpu().item()
-        return (
+        result = (
             indices,
             h_num_evicted,
             evicted_keys[:h_num_evicted],
@@ -1173,6 +1170,12 @@ class LinearBucketTable(ScoredHashTable):
             evicted_scores[:h_num_evicted],
             evicted_table_ids[:h_num_evicted],
         )
+        if not report_refused:
+            return result
+        h_refused = (
+            int((evicted_indices[:h_num_evicted] < 0).sum()) if refused.item() else 0
+        )
+        return (*result, h_refused)
 
     def erase(
         self,
@@ -2207,17 +2210,24 @@ class LinearBucketTable(ScoredHashTable):
         table_ids: torch.Tensor,
         score_value: Optional[torch.Tensor],
         policy: ScorePolicy,
-    ) -> Tuple[
-        torch.Tensor, int, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
-    ]:
+        report_refused: bool = False,
+    ) -> Tuple:
         """Like ``_deterministic_insert_and_evict`` but passes overflow
         parameters to ``table_insert_and_evict`` and uses
-        ``lookup_with_overflow``-style lookup for final indices."""
+        ``lookup_with_overflow``-style lookup for final indices. With
+        ``report_refused``, the keys the waves could not place follow, as in
+        ``insert_and_evict_with_counter_and_overflow``."""
         n = keys.numel()
         device = keys.device
         if n == 0:
             e = torch.empty(0, dtype=torch.int64, device=device)
-            return e, 0, torch.empty_like(keys[:0]), e.clone(), e.clone(), e.clone()
+            result = (e, 0, torch.empty_like(keys[:0]), e.clone(), e.clone(), e.clone())
+            return (*result, 0) if report_refused else result
+        refused = (
+            torch.zeros(1, dtype=torch.int64, pin_memory=True)
+            if report_refused
+            else None
+        )
 
         evicted_keys_buf = torch.empty_like(keys)
         evicted_indices_buf = torch.zeros(n, dtype=torch.int64, device=device)
@@ -2259,6 +2269,7 @@ class LinearBucketTable(ScoredHashTable):
                 ovf_bucket_sizes=self.overflow_bucket_sizes,
                 ovf_counter=self._ovf_counter,
                 ovf_output_offsets=self.overflow_output_offsets_,
+                refused=refused,
             )
             h_num_ev = num_ev.cpu().item()
             if h_num_ev > 0:
@@ -2282,7 +2293,7 @@ class LinearBucketTable(ScoredHashTable):
             ovf_bucket_capacity=self.overflow_bucket_capacity_,
             ovf_output_offsets=self.overflow_output_offsets_,
         )
-        return (
+        result = (
             indices,
             num_evicted_accum,
             evicted_keys_buf[:num_evicted_accum],
@@ -2290,6 +2301,14 @@ class LinearBucketTable(ScoredHashTable):
             evicted_scores_buf[:num_evicted_accum],
             evicted_tids_buf[:num_evicted_accum],
         )
+        if not report_refused:
+            return result
+        h_refused = (
+            int((evicted_indices_buf[:num_evicted_accum] < 0).sum())
+            if refused.item()
+            else 0
+        )
+        return (*result, h_refused)
 
 
 def get_scored_table(

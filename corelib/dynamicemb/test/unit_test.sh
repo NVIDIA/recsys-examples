@@ -1,5 +1,17 @@
 set -e
 FWD_BWD_TEST_FILES=(
+    "test/unit_tests/test_hier_receiver.py"
+    "test/unit_tests/test_pooled_receiver.py"
+    "test/unit_tests/test_storage_receiver.py"
+    "test/unit_tests/test_storage_prefetch.py"
+    "test/unit_tests/test_storage_row_copy.py"
+    "test/unit_tests/test_fp8_snapshot.py"
+    "test/unit_tests/test_raw_lookup_dispatch.py"
+    "test/unit_tests/test_cache_receiver.py"
+    "test/unit_tests/test_hbm_row_state.py"
+    "test/unit_tests/test_hbm_receiver.py"
+    "test/unit_tests/test_dense_lookup.py"
+    "test/unit_tests/test_pin_lease.py"
     "test/unit_tests/table_operation/test_table_operation.sh"
     "test/unit_tests/erase_async/test_erase_async.sh"
     "test/unit_tests/retain_evicted_keys/test_retain_evicted_keys.sh"
@@ -16,12 +28,12 @@ FWD_BWD_TEST_FILES=(
     "test/unit_tests/test_vmm_tensor.py"
     "test/unit_tests/optimizer/test_padded_buffer_optimizer.py"
     "test/unit_tests/optimizer/test_ftrl_optimizer.py"
+    "test/unit_tests/optimizer/test_fp8_table_storage.py"
+    "test/unit_tests/optimizer/test_optimizer_row_offsets.py"
     # Added by #495 and never registered, so its CUDA checks on the packed
     # fp32 Adagrad accumulator -- odd dims, checkpoint conversion, state
     # precision -- have not run in CI since.
     "test/unit_tests/optimizer/test_rowwise_adagrad_state_precision.py"
-    "test/unit_tests/test_input_dist_indices.sh"
-    "test/unit_tests/test_resolved_lifecycle.py"
     "test/unit_tests/test_no_eviction_row_indexing.py"
     "test/unit_tests/test_per_table_hbm_budget.py"
     "test/unit_tests/test_expansion_value_capacity.py"
@@ -30,6 +42,8 @@ FWD_BWD_TEST_FILES=(
     "test/unit_tests/test_frequency_requirements.py"
     "test/unit_tests/test_frequency_counter_guard.py"
     "test/unit_tests/test_no_grad_slot_lifetime.py"
+    "test/unit_tests/test_cache_refused_insert.py"
+    "test/unit_tests/test_pin_counter_concurrency.py"
     "test/unit_tests/per_key_score/test_per_key_score.sh"
     "test/unit_tests/test_planner_plan_cost.py"
     "test/unit_tests/test_planner_placement.py"

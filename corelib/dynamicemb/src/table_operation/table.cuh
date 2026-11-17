@@ -112,7 +112,8 @@ table_insert_and_evict(
     std::optional<at::Tensor> ovf_bucket_sizes = std::nullopt,
     std::optional<at::Tensor> ovf_counter = std::nullopt,
     std::optional<at::Tensor> ovf_output_offsets = std::nullopt,
-    int64_t num_scores = 1, int64_t score_fn_key = 0);
+    int64_t num_scores = 1, int64_t score_fn_key = 0,
+    std::optional<at::Tensor> refused = std::nullopt);
 
 void table_erase_by_score(at::Tensor table_storage, torch::Dtype key_dtype,
                           int64_t bucket_capacity, at::Tensor bucket_sizes,
@@ -185,16 +186,6 @@ void table_update_counter_with_layout(
     c10::optional<at::Tensor> table_ids,
     c10::optional<at::Tensor> overflow_output_offsets,
     int64_t overflow_bucket_capacity);
-
-at::Tensor table_update_counter_and_project_rows(
-    at::Tensor counter, at::Tensor slot_indices, int32_t delta,
-    at::Tensor table_bucket_offsets, int64_t bucket_capacity,
-    int64_t main_capacity, int64_t num_tables,
-    c10::optional<at::Tensor> table_ids,
-    c10::optional<at::Tensor> overflow_output_offsets,
-    int64_t overflow_bucket_capacity,
-    c10::optional<at::Tensor> value_rows,
-    c10::optional<at::Tensor> reverse_indices);
 
 // Resolve table-relative hash slots to the value rows they own, taking the
 // next row of the slot's table for a slot that has none yet when `allocate`;

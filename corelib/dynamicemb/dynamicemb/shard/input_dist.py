@@ -221,7 +221,8 @@ class _ResolveOnce:
         return self._resolved
 
 
-class _ReceiverInputMeta(type(KeyedJaggedTensor)):
+# TorchRec supplies the FX-compatible metaclass at runtime.
+class _ReceiverInputMeta(type(KeyedJaggedTensor)):  # type: ignore[misc]
     def __init__(cls, name, bases, attrs):
         # ABC initialization still runs in the inherited __new__. These
         # request-local transport types are never FX constructor targets:
@@ -304,12 +305,13 @@ class _PostprocessedSplitsAwaitable(Awaitable[KJTAllToAllTensorsAwaitable]):
         super().__init__()
         self._awaitable = awaitable
         self._resolve_once = _ResolveOnce(postprocessor)
-        self._tensors = None
+        self._tensors: Optional[KJTAllToAllTensorsAwaitable] = None
 
     def _wait_impl(self) -> KJTAllToAllTensorsAwaitable:
         if self._tensors is None:
-            self._tensors = self._awaitable.wait()
-            self._tensors.callbacks.append(self._resolve_once)
+            tensors = self._awaitable.wait()
+            tensors.callbacks.append(self._resolve_once)
+            self._tensors = tensors
         return self._tensors
 
 
