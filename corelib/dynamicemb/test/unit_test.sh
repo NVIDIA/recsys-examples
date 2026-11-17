@@ -17,6 +17,8 @@ FWD_BWD_TEST_FILES=(
     "test/unit_tests/test_vmm_tensor.py"
     "test/unit_tests/optimizer/test_padded_buffer_optimizer.py"
     "test/unit_tests/optimizer/test_ftrl_optimizer.py"
+    "test/unit_tests/optimizer/test_fp8_table_storage.py"
+    "test/unit_tests/optimizer/test_optimizer_row_offsets.py"
     # Added by #495 and never registered, so its CUDA checks on the packed
     # fp32 Adagrad accumulator -- odd dims, checkpoint conversion, state
     # precision -- have not run in CI since.
@@ -29,6 +31,8 @@ FWD_BWD_TEST_FILES=(
     "test/unit_tests/test_frequency_requirements.py"
     "test/unit_tests/test_frequency_counter_guard.py"
     "test/unit_tests/test_no_grad_slot_lifetime.py"
+    "test/unit_tests/test_cache_refused_insert.py"
+    "test/unit_tests/test_pin_counter_concurrency.py"
     "test/unit_tests/per_key_score/test_per_key_score.sh"
     "test/unit_tests/test_planner_plan_cost.py"
     "test/unit_tests/test_planner_placement.py"
