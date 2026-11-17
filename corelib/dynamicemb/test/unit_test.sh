@@ -4,6 +4,7 @@ FWD_BWD_TEST_FILES=(
     "test/unit_tests/test_storage_prefetch.py"
     "test/unit_tests/test_storage_row_copy.py"
     "test/unit_tests/test_fp8_snapshot.py"
+    "test/unit_tests/test_raw_lookup_dispatch.py"
     "test/unit_tests/test_cache_receiver.py"
     "test/unit_tests/test_hbm_row_state.py"
     "test/unit_tests/test_hbm_receiver.py"

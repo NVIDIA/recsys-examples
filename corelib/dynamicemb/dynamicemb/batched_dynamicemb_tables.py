@@ -1290,7 +1290,7 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                     self._admitter,
                     self._evict_strategy,
                     pooling_weights,
-                    self._native_lookup,
+                    self._native_lookup if prefetch_state.prepared_for_lookup else None,
                     self._empty_tensor,
                     self.output_alloc,
                 )
@@ -1371,6 +1371,7 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
             frequency_counters=frequency_counters,
             scores=scores,
         )
+        state.prepared_for_lookup = False
         self._prefetch_states.append(state)
 
     def resolve_input(
@@ -1387,7 +1388,8 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
         The caller owns the returned state and passes it explicitly to forward.
         HBM/cache states pin stable value rows. Other stores resolve into live
         batch-local rows shared with overlapping in-flight batches. Evaluation
-        resolves read-only rows. Every layout is consumed by TorchRec lookup.
+        resolves read-only rows. Explicit states use TorchRec lookup; raw/FIFO
+        calls retain the existing CUDA gather.
         Input distribution requests occurrence rows when it will construct a
         resolved KJT; raw/FIFO callers need not retain that extra array.
         """
@@ -1415,6 +1417,7 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                 self._table_gate,
             )
             state.input_frequencies = frequency_counters
+            state.prepared_for_lookup = True
             return state
         # These checks used to precede prefetch in forward. Keep them before
         # input_dist can initialize rows or take pins as well.
@@ -1465,6 +1468,7 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
         )
         self._update_score()
         state.input_frequencies = frequency_counters
+        state.prepared_for_lookup = True
         return state
 
     def set_score(
