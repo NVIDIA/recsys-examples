@@ -1,5 +1,9 @@
 # HSTU Inference
 
+The ranking workflow also supports a [Transformer dense backbone](transformer.md)
+with the same recommendation inputs, embeddings, KV-cache manager and export
+entry points. HSTU remains the default.
+
 ## Key Features
 
 1. KV Cache Manager

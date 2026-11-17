@@ -8,7 +8,9 @@ import torch
 from dynamicemb_extensions import copy_matching_storage_rows
 
 
-@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+@pytest.mark.parametrize(
+    "dtype", [torch.float32, torch.float16, torch.bfloat16, torch.float8_e4m3fn]
+)
 @pytest.mark.parametrize("width", [7, 64, 1024, 3072])
 @pytest.mark.parametrize("masked", [False, True])
 def test_storage_row_copy_preserves_table_key_admission_and_moments(
@@ -30,6 +32,13 @@ def test_storage_row_copy_preserves_table_key_admission_and_moments(
         torch.arange(len(keys), device="cuda", dtype=torch.float32)[:, None]
         + torch.arange(width, device="cuda", dtype=torch.float32)[None, :] / 4096
     ).to(dtype)
+    if dtype == torch.float8_e4m3fn:
+        # Arbitrary packed state bytes (including NaNs) must be copied exactly.
+        source.view(torch.uint8).copy_(
+            torch.arange(source.numel(), device="cuda")
+            .reshape_as(source)
+            .to(torch.uint8)
+        )
     target = torch.full((len(targets), width), 99, device="cuda", dtype=dtype)
     source_mask = [True, False, True, True, True, True]
     target_mask = [True, True, True, True, True, False, True]
@@ -51,7 +60,9 @@ def test_storage_row_copy_preserves_table_key_admission_and_moments(
         torch.tensor(source_mask, device="cuda") if masked else None,
         torch.tensor(target_mask, device="cuda") if masked else None,
     )
-    torch.testing.assert_close(target, expected, rtol=0, atol=0)
+    torch.testing.assert_close(
+        target.view(torch.uint8), expected.view(torch.uint8), rtol=0, atol=0
+    )
 
 
 @pytest.mark.parametrize(

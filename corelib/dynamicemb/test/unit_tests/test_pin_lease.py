@@ -36,7 +36,6 @@ def test_abandoned_pinned_batch_releases_rows(layout, stage):
     gc.collect()
     torch.cuda.synchronize()
     assert pins(counter) == 0
-    assert model._prefetch_outstanding_keys.item() == 0
     if stage == "discard_graph":
         check_values(detached, keys, DynamicEmbPoolingMode.NONE)
 
@@ -53,7 +52,6 @@ def test_cancellation_inside_table_gate_defers_cleanup(layout):
         assert pins(counter) == keys.numel()
     torch.cuda.synchronize()
     assert torch.count_nonzero(counter).item() == 0
-    assert model._prefetch_outstanding_keys.item() == 0
 
 
 @pytest.mark.parametrize("layout", ["hbm", "cache"])
@@ -110,7 +108,6 @@ def test_cross_stream_cancellation_keeps_release_metadata(layout):
         ]
     torch.cuda.synchronize()
     assert torch.count_nonzero(counter).item() == 0
-    assert model._prefetch_outstanding_keys.item() == 0
     assert len(reused) == 200
 
 
@@ -158,24 +155,21 @@ def test_final_backward_uses_forward_device_when_another_device_is_current(layou
     torch.testing.assert_close(model(keys, offsets), expected, rtol=0, atol=0)
 
 
-def test_rejected_cache_reservation_can_recover():
+def test_repeated_cache_prefetch_uses_actual_insert_capacity():
     model, counter = make_model(DynamicEmbPoolingMode.NONE, "cache")
-    capacity = model._cache._state.capacity
-    per_table = capacity // 4
+    per_table = model._cache._state.capacity // 4
     keys = torch.cat([torch.arange(per_table), torch.arange(per_table) + 10000]).cuda()
     offsets = torch.tensor(
         [0, per_table, 2 * per_table], dtype=torch.int64, device="cuda"
     )
-    states = [_prepare(model, keys, offsets) for _ in range(2)]
-    before = model._prefetch_outstanding_keys.item()
-    with pytest.raises(RuntimeError, match="exceed cache capacity"):
-        _prepare(model, keys, offsets)
-    assert model._prefetch_outstanding_keys.item() == before
+    # The removed estimate rejected the third batch although all keys are hits.
+    states = [_prepare(model, keys, offsets) for _ in range(3)]
+    assert pins(counter) == keys.numel() * len(states)
     for state in states:
         state.release()
     torch.cuda.synchronize()
-    assert torch.count_nonzero(counter).item() == 0
-    assert model._prefetch_outstanding_keys.item() == 0
+    assert pins(counter) == 0
     state = _prepare(model, keys, offsets)
     state.release()
-    assert model._prefetch_outstanding_keys.item() == 0
+    torch.cuda.synchronize()
+    assert pins(counter) == 0

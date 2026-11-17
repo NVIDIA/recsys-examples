@@ -74,8 +74,23 @@ LAYOUTS = ["hbm"]
 ENABLED_LAYOUTS = {"hbm", "cache", "cache_ps", "host", "hybrid", "ps"}
 
 
-@pytest.fixture(scope="module", autouse=True)
+@pytest.fixture(scope="session", autouse=True)
 def distributed():
+    if dist.is_initialized():
+        yield
+        return
+    if dist.is_initialized():
+        yield
+        return
+    if dist.is_initialized():
+        yield
+        return
+    if dist.is_initialized():
+        yield
+        return
+    if dist.is_initialized():
+        yield
+        return
     assert torch.cuda.is_available(), "These tests require CUDA"
     torch.cuda.set_device(int(os.environ.get("LOCAL_RANK", "0")))
     with tempfile.TemporaryDirectory() as directory:
@@ -934,3 +949,49 @@ def test_in_flight_batches_share_current_optimizer_state(
         == 0
         for table in tables(model)
     )
+
+
+@pytest.mark.parametrize(
+    "layout", [x for x in ["hbm", "cache", "host", "hybrid"] if x in ENABLED_LAYOUTS]
+)
+def test_fp8_receiver_decodes_rows_and_preserves_small_gradients(layout):
+    initial = 12.0 / 256.0
+    options = {
+        name: dict(
+            embedding_dtype=torch.float8_e4m3fn,
+            initializer_args=DynamicEmbInitializerArgs(
+                mode=DynamicEmbInitializerMode.CONSTANT, value=initial
+            ),
+        )
+        for name in ["t0", "t1"]
+    }
+    model = make_model(
+        layout=layout,
+        optimizer=EmbOptimType.EXACT_ROWWISE_ADAGRAD,
+        table_options=options,
+    )
+    assert all(t.embedding_dtype == torch.float8_e4m3fn for t in tables(model))
+    features = batch()
+    ctx, arrived = distribute(model, features)
+    assert isinstance(arrived[0], ResolvedEmbeddingInput)
+    with patch(
+        "dynamicemb.batched_dynamicemb_function._find_keys",
+        side_effect=AssertionError("resolved FP8 lookup rehashed keys"),
+    ):
+        result = output(model, ctx, arrived)
+    values = torch.cat([jt.values() for jt in result.values()])
+    torch.testing.assert_close(values, torch.full_like(values, initial), rtol=0, atol=0)
+    (values.sum() * 1e-8).backward()
+    with torch.no_grad():
+        ctx, arrived = distribute(model, features)
+        trained = output(model, ctx, arrived)
+        before_eval = {k: jt.values().clone() for k, jt in trained.items()}
+    # A gradient cast to fp16 or fp8 would flush these updates to zero.
+    assert all((v - initial).abs().mean().item() > 1e-3 for v in before_eval.values())
+    model.eval()
+    with torch.no_grad():
+        actual = model(features).wait()
+    for key in actual:
+        torch.testing.assert_close(
+            actual[key].values(), before_eval[key], rtol=0, atol=0
+        )

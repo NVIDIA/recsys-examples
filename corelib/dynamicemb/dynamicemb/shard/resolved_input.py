@@ -9,7 +9,7 @@ original local keys, hash slots and row-lifetime metadata remain in PrefetchStat
 only the KJT consumed by lookup carries value rows instead of keys.
 """
 
-from typing import List, Optional
+from typing import List, Optional, cast
 
 import torch
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
@@ -94,7 +94,7 @@ class ResolvedEmbeddingInput(KeyedJaggedTensor):
                     group.original_features().values()
                     if isinstance(group, ResolvedEmbeddingInput)
                     else group.values()
-                    for group in self._groups
+                    for group in cast(List[KeyedJaggedTensor], self._groups)
                 ]
             )
         )
