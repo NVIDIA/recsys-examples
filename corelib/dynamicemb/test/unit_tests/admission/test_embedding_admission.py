@@ -297,9 +297,7 @@ def expected_admitted_scores(
                     continue
                 waiting[table_name][key] += frequency
                 if waiting[table_name][key] >= threshold:
-                    scores[key] = (
-                        waiting[table_name][key] if carry_count else frequency
-                    )
+                    scores[key] = waiting[table_name][key] if carry_count else frequency
     return dict(expected)
 
 
