@@ -78,21 +78,6 @@ def distributed():
     if dist.is_initialized():
         yield
         return
-    if dist.is_initialized():
-        yield
-        return
-    if dist.is_initialized():
-        yield
-        return
-    if dist.is_initialized():
-        yield
-        return
-    if dist.is_initialized():
-        yield
-        return
-    if dist.is_initialized():
-        yield
-        return
     assert torch.cuda.is_available(), "These tests require CUDA"
     torch.cuda.set_device(int(os.environ.get("LOCAL_RANK", "0")))
     with tempfile.TemporaryDirectory() as directory:

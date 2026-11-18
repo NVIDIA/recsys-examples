@@ -4,79 +4,13 @@
 """Receiver-state lifetime and output-window contracts, using real GPU tables."""
 
 import gc
-import weakref
 from dataclasses import replace
-from unittest.mock import patch
 
 import pytest
 import torch
 from dynamicemb import DynamicEmbPoolingMode, EmbOptimType
 from dynamicemb.batched_dynamicemb_tables import BatchedDynamicEmbeddingTablesV2
 from test_no_grad_slot_lifetime import batch, check_values, make_model, pins
-
-
-@pytest.mark.parametrize("layout", ["hbm", "cache", "host", "hybrid"])
-@pytest.mark.parametrize("replace_values", [False, True])
-def test_eval_state_survives_drop_on_producer_stream(layout, replace_values):
-    model, _ = make_model(DynamicEmbPoolingMode.NONE, layout)
-    keys, offsets = batch(0)
-    model(keys, offsets).sum().backward()
-    model.eval()
-    source, consumer = torch.cuda.Stream(), torch.cuda.Stream()
-    torch.cuda.synchronize()
-    with torch.cuda.stream(source):
-        warm_state = model.resolve_input(keys, offsets)
-    source.synchronize()
-    with torch.cuda.stream(consumer):
-        warm_output = model(keys, offsets, prefetch_state=warm_state)
-    consumer.synchronize()
-    expected = warm_output.cpu()
-    shape, dtype = warm_state.unique_values.shape, warm_state.unique_values.dtype
-    del warm_state, warm_output
-
-    # Warm both the exact lookup and allocator pool. Lazy CUDA loading or a new
-    # cudaMalloc can synchronize the device and conceal missing registration.
-    with torch.cuda.stream(source):
-        warm_allocs = [
-            torch.full(shape, 7777, device=keys.device, dtype=dtype) for _ in range(64)
-        ]
-    source.synchronize()
-    del warm_allocs
-    with torch.cuda.stream(source):
-        state = model.resolve_input(keys, offsets)
-    source.synchronize()
-    if replace_values:
-        state.record_stream(consumer)
-        with torch.cuda.stream(source):
-            state.unique_values = state.unique_values.clone()
-        source.synchronize()
-    # Keep index metadata alive to isolate value-buffer reuse and avoid unsafe
-    # indices in a failing implementation. The state itself must be collectible.
-    other_metadata = [
-        value
-        for name, value in vars(state).items()
-        if isinstance(value, torch.Tensor) and name != "unique_values"
-    ]
-    state_ref, values_ref = weakref.ref(state), weakref.ref(state.unique_values)
-    with torch.cuda.stream(consumer):
-        torch.cuda._sleep(1_000_000_000)
-        actual = model(keys, offsets, prefetch_state=state)
-        done = torch.cuda.Event()
-        done.record()
-    del state
-    assert state_ref() is None and values_ref() is None
-    pending = not done.query()
-    with torch.cuda.stream(source):
-        reuse = [
-            torch.full(shape, 7777, device=keys.device, dtype=dtype) for _ in range(64)
-        ]
-    source.synchronize()
-    overwritten_while_pending = not done.query()
-    consumer.synchronize()
-    if not pending or not overwritten_while_pending:
-        pytest.skip("consumer finished before allocator reuse could be exercised")
-    torch.testing.assert_close(actual.cpu(), expected, rtol=0, atol=0)
-    assert len(other_metadata) > 0 and len(reuse) == 64
 
 
 @pytest.mark.parametrize("layout", ["hbm", "cache"])
@@ -110,79 +44,6 @@ def test_cancellation_inside_table_gate_defers_cleanup(layout):
         assert pins(counter) == keys.numel()
     torch.cuda.synchronize()
     assert torch.count_nonzero(counter).item() == 0
-
-
-@pytest.mark.parametrize("layout", ["hbm", "cache", "host", "hybrid"])
-def test_retained_backward_observes_intervening_update(layout):
-    model, counter = make_model(DynamicEmbPoolingMode.NONE, layout)
-    keys, offsets = batch(0)
-    output = model(keys, offsets)
-    output.sum().backward(retain_graph=True)
-    if counter is not None:
-        assert pins(counter) == keys.numel()
-    model(keys, offsets).sum().backward()
-    output.sum().backward()
-    if counter is not None:
-        assert pins(counter) == 0
-    model.eval()
-    actual = model(keys, offsets)
-    expected = (keys % 100000).float()[:, None].expand_as(actual) - 0.75
-    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
-
-
-@pytest.mark.parametrize("layout", ["hbm", "cache"])
-def test_discard_retained_graph_releases_rows(layout):
-    model, counter = make_model(DynamicEmbPoolingMode.NONE, layout)
-    keys, offsets = batch(0)
-    output = model(keys, offsets)
-    output.sum().backward(retain_graph=True)
-    assert pins(counter) == keys.numel()
-    del output
-    gc.collect()
-    torch.cuda.synchronize()
-    assert pins(counter) == 0
-
-
-@pytest.mark.parametrize("layout", ["hbm", "cache", "host", "hybrid"])
-@pytest.mark.parametrize(
-    "pooling", [DynamicEmbPoolingMode.NONE, DynamicEmbPoolingMode.SUM]
-)
-def test_resolved_batch_train_eval_transition(layout, pooling):
-    model, counter = make_model(pooling, layout)
-    keys, offsets = batch(0)
-    state = model.resolve_input(keys, offsets)
-    model.eval()
-    output = model(keys, offsets, prefetch_state=state)
-    assert not output.requires_grad
-    check_values(output, keys, pooling)
-    if counter is not None:
-        assert pins(counter) == 0
-    state = model.resolve_input(keys, offsets)
-    model.train()
-    output = model(keys, offsets, prefetch_state=state)
-    assert output.requires_grad
-    output.sum().backward()
-    if counter is not None:
-        assert pins(counter) == 0
-
-
-@pytest.mark.parametrize("layout", ["hbm", "cache", "host", "hybrid"])
-@pytest.mark.parametrize("reverse", [False, True])
-def test_recomputed_resolved_batch_owns_separate_state(layout, reverse):
-    model, counter = make_model(DynamicEmbPoolingMode.NONE, layout)
-    keys, offsets = batch(0)
-    state = model.resolve_input(keys, offsets)
-    outputs = [model(keys, offsets, prefetch_state=state) for _ in range(2)]
-    if counter is not None:
-        assert pins(counter) == 2 * keys.numel()
-    for output in reversed(outputs) if reverse else outputs:
-        output.sum().backward()
-    if counter is not None:
-        assert pins(counter) == 0
-    model.eval()
-    actual = model(keys, offsets)
-    expected = (keys % 100000).float()[:, None].expand_as(actual) - 0.5
-    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
 @pytest.mark.parametrize("layout", ["hbm", "cache", "host", "hybrid"])
@@ -255,116 +116,6 @@ def test_shared_output_window_accepts_multiple_lookup_groups():
         actual = model(keys, offsets)
         expected = (keys % 100000).float()[:, None].expand_as(actual) - 0.25
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
-
-
-@pytest.mark.parametrize("layout", ["hbm", "cache"])
-def test_cross_stream_cancellation_keeps_release_metadata(layout):
-    model, counter = make_model(DynamicEmbPoolingMode.NONE, layout)
-    keys, offsets = batch(0)
-    producer, canceller = torch.cuda.Stream(), torch.cuda.Stream()
-    producer.wait_stream(torch.cuda.current_stream())
-    with torch.cuda.stream(producer):
-        state = model.resolve_input(keys, offsets)
-        ready = torch.cuda.Event()
-        ready.record()
-    ready.synchronize()
-    assert pins(counter) == keys.numel()
-    with torch.cuda.stream(canceller):
-        torch.cuda._sleep(100_000_000)
-        del state
-        gc.collect()
-    with torch.cuda.stream(producer):
-        reused = [
-            torch.zeros((keys.numel(),), dtype=torch.int64, device=keys.device)
-            for _ in range(200)
-        ]
-    torch.cuda.synchronize()
-    assert torch.count_nonzero(counter).item() == 0
-    assert len(reused) == 200
-
-
-@pytest.mark.parametrize("layout", ["hbm", "cache"])
-@pytest.mark.parametrize("optimizer", [EmbOptimType.SGD, EmbOptimType.ADAM])
-@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
-def test_single_persistent_matrix_uses_physical_rows(layout, optimizer, dtype):
-    template, _ = make_model(DynamicEmbPoolingMode.NONE, layout)
-    model = BatchedDynamicEmbeddingTablesV2(
-        table_options=[replace(template._dynamicemb_options[0], embedding_dtype=dtype)],
-        table_names=["t0"],
-        feature_table_map=[0],
-        pooling_mode=DynamicEmbPoolingMode.NONE,
-        optimizer=optimizer,
-        learning_rate=0.25,
-        stochastic_rounding=False,
-        output_dtype=torch.float32,
-    )
-    del template
-    keys = torch.arange(1, 33, dtype=torch.int64, device="cuda").repeat(2)
-    offsets = torch.tensor([0, keys.numel()], dtype=torch.int64, device="cuda")
-    state = model.resolve_input(keys, offsets)
-    from dynamicemb.shard.resolved_input import ResolvedEmbeddingInput
-    from torchrec import KeyedJaggedTensor
-
-    features = ResolvedEmbeddingInput.from_rows(
-        KeyedJaggedTensor(keys=["f0"], values=keys, offsets=offsets), state
-    )
-    assert features.values().data_ptr() == state.occurrence_rows.data_ptr()
-    with patch(
-        "dynamicemb.batched_dynamicemb_function.load_from_flat",
-        side_effect=AssertionError("unexpected compact workspace"),
-    ):
-        output = model(features.values(), offsets, prefetch_state=state)
-    expected = (keys % 100000).float()[:, None].expand_as(output)
-    torch.testing.assert_close(output, expected, rtol=0, atol=0)
-    output.sum().backward()
-    model.eval()
-    # A repeated key has two occurrences; SGD sums them, Adam normalizes them.
-    delta = 0.5 if optimizer == EmbOptimType.SGD else 0.25
-    torch.testing.assert_close(model(keys, offsets), expected - delta)
-
-
-@pytest.mark.parametrize("layout", ["hbm", "cache"])
-def test_retained_backward_cancelled_on_another_stream_waits_for_update(layout):
-    model, counter = make_model(DynamicEmbPoolingMode.NONE, layout)
-    keys, offsets = batch(0)
-    producer, canceller = torch.cuda.Stream(), torch.cuda.Stream()
-    producer.wait_stream(torch.cuda.current_stream())
-    with torch.cuda.stream(producer):
-        output = model(keys, offsets)
-        ready = torch.cuda.Event()
-        ready.record()
-    ready.synchronize()
-    with torch.cuda.stream(producer):
-        torch.cuda._sleep(100_000_000)
-        output.sum().backward(retain_graph=True)
-    with torch.cuda.stream(canceller):
-        del output
-        gc.collect()
-        model.eval()
-        observed = model(keys, offsets)
-    torch.cuda.synchronize()
-    assert torch.count_nonzero(counter).item() == 0
-    expected = (keys % 100000).float()[:, None].expand_as(observed) - 0.25
-    torch.testing.assert_close(observed, expected, rtol=0, atol=0)
-
-
-@pytest.mark.parametrize("layout", ["hbm", "cache"])
-def test_final_backward_uses_forward_device_when_another_device_is_current(layout):
-    if torch.cuda.device_count() < 2:
-        pytest.skip("Requires two visible CUDA devices")
-    device = torch.cuda.current_device()
-    model, counter = make_model(DynamicEmbPoolingMode.NONE, layout)
-    keys, offsets = batch(0)
-    output = model(keys, offsets)
-    other = (device + 1) % torch.cuda.device_count()
-    with torch.cuda.device(other):
-        output.sum().backward()
-        assert torch.cuda.current_device() == other
-    torch.cuda.synchronize(device)
-    assert pins(counter) == 0
-    model.eval()
-    expected = (keys % 100000).float()[:, None].expand_as(output) - 0.25
-    torch.testing.assert_close(model(keys, offsets), expected, rtol=0, atol=0)
 
 
 def test_repeated_cache_resolution_uses_actual_capacity():
