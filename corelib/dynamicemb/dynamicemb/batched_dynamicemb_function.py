@@ -845,8 +845,8 @@ def _prefetch_hbm_direct_path(
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
     """HBM-direct prefetch with counter protection.
 
-    Only admitted keys are inserted.  Non-admitted keys get slot_indices = -1
-    and their positions are returned for lazy initialization at forward time.
+    Only admitted keys are sent to insert. Keys rejected by admission or by
+    the insert use temporary rows initialized at forward time.
 
     Returns ``(slot_indices, non_admitted_positions, value_row_indices)``. The
     two index spaces are kept apart because they only coincide by accident:
@@ -984,7 +984,17 @@ def _prefetch_hbm_direct_path(
             with torch.cuda.nvtx.range("op:store_to_flat"):
                 store_to_flat(state, new_rows, admitted_tids, init_values)
 
-            # Keys the insert could not place (-1) are skipped by the kernel.
+            # Pins and optimizer writes skip -1. Treat capacity refusals like
+            # admission refusals for lookup as well: TorchRec must never read
+            # -1 from a borrowed matrix or gather an uninitialized compact row.
+            refused = new_rows < 0
+            if refused.any():
+                refused_positions = admitted_unique_positions[refused]
+                non_admitted_positions = (
+                    refused_positions
+                    if non_admitted_positions is None
+                    else torch.cat((non_admitted_positions, refused_positions))
+                )
             storage.increment_counter(new_slots, admitted_tids)
 
             slot_indices[admitted_unique_positions] = new_slots

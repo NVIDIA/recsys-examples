@@ -10,6 +10,7 @@ FWD_BWD_TEST_FILES=(
     "test/unit_tests/test_cache_receiver.py"
     "test/unit_tests/test_hbm_row_state.py"
     "test/unit_tests/test_hbm_receiver.py"
+    "test/unit_tests/test_hbm_receiver_dist.sh"
     "test/unit_tests/test_dense_lookup.py"
     "test/unit_tests/test_pin_lease.py"
     "test/unit_tests/table_operation/test_table_operation.sh"
