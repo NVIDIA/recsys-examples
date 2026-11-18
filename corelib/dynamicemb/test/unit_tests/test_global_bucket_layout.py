@@ -70,11 +70,16 @@ from dynamicemb.planner.planners import (
     _prepare_dynemb_table_options,
 )
 from dynamicemb.scored_hashtable import ScoreArg, ScoreSpec, get_scored_table
-from dynamicemb.shard.input_dist import dist_type_codes, routing_param_tensors
+from dynamicemb.shard.input_dist import (
+    bucketize_kjt_before_all2all,
+    dist_type_codes,
+    routing_param_tensors,
+)
 from dynamicemb.types import MAX_BUCKET_CAPACITY
 from dynamicemb_extensions import ScorePolicy, block_bucketize_sparse_features
 from torchrec.distributed.types import ShardingType
 from torchrec.modules.embedding_configs import EmbeddingConfig
+from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="requires a CUDA device"
@@ -342,6 +347,51 @@ def test_routing_without_parameters_is_refused():
     # Other rules carry no parameters and are left alone.
     g, s = routing_param_tensors(["roundrobin", "continuous"], None, 2, device)
     assert g.tolist() == [0, 0] and s.tolist() == [0, 0]
+
+
+@pytest.mark.parametrize("dist_type", ["roundrobin", "hash_roundrobin", "hash_bucket"])
+def test_row_positions_are_refused_for_a_rule_that_is_not_continuous(dist_type):
+    """``block_bucketize_row_pos`` makes the kernel place keys by row range and
+    ignore the feature's dist_type; for anything but ``continuous`` that would
+    route a key by a rule the table does not follow, with nothing raising."""
+    device = torch.device("cuda")
+    kjt = KeyedJaggedTensor.from_lengths_sync(
+        keys=["f0", "f1"],
+        values=torch.arange(8, dtype=torch.int64, device=device),
+        lengths=torch.tensor([2, 2, 2, 2], dtype=torch.int32, device=device),
+    )
+    positions = [torch.tensor([0, 5], dtype=torch.int32, device=device)] * 2
+    block_sizes = torch.full((2,), 5, dtype=torch.int64, device=device)
+
+    # One feature that is not continuous is enough, and it is named.
+    mixed = dist_type_codes(["continuous", dist_type], device=device)
+    with pytest.raises(ValueError, match=r"\['f1'\]"):
+        bucketize_kjt_before_all2all(
+            kjt,
+            num_buckets=2,
+            block_sizes=block_sizes,
+            block_bucketize_row_pos=positions,
+            dist_type_per_feature=mixed,
+            global_capacity_per_feature=torch.tensor(
+                [0, GLOBAL_CAPACITY], dtype=torch.int64, device=device
+            ),
+            shard_capacity_per_feature=torch.tensor(
+                [0, buckets_per_shard(2) * BC], dtype=torch.int64, device=device
+            ),
+        )
+    # Without positions the same call is fine.
+    bucketize_kjt_before_all2all(
+        kjt,
+        num_buckets=2,
+        block_sizes=block_sizes,
+        dist_type_per_feature=mixed,
+        global_capacity_per_feature=torch.tensor(
+            [0, GLOBAL_CAPACITY], dtype=torch.int64, device=device
+        ),
+        shard_capacity_per_feature=torch.tensor(
+            [0, buckets_per_shard(2) * BC], dtype=torch.int64, device=device
+        ),
+    )
 
 
 # ---------------------------------------------------------------------------

@@ -165,6 +165,9 @@ def bucketize_kjt_before_all2all(
         bucketize_pos (bool): output the changed position of the bucketized values or
             not.
         block_bucketize_row_pos (Optional[List[torch.Tensor]]): The offsets of shard size for each feature.
+            Only for features whose dist_type is ``continuous``: the kernel places keys by
+            these row ranges and ignores ``dist_type_per_feature``, so any other dist_type
+            raises ``ValueError`` instead of being routed by a rule it does not follow.
         dist_type_per_feature (Optional[torch.Tensor]): int32 key -> rank rule per
             feature, from :func:`dist_type_codes`, in the same feature order as
             ``block_sizes`` -- the kernel indexes both with the same ``t``.
@@ -188,6 +191,28 @@ def bucketize_kjt_before_all2all(
     )
     block_sizes_new_type = _fx_wrap_tensor_to_device_dtype(block_sizes, kjt.values())
     dist_type_t = dist_type_per_feature.to(device=kjt.values().device)
+    if block_bucketize_row_pos is not None:
+        # The positions are the starts of uneven row ranges, one per rank, and
+        # the kernel then places every key by binary search in them without
+        # reading the feature's dist_type -- which is right for 'continuous'
+        # and for nothing else: a roundrobin, hash_roundrobin or hash_bucket
+        # key would be sent by its row range and stored by a rank whose rule
+        # never looks there, with nothing raising. This path is not on the
+        # distributors' call (they pass no positions), so the host sync is
+        # paid only by a caller that asked for it.
+        not_continuous = dist_type_t != DIST_TYPE_CODES["continuous"]
+        if bool(not_continuous.any().item()):
+            names = [
+                key
+                for key, bad in zip(kjt.keys(), not_continuous.tolist())
+                if bad
+            ]
+            raise ValueError(
+                "block_bucketize_row_pos places keys by row range, which only "
+                "dist_type 'continuous' means; features "
+                f"{names} use another dist_type. Pass no positions, or give "
+                "every feature dist_type 'continuous'."
+            )
     if global_capacity_per_feature is None or shard_capacity_per_feature is None:
         # Only a caller outside the distributors gets here (they always pass
         # both). A hash_bucket feature cannot be routed without them, and
