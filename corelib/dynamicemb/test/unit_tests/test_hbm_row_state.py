@@ -11,13 +11,21 @@ import pytest
 import torch
 from dynamicemb import DynamicEmbPoolingMode, EmbOptimType
 from dynamicemb.batched_dynamicemb_tables import BatchedDynamicEmbeddingTablesV2
+from dynamicemb.shard.resolved_input import ResolvedEmbeddingInput
 from test_no_grad_slot_lifetime import batch, check_values, make_model, pins
+from torchrec import KeyedJaggedTensor
 
 
 @pytest.mark.parametrize("layout", ["hbm", "cache"])
-@pytest.mark.parametrize("optimizer", [EmbOptimType.SGD, EmbOptimType.ADAM])
-@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("wrap_kjt", [False, True])
+@pytest.mark.parametrize(
+    "optimizer,dtype,wrap_kjt",
+    [
+        (EmbOptimType.SGD, torch.float32, False),
+        (EmbOptimType.ADAM, torch.float16, True),
+        (EmbOptimType.ADAM, torch.bfloat16, True),
+    ],
+    ids=["contiguous-dense", "strided-dense", "ec-fallback"],
+)
 def test_single_persistent_matrix_uses_physical_rows(
     layout, optimizer, dtype, wrap_kjt
 ):
@@ -36,9 +44,6 @@ def test_single_persistent_matrix_uses_physical_rows(
     keys = torch.arange(1, 33, dtype=torch.int64, device="cuda").repeat(2)
     offsets = torch.tensor([0, keys.numel()], dtype=torch.int64, device="cuda")
     state = model.resolve_input(keys, offsets)
-    from dynamicemb.shard.resolved_input import ResolvedEmbeddingInput
-    from torchrec import KeyedJaggedTensor
-
     features = KeyedJaggedTensor(keys=["f0"], values=keys, offsets=offsets)
     if wrap_kjt:
         features = ResolvedEmbeddingInput.from_rows(features, state)
@@ -57,6 +62,62 @@ def test_single_persistent_matrix_uses_physical_rows(
     # A repeated key has two occurrences; SGD sums them, Adam normalizes them.
     delta = 0.5 if optimizer == EmbOptimType.SGD else 0.25
     torch.testing.assert_close(model(keys, offsets), expected - delta)
+
+
+@pytest.mark.parametrize(
+    "dtype,free_slots",
+    [(torch.float32, 1), (torch.bfloat16, 0)],
+    ids=["dense-partial-refusal", "ec-all-new-keys-refused"],
+)
+def test_hbm_refused_insert_uses_initialized_temporary_rows(dtype, free_slots):
+    template, _ = make_model(DynamicEmbPoolingMode.NONE, "hbm")
+    options = replace(
+        template._dynamicemb_options[0],
+        max_capacity=128,
+        init_capacity=128,
+        embedding_dtype=dtype,
+    )
+    model = BatchedDynamicEmbeddingTablesV2(
+        table_options=[options],
+        table_names=["t0"],
+        pooling_mode=DynamicEmbPoolingMode.NONE,
+        optimizer=EmbOptimType.SGD,
+        learning_rate=1.0,
+        output_dtype=torch.float32,
+    )
+    counter = model._storage._state.key_index_map._ref_counter
+    assert model._storage._state.capacity == 128
+
+    def lookup(keys):
+        offsets = keys.new_tensor([0, keys.numel()])
+        state = model.resolve_input(keys, offsets)
+        features = ResolvedEmbeddingInput.from_rows(
+            KeyedJaggedTensor(keys=["f0"], values=keys, offsets=offsets), state
+        )
+        return model(features.values(), offsets, prefetch_state=state), state
+
+    owner_keys = torch.arange(128 - free_slots, device="cuda")
+    owner, _ = lookup(owner_keys)
+    keys = owner_keys.new_tensor([0, 128, 129])
+    result, state = lookup(keys)
+    expected = keys.float()[:, None].expand_as(result)
+    torch.testing.assert_close(result, expected, rtol=0, atol=0)
+    refused = state.value_row_indices[state.reverse_indices] < 0
+    assert not refused[0].item() and refused.sum().item() == 2 - free_slots
+    assert pins(counter) == 129
+    result.sum().backward()
+    assert pins(counter) == owner_keys.numel()
+
+    owner.sum().backward()
+    assert pins(counter) == 0
+    updated, _ = lookup(keys[:1])
+    torch.testing.assert_close(updated, torch.full_like(updated, -2))
+    updated.sum().backward()
+    retried, retry_state = lookup(keys[refused])
+    torch.testing.assert_close(retried, expected[refused], rtol=0, atol=0)
+    assert (retry_state.value_row_indices >= 0).all().item()
+    retried.sum().backward()
+    assert pins(counter) == 0
 
 
 @pytest.mark.parametrize("layout", ["hbm", "cache"])

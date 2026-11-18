@@ -3,9 +3,8 @@
 
 """Resolved input_dist and TorchRec lookup, on one or more real GPUs.
 
-    python -m pytest test/unit_tests/test_input_dist_indices.py -q
-    torchrun --standalone --nproc_per_node=2 -m pytest \
-        test/unit_tests/test_input_dist_indices.py -q
+    python -m pytest test/unit_tests/test_hbm_receiver.py -q
+    bash test/unit_tests/test_hbm_receiver_dist.sh
 """
 
 import copy
