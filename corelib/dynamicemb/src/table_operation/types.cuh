@@ -638,12 +638,13 @@ template <typename BucketType_> struct LinearBucketTable {
   home_bucket(int64_t const *__restrict__ table_bucket_offsets, int64_t t_id,
               int64_t hashcode, int64_t *bucket_id, int64_t *bkt_begin,
               int64_t *table_cap) const {
-    *bkt_begin = table_bucket_offsets[t_id];
-    int64_t nb = table_bucket_offsets[t_id + 1] - *bkt_begin;
+    int64_t begin = table_bucket_offsets[t_id];
+    int64_t nb = table_bucket_offsets[t_id + 1] - begin;
+    *bkt_begin = begin;
     *table_cap = nb * bucket_capacity_;
     if (nb <= 0)
       return;
-    *bucket_id = home_bucket_of(hashcode, *bkt_begin, nb, bucket_capacity_,
+    *bucket_id = home_bucket_of(hashcode, begin, nb, bucket_capacity_,
                                 global_capacities_, t_id);
   }
 
