@@ -75,7 +75,7 @@ The rule is written in three places, which must agree key for key:
 
 | Twin | Where | Formula |
 |---|---|---|
-| Table kernels | `LinearBucketTable::home_bucket`, `src/table_operation/types.cuh`; used by lookup, insert, insert_and_evict, erase, `scatter_keys_at_slots` (`kernels.cuh`) and `BucketizeFunctor` (`bucketize.cu`) | `bkt_begin + ((h % global_cap[t]) / bc) % nb_t`, `global_cap[t] <= 0` meaning the table's own capacity |
+| Table kernels | `home_bucket_of` in `src/table_operation/types.cuh`, called by `LinearBucketTable::home_bucket` (lookup, insert, insert_and_evict, erase, `scatter_keys_at_slots` in `kernels.cuh`) and by `BucketizeFunctor` (`bucketize.cu`) -- the one device-side copy of the arithmetic | `bkt_begin + ((h % global_cap[t]) / bc) % nb_t`, `global_cap[t] <= 0` meaning the table's own capacity |
 | Routing kernel | `hashed_shard`, `src/sparse_block_bucketize_features.cu` (`DistType::kHashedBucket`) | `(h % global_capacity[t]) / shard_capacity[t]` |
 | Host | `dynamicemb.key_ownership.owning_shard` (and `OwnershipRule`) | the same, in torch; raises without the parameters |
 

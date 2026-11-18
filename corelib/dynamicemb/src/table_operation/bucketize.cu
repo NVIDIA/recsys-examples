@@ -38,26 +38,16 @@ struct BucketizeFunctor {
   __host__ __device__ __forceinline__ IndexType operator()(KeyType key,
                                                            IndexType tid) {
 
-    // Same arithmetic as LinearBucketTable::home_bucket (types.cuh); keep the
-    // two in step.
     int64_t hashcode = BucketType::hash(key);
     int64_t t_id = table_ids[tid];
     int64_t bkt_begin = table_bucket_offsets[t_id];
-    int64_t bkt_end = table_bucket_offsets[t_id + 1];
-    int64_t nb = bkt_end - bkt_begin;
-    int64_t table_cap = nb * bucket_capacity;
-    if (table_cap == 0) {
+    int64_t nb = table_bucket_offsets[t_id + 1] - bkt_begin;
+    if (nb <= 0) {
       return static_cast<IndexType>(bkt_begin);
     }
-    int64_t global_cap =
-        table_global_capacities != nullptr ? table_global_capacities[t_id] : 0;
-    if (global_cap <= 0)
-      global_cap = table_cap;
-    // Use unsigned modulo to avoid negative results from signed hash values
-    int64_t local_idx = static_cast<int64_t>(static_cast<uint64_t>(hashcode) %
-                                             static_cast<uint64_t>(global_cap));
-    int64_t bucket_id = bkt_begin + (local_idx / bucket_capacity) % nb;
-    return static_cast<IndexType>(bucket_id);
+    return static_cast<IndexType>(
+        dyn_emb::home_bucket_of(hashcode, bkt_begin, nb, bucket_capacity,
+                                table_global_capacities, t_id));
   }
   int64_t const *__restrict__ table_ids;
   int64_t const *__restrict__ table_bucket_offsets;

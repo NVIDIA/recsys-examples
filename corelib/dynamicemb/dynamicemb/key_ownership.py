@@ -24,8 +24,9 @@ checkpoint is loaded, when a delta is replayed.
 This module is that rule, and it is the only place it is written down in Python.
 Its device twins are ``_block_bucketize_sparse_features_cuda_kernel1/2``
 (``hashed_shard``) in ``src/sparse_block_bucketize_features.cu`` and, for the
-bucket inside the rank, ``LinearBucketTable::home_bucket`` in
-``src/table_operation/types.cuh``; the three must agree key for key, or a key
+bucket inside the rank, ``home_bucket_of`` in
+``src/table_operation/types.cuh`` (called by ``LinearBucketTable::home_bucket``
+and by the bucketizer); the three must agree key for key, or a key
 is looked up on one rank and stored on another with nothing raising.
 
 Three rules exist, and they are not alike:
@@ -53,7 +54,7 @@ Three rules exist, and they are not alike:
   and a bucket that fit then fits now. ``P * bc`` is what the planner stores as
   the shard's ``max_capacity``.
 
-Three things the rule is easy to get wrong, and why they live here:
+Four things the rule is easy to get wrong, and why they live here:
 
 * **The modulo is unsigned.** Under the unsigned rules the kernel reads a key as
   ``uint64_t``, so a negative key wraps rather than staying negative.

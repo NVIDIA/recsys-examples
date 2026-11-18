@@ -322,12 +322,9 @@ __launch_bounds__(kMaxThreads) void _block_bucketize_sparse_features_cuda_kernel
           p = cyclic_bucket(indices_data[i], dist_type, my_size);
           break;
         case DistType::kHashedBucket:
-          // The table hashes the int64 key, so an int32 key must widen with
-          // its sign (as owning_shard's keys.to(int64) does), not as `idx`,
-          // which make_unsigned_t already zero-extended.
-          p = hashed_shard(
-              static_cast<uint64_t>(static_cast<int64_t>(indices_data[i])),
-              global_capacity_per_feature[t], shard_capacity_per_feature[t]);
+          p = hashed_shard(stored_key(indices_data[i]),
+                           global_capacity_per_feature[t],
+                           shard_capacity_per_feature[t]);
           break;
         default: // DistType::kBlock
           p = block_bucket(indices_data[i], blk_size, my_size).bucket;
@@ -415,10 +412,9 @@ __launch_bounds__(kMaxThreads) void _block_bucketize_sparse_features_cuda_kernel
           new_idx = idx;
           break;
         case DistType::kHashedBucket:
-          // Sign-extend, see kernel1.
-          p = hashed_shard(
-              static_cast<uint64_t>(static_cast<int64_t>(indices_data[i])),
-              global_capacity_per_feature[t], shard_capacity_per_feature[t]);
+          p = hashed_shard(stored_key(indices_data[i]),
+                           global_capacity_per_feature[t],
+                           shard_capacity_per_feature[t]);
           new_idx = idx;
           break;
         default: { // DistType::kBlock
