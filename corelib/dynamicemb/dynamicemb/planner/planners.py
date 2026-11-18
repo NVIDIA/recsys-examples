@@ -49,6 +49,7 @@ from ..dynamicemb_config import (
     get_group_value_bytes_by_tier,
     normalize_caching_against_hbm_budget,
 )
+from ..types import BUCKET_ALIGNMENT
 from .placement import BalancedNodePlacer, NodePlacer, TableToPlace
 from .plan import (
     TableKey,
@@ -510,6 +511,17 @@ def _prepare_dynemb_table_options(
             # It changes with the fan-out, so such a table is routed
             # consistently but not reloaded losslessly across world sizes.
             opts.global_capacity = fanout * aligned_per_rank_rows
+            warnings.warn(
+                f"{tmp_config.name}: dist_type 'hash_bucket' with "
+                "MAX_BUCKET_CAPACITY (one bucket per shard) routes keys "
+                "consistently but is not fan-out invariant: its global_capacity "
+                f"{opts.global_capacity} is {fanout} shards x {aligned_per_rank_rows} "
+                "rows and changes with the number of shards, so a checkpoint "
+                "reloaded at another world size re-partitions its keys and may "
+                "lose rows where a shard fills. Give bucket_capacity a multiple of "
+                f"{BUCKET_ALIGNMENT} for the fan-out-invariant layout.",
+                UserWarning,
+            )
         else:
             global_layout = _global_table_bucket_layout(
                 tmp_config, effective_bucket_capacity

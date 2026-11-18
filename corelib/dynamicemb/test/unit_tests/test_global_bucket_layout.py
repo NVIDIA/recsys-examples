@@ -473,12 +473,14 @@ def test_planner_one_bucket_per_shard_routes_over_the_shards_laid_end_to_end():
     """MAX_BUCKET_CAPACITY has no whole-table form: the rule's modulus is then
     world_size * shard rows, which routes uniformly but is not fan-out invariant."""
     for world_size in (1, 2, 8):
-        opts = _plan(
-            NUM_EMBEDDINGS,
-            world_size,
-            dist_type="hash_bucket",
-            bucket_capacity=MAX_BUCKET_CAPACITY,
-        )
+        # Routed consistently, but the user is told it is not fan-out invariant.
+        with pytest.warns(UserWarning, match="not fan-out invariant"):
+            opts = _plan(
+                NUM_EMBEDDINGS,
+                world_size,
+                dist_type="hash_bucket",
+                bucket_capacity=MAX_BUCKET_CAPACITY,
+            )
         assert opts.global_capacity == world_size * opts.max_capacity
         assert (
             hashed_shard_capacity(
