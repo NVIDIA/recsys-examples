@@ -21,9 +21,8 @@ That is where a restore loses rows. A table trained at 8 ranks to 97 % fill
 holds, in every bucket, at most `bc` keys -- the overflow was evicted during
 training. Loaded at 1 rank, those keys land in different buckets: some now hold
 more than `bc` keys, and the load path (`insert` with `ASSIGN`) evicts the
-surplus. Measured on a real 8-rank checkpoint folded onto one GPU
-(`TorchEasyRec`, `model.ckpt-412`, 89 tables, STEP/FTRL): 1.3-2.0 % of the rows
-of every in-memory table were lost; synthetic CACHING tables at 97 % fill lost
+surplus. Measured on a real production 8-rank checkpoint folded onto one GPU,
+1.3-2.0 % of the rows of every in-memory table were lost; synthetic CACHING tables at 97 % fill lost
 2.3 % with `bucket_capacity=128` and 0.3 % with 1024; HYBRID tables lost a
 further ~1.2 % on every same-topology reload. Only the external (RocksDB)
 storage, which has no buckets, restored exactly.
