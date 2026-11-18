@@ -2,16 +2,18 @@
 # SPDX-License-Identifier: Apache-2.0
 import gc
 import weakref
+from contextlib import ExitStack
 from unittest.mock import patch
 
 import pytest
 import torch
 import torch.distributed as dist
-from dynamicemb import EmbOptimType
+from dynamicemb import DynamicEmbScoreStrategy, EmbOptimType
 from dynamicemb.resolved_storage import matching_rows
 from dynamicemb.shard.resolved_input import ResolvedEmbeddingInput
 from dynamicemb.types import CopyMode
 from test_hbm_receiver import (  # noqa: F401
+    PipelineModel,
     batch,
     check_debug,
     distribute,
@@ -19,6 +21,10 @@ from test_hbm_receiver import (  # noqa: F401
     make_model,
     output,
     tables,
+)
+from torchrec.distributed.train_pipeline import (
+    PrefetchTrainPipelineSparseDist,
+    TrainPipelineSparseDist,
 )
 
 LAYOUTS = ["host", "hybrid", "ps"]
@@ -234,3 +240,166 @@ def test_cancelled_storage_rows_survive_queued_cross_stream_copy():
     assert (target.unique_values == 77).all()
     assert all(tensor.shape == shape for tensor in reuse)
     table._active_rows.release(target)
+
+
+@pytest.mark.parametrize(
+    "layout,dedup,dtype,fused",
+    [
+        ("host", False, torch.int64, False),
+        ("hybrid", True, torch.int32, True),
+        ("ps", True, torch.int64, True),
+    ],
+)
+def test_input_dist_resolves_before_lookup(dedup, dtype, fused, layout):
+    model = make_model(dedup=dedup, layout=layout)
+    features = batch(dtype=dtype, empty_rank=dist.get_world_size() > 1)
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        ctx, arrived = distribute(model, features, fused=fused)
+        assert isinstance(arrived[0], ResolvedEmbeddingInput)
+        groups = arrived[0].split(model._lookups[0]._feature_splits)
+        for group in groups:
+            state = group.prefetch_state
+            torch.testing.assert_close(
+                group.values(), state.value_row_indices[state.reverse_indices]
+            )
+            assert (state.value_row_indices >= 0).all()
+        assert ctx.sharding_contexts[0].input_splits
+        assert ctx.sharding_contexts[0].output_splits
+    torch.cuda.current_stream().wait_stream(stream)
+    arrived.record_stream(torch.cuda.current_stream())
+    ctx.record_stream(torch.cuda.current_stream())
+    # A prefetch pipeline must not enqueue, resolve or pin this batch twice.
+    for lookup, local_features in zip(model._lookups, arrived):
+        lookup.prefetch(local_features, forward_stream=stream)
+    assert all(not table._prefetch_states for table in tables(model))
+    with ExitStack() as checks:
+        checks.enter_context(
+            patch(
+                "dynamicemb.batched_dynamicemb_function._find_keys",
+                side_effect=AssertionError("lookup hashed a key"),
+            )
+        )
+        native_calls = []
+        for table in tables(model):
+            native = table._native_lookup._dense_module(False)
+            native_calls.append(
+                checks.enter_context(
+                    patch.object(native, "_operation", wraps=native._operation)
+                )
+            )
+            checks.enter_context(
+                patch.object(
+                    table.tables,
+                    "find",
+                    side_effect=AssertionError("lookup read keys from a storage"),
+                )
+            )
+        result = output(model, ctx, arrived)
+        assert all(call.call_count == 1 for call in native_calls)
+    check_debug(result, features)
+    sum(jt.values().sum() for jt in result.values()).backward()
+    for table in tables(model):
+        assert not table._active_rows.states
+
+
+def test_mixed_hbm_and_host_groups():
+    model = make_model(
+        dedup=True,
+        table_options={
+            "t1": {
+                "global_hbm_for_values": 0,
+                "score_strategy": DynamicEmbScoreStrategy.LFU,
+            }
+        },
+    )
+    features = batch()
+    ctx, arrived = distribute(model, features)
+    groups = arrived[0].split(model._lookups[0]._feature_splits)
+    assert sorted(isinstance(group, ResolvedEmbeddingInput) for group in groups) == [
+        True,
+        True,
+    ]
+    model.prefetch(arrived, ctx=ctx)
+    with torch.no_grad():
+        check_debug(output(model, ctx, arrived), features)
+    assert all(not table._prefetch_states for table in tables(model))
+
+
+@pytest.mark.parametrize("layout", ["host", "hybrid", "ps"])
+def test_legacy_prefetch_owns_rows_until_forward(layout):
+    table = tables(make_model(layout=layout))[0]
+    features = batch()
+    table.prefetch(features.values(), features.offsets())
+    refs = [weakref.ref(state) for state in table._prefetch_states]
+    gc.collect()
+    assert all(ref() is not None for ref in refs)
+    result = table(features.values(), features.offsets())
+    assert not table._prefetch_states
+    assert all(ref() is not None for ref in refs)
+    del result
+    gc.collect()
+    assert all(ref() is None for ref in refs)
+    assert not table._active_rows.states
+
+
+@pytest.mark.parametrize(
+    "layout,pipeline_type,clear_inputs,scored",
+    [
+        ("cache", PrefetchTrainPipelineSparseDist, False, True),
+        ("cache_ps", TrainPipelineSparseDist, True, False),
+        ("host", TrainPipelineSparseDist, False, True),
+        ("hybrid", PrefetchTrainPipelineSparseDist, False, False),
+        ("ps", TrainPipelineSparseDist, False, False),
+    ],
+    ids=[
+        "cache-prefetch-scores",
+        "cache-ps-clear",
+        "host-scores",
+        "hybrid-prefetch",
+        "ps",
+    ],
+)
+def test_sparse_dist_pipelines_with_storage(
+    pipeline_type, clear_inputs, scored, layout, monkeypatch
+):
+    if clear_inputs:
+        import inspect
+
+        if "clear_data_dist_inputs" not in inspect.signature(pipeline_type).parameters:
+            pytest.skip("TorchRec has no input-clearing option")
+        from torchrec.distributed.train_pipeline.runtime_forwards import (
+            PipelinedForward,
+        )
+
+        # The public constructor updates this class option. Restore it after
+        # the case so default-pipeline tests retain their original scheduling.
+        monkeypatch.setattr(PipelinedForward, "_use_main_stream_for_dist_init", False)
+    score = (
+        DynamicEmbScoreStrategy.PRECISE_CUSTOMIZED
+        if scored
+        else DynamicEmbScoreStrategy.TIMESTAMP
+    )
+    collection = make_model(optimizer=EmbOptimType.SGD, score=score, layout=layout)
+    model = PipelineModel(collection)
+    pipeline = pipeline_type(
+        model,
+        torch.optim.SGD([model.dense], lr=0.1),
+        torch.device("cuda", torch.cuda.current_device()),
+        execute_all_batches=True,
+        **({"clear_data_dist_inputs": True} if clear_inputs else {}),
+    )
+    control = PipelineModel(
+        make_model(optimizer=EmbOptimType.SGD, score=score, layout=layout)
+    )
+    inputs = [batch(start=iteration * 4, scored=scored) for iteration in range(4)]
+    iterator = iter(inputs)
+    for features in inputs:
+        actual = pipeline.progress(iterator)
+        loss, expected = control(features)
+        loss.sum().backward()
+        torch.testing.assert_close(actual, expected)
+    with pytest.raises(StopIteration):
+        pipeline.progress(iterator)
+    assert all(not table._active_rows.states for table in tables(collection))

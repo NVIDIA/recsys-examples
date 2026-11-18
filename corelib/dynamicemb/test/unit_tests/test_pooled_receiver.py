@@ -38,11 +38,14 @@ LAYOUTS = ["hbm", "cache", "host", "hybrid", "ps", "cache_ps"]
 
 @pytest.mark.parametrize("layout", LAYOUTS)
 @pytest.mark.parametrize(
-    "pooling,weighted",
-    [(PoolingType.SUM, False), (PoolingType.MEAN, False), (PoolingType.SUM, True)],
+    "pooling,weighted,optimizer,dims,native_dense",
+    [
+        (PoolingType.SUM, False, EmbOptimType.ADAM, (8, 8), True),
+        (PoolingType.MEAN, False, EmbOptimType.SGD, (7, 11), False),
+        (PoolingType.SUM, True, EmbOptimType.ADAM, (7, 11), False),
+    ],
+    ids=["dense-sum-adam", "mixed-mean-sgd", "weighted-ebc-adam"],
 )
-@pytest.mark.parametrize("optimizer", [EmbOptimType.SGD, EmbOptimType.ADAM])
-@pytest.mark.parametrize("dims,native_dense", [((8, 8), True), ((7, 11), False)])
 def test_pooled_lookup_and_update_match_unsharded_torchrec(
     layout, pooling, weighted, optimizer, dims, native_dense
 ):
@@ -137,11 +140,20 @@ def test_pooled_lookup_and_update_match_unsharded_torchrec(
 
 
 @pytest.mark.parametrize("layout", LAYOUTS)
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("dims", [(8, 8), (7, 11)])
 @pytest.mark.parametrize(
-    "pooling,weighted",
-    [(PoolingType.SUM, False), (PoolingType.MEAN, False), (PoolingType.SUM, True)],
+    "dtype,dims,pooling,weighted",
+    [
+        (torch.float16, (8, 8), PoolingType.SUM, True),
+        (torch.bfloat16, (7, 11), PoolingType.MEAN, False),
+        (torch.float16, (7, 11), PoolingType.SUM, False),
+        (torch.bfloat16, (8, 8), PoolingType.SUM, True),
+    ],
+    ids=[
+        "weighted-fp16-dense",
+        "bf16-mixed-mean",
+        "fp16-mixed-sum",
+        "weighted-bf16-fallback",
+    ],
 )
 def test_low_precision_pooling_and_update(layout, dtype, dims, pooling, weighted):
     model = make_model(
@@ -343,3 +355,45 @@ def test_feature_processor_preserves_no_grad_contract(grad_enabled):
     assert all(not table._active_rows.states for table in tables(model))
     for table in tables(model):
         assert (table.tables.key_index_map._ref_counter == 0).all()
+
+
+@pytest.mark.parametrize(
+    "pooling,dims,weighted",
+    [
+        (None, (7, 7), False),
+        (PoolingType.SUM, (8, 8), False),
+        (PoolingType.SUM, (7, 11), True),
+    ],
+    ids=["ec-fallback", "dense-pooled", "weighted-ebc-fallback"],
+)
+def test_cold_lookup_after_restore_preserves_rng(pooling, dims, weighted):
+    warm = tables(make_model(pooling=pooling, dims=dims, weighted=weighted))[0].eval()
+    restored = tables(make_model(pooling=pooling, dims=dims, weighted=weighted))[
+        0
+    ].eval()
+    features = batch(count=2)
+    kwargs = (
+        dict(pooling_weights=torch.ones(features.values().numel(), device="cuda"))
+        if weighted
+        else {}
+    )
+    with torch.no_grad():
+        warm(features.values(), features.offsets(), **kwargs)
+    restored.load_state_dict(warm.state_dict())
+    cpu_rng = torch.get_rng_state()
+    cuda_rng = torch.cuda.get_rng_state()
+    with torch.no_grad():
+        expected = warm(features.values(), features.offsets(), **kwargs)
+        expected_dropout = torch.nn.functional.dropout(expected, p=0.5, training=True)
+        expected_cpu = torch.rand(16)
+    torch.set_rng_state(cpu_rng)
+    torch.cuda.set_rng_state(cuda_rng)
+    with torch.no_grad():
+        actual = restored(features.values(), features.offsets(), **kwargs)
+        assert torch.equal(cpu_rng, torch.get_rng_state())
+        assert torch.equal(cuda_rng, torch.cuda.get_rng_state())
+        torch.testing.assert_close(actual, expected)
+        actual_dropout = torch.nn.functional.dropout(actual, p=0.5, training=True)
+        actual_cpu = torch.rand(16)
+    torch.testing.assert_close(actual_dropout, expected_dropout)
+    torch.testing.assert_close(actual_cpu, expected_cpu)

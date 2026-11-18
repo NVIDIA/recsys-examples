@@ -51,6 +51,7 @@ from torchrec import (
     EmbeddingCollection,
     EmbeddingConfig,
     KeyedJaggedTensor,
+    PoolingType,
 )
 from torchrec.distributed.embedding_sharding import (
     FusedKJTListSplitsAwaitable,
@@ -982,3 +983,53 @@ def test_fp8_receiver_decodes_rows_and_preserves_small_gradients(layout):
         torch.testing.assert_close(
             actual[key].values(), before_eval[key], rtol=0, atol=0
         )
+
+
+def test_later_group_resolution_failure_releases_earlier_pins():
+    model = make_model(
+        table_options={"t1": {"score_strategy": DynamicEmbScoreStrategy.LFU}}
+    )
+    features = batch()
+    grouped = model._lookups[0]
+    assert len(grouped._emb_modules) == 2
+    table = grouped._emb_modules[0].emb_module
+    with patch.object(
+        grouped._emb_modules[1],
+        "resolve_input",
+        side_effect=RuntimeError("receiver failure"),
+    ):
+        with pytest.raises(RuntimeError, match="receiver failure"):
+            distribute(model, features)
+    gc.collect()
+    torch.cuda.synchronize()
+    owner = table._cache if table._cache is not None else table._storage
+    assert torch.count_nonzero(owner._state.key_index_map._ref_counter).item() == 0
+
+
+@pytest.mark.parametrize("pooling", [None, PoolingType.SUM])
+def test_raw_grouped_prefetch_keeps_legacy_contract(pooling):
+    model = make_model(pooling=pooling)
+    shardings = (
+        model._sharding_type_to_sharding.values()
+        if pooling is None
+        else model._embedding_shardings
+    )
+    for sharding in shardings:
+        sharding._input_postprocessor = None
+    features = batch()
+    ctx, arrived = distribute(model, features)
+    for lookup, group in zip(model._lookups, arrived):
+        lookup.prefetch(group)
+    result = output(model, ctx, arrived)
+    if pooling is None:
+        check_debug(result, features)
+        loss = sum(jt.values().sum() for jt in result.values())
+    else:
+        expected = torch.cat(
+            [jt.values().float().sum().expand(8) for jt in features.to_dict().values()]
+        ).view(1, -1)
+        torch.testing.assert_close(result.values(), expected)
+        loss = result.values().sum()
+    loss.backward()
+    assert all(not table._prefetch_states for table in tables(model))
+    assert all(not table._active_rows.states for table in tables(model))
