@@ -1110,6 +1110,13 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
         return self._table_names
 
     @property
+    def dynamicemb_options(self) -> List[DynamicEmbTableOptions]:
+        """Per table, the options it was built with -- the planner's, after
+        sharding: ``bucket_capacity``, ``max_capacity`` and, for a ``hash_bucket``
+        table, ``global_capacity`` are the values the table really uses."""
+        return self._dynamicemb_options
+
+    @property
     def optimizer(
         self,
     ) -> BaseDynamicEmbeddingOptimizer:

@@ -25,10 +25,6 @@ import torch.distributed as dist
 import torchrec
 from dynamicemb import DynamicEmbTableOptions
 from dynamicemb.dump_load import find_sharded_modules, get_dynamic_emb_module
-from dynamicemb.dynamicemb_config import (
-    DEFAULT_BUCKET_CAPACITY,
-    _global_bucket_layout_rows,
-)
 from dynamicemb.key_ownership import owned_key_mask
 from dynamicemb.key_value_table import Storage
 from dynamicemb.planner import (
@@ -481,15 +477,22 @@ class ConstructTwinModule:
         # Seeding a row's optimizer state is the optimizer's call, not the
         # storage's, so keep a handle on it alongside the storage.
         table_name_map_optimizer = {}
+        # The options the planner gave each table, after sharding. Which rank
+        # owns a key is the table's rule with the table's own parameters
+        # (hash_bucket needs its global_capacity and bucket_capacity), so read
+        # them from the table rather than re-deriving them here.
+        table_name_map_options = {}
         for dynamic_emb_module in tmp_dynamic_emb_module_list:
             tmp_table_names = dynamic_emb_module.table_names
             tmp_storage = dynamic_emb_module.tables
             tmp_optimizer = dynamic_emb_module.optimizer
+            tmp_options = dynamic_emb_module.dynamicemb_options
 
             for i, tmp_table_name in enumerate(tmp_table_names):
                 table_name_map_hkv_table[tmp_table_name] = tmp_storage
                 table_name_map_table_id[tmp_table_name] = i
                 table_name_map_optimizer[tmp_table_name] = tmp_optimizer
+                table_name_map_options[tmp_table_name] = tmp_options[i]
 
         # Perform all lookup iterations
         for iter_idx in range(total_iterations):
@@ -548,31 +551,22 @@ class ConstructTwinModule:
             indices = result["indices"]
             values = result["values"]
 
-            # Get the dimension for this feature
-            feature_idx = self._feature_names.index(feature)
-            dim = self._dims[feature_idx]
-
-            # The same rule the planner gave the table: hash_bucket needs
-            # the whole table's capacity, which get_planner's options derive
-            # from num_embeddings and the default bucket capacity.
-            global_capacity = None
-            if self._dist_type == "hash_bucket":
-                layout = _global_bucket_layout_rows(
-                    self._num_embeddings[feature_idx] * self._scale_factor,
-                    DEFAULT_BUCKET_CAPACITY,
-                )
-                global_capacity = layout[0] * layout[1] if layout is not None else None
+            tmp_table_name = feature.replace("f_", "t_")
+            option = table_name_map_options[tmp_table_name]
             mask = owned_key_mask(
                 indices,
                 self._global_rank,
                 self._world_size,
-                self._dist_type,
-                global_capacity=global_capacity,
-                bucket_capacity=DEFAULT_BUCKET_CAPACITY,
+                option.dist_type,
+                global_capacity=option.global_capacity,
+                bucket_capacity=option.bucket_capacity,
             )
             if mask is None:
                 mask = torch.ones_like(indices, dtype=torch.bool)
             filtered_indices = indices[mask]
+
+            # Get the dimension for this feature
+            dim = self._dims[self._feature_names.index(feature)]
 
             # Reshape values to [num_indices, dim]
             values = values.reshape(-1, dim)
@@ -597,7 +591,6 @@ class ConstructTwinModule:
             unique_indices = uniq_key
             unique_values = chosen_value
 
-            tmp_table_name = feature.replace("f_", "t_")
             cur_hkv_table: Storage = table_name_map_hkv_table[tmp_table_name]
             table_id = table_name_map_table_id[tmp_table_name]
             max_emb_dim = cur_hkv_table.max_embedding_dim()
