@@ -52,8 +52,17 @@ from torchrec.distributed.types import (
 from torchrec.sparse.jagged_tensor import KeyedJaggedTensor
 
 from ..batched_dynamicemb_tables import BatchedDynamicEmbeddingTablesV2
-from .input_dist import bucketize_kjt_before_all2all, dist_type_codes
-from .rw_sharding import GroupedPooledEmbeddingsLookup, dist_type_per_feature
+from .input_dist import (
+    _PostprocessedSplitsAwaitable,
+    bucketize_kjt_before_all2all,
+    dist_type_codes,
+    resolve_at_receive,
+)
+from .rw_sharding import (
+    GroupedPooledEmbeddingsLookup,
+    dist_type_per_feature,
+    sharding_has_dynamic_tables,
+)
 
 
 class TwRwSparseFeaturesDist(_TwRwSparseFeaturesDist):
@@ -88,6 +97,7 @@ class TwRwSparseFeaturesDist(_TwRwSparseFeaturesDist):
         has_feature_processor: bool = False,
         need_pos: bool = False,
         dist_types: Optional[List[str]] = None,
+        input_postprocessor=None,
     ) -> None:
         super().__init__(
             pg=pg,
@@ -103,6 +113,11 @@ class TwRwSparseFeaturesDist(_TwRwSparseFeaturesDist):
             dist_type_codes(dist_types, device=device),
             persistent=False,
         )
+        self._input_postprocessor = input_postprocessor
+        self._resolve_via_dist_init = input_postprocessor is not None and pg.size() > 1
+        if input_postprocessor is not None and not self._resolve_via_dist_init:
+            self._key_dist = self._dist
+            del self._dist
 
     def forward(
         self,
@@ -133,6 +148,14 @@ class TwRwSparseFeaturesDist(_TwRwSparseFeaturesDist):
             self._sf_staggered_shuffle,
             self._sf_staggered_shuffle_tensor,
         )
+        if self._resolve_via_dist_init:
+            return self._dist(
+                resolve_at_receive(bucketized_features, self._input_postprocessor)
+            )
+        if self._input_postprocessor is not None:
+            return _PostprocessedSplitsAwaitable(
+                self._key_dist(bucketized_features), self._input_postprocessor
+            )
         return self._dist(bucketized_features)
 
 
@@ -164,6 +187,7 @@ class TwRwPooledDynamicEmbeddingSharding(TwRwPooledEmbeddingSharding):
         self._dist_type_per_feature: Dict[str, str] = dist_type_per_feature(
             sharding_infos
         )
+        self._has_dynamic_tables = sharding_has_dynamic_tables(sharding_infos)
 
     def create_input_dist(
         self,
@@ -186,6 +210,7 @@ class TwRwPooledDynamicEmbeddingSharding(TwRwPooledEmbeddingSharding):
             dist_types=[
                 self._dist_type_per_feature[name] for name in self.feature_names()
             ],
+            input_postprocessor=self._input_postprocessor,
         )
 
     def create_lookup(
@@ -223,4 +248,7 @@ class TwRwPooledDynamicEmbeddingSharding(TwRwPooledEmbeddingSharding):
             inner = getattr(emb, "emb_module", None)
             if isinstance(inner, BatchedDynamicEmbeddingTablesV2):
                 inner.set_shard_pg(self._intra_pg)
+        self._input_postprocessor = (
+            lookup.resolve_input if self._has_dynamic_tables else None
+        )
         return lookup
