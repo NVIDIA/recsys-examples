@@ -28,7 +28,7 @@ from dynamicemb import (
     DynamicEmbScoreStrategy,
     DynamicEmbTableOptions,
     FrequencyAdmissionStrategy,
-    get_sharded_table_capacity,
+    get_global_table_capacity,
 )
 from dynamicemb.batched_dynamicemb_tables import BatchedDynamicEmbeddingTablesV2
 from dynamicemb.dump_load import (
@@ -38,13 +38,14 @@ from dynamicemb.dump_load import (
     get_dynamic_emb_module,
 )
 from dynamicemb.dynamicemb_config import (
+    DEFAULT_BUCKET_CAPACITY,
     DynamicEmbInitializerArgs,
     DynamicEmbInitializerMode,
     ScoreStrategy,
     get_table_value_bytes,
 )
 from dynamicemb.embedding_admission import KVCounter
-from dynamicemb.key_ownership import murmur3_fmix64
+from dynamicemb.key_ownership import hashed_shard_capacity, murmur3_fmix64
 from dynamicemb.key_value_table import DynamicEmbStorage, HybridStorage
 from dynamicemb.planner import get_planner
 from dynamicemb.scored_hashtable import ScoreArg, ScorePolicy
@@ -383,7 +384,7 @@ def apply_dmp(
             eb_config,
             emb_opt_type,
             world_size,
-            MAX_BUCKET_CAPACITY,
+            table_bucket_capacity(dist_type),
         )
         if caching:
             global_hbm = int(value_bytes * cache_capacity_ratio)
@@ -398,7 +399,7 @@ def apply_dmp(
                 mode=DynamicEmbInitializerMode.CONSTANT,
                 value=TABLE_INITIALIZER_VALUE,
             ),
-            bucket_capacity=MAX_BUCKET_CAPACITY,  # keep same to the bucket capacity from get_table_value_bytes
+            bucket_capacity=table_bucket_capacity(dist_type),  # keep same to the bucket capacity from get_table_value_bytes
             caching=caching,
             admit_strategy=admit_strategy,
             **table_output_dist.get(eb_config.name, {}),
@@ -437,6 +438,18 @@ def apply_dmp(
     ]
     hier_switch.track(dmp, *(fields for _, fields in collection_output_dist))
     return dmp
+
+
+def table_bucket_capacity(dist_type: str) -> int:
+    """The bucket capacity these tests give a table: one bucket per shard
+    (``MAX_BUCKET_CAPACITY``), except under ``hash_bucket``, which exists for the
+    global bucket layout of a table of ordinary buckets. With one bucket per shard
+    its global capacity is ``world_size * shard rows`` and changes with the
+    fan-out, so a checkpoint would never be reloaded under the layout it was
+    written with."""
+    if dist_type == "hash_bucket":
+        return DEFAULT_BUCKET_CAPACITY
+    return MAX_BUCKET_CAPACITY
 
 
 def create_model(
@@ -578,9 +591,9 @@ def owns_key(
     as the int64 key a table stores.
 
     hash_bucket routes by the table's global bucket layout, so it needs the
-    table's size: these tables use MAX_BUCKET_CAPACITY (one bucket per shard),
-    for which the planner sets global_capacity = world_size * shard rows and
-    the bucket capacity to the shard's rows (``_prepare_dynemb_table_options``).
+    table's size: its whole-table capacity and the rows one shard holds follow from
+    ``num_embeddings`` and the bucket capacity the tests give it
+    (``table_bucket_capacity``), as the planner derives them.
     """
     if world_size <= 1:
         return True
@@ -589,17 +602,19 @@ def owns_key(
     if dist_type == "hash_bucket":
         if num_embeddings is None:
             raise ValueError("owns_key: hash_bucket needs the table's num_embeddings")
-        shard_capacity = get_sharded_table_capacity(
+        bucket_capacity = table_bucket_capacity(dist_type)
+        global_capacity = get_global_table_capacity(
             EmbeddingConfig(
                 name="owns_key",
                 embedding_dim=1,
                 num_embeddings=num_embeddings,
                 feature_names=["owns_key"],
             ),
-            world_size,
-            MAX_BUCKET_CAPACITY,
+            bucket_capacity,
         )
-        global_capacity = world_size * shard_capacity
+        shard_capacity = hashed_shard_capacity(
+            global_capacity, bucket_capacity, world_size
+        )
         h = int(murmur3_fmix64(key)) & ((1 << 63) - 1)
         return (h % global_capacity) // shard_capacity == rank
     return (int(key) & 0xFFFFFFFFFFFFFFFF) % world_size == rank

@@ -71,7 +71,12 @@ if [ "${DYNAMICEMB_TEST_OUTPUT_DIST:-}" != "hierarchical" ]; then
 # hash_bucket: dumped and reloaded at the same world size, then across world
 # sizes. The rule sends a key to the rank holding its global hash bucket, so a
 # checkpoint written by one fan-out is loaded by another with every rank
-# reading every file and keeping its own share -- and no bucket overflowing.
+# reading every file and keeping its own share. The tables have ordinary buckets
+# (table_bucket_capacity in test_embedding_dump_load.py), so the layout is the
+# fan-out-invariant one and the second pass reloads it without the
+# re-partition warning. These runs fill the tables far below a bucket, so they
+# check where every key lands; that a bucket filled to 97 % still loses nothing
+# on a fold is test_global_bucket_layout.py's.
 for num_gpus in 1 2; do
   for mode in "dump" "load"; do
     echo "hash_bucket: num_gpus: $num_gpus, mode: $mode"
