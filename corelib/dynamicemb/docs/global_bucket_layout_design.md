@@ -89,9 +89,15 @@ The input distributors (`RwSparseFeaturesDist`, `TwRwSparseFeaturesDist`) carry
 two int64 buffers next to the dist-type codes, `(global_capacity,
 shard_capacity)` per feature (`routing_param_tensors`, `shard/input_dist.py`),
 built once from the options the planner put into `fused_params`
-(`routing_params_per_feature`, `shard/rw_sharding.py`) and validated on the host
-so the per-batch kernel call has no checks and no sync. A `hash_bucket`
-feature without them is refused, not routed by some other modulus.
+(`routing_params_per_feature`, `shard/rw_sharding.py`: `global_capacity`,
+`bucket_capacity`, `max_capacity`). The shard capacity is not taken from the
+options but derived with `hashed_shard_capacity`, the way the host rule derives
+it, and checked against the table's `max_capacity`: a plan made for another
+number of shards than the distributor has is refused, since routing and
+checkpoint loading would otherwise disagree without a sound. All of it is
+validated on the host so the per-batch kernel call has no checks and no sync. A
+`hash_bucket` feature without the options is refused, not routed by some other
+modulus.
 
 ## 4. Options and planner
 

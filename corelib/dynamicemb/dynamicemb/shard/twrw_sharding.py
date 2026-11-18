@@ -96,7 +96,7 @@ class TwRwSparseFeaturesDist(_TwRwSparseFeaturesDist):
         has_feature_processor: bool = False,
         need_pos: bool = False,
         dist_types: Optional[List[str]] = None,
-        routing_params: Optional[List[Tuple[int, int]]] = None,
+        routing_params: Optional[List[Tuple[int, int, int]]] = None,
     ) -> None:
         super().__init__(
             pg=pg,
@@ -188,7 +188,7 @@ class TwRwPooledDynamicEmbeddingSharding(TwRwPooledEmbeddingSharding):
             sharding_infos
         )
         self._routing_params_per_feature: Dict[
-            str, Tuple[int, int]
+            str, Tuple[int, int, int]
         ] = routing_params_per_feature(sharding_infos)
 
     def create_input_dist(

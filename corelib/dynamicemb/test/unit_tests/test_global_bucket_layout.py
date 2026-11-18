@@ -280,8 +280,11 @@ def test_routing_kernel_and_host_rule_agree(current_device, num_shards, key_dtyp
         assert torch.equal(rule.owner(keys.to(torch.int64)), host)
 
     global_caps, shard_caps = routing_param_tensors(
-        ["hash_bucket"], [(GLOBAL_CAPACITY, shard_capacity)], num_shards, device
+        ["hash_bucket"], [(GLOBAL_CAPACITY, BC, shard_capacity)], num_shards, device
     )
+    # The shard capacity is derived, the way the host rule derives it.
+    assert global_caps.tolist() == [GLOBAL_CAPACITY]
+    assert shard_caps.tolist() == [shard_capacity]
     new_lengths, _, _, _, permute = block_bucketize_sparse_features(
         torch.tensor([keys.numel()], dtype=torch.int64, device=device),
         keys,
@@ -308,15 +311,34 @@ def test_routing_without_parameters_is_refused():
     with pytest.raises(ValueError, match="global_capacity"):
         owning_shard(torch.arange(10, device=device), 2, "hash_bucket")
     with pytest.raises(ValueError, match="needs a positive"):
-        routing_param_tensors(["hash_bucket"], [(0, 0)], 2, device)
-    with pytest.raises(ValueError, match="shards"):
-        # 8 shards' worth of buckets on a 2-shard distributor.
+        routing_param_tensors(["hash_bucket"], [(0, 0, 0)], 2, device)
+    with pytest.raises(ValueError, match="another number of shards"):
+        # A plan made for 8 shards (max_capacity is one 8th of the table) on a
+        # 2-shard distributor: the route would use another shard capacity than
+        # the host rule derives for 2 shards, and routing and loading would
+        # silently disagree.
         routing_param_tensors(
             ["hash_bucket"],
-            [(GLOBAL_CAPACITY, buckets_per_shard(8) * BC)],
+            [(GLOBAL_CAPACITY, BC, buckets_per_shard(8) * BC)],
             2,
             device,
         )
+    with pytest.raises(ValueError, match="multiple"):
+        # hashed_shard_capacity refuses a global capacity that is not a whole
+        # number of buckets.
+        routing_param_tensors(
+            ["hash_bucket"], [(GLOBAL_CAPACITY + 1, BC, BC)], 2, device
+        )
+    # Every shard count the plan can be made for is accepted with its own plan.
+    for shards in (1, 2, 3, 8):
+        g, s = routing_param_tensors(
+            ["hash_bucket"],
+            [(GLOBAL_CAPACITY, BC, buckets_per_shard(shards) * BC)],
+            shards,
+            device,
+        )
+        assert g.tolist() == [GLOBAL_CAPACITY]
+        assert s.tolist() == [buckets_per_shard(shards) * BC]
     # Other rules carry no parameters and are left alone.
     g, s = routing_param_tensors(["roundrobin", "continuous"], None, 2, device)
     assert g.tolist() == [0, 0] and s.tolist() == [0, 0]

@@ -17,6 +17,7 @@ from typing import List, Optional, Tuple
 
 import torch
 from dynamicemb.dynamicemb_config import DIST_TYPE_CODES
+from dynamicemb.key_ownership import hashed_shard_capacity
 from dynamicemb_extensions import block_bucketize_sparse_features  # pyre-ignore
 from torch import distributed as dist
 from torchrec.distributed.dist_data import KJTAllToAll, KJTAllToAllTensorsAwaitable
@@ -70,7 +71,7 @@ def dist_type_codes(
 
 def routing_param_tensors(
     dist_types: List[str],
-    routing_params: Optional[List[Tuple[int, int]]],
+    routing_params: Optional[List[Tuple[int, int, int]]],
     num_shards: int,
     device: Optional[torch.device] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -78,15 +79,25 @@ def routing_param_tensors(
 
     The parameters of the ``hash_bucket`` rule, in the same feature order as
     :func:`dist_type_codes`; the kernel indexes all three with the same ``t``.
+    ``routing_params`` carries, per feature, ``(global_capacity, bucket_capacity,
+    max_capacity)`` from the table's options; the shard capacity is **derived**
+    here, ``hashed_shard_capacity(global_capacity, bucket_capacity, num_shards)``,
+    the way the host rule (:func:`~dynamicemb.key_ownership.owning_shard`) derives
+    it, so the two cannot disagree. ``max_capacity`` is the capacity the table
+    was sized to at plan time; it has to equal the derived value, or the plan was
+    made for another number of shards than this distributor has, and the kernel
+    would route keys by one rule while a checkpoint load filters them by another.
+
     Built once, when the distributor is, and validated here on the host so the
-    per-batch kernel call stays free of checks and syncs: a ``hash_bucket``
-    feature needs both numbers positive, the global capacity a multiple of the
-    shard's, and ``ceil(global / shard) <= num_shards`` or the kernel would
-    name a shard that does not exist. Features under another rule carry
-    ``(0, 0)``, which the kernel does not read.
+    per-batch kernel call stays free of checks and syncs. A ``hash_bucket``
+    feature needs all three numbers positive and ``global_capacity`` a multiple
+    of ``bucket_capacity``; the derived shard capacity then satisfies
+    ``ceil(global / shard) <= num_shards``, so the kernel never names a shard that
+    does not exist. Features under another rule carry ``(0, 0)``, which the kernel
+    does not read.
     """
     if routing_params is None:
-        routing_params = [(0, 0)] * len(dist_types)
+        routing_params = [(0, 0, 0)] * len(dist_types)
     if len(routing_params) != len(dist_types):
         raise ValueError(
             f"routing_params has {len(routing_params)} entries for "
@@ -94,23 +105,31 @@ def routing_param_tensors(
         )
     global_caps: List[int] = []
     shard_caps: List[int] = []
-    for t, (dist_type, (global_capacity, shard_capacity)) in enumerate(
+    for t, (dist_type, (global_capacity, bucket_capacity, max_capacity)) in enumerate(
         zip(dist_types, routing_params)
     ):
-        global_capacity, shard_capacity = int(global_capacity), int(shard_capacity)
-        if dist_type == "hash_bucket":
-            if global_capacity <= 0 or shard_capacity <= 0:
+        shard_capacity = 0
+        if dist_type != "hash_bucket":
+            global_capacity = 0
+        else:
+            global_capacity = int(global_capacity)
+            bucket_capacity, max_capacity = int(bucket_capacity), int(max_capacity)
+            if global_capacity <= 0 or bucket_capacity <= 0 or max_capacity <= 0:
                 raise ValueError(
                     f"feature {t} uses dist_type 'hash_bucket' and needs a "
-                    "positive global_capacity and shard_capacity, got "
-                    f"({global_capacity}, {shard_capacity})"
+                    "positive global_capacity, bucket_capacity and max_capacity, "
+                    f"got ({global_capacity}, {bucket_capacity}, {max_capacity})"
                 )
-            if -(-global_capacity // shard_capacity) > num_shards:
+            shard_capacity = hashed_shard_capacity(
+                global_capacity, bucket_capacity, num_shards
+            )
+            if shard_capacity != max_capacity:
                 raise ValueError(
-                    f"feature {t}: global_capacity {global_capacity} over "
-                    f"shard_capacity {shard_capacity} needs "
-                    f"{-(-global_capacity // shard_capacity)} shards, but the "
-                    f"distributor has {num_shards}"
+                    f"feature {t}: a hash_bucket table of global_capacity "
+                    f"{global_capacity} and bucket_capacity {bucket_capacity} holds "
+                    f"{shard_capacity} rows per shard over {num_shards} shards, but "
+                    f"its max_capacity is {max_capacity}: the plan was made for "
+                    "another number of shards than this distributor has"
                 )
         global_caps.append(global_capacity)
         shard_caps.append(shard_capacity)
@@ -353,7 +372,7 @@ class RwSparseFeaturesDist(_RwSparseFeaturesDist):
         dist_types: Optional[List[str]] = None,
         per_key_score: bool = False,
         hier: Optional[HierDist] = None,
-        routing_params: Optional[List[Tuple[int, int]]] = None,
+        routing_params: Optional[List[Tuple[int, int, int]]] = None,
     ) -> None:
         super().__init__(
             pg=pg,
