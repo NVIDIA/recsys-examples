@@ -572,6 +572,14 @@ def as_shard(
 
 INSERT_CHUNK = 16384
 
+# The compound strategy is the LruLfu policy (two score words per key). Its
+# insert and eviction do not run in the AoT table kernel but in a driver-launched
+# cubin (src/jit/evict_lrulfu.cu), which rebuilds the table from EvictParams and
+# carries its own copy of the home-bucket arithmetic -- the one place
+# table_global_capacities reaches by a struct field rather than a kernel
+# argument. STEP, LFU alone and TIMESTAMP all take the AoT kernel.
+LRU_LFU = (DynamicEmbScoreStrategy.TIMESTAMP, DynamicEmbScoreStrategy.LFU)
+
 
 def insert_keys(model: BatchedDynamicEmbeddingTablesV2, keys: torch.Tensor) -> None:
     """A training forward inserts the keys it does not find; one key per bag."""
@@ -599,6 +607,7 @@ def dump_shards(
     save_dir: str,
     dist_type: str,
     caching: bool = False,
+    score_strategy=DynamicEmbScoreStrategy.TIMESTAMP,
 ) -> Tuple[np.ndarray, torch.Tensor]:
     """Insert ``keys`` into ``num_shards`` modules, dump them as one checkpoint,
     and return the keys the shards actually hold (what the dump wrote) with
@@ -607,7 +616,13 @@ def dump_shards(
     owner = owner_of(keys, num_shards, dist_type)
     held, values = [], []
     for shard in range(num_shards):
-        model = build_model(current_device, num_shards, dist_type, caching=caching)
+        model = build_model(
+            current_device,
+            num_shards,
+            dist_type,
+            caching=caching,
+            score_strategy=score_strategy,
+        )
         insert_keys(model, torch.from_numpy(keys[owner == shard]).to(device))
         as_shard(model, shard, num_shards)
         model.dump(save_dir)
@@ -627,13 +642,20 @@ def load_shards(
     save_dir: str,
     dist_type: str,
     caching: bool = False,
+    score_strategy=DynamicEmbScoreStrategy.TIMESTAMP,
 ) -> Tuple[np.ndarray, torch.Tensor]:
     """Load the checkpoint into ``num_shards`` fresh modules; return every key
     they hold and the corresponding embedding rows."""
     device = torch.device(f"cuda:{current_device}")
     keys, values = [], []
     for shard in range(num_shards):
-        model = build_model(current_device, num_shards, dist_type, caching=caching)
+        model = build_model(
+            current_device,
+            num_shards,
+            dist_type,
+            caching=caching,
+            score_strategy=score_strategy,
+        )
         as_shard(model, shard, num_shards)
         model.load(save_dir)
         k, v = model.export_keys_values(TABLE, device)
@@ -693,6 +715,42 @@ def test_hash_bucket_checkpoint_reloads_losslessly_at_another_fanout(
         assert_debug_rows(loaded, values)
 
 
+@pytest.mark.parametrize("src_shards,dst_shards", [(8, 1), (2, 1), (1, 2)])
+def test_hash_bucket_lru_lfu_checkpoint_reloads_losslessly_at_another_fanout(
+    current_device, src_shards, dst_shards
+):
+    """The same fold as above for the compound (TIMESTAMP, LFU) strategy, whose
+    inserts run in the LruLfu cubin. A cubin that ignored table_global_capacities
+    -- a fatbin built before EvictParams grew the field -- would place keys by the
+    per-shard layout: buckets that fit under the global one overflow, so rows are
+    evicted on the way in (``held`` falls short of ``keys``) or on the way back."""
+    keys = keys_filling_every_bucket(KEYS_PER_BUCKET)
+    with tempfile.TemporaryDirectory() as save_dir:
+        held, held_values = dump_shards(
+            current_device,
+            keys,
+            src_shards,
+            save_dir,
+            "hash_bucket",
+            score_strategy=LRU_LFU,
+        )
+        assert np.array_equal(np.sort(held), np.sort(keys))
+        loaded, values = load_shards(
+            current_device,
+            dst_shards,
+            save_dir,
+            "hash_bucket",
+            score_strategy=LRU_LFU,
+        )
+    lost = np.setdiff1d(keys, loaded)
+    assert (
+        lost.size == 0
+    ), f"{lost.size} of {keys.size} rows lost on {src_shards} -> {dst_shards}"
+    assert loaded.size == keys.size, "no row duplicated across shards"
+    assert_same_rows(held, held_values, loaded, values)
+    assert_debug_rows(loaded, values)
+
+
 def random_keys(n: int, seed: int = 1) -> np.ndarray:
     """``n`` distinct random keys -- the realistic case: no layout was consulted,
     so buckets fill unevenly and the fullest overflow during training."""
@@ -705,20 +763,36 @@ def random_keys(n: int, seed: int = 1) -> np.ndarray:
     return keys[:n]
 
 
-def test_hash_bucket_training_survivors_reload_losslessly(current_device):
+@pytest.mark.parametrize(
+    "score_strategy",
+    [DynamicEmbScoreStrategy.TIMESTAMP, LRU_LFU],
+    ids=["lru", "lru_lfu"],
+)
+def test_hash_bucket_training_survivors_reload_losslessly(
+    current_device, score_strategy
+):
     """Random keys at 97 % overall fill: the fullest global buckets overflow while
     training and evict, as they would in production. What the 8 shards still
     hold after that fits its buckets by construction -- and the same buckets at
-    1 shard, so the fold keeps every surviving row."""
+    1 shard, so the fold keeps every surviving row. Under LRU_LFU the evictions
+    are the LruLfu cubin's: it has to choose its victim inside the *global*
+    bucket, or the survivors would not fit the buckets they are reloaded into."""
     keys = random_keys(int(0.97 * GLOBAL_CAPACITY))
     with tempfile.TemporaryDirectory() as save_dir:
         held, held_values = dump_shards(
-            current_device, keys, 8, save_dir, "hash_bucket"
+            current_device,
+            keys,
+            8,
+            save_dir,
+            "hash_bucket",
+            score_strategy=score_strategy,
         )
         assert (
             held.size < keys.size
         ), "97 % random fill should have evicted at the source"
-        loaded, values = load_shards(current_device, 1, save_dir, "hash_bucket")
+        loaded, values = load_shards(
+            current_device, 1, save_dir, "hash_bucket", score_strategy=score_strategy
+        )
     assert np.setdiff1d(held, loaded).size == 0, "survivors lost on the 8 -> 1 fold"
     assert loaded.size == held.size
     assert_same_rows(held, held_values, loaded, values)
