@@ -26,7 +26,7 @@
 | --- | --- | --- |
 | `HBM_DIRECT` (`DynamicEmbStorage`, values in HBM) | yes | in-flight keys are pinned by the storage's own ref counter |
 | `CACHE` (`DynamicEmbCache` over a `DynamicEmbStorage`) | yes | only the backing storage is erased, the cache is left alone; see §5 |
-| `DEFAULT` (host values, no `PrefetchState`) | **no** | no ref counter: a key can be erased between forward and the key-based write-back in backward |
+| `DEFAULT` with a `DynamicEmbStorage` (`HOST_ONLY`) | yes | no ref counter: forward's find/insert and backward's write-back take the gate, and the write-back updates only the keys still there, so a key erased between forward and backward loses that batch's update instead of coming back with a score of 0 |
 | `HybridStorage` | **no** | two tiers, no ref counter in use |
 | `CACHE` with an `external_storage` (`CACHING_PS`), or the PS alone (`HOST_PS`) | **no** | erase drops data that is no longer used, so it has nothing to do with a PS; the table is rejected rather than left with a stale copy there (§5, consequence 2) |
 
@@ -474,7 +474,7 @@ reader from seeing a half-filled buffer.
   (§4.8), a parameter. **The key map is read again for every chunk**, and a table's scan
   restarts if its key map was replaced (`key_map_generation`).
 - **`external_storage`: not supported.** A table whose layout has a PS (`CACHING_PS`,
-  `HOST_PS`) is rejected at call time, like `DEFAULT` and `HybridStorage`.
+  `HOST_PS`) is rejected at call time, like `HybridStorage`.
 - **Return value**: the number erased and the number spared (a key whose score is below
   the threshold but that was pinned, so it stays).
 - **`NO_EVICTION` tables can be erased**, as `(NO_EVICTION, CUSTOMIZED)` /
@@ -514,7 +514,7 @@ ranks). 127 pytest items and one distributed script, passing on an H100 node.
 | `test_async_erase.py` | the lock (order, never free while one waits, a waiter interrupted before and after the hand-over, a hot loop does not keep another thread out of the gate), the gate (sections ordered on two streams, with a control; a failed section lets go; copies), the worker and the handle (thread, stream, counts; serial; the three moments; every way of asking raises; `wait_stream`), a real prefetch held back by the chunk the scan is in, and the stress test (three scans in chunks of eight buckets while training grows the table; no step limit) |
 | `test_erase_api.py` | strategy matching, argument checks (also for a model with no module), two-score-word tables, layouts refused (two real, two stand-ins) only where a table is picked, streams (type, device, the ones the training uses warn, the default one, kept), the new parameters (checked, passed through), nothing started when one module is refused, a model with several modules |
 | `test_erase_end_to_end.py` | the sliding window of a table that never evicts (does not grow), training beside the call, by time with `device_timestamp()`, a key a prefetched batch uses is spared until its backward, the same key in two tables with opposite ages, a cache (only the storage is erased, the cache is unchanged) |
-| `test_erase_distributed.py` (`torchrun`, 2 ranks) | `erase_by_score_async` on a `DistributedModelParallel` of row-wise `EmbeddingCollection`: per table, per key and per key in tables that never evict, with and without `use_index_dedup`, and beside training; the ranks erase every old key once between them; a host-only layout is refused |
+| `test_erase_distributed.py` (`torchrun`, 2 ranks) | `erase_by_score_async` on a `DistributedModelParallel` of row-wise `EmbeddingCollection`: per table, per key and per key in tables that never evict, with and without `use_index_dedup`, and beside training; the ranks erase every old key once between them; and the same on a host-only layout |
 | elsewhere | `test_table_rows.py` (digest of a reclaimed slot: rehash, restore), `incremental_dump/test_replay_increment.py` (a delta dumped after an erase by score is refused by `replay_increment`; one after a call that removed nothing is replayed), `table_operation/` (`test_table_without_ref_counter`), `test_no_eviction_row_indexing.py` (the `FLAG` policy, reuse) |
 
 **Not covered, chosen:**
