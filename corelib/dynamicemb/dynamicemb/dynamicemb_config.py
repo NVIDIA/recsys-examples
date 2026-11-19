@@ -1270,9 +1270,10 @@ def _sharded_table_bucket_layout(
     The per-rank count is the whole table's bucket count split over the ranks,
     ``ceil(ceil(N / bc) / world_size)`` -- the same number as
     ``ceil(ceil(N / world_size) / bc)``, so sizing did not change when the
-    whole-table view (:func:`_global_table_bucket_layout`) was introduced; only
-    the sum over ranks did, which may now exceed the global count by up to
-    ``world_size - 1`` buckets that no key maps to.
+    whole-table view (:func:`_global_table_bucket_layout`) was introduced, for
+    any ``dist_type``. The ranks' buckets together may exceed the whole table's
+    ``ceil(N / bc)`` by up to ``world_size - 1`` (as they always could); under
+    ``hash_bucket`` no key maps to those.
     """
     if world_size <= 0:
         raise ValueError(f"world_size must be positive, got {world_size}")
