@@ -122,7 +122,17 @@ the re-insert of `_expand_tables_impl` only moves it within the rank, as it does
 reload promises; below it a bucket holds the keys `{g : g = b mod num_buckets}` of
 the rank, a set that depends on `P` and so on the fan-out. That is only a problem for
 a table that is nearly full at that size, and a table grows at `max_load_factor`
-(0.5 by default); a load into one expands it first (`expand_if_need`), so it fits.
+(0.5 by default). A load into one sizes it by the number of keys it keeps
+(`expand_if_need`: total rows over capacity), not by how many land in each bucket, so
+keys that are hashed uniformly fit with overwhelming probability (a bucket of 128 slots
+holds a mean of 64 at the growth point, and overflows with probability about 1e-12),
+but a checkpoint whose keys are concentrated in global buckets that fold into one
+local bucket can still overflow it: with 100 global buckets, 20 local ones and 128 keys
+in each of the global buckets 0 and 20, the 256 keys are a load factor of 0.1, no
+growth, and 128 of them are lost. Hashed keys do not come like that, so it takes a
+checkpoint built key by key; where that matters, start the table at `max_capacity`
+(leave `init_capacity` unset), where the fold is the identity, or use `roundrobin` or
+`hash_roundrobin`, which promise nothing of the kind.
 Where `num_buckets` does not divide `P` the fold is uneven: a bucket holds
 `floor(P / num_buckets)` or `ceil(P / num_buckets)` of the rank's global buckets. The
 rank's `g` are `P` consecutive numbers from `r * P`, so they cover every residue
