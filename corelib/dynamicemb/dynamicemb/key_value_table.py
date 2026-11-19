@@ -1090,9 +1090,9 @@ def get_expand_info(
                 # A table with a global capacity folds the whole table's bucket map
                 # into the buckets it has (g % num_buckets). Where num_buckets does not
                 # divide the shard's P buckets, a bucket holds floor(P / num_buckets) or
-                # ceil(P / num_buckets) of them, the first P mod num_buckets the extra
-                # one: just under P that is one against two, and at the usual load
-                # factor the doubled buckets at the front are full and evict. So it
+                # ceil(P / num_buckets) of them, a run of P mod num_buckets consecutive
+                # buckets the extra one: just under P that is one against two, and at
+                # the usual load factor the doubled buckets are full and evict. So it
                 # does not stop between P / 2 and P: it grows to P, where the fold is
                 # the identity.
                 global_caps = getattr(state.key_index_map, "global_capacities_", None)

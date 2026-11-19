@@ -124,11 +124,14 @@ the rank, a set that depends on `P` and so on the fan-out. That is only a proble
 a table that is nearly full at that size, and a table grows at `max_load_factor`
 (0.5 by default); a load into one expands it first (`expand_if_need`), so it fits.
 Where `num_buckets` does not divide `P` the fold is uneven: a bucket holds
-`floor(P / num_buckets)` or `ceil(P / num_buckets)` of the rank's global buckets, the
-first `P mod num_buckets` of them the extra one. Up to `P / 2` that is a few percent
+`floor(P / num_buckets)` or `ceil(P / num_buckets)` of the rank's global buckets. The
+rank's `g` are `P` consecutive numbers from `r * P`, so they cover every residue
+`q = floor(P / num_buckets)` times and the `P mod num_buckets` consecutive residues
+from `r * P mod num_buckets` once more: those buckets hold the extra one (the first
+ones on rank 0, a window further on for the others). Up to `P / 2` that is a few percent
 (`4` against `5` at `P / 4`, `2` against `3` at `P / 2`) and costs nothing at the usual
 load factor; between `P / 2` and `P` it is one against two, and the doubled buckets at
-the front are full at load 0.5 (for `P = 977`, `num_buckets = 960`: 17 of them, about 59
+that window are full at load 0.5 (for `P = 977`, `num_buckets = 960`: 17 of them, about 59
 of 61 440 keys evicted, by a Poisson estimate). So `get_expand_info` does not stop
 there: a table with a global capacity whose next size would pass `P / 2` grows to `P`.
 

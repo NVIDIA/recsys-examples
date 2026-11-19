@@ -853,10 +853,10 @@ def test_hash_bucket_table_grows_and_keeps_its_keys(current_device, num_shards):
 def test_hash_bucket_growth_does_not_stop_on_the_uneven_fold(current_device):
     """Where the number of buckets does not divide the shard's P (977 over 8 shards),
     the fold ``g % num_buckets`` puts floor(P / num_buckets) or ceil(P / num_buckets)
-    global buckets in a bucket, the first P mod num_buckets of them the extra one.
-    Between P / 2 and P that is one against two: at 960 buckets the first 17 expect
-    about 126 keys of 128 at the usual load of 0.5, and evict (about 59 of 61 440
-    keys). So a table with a global capacity whose next size would pass P / 2 grows to
+    global buckets in a bucket, a run of P mod num_buckets consecutive buckets (from
+    ``r * P mod num_buckets`` on shard r) the extra one. Between P / 2 and P that is
+    one against two: at 960 buckets 17 of them expect about 126 keys of 128 at the
+    usual load of 0.5, and evict (about 59 of 61 440 keys). So a table with a global capacity whose next size would pass P / 2 grows to
     P (get_expand_info), where the fold is the identity. Random keys fill the first and
     the last shard to 45 % of its rows: the table must end at its max_capacity and
     nothing may be lost."""
