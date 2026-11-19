@@ -1078,7 +1078,7 @@ def get_expand_info(
                 continue
             if new_total / cap > max_lf:
                 results[table_id] = True
-                target_capacities[table_id] = min(
+                target = min(
                     max_cap,
                     max(
                         cap * 2,
@@ -1087,6 +1087,18 @@ def get_expand_info(
                         ),
                     ),
                 )
+                # A table with a global capacity folds the whole table's bucket map
+                # into the buckets it has (g % num_buckets). Where num_buckets does not
+                # divide the shard's P buckets, a bucket holds floor(P / num_buckets) or
+                # ceil(P / num_buckets) of them, the first P mod num_buckets the extra
+                # one: just under P that is one against two, and at the usual load
+                # factor the doubled buckets at the front are full and evict. So it
+                # does not stop between P / 2 and P: it grows to P, where the fold is
+                # the identity.
+                global_caps = getattr(state.key_index_map, "global_capacities_", None)
+                if global_caps and global_caps[table_id] and 2 * target > max_cap:
+                    target = max_cap
+                target_capacities[table_id] = target
     return results, target_capacities
 
 

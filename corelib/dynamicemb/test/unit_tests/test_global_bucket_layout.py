@@ -850,6 +850,40 @@ def test_hash_bucket_table_grows_and_keeps_its_keys(current_device, num_shards):
         torch.cuda.empty_cache()
 
 
+def test_hash_bucket_growth_does_not_stop_on_the_uneven_fold(current_device):
+    """Where the number of buckets does not divide the shard's P (977 over 8 shards),
+    the fold ``g % num_buckets`` puts floor(P / num_buckets) or ceil(P / num_buckets)
+    global buckets in a bucket, the first P mod num_buckets of them the extra one.
+    Between P / 2 and P that is one against two: at 960 buckets the first 17 expect
+    about 126 keys of 128 at the usual load of 0.5, and evict (about 59 of 61 440
+    keys). So a table with a global capacity whose next size would pass P / 2 grows to
+    P (get_expand_info), where the fold is the identity. Random keys fill the first and
+    the last shard to 45 % of its rows: the table must end at its max_capacity and
+    nothing may be lost."""
+    num_shards = 8
+    device = torch.device(f"cuda:{current_device}")
+    keys = random_keys(int(0.45 * GLOBAL_CAPACITY))
+    owner = oracle_shard(keys, num_shards)
+    buckets = buckets_per_shard(num_shards)
+    for shard in (0, num_shards - 1):
+        mine = keys[owner == shard]
+        model = build_model(
+            current_device, num_shards, "hash_bucket", init_fraction=1 / 32
+        )
+        state = model._storage._state
+        start = state.key_index_map.per_table_capacity_[0] // BC
+        assert buckets % start != 0, "it starts on a fold that does not divide P"
+        insert_keys(model, torch.from_numpy(mine).to(device))
+        capacity = state.key_index_map.per_table_capacity_[0]
+        assert capacity == model._dynamicemb_options[0].max_capacity == buckets * BC
+        held = model.export_keys_values(TABLE, device)[0].cpu().numpy()
+        assert (
+            held.size == mine.size
+        ), f"{mine.size - held.size} of {mine.size} keys evicted at 45 % fill"
+        del model
+        torch.cuda.empty_cache()
+
+
 @pytest.mark.parametrize("src_shards,dst_shards", [(2, 1), (8, 1), (1, 2)])
 def test_hash_bucket_grown_checkpoint_reloads_losslessly_at_another_fanout(
     current_device, src_shards, dst_shards

@@ -123,8 +123,14 @@ reload promises; below it a bucket holds the keys `{g : g = b mod num_buckets}` 
 the rank, a set that depends on `P` and so on the fan-out. That is only a problem for
 a table that is nearly full at that size, and a table grows at `max_load_factor`
 (0.5 by default); a load into one expands it first (`expand_if_need`), so it fits.
-Where `num_buckets` does not divide `P` the fold is slightly uneven: a bucket holds
-`floor(P / num_buckets)` or `ceil(P / num_buckets)` of the rank's global buckets.
+Where `num_buckets` does not divide `P` the fold is uneven: a bucket holds
+`floor(P / num_buckets)` or `ceil(P / num_buckets)` of the rank's global buckets, the
+first `P mod num_buckets` of them the extra one. Up to `P / 2` that is a few percent
+(`4` against `5` at `P / 4`, `2` against `3` at `P / 2`) and costs nothing at the usual
+load factor; between `P / 2` and `P` it is one against two, and the doubled buckets at
+the front are full at load 0.5 (for `P = 977`, `num_buckets = 960`: 17 of them, about 59
+of 61 440 keys evicted, by a Poisson estimate). So `get_expand_info` does not stop
+there: a table with a global capacity whose next size would pass `P / 2` grows to `P`.
 
 `global_capacity` is **not** part of `get_grouped_key`: it is per table, and
 fused tables keep their own (`G` differs with `N`). A fused group hashes every
