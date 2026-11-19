@@ -151,7 +151,8 @@ void table_erase(at::Tensor table_storage, at::Tensor table_bucket_offsets,
                  int64_t bucket_capacity, at::Tensor bucket_sizes,
                  at::Tensor keys, at::Tensor table_ids,
                  std::optional<at::Tensor> indices, int64_t num_scores = 1,
-                 std::optional<at::Tensor> table_global_capacities = std::nullopt);
+                 std::optional<at::Tensor> table_global_capacities =
+                     std::nullopt);
 
 std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor>
 table_export_batch(at::Tensor table_storage, int64_t bucket_capacity,
@@ -205,7 +206,9 @@ std::vector<at::Tensor> bucketize_keys(at::Tensor keys, at::Tensor table_ids,
                                        at::Tensor table_bucket_offsets,
                                        int64_t num_buckets,
                                        int64_t bucket_capacity,
-                                       std::optional<at::Tensor> table_global_capacities = std::nullopt);
+                                       std::optional<at::Tensor>
+                                           table_global_capacities =
+                                               std::nullopt);
 
 void table_update_counter_with_layout(
     at::Tensor counter, at::Tensor slot_indices, int32_t delta,

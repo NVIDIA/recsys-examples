@@ -20,7 +20,8 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 // is a numba-compiled LTO-IR linked into the custom fatbin via nvJitLink. Both
 // expose the dyn_emb_evict_entry_{ovf,noovf}_abi<N> entries (N is
 // DYN_EMB_EVICT_ABI, evict_abi.cuh: an image of another EvictParams layout does
-// not export them, and loading it raises) and are launched the same way. Includable by both nvcc (insert_and_evict.cu routing) and the host
+// not export them, and loading it raises) and are launched the same way.
+// Includable by both nvcc (insert_and_evict.cu routing) and the host
 // compiler (jit_link.cpp) -- only cuda.h + the POD EvictParams.
 #pragma once
 

@@ -117,7 +117,8 @@ std::vector<at::Tensor> bucketize_keys(at::Tensor keys, at::Tensor table_ids,
                                        at::Tensor table_bucket_offsets,
                                        int64_t num_buckets,
                                        int64_t bucket_capacity,
-                                       std::optional<at::Tensor> table_global_capacities) {
+                                       std::optional<at::Tensor>
+                                           table_global_capacities) {
 
   int64_t num_total = keys.size(0);
   TORCH_CHECK(num_buckets >= 0, "num_buckets must be non-negative");

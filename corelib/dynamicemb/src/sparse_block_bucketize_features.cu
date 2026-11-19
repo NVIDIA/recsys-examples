@@ -636,8 +636,8 @@ block_bucketize_sparse_features_cuda(
                                     ? indices_to_lb.data_ptr<offset_t>()
                                     : static_cast<offset_t *>(nullptr),
                                 dist_type_per_feature.data_ptr<int32_t>(),
-                  global_capacity_contig.data_ptr<int64_t>(),
-                  shard_capacity_contig.data_ptr<int64_t>());
+                                global_capacity_contig.data_ptr<int64_t>(),
+                                shard_capacity_contig.data_ptr<int64_t>());
                         C10_CUDA_KERNEL_LAUNCH_CHECK();
                       });
                 });
@@ -685,8 +685,8 @@ block_bucketize_sparse_features_cuda(
                                     ? indices_to_lb.data_ptr<offset_t>()
                                     : static_cast<offset_t *>(nullptr),
                                 dist_type_per_feature.data_ptr<int32_t>(),
-                  global_capacity_contig.data_ptr<int64_t>(),
-                  shard_capacity_contig.data_ptr<int64_t>());
+                                global_capacity_contig.data_ptr<int64_t>(),
+                                shard_capacity_contig.data_ptr<int64_t>());
                         C10_CUDA_KERNEL_LAUNCH_CHECK();
                       });
                 });
@@ -724,8 +724,8 @@ block_bucketize_sparse_features_cuda(
                               ? indices_to_lb.data_ptr<offset_t>()
                               : static_cast<offset_t *>(nullptr),
                           dist_type_per_feature.data_ptr<int32_t>(),
-                  global_capacity_contig.data_ptr<int64_t>(),
-                  shard_capacity_contig.data_ptr<int64_t>());
+                          global_capacity_contig.data_ptr<int64_t>(),
+                          shard_capacity_contig.data_ptr<int64_t>());
                   C10_CUDA_KERNEL_LAUNCH_CHECK();
                 });
           });
@@ -760,8 +760,8 @@ block_bucketize_sparse_features_cuda(
                               ? indices_to_lb.data_ptr<offset_t>()
                               : static_cast<offset_t *>(nullptr),
                           dist_type_per_feature.data_ptr<int32_t>(),
-                  global_capacity_contig.data_ptr<int64_t>(),
-                  shard_capacity_contig.data_ptr<int64_t>());
+                          global_capacity_contig.data_ptr<int64_t>(),
+                          shard_capacity_contig.data_ptr<int64_t>());
                   C10_CUDA_KERNEL_LAUNCH_CHECK();
                 });
           });
@@ -811,8 +811,8 @@ block_bucketize_sparse_features_cuda(
                                     ? indices_to_lb.data_ptr<offset_t>()
                                     : static_cast<offset_t *>(nullptr),
                                 dist_type_per_feature.data_ptr<int32_t>(),
-                  global_capacity_contig.data_ptr<int64_t>(),
-                  shard_capacity_contig.data_ptr<int64_t>());
+                                global_capacity_contig.data_ptr<int64_t>(),
+                                shard_capacity_contig.data_ptr<int64_t>());
                         C10_CUDA_KERNEL_LAUNCH_CHECK();
                       });
                 });
@@ -860,8 +860,8 @@ block_bucketize_sparse_features_cuda(
                                     ? indices_to_lb.data_ptr<offset_t>()
                                     : static_cast<offset_t *>(nullptr),
                                 dist_type_per_feature.data_ptr<int32_t>(),
-                  global_capacity_contig.data_ptr<int64_t>(),
-                  shard_capacity_contig.data_ptr<int64_t>());
+                                global_capacity_contig.data_ptr<int64_t>(),
+                                shard_capacity_contig.data_ptr<int64_t>());
                         C10_CUDA_KERNEL_LAUNCH_CHECK();
                       });
                 });
@@ -898,8 +898,8 @@ block_bucketize_sparse_features_cuda(
                               ? indices_to_lb.data_ptr<offset_t>()
                               : static_cast<offset_t *>(nullptr),
                           dist_type_per_feature.data_ptr<int32_t>(),
-                  global_capacity_contig.data_ptr<int64_t>(),
-                  shard_capacity_contig.data_ptr<int64_t>());
+                          global_capacity_contig.data_ptr<int64_t>(),
+                          shard_capacity_contig.data_ptr<int64_t>());
                   C10_CUDA_KERNEL_LAUNCH_CHECK();
                 });
           });
@@ -934,8 +934,8 @@ block_bucketize_sparse_features_cuda(
                               ? indices_to_lb.data_ptr<offset_t>()
                               : static_cast<offset_t *>(nullptr),
                           dist_type_per_feature.data_ptr<int32_t>(),
-                  global_capacity_contig.data_ptr<int64_t>(),
-                  shard_capacity_contig.data_ptr<int64_t>());
+                          global_capacity_contig.data_ptr<int64_t>(),
+                          shard_capacity_contig.data_ptr<int64_t>());
                   C10_CUDA_KERNEL_LAUNCH_CHECK();
                 });
           });

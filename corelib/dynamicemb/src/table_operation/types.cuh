@@ -556,10 +556,10 @@ struct LinearBucket {
 };
 
 // The bucket that `hashcode` belongs to in a logical table of `nb` buckets
-// starting at `bkt_begin` of the fused storage: the one place this arithmetic is
-// written on the device (`LinearBucketTable::home_bucket` and the bucketizer's
-// `BucketizeFunctor` both call it), so the table kernels and the bucketizer
-// cannot drift apart. Its routing twin is `hashed_shard`
+// starting at `bkt_begin` of the fused storage: the one place this arithmetic
+// is written on the device (`LinearBucketTable::home_bucket` and the
+// bucketizer's `BucketizeFunctor` both call it), so the table kernels and the
+// bucketizer cannot drift apart. Its routing twin is `hashed_shard`
 // (sparse_block_bucketize_features.cu) and its host twin is
 // `dynamicemb.key_ownership.owning_shard`; the three agree key for key.
 //
@@ -577,7 +577,8 @@ struct LinearBucket {
 __host__ __device__ __forceinline__ int64_t home_bucket_of(
     int64_t hashcode, int64_t bkt_begin, int64_t nb, int64_t bucket_capacity,
     int64_t const *__restrict__ global_capacities, int64_t t_id) {
-  int64_t global_cap = global_capacities != nullptr ? global_capacities[t_id] : 0;
+  int64_t global_cap =
+      global_capacities != nullptr ? global_capacities[t_id] : 0;
   if (global_cap <= 0)
     global_cap = nb * bucket_capacity;
   int64_t g = static_cast<int64_t>(static_cast<uint64_t>(hashcode) %
@@ -629,11 +630,11 @@ template <typename BucketType_> struct LinearBucketTable {
   // `home_bucket_of` above.
   //
   // Writes `*bkt_begin` (the table's first bucket) and `*table_cap` (its row
-  // capacity, `nb * bucket_capacity`) always. Writes `*bucket_id` **only when the
-  // table has buckets** (`*table_cap > 0`): for an empty table it is left as the
-  // caller initialised it. A caller therefore has to initialise `*bucket_id` (the
-  // callers in kernels.cuh set it to 0) and must not act on the bucket it names
-  // unless `*table_cap > 0`.
+  // capacity, `nb * bucket_capacity`) always. Writes `*bucket_id` **only when
+  // the table has buckets** (`*table_cap > 0`): for an empty table it is left
+  // as the caller initialised it. A caller therefore has to initialise
+  // `*bucket_id` (the callers in kernels.cuh set it to 0) and must not act on
+  // the bucket it names unless `*table_cap > 0`.
   __device__ __forceinline__ void
   home_bucket(int64_t const *__restrict__ table_bucket_offsets, int64_t t_id,
               int64_t hashcode, int64_t *bucket_id, int64_t *bkt_begin,
