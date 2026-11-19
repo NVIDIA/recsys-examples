@@ -231,6 +231,93 @@ def test_twin_module(
     is_weighted,
     key_dtype,
 ):
+    run_twin_module(
+        table_num,
+        dim,
+        num_embeddings,
+        is_pooled,
+        pooling_mode,
+        max_bag_size,
+        batch_size,
+        num_iteration,
+        seed,
+        optimizer_name,
+        use_index_dedup,
+        is_weighted,
+        key_dtype,
+        dist_type="roundrobin",
+    )
+
+
+# The twin seeds its reference with the rows each rank's table holds, so it has
+# to decide a key's owner as the table does: a wrong hash_bucket rule (or the
+# wrong global_capacity / bucket_capacity behind it) leaves rows in the reference
+# that the table does not have, and the outputs differ. Two table sizes that do
+# not divide evenly over the ranks, pooled and sequence, are enough to show it.
+@pytest.mark.parametrize(
+    "table_num, num_embeddings",
+    [
+        pytest.param(1, [128 * 1024 + 77]),
+        pytest.param(2, [100 * 1024 + 5, 3 * 128 * 1024 + 1]),
+    ],
+)
+@pytest.mark.parametrize(
+    "is_pooled, pooling_mode, max_bag_size",
+    [(True, PoolingType.SUM, 8), (False, None, 1)],
+    ids=["pooled", "sequence"],
+)
+@pytest.mark.parametrize("batch_size", [2048])
+@pytest.mark.parametrize("num_iteration", [10])
+@pytest.mark.parametrize("dim", [128])
+@pytest.mark.parametrize("optimizer_name", ["sgd"])
+def test_twin_module_hash_bucket(
+    table_num: int,
+    dim: int,
+    num_embeddings: List[int],
+    is_pooled: bool,
+    pooling_mode,
+    max_bag_size: int,
+    batch_size,
+    num_iteration,
+    tolerance,
+    seed,
+    optimizer_name,
+    backend_session,
+):
+    run_twin_module(
+        table_num,
+        dim,
+        num_embeddings,
+        is_pooled,
+        pooling_mode,
+        max_bag_size,
+        batch_size,
+        num_iteration,
+        seed,
+        optimizer_name,
+        use_index_dedup=True,
+        is_weighted=False,
+        key_dtype=torch.int64,
+        dist_type="hash_bucket",
+    )
+
+
+def run_twin_module(
+    table_num: int,
+    dim: int,
+    num_embeddings: List[int],
+    is_pooled: bool,
+    pooling_mode,
+    max_bag_size: int,
+    batch_size,
+    num_iteration,
+    seed,
+    optimizer_name,
+    use_index_dedup,
+    is_weighted,
+    key_dtype,
+    dist_type: str,
+):
     if is_weighted:
         if not (is_pooled and pooling_mode == PoolingType.SUM):
             pytest.skip("weighted pooling only exists for pooled SUM collections")
@@ -278,6 +365,7 @@ def test_twin_module(
         is_weighted=is_weighted,
         rank=local_rank,
         world_size=world_size,
+        dist_type=dist_type,
         dynamicemb_options_kwargs=output_dist_options,
         global_rank=dist.get_rank(),
     )
