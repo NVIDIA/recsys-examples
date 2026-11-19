@@ -64,10 +64,6 @@ for num_gpus in ${HASH_RR_NUM_GPUS[@]}; do
   done
 done
 
-# The hierarchical output dist places keys by roundrobin or hash_roundrobin only
-# and refuses a hash_bucket table, so the runs on it (unit_test.sh's hier_load_dump
-# group sets DYNAMICEMB_TEST_OUTPUT_DIST=hierarchical) skip this section.
-if [ "${DYNAMICEMB_TEST_OUTPUT_DIST:-}" != "hierarchical" ]; then
 # hash_bucket: dumped and reloaded at the same world size, then across world
 # sizes. The rule sends a key to the rank holding its global hash bucket, so a
 # checkpoint written by one fan-out is loaded by another with every rank
@@ -118,8 +114,6 @@ for pair in "2 1" "1 2"; do
     --multi-hot-sizes 10 \
     --embedding-dim 16 || exit 1
 done
-
-fi
 
 # Tables named "<scope>/<name>" dump into, and load from, a subdirectory of
 # the collection directory that nothing creates in advance.

@@ -75,7 +75,23 @@ def routing_param_tensors(
     num_shards: int,
     device: Optional[torch.device] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """The per-feature ``(global_capacity, shard_capacity)`` as two int64 tensors.
+    """The per-feature ``(global_capacity, shard_capacity)`` as two int64 tensors:
+    :func:`routing_param_lists` on the device."""
+    global_caps, shard_caps = routing_param_lists(
+        dist_types, routing_params, num_shards
+    )
+    return (
+        torch.tensor(global_caps, dtype=torch.int64, device=device),
+        torch.tensor(shard_caps, dtype=torch.int64, device=device),
+    )
+
+
+def routing_param_lists(
+    dist_types: List[str],
+    routing_params: Optional[List[Tuple[int, int, int]]],
+    num_shards: int,
+) -> Tuple[List[int], List[int]]:
+    """The per-feature ``(global_capacity, shard_capacity)`` as two lists of ints.
 
     The parameters of the ``hash_bucket`` rule, in the same feature order as
     :func:`dist_type_codes`; the kernel indexes all three with the same ``t``.
@@ -133,10 +149,7 @@ def routing_param_tensors(
                 )
         global_caps.append(global_capacity)
         shard_caps.append(shard_capacity)
-    return (
-        torch.tensor(global_caps, dtype=torch.int64, device=device),
-        torch.tensor(shard_caps, dtype=torch.int64, device=device),
-    )
+    return global_caps, shard_caps
 
 
 def bucketize_kjt_before_all2all(
@@ -415,14 +428,22 @@ class RwSparseFeaturesDist(_RwSparseFeaturesDist):
         )
         # The hash_bucket parameters per feature (see routing_param_tensors),
         # validated against this distributor's fan-out, the world.
-        global_capacity_tensor, shard_capacity_tensor = routing_param_tensors(
-            dist_types, routing_params, self._world_size, device=device
+        # The same on the host, which the hierarchical dist takes (a host sync
+        # to read them back from the device would come with every call).
+        self._global_capacity_list, self._shard_capacity_list = routing_param_lists(
+            dist_types, routing_params, self._world_size
         )
         self.register_buffer(
-            "_global_capacity_tensor", global_capacity_tensor, persistent=False
+            "_global_capacity_tensor",
+            torch.tensor(
+                self._global_capacity_list, dtype=torch.int64, device=device
+            ),
+            persistent=False,
         )
         self.register_buffer(
-            "_shard_capacity_tensor", shard_capacity_tensor, persistent=False
+            "_shard_capacity_tensor",
+            torch.tensor(self._shard_capacity_list, dtype=torch.int64, device=device),
+            persistent=False,
         )
         self._score_dist: Optional[KJTAllToAll] = (
             KJTAllToAll(pg=pg, splits=[num_features] * pg.size())
@@ -510,7 +531,14 @@ class RwSparseFeaturesDist(_RwSparseFeaturesDist):
         (index dedup's frequency counters); ``index_dedup``: the sharder's
         ``use_index_dedup``. A call on that dist deduplicates the sharding's
         keys either way; tables that clip gradients need the flag."""
-        return self.hier.setup(self._dist_type_codes, weighted, index_dedup)
+        # hash_bucket's two parameters of each feature (0 for the other rules), on the host
+        return self.hier.setup(
+            self._dist_type_codes,
+            weighted,
+            index_dedup,
+            global_capacities=self._global_capacity_list,
+            shard_capacities=self._shard_capacity_list,
+        )
 
     def hier_forward(
         self,

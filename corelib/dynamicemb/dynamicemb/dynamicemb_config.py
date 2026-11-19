@@ -670,9 +670,9 @@ class DynamicEmbTableOptions:
         holding its *global* hash bucket (see ``global_capacity``), so a
         checkpoint reloads at another world size without losing rows to full
         buckets; the other three hash within the rank's own capacity.
-        ``output_dist="hierarchical"`` takes ``roundrobin`` and
-        ``hash_roundrobin`` only: a row-wise sequence sharding with a
-        ``continuous`` or ``hash_bucket`` table raises ``ValueError`` at its first
+        ``output_dist="hierarchical"`` takes ``roundrobin``,
+        ``hash_roundrobin`` and ``hash_bucket``: a row-wise sequence sharding
+        with a ``continuous`` table raises ``ValueError`` at its first
         ``input_dist()`` (``"auto"`` takes TorchRec's dists there, with a
         warning).
     global_capacity : Optional[int], optional
