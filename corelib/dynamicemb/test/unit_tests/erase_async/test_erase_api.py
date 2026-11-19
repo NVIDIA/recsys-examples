@@ -149,7 +149,6 @@ def test_the_chunk_and_the_limit_in_flight_given_are_the_ones_the_scan_gets(devi
 @pytest.mark.parametrize(
     "layout, build_kwargs, stand_in",
     [
-        (StorageLayout(StorageTier.DDR), dict(local_hbm_for_values=0), False),
         (
             StorageLayout(StorageTier.HBM | StorageTier.DDR),
             dict(local_hbm_for_values=(1 << 20) * DIM * 4 // 2),
@@ -174,7 +173,7 @@ def test_the_chunk_and_the_limit_in_flight_given_are_the_ones_the_scan_gets(devi
 def test_a_layout_that_cannot_be_scanned_is_refused_only_where_a_table_is_picked(
     device, layout, build_kwargs, stand_in
 ):
-    """The first two are real layouts. The two with an external store are stand-ins -- a
+    """The first is a real layout. The two with an external store are stand-ins -- a
     module that says it has one, since the store the tests of tables with a PS use is
     not available here -- so what is tested is that the refusal goes by the layout."""
     module = build_de_table(device.index, S.CUSTOMIZED, **build_kwargs)
@@ -269,11 +268,13 @@ def test_nothing_is_started_when_any_module_is_refused(device):
     """The first module could be erased; the second cannot be scanned. All the checks
     come before any start, so the first one's worker was never made."""
     scannable = build_de_table(device.index, S.CUSTOMIZED)
-    host_only = build_de_table(device.index, S.CUSTOMIZED, local_hbm_for_values=0)
+    hybrid = build_de_table(
+        device.index, S.CUSTOMIZED, local_hbm_for_values=(1 << 20) * DIM * 4 // 2
+    )
     train_step(scannable, list(range(1, 501)), device, score=5)
-    with pytest.raises(NotImplementedError, match="GPU hash table"):
+    with pytest.raises(NotImplementedError, match="HYBRID"):
         erase_by_score_async(
-            nn.ModuleList([scannable, host_only]),
+            nn.ModuleList([scannable, hybrid]),
             S.CUSTOMIZED,
             100,
             torch.cuda.Stream(),
