@@ -66,7 +66,7 @@ from dynamicemb.extendable_tensor import (
     ExtendableBuffer,
     HostExtendableBuffer,
 )
-from dynamicemb.key_ownership import owned_key_mask
+from dynamicemb.key_ownership import OwnershipRule
 from dynamicemb.optimizer import BaseDynamicEmbeddingOptimizer
 from dynamicemb.scored_hashtable import (
     ScoreArg,
@@ -2083,6 +2083,7 @@ def _count_owned_keys(
     shard_index, num_shards = _resolve_shard(shard_index, num_shards)
     if num_shards <= 1:
         return num_keys
+    rule = OwnershipRule(dist_type, num_shards, global_capacity, bucket_capacity)
     owned = 0
     with open(emb_key_path, "rb") as fkey:
         for start in range(0, num_keys, batch_size):
@@ -2095,14 +2096,7 @@ def _count_owned_keys(
                 dtype=KEY_TYPE,
                 device=device,
             )
-            mask = owned_key_mask(
-                keys,
-                shard_index,
-                num_shards,
-                dist_type,
-                global_capacity=global_capacity,
-                bucket_capacity=bucket_capacity,
-            )
+            mask = rule.mask(keys, shard_index)
             owned += int(mask.sum().item()) if mask is not None else n
     return owned
 

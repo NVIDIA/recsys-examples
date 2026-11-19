@@ -357,7 +357,20 @@ class OwnershipRule:
         )
 
     def mask(self, keys: Tensor, rank: int) -> Optional[Tensor]:
+        """:func:`owned_key_mask` of this rule: ``None`` when no filter is needed."""
         return owned_key_mask(
+            keys,
+            rank,
+            self.num_shards,
+            self.dist_type,
+            global_capacity=self.global_capacity,
+            bucket_capacity=self.bucket_capacity,
+        )
+
+    def keep(self, keys: Optional[Tensor], rank: int) -> Optional[Tensor]:
+        """:func:`owned_keys` of this rule: the keys ``rank`` owns, tolerating a
+        list that is absent or empty."""
+        return owned_keys(
             keys,
             rank,
             self.num_shards,

@@ -16,7 +16,7 @@ import torch
 import torch.distributed as dist
 from torch import Tensor
 
-from .key_ownership import owned_key_mask
+from .key_ownership import OwnershipRule
 from .types import (
     EMBEDDING_TYPE,
     KEY_TYPE,
@@ -399,6 +399,7 @@ def _iter_batches_from_files(
     if num_shards is None or shard_index is None:
         num_shards = dist.get_world_size() if dist.is_initialized() else 1
         shard_index = dist.get_rank() if dist.is_initialized() else 0
+    rule = OwnershipRule(dist_type, num_shards, global_capacity, bucket_capacity)
 
     try:
         for start in range(0, num_keys, batch_size):
@@ -434,14 +435,7 @@ def _iter_batches_from_files(
                     opt_bytes, opt_state_dtype, device
                 ).view(-1, optstate_dim)
 
-            masks = owned_key_mask(
-                keys,
-                shard_index,
-                num_shards,
-                dist_type,
-                global_capacity=global_capacity,
-                bucket_capacity=bucket_capacity,
-            )
+            masks = rule.mask(keys, shard_index)
             if masks is not None:
                 keys = keys[masks]
                 embeddings = embeddings[masks]

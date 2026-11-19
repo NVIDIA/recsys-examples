@@ -24,7 +24,7 @@ import numpy as np
 import torch
 import torch.distributed as dist
 from dynamicemb.dynamicemb_config import dtype_to_bytes
-from dynamicemb.key_ownership import murmur3_hash_64bits, owned_key_mask
+from dynamicemb.key_ownership import OwnershipRule, murmur3_hash_64bits
 from dynamicemb.types import KEY_TYPE, SCORE_TYPE, MemoryType, torch_dtype_to_np_dtype
 from dynamicemb_extensions import (
     ScorePolicy,
@@ -1420,6 +1420,11 @@ class LinearBucketTable(ScoredHashTable):
         if num_shards is None or shard_index is None:
             num_shards = dist.get_world_size() if dist.is_initialized() else 1
             shard_index = dist.get_rank() if dist.is_initialized() else 0
+        rule = (
+            OwnershipRule(dist_type, num_shards, global_capacity, bucket_capacity)
+            if dist_type is not None
+            else None
+        )
 
         dump_timestamp = device_timestamp()
 
@@ -1453,18 +1458,7 @@ class LinearBucketTable(ScoredHashTable):
                     scores = torch.clamp(dump_timestamp - scores, min=0)
                 scores_dict[score_name] = scores
 
-            masks = (
-                owned_key_mask(
-                    keys,
-                    shard_index,
-                    num_shards,
-                    dist_type,
-                    global_capacity=global_capacity,
-                    bucket_capacity=bucket_capacity,
-                )
-                if dist_type is not None
-                else None
-            )
+            masks = rule.mask(keys, shard_index) if rule is not None else None
             if masks is not None:
                 keys = keys[masks]
                 for score_name in scores_dict:

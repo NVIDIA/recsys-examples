@@ -67,7 +67,7 @@ from dynamicemb.dynamicemb_config import (
     warning_for_cstm_score,
 )
 from dynamicemb.initializer import MultiTableInitializer, fp8_out_of_range_risk
-from dynamicemb.key_ownership import owned_key_mask, owned_keys
+from dynamicemb.key_ownership import OwnershipRule
 from dynamicemb.key_value_table import (
     ERASE_CHUNK_SLOTS,
     ERASE_MAX_CHUNKS_IN_FLIGHT,
@@ -2618,13 +2618,8 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
         # group could only narrow the modulus and mis-route every key, leaving
         # each claimed by several ranks and the one that owns it claiming nothing.
         rank = self._shard_index
-        routing = dict(
-            global_capacity=option.global_capacity,
-            bucket_capacity=option.bucket_capacity,
-        )
-        mask = owned_key_mask(
-            keys, rank, self._shard_world_size, option.dist_type, **routing
-        )
+        rule = OwnershipRule.of(option, self._shard_world_size)
+        mask = rule.mask(keys, rank)
         if mask is not None:
             stats.skipped = int(keys.numel() - mask.sum().item())
             keys, values = keys[mask], values[mask]
@@ -2633,9 +2628,8 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
             if scores is not None:
                 scores = scores[mask]
             slot_index = slot_index[mask]
-            ws, dt = self._shard_world_size, option.dist_type
-            erased = owned_keys(erased, rank, ws, dt, **routing)
-            evicted = owned_keys(evicted, rank, ws, dt, **routing)
+            erased = rule.keep(erased, rank)
+            evicted = rule.keep(evicted, rank)
 
         # Erase first: a key erased and then re-inserted inside the same window
         # appears in BOTH lists, and must survive the replay.

@@ -25,7 +25,7 @@ import torch.distributed as dist
 import torchrec
 from dynamicemb import DynamicEmbTableOptions
 from dynamicemb.dump_load import find_sharded_modules, get_dynamic_emb_module
-from dynamicemb.key_ownership import owned_key_mask
+from dynamicemb.key_ownership import OwnershipRule
 from dynamicemb.key_value_table import Storage
 from dynamicemb.planner import (
     DynamicEmbeddingShardingPlanner,
@@ -239,7 +239,7 @@ class ConstructTwinModule:
         assert not is_weighted or is_pooled, "is_weighted requires a pooled collection"
         self._is_weighted = is_weighted
         self._rank = rank
-        # The owner rank of the keys this rank seeds (``owned_key_mask``).
+        # The owner rank of the keys this rank seeds (``OwnershipRule``).
         # ``rank`` is the device; on one node the two are the same.
         self._global_rank = rank if global_rank is None else global_rank
         self._world_size = world_size
@@ -553,13 +553,8 @@ class ConstructTwinModule:
 
             tmp_table_name = feature.replace("f_", "t_")
             option = table_name_map_options[tmp_table_name]
-            mask = owned_key_mask(
-                indices,
-                self._global_rank,
-                self._world_size,
-                option.dist_type,
-                global_capacity=option.global_capacity,
-                bucket_capacity=option.bucket_capacity,
+            mask = OwnershipRule.of(option, self._world_size).mask(
+                indices, self._global_rank
             )
             if mask is None:
                 mask = torch.ones_like(indices, dtype=torch.bool)
