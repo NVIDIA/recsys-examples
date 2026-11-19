@@ -332,7 +332,9 @@ def test_key_frequency_skew(feature_name):
     top1_pct = counts[0] / total * 100
     top10_pct = counts[:10].sum() / total * 100
     top100_pct = counts[:100].sum() / total * 100
-    gini = 1 - 2 * getattr(np, "trapezoid", getattr(np, "trapz", None))(
+    # NumPy 2 renamed trapz to trapezoid, and a later one dropped the old name
+    trapezoid = getattr(np, "trapezoid", None) or np.trapz
+    gini = 1 - 2 * trapezoid(
         np.cumsum(sorted(counts)) / total,
         np.linspace(0, 1, len(counts)),
     )
