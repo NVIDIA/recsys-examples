@@ -296,19 +296,19 @@ def _admit_and_carry_counts(
     scores_are_frequencies: bool,
     rows: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    """Admit ``keys`` and, on a frequency-scored table, write each admitted key's count into ``scores``.
+    """Admit ``keys`` and, on a frequency-scored table, write each key's running count into ``scores``.
 
     ``rows`` says where ``keys`` sit in ``scores``; None means at the same positions.
+    A refused key's score is dropped before insert, so every key gets its count.
     Returns the admission mask over ``keys``.
     """
     admit_mask, counts = admitter.admit_with_counts(keys, table_ids, frequencies)
     if counts is not None and scores is not None and scores_are_frequencies:
-        current = scores if rows is None else scores[rows]
-        carried = torch.where(admit_mask, counts.to(scores.dtype), current)
+        counts = counts.to(scores.dtype)
         if rows is None:
-            scores.copy_(carried)
+            scores.copy_(counts)
         else:
-            scores[rows] = carried
+            scores[rows] = counts
     return admit_mask
 
 
