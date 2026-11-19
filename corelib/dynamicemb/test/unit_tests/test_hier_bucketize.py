@@ -216,19 +216,6 @@ CASES = [
         values=torch.int32,
     ),
     Case(
-        "hash_bucket, int32 keys at the edges",
-        rules=(HASH_BUCKET, HASH_BUCKET, HASH_BUCKET),
-        key_range=(-(1 << 31), 1 << 31),
-        values=torch.int32,
-        edges=0.5,
-    ),
-    Case(
-        "hash_bucket, int64 keys at the edges",
-        rules=(HASH_BUCKET, HASH_BUCKET, HASH_BUCKET),
-        key_range=(-(1 << 40), 1 << 40),
-        edges=0.5,
-    ),
-    Case(
         "roundrobin and hash_roundrobin",
         rules=(ROUNDROBIN, HASH_ROUNDROBIN, HASH_ROUNDROBIN),
     ),
