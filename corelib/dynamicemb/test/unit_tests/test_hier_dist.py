@@ -459,7 +459,6 @@ CASES = [
     Case("fp32 pow-law hash_roundrobin", keys="pow-law", dist_type="hash_roundrobin"),
     # hash_bucket: a key's owner is the shard that holds its global bucket, which the op
     # computes from the capacities of the key's table (the planner's)
-    Case("fp32 pow-law hash_bucket", keys="pow-law", dist_type="hash_bucket"),
     Case(
         "fp32 pow-law, hash_bucket and roundrobin tables",
         keys="pow-law",
