@@ -663,11 +663,33 @@ def _prefetch_cache_path(
                 cache_keys, cache_tids, None, report_refused=True
             )
         if num_refused > 0:
-            # Every key of a batch must be in the cache when its forward reads
-            # it. A refused key (its bucket and its table's overflow area held
-            # only keys the insert may not evict: pinned by batches in flight, or
-            # placed by this insert) has no slot; it comes back among the evicted
-            # ones with a negative one, and nothing is written back.
+            # Insert has already changed membership. Refused entries have no
+            # value row, but real victims still hold their dirty full rows.
+            # Capture those before initializing successfully accepted keys.
+            try:
+                n_valid, _, (valid_keys, valid_slots, valid_tids) = flagged_compact(
+                    evicted_slots >= 0, [evicted_keys, evicted_slots, evicted_tids]
+                )
+                if n_valid:
+                    valid_values = load_from_flat(
+                        state, valid_slots, valid_tids, copy_mode=CopyMode.VALUE
+                    )
+                # store_to_flat skips negative slots, as on ordinary inserts.
+                # A later smaller retry may hit any key accepted by this call.
+                store_to_flat(
+                    state,
+                    cache_slots,
+                    cache_tids,
+                    _select(values, into_cache, num_cache == values.size(0)),
+                )
+                if n_valid:
+                    _write_back_evicted(
+                        storage, external_storage, valid_keys, valid_tids, valid_values
+                    )
+            finally:
+                # Only lookup hits were pinned so far. Do not return another
+                # batch's pins, or decrement unpinned newly accepted slots.
+                cache.decrement_counter(cache_indices, unique_table_ids)
             raise RuntimeError(
                 f"The cache could not place {num_refused} keys of this batch: their "
                 "buckets and their tables' overflow areas held only keys it may not "
