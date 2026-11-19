@@ -473,6 +473,25 @@ def test_planner_keeps_a_small_init_capacity_for_hash_bucket():
     assert hashed.global_capacity == GLOBAL_CAPACITY
 
 
+@pytest.mark.parametrize(
+    "strategy",
+    [
+        DynamicEmbScoreStrategy.NO_EVICTION,
+        (DynamicEmbScoreStrategy.NO_EVICTION, DynamicEmbScoreStrategy.CUSTOMIZED),
+    ],
+    ids=["no_eviction", "no_eviction_customized"],
+)
+def test_hash_bucket_refuses_no_eviction(strategy):
+    """A NO_EVICTION table never evicts, so the layout buys it nothing, and its
+    num_embeddings only starts it (it grows without bound) while the rank of a key
+    under hash_bucket follows from it: a small one leaves ranks without keys, and
+    changing it moves every key. The other rules take the strategy."""
+    with pytest.raises(ValueError, match="NO_EVICTION"):
+        DynamicEmbTableOptions(dist_type="hash_bucket", score_strategy=strategy)
+    for dist_type in ("roundrobin", "hash_roundrobin"):
+        DynamicEmbTableOptions(dist_type=dist_type, score_strategy=strategy)
+
+
 def test_planner_one_bucket_per_shard_routes_over_the_shards_laid_end_to_end():
     """MAX_BUCKET_CAPACITY has no whole-table form: the rule's modulus is then
     world_size * shard rows, which routes uniformly but is not fan-out invariant."""

@@ -152,7 +152,7 @@ the whole shard (it may still be growing towards its `P` buckets):
 | CACHING: storage tier (host, full table) | yes | **yes** -- the cache is a subset and never the source of truth |
 | CACHING: cache tier (`DynamicEmbCache`) | no (rescaled, `bc=1024`) | n/a |
 | HYBRID: HBM and host tiers | no (each a rescaled part of the shard) | **no** -- a key's tier is decided by eviction history, so the two tiers are not a fixed partition of the keys; the layout is left as it is |
-| `NO_EVICTION` tables | no (key map is `2P` buckets at load factor 0.5) | n/a: they never evict |
+| `NO_EVICTION` tables | refused with `hash_bucket` (`ValueError`): the key map is `2P` buckets at load factor 0.5, they never evict, and their `num_embeddings` is only a starting size | n/a |
 | `MAX_BUCKET_CAPACITY` | no whole-table form | **no** |
 | `roundrobin`, `hash_roundrobin`, `continuous` | no | **no** (unchanged) |
 | External storage (RocksDB) | no buckets | yes, as before |

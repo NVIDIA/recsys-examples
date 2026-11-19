@@ -803,8 +803,9 @@ class DynamicEmbTableOptions:
     (NCCL GIN) between nodes, with one host sync per call. It needs DynamicEmb
     built against NCCL >= 2.30.7 (else ``ImportError`` when the model is
     sharded), ``output_dist_capacity``, and tables of ``dist_type``
-    ``"roundrobin"`` or ``"hash_roundrobin"``: a ``"continuous"`` table makes
-    the first ``input_dist()`` raise ``ValueError``. A call on it
+    ``"roundrobin"``, ``"hash_roundrobin"`` or ``"hash_bucket"``: a
+    ``"continuous"`` table makes the first ``input_dist()`` raise
+    ``ValueError``. A call on it
     deduplicates the sharding's keys (index dedup), whatever the sharder's
     ``use_index_dedup`` (without that flag, the sharding warns so once, at
     its first ``input_dist()``); tables that clip gradients need the flag
@@ -907,6 +908,16 @@ class DynamicEmbTableOptions:
         # reject unsupported compound tuples) so all downstream code sees either a
         # single strategy or a supported compound tuple.
         self.score_strategy = normalize_score_strategy(self.score_strategy)
+        if self.dist_type == "hash_bucket" and has_no_eviction(self.score_strategy):
+            raise ValueError(
+                "dist_type 'hash_bucket' is not supported with NO_EVICTION. The table "
+                "never evicts, so the bucket layout hash_bucket fixes buys it nothing "
+                "(a reload at another world size grows the table, it loses no row), "
+                "and the rank of a key follows from num_embeddings, which a "
+                "NO_EVICTION table only starts from, since it grows without bound: "
+                "a small value leaves ranks without keys, and changing it moves every "
+                "key. Use 'roundrobin' or 'hash_roundrobin'."
+            )
         # A custom eviction score_function needs both frequency and timestamp, so
         # it requires the 2-word LruLfu layout -- i.e. the {TIMESTAMP, LFU}
         # compound. After normalization that is the only strategy left as a tuple.

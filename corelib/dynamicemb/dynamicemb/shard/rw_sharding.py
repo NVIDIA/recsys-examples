@@ -107,7 +107,7 @@ def dist_type_per_feature(
                 "unknown. DynamicEmbeddingShardingPlanner puts the options on "
                 "the DynamicEmbParameterSharding it builds; a plan built "
                 "another way has to carry them too. dist_type must be "
-                "'roundrobin' or 'hash_roundrobin'."
+                "'roundrobin', 'hash_roundrobin' or 'hash_bucket'."
             )
         else:
             dist_type = "continuous"
