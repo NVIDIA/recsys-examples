@@ -64,6 +64,7 @@ from dynamicemb.key_ownership import (
     murmur3_fmix64,
     owning_shard,
 )
+from dynamicemb.key_value_table import HybridStorage
 from dynamicemb.planner.plan import TableKey
 from dynamicemb.planner.planners import (
     DynamicEmbParameterConstraints,
@@ -517,9 +518,13 @@ def build_model(
     dist_type: str = "hash_bucket",
     caching: bool = False,
     score_strategy=DynamicEmbScoreStrategy.TIMESTAMP,
+    hybrid: bool = False,
 ) -> BatchedDynamicEmbeddingTablesV2:
     """One shard of a NUM_EMBEDDINGS-row table split over ``num_shards``, sized
-    the way the planner sizes it (``_sharded_table_bucket_layout``)."""
+    the way the planner sizes it (``_sharded_table_bucket_layout``). ``hybrid``
+    gives it an HBM budget of half its rows and no cache: a HYBRID table, two
+    tiers that are each a rescaled part of the shard."""
+    assert not (caching and hybrid)
     config = EmbeddingConfig(
         name=TABLE,
         embedding_dim=DIM,
@@ -542,14 +547,14 @@ def build_model(
         safe_check_mode=DynamicEmbCheckMode.IGNORE,
         # A caching table keeps a GPU cache half the size of its host store (it
         # must hold a forward's worth of keys, INSERT_CHUNK, with room to spare).
-        local_hbm_for_values=value_bytes // 2 if caching else 1024**3,
+        local_hbm_for_values=value_bytes // 2 if (caching or hybrid) else 1024**3,
         caching=caching,
         score_strategy=score_strategy,
         initializer_args=DynamicEmbInitializerArgs(
             mode=DynamicEmbInitializerMode.DEBUG
         ),
     )
-    return BatchedDynamicEmbeddingTablesV2(
+    model = BatchedDynamicEmbeddingTablesV2(
         table_options=[options],
         output_dtype=torch.float32,
         table_names=[TABLE],
@@ -557,6 +562,9 @@ def build_model(
         pooling_mode=DynamicEmbPoolingMode.SUM,
         use_index_dedup=False,
     )
+    if hybrid:
+        assert isinstance(model._storage, HybridStorage), type(model._storage)
+    return model
 
 
 def as_shard(
@@ -608,6 +616,7 @@ def dump_shards(
     dist_type: str,
     caching: bool = False,
     score_strategy=DynamicEmbScoreStrategy.TIMESTAMP,
+    hybrid: bool = False,
 ) -> Tuple[np.ndarray, torch.Tensor]:
     """Insert ``keys`` into ``num_shards`` modules, dump them as one checkpoint,
     and return the keys the shards actually hold (what the dump wrote) with
@@ -622,6 +631,7 @@ def dump_shards(
             dist_type,
             caching=caching,
             score_strategy=score_strategy,
+            hybrid=hybrid,
         )
         insert_keys(model, torch.from_numpy(keys[owner == shard]).to(device))
         as_shard(model, shard, num_shards)
@@ -643,6 +653,7 @@ def load_shards(
     dist_type: str,
     caching: bool = False,
     score_strategy=DynamicEmbScoreStrategy.TIMESTAMP,
+    hybrid: bool = False,
 ) -> Tuple[np.ndarray, torch.Tensor]:
     """Load the checkpoint into ``num_shards`` fresh modules; return every key
     they hold and the corresponding embedding rows."""
@@ -655,6 +666,7 @@ def load_shards(
             dist_type,
             caching=caching,
             score_strategy=score_strategy,
+            hybrid=hybrid,
         )
         as_shard(model, shard, num_shards)
         model.load(save_dir)
@@ -817,6 +829,37 @@ def test_roundrobin_checkpoint_loses_rows_at_another_fanout(current_device):
         f"\nroundrobin control: {lost.size} of {held.size} rows lost "
         f"({lost.size / held.size:.2%})"
     )
+
+
+@pytest.mark.parametrize("num_shards", [1, 2])
+def test_hash_bucket_hybrid_checkpoint_roundtrips_at_the_same_fanout(
+    current_device, num_shards
+):
+    """A HYBRID table is accepted under ``hash_bucket`` but gets no fan-out
+    guarantee: its two tiers are rescaled parts of the shard and keep their own
+    per-tier hashing, so there is no lossless-across-fan-outs case here. What it
+    does have is the global routing rule, so a dump and a load at the *same* fan-out
+    must give every shard exactly its keys back. That goes through
+    ``HybridStorage.load``, which reads the key -> rank rule from the *host* tier's
+    options (the HBM tier's copy rescaled ``bucket_capacity``); a rule read from
+    the wrong tier would filter keys away, or keep another shard's. The fill is low
+    (16 of 128 slots per global bucket), so nothing is evicted and every key has to
+    come back."""
+    keys = keys_filling_every_bucket(per_bucket=16)
+    with tempfile.TemporaryDirectory() as save_dir:
+        held, held_values = dump_shards(
+            current_device, keys, num_shards, save_dir, "hash_bucket", hybrid=True
+        )
+        assert np.array_equal(np.sort(held), np.sort(keys)), "nothing evicted at 12 %"
+        loaded, values = load_shards(
+            current_device, num_shards, save_dir, "hash_bucket", hybrid=True
+        )
+    lost = np.setdiff1d(keys, loaded)
+    assert (
+        lost.size == 0
+    ), f"{lost.size} of {keys.size} rows lost at {num_shards} shards"
+    assert loaded.size == keys.size, "no row duplicated across shards"
+    assert_same_rows(held, held_values, loaded, values)
 
 
 # ---------------------------------------------------------------------------
