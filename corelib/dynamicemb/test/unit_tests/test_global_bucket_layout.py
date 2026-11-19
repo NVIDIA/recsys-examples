@@ -613,14 +613,22 @@ INSERT_CHUNK = 16384
 LRU_LFU = (DynamicEmbScoreStrategy.TIMESTAMP, DynamicEmbScoreStrategy.LFU)
 
 
-def insert_keys(model: BatchedDynamicEmbeddingTablesV2, keys: torch.Tensor) -> None:
+def insert_keys(
+    model: BatchedDynamicEmbeddingTablesV2,
+    keys: torch.Tensor,
+    chunk_size: int = INSERT_CHUNK,
+) -> None:
     """A training forward inserts the keys it does not find; one key per bag."""
-    for start in range(0, keys.numel(), INSERT_CHUNK):
-        chunk = keys[start : start + INSERT_CHUNK]
+    for start in range(0, keys.numel(), chunk_size):
+        chunk = keys[start : start + chunk_size]
         offsets = torch.arange(
             0, chunk.numel() + 1, dtype=torch.int64, device=keys.device
         )
-        model(chunk, offsets)
+        # Without an autograd graph the forward releases the keys it pinned (a cache
+        # raises when a batch finds only pinned ones, and a graph keeps them pinned
+        # until its backward).
+        with torch.no_grad():
+            model(chunk, offsets)
     torch.cuda.synchronize()
 
 
@@ -659,7 +667,8 @@ def dump_shards(
             hybrid=hybrid,
             init_fraction=init_fraction,
         )
-        insert_keys(model, torch.from_numpy(keys[owner == shard]).to(device))
+        mine = keys[owner == shard]
+        insert_keys(model, torch.from_numpy(mine).to(device))
         as_shard(model, shard, num_shards)
         model.dump(save_dir)
         k, v = model.export_keys_values(TABLE, device)
@@ -875,10 +884,13 @@ def test_hash_bucket_growth_does_not_stop_on_the_uneven_fold(current_device):
     global buckets in a bucket, a run of P mod num_buckets consecutive buckets (from
     ``r * P mod num_buckets`` on shard r) the extra one. Between P / 2 and P that is
     one against two: at 960 buckets 17 of them expect about 126 keys of 128 at the
-    usual load of 0.5, and evict (about 59 of 61 440 keys). So a table with a global capacity whose next size would pass P / 2 grows to
-    P (get_expand_info), where the fold is the identity. Random keys fill the first and
-    the last shard to 45 % of its rows: the table must end at its max_capacity and
-    nothing may be lost."""
+    usual load of 0.5, and evict (about 59 of 61 440 keys). So a table with a global
+    capacity whose next size would pass P / 2 grows to P (get_expand_info), where the
+    fold is the identity. Random keys fill the first and the last shard to 45 % of its
+    rows: the table must end at its max_capacity and nothing may be lost. The keys go
+    in a thousand at a time: a growth is sized for the keys a call brings (the load
+    factor over their total), so a chunk of 16 384 would jump the table most of the
+    way at once and never stop where it is to be shown not to."""
     num_shards = 8
     device = torch.device(f"cuda:{current_device}")
     keys = random_keys(int(0.45 * GLOBAL_CAPACITY))
@@ -892,7 +904,7 @@ def test_hash_bucket_growth_does_not_stop_on_the_uneven_fold(current_device):
         state = model._storage._state
         start = state.key_index_map.per_table_capacity_[0] // BC
         assert buckets % start != 0, "it starts on a fold that does not divide P"
-        insert_keys(model, torch.from_numpy(mine).to(device))
+        insert_keys(model, torch.from_numpy(mine).to(device), chunk_size=1024)
         capacity = state.key_index_map.per_table_capacity_[0]
         assert capacity == model._dynamicemb_options[0].max_capacity == buckets * BC
         held = model.export_keys_values(TABLE, device)[0].cpu().numpy()
