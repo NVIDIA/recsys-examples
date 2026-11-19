@@ -110,10 +110,21 @@ modulus.
 | `hash_bucket` | a multiple of 16 | `ceil(N / bc) * bc` (`get_global_table_capacity`) |
 | `hash_bucket` | `MAX_BUCKET_CAPACITY` | `fanout * max_capacity`: one bucket per shard has no whole-table form, so the modulus is the shards laid end to end -- routed uniformly, **not** fan-out invariant |
 
-A `hash_bucket` table with a global capacity is forced to
-`init_capacity == max_capacity` (with a warning if the user set less): the
-partition is only realised with exactly `P` buckets, and a rehash would
-re-partition. `_expand_tables_impl` refuses to grow such a table.
+A `hash_bucket` table may start below `max_capacity` and grow like any other
+(`init_capacity`, `max_load_factor`). Its keys go to a rank by the whole table's
+bucket map (`global_capacity`), which does not change with the table's size, and
+the table folds that map into the buckets it has: a key's bucket is
+`bkt_begin + g % num_buckets` (`home_bucket_of`). Growing adds buckets, so a bucket
+splits in two (`(g mod 2n) mod n = g mod n`) and **every key stays on its rank**:
+the re-insert of `_expand_tables_impl` only moves it within the rank, as it does for
+`roundrobin`, and the table keeps passing its `global_capacity` on. At
+`num_buckets == P` the fold is the identity, which is the layout the lossless
+reload promises; below it a bucket holds the keys `{g : g = b mod num_buckets}` of
+the rank, a set that depends on `P` and so on the fan-out. That is only a problem for
+a table that is nearly full at that size, and a table grows at `max_load_factor`
+(0.5 by default); a load into one expands it first (`expand_if_need`), so it fits.
+Where `num_buckets` does not divide `P` the fold is slightly uneven: a bucket holds
+`floor(P / num_buckets)` or `ceil(P / num_buckets)` of the rank's global buckets.
 
 `global_capacity` is **not** part of `get_grouped_key`: it is per table, and
 fused tables keep their own (`G` differs with `N`). A fused group hashes every
@@ -124,7 +135,7 @@ different one is refused in `create_table_state`.
 
 `create_table_state(..., global_bucket_layout=...)` decides whether a state
 hashes into the global bucket space. It can only hold for a state that *is*
-the whole shard, with exactly `P` buckets:
+the whole shard (it may still be growing towards its `P` buckets):
 
 | Layout | Uses the global layout | Lossless across fan-outs |
 |---|---|---|

@@ -422,11 +422,14 @@ def create_table_state(
     ``global_capacity`` (a ``hash_bucket`` table sized by the planner) hash
     keys into the whole table's bucket space, so the keys that share a bucket
     do not depend on the number of shards and a checkpoint reloads at any world
-    size without a bucket overflowing. It holds only when this state *is* the
-    whole shard -- exactly ``max_capacity / bucket_capacity`` buckets. A cache
-    or a hybrid tier is a rescaled part of the shard and passes ``False``; a
-    no-eviction table sizes its key map at twice its rows and is excluded here
-    for the same reason.
+    size without a bucket overflowing, once it has grown to ``max_capacity /
+    bucket_capacity`` buckets. It holds only when this state *is* the whole
+    shard: a table that starts smaller folds the whole table's bucket map into
+    the buckets it has (``g % num_buckets``, see ``home_bucket_of``) and, as it
+    grows, splits them, so its keys stay on their rank. A cache or a hybrid tier
+    is a rescaled part of the shard and passes ``False``; a no-eviction table
+    sizes its key map at twice its rows and is excluded here for the same
+    reason.
     ``use_ref_counter=False`` leaves out the per-slot reference counter (4 bytes
     a slot) for a table whose slots are never pinned: the storage under a cache,
     where the cache pins. It cannot be combined with ``enable_overflow``.
@@ -500,14 +503,6 @@ def create_table_state(
                     f"global_capacity {global_capacity} was derived with "
                     f"bucket_capacity {opt.bucket_capacity}, but the fused "
                     f"group hashes with bucket_capacity {bucket_capacity}"
-                )
-            if opt.init_capacity != opt.max_capacity:
-                raise ValueError(
-                    "a table with global_capacity must start at its full "
-                    f"capacity (init_capacity {opt.init_capacity} != "
-                    f"max_capacity {opt.max_capacity}): the global bucket map "
-                    "is only realised with exactly max_capacity / "
-                    "bucket_capacity buckets"
                 )
             global_capacities.append(global_capacity)
         else:
@@ -708,15 +703,11 @@ def _expand_tables_impl(
     )
     new_caps = []
     for i in range(state.num_tables):
-        if tables_to_expand[i] and old_global_caps[i]:
-            # Growing would re-partition the keys and break the promise that
-            # the bucket a key lives in does not depend on the table's size.
-            # Such a table starts at max_capacity, so get_expand_info never
-            # asks; this guards a table built by hand.
-            raise RuntimeError(
-                f"table {i} hashes into the whole table's bucket space "
-                f"(global_capacity {old_global_caps[i]}) and cannot be expanded"
-            )
+        # A table with a global capacity keeps it as it grows (passed on below):
+        # its keys go to a rank by the whole table's bucket map, which does not
+        # change with the table's size, and the table folds that map into its
+        # buckets. More buckets split the old ones, so every key stays on its
+        # rank and the re-insert below only moves it within it.
         if tables_to_expand[i]:
             if (
                 target_capacities is not None

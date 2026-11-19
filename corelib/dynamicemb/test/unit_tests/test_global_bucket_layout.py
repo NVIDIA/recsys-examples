@@ -448,8 +448,12 @@ def test_planner_sets_the_global_capacity_only_for_hash_bucket(world_size):
     assert (world_size - 1) * hashed.max_capacity < GLOBAL_CAPACITY + world_size * BC
 
 
-def test_planner_raises_init_capacity_to_max_for_hash_bucket():
-    with pytest.warns(UserWarning, match="init_capacity is raised"):
+def test_planner_keeps_a_small_init_capacity_for_hash_bucket():
+    """A hash_bucket table may start below max_capacity and grow like any other:
+    its keys go to a rank by the whole table's bucket map, which does not change with
+    its size, so the planner no longer raises init_capacity (nor warns)."""
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
         hashed = _plan(
             NUM_EMBEDDINGS,
             4,
@@ -457,9 +461,6 @@ def test_planner_raises_init_capacity_to_max_for_hash_bucket():
             bucket_capacity=BC,
             init_capacity=4096,
         )
-    assert hashed.init_capacity == hashed.max_capacity
-    with warnings.catch_warnings():
-        warnings.simplefilter("error")
         plain = _plan(
             NUM_EMBEDDINGS,
             4,
@@ -467,7 +468,9 @@ def test_planner_raises_init_capacity_to_max_for_hash_bucket():
             bucket_capacity=BC,
             init_capacity=4096,
         )
-    assert plain.init_capacity == 4096 < plain.max_capacity
+    assert hashed.init_capacity == plain.init_capacity == 4096 < hashed.max_capacity
+    # the bucket map stays the whole table's, whatever the table starts at
+    assert hashed.global_capacity == GLOBAL_CAPACITY
 
 
 def test_planner_one_bucket_per_shard_routes_over_the_shards_laid_end_to_end():
@@ -519,11 +522,13 @@ def build_model(
     caching: bool = False,
     score_strategy=DynamicEmbScoreStrategy.TIMESTAMP,
     hybrid: bool = False,
+    init_fraction: float = 1.0,
 ) -> BatchedDynamicEmbeddingTablesV2:
     """One shard of a NUM_EMBEDDINGS-row table split over ``num_shards``, sized
     the way the planner sizes it (``_sharded_table_bucket_layout``). ``hybrid``
     gives it an HBM budget of half its rows and no cache: a HYBRID table, two
-    tiers that are each a rescaled part of the shard."""
+    tiers that are each a rescaled part of the shard. ``init_fraction`` starts it
+    at that fraction of its rows (a whole number of buckets), to grow from."""
     assert not (caching and hybrid)
     config = EmbeddingConfig(
         name=TABLE,
@@ -540,7 +545,7 @@ def build_model(
         device_id=current_device,
         dim=DIM,
         max_capacity=shard_capacity,
-        init_capacity=shard_capacity,
+        init_capacity=max(BC, int(shard_capacity * init_fraction) // BC * BC),
         global_capacity=GLOBAL_CAPACITY if dist_type == "hash_bucket" else None,
         bucket_capacity=BC,
         dist_type=dist_type,
@@ -617,6 +622,7 @@ def dump_shards(
     caching: bool = False,
     score_strategy=DynamicEmbScoreStrategy.TIMESTAMP,
     hybrid: bool = False,
+    init_fraction: float = 1.0,
 ) -> Tuple[np.ndarray, torch.Tensor]:
     """Insert ``keys`` into ``num_shards`` modules, dump them as one checkpoint,
     and return the keys the shards actually hold (what the dump wrote) with
@@ -632,6 +638,7 @@ def dump_shards(
             caching=caching,
             score_strategy=score_strategy,
             hybrid=hybrid,
+            init_fraction=init_fraction,
         )
         insert_keys(model, torch.from_numpy(keys[owner == shard]).to(device))
         as_shard(model, shard, num_shards)
@@ -809,6 +816,67 @@ def test_hash_bucket_training_survivors_reload_losslessly(
     assert loaded.size == held.size
     assert_same_rows(held, held_values, loaded, values)
     assert_debug_rows(loaded, values)
+
+
+@pytest.mark.parametrize("num_shards", [1, 2, 8])
+def test_hash_bucket_table_grows_and_keeps_its_keys(current_device, num_shards):
+    """A hash_bucket table that starts at a thirty-second of its rows grows as keys
+    arrive: the whole table's bucket map does not change with its size, the table
+    folds it into the buckets it has (``g % num_buckets``), and more buckets split
+    the old ones. Every key must still be in the table after the growth, a second
+    pass over them must find them rather than insert them again, and the table must
+    not outgrow its max_capacity."""
+    device = torch.device(f"cuda:{current_device}")
+    keys = keys_filling_every_bucket(per_bucket=16)  # 12.5 % of every global bucket
+    owner = oracle_shard(keys, num_shards)
+    for shard in range(num_shards):
+        mine = keys[owner == shard]
+        model = build_model(
+            current_device, num_shards, "hash_bucket", init_fraction=1 / 32
+        )
+        capacity = model._storage._state.key_index_map.per_table_capacity_
+        start = capacity[0]
+        insert_keys(model, torch.from_numpy(mine).to(device))
+        grown = model._storage._state.key_index_map.per_table_capacity_[0]
+        assert grown > start, "the table should have grown"
+        assert grown <= model._dynamicemb_options[0].max_capacity
+        held = model.export_keys_values(TABLE, device)[0].cpu().numpy()
+        assert np.array_equal(np.sort(held), np.sort(mine)), "a key was lost"
+        # the keys are found where they were put
+        insert_keys(model, torch.from_numpy(mine).to(device))
+        again = model.export_keys_values(TABLE, device)[0].cpu().numpy()
+        assert np.array_equal(np.sort(again), np.sort(mine)), "a key was inserted twice"
+        del model
+        torch.cuda.empty_cache()
+
+
+@pytest.mark.parametrize("src_shards,dst_shards", [(2, 1), (8, 1), (1, 2)])
+def test_hash_bucket_grown_checkpoint_reloads_losslessly_at_another_fanout(
+    current_device, src_shards, dst_shards
+):
+    """The tables that were dumped grew from a thirty-second of their rows; the
+    checkpoint holds keys, not buckets, so it reloads at another fan-out like one
+    of a table that started full."""
+    keys = keys_filling_every_bucket(per_bucket=16)
+    with tempfile.TemporaryDirectory() as save_dir:
+        held, held_values = dump_shards(
+            current_device,
+            keys,
+            src_shards,
+            save_dir,
+            "hash_bucket",
+            init_fraction=1 / 32,
+        )
+        assert np.array_equal(np.sort(held), np.sort(keys)), "lost while growing"
+        loaded, values = load_shards(
+            current_device, dst_shards, save_dir, "hash_bucket"
+        )
+    lost = np.setdiff1d(keys, loaded)
+    assert (
+        lost.size == 0
+    ), f"{lost.size} of {keys.size} rows lost on {src_shards} -> {dst_shards}"
+    assert loaded.size == keys.size, "no row duplicated across shards"
+    assert_same_rows(held, held_values, loaded, values)
 
 
 def test_roundrobin_checkpoint_loses_rows_at_another_fanout(current_device):

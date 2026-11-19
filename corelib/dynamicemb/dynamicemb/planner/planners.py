@@ -553,19 +553,11 @@ def _prepare_dynemb_table_options(
                 opts.init_capacity = opts.max_capacity
         else:
             opts.init_capacity = opts.max_capacity
-        if opts.global_capacity is not None and opts.init_capacity != opts.max_capacity:
-            # The global bucket map is only realised with exactly
-            # max_capacity / bucket_capacity buckets; a smaller table would hash
-            # into a different partition until it grows, and the growth would
-            # re-partition again.
-            warnings.warn(
-                f"{tmp_config.name}: a hash_bucket table keeps exactly "
-                f"{num_buckets} buckets so that its key -> bucket map does not "
-                f"depend on the number of shards; init_capacity is raised from "
-                f"{opts.init_capacity} to max_capacity {opts.max_capacity}",
-                UserWarning,
-            )
-            opts.init_capacity = opts.max_capacity
+        # A hash_bucket table may start below max_capacity and grow like any other:
+        # its keys go to a rank by the whole table's bucket map (global_capacity,
+        # which does not change with its size), and the table folds that map into
+        # the buckets it has. Growing only adds buckets, so a bucket splits in two
+        # and every key stays on its rank.
 
         opts.dim = tmp_config.embedding_dim
 
