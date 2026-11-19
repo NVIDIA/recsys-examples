@@ -566,7 +566,7 @@ def replay_increment(
       belongs to someone else and is skipped, which ``ReplayStats.skipped``
       makes visible.
 
-    Only ``roundrobin`` and ``hash_roundrobin`` tables can be replayed:
+    Only ``roundrobin``, ``hash_roundrobin`` and ``hash_bucket`` tables can be replayed:
     ``continuous`` has no per-key rank mapping to reconstruct, so it raises
     whenever the fan-out is more than one rank (``incremental_dump`` already
     refuses to dump such a table at all).

@@ -206,11 +206,13 @@ HierOutputDist::HierOutputDist(const std::string &unique_id, int64_t rank, int64
                                at::ScalarType dtype, bool weighted, bool node_dedup,
                                int64_t lookup_keys, int64_t remote_keys, int64_t proxy_bytes,
                                double timeout_s, int64_t out_ctas, int64_t reduce_ctas,
-                               int64_t payload_kb, const std::vector<int64_t> &lookup_groups)
+                               int64_t payload_kb, const std::vector<int64_t> &lookup_groups,
+                               const std::vector<int64_t> &global_capacities,
+                               const std::vector<int64_t> &shard_capacities)
     : config_(validated(config_of(rank, world_size, local_size, feature_tables, dist_types,
                                   lookup_groups, dim, dtype, weighted, node_dedup, lookup_keys,
                                   remote_keys, proxy_bytes, timeout_s, out_ctas, reduce_ctas,
-                                  payload_kb))),
+                                  payload_kb, global_capacities, shard_capacities))),
       sizes_(sizes_of(config_)),
       device_(current_device()) {
   c10::cuda::CUDAGuard guard(device_);
