@@ -577,13 +577,13 @@ class MultiTableAdmitter(abc.ABC):
     """
 
     @abc.abstractmethod
-    def admit(
+    def admit_with_counts(
         self,
         keys: torch.Tensor,
         table_ids: torch.Tensor,
         frequencies: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        """Which of these missing keys may enter the table.
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """Which of these missing keys may enter the table, and the count each was admitted on.
 
         Args:
             keys (torch.Tensor): The keys to decide on, deduplicated.
@@ -595,27 +595,12 @@ class MultiTableAdmitter(abc.ABC):
                 running total -- any total is the admitter's own to keep.
 
         Returns:
-            torch.Tensor: Boolean mask over `keys`, True where admitted.
+            Tuple[torch.Tensor, Optional[torch.Tensor]]: Boolean mask over
+            `keys`, True where admitted; and, from an admitter that counts
+            occurrences across steps, each key's running total (this batch
+            included) as an int64 tensor over `keys`, else None. On a table
+            that evicts by LFU an admitted key's score starts from that total.
         """
-
-    def admit_with_counts(
-        self,
-        keys: torch.Tensor,
-        table_ids: torch.Tensor,
-        frequencies: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        """:meth:`admit`, plus the count each key was admitted on.
-
-        An admitter that counts occurrences across steps may return, for every
-        key, its running total (this batch included); a frequency-scored table
-        then starts an admitted key from that total instead of from this
-        batch's increment alone. The default keeps no count and returns None.
-
-        Returns:
-            Tuple[torch.Tensor, Optional[torch.Tensor]]: The mask of
-            :meth:`admit`, and an int64 tensor over `keys` or None.
-        """
-        return self.admit(keys, table_ids, frequencies), None
 
     def state(self) -> Optional[Counter]:
         """Persistent state the framework has to carry, or None.

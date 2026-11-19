@@ -1685,24 +1685,27 @@ class AdmissionStrategy(abc.ABC):
 ```
 
 `MultiTableAdmitter` is what the module runs, and holds everything deciding
-takes. Only `admit` has to be implemented; the other two have defaults, so an
+takes. Only `admit_with_counts` has to be implemented; the other two have defaults, so an
 admitter that merely decides is one method.
 
 ```python
 class MultiTableAdmitter(abc.ABC):
     @abc.abstractmethod
-    def admit(
+    def admit_with_counts(
         self,
         keys: torch.Tensor,
         table_ids: torch.Tensor,
         frequencies: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        """Which of these missing keys may enter the table.
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """Which of these missing keys may enter the table, and the count each was admitted on.
 
         ``frequencies`` is how often each key occurred in *this batch*, where
         the module counts occurrences at all; None means treat each key as one.
         It is an increment, not a running total -- any total is the admitter's
-        own to keep.
+        own to keep. Returns a boolean mask over ``keys`` and, from an admitter
+        that counts occurrences across steps, each key's running total (this
+        batch included), else None. On a table that evicts by LFU an admitted
+        key's score starts from that total.
         """
 
     def state(self) -> Optional[Counter]:
@@ -1727,7 +1730,11 @@ class MultiTableAdmitter(abc.ABC):
 
 `FrequencyAdmissionStrategy` admits a key once it has been seen often enough,
 and carries the counter it accumulates into, so admission is configured in one
-place. Its admitter erases a key from that counter the moment it is admitted.
+place. Its admitter erases a key from that counter the moment it is admitted,
+and returns the count it was admitted on: on a table that evicts by LFU
+(`LFU`, or `(TIMESTAMP, LFU)` in either order) the key's score starts from that
+count, the occurrences it waited with included, so it ranks as if it had been
+in the table since it was first seen. On other tables the count is not used.
 
 ```python
 class FrequencyAdmissionStrategy(AdmissionStrategy):
@@ -1741,8 +1748,8 @@ class FrequencyAdmissionStrategy(AdmissionStrategy):
 ```
 
 `ProbabilisticAdmissionStrategy` admits a key by a coin toss instead, and its
-admitter keeps no state at all -- `state()` is None and no counter is built for
-it. Admission is consulted only for a key that is missing, so a key gets a
+admitter keeps no state at all -- `state()` is None, no counter is built for
+it, and it returns no counts. Admission is consulted only for a key that is missing, so a key gets a
 fresh toss every time it turns up and is not yet in the table: it takes
 `1 / probability` appearances on average to get in. A batch holding a key `k`
 times counts as `k` tosses.

@@ -276,15 +276,14 @@ def validate_admission_keys(
 def expected_admitted_scores(
     iteration_frequencies: List[Dict[str, Dict[int, int]]],
     threshold: int,
-    carry_count: bool,
 ) -> Dict[str, Dict[int, int]]:
     """
     The LFU score each key should hold after every iteration ran.
 
     A key waits in the counter until its occurrences reach the threshold. The
-    iteration that admits it gives it a score: the whole count it waited with
-    under carry_count, only that iteration's occurrences without. Every later
-    occurrence adds one, like any LFU key.
+    iteration that admits it gives it a score: the whole count it waited with,
+    that iteration's occurrences included. Every later occurrence adds one, like
+    any LFU key.
     """
     expected: Dict[str, Dict[int, int]] = defaultdict(dict)
     waiting: Dict[str, Dict[int, int]] = defaultdict(lambda: defaultdict(int))
@@ -297,7 +296,7 @@ def expected_admitted_scores(
                     continue
                 waiting[table_name][key] += frequency
                 if waiting[table_name][key] >= threshold:
-                    scores[key] = waiting[table_name][key] if carry_count else frequency
+                    scores[key] = waiting[table_name][key]
     return dict(expected)
 
 
@@ -391,14 +390,6 @@ def validate_non_admitted_embedding_values(
     help="Score strategy. lru_lfu is the compound (TIMESTAMP, LFU).",
 )
 @click.option(
-    "--carry-count",
-    is_flag=True,
-    help=(
-        "Admit with FrequencyAdmissionStrategy(carry_count=True), so an admitted "
-        "key's LFU score starts from the count it waited with."
-    ),
-)
-@click.option(
     "--global-hbm-budget-scale",
     type=float,
     default=1.0,
@@ -459,7 +450,6 @@ def test_admission_strategy_validation(
     cache_capacity_ratio: float,
     empty_rank_iteration: Optional[int],
     score_strategy: str,
-    carry_count: bool,
     global_hbm_budget_scale: float,
     non_admitted_init_value: float,
     no_strategy_initializer: bool,
@@ -530,7 +520,6 @@ def test_admission_strategy_validation(
         threshold=threshold,
         counter=KVCounter(ADMISSION_COUNTER_CAPACITY),
         initializer_args=non_admitted_initializer_args,
-        carry_count=carry_count,
     )
 
     # Create model with admission strategy
@@ -609,7 +598,7 @@ def test_admission_strategy_validation(
 
     if score_strategy in ("lfu", "lru_lfu"):
         validate_admitted_scores(
-            expected_admitted_scores(iteration_frequencies, threshold, carry_count),
+            expected_admitted_scores(iteration_frequencies, threshold),
             actual_scores,
         )
 
@@ -729,39 +718,33 @@ def _build_cases():
 
     for storage, storage_options in STORAGE_MODES.items():
         for score_strategy in ("lfu", "lru_lfu"):
-            for carry_count in (False, True):
-                options = {
-                    **_FOUR_TABLES,
-                    **storage_options,
-                    "optimizer_type": "sgd",
-                    "score_strategy": score_strategy,
-                    "carry_count": carry_count,
-                }
-                if storage == "cache":
-                    options["threshold"] = 2
-                name = "carry-count" if carry_count else "admitted-score"
-                cases[f"{name}-{storage}-{score_strategy}"] = {
-                    "gpus": (1, 8),
-                    "options": options,
-                }
+            options = {
+                **_FOUR_TABLES,
+                **storage_options,
+                "optimizer_type": "sgd",
+                "score_strategy": score_strategy,
+            }
+            if storage == "cache":
+                options["threshold"] = 2
+            cases[f"admitted-score-{storage}-{score_strategy}"] = {
+                "gpus": (1, 8),
+                "options": options,
+            }
 
-    for carry_count in (False, True):
-        name = "carry-count" if carry_count else "admitted-score"
-        cases[f"{name}-tiny-cache"] = {
-            "gpus": (1,),
-            "options": {
-                **_ONE_TABLE,
-                "num_embeddings": "20000",
-                "multi_hot_sizes": "5",
-                "batch_size": 256,
-                "num_iterations": 25,
-                "caching": True,
-                "cache_capacity_ratio": 0.05,
-                "threshold": 2,
-                "score_strategy": "lfu",
-                "carry_count": carry_count,
-            },
-        }
+    cases["admitted-score-tiny-cache"] = {
+        "gpus": (1,),
+        "options": {
+            **_ONE_TABLE,
+            "num_embeddings": "20000",
+            "multi_hot_sizes": "5",
+            "batch_size": 256,
+            "num_iterations": 25,
+            "caching": True,
+            "cache_capacity_ratio": 0.05,
+            "threshold": 2,
+            "score_strategy": "lfu",
+        },
+    }
 
     # A threshold no key can reach, so every value the forward returns comes
     # from whichever initializer owns the rows admission rejects.

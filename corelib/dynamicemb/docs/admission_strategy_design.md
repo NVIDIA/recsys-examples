@@ -164,12 +164,16 @@ class MultiTableAdmitter(abc.ABC):
     """What a fused module runs, holding everything deciding takes."""
 
     @abc.abstractmethod
-    def admit(self, keys, table_ids, frequencies=None) -> torch.Tensor:
-        """Which of these missing keys may enter the table.
+    def admit_with_counts(
+        self, keys, table_ids, frequencies=None
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """Which of these missing keys may enter the table, and the count each was admitted on.
 
         ``frequencies`` is how often each key occurred in *this batch*, where
         the module counts occurrences at all; None means treat each key as one.
         An increment, not a running total -- any total is the admitter's own.
+        The counts are each key's running total, or None from an admitter that
+        keeps none; an LFU table starts an admitted key's score from it.
         """
 
     def state(self) -> Optional[Counter]:
@@ -184,7 +188,7 @@ class MultiTableAdmitter(abc.ABC):
 
 One abstract method each. Everything else has a default, so an admitter that
 merely decides is one method, and a probabilistic one needs no framework change
-at all: `state()` stays None and `admit` is one line.
+at all: `state()` stays None and `admit_with_counts` is one line.
 
 `state()` exists because the counter is not private bookkeeping: it is device
 memory the framework sizes, reports through `memory_usage`, and checkpoints.
@@ -224,7 +228,7 @@ module construction
         `-- type(s[0]).create_admitter(...)            admission
                  |-- MultiTableKVCounter               from each strategy's KVCounter
                  `-- MultiTableInitializer.create      for rejected rows
-forward                              admit() decides and keeps its own books
+forward                              admit_with_counts() decides and keeps its own books
 ```
 
 The planner touching only table fields is what keeps a configuration object
@@ -373,7 +377,7 @@ reads `keys`, and doing so keeps that argument out of every other mode.
 `ProbabilisticAdmissionStrategy` admits a missing key with a fixed chance, and
 needed no framework change at all: `state()` stays None so no counter is ever
 built for it, `create_admitter` only has the rejected-row initializer to open,
-and `admit` is a comparison.
+and `admit_with_counts` is a comparison that returns no counts.
 
 ```python
 draws = torch.rand(num_keys, device=keys.device)
@@ -435,7 +439,7 @@ filling the caller's args in place. `BaseDynamicEmbInitializer` and
 `FrequencyAdmissionStrategy` taking its own counter, implementing
 `create_admitter` and `get_grouped_key`, warning on an unbounded `UNIFORM`;
 and their admitters `MultiTableFrequencyAdmitter` and
-`MultiTableProbabilisticAdmitter` implementing `admit`, `state` and
+`MultiTableProbabilisticAdmitter` implementing `admit_with_counts`, `state` and
 `non_admitted_initializer`. The frequency admitter does the counter's `add`
 and `erase` itself.
 
@@ -452,7 +456,7 @@ and eval initializers; `_create_admitter` builds the admitter and takes
 `_admission_counter` from its `state()`, which the dump/load paths still read.
 
 **`batched_dynamicemb_function.py`** — six call sites pass `table_ids`; the
-three admission paths lose their counter bookkeeping to `admit()`; rejected
+three admission paths lose their counter bookkeeping to `admit_with_counts()`; rejected
 rows are written by `strategy.non_admitted_initializer or initializer`, one
 call, no branch on a return value; `admission_counter` is gone from every
 signature.
@@ -471,6 +475,7 @@ signature.
 | `AdmissionStrategy.initialize_non_admitted_embeddings` | `MultiTableAdmitter.non_admitted_initializer` | removed |
 | `AdmissionStrategy.admit` | `MultiTableAdmitter.admit` | a configuration no longer decides; `create_admitter` builds what does |
 | `admit(keys, frequencies)` | `admit(keys, table_ids, frequencies=None)` | `frequencies` is now a per-batch increment, not a running total |
+| `MultiTableAdmitter.admit -> mask` | `MultiTableAdmitter.admit_with_counts -> (mask, counts or None)` | rename; return `(mask, None)` from an admitter that keeps no count. `MultiTableFrequencyAdmitter` returns each key's running total, and an LFU table starts an admitted key's score from it instead of from the admitting batch's occurrences alone |
 
 `admission_counter` keeps working: `__post_init__` warns, then folds it into a
 *copy* of the strategy. A copy because one strategy is commonly handed to every
@@ -538,7 +543,7 @@ carries the deprecation.
 
 ## 9. Out of scope
 
-- **Per-table thresholds.** `admit` receives `table_ids`, so a strategy could
+- **Per-table thresholds.** `admit_with_counts` receives `table_ids`, so a strategy could
   hold a threshold per table and drop `threshold` from its grouping key. That is
   a feature, not a fix.
 - **`initializers[0]` elsewhere.** Only the initializer family is addressed here.
