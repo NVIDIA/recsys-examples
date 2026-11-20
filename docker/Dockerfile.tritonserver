@@ -1,5 +1,5 @@
 ARG PYTORCH_AOTI_IMAGE=recsys-examples:devel_latest
-ARG BASE_IMAGE=nvcr.io/nvidia/tritonserver:26.07-py3
+ARG BASE_IMAGE=nvcr.io/nvidia/tritonserver:26.09-py3
 
 FROM ${PYTORCH_AOTI_IMAGE} AS pytorch_aoti
 
@@ -39,7 +39,7 @@ RUN ln -sf /bin/python3 /bin/python && \
     rm -f /usr/lib/$(uname -m)-linux-gnu/libcuda.so.1 && \
     test -e /usr/local/cuda-13/compat/lib.real/libcuda.so.1 && \
     ln -s /usr/local/cuda-13/compat/lib.real/libcuda.so.1  /usr/lib/$(uname -m)-linux-gnu/libcuda.so.1 && \
-    pip3 install --no-cache-dir 'tritonclient[all]==2.71.0' && \
+    pip3 install --no-cache-dir 'tritonclient[all]==2.73.0' && \
     apt-get autoremove -y && apt-get clean && rm -rf /var/lib/apt/lists/*
 
 COPY --from=pytorch_aoti /workspace/deps/FlexKV /workspace/deps/FlexKV

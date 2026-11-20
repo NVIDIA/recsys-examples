@@ -12,7 +12,7 @@ def nvcc_threads_args():
 nvcc_flags = [
     "-g",
     "-O3",
-    "-std=c++17",
+    "-std=c++20",
     "-U__CUDA_NO_HALF_OPERATORS__",
     "-U__CUDA_NO_HALF_CONVERSIONS__",
     "-U__CUDA_NO_BFLOAT16_OPERATORS__",
@@ -33,7 +33,7 @@ _ALL_EXT_MODULES = [
             "ops/cuda_ops/csrc/kjt_aux_op.cpp",
         ],
         extra_compile_args={
-            "cxx": ["-O3", "-std=c++17", "-DWITH_PYBIND11=1"],
+            "cxx": ["-O3", "-std=c++20", "-DWITH_PYBIND11=1"],
             "nvcc": nvcc_threads_args() + nvcc_flags,
         },
     ),

@@ -1,8 +1,9 @@
 cmake_minimum_required(VERSION 3.18)
 project(inference_hstu_gr_ranking_exported_model LANGUAGES CXX CUDA)
 
-set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CUDA_STANDARD 20)
 set(CMAKE_PREFIX_PATH "${CMAKE_PREFIX_PATH};$ENV{Torch_DIR}")
 
 set(NVE_INSTALL_ROOT "/opt/nve" CACHE PATH "NVE install root")
@@ -51,9 +52,9 @@ target_include_directories(hstu_cuda_ops_runtime PRIVATE
   ${TORCH_INCLUDE_DIRS}
   "${NVTX_INCLUDE_DIR}"
 )
-target_compile_features(hstu_cuda_ops_runtime PRIVATE cxx_std_17)
+target_compile_features(hstu_cuda_ops_runtime PRIVATE cxx_std_20)
 set_target_properties(hstu_cuda_ops_runtime PROPERTIES
-  CUDA_STANDARD 17
+  CUDA_STANDARD 20
   CUDA_STANDARD_REQUIRED ON
   POSITION_INDEPENDENT_CODE ON
 )
@@ -72,7 +73,7 @@ target_include_directories(paged_kvcache_ops_runtime PRIVATE
 )
 target_compile_features(paged_kvcache_ops_runtime PRIVATE cxx_std_20)
 set_target_properties(paged_kvcache_ops_runtime PROPERTIES
-  CUDA_STANDARD 17
+  CUDA_STANDARD 20
   CUDA_STANDARD_REQUIRED ON
   POSITION_INDEPENDENT_CODE ON
 )
@@ -135,9 +136,9 @@ else()
   message(STATUS "fbgemm experimental hstu library not found. Will rely on runtime dlopen path.")
 endif()
 
-target_compile_features(inference_hstu_gr_ranking_exported_model PRIVATE cxx_std_17)
+target_compile_features(inference_hstu_gr_ranking_exported_model PRIVATE cxx_std_20)
 target_compile_options(inference_hstu_gr_ranking_exported_model PRIVATE -w)
-target_compile_features(inference_hstu_gr_ranking_kvcache_exported_model PRIVATE cxx_std_17)
+target_compile_features(inference_hstu_gr_ranking_kvcache_exported_model PRIVATE cxx_std_20)
 target_compile_options(inference_hstu_gr_ranking_kvcache_exported_model PRIVATE -w)
 
 if(NOT NVE_CACHE_LINE_SIZE)
@@ -193,7 +194,7 @@ function(add_nve_loader_plugin
     "${common_lib}"
   )
   set_target_properties(${target} PROPERTIES
-    CUDA_STANDARD 17
+    CUDA_STANDARD 20
     CUDA_STANDARD_REQUIRED ON
     CXX_VISIBILITY_PRESET hidden
     CUDA_VISIBILITY_PRESET hidden

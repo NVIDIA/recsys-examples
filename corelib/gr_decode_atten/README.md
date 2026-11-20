@@ -10,8 +10,8 @@ the canonical source and the location for ongoing kernel development.
 
 - **Source repo**: `ssh://git@gitlab-master.nvidia.com:12051/cjerry/gr-decode_atten.git`
 - **Pinned commit**: `1c540f6` (upstream `master`, includes `seqused_k` and `cu_seqlens_k` support)
-- **Local runtime baseline**: CUTLASS DSL 4.5.2 and Quack 0.4.1, matching
-  the NVIDIA PyTorch 26.07 base image
+- **Local runtime baseline**: CUTLASS DSL 4.8.0.dev0 and Quack 0.6.2, matching
+  the NVIDIA PyTorch 26.09 base image
 - **Initial import date**: 2026-05-13
 
 ### Sync policy
