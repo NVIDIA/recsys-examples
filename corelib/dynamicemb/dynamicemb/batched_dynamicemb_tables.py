@@ -1462,11 +1462,11 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                 result[table_name] = self._scores[table_name]
         return result
 
-    # What a storage layout lets an erase by score do. Only a single-tier GPU storage
-    # and the backing storage of a cache keep a key map the erase can scan; the others
-    # keep their keys where it cannot (host values read by the generic path, two tiers,
-    # an external store).
-    _ERASABLE_LAYOUTS = (StorageLayout.HBM_ONLY, StorageLayout.CACHING)
+    _ERASABLE_LAYOUTS = (
+        StorageLayout.HBM_ONLY,
+        StorageLayout.HOST_ONLY,
+        StorageLayout.CACHING,
+    )
 
     def erasable_table_ids(self, score_strategy: DynamicEmbScoreStrategy) -> List[int]:
         """The tables an erase by ``score_strategy`` would scan, after checking that it can.
@@ -1488,8 +1488,8 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
                 table_ids.append(table_id)
         if table_ids and self._storage_layout not in self._ERASABLE_LAYOUTS:
             raise NotImplementedError(
-                "erase by score needs the keys in a GPU hash table: HBM-only storage, "
-                "or a cache over host storage with no external storage. This module "
+                "erase by score needs a single-tier storage (HBM-only or host-only) "
+                "or a cache over host storage, with no external storage. This module "
                 f"is {self._storage_layout.name}."
             )
         return table_ids
@@ -1571,7 +1571,8 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
 
         Best effort: a key a prefetched batch is still using is spared, not erased.
         With a cache only the storage behind it is erased, and the cache is neither
-        read nor changed.
+        read nor changed. Host-only storage pins no key: one a batch is using is erased
+        if its score is below ``threshold``, and that batch's update to it is dropped.
 
         The scan can overlap training -- forward, backward and prefetch -- and nothing
         else: before a dump, load, incremental dump, replay or ``pop_*``, wait for
