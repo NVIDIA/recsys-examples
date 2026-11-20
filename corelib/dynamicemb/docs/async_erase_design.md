@@ -26,7 +26,7 @@
 | --- | --- | --- |
 | `HBM_DIRECT` (`DynamicEmbStorage`, values in HBM) | yes | in-flight keys are pinned by the storage's own ref counter |
 | `CACHE` (`DynamicEmbCache` over a `DynamicEmbStorage`) | yes | only the backing storage is erased, the cache is left alone; see §5 |
-| `DEFAULT` with a `DynamicEmbStorage` (`HOST_ONLY`) | yes | no ref counter: forward's find/insert and backward's write-back take the gate, and the write-back updates only the keys still there, so a key erased between forward and backward loses that batch's update instead of coming back with a score of 0 |
+| `DEFAULT` with a `DynamicEmbStorage` (`HOST_ONLY`) | yes | no ref counter: forward's find/insert and backward's write-back take the gate, and the write-back updates only the keys still there, so a key erased between forward and backward loses that batch's update instead of coming back with a score of 0. Not handled: a later forward inserts the key again before that backward; the backward then writes the erased row's updated embedding and optimizer state over the new row, with no error, until the later batch's backward writes it |
 | `HybridStorage` | **no** | two tiers, no ref counter in use |
 | `CACHE` with an `external_storage` (`CACHING_PS`), or the PS alone (`HOST_PS`) | **no** | erase drops data that is no longer used, so it has nothing to do with a PS; the table is rejected rather than left with a stale copy there (§5, consequence 2) |
 

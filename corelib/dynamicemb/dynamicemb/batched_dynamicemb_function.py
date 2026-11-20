@@ -33,6 +33,7 @@ from dynamicemb.key_value_table import (
     _select,
     _write_back_evicted,
     eval_lookup,
+    get_find_score_arg,
     get_insert_score_arg,
     load_from_flat,
     load_from_flat_by,
@@ -1278,14 +1279,24 @@ def write_back_generic(
     A ``DynamicEmbStorage`` pins no slot here, so between forward and backward an erase
     may have taken a key: its update is dropped rather than inserted again, since a
     ``CONST`` insert would give it a score of 0 and evict a live key to make room.
-    Other storages keep their own ``insert(preserve_existing=True)``."""
+    Other storages keep their own ``insert(preserve_existing=True)``.
+
+    No host sync: a missing key's row is set to -1, which the store skips."""
     if not isinstance(storage, DynamicEmbStorage):
         storage.insert(keys, table_ids, values, preserve_existing=True)
         return
+    if keys.numel() == 0:
+        return
     state = storage._state
-    found = _find_keys(state, keys, table_ids, const_lookup=True)
-    founds, rows = found[5], found[7]
-    store_to_flat(state, rows[founds], table_ids[founds], values[founds])
+    km = state.key_index_map
+    if keys.dtype != km.key_type:
+        keys = keys.to(km.key_type)
+    score_arg = get_find_score_arg(state, keys.numel(), keys.device, const_lookup=True)
+    if getattr(km, "enable_overflow_", False):
+        _, founds, rows = km.lookup_with_overflow(keys, table_ids, score_arg)
+    else:
+        _, founds, rows = km.lookup(keys, table_ids, score_arg)
+    store_to_flat(state, torch.where(founds, rows, -1), table_ids, values)
 
 
 class DynamicEmbeddingFunction(torch.autograd.Function):
