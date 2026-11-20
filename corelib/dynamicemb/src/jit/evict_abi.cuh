@@ -25,7 +25,8 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 //
 // KeyType/IndexType/CounterType are all int64, ScoreType is uint64, InsertResult
 // is a uint8 enum -- fixed for LruLfu (§11.2), so this ABI is monomorphic. The
-// cubin exposes three entry points (all take EvictParams by value):
+// cubin exposes these entry points (all take EvictParams by value; each name
+// ends in _abi<DYN_EMB_EVICT_ABI>, below):
 //   dyn_emb_evict_entry_ovf(EvictParams)     -- insert_and_evict, overflow tier
 //   dyn_emb_evict_entry_noovf(EvictParams)   -- insert_and_evict, no overflow
 //   dyn_emb_insert_entry(EvictParams)        -- plain insert (evicts a full
@@ -34,6 +35,26 @@ All rights reserved. # SPDX-License-Identifier: Apache-2.0
 #pragma once
 
 #include <cstdint>
+
+// The ABI version of EvictParams: bump it whenever the struct changes. The
+// cubin's entry points carry it in their names, so an image built against
+// another layout does not export the names the launcher asks for, and the
+// load raises (load_from_image, jit_link.cpp). Without it a stale fatbin
+// paired with a newer extension would launch happily and read a struct it does
+// not match: the fields it predates are ignored (a hash_bucket table's
+// table_global_capacities, say) and keys are placed by the old rule.
+//   1: the layout before table_global_capacities (entry points without suffix)
+//   2: + table_global_capacities
+#define DYN_EMB_EVICT_ABI 2
+#define DYN_EMB_STR_(x) #x
+#define DYN_EMB_STR(x) DYN_EMB_STR_(x)
+// An entry point's identifier (device side) and its name string (host side).
+// (The operands of ## are not macro-expanded, hence the extra level of CAT.)
+#define DYN_EMB_CAT_(a, b) a##b
+#define DYN_EMB_CAT(a, b) DYN_EMB_CAT_(a, b)
+#define DYN_EMB_EVICT_SYM(base)                                                \
+  DYN_EMB_CAT(DYN_EMB_CAT(base, _abi), DYN_EMB_EVICT_ABI)
+#define DYN_EMB_EVICT_NAME(base) base "_abi" DYN_EMB_STR(DYN_EMB_EVICT_ABI)
 
 namespace dyn_emb {
 
@@ -69,6 +90,11 @@ struct EvictParams {
   int *ovf_bucket_sizes;
   int32_t *ovf_counter;
   const int64_t *ovf_output_offsets;
+
+  // --- appended (keep last: the struct layout is the cubin launch contract) ---
+  // Per logical table global capacity for LinearBucketTable::home_bucket;
+  // nullptr == every table hashes within its own capacity.
+  const int64_t *table_global_capacities;
 };
 
 } // namespace dyn_emb

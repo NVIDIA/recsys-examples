@@ -66,17 +66,21 @@ void bind_hier_output_dist(py::module &py_module) {
          const std::vector<int64_t> &feature_tables, const std::vector<int64_t> &dist_types,
          int64_t dim, at::ScalarType dtype, bool weighted, bool node_dedup, int64_t lookup_keys,
          int64_t remote_keys, int64_t proxy_bytes, double timeout_s, int64_t out_ctas,
-         int64_t reduce_ctas, int64_t payload_kb, const std::vector<int64_t> &lookup_groups) {
+         int64_t reduce_ctas, int64_t payload_kb, const std::vector<int64_t> &lookup_groups,
+         const std::vector<int64_t> &global_capacities,
+         const std::vector<int64_t> &shard_capacities) {
         return dyn_emb::hier_output_dist::invalid(dyn_emb::hier_output_dist::config_of(
             rank, world_size, local_size, feature_tables, dist_types, lookup_groups, dim, dtype,
             weighted, node_dedup, lookup_keys, remote_keys, proxy_bytes, timeout_s, out_ctas,
-            reduce_ctas, payload_kb));
+            reduce_ctas, payload_kb, global_capacities, shard_capacities));
       },
       py::arg("rank"), py::arg("world_size"), py::arg("local_size"), py::arg("feature_tables"),
       py::arg("dist_types"), py::arg("dim"), py::arg("dtype"), py::arg("weighted"),
       py::arg("node_dedup"), py::arg("lookup_keys"), py::arg("remote_keys"), py::arg("proxy_bytes"),
       py::arg("timeout_s"), py::arg("out_ctas"), py::arg("reduce_ctas"), py::arg("payload_kb"),
       py::arg("lookup_groups") = std::vector<int64_t>{},
+      py::arg("global_capacities") = std::vector<int64_t>{},
+      py::arg("shard_capacities") = std::vector<int64_t>{},
       "Why the op refuses the configuration the constructor would take, or an empty string; "
       "builds nothing");
 
@@ -87,6 +91,7 @@ void bind_hier_output_dist(py::module &py_module) {
       .def(py::init<const std::string &, int64_t, int64_t, int64_t, const std::vector<int64_t> &,
                     const std::vector<int64_t> &, int64_t, at::ScalarType, bool, bool, int64_t,
                     int64_t, int64_t, double, int64_t, int64_t, int64_t,
+                    const std::vector<int64_t> &, const std::vector<int64_t> &,
                     const std::vector<int64_t> &>(),
            py::arg("unique_id"), py::arg("rank"), py::arg("world_size"), py::arg("local_size"),
            py::arg("feature_tables"), py::arg("dist_types"), py::arg("dim"), py::arg("dtype"),
@@ -94,6 +99,8 @@ void bind_hier_output_dist(py::module &py_module) {
            py::arg("remote_keys"), py::arg("proxy_bytes"), py::arg("timeout_s"),
            py::arg("out_ctas"), py::arg("reduce_ctas"), py::arg("payload_kb"),
            py::arg("lookup_groups") = std::vector<int64_t>{},
+           py::arg("global_capacities") = std::vector<int64_t>{},
+           py::arg("shard_capacities") = std::vector<int64_t>{},
            py::call_guard<py::gil_scoped_release>())  // the constructor's collectives
       .def("input_dist", &HierOutputDist::input_dist, py::arg("values"), py::arg("offsets"),
            py::arg("lengths"), py::arg("batch_size"), py::arg("weights"), py::arg("input_offsets"),

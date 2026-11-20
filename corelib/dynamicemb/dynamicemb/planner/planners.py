@@ -40,13 +40,16 @@ from torchrec.modules.embedding_configs import BaseEmbeddingConfig, data_type_to
 
 from ..dynamicemb_config import (
     DEFAULT_INDEX_TYPE,
+    MAX_BUCKET_CAPACITY,
     DynamicEmbTableOptions,
+    _global_table_bucket_layout,
     _sharded_table_bucket_layout,
     align_to_table_size,
     complete_initializer_args,
     get_group_value_bytes_by_tier,
     normalize_caching_against_hbm_budget,
 )
+from ..types import BUCKET_ALIGNMENT
 from .placement import BalancedNodePlacer, NodePlacer, TableToPlace
 from .plan import (
     TableKey,
@@ -481,10 +484,11 @@ def _prepare_dynemb_table_options(
         # is per table, not global (§4.2). It does not depend on *which* node,
         # which is why a table can be sized before it is placed.
         fanout = table_fanout(_sharding_type_of(tmp_constraint), world_size, local_size)
+        requested_bucket_capacity = opts.bucket_capacity
         num_buckets, effective_bucket_capacity = _sharded_table_bucket_layout(
             tmp_config,
             fanout,
-            opts.bucket_capacity,
+            requested_bucket_capacity,
         )
         opts.bucket_capacity = effective_bucket_capacity
         aligned_per_rank_rows = num_buckets * effective_bucket_capacity
@@ -494,6 +498,40 @@ def _prepare_dynemb_table_options(
         # have one, and this is the last moment before the options are grouped
         # and costed -- both read `caching` to decide a layout.
         normalize_caching_against_hbm_budget(opts, label=str(key))
+        # hash_bucket keys to a global bucket of the whole table, so the
+        # table has to know the whole table's capacity, not just its shard's.
+        # Every other rule keeps hashing within the shard (None), and the
+        # one-bucket sentinel has no whole-table form.
+        if opts.dist_type != "hash_bucket":
+            opts.global_capacity = None
+        elif requested_bucket_capacity == MAX_BUCKET_CAPACITY:
+            # One bucket per shard has no whole-table form, so the rule's
+            # modulus is the shards laid end to end: the key goes to shard
+            # (h % (S * shard_rows)) // shard_rows, uniform over the shards.
+            # It changes with the fan-out, so such a table is routed
+            # consistently but not reloaded losslessly across world sizes.
+            opts.global_capacity = fanout * aligned_per_rank_rows
+            warnings.warn(
+                f"{tmp_config.name}: dist_type 'hash_bucket' with "
+                "MAX_BUCKET_CAPACITY (one bucket per shard) routes keys "
+                "consistently but is not fan-out invariant: its global_capacity "
+                f"{opts.global_capacity} is {fanout} shards x {aligned_per_rank_rows} "
+                "rows and changes with the number of shards, so a checkpoint "
+                "reloaded at another world size re-partitions its keys and may "
+                "lose rows where a shard fills. Give bucket_capacity a multiple of "
+                f"{BUCKET_ALIGNMENT} for the fan-out-invariant layout.",
+                UserWarning,
+            )
+        else:
+            global_layout = _global_table_bucket_layout(
+                tmp_config, effective_bucket_capacity
+            )
+            assert global_layout is not None
+            num_global_buckets, _ = global_layout
+            # ceil(ceil(N/bc)/S) == ceil(ceil(N/S)/bc): the shard keeps the
+            # size it always had.
+            assert math.ceil(num_global_buckets / fanout) == num_buckets
+            opts.global_capacity = num_global_buckets * effective_bucket_capacity
 
         if opts.init_capacity is not None:
             aligned_init = align_to_table_size(
@@ -515,6 +553,11 @@ def _prepare_dynemb_table_options(
                 opts.init_capacity = opts.max_capacity
         else:
             opts.init_capacity = opts.max_capacity
+        # A hash_bucket table may start below max_capacity and grow like any other:
+        # its keys go to a rank by the whole table's bucket map (global_capacity,
+        # which does not change with its size), and the table folds that map into
+        # the buckets it has. Growing only adds buckets, so a bucket splits in two
+        # and every key stays on its rank.
 
         opts.dim = tmp_config.embedding_dim
 

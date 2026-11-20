@@ -25,7 +25,7 @@ void table_lookup_single_score(
     int64_t bucket_capacity, at::Tensor keys, at::Tensor table_ids,
     std::optional<at::Tensor> score_input, ScorePolicyType policy_type,
     at::Tensor score_output, at::Tensor founds, at::Tensor indices,
-    int64_t num_scores) {
+    int64_t num_scores, int64_t const *global_caps_ptr) {
 
   auto key_type = get_data_type(keys);
 
@@ -66,7 +66,8 @@ void table_lookup_single_score(
     using Table = LinearBucketTable<Bucket>;
 
     auto table = Table(reinterpret_cast<uint8_t *>(table_storage.data_ptr()),
-                       num_buckets, bucket_capacity, num_scores);
+                       num_buckets, bucket_capacity, num_scores,
+                       global_caps_ptr);
 
     DISPATCH_SCORE_POLICY(policy_type, PolicyTypeV, [&] {
       table_lookup_kernel<Table, 1, PolicyTypeV, false>
@@ -85,7 +86,8 @@ static void table_lookup_with_overflow_single_score(
     std::optional<at::Tensor> score_input, ScorePolicyType policy_type,
     at::Tensor score_output, at::Tensor founds, at::Tensor indices,
     at::Tensor ovf_storage, int64_t ovf_bucket_capacity,
-    at::Tensor ovf_output_offsets, int64_t num_scores) {
+    at::Tensor ovf_output_offsets, int64_t num_scores,
+    int64_t const *global_caps_ptr) {
 
   auto key_type = get_data_type(keys);
 
@@ -127,7 +129,8 @@ static void table_lookup_with_overflow_single_score(
     using Table = LinearBucketTable<Bucket>;
 
     auto table = Table(reinterpret_cast<uint8_t *>(table_storage.data_ptr()),
-                       num_buckets, bucket_capacity, num_scores);
+                       num_buckets, bucket_capacity, num_scores,
+                       global_caps_ptr);
 
     int64_t ovf_bucket_bytes = ovf_bucket_capacity * total_size;
     int64_t ovf_num_buckets =
@@ -152,7 +155,8 @@ table_lookup(at::Tensor table_storage, at::Tensor table_bucket_offsets,
              int64_t bucket_capacity, at::Tensor keys, at::Tensor table_ids,
              std::optional<at::Tensor> score_input, ScorePolicyType policy_type,
              std::optional<at::Tensor> ovf_storage, int64_t ovf_bucket_capacity,
-             std::optional<at::Tensor> ovf_output_offsets, int64_t num_scores) {
+             std::optional<at::Tensor> ovf_output_offsets, int64_t num_scores,
+             std::optional<at::Tensor> table_global_capacities) {
 
   int64_t num_total = keys.size(0);
   if (num_total == 0) {
@@ -171,18 +175,20 @@ table_lookup(at::Tensor table_storage, at::Tensor table_bucket_offsets,
       torch::empty({num_total}, keys.options().dtype(torch::kInt64));
 
   bool use_overflow = ovf_storage.has_value() && ovf_storage.value().defined();
+  auto global_caps_ptr =
+      global_capacities_ptr(table_global_capacities, table_bucket_offsets);
 
   if (use_overflow) {
     table_lookup_with_overflow_single_score(
         table_storage, table_bucket_offsets, bucket_capacity, keys, table_ids,
         score_input, policy_type, score_output, founds, indices,
         ovf_storage.value(), ovf_bucket_capacity, ovf_output_offsets.value(),
-        num_scores);
+        num_scores, global_caps_ptr);
   } else {
     table_lookup_single_score(table_storage, table_bucket_offsets,
                               bucket_capacity, keys, table_ids, score_input,
                               policy_type, score_output, founds, indices,
-                              num_scores);
+                              num_scores, global_caps_ptr);
   }
 
   return std::make_tuple(score_output, founds, indices);

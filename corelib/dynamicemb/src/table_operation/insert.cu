@@ -45,6 +45,7 @@ void launch_table_insert_kernel(
     p.bucket_capacity = table.bucket_capacity_;
     p.num_scores = table.num_scores_;
     p.table_bucket_offsets = table_bucket_offsets_ptr;
+    p.table_global_capacities = table.global_capacities_;
     p.bucket_sizes = bucket_sizes_ptr;
     p.batch = num_total;
     p.input_keys = reinterpret_cast<const int64_t *>(keys_ptr);
@@ -95,6 +96,7 @@ void launch_table_insert_collect_kernel(
     p.bucket_capacity = table.bucket_capacity_;
     p.num_scores = table.num_scores_;
     p.table_bucket_offsets = table_bucket_offsets_ptr;
+    p.table_global_capacities = table.global_capacities_;
     p.bucket_sizes = bucket_sizes_ptr;
     p.batch = num_total;
     p.input_keys = reinterpret_cast<const int64_t *>(keys_ptr);
@@ -133,7 +135,8 @@ void table_insert_single_score(at::Tensor table_storage,
                                std::optional<at::Tensor> insert_results,
                                std::optional<at::Tensor> score_output,
                                std::optional<at::Tensor> counter,
-                               int64_t num_scores, int64_t score_fn_key) {
+                               int64_t num_scores, int64_t score_fn_key,
+                               int64_t const *global_caps_ptr) {
 
   auto key_type = get_data_type(keys);
 
@@ -184,7 +187,8 @@ void table_insert_single_score(at::Tensor table_storage,
     using Table = LinearBucketTable<Bucket>;
 
     auto table = Table(reinterpret_cast<uint8_t *>(table_storage.data_ptr()),
-                       num_buckets, bucket_capacity, num_scores);
+                       num_buckets, bucket_capacity, num_scores,
+                       global_caps_ptr);
 
     DISPATCH_SCORE_POLICY(policy_type, PolicyTypeV, [&] {
       if (output_score) {
@@ -214,7 +218,8 @@ at::Tensor table_insert(at::Tensor table_storage,
                         std::optional<at::Tensor> counter,
                         std::optional<at::Tensor> insert_results,
                         std::optional<at::Tensor> score_output,
-                        int64_t num_scores, int64_t score_fn_key) {
+                        int64_t num_scores, int64_t score_fn_key,
+                        std::optional<at::Tensor> table_global_capacities) {
 
   int64_t num_total = keys.size(0);
   if (num_total == 0) {
@@ -227,7 +232,9 @@ at::Tensor table_insert(at::Tensor table_storage,
   table_insert_single_score(table_storage, table_bucket_offsets,
                             bucket_capacity, bucket_sizes, keys, table_ids,
                             score_input, policy_type, indices, insert_results,
-                            score_output, counter, num_scores, score_fn_key);
+                            score_output, counter, num_scores, score_fn_key,
+                            global_capacities_ptr(table_global_capacities,
+                                                  table_bucket_offsets));
 
   return indices;
 }
@@ -242,7 +249,8 @@ void table_insert_collect_single_score(
     std::optional<at::Tensor> insert_results,
     std::optional<at::Tensor> score_output, std::optional<at::Tensor> counter,
     int64_t num_scores, int64_t score_fn_key, at::Tensor evicted_counter,
-    at::Tensor evicted_keys, at::Tensor evicted_table_ids) {
+    at::Tensor evicted_keys, at::Tensor evicted_table_ids,
+    int64_t const *global_caps_ptr) {
 
   auto key_type = get_data_type(keys);
 
@@ -297,7 +305,8 @@ void table_insert_collect_single_score(
     using Table = LinearBucketTable<Bucket>;
 
     auto table = Table(reinterpret_cast<uint8_t *>(table_storage.data_ptr()),
-                       num_buckets, bucket_capacity, num_scores);
+                       num_buckets, bucket_capacity, num_scores,
+                       global_caps_ptr);
 
     DISPATCH_SCORE_POLICY(policy_type, PolicyTypeV, [&] {
       if (output_score) {
@@ -333,7 +342,7 @@ table_insert_collect_evicted(
     ScorePolicyType policy_type, std::optional<at::Tensor> counter,
     std::optional<at::Tensor> insert_results,
     std::optional<at::Tensor> score_output, int64_t num_scores,
-    int64_t score_fn_key) {
+    int64_t score_fn_key, std::optional<at::Tensor> table_global_capacities) {
 
   auto i64 = keys.options().dtype(torch::kInt64);
   int64_t num_total = keys.size(0);
@@ -353,7 +362,8 @@ table_insert_collect_evicted(
       table_storage, table_bucket_offsets, bucket_capacity, bucket_sizes, keys,
       table_ids, score_input, policy_type, indices, insert_results,
       score_output, counter, num_scores, score_fn_key, evicted_counter,
-      evicted_keys, evicted_table_ids);
+      evicted_keys, evicted_table_ids,
+      global_capacities_ptr(table_global_capacities, table_bucket_offsets));
 
   return std::make_tuple(indices, evicted_counter, evicted_keys,
                          evicted_table_ids);
@@ -469,7 +479,7 @@ std::tuple<at::Tensor, at::Tensor> table_scatter_keys_at_slots(
     at::Tensor table_storage, at::Tensor table_bucket_offsets,
     int64_t bucket_capacity, at::Tensor bucket_sizes, at::Tensor keys,
     at::Tensor table_ids, at::Tensor slots, at::Tensor scores,
-    int64_t num_scores) {
+    int64_t num_scores, std::optional<at::Tensor> table_global_capacities) {
 
   int64_t num_total = keys.size(0);
   auto status = torch::empty(
@@ -491,6 +501,8 @@ std::tuple<at::Tensor, at::Tensor> table_scatter_keys_at_slots(
   if (score_vals.scalar_type() != torch::kUInt64)
     score_vals = score_vals.view(torch::kUInt64);
   const ScoreType *score_ptr = score_vals.data_ptr<ScoreType>();
+  auto global_caps_ptr =
+      global_capacities_ptr(table_global_capacities, table_bucket_offsets);
 
   auto stream = at::cuda::getCurrentCUDAStream().stream();
   constexpr int BLOCK_SIZE = 256;
@@ -506,7 +518,8 @@ std::tuple<at::Tensor, at::Tensor> table_scatter_keys_at_slots(
     using Bucket = LinearBucket<KeyType>;
     using Table = LinearBucketTable<Bucket>;
     auto table = Table(reinterpret_cast<uint8_t *>(table_storage.data_ptr()),
-                       num_buckets, bucket_capacity, num_scores);
+                       num_buckets, bucket_capacity, num_scores,
+                       global_caps_ptr);
 
     scatter_keys_at_slots_kernel<Table, 1>
         <<<(num_total + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE, 0, stream>>>(

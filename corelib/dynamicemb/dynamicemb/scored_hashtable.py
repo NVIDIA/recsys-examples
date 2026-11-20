@@ -24,7 +24,7 @@ import numpy as np
 import torch
 import torch.distributed as dist
 from dynamicemb.dynamicemb_config import dtype_to_bytes
-from dynamicemb.key_ownership import murmur3_hash_64bits, owned_key_mask
+from dynamicemb.key_ownership import OwnershipRule, murmur3_hash_64bits
 from dynamicemb.types import KEY_TYPE, SCORE_TYPE, MemoryType, torch_dtype_to_np_dtype
 from dynamicemb_extensions import (
     ScorePolicy,
@@ -202,6 +202,8 @@ class ScoredHashTable(abc.ABC):
         dist_type: Optional[str] = None,
         shard_index: Optional[int] = None,
         num_shards: Optional[int] = None,
+        global_capacity: Optional[int] = None,
+        bucket_capacity: Optional[int] = None,
     ) -> None:
         """
         Load keys and scores from input file path.
@@ -304,11 +306,21 @@ class LinearBucketTable(ScoredHashTable):
         enable_overflow: bool = False,
         score_fn_key: int = 0,
         use_rows: bool = False,
+        global_capacities: Optional[List[Optional[int]]] = None,
         use_ref_counter: bool = True,
     ):
         """
         Args:
             capacity: List of capacities, one per logical table.
+            global_capacities: per logical table, the row capacity of the whole
+                table across every shard, or ``None`` / ``0`` for "this table's
+                own capacity". When set, a key's bucket is
+                ``(hash % global_capacity) // bucket_capacity % num_buckets``
+                instead of ``(hash % capacity) // bucket_capacity``, so the
+                keys that share a bucket do not depend on how many shards the
+                table is split over (see ``LinearBucketTable::home_bucket`` in
+                ``src/table_operation/types.cuh``). Must be a multiple of the
+                bucket capacity and at least the table's own capacity.
             score_specs: List of ScoreSpec (currently only one is supported).
             key_type: key data type, torch.int64 or torch.uint64.
             bucket_capacity: number of slots per bucket (default 128).
@@ -436,6 +448,40 @@ class LinearBucketTable(ScoredHashTable):
                 f"Table total capacity is rounded from {total_input_capacity} to {self.capacity_}.",
                 UserWarning,
             )
+
+        # Whole-table capacities for the global bucket map; 0 means "own
+        # capacity", which the kernels treat as today's arithmetic.
+        if global_capacities is None:
+            global_capacities = [None] * self.num_tables_
+        if len(global_capacities) != self.num_tables_:
+            raise ValueError(
+                f"global_capacities has {len(global_capacities)} entries for "
+                f"{self.num_tables_} tables"
+            )
+        self.global_capacities_: List[int] = []
+        for t, gc in enumerate(global_capacities):
+            gc = int(gc) if gc else 0
+            if gc:
+                if gc % self.bucket_capacity_ != 0:
+                    raise ValueError(
+                        f"global_capacities[{t}]={gc} is not a multiple of "
+                        f"bucket_capacity {self.bucket_capacity_}"
+                    )
+                if gc < self.per_table_capacity_[t]:
+                    raise ValueError(
+                        f"global_capacities[{t}]={gc} is smaller than the "
+                        f"table's own capacity {self.per_table_capacity_[t]}"
+                    )
+                if gc == self.per_table_capacity_[t]:
+                    # A single shard: the whole table is this table, and the
+                    # formula with its own capacity is the same arithmetic.
+                    gc = 0
+            self.global_capacities_.append(gc)
+        self.table_global_capacities_: Optional[torch.Tensor] = (
+            torch.tensor(self.global_capacities_, dtype=torch.int64, device=self.device)
+            if any(self.global_capacities_)
+            else None
+        )
 
         self.storage_bytes_ = (
             sum(self.fields_byte_) * self.bucket_capacity_ * self.num_buckets_
@@ -640,6 +686,7 @@ class LinearBucketTable(ScoredHashTable):
             None,
             ScorePolicy.CONST,
             num_scores=self.num_scores_,
+            table_global_capacities=self.table_global_capacities_,
         )
         return slots
 
@@ -714,6 +761,7 @@ class LinearBucketTable(ScoredHashTable):
             score_value,
             policy,
             num_scores=num_scores,
+            table_global_capacities=self.table_global_capacities_,
         )
         if return_slots:
             return score_out, founds, self._rows_of(indices, table_ids, False), indices
@@ -773,6 +821,7 @@ class LinearBucketTable(ScoredHashTable):
                 score_out,
                 num_scores=num_scores,
                 score_fn_key=self.score_fn_key_,
+                table_global_capacities=self.table_global_capacities_,
             )
             rows = self._rows_of(indices, table_ids, True)
             return (rows, *rest, indices) if return_slots else (rows, *rest)
@@ -791,6 +840,7 @@ class LinearBucketTable(ScoredHashTable):
             score_out,
             num_scores=num_scores,
             score_fn_key=self.score_fn_key_,
+            table_global_capacities=self.table_global_capacities_,
         )
         rows = self._rows_of(indices, table_ids, True)
         return (rows, indices) if return_slots else rows
@@ -849,6 +899,7 @@ class LinearBucketTable(ScoredHashTable):
             score_out,
             num_scores=num_scores,
             score_fn_key=self.score_fn_key_,
+            table_global_capacities=self.table_global_capacities_,
         )
 
         h_num_evicted = num_evicted.cpu().item()
@@ -904,6 +955,7 @@ class LinearBucketTable(ScoredHashTable):
                 self._ref_counter,
                 num_scores=self.num_scores_,
                 score_fn_key=self.score_fn_key_,
+                table_global_capacities=self.table_global_capacities_,
             )
         assert bool((slots >= 0).all()), "rehash insert must not reject keys"
         self.set_rows(slots, table_id, rows)
@@ -1092,6 +1144,7 @@ class LinearBucketTable(ScoredHashTable):
             ovf_bucket_capacity=self.overflow_bucket_capacity_,
             ovf_output_offsets=self.overflow_output_offsets_,
             num_scores=num_scores,
+            table_global_capacities=self.table_global_capacities_,
         )
         return score_out, founds, indices
 
@@ -1159,6 +1212,7 @@ class LinearBucketTable(ScoredHashTable):
             num_scores=num_scores,
             score_fn_key=self.score_fn_key_,
             refused=refused,
+            table_global_capacities=self.table_global_capacities_,
         )
 
         h_num_evicted = num_evicted.cpu().item()
@@ -1212,6 +1266,7 @@ class LinearBucketTable(ScoredHashTable):
             table_ids,
             indices=indices,
             num_scores=self.num_scores_,
+            table_global_capacities=self.table_global_capacities_,
         )
         return indices
 
@@ -1308,6 +1363,8 @@ class LinearBucketTable(ScoredHashTable):
         dist_type: Optional[str] = None,
         shard_index: Optional[int] = None,
         num_shards: Optional[int] = None,
+        global_capacity: Optional[int] = None,
+        bucket_capacity: Optional[int] = None,
     ) -> None:
         """
         Load keys and scores from input file path.
@@ -1322,6 +1379,9 @@ class LinearBucketTable(ScoredHashTable):
                 ``None`` keeps every key in the file: a table loaded on its own,
                 outside any sharding, has no rule to apply, and guessing one
                 would silently drop the keys it guessed wrong about.
+            global_capacity / bucket_capacity: the parameters of the
+                ``hash_bucket`` rule (the *module's* table layout, not this
+                table's own), see :func:`dynamicemb.key_ownership.owning_shard`.
         """
 
         load_table_id = table_id if table_id is not None else 0
@@ -1360,6 +1420,11 @@ class LinearBucketTable(ScoredHashTable):
         if num_shards is None or shard_index is None:
             num_shards = dist.get_world_size() if dist.is_initialized() else 1
             shard_index = dist.get_rank() if dist.is_initialized() else 0
+        rule = (
+            OwnershipRule(dist_type, num_shards, global_capacity, bucket_capacity)
+            if dist_type is not None
+            else None
+        )
 
         dump_timestamp = device_timestamp()
 
@@ -1393,11 +1458,7 @@ class LinearBucketTable(ScoredHashTable):
                     scores = torch.clamp(dump_timestamp - scores, min=0)
                 scores_dict[score_name] = scores
 
-            masks = (
-                owned_key_mask(keys, shard_index, num_shards, dist_type)
-                if dist_type is not None
-                else None
-            )
+            masks = rule.mask(keys, shard_index) if rule is not None else None
             if masks is not None:
                 keys = keys[masks]
                 for score_name in scores_dict:
@@ -1938,6 +1999,7 @@ class LinearBucketTable(ScoredHashTable):
             slots,
             scores,
             num_scores=self.num_scores_,
+            table_global_capacities=self.table_global_capacities_,
         )
 
     def capacity(self, table_id: Optional[int] = None) -> int:
@@ -2005,6 +2067,7 @@ class LinearBucketTable(ScoredHashTable):
             self.table_bucket_offsets_,
             self.num_buckets_,
             self.bucket_capacity_,
+            table_global_capacities=self.table_global_capacities_,
         )
         return bkt_keys, offsets, inverse
 
@@ -2108,6 +2171,7 @@ class LinearBucketTable(ScoredHashTable):
                 vs,
                 policy,
                 self._ref_counter,
+                table_global_capacities=self.table_global_capacities_,
             )
 
         _, _, indices = table_lookup(
@@ -2118,6 +2182,7 @@ class LinearBucketTable(ScoredHashTable):
             table_ids,
             None,
             ScorePolicy.CONST,
+            table_global_capacities=self.table_global_capacities_,
         )
         return indices
 
@@ -2175,6 +2240,7 @@ class LinearBucketTable(ScoredHashTable):
                 vs,
                 policy,
                 self._ref_counter,
+                table_global_capacities=self.table_global_capacities_,
             )
             h_num_ev = num_ev.cpu().item()
             if h_num_ev > 0:
@@ -2194,6 +2260,7 @@ class LinearBucketTable(ScoredHashTable):
             table_ids,
             None,
             ScorePolicy.CONST,
+            table_global_capacities=self.table_global_capacities_,
         )
         return (
             indices,
@@ -2270,6 +2337,7 @@ class LinearBucketTable(ScoredHashTable):
                 ovf_counter=self._ovf_counter,
                 ovf_output_offsets=self.overflow_output_offsets_,
                 refused=refused,
+                table_global_capacities=self.table_global_capacities_,
             )
             h_num_ev = num_ev.cpu().item()
             if h_num_ev > 0:
@@ -2292,6 +2360,7 @@ class LinearBucketTable(ScoredHashTable):
             ovf_storage=self.overflow_table_storage_,
             ovf_bucket_capacity=self.overflow_bucket_capacity_,
             ovf_output_offsets=self.overflow_output_offsets_,
+            table_global_capacities=self.table_global_capacities_,
         )
         result = (
             indices,
@@ -2325,6 +2394,7 @@ def get_scored_table(
     enable_overflow: bool = False,
     score_fn_key: int = 0,
     use_rows: bool = False,
+    global_capacities: Optional[List[Optional[int]]] = None,
     use_ref_counter: bool = True,
 ) -> ScoredHashTable:
     if probing_type == ProbingType.LINEAR and reduction_type == ReductionType.LINEAR:
@@ -2337,6 +2407,7 @@ def get_scored_table(
             enable_overflow=enable_overflow,
             score_fn_key=score_fn_key,
             use_rows=use_rows,
+            global_capacities=global_capacities,
             use_ref_counter=use_ref_counter,
         )
     else:
