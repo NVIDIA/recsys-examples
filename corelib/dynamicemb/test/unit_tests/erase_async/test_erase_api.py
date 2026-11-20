@@ -272,7 +272,7 @@ def test_nothing_is_started_when_any_module_is_refused(device):
         device.index, S.CUSTOMIZED, local_hbm_for_values=(1 << 20) * DIM * 4 // 2
     )
     train_step(scannable, list(range(1, 501)), device, score=5)
-    with pytest.raises(NotImplementedError, match="HYBRID"):
+    with pytest.raises(NotImplementedError, match=re.escape(str(StorageLayout(StorageTier.HBM | StorageTier.DDR)))):
         erase_by_score_async(
             nn.ModuleList([scannable, hybrid]),
             S.CUSTOMIZED,

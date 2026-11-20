@@ -202,8 +202,8 @@ def check_erase_beside_training(case: str, hbm_scale: float = 1.0) -> None:
     model, feature_names, table_names = _model(strategy, hbm_scale=hbm_scale)
     label = f"{case}, beside training, hbm_scale={hbm_scale}"
     if hbm_scale == 0.0:
-        layouts = {m._storage_layout.name for m in get_dynamic_emb_module(model)}
-        assert layouts == {"HOST_ONLY"}, layouts
+        layouts = {str(m._storage_layout) for m in get_dynamic_emb_module(model)}
+        assert layouts == {"DDR"}, layouts
 
     _train(model, feature_names, OLD_KEYS, per_key, OLD_SCORE)
     _train(model, feature_names, NEW_KEYS, per_key, NEW_SCORE)

@@ -210,7 +210,7 @@ def test_host_only_storage_is_erased_while_training_goes_on(device):
     the generic path, which finds and inserts its keys in forward and writes them back in
     backward. The erase runs beside it; the old keys go, every other key reads right."""
     module = build_de_table(device.index, S.CUSTOMIZED, local_hbm_for_values=0)
-    assert module._storage_layout is StorageLayout.HOST_ONLY
+    assert module._storage_layout == StorageLayout(StorageTier.DDR)
     old, new = key_range(1, 2000), key_range(2001, 2000)
     for keys, score in ((old, 10), (new, 200)):
         for start in range(0, len(keys), 500):
