@@ -401,7 +401,9 @@ def apply_dmp(
                 mode=DynamicEmbInitializerMode.CONSTANT,
                 value=TABLE_INITIALIZER_VALUE,
             ),
-            bucket_capacity=table_bucket_capacity(dist_type),  # keep same to the bucket capacity from get_table_value_bytes
+            bucket_capacity=table_bucket_capacity(
+                dist_type
+            ),  # keep same to the bucket capacity from get_table_value_bytes
             caching=caching,
             admit_strategy=admit_strategy,
             **table_output_dist.get(eb_config.name, {}),

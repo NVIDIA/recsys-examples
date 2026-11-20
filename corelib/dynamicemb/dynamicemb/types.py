@@ -577,13 +577,14 @@ class MultiTableAdmitter(abc.ABC):
     """
 
     @abc.abstractmethod
-    def admit_with_counts(
+    def admit(
         self,
         keys: torch.Tensor,
         table_ids: torch.Tensor,
         frequencies: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
-        """Which of these missing keys may enter the table, and the count each was admitted on.
+        scores: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Which of these missing keys may enter the table.
 
         Args:
             keys (torch.Tensor): The keys to decide on, deduplicated.
@@ -593,13 +594,14 @@ class MultiTableAdmitter(abc.ABC):
                 *this batch*, where the module counts occurrences at all; None
                 means treat each key as one occurrence. An increment, not a
                 running total -- any total is the admitter's own to keep.
+            scores (Optional[torch.Tensor]): The scores `keys` will be inserted
+                with, given only by a table that evicts by LFU, where a score is
+                a frequency. An admitter that counts occurrences across steps
+                overwrites it in place with each key's running total (this
+                batch included); one that does not leaves it as it is.
 
         Returns:
-            Tuple[torch.Tensor, Optional[torch.Tensor]]: Boolean mask over
-            `keys`, True where admitted; and, from an admitter that counts
-            occurrences across steps, each key's running total (this batch
-            included) as an int64 tensor over `keys`, else None. On a table
-            that evicts by LFU an admitted key's score starts from that total.
+            torch.Tensor: Boolean mask over `keys`, True where admitted.
         """
 
     def state(self) -> Optional[Counter]:
