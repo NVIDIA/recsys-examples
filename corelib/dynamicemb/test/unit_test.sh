@@ -38,6 +38,7 @@ FWD_BWD_TEST_FILES=(
     "test/unit_tests/test_planner_plan_cost.py"
     "test/unit_tests/test_planner_placement.py"
     "test/unit_tests/test_table_row_wise.sh"
+    "test/unit_tests/test_dmp_collection.sh"
 )
 
 LOAD_DUMP_TEST_FILES=(
