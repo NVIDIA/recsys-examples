@@ -99,8 +99,11 @@ def _assert_fraction(admitted: torch.Tensor, expected: float):
 def test_admits_at_the_configured_rate():
     probability = 0.3
     keys, table_ids = _inputs()
-    admitted = _admitter(probability).admit(keys, table_ids)
+    scores = torch.arange(keys.shape[0], dtype=torch.int64, device=keys.device)
+    expected_scores = scores.clone()
+    admitted = _admitter(probability).admit(keys, table_ids, scores=scores)
     _assert_fraction(admitted, probability)
+    assert torch.equal(scores, expected_scores)
 
 
 def test_probability_zero_admits_nothing():

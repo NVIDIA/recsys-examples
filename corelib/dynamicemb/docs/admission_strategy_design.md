@@ -164,12 +164,16 @@ class MultiTableAdmitter(abc.ABC):
     """What a fused module runs, holding everything deciding takes."""
 
     @abc.abstractmethod
-    def admit(self, keys, table_ids, frequencies=None) -> torch.Tensor:
+    def admit(
+        self, keys, table_ids, frequencies=None, scores=None
+    ) -> torch.Tensor:
         """Which of these missing keys may enter the table.
 
         ``frequencies`` is how often each key occurred in *this batch*, where
         the module counts occurrences at all; None means treat each key as one.
         An increment, not a running total -- any total is the admitter's own.
+        ``scores``, passed only by an LFU table, are overwritten in place with
+        each key's running total by an admitter that keeps one.
         """
 
     def state(self) -> Optional[Counter]:
@@ -471,6 +475,7 @@ signature.
 | `AdmissionStrategy.initialize_non_admitted_embeddings` | `MultiTableAdmitter.non_admitted_initializer` | removed |
 | `AdmissionStrategy.admit` | `MultiTableAdmitter.admit` | a configuration no longer decides; `create_admitter` builds what does |
 | `admit(keys, frequencies)` | `admit(keys, table_ids, frequencies=None)` | `frequencies` is now a per-batch increment, not a running total |
+| `admit(keys, table_ids, frequencies=None)` | `admit(keys, table_ids, frequencies=None, scores=None)` | an LFU table passes the scores it inserts with; `MultiTableFrequencyAdmitter` writes each key's running total over them, so an admitted key's score starts from all its occurrences instead of the admitting batch's alone. An admitter that keeps no count ignores them |
 
 `admission_counter` keeps working: `__post_init__` warns, then folds it into a
 *copy* of the strategy. A copy because one strategy is commonly handed to every

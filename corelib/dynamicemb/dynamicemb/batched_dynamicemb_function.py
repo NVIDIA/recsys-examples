@@ -298,6 +298,7 @@ def _apply_admission(
     max_emb_dim: int,
     freq_for_admission: Optional[torch.Tensor],
     admitter: Optional[MultiTableAdmitter],
+    scores_are_frequencies: bool = False,
 ) -> Tuple[
     torch.Tensor, Optional[torch.Tensor], torch.Tensor, torch.Tensor, torch.Tensor
 ]:
@@ -324,7 +325,12 @@ def _apply_admission(
                 missing_indices,
             )
 
-        admit_mask = admitter.admit(missing_keys, missing_table_ids, freq_for_admission)
+        admit_mask = admitter.admit(
+            missing_keys,
+            missing_table_ids,
+            freq_for_admission,
+            scores=missing_scores if scores_are_frequencies else None,
+        )
         non_admitted_initializer = admitter.non_admitted_initializer
 
         non_admitted_mask = ~admit_mask
@@ -596,7 +602,17 @@ def _prefetch_cache_path(
                     (new_keys, new_tids, new_freq, new_pos),
                 ) = flagged_compact(is_new, [miss_keys, miss_tids, miss_freq, miss_pos])
             if num_new > 0:
-                admit_mask = admitter.admit(new_keys, new_tids, new_freq)
+                new_scores = (
+                    miss_score_input[new_rows]
+                    if miss_score_input is not None
+                    and storage._state.evict_strategy == EvictStrategy.KLfu
+                    else None
+                )
+                admit_mask = admitter.admit(
+                    new_keys, new_tids, new_freq, scores=new_scores
+                )
+                if new_scores is not None:
+                    miss_score_input[new_rows] = new_scores
                 admitted[new_rows] = admit_mask
                 with torch.cuda.nvtx.range("op:flagged_compact"):
                     num_refused, _, (refused_pos,) = flagged_compact(
@@ -778,7 +794,14 @@ def _prefetch_hbm_direct_path(
                 else None
             )
             admit_mask = admitter.admit(
-                missing_keys, missing_table_ids, freq_for_admission
+                missing_keys,
+                missing_table_ids,
+                freq_for_admission,
+                scores=(
+                    missing_scores
+                    if state.evict_strategy == EvictStrategy.KLfu
+                    else None
+                ),
             )
 
             admitted_keys = missing_keys[admit_mask]
@@ -1210,6 +1233,7 @@ def _generic_forward_path(
             max_emb_dim,
             freq_for_admission,
             admitter,
+            scores_are_frequencies=evict_strategy == EvictStrategy.KLfu,
         )
 
         if indices_to_init.numel() > 0:

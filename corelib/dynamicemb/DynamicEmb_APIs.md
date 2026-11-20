@@ -1718,13 +1718,17 @@ class MultiTableAdmitter(abc.ABC):
         keys: torch.Tensor,
         table_ids: torch.Tensor,
         frequencies: Optional[torch.Tensor] = None,
+        scores: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Which of these missing keys may enter the table.
 
         ``frequencies`` is how often each key occurred in *this batch*, where
         the module counts occurrences at all; None means treat each key as one.
         It is an increment, not a running total -- any total is the admitter's
-        own to keep.
+        own to keep. ``scores`` are the scores ``keys`` will be inserted with,
+        passed only by a table that evicts by LFU, where a score is a
+        frequency; an admitter that keeps a running total writes it over them
+        in place, and one that does not leaves them as they are.
         """
 
     def state(self) -> Optional[Counter]:
@@ -1750,6 +1754,10 @@ class MultiTableAdmitter(abc.ABC):
 `FrequencyAdmissionStrategy` admits a key once it has been seen often enough,
 and carries the counter it accumulates into, so admission is configured in one
 place. Its admitter erases a key from that counter the moment it is admitted.
+On a table that evicts by LFU (`LFU`, or `(TIMESTAMP, LFU)` in either order) it
+also writes each key's running count over its score, so an admitted key's score
+includes the occurrences it waited with and it ranks as if it had been in the
+table since it was first seen.
 
 ```python
 class FrequencyAdmissionStrategy(AdmissionStrategy):

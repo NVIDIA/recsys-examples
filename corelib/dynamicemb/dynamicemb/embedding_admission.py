@@ -275,6 +275,7 @@ class MultiTableFrequencyAdmitter(MultiTableAdmitter):
         keys: torch.Tensor,
         table_ids: torch.Tensor,
         frequencies: Optional[torch.Tensor] = None,
+        scores: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if frequencies is None:
             frequencies = torch.ones(
@@ -288,6 +289,8 @@ class MultiTableFrequencyAdmitter(MultiTableAdmitter):
 
         accumulated = self._counter.add(keys, table_ids, frequencies)
         admit_mask = accumulated >= self._threshold
+        if scores is not None:
+            scores.copy_(accumulated)
 
         # A key that got in is no longer waiting, so it stops taking up room.
         # This repeats a compaction the caller also makes over the same mask;
@@ -380,6 +383,7 @@ class MultiTableProbabilisticAdmitter(MultiTableAdmitter):
         keys: torch.Tensor,
         table_ids: torch.Tensor,
         frequencies: Optional[torch.Tensor] = None,
+        scores: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         num_keys = keys.shape[0]
         if self._probability <= 0.0:
