@@ -219,7 +219,9 @@ class HierOutputDist {
                  int64_t dim, at::ScalarType dtype, bool weighted, bool node_dedup,
                  int64_t lookup_keys, int64_t remote_keys, int64_t proxy_bytes, double timeout_s,
                  int64_t out_ctas, int64_t reduce_ctas, int64_t payload_kb,
-                 const std::vector<int64_t> &lookup_groups);
+                 const std::vector<int64_t> &lookup_groups,
+                 const std::vector<int64_t> &global_capacities = {},
+                 const std::vector<int64_t> &shard_capacities = {});
   // Local: waits for this rank's kernels. Then, unless the op was quiesced
   // after the last kernel of every rank, it waits at most min(timeout, 30 s)
   // for every node and rail peer to reach its own teardown. It lets go of

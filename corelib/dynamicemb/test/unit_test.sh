@@ -13,6 +13,8 @@ FWD_BWD_TEST_FILES=(
     "test/unit_tests/test_twin_module.sh"
     "test/unit_tests/test_alignment.sh"
     "test/unit_tests/test_hash_roundrobin_kuairand.py"
+    "test/unit_tests/test_global_bucket_layout.py"
+    "test/unit_tests/test_lookup_meta.py"
     "test/unit_tests/test_vmm_tensor.py"
     "test/unit_tests/optimizer/test_padded_buffer_optimizer.py"
     "test/unit_tests/optimizer/test_ftrl_optimizer.py"
