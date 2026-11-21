@@ -1117,6 +1117,11 @@ class BatchedDynamicEmbeddingTablesV2(nn.Module):
         return self._dynamicemb_options
 
     @property
+    def shard_ranks(self) -> List[int]:
+        """The global ranks that hold these tables, in shard order."""
+        return self._shard_ranks
+
+    @property
     def optimizer(
         self,
     ) -> BaseDynamicEmbeddingOptimizer:

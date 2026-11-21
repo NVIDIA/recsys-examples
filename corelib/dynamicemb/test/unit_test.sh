@@ -39,6 +39,7 @@ FWD_BWD_TEST_FILES=(
     "test/unit_tests/test_planner_placement.py"
     "test/unit_tests/test_table_row_wise.sh"
     "test/unit_tests/test_dmp_collection.sh"
+    "test/unit_tests/test_two_d_sparse.sh"
 )
 
 LOAD_DUMP_TEST_FILES=(
@@ -49,6 +50,7 @@ LOAD_DUMP_TEST_FILES=(
     # Registered in both groups: it covers forward and checkpoints, and runs
     # only the half named by the group it is passed.
     "test/unit_tests/test_table_row_wise.sh"
+    "test/unit_tests/test_two_d_sparse.sh"
 )
 
 # The hierarchical output dist's own tests: the hier group, which the CI runs
