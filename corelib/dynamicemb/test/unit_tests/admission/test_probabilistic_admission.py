@@ -99,11 +99,21 @@ def _assert_fraction(admitted: torch.Tensor, expected: float):
 def test_admits_at_the_configured_rate():
     probability = 0.3
     keys, table_ids = _inputs()
-    frequencies = torch.arange(keys.shape[0], dtype=torch.int64, device=keys.device)
-    expected_frequencies = frequencies.clone()
+    # Each key once: a key seen k times gets 1 - (1 - p)^k, so the configured
+    # rate is the one for k = 1.
+    frequencies = torch.ones_like(keys)
     admitted = _admitter(probability).admit(keys, table_ids, frequencies)
     _assert_fraction(admitted, probability)
-    # It keeps no count, so what it was given goes back as it was.
+
+
+def test_the_frequencies_given_are_left_as_they_were():
+    """It keeps no count, so what it was given goes back untouched."""
+    keys, table_ids = _inputs()
+    frequencies = torch.arange(
+        1, keys.shape[0] + 1, dtype=torch.int64, device=keys.device
+    )
+    expected_frequencies = frequencies.clone()
+    _admitter(0.3).admit(keys, table_ids, frequencies)
     assert torch.equal(frequencies, expected_frequencies)
 
 
