@@ -1718,17 +1718,17 @@ class MultiTableAdmitter(abc.ABC):
         keys: torch.Tensor,
         table_ids: torch.Tensor,
         frequencies: Optional[torch.Tensor] = None,
-        scores: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Which of these missing keys may enter the table.
 
         ``frequencies`` is how often each key occurred in *this batch*, where
         the module counts occurrences at all; None means treat each key as one.
-        It is an increment, not a running total -- any total is the admitter's
-        own to keep. ``scores`` are the scores ``keys`` will be inserted with,
-        passed only by a table that evicts by LFU, where a score is a
-        frequency; an admitter that keeps a running total writes it over them
-        in place, and one that does not leaves them as they are.
+        On input it is an increment, not a running total -- any total is
+        the admitter's own to keep. It is a copy made for this call and it is
+        where an answer goes back: an admitter that keeps a running total
+        overwrites it in place with each key's total (this batch included),
+        which a table that evicts by LFU takes as the score the key is inserted
+        with; one that keeps none leaves it as it is.
         """
 
     def state(self) -> Optional[Counter]:

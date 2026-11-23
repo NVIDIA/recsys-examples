@@ -582,7 +582,6 @@ class MultiTableAdmitter(abc.ABC):
         keys: torch.Tensor,
         table_ids: torch.Tensor,
         frequencies: Optional[torch.Tensor] = None,
-        scores: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Which of these missing keys may enter the table.
 
@@ -592,13 +591,15 @@ class MultiTableAdmitter(abc.ABC):
                 spans several, so a decision may be made per table.
             frequencies (Optional[torch.Tensor]): How often each key occurred in
                 *this batch*, where the module counts occurrences at all; None
-                means treat each key as one occurrence. An increment, not a
-                running total -- any total is the admitter's own to keep.
-            scores (Optional[torch.Tensor]): The scores `keys` will be inserted
-                with, given only by a table that evicts by LFU, where a score is
-                a frequency. An admitter that counts occurrences across steps
-                overwrites it in place with each key's running total (this
-                batch included); one that does not leaves it as it is.
+                means treat each key as one occurrence. On input an increment,
+                not a running total -- any total is the admitter's own to keep.
+                It is a copy the framework made for this call, and it is also
+                where the answer goes back: an admitter that counts occurrences
+                across steps overwrites it in place with each key's running
+                total (this batch included), which a table that evicts by LFU
+                then takes as the score the key is inserted with. An admitter
+                that keeps no count leaves it as it is. Overwrite it with
+                nothing but that total.
 
         Returns:
             torch.Tensor: Boolean mask over `keys`, True where admitted.
